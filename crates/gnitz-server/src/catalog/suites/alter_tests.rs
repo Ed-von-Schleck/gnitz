@@ -4,6 +4,7 @@
 //! end-to-end SQL surface is in `crates/gnitz-sql/tests/engine/ddl.rs`.
 
 use super::*;
+use crate::test_support::u64_i64_cols;
 use gnitz_wire::sys_rows::{SysRow, TableTabRow};
 use std::path::Path;
 
@@ -381,17 +382,8 @@ fn insert_first_rename_pair_lands_the_new_name() {
 
 #[test]
 fn a_column_alter_must_be_its_bundles_only_change() {
-    let (mut engine, tid, dir) = table_fixture(
-        "alter_confined_to_bundle",
-        &[col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)],
-    );
-    let other = engine
-        .create_table(
-            "public.u",
-            &[col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)],
-            &[0],
-        )
-        .unwrap();
+    let (mut engine, tid, dir) = table_fixture("alter_confined_to_bundle", &u64_i64_cols());
+    let other = engine.create_table("public.u", &u64_i64_cols(), &[0]).unwrap();
     let append = |owner: u64, bb: &mut BatchBuilder| {
         nullable_def("w", TypeCode::I64).write_col_tab_row(bb, owner, 2, 1);
     };

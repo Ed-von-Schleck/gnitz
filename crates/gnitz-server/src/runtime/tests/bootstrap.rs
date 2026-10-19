@@ -1,43 +1,54 @@
 use super::*;
-use crate::catalog::{CatalogColumn, SysFamily};
+use crate::catalog::SysFamily;
 use crate::runtime::master::scatter::with_routed;
 use crate::runtime::sal::fixtures::{holders_of, TestLog};
 use crate::runtime::sal::DirectGroup;
 use crate::test_support::{
-    circuit_batch, col_def, col_tab_batch, identity_circuit, make_batch, push_view_tab_row, sum_weights,
-    table_tab_batch,
+    batch_rows, circuit_batch, col_tab_batch, identity_circuit, make_batch, net_weight, push_view_tab_row,
+    register_identity_view, table_tab_batch, u64_i64_cols,
 };
-use gnitz_wire::TypeCode;
+use gnitz_wire::{TableDistribution, TableProps};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
-// -- Boot staging -----------------------------------------------------------
-
 const SAL_SIZE: usize = 1 << 20;
 
-fn cols() -> Vec<CatalogColumn> {
-    vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
-}
-
 fn col_tab(owner: u64, weight: i64) -> Batch {
-    col_tab_batch(owner, &cols(), weight)
+    col_tab_batch(owner, &u64_i64_cols(), weight)
 }
 
-fn table_tab(tid: u64, weight: i64) -> Batch {
-    table_tab_batch(&[(tid, "t", weight)])
+fn replicated() -> TableProps {
+    TableProps {
+        distribution: TableDistribution::Replicated,
+        ..Default::default()
+    }
 }
 
-/// Boot the catalog at `dir` over `log`'s committed tail.
-fn recover(log: &TestLog, dir: &str) -> CatalogEngine {
-    let mut opened = CatalogEngine::open_master(dir, 1, Default::default()).unwrap();
-    stage_system_tail(CommittedTail::read(log.log()).unwrap(), &mut opened).unwrap();
-    opened.replay().unwrap()
+/// Boot the database at `dir` as `slot`'s worker over `log`'s committed tail:
+/// the master's recovery and then the worker's, with no fork between them.
+fn boot(dir: &str, slot: Slot, log: &TestLog) -> CatalogEngine {
+    let tail = CommittedTail::read(log.log()).unwrap();
+    let opened = CatalogEngine::open_master(dir, slot.of, Default::default()).unwrap();
+    let mut engine = master_pre_fork_recovery(opened, tail).unwrap();
+    worker_boot_recovery(&mut engine, tail, slot).unwrap();
+    engine
 }
 
-/// The net weight `family`'s store holds.
-fn net(engine: &CatalogEngine, family: SysFamily) -> i64 {
-    sum_weights(engine.registry.relation(family.id()).unwrap().cursor())
+/// Write `rows` to `log` as the master's push of them to `tid`.
+fn push(log: &TestLog, engine: &CatalogEngine, tid: u64, rows: &Batch) {
+    let placement = engine.registry.relation(tid).unwrap().placement();
+    let record = engine.schema_record(tid).expect("a registered table");
+    with_routed(rows, placement, log.writer.num_workers(), |data| {
+        log.commit_zone(&[DirectGroup::push(tid, &record, data, holders_of(&data))]);
+    });
 }
+
+/// The rows `tid`'s store holds, with their weights.
+fn held(engine: &CatalogEngine, tid: u64) -> Vec<(u64, i64, i64)> {
+    batch_rows(&engine.registry.relation(tid).unwrap().full_scan())
+}
+
+// -- System tail ----------------------------------------------------------------
 
 /// A view's VIEW_TAB and COL_TAB rows flushed, its circuit only in the SAL.
 #[test]
@@ -45,12 +56,10 @@ fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
-    let replicated = gnitz_wire::TableProps {
-        distribution: gnitz_wire::TableDistribution::Replicated,
-        ..Default::default()
-    };
-    let r = engine.create_table_with("public.r", &cols(), &[0], replicated).unwrap();
-    let v = r + 1;
+    let r = engine
+        .create_table_with("public.r", &u64_i64_cols(), &[0], replicated())
+        .unwrap();
+    let v = engine.allocate_ids(1).unwrap();
     let mut view_tab = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut view_tab, 1, v, "v", 0, 0, 0);
     engine.registry.ingest(SysFamily::Column.id(), col_tab(v, 1)).unwrap();
@@ -60,11 +69,11 @@ fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
     let log = TestLog::new(SAL_SIZE, 1, 1);
     let circuit = circuit_batch(v, &identity_circuit(r, gnitz_wire::ReadBound::None));
     log.ddl_zone(&[(SysFamily::Circuit, &circuit)]);
-    let engine = recover(&log, dir);
+    let engine = boot(dir, Slot::new(0, 1), &log);
 
     assert_eq!(engine.dag.sources_of(v), &[r][..]);
     assert_eq!(engine.registry.relation(v).unwrap().placement(), Placement::Replicated);
-    assert_eq!(net(&engine, SysFamily::View), 1);
+    assert_eq!(net_weight(&engine, SysFamily::View.id()), 1);
 }
 
 /// A table's create flushed without the id counter, its drop only in the SAL.
@@ -74,121 +83,104 @@ fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
 fn a_tail_drop_nets_out_once_and_its_id_is_not_reissued() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
+    let slot = Slot::new(0, 1);
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
     // Above the id counter this session flushes.
     let t: u64 = 10_000;
+    let table_tab = |weight| table_tab_batch(&[(t, "t", weight)]);
     engine.registry.ingest(SysFamily::Column.id(), col_tab(t, 1)).unwrap();
-    engine.registry.ingest(SysFamily::Table.id(), table_tab(t, 1)).unwrap();
+    engine.registry.ingest(SysFamily::Table.id(), table_tab(1)).unwrap();
     engine.close();
 
     let log = TestLog::new(SAL_SIZE, 1, 1);
-    log.ddl_zone(&[
-        (SysFamily::Table, &table_tab(t, -1)),
-        (SysFamily::Column, &col_tab(t, -1)),
-    ]);
-    let mut engine = recover(&log, dir);
+    log.ddl_zone(&[(SysFamily::Table, &table_tab(-1)), (SysFamily::Column, &col_tab(t, -1))]);
+    let nets = |engine: &CatalogEngine| [SysFamily::Table, SysFamily::Column].map(|f| net_weight(engine, f.id()));
+    let mut engine = boot(dir, slot, &log);
     assert!(engine.registry.relation(t).is_none(), "the drop nets the table out");
     assert_eq!(engine.allocate_ids(1).unwrap(), t + 1);
-    let flushed = [net(&engine, SysFamily::Table), net(&engine, SysFamily::Column)];
-    engine.close();
+    let flushed = nets(&engine);
+    drop(engine);
 
-    let engine = recover(&log, dir);
-    assert_eq!(
-        [net(&engine, SysFamily::Table), net(&engine, SysFamily::Column)],
-        flushed
-    );
+    let mut engine = boot(dir, slot, &log);
+    assert_eq!(nets(&engine), flushed);
+    assert!(engine.allocate_ids(1).unwrap() > t);
 }
 
-// -- Tail replay --------------------------------------------------------------
+// -- Push tail ------------------------------------------------------------------
 
-/// The PKs `tid`'s store holds, and the net weight over them.
-fn held(engine: &CatalogEngine, tid: u64) -> (Vec<u64>, i64) {
-    let relation = engine.registry.relation(tid).unwrap();
-    let mut cursor = relation.cursor();
-    let mut pks = Vec::new();
-    while let Some(chunk) = cursor.drain_chunk(1024) {
-        pks.extend((0..chunk.len()).map(|row| u64::from_be_bytes(chunk.get_pk_bytes(row).try_into().unwrap())));
-    }
-    (pks, sum_weights(relation.cursor()))
-}
-
-/// A tail written at another worker count than the one launched. A replicated
+/// A tail written at another worker count than the one launched: a replicated
 /// push holds its rows once however many workers it was written for, and a
-/// keyed push written at one worker is re-cut to this rank's share.
+/// keyed push written at one worker is re-cut to this rank's share. One written
+/// at the launched count applies this rank's payload alone, and over a store
+/// that already holds it changes nothing.
 #[test]
 fn a_tail_written_at_another_width_replays_for_the_launched_one() {
     const ROWS: u64 = 64;
     let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
     let slot = Slot::new(0, 2);
-    let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), slot.of).unwrap();
-    let replicated = gnitz_wire::TableProps {
-        distribution: gnitz_wire::TableDistribution::Replicated,
-        ..Default::default()
-    };
-    let r = engine.create_table_with("public.r", &cols(), &[0], replicated).unwrap();
-    let k = engine.create_table("public.k", &cols(), &[0]).unwrap();
+    let mut engine = CatalogEngine::open(dir, slot.of).unwrap();
+    let r = engine
+        .create_table_with("public.r", &u64_i64_cols(), &[0], replicated())
+        .unwrap();
+    let k = engine.create_table("public.k", &u64_i64_cols(), &[0]).unwrap();
     let keyed = engine.registry.relation(k).unwrap().placement();
-    let rows: Vec<_> = (0..ROWS).map(|pk| (pk, 1, pk as i64)).collect();
-    let rows = make_batch(&engine.registry.relation(k).unwrap().schema(), &rows);
-
-    for (tid, written_at) in [(r, 4), (k, 1)] {
-        let log = TestLog::new(SAL_SIZE, written_at, 1);
-        let placement = engine.registry.relation(tid).unwrap().placement();
-        let record = engine.schema_record(tid).expect("a registered table");
-        with_routed(&rows, placement, written_at, |data| {
-            log.commit_zone(&[DirectGroup::push(tid, &record, data, holders_of(&data))]);
-        });
-
-        let tail = CommittedTail::read(log.log()).unwrap();
-        let group = tail.groups().next().expect("the push is committed");
-        assert_eq!(
-            (group.head.width() as usize, group.payloads().count()),
-            (written_at, 1),
-            "one payload, written for {written_at} worker(s)"
-        );
-        recover_from_sal(tail, slot, &mut engine).unwrap();
-    }
-
-    assert_eq!(held(&engine, r), ((0..ROWS).collect(), ROWS as i64), "replicated");
-    let own: Vec<u64> = (0..ROWS)
-        .filter(|pk| keyed.owner(&pk.to_be_bytes(), slot.of as usize) == Some(slot.rank as usize))
+    let all: Vec<_> = (0..ROWS).map(|pk| (pk, 1, pk as i64)).collect();
+    let own: Vec<_> = all
+        .iter()
+        .copied()
+        .filter(|(pk, ..)| keyed.owner(&pk.to_be_bytes(), slot.of as usize) == Some(slot.rank as usize))
         .collect();
-    assert!(!own.is_empty() && own.len() < ROWS as usize, "the key space is split");
-    let net = own.len() as i64;
-    assert_eq!(held(&engine, k), (own, net), "keyed: this rank's share");
+    assert!(!own.is_empty() && own.len() < all.len(), "the key space is split");
+    let rows = make_batch(&engine.registry.relation(k).unwrap().schema(), &all);
+    let tails: Vec<_> = [(r, 4, &all), (k, 1, &own), (k, 2, &own)]
+        .into_iter()
+        .map(|(tid, written_at, expected)| {
+            let log = TestLog::new(SAL_SIZE, written_at, 1);
+            push(&log, &engine, tid, &rows);
+            (tid, written_at, log, expected)
+        })
+        .collect();
     engine.close();
+
+    for (tid, written_at, log, expected) in &tails {
+        let engine = boot(dir, slot, log);
+        assert_eq!(&held(&engine, *tid), *expected, "table {tid} written at {written_at}");
+    }
 }
 
-/// A replayed push lands above its base's cut only for a tick to take: under a
-/// view that is kept, and not under one that awaits its rebuild, whose backfill
-/// reads the base whole.
+/// A replayed push lands above its base's cut, past the boot flush, only for a
+/// tick to take: under a view the boot keeps, and not under one that awaits its
+/// rebuild, whose backfill reads the base whole.
 #[test]
 fn a_tail_lands_above_the_cut_only_under_a_kept_view() {
     let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
     let slot = Slot::new(0, 1);
-    let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), slot.of).unwrap();
-    let kept = engine.create_table("public.kept", &cols(), &[0]).unwrap();
-    let rejected = engine.create_table("public.rejected", &cols(), &[0]).unwrap();
-    crate::test_support::register_identity_view(&mut engine, kept, "v_kept", &cols());
-    let rebuilt = crate::test_support::register_identity_view(&mut engine, rejected, "v_rejected", &cols());
-    engine.dag.set_rebuild([rebuilt]);
-    let rows = make_batch(
-        &engine.registry.relation(kept).unwrap().schema(),
-        &[(1, 1, 10), (2, 1, 20)],
-    );
-
+    let mut engine = CatalogEngine::open(dir, slot.of).unwrap();
+    let kept = engine.create_table("public.kept", &u64_i64_cols(), &[0]).unwrap();
+    let rejected = engine.create_table("public.rejected", &u64_i64_cols(), &[0]).unwrap();
+    register_identity_view(&mut engine, kept, "v_kept", &u64_i64_cols());
+    engine.record_topology(slot.of).unwrap();
+    let g = engine.advance_durable_generation().unwrap();
+    engine.flush_ephemeral_round(g).unwrap();
+    // Created after the checkpoint, so the boot rebuilds it.
+    register_identity_view(&mut engine, rejected, "v_rejected", &u64_i64_cols());
+    let rows = [(1, 1, 10), (2, 1, 20)];
     let log = TestLog::new(SAL_SIZE, slot.of as usize, 1);
     for tid in [kept, rejected] {
-        let placement = engine.registry.relation(tid).unwrap().placement();
-        let record = engine.schema_record(tid).expect("a registered table");
-        with_routed(&rows, placement, slot.of as usize, |data| {
-            log.commit_zone(&[DirectGroup::push(tid, &record, data, holders_of(&data))]);
-        });
+        push(
+            &log,
+            &engine,
+            tid,
+            &make_batch(&engine.registry.relation(tid).unwrap().schema(), &rows),
+        );
     }
-    recover_from_sal(CommittedTail::read(log.log()).unwrap(), slot, &mut engine).unwrap();
+    engine.close();
 
+    let mut engine = boot(dir, slot, &log);
     for tid in [kept, rejected] {
-        assert_eq!(held(&engine, tid), (vec![1, 2], 2), "table {tid}");
+        assert_eq!(held(&engine, tid), rows, "table {tid}");
     }
     let above = engine
         .registry
@@ -197,7 +189,6 @@ fn a_tail_lands_above_the_cut_only_under_a_kept_view() {
         .expect("the kept view's tick takes the tail");
     assert_eq!(above.len(), 2);
     assert!(engine.registry.seal(rejected).unwrap().is_none());
-    engine.close();
 }
 
 // -- The descriptor limit ---------------------------------------------------

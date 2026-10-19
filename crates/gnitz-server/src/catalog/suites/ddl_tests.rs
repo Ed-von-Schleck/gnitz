@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::u64_i64_cols;
 use gnitz_wire::sys_rows::ColTabRow;
 use gnitz_wire::ColumnDef;
 use std::collections::HashMap;
@@ -739,7 +740,7 @@ fn dropped_name_resolves_to_its_recreation() {
     let dir = temp_dir("dropped_name_recreate");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
+    let cols = u64_i64_cols();
 
     // Create, then drop, a table named `public.t`.
     let tid1 = engine.create_table("public.t", &cols, &[0]).unwrap();
@@ -784,7 +785,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     let dir = temp_dir("replicated_bit_transitive");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
+    let cols = u64_i64_cols();
 
     // A REPLICATED base table.
     let rt = engine
@@ -1175,7 +1176,7 @@ fn a_view_create_at_a_registered_table_id_is_refused() {
 #[test]
 fn only_a_scanned_table_holds_a_push_for_its_tick() {
     use crate::test_support::make_batch;
-    let cols = [col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let (mut engine, tid, dir) = table_fixture("unscanned_push", &cols);
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 

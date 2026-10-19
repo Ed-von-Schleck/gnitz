@@ -1,7 +1,7 @@
-use super::tests::{addressed, engine_with_table, frames, pk_keys, probe, push, table_cols, worker_over};
+use super::tests::{addressed, engine_with_table, frames, pk_keys, probe, push, worker_over};
 use super::*;
 use crate::runtime::sal::SalExcl;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, net_weight, register_identity_view};
+use crate::test_support::{make_batch_raw, make_schema_u64_i64, net_weight, register_identity_view, u64_i64_cols};
 use gnitz_foundation::perf::Counter;
 use gnitz_store::relation::IndexClaim;
 use gnitz_wire::{PkColList, PkKeys, ReadBound, ReadSpec, WireStatus};
@@ -101,7 +101,7 @@ fn worker_request_bench() {
     arm("scan_spec", HELD, bare, REQUESTS, scan, n, HELD);
 
     let viewed = |engine: &mut CatalogEngine, tid| {
-        register_identity_view(engine, tid, "v", &table_cols());
+        register_identity_view(engine, tid, "v", &u64_i64_cols());
     };
     let tick = |excl: &SalExcl, tid, _: &[u8], id: u32| {
         let tick = Apply::Tick {

@@ -306,9 +306,11 @@ fn run_worker_child(
     WorkerProcess::new(catalog, sal_reader, ipc.w2m_writer, ipc.park, ipc.mesh).run()
 }
 
-/// The master's half of recovery before any worker exists: the system families
-/// made durable.
-fn master_pre_fork_recovery(catalog: &mut CatalogEngine, tail: CommittedTail) -> Result<(), String> {
+/// The master's half of recovery before any worker exists: the catalog staged
+/// and replayed from the tail, and the system families made durable.
+fn master_pre_fork_recovery(mut opened: UnreplayedCatalog, tail: CommittedTail) -> Result<CatalogEngine, String> {
+    stage_system_tail(tail, &mut opened)?;
+    let mut catalog = opened.replay().map_err(|e| format!("failed to replay catalog: {e}"))?;
     if tail.holds_pushes() {
         // G → G+1, the resume generation left at G: the workers' boot flush moves
         // the base stores past what the views at G integrate, so until
@@ -323,7 +325,7 @@ fn master_pre_fork_recovery(catalog: &mut CatalogEngine, tail: CommittedTail) ->
             .map_err(|e| format!("boot system flush failed: {e}"))?;
     }
     inject_recovery_panic("genbump");
-    Ok(())
+    Ok(catalog)
 }
 
 /// Fork one child per worker, each of which never returns and takes its own
@@ -440,7 +442,7 @@ fn run_server(
 
     gnitz_info!("Opening database at {}", data_dir);
 
-    let mut opened = CatalogEngine::open_master(data_dir, num_workers, StoreConfig::from_env("GNITZ_"))
+    let opened = CatalogEngine::open_master(data_dir, num_workers, StoreConfig::from_env("GNITZ_"))
         .map_err(|e| format!("failed to open catalog: {e}"))?;
     listen::clear_published(data_dir)?;
     // Ahead of recovery, so an identity that cannot be read or minted refuses
@@ -452,13 +454,8 @@ fn run_server(
 
     let ipc = acquire_shared_ipc(data_dir, nw)?;
 
-    stage_system_tail(ipc.tail, &mut opened)?;
-    let catalog = opened.replay().map_err(|e| format!("failed to replay catalog: {e}"))?;
-
     // Leaked: the dispatcher and reactor borrow it for the life of the process.
-    let catalog: &'static mut CatalogEngine = Box::leak(Box::new(catalog));
-
-    master_pre_fork_recovery(catalog, ipc.tail)?;
+    let catalog: &'static mut CatalogEngine = Box::leak(Box::new(master_pre_fork_recovery(opened, ipc.tail)?));
 
     let SharedIpc { tail, workers, receiver, parks } = ipc;
     let worker_pids = fork_workers(catalog, data_dir, workers, pinning.as_ref())?;
@@ -490,7 +487,7 @@ fn run_server(
         }
     })?;
 
-    let listeners = listen::bind_listeners(data_dir, socket_path, tls, listen::ADDRESS_GRACE)?;
+    let listeners = listen::bind_listeners(data_dir, socket_path, tls)?;
     Ok(executor::run(dispatcher, data_dir, backup_dir, listeners))
 }
 

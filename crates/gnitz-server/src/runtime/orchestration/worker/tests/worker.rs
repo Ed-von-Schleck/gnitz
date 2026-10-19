@@ -1,12 +1,12 @@
 use super::*;
-use crate::catalog::{CatalogColumn, SysFamily};
+use crate::catalog::SysFamily;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::TestLog;
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets};
 use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{
-    col_def, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
-    pk_only_schema, register_identity_view, scan_all, weighted_rows,
+    make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema,
+    register_identity_view, scan_all, u64_i64_cols, weighted_rows,
 };
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{PkColList, PkKeys, Probe, ReadBound, ReadSpec, TypeCode, WireStatus};
@@ -52,16 +52,11 @@ fn route(target_id: u64, request_id: u32, cut: u64) -> ReplyRoute {
     ReplyRoute { target_id, request_id, cut }
 }
 
-/// The columns of [`make_schema_u64_i64`].
-pub(super) fn table_cols() -> [CatalogColumn; 2] {
-    [col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)]
-}
-
 /// A fresh catalog holding `public.t` over [`table_cols`]; its id.
 pub(super) fn engine_with_table(name: &str) -> (CatalogEngine, u64) {
     let dir = crate::test_support::scratch_dir("worker", name);
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
-    let tid = engine.create_table("public.t", &table_cols(), &[0]).unwrap();
+    let tid = engine.create_table("public.t", &u64_i64_cols(), &[0]).unwrap();
     (engine, tid)
 }
 
@@ -199,7 +194,7 @@ fn weight(i: u64) -> i64 {
 #[test]
 fn in_wait_dispositions() {
     let (mut engine, tid) = engine_with_table("in_wait_dispositions");
-    let vid = register_identity_view(&mut engine, tid, "v", &table_cols());
+    let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
@@ -326,7 +321,7 @@ fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
 #[test]
 fn a_parked_view_read_answers_ahead_of_the_cut_member_behind_it() {
     let (mut engine, tid) = engine_with_table("parked_view_read");
-    let vid = register_identity_view(&mut engine, tid, "v", &table_cols());
+    let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let held = make_batch_raw(&schema, &[(1, 1, 10)]);
     engine.registry.ingest(tid, held.clone()).unwrap();
@@ -355,7 +350,7 @@ fn a_parked_view_read_answers_ahead_of_the_cut_member_behind_it() {
 #[test]
 fn a_burst_passes_what_another_cut_owes() {
     let (mut engine, tid) = engine_with_table("burst");
-    let vid = register_identity_view(&mut engine, tid, "v", &table_cols());
+    let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 

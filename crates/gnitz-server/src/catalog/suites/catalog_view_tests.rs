@@ -3,6 +3,7 @@
 //! view, and the two relations the catalog refuses beside its own.
 
 use super::*;
+use crate::test_support::u64_i64_cols;
 use gnitz_wire::sys_rows::{SysRow, TableTabRow, ViewTabRow};
 
 const TABLES: u64 = gnitz_wire::TABLE_TAB;
@@ -77,7 +78,7 @@ fn a_ddl_sync_into_an_unscanned_family_leaves_nothing_above_its_cut() {
 fn a_view_reaching_a_family_awaits_rebuild_at_reopen() {
     let dir = temp_dir("catalog_views_invalid_at_boot");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     let direct = tables_view(&mut engine, "v_direct");
@@ -104,7 +105,7 @@ fn a_view_reaching_a_family_awaits_rebuild_at_reopen() {
 fn an_ephemeral_round_publishes_no_view_a_family_reaches() {
     let dir = temp_dir("catalog_views_unpublished");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let family_cols = SysFamily::Table.column_defs();
 

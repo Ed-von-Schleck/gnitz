@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{opk_pk, pk_only_schema};
+use crate::test_support::{opk_pk, pk_only_schema, u64_i64_cols};
 use gnitz_wire::TypeCode;
 
 /// A write to a parent referenced through its lone PK column probes nothing
@@ -13,7 +13,7 @@ fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
-    let cols = [col_def("pid", TypeCode::U64), col_def("v", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let parent = engine.create_table("public.parent", &cols, &[0]).unwrap();
     let cols = [col_def("cid", TypeCode::U64), fk_def("fk", TypeCode::U64, parent, 0)];
     engine.create_table("public.child", &cols, &[0]).unwrap();

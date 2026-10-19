@@ -8,11 +8,12 @@
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 
-use super::tests::{base_rows, engine_with_base, engine_with_views, register_count, view_cols};
+use super::tests::{base_rows, engine_with_base, engine_with_views, register_count};
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    col_def, cols_of, make_schema_u64_i64, net_weight, register_identity_view, try_register_view, EchoDrive,
+    col_def, cols_of, make_schema_u64_i64, net_weight, register_identity_view, try_register_view, u64_i64_cols,
+    EchoDrive,
 };
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{AggDescriptor, Circuit, ReadBound, TypeCode};
@@ -117,7 +118,7 @@ fn drive_tick_bench() {
     for readers in [1, 8] {
         let (mut engine, base) = engine_with_base(&format!("tick_bench_fanout_{readers}"), 1);
         let views: Vec<u64> = (0..readers)
-            .map(|r| register_identity_view(&mut engine, base, &format!("v{r}"), &view_cols()))
+            .map(|r| register_identity_view(&mut engine, base, &format!("v{r}"), &u64_i64_cols()))
             .collect();
         cells(&counter, &format!("read by {readers}"), &mut engine, base);
         for view in views {

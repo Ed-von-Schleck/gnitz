@@ -2,6 +2,7 @@
 //! registration it implies, and the rules that guard a view over one.
 
 use super::*;
+use crate::test_support::u64_i64_cols;
 
 /// A `WITH (stream = true)` TABLE_TAB row must register as a stream with no store
 /// and no directory. Driven through `hook_relation_register` rather than a hand-built
@@ -10,7 +11,7 @@ use super::*;
 fn stream_flag_registers_storeless_with_no_directory() {
     let dir = temp_dir("stream_registers_storeless");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
+    let cols = u64_i64_cols();
 
     let sid = engine
         .create_table_with(
@@ -55,7 +56,7 @@ fn stream_flag_registers_storeless_with_no_directory() {
 fn stream_reads_no_committed_state() {
     let dir = temp_dir("stream_reads_no_committed_state");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let sid = engine
         .create_table_with(
             "public.s",
@@ -75,7 +76,7 @@ fn stream_reads_no_committed_state() {
 fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
     let dir = temp_dir("bounded_view_over_stream");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let sid = engine
         .create_table_with(
             "public.s",
@@ -115,7 +116,7 @@ fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
 fn the_drive_set_excludes_a_stream() {
     let dir = temp_dir("stream_excluded_from_sweep");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let sid = engine
         .create_table_with(
             "public.s",
@@ -148,7 +149,7 @@ fn the_drive_set_excludes_a_stream() {
 fn stream_fed_views_are_invalid_at_boot() {
     let dir = temp_dir("stream_fed_views_invalid");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let sid = engine
         .create_table_with(
             "public.s",
@@ -190,7 +191,7 @@ fn stream_fed_views_are_invalid_at_boot() {
 fn an_ephemeral_round_publishes_no_view_a_stream_reaches() {
     let dir = temp_dir("stream_views_unpublished");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("amount", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let sid = engine
         .create_table_with(
             "public.s",

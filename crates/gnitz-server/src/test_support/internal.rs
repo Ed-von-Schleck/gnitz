@@ -39,6 +39,11 @@ pub fn col_def(name: &str, type_code: TypeCode) -> CatalogColumn {
     }
 }
 
+/// The columns of `make_schema_u64_i64`: a U64 `id` key and an I64 `v`.
+pub fn u64_i64_cols() -> [CatalogColumn; 2] {
+    [col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
+}
+
 /// A plain non-nullable UUID column.
 pub fn uuid_def(name: &str) -> CatalogColumn {
     col_def(name, TypeCode::UUID)

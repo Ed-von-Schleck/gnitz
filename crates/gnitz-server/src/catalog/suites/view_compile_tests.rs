@@ -6,6 +6,7 @@
 //! cannot compile is a client-visible error, and no view is created.
 
 use super::*;
+use crate::test_support::u64_i64_cols;
 
 /// `ScanDelta(base_tid) → Filter(pred) → Distinct`. The filter blob is what
 /// decides whether the view compiles.
@@ -17,10 +18,6 @@ fn filtered_circuit(base_tid: u64, pred: &[u8]) -> gnitz_wire::Circuit {
     circuit
 }
 
-fn view_cols() -> Vec<CatalogColumn> {
-    vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
-}
-
 /// Register a view over `base_tid` whose filter is `pred`, as one bundle.
 fn try_register_filtered_view(
     engine: &mut CatalogEngine,
@@ -28,13 +25,13 @@ fn try_register_filtered_view(
     name: &str,
     pred: &[u8],
 ) -> Result<u64, String> {
-    try_register_view(engine, filtered_circuit(base_tid, pred), name, &view_cols(), 0, 0)
+    try_register_view(engine, filtered_circuit(base_tid, pred), name, &u64_i64_cols(), 0, 0)
 }
 
 /// The blocks creating `vid` as a view over `base_tid` whose filter is `pred`,
 /// with `views` as its VIEW_TAB block.
 fn filtered_view_blocks(vid: u64, base_tid: u64, pred: &[u8], views: Batch) -> [(SysFamily, Batch); 3] {
-    view_blocks([(vid, &filtered_circuit(base_tid, pred), &view_cols()[..])], views)
+    view_blocks([(vid, &filtered_circuit(base_tid, pred), &u64_i64_cols()[..])], views)
 }
 
 // ── The compile verdict ─────────────────────────────────────────────────────
@@ -45,7 +42,7 @@ fn filtered_view_blocks(vid: u64, base_tid: u64, pred: &[u8], views: Batch) -> [
 fn test_compile_verdict() {
     let dir = temp_dir("view_compile_verdict");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
+    let base_cols = u64_i64_cols();
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
     // A compilable circuit: a well-formed predicate over the base's own columns.
@@ -77,7 +74,7 @@ fn test_compile_verdict() {
 fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
     let dir = temp_dir("view_compile_routing");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let a = engine.create_table("public.a", &cols, &[0]).unwrap();
     let b = engine.create_table("public.b", &cols, &[0]).unwrap();
 
@@ -107,7 +104,7 @@ fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
 fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
     let dir = temp_dir("view_compile_unusable_circuit");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let base = engine.create_table("public.base", &cols, &[0]).unwrap();
     let other = engine.create_table("public.other", &cols, &[0]).unwrap();
     let circuits_before = count_records(engine.sys_relation(SysFamily::Circuit).cursor());
@@ -155,7 +152,7 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
 fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
     let dir = temp_dir("view_compile_bounded_in_bundle");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let base = engine.create_table("public.base", &cols, &[0]).unwrap();
     let bounded = engine.allocate_ids(1).unwrap();
     let over = engine.allocate_ids(1).unwrap();
@@ -195,7 +192,7 @@ fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
 fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     let dir = temp_dir("view_compile_qname");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
+    let base_cols = u64_i64_cols();
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 100)]).to_blob_bytes();
     let old_vid = try_register_filtered_view(&mut engine, base_tid, "vw", &pred).unwrap();
@@ -204,7 +201,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     // checked: staged as a worker applies them, since no bundle carries them alone.
     let new_vid = engine.allocate_ids(1).unwrap();
     engine
-        .ddl_sync(SysFamily::Column.id(), col_tab_batch(new_vid, &view_cols(), 1))
+        .ddl_sync(SysFamily::Column.id(), col_tab_batch(new_vid, &u64_i64_cols(), 1))
         .unwrap();
 
     // Reusing the live name without retiring the incumbent is still a collision.
@@ -237,7 +234,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
 fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let dir = temp_dir("view_compile_rollback");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
+    let base_cols = u64_i64_cols();
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 100)]).to_blob_bytes();
     let old_vid = try_register_filtered_view(&mut engine, base_tid, "vw", &pred).unwrap();

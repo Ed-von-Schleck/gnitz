@@ -16,7 +16,7 @@ const TLS_ENDPOINT_FILE: &str = "tls_endpoint";
 /// takes to tear its io_uring down, so a restart straight after a kill finds
 /// its own address taken; an address still in use after the wait is another
 /// server's.
-pub(crate) const ADDRESS_GRACE: Duration = Duration::from_secs(2);
+const ADDRESS_GRACE: Duration = Duration::from_secs(2);
 /// How often an address in use is tried again within the grace.
 const ADDRESS_RETRY: Duration = Duration::from_millis(5);
 
@@ -40,14 +40,13 @@ pub(crate) fn clear_published(data_dir: &str) -> Result<(), String> {
 
 /// Bind every listener, the AF_UNIX socket last, then publish the endpoint.
 /// Called after the fork, so no worker inherits a listening fd. An address in
-/// use is waited on for up to `grace` ([`ADDRESS_GRACE`]).
+/// use is waited on for up to [`ADDRESS_GRACE`].
 pub(crate) fn bind_listeners(
     data_dir: &str,
     socket_path: &str,
     tls: Option<TlsListener>,
-    grace: Duration,
 ) -> Result<Vec<ClientListener>, String> {
-    let deadline = Instant::now() + grace;
+    let deadline = Instant::now() + ADDRESS_GRACE;
     let tcp = tls
         .map(|tls| bind_tcp(tls.listen(), deadline).map(|(fd, bound)| (fd, bound, tls)))
         .transpose()?;

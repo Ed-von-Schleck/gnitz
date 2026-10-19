@@ -1,9 +1,8 @@
 use super::super::fixtures::test_dispatcher;
 use super::*;
 use crate::runtime::test_support::try_poll_once;
-use crate::test_support::{col_def, make_batch_raw, scratch_dir};
+use crate::test_support::{make_batch_raw, scratch_dir, u64_i64_cols};
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::TypeCode;
 
 /// What the master spends on an insert before it can commit it, in instructions
 /// per row: the bundle's fold, the batch of keys to probe, and that probe routed
@@ -14,7 +13,7 @@ use gnitz_wire::TypeCode;
 fn preflight_probe_bench() {
     let dir = scratch_dir("master", "preflight_probe_bench");
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
-    let cols = [col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
+    let cols = u64_i64_cols();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).unwrap().schema();
 

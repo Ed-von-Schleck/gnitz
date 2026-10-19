@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::u64_i64_cols;
 use gnitz_wire::sys_rows::{FkAction, FkRef};
 
 // ── test_write_lock_set ─────────────────────────────────────────────────
@@ -280,13 +281,7 @@ fn test_fk_invalid_targets() {
     let dir = temp_dir("fk_invalid");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let parent_tid = engine
-        .create_table(
-            "public.p",
-            &[col_def("pk", TypeCode::U64), col_def("other", TypeCode::I64)],
-            &[0],
-        )
-        .unwrap();
+    let parent_tid = engine.create_table("public.p", &u64_i64_cols(), &[0]).unwrap();
 
     // FK targeting non-PK column (col_idx=1) should fail
     let bad_cols = vec![col_def("pk", TypeCode::U64), fk_def("fk", TypeCode::I64, parent_tid, 1)];

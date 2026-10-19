@@ -2,10 +2,7 @@
 //! never builds, which a wire peer skipping its canonicalization can still send.
 
 use super::*;
-
-fn id_v() -> Vec<CatalogColumn> {
-    vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
-}
+use crate::test_support::u64_i64_cols;
 
 /// A name whose bytes are not UTF-8 is refused as such in every family that
 /// stores one, not read as some other name.
@@ -100,7 +97,7 @@ fn an_index_row_takes_a_canonical_name_once_per_batch() {
 /// directory would carry a name the directory grammar does not parse.
 #[test]
 fn an_index_row_repeating_a_column_is_refused() {
-    let (mut engine, tid, dir) = table_fixture("bundle_index_repeated_col", &id_v());
+    let (mut engine, tid, dir) = table_fixture("bundle_index_repeated_col", &u64_i64_cols());
     let index_id = engine.allocate_ids(1).unwrap();
 
     let row = gnitz_wire::sys_rows::IdxTabRow {
@@ -125,14 +122,14 @@ fn an_index_row_repeating_a_column_is_refused() {
 fn a_view_row_names_a_real_owner_and_a_canonical_name() {
     let dir = temp_dir("bundle_view_rows");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let table = engine.create_table("public.t", &id_v(), &[0]).unwrap();
-    let existing = register_identity_view(&mut engine, table, "existing", &id_v());
+    let table = engine.create_table("public.t", &u64_i64_cols(), &[0]).unwrap();
+    let existing = register_identity_view(&mut engine, table, "existing", &u64_i64_cols());
     let vid = engine.allocate_ids(3).unwrap();
     let (user, other) = (vid + 1, vid + 2);
     // Staged as a worker applies them: no bundle carries an ownerless column block.
     for id in [vid, user, other] {
         engine
-            .ddl_sync(SysFamily::Column.id(), col_tab_batch(id, &id_v(), 1))
+            .ddl_sync(SysFamily::Column.id(), col_tab_batch(id, &u64_i64_cols(), 1))
             .unwrap();
     }
     // `rows` of `(view id, name, owner)`.
@@ -183,7 +180,7 @@ fn a_column_block_needs_an_owner_its_bundle_creates_or_the_catalog_holds() {
     let dir = temp_dir("bundle_column_owner");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.allocate_ids(1).unwrap();
-    let columns = || (SysFamily::Column, col_tab_batch(tid, &id_v(), 1));
+    let columns = || (SysFamily::Column, col_tab_batch(tid, &u64_i64_cols(), 1));
 
     let err = apply_ddl(&mut engine, [columns()]).unwrap_err();
     assert!(
@@ -245,7 +242,7 @@ fn a_creating_bundle_registers_its_table() {
         &mut engine,
         [
             (SysFamily::Table, table_tab_batch(&[(tid, "t", 1)])),
-            (SysFamily::Column, col_tab_batch(tid, &id_v(), 1)),
+            (SysFamily::Column, col_tab_batch(tid, &u64_i64_cols(), 1)),
         ],
     )
     .unwrap();
@@ -264,8 +261,8 @@ fn an_all_drop_bundle_drops_a_schema_with_its_members() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     engine.create_schema("s").unwrap();
     let sid = engine.schema_id("s").unwrap();
-    let tid = engine.create_table("s.t", &id_v(), &[0]).unwrap();
-    let vid = register_identity_view(&mut engine, tid, "v", &id_v());
+    let tid = engine.create_table("s.t", &u64_i64_cols(), &[0]).unwrap();
+    let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
 
     let drop = |family, id| (family, engine.retract_under(family, &[id]));
     let drops = bundle([
@@ -289,7 +286,7 @@ fn an_all_drop_bundle_drops_a_schema_with_its_members() {
 fn a_refused_view_bundle_leaves_the_prior_catalog() {
     let dir = temp_dir("bundle_apply_refused_view");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let base = engine.create_table("public.base", &id_v(), &[0]).unwrap();
+    let base = engine.create_table("public.base", &u64_i64_cols(), &[0]).unwrap();
     let before = sys_row_counts(&engine);
     let view_bundle = |vid: u64, circuit: gnitz_wire::Circuit, cols: &[CatalogColumn]| {
         view_blocks([(vid, &circuit, cols)], build_view_tab_row(vid, "v"))
@@ -308,7 +305,7 @@ fn a_refused_view_bundle_leaves_the_prior_catalog() {
     let cases: [Case; 3] = [
         (
             "expr blob",
-            Box::new(|_, vid| view_bundle(vid, uncompilable.clone(), &id_v()).into()),
+            Box::new(|_, vid| view_bundle(vid, uncompilable.clone(), &u64_i64_cols()).into()),
         ),
         (
             "may not carry a FOREIGN KEY; only a base table's may",
@@ -317,7 +314,7 @@ fn a_refused_view_bundle_leaves_the_prior_catalog() {
         (
             &format!("relation {base}"),
             Box::new(|engine, vid| {
-                let mut blocks: Vec<_> = view_bundle(vid, identity(), &id_v()).into();
+                let mut blocks: Vec<_> = view_bundle(vid, identity(), &u64_i64_cols()).into();
                 blocks.push((SysFamily::Table, engine.retract_under(SysFamily::Table, &[base])));
                 blocks
             }),

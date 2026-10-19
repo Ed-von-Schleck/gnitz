@@ -1,23 +1,19 @@
 //! The tick and backfill drivers.
 
 use super::*;
-use crate::catalog::{CatalogColumn, CatalogEngine};
+use crate::catalog::CatalogEngine;
 use crate::test_support::{
     col_def, cols_of, make_batch, make_schema_u64_i64, push_and_tick, register_identity_view, scan_all, scan_keyed,
-    scratch_dir, try_register_view, two_term_join_circuit, zset_of, EchoDrive, RowKey,
+    scratch_dir, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, EchoDrive, RowKey,
 };
 use gnitz_wire::{AggDescriptor, Circuit, ReadBound, TypeCode};
 use gnitz_zset::stream::ReducePlan;
 use std::collections::HashMap;
 
-pub(super) fn view_cols() -> Vec<CatalogColumn> {
-    vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
-}
-
 /// A base table `(id U64 PK, v I64)` in a fresh catalog of `workers`.
 pub(super) fn engine_with_base(name: &str, workers: u32) -> (CatalogEngine, u64) {
     let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", name), workers).unwrap();
-    let base = engine.create_table("public.base", &view_cols(), &[0]).unwrap();
+    let base = engine.create_table("public.base", &u64_i64_cols(), &[0]).unwrap();
     (engine, base)
 }
 
@@ -45,7 +41,7 @@ impl Views {
 /// [`engine_with_base`] at one worker plus [`Views`].
 pub(super) fn engine_with_views(name: &str) -> (CatalogEngine, u64, Views) {
     let (mut engine, base) = engine_with_base(name, 1);
-    let cols = view_cols();
+    let cols = u64_i64_cols();
     let mut circuit = Circuit::default();
     let sides = [0, 1].map(|_| {
         let scan = circuit.input_delta(base, ReadBound::None);
@@ -128,7 +124,7 @@ fn a_tick_drives_the_whole_closure() {
 #[test]
 fn an_empty_tick_runs_every_round() {
     let (mut engine, base) = engine_with_base("empty_rounds", 4);
-    let once = register_identity_view(&mut engine, base, "once", &view_cols());
+    let once = register_identity_view(&mut engine, base, "once", &u64_i64_cols());
     for (source, name) in [(base, "count"), (once, "count_once")] {
         register_count(&mut engine, source, name);
     }
@@ -143,7 +139,7 @@ fn an_empty_tick_runs_every_round() {
 #[test]
 fn an_empty_tick_lands_only_an_owed_ground_row() {
     let (mut engine, base) = engine_with_base("empty_tick", 1);
-    let once = register_identity_view(&mut engine, base, "once", &view_cols());
+    let once = register_identity_view(&mut engine, base, "once", &u64_i64_cols());
     let (count, plan) = register_count(&mut engine, base, "count");
     let ground = plan.ground_row().unwrap();
     let ground = zset_of(ground, ground.schema());
