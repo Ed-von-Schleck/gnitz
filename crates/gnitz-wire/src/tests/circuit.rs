@@ -1,8 +1,5 @@
 use super::*;
-
-fn agg(agg_op: AggFunc, col_idx: u32) -> AggDescriptor {
-    AggDescriptor { agg_op, col_idx }
-}
+use crate::outside;
 
 /// One node per opcode, exhaustive with no wildcard, so a new `Opcode` variant
 /// cannot reach the wire without a round-trip. Each sample carries a non-empty
@@ -24,7 +21,7 @@ fn sample(op: Opcode) -> OpNode {
             agg: AggFunc::ALL
                 .iter()
                 .enumerate()
-                .map(|(i, &f)| agg(f, i as u32))
+                .map(|(i, &agg_op)| AggDescriptor { agg_op, col_idx: i as u32 })
                 .collect(),
         },
         Opcode::Distinct => OpNode::WeightClamp(ClampKind::Distinct),
@@ -106,13 +103,13 @@ fn tag_at(op: &OpNode) -> usize {
 
 /// A cell laid out as `encode` would, around `push`: what a forger can write and
 /// a builder cannot.
-fn cell(nodes: &[(OpNode, &[u16])]) -> Vec<u8> {
+fn cell(nodes: &[(OpNode, &[NodeId])]) -> Vec<u8> {
     let mut w = Writer::new();
     w.count(nodes.len());
     for (op, inputs) in nodes {
         op.write(&mut w);
         for &input in *inputs {
-            w.u16(input);
+            w.u16(input.try_into().unwrap());
         }
     }
     w.into_vec()
@@ -184,20 +181,11 @@ fn every_op_node_variant_roundtrips() {
     }
 }
 
-/// A circuit's output is its last node, so one of no nodes has none.
-#[test]
-fn decode_refuses_the_empty_circuit() {
-    assert_eq!(
-        Circuit::decode(&Circuit::default().encode()).unwrap_err(),
-        "circuit: a circuit has no nodes"
-    );
-}
-
 /// Each opcode's sample encodes under its own tag, and its cell is refused cut
 /// anywhere, one byte long, or under a tag no operator has.
 #[test]
 fn each_opcode_cell_refuses_every_perturbation() {
-    let unknown = (0..=u8::MAX).find(|&o| Opcode::from_wire(o).is_none()).unwrap();
+    let unknown = outside(Opcode::from_wire);
     for &op in Opcode::ALL {
         let node = sample(op);
         let bytes = wired(node.clone()).encode();
@@ -255,13 +243,6 @@ fn each_decode_guard_rejects_its_own_forgery() {
         group_cols: vec![],
         agg: vec![AggDescriptor::COUNT_STAR],
     };
-    // The first byte outside each wire enum — not a literal, which the next
-    // variant added would quietly turn into a valid value.
-    fn outside<T>(from_wire: impl Fn(u8) -> Option<T>) -> u8 {
-        (0..=u8::MAX).find(|&b| from_wire(b).is_none()).unwrap()
-    }
-    let mut past_cap = Writer::new();
-    past_cap.count(MAX_CIRCUIT_NODES + 1);
     let cases = [
         (poke(&aux, 1, outside(NullKeys::from_wire)), "unknown NullKeys"),
         (poke(&aux, 8, 0), "unknown TypeCode 0"),
@@ -287,13 +268,8 @@ fn each_decode_guard_rejects_its_own_forgery() {
         // tag 0 | source 1..9 | bound tag 9. A malformed backfill hint is catalog
         // corruption, not a wider scan.
         (poke(&scan(3), 9, 9), "unknown bound kind"),
-        // The count is refused before a node is read.
-        (past_cap.into_vec(), "nodes: 16385 entries exceeds cap 16384"),
-        (
-            cell(&[(scan(7), &[]), (OpNode::Negate, &[1])]),
-            "a node's input is not an earlier node",
-        ),
-        (cell(&[(OpNode::Negate, &[0])]), "a node's input is not an earlier node"),
+        // A circuit's output is its last node, so one of no nodes has none.
+        (Circuit::default().encode(), "a circuit has no nodes"),
         // A cell holds at least its node count.
         (vec![], "truncated"),
     ];
@@ -303,7 +279,8 @@ fn each_decode_guard_rejects_its_own_forgery() {
     }
 }
 
-/// The count `decode` refuses past is one a circuit may hold.
+/// A circuit at the node cap decodes, and one node more is refused by its count
+/// before a node is read.
 #[test]
 fn decode_accepts_a_circuit_at_the_node_cap() {
     let mut c = Circuit::default();
@@ -313,11 +290,16 @@ fn decode_accepts_a_circuit_at_the_node_cap() {
     }
     assert_eq!(Circuit::decode(&c.encode()), Ok(c.clone()));
     c.negate(last);
-    assert!(Circuit::decode(&c.encode()).unwrap_err().contains("exceeds cap"));
+    assert_eq!(
+        Circuit::decode(&c.encode()).unwrap_err(),
+        "circuit: nodes: 16385 entries exceeds cap 16384"
+    );
 }
 
-/// What holds of an operator under every schema is `push`'s, so a built node and
-/// a decoded one are refused alike.
+/// What holds of an operator under every schema, and an input naming a node not
+/// yet pushed, is `push`'s, so a built node and a decoded one are refused alike.
+/// An input count off the operator's arity is refused when built; a cell cannot
+/// spell one, its operator fixing how many inputs it reads.
 #[test]
 fn push_refuses_a_malformed_operator_built_or_decoded() {
     let key = vec![(3, TypeCode::I64)];
@@ -330,29 +312,50 @@ fn push_refuses_a_malformed_operator_built_or_decoded() {
         })
     };
     let scatter = |source_cols| ReindexRole::ScatterKey { source_cols };
-    let cases = [
+    let forward = "a node's input is not an earlier node";
+    let arity = "node's inputs do not match its operator's arity";
+    let reduce = OpNode::Reduce {
+        group_cols: vec![0],
+        agg: vec![AggDescriptor::COUNT_STAR],
+    };
+    let cases: [(OpNode, &[NodeId], &str); 7] = [
         (
             reindex(ReindexRole::Auxiliary, vec![]),
+            &[0],
             "a reindex names no key columns",
         ),
         // A route names leading slots of the key.
         (
             reindex(scatter(vec![1, 2]), key),
+            &[0],
             "a scatter key is longer than its reindex key",
         ),
         (
             OpNode::Map(MapKind::HashRow { cols: vec![] }),
+            &[0],
             "a hash-row map names no columns",
         ),
+        (OpNode::Negate, &[1], forward),
+        (OpNode::Negate, &[7], forward),
+        (OpNode::Union, &[0], arity),
+        // Slot 1 is filled solely by a binary operator.
+        (reduce, &[0, 0], arity),
     ];
-    for (op, want) in cases {
+    for (op, inputs, want) in cases {
         let mut c = Circuit::default();
-        let input = c.push(scan(7), &[]).unwrap();
-        assert_eq!(c.push(op.clone(), &[input]).unwrap_err(), want);
+        assert_eq!(c.push(scan(7), &[]), Ok(0));
+        assert_eq!(c.push(op.clone(), inputs).unwrap_err(), want);
         assert_eq!(c.nodes().len(), 1, "a refused push appends nothing");
-        let decoded = Circuit::decode(&cell(&[(scan(7), &[]), (op, &[0])])).unwrap_err();
-        assert_eq!(decoded, format!("circuit: {want}"));
+        assert_eq!(c.inputs(0), [] as [NodeId; 0]);
+        if want != arity {
+            let decoded = Circuit::decode(&cell(&[(scan(7), &[]), (op, inputs)])).unwrap_err();
+            assert_eq!(decoded, format!("circuit: {want}"));
+        }
     }
+    let mut c = Circuit::default();
+    let input = c.push(scan(7), &[]).unwrap();
+    assert_eq!(c.push(OpNode::Negate, &[input]), Ok(1));
+    assert_eq!(c.inputs(1), [input]);
 }
 
 /// The reduce output key: the source PK list keys on itself, and so does a
@@ -441,41 +444,6 @@ fn range_rel_predicates_and_converse() {
     }
 }
 
-/// `push` is the graph's only constructor: an input count off the operator's
-/// arity, or an input naming a node not yet pushed, is refused.
-#[test]
-fn push_refuses_an_arity_mismatch_and_a_forward_input() {
-    let mut c = Circuit::default();
-    let scan = c.push(scan(7), &[]).unwrap();
-    assert_eq!(scan, 0);
-    assert_eq!(
-        c.push(OpNode::Union, &[scan]).unwrap_err(),
-        "node's inputs do not match its operator's arity"
-    );
-    assert_eq!(
-        c.push(OpNode::Negate, &[1]).unwrap_err(),
-        "a node's input is not an earlier node"
-    );
-    assert_eq!(
-        c.push(OpNode::Negate, &[scan]),
-        Ok(1),
-        "an input naming an earlier node is accepted"
-    );
-    assert_eq!(c.nodes().len(), 2, "a refused push appends nothing");
-    assert_eq!(c.inputs(1), [scan]);
-    assert_eq!(c.inputs(0), [] as [NodeId; 0]);
-
-    // Slot 1 is filled solely by a binary operator.
-    let reduce = OpNode::Reduce {
-        group_cols: vec![0],
-        agg: vec![AggDescriptor::COUNT_STAR],
-    };
-    assert_eq!(
-        c.push(reduce, &[0, 1]).unwrap_err(),
-        "node's inputs do not match its operator's arity"
-    );
-}
-
 /// A circuit's sources are its scans', one per scan: the client's id substitution
 /// moves each, and a source scanned twice is named twice.
 #[test]
@@ -493,11 +461,10 @@ fn sources_are_the_scans_sources() {
     assert_eq!(c.sources().collect::<Vec<_>>(), [107, 109, 107]);
 }
 
-/// A reduce is exchanged or each worker's local fold by its builder, which is
-/// what a group-less one owes its ground row by.
+/// A reduce is exchanged or each worker's local fold by its builder, and a
+/// group-less exchanged one alone owes its ground row.
 #[test]
 fn the_reduce_builders_differ_in_the_exchange() {
-    let exchanged = |c: &Circuit, id: NodeId| matches!(c.op(c.inputs(id)[0]), OpNode::ExchangeShard);
     let mut c = Circuit::default();
     let input = c.input_delta(7, crate::ReadBound::None);
     let aggs = [AggDescriptor::COUNT_STAR];
@@ -505,9 +472,10 @@ fn the_reduce_builders_differ_in_the_exchange() {
     let grouped = c.reduce_multi(input, &[1], &aggs);
     let local = c.reduce_multi_local(input, &[], &aggs);
     assert_eq!(
-        [exchanged(&c, global), exchanged(&c, grouped), exchanged(&c, local)],
-        [true, true, false]
+        [global, grouped, local].map(|id| c.owes_ground_row(id)),
+        [true, false, false]
     );
+    assert_eq!(c.op(c.inputs(grouped)[0]), &OpNode::ExchangeShard);
 }
 
 /// COUNT is always I64, and MIN/MAX select an existing row, so they keep the
@@ -528,6 +496,7 @@ fn agg_output_type_is_count_i64_min_max_identity_and_sum_widening() {
         // downstream unsigned compare re-seeds right.
         (U64, Some(U64)),
         (Decimal, Some(Decimal)),
+        (Bool, None),
         (String, None),
         (Blob, None),
         (U128, None),

@@ -48,20 +48,12 @@ fn each_decode_guard_rejects_its_own_forgery() {
         ("pk_repeats byte 2", forge(&|b| b[1] = 2), "neither 0 nor 1"),
         ("serial byte 2", forge(&|b| b[2] = 2), "neither 0 nor 1"),
         ("trailing byte", forge(&|b| b.push(0)), "trailing"),
-        (
-            "index column count",
-            forge(&|b| crate::write_u64_le(b, ix, crate::PK_LIST_PACKED_FLAG | 0xF)),
-            "out of range",
-        ),
+        // The list's own rules are `PkColList::unpack`'s; one shows the decode
+        // routes the word through it.
         (
             "untagged index list",
             forge(&|b| crate::write_u64_le(b, ix, 0)),
-            "no packed-list flag",
-        ),
-        (
-            "index repeats a column",
-            forge(&|b| crate::write_u64_le(b, ix, crate::PK_LIST_PACKED_FLAG | 2 | 1 << 4 | 1 << 11)),
-            "names column 1 twice",
+            "index column list word carries no packed-list flag",
         ),
         ("is_unique byte 2", forge(&|b| b[ix + 8] = 2), "neither 0 nor 1"),
     ];

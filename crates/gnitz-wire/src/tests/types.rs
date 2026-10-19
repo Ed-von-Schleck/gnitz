@@ -6,36 +6,43 @@ use super::*;
 #[test]
 fn type_predicates_partition_the_type_table() {
     /// `(type, fixed_int, signed_int, int, float, german_string, wide_int,
-    /// pk_eligible, serial_eligible)` — one row per `TypeCode`, one column per
-    /// predicate. A SERIAL key is exactly the plain integers of at most 8 bytes:
-    /// not a DATE's days, a DECIMAL's scaled units, nor a 16-byte type. A
-    /// BOOLEAN, a DATE, a TIMESTAMP and a DECIMAL are stored as a fixed int and
-    /// key as one, and are no integer.
-    type Row = (TypeCode, bool, bool, bool, bool, bool, bool, bool, bool);
+    /// pk_eligible, serial_eligible, reindex_output_type)` — one row per
+    /// `TypeCode`, one column per predicate. A SERIAL key is exactly the plain
+    /// integers of at most 8 bytes: not a DATE's days, a DECIMAL's scaled units,
+    /// nor a 16-byte type. A BOOLEAN, a DATE, a TIMESTAMP and a DECIMAL are
+    /// stored as a fixed int and key as one, and are no integer. The reindex /
+    /// `_join_pk` key a type packs at — the one policy the engine compiler and
+    /// SQL planner both derive from — is the type itself for a ≤8-byte stored
+    /// int, `I128` keeps width 16 **with** its sign, and everything else (U128,
+    /// UUID, the STRING/BLOB content hash, floats) is the unsigned 16-byte U128.
+    use TypeCode::*;
+    type Row = (TypeCode, bool, bool, bool, bool, bool, bool, bool, bool, TypeCode);
     let table: &[Row] = &[
-        (TypeCode::U8, true, false, true, false, false, false, true, true),
-        (TypeCode::I8, true, true, true, false, false, false, true, true),
-        (TypeCode::U16, true, false, true, false, false, false, true, true),
-        (TypeCode::I16, true, true, true, false, false, false, true, true),
-        (TypeCode::U32, true, false, true, false, false, false, true, true),
-        (TypeCode::I32, true, true, true, false, false, false, true, true),
-        (TypeCode::F32, false, false, false, true, false, false, false, false),
-        (TypeCode::U64, true, false, true, false, false, false, true, true),
-        (TypeCode::I64, true, true, true, false, false, false, true, true),
-        (TypeCode::F64, false, false, false, true, false, false, false, false),
-        (TypeCode::String, false, false, false, false, true, false, false, false),
-        (TypeCode::U128, false, false, true, false, false, true, true, false),
-        (TypeCode::UUID, false, false, false, false, false, true, true, false),
-        (TypeCode::Blob, false, false, false, false, true, false, false, false),
-        (TypeCode::I128, false, true, true, false, false, true, true, false),
-        (TypeCode::Date, true, true, false, false, false, false, true, false),
-        (TypeCode::Timestamp, true, true, false, false, false, false, true, false),
-        (TypeCode::Decimal, true, true, false, false, false, false, true, false),
-        (TypeCode::Bool, true, false, false, false, false, false, true, false),
+        (U8, true, false, true, false, false, false, true, true, U8),
+        (I8, true, true, true, false, false, false, true, true, I8),
+        (U16, true, false, true, false, false, false, true, true, U16),
+        (I16, true, true, true, false, false, false, true, true, I16),
+        (U32, true, false, true, false, false, false, true, true, U32),
+        (I32, true, true, true, false, false, false, true, true, I32),
+        (F32, false, false, false, true, false, false, false, false, U128),
+        (U64, true, false, true, false, false, false, true, true, U64),
+        (I64, true, true, true, false, false, false, true, true, I64),
+        (F64, false, false, false, true, false, false, false, false, U128),
+        (String, false, false, false, false, true, false, false, false, U128),
+        (U128, false, false, true, false, false, true, true, false, U128),
+        (UUID, false, false, false, false, false, true, true, false, U128),
+        (Blob, false, false, false, false, true, false, false, false, U128),
+        (I128, false, true, true, false, false, true, true, false, I128),
+        (Date, true, true, false, false, false, false, true, false, Date),
+        (
+            Timestamp, true, true, false, false, false, false, true, false, Timestamp,
+        ),
+        (Decimal, true, true, false, false, false, false, true, false, Decimal),
+        (Bool, true, false, false, false, false, false, true, false, Bool),
     ];
     assert_eq!(table.len(), TypeCode::ALL.len(), "a TypeCode variant is unclassified");
 
-    for &(tc, fixed, signed, int, float, german, wide, pk, serial) in table {
+    for &(tc, fixed, signed, int, float, german, wide, pk, serial, reindex) in table {
         assert_eq!(tc.is_fixed_int(), fixed, "is_fixed_int({tc:?})");
         assert_eq!(tc.is_signed_int(), signed, "is_signed_int({tc:?})");
         assert_eq!(tc.is_int(), int, "is_int({tc:?})");
@@ -44,6 +51,7 @@ fn type_predicates_partition_the_type_table() {
         assert_eq!(tc.is_wide_int(), wide, "is_wide_int({tc:?})");
         assert_eq!(tc.is_pk_eligible(), pk, "is_pk_eligible({tc:?})");
         assert_eq!(FixedInt::exact(tc).is_some(), serial, "FixedInt::exact({tc:?})");
+        assert_eq!(tc.reindex_output_type(), reindex, "reindex_output_type({tc:?})");
     }
 }
 
@@ -98,48 +106,6 @@ fn int_domain_fits_is_bounds_containment() {
             assert_eq!(s.int_domain_fits(t), want, "{s} -> {t}");
             assert_eq!(s.is_widening_promotion(t), want && t.is_fixed_int(), "{s} -> {t}");
         }
-    }
-}
-
-/// The reindex / `_join_pk` width policy (the single source of truth the engine
-/// compiler and SQL planner both derive from): a ≤8-byte integer key keeps its
-/// native width, `I128` keeps width 16 **with** its sign, and everything else —
-/// U128/UUID, the STRING/BLOB content hash, and PK-ineligible floats — collapses
-/// to the unsigned 16-byte U128 key. Spelled as an expectation per type rather
-/// than re-derived from the predicate the production body branches on, and
-/// guarded against `TypeCode::ALL` so a new variant cannot escape it.
-#[test]
-fn reindex_output_type_policy() {
-    let policy: &[(TypeCode, TypeCode)] = &[
-        (TypeCode::U8, TypeCode::U8),
-        (TypeCode::I8, TypeCode::I8),
-        (TypeCode::U16, TypeCode::U16),
-        (TypeCode::I16, TypeCode::I16),
-        (TypeCode::U32, TypeCode::U32),
-        (TypeCode::I32, TypeCode::I32),
-        (TypeCode::U64, TypeCode::U64),
-        (TypeCode::I64, TypeCode::I64),
-        // Wider or non-integer: the unsigned 16-byte key.
-        (TypeCode::F32, TypeCode::U128),
-        (TypeCode::F64, TypeCode::U128),
-        (TypeCode::String, TypeCode::U128),
-        (TypeCode::Blob, TypeCode::U128),
-        (TypeCode::U128, TypeCode::U128),
-        (TypeCode::UUID, TypeCode::U128),
-        // The one 16-byte type that keeps its sign instead.
-        (TypeCode::I128, TypeCode::I128),
-        (TypeCode::Date, TypeCode::Date),
-        (TypeCode::Timestamp, TypeCode::Timestamp),
-        (TypeCode::Decimal, TypeCode::Decimal),
-        (TypeCode::Bool, TypeCode::Bool),
-    ];
-    assert_eq!(
-        policy.len(),
-        TypeCode::ALL.len(),
-        "a TypeCode variant has no stated policy"
-    );
-    for &(src, want) in policy {
-        assert_eq!(src.reindex_output_type(), want, "{src:?}");
     }
 }
 
@@ -292,7 +258,7 @@ fn cmp_col_window_orders_every_fixed_width_type() {
 /// exactly the low `width()` bytes — so `-1` on an `I8` column packs to `0xFF`,
 /// not to a sign-extended `0xFFFF…`; and `unpack` answers what `decode_le_i64`
 /// answers over any `u128`'s bytes, its unsigned arm masking the bits past the
-/// width.
+/// width; the width-keyed `read_*_exact` readers agree with `decode_le_i64`.
 #[test]
 fn fixed_int_packs_unpacks_and_decodes_its_own_width() {
     assert_eq!(FixedInt::U8.decode_le_i64(&[0xff]), 255i64);
@@ -305,16 +271,7 @@ fn fixed_int_packs_unpacks_and_decodes_its_own_width() {
     assert_eq!(FixedInt::U64.decode_le_i64(&u64::MAX.to_le_bytes()), -1i64);
     assert_eq!(FixedInt::I64.decode_le_i64(&i64::MIN.to_le_bytes()), i64::MIN);
 
-    for fi in [
-        FixedInt::U8,
-        FixedInt::I8,
-        FixedInt::U16,
-        FixedInt::I16,
-        FixedInt::U32,
-        FixedInt::I32,
-        FixedInt::U64,
-        FixedInt::I64,
-    ] {
+    for fi in TypeCode::ALL.iter().filter_map(|&t| FixedInt::exact(t)) {
         let (lo, hi) = fi.range();
         for v in [lo, 0, hi] {
             let packed = fi.pack(v);
@@ -322,7 +279,14 @@ fn fixed_int_packs_unpacks_and_decodes_its_own_width() {
             assert_eq!(fi.unpack(packed), v as i64, "{fi:?} v={v}");
         }
         for v in [0u128, 1, 0x7F, 0x80, 0xFF, 0x100, u64::MAX as u128, u128::MAX] {
-            assert_eq!(fi.unpack(v), fi.decode_le_i64(&v.to_le_bytes()), "{fi:?} v={v:#x}");
+            let cell = &v.to_le_bytes()[..fi.width()];
+            let want = fi.decode_le_i64(cell);
+            assert_eq!(fi.unpack(v), want, "{fi:?} v={v:#x}");
+            let exact = match fi.is_signed() {
+                true => crate::read_signed_exact(cell),
+                false => crate::read_unsigned_exact(cell) as i64,
+            };
+            assert_eq!(exact, want, "{fi:?} v={v:#x}: the width-keyed reader");
         }
     }
 }
@@ -343,16 +307,7 @@ fn narrow_f32_refuses_only_a_finite_overflow() {
 /// the inverse recovers the value.
 #[test]
 fn an_integers_order_image_is_its_opk_key_promoted() {
-    for fi in [
-        FixedInt::U8,
-        FixedInt::I8,
-        FixedInt::U16,
-        FixedInt::I16,
-        FixedInt::U32,
-        FixedInt::I32,
-        FixedInt::U64,
-        FixedInt::I64,
-    ] {
+    for fi in TypeCode::ALL.iter().filter_map(|&t| FixedInt::exact(t)) {
         let w = fi.width();
         let mask = u64::MAX >> (64 - 8 * w);
         // Exhaustive where the width allows, else the edges plus a sweep.

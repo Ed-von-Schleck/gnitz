@@ -168,13 +168,10 @@ fn a_wire_version_mismatch_is_answered_with_the_servers_refusal_then_closed() {
     sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut hello = gnitz_wire::HELLO;
     hello[4] ^= 1;
-    sock.write_all(&gnitz_wire::frame_len_prefix(hello.len())).unwrap();
-    sock.write_all(&hello).unwrap();
+    sock.write_all(&gnitz_wire::framed(&hello)).unwrap();
     let mut reply = Vec::new();
     sock.read_to_end(&mut reply).unwrap();
-    let refusal = gnitz_wire::refusal_hello();
-    let want = [&gnitz_wire::frame_len_prefix(refusal.len())[..], &refusal].concat();
-    assert_eq!(reply, want);
+    assert_eq!(reply, gnitz_wire::framed(&gnitz_wire::refusal_hello()));
 }
 
 #[track_caller]

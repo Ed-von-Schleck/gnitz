@@ -16,26 +16,36 @@ fn a_page_request_reads_back_as_written() {
     }
 }
 
+/// A page of rows `1..=MAX_PAGE_ROWS` naming at most one cursor per worker, each
+/// a key some relation can have, decodes; anything else, or a trailing byte, is
+/// refused by name.
 #[test]
-fn a_key_no_relation_has_is_refused() {
-    assert!(PageRequest::decode(&request(1, vec![None, Some(Vec::new())]).encode()).is_err());
-    assert!(PageRequest::decode(&request(1, vec![Some(vec![0; MAX_PK_BYTES + 1])]).encode()).is_err());
+fn a_page_request_refuses_what_no_page_is() {
     let mut trailing = request(1, vec![]).encode();
     trailing.push(0);
-    assert!(PageRequest::decode(&trailing).is_err());
-}
-
-#[test]
-fn a_page_of_no_rows_or_past_the_cap_is_refused() {
-    assert!(PageRequest::decode(&request(0, vec![]).encode()).is_err());
-    assert!(PageRequest::decode(&request(MAX_PAGE_ROWS + 1, vec![]).encode()).is_err());
-    assert!(PageRequest::decode(&request(MAX_PAGE_ROWS, vec![]).encode()).is_ok());
-}
-
-#[test]
-fn a_page_naming_more_cursors_than_workers_is_refused() {
-    assert!(PageRequest::decode(&request(1, vec![None; MAX_WORKERS]).encode()).is_ok());
-    assert!(PageRequest::decode(&request(1, vec![None; MAX_WORKERS + 1]).encode()).is_err());
+    for (blob, want) in [
+        (request(MAX_PAGE_ROWS, vec![]).encode(), None),
+        (request(1, vec![None; MAX_WORKERS]).encode(), None),
+        (request(1, vec![Some(vec![0; MAX_PK_BYTES])]).encode(), None),
+        (request(0, vec![]).encode(), Some("a page of 0 rows")),
+        (request(MAX_PAGE_ROWS + 1, vec![]).encode(), Some("rows (1..=")),
+        (
+            request(1, vec![None; MAX_WORKERS + 1]).encode(),
+            Some("cursors (at most"),
+        ),
+        (request(1, vec![None, Some(Vec::new())]).encode(), Some("a 0-byte key")),
+        (
+            request(1, vec![Some(vec![0; MAX_PK_BYTES + 1])]).encode(),
+            Some("-byte key"),
+        ),
+        (trailing, Some("trailing")),
+    ] {
+        match (PageRequest::decode(&blob), want) {
+            (Ok(_), None) => {}
+            (Err(err), Some(want)) => assert!(err.contains(want), "{err:?} does not name {want:?}"),
+            (got, want) => panic!("{got:?}, want {want:?}"),
+        }
+    }
 }
 
 #[test]

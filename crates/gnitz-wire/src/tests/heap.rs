@@ -14,7 +14,8 @@ fn framed(codes: &[u8]) -> Vec<u8> {
 /// Symbols of one to eight bytes, a prefix of one another among them.
 const SYMBOLS: [&[u8]; 5] = [b"hello", b" ", b"world", b"ab", b"abcdefgh"];
 
-fn table() -> Box<SymbolTable> {
+/// The table of `SYMBOLS`, one per test process.
+static TABLE: std::sync::LazyLock<Box<SymbolTable>> = std::sync::LazyLock::new(|| {
     let symbols: Vec<[u8; 8]> = SYMBOLS
         .iter()
         .map(|s| {
@@ -25,6 +26,11 @@ fn table() -> Box<SymbolTable> {
         .collect();
     let lens: Vec<u8> = SYMBOLS.iter().map(|s| s.len() as u8).collect();
     SymbolTable::new(&symbols, &lens).unwrap()
+});
+
+/// `codes` as a heap of `TABLE`'s codes whose values decode to `plain_len` bytes.
+fn coded(codes: &[u8], plain_len: usize) -> Heap<'_> {
+    Heap::Coded(CodedHeap { table: &TABLE, codes, plain_len })
 }
 
 /// `value` in `SYMBOLS`' codes: the longest symbol at each position, an escape
@@ -88,18 +94,13 @@ fn a_table_refuses_a_symbol_it_cannot_hold() {
 /// next one starts.
 #[test]
 fn coded_values_read_alone() {
-    let table = table();
     let values: [&[u8]; 3] = [
         b"hello world, hello abcdefgh!",
         b"ab ab ab ab abab ab",
         b"\xff\x00 hello world \x01",
     ];
     let ((_, plain), (cells, codes)) = heaps(&values);
-    let heap = Heap::Coded(CodedHeap {
-        table: &table,
-        codes: &codes,
-        plain_len: plain.len(),
-    });
+    let heap = coded(&codes, plain.len());
     let mut at = 0;
     for (v, cell) in values.iter().zip(&cells) {
         let value = heap.value(at as u64, v.len()).unwrap();
@@ -120,13 +121,8 @@ fn coded_values_read_alone() {
 /// heap, or that starts past it, is none.
 #[test]
 fn corrupt_codes_decode_to_the_cells_length() {
-    let table = table();
     let codes = framed(&[0, 200, SYMBOL_ESCAPE]);
-    let heap = Heap::Coded(CodedHeap {
-        table: &table,
-        codes: &codes,
-        plain_len: 0,
-    });
+    let heap = coded(&codes, 0);
     let value = heap.value(0, 13).unwrap();
     let mut want = b"hello\0".to_vec();
     want.resize(13, 0);
@@ -135,18 +131,10 @@ fn corrupt_codes_decode_to_the_cells_length() {
     assert!(heap.value(codes.len() as u64, 13).is_none());
     assert!(heap.value(u64::MAX, 13).is_none());
     let overrun = [9, 0, 0];
-    let heap = Heap::Coded(CodedHeap {
-        table: &table,
-        codes: &overrun,
-        plain_len: 0,
-    });
+    let heap = coded(&overrun, 0);
     assert!(heap.value(0, 13).is_none(), "a count past the heap");
     let unended = [0x80; 12];
-    let heap = Heap::Coded(CodedHeap {
-        table: &table,
-        codes: &unended,
-        plain_len: 0,
-    });
+    let heap = coded(&unended, 0);
     assert!(heap.value(0, 13).is_none(), "a count that never ends");
     let plain = Heap::Plain(b"0123456789abcdef");
     assert!(plain.value(4, 13).is_none(), "past a plain heap");
@@ -157,7 +145,6 @@ fn corrupt_codes_decode_to_the_cells_length() {
 /// values does.
 #[test]
 fn a_coded_heap_reads_as_its_plain_heap() {
-    let table = table();
     let values: [&[u8]; 7] = [
         b"hello world",
         b"hello world!!",
@@ -168,11 +155,7 @@ fn a_coded_heap_reads_as_its_plain_heap() {
         b"ab",
     ];
     let ((plain_cells, plain), (coded_cells, codes)) = heaps(&values);
-    let coded = Heap::Coded(CodedHeap {
-        table: &table,
-        codes: &codes,
-        plain_len: plain.len(),
-    });
+    let coded = coded(&codes, plain.len());
     let plain = Heap::Plain(&plain);
     for (pa, ca) in plain_cells.iter().zip(&coded_cells) {
         assert_eq!(german_string_lead(ca, coded), german_string_lead(pa, plain));
@@ -216,12 +199,7 @@ fn a_coded_value_carries_its_code_count() {
             },
             "{n} codes"
         );
-        let table = table();
-        let heap = Heap::Coded(CodedHeap {
-            table: &table,
-            codes: &framed,
-            plain_len: 0,
-        });
+        let heap = coded(&framed, 0);
         let value = heap.value(0, n.max(13)).unwrap();
         assert_eq!((value.stored(), value.end()), (&codes[..], framed.len()));
     }

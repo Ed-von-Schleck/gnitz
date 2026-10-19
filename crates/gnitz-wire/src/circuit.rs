@@ -818,19 +818,15 @@ impl Circuit {
     /// Over no group columns it owes a row over an empty input.
     pub fn reduce_multi(&mut self, input: NodeId, group_cols: &[u32], agg_specs: &[AggDescriptor]) -> NodeId {
         let sharded = self.shard(input);
-        self.reduce(sharded, group_cols, agg_specs)
+        self.reduce_multi_local(sharded, group_cols, agg_specs)
     }
 
     /// [`OpNode::Reduce`] with **no upstream exchange**: it aggregates `input` as
     /// each worker holds it, and emits nothing over an empty input.
     pub fn reduce_multi_local(&mut self, input: NodeId, group_cols: &[u32], agg_specs: &[AggDescriptor]) -> NodeId {
-        self.reduce(input, group_cols, agg_specs)
-    }
-
-    fn reduce(&mut self, input: NodeId, group_cols: &[u32], agg: &[AggDescriptor]) -> NodeId {
         let op = OpNode::Reduce {
             group_cols: group_cols.to_vec(),
-            agg: agg.to_vec(),
+            agg: agg_specs.to_vec(),
         };
         self.add(op, &[input])
     }

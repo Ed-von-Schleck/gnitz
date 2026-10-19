@@ -157,7 +157,7 @@ fn peek_rejects_an_unreadable_header_word() {
         buf[off..off + word.len()].copy_from_slice(word);
         buf
     };
-    let bad_status = (0u32..).find(|&s| WireStatus::from_wire(s).is_none()).unwrap();
+    let bad_status = crate::outside(WireStatus::from_wire);
     for (buf, want) in [
         (
             forged(OFF_BLOB_LEN, &u32::MAX.to_le_bytes()),

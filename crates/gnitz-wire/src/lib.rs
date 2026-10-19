@@ -124,6 +124,13 @@ macro_rules! wire_enum {
     };
 }
 
+/// The first value outside a wire enum, for a test forging one — not a
+/// literal, which the next variant added would quietly turn into a valid value.
+#[cfg(test)]
+fn outside<V: From<u8> + Copy, T>(from_wire: impl Fn(V) -> Option<T>) -> V {
+    (0..=u8::MAX).map(V::from).find(|&v| from_wire(v).is_none()).unwrap()
+}
+
 mod bytes;
 mod catalog;
 mod circuit;

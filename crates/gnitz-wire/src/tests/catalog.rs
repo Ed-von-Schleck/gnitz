@@ -159,8 +159,8 @@ fn catalog_flag_words_roundtrip_pin_and_refuse_undefined_bits() {
 }
 
 /// `validate` refuses what the flags word can hold but the table cannot: a
-/// distribution prefix longer than the PK, and a SERIAL table that is a stream
-/// or whose PK is not its one generated column.
+/// distribution prefix longer than the PK, a compressed stream, and a SERIAL
+/// table that is a stream or whose PK is not its one generated column.
 #[test]
 fn table_props_validate_refuses_what_the_pk_cannot_carry() {
     let keyed = |prefix_len| TableProps {
@@ -174,6 +174,11 @@ fn table_props_validate_refuses_what_the_pk_cannot_carry() {
     assert!(serial.validate(2).unwrap_err().contains("one SERIAL column"));
     let stream = TableProps { stream: true, ..serial };
     assert!(stream.validate(1).unwrap_err().contains("a stream cannot be SERIAL"));
+    let compressed = TableProps { compress: true, ..stream };
+    assert!(compressed
+        .validate(1)
+        .unwrap_err()
+        .contains("a stream cannot be compressed"));
 }
 
 /// The system-shape digest moves with every axis of a family's stored identity.

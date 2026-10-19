@@ -74,13 +74,11 @@ fn decode_rejects_malformed() {
         let err = dec(&bad).unwrap_err();
         assert!(err.contains("leave no range column"), "{err}");
     }
-    // An over-long column word, and one carrying no packed-list flag.
-    let mut long = good.clone();
-    long[..8].copy_from_slice(&(crate::PK_LIST_PACKED_FLAG | 7).to_le_bytes());
-    assert!(dec(&long).is_err());
+    // The column list's own rules are `PkColList::unpack`'s; one shows the
+    // decode routes the word through it.
     let mut untagged = good.clone();
     untagged[..8].copy_from_slice(&1u64.to_le_bytes());
-    assert!(dec(&untagged).is_err());
+    assert!(dec(&untagged).unwrap_err().contains("packed-list flag"));
 }
 
 #[test]

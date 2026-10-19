@@ -55,21 +55,11 @@ pub fn digest_with_hole(seed: &[u8], buf: &[u8], hole: usize) -> u64 {
 /// payload order — that a read's reply layout is checked by. Column numbering
 /// is no part of it.
 pub fn layout_digest(pk_columns: usize, region_types: impl IntoIterator<Item = crate::TypeCode>) -> u64 {
-    // One byte per region; a schema past the buffer hashes as a stream, to the same digest.
+    // One byte per region, and a schema holds at most `MAX_COLUMNS` of them.
     let mut buf = [0u8; 1 + crate::MAX_COLUMNS];
     buf[0] = pk_columns as u8;
     let mut n = 1;
-    let mut types = region_types.into_iter();
-    for tc in types.by_ref() {
-        if n == buf.len() {
-            let mut h = Xxh3Default::default();
-            h.update(&buf);
-            h.update(&[tc.as_wire()]);
-            for tc in types {
-                h.update(&[tc.as_wire()]);
-            }
-            return h.digest();
-        }
+    for tc in region_types {
         buf[n] = tc.as_wire();
         n += 1;
     }

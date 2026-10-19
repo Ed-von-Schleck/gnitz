@@ -73,35 +73,12 @@ fn opk_codec_over_every_pk_type() {
     }
 }
 
-/// The column decoder writes what `decode_pk_cell` writes per row, at every width,
-/// for a column that is the whole row and for one inside a wider key.
+/// The column codec at every width, for a column that is the whole row and for
+/// one inside a wider key: the encoder writes cells `decode_pk_cell` reads back
+/// row by row, the column decoder reads them back unchanged, and the row's other
+/// bytes stay as they were.
 #[test]
-fn decode_pk_cells_matches_decode_pk_cell() {
-    let rows = 37usize;
-    for width in [1usize, 2, 4, 8, 16] {
-        for (stride, off) in [(width, 0), (width + 11, 3)] {
-            let pk: Vec<u8> = (0..rows * stride)
-                .map(|i| (i as u8).wrapping_mul(151).wrapping_add(7))
-                .collect();
-            for signed in [false, true] {
-                let mut got = vec![0u8; rows * width];
-                decode_pk_cells(&pk, stride, off, width, signed, &mut got);
-                let mut want = vec![0u8; rows * width];
-                for r in 0..rows {
-                    let at = r * stride + off;
-                    decode_pk_cell(&pk[at..at + width], signed, &mut want[r * width..(r + 1) * width]);
-                }
-                assert_eq!(got, want, "width {width} stride {stride} signed {signed}");
-            }
-        }
-    }
-}
-
-/// The column encoder writes cells the column decoder reads back unchanged, at
-/// every width, for a column that is the whole row and for one inside a wider
-/// key, and leaves the row's other bytes as they were.
-#[test]
-fn encode_pk_cells_inverts_decode_pk_cells() {
+fn the_column_codec_is_the_cell_codec_per_row() {
     let rows = 37usize;
     for width in [1usize, 2, 4, 8, 16] {
         for (stride, off) in [(width, 0), (width + 11, 3)] {
@@ -109,15 +86,19 @@ fn encode_pk_cells_inverts_decode_pk_cells() {
                 .map(|i| (i as u8).wrapping_mul(151).wrapping_add(7))
                 .collect();
             for signed in [false, true] {
+                let at = format!("width {width} stride {stride} signed {signed}");
                 let before = vec![0xA5u8; rows * stride];
                 let mut pk = before.clone();
                 encode_pk_cells(&src, width, signed, &mut pk, stride, off);
                 let mut back = vec![0u8; rows * width];
                 decode_pk_cells(&pk, stride, off, width, signed, &mut back);
-                assert_eq!(back, src, "width {width} stride {stride} signed {signed}");
+                assert_eq!(back, src, "{at}");
                 for (r, (row, was)) in pk.chunks_exact(stride).zip(before.chunks_exact(stride)).enumerate() {
-                    assert_eq!(row[..off], was[..off], "row {r} before the cell");
-                    assert_eq!(row[off + width..], was[off + width..], "row {r} after the cell");
+                    let mut cell = vec![0u8; width];
+                    decode_pk_cell(&row[off..off + width], signed, &mut cell);
+                    assert_eq!(cell, src[r * width..(r + 1) * width], "{at}: row {r}");
+                    assert_eq!(row[..off], was[..off], "{at}: row {r} before the cell");
+                    assert_eq!(row[off + width..], was[off + width..], "{at}: row {r} after the cell");
                 }
             }
         }

@@ -32,17 +32,3 @@ fn bit_iter_yields_set_bits_lowest_first() {
     assert_eq!(BitIter(1u64 << 63).collect::<Vec<_>>(), vec![63]);
     assert_eq!(BitIter(low_bits_mask(64)).count(), 64);
 }
-
-/// The signed reader sign-extends and the unsigned one zero-extends, at every width.
-#[test]
-fn exact_readers_widen_by_their_signedness() {
-    for (cell, s, u) in [
-        (&[0xFF][..], -1i64, 0xFFu64),
-        (&[0x7F][..], 127, 127),
-        (&0xFFFEu16.to_le_bytes()[..], -2, 0xFFFE),
-        (&0xFFFF_FFFEu32.to_le_bytes()[..], -2, 0xFFFF_FFFE),
-        (&u64::MAX.to_le_bytes()[..], -1, u64::MAX),
-    ] {
-        assert_eq!((read_signed_exact(cell), read_unsigned_exact(cell)), (s, u), "{cell:?}");
-    }
-}

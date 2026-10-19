@@ -20,10 +20,6 @@ fn decode_cols(record: &[u8]) -> Result<(Vec<SchemaBlockCol<'_>>, PkIndices), St
     Ok((cols, pk))
 }
 
-fn decode_err(record: &[u8]) -> String {
-    decode_cols(record).expect_err("expected a rejection")
-}
-
 /// `n` U64 key columns, all of them in the PK, in column order.
 fn all_key_cols(n: usize) -> Vec<SchemaBlockCol<'static>> {
     (0..n).map(|_| col(TypeCode::U64, "k", false)).collect()
@@ -109,7 +105,7 @@ fn each_guard_rejects_its_own_forgery() {
         ),
     ];
     for (record, want) in cases {
-        let err = decode_err(&record);
+        let err = decode_cols(&record).expect_err("expected a rejection");
         assert!(
             err.starts_with("schema record: ") && err.contains(&want),
             "{err:?} lacks {want:?}"
@@ -155,8 +151,9 @@ fn the_record_layout_is_fixed() {
 
 /// Each difference `check_same_types` compares is refused as a mismatch, and
 /// each names itself distinctly — pairwise distinctness tests the message
-/// without pinning prose.
-/// What it does not compare (names, the hidden flag) is admitted.
+/// without pinning prose. What it does not compare (names, the hidden flag) is
+/// admitted, and a `got` that is not byte-equal to `want` is validated: a
+/// truncated one is a decode error, not a match.
 #[test]
 fn check_same_types_names_each_mismatch_distinctly() {
     let two_cols =
@@ -205,7 +202,6 @@ fn check_same_types_names_each_mismatch_distinctly() {
             &[0],
         )
     };
-    assert_eq!(check_same_types(&decimal(4), &decimal(4)), Ok(()));
     msgs.push(check_same_types(&decimal(2), &decimal(4)).expect_err("scale"));
 
     for i in 0..msgs.len() {
@@ -214,14 +210,7 @@ fn check_same_types_names_each_mismatch_distinctly() {
             assert_ne!(msgs[i], msgs[j], "cases {i} and {j} report the same message");
         }
     }
-}
 
-/// A `got` that is not byte-equal to `want` is validated: a truncated one is a
-/// decode error, not a match.
-#[test]
-fn check_same_types_refuses_a_malformed_record() {
-    let want = simple();
-    let truncated = &want[..want.len() - 1];
-    let err = check_same_types(truncated, &want).expect_err("a truncated record");
+    let err = check_same_types(&want[..want.len() - 1], &want).expect_err("a truncated record");
     assert!(err.starts_with("schema record: "), "{err}");
 }

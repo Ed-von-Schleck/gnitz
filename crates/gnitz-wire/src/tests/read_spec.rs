@@ -144,23 +144,13 @@ fn the_encoded_bytes_are_pinned() {
     assert_eq!(fold.encode(), want);
 }
 
-/// `from_keys` is the one sort: duplicates collapse and the list comes out
-/// ascending whatever order it went in; `from_sorted` takes that order as given.
-#[test]
-fn pk_keys_sort_and_dedup() {
-    let raw: Vec<[u8; 2]> = vec![[0, 9], [0, 1], [0, 9], [1, 0]];
-    let k = PkKeys::from_keys(2, raw.iter().map(|k| &k[..]));
-    assert_eq!(k.iter().collect::<Vec<_>>(), vec![&[0, 1][..], &[0, 9], &[1, 0]]);
-    assert_eq!(k.len(), 3);
-    assert_eq!(k.bounds(), Some((&[0, 1][..], &[1, 0][..])));
-    assert_eq!(PkKeys::from_sorted(2, vec![]).bounds(), None);
-    assert_eq!(PkKeys::from_sorted(2, vec![0, 1, 0, 9, 1, 0]), k);
-}
-
-/// At every narrow stride, sorting images builds the list a byte sort does,
-/// both arms of the integer width included; a wide stride keeps the byte sort.
+/// `from_keys` is the one sort: at every stride duplicates collapse and the
+/// list comes out ascending whatever order it went in, which `from_sorted` takes
+/// as given. At every narrow stride, sorting images builds the same list, both
+/// arms of the integer width included; a wide stride keeps the byte sort.
 #[test]
 fn pk_keys_from_images_is_the_byte_sort() {
+    assert_eq!(PkKeys::from_sorted(2, vec![]).bounds(), None);
     let mut x = 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C834u128;
     let mut next = || {
         x ^= x << 13;
@@ -179,6 +169,10 @@ fn pk_keys_from_images_is_the_byte_sort() {
         want.dedup();
         let k = PkKeys::from_keys(stride, raw.iter().map(|k| &k[..]));
         assert_eq!(k.as_bytes(), want.concat(), "stride {stride}");
+        assert_eq!(k.len(), want.len(), "stride {stride}");
+        let (first, last) = (&want[0][..], &want[want.len() - 1][..]);
+        assert_eq!(k.bounds(), Some((first, last)), "stride {stride}");
+        assert_eq!(PkKeys::from_sorted(stride, want.concat()), k, "stride {stride}");
         if stride <= NARROW_PK_MAX_BYTES {
             let images = raw.iter().map(|k| crate::widen_pk_be(k));
             assert_eq!(PkKeys::from_images(stride, images), k, "stride {stride}");
@@ -241,11 +235,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
         ..empty_spec()
     };
     let min = AggDescriptor { agg_op: AggFunc::Min, col_idx: 0 };
-    // The first byte naming no aggregate — not a literal, which the next
-    // aggregate added to the enum would quietly turn into a valid opcode.
-    let bad_agg = (0u8..=u8::MAX)
-        .find(|&b| AggFunc::from_wire(b).is_none())
-        .expect("some byte names no aggregate");
+    let bad_agg = crate::outside(AggFunc::from_wire);
     let bad_agg_op = {
         // The last aggregate's op byte, then its u32 column.
         let mut bytes = fold(vec![min]).encode();

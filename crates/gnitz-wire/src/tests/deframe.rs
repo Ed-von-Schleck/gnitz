@@ -130,54 +130,27 @@ impl Feeder {
     }
 }
 
-/// One read carrying a whole pipelined run yields every frame in it, in order,
-/// and leaves nothing behind.
+/// A run of frames fed as whole reads costs the reads named, yields every frame
+/// in order, and leaves nothing buffered: a pipelined run fits one read; a frame
+/// larger than the carry takes the reads behind its first straight into its own
+/// buffer, and the stream parses from the carry again afterwards; and a frame
+/// straddling the end of a carry read — its cut in the prefix, at the payload's
+/// start or in the payload — completes on the next read with what follows it.
 #[test]
-fn one_read_queues_every_frame_it_carries() {
-    let mut f = Feeder::new();
-    let payloads: Vec<Vec<u8>> = (0..16u8).map(|i| vec![i; 700]).collect();
-    let wire: Vec<u8> = payloads.iter().flat_map(|p| framed(p)).collect();
-
-    assert_eq!(f.feed(&wire), 1, "a 16-frame run must cost one read");
-    assert_eq!(f.frames, payloads, "every frame, in order");
-    assert!(
-        !f.deframer.is_mid_frame(),
-        "a fully consumed run leaves nothing buffered"
-    );
-}
-
-/// A frame larger than the carry takes the reads behind its first straight into
-/// its own buffer, and the stream parses from the carry again afterwards.
-#[test]
-fn a_frame_larger_than_the_carry_reads_into_its_own_buffer() {
-    let big = vec![0xC3u8; 2 * CARRY_BYTES + 500];
-    let small = vec![0x11u8; 300];
-    let mut wire = framed(&big);
-    wire.extend_from_slice(&framed(&small));
-
-    let mut f = Feeder::new();
-    assert_eq!(
-        f.feed(&wire),
-        3,
-        "one carry read, one direct read, one carry read for the tail"
-    );
-    assert_eq!(f.frames, vec![big, small]);
-    assert!(!f.deframer.is_mid_frame());
-}
-
-/// A frame straddling the end of a carry read completes on the next read, with
-/// whatever follows it — its cut in the prefix, at the payload's start or in
-/// the payload.
-#[test]
-fn a_frame_straddling_a_full_carry_completes_on_the_next_read() {
+fn a_run_of_frames_costs_the_reads_it_needs() {
     const P: usize = FRAME_LEN_PREFIX_BYTES;
-    for cut in 1..=P + 1 {
-        let payloads = vec![vec![0xA1u8; CARRY_BYTES - P - cut], vec![0xC3u8; 64]];
+    let mut cases: Vec<(Vec<Vec<u8>>, usize)> = vec![
+        ((0..16u8).map(|i| vec![i; 700]).collect(), 1),
+        (vec![vec![0xC3; 2 * CARRY_BYTES + 500], vec![0x11; 300]], 3),
+    ];
+    cases.extend((1..=P + 1).map(|cut| (vec![vec![0xA1; CARRY_BYTES - P - cut], vec![0xC3; 64]], 2)));
+    for (payloads, reads) in cases {
+        let at = payloads.iter().map(Vec::len).collect::<Vec<_>>();
         let wire: Vec<u8> = payloads.iter().flat_map(|p| framed(p)).collect();
         let mut f = Feeder::new();
-        assert_eq!(f.feed(&wire), 2, "cut={cut}");
-        assert_eq!(f.frames, payloads, "cut={cut}");
-        assert!(!f.deframer.is_mid_frame(), "cut={cut}");
+        assert_eq!(f.feed(&wire), reads, "{at:?}");
+        assert_eq!(f.frames, payloads, "{at:?}");
+        assert!(!f.deframer.is_mid_frame(), "{at:?}");
     }
 }
 

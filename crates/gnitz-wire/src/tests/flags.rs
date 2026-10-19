@@ -34,10 +34,19 @@ fn wire_flags_reject_unknown() {
     // Bits 32/33 are the control codec's, so the flags word neither refuses nor
     // carries them.
     assert_eq!(WireFlags::unpack(3 << 32), Ok(WireFlags::default()));
-    let bad_verb = (0..=u8::MAX).find(|&b| ClientVerb::from_wire(b).is_none()).unwrap();
-    let bad_mode = (0..=u8::MAX)
-        .find(|&b| WireConflictMode::from_wire(b).is_none())
-        .unwrap();
-    assert!(WireFlags::unpack(bad_verb as u64).is_err());
-    assert!(WireFlags::unpack((bad_mode as u64) << 8).is_err());
+    // The two-bit fields leave one value unused.
+    let probe = u64::from(crate::outside(WireProbeMode::from_wire));
+    let lane = u64::from(crate::outside(WireLane::from_wire));
+    assert!(probe < 4 && lane < 4, "a two-bit field holds no unknown value");
+    for (w, want) in [
+        (u64::from(crate::outside(ClientVerb::from_wire)), "unknown request verb"),
+        (
+            u64::from(crate::outside(WireConflictMode::from_wire)) << 8,
+            "unknown conflict mode",
+        ),
+        (probe << 36, "unknown probe mode"),
+        (lane << 38, "unknown lane"),
+    ] {
+        assert_eq!(WireFlags::unpack(w), Err(format!("flags: {want}").as_str()), "{w:#x}");
+    }
 }

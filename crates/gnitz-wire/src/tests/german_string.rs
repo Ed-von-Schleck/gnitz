@@ -26,6 +26,9 @@ fn roundtrip(s: &[u8], prefix: usize) {
         assert_eq!(blob.len(), prefix, "an inline payload must not touch the arena");
     }
     assert!(german_string_cell_ok(&st, &blob), "canonical cell rejected: {s:?}");
+    if s.is_empty() {
+        assert_eq!(st, [0u8; 16], "the empty string is the zero cell");
+    }
     let short = s.len() <= SHORT_STRING_THRESHOLD;
     assert_eq!(canonical_short_cell(&st), short.then_some(st));
     assert_eq!(german_string_short_ascii(&st), short && s.is_ascii());
@@ -52,35 +55,30 @@ fn roundtrip_across_length_boundaries() {
     }
 }
 
-/// A long cell overrunning its heap relocates to the canonical empty string,
-/// its prefix zeroed with its length: one left holding the corrupt cell's bytes
-/// would order apart from an empty string that reads the same.
+/// A relocated cell is rebuilt in canonical form: a long cell overrunning its
+/// heap becomes the empty string, its prefix zeroed with its length, and a
+/// skewed short-cell pad does not survive — either left as it was would order
+/// the cell apart from an equal-content one.
 #[test]
-fn relocate_overrunning_long_cell_becomes_clean_empty() {
-    let mut src_cell = [0u8; 16];
-    write_u32_le(&mut src_cell, 0, 20);
-    src_cell[4..8].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
-    write_u64_le(&mut src_cell, 8, 999);
-
-    let mut dst_blob: Vec<u8> = Vec::new();
-    let result = relocate_german_string(&src_cell, &[0u8; 4], &mut dst_blob);
-    assert_eq!(result, [0u8; 16]);
-    assert!(dst_blob.is_empty());
-    assert!(german_string_cell_ok(&result, &dst_blob));
-}
-
-/// A relocated short cell is rebuilt, so a skewed pad — which orders the cell
-/// apart from an equal-content one — does not survive.
-#[test]
-fn relocate_canonicalizes_pad_bytes() {
-    let mut dst_blob: Vec<u8> = Vec::new();
+fn relocation_rebuilds_each_cell_canonically() {
+    let mut overrun = encode_german_string(&[0xAB; 20], &mut Vec::new());
+    write_u64_le(&mut overrun, 8, 999);
+    let mut cases = vec![(overrun, [0u8; 16])];
     for content in [&b""[..], b"a", b"abc", b"abcd", b"abcdefghijkl"] {
         let clean = encode_german_string(content, &mut Vec::new());
         let mut dirty = clean;
         dirty[4 + content.len()..].fill(0xFF);
-        assert_eq!(relocate_german_string(&dirty, &[], &mut dst_blob), clean, "{content:?}");
+        cases.push((dirty, clean));
     }
-    assert!(dst_blob.is_empty(), "inline cells must not touch the blob");
+    let mut dst_blob = Vec::new();
+    for (src, want) in cases {
+        assert_eq!(
+            relocate_german_string(&src, &[0u8; 4], &mut dst_blob),
+            want,
+            "{src:02x?}"
+        );
+    }
+    assert!(dst_blob.is_empty());
 }
 
 /// A long cell's content lands wherever `place` puts it, its length and prefix
@@ -154,10 +152,10 @@ fn compare_corrupt_long_cell_degrades_to_empty_without_panic() {
 }
 
 /// `german_string_cell_ok` is "could `encode_german_string` have produced
-/// this?" — the round-trip above covers the acceptances. The two rejection cases are the ones the comparator's 4-byte
-/// prefix fast path can observe but `german_string_content` cannot — a cell
-/// that passes content-equality yet orders unequal would split one Z-set
-/// element's weight across two rows that consolidation never merges.
+/// this?". The rejections below are the ones the comparator's 4-byte prefix
+/// fast path can observe but `german_string_content` cannot — a cell that
+/// passes content-equality yet orders unequal would split one Z-set element's
+/// weight across two rows that consolidation never merges.
 #[test]
 fn cell_ok_accepts_canonical_and_rejects_compare_visible_corruption() {
     let mut blob = vec![0x7Fu8; 3];
@@ -172,9 +170,7 @@ fn cell_ok_accepts_canonical_and_rejects_compare_visible_corruption() {
     assert_ne!(
         compare_german_strings(&clean, Heap::Plain(&blob), &dirty, Heap::Plain(&blob)),
         Ordering::Equal,
-        "the pad is compare-visible — that is exactly what cell_ok must reject"
     );
-    assert!(german_string_cell_ok(&clean, &blob));
     assert!(!german_string_cell_ok(&dirty, &blob));
 
     // Short cell with a dirty suffix pad past the content — same story.
@@ -250,11 +246,4 @@ fn compare_matches_byte_order_across_classes_and_arenas() {
             }
         }
     }
-}
-
-#[test]
-fn the_empty_string_is_the_zero_cell() {
-    let mut blob = Vec::new();
-    assert_eq!(encode_german_string(&[], &mut blob), [0u8; 16]);
-    assert!(blob.is_empty());
 }

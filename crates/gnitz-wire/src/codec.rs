@@ -289,3 +289,7 @@ pub fn decode_all<'a, T>(
         .and_then(|v| r.expect_consumed().map(|()| v))
         .map_err(|e| format!("{ctx}: {e}"))
 }
+
+#[cfg(test)]
+#[path = "tests/codec.rs"]
+mod tests;

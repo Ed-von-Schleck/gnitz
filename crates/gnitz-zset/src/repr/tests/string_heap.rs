@@ -1,30 +1,5 @@
 use super::*;
 
-/// A relocated cell is rebuilt in canonical form: a malformed long cell becomes
-/// the empty string, and a skewed pad, which would split one element's weight
-/// across two rows, does not survive.
-#[test]
-fn relocation_rebuilds_each_cell_canonically() {
-    let mut malformed = gnitz_wire::encode_german_string(&[0xAB; 20], &mut Vec::new());
-    gnitz_wire::write_u64_le(&mut malformed, 8, 999);
-    let mut cases = vec![(malformed, gnitz_wire::encode_german_string(b"", &mut Vec::new()))];
-    for content in [&b""[..], b"a", b"abc", b"abcd", b"abcdefghijkl"] {
-        let clean = gnitz_wire::encode_german_string(content, &mut Vec::new());
-        let mut dirty = clean;
-        dirty[4 + content.len()..].fill(0xFF);
-        cases.push((dirty, clean));
-    }
-    let mut dst_blob = Vec::new();
-    for (src, want) in cases {
-        assert_eq!(
-            relocate_german_string_vec(&src, Heap::Plain(&[0; 4]), &mut dst_blob, None),
-            want,
-            "{src:02x?}"
-        );
-    }
-    assert!(dst_blob.is_empty());
-}
-
 /// A cache relocates each distinct span once.
 #[test]
 fn a_cached_relocation_copies_a_span_once() {

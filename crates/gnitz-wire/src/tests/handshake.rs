@@ -9,16 +9,6 @@ fn a_hello_is_checked_at_its_prefix_and_classified() {
     forged[0] ^= 1;
     assert_eq!(read_client_hello(&forged), Err(HelloError::Malformed));
     assert_eq!(read_client_hello(&HELLO[..7]), Err(HelloError::Malformed));
-
-    // The version is the little-endian word at offset 4, read before what follows it.
-    let mut other = server_hello(AuthStatus::Accepted);
-    other[4] ^= 1;
-    let want = HelloError::Version {
-        peer: WAL_FORMAT_VERSION ^ 1,
-        release: None,
-    };
-    assert_eq!(read_server_hello(&other[..HELLO.len()]), Err(want.clone()));
-    assert_eq!(read_client_hello(&other), Err(want));
 }
 
 #[test]
@@ -53,13 +43,15 @@ fn a_refusing_hello_names_its_release_to_a_client_of_another_version() {
     // From this build's own version the refusal carries no verdict.
     assert_eq!(read_server_hello(&refusal), Err(HelloError::Malformed));
 
+    // The version is the little-endian word at offset 4, read before what follows it.
     let mut other = refusal.clone();
     other[4] ^= 1;
     let peer = WAL_FORMAT_VERSION ^ 1;
     let want = HelloError::Version { peer, release: Some(RELEASE.to_string()) };
     assert_eq!(read_server_hello(&other), Err(want));
 
-    // What no release name is reads as a server naming none.
+    // What no release name is — a verdict byte from another version among
+    // them — reads as a server naming none.
     for rest in [&b""[..], b"\x01", b"0.1 8", &[b'9'; MAX_RELEASE_BYTES + 1], b"\xff\xfe"] {
         let hello = [&other[..HELLO.len()], rest].concat();
         assert_eq!(
@@ -68,23 +60,11 @@ fn a_refusing_hello_names_its_release_to_a_client_of_another_version() {
             "{rest:?}"
         );
     }
-    // A verdict byte from another version is no release either.
-    let mut verdict = server_hello(AuthStatus::Accepted);
-    verdict[4] ^= 1;
+    // A client's HELLO carries its token where a refusal carries a release.
+    let mut client = client_hello(b"gnitz_0.1.8");
+    client[4] ^= 1;
     assert_eq!(
-        read_server_hello(&verdict),
+        read_client_hello(&client),
         Err(HelloError::Version { peer, release: None })
     );
-}
-
-#[test]
-fn a_client_hello_of_another_version_names_no_release() {
-    // A client's HELLO carries its token where a refusal carries a release.
-    let mut other = client_hello(b"gnitz_0.1.8");
-    other[4] ^= 1;
-    let want = HelloError::Version {
-        peer: WAL_FORMAT_VERSION ^ 1,
-        release: None,
-    };
-    assert_eq!(read_client_hello(&other), Err(want));
 }
