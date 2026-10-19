@@ -77,16 +77,13 @@ fn index_key(cols: &[ColumnDef], key: &[u32], src_pk_count: usize, role: &str) -
 }
 
 /// The FK child-type rule: a child adopts the referenced type, so its type must
-/// equal it or hold a domain that fits inside it, and under DECIMAL adopting
-/// another scale would restate its values.
+/// equal it or be an integer whose domain fits inside it.
 fn check_fk_type_compat(fk_col_type: ColType, parent_col_type: ColType) -> Result<(), GnitzSqlError> {
-    let fits = fk_col_type.decimal_domains_match(parent_col_type)
-        && (fk_col_type.tc == parent_col_type.tc || fk_col_type.tc.int_domain_fits(parent_col_type.tc));
-    if !fits {
+    if fk_col_type != parent_col_type && !fk_col_type.tc.int_domain_fits(parent_col_type.tc) {
         return Err(GnitzSqlError::Rejected(format!(
             "FK type mismatch: column type {fk_col_type} cannot reference column type \
              {parent_col_type} — the child column adopts the referenced type, which would \
-             narrow or re-sign {fk_col_type}; declare the child with a type whose range \
+             narrow, re-sign or restate {fk_col_type}; declare the child with a type whose range \
              fits within {parent_col_type}",
         )));
     }

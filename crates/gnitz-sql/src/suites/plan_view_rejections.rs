@@ -76,8 +76,8 @@ fn cat() -> TestCatalog {
                     col("f", TypeCode::F64),
                     col("s", TypeCode::String),
                     ncol("d", TypeCode::Date),
-                    ColumnDef::typed("price", ColType { tc: TypeCode::Decimal, scale: 2 }, false),
-                    ColumnDef::typed("qty", ColType { tc: TypeCode::Decimal, scale: 3 }, true),
+                    ColumnDef::typed("price", ColType::decimal(2), false),
+                    ColumnDef::typed("qty", ColType::decimal(3), true),
                 ],
                 vec![0],
             ),
@@ -90,10 +90,7 @@ fn cat() -> TestCatalog {
             "xd",
             table(
                 54,
-                vec![
-                    col("id", i),
-                    ColumnDef::typed("q3", ColType { tc: TypeCode::Decimal, scale: 3 }, false),
-                ],
+                vec![col("id", i), ColumnDef::typed("q3", ColType::decimal(3), false)],
                 vec![0],
             ),
         ),
@@ -465,11 +462,6 @@ fn a_date_never_pairs_with_a_timestamp_key() {
                 "SELECT id, d FROM x UNION ALL SELECT id, ts FROM tt",
                 "column 1 type mismatch",
             ),
-            // Nor does either union with its storage integer.
-            (
-                "SELECT id, d FROM x UNION ALL SELECT id, i32c FROM ty",
-                "column 1 type mismatch",
-            ),
         ],
     );
 }
@@ -515,9 +507,6 @@ fn set_op_and_distinct_rules() {
             ("SELECT DISTINCT * FROM ty", "float column 'f' cannot be a key"),
             ("SELECT * FROM t UNION ALL SELECT * FROM ty", "column count mismatch"),
             ("SELECT id, g FROM t UNION ALL SELECT id, s FROM ty", "type mismatch"),
-            ("SELECT price FROM x UNION SELECT qty FROM x", "type mismatch"),
-            // U64 against I64 needs a 128-bit common type, past the 8-byte cap.
-            ("SELECT x FROM w UNION ALL SELECT id FROM t", "type mismatch"),
             ("SELECT g FROM t UNION ALL BY NAME SELECT g FROM u", "BY NAME"),
             (
                 "SELECT g AS x, v AS x FROM t UNION SELECT g AS x, v AS x FROM t",

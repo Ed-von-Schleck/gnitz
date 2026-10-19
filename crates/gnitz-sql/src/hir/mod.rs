@@ -525,9 +525,7 @@ impl JoinType {
         matches!(self, JoinType::Right | JoinType::Full)
     }
 
-    /// [`Self::preserves_left`] or [`Self::preserves_right`], selected by side —
-    /// for the emit loops that walk both sides of a null-fill uniformly and would
-    /// otherwise spell the same two-arm dispatch out per loop.
+    /// [`Self::preserves_left`] or [`Self::preserves_right`], selected by side.
     pub(crate) fn preserves(self, is_left: bool) -> bool {
         if is_left {
             self.preserves_left()
@@ -562,9 +560,7 @@ impl JoinType {
     /// Whether this side gets a **ν** — the unmatched set `w_P · [S = 0]`, its
     /// rows no row of the other side matches. Wider than [`Self::preserves`], which
     /// answers "emit an outer null-fill branch": `Semi`/`Anti`/`Mark` preserve
-    /// neither side yet all three decide per left row by match existence. The
-    /// reindex keep set protects the ν operands, so it asks this rather than
-    /// `preserves`.
+    /// neither side yet all three decide per left row by match existence.
     pub(crate) fn has_nu(self, is_left: bool) -> bool {
         self.preserves(is_left) || (is_left && self.is_decorrelated())
     }
@@ -601,9 +597,8 @@ pub(crate) struct JoinClass {
     pub range: Option<HirRange>,
 }
 
-/// Which physical join a join's keys call for. An enum rather than field probes
-/// at each site: a pure range join has an empty `eq` too, so probing `eq` first
-/// would read it as keyless and drop the range predicate.
+/// Which physical join a join's keys call for. A pure range join has an empty
+/// `eq`, as a keyless one does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinShape {
     Equi,
@@ -703,9 +698,6 @@ fn rename_key(key: Vec<ColId>, from: &[HirCol], to: &[HirCol]) -> Option<Vec<Col
 fn set_op_common_type(l: ColType, r: ColType) -> Option<ColType> {
     if l == r {
         return Some(l);
-    }
-    if !l.decimal_domains_match(r) || l.tc.is_temporal() || r.tc.is_temporal() {
-        return None;
     }
     let t = l.tc.join_key_common_type(r.tc).ok()?;
     let widens = |src: TypeCode| src.is_widening_promotion(t);
@@ -812,14 +804,23 @@ impl RelExpr {
     /// Columns no two live rows share a value of, each row at weight 1; `None` where
     /// the relation may be a bag.
     pub(crate) fn unique_key(&self) -> Option<Vec<ColId>> {
-        if let Some(mapped) = self.key_through(RelExpr::unique_key) {
-            return mapped;
-        }
         match self {
             RelExpr::Unit => Some(Vec::new()),
             RelExpr::Get { desc, cols } if !desc.pk_repeats => {
                 Some(desc.schema.pk_cols().iter().map(|&i| cols[i as usize].id).collect())
             }
+            RelExpr::Get { .. } => None,
+            // Rows of its input — a subset of them, or each once — under its
+            // input's identities.
+            RelExpr::Filter { input, .. } | RelExpr::TopN { input, .. } | RelExpr::Window { input, .. } => {
+                input.unique_key()
+            }
+            RelExpr::Project { input, items } => input
+                .unique_key()?
+                .iter()
+                .map(|k| items.iter().find(|it| as_col(&it.expr) == Some(*k)).map(|it| it.out.id))
+                .collect(),
+            RelExpr::Alias { input, cols } => rename_key(input.unique_key()?, &input.cols(), cols),
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
             RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
             // positive_part(A − B) ≤ A and min(A, B) ≤ A, B; a widened key stays a key.
@@ -831,9 +832,6 @@ impl RelExpr {
                     SetOpKind::Intersect => kept(left).or_else(|| kept(right)),
                 }
             }
-            // Rows of its input — a subset of them, or each once — under its
-            // input's identities.
-            RelExpr::TopN { input, .. } | RelExpr::Window { input, .. } => input.unique_key(),
             RelExpr::Join { left, right, kind, on } => match kind {
                 // One output row per left row.
                 k if k.is_decorrelated() => left.unique_key(),
@@ -841,23 +839,7 @@ impl RelExpr {
                 JoinType::Inner | JoinType::Right if on.side_unique(left, true) => right.unique_key(),
                 _ => None,
             },
-            _ => None,
         }
-    }
-
-    /// `key` of a pass-through node's input, renamed to this node's output ids —
-    /// `None` when `self` is not a filter, projection or alias.
-    fn key_through(&self, key: fn(&RelExpr) -> Option<Vec<ColId>>) -> Option<Option<Vec<ColId>>> {
-        Some(match self {
-            RelExpr::Filter { input, .. } => key(input),
-            RelExpr::Project { input, items } => key(input).and_then(|k| {
-                k.iter()
-                    .map(|k| items.iter().find(|it| as_col(&it.expr) == Some(*k)).map(|it| it.out.id))
-                    .collect()
-            }),
-            RelExpr::Alias { input, cols } => key(input).and_then(|k| rename_key(k, &input.cols(), cols)),
-            _ => return None,
-        })
     }
 
     /// A set operation, its sides' columns paired positionally at their common type

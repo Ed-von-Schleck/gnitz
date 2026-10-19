@@ -469,9 +469,10 @@ fn effective_order(call: &Call, key: Option<&[ColId]>) -> Vec<OrderCol> {
     order
 }
 
-/// The slots `offset .. offset + limit` a QUALIFY conjunct `rn <= n`, `rn < n`
-/// or `rn = n` over placeholder `rn` keeps of each partition, the literal on
-/// either side; `None` for any other predicate, or a bound keeping no slot.
+/// The `(limit, offset)` of the slots `offset .. offset + limit` a QUALIFY
+/// conjunct `rn <= n`, `rn < n` or `rn = n` over placeholder `rn` keeps of each
+/// partition, the literal on either side; `None` for any other predicate, or a
+/// bound keeping no slot.
 fn row_number_bound(conjunct: &HirExpr, rn: ColId) -> Option<(u64, u64)> {
     let BExpr::BinOp(l, op, r) = conjunct else {
         return None;
@@ -484,19 +485,19 @@ fn row_number_bound(conjunct: &HirExpr, rn: ColId) -> Option<(u64, u64)> {
         _ => return None,
     };
     // The row numbered `n` fills slot `n - 1`.
-    let (offset, limit) = match op {
-        BinOp::Le => (0, n),
-        BinOp::Lt => (0, n.saturating_sub(1)),
-        BinOp::Eq => (n.saturating_sub(1), 1),
+    let (limit, offset) = match op {
+        BinOp::Le => (n, 0),
+        BinOp::Lt => (n.saturating_sub(1), 0),
+        BinOp::Eq => (1, n.saturating_sub(1)),
         _ => return None,
     };
-    (n >= 1 && limit >= 1).then_some((offset as u64, limit as u64))
+    (n >= 1 && limit >= 1).then_some((limit as u64, offset as u64))
 }
 
 /// The body's top-N cut: a ROW_NUMBER with an order, bounded by one QUALIFY
 /// conjunct and read by nothing else — its index in `calls`, that conjunct's in
-/// `qualify`, and the slots `offset .. offset + limit` the bound keeps.
-fn top_n_cut(calls: &[Call], items: &[ProjEntry], qualify: &[HirExpr]) -> Option<(usize, usize, u64, u64)> {
+/// `qualify`, and the `(limit, offset)` the bound keeps.
+fn top_n_cut(calls: &[Call], items: &[ProjEntry], qualify: &[HirExpr]) -> Option<(usize, usize, (u64, u64))> {
     calls.iter().enumerate().find_map(|(ci, call)| {
         if call.func != WinFunc::RowNumber || call.order.is_empty() {
             return None;
@@ -507,13 +508,13 @@ fn top_n_cut(calls: &[Call], items: &[ProjEntry], qualify: &[HirExpr]) -> Option
             e.for_each_ref(&mut |id| found |= *id == rn);
             found
         };
-        let (qi, (offset, limit)) = qualify
+        let (qi, slots) = qualify
             .iter()
             .enumerate()
             .find_map(|(i, c)| Some((i, row_number_bound(c, rn)?)))?;
         let others = qualify.iter().enumerate().filter(|(i, _)| *i != qi).map(|(_, c)| c);
         let mut elsewhere = items.iter().map(|it| &it.expr).chain(others);
-        (!elsewhere.any(reads)).then_some((ci, qi, offset, limit))
+        (!elsewhere.any(reads)).then_some((ci, qi, slots))
     })
 }
 
@@ -590,10 +591,9 @@ fn desugar<L: ItemLeaf>(
         }
     }
 
-    let cut = top_n_cut(&calls, &items, &qualify).map(|(ci, qi, offset, limit)| {
+    let cut = top_n_cut(&calls, &items, &qualify).map(|(ci, qi, slots)| {
         qualify.remove(qi);
-        let call = calls.remove(ci);
-        (call.partition, call.order, limit, offset)
+        (calls.remove(ci), slots)
     });
 
     let mut specs: Vec<Spec> = Vec::new();
@@ -642,8 +642,8 @@ fn desugar<L: ItemLeaf>(
     for spec in specs.iter().filter(|s| !s.order.is_empty()) {
         rows = running_values(ids, rows, spec, &mut values)?;
     }
-    if let Some((partition, order, limit, offset)) = cut {
-        rows = RelExpr::top_n(rows, partition, order, limit, offset);
+    if let Some((call, (limit, offset))) = cut {
+        rows = RelExpr::top_n(rows, call.partition, call.order, limit, offset);
     }
     // Every unordered specification's `γ_P(W)`, joined onto an outer read of the
     // rows. One with no partition key is a keyless (cross) join against the one

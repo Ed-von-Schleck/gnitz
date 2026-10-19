@@ -33,9 +33,8 @@ fn with_options_carry_replicated_and_stream_independently() {
     );
 }
 
-/// A child adopts the referenced type: identity, an integer domain that fits
-/// inside it, or the same DECIMAL scale. The integer ladder itself is
-/// `int_domain_fits`'s own test.
+/// A child adopts the referenced type: identity, or an integer domain that fits
+/// inside it. The integer ladder itself is `int_domain_fits`'s own test.
 #[test]
 fn an_fk_child_type_must_fit_the_parent_type() {
     use TypeCode as T;
@@ -52,6 +51,12 @@ fn an_fk_child_type_must_fit_the_parent_type() {
         (t(T::UUID), t(T::U128), false),
         (t(T::U64), t(T::UUID), false),
         (t(T::F64), t(T::I64), false),
+        // A calendar type only by identity: adopting another would restate its
+        // values in another unit.
+        (t(T::Date), t(T::Date), true),
+        (t(T::Date), t(T::Timestamp), false),
+        (t(T::Date), t(T::I64), false),
+        (t(T::I32), t(T::Date), false),
         // A DECIMAL only at its own scale, never against an integer.
         (d(2), d(2), true),
         (d(2), d(3), false),

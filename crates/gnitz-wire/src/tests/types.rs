@@ -9,7 +9,8 @@ fn type_predicates_partition_the_type_table() {
     /// pk_eligible, serial_eligible)` — one row per `TypeCode`, one column per
     /// predicate. A SERIAL key is exactly the plain integers of at most 8 bytes:
     /// not a DATE's days, a DECIMAL's scaled units, nor a 16-byte type. A
-    /// BOOLEAN is stored as a fixed int and keys as one, and is no integer.
+    /// BOOLEAN, a DATE, a TIMESTAMP and a DECIMAL are stored as a fixed int and
+    /// key as one, and are no integer.
     type Row = (TypeCode, bool, bool, bool, bool, bool, bool, bool, bool);
     let table: &[Row] = &[
         (TypeCode::U8, true, false, true, false, false, false, true, true),
@@ -27,9 +28,9 @@ fn type_predicates_partition_the_type_table() {
         (TypeCode::UUID, false, false, false, false, false, true, true, false),
         (TypeCode::Blob, false, false, false, false, true, false, false, false),
         (TypeCode::I128, false, true, true, false, false, true, true, false),
-        (TypeCode::Date, true, true, true, false, false, false, true, false),
-        (TypeCode::Timestamp, true, true, true, false, false, false, true, false),
-        (TypeCode::Decimal, true, true, true, false, false, false, true, false),
+        (TypeCode::Date, true, true, false, false, false, false, true, false),
+        (TypeCode::Timestamp, true, true, false, false, false, false, true, false),
+        (TypeCode::Decimal, true, true, false, false, false, false, true, false),
         (TypeCode::Bool, true, false, false, false, false, false, true, false),
     ];
     assert_eq!(table.len(), TypeCode::ALL.len(), "a TypeCode variant is unclassified");
@@ -56,15 +57,14 @@ fn type_code_wire_names_are_distinct() {
     assert_eq!(names.len(), TypeCode::ALL.len(), "duplicate wire_name in ALL");
 }
 
-/// `[min, max]` of an integer type's values, read through its storage type;
-/// `None` for UUID, BOOLEAN and every non-integer.
+/// `[min, max]` of an integer type's values; `None` for every type stored as an
+/// integer without being one (UUID, BOOLEAN, DATE, TIMESTAMP, DECIMAL) and every
+/// non-integer.
 fn int_bounds(tc: TypeCode) -> Option<(i128, u128)> {
-    if tc == TypeCode::Bool {
-        return None;
-    }
-    match tc.storage_type() {
+    match tc {
         TypeCode::U128 => Some((0, u128::MAX)),
         TypeCode::I128 => Some((i128::MIN, i128::MAX as u128)),
+        TypeCode::Bool | TypeCode::Date | TypeCode::Timestamp | TypeCode::Decimal => None,
         t => FixedInt::from_type_code(t).map(|fi| {
             let (lo, hi) = fi.range();
             (lo, hi as u128)
@@ -72,9 +72,15 @@ fn int_bounds(tc: TypeCode) -> Option<(i128, u128)> {
     }
 }
 
-/// The bounds a type's key image spans: a UUID keys as the U128 it is stored as.
+/// The bounds a type's key image spans: its storage integer's, a UUID's the U128
+/// it is stored as.
 fn key_bounds(tc: TypeCode) -> (i128, u128) {
-    int_bounds(if tc == TypeCode::UUID { TypeCode::U128 } else { tc }).expect("an integer key type")
+    let storage = if tc == TypeCode::UUID {
+        TypeCode::U128
+    } else {
+        tc.storage_type()
+    };
+    int_bounds(storage).expect("an integer key type")
 }
 
 fn contains(outer: (i128, u128), inner: (i128, u128)) -> bool {

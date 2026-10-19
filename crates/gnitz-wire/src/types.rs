@@ -161,14 +161,14 @@ impl TypeCode {
         FixedInt::from_type_code(self).is_some()
     }
 
-    /// Whether this type is an **integer** of any width or sign —
-    /// [`Self::is_fixed_int`]'s domain plus the 128-bit pair. UUID shares U128's
-    /// width and is not one, and BOOLEAN is stored as an integer without being
-    /// one. The domain [`Self::int_domain_fits`] is defined on, where
-    /// `is_fixed_int`'s ≤ 8-byte scope would silently exclude a 128-bit column.
+    /// Whether this type is a plain **integer** of any width or sign. BOOLEAN, a
+    /// DATE's days, a TIMESTAMP's microseconds and a DECIMAL's scaled units are
+    /// each stored as an integer without being one, and UUID shares U128's width
+    /// without being one. The domain [`Self::int_domain_fits`] is defined on.
     #[inline(always)]
     const fn is_int(self) -> bool {
-        (self.is_fixed_int() && !matches!(self, TypeCode::Bool)) || matches!(self, TypeCode::U128 | TypeCode::I128)
+        use TypeCode::*;
+        matches!(self, U8 | I8 | U16 | I16 | U32 | I32 | U64 | I64 | U128 | I128)
     }
 
     /// Whether this type may be a PRIMARY KEY column: the scalars stored as an

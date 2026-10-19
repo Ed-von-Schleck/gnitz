@@ -1,12 +1,12 @@
 use super::*;
-use crate::test_support::{col, ncol, parse_stmt, table, TestCatalog};
-use gnitz_wire::TypeCode;
+use crate::test_support::{col, ncol, parse_stmt, rel, table, TestCatalog};
+use gnitz_wire::{RelClass, TypeCode};
 use sqlparser::ast::Statement;
 use std::rc::Rc;
 
-/// `t(id BIGINT PK, a BIGINT, b BIGINT NULL, f DOUBLE NULL)` and
-/// `u(uid BIGINT PK, a BIGINT)` — one catalog both a linear and a join body
-/// bind against.
+/// `t(id BIGINT PK, a BIGINT, b BIGINT NULL, f DOUBLE NULL)`,
+/// `u(uid BIGINT PK, a BIGINT)` and the stream `st(id BIGINT PK, a BIGINT)` —
+/// one catalog a linear, a join and a bag body bind against.
 fn catalog() -> TestCatalog {
     let i = TypeCode::I64;
     crate::test_support::catalog(vec![
@@ -19,27 +19,37 @@ fn catalog() -> TestCatalog {
             ),
         ),
         ("u", table(2, vec![col("uid", i), col("a", i)], vec![0])),
+        (
+            "st",
+            rel(
+                3,
+                RelClass::Stream,
+                vec![col("id", i), col("a", i)],
+                vec![0],
+                Vec::new(),
+            ),
+        ),
     ])
 }
 
-/// Bind one `CREATE VIEW` body.
-pub(in crate::hir) fn bound(sql: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
+/// Bind one `CREATE VIEW` body as a view binds it: its CTEs, then its query.
+pub(in crate::hir) fn bound(sql: &str) -> Rc<RelExpr> {
     let Statement::CreateView(cv) = parse_stmt(&format!("CREATE VIEW v AS {sql}")) else {
         panic!("not a CREATE VIEW");
     };
     let cat = catalog();
     let ids = ColIdGen::new();
-    let body = crate::validate::reject_query_envelope_body(&cv.query, "view body")?;
     let view = crate::hir::bind::ViewBody { stmt: "CREATE VIEW", replacing: None };
     let mut cx = BindCx::new(&cat, &ids, view);
-    bind_body(&mut cx, body)
+    bind_ctes(&mut cx, &cv.query)
+        .and_then(|()| bind_query(&mut cx, &cv.query))
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
 }
 
 /// `(name, type, nullable)` of every output column — what a projection item's
 /// def declares, and what the view schema publishes.
 fn shape(sql: &str) -> Vec<(String, TypeCode, bool)> {
     bound(sql)
-        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
         .cols()
         .iter()
         .map(|c| (c.def.name.clone(), c.def.ty.tc, c.def.is_nullable))
@@ -91,15 +101,11 @@ fn a_grouped_body_types_computed_keys_and_arguments() {
 /// The bound body's reduce, under its HAVING filter if any: its input, and the
 /// physical op of each aggregate column.
 fn reduce_of(sql: &str) -> (Rc<RelExpr>, Vec<gnitz_wire::AggFunc>) {
-    let rel = bound(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    let rel = bound(sql);
     let RelExpr::Project { input, .. } = rel.as_ref() else {
         panic!("{sql}: no projection")
     };
-    let input = match input.as_ref() {
-        RelExpr::Filter { input, .. } => input,
-        _ => input,
-    };
-    let RelExpr::Reduce { input, aggs, .. } = input.as_ref() else {
+    let RelExpr::Reduce { input, aggs, .. } = crate::hir::split_filter(input).1.as_ref() else {
         panic!("{sql}: no reduce")
     };
     (Rc::clone(input), aggs.iter().map(|c| c.op).collect())

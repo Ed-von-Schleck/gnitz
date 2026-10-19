@@ -4,7 +4,7 @@ use crate::hir::bind::tests::bound;
 /// The tree under a bound body's projection, a filter with its conjunct count,
 /// over `t` and `u` of the bind tests' catalog.
 fn tree(sql: &str) -> String {
-    let rel = bound(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    let rel = bound(sql);
     let RelExpr::Project { input, .. } = rel.as_ref() else {
         panic!("{sql}: no projection")
     };
@@ -30,7 +30,9 @@ fn render(rel: &RelExpr) -> String {
 /// Each conjunct lands as low as it is exact: a one-sided WHERE into an inner
 /// join's input or a LEFT join's preserved side, a LEFT join's ON into its
 /// null-supplying side, a FULL join's nowhere, an ON conjunct into the step whose
-/// input it names; a keying WHERE comparison keys a comma join.
+/// input it names; a keying WHERE comparison keys a comma join, and a range
+/// comparison is a join's one range key, a second staying above it. Past the
+/// key-arity cap a WHERE comparison stays a filter.
 #[test]
 fn each_conjunct_is_placed_as_low_as_it_is_exact() {
     for (sql, want) in [
@@ -57,6 +59,14 @@ fn each_conjunct_is_placed_as_low_as_it_is_exact() {
             "Join[eq=1](t, Filter[1](u))",
         ),
         (
+            "SELECT t.id FROM t RIGHT JOIN u ON t.a = u.a WHERE t.b > 5 AND u.uid > 1",
+            "Filter[1](Join[eq=1](t, Filter[1](u)))",
+        ),
+        (
+            "SELECT t.id FROM t RIGHT JOIN u ON t.a = u.a AND t.b > 5",
+            "Join[eq=1](Filter[1](t), u)",
+        ),
+        (
             "SELECT t.id FROM t FULL JOIN u ON t.a = u.a WHERE t.b > 5",
             "Filter[1](Join[eq=1](t, u))",
         ),
@@ -67,6 +77,20 @@ fn each_conjunct_is_placed_as_low_as_it_is_exact() {
         // A WHERE comparison whose pair cannot key stays a filter, where the same
         // pair in an ON is refused.
         ("SELECT t.id FROM t, u WHERE t.f = u.a", "Filter[1](Join[eq=0](t, u))"),
+        (
+            "SELECT t.id FROM t JOIN u ON t.a = u.a AND t.b < u.uid",
+            "Join[eq=1, range](t, u)",
+        ),
+        (
+            "SELECT t.id FROM t JOIN u ON t.a = u.a AND t.b < u.uid AND t.id > u.uid",
+            "Filter[1](Join[eq=1, range](t, u))",
+        ),
+        ("SELECT t.id FROM t, u WHERE t.b < u.uid", "Join[eq=0, range](t, u)"),
+        (
+            "SELECT t.id FROM t, u WHERE t.id = u.uid AND t.a = u.a AND t.b = u.uid AND t.id = u.a \
+             AND t.a = u.uid",
+            "Filter[1](Join[eq=4](t, u))",
+        ),
         // A pair already keyed is not keyed twice, in either orientation.
         (
             "SELECT t.id FROM t JOIN u ON t.a = u.a AND u.a = t.a",

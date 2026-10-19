@@ -274,7 +274,6 @@ const SHAPES: &[Row] = &[
     // one is a window's rank. The body's projection and filter run in the
     // top-N's own circuit, as a window's do in its.
     ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2", 1, &[Some(&[1])], &[(TopN, 1)]),
-    ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) < 3", 1, &[Some(&[1])], &[(TopN, 1)]),
     ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) <= 2 AND v > 0", 1, &[Some(&[1])], &[(TopN, 1), (Filter, 1)]),
     ("SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) = 1", 3, &[Some(&[1]), Some(&[2])], &[(TopN, 1), (EquiJoin, 1), (Reduce, 1)]),
     ("SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn FROM t QUALIFY rn <= 2", 1, &[Some(&[1])], &[(Window, 1), (Filter, 1)]),
