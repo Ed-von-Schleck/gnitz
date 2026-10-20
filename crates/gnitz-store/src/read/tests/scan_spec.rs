@@ -5,7 +5,7 @@ use crate::test_support::{
     relation_fixture, rows_spec, zset_of, RelationFixture, Rng, TID,
 };
 use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
-use gnitz_wire::{AggDescriptor, AggReadSpec, Cut, KeyRange, PkColList, ReadBound, ReadSink, SinkKind};
+use gnitz_wire::{AggDescriptor, AggReadSpec, KeyRange, PkColList, ReadBound, ReadSink, SinkKind};
 use gnitz_wire::{TypeCode, ViewBudget};
 use gnitz_zset::repr::{BatchBuilder, SourceCursor};
 use gnitz_zset::schema::SchemaColumn;
@@ -155,7 +155,7 @@ fn a_malformed_request_is_refused() {
     let schema = SchemaDescriptor::new(&[col(TypeCode::U64), col(TypeCode::I64), col(TypeCode::F64)], &[0]);
     let kind = RelationKind::View(ViewBudget::Plain);
     let r = relation_fixture(kind, schema, &[], []);
-    let walk = |c: u32| ReadSpec::all_rows(col_range(c, Cut::before(0), Cut::after(9)));
+    let walk = |c: u32| ReadSpec::all_rows(col_range(c, 0, 9));
     let own = schema.layout_digest();
     let two_slots = SchemaDescriptor::new(&[col(TypeCode::U64), col(TypeCode::I64), col(TypeCode::I64)], &[0]);
     let fold = ReadSpec {
@@ -214,11 +214,8 @@ fn keyed_reads_return_each_named_keys_whole_group() {
         (ReadBound::None, (0..10).collect()),
         (pk_set(&[2, 5, 7, 99]), vec![2, 5, 7]),
         (pk_set(&[7]), vec![7]),
-        (
-            pk_range(Cut::before(5), Cut::after(u64::MAX as u128)),
-            (5..10).collect(),
-        ),
-        (pk_range(Cut::before(5), Cut::before(8)), vec![5, 6, 7]),
+        (pk_range(5, u64::MAX as u128), (5..10).collect()),
+        (pk_range(5, 7), vec![5, 6, 7]),
         (
             ReadBound::Range(KeyRange::point(PkColList::from_slice(&[0]), &[], 7)),
             vec![7],
@@ -279,27 +276,15 @@ fn an_index_walk_returns_exactly_its_range() {
             .filter(|&id| walk_row(id).1.is_some_and(|b| b >= lo && b < hi))
             .collect()
     };
-    let (all_lo, all_hi) = (Cut::before(0), Cut::after(gnitz_wire::image_mask(8)));
-    // (column, start, end, walks the index, ids).
+    let (all_lo, all_hi) = (0, gnitz_wire::image_mask(8));
+    // (column, first, last, walks the index, ids).
     let walks = [
-        (
-            1,
-            Cut::after(img(-10)),
-            Cut::after(img(12)),
-            false,
-            vals(&|v| v > -10 && v <= 12),
-        ),
-        (1, Cut::after(img(-3)), Cut::after(img(1)), true, vec![31, 32, 33]),
-        (1, Cut::before(img(-31)), Cut::after(img(-31)), true, vec![1]),
+        (1, img(-9), img(12), false, vals(&|v| v > -10 && v <= 12)),
+        (1, img(-2), img(1), true, vec![31, 32, 33]),
+        (1, img(-31), img(-31), true, vec![1]),
         (1, all_lo, all_hi, false, vals(&|_| true)),
-        (
-            2,
-            Cut::before(3 << 70),
-            Cut::before(40 << 70),
-            false,
-            bigs(3 << 70, 40 << 70),
-        ),
-        (2, Cut::before(3 << 70), Cut::before(6 << 70), true, vec![3, 4, 5]),
+        (2, 3 << 70, (40 << 70) - 1, false, bigs(3 << 70, 40 << 70)),
+        (2, 3 << 70, (6 << 70) - 1, true, vec![3, 4, 5]),
     ];
     // A walk reply's ids, sorted, each at weight 1.
     let ids = |spec: ReadSpec| -> Vec<u64> {
@@ -539,7 +524,7 @@ impl SkeletonHydrator for Recompute {
 fn every_read_over_a_skeleton_store_answers_the_ingested_rows() {
     let r = skeleton_fixture();
     let layout = make_schema_u64_i64().layout_digest();
-    let pk_range = |start, end| col_range(0, Cut::before(start), Cut::after(end));
+    let pk_range = |first, last| col_range(0, first, last);
     let mut h = Recompute::default();
     let reads = [
         (ReadBound::None, (0..5).chain(100..105).collect()),

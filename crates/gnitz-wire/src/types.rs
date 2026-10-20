@@ -536,6 +536,21 @@ pub fn validate_pk_tuple(
     Ok(())
 }
 
+/// The rule an index key list `key` over a relation of `ncols` columns, `src_pk_len`
+/// of them its PK, must pass: an index key column is a PK column of the index, so
+/// the PK rule holds with nullability waived, and the index record — `key` then the
+/// source PK — keeps the PK arity limit.
+pub fn validate_index_key(
+    key: &[u32],
+    ncols: usize,
+    src_pk_len: usize,
+    type_code: impl Fn(u32) -> TypeCode,
+) -> Result<(), PkRule> {
+    validate_pk_tuple(key, ncols, crate::MAX_PK_COLUMNS - src_pk_len, |c| {
+        (type_code(c), false)
+    })
+}
+
 /// A fixed-width integer column type — ≤ 8 bytes, any sign. This is the exact
 /// domain on which "decode little-endian bytes → i64" is total. Construct via
 /// `from_type_code`; *holding* a `FixedInt` is proof the column is a narrow

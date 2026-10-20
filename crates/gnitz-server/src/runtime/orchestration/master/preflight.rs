@@ -28,7 +28,7 @@ use crate::catalog::{FkEdge, RowConstraints};
 use crate::runtime::committer::TxnFamily;
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::sys_rows::FkAction;
-use gnitz_wire::{PkBuf, PkKeys, ReadBound, WireConflictMode, WireStatus, MAX_PK_BYTES};
+use gnitz_wire::{PkBuf, PkKeys, ReadBound, WireConflictMode, WireStatus};
 use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::KeySpec;
 
@@ -310,10 +310,9 @@ impl<'a> TxnBundle<'a> {
         match self.get(tid).and_then(|t| t.fold.get(holder)).map(|e| e.last) {
             None => false,
             Some(FoldOp::Deleted) => true,
-            Some(FoldOp::Inserted(f, r)) => {
-                let mut own = [0u8; MAX_PK_BYTES];
-                !spec.write_span(self.mem(f), r as usize, &mut own) || own[..spec.key_size()] != *span
-            }
+            Some(FoldOp::Inserted(f, r)) => spec
+                .span(self.mem(f), r as usize)
+                .is_none_or(|own| own.pk_bytes() != span),
         }
     }
 }
@@ -556,16 +555,14 @@ fn plan_unique_checks<'a>(
 ) -> Result<(), WireFault> {
     for t in &b.tables {
         let tid = t.tid;
-        for &(col_indices, _, spec) in &t.cons.uniques {
+        for &(col_indices, spec) in &t.cons.uniques {
             let key_size = spec.key_size();
 
             let mut spans: Vec<u8> = Vec::with_capacity(t.fold.len() * key_size);
             for (_pk, fam, row) in b.surviving(tid) {
-                let at = spans.len();
-                spans.resize(at + key_size, 0);
                 // NULL in an indexed column ⇒ unindexed.
-                if !spec.write_span(b.mem(fam), row as usize, &mut spans[at..]) {
-                    spans.truncate(at);
+                if let Some(span) = spec.span(b.mem(fam), row as usize) {
+                    spans.extend_from_slice(span.pk_bytes());
                 }
             }
             let keys = PkKeys::from_keys(key_size, spans.chunks_exact(key_size));

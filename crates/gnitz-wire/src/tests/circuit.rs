@@ -32,8 +32,8 @@ fn sample(op: Opcode) -> OpNode {
             bound: crate::ReadBound::Range(crate::KeyRange::new(
                 crate::PkColList::from_slice(&[9, 3, 5]),
                 &[7, 11],
-                crate::Cut::after(4),
-                crate::Cut::before(90),
+                5,
+                89,
             )),
         },
         Opcode::ExchangeShard => OpNode::ExchangeShard,
@@ -212,7 +212,7 @@ fn each_opcode_cell_refuses_every_perturbation() {
 #[test]
 fn the_cell_layout_is_pinned_to_its_version() {
     let cells: Vec<u8> = Opcode::ALL.iter().flat_map(|&op| wired(sample(op)).encode()).collect();
-    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (12, 0x6651_e52e_9fc9_50d2));
+    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (13, 0xd27c_8648_462b_474a));
 }
 
 /// Every framing guard, against the forgery that trips it.

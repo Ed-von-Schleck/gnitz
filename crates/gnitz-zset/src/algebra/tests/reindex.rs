@@ -318,12 +318,11 @@ mod pack_proptest {
 }
 
 /// Over PKs of every suffix width and a nullable indexed column of every
-/// indexable width: the projection holds exactly the rows `write_span` admits,
+/// indexable width: the projection holds exactly the rows `KeySpec::span` admits,
 /// each as its span followed by its own PK, in source order — and `append_spans`
 /// the same rows' spans, zero to the end of a wider slot.
 #[test]
 fn index_entries_are_each_admitted_rows_span_and_pk() {
-    use crate::schema::MAX_PK_BYTES;
     use TypeCode::{I128, I16, I64, U128, U32, U64, U8};
     let mut rng = crate::test_support::Rng::new(0x1dc5);
     let pks: [&[TypeCode]; 6] = [&[U32, I64], &[U32], &[U64], &[U128], &[U64, U128], &[U128, U128]];
@@ -359,9 +358,8 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
                 .unwrap();
             let mut want: Vec<(Vec<u8>, i64)> = Vec::new();
             for row in 0..src.len() {
-                let mut e = [0u8; MAX_PK_BYTES];
-                if src.get_weight(row) != 0 && spec.write_span(&mb, row, &mut e) {
-                    let mut e = e[..spec.key_size()].to_vec();
+                if let Some(span) = spec.span(&mb, row).filter(|_| src.get_weight(row) != 0) {
+                    let mut e = span.pk_bytes().to_vec();
                     e.extend_from_slice(src.get_pk_bytes(row));
                     want.push((e, src.get_weight(row)));
                 }

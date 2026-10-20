@@ -33,12 +33,7 @@ fn ranked_of(sql: &str, schema: &Schema, indexes: &[RelIndex]) -> Vec<Ranked> {
 /// The range over the key list `cols` with `eq` pinned and the next column's
 /// image in `lo..=hi`.
 fn rng(cols: &[u32], eq: &[u128], lo: u128, hi: u128) -> ReadBound {
-    ReadBound::Range(KeyRange::new(
-        PkColList::from_slice(cols),
-        eq,
-        Cut::before(lo),
-        Cut::after(hi),
-    ))
+    ReadBound::Range(KeyRange::new(PkColList::from_slice(cols), eq, lo, hi))
 }
 
 /// The key set of `keys`, each the PK columns' native values in PK-list order.

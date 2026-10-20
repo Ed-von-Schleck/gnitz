@@ -174,6 +174,13 @@ fn validate_pk_tuple_names_each_rule() {
     ] {
         assert_eq!(check(pk, max), Err(want), "{pk:?}");
     }
+    // An index key waives nullability; its arity shares the limit with the source PK.
+    let index = |key: &[u32], src_pk_len| validate_index_key(key, cols.len(), src_pk_len, |c| cols[c as usize].0);
+    assert_eq!(index(&[4], crate::MAX_PK_COLUMNS - 1), Ok(()));
+    assert_eq!(
+        index(&[0, 4], crate::MAX_PK_COLUMNS - 1),
+        Err(PkRule::TooManyColumns { count: 2, max: 1 })
+    );
 }
 
 /// A rule names a column by the name its caller holds for it, and by its index

@@ -1,5 +1,4 @@
 use super::*;
-use crate::range::Cut;
 use crate::PkColList;
 use crate::TypeCode;
 use crate::{AggFunc, MAX_COLUMNS};
@@ -34,12 +33,7 @@ fn roundtrips_every_bound_against_every_sink() {
     let bounds = [
         ReadBound::None,
         // KeyRange shapes are `range`'s; one stands for them here.
-        ReadBound::Range(KeyRange::new(
-            PkColList::from_slice(&[1, 2]),
-            &[7],
-            Cut::before(1),
-            Cut::before(u128::MAX),
-        )),
+        ReadBound::Range(KeyRange::new(PkColList::from_slice(&[1, 2]), &[7], 1, u128::MAX - 1)),
         ReadBound::PkSet(keys(8)),
         ReadBound::PkSet(keys(crate::MAX_PK_BYTES)),
     ];
@@ -308,7 +302,7 @@ fn peek_bound_reads_only_the_routing_bounds() {
         .encode()
     };
 
-    let range = KeyRange::new(PkColList::from_slice(&[0, 1]), &[4], Cut::after(1), Cut::before(9));
+    let range = KeyRange::new(PkColList::from_slice(&[0, 1]), &[4], 2, 8);
     match peek_bound(&with(ReadBound::Range(range))) {
         Some(BoundPeek::Range(got)) => assert_eq!(got, range),
         _ => panic!("a Range peeks as itself"),

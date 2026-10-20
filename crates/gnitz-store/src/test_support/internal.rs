@@ -8,7 +8,7 @@ use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, 
 use crate::storage::{RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{
-    ComputeMap, Cut, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewBudget,
+    ComputeMap, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewBudget,
 };
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -172,9 +172,9 @@ pub(crate) fn between(col: u32, lo: i64, hi: i64) -> Vec<u8> {
     crate::test_support::cmp_all(&[(Ge, col, lo), (Lt, col, hi)]).to_blob_bytes()
 }
 
-/// The bound `start..end` over the one column `col`.
-pub(crate) fn col_range(col: u32, start: Cut, end: Cut) -> ReadBound {
-    ReadBound::Range(KeyRange::new(PkColList::from_slice(&[col]), &[], start, end))
+/// The bound `first..=last` over the one column `col`'s key images.
+pub(crate) fn col_range(col: u32, first: u128, last: u128) -> ReadBound {
+    ReadBound::Range(KeyRange::new(PkColList::from_slice(&[col]), &[], first, last))
 }
 
 /// One cut key: column `col`, NULLs last.

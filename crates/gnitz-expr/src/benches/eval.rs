@@ -397,7 +397,7 @@ fn is_null_arm_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn range_walk_bench() {
-    use gnitz_wire::{key_image, Cut, KeyRange, PkColList};
+    use gnitz_wire::{key_image, KeyRange, PkColList};
     let meter = Meter::new();
     let n = bench_rows();
     let schema = schema_pk_ints(1, true);
@@ -405,8 +405,8 @@ fn range_walk_bench() {
     let range = KeyRange::new(
         PkColList::from_slice(&[1]),
         &[],
-        Cut::before(key_image(TypeCode::I64, 100)),
-        Cut::after(key_image(TypeCode::I64, 600)),
+        key_image(TypeCode::I64, 100),
+        key_image(TypeCode::I64, 600),
     );
     let mut f = RowFilter::for_read(&[], Some(&range), &schema).expect("a walk");
     filter_verdicts(&mut f, &view);

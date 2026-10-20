@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{pk_only_schema, pk_payload_schema};
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-use gnitz_wire::{Cut, KeyRange, PkKeys, ReadBound, ReadSpec, TypeCode};
+use gnitz_wire::{KeyRange, PkKeys, ReadBound, ReadSpec, TypeCode};
 use std::num::NonZeroU64;
 
 const NW: usize = 4;
@@ -38,12 +38,12 @@ fn a_read_reaches_the_owners_its_bound_names() {
     let keyed = Placement::full_pk(&schema);
     let owner = |k: u64| keyed.owner(&k.to_be_bytes(), NW).unwrap();
     let set = |keys: &[u64]| ReadSpec::all_rows(pk_set(8, keys)).encode();
-    let range = |start, end| {
+    let range = |first, last| {
         ReadSpec::all_rows(ReadBound::Range(KeyRange::new(
             PkColList::from_slice(&[0]),
             &[],
-            start,
-            end,
+            first,
+            last,
         )))
         .encode()
     };
@@ -65,16 +65,10 @@ fn a_read_reaches_the_owners_its_bound_names() {
             "confined range",
             schema,
             keyed,
-            Some(range(Cut::before(42), Cut::after(42))),
+            Some(range(42, 42)),
             WorkerSet::one(owner(42)),
         ),
-        (
-            "empty range",
-            schema,
-            keyed,
-            Some(range(Cut::after(9), Cut::before(3))),
-            WorkerSet::one(0),
-        ),
+        ("empty range", schema, keyed, Some(range(10, 2)), WorkerSet::one(0)),
         ("one owner", schema, keyed, Some(set(&[42])), WorkerSet::one(owner(42))),
         ("empty set", schema, keyed, Some(set(&[])), WorkerSet::one(0)),
         ("Local", schema, Placement::Local, Some(set(&[0, b])), WorkerSet::ALL),

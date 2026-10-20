@@ -12,7 +12,7 @@ pub(crate) struct RangeMembership {
     /// The null-word bits of the list's payload columns: no index entry holds a NULL.
     null_mask: u64,
     /// Per bounded column, its admitted key images `lo ..= lo + span`: an equality
-    /// column is a span of 0. Empty when the cuts admit nothing.
+    /// column is a span of 0. Empty when the range admits nothing.
     bounds: Vec<(ColumnLocator, u128, u128)>,
     /// The instruction set the null exclusion's kernel runs at.
     pub(crate) level: Level,
@@ -35,21 +35,15 @@ impl RangeMembership {
         let range_col = locs[range.eq_vals().len()];
         let null_mask = locs.iter().fold(0, |m, l| m | l.null_bit());
         let mask = image_mask(range_col.size());
-        let (start, end) = (range.start.image & mask, range.end.image & mask);
-        let lo = if range.start.after {
-            start.checked_add(1)
-        } else {
-            Some(start)
-        };
-        let hi = if range.end.after { Some(end) } else { end.checked_sub(1) };
-        let bounds = match lo.zip(hi).filter(|(lo, hi)| lo <= hi) {
-            Some((lo, hi)) => locs
+        let (lo, hi) = (range.first & mask, range.last & mask);
+        let bounds = match lo <= hi {
+            true => locs
                 .iter()
                 .zip(range.eq_vals())
                 .map(|(&l, &v)| (l, v & image_mask(l.size()), 0))
                 .chain([(range_col, lo, hi - lo)])
                 .collect(),
-            None => Vec::new(),
+            false => Vec::new(),
         };
         Ok(RangeMembership { null_mask, bounds, level: Level::new() })
     }

@@ -5,7 +5,7 @@
 use gnitz_wire::snapshot::PageRequest;
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::{from_runs, from_runs_in_band, Batch};
-use gnitz_zset::schema::key::{key_range_between_cuts, KeyCut};
+use gnitz_zset::schema::key::KeyCut;
 
 use super::scan_spec::check_layout;
 use crate::relation::RelationRegistry;
@@ -34,8 +34,7 @@ impl RelationRegistry {
                     ));
                 }
                 // No key sorts above the greatest one.
-                let Some((start, _)) = key_range_between_cuts(KeyCut::above(after), KeyCut::above(&[]), after.len())
-                else {
+                let Some(start) = KeyCut::above(after).key(after.len()) else {
                     return Ok(Batch::empty_with_schema(&schema));
                 };
                 from_runs_in_band(runs, schema, cap, start.pk_bytes(), None)

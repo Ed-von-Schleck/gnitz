@@ -122,9 +122,9 @@ impl MasterDispatcher {
     pub(super) async fn ensure_unique_filters_warm(
         &self,
         table_id: u64,
-        uniques: &[(PkColList, SchemaDescriptor, KeySpec)],
+        uniques: &[(PkColList, KeySpec)],
     ) -> Result<(), WireFault> {
-        for &(cols, _, spec) in uniques {
+        for &(cols, spec) in uniques {
             if self.unique_filters.borrow().contains_key(&(table_id, cols)) {
                 continue;
             }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use gnitz_core::{RelDescriptor, RelName, Schema};
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::{Cut, KeyRange, ReadBound, ReadSpec, RelClass, RelIndex, TypeCode};
+use gnitz_wire::{KeyRange, ReadBound, ReadSpec, RelClass, RelIndex, TypeCode};
 use gnitz_zset::schema::encode_schema_block;
 use gnitz_zset_testkit::{encode_to_wire_vec, make_batch, make_schema_u64_i64};
 
@@ -95,7 +95,7 @@ fn copy_index_bench() {
             .map(|i| i * (ROWS / 2 - SELECTED) / READS)
             .map(|lo| {
                 let cols = PkColList::from_slice(&[1]);
-                let range = KeyRange::new(cols, &[], Cut::before(image(lo)), Cut::before(image(lo + SELECTED)));
+                let range = KeyRange::new(cols, &[], image(lo), image(lo + SELECTED - 1));
                 ReadSpec::all_rows(ReadBound::Range(range))
             })
             .collect();

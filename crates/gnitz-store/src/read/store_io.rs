@@ -84,10 +84,7 @@ fn open_range(entry: &Relation, r: KeyRange, cut: Cut) -> Result<(SourceCursor, 
     let schema = entry.schema();
     let table = entry.table();
     if r.walks_pk(schema.pk_cols()) {
-        let cursor = table.range_cursor(
-            gnitz_zset::schema::KeySpec::for_pk(&schema).range_keys(schema.pk_stride(), &r),
-            cut,
-        );
+        let cursor = table.range_cursor(gnitz_zset::schema::key::range_band(&schema, &r), cut);
         return Ok((SourceCursor::Full(Box::new(cursor)), None));
     }
     // An index holds a pending row's entry from its ingest on, so it is walked

@@ -91,7 +91,7 @@ impl Placement {
         if !range.walks_pk(schema.pk_cols()) {
             return None;
         }
-        let Some((start, end)) = key::KeySpec::for_pk(schema).range_keys(schema.pk_stride(), range) else {
+        let Some((start, end)) = key::range_band(schema, range) else {
             return Some(0);
         };
         let Placement::Keyed { dist_stride } = self else {

@@ -4,54 +4,31 @@ use crate::catalog::PK_LIST_MAX_COLS;
 use crate::codec::{Reader, Wire, Writer};
 use crate::{PkColList, PkListRole};
 
-const START_AFTER: u8 = 1 << 0;
-const END_AFTER: u8 = 1 << 1;
-
-/// A cut between adjacent key images ([`crate::key_image`]) of a column: below every
-/// entry whose image is `image`, or above them when `after`. The derived order is cut
-/// order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Cut {
-    pub image: u128,
-    pub after: bool,
-}
-
-impl Cut {
-    pub const fn before(image: u128) -> Cut {
-        Cut { image, after: false }
-    }
-
-    pub const fn after(image: u128) -> Cut {
-        Cut { image, after: true }
-    }
-}
-
 /// A range walk over the key list `cols`: the leading `eq_vals()` columns pinned to one
-/// image each, the next bounded by `[start, end)`. An empty or inverted interval walks
-/// nothing.
+/// key image ([`crate::key_image`]) each, the next bounded by the inclusive
+/// `[first, last]`. An inverted interval walks nothing.
 ///
-/// Wire layout (`10 + 16·(n_eq + 2)` bytes):
+/// Wire layout (`9 + 16·(n_eq + 2)` bytes):
 ///
 /// | bytes        | content                                                  |
 /// |--------------|----------------------------------------------------------|
 /// | 0            | `cols`, packed by `PkColList::pack`                     |
 /// | 8            | `n_eq` — count of equality-pinned leading columns        |
-/// | 9            | cut kinds: bit 0 start is `after`, bit 1 end is `after`  |
-/// | 10 + 16·i    | i-th equality image, LE `u128`                           |
-/// | then 16      | start cut image, LE `u128`                               |
-/// | then 16      | end cut image, LE `u128`                                 |
+/// | 9 + 16·i     | i-th equality image, LE `u128`                           |
+/// | then 16      | `first` image, LE `u128`                                 |
+/// | then 16      | `last` image, LE `u128`                                  |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyRange {
     cols: PkColList,
     eq: [u128; PK_LIST_MAX_COLS],
     n_eq: usize,
-    pub start: Cut,
-    pub end: Cut,
+    pub first: u128,
+    pub last: u128,
 }
 
 impl KeyRange {
     /// Panics when `eq` leaves no column of `cols` for the range.
-    pub fn new(cols: PkColList, eq: &[u128], start: Cut, end: Cut) -> Self {
+    pub fn new(cols: PkColList, eq: &[u128], first: u128, last: u128) -> Self {
         assert!(
             eq.len() < cols.as_slice().len(),
             "KeyRange: {} equality values leave no range column within its {} key columns",
@@ -64,14 +41,14 @@ impl KeyRange {
             cols,
             eq: vals,
             n_eq: eq.len(),
-            start,
-            end,
+            first,
+            last,
         }
     }
 
     /// `eq` pins the leading columns and the next column is exactly `v`.
     pub fn point(cols: PkColList, eq: &[u128], v: u128) -> Self {
-        KeyRange::new(cols, eq, Cut::before(v), Cut::after(v))
+        KeyRange::new(cols, eq, v, v)
     }
 
     pub fn cols(&self) -> PkColList {
@@ -98,18 +75,16 @@ impl KeyRange {
 
 impl Wire for KeyRange {
     fn write(&self, w: &mut Writer) {
-        let flags = ((self.start.after as u8) * START_AFTER) | ((self.end.after as u8) * END_AFTER);
-        w.u64(self.cols.pack()).u8(self.n_eq as u8).u8(flags);
+        w.u64(self.cols.pack()).u8(self.n_eq as u8);
         for v in self.eq_vals() {
             w.u128(*v);
         }
-        w.u128(self.start.image).u128(self.end.image);
+        w.u128(self.first).u128(self.last);
     }
 
     fn read(r: &mut Reader) -> Result<KeyRange, String> {
         let cols = PkColList::unpack(r.u64()?).map_err(|e| e.for_role(PkListRole::ColumnList))?;
         let n_eq = r.u8()? as usize;
-        let flags = r.flags(START_AFTER | END_AFTER)?;
         if n_eq >= cols.as_slice().len() {
             return Err(format!(
                 "{n_eq} equality values leave no range column within its {} key columns",
@@ -120,15 +95,8 @@ impl Wire for KeyRange {
         for slot in &mut eq[..n_eq] {
             *slot = r.u128()?;
         }
-        let start = Cut {
-            image: r.u128()?,
-            after: flags & START_AFTER != 0,
-        };
-        let end = Cut {
-            image: r.u128()?,
-            after: flags & END_AFTER != 0,
-        };
-        Ok(KeyRange { cols, eq, n_eq, start, end })
+        let (first, last) = (r.u128()?, r.u128()?);
+        Ok(KeyRange { cols, eq, n_eq, first, last })
     }
 }
 

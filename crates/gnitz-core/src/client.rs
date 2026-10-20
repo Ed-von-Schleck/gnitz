@@ -23,7 +23,7 @@ use gnitz_wire::sys_rows::{
 };
 use gnitz_wire::txn_frame::{kept_as, DeltaPollItem, BLIND};
 use gnitz_wire::{payload_bytes, payload_str, payload_u64};
-use gnitz_wire::{Circuit, ComputeMap, Cut, KeyRange, ReadBound, ReadSink, ReadSpec};
+use gnitz_wire::{Circuit, ComputeMap, KeyRange, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
     PkColList, TableProps, ViewProps, CIRCUIT_TAB, COL_TAB, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB,
     TABLE_TAB, VIEW_TAB,
@@ -1279,8 +1279,8 @@ impl GnitzClient {
                 let members = ReadSpec::all_rows(ReadBound::Range(KeyRange::new(
                     PkColList::from_slice(&[0]),
                     &[],
-                    Cut::before(base as u128),
-                    Cut::after(vid as u128),
+                    base as u128,
+                    vid as u128,
                 )));
                 let families = [VIEW_TAB, COL_TAB, CIRCUIT_TAB];
                 let rows = self.sys_cut(families, &members).await?;

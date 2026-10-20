@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use gnitz_core::{DeltaCursor, MirrorError, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
-use gnitz_wire::{Cut, KeyRange, PkColList, ReadBound, ReadSpec, RelClass, RelIndex};
+use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec, RelClass, RelIndex};
 use gnitz_zset::schema::{encode_schema_block, SchemaDescriptor};
 use gnitz_zset_testkit::{make_batch, make_schema_u128_i64, make_schema_u64_i64};
 use tempfile::TempDir;
@@ -370,12 +370,7 @@ fn a_failed_apply_erases_that_copy_and_spares_the_rest() {
 /// `v`: an index walk where the copy holds that index.
 fn v_range(store: &mut Mirror, tid: u64, lo: i64, hi: i64) -> BTreeMap<(u64, i64), i64> {
     let image = |v: i64| gnitz_wire::key_image(gnitz_wire::TypeCode::I64, v as u64 as u128);
-    let range = KeyRange::new(
-        PkColList::from_slice(&[1]),
-        &[],
-        Cut::before(image(lo)),
-        Cut::after(image(hi)),
-    );
+    let range = KeyRange::new(PkColList::from_slice(&[1]), &[], image(lo), image(hi));
     let batch = store
         .scan_spec(tid, ReadSpec::all_rows(ReadBound::Range(range)), &view_schema())
         .expect("a range read of a held copy");

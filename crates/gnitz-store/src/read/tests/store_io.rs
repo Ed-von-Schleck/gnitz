@@ -4,7 +4,7 @@ use crate::test_support::{
     batch_rows, col_range, img, make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture, zset_of,
     RelationFixture, Rng, TID,
 };
-use gnitz_wire::{image_mask, opk_bias, Cut, PkColList, ReadSpec, TypeCode, ViewBudget};
+use gnitz_wire::{image_mask, opk_bias, PkColList, ReadSpec, TypeCode, ViewBudget};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -24,7 +24,7 @@ fn x10(id: u64) -> i64 {
 
 /// The bound `val ∈ [lo, hi)`.
 fn val_range(lo: i64, hi: i64) -> ReadBound {
-    col_range(1, Cut::before(img(lo)), Cut::before(img(hi)))
+    col_range(1, img(lo), img(hi - 1))
 }
 
 /// Drain a cursor to its `(id, weight, val)` rows, `chunk` rows at a time so a chunk
@@ -58,7 +58,7 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
     // later chunk's first probe sorts below it: a backward re-seek.
     let anti = |id: u64| (NBASE - id) as i64 * 10;
     let point = ReadBound::Range(KeyRange::point(PkColList::from_slice(&[1]), &[], img(730)));
-    let inverted = col_range(1, Cut::after(img(900)), Cut::before(img(300)));
+    let inverted = col_range(1, img(901), img(299));
     // (val_of, indexed, bound, walks the index, ids).
     let x10: fn(u64) -> i64 = x10;
     let cases = [
@@ -257,37 +257,34 @@ fn a_composite_range_reads_exactly_the_rows_its_bounds_admit() {
             let eq: Vec<u128> = (0..n_eq)
                 .map(|ci| at[ci].or_else(|| image(&mut rng, ci)).unwrap_or(0))
                 .collect();
-            let cut = |rng: &mut Rng| {
+            let bound = |rng: &mut Rng| {
                 let (_, other) = &live[pick(rng, live.len())];
                 let img = match rng.gen_range(2) {
                     0 => at[n_eq].or(other[n_eq]),
                     _ => image(rng, n_eq),
                 };
-                Cut {
-                    image: img.unwrap_or(0),
-                    after: rng.gen_range(2) == 0,
-                }
+                img.unwrap_or(0)
             };
-            let (start, end) = match rng.gen_range(4) {
+            let (first, last) = match rng.gen_range(4) {
                 0 => {
-                    let at = cut(&mut rng).image;
-                    (Cut::before(at), Cut::after(at))
+                    let at = bound(&mut rng);
+                    (at, at)
                 }
                 // One in two inverted.
-                1 => (cut(&mut rng), cut(&mut rng)),
+                1 => (bound(&mut rng), bound(&mut rng)),
                 _ => {
-                    let (a, b) = (cut(&mut rng), cut(&mut rng));
+                    let (a, b) = (bound(&mut rng), bound(&mut rng));
                     (a.min(b), a.max(b))
                 }
             };
-            let range = KeyRange::new(PkColList::from_slice(&ix_cols), &eq, start, end);
+            let range = KeyRange::new(PkColList::from_slice(&ix_cols), &eq, first, last);
             let admitted: Vec<_> = live
                 .iter()
                 .filter(|(_, imgs)| {
                     let Some(imgs) = imgs.iter().copied().collect::<Option<Vec<u128>>>() else {
                         return false;
                     };
-                    imgs[..n_eq] == eq[..] && start <= Cut::before(imgs[n_eq]) && Cut::after(imgs[n_eq]) <= end
+                    imgs[..n_eq] == eq[..] && first <= imgs[n_eq] && imgs[n_eq] <= last
                 })
                 .map(|row| (row.clone(), 1))
                 .collect();

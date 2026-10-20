@@ -4,7 +4,7 @@ use gnitz_core::block_on;
 use std::hint::black_box;
 
 use gnitz_foundation::perf;
-use gnitz_wire::{key_image, Cut, KeyRange, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode};
+use gnitz_wire::{key_image, KeyRange, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode};
 
 /// One row of the cost table: `calls` runs of `f` on `client`, as what one of
 /// them costs the calling thread — user-space instructions retired, parks and
@@ -52,12 +52,7 @@ fn mirror_call_cost_bench() {
         .iter()
         .flat_map(|&v| (image(v) as u64).to_be_bytes())
         .collect();
-    let band = KeyRange::new(
-        PkColList::from_slice(&[0, 1]),
-        &[],
-        Cut::after(image(900)),
-        Cut::before(image(940)),
-    );
+    let band = KeyRange::new(PkColList::from_slice(&[0, 1]), &[], image(901), image(939));
     let reads = [
         ("point", ReadBound::PkSet(PkKeys::from_sorted(point.len(), point)), 1),
         ("range", ReadBound::Range(band), 39),

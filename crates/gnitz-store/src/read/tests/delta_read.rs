@@ -8,7 +8,7 @@ use crate::test_support::{
     pk_only_schema, pk_payload_schema, relation_fixture, relation_fixture_with, rows_spec, Rng, TID,
 };
 use gnitz_expr::{CmpOp, LogicalProgram};
-use gnitz_wire::{Cut, PkKeys, ReadSink, TypeCode, ViewBudget};
+use gnitz_wire::{PkKeys, ReadSink, TypeCode, ViewBudget};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_zset_testkit::{zset_of, RowKey};
@@ -155,7 +155,7 @@ fn cases() -> Vec<Case> {
     // Most keys the model draws: under the lagging subscriber's rounds, more
     // probes than a keyed read gathers, so it walks the band.
     let wide: Vec<(i64, u64)> = (-3..=3).flat_map(|k2| (0..5).map(move |k1| (k2, k1))).collect();
-    let range = col_range(3, Cut::before(img(-1)), Cut::before(img(2)));
+    let range = col_range(3, img(-1), img(1));
     let none = || ReadBound::None;
     vec![
         case("identity", none(), vec![], false, Box::new(|_| true)),

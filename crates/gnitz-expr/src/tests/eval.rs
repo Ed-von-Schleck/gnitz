@@ -557,7 +557,7 @@ fn int_results_widen_by_the_result_registers_signedness() {
 /// A read's filter keeps the rows passing both its predicate and its walk.
 #[test]
 fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
-    use gnitz_wire::{key_image, Cut, KeyRange, PkColList};
+    use gnitz_wire::{key_image, KeyRange, PkColList};
     let schema = schema_pk_ints(1, true);
     let v_gt_3 = crate::LogicalProgram::new(
         vec![
@@ -570,7 +570,7 @@ fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
     )
     .to_blob_bytes();
     let null = |row: usize| row.is_multiple_of(5);
-    let walk = |col: u32, start, end| Some(KeyRange::new(PkColList::from_slice(&[col]), &[], start, end));
+    let walk = |col: u32, first, last| Some(KeyRange::new(PkColList::from_slice(&[col]), &[], first, last));
     let p = |x| key_image(TypeCode::I64, FixedInt::I64.pack(x));
     type Keep<'a> = &'a dyn Fn(usize) -> bool;
     let preds: [(&str, &[u8], Keep<'_>); 2] = [
@@ -579,10 +579,8 @@ fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
     ];
     let bounds: [(&str, Option<KeyRange>, Keep<'_>); 3] = [
         ("full scan", None, &|_| true),
-        ("pk in [3, 80]", walk(0, Cut::before(3), Cut::after(80)), &|row| {
-            (2..80).contains(&row)
-        }),
-        ("v in [6, 12)", walk(1, Cut::before(p(6)), Cut::before(p(12))), &|row| {
+        ("pk in [3, 80]", walk(0, 3, 80), &|row| (2..80).contains(&row)),
+        ("v in [6, 11]", walk(1, p(6), p(11)), &|row| {
             (6..12).contains(&row) && !null(row)
         }),
     ];

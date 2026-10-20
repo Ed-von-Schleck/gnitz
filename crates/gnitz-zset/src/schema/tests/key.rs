@@ -3,7 +3,7 @@ use crate::repr::BatchBuilder;
 use crate::schema::MAX_PK_BYTES;
 use crate::test_support::Rng;
 use crate::test_support::{edge_native, pk_only_schema, random_schema};
-use gnitz_wire::{cmp_col_window, key_image};
+use gnitz_wire::{cmp_col_window, key_image, PkColList};
 
 /// Every byte primitive over OPK keys, at every PK width and over key pairs
 /// sharing a prefix of every length: each packs, compares or sort-keys exactly
@@ -39,9 +39,8 @@ fn opk_byte_primitives_agree_with_memcmp_at_every_width() {
 /// Over random schemas — any column types and nullability, the PK anywhere and
 /// in any order — and a random list of distinct PK-eligible columns within the
 /// arity budget, PK or nullable payload, over rows of edge values:
-/// - a base table's own span of a row is its PK region;
-/// - `write_span` skips exactly the rows NULL in an indexed column, and
-///   otherwise writes the seek prefix of the indexed values' key images;
+/// - `span` skips exactly the rows NULL in an indexed column, and is otherwise
+///   the band start a point walk over the indexed values' key images seeks to;
 /// - spans `memcmp` as the indexed values' typed lexicographic order;
 /// - the span schema is the key columns at their own types, the index schema
 ///   those then the source PK, so an entry splits at the span's width.
@@ -83,14 +82,6 @@ fn key_spans_encode_the_typed_order_of_their_columns() {
         let b = bb.finish();
         let mb = b.as_mem_batch();
 
-        let own = KeySpec::for_pk(&s);
-        assert_eq!(own.span_schema(), s.pk_only(), "{s:?}");
-        for row in 0..b.len() {
-            let mut span = [0u8; MAX_PK_BYTES];
-            assert!(own.write_span(&mb, row, &mut span), "{s:?}");
-            assert_eq!(&span[..own.key_size()], mb.get_pk_bytes(row), "{s:?} row={row}");
-        }
-
         let budget = MAX_PK_COLUMNS - s.pk_cols().len();
         if budget == 0 {
             continue;
@@ -102,7 +93,9 @@ fn key_spans_encode_the_typed_order_of_their_columns() {
         cols.truncate(1 + rng.gen_range(budget.min(cols.len()) as u64) as usize);
         let spec = KeySpec::new(&cols, &s).unwrap();
         let types: Vec<TypeCode> = cols.iter().map(|&c| tc(c as usize)).collect();
-        assert_eq!(spec.span_schema(), pk_only_schema(&types), "{s:?} {cols:?}");
+        let span_schema = spec.span_schema();
+        assert_eq!(span_schema, pk_only_schema(&types), "{s:?} {cols:?}");
+        let span_cols: Vec<u32> = (0..cols.len() as u32).collect();
         let src_pk = s.pk_columns().map(|(c, _)| tc(c));
         let index = spec.index_schema(&s);
         assert_eq!(index, pk_only_schema(&[types.clone(), src_pk.collect()].concat()));
@@ -111,19 +104,20 @@ fn key_spans_encode_the_typed_order_of_their_columns() {
         let key = |row: usize| -> Option<Vec<u128>> { cols.iter().map(|&c| natives[row][c as usize]).collect() };
         let mut spans: Vec<(Vec<u128>, Vec<u8>)> = Vec::new();
         for row in 0..b.len() {
-            let mut span = [0u8; MAX_PK_BYTES];
-            let written = spec.write_span(&mb, row, &mut span);
+            let span = spec.span(&mb, row);
             let want = key(row);
             assert_eq!(
-                written,
+                span.is_some(),
                 want.is_some(),
                 "{s:?} {cols:?} row={row}: only a NULL row is skipped"
             );
-            if let Some(vals) = want {
+            if let (Some(span), Some(vals)) = (span, want) {
                 let images: Vec<u128> = vals.iter().zip(&types).map(|(&v, &t)| key_image(t, v)).collect();
-                let span = span[..spec.key_size()].to_vec();
-                assert_eq!(span, spec.seek_prefix(&images).pk_bytes(), "{s:?} {cols:?} row={row}");
-                spans.push((vals, span));
+                let (&last, eq) = images.split_last().unwrap();
+                let point = KeyRange::point(PkColList::from_slice(&span_cols), eq, last);
+                let (start, _) = range_band(&span_schema, &point).expect("a point walk holds its key");
+                assert_eq!(span.pk_bytes(), start.pk_bytes(), "{s:?} {cols:?} row={row}");
+                spans.push((vals, span.pk_bytes().to_vec()));
             }
         }
         for (va, sa) in &spans {

@@ -4,7 +4,7 @@
 use gnitz_store::relation::Relation;
 use gnitz_wire::sys_rows::FkAction;
 use gnitz_wire::PkColList;
-use gnitz_zset::schema::{KeySpec, SchemaDescriptor};
+use gnitz_zset::schema::KeySpec;
 
 use super::CatalogEngine;
 
@@ -30,7 +30,7 @@ pub(crate) struct FkEdge {
 pub(crate) struct RowConstraints {
     pub(crate) fks_as_child: Vec<FkEdge>,
     pub(crate) fks_as_parent: Vec<FkEdge>,
-    pub(crate) uniques: Vec<(PkColList, SchemaDescriptor, KeySpec)>,
+    pub(crate) uniques: Vec<(PkColList, KeySpec)>,
 }
 
 impl RowConstraints {
@@ -97,7 +97,7 @@ impl CatalogEngine {
             fks_as_parent: as_parent.to_vec(),
             uniques: rel.map_or_else(Vec::new, |r| {
                 r.unique_indexes_to_check()
-                    .map(|ic| (ic.cols(), ic.schema(), ic.key_spec()))
+                    .map(|ic| (ic.cols(), ic.key_spec()))
                     .collect()
             }),
         }

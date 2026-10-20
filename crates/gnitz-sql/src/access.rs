@@ -7,7 +7,7 @@ use crate::ir::{BExpr, BinOp, BoundExpr};
 use crate::literal::{place, Compared, Placed};
 use gnitz_core::Schema;
 use gnitz_expr::CmpOp;
-use gnitz_wire::{image_mask, key_image, Cut, KeyRange, PkColList, PkKeys, ReadBound};
+use gnitz_wire::{image_mask, key_image, KeyRange, PkColList, PkKeys, ReadBound};
 use gnitz_wire::{RelIndex, TypeCode, PK_LIST_MAX_COLS};
 use std::cmp::Reverse;
 use std::ops::RangeInclusive;
@@ -175,7 +175,7 @@ fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option
             consumed.extend(f.consumed);
             let (&first, &last) = (f.admits.start(), f.admits.end());
             let sides = (first != 0) as u32 + (last != max) as u32;
-            (KeyRange::new(cols, &eq, Cut::before(first), Cut::after(last)), sides)
+            (KeyRange::new(cols, &eq, first, last), sides)
         }
         None => {
             let (&last, init) = eq.split_last()?;

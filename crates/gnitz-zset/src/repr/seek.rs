@@ -105,13 +105,7 @@ pub(crate) unsafe fn seek_pk_rows(count: usize, stride: usize, pk: ColPtr, key: 
 /// group is short and a gallop would cost more.
 #[inline]
 pub fn pk_group_end<S: RowSource>(src: &S, start: usize) -> usize {
-    let k = src.get_pk_bytes(start);
-    let count = src.row_count();
-    let mut j = start + 1;
-    while j < count && crate::schema::key::pk_bytes_eq(src.get_pk_bytes(j), k) {
-        j += 1;
-    }
-    j
+    pk_prefix_group_end(src, start, src.get_pk_bytes(start).len())
 }
 
 /// [`pk_group_end`] over a leading `width`-byte key prefix rather than the whole

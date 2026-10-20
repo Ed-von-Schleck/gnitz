@@ -12,9 +12,7 @@ use crate::relation::{Cut as At, RelationKind};
 use crate::test_support::{cmp_all, col_range, cut, id_rows, img, map_of, order_by, relation_fixture, rows_spec};
 use crate::test_support::{RelationFixture, TID};
 use gnitz_expr::{CmpOp, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Sink};
-use gnitz_wire::{
-    AggDescriptor, AggFunc, AggReadSpec, ComputeMap, Cut, ReadBound, ReadSink, ReadSpec, SinkKind, TypeCode,
-};
+use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, ComputeMap, ReadBound, ReadSink, ReadSpec, SinkKind, TypeCode};
 use gnitz_zset::repr::{BatchBuilder, SourceCursor};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -153,7 +151,7 @@ fn scan_spec_bench() {
         ("range, index walk", ROWS / 16, true),
         ("range, filtered scan", ROWS / 16 + 1, false),
     ] {
-        let bound = col_range(3, Cut::before(img(0)), Cut::before(img(width as i64)));
+        let bound = col_range(3, img(0), img(width as i64 - 1));
         let (source, _) = r.open_bound(TID, bound.clone(), At::Now).unwrap();
         assert_eq!(matches!(source, SourceCursor::Bounded(_)), walks, "{label}");
         cell(label, &r, ReadSpec::all_rows(bound), width, width);

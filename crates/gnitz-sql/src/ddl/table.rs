@@ -61,9 +61,7 @@ fn is_auto_name(name: &str, base: &str) -> bool {
     }
 }
 
-/// The column list of an index over `key`, or why no index can be built on it: an
-/// index key column is a PK column of the index, nullable or not, and the index
-/// record — `key` then the source PK — keeps the PK arity limit.
+/// The column list of an index over `key`, or why no index can be built on it.
 fn index_key(cols: &[ColumnDef], key: &[u32], src_pk_count: usize, role: &str) -> Result<PkColList, GnitzSqlError> {
     let rejected = |rule: gnitz_wire::PkRule| {
         let named = rule.named(PkListRole::ColumnList, |c| {
@@ -71,8 +69,7 @@ fn index_key(cols: &[ColumnDef], key: &[u32], src_pk_count: usize, role: &str) -
         });
         GnitzSqlError::Rejected(format!("{role}: {named}"))
     };
-    let max = gnitz_wire::MAX_PK_COLUMNS - src_pk_count;
-    gnitz_wire::validate_pk_tuple(key, cols.len(), max, |c| (cols[c as usize].ty.tc, false)).map_err(rejected)?;
+    gnitz_wire::validate_index_key(key, cols.len(), src_pk_count, |c| cols[c as usize].ty.tc).map_err(rejected)?;
     PkColList::checked(key, cols.len()).map_err(rejected)
 }
 

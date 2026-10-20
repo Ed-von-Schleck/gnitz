@@ -18,23 +18,16 @@ fn cols(c: &[u32]) -> PkColList {
 #[test]
 fn roundtrips_every_shape() {
     let shapes = [
-        KeyRange::new(cols(&[0]), &[], Cut::after(10), Cut::after(u64::MAX as u128)), // x > 10
-        KeyRange::new(cols(&[2]), &[], Cut::before(0), Cut::after(20)),               // x <= 20
-        KeyRange::new(cols(&[1, 2]), &[7], Cut::before(1), Cut::before(u128::MAX)),
-        KeyRange::new(cols(&[3, 0, 1, 2]), &[1, 2, 3], Cut::after(10), Cut::before(50)), // max arity
-        KeyRange::new(cols(&[0]), &[], Cut::after(5), Cut::after(5)),                    // empty
+        KeyRange::new(cols(&[0]), &[], 11, u64::MAX as u128), // x > 10
+        KeyRange::new(cols(&[2]), &[], 0, 20),                // x <= 20
+        KeyRange::new(cols(&[1, 2]), &[7], 1, u128::MAX),
+        KeyRange::new(cols(&[3, 0, 1, 2]), &[1, 2, 3], 11, 49), // max arity
+        KeyRange::new(cols(&[0]), &[], 6, 5),                   // empty
         KeyRange::point(cols(&[4, 5]), &[u128::MAX], 0),
     ];
     for r in shapes {
         assert_eq!(dec(&enc(&r)), Ok(r), "{r:?}");
     }
-}
-
-#[test]
-fn cut_order_is_image_then_kind() {
-    assert!(Cut::before(5) < Cut::after(5));
-    assert!(Cut::after(5) < Cut::before(6));
-    assert!(Cut::after(u128::MAX - 1) < Cut::before(u128::MAX));
 }
 
 #[test]
@@ -57,16 +50,12 @@ fn walks_pk_iff_the_list_leads_the_pk() {
 
 #[test]
 fn decode_rejects_malformed() {
-    let good = enc(&KeyRange::new(cols(&[1, 2]), &[7], Cut::before(1), Cut::after(2)));
+    let good = enc(&KeyRange::new(cols(&[1, 2]), &[7], 1, 2));
     assert!(dec(&good).is_ok());
     // Truncation anywhere.
     for n in 0..good.len() {
         assert!(dec(&good[..n]).is_err(), "truncated to {n}");
     }
-    // Unknown flag bits.
-    let mut stray = good.clone();
-    stray[9] |= 1 << 4;
-    assert!(dec(&stray).is_err());
     // An equality prefix leaving no range column, up to the byte's maximum.
     for n_eq in [2u8, 3, 255] {
         let mut bad = good.clone();
@@ -84,5 +73,5 @@ fn decode_rejects_malformed() {
 #[test]
 #[should_panic(expected = "leave no range column")]
 fn new_refuses_an_equality_prefix_over_every_column() {
-    KeyRange::new(cols(&[1, 2]), &[7, 8], Cut::before(0), Cut::after(0));
+    KeyRange::new(cols(&[1, 2]), &[7, 8], 0, 0);
 }

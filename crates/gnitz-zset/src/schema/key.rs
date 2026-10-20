@@ -1,21 +1,19 @@
 //! Order-preserving primary-key (OPK) primitives.
 //!
 //! These pure layout/key operations compare two OPK regions in byte order,
-//! pack a region into a fixed-width sort key, derive the half-open key range a
-//! `KeyRange`'s cut pair denotes, and compose a multi-column key span
+//! pack a region into a fixed-width sort key, derive the half-open key band a
+//! `KeyRange` walks over a store's PK, and compose a multi-column key span
 //! ([`KeySpec`]). The per-column codec is `gnitz_wire::pk`'s, shared with the
 //! client.
 use std::cmp::Ordering;
 
 use gnitz_wire::RowSource;
-use gnitz_wire::{KeyRange, NARROW_PK_MAX_BYTES};
-
-use gnitz_wire::{PkBuf, PkListRole};
+use gnitz_wire::{KeyRange, PkBuf, PkListRole, NARROW_PK_MAX_BYTES};
 
 use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_COLUMNS};
 
 /// Typed lexicographic OPK ordering of two **equal-length** PK regions — the
-/// comparator the read-cursor loser tree reads through its sources. Slice order
+/// comparator of seeks, group walks and probes. Slice order
 /// at every width, settled on the leading-16 `pack_pk_be` image where that
 /// decides: for `len ≤ 16` the image is the *whole* PK and is injective, so a
 /// tie is already a byte-equal PK; only `len > 16` can tie on the prefix while
@@ -205,8 +203,19 @@ pub struct KeySpec {
 }
 
 impl KeySpec {
-    /// The span of `locs`, at most `MAX_PK_COLUMNS` of them.
-    fn over(locs: impl IntoIterator<Item = ColumnLocator>) -> Self {
+    /// The span's columns, in order.
+    pub(crate) fn locators(&self) -> &[ColumnLocator] {
+        &self.locs[..self.n as usize]
+    }
+
+    /// The span of a secondary index on `cols` of `owner`.
+    ///
+    /// `Err` where `cols` breaks `gnitz_wire::validate_index_key`.
+    pub fn new(cols: &[u32], owner: &SchemaDescriptor) -> Result<Self, String> {
+        gnitz_wire::validate_index_key(cols, owner.num_columns(), owner.pk_cols().len(), |c| {
+            owner.columns()[c as usize].type_code
+        })
+        .map_err(|rule| format!("Index: {}", rule.for_role(PkListRole::ColumnList)))?;
         // Padding for the fixed array's unused slots; nothing reads past `n`.
         const EMPTY: ColumnLocator = ColumnLocator::Pk {
             byte_off: 0,
@@ -218,30 +227,13 @@ impl KeySpec {
             key_size: 0,
             locs: [EMPTY; MAX_PK_COLUMNS],
         };
-        for loc in locs {
+        for &c in cols {
+            let loc = owner.locate(c as usize);
             spec.locs[spec.n as usize] = loc;
             spec.n += 1;
             spec.key_size += loc.size() as u8;
         }
-        spec
-    }
-
-    /// The span's columns, in order.
-    pub(crate) fn locators(&self) -> &[ColumnLocator] {
-        &self.locs[..self.n as usize]
-    }
-
-    /// The span of a secondary index on `cols` of `owner`.
-    ///
-    /// `Err` where `cols` breaks the PK rule with nullability waived — an index
-    /// key column is a PK column of the index schema — or where the index record,
-    /// `cols` then `owner`'s PK, passes the PK arity limit.
-    pub fn new(cols: &[u32], owner: &SchemaDescriptor) -> Result<Self, String> {
-        gnitz_wire::validate_pk_tuple(cols, owner.num_columns(), MAX_PK_COLUMNS - owner.pk_cols().len(), |c| {
-            (owner.columns()[c as usize].type_code, false)
-        })
-        .map_err(|rule| format!("Index: {}", rule.for_role(PkListRole::ColumnList)))?;
-        Ok(Self::over(cols.iter().map(|&c| owner.locate(c as usize))))
+        Ok(spec)
     }
 
     /// The index schema this spec's entries land in: the key columns, then
@@ -267,33 +259,23 @@ impl KeySpec {
         b
     }
 
-    /// A base table's own PK as the degenerate span, so a PK range walk reads
-    /// through [`Self::range_keys`] as an index walk does.
-    pub fn for_pk(schema: &SchemaDescriptor) -> Self {
-        Self::over(schema.pk_columns().map(|(ci, _)| schema.locate(ci)))
-    }
-
     /// Span width in bytes — the sum of the column widths.
     #[inline]
     pub fn key_size(&self) -> usize {
         self.key_size as usize
     }
 
-    /// Write one row's leading-key span into `dst[..key_size()]` — the bytes
-    /// [`Self::seek_prefix`] produces for the same values.
-    /// `false` when any indexed column is NULL: the row is unindexed, `dst` partly written.
-    pub fn write_span(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
-        debug_assert!(dst.len() >= self.key_size(), "write_span: dst shorter than the span");
-        let mut off = 0;
+    /// One row's leading-key span, `key_size()` bytes; `None` when any indexed
+    /// column is NULL: the row is unindexed.
+    pub fn span(&self, mb: &impl RowSource, row: usize) -> Option<PkBuf> {
+        let mut key = PkBuf::zeroed(0);
         for loc in self.locators() {
             if loc.is_null(mb, row) {
-                return false;
+                return None;
             }
-            let w = loc.size();
-            gnitz_wire::store_opk(&mut dst[off..off + w], loc.opk_image(mb, row), false);
-            off += w;
+            key.push(loc.size(), loc.opk_image(mb, row), false);
         }
-        true
+        Some(key)
     }
 
     /// Split a stored index entry back into `(span, source PK)`: an entry is the
@@ -305,46 +287,30 @@ impl KeySpec {
         debug_assert!(entry.len() > self.key_size(), "index entry shorter than its span");
         entry.split_at(self.key_size())
     }
+}
 
-    /// The leading-key span of one key image per leading spec column: what
-    /// [`Self::write_span`] writes for those values.
-    fn seek_prefix(&self, images: &[u128]) -> PkBuf {
-        let k = images.len();
-        debug_assert!(
-            k >= 1 && k <= self.n as usize,
-            "seek_prefix: one image per leading spec column"
-        );
-        let mut key = PkBuf::zeroed(0);
-        for (loc, &image) in self.locs[..k].iter().zip(images) {
-            key.push(loc.size(), image, false);
-        }
-        key
+/// The half-open OPK key band `[start, end)` `range` walks over a store keyed by
+/// `schema`, whose leading PK columns are `range`'s columns at their own widths:
+/// every key from the group of `eq ‖ first` through the group of `eq ‖ last`.
+///
+/// `None` = provably empty.
+pub fn range_band(schema: &SchemaDescriptor, range: &KeyRange) -> Option<(PkBuf, Option<PkBuf>)> {
+    let mut widths = schema.pk_columns().map(|(ci, _)| schema.locate(ci).size());
+    let mut first = PkBuf::zeroed(0);
+    for (&image, w) in range.eq_vals().iter().zip(&mut widths) {
+        first.push(w, image, false);
     }
-
-    /// The half-open OPK key range `[start, end)` for `range` over this key
-    /// space, each key exactly `stride` bytes (the leading span plus, for a
-    /// secondary index, the source-PK suffix).
-    ///
-    /// `None` = provably empty.
-    pub fn range_keys(&self, stride: usize, range: &KeyRange) -> Option<(PkBuf, Option<PkBuf>)> {
-        debug_assert!(
-            range.cols().as_slice().len() <= self.n as usize,
-            "range_keys: the range lists more columns than the key space"
-        );
-        let eq = range.eq_vals();
-        let n_eq = eq.len();
-        let mut images = [0u128; MAX_PK_COLUMNS];
-        images[..n_eq].copy_from_slice(eq);
-        images[n_eq] = range.start.image;
-        let start = self.seek_prefix(&images[..=n_eq]);
-        images[n_eq] = range.end.image;
-        let end = self.seek_prefix(&images[..=n_eq]);
-        key_range_between_cuts(
-            KeyCut::new(start.pk_bytes(), range.start.after),
-            KeyCut::new(end.pk_bytes(), range.end.after),
-            stride,
-        )
-    }
+    let w = widths
+        .next()
+        .expect("range_band: the range lists more columns than the PK");
+    let mut last = first;
+    first.push(w, range.first, false);
+    last.push(w, range.last, false);
+    key_range_between_cuts(
+        KeyCut::min_of(first.pk_bytes()),
+        KeyCut::above(last.pk_bytes()),
+        schema.pk_stride(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +360,7 @@ impl<'a> KeyCut<'a> {
     /// This cut as a `stride`-wide key; `None` when it lies above the whole key
     /// space. The successor's carry ripples into the equality prefix, landing
     /// exactly on the first key of the next equality group.
-    fn key(&self, stride: usize) -> Option<PkBuf> {
+    pub fn key(&self, stride: usize) -> Option<PkBuf> {
         let mut k = PkBuf::from_bytes(self.group);
         let exists = !self.above || increment_key_in_place(k.pk_bytes_mut());
         exists.then(|| k.widened(stride))
