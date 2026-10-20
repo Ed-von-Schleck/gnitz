@@ -17,6 +17,7 @@ A stream refuses `WITH (compress = true)`: `admissibility/test_stream_rejections
 import gnitz
 from _read import bag, rows
 from _serverproc import disk_usage
+from _sql import insert
 
 _WORDS = ["the", "river", "under", "morning", "light", "carried", "every", "lantern", "toward", "harbour"]
 
@@ -38,8 +39,8 @@ def _churn(c, lo, hi, chunk=100):
     for a in range(lo, hi + 1, chunk):
         b = min(a + chunk - 1, hi)
         for name in ("t", "pt"):
-            c.execute_sql(f"INSERT INTO {name} VALUES " + ",".join(f"({i}, {i * 3}, '{_body(i)}')" for i in range(a, b + 1)))
-        c.execute_sql("INSERT INTO u VALUES " + ",".join(f"({i}, {i}, {i * 7})" for i in range(a, b + 1)))
+            insert(c, name, [(i, i * 3, _body(i)) for i in range(a, b + 1)])
+        insert(c, "u", [(i, i, i * 7) for i in range(a, b + 1)])
     span = hi - lo + 1
     for name in ("t", "pt"):
         c.execute_sql(f"UPDATE {name} SET body = body || ' updated' WHERE id >= {lo} AND id < {lo + span // 3}")
@@ -71,14 +72,6 @@ def _agree(c, views):
         assert bag(rows(c, f"SELECT * FROM {name}")) == bag(rows(c, f"SELECT * FROM p_{name}")), name
 
 
-def _coded(data_dir, name_id, plain_id):
-    """Whether the compressed relation's row stores hold a coded heap, after
-    asserting its twin's never do."""
-    report, stores = disk_usage(data_dir)
-    assert not any("blob symbols" in s["regions"] for s in stores if s["relation"] == plain_id and s["store"] == "rows"), report
-    return any("blob symbols" in s["regions"] for s in stores if s["relation"] == name_id and s["store"] == "rows")
-
-
 def test_a_compressed_relation_reads_as_its_plain_twin(sweeping):
     views = {
         "lin": "SELECT id, v, body FROM {t} WHERE v > 10",
@@ -91,7 +84,7 @@ def test_a_compressed_relation_reads_as_its_plain_twin(sweeping):
             c.execute_sql(f"CREATE VIEW p_{name} AS {body.format(t='pt')}")
         _churn(c, 1, 1500)
         _agree(c, views)
-        ids = {name: c.resolve_table(name)[0] for name in ["t", "pt", *views, *(f"p_{v}" for v in views)]}
+        compressed = {c.resolve_table(name)[0] for name in ["t", *views]}
 
     sweeping.restart()
     with gnitz.connect(sweeping.target) as c:
@@ -102,6 +95,7 @@ def test_a_compressed_relation_reads_as_its_plain_twin(sweeping):
     sweeping.restart(graceful=True)
     with gnitz.connect(sweeping.target) as c:
         _agree(c, views)
-    assert _coded(sweeping.data_dir, ids["t"], ids["pt"]), "the table's heaps are coded"
-    for name in views:
-        assert _coded(sweeping.data_dir, ids[name], ids[f"p_{name}"]), name
+    # Every relation of the server, its twins and the catalog's included: the
+    # compressed ones hold their heaps coded, and no other does.
+    report, stores = disk_usage(sweeping.data_dir)
+    assert {s["relation"] for s in stores if s["store"] == "rows" and "blob symbols" in s["regions"]} == compressed, report

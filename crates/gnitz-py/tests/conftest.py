@@ -100,6 +100,22 @@ def sweeping(own_server):
     return own_server.start()
 
 
+@pytest.fixture(scope="module")
+def swept(tmp_path_factory, _sock_path):
+    """A server whose stores reach the disk on modest data, as `sweeping`'s do,
+    shared by one module whose tests never restart it: each works in a fresh
+    schema through `swept_client` and tells its relations apart by id."""
+    with _fresh_proc(tmp_path_factory, _sock_path(), SWEEP_ENV) as proc:
+        yield proc
+
+
+@pytest.fixture
+def swept_client(swept):
+    """Per-test connection to `swept`, in a fresh schema of its own."""
+    with _in_fresh_schema(swept.target, "w") as conn:
+        yield conn
+
+
 def _boot_session_server(srv, tmp_path_factory):
     """(Re)start the session server on a fresh data dir, and so a clean catalog.
     The old one goes now rather than at pytest's end-of-session reclaim: each
@@ -158,9 +174,10 @@ def _session_target(srv, tmp_path_factory, user):
 
 
 @contextlib.contextmanager
-def _fresh_proc(tmp_path_factory, sock_path):
+def _fresh_proc(tmp_path_factory, sock_path, extra_env=()):
     """A server of its own, stopped and reclaimed on exit."""
     proc = ServerProc(str(tmp_path_factory.mktemp("r") / "data"), sock_path)
+    proc.extra_env.update(extra_env)
     proc.start()
     try:
         yield proc

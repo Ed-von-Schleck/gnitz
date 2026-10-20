@@ -17,7 +17,7 @@ import random
 
 import gnitz
 from _read import bag, scanned
-from _serverproc import MULTI, SWEEP_ENV, disk_usage
+from _serverproc import disk_usage
 
 _GROUPS = 6_000
 _VIEWS = {
@@ -46,9 +46,10 @@ def _assert_views(conn, live, ctx):
     assert bag(scanned(conn, "ext"), "g", "lo", "hi") == ext, ctx
 
 
-def _churn(conn, live, rng, rounds, next_id):
-    """`rounds` pushes, each inserting rows and moving some to another group and
-    value; returns the next unused id."""
+def _churn(conn, live, rng, rounds):
+    """`rounds` pushes, each inserting rows under fresh ids and moving some to
+    another group and value."""
+    next_id = max(live, default=0) + 1
     for _ in range(rounds):
         rows = {}
         for _ in range(3_000):
@@ -58,43 +59,42 @@ def _churn(conn, live, rng, rounds, next_id):
             rows[id_] = (rng.randrange(_GROUPS), id_ * 1000 + rng.randrange(1000))
         _push(conn, rows)
         live.update(rows)
-    return next_id
 
 
-def test_a_view_ending_in_an_aggregate_reads_its_own_store_as_history(own_server):
-    own_server.extra_env.update(SWEEP_ENV)
-    own_server.start(workers=MULTI)
+def test_a_view_ending_in_an_aggregate_reads_its_own_store_as_history(sweeping):
     rng, live = random.Random(11), {}
-    with gnitz.connect(own_server.target) as conn:
+    with gnitz.connect(sweeping.target) as conn:
         conn.execute_sql("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, v BIGINT NOT NULL)")
         for name, body in _VIEWS.items():
             conn.execute_sql(f"CREATE VIEW {name} AS {body}")
-        next_id = _churn(conn, live, rng, 5, 1)
+        ids = {conn.resolve_table(name)[0]: name for name in ["t", *_VIEWS]}
+        _churn(conn, live, rng, 5)
         _assert_views(conn, live, "live")
 
-    own_server.restart()
-    with gnitz.connect(own_server.target) as conn:
+    sweeping.restart()
+    with gnitz.connect(sweeping.target) as conn:
         _assert_views(conn, live, "after a crash")
-        next_id = _churn(conn, live, rng, 2, next_id)
+        _churn(conn, live, rng, 2)
         _assert_views(conn, live, "churn after a crash")
 
-    own_server.restart(graceful=True)
-    with gnitz.connect(own_server.target) as conn:
-        ids = {name: conn.resolve_table(name)[0] for name in ["t", *_VIEWS]}
-    # The report reads the files alone, beside the server now running on them.
-    report, stores = disk_usage(own_server.data_dir)
-
-    def kinds(name):
-        """The stores of `name` holding shards, without the node each is numbered by."""
-        return {s["store"].rstrip("0123456789").rstrip("_") for s in stores if s["relation"] == ids[name]}
-
-    assert kinds("t") == kinds("by_g") == {"rows"}, report
-    assert kinds("ext") == {"rows", "scratch_reduce", "scratch_avidx"}, report
-    # The top-N's index of every input row is the one store it keeps beside
-    # the view's rows.
-    assert kinds("top") == {"rows", "scratch_topnidx"}, report
-    with gnitz.connect(own_server.target) as conn:
+    sweeping.restart(graceful=True)
+    # The report reads the files alone, beside the server now running on them:
+    # each relation's stores holding shards, without the node each is numbered by.
+    report, stores = disk_usage(sweeping.data_dir)
+    kinds = {name: set() for name in ids.values()}
+    for s in stores:
+        if s["relation"] in ids:
+            kinds[ids[s["relation"]]].add(s["store"].rstrip("0123456789").rstrip("_"))
+    assert kinds == {
+        "t": {"rows"},
+        "by_g": {"rows"},
+        "ext": {"rows", "scratch_reduce", "scratch_avidx"},
+        # The top-N's index of every input row is the one store it keeps
+        # beside the view's rows.
+        "top": {"rows", "scratch_topnidx"},
+    }, report
+    with gnitz.connect(sweeping.target) as conn:
         _assert_views(conn, live, "after a graceful restart")
-        _churn(conn, live, rng, 2, next_id)
+        _churn(conn, live, rng, 2)
         _push(conn, {id_: live.pop(id_) for id_ in rng.sample(sorted(live), len(live) // 3)}, weight=-1)
         _assert_views(conn, live, "churn and deletes after a graceful restart")

@@ -14,6 +14,7 @@ already cover.
 """
 
 from _read import bag, rows
+from _sql import insert
 
 # Big enough that nothing built on these helpers falls off the window; a test
 # about retention sets its own.
@@ -149,12 +150,8 @@ def churn(client, lo, hi, chunk=None):
     step = chunk or span
     for a in range(lo, hi + 1, step):
         b = min(a + step - 1, hi)
-        client.execute_sql(
-            "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, 'body-{i:0>20}')" for i in range(a, b + 1)),
-        )
-        client.execute_sql(
-            "INSERT INTO u VALUES " + ",".join(f"({i}, {i}, {i * 7})" for i in range(a, b + 1)),
-        )
+        insert(client, "t", [(i, i * 3, f"body-{i:0>20}") for i in range(a, b + 1)])
+        insert(client, "u", [(i, i, i * 7) for i in range(a, b + 1)])
     client.execute_sql(f"UPDATE t SET v = v + 1 WHERE id >= {lo} AND id < {lo + span // 3}")
     # `u` loses the longer tail, so `t.id` is never a subset of `u.tid` and the
     # SETOP body (`t EXCEPT u`) holds rows. The other way round it is empty, and

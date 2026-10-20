@@ -12,6 +12,7 @@ aliases are `relational_shape/test_view_column_order.py`'s.
 """
 
 import pytest
+import gnitz
 from _catalog import family, schema_id
 from _feedviews import Subscriber
 from _read import bag, scanned
@@ -82,18 +83,47 @@ def test_the_with_clause_is_part_of_the_definition(client, base):
     assert budgets() == {("bounded", 0, 0): 1, ("fed", 0, 0): 1}
 
 
-def test_an_unchanged_replace_keeps_a_feed_cursor_and_a_dependent_view(client, base):
-    """Restating the standing definition replaces nothing: a feed cursor taken
-    before it polls on, and a view over it keeps maintaining."""
-    body = "SELECT id, a FROM t"
-    client.execute_sql(
-        f"CREATE VIEW v WITH (delta = '1 MB') AS {body}; CREATE VIEW w AS SELECT id FROM v WHERE a > 5")
-    sub = Subscriber(client, "v")
-    sub.bootstrap()
+_FED = "VIEW v WITH (delta = '1 MB') AS SELECT id, a FROM t"
 
-    assert not _replaces(client, f"CREATE OR REPLACE VIEW v WITH (delta = '1 MB') AS {body}", "v")
+
+@pytest.mark.parametrize("ddl, replaced", [
+    (f"CREATE OR REPLACE {_FED}", False),
+    (f"CREATE OR REPLACE {_FED} WHERE a > 0", True),
+    (f"DROP VIEW v; CREATE {_FED}", True),
+], ids=["unchanged", "changed", "drop-and-create"])
+def test_a_feed_cursor_polls_on_exactly_when_the_view_is_kept(client, base, ddl, replaced):
+    """Restating the standing definition replaces nothing: a feed cursor taken
+    before it polls on. A replaced view takes a fresh id whose rounds come from
+    the same global counter, so an unrefused cursor would be answered with the
+    new view's deltas above the stale round — and a replaced view's backfill
+    never enters a delta store, so applying them would yield a copy missing
+    everything below it. The cursor is refused instead, and a re-read at 0
+    recovers. A changed `CREATE OR REPLACE` is the case nothing else tells a
+    subscriber about: unlike a drop, the name still resolves."""
+    client.execute_sql(f"CREATE {_FED}")
+    stale = Subscriber(client, "v")
+    stale.bootstrap()
+
+    assert _replaces(client, ddl, "v") == replaced
     client.execute_sql("INSERT INTO t VALUES (3, 30, 300)")
-    assert bag(sub.poll()) == {(3, 30): 1}
+    sub = Subscriber(client, "v")
+    sub.cursor = stale.cursor
+    if not replaced:
+        assert bag(sub.poll()) == {(3, 30): 1}
+        return
+    with pytest.raises(gnitz.GnitzDeltaExpiredError):
+        sub.poll()
+    sub.bootstrap()
+    sub.assert_converged("after re-resolving and bootstrapping")
+
+
+def test_an_unchanged_replace_keeps_a_dependent_view(client, base):
+    """Restating the standing definition replaces nothing, so a view over it
+    keeps maintaining."""
+    body = "SELECT id, a FROM t"
+    client.execute_sql(f"CREATE VIEW v AS {body}; CREATE VIEW w AS SELECT id FROM v WHERE a > 5")
+    assert not _replaces(client, f"CREATE OR REPLACE VIEW v AS {body}", "v")
+    client.execute_sql("INSERT INTO t VALUES (3, 30, 300)")
     assert bag(scanned(client, "w")) == {(1,): 1, (2,): 1, (3,): 1}
 
 

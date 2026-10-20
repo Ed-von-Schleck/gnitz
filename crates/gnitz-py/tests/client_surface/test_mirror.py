@@ -165,8 +165,11 @@ def test_the_handles_life_in_one_interpreter(client, server, tmp_path):
 
 def test_a_refusal_arrives_as_its_error_class(client, mirror):
     """What cannot be mirrored is refused, and a name that resolves to nothing
-    is not found. Which refusal says what is the mirror crate's to test."""
+    is not found. Which refusal says what is the mirror crate's to test. A sync
+    told to wait a negative time is the binding's own `ValueError`."""
     fed_view(client)
+    with pytest.raises(ValueError, match="non-negative"):
+        mirror.sync(wait=-1)
     with pytest.raises(gnitz.GnitzRefusedError, match="is a table"):
         mirror.mirror_view("t")
     with pytest.raises(gnitz.GnitzNotFoundError, match="nosuchview"):

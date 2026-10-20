@@ -14,44 +14,52 @@ import pytest
 import gnitz
 from _feedviews import GROUPBY, JOIN, LINEAR, Subscriber, base_tables, churn, fed_view, mk_feed
 from _read import access, rows
+from _sql import insert
 
 
-CASES = [
-    # (view body, subscription over `f`)
-    (LINEAR, "SELECT id, v, body FROM f WHERE v % 2 = 0"),
-    (LINEAR, "SELECT id, v FROM f"),
-    (LINEAR, "SELECT id, body FROM f WHERE id >= 100 AND id < 300"),
-    (LINEAR, "SELECT id, v FROM f WHERE id IN (5, 77, 150, 420, 9999)"),
-    (LINEAR, "SELECT id FROM f WHERE id = 150"),
-    (LINEAR, "SELECT v FROM f WHERE v > 300"),
-    (LINEAR, "SELECT id, v FROM f WHERE body LIKE '%7' AND v > 300"),
-    (JOIN, "SELECT id, w FROM f WHERE w > 700"),
-    (GROUPBY, "SELECT tid, total FROM f WHERE total > 1000"),
-    (GROUPBY, "SELECT tid, n FROM f WHERE tid IN (3, 50, 250)"),
+# `(fed view, subscription over it)`: `lin` over LINEAR, `jn` over JOIN,
+# `grp` over GROUPBY.
+_SUBSCRIPTIONS = [
+    ("lin", "SELECT id, v, body FROM lin WHERE v % 2 = 0"),
+    ("lin", "SELECT id, v FROM lin"),
+    ("lin", "SELECT id, body FROM lin WHERE id >= 100 AND id < 300"),
+    ("lin", "SELECT id, v FROM lin WHERE id IN (5, 77, 150, 420, 9999)"),
+    ("lin", "SELECT id FROM lin WHERE id = 150"),
+    ("lin", "SELECT v FROM lin WHERE v > 300"),
+    ("lin", "SELECT id, v FROM lin WHERE body LIKE '%7' AND v > 300"),
+    ("jn", "SELECT id, w FROM jn WHERE w > 700"),
+    ("grp", "SELECT tid, total FROM grp WHERE total > 1000"),
+    ("grp", "SELECT tid, n FROM grp WHERE tid IN (3, 50, 250)"),
 ]
 
 
-@pytest.mark.parametrize("body, sql", CASES, ids=[c[1] for c in CASES])
-def test_a_subscribed_copy_is_the_select_over_the_view(client, body, sql):
-    """Through inserts, UPDATEs that move rows across the filter, single-key
-    rounds most workers emit nothing for, and deletes. A key list and a key
-    range reach only the workers that own them, which is where a wrong route
-    would lose a row."""
-    fed_view(client, body)
+def test_a_subscribed_copy_is_the_select_over_the_view(client):
+    """Every subscription, each its own copy over one churn: through inserts,
+    UPDATEs that move rows across the filter, single-key rounds most workers
+    emit nothing for, and deletes. A key list and a key range reach only the
+    workers that own them, which is where a wrong route would lose a row."""
+    base_tables(client)
+    for name, body in (("lin", LINEAR), ("jn", JOIN), ("grp", GROUPBY)):
+        mk_feed(client, name, body)
     churn(client, 1, 200)
-    sub = Subscriber(client, "f", sql)
-    sub.bootstrap()
-    assert sub.assert_converged("after the bootstrap") > 0
+    subs = [Subscriber(client, name, sql) for name, sql in _SUBSCRIPTIONS]
+
+    def converged(what):
+        return [sub.assert_converged(f"{sub.sql}: {what}") for sub in subs]
+
+    for sub in subs:
+        sub.bootstrap()
+    assert all(converged("after the bootstrap")), "every subscription keeps something"
     for lo, hi in ((201, 400), (401, 600)):
         churn(client, lo, hi)
-        sub.assert_converged(f"through key {hi}")
+        converged(f"through key {hi}")
     # An odd step flips `v % 2` and carries each of these keys over `v > 300`.
     for i in (150, 77, 5):
         client.execute_sql(f"UPDATE t SET v = v + 301 WHERE id = {i}")
         client.execute_sql(f"UPDATE u SET w = w + 500 WHERE id = {i}")
-        sub.assert_converged(f"single-key round {i}")
+        converged(f"single-key round {i}")
     client.execute_sql("DELETE FROM t WHERE id IN (150, 420)")
-    sub.assert_converged("after the deletes")
+    converged("after the deletes")
 
 
 def test_a_subscription_bounded_by_the_views_index(client):
@@ -108,9 +116,7 @@ def test_a_synced_cursor_passes_the_rounds_it_kept_nothing_of(client, peer):
     stayed.bootstrap()
     for r in range(12):
         lo = 100 + r * 40
-        client.execute_sql(
-            "INSERT INTO t VALUES " + ",".join(f"({i}, {i}, '{wide(i)}')" for i in range(lo, lo + 40)),
-        )
+        insert(client, "t", [(i, i, wide(i)) for i in range(lo, lo + 40)])
         # The read ticks the round.
         assert len(rows(client, one)) == 1
         assert len(sub.sync()) == 0

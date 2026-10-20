@@ -23,12 +23,10 @@ import os
 import pytest
 import gnitz
 from gnitz import aio
-from _feedviews import (
-    FEED, GROUPBY, JOIN, LINEAR, SETOP,
-    Subscriber, base_tables, churn, fed_view, mk_feed,
-)
+from _catalog import schema_id
+from _feedviews import GROUPBY, JOIN, LINEAR, SETOP, Subscriber, base_tables, churn, fed_view, mk_feed
 from _read import bag, rows
-from _serverproc import NEEDS_MULTI
+from _sql import insert
 
 
 # ── convergence ──────────────────────────────────────────────────────────────
@@ -76,18 +74,14 @@ def test_a_round_ticked_by_a_ddl_drain_reaches_the_next_poll(client):
     sub = Subscriber(client, "f")
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
     sub.bootstrap()
-    sub.drain()
 
     # Rows committed but deliberately NOT settled: the next statement's drain is
     # what ticks them.
-    client.execute_sql(
-        "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, 'late-{i}')" for i in range(2, 40)),
-    )
+    insert(client, "t", [(i, i * 3, f"late-{i}") for i in range(2, 40)])
     client.execute_sql("CREATE VIEW second AS SELECT id FROM t WHERE v > 1000")
 
-    sub.drain()
     # The seed plus ids 4..39, the ones `v > 10` keeps.
-    assert len(sub.copy) == 37 and sub.copy == sub.scan(), "the CREATE VIEW drain's round must reach the subscriber"
+    assert sub.assert_converged("the CREATE VIEW drain's round must reach the subscriber") == 37
 
 
 def test_subscribers_at_one_position_share_one_read(own_server):
@@ -118,7 +112,6 @@ def test_subscribers_at_one_position_share_one_read(own_server):
         for client in (a, b):
             sub = Subscriber(client, "f")
             sub.bootstrap()
-            sub.drain()
             subs.append(sub)
 
         before = sal_written()
@@ -150,7 +143,7 @@ def test_subscribers_at_one_position_share_one_read(own_server):
         def a_round_elsewhere():
             # A round of a table the view does not read.
             writer.execute_sql("INSERT INTO u VALUES (1, 1, 7)")
-            assert len(rows(writer, "SELECT * FROM other")) == 1
+            assert bag(rows(writer, "SELECT * FROM other")) == {(1, 7): 1}
 
         alone = round_read_by_the_first(2, lambda: None)
         again = round_read_by_the_first(3, a_round_elsewhere)
@@ -169,40 +162,36 @@ def test_a_poll_ticks_the_push_it_follows_and_loses_no_round(client):
     mk_feed(client, "f", "SELECT kind, SUM(amount) AS total FROM ev GROUP BY kind")
     sub = Subscriber(client, "f")
     sub.bootstrap()
-    sub.drain()
 
+    # The convergence check polls before it scans: a round its poll left
+    # behind is ticked by the scan, and the two disagree.
     for r in range(6):
-        client.execute_sql(
-            "INSERT INTO ev VALUES " + ",".join(f"({r * 50 + i}, {i % 4}, {i + 1})" for i in range(50)),
-        )
-        assert len(sub.poll()) > 0, f"poll {r} did not carry the push it followed"
-        assert len(sub.poll()) == 0, f"poll {r} left part of its round behind"
-        assert sub.copy == sub.scan(), f"after poll {r}"
+        insert(client, "ev", [(r * 50 + i, i % 4, i + 1) for i in range(50)])
+        sub.assert_converged(f"after poll {r}")
 
 
 # ── held syncs ───────────────────────────────────────────────────────────────
 
 
-async def test_a_held_sync_leaves_an_async_client_free(client, server):
+async def test_a_held_sync_leaves_an_async_client_free(client, aconn):
     """A sync held with nothing to report does not hold its client: a scan and a
     subscription submitted beside it are answered and leave it held, and it
-    waits for that subscription too — a commit reaching its view alone ends the
-    hold, with that commit's delta."""
+    waits for that subscription too — a DDL reaching its view of the catalog
+    alone ends the hold, with that DDL's catalog rows."""
     fed_view(client)
-    mk_feed(client, "g", "SELECT id, w FROM u WHERE w > 0")
+    mk_feed(client, "g", f"SELECT table_id, name FROM _system.tables WHERE schema_id = {schema_id(client)}")
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'seed')")
     (fid, f_schema), (gid, g_schema) = client.resolve_table("f"), client.resolve_table("g")
-    async with aio.connect(server, schema=client.schema) as conn:
-        await conn.subscribe(fid, f_schema)
-        held = asyncio.ensure_future(conn.sync(60))
-        scanned = await asyncio.wait_for(conn.scan(fid, f_schema), 20)
-        assert not held.done(), "the scan left the sync held"
-        late, _, cursor = await conn.subscribe(gid, g_schema)
-        assert not held.done(), "subscribing left the sync held"
-        client.execute_sql("INSERT INTO u VALUES (1, 1, 5)")
-        pushed = {p.sub: p for p in (await asyncio.wait_for(held, 20)).pushed}[late]
+    await aconn.subscribe(fid, f_schema)
+    held = asyncio.ensure_future(aconn.sync(60))
+    scanned = await asyncio.wait_for(aconn.scan(fid, f_schema), 20)
+    assert not held.done(), "the scan left the sync held"
+    late, _, cursor = await aconn.subscribe(gid, g_schema)
+    assert not held.done(), "subscribing left the sync held"
+    client.execute_sql("CREATE TABLE late (id BIGINT NOT NULL PRIMARY KEY)")
+    pushed = {p.sub: p for p in (await asyncio.wait_for(held, 20)).pushed}[late]
     assert bag(scanned) == {(1, 100, "seed"): 1}
-    assert (pushed.error, bag(pushed.rows)) == (None, {(1, 5): 1})
+    assert (pushed.error, bag(pushed.rows, "name")) == (None, {("late",): 1})
     assert pushed.cursor[0] == cursor[0] and pushed.cursor[1] > cursor[1]
 
 
@@ -223,7 +212,7 @@ async def test_a_sync_waiting_for_a_tick_holds_up_no_request(own_server):
                 await asyncio.wait_for(conn.execute_sql(f"INSERT INTO t VALUES ({i}, 100, 'w')"), 20)
             assert not held.done(), "no tick has taken the writes"
             # A read of the view ticks at once: no follower asked for it.
-            assert len(rows(client, "SELECT * FROM f")) == 5
+            assert bag(rows(client, "SELECT * FROM f")) == {(1, 100, "seed"): 1, **{(i, 100, "w"): 1 for i in range(2, 6)}}
             (pushed,) = (await asyncio.wait_for(held, 20)).pushed
             assert (pushed.error, bag(pushed.rows)) == (None, {(i, 100, "w"): 1 for i in range(2, 6)})
 
@@ -231,42 +220,8 @@ async def test_a_sync_waiting_for_a_tick_holds_up_no_request(own_server):
             (pushed,) = (await asyncio.wait_for(conn.sync(0.2), 60)).pushed
             assert (pushed.error, bag(pushed.rows)) == (None, {(6, 200, "late"): 1})
 
-        with pytest.raises(ValueError, match="non-negative"):
-            client.sync(wait=-1)
 
-
-# ── refused cursors ──────────────────────────────────────────────────────────
-
-
-def test_a_cursor_below_the_floor_is_refused_as_a_code(client):
-    """Retention drops the oldest rounds whether or not anyone still reads them,
-    and a cursor below what was dropped is refused with `GnitzDeltaExpiredError`
-    — a type the subscriber reacts to, not a string it matches. Recovery is the
-    read it made on its first day."""
-    base_tables(client)
-    mk_feed(client, "f", LINEAR, feed="1 KB")
-    sub = Subscriber(client, "f")
-    sub.bootstrap()
-    sub.drain()
-
-    # Rounds that each overrun the budget on every worker, each ticked by a
-    # read of the view: a feed keeps its newest round whatever its size, so the
-    # second is what drops the first.
-    for lo in (1, 401, 801):
-        client.execute_sql(
-            "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, '{'x' * 200}-{i}')" for i in range(lo, lo + 400)),
-        )
-        sub.scan()
-
-    with pytest.raises(gnitz.GnitzDeltaExpiredError):
-        sub.poll()
-
-    # Settle before re-reading rather than going through `assert_converged`:
-    # on a 1 KB budget one round of these rows overruns it outright, so a
-    # round ticked by that helper's scan is dropped before its poll arrives.
-    live = sub.scan()
-    sub.bootstrap()
-    assert sub.copy == live, "after re-reading at 0"
+# ── refusals ─────────────────────────────────────────────────────────────────
 
 
 def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client):
@@ -285,95 +240,3 @@ def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client):
         # so answering it here would spin one forever against a view that will
         # never have a feed.
         assert not isinstance(e.value, gnitz.GnitzDeltaExpiredError), str(e.value)
-
-
-@pytest.mark.parametrize("recreate", ["drop-and-create", "or-replace"])
-def test_a_cursor_across_a_recreate_is_rejected(client, recreate):
-    """A recreated view takes a fresh id whose rounds come from the same global
-    counter, so an unrefused cursor would be answered with the *new* view's deltas
-    above the stale round — and a recreated view's backfill never enters a delta
-    store, so applying them yields a copy missing everything below it.
-
-    `CREATE OR REPLACE` is the case nothing else would tell a subscriber about:
-    unlike the drop, the name still resolves.
-    """
-    fed_view(client)
-    sub = Subscriber(client, "f")
-    client.execute_sql("INSERT INTO t VALUES (1, 100, 'a')")
-    sub.bootstrap()
-    sub.drain()
-
-    if recreate == "drop-and-create":
-        client.execute_sql("DROP VIEW f")
-        mk_feed(client, "f", LINEAR)
-    else:
-        # A changed body: a replace by the standing definition keeps the view.
-        client.execute_sql(
-            f"CREATE OR REPLACE VIEW f WITH (delta = '{FEED}') AS {LINEAR} AND v > 0"
-        )
-    client.execute_sql("INSERT INTO t VALUES (2, 200, 'b')")
-
-    fresh = Subscriber(client, "f")
-    assert fresh.vid != sub.vid, "a recreated view takes a fresh id"
-    fresh.cursor = sub.cursor
-    with pytest.raises(gnitz.GnitzDeltaExpiredError):
-        fresh.poll()
-
-    fresh.bootstrap()
-    fresh.assert_converged("after re-resolving and bootstrapping")
-
-
-def test_a_feed_survives_a_restart_on_every_worker(own_server):
-    """A restart leaves a fed view fed on every worker — not a catalog that says
-    "fed" over no feed, which every other test reports only as "no rows".
-
-    A cursor held across the restart must be rejected: a feed starts empty at
-    every open and the boot mints a fresh tag.
-    """
-    own_server.start()
-    with gnitz.connect(own_server.target) as client:
-        fed_view(client)
-        sub = Subscriber(client, "f")
-        churn(client, 1, 120)
-        sub.bootstrap()
-        sub.drain()
-        stale, vid = sub.cursor, sub.vid
-
-    own_server.restart()
-    with gnitz.connect(own_server.target) as client:
-        sub = Subscriber(client, "f")
-        assert sub.vid == vid, "the view keeps its id across a restart"
-        sub.cursor = stale
-        with pytest.raises(gnitz.GnitzDeltaExpiredError):
-            sub.poll()
-
-        sub.bootstrap()
-        sub.assert_converged("after the restart's bootstrap")
-        churn(client, 121, 240)
-        sub.assert_converged("after post-restart churn")
-
-
-@NEEDS_MULTI
-def test_a_replicated_feed_lives_on_worker_zero_alone(client):
-    """A replicated view computes its entire result on every worker, so the feed
-    is read from one copy: a gather over all W identical stores would hand back
-    every row W times — invisible to a row-set comparison. Worker 0 serves it,
-    and the copy converging weight for weight is what shows one rank did.
-
-    A view over only replicated sources is itself replicated, which is what makes
-    this a feed over a replicated placement rather than over a partitioned one.
-    """
-    client.execute_sql(
-        "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) "
-        "WITH (replicated = true)",
-    )
-    mk_feed(client, "f", "SELECT id, v FROM r WHERE v > 10")
-    sub = Subscriber(client, "f")
-    # Before the inserts, so every row in the copy reaches it as a retained
-    # round through the one rank that serves the feed.
-    sub.bootstrap()
-    for i in range(1, 40):
-        client.execute_sql(f"INSERT INTO r VALUES ({i}, {i * 10})")
-    sub.assert_converged("over a replicated source")
-    client.execute_sql("UPDATE r SET v = v + 5 WHERE id < 10; DELETE FROM r WHERE id > 30")
-    sub.assert_converged("retractions over a replicated source")
