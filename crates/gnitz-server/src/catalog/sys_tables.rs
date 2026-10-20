@@ -220,10 +220,15 @@ static SCHEMAS: LazyLock<[SchemaDescriptor; SysFamily::COUNT]> = LazyLock::new(|
 static RECORDS: LazyLock<[Box<[u8]>; SysFamily::COUNT]> = LazyLock::new(|| {
     std::array::from_fn(|i| {
         let family = SysFamily::ALL[i];
-        let defs = family.column_defs();
-        gnitz_wire::schema_block::encode(defs.iter().map(|c| c.def.block_col()), family.wire().pk_cols).into()
+        encode_record(family.wire().pk_cols, &family.column_defs())
     })
 });
+
+/// The named record of a relation keyed `pk` over `defs` — the one a RESOLVE
+/// reply and every push/DDL SAL slot carries.
+pub(in crate::catalog) fn encode_record(pk: &[u32], defs: &[CatalogColumn]) -> Box<[u8]> {
+    gnitz_wire::schema_block::encode(defs.iter().map(|c| c.def.block_col()), pk).into()
+}
 
 /// The rules a relation's column records must satisfy on their own, with no PK
 /// list in hand; messages are bare predicates, and callers add the context. The

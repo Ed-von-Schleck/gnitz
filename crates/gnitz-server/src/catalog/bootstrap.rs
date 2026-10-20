@@ -4,7 +4,7 @@ use gnitz_store::relation::{lock_data_dir, RelationKind, RelationRegistry, Relat
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
-use super::cache::CatalogCacheSet;
+use super::cache::{CatalogCacheSet, RelationEntry};
 use super::sys_tables::SysFamily;
 use super::CatalogEngine;
 use crate::query::DagEngine;
@@ -78,7 +78,14 @@ impl CatalogEngine {
                     compress: false,
                 })
                 .map_err(|e| format!("Failed to create system table '{}': error {e}", family.name()))?;
-            engine.enter_relation(family.id(), Rc::from(family.record()), &family.column_defs(), false);
+            engine.caches.enter(
+                family.id(),
+                RelationEntry {
+                    record: Rc::from(family.record()),
+                    fks: Vec::new(),
+                    serial: false,
+                },
+            );
         }
 
         engine.system_zone = engine.registry.system_replay_floors().into_values().max().unwrap_or(0);

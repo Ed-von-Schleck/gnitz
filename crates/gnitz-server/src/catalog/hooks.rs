@@ -2,14 +2,13 @@ use gnitz_store::relation::{IndexClaim, RelationSpec};
 use gnitz_wire::{TableDistribution, TableProps};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
-use std::collections::hash_map::Entry;
 use std::rc::Rc;
 
-use super::cache::{encode_record, RelationEntry};
+use super::cache::RelationEntry;
 use super::constraints::FkEdge;
 use super::sys_reads::IdSet;
 use super::sys_tables::{
-    build_schema_from_col_defs, pk_signatures, read_rel_row, CatalogColumn, PkShape, RelDetail, RelRow, SysFamily,
+    build_schema_from_col_defs, encode_record, pk_signatures, read_rel_row, PkShape, RelDetail, RelRow, SysFamily,
 };
 use super::CatalogEngine;
 use gnitz_wire::sys_rows::{IdxTabRow, ViewParts};
@@ -22,16 +21,16 @@ impl CatalogEngine {
     /// CIRCUIT_TAB row, from the store, so the caller applies those families first.
     pub(in crate::catalog) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         let hooked = match family {
-            // A schema's name is read from its row.
-            SysFamily::Schema => Ok(()),
+            // A schema's name is read from its row, and a schema is never renamed;
+            // `sequences` rows drive no cache; a view's registration reads its
+            // `circuits` row.
+            SysFamily::Schema | SysFamily::Sequence | SysFamily::Circuit => return Ok(()),
             SysFamily::Table | SysFamily::View => {
                 self.apply_relation_names(batch);
                 self.hook_relation_register(family, batch)
             }
             SysFamily::Column => self.hook_column_change(batch),
             SysFamily::Index => self.hook_index_register(batch),
-            // `sequences` rows drive no cache; a view's registration reads its `circuits` row.
-            SysFamily::Sequence | SysFamily::Circuit => return Ok(()),
         };
         // Every family that reaches here can change what a RESOLVE answers.
         self.caches.resolve_tokens.get_mut().clear();
@@ -112,42 +111,12 @@ impl CatalogEngine {
             pk_repeats: rel.pk_repeats(),
             compress: rel.compress(),
         })?;
-        self.enter_relation(
-            rel.id,
-            encode_record(schema.pk_cols(), &col_defs),
-            &col_defs,
-            rel.serial(),
-        );
-        // Derived, not stored: every process builds the same FK indexes from the same
-        // column records. Every FK column carries one, a PK column included — a
-        // parent's RESTRICT probe reads the child through it.
-        for (ci, _) in col_defs.iter().enumerate().filter(|(_, cd)| cd.fk.is_some()) {
-            self.registry
-                .add_index(
-                    rel.id,
-                    IndexClaim::ForeignKey,
-                    gnitz_wire::PkColList::from_slice(&[ci as u32]),
-                )
-                .map_err(|e| format!("FK index on column {ci}: {e}"))?;
-        }
-        Ok(())
-    }
-
-    /// Enter registered relation `id`'s [`RelationEntry`], and index the FK edges it
-    /// declares by parent.
-    pub(in crate::catalog) fn enter_relation(
-        &mut self,
-        id: u64,
-        record: Rc<[u8]>,
-        defs: &[CatalogColumn],
-        serial: bool,
-    ) {
-        let fks: Vec<FkEdge> = defs
+        let fks: Vec<FkEdge> = col_defs
             .iter()
             .enumerate()
             .filter_map(|(ci, cd)| {
                 cd.fk.map(|fk| FkEdge {
-                    child_tid: id,
+                    child_tid: rel.id,
                     fk_col: ci,
                     parent_tid: fk.table_id,
                     parent_col: fk.col as usize,
@@ -155,10 +124,22 @@ impl CatalogEngine {
                 })
             })
             .collect();
+        // Derived, not stored: every process builds the same FK indexes from the same
+        // column records. Every FK column carries one, a PK column included.
         for e in &fks {
-            self.caches.fk_by_parent.entry(e.parent_tid).or_default().push(*e);
+            self.registry
+                .add_index(rel.id, IndexClaim::ForeignKey, e.child_index_cols())
+                .map_err(|err| format!("FK index on column {}: {err}", e.fk_col))?;
         }
-        self.caches.relations.insert(id, RelationEntry { record, fks, serial });
+        self.caches.enter(
+            rel.id,
+            RelationEntry {
+                record: Rc::from(encode_record(schema.pk_cols(), &col_defs)),
+                fks,
+                serial: rel.serial(),
+            },
+        );
+        Ok(())
     }
 
     /// Tear relation `id` out of the registry and the DAG. Its owned system rows are
@@ -167,16 +148,7 @@ impl CatalogEngine {
     fn unregister_relation(&mut self, id: u64) {
         self.dag.forget(id);
         self.registry.unregister(id);
-        if let Some(entry) = self.caches.relations.remove(&id) {
-            for e in entry.fks {
-                if let Entry::Occupied(mut edges) = self.caches.fk_by_parent.entry(e.parent_tid) {
-                    edges.get_mut().retain(|x| x.child_tid != id);
-                    if edges.get().is_empty() {
-                        edges.remove();
-                    }
-                }
-            }
-        }
+        self.caches.remove(id);
     }
 
     /// The TABLE_TAB / VIEW_TAB register hook: a PK carrying one sign is a drop or a
@@ -196,7 +168,7 @@ impl CatalogEngine {
         creates.sort_unstable_by_key(|c| c.0);
         for (id, row) in creates {
             // A system family's own TABLE_TAB row names a relation registered at open.
-            if self.registry.has_id(id) {
+            if SysFamily::from_id(id).is_some() {
                 continue;
             }
             let rel = read_rel_row(family, batch, row)?;
@@ -224,7 +196,7 @@ impl CatalogEngine {
                 .relations
                 .get_mut(&owner)
                 .expect("every registered relation has an entry")
-                .record = encode_record(cur.pk_cols(), &defs);
+                .record = Rc::from(encode_record(cur.pk_cols(), &defs));
         }
         Ok(())
     }

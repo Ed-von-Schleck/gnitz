@@ -26,6 +26,14 @@ pub(crate) struct FkEdge {
     pub(crate) on_delete: FkAction,
 }
 
+impl FkEdge {
+    /// The column list of the child's FK index, which a parent's RESTRICT and
+    /// CASCADE probes read the child through.
+    pub(crate) fn child_index_cols(&self) -> PkColList {
+        PkColList::from_slice(&[self.fk_col as u32])
+    }
+}
+
 /// Every constraint on one table whose validation reads committed state.
 pub(crate) struct RowConstraints {
     pub(crate) fks_as_child: Vec<FkEdge>,

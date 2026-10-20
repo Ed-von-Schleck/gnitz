@@ -12,7 +12,6 @@ use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashMap;
 
 use super::constraints::FkEdge;
-use super::sys_tables::CatalogColumn;
 use super::CatalogEngine;
 
 // ---------------------------------------------------------------------------
@@ -22,21 +21,12 @@ use super::CatalogEngine;
 /// What one registered relation's lifetime owns: entered by its registration,
 /// removed by its unregistration.
 pub(in crate::catalog) struct RelationEntry {
-    /// The relation's named record — the one a RESOLVE reply and every push/DDL
-    /// SAL slot carries.
+    /// The relation's [`encode_record`](super::sys_tables::encode_record).
     pub(in crate::catalog) record: Rc<[u8]>,
     /// The FK edges this relation declares as a child.
     pub(in crate::catalog) fks: Vec<FkEdge>,
     /// [`gnitz_wire::TableProps::serial`].
     pub(in crate::catalog) serial: bool,
-}
-
-/// The named record of a relation keyed `pk` over `defs`.
-pub(in crate::catalog) fn encode_record(pk: &[u32], defs: &[CatalogColumn]) -> Rc<[u8]> {
-    Rc::from(gnitz_wire::schema_block::encode(
-        defs.iter().map(|c| c.def.block_col()),
-        pk,
-    ))
 }
 
 impl CatalogEngine {
@@ -131,6 +121,31 @@ pub(in crate::catalog) struct CatalogCacheSet {
     /// [`CatalogEngine::resolve_token`] by relation, computed on first use and
     /// emptied by every hook of a family that can change a RESOLVE answer.
     pub(in crate::catalog) resolve_tokens: RefCell<FxHashMap<u64, u64>>,
+}
+
+impl CatalogCacheSet {
+    /// Enter registered relation `id`'s entry, and index its FK edges by parent.
+    pub(in crate::catalog) fn enter(&mut self, id: u64, entry: RelationEntry) {
+        for e in &entry.fks {
+            self.fk_by_parent.entry(e.parent_tid).or_default().push(*e);
+        }
+        self.relations.insert(id, entry);
+    }
+
+    /// Remove unregistered relation `id`'s entry and its FK edges.
+    pub(in crate::catalog) fn remove(&mut self, id: u64) {
+        let Some(entry) = self.relations.remove(&id) else {
+            return;
+        };
+        for e in entry.fks {
+            if let Entry::Occupied(mut edges) = self.fk_by_parent.entry(e.parent_tid) {
+                edges.get_mut().retain(|x| x.child_tid != id);
+                if edges.get().is_empty() {
+                    edges.remove();
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

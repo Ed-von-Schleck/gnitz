@@ -4,7 +4,7 @@
 //! It lives on this side because nothing links this crate, so the client is the
 //! half that can be pulled in — as a dev-dependency.
 
-use crate::catalog::cache::encode_record;
+use crate::catalog::sys_tables::encode_record;
 use crate::test_support::{arb_schema, cols_of};
 
 use gnitz_wire::schema_block::check_same_types;

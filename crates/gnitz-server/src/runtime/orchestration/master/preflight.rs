@@ -854,7 +854,7 @@ async fn removed_references(
         for (edge, cascades, values) in seeds.drain(..) {
             let FkEdge { child_tid, fk_col, .. } = edge;
             let child = disp.cat().registry.relation_or_err(child_tid)?;
-            let cols = PkColList::from_slice(&[fk_col as u32]);
+            let cols = edge.child_index_cols();
             let index = child
                 .index_on(cols.as_slice())
                 .ok_or_else(|| format!("FK check: no index on child {child_tid} col {fk_col}"))?;
