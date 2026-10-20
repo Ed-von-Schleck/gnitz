@@ -30,8 +30,9 @@ fn a_map_locates_every_field_section_and_list_a_decode_read() {
     );
 }
 
-/// The control header's six words are fields, in layout order, wherever the
-/// frame lies inside the mapped string.
+/// The control header's six words are fields, in layout order, and its blob
+/// is a section behind its length word, wherever the frame lies inside the
+/// mapped string.
 #[test]
 fn a_peeked_control_header_maps_its_six_words() {
     let mut bytes = vec![0xEE; 3];
@@ -47,6 +48,8 @@ fn a_peeked_control_header_maps_its_six_words() {
     let fields: Vec<(usize, usize)> = map.fields.iter().map(|f| (f.at, f.width)).collect();
     assert_eq!(fields, [(3, 4), (7, 4), (11, 8), (19, 8), (27, 8), (35, 8)]);
     assert_eq!(fields.last().map(|&(at, w)| at + w), Some(3 + CTRL_HEADER_SIZE));
+    let blob = 3 + CTRL_HEADER_SIZE;
+    assert_eq!(map.sections, [Section { prefix: 3 + 4, content: blob..blob + 4 }]);
 }
 
 /// A reader over a copy of the bytes notes nothing: a map holds offsets into

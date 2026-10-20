@@ -100,12 +100,9 @@ pub fn write_starts(seeds: &Seeds, starts: &Path) -> io::Result<()> {
         std::fs::write(traffic.join(format!("seed-{i:05}")), input)?;
         let seed = seeds.load(i).map_err(io::Error::other)?;
         for frame in &seed.sent {
-            let anatomy = crate::anatomy::Anatomy::of(&frame.bytes);
-            for s in &anatomy.sections {
-                let text = &frame.bytes[s.content.clone()];
-                if gnitz_expr::LogicalProgram::from_blob(text).is_ok() {
-                    std::fs::write(program.join(format!("{:016x}", gnitz_wire::checksum(text))), text)?;
-                }
+            for p in crate::anatomy::Anatomy::of(&frame.bytes).programs {
+                let text = &frame.bytes[p];
+                std::fs::write(program.join(format!("{:016x}", gnitz_wire::checksum(text))), text)?;
             }
         }
         let replies: Vec<u8> = seed

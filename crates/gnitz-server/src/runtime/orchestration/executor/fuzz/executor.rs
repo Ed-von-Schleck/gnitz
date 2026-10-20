@@ -38,7 +38,7 @@ fn traffic_fuzz() {
     bolero::check!().for_each(|bytes: &[u8]| {
         let input = Input::decode(bytes);
         let seed = &seeds[input.seed as usize % seeds.len()];
-        play(&input.edit(seed.sent.clone()));
+        play(&input.edit(&seed.sent));
     });
 }
 

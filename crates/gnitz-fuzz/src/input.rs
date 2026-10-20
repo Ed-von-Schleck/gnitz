@@ -71,7 +71,8 @@ impl Input {
     }
 
     /// `sent`, a seed's frames, with this input's edits made in order.
-    pub fn edit(&self, mut sent: Vec<Frame>) -> Vec<Frame> {
+    pub fn edit(&self, sent: &[Frame]) -> Vec<Frame> {
+        let mut sent = sent.to_vec();
         for e in &self.edits {
             e.apply(&mut sent);
         }

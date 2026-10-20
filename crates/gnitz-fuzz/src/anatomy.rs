@@ -5,7 +5,8 @@
 //! The decoders draw it ([`gnitz_wire::fields`]); this module knows only where
 //! one encoded structure nests inside another: items inside a multi-item
 //! frame, data blocks inside frames, strings inside blocks, a circuit inside a
-//! `circuits` row's string, and expression programs inside a circuit.
+//! `circuits` row's string, and an expression program in any section a
+//! decoder read.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -49,6 +50,8 @@ pub struct Anatomy {
     pub lists: Vec<List>,
     pub blocks: Vec<Block>,
     pub strings: Vec<StringCell>,
+    /// Every section that decodes as an expression program.
+    pub programs: Vec<Range<usize>>,
 }
 
 impl Anatomy {
@@ -109,14 +112,11 @@ impl Anatomy {
             let at = s.cell - fixed_at;
             fixed[at..at + 16].copy_from_slice(&gnitz_wire::encode_german_string(text, &mut heap));
         }
-        let mut regions = gnitz_wire::Regions::new();
-        for r in 0..layout.num_regions() {
-            let start = layout.region_start(r, rows);
-            regions.push(&fixed[start..start + rows * layout.region_stride(r)]);
-        }
-        regions.push(&heap);
-        let mut out = Vec::new();
-        wal::append_block(&regions, 0, &mut out);
+        // The fixed regions lie back to back, so they are framed whole.
+        let mut out = vec![0; wal::WAL_HEADER_SIZE];
+        wal::write_head(&mut out, rows, fixed.len(), heap.len(), 0);
+        out.extend(fixed);
+        out.extend(heap);
         out
     }
 
@@ -167,15 +167,15 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
     let verb = ctrl.hdr.flags.verb;
     let blob = &frame[ctrl.blob.clone()];
     match verb {
-        ClientVerb::ScanSpec => drop(fields::attempt(|| ReadSpec::decode(blob))),
-        ClientVerb::SyncPushed => drop(fields::attempt(|| txn_frame::decode_held(blob))),
-        ClientVerb::SnapshotPage => drop(fields::attempt(|| gnitz_wire::snapshot::PageRequest::decode(blob))),
+        ClientVerb::ScanSpec => drop(attempt(root, anatomy, || ReadSpec::decode(blob))),
+        ClientVerb::SyncPushed => drop(attempt(root, anatomy, || txn_frame::decode_held(blob))),
+        ClientVerb::SnapshotPage => drop(attempt(root, anatomy, || {
+            gnitz_wire::snapshot::PageRequest::decode(blob)
+        })),
         _ => {}
     }
     let schema = match &ctrl.schema {
-        Some(s) => fields::attempt(|| Schema::from_block(&frame[s.clone()]))
-            .ok()
-            .map(|(s, _)| Arc::new(s)),
+        Some(s) => attempt(root, anatomy, || Schema::from_block(&frame[s.clone()])).map(Arc::new),
         // A DDL_TXN item's rows are its system family's, which the item names.
         None if verb == ClientVerb::DdlTxn => gnitz_wire::sys_family_index(ctrl.hdr.target_id)
             .is_some()
@@ -193,21 +193,17 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
     // verbs' items are frames of their own.
     match verb {
         ClientVerb::ScanMulti => {
-            if let Ok((scans, _)) = fields::attempt(|| txn_frame::decode_scan_multi(body)) {
-                scans
-                    .iter()
-                    .for_each(|s| drop(fields::attempt(|| ReadSpec::decode(s.spec))));
+            for s in attempt(root, anatomy, || txn_frame::decode_scan_multi(body)).unwrap_or_default() {
+                attempt(root, anatomy, || ReadSpec::decode(s.spec));
             }
         }
         ClientVerb::DeltaPoll => {
-            if let Ok((polls, _)) = fields::attempt(|| txn_frame::decode_delta_items(body)) {
-                polls
-                    .iter()
-                    .for_each(|p| drop(fields::attempt(|| ReadSpec::decode(p.spec))));
+            for p in attempt(root, anatomy, || txn_frame::decode_delta_items(body)).unwrap_or_default() {
+                attempt(root, anatomy, || ReadSpec::decode(p.spec));
             }
         }
         _ => {
-            if let Ok((items, _)) = fields::attempt(|| txn_frame::decode_items(body, verb)) {
+            if let Some(items) = attempt(root, anatomy, || txn_frame::decode_items(body, verb)) {
                 for (item, ctrl) in items {
                     walk_frame(root, item, ctrl, anatomy);
                 }
@@ -220,7 +216,7 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
 /// string and what decodes inside one.
 fn walk_block(root: &[u8], block: &[u8], schema: Arc<Schema>, anatomy: &mut Anatomy) {
     let layout = schema.layout();
-    let Ok(((rows, fixed, heap, _), _)) = fields::attempt(|| wal::parse_block(block, layout.row_width())) else {
+    let Some((rows, fixed, heap, _)) = attempt(root, anatomy, || wal::parse_block(block, layout.row_width())) else {
         return;
     };
     let fixed_at = offset(root, fixed);
@@ -267,21 +263,24 @@ fn walk_block(root: &[u8], block: &[u8], schema: Arc<Schema>, anatomy: &mut Anat
         }
     }
     anatomy.blocks.push(Block { range: at..at + block.len(), schema });
+    // What decodes inside a string is a circuit.
     for s in &strings {
-        walk_string(root, s.content.clone());
+        attempt(root, anatomy, || Circuit::decode(&root[s.content.clone()]));
     }
     anatomy.strings.extend(strings);
 }
 
-/// Map whatever decodes inside the string `root[content]`: a circuit, and the
-/// expression programs among its sections.
-fn walk_string(root: &[u8], content: Range<usize>) {
-    let Ok((_, sections)) = fields::attempt(|| Circuit::decode(&root[content])) else {
-        return;
-    };
+/// Run `decode` under the open map, keeping what it read only when it
+/// succeeds, and map each section it read that decodes as an expression
+/// program.
+fn attempt<T, E>(root: &[u8], anatomy: &mut Anatomy, decode: impl FnOnce() -> Result<T, E>) -> Option<T> {
+    let (value, sections) = fields::attempt(decode).ok()?;
     for s in sections {
-        let _ = fields::attempt(|| LogicalProgram::from_blob(&root[s.content]));
+        if fields::attempt(|| LogicalProgram::from_blob(&root[s.content.clone()])).is_ok() {
+            anatomy.programs.push(s.content);
+        }
     }
+    Some(value)
 }
 
 #[cfg(test)]

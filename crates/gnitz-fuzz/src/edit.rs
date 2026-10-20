@@ -34,7 +34,7 @@ pub enum Kind {
     MoveFrame,
 }
 
-const KINDS: [Kind; 9] = [
+pub(crate) const KINDS: [Kind; 9] = [
     Kind::Int,
     Kind::DropItem,
     Kind::RepeatItem,
@@ -162,7 +162,7 @@ fn item(frame: &mut Vec<u8>, pick: u16, how: u64, repeat: bool) {
     };
     frame[list.count..list.count + 2].copy_from_slice(&count.to_le_bytes());
     *frame = match repeat {
-        true => anatomy.splice(frame, item.end..item.end, &frame[item.clone()]),
+        true => anatomy.splice(frame, item.clone(), &frame[item.clone()].repeat(2)),
         false => anatomy.splice(frame, item, &[]),
     };
 }

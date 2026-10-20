@@ -133,10 +133,11 @@ pub(crate) fn note_field(bytes: &[u8]) {
     note(bytes, |m, at| m.map.fields.push(Field { at, width: bytes.len() }));
 }
 
-/// A reader took the section `content` behind the `u32` prefix `prefix`.
+/// A reader took the section `content`, whose length the `u32` `prefix`
+/// states; the content need not follow the prefix.
 pub(crate) fn note_section(prefix: &[u8], content: &[u8]) {
     note(prefix, |m, at| {
-        let start = at + prefix.len();
+        let start = content.as_ptr().addr() - m.root.start;
         m.map.sections.push(Section {
             prefix: at,
             content: start..start + content.len(),

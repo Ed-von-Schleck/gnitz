@@ -36,9 +36,9 @@ const CHECKPOINT_BYTES: &str = "65536";
 /// One connection of a session, and the barrier it waits for.
 struct Conn {
     transport: ClientTransport,
-    barrier: u64,
-    /// The barrier's refusal arrived, or the server closed the connection.
-    settled: bool,
+    /// The barrier whose refusal it waits for: `None` once that refusal
+    /// arrived or the server closed the connection.
+    barrier: Option<u64>,
     /// The server closed it: the next frame on it opens it again.
     closed: bool,
 }
@@ -66,7 +66,7 @@ pub fn run(input: &Input, seed: &Seed, trace: bool) -> Result<(), String> {
         }
     };
     let deadline = Instant::now() + SESSION_BUDGET;
-    let sent = input.edit(seed.sent.clone());
+    let sent = input.edit(&seed.sent);
     let judged = play(&mut srv, &target, &sent, deadline, trace)
         .and_then(|()| read_back(&mut srv, &target))
         .and_then(|()| match boot.crash {
@@ -92,12 +92,7 @@ fn play(srv: &mut ServerHandle, target: &str, sent: &[Frame], deadline: Instant,
         let conn = match conns.entry(frame.conn) {
             Entry::Occupied(c) => c.into_mut(),
             Entry::Vacant(v) => match ClientTransport::connect(target, Instant::now() + Duration::from_secs(5)) {
-                Ok(transport) => v.insert(Conn {
-                    transport,
-                    barrier: 0,
-                    settled: true,
-                    closed: false,
-                }),
+                Ok(transport) => v.insert(Conn { transport, barrier: None, closed: false }),
                 // Refused while it runs: the server may cap connections.
                 Err(_) if srv.is_alive() => continue,
                 Err(_) => return Err(format!("the server died during frame {i}")),
@@ -107,9 +102,9 @@ fn play(srv: &mut ServerHandle, target: &str, sent: &[Frame], deadline: Instant,
             eprintln!("> conn {} frame {i}: {}", frame.conn, describe(&frame.bytes));
         }
         conn.transport.enqueue(frame.bytes.clone());
-        conn.barrier = BARRIER_BASE + i as u64;
-        conn.transport.enqueue(barrier(conn.barrier));
-        conn.settled = false;
+        let id = BARRIER_BASE + i as u64;
+        conn.transport.enqueue(barrier(id));
+        conn.barrier = Some(id);
         pump(&mut conns, frame.conn, deadline, trace).map_err(|e| match e {
             None => format!("frame {i} was not answered within {SESSION_BUDGET:?}"),
             Some(e) => format!("the server sent an undecodable frame: {e}"),
@@ -127,7 +122,7 @@ fn play(srv: &mut ServerHandle, target: &str, sent: &[Frame], deadline: Instant,
 /// server sent, or `None` for a deadline that passed first.
 fn pump(conns: &mut BTreeMap<u32, Conn>, key: u32, deadline: Instant, trace: bool) -> Result<(), Option<String>> {
     loop {
-        if conns[&key].settled {
+        if conns[&key].barrier.is_none() {
             return Ok(());
         }
         let mut fds: Vec<libc::pollfd> = conns
@@ -174,7 +169,7 @@ fn pump(conns: &mut BTreeMap<u32, Conn>, key: u32, deadline: Instant, trace: boo
                                 ctrl.hdr.status, ctrl.hdr.target_id, ctrl.hdr.flags.lane
                             );
                         }
-                        answered |= ctrl.hdr.target_id == barrier && ctrl.hdr.status != WireStatus::Ok;
+                        answered |= Some(ctrl.hdr.target_id) == barrier && ctrl.hdr.status != WireStatus::Ok;
                     }
                     Err(e) => bad = Some(e),
                 }
@@ -183,13 +178,10 @@ fn pump(conns: &mut BTreeMap<u32, Conn>, key: u32, deadline: Instant, trace: boo
             if let Some(e) = bad {
                 return Err(Some(e));
             }
-            if answered {
-                c.settled = true;
+            if answered || read.is_err() {
+                c.barrier = None;
             }
-            if read.is_err() {
-                c.settled = true;
-                c.closed = true;
-            }
+            c.closed |= read.is_err();
         }
     }
 }
