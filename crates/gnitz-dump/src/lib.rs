@@ -164,12 +164,8 @@ async fn dump_at(client: &mut GnitzClient, snapshot: u64, dir: &Path) -> Result<
     fs::create_dir(dir.join("data"))?;
     for rel in relations {
         let class = rel.class();
-        if class == RelClass::Catalog {
-            continue;
-        }
-        manifest.indexes.extend(rel.indexes.iter().map(|i| i.name.clone()));
         match class {
-            RelClass::Catalog => unreachable!("skipped above"),
+            RelClass::Catalog => continue,
             RelClass::Table | RelClass::Stream => {
                 pre.push(gnitz_sql::create_table_statement(&catalog, rel)?);
                 table_indexes.extend(gnitz_sql::create_index_statements(rel));
@@ -198,6 +194,7 @@ async fn dump_at(client: &mut GnitzClient, snapshot: u64, dir: &Path) -> Result<
                 });
             }
         }
+        manifest.indexes.extend(rel.indexes.iter().map(|i| i.name.clone()));
     }
     fs::write(dir.join("schema.sql"), script(&pre))?;
     table_indexes.extend(views);

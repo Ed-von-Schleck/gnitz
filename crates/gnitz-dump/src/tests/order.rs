@@ -24,48 +24,55 @@ fn tree(rows: &[(u64, Option<u64>)]) -> (ZSetBatch, Schema) {
     (batch, schema)
 }
 
-fn ids(batch: &ZSetBatch, order: &[u32]) -> Vec<u64> {
-    order.iter().map(|&r| batch.pks.get(r as usize) as u64).collect()
-}
-
+/// Each row after its parent, and the rows on a reference cycle, and every row
+/// waiting on one, after the rest, in no order of their own.
 #[test]
 fn every_row_comes_after_its_parent() {
-    // Children listed ahead of their parents.
-    let (batch, schema) = tree(&[
-        (4, Some(3)),
-        (3, Some(1)),
-        (2, Some(1)),
-        (1, None),
-        (5, Some(5)),
-        (6, Some(99)),
-    ]);
-    let (order, acyclic) = order(&batch, &schema, &[1]);
-    assert_eq!(ids(&batch, &order), [1, 5, 6, 3, 2, 4]);
-    assert_eq!(acyclic, 6);
-}
-
-#[test]
-fn a_cycle_comes_last() {
-    let (batch, schema) = tree(&[(1, Some(2)), (2, Some(1)), (3, None), (4, Some(1))]);
-    let (order, acyclic) = order(&batch, &schema, &[1]);
-    assert_eq!(ids(&batch, &order), [3, 1, 2, 4]);
-    assert_eq!(acyclic, 1);
-}
-
-#[test]
-fn a_row_waiting_on_a_cycle_comes_at_or_after_its_position() {
-    // 1 and 2 reference each other, 3 is a child of 2, and 4 stands apart.
-    let (batch, schema) = tree(&[(3, Some(2)), (1, Some(2)), (4, None), (2, Some(1))]);
-    let (order, acyclic) = order(&batch, &schema, &[1]);
-    assert_eq!(acyclic, 1);
-    assert_eq!(ids(&batch, &order[..acyclic]), [4]);
-    let mut waiting = ids(&batch, &order[acyclic..]);
-    waiting.sort_unstable();
-    assert_eq!(waiting, [1, 2, 3]);
-}
-
-#[test]
-fn a_table_with_no_reference_keeps_its_order() {
-    let (batch, schema) = tree(&[(2, Some(1)), (1, None)]);
-    assert_eq!(order(&batch, &schema, &[]), (vec![0, 1], 2));
+    /// Rows `(id, parent)`, the referencing columns, the rows in order up to
+    /// the first waiting on a cycle, and the rest.
+    type Case = (
+        &'static [(u64, Option<u64>)],
+        &'static [usize],
+        &'static [u64],
+        &'static [u64],
+    );
+    let cases: [Case; 4] = [
+        // Children listed ahead of their parents, a row referencing itself and
+        // one referencing no row of the table.
+        (
+            &[
+                (4, Some(3)),
+                (3, Some(1)),
+                (2, Some(1)),
+                (1, None),
+                (5, Some(5)),
+                (6, Some(99)),
+            ],
+            &[1],
+            &[1, 5, 6, 3, 2, 4],
+            &[],
+        ),
+        (
+            &[(1, Some(2)), (2, Some(1)), (3, None), (4, Some(1))],
+            &[1],
+            &[3],
+            &[1, 2, 4],
+        ),
+        // 1 and 2 reference each other, 3 is a child of 2, and 4 stands apart.
+        (
+            &[(3, Some(2)), (1, Some(2)), (4, None), (2, Some(1))],
+            &[1],
+            &[4],
+            &[1, 2, 3],
+        ),
+        // A table with no reference keeps its order.
+        (&[(2, Some(1)), (1, None)], &[], &[2, 1], &[]),
+    ];
+    for (rows, refs, head, tail) in cases {
+        let (batch, schema) = tree(rows);
+        let (order, acyclic) = order(&batch, &schema, refs);
+        let mut ids: Vec<u64> = order.iter().map(|&r| batch.pks.get(r as usize) as u64).collect();
+        ids[acyclic..].sort_unstable();
+        assert_eq!((&ids[..acyclic], &ids[acyclic..]), (head, tail), "{rows:?}");
+    }
 }

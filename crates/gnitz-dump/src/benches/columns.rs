@@ -45,69 +45,38 @@ fn scramble(i: usize) -> u64 {
 fn columns_bench() {
     let counter = gnitz_foundation::perf::Counter::instructions();
     let dir = tempfile::tempdir().unwrap();
-    type Fill = Box<dyn Fn(&mut BatchAppender<'_>, usize)>;
-    let cases: Vec<(&str, ColType, bool, Fill)> = vec![
-        (
-            "INT",
-            ColType::of(TypeCode::I32),
-            false,
-            Box::new(|r, i| {
-                r.int_val(i128::from(scramble(i) as i32));
-            }),
-        ),
-        (
-            "BIGINT",
-            ColType::of(TypeCode::I64),
-            false,
-            Box::new(|r, i| {
-                r.int_val(scramble(i) as i64 as i128);
-            }),
-        ),
-        (
-            "DOUBLE",
-            ColType::of(TypeCode::F64),
-            false,
-            Box::new(|r, i| {
-                r.f64_val(scramble(i) as f64 / 3.0);
-            }),
-        ),
-        (
-            "TEXT",
-            ColType::of(TypeCode::String),
-            false,
-            Box::new(|r, i| {
-                r.str_val(&format!("row-{:016x}", scramble(i)));
-            }),
-        ),
-        (
-            "BIGINT NULL",
-            ColType::of(TypeCode::I64),
-            true,
-            Box::new(|r, i| match i % 10 {
-                0 => {
-                    r.null();
-                }
-                _ => {
-                    r.int_val(scramble(i) as i64 as i128);
-                }
-            }),
-        ),
-        (
-            "DECIMAL",
-            ColType::decimal(2),
-            false,
-            Box::new(|r, i| {
-                r.int_val((scramble(i) >> 8) as i64 as i128);
-            }),
-        ),
-        (
-            "UUID",
-            ColType::of(TypeCode::UUID),
-            false,
-            Box::new(|r, i| {
-                r.u128_val(u128::from(scramble(i)) << 64 | u128::from(scramble(i + 1)));
-            }),
-        ),
+    type Fill = fn(&mut BatchAppender<'_>, usize);
+    let cases: [(&str, ColType, bool, Fill); 9] = [
+        ("BOOLEAN", ColType::of(TypeCode::Bool), false, |r, i| {
+            r.int_val(i128::from(scramble(i) & 1));
+        }),
+        ("SMALLINT", ColType::of(TypeCode::I16), false, |r, i| {
+            r.int_val(i128::from(scramble(i) as i16));
+        }),
+        ("INT", ColType::of(TypeCode::I32), false, |r, i| {
+            r.int_val(i128::from(scramble(i) as i32));
+        }),
+        ("BIGINT", ColType::of(TypeCode::I64), false, |r, i| {
+            r.int_val(i128::from(scramble(i) as i64));
+        }),
+        ("DOUBLE", ColType::of(TypeCode::F64), false, |r, i| {
+            r.f64_val(scramble(i) as f64 / 3.0);
+        }),
+        ("TEXT", ColType::of(TypeCode::String), false, |r, i| {
+            r.str_val(&format!("row-{:016x}", scramble(i)));
+        }),
+        ("BIGINT NULL", ColType::of(TypeCode::I64), true, |r, i| {
+            match i % 10 {
+                0 => r.null(),
+                _ => r.int_val(i128::from(scramble(i) as i64)),
+            };
+        }),
+        ("DECIMAL", ColType::decimal(2), false, |r, i| {
+            r.int_val(i128::from((scramble(i) >> 8) as i64));
+        }),
+        ("UUID", ColType::of(TypeCode::UUID), false, |r, i| {
+            r.u128_val(u128::from(scramble(i)) << 64 | u128::from(scramble(i + 1)));
+        }),
     ];
     for (name, ty, nullable, fill) in cases {
         let schema = table(ty, nullable);

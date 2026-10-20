@@ -35,11 +35,10 @@ fn a_manifest_reads_back_as_written() {
 #[test]
 fn another_format_or_version_is_refused() {
     let text = sample().to_json();
-    let other = text.replace(
-        &format!("\"version\": {VERSION}"),
-        &format!("\"version\": {}", VERSION + 1),
-    );
-    assert!(Manifest::from_json(&other).unwrap_err().0.contains("format version"));
+    for version in [0, VERSION + 1] {
+        let other = text.replace(&format!("\"version\": {VERSION}"), &format!("\"version\": {version}"));
+        assert!(Manifest::from_json(&other).unwrap_err().0.contains("format version"));
+    }
     assert!(Manifest::from_json(&text.replace("gnitz-dump", "pg_dump")).is_err());
     assert!(Manifest::from_json("{").is_err());
 }
