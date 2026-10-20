@@ -7,7 +7,7 @@ use std::rc::Rc;
 use super::bloom::BloomFilter;
 use gnitz_wire::PkBuf;
 use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch, StorageError};
-use gnitz_zset::schema::key::{pk_in_range, pk_ranges_overlap, probe_key};
+use gnitz_zset::schema::key::{pk_ranges_overlap, probe_key};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Runs to accumulate before folding them into one: bounds how many runs a
@@ -119,7 +119,7 @@ impl RunSet {
             return;
         }
         for run in self.runs.iter().rev() {
-            if !pk_in_range(pk_min(run), pk_max(run), key) {
+            if !pk_ranges_overlap(pk_min(run), pk_max(run), key, key) {
                 continue;
             }
             let rows = run.pk_rows(key);

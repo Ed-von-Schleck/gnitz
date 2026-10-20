@@ -147,7 +147,8 @@ fn the_encoded_bytes_are_pinned() {
 /// `from_keys` is the one sort: at every stride duplicates collapse and the
 /// list comes out ascending whatever order it went in, which `from_sorted` takes
 /// as given. At every narrow stride, sorting images builds the same list, both
-/// arms of the integer width included; a wide stride keeps the byte sort.
+/// arms of the integer width included. Keys over a two-letter alphabet tie and
+/// share prefixes, so every byte of a wide key decides somewhere.
 #[test]
 fn pk_keys_from_images_is_the_byte_sort() {
     assert_eq!(PkKeys::from_sorted(2, vec![]).bounds(), None);
@@ -160,9 +161,8 @@ fn pk_keys_from_images_is_the_byte_sort() {
     };
     for stride in 1..=MAX_PK_BYTES {
         let mut raw: Vec<Vec<u8>> = (0..64)
-            .map(|_| next().to_be_bytes()[..stride.min(16)].to_vec())
+            .map(|_| (0..stride).map(|_| next() as u8 & 1).collect())
             .collect();
-        raw.iter_mut().for_each(|k| k.resize(stride, 7));
         raw.push(raw[3].clone());
         let mut want = raw.clone();
         want.sort_unstable();

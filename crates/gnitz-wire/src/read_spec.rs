@@ -130,6 +130,24 @@ impl PkKeys {
         if stride <= NARROW_PK_MAX_BYTES {
             return Self::from_images(stride, keys.map(widen_pk_be));
         }
+        if stride <= 2 * NARROW_PK_MAX_BYTES {
+            // Two words, the second right-aligned: equal-width keys order as
+            // the pair does, and the sort moves no pointer into the keys.
+            let mut ks: Vec<[u128; 2]> = keys
+                .map(|k| {
+                    let (hi, lo) = k.split_at(NARROW_PK_MAX_BYTES);
+                    [widen_pk_be(hi), widen_pk_be(lo)]
+                })
+                .collect();
+            ks.sort_unstable();
+            ks.dedup();
+            let mut bytes = Vec::with_capacity(ks.len() * stride);
+            for [hi, lo] in ks {
+                bytes.extend_from_slice(&hi.to_be_bytes());
+                bytes.extend_from_slice(&lo.to_be_bytes()[2 * NARROW_PK_MAX_BYTES - stride..]);
+            }
+            return PkKeys { stride: stride as u8, bytes };
+        }
         let mut ks: Vec<&[u8]> = keys.collect();
         ks.sort_unstable();
         ks.dedup();

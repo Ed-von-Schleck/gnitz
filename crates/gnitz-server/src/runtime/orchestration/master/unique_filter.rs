@@ -5,6 +5,7 @@
 use rustc_hash::FxHashSet;
 
 use super::*;
+use gnitz_wire::PkKeys;
 use gnitz_zset::algebra::append_spans;
 use gnitz_zset::schema::key::probe_key;
 use gnitz_zset::schema::KeySpec;
@@ -75,17 +76,15 @@ pub(super) fn extract_into_filter(filter: &mut UniqueFilter, batch: &gnitz_zset:
 }
 
 impl MasterDispatcher {
-    /// Keep in `order` the entries whose `span` the filter for
-    /// `(table_id, cols)` cannot prove absent: all of them where it has none.
-    pub(super) fn unique_filter_retain_possible<'k>(
-        &self,
-        table_id: u64,
-        cols: PkColList,
-        order: &mut Vec<u32>,
-        span: impl Fn(u32) -> &'k [u8],
-    ) {
-        if let Some(f) = self.unique_filters.borrow().get(&(table_id, cols)) {
-            order.retain(|&x| f.may_contain(span(x)));
+    /// The spans of `keys` the filter for `(table_id, cols)` cannot prove
+    /// absent: all of them where it has none.
+    pub(super) fn unique_filter_retain_possible(&self, table_id: u64, cols: PkColList, keys: PkKeys) -> PkKeys {
+        match self.unique_filters.borrow().get(&(table_id, cols)) {
+            Some(f) => PkKeys::from_sorted(
+                keys.stride(),
+                keys.iter().filter(|k| f.may_contain(k)).flatten().copied().collect(),
+            ),
+            None => keys,
         }
     }
 

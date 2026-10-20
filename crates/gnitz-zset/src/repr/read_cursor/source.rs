@@ -6,7 +6,7 @@ use gnitz_wire::PkKeys;
 
 use super::{PkSetGather, ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
-use crate::schema::key::{sort_indices, KeySpec};
+use crate::schema::key::KeySpec;
 
 /// A chunked source of `Batch`es: a whole cursor, an index range, or a key list.
 pub enum SourceCursor {
@@ -48,7 +48,6 @@ pub struct BoundedIndexCursor {
     spec: KeySpec,
     /// A refill's source PKs in index order, flat at `src`'s `pk_stride`.
     pks: Vec<u8>,
-    order: Vec<u32>,
 }
 
 impl BoundedIndexCursor {
@@ -61,7 +60,6 @@ impl BoundedIndexCursor {
             src: PkSetGather::over(src, none),
             spec,
             pks: Vec::new(),
-            order: Vec::new(),
         }
     }
 
@@ -100,12 +98,8 @@ impl BoundedIndexCursor {
         if taken == 0 {
             return false;
         }
-        sort_indices(&self.pks, stride, &mut self.order);
-        let mut keys = Vec::with_capacity(self.pks.len());
-        for &i in &self.order {
-            keys.extend_from_slice(&self.pks[i as usize * stride..][..stride]);
-        }
-        self.src.reload(PkKeys::from_sorted(stride, keys));
+        self.src
+            .reload(PkKeys::from_keys(stride, self.pks.chunks_exact(stride)));
         true
     }
 }

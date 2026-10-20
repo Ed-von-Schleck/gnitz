@@ -3,8 +3,6 @@
 
 pub(crate) use gnitz_wire::ReduceOutKey;
 pub(crate) use gnitz_wire::TypeCode;
-#[cfg(test)]
-pub(crate) use gnitz_wire::MAX_COLUMNS;
 pub(crate) use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 
 /// Resolved column addressing, homed in the leaf `gnitz-expr` crate so the
@@ -17,19 +15,16 @@ pub(crate) use gnitz_expr::ColumnLocator;
 /// definition. Re-exported so a crate linking `gnitz-zset` alone can name it.
 pub use gnitz_expr::{decode_schema_block, encode_schema_block, SchemaColumn, SchemaDescriptor};
 
-/// Order-preserving primary-key (OPK) primitives — every native→OPK encoder
-/// (whole PK, index leading span), compare/pack, and the
-/// re-export of the width-tagged `PkBuf` those encoders return.
+/// Order-preserving primary-key (OPK) primitives — compare, sort keys, key
+/// ranges, and the index key span.
 pub mod key;
 
 /// The payload row order — the second term of the (PK, payload) total order —
 /// and the per-schema selection between its two comparators.
 pub(crate) mod payload_order;
 
-/// The precomputed per-row read/encode plan for an index's OPK leading-key span.
-/// Lives in [`key`] with the rest of the native→OPK encoders it shares its byte
-/// contract with; re-exported here because a spec is derived from a pair of
-/// schemas.
+/// The precomputed per-row read/encode plan for an index's OPK leading-key span;
+/// re-exported here because a spec is derived from a pair of schemas.
 pub use key::KeySpec;
 
 /// Accumulator for an operator's output schema: its PK columns, then its

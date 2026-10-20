@@ -1,7 +1,12 @@
 //! The descriptor's layout facts, checked against absolute answers.
 
-use crate::{ColumnLocator, SchemaColumn, SchemaDescriptor};
-use gnitz_wire::TypeCode;
+use crate::{decode_schema_block, encode_schema_block, ColumnLocator, SchemaColumn, SchemaDescriptor};
+use gnitz_wire::schema_block::SchemaBlockCol;
+use gnitz_wire::{ColType, TypeCode, MAX_COLUMNS};
+
+fn col(tc: TypeCode) -> SchemaColumn {
+    SchemaColumn::new(tc, false)
+}
 
 /// One case: a column table as `(type_code, nullable)`, and its PK list in
 /// PK-LIST order.
@@ -79,6 +84,10 @@ const CASES: &[Case] = &[
     (&[(TypeCode::U32, false)], &[0]),
 ];
 
+/// Per column: its PK membership, locator and payload slot. Per schema: the
+/// regions lie back to back at their columns' widths, an arena below eight rows
+/// holds exactly its rows, one of eight or more is the fewest rows from there
+/// that start each region 8-aligned, and the schema record round-trips.
 #[test]
 fn layout_facts_match_the_column_table() {
     for &(cols, pk) in CASES {
@@ -153,5 +162,120 @@ fn layout_facts_match_the_column_table() {
             want_not_null | !gnitz_wire::low_bits_mask(next_slot),
             "{ctx}: not_null_payload_slots()"
         );
+        let want_strings = cols
+            .iter()
+            .enumerate()
+            .filter_map(|(ci, &(tc, _))| s.payload_slot(ci).filter(|_| tc.is_german_string()))
+            .fold(0u64, |m, slot| m | 1 << slot);
+        assert_eq!(s.string_payload_slots(), want_strings, "{ctx}: string_payload_slots()");
+
+        // The PK, weight and null regions, then one per payload column.
+        let widths: Vec<usize> = [want_stride, 8, 8]
+            .into_iter()
+            .chain(
+                (0..cols.len())
+                    .filter(|&ci| !pk.contains(&(ci as u32)))
+                    .map(|ci| cols[ci].0.wire_stride()),
+            )
+            .collect();
+        let strides: Vec<usize> = (0..s.num_regions()).map(|r| s.region_stride(r)).collect();
+        assert_eq!(strides, widths, "{ctx}: region strides");
+        for rows in [0, 1, 7, 8, 9, 100] {
+            let aligned = |cap: usize| (0..s.num_regions()).all(|r| s.region_start(r, cap).is_multiple_of(8));
+            let want = match rows {
+                0..8 => rows,
+                _ => (rows..rows + 8)
+                    .find(|&cap| aligned(cap))
+                    .expect("eight rows align any stride"),
+            };
+            assert_eq!(s.arena_rows(rows), want, "{ctx}: {rows} rows");
+        }
+        assert_eq!(decode_schema_block(&encode_schema_block(&s)).unwrap(), s, "{ctx}");
+    }
+}
+
+/// A schema is a trailing append of another iff every earlier column keeps its
+/// position, type and PK membership.
+#[test]
+fn trailing_append_keeps_every_earlier_column() {
+    use TypeCode::{String, I64, U64};
+    let prev = SchemaDescriptor::new(&[col(U64), col(I64)], &[0]);
+    let cases: [(&[SchemaColumn], &[u32], bool, &str); 5] = [
+        (&[col(U64), col(I64)], &[0], true, "unchanged"),
+        (&[col(U64), col(I64), col(String)], &[0], true, "a column appended"),
+        (&[col(U64), col(U64)], &[0], false, "a column retyped"),
+        (&[col(U64), col(I64)], &[1], false, "the PK moved"),
+        (&[col(U64)], &[0], false, "a column dropped"),
+    ];
+    for (cols, pk, want, what) in cases {
+        assert_eq!(
+            SchemaDescriptor::new(cols, pk).is_trailing_append_of(&prev),
+            want,
+            "{what}"
+        );
+    }
+}
+
+/// `covers_pk` asks containment, not equality: any order, and any extra column.
+#[test]
+fn covers_pk_accepts_any_superset_of_the_pk_columns() {
+    let compound = SchemaDescriptor::new(&[col(TypeCode::U64); 4], &[1, 2]);
+    for (cols, want) in [
+        (&[1, 2][..], true),
+        (&[2, 1], true),
+        (&[2, 3, 1], true),
+        (&[1], false),
+        (&[0, 3], false),
+    ] {
+        assert_eq!(compound.covers_pk(cols), want, "{cols:?}");
+    }
+}
+
+/// `try_new` refuses a column count past `MAX_COLUMNS` and forwards the PK rule
+/// with each column's own nullability; the decode of a schema record carrying
+/// either shape refuses it too. The PK rule's own cases are `gnitz-wire`'s.
+#[test]
+fn admission_refuses_what_the_constructor_aborts_on() {
+    let k = col(TypeCode::U64);
+    let cases = [
+        ("nullable PK column", vec![SchemaColumn::new(TypeCode::U64, true)]),
+        ("column count past MAX_COLUMNS", vec![k; MAX_COLUMNS + 1]),
+    ];
+    for (what, cols) in &cases {
+        assert!(SchemaDescriptor::try_new(cols, &[0]).is_err(), "try_new: {what}");
+        let record = gnitz_wire::schema_block::encode(
+            cols.iter().map(|c| SchemaBlockCol {
+                ty: ColType::of(c.type_code),
+                nullable: c.nullable,
+                hidden: false,
+                name: b"k",
+            }),
+            &[0],
+        );
+        assert!(decode_schema_block(&record).is_err(), "decode: {what}");
+    }
+    assert!(SchemaDescriptor::try_new(&[k, k], &[1, 0]).is_ok());
+}
+
+/// A schema record's arity prefix carries no redundancy of its own, so every
+/// flip in it must either be refused or change the descriptor.
+#[test]
+fn no_flip_in_a_schema_records_arity_prefix_is_silently_inert() {
+    let cols = [
+        col(TypeCode::U64),
+        col(TypeCode::I64),
+        SchemaColumn::new(TypeCode::I64, true),
+        SchemaColumn::new(TypeCode::F64, true),
+    ];
+    let reference = SchemaDescriptor::new(&cols, &[0]);
+    let mut buf = encode_schema_block(&reference);
+    for byte in 0..4 + 1 + reference.pk_cols().len() {
+        for bit in 0..8 {
+            buf[byte] ^= 1 << bit;
+            if let Ok(decoded) = decode_schema_block(&buf) {
+                assert_ne!(decoded, reference, "prefix byte {byte} bit {bit} changed nothing");
+            }
+            buf[byte] ^= 1 << bit;
+        }
     }
 }

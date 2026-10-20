@@ -1,98 +1,23 @@
 use super::*;
-use crate::repr::{BatchBuilder, MemBatch};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
+use crate::repr::BatchBuilder;
+use crate::schema::MAX_PK_BYTES;
 use crate::test_support::Rng;
-use crate::test_support::{le_cell, pk_only_schema};
-use gnitz_wire::{cmp_col_window, image_mask, key_image, widen_pk_be};
-
-fn col(tc: TypeCode) -> SchemaColumn {
-    SchemaColumn::new(tc, false)
-}
-
-// ---------------------------------------------------------------------------
-// The OPK encoding and the byte primitives over it
-// ---------------------------------------------------------------------------
-
-/// The typed lexicographic order of two native little-endian PK tuples, laid
-/// out in PK-list order: each column by its own type's order.
-fn typed_cmp(s: &SchemaDescriptor, a: &[u8], b: &[u8]) -> Ordering {
-    let mut off = 0;
-    s.pk_columns()
-        .map(|(_, c)| {
-            let r = off..off + c.size();
-            off = r.end;
-            cmp_col_window(&a[r.clone()], &b[r], c.type_code)
-        })
-        .find(|o| o.is_ne())
-        .unwrap_or(Ordering::Equal)
-}
-
-/// Over random compound PKs — 1..=4 columns of any PK-eligible type, the PK list
-/// in random order — and native tuples sharing a random-length byte prefix, so
-/// later columns and bytes past 16 decide often: a `memcmp` of the OPK keys is
-/// the typed order, and each key column decodes back to its native value.
-#[test]
-fn opk_is_an_order_preserving_bijection() {
-    let pk_types: Vec<TypeCode> = TypeCode::ALL.iter().copied().filter(|t| t.is_pk_eligible()).collect();
-    let mut rng = Rng::new(0x09C4B);
-    for _ in 0..5000 {
-        let cols: Vec<SchemaColumn> = (0..1 + rng.gen_range(4)).map(|_| col(rng.pick(&pk_types))).collect();
-        let mut pk: Vec<u32> = (0..cols.len() as u32).collect();
-        rng.shuffle(&mut pk);
-        let s = SchemaDescriptor::new(&cols, &pk);
-        let a: Vec<u8> = (0..s.pk_stride()).map(|_| rng.next_u64() as u8).collect();
-        let mut b = a.clone();
-        for x in &mut b[rng.gen_range(a.len() as u64 + 1) as usize..] {
-            *x = rng.next_u64() as u8;
-        }
-
-        let natives = |le: &[u8]| -> Vec<u128> {
-            let mut off = 0;
-            s.pk_columns()
-                .map(|(_, c)| {
-                    off += c.size();
-                    le_cell(&le[off - c.size()..off])
-                })
-                .collect()
-        };
-        let (na, nb) = (natives(&a), natives(&b));
-        let (oa, ob) = (s.opk_key_cols(&na), s.opk_key_cols(&nb));
-        assert_eq!(
-            oa.pk_bytes().cmp(ob.pk_bytes()),
-            typed_cmp(&s, &a, &b),
-            "{s:?}: {a:?} vs {b:?}"
-        );
-        let mut off = 0;
-        for ((_, c), &native) in s.pk_columns().zip(&na) {
-            let cell = &oa.pk_bytes()[off..off + c.size()];
-            off += cell.len();
-            assert_eq!(key_image(c.type_code, widen_pk_be(cell)), native, "{s:?}");
-        }
-        assert_eq!(off, oa.pk_bytes().len(), "{s:?}");
-    }
-}
+use crate::test_support::{edge_native, pk_only_schema, random_schema};
+use gnitz_wire::{cmp_col_window, key_image};
 
 /// Every byte primitive over OPK keys, at every PK width and over key pairs
-/// sharing a prefix of every length: each compares, packs or sort-keys exactly
-/// as `memcmp` orders the bytes, and `sort_indices` sorts records by it.
+/// sharing a prefix of every length: each packs, compares or sort-keys exactly
+/// as `memcmp` orders the bytes.
 #[test]
 fn opk_byte_primitives_agree_with_memcmp_at_every_width() {
-    fn naive(pk: &[u8]) -> u128 {
-        let take = pk.len().min(16);
-        let mut buf = [0u8; 16];
-        buf[..take].copy_from_slice(&pk[..take]);
-        u128::from_be_bytes(buf)
-    }
     let mut rng = Rng::new(0xB17E5);
     for w in 0..=MAX_PK_BYTES {
         for _ in 0..16 {
             let a: Vec<u8> = (0..w).map(|_| rng.next_u64() as u8).collect();
-            assert_eq!(pack_pk_be(&a), naive(&a), "w={w}");
-            assert_eq!(u64::from_opk(&a), (naive(&a[..w.min(8)]) >> 64) as u64, "w={w}");
-            // Same width taxonomy as `widen_pk_be`, opposite alignment.
-            if (1..=16).contains(&w) {
-                assert_eq!(pack_pk_be(&a), widen_pk_be(&a) << (8 * (16 - w)), "w={w}");
-            }
+            // The leading 16 bytes, zero-padded, read big-endian.
+            let mut lead = [0u8; 16];
+            lead[..w.min(16)].copy_from_slice(&a[..w.min(16)]);
+            assert_eq!(pack_pk_be(&a), u128::from_be_bytes(lead), "w={w}");
             for pos in 0..=w {
                 let mut b = a.clone();
                 if pos < w {
@@ -108,215 +33,129 @@ fn opk_byte_primitives_agree_with_memcmp_at_every_width() {
                 ));
             }
         }
-        if w > 0 {
-            // A four-letter alphabet, so records tie and share prefixes.
-            let flat: Vec<u8> = (0..64 * w).map(|_| rng.next_u64() as u8 & 3).collect();
-            let rec = |i: u32| &flat[i as usize * w..(i as usize + 1) * w];
-            let mut idx = Vec::new();
-            sort_indices(&flat, w, &mut idx);
-            assert!(idx.windows(2).all(|p| rec(p[0]) <= rec(p[1])), "w={w}");
-            idx.sort_unstable();
-            assert!(idx.iter().copied().eq(0..64), "w={w}: a permutation");
-        }
     }
 }
 
-/// `probe_key` hashes the whole span: keys sharing their leading 16 bytes stay
-/// apart.
+/// Over random schemas — any column types and nullability, the PK anywhere and
+/// in any order — and a random list of distinct PK-eligible columns within the
+/// arity budget, PK or nullable payload, over rows of edge values:
+/// - a base table's own span of a row is its PK region;
+/// - `write_span` skips exactly the rows NULL in an indexed column, and
+///   otherwise writes the seek prefix of the indexed values' key images;
+/// - spans `memcmp` as the indexed values' typed lexicographic order;
+/// - the span schema is the key columns at their own types, the index schema
+///   those then the source PK, so an entry splits at the span's width.
 #[test]
-fn probe_key_reads_past_the_leading_16_bytes() {
-    let wide = |tail: u8| [[7u8; 16].as_slice(), &[tail; 8]].concat();
-    assert_ne!(probe_key(&wide(3)), probe_key(&wide(4)));
-}
+fn key_spans_encode_the_typed_order_of_their_columns() {
+    let mut rng = Rng::new(0x09C4B);
+    for _ in 0..2000 {
+        let s = random_schema(&mut rng, TypeCode::ALL, true);
+        let tc = |c: usize| s.columns()[c].type_code;
 
-// ---------------------------------------------------------------------------
-// Key ranges and confinement
-// ---------------------------------------------------------------------------
-
-/// `increment_key_in_place` is `+1` with carry and reports a carry-out;
-/// `decrement_key_in_place` undoes it — over every key of up to two bytes.
-#[test]
-fn key_increment_and_decrement_are_inverse_steps() {
-    for w in 0..=2usize {
-        let be = |x: u32| x.to_be_bytes()[4 - w..].to_vec();
-        let max = (1u32 << (8 * w)) - 1;
-        for v in 0..=max {
-            let mut k = be(v);
-            assert_eq!(increment_key_in_place(&mut k), v != max, "w={w} v={v}");
-            assert_eq!(k, be(if v == max { 0 } else { v + 1 }), "w={w} v={v}");
-            if v != max {
-                decrement_key_in_place(&mut k);
-                assert_eq!(k, be(v), "w={w} v={v}");
+        // Each row's natives by column, `None` for NULL or an unindexable value.
+        let mut natives: Vec<Vec<Option<u128>>> = Vec::new();
+        let mut bb = BatchBuilder::new(&s);
+        for _ in 0..8 {
+            let mut row: Vec<Option<u128>> = (0..s.num_columns()).map(|_| None).collect();
+            for (c, _) in s.pk_columns() {
+                row[c] = Some(edge_native(&mut rng, tc(c)));
             }
+            let pk: Vec<u128> = s.pk_columns().map(|(c, _)| row[c].unwrap()).collect();
+            bb.begin_row_natives(&pk, 1);
+            // Payload slots run in schema order.
+            for c in (0..s.num_columns()).filter(|&c| !s.is_pk_col(c)) {
+                let col = s.columns()[c];
+                if col.nullable && rng.gen_range(4) == 0 {
+                    bb.put_null();
+                } else if col.type_code.is_pk_eligible() {
+                    let v = edge_native(&mut rng, col.type_code);
+                    bb.put_int(v);
+                    row[c] = Some(v);
+                } else if col.type_code.is_german_string() {
+                    bb.put_blob(b"x");
+                } else {
+                    bb.put_float(0.0);
+                }
+            }
+            bb.end_row();
+            natives.push(row);
         }
-    }
-}
+        let b = bb.finish();
+        let mb = b.as_mem_batch();
 
-// ---------------------------------------------------------------------------
-// Index key spans
-// ---------------------------------------------------------------------------
-
-/// An index schema is the key columns at their own types then the source PK, all
-/// in the PK, and its span schema the key columns alone. A key column list
-/// follows the PK rule with nullability waived, and the index record the PK
-/// arity limit.
-#[test]
-fn index_schema_is_the_key_at_its_own_types_then_the_source_pk() {
-    use TypeCode::{I128, I16, I32, I64, I8, U128, U32, U64};
-    let src = SchemaDescriptor::new(&[col(U64), col(U32), col(U128)], &[0]);
-    let (spec, index) = spec_and_index_schema(&[1, 2], &src).unwrap();
-    assert_eq!(index, pk_only_schema(&[U32, U128, U64]));
-    assert_eq!(spec.span_schema(), pk_only_schema(&[U32, U128]));
-    assert_eq!(spec.key_size(), 20);
-    for t in [I8, I16, I32, I64, I128] {
-        let src = SchemaDescriptor::new(&[col(U64), SchemaColumn::new(t, true)], &[0]);
-        let (spec, index) = spec_and_index_schema(&[1], &src).unwrap();
-        assert_eq!(index, pk_only_schema(&[t, U64]), "{t}");
-        assert_eq!(spec.span_schema(), pk_only_schema(&[t]), "{t}");
-    }
-
-    let wide = SchemaDescriptor::new(&[col(U64); MAX_PK_COLUMNS + 1], &[0, 1]);
-    let key: Vec<u32> = (2..=MAX_PK_COLUMNS as u32).collect();
-    assert!(spec_and_index_schema(&key[1..], &wide).is_ok(), "arity MAX_PK_COLUMNS");
-    assert!(spec_and_index_schema(&key, &wide).is_err(), "arity MAX_PK_COLUMNS + 1");
-
-    let mixed = SchemaDescriptor::new(&[col(U64), col(U32), col(TypeCode::F64), col(TypeCode::String)], &[0]);
-    for (cols, why) in [
-        (&[][..], "must name at least one column"),
-        (&[1, 1], "names column 1 twice"),
-        (&[9], "index 9 out of bounds"),
-        (&[2], "column 2 has type_code F64"),
-        (&[3], "column 3 has type_code STRING"),
-    ] {
-        let err = KeySpec::new(cols, &mixed)
-            .err()
-            .unwrap_or_else(|| panic!("{cols:?} must be refused"));
-        assert!(
-            err.starts_with("Index: column list ") && err.contains(why),
-            "{cols:?}: {err}"
-        );
-    }
-}
-
-/// The span `write_span` writes for a row: each indexed column decoded to its
-/// native value and encoded through the seek side. `None` is the NULL skip.
-fn write_span_reference(
-    owner: &SchemaDescriptor,
-    spec: &KeySpec,
-    cols: &[u32],
-    mb: &MemBatch<'_>,
-    row: usize,
-) -> Option<PkBuf> {
-    let mut images = Vec::with_capacity(cols.len());
-    for &c in cols {
-        let loc = owner.locate(c as usize);
-        if loc.is_null(mb, row) {
-            return None;
+        let own = KeySpec::for_pk(&s);
+        assert_eq!(own.span_schema(), s.pk_only(), "{s:?}");
+        for row in 0..b.len() {
+            let mut span = [0u8; MAX_PK_BYTES];
+            assert!(own.write_span(&mb, row, &mut span), "{s:?}");
+            assert_eq!(&span[..own.key_size()], mb.get_pk_bytes(row), "{s:?} row={row}");
         }
-        let mut scratch = [0u8; 16];
-        images.push(key_image(
-            loc.type_code(),
-            le_cell(loc.native_le_bytes(mb, row, &mut scratch)),
-        ));
-    }
-    Some(spec.seek_prefix(&images))
-}
 
-/// Over a compound PK, so an indexed PK column sits at a non-zero byte offset,
-/// and a nullable payload column indexed leading and trailing: `write_span`
-/// writes the reference span and skips exactly the row NULL in an indexed
-/// column.
-#[test]
-fn write_span_matches_the_reference_on_compound_null_and_entry_shapes() {
-    let src = SchemaDescriptor::new(
-        &[
-            col(TypeCode::U32),
-            col(TypeCode::I64),
-            SchemaColumn::new(TypeCode::I32, true),
-        ],
-        &[0, 1],
-    );
-    let mut bb = BatchBuilder::new(&src);
-    for (i, (a, v)) in [(7u32, -1i64), (0, 0), (u32::MAX, i64::MIN), (3, i64::MAX)]
-        .into_iter()
-        .enumerate()
-    {
-        bb.begin_row_natives(&[a as u128, v as u64 as u128], 1);
-        bb.put_int(-(i as i32) as u128);
-        bb.end_row();
-    }
-    bb.begin_row_natives(&[9, 5], 1);
-    bb.put_null();
-    bb.end_row();
-    let b = bb.finish();
-    let null_row = b.len() - 1;
-    let mb = b.as_mem_batch();
-    let stride = src.pk_stride();
+        let budget = MAX_PK_COLUMNS - s.pk_cols().len();
+        if budget == 0 {
+            continue;
+        }
+        let mut cols: Vec<u32> = (0..s.num_columns() as u32)
+            .filter(|&c| tc(c as usize).is_pk_eligible())
+            .collect();
+        rng.shuffle(&mut cols);
+        cols.truncate(1 + rng.gen_range(budget.min(cols.len()) as u64) as usize);
+        let spec = KeySpec::new(&cols, &s).unwrap();
+        let types: Vec<TypeCode> = cols.iter().map(|&c| tc(c as usize)).collect();
+        assert_eq!(spec.span_schema(), pk_only_schema(&types), "{s:?} {cols:?}");
+        let src_pk = s.pk_columns().map(|(c, _)| tc(c));
+        let index = spec.index_schema(&s);
+        assert_eq!(index, pk_only_schema(&[types.clone(), src_pk.collect()].concat()));
+        assert_eq!(index.pk_stride(), spec.key_size() + s.pk_stride(), "{s:?} {cols:?}");
 
-    for cols in [[1u32, 2], [2, 1]] {
-        let (spec, idx) = KeySpec::new(&cols, &src)
-            .map(|spec| (spec, spec.index_schema(&src)))
-            .unwrap();
-        // The width `split_entry` splits a stored entry at.
-        assert_eq!(idx.pk_stride(), spec.key_size() + stride);
+        let key = |row: usize| -> Option<Vec<u128>> { cols.iter().map(|&c| natives[row][c as usize]).collect() };
+        let mut spans: Vec<(Vec<u128>, Vec<u8>)> = Vec::new();
         for row in 0..b.len() {
             let mut span = [0u8; MAX_PK_BYTES];
             let written = spec.write_span(&mb, row, &mut span);
+            let want = key(row);
             assert_eq!(
                 written,
-                row != null_row,
-                "{cols:?} row={row}: only the NULL row is skipped"
+                want.is_some(),
+                "{s:?} {cols:?} row={row}: only a NULL row is skipped"
             );
-            let want = write_span_reference(&src, &spec, &cols, &mb, row);
-            assert_eq!(
-                want.as_ref().map(|w| w.pk_bytes()),
-                written.then(|| &span[..spec.key_size()]),
-                "{cols:?} row={row}"
-            );
+            if let Some(vals) = want {
+                let images: Vec<u128> = vals.iter().zip(&types).map(|(&v, &t)| key_image(t, v)).collect();
+                let span = span[..spec.key_size()].to_vec();
+                assert_eq!(span, spec.seek_prefix(&images).pk_bytes(), "{s:?} {cols:?} row={row}");
+                spans.push((vals, span));
+            }
+        }
+        for (va, sa) in &spans {
+            for (vb, sb) in &spans {
+                let typed = va
+                    .iter()
+                    .zip(vb)
+                    .zip(&types)
+                    .map(|((a, b), &t)| {
+                        let w = t.wire_stride();
+                        cmp_col_window(&a.to_le_bytes()[..w], &b.to_le_bytes()[..w], t)
+                    })
+                    .find(|o| o.is_ne())
+                    .unwrap_or(Ordering::Equal);
+                assert_eq!(sa.cmp(sb), typed, "{s:?} {cols:?}: {va:?} vs {vb:?}");
+            }
         }
     }
 }
 
-/// For every indexable type, whether the column is payload or the table's PK:
-/// the span the write path stores for a value is the span a seek for that value
-/// builds, and spans sort as the values do.
+/// A key column list follows the PK rule with nullability waived, under the
+/// index's role prefix, and the index record — the key columns, then the
+/// owner's PK — the PK arity limit.
 #[test]
-fn index_spans_equal_the_seek_prefix_and_sort_as_the_values() {
-    for &t in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
-        let sz = t.wire_stride();
-        let mask = image_mask(sz);
-        let top = 1u128 << (8 * sz - 1);
-        // Natives in ascending typed order.
-        let values = match t.is_signed_int() {
-            true => [top, mask, 0, 1, mask >> 1],
-            false => [0, 1, top - 1, top, mask],
-        };
-        let payload_src = SchemaDescriptor::new(&[col(TypeCode::U64), col(t)], &[0]);
-        let pk_src = SchemaDescriptor::new(&[col(t), col(TypeCode::U64)], &[0]);
-        let mut prev: Option<Vec<u8>> = None;
-        for native in values {
-            let seek = KeySpec::new(&[1], &payload_src)
-                .unwrap()
-                .seek_prefix(&[key_image(t, native)]);
-            for (src, c) in [(payload_src, 1u32), (pk_src, 0)] {
-                let mut bb = BatchBuilder::new(&src);
-                bb.begin_row_natives(&[if c == 0 { native } else { 1 }], 1);
-                bb.put_int(if c == 0 { 0 } else { native });
-                bb.end_row();
-                let b = bb.finish();
-                let spec = KeySpec::new(&[c], &src).unwrap();
-                let mut entry = [0u8; MAX_PK_BYTES];
-                assert!(spec.write_span(&b.as_mem_batch(), 0, &mut entry));
-                assert_eq!(&entry[..spec.key_size()], seek.pk_bytes(), "{t} {native:#x}");
-            }
-            if let Some(p) = &prev {
-                assert!(p[..] < *seek.pk_bytes(), "{t}: spans out of value order at {native:#x}");
-            }
-            prev = Some(seek.pk_bytes().to_vec());
-        }
-    }
-}
-
-fn spec_and_index_schema(cols: &[u32], source: &SchemaDescriptor) -> Result<(KeySpec, SchemaDescriptor), String> {
-    KeySpec::new(cols, source).map(|spec| (spec, spec.index_schema(source)))
+fn key_spec_refuses_a_list_past_the_pk_rule_or_the_arity_budget() {
+    let wide = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false); MAX_PK_COLUMNS + 1], &[0, 1]);
+    let key: Vec<u32> = (2..=MAX_PK_COLUMNS as u32).collect();
+    assert!(KeySpec::new(&key[1..], &wide).is_ok(), "arity MAX_PK_COLUMNS");
+    assert!(KeySpec::new(&key, &wide).is_err(), "arity MAX_PK_COLUMNS + 1");
+    let err = KeySpec::new(&[2, 2], &wide).err().expect("a repeat is refused");
+    assert!(
+        err.starts_with("Index: column list ") && err.contains("names column 2 twice"),
+        "{err}"
+    );
 }

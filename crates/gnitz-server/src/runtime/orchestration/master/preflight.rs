@@ -559,8 +559,6 @@ fn plan_unique_checks<'a>(
         for &(col_indices, _, spec) in &t.cons.uniques {
             let key_size = spec.key_size();
 
-            // The surviving spans as a flat arena plus an order vector, so the
-            // sort moves 4-byte indices.
             let mut spans: Vec<u8> = Vec::with_capacity(t.fold.len() * key_size);
             for (_pk, fam, row) in b.surviving(tid) {
                 let at = spans.len();
@@ -570,12 +568,10 @@ fn plan_unique_checks<'a>(
                     spans.truncate(at);
                 }
             }
-            let span = |i: u32| &spans[i as usize * key_size..(i as usize + 1) * key_size];
-            let mut order: Vec<u32> = Vec::new();
-            gnitz_zset::schema::key::sort_indices(&spans, key_size, &mut order);
-            // `surviving` yields each PK once, so an adjacent-equal pair is two
-            // rows of the bundle claiming one span.
-            if order.windows(2).any(|w| span(w[0]) == span(w[1])) {
+            let keys = PkKeys::from_keys(key_size, spans.chunks_exact(key_size));
+            // `surviving` yields each PK once, so a span the dedup collapsed is
+            // two rows of the bundle claiming it.
+            if keys.len() * key_size != spans.len() {
                 violation.get_or_insert_with(|| {
                     unique_violation_err(disp.cat(), tid, col_indices.as_slice(), Clash::InBatch)
                 });
@@ -583,12 +579,11 @@ fn plan_unique_checks<'a>(
             }
 
             // A span the filter proves absent has no committed holder to answer for.
-            disp.unique_filter_retain_possible(tid, col_indices, &mut order, span);
-            if order.is_empty() {
+            let keys = disp.unique_filter_retain_possible(tid, col_indices, keys);
+            if keys.is_empty() {
                 continue;
             }
             let rel = disp.cat().registry.relation_or_err(tid)?;
-            let keys = PkKeys::from_sorted(key_size, order.iter().flat_map(|&x| span(x)).copied().collect());
             let plan = Rule::Unique { cols: col_indices, spec };
             checks.push(Check::new(rel, Probe::Index(col_indices, NonZeroU64::MAX), keys, plan)?);
         }

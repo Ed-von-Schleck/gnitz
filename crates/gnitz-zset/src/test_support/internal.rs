@@ -128,6 +128,15 @@ pub(crate) fn le_cell(cell: &[u8]) -> u128 {
     u128::from_le_bytes(v)
 }
 
+/// A native of the integer type `tc` drawn from its zero, one, signed extremes
+/// and all-ones, zero-extended: values tie often, so a tie falls through to the
+/// next column.
+pub(crate) fn edge_native(rng: &mut crate::test_support::Rng, tc: TypeCode) -> u128 {
+    let mask = gnitz_wire::image_mask(tc.wire_stride());
+    let top = (mask >> 1) + 1;
+    rng.pick(&[0, 1, top - 1, top, mask])
+}
+
 /// A random schema: `1..=MAX_PK_COLUMNS` PK columns of PK-eligible types and
 /// `0..=6` payload columns drawn from `payload`, nullable or not, all
 /// interleaved at random positions, with the PK list in random order.

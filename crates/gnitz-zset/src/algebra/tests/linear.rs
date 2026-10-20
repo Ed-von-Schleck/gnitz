@@ -162,8 +162,8 @@ fn the_null_extend_schema_and_the_widened_rows_agree_on_both_sides() {
 fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
     let guard = format!(
         "null-extend: merged schema column count {} exceeds MAX_COLUMNS ({})",
-        crate::schema::MAX_COLUMNS + 1,
-        crate::schema::MAX_COLUMNS
+        gnitz_wire::MAX_COLUMNS + 1,
+        gnitz_wire::MAX_COLUMNS
     );
     let extend = |s: &SchemaDescriptor, n: usize| null_extend_output_schema(s, &vec![TypeCode::I64; n], false);
     let narrow = make_schema_u64_i64();
@@ -174,7 +174,7 @@ fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
     // overflows, which a bound on the list length misses.
     let wide = u64_pk_schema(&vec![
         SchemaColumn::new(TypeCode::I64, false);
-        crate::schema::MAX_COLUMNS - 2
+        gnitz_wire::MAX_COLUMNS - 2
     ]);
     assert!(extend(&wide, 1).is_ok());
     assert_eq!(extend(&wide, 2).expect_err("overflow").to_string(), guard);

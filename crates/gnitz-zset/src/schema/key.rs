@@ -1,7 +1,7 @@
 //! Order-preserving primary-key (OPK) primitives.
 //!
-//! These pure layout/key operations compare two OPK regions with a raw `memcmp`,
-//! pack a narrow region into a sort key, derive the half-open key range a
+//! These pure layout/key operations compare two OPK regions in byte order,
+//! pack a region into a fixed-width sort key, derive the half-open key range a
 //! `KeyRange`'s cut pair denotes, and compose a multi-column key span
 //! ([`KeySpec`]). The per-column codec is `gnitz_wire::pk`'s, shared with the
 //! client.
@@ -13,31 +13,6 @@ use gnitz_wire::{KeyRange, NARROW_PK_MAX_BYTES};
 use gnitz_wire::{PkBuf, PkListRole};
 
 use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_COLUMNS};
-
-/// Sort `idx` into the order of `flat`'s `stride`-byte records, which stay in
-/// place. A record of at most 16 bytes is sorted by its [`PkSortKey`] image.
-pub fn sort_indices(flat: &[u8], stride: usize, idx: &mut Vec<u32>) {
-    fn by_image<'a, K: PkSortKey<'a>>(flat: &'a [u8], stride: usize, idx: &mut Vec<u32>) {
-        let mut pairs: Vec<(K, u32)> = flat.chunks_exact(stride).map(K::from_opk).zip(0..).collect();
-        pairs.sort_unstable();
-        idx.extend(pairs.iter().map(|&(_, i)| i));
-    }
-    let n = flat.len() / stride;
-    assert!(n <= u32::MAX as usize, "record count exceeds u32");
-    idx.clear();
-    match stride {
-        0..=8 => by_image::<u64>(flat, stride, idx),
-        9..=16 => by_image::<u128>(flat, stride, idx),
-        _ => {
-            idx.extend(0..n as u32);
-            idx.sort_unstable_by(|&a, &b| {
-                let a = a as usize * stride;
-                let b = b as usize * stride;
-                flat[a..a + stride].cmp(&flat[b..b + stride])
-            });
-        }
-    }
-}
 
 /// Typed lexicographic OPK ordering of two **equal-length** PK regions — the
 /// comparator the read-cursor loser tree reads through its sources. Slice order
@@ -62,14 +37,8 @@ pub(crate) fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
 /// reasoning and its `pk_bytes_eq(a, b) == (a == b)` guarantee. Use at every
 /// merge/group fold or probe that tests "same PK".
 #[inline(always)]
-pub fn pk_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn pk_bytes_eq(a: &[u8], b: &[u8]) -> bool {
     compare_pk_ordering(a, b) == Ordering::Equal
-}
-
-/// `min <= key <= max` over OPK bytes.
-#[inline]
-pub fn pk_in_range(min: &[u8], max: &[u8], key: &[u8]) -> bool {
-    min <= key && key <= max
 }
 
 /// The **inclusive** OPK ranges `[min, max]` and `[lo, hi]` intersect — whether a
@@ -97,13 +66,14 @@ pub fn pk_ranges_overlap(min: &[u8], max: &[u8], lo: &[u8], hi: &[u8]) -> bool {
 /// value occupies the high bits, the low bits zero; `≥16` reads the
 /// order-preserving leading 16 bytes). The remaining arms compose the same
 /// fixed-width loads: none copies through a runtime length, which would be an
-/// out-of-line `memcpy` per key.
+/// out-of-line `memcpy` per key. Kept apart from `gnitz_wire::widen_pk_be`'s
+/// right-aligned image, which retires more instructions per compare at 8, 12
+/// and 16 bytes.
 ///
 /// NOT a value accessor — for a U64 OPK value 1 (`[0,…,0,1]` at `[..8]`) this
-/// packs as `1·2^64`, not 1. Opposite alignment from `gnitz_wire::widen_pk_be`
-/// (right-aligned value recovery); never conflate them.
+/// packs as `1·2^64`, not 1.
 #[inline(always)]
-pub fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
+pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
     match pk_bytes.len() {
         8 => (u64::from_be_bytes(pk_bytes[..8].try_into().unwrap()) as u128) << 64,
         len if len >= 16 => u128::from_be_bytes(pk_bytes[..16].try_into().unwrap()),
@@ -187,8 +157,6 @@ impl PkSortKey<'_> for u64 {
 impl PkSortKey<'_> for u128 {
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> u128 {
-        // Identical left-align to `u64`, one width up; `pack_pk_be` is the canonical
-        // left-align-to-`u128`, reused here. Dispatched only for strides ≤ 16.
         pack_pk_be(opk)
     }
 }
@@ -340,7 +308,7 @@ impl KeySpec {
 
     /// The leading-key span of one key image per leading spec column: what
     /// [`Self::write_span`] writes for those values.
-    pub fn seek_prefix(&self, images: &[u128]) -> PkBuf {
+    fn seek_prefix(&self, images: &[u128]) -> PkBuf {
         let k = images.len();
         debug_assert!(
             k >= 1 && k <= self.n as usize,
@@ -380,7 +348,7 @@ impl KeySpec {
 }
 
 // ---------------------------------------------------------------------------
-// Byte successor / predecessor and cut → key-range derivation
+// Byte successor and cut → key-range derivation
 // ---------------------------------------------------------------------------
 
 /// Fixed-width byte-string successor: `p + 1` with carry, in place. Returns
@@ -395,18 +363,6 @@ fn increment_key_in_place(p: &mut [u8]) -> bool {
         }
     }
     false
-}
-
-/// Fixed-width byte-string predecessor: `p - 1` with borrow, in place — the
-/// mirror of [`increment_key_in_place`]. An all-zero `p` borrows out and wraps to
-/// all-`0xFF`; the sole caller never passes one.
-fn decrement_key_in_place(p: &mut [u8]) {
-    for b in p.iter_mut().rev() {
-        *b = b.wrapping_sub(1);
-        if *b != 0xFF {
-            return;
-        }
-    }
 }
 
 /// A cut in the OPK key space, named by an OPK group prefix: either that
@@ -461,18 +417,14 @@ pub fn key_range_between_cuts(start: KeyCut, end: KeyCut, stride: usize) -> Opti
 }
 
 /// Whether every key of a non-empty band `[start, end)` shares its leading `prefix`
-/// bytes — the bytes a worker owner hashes. OPK order is byte order, so the first and
-/// last keys decide; a band with no `end` runs to the all-`0xFF` key.
+/// bytes — the bytes a worker owner hashes. OPK order is byte order, so the band
+/// stays in `start`'s prefix group iff it ends at or below the first key above
+/// that group; a group with no key above it reaches the top of the key space.
 pub(crate) fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> bool {
-    let last = match end {
-        Some(e) => {
-            let mut l = *e;
-            decrement_key_in_place(l.pk_bytes_mut());
-            l
-        }
-        None => PkBuf::max(start.pk_bytes().len()),
-    };
-    start.pk_bytes()[..prefix] == last.pk_bytes()[..prefix]
+    let start = start.pk_bytes();
+    KeyCut::above(&start[..prefix])
+        .key(start.len())
+        .is_none_or(|above| end.is_some_and(|e| e.pk_bytes() <= above.pk_bytes()))
 }
 
 #[cfg(test)]

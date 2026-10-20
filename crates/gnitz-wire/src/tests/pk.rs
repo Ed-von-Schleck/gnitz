@@ -113,7 +113,7 @@ fn the_column_codec_is_the_cell_codec_per_row() {
 fn widen_pk_be_matches_the_general_form() {
     let mixed: [u8; 16] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(1));
     for bytes in [mixed, [0u8; 16], [0xFFu8; 16]] {
-        for stride in 1..=16usize {
+        for stride in 0..=16usize {
             let mut buf = [0u8; 16];
             buf[16 - stride..].copy_from_slice(&bytes[..stride]);
             assert_eq!(

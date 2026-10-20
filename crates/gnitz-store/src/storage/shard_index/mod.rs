@@ -10,7 +10,7 @@ use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
 use gnitz_zset::repr::StorageError;
 use gnitz_zset::repr::{guard_slot, Codebook, MappedShard};
-use gnitz_zset::schema::key::pk_in_range;
+use gnitz_zset::schema::key::pk_ranges_overlap;
 use gnitz_zset::schema::SchemaDescriptor;
 
 mod index;
@@ -145,7 +145,7 @@ impl ShardEntry {
     /// any. `filter_key` is `probe_key(key)` — the caller hoists it because it is
     /// the same value for every shard in one sweep.
     fn probe_pk_bytes(&self, key: &[u8], filter_key: u64) -> Option<Range<usize>> {
-        if !pk_in_range(self.pk_min.pk_bytes(), self.pk_max.pk_bytes(), key) {
+        if !pk_ranges_overlap(self.pk_min.pk_bytes(), self.pk_max.pk_bytes(), key, key) {
             return None;
         }
         if !self.shard.shard_filter_may_contain(filter_key) {

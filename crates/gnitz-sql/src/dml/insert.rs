@@ -325,8 +325,8 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<InsertPl
         for &(payload_idx, ci, col_def) in &payload {
             if col_def.is_hidden {
                 // Logical-dropped column: a zero-filled NOT-NULL filler cell (null
-                // bit left unset), keeping the batch rectangular and the table on
-                // the FixedIntNonnull comparator. The value is unobservable.
+                // bit left unset), keeping the batch rectangular and a payload of
+                // non-null fixed-width integers non-null. The value is unobservable.
                 rows.payload[payload_idx].push_zero();
                 continue;
             }

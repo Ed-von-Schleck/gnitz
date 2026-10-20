@@ -3,11 +3,12 @@ use gnitz_wire::{MapKind, NullKeys, ReindexRole};
 
 use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_COLUMNS, MAX_PK_COLUMNS};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_COLUMNS};
 use crate::test_support::{
     make_batch, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk, pk_payload_schema, rekey_plan, u64_pk_schema,
     weighted_rows,
 };
+use gnitz_wire::MAX_COLUMNS;
 
 /// `(pk, weight, payload cells)` rows against `schema`, `None` a NULL cell.
 pub(super) fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &[Option<i64>])]) -> Batch {
