@@ -11,112 +11,101 @@ const NW: usize = 3;
 /// One page of blocks past the head.
 const SMALL_OUTBOX: usize = BLOCKS_AT + PAGE_BYTES;
 
-fn meshes(nw: usize) -> Vec<Mesh> {
-    super::fixtures::meshes(nw, SMALL_OUTBOX)
+/// `nw` workers' views of one mesh of `outbox_bytes` outboxes, over parks of
+/// their own.
+pub(super) fn meshes(nw: usize, outbox_bytes: usize) -> Vec<Mesh> {
+    create(outbox_bytes, WorkerParks::create(nw).expect("map the parks")).expect("map the mesh")
 }
 
-/// Routing by the leading PK column of `schema`.
+/// Routing by the PK of `schema`.
 pub(super) fn by_pk(schema: &SchemaDescriptor) -> ScatterPlan {
-    ScatterPlan::group(schema, &[0]).unwrap()
+    ScatterPlan::native(Placement::full_pk(schema))
 }
 
-/// The receiver of 2 that [`by_pk`] routes a U64 `pk` to.
-fn owner(pk: u64) -> usize {
-    let schema = make_schema_u64_i64();
-    Placement::full_pk(&schema)
-        .owner(&opk_pk(&schema, &[pk as u128]), 2)
-        .expect("a keyed placement owns every key")
-}
-
-/// The first `n` pks from `from` up that [`owner`] routes to receiver `r`.
+/// The first `n` U64 pks from `from` up that [`by_pk`] routes to receiver `r` of 2.
 fn owned_by(r: usize, from: u64, n: usize) -> Vec<u64> {
+    let schema = make_schema_u64_i64();
+    let placement = Placement::full_pk(&schema);
+    let owner = |pk: u64| {
+        placement
+            .owner(&opk_pk(&schema, &[pk as u128]), 2)
+            .expect("a keyed placement owns every key")
+    };
     (from..).filter(|&pk| owner(pk) == r).take(n).collect()
 }
 
-/// Worker `w`'s partition in round `round`: distinct per worker and per round, so
-/// a slice read from the wrong outbox shows.
-fn partition(w: usize, round: u64) -> Batch {
-    let rows: Vec<(u64, i64, i64)> = (0..8u64)
-        .map(|i| {
-            (
-                round * 1000 + w as u64 * 100 + i,
-                1 + i as i64 % 2,
-                (round * 10 + w as u64) as i64,
-            )
-        })
-        .collect();
+/// Worker `w`'s `n` rows of round `round`, consolidated: every worker sends the
+/// same elements at weight `1 + w`, so a gather must sum across senders, and a
+/// block read from the wrong worker or round shows.
+pub(super) fn partition(w: usize, round: u64, n: u64) -> Batch {
+    let rows: Vec<(u64, i64, i64)> = (0..n).map(|i| (round * n + i, 1 + w as i64, (i % 7) as i64)).collect();
     make_batch(&make_schema_u64_i64(), &rows)
 }
 
-/// What receiver `r` must gather from `parts` under `spec`: its share of every
-/// sender's partition summed.
-fn expected_of(parts: &[Batch], spec: &ScatterPlan, r: usize) -> Batch {
-    let schema = *parts[0].schema();
-    let summed = Batch::concat(&schema, parts.iter().map(Batch::as_mem_batch)).into_consolidated();
-    spec.share(&summed, Slot::new(r as u32, parts.len() as u32))
-}
-
-/// Open round `round` on every worker in rank order, each sending its
-/// partition of it: the round completes on the last open and not before.
-fn open_all(mesh: &mut [Mesh], round: u64, spec: &ScatterPlan, drained: [bool; NW]) -> Vec<Round<'static>> {
-    let rounds = (0..NW)
-        .map(|w| {
-            assert!(
-                mesh.iter().all(|m| !m.complete()),
-                "round {round}: incomplete before worker {w}"
-            );
-            mesh[w].open(9, Cow::Owned(partition(w, round)), spec, true, drained[w])
-        })
-        .collect();
-    assert!(
-        mesh.iter().all(Mesh::complete),
-        "round {round}: complete on the last open"
-    );
-    rounds
-}
-
-/// Worker `r` gathers round `round`, a single part: what every sender routed to
-/// it, and the AND of the drained claims.
-fn gather_one(mesh: &mut Mesh, open: &mut Round<'_>, round: u64, spec: &ScatterPlan, drained: [bool; NW]) {
-    let r = mesh.rank;
-    let parts: Vec<Batch> = (0..NW).map(|w| partition(w, round)).collect();
-    let (got, all_drained) = mesh.step(open).expect("a round that fits one part");
-    assert_eq!(
-        weighted_rows(&got),
-        weighted_rows(&expected_of(&parts, spec, r)),
-        "round {round}: worker {r}"
-    );
-    assert!(got.is_consolidated(), "round {round}: worker {r}");
-    assert_eq!(all_drained, drained.iter().all(|&d| d), "round {round}: worker {r}");
-}
-
-/// Open a round of `parts[w]` on worker `w`, then [`finish_round`].
-fn run_round(
-    mesh: &mut [Mesh],
+/// Receiver `r`'s close of a round of `parts` under `spec`: its share of every
+/// sender's partition summed, merged iff every sender of rows to it published
+/// consolidated under `fold`, and the AND of the `drained` claims.
+fn assert_gathered(
+    r: usize,
+    (got, all_drained): (Batch, bool),
     parts: &[Batch],
     spec: &ScatterPlan,
     drained: &[bool],
     fold: bool,
-) -> (Vec<(Batch, bool)>, usize) {
+) {
+    let slot = Slot::new(r as u32, parts.len() as u32);
+    let merged = parts
+        .iter()
+        .all(|p| spec.share(p, slot).is_empty() || fold && p.is_consolidated());
+    let summed = Batch::concat(parts[0].schema(), parts.iter().map(Batch::as_mem_batch)).into_consolidated();
+    // A batch of at most one row is consolidated whatever its senders were.
+    let consolidated = merged || got.len() <= 1;
+    assert_eq!(got.is_consolidated(), consolidated, "receiver {r}, fold {fold}");
+    assert_eq!(all_drained, drained.iter().all(|&d| d), "receiver {r}");
+    assert_eq!(
+        weighted_rows(&got.into_consolidated()),
+        weighted_rows(&spec.share(&summed, slot)),
+        "receiver {r}, fold {fold}"
+    );
+}
+
+/// Worker `r` gathers round `round` of [`partition`]s of 8 rows, a single part.
+fn gather_one(mesh: &mut Mesh, open: &mut Round<'_>, round: u64, spec: &ScatterPlan, drained: [bool; NW]) {
+    let parts: Vec<Batch> = (0..NW).map(|w| partition(w, round, 8)).collect();
+    let got = mesh.step(open).expect("a round that fits one part");
+    assert_gathered(mesh.rank, got, &parts, spec, &drained, true);
+}
+
+/// Open a round of `parts[w]` on worker `w`, then [`finish_round`].
+fn run_round(mesh: &mut [Mesh], parts: &[Batch], spec: &ScatterPlan, drained: &[bool], fold: bool) -> usize {
     let rounds = mesh
         .iter_mut()
         .zip(parts)
         .zip(drained)
         .map(|((m, batch), &d)| m.open(9, Cow::Borrowed(batch), spec, fold, d))
         .collect();
-    finish_round(mesh, rounds)
+    finish_round(mesh, rounds, parts, spec, drained, fold)
 }
 
-/// Step every worker of an open round part by part until it closes: each
-/// worker's rows and the verdict it was answered, and how many parts the round
-/// took.
-fn finish_round(mesh: &mut [Mesh], mut rounds: Vec<Round<'_>>) -> (Vec<(Batch, bool)>, usize) {
+/// Step every worker of an open round of `parts` part by part until it closes,
+/// checking what each gathered; how many parts the round took.
+fn finish_round(
+    mesh: &mut [Mesh],
+    mut rounds: Vec<Round<'_>>,
+    parts: &[Batch],
+    spec: &ScatterPlan,
+    drained: &[bool],
+    fold: bool,
+) -> usize {
     let mut count = 1;
     loop {
         assert!(mesh.iter().all(Mesh::complete), "part {count} completes");
         let out: Vec<Option<(Batch, bool)>> = mesh.iter_mut().zip(&mut rounds).map(|(m, r)| m.step(r)).collect();
         if out.iter().all(Option::is_some) {
-            return (out.into_iter().flatten().collect(), count);
+            for (r, got) in out.into_iter().flatten().enumerate() {
+                assert_gathered(r, got, parts, spec, drained, fold);
+            }
+            return count;
         }
         assert!(
             out.iter().all(Option::is_none),
@@ -127,43 +116,45 @@ fn finish_round(mesh: &mut [Mesh], mut rounds: Vec<Round<'_>>) -> (Vec<(Batch, b
 }
 
 /// A scattered round then a broadcast one, each gathered intact by every worker,
-/// with round 1 opened by two workers before the third gathered round 0.
+/// with round 1 opened by two workers before the third gathered round 0. A part
+/// completes on its last open and not before, and a step of an incomplete one
+/// waits.
 #[test]
 fn every_worker_gathers_each_round_from_every_peer() {
-    let mut mesh = meshes(NW);
+    let mut mesh = meshes(NW, SMALL_OUTBOX);
     let pk = by_pk(&make_schema_u64_i64());
     let routes = [&pk, &ScatterPlan::broadcast()];
     let drained = [[true, true, false], [true; NW]];
+    let open = |m: &mut Mesh, w: usize, round: usize| {
+        m.open(
+            9,
+            Cow::Owned(partition(w, round as u64, 8)),
+            routes[round],
+            true,
+            drained[round][w],
+        )
+    };
 
-    let mut rounds = open_all(&mut mesh, 0, routes[0], drained[0]);
+    let mut rounds: Vec<Round> = (0..NW)
+        .map(|w| {
+            assert!(mesh.iter().all(|m| !m.complete()), "incomplete before worker {w}");
+            open(&mut mesh[w], w, 0)
+        })
+        .collect();
+    assert!(mesh.iter().all(Mesh::complete), "complete on the last open");
     for w in 0..NW - 1 {
         gather_one(&mut mesh[w], &mut rounds[w], 0, routes[0], drained[0]);
-        rounds[w] = mesh[w].open(9, Cow::Owned(partition(w, 1)), routes[1], true, drained[1][w]);
+        rounds[w] = open(&mut mesh[w], w, 1);
     }
     assert!(
-        !mesh[0].complete(),
+        mesh[0].step(&mut rounds[0]).is_none(),
         "round 1 is incomplete until the last worker opens it"
     );
     let last = NW - 1;
     gather_one(&mut mesh[last], &mut rounds[last], 0, routes[0], drained[0]);
-    rounds[last] = mesh[last].open(9, Cow::Owned(partition(last, 1)), routes[1], true, drained[1][last]);
+    rounds[last] = open(&mut mesh[last], last, 1);
     for (m, open) in mesh.iter_mut().zip(&mut rounds) {
         gather_one(m, open, 1, routes[1], drained[1]);
-    }
-}
-
-/// A closing `step` answers the AND of the claims its round was opened with, on
-/// every worker, and a later round answers its own claims.
-#[test]
-fn a_closing_step_answers_the_and_of_every_workers_claim() {
-    let spec = ScatterPlan::broadcast();
-    let mut mesh = meshes(NW);
-    for (round, claims) in [[true, true, false], [true; NW], [false; NW]].into_iter().enumerate() {
-        let mut rounds = open_all(&mut mesh, round as u64, &spec, claims);
-        for (m, open) in mesh.iter_mut().zip(&mut rounds) {
-            let (_, drained) = m.step(open).expect("a round that fits one part");
-            assert_eq!(drained, claims.iter().all(|&c| c), "round {round}: worker {}", m.rank);
-        }
     }
 }
 
@@ -172,129 +163,13 @@ fn a_closing_step_answers_the_and_of_every_workers_claim() {
 #[test]
 #[should_panic(expected = "a round is already open")]
 fn a_second_open_before_the_round_closes_is_refused() {
-    let mut mesh = meshes(NW);
-    let batch = partition(0, 0);
+    let mut mesh = meshes(NW, SMALL_OUTBOX);
+    let batch = partition(0, 0, 8);
     let _first = mesh[0].open(9, Cow::Borrowed(&batch), &ScatterPlan::broadcast(), true, true);
     mesh[0].open(9, Cow::Borrowed(&batch), &ScatterPlan::broadcast(), true, true);
 }
 
-/// A step before every worker published would read outboxes not yet written.
-#[test]
-#[should_panic(expected = "stepped before every worker published")]
-fn a_step_before_the_part_completes_is_refused() {
-    let mut mesh = meshes(NW);
-    let mut round = mesh[0].open(9, Cow::Owned(partition(0, 0)), &ScatterPlan::broadcast(), true, true);
-    mesh[0].step(&mut round);
-}
-
 // ── Multi-part rounds ───────────────────────────────────────────────────────
-
-/// `n` rows over `(U64 PK, I64)` from worker `w`, consolidated: every worker
-/// sends the same `(pk, payload)` elements at its own weight, so the gather must
-/// sum across senders.
-pub(super) fn wide_partition(w: usize, n: u64) -> Batch {
-    let rows: Vec<(u64, i64, i64)> = (0..n).map(|i| (i, 1 + w as i64, (i % 7) as i64)).collect();
-    make_batch(&make_schema_u64_i64(), &rows)
-}
-
-/// Partitions far larger than an outbox cross in several parts, and every
-/// receiver gathers what one part would have carried.
-#[test]
-fn an_oversize_round_crosses_in_parts() {
-    let mut mesh = meshes(NW);
-    let pk = by_pk(&make_schema_u64_i64());
-    for fold in [true, false] {
-        for (spec, drained) in [(&pk, [true, false, true]), (&ScatterPlan::broadcast(), [true; NW])] {
-            let parts: Vec<Batch> = (0..NW).map(|w| wide_partition(w, 1000)).collect();
-            let (got, count) = run_round(&mut mesh, &parts, spec, &drained, fold);
-            assert!(count > 2, "1000 rows per sender take several parts, not {count}");
-            for (r, (got, all_drained)) in got.into_iter().enumerate() {
-                assert_eq!(got.is_consolidated(), fold, "receiver {r}, fold {fold}");
-                assert_eq!(all_drained, drained.iter().all(|&d| d), "receiver {r}");
-                let want = weighted_rows(&expected_of(&parts, spec, r));
-                assert_eq!(
-                    weighted_rows(&got.into_consolidated()),
-                    want,
-                    "receiver {r}, fold {fold}"
-                );
-            }
-        }
-    }
-}
-
-/// A sender that runs out of rows early, or never had any, keeps arriving with
-/// empty parts until the longest sender is done.
-#[test]
-fn a_sender_with_nothing_left_sends_empty_parts() {
-    let mut mesh = meshes(NW);
-    let schema = make_schema_u64_i64();
-    let pk = by_pk(&schema);
-    for spec in [&pk, &ScatterPlan::broadcast()] {
-        let parts = vec![
-            wide_partition(0, 1000),
-            wide_partition(1, 40),
-            Batch::empty_with_schema(&schema),
-        ];
-        let (got, count) = run_round(&mut mesh, &parts, spec, &[false, true, true], true);
-        assert!(count > 2, "the long sender takes several parts, not {count}");
-        for (r, (got, drained)) in got.into_iter().enumerate() {
-            assert_eq!(
-                weighted_rows(&got),
-                weighted_rows(&expected_of(&parts, spec, r)),
-                "receiver {r}"
-            );
-            assert!(
-                got.is_consolidated(),
-                "receiver {r}: the empty raw sender wrote no block"
-            );
-            assert!(!drained, "receiver {r}: worker 0 was not drained");
-        }
-    }
-}
-
-/// A heap many times the space a part leaves crosses in parts, each block
-/// carrying its own share of it.
-#[test]
-fn a_heap_heavy_round_is_sized_by_its_relocated_heap() {
-    let mut mesh = meshes(2);
-    let texts: Vec<String> = (0..60u64).map(|pk| format!("{pk:->200}")).collect();
-    let rows_of = |w: i64| {
-        (0..60u64)
-            .map(|pk| (pk, 1 + w, texts[pk as usize].as_bytes()))
-            .collect::<Vec<_>>()
-    };
-    let consolidated = make_string_batch(&rows_of(0));
-    let raw = make_batch_bytes_raw(
-        &make_schema_pk_u64_payload_string(),
-        &rows_of(1).into_iter().rev().collect::<Vec<_>>(),
-    );
-    assert!(
-        consolidated.blob().len() > SMALL_OUTBOX,
-        "the heap alone overflows a part"
-    );
-    let pk = by_pk(&make_schema_pk_u64_payload_string());
-    let parts = vec![consolidated, raw];
-    for spec in [&pk, &ScatterPlan::broadcast()] {
-        let (got, count) = run_round(&mut mesh, &parts, spec, &[true, true], true);
-        assert!(
-            count > 2,
-            "12 KiB of strings per sender take several parts, not {count}"
-        );
-        for (r, (got, _)) in got.into_iter().enumerate() {
-            assert!(!got.is_consolidated(), "receiver {r}: a raw sender's rows stay raw");
-            let want = expected_of(&parts, spec, r);
-            assert!(
-                (0..want.len()).all(|i| want.get_weight(i) == 3),
-                "receiver {r}: weights sum to 1 + 2"
-            );
-            assert_eq!(
-                weighted_rows(&got.into_consolidated()),
-                weighted_rows(&want),
-                "receiver {r}"
-            );
-        }
-    }
-}
 
 /// Worker 0's partition over the string schema: `pks`, each with `text(pk)`.
 fn string_partition(mut pks: Vec<u64>, text: impl Fn(u64) -> String) -> Batch {
@@ -308,12 +183,77 @@ fn string_partition(mut pks: Vec<u64>, text: impl Fn(u64) -> String) -> Batch {
     )
 }
 
+/// A round too large for one part crosses in several, and every receiver
+/// gathers what one part would have carried, scattered or broadcast, folded or
+/// not: partitions far larger than an outbox; a sender that runs out early or
+/// never had rows, and keeps arriving with empty parts; a heap many times a
+/// part's room, each block carrying its own share of it, beside a raw sender
+/// whose rows stay raw; and a heap row too large for the room an earlier list
+/// left but not for a fresh part, which moves to the next part rather than
+/// ending the round.
+#[test]
+fn a_round_too_large_for_one_part_crosses_in_several() {
+    let fixed = make_schema_u64_i64();
+    let strings = make_schema_pk_u64_payload_string();
+    let texts: Vec<String> = (0..60u64).map(|pk| format!("{pk:->200}")).collect();
+    let heap_rows = |w: i64| {
+        (0..60u64)
+            .map(|pk| (pk, 1 + w, texts[pk as usize].as_bytes()))
+            .collect::<Vec<_>>()
+    };
+    let heap = make_string_batch(&heap_rows(0));
+    assert!(heap.blob().len() > SMALL_OUTBOX, "the heap alone overflows a part");
+    let raw_heap = make_batch_bytes_raw(&strings, &heap_rows(1).into_iter().rev().collect::<Vec<_>>());
+    // Twenty short rows for receiver 0; one long row for receiver 1.
+    let pks = owned_by(0, 0, 20).into_iter().chain(owned_by(1, 100_000, 1)).collect();
+    let one_long = string_partition(pks, |pk| match pk >= 100_000 {
+        true => "z".repeat(3000),
+        false => format!("{pk:->40}"),
+    });
+
+    let cases: [(&str, Vec<Batch>, &[bool], usize); 4] = [
+        (
+            "oversize",
+            (0..NW).map(|w| partition(w, 0, 1000)).collect(),
+            &[true, false, true],
+            3,
+        ),
+        (
+            "a sender runs out",
+            vec![
+                partition(0, 0, 1000),
+                partition(1, 0, 40),
+                Batch::empty_with_schema(&fixed),
+            ],
+            &[false, true, true],
+            3,
+        ),
+        ("heap-heavy", vec![heap, raw_heap], &[true, true], 3),
+        (
+            "a heap row fits only a fresh part",
+            vec![one_long, Batch::empty_with_schema(&strings)],
+            &[true, true],
+            2,
+        ),
+    ];
+    for (case, parts, drained, min_parts) in &cases {
+        let mut mesh = meshes(parts.len(), SMALL_OUTBOX);
+        let pk = by_pk(parts[0].schema());
+        for spec in [&pk, &ScatterPlan::broadcast()] {
+            for fold in [true, false] {
+                let count = run_round(&mut mesh, parts, spec, drained, fold);
+                assert!(count >= *min_parts, "{case}: {count} parts");
+            }
+        }
+    }
+}
+
 /// A receiver list that fills an outbox to its last byte ends the part cleanly:
 /// the next list has no room for a row and moves whole to the next part.
 #[test]
 fn a_list_that_fills_the_outbox_exactly_defers_the_next() {
     let schema = make_schema_pk_u64_payload_string();
-    let row_width = make_string_batch(&[(0, 1, b"")]).wire_whole().unwrap().byte_size() - WAL_HEADER_SIZE;
+    let row_width = schema.row_width();
     let room = SMALL_OUTBOX - BLOCKS_AT - WAL_HEADER_SIZE;
     // Fixed-width rows, and one long string whose heap bytes take up the rest.
     let fill = room / row_width - 1;
@@ -327,14 +267,13 @@ fn a_list_that_fills_the_outbox_exactly_defers_the_next() {
     let pks = to_0.into_iter().chain(owned_by(1, 0, 5)).collect();
     let full = string_partition(pks, |pk| if pk == anchor { "l".repeat(slack) } else { String::new() });
 
-    let mut mesh = meshes(2);
-    let pk = by_pk(&schema);
-    let spec = &pk;
+    let mut mesh = meshes(2, SMALL_OUTBOX);
+    let spec = by_pk(&schema);
     let parts = vec![full, Batch::empty_with_schema(&schema)];
     let rounds: Vec<Round> = mesh
         .iter_mut()
         .zip(&parts)
-        .map(|(m, batch)| m.open(9, Cow::Borrowed(batch), spec, true, true))
+        .map(|(m, batch)| m.open(9, Cow::Borrowed(batch), &spec, true, true))
         .collect();
     // SAFETY: worker 0 wrote its head before its arrival.
     let head = unsafe { &*mesh[0].outbox(0).cast::<Head>() };
@@ -344,50 +283,13 @@ fn a_list_that_fills_the_outbox_exactly_defers_the_next() {
         "list 0 fills the outbox"
     );
     assert_eq!(head.blocks[1].len, 0, "list 1 waits for the next part");
-    let (got, count) = finish_round(&mut mesh, rounds);
-    assert_eq!(count, 2);
-    for (r, (got, _)) in got.iter().enumerate() {
-        assert_eq!(
-            weighted_rows(got),
-            weighted_rows(&expected_of(&parts, spec, r)),
-            "receiver {r}"
-        );
-    }
-}
-
-/// A string row too large for the space list 0 left, but not for an empty
-/// outbox, moves to the next part rather than ending the round.
-#[test]
-fn a_heap_row_that_fits_only_a_fresh_part_moves_to_it() {
-    // Twenty short rows for receiver 0; one long row for receiver 1.
-    let pks = owned_by(0, 0, 20).into_iter().chain(owned_by(1, 100_000, 1)).collect();
-    let partition = string_partition(pks, |pk| {
-        if pk >= 100_000 {
-            "z".repeat(3000)
-        } else {
-            format!("{pk:->40}")
-        }
-    });
-    let schema = make_schema_pk_u64_payload_string();
-    let mut mesh = meshes(2);
-    let pk = by_pk(&schema);
-    let spec = &pk;
-    let parts = vec![partition, Batch::empty_with_schema(&schema)];
-    let (got, count) = run_round(&mut mesh, &parts, spec, &[true, true], true);
-    assert_eq!(count, 2, "the long row takes the second part");
-    for (r, (got, _)) in got.iter().enumerate() {
-        assert_eq!(
-            weighted_rows(got),
-            weighted_rows(&expected_of(&parts, spec, r)),
-            "receiver {r}"
-        );
-    }
+    assert_eq!(finish_round(&mut mesh, rounds, &parts, &spec, &[true, true], true), 2);
 }
 
 /// A trim frees the pages past the part, in a mapping every worker shares.
 #[test]
 fn trim_returns_the_pages_past_a_part() {
-    let mut m = super::fixtures::meshes(1, 2 * RESIDENT_SLACK_BYTES).pop().unwrap();
+    let mut m = meshes(1, 2 * RESIDENT_SLACK_BYTES).pop().unwrap();
     let resident = BLOCKS_AT + RESIDENT_SLACK_BYTES + 2 * PAGE_BYTES;
     unsafe { m.outbox(0).add(resident - 1).write(7) };
     m.resident[0] = resident;

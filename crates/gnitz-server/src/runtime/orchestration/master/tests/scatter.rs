@@ -1,7 +1,7 @@
 use super::*;
-use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::{group_at, holders_of, TestLog};
 use crate::runtime::sal::DirectGroup;
+use crate::runtime::sal::WorkerSet;
 use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     weighted_rows, zset_of,

@@ -8,7 +8,7 @@ use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::SchemaDescriptor;
 
 use super::*;
-use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::WorkerSet;
 use crate::runtime::sal::{GroupTargets, SalMessageKind};
 
 /// The request id every worker's boot verdict answers on.
@@ -62,8 +62,10 @@ pub(super) enum Route {
 }
 
 impl Reactor {
-    /// Hand worker `w`'s slot to the lease its ring id names.
-    pub(super) fn route(&self, w: usize, slot: W2mSlot) {
+    /// Hand a slot to the lease its ring id names, on behalf of the worker whose
+    /// ring it was read from.
+    pub(super) fn route(&self, slot: W2mSlot) {
+        let w = slot.worker as usize;
         match self.routes.borrow_mut().get_mut(&slot.internal_req_id) {
             Some(Route::Train(t)) => {
                 if let Some(q) = t.queue(w) {

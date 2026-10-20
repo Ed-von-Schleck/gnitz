@@ -6,8 +6,8 @@ use std::cell::RefCell;
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::repr::Batch;
 
-use crate::runtime::park::MAX_WORKERS;
 use crate::runtime::sal::GroupData;
+use gnitz_wire::MAX_WORKERS;
 use gnitz_zset::algebra::Placement;
 
 // Reuse the row lists across calls.

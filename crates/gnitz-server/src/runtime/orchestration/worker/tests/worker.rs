@@ -1,7 +1,7 @@
 use super::*;
 use crate::catalog::SysFamily;
-use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::TestLog;
+use crate::runtime::sal::WorkerSet;
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets};
 use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{
@@ -33,7 +33,9 @@ pub(super) fn worker_over(
 ) -> (WorkerProcess<'_>, TestLog, W2mReceiver) {
     let (mut writers, receiver) = w2m::fixtures::test_rings(&[ring_bytes]);
     let sal = TestLog::new(sal_bytes, 1, 1);
-    let mesh = crate::runtime::mesh::fixtures::meshes(1, crate::runtime::mesh::OUTBOX_BYTES)
+    // Over the SAL's parks, as at boot: the worker sleeps on one word for both.
+    let mesh = crate::runtime::mesh::create(crate::runtime::mesh::OUTBOX_BYTES, sal.parks())
+        .unwrap()
         .pop()
         .unwrap();
     let mut wp = WorkerProcess::new(
@@ -410,7 +412,8 @@ fn exchange_answers_the_rounds_verdict() {
     let part = make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 10)]);
     let plan = ScatterPlan::broadcast();
     for (own, peers, all) in [(true, true, true), (true, false, false), (false, true, false)] {
-        let mut meshes = crate::runtime::mesh::fixtures::meshes(2, 1 << 16);
+        let parks = crate::runtime::park::WorkerParks::create(2).unwrap();
+        let mut meshes = crate::runtime::mesh::create(1 << 16, parks).unwrap();
         let mut peer = meshes.pop().unwrap();
         wp.mesh = meshes.pop().unwrap();
         // The peer arrives first, so this worker's own open completes the round.

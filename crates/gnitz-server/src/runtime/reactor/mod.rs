@@ -232,7 +232,7 @@ impl Reactor {
     fn drain_all_w2m(&self) {
         for w in 0..self.w2m.num_workers() {
             while let Some(slot) = self.w2m.try_read_slot(w) {
-                self.route(w, slot);
+                self.route(slot);
             }
         }
     }

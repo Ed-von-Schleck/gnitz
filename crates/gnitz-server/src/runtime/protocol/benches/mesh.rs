@@ -1,5 +1,4 @@
-use super::tests::by_pk;
-use super::tests::wide_partition;
+use super::tests::{by_pk, meshes, partition};
 use super::*;
 use crate::test_support::make_schema_u64_i64;
 use gnitz_foundation::perf::Counter;
@@ -20,9 +19,9 @@ fn mesh_round_bench() {
     let pk = by_pk(&make_schema_u64_i64());
     let broadcast = ScatterPlan::broadcast();
     for nw in [2, 4] {
-        let mut mesh = super::fixtures::meshes(nw, 64 << 20);
+        let mut mesh = meshes(nw, 64 << 20);
         for rows in [1, 1_000] {
-            let parts: Vec<Batch> = (0..nw).map(|w| wide_partition(w, rows)).collect();
+            let parts: Vec<Batch> = (0..nw).map(|w| partition(w, 0, rows)).collect();
             // The rows all workers gather in a round: every sender holds the same
             // `rows` elements, which a fold sums into one row each.
             for (case, plan, fold, gathered) in [

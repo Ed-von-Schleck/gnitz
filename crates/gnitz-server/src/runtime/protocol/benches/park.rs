@@ -1,4 +1,3 @@
-use super::tests::word;
 use super::*;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 use gnitz_foundation::perf::voluntary_ctx_switches;
@@ -16,7 +15,7 @@ fn park_wake_bench() {
     const N: u64 = 200_000;
 
     for (advance, publish) in [("bump", false), ("publish", true)] {
-        let park = word(WorkerParks::create(1).unwrap(), 0);
+        let park = WorkerParks::create(1).unwrap().word(0);
         // The child's voluntary context switches, written before it exits.
         let sleeps = posix_io::map_shared(None, 4096).unwrap().cast::<i64>();
         let child = || {

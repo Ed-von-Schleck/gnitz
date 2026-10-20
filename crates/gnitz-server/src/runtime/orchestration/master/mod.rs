@@ -20,8 +20,8 @@ use std::cell::{Cell, RefCell};
 use rustc_hash::FxHashMap;
 
 use crate::catalog::CatalogEngine;
-use crate::runtime::park::WorkerSet;
 use crate::runtime::reactor::{Reactor, TrainLease};
+use crate::runtime::sal::WorkerSet;
 use crate::runtime::sal::{Apply, DirectGroup, GroupData, GroupTargets, Read, SalExcl, SalRequest, SalWriter};
 use gnitz_store::relation::Relation;
 use gnitz_wire::{BoundPeek, PkColList, Probe, WireFault};

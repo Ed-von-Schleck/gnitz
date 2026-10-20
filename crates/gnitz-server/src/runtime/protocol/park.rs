@@ -5,20 +5,12 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use gnitz_foundation::posix_io;
-use gnitz_wire::{low_bits_mask, BitIter};
+use gnitz_wire::MAX_WORKERS;
 use io_uring::types::FutexWaitV;
 
 // ---------------------------------------------------------------------------
 // Futex wait/wake
 // ---------------------------------------------------------------------------
-
-/// The 32-bit futex word aliasing a park word's low half. A ring cursor advances
-/// by at most its ring's capacity and a wake sequence by one, so under 2^32 an
-/// advance always moves the half a futex compares.
-#[inline]
-fn futex_word(word: &AtomicU64) -> *const AtomicU32 {
-    word as *const AtomicU64 as *const AtomicU32
-}
 
 /// `futex2(2)` flags byte for a 32-bit atomic. Matches the kernel constant
 /// `FUTEX2_SIZE_U32` (=2). No `FUTEX2_PRIVATE` bit — a park word is
@@ -34,55 +26,35 @@ pub(super) fn futex_waitv_entry(word: *const AtomicU32, expected: u32) -> FutexW
         .flags(FUTEX2_SIZE_U32)
 }
 
-/// The errno of the most recent failed syscall. The futex wrappers go through
-/// `libc::syscall`, which returns `-1` rather than `-errno`.
+/// One v1 futex call on `word`, with no `FUTEX_PRIVATE_FLAG` — a park word is
+/// shared: `Err` holds the errno.
 #[inline]
-fn errno() -> i32 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-}
-
-/// Wake the waiter parked on `ptr` (v1 `FUTEX_WAKE`, no `FUTEX_PRIVATE_FLAG` — a
-/// park word is shared). Aborts rather than reporting: a lost wake leaves the
-/// peer blocked on a queue that has work in it, so there is no caller-side
-/// answer to distinguish. `site` names the caller in the abort.
-#[inline]
-fn futex_wake_u32(ptr: *const AtomicU32, site: &str) {
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            ptr as *const libc::c_void,
-            libc::FUTEX_WAKE,
-            1 as libc::c_int,
-            std::ptr::null::<libc::timespec>(),
-            std::ptr::null::<u32>(),
-            0u32,
-        ) as i32
-    };
-    if rc < 0 {
-        futex_failed(site, errno());
-    }
-}
-
-/// Sleep on `word` while it reads `expected` (v1 `FUTEX_WAIT`, no
-/// `FUTEX_PRIVATE_FLAG` — a park word is shared). A wake, a moved value and a
-/// signal all return; anything else aborts.
-fn futex_wait_u32(word: *const AtomicU32, expected: u32, site: &str) {
+fn futex(word: *const AtomicU32, op: libc::c_int, val: u32) -> Result<(), i32> {
     let rc = unsafe {
         libc::syscall(
             libc::SYS_futex,
             word as *const libc::c_void,
-            libc::FUTEX_WAIT,
-            expected as libc::c_int,
+            op,
+            val as libc::c_int,
             std::ptr::null::<libc::timespec>(),
             std::ptr::null::<u32>(),
             0u32,
-        ) as i32
+        )
     };
-    if rc < 0 {
-        let e = errno();
-        if e != libc::EAGAIN && e != libc::EINTR {
-            futex_failed(site, e);
-        }
+    match rc < 0 {
+        // `libc::syscall` returns -1, not -errno.
+        true => Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0)),
+        false => Ok(()),
+    }
+}
+
+/// Wake the waiter parked on `word`. Aborts rather than reporting: a lost wake
+/// leaves the peer blocked on a queue that has work in it, so there is no
+/// caller-side answer to distinguish. `site` names the caller in the abort.
+#[inline]
+fn futex_wake(word: *const AtomicU32, site: &str) {
+    if let Err(e) = futex(word, libc::FUTEX_WAKE, 1) {
+        futex_failed(site, e);
     }
 }
 
@@ -135,7 +107,7 @@ impl Park {
     pub(super) fn publish(&self, v: u64, site: &str) {
         debug_assert_eq!(v & ARMED, 0, "a value reached the armed bit");
         if self.0.swap(v, Ordering::AcqRel) & ARMED != 0 {
-            futex_wake_u32(self.futex_word(), site);
+            futex_wake(self.futex_word(), site);
         }
     }
 
@@ -145,7 +117,7 @@ impl Park {
     #[inline]
     pub(super) fn bump(&self, site: &str) {
         if self.0.fetch_add(1, Ordering::AcqRel) & ARMED != 0 {
-            futex_wake_u32(self.futex_word(), site);
+            futex_wake(self.futex_word(), site);
         }
     }
 
@@ -153,76 +125,28 @@ impl Park {
     /// says otherwise. Disarms either way.
     pub(super) fn park(&self, site: &str, still_waiting: impl FnOnce() -> bool) {
         let at = self.arm();
+        // A wake, a moved value and a signal all return; anything else aborts.
         if still_waiting() {
-            futex_wait_u32(self.futex_word(), at as u32, site);
+            if let Err(e) = futex(self.futex_word(), libc::FUTEX_WAIT, at as u32) {
+                if e != libc::EAGAIN && e != libc::EINTR {
+                    futex_failed(site, e);
+                }
+            }
         }
         self.disarm();
     }
 
+    /// The 32-bit futex word aliasing the low half. A ring cursor advances by at
+    /// most its ring's capacity and a wake sequence by one, so under 2^32 an
+    /// advance always moves the half a futex compares.
     #[inline]
     pub(super) fn futex_word(&self) -> *const AtomicU32 {
-        futex_word(&self.0)
+        &self.0 as *const AtomicU64 as *const AtomicU32
     }
 
     #[cfg(test)]
     pub(super) fn armed(&self) -> bool {
         self.0.load(Ordering::Acquire) & ARMED != 0
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WorkerSet
-// ---------------------------------------------------------------------------
-
-// [`WorkerSet`] holds one bit per worker.
-pub(crate) use gnitz_wire::MAX_WORKERS;
-
-/// A subset of the workers. `ALL` is unbounded; every other set holds only
-/// launched workers.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct WorkerSet(pub(super) u64);
-
-const _: () = assert!(MAX_WORKERS <= u64::BITS as usize);
-
-impl WorkerSet {
-    pub(crate) const EMPTY: Self = WorkerSet(0);
-    pub(crate) const ALL: Self = WorkerSet(u64::MAX);
-
-    pub(crate) const fn one(w: usize) -> Self {
-        WorkerSet(1 << w)
-    }
-
-    pub(crate) const fn with(self, w: usize) -> Self {
-        WorkerSet(self.0 | 1 << w)
-    }
-
-    pub(crate) const fn without(self, w: usize) -> Self {
-        WorkerSet(self.0 & !(1 << w))
-    }
-
-    pub(crate) const fn within(self, nw: usize) -> Self {
-        WorkerSet(self.0 & low_bits_mask(nw))
-    }
-
-    pub(crate) const fn contains(self, w: usize) -> bool {
-        self.0 >> w & 1 == 1
-    }
-
-    pub(crate) const fn len(self) -> usize {
-        self.0.count_ones() as usize
-    }
-
-    pub(crate) const fn union(self, other: Self) -> Self {
-        WorkerSet(self.0 | other.0)
-    }
-
-    /// How many members of the set are below `w`: `w`'s position among them.
-    pub(crate) const fn rank(self, w: usize) -> usize {
-        (self.0 & low_bits_mask(w)).count_ones() as usize
-    }
-
-    pub(crate) fn iter(self) -> BitIter {
-        BitIter(self.0)
     }
 }
 
@@ -262,10 +186,10 @@ impl WorkerParks {
         WorkerPark(&self.0[w].0)
     }
 
-    /// How many wakes worker `w` was sent.
+    /// Worker `w`'s park word: its value is how many wakes `w` was sent.
     #[cfg(test)]
-    pub(crate) fn wake_seq(self, w: usize) -> u64 {
-        self.0[w].0.value()
+    pub(super) fn word(self, w: usize) -> &'static Park {
+        &self.0[w].0
     }
 }
 

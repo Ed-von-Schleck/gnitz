@@ -51,7 +51,7 @@ const W2M_REGION_SIZE: usize =
 // `arm_waitv` builds a `futex_waitv` word list of `num_workers` entries. The
 // kernel's `FUTEX_WAITV_MAX` is 128; past it the wait fails with EINVAL. Make a
 // `MAX_WORKERS` bump that outgrows it a build error.
-const _: () = assert!(super::park::MAX_WORKERS <= 128);
+const _: () = assert!(gnitz_wire::MAX_WORKERS <= 128);
 
 const _: () = assert!(
     2 * gnitz_wire::FRAME_LEN_PREFIX_BYTES as u64 == RING_PREFIX_BYTES,
@@ -632,12 +632,6 @@ impl W2mReceiver {
     #[cfg(test)]
     pub(crate) fn write_cursor(&self, worker: usize) -> u64 {
         self.rings[worker].hdr.write.value()
-    }
-
-    /// The master-local read cursor for `worker`.
-    #[cfg(test)]
-    fn read_cursor(&self, worker: usize) -> u64 {
-        self.rings[worker].read_cursor()
     }
 }
 

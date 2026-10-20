@@ -21,8 +21,9 @@ use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::runtime::park::{WorkerParks, MAX_WORKERS};
+use crate::runtime::park::WorkerParks;
 use gnitz_foundation::posix_io;
+use gnitz_wire::MAX_WORKERS;
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -62,24 +63,12 @@ pub(crate) fn outbox_bytes() -> usize {
 
 /// The mesh among `parks.len()` workers, over outboxes of `outbox_bytes`: one fresh
 /// shared mapping, never unmapped, and every worker's view of it in rank order.
-/// A close-on-exec memfd named `name`.
-pub(super) fn memfd(name: &std::ffi::CStr) -> std::io::Result<File> {
-    use std::os::fd::FromRawFd;
-    // SAFETY: `name` is NUL-terminated.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: a descriptor nothing else owns.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
 /// Zeroed. A memfd, so [`Mesh::trim`] can return pages by file offset.
 pub(crate) fn create(outbox_bytes: usize, parks: WorkerParks) -> std::io::Result<Vec<Mesh>> {
     let nw = parks.len();
     let len = HEADER_BYTES + 2 * nw * outbox_bytes;
     // Leaked with the mapping.
-    let file: &'static File = Box::leak(Box::new(memfd(c"gnitz-mesh")?));
+    let file: &'static File = Box::leak(Box::new(posix_io::memfd(c"gnitz-mesh")?));
     file.set_len(len as u64)?;
     let base = posix_io::map_shared(Some(file.as_fd()), len)?;
     Ok((0..nw)
@@ -331,12 +320,15 @@ impl Mesh {
         self.arrivals().load(Ordering::Acquire) >= (self.part + 1) * self.nw() as u64
     }
 
-    /// Take in the completed part. `None`: `round`'s next part was sent. `Some`:
-    /// the round is closed — the rows every peer sent this worker, and whether
-    /// every worker's source was drained.
+    /// Take in the current part once it is complete. `None`: the part is
+    /// incomplete, or `round`'s next part was sent. `Some`: the round is closed —
+    /// the rows every peer sent this worker, and whether every worker's source
+    /// was drained.
     pub(crate) fn step(&mut self, round: &mut Round<'_>) -> Option<(Batch, bool)> {
         assert!(self.in_round, "step without an open round");
-        assert!(self.complete(), "stepped before every worker published");
+        if !self.complete() {
+            return None;
+        }
         let view = round.view;
         let (mut drained, mut more, mut consolidated) = (true, false, round.saved_consolidated);
         let mut blocks = Vec::with_capacity(self.nw());
@@ -409,10 +401,6 @@ impl Mesh {
         unsafe { std::slice::from_raw_parts(self.outbox(peer).add(span.at as usize), span.len as usize) }
     }
 }
-
-#[cfg(test)]
-#[path = "tests/mesh_fixtures.rs"]
-pub(crate) mod fixtures;
 
 #[cfg(test)]
 #[path = "tests/mesh.rs"]

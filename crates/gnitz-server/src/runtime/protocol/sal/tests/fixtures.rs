@@ -15,9 +15,7 @@ use gnitz_zset::schema::encode_schema_block;
 pub(crate) fn test_writer(size: usize, parks: WorkerParks) -> SalWriter {
     let len = ANCHOR_BYTES + size;
     // Leaked: open and mapped for the rest of the process.
-    let file: &'static File = Box::leak(Box::new(
-        crate::runtime::protocol::mesh::memfd(c"test_sal").expect("memfd"),
-    ));
+    let file: &'static File = Box::leak(Box::new(gnitz_foundation::posix_io::memfd(c"test_sal").expect("memfd")));
     SalWriter::new(SalLog::map(file, len).expect("map the test SAL"), parks)
 }
 

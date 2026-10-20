@@ -33,10 +33,8 @@ impl DriveHost for WorkerProcess<'_> {
                     break;
                 }
             }
-            if self.mesh.complete() {
-                if let Some(gathered) = self.mesh.step(&mut round) {
-                    return gathered;
-                }
+            if let Some(gathered) = self.mesh.step(&mut round) {
+                return gathered;
             }
         }
     }

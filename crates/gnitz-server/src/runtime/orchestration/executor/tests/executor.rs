@@ -1,7 +1,7 @@
 use super::*;
-use crate::runtime::park::WorkerSet;
 use crate::runtime::reactor::{client_pair, reactor_with_rings, read_nonblocking, Reactor};
 use crate::runtime::sal::SalMessageKind;
+use crate::runtime::sal::WorkerSet;
 use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::WireMsg;

@@ -6,7 +6,8 @@ use std::hint::black_box;
 
 /// Instructions per control frame through one ring, publish and drain apart,
 /// by how many frames go in before they all come out. Nobody parks; a drained
-/// frame's cost includes its release.
+/// frame's cost includes its release. What a `measure` counts of itself is taken
+/// off every lap, so a lap of one is not charged it per frame.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn w2m_ring_bench() {
@@ -14,10 +15,12 @@ fn w2m_ring_bench() {
     const RING_FRAMES: u32 = 64;
 
     let counter = Counter::instructions();
+    let empty = (0..1_000).map(|_| counter.measure(|| ()).1).sum::<u64>() / 1_000;
     for lap in [RING_FRAMES, 1] {
+        let laps = FRAMES / lap as u64;
         let (mut writer, receiver) = make_ring(CTRL_HEADER_SIZE, RING_FRAMES as usize, 8);
         let (mut publish, mut drain) = (0, 0);
-        for _ in 0..FRAMES / lap as u64 {
+        for _ in 0..laps {
             publish += counter
                 .measure(|| {
                     for req in 1..=lap {
@@ -41,8 +44,8 @@ fn w2m_ring_bench() {
         );
         println!(
             "w2m_ring_bench lap of {lap}: publish {:.1} instr/frame, drain {:.1} instr/frame",
-            publish as f64 / FRAMES as f64,
-            drain as f64 / FRAMES as f64,
+            (publish - laps * empty) as f64 / FRAMES as f64,
+            (drain - laps * empty) as f64 / FRAMES as f64,
         );
     }
 }

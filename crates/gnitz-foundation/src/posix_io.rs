@@ -67,6 +67,18 @@ pub fn map_shared(fd: Option<BorrowedFd<'_>>, len: usize) -> io::Result<*mut u8>
     Ok(ptr.cast())
 }
 
+/// A close-on-exec memfd named `name`.
+pub fn memfd(name: &std::ffi::CStr) -> io::Result<File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: `name` is NUL-terminated.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor nothing else owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 /// Make the entries of directory `dir` durable.
 pub fn fsync_dir(dir: &str) -> io::Result<()> {
     File::open(dir)?.sync_all()

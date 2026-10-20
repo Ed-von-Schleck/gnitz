@@ -1,6 +1,6 @@
 use super::super::fixtures::test_dispatcher;
 use crate::catalog::CatalogEngine;
-use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::WorkerSet;
 use crate::runtime::sal::{Apply, DirectGroup, GroupData, GroupTargets};
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_once, within};
 use gnitz_foundation::posix_io::retry_eintr;

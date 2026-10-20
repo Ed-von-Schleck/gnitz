@@ -66,9 +66,7 @@ impl Train {
         self.next_row += rows.map_or(0, |r| r.rows());
         let last = self.next_row == batch.len() && (whole || batch.is_empty());
         let msg = WireMsg::train_frame(self.route.target_id, last, rows);
-        if msg.size() > gnitz_wire::MAX_FRAME_PAYLOAD {
-            return Err(crate::runtime::wire::oversized_frame_message(msg.size()).into());
-        }
+        msg.checked_size()?;
         w2m.send_msg(self.route.request_id, &msg);
         Ok(last)
     }

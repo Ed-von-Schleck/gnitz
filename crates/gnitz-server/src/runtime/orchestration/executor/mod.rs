@@ -1263,12 +1263,10 @@ fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
 /// Cork `msg` for the client, or a fault in its place past `MAX_FRAME_PAYLOAD`.
 /// The connection loop ships it.
 fn send_msg(peer: &Peer, msg: ipc::WireMsg<'_>) {
-    let sz = msg.size();
-    if sz > gnitz_wire::MAX_FRAME_PAYLOAD {
-        send_fault(peer, msg.target_id, &ipc::oversized_frame_message(sz).into());
-        return;
+    match msg.checked_size() {
+        Ok(_) => peer.cork_with(|out| encode_response_into(out, msg)),
+        Err(fault) => send_fault(peer, msg.target_id, &fault),
     }
-    peer.cork_with(|out| encode_response_into(out, msg));
 }
 
 /// A control-only ACK: the request's own `target_id`, and its one value — a

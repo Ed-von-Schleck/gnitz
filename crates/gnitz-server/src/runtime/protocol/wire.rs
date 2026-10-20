@@ -5,15 +5,6 @@ use gnitz_wire::{WireFault, WireFlags, WireStatus};
 use gnitz_zset::repr::{Batch, WireRows};
 use gnitz_zset::schema::SchemaDescriptor;
 
-/// The error text for a reply past [`gnitz_wire::MAX_FRAME_PAYLOAD`].
-pub(crate) fn oversized_frame_message(sz: usize) -> String {
-    format!(
-        "reply wire_size={sz} exceeds the maximum frame payload {}; \
-         one row wider than the cap cannot be returned at all",
-        gnitz_wire::MAX_FRAME_PAYLOAD
-    )
-}
-
 // ---------------------------------------------------------------------------
 // WireMsg
 // ---------------------------------------------------------------------------
@@ -69,6 +60,21 @@ impl<'a> WireMsg<'a> {
     pub fn size(&self) -> usize {
         gnitz_wire::control::frame_head_size(self.blob.len(), self.schema_block.map(<[u8]>::len))
             + self.data.map_or(0, |d| d.byte_size())
+    }
+
+    /// [`size`](WireMsg::size), or the fault a reply past
+    /// [`gnitz_wire::MAX_FRAME_PAYLOAD`] answers with in its place.
+    pub(crate) fn checked_size(&self) -> Result<usize, WireFault> {
+        let sz = self.size();
+        if sz > gnitz_wire::MAX_FRAME_PAYLOAD {
+            return Err(format!(
+                "reply wire_size={sz} exceeds the maximum frame payload {}; \
+                 one row wider than the cap cannot be returned at all",
+                gnitz_wire::MAX_FRAME_PAYLOAD
+            )
+            .into());
+        }
+        Ok(sz)
     }
 
     /// The control header this frame carries.

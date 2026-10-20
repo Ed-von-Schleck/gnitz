@@ -21,14 +21,14 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::runtime::park::{WorkerParks, WorkerSet, MAX_WORKERS};
+use crate::runtime::park::WorkerParks;
 use crate::runtime::reactor::{AsyncRwLock, Reactor, WriteGuard};
 use crate::runtime::wire::WireMsg;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
 use gnitz_wire::control::{frame_head_size, peek_control_block, DecodedControl};
+use gnitz_wire::{low_bits_mask, BitIter, WireFault, WireStatus, MAX_WORKERS};
 use gnitz_wire::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
-use gnitz_wire::{WireFault, WireStatus};
 use gnitz_zset::repr::{Batch, WireRows};
 use gnitz_zset::schema::{decode_schema_block, SchemaDescriptor};
 
@@ -36,6 +36,59 @@ use gnitz_zset::schema::{decode_schema_block, SchemaDescriptor};
 /// groups publishing and its closing member. The tag (`"ddl"` / `"commit"`)
 /// picks which scope aborts.
 static ZONE_PANIC: Seam = Seam::new("GNITZ_INJECT_SAL_ZONE_PANIC");
+
+// ---------------------------------------------------------------------------
+// WorkerSet
+// ---------------------------------------------------------------------------
+
+/// A subset of the workers. `ALL` is unbounded; every other set holds only
+/// launched workers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct WorkerSet(u64);
+
+const _: () = assert!(MAX_WORKERS <= u64::BITS as usize);
+
+impl WorkerSet {
+    pub(crate) const EMPTY: Self = WorkerSet(0);
+    pub(crate) const ALL: Self = WorkerSet(u64::MAX);
+
+    pub(crate) const fn one(w: usize) -> Self {
+        WorkerSet(1 << w)
+    }
+
+    pub(crate) const fn with(self, w: usize) -> Self {
+        WorkerSet(self.0 | 1 << w)
+    }
+
+    pub(crate) const fn without(self, w: usize) -> Self {
+        WorkerSet(self.0 & !(1 << w))
+    }
+
+    pub(crate) const fn within(self, nw: usize) -> Self {
+        WorkerSet(self.0 & low_bits_mask(nw))
+    }
+
+    pub(crate) const fn contains(self, w: usize) -> bool {
+        self.0 >> w & 1 == 1
+    }
+
+    pub(crate) const fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    pub(crate) const fn union(self, other: Self) -> Self {
+        WorkerSet(self.0 | other.0)
+    }
+
+    /// How many members of the set are below `w`: `w`'s position among them.
+    pub(crate) const fn rank(self, w: usize) -> usize {
+        (self.0 & low_bits_mask(w)).count_ones() as usize
+    }
+
+    pub(crate) fn iter(self) -> BitIter {
+        BitIter(self.0)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
