@@ -23,6 +23,7 @@ use crate::schema::key::{pack_pk_be, pk_width_dispatch, PkSortKey};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::BatchView;
+use gnitz_wire::native_key_image;
 use gnitz_wire::read_u64_le;
 use gnitz_wire::Heap;
 use gnitz_wire::RowSource;
@@ -405,7 +406,7 @@ pub(crate) fn run_merge_in<S: ColumnarSource>(
 
     // Dispatch the payload order, monomorphizing one branch-free copy of the
     // merge loop.
-    with_payload_cmp!(schema, run_merge_body, sources, &mut cursors, schema, emit)
+    with_payload_cmp!(schema, |p| run_merge_body(sources, &mut cursors, schema, emit, p))
 }
 
 /// [`run_merge_in`] over every row of every source.
@@ -548,7 +549,7 @@ pub(crate) struct MergeOrder {
     /// hydrated row of its PK, making it the exemplar [`drive`] folds the whole
     /// PK group into. A runtime flag, not a second monomorphisation axis: it is
     /// constant for a merge's life and reached only on a PK tie.
-    coarsen: bool,
+    pub(crate) coarsen: bool,
 }
 
 impl MergeOrder {
@@ -732,7 +733,7 @@ impl Batch {
             "merged_consolidated: both inputs must be consolidated",
         );
         let mut out = pk_width_dispatch!(schema.pk_stride(), |K| {
-            with_payload_cmp!(schema, merged_consolidated_body::<K, _>, self, other, schema)
+            with_payload_cmp!(schema, |p| merged_consolidated_body::<K, _>(self, other, schema, p))
         });
         out.certify_consolidated();
         out
@@ -1022,7 +1023,7 @@ pub(crate) fn consolidate_groups(batch: &MemBatch, schema: &SchemaDescriptor, ou
         return;
     }
 
-    with_payload_cmp!(schema, consolidate_groups_inner, n, batch, schema, out)
+    with_payload_cmp!(schema, |p| consolidate_groups_inner(n, batch, schema, out, p))
 }
 
 /// Whether `batch`'s rows already stand as [`consolidate_groups`] would leave
@@ -1032,7 +1033,7 @@ pub(crate) fn in_consolidated_order(batch: &Batch) -> bool {
     if batch.count == 0 {
         return true;
     }
-    with_payload_cmp!(batch.schema(), ascending_with, batch) && !batch.has_ghost()
+    with_payload_cmp!(batch.schema(), |p| ascending_with(batch, p)) && !batch.has_ghost()
 }
 
 /// Whether `batch`, of at least one row, is strictly (PK, payload)-ascending.
@@ -1230,11 +1231,10 @@ fn fold_keyed(
 ) {
     /// Shift each key left past the column and put the column's bits in.
     #[inline(always)]
-    fn put<const W: usize>(keyed: &mut [(u128, u32)], cells: &[u8], flip: u64) {
+    fn put<const W: usize>(keyed: &mut [(u128, u32)], cells: &[u8], signed: bool) {
+        let cells = cells.as_chunks::<W>().0;
         for (key, row) in keyed.iter_mut() {
-            let mut v = [0u8; 8];
-            v[..W].copy_from_slice(&cells[*row as usize * W..][..W]);
-            *key = (*key << (W * 8)) | (u64::from_le_bytes(v) ^ flip) as u128;
+            *key = (*key << (W * 8)) | native_key_image(&cells[*row as usize], signed);
         }
     }
     // The rows tie on the key the columns before `from` made, so whatever of it
@@ -1244,12 +1244,12 @@ fn fold_keyed(
         let cs = col.size();
         let Some(left) = room.checked_sub(cs * 8) else { break };
         (room, next) = (left, next + 1);
-        let (cells, flip) = (batch.col_data(pc, cs), (col.is_signed() as u64) << (cs * 8 - 1));
+        let (cells, signed) = (batch.col_data(pc, cs), col.is_signed());
         match cs {
-            1 => put::<1>(keyed, cells, flip),
-            2 => put::<2>(keyed, cells, flip),
-            4 => put::<4>(keyed, cells, flip),
-            8 => put::<8>(keyed, cells, flip),
+            1 => put::<1>(keyed, cells, signed),
+            2 => put::<2>(keyed, cells, signed),
+            4 => put::<4>(keyed, cells, signed),
+            8 => put::<8>(keyed, cells, signed),
             w => unreachable!("a fixed-int column of {w} bytes"),
         }
     }

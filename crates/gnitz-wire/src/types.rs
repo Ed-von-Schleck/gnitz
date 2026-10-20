@@ -153,9 +153,7 @@ impl TypeCode {
     }
 
     /// Whether this type is a fixed-width integer of ≤ 8 bytes, any sign — the
-    /// domain of [`FixedInt`], which answers through the storage type. These are
-    /// exactly the payload columns the fixed-int fast-path row comparator can
-    /// compare via a single `u64` load.
+    /// domain of [`FixedInt`], which answers through the storage type.
     #[inline(always)]
     pub const fn is_fixed_int(self) -> bool {
         FixedInt::from_type_code(self).is_some()

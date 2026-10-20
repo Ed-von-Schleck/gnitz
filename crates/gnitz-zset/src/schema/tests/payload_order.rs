@@ -60,10 +60,6 @@ fn random_row(rng: &mut Rng, s: &SchemaDescriptor) -> (Batch, Model) {
     (bb.finish(), (pk, cells))
 }
 
-fn selected<O: PayloadOrder>(s: &SchemaDescriptor, a: &Batch, b: &Batch, order: O) -> Ordering {
-    order.compare(s, a, 0, b, 0)
-}
-
 /// Over random schemas — any payload types and nullability, the PK anywhere and
 /// in any order — the (PK, payload) order is the PK bytes, then each payload
 /// cell by its type's order; `Equal` is exactly row identity; a schema selects
@@ -92,7 +88,7 @@ fn row_order_is_the_pk_bytes_then_each_typed_payload_cell() {
         let full = compare_full_rows(&s, &a, 0, &b, 0);
         assert_eq!(full, ma.cmp(&mb), "{s:?}: {ma:?} vs {mb:?}");
         assert_eq!(
-            with_payload_cmp!(s, selected, &s, &a, &b),
+            with_payload_cmp!(s, |p| p.compare(&s, &a, 0, &b, 0)),
             payload,
             "{s:?}: {ma:?} vs {mb:?}"
         );

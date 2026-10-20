@@ -78,9 +78,10 @@ pub struct ReadCursor {
     /// `None` drives `tree`, and may be pessimistic: only a reposition re-derives it.
     mode: Option<usize>,
     pub(crate) schema: SchemaDescriptor,
-    /// At least one source is a capacity-bounded view's skeleton shard, so the
-    /// merge runs with payload coarsening on (see [`MergeOrder`]).
-    any_skeleton: bool,
+    /// The merge's order, coarsened iff a source is a capacity-bounded view's
+    /// skeleton shard. Keyed by the PK's leading bytes: finding a shared prefix
+    /// would read every run's last row at each open.
+    order: MergeOrder,
     /// The drain's merge-order scratch, reused across chunks.
     merge_order: Vec<(u32, u32, i64)>,
     /// The drain's per-source row windows, reused across chunks.
@@ -107,13 +108,6 @@ impl ReadCursor {
         }
     }
 
-    /// The merge order of a cursor over `schema`, coarsened iff a source is a
-    /// skeleton run. Keyed by the PK's leading bytes: finding a shared prefix
-    /// would read every run's last row at each open.
-    fn order(schema: &SchemaDescriptor, any_skeleton: bool) -> MergeOrder {
-        MergeOrder::leading(schema.pk_stride(), any_skeleton)
-    }
-
     /// Positioned by `position` before it is returned, so no caller moves a cursor it
     /// has to mutate first.
     #[inline]
@@ -124,12 +118,12 @@ impl ReadCursor {
         position: impl FnOnce(&mut ReadCursor),
     ) -> Self {
         debug_assert_eq!(sources.len(), states.len());
-        let any_skeleton = sources.iter().any(ColumnarSource::is_skeleton);
+        let order = MergeOrder::leading(schema.pk_stride(), sources.iter().any(ColumnarSource::is_skeleton));
         let mut cursor = ReadCursor {
             // Sized for the source count; `rebuild_and_advance` plays it.
             tree: LoserTree::empty(sources.len()),
             sources,
-            any_skeleton,
+            order,
             states,
             merge_order: Vec::new(),
             drain_windows: Vec::new(),
@@ -150,12 +144,12 @@ impl ReadCursor {
         self.mode = Self::live_single(&self.states);
         match self.mode {
             Some(i) => self.advance_single(i),
-            None => with_payload_cmp!(self.schema, Self::rebuild_and_advance_merge_with, self),
+            None => with_payload_cmp!(self.schema, |p| self.rebuild_and_advance_merge_with(p)),
         }
     }
 
     /// One payload dispatch for the tournament re-play and the advance after it.
-    /// A leaf is keyed under [`Self::order`] and ties go to
+    /// A leaf is keyed under the cursor's `order` and ties go to
     /// [`merge::merge_less`], the pair the advance and forward-seek paths step
     /// the tree through, so a tree maintained in place cannot order rows
     /// differently from how it was played.
@@ -164,24 +158,14 @@ impl ReadCursor {
         {
             // Destructured so the tournament's `&mut tree` and the comparator's
             // `&sources` / `&states` are disjoint field borrows.
-            let ReadCursor {
-                tree,
-                sources,
-                states,
-                schema,
-                any_skeleton,
-                ..
-            } = &mut *self;
+            let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
             tree.rebuild(
                 |i| {
-                    states[i].is_valid().then(|| {
-                        (
-                            states[i].position as u32,
-                            Self::order(schema, *any_skeleton).key(sources, i, states[i].position),
-                        )
-                    })
+                    states[i]
+                        .is_valid()
+                        .then(|| (states[i].position as u32, order.key(sources, i, states[i].position)))
                 },
-                merge::merge_less(schema, sources, Self::order(schema, *any_skeleton), payload),
+                merge::merge_less(schema, sources, *order, payload),
             );
         }
         self.advance_merge_with(payload);
@@ -267,25 +251,18 @@ impl ReadCursor {
     /// the first live group. [`Self::advance_to_forward`]'s dispatch is what
     /// establishes the mode and the strictly-forward key this needs.
     fn seek_forward_merge(&mut self, key: &[u8]) {
-        with_payload_cmp!(self.schema, Self::seek_forward_merge_with, self, key);
+        with_payload_cmp!(self.schema, |p| self.seek_forward_merge_with(key, p));
     }
 
     #[inline]
     fn seek_forward_merge_with<P: PayloadOrder>(&mut self, key: &[u8], payload: P) {
         // Scoping the field borrows to `seek_phase` frees `self` for the advance.
-        let ReadCursor {
-            tree,
-            sources,
-            states,
-            schema,
-            any_skeleton,
-            ..
-        } = &mut *self;
-        let less = merge::merge_less(schema, sources, Self::order(schema, *any_skeleton), payload);
+        let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
+        let less = merge::merge_less(schema, sources, *order, payload);
         Self::seek_phase(
             tree,
             sources,
-            Self::order(schema, *any_skeleton),
+            *order,
             states,
             |s: &Run, r: usize| compare_pk_ordering(s.get_pk_bytes(r), key) == Ordering::Less,
             |s: &Run, pos: usize| s.advance_to(key, pos),
@@ -428,38 +405,26 @@ impl ReadCursor {
     ///
     /// Not [`Self::for_each_row_while`] with an equality `cont`: this crate
     /// builds at `opt-level = 0` in dev, where that closure is a real call per row.
-    pub(crate) fn for_each_pk_group_row<F: FnMut(&ReadCursor)>(&mut self, key: &[u8], f: F) {
-        with_payload_cmp!(self.schema, Self::for_each_pk_group_row_with::<_, _>, self, key, f);
-    }
-
-    #[inline]
-    fn for_each_pk_group_row_with<P: PayloadOrder, F: FnMut(&ReadCursor)>(&mut self, key: &[u8], mut f: F, payload: P) {
-        while self.valid && self.current_pk_starts_with(key) {
-            f(&*self);
-            self.advance_with(payload);
-        }
+    pub(crate) fn for_each_pk_group_row<F: FnMut(&ReadCursor)>(&mut self, key: &[u8], mut f: F) {
+        with_payload_cmp!(
+            self.schema,
+            |payload| while self.valid && self.current_pk_starts_with(key) {
+                f(&*self);
+                self.advance_with(payload);
+            }
+        )
     }
 
     /// `f(i, w)` for every row `i` of the (PK, payload)-sorted `mb`, `w` the net
     /// weight of the trace element equal to row `i` in (PK, payload), or 0. Rows
     /// are probed in order, each moving the cursor forward from where the last left it.
-    pub(crate) fn for_each_mem_row_weight<F: FnMut(usize, i64)>(&mut self, mb: &MemBatch, f: F) {
-        with_payload_cmp!(self.schema, Self::for_each_mem_row_weight_with::<_, _>, self, mb, f);
-    }
-
-    #[inline]
-    fn for_each_mem_row_weight_with<F: FnMut(usize, i64), P: PayloadOrder>(
-        &mut self,
-        mb: &MemBatch,
-        mut f: F,
-        payload: P,
-    ) {
+    pub(crate) fn for_each_mem_row_weight<F: FnMut(usize, i64)>(&mut self, mb: &MemBatch, mut f: F) {
         // A skeleton run folds a PK group regardless of payload; no history holds one.
-        debug_assert!(!self.any_skeleton, "element walk over a skeleton store");
-        for i in 0..mb.count {
+        debug_assert!(!self.order.coarsen, "element walk over a skeleton store");
+        with_payload_cmp!(self.schema, |payload| for i in 0..mb.count {
             let w = self.weight_of_with(mb, i, payload);
             f(i, w);
-        }
+        })
     }
 
     /// `mb[i]`'s weight at or after the cursor, consuming the element on a match.
@@ -514,7 +479,7 @@ impl ReadCursor {
             sources,
             states,
             schema,
-            any_skeleton,
+            order,
             mode,
             ..
         } = &mut *self;
@@ -528,16 +493,8 @@ impl ReadCursor {
             // The other sources' windows are empty, and a forward seek keeps them so.
             Some(src) => states[src].position = gallop(&sources[src], states[src].position),
             None => {
-                let less = merge::merge_less(schema, sources, Self::order(schema, *any_skeleton), payload);
-                Self::seek_phase(
-                    tree,
-                    sources,
-                    Self::order(schema, *any_skeleton),
-                    states,
-                    lags,
-                    gallop,
-                    &less,
-                );
+                let less = merge::merge_less(schema, sources, *order, payload);
+                Self::seek_phase(tree, sources, *order, states, lags, gallop, &less);
             }
         }
         self.advance_with(payload);
@@ -547,23 +504,14 @@ impl ReadCursor {
     /// cursor sits ON the first row `cont` rejected, or is exhausted. Seek-free.
     /// Selects the payload comparator once, where [`Self::advance`] re-runs that
     /// dispatch per call in merge mode.
-    pub(crate) fn for_each_row_while<C: Fn(&[u8]) -> bool, F: FnMut(&ReadCursor)>(&mut self, cont: C, f: F) {
-        with_payload_cmp!(self.schema, Self::for_each_row_while_with::<_, _, _>, self, cont, f);
-    }
-
-    /// Threads the selected `payload` order through each advance, so the per-row
-    /// step never re-selects it.
-    #[inline]
-    fn for_each_row_while_with<C: Fn(&[u8]) -> bool, F: FnMut(&ReadCursor), P: PayloadOrder>(
-        &mut self,
-        cont: C,
-        mut f: F,
-        payload: P,
-    ) {
-        while self.valid && cont(self.current_pk_bytes()) {
-            f(&*self);
-            self.advance_with(payload);
-        }
+    pub(crate) fn for_each_row_while<C: Fn(&[u8]) -> bool, F: FnMut(&ReadCursor)>(&mut self, cont: C, mut f: F) {
+        with_payload_cmp!(
+            self.schema,
+            |payload| while self.valid && cont(self.current_pk_bytes()) {
+                f(&*self);
+                self.advance_with(payload);
+            }
+        )
     }
 
     /// Storage-order comparison of the current row's PK against an OPK `key`.
@@ -592,31 +540,17 @@ impl ReadCursor {
     pub(crate) fn walk_positive_with_prefix_until<F: FnMut(&ReadCursor) -> ControlFlow<()>>(
         &mut self,
         prefix: &[u8],
-        f: F,
-    ) -> bool {
-        with_payload_cmp!(
-            self.schema,
-            Self::walk_positive_with_prefix_with::<_, _>,
-            self,
-            prefix,
-            f
-        )
-    }
-
-    #[inline]
-    fn walk_positive_with_prefix_with<F: FnMut(&ReadCursor) -> ControlFlow<()>, P: PayloadOrder>(
-        &mut self,
-        prefix: &[u8],
         mut f: F,
-        payload: P,
     ) -> bool {
-        while self.valid && self.current_pk_bytes().starts_with(prefix) {
-            if self.current_weight > 0 && f(&*self).is_break() {
-                return true;
+        with_payload_cmp!(self.schema, |payload| {
+            while self.valid && self.current_pk_bytes().starts_with(prefix) {
+                if self.current_weight > 0 && f(&*self).is_break() {
+                    return true;
+                }
+                self.advance_with(payload);
             }
-            self.advance_with(payload);
-        }
-        false
+            false
+        })
     }
 
     /// [`Self::for_each_row_while`] with the weight gate applied — the one place
@@ -644,7 +578,7 @@ impl ReadCursor {
     /// order once inlines [`Self::advance_merge_with`] instead.
     #[inline(never)]
     fn advance_merge(&mut self) {
-        with_payload_cmp!(self.schema, Self::advance_merge_with, self)
+        with_payload_cmp!(self.schema, |p| self.advance_merge_with(p))
     }
 
     /// Commit (or invalidate from) the `(source_idx, row, net_weight)` an advance
@@ -688,23 +622,15 @@ impl ReadCursor {
 
     /// The five-field destructure both merge-mode walks need before handing the
     /// tournament to [`merge::drive`]: `advance_merge_with` takes one group,
-    /// `output::drain_sorted_into_with` a whole chunk.
+    /// `drain_sorted_into` a whole chunk.
     #[inline(always)]
     pub(super) fn drive<P: PayloadOrder>(
         &mut self,
         payload: P,
         emit: impl FnMut(usize, usize, i64) -> std::ops::ControlFlow<()>,
     ) {
-        let ReadCursor {
-            tree,
-            sources,
-            states,
-            schema,
-            any_skeleton,
-            ..
-        } = &mut *self;
-        let order = Self::order(schema, *any_skeleton);
-        merge::drive(tree, schema, sources, order, states, payload, emit);
+        let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
+        merge::drive(tree, schema, sources, *order, states, payload, emit);
     }
 
     /// Merge-mode advance (`self.mode.is_none()`), monomorphized on payload.

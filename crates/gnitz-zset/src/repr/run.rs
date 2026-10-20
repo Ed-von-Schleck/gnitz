@@ -15,7 +15,7 @@ use crate::repr::merge::ColumnarSource;
 use crate::repr::merge::{ColPtr, UnifiedSource};
 use crate::repr::scatter::DecodedColumns;
 use crate::repr::shard_reader::MappedShard;
-use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
+use crate::schema::payload_order::compare_rows;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{Heap, RowSource};
 
@@ -98,20 +98,12 @@ impl StoredRow {
 /// Index of the first candidate in `pool` whose payload group nets strictly
 /// positive.
 pub fn first_live_payload_group(schema: &SchemaDescriptor, pool: &[StoredRow]) -> Option<usize> {
-    with_payload_cmp!(schema, first_live_payload_group_with, schema, pool)
-}
-
-fn first_live_payload_group_with<P: PayloadOrder>(
-    schema: &SchemaDescriptor,
-    pool: &[StoredRow],
-    payload: P,
-) -> Option<usize> {
     (0..pool.len()).find(|&i| {
         let (run, row) = (&pool[i].run, pool[i].row);
         let others: i64 = pool
             .iter()
             .enumerate()
-            .filter(|&(j, c)| j != i && payload.compare(schema, run, row, &c.run, c.row).is_eq())
+            .filter(|&(j, c)| j != i && compare_rows(schema, run, row, &c.run, c.row).is_eq())
             .map(|(_, c)| c.weight())
             .sum();
         pool[i].weight() + others > 0

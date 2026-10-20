@@ -72,6 +72,15 @@ pub fn opk_bias(tc: TypeCode) -> u128 {
     (tc.is_signed_int() as u128) << (tc.wire_stride() * 8 - 1)
 }
 
+/// [`key_image`] of a `W`-byte native little-endian integer cell, `signed` its
+/// column's signedness: zero-extended, the sign bit of its width flipped.
+#[inline(always)]
+pub fn native_key_image<const W: usize>(cell: &[u8; W], signed: bool) -> u128 {
+    let mut le = [0u8; 16];
+    le[..W].copy_from_slice(cell);
+    u128::from_le_bytes(le) ^ ((signed as u128) << (8 * W - 1))
+}
+
 /// Decode one OPK cell into its native little-endian bytes: `src` and `dst` are both
 /// the column's width, `signed` the column's signedness.
 ///

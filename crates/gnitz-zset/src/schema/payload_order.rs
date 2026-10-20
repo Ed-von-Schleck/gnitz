@@ -4,9 +4,9 @@
 
 use std::cmp::Ordering;
 
+use super::key::compare_pk_ordering;
 use super::SchemaDescriptor;
-use gnitz_wire::RowSource;
-use gnitz_wire::{cmp_col_window, compare_german_strings, null_word_get, read_unsigned_exact};
+use gnitz_wire::{cmp_col_window, compare_german_strings, native_key_image, null_word_get, RowSource};
 
 /// Compare two rows in the full (PK, payload) order.
 pub(crate) fn compare_full_rows<A: RowSource, B: RowSource>(
@@ -16,9 +16,7 @@ pub(crate) fn compare_full_rows<A: RowSource, B: RowSource>(
     src_b: &B,
     row_b: usize,
 ) -> Ordering {
-    src_a
-        .get_pk_bytes(row_a)
-        .cmp(src_b.get_pk_bytes(row_b))
+    compare_pk_ordering(src_a.get_pk_bytes(row_a), src_b.get_pk_bytes(row_b))
         .then_with(|| compare_rows(schema, src_a, row_a, src_b, row_b))
 }
 
@@ -36,9 +34,9 @@ pub(crate) fn compare_rows<A: RowSource, B: RowSource>(
     let null_word_a = src_a.get_null_word(row_a);
     let null_word_b = src_b.get_null_word(row_b);
 
-    for (payload_col, col) in schema.payload_columns() {
-        let null_a = null_word_get(null_word_a, payload_col);
-        let null_b = null_word_get(null_word_b, payload_col);
+    for (slot, col) in schema.payload_columns() {
+        let null_a = null_word_get(null_word_a, slot);
+        let null_b = null_word_get(null_word_b, slot);
         if null_a && null_b {
             continue;
         }
@@ -50,10 +48,7 @@ pub(crate) fn compare_rows<A: RowSource, B: RowSource>(
         }
 
         let cs = col.size();
-        let (a, b) = (
-            src_a.get_col_ptr(row_a, payload_col, cs),
-            src_b.get_col_ptr(row_b, payload_col, cs),
-        );
+        let (a, b) = (src_a.get_col_ptr(row_a, slot, cs), src_b.get_col_ptr(row_b, slot, cs));
         let ord = match col.type_code.is_german_string() {
             true => compare_german_strings(a.try_into().unwrap(), src_a.heap(), b.try_into().unwrap(), src_b.heap()),
             false => cmp_col_window(a, b, col.type_code),
@@ -94,27 +89,32 @@ pub(crate) struct Generic;
 impl PayloadOrder for FixedIntNonnull {
     const FIXED_INT: bool = true;
 
-    /// Each column read as an order-preserving u64: zero-extend, then flip the
-    /// sign bit for signed columns. Same order as [`compare_rows`], with no
-    /// null-bitmap read and no per-column type dispatch.
+    /// Each column by its cells' key images: the same order as [`compare_rows`],
+    /// with no null-bitmap read and no per-type dispatch, one width dispatch
+    /// serving both cells.
     #[inline]
     fn compare<A: RowSource, B: RowSource>(self, s: &SchemaDescriptor, a: &A, ra: usize, b: &B, rb: usize) -> Ordering {
         debug_assert!(
             s.payload_is_fixed_int_nonnull(),
             "FixedIntNonnull on a non-fixedint or nullable schema",
         );
-        for (payload_col, col) in s.payload_columns() {
+        for (slot, col) in s.payload_columns() {
             let cs = col.size();
-            // `cs*8-1 ∈ {7,15,31,63}`: `FixedIntNonnull` admits only
-            // `is_fixed_int` type codes, which are exactly the 1/2/4/8-byte
-            // widths. `is_signed` is 0 for unsigned columns, so the XOR is then
-            // a no-op; for signed ones it flips the MSB, putting two's-complement
-            // negatives below non-negatives.
-            let sign_flip = (col.is_signed() as u64) << (cs * 8 - 1);
-            // `get_col_ptr` returns exactly `cs` bytes.
-            let av = read_unsigned_exact(a.get_col_ptr(ra, payload_col, cs)) ^ sign_flip;
-            let bv = read_unsigned_exact(b.get_col_ptr(rb, payload_col, cs)) ^ sign_flip;
-            let ord = av.cmp(&bv);
+            let (ca, cb) = (a.get_col_ptr(ra, slot, cs), b.get_col_ptr(rb, slot, cs));
+            // A fixed-int image fits 64 bits, which compare cheaper than 128.
+            macro_rules! cmp {
+                ($w:literal) => {{
+                    let image = |c: &[u8]| native_key_image::<$w>(c.try_into().unwrap(), col.is_signed()) as u64;
+                    image(ca).cmp(&image(cb))
+                }};
+            }
+            let ord = match cs {
+                1 => cmp!(1),
+                2 => cmp!(2),
+                4 => cmp!(4),
+                8 => cmp!(8),
+                w => unreachable!("a fixed-int column of {w} bytes"),
+            };
             if ord != Ordering::Equal {
                 return ord;
             }
@@ -132,14 +132,16 @@ impl PayloadOrder for Generic {
     }
 }
 
-/// `f(args..., payload)` with the schema's [`PayloadOrder`] appended: one
-/// monomorphization of `f` per order.
+/// `$body` with `$p` bound to the schema's [`PayloadOrder`]: one copy of `$body`
+/// per order.
 macro_rules! with_payload_cmp {
-    ($schema:expr, $f:path $(, $arg:expr)* $(,)?) => {
+    ($schema:expr, |$p:ident| $body:expr $(,)?) => {
         if $schema.payload_is_fixed_int_nonnull() {
-            $f($($arg,)* $crate::schema::payload_order::FixedIntNonnull)
+            let $p = $crate::schema::payload_order::FixedIntNonnull;
+            $body
         } else {
-            $f($($arg,)* $crate::schema::payload_order::Generic)
+            let $p = $crate::schema::payload_order::Generic;
+            $body
         }
     };
 }

@@ -94,7 +94,7 @@ impl PkSetGather {
         if self.remaining_keys() == 0 {
             return None;
         }
-        let split = self.cursor.any_skeleton;
+        let split = self.cursor.order.coarsen;
         let mut picks: Vec<(u32, u32, i64)> = Vec::with_capacity(self.remaining_keys().min(max_rows));
         let visited = self.for_each_live_row(max_rows, |c| {
             if split && c.current_is_skeleton() {

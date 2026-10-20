@@ -111,12 +111,10 @@ impl KeyCells<'_> {
 /// native value with its sign bit flipped.
 #[inline(always)]
 pub(crate) fn cell_image<const W: usize, const OPK: bool>(cell: &[u8; W], signed: bool) -> u128 {
-    if OPK {
-        return gnitz_wire::widen_pk_be(cell);
+    match OPK {
+        true => gnitz_wire::widen_pk_be(cell),
+        false => gnitz_wire::native_key_image(cell, signed),
     }
-    let mut le = [0u8; 16];
-    le[..W].copy_from_slice(cell);
-    u128::from_le_bytes(le) ^ ((signed as u128) << (8 * W - 1))
 }
 
 /// Run `$body` with `$w` the constant `$width`, a [`KeyCells`] width.

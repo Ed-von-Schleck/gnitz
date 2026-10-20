@@ -7,7 +7,7 @@ use super::{ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
 use crate::repr::merge::ColumnarSource;
 use crate::repr::scatter::UnifiedSet;
-use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
+use crate::schema::payload_order::with_payload_cmp;
 use gnitz_wire::RowSource;
 
 impl ReadCursor {
@@ -50,7 +50,7 @@ impl ReadCursor {
         for (w, s) in windows.iter_mut().zip(&self.states) {
             w.end = s.position;
         }
-        if self.any_skeleton {
+        if self.order.coarsen {
             let sources = &self.sources;
             order.retain(|&(e, r, w)| {
                 let src = &sources[e as usize];
@@ -103,18 +103,13 @@ impl ReadCursor {
     fn drain_sorted_into(&mut self, max_rows: usize, out: &mut Vec<(u32, u32, i64)>) {
         out.clear();
         out.reserve(max_rows.min(self.estimated_length()));
-        with_payload_cmp!(self.schema, Self::drain_sorted_with, self, max_rows, out);
-    }
-
-    #[inline]
-    fn drain_sorted_with<P: PayloadOrder>(&mut self, max_rows: usize, out: &mut Vec<(u32, u32, i64)>, payload: P) {
         out.push((
             self.current_entry_idx as u32,
             self.current_row as u32,
             self.current_weight,
         ));
         let mut first_undrained = None;
-        self.drive(payload, |gs, gr, nw| {
+        with_payload_cmp!(self.schema, |payload| self.drive(payload, |gs, gr, nw| {
             if out.len() == max_rows {
                 first_undrained = Some((gs, gr, nw));
                 std::ops::ControlFlow::Break(())
@@ -122,7 +117,7 @@ impl ReadCursor {
                 out.push((gs as u32, gr as u32, nw));
                 std::ops::ControlFlow::Continue(())
             }
-        });
+        }));
         self.commit_emitted(first_undrained);
     }
 }
