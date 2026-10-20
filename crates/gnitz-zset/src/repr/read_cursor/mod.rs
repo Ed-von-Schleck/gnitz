@@ -179,7 +179,8 @@ impl ReadCursor {
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
             state.position = src.find_lower_bound_bytes(start);
             if let Some(end) = end {
-                state.count = state.count.min(src.find_lower_bound_bytes(end));
+                // `end` lands at or after `start`'s landing.
+                state.count = state.count.min(src.advance_to(end, state.position));
             }
         }
         self.rebuild_and_advance();

@@ -789,21 +789,8 @@ impl<'a, K: PkSortKey<'a>> Keys<'a, K> {
     /// is: a gallop, so the next row costs one probe and a far one `O(log gap)`.
     #[inline(always)]
     fn skip_below(&self, row: usize, key: K) -> usize {
-        let (mut lo, mut step) = (row, 1);
-        // SAFETY (both loops): the probed row is below `count`.
-        while lo + step < self.count && unsafe { self.at_unchecked(lo + step) } < key {
-            lo += step;
-            step *= 2;
-        }
-        let (mut lo, mut hi) = (lo + 1, (lo + step).min(self.count));
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            match unsafe { self.at_unchecked(mid) } < key {
-                true => lo = mid + 1,
-                false => hi = mid,
-            }
-        }
-        lo
+        // SAFETY: the gallop probes rows below `count` only.
+        super::seek::gallop_from(self.count, row, |i| unsafe { self.at_unchecked(i) } < key)
     }
 }
 

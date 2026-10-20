@@ -567,7 +567,7 @@ impl MappedShard {
     }
 
     /// First row whose OPK bytes are `>= key`; `key` is exactly `pk_stride` bytes.
-    pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
+    pub(crate) fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
         self.seek(key, None)
     }
 

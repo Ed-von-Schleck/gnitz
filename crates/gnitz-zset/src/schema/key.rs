@@ -153,9 +153,15 @@ impl PkSortKey<'_> for u64 {
 }
 
 impl PkSortKey<'_> for u128 {
+    /// The leading 8 bytes over the trailing 8, which overlap below 16 bytes:
+    /// ordered and injective among keys of one 9..=16-byte width, with no length
+    /// dispatch, so a search's comparison closure stays small enough to inline.
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> u128 {
-        pack_pk_be(opk)
+        let len = opk.len();
+        let hi = u64::from_be_bytes(opk[..8].try_into().unwrap()) as u128;
+        let tail = u64::from_be_bytes(opk[len - 8..].try_into().unwrap()) as u128;
+        (hi << 64) | tail
     }
 }
 

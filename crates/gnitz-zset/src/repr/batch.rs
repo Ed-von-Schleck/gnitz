@@ -902,17 +902,17 @@ impl Batch {
     }
 
     /// First row whose OPK bytes are `>= key`; `key` is exactly `pk_stride`
-    /// bytes. Correct at every PK width with no schema dependency.
-    pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
-        let cp = self.pk_col_ptr();
-        unsafe { super::seek::seek_lower_bound(self.count, cp.stride, cp, key) }
+    /// bytes.
+    pub(crate) fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
+        // SAFETY: the PK region holds a key for every row.
+        unsafe { super::seek::seek_lower_bound(self.count, self.schema.pk_stride(), self.pk_col_ptr(), key) }
     }
 
     /// The rows whose PK is the OPK `key`, exactly `pk_stride` bytes: none, at
     /// its lower bound, where the batch, which is in key order, holds no such row.
     pub fn pk_rows(&self, key: &[u8]) -> Range<usize> {
-        let cp = self.pk_col_ptr();
-        unsafe { super::seek::seek_pk_rows(self.count, cp.stride, cp, key) }
+        // SAFETY: the PK region holds a key for every row.
+        unsafe { super::seek::seek_pk_rows(self.count, self.schema.pk_stride(), self.pk_col_ptr(), key) }
     }
 
     /// Whether this batch holds the element of `src`'s row `row`, at any weight.
@@ -925,12 +925,11 @@ impl Batch {
 
     /// Galloping forward lower bound seeded at `hint` (the caller's live
     /// position): `O(log gap)` when the boundary is just ahead, `O(1)` when it
-    /// IS the hint, never worse than `find_lower_bound_bytes`. Used by the join's
-    /// equi merge walk, whose probe keys ascend, so the boundary only moves
-    /// forward. `key` must be exactly `pk_stride` OPK bytes.
+    /// IS the hint, never worse than `find_lower_bound_bytes`. `key` must be
+    /// exactly `pk_stride` OPK bytes.
     pub(crate) fn advance_to(&self, key: &[u8], hint: usize) -> usize {
-        let cp = self.pk_col_ptr();
-        unsafe { super::seek::seek_advance_to(self.count, cp.stride, cp, key, hint) }
+        // SAFETY: the PK region holds a key for every row.
+        unsafe { super::seek::seek_advance_to(self.count, self.schema.pk_stride(), self.pk_col_ptr(), key, hint) }
     }
 
     /// The rows of this batch, which is in key order, whose PK is one of

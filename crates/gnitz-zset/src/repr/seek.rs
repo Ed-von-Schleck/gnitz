@@ -1,7 +1,8 @@
 //! The lower-bound search every sorted PK region seeks through, stateless and
-//! galloping, plus the equal-PK group bracket: [`lower_bound_by`] and
-//! [`gallop_by`] under the `(count, stride, ColPtr)` entry points here for an
-//! OPK region, under a packed key's image and under a seek by (PK, payload).
+//! galloping, plus the equal-PK group bracket: [`lower_bound_by`],
+//! [`gallop_by`] and [`gallop_from`] under the `(count, width, ColPtr)` entry
+//! points here for an OPK region, under a packed key's image, under a seek by
+//! (PK, payload) and under the two-way merge's skip.
 
 use std::ops::Range;
 
@@ -22,6 +23,21 @@ pub(crate) fn lower_bound_by(mut lo: usize, mut hi: usize, lt: impl Fn(usize) ->
         }
     }
     lo
+}
+
+/// Galloping lower bound over `(lo, count)`, where row `lo` already sorts before
+/// the probe: `O(1)` for the next row, `O(log gap)` for a far one. `lt(i)`
+/// reports row `i < probe`, as in [`lower_bound_by`].
+#[inline(always)]
+pub(crate) fn gallop_from(count: usize, mut lo: usize, lt: impl Fn(usize) -> bool) -> usize {
+    debug_assert!(lo < count, "gallop_from: row {lo} out of {count}");
+    let mut step = 1usize;
+    while lo + step < count && lt(lo + step) {
+        lo += step;
+        step *= 2;
+    }
+    let hi = (lo + step).min(count); // row `hi` sorts >= probe, or hi == count
+    lower_bound_by(lo + 1, hi, lt)
 }
 
 /// Galloping lower bound over `[0, count)`, seeded at `hint`: `O(log gap)` forward
@@ -52,17 +68,18 @@ pub(crate) fn gallop_by(count: usize, hint: usize, lt: impl Fn(usize) -> bool) -
     lower_bound_by(0, h, lt) // genuine overshoot: bounded [0, h)
 }
 
-/// First row of `pk` whose OPK bytes are `>= key`; `key` is exactly `stride`
-/// bytes.
+/// First row of `pk` whose OPK bytes are `>= key`. `width` is the key's byte
+/// width, which `key` must be; `pk`'s own stride is the step between rows,
+/// which a Constant region sets to zero.
 ///
 /// # Safety
-/// `pk` must address at least `count` rows of `stride` bytes.
+/// `pk` must address at least `count` rows of `width` bytes.
 #[inline]
-pub(crate) unsafe fn seek_lower_bound(count: usize, stride: usize, pk: ColPtr, key: &[u8]) -> usize {
-    debug_assert_eq!(key.len(), stride, "seek probe width must equal pk_stride");
-    pk_width_dispatch!(stride, |K| {
+pub(crate) unsafe fn seek_lower_bound(count: usize, width: usize, pk: ColPtr, key: &[u8]) -> usize {
+    debug_assert_eq!(key.len(), width, "seek probe width must equal pk_stride");
+    pk_width_dispatch!(width, |K| {
         let p = K::from_opk(key);
-        lower_bound_by(0, count, |i| K::from_opk(pk.row(i, stride)) < p)
+        lower_bound_by(0, count, |i| K::from_opk(pk.row(i, width)) < p)
     })
 }
 
@@ -72,11 +89,11 @@ pub(crate) unsafe fn seek_lower_bound(count: usize, stride: usize, pk: ColPtr, k
 /// # Safety
 /// As [`seek_lower_bound`].
 #[inline]
-pub(crate) unsafe fn seek_advance_to(count: usize, stride: usize, pk: ColPtr, key: &[u8], hint: usize) -> usize {
-    debug_assert_eq!(key.len(), stride, "seek probe width must equal pk_stride");
-    pk_width_dispatch!(stride, |K| {
+pub(crate) unsafe fn seek_advance_to(count: usize, width: usize, pk: ColPtr, key: &[u8], hint: usize) -> usize {
+    debug_assert_eq!(key.len(), width, "seek probe width must equal pk_stride");
+    pk_width_dispatch!(width, |K| {
         let p = K::from_opk(key);
-        gallop_by(count, hint, |i| K::from_opk(pk.row(i, stride)) < p)
+        gallop_by(count, hint, |i| K::from_opk(pk.row(i, width)) < p)
     })
 }
 
@@ -86,13 +103,13 @@ pub(crate) unsafe fn seek_advance_to(count: usize, stride: usize, pk: ColPtr, ke
 /// # Safety
 /// As [`seek_lower_bound`].
 #[inline]
-pub(crate) unsafe fn seek_pk_rows(count: usize, stride: usize, pk: ColPtr, key: &[u8]) -> Range<usize> {
-    debug_assert_eq!(key.len(), stride, "seek probe width must equal pk_stride");
-    pk_width_dispatch!(stride, |K| {
+pub(crate) unsafe fn seek_pk_rows(count: usize, width: usize, pk: ColPtr, key: &[u8]) -> Range<usize> {
+    debug_assert_eq!(key.len(), width, "seek probe width must equal pk_stride");
+    pk_width_dispatch!(width, |K| {
         let p = K::from_opk(key);
-        let lo = lower_bound_by(0, count, |i| K::from_opk(pk.row(i, stride)) < p);
+        let lo = lower_bound_by(0, count, |i| K::from_opk(pk.row(i, width)) < p);
         let mut hi = lo;
-        while hi < count && K::from_opk(pk.row(hi, stride)) == p {
+        while hi < count && K::from_opk(pk.row(hi, width)) == p {
             hi += 1;
         }
         lo..hi
@@ -104,12 +121,13 @@ pub(crate) unsafe fn seek_pk_rows(count: usize, stride: usize, pk: ColPtr, key: 
 /// caller reaches it having just landed on the group's first row, where the
 /// group is short and a gallop would cost more.
 #[inline]
-pub fn pk_group_end<S: RowSource>(src: &S, start: usize) -> usize {
+pub(crate) fn pk_group_end<S: RowSource>(src: &S, start: usize) -> usize {
     pk_prefix_group_end(src, start, src.get_pk_bytes(start).len())
 }
 
 /// [`pk_group_end`] over a leading `width`-byte key prefix rather than the whole
-/// key.
+/// key. Linear as well: a prefix group can be long, but every caller walks the
+/// whole group anyway.
 #[inline]
 pub(crate) fn pk_prefix_group_end<S: RowSource>(src: &S, start: usize, width: usize) -> usize {
     let k = &src.get_pk_bytes(start)[..width];

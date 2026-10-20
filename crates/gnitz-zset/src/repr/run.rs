@@ -35,7 +35,7 @@ impl Run {
     }
 
     /// First row whose OPK bytes are `>= key`; `key` is exactly `pk_stride`
-    /// bytes. Correct at every PK width with no schema dependency.
+    /// bytes.
     pub(crate) fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
         match self {
             Run::Mem(b) => b.find_lower_bound_bytes(key),

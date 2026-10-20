@@ -1,7 +1,8 @@
 use super::*;
 
 /// The seeks equal the linear lower bound, and the key's rows run from it to the
-/// linear upper bound, for every row count, hint and width arm. Keys differ only in their last two bytes, past the register from stride 24.
+/// linear upper bound, for every row count, hint and width arm. Keys differ only in their last two bytes, past the
+/// register from stride 24.
 #[test]
 fn seek_matches_the_linear_lower_bound_at_every_width() {
     let vals: [u16; 8] = [10, 10, 20, 30, 30, 30, 40, 50];
