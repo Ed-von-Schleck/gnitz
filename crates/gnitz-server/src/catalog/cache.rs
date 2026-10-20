@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
 
@@ -27,6 +27,15 @@ pub(in crate::catalog) struct RelationEntry {
     pub(in crate::catalog) fks: Vec<FkEdge>,
     /// [`gnitz_wire::TableProps::serial`].
     pub(in crate::catalog) serial: bool,
+    /// [`CatalogEngine::resolve_token`], computed on first use; `0` until then.
+    /// Reset by every hook of a family that can change a RESOLVE answer.
+    pub(in crate::catalog) token: Cell<u64>,
+}
+
+impl RelationEntry {
+    pub(in crate::catalog) fn new(record: Rc<[u8]>, fks: Vec<FkEdge>, serial: bool) -> Self {
+        RelationEntry { record, fks, serial, token: Cell::new(0) }
+    }
 }
 
 impl CatalogEngine {
@@ -50,11 +59,7 @@ impl CatalogEngine {
 
     /// Whether a frame whose record matched `seen` still lays out `tid`'s columns.
     pub(crate) fn recheck_record(&self, tid: u64, seen: &Rc<[u8]>) -> Result<(), String> {
-        let current = &self.relation_entry(tid).record;
-        if Rc::ptr_eq(seen, current) {
-            return Ok(());
-        }
-        check_same_types(seen, current)
+        check_same_types(seen, &self.relation_entry(tid).record)
     }
 
     /// What a RESOLVE of `tid` answers: its encoded descriptor, its named record
@@ -80,21 +85,23 @@ impl CatalogEngine {
                 .collect(),
         };
         let desc = desc.encode();
-        let token = *self.caches.resolve_tokens.borrow_mut().entry(tid).or_insert_with(|| {
+        if entry.token.get() == 0 {
             let mut h = gnitz_wire::RowHasher::default();
             h.update(self.qualified_name(tid).as_bytes());
             h.update(&desc);
             h.update(&entry.record);
-            h.digest() | 1
-        });
-        Some((desc, entry.record.clone(), token))
+            entry.token.set(h.digest() | 1);
+        }
+        Some((desc, entry.record.clone(), entry.token.get()))
     }
 
     /// `tid`'s descriptor token (see [`Self::resolve_answer`]); `None` for an
     /// unregistered id.
     pub(in crate::catalog) fn resolve_token(&self, tid: u64) -> Option<u64> {
-        let memo = self.caches.resolve_tokens.borrow().get(&tid).copied();
-        memo.or_else(|| self.resolve_answer(tid).map(|(_, _, token)| token))
+        match self.caches.relations.get(&tid)?.token.get() {
+            0 => self.resolve_answer(tid).map(|(_, _, token)| token),
+            token => Some(token),
+        }
     }
 
     /// Refuse a request built under `token` once `tid` answers a RESOLVE
@@ -118,9 +125,6 @@ pub(in crate::catalog) struct CatalogCacheSet {
     pub(in crate::catalog) relations: FxHashMap<u64, RelationEntry>,
     /// Every [`RelationEntry::fks`] edge, keyed by its parent.
     pub(in crate::catalog) fk_by_parent: FxHashMap<u64, Vec<FkEdge>>,
-    /// [`CatalogEngine::resolve_token`] by relation, computed on first use and
-    /// emptied by every hook of a family that can change a RESOLVE answer.
-    pub(in crate::catalog) resolve_tokens: RefCell<FxHashMap<u64, u64>>,
 }
 
 impl CatalogCacheSet {
@@ -146,15 +150,10 @@ impl CatalogCacheSet {
             }
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// The relation name index's delta applier
-// ---------------------------------------------------------------------------
-
-impl CatalogEngine {
-    /// TABLE_TAB and VIEW_TAB share the leading `(schema_id, name)` payload prefix.
-    /// Retracted first: one delta may hand a name from one row to another.
+    /// Apply a TABLE_TAB or VIEW_TAB delta to [`Self::relation_by_name`]: the two
+    /// share the leading `(schema_id, name)` payload prefix. Retracted first: one
+    /// delta may hand a name from one row to another.
     pub(in crate::catalog) fn apply_relation_names(&mut self, batch: &Batch) {
         let key = |i| {
             (
@@ -162,7 +161,7 @@ impl CatalogEngine {
                 payload_str(batch, i, RELTAB_PAY_NAME).expect("a relation name passed the precheck"),
             )
         };
-        let by_schema = &mut self.caches.relation_by_name;
+        let by_schema = &mut self.relation_by_name;
         for i in batch.retracted_rows() {
             let (sid, name) = key(i);
             if let Entry::Occupied(mut names) = by_schema.entry(sid) {
@@ -177,7 +176,7 @@ impl CatalogEngine {
             by_schema
                 .entry(sid)
                 .or_default()
-                .insert(name.to_string(), batch.get_pk(i) as u64);
+                .insert(name.into_owned(), batch.get_pk(i) as u64);
         }
     }
 }

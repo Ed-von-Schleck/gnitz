@@ -80,11 +80,7 @@ impl CatalogEngine {
                 .map_err(|e| format!("Failed to create system table '{}': error {e}", family.name()))?;
             engine.caches.enter(
                 family.id(),
-                RelationEntry {
-                    record: Rc::from(family.record()),
-                    fks: Vec::new(),
-                    serial: false,
-                },
+                RelationEntry::new(Rc::from(family.record()), Vec::new(), false),
             );
         }
 

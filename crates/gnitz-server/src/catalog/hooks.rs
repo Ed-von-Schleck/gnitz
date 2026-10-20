@@ -26,14 +26,16 @@ impl CatalogEngine {
             // `circuits` row.
             SysFamily::Schema | SysFamily::Sequence | SysFamily::Circuit => return Ok(()),
             SysFamily::Table | SysFamily::View => {
-                self.apply_relation_names(batch);
+                self.caches.apply_relation_names(batch);
                 self.hook_relation_register(family, batch)
             }
             SysFamily::Column => self.hook_column_change(batch),
             SysFamily::Index => self.hook_index_register(batch),
         };
         // Every family that reaches here can change what a RESOLVE answers.
-        self.caches.resolve_tokens.get_mut().clear();
+        for entry in self.caches.relations.values_mut() {
+            *entry.token.get_mut() = 0;
+        }
         hooked
     }
 
@@ -103,14 +105,6 @@ impl CatalogEngine {
             rel.id,
             self.registry.slot().of
         );
-        self.registry.register(RelationSpec {
-            id: rel.id,
-            kind: rel.kind(),
-            schema,
-            placement,
-            pk_repeats: rel.pk_repeats(),
-            compress: rel.compress(),
-        })?;
         let fks: Vec<FkEdge> = col_defs
             .iter()
             .enumerate()
@@ -124,21 +118,23 @@ impl CatalogEngine {
                 })
             })
             .collect();
+        let record = Rc::from(encode_record(schema.pk_cols(), &col_defs));
+        self.registry.register(RelationSpec {
+            id: rel.id,
+            kind: rel.kind(),
+            schema,
+            placement,
+            pk_repeats: rel.pk_repeats(),
+            compress: rel.compress(),
+        })?;
+        self.caches.enter(rel.id, RelationEntry::new(record, fks, rel.serial()));
         // Derived, not stored: every process builds the same FK indexes from the same
         // column records. Every FK column carries one, a PK column included.
-        for e in &fks {
+        for e in &self.caches.relations[&rel.id].fks {
             self.registry
                 .add_index(rel.id, IndexClaim::ForeignKey, e.child_index_cols())
                 .map_err(|err| format!("FK index on column {}: {err}", e.fk_col))?;
         }
-        self.caches.enter(
-            rel.id,
-            RelationEntry {
-                record: Rc::from(encode_record(schema.pk_cols(), &col_defs)),
-                fks,
-                serial: rel.serial(),
-            },
-        );
         Ok(())
     }
 
