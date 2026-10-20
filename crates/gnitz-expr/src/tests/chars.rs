@@ -1,4 +1,5 @@
 use super::{char_count, char_offset, char_offset_back, reverse_chars};
+use crate::test_support::words;
 
 /// Every helper against `str`'s own view of the same text.
 fn check(s: &str) {
@@ -25,14 +26,8 @@ fn check(s: &str) {
 /// word skips and the ASCII reverse.
 #[test]
 fn every_helper_agrees_with_str() {
-    const ALPHABET: [char; 4] = ['a', 'é', '€', '😀'];
-    for len in 0..=5u32 {
-        for code in 0..ALPHABET.len().pow(len) {
-            let s: String = (0..len)
-                .map(|i| ALPHABET[code / ALPHABET.len().pow(i) % ALPHABET.len()])
-                .collect();
-            check(&s);
-        }
+    for s in words(&['a', 'é', '€', '😀'], 5) {
+        check(&s.into_iter().collect::<String>());
     }
     check(&"x".repeat(100));
     check(&"héllo wörld".repeat(8));

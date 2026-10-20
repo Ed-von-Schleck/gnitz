@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::batch::MORSEL;
-use crate::test_support::TestView;
+use crate::test_support::{filter_verdicts, TestView};
 use crate::{SchemaColumn, SchemaDescriptor};
 use gnitz_wire::TypeCode;
 
@@ -18,13 +18,7 @@ fn program_fuzz() {
         // Decoded once per resolution: a resolve consumes its program.
         let program = || LogicalProgram::from_blob(blob);
         if let Ok(mut filter) = program().and_then(|p| p.resolve_filter(&schema)) {
-            let mut runs = Vec::new();
-            filter.ranges(&rows, &mut runs);
-            let mut end = 0;
-            for &(start, stop) in &runs {
-                assert!(end <= start && start < stop && stop <= ROWS, "{runs:?}");
-                end = stop;
-            }
+            filter_verdicts(&mut filter, &rows);
         }
         if let Ok(mut scalar) = program().and_then(|p| p.resolve_scalar(&schema)) {
             scalar.eval_all(&rows);
@@ -59,19 +53,25 @@ fn edge_rows(schema: &SchemaDescriptor) -> TestView {
     const TEXTS: [&str; 5] = ["", "a", "a string past the inline twelve", "ünïcødé", "%_\\"];
     let mut view = TestView::for_schema(schema, ROWS);
     for pi in 0..schema.num_payload_cols() {
-        let col = schema.columns()[schema.payload_col_idx(pi)];
+        let ci = schema.payload_col_idx(pi);
+        let col = schema.columns()[ci];
         for row in 0..ROWS {
             if col.nullable && row % 3 == 0 {
                 view.set_null(row, pi);
                 continue;
             }
-            match col.type_code {
-                TypeCode::String | TypeCode::Blob => view.set_string(row, pi, TEXTS[row % TEXTS.len()].as_bytes()),
-                TypeCode::F64 => view.set_payload(row, pi, &FLOATS[row % FLOATS.len()].to_le_bytes()),
-                TypeCode::F32 => view.set_payload(row, pi, &(FLOATS[row % FLOATS.len()] as f32).to_le_bytes()),
-                TypeCode::Bool => view.set_payload(row, pi, &[(row % 2) as u8]),
-                _ => view.set_payload(row, pi, &INTS[row % INTS.len()].to_le_bytes()[..col.size()]),
-            }
+            let float = FLOATS[row % FLOATS.len()];
+            let native = match col.type_code {
+                TypeCode::String | TypeCode::Blob => {
+                    view.set_string(row, pi, TEXTS[row % TEXTS.len()].as_bytes());
+                    continue;
+                }
+                TypeCode::F64 => float.to_bits().into(),
+                TypeCode::F32 => (float as f32).to_bits().into(),
+                TypeCode::Bool => (row % 2) as u128,
+                _ => INTS[row % INTS.len()] as u128,
+            };
+            view.set_native(schema, row, ci, native);
         }
     }
     view

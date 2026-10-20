@@ -71,7 +71,7 @@ pub enum ExprValidateErr {
     ColKindMismatch {
         col: u32,
         type_code: TypeCode,
-        want: &'static str,
+        want: ColKind,
     },
     CopyTypeMismatch {
         col: u32,
@@ -140,19 +140,11 @@ impl fmt::Display for ExprValidateErr {
     }
 }
 
-/// What a `ColKindMismatch` asks for in place of a column no scalar register loads.
-const SCALAR_COL: &str = "a fixed-width integer or floating-point column";
-
-/// A column-type predicate paired with the phrase a `ColKindMismatch` renders
-/// for it — the two halves of one requirement, so neither can be widened without
-/// the other.
-type ColTypeTest = (fn(TypeCode) -> bool, &'static str);
-
 /// What an opcode's kernel requires of a column operand. A `Col` name admits a
 /// PK column; a `Payload` name does not — the kernels behind those address a
 /// column through a dense payload index, which a PK column has none of.
-#[derive(Clone, Copy)]
-enum ColKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColKind {
     /// PK or payload, any type: the reader decodes no value.
     AnyCol,
     /// A column a scalar register loads: a fixed-width integer, PK or payload,
@@ -162,14 +154,24 @@ enum ColKind {
     StringPayload,
 }
 
+/// The phrase a `ColKindMismatch` renders for the kind it asks for.
+impl fmt::Display for ColKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::AnyCol => "any column",
+            Self::ScalarCol => "a fixed-width integer or floating-point column",
+            Self::StringPayload => "a string or blob column",
+        })
+    }
+}
+
 impl ColKind {
-    /// The type predicate this kind imposes, with the phrase a `ColKindMismatch`
-    /// renders for it; `None` for a kind that imposes none.
-    fn type_test(self) -> Option<ColTypeTest> {
+    /// The type predicate this kind imposes; `None` for a kind that imposes none.
+    fn type_test(self) -> Option<fn(TypeCode) -> bool> {
         match self {
             Self::AnyCol => None,
-            Self::ScalarCol => Some((|t| ScalarKind::from_type_code(t).is_some(), SCALAR_COL)),
-            Self::StringPayload => Some((TypeCode::is_german_string, "a string or blob column")),
+            Self::ScalarCol => Some(|t| ScalarKind::from_type_code(t).is_some()),
+            Self::StringPayload => Some(TypeCode::is_german_string),
         }
     }
 
@@ -1514,7 +1516,7 @@ impl LogicalProgram {
                             return Err(ExprValidateErr::ColKindMismatch {
                                 col,
                                 type_code: loc.type_code(),
-                                want: SCALAR_COL,
+                                want: ColKind::ScalarCol,
                             })
                         }
                     }
@@ -2099,7 +2101,7 @@ fn locate_col(s: &SchemaDescriptor, col: u32, need: ColKind) -> Result<ColumnLoc
     }
     let type_code = loc.type_code();
     match need.type_test() {
-        Some((accepts, want)) if !accepts(type_code) => Err(ExprValidateErr::ColKindMismatch { col, type_code, want }),
+        Some(accepts) if !accepts(type_code) => Err(ExprValidateErr::ColKindMismatch { col, type_code, want: need }),
         _ => Ok(loc),
     }
 }

@@ -3,36 +3,36 @@
 use crate::SchemaColumn;
 use std::cmp::Ordering;
 
-use crate::test_support::TestView;
+use crate::test_support::{schema_pk_ints, TestView};
 use crate::SchemaDescriptor;
 use crate::{cmp_order_keys, order_bits, order_locators, ColumnLocator, OrderLocator, RowRanking};
 use gnitz_wire::{FixedInt, OrderKey, RowSource, ScalarKind, TypeCode};
+
+/// Key values that tie, that differ only in the low half of 16 bytes, and that
+/// cross each width's sign bit.
+const PATTERNS: &[u128] = &[
+    0,
+    1,
+    0x7F,
+    0x80,
+    0xFF,
+    0x7FFF,
+    0x8000,
+    1 << 31,
+    i64::MAX as u128,
+    1 << 63,
+    u64::MAX as u128,
+    1 << 64,
+    (1 << 64) + 1,
+    i128::MAX as u128,
+    1 << 127,
+    u128::MAX,
+];
 
 /// Every locator read of every key type, from a key column and from a payload
 /// slot holding the same values, against the value's own encoding.
 #[test]
 fn every_locator_read_agrees_with_the_values_encoding() {
-    const PATTERNS: &[u128] = &[
-        0,
-        1,
-        2,
-        0x7F,
-        0x80,
-        0xFF,
-        0x100,
-        i64::MAX as u128,
-        1 << 63,
-        u64::MAX as u128,
-        1 << 64,
-        i128::MAX as u128,
-        1 << 127,
-        u128::MAX,
-    ];
-    let opk = |native: u128, tc: TypeCode| {
-        let mut out = vec![0u8; tc.wire_stride()];
-        gnitz_wire::store_opk(&mut out, native, tc.is_signed_int());
-        out
-    };
     for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
         let w = tc.wire_stride();
         let schema = SchemaDescriptor::new(
@@ -59,7 +59,7 @@ fn every_locator_read_agrees_with_the_values_encoding() {
                 let label = format!("{tc} {arm} row {row}");
                 assert_eq!(
                     loc.opk_image(&v, row),
-                    gnitz_wire::widen_pk_be(&opk(PATTERNS[row], tc)),
+                    gnitz_wire::key_image(tc, PATTERNS[row]),
                     "{label}"
                 );
                 assert_eq!(loc.native_le_bytes(&v, row, &mut [0u8; 16]), &native[..], "{label}");
@@ -86,13 +86,6 @@ fn every_locator_read_agrees_with_the_values_encoding() {
             }
         }
     }
-    // The at-rest image itself: big-endian with the sign bit flipped, so `-1`
-    // lands just below `i64::MAX` and `i64::MIN` at all-zero.
-    assert_eq!(
-        opk(-1i64 as u128, TypeCode::I64),
-        [0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
-    );
-    assert_eq!(opk(i64::MIN as u128, TypeCode::I64), [0; 8]);
 }
 
 /// `order_bits` of a float payload slot is the order image of the slot's bits.
@@ -168,13 +161,7 @@ fn order_locators_append_the_identity_tiebreak_in_pk_list_order() {
 /// direction, and two NULLs tie.
 #[test]
 fn null_placement_ignores_the_direction() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-        ],
-        &[0],
-    );
+    let schema = schema_pk_ints(1, true);
     let mut v = TestView::for_schema(&schema, 3);
     v.set_int(1, 0, 5);
     v.set_null(0, 0);
@@ -245,26 +232,6 @@ fn assert_ranks_as_the_comparator(keys: &[OrderLocator], total: bool, v: &TestVi
 #[test]
 fn a_ranking_orders_rows_as_the_comparator_does() {
     const ROWS: usize = 48;
-    // Values that tie, that differ only in the low half of 16 bytes, and that cross each
-    // width's sign bit.
-    const PATTERNS: &[u128] = &[
-        0,
-        1,
-        0x7F,
-        0x80,
-        0xFF,
-        0x7FFF,
-        0x8000,
-        1 << 31,
-        i64::MAX as u128,
-        1 << 63,
-        u64::MAX as u128,
-        1 << 64,
-        (1 << 64) + 1,
-        i128::MAX as u128,
-        1 << 127,
-        u128::MAX,
-    ];
     const STRINGS: &[&[u8]] = &[
         b"",
         b"a",

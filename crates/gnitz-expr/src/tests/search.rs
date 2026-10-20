@@ -1,19 +1,7 @@
 use memchr::memmem::Finder;
 
 use super::{fields, find, find_lit};
-
-/// Every string of up to `max` bytes over `alphabet`.
-fn words(alphabet: &[u8], max: u32) -> Vec<Vec<u8>> {
-    (0..=max)
-        .flat_map(|len| {
-            (0..alphabet.len().pow(len)).map(move |code| {
-                (0..len)
-                    .map(|i| alphabet[code / alphabet.len().pow(i) % alphabet.len()])
-                    .collect()
-            })
-        })
-        .collect()
-}
+use crate::test_support::words;
 
 /// Both searches against the first window equal to the needle, over haystacks
 /// both sides of the cutoff where the byte loop hands over to the vector scan.

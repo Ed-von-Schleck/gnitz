@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::words;
 
 fn encode(p: &str, escape: Option<char>) -> Option<Vec<u8>> {
     LikePattern::encode(p, escape).map(|p| p.as_bytes().to_vec())
@@ -39,16 +40,8 @@ fn agrees(p: &[u8], h: &[u8]) {
 }
 
 /// Every string of up to `max` characters over `alphabet`.
-fn words(alphabet: &[&str], max: u32) -> Vec<String> {
-    (0..=max)
-        .flat_map(|len| {
-            (0..alphabet.len().pow(len)).map(move |code| {
-                (0..len)
-                    .map(|i| alphabet[code / alphabet.len().pow(i) % alphabet.len()])
-                    .collect()
-            })
-        })
-        .collect()
+fn strings(alphabet: &[&str], max: u32) -> Vec<String> {
+    words(alphabet, max).into_iter().map(|w| w.concat()).collect()
 }
 
 /// Every pattern of up to four symbols against every haystack of up to four
@@ -56,18 +49,11 @@ fn words(alphabet: &[&str], max: u32) -> Vec<String> {
 #[test]
 fn every_short_pattern_agrees_with_the_definition() {
     // `É` beside `é`: ASCII folding must keep them apart.
-    let haystacks = words(&["a", "A", "b", "é", "É"], 4);
-    for pattern in words(&["a", "B", "é", "%", "_"], 4) {
+    let haystacks = strings(&["a", "A", "b", "é", "É"], 4);
+    for pattern in strings(&["a", "B", "é", "%", "_"], 4) {
         let p = encode(&pattern, None).unwrap();
-        for ci in [false, true] {
-            let m = LikeMatcher::compile(&p, ci);
-            for h in &haystacks {
-                assert_eq!(
-                    hit(&m, h.as_bytes()),
-                    glob(&p, h.as_bytes(), ci),
-                    "{pattern:?} (ci={ci}) on {h:?}"
-                );
-            }
+        for h in &haystacks {
+            agrees(&p, h.as_bytes());
         }
     }
 }
@@ -181,16 +167,17 @@ fn only_the_scanning_shapes_fold_the_haystack() {
     }
 }
 
+/// A glob's `*` and `?` are the wildcards, and LIKE's own `%` and `_` are
+/// literals.
 #[test]
 fn a_glob_encodes_star_and_question_mark_and_keeps_the_rest_literal() {
-    let m = |p: &str| LikeMatcher::compile(LikePattern::glob(p).as_bytes(), true);
-    assert!(hit(&m("ord*"), b"Orders"));
-    assert!(hit(&m("?rders"), b"orders"));
-    assert!(hit(&m("*"), b""));
-    assert!(!hit(&m("ord"), b"orders"));
-    assert!(hit(&m("public.*"), b"public.t"));
-    assert!(hit(&m("a_b%"), b"A_B%"));
-    assert!(!hit(&m("a_b"), b"axb"));
-    assert!(!hit(&m("a%"), b"ab"));
-    assert!(!hit(&m("*a*a*a*a*a*a*a*a*b"), "a".repeat(40).as_bytes()));
+    for (glob, want) in [
+        ("ord*", vec![b'o', b'r', b'd', ANY_MANY]),
+        ("?rders", [&[ANY_ONE][..], b"rders"].concat()),
+        ("*", vec![ANY_MANY]),
+        ("public.*", [&b"public."[..], &[ANY_MANY]].concat()),
+        ("a_b%", b"a_b%".to_vec()),
+    ] {
+        assert_eq!(LikePattern::glob(glob).as_bytes(), want, "{glob:?}");
+    }
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::simd_levels;
+use crate::test_support::{pairs, simd_levels};
 
 /// The bit patterns a lane predicate has to get right: the integer extremes
 /// either side of the sign, and the floats that do not order like their bits.
@@ -24,13 +24,7 @@ const EDGES: [i64; 15] = [
 /// Every ordered pair of [`EDGES`], padded to whole words with a fixed mix of
 /// arbitrary patterns and small values that collide.
 fn operand_lanes() -> (Vec<i64>, Vec<i64>) {
-    let (mut a, mut b) = (Vec::new(), Vec::new());
-    for &x in &EDGES {
-        for &y in &EDGES {
-            a.push(x);
-            b.push(y);
-        }
-    }
+    let (mut a, mut b) = pairs(&EDGES);
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = move || crate::test_support::xorshift(&mut state) as i64;
     while !a.len().is_multiple_of(64) || a.len() < 512 {
@@ -44,11 +38,26 @@ fn operand_lanes() -> (Vec<i64>, Vec<i64>) {
 
 /// One bit per lane, as a per-row loop packs it.
 fn packed(n: usize, bit: impl Fn(usize) -> bool) -> Vec<u64> {
-    let mut out = vec![0u64; n / 64];
+    let mut out = vec![0u64; n.div_ceil(64)];
     for i in (0..n).filter(|&i| bit(i)) {
         out[i / 64] |= 1 << (i % 64);
     }
     out
+}
+
+/// `kernel` at every level, into a buffer the length of `want` filled with
+/// `fill` beforehand, against `want`.
+fn at_every_level<T: Copy + PartialEq + std::fmt::Debug>(
+    label: &str,
+    want: &[T],
+    fill: T,
+    kernel: impl Fn(Level, &mut [T]),
+) {
+    for (level_name, level) in simd_levels() {
+        let mut got = vec![fill; want.len()];
+        kernel(level, &mut got);
+        assert_eq!(got, want, "{label} at {level_name}");
+    }
 }
 
 /// `P` against the operator it stands for, per row and at every level.
@@ -58,11 +67,7 @@ fn check_pred<P: LanePred>(name: &str, holds: impl Fn(i64, i64) -> bool) {
         assert_eq!(P::scalar(x, y), holds(x, y), "{name} of {x:#x}, {y:#x}");
     }
     let want = packed(a.len(), |i| holds(a[i], b[i]));
-    for (level_name, level) in simd_levels() {
-        let mut got = vec![0u64; want.len()];
-        pred_bits::<P>(level, &a, &b, &mut got);
-        assert_eq!(got, want, "{name} at {level_name}");
-    }
+    at_every_level(name, &want, 0, |level, got| pred_bits::<P>(level, &a, &b, got));
 }
 
 #[test]
@@ -94,11 +99,7 @@ fn a_predicate_is_its_operator_per_row_and_per_vector() {
 fn truthy_bits_marks_the_non_zero_lanes() {
     let (a, _) = operand_lanes();
     let want = packed(a.len(), |i| a[i] != 0);
-    for (level_name, level) in simd_levels() {
-        let mut got = vec![0u64; want.len()];
-        truthy_bits(level, &a, &mut got);
-        assert_eq!(got, want, "{level_name}");
-    }
+    at_every_level("truthy", &want, 0, |level, got| truthy_bits(level, &a, got));
 }
 
 #[test]
@@ -107,11 +108,9 @@ fn in_set_bits_marks_the_members() {
     for len in [0, 1, 2, 3, 4, 5, 8, 11, 33] {
         let set = &b[..len];
         let want = packed(a.len(), |i| set.contains(&a[i]));
-        for (level_name, level) in simd_levels() {
-            let mut got = vec![0u64; want.len()];
-            in_set_bits(level, &a, set, &mut got);
-            assert_eq!(got, want, "{len} values at {level_name}");
-        }
+        at_every_level(&format!("{len} values"), &want, 0, |level, got| {
+            in_set_bits(level, &a, set, got)
+        });
     }
 }
 
@@ -130,15 +129,13 @@ fn null_bits_gathers_the_selected_columns() {
     for rows in [0, 1, 63, 64, 65, 200, 256] {
         let bytes: Vec<u8> = (0..rows).flat_map(|i| word(i).to_le_bytes()).collect();
         for cols in [1u64, 1 << 63, 0b1010, u64::MAX, 0] {
-            let mut want = vec![0u64; rows.div_ceil(64)];
-            for i in (0..rows).filter(|&i| word(i) & cols != 0) {
-                want[i / 64] |= 1 << (i % 64);
-            }
-            for (level_name, level) in simd_levels() {
-                let mut got = vec![u64::MAX; want.len()];
-                null_bits(level, &bytes, cols, &mut got);
-                assert_eq!(got, want, "{rows} rows, cols {cols:#x} at {level_name}");
-            }
+            let want = packed(rows, |i| word(i) & cols != 0);
+            at_every_level(
+                &format!("{rows} rows, cols {cols:#x}"),
+                &want,
+                u64::MAX,
+                |level, got| null_bits(level, &bytes, cols, got),
+            );
         }
     }
 }
@@ -158,11 +155,7 @@ fn blend_takes_a_where_the_bit_is_set() {
             }
         })
         .collect();
-    for (level_name, level) in simd_levels() {
-        let mut got = vec![0i64; a.len()];
-        blend(level, &take, &a, &b, &mut got);
-        assert_eq!(got, want, "{level_name}");
-    }
+    at_every_level("blend", &want, 0, |level, got| blend(level, &take, &a, &b, got));
 }
 
 #[test]
@@ -177,9 +170,5 @@ fn bit_lanes_writes_each_bit_as_a_lane() {
     let want: Vec<i64> = (0..bits.len() * 64)
         .map(|i| ((bits[i / 64] >> (i % 64)) & 1) as i64)
         .collect();
-    for (level_name, level) in simd_levels() {
-        let mut got = vec![-1i64; want.len()];
-        bit_lanes(level, &bits, &mut got);
-        assert_eq!(got, want, "{level_name}");
-    }
+    at_every_level("bit_lanes", &want, -1, |level, got| bit_lanes(level, &bits, got));
 }

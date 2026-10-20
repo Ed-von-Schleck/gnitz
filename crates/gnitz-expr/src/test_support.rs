@@ -6,8 +6,9 @@ use std::fmt::Debug;
 
 use gnitz_wire::TypeCode;
 
-use crate::batch::MORSEL;
+use crate::batch::{encode_f64, MORSEL};
 use crate::eval::Resolved;
+use crate::simd::Level;
 use crate::{
     BatchView, ColumnLocator, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg, RowFilter,
     ScalarEval, SchemaColumn, SchemaDescriptor, Sink,
@@ -94,6 +95,11 @@ impl TestView {
         gnitz_wire::write_u64_le(&mut self.nulls, row * 8, word);
     }
 
+    /// Empty the heap a map appends its long strings to, keeping its capacity.
+    pub fn clear_blob(&mut self) {
+        self.blob.clear();
+    }
+
     /// A view whose row `i` is this one's row `source[i]`. A string cell keeps
     /// its heap offset, so the blob is shared verbatim.
     pub fn tiled(&self, source: &[usize]) -> TestView {
@@ -162,15 +168,85 @@ impl MapTarget for TestView {
     }
 }
 
-/// A schema with its PK at `pk_index` and every other column of `col_types` a
-/// nullable payload.
-pub fn schema_with_pk_at(pk_index: usize, col_types: &[TypeCode]) -> SchemaDescriptor {
-    let cols: Vec<SchemaColumn> = col_types
-        .iter()
-        .enumerate()
-        .map(|(i, &t)| SchemaColumn::new(t, i != pk_index))
+/// One payload column of a [`view`]: its type and each row's cell, `None` for
+/// NULL.
+#[derive(Clone)]
+pub struct Col {
+    pub tc: TypeCode,
+    pub cells: Vec<Option<Cell>>,
+}
+
+/// An integer, a float's bit pattern, or a string.
+#[derive(Clone)]
+pub enum Cell {
+    Num(i64),
+    Str(Vec<u8>),
+}
+
+impl Col {
+    fn nullable(&self) -> bool {
+        self.cells.iter().any(Option::is_none)
+    }
+
+    /// What a NULL cell stores: a value no live row holds, truthy and past the
+    /// string inline threshold, so a kernel that read it shows in its result.
+    fn poison(&self) -> Cell {
+        match self.tc.is_german_string() {
+            true => Cell::Str(b"poison-in-a-null-cell".to_vec()),
+            false => Cell::Num(0x2A2A_2A2A_2A2A_2A2A),
+        }
+    }
+
+    /// The instruction loading column `col` of this type into a register.
+    pub fn load(&self, col: u32) -> LogicalInstr {
+        match self.tc.is_german_string() {
+            true => LogicalInstr::LoadColStr { col },
+            false => LogicalInstr::LoadCol { col },
+        }
+    }
+}
+
+/// A column of `tc`, each value truncated to its cell.
+pub fn int<T: Into<Option<i64>>>(tc: TypeCode, vals: impl IntoIterator<Item = T>) -> Col {
+    let cells = vals.into_iter().map(|v| v.into().map(Cell::Num)).collect();
+    Col { tc, cells }
+}
+
+pub fn i64s<T: Into<Option<i64>>>(vals: impl IntoIterator<Item = T>) -> Col {
+    int(TypeCode::I64, vals)
+}
+
+pub fn f64s<T: Into<Option<f64>>>(vals: impl IntoIterator<Item = T>) -> Col {
+    int(TypeCode::F64, vals.into_iter().map(|v| v.into().map(encode_f64)))
+}
+
+pub fn text<'a, T: Into<Option<&'a str>>>(vals: impl IntoIterator<Item = T>) -> Col {
+    let cells = vals
+        .into_iter()
+        .map(|v| v.into().map(|s| Cell::Str(s.as_bytes().to_vec())))
         .collect();
-    SchemaDescriptor::new(&cols, &[pk_index as u32])
+    Col { tc: TypeCode::String, cells }
+}
+
+/// A `U64` PK numbered from 1, then `cols` as the payload, each nullable iff it
+/// holds a NULL — and the view holding their rows.
+pub fn view(cols: &[Col]) -> (SchemaDescriptor, TestView) {
+    let mut schema_cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+    schema_cols.extend(cols.iter().map(|c| SchemaColumn::new(c.tc, c.nullable())));
+    let schema = SchemaDescriptor::new(&schema_cols, &[0]);
+    let mut v = TestView::for_schema(&schema, cols[0].cells.len());
+    for (pi, c) in cols.iter().enumerate() {
+        for (row, cell) in c.cells.iter().enumerate() {
+            match cell.clone().unwrap_or_else(|| c.poison()) {
+                Cell::Num(x) => v.set_int(row, pi, x),
+                Cell::Str(s) => v.set_string(row, pi, &s),
+            }
+            if cell.is_none() {
+                v.set_null(row, pi);
+            }
+        }
+    }
+    (schema, v)
 }
 
 /// An `n`-row view over `schema`'s German-string payload columns: slot `c` of
@@ -219,21 +295,23 @@ fn make_view(
     v
 }
 
-/// A `U64` PK plus `n` `I64` payload columns, all `nullable` or all not — the
-/// shape almost every kernel test wants.
+/// A `U64` PK plus a payload column of each of `payload`, all `nullable` or all
+/// not.
+pub fn schema_pk(payload: &[TypeCode], nullable: bool) -> SchemaDescriptor {
+    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+    cols.extend(payload.iter().map(|&tc| SchemaColumn::new(tc, nullable)));
+    SchemaDescriptor::new(&cols, &[0])
+}
+
+/// A `U64` PK plus `n` `I64` payload columns — the shape almost every kernel
+/// test wants.
 pub fn schema_pk_ints(n: usize, nullable: bool) -> SchemaDescriptor {
-    schema_pk_cols(TypeCode::I64, n, nullable)
+    schema_pk(&vec![TypeCode::I64; n], nullable)
 }
 
 /// A `U64` PK plus `n` `STRING` payload columns.
 pub fn schema_pk_strings(n: usize, nullable: bool) -> SchemaDescriptor {
-    schema_pk_cols(TypeCode::String, n, nullable)
-}
-
-fn schema_pk_cols(payload_tc: TypeCode, n: usize, nullable: bool) -> SchemaDescriptor {
-    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
-    cols.extend(std::iter::repeat_n(SchemaColumn::new(payload_tc, nullable), n));
-    SchemaDescriptor::new(&cols, &[0])
+    schema_pk(&vec![TypeCode::String; n], nullable)
 }
 
 /// `instrs` as a program whose one register sink is its last instruction.
@@ -283,7 +361,8 @@ fn placements(n: usize) -> [(&'static str, Vec<usize>); 2] {
 }
 
 /// `read(ev, mb)`, asserted to give each row the same result wherever it is
-/// placed and on every arm the program can run.
+/// placed, on every arm the program can run and at every instruction set its
+/// kernels can run at.
 fn checked<E: Resolved, T: PartialEq + Debug>(
     ev: &mut E,
     mb: &TestView,
@@ -296,17 +375,20 @@ fn checked<E: Resolved, T: PartialEq + Debug>(
     }
     let fast = ev.no_nulls();
     let arms: &[bool] = if fast { &[true, false] } else { &[false] };
-    for &no_nulls in arms {
-        ev.set_no_nulls(no_nulls);
-        assert_eq!(read(ev, mb), want, "no_nulls={no_nulls}");
-        for (label, source) in placements(n) {
-            let got = read(ev, &mb.tiled(&source));
-            for (i, (got, &r)) in got.iter().zip(&source).enumerate() {
-                assert_eq!(got, &want[r], "{label}: row {i} is row {r}, no_nulls={no_nulls}");
+    for (level_name, level) in simd_levels() {
+        for &no_nulls in arms {
+            ev.set_arm(no_nulls, level);
+            let arm = format!("no_nulls={no_nulls} at {level_name}");
+            assert_eq!(read(ev, mb), want, "{arm}");
+            for (label, source) in placements(n) {
+                let got = read(ev, &mb.tiled(&source));
+                for (i, (got, &r)) in got.iter().zip(&source).enumerate() {
+                    assert_eq!(got, &want[r], "{label}: row {i} is row {r}, {arm}");
+                }
             }
         }
     }
-    ev.set_no_nulls(fast);
+    ev.set_arm(fast, Level::new());
     want
 }
 
@@ -327,15 +409,45 @@ pub fn row_strs(ev: &mut ScalarEval, mb: &TestView) -> Vec<Option<Vec<u8>>> {
     })
 }
 
+/// Every row's value of `instrs` read as a scalar, asserted to be the same
+/// program's filter verdict — truthy and not NULL. A register only a filter
+/// reads is written as packed bits and never as lanes, so the two readings run
+/// different kernels.
+pub fn verdicts(
+    schema: &SchemaDescriptor,
+    instrs: Vec<LogicalInstr>,
+    consts: Vec<Vec<u8>>,
+    mb: &TestView,
+) -> Vec<Option<i128>> {
+    let vals = row_values(&mut scalar_prog(schema, instrs.clone(), consts.clone()), mb);
+    let passed = passing_rows(&mut filter_prog(schema, instrs, consts), mb);
+    let truthy: Vec<bool> = vals.iter().map(|v| v.is_some_and(|x| x != 0)).collect();
+    assert_eq!(passed, truthy, "the filter verdicts against the values");
+    vals
+}
+
 /// Each row's filter verdict — see [`checked`].
 pub fn passing_rows(ev: &mut RowFilter, mb: &TestView) -> Vec<bool> {
-    checked(ev, mb, |ev, mb| {
-        let mut passed = vec![false; mb.row_count()];
-        for (s, e) in passing_ranges(ev, mb) {
-            passed[s..e].fill(true);
-        }
-        passed
-    })
+    checked(ev, mb, |ev, mb| filter_verdicts(ev, mb))
+}
+
+/// Each row's verdict from one [`RowFilter::ranges`], whose runs are asserted
+/// to be exactly the maximal runs of those verdicts: ordered, non-empty, apart
+/// and inside the batch.
+pub fn filter_verdicts(ev: &mut RowFilter, mb: &dyn BatchView) -> Vec<bool> {
+    // A stale entry, which `ranges` must clear.
+    let mut ranges = vec![(usize::MAX, usize::MAX)];
+    ev.ranges(mb, &mut ranges);
+    let mut passed = vec![false; mb.row_count()];
+    for &(s, e) in &ranges {
+        assert!(
+            s < e && e <= passed.len(),
+            "run ({s}, {e}) is not a non-empty run of the batch"
+        );
+        passed[s..e].fill(true);
+    }
+    assert_eq!(ranges, runs(&passed), "the runs are not the maximal runs of their rows");
+    passed
 }
 
 /// The maximal runs of `true` in `verdicts`, half-open.
@@ -350,16 +462,29 @@ pub fn runs(verdicts: &[bool]) -> Vec<(usize, usize)> {
     out
 }
 
-/// The runs `ev` reports, each checked to be a non-empty run inside the batch.
-pub fn passing_ranges(ev: &mut RowFilter, mb: &TestView) -> Vec<(usize, usize)> {
-    let stale = (usize::MAX, usize::MAX);
-    let mut ranges = vec![stale];
-    ev.ranges(mb, &mut ranges);
-    let n = mb.row_count();
-    for &(s, e) in &ranges {
-        assert!(s < e && e <= n, "run ({s}, {e}) is not a non-empty run of 0..{n}");
-    }
-    ranges
+/// Each row a map writes into `out`, three rows into it: the row's null word
+/// and every payload slot's cell, a string slot read as its bytes — see
+/// [`checked`]. A copied slot is the caller's to move, so its cell reads zero.
+pub fn map_rows(ev: &mut MapEval, out: &SchemaDescriptor, mb: &TestView) -> Vec<(u64, Vec<Vec<u8>>)> {
+    const DST_START: usize = 3;
+    checked(ev, mb, |ev, mb| {
+        let n = mb.row_count();
+        let mut dst = TestView::for_schema(out, n + DST_START);
+        ev.write_computed(mb, 0, n, &mut dst, DST_START);
+        (DST_START..DST_START + n)
+            .map(|row| {
+                let cells = (0..out.num_payload_cols())
+                    .map(|pi| match out.locate(out.payload_col_idx(pi)) {
+                        ColumnLocator::Payload { type_code, .. } if type_code.is_german_string() => {
+                            gnitz_wire::payload_bytes(&dst, row, pi).into_owned()
+                        }
+                        loc => dst.get_col_ptr(row, pi, loc.size()).to_vec(),
+                    })
+                    .collect();
+                (dst.get_null_word(row), cells)
+            })
+            .collect()
+    })
 }
 
 pub fn is_null_op(col: u32) -> LogicalInstr {
@@ -389,22 +514,22 @@ pub(crate) fn simd_levels() -> Vec<(&'static str, crate::simd::Level)> {
     levels
 }
 
-/// The level an evaluator's kernels run at under test: the CPU's, or the one
-/// of [`simd_levels`] that `GNITZ_BENCH_LEVEL` names, so an evaluator bench
-/// reads the level a CPU without the wider set runs. On such a CPU `avx2` is
-/// the level it has.
-pub(crate) fn eval_level() -> crate::simd::Level {
-    let want = std::env::var("GNITZ_BENCH_LEVEL").unwrap_or_else(|_| "native".to_string());
-    let levels = simd_levels();
-    match levels.iter().find(|(name, _)| *name == want) {
-        Some(&(_, level)) => level,
-        #[cfg(target_arch = "x86_64")]
-        None if want == "avx2" && levels[0].1.as_avx2().is_some() => levels[0].1,
-        None => panic!(
-            "GNITZ_BENCH_LEVEL={want:?} names no level of {:?}",
-            levels.iter().map(|l| l.0).collect::<Vec<_>>()
-        ),
-    }
+/// Every sequence of up to `max` symbols over `alphabet`.
+pub fn words<T: Copy>(alphabet: &[T], max: u32) -> Vec<Vec<T>> {
+    (0..=max)
+        .flat_map(|len| {
+            (0..alphabet.len().pow(len)).map(move |code| {
+                (0..len)
+                    .map(|i| alphabet[code / alphabet.len().pow(i) % alphabet.len()])
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+/// Every ordered pair of `corpus`, as two operand columns.
+pub fn pairs<T: Copy>(corpus: &[T]) -> (Vec<T>, Vec<T>) {
+    corpus.iter().flat_map(|&x| corpus.iter().map(move |&y| (x, y))).unzip()
 }
 
 /// One step of a xorshift generator over `state`: the deterministic stream the randomized

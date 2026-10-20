@@ -165,10 +165,3 @@ impl Resident {
         status_bytes("VmRSS")
     }
 }
-
-/// The pass count a benchmark loops over, from `GNITZ_BENCH_PASSES`; `1` when
-/// unset. Two runs at different counts, differenced, cancel everything that
-/// happens once per process.
-pub fn bench_passes() -> usize {
-    crate::env::env_num("GNITZ_BENCH_PASSES", 1)
-}

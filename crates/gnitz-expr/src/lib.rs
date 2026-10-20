@@ -33,7 +33,7 @@
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
-//! private items. The `#[ignore]`d retired-instruction benches are in
+//! private items. The `#[ignore]`d instruction-count benches are in
 //! `benches/eval.rs`: they span several modules' kernels, so it attaches at the
 //! crate root.
 //!
@@ -53,9 +53,9 @@
 //! crate's. Anything a generic entry point reaches per row is
 //! `#[inline(always)]` regardless.
 //!
-//! Judge an inlining or kernel change on retired instructions
-//! (`perf stat -e instructions:u`), never on wall-clock: timings on the
-//! development machines swing far wider than the effects being measured.
+//! Judge an inlining or kernel change on retired instructions — what the
+//! benches print — never on wall-clock: timings on the development machines
+//! swing far wider than the effects being measured.
 
 mod batch;
 mod builder;

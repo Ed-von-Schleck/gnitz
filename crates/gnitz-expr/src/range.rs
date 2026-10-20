@@ -4,6 +4,7 @@
 
 use gnitz_wire::{image_mask, KeyRange};
 
+use crate::simd::Level;
 use crate::{BatchView, ColumnLocator, ExprValidateErr, SchemaDescriptor};
 
 /// A range walk over a column list, as a batch filter.
@@ -13,6 +14,8 @@ pub(crate) struct RangeMembership {
     /// Per bounded column, its admitted key images `lo ..= lo + span`: an equality
     /// column is a span of 0. Empty when the cuts admit nothing.
     bounds: Vec<(ColumnLocator, u128, u128)>,
+    /// The instruction set the null exclusion's kernel runs at.
+    pub(crate) level: Level,
 }
 
 impl RangeMembership {
@@ -48,7 +51,7 @@ impl RangeMembership {
                 .collect(),
             None => Vec::new(),
         };
-        Ok(RangeMembership { null_mask, bounds })
+        Ok(RangeMembership { null_mask, bounds, level: Level::new() })
     }
 
     /// Clear the bit of every row of `mb` outside the walk in `words`, one bit per row.
@@ -59,10 +62,9 @@ impl RangeMembership {
             return;
         }
         if self.null_mask != 0 {
-            let level = crate::simd::level();
             for (words, rows) in words.chunks_mut(4).zip(mb.null_bmp().chunks(4 * 64 * 8)) {
                 let mut nulls = [0u64; 4];
-                crate::simd::null_bits(level, rows, self.null_mask, &mut nulls[..words.len()]);
+                crate::simd::null_bits(self.level, rows, self.null_mask, &mut nulls[..words.len()]);
                 for (w, n) in words.iter_mut().zip(nulls) {
                     *w &= !n;
                 }

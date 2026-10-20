@@ -1,6 +1,6 @@
 //! Range membership over key images, driven through [`TestView`].
 
-use crate::test_support::{passing_ranges, runs, TestView};
+use crate::test_support::{filter_verdicts, schema_pk, TestView};
 use crate::SchemaColumn;
 use crate::SchemaDescriptor;
 use crate::{ExprValidateErr, RowFilter};
@@ -27,14 +27,7 @@ fn every_walk_admits_exactly_the_rows_between_its_cuts() {
             &[SchemaColumn::new(TypeCode::U16, false), SchemaColumn::new(tc, false)],
             &[0, 1],
         );
-        let walked_payload = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(TypeCode::U64, false),
-                SchemaColumn::new(TypeCode::I64, true),
-                SchemaColumn::new(tc, true),
-            ],
-            &[0],
-        );
+        let walked_payload = schema_pk(&[TypeCode::I64, tc], true);
         for (schema, [pin_col, range_col]) in [(walked_key, [0, 1]), (walked_payload, [1, 2])] {
             let pin_tc = schema.columns()[pin_col].type_code;
             let null = |row: usize, ci: usize| schema.payload_slot(ci).is_some() && row.is_multiple_of(10 + ci);
@@ -62,11 +55,7 @@ fn every_walk_admits_exactly_the_rows_between_its_cuts() {
                                 && Cut::after(img(row)) <= masked(end)
                         })
                         .collect();
-                    assert_eq!(
-                        passing_ranges(&mut f, &v),
-                        runs(&want),
-                        "{tc} {cols:?}: {start:?} .. {end:?}"
-                    );
+                    assert_eq!(filter_verdicts(&mut f, &v), want, "{tc} {cols:?}: {start:?} .. {end:?}");
                 }
             }
         }
@@ -76,14 +65,7 @@ fn every_walk_admits_exactly_the_rows_between_its_cuts() {
 /// A walk exists only over in-range, key-ordered columns.
 #[test]
 fn a_malformed_walk_is_refused() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::F64, true),
-            SchemaColumn::new(TypeCode::U64, true),
-        ],
-        &[0],
-    );
+    let schema = schema_pk(&[TypeCode::F64, TypeCode::U64], true);
     let walk = |col| {
         let range = KeyRange::point(PkColList::from_slice(&[col]), &[], 0);
         RowFilter::for_read(&[], Some(&range), &schema).err()

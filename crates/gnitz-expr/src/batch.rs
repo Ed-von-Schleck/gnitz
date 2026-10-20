@@ -138,7 +138,7 @@ impl EvalScratch {
     /// The whole register file for `prog`, sized and seeded once — every buffer
     /// is a function of the program alone, and a scratch belongs to exactly one
     /// evaluator, hence to one program.
-    pub(crate) fn new(prog: &ResolvedProgram) -> Self {
+    pub(crate) fn new(prog: &ResolvedProgram, level: Level) -> Self {
         const ZERO: Reg = Reg {
             lanes: [0; MORSEL],
             nulls: [0; NULL_WORDS_PER_REG],
@@ -148,7 +148,7 @@ impl EvalScratch {
             regs: vec![ZERO; prog.num_regs()],
             str_views: vec![[StrView::default(); MORSEL]; prog.str_lanes as usize],
             str_arena: prog.const_arena.clone(),
-            level: simd::level(),
+            level,
         };
         scratch.install_consts(prog);
         scratch

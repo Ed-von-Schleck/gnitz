@@ -9,6 +9,7 @@ use gnitz_wire::KeyRange;
 use crate::batch::{eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MorselOut, MORSEL};
 use crate::program::{ColCopy, MapSinks, ReadAs};
 use crate::range::RangeMembership;
+use crate::simd::Level;
 use crate::{BatchView, ExprValidateErr, LogicalProgram, MapTarget, ResolvedProgram, SchemaDescriptor, Sink};
 
 /// One program's result for every row of a batch, in the shape its result
@@ -92,7 +93,7 @@ impl LogicalProgram {
 
 impl Evaluator {
     fn new(prog: ResolvedProgram) -> Self {
-        let scratch = EvalScratch::new(&prog);
+        let scratch = EvalScratch::new(&prog, Level::new());
         Evaluator { prog, scratch }
     }
 
@@ -120,12 +121,13 @@ impl Evaluator {
         });
     }
 
-    /// Test hook: run this program on the `no_nulls` arm or the nullable one.
-    /// Only a program that resolved `no_nulls` may be put back on it.
+    /// Test hook: run this program on the `no_nulls` arm or the nullable one,
+    /// its kernels at `level`. Only a program that resolved `no_nulls` may be
+    /// put back on it.
     #[cfg(test)]
-    pub(crate) fn set_no_nulls(&mut self, no_nulls: bool) {
+    pub(crate) fn set_arm(&mut self, no_nulls: bool, level: Level) {
         self.prog.no_nulls = no_nulls;
-        self.scratch = EvalScratch::new(&self.prog);
+        self.scratch = EvalScratch::new(&self.prog, level);
     }
 }
 
@@ -256,12 +258,6 @@ impl ScalarEval {
         });
         ExprResults::Str { bytes, spans }
     }
-
-    /// Test hook: the register [`Self::eval_all`] reads back.
-    #[cfg(test)]
-    pub(crate) fn result_reg(&self) -> usize {
-        self.result_reg
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +324,8 @@ impl MapEval {
 }
 
 /// The evaluator behind each public type, for tests that read its resolved
-/// program or switch its arm. A filter without a predicate has neither.
+/// program or switch its arm and level. A filter without a predicate has no
+/// evaluator.
 #[cfg(test)]
 pub(crate) trait Resolved {
     fn ev(&self) -> Option<&Evaluator>;
@@ -342,9 +339,9 @@ pub(crate) trait Resolved {
         self.ev().is_some_and(|ev| ev.prog.no_nulls)
     }
 
-    fn set_no_nulls(&mut self, no_nulls: bool) {
+    fn set_arm(&mut self, no_nulls: bool, level: Level) {
         if let Some(ev) = self.ev_mut() {
-            ev.set_no_nulls(no_nulls)
+            ev.set_arm(no_nulls, level)
         }
     }
 
@@ -362,6 +359,14 @@ impl Resolved for RowFilter {
     }
     fn ev_mut(&mut self) -> Option<&mut Evaluator> {
         self.pred.as_mut().map(|p| &mut p.ev)
+    }
+    fn set_arm(&mut self, no_nulls: bool, level: Level) {
+        if let Some(p) = &mut self.pred {
+            p.ev.set_arm(no_nulls, level);
+        }
+        if let Some(w) = &mut self.walk {
+            w.level = level;
+        }
     }
 }
 

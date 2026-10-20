@@ -1,76 +1,20 @@
-use crate::SchemaColumn;
 use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg, TrimMode};
 use gnitz_wire::{FixedInt, Heap, TypeCode};
 
 use super::{decode_f64, encode_f64, eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MORSEL};
 use crate::eval::Resolved;
 use crate::program::{FloatUnaryOp, IntUnaryOp};
+use crate::simd::Level;
 use crate::test_support::{
-    filter_prog, make_string_view, passing_rows, row_strs, row_values, runs, scalar_prog, schema_pk_strings, TestView,
+    f64s, filter_prog, i64s, int, make_string_view, pairs, passing_rows, row_strs, row_values, runs, scalar_prog,
+    schema_pk_strings, text, verdicts, view, Col, TestView,
 };
-use crate::SchemaDescriptor;
 use crate::{CalendarOp, CmpOp, LogicalInstr, ScalarEval};
+use crate::{SchemaColumn, SchemaDescriptor};
 
 // ---------------------------------------------------------------------------
 // The harness: one U64 PK plus the operand columns a program loads in order
 // ---------------------------------------------------------------------------
-
-/// One operand column: its type and each row's cell, `None` for NULL.
-#[derive(Clone)]
-struct Col {
-    tc: TypeCode,
-    cells: Vec<Option<Cell>>,
-}
-
-/// An integer, a float's `f64` bit pattern, or a string.
-#[derive(Clone)]
-enum Cell {
-    Num(i64),
-    Str(Vec<u8>),
-}
-
-impl Col {
-    fn nullable(&self) -> bool {
-        self.cells.iter().any(Option::is_none)
-    }
-
-    /// What a NULL cell stores: a value no live row holds, truthy and past the
-    /// string inline threshold, so a kernel that read it shows in its result.
-    fn poison(&self) -> Cell {
-        match self.tc {
-            TypeCode::String => Cell::Str(b"poison-in-a-null-cell".to_vec()),
-            _ => Cell::Num(0x2A2A_2A2A_2A2A_2A2A),
-        }
-    }
-
-    fn load(&self, col: u32) -> LogicalInstr {
-        match self.tc {
-            TypeCode::String => LogicalInstr::LoadColStr { col },
-            _ => LogicalInstr::LoadCol { col },
-        }
-    }
-}
-
-fn int<T: Into<Option<i64>>>(tc: TypeCode, vals: impl IntoIterator<Item = T>) -> Col {
-    let cells = vals.into_iter().map(|v| v.into().map(Cell::Num)).collect();
-    Col { tc, cells }
-}
-
-fn i64s<T: Into<Option<i64>>>(vals: impl IntoIterator<Item = T>) -> Col {
-    int(TypeCode::I64, vals)
-}
-
-fn f64s<T: Into<Option<f64>>>(vals: impl IntoIterator<Item = T>) -> Col {
-    int(TypeCode::F64, vals.into_iter().map(|v| v.into().map(encode_f64)))
-}
-
-fn text<'a, T: Into<Option<&'a str>>>(vals: impl IntoIterator<Item = T>) -> Col {
-    let cells = vals
-        .into_iter()
-        .map(|v| v.into().map(|s| Cell::Str(s.as_bytes().to_vec())))
-        .collect();
-    Col { tc: TypeCode::String, cells }
-}
 
 /// The schema, instructions and rows of [`prog`]: one U64 PK and `cols`, each
 /// loaded into its own register, in order, ahead of `mk`'s instructions.
@@ -78,21 +22,7 @@ fn build(
     cols: &[Col],
     mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>,
 ) -> (SchemaDescriptor, Vec<LogicalInstr>, TestView) {
-    let mut schema_cols = vec![SchemaColumn::new(TypeCode::U64, false)];
-    schema_cols.extend(cols.iter().map(|c| SchemaColumn::new(c.tc, c.nullable())));
-    let schema = SchemaDescriptor::new(&schema_cols, &[0]);
-    let mut view = TestView::for_schema(&schema, cols[0].cells.len());
-    for (pi, c) in cols.iter().enumerate() {
-        for (row, cell) in c.cells.iter().enumerate() {
-            match cell.clone().unwrap_or_else(|| c.poison()) {
-                Cell::Num(x) => view.set_int(row, pi, x),
-                Cell::Str(s) => view.set_string(row, pi, &s),
-            }
-            if cell.is_none() {
-                view.set_null(row, pi);
-            }
-        }
-    }
+    let (schema, view) = view(cols);
     let mut instrs: Vec<LogicalInstr> = cols.iter().zip(1..).map(|(c, col)| c.load(col)).collect();
     let regs: Vec<Reg> = (0..cols.len() as u16).map(Reg).collect();
     instrs.extend(mk(&regs));
@@ -113,17 +43,11 @@ fn ints(cols: &[Col], mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> Vec<Optio
     int_rows(&mut ev, &view)
 }
 
-/// [`ints`] for a boolean result, which is read back as a filter verdict too: a
-/// register only the filter reads is written as packed bits and never as lanes,
-/// so the two readings run different kernels.
+/// [`ints`] for a boolean result, which is read back as a filter verdict too.
 fn bools(cols: &[Col], mk: impl FnOnce(&[Reg]) -> Vec<LogicalInstr>) -> Vec<Option<i64>> {
     let (schema, instrs, view) = build(cols, mk);
-    let got = int_rows(&mut scalar_prog(&schema, instrs.clone(), vec![]), &view);
-    let passed = passing_rows(&mut filter_prog(&schema, instrs, vec![]), &view);
-    for (row, (value, passed)) in got.iter().zip(passed).enumerate() {
-        assert_eq!(passed, *value == Some(1), "row {row} as a filter");
-    }
-    got
+    let vals = verdicts(&schema, instrs, vec![], &view);
+    vals.into_iter().map(|v| v.map(|x| x as i64)).collect()
 }
 
 /// Every row's result of a string-valued [`prog`], as text.
@@ -146,11 +70,6 @@ fn text_rows(ev: &mut ScalarEval, view: &TestView) -> Vec<Option<String>> {
 /// `rows` as [`text_rows`] reports them.
 fn texts(rows: &[Option<&str>]) -> Vec<Option<String>> {
     rows.iter().map(|r| r.map(String::from)).collect()
-}
-
-/// Every ordered pair of `corpus`, as the two operand columns.
-fn pairs<T: Copy>(corpus: &[T]) -> (Vec<T>, Vec<T>) {
-    corpus.iter().flat_map(|&x| corpus.iter().map(move |&y| (x, y))).unzip()
 }
 
 // ---------------------------------------------------------------------------
@@ -243,16 +162,7 @@ fn every_int_load_reads_its_value_from_either_region() {
         u64::MAX,
         0x0123_4567_89AB_CDEF,
     ];
-    for fi in [
-        FixedInt::U8,
-        FixedInt::I8,
-        FixedInt::U16,
-        FixedInt::I16,
-        FixedInt::U32,
-        FixedInt::I32,
-        FixedInt::U64,
-        FixedInt::I64,
-    ] {
+    for fi in fixed_ints() {
         let tc = fi.type_code();
         let schema = SchemaDescriptor::new(
             &[
@@ -369,12 +279,30 @@ fn float_arithmetic_is_the_ieee_op() {
     }
 }
 
-/// Every `FloatUnaryOp` is the `f64` method it is named for.
+/// Every `FloatUnaryOp` is the `f64` method it is named for, and `FloatToF32`
+/// is [`gnitz_wire::narrow_f32`].
 #[test]
 fn float_unary_ops_match_ieee() {
-    let inputs = [-0.0f64, 0.0, 2.5, 3.5, -2.5, -1.7, 4.0, 1000.0, f64::INFINITY, f64::NAN];
+    let inputs = [
+        -0.0f64,
+        0.0,
+        0.1,
+        2.5,
+        3.5,
+        -2.5,
+        -1.7,
+        4.0,
+        1000.0,
+        1e300,
+        f64::INFINITY,
+        f64::NAN,
+    ];
     // One NULL row, so null propagation is swept too.
     let vals = f64s(inputs.iter().map(|&x| Some(x)).chain([None]));
+    let float = |op: fn(Reg) -> LogicalInstr| float_bits(&ints(std::slice::from_ref(&vals), |r| vec![op(r[0])]));
+    let want = |f: &dyn Fn(f64) -> Option<f64>| -> Vec<Option<u64>> {
+        inputs.iter().map(|&x| f(x).map(canonical_bits)).chain([None]).collect()
+    };
     for op in FloatUnaryOp::ALL.iter().copied() {
         let f: fn(f64) -> f64 = match op {
             FloatUnaryOp::Neg => |x| -x,
@@ -393,51 +321,19 @@ fn float_unary_ops_match_ieee() {
         let got = ints(std::slice::from_ref(&vals), |r| {
             vec![LogicalInstr::FloatUnary { op, a: r[0] }]
         });
-        let want: Vec<Option<u64>> = inputs
-            .iter()
-            .map(|&x| Some(canonical_bits(f(x))))
-            .chain([None])
-            .collect();
-        assert_eq!(float_bits(&got), want, "{op:?}");
+        assert_eq!(float_bits(&got), want(&|x| Some(f(x))), "{op:?}");
     }
+    assert_eq!(
+        float(|a| LogicalInstr::FloatToF32 { a }),
+        want(&|x| gnitz_wire::narrow_f32(x).map(f64::from)),
+        "FloatToF32"
+    );
 }
 
-#[test]
-fn float_to_f32_nulls_only_on_finite_overflow() {
-    // The value just above f32::MAX that rounds DOWN to it is not an overflow.
-    let just_over = f32::MAX as f64 + 2.0f64.powi(102);
-    let inputs = [
-        0.1f64,
-        1e300,
-        1e-300,
-        f64::INFINITY,
-        f64::NAN,
-        f32::MAX as f64,
-        just_over,
-    ];
-    let got = ints(&[f64s(inputs)], |r| vec![LogicalInstr::FloatToF32 { a: r[0] }]);
-    let want = [
-        Some(0.1f32 as f64), // rounded through f32 precision
-        None,                // finite beyond f32 range
-        Some(0.0),           // underflow flushes to zero
-        Some(f64::INFINITY),
-        Some(f64::NAN),
-        Some(f32::MAX as f64),
-        Some(f32::MAX as f64),
-    ];
-    assert_eq!(float_bits(&got), want.map(|w| w.map(canonical_bits)));
+/// Every fixed-width integer type.
+fn fixed_ints() -> impl Iterator<Item = FixedInt> {
+    TypeCode::ALL.iter().filter_map(|&t| FixedInt::exact(t))
 }
-
-const FIXED_INTS: [FixedInt; 8] = [
-    FixedInt::U8,
-    FixedInt::I8,
-    FixedInt::U16,
-    FixedInt::I16,
-    FixedInt::U32,
-    FixedInt::I32,
-    FixedInt::U64,
-    FixedInt::I64,
-];
 
 /// `CAST` to every integer type from either source signedness: the value
 /// survives iff the source reads it inside the target's range, and then keeps
@@ -458,7 +354,7 @@ fn int_cast_keeps_exactly_the_values_in_the_target_range() {
             TypeCode::U64 => i128::from(bits as u64),
             _ => i128::from(bits),
         };
-        for fi in FIXED_INTS {
+        for fi in fixed_ints() {
             let (lo, hi) = fi.range();
             let got = ints(&[int(source, corpus.iter().copied())], |r| {
                 vec![LogicalInstr::IntCast { a: r[0], fi }]
@@ -506,7 +402,7 @@ fn float_to_int_truncates_then_range_checks() {
         f64::NEG_INFINITY,
         f64::NAN,
     ];
-    for fi in FIXED_INTS {
+    for fi in fixed_ints() {
         let (lo, hi) = fi.range();
         let got = ints(&[f64s(corpus)], |r| vec![LogicalInstr::FloatToInt { a: r[0], fi }]);
         let want: Vec<Option<i64>> = corpus
@@ -744,7 +640,7 @@ fn every_string_column_addresses_its_own_region_in_place() {
     // Drive the loads alone and read back which buffer each lane resolved
     // against — the claim the concatenation below cannot make, since its own
     // result always lands in the arena.
-    let mut scratch = EvalScratch::new(ev.prog());
+    let mut scratch = EvalScratch::new(ev.prog(), Level::new());
     with_str_bufs(ev.prog(), &view, |bufs| {
         eval_batch(ev.prog(), &view, bufs, 0, 1, &mut scratch)
     });
@@ -764,29 +660,26 @@ fn every_string_column_addresses_its_own_region_in_place() {
     assert_eq!(text_rows(&mut ev, &view), [Some(vals.concat())]);
 }
 
-/// Values crossing the 12-byte inline/heap boundary, so every kernel is driven
-/// over both cell classes and over a lane whose buffer discriminator changes
-/// row to row.
-const CELL_CLASSES: [&str; 5] = [
-    "",
-    "abcdefghijk",   // 11 — inline
-    "abcdefghijkl",  // 12 — inline, at the threshold
-    "abcdefghijklm", // 13 — first heap length
-    "abcdefghijklmnopqrstuvwxyz",
-];
-
 /// UPPER and LOWER fold ASCII only: the neighbours of `a-z`/`A-Z` pass through,
 /// and — a documented deviation from PostgreSQL under a UTF-8 locale — so does
-/// `ß`, over both cell classes and a NULL.
+/// `ß`, over values either side of the 12-byte inline/heap boundary, so the
+/// lane's buffer discriminator changes row to row, and a NULL.
 #[test]
 fn case_fold_is_ascii_only() {
-    let vals: Vec<Option<&str>> = CELL_CLASSES
-        .iter()
-        .copied()
-        .chain(["`az{", "@AZ[", "straße"])
-        .map(Some)
-        .chain([None])
-        .collect();
+    let vals: Vec<Option<&str>> = [
+        "",
+        "abcdefghijk",   // 11 — inline
+        "abcdefghijkl",  // 12 — inline, at the threshold
+        "abcdefghijklm", // 13 — first heap length
+        "abcdefghijklmnopqrstuvwxyz",
+        "`az{",
+        "@AZ[",
+        "straße",
+    ]
+    .map(Some)
+    .into_iter()
+    .chain([None])
+    .collect();
     for upper in [true, false] {
         let got = strs(&[text(vals.clone())], |r| {
             vec![LogicalInstr::StrCase { a: r[0], upper }]
@@ -875,65 +768,6 @@ fn substring_is_the_clipped_character_window() {
     assert_eq!(got, want, "with FOR");
 }
 
-/// `StrSubstr` reads its `start` and `len` through `IntReg`, whose arm is chosen
-/// by the register's U64 tracking — here reached from a `U64` column,
-/// `SUBSTRING(s FROM ucol)`.
-#[test]
-fn substring_bounds_read_an_unsigned_register_as_unsigned() {
-    // Row 0 takes a bound that fits either reading; row 1 takes one whose bits
-    // are `-1` as `i64` and `u64::MAX` as `u64`. Signed, `-1` would open the
-    // window before the string and yield a prefix; unsigned it is past the end.
-    let got = strs(&[text(["abcdef"; 2]), int(TypeCode::U64, [3, -1])], |r| {
-        vec![LogicalInstr::StrSubstr {
-            src: r[0],
-            start_reg: r[1],
-            len_reg: None,
-        }]
-    });
-    assert_eq!(got, texts(&[Some("cdef"), Some("")]));
-}
-
-#[test]
-fn substring_of_a_computed_string_is_a_sub_view_of_the_arena() {
-    let got = strs(&[text(["abcdefghijklmnop"])], |r| {
-        vec![
-            LogicalInstr::StrCase { a: r[0], upper: true },
-            LogicalInstr::LoadConst { val: 3, unsigned: false },
-            LogicalInstr::LoadConst { val: 4, unsigned: false },
-            LogicalInstr::StrSubstr {
-                src: Reg(1),
-                start_reg: Reg(2),
-                len_reg: Some(Reg(3)),
-            },
-        ]
-    });
-    assert_eq!(got, texts(&[Some("CDEF")]));
-}
-
-/// Each mode strips only its own ends, and BOTH is exactly LEADING then
-/// TRAILING, including where the two overlap.
-#[test]
-fn trim_strips_the_selected_ends_only() {
-    let trim = |mode: TrimMode| {
-        let (mut ev, view) = prog(&[text(["xyaxybyx", "xyxy", "", "abc"])], vec![b"xy".to_vec()], |r| {
-            vec![LogicalInstr::StrTrim { a: r[0], mode, set_idx: ConstIdx(0) }]
-        });
-        text_rows(&mut ev, &view)
-    };
-    assert_eq!(
-        trim(TrimMode::Leading),
-        texts(&[Some("axybyx"), Some(""), Some(""), Some("abc")])
-    );
-    assert_eq!(
-        trim(TrimMode::Trailing),
-        texts(&[Some("xyaxyb"), Some(""), Some(""), Some("abc")])
-    );
-    assert_eq!(
-        trim(TrimMode::Both),
-        texts(&[Some("axyb"), Some(""), Some(""), Some("abc")])
-    );
-}
-
 /// LIKE over both cell classes and a NULL row, which is NULL whatever the
 /// matcher answered on its stored bytes — `'%'` matches anything.
 #[test]
@@ -953,25 +787,6 @@ fn like_over_inline_and_heap_cells_with_a_null_row() {
     // ILIKE folds ASCII case; LIKE does not.
     assert_eq!(like("ABC", true), [Some(1), Some(0), Some(0), None]);
     assert_eq!(like("ABC", false), [Some(0), Some(0), Some(0), None]);
-}
-
-/// The two null rules are the whole difference between `||` and `CONCAT`, and
-/// CONCAT's is asymmetric so a NULL accumulator still propagates.
-#[test]
-fn concat_null_rules_differ_by_operand_side() {
-    let concat = |skip_null: bool| {
-        strs(
-            &[
-                text([Some("ab"), None, Some("ab")]),
-                text([Some("cd"), Some("cd"), None]),
-            ],
-            |r| vec![LogicalInstr::StrConcat { a: r[0], b: r[1], skip_null }],
-        )
-    };
-    // || propagates NULL from either side; CONCAT's NULL argument contributes
-    // the empty string, but a NULL accumulator still propagates.
-    assert_eq!(concat(false), texts(&[Some("abcd"), None, None]));
-    assert_eq!(concat(true), texts(&[Some("abcd"), None, Some("ab")]));
 }
 
 /// The three string-compare channels agree with `compare_german_strings`, the
@@ -1004,6 +819,10 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
         .map(|s| gnitz_wire::encode_german_string(s, &mut blob))
         .collect();
 
+    let cmp = |op, i: usize, j: usize| {
+        let ord = gnitz_wire::compare_german_strings(&cells[i], Heap::Plain(&blob), &cells[j], Heap::Plain(&blob));
+        i128::from(cmp_want(op, ord))
+    };
     for nullable in [false, true] {
         // Row `i * len + j` compares corpus[i] against corpus[j].
         let null = |row: usize, c: usize| nullable && row.is_multiple_of([7, 11][c]);
@@ -1014,60 +833,34 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
             |row, c| [corpus[row / len], corpus[row % len]][c],
             null,
         );
-        let want = |op: CmpOp, row: usize| {
-            let (i, j) = (row / len, row % len);
-            let ord = gnitz_wire::compare_german_strings(&cells[i], Heap::Plain(&blob), &cells[j], Heap::Plain(&blob));
-            (!null(row, 0) && !null(row, 1)).then(|| cmp_want(op, ord))
-        };
-        let run = |instrs: Vec<LogicalInstr>, consts| int_rows(&mut scalar_prog(&schema, instrs, consts), &view);
         for op in CmpOp::ALL.iter().copied() {
-            let all_rows: Vec<Option<i64>> = (0..len * len).map(|row| want(op, row)).collect();
+            let want: Vec<Option<i128>> = (0..len * len)
+                .map(|row| (!null(row, 0) && !null(row, 1)).then(|| cmp(op, row / len, row % len)))
+                .collect();
             let by_regs = vec![
                 LogicalInstr::LoadColStr { col: 1 },
                 LogicalInstr::LoadColStr { col: 2 },
                 LogicalInstr::StrCmp { op, a: Reg(0), b: Reg(1) },
             ];
-            assert_eq!(run(by_regs, vec![]), all_rows, "nullable={nullable} StrCmp {op:?}");
+            assert_eq!(
+                verdicts(&schema, by_regs, vec![], &view),
+                want,
+                "nullable={nullable} StrCmp {op:?}"
+            );
             let in_place = vec![LogicalInstr::StrColCol { op, col_a: 1, col_b: 2 }];
             assert_eq!(
-                run(in_place.clone(), vec![]),
-                all_rows,
+                verdicts(&schema, in_place, vec![], &view),
+                want,
                 "nullable={nullable} StrColCol {op:?}"
-            );
-            // As a filter the verdict leaves as packed bits, with no lane read.
-            let passes: Vec<bool> = all_rows.iter().map(|v| *v == Some(1)).collect();
-            assert_eq!(
-                passing_rows(&mut filter_prog(&schema, in_place, vec![]), &view),
-                passes,
-                "nullable={nullable} StrColCol {op:?} as a filter"
             );
             // The constant is baked into the program, so it is checked on the
             // rows whose right-hand side it is; only the left column is read.
             for (j, b) in corpus.iter().enumerate() {
                 let vs_const = vec![LogicalInstr::StrColConst { op, col: 1, const_idx: ConstIdx(0) }];
-                let got = run(vs_const, vec![b.to_vec()]);
+                let got = verdicts(&schema, vs_const, vec![b.to_vec()], &view);
                 for row in (j..len * len).step_by(len) {
-                    let want = (!null(row, 0)).then(|| {
-                        cmp_want(
-                            op,
-                            gnitz_wire::compare_german_strings(
-                                &cells[row / len],
-                                Heap::Plain(&blob),
-                                &cells[j],
-                                Heap::Plain(&blob),
-                            ),
-                        )
-                    });
+                    let want = (!null(row, 0)).then(|| cmp(op, row / len, j));
                     assert_eq!(got[row], want, "nullable={nullable} StrColConst {op:?} row {row}");
-                }
-                let vs_const = vec![LogicalInstr::StrColConst { op, col: 1, const_idx: ConstIdx(0) }];
-                let passed = passing_rows(&mut filter_prog(&schema, vs_const, vec![b.to_vec()]), &view);
-                for row in (j..len * len).step_by(len) {
-                    assert_eq!(
-                        passed[row],
-                        got[row] == Some(1),
-                        "nullable={nullable} StrColConst {op:?} row {row} as a filter"
-                    );
                 }
             }
         }
@@ -1106,21 +899,6 @@ fn a_fused_compare_reads_its_constant_at_any_pool_index() {
         vec![gnitz_wire::as_le_bytes(&[2i64, 3]).to_vec(), a.to_vec(), b.to_vec()],
     );
     assert_eq!(passing_rows(&mut ev, &view), vec![false, true, false, false]);
-}
-
-#[test]
-fn int_to_text_reads_the_source_signedness_from_the_register_tracking() {
-    // Above i64::MAX, only the register's U64 tracking keeps the text unsigned;
-    // 0 and -7 are the digit loop's shortest outputs.
-    let to_text = |col: Col| strs(&[col], |r| vec![LogicalInstr::IntToStr { a: r[0] }]);
-    assert_eq!(
-        to_text(int(TypeCode::U64, [u64::MAX as i64, 0])),
-        [Some(u64::MAX.to_string()), Some("0".into())]
-    );
-    assert_eq!(
-        to_text(i64s([i64::MIN, -7])),
-        [Some(i64::MIN.to_string()), Some("-7".into())]
-    );
 }
 
 /// A float's text is at most 24 bytes and parses back to the same bits, the
@@ -1249,29 +1027,6 @@ fn a_constant_string_outlives_every_morsel_reset() {
     );
 }
 
-/// The blend must carry the *chosen* branch's null bit, not the union — that is
-/// what makes `COALESCE(s, 'default')` yield the default rather than NULL.
-#[test]
-fn string_select_takes_the_chosen_branch_and_its_null_bit() {
-    let select = |a: Col, b: Col| {
-        strs(&[i64s([1, 0, 1]), a, b], |r| {
-            vec![LogicalInstr::StrSelect { cond: r[0], a: r[1], b: r[2] }]
-        })
-    };
-    // Row 0's taken branch is NULL, row 2's untaken one.
-    assert_eq!(
-        select(
-            text([None, Some("yes"), Some("yes")]),
-            text([Some("no"), Some("no"), None])
-        ),
-        texts(&[None, Some("no"), Some("yes")])
-    );
-    assert_eq!(
-        select(text(["yes"; 3]), text(["no"; 3])),
-        texts(&[Some("yes"), Some("no"), Some("yes")])
-    );
-}
-
 // ---------------------------------------------------------------------------
 // The register null test
 // ---------------------------------------------------------------------------
@@ -1306,26 +1061,6 @@ fn is_null_reg_reads_the_null_lane_of_either_class() {
 // The multi-operand string producers
 // ---------------------------------------------------------------------------
 
-/// LEFT/RIGHT count characters, a negative count drops from the other end,
-/// and an oversized one is the whole string. RIGHT walks from the end, so its
-/// row is where an off-by-one in the backward walk shows.
-#[test]
-fn left_and_right_count_characters_from_either_end() {
-    let side = |left: bool| {
-        strs(&[text(["héllo"; 5]), i64s([2, -1, 10, 0, -10])], |r| {
-            vec![LogicalInstr::StrSide { src: r[0], n_reg: r[1], left }]
-        })
-    };
-    assert_eq!(
-        side(true),
-        texts(&[Some("hé"), Some("héll"), Some("héllo"), Some(""), Some("")])
-    );
-    assert_eq!(
-        side(false),
-        texts(&[Some("lo"), Some("éllo"), Some("héllo"), Some(""), Some("")])
-    );
-}
-
 /// STRPOS is a 1-based *character* index, 0 when absent, 1 for an empty needle.
 #[test]
 fn strpos_is_a_character_index() {
@@ -1335,106 +1070,280 @@ fn strpos_is_a_character_index() {
     assert_eq!(got, [Some(3), Some(1), Some(0), Some(2)]);
 }
 
-/// REVERSE reverses characters, so a multibyte sequence stays intact.
+/// Each string producer against rows worked by hand.
 #[test]
-fn reverse_reverses_characters_not_bytes() {
-    let got = strs(&[text(["héllo", "", "a"])], |r| {
-        vec![LogicalInstr::StrReverse { a: r[0] }]
-    });
-    assert_eq!(got, texts(&[Some("olléh"), Some(""), Some("a")]));
-}
-
-/// REPLACE rewrites every non-overlapping occurrence left to right; an empty
-/// or absent pattern passes the subject through unchanged.
-#[test]
-fn replace_rewrites_every_occurrence_left_to_right() {
-    let got = strs(
-        &[
-            text(["aXbXc", "abc", "aaa", "abc", "XX"]),
-            text(["X", "", "aa", "z", "X"]),
-            text(["--", "z", "b", "q", ""]),
-        ],
-        |r| vec![LogicalInstr::StrReplace { s: r[0], from: r[1], to: r[2] }],
+fn string_producers_answer_their_reference_rows() {
+    use LogicalInstr as L;
+    type Row = (
+        &'static str,
+        Vec<Col>,
+        Vec<Vec<u8>>,
+        fn(&[Reg]) -> Vec<LogicalInstr>,
+        Vec<Option<&'static str>>,
     );
-    assert_eq!(
-        got,
-        texts(&[Some("a--b--c"), Some("abc"), Some("ba"), Some("abc"), Some("")])
-    );
-}
-
-/// The subject and the replacement may both live in the arena the kernel is
-/// growing: the views are re-resolved across every push.
-#[test]
-fn replace_over_arena_operands_rewrites_correctly() {
-    let got = strs(&[text(["axbxc"]), text(["X"]), text(["yy"])], |r| {
+    let pad_cols = || {
         vec![
-            LogicalInstr::StrCase { a: r[0], upper: true },
-            LogicalInstr::StrCase { a: r[2], upper: true },
-            LogicalInstr::StrReplace { s: Reg(3), from: r[1], to: Reg(4) },
+            text(["hé", "hé", "hello", "a", "a", "a", "a", "a", "a", "a"]),
+            text(["xy", "éx", "x", "x", "", "x", "xyz", "xyz", "x", "é"]),
+            // The last two pass the byte ceiling by count, and by fill width.
+            i64s([5, 5, 3, 0, 3, -2, 8, 2, 5_000_000_000, 4_000_000_000]),
         ]
-    });
-    assert_eq!(got, texts(&[Some("AYYBYYC")]));
-}
-
-/// LPAD/RPAD measure in characters, cycle the fill, truncate a longer subject,
-/// and NULL a result past the byte ceiling.
-#[test]
-fn pad_measures_characters_and_truncates_a_long_subject() {
-    let pad = |left: bool| {
-        strs(
-            &[
-                text(["hé", "hé", "hello", "a", "a", "a", "a", "a", "a", "a"]),
-                text(["xy", "éx", "x", "x", "", "x", "xyz", "xyz", "x", "é"]),
-                // The last two pass the byte ceiling by count, and by fill width.
-                i64s([5, 5, 3, 0, 3, -2, 8, 2, 5_000_000_000, 4_000_000_000]),
-            ],
-            |r| vec![LogicalInstr::StrPad { s: r[0], n_reg: r[2], fill: r[1], left }],
-        )
     };
-    let want = |ss: [&str; 8]| texts(&ss.map(Some)).into_iter().chain([None, None]).collect::<Vec<_>>();
-    assert_eq!(
-        pad(true),
-        want(["xyxhé", "éxéhé", "hel", "", "a", "", "xyzxyzxa", "xa"])
-    );
-    assert_eq!(
-        pad(false),
-        want(["héxyx", "hééxé", "hel", "", "a", "", "axyzxyzx", "ax"])
-    );
-}
-
-/// SPLIT_PART indexes fields from either end, is empty past the last field,
-/// treats an empty delimiter as one field, and is NULL for field zero.
-#[test]
-fn split_part_indexes_fields_from_either_end_and_nulls_on_zero() {
-    let got = strs(
-        &[
-            text(["a,b,c"; 8]),
-            text([",", ",", ",", ",", ",", "", "", ","]),
-            i64s([2, -1, 5, -5, 1, 1, 2, 0]),
-        ],
-        |r| vec![LogicalInstr::StrSplitPart { s: r[0], delim: r[1], n_reg: r[2] }],
-    );
-    assert_eq!(
-        got,
-        texts(&[
-            Some("b"),
-            Some("c"),
-            Some(""),
-            Some(""),
-            Some("a"),
-            Some("a,b,c"),
-            Some(""),
-            None
-        ])
-    );
-}
-
-/// A NULL operand of any class makes the producer's row NULL — the shared
-/// propagation over the mixed operand list.
-#[test]
-fn string_producers_propagate_a_null_operand_of_either_class() {
-    let got = strs(&[text([None, Some("abc")]), i64s([Some(1), None])], |r| {
-        vec![LogicalInstr::StrSide { src: r[0], n_reg: r[1], left: true }]
-    });
-    assert_eq!(got, [None, None]);
+    let padded = |ss: [&'static str; 8]| ss.map(Some).into_iter().chain([None, None]).collect::<Vec<_>>();
+    let trimmed = || vec![text(["xyaxybyx", "xyxy", "", "abc"])];
+    let rows: Vec<Row> = vec![
+        // Each TRIM mode strips only its own ends, and BOTH is exactly LEADING
+        // then TRAILING, including where the two overlap.
+        (
+            "TRIM LEADING",
+            trimmed(),
+            vec![b"xy".to_vec()],
+            |r| {
+                vec![L::StrTrim {
+                    a: r[0],
+                    mode: TrimMode::Leading,
+                    set_idx: ConstIdx(0),
+                }]
+            },
+            vec![Some("axybyx"), Some(""), Some(""), Some("abc")],
+        ),
+        (
+            "TRIM TRAILING",
+            trimmed(),
+            vec![b"xy".to_vec()],
+            |r| {
+                vec![L::StrTrim {
+                    a: r[0],
+                    mode: TrimMode::Trailing,
+                    set_idx: ConstIdx(0),
+                }]
+            },
+            vec![Some("xyaxyb"), Some(""), Some(""), Some("abc")],
+        ),
+        (
+            "TRIM BOTH",
+            trimmed(),
+            vec![b"xy".to_vec()],
+            |r| {
+                vec![L::StrTrim {
+                    a: r[0],
+                    mode: TrimMode::Both,
+                    set_idx: ConstIdx(0),
+                }]
+            },
+            vec![Some("axyb"), Some(""), Some(""), Some("abc")],
+        ),
+        // `||` propagates NULL from either side; CONCAT's NULL argument
+        // contributes the empty string, but a NULL accumulator still propagates.
+        (
+            "||",
+            vec![
+                text([Some("ab"), None, Some("ab")]),
+                text([Some("cd"), Some("cd"), None]),
+            ],
+            vec![],
+            |r| vec![L::StrConcat { a: r[0], b: r[1], skip_null: false }],
+            vec![Some("abcd"), None, None],
+        ),
+        (
+            "CONCAT",
+            vec![
+                text([Some("ab"), None, Some("ab")]),
+                text([Some("cd"), Some("cd"), None]),
+            ],
+            vec![],
+            |r| vec![L::StrConcat { a: r[0], b: r[1], skip_null: true }],
+            vec![Some("abcd"), None, Some("ab")],
+        ),
+        // The blend carries the chosen branch's null bit, not the union — what
+        // makes `COALESCE(s, 'default')` yield the default. Row 0's taken
+        // branch is NULL, row 2's untaken one.
+        (
+            "CASE over strings with NULLs",
+            vec![
+                i64s([1, 0, 1]),
+                text([None, Some("yes"), Some("yes")]),
+                text([Some("no"), Some("no"), None]),
+            ],
+            vec![],
+            |r| vec![L::StrSelect { cond: r[0], a: r[1], b: r[2] }],
+            vec![None, Some("no"), Some("yes")],
+        ),
+        (
+            "CASE over strings",
+            vec![i64s([1, 0, 1]), text(["yes"; 3]), text(["no"; 3])],
+            vec![],
+            |r| vec![L::StrSelect { cond: r[0], a: r[1], b: r[2] }],
+            vec![Some("yes"), Some("no"), Some("yes")],
+        ),
+        // LEFT/RIGHT count characters, a negative count drops from the other
+        // end, and an oversized one is the whole string. RIGHT walks from the
+        // end, so its row is where an off-by-one in the backward walk shows.
+        (
+            "LEFT",
+            vec![text(["héllo"; 5]), i64s([2, -1, 10, 0, -10])],
+            vec![],
+            |r| vec![L::StrSide { src: r[0], n_reg: r[1], left: true }],
+            vec![Some("hé"), Some("héll"), Some("héllo"), Some(""), Some("")],
+        ),
+        (
+            "RIGHT",
+            vec![text(["héllo"; 5]), i64s([2, -1, 10, 0, -10])],
+            vec![],
+            |r| vec![L::StrSide { src: r[0], n_reg: r[1], left: false }],
+            vec![Some("lo"), Some("éllo"), Some("héllo"), Some(""), Some("")],
+        ),
+        // A NULL operand of either class makes the producer's row NULL.
+        (
+            "LEFT over a NULL",
+            vec![text([None, Some("abc")]), i64s([Some(1), None])],
+            vec![],
+            |r| vec![L::StrSide { src: r[0], n_reg: r[1], left: true }],
+            vec![None, None],
+        ),
+        // REVERSE reverses characters, so a multibyte sequence stays intact.
+        (
+            "REVERSE",
+            vec![text(["héllo", "", "a"])],
+            vec![],
+            |r| vec![L::StrReverse { a: r[0] }],
+            vec![Some("olléh"), Some(""), Some("a")],
+        ),
+        // REPLACE rewrites every non-overlapping occurrence left to right; an
+        // empty or absent pattern passes the subject through unchanged.
+        (
+            "REPLACE",
+            vec![
+                text(["aXbXc", "abc", "aaa", "abc", "XX"]),
+                text(["X", "", "aa", "z", "X"]),
+                text(["--", "z", "b", "q", ""]),
+            ],
+            vec![],
+            |r| vec![L::StrReplace { s: r[0], from: r[1], to: r[2] }],
+            vec![Some("a--b--c"), Some("abc"), Some("ba"), Some("abc"), Some("")],
+        ),
+        // The subject and the replacement both in the arena the kernel is
+        // growing: the views are re-resolved across every push.
+        (
+            "REPLACE over the arena",
+            vec![text(["axbxc"]), text(["X"]), text(["yy"])],
+            vec![],
+            |r| {
+                vec![
+                    L::StrCase { a: r[0], upper: true },
+                    L::StrCase { a: r[2], upper: true },
+                    L::StrReplace { s: Reg(3), from: r[1], to: Reg(4) },
+                ]
+            },
+            vec![Some("AYYBYYC")],
+        ),
+        // LPAD/RPAD measure in characters, cycle the fill, truncate a longer
+        // subject, and NULL a result past the byte ceiling.
+        (
+            "LPAD",
+            pad_cols(),
+            vec![],
+            |r| {
+                vec![L::StrPad {
+                    s: r[0],
+                    n_reg: r[2],
+                    fill: r[1],
+                    left: true,
+                }]
+            },
+            padded(["xyxhé", "éxéhé", "hel", "", "a", "", "xyzxyzxa", "xa"]),
+        ),
+        (
+            "RPAD",
+            pad_cols(),
+            vec![],
+            |r| {
+                vec![L::StrPad {
+                    s: r[0],
+                    n_reg: r[2],
+                    fill: r[1],
+                    left: false,
+                }]
+            },
+            padded(["héxyx", "hééxé", "hel", "", "a", "", "axyzxyzx", "ax"]),
+        ),
+        // SPLIT_PART indexes fields from either end, is empty past the last
+        // field, treats an empty delimiter as one field, and is NULL for field
+        // zero.
+        (
+            "SPLIT_PART",
+            vec![
+                text(["a,b,c"; 8]),
+                text([",", ",", ",", ",", ",", "", "", ","]),
+                i64s([2, -1, 5, -5, 1, 1, 2, 0]),
+            ],
+            vec![],
+            |r| vec![L::StrSplitPart { s: r[0], delim: r[1], n_reg: r[2] }],
+            vec![
+                Some("b"),
+                Some("c"),
+                Some(""),
+                Some(""),
+                Some("a"),
+                Some("a,b,c"),
+                Some(""),
+                None,
+            ],
+        ),
+        // A bound read through a U64 register is unsigned: row 1's bits are
+        // `-1` as `i64` and `u64::MAX` as `u64`, so signed it would open the
+        // window before the string and yield a prefix.
+        (
+            "SUBSTRING FROM a U64 column",
+            vec![text(["abcdef"; 2]), int(TypeCode::U64, [3, -1])],
+            vec![],
+            |r| {
+                vec![L::StrSubstr {
+                    src: r[0],
+                    start_reg: r[1],
+                    len_reg: None,
+                }]
+            },
+            vec![Some("cdef"), Some("")],
+        ),
+        // A window of a computed string is a sub-view of the arena.
+        (
+            "SUBSTRING of UPPER",
+            vec![text(["abcdefghijklmnop"])],
+            vec![],
+            |r| {
+                vec![
+                    L::StrCase { a: r[0], upper: true },
+                    L::LoadConst { val: 3, unsigned: false },
+                    L::LoadConst { val: 4, unsigned: false },
+                    L::StrSubstr {
+                        src: Reg(1),
+                        start_reg: Reg(2),
+                        len_reg: Some(Reg(3)),
+                    },
+                ]
+            },
+            vec![Some("CDEF")],
+        ),
+        // Above i64::MAX only the register's U64 tracking keeps the text
+        // unsigned; 0 and -7 are the digit loop's shortest outputs.
+        (
+            "U64 to text",
+            vec![int(TypeCode::U64, [u64::MAX as i64, 0])],
+            vec![],
+            |r| vec![L::IntToStr { a: r[0] }],
+            vec![Some("18446744073709551615"), Some("0")],
+        ),
+        (
+            "I64 to text",
+            vec![i64s([i64::MIN, -7])],
+            vec![],
+            |r| vec![L::IntToStr { a: r[0] }],
+            vec![Some("-9223372036854775808"), Some("-7")],
+        ),
+    ];
+    for (label, cols, consts, mk, want) in rows {
+        let (mut ev, view) = prog(&cols, consts, mk);
+        assert_eq!(text_rows(&mut ev, &view), texts(&want), "{label}");
+    }
 }

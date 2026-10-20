@@ -17,14 +17,6 @@ use fearless_simd::{dispatch, f64x8, i64x8, mask64x8, prelude::*, u64x8, u8x64};
 
 pub(crate) use fearless_simd::Level;
 
-/// The level the kernels run at: the CPU's.
-pub(crate) fn level() -> Level {
-    #[cfg(not(test))]
-    return Level::new();
-    #[cfg(test)]
-    return crate::test_support::eval_level();
-}
-
 /// A predicate over two register lanes, spelled once per row and once per
 /// vector. The two agree on every pair of bit patterns, the vector's mask read
 /// through [`Self::FLIP`].
