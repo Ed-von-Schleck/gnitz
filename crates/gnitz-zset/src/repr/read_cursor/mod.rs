@@ -28,9 +28,9 @@ pub use source::{BoundedIndexCursor, SourceCursor};
 /// The skeleton rows a split drain set aside instead of copying: their OPK keys, flat
 /// and ascending, and — in debug builds — each one's coarse weight.
 #[derive(Default)]
-pub struct SkeletonKeys {
-    pub keys: Vec<u8>,
-    pub coarse: Vec<i64>,
+pub(crate) struct SkeletonKeys {
+    pub(crate) keys: Vec<u8>,
+    pub(crate) coarse: Vec<i64>,
 }
 
 impl SkeletonKeys {

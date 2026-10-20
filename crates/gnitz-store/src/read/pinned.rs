@@ -7,7 +7,7 @@ use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::{from_runs, from_runs_in_band, Batch};
 use gnitz_zset::schema::key::KeyCut;
 
-use super::scan_spec::check_layout;
+use super::check_layout;
 use crate::relation::RelationRegistry;
 
 impl RelationRegistry {

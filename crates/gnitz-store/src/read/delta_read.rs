@@ -6,8 +6,7 @@ use gnitz_wire::{ReadBound, ReadSpec, SinkKind, WireFault, WireStatus};
 
 use std::rc::Rc;
 
-use super::check_stride;
-use super::scan_spec::check_layout;
+use super::{check_layout, check_stride};
 use crate::relation::RelationRegistry;
 use gnitz_zset::algebra::SinkPlan;
 use gnitz_zset::repr::Batch;
@@ -46,7 +45,8 @@ impl RelationRegistry {
             .ok_or_else(|| format!("delta_read: this process holds no delta feed for relation {id}"))?;
         let whole = spec.is_whole();
         let ReadSpec { bound, predicate, sink } = spec;
-        let mut plan = SinkPlan::from_wire(&view, &sink, self.config.adhoc_group_cap)?;
+        let mut plan =
+            SinkPlan::from_wire(&view, &sink, self.config.adhoc_group_cap).map_err(|e| format!("delta_read: {e}"))?;
         // Before the floor: a layout no cursor could have been handed is a bad
         // request, not an expired one.
         check_layout(reply_layout, plan.output_schema())?;
@@ -70,11 +70,8 @@ impl RelationRegistry {
                 _ => Rc::new(Batch::concat(&view, rounds.map(|round| round.as_mem_batch()))),
             });
         }
-        let walk = match &bound {
-            ReadBound::Range(r) => Some(r),
-            ReadBound::None | ReadBound::PkSet(_) => None,
-        };
-        let mut filter = RowFilter::for_read(&predicate, walk, &view).map_err(|e| format!("delta_read: {e}"))?;
+        let mut filter =
+            RowFilter::for_read(&predicate, bound.range(), &view).map_err(|e| format!("delta_read: {e}"))?;
         let chunk_rows = self.config.scan_chunk_rows;
         let mut ranges = Vec::new();
         let mut read = |rows: &Batch| {

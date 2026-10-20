@@ -6,9 +6,9 @@ use crate::test_support::{
 };
 use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::{AggDescriptor, AggReadSpec, KeyRange, PkColList, ReadBound, ReadSink, SinkKind};
-use gnitz_wire::{TypeCode, ViewBudget};
+use gnitz_wire::{PkKeys, TypeCode, ViewBudget};
 use gnitz_zset::repr::{BatchBuilder, SourceCursor};
-use gnitz_zset::schema::SchemaColumn;
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 /// [`relation_fixture`] over a plain `(id U64 PK | val I64)` view holding the
 /// `(id, weight, val)` `rows`. A view's store runs no `enforce_unique_pk`, so a PK
@@ -296,7 +296,7 @@ fn an_index_walk_returns_exactly_its_range() {
     };
     for (col, start, end, walks, want) in walks {
         let bound = col_range(col, start, end);
-        let (cursor, _) = r.open_bound(TID, bound.clone(), At::Now).unwrap();
+        let (cursor, _) = r.relation(TID).unwrap().open_bound(bound.clone(), At::Now).unwrap();
         assert_eq!(matches!(cursor, SourceCursor::Bounded(_)), walks, "{bound:?}");
         let spec = |cut| ReadSpec {
             bound: bound.clone(),
@@ -563,7 +563,9 @@ fn every_read_over_a_skeleton_store_answers_the_ingested_rows() {
 #[should_panic(expected = "a raw drain met a skeleton row")]
 fn a_raw_drain_over_a_skeleton_run_panics() {
     let r = skeleton_fixture();
-    r.open_bound(TID, ReadBound::None, At::Now)
+    r.relation(TID)
+        .unwrap()
+        .open_bound(ReadBound::None, At::Now)
         .unwrap()
         .0
         .drain_chunk(usize::MAX);
@@ -578,22 +580,23 @@ fn a_hydration_off_the_skeleton_rows_panics() {
     type Edit = fn(&mut Vec<(u64, i64, i64)>);
     let r = skeleton_fixture();
     let layout = make_schema_u64_i64().layout_digest();
-    let faults: [(&[u64], Edit, &str); 4] = [
-        (&[1, 4], |rows| rows.retain(|r| r.0 != 1), "no rows for skeleton key"),
-        (&[1, 4], |rows| rows.push((3, 1, 3)), "a PK no skeleton row named"),
-        (&[1, 4], |rows| rows.retain(|r| r.0 != 4), "a trailing skeleton key"),
-        (&[2], |rows| rows.retain(|r| *r != (2, 1, 7)), "weight mismatch"),
+    let faults: [(&[u64], Edit); 4] = [
+        (&[1, 4], |rows| rows.retain(|r| r.0 != 1)),
+        (&[1, 4], |rows| rows.push((3, 1, 3))),
+        (&[1, 4], |rows| rows.retain(|r| r.0 != 4)),
+        (&[2], |rows| rows.retain(|r| *r != (2, 1, 7))),
     ];
-    for (keys, edit, why) in faults {
+    for (i, (keys, edit)) in faults.into_iter().enumerate() {
         let mut h = Recompute { edit, ..Recompute::default() };
         let read = || drop(r.scan_spec(TID, ReadSpec::all_rows(pk_set(keys)), layout, Some(&mut h)));
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).expect_err(why);
+        let panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).expect_err("a broken hydration panics");
         let msg = panic
             .downcast_ref::<String>()
             .map(String::as_str)
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .unwrap_or_default();
-        assert!(msg.contains(why), "{why}: {msg}");
+        assert!(msg.contains("hydration off its skeleton rows"), "fault {i}: {msg}");
     }
 }
 

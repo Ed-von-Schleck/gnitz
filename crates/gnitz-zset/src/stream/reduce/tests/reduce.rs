@@ -471,7 +471,7 @@ fn a_shape_the_reduce_cannot_run_is_refused() {
             continue;
         }
         let err = fold_sink(group_cols, aggs, usize::MAX).err().expect("refused");
-        assert!(err.starts_with("scan_spec fold: ") && err.contains(why), "{err}");
+        assert!(err.starts_with("fold: ") && err.contains(why), "{err}");
     }
 }
 

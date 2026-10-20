@@ -54,7 +54,7 @@ impl SinkPlan {
             .as_ref()
             .map(|m| MapPlan::from_compute_map(src_schema, m))
             .transpose()
-            .map_err(|e| format!("scan_spec map: {e}"))?;
+            .map_err(|e| format!("map: {e}"))?;
         let sink_in = map.as_ref().map_or(*src_schema, |m| *m.out_schema());
         let kind = match &sink.kind {
             SinkKind::Fold(agg) => Kind::Fold {
@@ -69,7 +69,7 @@ impl SinkPlan {
                     None => None,
                     Some(RowsCut { k, order }) => {
                         for k in order {
-                            sink_in.wire_col("scan_spec: order key column", k.col as u32)?;
+                            sink_in.wire_col("order key column", k.col as u32)?;
                         }
                         // Saturated: a wrapped negative window would truncate the answer.
                         let window = NonZeroI64::try_from(*k).unwrap_or(NonZeroI64::MAX);

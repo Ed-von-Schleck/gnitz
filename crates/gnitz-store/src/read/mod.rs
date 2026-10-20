@@ -28,6 +28,17 @@ pub use key_spans::KeySpans;
 use crate::relation::RelationRegistry;
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::SchemaDescriptor;
+
+/// Refuses a reply in `produced` unless its layout digest is the client's
+/// `reply_layout`: a reply in any other layout would ship its regions under the
+/// client's strides.
+fn check_layout(reply_layout: u64, produced: &SchemaDescriptor) -> Result<(), String> {
+    match reply_layout == produced.layout_digest() {
+        true => Ok(()),
+        false => Err("reply schema does not match the output layout".to_string()),
+    }
+}
 
 /// Refuses `keys` unless each is `stride` bytes, the key of the store `verb` reads
 /// of relation `id`: a key list of another width names none of its keys.

@@ -26,15 +26,65 @@ impl SourceCursor {
         chunk
     }
 
+    /// [`Self::drain_chunk`] over a store that may hold skeleton rows: each one the
+    /// chunk meets is replaced by its key's rows, which `hydrate` recomputes from
+    /// the keys, ascending. A skeleton row counts once against `max_rows` however
+    /// many rows it hydrates to.
+    pub fn drain_hydrated(
+        &mut self,
+        max_rows: usize,
+        hydrate: impl FnOnce(PkKeys) -> Result<Batch, String>,
+    ) -> Result<Option<Batch>, String> {
+        let mut skeletons = SkeletonKeys::default();
+        let Some(live) = self.drain_live_chunk(max_rows, &mut skeletons) else {
+            return Ok(None);
+        };
+        if skeletons.keys.is_empty() {
+            return Ok(Some(live));
+        }
+        let keys = PkKeys::from_sorted(live.schema().pk_stride(), skeletons.keys);
+        #[cfg(debug_assertions)]
+        let asked = keys.clone();
+        let hydrated = hydrate(keys)?;
+        #[cfg(debug_assertions)]
+        assert_hydration_matches(&hydrated, &asked, &skeletons.coarse);
+        // Both consolidated and PK-disjoint.
+        Ok(Some(if live.is_empty() {
+            hydrated
+        } else {
+            hydrated.merged_consolidated(&live, live.schema())
+        }))
+    }
+
     /// [`Self::drain_chunk`] with skeleton rows split out; `Some` and empty means every
     /// row of the chunk was a skeleton.
-    pub fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
+    fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
         match self {
             SourceCursor::Full(c) => c.drain_live_chunk(max_rows, skeletons),
             SourceCursor::Bounded(c) => c.drain_live_chunk(max_rows, skeletons),
             SourceCursor::PkSet(g) => g.drain_live_chunk(max_rows, skeletons),
         }
     }
+}
+
+/// Tripwire: a hydration's rows sum, per PK, to the coarse weight the skeleton row
+/// at that key carried — by linearity of the PK projection — and name exactly the
+/// keys asked.
+#[cfg(debug_assertions)]
+fn assert_hydration_matches(out: &Batch, keys: &PkKeys, coarse: &[i64]) {
+    assert_eq!(keys.len(), coarse.len());
+    let mut got = Vec::new();
+    let mut i = 0;
+    while i < out.len() {
+        let j = crate::repr::pk_group_end(out, i);
+        got.push((out.get_pk_bytes(i), out.as_mem_batch().sum_weights(i, j)));
+        i = j;
+    }
+    let want: Vec<_> = keys.iter().zip(coarse.iter().copied()).collect();
+    assert_eq!(
+        got, want,
+        "hydration off its skeleton rows: (pk, summed weight) per key"
+    );
 }
 
 /// A walk of one secondary-index key range, gathering each entry's row from the

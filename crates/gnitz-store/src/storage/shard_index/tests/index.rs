@@ -1568,24 +1568,13 @@ fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
     }
 
     // The full cursor.
-    let cursor = from_runs(idx.shard_arcs(true).map(Run::Shard), idx.schema, idx.shard_count());
+    let mut cursor = from_runs(idx.shard_arcs(true).map(Run::Shard), idx.schema, idx.shard_count());
     if skeleton {
-        let mut src = gnitz_zset::repr::SourceCursor::Full(Box::new(cursor));
+        // A skeleton row is one merge group at its key's coarse weight.
         let mut sums: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
-        let mut skel = gnitz_zset::repr::SkeletonKeys::default();
-        while let Some(got) = src.drain_live_chunk(4096, &mut skel) {
-            for r in 0..got.len() {
-                *sums.entry(got.get_pk_bytes(r).to_vec()).or_default() += got.get_weight(r);
-            }
-        }
-        let stride = idx.schema.pk_stride();
-        assert_eq!(
-            skel.keys.len() / stride,
-            skel.coarse.len(),
-            "{what}: debug build records coarse weights"
-        );
-        for (k, w) in skel.keys.chunks_exact(stride).zip(&skel.coarse) {
-            *sums.entry(k.to_vec()).or_default() += w;
+        while cursor.valid {
+            *sums.entry(cursor.current_pk_bytes().to_vec()).or_default() += cursor.current_weight;
+            cursor.advance();
         }
         sums.retain(|_, w| *w != 0);
         assert_eq!(sums, per_pk, "{what}: per-PK sums by cursor");

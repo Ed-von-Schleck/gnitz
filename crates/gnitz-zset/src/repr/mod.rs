@@ -59,8 +59,7 @@ pub use compact::{guard_slot, merge_guard, GuardRun};
 pub use error::StorageError;
 pub use merge::{merge_consolidated, MemBatch};
 pub use read_cursor::{
-    empty_cursor, from_runs, from_runs_at, from_runs_in_band, BoundedIndexCursor, PkSetGather, ReadCursor,
-    SkeletonKeys, SourceCursor,
+    empty_cursor, from_runs, from_runs_at, from_runs_in_band, BoundedIndexCursor, PkSetGather, ReadCursor, SourceCursor,
 };
 pub use run::{first_live_payload_group, Run, StoredRow};
 pub use seek::pk_group_end;

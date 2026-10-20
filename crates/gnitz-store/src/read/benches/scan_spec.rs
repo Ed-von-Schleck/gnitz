@@ -152,7 +152,7 @@ fn scan_spec_bench() {
         ("range, filtered scan", ROWS / 16 + 1, false),
     ] {
         let bound = col_range(3, img(0), img(width as i64 - 1));
-        let (source, _) = r.open_bound(TID, bound.clone(), At::Now).unwrap();
+        let (source, _) = r.relation(TID).unwrap().open_bound(bound.clone(), At::Now).unwrap();
         assert_eq!(matches!(source, SourceCursor::Bounded(_)), walks, "{label}");
         cell(label, &r, ReadSpec::all_rows(bound), width, width);
     }

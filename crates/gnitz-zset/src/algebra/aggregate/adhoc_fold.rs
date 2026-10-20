@@ -40,7 +40,7 @@ impl AdhocFold {
     /// serve.
     pub(crate) fn new(src_schema: &SchemaDescriptor, agg: &AggReadSpec, group_cap: usize) -> Result<Self, String> {
         let (shape, leading) =
-            ReduceShape::new(src_schema, &agg.group_cols, &agg.aggs).map_err(|e| format!("scan_spec fold: {e}"))?;
+            ReduceShape::new(src_schema, &agg.group_cols, &agg.aggs).map_err(|e| format!("fold: {e}"))?;
         let mut groups = Batch::empty_with_schema(&leading);
         if shape.key.is_global() {
             // A global fold's one group exists over no input: every worker emits it.

@@ -94,8 +94,9 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
         // `sources_of` names only registered views, and of each only the
         // relations its circuit scans.
         let bound = dag.views[&view].code.sources[&source].1.clone();
-        let (mut cursor, _unapplied) = registry.open_bound(source, bound, Cut::Sealed)?;
-        let schema = registry.relation_or_err(source)?.schema();
+        let relation = registry.relation_or_err(source)?;
+        let (mut cursor, _unapplied) = relation.open_bound(bound, Cut::Sealed)?;
+        let schema = relation.schema();
         let unfed = &sources[at + 1..];
         loop {
             let chunk = cursor.drain_chunk(chunk_rows);

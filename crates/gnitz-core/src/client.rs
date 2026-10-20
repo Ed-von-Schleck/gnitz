@@ -1779,11 +1779,7 @@ impl TxnBuffer {
             return Ok(out);
         }
         let mut ranges = Vec::new();
-        let walk = match &spec.bound {
-            ReadBound::Range(r) => Some(r),
-            _ => None,
-        };
-        RowFilter::for_read(&spec.predicate, walk, schema.layout())
+        RowFilter::for_read(&spec.predicate, spec.bound.range(), schema.layout())
             .map_err(|e| ClientError::from(e.to_string()))?
             .ranges(&live, &mut ranges);
         if keys {

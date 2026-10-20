@@ -344,6 +344,14 @@ fn read_pk_set<'a>(r: &mut Reader<'a>) -> Result<(usize, &'a [u8]), String> {
 }
 
 impl ReadBound {
+    /// The range a `Range` bound walks; `None` for any other bound.
+    pub fn range(&self) -> Option<&KeyRange> {
+        match self {
+            ReadBound::Range(r) => Some(r),
+            ReadBound::None | ReadBound::PkSet(_) => None,
+        }
+    }
+
     /// The bytes of the keys a `PkSet` carries; `0` for any other bound.
     fn key_bytes(&self) -> usize {
         match self {
