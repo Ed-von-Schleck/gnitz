@@ -13,7 +13,7 @@ fn test_bootstrap() {
 
     assert!(engine.schema_id("_system").is_some());
     assert!(engine.schema_id("public").is_some());
-    assert_eq!(engine.next_id, FIRST_ALLOCATED_ID);
+    assert_eq!(engine.next_id, gnitz_wire::FIRST_USER_TABLE_ID);
 
     let schemas_before = count_records(engine.sys_relation(SysFamily::Schema).cursor());
     let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
@@ -455,10 +455,7 @@ fn test_edge_cases_extended() {
     assert!(engine.registry.relation(999999).map(Relation::schema).is_none());
     engine.drop_table("public.reg_test").unwrap();
 
-    // #26. A relation in a schema the catalog does not hold is rejected. The
-    // `_system` schema itself is not: the engine's name rule is
-    // `reject_unstorable_name`, deliberately weaker than the client's
-    // leading-`_` identifier policy, so a raw bundle may name one.
+    // #26. A relation in a schema the catalog does not hold is rejected.
     assert!(engine.create_table("nosuchschema.new_tbl", &cols, &[0]).is_err());
 
     engine.close();

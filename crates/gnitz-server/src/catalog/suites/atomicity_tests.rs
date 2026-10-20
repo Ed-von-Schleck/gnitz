@@ -113,7 +113,10 @@ fn a_malformed_create_is_refused_at_the_precheck() {
 fn a_recovered_row_raises_the_id_counter_past_its_id() {
     let dir = temp_dir("atomicity_recovered_ids");
     let mut unreplayed = CatalogEngine::open_master(&dir, 1, Default::default()).unwrap();
-    let (sid, tail) = (FIRST_ALLOCATED_ID + 500, FIRST_ALLOCATED_ID + 900);
+    let (sid, tail) = (
+        gnitz_wire::FIRST_USER_TABLE_ID + 500,
+        gnitz_wire::FIRST_USER_TABLE_ID + 900,
+    );
     unreplayed
         .stage(gnitz_wire::SCHEMA_TAB, 500, schema_tab_batch(&[(sid, "recovered", 1)]))
         .unwrap();

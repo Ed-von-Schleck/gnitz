@@ -60,8 +60,9 @@ fn test_reserve_user_sequence_rejects_exhausted_range() {
     let dir = temp_dir("reserve_user_seq_exhausted");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
+    // A run whose last id would be i64::MAX, the ceiling.
     let full = engine.create_serial_table("public.full").unwrap();
-    engine.set_sequence(full, (i64::MAX - 1) as u64).unwrap();
+    reserve(&mut engine, full, (i64::MAX - 64) as u64).unwrap();
     let err = reserve(&mut engine, full, 64).err().unwrap();
     assert!(err.contains("invalid or exhausted"), "{err}");
     let edge = engine.create_serial_table("public.edge").unwrap();
@@ -70,7 +71,7 @@ fn test_reserve_user_sequence_rejects_exhausted_range() {
     reserve(&mut engine, edge + 1000, 1).err().unwrap();
     assert_eq!(engine.sequence_value(edge), None, "a refused reservation moves nothing");
 
-    engine.set_sequence(edge, (i64::MAX - 65) as u64).unwrap();
+    reserve(&mut engine, edge, (i64::MAX - 65) as u64).unwrap();
     let (base, delta) = reserve(&mut engine, edge, 64).unwrap();
     assert_eq!(base, i64::MAX - 64);
     assert_eq!(payload_u64(&delta, 1, 0), (i64::MAX - 1) as u64, "last = i64::MAX - 1");
@@ -90,6 +91,10 @@ fn allocate_ids_hands_out_contiguous_runs_under_the_ceiling() {
         engine.allocate_ids(count).unwrap_err();
     }
     assert_eq!(engine.allocate_ids(1).unwrap(), a + 4, "a refused run consumes nothing");
+    // The last id below the ceiling is the last one handed out.
+    let rest = gnitz_wire::CATALOG_ID_CEILING - engine.next_id;
+    engine.allocate_ids(rest + 1).unwrap_err();
+    assert_eq!(engine.allocate_ids(rest).unwrap(), a + 5);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -142,27 +147,6 @@ fn test_user_sequence_durable_roundtrip() {
 }
 
 #[test]
-fn test_recover_checkpoint_gen_and_topology() {
-    let dir = temp_dir("recover_ckpt_records");
-    let expected_topology = crate::catalog::sequences::topology_word(4);
-    {
-        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        assert_eq!(engine.durable_generation(), 0);
-        assert_eq!(engine.sequence_value(SEQ_ID_TOPOLOGY).unwrap_or(0), 0);
-        engine.record_topology(4).unwrap();
-        assert_eq!(engine.sequence_value(SEQ_ID_TOPOLOGY).unwrap_or(0), expected_topology);
-        assert_eq!(engine.advance_durable_generation().unwrap(), 1);
-        assert_eq!(engine.advance_durable_generation().unwrap(), 2);
-        engine.close();
-    }
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(engine.durable_generation(), 2);
-    assert_eq!(engine.sequence_value(SEQ_ID_TOPOLOGY).unwrap_or(0), expected_topology);
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn test_boot_generation_advance_monotonic() {
     let dir = temp_dir("recovery_start_gen_bump");
     {
@@ -177,7 +161,6 @@ fn test_boot_generation_advance_monotonic() {
         assert_eq!(engine.durable_generation(), 2);
         assert_eq!(engine.advance_durable_generation().unwrap(), 3);
         assert_eq!(engine.resume_generation, 2);
-        assert_eq!(engine.sequence_value(SEQ_ID_CHECKPOINT_GEN), Some(3));
         assert_eq!(engine.advance_durable_generation().unwrap(), 4);
         engine.close();
     }

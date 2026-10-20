@@ -23,16 +23,6 @@ use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 pub(super) const SYSTEM_SCHEMA_ID: u64 = 1;
 pub(crate) const PUBLIC_SCHEMA_ID: u64 = 2;
 
-/// The next catalog object id to allocate.
-pub(super) const SEQ_ID_NEXT_ID: u64 = 1;
-/// Committed checkpoint generation (monotonic).
-pub(super) const SEQ_ID_CHECKPOINT_GEN: u64 = 2;
-/// Cluster topology: `(worker_count as u64) << 32 | STATE_FORMAT as u64`.
-pub(super) const SEQ_ID_TOPOLOGY: u64 = 3;
-
-/// The first id `allocate_ids` hands out.
-pub(super) const FIRST_ALLOCATED_ID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
-
 // PK list encoding lives in gnitz-wire so the client and engine cannot drift on
 // the on-disk format.
 pub(super) use gnitz_wire::PkColList;
@@ -103,52 +93,23 @@ impl std::fmt::Display for RelRow<'_> {
 /// Decode row `row` of relation family `family` (Table or View). The raw `flags`
 /// word does not escape, so the rejections below hold for every caller.
 pub(super) fn read_rel_row(family: SysFamily, batch: &Batch, row: usize) -> Result<RelRow<'_>, String> {
-    let unreadable = |e: String| {
-        let (noun, id) = (family.row_noun(), batch.get_pk(row) as u64);
-        format!("catalog invariant violated: {noun} (id={id}) {e}")
-    };
-    match family {
-        SysFamily::Table => rel_from_table_row(TableTabRow::read(batch, row).map_err(unreadable)?),
-        SysFamily::View => rel_from_view_row(ViewTabRow::read(batch, row).map_err(unreadable)?),
+    let (noun, id) = (family.row_noun(), batch.get_pk(row) as u64);
+    let unreadable = |e: String| format!("catalog invariant violated: {noun} (id={id}) {e}");
+    let (schema_id, name, parts) = match family {
+        SysFamily::Table => {
+            let r = TableTabRow::read(batch, row).map_err(unreadable)?;
+            let parts = r.parts().map(|(pk, props)| (pk, RelDetail::Table(props)));
+            (r.schema_id, r.name, parts)
+        }
+        SysFamily::View => {
+            let r = ViewTabRow::read(batch, row).map_err(unreadable)?;
+            let parts = r.parts().map(|(pk, view)| (pk, RelDetail::View(view)));
+            (r.schema_id, r.name, parts)
+        }
         _ => unreachable!("{} is not a relation family", family.name()),
-    }
-}
-
-fn rel_violated(noun: &str, name: &str, id: u64, e: String) -> String {
-    format!("catalog invariant violated: {noun} '{name}' (id={id}) {e}")
-}
-
-fn rel_from_table_row(r: TableTabRow<'_>) -> Result<RelRow<'_>, String> {
-    let (pk, props) = r
-        .parts()
-        .map_err(|e| rel_violated(SysFamily::Table.row_noun(), &r.name, r.table_id, e))?;
-    Ok(RelRow {
-        id: r.table_id,
-        schema_id: r.schema_id,
-        name: r.name,
-        pk,
-        detail: RelDetail::Table(props),
-    })
-}
-
-fn rel_from_view_row(r: ViewTabRow<'_>) -> Result<RelRow<'_>, String> {
-    let (pk, parts) = r
-        .parts()
-        .map_err(|e| rel_violated(SysFamily::View.row_noun(), &r.name, r.view_id, e))?;
-    Ok(RelRow {
-        id: r.view_id,
-        schema_id: r.schema_id,
-        name: r.name,
-        pk,
-        detail: RelDetail::View(parts),
-    })
-}
-
-/// `defs` as `owner_id`'s COL_TAB rows, keyed by position, at `weight`.
-pub(crate) fn write_col_tab_rows(bb: &mut BatchBuilder, owner_id: u64, defs: &[CatalogColumn], weight: i64) {
-    for (i, cd) in defs.iter().enumerate() {
-        cd.write_col_tab_row(bb, owner_id, i, weight);
-    }
+    };
+    let (pk, detail) = parts.map_err(|e| format!("catalog invariant violated: {noun} '{name}' (id={id}) {e}"))?;
+    Ok(RelRow { id, schema_id, name, pk, detail })
 }
 
 /// What one delta does to one PK: where its `-1` and `+1` rows are, and the
@@ -420,7 +381,9 @@ impl SysFamily {
             }
             SysFamily::Column => {
                 for family in SysFamily::ALL {
-                    write_col_tab_rows(bb, family.id(), &family.column_defs(), 1);
+                    for (i, cd) in family.column_defs().iter().enumerate() {
+                        cd.write_col_tab_row(bb, family.id(), i, 1);
+                    }
                 }
             }
             SysFamily::View | SysFamily::Index | SysFamily::Sequence | SysFamily::Circuit => {}
@@ -540,7 +503,3 @@ const _: () = {
         i += 1;
     }
 };
-
-#[cfg(test)]
-#[path = "tests/sys_tables.rs"]
-mod tests;

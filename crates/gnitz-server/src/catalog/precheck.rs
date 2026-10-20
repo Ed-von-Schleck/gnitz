@@ -18,15 +18,16 @@ use super::sys_tables::{
 };
 use super::CatalogEngine;
 
-/// The name rules a catalog row must satisfy to be *stored*: non-empty
-/// `[A-Za-z0-9_]` and already canonical, since every name-index key is compared
-/// byte-wise against the client's folded form. Unlike `validate_user_identifier`
-/// it admits a leading `_`, which the names the client mints carry.
-fn reject_unstorable_name(name: &str, noun: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err(format!("{noun} name cannot be empty"));
-    }
-    if !name.bytes().all(gnitz_wire::is_valid_ident_char) {
+/// The name rule a catalog row must satisfy to be stored: a chain segment's
+/// name (`segment`) is `_` then `[A-Za-z0-9_]`, every other name a user
+/// identifier; and every one already canonical, since every name-index key is
+/// compared byte-wise against the client's folded form.
+fn check_stored_name(name: &str, noun: &str, segment: bool) -> Result<(), String> {
+    if !segment {
+        validate_user_identifier(name)?;
+    } else if !name.starts_with('_') {
+        return Err(format!("{noun} '{name}': a chain segment's name starts with '_'"));
+    } else if !name.bytes().all(gnitz_wire::is_valid_ident_char) {
         return Err(format!("{noun} name contains invalid characters: {name}"));
     }
     if name.bytes().any(|c| c.is_ascii_uppercase()) {
@@ -88,8 +89,8 @@ fn check_id_range(family: SysFamily, sig: &PkSignature, next_id: u64) -> Result<
 }
 
 /// Whether row `ra` of `a` and row `rb` of `b` differ in a payload column outside
-/// `mask` (bit `pi` exempts payload column `pi`). NULL equals NULL, and
-/// STRING/BLOB compare by content through each side's own blob heap.
+/// `mask` (bit `pi` exempts payload column `pi`). A system schema holds no
+/// nullable column; STRING/BLOB compare by content through each side's own heap.
 fn payload_differs(
     schema: &SchemaDescriptor,
     mask: u64,
@@ -99,11 +100,10 @@ fn payload_differs(
     rb: usize,
 ) -> bool {
     BitIter(low_bits_mask(schema.num_payload_cols()) & !mask).any(|pi| {
-        let loc = schema.locate(schema.payload_col_idx(pi));
-        match (loc.is_null(a, ra), loc.is_null(b, rb)) {
-            (false, false) => loc.cmp_non_null(a, ra, b, rb).is_ne(),
-            (na, nb) => na != nb,
-        }
+        schema
+            .locate(schema.payload_col_idx(pi))
+            .cmp_non_null(a, ra, b, rb)
+            .is_ne()
     })
 }
 
@@ -323,11 +323,7 @@ impl CatalogEngine {
             let old = sig.neg.map(decode).transpose()?;
             let new = sig.pos.map(decode).transpose()?;
 
-            let Some((is_base, owner_schema)) = self
-                .registry
-                .relation(owner_id)
-                .map(|e| (e.kind().is_base_table(), e.schema()))
-            else {
+            let Some(owner) = self.registry.relation(owner_id) else {
                 if sig.neg.is_some() {
                     return Err(format!(
                         "catalog changed concurrently: retracting a column of unregistered owner {owner_id}"
@@ -340,7 +336,7 @@ impl CatalogEngine {
 
             // Every column transition — RENAME, DROP, ADD — needs a user base
             // table owner, so every other `RelationKind` fails here.
-            if !is_base {
+            if !owner.kind().is_base_table() {
                 return Err(format!("cannot ALTER a column of {owner_id}: not a user base table"));
             }
 
@@ -369,7 +365,7 @@ impl CatalogEngine {
                         (false, false) => continue,
                     };
                     let name = &old.def.name;
-                    if owner_schema.is_pk_col(col_idx as usize) {
+                    if owner.schema().is_pk_col(col_idx as usize) {
                         return Err(format!("cannot {op} '{name}': it is a primary-key column"));
                     }
                     if hides {
@@ -377,11 +373,10 @@ impl CatalogEngine {
                         if old.fk.is_some() {
                             return Err(format!("cannot DROP COLUMN '{name}': it carries a foreign key"));
                         }
-                        let indexed = self.registry.relation(owner_id).is_some_and(|e| {
-                            e.indexes()
-                                .iter()
-                                .any(|ix| ix.cols().as_slice().contains(&(col_idx as u32)))
-                        });
+                        let indexed = owner
+                            .indexes()
+                            .iter()
+                            .any(|ix| ix.cols().as_slice().contains(&(col_idx as u32)));
                         if indexed {
                             return Err(format!(
                                 "cannot DROP COLUMN '{name}': it is covered by a secondary index; \
@@ -391,7 +386,7 @@ impl CatalogEngine {
                     }
                     self.reject_if_dependent_views(owner_id, op, &IdSet::default())?;
                 }
-                None => self.precheck_column_append(new, owner_id, col_idx, &owner_schema)?,
+                None => self.precheck_column_append(new, owner_id, col_idx, &owner.schema())?,
             }
         }
         Ok(())
@@ -569,10 +564,9 @@ impl CatalogEngine {
         let mut claimed: FxHashSet<Cow<'_, str>> = FxHashSet::default();
         for i in batch.live_rows() {
             let name = SchemaTabRow::read(batch, i).map_err(|e| format!("Schema: {e}"))?.name;
-            // The full identifier rule, leading-`_` included. Nothing synthesizes
-            // a schema name, so the reserved `_` prefix applies with no carve-out.
-            validate_user_identifier(&name)?;
-            reject_unstorable_name(&name, "schema")?;
+            // Nothing synthesizes a schema name, so the reserved `_` prefix
+            // applies with no carve-out.
+            check_stored_name(&name, "schema", false)?;
             if self.schema_id(&name).is_some() || !claimed.insert(name.clone()) {
                 return Err(format!("Schema already exists: {name}"));
             }
@@ -629,14 +623,8 @@ impl CatalogEngine {
             let schema = build_schema_from_col_defs(rel.kind(), &col_defs, rel.pk.as_slice())
                 .map_err(|e| format!("{rel} {e}"))?;
             // A leading `_` names a chain segment and nothing else.
-            match rel.detail {
-                RelDetail::View(ViewParts { owner: Some(_), .. }) if !rel.name.starts_with('_') => {
-                    return Err(format!("{rel}: a chain segment's name starts with '_'"));
-                }
-                RelDetail::View(ViewParts { owner: Some(_), .. }) => {}
-                _ => validate_user_identifier(&rel.name)?,
-            }
-            reject_unstorable_name(&rel.name, rel.kind().noun())?;
+            let segment = matches!(rel.detail, RelDetail::View(ViewParts { owner: Some(_), .. }));
+            check_stored_name(&rel.name, rel.kind().noun(), segment)?;
             // An FK probes its parent's store on every write of the child, which only
             // a base table's ingest runs; a stream push must stay a pure append.
             if !rel.kind().is_base_table() {
@@ -761,8 +749,7 @@ impl CatalogEngine {
             let r = IdxTabRow::read(batch, i).map_err(|e| format!("Index: {e}"))?;
             let (owner_id, cols, unique) = r.parts().map_err(|e| format!("Index: {e}"))?;
             let index_name = r.name;
-            validate_user_identifier(&index_name)?;
-            reject_unstorable_name(&index_name, noun)?;
+            check_stored_name(&index_name, noun, false)?;
             self.validate_index_create(owner_id, cols.as_slice(), unique)?;
             if !taken.insert(Cow::Owned(index_name.as_bytes().to_vec())) {
                 return Err(format!("Index already exists: {index_name}"));
@@ -789,23 +776,16 @@ impl CatalogEngine {
             // to validate. The drop is allowed when uniqueness is structurally
             // preserved: the column is the lone PK, or another unique secondary
             // index survives the drop.
-            let is_lone_pk = self
-                .registry
-                .relation(owner_id)
-                .is_some_and(|e| e.schema().lone_pk_col() == Some(src_col));
-            if is_lone_pk {
+            let owner = self.registry.relation(owner_id);
+            if owner.is_some_and(|e| e.schema().lone_pk_col() == Some(src_col)) {
                 continue;
             }
             // The claims are pre-drop: this batch has not been applied yet.
-            let unique_remains = self
-                .registry
-                .relation(owner_id)
-                .and_then(|r| r.index_on(&[src_col as u32]))
-                .is_some_and(|ix| {
-                    ix.claims()
-                        .iter()
-                        .any(|c| matches!(*c, IndexClaim::Index { id, unique: true } if !net_dead.contains(id)))
-                });
+            let unique_remains = owner.and_then(|r| r.index_on(&[src_col as u32])).is_some_and(|ix| {
+                ix.claims()
+                    .iter()
+                    .any(|c| matches!(*c, IndexClaim::Index { id, unique: true } if !net_dead.contains(id)))
+            });
             if !unique_remains {
                 return Err(format!(
                     "Integrity violation: index on '{}' is referenced by a \

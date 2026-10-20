@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::test_support::u64_i64_cols;
-use gnitz_wire::sys_rows::{SysRow, TableTabRow, ViewTabRow};
+use gnitz_wire::sys_rows::{TableTabRow, ViewTabRow};
 
 const TABLES: u64 = gnitz_wire::TABLE_TAB;
 
@@ -140,23 +140,20 @@ fn the_system_schema_takes_no_relation() {
     let pk_col_idx = PkColList::from_slice(&[0]).pack();
 
     let tid = engine.allocate_ids(1).unwrap();
-    let mut table = BatchBuilder::new(SysFamily::Table.schema());
-    TableTabRow {
+    let table = TableTabRow {
         table_id: tid,
         schema_id: SYSTEM_SCHEMA_ID,
         name: "mine".into(),
         pk_col_idx,
         flags: gnitz_wire::TableProps::default().pack(),
-    }
-    .write(&mut table, 1);
+    };
     let table = vec![
         (SysFamily::Column, col_tab_batch(tid, &cols, 1)),
-        (SysFamily::Table, table.finish()),
+        (SysFamily::Table, crate::test_support::sys_batch([(table, 1)])),
     ];
 
     let vid = engine.allocate_ids(1).unwrap();
-    let mut view = BatchBuilder::new(SysFamily::View.schema());
-    ViewTabRow {
+    let view = ViewTabRow {
         view_id: vid,
         schema_id: SYSTEM_SCHEMA_ID,
         name: "mine".into(),
@@ -167,11 +164,14 @@ fn the_system_schema_takes_no_relation() {
         pk_repeats: 0,
         compress: 0,
         definition: Default::default(),
-    }
-    .write(&mut view, 1);
+    };
     let family_cols = SysFamily::Table.column_defs();
     let circuit = crate::test_support::identity_circuit(TABLES, gnitz_wire::ReadBound::None);
-    let view: Vec<_> = view_blocks([(vid, &circuit, &family_cols[..])], view.finish()).into();
+    let view: Vec<_> = view_blocks(
+        [(vid, &circuit, &family_cols[..])],
+        crate::test_support::sys_batch([(view, 1)]),
+    )
+    .into();
 
     for blocks in [table, view] {
         let err = apply_ddl(&mut engine, blocks).expect_err("a relation in the system schema");

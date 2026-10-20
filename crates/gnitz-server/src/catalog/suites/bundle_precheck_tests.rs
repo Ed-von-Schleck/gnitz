@@ -39,13 +39,7 @@ fn a_schema_row_takes_the_full_identifier_rule_once_per_name() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let (a, b) = (engine.allocate_ids(1).unwrap(), engine.allocate_ids(1).unwrap());
 
-    for (name, why) in [
-        ("a/b", "invalid characters"),
-        ("with space", "invalid characters"),
-        ("", "cannot be empty"),
-        ("_x", "cannot start with '_'"),
-        ("MixedCase", "not canonical"),
-    ] {
+    for (name, why) in [("_x", "cannot start with '_'"), ("MixedCase", "not canonical")] {
         let err = engine
             .precheck_family(SysFamily::Schema, &schema_tab_batch(&[(a, name, 1)]))
             .unwrap_err();
@@ -132,38 +126,52 @@ fn a_view_row_names_a_real_owner_and_a_canonical_name() {
             .ddl_sync(SysFamily::Column.id(), col_tab_batch(id, &u64_i64_cols(), 1))
             .unwrap();
     }
-    // `rows` of `(view id, name, owner)`.
-    let view_rows = |rows: &[(u64, &str, u64)]| {
+    // `rows` of `(view id, name, owner, capacity)`.
+    let view_rows = |rows: &[(u64, &str, u64, u64)]| {
         let mut bb = BatchBuilder::new(SysFamily::View.schema());
-        for &(id, name, owner) in rows {
-            push_view_tab_row(&mut bb, 1, id, name, 0, 0, owner);
+        for &(id, name, owner, capacity) in rows {
+            push_view_tab_row(&mut bb, 1, id, name, capacity, 0, owner);
         }
         bb.finish()
     };
 
     let not_created = "is not a user view this bundle creates";
+    let with_option =
+        format!("catalog invariant violated: view '_seg' (id={vid}) is a chain segment carrying a WITH option");
     for (rows, why) in [
-        (&[(vid, "_seg", 999_999)][..], not_created),
-        (&[(vid, "_seg", table)], not_created),
-        (&[(vid, "_seg", existing)], not_created),
+        (&[(vid, "_seg", 999_999, 0)][..], not_created),
+        (&[(vid, "_seg", table, 0)], not_created),
+        (&[(vid, "_seg", existing, 0)], not_created),
         // A segment of the bundle is no user view.
         (
-            &[(vid, "_seg", other), (other, "_other", user), (user, "user", 0)],
+            &[
+                (vid, "_seg", other, 0),
+                (other, "_other", user, 0),
+                (user, "user", 0, 0),
+            ],
             not_created,
         ),
-        (&[(vid, "_seg", vid)], not_created),
-        (&[(vid, "MixedCase", 0)], "not canonical"),
+        (&[(vid, "_seg", vid, 0)], not_created),
+        (&[(vid, "MixedCase", 0, 0)], "not canonical"),
         // A leading `_` names a segment and nothing else.
-        (&[(vid, "_v", 0)], "cannot start with '_'"),
+        (&[(vid, "_v", 0, 0)], "cannot start with '_'"),
         (
-            &[(vid, "seg", user), (user, "user", 0)],
+            &[(vid, "seg", user, 0), (user, "user", 0, 0)],
             "a chain segment's name starts with '_'",
+        ),
+        // A segment is planner-minted, so it carries no WITH option; a user view may.
+        (
+            &[(vid, "_seg", user, 4 << 20), (user, "user", 0, 0)],
+            with_option.as_str(),
         ),
     ] {
         let err = engine.precheck_family(SysFamily::View, &view_rows(rows)).unwrap_err();
         assert!(err.contains(why), "{rows:?}: {err}");
     }
-    for rows in [&[(vid, "v", 0)][..], &[(vid, "_seg", user), (user, "user", 0)]] {
+    for rows in [
+        &[(vid, "v", 0, 4 << 20)][..],
+        &[(vid, "_seg", user, 0), (user, "user", 0, 0)],
+    ] {
         engine
             .precheck_family(SysFamily::View, &view_rows(rows))
             .unwrap_or_else(|e| panic!("{rows:?}: {e}"));

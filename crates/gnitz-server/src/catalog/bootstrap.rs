@@ -5,7 +5,7 @@ use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
 use super::cache::CatalogCacheSet;
-use super::sys_tables::{SysFamily, FIRST_ALLOCATED_ID};
+use super::sys_tables::SysFamily;
 use super::CatalogEngine;
 use crate::query::DagEngine;
 
@@ -60,7 +60,7 @@ impl CatalogEngine {
             dag: DagEngine::default(),
             _dir_lock: dir_lock,
             caches: CatalogCacheSet::default(),
-            next_id: FIRST_ALLOCATED_ID,
+            next_id: gnitz_wire::FIRST_USER_TABLE_ID,
             system_zone: 0,
             resume_generation: 0,
         };

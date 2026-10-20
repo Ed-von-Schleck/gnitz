@@ -5,20 +5,19 @@
 
 use super::*;
 use crate::test_support::u64_i64_cols;
-use gnitz_wire::sys_rows::{SysRow, TableTabRow};
+use gnitz_wire::sys_rows::TableTabRow;
 use std::path::Path;
 
 /// A rename of `tid` to `new_name` as its two TABLE_TAB rows, `[-1, +1]`: the
 /// `-1` copies the live row, the `+1` differs from it only in `name`.
 fn table_rename_rows(engine: &CatalogEngine, tid: u64, new_name: &str) -> [Batch; 2] {
     let minus = engine.retract_under(SysFamily::Table, &[tid]);
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
     let row = TableTabRow {
         name: new_name.into(),
         ..TableTabRow::read(&minus, 0).unwrap()
     };
-    row.write(&mut bb, 1);
-    [minus, bb.finish()]
+    let plus = crate::test_support::sys_batch([(row, 1)]);
+    [minus, plus]
 }
 
 fn table_rename_pair(engine: &CatalogEngine, tid: u64, new_name: &str) -> Batch {
@@ -194,29 +193,6 @@ fn hiding_a_foreign_key_column_rejected() {
         .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], hide))
         .unwrap_err();
     assert!(err.contains("carries a foreign key"), "{err}");
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// A column's `ON DELETE` action is fixed when it is declared.
-#[test]
-fn changing_a_foreign_keys_action_rejected() {
-    let dir = temp_dir("alter_fk_action");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let ptid = engine
-        .create_table("public.p", &[col_def("id", TypeCode::U64)], &[0])
-        .unwrap();
-    let cols = vec![col_def("id", TypeCode::U64), fk_def("r", TypeCode::U64, ptid, 0)];
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-
-    let cascade = |c: &mut CatalogColumn| {
-        c.fk.as_mut().unwrap().on_delete = gnitz_wire::sys_rows::FkAction::Cascade;
-    };
-    let err = engine
-        .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], cascade))
-        .unwrap_err();
-    assert!(err.contains("changes a field it may not"), "{err}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

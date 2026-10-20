@@ -447,7 +447,9 @@ pub fn schema_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
 /// `defs` as `owner_id`'s COL_TAB batch at `weight`, numbered by position.
 pub fn col_tab_batch(owner_id: u64, defs: &[CatalogColumn], weight: i64) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Column.schema());
-    crate::catalog::write_col_tab_rows(&mut bb, owner_id, defs, weight);
+    for (i, cd) in defs.iter().enumerate() {
+        cd.write_col_tab_row(&mut bb, owner_id, i, weight);
+    }
     bb.finish()
 }
 

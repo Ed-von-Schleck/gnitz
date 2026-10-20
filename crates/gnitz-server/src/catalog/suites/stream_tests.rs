@@ -27,6 +27,7 @@ fn stream_flag_registers_storeless_with_no_directory() {
 
     let entry = engine.registry.relation_or_err(sid).expect("stream registered");
     assert_eq!(entry.kind(), RelationKind::Stream);
+    assert!(entry.pk_repeats());
     // No directory is what says it holds no store: `build_relation_store`
     // creates one for every kind that opens one.
     let stream_dir = relation_dir(&dir, sid);
@@ -45,6 +46,7 @@ fn stream_flag_registers_storeless_with_no_directory() {
     // directory, so the assertions above are about the flag and not the fixture.
     let base = engine.registry.relation_or_err(tid).expect("table registered");
     assert_eq!(base.kind(), RelationKind::BaseTable);
+    assert!(!base.pk_repeats());
     assert!(std::path::Path::new(&relation_dir(&dir, tid)).exists());
 
     fs::remove_dir_all(&dir).ok();

@@ -8,7 +8,7 @@ use crate::catalog::cache::encode_record;
 use crate::test_support::{arb_schema, cols_of};
 
 use gnitz_wire::schema_block::check_same_types;
-use gnitz_wire::{ColumnDef, TypeCode, MAX_PK_COLUMNS};
+use gnitz_wire::{ColumnDef, MAX_PK_COLUMNS};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use proptest::prelude::*;
@@ -60,137 +60,135 @@ proptest! {
     }
 }
 
-/// Client `encode_ddl_txn` → server `decode_items` → `Batch::decode_from_wal_block`
-/// against each family's own schema, for 1-, 2- and 3-family bundles.
+/// A DDL bundle the client builds, as the engine reads it: each family's block,
+/// written through the client's sink, decodes against the catalog's own schema
+/// for that family to the rows the client wrote, weights included — STRING and
+/// BLOB cells past the inline bytes, an empty BLOB and the pair-keyed family's
+/// two key words among them.
 ///
 /// The frame layout itself is `gnitz_wire::txn_frame`'s, round-tripped in that
-/// crate, and both ends derive their system schemas from `gnitz_wire::SYS_FAMILIES`
-/// rather than hand-keeping them. What is only covered here is the pairing:
-/// a client-built WAL block per family, written by the shared row writers the
-/// client uses, decoded by the engine against the catalog's own schema for that
-/// family — with STRING columns and compound PKs.
+/// crate.
 #[test]
-fn ddl_txn_roundtrip_client_to_server() {
-    use gnitz_core::sys_schema;
+fn a_client_bundle_decodes_to_the_rows_it_wrote() {
     use gnitz_core::{BatchAppender, ZSetBatch};
-    use gnitz_wire::sys_rows::{CircuitRow, ColTabRow, IdxTabRow, SysRow, TableTabRow, ViewTabRow};
+    use gnitz_wire::sys_rows::*;
     use gnitz_wire::txn_frame::decode_items;
-    use gnitz_wire::{CIRCUIT_TAB, COL_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB};
 
-    // A COL_TAB batch for `oid` with `n` U64 columns.
-    let col_batch = |oid: u64, n: usize| -> ZSetBatch {
-        let s = sys_schema(COL_TAB);
-        let mut b = ZSetBatch::new(s);
-        let mut a = BatchAppender::new(&mut b);
-        for i in 0..n {
-            let col = ColumnDef::new(format!("c{i}"), TypeCode::U64, false);
-            ColTabRow::of(oid, i as u64, &col, None).write(&mut a, 1);
+    fn block<R: SysRow>(rows: &[(R, i64)]) -> (u64, ZSetBatch) {
+        let mut b = ZSetBatch::new(gnitz_core::sys_schema(R::FAMILY));
+        let mut sink = BatchAppender::new(&mut b);
+        for (row, weight) in rows {
+            row.write(&mut sink, *weight);
         }
-        b
-    };
-    let table_batch = |tid: u64, weight: i64| -> ZSetBatch {
-        let s = sys_schema(TABLE_TAB);
-        let mut b = ZSetBatch::new(s);
-        let row = TableTabRow {
-            table_id: tid,
-            schema_id: 3,
-            name: "t".into(),
-            pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]).pack(),
-            flags: gnitz_wire::TableProps::default().pack(),
-        };
-        row.write(&mut BatchAppender::new(&mut b), weight);
-        b
-    };
-    let idx_batch = |idx_id: u64, owner: u64| -> ZSetBatch {
-        let s = sys_schema(IDX_TAB);
-        let mut b = ZSetBatch::new(s);
-        let row = IdxTabRow {
-            index_id: idx_id,
-            owner_id: owner,
-            source_col_idx: gnitz_wire::PkColList::from_slice(&[1]).pack(),
-            name: "idx_t_b".into(),
-            is_unique: 1,
-        };
-        row.write(&mut BatchAppender::new(&mut b), 1);
-        b
-    };
+        (R::FAMILY, b)
+    }
+    fn read_back<'b, R, E>(
+        batch: &'b Batch,
+        read: impl Fn(&'b Batch, usize) -> Result<R, E>,
+    ) -> Result<Vec<(R, i64)>, E> {
+        (0..batch.len())
+            .map(|i| Ok((read(batch, i)?, batch.get_weight(i))))
+            .collect()
+    }
 
-    // Verify a bundle roundtrips: family count, order (tid), and per-row weight
-    // and key bytes.
-    let verify = |families: &[(u64, ZSetBatch)]| {
-        let payload = gnitz_core::encode_ddl_txn(families);
-        let ctrl = gnitz_wire::control::peek_control_block(&payload).expect("control header");
-        let decoded = decode_items(&payload[ctrl.body], gnitz_wire::ClientVerb::DdlTxn).expect("decode_items");
-        assert_eq!(decoded.len(), families.len(), "family count");
-        for (fi, ((exp_tid, exp_batch), (frame, item))) in families.iter().zip(&decoded).enumerate() {
-            let got_tid = &item.hdr.target_id;
-            let slice = &frame[item.data.clone().expect("a DDL_TXN item carries a block")];
-            assert_eq!(*got_tid, *exp_tid, "family {fi} tid/order");
-            let schema = crate::catalog::SysFamily::from_id(*got_tid)
-                .expect("bundle family id must be a system family")
-                .schema();
-            let batch = Batch::decode_from_wal_block(slice, schema).expect("decode family batch");
-            assert_eq!(batch.len(), exp_batch.len(), "row count tid {got_tid}");
-            for i in 0..batch.len() {
-                assert_eq!(
-                    batch.get_weight(i),
-                    exp_batch.weights[i],
-                    "weight row {i} tid {got_tid}"
-                );
-                assert_eq!(
-                    batch.get_pk_bytes(i),
-                    exp_batch.pks.get_bytes(i),
-                    "pk row {i} tid {got_tid}"
-                );
-            }
-        }
-    };
-
-    // 1-family: DROP TABLE (one TABLE_TAB -1).
-    verify(&[(TABLE_TAB, table_batch(16, -1))]);
-
-    // 2-family: CREATE TABLE (COL_TAB + TABLE_TAB).
-    verify(&[(COL_TAB, col_batch(17, 2)), (TABLE_TAB, table_batch(17, 1))]);
-
-    // 3-family: CREATE TABLE + inline UNIQUE index (COL_TAB + TABLE_TAB + IDX_TAB).
-    verify(&[
-        (COL_TAB, col_batch(18, 2)),
-        (TABLE_TAB, table_batch(18, 1)),
-        (IDX_TAB, idx_batch(100, 18)),
-    ]);
-
-    // 3-family: CREATE VIEW (COL_TAB + CIRCUIT_TAB + VIEW_TAB).
-    let vid: u64 = 20;
-    let src: u64 = 16;
-    let circuit = {
-        let s = sys_schema(CIRCUIT_TAB);
-        let mut b = ZSetBatch::new(s);
-        let identity = crate::test_support::identity_circuit(src, gnitz_wire::ReadBound::None);
-        let circuit = identity.encode();
-        CircuitRow {
-            view_id: vid,
-            circuit: circuit.as_slice().into(),
-        }
-        .write(&mut BatchAppender::new(&mut b), 1);
-        b
-    };
-    let view = {
-        let s = sys_schema(VIEW_TAB);
-        let mut b = ZSetBatch::new(s);
-        let row = ViewTabRow {
-            view_id: vid,
-            schema_id: 3,
+    let schemas = [(
+        SchemaTabRow {
+            schema_id: 7,
+            name: "a_long_schema_name_past_twelve".into(),
+        },
+        1,
+    )];
+    let tables = [(
+        TableTabRow {
+            table_id: 9,
+            schema_id: 7,
+            name: "a_long_table_name_past_twelve".into(),
+            pk_col_idx: 0x31,
+            flags: 5,
+        },
+        -1,
+    )];
+    let views = [(
+        ViewTabRow {
+            view_id: 11,
+            schema_id: 7,
             name: "v".into(),
-            pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]).pack(),
-            capacity_bytes: 0,
-            delta_bytes: 0,
-            owner_view_id: 0,
-            pk_repeats: 0,
+            pk_col_idx: 1,
+            capacity_bytes: 4 << 20,
+            delta_bytes: 32 << 20,
+            owner_view_id: 10,
+            pk_repeats: 1,
             compress: 0,
             definition: Default::default(),
-        };
-        row.write(&mut BatchAppender::new(&mut b), 1);
-        b
+        },
+        1,
+    )];
+    let column = |col_idx, name: &'static str| ColTabRow {
+        owner_id: 0x1122,
+        col_idx,
+        name: name.into(),
+        type_code: 8,
+        is_nullable: 1,
+        fk_table_id: 12,
+        fk_col_idx: 2,
+        fk_on_delete: 1,
+        is_hidden: 1,
+        scale: 4,
     };
-    verify(&[(COL_TAB, col_batch(vid, 1)), (CIRCUIT_TAB, circuit), (VIEW_TAB, view)]);
+    let columns = [
+        (column(0xAABB, "c"), 1),
+        (column(0xAABC, "a_column_name_past_twelve"), 1),
+    ];
+    let indexes = [(
+        IdxTabRow {
+            index_id: 70,
+            owner_id: 16,
+            source_col_idx: 0x21,
+            name: "i".into(),
+            is_unique: 1,
+        },
+        1,
+    )];
+    let sequences = [(SeqTabRow { seq_id: 3, next_val: u64::MAX }, 1)];
+    let identity = crate::test_support::identity_circuit(16, gnitz_wire::ReadBound::None).encode();
+    let circuits = [
+        (
+            CircuitRow {
+                view_id: 11,
+                circuit: identity.as_slice().into(),
+            },
+            1,
+        ),
+        (CircuitRow { view_id: 12, circuit: (&[][..]).into() }, 1),
+    ];
+
+    let bundle = [
+        block(&schemas),
+        block(&tables),
+        block(&views),
+        block(&columns),
+        block(&indexes),
+        block(&sequences),
+        block(&circuits),
+    ];
+    let payload = gnitz_core::encode_ddl_txn(&bundle);
+    let ctrl = gnitz_wire::control::peek_control_block(&payload).expect("control header");
+    let items = decode_items(&payload[ctrl.body], gnitz_wire::ClientVerb::DdlTxn).expect("decode_items");
+    let ids: Vec<u64> = items.iter().map(|(_, item)| item.hdr.target_id).collect();
+    assert_eq!(ids, bundle.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+    let b: Vec<Batch> = items
+        .iter()
+        .map(|(frame, item)| {
+            let schema = crate::catalog::SysFamily::from_id(item.hdr.target_id).unwrap().schema();
+            Batch::decode_from_wal_block(&frame[item.data.clone().unwrap()], schema).unwrap()
+        })
+        .collect();
+
+    assert_eq!(read_back(&b[0], SchemaTabRow::read), Ok(schemas.to_vec()));
+    assert_eq!(read_back(&b[1], TableTabRow::read), Ok(tables.to_vec()));
+    assert_eq!(read_back(&b[2], ViewTabRow::read), Ok(views.to_vec()));
+    assert_eq!(read_back(&b[3], ColTabRow::read), Ok(columns.to_vec()));
+    assert_eq!(read_back(&b[4], IdxTabRow::read), Ok(indexes.to_vec()));
+    assert_eq!(read_back(&b[5], SeqTabRow::read), Ok(sequences.to_vec()));
+    assert_eq!(read_back(&b[6], CircuitRow::read), Ok(circuits.to_vec()));
 }

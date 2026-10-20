@@ -5,9 +5,16 @@
 use gnitz_wire::sys_rows::{SeqTabRow, SysRow};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
-use super::sys_tables::{SysFamily, SEQ_ID_CHECKPOINT_GEN, SEQ_ID_NEXT_ID, SEQ_ID_TOPOLOGY};
+use super::sys_tables::SysFamily;
 use super::write_path::{ZoneError, ZoneSink};
 use super::CatalogEngine;
+
+/// The next catalog object id to allocate.
+const SEQ_ID_NEXT_ID: u64 = 1;
+/// Committed checkpoint generation (monotonic).
+const SEQ_ID_CHECKPOINT_GEN: u64 = 2;
+/// Cluster topology: [`topology_word`].
+const SEQ_ID_TOPOLOGY: u64 = 3;
 
 /// Operator-state format version. Bump on any change to an operator-state
 /// schema; a mismatch marks every Rederive view invalid at boot. Shard and
@@ -17,7 +24,7 @@ const STATE_FORMAT: u32 = 16;
 /// The durable topology word recorded in `sequences` ([`SEQ_ID_TOPOLOGY`]):
 /// `(worker_count << 32) | STATE_FORMAT`. One packer, shared by the boot-time
 /// recorder and the resume-verdict validator.
-pub(in crate::catalog) fn topology_word(worker_count: u32) -> u64 {
+fn topology_word(worker_count: u32) -> u64 {
     ((worker_count as u64) << 32) | STATE_FORMAT as u64
 }
 
@@ -92,7 +99,7 @@ impl CatalogEngine {
     }
 
     /// Move `sequences` row `seq_id` to `value`.
-    pub(in crate::catalog) fn set_sequence(&mut self, seq_id: u64, value: u64) -> Result<(), String> {
+    fn set_sequence(&mut self, seq_id: u64, value: u64) -> Result<(), String> {
         let old = self.sequence_value(seq_id);
         if old == Some(value) {
             return Ok(());
@@ -159,7 +166,3 @@ fn validated_run_last(base: u64, count: u64, ceiling: u64) -> Option<u64> {
     let last = base.checked_add(count.checked_sub(1)?)?;
     (last < ceiling).then_some(last)
 }
-
-#[cfg(test)]
-#[path = "tests/sequences.rs"]
-mod tests;

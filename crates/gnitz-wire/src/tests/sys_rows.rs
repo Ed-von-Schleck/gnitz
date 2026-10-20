@@ -150,6 +150,17 @@ fn a_relation_rows_parts_invert_its_packed_words() {
         is_unique: 1,
     };
     assert_eq!(index.parts(), Ok((16, pk, true)));
-    let err = IdxTabRow { is_unique: 2, ..index }.parts().unwrap_err();
-    assert!(err.contains("is_unique"), "{err}");
+    for (r, expect) in [
+        (IdxTabRow { is_unique: 2, ..index.clone() }, "is_unique"),
+        (
+            IdxTabRow {
+                source_col_idx: pk.pack() & !crate::PK_LIST_PACKED_FLAG,
+                ..index
+            },
+            "column list word carries no packed-list flag",
+        ),
+    ] {
+        let err = r.parts().unwrap_err();
+        assert!(err.contains(expect), "{expect}: {err}");
+    }
 }

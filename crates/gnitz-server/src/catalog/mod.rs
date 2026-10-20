@@ -44,7 +44,7 @@ pub(crate) use bootstrap::UnreplayedCatalog;
 pub(crate) use constraints::{FkEdge, RowConstraints};
 pub(crate) use sys_tables::SysFamily;
 #[cfg(test)]
-pub(crate) use sys_tables::{write_col_tab_rows, CatalogColumn, PUBLIC_SCHEMA_ID};
+pub(crate) use sys_tables::{CatalogColumn, PUBLIC_SCHEMA_ID};
 // The DDL_TXN driver's unique-index pre-flight input.
 pub(crate) use sys_tables::unique_index_creates;
 pub(crate) use write_path::{ZoneError, ZoneSink};
