@@ -1,7 +1,5 @@
 use crate::catalog::{idx_rows, Catalog, IndexRow, CATALOG_FAMILIES};
-use crate::connection::{
-    promise, DeltaCursor, Interest, Polled, RelDescriptor, Request, ScanReply, Sent, Session, Target,
-};
+use crate::connection::{promise, DeltaCursor, Interest, RelDescriptor, Request, ScanReply, Sent, Session, Target};
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
 use crate::{sys_schema, BatchAppender, PkColumn, PushFamily, RelName, RelationRef, Schema, ViewDefinition, ZSetBatch};
@@ -21,8 +19,8 @@ use gnitz_wire::sys_rows::{
     CircuitRow, ColTabRow, ColTabSlot, FkAction, FkRef, IdxTabRow, IdxTabSlot, SchemaTabRow, SchemaTabSlot, SysRow,
     TableTabRow, ViewTabRow,
 };
-use gnitz_wire::txn_frame::{kept_as, DeltaPollItem, BLIND};
-use gnitz_wire::{payload_bytes, payload_str, payload_u64};
+use gnitz_wire::txn_frame::BLIND;
+use gnitz_wire::{payload_bytes, payload_u64};
 use gnitz_wire::{Circuit, ComputeMap, KeyRange, ReadBound, ReadSink, ReadSpec};
 use gnitz_wire::{
     PkColList, TableProps, ViewProps, CIRCUIT_TAB, COL_TAB, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB,
@@ -30,7 +28,7 @@ use gnitz_wire::{
 };
 
 /// The absence a catalog lookup by name reports.
-pub fn not_found(noun: &'static str, name: &RelName) -> ClientError {
+pub fn not_found(noun: &'static str, name: impl std::fmt::Display) -> ClientError {
     absent(format!("{noun} '{name}' not found"))
 }
 
@@ -41,24 +39,10 @@ fn absent(text: String) -> ClientError {
 
 /// The index in `schemas`, SCHEMA_TAB's rows, of the live row named
 /// `schema_name` (already canonical).
-fn schema_row(schemas: &ZSetBatch, schema_name: &str) -> Result<usize, ClientError> {
+fn schema_row(schemas: &ZSetBatch, schema_name: &str) -> Option<usize> {
     schemas
         .live_rows()
         .find(|&i| payload_bytes(schemas, i, SchemaTabSlot::name as usize) == schema_name.as_bytes())
-        .ok_or_else(|| absent(format!("schema '{schema_name}' not found")))
-}
-
-/// Build the `-1` retraction batch for `pks`: the server's unique-PK rule
-/// retracts by PK alone, so the payload columns are inert filler.
-pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
-    let count = pks.len();
-    ZSetBatch {
-        pks,
-        weights: vec![-1; count],
-        nulls: vec![0; count],
-        payload: ZSetBatch::filler_columns(schema, count),
-        blob: vec![],
-    }
 }
 
 /// The keys-only read of `schema`: a reply of its PK columns alone, and a rows sink
@@ -83,6 +67,32 @@ pub const RMW_MAX_ATTEMPTS: usize = 4;
 pub struct InlineUniqueIndex {
     pub cols: PkColList,
     pub name: String,
+}
+
+/// A `CREATE TABLE`: the table, its FOREIGN KEY columns and its inline UNIQUE
+/// indexes, which [`GnitzClient::create_table`] writes as one DDL bundle.
+pub struct TableDef {
+    pub name: RelName,
+    pub schema: Schema,
+    /// `fks[i]` is column `i`'s target; an empty `fks` gives no column one.
+    pub fks: Vec<Option<FkTarget>>,
+    pub props: TableProps,
+    /// Each inline UNIQUE constraint's columns and the catalog name its index
+    /// takes.
+    pub unique_indexes: Vec<InlineUniqueIndex>,
+}
+
+impl TableDef {
+    /// `name` over `schema`, with no foreign key, unique index or option.
+    pub fn new(name: RelName, schema: Schema) -> Self {
+        TableDef {
+            name,
+            schema,
+            fks: Vec::new(),
+            props: TableProps::default(),
+            unique_indexes: Vec::new(),
+        }
+    }
 }
 
 /// The column a FOREIGN KEY column references. `SelfTable` names the table
@@ -123,6 +133,17 @@ impl DdlBundle {
             }
         };
         &mut self.0[at].1
+    }
+
+    /// `scanned`'s row `i`, a stored `family` row, at `-1` — once: a row the
+    /// bundle already retracts is not retracted again. A system family holds
+    /// one live row per key, so the key names the row.
+    fn retract(&mut self, family: u64, scanned: &ZSetBatch, i: usize) {
+        let rows = self.batch(family);
+        let key = scanned.pks.get_bytes(i);
+        if !(0..rows.len()).any(|j| rows.weights[j] < 0 && rows.pks.get_bytes(j) == key) {
+            rows.copy_row_at(scanned, i, -1);
+        }
     }
 
     /// `row` at `weight`, in its own family's batch.
@@ -231,6 +252,11 @@ pub struct PlannedView {
 /// hidden segments it owns, in dependency order. [`segment_id`]`(j)` names
 /// `segments[j]`.
 pub struct ViewBundle {
+    /// The user-named view's name and options.
+    pub name: RelName,
+    pub props: ViewProps,
+    /// The id of the view the chain supersedes in the same zone.
+    pub replacing: Option<u64>,
     pub segments: Vec<PlannedView>,
     pub view: PlannedView,
     /// What the user-named view's row records of its body.
@@ -240,16 +266,8 @@ pub struct ViewBundle {
 impl ViewBundle {
     /// The chain's catalog rows at `+1`, its first member standing at `base`:
     /// each segment named by [`segment_name`] and owned by the user-named view,
-    /// which stands last under `view_name` and `props`, recording `definition`.
-    fn put_rows(
-        &self,
-        b: &mut DdlBundle,
-        view_name: &str,
-        props: ViewProps,
-        definition: &[u8],
-        schema_id: u64,
-        base: u64,
-    ) {
+    /// which stands last under its own name and props, recording `definition`.
+    fn put_rows(&self, b: &mut DdlBundle, definition: &[u8], schema_id: u64, base: u64) {
         let owner_vid = base + self.segments.len() as u64;
         for (pv, vid) in self.segments.iter().chain([&self.view]).zip(base..) {
             let mut circuit = pv.circuit.clone();
@@ -257,7 +275,7 @@ impl ViewBundle {
                 *src = source_at(*src, base);
             }
             let (name, owner_view_id, props, definition) = if vid == owner_vid {
-                (view_name.to_string(), 0, props, definition)
+                (self.name.name().to_string(), 0, self.props, definition)
             } else {
                 (segment_name(vid), owner_vid, ViewProps::default(), &[][..])
             };
@@ -383,7 +401,11 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
 }
 
 /// Wait for the session's socket and step it on what is ready.
-fn poll_turn(session: &mut Session, host: &mut dyn Host, cx: &mut Context<'_>) -> Poll<Result<(), ClientError>> {
+pub(crate) fn poll_turn(
+    session: &mut Session,
+    host: &mut dyn Host,
+    cx: &mut Context<'_>,
+) -> Poll<Result<(), ClientError>> {
     if session.unread() {
         session.step(Interest::READ);
         return Poll::Ready(Ok(()));
@@ -690,8 +712,7 @@ impl GnitzClient {
         let (target, batch) = (target.into(), batch.into());
         if let Some(txn) = &mut self.txn {
             let buffered = txn.push(target, schema, batch.into_owned(), mode, BLIND);
-            let sent = Sent::ready(buffered.map(|()| 0));
-            return Pending { client: self, sent };
+            return self.wait(Sent::ready(buffered.map(|()| 0)));
         }
         let batch = &*batch;
         self.ack(Request::Push { target, schema, batch, mode })
@@ -757,8 +778,7 @@ impl GnitzClient {
                 schema: Arc::clone(reply_schema),
                 lsn: None,
             });
-        let sent = Sent::ready(reply.map_err(ClientError::from));
-        Pending { client: self, sent }
+        self.wait(Sent::ready(reply.map_err(ClientError::from)))
     }
 
     /// Replace the connection and keep the copies — what a host does after a
@@ -799,53 +819,35 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// Bootstrap a view's delta feed: the view's whole current value at its true
-    /// net weights, and the cursor to poll from. It replaces a copy's state; it
-    /// does not add to it.
+    /// Read a view's delta feed under `spec`, with the cursor to poll from
+    /// next. The reply comes back in `reply_schema`, weights and all.
+    ///
+    /// With no `from` it bootstraps: the view's whole current value at its true
+    /// net weights, which replaces a copy's state rather than adding to it.
+    /// After `from` it is every delta the view emitted since: apply it and store
+    /// the new cursor; there is nothing to reconcile.
     ///
     /// `spec` is an encoded `ReadSpec` forwarding rows with no cut: the reply is
     /// that spec applied to the view, in `reply_schema`, which is the view's own
     /// under `ReadSpec::all_rows` of no bound. Every later poll of the copy
     /// carries the same `spec`.
-    pub fn delta_bootstrap(
-        &mut self,
-        view: impl Into<Target>,
-        reply_schema: &Arc<Schema>,
-        spec: &[u8],
-    ) -> Pending<'_, (ScanReply, DeltaCursor)> {
-        self.delta_read(view.into(), None, reply_schema, spec)
-    }
-
-    /// Poll a view's delta feed: every delta it emitted after `cursor`, under
-    /// `spec`, with the cursor to poll from next. The reply comes back in
-    /// `reply_schema`, weights and all. Apply what comes back and store the new
-    /// cursor; there is nothing to reconcile.
     ///
     /// A cursor the feed does not continue — its rounds dropped, or handed out
     /// by another boot, relation or `spec` — is refused as `DeltaExpired`:
-    /// discard the copy and [`delta_bootstrap`](Self::delta_bootstrap) again.
+    /// discard the copy and bootstrap again.
     ///
     /// It carries every push acknowledged before it, and is answered at once:
     /// only a sync waits for a view to change.
-    pub fn delta_poll(
+    pub fn delta_read(
         &mut self,
         view: impl Into<Target>,
-        cursor: DeltaCursor,
-        reply_schema: &Arc<Schema>,
-        spec: &[u8],
-    ) -> Pending<'_, (ScanReply, DeltaCursor)> {
-        self.delta_read(view.into(), Some(cursor), reply_schema, spec)
-    }
-
-    /// One view's delta read after `from`, the view whole with none.
-    fn delta_read(
-        &mut self,
-        view: Target,
         from: Option<DeltaCursor>,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
     ) -> Pending<'_, (ScanReply, DeltaCursor)> {
-        let sent = self.session.submit_delta_read(view, from, reply_schema, spec, None);
+        let sent = self
+            .session
+            .submit_delta_read(view.into(), from, reply_schema, spec, None);
         self.wait(sent)
     }
 
@@ -907,19 +909,12 @@ impl GnitzClient {
         let scanned = self.sys_rows(IDX_TAB, ReadBound::None).await?;
         let rows = idx_rows(&scanned)?;
         let mut b = DdlBundle::default();
-        let mut retired: Vec<usize> = Vec::with_capacity(names.len());
         for name in names {
             let name = gnitz_wire::canonical_identifier(name)?;
             match rows.iter().find(|(_, r)| r.name == name && matches(r)) {
-                Some(&(i, _)) => {
-                    // A repeated name retires once: the row is already in the batch.
-                    if !retired.contains(&i) {
-                        retired.push(i);
-                        b.batch(IDX_TAB).copy_row_at(&scanned, i, -1);
-                    }
-                }
+                Some(&(i, _)) => b.retract(IDX_TAB, &scanned, i),
                 None if if_exists => {}
-                None => return Err(absent(format!("{noun} '{name}' not found"))),
+                None => return Err(not_found(noun, name)),
             }
         }
         self.commit_ddl(b).await
@@ -1083,45 +1078,8 @@ impl GnitzClient {
         self.ack(Request::DdlTxn(&bundle.0)).await?;
         let written = bundle.relations_written();
         self.kept.retain(|_, rel| !written.contains(&rel.tid));
-        self.after_ddl_commit(&bundle.0).await;
+        self.ddl_committed(&bundle.0).await;
         Ok(())
-    }
-
-    /// Drop the copy of every view the bundle retracted, except a mirrored view
-    /// the bundle also wrote back — a rename — which is rebound under its new
-    /// name.
-    async fn after_ddl_commit(&mut self, families: &[(u64, ZSetBatch)]) {
-        let Some(m) = self.mirror.as_deref() else {
-            return;
-        };
-        let Some((_, b)) = families.iter().find(|(family, _)| *family == VIEW_TAB) else {
-            return;
-        };
-        let vid = |i| b.pks.get(i) as u64;
-        let mut dropped: Vec<u64> = Vec::new();
-        let mut renamed = Vec::new();
-        for v in (0..b.len()).filter(|&i| b.weights[i] < 0).map(vid) {
-            match (m.views.get(&v), b.live_rows().find(|&j| vid(j) == v)) {
-                (Some(view), Some(j)) => renamed.push(
-                    view.renamed(
-                        payload_str(b, j, RELTAB_PAY_NAME)
-                            .ok()
-                            .and_then(|new| view.name.sibling(&new).ok())
-                            .expect("a bundle this client built names its views"),
-                    ),
-                ),
-                _ => dropped.push(v),
-            }
-        }
-        for v in dropped {
-            let _ = self.forget_view(v).await;
-        }
-        for entry in renamed {
-            let tid = entry.desc.tid;
-            if self.bind(entry).await.is_err() {
-                let _ = self.forget_view(tid).await;
-            }
-        }
     }
 
     pub async fn create_schema(&mut self, name: &str) -> Result<u64, ClientError> {
@@ -1142,32 +1100,30 @@ impl GnitzClient {
         let name = gnitz_wire::canonical_identifier(name)?;
         let all = ReadSpec::all_rows(ReadBound::None);
         let [schemas, views, tables] = self.sys_cut([SCHEMA_TAB, VIEW_TAB, TABLE_TAB], &all).await?;
-        let at = schema_row(&schemas, &name)?;
+        let at = schema_row(&schemas, &name).ok_or_else(|| not_found("schema", &name))?;
         let schema_id = schemas.pks.get(at) as u64;
 
         let mut b = DdlBundle::default();
         for (family, scanned) in [(VIEW_TAB, views), (TABLE_TAB, tables)] {
             for i in scanned.live_rows() {
                 if payload_u64(&scanned, i, RELTAB_PAY_SCHEMA_ID) == schema_id {
-                    b.batch(family).copy_row_at(&scanned, i, -1);
+                    b.retract(family, &scanned, i);
                 }
             }
         }
-        b.batch(SCHEMA_TAB).copy_row_at(&schemas, at, -1);
+        b.retract(SCHEMA_TAB, &schemas, at);
         self.commit_ddl(b).await
     }
 
-    /// Register a table, its FOREIGN KEY columns and its inline UNIQUE indexes as
-    /// one DDL bundle. `fks[i]` is column `i`'s target; an empty `fks` gives no
-    /// column one.
-    pub async fn create_table(
-        &mut self,
-        table: &RelName,
-        schema: &Schema,
-        fks: &[Option<FkTarget>],
-        props: TableProps,
-        unique_indexes: &[InlineUniqueIndex],
-    ) -> Result<u64, ClientError> {
+    /// Register `def` as one DDL bundle and return the table's id.
+    pub async fn create_table(&mut self, def: &TableDef) -> Result<u64, ClientError> {
+        let TableDef {
+            name: table,
+            schema,
+            fks,
+            props,
+            unique_indexes,
+        } = def;
         let index_names: Vec<String> = unique_indexes
             .iter()
             .map(|spec| gnitz_wire::canonical_identifier(&spec.name))
@@ -1181,10 +1137,10 @@ impl GnitzClient {
             )));
         }
 
-        let (schemas, at) = self.lookup_schema(table.schema()).await?;
-        let schema_id = schemas.pks.get(at) as u64;
         // The table's id, then one per inline UNIQUE index.
-        let new_tid = self.alloc_ids(1 + unique_indexes.len() as u64).await?;
+        let (schema_id, new_tid) = self
+            .schema_and_ids(table.schema(), 1 + unique_indexes.len() as u64)
+            .await?;
 
         let mut b = DdlBundle::default();
         append_col_rows(&mut b, new_tid, schema.columns(), fks);
@@ -1240,24 +1196,21 @@ impl GnitzClient {
             pk_repeats: source.pk_repeats,
         };
         let bundle = ViewBundle {
+            name: view.clone(),
+            props,
+            replacing: None,
             segments: Vec::new(),
             view: planned,
             definition: passthrough_definition(source),
         };
-        self.create_view_chain(view, bundle, props, None).await
+        self.create_view_chain(bundle).await
     }
 
-    /// Create `bundle` as `view` in one atomic `DDL_TXN` and return its id.
-    /// `replace` is the id of the view it supersedes in the same zone. One that
-    /// already is `bundle` stays under its id, and nothing is written.
-    pub async fn create_view_chain(
-        &mut self,
-        view: &RelName,
-        bundle: ViewBundle,
-        props: ViewProps,
-        replace: Option<u64>,
-    ) -> Result<u64, ClientError> {
-        let view_name = view.name();
+    /// Create `bundle` in one atomic `DDL_TXN` and return its id. A view it
+    /// replaces that already is `bundle` stays under its id, and nothing is
+    /// written.
+    pub async fn create_view_chain(&mut self, bundle: ViewBundle) -> Result<u64, ClientError> {
+        let view = &bundle.name;
         let n_views = bundle.segments.len() + 1;
         if n_views > MAX_CHAIN_SEGMENTS {
             return Err(ClientError::from(format!(
@@ -1267,7 +1220,7 @@ impl GnitzClient {
         let n_segments = bundle.segments.len() as u64;
 
         let mut b = DdlBundle::default();
-        let schema_id = match replace {
+        let (schema_id, base) = match bundle.replacing {
             Some(vid) => {
                 // Where `bundle` stands if it is the chain under `vid`: one
                 // allocation holds a chain, the user-named view last.
@@ -1295,24 +1248,20 @@ impl GnitzClient {
                     .map_err(|e| ClientError::from(format!("view {vid}: {e}")))?
                     .definition;
                 let mut want = DdlBundle::default();
-                bundle.put_rows(&mut want, view_name, props, &standing_definition, schema_id, base);
+                bundle.put_rows(&mut want, &standing_definition, schema_id, base);
                 if want.same_rows(&standing) {
                     return Ok(vid);
                 }
                 // Only the user-named view, ahead of the new chain's `+1`s: the
                 // engine cascades its segments.
-                b.batch(VIEW_TAB).copy_row_at(views, i, -1);
-                schema_id
+                b.retract(VIEW_TAB, views, i);
+                (schema_id, self.alloc_ids(n_views as u64).await?)
             }
-            None => {
-                let (schemas, at) = self.lookup_schema(view.schema()).await?;
-                schemas.pks.get(at) as u64
-            }
+            None => self.schema_and_ids(view.schema(), n_views as u64).await?,
         };
 
-        let base = self.alloc_ids(n_views as u64).await?;
         let definition = bundle.definition.encode();
-        bundle.put_rows(&mut b, view_name, props, &definition, schema_id, base);
+        bundle.put_rows(&mut b, &definition, schema_id, base);
         self.commit_ddl(b).await?;
         Ok(base + n_segments)
     }
@@ -1338,18 +1287,11 @@ impl GnitzClient {
         if_exists: bool,
     ) -> Result<(), ClientError> {
         let mut b = DdlBundle::default();
-        let mut retired: Vec<u64> = Vec::with_capacity(names.len());
         for name in names {
-            let Some((scanned, i)) = self.relation_retraction(family, noun, name).await? else {
-                if if_exists {
-                    continue;
-                }
-                return Err(not_found(noun, name));
-            };
-            let id = scanned.pks.get(i) as u64;
-            if !retired.contains(&id) {
-                retired.push(id);
-                b.batch(family).copy_row_at(&scanned, i, -1);
+            match self.relation_retraction(family, noun, name).await? {
+                Some((scanned, i)) => b.retract(family, &scanned, i),
+                None if if_exists => {}
+                None => return Err(not_found(noun, name)),
             }
         }
         self.commit_ddl(b).await
@@ -1462,8 +1404,8 @@ impl GnitzClient {
     ) -> Result<(), ClientError> {
         let (scanned, i) = self.seek_sys_row(family, key, missing).await?;
         let mut b = DdlBundle::default();
+        b.retract(family, &scanned, i);
         let rows = b.batch(family);
-        rows.copy_row_at(&scanned, i, -1);
         rows.copy_row_at(&scanned, i, 1);
         patch(rows, 1);
         self.commit_ddl(b).await
@@ -1490,12 +1432,25 @@ impl GnitzClient {
 
     // --- Private catalog-lookup helpers ---
 
-    /// The live SCHEMA_TAB row named `schema_name` (already canonical): the scanned
-    /// batch and the row's index in it.
-    async fn lookup_schema(&mut self, schema_name: &str) -> Result<(ZSetBatch, usize), ClientError> {
-        let batch = self.sys_rows(SCHEMA_TAB, ReadBound::None).await?;
-        let i = schema_row(&batch, schema_name)?;
-        Ok((batch, i))
+    /// The id of the live schema `schema_name` (already canonical), `None` when
+    /// there is none.
+    pub async fn schema_id(&mut self, schema_name: &str) -> Result<Option<u64>, ClientError> {
+        let schemas = self.sys_rows(SCHEMA_TAB, ReadBound::None).await?;
+        Ok(schema_row(&schemas, schema_name).map(|i| schemas.pks.get(i) as u64))
+    }
+
+    /// The id of the live schema `schema_name` (already canonical) and the first
+    /// of `n` fresh catalog ids, asked for in one round trip. The ids a missing
+    /// schema leaves untaken are a gap in the id sequence and nothing more.
+    async fn schema_and_ids(&mut self, schema_name: &str, n: u64) -> Result<(u64, u64), ClientError> {
+        let all = ReadSpec::all_rows(ReadBound::None);
+        let schemas = self
+            .session
+            .submit_scan(SCHEMA_TAB.into(), &all, sys_schema(SCHEMA_TAB));
+        let ids = self.session.submit(Request::AllocIds(n));
+        let schemas = self.wait(schemas).await?.batch;
+        let at = schema_row(&schemas, schema_name).ok_or_else(|| not_found("schema", schema_name))?;
+        Ok((schemas.pks.get(at) as u64, self.wait(ids).await?))
     }
 
     /// `families`' rows under `spec`, with no DDL between them.
@@ -1536,64 +1491,6 @@ impl GnitzClient {
         let batch = self.sys_rows(family, ReadBound::PkSet(keys.keys())).await?;
         let i = batch.live_rows().next().ok_or_else(missing)?;
         Ok((batch, i))
-    }
-}
-
-/// A delta poll in flight: `items` in one request, handed out as each item's
-/// blocks and then its one end, the items in order. Dropping it drops what is
-/// left of its trains. A subscription it kept is its caller's only once
-/// [`Self::kept`] is recorded where the next sync names it from.
-pub(crate) struct DeltaPoll<'s> {
-    session: &'s mut Session,
-    /// Ends handed out so far: the index of the item being answered.
-    answered: usize,
-    items: usize,
-    /// The subscription id item 0 is kept as.
-    first_id: u64,
-}
-
-impl Drop for DeltaPoll<'_> {
-    fn drop(&mut self) {
-        self.session.abandon_poll();
-    }
-}
-
-impl<'s> DeltaPoll<'s> {
-    /// Poll `items`, item `i` kept as the subscription `first_id + i`.
-    pub(crate) fn start(session: &'s mut Session, first_id: u64, items: &[DeltaPollItem]) -> Self {
-        session.submit_delta_poll(first_id, items);
-        DeltaPoll {
-            session,
-            answered: 0,
-            items: items.len(),
-            first_id,
-        }
-    }
-
-    /// Everything the last step queued has been handed out.
-    pub(crate) fn drained(&self) -> bool {
-        self.session.polled_out()
-    }
-
-    /// The next block or end, with its item's index; `None` once every item
-    /// has ended. `Err` is the host's alone.
-    pub(crate) async fn next(&mut self, host: &mut dyn Host) -> Result<Option<(usize, Polled)>, ClientError> {
-        loop {
-            if let Some(next) = self.session.next_polled() {
-                let item = self.answered;
-                self.answered += matches!(next, Polled::End(_)) as usize;
-                return Ok(Some((item, next)));
-            }
-            if self.answered == self.items {
-                return Ok(None);
-            }
-            poll_fn(|cx| poll_turn(self.session, host, cx)).await?;
-        }
-    }
-
-    /// The id of the subscription `item`, which ended with a cursor, is kept as.
-    pub(crate) fn kept(&self, item: usize) -> u64 {
-        kept_as(self.first_id, item)
     }
 }
 
@@ -1725,14 +1622,12 @@ impl TxnBuffer {
     fn unwritten(&mut self, tid: u64, set: &PkKeys) -> Option<PkKeys> {
         self.index_tid(tid);
         let index = self.last_op_of.get(&tid)?;
-        let first = set.iter().position(|k| index.contains_key(k))?;
-        let stride = set.stride();
-        let mut rest = Vec::with_capacity(set.as_bytes().len() - stride);
-        rest.extend_from_slice(&set.as_bytes()[..first * stride]);
-        for k in set.iter().skip(first + 1).filter(|k| !index.contains_key(*k)) {
-            rest.extend_from_slice(k);
+        if !set.iter().any(|k| index.contains_key(k)) {
+            return None;
         }
-        Some(PkKeys::from_sorted(stride, rest))
+        let mut rest = set.clone();
+        rest.retain(|k| !index.contains_key(k));
+        Some(rest)
     }
 
     /// `committed`, a server read of `tid` under `spec`, as this transaction sees

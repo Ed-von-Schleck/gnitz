@@ -754,7 +754,7 @@ fn capacity_rules() {
         "SELECT t.id, d.s FROM t JOIN (SELECT g, SUM(v) AS s FROM u GROUP BY g) d ON t.id = d.g",
     ] {
         assert!(
-            !view(&cat, body).bundle.segments.is_empty(),
+            !view(&cat, body).segments.is_empty(),
             "`{body}` cuts a segment unbounded"
         );
         let sql = format!("CREATE VIEW v WITH (capacity = '1 MB') AS {body}");

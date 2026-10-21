@@ -1,6 +1,5 @@
 use super::*;
 use crate::protocol::wal_block::decode_wal_block_into;
-use crate::retraction_batch;
 use crate::test_support::{encode_wal_block, kv_schema};
 use gnitz_expr::{BatchView, CmpOp, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarEval, Sink};
 use gnitz_wire::{payload_str, payload_u64};
@@ -777,7 +776,7 @@ fn batches_round_trip_through_a_wal_block() {
     let mut a_keys = PkColumn::empty_for_schema(&a);
     a_keys.push_natives(&[10, 0]);
     a_keys.push_natives(&[20, 0]);
-    let a_retraction = retraction_batch(&a, a_keys);
+    let a_retraction = ZSetBatch::retraction(&a, a_keys);
     for (schema, batch) in [
         (fixture_a_schema(), fixture_a_batch()),
         (fixture_b_schema(), fixture_b_batch()),

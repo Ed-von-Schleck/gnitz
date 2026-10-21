@@ -214,6 +214,20 @@ impl PkKeys {
         self.bytes.chunks_exact(self.stride())
     }
 
+    /// Keep only the keys `keep` admits. A subsequence of an ascending list
+    /// ascends, so nothing is re-checked.
+    pub fn retain(&mut self, mut keep: impl FnMut(&[u8]) -> bool) {
+        let stride = self.stride();
+        let mut kept = 0;
+        for at in (0..self.bytes.len()).step_by(stride) {
+            if keep(&self.bytes[at..at + stride]) {
+                self.bytes.copy_within(at..at + stride, kept);
+                kept += stride;
+            }
+        }
+        self.bytes.truncate(kept);
+    }
+
     /// The first and last key, or `None` for an empty list.
     pub fn bounds(&self) -> Option<(&[u8], &[u8])> {
         let first = self.iter().next()?;

@@ -391,6 +391,19 @@ impl ZSetBatch {
         }
     }
 
+    /// The `-1` retraction batch for `pks`: the server's unique-PK rule
+    /// retracts by PK alone, so the payload columns are inert filler.
+    pub fn retraction(schema: &Schema, pks: PkColumn) -> Self {
+        let count = pks.len();
+        ZSetBatch {
+            pks,
+            weights: vec![-1; count],
+            nulls: vec![0; count],
+            payload: Self::filler_columns(schema, count),
+            blob: vec![],
+        }
+    }
+
     /// One region per payload slot, zero-filled for `count` rows.
     pub fn filler_columns(schema: &Schema, count: usize) -> Vec<PayloadColumn> {
         schema

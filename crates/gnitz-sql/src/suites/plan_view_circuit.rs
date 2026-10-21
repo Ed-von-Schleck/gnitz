@@ -91,7 +91,7 @@ fn cat() -> TestCatalog {
 }
 
 /// How many nodes of every segment are a `kind`.
-fn total(chain: &PlannedChain, kind: Node) -> usize {
+fn total(chain: &ViewBundle, kind: Node) -> usize {
     all_views(chain)
         .map(|pv| {
             pv.circuit
@@ -104,7 +104,7 @@ fn total(chain: &PlannedChain, kind: Node) -> usize {
 
 /// Every exchange of every segment, by the group columns of the reduce, top-N
 /// or window reading it.
-fn exchanges(chain: &PlannedChain) -> Vec<Option<Vec<u32>>> {
+fn exchanges(chain: &ViewBundle) -> Vec<Option<Vec<u32>>> {
     let mut out: Vec<Option<Vec<u32>>> = all_views(chain)
         .flat_map(|pv| {
             let circuit = &pv.circuit;
@@ -496,7 +496,7 @@ fn a_permutation_of_leading_pk_columns_groups_in_pk_order() {
 
 /// Every scatter key of the final view, as `(source, the columns it states)`, in
 /// circuit order: each re-key walked back to the scan it reads.
-fn scatter_keys(chain: &PlannedChain) -> Vec<(u64, Vec<u32>)> {
+fn scatter_keys(chain: &ViewBundle) -> Vec<(u64, Vec<u32>)> {
     use gnitz_wire::{MapKind, ReindexRole};
     let circuit = &final_view(chain).circuit;
     circuit
@@ -603,11 +603,11 @@ fn the_side_that_alone_outputs_its_unmatched_rows_is_scanned_second() {
 #[test]
 fn a_set_op_is_keyed_by_the_key_its_leaves_carry() {
     let cat = cat();
-    let maps = |chain: &PlannedChain, kind: fn(&gnitz_wire::MapKind) -> bool| {
+    let maps = |chain: &ViewBundle, kind: fn(&gnitz_wire::MapKind) -> bool| {
         all_views(chain).any(|pv| pv.circuit.ops().any(|(_, op)| matches!(op, OpNode::Map(m) if kind(m))))
     };
-    let hashes = |chain: &PlannedChain| maps(chain, |m| matches!(m, gnitz_wire::MapKind::HashRow { .. }));
-    let reindexes = |chain: &PlannedChain| maps(chain, |m| matches!(m, gnitz_wire::MapKind::Reindex { .. }));
+    let hashes = |chain: &ViewBundle| maps(chain, |m| matches!(m, gnitz_wire::MapKind::HashRow { .. }));
+    let reindexes = |chain: &ViewBundle| maps(chain, |m| matches!(m, gnitz_wire::MapKind::Reindex { .. }));
     // (body, key columns of the view with no hidden key, PK repeats)
     #[rustfmt::skip]
     let carried: &[(&str, &[u32], bool)] = &[

@@ -13,14 +13,13 @@ use std::time::Duration;
 use std::future::Future;
 
 use gnitz_core::{
-    block_on, BatchAppender, ClientError, GnitzClient, PkColumn, PollResult, RelName, ScanReply, Schema, ZSetBatch,
+    block_on, BatchAppender, ClientError, GnitzClient, PkColumn, PollResult, RelName, ScanReply, Schema, TableDef,
+    ZSetBatch,
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
 use gnitz_tokio::AsyncClient;
-use gnitz_wire::{
-    read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewBudget, ViewProps, WireConflictMode,
-};
+use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TypeCode, ViewBudget, ViewProps, WireConflictMode};
 use support::settled;
 use tokio::runtime::Runtime;
 
@@ -48,7 +47,7 @@ fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
     let sn = unique_schema("tokio");
     block_on(client.create_schema(&sn)).unwrap();
     let schema = schema();
-    let tid = block_on(client.create_table(&rel(&sn, "t"), &schema, &[], TableProps::default(), &[])).unwrap();
+    let tid = block_on(client.create_table(&TableDef::new(rel(&sn, "t"), schema.clone()))).unwrap();
     (client, tid, Arc::new(schema), sn)
 }
 

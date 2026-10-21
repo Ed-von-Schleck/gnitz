@@ -72,7 +72,7 @@ fn pages_of_a_compound_key_return_every_row_once() {
         ColumnDef::new("v", TypeCode::I64, false),
     ];
     let schema = Arc::new(Schema::from_parts(cols, &[0, 1]).unwrap());
-    let tid = block_on(client.create_table(&rel(&sn, "t"), &schema, &[], TableProps::default(), &[])).unwrap();
+    let tid = block_on(client.create_table(&TableDef::new(rel(&sn, "t"), Schema::clone(&schema)))).unwrap();
     let mut batch = ZSetBatch::new(&schema);
     let mut app = BatchAppender::new(&mut batch);
     let mut want = Vec::new();
@@ -110,7 +110,11 @@ fn a_replicated_table_is_read_once() {
         distribution: TableDistribution::Replicated,
         ..TableProps::default()
     };
-    let tid = block_on(client.create_table(&rel(&sn, "t"), &schema, &[], props, &[])).unwrap();
+    let tid = block_on(client.create_table(&TableDef {
+        props,
+        ..TableDef::new(rel(&sn, "t"), Schema::clone(&schema))
+    }))
+    .unwrap();
     push(&mut client, tid, &schema, rows(&schema, 0..100));
     let id = block_on(client.snapshot_open()).unwrap();
     let page = block_on(client.snapshot_page(id, tid, &[], 40, &schema)).unwrap();
@@ -146,7 +150,11 @@ fn a_page_takes_every_workers_share_however_its_keys_interleave() {
         distribution: TableDistribution::Keyed { prefix_len: 1 },
         ..TableProps::default()
     };
-    let tid = block_on(client.create_table(&rel(&sn, "t"), &schema, &[], props, &[])).unwrap();
+    let tid = block_on(client.create_table(&TableDef {
+        props,
+        ..TableDef::new(rel(&sn, "t"), Schema::clone(&schema))
+    }))
+    .unwrap();
     let mut batch = ZSetBatch::new(&schema);
     let mut app = BatchAppender::new(&mut batch);
     for a in 0i64..64 {
@@ -188,7 +196,7 @@ fn a_snapshot_holds_the_catalog_and_the_tables_of_its_cut() {
 
     block_on(client.drop_table(&[rel(&sn, "t")], false)).unwrap();
     let later = schema_of(&[("pk", TypeCode::U64)]);
-    block_on(client.create_table(&rel(&sn, "u"), &later, &[], TableProps::default(), &[])).unwrap();
+    block_on(client.create_table(&TableDef::new(rel(&sn, "u"), later.clone()))).unwrap();
 
     let catalog = block_on(client.snapshot_catalog(id)).unwrap();
     assert!(catalog.get(&rel(&sn, "t")).is_some_and(|r| r.id == tid));
@@ -209,7 +217,11 @@ fn a_snapshot_holds_the_serial_positions_of_its_cut() {
     block_on(client.create_schema(&sn)).unwrap();
     let schema = schema_of(&[("id", TypeCode::I64), ("v", TypeCode::I64)]);
     let props = TableProps { serial: true, ..TableProps::default() };
-    let tid = block_on(client.create_table(&rel(&sn, "t"), &schema, &[], props, &[])).unwrap();
+    let tid = block_on(client.create_table(&TableDef {
+        props,
+        ..TableDef::new(rel(&sn, "t"), schema.clone())
+    }))
+    .unwrap();
     let desc = block_on(client.resolve_relation(&rel(&sn, "t"))).unwrap();
     let base = block_on(client.reserve_serial_ids(&desc, 40_000)).unwrap();
     let id = block_on(client.snapshot_open()).unwrap();

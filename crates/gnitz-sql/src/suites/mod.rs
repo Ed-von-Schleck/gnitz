@@ -14,12 +14,12 @@ mod plan_view_window;
 mod view_definition;
 
 use crate::bind::Catalog;
-use crate::ddl::{plan_alter_view, plan_create_view, PlannedChain};
+use crate::ddl::{plan_alter_view, plan_create_view};
 use crate::dml::ReadPlan;
 use crate::error::GnitzSqlError;
 use crate::source::split_statements;
 use crate::test_support::*;
-use gnitz_core::PlannedView;
+use gnitz_core::{PlannedView, ViewBundle};
 use gnitz_wire::{OpNode, RelClass, TypeCode};
 use sqlparser::ast::Statement;
 
@@ -86,7 +86,7 @@ fn base() -> TestCatalog {
 
 /// Plan a `CREATE VIEW` / `ALTER VIEW … AS` against `cat`. None of the statements
 /// here carry `IF NOT EXISTS`, the one clause that plans nothing.
-fn plan(cat: &dyn Catalog, sql: &str) -> Result<PlannedChain, GnitzSqlError> {
+fn plan(cat: &dyn Catalog, sql: &str) -> Result<ViewBundle, GnitzSqlError> {
     let (stmt, text) = split_statements(sql).expect("parses").remove(0);
     match stmt {
         Statement::CreateView(cv) => {
@@ -105,27 +105,27 @@ fn read(cat: &dyn Catalog, sql: &str) -> Result<ReadPlan, GnitzSqlError> {
 }
 
 /// The user-named view of a planned chain.
-fn final_view(chain: &PlannedChain) -> &PlannedView {
-    &chain.bundle.view
+fn final_view(chain: &ViewBundle) -> &PlannedView {
+    &chain.view
 }
 
 /// Every view of a planned chain, its segments first.
-fn all_views(chain: &PlannedChain) -> impl Iterator<Item = &PlannedView> {
-    chain.bundle.segments.iter().chain([&chain.bundle.view])
+fn all_views(chain: &ViewBundle) -> impl Iterator<Item = &PlannedView> {
+    chain.segments.iter().chain([&chain.view])
 }
 
 /// How many views a planned chain commits, the user-named view included.
-fn view_count(chain: &PlannedChain) -> usize {
-    chain.bundle.segments.len() + 1
+fn view_count(chain: &ViewBundle) -> usize {
+    chain.segments.len() + 1
 }
 
 /// `CREATE VIEW v AS <body>` planned against `cat`, unwrapped.
-fn view(cat: &dyn Catalog, body: &str) -> PlannedChain {
+fn view(cat: &dyn Catalog, body: &str) -> ViewBundle {
     plan(cat, &format!("CREATE VIEW v AS {body}")).unwrap_or_else(|e| panic!("`{body}`: {e:?}"))
 }
 
 /// The final view's output columns as `(name, hidden, nullable)`.
-fn output_shape(chain: &PlannedChain) -> Vec<(String, bool, bool)> {
+fn output_shape(chain: &ViewBundle) -> Vec<(String, bool, bool)> {
     final_view(chain)
         .schema
         .columns()

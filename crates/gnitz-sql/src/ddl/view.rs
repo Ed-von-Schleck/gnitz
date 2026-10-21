@@ -10,7 +10,7 @@ use crate::hir::ViewBody;
 use crate::ir::BExpr;
 use crate::rules::{require_class, ClassWant};
 use crate::source::StatementText;
-use gnitz_core::{GnitzClient, RelName, ViewBundle};
+use gnitz_core::{RelName, ViewBundle};
 use gnitz_wire::{ViewBudget, ViewProps};
 use std::num::NonZeroU64;
 
@@ -153,21 +153,12 @@ fn reject_unhonored_create_view_clauses(cv: &sqlparser::ast::CreateView) -> Resu
     Ok(())
 }
 
-/// A planned view: its segment bundle, and the view it supersedes.
-pub(crate) struct PlannedChain {
-    pub(crate) name: RelName,
-    pub(crate) bundle: ViewBundle,
-    pub(crate) props: ViewProps,
-    /// The id of the view this chain supersedes.
-    pub(crate) replacing: Option<u64>,
-}
-
 /// Plan a `CREATE VIEW`; `None` when `IF NOT EXISTS` finds the name taken.
 pub(crate) fn plan_create_view(
     cv: &CreateView,
     text: StatementText<'_>,
     cat: &dyn Catalog,
-) -> Result<Option<PlannedChain>, GnitzSqlError> {
+) -> Result<Option<ViewBundle>, GnitzSqlError> {
     reject_unhonored_create_view_clauses(cv)?;
     let view_name = extract_object_name(&cv.name, cat.schema_name(), "CREATE VIEW")?;
 
@@ -194,13 +185,7 @@ pub(crate) fn plan_create_view(
     let props = decode_view_options(&cv.options)?;
     let view = ViewBody { stmt: "CREATE VIEW", replacing };
     let aliases = cv.columns.iter().map(|c| &c.name);
-    let bundle = plan_segments(cat, view, &cv.query, text, aliases, props)?;
-    Ok(Some(PlannedChain {
-        name: view_name,
-        bundle,
-        props,
-        replacing,
-    }))
+    plan_segments(cat, view_name, view, &cv.query, text, aliases, props).map(Some)
 }
 
 /// Plan an `ALTER VIEW <name> [(columns)] AS <query>`: the chain that supersedes
@@ -212,7 +197,7 @@ pub(crate) fn plan_alter_view(
     with_options: &[sqlparser::ast::SqlOption],
     text: StatementText<'_>,
     cat: &dyn Catalog,
-) -> Result<PlannedChain, GnitzSqlError> {
+) -> Result<ViewBundle, GnitzSqlError> {
     // Only `CREATE OR REPLACE VIEW` states a view's options.
     reject_if(!with_options.is_empty(), "ALTER VIEW", "WITH options")?;
     let named = extract_object_name(name, cat.schema_name(), "ALTER VIEW")?;
@@ -223,20 +208,15 @@ pub(crate) fn plan_alter_view(
         stmt: "ALTER VIEW",
         replacing: Some(old_vid),
     };
-    let props = ViewProps::default();
-    let bundle = plan_segments(cat, view, query, text, columns.iter(), props)?;
-    Ok(PlannedChain {
-        name: named,
-        bundle,
-        props,
-        replacing: Some(old_vid),
-    })
+    plan_segments(cat, named, view, query, text, columns.iter(), ViewProps::default())
 }
 
-/// Compile a view body to its segment bundle, the user-named view's visible
-/// output columns renamed by `aliases`, carrying the definition `text` declares.
+/// Compile a view body to its segment bundle under `name`, the user-named view's
+/// visible output columns renamed by `aliases`, carrying the definition `text`
+/// declares.
 fn plan_segments<'a>(
     cat: &dyn Catalog,
+    name: RelName,
     view: ViewBody,
     query: &Query,
     text: StatementText<'_>,
@@ -244,20 +224,17 @@ fn plan_segments<'a>(
     props: ViewProps,
 ) -> Result<ViewBundle, GnitzSqlError> {
     let bounded = matches!(props.budget, ViewBudget::Bounded { .. });
+    let replacing = view.replacing;
     let lowered = crate::hir::bind_and_lower(cat, query, view, bounded, aliases)?;
     let definition = record_definition(text, &lowered)?;
     Ok(ViewBundle {
+        name,
+        props,
+        replacing,
         segments: lowered.segments,
         view: lowered.view,
         definition,
     })
-}
-
-/// Commit a planned `CREATE VIEW` or `ALTER VIEW … AS`.
-pub(crate) async fn execute_view_chain(client: &mut GnitzClient, chain: PlannedChain) -> Result<(), GnitzSqlError> {
-    let PlannedChain { name, bundle, props, replacing } = chain;
-    client.create_view_chain(&name, bundle, props, replacing).await?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -167,6 +167,10 @@ fn pk_keys_from_images_is_the_byte_sort() {
         let (first, last) = (&want[0][..], &want[want.len() - 1][..]);
         assert_eq!(k.bounds(), Some((first, last)), "stride {stride}");
         assert_eq!(PkKeys::from_sorted(stride, want.concat()), k, "stride {stride}");
+        let mut ones = k.clone();
+        ones.retain(|key| key[stride - 1] == 1);
+        let want_ones = want.iter().filter(|key| key[stride - 1] == 1).map(|key| &key[..]);
+        assert_eq!(ones, PkKeys::from_keys(stride, want_ones), "stride {stride}");
         if stride <= NARROW_PK_MAX_BYTES {
             let images = raw.iter().map(|k| crate::widen_pk_be(k));
             assert_eq!(PkKeys::from_images(stride, images), k, "stride {stride}");

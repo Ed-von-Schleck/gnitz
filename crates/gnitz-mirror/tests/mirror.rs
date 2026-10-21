@@ -20,7 +20,7 @@ mod support;
 mod bench;
 
 use gnitz_core::block_on;
-use gnitz_core::{ClientError, GnitzClient, MirrorError, PollOutcome, PollResult, RelName, Schema};
+use gnitz_core::{ClientError, GnitzClient, MirrorError, PollOutcome, PollResult, RelName, Schema, TableDef};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::GnitzSqlError;
 use gnitz_test_harness::ServerHandle;
@@ -1145,7 +1145,7 @@ impl Reader {
     fn bootstrap(client: &mut GnitzClient) -> Reader {
         let desc = block_on(client.resolve_relation(&rel("s", "v_keyed"))).expect("resolve");
         let whole = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
-        let (rows, cursor) = block_on(client.delta_bootstrap(&*desc, &desc.schema, &whole)).expect("bootstrap");
+        let (rows, cursor) = block_on(client.delta_read(&*desc, None, &desc.schema, &whole)).expect("bootstrap");
         let copy = canonical(&(rows.schema, rows.batch));
         Reader { desc, whole, copy, cursor }
     }
@@ -1222,7 +1222,7 @@ fn a_sync_hands_a_reader_the_deltas_pushed_for_it() {
         .pushed
         .is_empty());
     let (desc, whole) = (reader.desc.clone(), reader.whole.clone());
-    let polled = block_on(fx.direct.delta_poll(&*desc, reader.cursor, &desc.schema, &whole)).expect("poll");
+    let polled = block_on(fx.direct.delta_read(&*desc, Some(reader.cursor), &desc.schema, &whole)).expect("poll");
     assert!(reader.apply(polled) > 0);
     reader.assert_converged(&mut fx.direct, "after a delta read from the subscription's cursor");
 }
@@ -1394,7 +1394,11 @@ fn a_reconnect_ends_a_readers_subscription() {
     assert!(pushed.is_empty() && ended.sub == sub && ended.result.is_err());
 
     let (desc, whole) = (reader.desc.clone(), reader.whole.clone());
-    let polled = block_on(fx.mirror().delta_poll(&*desc, reader.cursor, &desc.schema, &whole)).expect("poll");
+    let polled = block_on(
+        fx.mirror()
+            .delta_read(&*desc, Some(reader.cursor), &desc.schema, &whole),
+    )
+    .expect("poll");
     assert!(reader.apply(polled) > 0);
     let again = reader.subscribe(fx.mirror());
     assert_ne!(again, sub, "an id is one subscription's");
@@ -1468,10 +1472,13 @@ fn a_whole_read_of_nothing_is_answered_with_a_cursor() {
     .expect("a subscription that keeps no row");
 
     let (rows, cursor) =
-        block_on(fx.direct.delta_bootstrap(&*sub.upstream, &sub.schema, &sub.spec)).expect("a whole read");
+        block_on(fx.direct.delta_read(&*sub.upstream, None, &sub.schema, &sub.spec)).expect("a whole read");
     assert_eq!(rows.batch.len(), 0);
-    let (rows, next) = block_on(fx.direct.delta_poll(&*sub.upstream, cursor, &sub.schema, &sub.spec))
-        .expect("the cursor is the feed's own");
+    let (rows, next) = block_on(
+        fx.direct
+            .delta_read(&*sub.upstream, Some(cursor), &sub.schema, &sub.spec),
+    )
+    .expect("the cursor is the feed's own");
     assert_eq!((rows.batch.len(), next.tag), (0, cursor.tag));
 }
 
@@ -1558,14 +1565,8 @@ fn seed_shapes(client: &mut GnitzClient) {
         gnitz_wire::ColumnDef::new("id", gnitz_wire::TypeCode::I64, false),
         gnitz_wire::ColumnDef::new("b", gnitz_wire::TypeCode::Blob, true),
     ];
-    block_on(client.create_table(
-        &rel(SH, "blb"),
-        &Schema::from_parts(cols, &[0]).unwrap(),
-        &[],
-        gnitz_wire::TableProps::default(),
-        &[],
-    ))
-    .expect("a BLOB column is admissible through the binary API");
+    let def = TableDef::new(rel(SH, "blb"), Schema::from_parts(cols, &[0]).unwrap());
+    block_on(client.create_table(&def)).expect("a BLOB column is admissible through the binary API");
 }
 
 /// Fresh keys in every table: `u` reaching only halfway up `t`'s range, every

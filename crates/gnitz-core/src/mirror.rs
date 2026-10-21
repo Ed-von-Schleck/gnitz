@@ -36,12 +36,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use crate::client::{offload, BoxFut, DeltaPoll, GnitzClient, Host};
-use crate::connection::{DeltaCursor, Polled, RawBlock, RelDescriptor, Target};
+use crate::client::{offload, poll_turn, BoxFut, GnitzClient, Host};
+use crate::connection::{DeltaCursor, Polled, RawBlock, RelDescriptor, Session, Target};
 use crate::error::ClientError;
 use crate::{RelName, Schema, ZSetBatch};
-use gnitz_wire::txn_frame::DeltaPollItem;
+use gnitz_wire::txn_frame::{kept_as, DeltaPollItem};
 use gnitz_wire::RelClass;
+use gnitz_wire::{payload_str, RELTAB_PAY_NAME, VIEW_TAB};
+use std::future::poll_fn;
 
 // ---------------------------------------------------------------------------
 // The store
@@ -297,7 +299,7 @@ impl MirroredView {
     }
 
     /// This registration under another name.
-    pub(crate) fn renamed(&self, name: RelName) -> Self {
+    fn renamed(&self, name: RelName) -> Self {
         MirroredView { name, ..self.clone() }
     }
 
@@ -493,7 +495,7 @@ impl GnitzClient {
     }
 
     /// Record `entry` as mirrored, under its descriptor's id, which is returned.
-    pub(crate) async fn bind(&mut self, mut entry: MirroredView) -> Result<u64, ClientError> {
+    async fn bind(&mut self, mut entry: MirroredView) -> Result<u64, ClientError> {
         let tid = entry.desc.tid;
         let store = self.mirror_state()?.store.clone();
         let (rel, registered) = (entry.name.clone(), Arc::clone(&entry.desc));
@@ -621,6 +623,7 @@ impl GnitzClient {
             let from = |tid: &u64| store.cursor_of(*tid).filter(|_| !whole.contains(tid));
             tids.iter().map(from).collect()
         };
+        let first = *next_sub;
         let mut poll = {
             let item = |(tid, from): (&u64, &Option<DeltaCursor>)| {
                 let view = views.get(tid);
@@ -630,7 +633,7 @@ impl GnitzClient {
             };
             let items: Result<Vec<DeltaPollItem>, ClientError> = tids.iter().zip(&froms).map(item).collect();
             let items = items?;
-            let first = std::mem::replace(next_sub, *next_sub + items.len() as u64);
+            *next_sub += items.len() as u64;
             DeltaPoll::start(session, first, &items)
         };
         let mut done = Vec::with_capacity(tids.len());
@@ -691,7 +694,7 @@ impl GnitzClient {
                             (None, Ok(_)) => Ok(()),
                         };
                         if let (Ok(()), Some(view)) = (&read, views.get_mut(&tid)) {
-                            view.subscribed(poll.kept(i));
+                            view.subscribed(kept_as(first, i));
                         }
                         done.push((tid, read));
                     }
@@ -710,7 +713,7 @@ impl GnitzClient {
                 let advanced = store.clone().advance(host, std::mem::take(&mut due)).await?;
                 for (i, (tid, advanced)) in ended.drain(..).zip(advanced) {
                     if let (Ok(()), Some(view)) = (&advanced, views.get_mut(&tid)) {
-                        view.subscribed(poll.kept(i));
+                        view.subscribed(kept_as(first, i));
                     }
                     done.push((tid, advanced));
                 }
@@ -837,6 +840,58 @@ impl GnitzClient {
             .await
     }
 
+    /// After this client's own DDL `families` committed: drop the copy of every
+    /// view it retracted, except a mirrored view it also wrote back — a rename —
+    /// which is rebound under its new name.
+    pub(crate) async fn ddl_committed(&mut self, families: &[(u64, ZSetBatch)]) {
+        let GnitzClient { mirror, host, .. } = self;
+        let Some(m) = mirror.as_deref_mut() else {
+            return;
+        };
+        let Some((_, b)) = families.iter().find(|(family, _)| *family == VIEW_TAB) else {
+            return;
+        };
+        let vid = |i| b.pks.get(i) as u64;
+        let mut dropped: Vec<u64> = Vec::new();
+        let mut renamed = Vec::new();
+        for v in (0..b.len()).filter(|&i| b.weights[i] < 0).map(vid) {
+            let written_back = m
+                .views
+                .get(&v)
+                .and_then(|view| Some((view, b.live_rows().find(|&j| vid(j) == v)?)));
+            match written_back {
+                Some((view, j)) => renamed.push(
+                    view.renamed(
+                        payload_str(b, j, RELTAB_PAY_NAME)
+                            .ok()
+                            .and_then(|new| view.name.sibling(&new).ok())
+                            .expect("a bundle this client built names its views"),
+                    ),
+                ),
+                None => dropped.push(v),
+            }
+        }
+        if !dropped.is_empty() {
+            // Asked of the store whether or not this client registered them,
+            // as `forget_view` does.
+            for v in &dropped {
+                m.views.remove(v);
+            }
+            let forget = move |s: &mut dyn MirrorStore| {
+                for v in dropped {
+                    let _ = s.forget(v);
+                }
+            };
+            let _ = m.store.clone().run(&mut **host, forget).await;
+        }
+        for entry in renamed {
+            let tid = entry.desc.tid;
+            if self.bind(entry).await.is_err() {
+                let _ = self.forget_view(tid).await;
+            }
+        }
+    }
+
     /// Stop mirroring `table_id`: its record is retracted, its directory
     /// removed, and a later read of it is delegated upstream.
     pub async fn forget_view(&mut self, table_id: u64) -> Result<(), ClientError> {
@@ -953,6 +1008,52 @@ impl GnitzClient {
         match self.mirror_state()?.store.get().poisoned() {
             Some(why) => Err(MirrorError::Poisoned(why.to_string()).into()),
             None => Ok(()),
+        }
+    }
+}
+
+/// A delta poll in flight: `items` in one request, handed out as each item's
+/// blocks and then its one end, the items in order. Dropping it drops what is
+/// left of its trains. A subscription it kept, item `i` as `kept_as(first, i)`,
+/// is its caller's only once recorded where the next sync names it from.
+pub(crate) struct DeltaPoll<'s> {
+    session: &'s mut Session,
+    /// Ends handed out so far: the index of the item being answered.
+    answered: usize,
+    items: usize,
+}
+
+impl Drop for DeltaPoll<'_> {
+    fn drop(&mut self) {
+        self.session.abandon_poll();
+    }
+}
+
+impl<'s> DeltaPoll<'s> {
+    /// Poll `items`, item `i` kept as the subscription `kept_as(first, i)`.
+    pub(crate) fn start(session: &'s mut Session, first: u64, items: &[DeltaPollItem]) -> Self {
+        session.submit_delta_poll(first, items);
+        DeltaPoll { session, answered: 0, items: items.len() }
+    }
+
+    /// Everything the last step queued has been handed out.
+    pub(crate) fn drained(&self) -> bool {
+        self.session.polled_out()
+    }
+
+    /// The next block or end, with its item's index; `None` once every item
+    /// has ended. `Err` is the host's alone.
+    pub(crate) async fn next(&mut self, host: &mut dyn Host) -> Result<Option<(usize, Polled)>, ClientError> {
+        loop {
+            if let Some(next) = self.session.next_polled() {
+                let item = self.answered;
+                self.answered += matches!(next, Polled::End(_)) as usize;
+                return Ok(Some((item, next)));
+            }
+            if self.answered == self.items {
+                return Ok(None);
+            }
+            poll_fn(|cx| poll_turn(self.session, host, cx)).await?;
         }
     }
 }

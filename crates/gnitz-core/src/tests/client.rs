@@ -9,7 +9,7 @@ use WireConflictMode::{Error, Update};
 
 fn del(pk: u64) -> ZSetBatch {
     let s = Arc::new(kv_schema(TypeCode::I64));
-    retraction_batch(&s, PkColumn::from_natives(&s, [pk as u128]))
+    ZSetBatch::retraction(&s, PkColumn::from_natives(&s, [pk as u128]))
 }
 
 /// `(pk, v, weight)` of a `kv_schema(I64)` batch, sorted.
@@ -281,10 +281,12 @@ fn create_table_refuses_an_fk_it_cannot_write() {
         on_delete: gnitz_wire::sys_rows::FkAction::Restrict,
     }));
     for fks in [vec![fk], vec![None, fk, None]] {
-        let err = block_on(c.create_table(&rel("public", "t"), &schema, &fks, TableProps::default(), &[]))
-            .unwrap_err()
-            .to_string();
         let want = format!("{} foreign-key slots for 2 columns", fks.len());
+        let def = TableDef {
+            fks,
+            ..TableDef::new(rel("public", "t"), schema.clone())
+        };
+        let err = block_on(c.create_table(&def)).unwrap_err().to_string();
         assert!(err.contains(&want), "{err}");
     }
 }

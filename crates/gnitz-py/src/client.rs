@@ -15,13 +15,13 @@ use pyo3::types::{PyDict, PyList};
 use pyo3::IntoPyObjectExt;
 
 use gnitz_core::{
-    retraction_batch, BoxFut, ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, Pushed, RelName,
-    ScanReply, Sent, Synced,
+    BoxFut, ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, Pushed, RelName, ScanReply, Sent, Synced,
+    TableDef, ZSetBatch,
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::{GnitzSqlError, SqlResult};
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
-use gnitz_wire::{TableProps, ViewProps, WireConflictMode};
+use gnitz_wire::{ViewProps, WireConflictMode};
 
 use crate::client_err;
 use crate::drive::{Blocking, LoopHandle, PyPipeline};
@@ -302,10 +302,7 @@ impl PyClient {
         let table = Self::relation(slf, &table_name)?;
         Self::run(
             slf,
-            whole!(|c| {
-                c.create_table(&table, &schema.rust, &[], TableProps::default(), &[])
-                    .await?
-            }),
+            whole!(|c| c.create_table(&TableDef::new(table, (*schema.rust).clone())).await?),
             |py, tid| tid.into_py_any(py),
         )
     }
@@ -342,7 +339,7 @@ impl PyClient {
         schema: PySchema,
         pks: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let batch = retraction_batch(&schema.rust, py_pks_to_column(&schema.rust, &pks)?);
+        let batch = ZSetBatch::retraction(&schema.rust, py_pks_to_column(&schema.rust, &pks)?);
         Self::run(
             slf,
             single!(|c| c.push(target_id, &schema.rust, batch, WireConflictMode::Update)),
@@ -445,7 +442,11 @@ impl PyClient {
         spec: Option<Vec<u8>>,
     ) -> PyResult<Py<PyAny>> {
         let spec = spec.unwrap_or_else(whole_view);
-        Self::run(slf, single!(|c| c.delta_bootstrap(view_id, &schema.rust, &spec)), delta)
+        Self::run(
+            slf,
+            single!(|c| c.delta_read(view_id, None, &schema.rust, &spec)),
+            delta,
+        )
     }
 
     /// delta_poll(view_id, schema, cursor, spec=None) -> (rows, cursor)
@@ -467,7 +468,7 @@ impl PyClient {
         let spec = spec.unwrap_or_else(whole_view);
         Self::run(
             slf,
-            single!(|c| c.delta_poll(view_id, cursor, &schema.rust, &spec)),
+            single!(|c| c.delta_read(view_id, Some(cursor), &schema.rust, &spec)),
             delta,
         )
     }

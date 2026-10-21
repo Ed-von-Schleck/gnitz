@@ -31,13 +31,8 @@ impl RelationRegistry {
             Probe::PkColumn(col) => {
                 keyed_as(relation.schema().pk_stride())?;
                 let table = relation.table();
-                let live: Vec<u8> = keys
-                    .iter()
-                    .filter(|k| table.has_pk_bytes(k))
-                    .flatten()
-                    .copied()
-                    .collect();
-                let live = PkKeys::from_sorted(keys.stride(), live);
+                let mut live = keys;
+                live.retain(|k| table.has_pk_bytes(k));
                 relation.gather(live, Cut::Now).project_live(&[col])
             }
             Probe::Index(cols, cap) => {

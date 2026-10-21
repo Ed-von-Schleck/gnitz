@@ -16,7 +16,7 @@ use gnitz_core::block_on;
 use std::sync::Arc;
 
 use gnitz_core::{
-    BatchAppender, ClientError, GnitzClient, Interest, RelName, Request, Schema, Sent, Session, ZSetBatch,
+    BatchAppender, ClientError, GnitzClient, Interest, RelName, Request, Schema, Sent, Session, TableDef, ZSetBatch,
 };
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, WireConflictMode};
@@ -42,7 +42,7 @@ fn schema_of(columns: &[(&str, TypeCode)]) -> Schema {
 fn create_table(client: &mut GnitzClient, schema: Schema) -> (String, u64, Arc<Schema>) {
     let sn = unique_schema("t");
     block_on(client.create_schema(&sn)).unwrap();
-    let tid = block_on(client.create_table(&rel(&sn, "t"), &schema, &[], TableProps::default(), &[])).unwrap();
+    let tid = block_on(client.create_table(&TableDef::new(rel(&sn, "t"), schema.clone()))).unwrap();
     (sn, tid, Arc::new(schema))
 }
 

@@ -8,10 +8,11 @@ use gnitz_wire::{PkColList, RelClass, TableDistribution, TypeCode};
 
 use super::*;
 
-use crate::ddl::{plan_create_table, TablePlan};
+use crate::ddl::plan_create_table;
+use gnitz_core::TableDef;
 
 /// Plan `sql` against `cat`. The statement must parse as a `CREATE TABLE`.
-fn plan_table(cat: &dyn Catalog, sql: &str) -> Result<Option<TablePlan>, GnitzSqlError> {
+fn plan_table(cat: &dyn Catalog, sql: &str) -> Result<Option<TableDef>, GnitzSqlError> {
     match parse_stmt(sql) {
         sqlparser::ast::Statement::CreateTable(c) => plan_create_table(&c, cat),
         other => panic!("`{sql}` is not a CREATE TABLE: {other}"),
@@ -19,7 +20,7 @@ fn plan_table(cat: &dyn Catalog, sql: &str) -> Result<Option<TablePlan>, GnitzSq
 }
 
 /// The bundle of a plan expected to create.
-fn created(cat: &dyn Catalog, sql: &str) -> TablePlan {
+fn created(cat: &dyn Catalog, sql: &str) -> TableDef {
     plan_table(cat, sql)
         .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
         .unwrap_or_else(|| panic!("`{sql}` planned nothing"))

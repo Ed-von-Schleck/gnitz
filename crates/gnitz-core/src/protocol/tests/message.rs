@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{decode_wal_block, kv_rows, kv_schema};
-use crate::{retraction_batch, PkColumn, Schema, ZSetBatch};
+use crate::{PkColumn, Schema, ZSetBatch};
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::TypeCode;
 use gnitz_wire::{ClientVerb, WireConflictMode};
@@ -28,7 +28,7 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     let schema = Arc::new(kv_schema(TypeCode::I64));
     let b0 = kv_rows(&[(1, 10, 1), (2, 20, 1)]);
     let b1 = kv_rows(&[(3, 30, 1)]);
-    let b2 = retraction_batch(&schema, PkColumn::from_natives(&schema, [4]));
+    let b2 = ZSetBatch::retraction(&schema, PkColumn::from_natives(&schema, [4]));
 
     let family = |tid: u64, batch, mode, basis| PushFamily {
         target: tid.into(),

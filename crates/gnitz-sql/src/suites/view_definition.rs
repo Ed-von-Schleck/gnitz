@@ -72,8 +72,8 @@ fn client_catalog(cat: &TestCatalog, names: &[String]) -> Catalog {
     Catalog { schemas: vec![SN.to_string()], relations }
 }
 
-fn definition(chain: &PlannedChain) -> &ViewDefinition {
-    &chain.bundle.definition
+fn definition(chain: &ViewBundle) -> &ViewDefinition {
+    &chain.definition
 }
 
 /// One chain member as committed: its encoded circuit, its key and its
@@ -82,7 +82,7 @@ type Member = (Vec<u8>, Vec<u32>, bool);
 
 /// What a chain commits that a reader can tell apart: every member, and the
 /// user-named view's visible columns.
-fn shape(chain: &PlannedChain) -> (Vec<Member>, Vec<String>) {
+fn shape(chain: &ViewBundle) -> (Vec<Member>, Vec<String>) {
     let members = all_views(chain)
         .map(|v| (v.circuit.encode(), v.schema.pk_cols().to_vec(), v.pk_repeats))
         .collect();

@@ -14,11 +14,5 @@ mod view;
 
 pub(crate) use alter::execute_alter_table;
 pub(crate) use schema::execute_create_schema;
-#[cfg(test)]
-pub(crate) use table::TablePlan;
-pub(crate) use table::{
-    execute_create_index, execute_create_table, execute_drop, plan_create_table, table_with_options, TABLE_OPTIONS,
-};
-#[cfg(test)]
-pub(crate) use view::PlannedChain;
-pub(crate) use view::{execute_view_chain, plan_alter_view, plan_create_view, view_with_options, VIEW_OPTIONS};
+pub(crate) use table::{execute_create_index, execute_drop, plan_create_table, table_with_options, TABLE_OPTIONS};
+pub(crate) use view::{plan_alter_view, plan_create_view, view_with_options, VIEW_OPTIONS};

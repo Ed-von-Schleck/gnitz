@@ -236,7 +236,7 @@ fn read_back(srv: &mut ServerHandle, target: &str) -> Result<(), String> {
         };
         let read = block_on(client.resolve_relation(&name)).and_then(|desc| {
             let spec = ReadSpec::all_rows(ReadBound::None);
-            block_on(client.scan_spec(Target { tid: desc.tid, token: desc.token }, &spec, &desc.schema)).map(drop)
+            block_on(client.scan_spec(&*desc, &spec, &desc.schema)).map(drop)
         });
         match read {
             Ok(()) | Err(ClientError::Refused(_)) => {}

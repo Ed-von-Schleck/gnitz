@@ -10,7 +10,7 @@ use crate::bind::{require_column, Catalog};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
 use crate::types::column_def;
-use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema};
+use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema, TableDef};
 use gnitz_wire::sys_rows::{FkAction, FkRef};
 use gnitz_wire::TableDistribution;
 use gnitz_wire::{ColType, ColumnDef, PkColList, PkListRole, TableProps};
@@ -496,18 +496,6 @@ fn name_unique_indexes(
         .collect()
 }
 
-/// A `CREATE TABLE`'s bundle: the table and its inline unique indexes.
-pub(crate) struct TablePlan {
-    pub(crate) name: RelName,
-    pub(crate) schema: Schema,
-    /// Per column, the target its FOREIGN KEY names.
-    pub(crate) fks: Vec<Option<FkTarget>>,
-    pub(crate) props: TableProps,
-    /// Each inline UNIQUE constraint's columns and the catalog name its index
-    /// takes — auto-names already disambiguated within the bundle.
-    pub(crate) unique_indexes: Vec<InlineUniqueIndex>,
-}
-
 /// Reject every `CREATE TABLE` clause the planner does not consume. Exhaustive
 /// destructure (no `..`): a future `sqlparser` field stops the build.
 fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<(), GnitzSqlError> {
@@ -651,7 +639,7 @@ fn validate_dist_prefix(cols: &[ColumnDef], pk: &[u32], cluster: &[u32]) -> Resu
 pub(crate) fn plan_create_table(
     create: &sqlparser::ast::CreateTable,
     cat: &dyn Catalog,
-) -> Result<Option<TablePlan>, GnitzSqlError> {
+) -> Result<Option<TableDef>, GnitzSqlError> {
     reject_unhonored_create_table_clauses(create)?;
     let schema_name = cat.schema_name();
     let table_name = extract_object_name(&create.name, schema_name, "CREATE TABLE")?;
@@ -767,22 +755,14 @@ pub(crate) fn plan_create_table(
     }
     props.validate(pk_indices.len()).map_err(GnitzSqlError::Rejected)?;
 
-    Ok(Some(TablePlan {
+    // Inline UNIQUE auto-names are already disambiguated within the bundle.
+    Ok(Some(TableDef {
         name: table_name,
         schema,
         fks,
         props,
         unique_indexes,
     }))
-}
-/// Commit a planned `CREATE TABLE`: one bundle carrying the table, its columns
-/// and its inline unique indexes.
-pub(crate) async fn execute_create_table(client: &mut GnitzClient, plan: TablePlan) -> Result<(), GnitzSqlError> {
-    let TablePlan { name, schema, fks, props, unique_indexes } = plan;
-    client
-        .create_table(&name, &schema, &fks, props, &unique_indexes)
-        .await?;
-    Ok(())
 }
 
 pub(crate) async fn execute_drop(

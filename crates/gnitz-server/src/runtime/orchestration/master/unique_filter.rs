@@ -75,14 +75,11 @@ pub(super) fn extract_into_filter(filter: &mut UniqueFilter, batch: &gnitz_zset:
 impl MasterDispatcher {
     /// The spans of `keys` the filter for `(table_id, cols)` cannot prove
     /// absent: all of them where it has none.
-    pub(super) fn unique_filter_retain_possible(&self, table_id: u64, cols: PkColList, keys: PkKeys) -> PkKeys {
-        match self.unique_filters.borrow().get(&(table_id, cols)) {
-            Some(f) => PkKeys::from_sorted(
-                keys.stride(),
-                keys.iter().filter(|k| f.may_contain(k)).flatten().copied().collect(),
-            ),
-            None => keys,
+    pub(super) fn unique_filter_retain_possible(&self, table_id: u64, cols: PkColList, mut keys: PkKeys) -> PkKeys {
+        if let Some(f) = self.unique_filters.borrow().get(&(table_id, cols)) {
+            keys.retain(|k| f.may_contain(k));
         }
+        keys
     }
 
     /// Record every indexed span of a durable `batch` on `table_id`.

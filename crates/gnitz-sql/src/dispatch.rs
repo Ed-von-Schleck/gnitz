@@ -283,7 +283,10 @@ async fn execute_ddl(
             .await
             .0?
             {
-                Some(plan) => ddl::execute_create_table(client, plan).await,
+                Some(def) => {
+                    client.create_table(&def).await?;
+                    Ok(())
+                }
                 None => Ok(()),
             }
         }
@@ -315,7 +318,10 @@ async fn execute_ddl(
             .await
             .0?
             {
-                Some(chain) => ddl::execute_view_chain(client, chain).await,
+                Some(chain) => {
+                    client.create_view_chain(chain).await?;
+                    Ok(())
+                }
                 None => Ok(()),
             }
         }
@@ -346,7 +352,8 @@ async fn execute_ddl(
             })
             .await
             .0?;
-            ddl::execute_view_chain(client, chain).await
+            client.create_view_chain(chain).await?;
+            Ok(())
         }
         _ => unreachable!("execute_statement routes only DDL here"),
     }

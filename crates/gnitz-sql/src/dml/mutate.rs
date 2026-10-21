@@ -20,7 +20,7 @@ use crate::hir::bind_single_table;
 use crate::ir::{BoundExpr, RegClass};
 use crate::rules::{require_class, ClassWant};
 use crate::SqlResult;
-use gnitz_core::{retraction_batch, GnitzClient, RelDescriptor, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, RelDescriptor, Schema, ZSetBatch};
 use gnitz_expr::{ExprResults, ScalarEval};
 use gnitz_wire::{encode_german_string, null_word_get, null_word_set, relocate_german_string};
 use gnitz_wire::{ColType, ColumnDef, FixedInt, ReadBound, TypeCode};
@@ -163,7 +163,7 @@ pub(crate) async fn execute_mutation(
 fn delta(set: Option<&mut [SetCol]>, rows: ZSetBatch, schema: &Schema) -> Result<ZSetBatch, GnitzSqlError> {
     match set {
         Some(set) => apply_set(set, rows, None, schema),
-        None => Ok(retraction_batch(schema, rows.pks)),
+        None => Ok(ZSetBatch::retraction(schema, rows.pks)),
     }
 }
 

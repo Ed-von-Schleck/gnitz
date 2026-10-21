@@ -14,12 +14,12 @@ fn sh(cols: &[(&str, bool, bool)]) -> Shape {
 }
 
 /// The final view's PK column set.
-fn pk(chain: &PlannedChain) -> Vec<u32> {
+fn pk(chain: &ViewBundle) -> Vec<u32> {
     final_view(chain).schema.pk_cols().to_vec()
 }
 
 /// The final view's output type codes.
-fn types(chain: &PlannedChain) -> Vec<TypeCode> {
+fn types(chain: &ViewBundle) -> Vec<TypeCode> {
     final_view(chain).schema.columns().iter().map(|c| c.ty.tc).collect()
 }
 
@@ -993,7 +993,7 @@ fn a_chain_segment_keeps_only_its_live_columns() {
         "SELECT ja.id AS aid, jc.cv AS ccv FROM ja JOIN jb ON ja.k = jb.id JOIN jc ON ja.v = jc.id",
     );
     assert_eq!(view_count(&chain), 2);
-    let seg: Vec<&str> = chain.bundle.segments[0]
+    let seg: Vec<&str> = chain.segments[0]
         .schema
         .columns()
         .iter()
@@ -1035,7 +1035,7 @@ fn a_collision_segment_keeps_only_its_live_columns() {
         "SELECT e.nm AS emp, m.nm AS boss FROM emp e JOIN emp m ON e.mgr = m.id",
     );
     assert_eq!(view_count(&chain), 2);
-    let wrapper: Vec<&str> = chain.bundle.segments[0]
+    let wrapper: Vec<&str> = chain.segments[0]
         .schema
         .columns()
         .iter()
@@ -1045,7 +1045,7 @@ fn a_collision_segment_keeps_only_its_live_columns() {
 
     // `t EXCEPT t` cuts nothing: a set operation reads one source on both sides.
     let chain = view(&base(), "SELECT g FROM t EXCEPT SELECT g FROM t");
-    assert!(chain.bundle.segments.is_empty());
+    assert!(chain.segments.is_empty());
 }
 
 /// `register` mirrors what the server records: a bounded view registers as
