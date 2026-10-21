@@ -266,7 +266,7 @@ fn a_page_in_another_layout_is_refused() {
 /// views and indexes answer as they did, and it boots at another worker count.
 #[test]
 fn a_backup_boots_as_the_server_stood_at_its_checkpoint() {
-    let srv = ServerHandle::start_with_backups(WORKERS);
+    let srv = ServerHandle::start_with_backups(WORKERS, &[]);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let (sn, tid, schema) = create_table(&mut client, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
     let source = block_on(client.resolve_relation(&rel(&sn, "t"))).unwrap();
@@ -293,6 +293,25 @@ fn a_backup_boots_as_the_server_stood_at_its_checkpoint() {
     // The restored server is a live one.
     push(&mut client, tid, &schema, rows(&schema, 7000..7001));
     assert_eq!(scan_all(&mut client, tid, &schema).len(), 1991);
+}
+
+/// A backup interrupted part-way leaves no entry under its name: its copy is
+/// made under another, which the entry's takes only once the copy is whole.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "the seam folds away in a release build")]
+fn an_interrupted_backup_leaves_no_entry() {
+    let srv = ServerHandle::start_with_backups(WORKERS, &[("GNITZ_INJECT_BACKUP_ABORT", "1")]);
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    let (_, tid, schema) = create_table(&mut client, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
+    push(&mut client, tid, &schema, rows(&schema, 0..100));
+
+    assert!(block_on(client.backup("first")).is_err(), "the master dies part-way");
+    let backups = srv.backups();
+    assert!(
+        backups.join(".first.partial").join("_relations").is_dir(),
+        "the workers' copies were made before the abort"
+    );
+    assert!(!backups.join("first").exists(), "an interrupted backup is no entry");
 }
 
 #[test]

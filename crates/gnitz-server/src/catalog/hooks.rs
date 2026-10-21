@@ -125,6 +125,9 @@ impl CatalogEngine {
             pk_repeats,
             compress,
         })?;
+        if rel.kind().is_view() {
+            self.registry.declare_traces(rel.id, self.dag.state_layout(rel.id))?;
+        }
         self.caches.enter(rel.id, RelationEntry::new(record, fks, serial));
         // Derived, not stored: every process builds the same FK indexes from the same
         // column records. Every FK column carries one, a PK column included.

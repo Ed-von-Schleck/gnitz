@@ -29,7 +29,7 @@ mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
 use dirs::ensure_dir;
-pub use dirs::{lock_data_dir, relation_dir, relations_dir, ChildAddr, ChildKind, DirLock};
+pub use dirs::{lock_data_dir, relation_dir, ChildAddr, ChildKind, DirLock};
 pub use disk_usage::{disk_usage, DiskUsage};
 pub(crate) use feed::Feed;
 use store::Store;
@@ -261,6 +261,9 @@ pub struct Relation {
     unsealed: Option<Batch>,
     feed: Option<Feed>,
     indexes: Vec<SecondaryIndex>,
+    /// The trace children a view's compiled operator state declares, by name:
+    /// the scratch children the resume verdict reads and the reclaim keeps.
+    traces: Box<[String]>,
     kind: RelationKind,
     placement: Placement,
     pk_repeats: bool,

@@ -15,47 +15,64 @@ use std::path::Path;
 use super::Shared;
 use crate::runtime::committer::{BackupJob, CommitRequest};
 use crate::runtime::reactor::oneshot;
+use gnitz_foundation::posix_io;
 use gnitz_wire::WireFault;
 
 /// The longest entry name a backup takes.
 const MAX_NAME_LEN: usize = 128;
 
-/// BACKUP into the entry `name` of the backup directory.
+/// BACKUP into the entry `name` of the backup directory. The copy is made under
+/// a name no entry takes and renamed onto `name` once complete, so an entry of
+/// the backup directory is always a whole backup: an interrupted one leaves only
+/// its partial copy behind, which a later BACKUP of that name refuses to reuse.
 pub(super) async fn backup(shared: &Shared, name: &[u8]) -> Result<(), WireFault> {
     let root = shared
         .backup_dir
         .as_deref()
         .ok_or_else(|| "the server was started without --backup-dir".to_string())?;
     let name = entry_name(name)?;
-    let dest = Path::new(root).join(name);
-    let dest = dest
-        .to_str()
-        .ok_or_else(|| "a backup path that is not UTF-8".to_string())?
-        .to_string();
+    let (dest, partial) = (format!("{root}/{name}"), format!("{root}/.{name}.partial"));
     if shared.draining.get() {
         return Err("server shutting down".to_string().into());
     }
     let catalog = shared.catalog_rwlock.read().await;
-    match fs::create_dir(&dest) {
+    if Path::new(&dest).exists() {
+        return Err(format!("backup '{name}' already exists").into());
+    }
+    match fs::create_dir(&partial) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(format!("backup '{name}' already exists").into());
+            return Err(
+                format!("backup '{name}' is being taken, or an interrupted one left '{partial}' behind").into(),
+            );
         }
-        Err(e) => return Err(format!("create backup '{dest}': {e}").into()),
+        Err(e) => return Err(format!("create backup '{partial}': {e}").into()),
     }
     let (done, rx) = oneshot::channel();
     shared
         .committer_tx
-        .send(CommitRequest::Backup(BackupJob { dir: dest.clone(), done }));
-    let result = rx.await;
+        .send(CommitRequest::Backup(BackupJob { dir: partial.clone(), done }));
+    let result = rx.await.and_then(|()| publish(&partial, &dest, root));
     drop(catalog);
     if result.is_err() {
         // Only this request made the directory, and it is no backup.
-        if let Err(e) = fs::remove_dir_all(&dest) {
-            gnitz_warn!("backup: failed to remove the incomplete '{}': {}", dest, e);
+        if let Err(e) = fs::remove_dir_all(&partial) {
+            gnitz_warn!("backup: failed to remove the incomplete '{}': {}", partial, e);
         }
     }
     result
+}
+
+/// Give the complete copy at `partial` the entry `dest` of the backup directory
+/// `root`, durably.
+fn publish(partial: &str, dest: &str, root: &str) -> Result<(), WireFault> {
+    let synced = |dir: &str| posix_io::fsync_dir(dir).map_err(|e| format!("fsync '{dir}': {e}"));
+    // The copy's own entries, durable before the name makes it a backup.
+    synced(partial)?;
+    posix_io::rename_noreplace(partial, dest).map_err(|e| format!("name backup '{dest}': {e}"))?;
+    synced(root)?;
+    gnitz_info!("backup '{}' complete", dest);
+    Ok(())
 }
 
 /// `name` as an entry of the backup directory: one path component of the

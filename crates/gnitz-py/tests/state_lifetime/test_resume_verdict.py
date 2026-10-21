@@ -12,6 +12,7 @@ the view's Z-set. That marker is the only observable the distinction has.
 
 import glob
 import os
+import shutil
 
 import pytest
 import gnitz
@@ -116,6 +117,32 @@ def _manifests(srv):
     changed inode."""
     paths = glob.glob(os.path.join(srv.data_dir, "_relations", "**", "manifest.bin"), recursive=True)
     return {os.path.relpath(p, srv.data_dir): os.stat(p).st_ino for p in paths}
+
+
+def test_a_view_missing_one_ranks_trace_rebuilds_instead_of_refusing_the_boot(own_server):
+    """A crash part-way through removing a view's children can take one rank's
+    trace and leave every output store at the committed generation. The verdict
+    reads the traces the view's circuit declares, so the boot rebuilds the view;
+    reading only the traces still on disk, it would resume it, and the worker
+    whose trace is gone would fail every boot opening it."""
+    _checkpoint_cut(own_server)
+    own_server.start()
+    with gnitz.connect(own_server.target) as conn:
+        conn.execute_sql("CREATE VIEW g AS SELECT val % 3 AS k, SUM(val) AS s FROM t GROUP BY val % 3")
+        view_id = conn.resolve_table("g")[0]
+    own_server.stop_graceful()
+    traces = sorted(glob.glob(os.path.join(own_server.data_dir, "_relations", str(view_id), "scratch_*")))
+    assert len(traces) == own_server.workers, f"one trace per rank, got {traces}"
+    shutil.rmtree(traces[0])
+
+    own_server.start()
+    assert own_server.rebuilt_view_count() == 1, "the view missing a trace alone rebuilds"
+    with gnitz.connect(own_server.target) as conn:
+        sums = {}
+        for k in range(1, 6):
+            sums[k * 10 % 3] = sums.get(k * 10 % 3, 0) + k * 10
+        assert bag(scanned(conn, "g"), "k", "s") == {kv: 1 for kv in sums.items()}
+    _assert_doubled(own_server, range(1, 6), "the sibling view resumes untouched")
 
 
 def test_a_checkpoint_cut_resumes_and_replays_only_the_tail(own_server):

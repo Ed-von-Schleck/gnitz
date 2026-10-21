@@ -2,11 +2,11 @@
 //! durable flush barrier.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use io_uring::types::FsyncFlags;
 
-use super::super::batch_fsync::{new_ring, sync_paths};
+use super::super::batch_fsync::Syncer;
 use super::super::manifest::{self, Manifest};
 use super::Table;
 use gnitz_zset::repr::StorageError;
@@ -15,10 +15,11 @@ use gnitz_zset::repr::StorageError;
 pub(super) struct FlushWork {
     bytes: Vec<u8>,
     /// Whether a manifest was staged for the rename. Without one the manifest
-    /// in place already holds `bytes`, and only `dirs` are owed.
+    /// in place already holds `bytes`, and only the directory syncs are owed.
     staged: bool,
-    /// Fsynced once the manifest is in place.
-    dirs: Vec<PathBuf>,
+    /// Whether no publish of this store is known durable, so the entries that
+    /// reach its directory are owed a sync beside the directory itself.
+    first_sync: bool,
 }
 
 /// Durably publish every table in `tables`, each manifest carrying
@@ -36,10 +37,9 @@ pub(crate) fn flush_barrier<'a>(
     if work.is_empty() {
         return Ok(());
     }
-    let mut ring = new_ring()?;
+    let mut sync = Syncer::default();
     // Every unsynced shard and every staged manifest, before any rename.
-    sync_paths(
-        &mut ring,
+    sync.sync_paths(
         work.iter().flat_map(|(t, w)| {
             t.shard_index
                 .unsynced_paths()
@@ -54,10 +54,15 @@ pub(crate) fn flush_barrier<'a>(
             manifest::commit(&t.shard_index.output_dir)?;
             t.shard_index.mark_published();
         }
-        dirs.extend(std::mem::take(&mut w.dirs));
+        let dir = &t.shard_index.output_dir;
+        if w.first_sync {
+            dirs.extend(manifest::entry_dirs(dir));
+        } else {
+            dirs.insert(PathBuf::from(dir));
+        }
     }
     // A rename is metadata: a full fsync, not fdatasync.
-    sync_paths(&mut ring, &dirs, FsyncFlags::empty())?;
+    sync.sync_paths(&dirs, FsyncFlags::empty())?;
     // No durable manifest names a superseded shard any more.
     for (t, w) in work {
         t.manifest_in_place = Some(w.bytes);
@@ -134,15 +139,7 @@ impl Table {
             self.manifest_in_place = None;
             manifest::prepare(&self.shard_index.output_dir, &bytes)?;
         }
-        // A first sync also makes the directory's own entry and its parent's durable.
-        let entry_dirs = if first_sync { 2 } else { 0 };
-        let dirs = Path::new(&self.shard_index.output_dir)
-            .ancestors()
-            .take(1 + entry_dirs)
-            .filter(|d| !d.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .collect();
-        Ok(Some(FlushWork { bytes, staged, dirs }))
+        Ok(Some(FlushWork { bytes, staged, first_sync }))
     }
 
     /// Move the RAM tier's rows to an unsynced L0 shard.

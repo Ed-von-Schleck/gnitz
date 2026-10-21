@@ -363,7 +363,7 @@ fn dump_and_restore_run_from_the_shell() {
 
 #[test]
 fn backup_writes_an_entry_of_the_backup_directory() {
-    let server = ServerHandle::start_with_backups(WORKERS);
+    let server = ServerHandle::start_with_backups(WORKERS, &[]);
     let mut sh = shell(server.sock_path(), None);
     sh.run_script("CREATE TABLE t (id BIGINT PRIMARY KEY); INSERT INTO t VALUES (1);\n\\backup nightly")
         .unwrap();

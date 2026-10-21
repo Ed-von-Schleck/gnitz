@@ -55,6 +55,7 @@ fn a_resumed_view_refuses_a_missing_manifest() {
     let worker = |resume: bool| {
         let mut master = RelationRegistry::master(base, 1, StoreConfig::default());
         master.register(spec).unwrap();
+        master.declare_traces(7, &layout()).unwrap();
         master.reconcile_child_dirs().unwrap();
         master
             .open_stores(0, Residency::Worker, |_| resume.then_some(0))

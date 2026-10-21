@@ -11,7 +11,7 @@ use gnitz_foundation::posix_io::fsync_dir;
 use gnitz_wire::PkColList;
 
 use super::{RelationKind, RelationRegistry, Residency};
-use crate::storage::{link_store, manifest_path, read_at, read_intact, retire_store};
+use crate::storage::{link_stores, manifest_path, read_at, read_intact, retire_stores};
 use gnitz_zset::algebra::Slot;
 
 /// What a child directory holds.
@@ -95,25 +95,22 @@ impl<'a> ChildAddr<'a> {
     }
 }
 
-/// Every child a relation has across the whole cluster at `num_workers` — one
-/// per launched rank.
-pub(super) fn cluster_children<'a>(num_workers: u32) -> impl Iterator<Item = ChildAddr<'a>> {
-    (0..num_workers).map(move |rank| ChildAddr {
-        kind: ChildKind::Rows,
-        slot: Slot::new(rank, num_workers),
-    })
+/// Every `kind` child a relation has across the whole cluster at `num_workers`
+/// — one per launched rank.
+pub(super) fn cluster_children(kind: ChildKind<'_>, num_workers: u32) -> impl Iterator<Item = ChildAddr<'_>> {
+    (0..num_workers).map(move |rank| ChildAddr { kind, slot: Slot::new(rank, num_workers) })
 }
 
-/// Whether each launched rank's rows and every scratch child under `rel_dir`
-/// carry a manifest at `generation`; `false` on any I/O failure.
-pub(super) fn children_at_generation(rel_dir: &str, num_workers: u32, generation: u64) -> bool {
-    let Ok(names) = subdir_names(rel_dir) else { return false };
-    let scratch = names
-        .iter()
-        .filter_map(|n| ChildAddr::parse(n))
-        .filter(|c| matches!(c.kind, ChildKind::Scratch(_)));
-    let mut children = cluster_children(num_workers).chain(scratch);
-    children.all(|c| matches!(read_at(&c.dir(rel_dir), generation), Ok(Some(_))))
+/// Whether, on each of `num_workers` ranks under `rel_dir`, the rows child and
+/// the scratch child of every name in `traces` carry a manifest at
+/// `generation`; `false` on any I/O failure. A trace with no directory is a
+/// mismatch: a crash part-way through retiring a view's children can take it
+/// and leave its siblings.
+pub(super) fn children_at_generation(rel_dir: &str, num_workers: u32, generation: u64, traces: &[String]) -> bool {
+    let kinds = std::iter::once(ChildKind::Rows).chain(traces.iter().map(|t| ChildKind::Scratch(t)));
+    kinds
+        .flat_map(|kind| cluster_children(kind, num_workers))
+        .all(|c| matches!(read_at(&c.dir(rel_dir), generation), Ok(Some(_))))
 }
 
 /// Immediate sub-directory names of `path`, none if it is missing. Collected
@@ -135,19 +132,17 @@ pub(super) fn subdir_names(path: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// Retire every child of `dir` that `dead` picks; names in no child grammar are
-/// left alone.
+/// The directory of every child of `dir` that `pick` selects; a name in no
+/// child grammar is never selected.
+fn children(dir: &str, pick: impl Fn(&ChildAddr) -> bool) -> Result<Vec<String>, String> {
+    let names = subdir_names(dir)?;
+    let picked = names.iter().filter_map(|n| ChildAddr::parse(n)).filter(|c| pick(c));
+    Ok(picked.map(|c| c.dir(dir)).collect())
+}
+
+/// Retire every child of `dir` that `dead` picks.
 pub(super) fn remove_children(dir: &str, dead: impl Fn(&ChildAddr) -> bool) -> Result<(), String> {
-    for child in subdir_names(dir)?
-        .iter()
-        .filter_map(|n| ChildAddr::parse(n))
-        .filter(|c| dead(c))
-    {
-        let child = child.dir(dir);
-        gnitz_debug!("relation: removing child dir {}", child);
-        retire_store(&child).map_err(|e| format!("retire '{child}': {e}"))?;
-    }
-    Ok(())
+    retire_stores(&children(dir, dead)?).map_err(|e| format!("retire the children of '{dir}': {e}"))
 }
 
 /// `<base_dir>/LOCK` — the file whose `flock` makes a data directory
@@ -156,7 +151,7 @@ const DIR_LOCK_FILENAME: &str = "LOCK";
 
 /// `<base_dir>/_relations` — the directory every relation's store directory sits
 /// in, system families included. Only this crate's hosts write it.
-pub fn relations_dir(base_dir: &str) -> String {
+pub(super) fn relations_dir(base_dir: &str) -> String {
     format!("{base_dir}/_relations")
 }
 
@@ -258,10 +253,13 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// Remove every relation directory and child this registry does not own. Sound
-    /// only once every process sharing `base_dir` has applied this catalog.
+    /// Remove every relation directory and child this registry does not own — a
+    /// child of another worker count, an index nothing declares, a trace no
+    /// compiled circuit declares — the children retired in one batch. Sound only once every process sharing
+    /// `base_dir` has applied this catalog.
     pub fn reclaim_orphan_relation_dirs(&self) -> Result<(), String> {
         let root = relations_dir(&self.base_dir);
+        let mut dead = Vec::new();
         for name in subdir_names(&root)? {
             let dir = format!("{root}/{name}");
             let Some(entry) = parse_relation_dir_name(&name).and_then(|id| self.tables.get(&id)) else {
@@ -272,12 +270,17 @@ impl RelationRegistry {
                 continue;
             };
             let of = self.slot.of;
-            remove_children(&dir, |c| {
-                c.slot.of != of || matches!(c.kind, ChildKind::Index(cols) if entry.index_on(cols.as_slice()).is_none())
-            })
-            .map_err(|e| format!("reclaim children of '{dir}': {e}"))?;
+            dead.extend(children(&dir, |c| {
+                c.slot.of != of
+                    || match c.kind {
+                        ChildKind::Index(cols) => entry.index_on(cols.as_slice()).is_none(),
+                        ChildKind::Scratch(name) => !entry.traces.iter().any(|t| t == name),
+                        ChildKind::Rows => false,
+                    }
+            })?);
         }
-        Ok(())
+        gnitz_debug!("relation: reclaiming {} child dir(s) under {}", dead.len(), root);
+        retire_stores(&dead).map_err(|e| format!("reclaim the children no relation owns under '{root}': {e}"))
     }
 
     /// Put every store this process published into the data directory `dest`, at
@@ -285,41 +288,30 @@ impl RelationRegistry {
     /// directory's filesystem, copied where it does not. A worker puts the
     /// children of its own slot; the master, the system families' stores it
     /// holds; an origin, both. A store's manifest is what was published, so a
-    /// store with none is left for the boot over `dest` to rebuild. Returns the
-    /// stores put.
-    pub fn link_published_into(&self, dest: &str) -> Result<usize, String> {
-        let link = |src: &str, dst: &str| link_store(src, dst).map_err(|e| format!("put '{src}' into '{dst}': {e}"));
-        let mut put = 0;
+    /// store with none is left for the boot over `dest` to rebuild.
+    pub fn link_published_into(&self, dest: &str) -> Result<(), String> {
+        let mut pairs = Vec::new();
         for (&id, entry) in &self.tables {
             let (src_rel, dst_rel) = (relation_dir(&self.base_dir, id), relation_dir(dest, id));
             if entry.kind() == RelationKind::SystemCatalog {
                 // Its one store is the relation directory itself, which a worker
                 // holds in memory only.
-                if self.residency != Residency::Worker && link(&src_rel, &dst_rel)? {
-                    put += 1;
+                if self.residency != Residency::Worker {
+                    pairs.push((src_rel, dst_rel));
                 }
                 continue;
             }
             if !self.residency.owns_stores() {
                 continue;
             }
-            let before = put;
             let names = subdir_names(&src_rel)?;
-            for child in names
+            let own = names
                 .iter()
                 .filter_map(|n| ChildAddr::parse(n))
-                .filter(|c| c.slot == self.slot)
-            {
-                if link(&child.dir(&src_rel), &child.dir(&dst_rel))? {
-                    put += 1;
-                }
-            }
-            if put > before {
-                // A child's directory entry, durable in the relation's.
-                fsync_dir(&dst_rel).map_err(|e| format!("fsync '{dst_rel}': {e}"))?;
-            }
+                .filter(|c| c.slot == self.slot);
+            pairs.extend(own.map(|c| (c.dir(&src_rel), c.dir(&dst_rel))));
         }
-        Ok(put)
+        link_stores(&pairs).map_err(|e| format!("put the published stores into '{dest}': {e}"))
     }
 }
 

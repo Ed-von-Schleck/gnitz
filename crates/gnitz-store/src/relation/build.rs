@@ -1,6 +1,5 @@
 //! Opening a relation's stores and entering it in the registry.
 
-use super::dirs::remove_children;
 use super::*;
 use gnitz_foundation::fault::Seam;
 
@@ -41,6 +40,7 @@ impl RelationRegistry {
                 unsealed: None,
                 feed,
                 indexes: Vec::new(),
+                traces: Box::default(),
                 kind,
                 placement,
                 pk_repeats,
@@ -84,22 +84,11 @@ impl RelationRegistry {
                 }
                 (RecoverySource::SalReplay, None, None)
             }
-            RelationKind::View(p) => {
-                if resume_at.is_none() {
-                    // The traces a previous compile left here are rebuilt with the rows they
-                    // integrate; one the next compile does not declare would never be erased.
-                    let slot = self.slot;
-                    remove_children(&relation_dir(&self.base_dir, id), |c| {
-                        matches!(c.kind, ChildKind::Scratch(_)) && c.slot == slot
-                    })
-                    .map_err(|e| format!("remove the operator traces of view {id}: {e}"))?;
-                }
-                (
-                    RecoverySource::Rederive { resume_at },
-                    p.capacity_bytes(),
-                    p.delta_bytes(),
-                )
-            }
+            RelationKind::View(p) => (
+                RecoverySource::Rederive { resume_at },
+                p.capacity_bytes(),
+                p.delta_bytes(),
+            ),
         };
         let rows = self.open_child_as(id, ChildKind::Rows, schema, recovery, capacity, compress)?;
         // Empty at every open: no delta expresses what a boot does to a view, so every cursor restarts.

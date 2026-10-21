@@ -73,10 +73,10 @@ impl ServerHandle {
         Self::start_inner(workers, extra_env, None, Auth::None)
     }
 
-    /// [`Self::start_n`] with `--backup-dir` naming [`Self::backups`], a
+    /// [`Self::start_with_env`] with `--backup-dir` naming [`Self::backups`], a
     /// directory of its tmpdir.
-    pub fn start_with_backups(workers: usize) -> Self {
-        Self::boot(workers, &[], None, Auth::None, Boot::WithBackups)
+    pub fn start_with_backups(workers: usize, extra_env: &[(&str, &str)]) -> Self {
+        Self::boot(workers, extra_env, None, Auth::None, Boot::WithBackups)
     }
 
     /// [`Self::start_n`] over the existing data directory `data_dir` — a backup

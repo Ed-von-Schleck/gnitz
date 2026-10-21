@@ -4,7 +4,7 @@
 
 use super::dirs::children_at_generation;
 use super::relation_dir;
-use super::ChildKind;
+use super::{ChildKind, StateLayout};
 use super::{RelationKind, RelationRegistry, RelationSpec, Residency, SecondaryIndex, Store};
 use crate::storage::{RecoverySource, Table};
 use gnitz_zset::algebra::Slot;
@@ -113,16 +113,30 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// Whether every checkpointed child of `view_id`, on **every launched rank**,
-    /// carries a manifest at `generation` — the store half of the resume verdict.
-    /// `false` for an id this registry does not hold.
+    /// Record the trace children `layout`, view `view_id`'s compiled operator
+    /// state, declares.
+    pub fn declare_traces(&mut self, view_id: u64, layout: &StateLayout) -> Result<(), String> {
+        self.relation_mut_or_err(view_id)?.traces = layout.names().map(str::to_string).collect();
+        Ok(())
+    }
+
+    /// Whether the rows child and every declared trace child of `view_id` carry
+    /// a manifest at `generation` on **every launched rank** — the store half of
+    /// the resume verdict. `false` for an id this registry does not hold.
     pub fn view_children_resumable(&self, view_id: u64, generation: u64) -> bool {
         // A worker cannot speak for its peers.
         assert!(
             matches!(self.residency, Residency::Master | Residency::Origin),
             "view_children_resumable reads every rank's children"
         );
-        self.has_id(view_id) && children_at_generation(&relation_dir(&self.base_dir, view_id), self.slot.of, generation)
+        self.tables.get(&view_id).is_some_and(|r| {
+            children_at_generation(
+                &relation_dir(&self.base_dir, view_id),
+                self.slot.of,
+                generation,
+                &r.traces,
+            )
+        })
     }
 
     /// The system families' `table id → replay floor` their stores opened with:

@@ -308,31 +308,61 @@ fn view_traces_resume_with_their_output_store() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── uncompiled_view_traces_invalidate_the_view ──────────────────────────
-// The other half: the ephemeral round stamps every output store but only the
-// traces of the views in the plan cache, so a view that goes through a checkpoint
-// uncompiled lands an output store one generation ahead of its integral. The boot
-// verdict must reject that pair rather than resume it.
+// ── an_unrun_view_checkpoints_its_traces_and_resumes ────────────────────
+// The other half: a checkpoint stamps a resumed view's traces with its output
+// store even where nothing has run the view since the boot, so the next boot
+// finds both at one generation and resumes the view.
 #[test]
-fn uncompiled_view_traces_invalidate_the_view() {
-    let dir = temp_dir("view_uncompiled_traces_invalidate");
-    let (_, vid) = checkpointed_traced_view(&dir);
+fn an_unrun_view_checkpoints_its_traces_and_resumes() {
+    let dir = temp_dir("view_unrun_traces_resume");
+    let (tid, vid) = checkpointed_traced_view(&dir);
 
-    // A checkpoint with nothing in the plan cache — what a boot checkpoint is for
-    // a view no tick sweep reaches.
+    // A checkpoint no tick precedes — what a boot checkpoint is for a view no
+    // tick sweep reaches.
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let g2 = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g2).unwrap();
     engine.close();
 
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    assert!(!engine.dag.awaits_rebuild(vid), "the view resumes");
+    tick(&mut engine, tid, 0, 1);
+    assert_eq!(net_weight(&engine, vid), N, "a resumed trace still holds the row");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── a_missing_trace_child_invalidates_the_view ──────────────────────────
+// A crash part-way through removing a view's children can take a trace child and
+// leave the output store behind. The verdict reads the children the compiled
+// circuit declares, so the missing one rejects the view; a resume would fail the
+// first open of its operator state instead.
+#[test]
+fn a_missing_trace_child_invalidates_the_view() {
+    let dir = temp_dir("view_missing_trace_child_invalidates");
+    let (_, vid) = checkpointed_traced_view(&dir);
+    remove_trace(&dir, vid);
+
     let engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(
         engine.dag.awaits_rebuild(vid),
-        "an output store ahead of its traces must be rebuilt, not resumed"
+        "a view missing a trace child must be rebuilt, not resumed"
     );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Remove the trace child view `vid` published in `dir`, as a crash part-way
+/// through retiring the view's children can.
+fn remove_trace(dir: &str, vid: u64) {
+    let children = published_children(dir, vid);
+    let trace = children
+        .iter()
+        .find(|c| c.starts_with("scratch_"))
+        .expect("a traced view checkpoints its trace");
+    fs::remove_dir_all(format!("{}/{trace}", relation_dir(dir, vid))).unwrap();
 }
 
 // ── Chains ───────────────────────────────────────────────────────────────
@@ -396,19 +426,14 @@ fn a_chain_resumes_or_rebuilds_as_one() {
     // Kept: the segment reopens holding nothing, and takes nothing.
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine.dag.awaits_rebuild(seg) && !engine.dag.awaits_rebuild(top));
-    // A checkpoint the owner goes through uncompiled leaves its trace a generation
-    // behind; the segment has none to leave.
-    let g2 = engine.advance_durable_generation().unwrap();
-    engine.flush_ephemeral_round(g2).unwrap();
     tick(&mut engine, tid, N as u64 + 1, 0);
     assert_eq!(net_weight(&engine, seg), 0, "a kept chain's segment stays empty");
     engine.close();
 
+    // The owner alone holds a trace; the segment has none to lose.
+    remove_trace(&dir, top);
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(
-        engine.dag.awaits_rebuild(top),
-        "the owner's trace is a generation behind"
-    );
+    assert!(engine.dag.awaits_rebuild(top), "the owner lost its trace");
     assert!(engine.dag.awaits_rebuild(seg), "its segment rebuilds with it");
 
     engine.close();
@@ -448,15 +473,13 @@ fn a_rejected_view_opens_empty_and_loses_its_stale_traces() {
     let dir = temp_dir("view_rejected_erased_at_open");
     let (_, vid) = checkpointed_traced_view(&dir);
 
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
     let stale = engine
         .registry
         .child_dir(vid, gnitz_store::relation::ChildKind::Scratch("stale"));
-    fs::create_dir_all(&stale).unwrap();
-    // The plan cache is empty, so this stamps the output store but not the traces.
-    let g2 = engine.advance_durable_generation().unwrap();
-    engine.flush_ephemeral_round(g2).unwrap();
     engine.close();
+    fs::create_dir_all(&stale).unwrap();
+    remove_trace(&dir, vid);
 
     let engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(engine.dag.awaits_rebuild(vid));

@@ -2,11 +2,14 @@
 //! primitives over them. A store owns its directory, so every shard and staging
 //! file in it is the store's.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 
-use gnitz_foundation::posix_io::fsync_dir;
+use io_uring::types::FsyncFlags;
+
+use super::batch_fsync::Syncer;
 use gnitz_wire::PkBuf;
 use gnitz_wire::MAX_PK_BYTES;
 use gnitz_wire::{Reader, Writer};
@@ -217,49 +220,93 @@ pub(crate) fn commit(dir: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Durably unlink `dir`'s manifest; an absent manifest or directory is already
-/// unlinked.
-pub(crate) fn unlink(dir: &str) -> Result<(), StorageError> {
-    absent_ok(fs::remove_file(manifest_path(dir)))?;
-    Ok(absent_ok(fsync_dir(dir))?)
+/// The directories a store directory's first sync makes durable: its own, for
+/// the files in it, and its parent's and grandparent's, for the entries that
+/// reach it.
+pub(super) fn entry_dirs(dir: &str) -> impl Iterator<Item = PathBuf> + '_ {
+    Path::new(dir)
+        .ancestors()
+        .take(3)
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(Path::to_path_buf)
 }
 
-/// Retire the store at `store_dir`: once this returns `Ok`, no crash brings its
-/// manifest back. Removing the directory itself is best-effort.
-pub(crate) fn retire_store(store_dir: &str) -> Result<(), StorageError> {
-    unlink(store_dir)?;
-    // Without its manifest the directory holds no reachable rows.
-    if let Err(e) = absent_ok(fs::remove_dir_all(store_dir)) {
-        gnitz_warn!("storage: failed to remove retired store dir {}: {}", store_dir, e);
+/// Durably unlink the manifest of every store in `dirs`, in one sync batch; an
+/// absent manifest or directory is already unlinked.
+pub(crate) fn unlink<S: AsRef<str>>(dirs: &[S]) -> Result<(), StorageError> {
+    let mut present = Vec::with_capacity(dirs.len());
+    for dir in dirs.iter().map(AsRef::as_ref) {
+        absent_ok(fs::remove_file(manifest_path(dir)))?;
+        // Synced even with no manifest to unlink: a process that died between
+        // its own unlink and the sync left the unlink in the page cache alone.
+        if Path::new(dir).is_dir() {
+            present.push(dir);
+        }
+    }
+    if present.is_empty() {
+        return Ok(());
+    }
+    Syncer::default().sync_paths(present, FsyncFlags::empty())
+}
+
+/// Retire every store in `dirs`: once this returns `Ok`, no crash brings any of
+/// their manifests back. Removing the directories themselves is best-effort, and
+/// starts only once every unlink is durable: a removal that reached the disk
+/// ahead of its store's unlink would leave a manifest naming shards that are gone.
+pub(crate) fn retire_stores(dirs: &[String]) -> Result<(), StorageError> {
+    unlink(dirs)?;
+    // Without its manifest a directory holds no reachable rows.
+    for dir in dirs {
+        if let Err(e) = absent_ok(fs::remove_dir_all(dir)) {
+            gnitz_warn!("storage: failed to remove retired store dir {}: {}", dir, e);
+        }
     }
     Ok(())
 }
 
-/// Make `dst_dir` a durable copy of the store `src_dir` published — its
-/// manifest and the shards that manifest names, the shards durable ahead of the
-/// manifest. Each file is hard-linked where `dst_dir` shares `src_dir`'s
-/// filesystem, and copied and synced where it does not; the file names are
-/// kept, since a shard's descriptor digest covers its own. `Ok(false)`, with
-/// nothing made, where `src_dir` published no manifest.
-pub(crate) fn link_store(src_dir: &str, dst_dir: &str) -> Result<bool, StorageError> {
+/// Make each pair's `dst` a durable copy of the store its `src` published — the
+/// manifest and the shards it names — published as [`flush_barrier`] publishes
+/// a store's first manifest. A file is hard-linked where `dst` shares `src`'s
+/// filesystem, and copied where it does not; the file names are kept, since a
+/// shard's descriptor digest covers its own. A `src` that published no manifest
+/// puts nothing.
+///
+/// [`flush_barrier`]: super::flush_barrier
+pub(crate) fn link_stores(pairs: &[(String, String)]) -> Result<(), StorageError> {
+    // `Ok(true)` for a copy, whose bytes are owed a sync of their own.
     let put = |src: &str, dst: &str| match fs::hard_link(src, dst) {
-        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-            fs::copy(src, dst)?;
-            fs::File::open(dst)?.sync_all()
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => fs::copy(src, dst).map(|_| true),
+        r => r.map(|()| false),
+    };
+    let mut stores = Vec::with_capacity(pairs.len());
+    let mut copies = Vec::new();
+    let mut dirs = BTreeSet::new();
+    for (src, dst) in pairs {
+        let Some(m) = read(src)? else { continue };
+        fs::create_dir_all(dst)?;
+        let shards = m
+            .shards
+            .entries
+            .iter()
+            .map(|e| (shard_path(src, e.seq), shard_path(dst, e.seq)));
+        for (from, to) in shards.chain([(manifest_path(src), staging_path(dst))]) {
+            if put(&from, &to)? {
+                copies.push(to);
+            }
         }
-        r => r,
-    };
-    let Some(m) = read(src_dir)? else {
-        return Ok(false);
-    };
-    fs::create_dir_all(dst_dir)?;
-    for e in &m.shards.entries {
-        put(&shard_path(src_dir, e.seq), &shard_path(dst_dir, e.seq))?;
+        dirs.extend(entry_dirs(dst));
+        stores.push(dst);
     }
-    fsync_dir(dst_dir)?;
-    put(&manifest_path(src_dir), &manifest_path(dst_dir))?;
-    fsync_dir(dst_dir)?;
-    Ok(true)
+    if stores.is_empty() {
+        return Ok(());
+    }
+    let mut sync = Syncer::default();
+    // Every copied shard and staged manifest, before any rename.
+    sync.sync_paths(copies, FsyncFlags::DATASYNC)?;
+    for dst in stores {
+        commit(dst)?;
+    }
+    sync.sync_paths(&dirs, FsyncFlags::empty())
 }
 
 // ---------------------------------------------------------------------------

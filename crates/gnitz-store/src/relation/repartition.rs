@@ -10,8 +10,7 @@ use std::fs;
 
 use super::dirs::{cluster_children, subdir_names};
 use super::{ChildAddr, ChildKind};
-use crate::storage::{flush_barrier, link_store, retire_store, Cut, RecoverySource, Table};
-use gnitz_foundation::posix_io::fsync_dir;
+use crate::storage::{flush_barrier, link_stores, retire_stores, Cut, RecoverySource, Table};
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::{from_runs, Batch, StorageError};
@@ -38,7 +37,7 @@ fn relay_source(rel_dir: &str, launched: u32) -> Result<Option<u32>, String> {
         }
     }
     let complete = |of: u32| -> Result<bool, String> {
-        for m in cluster_children(of).map(|c| c.manifest(rel_dir)) {
+        for m in cluster_children(ChildKind::Rows, of).map(|c| c.manifest(rel_dir)) {
             if !fs::exists(&m).map_err(|e| format!("repartition: {m}: {e}"))? {
                 return Ok(false);
             }
@@ -92,12 +91,13 @@ fn relay(
     } else {
         rewrite_targets(rel_dir, schema, placement, source, launched, ram_tier_bytes, chunk_rows)?;
     }
-    fsync_dir(rel_dir)?;
+    // Each target's first publish made its entry in `rel_dir` durable.
     remove_set(rel_dir, source)
 }
 
 fn remove_set(rel_dir: &str, of: u32) -> Result<(), StorageError> {
-    cluster_children(of).try_for_each(|c| retire_store(&c.dir(rel_dir)))
+    let set: Vec<String> = cluster_children(ChildKind::Rows, of).map(|c| c.dir(rel_dir)).collect();
+    retire_stores(&set)
 }
 
 /// Replicated relations: every child is a copy, so each target hard-links rank
@@ -108,10 +108,10 @@ fn link_targets(rel_dir: &str, source: u32, launched: u32) -> Result<(), Storage
         slot: Slot::new(0, source),
     }
     .dir(rel_dir);
-    cluster_children(launched).try_for_each(|target| match link_store(&source_dir, &target.dir(rel_dir))? {
-        true => Ok(()),
-        false => Err(StorageError::Io(libc::ENOENT)),
-    })
+    let pairs: Vec<(String, String)> = cluster_children(ChildKind::Rows, launched)
+        .map(|target| (source_dir.clone(), target.dir(rel_dir)))
+        .collect();
+    link_stores(&pairs)
 }
 
 /// Key-routed relations: scatter the merged source set to its owners, cutting
@@ -128,7 +128,7 @@ fn rewrite_targets(
     // The relay writes its copy's heaps plain: a compressed relation's store
     // codes them as its compactions rewrite them.
     let open = |of: u32| {
-        cluster_children(of)
+        cluster_children(ChildKind::Rows, of)
             .map(|c| {
                 Table::new(
                     &c.dir(rel_dir),

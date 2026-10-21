@@ -137,3 +137,62 @@ fn only_the_canonical_shard_name_denotes_a_seq() {
         assert_eq!(shard_seq(name), None, "{name}");
     }
 }
+
+/// `dir` holding a published manifest of `count` entries, each entry's shard
+/// file beside it.
+fn published(dir: &str, count: usize) -> Manifest {
+    fs::create_dir_all(dir).unwrap();
+    let m = sample(count);
+    for e in &m.shards.entries {
+        fs::write(shard_path(dir, e.seq), e.seq.to_le_bytes()).unwrap();
+    }
+    prepare(dir, &encode(&m)).unwrap();
+    commit(dir).unwrap();
+    m
+}
+
+/// A batch retires every store it names, a store with no manifest or no
+/// directory among them.
+#[test]
+fn retire_stores_removes_every_store_it_names() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = |name: &str| format!("{}/{name}", root.path().to_str().unwrap());
+    published(&dir("a"), 2);
+    published(&dir("b"), 0);
+    fs::create_dir(dir("unpublished")).unwrap();
+    published(&dir("kept"), 1);
+
+    retire_stores(&[dir("a"), dir("b"), dir("unpublished"), dir("absent")]).unwrap();
+    for name in ["a", "b", "unpublished", "absent"] {
+        assert!(!Path::new(&dir(name)).exists(), "{name}");
+    }
+    assert!(read(&dir("kept")).unwrap().is_some(), "a store the batch does not name");
+}
+
+/// A batch puts every store whose source published a manifest, each copy
+/// reading back as its source, and makes nothing for one that published none.
+#[test]
+fn link_stores_puts_every_published_store_and_nothing_else() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = |name: &str| format!("{}/{name}", root.path().to_str().unwrap());
+    let a = published(&dir("src/a"), 3);
+    let b = published(&dir("src/b"), 0);
+    fs::create_dir_all(dir("src/unpublished")).unwrap();
+
+    let pairs = [("a", "dst/x/a"), ("b", "dst/y/b"), ("unpublished", "dst/z/c")]
+        .map(|(src, dst)| (dir(&format!("src/{src}")), dir(dst)));
+    link_stores(&pairs).unwrap();
+    assert_eq!(read(&dir("dst/x/a")).unwrap(), Some(a.clone()));
+    assert_eq!(read(&dir("dst/y/b")).unwrap(), Some(b));
+    for e in &a.shards.entries {
+        assert_eq!(
+            fs::read(shard_path(&dir("dst/x/a"), e.seq)).unwrap(),
+            e.seq.to_le_bytes()
+        );
+    }
+    assert!(
+        !Path::new(&dir("dst/z")).exists(),
+        "nothing is made for an unpublished store"
+    );
+    link_stores(&[]).unwrap();
+}

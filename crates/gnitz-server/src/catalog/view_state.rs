@@ -24,7 +24,8 @@ impl CatalogEngine {
     /// A view is **valid** (resumed) iff:
     ///   * the recorded topology matches the launched `(worker_count, STATE_FORMAT)`
     ///     — a different worker count re-shapes every keyed store's row placement;
-    ///   * every child that carries its state is stamped with the committed
+    ///   * its output child and every trace child its compiled circuit declares
+    ///     ([`RelationRegistry::declare_traces`]) are stamped with the committed
     ///     checkpoint generation, which
     ///     [`RelationRegistry::view_children_resumable`] answers. That is
     ///     `resume_generation`, the recovered `G`: the durable one is `G+1`
@@ -52,7 +53,7 @@ impl CatalogEngine {
             return;
         }
 
-        // Local validity: every output child's manifest at `g`. A view over a
+        // Local validity: every child the view's state needs, at `g`. A view over a
         // stream or a system family needs no manifest read.
         // An unreadable manifest reads as a mismatch, which is the verdict a child
         // whose manifest a previous open erased must get: its siblings may still

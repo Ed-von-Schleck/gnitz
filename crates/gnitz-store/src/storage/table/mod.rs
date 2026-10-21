@@ -186,7 +186,7 @@ impl Table {
         };
         if loaded.is_none() && rederived && !created {
             // So a later re-open cannot reload what this one rejected.
-            super::manifest::unlink(dir)?;
+            super::manifest::unlink(&[dir])?;
         }
         let loaded_mark = loaded.as_ref().map(|m| m.checkpoint_mark);
         let manifest_in_place = loaded.as_ref().map(super::manifest::encode);

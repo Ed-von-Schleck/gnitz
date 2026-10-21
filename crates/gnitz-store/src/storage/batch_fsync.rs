@@ -24,7 +24,7 @@ static BLOCKING: LazyLock<AtomicBool> =
 
 /// The ring, or `None` for blocking fsync: where this host denies io_uring, or
 /// `GNITZ_DISABLE_IO_URING` is set.
-pub(super) fn new_ring() -> Result<Option<IoUring>, StorageError> {
+fn new_ring() -> Result<Option<IoUring>, StorageError> {
     if BLOCKING.load(Relaxed) {
         return Ok(None);
     }
@@ -40,23 +40,44 @@ pub(super) fn new_ring() -> Result<Option<IoUring>, StorageError> {
     Ok(None)
 }
 
-/// Sync `paths`, [`FD_CHUNK_THRESHOLD`] open files at a time; `DATASYNC` in
-/// `flags` selects fdatasync.
-pub(super) fn sync_paths<P: AsRef<Path>>(
-    ring: &mut Option<IoUring>,
-    paths: impl IntoIterator<Item = P>,
-    flags: FsyncFlags,
-) -> Result<(), StorageError> {
-    let mut paths = paths.into_iter().peekable();
-    while paths.peek().is_some() {
-        let files: Vec<File> = paths
-            .by_ref()
-            .take(FD_CHUNK_THRESHOLD)
-            .map(File::open)
-            .collect::<Result<_, _>>()?;
-        batch_sync_with(ring.as_mut(), &files, flags, |r, want| r.submit_and_wait(want))?;
+/// Syncs batches of files through one ring, set up on the first chunk of more
+/// than one file: a lone file's sync is one blocking call, cheaper than setting
+/// up a ring, and a ring's memory is returned to the locked-memory budget only
+/// some time after it closes, so a run of single syncs that each set one up can
+/// exhaust it.
+#[derive(Default)]
+pub(super) struct Syncer {
+    /// `None` until a chunk needs it; `Some(None)` where syncs block.
+    ring: Option<Option<IoUring>>,
+}
+
+impl Syncer {
+    /// Sync `paths`, [`FD_CHUNK_THRESHOLD`] open files at a time; `DATASYNC`
+    /// in `flags` selects fdatasync.
+    pub(super) fn sync_paths<P: AsRef<Path>>(
+        &mut self,
+        paths: impl IntoIterator<Item = P>,
+        flags: FsyncFlags,
+    ) -> Result<(), StorageError> {
+        let mut paths = paths.into_iter().peekable();
+        while paths.peek().is_some() {
+            let files: Vec<File> = paths
+                .by_ref()
+                .take(FD_CHUNK_THRESHOLD)
+                .map(File::open)
+                .collect::<Result<_, _>>()?;
+            let ring = if files.len() > 1 { self.ring()? } else { None };
+            batch_sync_with(ring, &files, flags, |r, want| r.submit_and_wait(want))?;
+        }
+        Ok(())
     }
-    Ok(())
+
+    fn ring(&mut self) -> Result<Option<&mut IoUring>, StorageError> {
+        if self.ring.is_none() {
+            self.ring = Some(new_ring()?);
+        }
+        Ok(self.ring.as_mut().and_then(Option::as_mut))
+    }
 }
 
 /// Sync every file in `files`, with the submit call injectable for tests.

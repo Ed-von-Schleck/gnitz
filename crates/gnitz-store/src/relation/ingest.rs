@@ -240,20 +240,16 @@ impl RelationRegistry {
     }
 
     /// The ephemeral round at `generation`: the rederived stores of every
-    /// relation `resumes` picks and, of `state`, those relations' operator
-    /// traces, in one barrier. A relation no round ever picks has no manifest,
-    /// so every open rebuilds it.
+    /// relation `resumes` picks and `state`, those relations' operator traces,
+    /// in one barrier. A relation no round ever picks has no manifest, so every
+    /// open rebuilds it.
     pub fn checkpoint_ephemeral<'s>(
         &mut self,
         state: impl IntoIterator<Item = (u64, &'s mut crate::relation::CircuitState)>,
         generation: u64,
         resumes: impl Fn(u64) -> bool,
     ) -> Result<(), String> {
-        let mut tables: Vec<&mut Table> = state
-            .into_iter()
-            .filter(|(id, _)| resumes(*id))
-            .flat_map(|(_, s)| s.tables_mut())
-            .collect();
+        let mut tables: Vec<&mut Table> = state.into_iter().flat_map(|(_, s)| s.tables_mut()).collect();
         tables.extend(self.collect_user_tables(resumes).filter(|t| t.is_rederived()));
         crate::storage::flush_barrier(tables, generation).map_err(|e| format!("ephemeral flush: {e}"))
     }

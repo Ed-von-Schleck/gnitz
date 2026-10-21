@@ -45,9 +45,10 @@ fn sync_paths_spans_several_chunks() {
             p
         })
         .collect();
-    for mut ring in [Some(ring()), None] {
-        sync_paths(&mut ring, &paths, DATASYNC).expect("chunked fdatasync");
-        sync_paths(&mut ring, [dir.path()], FsyncFlags::empty()).expect("directory fsync");
+    for mut sync in [Syncer::default(), Syncer { ring: Some(None) }] {
+        sync.sync_paths(&paths, DATASYNC).expect("chunked fdatasync");
+        sync.sync_paths([dir.path()], FsyncFlags::empty())
+            .expect("directory fsync");
     }
 }
 

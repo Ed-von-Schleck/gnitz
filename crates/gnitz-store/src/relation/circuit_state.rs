@@ -31,6 +31,11 @@ impl StateLayout {
         self.children.push((child, schema));
         idx
     }
+
+    /// The name of every child declared, in [`StateIdx`] order.
+    pub(super) fn names(&self) -> impl Iterator<Item = &str> {
+        self.children.iter().map(|(name, _)| name.as_str())
+    }
 }
 
 /// The rederived operator state of one compiled circuit: the stores its stateful

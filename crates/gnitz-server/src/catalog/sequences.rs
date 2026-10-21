@@ -140,8 +140,9 @@ impl CatalogEngine {
     /// `generation`.
     pub(crate) fn flush_ephemeral_round(&mut self, generation: u64) -> Result<(), String> {
         let never = self.never_resumed_views();
-        self.registry
-            .checkpoint_ephemeral(self.dag.ephemeral_states(), generation, |id| !never.contains(&id))
+        let resumes = |id| !never.contains(&id);
+        let states = self.dag.ephemeral_states(&self.registry, resumes)?;
+        self.registry.checkpoint_ephemeral(states, generation, resumes)
     }
 
     /// Record the launched topology. Durable at the next system flush.

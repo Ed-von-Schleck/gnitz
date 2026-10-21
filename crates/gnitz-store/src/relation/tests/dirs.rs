@@ -64,27 +64,42 @@ fn stamp(dir: &str, generation: u64) {
     flush_barrier([&mut scratch_table(dir, make_schema_u64_i64())], generation).unwrap();
 }
 
+/// The verdict reads every rank's rows child and every declared trace child,
+/// whatever else the directory holds.
 #[test]
-fn children_at_generation_reads_the_rows_and_the_scratch() {
+fn children_at_generation_reads_the_rows_and_the_declared_scratch() {
     const G: u64 = 5;
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap().to_string();
-    assert!(!children_at_generation(&dir, 2, G), "an absent rank is a mismatch");
+    let traces = ["agg".to_string()];
+    assert!(
+        !children_at_generation(&dir, 2, G, &traces),
+        "an absent rank is a mismatch"
+    );
 
     for name in ["w0of2", "w1of2", "scratch_agg_w0of2", "scratch_agg_w1of2"] {
         stamp(&format!("{dir}/{name}"), G);
     }
-    assert!(children_at_generation(&dir, 2, G));
+    assert!(children_at_generation(&dir, 2, G, &traces));
 
-    for name in ["idx_7_w0of2", "w0of4", "not_a_child"] {
+    for name in ["idx_7_w0of2", "w0of4", "scratch_old_w0of2", "not_a_child"] {
         std::fs::create_dir_all(format!("{dir}/{name}")).unwrap();
     }
-    assert!(children_at_generation(&dir, 2, G), "unstamped kinds are not read");
+    assert!(
+        children_at_generation(&dir, 2, G, &traces),
+        "undeclared children are not read"
+    );
 
     stamp(&format!("{dir}/scratch_agg_w1of2"), G - 1);
     assert!(
-        !children_at_generation(&dir, 2, G),
+        !children_at_generation(&dir, 2, G, &traces),
         "a stale scratch child is a mismatch"
+    );
+
+    std::fs::remove_dir_all(format!("{dir}/scratch_agg_w1of2")).unwrap();
+    assert!(
+        !children_at_generation(&dir, 2, G, &traces),
+        "a declared scratch child with no directory is a mismatch"
     );
 }
 
@@ -110,7 +125,7 @@ fn a_published_store_put_elsewhere_opens_with_the_checkpointed_rows() {
 
     let dest = tempfile::tempdir().unwrap();
     let dest = dest.path().to_str().unwrap();
-    assert_eq!(r.link_published_into(dest).unwrap(), 1);
+    r.link_published_into(dest).unwrap();
     let index = ChildAddr {
         kind: ChildKind::Index(PkColList::from_slice(&[1])),
         slot: Slot::SOLO,
@@ -160,9 +175,9 @@ fn persisted_records_reads_well_formed_relation_manifests() {
 }
 
 /// A sweep removes every relation directory no relation holds, and every child
-/// of a held one laid out for another worker count or an index no circuit
-/// covers; it leaves the rest, a name in no child grammar included, and a second
-/// sweep finds nothing to remove.
+/// of a held one laid out for another worker count, an index no circuit covers
+/// or a trace none declares; it leaves the rest, a name in no child grammar
+/// included, and a second sweep finds nothing to remove.
 #[test]
 fn a_sweep_reclaims_exactly_what_no_relation_owns() {
     let schema = make_schema_u64_i64();
@@ -177,6 +192,9 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
         PkColList::from_slice(&[1]),
     )
     .unwrap();
+    let mut traces = crate::relation::StateLayout::default();
+    traces.declare("agg".to_string(), schema);
+    r.declare_traces(TID, &traces).unwrap();
     r.ingest(TID, make_batch_raw(&schema, &[(1, 1, 7)])).unwrap();
     r.checkpoint_base().unwrap();
 
@@ -189,6 +207,7 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
         format!("{rel}/scratch_agg_w1of2"),
         format!("{rel}/idx_7_w0of2"),
         format!("{rel}/idx_0-1_w0of3"),
+        format!("{rel}/scratch_old_w0of3"),
     ];
     let kept = [
         format!("{rel}/w0of3"),

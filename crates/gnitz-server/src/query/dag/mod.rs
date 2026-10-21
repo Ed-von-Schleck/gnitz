@@ -9,7 +9,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::query::compiler::{self, CompileOutput};
 use crate::query::vm;
-use gnitz_store::relation::{CircuitState, Cut, RelationRegistry};
+use gnitz_store::relation::{CircuitState, Cut, RelationRegistry, StateLayout};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::algebra::{self, ScatterPlan, Slot};
 use gnitz_zset::repr::Batch;
@@ -95,6 +95,12 @@ impl DagEngine {
             .is_some_and(|v| v.chain != id && !v.code.vm.reads_view_store())
     }
 
+    /// The operator state the compiled circuit of view `id`, a registered view,
+    /// opens.
+    pub(crate) fn state_layout(&self, id: u64) -> &StateLayout {
+        self.views[&id].code.vm.layout()
+    }
+
     /// The user view whose chain holds view `id`: its owner, or `id` itself.
     pub(crate) fn chain_of(&self, id: u64) -> u64 {
         self.views.get(&id).map_or(id, |v| v.chain)
@@ -126,12 +132,33 @@ impl DagEngine {
 
     // ── Operator state ──────────────────────────────────────────────────
 
-    /// Every opened view's operator state, by view id.
-    pub(crate) fn ephemeral_states(&mut self) -> impl Iterator<Item = (u64, &mut CircuitState)> {
-        self.views
-            .iter_mut()
-            .filter_map(|(&id, v)| Some((id, v.state.as_mut()?)))
+    /// The operator state of every view `checkpointed` picks, by view id, each
+    /// opened on a miss: the round that stamps a view's output store stamps its
+    /// traces with it, run or not, so the next boot finds them at one generation.
+    pub(crate) fn ephemeral_states<'a>(
+        &'a mut self,
+        registry: &RelationRegistry,
+        checkpointed: impl Fn(u64) -> bool,
+    ) -> Result<Vec<(u64, &'a mut CircuitState)>, String> {
+        let views = self.views.iter_mut().filter(|(&id, _)| checkpointed(id));
+        views
+            .map(|(&id, v)| Ok((id, open_state(&mut v.state, registry, id, v.code.vm.layout())?)))
+            .collect()
     }
+}
+
+/// `state`, the operator state of view `view_id`, opened on a miss.
+fn open_state<'a>(
+    state: &'a mut Option<CircuitState>,
+    registry: &RelationRegistry,
+    view_id: u64,
+    layout: &StateLayout,
+) -> Result<&'a mut CircuitState, String> {
+    if state.is_none() {
+        let open = CircuitState::open(registry, view_id, layout);
+        *state = Some(open.map_err(|e| format!("view_id={view_id}: open operator state: {e}"))?);
+    }
+    Ok(state.as_mut().expect("opened above"))
 }
 
 /// `view_id`'s plan, beside the stores a run of it reads: its operator state,
@@ -145,10 +172,6 @@ fn opened<'a>(
     let RegisteredView { code, state, .. } = views
         .get_mut(&view_id)
         .ok_or_else(|| format!("view {view_id} is not registered"))?;
-    if state.is_none() {
-        let open = CircuitState::open(registry, view_id, code.vm.layout());
-        *state = Some(open.map_err(|e| format!("view_id={view_id}: open operator state: {e}"))?);
-    }
-    let own = state.as_mut().expect("opened above");
+    let own = open_state(state, registry, view_id, code.vm.layout())?;
     Ok((code, vm::Stores { own, registry, unfed }))
 }

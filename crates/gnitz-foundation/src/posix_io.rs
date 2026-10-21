@@ -84,6 +84,26 @@ pub fn fsync_dir(dir: &str) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// Rename `from` to `to`, refused with `AlreadyExists` where `to` exists:
+/// `std::fs::rename` replaces a file, or an empty directory, in its place.
+pub fn rename_noreplace(from: &str, to: &str) -> io::Result<()> {
+    let (from, to) = (std::ffi::CString::new(from)?, std::ffi::CString::new(to)?);
+    // SAFETY: both paths are NUL-terminated and outlive the call.
+    let r = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "tests/posix_io.rs"]
 mod tests;

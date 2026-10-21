@@ -9,10 +9,15 @@ use super::*;
 use crate::catalog::{SysFamily, ZoneError, ZoneSink};
 use crate::runtime::reactor::AckLease;
 use crate::runtime::sal::SalScope;
-use gnitz_foundation::posix_io::{self, retry_eintr};
+use gnitz_foundation::fault::Seam;
+use gnitz_foundation::posix_io::retry_eintr;
 
 /// How often a worker's death is probed for.
 pub(crate) const WORKER_WATCH: Duration = Duration::from_millis(100);
+
+/// `GNITZ_INJECT_BACKUP_ABORT`: abort the master between the workers' copies and
+/// its own, as a crash part-way through a backup would.
+static BACKUP_ABORT: Seam = Seam::new("GNITZ_INJECT_BACKUP_ABORT");
 
 /// A `u64` from the OS entropy pool for [`MasterDispatcher::delta_cursor_tag`],
 /// so two back-to-back boots cannot collide.
@@ -381,21 +386,18 @@ impl MasterDispatcher {
 
     /// A backup's copy, run by the committer right behind a checkpoint: every
     /// worker puts the stores it published into the data directory `dir`, then
-    /// the master puts its system families', and the directory tree is synced.
-    /// `dir` exists; everything under it is made here.
+    /// the master puts its system families', each store with the entries that
+    /// reach it durable. `dir` exists; everything under it is made here.
     pub(crate) async fn backup_round(&self, dir: &str) -> Result<(), WireFault> {
-        let relations = gnitz_store::relation::relations_dir(dir);
-        std::fs::create_dir(&relations).map_err(|e| format!("create '{relations}': {e}"))?;
         self.scan_all(Read::Backup { dir: dir.as_bytes().into() })
             .await?
             .finish()
             .await?;
-        self.cat().registry.link_published_into(dir)?;
-        let parent = std::path::Path::new(dir).parent().and_then(std::path::Path::to_str);
-        for d in [Some(relations.as_str()), Some(dir), parent].into_iter().flatten() {
-            posix_io::fsync_dir(d).map_err(|e| format!("fsync '{d}': {e}"))?;
+        if BACKUP_ABORT.armed() {
+            gnitz_fatal_abort!("injected backup abort");
         }
-        gnitz_info!("backup into {} complete", dir);
+        self.cat().registry.link_published_into(dir)?;
+        gnitz_info!("backup copied into {}", dir);
         Ok(())
     }
 
