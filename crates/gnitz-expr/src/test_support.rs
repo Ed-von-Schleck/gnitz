@@ -6,8 +6,9 @@ use std::fmt::Debug;
 
 use gnitz_wire::TypeCode;
 
-use crate::batch::{encode_f64, MORSEL};
+use crate::batch::MORSEL;
 use crate::eval::Resolved;
+use crate::simd::encode_f64;
 use crate::simd::Level;
 use crate::{
     BatchView, ColumnLocator, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg, RowFilter,
@@ -373,12 +374,12 @@ fn checked<E: Resolved, T: PartialEq + Debug>(
     if n == 0 {
         return want;
     }
-    let fast = ev.no_nulls();
-    let arms: &[bool] = if fast { &[true, false] } else { &[false] };
+    // The resolved null tracking, and every register's.
+    let resolved = ev.null_regs();
     for (level_name, level) in simd_levels() {
-        for &no_nulls in arms {
-            ev.set_arm(no_nulls, level);
-            let arm = format!("no_nulls={no_nulls} at {level_name}");
+        for null_regs in [resolved, u64::MAX] {
+            ev.set_arm(null_regs, level);
+            let arm = format!("null_regs={null_regs:#x} at {level_name}");
             assert_eq!(read(ev, mb), want, "{arm}");
             for (label, source) in placements(n) {
                 let got = read(ev, &mb.tiled(&source));
@@ -388,7 +389,7 @@ fn checked<E: Resolved, T: PartialEq + Debug>(
             }
         }
     }
-    ev.set_arm(fast, Level::new());
+    ev.set_arm(resolved, Level::new());
     want
 }
 
@@ -451,7 +452,7 @@ pub fn filter_verdicts(ev: &mut RowFilter, mb: &dyn BatchView) -> Vec<bool> {
 }
 
 /// The maximal runs of `true` in `verdicts`, half-open.
-pub fn runs(verdicts: &[bool]) -> Vec<(usize, usize)> {
+fn runs(verdicts: &[bool]) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::new();
     for (row, _) in verdicts.iter().enumerate().filter(|(_, &v)| v) {
         match out.last_mut() {

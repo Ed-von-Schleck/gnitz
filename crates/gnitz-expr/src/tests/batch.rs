@@ -1,12 +1,11 @@
 use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg, TrimMode};
 use gnitz_wire::{FixedInt, Heap, TypeCode};
 
-use super::{decode_f64, encode_f64, eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MORSEL};
+use super::{decode_f64, encode_f64, MORSEL};
 use crate::eval::Resolved;
 use crate::program::{FloatUnaryOp, IntUnaryOp};
-use crate::simd::Level;
 use crate::test_support::{
-    f64s, filter_prog, i64s, int, make_string_view, pairs, passing_rows, row_strs, row_values, runs, scalar_prog,
+    f64s, filter_prog, i64s, int, make_string_view, pairs, passing_rows, row_strs, row_values, scalar_prog,
     schema_pk_strings, text, verdicts, view, Col, TestView,
 };
 use crate::{CalendarOp, CmpOp, LogicalInstr, ScalarEval};
@@ -565,42 +564,6 @@ fn calendar_ops_read_their_columns_representation() {
 }
 
 // ---------------------------------------------------------------------------
-// The filter-bit scan
-// ---------------------------------------------------------------------------
-
-/// `scan_filter_bits` against a bit-by-bit run collector: every maximal run of
-/// set bits below `n`, over single bits at both ends of a word, whole words set
-/// and clear, and runs crossing and ending on word boundaries.
-#[test]
-fn scan_filter_bits_reports_every_maximal_run() {
-    let naive = |bits: &[u64], n: usize| runs(&(0..n).map(|i| bits[i / 64] >> (i % 64) & 1 != 0).collect::<Vec<_>>());
-    let words = [
-        0,
-        u64::MAX,
-        1,
-        1 << 63,
-        0x5555_5555_5555_5555,
-        0xF0F0_0000_0000_000F,
-        0x8000_0000_0000_0001,
-    ];
-    for a in words {
-        for b in words {
-            for c in words {
-                for n in [1, 63, 64, 65, 127, 128, 150, 191, 192] {
-                    let mut bits = [a, b, c];
-                    bits[n / 64..].iter_mut().enumerate().for_each(|(k, w)| {
-                        *w &= if k == 0 { gnitz_wire::low_bits_mask(n % 64) } else { 0 };
-                    });
-                    let mut got = Vec::new();
-                    scan_filter_bits(&bits[..n.div_ceil(64)], n, &mut got);
-                    assert_eq!(got, naive(&bits, n), "{bits:x?} n={n}");
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // String registers
 // ---------------------------------------------------------------------------
 
@@ -640,17 +603,16 @@ fn every_string_column_addresses_its_own_region_in_place() {
     // Drive the loads alone and read back which buffer each lane resolved
     // against — the claim the concatenation below cannot make, since its own
     // result always lands in the arena.
-    let mut scratch = EvalScratch::new(ev.prog(), Level::new());
-    with_str_bufs(ev.prog(), &view, |bufs| {
-        eval_batch(ev.prog(), &view, bufs, 0, 1, &mut scratch)
-    });
+    let evaluator = ev.ev_mut().expect("an evaluated program");
+    evaluator.eval_morsels(&view, 0, 1, |_, _| {});
+    let lanes = &evaluator.scratch.str_views;
     for (c, val) in vals.iter().enumerate() {
         let want = match gnitz_wire::german_string_inline(crate::BatchView::col_data(&view, c, 16)) {
             Some(_) => super::SRC_COL_BASE + c as u32,
             None => super::SRC_BLOB,
         };
         assert_eq!(
-            scratch.str_views[c][0].src,
+            lanes[c][0].src,
             want,
             "column {c} ({} bytes) loaded through the wrong buffer",
             val.len(),
@@ -962,7 +924,7 @@ fn text_to_int_accepts_only_plain_decimal_and_range_checks_the_target() {
         // PostgreSQL 16+ accepts these; the decimal loop deliberately does not.
         ("0x10", None),
         ("1_000", None),
-        // 39 digits overflows i128's accumulate; the checked ops make it NULL,
+        // 39 digits overflows the u64 accumulate; the checked ops make it NULL,
         // never a wrap.
         ("999999999999999999999999999999999999999", None),
     ];
@@ -1032,8 +994,8 @@ fn a_constant_string_outlives_every_morsel_reset() {
 // ---------------------------------------------------------------------------
 
 /// `IS [NOT] NULL` over a register reads its null lane whatever class the
-/// register is, and its own result is never NULL. On the `no_nulls` arm no lane
-/// exists and nothing is NULL, so the answer is the constant.
+/// register is, and its own result is never NULL. Outside `null_regs` every
+/// null lane is zero, so the answer is the constant.
 #[test]
 fn is_null_reg_reads_the_null_lane_of_either_class() {
     for invert in [false, true] {

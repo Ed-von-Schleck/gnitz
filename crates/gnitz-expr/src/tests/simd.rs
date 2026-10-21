@@ -72,7 +72,7 @@ fn check_pred<P: LanePred>(name: &str, holds: impl Fn(i64, i64) -> bool) {
 
 #[test]
 fn a_predicate_is_its_operator_per_row_and_per_vector() {
-    let f = |x: i64| f64::from_bits(x as u64);
+    let f = super::decode_f64;
     // An unsigned `x` against a signed `y`, widened so both fit.
     let wide = |x: i64, y: i64| (x as u64 as i128, y as i128);
     check_pred::<Eq>("Eq", |x, y| x == y);

@@ -32,8 +32,20 @@ pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
         write_u64_le(&mut st, 8, blob.len() as u64);
         blob.extend_from_slice(s);
     } else {
-        // Prefix and suffix are one run: the whole value, inline.
-        st[GERMAN_INLINE_OFF..GERMAN_INLINE_OFF + len].copy_from_slice(s);
+        // The whole value, inline, in overlapping fixed-width copies: no
+        // `memcpy` call for a run-time length.
+        let d = &mut st[GERMAN_INLINE_OFF..];
+        if len >= 8 {
+            d[..8].copy_from_slice(&s[..8]);
+            d[len - 8..len].copy_from_slice(&s[len - 8..]);
+        } else if len >= 4 {
+            d[..4].copy_from_slice(&s[..4]);
+            d[len - 4..len].copy_from_slice(&s[len - 4..]);
+        } else {
+            for (d, &b) in d.iter_mut().zip(s) {
+                *d = b;
+            }
+        }
     }
     st
 }

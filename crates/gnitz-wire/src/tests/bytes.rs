@@ -32,3 +32,44 @@ fn bit_iter_yields_set_bits_lowest_first() {
     assert_eq!(BitIter(1u64 << 63).collect::<Vec<_>>(), vec![63]);
     assert_eq!(BitIter(low_bits_mask(64)).count(), 64);
 }
+
+/// `set_bit_runs` against a bit-by-bit run collector: every maximal run of set
+/// bits below `n`, over single bits at both ends of a word, whole words set and
+/// clear, and runs crossing and ending on word boundaries.
+#[test]
+fn set_bit_runs_reports_every_maximal_run() {
+    let naive = |bits: &[u64], n: usize| {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for i in (0..n).filter(|&i| bits[i / 64] >> (i % 64) & 1 != 0) {
+            match out.last_mut() {
+                Some((_, end)) if *end == i => *end = i + 1,
+                _ => out.push((i, i + 1)),
+            }
+        }
+        out
+    };
+    let words = [
+        0,
+        u64::MAX,
+        1,
+        1 << 63,
+        0x5555_5555_5555_5555,
+        0xF0F0_0000_0000_000F,
+        0x8000_0000_0000_0001,
+    ];
+    for a in words {
+        for b in words {
+            for c in words {
+                for n in [1, 63, 64, 65, 127, 128, 150, 191, 192] {
+                    let mut bits = [a, b, c];
+                    bits[n / 64..].iter_mut().enumerate().for_each(|(k, w)| {
+                        *w &= if k == 0 { low_bits_mask(n % 64) } else { 0 };
+                    });
+                    let mut got = Vec::new();
+                    set_bit_runs(&bits[..n.div_ceil(64)], n, &mut got);
+                    assert_eq!(got, naive(&bits, n), "{bits:x?} n={n}");
+                }
+            }
+        }
+    }
+}

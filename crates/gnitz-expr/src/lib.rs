@@ -72,7 +72,7 @@ mod search;
 mod simd;
 mod view;
 
-pub use batch::{scan_filter_bits, FloatText};
+pub use batch::FloatText;
 pub use builder::*;
 pub use calendar::CalendarOp;
 pub use eval::*;

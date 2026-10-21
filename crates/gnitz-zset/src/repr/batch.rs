@@ -41,7 +41,7 @@ pub(crate) fn runs_where(n: usize, keep: impl Fn(usize) -> bool) -> Vec<(usize, 
         .map(|base| (base..n.min(base + 64)).fold(0, |bits, row| bits | u64::from(keep(row)) << (row - base)))
         .collect();
     let mut runs = Vec::new();
-    gnitz_expr::scan_filter_bits(&kept, n, &mut runs);
+    gnitz_wire::set_bit_runs(&kept, n, &mut runs);
     runs
 }
 

@@ -28,10 +28,10 @@ fn a_program_whose_sinks_do_not_fit_its_role_is_refused() {
     assert!(LogicalProgram::copy_cols(&[1]).resolve_map(&schema, &schema).is_ok());
 }
 
-/// A program resolves `no_nulls` exactly when nothing in it can produce a NULL
-/// against the schema.
+/// A program resolves no register that tracks NULLs exactly when nothing in it
+/// can produce a NULL against the schema.
 #[test]
-fn no_nulls_holds_exactly_when_nothing_can_produce_a_null() {
+fn no_register_tracks_nulls_exactly_when_nothing_can_produce_one() {
     use LogicalInstr as L;
     let ints = |nullable| schema_pk_ints(3, nullable);
     let strs = |nullable| schema_pk_strings(2, nullable);
@@ -177,7 +177,35 @@ fn no_nulls_holds_exactly_when_nothing_can_produce_a_null() {
     ];
     for (label, schema, instrs, want) in cases {
         let prog = scalar_prog(&schema, instrs, vec![b"m".to_vec()]);
-        assert_eq!(prog.prog().no_nulls, want, "{label}");
+        assert_eq!(prog.prog().null_regs == 0, want, "{label}");
+    }
+}
+
+/// A register tracks NULLs exactly when its kernel can make one, it decodes a
+/// nullable column, or it reads such a register other than by a null test.
+#[test]
+fn null_regs_holds_exactly_the_registers_that_can_be_null() {
+    use LogicalInstr as L;
+    let ints = schema_pk_ints(2, true);
+    let (col, not_null_col) = (L::LoadCol { col: 1 }, L::LoadCol { col: 0 });
+    let neg = |a| L::IntUnary { op: IntUnaryOp::Neg, a: Reg(a) };
+    let cases: Vec<(&str, Vec<LogicalInstr>, u64)> = vec![
+        ("a nullable operand", vec![col, neg(0)], 0b11),
+        ("a NOT NULL operand", vec![not_null_col, neg(0), col], 0b100),
+        (
+            "a null test of a nullable register",
+            vec![col, L::IsNullReg { a: Reg(0), invert: false }, neg(1)],
+            0b001,
+        ),
+        (
+            "a NULL its kernel makes",
+            vec![not_null_col, L::IntCast { a: Reg(0), fi: FixedInt::I8 }, neg(1)],
+            0b110,
+        ),
+    ];
+    for (label, instrs, want) in cases {
+        let prog = scalar_prog(&ints, instrs, vec![]);
+        assert_eq!(prog.prog().null_regs, want, "{label}");
     }
 }
 

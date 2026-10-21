@@ -12,9 +12,10 @@
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{FixedInt, RowSource, TypeCode};
 
-use crate::batch::{encode_f64, MORSEL};
+use crate::batch::MORSEL;
 use crate::eval::Resolved;
 use crate::program::{FloatUnaryOp, IntUnaryOp};
+use crate::simd::encode_f64;
 use crate::simd::{self, Level};
 use crate::test_support::{
     filter_prog, filter_verdicts, int, make_n_col_view, make_string_view, map_prog, map_rows, passing_rows, schema_pk,
@@ -63,12 +64,12 @@ impl Meter {
         ev: &mut E,
         mut pass: impl FnMut(&mut E) -> T,
     ) {
-        let no_nulls = ev.no_nulls();
+        let null_regs = ev.null_regs();
         for (level_name, level) in simd_levels() {
-            ev.set_arm(no_nulls, level);
+            ev.set_arm(null_regs, level);
             self.pass(bench, &format!("{case} @{level_name}"), rows, || pass(ev));
         }
-        ev.set_arm(no_nulls, Level::new());
+        ev.set_arm(null_regs, Level::new());
     }
 
     /// [`Self::levels`] of a filter's `ranges` over `view`.
@@ -220,7 +221,7 @@ fn filter_kernel_bench() {
         L::BoolBinary { is_or: false, a: Reg(3), b: Reg(6) },
     ];
 
-    // Five literal comparisons over one column: the `no_nulls` arm's cheapest
+    // Five literal comparisons over one column: the untracked-null arm's cheapest
     // per-row work carrying the most constant registers, which is where a
     // per-morsel constant refill would show.
     let mut lit_instrs = vec![L::LoadCol { col: 1 }];
@@ -311,7 +312,7 @@ fn filter_kernel_bench() {
 }
 
 /// `col1 IS NULL AND col2 > k AND …` over `n_cmp` NOT NULL columns, so the
-/// whole predicate resolves `no_nulls`.
+/// whole predicate resolves no nullable register.
 fn is_null_chain(bound: i64, n_cmp: u32) -> Vec<LogicalInstr> {
     let mut instrs = vec![L::IsNull { col: 1, invert: false }];
     if n_cmp == 0 {
@@ -334,8 +335,8 @@ fn is_null_chain(bound: i64, n_cmp: u32) -> Vec<LogicalInstr> {
     instrs
 }
 
-/// The `no_nulls` arm against the nullable one for an `IS [NOT] NULL`
-/// predicate, and for a null test into a register sink. Read the cycles too:
+/// No register's null words tracked against every register's, for an
+/// `IS [NOT] NULL` predicate, and for a null test into a register sink. Read the cycles too:
 /// only they see a stall.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
@@ -370,11 +371,11 @@ fn is_null_arm_bench() {
     ];
     for (name, view, instrs) in shapes {
         let mut f = filter_prog(&schema, instrs, vec![]);
-        assert!(f.no_nulls(), "{name}: must resolve no_nulls");
+        assert_eq!(f.null_regs(), 0, "{name}: must resolve no nullable register");
         // Also the arms' agreement check.
         passing_rows(&mut f, view);
-        for (arm, no_nulls) in [("fast", true), ("nullable", false)] {
-            f.set_arm(no_nulls, Level::new());
+        for (arm, null_regs) in [("fast", 0), ("nullable", u64::MAX)] {
+            f.set_arm(null_regs, Level::new());
             meter.filter("is_null_arm_bench", &format!("{name}/{arm}"), &mut f, view);
         }
     }
@@ -384,8 +385,8 @@ fn is_null_arm_bench() {
     let mut map = map_prog(&schema, &out, is_null_chain(0, 0), vec![Sink::Reg(Reg(0))], vec![]);
     map_rows(&mut map, &out, &spread);
     let mut dst = TestView::for_schema(&out, n);
-    for (arm, no_nulls) in [("fast", true), ("nullable", false)] {
-        map.set_arm(no_nulls, Level::new());
+    for (arm, null_regs) in [("fast", 0), ("nullable", u64::MAX)] {
+        map.set_arm(null_regs, Level::new());
         meter.levels("is_null_arm_bench", &format!("map/{arm}"), n, &mut map, |m| {
             m.write_computed(&spread, 0, n, &mut dst, 0)
         });

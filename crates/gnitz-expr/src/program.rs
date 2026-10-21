@@ -665,11 +665,7 @@ pub enum LogicalInstr {
     IntToStr {
         a: Reg,
     },
-    /// Float register to text: the shortest round-trip decimal, switched to
-    /// scientific notation outside `[1e-4, 1e15)` so the output stays bounded
-    /// (Rust's positional `Display` renders `1e300` as 301 digits). The
-    /// non-finite values spell `Infinity` / `-Infinity` / `NaN`, as PostgreSQL
-    /// does.
+    /// Float register to text, as [`crate::FloatText`] spells it.
     FloatToStr {
         a: Reg,
     },
@@ -845,7 +841,6 @@ pub(crate) enum Instr {
         a: u16,
         b: u16,
     },
-    LoadNull,
     /// Three-valued AND, or OR when `is_or` — one kernel, the operator carried
     /// as data, as [`LogicalInstr::BoolBinary`] carries it.
     BoolBinary {
@@ -886,7 +881,6 @@ pub(crate) enum Instr {
     LoadColStr {
         pi: u8,
     },
-    LoadNullStr,
     StrSelect {
         cond: u16,
         a: u16,
@@ -928,8 +922,7 @@ pub(crate) enum Instr {
         skip_null: bool,
     },
     IntToStr {
-        a: u16,
-        signed: bool,
+        a: IntReg,
     },
     FloatToStr {
         a: u16,
@@ -1457,7 +1450,13 @@ impl LogicalProgram {
         use Instr as I;
         use LogicalInstr as L;
 
-        let ProgramFacts { bit_only, bool_pack, no_nulls, reg_u64 } = self.analyze(schema, sink_read)?;
+        let ProgramFacts {
+            bit_only,
+            bool_pack,
+            null_regs,
+            reg_u64,
+            str_cols,
+        } = self.analyze(schema, sink_read)?;
         let str_class = self.str_class;
 
         let payload_slot = |col: u32| match schema.payload_slot(col as usize) {
@@ -1477,22 +1476,16 @@ impl LogicalProgram {
         // and each stream entry would cost the per-morsel dispatch a no-op arm.
         let mut const_regs: Vec<(u16, i64)> = Vec::new();
         let mut const_str_regs: Vec<(u16, u32, u32)> = Vec::new();
-        // Bit `pi` per string column some `LoadColStr` loads; `with_str_bufs` resolves
-        // one column region per set bit.
-        let mut str_cols: u64 = 0;
+        let mut const_nulls: u64 = 0;
         // Answered once per register by `analyze`, off each opcode's `U64Rule`,
         // so no arm below restates the rule.
         let is_u64 = |r: u16| (reg_u64 >> r) & 1 != 0;
         let int_reg = |r: Reg| IntReg { reg: r.0, signed: !is_u64(r.0) };
         let nullable_slots = schema.nullable_payload_slots();
-        // A register file is exactly one entry per instruction.
-        let num_regs = self.instrs.len() as u32;
         for (i, li) in self.instrs.iter().copied().enumerate() {
             // A register is the index of the instruction that writes it.
             let dst = i as u16;
-            // One logical instruction, one resolved instruction — bar the
-            // constants (the two loads, and a null test over a column that
-            // cannot be NULL), which leave the stream for their own tables.
+            // A constant leaves the stream for its own table.
             let resolved = match li {
                 L::LoadCol { col } => {
                     let loc = locate_col(schema, col, ColKind::ScalarCol)?;
@@ -1552,7 +1545,10 @@ impl LogicalProgram {
                 L::FloatMinMax2 { a: Reg(a), b: Reg(b), is_max } => I::FloatMinMax2 { a, b, is_max },
                 L::IntToFloat { a: Reg(a) } => I::IntToFloat { a, signed: !is_u64(a) },
                 L::Select { cond: Reg(cond), a: Reg(a), b: Reg(b) } => I::Select { cond, a, b },
-                L::LoadNull => I::LoadNull,
+                L::LoadNull | L::LoadNullStr => {
+                    const_nulls |= 1u64 << dst;
+                    continue;
+                }
                 L::BoolBinary { a: Reg(a), b: Reg(b), is_or } => I::BoolBinary { a, b, is_or },
                 L::BoolNot { a: Reg(a) } => I::BoolNot { a },
                 // A column that cannot be NULL — a PK column, or a `NOT NULL`
@@ -1586,11 +1582,7 @@ impl LogicalProgram {
                     int_sets[si].get_or_insert_with(|| decode_int_set(&self.const_strings[si]));
                     I::IntInSet { value_reg, set_idx }
                 }
-                L::LoadColStr { col } => {
-                    let pi = payload_slot(col)?;
-                    str_cols |= 1u64 << pi;
-                    I::LoadColStr { pi }
-                }
+                L::LoadColStr { col } => I::LoadColStr { pi: payload_slot(col)? },
                 L::LoadConstStr { const_idx: ConstIdx(const_idx) } => {
                     let ci = const_idx as usize;
                     let (off, len) = *const_spans[ci].get_or_insert_with(|| {
@@ -1602,7 +1594,6 @@ impl LogicalProgram {
                     const_str_regs.push((dst, off, len));
                     continue;
                 }
-                L::LoadNullStr => I::LoadNullStr,
                 L::StrSelect { cond: Reg(cond), a: Reg(a), b: Reg(b) } => I::StrSelect { cond, a, b },
                 L::StrCmp { op, a: Reg(a), b: Reg(b) } => I::StrCmp { op, a, b },
                 L::StrLen { a: Reg(a), chars } => I::StrLen { a, chars },
@@ -1638,7 +1629,7 @@ impl LogicalProgram {
                     I::StrLike { src, matcher_idx }
                 }
                 L::StrConcat { a: Reg(a), b: Reg(b), skip_null } => I::StrConcat { a, b, skip_null },
-                L::IntToStr { a: Reg(a) } => I::IntToStr { a, signed: !is_u64(a) },
+                L::IntToStr { a } => I::IntToStr { a: int_reg(a) },
                 L::FloatToStr { a: Reg(a) } => I::FloatToStr { a },
                 L::StrToInt { a: Reg(a), fi } => I::StrToInt { a, fi },
                 L::StrToFloat { a: Reg(a) } => I::StrToFloat { a },
@@ -1654,23 +1645,22 @@ impl LogicalProgram {
             instrs.push((dst, resolved));
         }
         Ok(ResolvedProgram {
-            no_nulls,
+            null_regs,
             nullable_slots,
             bit_only_mask: bit_only,
             bool_pack_mask: bool_pack,
             instrs,
             const_regs,
             const_str_regs,
+            const_nulls,
             const_cells: dense(const_cells),
             int_sets: dense(int_sets),
             trim_sets: dense(trim_sets),
             like_matchers,
             const_arena,
+            // A register file is exactly one entry per instruction.
+            num_regs: self.instrs.len() as u32,
             str_lanes: MAX_REGS as u32 - str_class.leading_zeros(),
-            scalar_lanes: (0..num_regs)
-                .rev()
-                .find(|&r| (str_class >> r) & 1 == 0)
-                .map_or(0, |r| r + 1),
             str_cols,
             reg_u64,
         })
@@ -1688,17 +1678,19 @@ impl LogicalProgram {
             ReadAs::Value | ReadAs::Str => non_bool_read |= 1u64 << reg.0,
         };
         let nullable_slots = schema.nullable_payload_slots();
-        let mut no_nulls = true;
-        let mut reg_u64 = 0u64;
+        let (mut null_regs, mut reg_u64, mut str_cols) = (0u64, 0u64, 0u64);
         for (i, li) in self.instrs.iter().enumerate() {
             let ops = operands(li);
-            let mut col_is_u64 = false;
+            let (mut col_is_u64, mut may_null) = (false, ops.makes_null);
             for &(col, kind) in ops.cols.iter().flatten() {
                 let loc = locate_col(schema, col, kind)?;
                 col_is_u64 |= loc.type_code() == TypeCode::U64;
                 // A kind names a type exactly when its kernel decodes the column
                 // into a register, which is when the null bit flows.
-                no_nulls &= kind.type_test().is_none() || !loc.is_null_word(nullable_slots);
+                may_null |= kind.type_test().is_some() && loc.is_null_word(nullable_slots);
+                if let (ColKind::StringPayload, ColumnLocator::Payload { slot, .. }) = (kind, loc) {
+                    str_cols |= 1u64 << slot;
+                }
             }
             match ops.write {
                 WriteAs::Bool => bool_produced |= 1u64 << i,
@@ -1706,10 +1698,12 @@ impl LogicalProgram {
                 WriteAs::Value(rule) => reg_u64 |= (u64_verdict(rule, &ops, col_is_u64, reg_u64) as u64) << i,
                 WriteAs::Str => {}
             }
-            no_nulls &= !ops.makes_null;
             for &(reg, read) in ops.reads.iter().flatten() {
+                // A null test reads the NULL away; every other read carries it.
+                may_null |= read != ReadAs::NullBit && (null_regs >> reg.0) & 1 != 0;
                 read_as(reg, read);
             }
+            null_regs |= (may_null as u64) << i;
         }
         for reg in self.sinks.iter().filter_map(|s| s.reg()) {
             read_as(reg, sink_read);
@@ -1720,8 +1714,9 @@ impl LogicalProgram {
             // `IsNullReg` as its only possible reader, which reads the null
             // words and never the packed bit.
             bool_pack: bool_input,
-            no_nulls,
+            null_regs,
             reg_u64,
+            str_cols,
         })
     }
 
@@ -1933,8 +1928,9 @@ fn operands(li: &LogicalInstr) -> Operands {
             let ops = writes(WVal(FromOperands)).reading(a, RVal).reading(b, RVal);
             // Spelled out rather than left to a `_` arm: a new operator that
             // *can* produce NULL would otherwise default to `makes_null: false`,
-            // `analyze` would set `no_nulls`, and the evaluator would skip null
-            // tracking — a wrong answer in release with no compile error.
+            // `analyze` would leave its register out of `null_regs`, and the
+            // evaluator would skip its null words — a wrong answer in release
+            // with no compile error.
             match op {
                 IntArithOp::Div | IntArithOp::Mod => ops.may_null(),
                 IntArithOp::Add | IntArithOp::Sub | IntArithOp::Mul => ops,
@@ -2369,6 +2365,9 @@ pub(crate) struct ResolvedProgram {
     /// The string constant registers, as `(destination, `[`Self::const_arena`]
     /// `offset, length)` — the same treatment, over the lane array.
     pub(crate) const_str_regs: Vec<(u16, u32, u32)>,
+    /// Bit `r` set iff register `r` is a NULL constant of either class: its
+    /// null words are set once per evaluator, beside the other constants.
+    pub(crate) const_nulls: u64,
     /// `StrColConst`'s constants as German-string cells, by pool index; a long
     /// one's heap half is in `const_arena`.
     pub(crate) const_cells: Vec<[u8; 16]>,
@@ -2387,26 +2386,27 @@ pub(crate) struct ResolvedProgram {
     /// `const_arena.len()`, so a `LoadConstStr` span stays valid for the
     /// evaluator's life.
     pub(crate) const_arena: Vec<u8>,
-    /// Bit `pi` set iff some `LoadColStr` holds views into payload slot `pi`'s
-    /// string column. A drive resolves one column region per set bit, into the
-    /// slot the bit names — so a string register's `src` is a payload slot, not
-    /// an allocation order, and no column can be left without one.
+    /// Bit `pi` set iff some opcode reads payload slot `pi`'s string column,
+    /// whose region the evaluator then holds in buffer slot `pi`.
     pub(crate) str_cols: u64,
+    /// Registers of either class: a string register keeps its null and truth
+    /// words in the scalar file too.
+    num_regs: u32,
     /// One past the highest string register; 0 for a program with none.
     pub(crate) str_lanes: u32,
-    /// One past the highest scalar register. A string register has no i64 lane.
-    pub(crate) scalar_lanes: u32,
-    /// True iff no instruction can produce a NULL against the schema this program
-    /// was resolved against, so the evaluator skips null-bit tracking entirely.
-    /// Resolved once — the answer is only meaningful for that one schema, since
-    /// the payload indices in `instrs` were assigned from it.
-    pub(crate) no_nulls: bool,
+    /// Bit `r` set iff register `r` may hold a NULL against the schema this
+    /// program was resolved against: its kernel can make one, it decodes a
+    /// nullable column, or it reads such a register other than by a null test.
+    /// A kernel writes no null word for a register outside it, whose operands
+    /// are all outside it too. Only meaningful for that one schema, since the
+    /// payload indices in `instrs` were assigned from it.
+    pub(crate) null_regs: u64,
     /// Bit `N` set iff payload slot `N`'s column admits NULL in the schema this
     /// program was resolved against. A column read from a slot outside this mask
     /// contributes no null bit, so its destination register's null words are
-    /// cleared instead of gathered per row.
+    /// left zero instead of gathered per row.
     ///
-    /// Carries the same schema caveat as [`Self::no_nulls`], and rests on the
+    /// Carries the same schema caveat as [`Self::null_regs`], and rests on the
     /// same assumption it does: a `NOT NULL` column's declared flag is believed
     /// over the bit the batch carries for it.
     pub(crate) nullable_slots: u64,
@@ -2425,9 +2425,13 @@ pub(crate) struct ResolvedProgram {
 }
 
 impl ResolvedProgram {
-    /// One past the highest register of either class.
     pub(crate) fn num_regs(&self) -> usize {
-        self.str_lanes.max(self.scalar_lanes) as usize
+        self.num_regs as usize
+    }
+
+    /// Per instruction per morsel: whether `reg`'s kernel tracks null words.
+    pub(crate) fn may_null(&self, reg: usize) -> bool {
+        (self.null_regs >> reg) & 1 != 0
     }
 
     /// Per instruction per morsel, from the BOOL arms of `eval_batch`.
@@ -2451,13 +2455,14 @@ struct ProgramFacts {
     /// downstream consumer reads it as a truth bit, a filter's result register
     /// included.
     bool_pack: u64,
-    /// True iff no instruction can produce a NULL against the schema, so the
-    /// evaluator skips null-bit tracking entirely.
-    no_nulls: bool,
+    /// [`ResolvedProgram::null_regs`].
+    null_regs: u64,
     /// Bit `r` set iff register `r`'s i64 image is to be read as a `u64`, per
     /// each opcode's [`U64Rule`]. Final rather than running, and safe to read at
     /// any point for the reason [`LogicalProgram::str_class`] gives.
     reg_u64: u64,
+    /// [`ResolvedProgram::str_cols`].
+    str_cols: u64,
 }
 
 /// Whether one opcode's `Value` destination holds a `u64`, per its [`U64Rule`].

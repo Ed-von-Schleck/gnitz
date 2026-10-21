@@ -51,6 +51,18 @@ fn unsigned<S: Simd>(_: S, v: i64x8<S>) -> u64x8<S> {
     v.bitcast()
 }
 
+/// A register lane's raw i64 bits as the `f64` they encode, and back: the
+/// register file's one scalar codec, as [`float`] is its vector reading.
+#[inline(always)]
+pub(crate) fn decode_f64(bits: i64) -> f64 {
+    f64::from_bits(bits as u64)
+}
+
+#[inline(always)]
+pub(crate) fn encode_f64(f: f64) -> i64 {
+    f.to_bits() as i64
+}
+
 /// The lanes as the `f64` image they hold.
 #[inline(always)]
 fn float<S: Simd>(_: S, v: i64x8<S>) -> f64x8<S> {
@@ -89,19 +101,17 @@ lane_pred!(
     /// IEEE comparison, as the two below: a NaN on either side is unordered,
     /// and `-0.0 == 0.0`.
     EqFloat,
-    |x, y| f64::from_bits(x as u64) == f64::from_bits(y as u64),
+    |x, y| decode_f64(x) == decode_f64(y),
     |simd, a, b| float(simd, a).simd_eq(float(simd, b))
 );
-lane_pred!(
-    GtFloat,
-    |x, y| f64::from_bits(x as u64) > f64::from_bits(y as u64),
-    |simd, a, b| float(simd, a).simd_gt(float(simd, b))
-);
-lane_pred!(
-    GeFloat,
-    |x, y| f64::from_bits(x as u64) >= f64::from_bits(y as u64),
-    |simd, a, b| float(simd, a).simd_ge(float(simd, b))
-);
+lane_pred!(GtFloat, |x, y| decode_f64(x) > decode_f64(y), |simd, a, b| float(
+    simd, a
+)
+.simd_gt(float(simd, b)));
+lane_pred!(GeFloat, |x, y| decode_f64(x) >= decode_f64(y), |simd, a, b| float(
+    simd, a
+)
+.simd_ge(float(simd, b)));
 
 /// The lanes as keys whose signed order is `f64::total_cmp`'s over the `f64`
 /// images: a negative image's magnitude bits flipped.
@@ -114,7 +124,7 @@ fn total_key<S: Simd>(_: S, v: i64x8<S>) -> i64x8<S> {
 lane_pred!(
     /// `f64::total_cmp` order, which tells `-0.0` from `0.0` and places a NaN.
     GtTotal,
-    |x, y| f64::from_bits(x as u64).total_cmp(&f64::from_bits(y as u64)).is_gt(),
+    |x, y| decode_f64(x).total_cmp(&decode_f64(y)).is_gt(),
     |simd, a, b| total_key(simd, a).simd_gt(total_key(simd, b))
 );
 

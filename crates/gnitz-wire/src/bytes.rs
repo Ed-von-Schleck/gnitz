@@ -116,6 +116,42 @@ impl Iterator for BitIter {
     }
 }
 
+/// Append every maximal run of set bits below `n` to `out` as `[start, end)`,
+/// one step per run.
+pub fn set_bit_runs(bits: &[u64], n: usize, out: &mut Vec<(usize, usize)>) {
+    // The start of a run that reached the top of the previous word. It continues
+    // into this one only while the low bit is still set.
+    let mut open: Option<usize> = None;
+    for (w, &word) in bits.iter().enumerate() {
+        let base = w * 64;
+        if word & 1 == 0 {
+            if let Some(s) = open.take() {
+                out.push((s, base));
+            }
+        }
+        // Unscanned bits stay in place, so no shift below reaches 64.
+        let mut rest = word;
+        while rest != 0 {
+            let start_bit = rest.trailing_zeros() as usize;
+            // Filling in below the run's start is what makes `trailing_ones`
+            // measure the run rather than the gap under it.
+            let end_bit = (rest | ((1u64 << start_bit) - 1)).trailing_ones() as usize;
+            let start = open.take().unwrap_or(base + start_bit);
+            if end_bit == 64 {
+                open = Some(start); // reaches the top; the next word may continue it
+                break;
+            }
+            out.push((start, base + end_bit));
+            rest &= !((1u64 << end_bit) - 1);
+        }
+    }
+    // A run still open past the last word ends at the batch, not at the bitmap:
+    // `n` is not always a multiple of 64.
+    if let Some(s) = open {
+        out.push((s, n));
+    }
+}
+
 #[inline(always)]
 pub fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());

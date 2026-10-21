@@ -43,8 +43,9 @@ pub(crate) fn native_value<R>(lit: &BExpr<R>, def: &ColumnDef) -> Result<u128, G
 /// at the wire, because neither reaches the wire in time: `ON CONFLICT DO
 /// UPDATE` reads its incoming VALUES batch to build the merged row and never
 /// pushes it, and a transaction's buffered row is read back by later statements
-/// long before COMMIT validates it. Either reader is a program resolved with
-/// `no_nulls = true`, which would take the filler zero for a real value.
+/// long before COMMIT validates it. Either reader is a program that believes the
+/// column's NOT NULL flag over its null bit, so it would take the filler zero for
+/// a real value.
 pub(crate) fn check_not_null(col_def: &ColumnDef, is_null: bool) -> Result<(), GnitzSqlError> {
     if is_null && !col_def.is_nullable {
         return Err(GnitzSqlError::Rejected(format!(

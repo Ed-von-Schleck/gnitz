@@ -1,4 +1,4 @@
-//! The evaluator: a resolved program and its register file ([`Evaluator`]),
+//! The evaluator ([`Evaluator`]),
 //! wrapped in one public type per consumer — [`RowFilter`], [`MapEval`],
 //! [`ScalarEval`] — each exposing only its own read-back.
 //!
@@ -6,11 +6,16 @@
 
 use gnitz_wire::KeyRange;
 
-use crate::batch::{eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MorselOut, MORSEL};
+use crate::batch::Evaluator;
+#[cfg(test)]
+use crate::batch::MorselOut;
 use crate::program::{ColCopy, MapSinks, ReadAs};
 use crate::range::RangeMembership;
+#[cfg(test)]
 use crate::simd::Level;
-use crate::{BatchView, ExprValidateErr, LogicalProgram, MapTarget, ResolvedProgram, SchemaDescriptor, Sink};
+#[cfg(test)]
+use crate::ResolvedProgram;
+use crate::{BatchView, ExprValidateErr, LogicalProgram, MapTarget, SchemaDescriptor, Sink};
 
 /// One program's result for every row of a batch, in the shape its result
 /// register's class fixes.
@@ -24,12 +29,6 @@ pub enum ExprResults {
         bytes: Vec<u8>,
         spans: Vec<Option<(usize, usize)>>,
     },
-}
-
-/// A resolved program and the register file it evaluates into.
-pub(crate) struct Evaluator {
-    pub(crate) prog: ResolvedProgram,
-    scratch: EvalScratch,
 }
 
 /// The only way to obtain an evaluator: each constructor resolves the program
@@ -88,46 +87,6 @@ impl LogicalProgram {
             sinks,
             is_identity,
         })
-    }
-}
-
-impl Evaluator {
-    fn new(prog: ResolvedProgram) -> Self {
-        let scratch = EvalScratch::new(&prog, Level::new());
-        Evaluator { prog, scratch }
-    }
-
-    /// Evaluate rows `start..start + n` a morsel at a time, handing
-    /// `f(rel_start, out)` each morsel's registers; `rel_start` counts from `start`.
-    pub(crate) fn eval_morsels(
-        &mut self,
-        mb: &dyn BatchView,
-        start: usize,
-        n: usize,
-        mut f: impl FnMut(usize, &MorselOut<'_>),
-    ) {
-        debug_assert!(
-            start + n <= mb.row_count(),
-            "eval window {start}..{} is past the batch's end",
-            start + n,
-        );
-        let Evaluator { prog, scratch } = self;
-        with_str_bufs(prog, mb, |bufs| {
-            for rel_start in (0..n).step_by(MORSEL) {
-                let m = MORSEL.min(n - rel_start);
-                eval_batch(prog, mb, bufs, start + rel_start, m, scratch);
-                f(rel_start, &scratch.morsel_out(prog, bufs, m));
-            }
-        });
-    }
-
-    /// Test hook: run this program on the `no_nulls` arm or the nullable one,
-    /// its kernels at `level`. Only a program that resolved `no_nulls` may be
-    /// put back on it.
-    #[cfg(test)]
-    pub(crate) fn set_arm(&mut self, no_nulls: bool, level: Level) {
-        self.prog.no_nulls = no_nulls;
-        self.scratch = EvalScratch::new(&self.prog, level);
     }
 }
 
@@ -201,7 +160,7 @@ impl RowFilter {
         if let Some(w) = &self.walk {
             w.and_into(mb, words);
         }
-        scan_filter_bits(words, n, out);
+        gnitz_wire::set_bit_runs(words, n, out);
     }
 }
 
@@ -332,16 +291,16 @@ pub(crate) trait Resolved {
     fn ev_mut(&mut self) -> Option<&mut Evaluator>;
 
     fn prog(&self) -> &ResolvedProgram {
-        &self.ev().expect("an evaluated program").prog
+        self.ev().expect("an evaluated program").prog()
     }
 
-    fn no_nulls(&self) -> bool {
-        self.ev().is_some_and(|ev| ev.prog.no_nulls)
+    fn null_regs(&self) -> u64 {
+        self.ev().map_or(0, |ev| ev.prog().null_regs)
     }
 
-    fn set_arm(&mut self, no_nulls: bool, level: Level) {
+    fn set_arm(&mut self, null_regs: u64, level: Level) {
         if let Some(ev) = self.ev_mut() {
-            ev.set_arm(no_nulls, level)
+            ev.set_arm(null_regs, level)
         }
     }
 
@@ -360,9 +319,9 @@ impl Resolved for RowFilter {
     fn ev_mut(&mut self) -> Option<&mut Evaluator> {
         self.pred.as_mut().map(|p| &mut p.ev)
     }
-    fn set_arm(&mut self, no_nulls: bool, level: Level) {
+    fn set_arm(&mut self, null_regs: u64, level: Level) {
         if let Some(p) = &mut self.pred {
-            p.ev.set_arm(no_nulls, level);
+            p.ev.set_arm(null_regs, level);
         }
         if let Some(w) = &mut self.walk {
             w.level = level;

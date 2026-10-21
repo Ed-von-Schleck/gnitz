@@ -90,7 +90,7 @@ impl ExprBuilder {
     /// a different number.
     pub fn const_f64(&mut self, v: f64) -> Reg {
         self.emit(LogicalInstr::LoadConst {
-            val: crate::batch::encode_f64(v),
+            val: crate::simd::encode_f64(v),
             unsigned: false,
         })
     }
