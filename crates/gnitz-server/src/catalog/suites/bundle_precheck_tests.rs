@@ -209,17 +209,17 @@ fn a_column_block_needs_an_owner_its_bundle_creates_or_the_catalog_holds() {
 fn a_circuit_block_names_only_views_its_bundle_creates() {
     let dir = temp_dir("bundle_circuit_owner");
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
-    let mut circuits = crate::test_support::circuit_batch(30, &negate_chain(16, 2));
-    circuits.append_batch(&crate::test_support::circuit_batch(20, &negate_chain(16, 2)));
-    families[SysFamily::Circuit.index()] = Some(circuits);
-    let mut views = |rows: &[(i64, u64)]| {
+    let views = |rows: &[(i64, u64)]| {
+        let mut circuits = crate::test_support::circuit_batch(30, &negate_chain(16, 2));
+        circuits.append_batch(&crate::test_support::circuit_batch(20, &negate_chain(16, 2)));
         let mut bb = BatchBuilder::new(SysFamily::View.schema());
         for &(weight, vid) in rows {
             push_view_tab_row(&mut bb, weight, vid, "v", 0, 0, 0);
         }
-        families[SysFamily::View.index()] = Some(bb.finish());
-        engine.precheck_bundle(&families)
+        engine.precheck_bundle(&bundle([
+            (SysFamily::Circuit, circuits),
+            (SysFamily::View, bb.finish()),
+        ]))
     };
 
     for (rows, uncreated) in [(&[][..], 30), (&[(1, 30)], 20), (&[(1, 30), (-1, 20), (1, 20)], 20)] {

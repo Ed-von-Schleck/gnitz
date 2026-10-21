@@ -158,6 +158,16 @@ pub(crate) struct SysShape {
     pub(crate) key_len: usize,
 }
 
+impl WireSysFamily {
+    /// The family's columns as the column definitions every schema of it is
+    /// built from: non-nullable, as every system column is.
+    pub fn column_defs(&self) -> impl Iterator<Item = crate::ColumnDef> + '_ {
+        self.cols
+            .iter()
+            .map(|c| crate::ColumnDef::new(c.name, c.type_code, false))
+    }
+}
+
 const fn fam(id: u64, name: &'static str, shape: SysShape) -> WireSysFamily {
     const LEADING: &[u32] = &[0, 1];
     WireSysFamily {

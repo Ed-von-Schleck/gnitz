@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use gnitz_store::relation::{IndexClaim, RelationKind};
 use gnitz_wire::sys_rows::FkRef;
-use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, IdxTabSlot, SchemaTabRow, ViewParts};
+use gnitz_wire::sys_rows::{CatalogColumn, ColTabRow, IdxTabRow, IdxTabSlot, SchemaTabRow, ViewParts};
 use gnitz_wire::{low_bits_mask, validate_user_identifier, BitIter, TableProps};
 use gnitz_wire::{payload_bytes, RowSource};
 use gnitz_zset::repr::Batch;
@@ -13,8 +13,8 @@ use rustc_hash::FxHashSet;
 
 use super::sys_reads::IdSet;
 use super::sys_tables::{
-    build_schema_from_col_defs, check_col_defs, pk_signatures, read_rel_row, CatalogColumn, PkShape, PkSignature,
-    RelDetail, RelRow, SysFamily, SYSTEM_SCHEMA_ID,
+    build_schema_from_col_defs, pk_signatures, read_rel_row, DdlBundle, PkShape, PkSignature, RelDetail, RelRow,
+    SysFamily, SYSTEM_SCHEMA_ID,
 };
 use super::CatalogEngine;
 
@@ -286,7 +286,8 @@ impl CatalogEngine {
                 ));
             }
         }
-        let net = live_weight + sig.sum;
+        // `check_batch_shape` admitted at most one row of each sign, each of weight ±1.
+        let net = live_weight + sig.pos.is_some() as i64 - sig.neg.is_some() as i64;
         if !(0..=1).contains(&net) {
             return Err(format!(
                 "system-catalog write would leave {} at net weight {net} (expected 0 or 1)",
@@ -354,20 +355,23 @@ impl CatalogEngine {
                         return Err("a column-ALTER may only set is_nullable 0→1 (DROP NOT NULL)".into());
                     }
                     let (hides, unnulls) = (new.def.is_hidden, new.def.is_nullable != old.def.is_nullable);
-                    let prospective = self.col_defs_with(owner_id, col_idx, new)?;
-                    check_col_defs(RelationKind::BaseTable, &prospective)
-                        .map_err(|e| format!("cannot ALTER COLUMN on table {owner_id}: {e}"))?;
                     let op = match (hides, unnulls) {
-                        (true, _) => "DROP COLUMN",
-                        (false, true) => "DROP NOT NULL",
+                        (true, _) => Some("DROP COLUMN"),
+                        (false, true) => Some("DROP NOT NULL"),
                         // A rename: legal on a PK column and under dependent
                         // views, which bind columns by ordinal.
-                        (false, false) => continue,
+                        (false, false) => None,
                     };
                     let name = &old.def.name;
-                    if owner.schema().is_pk_col(col_idx as usize) {
+                    // Before the schema build, whose PK rules would refuse a PK
+                    // column's DROP NOT NULL with a less direct message.
+                    if let Some(op) = op.filter(|_| owner.schema().is_pk_col(col_idx as usize)) {
                         return Err(format!("cannot {op} '{name}': it is a primary-key column"));
                     }
+                    let prospective = self.col_defs_with(owner_id, col_idx, new)?;
+                    build_schema_from_col_defs(RelationKind::BaseTable, &prospective, owner.schema().pk_cols())
+                        .map_err(|e| format!("cannot ALTER COLUMN on table {owner_id}: {e}"))?;
+                    let Some(op) = op else { continue };
                     if hides {
                         // Before the index test: an FK column also carries its FK index.
                         if old.fk.is_some() {
@@ -451,10 +455,8 @@ impl CatalogEngine {
                 owner_schema.num_columns()
             ));
         }
-        // The PK rules are not re-run: a trailing non-PK append cannot invalidate
-        // an already-valid PK list.
         let prospective = self.col_defs_with(owner_id, col_idx, appended.clone())?;
-        check_col_defs(RelationKind::BaseTable, &prospective)
+        build_schema_from_col_defs(RelationKind::BaseTable, &prospective, owner_schema.pk_cols())
             .map_err(|e| format!("cannot ADD COLUMN on table {owner_id}: {e}"))?;
         // A new column over existing rows is unconditionally nullable, carries
         // no FK, and is visible.
@@ -491,13 +493,10 @@ impl CatalogEngine {
     /// can see, because each is prechecked against a catalog the bundle's other
     /// families have not reached yet. Run before the first family is applied, so
     /// a rejection has written nothing.
-    pub(in crate::catalog) fn precheck_bundle(
-        &self,
-        families: &[Option<Batch>; SysFamily::COUNT],
-    ) -> Result<(), String> {
+    pub(in crate::catalog) fn precheck_bundle(&self, families: &DdlBundle) -> Result<(), String> {
         if let Some(f) = SysFamily::ALL
             .into_iter()
-            .find(|f| f.master_only() && families[f.index()].is_some())
+            .find(|&f| f.master_only() && families.get(f).is_some())
         {
             return Err(format!(
                 "family {} ({}) is not writable from the wire",
@@ -505,20 +504,18 @@ impl CatalogEngine {
                 f.name()
             ));
         }
-        if let Some(cols) = families[SysFamily::Column.index()].as_ref() {
+        if let Some(cols) = families.get(SysFamily::Column) {
             self.check_column_owners(cols, families)?;
         }
-        if let Some(b) = families[SysFamily::Circuit.index()].as_ref() {
-            let created = families[SysFamily::View.index()]
-                .as_ref()
-                .map_or_else(IdSet::default, |v| {
-                    IdSet::new(
-                        pk_signatures(v)
-                            .into_iter()
-                            .filter(|s| s.shape() == PkShape::Create)
-                            .map(|s| s.leading),
-                    )
-                });
+        if let Some(b) = families.get(SysFamily::Circuit) {
+            let created = families.get(SysFamily::View).map_or_else(IdSet::default, |v| {
+                IdSet::new(
+                    pk_signatures(v)
+                        .into_iter()
+                        .filter(|s| s.shape() == PkShape::Create)
+                        .map(|s| s.leading),
+                )
+            });
             check_circuit_rows(b, &created)?;
         }
         Ok(())
@@ -526,11 +523,11 @@ impl CatalogEngine {
 
     /// Every column record must name an owner this bundle creates or the registry
     /// holds: a phantom owner is never dropped, so nothing would ever retract the row.
-    fn check_column_owners(&self, cols: &Batch, families: &[Option<Batch>; SysFamily::COUNT]) -> Result<(), String> {
+    fn check_column_owners(&self, cols: &Batch, families: &DdlBundle) -> Result<(), String> {
         let created = IdSet::new(
             [SysFamily::Table, SysFamily::View]
                 .into_iter()
-                .filter_map(|family| families[family.index()].as_ref())
+                .filter_map(|family| families.get(family))
                 .flat_map(|b| b.live_rows().map(|i| b.get_pk(i) as u64)),
         );
         let mut altered: Option<u64> = None;
@@ -539,7 +536,7 @@ impl CatalogEngine {
             // An ALTER must be its bundle's only change, on one owner: nothing can undo
             // its descriptor swap, so the swap must be the bundle's last fallible step.
             if self.registry.has_id(owner_id) {
-                if altered.is_some_and(|a| a != owner_id) || families.iter().flatten().count() > 1 {
+                if altered.is_some_and(|a| a != owner_id) || families.family_count() > 1 {
                     return Err("a column ALTER must be the only change in its DDL transaction".into());
                 }
                 altered = Some(owner_id);

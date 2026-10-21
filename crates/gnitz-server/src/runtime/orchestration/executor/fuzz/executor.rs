@@ -165,7 +165,7 @@ impl Session {
         let Ok(families) = ddl::decode_bundle(body) else { return };
         // The master refuses a unique index over rows a duplicate may be
         // among, by asking its workers; this one has none to ask.
-        let unique_over_rows = families[SysFamily::Index.index()].as_ref().is_some_and(|b| {
+        let unique_over_rows = families.get(SysFamily::Index).is_some_and(|b| {
             unique_index_creates(b)
                 .iter()
                 .any(|(owner, _)| self.filled.contains(owner))

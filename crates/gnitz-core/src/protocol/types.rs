@@ -120,11 +120,7 @@ pub fn sys_schema(tid: u64) -> &'static Arc<Schema> {
         gnitz_wire::SYS_FAMILIES
             .iter()
             .map(|f| {
-                let columns = f
-                    .cols
-                    .iter()
-                    .map(|c| ColumnDef::new(c.name, c.type_code, false))
-                    .collect();
+                let columns = f.column_defs().collect();
                 Arc::new(Schema::from_parts(columns, f.pk_cols).expect("a system family is an admissible schema"))
             })
             .collect()

@@ -263,6 +263,21 @@ impl<'a> ColTabRow<'a> {
         }
     }
 
+    /// Push this row's column onto `defs`, the columns its owner's earlier rows
+    /// described. Records must be keyed 0,1,2,… with no gap or duplicate: every
+    /// consumer maps columns positionally.
+    pub fn append_to(&self, defs: &mut Vec<CatalogColumn>) -> Result<(), String> {
+        let expected = defs.len() as u64;
+        if self.col_idx != expected {
+            return Err(format!(
+                "column records are non-contiguous; expected index {expected}, got {}",
+                self.col_idx
+            ));
+        }
+        defs.push(self.column()?);
+        Ok(())
+    }
+
     /// The column this row describes and the column it references:
     /// [`Self::of`]'s inverse. Every word must fit the width it is stored at and
     /// decode to a value `of` could emit: an overflowing one would leave a stored

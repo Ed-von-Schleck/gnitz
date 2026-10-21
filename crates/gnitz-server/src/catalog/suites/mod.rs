@@ -29,6 +29,7 @@ use gnitz_store::relation::{
     relation_dir, ChildKind, IndexClaim, Relation, RelationKind, RelationSpec, SecondaryIndex, StoreConfig,
 };
 use gnitz_wire::payload_u64;
+use gnitz_wire::sys_rows::CatalogColumn;
 use gnitz_wire::{Circuit, NullKeys, PkColList, ReindexRole, TypeCode, PK_LIST_PACKED_FLAG};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{park_until, request_barrier, send_ack, Shared};
-use crate::catalog::{unique_index_creates, SysFamily};
+use crate::catalog::{unique_index_creates, DdlBundle, SysFamily};
 use crate::runtime::committer::{BarrierKind, CHECKPOINTS_BEHIND_DDL};
 use crate::runtime::master::UniqueFilter;
 use crate::runtime::peer::Peer;
@@ -97,15 +97,14 @@ fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, B
 /// materialised into an owned batch under its own schema — see
 /// [`decode_sys_family`]. One slot per family: every list derived from a bundle
 /// reads one block of each.
-pub(super) fn decode_bundle(body: &[u8]) -> Result<[Option<Batch>; SysFamily::COUNT], WireFault> {
+pub(super) fn decode_bundle(body: &[u8]) -> Result<DdlBundle, WireFault> {
     let items =
         gnitz_wire::txn_frame::decode_items(body, ClientVerb::DdlTxn).map_err(|e| format!("decode error: {e}"))?;
-    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
+    let mut families = DdlBundle::default();
     for (frame, ctrl) in items {
-        let (family, batch) = decode_sys_family(frame, ctrl).map_err(|e| format!("DDL_TXN: {e}"))?;
-        if families[family.index()].replace(batch).is_some() {
-            return Err(format!("DDL_TXN: bundle carries two blocks for family {}", family.id()).into());
-        }
+        decode_sys_family(frame, ctrl)
+            .and_then(|(family, batch)| families.insert(family, batch))
+            .map_err(|e| format!("DDL_TXN: {e}"))?;
     }
     Ok(families)
 }
@@ -132,10 +131,10 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     let t_ddl_start = Instant::now();
     // Decoded up front, before any lock.
     let families = decode_bundle(body)?;
-    let family_count = families.iter().flatten().count();
+    let family_count = families.family_count();
 
-    let unique_creates = families[SysFamily::Index.index()]
-        .as_ref()
+    let unique_creates = families
+        .get(SysFamily::Index)
         .map(unique_index_creates)
         .unwrap_or_default();
 
@@ -158,7 +157,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
 
     // Before the views exist: a tick owed now carries rows pushed ahead of them,
     // and a stream's must not reach them.
-    if families[SysFamily::Circuit.index()].is_some() {
+    if families.get(SysFamily::Circuit).is_some() {
         if let Some(lease) = shared.emit_pending_tick().await? {
             lease.acks().await;
         }

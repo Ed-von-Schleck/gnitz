@@ -4,8 +4,10 @@
 //! This file is compiled once, and only inside this crate, so it names
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
-use crate::catalog::{CatalogColumn, CatalogEngine, SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
-use gnitz_wire::sys_rows::{CircuitRow, FkAction, FkRef, IdxTabRow, SchemaTabRow, SysRow, TableTabRow, ViewTabRow};
+use crate::catalog::{CatalogEngine, DdlBundle, SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
+use gnitz_wire::sys_rows::{
+    CatalogColumn, CircuitRow, FkAction, FkRef, IdxTabRow, SchemaTabRow, SysRow, TableTabRow, ViewTabRow,
+};
 use gnitz_wire::Circuit;
 use gnitz_wire::{ColumnDef, TypeCode};
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
@@ -347,10 +349,10 @@ impl crate::query::DriveHost for EchoDrive<'_> {
 // ── DDL entry ────────────────────────────────────────────────────────────
 
 /// A `DDL_TXN` bundle of `blocks`, one per family.
-pub fn bundle(blocks: impl IntoIterator<Item = (SysFamily, Batch)>) -> [Option<Batch>; SysFamily::COUNT] {
-    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
+pub fn bundle(blocks: impl IntoIterator<Item = (SysFamily, Batch)>) -> DdlBundle {
+    let mut families = DdlBundle::default();
     for (family, batch) in blocks {
-        assert!(families[family.index()].replace(batch).is_none());
+        families.insert(family, batch).unwrap();
     }
     families
 }

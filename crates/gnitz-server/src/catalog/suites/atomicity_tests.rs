@@ -73,7 +73,11 @@ fn a_malformed_create_is_refused_at_the_precheck() {
             build_view_tab_row(no_cols, "v"),
             "has no column records",
         ),
-        (SysFamily::View, build_view_tab_row(too_wide, "v"), "columns (max"),
+        (
+            SysFamily::View,
+            build_view_tab_row(too_wide, "v"),
+            "exceeds MAX_COLUMNS",
+        ),
         (
             SysFamily::Index,
             index_on(unregistered, &[0], "ix"),

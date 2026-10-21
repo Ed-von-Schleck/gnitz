@@ -204,7 +204,7 @@ fn a_column_gap_fails_the_read() {
     rows.put(&ColTabRow::of(17, 1, &def, None), 1);
     let err = Catalog::decode(&rows.0).unwrap_err().to_string();
     assert!(
-        err.contains("column 1 of 17") && err.contains("expected column 0"),
+        err.contains("column 1 of 17") && err.contains("expected index 0"),
         "{err}"
     );
 }

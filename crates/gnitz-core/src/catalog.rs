@@ -214,12 +214,7 @@ impl Catalog {
             let r = ColTabRow::read(columns, i).map_err(|e| bad(format_args!("column row {i}"), e))?;
             let what = format_args!("column {} of {}", r.col_idx, r.owner_id);
             if let Some(&at) = slot_of.get(&r.owner_id) {
-                let col = r.column().map_err(|e| bad(what, e))?;
-                let rel = &mut relations[at];
-                if r.col_idx != rel.columns.len() as u64 {
-                    return Err(bad(what, format!("expected column {}", rel.columns.len())));
-                }
-                rel.columns.push(col);
+                r.append_to(&mut relations[at].columns).map_err(|e| bad(what, e))?;
             }
         }
         for (_, index) in idx_rows(indices)? {

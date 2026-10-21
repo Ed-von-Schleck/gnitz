@@ -6,8 +6,9 @@ use gnitz_wire::sys_rows::{ColTabRow, SchemaTabRow, SchemaTabSlot};
 use gnitz_wire::{payload_bytes, payload_str, payload_u64};
 use gnitz_zset::repr::{Batch, ReadCursor, StoredRow};
 
-use super::sys_tables::{CatalogColumn, SysFamily};
+use super::sys_tables::SysFamily;
 use super::CatalogEngine;
+use gnitz_wire::sys_rows::CatalogColumn;
 
 /// A set of catalog ids, sorted once so every probe is a binary search: the
 /// probes run per row of a client-supplied block bounded only by the frame.
@@ -92,8 +93,7 @@ impl CatalogEngine {
 
     // -- Read column definitions from sys_columns --------------------------
 
-    /// Column definitions for `owner_id`, in key order. Its records must be keyed
-    /// 0,1,2,… with no gap or duplicate: every consumer maps columns positionally.
+    /// Column definitions for `owner_id`, in key order.
     pub(in crate::catalog) fn read_column_defs(&self, owner_id: u64) -> Result<Vec<CatalogColumn>, String> {
         let mut defs = Vec::new();
         let mut err = None;
@@ -102,19 +102,10 @@ impl CatalogEngine {
                 return;
             }
             let (src, row) = c.current_row_source();
-            let expected = defs.len() as u64;
-            let def = ColTabRow::read(src, row).and_then(|r| {
-                if r.col_idx != expected {
-                    return Err(format!(
-                        "column records are non-contiguous; expected index {expected}, got {}",
-                        r.col_idx
-                    ));
-                }
-                r.column().map_err(|e| format!("column {}: {e}", r.col_idx))
-            });
-            match def {
-                Ok(d) => defs.push(d),
-                Err(e) => err = Some(format!("entity (owner_id={owner_id}): {e}")),
+            let appended = ColTabRow::read(src, row)
+                .and_then(|r| r.append_to(&mut defs).map_err(|e| format!("column {}: {e}", r.col_idx)));
+            if let Err(e) = appended {
+                err = Some(format!("entity (owner_id={owner_id}): {e}"));
             }
         });
         err.map_or(Ok(defs), Err)

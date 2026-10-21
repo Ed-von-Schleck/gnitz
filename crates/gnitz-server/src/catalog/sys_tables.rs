@@ -10,9 +10,10 @@ use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use gnitz_store::relation::RelationKind;
-pub(crate) use gnitz_wire::sys_rows::CatalogColumn;
-use gnitz_wire::sys_rows::{ColTabSlot, IdxTabRow, SchemaTabRow, SysRow, TableTabRow, ViewParts, ViewTabRow};
-use gnitz_wire::{ColumnDef, TableProps, MAX_COLUMNS};
+use gnitz_wire::sys_rows::{
+    CatalogColumn, ColTabSlot, IdxTabRow, SchemaTabRow, SysRow, TableTabRow, ViewParts, ViewTabRow,
+};
+use gnitz_wire::{PkColList, TableProps};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -23,18 +24,9 @@ use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 pub(super) const SYSTEM_SCHEMA_ID: u64 = 1;
 pub(crate) const PUBLIC_SCHEMA_ID: u64 = 2;
 
-// PK list encoding lives in gnitz-wire so the client and engine cannot drift on
-// the on-disk format.
-pub(super) use gnitz_wire::PkColList;
-
 // ---------------------------------------------------------------------------
-// Per-family row-view decoders — the one reading of each family's *full row
-// shape*, run by the precheck arms and again by the register hooks, each over
-// the row `gnitz_wire::sys_rows` reads back.
-//
-// `read_rel_row` decodes both relation families off a wire `Batch`, which is
-// what every caller holds; the rest are generic over `RowSource`, so a stored
-// row or a positioned cursor decodes too.
+// Relation rows — TABLE_TAB and VIEW_TAB decoded as one shape, by the precheck
+// and again by the register hook.
 // ---------------------------------------------------------------------------
 
 /// A TABLE_TAB or VIEW_TAB row as decoded.
@@ -57,28 +49,6 @@ impl RelRow<'_> {
             RelDetail::Table(TableProps { stream: true, .. }) => RelationKind::Stream,
             RelDetail::Table(_) => RelationKind::BaseTable,
             RelDetail::View(v) => RelationKind::View(v.props.budget),
-        }
-    }
-
-    /// Whether two of the relation's rows may share a PK.
-    pub(super) fn pk_repeats(&self) -> bool {
-        match self.detail {
-            // A base table's PK is unique by `enforce_unique_pk`; a stream's is not.
-            RelDetail::Table(t) => t.stream,
-            RelDetail::View(v) => v.pk_repeats,
-        }
-    }
-
-    /// [`TableProps::serial`].
-    pub(super) fn serial(&self) -> bool {
-        matches!(self.detail, RelDetail::Table(TableProps { serial: true, .. }))
-    }
-
-    /// `WITH (compress = true)`: its rows' store codes its heaps.
-    pub(super) fn compress(&self) -> bool {
-        match self.detail {
-            RelDetail::Table(t) => t.compress,
-            RelDetail::View(v) => v.props.compress,
         }
     }
 }
@@ -112,8 +82,8 @@ pub(super) fn read_rel_row(family: SysFamily, batch: &Batch, row: usize) -> Resu
     Ok(RelRow { id, schema_id, name, pk, detail })
 }
 
-/// What one delta does to one PK: where its `-1` and `+1` rows are, and the
-/// summed weight. A PK carrying both signs is a **rewrite pair** (a rename).
+/// What one delta does to one PK: where its `-1` and `+1` rows are. A PK
+/// carrying both signs is a **rewrite pair** (a rename).
 pub(super) struct PkSignature {
     pub(super) pk: u128,
     /// `sys_leading_id` of the key, so no consumer re-derives it.
@@ -125,7 +95,6 @@ pub(super) struct PkSignature {
     pub(super) pos: Option<usize>,
     /// A sign occurs on more than one row.
     pub(super) repeats_a_sign: bool,
-    pub(super) sum: i64,
 }
 
 /// Which signs one delta carries on one PK.
@@ -175,12 +144,10 @@ pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
                 neg: None,
                 pos: None,
                 repeats_a_sign: false,
-                sum: 0,
             });
             sigs.len() - 1
         });
         let sig = &mut sigs[slot];
-        sig.sum += w;
         // Keep the FIRST row of each sign; a later one only sets the flag.
         let sign_slot = if w < 0 { &mut sig.neg } else { &mut sig.pos };
         sig.repeats_a_sign |= sign_slot.is_some();
@@ -201,26 +168,55 @@ pub(crate) fn unique_index_creates(batch: &Batch) -> Vec<(u64, PkColList)> {
         .collect()
 }
 
+/// One `DDL_TXN` bundle: at most one block per system family.
+#[derive(Default)]
+pub(crate) struct DdlBundle([Option<Batch>; SysFamily::COUNT]);
+
+impl DdlBundle {
+    /// Add `family`'s block; `Err` when the bundle already carries one.
+    pub(crate) fn insert(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
+        match &mut self.0[family.index()] {
+            Some(_) => Err(format!("bundle carries two blocks for family {}", family.id())),
+            slot => {
+                *slot = Some(batch);
+                Ok(())
+            }
+        }
+    }
+
+    /// `family`'s block, if the bundle carries one.
+    pub(crate) fn get(&self, family: SysFamily) -> Option<&Batch> {
+        self.0[family.index()].as_ref()
+    }
+
+    /// How many families the bundle carries a block for.
+    pub(crate) fn family_count(&self) -> usize {
+        self.0.iter().flatten().count()
+    }
+
+    /// The blocks in [`SysFamily::ALL`] order.
+    pub(crate) fn into_blocks(self) -> impl Iterator<Item = (SysFamily, Batch)> {
+        SysFamily::ALL
+            .into_iter()
+            .zip(self.0)
+            .filter_map(|(f, b)| Some((f, b?)))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Schema derivation from the shared wire column slices
 // ---------------------------------------------------------------------------
 
-/// One schema per family, indexed by [`SysFamily::index`], each built from
-/// `gnitz-wire`'s canonical system-table column array.
-static SCHEMAS: LazyLock<[SchemaDescriptor; SysFamily::COUNT]> = LazyLock::new(|| {
-    std::array::from_fn(|i| {
-        let f = &gnitz_wire::SYS_FAMILIES[i];
-        let cols: Vec<SchemaColumn> = f.cols.iter().map(|c| SchemaColumn::new(c.type_code, false)).collect();
-        SchemaDescriptor::new(&cols, f.pk_cols)
-    })
-});
-
-/// One named record per family, indexed by [`SysFamily::index`]: what every
-/// DdlSync group of the family carries.
-static RECORDS: LazyLock<[Box<[u8]>; SysFamily::COUNT]> = LazyLock::new(|| {
-    std::array::from_fn(|i| {
-        let family = SysFamily::ALL[i];
-        encode_record(family.wire().pk_cols, &family.column_defs())
+/// Each family's schema and named record, indexed by [`SysFamily::index`], both
+/// derived from `gnitz-wire`'s system-table columns as a user relation's are
+/// from its COL_TAB records. The record is what every DdlSync group of the
+/// family carries.
+static SCHEMAS: LazyLock<[(SchemaDescriptor, Box<[u8]>); SysFamily::COUNT]> = LazyLock::new(|| {
+    SysFamily::ALL.map(|family| {
+        let (defs, pk) = (family.column_defs(), family.wire().pk_cols);
+        let schema = build_schema_from_col_defs(RelationKind::SystemCatalog, &defs, pk)
+            .expect("a system family is an admissible schema");
+        (schema, encode_record(pk, &defs))
     })
 });
 
@@ -230,18 +226,17 @@ pub(in crate::catalog) fn encode_record(pk: &[u32], defs: &[CatalogColumn]) -> B
     gnitz_wire::schema_block::encode(defs.iter().map(|c| c.def.block_col()), pk).into()
 }
 
-/// The rules a relation's column records must satisfy on their own, with no PK
-/// list in hand; messages are bare predicates, and callers add the context. The
-/// duplicate-name rule is ingestion points only — a view segment legitimately
-/// carries two visible columns of one name (a join chain's output).
-pub(super) fn check_col_defs(kind: RelationKind, col_defs: &[CatalogColumn]) -> Result<(), String> {
+/// The `SchemaDescriptor` COL_TAB records describe, or the first admissibility
+/// rule they break; messages are bare predicates, and callers add the context.
+/// The duplicate-name rule is ingestion points only — a view segment
+/// legitimately carries two visible columns of one name (a join chain's output).
+pub(super) fn build_schema_from_col_defs(
+    kind: RelationKind,
+    col_defs: &[CatalogColumn],
+    pk_cols: &[u32],
+) -> Result<SchemaDescriptor, String> {
     if col_defs.is_empty() {
         return Err("has no column records".into());
-    }
-    // Reachable from a plain view as well as a wide CREATE TABLE: a compound-PK
-    // plain projection prepends the k source PK columns.
-    if col_defs.len() > MAX_COLUMNS {
-        return Err(format!("has {} columns (max {MAX_COLUMNS})", col_defs.len()));
     }
     if kind.is_ingestion_point() {
         let visible = col_defs.iter().filter(|c| !c.def.is_hidden);
@@ -249,17 +244,6 @@ pub(super) fn check_col_defs(kind: RelationKind, col_defs: &[CatalogColumn]) -> 
             return Err(format!("has duplicate column name '{name}'"));
         }
     }
-    Ok(())
-}
-
-/// The `SchemaDescriptor` COL_TAB records describe, or the first admissibility
-/// rule they break.
-pub(super) fn build_schema_from_col_defs(
-    kind: RelationKind,
-    col_defs: &[CatalogColumn],
-    pk_cols: &[u32],
-) -> Result<SchemaDescriptor, String> {
-    check_col_defs(kind, col_defs)?;
     let cols: Vec<SchemaColumn> = col_defs
         .iter()
         .map(|cd| SchemaColumn::new(cd.def.ty.tc, cd.def.is_nullable))
@@ -340,24 +324,20 @@ impl SysFamily {
     /// This family's fixed schema.
     #[inline]
     pub(crate) fn schema(self) -> &'static SchemaDescriptor {
-        &SCHEMAS[self.index()]
+        &SCHEMAS[self.index()].0
     }
 
     /// This family's named record.
     pub(crate) fn record(self) -> &'static [u8] {
-        &RECORDS[self.index()]
+        &SCHEMAS[self.index()].1
     }
 
     /// This family's column definitions, from the same wire slice its schema is
     /// built from — compile-time data, never read back from COL_TAB.
     pub(in crate::catalog) fn column_defs(self) -> Vec<CatalogColumn> {
         self.wire()
-            .cols
-            .iter()
-            .map(|c| CatalogColumn {
-                def: ColumnDef::new(c.name, c.type_code, false),
-                fk: None,
-            })
+            .column_defs()
+            .map(|def| CatalogColumn { def, fk: None })
             .collect()
     }
 

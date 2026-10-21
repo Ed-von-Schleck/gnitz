@@ -8,7 +8,7 @@ use gnitz_wire::{payload_u64, PkColList, WireFault};
 use gnitz_zset::repr::Batch;
 
 use super::sys_reads::IdSet;
-use super::sys_tables::{pk_signatures, PkShape, SysFamily};
+use super::sys_tables::{pk_signatures, DdlBundle, PkShape, SysFamily};
 use super::CatalogEngine;
 
 /// Where a catalog write lays each group out, before applying it. An `Err`
@@ -154,7 +154,7 @@ impl CatalogEngine {
     /// `Refused` leaves the catalog as it was.
     pub(crate) fn apply_bundle(
         &mut self,
-        families: [Option<Batch>; SysFamily::COUNT],
+        families: DdlBundle,
         sink: &mut ZoneSink<'_>,
     ) -> Result<AppliedDdl, ZoneError> {
         let mut zone = Vec::new();
@@ -178,16 +178,12 @@ impl CatalogEngine {
     /// a dependent is retired first. On `Err`, `zone` holds what was applied.
     fn apply_families(
         &mut self,
-        families: [Option<Batch>; SysFamily::COUNT],
+        families: DdlBundle,
         zone: &mut Vec<ZoneGroup>,
         sink: &mut ZoneSink<'_>,
     ) -> Result<(), WireFault> {
         self.precheck_bundle(&families)?;
-        let mut ordered: Vec<(SysFamily, Batch)> = SysFamily::ALL
-            .into_iter()
-            .zip(families)
-            .filter_map(|(f, b)| Some((f, b?)))
-            .collect();
+        let mut ordered: Vec<(SysFamily, Batch)> = families.into_blocks().collect();
         if ordered.iter().all(|(_, b)| (0..b.len()).all(|i| b.get_weight(i) < 0)) {
             ordered.reverse();
         }
