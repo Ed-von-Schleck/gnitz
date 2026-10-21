@@ -42,7 +42,7 @@ pub(super) struct EmitCtx<'a> {
 /// seed's, or the relay's the source's route puts behind it — and its backfill bound.
 pub(super) struct Scan {
     pub(super) seed: DeltaReg,
-    reg: DeltaReg,
+    pub(super) reg: DeltaReg,
     /// An exchange round moves the delta between the seed and `reg`.
     relayed: bool,
     pub(super) bound: ReadBound,

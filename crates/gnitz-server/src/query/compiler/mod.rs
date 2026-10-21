@@ -37,14 +37,6 @@ use routing::ViewMeta;
 // Circuit walks
 // ---------------------------------------------------------------------------
 
-/// Every `ExchangeShard`, in topological order.
-fn exchange_shards(circuit: &Circuit) -> impl Iterator<Item = NodeId> + '_ {
-    circuit
-        .ops()
-        .filter(|(_, op)| matches!(op, gnitz_wire::OpNode::ExchangeShard))
-        .map(|(nid, _)| nid)
-}
-
 /// Backward pass: `start` and every node it reads, directly or transitively.
 fn ancestors_inclusive(circuit: &Circuit, start: NodeId) -> Vec<bool> {
     let mut reached = vec![false; circuit.nodes().len()];
@@ -131,7 +123,7 @@ pub(super) fn compile_view(
         return Err("the circuit's output schema is not the view's".into());
     }
     let hydration = bounded
-        .then(|| derive_hydration(circuit, registry, &vm, &regs, &integrals))
+        .then(|| derive_hydration(circuit, registry, &vm, &regs, &integrals, &sources))
         .transpose()?;
     let sources = sources
         .into_iter()
