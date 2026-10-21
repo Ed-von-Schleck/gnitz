@@ -5,13 +5,15 @@
 //! region layout (`batch`), wire serialization (`batch_wire`), TLS buffer
 //! recycling (`batch_pool`), the OPK lower-bound search (`seek`), sort-merge
 //! consolidation (`merge`), the German-string heap (`string_heap`), the direct
-//! row writer (`writer`), the column-first row copy (`scatter`), the N-way min-merge tournament (`loser_tree`), the
-//! shard PK-probe filter (`shard_filter`), the shard writer (`shard_file`), the
-//! shard file's framing (`layout`) and its region encodings (`encoding`), the
-//! guard-routed shard merge a compaction runs (`compact`), and the read-only file
-//! mapping (`mmap`). The low-level WAL-block framer lives in `gnitz_wire::wal` (the one definition client and
-//! engine share). The row-at-a-time system-table writer over a batch is
-//! `batch_builder`.
+//! row writer (`writer`), the column-first row copy (`scatter`), the N-way
+//! min-merge tournament (`loser_tree`), the shard PK-probe filter
+//! (`shard_filter`), the shard writer (`shard_file`), the shard file's framing
+//! (`layout`), its region encodings (`encoding`) and the shard heap's symbol
+//! table (`codebook`), the guard-routed shard merge a compaction runs
+//! (`compact`), the read-only file mapping (`mmap`), and the storage error type
+//! (`error`). The low-level WAL-block framer lives in `gnitz_wire::wal` (the one
+//! definition client and engine share). The row-at-a-time system-table writer
+//! over a batch is `batch_builder`.
 //!
 //! The shard *image* has one owner: `shard_file` writes it, `shard_reader`
 //! mmaps and validates it, and `layout` and `encoding` hold the format rules

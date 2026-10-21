@@ -18,10 +18,12 @@
 use gnitz_wire::{read_u32_le, read_u64_le};
 use xorf::{BinaryFuse8, BinaryFuse8Ref, Descriptor, DmaSerializable, Filter, FilterRef};
 
-/// Build from probe keys. Sorted and deduplicated first: `probe_key` is a
-/// 64-bit digest, so distinct PKs collide, and the caller's
-/// adjacent-byte-equal pre-shrink cannot see it. The construction requires
-/// distinct keys and asserts it under `debug_assertions`.
+/// Build the filter over a PK-sorted region of `stride`-byte keys, as its region
+/// bytes `[descriptor][fingerprints]`. Rows sharing a PK are adjacent, so
+/// skipping a key byte-equal to its predecessor bounds the sort at the distinct
+/// PKs. The keys are deduplicated again after hashing: `probe_key` is a 64-bit
+/// digest, so distinct PKs collide, and the construction requires distinct keys
+/// (asserted under `debug_assertions`).
 ///
 /// `None` on a construction failure, which writes the shard filterless: a
 /// permanent read-cost regression for that one file, and a repeated one means
@@ -29,24 +31,29 @@ use xorf::{BinaryFuse8, BinaryFuse8Ref, Descriptor, DmaSerializable, Filter, Fil
 /// `None` at the call site. Do not add a caller-side retry — the crate already
 /// reseeds up to 1000 times internally, each iteration O(n), and a second
 /// unbounded loop would sit on the compaction path.
-pub(crate) fn build(mut keys: Vec<u64>) -> Option<BinaryFuse8> {
+pub(crate) fn build(pk_region: &[u8], stride: usize) -> Option<Vec<u8>> {
+    let mut keys: Vec<u64> = Vec::with_capacity(pk_region.len() / stride);
+    let mut prev: Option<&[u8]> = None;
+    for chunk in pk_region.chunks_exact(stride) {
+        if prev == Some(chunk) {
+            continue;
+        }
+        prev = Some(chunk);
+        keys.push(crate::schema::key::probe_key(chunk));
+    }
     keys.sort_unstable();
     keys.dedup();
-    match BinaryFuse8::try_from(keys.as_slice()) {
-        Ok(f) => Some(f),
+    let filter = match BinaryFuse8::try_from(keys.as_slice()) {
+        Ok(f) => f,
         Err(e) => {
             gnitz_warn!("shard PK filter construction failed over {} keys: {e}", keys.len());
-            None
+            return None;
         }
-    }
-}
-
-/// Serialize a filter to its region bytes: `[descriptor][fingerprints]`.
-pub(crate) fn serialize(filter: &BinaryFuse8) -> Vec<u8> {
+    };
     let mut buf = vec![0u8; Descriptor::DMA_LEN + filter.fingerprints.len()];
     filter.dma_copy_descriptor_to(&mut buf[..Descriptor::DMA_LEN]);
     buf[Descriptor::DMA_LEN..].copy_from_slice(filter.dma_fingerprints());
-    buf
+    Some(buf)
 }
 
 /// The properties every descriptor the construction emits satisfies, and the
@@ -58,12 +65,12 @@ pub(crate) fn serialize(filter: &BinaryFuse8) -> Vec<u8> {
 /// largest reachable index is `scl + 2·sl - 1`, which the length rule pins to
 /// `fingerprints_len - 1`. Three rules carry their own weight beyond that
 /// argument, so each is noted where it sits.
-fn validate(d: &Descriptor, fingerprints_len: usize) -> Option<()> {
+fn validate(d: &Descriptor, fingerprints_len: usize) -> bool {
     // u64 throughout: `scl + 2 * sl` in u32 wraps, and a forged descriptor
     // would then pass the length rule.
     let sl = d.segment_length as u64;
     let scl = d.segment_count_length as u64;
-    (sl.is_power_of_two()
+    sl.is_power_of_two()
         && d.segment_length_mask as u64 == sl - 1
         // At scl = 0 every h0 is 0, so h2 reaches 3·sl - 1 against a length of
         // 2·sl. The alignment rule below admits 0.
@@ -74,8 +81,7 @@ fn validate(d: &Descriptor, fingerprints_len: usize) -> Option<()> {
         && fingerprints_len as u64 == scl + 2 * sl
         // `hash_of_hash` sums h1 and h2 in u32, so a length at or above 2^32
         // overflows: a debug panic, a wrong in-bounds index in release.
-        && fingerprints_len < u32::MAX as usize)
-        .then_some(())
+        && fingerprints_len < u32::MAX as usize
 }
 
 /// Whether `region` is a filter region a probe can read.
@@ -95,7 +101,6 @@ pub(crate) fn is_valid(region: &[u8]) -> bool {
         },
         region.len() - Descriptor::DMA_LEN,
     )
-    .is_some()
 }
 
 /// Whether a [`crate::schema::key::probe_key`] may be present in `region`.

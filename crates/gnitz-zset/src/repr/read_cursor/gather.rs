@@ -129,9 +129,6 @@ impl PkSetGather {
     /// The next non-empty chunk of source rows, or `None` once the key list is
     /// exhausted; `max_rows` as [`Self::for_each_live_row`].
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
-        let mut skeletons = SkeletonKeys::default();
-        let chunk = self.drain_live_chunk(max_rows, &mut skeletons);
-        skeletons.assert_none();
-        chunk
+        SkeletonKeys::raw(|s| self.drain_live_chunk(max_rows, s))
     }
 }

@@ -984,9 +984,7 @@ impl<'a> SeqImage<'a> {
         for row in block * DECODE_BLOCK_ROWS..first_row {
             match len(row) {
                 n if n > SHORT_STRING_THRESHOLD => heap_at = long(heap_at, n).1,
-                short => {
-                    step(&mut pool_at, short);
-                }
+                short => pool_at = pool_at.saturating_add(short),
             }
         }
         for (i, cell) in cells.iter_mut().enumerate() {
@@ -1052,14 +1050,14 @@ impl<'a> HeapWriter<'a> {
 
     /// A heap holding each value coded under `book`.
     pub(crate) fn coded(book: &'a Codebook) -> Self {
-        let symbols: Vec<_> = book.table().symbols().collect();
-        let mut bytes = vec![0u8; symbols_head_len(0) + symbols.len() * MAX_SYMBOL_LEN];
+        let table = book.table();
+        let mut bytes = vec![0u8; SYMBOLS_AT];
         write_u64_le(&mut bytes, SYMBOLS_TRAINED_AT, book.trained_sixteenths() as u64);
-        write_u64_le(&mut bytes, SYMBOLS_COUNT_AT, symbols.len() as u64);
-        for (i, (symbol, _)) in symbols.iter().enumerate() {
-            bytes[SYMBOLS_AT + i * MAX_SYMBOL_LEN..][..MAX_SYMBOL_LEN].copy_from_slice(*symbol);
+        write_u64_le(&mut bytes, SYMBOLS_COUNT_AT, table.symbols().count() as u64);
+        for (symbol, _) in table.symbols() {
+            bytes.extend_from_slice(symbol);
         }
-        bytes.extend(symbols.iter().map(|&(_, len)| len));
+        bytes.extend(table.symbols().map(|(_, len)| len));
         HeapWriter {
             coded: Some((bytes.len(), book)),
             bytes,
@@ -1130,8 +1128,8 @@ pub(crate) struct SymbolsImage<'a> {
     pub(crate) table: Box<SymbolTable>,
     /// How the table coded its training values, in sixteenths of their bytes.
     pub(crate) trained_sixteenths: usize,
-    pub(crate) codes: &'a [u8],
-    pub(crate) plain_len: usize,
+    codes: &'a [u8],
+    plain_len: usize,
 }
 
 impl<'a> SymbolsImage<'a> {

@@ -60,7 +60,7 @@ fn assert_self_description(engine: &CatalogEngine) {
         if c.current_weight > 0 {
             let (src, row) = c.current_row_source();
             // COL_TAB PK = `(owner_id, col_idx)`.
-            let (owner, col_idx) = gnitz_wire::unpack_pair_pk(c.current_key_narrow());
+            let (owner, col_idx) = gnitz_wire::unpack_pair_pk(gnitz_wire::widen_pk_be(c.current_pk_bytes()));
             let entry = (col_idx, ColTabRow::read(src, row).unwrap().name.into_owned());
             described.entry(owner).or_default().push(entry);
         }

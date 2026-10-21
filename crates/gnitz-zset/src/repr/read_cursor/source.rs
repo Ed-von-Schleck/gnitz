@@ -21,10 +21,7 @@ impl SourceCursor {
     /// The next non-empty source chunk, or `None` once the source is exhausted.
     /// `PkSet` exceeds `max_rows` rather than split a PK group.
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
-        let mut skeletons = SkeletonKeys::default();
-        let chunk = self.drain_live_chunk(max_rows, &mut skeletons);
-        skeletons.assert_none();
-        chunk
+        SkeletonKeys::raw(|s| self.drain_live_chunk(max_rows, s))
     }
 
     /// [`Self::drain_chunk`] over a store that may hold skeleton rows: each one the

@@ -5,7 +5,8 @@ use super::super::shard_file::ShardWriteOpts;
 use super::*;
 use crate::repr::merge_consolidated;
 use crate::test_support::{
-    arb_fold_case, assert_folds, fold_batch, make_batch, make_schema_u64_i64, map_shard, FoldRow,
+    arb_fold_case, assert_folds, fold_batch, make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64,
+    make_string_batch, map_coded_shard, map_shard, prose, FoldRow,
 };
 use gnitz_wire::PkBuf;
 use proptest::prelude::*;
@@ -205,9 +206,8 @@ fn stored(src: &impl RowSource, row: usize) -> Vec<u8> {
 /// table or under two — the rows are the plain merge's, weights and all.
 #[test]
 fn a_coded_merge_keeps_the_codes_of_its_own_table() {
-    use crate::test_support::{make_string_batch, map_coded_shard, prose};
     let dir = tempfile::tempdir().unwrap();
-    let schema = crate::test_support::make_schema_pk_u64_payload_string();
+    let schema = make_schema_pk_u64_payload_string();
     let values: Vec<String> = (0..1000).map(prose).collect();
     let rows = |pks: std::ops::RangeInclusive<u64>, w: i64| -> Batch {
         let rows: Vec<(u64, i64, &[u8])> = pks.map(|pk| (pk, w, values[pk as usize].as_bytes())).collect();
@@ -227,7 +227,7 @@ fn a_coded_merge_keeps_the_codes_of_its_own_table() {
         map_coded_shard(&dir.path().join("own.db"), &own, &book),
         map_coded_shard(&dir.path().join("theirs.db"), &theirs, &other),
         map_coded_shard(&dir.path().join("late.db"), &late, &book),
-        crate::test_support::map_shard(&dir.path().join("retracted.db"), &retracted),
+        map_shard(&dir.path().join("retracted.db"), &retracted),
     ];
     let guards = [PkBuf::zeroed(schema.pk_stride())];
 

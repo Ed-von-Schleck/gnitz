@@ -6,7 +6,7 @@
 use std::cmp::Ordering;
 use std::ops::{ControlFlow, Range};
 
-use crate::repr::batch::MemBatch;
+use crate::repr::batch::{Batch, MemBatch};
 use crate::repr::loser_tree::{HeapNode, LoserTree};
 use crate::repr::merge::{self, ColumnarSource, MergeOrder, PosCursor};
 use crate::repr::seek::gallop_by;
@@ -28,9 +28,9 @@ pub use source::{BoundedIndexCursor, SourceCursor};
 /// The skeleton rows a split drain set aside instead of copying: their OPK keys, flat
 /// and ascending, and — in debug builds — each one's coarse weight.
 #[derive(Default)]
-pub(crate) struct SkeletonKeys {
-    pub(crate) keys: Vec<u8>,
-    pub(crate) coarse: Vec<i64>,
+struct SkeletonKeys {
+    keys: Vec<u8>,
+    coarse: Vec<i64>,
 }
 
 impl SkeletonKeys {
@@ -45,17 +45,20 @@ impl SkeletonKeys {
     fn extend(&mut self, shard: &MappedShard, rows: Range<usize>) {
         shard.append_pks(rows.clone(), &mut self.keys);
         if cfg!(debug_assertions) {
-            self.coarse.extend(rows.map(|r| ColumnarSource::get_weight(shard, r)));
+            self.coarse.extend(rows.map(|r| shard.get_weight(r)));
         }
     }
 
-    /// The raw drains' guard: a raw drain has no hydrator to recompute a skeleton
-    /// row's payload.
-    fn assert_none(&self) {
+    /// Run a raw drain, which has no hydrator to recompute a skeleton row's
+    /// payload, and assert it met none.
+    fn raw(drain: impl FnOnce(&mut SkeletonKeys) -> Option<Batch>) -> Option<Batch> {
+        let mut keys = SkeletonKeys::default();
+        let chunk = drain(&mut keys);
         assert!(
-            self.keys.is_empty(),
+            keys.keys.is_empty(),
             "a raw drain met a skeleton row: hydrate its keys instead"
         );
+        chunk
     }
 }
 
@@ -106,36 +109,6 @@ impl ReadCursor {
             (Some(a), None) => Some(a),
             _ => None,
         }
-    }
-
-    /// Positioned by `position` before it is returned, so no caller moves a cursor it
-    /// has to mutate first.
-    #[inline]
-    fn new(
-        sources: Vec<Run>,
-        states: Vec<PosCursor>,
-        schema: SchemaDescriptor,
-        position: impl FnOnce(&mut ReadCursor),
-    ) -> Self {
-        debug_assert_eq!(sources.len(), states.len());
-        let order = MergeOrder::leading(schema.pk_stride(), sources.iter().any(ColumnarSource::is_skeleton));
-        let mut cursor = ReadCursor {
-            // Sized for the source count; `rebuild_and_advance` plays it.
-            tree: LoserTree::empty(sources.len()),
-            sources,
-            order,
-            states,
-            merge_order: Vec::new(),
-            drain_windows: Vec::new(),
-            mode: None,
-            schema,
-            valid: false,
-            current_weight: 0,
-            current_entry_idx: 0,
-            current_row: 0,
-        };
-        position(&mut cursor);
-        cursor
     }
 
     /// Re-derive the drive mode after the per-source positions moved, then advance
@@ -190,20 +163,6 @@ impl ReadCursor {
             state.position = 0;
         }
         self.rebuild_and_advance();
-    }
-
-    /// Absolute lower-bound seek: each source binary-searches its full row range
-    /// for the first row `>= key`. `key` must be exactly `pk_stride` OPK bytes
-    /// (the bytes `get_pk_bytes`/`current_pk_bytes` yield). Correct at every PK
-    /// width and signedness — the search and the tree both order by the raw OPK
-    /// bytes.
-    ///
-    /// `Self::advance_to` lands identically, galloping from where the cursor
-    /// stands; this one's landing owes nothing to where the cursor stood, which
-    /// is what makes it the tests' independent oracle.
-    #[cfg(test)]
-    pub(crate) fn seek_bytes(&mut self, key: &[u8]) {
-        self.seek_range_bytes(key, None);
     }
 
     /// Galloping lower-bound seek: each source's search is seeded at its live
@@ -306,10 +265,11 @@ impl ReadCursor {
             Ordering::Equal => true,
             Ordering::Less => {
                 let stride = self.schema.pk_stride();
-                match key.len() == stride {
-                    true => self.advance_to_forward(key),
+                if key.len() == stride {
+                    self.advance_to_forward(key);
+                } else {
                     // The prefix over an all-zero rest is its group's lower bound.
-                    false => self.advance_to_forward(PkBuf::from_bytes(key).widened(stride).pk_bytes()),
+                    self.advance_to_forward(PkBuf::from_bytes(key).widened(stride).pk_bytes());
                 }
                 self.valid && self.current_pk_starts_with(key)
             }
@@ -367,20 +327,9 @@ impl ReadCursor {
         &self.sources[idx]
     }
 
-    /// The current row's PK as its image: its OPK bytes read as a big-endian
-    /// integer. Only narrow (`pk_stride ≤ 16`) relations have one; panics above
-    /// that width.
-    #[inline]
-    pub fn current_key_narrow(&self) -> u128 {
-        debug_assert!(self.valid, "current_key_narrow on an invalid cursor");
-        let bytes = self.current_pk_bytes();
-        assert!(bytes.len() <= gnitz_wire::NARROW_PK_MAX_BYTES, "narrow PK cursor");
-        gnitz_wire::widen_pk_be(bytes)
-    }
-
     /// Whether the current row's PK equals the group's OPK `key_bytes`.
     #[inline]
-    pub(crate) fn current_pk_eq(&self, key_bytes: &[u8]) -> bool {
+    fn current_pk_eq(&self, key_bytes: &[u8]) -> bool {
         pk_bytes_eq(self.current_pk_bytes(), key_bytes)
     }
 
@@ -544,14 +493,16 @@ impl ReadCursor {
         })
     }
 
-    /// [`Self::for_each_row_while`] with the weight gate applied — the one place
-    /// the two positive-row walks below spell `current_weight > 0`.
-    pub fn for_each_positive_while<C: Fn(&[u8]) -> bool, F: FnMut(&ReadCursor)>(&mut self, cont: C, mut f: F) {
-        self.for_each_row_while(cont, |c| {
-            if c.current_weight > 0 {
-                f(c);
-            }
-        });
+    /// Call `f` on every remaining row at positive weight.
+    pub fn for_each_positive<F: FnMut(&ReadCursor)>(&mut self, mut f: F) {
+        self.for_each_row_while(
+            |_| true,
+            |c| {
+                if c.current_weight > 0 {
+                    f(c);
+                }
+            },
+        );
     }
 
     /// Step to the next live group; an advance consumes the group it emitted, so
@@ -618,7 +569,7 @@ impl ReadCursor {
     pub(super) fn drive<P: PayloadOrder>(
         &mut self,
         payload: P,
-        emit: impl FnMut(usize, usize, i64) -> std::ops::ControlFlow<()>,
+        emit: impl FnMut(usize, usize, i64) -> ControlFlow<()>,
     ) {
         let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
         merge::drive(tree, schema, sources, *order, states, payload, emit);
@@ -635,7 +586,7 @@ impl ReadCursor {
         let mut emitted: Option<(usize, usize, i64)> = None;
         self.drive(payload, |gs, gr, nw| {
             emitted = Some((gs, gr, nw));
-            std::ops::ControlFlow::Break(())
+            ControlFlow::Break(())
         });
         self.commit_emitted(emitted);
     }
@@ -681,6 +632,8 @@ pub fn from_runs_at(
     build(runs, schema, cap, |c| c.reposition_to(key))
 }
 
+/// Positioned by `position` before it is returned, so no caller moves a cursor it
+/// has to mutate first.
 #[inline]
 fn build(
     runs: impl IntoIterator<Item = Run>,
@@ -700,10 +653,27 @@ fn build(
         let count = run.row_count();
         if count > 0 {
             sources.push(run);
-            states.push(PosCursor::new(count));
+            states.push(PosCursor::over(0..count));
         }
     });
-    ReadCursor::new(sources, states, schema, position)
+    let order = MergeOrder::leading(schema.pk_stride(), sources.iter().any(ColumnarSource::is_skeleton));
+    let mut cursor = ReadCursor {
+        // Sized for the source count; `rebuild_and_advance` plays it.
+        tree: LoserTree::empty(sources.len()),
+        sources,
+        order,
+        states,
+        merge_order: Vec::new(),
+        drain_windows: Vec::new(),
+        mode: None,
+        schema,
+        valid: false,
+        current_weight: 0,
+        current_entry_idx: 0,
+        current_row: 0,
+    };
+    position(&mut cursor);
+    cursor
 }
 
 /// A cursor over nothing, in `schema`'s shape.

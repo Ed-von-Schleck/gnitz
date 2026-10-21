@@ -334,7 +334,7 @@ impl Relation {
     pub fn for_each_positive_with_prefix(&self, prefix: &[u8], f: impl FnMut(&ReadCursor)) {
         self.table()
             .cursor_between(prefix, prefix, Cut::Now)
-            .for_each_positive_while(|_| true, f);
+            .for_each_positive(f);
     }
 
     /// Materialize every row of this relation's store whose net weight is non-zero.

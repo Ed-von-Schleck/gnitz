@@ -82,7 +82,7 @@ fn idx_weights_for(engine: &CatalogEngine, idx_id: u64) -> Vec<i64> {
     let mut c = engine.sys_relation(SysFamily::Index).cursor();
     let mut v = Vec::new();
     while c.valid {
-        if c.current_key_narrow() as u64 == idx_id {
+        if gnitz_wire::widen_pk_be(c.current_pk_bytes()) as u64 == idx_id {
             v.push(c.current_weight);
         }
         c.advance();

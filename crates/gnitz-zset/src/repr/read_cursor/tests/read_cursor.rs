@@ -25,7 +25,11 @@ fn walk(c: &mut ReadCursor) -> Vec<(u128, i64, i64)> {
     let mut rows = Vec::new();
     while c.valid {
         let (src, row) = c.current_row_source();
-        rows.push((c.current_key_narrow(), c.current_weight, payload0_i64(src, row)));
+        rows.push((
+            gnitz_wire::widen_pk_be(c.current_pk_bytes()),
+            c.current_weight,
+            payload0_i64(src, row),
+        ));
         c.advance();
     }
     rows
@@ -117,8 +121,9 @@ proptest! {
         let mut adv = open();
         for k in &keys {
             let lower = (0..mat.count).find(|&r| pk(r) >= &k[..]);
+            // `fresh` lands by absolute binary search, independent of where the last probe left `adv`.
             let mut fresh = open();
-            fresh.seek_bytes(k);
+            fresh.seek_range_bytes(k, None);
             adv.advance_to(k);
             for c in [&fresh, &adv] {
                 prop_assert_eq!(c.valid, lower.is_some());
@@ -233,7 +238,7 @@ fn mode_follows_the_live_source_set() {
 
     // The unbounded seek reaches the same collapse, and `rewind` re-livens all.
     let mut c = create_read_cursor(&b, &[], schema);
-    c.seek_bytes(&opk(301));
+    c.seek_range_bytes(&opk(301), None);
     assert_eq!(c.mode, Some(3));
     assert_eq!(walk(&mut c), rows(301, 340));
     c.rewind();
@@ -368,7 +373,11 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
         let mut c = create_read_cursor(std::slice::from_ref(&mem), std::slice::from_ref(&sk), schema);
         let mut groups = Vec::new();
         while c.valid {
-            groups.push((c.current_key_narrow(), c.current_weight, c.current_is_skeleton()));
+            groups.push((
+                gnitz_wire::widen_pk_be(c.current_pk_bytes()),
+                c.current_weight,
+                c.current_is_skeleton(),
+            ));
             c.advance();
         }
         assert_eq!(

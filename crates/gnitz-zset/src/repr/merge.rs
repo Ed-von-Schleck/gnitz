@@ -157,12 +157,6 @@ pub(crate) struct PosCursor {
 }
 
 impl PosCursor {
-    /// A cursor over `[0, count)`, from row 0.
-    #[inline]
-    pub(crate) fn new(count: usize) -> Self {
-        Self::over(0..count)
-    }
-
     /// A cursor over `rows`, from its first.
     #[inline]
     pub(crate) fn over(rows: Range<usize>) -> Self {
@@ -176,13 +170,6 @@ impl PosCursor {
     #[inline]
     pub(crate) fn is_valid(&self) -> bool {
         self.position < self.end
-    }
-
-    /// Step past the current row. Callers advance only a position they have
-    /// established is valid (the merge drivers advance the heap root).
-    #[inline]
-    pub(crate) fn advance(&mut self) {
-        self.position += 1;
     }
 }
 
@@ -201,13 +188,10 @@ impl PosCursor {
 /// matching rows inside one sorted source) and cross-source duplicates in one
 /// pass.
 ///
-/// Selects the payload order once via `with_payload_cmp!`, seats one
-/// [`PosCursor`] per source, and drives [`drive`]; the PK axis is settled by
-/// each row's key under a [`MergeOrder`], and past it by [`merge_less`]. Source
-/// `i` is walked over the `i`-th of `windows`.
+/// The PK axis is settled by each row's key under a [`MergeOrder`], and past it
+/// by [`merge_less`]; source `i` is walked over the `i`-th of `windows`.
 /// `emit(group_src, group_row, net_weight)` fires once per surviving (net ≠ 0)
-/// group; the caller turns `(src, row)` into its output (a survivor triple for
-/// the scatter, a guard-routed shard append for compaction).
+/// group, in (PK, payload) order.
 pub(crate) fn run_merge<S: ColumnarSource>(
     sources: &[S],
     schema: &SchemaDescriptor,
@@ -392,11 +376,10 @@ pub(crate) fn drive<S, P>(
     // `cursors`, so it coexists with the `&mut cursors` `step!` holds.
     let less = merge_less(schema, sources, order, payload);
     let wide = order.has_tail(schema.pk_stride());
-    // Sources are ghost-free, so the advance is a bare `position + 1`.
     macro_rules! step {
         ($src:expr) => {{
             let c = &mut cursors[$src];
-            c.advance();
+            c.position += 1;
             tree.step_top(order.head(sources, $src, c), &less);
         }};
     }

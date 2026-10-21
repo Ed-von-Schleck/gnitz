@@ -10,11 +10,10 @@ pub(super) struct Mmap {
 }
 
 impl Mmap {
-    /// Map the whole of `file` read-only. The mapping holds its own reference to
-    /// the inode, so the caller may close `file` at once. An empty file is refused
-    /// (`EINVAL`).
-    pub(super) fn from_file(file: &File) -> io::Result<Self> {
-        let len = file.metadata()?.len() as usize;
+    /// Map the first `len` bytes of `file` read-only; `len` must be its length,
+    /// and nonzero. The mapping holds its own reference to the inode, so the
+    /// caller may close `file` at once.
+    pub(super) fn from_file(file: &File, len: usize) -> io::Result<Self> {
         // SAFETY: a fresh mapping at an address the kernel picks.
         let raw = unsafe {
             libc::mmap(
@@ -32,18 +31,9 @@ impl Mmap {
         Ok(Mmap { ptr: raw.cast(), len })
     }
 
-    /// `MADV_SEQUENTIAL` over the mapping; best-effort.
-    pub(super) fn advise_sequential(&self) {
-        self.advise(libc::MADV_SEQUENTIAL);
-    }
-
-    /// `MADV_HUGEPAGE` over the mapping; best-effort.
-    pub(super) fn advise_hugepage(&self) {
-        self.advise(libc::MADV_HUGEPAGE);
-    }
-
-    fn advise(&self, advice: libc::c_int) {
-        // SAFETY: the range is this mapping, and neither advice changes what it reads.
+    /// `advice` over the mapping; best-effort.
+    pub(super) fn advise(&self, advice: libc::c_int) {
+        // SAFETY: the range is this mapping, and the advice its callers give changes no byte it reads.
         unsafe { libc::madvise(self.ptr.cast_mut().cast(), self.len, advice) };
     }
 

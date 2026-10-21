@@ -10,11 +10,9 @@
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::repr::batch::Batch;
-use crate::repr::batch::ColPtr;
+use crate::repr::batch::{Batch, ColPtr};
 use crate::repr::merge::ColumnarSource;
-use crate::repr::scatter::DecodedColumns;
-use crate::repr::scatter::UnifiedSource;
+use crate::repr::scatter::{mem_batch_to_unified, DecodedColumns, UnifiedSource};
 use crate::repr::shard_reader::MappedShard;
 use crate::schema::payload_order::compare_rows;
 use crate::schema::SchemaDescriptor;
@@ -84,7 +82,7 @@ impl StoredRow {
     /// and every comparator takes. An `impl Trait` return, so which run kind
     /// backs it stays this crate's business.
     #[inline]
-    pub fn source(&self) -> (&impl gnitz_wire::RowSource, usize) {
+    pub fn source(&self) -> (&impl RowSource, usize) {
         (&self.run, self.row)
     }
 }
@@ -153,7 +151,7 @@ impl ColumnarSource for Run {
         decoded: &mut DecodedColumns,
     ) -> UnifiedSource<'_> {
         match self {
-            Run::Mem(b) => crate::repr::scatter::mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
+            Run::Mem(b) => mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
             Run::Shard(s) => s.to_unified(schema, cols, window, decoded),
         }
     }

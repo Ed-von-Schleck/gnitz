@@ -1,5 +1,6 @@
 //! Draining the merge into owned batches.
 
+use std::ops::ControlFlow;
 use std::rc::Rc;
 
 use super::super::run::Run;
@@ -24,10 +25,7 @@ impl ReadCursor {
     /// Up to `max_rows` rows in merge order, consolidated, each a whole (PK, payload)
     /// group; `None` once the cursor is exhausted.
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
-        let mut skeletons = SkeletonKeys::default();
-        let chunk = self.drain_live_chunk(max_rows, &mut skeletons);
-        skeletons.assert_none();
-        chunk
+        SkeletonKeys::raw(|s| self.drain_live_chunk(max_rows, s))
     }
 
     /// [`Self::drain_chunk`], with each skeleton row's key pushed to `skeletons` instead of
@@ -54,10 +52,11 @@ impl ReadCursor {
             let sources = &self.sources;
             order.retain(|&(e, r, w)| {
                 let src = &sources[e as usize];
-                if src.is_skeleton() {
+                let skeleton = src.is_skeleton();
+                if skeleton {
                     skeletons.push(src.get_pk_bytes(r as usize), w);
                 }
-                !src.is_skeleton()
+                !skeleton
             });
         }
         let set = UnifiedSet::of(&self.sources, &self.schema, windows.iter().cloned());
@@ -112,10 +111,10 @@ impl ReadCursor {
         with_payload_cmp!(self.schema, |payload| self.drive(payload, |gs, gr, nw| {
             if out.len() == max_rows {
                 first_undrained = Some((gs, gr, nw));
-                std::ops::ControlFlow::Break(())
+                ControlFlow::Break(())
             } else {
                 out.push((gs as u32, gr as u32, nw));
-                std::ops::ControlFlow::Continue(())
+                ControlFlow::Continue(())
             }
         }));
         self.commit_emitted(first_undrained);

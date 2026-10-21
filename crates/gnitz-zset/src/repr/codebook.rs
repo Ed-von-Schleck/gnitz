@@ -35,13 +35,6 @@ pub struct Codebook {
 }
 
 impl Codebook {
-    /// A table trained on `values`.
-    pub(crate) fn train(values: &[&[u8]]) -> Self {
-        let mut book = Self::of_encoder(fsst::Compressor::train(&values.to_vec()), 0);
-        book.trained_sixteenths = book.probe_sixteenths(values);
-        book
-    }
-
     /// The codebook of `shard`'s table; `None` for a plain heap, or a table no
     /// trained encoder could have written.
     pub fn of_shard(shard: &MappedShard) -> Option<Self> {
@@ -145,7 +138,12 @@ impl Codebook {
             Some(book) if book.probe_sixteenths(&values) <= book.trained_sixteenths + DRIFT_SIXTEENTHS => {
                 Some(Rc::clone(book))
             }
-            _ => Some(Rc::new(Codebook::train(&values))),
+            _ => {
+                // A table trained on `values`.
+                let mut book = Self::of_encoder(fsst::Compressor::train(&values), 0);
+                book.trained_sixteenths = book.probe_sixteenths(&values);
+                Some(Rc::new(book))
+            }
         }
     }
 }

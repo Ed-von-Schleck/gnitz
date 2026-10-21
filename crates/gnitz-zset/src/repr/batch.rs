@@ -93,7 +93,7 @@ pub struct Batch {
     /// row whose regions were not all written reads uninitialised arena bytes.
     pub(crate) count: usize,
     /// The rows are strictly (PK, payload)-increasing and ghost-free. Cleared by
-    /// every mutable region borrow and every append, and kept by
+    /// every row swap and every append, and kept by
     /// [`Self::map_weights`]; raised by [`Self::certify_consolidated`], by
     /// copying a source's claim, and by [`Self::append_above`], which checks the
     /// order it extends. A debug build verifies the rows wherever the claim is
@@ -231,6 +231,14 @@ impl Batch {
         self.dead_heap = self.dead_heap.saturating_add(bytes).min(self.blob.len());
     }
 
+    /// These rows over their heap padded with `pad` unreferenced bytes, charged dead.
+    #[cfg(test)]
+    pub(crate) fn padded(mut self, pad: usize) -> Batch {
+        self.blob.extend(std::iter::repeat_n(0u8, pad));
+        self.dead_heap += pad;
+        self
+    }
+
     /// The live `count * stride` bytes of region `r` — the one range computation
     /// every fixed-region accessor below shares, and the slice the wire and shard
     /// framers build their region lists from.
@@ -244,15 +252,6 @@ impl Batch {
     #[inline(always)]
     fn region_start(&self, r: usize) -> usize {
         self.schema.region_start(r, self.capacity)
-    }
-
-    /// [`Self::region`] as a mutable borrow.
-    #[inline(always)]
-    fn region_mut(&mut self, r: usize) -> &mut [u8] {
-        self.consolidated = false;
-        let off = self.region_start(r);
-        let end = off + self.count * self.schema.region_stride(r);
-        &mut self.data[off..end]
     }
 
     #[inline]
@@ -270,7 +269,7 @@ impl Batch {
 
     /// The `[start, end)` runs of rows with no null bit of `mask` set.
     pub(crate) fn runs_without_nulls(&self, mask: u64) -> Vec<(usize, usize)> {
-        let words = self.null_bmp().as_chunks::<8>().0;
+        let words = self.null_bmp().as_chunks::<FIXED_REGION_BYTES>().0;
         // A batch with none of them set takes only this branch-free pass.
         if words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & mask == 0 {
             return vec![(0, self.count)];
@@ -286,16 +285,6 @@ impl Batch {
     #[inline(always)]
     pub fn num_payload_cols(&self) -> usize {
         self.schema.num_payload_cols()
-    }
-
-    // ── Mutable slice accessors ─────────────────────────────────────────
-
-    /// These rows over their heap padded with `pad` unreferenced bytes, charged dead.
-    #[cfg(test)]
-    pub(crate) fn padded(mut self, pad: usize) -> Batch {
-        self.blob.extend(std::iter::repeat_n(0u8, pad));
-        self.dead_heap += pad;
-        self
     }
 
     // ── Row accessors ───────────────────────────────────────────────────
@@ -673,10 +662,12 @@ impl Batch {
         if a == b {
             return;
         }
+        self.consolidated = false;
         let (lo, hi) = (a.min(b), a.max(b));
         for r in 0..self.schema.num_regions() {
             let stride = self.schema.region_stride(r);
-            let (head, tail) = self.region_mut(r).split_at_mut(hi * stride);
+            let start = self.region_start(r);
+            let (head, tail) = self.data[start..start + self.count * stride].split_at_mut(hi * stride);
             head[lo * stride..(lo + 1) * stride].swap_with_slice(&mut tail[..stride]);
         }
     }
@@ -1010,13 +1001,11 @@ impl Batch {
             blob += src.blob.len();
         }
         let mut out = Batch::with_capacity_blob(schema, rows, blob);
-        if rows > 0 {
-            // One session for every source: its setup would otherwise be paid
-            // per source, which a fold of one-row runs is made of.
-            let mut session = out.append_session(rows);
-            for src in sources.filter(|src| src.count > 0) {
-                session.push_ranges(&src, &[(0, src.count)]);
-            }
+        // One session for every source: its setup would otherwise be paid
+        // per source, which a fold of one-row runs is made of.
+        let mut session = out.append_session(rows);
+        for src in sources {
+            session.push_ranges(&src, &[(0, src.count)]);
         }
         out
     }
@@ -1437,8 +1426,8 @@ impl<'a> MemBatch<'a> {
     /// bounds-checked slice of the weight region.
     #[inline]
     pub fn sum_weights(&self, start: usize, end: usize) -> i64 {
-        self.weight()[start * 8..end * 8]
-            .as_chunks::<8>()
+        self.weight()[start * FIXED_REGION_BYTES..end * FIXED_REGION_BYTES]
+            .as_chunks::<FIXED_REGION_BYTES>()
             .0
             .iter()
             .fold(0i64, |a, w| a.wrapping_add(i64::from_le_bytes(*w)))
@@ -1471,11 +1460,11 @@ impl<'a> MemBatch<'a> {
     }
     #[inline(always)]
     pub fn get_weight(&self, row: usize) -> i64 {
-        gnitz_wire::read_i64_le(self.data, self.region_start(REG_WEIGHT) + row * 8)
+        read_i64_le(self.data, self.region_start(REG_WEIGHT) + row * FIXED_REGION_BYTES)
     }
     #[inline(always)]
     pub fn get_null_word(&self, row: usize) -> u64 {
-        read_u64_le(self.data, self.region_start(REG_NULL_BMP) + row * 8)
+        read_u64_le(self.data, self.region_start(REG_NULL_BMP) + row * FIXED_REGION_BYTES)
     }
     #[inline(always)]
     pub(crate) fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &'a [u8] {

@@ -8,7 +8,7 @@ use gnitz_wire::{read_u64_le, write_u64_le};
 
 use StorageError::Corrupt;
 
-pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
+const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// Bumped by hand for any change to the bytes a writer produces;
 /// `shard_bytes_are_pinned` fails until it is.
 pub(crate) const SHARD_EPOCH: u64 = 30;
@@ -16,10 +16,10 @@ pub(crate) const SHARD_EPOCH: u64 = 30;
 /// Compared for equality at open. A shard sizes its regions from the live
 /// schema, so a system-table shape change must refuse the file, not reinterpret it.
 pub(crate) const SHARD_VERSION: u64 = SHARD_EPOCH ^ gnitz_wire::SYS_SCHEMA_DIGEST;
-pub(crate) const DIR_ENTRY_SIZE: usize = 16;
+const DIR_ENTRY_SIZE: usize = 16;
 pub(crate) const ALIGNMENT: usize = 64;
 
-pub(crate) const OFF_MAGIC: usize = 0;
+const OFF_MAGIC: usize = 0;
 pub(crate) const OFF_VERSION: usize = 8;
 /// The row count (u64 LE), at least 1: every writer skips an empty output.
 pub(crate) const OFF_ROW_COUNT: usize = 16;
@@ -27,20 +27,20 @@ pub(crate) const OFF_DESC_CHECKSUM: usize = 24;
 /// The writer's payload-column count (u64 LE), which fixes the file's region count.
 pub(crate) const OFF_FILE_NPC: usize = 32;
 /// Flag bits (u64 LE); see [`SHARD_FLAG_SKELETON`].
-pub(crate) const OFF_FLAGS: usize = 40;
+const OFF_FLAGS: usize = 40;
 /// XXH3-64 over every byte after the descriptive prefix, alignment padding
 /// included.
-pub(crate) const OFF_BODY_CHECKSUM: usize = 48;
+const OFF_BODY_CHECKSUM: usize = 48;
 /// How many rows carry a negative weight (u64 LE).
-pub(crate) const OFF_RETRACTIONS: usize = 56;
+const OFF_RETRACTIONS: usize = 56;
 pub(crate) const HEADER_SIZE: usize = OFF_RETRACTIONS + 8;
 
 /// [`OFF_FLAGS`] bit: a capacity-bounded view's skeleton shard, one (PK, coarse
 /// weight) row per key.
 pub(crate) const SHARD_FLAG_SKELETON: u64 = 1;
 
-/// The header fields a reader acts on; [`read`](Self::read) checks magic and
-/// version.
+/// The header fields a reader acts on; [`read`](Self::read) checks the length,
+/// magic, version, payload arity and a non-zero row count.
 #[derive(Clone, Copy)]
 pub(crate) struct ShardHeader {
     pub row_count: usize,

@@ -14,7 +14,7 @@ fn a_table_read_back_codes_as_the_one_trained() {
     let book = Codebook::for_batch(None, &batch).expect("enough long bytes to train");
     let shard = map_coded_shard(&dir.path().join("s.db"), &batch, &book);
     let read = Codebook::of_shard(&shard).unwrap();
-    assert_eq!(read.table().digest(), book.table().digest());
+    assert_eq!(read.digest(), book.digest());
     assert_eq!(read.trained_sixteenths(), book.trained_sixteenths());
     for i in 0..2000 {
         let (mut a, mut b) = (Vec::new(), Vec::new());
@@ -39,7 +39,7 @@ fn a_codebook_is_kept_until_a_batch_drifts_from_it() {
     let hex: Vec<(u64, String)> = (0..400u64).map(|i| (i, format!("{:032x}", mix(i)))).collect();
     let drifted = Codebook::for_batch(Some(&book), &string_batch(&hex)).unwrap();
     assert!(!Rc::ptr_eq(&book, &drifted));
-    assert_ne!(drifted.table().digest(), book.table().digest());
+    assert_ne!(drifted.digest(), book.digest());
 }
 
 /// A table read off disk in an order no trained encoder keeps is refused, never

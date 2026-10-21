@@ -485,12 +485,9 @@ fn sparse_parse_refuses_a_size_its_header_does_not_give() {
     }
     assert!(SparseImage::parse(&image[..image.len() - 1], rows, 8).is_none());
     assert!(SparseImage::parse(&image[..SPARSE_RANKS_AT - 1], rows, 8).is_none());
-    let forged = |at: usize, v: u32| {
-        let mut image = image.clone();
-        image[at..at + 4].copy_from_slice(&v.to_le_bytes());
-        SparseImage::parse(&image, rows, 8).is_none()
-    };
-    assert!(forged(0, rows as u32 + 1), "more values than rows");
+    let mut forged = image.clone();
+    forged[..4].copy_from_slice(&(rows as u32 + 1).to_le_bytes());
+    assert!(SparseImage::parse(&forged, rows, 8).is_none(), "more values than rows");
 }
 
 /// The null words and the block ranks are body bytes no open verifies.
@@ -532,6 +529,13 @@ pub(super) fn key_region(
         .collect();
     keys.sort();
     (schema, keys.concat())
+}
+
+/// A 300-row (U16, U64) key region whose first field takes nine values.
+fn two_field_key() -> (SchemaDescriptor, Vec<u8>) {
+    key_region(&[TypeCode::U16, TypeCode::U64], 300, |i, c| {
+        [(i % 9) as u128, i as u128][c]
+    })
 }
 
 /// The first row of `raw` at or after `key`.
@@ -696,9 +700,7 @@ fn key_roundtrips_and_seeks_as_the_region_it_packs() {
 
 #[test]
 fn key_parse_refuses_widths_its_fields_do_not_hold() {
-    let (schema, raw) = key_region(&[TypeCode::U16, TypeCode::U64], 300, |i, c| {
-        [(i % 9) as u128, i as u128][c]
-    });
+    let (schema, raw) = two_field_key();
     let fields = KeyLayout::of(&schema);
     let image = key_encode(&raw, &schema).unwrap();
     let bits_at = fields.fields().len() * 8;
@@ -729,9 +731,7 @@ fn key_parse_refuses_widths_its_fields_do_not_hold() {
 
 #[test]
 fn a_key_minimum_past_its_field_wraps() {
-    let (schema, raw) = key_region(&[TypeCode::U16, TypeCode::U64], 300, |i, c| {
-        [(i % 9) as u128, i as u128][c]
-    });
+    let (schema, raw) = two_field_key();
     let mut image = key_encode(&raw, &schema).unwrap();
     image[..16].fill(0xFF);
     let key = KeyImage::parse(&image, 300, &schema).unwrap();

@@ -292,7 +292,7 @@ impl MappedShard {
 
     pub fn open(path: &str, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
         let (mmap, header) = Self::map(path)?;
-        mmap.advise_hugepage();
+        mmap.advise(libc::MADV_HUGEPAGE);
         Self::bind(Rc::new(mmap), header, schema)
     }
 
@@ -300,10 +300,11 @@ impl MappedShard {
     /// matches the digest stamped over it.
     fn map(path: &str) -> Result<(Mmap, ShardHeader), StorageError> {
         let file = std::fs::File::open(path)?;
-        if file.metadata()?.len() == 0 {
+        let len = file.metadata()?.len() as usize;
+        if len == 0 {
             return Err(Corrupt("empty file"));
         }
-        let mmap = Mmap::from_file(&file)?;
+        let mmap = Mmap::from_file(&file, len)?;
         let data = mmap.as_slice();
         let header = ShardHeader::read(data)?;
         let prefix = data
@@ -425,7 +426,7 @@ impl MappedShard {
 
     /// Whether the body still hashes to the checksum the writer recorded.
     pub fn verify_body(&self) -> Result<(), StorageError> {
-        self.mmap.advise_sequential();
+        self.mmap.advise(libc::MADV_SEQUENTIAL);
         let body = &self.mmap.as_slice()[desc_len(self.header.file_npc)..];
         (gnitz_wire::checksum(body) == self.header.body_checksum)
             .then_some(())
@@ -796,7 +797,7 @@ impl ColumnarSource for ShardWindow<'_> {
 
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
-        ColumnarSource::get_weight(self.shard, row)
+        self.shard.get_weight(row)
     }
 
     #[inline(always)]

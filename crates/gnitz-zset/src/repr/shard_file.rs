@@ -10,11 +10,9 @@ use super::encoding::*;
 use super::layout::*;
 use super::shard_filter;
 use crate::repr::error::StorageError;
-use crate::schema::key::probe_key;
 use crate::schema::SchemaColumn;
 use gnitz_wire::{read_u64_le, write_u64_le, FixedInt, Heap, RowSource};
 use rustc_hash::{FxHashMap, FxHashSet};
-use xorf::BinaryFuse8;
 
 /// Whether every `width`-byte element of `region` is the same. Every element
 /// equals the next exactly when the region equals itself shifted by one
@@ -190,25 +188,6 @@ fn pack_string_column<'a>(cells: &'a [[u8; 16]], src: Heap<'a>, heap: &mut HeapW
     (Encoding::Seq, seq_encode(cells, span, src, heap))
 }
 
-fn build_shard_filter_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<BinaryFuse8> {
-    // One hashed key per distinct PK. The PK region is sorted, so rows that
-    // share a PK but differ in payload (valid under (PK, payload) element
-    // identity) are adjacent — skipping chunks byte-equal to their predecessor
-    // is an allocation-free O(n) pre-shrink that bounds `build`'s sort at the
-    // number of *distinct* PKs in the region rather than its row count.
-    // `probe_key` is the derivation the probe side must match exactly.
-    let mut keys: Vec<u64> = Vec::with_capacity(pk_bytes.len() / stride);
-    let mut prev: Option<&[u8]> = None;
-    for chunk in pk_bytes.chunks_exact(stride) {
-        if prev == Some(chunk) {
-            continue;
-        }
-        prev = Some(chunk);
-        keys.push(probe_key(chunk));
-    }
-    shard_filter::build(keys)
-}
-
 /// Per-call policy for [`Batch::write_as_shard`].
 #[derive(Clone, Copy, Default)]
 pub struct ShardWriteOpts<'a> {
@@ -252,9 +231,8 @@ impl Batch {
         );
         // A store nothing point-probes writes no filter.
         let filter = (!opts.skip_pk_filter)
-            .then(|| build_shard_filter_from_pk_region(regions[REG_PK], schema.pk_stride()))
-            .flatten()
-            .map(|f| shard_filter::serialize(&f));
+            .then(|| shard_filter::build(regions[REG_PK], schema.pk_stride()))
+            .flatten();
         let nulls = regions[REG_NULL_BMP];
         let mut images: Vec<(Encoding, Cow<[u8]>)> = Vec::with_capacity(regions.len() + 1);
         images.push(encode_region(regions[REG_PK], schema.pk_stride(), || {

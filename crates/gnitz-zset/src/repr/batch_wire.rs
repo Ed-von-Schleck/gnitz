@@ -96,7 +96,11 @@ impl Batch {
             return Some(whole);
         }
         let (rows, heap) = match self.heap_referencing_slots() {
-            0 => (self.rows_by_width(start, budget), 0),
+            0 => (
+                (self.count - start)
+                    .min((budget.saturating_sub(wal::WAL_HEADER_SIZE) / self.schema().row_width()).max(1)),
+                0,
+            ),
             slots => self.rows_with_heap(start..self.count, slots, budget),
         };
         let out = WireRows {
@@ -155,12 +159,6 @@ impl Batch {
     fn long_spans(&self, row: usize, slots: u64) -> impl Iterator<Item = Range<usize>> + '_ {
         gnitz_wire::BitIter(slots)
             .filter_map(move |pi| gnitz_wire::german_string_heap(self.get_col_ptr(row, pi, 16), self.blob.len()))
-    }
-
-    /// Rows from `start` that fit `budget` by fixed width alone.
-    fn rows_by_width(&self, start: usize, budget: usize) -> usize {
-        let slope = self.schema().row_width();
-        (self.count - start).min((budget.saturating_sub(wal::WAL_HEADER_SIZE) / slope).max(1))
     }
 
     /// How many of `rows`, from the front, fit `budget` once the heap bytes they

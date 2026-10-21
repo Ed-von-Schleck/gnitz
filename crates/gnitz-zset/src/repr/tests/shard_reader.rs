@@ -16,7 +16,7 @@ use gnitz_wire::write_u64_le;
 
 /// Write `batch` through the production writer to `dir/name`, its heap coded
 /// under a codebook trained on it where that pays.
-pub(super) fn write(dir: &std::path::Path, name: &str, batch: &Batch) -> String {
+fn write(dir: &std::path::Path, name: &str, batch: &Batch) -> String {
     let path = dir.join(name).to_str().unwrap().to_owned();
     let codebook = Codebook::for_batch(None, batch);
     let opts = ShardWriteOpts {
