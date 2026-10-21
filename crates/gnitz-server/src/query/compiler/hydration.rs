@@ -24,8 +24,7 @@ pub(super) fn derive_hydration(
     registry: &RelationRegistry,
     vm: &Vm,
     regs: &[DeltaReg],
-    integrals: &[Option<Integral>],
-    sources: &FxHashMap<u64, Scan>,
+    integrals: &[Option<(Integral, DeltaReg)>],
 ) -> Result<Hydration, String> {
     use gnitz_wire::{JoinKind, OpNode};
     // A replay runs on one worker, and so no exchange round.
@@ -52,12 +51,8 @@ pub(super) fn derive_hydration(
             if (ia, ib) != (da, db) {
                 return Err(UNSUPPORTED.into());
             }
-            match integrals[da].expect("the join declared its integrand's integral") {
-                seed @ Integral::Own(_) => (regs[da], seed),
-                // The table's rows enter where its scan's delta does, ahead of
-                // `da`'s re-key, whose integral the store is.
-                seed @ Integral::Relation(table) => (sources[&table].reg, seed),
-            }
+            let (seed, entry) = integrals[da].expect("the join declared its integrand's integral");
+            (entry, seed)
         }
         _ => return Err(UNSUPPORTED.into()),
     };

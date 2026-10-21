@@ -37,20 +37,6 @@ use routing::ViewMeta;
 // Circuit walks
 // ---------------------------------------------------------------------------
 
-/// Backward pass: `start` and every node it reads, directly or transitively.
-fn ancestors_inclusive(circuit: &Circuit, start: NodeId) -> Vec<bool> {
-    let mut reached = vec![false; circuit.nodes().len()];
-    reached[start] = true;
-    for n in (0..=start).rev() {
-        if reached[n] {
-            for &p in circuit.inputs(n) {
-                reached[p] = true;
-            }
-        }
-    }
-    reached
-}
-
 /// True iff `op` carries every row through on its own worker with the PK region
 /// intact.
 fn keeps_rows_and_pk_region(op: &gnitz_wire::OpNode) -> bool {
@@ -70,24 +56,13 @@ fn row_local_origin(circuit: &Circuit, mut from: NodeId) -> NodeId {
     from
 }
 
-/// Some node `nid` reads, directly or transitively, owes a ground row.
-fn behind_ground_reduce(circuit: &Circuit, nid: NodeId) -> bool {
-    let behind = ancestors_inclusive(circuit, circuit.inputs(nid)[0]);
-    (0..circuit.nodes().len()).any(|n| behind[n] && circuit.owes_ground_row(n))
-}
-
 /// The reader of `shard` that groups its input, and its group columns — the key
 /// the exchange co-locates by. `None` where no reader is one: the rows are placed
 /// by their own PK.
-fn keyed_reader(circuit: &Circuit, shard: NodeId) -> Result<Option<(NodeId, &[u32])>, String> {
-    let keyed = circuit
+fn keyed_reader(circuit: &Circuit, shard: NodeId) -> Option<(NodeId, &[u32])> {
+    circuit
         .readers(shard)
-        .find_map(|n| Some((n, circuit.op(n).group_cols()?)));
-    // A second reader would be handed rows placed by a key that is not its own.
-    if keyed.is_some() && circuit.readers(shard).nth(1).is_some() {
-        return Err("an exchange in front of a reduce, top-N or window has another reader".into());
-    }
-    Ok(keyed)
+        .find_map(|n| Some((n, circuit.op(n).group_cols()?)))
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +98,7 @@ pub(super) fn compile_view(
         return Err("the circuit's output schema is not the view's".into());
     }
     let hydration = bounded
-        .then(|| derive_hydration(circuit, registry, &vm, &regs, &integrals, &sources))
+        .then(|| derive_hydration(circuit, registry, &vm, &regs, &integrals))
         .transpose()?;
     let sources = sources
         .into_iter()

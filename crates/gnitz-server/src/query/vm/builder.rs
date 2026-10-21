@@ -57,6 +57,12 @@ impl ProgramBuilder {
         self.reach[a.at()].iter().any(|seed| self.reach[b.at()].contains(seed))
     }
 
+    /// Push the sum of `a` and `b`, under the schema both widen to.
+    pub(in crate::query) fn union(&mut self, a: DeltaReg, b: DeltaReg) -> Result<DeltaReg, String> {
+        let schema = gnitz_zset::algebra::union_nullability_merge(&self.schema_of(a), &self.schema_of(b))?;
+        Ok(self.push(a, schema, Op::Union { in_b: b }))
+    }
+
     /// Push an exchange round of `in_reg` under `plan`.
     pub(in crate::query) fn round(&mut self, in_reg: DeltaReg, plan: Rc<ScatterPlan>) -> DeltaReg {
         let seeds = self.reach[in_reg.at()].as_slice().into();

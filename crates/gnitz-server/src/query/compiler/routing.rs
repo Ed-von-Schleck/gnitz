@@ -18,6 +18,10 @@ pub(super) struct ViewMeta {
     /// by: a share of it where the source is replicated, a round otherwise.
     /// A source absent from it does not scatter; a self-contained view has none.
     source_routes: FxHashMap<u64, Rc<ScatterPlan>>,
+    /// Per node, every worker computes the same rows into it: each relation
+    /// behind it is replicated and reaches it whole, and nothing on the way trims
+    /// or moves its rows.
+    whole: Vec<bool>,
 }
 
 impl ViewMeta {
@@ -80,7 +84,13 @@ impl ViewMeta {
             source_routes.clear();
         }
 
-        Ok((ViewMeta { self_contained, source_routes }, placement))
+        let whole = whole_nodes(circuit, |tid| replicated(tid) && !source_routes.contains_key(&tid))?;
+        Ok((ViewMeta { self_contained, source_routes, whole }, placement))
+    }
+
+    /// Every worker computes the same rows into `nid`.
+    pub(super) fn held_whole(&self, nid: NodeId) -> bool {
+        self.whole[nid]
     }
 
     /// The plan a worker relays `source_id`'s delta into this view by, `None`
@@ -236,6 +246,42 @@ fn source_uses(circuit: &Circuit) -> Result<BTreeMap<u64, SourceUse>, String> {
         uses.entry(tid).or_default().owner_trimmed = false;
     }
     Ok(uses)
+}
+
+/// One forward pass: per node, whether every worker computes the same rows into
+/// it, where `whole_scan` answers for each source's scan. Refuses an exchange whose
+/// placement no worker count could serve, so a view's acceptance never depends on
+/// the worker count.
+fn whole_nodes(circuit: &Circuit, whole_scan: impl Fn(u64) -> bool) -> Result<Vec<bool>, String> {
+    use gnitz_wire::OpNode;
+    let n = circuit.nodes().len();
+    let mut whole: Vec<bool> = Vec::with_capacity(n);
+    // Some node it reads, directly or transitively, owes a ground row.
+    let mut grounded: Vec<bool> = Vec::with_capacity(n);
+    for (nid, op) in circuit.ops() {
+        let inputs = circuit.inputs(nid);
+        let behind_ground = inputs.iter().any(|&p| grounded[p]);
+        if let OpNode::ExchangeShard = op {
+            // The ground row is minted in an epoch of its own on one worker,
+            // entered behind the reduce: a round behind it would wait on workers
+            // that never run it.
+            if behind_ground {
+                return Err("an exchange behind a global aggregate".into());
+            }
+            // A second reader would be handed rows placed by a key that is not its own.
+            if keyed_reader(circuit, nid).is_some() && circuit.readers(nid).nth(1).is_some() {
+                return Err("an exchange in front of a reduce, top-N or window has another reader".into());
+            }
+        }
+        grounded.push(behind_ground || circuit.owes_ground_row(nid));
+        let own = match op {
+            OpNode::ScanDelta { source, .. } => whole_scan(*source),
+            OpNode::WorkerFilter | OpNode::ExchangeShard => false,
+            _ => true,
+        };
+        whole.push(own && inputs.iter().all(|&p| whole[p]));
+    }
+    Ok(whole)
 }
 
 /// The source of the `ScanDelta` the row-local walk back from `from` ends at.
