@@ -91,15 +91,6 @@ fn arb_string(rng: &mut crate::test_support::Rng) -> Vec<u8> {
 /// owes a compaction.
 const WAVES: usize = 5;
 
-fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> Table {
-    let p = if durable {
-        RecoverySource::SalReplay
-    } else {
-        RecoverySource::Rederive { resume_at: None }
-    };
-    test_support::new_table(dir, schema, p, DEFAULT_RAM_TIER_BYTES)
-}
-
 proptest! {
     /// Ingested in waves, each flushed (durable) or folded into the RAM tier
     /// (ephemeral): `has_pk_bytes` finds exactly the rows ingested so far and
@@ -114,7 +105,11 @@ proptest! {
         seed in any::<u64>(),
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let mut table = new_table(&dir.path().join("t"), schema, durable);
+        let path = dir.path().join("t");
+        let mut table = match durable {
+            true => test_support::new_table(&path, schema, RecoverySource::SalReplay, DEFAULT_RAM_TIER_BYTES),
+            false => test_support::scratch_table(&path, schema),
+        };
         let (original, mut absent) = arb_batch(&schema, rows, seed);
         // Same leading PK columns, trailing ordinal `rows`: never a real row.
         absent.push(rows as u128);

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use super::*;
 use crate::relation::{relation_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
-use crate::storage::{read_intact, shard_path, DEFAULT_RAM_TIER_BYTES};
+use crate::storage::{read_intact, shard_files, DEFAULT_RAM_TIER_BYTES};
 use crate::test_support::{
     flip_last_byte_in_place, make_batch_opk, make_schema_u64_i64, new_table, opk_pk, pk_payload_schema, spec, zset_of,
     RowKey,
@@ -140,15 +140,16 @@ fn a_corrupt_source_body_fails_the_relayout_and_keeps_the_source_set() {
 
     let source = child(0, 1).dir(rel);
     let manifest = read_intact(&source).unwrap().unwrap();
-    assert_eq!(manifest.shards.entries.len(), 1, "the seeded set flushed one shard");
-    let shard = shard_path(&source, manifest.shards.entries[0].seq);
-    flip_last_byte_in_place(&shard);
+    let [(shard, Some(_))] = &shard_files(&source).unwrap()[..] else {
+        panic!("the seeded set flushed one published shard")
+    };
+    flip_last_byte_in_place(shard);
 
     assert!(matches!(
         repartition_relation(rel, &schema, placement, 2, 4096, 64),
         Err(e) if e.contains("corrupt: body checksum")
     ));
-    assert!(Path::new(&shard).exists(), "the source shard survives");
+    assert!(Path::new(shard).exists(), "the source shard survives");
     assert_eq!(
         read_intact(&source).unwrap(),
         Some(manifest),

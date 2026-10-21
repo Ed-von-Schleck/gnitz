@@ -116,7 +116,7 @@ fn read_roundtrips_a_prepared_manifest_at_zero_one_and_many_entries() {
         let m = sample(count);
         // The barrier's publish step, minus the fsyncs a round-trip does
         // not observe.
-        prepare(d, &encode(&m)).unwrap();
+        fs::write(staging_path(d), encode(&m)).unwrap();
         commit(d).unwrap();
         assert_eq!(read(d).unwrap(), Some(m), "count={count}");
     }
@@ -146,7 +146,7 @@ fn published(dir: &str, count: usize) -> Manifest {
     for e in &m.shards.entries {
         fs::write(shard_path(dir, e.seq), e.seq.to_le_bytes()).unwrap();
     }
-    prepare(dir, &encode(&m)).unwrap();
+    fs::write(staging_path(dir), encode(&m)).unwrap();
     commit(dir).unwrap();
     m
 }

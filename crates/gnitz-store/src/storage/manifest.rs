@@ -18,10 +18,6 @@ use gnitz_zset::repr::StorageError;
 const MAGIC: u64 = 0x4D414E49464E5447;
 const VERSION: u64 = 17;
 
-const MANIFEST_FILE: &str = "manifest.bin";
-/// The one file a manifest is staged under before its rename.
-const STAGING_FILE: &str = "manifest.bin.tmp";
-
 /// What a shard index publishes and reopens from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ShardSet {
@@ -120,12 +116,13 @@ fn decode_body(r: &mut Reader) -> Result<Manifest, String> {
 
 /// The manifest path of the store at `store_dir`.
 pub(crate) fn manifest_path(store_dir: &str) -> String {
-    format!("{store_dir}/{MANIFEST_FILE}")
+    format!("{store_dir}/manifest.bin")
 }
 
-/// The path a manifest is staged under in the store at `dir`.
+/// The one path a manifest is staged under before its rename, in the store at
+/// `dir`.
 pub(super) fn staging_path(dir: &str) -> String {
-    format!("{dir}/{STAGING_FILE}")
+    format!("{dir}/manifest.bin.tmp")
 }
 
 /// The basename of the shard drawn at `seq`: `shard_{seq}.db`.
@@ -207,14 +204,7 @@ pub(crate) fn read_at(dir: &str, generation: u64) -> Result<Option<Manifest>, St
     Ok(read_intact(dir)?.filter(|m| m.checkpoint_mark == generation))
 }
 
-/// Stage `bytes` (an [`encode`]d manifest) beside `dir`'s manifest. Does NOT
-/// fdatasync or rename.
-pub(crate) fn prepare(dir: &str, bytes: &[u8]) -> Result<(), StorageError> {
-    fs::write(staging_path(dir), bytes)?;
-    Ok(())
-}
-
-/// Rename the manifest [`prepare`] staged onto `dir`'s manifest path.
+/// Rename the manifest staged at [`staging_path`] onto `dir`'s manifest path.
 pub(crate) fn commit(dir: &str) -> Result<(), StorageError> {
     fs::rename(staging_path(dir), manifest_path(dir))?;
     Ok(())
@@ -242,9 +232,6 @@ pub(crate) fn unlink<S: AsRef<str>>(dirs: &[S]) -> Result<(), StorageError> {
         if Path::new(dir).is_dir() {
             present.push(dir);
         }
-    }
-    if present.is_empty() {
-        return Ok(());
     }
     Syncer::default().sync_paths(present, FsyncFlags::empty())
 }
@@ -296,9 +283,6 @@ pub(crate) fn link_stores(pairs: &[(String, String)]) -> Result<(), StorageError
         }
         dirs.extend(entry_dirs(dst));
         stores.push(dst);
-    }
-    if stores.is_empty() {
-        return Ok(());
     }
     let mut sync = Syncer::default();
     // Every copied shard and staged manifest, before any rename.

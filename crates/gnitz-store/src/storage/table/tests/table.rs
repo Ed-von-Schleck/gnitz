@@ -8,8 +8,8 @@ use super::super::shard_index::L0_COMPACT_THRESHOLD;
 use super::flush_barrier;
 
 use crate::test_support::{
-    arb_fold_case, fold_batch, make_batch_raw, make_schema_u64_i64, new_table, row_key, zset_of, zset_sum, FoldRow,
-    RowKey,
+    arb_fold_case, fold_batch, make_batch_raw, make_schema_u64_i64, new_table, row_key, scratch_table, zset_of,
+    zset_sum, FoldRow, RowKey,
 };
 use gnitz_wire::PkKeys;
 use proptest::prelude::*;
@@ -216,7 +216,7 @@ proptest! {
 fn a_cursor_between_empty_prefixes_reads_the_whole_store() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut t = new_table(dir.path(), schema, RecoverySource::SalReplay, DEFAULT_RAM_TIER_BYTES);
+    let mut t = scratch_table(dir.path(), schema);
     t.ingest(rows(&[(1, 1, 10), (2, 1, 20), (5, 1, 50)])).unwrap();
     t.fold_to_ram().unwrap();
     t.ingest(rows(&[(2, -1, 20), (3, 1, 30)])).unwrap();
@@ -247,12 +247,7 @@ fn key(pk: u64) -> Vec<u8> {
 /// A store whose keys 1..=64 are inserted and retracted in two runs, and whose
 /// one live row is key 100.
 fn store_cancelled_under_100(dir: &Path) -> Table {
-    let mut t = new_table(
-        dir,
-        make_schema_u64_i64(),
-        RecoverySource::SalReplay,
-        DEFAULT_RAM_TIER_BYTES,
-    );
+    let mut t = scratch_table(dir, make_schema_u64_i64());
     let cancelled: Vec<(u64, i64, i64)> = (1..=64).map(|pk| (pk, 1, 0)).collect();
     t.ingest(rows(&[cancelled.as_slice(), &[(100, 1, 0)]].concat()))
         .unwrap();
@@ -351,12 +346,7 @@ fn a_store_of_cancelled_rows_floors_at_the_top_key() {
 #[test]
 fn a_memtable_over_budget_folds_into_the_ram_tier() {
     let dir = tempfile::tempdir().unwrap();
-    let mut t = new_table(
-        dir.path(),
-        make_schema_u64_i64(),
-        RecoverySource::SalReplay,
-        DEFAULT_RAM_TIER_BYTES,
-    );
+    let mut t = scratch_table(dir.path(), make_schema_u64_i64());
     let n = MEMTABLE_BYTES as u64 / 32 + 1;
     t.ingest(rows(&(0..n).map(|k| (k, 1, 0)).collect::<Vec<_>>())).unwrap();
     assert_eq!(t.memtable.len(), 0, "the ingest folded the memtable");

@@ -49,9 +49,10 @@ const SEAL_FOLD_RATIO: usize = 64;
 /// workload.
 const UPKEEP_LEVY: u64 = 64;
 
-/// The RAM-tier ceiling every store opens with: it bounds that one tier, not the
-/// table's heap. The ceiling trades spill writes against RSS; shrinking it is how
-/// a test reaches the disk regime on small data.
+/// The RAM-tier ceiling a registry's stores open with unless its `StoreConfig`
+/// overrides it: it bounds that one tier, not the table's heap. The ceiling trades
+/// spill writes against RSS; shrinking it is how a test reaches the disk regime on
+/// small data.
 pub(crate) const DEFAULT_RAM_TIER_BYTES: usize = 32 << 20;
 
 // ---------------------------------------------------------------------------
@@ -266,7 +267,6 @@ impl Table {
     // ------------------------------------------------------------------
 
     /// Ingest an already-constructed Batch into the memtable.
-    /// The relation-store ingest entry point.
     ///
     /// `#[inline]`: it takes a `Batch` by value, and every stateful operator
     /// calls it once per epoch.
@@ -390,7 +390,7 @@ impl Table {
     // ------------------------------------------------------------------
 
     /// The heap-resident tiers `cut` reads, newest first.
-    fn ram_tiers(&self, cut: Cut) -> impl Iterator<Item = &RunSet> + Clone {
+    fn ram_tiers(&self, cut: Cut) -> impl Iterator<Item = &RunSet> {
         [&self.pending, &self.memtable, &self.ram_tier]
             .into_iter()
             .skip(usize::from(cut == Cut::Sealed))

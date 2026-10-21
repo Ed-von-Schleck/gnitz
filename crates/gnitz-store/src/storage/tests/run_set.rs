@@ -115,7 +115,7 @@ fn a_cancelling_set_merges_only_a_run_that_cancels_the_one_before_it() {
 #[test]
 fn a_fold_drops_the_filter_once_most_of_its_keys_are_gone() {
     let schema = make_schema_u64_i64();
-    // A zero budget sizes the filter to its floor of 16 keys.
+    // A zero budget sizes the filter to one block.
     let mut set = RunSet::new(0);
     let push = |set: &mut RunSet, keys: std::ops::Range<u64>, w: i64| set.push(keyed_run(&schema, keys, w, 7), &schema);
 

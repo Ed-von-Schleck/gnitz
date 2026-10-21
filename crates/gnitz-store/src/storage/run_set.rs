@@ -248,7 +248,7 @@ impl RunSet {
             // Sized to the rows the budget holds, not the current ones: later
             // pushes add to it.
             let row_width = self.runs[0].schema().row_width();
-            let mut bloom = BloomFilter::new((self.budget / row_width).max(16));
+            let mut bloom = BloomFilter::new(self.budget / row_width);
             for run in &self.runs {
                 bloom_add_batch(&mut bloom, run);
             }

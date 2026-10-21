@@ -217,7 +217,7 @@ fn publish_manifest(idx: &mut ShardIndex) {
         caller_record: Vec::new(),
         shards: idx.shard_set(),
     });
-    manifest::prepare(&idx.output_dir, &bytes).unwrap();
+    std::fs::write(manifest::staging_path(&idx.output_dir), bytes).unwrap();
     manifest::commit(&idx.output_dir).unwrap();
     idx.mark_published();
     idx.unlink_retired();

@@ -15,8 +15,6 @@ use gnitz_zset::repr::StorageError;
 /// The fds one sync batch opens, and the ring's SQ size.
 const FD_CHUNK_THRESHOLD: usize = 256;
 
-const DATASYNC: FsyncFlags = FsyncFlags::DATASYNC;
-
 /// Blocking fsync instead of io_uring: `GNITZ_DISABLE_IO_URING`, read once per
 /// process, or a host that denied `io_uring_setup`.
 static BLOCKING: LazyLock<AtomicBool> =
@@ -47,8 +45,8 @@ fn new_ring() -> Result<Option<IoUring>, StorageError> {
 /// exhaust it.
 #[derive(Default)]
 pub(super) struct Syncer {
-    /// `None` until a chunk needs it; `Some(None)` where syncs block.
-    ring: Option<Option<IoUring>>,
+    /// `None` until a chunk needs it, and where syncs block.
+    ring: Option<IoUring>,
 }
 
 impl Syncer {
@@ -74,9 +72,9 @@ impl Syncer {
 
     fn ring(&mut self) -> Result<Option<&mut IoUring>, StorageError> {
         if self.ring.is_none() {
-            self.ring = Some(new_ring()?);
+            self.ring = new_ring()?;
         }
-        Ok(self.ring.as_mut().and_then(Option::as_mut))
+        Ok(self.ring.as_mut())
     }
 }
 
@@ -88,7 +86,7 @@ fn batch_sync_with(
     mut submit: impl FnMut(&mut IoUring, usize) -> std::io::Result<usize>,
 ) -> Result<(), StorageError> {
     let Some(ring) = ring else {
-        let datasync = flags.contains(DATASYNC);
+        let datasync = flags.contains(FsyncFlags::DATASYNC);
         return files
             .iter()
             .try_for_each(|f| if datasync { f.sync_data() } else { f.sync_all() })

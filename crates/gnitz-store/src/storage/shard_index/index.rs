@@ -65,7 +65,8 @@ impl ShardIndex {
     }
 
     /// Write `run`, a run spilled into the store, as an unpublished shard named
-    /// by a fresh seq, its heap coded under [`Self::codebook_for`] it.
+    /// by a fresh seq, its heap coded under the codebook [`Self::codebook_for`]
+    /// picks for it, if any.
     fn write_shard(&mut self, run: &Batch) -> Result<ShardEntry, StorageError> {
         let codebook = self.codebook_for(run);
         self.write_with(None, |path, opts| {
@@ -212,7 +213,10 @@ impl ShardIndex {
             terminal.guards.last().is_none_or(|g| g.key_extent().1 < first),
             "a terminal run ascends past every key its level holds"
         );
-        self.abandon_fold();
+        debug_assert!(
+            self.running.is_none() && self.bands.is_empty(),
+            "a terminal run enters a store with no fold under way"
+        );
         self.owed = true;
         let entry = self.write_shard(run)?;
         self.l0_run_bytes = self.l0_run_bytes.max(entry.shard.file_len());
@@ -330,7 +334,6 @@ impl ShardIndex {
         for e in &shards {
             e.shard.verify_body()?;
         }
-        // Every output inherits the newest stamp over the inputs.
         let newest = shards.iter().map(|e| e.newest).max().unwrap_or(0);
         let shards: Vec<Rc<MappedShard>> = shards.iter().map(|e| Rc::clone(&e.shard)).collect();
         self.running = Some(Running {
@@ -352,7 +355,6 @@ impl ShardIndex {
         let mut run = self.running.take().expect("a fold is under way");
         let before: usize = run.starts.iter().sum();
         let dehydrate = run.fold.kind == CompactionKind::Dehydrate;
-        let schema = self.schema;
         let codebook = self.codebook.clone();
         let merged = merge_guard(
             &run.shards,
@@ -360,7 +362,7 @@ impl ShardIndex {
             run.next,
             &mut run.starts,
             dehydrate,
-            &schema,
+            &self.schema,
             codebook.as_deref(),
         );
         // Row share stands in for byte share.
@@ -488,10 +490,9 @@ impl ShardIndex {
     /// byte target; and the store down to its capacity.
     fn plan(&mut self) -> Option<Fold> {
         loop {
-            if let Some(band) = self.bands.pop() {
-                match self.plan_band(band) {
-                    Some(fold) => return Some(fold),
-                    None => continue,
+            while let Some(band) = self.bands.pop() {
+                if let Some(fold) = self.plan_band(band) {
+                    return Some(fold);
                 }
             }
             let split = [L1, TERMINAL].into_iter().find_map(|level| self.plan_split(level));
@@ -505,39 +506,34 @@ impl ShardIndex {
             if merge.is_some() {
                 return merge;
             }
-            if self.levels[L1].bytes() > self.l1_target_bytes() {
-                if let Some(gi) = self.cheapest_l1_guard_to_drain() {
-                    match self.plan_drain(gi) {
-                        Some(fold) => return Some(fold),
-                        None => continue,
-                    }
+            if self.levels[L1].bytes() <= self.l1_target_bytes() {
+                self.capacity.filter(|&cap| self.resident_bytes() > cap)?;
+                // The oldest-written hydrated terminal guard: the only recency
+                // signal the tree carries, since nothing records that a row was read.
+                let victim = self.levels[TERMINAL]
+                    .guards
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, g)| !g.dehydrated())
+                    .min_by_key(|(_, g)| g.entries.iter().map(|e| e.newest).max())
+                    .map(|(gi, _)| gi);
+                if let Some(gi) = victim {
+                    return Some(self.plan_dehydration(gi));
                 }
-            }
-            self.capacity.filter(|&cap| self.resident_bytes() > cap)?;
-            // The oldest-written hydrated terminal guard: the only recency
-            // signal the tree carries, since nothing records that a row was read.
-            let victim = self.levels[TERMINAL]
-                .guards
-                .iter()
-                .enumerate()
-                .filter(|(_, g)| !g.dehydrated())
-                .min_by_key(|(_, g)| g.newest())
-                .map(|(gi, _)| gi);
-            match victim {
-                Some(gi) => return Some(self.plan_dehydration(gi)),
                 // Nothing left to evict where it sits: push a level's worth of
                 // data down to make one, L1 before L0.
-                None => match self.cheapest_l1_guard_to_drain() {
-                    Some(gi) => match self.plan_drain(gi) {
-                        Some(fold) => return Some(fold),
-                        None => continue,
-                    },
-                    None if !self.levels[L0].guards.is_empty() => return Some(self.plan_l0_fold()),
-                    // Everything is at the terminal level and dehydrated: the
-                    // skeleton floor, below which a sweep cannot go, however
-                    // far over its capacity the store is.
-                    None => return None,
-                },
+            }
+            match self.cheapest_l1_guard_to_drain() {
+                Some(gi) => {
+                    if let Some(fold) = self.plan_drain(gi) {
+                        return Some(fold);
+                    }
+                }
+                None if !self.levels[L0].guards.is_empty() => return Some(self.plan_l0_fold()),
+                // Everything is at the terminal level and dehydrated: the
+                // skeleton floor, below which a sweep cannot go, however far
+                // over its capacity the store is.
+                None => return None,
             }
         }
     }
@@ -634,7 +630,7 @@ impl ShardIndex {
         let top = last.key_extent().1.max(last.guard_key);
         let (mut above, mut rows, mut fence) = (0, 0, None::<PkBuf>);
         for e in l0.entries() {
-            let (n, first) = (e.shard.row_count(), e.first_row_above(&top));
+            let (n, first) = (e.shard.row_count(), e.shard.pk_rows(top.pk_bytes()).end);
             rows += n;
             if first < n {
                 above += n - first;
@@ -662,8 +658,11 @@ impl ShardIndex {
     /// rewritten a logarithmic number of times over the guard's growth; folding
     /// the whole guard each time would rewrite its oldest shard at every fold.
     fn plan_split(&self, level_idx: usize) -> Option<Fold> {
-        let guards = self.levels[level_idx].guards.iter().rev();
-        guards.into_iter().find_map(|guard| self.split_of(level_idx, guard))
+        self.levels[level_idx]
+            .guards
+            .iter()
+            .rev()
+            .find_map(|guard| self.split_of(level_idx, guard))
     }
 
     /// [`Self::plan_split`] for the one guard.
@@ -695,40 +694,35 @@ impl ShardIndex {
         })
     }
 
-    /// Maximal runs of two or more adjacent guards whose combined bytes fit
-    /// `bound`. A run also breaks at a change of representation, because folding
-    /// a hydrated guard together with a dehydrated one would evict it (see
-    /// [`merge_guard`]).
-    fn underfull_runs(&self, level_idx: usize, bound: u64) -> Vec<Range<usize>> {
+    /// The highest underfull run of `level_idx`, folded into its lowest key, so
+    /// the guard count follows the level's bytes down as well as up — the
+    /// capacity sweep can shrink a guard by an order of magnitude in one rewrite.
+    ///
+    /// The runs are the maximal runs of two or more adjacent guards whose
+    /// combined bytes fit half the target. A run also breaks at a change of
+    /// representation, because folding a hydrated guard together with a
+    /// dehydrated one would evict it (see [`merge_guard`]).
+    ///
+    /// Half the target is the hysteresis: a merged run no larger than its inputs
+    /// is under the split trigger.
+    fn plan_merge(&self, level_idx: usize) -> Option<Fold> {
+        let bound = self.guard_target_bytes(level_idx) / 2;
         let guards = &self.levels[level_idx].guards;
-        let mut runs = Vec::new();
-        let (mut start, mut acc) = (0usize, 0u64);
+        let (mut start, mut acc, mut highest) = (0usize, 0u64, None);
         for (i, g) in guards.iter().enumerate() {
             let bytes = g.bytes();
             if i > start && (acc + bytes > bound || g.dehydrated() != guards[start].dehydrated()) {
                 if i - start > 1 {
-                    runs.push(start..i);
+                    highest = Some(start..i);
                 }
                 (start, acc) = (i, 0);
             }
             acc += bytes;
         }
         if guards.len() - start > 1 {
-            runs.push(start..guards.len());
+            highest = Some(start..guards.len());
         }
-        runs
-    }
-
-    /// The highest underfull run of `level_idx`, folded into its lowest key, so
-    /// the guard count follows the level's bytes down as well as up — the
-    /// capacity sweep can shrink a guard by an order of magnitude in one rewrite.
-    ///
-    /// Half the target is the hysteresis: a merged run no larger than its inputs
-    /// is under the split trigger.
-    fn plan_merge(&self, level_idx: usize) -> Option<Fold> {
-        let bound = self.guard_target_bytes(level_idx) / 2;
-        let run = self.underfull_runs(level_idx, bound).pop()?;
-        let guards = &self.levels[level_idx].guards[run];
+        let guards = &guards[highest?];
         Some(Fold {
             kind: CompactionKind::GuardMerge,
             sources: Self::seqs(guards),
@@ -750,39 +744,31 @@ impl ShardIndex {
         }
     }
 
-    /// The keys an L1 guard is cut at before it is folded down: the low end of its
-    /// key extent, then every terminal guard key inside the extent, so each band
-    /// overlaps one terminal guard.
-    fn vertical_band_keys(&self, src: usize) -> Vec<PkBuf> {
-        let (lo, hi) = self.levels[L1].guards[src].key_extent();
-        let terminal = &self.levels[TERMINAL];
-        // `skip(1)`: the run's first guard owns `lo`, and every later key is above it.
-        let run = terminal.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
-        std::iter::once(lo)
-            .chain(terminal.guards[run].iter().skip(1).map(|g| g.guard_key))
-            .collect()
-    }
-
     /// Start L1 guard `src` on its way down into the terminal level, banded so
     /// no single merge reads more than one band plus one terminal guard: the
-    /// fold that cuts it into bands, or `None` for a guard that is one band
-    /// already.
+    /// fold that cuts it at the low end of its key extent and at every terminal
+    /// guard key inside the extent. A guard that overlaps one terminal guard
+    /// already is a band, and goes down as [`Self::plan_band`] plans it.
     ///
     /// Each band folds down as a fold of its own, so a failure in band *k*
     /// leaves bands `0..k` folded and every intermediate state a valid
     /// partition.
     fn plan_drain(&mut self, src: usize) -> Option<Fold> {
-        let keys = self.vertical_band_keys(src);
         let guard = &self.levels[L1].guards[src];
-        if keys.len() == 1 {
-            self.bands.push(guard.guard_key);
-            return None;
+        let (lo, hi) = guard.key_extent();
+        let terminal = &self.levels[TERMINAL];
+        let run = terminal.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
+        if run.len() <= 1 {
+            return self.plan_band(guard.guard_key);
         }
         Some(Fold {
             kind: CompactionKind::BandCut,
             sources: Self::seqs([guard]),
             dest: L1,
-            keys,
+            // `skip(1)`: the run's first guard owns `lo`, and every later key is above it.
+            keys: std::iter::once(lo)
+                .chain(terminal.guards[run].iter().skip(1).map(|g| g.guard_key))
+                .collect(),
         })
     }
 

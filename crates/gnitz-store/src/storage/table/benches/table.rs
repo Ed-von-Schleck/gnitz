@@ -1,5 +1,5 @@
 use super::{flush_barrier, Cut, RecoverySource, DEFAULT_RAM_TIER_BYTES};
-use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, new_table};
+use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, new_table, scratch_table};
 use gnitz_foundation::perf::{self, Counter};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;
@@ -407,13 +407,7 @@ fn open_cursor_bench() {
     let dir = tempfile::tempdir().unwrap();
     let counter = Counter::instructions();
     for cancelled in [0u64, 8, 32, 64, 4096] {
-        let rederive = RecoverySource::Rederive { resume_at: None };
-        let mut t = new_table(
-            dir.path().join(cancelled.to_string()),
-            schema,
-            rederive,
-            DEFAULT_RAM_TIER_BYTES,
-        );
+        let mut t = scratch_table(dir.path().join(cancelled.to_string()), schema);
         let held: Vec<_> = (0..HELD).map(|k| (k, 1, k as i64)).collect();
         t.ingest(make_batch(&schema, &held)).unwrap();
         t.fold_to_ram().unwrap();

@@ -20,7 +20,7 @@ pub(crate) struct BloomFilter {
 
 impl BloomFilter {
     pub(crate) fn new(expected_n: usize) -> Self {
-        let blocks = (expected_n.max(1) * BITS_PER_KEY).div_ceil(256).next_power_of_two();
+        let blocks = (expected_n * BITS_PER_KEY).div_ceil(256).next_power_of_two();
         BloomFilter {
             words: vec![0; blocks * 8],
             block_mask: blocks - 1,

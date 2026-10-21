@@ -19,7 +19,8 @@ mod index;
 /// changes what is written. The index learns its run size from an
 /// [`L0Fold`](Self::L0Fold) and its cancel yield from a
 /// [`GuardSplit`](Self::GuardSplit), the one fold that reads a whole guard in
-/// place; the rest label the byte accounting of [`cstats`].
+/// place, and a [`BandCut`](Self::BandCut) leaves its outputs as the bands the
+/// plan folds down next; the rest only label the byte accounting of [`cstats`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum CompactionKind {
     L0Fold,
@@ -136,11 +137,6 @@ impl ShardEntry {
         Ok(ShardEntry { shard, seq, newest, pk_min, pk_max })
     }
 
-    /// The first row above `key`, or the row count when there is none.
-    fn first_row_above(&self, key: &PkBuf) -> usize {
-        self.shard.pk_rows(key.pk_bytes()).end
-    }
-
     /// This shard's rows of OPK `key` (exactly `pk_stride` wide), where it has
     /// any. `filter_key` is `probe_key(key)` — the caller hoists it because it is
     /// the same value for every shard in one sweep.
@@ -165,17 +161,6 @@ impl LevelGuard {
     /// leaves behind, read off the shard headers.
     fn dehydrated(&self) -> bool {
         self.entries.iter().any(|e| e.shard.is_skeleton())
-    }
-
-    /// When this guard was last written, as the newest stamp over its entries.
-    /// The only recency signal the tree carries; the capacity sweep orders its
-    /// victims by it.
-    fn newest(&self) -> u64 {
-        self.entries
-            .iter()
-            .map(|e| e.newest)
-            .max()
-            .expect("a guard holds at least one shard")
     }
 
     /// Total registered bytes of this guard's entries.
@@ -378,13 +363,15 @@ impl ShardIndex {
         compress: bool,
         shards: &ShardSet,
     ) -> Result<Self, StorageError> {
+        let live: HashSet<u64> = shards.entries.iter().map(|e| e.seq).collect();
+        let shard_seq = live.iter().copied().max().unwrap_or(0);
         let mut idx = ShardIndex {
             output_dir: output_dir.to_string(),
             schema,
             levels: Default::default(),
             pending: Vec::new(),
-            shard_seq: 0,
-            published_through: 0,
+            shard_seq,
+            published_through: shard_seq,
             retired: Vec::new(),
             l0_run_bytes: shards.run_bytes.max(MIN_GUARD_BYTES),
             capacity,
@@ -405,7 +392,6 @@ impl ShardIndex {
                 .ok_or(StorageError::Corrupt("manifest level"))?;
             level.get_or_create_guard(e.guard_key).entries.push(entry);
         }
-        idx.shard_seq = idx.all_entries().map(|e| e.seq).max().unwrap_or(0);
         if compress {
             let newest_coded = idx
                 .all_entries()
@@ -413,8 +399,6 @@ impl ShardIndex {
                 .max_by_key(|e| e.seq);
             idx.codebook = newest_coded.and_then(|e| Codebook::of_shard(&e.shard)).map(Rc::new);
         }
-        idx.published_through = idx.shard_seq;
-        let live: HashSet<u64> = idx.all_entries().map(|e| e.seq).collect();
         manifest::remove_stale_files(output_dir, |seq| live.contains(&seq))?;
         Ok(idx)
     }

@@ -34,9 +34,6 @@ pub(crate) fn flush_barrier<'a>(
             work.push((t, w));
         }
     }
-    if work.is_empty() {
-        return Ok(());
-    }
     let mut sync = Syncer::default();
     // Every unsynced shard and every staged manifest, before any rename.
     sync.sync_paths(
@@ -137,7 +134,7 @@ impl Table {
         let first_sync = !std::mem::take(&mut self.manifest_synced);
         if staged {
             self.manifest_in_place = None;
-            manifest::prepare(&self.shard_index.output_dir, &bytes)?;
+            std::fs::write(manifest::staging_path(&self.shard_index.output_dir), &bytes)?;
         }
         Ok(Some(FlushWork { bytes, staged, first_sync }))
     }
