@@ -53,14 +53,7 @@ pub(crate) fn gallop_by(count: usize, hint: usize, lt: impl Fn(usize) -> bool) -
     let h = hint.min(count);
     if h < count && lt(h) {
         // boundary strictly after the hint
-        let mut lo = h; // invariant: row `lo` sorts before the probe
-        let mut step = 1usize;
-        while lo + step < count && lt(lo + step) {
-            lo += step;
-            step *= 2;
-        }
-        let hi = (lo + step).min(count); // row `hi` sorts >= probe, or hi == count
-        return lower_bound_by(lo + 1, hi, lt);
+        return gallop_from(count, h, lt);
     }
     if h == 0 || lt(h - 1) {
         return h;

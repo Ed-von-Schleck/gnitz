@@ -682,7 +682,7 @@ fn fold_cells<const N: usize, const OPK: bool, R: Reg>(
     let (cells, stride, off) = match src {
         _ if N == 0 => (&[][..], 0, 0),
         ColumnLocator::Pk { byte_off, .. } => (mb.pk(), mb.pk_stride(), byte_off as usize),
-        ColumnLocator::Payload { slot, .. } => (mb.col_data(slot as usize, N), N, 0),
+        ColumnLocator::Payload { slot, .. } => (mb.col_data(slot as usize), N, 0),
     };
     // No bit for a column that cannot be NULL.
     let null_bit = slot.map_or(0, |slot| 1u64 << slot);

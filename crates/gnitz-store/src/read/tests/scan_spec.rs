@@ -290,7 +290,9 @@ fn an_index_walk_returns_exactly_its_range() {
     let ids = |spec: ReadSpec| -> Vec<u64> {
         let b = run(&r, spec).unwrap();
         assert!((0..b.len()).all(|i| b.get_weight(i) == 1));
-        let mut ids: Vec<u64> = (0..b.len()).map(|i| b.get_pk(i) as u64).collect();
+        let mut ids: Vec<u64> = (0..b.len())
+            .map(|i| gnitz_wire::widen_pk_be(b.get_pk_bytes(i)) as u64)
+            .collect();
         ids.sort_unstable();
         ids
     };

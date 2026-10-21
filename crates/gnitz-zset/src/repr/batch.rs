@@ -1,7 +1,7 @@
 //! Owned columnar batch type for Z-set rows.
 //!
-//! `Batch` owns its memory (two pooled buffers — data + blob).
-//! `MemBatch<'a>` in the merge module is the borrowed slice-view counterpart.
+//! `Batch` owns its memory (two pooled buffers — data + blob); `MemBatch<'a>`
+//! is its borrowed slice-view counterpart.
 
 use std::ops::Range;
 
@@ -45,9 +45,6 @@ pub(crate) fn runs_where(n: usize, keep: impl Fn(usize) -> bool) -> Vec<(usize, 
     gnitz_wire::set_bit_runs(&kept, n, &mut runs);
     runs
 }
-
-/// Cells [`Batch::carry_heap`] charges dead between two waste checks.
-const DEAD_CHECK_CELLS: usize = 1024;
 
 /// Copy `count` rows of every region from an arena of `src_cap` rows onto one
 /// of `dst_cap` rows, both laid out under `schema`. Arenas of one capacity
@@ -155,7 +152,7 @@ impl Batch {
     /// a bare [`Vec::reserve`] would take them from the global allocator. A heap
     /// already holding bytes has to grow in place. A schema with no string
     /// column has no heap to reserve.
-    pub(crate) fn reserve_blob(&mut self, bytes: usize) {
+    fn reserve_blob(&mut self, bytes: usize) {
         if !self.schema.has_german_string() {
             return;
         }
@@ -238,7 +235,7 @@ impl Batch {
     /// every fixed-region accessor below shares, and the slice the wire and shard
     /// framers build their region lists from.
     #[inline(always)]
-    pub(super) fn region_at(&self, r: usize) -> &[u8] {
+    pub(super) fn region(&self, r: usize) -> &[u8] {
         let off = self.region_start(r);
         &self.data[off..off + self.count * self.schema.region_stride(r)]
     }
@@ -249,9 +246,9 @@ impl Batch {
         self.schema.region_start(r, self.capacity)
     }
 
-    /// [`Self::region_at`] as a mutable borrow.
+    /// [`Self::region`] as a mutable borrow.
     #[inline(always)]
-    fn region_at_mut(&mut self, r: usize) -> &mut [u8] {
+    fn region_mut(&mut self, r: usize) -> &mut [u8] {
         self.consolidated = false;
         let off = self.region_start(r);
         let end = off + self.count * self.schema.region_stride(r);
@@ -259,21 +256,21 @@ impl Batch {
     }
 
     #[inline]
-    pub fn pk_data(&self) -> &[u8] {
-        self.region_at(REG_PK)
+    pub fn pk(&self) -> &[u8] {
+        self.region(REG_PK)
     }
     #[inline]
-    pub(crate) fn weight_data(&self) -> &[u8] {
-        self.region_at(REG_WEIGHT)
+    pub(crate) fn weight(&self) -> &[u8] {
+        self.region(REG_WEIGHT)
     }
     #[inline]
-    pub(crate) fn null_bmp_data(&self) -> &[u8] {
-        self.region_at(REG_NULL_BMP)
+    pub(crate) fn null_bmp(&self) -> &[u8] {
+        self.region(REG_NULL_BMP)
     }
 
     /// The `[start, end)` runs of rows with no null bit of `mask` set.
     pub(crate) fn runs_without_nulls(&self, mask: u64) -> Vec<(usize, usize)> {
-        let words = self.null_bmp_data().as_chunks::<8>().0;
+        let words = self.null_bmp().as_chunks::<8>().0;
         // A batch with none of them set takes only this branch-free pass.
         if words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & mask == 0 {
             return vec![(0, self.count)];
@@ -282,7 +279,7 @@ impl Batch {
     }
     #[inline]
     pub fn col_data(&self, pi: usize) -> &[u8] {
-        self.region_at(REG_PAYLOAD_START + pi)
+        self.region(REG_PAYLOAD_START + pi)
     }
     /// `#[inline(always)]`: two byte loads off the embedded descriptor, on the
     /// per-row appenders' loop bound.
@@ -303,16 +300,8 @@ impl Batch {
 
     // ── Row accessors ───────────────────────────────────────────────────
 
-    #[inline(always)]
-    pub fn get_pk(&self, row: usize) -> u128 {
-        let stride = self.schema.pk_stride();
-        let off = row * stride;
-        gnitz_wire::widen_pk_be(&self.data[off..off + stride])
-    }
-
-    /// Owned-`Batch` sibling of `MemBatch::get_pk_bytes`. Returns exactly
-    /// `pk_stride` bytes, so a wide PK (`pk_stride > 16`) survives where a
-    /// `u128` would truncate it.
+    /// Owned-`Batch` sibling of `MemBatch::get_pk_bytes`: row `row`'s
+    /// `pk_stride` OPK bytes.
     #[inline(always)]
     pub fn get_pk_bytes(&self, row: usize) -> &[u8] {
         let stride = self.schema.pk_stride();
@@ -365,7 +354,7 @@ impl Batch {
     #[inline]
     pub fn all_weights_positive(&self) -> bool {
         !self
-            .weight_data()
+            .weight()
             .as_chunks::<FIXED_REGION_BYTES>()
             .0
             .iter()
@@ -375,7 +364,7 @@ impl Batch {
     /// region, like [`Self::all_weights_positive`].
     #[inline]
     pub fn has_ghost(&self) -> bool {
-        self.weight_data()
+        self.weight()
             .as_chunks::<FIXED_REGION_BYTES>()
             .0
             .iter()
@@ -554,11 +543,11 @@ impl AppendSession<'_> {
 
     /// Append every listed range of `src`, a batch of the destination's layout,
     /// in list order: fixed-width regions in bulk, its string cells shifted onto
-    /// its heap carried at `heap_at`, or relocated under the session's cache.
-    pub(crate) fn push_ranges(&mut self, src: &MemBatch<'_>, heap_at: Option<usize>, ranges: &[(usize, usize)]) {
-        let dst = &mut *self.dst;
+    /// its heap when [`Self::carry`] carries it, or relocated under the session's
+    /// cache.
+    pub(crate) fn push_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
         debug_assert!(
-            dst.schema.same_regions(src.schema),
+            self.dst.schema.same_regions(src.schema),
             "push_ranges: a source of another layout"
         );
         let total: usize = ranges
@@ -572,11 +561,7 @@ impl AppendSession<'_> {
         if total == 0 {
             return;
         }
-        if heap_at.is_none() && !src.blob.is_empty() {
-            // The rows this call copies, not the whole source heap: a many-run merge
-            // appends into one output, and the whole heap per run ratchets capacity.
-            dst.reserve_blob(string_heap::prorated_blob_cap(src.blob.len(), src.count, total));
-        }
+        let heap_at = self.carry(src, ranges);
         self.write(total, |w| copy_ranges(src, heap_at, ranges, w));
     }
 
@@ -611,12 +596,6 @@ impl AppendSession<'_> {
         assert!(written <= rows, "write_at_most: more rows written than it had room for");
         dst.count += written;
         out
-    }
-
-    /// Append one row of `src` at an explicit weight, under the session's own
-    /// blob dedup cache. A zero weight appends nothing.
-    pub(crate) fn push_row<S: RowSource>(&mut self, src: &S, row: usize, weight: i64) {
-        self.dst.append_row_from_source(weight, src, row, Some(&mut self.cache));
     }
 }
 
@@ -697,7 +676,7 @@ impl Batch {
         let (lo, hi) = (a.min(b), a.max(b));
         for r in 0..self.schema.num_regions() {
             let stride = self.schema.region_stride(r);
-            let (head, tail) = self.region_at_mut(r).split_at_mut(hi * stride);
+            let (head, tail) = self.region_mut(r).split_at_mut(hi * stride);
             head[lo * stride..(lo + 1) * stride].swap_with_slice(&mut tail[..stride]);
         }
     }
@@ -719,20 +698,12 @@ impl Batch {
         if !cfg!(debug_assertions) {
             return;
         }
-        let schema = &self.schema;
-        let violation = gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), self.null_bmp_data());
-        debug_assert!(
-            violation.is_none(),
-            "batch sets a null bit under a payload column the operating schema declares \
-             NOT NULL: (row, payload slot) = {violation:?} of {} rows",
-            self.count,
-        );
-        let valued = super::batch_wire::first_valued_null_cell(&self.as_mem_batch());
-        debug_assert!(
-            valued.is_none(),
-            "batch holds a non-zero cell under a null bit: (row, payload slot) = {valued:?} of {} rows",
-            self.count,
-        );
+        if let Some((breach, (row, slot))) = super::batch_wire::null_breach(&self.as_mem_batch()) {
+            panic!(
+                "batch holds {breach} at row {row}, payload slot {slot}, of {} rows",
+                self.count
+            );
+        }
     }
 
     /// Debug-only: assert the data is fully consolidated — strictly increasing by
@@ -824,7 +795,7 @@ impl Batch {
         let mut out = Self::with_capacity(out_schema, n);
         let heap_at = out.carry_heap(&self.as_mem_batch(), in_schema.string_payload_slots(), &[(0, n)]);
         out.append_session(n).write(n, |w| {
-            w.weight_mut().copy_from_slice(self.weight_data());
+            w.weight_mut().copy_from_slice(self.weight());
             for (pi, col) in in_schema.payload_columns() {
                 w.col_mut(first_slot + pi).copy_from_slice(self.col_data(pi));
                 if col.type_code.is_german_string() {
@@ -843,9 +814,9 @@ impl Batch {
         debug_assert_eq!(out_schema.num_payload_cols(), self.schema.num_payload_cols());
         self.copied_into(out_schema, 0, |w| {
             let (pk, _, nulls) = w.fixed_mut();
-            nulls.copy_from_slice(self.null_bmp_data());
+            nulls.copy_from_slice(self.null_bmp());
             let keys = pk.chunks_exact_mut(out_schema.pk_stride());
-            for (dst, src) in keys.zip(self.pk_data().chunks_exact(self.schema.pk_stride())) {
+            for (dst, src) in keys.zip(self.pk().chunks_exact(self.schema.pk_stride())) {
                 dst.copy_from_slice(&src[..dst.len()]);
             }
         })
@@ -876,9 +847,9 @@ impl Batch {
                 w.col_mut(pi).fill(0);
             }
             let (pk, _, nulls) = w.fixed_mut();
-            pk.copy_from_slice(self.pk_data());
+            pk.copy_from_slice(self.pk());
             let out_words = nulls.as_chunks_mut::<8>().0.iter_mut();
-            for (out, word) in out_words.zip(self.null_bmp_data().as_chunks::<8>().0) {
+            for (out, word) in out_words.zip(self.null_bmp().as_chunks::<8>().0) {
                 let in_null = u64::from_le_bytes(*word);
                 let out_null = match nulls_first {
                     true => new_null_bits | gnitz_wire::null_word_at(in_null, n_new),
@@ -902,11 +873,15 @@ impl Batch {
         }
     }
 
-    /// First row whose OPK bytes are `>= key`; `key` is exactly `pk_stride`
-    /// bytes.
-    pub(crate) fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
+    /// The first row whose OPK bytes are `>= key`, galloping from `hint` where
+    /// there is one; `key` is exactly `pk_stride` bytes.
+    pub(crate) fn seek(&self, key: &[u8], hint: Option<usize>) -> usize {
+        let (count, stride, pk) = (self.count, self.schema.pk_stride(), self.pk_col_ptr());
         // SAFETY: the PK region holds a key for every row.
-        unsafe { super::seek::seek_lower_bound(self.count, self.schema.pk_stride(), self.pk_col_ptr(), key) }
+        match hint {
+            None => unsafe { super::seek::seek_lower_bound(count, stride, pk, key) },
+            Some(hint) => unsafe { super::seek::seek_advance_to(count, stride, pk, key, hint) },
+        }
     }
 
     /// The rows whose PK is the OPK `key`, exactly `pk_stride` bytes: none, at
@@ -917,20 +892,11 @@ impl Batch {
     }
 
     /// Whether this batch holds the element of `src`'s row `row`, at any weight.
-    pub fn holds_element_of(&self, src: &Batch, row: usize, schema: &SchemaDescriptor) -> bool {
+    pub fn holds_element_of(&self, src: &Batch, row: usize) -> bool {
         let rows = self.pk_rows(src.get_pk_bytes(row));
-        let cmp = |i| compare_rows(schema, self, i, src, row);
+        let cmp = |i| compare_rows(&self.schema, self, i, src, row);
         let at = super::seek::lower_bound_by(rows.start, rows.end, |i| cmp(i).is_lt());
         at < rows.end && cmp(at).is_eq()
-    }
-
-    /// Galloping forward lower bound seeded at `hint` (the caller's live
-    /// position): `O(log gap)` when the boundary is just ahead, `O(1)` when it
-    /// IS the hint, never worse than `find_lower_bound_bytes`. `key` must be
-    /// exactly `pk_stride` OPK bytes.
-    pub(crate) fn advance_to(&self, key: &[u8], hint: usize) -> usize {
-        // SAFETY: the PK region holds a key for every row.
-        unsafe { super::seek::seek_advance_to(self.count, self.schema.pk_stride(), self.pk_col_ptr(), key, hint) }
     }
 
     /// The rows of this batch, which is in key order, whose PK is one of
@@ -940,7 +906,7 @@ impl Batch {
         out.clear();
         let mut from = 0;
         for key in keys {
-            let lo = self.advance_to(key, from);
+            let lo = self.seek(key, Some(from));
             from = lo;
             if lo == self.count {
                 break;
@@ -964,9 +930,7 @@ impl Batch {
         if rows == 0 {
             return;
         }
-        let mut s = self.append_session(rows);
-        let at = s.carry(src, ranges);
-        s.push_ranges(src, at, ranges);
+        self.append_session(rows).push_ranges(src, ranges);
     }
 
     /// Copy each of `rows` onto this batch's tail at `weight`.
@@ -974,9 +938,10 @@ impl Batch {
         if rows.is_empty() {
             return;
         }
-        let mut s = self.append_session(rows.len());
+        self.reserve_rows(rows.len());
+        let mut cache = BlobCache::new(self.string_cells(rows.len()));
         for r in rows {
-            s.push_row(&r.run, r.row, weight);
+            self.append_row_from_source(weight, &r.run, r.row, Some(&mut cache));
         }
     }
 
@@ -986,8 +951,7 @@ impl Batch {
     pub fn key_retractions(schema: &SchemaDescriptor, pks: &[u8]) -> Batch {
         let n = pks.len() / schema.pk_stride();
         debug_assert_eq!(n * schema.pk_stride(), pks.len(), "key_retractions: pks are whole keys");
-        let mut out = Self::with_capacity(schema, n);
-        out.append_session(0).write(n, |w| {
+        write_to_batch(schema, n, 0, |w| {
             for pi in 0..schema.num_payload_cols() {
                 w.col_mut(pi).fill(0);
             }
@@ -997,8 +961,7 @@ impl Batch {
             for word in weight.as_chunks_mut::<8>().0 {
                 *word = (-1i64).to_le_bytes();
             }
-        });
-        out
+        })
     }
 
     /// Copy every row of `src` onto this batch's tail.
@@ -1052,9 +1015,7 @@ impl Batch {
             // per source, which a fold of one-row runs is made of.
             let mut session = out.append_session(rows);
             for src in sources.filter(|src| src.count > 0) {
-                let whole = [(0, src.count)];
-                let heap_at = session.carry(&src, &whole);
-                session.push_ranges(&src, heap_at, &whole);
+                session.push_ranges(&src, &[(0, src.count)]);
             }
         }
         out
@@ -1095,35 +1056,22 @@ impl Batch {
     }
 
     /// Carry `src`'s heap onto this one to copy the string slots `kept_slots`
-    /// of the rows `kept`, unless relocating them is cheaper or the carried heap
-    /// would be wasteful. Returns the base the copied cells shift by, with every
-    /// byte they cannot reference charged dead.
+    /// of the rows `kept`, when [`string_heap::carry_dead`] admits it: the base
+    /// the copied cells shift by, with every byte they cannot reference charged
+    /// dead. Declined, it reserves the rows' share of `src`'s heap for the cells
+    /// relocated instead — that share, not the whole heap: a many-run merge
+    /// appends into one output, and the whole heap per run ratchets capacity.
     pub(crate) fn carry_heap(&mut self, src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, usize)]) -> Option<usize> {
-        let mask = src.schema.string_payload_slots();
-        if mask == 0 {
-            // No string cell to rebase onto a heap.
-            return None;
-        }
-        debug_assert!(kept.windows(2).all(|w| w[0].1 <= w[1].0) && kept.last().is_none_or(|k| k.1 <= src.count));
-        debug_assert_eq!(kept_slots & !mask, 0, "carry_heap: a kept slot is not a string slot");
-        let heap = src.blob.len();
-        if kept_slots == 0 && heap != 0 {
-            return None;
-        }
-        let mut dead = src.dead_heap;
-        for pi in gnitz_wire::BitIter(mask & !kept_slots) {
-            let cells = src.col_data(pi, 16).as_chunks::<16>().0;
-            for &(start, end) in kept {
-                for run in cells[start..end].chunks(DEAD_CHECK_CELLS) {
-                    dead += run.iter().map(|cell| string_heap::cell_long_bytes(cell)).sum::<usize>();
-                    if string_heap::heap_is_wasteful(dead, heap) {
-                        return None;
-                    }
-                }
+        let Some(dead) = string_heap::carry_dead(src, kept_slots, kept) else {
+            if !src.blob.is_empty() {
+                self.reserve_blob(string_heap::prorated_blob_cap(
+                    src.blob.len(),
+                    src.count,
+                    range_rows(kept),
+                ));
             }
-        }
-        let excluded = || string_heap::long_bytes_outside(src, mask, kept);
-        let dead = string_heap::carried_dead(heap, dead, src.count, range_rows(kept), excluded)?;
+            return None;
+        };
         let base = self.blob.len();
         self.reserve_blob(src.blob.len());
         self.blob.extend_from_slice(src.blob);
@@ -1212,14 +1160,24 @@ impl Batch {
         }
     }
 
-    /// [`Self::consolidate_in_place`] of a batch without the claim: rows that
-    /// stand in consolidated order are certified where they are, and any others
-    /// are sorted and weight-folded into a fresh batch.
+    /// [`Self::consolidate_in_place`] of a batch without the claim.
     #[inline(never)]
     fn consolidate_unclaimed(&mut self) {
-        match merge::in_consolidated_order(self) {
+        self.consolidate_recording(&mut Vec::new());
+    }
+
+    /// Consolidate this batch: rows that stand in consolidated order are
+    /// certified where they are, and any others are sorted and weight-folded
+    /// into a fresh batch, `survivors` then holding what
+    /// [`merge::consolidate_groups`] found — per output row, the row it was. Left
+    /// empty when the rows stood.
+    pub(crate) fn consolidate_recording(&mut self, survivors: &mut Vec<(u32, u32, i64)>) {
+        match self.stands_consolidated() {
             true => self.certify_consolidated(),
-            false => *self = Self::consolidate_into_new(self),
+            false => {
+                survivors.reserve_exact(self.count);
+                *self = Self::consolidated_from(self, survivors);
+            }
         }
     }
 
@@ -1227,7 +1185,7 @@ impl Batch {
     /// counterpart of [`Self::into_consolidated`].
     pub fn to_consolidated(&self) -> Batch {
         if !self.stands_consolidated() {
-            return Self::consolidate_into_new(self);
+            return Self::consolidated_from(self, &mut Vec::with_capacity(self.count));
         }
         let mut copy = self.clone();
         if !copy.consolidated {
@@ -1243,16 +1201,11 @@ impl Batch {
         self.is_consolidated() || merge::in_consolidated_order(self)
     }
 
-    /// Sort and weight-fold `batch` into a fresh certified batch — the
-    /// consolidation slow path the entry points above share.
-    fn consolidate_into_new(batch: &Batch) -> Batch {
-        Self::consolidated_from(batch, &mut Vec::with_capacity(batch.count))
-    }
-
-    /// [`Self::consolidate_into_new`], handing back in `survivors` what
-    /// [`merge::consolidate_groups`] found: per output row, the `batch` row it is.
+    /// Sort and weight-fold `batch` into a fresh certified batch, handing back in
+    /// `survivors` what [`merge::consolidate_groups`] found: per output row, the
+    /// `batch` row it is.
     #[inline(always)]
-    pub(crate) fn consolidated_from(batch: &Batch, survivors: &mut Vec<(u32, u32, i64)>) -> Batch {
+    fn consolidated_from(batch: &Batch, survivors: &mut Vec<(u32, u32, i64)>) -> Batch {
         let schema = &batch.schema;
         let mb = batch.as_mem_batch();
         // Folded first, so the arena is sized to the survivors.
@@ -1262,17 +1215,22 @@ impl Batch {
         result
     }
 
-    /// `self`, or a tight copy when its buffers are not [`is_tight`] for its rows
-    /// — a [`Self::compacted`] one when its heap is [`string_heap::heap_is_wasteful`].
-    /// The bound counts a span several cells share once per cell, so a wasteful
-    /// one is measured before a compaction is paid for.
-    pub fn trimmed(mut self) -> Batch {
+    /// Whether the heap is [`string_heap::heap_is_wasteful`]. The bound counts a
+    /// span several cells share once per cell, so a wasteful one is measured
+    /// before a compaction is paid for.
+    fn heap_is_wasteful(&mut self) -> bool {
         self.debug_verify_dead_heap();
         if string_heap::heap_is_wasteful(self.dead_heap, self.blob.len()) {
             self.dead_heap = string_heap::measure_dead_heap(&self.as_mem_batch());
-            if string_heap::heap_is_wasteful(self.dead_heap, self.blob.len()) {
-                return self.compacted();
-            }
+        }
+        string_heap::heap_is_wasteful(self.dead_heap, self.blob.len())
+    }
+
+    /// `self`, or a tight copy when its buffers are not [`is_tight`] for its rows
+    /// — a [`Self::compacted`] one when its heap is wasteful.
+    pub fn trimmed(mut self) -> Batch {
+        if self.heap_is_wasteful() {
+            return self.compacted();
         }
         let need = self.schema.arena_rows(self.count) * self.schema.row_width() + self.blob.len();
         if is_tight(self.data.capacity() + self.blob.capacity(), need) {
@@ -1281,36 +1239,34 @@ impl Batch {
         Batch::clone(&self)
     }
 
-    /// `self`, or a copy in buffers of exactly what its rows take when its own
-    /// hold more.
-    pub fn shrunk(self) -> Batch {
-        let schema = self.schema;
-        let cap = schema.arena_rows(self.count);
-        let need = cap * schema.row_width();
-        if self.data.capacity() == need && self.blob.capacity() == self.blob.len() {
-            return self;
+    /// `self` in buffers of exactly what its rows take, with a wasteful heap
+    /// compacted first: each buffer that holds more is copied into one fresh off
+    /// the allocator, since a pooled buffer may hold twice what is asked of it,
+    /// and one shrunk in place keeps its tail resident.
+    pub fn shrunk(mut self) -> Batch {
+        if self.heap_is_wasteful() {
+            self = self.compacted();
         }
-        // Fresh off the allocator: a pooled buffer may hold twice what is
-        // asked of it, and one shrunk in place keeps its tail resident.
-        let mut data = vec![0; need];
-        copy_regions(&schema, &self.data, self.capacity, &mut data, cap, self.count);
-        Batch {
-            data: PooledBuf(data),
-            blob: PooledBuf(self.blob.to_vec()),
-            dead_heap: self.dead_heap,
-            capacity: cap,
-            count: self.count,
-            consolidated: self.consolidated,
-            schema,
+        let cap = self.schema.arena_rows(self.count);
+        let need = cap * self.schema.row_width();
+        if self.data.capacity() != need {
+            let mut data = vec![0; need];
+            copy_regions(&self.schema, &self.data, self.capacity, &mut data, cap, self.count);
+            self.data = PooledBuf(data);
+            self.capacity = cap;
         }
+        if self.blob.capacity() != self.blob.len() {
+            self.blob = PooledBuf(self.blob.to_vec());
+        }
+        self
     }
 
     /// A tight copy with every long string relocated, so its heap holds no
     /// dead bytes.
-    pub(crate) fn compacted(&self) -> Batch {
-        let n = self.count;
-        let mut out = Batch::with_capacity(&self.schema, n);
-        out.append_session(n).push_ranges(&self.as_mem_batch(), None, &[(0, n)]);
+    fn compacted(&self) -> Batch {
+        let (n, mb) = (self.count, self.as_mem_batch());
+        let mut out = Batch::with_capacity_blob(&self.schema, n, self.blob.len());
+        out.append_session(n).write(n, |w| copy_ranges(&mb, None, &[(0, n)], w));
         out.inherit_consolidated(self);
         out
     }
@@ -1494,11 +1450,9 @@ impl<'a> MemBatch<'a> {
         self.region(REG_NULL_BMP)
     }
 
-    /// Payload column `pi` as a contiguous slice (`count * stride` bytes), where
-    /// `stride` is its width (see `payload_columns`).
+    /// Payload column `pi` as a contiguous slice (`count * width` bytes).
     #[inline(always)]
-    pub fn col_data(&self, pi: usize, stride: usize) -> &'a [u8] {
-        debug_assert_eq!(stride, self.schema.region_stride(REG_PAYLOAD_START + pi));
+    pub fn col_data(&self, pi: usize) -> &'a [u8] {
         self.region(REG_PAYLOAD_START + pi)
     }
 
@@ -1566,7 +1520,8 @@ impl<'a> RowSource for MemBatch<'a> {
 impl<'a> BatchView for MemBatch<'a> {
     #[inline(always)]
     fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8] {
-        MemBatch::col_data(self, payload_col, col_size)
+        debug_assert_eq!(col_size, self.schema.region_stride(REG_PAYLOAD_START + payload_col));
+        MemBatch::col_data(self, payload_col)
     }
     #[inline(always)]
     fn null_bmp(&self) -> &[u8] {

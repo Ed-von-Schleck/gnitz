@@ -173,10 +173,10 @@ impl ReadCursor {
         debug_assert_eq!(start.len(), self.schema.pk_stride());
         debug_assert!(end.is_none_or(|e| e.len() == self.schema.pk_stride()));
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
-            state.position = src.find_lower_bound_bytes(start);
+            state.position = src.seek(start, None);
             if let Some(end) = end {
                 // `end` lands at or after `start`'s landing.
-                state.end = state.end.min(src.advance_to(end, state.position));
+                state.end = state.end.min(src.seek(end, Some(state.position)));
             }
         }
         self.rebuild_and_advance();
@@ -239,7 +239,7 @@ impl ReadCursor {
     /// Backward-capable: each source searches its full row range.
     fn reposition_to(&mut self, key: &[u8]) {
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
-            state.position = src.advance_to(key, state.position);
+            state.position = src.seek(key, Some(state.position));
         }
         self.rebuild_and_advance();
     }
@@ -262,7 +262,7 @@ impl ReadCursor {
             *order,
             states,
             |s: &Run, r: usize| compare_pk_ordering(s.get_pk_bytes(r), key) == Ordering::Less,
-            |s: &Run, pos: usize| s.advance_to(key, pos),
+            |s: &Run, pos: usize| s.seek(key, Some(pos)),
             &less,
         );
         self.advance_merge_with(payload);

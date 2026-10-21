@@ -177,7 +177,7 @@ impl RelationRegistry {
         // One allocation for the store's run and the feed's round, which is
         // charged every byte it holds: none it has no row in.
         let run = Rc::new(match capture {
-            Some(_) => run.trimmed().shrunk(),
+            Some(_) => run.shrunk(),
             None => run.trimmed(),
         });
         let res = store.ingest_run(Rc::clone(&run));

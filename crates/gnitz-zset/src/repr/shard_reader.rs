@@ -556,7 +556,7 @@ impl MappedShard {
     /// The first row whose PK is at or after the OPK `key`, galloping from
     /// `hint` where there is one.
     #[inline]
-    fn seek(&self, key: &[u8], hint: Option<usize>) -> usize {
+    pub(crate) fn seek(&self, key: &[u8], hint: Option<usize>) -> usize {
         let (count, stride) = (self.header.row_count, self.schema.pk_stride());
         match (&self.pk, hint) {
             // SAFETY: the region holds a key for every row of the shard.
@@ -566,16 +566,6 @@ impl MappedShard {
             },
             (KeyRegion::Packed(packed), hint) => packed.image.seek(key, hint),
         }
-    }
-
-    /// First row whose OPK bytes are `>= key`; `key` is exactly `pk_stride` bytes.
-    pub(crate) fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
-        self.seek(key, None)
-    }
-
-    /// [`find_lower_bound_bytes`](Self::find_lower_bound_bytes), galloping from `hint`.
-    pub(crate) fn advance_to(&self, key: &[u8], hint: usize) -> usize {
-        self.seek(key, Some(hint))
     }
 
     /// Copy a contiguous slice of rows into a batch under the schema this handle

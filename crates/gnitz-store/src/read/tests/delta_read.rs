@@ -394,7 +394,9 @@ fn a_delta_read_answers_the_rounds_past_its_cursor() {
     r.ingest_at(TID, id_rows(&keys, [(7, -1), (8, 1)], |_, _| {}), Some(5), false)
         .unwrap();
     let b = r.delta_read(TID, 3, whole(), keys.layout_digest()).unwrap();
-    let mut rows: Vec<_> = (0..b.len()).map(|i| (b.get_pk(i) as u64, b.get_weight(i))).collect();
+    let mut rows: Vec<_> = (0..b.len())
+        .map(|i| (gnitz_wire::widen_pk_be(b.get_pk_bytes(i)) as u64, b.get_weight(i)))
+        .collect();
     rows.sort_unstable();
     assert_eq!(rows, [(7, -1), (7, 1), (8, 1)]);
 }

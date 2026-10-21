@@ -528,7 +528,7 @@ impl CatalogEngine {
             [SysFamily::Table, SysFamily::View]
                 .into_iter()
                 .filter_map(|family| families.get(family))
-                .flat_map(|b| b.live_rows().map(|i| b.get_pk(i) as u64)),
+                .flat_map(|b| b.live_rows().map(|i| gnitz_wire::sys_leading_id(b.get_pk_bytes(i)))),
         );
         let mut altered: Option<u64> = None;
         for i in cols.live_rows() {

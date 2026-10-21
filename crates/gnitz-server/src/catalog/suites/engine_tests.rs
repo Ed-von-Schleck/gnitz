@@ -261,7 +261,7 @@ fn test_ingest_scan_seek_family() {
     // Point read, present
     let row = pk_group_native(&mut engine, tid, 2);
     assert_eq!(row.len(), 1);
-    assert_eq!(row.get_pk(0), 2);
+    assert_eq!(gnitz_wire::widen_pk_be(row.get_pk_bytes(0)), 2);
 
     // Point read, missing
     assert!(pk_group_native(&mut engine, tid, 99).is_empty());
@@ -321,7 +321,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     // Scan — should have exactly 1 row with val=200
     let scan = scan_all(&mut engine, tid);
     assert_eq!(scan.len(), 1);
-    assert_eq!(scan.get_pk(0), 1);
+    assert_eq!(gnitz_wire::widen_pk_be(scan.get_pk_bytes(0)), 1);
     assert_eq!(payload_u64(&*scan, 0, 0), 200, "the later write must win the PK");
 
     engine.close();

@@ -440,7 +440,13 @@ pub fn payload0_i64<S: gnitz_wire::RowSource>(src: &S, row: usize) -> i64 {
 /// sorted: a batch's row order is not what a test compares.
 pub fn batch_rows(batch: &Batch) -> Vec<(u64, i64, i64)> {
     let mut rows: Vec<_> = (0..batch.len())
-        .map(|i| (batch.get_pk(i) as u64, batch.get_weight(i), payload0_i64(batch, i)))
+        .map(|i| {
+            (
+                gnitz_wire::widen_pk_be(batch.get_pk_bytes(i)) as u64,
+                batch.get_weight(i),
+                payload0_i64(batch, i),
+            )
+        })
         .collect();
     rows.sort_unstable();
     rows

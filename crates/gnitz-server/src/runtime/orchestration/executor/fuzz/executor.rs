@@ -205,7 +205,7 @@ impl Session {
             return false;
         }
         let stride = batch.schema().pk_stride();
-        let mut keys: Vec<&[u8]> = batch.pk_data().chunks(stride).collect();
+        let mut keys: Vec<&[u8]> = batch.pk().chunks(stride).collect();
         keys.sort_unstable();
         if keys.windows(2).any(|w| w[0] == w[1]) {
             return false;

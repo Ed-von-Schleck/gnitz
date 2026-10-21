@@ -126,9 +126,10 @@ fn a_foreign_decode_refuses_a_boolean_byte_past_one() {
 fn shared_span() -> Batch {
     let one = string_batch(&[(1, "v".repeat(200))]);
     let mut shared = Batch::with_capacity(one.schema(), 20);
+    let src = one.as_mem_batch();
     shared
         .append_session(20)
-        .push_ranges(&one.as_mem_batch(), None, &[(0, 1); 20]);
+        .write(20, |w| crate::repr::scatter::copy_ranges(&src, None, &[(0, 1); 20], w));
     assert_eq!(shared.blob.len(), 200, "precondition: one span for every row");
     shared
 }

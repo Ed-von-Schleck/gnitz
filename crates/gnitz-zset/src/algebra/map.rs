@@ -96,7 +96,7 @@ pub(crate) fn copy_column(
             // The PK region holds OPK bytes, decoded back to native LE at the
             // source column's own width.
             let pk_stride = in_batch.schema().pk_stride();
-            let pk = &in_batch.pk_data()[src_start * pk_stride..(src_start + n) * pk_stride];
+            let pk = &in_batch.pk()[src_start * pk_stride..(src_start + n) * pk_stride];
             let dst = &mut output.col_mut(dst_payload)[dst_base * stride..(dst_base + n) * stride];
             let (off, src_stride) = (byte_off as usize, size as usize);
             if src_stride == stride {
@@ -391,11 +391,8 @@ impl MapPlan {
             Some(c) => (c, &whole[..]),
             None => (src, ranges),
         };
+        // Declined, the carry reserves for relocated copies and string emits alike.
         let heap_at = out.carry_heap(&src.as_mem_batch(), self.copied_string_slots, ranges);
-        // For relocated copies and string emits alike.
-        if heap_at.is_none() {
-            out.reserve_blob(crate::repr::prorated_blob_cap(src.blob().len(), src.count, total));
-        }
         out.append_session(total).write(total, |out| {
             let mut dst = 0;
             for &(start, end) in ranges {
@@ -429,7 +426,7 @@ impl MapPlan {
                     "PkSource::Inherit: PK stride mismatch"
                 );
                 output.pk_mut()[dst_base * pk_st..(dst_base + n) * pk_st]
-                    .copy_from_slice(&in_batch.pk_data()[src_start * pk_st..(src_start + n) * pk_st]);
+                    .copy_from_slice(&in_batch.pk()[src_start * pk_st..(src_start + n) * pk_st]);
             }
             PkSource::Pack { packer, .. } => {
                 debug_assert_eq!(output.schema.pk_stride(), packer.out_stride);
@@ -442,7 +439,7 @@ impl MapPlan {
             PkSource::HashRow(_) => {}
         }
         output.weight_mut()[dst_base * 8..(dst_base + n) * 8]
-            .copy_from_slice(&in_batch.weight_data()[src_start * 8..(src_start + n) * 8]);
+            .copy_from_slice(&in_batch.weight()[src_start * 8..(src_start + n) * 8]);
 
         for c in self.ev.copies() {
             copy_column(in_batch, output, c, w);

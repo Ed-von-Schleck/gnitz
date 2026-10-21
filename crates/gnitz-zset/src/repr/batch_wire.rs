@@ -200,7 +200,7 @@ impl Batch {
     pub fn wire_regions(&self) -> Regions<'_> {
         let mut out = Regions::new();
         for r in 0..self.schema().num_regions() {
-            out.push(self.region_at(r));
+            out.push(self.region(r));
         }
         out.push(&self.blob);
         out
@@ -295,11 +295,8 @@ impl Batch {
     pub fn decode_foreign_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
         let mut mb = MemBatch::of_wal_block(data, schema)?;
         mb.dead_heap = validate_string_cells(&mb)?;
-        if gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), mb.null_bmp()).is_some() {
-            return Err("a null bit on a NOT NULL column");
-        }
-        if first_valued_null_cell(&mb).is_some() {
-            return Err("a non-zero cell under a NULL");
+        if let Some((breach, _)) = null_breach(&mb) {
+            return Err(breach);
         }
         if !boolean_cells_ok(&mb) {
             return Err("a BOOLEAN cell is neither 0 nor 1");
@@ -308,16 +305,23 @@ impl Batch {
     }
 }
 
-/// The first `(row, payload slot)` of `mb` whose NULL cell is not zeroed: a key
-/// reader packs or routes a cell whatever its null bit says, so a second
-/// encoding would key a row and its retraction apart.
-pub(super) fn first_valued_null_cell(mb: &MemBatch<'_>) -> Option<(usize, usize)> {
+/// The first breach of `mb`'s null rule, and its `(row, payload slot)`: a null
+/// bit on a NOT NULL column, or a NULL cell that is not zeroed — a key reader
+/// packs or routes a cell whatever its null bit says, so a second encoding
+/// would key a row and its retraction apart.
+pub(super) fn null_breach(mb: &MemBatch<'_>) -> Option<(&'static str, (usize, usize))> {
     let schema = mb.schema;
+    if let Some(at) = gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), mb.null_bmp()) {
+        return Some(("a null bit on a NOT NULL column", at));
+    }
     let col = |pi| {
-        let width = schema.columns()[schema.payload_col_idx(pi)].size();
-        (mb.col_data(pi, width), width)
+        (
+            mb.col_data(pi),
+            schema.region_stride(super::batch::REG_PAYLOAD_START + pi),
+        )
     };
     gnitz_wire::first_valued_null(schema.nullable_payload_slots(), mb.null_bmp(), col)
+        .map(|at| ("a non-zero cell under a NULL", at))
 }
 
 /// Every BOOLEAN cell of `mb`, key or payload, is 0 or 1: a third byte would
@@ -328,7 +332,7 @@ fn boolean_cells_ok(mb: &MemBatch<'_>) -> bool {
         cells.fold(0, |a, &b| a | b) <= 1
     }
     (0..mb.schema.num_columns()).all(|ci| match mb.schema.locate(ci) {
-        ColumnLocator::Payload { slot, type_code: TypeCode::Bool, .. } => le1(mb.col_data(slot as usize, 1).iter()),
+        ColumnLocator::Payload { slot, type_code: TypeCode::Bool, .. } => le1(mb.col_data(slot as usize).iter()),
         ColumnLocator::Pk { byte_off, type_code: TypeCode::Bool, .. } => {
             le1(mb.pk().iter().skip(byte_off as usize).step_by(mb.pk_stride()))
         }

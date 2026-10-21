@@ -74,7 +74,7 @@ impl GroupKey {
         match *self {
             GroupKey::PkRange { at, n } if (1..=NARROW_PK_MAX_BYTES).contains(&n) => Some(pk(at, n)),
             GroupKey::Image(ColumnLocator::Payload { slot, size, type_code }) => Some(KeyCells {
-                region: mb.col_data(slot as usize, size as usize),
+                region: mb.col_data(slot as usize),
                 stride: size as usize,
                 off: 0,
                 width: size as usize,

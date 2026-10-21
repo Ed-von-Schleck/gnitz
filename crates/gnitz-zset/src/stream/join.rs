@@ -384,10 +384,10 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
                 }
             }
             // A keyed plan's output key is the delta's PK region verbatim.
-            _ => width_dispatch!(d_schema.pk_stride(), copy_runs, delta.pk_data(), pk, delta_runs(pairs)),
+            _ => width_dispatch!(d_schema.pk_stride(), copy_runs, delta.pk(), pk, delta_runs(pairs)),
         }
         {
-            let src = delta.weight_data().as_chunks::<8>().0;
+            let src = delta.weight().as_chunks::<8>().0;
             let mut dst = weights.as_chunks_mut::<8>().0.iter_mut();
             for p in pairs {
                 for (w_delta, w_out) in src[p.delta_rows()].iter().zip(&mut dst) {
@@ -399,7 +399,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
         }
         {
             // Each half's null bits rebase onto the slot its columns land at.
-            let src = delta.null_bmp_data().as_chunks::<8>().0;
+            let src = delta.null_bmp().as_chunks::<8>().0;
             let mut dst = nulls.as_chunks_mut::<8>().0.iter_mut();
             for p in pairs {
                 let (t_src, t_row) = trace_row(p);
@@ -527,7 +527,7 @@ fn equi_merge_walk(delta: &Batch, m: &mut ReadCursor, mut emit: impl FnMut(usize
             m.for_each_pk_group_row(dk, |c| emit(i, j, c));
             i = j;
         } else if m.valid {
-            i = delta.advance_to(&m.current_pk_bytes()[..k], i); // skip delta
+            i = delta.seek(&m.current_pk_bytes()[..k], Some(i)); // skip delta
         } else {
             break;
         }
@@ -596,7 +596,7 @@ fn range_merge_walk(
         lo = hi;
         if hi < delta.count && compare_pk_ordering(&delta.get_pk_bytes(hi)[..eq_size], trace_group).is_lt() {
             group_lb[..eq_size].copy_from_slice(trace_group);
-            lo = delta.advance_to(&group_lb[..stride], hi).max(hi);
+            lo = delta.seek(&group_lb[..stride], Some(hi)).max(hi);
         }
     }
 }

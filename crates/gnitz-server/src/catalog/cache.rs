@@ -176,7 +176,7 @@ impl CatalogCacheSet {
             by_schema
                 .entry(sid)
                 .or_default()
-                .insert(name.into_owned(), batch.get_pk(i) as u64);
+                .insert(name.into_owned(), gnitz_wire::sys_leading_id(batch.get_pk_bytes(i)));
         }
     }
 }

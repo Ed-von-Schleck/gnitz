@@ -18,7 +18,7 @@ fn keys(b: &Batch) -> Vec<u64> {
     (0..b.len())
         .map(|i| {
             assert_eq!((b.get_weight(i), payload0_i64(b, i)), (1, 0));
-            b.get_pk(i) as u64
+            gnitz_wire::widen_pk_be(b.get_pk_bytes(i)) as u64
         })
         .collect()
 }

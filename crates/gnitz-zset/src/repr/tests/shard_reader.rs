@@ -168,11 +168,11 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
             "{label}: PK filter false negative on row {r}"
         );
         let lb = (0..n).find(|&i| want.get_pk_bytes(i) == key).unwrap();
-        assert_eq!(shard.find_lower_bound_bytes(key), lb, "{label}: lower bound row {r}");
+        assert_eq!(shard.seek(key, None), lb, "{label}: lower bound row {r}");
         for hint in [0, lb] {
             assert_eq!(
-                shard.advance_to(key, hint),
-                want.advance_to(key, hint),
+                shard.seek(key, Some(hint)),
+                want.seek(key, Some(hint)),
                 "{label}: advance row {r}"
             );
         }
@@ -816,8 +816,8 @@ fn a_point_read_decodes_one_block_and_keeps_its_address() {
     let (n, row) = (shard.row_count(), DECODE_BLOCK_ROWS + 3);
     let key = (row as u64).to_be_bytes();
 
-    assert_eq!(shard.find_lower_bound_bytes(&key), row);
-    assert_eq!(shard.advance_to(&key, 3), row);
+    assert_eq!(shard.seek(&key, None), row);
+    assert_eq!(shard.seek(&key, Some(3)), row);
     assert_eq!(shard.pk_at(row).pk_bytes(), key);
     assert_eq!(shard.pk_rows(&key), row..row + 1);
     std::hint::black_box(shard.slice_to_owned_batch(100, n - 200));

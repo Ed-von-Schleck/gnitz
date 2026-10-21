@@ -120,10 +120,10 @@ impl CatalogEngine {
         if family == SysFamily::View {
             let segs = self.sys_rows_where(SysFamily::View, |s, i| {
                 owners.contains(payload_u64(s, i, ViewTabSlot::owner_view_id as usize))
-                    && !owners.contains(s.get_pk(i) as u64)
+                    && !owners.contains(gnitz_wire::sys_leading_id(s.get_pk_bytes(i)))
             });
             if !segs.is_empty() {
-                owners = owners.with((0..segs.len()).map(|i| segs.get_pk(i) as u64));
+                owners = owners.with((0..segs.len()).map(|i| gnitz_wire::sys_leading_id(segs.get_pk_bytes(i))));
                 let mut merged = segs.negated();
                 merged.append_batch(&batch);
                 batch = merged;

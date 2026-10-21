@@ -447,7 +447,7 @@ impl OrderIndex {
                     put(&image);
                 }
             }
-            w.weight_mut().copy_from_slice(delta.weight_data());
+            w.weight_mut().copy_from_slice(delta.weight());
             self.nulls.write_rows(mb.null_bmp(), 0, w.null_bmp_mut(), 0, n);
             for c in &self.copies {
                 copy_column(delta, w, c, RowWindow { src: 0, dst: 0, n });
@@ -473,13 +473,7 @@ impl OrderIndex {
         // Entry `i` is delta row `i`'s, unless a fold moved the entries: then
         // `moved` records every entry's.
         let mut moved: Vec<(u32, u32, i64)> = Vec::new();
-        match folded.stands_consolidated() {
-            true => folded.certify_consolidated(),
-            false => {
-                moved.reserve_exact(folded.count);
-                folded = Batch::consolidated_from(&folded, &mut moved);
-            }
-        }
+        folded.consolidate_recording(&mut moved);
         let entries = &folded.as_mem_batch();
         let n = entries.count;
         if n == 0 {

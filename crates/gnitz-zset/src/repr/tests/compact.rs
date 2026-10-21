@@ -171,7 +171,9 @@ fn a_skeleton_input_makes_every_output_a_skeleton() {
         .iter()
         .map(|(_, skel, b)| {
             assert_eq!(*b.schema(), schema.pk_only());
-            let rows = (0..b.count).map(|r| (b.get_pk(r) as u64, b.get_weight(r))).collect();
+            let rows = (0..b.count)
+                .map(|r| (gnitz_wire::widen_pk_be(b.get_pk_bytes(r)) as u64, b.get_weight(r)))
+                .collect();
             (*skel, rows)
         })
         .collect();

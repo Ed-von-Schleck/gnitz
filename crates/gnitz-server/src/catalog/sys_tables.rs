@@ -63,7 +63,7 @@ impl std::fmt::Display for RelRow<'_> {
 /// Decode row `row` of relation family `family` (Table or View). The raw `flags`
 /// word does not escape, so the rejections below hold for every caller.
 pub(super) fn read_rel_row(family: SysFamily, batch: &Batch, row: usize) -> Result<RelRow<'_>, String> {
-    let (noun, id) = (family.row_noun(), batch.get_pk(row) as u64);
+    let (noun, id) = (family.row_noun(), gnitz_wire::sys_leading_id(batch.get_pk_bytes(row)));
     let unreadable = |e: String| format!("catalog invariant violated: {noun} (id={id}) {e}");
     let (schema_id, name, parts) = match family {
         SysFamily::Table => {
@@ -131,7 +131,7 @@ pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
     let mut sigs: Vec<PkSignature> = Vec::new();
     let mut by_pk: FxHashMap<u128, usize> = FxHashMap::default();
     for i in 0..batch.len() {
-        let pk = batch.get_pk(i);
+        let pk = gnitz_wire::widen_pk_be(batch.get_pk_bytes(i));
         let w = batch.get_weight(i);
         if w == 0 {
             continue;

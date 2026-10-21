@@ -4,7 +4,6 @@ use std::cmp::Ordering;
 
 use crate::repr::{Batch, MemBatch, ReadCursor, RowMark};
 use crate::schema::payload_order::compare_rows;
-use crate::schema::SchemaDescriptor;
 
 use super::avi::AviBake;
 use super::plan::ReducePlan;
@@ -186,7 +185,7 @@ impl<'a> GroupEmit<'a> {
             // An emptied global aggregate still publishes one row.
             self.out.append_batch(v0);
         }
-        consolidate_group(&mut self.out, &shape.output_schema, mark);
+        consolidate_group(&mut self.out, mark);
     }
 
     fn finish(mut self) -> Batch {
@@ -203,13 +202,13 @@ impl<'a> GroupEmit<'a> {
 
 /// Consolidate the rows one group wrote since `mark`: at most a retraction and
 /// a new row, under one PK.
-fn consolidate_group(out: &mut Batch, schema: &SchemaDescriptor, mark: RowMark) {
+fn consolidate_group(out: &mut Batch, mark: RowMark) {
     if out.rows_since(mark) != 2 {
         return;
     }
     let row0 = out.count - 2;
     let omb = out.as_mem_batch();
-    match compare_rows(schema, &omb, row0, &omb, row0 + 1) {
+    match compare_rows(out.schema(), &omb, row0, &omb, row0 + 1) {
         Ordering::Equal => out.truncate_to(mark),
         Ordering::Greater => out.swap_rows(row0, row0 + 1),
         Ordering::Less => {}

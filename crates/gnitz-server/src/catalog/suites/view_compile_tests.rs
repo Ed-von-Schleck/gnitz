@@ -313,7 +313,13 @@ fn a_clamp_over_its_sources_stores_holds_its_definition_through_ticks() {
     let check = |engine: &mut CatalogEngine, held: &[BTreeMap<u64, u64>; 2], step: &str| {
         let out = read_rows(engine, vid, gnitz_wire::ReadBound::None);
         let mut got: Vec<(u64, u64, i64)> = (0..out.len())
-            .map(|i| (out.get_pk(i) as u64, payload_u64(&*out, i, 0), out.get_weight(i)))
+            .map(|i| {
+                (
+                    gnitz_wire::widen_pk_be(out.get_pk_bytes(i)) as u64,
+                    payload_u64(&*out, i, 0),
+                    out.get_weight(i),
+                )
+            })
             .collect();
         got.sort();
         let want: Vec<(u64, u64, i64)> = held[0]

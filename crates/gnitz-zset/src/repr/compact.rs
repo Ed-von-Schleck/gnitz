@@ -124,7 +124,7 @@ pub fn merge_guard<'a>(
         .zip(starts)
         .map(|(shard, start)| {
             let end = match guards.get(g + 1) {
-                Some(next) => shard.advance_to(next.pk_bytes(), *start),
+                Some(next) => shard.seek(next.pk_bytes(), Some(*start)),
                 None => shard.row_count(),
             };
             std::mem::replace(start, end)..end

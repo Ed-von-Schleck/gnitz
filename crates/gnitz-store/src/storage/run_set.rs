@@ -88,7 +88,7 @@ impl RunSet {
         while let [.., older, newer] = &self.runs[..] {
             if !self.merges_cancelling
                 || older.len() > CANCEL_MERGE_RATIO * newer.len()
-                || !retractions_cancel(older, newer, schema)
+                || !retractions_cancel(older, newer)
             {
                 break;
             }
@@ -259,7 +259,7 @@ impl RunSet {
 
 /// Whether `older` holds most sampled retractions of `newer`: the first
 /// retraction of each of [`CANCEL_SAMPLE`] equal stretches of its rows.
-fn retractions_cancel(older: &Batch, newer: &Batch, schema: &SchemaDescriptor) -> bool {
+fn retractions_cancel(older: &Batch, newer: &Batch) -> bool {
     // The count vectorises, so an insert-only run costs one cheap pass, where
     // the sampling below would read each of its weights one at a time.
     if newer.retracted_rows().count() == 0 {
@@ -271,7 +271,7 @@ fn retractions_cancel(older: &Batch, newer: &Batch, schema: &SchemaDescriptor) -
         let stretch = s * n / CANCEL_SAMPLE..(s + 1) * n / CANCEL_SAMPLE;
         if let Some(row) = stretch.into_iter().find(|&i| newer.get_weight(i) < 0) {
             sampled += 1;
-            held += usize::from(older.holds_element_of(newer, row, schema));
+            held += usize::from(older.holds_element_of(newer, row));
         }
     }
     2 * held >= sampled

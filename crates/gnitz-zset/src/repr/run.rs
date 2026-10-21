@@ -35,20 +35,13 @@ impl Run {
         ColumnarSource::get_weight(self, row)
     }
 
-    /// First row whose OPK bytes are `>= key`; `key` is exactly `pk_stride`
+    /// The first row whose OPK bytes are `>= key`, galloping from `hint` (this
+    /// run's live position) where there is one; `key` is exactly `pk_stride`
     /// bytes.
-    pub(crate) fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
+    pub(crate) fn seek(&self, key: &[u8], hint: Option<usize>) -> usize {
         match self {
-            Run::Mem(b) => b.find_lower_bound_bytes(key),
-            Run::Shard(s) => s.find_lower_bound_bytes(key),
-        }
-    }
-
-    /// Galloping forward lower bound seeded at `hint` (this run's live position).
-    pub(crate) fn advance_to(&self, key: &[u8], hint: usize) -> usize {
-        match self {
-            Run::Mem(b) => b.advance_to(key, hint),
-            Run::Shard(s) => s.advance_to(key, hint),
+            Run::Mem(b) => b.seek(key, hint),
+            Run::Shard(s) => s.seek(key, hint),
         }
     }
 

@@ -5,7 +5,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 
-use super::batch::MemBatch;
+use super::batch::{range_rows, MemBatch};
 use super::batch_pool::{is_tight, tls_pool};
 use super::codebook::Codebook;
 use gnitz_wire::TypeCode;
@@ -76,9 +76,44 @@ pub(super) fn carried_dead(
     (!heap_is_wasteful(dead, heap)).then_some(dead)
 }
 
+/// Cells [`carry_dead`] charges dead between two waste checks.
+const DEAD_CHECK_CELLS: usize = 1024;
+
+/// [`carried_dead`] for copying the German-string slots `kept_slots` of `src`'s
+/// rows `kept`, ascending and disjoint: the string slots it leaves behind are
+/// charged dead as well. `None` when `src` has no string slot, when no kept
+/// slot reads a non-empty heap, or when carrying loses to relocating.
+pub(super) fn carry_dead(src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, usize)]) -> Option<usize> {
+    let mask = src.schema.string_payload_slots();
+    if mask == 0 {
+        // No string cell to rebase onto a heap.
+        return None;
+    }
+    debug_assert!(kept.windows(2).all(|w| w[0].1 <= w[1].0) && kept.last().is_none_or(|k| k.1 <= src.count));
+    debug_assert_eq!(kept_slots & !mask, 0, "carry_dead: a kept slot is not a string slot");
+    let heap = src.blob.len();
+    if kept_slots == 0 && heap != 0 {
+        return None;
+    }
+    let mut dead = src.dead_heap;
+    for pi in gnitz_wire::BitIter(mask & !kept_slots) {
+        let cells = src.col_data(pi).as_chunks::<16>().0;
+        for &(start, end) in kept {
+            for run in cells[start..end].chunks(DEAD_CHECK_CELLS) {
+                dead += run.iter().map(|cell| cell_long_bytes(cell)).sum::<usize>();
+                if heap_is_wasteful(dead, heap) {
+                    return None;
+                }
+            }
+        }
+    }
+    let excluded = || long_bytes_outside(src, mask, kept);
+    carried_dead(heap, dead, src.count, range_rows(kept), excluded)
+}
+
 /// The heap bytes a long German-string cell names; none for a short one.
 #[inline]
-pub(super) fn cell_long_bytes(cell: &[u8]) -> usize {
+fn cell_long_bytes(cell: &[u8]) -> usize {
     gnitz_wire::german_string_heap(cell, usize::MAX).map_or(0, |span| span.len())
 }
 
@@ -335,7 +370,7 @@ pub(super) fn walk_heap_spans(mb: &MemBatch<'_>, mut accept: impl FnMut(&[u8; 16
         if !col.type_code.is_german_string() {
             continue;
         }
-        for cell in mb.col_data(pi, 16).as_chunks::<16>().0 {
+        for cell in mb.col_data(pi).as_chunks::<16>().0 {
             if !accept(cell, col.type_code) {
                 return None;
             }

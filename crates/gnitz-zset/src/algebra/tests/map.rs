@@ -186,11 +186,7 @@ fn a_copied_column_holds_each_rows_value_in_its_slot() {
             let out = compute(&schema, LogicalProgram::copy_cols(&[c]), &[(slot, false)]).evaluate_map_batch(&batch);
             let what = format!("{src} -> {slot}, PK {:?} column {c}", schema.pk_cols());
             assert_eq!(out.col_data(0), &want[..], "{what}");
-            assert_eq!(
-                (out.pk_data(), out.weight_data()),
-                (batch.pk_data(), batch.weight_data()),
-                "{what}"
-            );
+            assert_eq!((out.pk(), out.weight()), (batch.pk(), batch.weight()), "{what}");
         }
     }
 }

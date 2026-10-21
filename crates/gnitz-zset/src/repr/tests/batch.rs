@@ -193,7 +193,7 @@ fn key_retractions_are_minus_one_rows_of_zeroed_non_null_cells() {
     let pks: Vec<u8> = [7u64, 3, 9].iter().flat_map(|pk| pk.to_be_bytes()).collect();
     let b = Batch::key_retractions(&schema, &pks);
     assert_eq!(b.len(), 3);
-    assert_eq!(b.pk_data(), &pks[..]);
+    assert_eq!(b.pk(), &pks[..]);
     for row in 0..3 {
         assert_eq!(b.get_weight(row), -1, "row {row}");
         assert_eq!(b.get_null_word(row), 0, "row {row}");
@@ -309,7 +309,7 @@ fn widened_with_nulls_places_the_fill_on_either_side() {
         };
 
         assert_eq!(out.count, 1);
-        assert_eq!(out.get_pk(0), 1);
+        assert_eq!(gnitz_wire::widen_pk_be(out.get_pk_bytes(0)), 1);
         assert!(!out.blob.is_empty(), "output blob must be propagated ({nulls_first})");
         assert_eq!(
             gnitz_wire::payload_bytes(&out, 0, str_slot),
@@ -616,9 +616,9 @@ fn holds_element_of_matches_pk_and_payload() {
     let got: Vec<(u128, i64, bool)> = (0..probes.len())
         .map(|i| {
             (
-                probes.get_pk(i),
+                gnitz_wire::widen_pk_be(probes.get_pk_bytes(i)),
                 payload0_i64(&probes, i),
-                held.holds_element_of(&probes, i, &schema),
+                held.holds_element_of(&probes, i),
             )
         })
         .collect();

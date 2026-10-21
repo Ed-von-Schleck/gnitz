@@ -151,7 +151,7 @@ pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
         ends.clear();
         out.append_session(rows).write(rows, |w| {
             bake.key_packer.pack_rows(w.pk_mut(), width, &mb, &runs);
-            copy_runs::<8>(delta.weight_data(), w.weight_mut(), runs.iter().copied(), 8);
+            copy_runs::<8>(delta.weight(), w.weight_mut(), runs.iter().copied(), 8);
             w.null_bmp_mut().fill(0);
             let live = runs.iter().flat_map(|&(s, e)| s..e);
             for (key, row) in w.pk_mut().chunks_exact_mut(width).zip(live) {

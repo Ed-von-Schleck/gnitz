@@ -664,7 +664,7 @@ pub fn index_entries(source: &Batch, spec: &KeySpec, idx_schema: &SchemaDescript
     write_to_batch(idx_schema, rows, 0, |w| {
         let (entries, weights, nulls) = w.fixed_mut();
         ReindexPacker::of_span(spec).pack_rows(entries, idx_stride, &mb, &runs);
-        let pks = source.pk_data();
+        let pks = source.pk();
         match src_stride {
             4 => suffix::<4>(entries, idx_stride, key_size, pks, &runs),
             8 => suffix::<8>(entries, idx_stride, key_size, pks, &runs),
@@ -681,7 +681,7 @@ pub fn index_entries(source: &Batch, spec: &KeySpec, idx_schema: &SchemaDescript
                 }
             }
         }
-        copy_runs::<8>(source.weight_data(), weights, runs.iter().copied(), 8);
+        copy_runs::<8>(source.weight(), weights, runs.iter().copied(), 8);
         // An index entry is all key: it has no payload column to be NULL.
         nulls.fill(0);
     })

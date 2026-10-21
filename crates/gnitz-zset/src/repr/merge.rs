@@ -760,7 +760,7 @@ fn ascending_with<P: PayloadOrder>(batch: &Batch, payload: P) -> bool {
     let schema = batch.schema();
     let stride = schema.pk_stride();
     pk_width_dispatch!(stride, |K| {
-        let mut keys = batch.pk_data().chunks_exact(stride).map(K::from_opk);
+        let mut keys = batch.pk().chunks_exact(stride).map(K::from_opk);
         let mut prev = keys.next().expect("a batch of at least one row");
         keys.zip(1..).all(|(key, i)| {
             // The payload order is read only where two rows share a PK.
@@ -957,7 +957,7 @@ fn fold_keyed(
         let cs = col.size();
         let Some(left) = room.checked_sub(cs * 8) else { break };
         (room, next) = (left, next + 1);
-        let (cells, signed) = (batch.col_data(pc, cs), col.is_signed());
+        let (cells, signed) = (batch.col_data(pc), col.is_signed());
         match cs {
             1 => put::<1>(keyed, cells, signed),
             2 => put::<2>(keyed, cells, signed),

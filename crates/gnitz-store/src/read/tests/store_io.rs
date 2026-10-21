@@ -34,7 +34,10 @@ fn drain_all(cur: &mut SourceCursor, chunk: usize) -> Vec<(u64, i64, i64)> {
     while let Some(b) = cur.drain_chunk(chunk) {
         assert!(!b.is_empty(), "drain_chunk yielded an empty chunk");
         for i in 1..b.len() {
-            assert!(b.get_pk(i - 1) < b.get_pk(i), "chunk {chunk}: rows out of PK order");
+            assert!(
+                gnitz_wire::widen_pk_be(b.get_pk_bytes(i - 1)) < gnitz_wire::widen_pk_be(b.get_pk_bytes(i)),
+                "chunk {chunk}: rows out of PK order"
+            );
         }
         out.extend(batch_rows(&b));
     }
@@ -377,7 +380,7 @@ fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
 /// A reply's `(key, weight)` rows, in reply order.
 fn keyed(reply: &Batch) -> Vec<(u128, i64)> {
     (0..reply.len())
-        .map(|i| (reply.get_pk(i), reply.get_weight(i)))
+        .map(|i| (gnitz_wire::widen_pk_be(reply.get_pk_bytes(i)), reply.get_weight(i)))
         .collect()
 }
 

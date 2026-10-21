@@ -713,7 +713,10 @@ fn undone_drop_index_refills_the_restored_circuit() {
     let entries = index.expect("the drop is undone").cursor().drain_chunk(usize::MAX);
     let entries = entries.expect("the restored index must hold the flushed row");
     // A U64's key image is its value: the entry is `val`, then the row's PK.
-    assert_eq!((entries.len(), entries.get_pk(0)), (1, 200 << 64 | 20));
+    assert_eq!(
+        (entries.len(), gnitz_wire::widen_pk_be(entries.get_pk_bytes(0))),
+        (1, 200 << 64 | 20)
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

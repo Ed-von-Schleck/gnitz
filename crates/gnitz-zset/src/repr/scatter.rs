@@ -145,14 +145,14 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
     for (pi, col) in schema.payload_columns() {
         let cs = col.size();
         if col.type_code.is_german_string() {
-            let src = batch.col_data(pi, 16).as_chunks::<16>().0;
+            let src = batch.col_data(pi).as_chunks::<16>().0;
             let (cells, blob, mut cache) = writer.string_col_mut(pi);
             for (cell, &idx) in cells.as_chunks_mut::<16>().0.iter_mut().zip(indices) {
                 *cell =
                     relocate_german_string_vec(&src[idx as usize], Heap::Plain(batch.blob), blob, cache.as_deref_mut());
             }
         } else {
-            let src_col = batch.col_data(pi, cs);
+            let src_col = batch.col_data(pi);
             width_dispatch!(cs, gather_col, src_col, writer.col_mut(pi), indices);
         }
     }

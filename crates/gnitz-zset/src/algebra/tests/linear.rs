@@ -115,8 +115,8 @@ fn filter_keeps_exactly_the_matching_rows() {
     assert!(out.is_consolidated());
     // Every row passes: an owned input is the output, not a copy of it.
     let owned = input.clone();
-    let regions = owned.pk_data().as_ptr();
-    assert_eq!(op_filter(Cow::Owned(owned), &mut gt(-1)).pk_data().as_ptr(), regions);
+    let regions = owned.pk().as_ptr();
+    assert_eq!(op_filter(Cow::Owned(owned), &mut gt(-1)).pk().as_ptr(), regions);
 }
 
 // ── Derived output schemas ──────────────────────────────────────────────

@@ -199,7 +199,7 @@ impl CatalogEngine {
     /// a `-1` releases it.
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
-            let idx_id = batch.get_pk(i) as u64;
+            let idx_id = gnitz_wire::sys_leading_id(batch.get_pk_bytes(i));
             let (owner_id, cols, unique) = IdxTabRow::read(batch, i)
                 .and_then(|r| r.parts())
                 .map_err(|e| format!("index {idx_id}: {e}"))?;

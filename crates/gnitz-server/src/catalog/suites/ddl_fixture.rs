@@ -52,7 +52,7 @@ impl CatalogEngine {
         let rows = self.sys_rows_where(SysFamily::Index, |s, i| {
             gnitz_wire::payload_bytes(s, i, IdxTabSlot::name as usize) == name.as_bytes()
         });
-        (!rows.is_empty()).then(|| rows.get_pk(0) as u64)
+        (!rows.is_empty()).then(|| gnitz_wire::widen_pk_be(rows.get_pk_bytes(0)) as u64)
     }
 
     pub(in crate::catalog) fn has_index_by_name(&self, name: &str) -> bool {
@@ -64,7 +64,9 @@ impl CatalogEngine {
         let rows = self.sys_rows_where(SysFamily::Index, |s, i| {
             payload_u64(s, i, IdxTabSlot::owner_id as usize) == owner
         });
-        (0..rows.len()).map(|i| rows.get_pk(i) as u64).collect()
+        (0..rows.len())
+            .map(|i| gnitz_wire::widen_pk_be(rows.get_pk_bytes(i)) as u64)
+            .collect()
     }
 
     /// Retract the live row at `id` in `family` as a one-block bundle, whose apply

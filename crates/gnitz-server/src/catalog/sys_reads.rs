@@ -118,7 +118,7 @@ impl CatalogEngine {
         let scan = self.sys_relation(SysFamily::Schema).full_scan();
         (0..scan.len())
             .find(|&i| payload_bytes(&*scan, i, SchemaTabSlot::name as usize) == name.as_bytes())
-            .map(|i| scan.get_pk(i) as u64)
+            .map(|i| gnitz_wire::sys_leading_id(scan.get_pk_bytes(i)))
     }
 
     /// The id of relation `name` in schema `schema_id`.
