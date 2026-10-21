@@ -151,8 +151,8 @@ impl Reactor {
             }
             KIND_OP => {
                 let op = self.ops.borrow_mut().remove(&id);
-                let PendingOp { done, carry } = op.expect("an op's entry lives until its CQE");
-                done.send((res, carry));
+                let op = op.expect("an op's entry lives until its CQE");
+                op.done.send(res);
             }
             KIND_RECV => self.handle_recv_cqe(id as i32, res),
             kind => unreachable!("CQE kind {kind} (user_data={user_data:#x}) was never issued"),

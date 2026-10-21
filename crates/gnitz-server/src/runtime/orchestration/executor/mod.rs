@@ -1229,8 +1229,6 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -
 // Wire-protocol response helpers
 // ---------------------------------------------------------------------------
 
-/// Append `msg`'s framed bytes to `out`, so a corked reply never passes through a
-/// buffer of its own.
 /// Forward every frame of `lease` that carries rows to `peer`, workers in ascending
 /// order. Stops at the first failed send, which closes the peer; `Err` on the first
 /// worker fault, leaving the rest undrained.
@@ -1243,6 +1241,8 @@ async fn forward_scan(peer: &Peer, lease: &TrainLease) -> Result<(), WireFault> 
     Ok(())
 }
 
+/// Append `msg`'s framed bytes to `out`, so a corked reply never passes through a
+/// buffer of its own.
 fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
     const PFX: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
     let sz = msg.size();

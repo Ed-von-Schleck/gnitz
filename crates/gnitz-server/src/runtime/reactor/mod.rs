@@ -168,14 +168,11 @@ pub struct ReactorShared {
     w2m: W2mReceiver,
 }
 
-/// A one-shot op's CQE `res` and what it carried.
-type OpResult = (i32, Option<conn::Outbound>);
-
-/// A submitted op awaiting its CQE.
+/// A submitted op awaiting its CQE `res`.
 struct PendingOp {
-    done: oneshot::Sender<OpResult>,
+    done: oneshot::Sender<i32>,
     /// What the SQE names, held until the CQE.
-    carry: Option<conn::Outbound>,
+    _carry: Option<Rc<conn::Outbound>>,
 }
 
 /// A handle on the master's one event loop; clones share it.
@@ -261,27 +258,34 @@ impl Reactor {
         }
     }
 
-    /// Register a one-shot op holding `carry`: the `user_data` its SQE must carry,
-    /// and the receiver its CQE resolves.
-    fn install_op(&self, carry: Option<conn::Outbound>) -> (u64, oneshot::Receiver<OpResult>) {
+    /// Queue `sqe` as a one-shot op holding `carry` until its CQE, whose `res` the
+    /// receiver yields. Not submitted.
+    ///
+    /// # Safety
+    /// As [`IoUringRing::push`]; what `carry` holds counts as valid until the CQE.
+    unsafe fn push_op(
+        &self,
+        sqe: io_uring::squeue::Entry,
+        carry: Option<Rc<conn::Outbound>>,
+    ) -> oneshot::Receiver<i32> {
         let id = self.alloc_op_id();
         let (done, rx) = oneshot::channel();
-        self.ops.borrow_mut().insert(id, PendingOp { done, carry });
-        (udata(KIND_OP, id), rx)
+        self.ops.borrow_mut().insert(id, PendingOp { done, _carry: carry });
+        // SAFETY: forwarded to the caller.
+        unsafe { self.ring.borrow_mut().push(sqe, udata(KIND_OP, id)) };
+        rx
     }
 
     /// Queue an fdatasync of `fd` and submit it now, so it runs while the caller
     /// works on. The future yields the CQE `res`: 0, or a negative errno.
     pub(crate) fn fsync(&self, fd: BorrowedFd<'static>) -> impl Future<Output = i32> {
-        let (u, op) = self.install_op(None);
         let sqe = opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
             .flags(types::FsyncFlags::DATASYNC)
             .build();
-        let mut ring = self.ring.borrow_mut();
         // SAFETY: `fd` is open for the process's life; the SQE names no memory.
-        unsafe { ring.push(sqe, u) };
-        ring.submit();
-        async move { op.await.0 }
+        let op = unsafe { self.push_op(sqe, None) };
+        self.ring.borrow_mut().submit();
+        op
     }
 }
 

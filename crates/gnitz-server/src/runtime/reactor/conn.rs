@@ -17,7 +17,7 @@ pub(super) struct Armed {
 }
 
 /// A send in flight: the connection whose fd its SQE names, and the bytes the
-/// kernel reads. The op holds it until the CQE.
+/// kernel reads. Each kernel send's op holds it until that send's CQE.
 pub(super) struct Outbound {
     _conn: Rc<ClientConn>,
     body: SendBody,
@@ -45,16 +45,19 @@ impl SendBody {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PeerGone;
 
-/// Arm (or re-arm) `armed`'s recv on `fd` into its filter's window. The fd rides
-/// the udata id, so the completion routes back to the entry. Not flushed (see
-/// the module header).
-fn arm_recv(ring: &mut IoUringRing, fd: i32, armed: &mut Armed) {
-    let mut q = armed.conn.q.borrow_mut();
-    let w = armed.filter.window(&mut q);
-    let sqe = opcode::Recv::new(types::Fd(fd), w.as_mut_ptr().cast(), w.len() as u32).build();
-    // SAFETY: only this recv's CQE removes or refills the entry, which holds the
-    // connection (so `fd`) and the filter owning the window; `ring` drops first.
-    unsafe { ring.push(sqe, udata(KIND_RECV, fd as u32 as u64)) };
+impl Armed {
+    /// Arm (or re-arm) the recv into the filter's window. The fd rides the udata
+    /// id, so the completion routes back to this entry. Not flushed (see the
+    /// module header).
+    fn arm(&mut self, ring: &mut IoUringRing) {
+        let fd = self.conn.fd();
+        let mut q = self.conn.q.borrow_mut();
+        let w = self.filter.window(&mut q);
+        let sqe = opcode::Recv::new(types::Fd(fd), w.as_mut_ptr().cast(), w.len() as u32).build();
+        // SAFETY: only this recv's CQE removes or refills the entry, which holds the
+        // connection (so `fd`) and the filter owning the window; `ring` drops first.
+        unsafe { ring.push(sqe, udata(KIND_RECV, fd as u32 as u64)) };
+    }
 }
 
 impl Reactor {
@@ -66,7 +69,6 @@ impl Reactor {
     /// result is a raw fd nothing owns.
     pub(crate) async fn accept(&self, listener: BorrowedFd<'static>) -> OwnedFd {
         loop {
-            let (u, op) = self.install_op(None);
             let sqe = opcode::Accept::new(
                 types::Fd(listener.as_raw_fd()),
                 std::ptr::null_mut(),
@@ -75,8 +77,7 @@ impl Reactor {
             .build();
             // SAFETY: the SQE names no memory, and `listener` is open for the
             // process's life.
-            unsafe { self.ring.borrow_mut().push(sqe, u) };
-            let (res, _) = op.await;
+            let res = unsafe { self.push_op(sqe, None) }.await;
             if res >= 0 {
                 // SAFETY: a fresh fd from the kernel, owned by nothing else.
                 return unsafe { OwnedFd::from_raw_fd(res) };
@@ -110,83 +111,76 @@ impl Reactor {
             // reissued.
             unreachable!("fd={fd} registered while an entry still holds it")
         };
-        let armed = slot.insert(Armed { conn: Rc::clone(conn), filter });
-        arm_recv(&mut self.ring.borrow_mut(), fd, armed);
+        slot.insert(Armed { conn: Rc::clone(conn), filter })
+            .arm(&mut self.ring.borrow_mut());
     }
 
     pub(super) fn handle_recv_cqe(&self, fd: i32, res: i32) {
         let mut conns = self.conns.borrow_mut();
-        let Some(armed) = conns.get_mut(&fd) else { return };
+        let Entry::Occupied(mut entry) = conns.entry(fd) else {
+            return;
+        };
+        let armed = entry.get_mut();
         if armed.conn.is_gone() {
             // Retired while this recv was in flight: its bytes are discarded.
-            conns.remove(&fd);
+            entry.remove();
             return;
         }
-        let mut q = armed.conn.q.borrow_mut();
-        let next = if res < 0 {
-            Err(RecvEnd::Socket)
-        } else if res == 0 {
-            Err(RecvEnd::PeerClosed)
-        } else {
-            armed.filter.ingest(res as usize, &mut q)
-        };
-        drop(q);
-        match next {
-            Ok(()) => arm_recv(&mut self.ring.borrow_mut(), fd, armed),
-            Err(end) => {
-                let armed = conns.remove(&fd).expect("entry present");
-                drop(conns);
-                if matches!(end, RecvEnd::PeerClosed) {
-                    gnitz_debug!("reactor: fd={fd} recv side ended: {end}");
-                    armed.conn.end_recv();
-                } else {
-                    gnitz_warn!(
-                        "reactor: fd={fd} recv side ended: {end} (res={res}, inbound held={} of {} B)",
-                        self.inbound.held(),
-                        self.inbound.cap(),
-                    );
-                    match end {
-                        // The transport may owe the client a reply to the violation.
-                        RecvEnd::Protocol => armed.conn.retire(),
-                        // Owed nothing, and possibly not reading.
-                        _ => armed.conn.fail(),
-                    }
+        let end = match res {
+            ..0 => RecvEnd::Socket,
+            0 => RecvEnd::PeerClosed,
+            n => {
+                let ingested = armed.filter.ingest(n as usize, &mut armed.conn.q.borrow_mut());
+                match ingested {
+                    Ok(()) => return armed.arm(&mut self.ring.borrow_mut()),
+                    Err(end) => end,
                 }
-            } // `armed` drops: the reactor's hold on the connection ends
+            }
+        };
+        let armed = entry.remove();
+        drop(conns);
+        if let RecvEnd::PeerClosed = end {
+            gnitz_debug!("reactor: fd={fd} recv side ended: {end}");
+            return armed.conn.end_recv();
         }
-    }
+        gnitz_warn!(
+            "reactor: fd={fd} recv side ended: {end} (res={res}, inbound held={} of {} B)",
+            self.inbound.held(),
+            self.inbound.cap(),
+        );
+        match end {
+            // The transport may owe the client a reply to the violation.
+            RecvEnd::Protocol => armed.conn.retire(),
+            // Owed nothing, and possibly not reading.
+            _ => armed.conn.fail(),
+        }
+    } // `armed` drops: the reactor's hold on the connection ends
 
     /// Send `body`'s whole byte range on `conn`. Loops on short sends; each kernel
     /// send has its own `Limits::client_send_timeout` deadline, past which the
     /// client is evicted. A failed or evicted send finishes the connection
     /// ([`ClientConn::fail`]).
     pub(crate) async fn send_owned(&self, conn: &Rc<ClientConn>, body: SendBody) -> Result<(), PeerGone> {
-        let mut out = Outbound { _conn: Rc::clone(conn), body };
-        let len = out.body.bytes().len();
+        let out = Rc::new(Outbound { _conn: Rc::clone(conn), body });
+        let bytes = out.body.bytes();
         let mut sent = 0usize;
-        while sent < len {
-            let rest = &out.body.bytes()[sent..];
+        while sent < bytes.len() {
+            let rest = &bytes[sent..];
             let sqe = opcode::Send::new(types::Fd(conn.fd()), rest.as_ptr(), rest.len() as u32).build();
-            let (u, op) = self.install_op(Some(out));
-            // SAFETY: the op holds `out` until the CQE, and moving a `SendBody`
-            // leaves its bytes in place.
-            unsafe { self.ring.borrow_mut().push(sqe, u) };
+            // SAFETY: the op holds `out` until the CQE.
+            let op = unsafe { self.push_op(sqe, Some(Rc::clone(&out))) };
             let rc = match select2(op, self.sleep(self.limits.client_send_timeout)).await {
-                Either::A((rc, back)) => {
-                    out = back.expect("a send carries its connection and body");
-                    rc
-                }
+                Either::A(rc) => rc,
                 // Evicted; a completion that raced the timer still counts as failed.
+                // The abandoned send completes only once the socket errors; its
+                // `ops` entry holds the connection and body until then.
                 Either::B(()) => {
                     gnitz_warn!(
                         "client fd={} made no send progress for {:?}; evicting",
                         conn.fd(),
                         self.limits.client_send_timeout
                     );
-                    // The abandoned send completes only once the socket errors; its
-                    // `ops` entry holds the connection and body until then.
-                    conn.fail();
-                    return Err(PeerGone);
+                    0
                 }
             };
             // A zero is the kernel accepting nothing, which is not progress either.

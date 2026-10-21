@@ -12,11 +12,9 @@ use crate::runtime::wire::WireMsg;
 const PASSES: u64 = 100_000;
 
 /// A one-shot op the kernel completes at its submit.
-fn nop(r: &Reactor) -> oneshot::Receiver<OpResult> {
-    let (u, op) = r.install_op(None);
+fn nop(r: &Reactor) -> oneshot::Receiver<i32> {
     // SAFETY: the SQE names no memory.
-    unsafe { r.ring.borrow_mut().push(opcode::Nop::new().build(), u) };
-    op
+    unsafe { r.push_op(opcode::Nop::new().build(), None) }
 }
 
 /// Spawn a task on `r` that parks in `park` over and over, then run `PASSES`
@@ -63,7 +61,14 @@ fn reactor_pass_bench() {
 
     let r = make_reactor();
     let r2 = r.clone();
-    arm("op", r, async move || drop(black_box(nop(&r2).await)), || ());
+    arm(
+        "op",
+        r,
+        async move || {
+            black_box(nop(&r2).await);
+        },
+        || (),
+    );
 
     let r = make_reactor();
     let r2 = r.clone();
