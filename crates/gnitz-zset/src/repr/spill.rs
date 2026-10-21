@@ -2,8 +2,9 @@
 //! run, whatever the input size. The spill file is `O_TMPFILE`, so no exit
 //! leaves it on disk.
 //!
-//! A record occupies a slot of its stride rounded up to 8 bytes, zero past the
-//! record, so the kernel compares whole words and the slot orders as the record.
+//! [`SpillSort::push`] stores a record in a slot of its stride rounded up to 8
+//! bytes, zero past the record, so the kernel compares whole words and the slot
+//! orders as the record.
 
 use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
@@ -29,6 +30,13 @@ fn cmp_records(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 fn sort_records(flat: &mut [u8], slot: usize) {
+    if slot == 8 {
+        // One word: sorting by the word itself compiles tighter than `cmp_records`.
+        return flat
+            .as_chunks_mut::<8>()
+            .0
+            .sort_unstable_by_key(|r| u64::from_be_bytes(*r));
+    }
     macro_rules! by_width {
         ($($w:literal)*) => {
             match slot {
@@ -37,7 +45,7 @@ fn sort_records(flat: &mut [u8], slot: usize) {
             }
         };
     }
-    by_width!(8 16 24 32 40 48 56 64 72 80)
+    by_width!(16 24 32 40 48 56 64 72 80)
 }
 const _: () = assert!(MAX_PK_BYTES == 80); // the arm list above is total
 
@@ -68,28 +76,33 @@ impl SpillSort {
         }
     }
 
-    /// Bytes a record occupies in [`Self::push`]'s input.
-    pub fn slot(&self) -> usize {
-        self.slot
-    }
-
-    /// Push a whole number of slot-wide records, each zero past its `stride` bytes.
-    pub fn push(&mut self, records: &[u8]) -> Result<(), String> {
-        debug_assert!(records.len().is_multiple_of(self.slot));
-        self.flat.extend_from_slice(records);
-        let run = self.run_len * self.slot;
-        let mut at = 0;
-        while self.flat.len() - at >= run {
-            self.spill_run(at, at + run)?;
-            at += run;
+    /// Push a whole number of `stride`-byte records, spilling each run as it fills.
+    pub fn push(&mut self, mut records: &[u8]) -> Result<(), String> {
+        let (stride, slot) = (self.stride, self.slot);
+        debug_assert!(records.len().is_multiple_of(stride));
+        while !records.is_empty() {
+            let room = self.run_len - self.flat.len() / slot;
+            let (now, rest) = records.split_at(room.min(records.len() / stride) * stride);
+            records = rest;
+            if slot == stride {
+                self.flat.extend_from_slice(now);
+            } else {
+                let at = self.flat.len();
+                self.flat.resize(at + now.len() / stride * slot, 0);
+                for (d, s) in self.flat[at..].chunks_exact_mut(slot).zip(now.chunks_exact(stride)) {
+                    d[..stride].copy_from_slice(s);
+                }
+            }
+            if self.flat.len() == self.run_len * slot {
+                self.spill_run()?;
+            }
         }
-        self.flat.drain(..at);
         Ok(())
     }
 
-    /// Sort `flat[from..to]` and append it to the spill file as one run.
-    fn spill_run(&mut self, from: usize, to: usize) -> Result<(), String> {
-        sort_records(&mut self.flat[from..to], self.slot);
+    /// Sort `flat` and append it to the spill file as one run.
+    fn spill_run(&mut self) -> Result<(), String> {
+        sort_records(&mut self.flat, self.slot);
         let file = match &mut self.spill {
             Some(f) => f,
             None => self.spill.insert(
@@ -102,8 +115,10 @@ impl SpillSort {
                     .map_err(|e| format!("external sort: cannot create spill file in {}: {e}", self.dir))?,
             ),
         };
-        file.write_all(&self.flat[from..to])
-            .map_err(|e| format!("external sort: spill write failed: {e}"))
+        file.write_all(&self.flat)
+            .map_err(|e| format!("external sort: spill write failed: {e}"))?;
+        self.flat.clear();
+        Ok(())
     }
 
     pub fn finish(mut self) -> Result<KeyProducer, String> {
@@ -112,7 +127,7 @@ impl SpillSort {
             Records::Ram(self.flat)
         } else {
             // The last run goes to disk too, so `flat` is freed before the merge.
-            self.spill_run(0, self.flat.len())?;
+            self.spill_run()?;
             let file = self.spill.take().expect("spilled");
             // The mapping keeps the inode alive after `file` closes.
             let map = Mmap::from_file(&file).map_err(|e| format!("external sort: mmap spill file failed: {e}"))?;
@@ -143,11 +158,15 @@ fn record_index(n: &HeapNode, run_len: usize) -> usize {
     n.source_idx as usize * run_len + n.row as usize
 }
 
-/// Record `index`'s tournament key: its leading word, the order of every record
-/// that differs in it.
+/// Record `index`'s tournament key: its leading 16 bytes, or its one word, the
+/// order of every record that differs in them.
 #[inline(always)]
 fn record_key(bytes: &[u8], slot: usize, index: usize) -> u128 {
-    u128::from(u64::from_be_bytes(*bytes[index * slot..].first_chunk().unwrap()))
+    let record = &bytes[index * slot..];
+    match slot {
+        8 => u128::from(u64::from_be_bytes(*record.first_chunk().unwrap())),
+        _ => u128::from_be_bytes(*record.first_chunk().unwrap()),
+    }
 }
 
 fn less(bytes: &[u8], slot: usize, run_len: usize) -> impl Fn(&HeapNode, &HeapNode) -> bool + '_ {
@@ -185,11 +204,9 @@ impl KeyProducer {
         }
     }
 
-    // Not `Iterator::next`: the record is lent out of `self`, so the returned
-    // borrow outlives no second call — a shape `Iterator` cannot express.
-    #[allow(clippy::should_implement_trait)]
+    /// The next record of the merge across runs.
     #[inline]
-    pub fn next(&mut self) -> Option<&[u8]> {
+    fn next(&mut self) -> Option<&[u8]> {
         let top = self.tree.peek()?;
         let g = record_index(&top, self.run_len);
         let more = (top.row as usize + 1) < self.run_len && g + 1 < self.total;
@@ -202,18 +219,36 @@ impl KeyProducer {
         Some(&bytes[g * self.slot..][..self.stride])
     }
 
-    #[inline]
-    pub fn remaining(&self) -> usize {
-        self.remaining
-    }
-
     /// Reset `chunk` to the next `max_rows` records, or as many as remain, each
-    /// as a key-only row at weight 1.
+    /// as a key-only row at weight 1; empty once none remain.
     pub fn fill(&mut self, chunk: &mut Batch, max_rows: usize) {
         chunk.clear();
-        for _ in 0..self.remaining.min(max_rows) {
-            chunk.push_key_row(self.next().expect("`remaining` records are left"), 1);
-        }
+        let n = self.remaining.min(max_rows);
+        let (stride, slot) = (self.stride, self.slot);
+        chunk.append_session(n).write(n, |w| {
+            let (keys, weights, nulls) = w.fixed_mut();
+            if self.total <= self.run_len {
+                // One run: the records are in order already, so no merge steps.
+                let at = self.total - self.remaining;
+                let records = &self.records.as_slice()[at * slot..][..n * slot];
+                if slot == stride {
+                    keys.copy_from_slice(records);
+                } else {
+                    for (d, s) in keys.chunks_exact_mut(stride).zip(records.chunks_exact(slot)) {
+                        d.copy_from_slice(&s[..stride]);
+                    }
+                }
+                self.remaining -= n;
+            } else {
+                for d in keys.chunks_exact_mut(stride) {
+                    d.copy_from_slice(self.next().expect("`remaining` records are left"));
+                }
+            }
+            for w in weights.as_chunks_mut::<8>().0 {
+                *w = 1i64.to_le_bytes();
+            }
+            nulls.fill(0);
+        });
     }
 }
 

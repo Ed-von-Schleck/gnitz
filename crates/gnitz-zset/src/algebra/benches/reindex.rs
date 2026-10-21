@@ -67,15 +67,15 @@ fn index_entries_bench() {
             .map(|spec| (spec, spec.index_schema(batch.schema())))
             .unwrap();
         let mb = batch.as_mem_batch();
-        let slot = spec.key_size().next_multiple_of(8);
-        let mut spans = Vec::with_capacity(N * slot);
-        append_spans(&mut spans, slot, &mb, &spec, |_| true);
+        let key_size = spec.key_size();
+        let mut spans = Vec::with_capacity(N * key_size);
+        append_spans(&mut spans, &mb, &spec, |_| true);
         spans.clear();
-        let ((), span) = counter.measure(|| append_spans(&mut spans, slot, &mb, &spec, |_| true));
+        let ((), span) = counter.measure(|| append_spans(&mut spans, &mb, &spec, |_| true));
         black_box(&spans);
         black_box(index_entries(batch, &spec, &idx_schema));
         let (entries, entry) = counter.measure(|| index_entries(batch, &spec, &idx_schema));
-        assert_eq!((entries.len(), spans.len()), (live, live * slot), "{label}");
+        assert_eq!((entries.len(), spans.len()), (live, live * key_size), "{label}");
         println!(
             "index_entries_bench {label:<40} spans {:5.1}, entries {:5.1} instr/row ({live} entries)",
             span as f64 / N as f64,

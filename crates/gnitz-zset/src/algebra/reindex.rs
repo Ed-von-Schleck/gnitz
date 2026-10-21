@@ -623,13 +623,12 @@ fn indexed_runs(mb: &MemBatch<'_>, spec: &KeySpec, keep: impl Fn(i64) -> bool) -
     })
 }
 
-/// Append to `out` one zeroed `slot`-byte record per row [`indexed_runs`] yields, in row
-/// order, the row's `spec` span at its front.
-pub fn append_spans(out: &mut Vec<u8>, slot: usize, mb: &MemBatch<'_>, spec: &KeySpec, keep: impl Fn(i64) -> bool) {
+/// Append to `out` the `spec` span of each row [`indexed_runs`] yields, in row order.
+pub fn append_spans(out: &mut Vec<u8>, mb: &MemBatch<'_>, spec: &KeySpec, keep: impl Fn(i64) -> bool) {
     let runs = indexed_runs(mb, spec, keep);
-    let at = out.len();
-    out.resize(at + range_rows(&runs) * slot, 0);
-    ReindexPacker::of_span(spec).pack_rows(&mut out[at..], slot, mb, &runs);
+    let (at, key_size) = (out.len(), spec.key_size());
+    out.resize(at + range_rows(&runs) * key_size, 0);
+    ReindexPacker::of_span(spec).pack_rows(&mut out[at..], key_size, mb, &runs);
 }
 
 /// Each nonzero-weight row of `source` that `spec` indexes, as its index entry

@@ -31,8 +31,11 @@ fn spill_sort_bench() {
                 }
                 let mut sorted = s.finish().unwrap();
                 let (mut chunk, mut rows) = (Batch::empty_with_schema(&schema), 0);
-                while sorted.remaining() > 0 {
+                loop {
                     sorted.fill(&mut chunk, CHUNK_ROWS);
+                    if chunk.count == 0 {
+                        break;
+                    }
                     rows += std::hint::black_box(&chunk).count;
                 }
                 assert_eq!(rows, n);

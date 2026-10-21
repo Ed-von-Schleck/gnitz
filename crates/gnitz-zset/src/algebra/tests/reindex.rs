@@ -320,7 +320,7 @@ mod pack_proptest {
 /// Over PKs of every suffix width and a nullable indexed column of every
 /// indexable width: the projection holds exactly the rows `KeySpec::span` admits,
 /// each as its span followed by its own PK, in source order — and `append_spans`
-/// the same rows' spans, zero to the end of a wider slot.
+/// the same rows' spans.
 #[test]
 fn index_entries_are_each_admitted_rows_span_and_pk() {
     use TypeCode::{I128, I16, I64, U128, U32, U64, U8};
@@ -370,17 +370,13 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
                 .collect();
             assert_eq!(got, want, "{pk:?} {tc} indexed on {indexed:?}");
 
-            let (key_size, slot) = (spec.key_size(), spec.key_size().next_multiple_of(8));
+            let key_size = spec.key_size();
             let mut spans = vec![0xEEu8; 3];
-            append_spans(&mut spans, slot, &mb, &spec, |w| w > 0);
+            append_spans(&mut spans, &mb, &spec, |w| w > 0);
             let want_spans: Vec<u8> = want
                 .iter()
                 .filter(|(_, w)| *w > 0)
-                .flat_map(|(e, _)| {
-                    let mut record = e[..key_size].to_vec();
-                    record.resize(slot, 0);
-                    record
-                })
+                .flat_map(|(e, _)| e[..key_size].to_vec())
                 .collect();
             assert_eq!(spans[..3], [0xEE; 3], "{pk:?} {tc} indexed on {indexed:?}");
             assert_eq!(spans[3..], want_spans, "{pk:?} {tc} indexed on {indexed:?}");

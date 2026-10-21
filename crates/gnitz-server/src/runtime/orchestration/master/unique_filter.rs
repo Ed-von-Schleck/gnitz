@@ -67,7 +67,7 @@ pub(super) fn extract_into_filter(filter: &mut UniqueFilter, batch: &gnitz_zset:
     }
     let key_size = spec.key_size();
     let mut spans = Vec::new();
-    append_spans(&mut spans, key_size, batch, spec, |w| w > 0);
+    append_spans(&mut spans, batch, spec, |w| w > 0);
     for span in spans.chunks_exact(key_size) {
         if !filter.insert(span) {
             return;

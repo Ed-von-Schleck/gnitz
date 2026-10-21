@@ -37,7 +37,7 @@ impl RelationRegistry {
                 // A drained chunk is consolidated, every row at weight 1.
                 while let Some(chunk) = rows.drain_chunk(chunk_rows) {
                     spans.clear();
-                    append_spans(&mut spans, sort.slot(), &chunk.as_mem_batch(), &spec, |_| true);
+                    append_spans(&mut spans, &chunk.as_mem_batch(), &spec, |_| true);
                     sort.push(&spans)?;
                 }
                 Source::Sorted(sort.finish()?)
