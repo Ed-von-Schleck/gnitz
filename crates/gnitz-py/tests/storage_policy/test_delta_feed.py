@@ -195,6 +195,22 @@ async def test_a_held_sync_leaves_an_async_client_free(client, aconn):
     assert pushed.cursor[0] == cursor[0] and pushed.cursor[1] > cursor[1]
 
 
+async def test_a_cancelled_held_sync_loses_nothing(client, aconn):
+    """A held sync that is cancelled hands nothing to nobody: the next sync
+    brings what the cancelled one's answer carried, and is not held behind it."""
+    fed_view(client)
+    vid, schema = client.resolve_table("f")
+    sub, _, _ = await aconn.subscribe(vid, schema)
+    held = asyncio.ensure_future(aconn.sync(60))
+    # Answered behind the sync's request, so the server holds that one.
+    await asyncio.wait_for(aconn.scan(vid, schema), 20)
+    assert not held.done(), "the scan left the sync held"
+    held.cancel()
+    insert(client, "t", [(i, 100, "w") for i in range(10)])
+    (pushed,) = (await asyncio.wait_for(aconn.sync(60), 20)).pushed
+    assert (pushed.sub, pushed.error, bag(pushed.rows)) == (sub, None, {(i, 100, "w"): 1 for i in range(10)})
+
+
 async def test_a_sync_waiting_for_a_tick_holds_up_no_request(own_server):
     """The writes behind a held sync are answered while it waits for a tick,
     which at the pace set here is ten minutes away; and a sync that finds a

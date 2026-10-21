@@ -281,6 +281,16 @@ impl Owed {
         })
     }
 
+    /// The caller cancelled the loop future: nobody takes what the call yields.
+    fn abandoned(&self) -> bool {
+        Python::attach(|py| {
+            self.future.as_ref().is_some_and(|future| {
+                let cancelled = future.bind(py).call_method0(intern!(py, "cancelled"));
+                cancelled.and_then(|c| c.extract()).unwrap_or(false)
+            })
+        })
+    }
+
     fn land(mut self, result: Landed) {
         let future = self.future.take().expect("landed once");
         self.shared.state().landed.push((future, result));
@@ -491,7 +501,9 @@ impl LoopHandle {
 
     /// Queue `first`, and once the reply it sent for arrives, `second` with
     /// that reply; hand back the loop future `second`'s result resolves. The
-    /// client is free in between.
+    /// client is free in between. A loop future cancelled by then never runs
+    /// `second`, so what `second` would take from the client stays there for
+    /// the next call.
     pub(crate) fn submit_then<A, T, O, P, C>(
         &self,
         py: Python<'_>,
@@ -515,6 +527,9 @@ impl LoopHandle {
                         // The step that reads the reply queues the rest, and
                         // the `serve` loop takes it up before it waits again.
                         Ok(sent) => sent.then(move |reply| {
+                            if owed.abandoned() {
+                                return;
+                            }
                             let shared = Arc::clone(&owed.shared);
                             let rest = owed.call(move |client| second(client, reply), convert);
                             shared.state().queue.push_back(rest);

@@ -668,7 +668,8 @@ impl PyClient {
     /// Bring every subscription of this connection up to every push
     /// acknowledged before the call. With nothing to report, the server holds
     /// the reply for up to `wait` seconds. On an event loop the client's other
-    /// calls are answered meanwhile, and leave the sync held.
+    /// calls are answered meanwhile, and leave the sync held; a sync cancelled
+    /// before its answer arrives loses nothing, which the next sync brings.
     ///
     /// A subscription that ended and a view that failed carry the exception
     /// in their entry's `error`. The call raises only for a poisoned store or
