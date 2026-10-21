@@ -78,6 +78,9 @@ pub(super) struct CompileOutput {
     pub(in crate::query) sources: FxHashMap<u64, (DeltaReg, ReadBound)>,
     /// `Some` iff the view is capacity-bounded.
     pub(in crate::query) hydration: Option<Hydration>,
+    /// Each worker computes the view's whole result locally: it is replicated, or
+    /// there is one worker.
+    pub(in crate::query) self_contained: bool,
 }
 
 /// Compile view `view_id`'s circuit, and answer the placement its store registers
@@ -104,7 +107,12 @@ pub(super) fn compile_view(
         .into_iter()
         .map(|(tid, scan)| (tid, (scan.seed, scan.bound)))
         .collect();
-    let output = CompileOutput { vm, sources, hydration };
+    let output = CompileOutput {
+        vm,
+        sources,
+        hydration,
+        self_contained: meta.self_contained,
+    };
     Ok((output, placement))
 }
 

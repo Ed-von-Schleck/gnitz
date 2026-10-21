@@ -134,12 +134,14 @@ impl DagEngine {
     }
 }
 
-/// `view_id`'s plan and its operator state, opened on a miss.
+/// `view_id`'s plan, beside the stores a run of it reads: its operator state,
+/// opened on a miss, and `unfed`, the sources it has been fed no row of.
 fn opened<'a>(
     views: &'a mut FxHashMap<u64, RegisteredView>,
-    registry: &RelationRegistry,
+    registry: &'a RelationRegistry,
     view_id: u64,
-) -> Result<(&'a mut CompileOutput, &'a mut CircuitState), String> {
+    unfed: &'a [u64],
+) -> Result<(&'a mut CompileOutput, vm::Stores<'a>), String> {
     let RegisteredView { code, state, .. } = views
         .get_mut(&view_id)
         .ok_or_else(|| format!("view {view_id} is not registered"))?;
@@ -147,5 +149,6 @@ fn opened<'a>(
         let open = CircuitState::open(registry, view_id, code.vm.layout());
         *state = Some(open.map_err(|e| format!("view_id={view_id}: open operator state: {e}"))?);
     }
-    Ok((code, state.as_mut().expect("opened above")))
+    let own = state.as_mut().expect("opened above");
+    Ok((code, vm::Stores { own, registry, unfed }))
 }

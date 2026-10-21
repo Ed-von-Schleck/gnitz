@@ -2,22 +2,9 @@
 //! evaluation driver.
 
 use super::*;
+use std::collections::hash_map::Entry;
 
 // ── Epoch execution ─────────────────────────────────────────────────────
-
-/// `view_id`'s program, beside the stores an epoch of it runs over, which its
-/// epoch opened on entry.
-fn plan_and_stores<'a>(
-    host: &'a mut impl DriveHost,
-    view_id: u64,
-    unfed: &'a [u64],
-) -> (&'a mut vm::Vm, vm::Stores<'a>) {
-    let (dag, registry) = host.parts();
-    let view = dag.views.get_mut(&view_id).expect("registered on the epoch's entry");
-    let state = view.state.as_mut().expect("opened on the epoch's entry");
-    let stores = vm::Stores { own: state, registry, unfed };
-    (&mut view.code.vm, stores)
-}
 
 /// Run one view's epoch over `input`, `src_id`'s delta, which it may `take`.
 /// `unfed`: the sources the view has been fed no row of — none, past its
@@ -36,7 +23,7 @@ fn run_view_epoch(
 ) -> Result<Batch, String> {
     let reg = {
         let (dag, registry) = host.parts();
-        let (code, _) = opened(&mut dag.views, registry, view_id)?;
+        let (code, _) = opened(&mut dag.views, registry, view_id, unfed)?;
         let scan = code.sources.get(&src_id);
         let reg = scan.expect("the dep map names only sources the view's circuit scans").0;
         if input.is_empty() && code.vm.idles_on_empty(reg) {
@@ -47,8 +34,9 @@ fn run_view_epoch(
     let mut epoch = vm::Epoch::tick(reg, input, take);
     let mut gathered = None;
     loop {
-        let (vm, mut stores) = plan_and_stores(host, view_id, unfed);
-        match vm::run(vm, &mut stores, &mut epoch, gathered.take())? {
+        let (dag, registry) = host.parts();
+        let (code, mut stores) = opened(&mut dag.views, registry, view_id, unfed)?;
+        match vm::run(&mut code.vm, &mut stores, &mut epoch, gathered.take())? {
             vm::Ran::Done(out) => return Ok(out),
             vm::Ran::Round { plan, batch, fold } => {
                 let rows;
@@ -64,8 +52,8 @@ fn run_view_epoch(
 /// Whether this process mints the row a global aggregate owes over an empty input: each
 /// process holding the view's whole input does, else the one worker the empty group's
 /// exchange sends every row to.
-fn mints_ground_row(slot: Slot, view: Placement) -> bool {
-    slot.of <= 1 || view.is_replicated() || slot.rank as usize == algebra::ground_owner(slot.of as usize)
+fn mints_ground_row(slot: Slot, self_contained: bool) -> bool {
+    self_contained || slot.rank as usize == algebra::ground_owner(slot.of as usize)
 }
 
 /// Seal `source` and run its whole dependent closure over what the seal answers,
@@ -82,12 +70,11 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
     dag.rebuild.remove(&view);
     let sources = dag.sources_of(view).to_vec();
     let chunk_rows = registry.scan_chunk_rows();
-    if mints_ground_row(registry.slot(), registry.relation_or_err(view)?.placement()) {
-        opened(&mut dag.views, registry, view)?;
-        // No source has fed the view yet.
-        let (vm, mut stores) = plan_and_stores(host, view, &sources);
-        let minted = vm::mint_ground_rows(vm, &mut stores)?;
-        host.parts().1.ingest_at(view, minted, None, false)?;
+    // No source has fed the view yet.
+    let (code, mut stores) = opened(&mut dag.views, registry, view, &sources)?;
+    if mints_ground_row(registry.slot(), code.self_contained) {
+        let minted = vm::mint_ground_rows(&mut code.vm, &mut stores)?;
+        registry.ingest_at(view, minted, None, false)?;
     }
     for (at, &source) in sources.iter().enumerate() {
         let (dag, registry) = host.parts();
@@ -140,9 +127,6 @@ fn run_tick(host: &mut impl DriveHost, source: u64, round: u64, delta: Option<Ba
         let input = outputs.get_mut(&producer);
         let input = input.expect("the schedule runs every producer before the steps it feeds");
         let out = run_view_epoch(host, view, input, last, producer, &[], &mut false)?;
-        if last {
-            outputs.remove(&producer);
-        }
         let (dag, registry) = host.parts();
         let echo = match out.is_empty() || dag.passes_through(view) {
             // A tick's delta reaches its readers in this schedule, and an empty one
@@ -152,15 +136,17 @@ fn run_tick(host: &mut impl DriveHost, source: u64, round: u64, delta: Option<Ba
         };
         // Kept even when empty, so a reader's exchange rounds run on every worker.
         if let Some(out) = echo {
-            let merged = match outputs.remove(&view) {
-                Some(held) => {
+            match outputs.entry(view) {
+                Entry::Vacant(e) => {
+                    e.insert(out);
+                }
+                Entry::Occupied(mut e) => {
+                    let held = e.get_mut();
                     // The held batch's schema: the union is certified under it.
                     let schema = *held.schema();
-                    algebra::op_union(Cow::Owned(held), Cow::Owned(out), &schema)
+                    *held = algebra::op_union(Cow::Owned(held.take()), Cow::Owned(out), &schema);
                 }
-                None => out,
-            };
-            outputs.insert(view, merged);
+            }
         }
     }
     Ok(())

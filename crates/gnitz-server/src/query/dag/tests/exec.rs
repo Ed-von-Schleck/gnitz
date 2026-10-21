@@ -236,16 +236,15 @@ fn a_backfill_of_a_join_feeds_each_source_against_the_ones_before_it() {
 #[test]
 fn the_ground_row_is_minted_where_the_whole_input_arrives() {
     let schema = make_schema_u64_i64();
-    let keyed = Placement::full_pk(&schema);
     let probe = make_batch(&schema, &[(1, 1, 1)]);
     let group = ScatterPlan::group(&schema, &[]).unwrap();
     let (mints, receives): (Vec<bool>, Vec<bool>) = (0..4)
         .map(|rank| {
             let slot = Slot::new(rank, 4);
-            (mints_ground_row(slot, keyed), !group.share(&probe, slot).is_empty())
+            (mints_ground_row(slot, false), !group.share(&probe, slot).is_empty())
         })
         .unzip();
     assert_eq!(mints, receives);
     assert_eq!(mints.iter().filter(|&&m| m).count(), 1, "one owner");
-    assert!(mints_ground_row(Slot::SOLO, keyed), "one worker");
+    assert!(mints_ground_row(Slot::SOLO, false), "one worker");
 }
