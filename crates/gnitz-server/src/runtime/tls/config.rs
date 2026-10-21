@@ -50,7 +50,7 @@ pub(crate) struct Served {
     /// `None`: no token is asked for.
     pub(crate) tokens: Option<Tokens>,
     /// The served certificate's SHA-256, as `openssl x509 -fingerprint -sha256` prints it.
-    pub(crate) fingerprint: String,
+    pub(super) fingerprint: String,
 }
 
 impl TlsArgs {
@@ -123,7 +123,7 @@ impl TlsArgs {
 
     /// What connections are served under with `identity`.
     fn serve(&self, (chain, key): Identity) -> Result<Served, String> {
-        let fingerprint = fingerprint(&chain[0]);
+        let fingerprint = sha256(&chain[0]).map(|b| format!("{b:02X}")).join(":");
         let builder = rustls::ServerConfig::builder();
         let auth = match &self.client_ca {
             Some(path) => builder.with_client_cert_verifier(client_verifier(path)?),
@@ -221,8 +221,11 @@ fn client_verifier(path: &str) -> Result<Arc<dyn ClientCertVerifier>, String> {
     verifier().map_err(|e| format!("tls client-ca {path:?}: {e}"))
 }
 
-/// [`LOOPBACK_NAMES`], then each of `names` not among them.
-fn minted_names(names: &[ServerName<'static>]) -> Vec<ServerName<'static>> {
+/// The self-signed identity kept in `data_dir`, minted for [`LOOPBACK_NAMES`]
+/// and `names` when absent. Clients pin it, so a kept one is never replaced.
+fn minted_identity(data_dir: &str, names: &[ServerName<'static>]) -> Result<Identity, String> {
+    let cert_path = format!("{data_dir}/{TLS_CERT_FILE}");
+    let key_path = format!("{data_dir}/{TLS_KEY_FILE}");
     let mut all: Vec<ServerName<'static>> = LOOPBACK_NAMES
         .map(|n| ServerName::try_from(n).expect("a loopback name"))
         .to_vec();
@@ -231,15 +234,6 @@ fn minted_names(names: &[ServerName<'static>]) -> Vec<ServerName<'static>> {
             all.push(name.clone());
         }
     }
-    all
-}
-
-/// The self-signed identity kept in `data_dir`, minted for [`LOOPBACK_NAMES`]
-/// and `names` when absent. Clients pin it, so a kept one is never replaced.
-fn minted_identity(data_dir: &str, names: &[ServerName<'static>]) -> Result<Identity, String> {
-    let cert_path = format!("{data_dir}/{TLS_CERT_FILE}");
-    let key_path = format!("{data_dir}/{TLS_KEY_FILE}");
-    let all = minted_names(names);
     if !(std::path::Path::new(&cert_path).exists() && std::path::Path::new(&key_path).exists()) {
         let sans: Vec<String> = all.iter().map(|n| n.to_str().into_owned()).collect();
         let ck = rcgen::generate_simple_self_signed(sans.clone())
@@ -287,9 +281,4 @@ pub(super) fn write_file(path: &str, bytes: &[u8], mode: u32) -> Result<(), Stri
             },
         )
         .map_err(|e| format!("failed to write {path}: {e}"))
-}
-
-/// `der`'s SHA-256 as colon-separated upper-case hex.
-fn fingerprint(der: &CertificateDer<'_>) -> String {
-    sha256(der).map(|b| format!("{b:02X}")).join(":")
 }

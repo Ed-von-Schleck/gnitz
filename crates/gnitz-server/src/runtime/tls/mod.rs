@@ -30,34 +30,29 @@ const TLS_MAX_FRAGMENT: usize = 16 * 1024;
 const TLS_RECORD_OVERHEAD: usize = 5 + 1 + 16;
 
 /// Feed one socket chunk of ciphertext through rustls, enqueueing the plaintext
-/// frames it yields on `q`.
+/// frames it yields on `q`. A peer's close_notify ends the recv side once the
+/// plaintext ahead of it is queued.
 fn ingest_cipher(sess: &mut rustls::ServerConnection, mut cipher: &[u8], q: &mut RecvQueue) -> Result<(), RecvEnd> {
     while !cipher.is_empty() {
         // An `Err` is rustls's buffer being full, not a failure: the drain below
         // frees it and the loop retries the rest.
         let _ = sess.read_tls(&mut cipher);
         sess.process_new_packets().map_err(|_| RecvEnd::Protocol)?;
-        feed_decrypted(sess, q)?;
+        let mut reader = sess.reader();
+        loop {
+            let n = match reader.fill_buf() {
+                Ok([]) => return Err(RecvEnd::PeerClosed),
+                Ok(chunk) => {
+                    q.feed(chunk)?;
+                    chunk.len()
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => return Err(RecvEnd::Protocol),
+            };
+            reader.consume(n);
+        }
     }
     Ok(())
-}
-
-/// Hand every decrypted plaintext chunk rustls holds to `q`. A peer's close_notify
-/// ends the recv side here, once the plaintext ahead of it is queued.
-fn feed_decrypted(sess: &mut rustls::ServerConnection, q: &mut RecvQueue) -> Result<(), RecvEnd> {
-    let mut reader = sess.reader();
-    loop {
-        let n = match reader.fill_buf() {
-            Ok([]) => return Err(RecvEnd::PeerClosed),
-            Ok(chunk) => {
-                q.feed(chunk)?;
-                chunk.len()
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
-            Err(_) => return Err(RecvEnd::Protocol),
-        };
-        reader.consume(n);
-    }
 }
 
 /// Shared handle to one TLS connection.
@@ -118,25 +113,20 @@ impl TlsShared {
     /// Encrypt and send `body` under one `send_lock` hold; rustls sizes the chunks.
     pub(crate) async fn send(&self, body: SendBody) -> Result<(), PeerGone> {
         let send = self.send_lock.write().await;
+        let bytes = body.bytes();
         let mut off = 0;
-        while off < body.bytes().len() {
-            let n = {
-                let mut sess = self.state.borrow_mut();
-                if self.conn.is_gone() {
-                    return Err(PeerGone);
-                }
-                match sess.writer().write(&body.bytes()[off..]) {
-                    Ok(n) if n > 0 => n,
-                    // rustls short-writes only on a full outgoing buffer, which the
-                    // previous turn's flush emptied: a zero here is a wedged session.
-                    _ => {
-                        self.conn.fail();
-                        return Err(PeerGone);
-                    }
-                }
+        while off < bytes.len() {
+            if self.conn.is_gone() {
+                return Err(PeerGone);
+            }
+            // rustls short-writes only on a full outgoing buffer, which the
+            // previous turn's flush emptied: a zero here is a wedged session.
+            let Ok(n @ 1..) = self.state.borrow_mut().writer().write(&bytes[off..]) else {
+                self.conn.fail();
+                return Err(PeerGone);
             };
             off += n;
-            if off == body.bytes().len() {
+            if off == bytes.len() {
                 // rustls holds every byte now: release the body — a W2M slot — before the send.
                 drop(body);
                 return self.flush_records(&send, n).await;
@@ -176,6 +166,10 @@ impl RecvFilter for TlsIngress {
 /// close_notify — and shuts the socket down once the connection is gone.
 async fn flusher(tls: Rc<TlsShared>, mut rx: chan::Receiver<()>) {
     loop {
+        // The queue is a flag, not a stream: park on the next notification, then
+        // drop whatever piled up behind it.
+        rx.recv().await;
+        while rx.try_recv().is_some() {}
         let gone = tls.conn.is_gone();
         if gone {
             tls.state.borrow_mut().send_close_notify();
@@ -185,10 +179,6 @@ async fn flusher(tls: Rc<TlsShared>, mut rx: chan::Receiver<()>) {
             tls.conn.shutdown();
             return;
         }
-        // The queue is a flag, not a stream: park on the next notification, then
-        // drop whatever piled up behind it.
-        rx.recv().await;
-        while rx.try_recv().is_some() {}
     }
 }
 

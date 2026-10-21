@@ -70,7 +70,10 @@ fn a_malformed_token_file_is_refused_naming_the_line() {
         (format!("app1 {}g\n", &hex[..63]), "64 hex digits"),
         (format!("bad/name {hex}\n"), "must be"),
         (format!("app1 {hex}\napp1 {other}\n"), "already held"),
-        (format!("app1 {hex}\napp2 {hex}\n"), "line 2"),
+        (
+            format!("app1 {hex}\napp2 {hex}\n"),
+            "line 2: \"app2\" and \"app1\" hold the same digest",
+        ),
     ] {
         let path = file_in(&dir, &body);
         let e = Tokens::load(&path).unwrap_err();

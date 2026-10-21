@@ -10,7 +10,7 @@
 //! the client verifying for real against the certificate it is told to trust.
 //! The session tests run a `TlsShared` over a socketpair.
 
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::os::unix::net::UnixStream;
 
 use rustls::pki_types::pem::PemObject;
@@ -46,28 +46,27 @@ fn ciphertext<D>(conn: &mut rustls::ConnectionCommon<D>) -> Vec<u8> {
     out
 }
 
+/// Feed `bytes` of ciphertext through `conn`; its refusal, if it refuses.
+fn feed<D>(conn: &mut rustls::ConnectionCommon<D>, mut bytes: &[u8]) -> Result<(), rustls::Error> {
+    while !bytes.is_empty() {
+        conn.read_tls(&mut bytes).unwrap();
+        conn.process_new_packets()?;
+    }
+    Ok(())
+}
+
 /// Handshake a [`client_trusting`] `pem` and dialling `name` against a session
-/// under `server`; the server's refusal, if it refuses.
+/// under `served`; the server's refusal, if it refuses.
 fn handshake(
-    server: &Served,
+    served: &Served,
     pem: &str,
     name: &str,
 ) -> Result<(rustls::ClientConnection, rustls::ServerConnection), rustls::Error> {
     let mut client = client_trusting(pem, name);
-    let mut server = rustls::ServerConnection::new(Arc::clone(&server.cfg)).unwrap();
+    let mut server = rustls::ServerConnection::new(Arc::clone(&served.cfg)).unwrap();
     while client.is_handshaking() || server.is_handshaking() {
-        let c2s = ciphertext(&mut client);
-        let mut c2s = &c2s[..];
-        while !c2s.is_empty() {
-            server.read_tls(&mut c2s).unwrap();
-            server.process_new_packets()?;
-        }
-        let s2c = ciphertext(&mut server);
-        let mut s2c = &s2c[..];
-        while !s2c.is_empty() {
-            client.read_tls(&mut s2c).unwrap();
-            client.process_new_packets().unwrap();
-        }
+        feed(&mut server, &ciphertext(&mut client))?;
+        feed(&mut client, &ciphertext(&mut server)).unwrap();
     }
     Ok((client, server))
 }
@@ -276,8 +275,8 @@ fn read_until_eof(r: &Reactor, fd: &UnixStream) -> Option<Vec<u8>> {
     eof.then_some(seen)
 }
 
-/// An alert record before the handshake: content type, legacy version, length,
-/// then the level, fatal (2) or warning (1).
+/// An unencrypted alert record's header: content type, legacy version, length 2.
+/// The level, fatal (2) or warning (1), and the description follow it.
 const ALERT_HEADER: [u8; 5] = [0x15, 3, 3, 0, 2];
 
 /// Bytes that are not TLS end the session with one fatal alert the client reads

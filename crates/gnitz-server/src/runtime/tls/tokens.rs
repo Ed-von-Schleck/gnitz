@@ -1,11 +1,9 @@
 //! Access tokens, `gnitz_` and 64 random hex digits, and the file `--auth-tokens`
 //! names: one `<name> <sha256-hex>` line per token, holding no token itself.
 
-use std::collections::hash_map::Entry;
-
 use ring::digest::{digest, SHA256};
 use ring::rand::{generate, SystemRandom};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::config::write_file;
 
@@ -24,13 +22,13 @@ pub(crate) struct Tokens {
 impl Tokens {
     /// Read and check the token file at `path`. Every malformed line refuses
     /// the whole file, naming the line.
-    pub(crate) fn load(path: &str) -> Result<Tokens, String> {
+    pub(super) fn load(path: &str) -> Result<Tokens, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("auth tokens {path:?}: {e}"))?;
         parse(&text).map_err(|e| format!("auth tokens {path:?}: {e}"))
     }
 
     /// The number of tokens held.
-    pub(crate) fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.by_digest.len()
     }
 
@@ -80,7 +78,7 @@ fn check_name(name: &str) -> Result<(), String> {
 /// skipped. A name or a digest held twice is refused.
 fn parse(text: &str) -> Result<Tokens, String> {
     let mut tokens = Tokens::default();
-    let mut names = rustc_hash::FxHashSet::default();
+    let mut names = FxHashSet::default();
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -93,13 +91,12 @@ fn parse(text: &str) -> Result<Tokens, String> {
         };
         check_name(name).map_err(at)?;
         let digest = from_hex32(hex).ok_or_else(|| at(format!("{hex:?} is not 64 hex digits")))?;
-        if !names.insert(name.to_string()) {
+        if !names.insert(name) {
             return Err(at(format!("a token named {name:?} is already held")));
         }
-        match tokens.by_digest.entry(digest) {
-            Entry::Occupied(e) => return Err(at(format!("{name:?} and {:?} hold the same digest", e.get()))),
-            Entry::Vacant(e) => e.insert(name.to_string()),
-        };
+        if let Some(held) = tokens.by_digest.insert(digest, name.to_string()) {
+            return Err(at(format!("{name:?} and {held:?} hold the same digest")));
+        }
     }
     Ok(tokens)
 }
