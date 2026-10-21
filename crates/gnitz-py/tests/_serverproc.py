@@ -118,29 +118,50 @@ def server_preexec():
     # we were already reparented, so the death signal would never arrive.
     if os.getppid() != parent:
         os._exit(1)
-
-
-def server_preexec_no_core():
-    """`server_preexec` for a server expected to die: a build that aborts on a
-    panic would hand its image to the host's core handler, which can outlast
-    the wait for its exit."""
-    server_preexec()
+    # The server aborts on every panic, an injected one included, and a core
+    # handler reads every page of the image, its sparse shared mappings too:
+    # one dump outlasts the boot many times over, holding the data dir all
+    # along. A test reads a crash off the server's log instead.
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
+# Deadlock ceiling, not a performance budget: a group of killed processes that
+# never finishes exiting fails here rather than hanging the test.
+_GROUP_EXIT_TIMEOUT_S = 60
+
+
+def await_group_exit(proc):
+    """Return once no process of `proc`'s group is left; `proc` itself must be
+    reaped already. The master's exit is not the server's: each worker shares
+    the data dir's lock and the master's shared mappings, dies of its PDEATHSIG
+    only asynchronously, and is reparented rather than reaped here, so it can
+    hold both for seconds after the master's exit code is in. Anything that
+    touches the data dir next waits here: a reboot gives up on a held lock, and
+    an `rmtree` races a worker still mapping `wal.sal`."""
+    deadline = time.monotonic() + _GROUP_EXIT_TIMEOUT_S
+    while True:
+        try:
+            # The group id is the master's pid, and stays the group's after the
+            # master is reaped, for as long as any member is left.
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            return
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"server group {proc.pid} still running {_GROUP_EXIT_TIMEOUT_S}s after its master exited")
+        time.sleep(_READY_POLL_S)
+
+
 def kill_group(proc):
-    """SIGKILL `proc`'s whole process group — master and workers together. The
-    master's PDEATHSIG reaps workers only asynchronously, so anything that
-    touches the data dir afterwards (a restart, an `rmtree`) would otherwise race
-    a worker still mapping `wal.sal`. Requires the spawn to have used
+    """SIGKILL `proc`'s whole process group — master and workers together — and
+    return once all of it is gone. Requires the spawn to have used
     `start_new_session`, or this reaches the caller too."""
     try:
-        # The group id is the master's pid, and stays the group's after the
-        # master is reaped — which is when its workers most need killing.
         os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
     proc.wait()
+    await_group_exit(proc)
 
 
 def await_log(proc, read_log, marker, timeout):
@@ -277,7 +298,7 @@ class ServerProc:
 
     # ── spawning ─────────────────────────────────────────────────────────────
 
-    def _popen(self, spawn_env, extra_args=(), preexec=server_preexec):
+    def _popen(self, spawn_env, extra_args=()):
         env = server_env()
         env.update(self.extra_env)     # config of this server, every boot
         env.update(spawn_env or {})    # this boot only
@@ -296,7 +317,7 @@ class ServerProc:
                 [server_binary(), self.data_dir, self.sock_path, f"--workers={self.workers}",
                  "--tls-listen=127.0.0.1:0", *self.extra_args, *extra_args],
                 stdout=log, stderr=log, env=env,
-                start_new_session=True, preexec_fn=preexec,
+                start_new_session=True, preexec_fn=server_preexec,
             )
         finally:
             log.close()
@@ -329,12 +350,11 @@ class ServerProc:
         replaces its default."""
         if workers is not None:
             self.workers = workers
-        self.proc = self._popen(extra_env, extra_args, server_preexec_no_core)
+        self.proc = self._popen(extra_env, extra_args)
         deadline = time.time() + timeout
         while time.time() < deadline:
             rc = self.proc.poll()
             if rc is not None:
-                # Reaps the workers the master's PDEATHSIG reaches only asynchronously.
                 self.stop()
                 assert rc != 0, f"the boot exited cleanly\n{self.log_tail()}"
                 assert marker in self.log_text() or any(marker in t for t in self.worker_log_texts()), \
@@ -367,6 +387,7 @@ class ServerProc:
         except ProcessLookupError:
             pass
         self.proc.wait(timeout=timeout)
+        await_group_exit(self.proc)
         rc = self.proc.returncode
         self.proc = None
         assert rc == 0, f"graceful shutdown must exit rc 0, got {rc}\n{self.log_tail()}"
@@ -380,6 +401,7 @@ class ServerProc:
         except subprocess.TimeoutExpired:
             self.stop()
             raise RuntimeError("server did not exit; expected an injected abort")
+        await_group_exit(self.proc)
         rc = self.proc.returncode
         self.proc = None
         return rc
