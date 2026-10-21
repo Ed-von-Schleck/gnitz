@@ -184,8 +184,8 @@ impl SalRequest<'static> {
                 Read::HasPk { tid, probe, keys: blob.to_vec().into() }.into()
             }
             SalMessageKind::KeySpans => {
-                let cols = PkColList::unpack(hdr.arg1)
-                    .map_err(|e| format!("key spans of table {tid}: {}", e.for_role(PkListRole::ColumnList)))?;
+                let cols = PkColList::unpack_as(hdr.arg1, PkListRole::ColumnList)
+                    .map_err(|e| format!("key spans of table {tid}: {e}"))?;
                 let claim =
                     gnitz_wire::bool_word(hdr.arg0).map_err(|e| format!("key spans of table {tid}: claim: {e}"))?;
                 Read::KeySpans { tid, cols, claim }.into()

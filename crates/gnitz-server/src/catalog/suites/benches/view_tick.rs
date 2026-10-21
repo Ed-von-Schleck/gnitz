@@ -132,7 +132,7 @@ fn left_join_rows(engine: &mut CatalogEngine, view: u64) -> (u64, u64) {
     let out = scan_all(engine, view);
     let b_w = out.schema().num_payload_cols() - 1;
     let null_filled = (0..out.len())
-        .filter(|&i| gnitz_wire::payload_is_null(&*out, i, b_w))
+        .filter(|&i| gnitz_wire::null_word_get(out.get_null_word(i), b_w))
         .count();
     (out.len() as u64, null_filled as u64)
 }

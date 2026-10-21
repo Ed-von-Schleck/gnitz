@@ -83,7 +83,7 @@ impl Wire for KeyRange {
     }
 
     fn read(r: &mut Reader) -> Result<KeyRange, String> {
-        let cols = PkColList::unpack(r.u64()?).map_err(|e| e.for_role(PkListRole::ColumnList))?;
+        let cols = PkColList::unpack_as(r.u64()?, PkListRole::ColumnList)?;
         let n_eq = r.u8()? as usize;
         if n_eq >= cols.as_slice().len() {
             return Err(format!(

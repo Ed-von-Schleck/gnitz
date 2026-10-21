@@ -139,16 +139,9 @@ pub fn german_string_region_ok(cells: &[u8], blob: &[u8]) -> bool {
 /// [`german_string_content`] reads it.
 #[inline]
 pub fn relocate_german_string_with(cell: &[u8; 16], src_blob: &[u8], place: impl FnOnce(&[u8]) -> usize) -> [u8; 16] {
-    match canonical_short_cell(cell) {
-        Some(short) => short,
-        None => relocate_long(cell, src_blob, place),
+    if let Some(short) = canonical_short_cell(cell) {
+        return short;
     }
-}
-
-/// The long arm of [`relocate_german_string_with`]. A long cell's length and
-/// prefix stay; only its offset moves.
-#[inline]
-fn relocate_long(cell: &[u8; 16], src_blob: &[u8], place: impl FnOnce(&[u8]) -> usize) -> [u8; 16] {
     let Some(span) = german_string_heap(cell, src_blob.len()) else {
         return [0; 16];
     };

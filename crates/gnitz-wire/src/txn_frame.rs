@@ -26,7 +26,7 @@ use std::ops::Range;
 /// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
 /// one reply train of bookkeeping per relation; a handful of related tables
 /// covers a realistic consistent snapshot.
-pub(crate) const SCAN_MULTI_MAX_RELATIONS: usize = 16;
+const SCAN_MULTI_MAX_RELATIONS: usize = 16;
 
 /// The basis of a `PUSH_TXN` family built from no read. No read reports it, and
 /// no commit exceeds it.
@@ -71,7 +71,6 @@ fn encode_items_under(verb: ClientVerb, arg0: u64, items: &[FrameItem<'_>]) -> V
 
 /// The sections an item of a multi-item verb carries, and how many items one
 /// frame may hold.
-#[derive(Clone, Copy)]
 pub(crate) struct ItemShape {
     /// Whether an item may carry a blob.
     pub(crate) blob: bool,

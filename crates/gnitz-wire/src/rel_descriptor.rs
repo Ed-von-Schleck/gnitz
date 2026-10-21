@@ -94,8 +94,8 @@ impl RelDescriptorBlob {
             let serial = r.bool()?;
             let indexes = (0..r.u16()?)
                 .map(|_| {
-                    let cols = PkColList::unpack(r.u64()?)
-                        .map_err(|rule| format!("index {}", rule.for_role(PkListRole::ColumnList)))?;
+                    let cols =
+                        PkColList::unpack_as(r.u64()?, PkListRole::ColumnList).map_err(|e| format!("index {e}"))?;
                     let is_unique = r.bool()?;
                     Ok(RelIndex { cols, is_unique })
                 })

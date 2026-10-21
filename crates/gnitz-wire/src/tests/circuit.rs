@@ -285,7 +285,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
 fn decode_accepts_a_circuit_at_the_node_cap() {
     let mut c = Circuit::default();
     let mut last = c.input_delta(7, crate::ReadBound::None);
-    while c.nodes().len() < MAX_CIRCUIT_NODES {
+    while c.nodes.len() < MAX_CIRCUIT_NODES {
         last = c.negate(last);
     }
     assert_eq!(Circuit::decode(&c.encode()), Ok(c.clone()));
@@ -345,7 +345,7 @@ fn push_refuses_a_malformed_operator_built_or_decoded() {
         let mut c = Circuit::default();
         assert_eq!(c.push(scan(7), &[]), Ok(0));
         assert_eq!(c.push(op.clone(), inputs).unwrap_err(), want);
-        assert_eq!(c.nodes().len(), 1, "a refused push appends nothing");
+        assert_eq!(c.nodes.len(), 1, "a refused push appends nothing");
         assert_eq!(c.inputs(0), [] as [NodeId; 0]);
         if want != arity {
             let decoded = Circuit::decode(&cell(&[(scan(7), &[]), (op, inputs)])).unwrap_err();

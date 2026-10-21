@@ -62,7 +62,7 @@ impl<'a> EmitCtx<'a> {
         meta: &'a ViewMeta,
         view: u64,
     ) -> Result<Self, String> {
-        let nodes = circuit.nodes().len();
+        let nodes = circuit.ops().len();
         let mut ctx = EmitCtx {
             circuit,
             meta,

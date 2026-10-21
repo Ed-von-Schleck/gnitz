@@ -260,15 +260,13 @@ pub fn validate_user_identifier(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Identifier cannot be empty".into());
     }
-    if name.as_bytes()[0] == b'_' {
+    if name.starts_with('_') {
         return Err(format!(
             "User identifiers cannot start with '_' (reserved for system prefix): {name}"
         ));
     }
-    for &ch in name.as_bytes() {
-        if !is_valid_ident_char(ch) {
-            return Err(format!("Identifier contains invalid characters: {name}"));
-        }
+    if !name.bytes().all(is_valid_ident_char) {
+        return Err(format!("Identifier contains invalid characters: {name}"));
     }
     Ok(())
 }
@@ -288,11 +286,7 @@ pub fn canonical_identifier(name: &str) -> Result<String, String> {
 /// `"schema.relation"`: the catalog key when both names are canonical. `.`
 /// is outside [`is_valid_ident_char`], so no pair can produce another pair's key.
 pub fn qualified_key(schema_name: &str, name: &str) -> String {
-    let mut q = String::with_capacity(schema_name.len() + 1 + name.len());
-    q.push_str(schema_name);
-    q.push('.');
-    q.push_str(name);
-    q
+    [schema_name, ".", name].concat()
 }
 
 // ---------------------------------------------------------------------------
@@ -360,10 +354,8 @@ const PK_LIST_COUNT_BITS: u32 = 4;
 const PK_LIST_COL_BITS: u32 = 7;
 const PK_LIST_COL_MAX: u32 = (1 << PK_LIST_COL_BITS) - 1;
 
-// The packed u64 lays the decoded count in bits [0..4) and each column index in
-// a 7-bit field at bit 4 + 7*i; the packed flag occupies bit 63. Guard the
-// ceilings at compile time so bumping PK_LIST_MAX_COLS past what the encoding
-// can hold fails to build instead of silently corrupting the catalog word.
+// Bumping PK_LIST_MAX_COLS past what the encoding can hold fails to build
+// instead of silently corrupting the catalog word.
 const _: () = assert!(PK_LIST_MAX_COLS >= 1);
 const _: () = assert!(
     PK_LIST_MAX_COLS < (1 << PK_LIST_COUNT_BITS),
@@ -410,13 +402,12 @@ impl Probe {
     /// The inverse of [`Self::wire`], refusing every other triple.
     pub fn from_wire(mode: WireProbeMode, arg0: u64, arg1: u64) -> Result<Self, String> {
         let refused = || format!("no probe is carried as ({mode:?}, {arg0}, {arg1:#x})");
-        let unpack = |cols| PkColList::unpack(cols).map_err(|e| e.for_role(PkListRole::ColumnList));
         match (mode, arg0, arg1) {
             (WireProbeMode::Pk, 0, 0) => Ok(Probe::Pk),
             (WireProbeMode::PkColumn, col, 0) => Ok(Probe::PkColumn(u32::try_from(col).map_err(|_| refused())?)),
             (WireProbeMode::Index, cap, cols) => {
                 let cap = NonZeroU64::new(cap).ok_or_else(refused)?;
-                Ok(Probe::Index(unpack(cols)?, cap))
+                Ok(Probe::Index(PkColList::unpack_as(cols, PkListRole::ColumnList)?, cap))
             }
             _ => Err(refused()),
         }
@@ -484,6 +475,11 @@ impl PkColList {
             *slot = ((word >> (PK_LIST_COUNT_BITS + PK_LIST_COL_BITS * i as u32)) & PK_LIST_COL_MAX as u64) as u32;
         }
         Self::checked(&cols[..n], MAX_COLUMNS)
+    }
+
+    /// [`Self::unpack`], its refusal rendered for `role`.
+    pub fn unpack_as(word: u64, role: PkListRole) -> Result<Self, String> {
+        Self::unpack(word).map_err(|rule| rule.for_role(role))
     }
 }
 

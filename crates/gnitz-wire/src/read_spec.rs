@@ -187,7 +187,7 @@ impl PkKeys {
 
     /// [`Self::from_sorted`] for keys off the wire: `Err` where they do not
     /// strictly ascend.
-    pub fn checked(stride: usize, bytes: Vec<u8>) -> Result<Self, String> {
+    fn checked(stride: usize, bytes: Vec<u8>) -> Result<Self, String> {
         match strictly_ascending(&bytes, stride) {
             true => Ok(PkKeys { stride: stride as u8, bytes }),
             false => Err("keys are not strictly ascending".to_string()),
@@ -236,7 +236,7 @@ impl PkKeys {
 }
 
 /// Whether `bytes`, read as keys of `stride`, strictly ascend.
-pub fn strictly_ascending(bytes: &[u8], stride: usize) -> bool {
+fn strictly_ascending(bytes: &[u8], stride: usize) -> bool {
     bytes.chunks_exact(stride).is_sorted_by(|a, b| a < b)
 }
 

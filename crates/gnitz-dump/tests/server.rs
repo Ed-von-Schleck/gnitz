@@ -151,7 +151,7 @@ fn scans_bounded(client: &mut GnitzClient, view: &RelName) -> bool {
         panic!("{view}: {} circuit rows", found.len())
     };
     let circuit = Circuit::decode(cells[0].as_deref().unwrap()).unwrap();
-    let mut bounds = circuit.nodes().iter().filter_map(|n| match &n.op {
+    let mut bounds = circuit.ops().filter_map(|(_, op)| match op {
         OpNode::ScanDelta { bound, .. } => Some(bound),
         _ => None,
     });

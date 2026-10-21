@@ -21,7 +21,7 @@ pub(crate) const WAL_EPOCH: u32 = 35;
 pub const WAL_FORMAT_VERSION: u32 = WAL_EPOCH ^ ((SYS_SCHEMA_DIGEST ^ (SYS_SCHEMA_DIGEST >> 32)) as u32);
 
 /// Total block size: header, fixed regions and heap.
-pub(crate) const WAL_OFF_SIZE: usize = 0;
+const WAL_OFF_SIZE: usize = 0;
 const WAL_OFF_VERSION: usize = 4;
 const WAL_OFF_ROWS: usize = 8;
 const WAL_OFF_HEAP_LEN: usize = 12;

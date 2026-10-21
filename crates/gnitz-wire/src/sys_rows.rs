@@ -321,8 +321,7 @@ impl TableTabRow<'_> {
     /// held to the rules the flags word cannot encode against that key.
     pub fn parts(&self) -> Result<(crate::PkColList, crate::TableProps), String> {
         let props = crate::TableProps::from_flags(self.flags)?;
-        let pk =
-            crate::PkColList::unpack(self.pk_col_idx).map_err(|rule| rule.for_role(crate::PkListRole::PrimaryKey))?;
+        let pk = crate::PkColList::unpack_as(self.pk_col_idx, crate::PkListRole::PrimaryKey)?;
         props.validate(pk.as_slice().len())?;
         Ok((pk, props))
     }
@@ -342,8 +341,7 @@ impl ViewTabRow<'_> {
     /// The row's `(pk, parts)` — the one decoding of its words, held to the rule
     /// that a chain segment, which the planner mints, carries no `WITH` option.
     pub fn parts(&self) -> Result<(crate::PkColList, ViewParts), String> {
-        let pk =
-            crate::PkColList::unpack(self.pk_col_idx).map_err(|rule| rule.for_role(crate::PkListRole::PrimaryKey))?;
+        let pk = crate::PkColList::unpack_as(self.pk_col_idx, crate::PkListRole::PrimaryKey)?;
         let budget = crate::ViewBudget::from_row(self.capacity_bytes, self.delta_bytes)?;
         let compress = crate::bool_word(self.compress).map_err(|e| format!("compress: {e}"))?;
         let pk_repeats = crate::bool_word(self.pk_repeats).map_err(|e| format!("pk_repeats: {e}"))?;
@@ -365,8 +363,7 @@ impl IdxTabRow<'_> {
     pub fn parts(&self) -> Result<(u64, crate::PkColList, bool), String> {
         Ok((
             self.owner_id,
-            crate::PkColList::unpack(self.source_col_idx)
-                .map_err(|rule| rule.for_role(crate::PkListRole::ColumnList))?,
+            crate::PkColList::unpack_as(self.source_col_idx, crate::PkListRole::ColumnList)?,
             crate::bool_word(self.is_unique).map_err(|e| format!("is_unique: {e}"))?,
         ))
     }

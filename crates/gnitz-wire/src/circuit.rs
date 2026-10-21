@@ -236,17 +236,16 @@ impl ReduceOutKey {
     /// An output's layout ahead of its aggregates: the key region (or the synthetic
     /// key), then each `row` column the key region does not spell.
     pub fn output_layout(self, group_cols: &[u32], row: impl IntoIterator<Item = u32>) -> Vec<ReduceOutSlot> {
-        let (lead, spelled): (Vec<ReduceOutSlot>, &[u32]) = match self {
+        let (mut slots, spelled): (Vec<ReduceOutSlot>, &[u32]) = match self {
             ReduceOutKey::SyntheticFold => (vec![ReduceOutSlot::SyntheticKey], &[]),
             ReduceOutKey::Natural => (group_cols.iter().map(|&c| ReduceOutSlot::Key(c)).collect(), group_cols),
         };
-        lead.into_iter()
-            .chain(
-                row.into_iter()
-                    .filter(|c| !spelled.contains(c))
-                    .map(ReduceOutSlot::Carried),
-            )
-            .collect()
+        slots.extend(
+            row.into_iter()
+                .filter(|c| !spelled.contains(c))
+                .map(ReduceOutSlot::Carried),
+        );
+        slots
     }
 }
 
@@ -595,19 +594,16 @@ pub type NodeId = usize;
 /// past.
 pub const MAX_CIRCUIT_NODES: usize = 16_384;
 
-const ARITY_MISMATCH: &str = "node's inputs do not match its operator's arity";
-const EARLIER_NODE: &str = "a node's input is not an earlier node";
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Node {
-    pub op: OpNode,
+struct Node {
+    op: OpNode,
     /// Slot 0 first; a slot past `op.arity()` is unused and zero.
     inputs: [NodeId; 4],
 }
 
 impl Node {
     /// The producers, in slot order.
-    pub fn inputs(&self) -> &[NodeId] {
+    fn inputs(&self) -> &[NodeId] {
         &self.inputs[..self.op.arity()]
     }
 }
@@ -621,20 +617,16 @@ pub struct Circuit {
 }
 
 impl Circuit {
-    pub fn nodes(&self) -> &[Node] {
-        &self.nodes
-    }
-
     /// Append `op` wired on `inputs`, refusing an operator that holds under no
     /// schema, an input count other than its [`OpNode::arity`], and an input that
     /// is not an earlier node.
     pub fn push(&mut self, op: OpNode, inputs: &[NodeId]) -> Result<NodeId, String> {
         op.check()?;
         if op.arity() != inputs.len() {
-            return Err(ARITY_MISMATCH.into());
+            return Err("node's inputs do not match its operator's arity".into());
         }
         if inputs.iter().any(|&p| p >= self.nodes.len()) {
-            return Err(EARLIER_NODE.into());
+            return Err("a node's input is not an earlier node".into());
         }
         let mut slots = [0; 4];
         slots[..inputs.len()].copy_from_slice(inputs);
@@ -693,7 +685,7 @@ impl Circuit {
     }
 
     /// Every operator, in topological order.
-    pub fn ops(&self) -> impl Iterator<Item = (NodeId, &OpNode)> {
+    pub fn ops(&self) -> impl ExactSizeIterator<Item = (NodeId, &OpNode)> {
         self.nodes.iter().map(|n| &n.op).enumerate()
     }
 

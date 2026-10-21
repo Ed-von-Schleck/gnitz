@@ -440,16 +440,6 @@ pub enum PkListRole {
     ColumnList,
 }
 
-impl PkListRole {
-    /// The noun every rule's message opens with.
-    fn noun(self) -> &'static str {
-        match self {
-            PkListRole::PrimaryKey => "primary key",
-            PkListRole::ColumnList => "column list",
-        }
-    }
-}
-
 impl PkRule {
     /// This rule's message, worded for the list it is about, with every column
     /// rendered positionally.
@@ -460,7 +450,10 @@ impl PkRule {
     /// [`Self::for_role`] with each column rendered as `'name'` where `name`
     /// answers its index, and as the index where it does not.
     pub fn named<'a>(&self, role: PkListRole, name: impl Fn(u32) -> Option<&'a str>) -> String {
-        let what = role.noun();
+        let what = match role {
+            PkListRole::PrimaryKey => "primary key",
+            PkListRole::ColumnList => "column list",
+        };
         let col = |c: u32| match name(c) {
             Some(n) => format!("'{n}'"),
             None => c.to_string(),

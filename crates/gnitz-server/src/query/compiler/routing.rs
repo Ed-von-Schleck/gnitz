@@ -186,8 +186,8 @@ fn source_uses(circuit: &Circuit) -> Result<BTreeMap<u64, SourceUse>, String> {
     let mut uses: BTreeMap<u64, SourceUse> = BTreeMap::new();
     // Whose scan's delta flows into each node — propagated along the way — and
     // which node IS that source's `ScatterKey` Map, read by its readers alone.
-    let mut owner: Vec<Option<u64>> = vec![None; circuit.nodes().len()];
-    let mut states_key: Vec<Option<u64>> = vec![None; circuit.nodes().len()];
+    let mut owner: Vec<Option<u64>> = vec![None; circuit.ops().len()];
+    let mut states_key: Vec<Option<u64>> = vec![None; circuit.ops().len()];
 
     for (nid, op) in circuit.ops() {
         let propagates = matches!(
@@ -254,7 +254,7 @@ fn source_uses(circuit: &Circuit) -> Result<BTreeMap<u64, SourceUse>, String> {
 /// the worker count.
 fn whole_nodes(circuit: &Circuit, whole_scan: impl Fn(u64) -> bool) -> Result<Vec<bool>, String> {
     use gnitz_wire::OpNode;
-    let n = circuit.nodes().len();
+    let n = circuit.ops().len();
     let mut whole: Vec<bool> = Vec::with_capacity(n);
     // Some node it reads, directly or transitively, owes a ground row.
     let mut grounded: Vec<bool> = Vec::with_capacity(n);

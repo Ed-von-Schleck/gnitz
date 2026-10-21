@@ -225,11 +225,6 @@ pub fn payload_str<S: RowSource>(
     }
 }
 
-/// Whether one row's payload slot `pi` is NULL.
-pub fn payload_is_null<S: RowSource>(src: &S, row: usize, pi: usize) -> bool {
-    null_word_get(src.get_null_word(row), pi)
-}
-
 #[cfg(test)]
 #[path = "tests/region.rs"]
 mod tests;
