@@ -81,7 +81,7 @@ fn block_on_is_woken_by_a_task() {
         let r = make_reactor();
         let (tx, rx) = oneshot::channel();
         r.spawn(async move {
-            YieldOnce::new().await;
+            yield_once().await;
             tx.send(9);
         });
         assert_eq!(r.block_on(rx), 9);

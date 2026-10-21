@@ -57,7 +57,7 @@ fn arm(label: &str, r: Reactor, park: impl AsyncFn() + 'static, mut publish: imp
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn reactor_pass_bench() {
-    arm("task", make_reactor(), async || YieldOnce::new().await, || ());
+    arm("task", make_reactor(), async || yield_once().await, || ());
 
     let r = make_reactor();
     let r2 = r.clone();

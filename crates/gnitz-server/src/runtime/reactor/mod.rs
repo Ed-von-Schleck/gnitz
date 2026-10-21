@@ -38,8 +38,8 @@ mod wake_queue;
 pub(crate) use conn::{PeerGone, SendBody};
 pub(crate) use uring::check_host;
 
+use futures::Route;
 pub(crate) use futures::{AckLease, TrainFrame, TrainLease, BOOT_READY_REQUEST_ID};
-use futures::{Route, TimerFuture};
 use runloop::run_queue_is_empty;
 use wake_queue::WakeQueue;
 
@@ -112,16 +112,6 @@ const fn udata(kind: u64, id: u64) -> u64 {
     (kind << KIND_SHIFT) | (id & ID_MASK)
 }
 
-#[inline]
-const fn udata_kind(u: u64) -> u64 {
-    u >> KIND_SHIFT
-}
-
-#[inline]
-const fn udata_id(u: u64) -> u64 {
-    u & ID_MASK
-}
-
 // ---------------------------------------------------------------------------
 // Reactor
 // ---------------------------------------------------------------------------
@@ -133,9 +123,7 @@ type Task = Pin<Box<dyn Future<Output = ()>>>;
 pub struct ReactorShared {
     /// First, so it drops before the memory its SQEs point into.
     ring: RefCell<IoUringRing>,
-    /// Live tasks keyed by a monotonically-increasing id. A task's future may
-    /// spawn during its own poll, so `poll_task` takes the future out and puts
-    /// it back at the same key rather than holding a borrow across the poll.
+    /// Live tasks keyed by a monotonically-increasing id.
     tasks: RefCell<FxHashMap<usize, Task>>,
     next_task_key: Cell<usize>,
     /// Every live lease's id and what its workers have answered on it.
@@ -218,11 +206,6 @@ impl Reactor {
         let id = self.next_op_id.get();
         self.next_op_id.set(id + 1);
         id
-    }
-
-    /// Future that completes once `d` has passed.
-    pub fn sleep(&self, d: Duration) -> impl Future<Output = ()> {
-        TimerFuture::new(Instant::now() + d, self.clone())
     }
 
     /// Route every unread slot of every worker's ring.

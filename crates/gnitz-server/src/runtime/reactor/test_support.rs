@@ -56,28 +56,16 @@ pub(crate) fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
     (receiver, slot)
 }
 
-/// Future that returns Pending exactly once, then Ready.
-pub(super) struct YieldOnce {
-    yielded: bool,
-}
-
-impl YieldOnce {
-    pub(super) fn new() -> Self {
-        YieldOnce { yielded: false }
-    }
-}
-
-impl Future for YieldOnce {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.yielded {
-            Poll::Ready(())
-        } else {
-            self.yielded = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
+/// Future that returns Pending exactly once, waking itself, then Ready.
+pub(super) fn yield_once() -> impl Future<Output = ()> {
+    let mut yielded = false;
+    std::future::poll_fn(move |cx| {
+        if std::mem::replace(&mut yielded, true) {
+            return Poll::Ready(());
         }
-    }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
 }
 
 /// A connection over one end of a fresh socketpair, nothing armed on it, and the

@@ -103,17 +103,12 @@ impl Reactor {
     /// re-enter the reactor and `spawn`, which can reallocate the map, so no
     /// borrow of it may span the poll.
     fn poll_task(&self, key: usize) {
-        let mut task = match self.tasks.borrow_mut().remove(&key) {
-            Some(t) => t,
-            None => return,
+        let Some(mut task) = self.tasks.borrow_mut().remove(&key) else {
+            return;
         };
         let waker = make_waker(key);
-        let mut cx = Context::from_waker(&waker);
-        match task.as_mut().poll(&mut cx) {
-            Poll::Ready(()) => {}
-            Poll::Pending => {
-                self.tasks.borrow_mut().insert(key, task);
-            }
+        if task.as_mut().poll(&mut Context::from_waker(&waker)).is_pending() {
+            self.tasks.borrow_mut().insert(key, task);
         }
     }
 
@@ -134,8 +129,8 @@ impl Reactor {
     }
 
     fn dispatch_cqe(&self, user_data: u64, res: i32) {
-        let id = udata_id(user_data);
-        match udata_kind(user_data) {
+        let id = user_data & ID_MASK;
+        match user_data >> KIND_SHIFT {
             KIND_FUTEX_WAITV => {
                 // No drain here: the pass's own drain follows CQE dispatch.
                 // The boot's `check_host` saw the opcode supported, so these are

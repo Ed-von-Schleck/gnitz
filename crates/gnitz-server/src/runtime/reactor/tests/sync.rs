@@ -37,7 +37,7 @@ fn async_rwlock_multiple_readers() {
             a.set(a.get() + 1);
             m.set(m.get().max(a.get()));
             // Yield once to let other tasks acquire too.
-            YieldOnce::new().await;
+            yield_once().await;
             a.set(a.get() - 1);
         });
     }
@@ -58,7 +58,7 @@ fn async_rwlock_new_readers_blocked_by_waiting_writer() {
     r.spawn(async move {
         let _g = l_a.read().await;
         o_a.borrow_mut().push("R1");
-        YieldOnce::new().await;
+        yield_once().await;
     });
 
     // Task B: writer — parks while A holds the read lock.
@@ -166,7 +166,7 @@ fn async_rwlock_every_task_mix_excludes_finishes_and_leaves_the_lock_idle() {
                             "mix {mix} of {len}: {inside:?} (readers, writers) inside the lock"
                         );
                         h.set(inside);
-                        YieldOnce::new().await;
+                        yield_once().await;
                         let (rd, wr) = h.get();
                         h.set((rd - me.0, wr - me.1));
                         d.set(d.get() + 1);
@@ -223,7 +223,7 @@ fn async_rwlock_write_release_admits_one_writer() {
             })
             .await;
             // Without this nothing contends and every acquire takes one poll.
-            YieldOnce::new().await;
+            yield_once().await;
         });
     }
 

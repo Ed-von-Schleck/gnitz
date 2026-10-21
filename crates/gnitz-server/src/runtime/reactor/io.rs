@@ -28,14 +28,6 @@ pub(super) fn resolve_inbound_cap() -> usize {
     gnitz_foundation::env::env_num("GNITZ_INBOUND_MEM_BYTES", default).max(INBOUND_CAP_FLOOR)
 }
 
-/// Accounted memory weight of one inbound payload buffer of `len` bytes.
-#[inline]
-fn frame_weight(len: usize) -> usize {
-    // Floor: 64 bytes per frame, so a flood of tiny frames is bounded by frame
-    // count, not only by bytes.
-    len.max(64)
-}
-
 /// A capped running total. Each [`Charge`] counts toward it until dropped.
 pub(crate) struct Budget {
     held: Cell<usize>,
@@ -167,7 +159,9 @@ impl RecvQueue {
             if len > max_frame {
                 return Err(RecvEnd::Oversize);
             }
-            let want = frame_weight(len);
+            // A 64-byte floor per frame, so a flood of tiny frames is bounded
+            // by frame count as well as bytes.
+            let want = len.max(64);
             budget.charge(want).ok_or(RecvEnd::CapBreach { want })
         })? {
             self.frames.push(RecvBuf {

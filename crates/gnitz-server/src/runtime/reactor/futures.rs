@@ -20,23 +20,10 @@ pub(crate) const BOOT_READY_REQUEST_ID: u32 = 1;
 
 /// What the workers have answered on one [`AckLease`] id.
 pub(super) struct AckRoute {
-    /// The workers that answer.
-    expected: WorkerSet,
-    answered: WorkerSet,
+    /// The workers yet to answer.
+    left: WorkerSet,
     /// The `acks` awaiter parked on this id.
     waker: Option<Waker>,
-}
-
-impl AckRoute {
-    /// Record worker `w`'s answer.
-    fn record(&mut self, w: usize) {
-        debug_assert!(
-            self.expected.contains(w),
-            "worker {w} answered a request it was not sent"
-        );
-        debug_assert!(!self.answered.contains(w), "worker {w} answered one request id twice");
-        self.answered = self.answered.with(w);
-    }
 }
 
 /// The undecoded frames of one [`TrainLease`]; each pins its ring space until
@@ -73,8 +60,12 @@ impl Reactor {
                 }
             }
             Some(Route::Acks(r)) => {
-                r.record(w);
-                if r.answered == r.expected {
+                debug_assert!(
+                    r.left.contains(w),
+                    "worker {w} answered a request it was not sent, or answered it twice"
+                );
+                r.left = r.left.without(w);
+                if r.left == WorkerSet::EMPTY {
                     if let Some(waker) = r.waker.take() {
                         waker.wake();
                     }
@@ -99,11 +90,7 @@ impl Reactor {
     /// `id`, answered by one ACK from every worker in `set`.
     fn lease_acks_on(&self, id: u32, set: WorkerSet) -> AckLease {
         let set = set.within(self.w2m.num_workers());
-        let route = AckRoute {
-            expected: set,
-            answered: WorkerSet::EMPTY,
-            waker: None,
-        };
+        let route = AckRoute { left: set, waker: None };
         self.routes.borrow_mut().insert(id, Route::Acks(route));
         AckLease { reactor: self.clone(), id, workers: set }
     }
@@ -165,7 +152,7 @@ impl AckLease {
             let Some(Route::Acks(r)) = routes.get_mut(&self.id) else {
                 unreachable!("an ACK lease's id routes to its ACKs")
             };
-            if r.answered == r.expected {
+            if r.left == WorkerSet::EMPTY {
                 return Poll::Ready(());
             }
             r.waker = Some(cx.waker().clone());
@@ -296,18 +283,19 @@ impl Drop for TrainLease {
 // ---------------------------------------------------------------------------
 
 /// A deadline. Its entry in the deadline map lives until the future drops.
-pub(super) struct TimerFuture {
+struct TimerFuture {
     deadline: Instant,
     id: u64,
     reactor: Reactor,
 }
 
-impl TimerFuture {
-    pub(super) fn new(deadline: Instant, reactor: Reactor) -> Self {
+impl Reactor {
+    /// Future that completes once `d` has passed.
+    pub fn sleep(&self, d: Duration) -> impl Future<Output = ()> {
         TimerFuture {
-            deadline,
-            id: reactor.alloc_op_id(),
-            reactor,
+            deadline: Instant::now() + d,
+            id: self.alloc_op_id(),
+            reactor: self.clone(),
         }
     }
 }

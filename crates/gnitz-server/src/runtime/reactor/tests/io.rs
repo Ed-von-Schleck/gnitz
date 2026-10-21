@@ -42,7 +42,7 @@ pub(super) fn deframe(stream: &[u8], step: usize, admitted: bool, cap: usize) ->
 fn a_queue_deframes_until_a_header_refuses() {
     let past_handshake = framed(&[0x5A; HANDSHAKE_FRAME_MAX + 1]);
     for (cap, admitted, wire, frames, end) in [
-        // frame_weight(100) = 100: two frames hold 200, the third would pass 250.
+        // a 100-byte frame weighs 100: two frames hold 200, the third would pass 250.
         (
             250,
             true,
@@ -141,7 +141,7 @@ fn inbound_cap_accounting_balances_on_consume() {
     let r = capped_reactor(15_000);
     let (conn, partner) = admitted(&r);
 
-    let wire = framed(&[0x7Eu8; 1_000]).repeat(10); // frame_weight = 1_000
+    let wire = framed(&[0x7Eu8; 1_000]).repeat(10); // each frame weighs 1_000
     for _round in 0..2 {
         (&partner).write_all(&wire).expect("write");
         r.block_on(async {
