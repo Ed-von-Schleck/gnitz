@@ -11,9 +11,10 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use crate::repr::batch::Batch;
+use crate::repr::batch::ColPtr;
 use crate::repr::merge::ColumnarSource;
-use crate::repr::merge::{ColPtr, UnifiedSource};
 use crate::repr::scatter::DecodedColumns;
+use crate::repr::scatter::UnifiedSource;
 use crate::repr::shard_reader::MappedShard;
 use crate::schema::payload_order::compare_rows;
 use crate::schema::SchemaDescriptor;
@@ -159,7 +160,7 @@ impl ColumnarSource for Run {
         decoded: &mut DecodedColumns,
     ) -> UnifiedSource<'_> {
         match self {
-            Run::Mem(b) => crate::repr::merge::mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
+            Run::Mem(b) => crate::repr::scatter::mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
             Run::Shard(s) => s.to_unified(schema, cols, window, decoded),
         }
     }

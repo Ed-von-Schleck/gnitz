@@ -1,304 +1,51 @@
-//! The borrowed batch view [`MemBatch`], the columnar source abstraction, and
-//! the merges built on them: the N-way run merge, in-batch consolidation, and
-//! the two-way batch merge.
+//! The Z-set merges: the N-way run merge over any [`ColumnarSource`], the
+//! two-way galloping batch merge, and in-batch consolidation.
 //!
 //! Operates on flat columnar buffers: pk[OPK big-endian, `pk_stride` B/row],
 //! weight[i64 LE], null_bitmap[u64 LE], payload columns, blob arena.
 //!
-//! The N-way merge is a fused k-way merge + inline consolidation: rows with the
-//! same (PK, payload) have their weights summed; rows whose net weight is zero
-//! are dropped. [`Batch::merged_consolidated`] is the two-input counterpart over
-//! the same comparator family — Z-Set `+`, fold included.
+//! Every merge fuses its walk with consolidation: rows with the same
+//! (PK, payload) have their weights summed; rows whose net weight is zero are
+//! dropped. [`merge_consolidated`] is Z-Set `+` over consolidated batches, and
+//! picks the kernel that computes it.
 
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::ops::{ControlFlow, Range};
 
-use super::batch::{Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_WEIGHT};
+use super::batch::{Batch, ColPtr, MemBatch, REG_PAYLOAD_START, REG_WEIGHT};
 use super::loser_tree::{HeapNode, LoserTree};
-use super::scatter::DecodedColumns;
+use super::scatter::{mem_batch_to_unified, DecodedColumns, UnifiedSource};
 use super::string_heap::{rebase_string_cells, row_long_bytes, BlobCache};
 use super::writer::DirectWriter;
 use crate::schema::key::{pack_pk_be, pk_width_dispatch, PkSortKey};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
-use gnitz_expr::BatchView;
 use gnitz_wire::native_key_image;
-use gnitz_wire::read_u64_le;
 use gnitz_wire::Heap;
 use gnitz_wire::RowSource;
 use gnitz_wire::NARROW_PK_MAX_BYTES;
 
-// ---------------------------------------------------------------------------
-// ColPtr / UnifiedSource: type-erased column accessors, one `(base, stride)`
-// `ColPtr` per region, for in-memory `MemBatch` and shard sources alike.
-// ---------------------------------------------------------------------------
+/// A `RowSource` that also carries the Z-set weight: a storage row the N-way
+/// merge folds.
+pub(crate) trait ColumnarSource: RowSource {
+    /// The row's signed Z-set weight / multiplicity (region[1]).
+    fn get_weight(&self, row: usize) -> i64;
 
-/// A column as `base + row * stride`. Stride 0 reads one shared element for
-/// every row. `base` itself need not lie inside the column: a decoded window is
-/// rebased so that its first row lands on its first cell.
-#[derive(Clone, Copy)]
-pub(crate) struct ColPtr {
-    pub base: *const u8,
-    pub stride: usize,
-}
+    /// A [`UnifiedSource`] over this source's regions, readable at rows in
+    /// `window`, with one payload `ColPtr` per payload column of `schema`
+    /// appended to `cols`.
+    fn to_unified(
+        &self,
+        schema: &SchemaDescriptor,
+        cols: &mut Vec<ColPtr>,
+        window: Range<usize>,
+        decoded: &mut DecodedColumns,
+    ) -> UnifiedSource<'_>;
 
-impl ColPtr {
-    /// Row `i`'s address.
-    #[inline(always)]
-    pub(crate) fn row_ptr(self, i: usize) -> *const u8 {
-        self.base.wrapping_add(i * self.stride)
-    }
-
-    /// Row `i`'s first `len` bytes.
-    ///
-    /// # Safety
-    /// Row `i` is a row of a live column this addresses, and `len` does not
-    /// exceed its element width.
-    #[inline(always)]
-    pub(crate) unsafe fn row<'a>(self, i: usize, len: usize) -> &'a [u8] {
-        std::slice::from_raw_parts(self.row_ptr(i), len)
-    }
-
-    /// Copy rows `start..` of this column of `width`-byte elements onto `dst`,
-    /// `dst.len() / width` rows.
-    ///
-    /// # Safety
-    /// Those rows are rows of a live column this addresses.
-    pub(crate) unsafe fn copy_rows(self, start: usize, width: usize, dst: &mut [u8]) {
-        if self.stride != 0 {
-            return dst.copy_from_slice(std::slice::from_raw_parts(self.row_ptr(start), dst.len()));
-        }
-        if dst.is_empty() {
-            return;
-        }
-        // One element repeated: write it once, then double the written prefix,
-        // so any element width costs O(log rows) copies.
-        dst[..width].copy_from_slice(self.row(0, width));
-        let mut filled = width;
-        while filled < dst.len() {
-            let n = filled.min(dst.len() - filled);
-            dst.copy_within(..n, filled);
-            filled += n;
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct UnifiedSource<'a> {
-    pub pk: ColPtr,
-    pub null_bmp: ColPtr,
-    /// Null bits OR'd into every null word the scatter copies out.
-    pub null_pad_mask: u64,
-    /// Index of this source's first payload `ColPtr` in the caller-owned table
-    /// the scatter reads through: column `pi` is `cols[cols_off + pi]`. Out of
-    /// line because a by-value `[ColPtr; MAX_COLUMNS]` would be zeroed per source
-    /// per call, whatever the schema's real column count.
-    pub cols_off: usize,
-    pub heap: Heap<'a>,
-    /// Where `heap` already lies in the scatter's destination heap, when carried
-    /// whole; `None` relocates each cell.
-    pub heap_at: Option<usize>,
-}
-
-/// Derive a `UnifiedSource` view over an in-memory `MemBatch`: every region
-/// becomes a `(base, stride)` `ColPtr` into the batch's `data`, and the blob
-/// arena is borrowed. Pure pointer arithmetic — no allocation,
-/// no scan. The payload `ColPtr`s are appended to `cols`, the flat table the
-/// scatter indexes through `UnifiedSource::cols_off`.
-pub(crate) fn mem_batch_to_unified<'a>(
-    mb: &MemBatch<'a>,
-    schema: &SchemaDescriptor,
-    cols: &mut Vec<ColPtr>,
-) -> UnifiedSource<'a> {
-    let data_ptr = mb.data.as_ptr();
-    let cols_off = cols.len();
-    for (pi, col) in schema.payload_columns() {
-        cols.push(ColPtr {
-            base: unsafe { data_ptr.add(mb.region_start(REG_PAYLOAD_START + pi)) },
-            stride: col.size(),
-        });
-    }
-    UnifiedSource {
-        pk: ColPtr { base: data_ptr, stride: mb.pk_stride() },
-        null_bmp: ColPtr {
-            base: unsafe { data_ptr.add(mb.region_start(REG_NULL_BMP)) },
-            stride: FIXED_REGION_BYTES,
-        },
-        null_pad_mask: 0,
-        cols_off,
-        heap: Heap::Plain(mb.blob),
-        heap_at: None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// MemBatch: a view over flat columnar buffers (one batch / sorted run)
-// ---------------------------------------------------------------------------
-
-/// A borrowed view of batch rows: an arena of `cap` rows laid out under
-/// `schema`, of which the first `count` are rows. A [`Batch`]'s own, or a WAL
-/// block's fixed bytes, which are an arena exactly as large as its rows.
-#[derive(Clone)]
-pub struct MemBatch<'a> {
-    pub(crate) data: &'a [u8],
-    /// The layout: region `r` starts at `schema.region_start(r, cap)`.
-    pub(crate) schema: &'a SchemaDescriptor,
-    pub(crate) cap: usize,
-    pub(crate) blob: &'a [u8],
-    /// Row count of the view. Read from outside through [`MemBatch::len`].
-    pub(crate) count: usize,
-    /// An upper bound on the bytes of `blob` no cell references.
-    pub(in crate::repr) dead_heap: usize,
-}
-
-impl<'a> MemBatch<'a> {
-    /// Row count of the view.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.count
-    }
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    /// Byte width of the PK region per row.
-    #[inline(always)]
-    pub fn pk_stride(&self) -> usize {
-        self.schema.pk_stride()
-    }
-
-    /// Where region `r` starts in the arena.
-    #[inline(always)]
-    pub(crate) fn region_start(&self, r: usize) -> usize {
-        self.schema.region_start(r, self.cap)
-    }
-
-    /// The `count` rows of region `r`.
-    #[inline(always)]
-    pub(crate) fn region(&self, r: usize) -> &'a [u8] {
-        let off = self.region_start(r);
-        &self.data[off..off + self.count * self.schema.region_stride(r)]
-    }
-
-    /// PK region as a contiguous slice (`count * pk_stride` bytes).
-    #[inline]
-    pub fn pk(&self) -> &'a [u8] {
-        &self.data[..self.count * self.pk_stride()]
-    }
-
-    /// Weight region as a contiguous slice (`count * 8` bytes).
-    #[inline]
-    pub(crate) fn weight(&self) -> &'a [u8] {
-        let off = self.region_start(REG_WEIGHT);
-        &self.data[off..off + self.count * 8]
-    }
-
-    /// Wrapping sum of the weights of rows `[start, end)`, over one
-    /// bounds-checked slice of the weight region.
-    #[inline]
-    pub fn sum_weights(&self, start: usize, end: usize) -> i64 {
-        self.weight()[start * 8..end * 8]
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .fold(0i64, |a, w| a.wrapping_add(i64::from_le_bytes(*w)))
-    }
-
-    /// Null bitmap region as a contiguous slice (`count * 8` bytes).
-    #[inline(always)]
-    pub(crate) fn null_bmp(&self) -> &'a [u8] {
-        let off = self.region_start(REG_NULL_BMP);
-        &self.data[off..off + self.count * 8]
-    }
-
-    /// Payload column `pi` as a contiguous slice (`count * stride` bytes).
-    /// Caller supplies the stride from the schema (see `payload_columns`).
-    #[inline(always)]
-    pub fn col_data(&self, pi: usize, stride: usize) -> &'a [u8] {
-        let off = self.region_start(REG_PAYLOAD_START + pi);
-        &self.data[off..off + self.count * stride]
-    }
-
-    #[inline(always)]
-    pub fn get_pk_bytes(&self, row: usize) -> &'a [u8] {
-        let stride = self.pk_stride();
-        let off = row * stride;
-        &self.data[off..off + stride]
-    }
-    /// The `n` bytes at `at` of row `row`'s PK.
-    #[inline(always)]
-    pub(crate) fn get_pk_range(&self, row: usize, at: usize, n: usize) -> &'a [u8] {
-        debug_assert!(at + n <= self.pk_stride());
-        let off = row * self.pk_stride() + at;
-        &self.data[off..off + n]
-    }
-    #[inline(always)]
-    pub fn get_weight(&self, row: usize) -> i64 {
-        gnitz_wire::read_i64_le(self.data, self.region_start(REG_WEIGHT) + row * 8)
-    }
-    #[inline(always)]
-    pub fn get_null_word(&self, row: usize) -> u64 {
-        read_u64_le(self.data, self.region_start(REG_NULL_BMP) + row * 8)
-    }
-    #[inline(always)]
-    pub(crate) fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &'a [u8] {
-        let off = self.region_start(REG_PAYLOAD_START + payload_col) + row * col_size;
-        &self.data[off..off + col_size]
-    }
-}
-
-/// Each method forwards via UFCS to the inherent accessor of the same name, so
-/// the call binds to the concrete read rather than recursing into the trait.
-///
-/// Every forwarder — **and every inherent accessor it UFCS-calls** — is
-/// `#[inline(always)]`; see [`BatchView`] for why the plain hint is not enough.
-/// Promoting only the forwarder would leave the terminus a real call and do half
-/// the job.
-impl<'a> RowSource for MemBatch<'a> {
-    #[inline(always)]
-    fn get_pk_bytes(&self, row: usize) -> &[u8] {
-        MemBatch::get_pk_bytes(self, row)
-    }
-    #[inline(always)]
-    fn get_null_word(&self, row: usize) -> u64 {
-        MemBatch::get_null_word(self, row)
-    }
-    #[inline(always)]
-    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
-        MemBatch::get_col_ptr(self, row, payload_col, col_size)
-    }
-    #[inline(always)]
-    fn heap(&self) -> Heap<'_> {
-        Heap::Plain(self.blob)
-    }
-    #[inline(always)]
-    fn row_count(&self) -> usize {
-        MemBatch::len(self)
-    }
-}
-
-/// The region half. The per-row accessors above are **not** derived from these
-/// (see [`BatchView`]): the derived form costs a row-count load, a second
-/// multiply and a second range check per read, which `-O0` cannot hoist.
-impl<'a> BatchView for MemBatch<'a> {
-    #[inline(always)]
-    fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8] {
-        MemBatch::col_data(self, payload_col, col_size)
-    }
-    #[inline(always)]
-    fn null_bmp(&self) -> &[u8] {
-        MemBatch::null_bmp(self)
-    }
-    #[inline(always)]
-    fn pk_region(&self) -> (&[u8], usize) {
-        (MemBatch::pk(self), self.pk_stride())
-    }
-    #[inline(always)]
-    fn blob(&self) -> &[u8] {
-        self.blob
-    }
+    /// Whether this source's rows are (PK, coarse weight) pairs with no payload —
+    /// a capacity-bounded view's skeleton shard.
+    fn is_skeleton(&self) -> bool;
 }
 
 impl<'a> ColumnarSource for MemBatch<'a> {
@@ -324,20 +71,89 @@ impl<'a> ColumnarSource for MemBatch<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Z-Set `+` over consolidated batches
+// ---------------------------------------------------------------------------
+
+/// Z-set `+` of `sources`, each consolidated, as one consolidated batch.
+///
+/// Sources that each end below the PK the next begins at share no row and hold
+/// none out of order across them: in order, they are the sum, and are
+/// concatenated. Otherwise two sources gallop against each other, and so does
+/// a dominant one — usually a previous fold's output — against the sum of the
+/// rest, so its stretches are bulk-copied; any other mix takes the N-way fold.
+pub fn merge_consolidated(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
+    let held = sources.iter().filter(|s| s.count > 0);
+    let ascending = held
+        .clone()
+        .zip(held.skip(1))
+        .all(|(a, b)| a.get_pk_bytes(a.count - 1) < b.get_pk_bytes(0));
+    let mut out = match ascending {
+        true => Batch::concat(schema, sources.iter().cloned()),
+        false => merge_interleaved(sources, schema),
+    };
+    out.certify_consolidated();
+    out
+}
+
+/// [`merge_consolidated`] of sources that interleave, so at least two hold rows.
+fn merge_interleaved(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
+    let rows: usize = sources.iter().map(|s| s.count).sum();
+    let (big, dominant) = sources
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, s)| s.count)
+        .expect("interleaved sources");
+    if dominant.count * 2 < rows {
+        return merge_rows(sources, schema);
+    }
+    // The rest keep their order, which is what lets an ascending load's runs
+    // sum by concatenation.
+    let rest: Vec<MemBatch> = sources
+        .iter()
+        .enumerate()
+        .filter(|&(i, s)| i != big && s.count > 0)
+        .map(|(_, s)| s.clone())
+        .collect();
+    let summed;
+    let other = match &rest[..] {
+        [one] => one.clone(),
+        rest => {
+            summed = merge_consolidated(rest, schema);
+            summed.as_mem_batch()
+        }
+    };
+    let srcs = [dominant.clone(), other];
+    pk_width_dispatch!(schema.pk_stride(), |K| {
+        with_payload_cmp!(schema, |p| two_way::<K, _>(&srcs, schema, p))
+    })
+}
+
+/// The N-way fold of `sources`, each sorted by (PK, payload). Out of line, so
+/// the loop compiles as it does without [`merge_consolidated`]'s tests ahead of
+/// it.
+#[inline(never)]
+fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
+    let mut rows: Vec<(u32, u32, i64)> = Vec::with_capacity(sources.iter().map(|s| s.count).sum());
+    run_merge(sources, schema, sources.iter().map(|s| 0..s.count), |src, row, w| {
+        rows.push((src as u32, row as u32, w))
+    });
+    super::scatter::materialize_carrying(sources, schema, &rows)
+}
+
+// ---------------------------------------------------------------------------
 // PosCursor: one source's position within the N-way merge
 // ---------------------------------------------------------------------------
 
-/// One source's merge position: `position` walks up to `count`. Sources are
-/// ghost-free by construction (a shard is *written* consolidated, a RAM-tier run
-/// folded on the way in) and [`drive`]'s fold drops a stray ghost anyway, so
-/// advancing is a bare `position + 1`.
+/// One source's merge position: `position` walks up to `end`, exclusive.
+/// Sources are ghost-free by construction (a shard is *written* consolidated, a
+/// RAM-tier run folded on the way in) and [`drive`]'s fold drops a stray ghost
+/// anyway, so advancing is a bare `position + 1`.
 ///
-/// `count` is the walk's upper bound, which need not be the source's row count:
-/// a read cursor's range seek clamps it to the range's exclusive end so the walk
-/// simply exhausts at the cut.
+/// `end` need not be the source's row count: a read cursor's range seek clamps
+/// it to the range's exclusive end so the walk simply exhausts at the cut.
 pub(crate) struct PosCursor {
     pub(crate) position: usize,
-    pub(crate) count: usize,
+    pub(crate) end: usize,
 }
 
 impl PosCursor {
@@ -354,12 +170,12 @@ impl PosCursor {
             rows.end < u32::MAX as usize,
             "merge source exceeds the heap node's u32 row"
         );
-        PosCursor { position: rows.start, count: rows.end }
+        PosCursor { position: rows.start, end: rows.end }
     }
 
     #[inline]
     pub(crate) fn is_valid(&self) -> bool {
-        self.position < self.count
+        self.position < self.end
     }
 
     /// Step past the current row. Callers advance only a position they have
@@ -375,8 +191,8 @@ impl PosCursor {
 // ---------------------------------------------------------------------------
 
 /// N-way (PK, payload) merge + consolidation over any sorted columnar sources —
-/// the single owner of the merge that a store's flush and shard compaction
-/// (`compact::merge_guard`) share.
+/// the kernel of shard compaction (`compact::merge_guard`) and of
+/// [`merge_consolidated`]'s N-way arm.
 ///
 /// Rows with the same (PK, payload) have their weights summed; zero-weight
 /// (PK, payload) groups are dropped. The payload-aware heap ordering puts equal
@@ -390,9 +206,9 @@ impl PosCursor {
 /// each row's key under a [`MergeOrder`], and past it by [`merge_less`]. Source
 /// `i` is walked over the `i`-th of `windows`.
 /// `emit(group_src, group_row, net_weight)` fires once per surviving (net ≠ 0)
-/// group; the caller turns `(src, row)` into its output (a `DirectWriter` row for
-/// flush, a guard-routed shard append for compaction).
-pub(crate) fn run_merge_in<S: ColumnarSource>(
+/// group; the caller turns `(src, row)` into its output (a survivor triple for
+/// the scatter, a guard-routed shard append for compaction).
+pub(crate) fn run_merge<S: ColumnarSource>(
     sources: &[S],
     schema: &SchemaDescriptor,
     windows: impl IntoIterator<Item = Range<usize>>,
@@ -402,102 +218,16 @@ pub(crate) fn run_merge_in<S: ColumnarSource>(
         return;
     }
     let mut cursors: Vec<PosCursor> = windows.into_iter().map(PosCursor::over).collect();
-    debug_assert_eq!(cursors.len(), sources.len(), "run_merge_in: one window per source");
+    debug_assert_eq!(cursors.len(), sources.len(), "run_merge: one window per source");
 
     // Dispatch the payload order, monomorphizing one branch-free copy of the
     // merge loop.
     with_payload_cmp!(schema, |p| run_merge_body(sources, &mut cursors, schema, emit, p))
 }
 
-/// [`run_merge_in`] over every row of every source.
-pub(crate) fn run_merge<S: ColumnarSource>(
-    sources: &[S],
-    schema: &SchemaDescriptor,
-    emit: impl FnMut(usize, usize, i64),
-) {
-    run_merge_in(sources, schema, sources.iter().map(|s| 0..s.row_count()), emit)
-}
-
-/// Z-set `+` of `sources`, each consolidated, as one consolidated batch.
-pub fn merge_consolidated(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
-    let held = sources.iter().filter(|s| s.count > 0);
-    let ascending = held
-        .clone()
-        .zip(held.skip(1))
-        .all(|(a, b)| a.get_pk_bytes(a.count - 1) < b.get_pk_bytes(0));
-    let mut out = match ascending {
-        // Sources that each end below the PK the next begins at share no row
-        // and hold none out of order across them: in order, they are the merge.
-        true => Batch::concat(schema, sources.iter().cloned()),
-        false => merge_rows(sources, schema),
-    };
-    out.certify_consolidated();
-    out
-}
-
-/// The N-way fold of `sources`, each sorted by (PK, payload). Out of line, so
-/// the loop compiles as it does without [`merge_consolidated`]'s test ahead of it.
-#[inline(never)]
-fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
-    let mut rows: Vec<(u32, u32, i64)> = Vec::with_capacity(sources.iter().map(|s| s.count).sum());
-    run_merge(sources, schema, |src, row, w| rows.push((src as u32, row as u32, w)));
-    super::scatter::materialize_carrying(sources, schema, &rows)
-}
-
-/// A `RowSource` that also carries the Z-set weight: a storage row the N-way
-/// merge folds.
-pub(crate) trait ColumnarSource: RowSource {
-    /// The row's signed Z-set weight / multiplicity (region[1]).
-    fn get_weight(&self, row: usize) -> i64;
-
-    /// A [`UnifiedSource`] over this source's regions, readable at rows in
-    /// `window`, with one payload `ColPtr` per payload column of `schema`
-    /// appended to `cols`.
-    fn to_unified(
-        &self,
-        schema: &SchemaDescriptor,
-        cols: &mut Vec<ColPtr>,
-        window: Range<usize>,
-        decoded: &mut DecodedColumns,
-    ) -> UnifiedSource<'_>;
-
-    /// Whether this source's rows are (PK, coarse weight) pairs with no payload —
-    /// a capacity-bounded view's skeleton shard.
-    fn is_skeleton(&self) -> bool;
-}
-
-/// A borrowed source reads as the source it borrows.
-impl<T: ColumnarSource + ?Sized> ColumnarSource for &T {
-    #[inline(always)]
-    fn get_weight(&self, row: usize) -> i64 {
-        (**self).get_weight(row)
-    }
-
-    #[inline(always)]
-    fn to_unified(
-        &self,
-        schema: &SchemaDescriptor,
-        cols: &mut Vec<ColPtr>,
-        window: Range<usize>,
-        decoded: &mut DecodedColumns,
-    ) -> UnifiedSource<'_> {
-        (**self).to_unified(schema, cols, window, decoded)
-    }
-
-    #[inline(always)]
-    fn is_skeleton(&self) -> bool {
-        (**self).is_skeleton()
-    }
-}
-
 /// The order of two players whose keys under `order` tie, which [`drive`] and
 /// the read cursor share. Generic over the source type, so each caller
 /// monomorphizes its own branch-free copy.
-///
-/// The PK bytes behind the key span, which only a wide PK has, then the
-/// `payload` order — unless `order` coarsens and one row is a skeleton row,
-/// which is tested ahead of `payload`, so a skeleton row's absent columns are
-/// never read.
 #[inline]
 pub(crate) fn merge_less<'a, S, P>(
     schema: &'a SchemaDescriptor,
@@ -510,27 +240,47 @@ where
     P: PayloadOrder + 'a,
 {
     let wide = order.has_tail(schema.pk_stride());
-    move |a, b| {
-        let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
-        let (b_src, b_row) = (b.source_idx as usize, b.row as usize);
-        let pk = match wide {
-            true => order
-                .tail(&sources[a_src], a_row)
-                .cmp(order.tail(&sources[b_src], b_row)),
-            false => Ordering::Equal,
-        };
-        match pk {
-            Ordering::Less => true,
-            Ordering::Greater => false,
-            Ordering::Equal => {
-                if order.coarsen {
-                    let (sa, sb) = (sources[a_src].is_skeleton(), sources[b_src].is_skeleton());
-                    if sa || sb {
-                        return sa && !sb;
-                    }
+    move |a, b| tie_less::<false, S, P>(schema, sources, order, wide, payload, a, b)
+}
+
+/// [`merge_less`]'s order, and under `FOLD` its group boundary: of an exemplar
+/// and a later root, the root starts a new group exactly when the exemplar
+/// orders before it — except that a skeleton row orders before no row of its
+/// PK, so under `FOLD` the whole PK group folds into it.
+///
+/// The PK bytes behind the key span, which only a wide PK has, then the
+/// `payload` order — unless `order` coarsens and one row is a skeleton row,
+/// which is tested ahead of `payload`, so a skeleton row's absent columns are
+/// never read.
+#[inline(always)]
+fn tie_less<const FOLD: bool, S: ColumnarSource, P: PayloadOrder>(
+    schema: &SchemaDescriptor,
+    sources: &[S],
+    order: MergeOrder,
+    wide: bool,
+    payload: P,
+    a: &HeapNode,
+    b: &HeapNode,
+) -> bool {
+    let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
+    let (b_src, b_row) = (b.source_idx as usize, b.row as usize);
+    let pk = match wide {
+        true => order
+            .tail(&sources[a_src], a_row)
+            .cmp(order.tail(&sources[b_src], b_row)),
+        false => Ordering::Equal,
+    };
+    match pk {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => {
+            if order.coarsen {
+                let (sa, sb) = (sources[a_src].is_skeleton(), sources[b_src].is_skeleton());
+                if sa || sb {
+                    return !FOLD && sa && !sb;
                 }
-                payload.compare(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less
             }
+            payload.compare(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less
         }
     }
 }
@@ -572,7 +322,7 @@ impl MergeOrder {
             .iter()
             .zip(cursors)
             .filter(|(_, c)| c.is_valid())
-            .flat_map(|(s, c)| [s.get_pk_bytes(c.position), s.get_pk_bytes(c.count - 1)]);
+            .flat_map(|(s, c)| [s.get_pk_bytes(c.position), s.get_pk_bytes(c.end - 1)]);
         let first = bounds.next().unwrap_or(&[]);
         let shared = |pk: &[u8]| first.iter().zip(pk).take_while(|(a, b)| a == b).count();
         let at = bounds.map(shared).min().unwrap_or(0);
@@ -588,10 +338,18 @@ impl MergeOrder {
         self.wide_at.is_some_and(|at| at + NARROW_PK_MAX_BYTES < stride)
     }
 
+    /// The tournament leaf of source `src`'s walk `c`: its current row and that
+    /// row's key, or `None` once the walk is exhausted.
+    #[inline(always)]
+    pub(crate) fn head<S: ColumnarSource>(self, sources: &[S], src: usize, c: &PosCursor) -> Option<(u32, u128)> {
+        c.is_valid()
+            .then(|| (c.position as u32, self.key(&sources[src], c.position)))
+    }
+
     /// A row's tournament key.
     #[inline(always)]
-    pub(crate) fn key<S: ColumnarSource>(self, sources: &[S], src: usize, row: usize) -> u128 {
-        let pk = sources[src].get_pk_bytes(row);
+    fn key<S: ColumnarSource>(self, source: &S, row: usize) -> u128 {
+        let pk = source.get_pk_bytes(row);
         match self.wide_at {
             None => pack_pk_be(pk),
             Some(at) => u128::from_be_bytes(*pk[at..].first_chunk().unwrap()),
@@ -610,9 +368,9 @@ impl MergeOrder {
 /// surviving (net ≠ 0) group; a `Break` returns immediately. The output PK is
 /// re-derived from `(group_src, group_row)` by the caller.
 ///
-/// Every merge in the tree runs through this — the flush/compaction kernel
-/// ([`run_merge`]) and the read cursor's advance and drain — and it builds all
-/// four closures itself, so no caller can pair a heap order with a mismatched
+/// Every N-way merge runs through this — [`run_merge`] and the read cursor's
+/// advance and drain — and it builds its order and group boundary itself, from
+/// the one [`tie_less`], so no caller can pair a heap order with a mismatched
 /// group boundary. `order` is [`merge_less`]'s and means the same here.
 ///
 /// `#[inline(always)]`: each caller's `emit` returns a constant `ControlFlow`, so
@@ -630,38 +388,25 @@ pub(crate) fn drive<S, P>(
     S: ColumnarSource,
     P: PayloadOrder,
 {
-    // `less` and `same_group` read `(source_idx, row)` out of the heap node and
-    // never touch `cursors`, so they coexist with the `&mut cursors` `step!` holds.
+    // `less` reads `(source_idx, row)` out of the heap node and never touches
+    // `cursors`, so it coexists with the `&mut cursors` `step!` holds.
     let less = merge_less(schema, sources, order, payload);
     let wide = order.has_tail(schema.pk_stride());
-    // Of two rows whose keys tie, as `less` is.
-    let same_group = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-        if wide && order.tail(&sources[a_src], a_row) != order.tail(&sources[b_src], b_row) {
-            return false;
-        }
-        if order.coarsen && (sources[a_src].is_skeleton() || sources[b_src].is_skeleton()) {
-            return true;
-        }
-        payload.compare(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
-    };
     // Sources are ghost-free, so the advance is a bare `position + 1`.
     macro_rules! step {
         ($src:expr) => {{
             let c = &mut cursors[$src];
             c.advance();
-            let next = c
-                .is_valid()
-                .then(|| (c.position as u32, order.key(sources, $src, c.position)));
-            tree.step_top(next, &less);
+            tree.step_top(order.head(sources, $src, c), &less);
         }};
     }
 
-    while let Some(top) = tree.peek() {
-        let (group_src, group_row, group_key) = (top.source_idx as usize, top.row as usize, top.key());
+    while let Some(group) = tree.peek() {
+        let (group_src, group_row, group_key) = (group.source_idx as usize, group.row as usize, group.key());
 
         // Open the group: take the root's weight and step past it. The first row
-        // is the exemplar, so `same_group` would be tautologically true — and its
-        // payload term walks every column.
+        // is the exemplar, so the boundary test would be tautologically false —
+        // and its payload term walks every column.
         let mut net_weight: i64 = sources[group_src].get_weight(group_row);
         step!(group_src);
 
@@ -669,7 +414,7 @@ pub(crate) fn drive<S, P>(
         // boundary, otherwise accumulates weight and steps again.
         while let Some(top) = tree.peek() {
             let (cur_src, cur_row) = (top.source_idx as usize, top.row as usize);
-            if top.key() != group_key || !same_group(group_src, group_row, cur_src, cur_row) {
+            if top.key() != group_key || tie_less::<true, S, P>(schema, sources, order, wide, payload, &group, &top) {
                 break;
             }
             net_weight += sources[cur_src].get_weight(cur_row);
@@ -702,11 +447,7 @@ fn run_merge_body<S, P>(
     let order = MergeOrder::past_shared_prefix(sources, cursors, schema.pk_stride());
     let mut tree = LoserTree::build(
         cursors.len(),
-        |i| {
-            cursors[i]
-                .is_valid()
-                .then(|| (cursors[i].position as u32, order.key(sources, i, cursors[i].position)))
-        },
+        |i| order.head(sources, i, &cursors[i]),
         merge_less(schema, sources, order, payload),
     );
     drive(&mut tree, schema, sources, order, cursors, payload, |src, row, w| {
@@ -716,29 +457,8 @@ fn run_merge_body<S, P>(
 }
 
 // ---------------------------------------------------------------------------
-// The two-way merge: Z-Set `+` over two consolidated batches
+// The two-way merge
 // ---------------------------------------------------------------------------
-
-impl Batch {
-    /// Z-Set `+` of two consolidated batches: both sides' rows in (PK, payload)
-    /// order, equal elements' weights summed into one row, net-zero elements
-    /// dropped.
-    ///
-    /// Only the shared-PK arm folds: a galloped stretch stops at the other
-    /// side's head PK, so nothing in it can share a (PK, payload) across sides,
-    /// and a consolidated input repeats none internally.
-    pub fn merged_consolidated(&self, other: &Batch, schema: &SchemaDescriptor) -> Batch {
-        debug_assert!(
-            self.stands_consolidated() && other.stands_consolidated(),
-            "merged_consolidated: both inputs must be consolidated",
-        );
-        let mut out = pk_width_dispatch!(schema.pk_stride(), |K| {
-            with_payload_cmp!(schema, |p| merged_consolidated_body::<K, _>(self, other, schema, p))
-        });
-        out.certify_consolidated();
-        out
-    }
-}
 
 /// One batch's PK region, read as keys of the type `K` matching its stride.
 struct Keys<'a, K> {
@@ -749,26 +469,19 @@ struct Keys<'a, K> {
 }
 
 impl<'a, K: PkSortKey<'a>> Keys<'a, K> {
-    fn of(batch: &'a Batch) -> Self {
+    fn of(batch: &MemBatch<'a>) -> Self {
         Keys {
-            pk: batch.pk_data(),
-            stride: batch.schema().pk_stride(),
+            pk: batch.pk(),
+            stride: batch.pk_stride(),
             count: batch.count,
             key: PhantomData,
         }
     }
 
-    #[inline(always)]
-    fn at(&self, row: usize) -> K {
-        assert!(row < self.count);
-        // SAFETY: `row` is one of the `count` rows `pk` holds.
-        unsafe { self.at_unchecked(row) }
-    }
-
     /// # Safety
     /// `row < self.count`.
     #[inline(always)]
-    unsafe fn at_unchecked(&self, row: usize) -> K {
+    unsafe fn at(&self, row: usize) -> K {
         debug_assert!(row < self.count);
         K::from_opk(unsafe { self.pk.get_unchecked(row * self.stride..(row + 1) * self.stride) })
     }
@@ -779,7 +492,7 @@ impl<'a, K: PkSortKey<'a>> Keys<'a, K> {
     fn group_end(&self, row: usize, key: K) -> usize {
         let mut end = row + 1;
         // SAFETY: `end < count`.
-        while end < self.count && unsafe { self.at_unchecked(end) } == key {
+        while end < self.count && unsafe { self.at(end) } == key {
             end += 1;
         }
         end
@@ -790,13 +503,13 @@ impl<'a, K: PkSortKey<'a>> Keys<'a, K> {
     #[inline(always)]
     fn skip_below(&self, row: usize, key: K) -> usize {
         // SAFETY: the gallop probes rows below `count` only.
-        super::seek::gallop_from(self.count, row, |i| unsafe { self.at_unchecked(i) } < key)
+        super::seek::gallop_from(self.count, row, |i| unsafe { self.at(i) } < key)
     }
 }
 
-/// One region of a two-way merge: each side's cells and the output's.
+/// One region of a two-way merge: each side's first cell and the output's cells.
 struct MergeRegion<'w> {
-    src: [&'w [u8]; 2],
+    src: [*const u8; 2],
     dst: &'w mut [u8],
     stride: usize,
 }
@@ -824,9 +537,21 @@ struct MergeSink<'w> {
 impl<'w> MergeSink<'w> {
     fn new(srcs: &'w [MemBatch<'w>; 2], heap_at: [Option<usize>; 2], writer: &'w mut DirectWriter<'_>) -> Self {
         let (schema, room) = (writer.schema, writer.rows());
+        let last = schema.num_regions() - 1;
+        for src in srcs {
+            debug_assert!(src.schema.same_regions(schema), "a merge side of another layout");
+            assert!(
+                src.count <= src.cap
+                    && src.region_start(last) + src.count * schema.region_stride(last) <= src.data.len()
+            );
+        }
         let (regions, blob, cache) = writer.split_mut();
         let regions = regions.enumerate().map(|(r, dst)| MergeRegion {
-            src: [srcs[0].region(r), srcs[1].region(r)],
+            // SAFETY: region `r` starts inside each side's arena: the regions
+            // lie back to back, and the assert above bounds the last.
+            src: srcs
+                .each_ref()
+                .map(|s| unsafe { s.data.as_ptr().add(s.region_start(r)) }),
             dst,
             stride: schema.region_stride(r),
         });
@@ -844,33 +569,29 @@ impl<'w> MergeSink<'w> {
     }
 
     /// Rows `[start, end)` of `side` follow; possibly none.
+    ///
+    /// # Safety
+    /// `start <= end <= ` that side's row count, and the output has room for
+    /// `end - start` more rows.
     #[inline(always)]
-    fn push(&mut self, side: usize, start: usize, end: usize) {
+    unsafe fn push(&mut self, side: usize, start: usize, end: usize) {
         if start == end {
             return;
         }
         let at = self.rows;
-        assert!(start < end && end <= self.srcs[side].count && at + (end - start) <= self.room);
+        debug_assert!(start < end && end <= self.srcs[side].count && at + (end - start) <= self.room);
         let n = end - start;
-        // SAFETY (both arms): the stretch lies inside its side's rows and the
-        // rows the output has room for, and every region holds that many cells.
-        if n == 1 {
-            for region in &mut self.regions {
-                let w = region.stride;
-                unsafe {
-                    copy_cell(
-                        region.src[side].as_ptr().add(start * w),
-                        region.dst.as_mut_ptr().add(at * w),
-                        w,
-                    )
-                };
-            }
-        } else {
-            for region in &mut self.regions {
-                let w = region.stride;
-                let src = unsafe { region.src[side].as_ptr().add(start * w) };
-                unsafe { std::ptr::copy_nonoverlapping(src, region.dst.as_mut_ptr().add(at * w), n * w) };
-            }
+        for region in &mut self.regions {
+            let w = region.stride;
+            // SAFETY: the stretch lies inside its side's rows and the rows the
+            // output has room for, and every region holds that many cells.
+            unsafe {
+                copy_cell(
+                    region.src[side].add(start * w),
+                    region.dst.as_mut_ptr().add(at * w),
+                    n * w,
+                )
+            };
         }
         for pi in gnitz_wire::BitIter(self.string_slots) {
             let cells = &mut self.regions[REG_PAYLOAD_START + pi].dst[at * 16..(at + n) * 16];
@@ -882,13 +603,16 @@ impl<'w> MergeSink<'w> {
 
     /// Row `ia` of side 0 and row `jb` of side 1 are one element of weight
     /// `weight`: side 0's row follows at that weight, unless it is zero.
+    ///
+    /// # Safety
+    /// As [`Self::push`]'s, for row `ia` of side 0.
     #[inline(always)]
-    fn push_folded(&mut self, ia: usize, jb: usize, weight: i64) {
+    unsafe fn push_folded(&mut self, ia: usize, jb: usize, weight: i64) {
         self.leave_out(1, jb);
         if weight == 0 {
             return self.leave_out(0, ia);
         }
-        self.push(0, ia, ia + 1);
+        unsafe { self.push(0, ia, ia + 1) };
         let weights = self.regions[REG_WEIGHT].dst.as_chunks_mut::<8>().0;
         weights[self.rows - 1] = weight.to_le_bytes();
     }
@@ -902,8 +626,8 @@ impl<'w> MergeSink<'w> {
     }
 }
 
-/// Copy one `width`-byte cell. At a width columns commonly have it is a load
-/// and a store, where a copy of a runtime length is a `memcpy` call.
+/// Copy `width` bytes. At a width a cell commonly has it is a load and a store,
+/// where a copy of a runtime length is a `memcpy` call.
 ///
 /// # Safety
 /// `src` and `dst` each address `width` bytes, and do not overlap.
@@ -920,75 +644,85 @@ unsafe fn copy_cell(src: *const u8, dst: *mut u8, width: usize) {
     }
 }
 
-/// Out of line, so each (key, payload order) pair compiles as its own function.
+/// The two-way merge of `srcs`, each consolidated: both sides' rows in
+/// (PK, payload) order, equal elements' weights summed into one row, net-zero
+/// elements dropped. Out of line, so each (key, payload order) pair compiles as
+/// its own function.
+///
+/// Only the shared-PK arm folds: a galloped stretch stops at the other side's
+/// head PK, so nothing in it can share a (PK, payload) across sides, and a
+/// consolidated input repeats none internally.
 #[inline(never)]
-fn merged_consolidated_body<'a, K, P>(a: &'a Batch, b: &'a Batch, schema: &SchemaDescriptor, payload: P) -> Batch
+fn two_way<'a, K, P>(srcs: &[MemBatch<'a>; 2], schema: &SchemaDescriptor, payload: P) -> Batch
 where
     K: PkSortKey<'a>,
     P: PayloadOrder,
 {
+    let [a, b] = srcs;
     let (n_a, n_b) = (a.count, b.count);
-    let srcs = [a.as_mem_batch(), b.as_mem_batch()];
     let (keys_a, keys_b) = (Keys::<K>::of(a), Keys::<K>::of(b));
     let mut out = Batch::with_capacity(schema, n_a + n_b);
     let mut session = out.append_session(n_a + n_b);
-    let heap_at = [
-        session.carry(&srcs[0], &[(0, n_a)]),
-        session.carry(&srcs[1], &[(0, n_b)]),
-    ];
+    let heap_at = [session.carry(a, &[(0, n_a)]), session.carry(b, &[(0, n_b)])];
     let dead = session.write_at_most(n_a + n_b, |writer| {
-        let mut sink = MergeSink::new(&srcs, heap_at, writer);
+        let mut sink = MergeSink::new(srcs, heap_at, writer);
         let (mut ia, mut jb) = (0usize, 0usize);
-        while ia < n_a && jb < n_b {
-            let (ka, kb) = (keys_a.at(ia), keys_b.at(jb));
-            match ka.cmp(&kb) {
-                // A single-source stretch: one galloping skip, one copy.
-                Ordering::Less => {
-                    let start = ia;
-                    ia = keys_a.skip_below(ia, kb);
-                    sink.push(0, start, ia);
-                }
-                Ordering::Greater => {
-                    let start = jb;
-                    jb = keys_b.skip_below(jb, ka);
-                    sink.push(1, start, jb);
-                }
-                // A shared PK: both equal-PK groups, interleaved by payload.
-                // The only arm that folds, and the only one that reads row by
-                // row.
-                Ordering::Equal => {
-                    let (ga, gb) = (keys_a.group_end(ia, ka), keys_b.group_end(jb, ka));
-                    while ia < ga && jb < gb {
-                        match payload.compare(schema, &srcs[0], ia, &srcs[1], jb) {
-                            Ordering::Less => {
-                                sink.push(0, ia, ia + 1);
-                                ia += 1;
-                            }
-                            Ordering::Greater => {
-                                sink.push(1, jb, jb + 1);
-                                jb += 1;
-                            }
-                            // One element carried by both sides: `+` sums its
-                            // two weights into one row, and a zero sum drops it
-                            // (§2), which is why this merge can emit fewer rows
-                            // than it read.
-                            Ordering::Equal => {
-                                sink.push_folded(ia, jb, a.get_weight(ia) + b.get_weight(jb));
-                                ia += 1;
-                                jb += 1;
+        // SAFETY: `ia` and `jb` only grow, each stays within its side's rows
+        // (a skip and a group end stop at the side's count), and every row is
+        // pushed at most once, so at most `n_a + n_b` rows — the output's
+        // room — are written; the keys are read at `ia < n_a`, `jb < n_b`.
+        unsafe {
+            while ia < n_a && jb < n_b {
+                let (ka, kb) = (keys_a.at(ia), keys_b.at(jb));
+                match ka.cmp(&kb) {
+                    // A single-source stretch: one galloping skip, one copy.
+                    Ordering::Less => {
+                        let start = ia;
+                        ia = keys_a.skip_below(ia, kb);
+                        sink.push(0, start, ia);
+                    }
+                    Ordering::Greater => {
+                        let start = jb;
+                        jb = keys_b.skip_below(jb, ka);
+                        sink.push(1, start, jb);
+                    }
+                    // A shared PK: both equal-PK groups, interleaved by payload.
+                    // The only arm that folds, and the only one that reads row by
+                    // row.
+                    Ordering::Equal => {
+                        let (ga, gb) = (keys_a.group_end(ia, ka), keys_b.group_end(jb, ka));
+                        while ia < ga && jb < gb {
+                            match payload.compare(schema, a, ia, b, jb) {
+                                Ordering::Less => {
+                                    sink.push(0, ia, ia + 1);
+                                    ia += 1;
+                                }
+                                Ordering::Greater => {
+                                    sink.push(1, jb, jb + 1);
+                                    jb += 1;
+                                }
+                                // One element carried by both sides: `+` sums its
+                                // two weights into one row, and a zero sum drops it
+                                // (§2), which is why this merge can emit fewer rows
+                                // than it read.
+                                Ordering::Equal => {
+                                    sink.push_folded(ia, jb, a.get_weight(ia) + b.get_weight(jb));
+                                    ia += 1;
+                                    jb += 1;
+                                }
                             }
                         }
+                        // One group ended, and nothing left folds against the
+                        // other's remainder.
+                        sink.push(0, ia, ga);
+                        sink.push(1, jb, gb);
+                        (ia, jb) = (ga, gb);
                     }
-                    // One group ended, and nothing left folds against the
-                    // other's remainder.
-                    sink.push(0, ia, ga);
-                    sink.push(1, jb, gb);
-                    (ia, jb) = (ga, gb);
                 }
             }
+            sink.push(0, ia, n_a);
+            sink.push(1, jb, n_b);
         }
-        sink.push(0, ia, n_a);
-        sink.push(1, jb, n_b);
         (sink.rows, sink.dead)
     });
     out.charge_dead(dead);
@@ -1004,13 +738,11 @@ where
 /// group to `out` — [`run_merge`]'s single-source counterpart, in the shape
 /// [`super::scatter::scatter_unified_sources`] materializes and the caller sizes
 /// its arena from.
-pub(crate) fn consolidate_groups(batch: &MemBatch, schema: &SchemaDescriptor, out: &mut Vec<(u32, u32, i64)>) {
-    let n = batch.count;
-    if n == 0 {
+pub(crate) fn consolidate_groups(batch: &MemBatch, out: &mut Vec<(u32, u32, i64)>) {
+    if batch.count == 0 {
         return;
     }
-
-    with_payload_cmp!(schema, |p| consolidate_groups_inner(n, batch, schema, out, p))
+    with_payload_cmp!(batch.schema, |p| consolidate_groups_inner(batch, out, p))
 }
 
 /// Whether `batch`'s rows already stand as [`consolidate_groups`] would leave
@@ -1111,14 +843,8 @@ impl ArgEntry for PackedEntry {
 /// a batch whose PKs already stand in order sorts in one pass — and each run of
 /// a PK sorted by its payload as [`fold_runs`] folds it.
 #[inline]
-fn consolidate_groups_inner<P: PayloadOrder>(
-    n: usize,
-    batch: &MemBatch,
-    schema: &SchemaDescriptor,
-    out: &mut Vec<(u32, u32, i64)>,
-    payload: P,
-) {
-    let stride = batch.pk_stride();
+fn consolidate_groups_inner<P: PayloadOrder>(batch: &MemBatch, out: &mut Vec<(u32, u32, i64)>, payload: P) {
+    let (n, schema, stride) = (batch.count, batch.schema, batch.pk_stride());
     if (17..=PACKED_MAX_STRIDE).contains(&stride) {
         let mut entries: Vec<PackedEntry> = (0..n as u32)
             .map(|i| PackedEntry::new(batch.get_pk_bytes(i as usize), i))

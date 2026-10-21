@@ -50,14 +50,14 @@ mod spill;
 mod string_heap;
 mod writer;
 
-pub use batch::Batch;
+pub use batch::{Batch, MemBatch};
 pub use batch_builder::BatchBuilder;
 pub use batch_pool::PooledBuf;
 pub use batch_wire::WireRows;
 pub use codebook::Codebook;
 pub use compact::{guard_slot, merge_guard, GuardRun};
 pub use error::StorageError;
-pub use merge::{merge_consolidated, MemBatch};
+pub use merge::merge_consolidated;
 pub use read_cursor::{
     empty_cursor, from_runs, from_runs_at, from_runs_in_band, BoundedIndexCursor, PkSetGather, ReadCursor, SourceCursor,
 };

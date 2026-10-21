@@ -5,9 +5,9 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 
+use super::batch::MemBatch;
 use super::batch_pool::{is_tight, tls_pool};
 use super::codebook::Codebook;
-use super::merge::MemBatch;
 use gnitz_wire::TypeCode;
 use gnitz_wire::{Heap, HeapValue, RowSource};
 use rustc_hash::FxHashMap;

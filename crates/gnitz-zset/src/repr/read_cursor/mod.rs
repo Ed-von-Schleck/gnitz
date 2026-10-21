@@ -6,8 +6,8 @@
 use std::cmp::Ordering;
 use std::ops::{ControlFlow, Range};
 
+use crate::repr::batch::MemBatch;
 use crate::repr::loser_tree::{HeapNode, LoserTree};
-use crate::repr::merge::MemBatch;
 use crate::repr::merge::{self, ColumnarSource, MergeOrder, PosCursor};
 use crate::repr::seek::gallop_by;
 use crate::repr::shard_reader::MappedShard;
@@ -160,11 +160,7 @@ impl ReadCursor {
             // `&sources` / `&states` are disjoint field borrows.
             let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
             tree.rebuild(
-                |i| {
-                    states[i]
-                        .is_valid()
-                        .then(|| (states[i].position as u32, order.key(sources, i, states[i].position)))
-                },
+                |i| order.head(sources, i, &states[i]),
                 merge::merge_less(schema, sources, *order, payload),
             );
         }
@@ -180,7 +176,7 @@ impl ReadCursor {
             state.position = src.find_lower_bound_bytes(start);
             if let Some(end) = end {
                 // `end` lands at or after `start`'s landing.
-                state.count = state.count.min(src.advance_to(end, state.position));
+                state.end = state.end.min(src.advance_to(end, state.position));
             }
         }
         self.rebuild_and_advance();
@@ -293,13 +289,7 @@ impl ReadCursor {
                 break;
             }
             states[src].position = gallop(&sources[src], states[src].position);
-            let next = states[src].is_valid().then(|| {
-                (
-                    states[src].position as u32,
-                    order.key(sources, src, states[src].position),
-                )
-            });
-            heap.step_top(next, less);
+            heap.step_top(order.head(sources, src, &states[src]), less);
         }
     }
 
@@ -655,7 +645,7 @@ impl ReadCursor {
     /// it) PLUS the row the cursor sits on: a drive CONSUMES the group it emits,
     /// so `position` is already past a row still to be visited.
     pub fn estimated_length(&self) -> usize {
-        let ahead: usize = self.states.iter().map(|s| s.count.saturating_sub(s.position)).sum();
+        let ahead: usize = self.states.iter().map(|s| s.end.saturating_sub(s.position)).sum();
         ahead + usize::from(self.valid)
     }
 }

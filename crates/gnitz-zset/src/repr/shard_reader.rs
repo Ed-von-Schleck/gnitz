@@ -7,13 +7,15 @@ use std::cell::OnceCell;
 use std::ops::Range;
 use std::rc::Rc;
 
+use super::batch::ColPtr;
 use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::batch_pool::PooledBuf;
 use super::encoding::*;
 use super::layout::*;
-use super::merge::{ColPtr, ColumnarSource, UnifiedSource};
+use super::merge::ColumnarSource;
 use super::mmap::Mmap;
 use super::scatter::DecodedColumns;
+use super::scatter::UnifiedSource;
 use super::shard_filter;
 use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
 use crate::repr::error::StorageError;

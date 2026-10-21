@@ -120,9 +120,12 @@ fn distinct_compaction_bench() {
             let (rows, merge) = instructions.measure(|| {
                 let windows: Vec<_> = inputs.iter().map(|s| s.window(0..s.row_count())).collect();
                 let mut rows = 0u64;
-                run_merge(&windows, &schema, |src, row, w| {
-                    rows += black_box((src, row, w)).2 as u64
-                });
+                run_merge(
+                    &windows,
+                    &schema,
+                    windows.iter().map(|w| 0..w.row_count()),
+                    |src, row, w| rows += black_box((src, row, w)).2 as u64,
+                );
                 rows
             });
             assert_eq!(rows, TOTAL);

@@ -8,7 +8,7 @@ use std::borrow::Cow;
 
 use gnitz_expr::RowFilter;
 
-use crate::repr::Batch;
+use crate::repr::{merge_consolidated, Batch};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
 
 // ---------------------------------------------------------------------------
@@ -94,7 +94,7 @@ pub fn op_union(batch_a: Cow<'_, Batch>, batch_b: Cow<'_, Batch>, out_schema: &S
         return out;
     }
     if batch_a.stands_consolidated() && batch_b.stands_consolidated() {
-        return batch_a.merged_consolidated(&batch_b, out_schema);
+        return merge_consolidated(&[batch_a.as_mem_batch(), batch_b.as_mem_batch()], out_schema);
     }
     match batch_a {
         // Both operands sized once, where a clone would be grown by the append.

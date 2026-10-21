@@ -92,7 +92,7 @@ impl RunSet {
             {
                 break;
             }
-            let merged = older.merged_consolidated(newer, schema);
+            let merged = merge_consolidated(&[older.as_mem_batch(), newer.as_mem_batch()], schema);
             self.replace_from(self.runs.len() - 2, merged);
         }
         if self.runs.len() >= FOLD_THRESHOLD {
@@ -180,21 +180,8 @@ impl RunSet {
         if self.runs.len() <= 1 {
             return;
         }
-        let input_rows = self.row_count();
-        // A dominant run — usually the previous fold's output — is galloped
-        // against the fold of the rest, so its stretches are bulk-copied.
-        let big = (0..self.runs.len()).max_by_key(|&i| self.runs[i].len()).unwrap();
-        let merged = if self.runs[big].len() * 2 >= input_rows {
-            // `remove`, not `swap_remove`: the rest stay in push order, which
-            // is what lets an ascending load's runs fold by concatenation.
-            let dominant = self.runs.remove(big);
-            match &self.runs[..] {
-                [one] => dominant.merged_consolidated(one, schema),
-                rest => dominant.merged_consolidated(&consolidate_all(rest, schema), schema),
-            }
-        } else {
-            consolidate_all(&self.runs, schema)
-        };
+        let views: Vec<MemBatch> = self.runs.iter().map(|r| r.as_mem_batch()).collect();
+        let merged = merge_consolidated(&views, schema);
         self.replace_from(0, merged);
     }
 
@@ -268,12 +255,6 @@ impl RunSet {
             bloom
         })
     }
-}
-
-/// `runs` folded N-way into one consolidated batch.
-fn consolidate_all(runs: &[Rc<Batch>], schema: &SchemaDescriptor) -> Batch {
-    let views: Vec<MemBatch> = runs.iter().map(|r| r.as_mem_batch()).collect();
-    merge_consolidated(&views, schema)
 }
 
 /// Whether `older` holds most sampled retractions of `newer`: the first

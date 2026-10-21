@@ -6,7 +6,7 @@
 
 use std::ops::Range;
 
-use super::merge::ColPtr;
+use super::batch::ColPtr;
 use crate::schema::key::{pk_width_dispatch, PkSortKey};
 use gnitz_wire::RowSource;
 

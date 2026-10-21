@@ -1,6 +1,6 @@
 use super::tests::{key_region, pack};
 use super::*;
-use crate::repr::merge::ColPtr;
+use crate::repr::batch::ColPtr;
 use crate::repr::seek::seek_lower_bound;
 use crate::schema::TypeCode;
 use crate::test_support::Rng;

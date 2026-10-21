@@ -4,8 +4,8 @@
 use std::ops::Range;
 
 use super::batch::Batch;
+use super::batch::MemBatch;
 use super::batch_pool::PooledBuf;
-use super::merge::MemBatch;
 use super::scatter::{copy_ranges, scatter_copy};
 use super::string_heap::{blob_span_key, prorated_blob_cap, walk_heap_spans, BlobCache};
 use super::writer::DirectWriter;

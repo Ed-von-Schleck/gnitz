@@ -3,6 +3,7 @@ use super::super::encoding::Encoding;
 use super::super::layout::{spans_of, ShardHeader};
 use super::super::shard_file::ShardWriteOpts;
 use super::*;
+use crate::repr::merge_consolidated;
 use crate::test_support::{
     arb_fold_case, assert_folds, fold_batch, make_batch, make_schema_u64_i64, map_shard, FoldRow,
 };
@@ -217,7 +218,8 @@ fn a_coded_merge_keeps_the_codes_of_its_own_table() {
     assert_ne!(other.table().digest(), book.table().digest(), "premise: two tables");
     // Retractions of `own`'s first rows under its table, of `theirs`' under
     // none, and rows of no table yet.
-    let late = rows(1..=50, -1).merged_consolidated(&rows(601..=900, 1), &schema);
+    let (gone, fresh) = (rows(1..=50, -1), rows(601..=900, 1));
+    let late = merge_consolidated(&[gone.as_mem_batch(), fresh.as_mem_batch()], &schema);
     let retracted = rows(301..=320, -1);
     let shards = [
         map_coded_shard(&dir.path().join("own.db"), &own, &book),

@@ -1,5 +1,5 @@
 use super::*;
-use crate::repr::BatchBuilder;
+use crate::repr::{merge_consolidated, BatchBuilder};
 use crate::schema::{SchemaDescriptor, TypeCode};
 use crate::test_support::{
     make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch, map_shard, read_strings,
@@ -126,7 +126,11 @@ fn a_shard_drops_its_runs_dead_heap() {
         let mut rows = vec![(1, 1, &x[..])];
         rows.extend((2..2 + copies).map(|pk| (pk, 1, &y[..])));
         let retract = make_string_batch(&[(1, -1, &x)]);
-        let run = make_string_batch(&rows).merged_consolidated(&retract, &make_schema_pk_u64_payload_string());
+        let run = make_string_batch(&rows);
+        let run = merge_consolidated(
+            &[run.as_mem_batch(), retract.as_mem_batch()],
+            &make_schema_pk_u64_payload_string(),
+        );
         assert!(run.dead_heap > 0, "premise: the fold left dead bytes");
         assert_eq!(written_strings(&run), (y.len(), Encoding::Constant), "{copies} copies");
     }

@@ -43,7 +43,9 @@ proptest::proptest! {
         let consolidated_mem: Vec<MemBatch> = consolidated.iter().map(Batch::as_mem_batch).collect();
         let pairwise = consolidated
             .iter()
-            .fold(Batch::empty_with_schema(&s), |acc, b| acc.merged_consolidated(b, &s));
+            .fold(Batch::empty_with_schema(&s), |acc, b| {
+                merge_consolidated(&[acc.as_mem_batch(), b.as_mem_batch()], &s)
+            });
         for (path, got) in [
             ("consolidate", Batch::concat(&s, mem.iter().cloned()).into_consolidated()),
             ("N-way", merge_rows(&mem, &s)),
@@ -62,7 +64,7 @@ proptest::proptest! {
 /// of the rows the fold drops: both rows of a cancelled pair, one side's copy
 /// of a summed row, nothing for a disjoint merge.
 #[test]
-fn merged_consolidated_charges_exactly_the_dropped_rows() {
+fn a_two_way_sum_charges_exactly_the_dropped_rows() {
     let schema = make_schema_pk_u64_payload_string();
     let (x, y) = ([b'x'; 20], [b'y'; 30]);
     let a = make_string_batch(&[(1, 1, &x), (2, 1, &y)]);
@@ -72,7 +74,7 @@ fn merged_consolidated_charges_exactly_the_dropped_rows() {
         (&[(3, 1, &x[..])], 0),
     ] {
         let b = make_string_batch(b_rows);
-        let out = a.merged_consolidated(&b, &schema);
+        let out = merge_consolidated(&[a.as_mem_batch(), b.as_mem_batch()], &schema);
         assert_folds(&[a.clone(), b.clone()], &out, "merge");
         out.debug_verify_dead_heap();
         assert_eq!(
@@ -98,7 +100,7 @@ fn a_carried_merge_reads_back_every_string() {
             make_string_batch(&a_rows).padded(pad_a),
             make_string_batch(&b_rows).padded(pad_b),
         );
-        let out = a.merged_consolidated(&b, &schema);
+        let out = merge_consolidated(&[a.as_mem_batch(), b.as_mem_batch()], &schema);
         assert_folds(&[a, b], &out, &format!("padding ({pad_a}, {pad_b})"));
         out.debug_verify_dead_heap();
         assert!(

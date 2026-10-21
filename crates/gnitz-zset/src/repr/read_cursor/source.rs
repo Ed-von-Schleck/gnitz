@@ -6,6 +6,7 @@ use gnitz_wire::PkKeys;
 
 use super::{PkSetGather, ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
+use crate::repr::merge::merge_consolidated;
 use crate::schema::key::KeySpec;
 
 /// A chunked source of `Batch`es: a whole cursor, an index range, or a key list.
@@ -52,7 +53,7 @@ impl SourceCursor {
         Ok(Some(if live.is_empty() {
             hydrated
         } else {
-            hydrated.merged_consolidated(&live, live.schema())
+            merge_consolidated(&[hydrated.as_mem_batch(), live.as_mem_batch()], live.schema())
         }))
     }
 

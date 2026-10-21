@@ -9,10 +9,12 @@
 
 use std::ops::Range;
 
-use super::batch::{range_rows, write_to_batch, Batch, FIXED_REGION_BYTES};
+use super::batch::{
+    range_rows, write_to_batch, Batch, ColPtr, MemBatch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START,
+};
 use super::batch_pool::PooledBuf;
 use super::codebook::Codebook;
-use super::merge::{ColPtr, ColumnarSource, MemBatch, UnifiedSource};
+use super::merge::ColumnarSource;
 use super::string_heap::{
     carried_dead, prorated_blob_cap, rebase_string_cell, recode_string_cell, relocate_german_string_vec, row_long_bytes,
 };
@@ -193,6 +195,56 @@ fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32], width
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr().add(i * N), dst.as_mut_ptr().add(out * N), N);
         }
+    }
+}
+
+/// A source's regions as one `(base, stride)` [`ColPtr`] each — what
+/// [`scatter_unified_sources`] reads a mix of batch and shard sources through.
+#[derive(Clone, Copy)]
+pub(crate) struct UnifiedSource<'a> {
+    pub pk: ColPtr,
+    pub null_bmp: ColPtr,
+    /// Null bits OR'd into every null word the scatter copies out.
+    pub null_pad_mask: u64,
+    /// Index of this source's first payload `ColPtr` in the caller-owned table
+    /// the scatter reads through: column `pi` is `cols[cols_off + pi]`. Out of
+    /// line because a by-value `[ColPtr; MAX_COLUMNS]` would be zeroed per source
+    /// per call, whatever the schema's real column count.
+    pub cols_off: usize,
+    pub heap: Heap<'a>,
+    /// Where `heap` already lies in the scatter's destination heap, when carried
+    /// whole; `None` relocates each cell.
+    pub heap_at: Option<usize>,
+}
+
+/// Derive a `UnifiedSource` view over an in-memory `MemBatch`: every region
+/// becomes a `(base, stride)` `ColPtr` into the batch's `data`, and the blob
+/// arena is borrowed. Pure pointer arithmetic — no allocation,
+/// no scan. The payload `ColPtr`s are appended to `cols`, the flat table the
+/// scatter indexes through `UnifiedSource::cols_off`.
+pub(crate) fn mem_batch_to_unified<'a>(
+    mb: &MemBatch<'a>,
+    schema: &SchemaDescriptor,
+    cols: &mut Vec<ColPtr>,
+) -> UnifiedSource<'a> {
+    let data_ptr = mb.data.as_ptr();
+    let cols_off = cols.len();
+    for (pi, col) in schema.payload_columns() {
+        cols.push(ColPtr {
+            base: unsafe { data_ptr.add(mb.region_start(REG_PAYLOAD_START + pi)) },
+            stride: col.size(),
+        });
+    }
+    UnifiedSource {
+        pk: ColPtr { base: data_ptr, stride: mb.pk_stride() },
+        null_bmp: ColPtr {
+            base: unsafe { data_ptr.add(mb.region_start(REG_NULL_BMP)) },
+            stride: FIXED_REGION_BYTES,
+        },
+        null_pad_mask: 0,
+        cols_off,
+        heap: Heap::Plain(mb.blob),
+        heap_at: None,
     }
 }
 

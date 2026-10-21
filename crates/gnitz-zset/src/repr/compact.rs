@@ -4,13 +4,13 @@
 //! [`merge_guard`] merges the rows one guard owns → column-first scatter → one
 //! output batch, handed to the caller to write, one guard of a fold per call.
 //! The merge kernel itself is the shared
-//! [`run_merge_in`](crate::repr::merge::run_merge_in), which owns the
+//! [`run_merge`](crate::repr::merge::run_merge), which owns the
 //! (PK, payload) total order; this module only drives it and materializes
 //! survivors.
 
 use super::batch::Batch;
 use super::codebook::Codebook;
-use super::merge::run_merge_in;
+use super::merge::run_merge;
 use super::scatter::UnifiedSet;
 use super::shard_file::ShardWriteOpts;
 use super::shard_reader::MappedShard;
@@ -133,7 +133,7 @@ pub fn merge_guard<'a>(
     // The merge compares every key of a window and the scatter copies it.
     let shards: Vec<_> = shards.iter().zip(&windows).map(|(s, w)| s.window(w.clone())).collect();
     let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(windows.iter().map(Range::len).sum());
-    run_merge_in(&shards, &out_schema, windows.iter().cloned(), |src, row, w| {
+    run_merge(&shards, &out_schema, windows.iter().cloned(), |src, row, w| {
         survivors.push((src as u32, row as u32, w));
     });
     if survivors.is_empty() {

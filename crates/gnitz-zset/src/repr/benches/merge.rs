@@ -61,7 +61,9 @@ fn run_merge_dup_pk_bench() {
         let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
         let merge = || {
             let mut sink = 0i64;
-            run_merge(black_box(&mem), &schema, |_s, _r, w| sink = sink.wrapping_add(w));
+            run_merge(black_box(&mem), &schema, mem.iter().map(|m| 0..m.count), |_s, _r, w| {
+                sink = sink.wrapping_add(w)
+            });
             black_box(sink)
         };
         // K copies of one batch: every row folds with its twins.
@@ -144,8 +146,9 @@ fn striped_sum_bench() {
     }
 }
 
-/// Instructions and cycles per input row of [`Batch::merged_consolidated`], over
-/// the shapes its three arms see. `shared_pk_interleave` and `shared_pk_fold`
+/// Instructions and cycles per input row of the two-way merge
+/// [`merge_consolidated`] takes for two interleaved batches, over the shapes its
+/// three arms see. `shared_pk_interleave` and `shared_pk_fold`
 /// put every row in an equal-PK group, the arm that folds: the first switches
 /// side at every row, the second folds every row into its twin. The rest are
 /// PK-disjoint and stay in the galloping arms: `alt1` at runs of one row (what a
@@ -153,7 +156,7 @@ fn striped_sum_bench() {
 /// `dominant` with one row of the small side between each 4096 of the large.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn merged_consolidated_bench() {
+fn two_way_bench() {
     const N: usize = 500_000;
     const RUN: usize = 4096;
     let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
@@ -188,11 +191,12 @@ fn merged_consolidated_bench() {
             make_batch(&schema, &rows)
         });
         let rows = (N + side1) as f64;
-        black_box(a.merged_consolidated(&b, &schema));
-        let ((out, instr), cyc) = cycles.measure(|| instructions.measure(|| a.merged_consolidated(&b, &schema)));
+        let mem = [a.as_mem_batch(), b.as_mem_batch()];
+        black_box(merge_consolidated(&mem, &schema));
+        let ((out, instr), cyc) = cycles.measure(|| instructions.measure(|| merge_consolidated(&mem, &schema)));
         assert_eq!(out.count, survivors, "{label}");
         println!(
-            "merged_consolidated_bench {label:<20} {:5.1} instr/row, {:5.1} cycles/row",
+            "two_way_bench {label:<20} {:5.1} instr/row, {:5.1} cycles/row",
             instr as f64 / rows,
             cyc as f64 / rows,
         );
@@ -230,13 +234,14 @@ fn seeded_batch(schema: &SchemaDescriptor, rows: &[(u128, i64, u64)]) -> Batch {
     b
 }
 
-/// The two-input kernels — [`Batch::merged_consolidated`] and
-/// [`merge_consolidated`] over the same pair — on the shapes their callers feed
-/// them, per input row: instructions, cycles and mispredicted branches.
+/// [`merge_consolidated`] of two batches — the two-way merge, or the
+/// concatenation of an `append` — against the N-way fold over the same pair, on
+/// the shapes their callers feed them, per input row: instructions, cycles and
+/// mispredicted branches.
 ///
 /// The keys are hashed, so stretch lengths are geometric rather than regular
 /// and the merge order is unpredictable, as a scattered load's or a set
-/// operation's is; `merged_consolidated_bench` is the regular counterpart. `d`
+/// operation's is; `two_way_bench` is the regular counterpart. `d`
 /// and `s` are a RAM tier's dominant run against the rest at three ratios, and
 /// two same-sized deltas. The schemas are a narrow one, a wide mixed one whose
 /// payload order is the generic arm, and a 128-bit-PK one. `disjoint` shares no
@@ -311,8 +316,8 @@ fn two_way_shapes_bench() {
                 let mem = [a.as_mem_batch(), b.as_mem_batch()];
                 type Kernel<'k> = (&'k str, &'k dyn Fn() -> Batch);
                 let kernels: [Kernel; 2] = [
-                    ("two-way", &|| a.merged_consolidated(&b, &schema)),
-                    ("n-way", &|| merge_consolidated(&mem, &schema)),
+                    ("sum", &|| merge_consolidated(&mem, &schema)),
+                    ("n-way", &|| merge_rows(&mem, &schema)),
                 ];
                 assert_eq!(
                     weighted_rows(&kernels[0].1()),
@@ -337,8 +342,9 @@ fn two_way_shapes_bench() {
     }
 }
 
-/// Instructions per call of the two-input kernels on merges too small for
-/// anything but a call's fixed cost to show: what a tick of a row or two pays.
+/// Instructions per call of [`merge_consolidated`] and the N-way fold over two
+/// batches too small for anything but a call's fixed cost to show: what a tick
+/// of a row or two pays.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn two_way_tiny_bench() {
@@ -370,9 +376,9 @@ fn two_way_tiny_bench() {
                 instr / CALLS
             };
             println!(
-                "two_way_tiny_bench {ty:<7} {d:>4}+{s:<2} {shape:<6} two-way {:6} instr/call, n-way {:6}",
-                per_call(&|| a.merged_consolidated(&b, &schema)),
+                "two_way_tiny_bench {ty:<7} {d:>4}+{s:<2} {shape:<6} sum {:6} instr/call, n-way {:6}",
                 per_call(&|| merge_consolidated(&mem, &schema)),
+                per_call(&|| merge_rows(&mem, &schema)),
             );
         }
     }

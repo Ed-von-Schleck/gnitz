@@ -71,7 +71,7 @@ impl ReadCursor {
     /// Every remaining row in merge order, consolidated.
     pub fn materialize(mut self) -> Rc<Batch> {
         if let [Run::Mem(rc)] = &self.sources[..] {
-            let whole = self.valid && self.current_row == 0 && self.states[0].count == rc.count;
+            let whole = self.valid && self.current_row == 0 && self.states[0].end == rc.count;
             if whole {
                 return Rc::clone(rc);
             }
@@ -85,7 +85,7 @@ impl ReadCursor {
     fn drain_single(&mut self, i: usize, max_rows: usize, skeletons: &mut SkeletonKeys) -> Batch {
         // `position` is already past the committed row.
         let start = self.current_row;
-        let row_count = (self.states[i].count - start).min(max_rows);
+        let row_count = (self.states[i].end - start).min(max_rows);
         let batch = match &self.sources[i] {
             Run::Shard(shard) if shard.is_skeleton() => {
                 skeletons.extend(shard, start..start + row_count);

@@ -6,13 +6,14 @@
 use std::ops::Range;
 
 use super::batch_pool::{is_tight, PooledBuf};
-use super::merge::{self, ColPtr, MemBatch};
+use super::merge;
 use super::run::StoredRow;
 use super::scatter::copy_ranges;
 use super::string_heap::{self, relocate_german_string_vec, BlobCache};
 use super::writer::DirectWriter;
 use crate::schema::payload_order::compare_rows;
 use crate::schema::{ColumnLocator, SchemaDescriptor};
+use gnitz_expr::BatchView;
 use gnitz_wire::RowSource;
 use gnitz_wire::{read_i64_le, read_u64_le, Heap, TypeCode};
 
@@ -1099,6 +1100,10 @@ impl Batch {
     /// byte they cannot reference charged dead.
     pub(crate) fn carry_heap(&mut self, src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, usize)]) -> Option<usize> {
         let mask = src.schema.string_payload_slots();
+        if mask == 0 {
+            // No string cell to rebase onto a heap.
+            return None;
+        }
         debug_assert!(kept.windows(2).all(|w| w[0].1 <= w[1].0) && kept.last().is_none_or(|k| k.1 <= src.count));
         debug_assert_eq!(kept_slots & !mask, 0, "carry_heap: a kept slot is not a string slot");
         let heap = src.blob.len();
@@ -1251,7 +1256,7 @@ impl Batch {
         let schema = &batch.schema;
         let mb = batch.as_mem_batch();
         // Folded first, so the arena is sized to the survivors.
-        merge::consolidate_groups(&mb, schema, survivors);
+        merge::consolidate_groups(&mb, survivors);
         let mut result = super::scatter::materialize_carrying(std::slice::from_ref(&mb), schema, survivors);
         result.certify_consolidated();
         result
@@ -1361,6 +1366,219 @@ impl RowSource for Batch {
     #[inline(always)]
     fn row_count(&self) -> usize {
         Batch::len(self)
+    }
+}
+
+/// A column as `base + row * stride`. Stride 0 reads one shared element for
+/// every row. `base` itself need not lie inside the column: a decoded window is
+/// rebased so that its first row lands on its first cell.
+#[derive(Clone, Copy)]
+pub(crate) struct ColPtr {
+    pub base: *const u8,
+    pub stride: usize,
+}
+
+impl ColPtr {
+    /// Row `i`'s address.
+    #[inline(always)]
+    pub(crate) fn row_ptr(self, i: usize) -> *const u8 {
+        self.base.wrapping_add(i * self.stride)
+    }
+
+    /// Row `i`'s first `len` bytes.
+    ///
+    /// # Safety
+    /// Row `i` is a row of a live column this addresses, and `len` does not
+    /// exceed its element width.
+    #[inline(always)]
+    pub(crate) unsafe fn row<'a>(self, i: usize, len: usize) -> &'a [u8] {
+        std::slice::from_raw_parts(self.row_ptr(i), len)
+    }
+
+    /// Copy rows `start..` of this column of `width`-byte elements onto `dst`,
+    /// `dst.len() / width` rows.
+    ///
+    /// # Safety
+    /// Those rows are rows of a live column this addresses.
+    pub(crate) unsafe fn copy_rows(self, start: usize, width: usize, dst: &mut [u8]) {
+        if self.stride != 0 {
+            return dst.copy_from_slice(std::slice::from_raw_parts(self.row_ptr(start), dst.len()));
+        }
+        if dst.is_empty() {
+            return;
+        }
+        // One element repeated: write it once, then double the written prefix,
+        // so any element width costs O(log rows) copies.
+        dst[..width].copy_from_slice(self.row(0, width));
+        let mut filled = width;
+        while filled < dst.len() {
+            let n = filled.min(dst.len() - filled);
+            dst.copy_within(..n, filled);
+            filled += n;
+        }
+    }
+}
+
+/// A borrowed view of batch rows: an arena of `cap` rows laid out under
+/// `schema`, of which the first `count` are rows. A [`Batch`]'s own, or a WAL
+/// block's fixed bytes, which are an arena exactly as large as its rows.
+#[derive(Clone)]
+pub struct MemBatch<'a> {
+    pub(crate) data: &'a [u8],
+    /// The layout: region `r` starts at `schema.region_start(r, cap)`.
+    pub(crate) schema: &'a SchemaDescriptor,
+    pub(crate) cap: usize,
+    pub(crate) blob: &'a [u8],
+    /// Row count of the view. Read from outside through [`MemBatch::len`].
+    pub(crate) count: usize,
+    /// An upper bound on the bytes of `blob` no cell references.
+    pub(in crate::repr) dead_heap: usize,
+}
+
+impl<'a> MemBatch<'a> {
+    /// Row count of the view.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Byte width of the PK region per row.
+    #[inline(always)]
+    pub fn pk_stride(&self) -> usize {
+        self.schema.pk_stride()
+    }
+
+    /// Where region `r` starts in the arena.
+    #[inline(always)]
+    pub(crate) fn region_start(&self, r: usize) -> usize {
+        self.schema.region_start(r, self.cap)
+    }
+
+    /// The `count` rows of region `r`.
+    #[inline(always)]
+    pub(crate) fn region(&self, r: usize) -> &'a [u8] {
+        let off = self.region_start(r);
+        &self.data[off..off + self.count * self.schema.region_stride(r)]
+    }
+
+    /// PK region as a contiguous slice (`count * pk_stride` bytes).
+    #[inline]
+    pub fn pk(&self) -> &'a [u8] {
+        self.region(REG_PK)
+    }
+
+    /// Weight region as a contiguous slice (`count * 8` bytes).
+    #[inline]
+    pub(crate) fn weight(&self) -> &'a [u8] {
+        self.region(REG_WEIGHT)
+    }
+
+    /// Wrapping sum of the weights of rows `[start, end)`, over one
+    /// bounds-checked slice of the weight region.
+    #[inline]
+    pub fn sum_weights(&self, start: usize, end: usize) -> i64 {
+        self.weight()[start * 8..end * 8]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .fold(0i64, |a, w| a.wrapping_add(i64::from_le_bytes(*w)))
+    }
+
+    /// Null bitmap region as a contiguous slice (`count * 8` bytes).
+    #[inline(always)]
+    pub(crate) fn null_bmp(&self) -> &'a [u8] {
+        self.region(REG_NULL_BMP)
+    }
+
+    /// Payload column `pi` as a contiguous slice (`count * stride` bytes), where
+    /// `stride` is its width (see `payload_columns`).
+    #[inline(always)]
+    pub fn col_data(&self, pi: usize, stride: usize) -> &'a [u8] {
+        debug_assert_eq!(stride, self.schema.region_stride(REG_PAYLOAD_START + pi));
+        self.region(REG_PAYLOAD_START + pi)
+    }
+
+    #[inline(always)]
+    pub fn get_pk_bytes(&self, row: usize) -> &'a [u8] {
+        let stride = self.pk_stride();
+        let off = row * stride;
+        &self.data[off..off + stride]
+    }
+    /// The `n` bytes at `at` of row `row`'s PK.
+    #[inline(always)]
+    pub(crate) fn get_pk_range(&self, row: usize, at: usize, n: usize) -> &'a [u8] {
+        debug_assert!(at + n <= self.pk_stride());
+        let off = row * self.pk_stride() + at;
+        &self.data[off..off + n]
+    }
+    #[inline(always)]
+    pub fn get_weight(&self, row: usize) -> i64 {
+        gnitz_wire::read_i64_le(self.data, self.region_start(REG_WEIGHT) + row * 8)
+    }
+    #[inline(always)]
+    pub fn get_null_word(&self, row: usize) -> u64 {
+        read_u64_le(self.data, self.region_start(REG_NULL_BMP) + row * 8)
+    }
+    #[inline(always)]
+    pub(crate) fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &'a [u8] {
+        let off = self.region_start(REG_PAYLOAD_START + payload_col) + row * col_size;
+        &self.data[off..off + col_size]
+    }
+}
+
+/// Each method forwards via UFCS to the inherent accessor of the same name, so
+/// the call binds to the concrete read rather than recursing into the trait.
+///
+/// Every forwarder — **and every inherent accessor it UFCS-calls** — is
+/// `#[inline(always)]`; see [`BatchView`] for why the plain hint is not enough.
+/// Promoting only the forwarder would leave the terminus a real call and do half
+/// the job.
+impl<'a> RowSource for MemBatch<'a> {
+    #[inline(always)]
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        MemBatch::get_pk_bytes(self, row)
+    }
+    #[inline(always)]
+    fn get_null_word(&self, row: usize) -> u64 {
+        MemBatch::get_null_word(self, row)
+    }
+    #[inline(always)]
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        MemBatch::get_col_ptr(self, row, payload_col, col_size)
+    }
+    #[inline(always)]
+    fn heap(&self) -> Heap<'_> {
+        Heap::Plain(self.blob)
+    }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        MemBatch::len(self)
+    }
+}
+
+/// The region half. The per-row accessors above are **not** derived from these
+/// (see [`BatchView`]): the derived form costs a row-count load, a second
+/// multiply and a second range check per read, which `-O0` cannot hoist.
+impl<'a> BatchView for MemBatch<'a> {
+    #[inline(always)]
+    fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8] {
+        MemBatch::col_data(self, payload_col, col_size)
+    }
+    #[inline(always)]
+    fn null_bmp(&self) -> &[u8] {
+        MemBatch::null_bmp(self)
+    }
+    #[inline(always)]
+    fn pk_region(&self) -> (&[u8], usize) {
+        (MemBatch::pk(self), self.pk_stride())
+    }
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
+        self.blob
     }
 }
 

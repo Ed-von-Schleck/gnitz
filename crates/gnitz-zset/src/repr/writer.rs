@@ -1,8 +1,8 @@
 //! The direct row writer: a batch's tail or a wire block's fixed bytes, written
 //! a region at a time.
 
+use super::batch::MemBatch;
 use super::batch::{FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
-use super::merge::MemBatch;
 use super::string_heap::{rebase_string_cells, BlobCache};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::Heap;
