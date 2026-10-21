@@ -1,9 +1,8 @@
 //! The rederived operator state of one compiled circuit: the children its
 //! compile declares, and the stores it opens for them.
 
-use super::ChildKind;
-use super::RelationRegistry;
-use crate::storage::{RecoverySource, Table};
+use super::{ChildKind, RelationRegistry};
+use crate::storage::{Cut, RecoverySource, Table};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -64,29 +63,21 @@ impl CircuitState {
 
     /// Every live row of `keys` in `idx`.
     pub fn gather(&self, idx: StateIdx, keys: PkKeys) -> PkSetGather {
-        self.at(idx).gather(keys, super::Cut::Now)
+        self.tables[idx.0].gather(keys, Cut::Now)
     }
 
     /// A cursor over `idx` for probing at the keys in `[first, last]` — whole
     /// PKs, or the same leading bytes of one — positioned on the band they span.
     pub fn cursor_between(&self, idx: StateIdx, first: &[u8], last: &[u8]) -> ReadCursor {
-        self.at(idx).cursor_between(first, last, super::Cut::Now)
+        self.tables[idx.0].cursor_between(first, last, Cut::Now)
     }
 
     pub fn ingest(&mut self, idx: StateIdx, batch: Batch) -> Result<(), StorageError> {
-        self.at_mut(idx).ingest(batch)
+        self.tables[idx.0].ingest(batch)
     }
 
     /// Every child store, for the checkpoint round that publishes them.
-    pub(crate) fn tables_mut(&mut self) -> impl Iterator<Item = &mut Table> {
+    pub(super) fn tables_mut(&mut self) -> impl Iterator<Item = &mut Table> {
         self.tables.iter_mut()
-    }
-
-    fn at(&self, idx: StateIdx) -> &Table {
-        &self.tables[idx.0]
-    }
-
-    fn at_mut(&mut self, idx: StateIdx) -> &mut Table {
-        &mut self.tables[idx.0]
     }
 }

@@ -45,8 +45,9 @@ fn a_pin_answers_as_the_store_stood_whatever_it_takes_after() {
         before
     );
 
-    assert!(r.unpin(7));
-    assert!(!r.unpin(7));
+    r.unpin(7);
+    assert!(r.snapshots.is_empty());
+    r.unpin(7);
     let err = r.pinned_page(7, TID, &page(layout, 1), Slot::SOLO).err().unwrap();
     assert!(err.contains("not pinned"), "{err}");
 }

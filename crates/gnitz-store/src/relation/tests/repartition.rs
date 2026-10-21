@@ -102,6 +102,14 @@ fn any_published(rel: &str, of: u32) -> bool {
 
 /// A relayout cuts each target into filtered terminal runs and moves every row
 /// once, onto its owner, payload intact.
+/// A fresh data directory, and [`ID`]'s relation directory under it.
+fn scratch_relation() -> (tempfile::TempDir, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().to_str().unwrap().to_string();
+    let rel = relation_dir(&base, ID);
+    (dir, base, rel)
+}
+
 #[test]
 fn a_relayout_writes_filtered_terminal_runs() {
     let dir = tempfile::tempdir().unwrap();
@@ -166,11 +174,9 @@ fn a_keyed_table_round_trips_across_worker_counts() {
     let placement = Placement::full_pk(&schema);
     let rows = ids(300);
     for (old, new) in [(1, 1), (1, 4), (4, 1), (2, 3), (3, 2), (4, 5), (5, 8), (8, 4)] {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().to_str().unwrap();
-        let rel = relation_dir(base, ID);
+        let (_dir, base, rel) = scratch_relation();
         seed_set(&rel, schema, placement, &rows, old);
-        boot(base, new, schema, placement).unwrap();
+        boot(&base, new, schema, placement).unwrap();
         assert_eq!(
             set_of(&rel, schema, new),
             expected(schema, placement, &rows, new),
@@ -189,9 +195,7 @@ fn a_keyed_table_round_trips_across_worker_counts() {
 /// hard-links rank 0's files into every launched rank and removes the old set.
 #[test]
 fn a_replicated_table_is_relinked_at_a_new_worker_count() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().to_str().unwrap();
-    let rel = relation_dir(base, ID);
+    let (_dir, base, rel) = scratch_relation();
     let schema = make_schema_u64_i64();
     let rows = ids(10);
     seed_set(&rel, schema, Placement::Replicated, &rows, 1);
@@ -205,7 +209,7 @@ fn a_replicated_table_is_relinked_at_a_new_worker_count() {
     };
     let source_files = files(0, 1);
 
-    boot(base, 3, schema, Placement::Replicated).unwrap();
+    boot(&base, 3, schema, Placement::Replicated).unwrap();
     for k in 0..3 {
         assert_eq!(files(k, 3), source_files, "rank {k} holds a copy");
     }
@@ -221,9 +225,7 @@ fn a_replicated_table_is_relinked_at_a_new_worker_count() {
 /// relays.
 #[test]
 fn a_set_of_empty_children_relays() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().to_str().unwrap();
-    let rel = relation_dir(base, ID);
+    let (_dir, base, rel) = scratch_relation();
     let schema = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
     let placement = Placement::keyed(&schema, 1);
     let rows: Vec<_> = (0..20).map(|b| (opk_pk(&schema, &[1, b]), b as i64)).collect();
@@ -231,7 +233,7 @@ fn a_set_of_empty_children_relays() {
     let occupied = set_of(&rel, schema, 3).iter().filter(|z| !z.is_empty()).count();
     assert_eq!(occupied, 1, "one prefix, one worker");
 
-    boot(base, 2, schema, placement).unwrap();
+    boot(&base, 2, schema, placement).unwrap();
     assert_eq!(set_of(&rel, schema, 2), expected(schema, placement, &rows, 2));
 }
 
@@ -239,16 +241,14 @@ fn a_set_of_empty_children_relays() {
 /// source's removal leaves, hold the same rows: either relays, and both go.
 #[test]
 fn either_of_two_complete_sets_relays() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().to_str().unwrap();
-    let rel = relation_dir(base, ID);
+    let (_dir, base, rel) = scratch_relation();
     let schema = make_schema_u64_i64();
     let placement = Placement::full_pk(&schema);
     let rows = ids(40);
     seed_set(&rel, schema, placement, &rows, 2);
     seed_set(&rel, schema, placement, &rows, 4);
 
-    boot(base, 3, schema, placement).unwrap();
+    boot(&base, 3, schema, placement).unwrap();
     assert_eq!(set_of(&rel, schema, 3), expected(schema, placement, &rows, 3));
     assert!(!any_published(&rel, 2) && !any_published(&rel, 4));
 }
@@ -261,13 +261,11 @@ fn a_partial_target_is_relaid_over() {
     let schema = make_schema_u64_i64();
     let rows = ids(40);
     for placement in [Placement::full_pk(&schema), Placement::Replicated] {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().to_str().unwrap();
-        let rel = relation_dir(base, ID);
+        let (_dir, base, rel) = scratch_relation();
         seed_set(&rel, schema, placement, &rows, 2);
         seed_child(&rel, schema, placement, &rows, 0, 4);
 
-        boot(base, 4, schema, placement).unwrap();
+        boot(&base, 4, schema, placement).unwrap();
         assert_eq!(
             set_of(&rel, schema, 4),
             expected(schema, placement, &rows, 4),
@@ -282,16 +280,14 @@ fn a_partial_target_is_relaid_over() {
 /// exactly as it was.
 #[test]
 fn a_torn_set_at_the_launched_count_is_left_as_it_is() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().to_str().unwrap();
-    let rel = relation_dir(base, ID);
+    let (_dir, base, rel) = scratch_relation();
     let schema = make_schema_u64_i64();
     let placement = Placement::full_pk(&schema);
     seed_set(&rel, schema, placement, &ids(60), 3);
     std::fs::remove_file(child(2, 3).manifest(&rel)).unwrap();
     let published = set_of(&rel, schema, 3);
 
-    boot(base, 3, schema, placement).unwrap();
+    boot(&base, 3, schema, placement).unwrap();
     assert_eq!(set_of(&rel, schema, 3), published);
 }
 
@@ -302,13 +298,11 @@ fn a_torn_set_at_the_launched_count_is_left_as_it_is() {
 fn a_torn_foreign_set_moves_nothing() {
     let schema = make_schema_u64_i64();
     for placement in [Placement::full_pk(&schema), Placement::Replicated] {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().to_str().unwrap();
-        let rel = relation_dir(base, ID);
+        let (_dir, base, rel) = scratch_relation();
         seed_set(&rel, schema, placement, &ids(40), 4);
         std::fs::remove_file(child(3, 4).manifest(&rel)).unwrap();
 
-        boot(base, 2, schema, placement).unwrap();
+        boot(&base, 2, schema, placement).unwrap();
         assert!(!any_published(&rel, 2), "{placement:?}: nothing is relaid");
         assert!(
             !Path::new(&child(0, 4).dir(&rel)).exists(),
@@ -322,17 +316,15 @@ fn a_torn_foreign_set_moves_nothing() {
 /// stands and removes the source.
 #[test]
 fn a_complete_launched_set_is_kept_and_a_leftover_source_set_removed() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().to_str().unwrap();
-    let rel = relation_dir(base, ID);
+    let (_dir, base, rel) = scratch_relation();
     let schema = make_schema_u64_i64();
     let placement = Placement::full_pk(&schema);
     seed_set(&rel, schema, placement, &ids(40), 1);
-    boot(base, 2, schema, placement).unwrap();
+    boot(&base, 2, schema, placement).unwrap();
     // One row the target does not hold: relaying the set again would add it.
     seed_set(&rel, schema, placement, &ids(41), 1);
 
-    boot(base, 2, schema, placement).unwrap();
+    boot(&base, 2, schema, placement).unwrap();
     assert_eq!(set_of(&rel, schema, 2), expected(schema, placement, &ids(40), 2));
     assert!(
         !Path::new(&child(0, 1).dir(&rel)).exists(),
@@ -343,9 +335,7 @@ fn a_complete_launched_set_is_kept_and_a_leftover_source_set_removed() {
 /// A boot at the count the set is laid out for rewrites no file.
 #[test]
 fn an_unchanged_worker_count_moves_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().to_str().unwrap();
-    let rel = relation_dir(base, ID);
+    let (_dir, base, rel) = scratch_relation();
     let schema = make_schema_u64_i64();
     let placement = Placement::full_pk(&schema);
     seed_set(&rel, schema, placement, &ids(50), 2);
@@ -361,7 +351,7 @@ fn an_unchanged_worker_count_moves_nothing() {
     let before = stamps();
     assert!(!before.is_empty());
 
-    boot(base, 2, schema, placement).unwrap();
+    boot(&base, 2, schema, placement).unwrap();
     assert_eq!(stamps(), before);
 }
 
@@ -370,12 +360,10 @@ fn an_unchanged_worker_count_moves_nothing() {
 /// checkpointed.
 #[test]
 fn an_unknown_child_grammar_refuses_the_boot() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().to_str().unwrap();
-    let rel = relation_dir(base, ID);
+    let (_dir, base, rel) = scratch_relation();
     std::fs::create_dir_all(format!("{rel}/part_7")).unwrap();
     std::fs::write(format!("{rel}/part_7/manifest.bin"), b"x").unwrap();
     let schema = make_schema_u64_i64();
-    let err = boot(base, 1, schema, Placement::full_pk(&schema)).unwrap_err();
+    let err = boot(&base, 1, schema, Placement::full_pk(&schema)).unwrap_err();
     assert!(err.contains("part_7"), "{err}");
 }

@@ -140,11 +140,6 @@ fn children(dir: &str, pick: impl Fn(&ChildAddr) -> bool) -> Result<Vec<String>,
     Ok(picked.map(|c| c.dir(dir)).collect())
 }
 
-/// Retire every child of `dir` that `dead` picks.
-pub(super) fn remove_children(dir: &str, dead: impl Fn(&ChildAddr) -> bool) -> Result<(), String> {
-    retire_stores(&children(dir, dead)?).map_err(|e| format!("retire the children of '{dir}': {e}"))
-}
-
 /// `<base_dir>/LOCK` — the file whose `flock` makes a data directory
 /// single-writer.
 const DIR_LOCK_FILENAME: &str = "LOCK";
@@ -246,7 +241,9 @@ impl RelationRegistry {
         }
         let dir = relation_dir(&self.base_dir, id);
         // Durably first: a child's manifest carries the record a reopen would revive.
-        remove_children(&dir, |_| true).map_err(|e| format!("erase relation {id} (dir={dir}): {e}"))?;
+        let fail = |e: String| format!("erase relation {id} (dir={dir}): {e}");
+        let stores = children(&dir, |_| true).map_err(fail)?;
+        retire_stores(&stores).map_err(|e| fail(e.to_string()))?;
         if let Err(e) = fs::remove_dir_all(&dir) {
             gnitz_debug!("relation: failed to erase relation dir {}: {}", dir, e);
         }

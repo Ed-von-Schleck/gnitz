@@ -1,6 +1,9 @@
 use crate::relation::{ChildKind, RelationKind};
 use crate::storage::{read_at, read_intact};
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, zset_of, TID};
+use crate::test_support::{
+    assert_index_holds, id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, zset_of,
+    TID,
+};
 use gnitz_wire::PkColList;
 
 /// The append path sizes by the store's region count, so a batch of another
@@ -8,12 +11,11 @@ use gnitz_wire::PkColList;
 #[test]
 fn ingest_refuses_a_batch_of_another_arity() {
     let mut registry = relation_fixture(RelationKind::BaseTable, make_schema_u64_i64(), &[], []);
-    let mut wide = gnitz_zset::repr::BatchBuilder::new(&pk_u64_two_i64_schema());
-    wide.begin_row(1, 1);
-    wide.put_int(1);
-    wide.put_int(2);
-    wide.end_row();
-    assert!(registry.ingest(TID, wide.finish()).is_err());
+    let wide = id_rows(&pk_u64_two_i64_schema(), [(1, 1)], |bb, _| {
+        bb.put_int(1);
+        bb.put_int(2);
+    });
+    assert!(registry.ingest(TID, wide).is_err());
     assert_eq!(
         registry.relation(TID).unwrap().full_scan().len(),
         0,
@@ -33,12 +35,7 @@ fn an_upsert_moves_the_index_entry() {
         let row = make_batch_raw(&schema, &[(1, 1, val)]);
         registry.ingest(TID, row.clone()).unwrap();
         let ix = registry.relation(TID).unwrap().index_on(&[1]).unwrap();
-        let want = gnitz_zset::algebra::index_entries(&row, &ix.key_spec(), &ix.schema());
-        assert_eq!(
-            zset_of(&ix.cursor().materialize(), &ix.schema()),
-            zset_of(&want, &ix.schema()),
-            "after {val}"
-        );
+        assert_index_holds(ix, &row, format_args!("after {val}"));
         if val == 10 {
             assert_eq!(
                 ix.store.held().estimated_rows(),

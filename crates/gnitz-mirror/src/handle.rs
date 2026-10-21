@@ -172,16 +172,9 @@ impl Copies {
             pk_repeats: rec.pk_repeats,
             compress: false,
         };
-        match resume {
-            Some(generation) => self.registry.reopen_view(spec, generation)?,
-            None => self.registry.register(spec)?,
-        }
+        self.registry.register_at(spec, resume)?;
         for &cols in &rec.indexes {
-            let entered = match resume {
-                Some(generation) => self.registry.reopen_index(tid, index_claim(cols), cols, generation),
-                None => self.registry.add_index(tid, index_claim(cols), cols),
-            };
-            if let Err(e) = entered {
+            if let Err(e) = self.registry.add_index_at(tid, index_claim(cols), cols, resume) {
                 // Not erased: the fault may be transient, and the stores resumable.
                 self.registry.unregister(tid);
                 return Err(e);

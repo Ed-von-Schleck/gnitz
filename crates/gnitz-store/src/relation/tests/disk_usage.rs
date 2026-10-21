@@ -1,5 +1,4 @@
 use super::*;
-use crate::relation::{relation_dir, ChildKind};
 use crate::storage::flush_barrier;
 use crate::test_support::{make_batch, make_schema_u64_i64, scratch_table};
 use gnitz_zset::algebra::Slot;
@@ -20,7 +19,6 @@ fn store_dir(base: &str, id: u64, kind: ChildKind) -> String {
 
 /// Publish `rows` as one shard of the store at `dir`.
 fn publish(dir: &str, rows: &[(u64, i64, i64)]) {
-    std::fs::create_dir_all(dir).unwrap();
     let schema = make_schema_u64_i64();
     let mut table = scratch_table(dir, schema);
     table.ingest(make_batch(&schema, rows)).unwrap();
@@ -31,7 +29,7 @@ fn publish(dir: &str, rows: &[(u64, i64, i64)]) {
 fn a_directory_is_summed_by_store_with_identical_shards_named() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().to_str().unwrap();
-    assert_eq!(disk_usage(base).unwrap().shard_bytes(), 0, "an empty directory");
+    assert_eq!(disk_usage(base).unwrap().shard_total.bytes, 0, "an empty directory");
     let rows: Vec<(u64, i64, i64)> = (1..=50).map(|i| (i, 1, i as i64 * 3)).collect();
     let view_rows = store_dir(base, 20, ChildKind::Rows);
     publish(&view_rows, &rows);

@@ -71,28 +71,18 @@ pub(super) fn repartition_relation(
         return Ok(());
     };
     gnitz_info!("repartition: {} from {} to {} worker(s)", rel_dir, source, launched);
-    relay(rel_dir, schema, placement, source, launched, ram_tier_bytes, chunk_rows)
-        .map_err(|e| format!("repartition {rel_dir} to {launched} worker(s): {e}"))
-}
-
-fn relay(
-    rel_dir: &str,
-    schema: &SchemaDescriptor,
-    placement: Placement,
-    source: u32,
-    launched: u32,
-    ram_tier_bytes: usize,
-    chunk_rows: usize,
-) -> Result<(), StorageError> {
-    // A crashed attempt's partial target would double every row it holds.
-    remove_set(rel_dir, launched)?;
-    if placement.is_replicated() {
-        link_targets(rel_dir, source, launched)?;
-    } else {
-        rewrite_targets(rel_dir, schema, placement, source, launched, ram_tier_bytes, chunk_rows)?;
-    }
-    // Each target's first publish made its entry in `rel_dir` durable.
-    remove_set(rel_dir, source)
+    let relay = || -> Result<(), StorageError> {
+        // A crashed attempt's partial target would double every row it holds.
+        remove_set(rel_dir, launched)?;
+        if placement.is_replicated() {
+            link_targets(rel_dir, source, launched)?;
+        } else {
+            rewrite_targets(rel_dir, schema, placement, source, launched, ram_tier_bytes, chunk_rows)?;
+        }
+        // Each target's first publish made its entry in `rel_dir` durable.
+        remove_set(rel_dir, source)
+    };
+    relay().map_err(|e| format!("repartition {rel_dir} to {launched} worker(s): {e}"))
 }
 
 fn remove_set(rel_dir: &str, of: u32) -> Result<(), StorageError> {
@@ -100,12 +90,12 @@ fn remove_set(rel_dir: &str, of: u32) -> Result<(), StorageError> {
     retire_stores(&set)
 }
 
-/// Replicated relations: every child is a copy, so each target hard-links rank
-/// 0's published files, which no publish rewrites in place.
+/// Replicated relations: every child is a copy, so each target hard-links the
+/// replica owner's published files, which no publish rewrites in place.
 fn link_targets(rel_dir: &str, source: u32, launched: u32) -> Result<(), StorageError> {
     let source_dir = ChildAddr {
         kind: ChildKind::Rows,
-        slot: Slot::new(0, source),
+        slot: Slot::new(Placement::REPLICA_OWNER, source),
     }
     .dir(rel_dir);
     let pairs: Vec<(String, String)> = cluster_children(ChildKind::Rows, launched)
@@ -159,22 +149,16 @@ fn rewrite_targets(
             // Ascending subsets of one consolidated cursor, in cursor order.
             buffer.append_above(chunk.ascending_subset(idx));
             if buffer.total_bytes() >= ram_tier_bytes {
-                write_run(target, buffer)?;
+                target.append_terminal_run(&buffer.take())?;
             }
         }
     }
     for (target, buffer) in targets.iter_mut().zip(&mut buffers) {
         if !buffer.is_empty() {
-            write_run(target, buffer)?;
+            target.append_terminal_run(&buffer.take())?;
         }
     }
     flush_barrier(targets.iter_mut(), 0)
-}
-
-fn write_run(target: &mut Table, run: &mut Batch) -> Result<(), StorageError> {
-    target.append_terminal_run(run)?;
-    run.clear();
-    Ok(())
 }
 
 #[cfg(test)]

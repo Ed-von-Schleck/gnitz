@@ -149,7 +149,7 @@ impl Session {
                     ));
                 }
             }
-            ClientVerb::SnapshotClose => drop(self.cat.registry.unpin(ctrl.hdr.arg0)),
+            ClientVerb::SnapshotClose => self.cat.registry.unpin(ctrl.hdr.arg0),
             // Each reads, or moves, nothing a circuit runs over.
             ClientVerb::Resolve
             | ClientVerb::AllocSerialRange

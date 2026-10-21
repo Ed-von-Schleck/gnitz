@@ -1,7 +1,7 @@
 //! The relation registry — what relations this process holds, the stores
 //! behind them, and the snapshots of those stores it has pinned (`snapshot`).
 //!
-//! Every relation enters through [`RelationRegistry::register`].
+//! Every relation enters through [`RelationRegistry::register_at`].
 
 use gnitz_foundation::env::env_num;
 use rustc_hash::FxHashMap;
@@ -28,10 +28,9 @@ mod store_lifecycle;
 mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
-use dirs::ensure_dir;
 pub use dirs::{lock_data_dir, relation_dir, ChildAddr, ChildKind, DirLock};
 pub use disk_usage::{disk_usage, DiskUsage};
-pub(crate) use feed::Feed;
+use feed::Feed;
 use store::Store;
 
 // ---------------------------------------------------------------------------
@@ -54,9 +53,8 @@ pub enum IndexClaim {
 /// for it — dropping the index drops the store.
 pub struct SecondaryIndex {
     store: Store,
-    /// The index's declared column list, in order. A 1-element list is the
-    /// single-column case. Dedup/lookup is exact ordered-list equality on
-    /// `cols.as_slice()`; order is significant (it drives leading-prefix seeks).
+    /// The index's declared column list, in order, which drives leading-prefix
+    /// seeks. A relation holds at most one index per list.
     cols: PkColList,
     /// Full-arity span-encode plan, precomputed at registration so the per-push
     /// consumers do no per-call spec rebuild. It survives every column ALTER of
@@ -111,9 +109,10 @@ impl SecondaryIndex {
         t.range_cursor(gnitz_zset::schema::key::range_band(t.schema(), r), Cut::Now)
     }
 
-    /// Project `source` into this index's layout and ingest the result. The key
-    /// spec rejects rows, so a non-empty `source` can project to nothing.
-    pub(crate) fn project_and_ingest(&mut self, source: &Batch) -> Result<(), StorageError> {
+    /// Project `source` into this index's layout and ingest the result. A
+    /// zero-weight row, or one NULL in an indexed column, has no entry, so a
+    /// non-empty `source` can project to nothing.
+    fn project_and_ingest(&mut self, source: &Batch) -> Result<(), StorageError> {
         let table = self.store.held_mut();
         let projected = index_entries(source, &self.key_spec, table.schema());
         if projected.is_empty() {
@@ -237,9 +236,11 @@ pub enum Residency {
 }
 
 impl Residency {
-    /// True iff this process opens a store for every relation it registers.
+    /// True iff this process opens a store of every user relation and index it
+    /// registers. A stream has none wherever it is registered, and the master
+    /// still holds the system families'.
     #[inline]
-    pub(crate) fn owns_stores(self) -> bool {
+    fn owns_stores(self) -> bool {
         !matches!(self, Residency::Master)
     }
 }
@@ -301,11 +302,6 @@ impl Relation {
         self.pk_repeats
     }
 
-    /// Whether its rows' store codes its heaps.
-    pub fn compress(&self) -> bool {
-        self.compress
-    }
-
     /// The unique secondary indexes a write must still check: one covering the
     /// PK cannot collide, so it is not among them.
     pub fn unique_indexes_to_check(&self) -> impl Iterator<Item = &SecondaryIndex> + '_ {
@@ -328,13 +324,6 @@ impl Relation {
     /// rows `cut` reads.
     pub fn cursor_between(&self, first: &[u8], last: &[u8], cut: Cut) -> ReadCursor {
         self.table().cursor_between(first, last, cut)
-    }
-
-    /// Visit every positive-weight row whose OPK key begins with `prefix`.
-    pub fn for_each_positive_with_prefix(&self, prefix: &[u8], f: impl FnMut(&ReadCursor)) {
-        self.table()
-            .cursor_between(prefix, prefix, Cut::Now)
-            .for_each_positive(f);
     }
 
     /// Materialize every row of this relation's store whose net weight is non-zero.
@@ -360,24 +349,24 @@ impl Relation {
 
     /// Remove `claim` from every index, dropping an index left with none.
     fn release(&mut self, claim: IndexClaim) {
-        for ix in &mut self.indexes {
+        self.indexes.retain_mut(|ix| {
             ix.claims.retain(|&c| c != claim);
-        }
-        self.indexes.retain(|ix| !ix.claims.is_empty());
+            !ix.claims.is_empty()
+        });
     }
 
     /// [`Self::index_on`], `Err` when there is none.
-    pub fn index_or_err(&self, cols: &[u32]) -> Result<&SecondaryIndex, String> {
+    pub(crate) fn index_or_err(&self, cols: &[u32]) -> Result<&SecondaryIndex, String> {
         self.index_on(cols)
             .ok_or_else(|| format!("relation {} has no index on columns {cols:?}", self.id()))
     }
 
     /// The layout a `probe` of this relation answers in.
     pub fn probe_reply_schema(&self, probe: Probe) -> Result<SchemaDescriptor, String> {
-        let schema = self.schema();
+        let schema = self.store.schema();
         match probe {
             Probe::Pk => Ok(schema.pk_only()),
-            Probe::PkColumn(col) => project_schema(&schema, &[col]),
+            Probe::PkColumn(col) => project_schema(schema, &[col]),
             Probe::Index(cols, _) => Ok(self.index_or_err(cols.as_slice())?.schema()),
         }
     }
@@ -400,7 +389,7 @@ impl Relation {
 // The relation to register
 // ---------------------------------------------------------------------------
 
-/// A relation to [`RelationRegistry::register`].
+/// A relation to [`RelationRegistry::register_at`].
 #[derive(Clone, Copy)]
 pub struct RelationSpec {
     pub id: u64,
@@ -426,7 +415,8 @@ pub struct StoreConfig {
     /// The RAM-tier ceiling every store this registry opens is sized to.
     pub ram_tier_bytes: usize,
     /// Rows per `drain_chunk` on every chunked scan this process drives; bounds
-    /// peak scan memory at O(chunk × row_width). Never zero.
+    /// peak scan memory at O(chunk × row_width). A registry clamps it to at
+    /// least one row.
     pub scan_chunk_rows: usize,
     /// Per-worker distinct-group cap for the ad-hoc aggregate fold; bounds the
     /// fold's running values at one per aggregate per group.
@@ -468,17 +458,17 @@ impl StoreConfig {
 /// `Rc`-bearing value it handed out is still alive outside it: those refcounts
 /// are non-atomic.
 pub struct RelationRegistry {
-    pub(crate) tables: FxHashMap<u64, Relation>,
+    tables: FxHashMap<u64, Relation>,
     /// The data directory every relation's [`relation_dir`] sits under.
-    pub(crate) base_dir: String,
+    base_dir: String,
     /// Which worker this process is, of how many: names the `w{k}of{n}` child
     /// its stores open under.
-    pub(crate) slot: Slot,
+    slot: Slot,
     pub(crate) config: StoreConfig,
     /// What this process is to the stores it registered.
-    pub(crate) residency: Residency,
+    residency: Residency,
     /// The snapshots this process holds pinned, by id.
-    pub(crate) snapshots: FxHashMap<u64, snapshot::Pinned>,
+    snapshots: FxHashMap<u64, snapshot::Pinned>,
 }
 
 impl RelationRegistry {
@@ -517,23 +507,13 @@ impl RelationRegistry {
     /// `Err` nothing is entered. A claim's `unique` is trusted: a duplicate can
     /// straddle two workers' slices, so only the caller can check it.
     pub fn add_index(&mut self, owner: u64, claim: IndexClaim, cols: PkColList) -> Result<(), String> {
-        self.enter_index(owner, claim, cols, None)
+        self.add_index_at(owner, claim, cols, None)
     }
 
-    /// [`Self::add_index`] beside an owner [reopened](Self::reopen_view) at
-    /// `generation`: the index's store resumes from its manifest at that
+    /// [`Self::add_index`]; beside an owner [reopened](Self::register_at) at
+    /// `Some(generation)`, the index's store resumes from its manifest at that
     /// generation, and is filled from the owner when it carries none.
-    pub fn reopen_index(
-        &mut self,
-        owner: u64,
-        claim: IndexClaim,
-        cols: PkColList,
-        generation: u64,
-    ) -> Result<(), String> {
-        self.enter_index(owner, claim, cols, Some(generation))
-    }
-
-    fn enter_index(
+    pub fn add_index_at(
         &mut self,
         owner: u64,
         claim: IndexClaim,
@@ -550,28 +530,23 @@ impl RelationRegistry {
         }
         let key_spec = KeySpec::new(cols.as_slice(), &owner_schema)?;
         let index_schema = key_spec.index_schema(&owner_schema);
+        let store = if self.residency.owns_stores() {
+            self.open_index_store(owner, cols, index_schema, resume_at)?
+        } else {
+            Store::Absent(Box::new(index_schema))
+        };
         let mut ix = SecondaryIndex {
             cols,
-            store: Store::Absent(Box::new(index_schema)),
+            store,
             key_spec,
             claims: vec![claim],
             covers_pk: owner_schema.covers_pk(cols.as_slice()),
         };
-        if self.residency.owns_stores() {
-            ix.store = Store::Held(Box::new(self.open_child(
-                owner,
-                ChildKind::Index(ix.cols),
-                index_schema,
-                RecoverySource::Rederive { resume_at },
-                None,
-                false,
-            )?));
-            if !ix.resumed() {
-                let owner_store = &self.tables[&owner].store;
-                ingest::fill_indexes(owner_store, self.config.scan_chunk_rows, owner, &mut [&mut ix])?;
-            }
+        let entry = self.tables.get_mut(&owner).expect("resolved above");
+        if matches!(ix.store, Store::Held(_)) && !ix.resumed() {
+            ingest::fill_indexes(&entry.store, self.config.scan_chunk_rows, owner, &mut [&mut ix])?;
         }
-        self.tables.get_mut(&owner).expect("resolved above").indexes.push(ix);
+        entry.indexes.push(ix);
         Ok(())
     }
 
@@ -588,9 +563,10 @@ impl RelationRegistry {
         self.tables.values_mut().for_each(|entry| entry.release(claim));
     }
 
-    /// Publish a new column schema for a registered base table in place (any
-    /// column ALTER): update the registry copy and push the same value down into
-    /// the owned `Table`, which rebinds its shards if the region count grew.
+    /// Publish a new column schema for relation `id` in place (any column
+    /// ALTER) into its store, where a held `Table` rebinds its shards if the
+    /// region count grew. Refuses a descriptor that is not a trailing append of
+    /// the stored one.
     pub fn swap_schema(&mut self, id: u64, schema: SchemaDescriptor) -> Result<(), String> {
         let entry = self.relation_mut_or_err(id)?;
         // Checked, not asserted: what a stale `key_spec` produces is a silently
@@ -674,7 +650,7 @@ impl RelationRegistry {
     }
 
     /// [`Self::relation_or_err`] as `&mut`.
-    pub(crate) fn relation_mut_or_err(&mut self, id: u64) -> Result<&mut Relation, String> {
+    fn relation_mut_or_err(&mut self, id: u64) -> Result<&mut Relation, String> {
         self.tables.get_mut(&id).ok_or_else(|| Self::unregistered(id))
     }
 

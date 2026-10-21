@@ -1,17 +1,14 @@
-//! Per-process store lifecycle across the fork — the store open, the boot
-//! relayout and child-dir reclamation — and the system families' replay floors
-//! recovery reads.
+//! Per-process store lifecycle across the fork: the store open, the boot
+//! relayout and child-dir reclamation, the traces a view declares and the resume
+//! verdict over its children, the caller record a manifest carries, and the
+//! system families' replay floors recovery reads.
 
 use super::dirs::children_at_generation;
-use super::relation_dir;
-use super::{ChildKind, StateLayout};
-use super::{RelationKind, RelationRegistry, RelationSpec, Residency, SecondaryIndex, Store};
-use crate::storage::{RecoverySource, Table};
+use super::{relation_dir, RelationKind, RelationRegistry, RelationSpec, Residency, SecondaryIndex, StateLayout};
+use crate::storage::Table;
 use gnitz_zset::algebra::Slot;
 
 impl RelationRegistry {
-    // -- Store management (for multi-worker fork) -----------------------------
-
     /// Become rank `rank` as `residency`: open this process's store of every
     /// relation and index, a rederived one from its manifest at `resume_at(id)` or
     /// rebuilt, and fill each index that did not resume. Returns how many it filled.
@@ -42,31 +39,22 @@ impl RelationRegistry {
             let resume_at = resume_at(tid);
             let spec = RelationSpec {
                 id: tid,
-                kind: e.kind(),
+                kind: e.kind,
                 schema: e.schema(),
-                placement: e.placement(),
-                pk_repeats: e.pk_repeats(),
-                compress: e.compress(),
+                placement: e.placement,
+                pk_repeats: e.pk_repeats,
+                compress: e.compress,
             };
             let (store, feed) = self.build_relation_store(spec, resume_at)?;
             let index_stores = e
                 .indexes
                 .iter()
-                .map(|ix| {
-                    self.open_child(
-                        tid,
-                        ChildKind::Index(ix.cols),
-                        ix.schema(),
-                        RecoverySource::Rederive { resume_at },
-                        None,
-                        false,
-                    )
-                })
+                .map(|ix| self.open_index_store(tid, ix.cols, ix.schema(), resume_at))
                 .collect::<Result<Vec<_>, _>>()?;
             let entry = self.tables.get_mut(&tid).expect("listed above");
             (entry.store, entry.feed) = (store, feed);
-            for (ix, t) in entry.indexes.iter_mut().zip(index_stores) {
-                ix.store = Store::Held(Box::new(t));
+            for (ix, s) in entry.indexes.iter_mut().zip(index_stores) {
+                ix.store = s;
             }
             let mut targets: Vec<&mut SecondaryIndex> = entry.indexes.iter_mut().filter(|ix| !ix.resumed()).collect();
             super::ingest::fill_indexes(&entry.store, chunk_rows, tid, &mut targets)?;

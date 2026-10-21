@@ -524,7 +524,7 @@ fn a_damaged_copy_costs_that_copy_alone() {
                 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec};
                 let mut raw =
                     RelationRegistry::new(&root(path(&dir)), gnitz_zset::algebra::Slot::SOLO, Default::default());
-                raw.reopen_view(
+                raw.register_at(
                     RelationSpec {
                         id: TID,
                         kind: RelationKind::View(gnitz_wire::ViewBudget::Plain),
@@ -533,7 +533,7 @@ fn a_damaged_copy_costs_that_copy_alone() {
                         pk_repeats: false,
                         compress: false,
                     },
-                    FIRST_GENERATION,
+                    Some(FIRST_GENERATION),
                 )
                 .unwrap();
                 raw.set_caller_record(TID, b"not a mirror record".to_vec()).unwrap();

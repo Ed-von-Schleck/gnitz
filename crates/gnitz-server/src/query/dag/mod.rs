@@ -132,17 +132,17 @@ impl DagEngine {
 
     // ── Operator state ──────────────────────────────────────────────────
 
-    /// The operator state of every view `checkpointed` picks, by view id, each
+    /// The operator state of every view `checkpointed` picks, each
     /// opened on a miss: the round that stamps a view's output store stamps its
     /// traces with it, run or not, so the next boot finds them at one generation.
     pub(crate) fn ephemeral_states<'a>(
         &'a mut self,
         registry: &RelationRegistry,
         checkpointed: impl Fn(u64) -> bool,
-    ) -> Result<Vec<(u64, &'a mut CircuitState)>, String> {
+    ) -> Result<Vec<&'a mut CircuitState>, String> {
         let views = self.views.iter_mut().filter(|(&id, _)| checkpointed(id));
         views
-            .map(|(&id, v)| Ok((id, open_state(&mut v.state, registry, id, v.code.vm.layout())?)))
+            .map(|(&id, v)| open_state(&mut v.state, registry, id, v.code.vm.layout()))
             .collect()
     }
 }

@@ -22,7 +22,7 @@ pub(crate) struct PinnedStore {
 }
 
 /// The stores one pin holds, by relation id.
-pub(crate) type Pinned = FxHashMap<u64, PinnedStore>;
+pub(super) type Pinned = FxHashMap<u64, PinnedStore>;
 
 impl RelationRegistry {
     /// Pin, as `snapshot`, the store of every relation whose kind `keep` accepts
@@ -42,9 +42,10 @@ impl RelationRegistry {
                     id,
                     PinnedStore {
                         schema: *table.schema(),
-                        runs: match rel.placement.counts_on(self.slot.rank) {
-                            true => table.runs(Cut::Now).collect(),
-                            false => Vec::new(),
+                        runs: if rel.placement.counts_on(self.slot.rank) {
+                            table.runs(Cut::Now).collect()
+                        } else {
+                            Vec::new()
                         },
                     },
                 )),
@@ -55,9 +56,9 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// Release `snapshot`; whether it was pinned.
-    pub fn unpin(&mut self, snapshot: u64) -> bool {
-        self.snapshots.remove(&snapshot).is_some()
+    /// Release `snapshot`, if it is pinned.
+    pub fn unpin(&mut self, snapshot: u64) {
+        self.snapshots.remove(&snapshot);
     }
 
     /// Whether `snapshot` pinned relation `id` here.

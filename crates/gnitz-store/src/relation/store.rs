@@ -6,7 +6,7 @@ use gnitz_zset::repr::StorageError;
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// This process's store of one relation or index.
-pub(crate) enum Store {
+pub(super) enum Store {
     Held(Box<Table>),
     /// No store in this process; the schema stays readable.
     Absent(Box<SchemaDescriptor>),
@@ -14,7 +14,7 @@ pub(crate) enum Store {
 
 impl Store {
     /// The schema this store's rows are read in.
-    pub(crate) fn schema(&self) -> &SchemaDescriptor {
+    pub(super) fn schema(&self) -> &SchemaDescriptor {
         match self {
             Store::Held(t) => t.schema(),
             Store::Absent(s) => s,
@@ -23,7 +23,7 @@ impl Store {
 
     /// Publish a new schema for this store, down into a held `Table`, which
     /// rebinds its shards if the region count grew.
-    pub(crate) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
+    pub(super) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
         match self {
             Store::Held(t) => t.swap_schema(schema),
             Store::Absent(s) => {
@@ -35,7 +35,7 @@ impl Store {
 
     /// The `Table` this process holds; panics on [`Store::Absent`].
     #[track_caller]
-    pub(crate) fn held(&self) -> &Table {
+    pub(super) fn held(&self) -> &Table {
         match self {
             Store::Held(t) => t,
             Store::Absent(_) => not_held(),
@@ -44,7 +44,7 @@ impl Store {
 
     /// [`Self::held`] as `&mut`.
     #[track_caller]
-    pub(crate) fn held_mut(&mut self) -> &mut Table {
+    pub(super) fn held_mut(&mut self) -> &mut Table {
         match self {
             Store::Held(t) => t,
             Store::Absent(_) => not_held(),
@@ -52,7 +52,7 @@ impl Store {
     }
 
     /// The `Table`, if this process holds one.
-    pub(in crate::relation) fn table_mut(&mut self) -> Option<&mut Table> {
+    pub(super) fn table_mut(&mut self) -> Option<&mut Table> {
         match self {
             Store::Held(t) => Some(t),
             Store::Absent(_) => None,

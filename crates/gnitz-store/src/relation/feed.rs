@@ -67,12 +67,6 @@ impl Feed {
         let first = self.rounds.partition_point(|&(r, _)| r <= after);
         self.rounds.range(first..).map(|(_, delta)| delta)
     }
-
-    /// What the rounds retained are charged.
-    #[cfg(test)]
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.bytes
-    }
 }
 
 #[cfg(test)]

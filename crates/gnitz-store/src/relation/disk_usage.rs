@@ -49,27 +49,20 @@ impl FileTotals {
 #[derive(Default)]
 pub struct DiskUsage {
     shards: BTreeMap<StoreLevel, ShardTotals>,
-    /// Bytes the filesystem allocated to the shards counted above.
-    shard_allocated: u64,
+    /// Every shard counted above, each file once however many names it has.
+    shard_total: FileTotals,
     /// Shard files that are further names of one already counted.
     linked: FileTotals,
     /// Files named as shards whose descriptive prefix does not read as one.
     unreadable: FileTotals,
-    /// Stores holding a shard another store holds byte for byte, with the
-    /// files and bytes past one copy.
+    /// The stores holding one shard body more than once, byte for byte (several
+    /// stores, or one store twice), with the files and bytes past one copy.
     identical: BTreeMap<Vec<(u64, String)>, FileTotals>,
     /// Every other file, by name.
     other: BTreeMap<String, FileTotals>,
 }
 
-impl DiskUsage {
-    /// Shard bytes, each file counted once however many names it has.
-    fn shard_bytes(&self) -> u64 {
-        self.shards.values().map(|t| t.bytes).sum()
-    }
-}
-
-/// Walk `base_dir`. A file that vanishes mid-walk is skipped: a running server
+/// Walk `base_dir`. A file or directory that vanishes mid-walk is skipped: a running server
 /// unlinks shards as it compacts.
 pub fn disk_usage(base_dir: &str) -> Result<DiskUsage, String> {
     let mut usage = DiskUsage::default();
@@ -112,7 +105,7 @@ pub fn disk_usage(base_dir: &str) -> Result<DiskUsage, String> {
             usage.unreadable.add(&meta);
             continue;
         };
-        usage.shard_allocated += meta.blocks() * 512;
+        usage.shard_total.add(&meta);
         bodies
             .entry((meta.len(), shard.body_checksum, shard.rows))
             .or_default()
@@ -127,14 +120,15 @@ pub fn disk_usage(base_dir: &str) -> Result<DiskUsage, String> {
         }
     }
     for ((len, _, _), mut holders) in bodies {
-        let copies = holders.len() as u64;
+        let extra = holders.len() as u64 - 1;
+        if extra == 0 {
+            continue;
+        }
         holders.sort();
         holders.dedup();
-        if copies > 1 {
-            let t = usage.identical.entry(holders).or_default();
-            t.files += copies - 1;
-            t.bytes += len * (copies - 1);
-        }
+        let t = usage.identical.entry(holders).or_default();
+        t.files += extra;
+        t.bytes += len * extra;
     }
     other_files(Path::new(base_dir), &inodes, &mut usage.other).map_err(|e| format!("walk '{base_dir}': {e}"))?;
     Ok(usage)
@@ -147,10 +141,13 @@ fn other_files(
     out: &mut BTreeMap<String, FileTotals>,
 ) -> std::io::Result<()> {
     for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+        let Ok(entry) = entry else { continue };
         let Ok(meta) = entry.metadata() else { continue };
         if meta.is_dir() {
-            other_files(&entry.path(), shards, out)?;
+            match other_files(&entry.path(), shards, out) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                r => r?,
+            }
         } else if !shards.contains(&(meta.dev(), meta.ino())) {
             let name = entry.file_name().to_string_lossy().into_owned();
             out.entry(name).or_default().add(&meta);
@@ -172,9 +169,10 @@ impl fmt::Display for DiskUsage {
             regions.sort_by_key(|&(_, &bytes)| std::cmp::Reverse(bytes));
             let shares: Vec<String> = regions
                 .iter()
-                .map(|((role, encoding), &bytes)| (role, encoding, bytes * 100 / t.bytes.max(1)))
-                .filter(|&(_, _, pct)| pct > 0)
-                .map(|(role, encoding, pct)| format!("{role} {encoding} {pct}%"))
+                .filter_map(|((role, encoding), &bytes)| {
+                    let pct = bytes * 100 / t.bytes.max(1);
+                    (pct > 0).then(|| format!("{role} {encoding} {pct}%"))
+                })
                 .collect();
             writeln!(
                 f,
@@ -187,12 +185,11 @@ impl fmt::Display for DiskUsage {
                 shares.join(", ")
             )?;
         }
-        let files: u64 = self.shards.values().map(|t| t.files).sum();
+        let t = &self.shard_total;
         writeln!(
             f,
-            "shards: {files} files, {} bytes, {} allocated",
-            self.shard_bytes(),
-            self.shard_allocated
+            "shards: {} files, {} bytes, {} allocated",
+            t.files, t.bytes, t.allocated
         )?;
         if self.linked.files > 0 {
             writeln!(

@@ -1,6 +1,6 @@
 use super::*;
-use crate::relation::{RelationKind, StoreConfig};
-use crate::storage::{flush_barrier, manifest_path};
+use crate::relation::{IndexClaim, StateLayout, StoreConfig};
+use crate::storage::flush_barrier;
 use crate::test_support::{
     flip_last_byte_in_place, make_batch_raw, make_schema_u64_i64, relation_fixture_with, scratch_table, solo, spec,
     spilling, zset_of, TID,
@@ -188,11 +188,11 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
     r.register(spec(TID, RelationKind::BaseTable, schema)).unwrap();
     r.add_index(
         TID,
-        crate::relation::IndexClaim::Index { id: TID + 1, unique: false },
+        IndexClaim::Index { id: TID + 1, unique: false },
         PkColList::from_slice(&[1]),
     )
     .unwrap();
-    let mut traces = crate::relation::StateLayout::default();
+    let mut traces = StateLayout::default();
     traces.declare("agg".to_string(), schema);
     r.declare_traces(TID, &traces).unwrap();
     r.ingest(TID, make_batch_raw(&schema, &[(1, 1, 7)])).unwrap();

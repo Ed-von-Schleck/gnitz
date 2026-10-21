@@ -4,7 +4,7 @@
 use std::num::NonZeroU64;
 use std::path::Path;
 
-use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
+use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StoreConfig};
 use crate::storage::{RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{
@@ -196,6 +196,16 @@ pub(crate) fn id_rows(
         bb.end_row();
     }
     bb.finish()
+}
+
+/// Assert `ix` holds exactly the entries `rows` project to, weights included.
+pub(crate) fn assert_index_holds(ix: &SecondaryIndex, rows: &Batch, what: impl std::fmt::Display) {
+    let want = gnitz_zset::algebra::index_entries(rows, &ix.key_spec(), &ix.schema());
+    assert_eq!(
+        gnitz_zset_testkit::zset_of(&ix.cursor().materialize(), &ix.schema()),
+        gnitz_zset_testkit::zset_of(&want, &ix.schema()),
+        "{what}"
+    );
 }
 
 /// `program` as a sink map declaring `reply`'s payload columns.

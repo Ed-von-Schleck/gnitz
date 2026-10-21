@@ -1,7 +1,7 @@
 //! Every read over the system stores: live rows by id or name, an owner's band of
 //! rows and the retraction of one, column records, schema and relation names.
 
-use gnitz_store::relation::Relation;
+use gnitz_store::relation::{Cut, Relation};
 use gnitz_wire::sys_rows::{ColTabRow, SchemaTabRow, SchemaTabSlot};
 use gnitz_wire::{payload_bytes, payload_str, payload_u64};
 use gnitz_zset::repr::{Batch, ReadCursor, StoredRow};
@@ -68,8 +68,10 @@ impl CatalogEngine {
     /// Visit every live row of `family` whose leading key column is `leading`: the
     /// row itself for a single-column key, the owner's whole band for a pair.
     pub(in crate::catalog) fn for_each_row_under(&self, family: SysFamily, leading: u64, f: impl FnMut(&ReadCursor)) {
+        let key = gnitz_wire::sys_key(leading);
         self.sys_relation(family)
-            .for_each_positive_with_prefix(&gnitz_wire::sys_key(leading), f)
+            .cursor_between(&key, &key, Cut::Now)
+            .for_each_positive(f)
     }
 
     /// The live rows of `family` that `keep` selects, in key order.

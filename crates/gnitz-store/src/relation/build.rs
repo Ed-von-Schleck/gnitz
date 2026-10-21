@@ -1,5 +1,6 @@
 //! Opening a relation's stores and entering it in the registry.
 
+use super::dirs::ensure_dir;
 use super::*;
 use gnitz_foundation::fault::Seam;
 
@@ -8,22 +9,16 @@ use gnitz_foundation::fault::Seam;
 static TABLE_CREATE_DELAY: Seam = Seam::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS");
 
 impl RelationRegistry {
-    /// Enter a relation, its stores opened fresh.
+    /// [`Self::register_at`] with a view's rows rebuilt.
     pub fn register(&mut self, spec: RelationSpec) -> Result<(), String> {
-        let stores = self.build_relation_store(spec, None)?;
-        self.enter(spec, stores);
-        Ok(())
+        self.register_at(spec, None)
     }
 
-    /// Enter a view whose rows open from the manifest at `generation` already in
-    /// its directory; `Err`, entering nothing, otherwise.
-    pub fn reopen_view(&mut self, spec: RelationSpec, generation: u64) -> Result<(), String> {
-        let stores = self.build_relation_store(spec, Some(generation))?;
-        self.enter(spec, stores);
-        Ok(())
-    }
-
-    fn enter(&mut self, spec: RelationSpec, (store, feed): (Store, Option<Feed>)) {
+    /// Enter a relation. A view's rows open from the manifest at
+    /// `Some(generation)` already in its directory, `Err` entering nothing when
+    /// there is none, and are rebuilt at `None`.
+    pub fn register_at(&mut self, spec: RelationSpec, resume_at: Option<u64>) -> Result<(), String> {
+        let (store, feed) = self.build_relation_store(spec, resume_at)?;
         let RelationSpec {
             id,
             kind,
@@ -48,6 +43,7 @@ impl RelationRegistry {
             },
         );
         debug_assert!(prev.is_none(), "relation {id} registered twice");
+        Ok(())
     }
 
     /// This process's stores for a relation: its rows, and a fed view's feed. A
@@ -67,9 +63,15 @@ impl RelationRegistry {
             // layout that a worker-count change relays and reclaims.
             RelationKind::SystemCatalog => {
                 let dir = relation_dir(&self.base_dir, id);
-                let ram_tier_bytes = self.config.ram_tier_bytes;
-                let table = Table::new(&dir, schema, RecoverySource::SalReplay, ram_tier_bytes, None, false)
-                    .map_err(|e| format!("open store '{dir}': {e}"))?;
+                let table = Table::new(
+                    &dir,
+                    schema,
+                    RecoverySource::SalReplay,
+                    self.config.ram_tier_bytes,
+                    None,
+                    false,
+                )
+                .map_err(|e| format!("open store '{dir}': {e}"))?;
                 return Ok((Store::Held(Box::new(table)), None));
             }
             // The master opens no user store, but it still creates the relation's
@@ -94,6 +96,20 @@ impl RelationRegistry {
         // Empty at every open: no delta expresses what a boot does to a view, so every cursor restarts.
         let feed = feed.filter(|_| placement.counts_on(self.slot.rank)).map(Feed::new);
         Ok((Store::Held(Box::new(rows)), feed))
+    }
+
+    /// This process's store of the index on `owner` over `cols`, resumed from its
+    /// manifest at `resume_at` when it carries one.
+    pub(super) fn open_index_store(
+        &self,
+        owner: u64,
+        cols: PkColList,
+        schema: SchemaDescriptor,
+        resume_at: Option<u64>,
+    ) -> Result<Store, String> {
+        let recovery = RecoverySource::Rederive { resume_at };
+        let table = self.open_child(owner, ChildKind::Index(cols), schema, recovery, None, false)?;
+        Ok(Store::Held(Box::new(table)))
     }
 
     /// [`Self::open_child`], `Err` for a store asked to resume that did not.

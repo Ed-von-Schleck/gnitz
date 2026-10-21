@@ -12,7 +12,7 @@ use gnitz_zset::repr::{Batch, StoredRow};
 /// Enforce unique-PK semantics on an ingest batch: per PK, the batch's last
 /// non-zero row decides over whatever the store holds. A held key's stored row
 /// is retracted; the last row survives, at `+1`, iff it is an insert.
-pub(crate) fn enforce_unique_pk(store: &Table, mut batch: Batch) -> Batch {
+pub(super) fn enforce_unique_pk(store: &Table, mut batch: Batch) -> Batch {
     let schema = store.schema();
     batch.set_schema(schema);
     // A push at `w > 1` is the row repeated; a live base-table row weighs 1.

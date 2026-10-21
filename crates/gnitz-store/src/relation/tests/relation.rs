@@ -1,6 +1,7 @@
 use super::*;
 use crate::test_support::{
-    id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, solo, spec, zset_of, TID,
+    assert_index_holds, id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, solo,
+    spec, TID,
 };
 
 fn index(id: u64, unique: bool) -> IndexClaim {
@@ -162,15 +163,11 @@ fn a_reopened_index_resumes_only_at_its_owners_generation() {
     }
     let reopen = |index_generation: u64| {
         let mut r = solo(tmp.path());
-        r.reopen_view(spec, 5).unwrap();
-        r.reopen_index(9, index(1, false), cols, index_generation).unwrap();
+        r.register_at(spec, Some(5)).unwrap();
+        r.add_index_at(9, index(1, false), cols, Some(index_generation))
+            .unwrap();
         let ix = r.relation(9).unwrap().index_on(&[1]).unwrap();
-        let want = gnitz_zset::algebra::index_entries(&rows, &ix.key_spec(), &ix.schema());
-        assert_eq!(
-            zset_of(&ix.cursor().materialize(), &ix.schema()),
-            zset_of(&want, &ix.schema()),
-            "generation {index_generation}"
-        );
+        assert_index_holds(ix, &rows, format_args!("generation {index_generation}"));
         ix.resumed()
     };
     assert!(reopen(5), "published with its owner");

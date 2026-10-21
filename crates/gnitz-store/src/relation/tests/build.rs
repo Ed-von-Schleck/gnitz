@@ -21,7 +21,7 @@ fn a_master_creates_the_relation_directory_and_no_child() {
         .unwrap();
     let dir = relation_dir(registry.base_dir(), 50);
     assert!(std::path::Path::new(&dir).is_dir());
-    assert_eq!(super::super::dirs::subdir_names(&dir).unwrap(), Vec::<String>::new());
+    assert_eq!(dirs::subdir_names(&dir).unwrap(), Vec::<String>::new());
 }
 
 /// A view told to resume opens only from its manifests: its store from the
@@ -45,11 +45,11 @@ fn a_resumed_view_refuses_a_missing_manifest() {
         let mut origin = solo(tmp.path());
         origin.register(spec).unwrap();
         let mut state = CircuitState::open(&origin, 7, &layout()).unwrap();
-        origin.checkpoint_ephemeral([(7, &mut state)], 0, |_| true).unwrap();
+        origin.checkpoint_ephemeral([&mut state], 0, |_| true).unwrap();
     }
     let reopen = || {
         let mut r = solo(tmp.path());
-        r.reopen_view(spec, 0).map(|()| r)
+        r.register_at(spec, Some(0)).map(|()| r)
     };
     let trace = |r: &RelationRegistry| CircuitState::open(r, 7, &layout()).map(drop);
     let worker = |resume: bool| {
@@ -70,7 +70,7 @@ fn a_resumed_view_refuses_a_missing_manifest() {
 
     std::fs::remove_file(child(ChildKind::Rows)).unwrap();
     let mut r = solo(tmp.path());
-    assert!(r.reopen_view(spec, 0).is_err());
+    assert!(r.register_at(spec, Some(0)).is_err());
     assert!(!r.has_id(7), "a refused view is not entered");
     assert!(worker(true).is_err());
     worker(false).expect("told to rebuild, a worker opens the view");

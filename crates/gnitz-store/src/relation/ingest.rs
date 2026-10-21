@@ -1,7 +1,7 @@
 //! The ingestion pipeline: unique-PK enforcement, store + secondary-index
 //! application, delta capture, and the flush / checkpoint table collection.
 
-use super::{RelationKind, RelationRegistry, SecondaryIndex, Store};
+use super::{CircuitState, Cut, RelationKind, RelationRegistry, SecondaryIndex, Store};
 use crate::storage::Table;
 use gnitz_zset::repr::{Batch, StorageError};
 use std::rc::Rc;
@@ -39,14 +39,13 @@ pub(super) fn fill_indexes(
             ix.cols.as_slice()
         );
     }
-    let mut source = owner.held().open_cursor(super::Cut::Now);
+    let mut source = owner.held().open_cursor(Cut::Now);
     while let Some(chunk) = source.drain_chunk(chunk_rows) {
         for ix in targets.iter_mut() {
-            let cols = ix.cols;
             ix.project_and_ingest(&chunk).map_err(|e| {
                 format!(
                     "fill index on columns {:?} of relation {owner_id}: {e}",
-                    cols.as_slice()
+                    ix.cols.as_slice()
                 )
             })?;
         }
@@ -58,8 +57,9 @@ impl RelationRegistry {
     // ── Ingestion ───────────────────────────────────────────────────────
 
     /// Apply `batch` to `id`'s store and its index projections, moving it in.
-    /// Kind-uniform: a base table's PK rule runs, everything else is written as
-    /// it stands.
+    /// A base table's PK rule runs and a view's batch is consolidated; a stream
+    /// writes nothing, holding no rows; a system family's batch is written as it
+    /// stands.
     pub fn ingest(&mut self, id: u64, batch: Batch) -> Result<(), String> {
         // Rows left above the cut would stay there: nothing seals a relation no
         // view reads.
@@ -95,7 +95,8 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// [`Self::ingest`], captured as round `round` by the delta feed this process
+    /// [`Self::ingest`] without its seal of pending rows (its callers write views,
+    /// which hold none), captured as round `round` by the delta feed this process
     /// serves for `id`; the batch as applied comes back iff `echo` and it holds
     /// a row.
     pub fn ingest_at(
@@ -150,12 +151,11 @@ impl RelationRegistry {
         }
 
         for ix in entry.indexes.iter_mut() {
-            let cols = ix.cols;
             let res = ix.project_and_ingest(&effective);
             inject_ingest_apply_error("index", kind, res).map_err(|e| {
                 format!(
                     "ingest into index on columns {:?} of relation {id}: {e}",
-                    cols.as_slice()
+                    ix.cols.as_slice()
                 )
             })?;
         }
@@ -246,11 +246,11 @@ impl RelationRegistry {
     /// open rebuilds it.
     pub fn checkpoint_ephemeral<'s>(
         &mut self,
-        state: impl IntoIterator<Item = (u64, &'s mut crate::relation::CircuitState)>,
+        state: impl IntoIterator<Item = &'s mut CircuitState>,
         generation: u64,
         resumes: impl Fn(u64) -> bool,
     ) -> Result<(), String> {
-        let mut tables: Vec<&mut Table> = state.into_iter().flat_map(|(_, s)| s.tables_mut()).collect();
+        let mut tables: Vec<&mut Table> = state.into_iter().flat_map(CircuitState::tables_mut).collect();
         tables.extend(self.collect_user_tables(resumes).filter(|t| t.is_rederived()));
         crate::storage::flush_barrier(tables, generation).map_err(|e| format!("ephemeral flush: {e}"))
     }

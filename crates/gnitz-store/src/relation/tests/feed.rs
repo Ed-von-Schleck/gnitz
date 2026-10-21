@@ -48,7 +48,7 @@ fn a_feed_holds_its_newest_whole_rounds_within_budget() {
             }
             let (floor, held_now) = (first.checked_sub(1).map_or(0, |i| history[i].0), &history[first..]);
             assert_eq!(feed.dropped_through(), floor, "seed {seed}");
-            assert_eq!(feed.retained_bytes(), held_now.iter().map(|m| m.2).sum::<usize>());
+            assert_eq!(feed.bytes, held_now.iter().map(|m| m.2).sum::<usize>());
             let after = rng.gen_range(round + 2);
             let want: Vec<usize> = held_now.iter().filter(|m| after < m.0).map(|m| m.1).collect();
             assert_eq!(lens(&feed, after), want, "seed {seed} after {after}");
