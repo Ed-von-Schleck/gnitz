@@ -442,6 +442,9 @@ fn run_server(
 
     gnitz_info!("Opening database at {}", data_dir);
 
+    // Held for the life of the process, from before any store opens; a forked
+    // worker shares it.
+    let _dir_lock = gnitz_store::relation::lock_data_dir(data_dir)?;
     let opened = CatalogEngine::open_master(data_dir, num_workers, StoreConfig::from_env("GNITZ_"))
         .map_err(|e| format!("failed to open catalog: {e}"))?;
     listen::clear_published(data_dir)?;

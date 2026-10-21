@@ -225,8 +225,9 @@ pub enum Residency {
     /// The server's master: holds the system families' stores and no user store,
     /// which is what lets it relay and reclaim any rank's children.
     Master,
-    /// A standalone host — a mirror, a unit-test engine or fixture: owns every
-    /// store it registers, at its slot, and may read any rank's manifests.
+    /// A standalone host — a mirror, a unit-test engine or fixture: the one
+    /// process on its data directory, owns every store it registers, at its
+    /// slot, and may read any rank's manifests.
     Origin,
     /// A forked worker, at its own slot. Owns its stores; speaks for itself.
     Worker,

@@ -8,7 +8,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use super::dirs::{parse_relation_dir_name, relations_dir, subdir_names, ChildAddr, ChildKind};
+use super::dirs::{parse_relation_dir_name, relation_dir, relations_dir, subdir_names, ChildAddr, ChildKind};
 use crate::storage::shard_files;
 use gnitz_zset::repr::ShardDirectory;
 
@@ -76,21 +76,21 @@ pub fn disk_usage(base_dir: &str) -> Result<DiskUsage, String> {
     let mut inodes = HashSet::new();
     // (length, body digest, rows) -> the stores holding such a shard.
     let mut bodies: BTreeMap<(u64, u64, usize), Vec<(u64, String)>> = BTreeMap::new();
-    let root = relations_dir(base_dir);
-    let listed = |dir: &str| subdir_names(dir).map_err(|e| format!("list '{dir}': {e}"));
     let mut shards = Vec::new();
-    for rel in listed(&root)? {
+    for rel in subdir_names(&relations_dir(base_dir))? {
         let Some(id) = parse_relation_dir_name(&rel) else {
             continue;
         };
-        let rel_dir = format!("{root}/{rel}");
+        let rel_dir = relation_dir(base_dir, id);
         // A system family's one store is its relation directory itself.
         let mut stores = vec![(rel_dir.clone(), ChildKind::Rows.label())];
-        for child in listed(&rel_dir)? {
-            if let Some(addr) = ChildAddr::parse(&child) {
-                stores.push((format!("{rel_dir}/{child}"), addr.kind.label()));
-            }
-        }
+        let children = subdir_names(&rel_dir)?;
+        stores.extend(
+            children
+                .iter()
+                .filter_map(|n| ChildAddr::parse(n))
+                .map(|c| (c.dir(&rel_dir), c.kind.label())),
+        );
         for (dir, label) in stores {
             let Ok(files) = shard_files(&dir) else { continue };
             shards.extend(

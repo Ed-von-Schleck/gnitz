@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use gnitz_store::relation::{lock_data_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
+use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
@@ -52,13 +52,9 @@ impl CatalogEngine {
         num_workers: u32,
         config: StoreConfig,
     ) -> Result<UnreplayedCatalog, String> {
-        // Before any store opens.
-        let dir_lock = lock_data_dir(base_dir)?;
-
         let mut engine = CatalogEngine {
             registry: RelationRegistry::master(base_dir, num_workers, config),
             dag: DagEngine::default(),
-            _dir_lock: dir_lock,
             caches: CatalogCacheSet::default(),
             next_id: gnitz_wire::FIRST_USER_TABLE_ID,
             system_zone: 0,

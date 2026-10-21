@@ -22,8 +22,7 @@ use gnitz_zset::schema::SchemaDescriptor;
 /// checkpoint, so the SAL tail still holds its rows.
 fn relay_source(rel_dir: &str, launched: u32) -> Result<Option<u32>, String> {
     let mut foreign = BTreeSet::new();
-    let names = subdir_names(rel_dir).map_err(|e| format!("repartition: list {rel_dir}: {e}"))?;
-    for name in names {
+    for name in subdir_names(rel_dir)? {
         match ChildAddr::parse(&name) {
             Some(ChildAddr { kind: ChildKind::Rows, slot }) if slot.of != launched => {
                 foreign.insert(slot.of);

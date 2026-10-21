@@ -34,7 +34,7 @@ mod write_path;
 #[cfg(test)]
 mod suites;
 
-use gnitz_store::relation::{DirLock, RelationRegistry};
+use gnitz_store::relation::RelationRegistry;
 
 use crate::query::DagEngine;
 use cache::CatalogCacheSet;
@@ -61,8 +61,6 @@ pub(crate) struct CatalogEngine {
     /// and no VM at all, which is what the split exists for.
     pub(crate) registry: RelationRegistry,
     pub(crate) dag: DagEngine,
-
-    _dir_lock: DirLock,
 
     /// Every derived lookup the catalog maintains from system-table deltas and
     /// relation registrations.
