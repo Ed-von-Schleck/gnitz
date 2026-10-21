@@ -82,7 +82,7 @@ impl RelationRegistry {
         let entry = self.relation_mut_or_err(id)?;
         match entry.store.table_mut() {
             Some(table) => table.seal().map_err(|e| format!("seal relation {id}: {e}")),
-            None => Ok(entry.unsealed.take()),
+            None => Ok(entry.unsealed.take().filter(|delta| !delta.is_empty())),
         }
     }
 
@@ -96,7 +96,8 @@ impl RelationRegistry {
     }
 
     /// [`Self::ingest`], captured as round `round` by the delta feed this process
-    /// serves for `id`; the batch as applied comes back iff `echo`.
+    /// serves for `id`; the batch as applied comes back iff `echo` and it holds
+    /// a row.
     pub fn ingest_at(
         &mut self,
         id: u64,
@@ -145,7 +146,7 @@ impl RelationRegistry {
             RelationKind::SystemCatalog => batch,
         };
         if effective.is_empty() {
-            return Ok(echo.then_some(effective));
+            return Ok(None);
         }
 
         for ix in entry.indexes.iter_mut() {

@@ -101,8 +101,8 @@ fn ingest_err(op: &str, idx: StateIdx, e: StorageError) -> String {
 }
 
 /// One run of a program over the delta seeding one register. The seed is lent:
-/// it comes back folded where its register folds, and empty where `take` let
-/// its last reader have it.
+/// it comes back labelled with its register's schema, folded where its
+/// register folds, and empty where `take` let its last reader have it.
 pub(in crate::query) struct Epoch<'e> {
     reg: DeltaReg,
     seed: &'e mut Batch,
@@ -230,18 +230,23 @@ fn run_through(
     }
 }
 
-/// Fold the seed where its register folds.
+/// Label the seed with its register's schema, and fold it where its register
+/// folds.
 fn begin(vm: &mut Vm, epoch: &Epoch<'_>) {
-    let seed = &vm.batches[epoch.reg.at()];
+    let seed = &mut vm.batches[epoch.reg.at()];
+    let want = &vm.regs[epoch.reg.at()].schema;
     // Rows under the wrong layout would scramble every downstream read
     // silently. An empty batch has no rows to misread, so it is exempt.
     if !seed.is_empty() {
         assert_eq!(
             seed.schema().num_columns(),
-            vm.schema_of(epoch.reg).num_columns(),
+            want.num_columns(),
             "VM register {} schema/batch column-count mismatch",
             epoch.reg.0,
         );
+        // A producer's label may be narrower in nullability, and a round sends
+        // the seed under the label every worker sends it under.
+        seed.set_schema(want);
     }
     fold_written(&mut vm.batches, &vm.regs, epoch.reg);
 }

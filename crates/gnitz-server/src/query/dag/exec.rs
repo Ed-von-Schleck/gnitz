@@ -6,7 +6,8 @@ use std::collections::hash_map::Entry;
 
 // ── Epoch execution ─────────────────────────────────────────────────────
 
-/// Run one view's epoch over `input`, `src_id`'s delta, which it may `take`.
+/// Run one view's epoch over `input`, `src_id`'s delta, which it may `take`;
+/// `None` is an empty delta. Answers `None` where the epoch produced no row.
 /// `unfed`: the sources the view has been fed no row of — none, past its
 /// backfill. `drained`: what each round it runs passes to
 /// [`DriveHost::exchange`], and takes from it.
@@ -15,21 +16,27 @@ use std::collections::hash_map::Entry;
 fn run_view_epoch(
     host: &mut impl DriveHost,
     view_id: u64,
-    input: &mut Batch,
+    input: Option<&mut Batch>,
     take: bool,
     src_id: u64,
     unfed: &[u64],
     drained: &mut bool,
-) -> Result<Batch, String> {
-    let reg = {
+) -> Result<Option<Batch>, String> {
+    let mut empty;
+    let (reg, input) = {
         let (dag, registry) = host.parts();
         let (code, _) = opened(&mut dag.views, registry, view_id, unfed)?;
         let scan = code.sources.get(&src_id);
         let reg = scan.expect("the dep map names only sources the view's circuit scans").0;
-        if input.is_empty() && code.vm.idles_on_empty(reg) {
-            return Ok(Batch::empty_with_schema(code.vm.out_schema()));
+        match input.filter(|input| !input.is_empty()) {
+            Some(input) => (reg, input),
+            None if code.vm.idles_on_empty(reg) => return Ok(None),
+            // Its round runs on every worker, whatever this one holds.
+            None => {
+                empty = Batch::empty_with_schema(code.vm.schema_of(reg));
+                (reg, &mut empty)
+            }
         }
-        reg
     };
     let mut epoch = vm::Epoch::tick(reg, input, take);
     let mut gathered = None;
@@ -37,7 +44,7 @@ fn run_view_epoch(
         let (dag, registry) = host.parts();
         let (code, mut stores) = opened(&mut dag.views, registry, view_id, unfed)?;
         match vm::run(&mut code.vm, &mut stores, &mut epoch, gathered.take())? {
-            vm::Ran::Done(out) => return Ok(out),
+            vm::Ran::Done(out) => return Ok((!out.is_empty()).then_some(out)),
             vm::Ran::Round { plan, batch, fold } => {
                 let rows;
                 (rows, *drained) = host.exchange(view_id, batch, &plan, fold, *drained);
@@ -83,15 +90,14 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
         let bound = dag.views[&view].code.sources[&source].1.clone();
         let relation = registry.relation_or_err(source)?;
         let (mut cursor, _unapplied) = relation.open_bound(bound, Cut::Sealed)?;
-        let schema = relation.schema();
         let unfed = &sources[at + 1..];
         loop {
-            let chunk = cursor.drain_chunk(chunk_rows);
+            let mut chunk = cursor.drain_chunk(chunk_rows);
+            // `None` once drained, until every worker is: all run the same rounds.
             let mut drained = chunk.is_none();
-            // Empty once drained, until every worker is: all run the same rounds.
-            let mut input = chunk.unwrap_or_else(|| Batch::empty_with_schema(&schema));
-            let out = run_view_epoch(host, view, &mut input, true, source, unfed, &mut drained)?;
-            host.parts().1.ingest_at(view, out, None, false)?;
+            if let Some(out) = run_view_epoch(host, view, chunk.as_mut(), true, source, unfed, &mut drained)? {
+                host.parts().1.ingest_at(view, out, None, false)?;
+            }
             if drained {
                 break;
             }
@@ -112,29 +118,23 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
 // Inlined: `delta` is taken by value, and at a call it is copied whole.
 #[inline(always)]
 fn run_tick(host: &mut impl DriveHost, source: u64, round: u64, delta: Option<Batch>) -> Result<(), String> {
-    let (dag, registry) = host.parts();
-    let delta = match delta {
-        Some(delta) => delta,
-        // Driven all the same: the other workers' exchange rounds wait on this one.
-        None => Batch::empty_with_schema(&registry.relation_or_err(source)?.schema()),
-    };
-    let schedule = dag.tick_schedule(source);
-    // Sized for the schedule: growing it rehashes it once per doubling.
+    let schedule = host.parts().0.tick_schedule(source);
+    // Sized for the schedule: growing it rehashes it once per doubling. A
+    // producer with no entry produced nothing.
     let mut outputs: FxHashMap<u64, Batch> = FxHashMap::with_capacity_and_hasher(schedule.len(), Default::default());
-    outputs.insert(source, delta);
+    outputs.extend(delta.map(|delta| (source, delta)));
     for &Step { view, producer, last, needed } in schedule.iter() {
         // Lent to every reader, the last of which may take it.
         let input = outputs.get_mut(&producer);
-        let input = input.expect("the schedule runs every producer before the steps it feeds");
-        let out = run_view_epoch(host, view, input, last, producer, &[], &mut false)?;
+        let Some(out) = run_view_epoch(host, view, input, last, producer, &[], &mut false)? else {
+            continue;
+        };
         let (dag, registry) = host.parts();
-        let echo = match out.is_empty() || dag.passes_through(view) {
-            // A tick's delta reaches its readers in this schedule, and an empty one
-            // changes no store.
+        let echo = match dag.passes_through(view) {
+            // A tick's delta reaches its readers in this schedule.
             true => needed.then_some(out),
             false => registry.ingest_at(view, out, Some(round), needed)?,
         };
-        // Kept even when empty, so a reader's exchange rounds run on every worker.
         if let Some(out) = echo {
             match outputs.entry(view) {
                 Entry::Vacant(e) => {
