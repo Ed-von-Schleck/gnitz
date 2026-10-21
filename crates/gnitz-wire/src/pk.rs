@@ -243,6 +243,16 @@ pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {
     }
 }
 
+/// An integer column's cell as its value: under `OPK` a PK column's OPK image,
+/// else a payload column's native bytes.
+#[inline(always)]
+pub fn int_cell<const OPK: bool>(fi: crate::FixedInt, cell: &[u8]) -> i64 {
+    match OPK {
+        true => decode_opk_i64(cell, fi),
+        false => fi.decode_le_i64(cell),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Width-tagged PK byte buffer
 // ---------------------------------------------------------------------------

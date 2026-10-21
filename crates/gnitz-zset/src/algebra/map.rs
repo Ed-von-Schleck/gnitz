@@ -5,17 +5,16 @@
 //! the PK, weight and column moves around the computed columns
 //! `gnitz_expr::MapEval` writes.
 
-use gnitz_expr::{ColCopy, ExprValidateErr, LogicalProgram, MapEval};
+use gnitz_expr::{ColCopy, LogicalProgram, MapEval};
 
 use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
-use crate::repr::{Batch, DirectWriter};
+use crate::repr::{copy_runs, Batch, DirectWriter};
 use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
-use gnitz_wire::{zip_cells, FixedInt};
+use gnitz_wire::{int_cell, zip_cells, FixedInt};
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
-/// `[dst, dst + n)`. The three travel together through every columnar body
-/// below, so they are one value rather than three positional `usize`s a caller
-/// can transpose.
+/// `[dst, dst + n)`: one value rather than three positional `usize`s a
+/// [`copy_column`] caller can transpose.
 #[derive(Clone, Copy)]
 pub(crate) struct RowWindow {
     pub(crate) src: usize,
@@ -102,7 +101,7 @@ pub(crate) fn copy_column(
             if src_stride == stride {
                 gnitz_wire::decode_pk_cells(pk, pk_stride, off, stride, type_code.is_signed_int(), dst);
             } else {
-                widen_column(pk, pk_stride, off, type_code, true, stride, dst);
+                widen_column::<true>(pk, pk_stride, off, type_code, stride, dst);
             }
         }
         ColumnLocator::Payload { slot, size, type_code } => {
@@ -122,36 +121,41 @@ pub(crate) fn copy_column(
             if src_stride == stride {
                 dst.copy_from_slice(src);
             } else {
-                widen_column(src, src_stride, 0, type_code, false, stride, dst);
+                widen_column::<false>(src, src_stride, 0, type_code, stride, dst);
             }
         }
     }
 }
 
 /// [`widen_cells`] at the slot width `dw`: 2, 4 or 8, a widened slot being a fixed int.
-fn widen_column(src: &[u8], src_stride: usize, off: usize, tc: TypeCode, pk: bool, dw: usize, dst: &mut [u8]) {
+fn widen_column<const PK: bool>(src: &[u8], src_stride: usize, off: usize, tc: TypeCode, dw: usize, dst: &mut [u8]) {
     let fi = FixedInt::from_type_code(tc).expect("a widened column is a fixed int");
     match dw {
-        2 => widen_cells::<2>(src, src_stride, off, fi, pk, dst),
-        4 => widen_cells::<4>(src, src_stride, off, fi, pk, dst),
-        8 => widen_cells::<8>(src, src_stride, off, fi, pk, dst),
+        2 => widen_cells::<2, PK>(src, src_stride, off, fi, dst),
+        4 => widen_cells::<4, PK>(src, src_stride, off, fi, dst),
+        8 => widen_cells::<8, PK>(src, src_stride, off, fi, dst),
         other => unreachable!("a widened slot is 2/4/8 bytes, got {other}"),
     }
 }
 
 /// Widen each `fi` cell at byte `off` of `src`'s `src_stride`-byte rows — a PK column's
-/// OPK cell when `pk`, else a native one — into `dst`'s `DW`-byte native cells.
-fn widen_cells<const DW: usize>(src: &[u8], src_stride: usize, off: usize, fi: FixedInt, pk: bool, dst: &mut [u8]) {
+/// OPK cell under `PK`, else a native one — into `dst`'s `DW`-byte native cells.
+/// Out of line: inlined into [`copy_column`], its loop compiles to more
+/// instructions per row.
+#[inline(never)]
+fn widen_cells<const DW: usize, const PK: bool>(
+    src: &[u8],
+    src_stride: usize,
+    off: usize,
+    fi: FixedInt,
+    dst: &mut [u8],
+) {
     let out = dst.as_chunks_mut::<DW>().0.iter_mut();
     gnitz_wire::for_each_fixed_int!(fi, |FI| {
         const W: usize = FI.width();
-        let store = |v: i64, d: &mut [u8; DW]| *d = v.to_le_bytes()[..DW].try_into().unwrap();
-        match pk {
-            true => zip_cells::<W, _>(src, src_stride, off, out, |c, d| {
-                store(gnitz_wire::decode_opk_i64(c, FI), d)
-            }),
-            false => zip_cells::<W, _>(src, src_stride, off, out, |c, d| store(FI.decode_le_i64(c), d)),
-        }
+        zip_cells::<W, _>(src, src_stride, off, out, |c, d| {
+            *d = int_cell::<PK>(FI, c).to_le_bytes()[..DW].try_into().unwrap()
+        })
     });
 }
 
@@ -190,7 +194,7 @@ fn reindex_hash_row(output: &mut DirectWriter<'_>, fold: &FoldCols) {
         {
             let mb = output.written();
             for (key, row) in keys.iter_mut().zip(first + start..first + end) {
-                *key = fold.key_row(&mb, row, mb.get_null_word(row));
+                *key = fold.key_row(&mb, row);
             }
         }
         let pk = &mut output.pk_mut()[start * KEY_BYTES..end * KEY_BYTES];
@@ -199,22 +203,6 @@ fn reindex_hash_row(output: &mut DirectWriter<'_>, fold: &FoldCols) {
         }
         start = end;
     }
-}
-
-/// Output schema of a computed-projection `Map`: the input's PK region (the map
-/// inherits it verbatim, [`PkSource::Inherit`]), then one payload column per
-/// declared `(type_code, nullable)` slot. The declared slots ARE the layout;
-/// `MapPlan::from_map` is what catches a program disagreeing with them.
-fn compute_map_output_schema(
-    in_schema: &SchemaDescriptor,
-    out_cols: &[(TypeCode, bool)],
-) -> Result<SchemaDescriptor, String> {
-    let mut b = DerivedSchema::new();
-    b.push_pk_of(in_schema);
-    for &(tc, nullable) in out_cols {
-        b.push(SchemaColumn::new(tc, nullable));
-    }
-    b.finish().map_err(|e| format!("compute map: output {e}"))
 }
 
 /// Output schema of a HashRow Map: a U128 PK, then each projected column at its
@@ -274,7 +262,6 @@ impl MapPlan {
             }
         };
         Self::from_map(prog, in_schema, &out_schema, pk_source)
-            .map_err(|e| format!("map: program/schema mismatch: {e}"))
     }
 
     /// A computed projection: [`gnitz_wire::MapKind::Compute`]'s whole body, and
@@ -282,13 +269,20 @@ impl MapPlan {
     /// the map inherits the input's PK region verbatim ([`PkSource::Inherit`]),
     /// so no caller can describe a PK region the map does not produce.
     pub(crate) fn from_compute_map(in_schema: &SchemaDescriptor, map: &gnitz_wire::ComputeMap) -> Result<Self, String> {
-        let out_schema = compute_map_output_schema(in_schema, &map.out_cols)?;
+        // The input's PK region, then one payload column per declared
+        // `(type_code, nullable)` slot. The declared slots are the layout;
+        // `from_map` catches a program disagreeing with them.
+        let mut b = DerivedSchema::new();
+        b.push_pk_of(in_schema);
+        for &(tc, nullable) in &map.out_cols {
+            b.push(SchemaColumn::new(tc, nullable));
+        }
+        let out_schema = b.finish().map_err(|e| format!("compute map: output {e}"))?;
         // The only map whose program is client bytes; every other kind builds
         // one from a column list. Rejected, not skipped: skipping a corrupt blob
         // would leave the output at the default empty schema.
         let prog = LogicalProgram::from_blob(&map.program).map_err(|e| format!("map: invalid program: {e}"))?;
         Self::from_map(prog, in_schema, &out_schema, PkSource::Inherit)
-            .map_err(|e| format!("map: program/schema mismatch: {e}"))
     }
 
     /// Map plan from a logical expression program. A pure projection is the
@@ -300,14 +294,14 @@ impl MapPlan {
         in_schema: &SchemaDescriptor,
         out_schema: &SchemaDescriptor,
         pk_source: PkSource,
-    ) -> Result<Self, ExprValidateErr> {
-        let ev = logical.resolve_map(in_schema, out_schema)?;
-        let copied_string_slots = copied_string_slots(ev.copies());
-
+    ) -> Result<Self, String> {
+        let ev = logical
+            .resolve_map(in_schema, out_schema)
+            .map_err(|e| format!("map: program/schema mismatch: {e}"))?;
         Ok(MapPlan {
+            copied_string_slots: copied_string_slots(ev.copies()),
             ev,
             pk_source,
-            copied_string_slots,
             out_schema: *out_schema,
         })
     }
@@ -394,58 +388,35 @@ impl MapPlan {
         // Declined, the carry reserves for relocated copies and string emits alike.
         let heap_at = out.carry_heap(&src.as_mem_batch(), self.copied_string_slots, ranges);
         out.append_session(total).write(total, |out| {
+            let mb = src.as_mem_batch();
+            match &self.pk_source {
+                PkSource::Inherit => {
+                    let stride = src.schema().pk_stride();
+                    debug_assert_eq!(stride, out.schema.pk_stride(), "PkSource::Inherit: PK stride mismatch");
+                    copy_runs::<0>(src.pk(), out.pk_mut(), ranges.iter().copied(), stride);
+                }
+                PkSource::Pack { packer, .. } => {
+                    debug_assert_eq!(out.schema.pk_stride(), packer.out_stride);
+                    packer.pack_rows(out.pk_mut(), packer.out_stride, &mb, ranges);
+                }
+                // Hashes the finished output row, below.
+                PkSource::HashRow(_) => {}
+            }
+            copy_runs::<8>(src.weight(), out.weight_mut(), ranges.iter().copied(), 8);
             let mut dst = 0;
             for &(start, end) in ranges {
                 let w = RowWindow { src: start, dst, n: end - start };
-                self.map_rows_into(src, out, w);
+                for c in self.ev.copies() {
+                    copy_column(src, out, c, w);
+                }
+                self.ev.write_computed(&mb, start, w.n, out, dst);
                 dst += w.n;
             }
             rebase_copied_strings(self.ev.copies(), out, src.blob(), heap_at);
-            // The one source that keys on the finished output row.
             if let PkSource::HashRow(fold) = &self.pk_source {
                 reindex_hash_row(out, fold);
             }
         });
-    }
-
-    /// Map one row window of `output`'s rows: PK, weight, column moves, then the
-    /// null words and computed columns.
-    ///
-    /// `#[inline(always)]`: it runs once per window, and a window can be one row.
-    #[inline(always)]
-    fn map_rows_into(&mut self, in_batch: &Batch, output: &mut DirectWriter<'_>, w: RowWindow) {
-        let RowWindow { src: src_start, dst: dst_base, n } = w;
-        // Both PK sources that read the *input* row, so both belong to the
-        // window rather than to a pass over the finished batch.
-        match &self.pk_source {
-            PkSource::Inherit => {
-                let pk_st = in_batch.schema().pk_stride();
-                debug_assert_eq!(
-                    pk_st,
-                    output.schema.pk_stride(),
-                    "PkSource::Inherit: PK stride mismatch"
-                );
-                output.pk_mut()[dst_base * pk_st..(dst_base + n) * pk_st]
-                    .copy_from_slice(&in_batch.pk()[src_start * pk_st..(src_start + n) * pk_st]);
-            }
-            PkSource::Pack { packer, .. } => {
-                debug_assert_eq!(output.schema.pk_stride(), packer.out_stride);
-                let stride = packer.out_stride;
-                let pk = &mut output.pk_mut()[dst_base * stride..];
-                packer.pack_rows(pk, stride, &in_batch.as_mem_batch(), &[(src_start, src_start + n)]);
-            }
-            // Hashes the finished output row, so `append_map_ranges` stamps it
-            // once every window's payload is written.
-            PkSource::HashRow(_) => {}
-        }
-        output.weight_mut()[dst_base * 8..(dst_base + n) * 8]
-            .copy_from_slice(&in_batch.weight()[src_start * 8..(src_start + n) * 8]);
-
-        for c in self.ev.copies() {
-            copy_column(in_batch, output, c, w);
-        }
-        self.ev
-            .write_computed(&in_batch.as_mem_batch(), src_start, n, output, dst_base);
     }
 }
 

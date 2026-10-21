@@ -334,3 +334,16 @@ pub(crate) fn delta_to<R: Ord + Copy>(model: &mut BTreeMap<R, i64>, targets: &[(
 pub(crate) fn mix(i: u64) -> u64 {
     i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
+
+/// `(pk, weight, payload cells)` rows against `schema`, `None` a NULL cell.
+pub(crate) fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &[Option<i64>])]) -> Batch {
+    let mut batch = crate::repr::BatchBuilder::new(schema);
+    for &(pk, weight, cells) in rows {
+        batch.begin_row(pk as u128, weight);
+        for &cell in cells {
+            batch.put_opt_int(cell.map(|v| v as u128));
+        }
+        batch.end_row();
+    }
+    batch.finish()
+}

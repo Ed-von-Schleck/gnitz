@@ -63,10 +63,7 @@ fn a_fold_keys_a_row_by_its_columns() {
     let mb = b.as_mem_batch();
 
     let empty = FoldCols::new(Vec::new());
-    assert_eq!(
-        empty.key_row(&mb, 0, mb.get_null_word(0)),
-        gnitz_wire::global_group_key()
-    );
+    assert_eq!(empty.key_row(&mb, 0), gnitz_wire::global_group_key());
     for cols in [
         &[1][..],
         &[1, 2],
@@ -82,9 +79,7 @@ fn a_fold_keys_a_row_by_its_columns() {
             cols.len() <= FOLD_INLINE_COLS && !cols.contains(&5),
             "{cols:?}"
         );
-        let keys: Vec<u128> = (0..rows.len())
-            .map(|r| f.key_row(&mb, r, mb.get_null_word(r)))
-            .collect();
+        let keys: Vec<u128> = (0..rows.len()).map(|r| f.key_row(&mb, r)).collect();
         let vals = |r: usize| -> Vec<Option<u128>> { cols.iter().map(|&c| rows[r][c - 1]).collect() };
         for x in 0..rows.len() {
             for y in 0..rows.len() {

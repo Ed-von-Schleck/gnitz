@@ -11,19 +11,20 @@ use crate::repr::Batch;
 use crate::schema::SchemaDescriptor;
 
 /// A read sink resolved against its source schema, and the reply it is building.
-pub struct SinkPlan(Kind);
+pub struct SinkPlan {
+    /// The map every survivor goes through first, if any.
+    map: Option<MapPlan>,
+    kind: Kind,
+}
 
 enum Kind {
-    /// Forward rows, mapped or not: every survivor, or the ones `cut` keeps.
-    Rows {
-        map: Option<MapPlan>,
-        keeper: Batch,
-        cut: Option<Cut>,
-    },
-    /// Partial reduce-output rows. A map's batch is the one mapped batch of the
-    /// whole scan: `clear` keeps its buffers.
+    /// Forward rows: every survivor, or the ones `cut` keeps.
+    Rows { keeper: Batch, cut: Option<Cut> },
+    /// Partial reduce-output rows.
     Fold {
-        map: Option<(MapPlan, Batch)>,
+        /// The one mapped batch of the whole scan, used only under a map:
+        /// `clear` keeps its buffers.
+        mapped: Batch,
         fold: Box<AdhocFold>,
     },
 }
@@ -58,16 +59,12 @@ impl SinkPlan {
             .map
             .as_ref()
             .map(|m| MapPlan::from_compute_map(src_schema, m))
-            .transpose()
-            .map_err(|e| format!("map: {e}"))?;
+            .transpose()?;
         let sink_in = map.as_ref().map_or(*src_schema, |m| *m.out_schema());
         let kind = match &sink.kind {
             SinkKind::Fold(agg) => Kind::Fold {
                 fold: Box::new(AdhocFold::new(&sink_in, agg, group_cap)?),
-                map: map.map(|m| {
-                    let mapped = Batch::empty_with_schema(m.out_schema());
-                    (m, mapped)
-                }),
+                mapped: Batch::empty_with_schema(&sink_in),
             },
             SinkKind::Rows { cut } => {
                 let cut = match cut {
@@ -91,18 +88,17 @@ impl SinkPlan {
                     }
                 };
                 Kind::Rows {
-                    map,
                     keeper: Batch::empty_with_schema(&sink_in),
                     cut,
                 }
             }
         };
-        Ok(SinkPlan(kind))
+        Ok(SinkPlan { map, kind })
     }
 
     /// The layout [`Self::finish`] emits.
     pub fn output_schema(&self) -> &SchemaDescriptor {
-        match &self.0 {
+        match &self.kind {
             Kind::Rows { keeper, .. } => keeper.schema(),
             Kind::Fold { fold, .. } => fold.output_schema(),
         }
@@ -111,7 +107,7 @@ impl SinkPlan {
     /// How many source rows the first drain should visit, of at most
     /// `chunk_rows`: an unordered cut needs no more than its window.
     pub fn first_drain(&self, chunk_rows: usize) -> usize {
-        match &self.0 {
+        match &self.kind {
             Kind::Rows { cut: Some(Cut::Prefix { left }), .. } => (*left as usize).min(chunk_rows),
             _ => chunk_rows,
         }
@@ -121,16 +117,13 @@ impl SinkPlan {
     /// cutting the last range a window ends in. `Ok(true)` once the sink needs
     /// no more rows; `Err` past a fold's group cap.
     pub fn push(&mut self, chunk: &Batch, ranges: &mut [(usize, usize)]) -> Result<bool, String> {
-        match &mut self.0 {
-            Kind::Rows { map, keeper, cut: None } => {
-                append_survivors(map.as_mut(), chunk, keeper, ranges);
+        let map = self.map.as_mut();
+        match &mut self.kind {
+            Kind::Rows { keeper, cut: None } => {
+                append_survivors(map, chunk, keeper, ranges);
                 Ok(false)
             }
-            Kind::Rows {
-                map,
-                keeper,
-                cut: Some(Cut::Prefix { left }),
-            } => {
+            Kind::Rows { keeper, cut: Some(Cut::Prefix { left }) } => {
                 let mb = chunk.as_mem_batch();
                 // Cut at the row whose weight reaches the window: a range, or a
                 // hydrated group, can run far past it.
@@ -150,12 +143,12 @@ impl SinkPlan {
                     taken = i + 1;
                     break;
                 }
-                append_survivors(map.as_mut(), chunk, keeper, &ranges[..taken]);
+                append_survivors(map, chunk, keeper, &ranges[..taken]);
                 Ok(*left <= 0)
             }
-            Kind::Rows { map, keeper, cut: Some(Cut::TopK(top)) } => {
+            Kind::Rows { keeper, cut: Some(Cut::TopK(top)) } => {
                 let before = keeper.len();
-                append_survivors(map.as_mut(), chunk, keeper, ranges);
+                append_survivors(map, chunk, keeper, ranges);
                 top.summed = top
                     .summed
                     .saturating_add(keeper.as_mem_batch().sum_weights(before, keeper.len()));
@@ -167,16 +160,17 @@ impl SinkPlan {
                 }
                 Ok(false)
             }
-            Kind::Fold { map: Some((plan, dst)), fold } => {
-                dst.clear();
-                plan.append_map_ranges(chunk, dst, ranges);
-                // The map already dropped the non-survivors, so every row of
-                // `dst` folds.
-                fold.fold_ranges(dst, &[(0, dst.len())])?;
-                Ok(false)
-            }
-            Kind::Fold { map: None, fold } => {
-                fold.fold_ranges(chunk, ranges)?;
+            Kind::Fold { mapped, fold } => {
+                match map {
+                    Some(plan) => {
+                        mapped.clear();
+                        plan.append_map_ranges(chunk, mapped, ranges);
+                        // The map already dropped the non-survivors, so every
+                        // row of `mapped` folds.
+                        fold.fold_ranges(mapped, &[(0, mapped.len())])?;
+                    }
+                    None => fold.fold_ranges(chunk, ranges)?,
+                }
                 Ok(false)
             }
         }
@@ -184,7 +178,7 @@ impl SinkPlan {
 
     /// The reply: the kept rows, or one partial row per group.
     pub fn finish(self) -> Batch {
-        match self.0 {
+        match self.kind {
             Kind::Rows { mut keeper, cut, .. } => {
                 // The keeper is the reply now: shed an ordered keeper down to
                 // the smallest superset the client can still cut exactly. At or

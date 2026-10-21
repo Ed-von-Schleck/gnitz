@@ -4,7 +4,7 @@
 //! surviving scan chunk folds into per-group aggregate values in bounded RAM, then
 //! one partial reduce-output batch is emitted.
 //!
-//! It runs the same `GroupOutKey`, aggregates and `emit_reduce_row` as a
+//! It runs the same `GroupOutKey`, aggregates and `AggValues::emit_row` as a
 //! view's reduce, so its output is that reduce's output over the same group set.
 //!
 //! The scan cursor delivers consolidated, positive-weight rows, so there is no
@@ -15,8 +15,8 @@
 use gnitz_wire::AggReadSpec;
 
 use super::agg::{AggValues, RangeGroups};
-use super::shape::{emit_reduce_row, ReduceShape};
-use crate::algebra::group_key::{ground_pk, GroupNumbers, IdentityLoop};
+use super::shape::ReduceShape;
+use crate::algebra::group_key::{ground_pk, GroupNumbers, GroupOutKey, IdentityLoop};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
 
@@ -64,56 +64,40 @@ impl AdhocFold {
     /// Fold the surviving `[start, end)` row ranges of one source chunk into the
     /// group state. `Err` past the per-worker group cap.
     pub(crate) fn fold_ranges(&mut self, chunk: &Batch, ranges: &[(usize, usize)]) -> Result<(), String> {
-        let Self {
-            shape,
-            groups,
-            vals,
-            numbers,
-            ord,
-            group_cap,
-        } = self;
         let mb = chunk.as_mem_batch();
-        if shape.key.is_global() {
-            for (k, agg) in shape.aggs.iter().enumerate() {
-                vals.fold(k, agg, &mb, ranges, RangeGroups::FIRST);
+        if self.shape.key.is_global() {
+            for k in 0..self.shape.aggs.len() {
+                self.vals.fold(k, &mb, ranges, RangeGroups::FIRST);
             }
             return Ok(());
         }
         // Each row's group first, then each aggregate over its own column.
-        ord.clear();
+        self.ord.clear();
         let assign = AssignGroups {
-            shape,
-            groups,
-            numbers,
-            ord,
-            group_cap: *group_cap,
+            key: &self.shape.key,
+            groups: &mut self.groups,
+            numbers: &mut self.numbers,
+            ord: &mut self.ord,
+            group_cap: self.group_cap,
             mb: &mb,
             ranges,
         };
-        shape.key.with_identity(&mb, ranges, assign)?;
-        vals.resize(groups.count);
-        for (k, agg) in shape.aggs.iter().enumerate() {
-            vals.fold(k, agg, &mb, ranges, &ord[..]);
+        self.shape.key.with_identity(&mb, ranges, assign)?;
+        self.vals.resize(self.groups.count);
+        for k in 0..self.shape.aggs.len() {
+            self.vals.fold(k, &mb, ranges, &self.ord[..]);
         }
         Ok(())
     }
 
     /// One partial row per present group (weight +1), in group-discovery order.
     pub(crate) fn finish(self) -> Batch {
-        let gs = self.groups.schema();
-        let carried = gs.payload_locators();
+        let carried = self.groups.schema().payload_locators();
         let mut output = Batch::with_capacity(&self.shape.output_schema, self.groups.count);
         let groups_mb = self.groups.as_mem_batch();
         for g in 0..self.groups.count {
             let group = Some((&groups_mb, g, &carried[..]));
-            emit_reduce_row(
-                &mut output,
-                group,
-                groups_mb.get_pk_bytes(g),
-                &self.shape.aggs,
-                &self.vals,
-                g,
-            );
+            self.vals.emit_row(&mut output, group, groups_mb.get_pk_bytes(g), g);
         }
         output
     }
@@ -122,7 +106,7 @@ impl AdhocFold {
 /// One chunk's surviving rows, each assigned its group's ordinal; a group met
 /// for the first time is appended to `groups`.
 struct AssignGroups<'a> {
-    shape: &'a ReduceShape,
+    key: &'a GroupOutKey,
     groups: &'a mut Batch,
     numbers: &'a mut GroupNumbers,
     ord: &'a mut Vec<u32>,
@@ -136,7 +120,7 @@ impl IdentityLoop for AssignGroups<'_> {
 
     fn run(self, identity: impl Fn(usize) -> u128) -> Self::Out {
         let AssignGroups {
-            shape,
+            key,
             groups,
             numbers,
             ord,
@@ -157,8 +141,8 @@ impl IdentityLoop for AssignGroups<'_> {
                          CREATE VIEW to maintain this aggregation incrementally"
                     ));
                 }
-                groups.begin_row(shape.key.out_pk(mb, row).bytes(), 1);
-                groups.append_cells_from(shape.key.carried(), mb, row);
+                groups.begin_row(key.out_pk(mb, row).bytes(), 1);
+                groups.append_cells_from(key.carried(), mb, row);
                 groups.commit_row();
                 Ok(g as u32)
             })?;

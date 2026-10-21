@@ -37,17 +37,13 @@ fn assert_kernels_match(b: &Batch, ci: u32) {
     ] {
         let aggs = [AggDescriptor { col_idx: ci, agg_op }];
         let aggs = ReduceShape::new(schema, &[0], &aggs).unwrap().0.aggs;
-        let agg = &aggs[0];
         let ranges = [(0, 0), (0, 1), (3, 40), (40, 41), (41, N)];
-        let step = |vals: &mut AggValues, g: usize, row: usize| {
-            vals.apply(0, g, (agg.kind, agg.src), &mb, row, mb.get_weight(row))
-        };
+        let step = |vals: &mut AggValues, g: usize, row: usize| vals.step(g, &mb, row, mb.get_weight(row));
         let assert_same = |got: &AggValues, want: &AggValues, groups: usize, mode: &str| {
+            // The held register image, or `None` for an extreme with no value.
             let bits = |vals: &AggValues, g: usize| {
-                vals.value(0, agg, g).map(|v| match v {
-                    AggValue::Bits(b) => b,
-                    AggValue::Wide(..) => unreachable!("a scalar column"),
-                })
+                let at = vals.at(0, g);
+                (vals.has.get(at) != Some(&false)).then(|| vals.acc[at])
             };
             for g in 0..groups {
                 assert_eq!(
@@ -65,12 +61,12 @@ fn assert_kernels_match(b: &Batch, ci: u32) {
         let (mut one, mut one_each) = (sized(1), sized(1));
         let (mut ranged, mut ranged_each) = (sized(ranges.len()), sized(ranges.len()));
         let (mut mixed, mut mixed_each) = (sized(0), sized(GROUPS));
-        ranged.fold(0, agg, &mb, &ranges, RangeGroups::EACH);
+        ranged.fold(0, &mb, &ranges, RangeGroups::EACH);
         for (i, &(s, e)) in ranges.iter().enumerate() {
-            one.fold(0, agg, &mb, &[(s, e)], RangeGroups::FIRST);
+            one.fold(0, &mb, &[(s, e)], RangeGroups::FIRST);
             let ord: Vec<u32> = (s..e).map(|row| (row % GROUPS) as u32).collect();
             mixed.resize(if i < 2 { 1 } else { GROUPS });
-            mixed.fold(0, agg, &mb, &[(s, e)], &ord[..]);
+            mixed.fold(0, &mb, &[(s, e)], &ord[..]);
             for row in s..e {
                 step(&mut one_each, 0, row);
                 step(&mut ranged_each, i, row);

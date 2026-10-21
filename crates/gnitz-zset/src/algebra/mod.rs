@@ -42,7 +42,7 @@ pub use reindex::{index_entries, spans};
 pub use route::{ground_owner, Placement, Slot};
 pub use sink::SinkPlan;
 
-pub(crate) use aggregate::{emit_reduce_row, resolve_aggs, Agg, AggValues, RangeGroups, ReduceShape};
+pub(crate) use aggregate::{resolve_aggs, Agg, AggValues, RangeGroups, ReduceShape};
 pub(crate) use group_key::{ground_pk, GroupOrdinals, GroupOutKey};
 pub(crate) use map::{copied_string_slots, copy_column, rebase_copied_strings, RowWindow};
 pub(crate) use order_image::{image_slot_col, ImageCol, IMAGE_COL};

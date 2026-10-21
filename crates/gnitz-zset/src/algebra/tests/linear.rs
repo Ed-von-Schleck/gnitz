@@ -1,8 +1,8 @@
 use super::*;
-use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
-    assert_folds, make_batch, make_schema_u64_i64, pk_payload_schema, u64_pk_schema, weighted_rows, zset_of, zset_sum,
+    assert_folds, make_batch, make_int_batch, make_schema_u64_i64, pk_payload_schema, u64_pk_schema, weighted_rows,
+    zset_of, zset_sum,
 };
 
 /// How a fixture batch holds rows given in (PK, payload) order.
@@ -23,13 +23,11 @@ fn opt_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, Option<i64>)], how: R
     if how == Rows::Scrambled {
         rows.reverse();
     }
-    let mut b = BatchBuilder::new(schema);
-    for (pk, w, v) in rows {
-        b.begin_row(pk as u128, w);
-        b.put_opt_int(v.map(|v| v as u128));
-        b.end_row();
-    }
-    let mut b = b.finish();
+    let rows: Vec<(u64, i64, &[Option<i64>])> = rows
+        .iter()
+        .map(|(pk, w, v)| (*pk, *w, std::slice::from_ref(v)))
+        .collect();
+    let mut b = make_int_batch(schema, &rows);
     if how == Rows::Claimed {
         b.certify_consolidated();
     }

@@ -3,6 +3,8 @@
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use gnitz_wire::{AggDescriptor, AggFunc, OrderKey};
 
+use std::rc::Rc;
+
 use crate::algebra::{resolve_aggs, Agg};
 use crate::stream::order_index::{OrderIndex, OrderedKind, OrderedPlan};
 
@@ -13,7 +15,7 @@ pub(in crate::stream) struct Window {
     pub(super) rank: Option<usize>,
     pub(super) dense_rank: Option<usize>,
     /// The aggregates, each reading its column off an index row.
-    pub(super) aggs: Vec<Agg>,
+    pub(super) aggs: Rc<[Agg]>,
 }
 
 impl OrderedPlan {

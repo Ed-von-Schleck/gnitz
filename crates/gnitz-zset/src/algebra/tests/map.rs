@@ -5,23 +5,10 @@ use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_COLUMNS};
 use crate::test_support::{
-    make_batch, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk, pk_payload_schema, rekey_plan, u64_pk_schema,
-    weighted_rows,
+    make_batch, make_int_batch, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk, pk_payload_schema, rekey_plan,
+    u64_pk_schema, weighted_rows,
 };
 use gnitz_wire::MAX_COLUMNS;
-
-/// `(pk, weight, payload cells)` rows against `schema`, `None` a NULL cell.
-pub(super) fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &[Option<i64>])]) -> Batch {
-    let mut batch = BatchBuilder::new(schema);
-    for &(pk, weight, cells) in rows {
-        batch.begin_row(pk as u128, weight);
-        for &cell in cells {
-            batch.put_opt_int(cell.map(|v| v as u128));
-        }
-        batch.end_row();
-    }
-    batch.finish()
-}
 
 /// A U64 PK at column 0, then nullable payload columns of `col_types[1..]`.
 pub(super) fn make_schema(col_types: &[TypeCode]) -> SchemaDescriptor {

@@ -11,6 +11,28 @@ const CHUNK: u64 = 65_536;
 /// A store's cap on the groups of one fold.
 const GROUP_CAP: usize = 65_536;
 
+/// Instructions retired by one whole fold of `spec` — every chunk's `ranges`, and
+/// the finish — measured after one warm-up fold.
+fn instructions(
+    counter: &Counter,
+    schema: &SchemaDescriptor,
+    spec: &AggReadSpec,
+    chunks: &[Batch],
+    ranges: &[(usize, usize)],
+) -> u64 {
+    let fold = || {
+        let mut fold = AdhocFold::new(schema, spec, GROUP_CAP).unwrap();
+        for c in chunks {
+            fold.fold_ranges(c, ranges).unwrap();
+        }
+        fold.finish()
+    };
+    std::hint::black_box(fold());
+    let (out, instructions) = counter.measure(fold);
+    std::hint::black_box(out);
+    instructions
+}
+
 /// Instructions per row of a whole fold — every chunk and the finish — over
 /// `[U64 pk | I64 grp | I64 a | I32 b NULL | F64 c]`, across aggregate sets and
 /// group counts: grouped by `grp` into a few groups and into nearly the cap, and
@@ -56,7 +78,7 @@ fn adhoc_fold_bench() {
                 agg(3, AggFunc::Max),
             ],
         ),
-        // A PK column has no column kernel: each is stepped a row at a time.
+        // The column kernel over a PK column's OPK cells.
         ("pk min+sum", vec![agg(0, AggFunc::Min), agg(0, AggFunc::Sum)]),
     ];
     let counter = Counter::instructions();
@@ -81,16 +103,7 @@ fn adhoc_fold_bench() {
                 group_cols: group_cols.clone(),
                 aggs: aggs.clone(),
             };
-            let fold = || {
-                let mut fold = AdhocFold::new(&schema, &spec, GROUP_CAP).unwrap();
-                for c in &chunks {
-                    fold.fold_ranges(c, &[(0, c.len())]).unwrap();
-                }
-                fold.finish()
-            };
-            std::hint::black_box(fold());
-            let (out, instructions) = counter.measure(fold);
-            std::hint::black_box(out);
+            let instructions = instructions(&counter, &schema, &spec, &chunks, &[(0, CHUNK as usize)]);
             println!(
                 "adhoc_fold_bench groups={groups:<6} {name:<18} {:>6.1} instr/row",
                 instructions as f64 / N as f64
@@ -197,16 +210,7 @@ fn adhoc_fold_shapes_bench() {
                     group_cols: group_cols.clone(),
                     aggs: aggs.clone(),
                 };
-                let fold = || {
-                    let mut fold = AdhocFold::new(&schema, &spec, GROUP_CAP).unwrap();
-                    for c in &chunks {
-                        fold.fold_ranges(c, &[(0, c.len())]).unwrap();
-                    }
-                    fold.finish()
-                };
-                std::hint::black_box(fold());
-                let (out, instructions) = counter.measure(fold);
-                std::hint::black_box(out);
+                let instructions = instructions(&counter, &schema, &spec, &chunks, &[(0, CHUNK as usize)]);
                 println!(
                     "adhoc_fold_shapes_bench {wname:<8} groups={groups:<6} {name:<18} {:>6.1} instr/row",
                     instructions as f64 / N as f64
@@ -285,16 +289,7 @@ fn adhoc_fold_sparse_bench() {
             ("runs of 16 in 32", (0..n).step_by(32).map(|s| (s, s + 16)).collect()),
         ] {
             let kept: usize = ranges.iter().map(|&(s, e)| e - s).sum::<usize>() * chunks.len();
-            let fold = || {
-                let mut fold = AdhocFold::new(schema, &spec, GROUP_CAP).unwrap();
-                for c in &chunks {
-                    fold.fold_ranges(c, &ranges).unwrap();
-                }
-                fold.finish()
-            };
-            std::hint::black_box(fold());
-            let (out, instructions) = counter.measure(fold);
-            std::hint::black_box(out);
+            let instructions = instructions(&counter, schema, &spec, &chunks, &ranges);
             println!(
                 "adhoc_fold_sparse_bench {label:<8} {density:<16} {:>7.1} instr/surviving row",
                 instructions as f64 / kept as f64

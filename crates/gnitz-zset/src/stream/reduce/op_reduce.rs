@@ -7,7 +7,6 @@ use crate::schema::payload_order::compare_rows;
 
 use super::avi::AviBake;
 use super::plan::ReducePlan;
-use crate::algebra::emit_reduce_row;
 use crate::algebra::{AggValues, GroupOrdinals, RangeGroups};
 use crate::stream::OpenAt;
 
@@ -40,7 +39,7 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
     let weights = mb.weight().as_chunks::<8>().0;
     let retracts = |w: &[u8; 8]| i64::from_le_bytes(*w) <= 0;
     let indexed = plan.avi.is_some();
-    let aggs = &shape.aggs[..];
+    let aggs = &shape.aggs;
 
     let groups = match shape.key.runs(delta) {
         Some(ranges) if ranges.len() == 1 || 2 * ranges.len() <= delta.count => {
@@ -74,7 +73,7 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
             let mut vals = AggValues::new(aggs, ranges.len());
             for (k, agg) in aggs.iter().enumerate() {
                 let folded = if agg.is_linear() { ranges } else { stepped };
-                vals.fold(k, agg, &mb, folded, RangeGroups::EACH);
+                vals.fold(k, &mb, folded, RangeGroups::EACH);
             }
             for (g, &(first, _)) in ranges.iter().enumerate() {
                 groups.emit(first, &mut vals, g, indexed && probes[g]);
@@ -86,8 +85,8 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
     };
 
     let mut vals = AggValues::new(aggs, groups.len());
-    for (k, agg) in aggs.iter().enumerate() {
-        vals.fold(k, agg, &mb, &[(0, delta.count)], &groups.ord[..]);
+    for k in 0..aggs.len() {
+        vals.fold(k, &mb, &[(0, delta.count)], &groups.ord[..]);
     }
     // Per group, whether its extremes come off the index. Every row is stepped
     // whatever its group then reads, so only a retraction sends one there.
@@ -163,24 +162,22 @@ impl<'a> GroupEmit<'a> {
             // −Agg(history) is the stored row, copied byte-identical at −1.
             self.trace_out.copy_current_row_into(&mut self.out, -1);
             let (stored_row, stored_idx) = self.trace_out.current_row_source();
-            for (k, agg) in shape.aggs.iter().enumerate().filter(|(_, a)| a.is_linear() || !probe) {
-                vals.fold_stored(k, agg, g, stored_row, stored_idx);
-            }
+            vals.fold_stored(g, stored_row, stored_idx, !probe);
         }
         if probe {
             let (bake, cursor) = self.avi.as_mut().expect("opened for every group that probes");
-            bake.seed_extremes(cursor, self.delta, first, &shape.aggs, vals, g);
+            bake.seed_extremes(cursor, self.delta, first, vals, g);
         }
 
         let count = self.plan.cardinality;
-        let cardinality = vals.count_value(count, &shape.aggs[count], g);
+        let cardinality = vals.count_value(count, g);
         debug_assert!(
             cardinality >= 0,
             "reduce input must be bag-positive: negative group cardinality"
         );
         if cardinality > 0 {
             let group = Some((self.delta, first, shape.key.carried()));
-            emit_reduce_row(&mut self.out, group, out_pk_bytes, &shape.aggs, vals, g);
+            vals.emit_row(&mut self.out, group, out_pk_bytes, g);
         } else if let Some(v0) = &self.plan.ground {
             // An emptied global aggregate still publishes one row.
             self.out.append_batch(v0);

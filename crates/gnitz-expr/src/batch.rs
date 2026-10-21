@@ -1342,18 +1342,9 @@ fn load_pk(
     let rows = &pk[mo.start * stride..(mo.start + mo.m) * stride];
     let dst_reg = scratch.reg_mut(dst, mo.m);
     gnitz_wire::for_each_fixed_int!(fi, |FI| {
-        const W: usize = FI.width();
-        assert!(off + W <= stride, "a PK column lies inside the PK");
-        // A single-column PK is a fixed-stride array.
-        if stride == W {
-            for (r, key) in dst_reg.iter_mut().zip(rows.as_chunks::<W>().0) {
-                *r = gnitz_wire::decode_opk_i64(key, FI);
-            }
-        } else {
-            for (r, row) in dst_reg.iter_mut().zip(rows.chunks_exact(stride)) {
-                *r = gnitz_wire::decode_opk_i64(&row[off..off + W], FI);
-            }
-        }
+        gnitz_wire::zip_cells::<{ FI.width() }, _>(rows, stride, off, dst_reg.iter_mut(), |c, r| {
+            *r = gnitz_wire::decode_opk_i64(c, FI)
+        })
     });
     maybe_pack_bool_bits(scratch, mo, dst);
 }

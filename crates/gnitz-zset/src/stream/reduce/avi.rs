@@ -100,7 +100,6 @@ impl AviBake {
         cur: &mut ReadCursor,
         src: &R,
         row: usize,
-        aggs: &[Agg],
         vals: &mut AggValues,
         g: usize,
     ) {
@@ -119,7 +118,7 @@ impl AviBake {
                 let (src, row) = cur.current_row_source();
                 payload_bytes(src, row, IMAGE_SLOT)
             };
-            vals.seed_from_index(k, &aggs[k], g, &image);
+            vals.seed_from_index(k, g, &image);
         }
     }
 }

@@ -2,22 +2,16 @@
 
 use std::cmp::Ordering;
 use std::ops::Range;
+use std::rc::Rc;
 
 use crate::repr::{Batch, MemBatch};
 use crate::schema::{ColumnLocator, TypeCode};
 use gnitz_wire::RowSource;
-use gnitz_wire::{for_each_fixed_int, AggFunc, FixedInt, ScalarKind};
+use gnitz_wire::{for_each_fixed_int, int_cell, AggFunc, FixedInt, ScalarKind};
 
 use crate::algebra::order_image::{
     scalar_image, scalar_native_of_image, wide_native, wide_native_of_image, ImageCol, ImageKind, WideKind,
 };
-
-/// A group's value of one aggregate: a register image, or a wide extreme's native
-/// bytes.
-pub(crate) enum AggValue<'a> {
-    Bits(u64),
-    Wide(WideKind, &'a [u8]),
-}
 
 /// One aggregate: the column it reads, the output column it fills, and what a
 /// row does to a group's value. The values live in an [`AggValues`].
@@ -75,8 +69,9 @@ pub(crate) struct AggValues {
     /// A value is overwritten in place while it fits its room, and moves to the
     /// end, into twice the room, when it does not.
     heap: Vec<u8>,
-    /// Aggregates in the list, and whether one is an extreme, a wide one.
-    aggs: usize,
+    /// The list, shared with its plan: aggregate `k` owns value column `k`.
+    aggs: Rc<[Agg]>,
+    /// Whether an aggregate of the list is an extreme, a wide one.
     extremes: bool,
     wides: bool,
     groups: usize,
@@ -87,7 +82,7 @@ pub(crate) struct AggValues {
 
 impl AggValues {
     /// `groups` empty groups of `aggs`.
-    pub(crate) fn new(aggs: &[Agg], groups: usize) -> Self {
+    pub(crate) fn new(aggs: &Rc<[Agg]>, groups: usize) -> Self {
         let (extremes, wides) = (aggs.iter().any(|a| !a.is_linear()), aggs.iter().any(Agg::is_wide));
         let n = aggs.len() * groups;
         AggValues {
@@ -95,7 +90,7 @@ impl AggValues {
             has: vec![false; if extremes { n } else { 0 }],
             wide: vec![(0, 0, 0); if wides { n } else { 0 }],
             heap: Vec::new(),
-            aggs: aggs.len(),
+            aggs: Rc::clone(aggs),
             extremes,
             wides,
             groups,
@@ -114,7 +109,7 @@ impl AggValues {
                 }
                 *v = grown;
             }
-            let (aggs, old) = (self.aggs, self.cap);
+            let (aggs, old) = (self.aggs.len(), self.cap);
             let cap = groups.max(2 * old);
             regrow(&mut self.acc, aggs, old, cap, 0);
             if self.extremes {
@@ -371,30 +366,16 @@ impl Agg {
     }
 }
 
-/// An aggregate list over its values: aggregate `k` of `aggs` owns column `k`.
 impl AggValues {
     /// The net row count a COUNT, or a combine's sum of partial COUNTs, holds for
     /// group `g`.
     #[inline(always)]
-    pub(crate) fn count_value(&self, k: usize, agg: &Agg, g: usize) -> i64 {
+    pub(crate) fn count_value(&self, k: usize, g: usize) -> i64 {
         debug_assert!(matches!(
-            agg.kind,
+            self.aggs[k].kind,
             StepKind::Count | StepKind::CountNonNull | StepKind::Sum(ScalarKind::Int(FixedInt::I64))
         ));
         self.acc[self.at(k, g)]
-    }
-
-    /// Group `g`'s emitted value of aggregate `k`; `None` renders NULL.
-    pub(crate) fn value(&self, k: usize, agg: &Agg, g: usize) -> Option<AggValue<'_>> {
-        let at = self.at(k, g);
-        Some(match agg.kind {
-            StepKind::Extreme { .. } if !self.has[at] => return None,
-            StepKind::Extreme { kind: ImageKind::Wide(kind), .. } => AggValue::Wide(kind, self.wide(at)),
-            StepKind::Extreme { kind: ImageKind::Scalar(kind), max } => {
-                AggValue::Bits(scalar_native_of_image(kind, max, self.acc[at] as u64))
-            }
-            _ => AggValue::Bits(self.acc[at] as u64),
-        })
     }
 
     /// Empty group `g` of extreme `k`.
@@ -406,8 +387,8 @@ impl AggValues {
 
     /// Seed group `g` of MIN/MAX `k` with the extreme image the value index
     /// holds for it.
-    pub(crate) fn seed_from_index(&mut self, k: usize, agg: &Agg, g: usize, image: &[u8]) {
-        let StepKind::Extreme { max, kind } = agg.kind else {
+    pub(crate) fn seed_from_index(&mut self, k: usize, g: usize, image: &[u8]) {
+        let StepKind::Extreme { max, kind } = self.aggs[k].kind else {
             unreachable!("only an extreme is seeded from the value index")
         };
         let at = self.at(k, g);
@@ -472,54 +453,36 @@ impl AggValues {
     /// Step this aggregate over rows `ranges` of `mb`, each into its group: one
     /// pass over its column, in row order. A row at a non-positive weight steps no
     /// extreme.
-    pub(crate) fn fold(&mut self, k: usize, agg: &Agg, mb: &MemBatch, ranges: &[(usize, usize)], groups: impl Groups) {
-        let (kind, src) = (agg.kind, agg.src);
-        let slot = src.payload_slot();
+    pub(crate) fn fold(&mut self, k: usize, mb: &MemBatch, ranges: &[(usize, usize)], groups: impl Groups) {
+        let Agg { kind, src, .. } = self.aggs[k];
+        macro_rules! fold {
+            ($n:expr, $opk:expr, $reg:ty, $contribution:expr) => {
+                fold_cells::<{ $n }, { $opk }, $reg>(&mut self.column(k), mb, src, ranges, groups, $contribution)
+            };
+        }
         // `$contribution` over the source column's `$n`-byte cells: a payload
-        // column's native ones, or a PK column's OPK images under `OPK`.
+        // column's native ones, or a PK column's OPK images under `$opk`.
         macro_rules! fold_ints {
-            ($n:expr, $reg:ty, $contribution:expr) => {
-                match slot {
-                    Some(_) => {
-                        const OPK: bool = false;
-                        fold_cells::<{ $n }, OPK, $reg>(
-                            &mut self.column(k),
-                            mb,
-                            src,
-                            slot,
-                            ranges,
-                            groups,
-                            $contribution,
-                        )
+            ($n:expr, $reg:ty, |$opk:ident| $contribution:expr) => {
+                match src {
+                    ColumnLocator::Payload { .. } => {
+                        const $opk: bool = false;
+                        fold!($n, $opk, $reg, $contribution)
                     }
-                    None => {
-                        const OPK: bool = true;
-                        fold_cells::<{ $n }, OPK, $reg>(
-                            &mut self.column(k),
-                            mb,
-                            src,
-                            slot,
-                            ranges,
-                            groups,
-                            $contribution,
-                        )
+                    ColumnLocator::Pk { .. } => {
+                        const $opk: bool = true;
+                        fold!($n, $opk, $reg, $contribution)
                     }
                 }
             };
         }
         match kind {
             // Reads no column.
-            StepKind::Count => {
-                fold_cells::<0, false, IntSum>(&mut self.column(k), mb, src, None, ranges, groups, |_, w, _| Some(w))
-            }
+            StepKind::Count => fold!(0, false, IntSum, |_, w, _| Some(w)),
             // A PK column is never NULL.
-            StepKind::CountNonNull => {
-                fold_cells::<0, false, IntSum>(&mut self.column(k), mb, src, slot, ranges, groups, |_, w, null| {
-                    Some(if null { 0 } else { w })
-                })
-            }
+            StepKind::CountNonNull => fold!(0, false, IntSum, |_, w, null| Some(if null { 0 } else { w })),
             StepKind::Sum(ScalarKind::Int(fi)) => for_each_fixed_int!(fi, |FI| {
-                fold_ints!(FI.width(), IntSum, |v, w, null| {
+                fold_ints!(FI.width(), IntSum, |OPK| |v, w, null| {
                     Some(if null {
                         0
                     } else {
@@ -528,48 +491,28 @@ impl AggValues {
                 })
             }),
             // A float is never a PK column.
-            StepKind::Sum(ScalarKind::F32) => {
-                fold_cells::<4, false, FloatSum>(&mut self.column(k), mb, src, slot, ranges, groups, |v, w, null| {
-                    (!null).then(|| f32::from_le_bytes(v) as f64 * w as f64)
-                })
-            }
-            StepKind::Sum(ScalarKind::F64) => {
-                fold_cells::<8, false, FloatSum>(&mut self.column(k), mb, src, slot, ranges, groups, |v, w, null| {
-                    (!null).then(|| f64::from_le_bytes(v) * w as f64)
-                })
-            }
+            StepKind::Sum(ScalarKind::F32) => fold!(4, false, FloatSum, |v, w, null| {
+                (!null).then(|| f32::from_le_bytes(v) as f64 * w as f64)
+            }),
+            StepKind::Sum(ScalarKind::F64) => fold!(8, false, FloatSum, |v, w, null| {
+                (!null).then(|| f64::from_le_bytes(v) * w as f64)
+            }),
             StepKind::Extreme { max, kind: ImageKind::Scalar(scalar) } => {
                 // A MAX keeps the smallest complement, as the value index does.
                 let flip = if max { u64::MAX } else { 0 };
                 match scalar {
                     ScalarKind::Int(fi) => for_each_fixed_int!(fi, |FI| {
-                        fold_ints!(FI.width(), Least, move |v, w, null| {
+                        fold_ints!(FI.width(), Least, |OPK| move |v, w, null| {
                             (w > 0 && !null)
                                 .then(|| ScalarKind::Int(FI).order_image(int_cell::<OPK>(FI, &v) as u64) ^ flip)
                         })
                     }),
-                    ScalarKind::F32 => fold_cells::<4, false, Least>(
-                        &mut self.column(k),
-                        mb,
-                        src,
-                        slot,
-                        ranges,
-                        groups,
-                        move |v, w, null| {
-                            (w > 0 && !null).then(|| ScalarKind::F32.order_image(u32::from_le_bytes(v) as u64) ^ flip)
-                        },
-                    ),
-                    ScalarKind::F64 => fold_cells::<8, false, Least>(
-                        &mut self.column(k),
-                        mb,
-                        src,
-                        slot,
-                        ranges,
-                        groups,
-                        move |v, w, null| {
-                            (w > 0 && !null).then(|| ScalarKind::F64.order_image(u64::from_le_bytes(v)) ^ flip)
-                        },
-                    ),
+                    ScalarKind::F32 => fold!(4, false, Least, move |v, w, null| {
+                        (w > 0 && !null).then(|| ScalarKind::F32.order_image(u32::from_le_bytes(v) as u64) ^ flip)
+                    }),
+                    ScalarKind::F64 => fold!(8, false, Least, move |v, w, null| {
+                        (w > 0 && !null).then(|| ScalarKind::F64.order_image(u64::from_le_bytes(v)) ^ flip)
+                    }),
                 }
             }
             // A wide extreme compares native bytes, a row at a time.
@@ -588,11 +531,14 @@ impl AggValues {
         }
     }
 
-    /// What `rows`' row at `weight` does to group `g` of aggregate `k`. An extreme
-    /// takes a positive weight only.
-    #[inline]
-    pub(crate) fn step(&mut self, k: usize, agg: &Agg, g: usize, rows: &impl RowSource, row: usize, weight: i64) {
-        self.apply(k, g, (agg.kind, agg.src), rows, row, weight);
+    /// What `rows`' row at `weight` does to group `g` of every aggregate. An
+    /// extreme takes a positive weight only.
+    #[inline(always)]
+    pub(crate) fn step(&mut self, g: usize, rows: &impl RowSource, row: usize, weight: i64) {
+        for k in 0..self.aggs.len() {
+            let Agg { kind, src, .. } = self.aggs[k];
+            self.apply(k, g, (kind, src), rows, row, weight);
+        }
     }
 
     /// Empty every group.
@@ -601,78 +547,107 @@ impl AggValues {
         self.has.fill(false);
     }
 
-    /// Give group `to` the value group `from` holds of aggregate `k`.
-    pub(crate) fn copy(&mut self, k: usize, agg: &Agg, from: usize, to: usize) {
-        let (from, to) = (self.at(k, from), self.at(k, to));
-        self.acc[to] = self.acc[from];
-        if let StepKind::Extreme { kind, .. } = agg.kind {
-            self.has[to] = self.has[from];
-            if matches!(kind, ImageKind::Wide(_)) && self.has[from] {
-                let value = self.wide(from).to_vec();
-                self.store_wide(to, &value);
+    /// Give group `to` the values group `from` holds.
+    pub(crate) fn copy(&mut self, from: usize, to: usize) {
+        for k in 0..self.aggs.len() {
+            let (from, to) = (self.at(k, from), self.at(k, to));
+            self.acc[to] = self.acc[from];
+            if let StepKind::Extreme { kind, .. } = self.aggs[k].kind {
+                self.has[to] = self.has[from];
+                if matches!(kind, ImageKind::Wide(_)) && self.has[from] {
+                    let value = self.wide(from).to_vec();
+                    self.store_wide(to, &value);
+                }
             }
         }
     }
 
-    /// Whether groups `a` and `b` hold the same value of aggregate `k`.
-    pub(crate) fn same(&self, k: usize, agg: &Agg, a: usize, b: usize) -> bool {
-        let (a, b) = (self.at(k, a), self.at(k, b));
-        match agg.kind {
-            StepKind::Extreme { kind, .. } => {
-                self.has[a] == self.has[b]
-                    && (!self.has[a]
-                        || match kind {
-                            ImageKind::Scalar(_) => self.acc[a] == self.acc[b],
-                            ImageKind::Wide(_) => self.wide(a) == self.wide(b),
-                        })
-            }
-            _ => self.acc[a] == self.acc[b],
-        }
-    }
-
-    /// Fold into group `g` aggregate `k`'s value from a previously-emitted
-    /// output row.
-    pub(crate) fn fold_stored(&mut self, k: usize, agg: &Agg, g: usize, out_row: &impl RowSource, row: usize) {
-        self.apply(k, g, (agg.merge, agg.out), out_row, row, 1);
-    }
-
-    /// Write group `g`'s value of aggregate `k` into its column of the row `out`
-    /// has open; `None` from [`Self::value`] renders NULL.
+    /// Whether groups `a` and `b` hold the same values.
     #[inline]
-    pub(crate) fn emit(&self, k: usize, agg: &Agg, g: usize, out: &mut Batch) {
-        let ColumnLocator::Payload { slot, size, .. } = agg.out else {
-            unreachable!("an aggregate is a payload column")
-        };
-        let pi = slot as usize;
-        match self.value(k, agg, g) {
-            None => out.put_null(pi),
-            Some(AggValue::Bits(bits)) => out.extend_col(pi, &bits.to_le_bytes()[..size as usize]),
-            Some(AggValue::Wide(WideKind::Bytes, v)) => out.extend_col_blob(pi, v),
-            Some(AggValue::Wide(WideKind::Fixed(_), v)) => out.extend_col(pi, v),
+    pub(crate) fn same(&self, a: usize, b: usize) -> bool {
+        self.aggs.iter().enumerate().all(|(k, agg)| {
+            let (a, b) = (self.at(k, a), self.at(k, b));
+            match agg.kind {
+                StepKind::Extreme { kind, .. } => {
+                    self.has[a] == self.has[b]
+                        && (!self.has[a]
+                            || match kind {
+                                ImageKind::Scalar(_) => self.acc[a] == self.acc[b],
+                                ImageKind::Wide(_) => self.wide(a) == self.wide(b),
+                            })
+                }
+                _ => self.acc[a] == self.acc[b],
+            }
+        })
+    }
+
+    /// Fold into group `g` the values of a previously-emitted output row: every
+    /// aggregate's, or only the linear ones' unless `extremes`.
+    pub(crate) fn fold_stored(&mut self, g: usize, out_row: &impl RowSource, row: usize, extremes: bool) {
+        for k in 0..self.aggs.len() {
+            let Agg { merge, out, .. } = self.aggs[k];
+            if extremes || self.aggs[k].is_linear() {
+                self.apply(k, g, (merge, out), out_row, row, 1);
+            }
         }
     }
-}
 
-/// An integer column's cell as its value: under `OPK` a PK column's OPK image,
-/// else a payload column's native bytes.
-#[inline(always)]
-fn int_cell<const OPK: bool>(fi: FixedInt, cell: &[u8]) -> i64 {
-    match OPK {
-        true => gnitz_wire::decode_opk_i64(cell, fi),
-        false => fi.decode_le_i64(cell),
+    /// Emit one `[key…, group columns…, aggregates…]` row at weight +1, copying
+    /// the group columns from `group`'s row at its locators — the ground row has
+    /// none — and the aggregates from group `g`.
+    pub(crate) fn emit_row(
+        &self,
+        output: &mut Batch,
+        group: Option<(&MemBatch, usize, &[ColumnLocator])>,
+        out_pk_bytes: &[u8],
+        g: usize,
+    ) {
+        output.begin_row(out_pk_bytes, 1);
+        if let Some((src, row, locs)) = group {
+            output.append_cells_from(locs, src, row);
+        }
+        self.emit(g, output);
+        output.commit_row();
+    }
+
+    /// Write group `g`'s value of every aggregate into its column of the row
+    /// `out` has open; an extreme with no value renders NULL.
+    #[inline(always)]
+    pub(crate) fn emit(&self, g: usize, out: &mut Batch) {
+        for (k, agg) in self.aggs.iter().enumerate() {
+            let ColumnLocator::Payload { slot, size, .. } = agg.out else {
+                unreachable!("an aggregate is a payload column")
+            };
+            let (pi, size) = (slot as usize, size as usize);
+            let at = self.at(k, g);
+            match agg.kind {
+                StepKind::Extreme { .. } if !self.has[at] => out.put_null(pi),
+                StepKind::Extreme {
+                    kind: ImageKind::Wide(WideKind::Bytes), ..
+                } => out.extend_col_blob(pi, self.wide(at)),
+                StepKind::Extreme {
+                    kind: ImageKind::Wide(WideKind::Fixed(_)),
+                    ..
+                } => out.extend_col(pi, self.wide(at)),
+                StepKind::Extreme { kind: ImageKind::Scalar(kind), max } => {
+                    let bits = scalar_native_of_image(kind, max, self.acc[at] as u64);
+                    out.extend_col(pi, &bits.to_le_bytes()[..size])
+                }
+                _ => out.extend_col(pi, &(self.acc[at] as u64).to_le_bytes()[..size]),
+            }
+        }
     }
 }
 
 /// Rows `ranges` of source column `src`, in row order, each stepping
 /// its group by what `contribution` makes of its `(cell, weight, is NULL)`. The
-/// cells are `N` bytes: a PK column's under `OPK`, else payload column `slot`'s,
-/// which alone can be NULL. `N = 0` reads no cell.
+/// cells are `N` bytes: a PK column's under `OPK`, else a payload column's, which
+/// alone can be NULL. `N = 0` reads no cell.
 #[inline(never)]
 fn fold_cells<const N: usize, const OPK: bool, R: Reg>(
     vals: &mut Slots,
     mb: &MemBatch,
     src: ColumnLocator,
-    slot: Option<usize>,
     ranges: &[(usize, usize)],
     groups: impl Groups,
     contribution: impl Fn([u8; N], i64, bool) -> Option<R::In>,
@@ -684,8 +659,8 @@ fn fold_cells<const N: usize, const OPK: bool, R: Reg>(
         ColumnLocator::Pk { byte_off, .. } => (mb.pk(), mb.pk_stride(), byte_off as usize),
         ColumnLocator::Payload { slot, .. } => (mb.col_data(slot as usize), N, 0),
     };
-    // No bit for a column that cannot be NULL.
-    let null_bit = slot.map_or(0, |slot| 1u64 << slot);
+    // A PK column has no null bit: a constant under `OPK`, so its loop tests none.
+    let null_bit = if OPK { 0 } else { src.null_bit() };
     let mut at = 0;
     for (range, &(s, e)) in ranges.iter().enumerate() {
         let fold_rows = at..at + (e - s);

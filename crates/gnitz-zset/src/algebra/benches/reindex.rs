@@ -38,7 +38,7 @@ fn fold_key_bench() {
         let run = || {
             let mut acc = 0u128;
             for row in 0..N {
-                acc ^= fold.key_row(mb, row, mb.get_null_word(row));
+                acc ^= fold.key_row(mb, row);
             }
             black_box(acc)
         };

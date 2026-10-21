@@ -11,7 +11,7 @@ mod shape;
 
 pub(crate) use adhoc_fold::AdhocFold;
 pub(crate) use agg::{Agg, AggValues, RangeGroups};
-pub(crate) use shape::{emit_reduce_row, resolve_aggs, ReduceShape};
+pub(crate) use shape::{resolve_aggs, ReduceShape};
 
 #[cfg(test)]
 #[path = "benches/aggregate.rs"]

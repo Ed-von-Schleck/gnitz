@@ -91,7 +91,8 @@ impl FoldCols {
 
     /// The 128-bit XXH3 digest of these columns' key bytes over `row`.
     #[inline]
-    pub(crate) fn key_row<R: RowSource>(&self, src: &R, row: usize, null_word: u64) -> u128 {
+    pub(crate) fn key_row<R: RowSource>(&self, src: &R, row: usize) -> u128 {
+        let null_word = src.get_null_word(row);
         if self.inline {
             // One word of presence bits, then each present column's image: every
             // 8-byte read XXH3 makes lies inside one store.
@@ -411,7 +412,7 @@ impl ReindexPacker {
             dst[0] = null_bits;
         }
         if !self.fold.is_empty() {
-            let h = self.fold.key_row(batch, row, null_word);
+            let h = self.fold.key_row(batch, row);
             dst[off..off + FOLD_BYTES].copy_from_slice(&h.to_be_bytes());
         }
     }

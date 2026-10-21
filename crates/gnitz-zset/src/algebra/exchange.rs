@@ -2,7 +2,7 @@
 //! routing-key kernels.
 
 use super::route::{ground_owner, worker_for_key, worker_for_pk_bytes, Placement, Slot};
-use crate::algebra::group_key::{cell_image, for_cell_width, GroupKey, KeyCells};
+use crate::algebra::group_key::{cell_image, for_key_cells, GroupKey, KeyCells};
 use crate::algebra::reindex::{FoldCols, ReindexPacker};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
@@ -55,10 +55,7 @@ impl ScatterPlan {
     /// `batch` that worker owns — a weight-0 row is not a Z-set element. A
     /// broadcast is the one list every worker is sent.
     pub fn route<'a>(&self, batch: &Batch, out: &'a mut Vec<Vec<u32>>, num_workers: usize) -> &'a [Vec<u32>] {
-        let lists = match self.0 {
-            None => 1,
-            Some(_) => num_workers,
-        };
+        let lists = if self.is_broadcast() { 1 } else { num_workers };
         // Reset to `lists` empty lists, keeping their allocations.
         if out.len() < lists {
             out.resize_with(lists, Vec::new);
@@ -74,10 +71,7 @@ impl ScatterPlan {
     pub fn share(&self, batch: &Batch, slot: Slot) -> Batch {
         let nw = slot.of as usize;
         let mut share = Share {
-            rank: match self.0 {
-                None => 0,
-                Some(_) => slot.rank as usize,
-            },
+            rank: if self.is_broadcast() { 0 } else { slot.rank as usize },
             rows: Vec::with_capacity(batch.count / nw + 1),
         };
         self.route_into(&batch.as_mem_batch(), nw, &mut share);
@@ -89,10 +83,7 @@ impl ScatterPlan {
             // One worker owns every key, so no key is read or hashed.
             _ if nw == 1 => route_rows(mb, sink, Owner(0)),
             Some(ref key) => match key.cells(mb) {
-                Some(cells) => for_cell_width!(cells.width, |W| match cells.opk {
-                    true => route_cells::<W, true>(&cells, mb.weight(), sink, nw),
-                    false => route_cells::<W, false>(&cells, mb.weight(), sink, nw),
-                }),
+                Some(cells) => for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(&cells, mb.weight(), sink, nw)),
                 None => match *key {
                     GroupKey::PkRange { at, n } => route_rows(mb, sink, PkRangeW { at, n, nw }),
                     GroupKey::Packed(ref packer) => route_rows_packed(mb, sink, packer, nw),
@@ -175,7 +166,7 @@ struct FoldW<'a> {
 impl RowWorker for FoldW<'_> {
     #[inline(always)]
     fn worker(&self, mb: &MemBatch, row: usize) -> usize {
-        worker_for_key(self.fold.key_row(mb, row, mb.get_null_word(row)), self.nw)
+        worker_for_key(self.fold.key_row(mb, row), self.nw)
     }
 }
 

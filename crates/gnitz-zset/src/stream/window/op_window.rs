@@ -29,11 +29,6 @@ struct Running {
 
 impl Running {
     /// Whether the two contents give a row the same aggregates.
-    fn same_aggs(&self, plan: &Window) -> bool {
-        let same = |(k, agg)| self.aggs.same(k, agg, OLD, NEW);
-        plan.aggs.iter().enumerate().all(same)
-    }
-
     /// Whether the two contents give a row the same ranks.
     fn same_ranks(&self, plan: &Window) -> bool {
         (plan.rank.is_none() || self.rows[OLD] == self.rows[NEW])
@@ -53,15 +48,11 @@ impl Running {
                     self.groups[NEW] += last.is_none_or(|last| !walk.peers(last, at)) as i64;
                     last = Some(at);
                 }
-                with_row!(walk, at, |src, at| for (k, agg) in plan.aggs.iter().enumerate() {
-                    self.aggs.step(k, agg, NEW, src, at, weight);
-                });
+                with_row!(walk, at, |src, at| self.aggs.step(NEW, src, at, weight));
                 self.rows[NEW] = self.rows[NEW].wrapping_add(weight);
             }
         }
-        for (k, agg) in plan.aggs.iter().enumerate() {
-            self.aggs.copy(k, agg, NEW, OLD);
-        }
+        self.aggs.copy(NEW, OLD);
         (self.rows[OLD], self.groups[OLD]) = (self.rows[NEW], self.groups[NEW]);
     }
 
@@ -85,9 +76,7 @@ impl Running {
         if let Some(slot) = plan.dense_rank {
             out.extend_col(slot, &(self.groups[side] + 1).to_le_bytes());
         }
-        for (k, agg) in plan.aggs.iter().enumerate() {
-            self.aggs.emit(k, agg, side, out);
-        }
+        self.aggs.emit(side, out);
         out.commit_row();
     }
 }
@@ -133,18 +122,12 @@ pub(in crate::stream) fn op_window(
                         let w = peer.weight[side];
                         if w > 0 {
                             weight[side] = weight[side].wrapping_add(w);
-                            with_row!(
-                                walk,
-                                peer.at,
-                                |src, row| for (k, agg) in window.aggs.iter().enumerate() {
-                                    running.aggs.step(k, agg, side, src, row, w);
-                                }
-                            );
+                            with_row!(walk, peer.at, |src, row| running.aggs.step(side, src, row, w));
                         }
                     }
                 }
                 // An aggregate folds this peer group; a rank counts up to it.
-                let same_aggs = running.same_aggs(window);
+                let same_aggs = running.aggs.same(OLD, NEW);
                 let same = same_aggs && running.same_ranks(window);
                 for peer in &peers {
                     let [old, new] = peer.weight;

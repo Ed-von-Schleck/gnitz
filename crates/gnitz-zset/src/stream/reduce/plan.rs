@@ -2,7 +2,7 @@
 //! `ReduceShape` the ad-hoc fold shares.
 
 use super::avi::{avi_batch, AviBake};
-use crate::algebra::{emit_reduce_row, ground_pk, Agg, AggValues, ReduceShape};
+use crate::algebra::{ground_pk, Agg, AggValues, ReduceShape};
 use crate::repr::Batch;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::AggDescriptor;
@@ -70,7 +70,7 @@ impl ReducePlan {
         let ground = seeds_ground.then(|| {
             let mut v0 = Batch::with_capacity(&shape.output_schema, 1);
             let values = AggValues::new(&shape.aggs, 1);
-            emit_reduce_row(&mut v0, None, ground_pk().bytes(), &shape.aggs, &values, 0);
+            values.emit_row(&mut v0, None, ground_pk().bytes(), 0);
             v0
         });
         Ok(ReducePlan { shape, ground, cardinality, avi })

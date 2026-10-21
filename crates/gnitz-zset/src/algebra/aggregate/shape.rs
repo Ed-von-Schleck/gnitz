@@ -1,9 +1,10 @@
 //! `ReduceShape`: what a reduce's rows look like, shared by the circuit reduce,
 //! the ad-hoc fold and the window.
-use crate::repr::{Batch, MemBatch};
-use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor};
+use std::rc::Rc;
 
-use super::agg::{Agg, AggValues};
+use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
+
+use super::agg::Agg;
 use crate::algebra::group_key::GroupOutKey;
 use gnitz_wire::AggDescriptor;
 
@@ -12,7 +13,7 @@ use gnitz_wire::AggDescriptor;
 pub(crate) struct ReduceShape {
     pub(crate) output_schema: SchemaDescriptor,
     pub(crate) key: GroupOutKey,
-    pub(crate) aggs: Vec<Agg>,
+    pub(crate) aggs: Rc<[Agg]>,
 }
 
 impl ReduceShape {
@@ -34,27 +35,6 @@ impl ReduceShape {
     }
 }
 
-/// Emit one `[key…, group columns…, aggregates…]` row at weight +1, copying the
-/// group columns from `group`'s row at its locators — the ground row has none —
-/// and each of `aggs` from group `g` of `vals`.
-pub(crate) fn emit_reduce_row(
-    output: &mut Batch,
-    group: Option<(&MemBatch, usize, &[ColumnLocator])>,
-    out_pk_bytes: &[u8],
-    aggs: &[Agg],
-    vals: &AggValues,
-    g: usize,
-) {
-    output.begin_row(out_pk_bytes, 1);
-    if let Some((src, row, locs)) = group {
-        output.append_cells_from(locs, src, row);
-    }
-    for (k, agg) in aggs.iter().enumerate() {
-        vals.emit(k, agg, g, output);
-    }
-    output.commit_row();
-}
-
 /// `aggs` over `input`, emitted behind the `prefix` columns: the output layout,
 /// and each aggregate resolved against both. `empty` is whether a value is ever
 /// taken over no rows, as a global reduce's is. `Err` for an aggregate column out
@@ -65,7 +45,7 @@ pub(crate) fn resolve_aggs(
     mut prefix: DerivedSchema,
     aggs: &[AggDescriptor],
     empty: bool,
-) -> Result<(SchemaDescriptor, Vec<Agg>), String> {
+) -> Result<(SchemaDescriptor, Rc<[Agg]>), String> {
     for d in aggs {
         let (src, _) = input.wire_col("aggregate column", d.col_idx)?;
         let tc = gnitz_wire::agg_output_type(d.agg_op, src.type_code)

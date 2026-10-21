@@ -117,22 +117,32 @@ pub(crate) fn cell_image<const W: usize, const OPK: bool>(cell: &[u8; W], signed
     }
 }
 
-/// Run `$body` with `$w` the constant `$width`, a [`KeyCells`] width.
-macro_rules! for_cell_width {
-    ($width:expr, |$w:ident| $body:expr) => {
-        $crate::algebra::group_key::for_cell_width!(@arms $width, $w, $body, 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+/// Run `$body` with `$w` the constant width of [`KeyCells`] `$cells` and `$opk`
+/// its constant `opk`.
+macro_rules! for_key_cells {
+    ($cells:ident, |$w:ident, $opk:ident| $body:expr) => {
+        $crate::algebra::group_key::for_key_cells!(@arms $cells, $w, $opk, $body, 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
     };
-    (@arms $width:expr, $w:ident, $body:expr, $($n:literal)*) => {
-        match $width {
+    (@arms $cells:ident, $w:ident, $opk:ident, $body:expr, $($n:literal)*) => {
+        match $cells.width {
             $($n => {
                 const $w: usize = $n;
-                $body
+                match $cells.opk {
+                    true => {
+                        const $opk: bool = true;
+                        $body
+                    }
+                    false => {
+                        const $opk: bool = false;
+                        $body
+                    }
+                }
             })*
             _ => unreachable!("a key cell is 1..=16 bytes"),
         }
     };
 }
-pub(crate) use for_cell_width;
+pub(crate) use for_key_cells;
 
 /// The synthetic `_group_pk` key — the whole PK region of an output whose group
 /// set has no natural key.
@@ -251,7 +261,7 @@ impl GroupOutKey {
             &GroupKey::PkRange { at, n } => OutPk::Borrowed(mb.get_pk_range(row, at, n)),
             &GroupKey::Image(loc) => OutPk::Narrow(NarrowPkOpk::new(loc.opk_image(mb, row), loc.size())),
             GroupKey::Packed(p) => group_pk(p.narrow_image(mb, row)),
-            GroupKey::Fold(f) => group_pk(f.key_row(mb, row, mb.get_null_word(row))),
+            GroupKey::Fold(f) => group_pk(f.key_row(mb, row)),
         }
     }
 
@@ -261,13 +271,11 @@ impl GroupOutKey {
     #[inline]
     pub(crate) fn with_identity<L: IdentityLoop>(&self, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
         if let Some(cells) = self.key.cells(mb) {
-            return for_cell_width!(cells.width, |W| match cells.opk {
-                true => body.run(|r| cell_image::<W, true>(cells.cell::<W>(r), cells.signed)),
-                false => body.run(|r| cell_image::<W, false>(cells.cell::<W>(r), cells.signed)),
-            });
+            return for_key_cells!(cells, |W, OPK| body
+                .run(|r| cell_image::<W, OPK>(cells.cell::<W>(r), cells.signed)));
         }
         match &self.key {
-            GroupKey::Fold(f) => body.run(|r| f.key_row(mb, r, mb.get_null_word(r))),
+            GroupKey::Fold(f) => body.run(|r| f.key_row(mb, r)),
             GroupKey::Packed(p) => packed_identity(p, mb, rows, body),
             &GroupKey::PkRange { at, n } => body.run(|r| gnitz_wire::checksum_128(mb.get_pk_range(r, at, n))),
             GroupKey::Image(_) => unreachable!("an image key is one cell"),
@@ -324,7 +332,7 @@ impl GroupOutKey {
                 let (keys, w) = (p.keys(mb), p.out_stride);
                 GroupOrdinals::sorted(n, |i| gnitz_wire::widen_pk_be(&keys[i * w..(i + 1) * w]))
             }
-            GroupKey::Fold(f) => GroupOrdinals::sorted(n, |i| f.key_row(mb, i, mb.get_null_word(i))),
+            GroupKey::Fold(f) => GroupOrdinals::sorted(n, |i| f.key_row(mb, i)),
         }
     }
 }
