@@ -90,8 +90,7 @@ pub(super) async fn page(
         send_msg(peer, ipc::WireMsg::train_frame(tid, true, rows.wire_whole()));
     } else {
         let read = Read::SnapshotPage { snapshot: id, tid, page: blob.into() };
-        let mut leases = shared.disp().scan_cut(|cut| cut.read_all(read)).await?;
-        let lease = leases.pop().expect("one read, one lease");
+        let lease = shared.disp().scan_all(read).await?;
         'forward: for w in lease.workers().iter() {
             let mut forwarded = false;
             while let Some(f) = lease.next_of(w).await? {
@@ -131,14 +130,15 @@ pub(super) async fn release_all(shared: &Shared, held: HeldSnapshots) {
 /// the release has left the cluster, which ends the server.
 async fn release(shared: &Shared, id: u64) {
     shared.cat_mut().registry.unpin(id);
-    let released = match shared
-        .disp()
-        .scan_cut(|cut| cut.read_all(Read::Unpin { snapshot: id }))
-        .await
-    {
-        Ok(mut leases) => leases.pop().expect("one read, one lease").finish().await,
-        Err(e) => Err(e),
-    };
+    let released = async {
+        shared
+            .disp()
+            .scan_all(Read::Unpin { snapshot: id })
+            .await?
+            .finish()
+            .await
+    }
+    .await;
     if let Err(e) = released {
         gnitz_warn!("snapshot {id}: release failed: {}", e.text);
     }

@@ -88,14 +88,16 @@ async fn merge_index_scan(
 
 impl MasterDispatcher {
     /// Pre-flight global uniqueness check for CREATE UNIQUE INDEX, distributed:
-    /// each worker streams its committed partition's indexed-column OPK spans
-    /// back sorted, and the master's streaming k-way merge (`merge_index_scan`)
-    /// finds any adjacent equal pair, within or across partitions — which no
-    /// worker's own slice can show. Master memory is `O(num_workers)` plus the (≤ cap) filter seed.
+    /// each worker enters the index on `cols` under the pre-flight's claim,
+    /// filled from its committed partition, and streams its spans back off it,
+    /// sorted; the master's streaming k-way merge (`merge_index_scan`) finds any
+    /// adjacent equal pair, within or across partitions — which no worker's own
+    /// slice can show. Master memory is `O(num_workers)` plus the (≤ cap) filter seed.
     ///
     /// MUST run inside the DDL critical section (committer barrier drained,
     /// catalog write lock held) and BEFORE the IDX_TAB +1 is appended, so the
-    /// scanned snapshot is exactly what each worker fills the index from.
+    /// index each worker filled is the one its catalog claim adopts. The caller
+    /// releases the pre-flight's claims, committed or not.
     ///
     /// `Some(filter)` seeds the master's unique-filter cache; `None` when the
     /// index covers the owner's PK and so can never collide.
@@ -122,7 +124,7 @@ impl MasterDispatcher {
 
         // A replicated owner is read on one worker: every worker's copy would
         // pop each value `nw` times.
-        let lease = self.scan(Read::KeySpans { tid: owner_id, cols }).await?;
+        let lease = self.scan(Read::KeySpans { tid: owner_id, cols, claim: true }).await?;
 
         let Some(seed) = merge_index_scan(&lease, &frame_schema).await? else {
             let cat = self.cat();

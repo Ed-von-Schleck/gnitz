@@ -386,10 +386,10 @@ impl MasterDispatcher {
     pub(crate) async fn backup_round(&self, dir: &str) -> Result<(), WireFault> {
         let relations = gnitz_store::relation::relations_dir(dir);
         std::fs::create_dir(&relations).map_err(|e| format!("create '{relations}': {e}"))?;
-        let mut leases = self
-            .scan_cut(|cut| cut.read_all(Read::Backup { dir: dir.as_bytes().into() }))
+        self.scan_all(Read::Backup { dir: dir.as_bytes().into() })
+            .await?
+            .finish()
             .await?;
-        leases.pop().expect("one read, one lease").finish().await?;
         self.cat().registry.link_published_into(dir)?;
         let parent = std::path::Path::new(dir).parent().and_then(std::path::Path::to_str);
         for d in [Some(relations.as_str()), Some(dir), parent].into_iter().flatten() {

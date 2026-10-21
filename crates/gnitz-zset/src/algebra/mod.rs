@@ -38,7 +38,7 @@ mod sink;
 pub use exchange::ScatterPlan;
 pub use linear::{null_extend_output_schema, op_filter, op_union, union_nullability_merge};
 pub use map::MapPlan;
-pub use reindex::{append_spans, index_entries};
+pub use reindex::{index_entries, spans};
 pub use route::{ground_owner, Placement, Slot};
 pub use sink::SinkPlan;
 

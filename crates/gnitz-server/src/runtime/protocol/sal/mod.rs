@@ -409,6 +409,7 @@ gnitz_wire::wire_enum! {
         Unpin = 14,
         SnapshotPage = 15,
         Backup = 16,
+        ReleasePreflight = 17,
     }
 }
 

@@ -45,6 +45,9 @@ pub enum IndexClaim {
     ForeignKey,
     /// A catalog index.
     Index { id: u64, unique: bool },
+    /// The `CREATE UNIQUE INDEX` pre-flight, which reads its spans off the index
+    /// and leaves it for its DDL to claim on commit.
+    Preflight,
 }
 
 /// A secondary index on a column list of one relation. Owns this process's store
@@ -352,16 +355,27 @@ impl Relation {
         self.indexes.iter().find(|ix| ix.cols.as_slice() == cols)
     }
 
+    /// Remove `claim` from every index, dropping an index left with none.
+    fn release(&mut self, claim: IndexClaim) {
+        for ix in &mut self.indexes {
+            ix.claims.retain(|&c| c != claim);
+        }
+        self.indexes.retain(|ix| !ix.claims.is_empty());
+    }
+
+    /// [`Self::index_on`], `Err` when there is none.
+    pub fn index_or_err(&self, cols: &[u32]) -> Result<&SecondaryIndex, String> {
+        self.index_on(cols)
+            .ok_or_else(|| format!("relation {} has no index on columns {cols:?}", self.id()))
+    }
+
     /// The layout a `probe` of this relation answers in.
     pub fn probe_reply_schema(&self, probe: Probe) -> Result<SchemaDescriptor, String> {
         let schema = self.schema();
         match probe {
             Probe::Pk => Ok(schema.pk_only()),
             Probe::PkColumn(col) => project_schema(&schema, &[col]),
-            Probe::Index(cols, _) => self
-                .index_on(cols.as_slice())
-                .map(|ix| ix.schema())
-                .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), self.id())),
+            Probe::Index(cols, _) => Ok(self.index_or_err(cols.as_slice())?.schema()),
         }
     }
 
@@ -414,8 +428,6 @@ pub struct StoreConfig {
     /// Per-worker distinct-group cap for the ad-hoc aggregate fold; bounds the
     /// fold's running values at one per aggregate per group.
     pub adhoc_group_cap: usize,
-    /// Bytes a key-span sort holds in RAM before it spills a run.
-    pub key_spans_spill_bytes: usize,
 }
 
 impl Default for StoreConfig {
@@ -424,22 +436,19 @@ impl Default for StoreConfig {
             ram_tier_bytes: crate::storage::DEFAULT_RAM_TIER_BYTES,
             scan_chunk_rows: 65_536,
             adhoc_group_cap: 65_536,
-            key_spans_spill_bytes: 128 << 20,
         }
     }
 }
 
 impl StoreConfig {
-    /// Every field from `<prefix>RAM_TIER_BYTES`, `<prefix>SCAN_CHUNK_ROWS`,
-    /// `<prefix>ADHOC_GROUP_CAP` and `<prefix>KEY_SPANS_SPILL_BYTES`, each falling
-    /// back to [`Default`].
+    /// Every field from `<prefix>RAM_TIER_BYTES`, `<prefix>SCAN_CHUNK_ROWS` and
+    /// `<prefix>ADHOC_GROUP_CAP`, each falling back to [`Default`].
     pub fn from_env(prefix: &str) -> Self {
         let d = StoreConfig::default();
         StoreConfig {
             ram_tier_bytes: env_num(&format!("{prefix}RAM_TIER_BYTES"), d.ram_tier_bytes),
             scan_chunk_rows: env_num(&format!("{prefix}SCAN_CHUNK_ROWS"), d.scan_chunk_rows),
             adhoc_group_cap: env_num(&format!("{prefix}ADHOC_GROUP_CAP"), d.adhoc_group_cap),
-            key_spans_spill_bytes: env_num(&format!("{prefix}KEY_SPANS_SPILL_BYTES"), d.key_spans_spill_bytes),
         }
     }
 }
@@ -563,18 +572,17 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// Remove catalog index `index_id`'s claim from whichever of `owner`'s
-    /// circuits holds it, dropping a circuit left with none. A no-op when the
-    /// owner or claim is absent.
-    pub fn release_index(&mut self, owner: u64, index_id: u64) {
-        let Some(entry) = self.tables.get_mut(&owner) else {
-            return;
-        };
-        for ix in &mut entry.indexes {
-            ix.claims
-                .retain(|c| !matches!(*c, IndexClaim::Index { id, .. } if id == index_id));
+    /// Remove `claim` from whichever of `owner`'s circuits hold it, dropping a
+    /// circuit left with none. A no-op when the owner or claim is absent.
+    pub fn release_index(&mut self, owner: u64, claim: IndexClaim) {
+        if let Some(entry) = self.tables.get_mut(&owner) {
+            entry.release(claim);
         }
-        entry.indexes.retain(|ix| !ix.claims.is_empty());
+    }
+
+    /// [`Self::release_index`] over every relation.
+    pub fn release_claim(&mut self, claim: IndexClaim) {
+        self.tables.values_mut().for_each(|entry| entry.release(claim));
     }
 
     /// Publish a new column schema for a registered base table in place (any

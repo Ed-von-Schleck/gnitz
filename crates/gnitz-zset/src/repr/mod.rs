@@ -7,10 +7,9 @@
 //! consolidation (`merge`), the German-string heap (`string_heap`), the direct
 //! row writer (`writer`), the column-first row copy (`scatter`), the N-way min-merge tournament (`loser_tree`), the
 //! shard PK-probe filter (`shard_filter`), the shard writer (`shard_file`), the
-//! shard file's framing (`layout`) and its region encodings (`encoding`), and the
-//! guard-routed shard merge a compaction runs (`compact`), the bounded external sort of
-//! key records (`spill`), and the read-only file mapping (`mmap`). The low-level
-//! WAL-block framer lives in `gnitz_wire::wal` (the one definition client and
+//! shard file's framing (`layout`) and its region encodings (`encoding`), the
+//! guard-routed shard merge a compaction runs (`compact`), and the read-only file
+//! mapping (`mmap`). The low-level WAL-block framer lives in `gnitz_wire::wal` (the one definition client and
 //! engine share). The row-at-a-time system-table writer over a batch is
 //! `batch_builder`.
 //!
@@ -46,7 +45,6 @@ mod seek;
 mod shard_file;
 mod shard_filter;
 mod shard_reader;
-mod spill;
 mod string_heap;
 mod writer;
 
@@ -64,7 +62,6 @@ pub use read_cursor::{
 pub use run::{first_live_payload_group, Run, StoredRow};
 pub use shard_file::ShardWriteOpts;
 pub use shard_reader::{MappedShard, ShardDirectory};
-pub use spill::{KeyProducer, SpillSort};
 
 pub(crate) use batch::{range_rows, runs_where, write_to_batch, RowMark};
 pub(crate) use scatter::{copy_runs, materialize_carrying, width_dispatch};

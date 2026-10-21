@@ -16,7 +16,7 @@ gnitz-wire.workspace = true
 gnitz-expr.workspace = true
 xorf = { version = "0.13", default-features = false, features = ["binary-fuse"] }
 rustc-hash.workspace = true
-# `O_TMPFILE`, for the spill sort's nameless run file.
+# `mmap`, for the read-only file mapping.
 libc.workspace = true
 # The UTF-8 check on a pushed block's STRING cells.
 simdutf8 = "0.1"

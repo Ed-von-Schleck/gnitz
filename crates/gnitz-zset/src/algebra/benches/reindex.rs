@@ -54,7 +54,7 @@ fn fold_key_bench() {
 }
 
 /// Instructions per input row of a secondary index's projection — the span
-/// alone ([`append_spans`]) and the whole entry ([`index_entries`]) — by span
+/// alone ([`spans`]) and the whole entry ([`index_entries`]) — by span
 /// shape, NULL density of the indexed columns, and width of the source PK the
 /// entry ends in.
 #[test]
@@ -68,11 +68,8 @@ fn index_entries_bench() {
             .unwrap();
         let mb = batch.as_mem_batch();
         let key_size = spec.key_size();
-        let mut spans = Vec::with_capacity(N * key_size);
-        append_spans(&mut spans, &mb, &spec, |_| true);
-        spans.clear();
-        let ((), span) = counter.measure(|| append_spans(&mut spans, &mb, &spec, |_| true));
-        black_box(&spans);
+        black_box(spans(&mb, &spec));
+        let (spans, span) = counter.measure(|| spans(&mb, &spec));
         black_box(index_entries(batch, &spec, &idx_schema));
         let (entries, entry) = counter.measure(|| index_entries(batch, &spec, &idx_schema));
         assert_eq!((entries.len(), spans.len()), (live, live * key_size), "{label}");

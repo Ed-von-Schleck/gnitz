@@ -4,7 +4,7 @@
 //! The reindex Map keys rows through it and the exchange scatter routes by the
 //! bytes it packs, so the reindexed trace side and the scattered delta
 //! co-partition byte-for-byte. [`index_entries`] is a secondary index's
-//! projection of its owner's rows, and [`append_spans`] their spans alone.
+//! projection of its owner's rows, and [`spans`] their spans alone.
 
 use std::cell::Cell;
 
@@ -623,12 +623,13 @@ fn indexed_runs(mb: &MemBatch<'_>, spec: &KeySpec, keep: impl Fn(i64) -> bool) -
     })
 }
 
-/// Append to `out` the `spec` span of each row [`indexed_runs`] yields, in row order.
-pub fn append_spans(out: &mut Vec<u8>, mb: &MemBatch<'_>, spec: &KeySpec, keep: impl Fn(i64) -> bool) {
-    let runs = indexed_runs(mb, spec, keep);
-    let (at, key_size) = (out.len(), spec.key_size());
-    out.resize(at + range_rows(&runs) * key_size, 0);
-    ReindexPacker::of_span(spec).pack_rows(&mut out[at..], key_size, mb, &runs);
+/// The `spec` span of each positive-weight row of `mb` that `spec` indexes, in row order.
+pub fn spans(mb: &MemBatch<'_>, spec: &KeySpec) -> Vec<u8> {
+    let runs = indexed_runs(mb, spec, |w| w > 0);
+    let key_size = spec.key_size();
+    let mut out = vec![0; range_rows(&runs) * key_size];
+    ReindexPacker::of_span(spec).pack_rows(&mut out, key_size, mb, &runs);
+    out
 }
 
 /// Each nonzero-weight row of `source` that `spec` indexes, as its index entry

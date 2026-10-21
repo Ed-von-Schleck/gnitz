@@ -203,11 +203,11 @@ impl CatalogEngine {
             let (owner_id, cols, unique) = IdxTabRow::read(batch, i)
                 .and_then(|r| r.parts())
                 .map_err(|e| format!("index {idx_id}: {e}"))?;
+            let claim = IndexClaim::Index { id: idx_id, unique };
             if batch.get_weight(i) > 0 {
-                self.registry
-                    .add_index(owner_id, IndexClaim::Index { id: idx_id, unique }, cols)?;
+                self.registry.add_index(owner_id, claim, cols)?;
             } else {
-                self.registry.release_index(owner_id, idx_id);
+                self.registry.release_index(owner_id, claim);
             }
         }
         Ok(())

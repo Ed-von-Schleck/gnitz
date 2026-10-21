@@ -16,7 +16,7 @@ use crate::runtime::sal::{Apply, Inbound, Read, ReplyRoute, SalReader, SalReques
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
-use gnitz_store::relation::{RelationKind, RelationRegistry};
+use gnitz_store::relation::{IndexClaim, RelationKind, RelationRegistry};
 use gnitz_wire::TypeCode;
 use gnitz_wire::{ReadBound, WireFault};
 use gnitz_zset::repr::Batch;
@@ -49,7 +49,7 @@ mod reply;
 
 use reply::{Owed, Rows};
 
-/// `GNITZ_INJECT_KEY_SPANS_ERROR`: fail every `KeySpans` request.
+/// `GNITZ_INJECT_KEY_SPANS_ERROR`: fail every `KeySpans` request, after its claim.
 static KEY_SPANS_ERROR: Seam = Seam::new("GNITZ_INJECT_KEY_SPANS_ERROR");
 
 impl<'c> WorkerProcess<'c> {
@@ -195,11 +195,18 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
             gnitz_wire::ReadSpec::decode(spec)?,
             reply_layout,
         )?)),
-        Read::KeySpans { tid, cols } => {
+        Read::KeySpans { tid, cols, claim } => {
+            if claim {
+                cat.registry.add_index(tid, IndexClaim::Preflight, cols)?;
+            }
             if KEY_SPANS_ERROR.armed() {
                 return Err("injected key-spans fault".into());
             }
             Ok(Rows::Spans(Box::new(cat.registry.key_spans(tid, cols.as_slice())?)))
+        }
+        Read::ReleasePreflight => {
+            cat.registry.release_claim(IndexClaim::Preflight);
+            Ok(no_rows())
         }
         // A worker holds no system family a snapshot reads: the master answers
         // those from its own pin.

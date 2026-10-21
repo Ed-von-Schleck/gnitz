@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{
-    make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, solo, spec, zset_of, TID,
+    id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, solo, spec, zset_of, TID,
 };
 
 fn index(id: u64, unique: bool) -> IndexClaim {
@@ -24,18 +24,18 @@ fn a_circuit_lives_while_one_claim_remains() {
     );
     assert_eq!(circuit(&registry), Some(true));
 
-    registry.release_index(TID, 71);
+    registry.release_index(TID, index(71, true));
     assert_eq!(
         circuit(&registry),
         Some(false),
         "the non-unique claim keeps the circuit"
     );
 
-    registry.release_index(TID, 12345);
-    registry.release_index(TID + 1, 70);
+    registry.release_index(TID, index(12345, false));
+    registry.release_index(TID + 1, index(70, false));
     assert_eq!(circuit(&registry), Some(false), "an unknown claim or owner is a no-op");
 
-    registry.release_index(TID, 70);
+    registry.release_index(TID, index(70, false));
     assert!(
         registry.relation(TID).unwrap().indexes().is_empty(),
         "the last release drops the circuit"
@@ -77,6 +77,43 @@ fn only_a_store_naming_one_row_per_key_admits_an_index() {
             }
         }
     }
+}
+
+/// The pre-flight's claim enters an index filled from the rows already held,
+/// which the catalog's claim then takes over: releasing the pre-flight keeps the
+/// index it adopted and drops the one nothing adopted. The pre-flight's claim
+/// makes no index unique.
+#[test]
+fn a_preflight_index_lives_on_only_under_the_claim_that_adopts_it() {
+    let schema = pk_u64_two_i64_schema();
+    let rows = id_rows(&schema, (1..=3).map(|id| (id, 1)), |bb, id| {
+        bb.put_int(id as u128 * 10);
+        bb.put_int(7);
+    });
+    let mut registry = relation_fixture(RelationKind::BaseTable, schema, &[], [rows]);
+    let (adopted, abandoned) = (PkColList::from_slice(&[2]), PkColList::from_slice(&[1]));
+    for cols in [adopted, abandoned] {
+        registry.add_index(TID, IndexClaim::Preflight, cols).unwrap();
+    }
+    // Whether the index on `cols` is unique, and how many spans it holds.
+    let index = |r: &RelationRegistry, cols: PkColList| {
+        let ix = r.relation(TID).unwrap().index_on(cols.as_slice())?;
+        let mut spans = r.key_spans(TID, cols.as_slice()).unwrap();
+        let mut held = 0;
+        while !spans.chunk().is_empty() {
+            held += spans.chunk().len();
+            spans.advance();
+        }
+        Some((ix.is_unique(), held))
+    };
+    assert_eq!(index(&registry, adopted), Some((false, 3)), "filled from the held rows");
+
+    registry
+        .add_index(TID, IndexClaim::Index { id: 80, unique: true }, adopted)
+        .unwrap();
+    registry.release_index(TID, IndexClaim::Preflight);
+    assert_eq!(index(&registry, adopted), Some((true, 3)));
+    assert_eq!(index(&registry, abandoned), None);
 }
 
 /// Not unique, or covering the PK: either one excludes an index.

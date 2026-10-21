@@ -47,7 +47,7 @@ pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
 pub(crate) use sys_tables::{DdlBundle, SysFamily};
 // The DDL_TXN driver's unique-index pre-flight input.
 pub(crate) use sys_tables::unique_index_creates;
-pub(crate) use write_path::{ZoneError, ZoneSink};
+pub(crate) use write_path::{AppliedDdl, ZoneError, ZoneSink};
 
 // ---------------------------------------------------------------------------
 // CatalogEngine

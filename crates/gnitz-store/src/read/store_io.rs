@@ -41,9 +41,7 @@ impl RelationRegistry {
                 relation.gather(live, Cut::Now).project_live(&[col])
             }
             Probe::Index(cols, cap) => {
-                let index = relation
-                    .index_on(cols.as_slice())
-                    .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), id))?;
+                let index = relation.index_or_err(cols.as_slice())?;
                 // The keys are the probed spans themselves.
                 keyed_as(index.key_spec().key_size())?;
                 let mut entries = Batch::empty_with_schema(&relation.probe_reply_schema(probe)?);

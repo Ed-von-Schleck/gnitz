@@ -197,6 +197,9 @@ fn weight(i: u64) -> i64 {
 fn in_wait_dispositions() {
     let (mut engine, tid) = engine_with_table("in_wait_dispositions");
     let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
+    let cols = PkColList::from_slice(&[1]);
+    let claim = IndexClaim::Index { id: vid + 1, unique: false };
+    engine.registry.add_index(tid, claim, cols).unwrap();
     let schema = make_schema_u64_i64();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
@@ -208,7 +211,7 @@ fn in_wait_dispositions() {
             .encode()
             .into(),
     };
-    let spans = Read::KeySpans { tid, cols: PkColList::from_slice(&[1]) };
+    let spans = Read::KeySpans { tid, cols, claim: false };
     let ddl = DirectGroup {
         targets: GroupTargets {
             set: WorkerSet::EMPTY,
@@ -690,6 +693,49 @@ fn a_train_advances_with_every_request() {
     assert_eq!(owed(&wp), [("train", 11)], "ten frames, six sent");
 }
 
+/// The pre-flight's span read enters the index under its claim, filled from the
+/// rows already held, and answers off it; its release drops the index no other
+/// claim holds.
+#[test]
+fn a_claiming_span_read_holds_its_index_until_its_release() {
+    let (mut engine, tid) = engine_with_table("preflight_claim");
+    let held: Vec<_> = (0..5).map(|i| (i, 1, -(i as i64))).collect();
+    engine
+        .registry
+        .ingest(tid, make_batch_raw(&make_schema_u64_i64(), &held))
+        .unwrap();
+    let cols = PkColList::from_slice(&[1]);
+    let (mut wp, sal, rx) = test_worker(&mut engine);
+    let indexed = |wp: &WorkerProcess| {
+        wp.catalog
+            .registry
+            .relation(tid)
+            .unwrap()
+            .index_on(cols.as_slice())
+            .is_some()
+    };
+
+    let spans = Read::KeySpans { tid, cols, claim: true };
+    sal.excl().write(&addressed(spans, 1)).expect("group fits");
+    wp.drain_sal();
+    drain_replies(&mut wp);
+    assert!(indexed(&wp));
+    let span_schema = pk_only_schema(&[TypeCode::I64]);
+    let out = frames(&rx);
+    assert!(reqs(&out).iter().all(|&r| r == 1));
+    assert_eq!(
+        out.iter().map(|f| f.rows(&span_schema).len()).sum::<usize>(),
+        held.len()
+    );
+
+    sal.excl()
+        .write(&addressed(Read::ReleasePreflight, 2))
+        .expect("group fits");
+    wp.drain_sal();
+    assert!(!indexed(&wp));
+    assert_eq!(reqs(&frames(&rx)), [2]);
+}
+
 /// A span train carries every span in order, cut into frames by `chunk_rows` or
 /// the byte budget, whichever is hit first, and ends in one row-less terminal frame.
 #[test]
@@ -706,6 +752,8 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
     ];
     for (n, budget, chunk_rows, carrying) in cases {
         let (mut engine, tid) = engine_with_table(&format!("span_train_{n}"));
+        let claim = IndexClaim::Index { id: tid + 1, unique: false };
+        engine.registry.add_index(tid, claim, cols).unwrap();
         // Values descend as ids ascend, so span order is not row order.
         let held: Vec<_> = (0..n).map(|i| (i, 1, -(i as i64))).collect();
         engine

@@ -99,7 +99,11 @@ fn route_read(read: &Read<'_>, rel: &Relation, nw: usize) -> ReadRoute {
             },
         ),
         Read::ScanSpec { spec, .. } | Read::Delta { spec, .. } => (gnitz_wire::peek_bound(spec), rel.placement()),
-        Read::Pin { .. } | Read::Unpin { .. } | Read::SnapshotPage { .. } | Read::Backup { .. } => {
+        Read::Pin { .. }
+        | Read::Unpin { .. }
+        | Read::SnapshotPage { .. }
+        | Read::Backup { .. }
+        | Read::ReleasePreflight => {
             unreachable!("a read of no live relation's rows is routed by ScanCut::read_all")
         }
     };
@@ -231,6 +235,12 @@ impl MasterDispatcher {
     /// One scan-shaped read under its own SAL hold.
     pub(crate) async fn scan(&self, read: Read<'_>) -> Result<TrainLease, WireFault> {
         let mut leases = self.scan_cut(|cut| cut.read(read)).await?;
+        Ok(leases.pop().expect("one read, one lease"))
+    }
+
+    /// [`Self::scan`] of a read every worker answers.
+    pub(crate) async fn scan_all(&self, read: Read<'_>) -> Result<TrainLease, WireFault> {
+        let mut leases = self.scan_cut(|cut| cut.read_all(read)).await?;
         Ok(leases.pop().expect("one read, one lease"))
     }
 }

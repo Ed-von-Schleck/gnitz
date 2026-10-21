@@ -1,5 +1,6 @@
 use super::*;
 use crate::relation::Cut as At;
+use crate::relation::IndexClaim;
 use crate::test_support::{
     batch_rows, col_range, img, make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture, zset_of,
     RelationFixture, Rng, TID,
@@ -77,7 +78,7 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
     for (val_of, indexed, bound, walks, ids) in cases {
         let mut r = fixture(RelationKind::BaseTable, val_of);
         if !indexed {
-            r.release_index(TID, TID + 1);
+            r.release_index(TID, IndexClaim::Index { id: TID + 1, unique: false });
         }
         let want: Vec<_> = ids.into_iter().map(|id| (id, 1, val_of(id))).collect();
         for chunk in [1, 3, 7, 64, usize::MAX] {
@@ -448,7 +449,7 @@ fn a_read_of_what_the_relation_has_not_got_is_refused() {
             "stride",
         ),
         (r.probe(999_999, index(&[1]), span()).map(drop), "not registered"),
-        (r.probe(TID, index(&[0, 1]), span()).map(drop), "No index"),
+        (r.probe(TID, index(&[0, 1]), span()).map(drop), "no index"),
         (r.probe(TID, index(&[1]), entry()).map(drop), "stride"),
         (r.probe(TID, Probe::Pk, entry()).map(drop), "stride"),
         (r.probe(TID, Probe::PkColumn(1), entry()).map(drop), "stride"),

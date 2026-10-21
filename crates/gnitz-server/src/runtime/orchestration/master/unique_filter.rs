@@ -6,7 +6,7 @@ use rustc_hash::FxHashSet;
 
 use super::*;
 use gnitz_wire::PkKeys;
-use gnitz_zset::algebra::append_spans;
+use gnitz_zset::algebra::spans;
 use gnitz_zset::schema::key::probe_key;
 use gnitz_zset::schema::KeySpec;
 
@@ -65,10 +65,7 @@ pub(super) fn extract_into_filter(filter: &mut UniqueFilter, batch: &gnitz_zset:
     if filter.is_capped() {
         return;
     }
-    let key_size = spec.key_size();
-    let mut spans = Vec::new();
-    append_spans(&mut spans, batch, spec, |w| w > 0);
-    for span in spans.chunks_exact(key_size) {
+    for span in spans(batch, spec).chunks_exact(spec.key_size()) {
         if !filter.insert(span) {
             return;
         }
@@ -128,7 +125,7 @@ impl MasterDispatcher {
             if self.unique_filters.borrow().contains_key(&(table_id, cols)) {
                 continue;
             }
-            let lease = self.scan(Read::KeySpans { tid: table_id, cols }).await?;
+            let lease = self.scan(Read::KeySpans { tid: table_id, cols, claim: false }).await?;
             let (span_schema, mut filter) = (spec.span_schema(), UniqueFilter::new());
             // A capped filter reads no further; the lease drop discards the rest.
             'train: while let Some(frame) = lease.next().await? {

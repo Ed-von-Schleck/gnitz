@@ -251,8 +251,8 @@ impl Copies {
         if rec.cursor.is_none() {
             return self.erase(tid);
         }
-        for cols in held.iter().filter(|c| !listed.contains(c)) {
-            self.registry.release_index(tid, cols.pack());
+        for &cols in held.iter().filter(|c| !listed.contains(c)) {
+            self.registry.release_index(tid, index_claim(cols));
         }
         for &cols in listed.iter().filter(|c| !held.contains(c)) {
             if let Err(e) = self.registry.add_index(tid, index_claim(cols), cols) {

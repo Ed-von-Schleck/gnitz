@@ -156,16 +156,19 @@ pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
     sigs
 }
 
-/// `(owner, cols)` of every unique index `batch` (an IDX_TAB delta) creates: the
-/// DDL driver's pre-flight input, read before the precheck. A row that does not
-/// decode is skipped; the precheck refuses the bundle over it.
+/// The distinct `(owner, cols)` of every unique index `batch` (an IDX_TAB delta)
+/// creates: the DDL driver's pre-flight input, read before the precheck. A row
+/// that does not decode is skipped; the precheck refuses the bundle over it.
 pub(crate) fn unique_index_creates(batch: &Batch) -> Vec<(u64, PkColList)> {
-    pk_signatures(batch)
+    let mut creates: Vec<_> = pk_signatures(batch)
         .into_iter()
         .filter(|s| s.shape() == PkShape::Create)
         .filter_map(|s| IdxTabRow::read(batch, s.row).and_then(|r| r.parts()).ok())
         .filter_map(|(owner, cols, unique)| unique.then_some((owner, cols)))
-        .collect()
+        .collect();
+    creates.sort_unstable_by_key(|&(owner, cols)| (owner, cols.pack()));
+    creates.dedup();
+    creates
 }
 
 /// One `DDL_TXN` bundle: at most one block per system family.

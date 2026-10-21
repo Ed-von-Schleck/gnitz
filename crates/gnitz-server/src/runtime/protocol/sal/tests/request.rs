@@ -41,7 +41,9 @@ fn every_request() -> Vec<SalRequest<'static>> {
             keys: vec![41u8, 42, 43].into(),
         }
         .into(),
-        Read::KeySpans { tid: 24, cols }.into(),
+        Read::KeySpans { tid: 24, cols, claim: false }.into(),
+        Read::KeySpans { tid: 37, cols, claim: true }.into(),
+        Read::ReleasePreflight.into(),
         Read::ScanSpec {
             tid: 25,
             reply_layout: 26,

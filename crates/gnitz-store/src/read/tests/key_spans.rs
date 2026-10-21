@@ -13,8 +13,7 @@ fn val(id: u64) -> Option<i64> {
 }
 
 /// `(id U64 PK | val I64 NULL)` holding ids `0..ROWS`, every third then retracted,
-/// read `chunk_rows` rows a chunk and spilling its sorts three 8-byte records a run.
-/// Indexed on `val` when `indexed`.
+/// read `chunk_rows` rows a chunk. Indexed on `val` when `indexed`.
 fn fixture(indexed: bool, chunk_rows: usize) -> RelationFixture {
     let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]);
     let rows = |w: i64, ids: &mut dyn Iterator<Item = u64>| {
@@ -24,7 +23,6 @@ fn fixture(indexed: bool, chunk_rows: usize) -> RelationFixture {
     };
     let config = StoreConfig {
         scan_chunk_rows: chunk_rows,
-        key_spans_spill_bytes: 24,
         ..StoreConfig::default()
     };
     let indexed: &[&[u32]] = if indexed { &[&[1]] } else { &[] };
@@ -46,13 +44,12 @@ fn drain(mut spans: KeySpans) -> (Vec<Vec<u8>>, Vec<usize>) {
     (keys, chunks)
 }
 
-/// The spans of a relation are one sorted list whether an index on the columns
-/// holds them or a sort of the rows makes them — across chunk boundaries, and
-/// with a spill budget of a few records — and neither a NULL in the column nor a
-/// retracted row yields one. A column list the relation does not have, or a
-/// relation it does not hold, is refused before anything is read.
+/// The spans of a relation are the index's entries as one sorted list, across
+/// chunk boundaries, and neither a NULL in the column nor a retracted row yields
+/// one. A column list the relation has no index on, or a relation it does not
+/// hold, is refused before anything is read.
 #[test]
-fn the_index_and_the_sort_yield_the_same_sorted_spans() {
+fn the_index_yields_every_span_in_order() {
     let span_schema = pk_only_schema(&[TypeCode::I64]);
     let mut want: Vec<Vec<u8>> = (0..ROWS)
         .filter(|id| !id.is_multiple_of(3))
@@ -62,21 +59,14 @@ fn the_index_and_the_sort_yield_the_same_sorted_spans() {
     want.sort();
 
     for chunk_rows in [1, 4, 1024] {
-        for indexed in [true, false] {
-            let r = fixture(indexed, chunk_rows);
-            assert_eq!(r.relation(TID).unwrap().index_on(&[1]).is_some(), indexed);
-
-            let (got, chunks) = drain(r.key_spans(TID, &[1]).unwrap());
-            assert_eq!(got, want, "indexed={indexed}, chunk_rows={chunk_rows}");
-            assert!(
-                chunks.iter().all(|&n| n <= chunk_rows),
-                "indexed={indexed}: {chunks:?} over {chunk_rows}"
-            );
-            assert_eq!(chunks.len(), want.len().div_ceil(chunk_rows), "indexed={indexed}");
-        }
+        let (got, chunks) = drain(fixture(true, chunk_rows).key_spans(TID, &[1]).unwrap());
+        assert_eq!(got, want, "chunk_rows={chunk_rows}");
+        assert!(chunks.iter().all(|&n| n <= chunk_rows), "{chunks:?} over {chunk_rows}");
+        assert_eq!(chunks.len(), want.len().div_ceil(chunk_rows));
     }
 
-    let r = fixture(false, 1024);
-    assert!(r.key_spans(TID, &[9]).is_err());
+    let r = fixture(true, 1024);
+    assert!(r.key_spans(TID, &[0]).is_err(), "no index on the PK");
     assert!(r.key_spans(TID + 100, &[1]).is_err());
+    assert!(fixture(false, 1024).key_spans(TID, &[1]).is_err());
 }

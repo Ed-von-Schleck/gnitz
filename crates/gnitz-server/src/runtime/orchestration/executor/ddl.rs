@@ -13,11 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{park_until, request_barrier, send_ack, Shared};
-use crate::catalog::{unique_index_creates, DdlBundle, SysFamily};
+use crate::catalog::{unique_index_creates, AppliedDdl, DdlBundle, SysFamily};
 use crate::runtime::committer::{BarrierKind, CHECKPOINTS_BEHIND_DDL};
 use crate::runtime::master::UniqueFilter;
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::WriteGuard;
+use crate::runtime::sal::Read;
 use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
 use gnitz_wire::control::{DecodedControl, Target};
@@ -139,37 +140,18 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         .unwrap_or_default();
 
     let locks = enter_ddl(shared).await;
-
-    // Pre-flight global uniqueness for every unique secondary index in this
-    // bundle before reserving the zone LSN or mutating the catalog, so a
-    // violation needs no rollback.
-    let mut filter_seeds: Vec<(u64, PkColList, UniqueFilter)> = Vec::new();
-    for (owner_id, cols) in unique_creates {
-        match shared.disp().validate_unique_index_create(owner_id, cols).await {
-            // No catalog mutation yet: just surface the violation to the
-            // client. The write lock drops on return.
-            Err(e) => return Err(e),
-            Ok(Some(filter)) => filter_seeds.push((owner_id, cols, filter)),
-            // The index covers the owner's PK: nothing will consult a filter.
-            Ok(None) => {}
-        }
-    }
-
-    // Before the views exist: a tick owed now carries rows pushed ahead of them,
-    // and a stream's must not reach them.
-    if families.get(SysFamily::Circuit).is_some() {
-        if let Some(lease) = shared.emit_pending_tick().await? {
-            lease.acks().await;
-        }
-    }
-    let ((applied, zone_lsn), synced) = {
-        let mut excl = shared.disp().sal().lock().await;
-        let written = shared
-            .disp()
-            .emit_zone(&mut excl, "DDL", |cat, sink| cat.apply_bundle(families, sink))?;
-        (written, excl.sync(shared.disp().reactor(), "DDL"))
+    // Only an owner that already exists is scanned, so only it leaves claims.
+    let claims = {
+        let cat = shared.cat();
+        unique_creates
+            .iter()
+            .any(|&(owner, _)| cat.registry.relation(owner).is_some())
     };
-    synced.await;
+    let committed = commit_bundle(shared, families, &unique_creates).await;
+    if claims {
+        release_preflight(shared).await;
+    }
+    let Committed { applied, zone_lsn, filter_seeds } = committed?;
 
     // Relation ids are never reissued within a boot, so these entries are dead.
     for &id in &applied.dropped_relations {
@@ -213,6 +195,62 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
     }
     Ok(())
+}
+
+/// A bundle made durable: what it applied, its zone, and the unique-filter seed of
+/// each unique index it created over rows already present.
+struct Committed {
+    applied: AppliedDdl,
+    zone_lsn: u64,
+    filter_seeds: Vec<(u64, PkColList, UniqueFilter)>,
+}
+
+/// Pre-flight every unique index of the bundle, then apply it and make its zone
+/// durable. Every `Err` leaves the catalog as it was.
+async fn commit_bundle(
+    shared: &Rc<Shared>,
+    families: DdlBundle,
+    unique_creates: &[(u64, PkColList)],
+) -> Result<Committed, WireFault> {
+    // Pre-flight global uniqueness for every unique secondary index in this
+    // bundle before reserving the zone LSN or mutating the catalog, so a
+    // violation needs no rollback.
+    let mut filter_seeds = Vec::new();
+    for &(owner_id, cols) in unique_creates {
+        // `None`: the index covers the owner's PK, so nothing will consult a filter.
+        if let Some(filter) = shared.disp().validate_unique_index_create(owner_id, cols).await? {
+            filter_seeds.push((owner_id, cols, filter));
+        }
+    }
+
+    // Before the views exist: a tick owed now carries rows pushed ahead of them,
+    // and a stream's must not reach them.
+    if families.get(SysFamily::Circuit).is_some() {
+        if let Some(lease) = shared.emit_pending_tick().await? {
+            lease.acks().await;
+        }
+    }
+    let ((applied, zone_lsn), synced) = {
+        let mut excl = shared.disp().sal().lock().await;
+        let written = shared
+            .disp()
+            .emit_zone(&mut excl, "DDL", |cat, sink| cat.apply_bundle(families, sink))?;
+        (written, excl.sync(shared.disp().reactor(), "DDL"))
+    };
+    synced.await;
+    Ok(Committed { applied, zone_lsn, filter_seeds })
+}
+
+/// Release the pre-flight's index claims, committed or not, while the DDL's locks
+/// still hold off every checkpoint. The release follows the zone in the log, so a
+/// worker enters the catalog's claim on an index the DDL created before it drops
+/// the pre-flight's. A claim left standing would keep an index no catalog row
+/// owns, whose directory the next checkpoint's sweep removes from under it.
+async fn release_preflight(shared: &Shared) {
+    let released = async { shared.disp().scan_all(Read::ReleasePreflight).await?.finish().await }.await;
+    if let Err(e) = released {
+        gnitz_fatal_abort!("releasing the unique-index pre-flight's claims failed: {}", e.text);
+    }
 }
 
 /// Reserve a SERIAL id range for `seq` and return its base. The advance is a

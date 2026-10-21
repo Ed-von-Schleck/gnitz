@@ -152,12 +152,11 @@ _MERGES = {
     # multi-frame continuation train.
     "multi-frame key train": (
         TINY_SCAN_CHUNKS, [(pk, pk * 7) for pk in range(1, 201)], (201, 7), (1000, 700)),
-    # With a 256-byte sort budget, a partition far past it drives the external
-    # merge sort: a wide PK spread makes hundreds of spans per worker, so many
-    # spilled runs and a k-way merge over them. The budget is honoured in every
-    # build, so this bites a release server too.
-    "external sort spill": (
-        {"GNITZ_KEY_SPANS_SPILL_BYTES": "256"}, [(i * 7 + 1, i) for i in range(_n)],
+    # With a 1 KiB RAM tier, the index each worker fills for the pre-flight
+    # spills to shards long before its hundreds of spans are in, so they are
+    # read back through a merge over many runs.
+    "index past its RAM tier": (
+        {"GNITZ_RAM_TIER_BYTES": "1024"}, [(i * 7 + 1, i) for i in range(_n)],
         (_n * 10, 5), (_n * 10 + 3, 0)),
 }
 
@@ -167,7 +166,8 @@ def test_the_preflight_merge_stays_exact_across_its_own_boundaries(own_server, e
     """The merge must stay exact wherever its frame or run boundaries happen to
     fall, on both verdicts: an all-distinct seed creates and then enforces, and
     one duplicate pair on far-apart PKs — adjacent only in the merged stream —
-    is still caught."""
+    is still caught. Each verdict leaves the workers' indexes as the catalog
+    has them, so the refused create succeeds once the duplicate is gone."""
     with gnitz.connect(own_server.start(extra_env=env).target) as srv:
         srv.execute_sql(_T)
         insert(srv, "t", seed)
@@ -181,12 +181,18 @@ def test_the_preflight_merge_stays_exact_across_its_own_boundaries(own_server, e
             srv.execute_sql("CREATE UNIQUE INDEX ix ON t(val)")
         assert _indices(srv) == {}
 
+        srv.execute_sql(f"DELETE FROM t WHERE pk = {repeat[0]}")
+        srv.execute_sql("CREATE UNIQUE INDEX ix ON t(val)")
+        with _violation():
+            insert(srv, "t", [repeat])
+
 
 def test_worker_fault_mid_preflight(own_server):
-    """An injected worker fault during the pre-flight scan must surface as a
-    client error with no index created, no filter seeded, and every worker
-    drained (not wedged): the table stays fully usable, and the PK
-    short-circuit — which never fans out — still succeeds."""
+    """An injected worker fault during the pre-flight scan, after each worker
+    has filled the index, must surface as a client error with no index created,
+    no filter seeded, and every worker drained (not wedged): the table stays
+    fully usable, and the PK short-circuit — which never fans out — still
+    succeeds."""
     with gnitz.connect(own_server.start(extra_env={"GNITZ_INJECT_KEY_SPANS_ERROR": "1"}).target) as srv:
         srv.execute_sql(_T)
         seed = [(pk, pk) for pk in range(1, 33)]

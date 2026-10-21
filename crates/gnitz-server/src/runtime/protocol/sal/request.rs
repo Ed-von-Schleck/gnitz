@@ -18,8 +18,12 @@ pub(crate) enum Read<'a> {
         probe: Probe,
         keys: Cow<'a, [u8]>,
     },
-    /// The sorted spans of `cols` over `tid`.
-    KeySpans { tid: u64, cols: PkColList },
+    /// The sorted spans of `cols` over `tid`, off its index on `cols`. With
+    /// `claim`, the `CREATE UNIQUE INDEX` pre-flight's: that index is first
+    /// entered under the pre-flight's claim, filled from `tid`'s rows if absent.
+    KeySpans { tid: u64, cols: PkColList, claim: bool },
+    /// Release every claim the pre-flight holds.
+    ReleasePreflight,
     /// The encoded `ReadSpec` `spec`, in the layout whose digest is `reply_layout`.
     ScanSpec {
         tid: u64,
@@ -80,6 +84,7 @@ impl SalRequest<'_> {
             SalRequest::Shutdown => SalMessageKind::Shutdown,
             SalRequest::Read(Read::HasPk { .. }) => SalMessageKind::HasPk,
             SalRequest::Read(Read::KeySpans { .. }) => SalMessageKind::KeySpans,
+            SalRequest::Read(Read::ReleasePreflight) => SalMessageKind::ReleasePreflight,
             SalRequest::Read(Read::ScanSpec { .. }) => SalMessageKind::ScanSpec,
             SalRequest::Read(Read::Delta { .. }) => SalMessageKind::DeltaRead,
             SalRequest::Read(Read::Pin { .. }) => SalMessageKind::Pin,
@@ -124,11 +129,13 @@ impl SalRequest<'_> {
                     ..head
                 }
             }
-            SalRequest::Read(Read::KeySpans { tid, cols }) => WireMsg {
+            SalRequest::Read(Read::KeySpans { tid, cols, claim }) => WireMsg {
                 target_id: tid,
+                arg0: claim.into(),
                 arg1: cols.pack(),
                 ..head
             },
+            SalRequest::Read(Read::ReleasePreflight) => head,
             SalRequest::Read(Read::ScanSpec { tid, reply_layout, ref spec }) => WireMsg {
                 target_id: tid,
                 arg0: reply_layout,
@@ -179,8 +186,11 @@ impl SalRequest<'static> {
             SalMessageKind::KeySpans => {
                 let cols = PkColList::unpack(hdr.arg1)
                     .map_err(|e| format!("key spans of table {tid}: {}", e.for_role(PkListRole::ColumnList)))?;
-                Read::KeySpans { tid, cols }.into()
+                let claim =
+                    gnitz_wire::bool_word(hdr.arg0).map_err(|e| format!("key spans of table {tid}: claim: {e}"))?;
+                Read::KeySpans { tid, cols, claim }.into()
             }
+            SalMessageKind::ReleasePreflight => Read::ReleasePreflight.into(),
             SalMessageKind::ScanSpec => Read::ScanSpec {
                 tid,
                 reply_layout: hdr.arg0,

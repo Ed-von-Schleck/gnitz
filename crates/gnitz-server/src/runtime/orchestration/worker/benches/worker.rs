@@ -59,12 +59,11 @@ fn arm(
 
 /// The worker's own request path, in instructions per reply frame: a group read
 /// off the SAL, decoded, applied or answered, and its reply on the ring. Every
-/// arm but `key_spans` answers a request in one frame.
+/// arm but `spans` answers a request in one frame.
 ///
 /// `ack` is a push that carries no rows, the floor under the others. `tick` runs
-/// one identity view over an empty delta. The `spans` arms are one train over
-/// the table's second column, a chunk of spans per frame: sorted out of the
-/// table's rows, and read off an index of that column.
+/// one identity view over an empty delta. `spans` is one train over the table's
+/// second column, a chunk of spans per frame, read off an index of that column.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn worker_request_bench() {
@@ -113,15 +112,14 @@ fn worker_request_bench() {
     arm("tick", 0, viewed, REQUESTS, tick, n, 0);
 
     let cols = PkColList::from_slice(&[1]);
-    let chunked = |engine: &mut CatalogEngine, _| engine.registry.set_scan_chunk_rows(CHUNK_ROWS);
     let indexed = |engine: &mut CatalogEngine, tid| {
-        chunked(engine, tid);
+        engine.registry.set_scan_chunk_rows(CHUNK_ROWS);
         let claim = IndexClaim::Index { id: tid + 1, unique: false };
         engine.registry.add_index(tid, claim, cols).unwrap();
     };
-    let spans = |excl: &SalExcl, tid, _: &[u8], id| excl.write(&addressed(Read::KeySpans { tid, cols }, id));
+    let spans =
+        |excl: &SalExcl, tid, _: &[u8], id| excl.write(&addressed(Read::KeySpans { tid, cols, claim: false }, id));
     let held = (CHUNKS * CHUNK_ROWS) as u64;
     // A frame per chunk, then the train's end.
-    arm("spans_sort", held, chunked, 1, spans, CHUNKS + 1, held);
-    arm("spans_index", held, indexed, 1, spans, CHUNKS + 1, held);
+    arm("spans", held, indexed, 1, spans, CHUNKS + 1, held);
 }
