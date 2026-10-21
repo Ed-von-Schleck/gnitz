@@ -437,8 +437,8 @@ fn the_adhoc_fold_refuses_a_group_past_its_cap() {
                 .collect::<Vec<_>>(),
         )
     };
-    fold.push(&rows(&[7, 8, 7]), &mut vec![(0, 3)]).unwrap();
-    let err = fold.push(&rows(&[8, 9]), &mut vec![(0, 2)]).unwrap_err();
+    fold.push(&rows(&[7, 8, 7]), &mut [(0, 3)]).unwrap();
+    let err = fold.push(&rows(&[8, 9]), &mut [(0, 2)]).unwrap_err();
     assert!(err.contains("exceeds 2 distinct groups"), "{err}");
 }
 
@@ -595,7 +595,7 @@ fn a_float_sum_weighs_each_value() {
         assert_eq!(got, want, "group {group_cols:?}");
 
         let mut fold = fold_sink(group_cols, aggs.to_vec(), usize::MAX).unwrap();
-        fold.push(&batch(&rows), &mut vec![(0, rows.len())]).unwrap();
+        fold.push(&batch(&rows), &mut [(0, rows.len())]).unwrap();
         let b = fold.finish();
         let mb = b.as_mem_batch();
         let loc = b.schema().locate(b.schema().num_columns() - 1);
@@ -706,7 +706,7 @@ fn a_float_sum_is_carried_in_f64() {
             "reduce, group {group_cols:?}"
         );
         let mut fold = fold_sink(group_cols, aggs.to_vec(), usize::MAX).unwrap();
-        fold.push(&batch(&rows), &mut vec![(0, rows.len())]).unwrap();
+        fold.push(&batch(&rows), &mut [(0, rows.len())]).unwrap();
         assert_eq!(read(&fold.finish()), (want_f, want_x), "ad hoc, group {group_cols:?}");
     }
 }

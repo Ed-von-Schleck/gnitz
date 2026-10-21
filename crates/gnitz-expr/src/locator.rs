@@ -389,10 +389,41 @@ impl<'a, S: RowSource> RowRanking<'a, S> {
         self.rows.iter().map(|r| r.row)
     }
 
+    /// Order the rows ascending; rows the keys do not tell apart keep their order.
+    pub fn sort(&mut self) {
+        sort_run(self.keys, self.src, &mut self.rows);
+    }
+
+    /// Keep the first `n` rows.
+    pub fn truncate(&mut self, n: usize) {
+        self.rows.truncate(n);
+    }
+
     /// The rows ascending; rows the keys do not tell apart keep their order.
     pub fn sorted(mut self) -> Vec<u32> {
-        sort_run(self.keys, self.src, &mut self.rows);
+        self.sort();
         self.rows().collect()
+    }
+}
+
+/// The weight slots of a window still to skip, then to keep: OFFSET and LIMIT
+/// counted in logical rows, an element of weight `w` standing for `w` of them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct WeightSlots {
+    pub skip: u64,
+    pub keep: u64,
+}
+
+impl WeightSlots {
+    /// How many of the next element's `weight` slots are kept.
+    #[inline]
+    pub fn take(&mut self, weight: i64) -> i64 {
+        let slots = weight.max(0) as u64;
+        let skipped = slots.min(self.skip);
+        self.skip -= skipped;
+        let take = (slots - skipped).min(self.keep);
+        self.keep -= take;
+        take as i64
     }
 }
 

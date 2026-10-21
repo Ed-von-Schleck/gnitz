@@ -2,7 +2,7 @@
 //! pass over a fetched result (base tables and views).
 
 use gnitz_core::{Schema, ZSetBatch};
-use gnitz_expr::{order_locators, RowRanking};
+use gnitz_expr::{order_locators, RowRanking, WeightSlots};
 
 /// The client-side cut a sink applies to its own result. `limit: None` is
 /// unbounded.
@@ -55,32 +55,23 @@ pub(crate) fn order_and_window(
     if !cut {
         return batch.gather(&rows);
     }
-    // Entry `r` holds logical rows `[at, at + w)`; the window keeps `span` of the entries, whole
-    // but for what it clips off the first and the last.
-    let mut at = 0usize;
-    let mut span = 0..0;
-    let (mut head, mut tail) = (0i64, 0i64);
-    for (i, &r) in rows.iter().enumerate() {
-        let next = at.saturating_add(batch.weights[r as usize] as usize);
-        let kept = next.min(end).saturating_sub(at.max(window.offset)) as i64;
-        if kept > 0 {
-            if span.is_empty() {
-                (span.start, head) = (i, kept);
-            }
-            (span.end, tail) = (i + 1, kept);
+    let mut slots = WeightSlots {
+        skip: window.offset as u64,
+        keep: window.limit.map_or(u64::MAX, |l| l as u64),
+    };
+    let (mut kept, mut takes) = (Vec::new(), Vec::new());
+    for &r in &rows {
+        let take = slots.take(batch.weights[r as usize]);
+        if take > 0 {
+            kept.push(r);
+            takes.push(take);
         }
-        at = next;
-        if at >= end {
+        if slots.keep == 0 {
             break;
         }
     }
-    let mut out = batch.gather(&rows[span]);
-    if let Some(w) = out.weights.first_mut() {
-        *w = head;
-    }
-    if let Some(w) = out.weights.last_mut() {
-        *w = tail;
-    }
+    let mut out = batch.gather(&kept);
+    out.weights = takes;
     out
 }
 
