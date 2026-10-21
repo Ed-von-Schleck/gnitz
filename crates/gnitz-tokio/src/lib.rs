@@ -3,9 +3,7 @@
 //! [`connect`] is a `gnitz-core` client that waits on this runtime, for the task
 //! that owns it; [`share`] hands one to a driver, and tasks share the handle.
 
-use std::future::Future;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
-use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -97,7 +95,7 @@ pub async fn connect(target: &str) -> Result<GnitzClient, ClientError> {
 pub fn share(client: GnitzClient) -> (AsyncClient, Connection) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Op>();
     let driver = serve(client, move |cx| rx.poll_recv(cx));
-    (AsyncClient { tx }, Connection(Box::pin(driver)))
+    (AsyncClient { tx }, Box::pin(driver))
 }
 
 /// The handle to a [`Connection`], shared by cloning. Its calls run on the one
@@ -157,20 +155,11 @@ impl AsyncClient {
     pub async fn sync(&self, wait: Duration) -> Result<Synced, ClientError> {
         let sent = self.run(move |c| Box::pin(async move { c.begin_sync(wait) })).await??;
         let reply = sent.await;
-        self.run(move |c| Box::pin(async move { c.finish_sync(reply).await }))
-            .await?
+        self.run(move |c| Box::pin(c.finish_sync(reply))).await?
     }
 }
 
 /// Owns the client and serves the calls its [`AsyncClient`]s make: poll it to
 /// completion. It completes once every handle is dropped and nothing is
 /// outstanding; a lost connection fails the calls and does not end it.
-pub struct Connection(BoxFut<'static, ()>);
-
-impl Future for Connection {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.as_mut().poll(cx)
-    }
-}
+pub type Connection = BoxFut<'static, ()>;

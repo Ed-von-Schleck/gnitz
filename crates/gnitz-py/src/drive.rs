@@ -358,14 +358,19 @@ impl Host for LoopHost {
             let mut st = self.shared.state();
             Interest {
                 read: want.read && std::mem::take(&mut st.readable),
-                write: want.write && (std::mem::take(&mut st.writable) || !st.writer_on),
+                write: want.write && std::mem::take(&mut st.writable),
             }
         };
         if ready.is_empty() {
             // The callbacks poll the loop that polled this; no waker is needed.
-            if want.read {
-                Python::attach(|py| self.shared.watch(py, false, true));
-            }
+            Python::attach(|py| {
+                if want.read {
+                    self.shared.watch(py, false, true);
+                }
+                if want.write {
+                    self.shared.watch(py, true, true);
+                }
+            });
             return Poll::Pending;
         }
         let refused = io(ready);

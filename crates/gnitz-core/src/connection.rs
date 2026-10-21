@@ -494,6 +494,9 @@ pub struct Session {
     ended: Option<ClientError>,
     /// The last read filled its window, so more may be waiting.
     unread: bool,
+    /// The last flush left bytes the socket would not take, so the next one
+    /// waits for it to be writable.
+    refused: bool,
     polls: Polls,
     /// The pushed train being read.
     pushed: Option<Slot>,
@@ -519,6 +522,7 @@ impl Session {
             submitted: 0,
             ended: None,
             unread: false,
+            refused: false,
             polls: Polls::default(),
             pushed: None,
             syncing: VecDeque::new(),
@@ -788,13 +792,16 @@ impl Session {
         }
         // Last, so the ciphertext a read queues goes out with this flush.
         if ready.write && self.ended.is_none() {
-            if let Err(e) = self.transport.flush() {
-                // A peer gone after answering is still readable.
-                self.read();
-                while self.unread {
+            match self.transport.flush() {
+                Ok(()) => self.refused = self.transport.wants_write(),
+                Err(e) => {
+                    // A peer gone after answering is still readable.
                     self.read();
+                    while self.unread {
+                        self.read();
+                    }
+                    self.end(ClientError::ConnectionLost(e));
                 }
-                self.end(ClientError::ConnectionLost(e));
             }
         }
     }
@@ -841,6 +848,12 @@ impl Session {
     /// for the socket, which has no new edge to report.
     pub(crate) fn unread(&self) -> bool {
         self.unread
+    }
+
+    /// The last flush left bytes the socket refused. Until one does, a write
+    /// needs no wait: a socket takes bytes until it says otherwise.
+    pub(crate) fn refused(&self) -> bool {
+        self.refused
     }
 
     /// Frame bytes queued and not yet written, against [`MAX_QUEUED_BYTES`].

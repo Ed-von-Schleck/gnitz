@@ -308,9 +308,9 @@ pub trait Host: Send {
 
     /// Once the socket is ready for any of `want`, step the client on what is
     /// ready by calling `io`. It answers whether bytes are still waiting to be
-    /// written: after a write, ones the socket refused. Read readiness is spent
-    /// by the call — before it asks again, the client reads on by itself until
-    /// the socket has no more.
+    /// written: after a write, ones the socket refused. Readiness is spent by
+    /// the call: before it asks again, the client reads on by itself until the
+    /// socket has no more, and writes by itself until the socket refuses bytes.
     fn poll_io(
         &mut self,
         want: Interest,
@@ -328,8 +328,6 @@ pub trait Host: Send {
 pub struct BlockingHost {
     fd: Option<RawFd>,
     hook: Option<ParkHook>,
-    /// The socket refused bytes, so the next write waits for it.
-    refused: bool,
 }
 
 impl BlockingHost {
@@ -342,7 +340,6 @@ impl BlockingHost {
 impl Host for BlockingHost {
     fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()> {
         self.fd = Some(fd.as_raw_fd());
-        self.refused = false;
         Ok(())
     }
 
@@ -353,16 +350,10 @@ impl Host for BlockingHost {
         io: &mut dyn FnMut(Interest) -> bool,
     ) -> Poll<Result<(), ClientError>> {
         let fd = self.fd.expect("a client attaches its host before it waits");
-        // A socket takes bytes until it says otherwise, so asking first would
-        // be a syscall per request.
-        if want.write && !self.refused {
-            self.refused = io(Interest::WRITE);
-            return Poll::Ready(Ok(()));
-        }
         loop {
             match poll_fd(fd, want.poll_events(), None) {
                 Ok(revents) => {
-                    self.refused = io(Interest::from_revents(revents));
+                    io(Interest::from_revents(revents));
                     return Poll::Ready(Ok(()));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
@@ -402,6 +393,11 @@ fn poll_turn(session: &mut Session, host: &mut dyn Host, cx: &mut Context<'_>) -
         // Nothing this session will ever answer: it ended, or the reply
         // awaited belongs to a session since replaced.
         return Poll::Ready(Err(ClientError::Closed));
+    }
+    // Asking the host first would cost a wait per request.
+    if want.write && !session.refused() {
+        session.step(Interest::WRITE);
+        return Poll::Ready(Ok(()));
     }
     let waited = ready!(host.poll_io(want, cx, &mut |ready| {
         session.step(ready);
