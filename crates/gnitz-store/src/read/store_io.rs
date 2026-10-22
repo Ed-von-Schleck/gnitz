@@ -1,12 +1,14 @@
 //! Read I/O on relation families. [`Relation::open_bound`] opens every
 //! source a bound can name as a [`SourceCursor`], choosing between the store and
 //! an index over it;
-//! [`RelationRegistry::probe`] answers a HasPk probe.
+//! [`RelationRegistry::probe`] answers a HasPk probe, in the layout
+//! [`Relation::probe_reply_schema`] names.
 
 use super::check_stride;
 use crate::relation::{Cut, Relation, RelationKind, RelationRegistry};
 use gnitz_wire::{KeyRange, PkKeys, Probe, ReadBound};
 use gnitz_zset::repr::{empty_cursor, Batch, BoundedIndexCursor, SourceCursor};
+use gnitz_zset::schema::{project_schema, SchemaDescriptor};
 
 /// A range walks an index only while the walk's estimated entries are at most
 /// one in this many of the store's rows; past that it scans the store under
@@ -51,6 +53,16 @@ impl RelationRegistry {
 }
 
 impl Relation {
+    /// The layout a `probe` of this relation answers in.
+    pub fn probe_reply_schema(&self, probe: Probe) -> Result<SchemaDescriptor, String> {
+        let schema = self.schema();
+        match probe {
+            Probe::Pk => Ok(schema.pk_only()),
+            Probe::PkColumn(col) => project_schema(&schema, &[col]),
+            Probe::Index(cols, _) => Ok(self.index_or_err(cols.as_slice())?.schema()),
+        }
+    }
+
     /// Open `bound`'s source over this relation, without walking it, and the part
     /// of `bound` the source does not apply.
     pub fn open_bound(&self, bound: ReadBound, cut: Cut) -> Result<(SourceCursor, Option<KeyRange>), String> {
@@ -85,7 +97,7 @@ fn open_range(entry: &Relation, r: KeyRange, cut: Cut) -> Result<(SourceCursor, 
     // only where the store's two cuts read the same rows.
     let index = entry
         .index_on(r.cols().as_slice())
-        .filter(|_| cut == Cut::Now || !entry.has_pending());
+        .filter(|_| cut == Cut::Now || !table.has_pending());
     if let Some(ic) = index {
         let idx = ic.cursor_over(&r);
         if idx.estimated_length() <= table.estimated_rows() / INDEX_SCAN_RATIO {

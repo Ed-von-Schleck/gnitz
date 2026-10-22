@@ -1,8 +1,8 @@
 //! The read rung — the `ReadSpec` executor and the store read verbs, as
-//! `impl RelationRegistry` blocks over `relation`.
+//! `impl RelationRegistry` and `impl Relation` blocks over `relation`.
 //!
 //! What is decided here is which source serves a bound — the store, or an index
-//! over it — and how a skeleton row is hydrated. The filter `scan_spec` drives is
+//! over it — and who hydrates a skeleton row. The filter `scan_spec` drives is
 //! `gnitz-expr`'s, the map and the sink are `gnitz_zset::algebra`'s — the same
 //! kernels a circuit's linear operators dispatch to — so a read here and a view
 //! there compute a row the same way.

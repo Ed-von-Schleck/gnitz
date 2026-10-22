@@ -104,12 +104,12 @@ impl SinkPlan {
         }
     }
 
-    /// How many source rows the first drain should visit, of at most
-    /// `chunk_rows`: an unordered cut needs no more than its window.
-    pub fn first_drain(&self, chunk_rows: usize) -> usize {
+    /// How many source rows the first drain needs to visit: an unordered cut
+    /// no more than its window, any other sink no fewer than every row.
+    pub fn first_drain(&self) -> usize {
         match &self.kind {
-            Kind::Rows { cut: Some(Cut::Prefix { left }), .. } => (*left as usize).min(chunk_rows),
-            _ => chunk_rows,
+            Kind::Rows { cut: Some(Cut::Prefix { left }), .. } => *left as usize,
+            _ => usize::MAX,
         }
     }
 

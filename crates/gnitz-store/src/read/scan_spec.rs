@@ -46,16 +46,16 @@ impl RelationRegistry {
             RowFilter::for_read(&predicate, walk.as_ref(), &src_schema).map_err(|e| format!("scan_spec: {e}"))?;
         let chunk_rows = self.config.scan_chunk_rows;
         let mut ranges = Vec::new();
-        for drain_rows in drain_ramp(sink.first_drain(chunk_rows), chunk_rows) {
-            let hydrate = |keys| match hydrator.as_deref_mut() {
-                Some(h) => h
-                    .hydrate_keys(self, target_id, keys)
-                    .map_err(|e| format!("hydrate: view {target_id}: {e}")),
-                None => Err(format!(
-                    "relation {target_id} holds skeleton rows but this process maintains no circuit"
-                )),
-            };
-            let Some(chunk) = source.drain_hydrated(drain_rows, hydrate)? else {
+        let mut hydrate = |keys| match hydrator.as_deref_mut() {
+            Some(h) => h
+                .hydrate_keys(self, target_id, keys)
+                .map_err(|e| format!("hydrate: view {target_id}: {e}")),
+            None => Err(format!(
+                "relation {target_id} holds skeleton rows but this process maintains no circuit"
+            )),
+        };
+        for drain_rows in drain_ramp(sink.first_drain(), chunk_rows) {
+            let Some(chunk) = source.drain_hydrated(drain_rows, &mut hydrate)? else {
                 break;
             };
             filter.ranges(&chunk.as_mem_batch(), &mut ranges);

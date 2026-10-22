@@ -22,7 +22,7 @@ impl RelationRegistry {
         let store = self.pinned_store(snapshot, id)?;
         let schema = store.schema;
         check_layout(page.layout, &schema)?;
-        let limit = usize::try_from(share).map_err(|_| format!("a page of {share} rows"))?;
+        let limit = usize::try_from(share).unwrap_or(usize::MAX);
         let (runs, cap) = (store.runs.iter().cloned(), store.runs.len());
         let mut cursor = match after {
             None => from_runs(runs, schema, cap),
@@ -40,16 +40,12 @@ impl RelationRegistry {
                 from_runs_in_band(runs, schema, cap, start.pk_bytes(), None)
             }
         };
-        let mut rows = Batch::empty_with_schema(&schema);
-        // A drain counts the groups it visits, cancelled ones included, so one
-        // short of `limit` says nothing about what is left.
-        while rows.len() < limit {
-            let Some(chunk) = cursor.drain_chunk(limit - rows.len()) else {
-                break;
-            };
-            rows.append_above(chunk);
-        }
-        Ok(rows)
+        // A drain passes over cancelled groups without counting them, and a
+        // pinned store holds no skeleton rows, so one drain falls short of
+        // `limit` only where the store ends.
+        Ok(cursor
+            .drain_chunk(limit)
+            .unwrap_or_else(|| Batch::empty_with_schema(&schema)))
     }
 }
 
