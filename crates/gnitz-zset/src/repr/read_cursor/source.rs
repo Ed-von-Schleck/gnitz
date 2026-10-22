@@ -7,7 +7,6 @@ use gnitz_wire::PkKeys;
 use super::{PkSetGather, ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
 use crate::repr::merge::merge_consolidated;
-use crate::schema::key::KeySpec;
 
 /// A chunked source of `Batch`es: a whole cursor, an index range, or a key list.
 pub enum SourceCursor {
@@ -93,20 +92,22 @@ pub struct BoundedIndexCursor {
     /// Positioned on the index range and clamped at its end.
     idx: ReadCursor,
     src: PkSetGather,
-    spec: KeySpec,
+    /// The width of an entry's leading span; the source PK follows it.
+    span: usize,
     /// A refill's source PKs in index order, flat at `src`'s `pk_stride`.
     pks: Vec<u8>,
 }
 
 impl BoundedIndexCursor {
     /// A walk of `idx`, positioned on the index range and clamped at its end,
-    /// gathering from `src`, a cursor over the relation `spec` indexes.
-    pub fn new(idx: ReadCursor, src: ReadCursor, spec: KeySpec) -> Self {
+    /// gathering from `src`, a cursor over the relation `idx` indexes.
+    pub fn new(idx: ReadCursor, src: ReadCursor) -> Self {
         let none = PkKeys::from_sorted(src.schema.pk_stride(), Vec::new());
+        let span = idx.schema.pk_stride() - src.schema.pk_stride();
         BoundedIndexCursor {
             idx,
             src: PkSetGather::over(src, none),
-            spec,
+            span,
             pks: Vec::new(),
         }
     }
@@ -138,8 +139,7 @@ impl BoundedIndexCursor {
         let mut taken = 0;
         while taken < max_rows && self.idx.valid {
             debug_assert!(self.idx.current_weight > 0, "an index entry at a non-positive weight");
-            self.pks
-                .extend_from_slice(self.spec.split_entry(self.idx.current_pk_bytes()).1);
+            self.pks.extend_from_slice(&self.idx.current_pk_bytes()[self.span..]);
             self.idx.advance();
             taken += 1;
         }

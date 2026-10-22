@@ -18,8 +18,6 @@ use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor
 /// decides: for `len ≤ 16` the image is the *whole* PK and is injective, so a
 /// tie is already a byte-equal PK; only `len > 16` can tie on the prefix while
 /// differing later, and the slice compare runs only there.
-///
-/// Equal-width operands use this or [`pk_bytes_eq`]; anything else is slice order.
 #[inline(always)]
 pub(crate) fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
     debug_assert_eq!(a.len(), b.len(), "compare_pk_ordering on unequal PK widths");
@@ -29,11 +27,8 @@ pub(crate) fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
     }
 }
 
-/// OPK byte-equality of two **equal-length** PK regions (a full PK, or a shared
-/// equi-prefix sliced to the same width on both sides): [`compare_pk_ordering`]'s
-/// `Equal`, so it inherits that function's equal-width contract, its width
-/// reasoning and its `pk_bytes_eq(a, b) == (a == b)` guarantee. Use at every
-/// merge/group fold or probe that tests "same PK".
+/// `a == b` for two **equal-length** PK regions (a whole PK, or an equi-prefix
+/// sliced to one width on both sides): [`compare_pk_ordering`]'s `Equal`.
 #[inline(always)]
 pub(crate) fn pk_bytes_eq(a: &[u8], b: &[u8]) -> bool {
     compare_pk_ordering(a, b) == Ordering::Equal
@@ -146,7 +141,7 @@ impl PkSortKey<'_> for u64 {
         if opk.len() >= 8 {
             u64::from_be_bytes(opk[..8].try_into().unwrap())
         } else {
-            // `pack_pk_be` left-aligns a narrow key with register loads at 2 and 4.
+            // `pack_pk_be` left-aligns a narrow key with fixed-width register loads.
             (pack_pk_be(opk) >> 64) as u64
         }
     }
@@ -198,8 +193,8 @@ pub fn probe_key(opk: &[u8]) -> u64 {
     gnitz_wire::checksum(opk)
 }
 
-/// A key span: columns at their own types, packed tightly in order. `Copy`, so
-/// the row paths allocate nothing.
+/// A key span: columns at their own types, packed tightly in order. A fixed
+/// array, so a spec is `Copy` and building one allocates nothing.
 #[derive(Clone, Copy)]
 pub struct KeySpec {
     n: u8,
@@ -284,11 +279,8 @@ impl KeySpec {
         Some(key)
     }
 
-    /// Split a stored index entry back into `(span, source PK)`: an entry is the
-    /// span followed by the source PK, which therefore sits at `key_size()`. The
-    /// split is exact by layout (an index schema is the indexed columns followed
-    /// by the source PK columns, so its stride is `key_size() + src_pk_stride`),
-    /// so nothing is decoded.
+    /// Split an index entry `[span ‖ source PK]` at `key_size()`; nothing is
+    /// decoded.
     pub fn split_entry<'a>(&self, entry: &'a [u8]) -> (&'a [u8], &'a [u8]) {
         debug_assert!(entry.len() > self.key_size(), "index entry shorter than its span");
         entry.split_at(self.key_size())
@@ -301,7 +293,7 @@ impl KeySpec {
 ///
 /// `None` = provably empty.
 pub fn range_band(schema: &SchemaDescriptor, range: &KeyRange) -> Option<(PkBuf, Option<PkBuf>)> {
-    let mut widths = schema.pk_columns().map(|(ci, _)| schema.locate(ci).size());
+    let mut widths = schema.pk_columns().map(|(_, c)| c.size());
     let mut first = PkBuf::zeroed(0);
     for (&image, w) in range.eq_vals().iter().zip(&mut widths) {
         first.push(w, image, false);
@@ -312,30 +304,19 @@ pub fn range_band(schema: &SchemaDescriptor, range: &KeyRange) -> Option<(PkBuf,
     let mut last = first;
     first.push(w, range.first, false);
     last.push(w, range.last, false);
-    key_range_between_cuts(
-        KeyCut::min_of(first.pk_bytes()),
-        KeyCut::above(last.pk_bytes()),
-        schema.pk_stride(),
-    )
+    group_band(first.pk_bytes(), last.pk_bytes(), schema.pk_stride())
+}
+
+/// The half-open band `[start, end)` of every `stride`-wide key beginning with a
+/// group in `[first, last]`; `end == None` runs to the top of the key space.
+/// `None` = provably empty.
+pub fn group_band(first: &[u8], last: &[u8], stride: usize) -> Option<(PkBuf, Option<PkBuf>)> {
+    key_range_between_cuts(KeyCut::min_of(first), KeyCut::above(last), stride)
 }
 
 // ---------------------------------------------------------------------------
-// Byte successor and cut → key-range derivation
+// Cut → key-range derivation
 // ---------------------------------------------------------------------------
-
-/// Fixed-width byte-string successor: `p + 1` with carry, in place. Returns
-/// `false` when `p` is all-`0xFF` (or empty) — no successor exists at this width
-/// (carry-out), which a caller reads as `+∞` (scan to the table end, or a
-/// provably-empty start).
-fn increment_key_in_place(p: &mut [u8]) -> bool {
-    for b in p.iter_mut().rev() {
-        *b = b.wrapping_add(1);
-        if *b != 0 {
-            return true;
-        }
-    }
-    false
-}
 
 /// A cut in the OPK key space, named by an OPK group prefix: either that
 /// group's own minimum key or the first key above every member of it. Zero-
@@ -353,7 +334,7 @@ impl<'a> KeyCut<'a> {
     }
 
     /// The group's own minimum key — below every member of it.
-    pub fn min_of(group: &'a [u8]) -> Self {
+    pub(crate) fn min_of(group: &'a [u8]) -> Self {
         KeyCut::new(group, false)
     }
 
@@ -364,12 +345,18 @@ impl<'a> KeyCut<'a> {
     }
 
     /// This cut as a `stride`-wide key; `None` when it lies above the whole key
-    /// space. The successor's carry ripples into the equality prefix, landing
-    /// exactly on the first key of the next equality group.
+    /// space. An `above` cut is the group plus one, the carry running leftward
+    /// through its bytes: the least key of the next group of the same width.
     pub fn key(&self, stride: usize) -> Option<PkBuf> {
         let mut k = PkBuf::from_bytes(self.group);
-        let exists = !self.above || increment_key_in_place(k.pk_bytes_mut());
-        exists.then(|| k.widened(stride))
+        if self.above {
+            // An all-`0xFF` or empty group has no successor at its width.
+            let i = self.group.iter().rposition(|&b| b != 0xFF)?;
+            let bytes = k.pk_bytes_mut();
+            bytes[i] += 1;
+            bytes[i + 1..].fill(0);
+        }
+        Some(k.widened(stride))
     }
 }
 
@@ -379,24 +366,13 @@ impl<'a> KeyCut<'a> {
 /// `None` = provably empty: `start` lies above the whole key space, or
 /// `start >= end`. `end == None` inside `Some` means the range runs to the table
 /// end.
-pub fn key_range_between_cuts(start: KeyCut, end: KeyCut, stride: usize) -> Option<(PkBuf, Option<PkBuf>)> {
+pub(crate) fn key_range_between_cuts(start: KeyCut, end: KeyCut, stride: usize) -> Option<(PkBuf, Option<PkBuf>)> {
     let start = start.key(stride)?;
     let end = end.key(stride);
     if end.as_ref().is_some_and(|e| start.pk_bytes() >= e.pk_bytes()) {
         return None;
     }
     Some((start, end))
-}
-
-/// Whether every key of a non-empty band `[start, end)` shares its leading `prefix`
-/// bytes — the bytes a worker owner hashes. OPK order is byte order, so the band
-/// stays in `start`'s prefix group iff it ends at or below the first key above
-/// that group; a group with no key above it reaches the top of the key space.
-pub(crate) fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> bool {
-    let start = start.pk_bytes();
-    KeyCut::above(&start[..prefix])
-        .key(start.len())
-        .is_none_or(|above| end.is_some_and(|e| e.pk_bytes() <= above.pk_bytes()))
 }
 
 #[cfg(test)]

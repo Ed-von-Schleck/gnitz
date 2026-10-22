@@ -360,7 +360,7 @@ impl OrderIndex {
             b.push(IMAGE_COL);
         }
         let (key, row) = GroupOutKey::new(input, group_cols, 0..input.num_columns() as u32)?;
-        b.push_payload_of(&row.finish().map_err(|e| format!("order index: row {e}"))?);
+        row.payload().iter().for_each(|&c| b.push(c));
         let mut carried = key.carried().to_vec();
         let row_cols = carried.len();
         for c in also {

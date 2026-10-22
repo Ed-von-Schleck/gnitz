@@ -32,7 +32,7 @@ use gnitz_zset::repr::MappedShard;
 use gnitz_zset::repr::StorageError;
 use gnitz_zset::repr::{empty_cursor, from_runs, from_runs_at, from_runs_in_band, PkSetGather, ReadCursor};
 use gnitz_zset::repr::{first_live_payload_group, Run, StoredRow};
-use gnitz_zset::schema::key::{key_range_between_cuts, probe_key, KeyCut};
+use gnitz_zset::schema::key::{group_band, probe_key};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Ingest runs fold into the RAM tier once they pass this.
@@ -481,7 +481,7 @@ impl Table {
             return self.open_cursor(cut);
         }
         let stride = self.shard_index.schema.pk_stride();
-        let band = key_range_between_cuts(KeyCut::min_of(first), KeyCut::above(last), stride)
+        let band = group_band(first, last, stride)
             .expect("`first <= last`, so the band from one's group to the other's holds a key");
         self.range_cursor(Some(band), cut)
     }

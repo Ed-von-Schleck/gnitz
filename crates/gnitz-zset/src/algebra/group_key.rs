@@ -6,8 +6,8 @@
 use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::key::{pk_width_dispatch, PkSortKey};
-use crate::schema::{ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor, TypeCode};
-use gnitz_wire::{ReduceOutSlot, NARROW_PK_MAX_BYTES};
+use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
+use gnitz_wire::{ReduceOutKey, ReduceOutSlot, NARROW_PK_MAX_BYTES};
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 

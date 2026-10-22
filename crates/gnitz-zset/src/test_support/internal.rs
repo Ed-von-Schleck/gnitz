@@ -13,7 +13,7 @@ use std::rc::Rc;
 use crate::repr::{
     from_runs, from_runs_in_band, Batch, Codebook, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts,
 };
-use crate::schema::key::{key_range_between_cuts, KeyCut};
+use crate::schema::key::group_band;
 use crate::schema::payload_order::compare_full_rows;
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::{PkBuf, TypeCode};
@@ -54,12 +54,6 @@ pub(crate) fn rekey_plan(
         nulls,
     };
     crate::algebra::MapPlan::from_wire(source, &rekey).expect("fixture reindex is well-formed")
-}
-
-/// The key band `[start, end)` of every PK beginning with a key in `[first, last]`.
-fn band(first: &[u8], last: &[u8], stride: usize) -> (PkBuf, Option<PkBuf>) {
-    key_range_between_cuts(KeyCut::min_of(first), KeyCut::above(last), stride)
-        .expect("`first <= last`, so the band holds a key")
 }
 
 /// An operator's trace in a test: one consolidated run per ingest, read through
@@ -103,7 +97,8 @@ impl TestTrace {
     /// over no other: an operator that reads outside the keys it opened its
     /// history at finds nothing there.
     pub(crate) fn cursor_within(&self, first: &[u8], last: &[u8]) -> ReadCursor {
-        let (start, end) = band(first, last, self.schema.pk_stride());
+        let (start, end) =
+            group_band(first, last, self.schema.pk_stride()).expect("`first <= last`, so the band holds a key");
         let runs = self.runs.iter().cloned().map(Run::Mem);
         let end = end.as_ref().map(PkBuf::pk_bytes);
         from_runs_in_band(runs, self.schema, self.runs.len(), start.pk_bytes(), end)

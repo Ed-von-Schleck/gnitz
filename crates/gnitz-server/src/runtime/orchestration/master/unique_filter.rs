@@ -7,8 +7,7 @@ use rustc_hash::FxHashSet;
 use super::*;
 use gnitz_wire::PkKeys;
 use gnitz_zset::algebra::spans;
-use gnitz_zset::schema::key::probe_key;
-use gnitz_zset::schema::KeySpec;
+use gnitz_zset::schema::key::{probe_key, KeySpec};
 
 /// Spans a filter tracks before it disables itself.
 const UNIQUE_FILTER_CAP: usize = 7 << 20;

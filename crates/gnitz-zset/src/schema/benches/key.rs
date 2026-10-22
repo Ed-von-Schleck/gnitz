@@ -47,7 +47,7 @@ fn per_compare(counter: &Counter, flat: &[u8], stride: usize, cmp: impl Fn(&[u8]
 }
 
 /// Instructions per [`compare_pk_ordering`] of two random keys, beside a slice
-/// `memcmp` of the same pairs, at a stride in each arm of `widen_pk_be` and of
+/// `memcmp` of the same pairs, at a stride in each arm of [`pack_pk_be`] and of
 /// the wide split, where the first byte decides and where only the last does.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]

@@ -7,7 +7,7 @@ use gnitz_foundation::env::env_num;
 use rustc_hash::FxHashMap;
 
 use gnitz_zset::algebra::index_entries;
-use gnitz_zset::schema::{KeySpec, SchemaDescriptor};
+use gnitz_zset::schema::{key::KeySpec, SchemaDescriptor};
 
 pub use crate::storage::Cut;
 use crate::storage::{RecoverySource, Table};

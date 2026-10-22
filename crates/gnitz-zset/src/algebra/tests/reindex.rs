@@ -348,7 +348,7 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
         let src = b.finish();
         let mb = src.as_mem_batch();
         for indexed in [&[k][..], &[k, k + 1], &[k - 1, k]] {
-            let (spec, idx_schema) = crate::schema::KeySpec::new(indexed, &owner)
+            let (spec, idx_schema) = crate::schema::key::KeySpec::new(indexed, &owner)
                 .map(|spec| (spec, spec.index_schema(&owner)))
                 .unwrap();
             let mut want: Vec<(Vec<u8>, i64)> = Vec::new();

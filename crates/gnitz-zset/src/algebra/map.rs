@@ -9,7 +9,7 @@ use gnitz_expr::{ColCopy, LogicalProgram, MapEval};
 
 use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
 use crate::repr::{copy_runs, Batch, DirectWriter};
-use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{project_schema, ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
 use gnitz_wire::{int_cell, zip_cells, FixedInt};
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
@@ -213,7 +213,7 @@ fn hashrow_output_schema(
     cols: &[gnitz_wire::ReindexSlot],
 ) -> Result<SchemaDescriptor, String> {
     let mut b = DerivedSchema::new();
-    b.push_pk(SchemaColumn::new(crate::schema::TypeCode::U128, false));
+    b.push_pk(SchemaColumn::new(TypeCode::U128, false));
     for &(c, t) in cols {
         // A key column, not merely an in-range one — the screen the reindex and
         // top-N key kinds clear at this same boundary.
@@ -256,8 +256,7 @@ impl MapPlan {
             }
 
             gnitz_wire::MapKind::Projection(cols) => {
-                let out_schema =
-                    crate::schema::project_schema(in_schema, cols).map_err(|e| format!("projection map: {e}"))?;
+                let out_schema = project_schema(in_schema, cols).map_err(|e| format!("projection map: {e}"))?;
                 (out_schema, LogicalProgram::copy_cols(cols), PkSource::Inherit)
             }
         };

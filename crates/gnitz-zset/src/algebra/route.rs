@@ -97,9 +97,15 @@ impl Placement {
         let Placement::Keyed { dist_stride } = self else {
             return None;
         };
-        key::range_shares_prefix(&start, end.as_ref(), dist_stride as usize)
-            .then(|| self.owner(start.pk_bytes(), num_workers))
-            .flatten()
+        let start = start.pk_bytes();
+        let prefix = &start[..dist_stride as usize];
+        // OPK order is byte order: the band keeps `start`'s distribution prefix iff
+        // it ends at or below the first key above that prefix group, and a group
+        // with no key above it reaches the top of the key space.
+        let confined = key::KeyCut::above(prefix)
+            .key(start.len())
+            .is_none_or(|above| end.is_some_and(|e| e <= above));
+        confined.then(|| worker_for_pk_bytes(prefix, num_workers))
     }
 
     /// The worker that stores the row keyed `pk`; `None` unless rows are

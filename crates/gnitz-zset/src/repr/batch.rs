@@ -11,7 +11,7 @@ use super::run::StoredRow;
 use super::scatter::copy_ranges;
 use super::string_heap::{self, relocate_german_string_vec, BlobCache};
 use super::writer::DirectWriter;
-use crate::schema::payload_order::compare_rows;
+use crate::schema::payload_order::{compare_full_rows, compare_rows};
 use crate::schema::{ColumnLocator, SchemaDescriptor};
 use gnitz_expr::BatchView;
 use gnitz_wire::RowSource;
@@ -717,7 +717,7 @@ impl Batch {
                 "batch flagged consolidated, but row {i} has weight 0 (ghost not eliminated)"
             );
             if i + 1 < self.count {
-                let ord = crate::schema::payload_order::compare_full_rows(&self.schema, rows, i, rows, i + 1);
+                let ord = compare_full_rows(&self.schema, rows, i, rows, i + 1);
                 debug_assert_eq!(
                     ord,
                     std::cmp::Ordering::Less,
@@ -973,7 +973,7 @@ impl Batch {
             return;
         }
         if next.count > 0 {
-            let order = crate::schema::payload_order::compare_full_rows(&self.schema, &*self, self.count - 1, &next, 0);
+            let order = compare_full_rows(&self.schema, &*self, self.count - 1, &next, 0);
             assert!(
                 order.is_lt(),
                 "append_above: the appended rows do not sort above this batch's"

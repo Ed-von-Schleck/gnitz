@@ -30,7 +30,7 @@ use gnitz_expr::ColumnLocator;
 use gnitz_wire::sys_rows::FkAction;
 use gnitz_wire::{PkBuf, PkKeys, ReadBound, WireConflictMode, WireStatus};
 use gnitz_zset::repr::MemBatch;
-use gnitz_zset::schema::KeySpec;
+use gnitz_zset::schema::key::KeySpec;
 
 /// One probe of relation `tid` at `keys`, queued for a burst, with the state
 /// `plan` its replies fold into.

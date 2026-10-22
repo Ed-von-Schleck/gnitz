@@ -62,8 +62,9 @@ pub(crate) fn compare_rows<A: RowSource, B: RowSource>(
     Ordering::Equal
 }
 
-/// A payload row order. Generic over both sources, so one selected order serves
-/// every source pairing a merge seat puts under it.
+/// A payload row order. Generic over both sources, so one selected order also
+/// compares rows of two source types, as the read cursor does a run's row
+/// against a batch's.
 pub(crate) trait PayloadOrder: Copy {
     /// Whether the order is [`FixedIntNonnull`]'s: each column's cells read as
     /// an order-preserving integer.

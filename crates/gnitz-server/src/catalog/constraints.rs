@@ -4,7 +4,7 @@
 use gnitz_store::relation::Relation;
 use gnitz_wire::sys_rows::FkAction;
 use gnitz_wire::PkColList;
-use gnitz_zset::schema::KeySpec;
+use gnitz_zset::schema::key::KeySpec;
 
 use super::CatalogEngine;
 

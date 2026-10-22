@@ -247,8 +247,7 @@ pub fn german_string_lead(cell: &[u8], heap: Heap<'_>) -> u64 {
     u64::from_be_bytes(lead)
 }
 
-/// Byte-lexicographic order over two German string cells — the order
-/// `compare_rows`, every merge heap and every compaction sorts by.
+/// Byte-lexicographic order over two German string cells.
 #[inline(always)]
 pub fn compare_german_strings(a: &[u8; 16], heap_a: Heap<'_>, b: &[u8; 16], heap_b: Heap<'_>) -> std::cmp::Ordering {
     // A canonical cell zero-pads its inline bytes, so each 4- and 8-byte word

@@ -101,7 +101,7 @@ fn open_range(entry: &Relation, r: KeyRange, cut: Cut) -> Result<(SourceCursor, 
     if let Some(ic) = index {
         let idx = ic.cursor_over(&r);
         if idx.estimated_length() <= table.estimated_rows() / INDEX_SCAN_RATIO {
-            let walk = BoundedIndexCursor::new(idx, table.open_cursor(cut), ic.key_spec());
+            let walk = BoundedIndexCursor::new(idx, table.open_cursor(cut));
             return Ok((SourceCursor::Bounded(Box::new(walk)), None));
         }
     }

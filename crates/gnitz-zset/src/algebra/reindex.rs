@@ -14,8 +14,9 @@ use gnitz_wire::RowSource;
 
 use crate::repr::{copy_runs, range_rows, runs_where, write_to_batch, Batch, MemBatch};
 
+use crate::schema::key::KeySpec;
 use crate::schema::{
-    ColumnLocator, DerivedSchema, KeySpec, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS,
+    ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS,
 };
 
 // ---------------------------------------------------------------------------

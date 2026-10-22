@@ -1,15 +1,12 @@
-//! The key and payload-order kernels over a schema, and the shaping of an
-//! operator's output schema. The descriptor itself is `gnitz-expr`'s.
+//! The key and payload-order kernels over a schema, and the shaping of a derived
+//! schema: an operator's output or an index's layout. The descriptor itself is
+//! `gnitz-expr`'s.
 
-pub(crate) use gnitz_wire::ReduceOutKey;
 pub(crate) use gnitz_wire::TypeCode;
 pub(crate) use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 
-/// Resolved column addressing, homed in the leaf `gnitz-expr` crate so the
-/// expression evaluator (and, through it, the SQL client) shares one definition
-/// with the engine. Re-exported here because it *is* a schema fact —
-/// `SchemaDescriptor::locate` produces one.
 pub(crate) use gnitz_expr::ColumnLocator;
+use gnitz_expr::SchemaRefusal;
 
 /// The schema descriptor, homed in `gnitz-expr` so the client links the same
 /// definition. Re-exported so a crate linking `gnitz-zset` alone can name it.
@@ -23,12 +20,7 @@ pub mod key;
 /// and the per-schema selection between its two comparators.
 pub(crate) mod payload_order;
 
-/// The precomputed per-row read/encode plan for an index's OPK leading-key span;
-/// re-exported here because a spec is derived from a pair of schemas.
-pub use key::KeySpec;
-
-/// Accumulator for an operator's output schema: its PK columns, then its
-/// payload columns.
+/// Builder for a derived schema: its PK columns, then its payload columns.
 pub(crate) struct DerivedSchema {
     cols: Vec<SchemaColumn>,
     pk_len: usize,
@@ -66,19 +58,17 @@ impl DerivedSchema {
         schema.payload_columns().for_each(|(_, c)| self.push(*c));
     }
 
+    /// The payload columns pushed so far, in order.
+    pub(crate) fn payload(&self) -> &[SchemaColumn] {
+        &self.cols[self.pk_len..]
+    }
+
     /// The schema pushed so far, as [`SchemaDescriptor::try_new`] admits it.
-    pub(crate) fn finish(&self) -> Result<SchemaDescriptor, String> {
+    pub(crate) fn finish(&self) -> Result<SchemaDescriptor, SchemaRefusal> {
         let pk: Vec<u32> = (0..self.pk_len as u32).collect();
-        Ok(SchemaDescriptor::try_new(&self.cols, &pk)?)
+        SchemaDescriptor::try_new(&self.cols, &pk)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Schema-shaping free functions
-//
-// Derived purely from a `SchemaDescriptor` (no catalog or storage state), and
-// shared across layers.
-// ---------------------------------------------------------------------------
 
 /// `schema`'s PK columns, then the payload columns `project` names, in that
 /// order. `Err` for an entry that names no payload column, and for a list
@@ -95,7 +85,7 @@ pub fn project_schema(schema: &SchemaDescriptor, project: &[u32]) -> Result<Sche
         }
         b.push(schema.columns()[p as usize]);
     }
-    b.finish()
+    Ok(b.finish()?)
 }
 
 #[cfg(test)]
