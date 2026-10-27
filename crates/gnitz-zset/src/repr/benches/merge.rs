@@ -48,7 +48,7 @@ fn generic_schema() -> SchemaDescriptor {
     ])
 }
 
-/// `run_merge`'s compare loop alone — the emit materializes nothing — under a
+/// `run_merge` — the compare loop and the survivor triples it returns — under a
 /// high duplicate-PK rate, over each payload comparator arm.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
@@ -61,11 +61,8 @@ fn run_merge_dup_pk_bench() {
         let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_batch(&schema, N, DUP)).collect();
         let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
         let merge = || {
-            let mut sink = 0i64;
-            run_merge(black_box(&mem), &schema, mem.iter().map(|m| 0..m.count), |_s, _r, w| {
-                sink = sink.wrapping_add(w)
-            });
-            black_box(sink)
+            let rows = run_merge(black_box(&mem), &schema, mem.iter().map(|m| 0..m.count));
+            black_box(rows.iter().map(|r| r.2).sum::<i64>())
         };
         // K copies of one batch: every row folds with its twins.
         assert_eq!(merge(), (K * N) as i64);

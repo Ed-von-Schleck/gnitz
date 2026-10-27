@@ -72,7 +72,7 @@ impl ScatterPlan {
         let nw = slot.of as usize;
         let mut share = Share {
             rank: if self.is_broadcast() { 0 } else { slot.rank as usize },
-            rows: Vec::with_capacity(batch.count / nw + 1),
+            rows: Vec::with_capacity(batch.len() / nw + 1),
         };
         self.route_into(&batch.as_mem_batch(), nw, &mut share);
         batch.ascending_subset(&share.rows)

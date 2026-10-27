@@ -12,11 +12,11 @@
 //!
 //! The crate parses a descriptor without validating it, and `contains` indexes
 //! the fingerprints from descriptor-derived values, so a corrupt descriptor
-//! panics rather than answering wrongly. [`is_valid`] therefore puts
-//! [`validate`] between the region and the first probe.
+//! panics rather than answering wrongly. [`parse`] therefore puts
+//! [`validate`] between the region and any [`BinaryFuse8Ref`].
 
 use gnitz_wire::{read_u32_le, read_u64_le};
-use xorf::{BinaryFuse8, BinaryFuse8Ref, Descriptor, DmaSerializable, Filter, FilterRef};
+use xorf::{BinaryFuse8, BinaryFuse8Ref, Descriptor, DmaSerializable, FilterRef};
 
 /// Build the filter over a PK-sorted region of `stride`-byte keys, as its region
 /// bytes `[descriptor][fingerprints]`. Rows sharing a PK are adjacent, so
@@ -84,11 +84,10 @@ fn validate(d: &Descriptor, fingerprints_len: usize) -> bool {
         && fingerprints_len < u32::MAX as usize
 }
 
-/// Whether `region` is a filter region a probe can read.
-pub(crate) fn is_valid(region: &[u8]) -> bool {
-    let Some(d) = region.get(..Descriptor::DMA_LEN) else {
-        return false;
-    };
+/// `region` as a filter a probe can read, or `None` where its descriptor
+/// would index out of bounds.
+pub(crate) fn parse(region: &[u8]) -> Option<BinaryFuse8Ref<'_>> {
+    let (d, fingerprints) = region.split_at_checked(Descriptor::DMA_LEN)?;
     // Field order is the LE layout the write side's `dma_copy_descriptor_to`
     // produces and `BinaryFuse8Ref::from_dma` reads back;
     // `no_key_set_produces_a_false_negative_through_its_region` pins it.
@@ -99,15 +98,9 @@ pub(crate) fn is_valid(region: &[u8]) -> bool {
             segment_length_mask: read_u32_le(d, 12),
             segment_count_length: read_u32_le(d, 16),
         },
-        region.len() - Descriptor::DMA_LEN,
+        fingerprints.len(),
     )
-}
-
-/// Whether a [`crate::schema::key::probe_key`] may be present in `region`.
-pub(crate) fn may_contain(region: &[u8], probe_key: u64) -> bool {
-    debug_assert!(is_valid(region));
-    let (descriptor, fingerprints) = region.split_at(Descriptor::DMA_LEN);
-    BinaryFuse8Ref::from_dma(descriptor, fingerprints).contains(&probe_key)
+    .then(|| BinaryFuse8Ref::from_dma(d, fingerprints))
 }
 
 #[cfg(test)]

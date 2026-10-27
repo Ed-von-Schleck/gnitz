@@ -73,7 +73,7 @@ fn a_computed_map_copies_and_computes_every_row_at_its_weight() {
     assert_eq!(weighted_rows(&plan.evaluate_map_batch(&input)), weighted_rows(&want));
 
     let empty = plan.evaluate_map_batch(&Batch::empty_with_schema(&in_schema));
-    assert_eq!((empty.count, empty.schema()), (0, plan.out_schema()));
+    assert_eq!((empty.len(), empty.schema()), (0, plan.out_schema()));
 }
 
 /// A projection of string columns, reordered, moves each row's content; one
@@ -239,7 +239,7 @@ fn appended_runs_map_as_their_rows_alone() {
             let mut out = Batch::empty_with_schema(plan.out_schema());
             plan.append_map_ranges(&src, &mut out, &[(0, N)]);
             plan.append_map_ranges(&src, &mut out, &ranges);
-            let tail: Vec<u32> = (N as u32..out.count as u32).collect();
+            let tail: Vec<u32> = (N as u32..out.len() as u32).collect();
             assert_eq!(
                 weighted_rows(&out.ascending_subset(&tail)),
                 want,
@@ -325,7 +325,7 @@ fn a_reindex_keys_each_row_by_the_opk_image_of_its_key_column() {
     let rows = [(1, 1, 200), (2, -3, 100), (3, 1, -300)];
     let batch = make_batch(&schema, &rows);
     let out = rekey_plan(&schema, &[1], &[1], NullKeys::Keep).evaluate_map_batch(&batch);
-    assert_eq!(out.count, rows.len());
+    assert_eq!(out.len(), rows.len());
     for (r, &(_, w, v)) in rows.iter().enumerate() {
         assert_eq!(out.get_pk_bytes(r), opk_pk(&make_schema_i64pk_i64(), &[v as u128]));
         assert_eq!(out.get_weight(r), w);
@@ -390,10 +390,10 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
     let out = MapPlan::from_wire(&in_schema, &hash_row)
         .unwrap()
         .evaluate_map_batch(&batch);
-    assert_eq!(out.count, batch.count);
+    assert_eq!(out.len(), batch.len());
     let pk = |row: usize| out.get_pk_bytes(row);
 
-    for row in rows.len()..out.count {
+    for row in rows.len()..out.len() {
         assert_eq!(pk(row), pk(row % rows.len()), "row {row} keys unlike its first copy");
     }
     assert_eq!(pk(0), pk(1), "equal content must key equally, at whatever heap offset");
@@ -588,7 +588,7 @@ fn a_drop_reindex_is_filter_then_reindex_and_keep_keeps_null_keys() {
                 weighted_rows(&run(NullKeys::Keep).evaluate_map_batch(&filtered)),
                 "pattern {p}"
             );
-            assert_eq!(run(NullKeys::Keep).evaluate_map_batch(&batch).count, batch.count);
+            assert_eq!(run(NullKeys::Keep).evaluate_map_batch(&batch).len(), batch.len());
         }
     }
 }

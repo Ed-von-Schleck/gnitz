@@ -98,7 +98,7 @@ fn reduce_index_batch_bench() {
         println!(
             "reduce_index_batch_bench {label:<17} {:6.1} instr/row ({} entries)",
             instructions as f64 / N as f64,
-            entries.count
+            entries.len()
         );
     }
 }
@@ -109,7 +109,7 @@ fn epoch(counter: &Counter, h: &mut Harness, delta: &Batch) -> f64 {
     h.index(delta);
     let (out, instructions) = counter.measure(|| h.reduce(delta));
     h.trace_out.ingest(out);
-    instructions as f64 / delta.count as f64
+    instructions as f64 / delta.len() as f64
 }
 
 /// Instructions per delta row of `op_reduce` per shape, over three epochs: an
@@ -248,8 +248,8 @@ fn op_reduce_multi_run_bench() {
     let [_, (out, instructions)] = [(); 2].map(|()| counter.measure(|| h.reduce(&delta)));
     println!(
         "op_reduce_multi_run_bench {:.1} instr/row (out {})",
-        instructions as f64 / delta.count as f64,
-        out.count
+        instructions as f64 / delta.len() as f64,
+        out.len()
     );
 }
 
@@ -540,7 +540,7 @@ fn reduce_index_strings_bench() {
         println!(
             "reduce_index_strings_bench {label:<20} {:7.1} instr/row ({} entries)",
             instructions as f64 / N as f64,
-            entries.count
+            entries.len()
         );
     }
 }

@@ -76,17 +76,6 @@ impl LoserTree {
         }
     }
 
-    /// Allocate a tournament over `n` sources and play it.
-    pub(crate) fn build(
-        n: usize,
-        init_fn: impl Fn(usize) -> Option<(u32, u128)>,
-        less: impl Fn(&HeapNode, &HeapNode) -> bool,
-    ) -> Self {
-        let mut this = Self::empty(n);
-        this.rebuild(init_fn, less);
-        this
-    }
-
     /// Re-play the tournament over the same `n` sources at their current rows.
     /// O(n) compares, no allocation.
     pub(crate) fn rebuild(

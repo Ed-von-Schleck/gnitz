@@ -42,8 +42,11 @@ fn for_compaction_bench() {
             instructions.measure(|| {
                 let mut starts = vec![0usize; inputs.len()];
                 (0..guard_keys.len())
-                    .filter_map(|g| merge_guard(&inputs, &guard_keys, g, &mut starts, skeleton, &schema, None))
-                    .map(|(_, run)| black_box(run).row_count())
+                    .filter_map(|g| {
+                        let until = guard_keys.get(g + 1).map(PkBuf::pk_bytes);
+                        merge_guard(&inputs, &mut starts, until, skeleton, &schema, None)
+                    })
+                    .map(|run| black_box(run).row_count())
                     .sum::<usize>()
             })
         });
@@ -104,13 +107,12 @@ fn distinct_compaction_bench() {
                 .zip(builders)
                 .map(|(s, b)| map_shard(&dir.path().join(format!("{pk}_{deal}_{s}.db")), &b.finish()))
                 .collect();
-            let guard_keys = [PkBuf::zeroed(schema.pk_stride())];
             for s in &inputs {
                 s.verify_body().unwrap();
             }
             let mut starts = vec![0usize; inputs.len()];
             let ((), whole) = instructions.measure(|| {
-                let (_, run) = merge_guard(&inputs, &guard_keys, 0, &mut starts, false, &schema, None).unwrap();
+                let run = merge_guard(&inputs, &mut starts, None, false, &schema, None).unwrap();
                 let batch = run.plain().unwrap();
                 assert_eq!(batch.len() as u64, TOTAL);
                 black_box(batch);
@@ -119,14 +121,8 @@ fn distinct_compaction_bench() {
             // is the output batch.
             let (rows, merge) = instructions.measure(|| {
                 let windows: Vec<_> = inputs.iter().map(|s| s.window(0..s.row_count())).collect();
-                let mut rows = 0u64;
-                run_merge(
-                    &windows,
-                    &schema,
-                    windows.iter().map(|w| 0..w.row_count()),
-                    |src, row, w| rows += black_box((src, row, w)).2 as u64,
-                );
-                rows
+                let rows = run_merge(&windows, &schema, windows.iter().map(|w| 0..w.row_count()));
+                black_box(rows).iter().map(|r| r.2 as u64).sum::<u64>()
             });
             assert_eq!(rows, TOTAL);
             println!(

@@ -96,7 +96,7 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
             let groups = runs
                 .as_deref()
                 .map_or_else(|| key.numbered(batch), GroupOrdinals::of_runs);
-            prop_assert_eq!(groups.ord.len(), batch.count, "{:?}", cols);
+            prop_assert_eq!(groups.ord.len(), batch.len(), "{:?}", cols);
             for (row, &g) in groups.ord.iter().enumerate() {
                 let first = groups.first[g as usize] as usize;
                 prop_assert!(first <= row, "{:?}: row {} precedes its group's first", cols, row);
@@ -134,8 +134,8 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
             let group =
                 |r: usize| -> Vec<_> { cols.iter().map(|&c| cell(&mb, schema.locate(c as usize), r)).collect() };
             let ids = identities(&key, &mb);
-            for a in 0..batch.count {
-                for b in a + 1..batch.count {
+            for a in 0..batch.len() {
+                for b in a + 1..batch.len() {
                     let same_out_pk = out_pk(a) == out_pk(b);
                     prop_assert_eq!(group(a) == group(b), same_out_pk, "{:?}: rows {} and {}", cols, a, b);
                     prop_assert_eq!(

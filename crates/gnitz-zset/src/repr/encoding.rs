@@ -29,8 +29,8 @@ gnitz_wire::wire_enum! {
         For = 3,
         /// Dictionary: a payload column as its distinct cells and one code per row.
         Dict = 4,
-        /// Sequential: a string column of values that do not repeat, as one length
-        /// per row.
+        /// Sequential: a string column as one length per row, then each row's value
+        /// in row order.
         Seq = 5,
         /// Sparse: a nullable payload column, not a string's, as its non-NULL cells.
         Sparse = 6,

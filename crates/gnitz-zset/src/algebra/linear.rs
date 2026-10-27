@@ -26,7 +26,7 @@ pub fn op_filter(batch: Cow<'_, Batch>, pred: &mut RowFilter) -> Batch {
     // has one batch.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     pred.ranges(&batch.as_mem_batch(), &mut ranges);
-    if ranges == [(0, batch.count)] {
+    if ranges == [(0, batch.len())] {
         return batch.into_owned();
     }
     Batch::from_ranges(&batch, &ranges, 0)

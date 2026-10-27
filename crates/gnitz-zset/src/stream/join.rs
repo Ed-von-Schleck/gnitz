@@ -10,8 +10,8 @@
 use std::cmp::Ordering;
 
 use crate::repr::{
-    copy_runs, pk_group_end, pk_prefix_group_end, relocate_german_string_vec, runs_where, should_relocate_blob,
-    width_dispatch, Batch, ReadCursor,
+    copy_runs, pk_group_end, relocate_german_string_vec, runs_where, should_relocate_blob, width_dispatch, Batch,
+    ReadCursor,
 };
 use crate::schema::key::{band, compare_pk_ordering, key_above};
 use crate::schema::{DerivedSchema, SchemaDescriptor};
@@ -287,7 +287,7 @@ impl Pairing {
 pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) -> Batch {
     let out_schema = &plan.out_schema;
     debug_assert!(delta.is_consolidated());
-    let n = delta.count;
+    let n = delta.len();
     if n == 0 {
         return Batch::empty_with_schema(out_schema);
     }
@@ -348,11 +348,11 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
     // The delta's heap rides whole unless relocating the emitted cells is
     // cheaper; the rows no pairing names are what it then holds dead.
     let strings = d_schema.string_payload_slots();
-    let heap_at = match strings != 0 && !should_relocate_blob(delta.blob().len(), delta.count, rows) {
+    let heap_at = match strings != 0 && !should_relocate_blob(delta.blob().len(), delta.len(), rows) {
         true => {
-            let mut emitted = vec![false; delta.count];
+            let mut emitted = vec![false; delta.len()];
             pairs.iter().for_each(|p| emitted[p.delta_rows()].fill(true));
-            let kept = runs_where(delta.count, |row| emitted[row]);
+            let kept = runs_where(delta.len(), |row| emitted[row]);
             out.carry_heap(&delta.as_mem_batch(), strings, &kept)
         }
         false => None,
@@ -520,12 +520,12 @@ fn repeat_pk_cells<const N: usize>(
 /// matches the rows its PK prefixes, which sit together because the cursor
 /// orders by the whole PK.
 fn equi_merge_walk(delta: &Batch, m: &mut ReadCursor, mut emit: impl FnMut(usize, usize, &ReadCursor)) {
-    let (n, k) = (delta.count, delta.schema().pk_stride());
+    let (n, k) = (delta.len(), delta.schema().pk_stride());
     let mut i = 0;
     while i < n {
         let dk = delta.get_pk_bytes(i);
         if m.seek_pk_group_ascending(dk) {
-            let j = pk_group_end(delta, i); // delta group
+            let j = pk_group_end(delta, i, k); // delta group
             m.for_each_pk_group_row(dk, |c| emit(i, j, c));
             i = j;
         } else if m.valid {
@@ -555,8 +555,8 @@ fn range_merge_walk(
     // so only the prefix is ever rewritten.
     let mut group_lb = [0u8; MAX_PK_BYTES];
     let mut lo = 0;
-    while lo < delta.count {
-        let hi = pk_prefix_group_end(delta, lo, eq_size);
+    while lo < delta.len() {
+        let hi = pk_group_end(delta, lo, eq_size);
         // The group shares one bound, so the row whose other bound spans
         // widest cuts for all of them.
         let cut_row = if above { lo } else { hi - 1 };
@@ -596,7 +596,7 @@ fn range_merge_walk(
         // not a forward one, so `hi` floors it.
         let trace_group = &cursor.current_pk_bytes()[..eq_size];
         lo = hi;
-        if hi < delta.count && compare_pk_ordering(&delta.get_pk_bytes(hi)[..eq_size], trace_group).is_lt() {
+        if hi < delta.len() && compare_pk_ordering(&delta.get_pk_bytes(hi)[..eq_size], trace_group).is_lt() {
             group_lb[..eq_size].copy_from_slice(trace_group);
             lo = delta.seek(&group_lb[..stride], Some(hi)).max(hi);
         }

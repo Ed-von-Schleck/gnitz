@@ -262,7 +262,7 @@ fn assert_matches_reference(
         let trace = TestTrace::dealt(trace, runs);
         let out = op_join_delta_trace(delta, &mut |f, l| trace.cursor_within(f, l), &p);
         let at = format!("kind={kind:?} delta_is_right={delta_is_right}, {runs} runs");
-        assert_eq!(out.count, want_rows, "{at}: row count");
+        assert_eq!(out.len(), want_rows, "{at}: row count");
         assert_eq!(zset_of(&out, &p.out_schema), want, "{at}: z-set");
     }
 }

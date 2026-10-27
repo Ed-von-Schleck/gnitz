@@ -152,11 +152,11 @@ fn order_index_batch_bench() {
             .collect();
         let (index, _) = OrderIndex::new(&schema, group_cols, &keys, []).unwrap();
         let (entries, build) = counter.measure(|| std::hint::black_box(index.batch(&d1)));
-        assert_eq!(entries.count, d1.count, "one entry per delta row");
+        assert_eq!(entries.len(), d1.len(), "one entry per delta row");
         let bytes = entries.total_bytes() as f64 / N as f64;
         let pk = index.schema.pk_stride();
         let (folded, fold) = counter.measure(|| std::hint::black_box(entries.to_consolidated()));
-        assert_eq!(folded.count, d1.count, "no two entries are one element");
+        assert_eq!(folded.len(), d1.len(), "no two entries are one element");
         let mut h = Harness::new(OrderedPlan::top_n(&schema, group_cols, &keys, 10, 0).unwrap());
         let retraction = d1.clone().negated().into_consolidated();
         let [e1, e2, e3] = [&d1, &d2, &retraction].map(|d| h.measure(&counter, d) as f64 / N as f64);

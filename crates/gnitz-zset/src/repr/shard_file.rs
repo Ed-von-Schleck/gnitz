@@ -1,4 +1,5 @@
-//! Shard image encoding and writing, reached through `Batch::write_as_shard`.
+//! Shard image encoding and writing, reached through `Batch::write_as_shard`
+//! and `GuardRun::write_as_shard`.
 
 use std::borrow::Cow;
 use std::fs::OpenOptions;
@@ -33,7 +34,7 @@ fn encode_region(
     if is_constant(src, width) {
         return (Encoding::Constant, Cow::Borrowed(&src[..width]));
     }
-    match pack().filter(|(_, image)| region_start(image.len()) < region_start(src.len())) {
+    match pack().filter(|(_, image)| aligned(image.len()) < aligned(src.len())) {
         Some((encoding, image)) => (encoding, Cow::Owned(image)),
         None => (Encoding::Raw, Cow::Borrowed(src)),
     }
@@ -56,13 +57,13 @@ fn pack_fixed_column(col: &SchemaColumn, pi: usize, src: &[u8], nulls: &[u8]) ->
     let framed = col
         .fixed_int()
         .and_then(|fi| for_encode(src, fi))
-        .filter(|image| region_start(image.len()) < region_start(src.len()));
+        .filter(|image| aligned(image.len()) < aligned(src.len()));
     let limit = framed.as_ref().map_or(src.len(), Vec::len) / 2;
     let is_null = |row: usize| gnitz_wire::null_word_get(read_u64_le(nulls, row * FIXED_REGION_BYTES), pi);
     // A column under half NULL has more cells than half the region holds.
     let sparse = (col.nullable && (0..n).filter(|&r| is_null(r)).count() > n / 2)
         .then(|| sparse_encode(src, width, col.fixed_int(), is_null))
-        .filter(|image| region_start(image.len()) < region_start(limit));
+        .filter(|image| aligned(image.len()) < aligned(limit));
     let limit = sparse.as_ref().map_or(limit, Vec::len);
     let dict = (dict_image_len(n, 2) < limit && sample_repeats(n, |row| &src[row * width..][..width]))
         .then(|| dict_fixed_column(src, width, limit))
@@ -115,7 +116,7 @@ fn dict_fixed_column(src: &[u8], width: usize, limit: usize) -> Option<Vec<u8>> 
         let next = entries.len();
         let id = *index.entry(Content(cell)).or_insert(next as u32);
         if id as usize == next {
-            if next == DICT_MAX_ENTRIES || region_start(dict_image_len(n, next + 1)) >= region_start(limit) {
+            if next == DICT_MAX_ENTRIES || aligned(dict_image_len(n, next + 1)) >= aligned(limit) {
                 return None;
             }
             let mut entry = [0u8; 16];
@@ -138,7 +139,7 @@ fn pack_string_column<'a>(cells: &'a [[u8; 16]], src: Heap<'a>, heap: &mut HeapW
     if is_constant(cells.as_flattened(), 16) {
         return (Encoding::Constant, heap.place(&cells[0], src).to_vec());
     }
-    let (at, raw) = (heap.mark(), region_start(cells.len() * 16));
+    let (at, raw) = (heap.mark(), aligned(cells.len() * 16));
     let (mut span, mut short, mut long) = ((usize::MAX, 0), 0, 0);
     for len in cells.iter().map(|cell| stored_value(cell, src).0) {
         span = (span.0.min(len), span.1.max(len));
@@ -148,12 +149,12 @@ fn pack_string_column<'a>(cells: &'a [[u8; 16]], src: Heap<'a>, heap: &mut HeapW
             &mut short
         } += len;
     }
-    let seq = region_start(seq_image_len(cells.len(), span, short)) + long;
+    let seq = aligned(seq_image_len(cells.len(), span, short)) + long;
     // The image that holds each of `entries` distinct values once, `shared`
     // heap bytes in all, if it is no larger than the lengths. Both only grow
     // over the pass, so a `None` stays one.
     let sharing = |entries: usize, shared: usize| {
-        let dict = region_start(dict_image_len(cells.len(), entries));
+        let dict = aligned(dict_image_len(cells.len(), entries));
         if entries <= DICT_MAX_ENTRIES && dict < raw && dict + shared <= seq {
             Some(Encoding::Dict)
         } else {
@@ -188,11 +189,9 @@ fn pack_string_column<'a>(cells: &'a [[u8; 16]], src: Heap<'a>, heap: &mut HeapW
     (Encoding::Seq, seq_encode(cells, span, src, heap))
 }
 
-/// Per-call policy for [`Batch::write_as_shard`].
+/// Per-call policy for writing a shard.
 #[derive(Clone, Copy, Default)]
 pub struct ShardWriteOpts<'a> {
-    /// Stamp [`SHARD_FLAG_SKELETON`].
-    pub skeleton: bool,
     /// Write no PK filter — named for what it turns off, so `Default` builds one.
     pub skip_pk_filter: bool,
     /// Code the heap under this codebook, unless that leaves it more than three
@@ -203,16 +202,18 @@ pub struct ShardWriteOpts<'a> {
 impl Batch {
     /// Write this batch as a new, unsynced shard at `path`; `Err` if `path` exists.
     pub fn write_as_shard(&self, path: &str, opts: ShardWriteOpts<'_>) -> Result<(), StorageError> {
-        self.write_shard_over(self, path, opts)
+        self.write_shard_over(self, path, opts, false)
     }
 
     /// [`write_as_shard`](Self::write_as_shard) of this batch's rows as `rows`
-    /// reads them: over the heap its blob holds.
+    /// reads them: over the heap its blob holds. `skeleton` sets the header's
+    /// skeleton flag.
     pub(crate) fn write_shard_over(
         &self,
         rows: &impl RowSource,
         path: &str,
         opts: ShardWriteOpts<'_>,
+        skeleton: bool,
     ) -> Result<(), StorageError> {
         let schema = self.schema();
         let n = self.count;
@@ -221,12 +222,12 @@ impl Batch {
         if src.plain().is_some() {
             self.debug_verify_dead_heap();
         }
-        self.debug_verify_consolidated_over(rows);
+        self.debug_verify_consolidated(rows);
         let regions = self.wire_regions();
         let npc = schema.num_payload_cols();
         // A skeleton weight sums a per-key time prefix of a positive integral.
         debug_assert!(
-            !opts.skeleton || (npc == 0 && (0..n).all(|row| self.get_weight(row) > 0)),
+            !skeleton || (npc == 0 && (0..n).all(|row| self.get_weight(row) > 0)),
             "a skeleton shard is the PK-only projection of its relation's schema at positive coarse weights",
         );
         // A store nothing point-probes writes no filter.
@@ -280,7 +281,7 @@ impl Batch {
         let mut body = gnitz_wire::RowHasher::default();
         let mut end = header.len();
         for (i, (encoding, image)) in images.iter().enumerate() {
-            for bytes in [&PAD[..region_start(end) - end], &image[..]] {
+            for bytes in [&PAD[..aligned(end) - end], &image[..]] {
                 body.update(bytes);
                 file.write_all_at(bytes, end as u64)?;
                 end += bytes.len();
@@ -296,7 +297,7 @@ impl Batch {
             row_count: n,
             retractions: self.retracted_rows().count(),
             file_npc: npc,
-            skeleton: opts.skeleton,
+            skeleton,
             body_checksum: body.digest(),
         }
         .write(&mut header);

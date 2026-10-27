@@ -161,7 +161,7 @@ fn output_rows(b: &Batch, group_cols: &[u32]) -> BTreeMap<Cells, i64> {
     let out = b.schema();
     let skip = usize::from(schema().reduce_out_key(group_cols) == ReduceOutKey::SyntheticFold);
     let mut z = BTreeMap::new();
-    for r in 0..b.count {
+    for r in 0..b.len() {
         let row: Cells = (skip..out.num_columns()).map(|c| cell(&mb, out.locate(c), r)).collect();
         *z.entry(row).or_insert(0) += b.get_weight(r);
     }
@@ -580,7 +580,7 @@ fn a_float_sum_weighs_each_value() {
             let b = h.trace_out.cursor().materialize();
             let mb = b.as_mem_batch();
             let loc = b.schema().locate(b.schema().num_columns() - 1);
-            (0..b.count)
+            (0..b.len())
                 .map(|r| f64::from_le_bytes(cell(&mb, loc, r).unwrap().try_into().unwrap()))
                 .collect()
         };
@@ -599,7 +599,7 @@ fn a_float_sum_weighs_each_value() {
         let b = fold.finish();
         let mb = b.as_mem_batch();
         let loc = b.schema().locate(b.schema().num_columns() - 1);
-        let mut got: Vec<f64> = (0..b.count)
+        let mut got: Vec<f64> = (0..b.len())
             .map(|r| f64::from_le_bytes(cell(&mb, loc, r).unwrap().try_into().unwrap()))
             .collect();
         got.sort_by(f64::total_cmp);
@@ -653,7 +653,7 @@ fn two_string_extremes_keep_their_own_index_images() {
     // A fixed-width ordinal's payload cell is the zeroed empty string, not what
     // the arena held: the cell is part of the entry's identity.
     let idx = plan.index_batch(&batch(&[(row(1, "aa"), 1)])).unwrap();
-    assert_eq!(idx.count, 3);
+    assert_eq!(idx.len(), 3);
     assert_eq!(
         gnitz_wire::RowSource::get_col_ptr(&idx, 2, 0, 16),
         &[0u8; 16],
@@ -694,7 +694,7 @@ fn a_float_sum_is_carried_in_f64() {
         let mb = b.as_mem_batch();
         let n = b.schema().num_columns();
         let f = |c: usize| f64::from_le_bytes(cell(&mb, b.schema().locate(c), 0).unwrap().try_into().unwrap());
-        assert_eq!(b.count, 1);
+        assert_eq!(b.len(), 1);
         (f(n - 2), f(n - 1))
     };
     for group_cols in [&[][..], &[3]] {

@@ -341,7 +341,7 @@ impl MapPlan {
     /// The map over `in_batch`, less a [`gnitz_wire::NullKeys::Drop`] reindex's
     /// NULL-keyed rows, into a fresh unconsolidated output.
     pub fn evaluate_map_batch(&mut self, in_batch: &Batch) -> Batch {
-        let whole = [(0, in_batch.count)];
+        let whole = [(0, in_batch.len())];
         let runs;
         let ranges: &[(usize, usize)] = match self.pk_source {
             PkSource::Pack { drop_nulls, .. } if drop_nulls != 0 => {

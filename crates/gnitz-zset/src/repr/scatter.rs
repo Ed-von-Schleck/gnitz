@@ -1,11 +1,14 @@
 //! Column-first row copy into a `DirectWriter`: choose the rows, then copy them.
 //!
-//! Two kernels, split on where the output weight comes from. [`scatter_copy`]
-//! carries each source row's own. [`scatter_unified_sources`] takes it from the
-//! caller's `(src, row, weight)` triple: a `UnifiedSource` has no weight region,
-//! so the triple is the only channel for a merge fold's net weight — which is
-//! not any one source row's weight. [`gather_rows`] takes the same triples and
-//! reads each cell through its source, for picks sparse in their sources.
+//! Four kernels, split first on where the output weight comes from.
+//! [`copy_ranges`] copies `[start, end)` ranges of one batch of the writer's
+//! layout and [`scatter_copy`] an index list; each row keeps its own weight.
+//! [`scatter_unified_sources`] (through [`UnifiedSet`]) takes the weight from
+//! the caller's `(src, row, weight)` triple instead: a `UnifiedSource` has no
+//! weight region, so the triple is the only channel for a merge fold's net
+//! weight — which is not any one source row's weight. [`gather_rows`] takes the
+//! same triples and reads each cell through its source, for picks sparse in
+//! their sources.
 
 use std::ops::Range;
 
@@ -254,7 +257,7 @@ pub(crate) fn mem_batch_to_unified<'a>(
 ///
 /// `cols` is the flat payload-`ColPtr` table the sources were built against;
 /// source `si`'s column `pi` is `cols[sources[si].cols_off + pi]`.
-pub(crate) fn scatter_unified_sources(
+fn scatter_unified_sources(
     sources: &[UnifiedSource<'_>],
     cols: &[ColPtr],
     rows: &[(u32, u32, i64)],
@@ -505,27 +508,23 @@ impl<'a> UnifiedSet<'a> {
         Self::of(sources, schema, sources.iter().map(|s| 0..s.row_count()))
     }
 
-    /// Rows across the whole sources.
-    pub(crate) fn src_rows(&self) -> usize {
-        self.src_rows
-    }
-
     /// Copy the rows `rows` names, in the order given, each at the weight its
-    /// triple carries, into a fresh unconsolidated batch under the set's schema.
-    /// `of_rows` is the row count of the whole output `rows` is a share of; it
-    /// sizes the heap reserved.
-    pub(crate) fn materialize(&self, rows: &[(u32, u32, i64)], of_rows: usize) -> Batch {
-        self.materialize_under(rows, of_rows, None)
+    /// triple carries, into a fresh unconsolidated batch under the set's schema,
+    /// its heap coded under `codebook` where one is given (see
+    /// [`Codebook::append`]). The heap reserved is prorated from the whole
+    /// sources, and none under a schema without a string column, such as a
+    /// skeleton merge's PK-only one over sources that hold strings.
+    pub(crate) fn materialize(&self, rows: &[(u32, u32, i64)], codebook: Option<&Codebook>) -> Batch {
+        let blob_cap = match self.schema.has_german_string() {
+            true => prorated_blob_cap(self.src_blob, self.src_rows, rows.len()),
+            false => 0,
+        };
+        self.write(rows, blob_cap, codebook)
     }
 
-    /// [`materialize`](Self::materialize) into a heap coded under `codebook`
-    /// where one is given; see [`Codebook::append`].
-    pub(crate) fn materialize_under(
-        &self,
-        rows: &[(u32, u32, i64)],
-        of_rows: usize,
-        codebook: Option<&Codebook>,
-    ) -> Batch {
+    /// [`materialize`](Self::materialize) reserving `blob_cap` heap bytes, with
+    /// each carried source heap adopted at its `heap_at` before any cell lands.
+    fn write(&self, rows: &[(u32, u32, i64)], blob_cap: usize, codebook: Option<&Codebook>) -> Batch {
         #[cfg(debug_assertions)]
         for &(si, ri, _) in rows {
             debug_assert!(
@@ -534,12 +533,13 @@ impl<'a> UnifiedSet<'a> {
                 self.windows[si as usize],
             );
         }
-        let blob_cap = if self.schema.has_german_string() {
-            prorated_blob_cap(self.src_blob, of_rows, rows.len())
-        } else {
-            0
-        };
         write_to_batch(&self.schema, rows.len(), blob_cap, |writer| {
+            for view in &self.sources {
+                if let Some(at) = view.heap_at {
+                    let base = writer.adopt_heap(view.heap.plain().expect("a carried heap is plain"));
+                    debug_assert_eq!(base, at, "carried heaps land in source order");
+                }
+            }
             scatter_unified_sources(&self.sources, &self.cols, rows, codebook, writer);
         })
     }
@@ -555,7 +555,7 @@ pub(crate) fn materialize_carrying(
     let mut set = UnifiedSet::whole(sources, schema);
     let mask = schema.string_payload_slots();
     if mask == 0 {
-        return set.materialize(rows, rows.len());
+        return set.materialize(rows, None);
     }
     let mut kept = vec![0usize; sources.len()];
     for &(si, _, _) in rows {
@@ -586,15 +586,7 @@ pub(crate) fn materialize_carrying(
         }
     }
     let blob_cap = heap_end + prorated_blob_cap(relocated_blob, relocated_rows, relocated_out);
-    let mut out = write_to_batch(schema, rows.len(), blob_cap, |writer| {
-        for (src, view) in sources.iter().zip(&set.sources) {
-            if let Some(at) = view.heap_at {
-                let base = writer.adopt_heap(src.blob);
-                debug_assert_eq!(base, at, "carried heaps land in source order");
-            }
-        }
-        scatter_unified_sources(&set.sources, &set.cols, rows, None, writer);
-    });
+    let mut out = set.write(rows, blob_cap, None);
     out.charge_dead(dead);
     out
 }

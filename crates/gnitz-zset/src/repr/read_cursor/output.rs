@@ -60,7 +60,7 @@ impl ReadCursor {
             });
         }
         let set = UnifiedSet::of(&self.sources, &self.schema, windows.iter().cloned());
-        let mut batch = set.materialize(&order, set.src_rows());
+        let mut batch = set.materialize(&order, None);
         batch.certify_consolidated();
         self.merge_order = order;
         self.drain_windows = windows;
@@ -90,7 +90,18 @@ impl ReadCursor {
                 skeletons.extend(shard, start..start + row_count);
                 Batch::empty_with_schema(&self.schema)
             }
-            src => src.slice_to_owned_batch(start, row_count, &self.schema),
+            Run::Shard(shard) => {
+                debug_assert!(
+                    *shard.schema() == self.schema,
+                    "a shard slices under the schema it is bound to"
+                );
+                shard.slice_to_owned_batch(start, row_count)
+            }
+            Run::Mem(b) => {
+                let mut slice = Batch::from_ranges(b, &[(start, start + row_count)], 0);
+                slice.set_schema(&self.schema);
+                slice
+            }
         };
         self.states[i].position = start + row_count;
         self.advance_single(i);

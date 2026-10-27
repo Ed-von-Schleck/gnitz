@@ -95,11 +95,11 @@ fn weight_clamp_bench() {
                 )
             })
         });
-        assert_eq!(out.count, want, "{name}");
+        assert_eq!(out.len(), want, "{name}");
         println!(
             "weight_clamp_bench {name:<42} {:>8.1} instr/row (out {})",
-            instructions as f64 / delta.count as f64,
-            out.count
+            instructions as f64 / delta.len() as f64,
+            out.len()
         );
     }
 }

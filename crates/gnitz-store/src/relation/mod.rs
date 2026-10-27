@@ -554,9 +554,9 @@ impl RelationRegistry {
     }
 
     /// Publish a new column schema for relation `id` in place (any column
-    /// ALTER) into its store, where a held `Table` rebinds its shards if the
-    /// region count grew. Refuses a descriptor that is not a trailing append of
-    /// the stored one.
+    /// ALTER) into its store, where a held `Table` rebinds its shards to it if
+    /// it changed. Refuses a descriptor that is not a trailing append of the
+    /// stored one.
     pub fn swap_schema(&mut self, id: u64, schema: SchemaDescriptor) -> Result<(), String> {
         let entry = self.relation_mut_or_err(id)?;
         // Checked, not asserted: what a stale `key_spec` produces is a silently

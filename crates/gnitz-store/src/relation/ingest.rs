@@ -122,11 +122,10 @@ impl RelationRegistry {
         // Checked, not asserted: the append path sizes by the destination's region
         // count, so a mismatch would silently drop the extra column.
         let want = entry.store.schema().num_payload_cols();
-        if batch.num_payload_cols() != want {
+        let got = batch.schema().num_payload_cols();
+        if got != want {
             return Err(format!(
-                "batch for relation {id} carries {} payload columns, its schema has {}",
-                batch.num_payload_cols(),
-                want
+                "batch for relation {id} carries {got} payload columns, its schema has {want}"
             ));
         }
         let kind = entry.kind;

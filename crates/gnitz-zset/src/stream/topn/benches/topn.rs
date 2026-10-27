@@ -14,7 +14,7 @@ const N: u64 = 1 << 16;
 /// retraction of `first` — in instructions per delta row.
 fn bulk_epochs(h: &mut Harness, counter: &Counter, first: &Batch, second: &Batch) -> [f64; 3] {
     let retraction = first.clone().negated().into_consolidated();
-    [first, second, &retraction].map(|d| h.measure(counter, d) as f64 / d.count as f64)
+    [first, second, &retraction].map(|d| h.measure(counter, d) as f64 / d.len() as f64)
 }
 
 /// `[U64 id (pk), I64 grp, I64 key]`.

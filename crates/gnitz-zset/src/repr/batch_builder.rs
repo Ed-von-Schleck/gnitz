@@ -19,7 +19,7 @@ impl gnitz_wire::sys_rows::SysRowSink for BatchBuilder {
         BatchBuilder::begin_row_natives(self, pk, weight);
     }
     fn put_u64(&mut self, v: u64) {
-        BatchBuilder::put_u64(self, v);
+        self.put_int(v.into());
     }
     fn put_string(&mut self, s: &str) {
         BatchBuilder::put_string(self, s);
@@ -86,8 +86,7 @@ impl BatchBuilder {
         self.curr_col += 1;
     }
 
-    /// [`Self::put_int`] under the name `SysRowSink` requires; every system-table
-    /// payload column is a U64.
+    /// [`Self::put_int`] for a u64 value.
     pub fn put_u64(&mut self, val: u64) {
         self.put_int(val as u128);
     }

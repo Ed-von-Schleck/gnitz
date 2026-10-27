@@ -20,7 +20,7 @@
 use std::cmp::Ordering;
 
 use crate::algebra::{GroupOutKey, ReindexPacker};
-use crate::repr::{pk_prefix_group_end, Batch, MemBatch, ReadCursor};
+use crate::repr::{pk_group_end, Batch, MemBatch, ReadCursor};
 use crate::schema::key::compare_pk_ordering;
 use crate::schema::payload_order::{Generic, PayloadOrder};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
@@ -416,7 +416,7 @@ impl OrderIndex {
     /// weight, unsorted: a region at a time.
     pub(in crate::stream) fn batch(&self, delta: &Batch) -> Batch {
         let mb = delta.as_mem_batch();
-        let n = delta.count;
+        let n = delta.len();
         let mut out = Batch::with_capacity(&self.schema, n.max(1));
         // No carried string reads the delta's heap.
         let heap_at = match self.strings {
@@ -470,7 +470,7 @@ impl OrderIndex {
         mut group: impl FnMut(&mut Batch, &[u8], &mut Walk<'_>),
     ) -> OrderedEpoch {
         let mut folded = self.batch(delta);
-        debug_assert_eq!(folded.count, delta.count);
+        debug_assert_eq!(folded.len(), delta.len());
         // Entry `i` is delta row `i`'s, unless a fold moved the entries: then
         // `moved` records every entry's.
         let mut moved: Vec<(u32, u32, i64)> = Vec::new();
@@ -500,7 +500,7 @@ impl OrderIndex {
         };
         while walk.end < n {
             walk.next = walk.end;
-            walk.end = pk_prefix_group_end(entries, walk.next, width);
+            walk.end = pk_group_end(entries, walk.next, width);
             let delta_row = moved.get(walk.next).map_or(walk.next, |m| m.1 as usize);
             let out_pk = self.key.out_pk(&mb, delta_row);
             walk.group = prefix(walk.next);

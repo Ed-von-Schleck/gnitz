@@ -1,7 +1,8 @@
 //! Memory-mapped columnar shard reader.
 //!
-//! Opening verifies the header and directory; [`MappedShard::verify_body`]
-//! verifies the body.
+//! Opening verifies the header, the directory, and that every region's size and
+//! encoding fits the schema, the heap's symbol table and the PK filter included;
+//! [`MappedShard::verify_body`] verifies the body.
 
 use std::cell::OnceCell;
 use std::ops::Range;
@@ -24,11 +25,12 @@ use gnitz_wire::read_u64_le;
 use gnitz_wire::Heap;
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
+use xorf::{BinaryFuse8Ref, Filter};
 
 use StorageError::Corrupt;
 
 /// A payload-column region.
-pub(crate) enum PayloadRegion {
+enum PayloadRegion {
     /// Readable in place: a Raw (stride = width) or Constant (stride 0) region
     /// of the mapping, or `ZERO_CELL` at stride 0 for a column the file predates
     /// (its null bit comes from `null_pad_mask`).
@@ -44,7 +46,7 @@ static ZERO_CELL: [u8; 16] = [0; 16];
 
 /// A payload region read through a decode. A per-row read decodes the block it
 /// lands in and keeps it; a bulk read decodes its own window and keeps nothing.
-pub(crate) struct PackedRegion {
+struct PackedRegion {
     image: PackedImage,
     /// The column's cell width.
     width: usize,
@@ -60,7 +62,7 @@ enum PackedImage {
 
 /// The blocks of a column or of a packed key that per-row reads have decoded,
 /// one per `DECODE_BLOCK_ROWS` rows.
-pub(crate) struct DecodedBlocks(Box<[OnceCell<Box<[u8]>>]>);
+struct DecodedBlocks(Box<[OnceCell<Box<[u8]>>]>);
 
 impl DecodedBlocks {
     fn new(rows: usize) -> Self {
@@ -100,7 +102,7 @@ impl DecodedBlocks {
 }
 
 /// The PK region.
-pub(crate) enum KeyRegion {
+enum KeyRegion {
     /// Readable in place: a Raw (stride = `pk_stride`) or Constant (stride 0)
     /// region of the mapping.
     Mapped(ColPtr),
@@ -110,7 +112,7 @@ pub(crate) enum KeyRegion {
 /// An [`Encoding::Key`] region of the mapping. A seek searches the image in
 /// place; a per-row read decodes the block it lands in and keeps it, and a bulk
 /// read decodes its own window and keeps nothing.
-pub(crate) struct PackedKey {
+struct PackedKey {
     image: KeyImage<'static>,
     blocks: DecodedBlocks,
 }
@@ -150,7 +152,7 @@ impl KeyRegion {
 
 /// A region of one 8-byte word per row: the weights, or the null words. A
 /// packed one is a region of the mapping, read per row in place.
-pub(crate) enum WordRegion {
+enum WordRegion {
     Mapped(ColPtr),
     TwoValue(TwoValueImage<'static>),
     For(ForImage<'static>),
@@ -191,6 +193,8 @@ impl WordRegion {
     }
 }
 
+/// A shard file mapped read-only and bound to the schema it reads under;
+/// every region it reads was checked when it was bound.
 pub struct MappedShard {
     /// The mapping every pointer and `'static` slice below points into, shared
     /// by every handle [`rebind`](Self::rebind) derives from this one.
@@ -206,15 +210,19 @@ pub struct MappedShard {
     /// The null bits of `schema`'s payload columns past the file's own, OR'd
     /// into every null word read: a column the file predates reads NULL.
     null_pad_mask: u64,
-    /// The heap region.
-    blob: &'static [u8],
-    /// `blob` taken apart, where it holds its values coded under a table.
-    coded: Option<SymbolsImage<'static>>,
-    /// The PK filter region, or `None` when the file carries none.
-    shard_filter: Option<&'static [u8]>,
+    heap: ShardHeap,
+    /// The validated PK filter, or `None` when the file carries none.
+    shard_filter: Option<BinaryFuse8Ref<'static>>,
     /// The words `null_bmp` points into when the file is wider than `schema`:
     /// the file's null words without the bits of the columns `schema` lacks.
     _narrowed_nulls: Option<Box<[u8]>>,
+}
+
+/// The heap region: the verbatim heap, or the parsed image of one coded under
+/// a symbol table.
+enum ShardHeap {
+    Plain(&'static [u8]),
+    Coded(SymbolsImage<'static>),
 }
 
 /// A shard's header and directory, read under no schema.
@@ -290,6 +298,9 @@ impl MappedShard {
         self.header.retractions
     }
 
+    /// Maps the shard at `path`, advised for huge pages, and binds it to
+    /// `schema`, refusing a file whose header, directory or regions do not
+    /// check out; the body is not hashed (see [`verify_body`](Self::verify_body)).
     pub fn open(path: &str, schema: &SchemaDescriptor) -> Result<Self, StorageError> {
         let (mmap, header) = Self::map(path)?;
         mmap.advise(libc::MADV_HUGEPAGE);
@@ -389,9 +400,9 @@ impl MappedShard {
         let [.., blob, filter] = spans.as_slice() else {
             unreachable!("region_spans yields every region plus the filter")
         };
-        let coded = match blob.encoding {
-            Encoding::Raw => None,
-            Encoding::Symbols => Some(SymbolsImage::parse(blob.bytes(data)).ok_or(Corrupt("region size"))?),
+        let heap = match blob.encoding {
+            Encoding::Raw => ShardHeap::Plain(blob.bytes(data)),
+            Encoding::Symbols => ShardHeap::Coded(SymbolsImage::parse(blob.bytes(data)).ok_or(Corrupt("region size"))?),
             _ => return Err(Corrupt("encoding")),
         };
         if filter.encoding != Encoding::Raw {
@@ -399,13 +410,7 @@ impl MappedShard {
         }
         let shard_filter = match filter.size {
             0 => None,
-            _ => {
-                let region = filter.bytes(data);
-                if !shard_filter::is_valid(region) {
-                    return Err(Corrupt("filter descriptor"));
-                }
-                Some(region)
-            }
+            _ => Some(shard_filter::parse(filter.bytes(data)).ok_or(Corrupt("filter descriptor"))?),
         };
 
         Ok(MappedShard {
@@ -417,14 +422,15 @@ impl MappedShard {
             _narrowed_nulls: narrowed_nulls,
             col_regions,
             null_pad_mask,
-            blob: blob.bytes(data),
-            coded,
+            heap,
             shard_filter,
             mmap,
         })
     }
 
     /// Whether the body still hashes to the checksum the writer recorded.
+    /// Leaves the mapping, which every handle rebound from this one shares,
+    /// advised MADV_SEQUENTIAL.
     pub fn verify_body(&self) -> Result<(), StorageError> {
         self.mmap.advise(libc::MADV_SEQUENTIAL);
         let body = &self.mmap.as_slice()[desc_len(self.header.file_npc)..];
@@ -506,14 +512,12 @@ impl MappedShard {
         }
     }
 
-    /// Whether the heap holds its values coded under a symbol table.
-    pub fn heap_is_coded(&self) -> bool {
-        self.coded.is_some()
-    }
-
     /// The heap region, where it is coded.
     pub(crate) fn coded_heap(&self) -> Option<&SymbolsImage<'static>> {
-        self.coded.as_ref()
+        match &self.heap {
+            ShardHeap::Coded(image) => Some(image),
+            ShardHeap::Plain(_) => None,
+        }
     }
 
     /// Whether this shard carries a PK filter.
@@ -524,7 +528,8 @@ impl MappedShard {
     /// A shard carrying no filter admits every key.
     pub fn shard_filter_may_contain(&self, probe_key: u64) -> bool {
         self.shard_filter
-            .is_none_or(|region| shard_filter::may_contain(region, probe_key))
+            .as_ref()
+            .is_none_or(|filter| filter.contains(&probe_key))
     }
 
     /// Row `row`'s key by value, decoded alone where the key is packed.
@@ -652,6 +657,7 @@ impl RowSource for MappedShard {
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
         debug_assert!(row < self.header.row_count);
         match &self.col_regions[payload_col] {
+            // SAFETY: the region holds a cell for every row of the shard.
             PayloadRegion::Mapped(cp) => unsafe { cp.row(row, col_size) },
             PayloadRegion::Packed(p) => self.packed_cell(p, payload_col, row, col_size),
             PayloadRegion::Dict(d) => &d.cell(row)[..col_size],
@@ -660,9 +666,9 @@ impl RowSource for MappedShard {
 
     #[inline(always)]
     fn heap(&self) -> Heap<'_> {
-        match &self.coded {
-            None => Heap::Plain(self.blob),
-            Some(image) => image.heap(),
+        match &self.heap {
+            ShardHeap::Plain(blob) => Heap::Plain(blob),
+            ShardHeap::Coded(image) => image.heap(),
         }
     }
 

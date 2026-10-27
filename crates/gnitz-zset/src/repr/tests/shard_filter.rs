@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::Rng;
+use xorf::Filter;
 
 /// A `u128` PK through the real key derivation, as its OPK bytes.
 fn key_u128(k: u128) -> u64 {
@@ -25,19 +26,19 @@ fn no_key_set_produces_a_false_negative_through_its_region() {
         ),
     ] {
         let region = build(&pks.iter().flat_map(|k| k.to_be_bytes()).collect::<Vec<u8>>(), 16).unwrap();
-        assert!(is_valid(&region), "{what}: a freshly built filter parses back");
+        let filter = parse(&region).unwrap_or_else(|| panic!("{what}: a freshly built filter parses back"));
         for &pk in &pks {
-            assert!(may_contain(&region, key_u128(pk)), "{what}: {pk:#034x}");
+            assert!(filter.contains(&key_u128(pk)), "{what}: {pk:#034x}");
         }
-        let fp = absent.iter().filter(|&&k| may_contain(&region, key_u128(k))).count();
+        let fp = absent.iter().filter(|&&k| filter.contains(&key_u128(k))).count();
         assert!(fp * 100 < absent.len(), "{what}: false-positive rate above 1%: {fp}");
     }
 }
 
 #[test]
 fn a_region_shorter_than_the_descriptor_is_invalid() {
-    assert!(!is_valid(&[]));
-    assert!(!is_valid(&[0u8; Descriptor::DMA_LEN - 1]));
+    assert!(parse(&[]).is_none());
+    assert!(parse(&[0u8; Descriptor::DMA_LEN - 1]).is_none());
 }
 
 /// Every rule, one forged descriptor each. `{sl:4, mask:3, scl:5}` is the

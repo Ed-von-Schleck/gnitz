@@ -67,7 +67,8 @@ impl<'a> DirectWriter<'a> {
     }
 
     /// The arena through this writer's last row, read back: the rows before
-    /// this writer's and whatever of its own it has written.
+    /// this writer's and whatever of its own it has written. Its dead-heap bound
+    /// is the whole heap, since the writer does not know the batch's.
     #[inline]
     pub(crate) fn written(&self) -> MemBatch<'_> {
         MemBatch {
@@ -76,7 +77,7 @@ impl<'a> DirectWriter<'a> {
             cap: self.cap,
             blob: self.blob.as_slice(),
             count: self.at + self.rows,
-            dead_heap: 0,
+            dead_heap: self.blob.len(),
         }
     }
 
@@ -117,11 +118,11 @@ impl<'a> DirectWriter<'a> {
     pub(crate) fn fixed_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
         let pk_stride = self.schema.pk_stride();
         let (pk, rest) = self.data.split_at_mut(self.cap * pk_stride);
-        let (weight, rest) = rest.split_at_mut(self.cap * 8);
+        let (weight, rest) = rest.split_at_mut(self.cap * FIXED_REGION_BYTES);
         (
             &mut pk[self.at * pk_stride..][..self.rows * pk_stride],
-            &mut weight[self.at * 8..][..self.rows * 8],
-            &mut rest[self.at * 8..][..self.rows * 8],
+            &mut weight[self.at * FIXED_REGION_BYTES..][..self.rows * FIXED_REGION_BYTES],
+            &mut rest[self.at * FIXED_REGION_BYTES..][..self.rows * FIXED_REGION_BYTES],
         )
     }
 

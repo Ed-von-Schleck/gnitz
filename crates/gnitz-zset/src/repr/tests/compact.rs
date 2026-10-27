@@ -27,10 +27,11 @@ fn route(
     let mut starts = vec![0usize; shards.len()];
     (0..guards.len())
         .filter_map(|g| {
-            let (skeleton, run) = merge_guard(shards, guards, g, &mut starts, dehydrate, schema, None)?;
+            let until = guards.get(g + 1).map(PkBuf::pk_bytes);
+            let run = merge_guard(shards, &mut starts, until, dehydrate, schema, None)?;
             Some((
                 guards[g],
-                skeleton,
+                run.skeleton,
                 run.plain().expect("a merge given no codebook is plain").clone(),
             ))
         })
@@ -153,8 +154,9 @@ fn a_skeleton_input_makes_every_output_a_skeleton() {
     };
     // Written PK-only, read back under the relation's schema as a store does.
     let path = dir.path().join("b.db");
-    let opts = ShardWriteOpts { skeleton: true, ..Default::default() };
-    coarse.write_as_shard(path.to_str().unwrap(), opts).unwrap();
+    coarse
+        .write_shard_over(coarse, path.to_str().unwrap(), ShardWriteOpts::default(), true)
+        .unwrap();
     let raw = std::fs::read(&path).unwrap();
     let header = ShardHeader::read(&raw).unwrap();
     assert_eq!((header.file_npc, header.skeleton), (0, true));
@@ -229,10 +231,9 @@ fn a_coded_merge_keeps_the_codes_of_its_own_table() {
         map_coded_shard(&dir.path().join("late.db"), &late, &book),
         map_shard(&dir.path().join("retracted.db"), &retracted),
     ];
-    let guards = [PkBuf::zeroed(schema.pk_stride())];
 
-    let (_, plain) = merge_guard(&shards, &guards, 0, &mut [0; 4], false, &schema, None).unwrap();
-    let (_, coded) = merge_guard(&shards, &guards, 0, &mut [0; 4], false, &schema, Some(&book)).unwrap();
+    let plain = merge_guard(&shards, &mut [0; 4], None, false, &schema, None).unwrap();
+    let coded = merge_guard(&shards, &mut [0; 4], None, false, &schema, Some(&book)).unwrap();
     let plain = plain.plain().unwrap();
     let want = string_rows(plain, |r| plain.get_weight(r));
     assert_eq!(want.len(), 250 + 280 + 300);

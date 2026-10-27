@@ -50,7 +50,3 @@ impl Drop for Mmap {
         unsafe { libc::munmap(self.ptr.cast_mut().cast(), self.len) };
     }
 }
-
-#[cfg(test)]
-#[path = "tests/mmap.rs"]
-mod tests;

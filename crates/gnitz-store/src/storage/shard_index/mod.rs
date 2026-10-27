@@ -190,9 +190,9 @@ impl LevelGuard {
 }
 
 /// The destination keys a fold of `entries` into the guard at `key` routes into
-/// — sorted and distinct, as `merge_guard` requires. `key` alone until the
-/// entries hold more than `target` bytes, then row quantiles of a bounded sample
-/// as well.
+/// — sorted and distinct, as each fold step's window ends must ascend. `key`
+/// alone until the entries hold more than `target` bytes, then row quantiles of
+/// a bounded sample as well.
 ///
 /// Row quantiles stand in for byte quantiles: a skewed sample only makes the
 /// split uneven, and the oversized half crosses the target again next fold.
@@ -395,7 +395,7 @@ impl ShardIndex {
         if compress {
             let newest_coded = idx
                 .all_entries()
-                .filter(|e| e.shard.heap_is_coded())
+                .filter(|e| e.shard.heap().plain().is_none())
                 .max_by_key(|e| e.seq);
             idx.codebook = newest_coded.and_then(|e| Codebook::of_shard(&e.shard)).map(Rc::new);
         }

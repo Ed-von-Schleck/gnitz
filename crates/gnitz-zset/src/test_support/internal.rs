@@ -74,7 +74,7 @@ impl TestTrace {
     pub(crate) fn dealt(rows: &Batch, runs: usize) -> Self {
         let mut trace = TestTrace::new(*rows.schema());
         for k in 0..runs {
-            let rows_k: Vec<(usize, usize)> = (k..rows.count).step_by(runs).map(|r| (r, r + 1)).collect();
+            let rows_k: Vec<(usize, usize)> = (k..rows.len()).step_by(runs).map(|r| (r, r + 1)).collect();
             trace.ingest(Batch::from_ranges(rows, &rows_k, 0));
         }
         trace
@@ -171,9 +171,9 @@ pub(crate) fn assert_folds(inputs: &[Batch], got: &Batch, what: &str) {
     let schema = got.schema();
     let want = zset_sum(inputs, schema);
     assert_eq!(zset_of(got, schema), want, "{what}: the Z-set sum");
-    assert_eq!(got.count, want.len(), "{what}: one row per element");
+    assert_eq!(got.len(), want.len(), "{what}: one row per element");
     let mb = got.as_mem_batch();
-    for r in 1..got.count {
+    for r in 1..got.len() {
         assert_eq!(
             Generic.compare_full(schema, &mb, r - 1, &mb, r),
             Ordering::Less,
@@ -251,7 +251,7 @@ pub(crate) fn map_coded_shard(path: &Path, batch: &Batch, codebook: &Codebook) -
     batch.write_as_shard(path, opts).unwrap();
     let shard = MappedShard::open(path, batch.schema()).unwrap();
     assert!(
-        shard.heap_is_coded(),
+        shard.coded_heap().is_some(),
         "premise: the heap codes to less than three quarters"
     );
     Rc::new(shard)

@@ -104,8 +104,8 @@ impl Harness {
             .plan
             .epoch(delta, &mut |first, last| index.cursor_within(first, last));
         self.index.ingest(entries);
-        let elements = out.clone().into_consolidated().count;
-        assert_eq!(out.count, elements, "the epoch's delta holds an element once");
+        let elements = out.clone().into_consolidated().len();
+        assert_eq!(out.len(), elements, "the epoch's delta holds an element once");
         self.out.ingest(out.clone());
         out
     }
@@ -118,7 +118,7 @@ impl Harness {
         let b = self.out.cursor().materialize();
         let mb = b.as_mem_batch();
         let out = self.plan.output_schema();
-        (0..b.count)
+        (0..b.len())
             .map(|r| {
                 let mut row = vec![None; 5];
                 for (oc, slot) in layout.iter().enumerate() {

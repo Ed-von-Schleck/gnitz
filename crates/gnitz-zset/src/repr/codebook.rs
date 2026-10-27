@@ -15,7 +15,7 @@ use super::shard_reader::MappedShard;
 
 /// Long-value bytes a heap must hold before a table is trained over it: below
 /// four full tables, the table alone takes a quarter of them.
-pub(crate) const MIN_CODED_HEAP: usize = 4 * super::encoding::symbols_head_len(gnitz_wire::MAX_SYMBOLS);
+const MIN_CODED_HEAP: usize = 4 * super::encoding::symbols_head_len(gnitz_wire::MAX_SYMBOLS);
 
 /// Plain bytes of the values sampled to price a table against a batch.
 const PROBE_BYTES: usize = 16 << 10;

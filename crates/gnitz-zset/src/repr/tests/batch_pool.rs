@@ -1,5 +1,4 @@
 use super::*;
-use tls_pool::{MAX_POOLED, MAX_POOLED_BYTES};
 
 #[test]
 fn recycle_admits_only_nonempty_items_within_the_byte_cap() {

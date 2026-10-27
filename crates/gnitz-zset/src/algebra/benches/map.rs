@@ -22,7 +22,7 @@ fn map_ranges_bench() {
     let whole = |name: &str, mut plan: MapPlan, src: &Batch, rows: usize| {
         black_box(plan.evaluate_map_batch(src));
         let (out, instructions) = counter.measure(|| plan.evaluate_map_batch(black_box(src)));
-        assert_eq!(out.count, rows, "{name}");
+        assert_eq!(out.len(), rows, "{name}");
         println!(
             "map_ranges_bench {name:<24} {:6.1} instr/row",
             instructions as f64 / N as f64
@@ -161,11 +161,11 @@ fn map_ranges_bench() {
             plan.append_map_ranges(src, &mut keeper, &ranges);
             keeper.clear();
             let ((), instructions) = counter.measure(|| plan.append_map_ranges(black_box(src), &mut keeper, &ranges));
-            assert_eq!(keeper.count, crate::repr::range_rows(&ranges), "{name}_r{run}");
+            assert_eq!(keeper.len(), crate::repr::range_rows(&ranges), "{name}_r{run}");
             println!(
                 "map_ranges_bench {:<24} {:6.1} instr/row ({} ranges)",
                 format!("{name}_r{run}"),
-                instructions as f64 / keeper.count as f64,
+                instructions as f64 / keeper.len() as f64,
                 ranges.len()
             );
         }

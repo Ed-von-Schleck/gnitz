@@ -160,7 +160,7 @@ impl RunSet {
         let npc = schema.num_payload_cols();
         let mut bytes = 0;
         for run in &mut self.runs {
-            if run.num_payload_cols() < npc {
+            if run.schema().num_payload_cols() < npc {
                 let widened = run.widened_with_nulls(schema, false);
                 debug_assert!(
                     widened.is_consolidated(),

@@ -73,7 +73,7 @@ fn assert_hydration_matches(out: &Batch, keys: &PkKeys, coarse: &[i64]) {
     let mut got = Vec::new();
     let mut i = 0;
     while i < out.len() {
-        let j = crate::repr::pk_group_end(out, i);
+        let j = crate::repr::pk_group_end(out, i, out.schema().pk_stride());
         got.push((out.get_pk_bytes(i), out.as_mem_batch().sum_weights(i, j)));
         i = j;
     }

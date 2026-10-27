@@ -15,7 +15,7 @@ pub(crate) const SHARD_EPOCH: u64 = 30;
 
 /// Compared for equality at open. A shard sizes its regions from the live
 /// schema, so a system-table shape change must refuse the file, not reinterpret it.
-pub(crate) const SHARD_VERSION: u64 = SHARD_EPOCH ^ gnitz_wire::SYS_SCHEMA_DIGEST;
+const SHARD_VERSION: u64 = SHARD_EPOCH ^ gnitz_wire::SYS_SCHEMA_DIGEST;
 const DIR_ENTRY_SIZE: usize = 16;
 pub(crate) const ALIGNMENT: usize = 64;
 
@@ -37,7 +37,7 @@ pub(crate) const HEADER_SIZE: usize = OFF_RETRACTIONS + 8;
 
 /// [`OFF_FLAGS`] bit: a capacity-bounded view's skeleton shard, one (PK, coarse
 /// weight) row per key.
-pub(crate) const SHARD_FLAG_SKELETON: u64 = 1;
+const SHARD_FLAG_SKELETON: u64 = 1;
 
 /// The header fields a reader acts on; [`read`](Self::read) checks the length,
 /// magic, version, payload arity and a non-zero row count.
@@ -119,9 +119,11 @@ impl DirEntry {
     }
 }
 
-/// Where the next region of a file starts, once the one before it ended at `end`.
-pub(crate) const fn region_start(end: usize) -> usize {
-    end.next_multiple_of(ALIGNMENT)
+/// `len` rounded up to the file's region alignment: the bytes a region of `len`
+/// bytes occupies on disk, and where the next region starts after one ending at
+/// `len`.
+pub(crate) const fn aligned(len: usize) -> usize {
+    len.next_multiple_of(ALIGNMENT)
 }
 
 /// A directory entry placed in its file.
@@ -146,7 +148,7 @@ pub(crate) fn region_spans(image: &[u8], file_npc: usize) -> Result<Vec<Span>, S
         .map(|i| {
             let DirEntry { size, encoding } = DirEntry::read(image, i);
             let encoding = Encoding::from_wire(encoding).ok_or(Corrupt("encoding"))?;
-            let off = region_start(end);
+            let off = aligned(end);
             if off > file_size || size > file_size - off {
                 return Err(Corrupt("region past the end"));
             }
@@ -175,6 +177,6 @@ pub(crate) const fn desc_len(file_npc: usize) -> usize {
 /// bytes excluded, seeded with the shard's basename so a prefix written under
 /// another name fails to validate.
 pub(crate) fn desc_digest(path: &str, prefix: &[u8]) -> u64 {
-    let basename = path.rsplit('/').next().unwrap_or(path);
+    let basename = path.rsplit_once('/').map_or(path, |(_, name)| name);
     gnitz_wire::digest_with_hole(basename.as_bytes(), prefix, OFF_DESC_CHECKSUM)
 }

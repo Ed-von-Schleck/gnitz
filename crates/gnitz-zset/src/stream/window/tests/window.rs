@@ -126,12 +126,12 @@ fn a_row_moves_the_rows_behind_it_and_no_others() {
     let mut h = Harness::new(plan);
     let row = |id, val| ((id, 7, Some(val), None, 0), 1);
     h.tick(&batch(&[row(1, 10), row(2, 20), row(3, 30)]));
-    assert_eq!(h.tick(&batch(&[row(4, 40)])).count, 1, "an append");
+    assert_eq!(h.tick(&batch(&[row(4, 40)])).len(), 1, "an append");
     // The new row, and a retraction and an insert for each of the four behind it.
-    assert_eq!(h.tick(&batch(&[row(5, 5)])).count, 9, "a row in front");
+    assert_eq!(h.tick(&batch(&[row(5, 5)])).len(), 9, "a row in front");
     // A row of another group reads none of this one's.
     assert_eq!(
-        h.tick(&batch(&[((6, 8, Some(1), None, 0), 1)])).count,
+        h.tick(&batch(&[((6, 8, Some(1), None, 0), 1)])).len(),
         1,
         "another group"
     );

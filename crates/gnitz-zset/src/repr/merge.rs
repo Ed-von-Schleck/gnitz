@@ -133,10 +133,7 @@ fn merge_interleaved(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Bat
 /// it.
 #[inline(never)]
 fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
-    let mut rows: Vec<(u32, u32, i64)> = Vec::with_capacity(sources.iter().map(|s| s.count).sum());
-    run_merge(sources, schema, sources.iter().map(|s| 0..s.count), |src, row, w| {
-        rows.push((src as u32, row as u32, w))
-    });
+    let rows = run_merge(sources, schema, sources.iter().map(|s| 0..s.count));
     super::scatter::materialize_carrying(sources, schema, &rows)
 }
 
@@ -190,23 +187,47 @@ impl PosCursor {
 ///
 /// The PK axis is settled by each row's key under a [`MergeOrder`], and past it
 /// by [`merge_less`]; source `i` is walked over the `i`-th of `windows`.
-/// `emit(group_src, group_row, net_weight)` fires once per surviving (net ≠ 0)
-/// group, in (PK, payload) order.
+/// Returns `(group_src, group_row, net_weight)` per surviving (net ≠ 0) group,
+/// in (PK, payload) order.
 pub(crate) fn run_merge<S: ColumnarSource>(
     sources: &[S],
     schema: &SchemaDescriptor,
     windows: impl IntoIterator<Item = Range<usize>>,
-    emit: impl FnMut(usize, usize, i64),
-) {
+) -> Vec<(u32, u32, i64)> {
     if sources.is_empty() {
-        return;
+        return Vec::new();
     }
     let mut cursors: Vec<PosCursor> = windows.into_iter().map(PosCursor::over).collect();
     debug_assert_eq!(cursors.len(), sources.len(), "run_merge: one window per source");
+    debug_assert!(
+        schema.num_payload_cols() == 0 || !sources.iter().any(S::is_skeleton),
+        "a skeleton row merges under the PK-only schema: this order is never coarsened"
+    );
+    let mut rows = Vec::with_capacity(cursors.iter().map(|c| c.end - c.position).sum());
 
     // Dispatch the payload order, monomorphizing one branch-free copy of the
     // merge loop.
-    with_payload_cmp!(schema, |p| run_merge_body(sources, &mut cursors, schema, emit, p))
+    with_payload_cmp!(schema, |payload| {
+        let order = MergeOrder::past_shared_prefix(sources, &cursors, schema.pk_stride());
+        let mut tree = LoserTree::empty(cursors.len());
+        tree.rebuild(
+            |i| order.head(sources, i, &cursors[i]),
+            merge_less(schema, sources, order, payload),
+        );
+        drive(
+            &mut tree,
+            schema,
+            sources,
+            order,
+            &mut cursors,
+            payload,
+            |src, row, w| {
+                rows.push((src as u32, row as u32, w));
+                ControlFlow::Continue(())
+            },
+        );
+    });
+    rows
 }
 
 /// The order of two players whose keys under `order` tie, which [`drive`] and
@@ -316,7 +337,9 @@ impl MergeOrder {
         }
     }
 
-    /// Whether a PK has bytes behind the key span.
+    /// Whether a PK has bytes behind the key span. Derived per merge rather than
+    /// stored: a wider `MergeOrder`, copied into every comparator, costs the
+    /// merge loop more than this check does once.
     #[inline(always)]
     fn has_tail(self, stride: usize) -> bool {
         self.wide_at.is_some_and(|at| at + NARROW_PK_MAX_BYTES < stride)
@@ -408,35 +431,6 @@ pub(crate) fn drive<S, P>(
             return;
         }
     }
-}
-
-/// The tournament build for [`run_merge`]; the walk itself is [`drive`].
-/// Monomorphised per (source, payload) so the hot loop stays branch-free.
-#[inline]
-fn run_merge_body<S, P>(
-    sources: &[S],
-    cursors: &mut [PosCursor],
-    schema: &SchemaDescriptor,
-    mut emit: impl FnMut(usize, usize, i64),
-    payload: P,
-) where
-    S: ColumnarSource,
-    P: PayloadOrder,
-{
-    debug_assert!(
-        schema.num_payload_cols() == 0 || !sources.iter().any(S::is_skeleton),
-        "a skeleton row merges under the PK-only schema: this order is never coarsened"
-    );
-    let order = MergeOrder::past_shared_prefix(sources, cursors, schema.pk_stride());
-    let mut tree = LoserTree::build(
-        cursors.len(),
-        |i| order.head(sources, i, &cursors[i]),
-        merge_less(schema, sources, order, payload),
-    );
-    drive(&mut tree, schema, sources, order, cursors, payload, |src, row, w| {
-        emit(src, row, w);
-        ControlFlow::Continue(())
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -719,7 +713,7 @@ where
 /// Sort a single batch by (PK, payload) and consolidate: sum the weights of
 /// identical rows, drop ghosts. Appends one `(0, row, net weight)` survivor per
 /// group to `out` — [`run_merge`]'s single-source counterpart, in the shape
-/// [`super::scatter::scatter_unified_sources`] materializes and the caller sizes
+/// [`super::scatter::UnifiedSet::materialize`] copies out and the caller sizes
 /// its arena from.
 pub(crate) fn consolidate_groups(batch: &MemBatch, out: &mut Vec<(u32, u32, i64)>) {
     if batch.count == 0 {

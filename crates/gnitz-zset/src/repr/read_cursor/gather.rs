@@ -30,7 +30,7 @@ impl PkSetGather {
     }
 
     /// Start over on `keys` against the same snapshot.
-    pub(crate) fn reload(&mut self, keys: PkKeys) {
+    pub(super) fn reload(&mut self, keys: PkKeys) {
         self.keys = keys;
         self.next = 0;
         if let Some(first) = self.keys.iter().next() {

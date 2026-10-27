@@ -1,4 +1,4 @@
-use super::tls_pool::{recycle, take, MAX_POOLED};
+use super::{recycle, take, MAX_POOLED};
 use gnitz_foundation::perf::Counter;
 use std::cell::Cell;
 use std::collections::VecDeque;

@@ -42,21 +42,6 @@ impl Run {
             Run::Shard(s) => s.seek(key, hint),
         }
     }
-
-    /// Bulk-copy `[start, start + row_count)` into an owned batch under `schema`.
-    pub(crate) fn slice_to_owned_batch(&self, start: usize, row_count: usize, schema: &SchemaDescriptor) -> Batch {
-        match self {
-            Run::Mem(b) => {
-                let mut slice = Batch::from_ranges(b, &[(start, start + row_count)], 0);
-                slice.set_schema(schema);
-                slice
-            }
-            Run::Shard(s) => {
-                debug_assert!(*s.schema() == *schema, "a shard slices under the schema it is bound to");
-                s.slice_to_owned_batch(start, row_count)
-            }
-        }
-    }
 }
 
 /// One located row, pinned to the run that holds it. Keeps its backing alive via
@@ -74,7 +59,7 @@ impl StoredRow {
     }
 
     #[inline]
-    pub(crate) fn weight(&self) -> i64 {
+    fn weight(&self) -> i64 {
         self.run.get_weight(self.row)
     }
 

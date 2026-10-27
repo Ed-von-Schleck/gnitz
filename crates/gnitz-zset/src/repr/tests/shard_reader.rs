@@ -151,8 +151,8 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
     }
     for w in [0..n, mid] {
         let rows: Vec<(u32, u32, i64)> = w.clone().map(|r| (0, r as u32, want.get_weight(r))).collect();
-        let b = UnifiedSet::of(std::slice::from_ref(shard), schema, std::iter::once(w.clone()))
-            .materialize(&rows, rows.len());
+        let b =
+            UnifiedSet::of(std::slice::from_ref(shard), schema, std::iter::once(w.clone())).materialize(&rows, None);
         assert_eq!(
             rows_of(&b.as_mem_batch(), schema),
             want_rows[w.clone()],
@@ -823,7 +823,7 @@ fn a_point_read_decodes_one_block_and_keeps_its_address() {
     std::hint::black_box(shard.slice_to_owned_batch(100, n - 200));
     let rows: Vec<(u32, u32, i64)> = (0..n as u32).map(|r| (0, r, 1)).collect();
     let schema = make_schema_u64_i64();
-    std::hint::black_box(UnifiedSet::whole(std::slice::from_ref(&shard), &schema).materialize(&rows, rows.len()));
+    std::hint::black_box(UnifiedSet::whole(std::slice::from_ref(&shard), &schema).materialize(&rows, None));
     assert_eq!((shard.decoded_blocks(0), shard.decoded_key_blocks()), (0, 0));
 
     let cell = shard.get_col_ptr(row, 0, 8);

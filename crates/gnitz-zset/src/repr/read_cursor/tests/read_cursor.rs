@@ -1,5 +1,5 @@
 use super::*;
-use crate::repr::batch_pool::tls_pool::MAX_POOLED_BYTES;
+use crate::repr::batch_pool::MAX_POOLED_BYTES;
 use crate::repr::shard_file::ShardWriteOpts;
 use crate::repr::{Batch, BatchBuilder, MappedShard};
 use crate::schema::SchemaColumn;
@@ -138,7 +138,9 @@ proptest! {
             for n in [1, stride] {
                 let want = rows_where(&|p, w| p[..n] == k[..n] && w > 0);
                 let mut positive = Vec::new();
-                open().for_each_positive_with_prefix_until(&k[..n], |c| {
+                let mut c = open();
+                prop_assert_eq!(c.seek_positive_with_prefix(&k[..n]), !want.is_empty());
+                c.walk_positive_with_prefix_until(&k[..n], |c| {
                     positive.push(current(c));
                     ControlFlow::Continue(())
                 });
@@ -355,8 +357,9 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
         // Opened under the view schema, as every reader sees a skeleton shard.
         let sk_path = dir.path().join(format!("{name}_sk.db"));
         let sk_path = sk_path.to_str().unwrap();
-        let opts = ShardWriteOpts { skeleton: true, ..Default::default() };
-        sk.finish().write_as_shard(sk_path, opts).unwrap();
+        let sk = sk.finish();
+        sk.write_shard_over(&sk, sk_path, ShardWriteOpts::default(), true)
+            .unwrap();
         let sk = Rc::new(MappedShard::open(sk_path, &schema).unwrap());
         let mut bb = BatchBuilder::new(&schema);
         for (pk, w, v) in [(1u128, 5, None), (1, 7, Some(9)), (2, 4, Some(1)), (3, -2, None)] {

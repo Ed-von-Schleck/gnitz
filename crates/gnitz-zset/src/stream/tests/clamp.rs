@@ -44,7 +44,7 @@ proptest! {
             want.values_mut().for_each(|w| *w = clamped(kind, *w));
             want.retain(|_, w| *w != 0);
             prop_assert_eq!(zset_sum(&outs, &s), want);
-            prop_assert_eq!(zset_of(outs.last().unwrap(), &s).len(), outs.last().unwrap().count);
+            prop_assert_eq!(zset_of(outs.last().unwrap(), &s).len(), outs.last().unwrap().len());
         }
     }
 }

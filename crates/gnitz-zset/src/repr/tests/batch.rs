@@ -108,18 +108,6 @@ fn every_producer_states_its_claim() {
     }
 }
 
-/// A batch's arena is the schema's `arena_rows` of the capacity asked for, its
-/// regions laid out at that row count.
-#[test]
-fn a_batch_arena_is_laid_out_at_its_schemas_arena_rows() {
-    let schema = ragged_schema();
-    let b = Batch::with_capacity(&schema, 9);
-    assert_eq!(b.capacity, schema.arena_rows(9));
-    for r in 0..schema.num_regions() {
-        assert_eq!(b.region_start(r), schema.region_start(r, b.capacity), "region {r}");
-    }
-}
-
 /// Rows appended whole or three at a time under a layout whose regions move
 /// with the capacity read back whole, whether a growth copies onto a fresh
 /// buffer or shifts the regions within the one it has.

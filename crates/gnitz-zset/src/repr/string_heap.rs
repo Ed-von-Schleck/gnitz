@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 
 use super::batch::{range_rows, MemBatch};
-use super::batch_pool::{is_tight, tls_pool};
+use super::batch_pool::{self, is_tight};
 use super::codebook::Codebook;
 use gnitz_wire::TypeCode;
 use gnitz_wire::{Heap, HeapValue, RowSource};
@@ -208,7 +208,8 @@ fn relocate_cells(cells: &mut [[u8; 16]], src: Heap<'_>, dst_blob: &mut Vec<u8>,
     }
 }
 
-/// [`relocate_cells`] out of a coded heap.
+/// [`relocate_cells`] out of a coded heap. Out of line: inlined into
+/// `relocate_cells`, it changes how the plain arm's loop compiles.
 #[inline(never)]
 fn relocate_coded_cells(
     cells: &mut [[u8; 16]],
@@ -260,8 +261,7 @@ fn relocate_value(cell: &mut [u8; 16], src: Heap<'_>, dst_blob: &mut Vec<u8>, ca
 }
 
 /// Where `content`, a span of a plain source heap, sits in `dst_blob`:
-/// appended, or where `cache` already put it. Out of line so a short cell's
-/// relocation inlines without it.
+/// appended, or where `cache` already put it.
 fn place_span(content: &[u8], dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCache>) -> usize {
     let at = dst_blob.len();
     match cache {
@@ -333,7 +333,7 @@ impl BlobCache {
             // than its reserve, which would grow it.
             let reserve = cells.min(BLOB_CACHE_RESERVE_CAP);
             let fits = |m: &SpanMap| m.capacity() >= reserve && is_tight(m.capacity(), cells.max(4));
-            let mut map = tls_pool::take(&BLOB_CACHE_POOL, fits).unwrap_or_default();
+            let mut map = batch_pool::take(&BLOB_CACHE_POOL, fits).unwrap_or_default();
             map.reserve(reserve);
             map
         })
@@ -345,7 +345,7 @@ impl Drop for BlobCache {
         if let Some(mut map) = self.map.take() {
             let bytes = map.capacity() * std::mem::size_of::<(SpanKey, usize)>();
             map.clear();
-            tls_pool::recycle(&BLOB_CACHE_POOL, map, bytes);
+            batch_pool::recycle(&BLOB_CACHE_POOL, map, bytes);
         }
     }
 }

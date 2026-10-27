@@ -31,7 +31,7 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
 
     debug_assert!(plan.is_exact_linear() || delta.is_consolidated());
 
-    if delta.count == 0 {
+    if delta.is_empty() {
         return Batch::empty_with_schema(output_schema);
     }
 
@@ -42,7 +42,7 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
     let aggs = &shape.aggs;
 
     let groups = match shape.key.runs(delta) {
-        Some(ranges) if ranges.len() == 1 || 2 * ranges.len() <= delta.count => {
+        Some(ranges) if ranges.len() == 1 || 2 * ranges.len() <= delta.len() => {
             // An extreme recedes only on a retraction, so an all-insert group's
             // extremes are its rows' and its stored row's: no probe.
             let probes: Vec<bool> = match indexed {
@@ -86,7 +86,7 @@ pub fn op_reduce(delta: &Batch, trace_out: OpenAt<'_>, history: Option<OpenAt<'_
 
     let mut vals = AggValues::new(aggs, groups.len());
     for k in 0..aggs.len() {
-        vals.fold(k, &mb, &[(0, delta.count)], &groups.ord[..]);
+        vals.fold(k, &mb, &[(0, delta.len())], &groups.ord[..]);
     }
     // Per group, whether its extremes come off the index. Every row is stepped
     // whatever its group then reads, so only a retraction sends one there.
@@ -190,7 +190,7 @@ impl<'a> GroupEmit<'a> {
             "op_reduce: in={} groups={} out={}",
             self.delta.count,
             self.groups,
-            self.out.count
+            self.out.len()
         );
         self.out.certify_consolidated();
         self.out
@@ -203,7 +203,7 @@ fn consolidate_group(out: &mut Batch, mark: RowMark) {
     if out.rows_since(mark) != 2 {
         return;
     }
-    let row0 = out.count - 2;
+    let row0 = out.len() - 2;
     let omb = out.as_mem_batch();
     match Generic.compare(out.schema(), &omb, row0, &omb, row0 + 1) {
         Ordering::Equal => out.truncate_to(mark),

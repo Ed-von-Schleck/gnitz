@@ -70,7 +70,7 @@ fn probe(counter: &Counter, plan: &JoinPlan, delta: &Batch, trace: &Batch, runs:
     // The first pass takes the pool's first allocations.
     let [_, (out, instructions)] =
         [(); 2].map(|()| counter.measure(|| op_join_delta_trace(delta, &mut |f, l| trace.cursor_within(f, l), plan)));
-    (instructions, out.count)
+    (instructions, out.len())
 }
 
 /// The equi join, in instructions per delta row, over a trace that is its
@@ -118,8 +118,8 @@ fn join_equi_bench() {
                     "join_equi_bench {name:<24} {:<8} runs={runs} out {out:>5}: {:>8.1} stored, {:>8.1} over source \
                      instr/delta-row",
                     format!("{p:?}"),
-                    stored_instr as f64 / delta.count as f64,
-                    over_instr as f64 / delta.count as f64,
+                    stored_instr as f64 / delta.len() as f64,
+                    over_instr as f64 / delta.len() as f64,
                 );
             }
         }
@@ -201,7 +201,7 @@ fn join_range_bench() {
                 println!(
                     "join_range_bench {name:<34} {rel:?} runs={runs} out {out:>7}: {:>9.1} instr/delta-row, \
                      {:>6.1} instr/out-row",
-                    instructions as f64 / delta.count as f64,
+                    instructions as f64 / delta.len() as f64,
                     instructions as f64 / out as f64
                 );
             }

@@ -109,20 +109,14 @@ pub(crate) unsafe fn seek_pk_rows(count: usize, width: usize, pk: ColPtr, key: &
     })
 }
 
-/// First row index past the equal-PK group beginning at `start`, in a PK-sorted
-/// source. Requires `start < src.row_count()`. A linear step, not a seek: every
-/// caller reaches it having just landed on the group's first row, where the
-/// group is short and a gallop would cost more.
+/// First row index past the group beginning at `start` whose rows share row
+/// `start`'s leading `width` key bytes, in a PK-sorted source; `width` is the PK
+/// stride for the whole key. Requires `start < src.row_count()` and `width` no
+/// wider than the PK. A linear step, not a seek: every caller reaches it having
+/// just landed on the group's first row, and either the group is short or the
+/// caller walks all of it anyway.
 #[inline]
-pub(crate) fn pk_group_end<S: RowSource>(src: &S, start: usize) -> usize {
-    pk_prefix_group_end(src, start, src.get_pk_bytes(start).len())
-}
-
-/// [`pk_group_end`] over a leading `width`-byte key prefix rather than the whole
-/// key. Linear as well: a prefix group can be long, but every caller walks the
-/// whole group anyway.
-#[inline]
-pub(crate) fn pk_prefix_group_end<S: RowSource>(src: &S, start: usize, width: usize) -> usize {
+pub(crate) fn pk_group_end<S: RowSource>(src: &S, start: usize, width: usize) -> usize {
     let k = &src.get_pk_bytes(start)[..width];
     let count = src.row_count();
     let mut j = start + 1;

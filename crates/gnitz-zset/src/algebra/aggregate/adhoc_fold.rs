@@ -47,7 +47,7 @@ impl AdhocFold {
             groups.push_key_row(ground_pk().bytes(), 1);
         }
         Ok(AdhocFold {
-            vals: AggValues::new(&shape.aggs, groups.count),
+            vals: AggValues::new(&shape.aggs, groups.len()),
             groups,
             shape,
             numbers: GroupNumbers::default(),
@@ -83,7 +83,7 @@ impl AdhocFold {
             ranges,
         };
         self.shape.key.with_identity(&mb, ranges, assign)?;
-        self.vals.resize(self.groups.count);
+        self.vals.resize(self.groups.len());
         for k in 0..self.shape.aggs.len() {
             self.vals.fold(k, &mb, ranges, &self.ord[..]);
         }
@@ -93,9 +93,9 @@ impl AdhocFold {
     /// One partial row per present group (weight +1), in group-discovery order.
     pub(crate) fn finish(self) -> Batch {
         let carried = self.groups.schema().payload_locators();
-        let mut output = Batch::with_capacity(&self.shape.output_schema, self.groups.count);
+        let mut output = Batch::with_capacity(&self.shape.output_schema, self.groups.len());
         let groups_mb = self.groups.as_mem_batch();
-        for g in 0..self.groups.count {
+        for g in 0..self.groups.len() {
             let group = Some((&groups_mb, g, &carried[..]));
             self.vals.emit_row(&mut output, group, groups_mb.get_pk_bytes(g), g);
         }
@@ -134,7 +134,7 @@ impl IdentityLoop for AssignGroups<'_> {
                 "adhoc fold: scan cursor must deliver positive weights"
             );
             let g = numbers.ordinal(identity(row), || {
-                let g = groups.count;
+                let g = groups.len();
                 if g >= group_cap {
                     return Err(format!(
                         "GROUP BY exceeds {group_cap} distinct groups for ad-hoc execution; \

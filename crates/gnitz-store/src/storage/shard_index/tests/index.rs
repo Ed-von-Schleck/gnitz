@@ -1761,7 +1761,7 @@ fn tier_folds_keep_the_zset() {
             let mut per_key: BTreeMap<u64, i64> = BTreeMap::new();
             idx.verify_shards().unwrap();
             let mut starts = vec![0; shards.len()];
-            if let Some((_, run)) = merge_guard(&shards, &[gk(0)], 0, &mut starts, false, &schema, None) {
+            if let Some(run) = merge_guard(&shards, &mut starts, None, false, &schema, None) {
                 let batch = run.plain().unwrap();
                 for row in 0..batch.len() {
                     let k = u64::from_be_bytes(batch.get_pk_bytes(row).try_into().unwrap());

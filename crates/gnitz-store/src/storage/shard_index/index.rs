@@ -358,9 +358,8 @@ impl ShardIndex {
         let codebook = self.codebook.clone();
         let merged = merge_guard(
             &run.shards,
-            &run.fold.keys,
-            run.next,
             &mut run.starts,
+            run.fold.keys.get(run.next + 1).map(PkBuf::pk_bytes),
             dehydrate,
             &self.schema,
             codebook.as_deref(),
@@ -372,18 +371,11 @@ impl ShardIndex {
             .fold((0, 0), |(r, b), s| (r + s.row_count(), b + s.file_len()));
         let merged_rows = (run.starts.iter().sum::<usize>() - before) as u128;
         *read += (u128::from(bytes) * merged_rows / rows.max(1) as u128) as u64 + 1;
-        if let Some((skeleton, merged)) = merged {
+        if let Some(merged) = merged {
             // A store that has coded no heap yet codes the run under one of its own.
-            let fresh = merged.plain().filter(|_| !skeleton).and_then(|b| self.codebook_for(b));
+            let fresh = merged.plain().and_then(|b| self.codebook_for(b));
             let written = self.write_with(Some(run.newest), |path, opts| {
-                merged.write_as_shard(
-                    path,
-                    ShardWriteOpts {
-                        skeleton,
-                        codebook: fresh.as_deref(),
-                        ..opts
-                    },
-                )
+                merged.write_as_shard(path, ShardWriteOpts { codebook: fresh.as_deref(), ..opts })
             });
             match written {
                 Ok(entry) => run.opened.push((run.fold.keys[run.next], entry)),

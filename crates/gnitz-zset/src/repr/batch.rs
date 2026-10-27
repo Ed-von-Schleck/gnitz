@@ -90,9 +90,10 @@ pub struct Batch {
     /// Rows the arena has room for: region `r` starts at
     /// `schema.region_start(r, capacity)`.
     capacity: usize,
-    /// Live row count; [`Batch::len`] outside the crate. Not `pub`: a counted
-    /// row whose regions were not all written reads uninitialised arena bytes.
-    pub(crate) count: usize,
+    /// Live row count; read through [`Batch::len`] outside `repr`. Not wider: a
+    /// counted row whose regions were not all written reads uninitialised arena
+    /// bytes.
+    pub(in crate::repr) count: usize,
     /// The rows are strictly (PK, payload)-increasing and ghost-free. Cleared by
     /// every row swap and every append, and kept by
     /// [`Self::map_weights`]; raised by [`Self::certify_consolidated`], by
@@ -143,7 +144,7 @@ impl Batch {
     /// [`Self::with_capacity`] with the blob heap pre-sized. For the callers that
     /// know the byte count up front; `with_capacity` leaves it empty because most
     /// writers do not.
-    pub(crate) fn with_capacity_blob(schema: &SchemaDescriptor, rows: usize, blob_bytes: usize) -> Self {
+    fn with_capacity_blob(schema: &SchemaDescriptor, rows: usize, blob_bytes: usize) -> Self {
         let mut b = Self::with_capacity(schema, rows);
         b.reserve_blob(blob_bytes);
         b
@@ -281,12 +282,6 @@ impl Batch {
     pub fn col_data(&self, pi: usize) -> &[u8] {
         self.region(REG_PAYLOAD_START + pi)
     }
-    /// `#[inline(always)]`: two byte loads off the embedded descriptor, on the
-    /// per-row appenders' loop bound.
-    #[inline(always)]
-    pub fn num_payload_cols(&self) -> usize {
-        self.schema.num_payload_cols()
-    }
 
     // ── Row accessors ───────────────────────────────────────────────────
 
@@ -373,7 +368,7 @@ impl Batch {
     /// The most string cells `rows` rows of this batch's schema hold: what a
     /// span-dedup session over them is sized by.
     #[inline]
-    pub(crate) fn string_cells(&self, rows: usize) -> usize {
+    pub(super) fn string_cells(&self, rows: usize) -> usize {
         rows * self.schema.string_payload_slots().count_ones() as usize
     }
 
@@ -383,7 +378,7 @@ impl Batch {
     /// `#[inline]` for the already-has-room test, which is the whole call on
     /// every append but the growing one.
     #[inline]
-    pub(crate) fn reserve_rows(&mut self, n: usize) {
+    fn reserve_rows(&mut self, n: usize) {
         if self.count + n <= self.capacity {
             return;
         }
@@ -498,7 +493,7 @@ impl Batch {
     #[inline]
     pub fn push_key_row(&mut self, pk: &[u8], weight: i64) {
         debug_assert_eq!(
-            self.num_payload_cols(),
+            self.schema.num_payload_cols(),
             0,
             "push_key_row is the payload-free schema; use BatchBuilder",
         );
@@ -526,7 +521,7 @@ pub(crate) struct AppendSession<'d> {
 impl AppendSession<'_> {
     /// [`Batch::carry_heap`] into the session's destination: the `heap_at` to
     /// push `src`'s rows at.
-    pub(crate) fn carry(&mut self, src: &MemBatch<'_>, kept: &[(usize, usize)]) -> Option<usize> {
+    pub(super) fn carry(&mut self, src: &MemBatch<'_>, kept: &[(usize, usize)]) -> Option<usize> {
         let slots = self.dst.schema.string_payload_slots();
         self.dst.carry_heap(src, slots, kept)
     }
@@ -566,7 +561,7 @@ impl AppendSession<'_> {
     /// [`Self::write`] for a `fill` that writes only the first of the `rows` it
     /// has room for, and answers how many ahead of its own result.
     #[inline(always)]
-    pub(crate) fn write_at_most<R>(
+    pub(super) fn write_at_most<R>(
         &mut self,
         rows: usize,
         fill: impl FnOnce(&mut DirectWriter<'_>) -> (usize, R),
@@ -624,7 +619,7 @@ impl Batch {
     #[inline]
     pub fn certify_consolidated(&mut self) {
         self.debug_verify_null_bits();
-        self.debug_verify_consolidated();
+        self.debug_verify_consolidated(self);
         self.consolidated = true;
     }
 
@@ -677,10 +672,10 @@ impl Batch {
     /// (PK, payload) order, distinctness and weights, which a debug build
     /// verifies.
     #[inline]
-    pub(crate) fn inherit_consolidated(&mut self, src: &Batch) {
+    fn inherit_consolidated(&mut self, src: &Batch) {
         self.consolidated = src.consolidated;
         if self.consolidated {
-            self.debug_verify_consolidated();
+            self.debug_verify_consolidated(self);
         }
     }
 
@@ -700,14 +695,9 @@ impl Batch {
 
     /// Debug-only: assert the data is fully consolidated — strictly increasing by
     /// (PK, payload) (no unfolded duplicate) AND no zero-weight row (ghost
-    /// eliminated, §2).
-    pub(crate) fn debug_verify_consolidated(&self) {
-        self.debug_verify_consolidated_over(self);
-    }
-
-    /// [`debug_verify_consolidated`](Self::debug_verify_consolidated) of this
-    /// batch's rows as `rows` reads them, over a heap other than its own.
-    pub(crate) fn debug_verify_consolidated_over(&self, rows: &impl RowSource) {
+    /// eliminated, §2). The weights are this batch's; the rows are compared as
+    /// `rows` reads them, which is the batch itself or its rows over another heap.
+    pub(super) fn debug_verify_consolidated(&self, rows: &impl RowSource) {
         if !cfg!(debug_assertions) {
             return;
         }
@@ -904,7 +894,7 @@ impl Batch {
                 break;
             }
             if compare_pk_ordering(self.get_pk_bytes(lo), key).is_eq() {
-                from = super::seek::pk_group_end(self, lo);
+                from = super::seek::pk_group_end(self, lo, self.schema.pk_stride());
                 match out.last_mut() {
                     Some(last) if last.1 == lo => last.1 = from,
                     _ => out.push((lo, from)),
@@ -1071,7 +1061,7 @@ impl Batch {
 
     /// Append `source[row]` at `weight`; a `blob_cache` dedups repeated long-string
     /// spans.
-    pub(crate) fn append_row_from_source<S: RowSource>(
+    pub(super) fn append_row_from_source<S: RowSource>(
         &mut self,
         weight: i64,
         source: &S,
@@ -1370,11 +1360,11 @@ impl ColPtr {
 /// block's fixed bytes, which are an arena exactly as large as its rows.
 #[derive(Clone)]
 pub struct MemBatch<'a> {
-    pub(crate) data: &'a [u8],
+    pub(in crate::repr) data: &'a [u8],
     /// The layout: region `r` starts at `schema.region_start(r, cap)`.
-    pub(crate) schema: &'a SchemaDescriptor,
-    pub(crate) cap: usize,
-    pub(crate) blob: &'a [u8],
+    pub(in crate::repr) schema: &'a SchemaDescriptor,
+    pub(in crate::repr) cap: usize,
+    pub(in crate::repr) blob: &'a [u8],
     /// Row count of the view. Read from outside through [`MemBatch::len`].
     pub(crate) count: usize,
     /// An upper bound on the bytes of `blob` no cell references.
@@ -1400,13 +1390,13 @@ impl<'a> MemBatch<'a> {
 
     /// Where region `r` starts in the arena.
     #[inline(always)]
-    pub(crate) fn region_start(&self, r: usize) -> usize {
+    pub(super) fn region_start(&self, r: usize) -> usize {
         self.schema.region_start(r, self.cap)
     }
 
     /// The `count` rows of region `r`.
     #[inline(always)]
-    pub(crate) fn region(&self, r: usize) -> &'a [u8] {
+    pub(super) fn region(&self, r: usize) -> &'a [u8] {
         let off = self.region_start(r);
         &self.data[off..off + self.count * self.schema.region_stride(r)]
     }

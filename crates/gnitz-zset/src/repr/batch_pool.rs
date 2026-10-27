@@ -1,49 +1,43 @@
-//! Thread-local object pools: `tls_pool`'s take and recycle, and the `Vec<u8>`
-//! pool built on them. Each thread has its own pools; nothing is shared or
-//! locked.
+//! Thread-local object pools: take and recycle for a pool of `T`, and the
+//! `Vec<u8>` pool built on them. Each thread has its own pools; nothing is
+//! shared or locked.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::thread::LocalKey;
 
-/// Take and recycle for a thread-local pool of `T`.
-pub(crate) mod tls_pool {
-    use std::cell::Cell;
-    use std::collections::VecDeque;
-    use std::thread::LocalKey;
+/// Items retained per pool.
+pub(super) const MAX_POOLED: usize = 64;
+/// The largest item a pool retains, in bytes.
+pub(super) const MAX_POOLED_BYTES: usize = 2 * 1024 * 1024;
 
-    /// Items retained per pool.
-    pub(crate) const MAX_POOLED: usize = 64;
-    /// The largest item a pool retains, in bytes.
-    pub(crate) const MAX_POOLED_BYTES: usize = 2 * 1024 * 1024;
+/// The most recently returned item `fits` accepts. `None` when there is none,
+/// or the thread-local is being torn down.
+pub(super) fn take<T>(pool: &'static LocalKey<Cell<VecDeque<T>>>, fits: impl Fn(&T) -> bool) -> Option<T> {
+    pool.try_with(|p| {
+        let mut items = p.take();
+        let item = items.iter().rposition(fits).and_then(|i| items.remove(i));
+        p.set(items);
+        item
+    })
+    .ok()
+    .flatten()
+}
 
-    /// The most recently returned item `fits` accepts. `None` when there is none,
-    /// or the thread-local is being torn down.
-    pub(crate) fn take<T>(pool: &'static LocalKey<Cell<VecDeque<T>>>, fits: impl Fn(&T) -> bool) -> Option<T> {
-        pool.try_with(|p| {
-            let mut items = p.take();
-            let item = items.iter().rposition(fits).and_then(|i| items.remove(i));
-            p.set(items);
-            item
-        })
-        .ok()
-        .flatten()
+/// Return `item`, which holds `bytes` of heap. Dropped when that is zero or
+/// above `MAX_POOLED_BYTES`; a full pool drops its oldest item instead.
+pub(super) fn recycle<T>(pool: &'static LocalKey<Cell<VecDeque<T>>>, item: T, bytes: usize) {
+    if bytes == 0 || bytes > MAX_POOLED_BYTES {
+        return;
     }
-
-    /// Return `item`, which holds `bytes` of heap. Dropped when that is zero or
-    /// above `MAX_POOLED_BYTES`; a full pool drops its oldest item instead.
-    pub(crate) fn recycle<T>(pool: &'static LocalKey<Cell<VecDeque<T>>>, item: T, bytes: usize) {
-        if bytes == 0 || bytes > MAX_POOLED_BYTES {
-            return;
+    let _ = pool.try_with(|p| {
+        let mut items = p.take();
+        if items.len() == MAX_POOLED {
+            items.pop_front();
         }
-        let _ = pool.try_with(|p| {
-            let mut items = p.take();
-            if items.len() == MAX_POOLED {
-                items.pop_front();
-            }
-            items.push_back(item);
-            p.set(items);
-        });
-    }
+        items.push_back(item);
+        p.set(items);
+    });
 }
 
 thread_local! {
@@ -67,7 +61,7 @@ impl PooledBuf {
             return PooledBuf(Vec::new());
         }
         PooledBuf(
-            tls_pool::take(&BUF_POOL, |b| b.capacity() >= size && is_tight(b.capacity(), size))
+            take(&BUF_POOL, |b| b.capacity() >= size && is_tight(b.capacity(), size))
                 .unwrap_or_else(|| Vec::with_capacity(size)),
         )
     }
@@ -103,7 +97,7 @@ impl Drop for PooledBuf {
         let mut buf = std::mem::take(&mut self.0);
         buf.clear();
         let cap = buf.capacity();
-        tls_pool::recycle(&BUF_POOL, buf, cap);
+        recycle(&BUF_POOL, buf, cap);
     }
 }
 

@@ -22,7 +22,7 @@ impl Store {
     }
 
     /// Publish a new schema for this store, down into a held `Table`, which
-    /// rebinds its shards if the region count grew.
+    /// rebinds its shards to it if it changed.
     pub(super) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
         match self {
             Store::Held(t) => t.swap_schema(schema),

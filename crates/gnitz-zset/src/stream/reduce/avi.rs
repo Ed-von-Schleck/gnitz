@@ -18,7 +18,6 @@ use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
 use gnitz_wire::{payload_bytes, TypeCode, MAX_PK_BYTES};
 use std::borrow::Cow;
-use std::ops::ControlFlow;
 
 // ---------------------------------------------------------------------------
 // Key layout
@@ -108,7 +107,7 @@ impl AviBake {
         for (j, a) in self.aggs.iter().enumerate() {
             let k = a.agg_idx as usize;
             let prefix_len = self.prefix(&mut key, j as u8).len();
-            if !cur.for_each_positive_with_prefix_until(&key[..prefix_len], |_| ControlFlow::Break(())) {
+            if !cur.seek_positive_with_prefix(&key[..prefix_len]) {
                 vals.clear_extreme(k, g);
                 continue;
             }
@@ -133,7 +132,7 @@ pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
     // Consolidated, so no row is a ghost.
     debug_assert!(delta.is_consolidated());
     let mb = delta.as_mem_batch();
-    let n = delta.count;
+    let n = delta.len();
     let stride = bake.key_packer.out_stride;
     let width = bake.schema.pk_stride();
     let value = stride + ORDINAL_BYTES..width;
