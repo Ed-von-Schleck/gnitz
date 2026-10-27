@@ -1,10 +1,11 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, TypeCode};
+use crate::schema::SchemaColumn;
 use crate::test_support::{
     make_batch_raw, make_schema_u64_i64, make_string_batch, mix, pk_payload_schema, string_batch, u64_pk_schema,
 };
 use gnitz_foundation::perf::Counter;
+use gnitz_wire::TypeCode;
 use std::hint::black_box;
 
 /// `into_consolidated` over a batch with no claim, by the order its rows stand

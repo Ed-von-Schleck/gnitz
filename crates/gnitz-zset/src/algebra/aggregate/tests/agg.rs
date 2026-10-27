@@ -1,9 +1,9 @@
 use super::*;
 use crate::algebra::aggregate::ReduceShape;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{le_cell, pk_payload_schema, Rng};
-use gnitz_wire::AggDescriptor;
+use gnitz_wire::{AggDescriptor, TypeCode};
 
 const N: usize = 97;
 const INTS: [TypeCode; 8] = [

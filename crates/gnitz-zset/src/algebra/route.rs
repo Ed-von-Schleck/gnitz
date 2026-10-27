@@ -102,9 +102,7 @@ impl Placement {
         // OPK order is byte order: the band keeps `start`'s distribution prefix iff
         // it ends at or below the first key above that prefix group, and a group
         // with no key above it reaches the top of the key space.
-        let confined = key::KeyCut::above(prefix)
-            .key(start.len())
-            .is_none_or(|above| end.is_some_and(|e| e <= above));
+        let confined = key::key_above(prefix, start.len()).is_none_or(|above| end.is_some_and(|e| e <= above));
         confined.then(|| worker_for_pk_bytes(prefix, num_workers))
     }
 

@@ -9,7 +9,8 @@ use super::batch_pool::PooledBuf;
 use super::scatter::{copy_ranges, scatter_copy};
 use super::string_heap::{blob_span_key, prorated_blob_cap, walk_heap_spans, BlobCache};
 use super::writer::DirectWriter;
-use crate::schema::{ColumnLocator, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
+use gnitz_expr::ColumnLocator;
 use gnitz_wire::wal;
 use gnitz_wire::{Regions, TypeCode};
 

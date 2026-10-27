@@ -1,7 +1,8 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, TypeCode};
+use crate::schema::SchemaColumn;
 use crate::test_support::{mix, pk_payload_schema, u64_pk_schema};
+use gnitz_wire::TypeCode;
 
 /// Instructions per [`GroupOutKey::numbered`] call and per row, per key form,
 /// over unconsolidated rows: a two-row delta of two groups — an UPDATE's

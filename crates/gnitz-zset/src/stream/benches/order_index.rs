@@ -2,10 +2,10 @@ use super::tests::Harness;
 use super::OrderIndex;
 use super::OrderedPlan;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::mix;
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::OrderKey;
+use gnitz_wire::{OrderKey, TypeCode};
 
 const N: u64 = 1 << 16;
 

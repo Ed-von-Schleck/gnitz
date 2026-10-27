@@ -5,12 +5,12 @@
 //! the PK, weight and column moves around the computed columns
 //! `gnitz_expr::MapEval` writes.
 
-use gnitz_expr::{ColCopy, LogicalProgram, MapEval};
+use gnitz_expr::{ColCopy, ColumnLocator, LogicalProgram, MapEval};
 
 use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
 use crate::repr::{copy_runs, Batch, DirectWriter};
-use crate::schema::{project_schema, ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
-use gnitz_wire::{int_cell, zip_cells, FixedInt};
+use crate::schema::{project_schema, DerivedSchema, SchemaColumn, SchemaDescriptor};
+use gnitz_wire::{int_cell, zip_cells, FixedInt, TypeCode};
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
 /// `[dst, dst + n)`: one value rather than three positional `usize`s a

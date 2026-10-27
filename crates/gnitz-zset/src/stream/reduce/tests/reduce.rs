@@ -9,9 +9,9 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{arb_ticks, assert_folds, cell, delta_to, le_cell, TestTrace, FLOATS, STRS};
-use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, ReadSink, ReduceOutKey, SinkKind};
+use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, ReadSink, ReduceOutKey, SinkKind, TypeCode};
 
 use super::op_reduce::op_reduce;
 use super::plan::ReducePlan;

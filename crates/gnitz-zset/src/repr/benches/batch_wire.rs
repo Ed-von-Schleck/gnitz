@@ -1,8 +1,9 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, TypeCode};
+use crate::schema::SchemaColumn;
 use crate::test_support::{encode_to_wire_vec, pk_u64_two_i64_schema, string_batch, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
+use gnitz_wire::TypeCode;
 use std::hint::black_box;
 
 /// Instructions to frame, and to decode in place, 1-row and 100-row blocks of a

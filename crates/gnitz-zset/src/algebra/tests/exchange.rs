@@ -2,9 +2,9 @@ use super::*;
 use crate::algebra::group_key::GroupOutKey;
 use crate::algebra::{ground_owner, MapPlan, Placement};
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, TypeCode};
+use crate::schema::SchemaColumn;
 use crate::test_support::{pk_payload_schema, self_typed_slots, u64_pk_schema, weighted_rows};
-use gnitz_wire::{MapKind, NullKeys, ReindexRole};
+use gnitz_wire::{MapKind, NullKeys, ReindexRole, TypeCode};
 
 /// PK `(U32, I32, U64, U64)` — 24 bytes, so the whole PK routes by the wide
 /// hash and every proper prefix by its narrow image — over

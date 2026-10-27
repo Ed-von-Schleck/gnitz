@@ -1,11 +1,11 @@
 use super::*;
 use crate::repr::{merge_consolidated, BatchBuilder};
-use crate::schema::{SchemaDescriptor, TypeCode};
+use crate::schema::SchemaDescriptor;
 use crate::test_support::{
     make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch, map_shard, read_strings,
     string_batch,
 };
-use gnitz_wire::Heap;
+use gnitz_wire::{Heap, TypeCode};
 
 /// Any change to the written bytes, the writer's own or a dependency's, needs a
 /// `SHARD_EPOCH` bump.

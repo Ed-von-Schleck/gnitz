@@ -1,7 +1,7 @@
 //! The window's plan: everything `op_window` needs that is a pure function of
 //! compile-time facts, baked once at emit time.
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
-use gnitz_wire::{AggDescriptor, AggFunc, OrderKey};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_wire::{AggDescriptor, AggFunc, OrderKey, TypeCode};
 
 use std::rc::Rc;
 

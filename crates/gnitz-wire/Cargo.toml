@@ -17,5 +17,9 @@ field-map = []
 [dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+[dev-dependencies]
+# The benches' instruction and cycle counters.
+gnitz-foundation = { path = "../gnitz-foundation" }
+
 [lints]
 workspace = true

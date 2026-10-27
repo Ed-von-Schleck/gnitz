@@ -6,13 +6,13 @@ use super::super::scatter::UnifiedSet;
 use super::super::shard_file::ShardWriteOpts;
 use super::*;
 use crate::repr::error::StorageError;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     make_batch, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, mix, payload0_i64,
     pk_only_schema, prose, sweep_bit_flips, u64_pk_schema,
 };
-use gnitz_wire::num_regions;
 use gnitz_wire::write_u64_le;
+use gnitz_wire::{num_regions, TypeCode};
 
 /// Write `batch` through the production writer to `dir/name`, its heap coded
 /// under a codebook trained on it where that pays.

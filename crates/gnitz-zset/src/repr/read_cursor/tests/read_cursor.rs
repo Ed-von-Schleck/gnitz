@@ -2,13 +2,13 @@ use super::*;
 use crate::repr::batch_pool::tls_pool::MAX_POOLED_BYTES;
 use crate::repr::shard_file::ShardWriteOpts;
 use crate::repr::{Batch, BatchBuilder, MappedShard};
-use crate::schema::{SchemaColumn, TypeCode};
+use crate::schema::SchemaColumn;
 use crate::test_support::{
     arb_fold_case, assert_folds, create_read_cursor, fold_batch, make_batch_u128, make_schema_pk_u64_payload_string,
     make_schema_u128_i64, make_schema_u64_i64, map_shard, payload0_i64, row_key, u64_pk_schema, weighted_rows, zset_of,
     RowKey,
 };
-use gnitz_wire::PkKeys;
+use gnitz_wire::{PkKeys, TypeCode};
 use proptest::prelude::*;
 use std::ops::ControlFlow;
 use std::rc::Rc;

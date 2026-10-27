@@ -1,12 +1,13 @@
 use super::super::batch_pool::drain_pool;
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     make_batch, make_batch_bytes, make_batch_raw, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string,
     make_schema_u64_i64, make_string_batch, payload0_i64, pk_only_schema, ragged_batch, ragged_schema, read_strings,
     u64_pk_schema, weighted_rows,
 };
+use gnitz_wire::TypeCode;
 
 /// `append_row_from_source` copies the PK verbatim and carries the
 /// caller's weight, not the source row's; a zero weight appends nothing.

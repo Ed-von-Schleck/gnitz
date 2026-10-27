@@ -1,8 +1,8 @@
 use super::*;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, TypeCode};
+use crate::schema::SchemaColumn;
 use crate::test_support::{edge_native, opk_pk, random_schema, row_key, Rng, FLOATS, STRS};
-use gnitz_wire::{key_image, ScalarKind};
+use gnitz_wire::{key_image, ScalarKind, TypeCode};
 
 /// A payload cell by its type's order: an integer by its key image, a float by
 /// its `total_cmp` image, a string by its bytes. One column always yields one
@@ -62,9 +62,8 @@ fn random_row(rng: &mut Rng, s: &SchemaDescriptor) -> (Batch, Model) {
 
 /// Over random schemas — any payload types and nullability, the PK anywhere and
 /// in any order — the (PK, payload) order is the PK bytes, then each payload
-/// cell by its type's order; `Equal` is exactly row identity; a schema selects
-/// the fast comparator exactly when its payload is non-null fixed-width
-/// integers, and the one it selects orders as the generic one.
+/// cell by its type's order; `Equal` is exactly row identity; and the fast
+/// comparator, which every other schema selects, orders as the generic one.
 #[test]
 fn row_order_is_the_pk_bytes_then_each_typed_payload_cell() {
     let fixed_ints: Vec<TypeCode> = TypeCode::ALL.iter().copied().filter(|t| t.is_fixed_int()).collect();
@@ -75,17 +74,12 @@ fn row_order_is_the_pk_bytes_then_each_typed_payload_cell() {
             0 => random_schema(&mut rng, TypeCode::ALL, true),
             _ => random_schema(&mut rng, &fixed_ints, false),
         };
-        assert_eq!(
-            s.payload_is_fixed_int_nonnull(),
-            s.payload_columns()
-                .all(|(_, c)| !c.nullable && c.type_code.is_fixed_int()),
-            "{s:?}"
-        );
+        assert!(i % 2 == 0 || s.payload_is_fixed_int_nonnull(), "{s:?}");
         let (a, ma) = random_row(&mut rng, &s);
         let (b, mb) = random_row(&mut rng, &s);
-        let payload = compare_rows(&s, &a, 0, &b, 0);
+        let payload = Generic.compare(&s, &a, 0, &b, 0);
         assert_eq!(payload, ma.1.cmp(&mb.1), "{s:?}: {ma:?} vs {mb:?}");
-        let full = compare_full_rows(&s, &a, 0, &b, 0);
+        let full = Generic.compare_full(&s, &a, 0, &b, 0);
         assert_eq!(full, ma.cmp(&mb), "{s:?}: {ma:?} vs {mb:?}");
         assert_eq!(
             with_payload_cmp!(s, |p| p.compare(&s, &a, 0, &b, 0)),

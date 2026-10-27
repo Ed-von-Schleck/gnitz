@@ -3,8 +3,9 @@
 
 use super::{scalar_native_of_image, wide_native, wide_native_of_image, ImageCol, ImageKind};
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{le_cell, STRS};
+use gnitz_wire::TypeCode;
 
 /// Over a PK and a payload column of every image kind: a row's image decodes
 /// back to its value, a wide one orders as the value does, and `invert`

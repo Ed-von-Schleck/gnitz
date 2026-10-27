@@ -1,9 +1,9 @@
 use gnitz_expr::{ConstIdx, IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
-use gnitz_wire::{MapKind, NullKeys, ReindexRole};
+use gnitz_wire::{MapKind, NullKeys, ReindexRole, TypeCode, MAX_PK_COLUMNS};
 
 use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_COLUMNS};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     make_batch, make_int_batch, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk, pk_payload_schema, rekey_plan,
     u64_pk_schema, weighted_rows,

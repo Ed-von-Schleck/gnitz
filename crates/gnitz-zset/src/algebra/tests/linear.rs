@@ -1,9 +1,10 @@
 use super::*;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     assert_folds, make_batch, make_int_batch, make_schema_u64_i64, pk_payload_schema, u64_pk_schema, weighted_rows,
     zset_of, zset_sum,
 };
+use gnitz_wire::TypeCode;
 
 /// How a fixture batch holds rows given in (PK, payload) order.
 #[derive(Clone, Copy, PartialEq, Debug)]

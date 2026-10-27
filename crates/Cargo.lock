@@ -922,6 +922,7 @@ dependencies = [
 name = "gnitz-wire"
 version = "0.1.8"
 dependencies = [
+ "gnitz-foundation",
  "xxhash-rust",
 ]
 

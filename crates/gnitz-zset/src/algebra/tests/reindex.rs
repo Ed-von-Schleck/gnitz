@@ -1,9 +1,10 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     le_cell, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string, u64_pk_schema, STRS,
 };
+use gnitz_wire::TypeCode;
 
 /// `native`, a `tc` value in its low bytes, sign- or zero-extended to 128 bits.
 fn extended(tc: TypeCode, native: u128) -> u128 {
@@ -176,8 +177,8 @@ fn a_content_key_packs_its_content_hash() {
 
 mod pack_proptest {
     use super::*;
-    use crate::schema::{MAX_PK_BYTES, MAX_PK_COLUMNS};
     use crate::test_support::{arb_pk_type, pk_only_schema};
+    use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
     use proptest::prelude::*;
     use proptest::sample::Index;
 

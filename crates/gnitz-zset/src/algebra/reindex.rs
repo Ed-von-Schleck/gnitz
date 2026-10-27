@@ -8,16 +8,14 @@
 
 use std::cell::Cell;
 
-use gnitz_expr::BatchView;
-use gnitz_wire::PkBuf;
+use gnitz_expr::{BatchView, ColumnLocator};
 use gnitz_wire::RowSource;
+use gnitz_wire::{PkBuf, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS};
 
 use crate::repr::{copy_runs, range_rows, runs_where, write_to_batch, Batch, MemBatch};
 
-use crate::schema::key::KeySpec;
-use crate::schema::{
-    ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS,
-};
+use crate::schema::key::{KeySpec, PADDING_LOCATOR};
+use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 
 // ---------------------------------------------------------------------------
 // Row-content key material — the hashed key bytes, for the slots no scalar OPK
@@ -161,11 +159,7 @@ struct KeyCol {
 impl KeyCol {
     /// Padding for the fixed array's unused slots; nothing reads past `n`.
     const EMPTY: KeyCol = KeyCol {
-        loc: ColumnLocator::Pk {
-            byte_off: 0,
-            size: 0,
-            type_code: TypeCode::U8,
-        },
+        loc: PADDING_LOCATOR,
         out: SchemaColumn::new(TypeCode::U8, false),
     };
 }

@@ -7,10 +7,11 @@
 //! client.
 use std::cmp::Ordering;
 
-use gnitz_wire::RowSource;
 use gnitz_wire::{KeyRange, PkBuf, PkListRole, NARROW_PK_MAX_BYTES};
+use gnitz_wire::{RowSource, TypeCode, MAX_PK_COLUMNS};
 
-use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_COLUMNS};
+use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
+use gnitz_expr::ColumnLocator;
 
 /// Typed lexicographic OPK ordering of two **equal-length** PK regions — the
 /// comparator of seeks, group walks and probes. Slice order
@@ -25,13 +26,6 @@ pub(crate) fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
         Ordering::Equal if a.len() > NARROW_PK_MAX_BYTES => a.cmp(b),
         ord => ord,
     }
-}
-
-/// `a == b` for two **equal-length** PK regions (a whole PK, or an equi-prefix
-/// sliced to one width on both sides): [`compare_pk_ordering`]'s `Equal`.
-#[inline(always)]
-pub(crate) fn pk_bytes_eq(a: &[u8], b: &[u8]) -> bool {
-    compare_pk_ordering(a, b) == Ordering::Equal
 }
 
 /// The **inclusive** OPK ranges `[min, max]` and `[lo, hi]` intersect — whether a
@@ -193,6 +187,13 @@ pub fn probe_key(opk: &[u8]) -> u64 {
     gnitz_wire::checksum(opk)
 }
 
+/// Filler for a fixed locator array's unused slots; nothing reads it.
+pub(crate) const PADDING_LOCATOR: ColumnLocator = ColumnLocator::Pk {
+    byte_off: 0,
+    size: 0,
+    type_code: TypeCode::U8,
+};
+
 /// A key span: columns at their own types, packed tightly in order. A fixed
 /// array, so a spec is `Copy` and building one allocates nothing.
 #[derive(Clone, Copy)]
@@ -217,16 +218,10 @@ impl KeySpec {
             owner.columns()[c as usize].type_code
         })
         .map_err(|rule| format!("Index: {}", rule.for_role(PkListRole::ColumnList)))?;
-        // Padding for the fixed array's unused slots; nothing reads past `n`.
-        const EMPTY: ColumnLocator = ColumnLocator::Pk {
-            byte_off: 0,
-            size: 0,
-            type_code: TypeCode::U8,
-        };
         let mut spec = KeySpec {
             n: 0,
             key_size: 0,
-            locs: [EMPTY; MAX_PK_COLUMNS],
+            locs: [PADDING_LOCATOR; MAX_PK_COLUMNS],
         };
         for &c in cols {
             let loc = owner.locate(c as usize);
@@ -309,70 +304,26 @@ pub fn range_band(schema: &SchemaDescriptor, range: &KeyRange) -> Option<(PkBuf,
 
 /// The half-open band `[start, end)` of every `stride`-wide key beginning with a
 /// group in `[first, last]`; `end == None` runs to the top of the key space.
+/// Zero-padding `first` to the key width is what makes it its group's minimum.
 /// `None` = provably empty.
 pub fn group_band(first: &[u8], last: &[u8], stride: usize) -> Option<(PkBuf, Option<PkBuf>)> {
-    key_range_between_cuts(KeyCut::min_of(first), KeyCut::above(last), stride)
+    band(PkBuf::from_bytes(first).widened(stride), key_above(last, stride))
 }
 
-// ---------------------------------------------------------------------------
-// Cut → key-range derivation
-// ---------------------------------------------------------------------------
-
-/// A cut in the OPK key space, named by an OPK group prefix: either that
-/// group's own minimum key or the first key above every member of it. Zero-
-/// padding the prefix to the key width is what makes it the group's minimum.
-#[derive(Clone, Copy)]
-pub struct KeyCut<'a> {
-    group: &'a [u8],
-    above: bool,
+/// The least `stride`-wide key above every key beginning with `group`: the group
+/// plus one, the carry running leftward through its bytes, zero-padded. `None`
+/// for an all-`0xFF` or empty group, which no key lies above.
+pub fn key_above(group: &[u8], stride: usize) -> Option<PkBuf> {
+    let i = group.iter().rposition(|&b| b != 0xFF)?;
+    let mut k = PkBuf::from_bytes(&group[..=i]);
+    k.pk_bytes_mut()[i] += 1;
+    Some(k.widened(stride))
 }
 
-impl<'a> KeyCut<'a> {
-    /// [`Self::above`] when `above`, else [`Self::min_of`].
-    pub(crate) fn new(group: &'a [u8], above: bool) -> Self {
-        KeyCut { group, above }
-    }
-
-    /// The group's own minimum key — below every member of it.
-    pub(crate) fn min_of(group: &'a [u8]) -> Self {
-        KeyCut::new(group, false)
-    }
-
-    /// The first key above every member of the group. A saturated group — and
-    /// the zero-width group, which is the whole key space — has none.
-    pub fn above(group: &'a [u8]) -> Self {
-        KeyCut::new(group, true)
-    }
-
-    /// This cut as a `stride`-wide key; `None` when it lies above the whole key
-    /// space. An `above` cut is the group plus one, the carry running leftward
-    /// through its bytes: the least key of the next group of the same width.
-    pub fn key(&self, stride: usize) -> Option<PkBuf> {
-        let mut k = PkBuf::from_bytes(self.group);
-        if self.above {
-            // An all-`0xFF` or empty group has no successor at its width.
-            let i = self.group.iter().rposition(|&b| b != 0xFF)?;
-            let bytes = k.pk_bytes_mut();
-            bytes[i] += 1;
-            bytes[i + 1..].fill(0);
-        }
-        Some(k.widened(stride))
-    }
-}
-
-/// Half-open `[start, end)` OPK key range between two cuts over a `stride`-byte
-/// key space.
-///
-/// `None` = provably empty: `start` lies above the whole key space, or
-/// `start >= end`. `end == None` inside `Some` means the range runs to the table
-/// end.
-pub(crate) fn key_range_between_cuts(start: KeyCut, end: KeyCut, stride: usize) -> Option<(PkBuf, Option<PkBuf>)> {
-    let start = start.key(stride)?;
-    let end = end.key(stride);
-    if end.as_ref().is_some_and(|e| start.pk_bytes() >= e.pk_bytes()) {
-        return None;
-    }
-    Some((start, end))
+/// The half-open key range `[start, end)`, `end == None` running to the top of
+/// the key space; `None` when `start >= end`.
+pub(crate) fn band(start: PkBuf, end: Option<PkBuf>) -> Option<(PkBuf, Option<PkBuf>)> {
+    end.as_ref().is_none_or(|e| start < *e).then_some((start, end))
 }
 
 #[cfg(test)]

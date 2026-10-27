@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 
 use crate::repr::{Batch, MemBatch, ReadCursor, RowMark};
-use crate::schema::payload_order::compare_rows;
+use crate::schema::payload_order::{Generic, PayloadOrder};
 
 use super::avi::AviBake;
 use super::plan::ReducePlan;
@@ -205,7 +205,7 @@ fn consolidate_group(out: &mut Batch, mark: RowMark) {
     }
     let row0 = out.count - 2;
     let omb = out.as_mem_batch();
-    match compare_rows(out.schema(), &omb, row0, &omb, row0 + 1) {
+    match Generic.compare(out.schema(), &omb, row0, &omb, row0 + 1) {
         Ordering::Equal => out.truncate_to(mark),
         Ordering::Greater => out.swap_rows(row0, row0 + 1),
         Ordering::Less => {}

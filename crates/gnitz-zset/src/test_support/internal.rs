@@ -14,8 +14,9 @@ use crate::repr::{
     from_runs, from_runs_in_band, Batch, Codebook, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts,
 };
 use crate::schema::key::group_band;
-use crate::schema::payload_order::compare_full_rows;
-use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor};
+use crate::schema::payload_order::{Generic, PayloadOrder};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_expr::ColumnLocator;
 use gnitz_wire::{PkBuf, TypeCode};
 
 use proptest::strategy::Strategy;
@@ -141,7 +142,7 @@ pub(crate) fn random_schema(
     nullable: bool,
 ) -> SchemaDescriptor {
     let pk_types: Vec<TypeCode> = TypeCode::ALL.iter().copied().filter(|t| t.is_pk_eligible()).collect();
-    let n_pk = 1 + rng.gen_range(crate::schema::MAX_PK_COLUMNS as u64) as usize;
+    let n_pk = 1 + rng.gen_range(gnitz_wire::MAX_PK_COLUMNS as u64) as usize;
     let n_payload = rng.gen_range(7) as usize;
     let mut cols: Vec<SchemaColumn> = (0..n_pk)
         .map(|_| SchemaColumn::new(rng.pick(&pk_types), false))
@@ -174,7 +175,7 @@ pub(crate) fn assert_folds(inputs: &[Batch], got: &Batch, what: &str) {
     let mb = got.as_mem_batch();
     for r in 1..got.count {
         assert_eq!(
-            compare_full_rows(schema, &mb, r - 1, &mb, r),
+            Generic.compare_full(schema, &mb, r - 1, &mb, r),
             Ordering::Less,
             "{what}: rows {} and {r} out of order",
             r - 1

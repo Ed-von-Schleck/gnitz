@@ -1,9 +1,9 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, TypeCode};
+use crate::schema::SchemaColumn;
 use crate::test_support::{rekey_plan, TestTrace};
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::{NullKeys, RangeRel};
+use gnitz_wire::{NullKeys, RangeRel, TypeCode};
 
 /// Rows on the larger side of an equi or a range fixture.
 const N: usize = 4096;

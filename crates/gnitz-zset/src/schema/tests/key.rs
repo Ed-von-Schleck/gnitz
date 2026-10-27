@@ -1,9 +1,8 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::MAX_PK_BYTES;
 use crate::test_support::Rng;
 use crate::test_support::{edge_native, pk_only_schema, random_schema};
-use gnitz_wire::{cmp_col_window, key_image, PkColList};
+use gnitz_wire::{cmp_col_window, key_image, PkColList, MAX_PK_BYTES};
 
 /// Every byte primitive over OPK keys, at every PK width and over key pairs
 /// sharing a prefix of every length: each packs, compares or sort-keys exactly
@@ -25,7 +24,6 @@ fn opk_byte_primitives_agree_with_memcmp_at_every_width() {
                 }
                 let want = a.cmp(&b);
                 assert_eq!(compare_pk_ordering(&a, &b), want, "w={w} pos={pos}");
-                assert_eq!(pk_bytes_eq(&a, &b), want.is_eq(), "w={w} pos={pos}");
                 pk_width_dispatch!(w, |K| assert_eq!(
                     Ord::cmp(&K::from_opk(&a[..]), &K::from_opk(&b[..])),
                     want,

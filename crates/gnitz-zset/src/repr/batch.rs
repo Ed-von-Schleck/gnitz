@@ -11,9 +11,10 @@ use super::run::StoredRow;
 use super::scatter::copy_ranges;
 use super::string_heap::{self, relocate_german_string_vec, BlobCache};
 use super::writer::DirectWriter;
-use crate::schema::payload_order::{compare_full_rows, compare_rows};
-use crate::schema::{ColumnLocator, SchemaDescriptor};
-use gnitz_expr::BatchView;
+use crate::schema::key::compare_pk_ordering;
+use crate::schema::payload_order::{Generic, PayloadOrder};
+use crate::schema::SchemaDescriptor;
+use gnitz_expr::{BatchView, ColumnLocator};
 use gnitz_wire::RowSource;
 use gnitz_wire::{read_i64_le, read_u64_le, Heap, TypeCode};
 
@@ -717,7 +718,7 @@ impl Batch {
                 "batch flagged consolidated, but row {i} has weight 0 (ghost not eliminated)"
             );
             if i + 1 < self.count {
-                let ord = compare_full_rows(&self.schema, rows, i, rows, i + 1);
+                let ord = Generic.compare_full(&self.schema, rows, i, rows, i + 1);
                 debug_assert_eq!(
                     ord,
                     std::cmp::Ordering::Less,
@@ -885,7 +886,7 @@ impl Batch {
     /// Whether this batch holds the element of `src`'s row `row`, at any weight.
     pub fn holds_element_of(&self, src: &Batch, row: usize) -> bool {
         let rows = self.pk_rows(src.get_pk_bytes(row));
-        let cmp = |i| compare_rows(&self.schema, self, i, src, row);
+        let cmp = |i| Generic.compare(&self.schema, self, i, src, row);
         let at = super::seek::lower_bound_by(rows.start, rows.end, |i| cmp(i).is_lt());
         at < rows.end && cmp(at).is_eq()
     }
@@ -902,7 +903,7 @@ impl Batch {
             if lo == self.count {
                 break;
             }
-            if self.get_pk_bytes(lo) == key {
+            if compare_pk_ordering(self.get_pk_bytes(lo), key).is_eq() {
                 from = super::seek::pk_group_end(self, lo);
                 match out.last_mut() {
                     Some(last) if last.1 == lo => last.1 = from,
@@ -973,7 +974,7 @@ impl Batch {
             return;
         }
         if next.count > 0 {
-            let order = compare_full_rows(&self.schema, &*self, self.count - 1, &next, 0);
+            let order = Generic.compare_full(&self.schema, &*self, self.count - 1, &next, 0);
             assert!(
                 order.is_lt(),
                 "append_above: the appended rows do not sort above this batch's"

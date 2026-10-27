@@ -1,9 +1,9 @@
 use super::*;
 use crate::repr::{Batch, BatchBuilder, MappedShard, Run};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{create_read_cursor, map_shard, pk_payload_schema, pk_u64_two_i64_schema};
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::PkKeys;
+use gnitz_wire::{PkKeys, TypeCode};
 use std::hint::black_box;
 use std::path::Path;
 use std::rc::Rc;

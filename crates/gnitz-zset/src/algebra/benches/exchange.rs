@@ -1,10 +1,11 @@
 use super::*;
 use crate::algebra::Placement;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema, pk_u64_two_i64_schema, u64_pk_schema,
 };
+use gnitz_wire::TypeCode;
 use std::hint::black_box;
 
 /// `n` rows, none NULL: the last PK column `0..n` and every other column a

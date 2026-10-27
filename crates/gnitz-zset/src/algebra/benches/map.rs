@@ -1,10 +1,10 @@
 use super::tests::{compute, make_schema, project};
 use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{pk_payload_schema, rekey_plan, u64_pk_schema};
 use gnitz_expr::{IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
-use gnitz_wire::{MapKind, NullKeys};
+use gnitz_wire::{MapKind, NullKeys, TypeCode};
 use std::hint::black_box;
 
 /// Instructions per row of the map driver: `evaluate_map_batch` over whole

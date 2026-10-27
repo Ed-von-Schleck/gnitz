@@ -2,22 +2,13 @@
 //! schema: an operator's output or an index's layout. The descriptor itself is
 //! `gnitz-expr`'s.
 
-pub(crate) use gnitz_wire::TypeCode;
-pub(crate) use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
-
-pub(crate) use gnitz_expr::ColumnLocator;
 use gnitz_expr::SchemaRefusal;
 
 /// The schema descriptor, homed in `gnitz-expr` so the client links the same
 /// definition. Re-exported so a crate linking `gnitz-zset` alone can name it.
 pub use gnitz_expr::{decode_schema_block, encode_schema_block, SchemaColumn, SchemaDescriptor};
 
-/// Order-preserving primary-key (OPK) primitives — compare, sort keys, key
-/// ranges, and the index key span.
 pub mod key;
-
-/// The payload row order — the second term of the (PK, payload) total order —
-/// and the per-schema selection between its two comparators.
 pub(crate) mod payload_order;
 
 /// Builder for a derived schema: its PK columns, then its payload columns.

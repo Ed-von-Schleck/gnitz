@@ -1,7 +1,7 @@
 use super::*;
-use crate::schema::{SchemaDescriptor, TypeCode};
+use crate::schema::SchemaDescriptor;
 use crate::test_support::{mix, opk_pk, pk_only_schema, Rng};
-use gnitz_wire::FixedInt;
+use gnitz_wire::{FixedInt, TypeCode};
 
 /// Pack signed/unsigned values into a raw `fi.width()`-byte-per-cell LE
 /// region, exactly as the payload region would appear on the batch.

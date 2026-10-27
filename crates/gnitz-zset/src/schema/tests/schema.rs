@@ -4,7 +4,7 @@ use super::*;
 /// named, a repeat kept.
 #[test]
 fn project_schema_places_the_pk_then_the_named_payload() {
-    use TypeCode::{I32, I64, U32, U64};
+    use gnitz_wire::TypeCode::{I32, I64, U32, U64};
     let col = |tc| SchemaColumn::new(tc, false);
     let opt = SchemaColumn::new(I64, true);
     let input = SchemaDescriptor::new(&[col(I32), col(U64), opt, col(U32)], &[3, 1]);

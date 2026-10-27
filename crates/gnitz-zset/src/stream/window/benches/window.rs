@@ -1,12 +1,12 @@
 use std::ops::Range;
 
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::stream::order_index::tests::Harness;
 use crate::stream::order_index::OrderedPlan;
 use crate::test_support::mix;
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::{AggDescriptor, AggFunc, OrderKey};
+use gnitz_wire::{AggDescriptor, AggFunc, OrderKey, TypeCode};
 
 const N: u64 = 1 << 16;
 

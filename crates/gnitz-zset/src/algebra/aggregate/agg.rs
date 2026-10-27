@@ -5,9 +5,9 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use crate::repr::{Batch, MemBatch};
-use crate::schema::{ColumnLocator, TypeCode};
-use gnitz_wire::RowSource;
+use gnitz_expr::ColumnLocator;
 use gnitz_wire::{for_each_fixed_int, int_cell, AggFunc, FixedInt, ScalarKind};
+use gnitz_wire::{RowSource, TypeCode};
 
 use crate::algebra::order_image::{
     scalar_image, scalar_native_of_image, wide_native, wide_native_of_image, ImageCol, ImageKind, WideKind,

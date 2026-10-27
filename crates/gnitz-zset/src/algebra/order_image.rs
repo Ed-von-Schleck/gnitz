@@ -4,10 +4,10 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
-use crate::schema::{ColumnLocator, SchemaColumn, TypeCode};
-use gnitz_expr::order_bits;
-use gnitz_wire::RowSource;
+use crate::schema::SchemaColumn;
+use gnitz_expr::{order_bits, ColumnLocator};
 use gnitz_wire::{cmp_col_window, ScalarKind};
+use gnitz_wire::{RowSource, TypeCode};
 
 /// The column types outside [`ScalarKind`] that MIN/MAX still select over: the
 /// 16-byte integers and the German-string pair.

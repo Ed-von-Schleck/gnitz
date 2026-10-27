@@ -469,3 +469,7 @@ pub fn peek_bound(blob: &[u8]) -> Option<BoundPeek<'_>> {
 #[cfg(test)]
 #[path = "tests/read_spec.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/read_spec.rs"]
+mod bench;

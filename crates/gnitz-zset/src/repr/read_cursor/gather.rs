@@ -12,7 +12,8 @@ use std::ops::ControlFlow;
 use super::{ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
 use crate::repr::scatter::gather_rows;
-use crate::schema::{project_schema, ColumnLocator, SchemaDescriptor};
+use crate::schema::{project_schema, SchemaDescriptor};
+use gnitz_expr::ColumnLocator;
 
 pub struct PkSetGather {
     cursor: ReadCursor,

@@ -1,8 +1,9 @@
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::{SchemaColumn, TypeCode};
+use crate::schema::SchemaColumn;
 use crate::test_support::{pk_payload_schema, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
+use gnitz_wire::TypeCode;
 use std::hint::black_box;
 
 const N: usize = 500_000;

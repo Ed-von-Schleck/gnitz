@@ -2,12 +2,12 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     join_reference, make_batch, make_schema_u128_i64, make_schema_u64_i64, pk_only_schema, pk_payload_schema,
     rekey_plan, zset_of, TestTrace,
 };
-use gnitz_wire::NullKeys;
+use gnitz_wire::{NullKeys, TypeCode};
 
 /// The plan the compiler would bake for this pair, through the operator's own
 /// constructor rather than a look-alike.

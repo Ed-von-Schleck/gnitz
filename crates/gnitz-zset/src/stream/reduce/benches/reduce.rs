@@ -1,10 +1,10 @@
 use super::plan::ReducePlan;
 use super::tests::Harness;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{mix, pk_payload_schema};
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::{AggDescriptor, AggFunc};
+use gnitz_wire::{AggDescriptor, AggFunc, TypeCode};
 
 /// A U64 PK, the `group` columns, then one `value` column.
 fn grouped_schema(group: &[SchemaColumn], value: SchemaColumn) -> SchemaDescriptor {

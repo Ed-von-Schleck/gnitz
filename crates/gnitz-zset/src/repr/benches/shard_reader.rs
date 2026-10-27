@@ -6,12 +6,13 @@ use super::super::string_heap::{carried_dead, long_bytes_outside};
 use super::tests::{build, wide_string};
 use super::*;
 use crate::schema::key::probe_key;
-use crate::schema::{SchemaColumn, TypeCode};
+use crate::schema::SchemaColumn;
 use crate::test_support::{
     make_schema_pk_u64_payload_string, make_schema_u64_i64, map_shard, pk_u64_two_i64_schema, u64_pk_schema,
     weighted_rows, Rng,
 };
 use gnitz_foundation::perf::Counter;
+use gnitz_wire::TypeCode;
 use std::hint::black_box;
 use std::rc::Rc;
 

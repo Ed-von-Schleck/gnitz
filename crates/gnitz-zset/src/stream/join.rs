@@ -13,14 +13,14 @@ use crate::repr::{
     copy_runs, pk_group_end, pk_prefix_group_end, relocate_german_string_vec, runs_where, should_relocate_blob,
     width_dispatch, Batch, ReadCursor,
 };
-use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, KeyCut};
-use crate::schema::{DerivedSchema, SchemaDescriptor, MAX_PK_BYTES};
+use crate::schema::key::{band, compare_pk_ordering, key_above};
+use crate::schema::{DerivedSchema, SchemaDescriptor};
 
 use crate::algebra::MapPlan;
 use crate::stream::OpenAt;
 use gnitz_expr::{ColCopy, ColumnLocator, NullPerm};
-use gnitz_wire::RowSource;
 use gnitz_wire::{null_word_at, Heap, JoinKind, PkBuf, RangeRel, TypeCode};
+use gnitz_wire::{RowSource, MAX_PK_BYTES};
 
 // ---------------------------------------------------------------------------
 // The plan
@@ -221,13 +221,15 @@ impl RangeProbe {
     /// The trace key range this probe covers for a delta row whose PK region is
     /// `pk` (`equality prefix ‖ range slot`). `None` when it is provably empty.
     fn cut_points(&self, pk: &[u8]) -> Option<(PkBuf, Option<PkBuf>)> {
-        let group = &pk[..self.eq_size];
-        let slot = KeyCut::new(pk, !self.cuts_below);
-        let (start, end) = match self.above {
-            true => (slot, KeyCut::above(group)),
-            false => (KeyCut::min_of(group), slot),
+        let (group, stride) = (&pk[..self.eq_size], pk.len());
+        let split = match self.cuts_below {
+            true => Some(PkBuf::from_bytes(pk)),
+            false => key_above(pk, stride),
         };
-        key_range_between_cuts(start, end, pk.len())
+        match self.above {
+            true => band(split?, key_above(group, stride)),
+            false => band(PkBuf::from_bytes(group).widened(stride), split),
+        }
     }
 
     /// The greatest ordering a delta slot may have against a trace slot while

@@ -13,10 +13,10 @@ use crate::algebra::ReindexPacker;
 use crate::algebra::{image_slot_col, ImageCol, IMAGE_COL};
 use crate::algebra::{Agg, AggValues};
 use crate::repr::{copy_runs, range_rows, Batch, ReadCursor};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
-use gnitz_wire::payload_bytes;
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
+use gnitz_wire::{payload_bytes, TypeCode, MAX_PK_BYTES};
 use std::borrow::Cow;
 use std::ops::ControlFlow;
 

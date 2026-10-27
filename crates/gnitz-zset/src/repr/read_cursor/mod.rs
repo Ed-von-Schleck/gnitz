@@ -11,7 +11,7 @@ use crate::repr::loser_tree::{HeapNode, LoserTree};
 use crate::repr::merge::{self, ColumnarSource, MergeOrder, PosCursor};
 use crate::repr::seek::gallop_by;
 use crate::repr::shard_reader::MappedShard;
-use crate::schema::key::{compare_pk_ordering, pk_bytes_eq};
+use crate::schema::key::compare_pk_ordering;
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::PkBuf;
@@ -330,13 +330,13 @@ impl ReadCursor {
     /// Whether the current row's PK equals the group's OPK `key_bytes`.
     #[inline]
     fn current_pk_eq(&self, key_bytes: &[u8]) -> bool {
-        pk_bytes_eq(self.current_pk_bytes(), key_bytes)
+        compare_pk_ordering(self.current_pk_bytes(), key_bytes).is_eq()
     }
 
     /// Whether the current row's PK begins with `key`, a whole PK included.
     #[inline]
     fn current_pk_starts_with(&self, key: &[u8]) -> bool {
-        pk_bytes_eq(&self.current_pk_bytes()[..key.len()], key)
+        compare_pk_ordering(&self.current_pk_bytes()[..key.len()], key).is_eq()
     }
 
     /// Walk `key`'s PK group — as [`Self::seek_pk_group_ascending`] reads a key —

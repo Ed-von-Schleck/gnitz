@@ -21,18 +21,19 @@ use std::cmp::Ordering;
 
 use crate::algebra::{GroupOutKey, ReindexPacker};
 use crate::repr::{pk_prefix_group_end, Batch, MemBatch, ReadCursor};
-use crate::schema::payload_order::compare_full_rows;
-use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::key::compare_pk_ordering;
+use crate::schema::payload_order::{Generic, PayloadOrder};
+use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 use crate::stream::topn::{op_topn, TopN};
 use crate::stream::window::{op_window, Window};
 use crate::stream::OpenAt;
-use gnitz_wire::OrderKey;
 use gnitz_wire::RowSource;
+use gnitz_wire::{OrderKey, TypeCode};
 
 use crate::algebra::{
     copied_string_slots, copy_column, image_slot_col, rebase_copied_strings, ImageCol, RowWindow, IMAGE_COL,
 };
-use gnitz_expr::{ColCopy, NullPerm};
+use gnitz_expr::{ColCopy, ColumnLocator, NullPerm};
 
 /// The most rows an epoch's output batch reserves up front; it grows past that.
 const MAX_OUT_CAP_HINT: usize = 1 << 16;
@@ -217,7 +218,7 @@ impl Walk<'_> {
             // PK leads with the group: a row at or before the entry is the group's.
             (true, true) => {
                 let (src, at) = self.history.current_row_source();
-                compare_full_rows(&self.index.schema, src, at, self.entries, self.next)
+                Generic.compare_full(&self.index.schema, src, at, self.entries, self.next)
             }
         };
         let (stored, entry) = (ord.is_le(), ord.is_ge());
@@ -402,7 +403,7 @@ impl OrderIndex {
     /// the carried columns that break its ties.
     #[inline(always)]
     fn cmp_keys(&self, a: &impl RowSource, a_row: usize, b: &impl RowSource, b_row: usize) -> Ordering {
-        a.get_pk_bytes(a_row).cmp(b.get_pk_bytes(b_row)).then_with(|| {
+        compare_pk_ordering(a.get_pk_bytes(a_row), b.get_pk_bytes(b_row)).then_with(|| {
             self.images
                 .iter()
                 .map(|loc| loc.content(a, a_row).cmp(&loc.content(b, b_row)))

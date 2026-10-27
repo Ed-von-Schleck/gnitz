@@ -1,7 +1,8 @@
 use super::*;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, TypeCode};
+use crate::schema::SchemaColumn;
 use crate::test_support::{arb_fold_case, cell, fold_batch, le_cell, mix, opk_pk, pk_only_schema};
+use gnitz_wire::TypeCode;
 use proptest::prelude::*;
 
 /// The identities of `runs`' rows, in row order.

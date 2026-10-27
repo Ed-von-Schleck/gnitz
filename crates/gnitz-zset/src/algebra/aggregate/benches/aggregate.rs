@@ -1,9 +1,9 @@
 use super::adhoc_fold::AdhocFold;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::mix;
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec};
+use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, TypeCode};
 
 const N: u64 = 1 << 20;
 /// A store's scan chunk.

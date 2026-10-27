@@ -14,7 +14,7 @@ use crate::repr::batch::{Batch, ColPtr};
 use crate::repr::merge::ColumnarSource;
 use crate::repr::scatter::{mem_batch_to_unified, DecodedColumns, UnifiedSource};
 use crate::repr::shard_reader::MappedShard;
-use crate::schema::payload_order::compare_rows;
+use crate::schema::payload_order::{Generic, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{Heap, RowSource};
 
@@ -95,7 +95,7 @@ pub fn first_live_payload_group(schema: &SchemaDescriptor, pool: &[StoredRow]) -
         let others: i64 = pool
             .iter()
             .enumerate()
-            .filter(|&(j, c)| j != i && compare_rows(schema, run, row, &c.run, c.row).is_eq())
+            .filter(|&(j, c)| j != i && Generic.compare(schema, run, row, &c.run, c.row).is_eq())
             .map(|(_, c)| c.weight())
             .sum();
         pool[i].weight() + others > 0

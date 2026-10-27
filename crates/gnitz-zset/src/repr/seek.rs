@@ -126,7 +126,7 @@ pub(crate) fn pk_prefix_group_end<S: RowSource>(src: &S, start: usize, width: us
     let k = &src.get_pk_bytes(start)[..width];
     let count = src.row_count();
     let mut j = start + 1;
-    while j < count && crate::schema::key::pk_bytes_eq(&src.get_pk_bytes(j)[..width], k) {
+    while j < count && crate::schema::key::compare_pk_ordering(&src.get_pk_bytes(j)[..width], k).is_eq() {
         j += 1;
     }
     j

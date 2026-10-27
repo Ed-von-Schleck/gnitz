@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::payload_order::compare_full_rows;
+use crate::schema::payload_order::{Generic, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use crate::test_support::{
     arb_fold_case, assert_folds, fold_batch, make_schema_pk_u64_payload_string, make_string_batch, FoldRow,
@@ -13,7 +13,7 @@ fn sorted_run(schema: &SchemaDescriptor, rows: &[FoldRow]) -> Batch {
     let b = fold_batch(schema, rows);
     let mb = b.as_mem_batch();
     let mut order: Vec<usize> = (0..rows.len()).collect();
-    order.sort_by(|&x, &y| compare_full_rows(schema, &mb, x, &mb, y));
+    order.sort_by(|&x, &y| Generic.compare_full(schema, &mb, x, &mb, y));
     fold_batch(schema, &order.iter().map(|&i| rows[i].clone()).collect::<Vec<_>>())
 }
 
