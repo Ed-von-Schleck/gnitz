@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{decode_wal_block, encode_wal_block, kv_schema};
-use crate::{BatchAppender, ZSetBatch};
+use crate::BatchAppender;
 use gnitz_wire::TypeCode;
 
 /// A German cell whose heap offset overruns the heap is a `DecodeError`.

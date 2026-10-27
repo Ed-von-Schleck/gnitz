@@ -27,14 +27,14 @@ use gnitz_wire::CONNECT_TIMEOUT;
 use gnitz_wire::{ClientVerb, WireConflictMode, WireLane};
 use gnitz_wire::{RelClass, RelDescriptorBlob, RelIndex};
 
-/// Requests one connection may hold in flight; `submit` raises past it. A bound
+/// Requests one connection may hold in flight; `submit` refuses past it. A bound
 /// on the memory a driver that never waits can pin, not a throughput knob.
 pub const MAX_IN_FLIGHT: usize = 4096;
 
-/// Unwritten frame bytes one connection may hold; `submit` raises past it. An
+/// Unwritten frame bytes one connection may hold; `submit` refuses past it. An
 /// encoded push is a full copy of its batch, so the count above bounds no
-/// memory on its own. Checked before queueing, so one frame up to the peer's
-/// egress limit always goes through — what it bounds is a driver that submits
+/// memory on its own. Checked before queueing, so one frame up to
+/// [`gnitz_wire::MAX_FRAME_PAYLOAD`] always goes through — what it bounds is a driver that submits
 /// without flushing.
 pub const MAX_QUEUED_BYTES: usize = 64 << 20;
 
@@ -84,7 +84,7 @@ impl From<&RelDescriptor> for Target {
 }
 
 /// One reply frame's data block, kept undecoded: the owned frame buffer and the
-/// block's extent within it. `block()` is the block itself.
+/// block's extent within it.
 #[derive(Debug)]
 pub(crate) struct RawBlock {
     frame: Vec<u8>,
@@ -167,15 +167,13 @@ pub enum Request<'a> {
 impl Request<'_> {
     /// Validate and encode: the frame, and the relation its ACK names.
     fn encode(self) -> Result<(Vec<u8>, u64), ClientError> {
-        Ok(match self {
-            Request::AllocIds(n) => {
-                let hdr = ControlHeader::naming(ClientVerb::AllocIds, Target::from(0), n);
-                (encode_frame(hdr, &[], None, None), 0)
-            }
-            Request::AllocSerial { table, count } => {
-                let hdr = ControlHeader::naming(ClientVerb::AllocSerialRange, table, count);
-                (encode_frame(hdr, &[], None, None), table.tid)
-            }
+        // A control-only request: its verb, the relation its ACK names, `arg0`, and its blob.
+        let (verb, target, arg0, blob): (ClientVerb, Target, u64, &[u8]) = match self {
+            Request::AllocIds(n) => (ClientVerb::AllocIds, Target::from(0), n, &[]),
+            Request::AllocSerial { table, count } => (ClientVerb::AllocSerialRange, table, count, &[]),
+            Request::SnapshotOpen => (ClientVerb::SnapshotOpen, Target::from(0), 0, &[]),
+            Request::SnapshotClose(id) => (ClientVerb::SnapshotClose, Target::from(0), id, &[]),
+            Request::Backup(name) => (ClientVerb::Backup, Target::from(0), 0, name.as_bytes()),
             Request::DdlTxn(families) => {
                 for (tid, batch) in families {
                     if gnitz_wire::sys_family_index(*tid).is_none() {
@@ -183,42 +181,29 @@ impl Request<'_> {
                     }
                     batch.validate(sys_schema(*tid))?;
                 }
-                (encode_ddl_txn(families), 0)
+                return Ok((encode_ddl_txn(families), 0));
             }
             Request::PushTxn { families } => {
                 for f in families {
                     f.batch.validate(&f.schema)?;
                 }
-                (encode_push_txn(families), 0)
+                return Ok((encode_push_txn(families), 0));
             }
             Request::Push { target, schema, batch, mode } => {
                 // In-process, so a convenience and never a trust boundary; the
                 // server checks the same things. Here so no driver has to
                 // remember to.
                 batch.validate(schema)?;
-                // The push verb marks the frame as a push independent of data
-                // presence, so an empty batch (a legitimate empty Z-set delta)
-                // is ACKed as a no-op push instead of being mistaken for a scan.
                 let mut hdr = ControlHeader::naming(ClientVerb::Push, target, 0);
                 hdr.flags.conflict_mode = mode;
-                (
-                    encode_frame(hdr, &[], Some(&schema.to_block()), Some(batch)),
-                    target.tid,
-                )
+                let frame = encode_frame(hdr, &[], Some(&schema.to_block()), Some(batch));
+                return Ok((frame, target.tid));
             }
-            Request::SnapshotOpen => {
-                let hdr = ControlHeader::naming(ClientVerb::SnapshotOpen, Target::from(0), 0);
-                (encode_frame(hdr, &[], None, None), 0)
-            }
-            Request::SnapshotClose(id) => {
-                let hdr = ControlHeader::naming(ClientVerb::SnapshotClose, Target::from(0), id);
-                (encode_frame(hdr, &[], None, None), 0)
-            }
-            Request::Backup(name) => {
-                let hdr = ControlHeader::naming(ClientVerb::Backup, Target::from(0), 0);
-                (encode_frame(hdr, name.as_bytes(), None, None), 0)
-            }
-        })
+        };
+        Ok((
+            encode_frame(ControlHeader::naming(verb, target, arg0), blob, None, None),
+            target.tid,
+        ))
     }
 }
 
@@ -541,7 +526,7 @@ impl Session {
     }
 
     /// The connection's socket, for a [`Host`](crate::Host) to register.
-    pub fn as_fd(&self) -> BorrowedFd<'_> {
+    pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
         self.transport.as_fd()
     }
 
@@ -562,7 +547,7 @@ impl Session {
 
     /// RESOLVE — describe the relation named by the canonical
     /// `"schema_name.relation_name"`; `None` when there is none.
-    pub fn submit_resolve(&mut self, qname: &str) -> Sent<Option<Arc<RelDescriptor>>> {
+    pub(crate) fn submit_resolve(&mut self, qname: &str) -> Sent<Option<Arc<RelDescriptor>>> {
         let hdr = ControlHeader::naming(ClientVerb::Resolve, Target::from(0), 0);
         let (to, sent) = promise();
         self.enqueue(encode_frame(hdr, qname.as_bytes(), None, None), Slot::Resolve { to });
@@ -591,7 +576,7 @@ impl Session {
     /// SNAPSHOT_PAGE: up to `limit` rows of `tid` as snapshot `snapshot` holds
     /// it, each worker's after its key in `after` — every worker's first rows
     /// with `after` empty — replied in `reply_schema`'s layout.
-    pub fn submit_snapshot_page(
+    pub(crate) fn submit_snapshot_page(
         &mut self,
         snapshot: u64,
         tid: u64,
@@ -618,7 +603,7 @@ impl Session {
     }
 
     /// SCAN_MULTI: N [`Self::submit_scan`]s as one request, replied in order.
-    pub fn submit_scan_multi(
+    pub(crate) fn submit_scan_multi(
         &mut self,
         scans: &[(Target, &gnitz_wire::ReadSpec, &Arc<Schema>)],
     ) -> Sent<Vec<ScanReply>> {
@@ -652,7 +637,7 @@ impl Session {
     /// DELTA_POLL of one view after `from` — the view whole with none — under
     /// `spec`, replied in `reply_schema`'s layout. With `keep`, a view answered
     /// with a cursor stays subscribed from it under that id.
-    pub fn submit_delta_read(
+    pub(crate) fn submit_delta_read(
         &mut self,
         view: Target,
         from: Option<DeltaCursor>,
@@ -686,13 +671,14 @@ impl Session {
         if !self.polls.server_holds {
             return Sent::ready(Ok(()));
         }
-        // An unanswered sync may bring trains nobody is left to take.
-        let wait = if self.polls.untaken() || !self.syncing.is_empty() {
-            Duration::ZERO
+        // An unanswered sync may bring trains nobody is left to take. The wait goes in
+        // the wire's milliseconds, rounded up, so a wait shorter than one is still a wait.
+        let wait_ms = if self.polls.untaken() || !self.syncing.is_empty() {
+            0
         } else {
-            wait
+            u64::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
         };
-        let hdr = ControlHeader::naming(ClientVerb::SyncPushed, Target::from(0), wait_ms(wait));
+        let hdr = ControlHeader::naming(ClientVerb::SyncPushed, Target::from(0), wait_ms);
         let named = txn_frame::encode_held(self.polls.subs.keys().copied());
         let (to, sent) = promise();
         if self.enqueue(encode_frame(hdr, &named, None, None), Slot::Sync { to }) {
@@ -753,11 +739,13 @@ impl Session {
             // The predicate a driver reads for back-pressure, so the two can
             // never disagree; only the message re-derives which cap was hit.
             self.at_capacity().then(|| {
-                let queued = self.queued_bytes();
                 ClientError::from(if self.in_flight() >= MAX_IN_FLIGHT {
                     format!("connection has {MAX_IN_FLIGHT} requests in flight")
                 } else {
-                    format!("connection has {queued} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap")
+                    format!(
+                        "connection has {} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap",
+                        self.transport.queued_bytes()
+                    )
                 })
             })
         };
@@ -856,17 +844,12 @@ impl Session {
         self.refused
     }
 
-    /// Frame bytes queued and not yet written, against [`MAX_QUEUED_BYTES`].
-    fn queued_bytes(&self) -> usize {
-        self.transport.queued_bytes()
-    }
-
     /// Either of the caps [`Self::submit`] refuses on — in-flight slots or
     /// queued bytes — reached. A driver that can wait leaves the request where
     /// it is, which is what turns a cap into back-pressure rather than an error.
     /// Each cap implies its own interest bit, so gating on it loses no wakeup.
-    pub fn at_capacity(&self) -> bool {
-        self.in_flight() >= MAX_IN_FLIGHT || self.queued_bytes() >= MAX_QUEUED_BYTES
+    pub(crate) fn at_capacity(&self) -> bool {
+        self.in_flight() >= MAX_IN_FLIGHT || self.transport.queued_bytes() >= MAX_QUEUED_BYTES
     }
 
     /// `READ` while any request is unanswered; `WRITE` while bytes remain queued
@@ -899,12 +882,6 @@ impl Session {
         }
         self.ended = Some(why);
     }
-}
-
-/// `wait` in the wire's milliseconds, rounded up: a wait shorter than one is
-/// still a wait.
-fn wait_ms(wait: Duration) -> u64 {
-    u64::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
 }
 
 /// Feed one frame to the slot it is of, whose reply arrives if that completes it.

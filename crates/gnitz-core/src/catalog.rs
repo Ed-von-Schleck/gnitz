@@ -101,25 +101,24 @@ impl CatalogRelation {
         qualified_key(&self.schema, &self.name)
     }
 
-    /// The columns `cols` lists — its [`pk`](Self::pk) or an index's — in list
-    /// order.
-    pub fn columns_of<'a>(&'a self, cols: &'a PkColList) -> impl Iterator<Item = &'a CatalogColumn> {
-        cols.as_slice().iter().filter_map(|&ci| self.columns.get(ci as usize))
-    }
-
     /// The columns a client reads, in schema order.
     pub fn visible_columns(&self) -> impl Iterator<Item = &ColumnDef> {
         self.columns.iter().map(|c| &c.def).filter(|c| !c.is_hidden)
     }
 
-    /// The names of [`columns_of`](Self::columns_of) `cols`.
-    pub fn column_names<'a>(&'a self, cols: &'a PkColList) -> Vec<&'a str> {
-        self.columns_of(cols).map(|c| c.def.name.as_str()).collect()
+    /// The names of the columns `cols` lists — its [`pk`](Self::pk) or an
+    /// index's — in list order.
+    pub fn column_names(&self, cols: &PkColList) -> Vec<&str> {
+        cols.as_slice()
+            .iter()
+            .filter_map(|&ci| self.columns.get(ci as usize))
+            .map(|c| c.def.name.as_str())
+            .collect()
     }
 }
 
 /// The catalog at one cut.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Catalog {
     /// Every schema's name, ascending.
     pub schemas: Vec<String>,

@@ -4,7 +4,7 @@
 
 use std::io::{self, BufRead, IoSlice, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -214,21 +214,13 @@ pub(super) fn connect_tls(rest: &str, until: Instant) -> Result<(ClientTransport
 
 /// The TLS arm's state: the rustls connection and the socket beneath it.
 pub(super) struct TlsInner {
-    conn: ClientConnection,
-    sock: TcpStream,
+    pub(super) conn: ClientConnection,
+    pub(super) sock: TcpStream,
 }
 
 impl TlsInner {
-    pub(super) fn as_fd(&self) -> BorrowedFd<'_> {
-        self.sock.as_fd()
-    }
-
-    pub(super) fn wants_write(&self) -> bool {
-        self.conn.wants_write()
-    }
-
     /// Ship what the socket takes of rustls's queued ciphertext; the rest stays queued,
-    /// reported by `wants_write`.
+    /// reported by `conn.wants_write`.
     pub(super) fn ship(&mut self) -> Result<(), ProtocolError> {
         while self.conn.wants_write() {
             if write_nonblocking(|| self.conn.write_tls(&mut self.sock))?.is_none() {

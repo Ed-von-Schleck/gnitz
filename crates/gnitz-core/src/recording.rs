@@ -21,7 +21,7 @@ use gnitz_wire::wal::WAL_FORMAT_VERSION;
 use gnitz_wire::{Reader, Writer};
 
 /// The directory every connection of this process records into.
-pub const RECORD_ENV: &str = "GNITZ_RECORD_FRAMES";
+const RECORD_ENV: &str = "GNITZ_RECORD_FRAMES";
 
 /// What a recording file is named with.
 pub const EXT: &str = "frames";

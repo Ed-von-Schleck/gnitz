@@ -600,23 +600,8 @@ fn block_on_refuses_a_host_that_pends() {
 /// resolve as what went wrong, and the loop ends once its calls have.
 #[test]
 fn serve_ends_the_session_as_the_hosts_failure() {
-    struct Failing;
-    impl Host for Failing {
-        fn attach(&mut self, _: BorrowedFd<'_>) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn poll_io(
-            &mut self,
-            _: Interest,
-            _: &mut Context<'_>,
-            _: &mut dyn FnMut(Interest) -> bool,
-        ) -> Poll<Result<(), ClientError>> {
-            Poll::Ready(Err(std::io::Error::other("the reactor is gone").into()))
-        }
-        fn spawn(&mut self, _: Job) {}
-    }
     let (s, _peer) = session_pair();
-    let c = GnitzClient::over(s, Box::new(Failing)).unwrap();
+    let c = GnitzClient::over(s, Box::new(FailingHost)).unwrap();
     let owed: Arc<Mutex<Option<Sent<u64>>>> = Arc::default();
     let out = Arc::clone(&owed);
     let mut call: Option<Op> = Some(Box::new(move |c| {
@@ -625,7 +610,7 @@ fn serve_ends_the_session_as_the_hosts_failure() {
     block_on(serve(c, |_| Poll::Ready(call.take())));
     let failed = owed.lock().unwrap().take().unwrap().try_take();
     assert!(
-        matches!(&failed, Some(Err(e)) if e.to_string().contains("the reactor is gone")),
+        matches!(&failed, Some(Err(e)) if e.to_string().contains("no reactor")),
         "{failed:?}"
     );
 }

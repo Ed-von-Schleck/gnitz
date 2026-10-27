@@ -2,7 +2,6 @@ use super::*;
 use crate::protocol::transport::poll_fd;
 use crate::test_support::{flush_all, framed, io_kind, pass, read_frame, recv_frames, write_frame};
 use crate::ClientError;
-use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_wire::CONNECT_TIMEOUT;
 use std::io::ErrorKind;
 use std::net::TcpListener;
@@ -93,8 +92,8 @@ pub(in crate::protocol::transport) fn pair(rcvbuf: Option<libc::c_int>) -> (Clie
 }
 
 /// The client profile: TLS 1.3 alone, and early data off, so that the access
-/// token the handshake sends never rides replayable early data. gnitz-server's TLS config tests assert the
-/// server-side half.
+/// token the handshake sends never rides replayable early data. gnitz-server's
+/// TLS config tests assert the server-side half.
 #[test]
 fn client_config_profile() {
     let cfg = build_client_config(&parse_target("127.0.0.1:1").unwrap()).expect("client config");
@@ -345,8 +344,8 @@ fn a_token_file_is_read_trimmed_and_bounded() {
     }
 }
 
-/// A token the server answers `Unrecognised` fails the connect with that
-/// verdict, and the token rides the client's HELLO verbatim.
+/// A token the server refuses fails the connect with that verdict, and the token
+/// rides the client's HELLO verbatim.
 #[test]
 fn a_refused_token_fails_the_connect() {
     let lb = Loopback::serve(None, |sock, cfg| {

@@ -5,8 +5,7 @@
 //! bytes panics the client.
 
 use super::*;
-use crate::protocol::transport::poll_fd;
-use crate::test_support::{session_pair, wide_schema};
+use crate::test_support::{session_pair, step_until_idle, wide_schema};
 use gnitz_wire::{ReadBound, ReadSpec};
 
 #[test]
@@ -23,23 +22,18 @@ fn reply_fuzz() {
 
         peer.send_bytes(stream);
         drop(peer);
-        let mut ready = Interest::WRITE;
-        while s.interest() != Interest::NONE {
-            s.step(ready);
-            if s.interest() == Interest::NONE {
-                break;
-            }
-            let events = poll_fd(s.as_raw_fd(), s.interest().poll_events(), None).unwrap();
-            ready = Interest::from_revents(events);
-        }
-        let answered = [
+        s.step(Interest::WRITE);
+        step_until_idle(&mut s);
+        for (k, answered) in [
             ack.try_take().is_some(),
             resolve.try_take().is_some(),
             scan.try_take().is_some(),
             multi.try_take().is_some(),
             delta.try_take().is_some(),
-        ];
-        for (k, answered) in answered.into_iter().enumerate() {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert!(answered, "request {k} was never answered");
         }
     });

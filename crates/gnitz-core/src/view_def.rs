@@ -83,18 +83,14 @@ impl ViewDefinition {
     /// The rules [`Self::encode`]'s output keeps: every range lies on character
     /// boundaries of the query, in order and apart.
     pub fn check(&self) -> Result<(), String> {
-        let on_boundary = |at: u32| self.query.is_char_boundary(at as usize);
         let mut floor = 0;
         for r in &self.refs {
             let ends_in_order = r.alias_end.is_none_or(|end| end >= r.name.end);
             if r.name.start < floor || r.name.start >= r.name.end || !ends_in_order {
                 return Err("relation references overlap or are out of order".to_string());
             }
-            let edges = [r.name.start, r.name.end].into_iter().chain(r.alias_end);
-            if !edges
-                .clone()
-                .all(|at| at as usize <= self.query.len() && on_boundary(at))
-            {
+            let mut edges = [r.name.start, r.name.end].into_iter().chain(r.alias_end);
+            if !edges.all(|at| self.query.is_char_boundary(at as usize)) {
                 return Err("a relation reference lies outside the query".to_string());
             }
             floor = r.alias_end.unwrap_or(r.name.end);

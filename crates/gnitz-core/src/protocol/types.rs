@@ -151,10 +151,6 @@ impl PkColumn {
     /// never zero or wider than a key.
     pub fn empty_for_schema(schema: &Schema) -> Self {
         let n = schema.pk_cols().len();
-        assert!(
-            (1..=MAX_PK_COLUMNS).contains(&n),
-            "PkColumn: {n} key columns is outside 1..={MAX_PK_COLUMNS}"
-        );
         let mut types = [TypeCode::U8; MAX_PK_COLUMNS];
         for (t, &c) in types.iter_mut().zip(schema.pk_cols()) {
             *t = schema.columns[c as usize].ty.tc;
@@ -217,7 +213,7 @@ impl PkColumn {
 
     /// The key columns' types in PK-list order.
     #[inline]
-    pub fn key_types(&self) -> &[TypeCode] {
+    fn key_types(&self) -> &[TypeCode] {
         &self.types[..self.n as usize]
     }
 
@@ -284,22 +280,6 @@ impl PkColumn {
         );
         self.buf.extend_from_slice(opk);
     }
-
-    /// Move every row of `other` onto this column's tail.
-    pub(crate) fn append(&mut self, other: &mut PkColumn) {
-        debug_assert_eq!(self.key_types(), other.key_types());
-        self.buf.append(&mut other.buf);
-    }
-
-    fn truncate(&mut self, len: usize) {
-        self.buf.truncate(len * self.stride());
-    }
-
-    /// Append the row at `src[i]` to `self`. Layouts must match.
-    fn push_from(&mut self, src: &PkColumn, i: usize) {
-        debug_assert_eq!(self.key_types(), src.key_types());
-        self.buf.extend_from_slice(src.get_bytes(i));
-    }
 }
 
 /// Append one zero-filled cell of wire type `tc` to a payload region — the NULL
@@ -324,21 +304,13 @@ impl PayloadColumn {
         PayloadColumn { tc, bytes: Vec::new() }
     }
 
-    /// `rows` zero cells.
-    pub fn zeroed(tc: TypeCode, rows: usize) -> Self {
-        PayloadColumn {
-            tc,
-            bytes: vec![0; rows * tc.wire_stride()],
-        }
-    }
-
     #[inline]
-    pub fn tc(&self) -> TypeCode {
+    pub(crate) fn tc(&self) -> TypeCode {
         self.tc
     }
 
     #[inline]
-    pub fn stride(&self) -> usize {
+    pub(crate) fn stride(&self) -> usize {
         self.tc.wire_stride()
     }
 
@@ -382,11 +354,10 @@ impl ZSetBatch {
             pks: PkColumn::empty_for_schema(schema),
             weights: vec![],
             nulls: vec![],
-            payload: {
-                let mut payload = Vec::with_capacity(schema.layout().num_payload_cols());
-                payload.extend(schema.payload_columns().map(|(_, _, c)| PayloadColumn::new(c.ty.tc)));
-                payload
-            },
+            payload: schema
+                .payload_columns()
+                .map(|(_, _, c)| PayloadColumn::new(c.ty.tc))
+                .collect(),
             blob: vec![],
         }
     }
@@ -408,7 +379,10 @@ impl ZSetBatch {
     pub fn filler_columns(schema: &Schema, count: usize) -> Vec<PayloadColumn> {
         schema
             .payload_columns()
-            .map(|(_, _, c)| PayloadColumn::zeroed(c.ty.tc, count))
+            .map(|(_, _, c)| PayloadColumn {
+                tc: c.ty.tc,
+                bytes: vec![0; count * c.ty.tc.wire_stride()],
+            })
             .collect()
     }
 
@@ -436,7 +410,7 @@ impl ZSetBatch {
     /// agreeing. `src` and `self` must share a layout.
     pub fn copy_row_at(&mut self, src: &ZSetBatch, i: usize, weight: i64) {
         debug_assert!(self.same_layout(src), "copy_row_at: layout mismatch");
-        self.pks.push_from(&src.pks, i);
+        self.pks.buf.extend_from_slice(src.pks.get_bytes(i));
         self.weights.push(weight);
         self.nulls.push(src.nulls[i]);
         for pi in 0..self.payload.len() {
@@ -451,11 +425,9 @@ impl ZSetBatch {
             && self.payload.iter().zip(&other.payload).all(|(a, b)| a.tc() == b.tc())
     }
 
-    /// Overwrite the STRING cell at `(row, pi)`. Addressable rather than "patch
-    /// the row I just pushed", so a caller that copied two rows can name which
-    /// one it means. The replaced cell's spill, if any, stays in the arena
-    /// unreferenced.
-    pub fn set_string_cell(&mut self, row: usize, pi: usize, v: &str) {
+    /// Overwrite the STRING cell at `(row, pi)`. The replaced cell's spill, if any,
+    /// stays in the arena unreferenced.
+    pub(crate) fn set_string_cell(&mut self, row: usize, pi: usize, v: &str) {
         let cell = gnitz_wire::encode_german_string(v.as_bytes(), &mut self.blob);
         self.payload[pi].bytes[row * 16..(row + 1) * 16].copy_from_slice(&cell);
     }
@@ -465,10 +437,8 @@ impl ZSetBatch {
         gnitz_wire::write_u64_le(&mut self.payload[pi].bytes, row * 8, v);
     }
 
-    /// An empty batch with every growth stream sized for `n` rows: the PK
-    /// buffer, the weights, the null words and each payload column. The form to
-    /// use whenever the row count is known before the build loop — otherwise a
-    /// column-at-a-time fill reallocates its way up from zero.
+    /// An empty batch with every growth stream sized for `n` rows: the PK buffer,
+    /// the weights, the null words and each payload column.
     pub fn with_capacity(schema: &Schema, n: usize) -> Self {
         let mut b = Self::new(schema);
         b.reserve(n);
@@ -497,7 +467,7 @@ impl ZSetBatch {
     /// Indices of the live rows — those with positive weight. A `ZSetBatch`
     /// row with weight ≤ 0 is a retraction/ghost, not a present element, so a
     /// catalog scan over a batch iterates only its live rows.
-    pub fn live_rows(&self) -> impl Iterator<Item = usize> + '_ {
+    pub(crate) fn live_rows(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.len()).filter(move |&i| self.weights[i] > 0)
     }
 
@@ -510,7 +480,7 @@ impl ZSetBatch {
             *self = other;
             return;
         }
-        self.pks.append(&mut other.pks);
+        self.pks.buf.append(&mut other.pks.buf);
         self.weights.append(&mut other.weights);
         self.nulls.append(&mut other.nulls);
         let delta = self.blob.len();
@@ -535,7 +505,7 @@ impl ZSetBatch {
     /// Drop everything appended since `mark` — used to undo a half-written row,
     /// its blob spill included.
     pub fn rollback_to(&mut self, mark: BatchMark) {
-        self.pks.truncate(mark.rows);
+        self.pks.buf.truncate(mark.rows * self.pks.stride());
         self.weights.truncate(mark.rows);
         self.nulls.truncate(mark.rows);
         self.blob.truncate(mark.blob);
@@ -568,13 +538,6 @@ impl ZSetBatch {
     /// Every payload region is the length its type and the row count imply.
     pub(crate) fn check_columns(&self) -> Result<(), String> {
         let n = self.len();
-        let regions = gnitz_wire::num_regions(self.payload.len());
-        if regions > gnitz_wire::MAX_WIRE_REGIONS {
-            return Err(format!(
-                "{regions} regions exceeds the {} a region list holds",
-                gnitz_wire::MAX_WIRE_REGIONS
-            ));
-        }
         for (pi, col) in self.payload.iter().enumerate() {
             let (got, want) = (col.bytes.len(), n * col.stride());
             if got != want {
@@ -586,7 +549,7 @@ impl ZSetBatch {
 
     /// The batch's layout is `schema`'s: key column types, payload slot count,
     /// and each slot's type.
-    pub fn layout_matches(&self, schema: &Schema) -> Result<(), String> {
+    pub(crate) fn layout_matches(&self, schema: &Schema) -> Result<(), String> {
         let want = schema.pk_cols().iter().map(|&c| schema.columns[c as usize].ty.tc);
         let got = self.pks.key_types();
         if !got.iter().copied().eq(want.clone()) {
@@ -766,8 +729,16 @@ impl gnitz_wire::sys_rows::SysRowSink for BatchAppender<'_> {
     fn put_bytes(&mut self, b: &[u8]) {
         self.bytes_val(b);
     }
+    /// A row takes exactly one push per payload column; names the row `validate` would reject
+    /// later as a bare region-length error.
     fn end_row(&mut self) {
-        self.check_row_complete();
+        debug_assert_eq!(
+            self.cursor,
+            self.batch.payload.len(),
+            "BatchAppender: row got {} of {} payload columns",
+            self.cursor,
+            self.batch.payload.len(),
+        );
     }
 }
 
@@ -778,36 +749,17 @@ impl<'a> BatchAppender<'a> {
 
     /// Start a new row with the given single-column primary key and weight.
     pub fn add_row(&mut self, pk: u128, weight: i64) -> &mut Self {
-        self.open_row(weight);
-        self.batch.pks.push_natives(&[pk]);
-        self
+        self.add_row_natives(&[pk], weight)
     }
 
     /// [`Self::add_row`] for a **compound** PK: `natives` are the PK columns'
     /// native values in PK-list order.
     pub fn add_row_natives(&mut self, natives: &[u128], weight: i64) -> &mut Self {
-        self.open_row(weight);
-        self.batch.pks.push_natives(natives);
-        self
-    }
-
-    /// A row takes exactly one push per payload column; names the row `validate` would reject
-    /// later as a bare region-length error.
-    fn check_row_complete(&self) {
-        debug_assert_eq!(
-            self.cursor,
-            self.batch.payload.len(),
-            "BatchAppender: row got {} of {} payload columns",
-            self.cursor,
-            self.batch.payload.len(),
-        );
-    }
-
-    /// The per-row bookkeeping both row starters owe, minus the key itself.
-    fn open_row(&mut self, weight: i64) {
         self.batch.weights.push(weight);
         self.batch.nulls.push(0);
         self.cursor = 0;
+        self.batch.pks.push_natives(natives);
+        self
     }
 
     /// Append one fixed-width cell, exactly the column's stride wide, to the next column.

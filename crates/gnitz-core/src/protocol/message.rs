@@ -1,13 +1,17 @@
 use super::types::{Schema, ZSetBatch};
 use gnitz_wire::control::{append_frame, ControlHeader};
 use gnitz_wire::txn_frame::{encode_items, FrameItem};
-use gnitz_wire::WireConflictMode;
-use gnitz_wire::{ClientVerb, WireFlags};
+use gnitz_wire::{ClientVerb, WireConflictMode};
 use std::sync::Arc;
 
 /// One frame payload, without the 4-byte length prefix. An empty batch ships no
 /// data block, and still ships the schema record.
-pub fn encode_frame(hdr: ControlHeader, blob: &[u8], schema: Option<&[u8]>, data: Option<&ZSetBatch>) -> Vec<u8> {
+pub(crate) fn encode_frame(
+    hdr: ControlHeader,
+    blob: &[u8],
+    schema: Option<&[u8]>,
+    data: Option<&ZSetBatch>,
+) -> Vec<u8> {
     let mut out = Vec::new();
     append_frame(
         &mut out,
@@ -37,22 +41,20 @@ pub struct PushFamily {
 /// Encode an atomic user-table push transaction frame (`ClientVerb::PushTxn`) into
 /// wire bytes (without the 4-byte frame header). Every family carries its schema
 /// record, which the master validates it against.
-pub fn encode_push_txn(families: &[PushFamily]) -> Vec<u8> {
+pub(crate) fn encode_push_txn(families: &[PushFamily]) -> Vec<u8> {
     let schemas: Vec<Vec<u8>> = families.iter().map(|f| f.schema.to_block()).collect();
     let items: Vec<FrameItem> = families
         .iter()
         .zip(&schemas)
-        .map(|(f, schema)| FrameItem {
-            hdr: ControlHeader {
-                flags: WireFlags {
-                    conflict_mode: f.mode,
-                    ..Default::default()
-                },
-                ..ControlHeader::naming(ClientVerb::PushTxn, f.target, f.basis)
-            },
-            blob: &[],
-            schema: Some(schema),
-            data: Some(f.batch.wire_regions()),
+        .map(|(f, schema)| {
+            let mut hdr = ControlHeader::naming(ClientVerb::PushTxn, f.target, f.basis);
+            hdr.flags.conflict_mode = f.mode;
+            FrameItem {
+                hdr,
+                blob: &[],
+                schema: Some(schema),
+                data: Some(f.batch.wire_regions()),
+            }
         })
         .collect();
     encode_items(ClientVerb::PushTxn, &items)

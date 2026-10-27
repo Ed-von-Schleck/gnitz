@@ -1,17 +1,15 @@
 use super::*;
 use crate::protocol::wal_block::decode_wal_block_into;
-use crate::test_support::{encode_wal_block, kv_schema};
+use crate::test_support::{decode_wal_block, encode_wal_block, kv_schema};
 use gnitz_expr::{BatchView, CmpOp, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarEval, Sink};
 use gnitz_wire::{payload_str, payload_u64};
 
 /// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
 /// a NULL cell, which the region zero-fills.
 fn german_col(vals: &[Option<&[u8]>], blob: &mut Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vals.len() * 16);
-    for v in vals {
-        out.extend_from_slice(&gnitz_wire::encode_german_string(v.unwrap_or(&[]), blob));
-    }
-    out
+    vals.iter()
+        .flat_map(|v| gnitz_wire::encode_german_string(v.unwrap_or(&[]), blob))
+        .collect()
 }
 
 /// `schema`'s payload regions holding `regions`, one per payload slot in slot
@@ -25,11 +23,7 @@ fn payload_of(schema: &Schema, regions: Vec<Vec<u8>>) -> Vec<PayloadColumn> {
     schema
         .payload_columns()
         .zip(regions)
-        .map(|((_, _, c), bytes)| {
-            let mut col = PayloadColumn::new(c.ty.tc);
-            col.bytes = bytes;
-            col
-        })
+        .map(|((_, _, c), bytes)| PayloadColumn { tc: c.ty.tc, bytes })
         .collect()
 }
 
@@ -71,8 +65,11 @@ fn from_parts_enforces_full_rule_set() {
     assert!(schema(&[0], &wide[..gnitz_wire::MAX_COLUMNS]).is_ok());
 }
 
-/// `(pk U64 | v I64 | s STRING nullable)`, two valid rows, the second NULL in `s`.
-fn validate_fixture() -> (Schema, ZSetBatch) {
+/// Each way a batch can disagree with its schema or with itself is refused and
+/// named; a NULL over a zeroed cell of a nullable column is not one of them.
+#[test]
+fn validate_refuses_each_malformed_batch() {
+    // `(pk U64 | v I64 | s STRING nullable)`, two valid rows, the second NULL in `s`.
     let schema = Schema::from_parts(
         vec![
             ColumnDef::new("pk", TypeCode::U64, false),
@@ -82,20 +79,12 @@ fn validate_fixture() -> (Schema, ZSetBatch) {
         &[0],
     )
     .unwrap();
-    let mut b = ZSetBatch::new(&schema);
+    let mut base = ZSetBatch::new(&schema);
     {
-        let mut a = BatchAppender::new(&mut b);
+        let mut a = BatchAppender::new(&mut base);
         a.add_row(1, 1).i64_val(10).str_val("x");
         a.add_row(2, -1).i64_val(20).null();
     }
-    (schema, b)
-}
-
-/// Each way a batch can disagree with its schema or with itself is refused and
-/// named; a NULL over a zeroed cell of a nullable column is not one of them.
-#[test]
-fn validate_refuses_each_malformed_batch() {
-    let (schema, base) = validate_fixture();
     base.validate(&schema)
         .expect("a NULL over a zeroed nullable cell validates");
 
@@ -784,8 +773,7 @@ fn batches_round_trip_through_a_wal_block() {
         (fixture_a_schema(), a_retraction),
     ] {
         let block = encode_wal_block(&batch);
-        let mut sink = ZSetBatch::new(&schema);
-        decode_wal_block_into(&mut sink, &block, &schema).expect("block decodes");
+        let mut sink = decode_wal_block(&block, &schema).expect("block decodes");
         assert_eq!(sink, batch, "batch must survive encode -> decode");
 
         decode_wal_block_into(&mut sink, &block, &schema).expect("block decodes");

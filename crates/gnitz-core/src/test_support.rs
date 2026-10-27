@@ -1,6 +1,7 @@
 //! Shared `#[cfg(test)]` scaffolding: the socketpair loopback, the framing
-//! helpers a scripted peer is written with, and the `(pk, v)` fixture. They sit
-//! at the crate root because the suites that read them are spread over three
+//! helpers a scripted peer is written with, the reply frames it sends, and the
+//! batch fixtures and their WAL-block codecs. It sits at the crate root because
+//! the tests, benchmarks and fuzz targets that read it are spread over several
 //! directories — a `tests` module is private to its parent, so none of them can
 //! host the rest.
 
@@ -13,7 +14,7 @@ use gnitz_wire::{ColumnDef, TypeCode, WireStatus};
 
 use crate::protocol::error::ProtocolError;
 use crate::protocol::transport::{poll_fd, ClientTransport};
-use crate::{BatchAppender, RelName, Schema, Session, ZSetBatch};
+use crate::{BatchAppender, Interest, RelName, Schema, Session, ZSetBatch};
 
 /// `schema.name`.
 pub(crate) fn rel(schema: &str, name: &str) -> RelName {
@@ -140,11 +141,44 @@ pub(crate) fn session_pair() -> (Session, Peer) {
     (Session::over(t), peer)
 }
 
+/// Step `s` on what its socket reports ready, parked between steps, until it owes nothing.
+pub(crate) fn step_until_idle(s: &mut Session) {
+    while !s.interest().is_empty() {
+        s.step(Interest::from_revents(
+            poll_fd(s.as_raw_fd(), s.interest().poll_events(), None).unwrap(),
+        ));
+    }
+}
+
 /// A control-only reply frame naming `tid` and carrying `lsn` in `arg0`.
 pub(crate) fn reply_ctrl(tid: u64, lsn: u64) -> Vec<u8> {
     let hdr = gnitz_wire::control::ControlHeader {
         target_id: tid,
         arg0: lsn,
+        ..Default::default()
+    };
+    crate::encode_frame(hdr, &[], None, None)
+}
+
+/// A reply frame carrying `batch` and `lsn` in `arg0`, and no schema block;
+/// `cont` sets `continuation`.
+pub(crate) fn reply_rows(tid: u64, batch: &ZSetBatch, lsn: u64, cont: bool) -> Vec<u8> {
+    let hdr = gnitz_wire::control::ControlHeader {
+        target_id: tid,
+        flags: gnitz_wire::WireFlags { continuation: cont, ..Default::default() },
+        arg0: lsn,
+        ..Default::default()
+    };
+    crate::encode_frame(hdr, &[], None, Some(batch))
+}
+
+/// `view`'s terminal of a delta read or poll: control-only, carrying the cursor
+/// `(tag, tick)`.
+pub(crate) fn delta_terminal(view: u64, tag: u64, tick: u64) -> Vec<u8> {
+    let hdr = gnitz_wire::control::ControlHeader {
+        target_id: view,
+        arg0: tick,
+        arg1: tag,
         ..Default::default()
     };
     crate::encode_frame(hdr, &[], None, None)

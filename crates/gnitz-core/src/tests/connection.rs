@@ -4,10 +4,11 @@
 use super::*;
 use crate::protocol::transport::poll_fd;
 use crate::test_support::{
-    framed, kv_rows, kv_schema, pushed_marker, reply_ctrl, reply_status, session_pair as pair, sync_answer, Peer,
+    decode_wal_block, delta_terminal, framed, kv_rows, kv_schema, pushed_marker, reply_ctrl, reply_rows, reply_status,
+    session_pair as pair, step_until_idle, sync_answer, Peer,
 };
 use crate::BatchAppender;
-use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireFlags, WireStatus};
+use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireStatus};
 
 /// Submit a read of every row of `tid`, decoded under `schema`.
 fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Sent<ScanReply> {
@@ -62,21 +63,6 @@ fn batch_b(pks: &[u64]) -> ZSetBatch {
             .f64_val(pk as f64 * 0.5);
     }
     b
-}
-
-fn reply_header(tid: u64, lsn: u64, cont: bool) -> ControlHeader {
-    ControlHeader {
-        target_id: tid,
-        flags: WireFlags { continuation: cont, ..Default::default() },
-        arg0: lsn,
-        ..Default::default()
-    }
-}
-
-/// A reply frame carrying `batch` and `lsn` in `arg0`, and no schema block;
-/// `cont` sets `continuation`.
-fn reply_rows(tid: u64, batch: &ZSetBatch, lsn: u64, cont: bool) -> Vec<u8> {
-    encode_frame(reply_header(tid, lsn, cont), &[], None, Some(batch))
 }
 
 #[test]
@@ -158,7 +144,7 @@ fn a_schema_block_on_a_read_reply_fails_the_slot_and_ends_the_session() {
     s.step(Interest::WRITE);
     peer.recv();
     peer.send(&encode_frame(
-        reply_header(7, 0, false),
+        ControlHeader { target_id: 7, ..Default::default() },
         &[],
         Some(&sa.to_block()),
         Some(&batch_a(&[5])),
@@ -403,17 +389,17 @@ fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
     // An encoded push is a full copy of its batch, so the counter grows with
     // what was pushed, not with how many times.
     assert!(push(&mut s).is_none());
-    let one = s.queued_bytes();
+    let one = s.transport.queued_bytes();
     assert!(one > b.len() * 32, "the frame carries the batch");
     assert!(push(&mut s).is_none());
-    assert_eq!(s.queued_bytes(), 2 * one, "bytes, not submits");
+    assert_eq!(s.transport.queued_bytes(), 2 * one, "bytes, not submits");
 
     // The cap is checked before queueing, so the push that crosses it goes
     // through and it is the *next* submit that is refused.
     while !s.at_capacity() {
         assert!(push(&mut s).is_none());
     }
-    let queued = s.queued_bytes();
+    let queued = s.transport.queued_bytes();
     assert!(
         queued - one < MAX_QUEUED_BYTES,
         "the last push was admitted under the cap"
@@ -421,7 +407,7 @@ fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
     let sent = s.requests_sent();
     assert!(matches!(push(&mut s), Some(Err(ClientError::Refused(_)))));
     assert_eq!(
-        (s.queued_bytes(), s.requests_sent()),
+        (s.transport.queued_bytes(), s.requests_sent()),
         (queued, sent),
         "the refusal queued nothing"
     );
@@ -430,7 +416,7 @@ fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
     // Writing gives the budget back — the counter tracks the write cursor,
     // not just the pushes.
     s.step(Interest::WRITE);
-    assert!(s.queued_bytes() < queued, "a flush releases what it wrote");
+    assert!(s.transport.queued_bytes() < queued, "a flush releases what it wrote");
 }
 
 #[test]
@@ -458,17 +444,6 @@ fn delta_item(view: u64) -> txn_frame::DeltaPollItem<'static> {
     }
 }
 
-/// `view`'s terminal of a delta poll, carrying cursor `(tag 1, tick)`.
-fn delta_terminal(view: u64, tick: u64) -> Vec<u8> {
-    let hdr = ControlHeader {
-        target_id: view,
-        arg0: tick,
-        arg1: 1,
-        ..Default::default()
-    };
-    encode_frame(hdr, &[], None, None)
-}
-
 /// A delta poll that fails whole — refused at target 0, or cut off by the
 /// connection — still ends every view it had yet to answer, once each.
 #[test]
@@ -479,7 +454,7 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
         s.step(Interest::WRITE);
         peer.recv();
         // View 7 is answered; the failure finds 8 and 9 open.
-        let mut wire = framed(&delta_terminal(7, 9));
+        let mut wire = framed(&delta_terminal(7, 1, 9));
         if refused {
             wire.extend(framed(&reply_status(0, WireStatus::Error, "refused")));
         }
@@ -522,20 +497,14 @@ fn an_abandoned_poll_queues_nothing() {
     let mut wire = Vec::new();
     for tid in [7, 8] {
         wire.extend(framed(&reply_rows(tid, &batch_a(&[tid]), 0, true)));
-        wire.extend(framed(&delta_terminal(tid, 9)));
+        wire.extend(framed(&delta_terminal(tid, 1, 9)));
     }
     peer.send_bytes(&wire);
-    while !s.interest().is_empty() {
-        s.step(Interest::from_revents(
-            poll_fd(s.as_raw_fd(), s.interest().poll_events(), None).unwrap(),
-        ));
-    }
+    step_until_idle(&mut s);
     let Some(Polled::Block(block)) = s.next_polled() else {
         panic!("the live poll's block comes first");
     };
-    let mut rows = ZSetBatch::new(&schema_a());
-    decode_wal_block_into(&mut rows, block.block(), &schema_a()).unwrap();
-    assert_eq!(rows, batch_a(&[8]));
+    assert_eq!(decode_wal_block(block.block(), &schema_a()).unwrap(), batch_a(&[8]));
     assert!(matches!(s.next_polled(), Some(Polled::End(Ok(_)))));
     assert!(s.polled_out());
 }
@@ -554,7 +523,7 @@ fn a_delta_read_yields_its_trains_rows_and_the_terminals_cursor() {
     peer.recv();
     peer.send(&reply_rows(7, &batch_a(&[1, 2]), 0, true));
     peer.send(&reply_rows(7, &batch_a(&[3]), 0, true));
-    peer.send(&delta_terminal(7, 9));
+    peer.send(&delta_terminal(7, 1, 9));
     let (reply, cursor) = await_reply(&mut s, sent).unwrap();
     assert_eq!(reply.batch, batch_a(&[1, 2, 3]));
     assert_eq!(reply.lsn, None);
@@ -585,7 +554,7 @@ fn a_delta_read_terminal_at_round_0_ends_the_session() {
     let sent = submit_delta_read(&mut s, &schema_a());
     s.step(Interest::WRITE);
     peer.recv();
-    peer.send(&delta_terminal(7, 0));
+    peer.send(&delta_terminal(7, 1, 0));
     let e = await_reply(&mut s, sent).expect_err("round 0 continues nothing");
     assert!(
         matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
@@ -629,7 +598,7 @@ fn a_resolve_reply_that_does_not_decode_ends_the_session() {
 fn pushed_train(view: u64, sub: u64, rows: &[u64], round: u64) -> Vec<u8> {
     let mut out = framed(&pushed_marker(view, sub));
     out.extend(framed(&reply_rows(view, &batch_a(rows), 0, true)));
-    out.extend(framed(&delta_terminal(view, round)));
+    out.extend(framed(&delta_terminal(view, 1, round)));
     out
 }
 
@@ -647,7 +616,7 @@ fn submit_kept_read(s: &mut Session, id: u64) -> Sent<(ScanReply, DeltaCursor)> 
 /// no row and round 3.
 fn subscribe_as(s: &mut Session, peer: &Peer, id: u64) {
     let sent = submit_kept_read(s, id);
-    peer.send(&delta_terminal(40, 3));
+    peer.send(&delta_terminal(40, 1, 3));
     assert_eq!(await_reply(s, sent).unwrap().1, cursor(3));
 }
 
@@ -690,7 +659,7 @@ fn a_kept_reads_terminal_parks_its_cursor() {
     let sent = submit_kept_read(&mut s, 5);
     assert!(s.take_pushed(5).is_err(), "unanswered, nothing is held");
     let mut bytes = framed(&reply_rows(40, &batch_a(&[1, 2]), 0, true));
-    bytes.extend(framed(&delta_terminal(40, 9)));
+    bytes.extend(framed(&delta_terminal(40, 1, 9)));
     bytes.extend(pushed_train(40, 5, &[3], 11));
     peer.send_bytes(&bytes);
     let (reply, at) = await_reply(&mut s, sent).unwrap();
@@ -717,18 +686,14 @@ fn an_abandoned_kept_poll_is_ended_by_the_next_sync() {
     s.submit_delta_poll(first, &[delta_item(7), delta_item(8)]);
     s.step(Interest::WRITE);
     peer.recv();
-    peer.send(&delta_terminal(7, 9));
+    peer.send(&delta_terminal(7, 1, 9));
     s.step(Interest::READ);
     s.abandon_poll();
     assert_eq!(s.requests_sent(), 1, "the poll alone");
-    let mut bytes = framed(&delta_terminal(8, 9));
+    let mut bytes = framed(&delta_terminal(8, 1, 9));
     bytes.extend(pushed_train(8, first + 1, &[1], 11));
     peer.send_bytes(&bytes);
-    while !s.interest().is_empty() {
-        s.step(Interest::from_revents(
-            poll_fd(s.as_raw_fd(), s.interest().poll_events(), None).unwrap(),
-        ));
-    }
+    step_until_idle(&mut s);
     assert!(!s.is_closed());
     assert!(s.take_pushed(first).is_ok(), "answered before its reader went");
     let gone = s.take_pushed(first + 1).expect_err("answered to nobody");
@@ -934,7 +899,7 @@ fn a_pushed_train_naming_another_view_ends_the_session() {
     let (mut s, peer) = pair();
     let sent = s.submit(COMMIT);
     let mut bytes = framed(&pushed_marker(40, 5));
-    bytes.extend(framed(&delta_terminal(41, 9)));
+    bytes.extend(framed(&delta_terminal(41, 1, 9)));
     peer.send_bytes(&bytes);
     assert!(matches!(await_reply(&mut s, sent), Err(ClientError::ConnectionLost(_))));
     assert!(s.is_closed());

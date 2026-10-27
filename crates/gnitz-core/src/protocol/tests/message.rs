@@ -1,9 +1,8 @@
 use super::*;
 use crate::test_support::{decode_wal_block, kv_rows, kv_schema};
-use crate::{PkColumn, Schema, ZSetBatch};
+use crate::PkColumn;
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::TypeCode;
-use gnitz_wire::{ClientVerb, WireConflictMode};
 
 /// A frame's schema block, decoded.
 fn frame_schema(buf: &[u8], ctrl: &DecodedControl) -> Option<Schema> {

@@ -70,9 +70,7 @@ fn server_hello(status: gnitz_wire::AuthStatus) -> Vec<u8> {
 
 /// The HELLO a server of another protocol version refuses ours with.
 fn other_version_hello() -> Vec<u8> {
-    let mut other = gnitz_wire::HELLO;
-    other[4] ^= 1;
-    framed(&other)
+    other_release_hello("")
 }
 
 /// The HELLO a server of another protocol version refuses ours with, naming
@@ -95,7 +93,6 @@ fn assert_refusal(r: Result<(), ClientError>, names: &str) {
 #[test]
 fn hello_checks_the_server_hello() {
     hello_against(b"", &server_hello(gnitz_wire::AuthStatus::Accepted)).unwrap();
-    assert_refusal(hello_against(b"", &other_version_hello()), "version mismatch");
     assert!(matches!(
         hello_against(b"", &framed(b"GNTX\0\0\0\0\0")),
         Err(ClientError::Protocol(ProtocolError::DecodeError(_)))

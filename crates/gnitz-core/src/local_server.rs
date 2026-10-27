@@ -48,7 +48,6 @@ pub struct LocalServer {
     scratch: Option<TempDir>,
     socket: PathBuf,
     data_dir: PathBuf,
-    ready: bool,
 }
 
 impl LocalServer {
@@ -91,7 +90,6 @@ impl LocalServer {
             scratch: Some(scratch),
             socket,
             data_dir,
-            ready: false,
         };
         server.await_ready()?;
         Ok(server)
@@ -120,11 +118,10 @@ impl LocalServer {
             return Ok(());
         }
         let report = match self.child.try_wait() {
-            Ok(Some(status)) if self.ready => Err(format!(
+            Ok(Some(status)) => Err(format!(
                 "{SERVER} exited ({status}) while it served:\n{}",
                 self.log_tail()
             )),
-            Ok(Some(_)) => Ok(()),
             _ => {
                 self.terminate();
                 Ok(())
@@ -171,7 +168,6 @@ impl LocalServer {
         let deadline = Instant::now() + BOOT_TIMEOUT;
         loop {
             if self.log().contains(READY_LINE) {
-                self.ready = true;
                 return Ok(());
             }
             let why = match self.child.try_wait() {
@@ -241,13 +237,11 @@ pub fn find_server(installed: Option<&Path>) -> Result<PathBuf, String> {
             )),
         };
     }
-    let on_path: Vec<PathBuf> = env::var_os("PATH")
-        .map(|path| env::split_paths(&path).collect())
-        .unwrap_or_default();
+    let path = env::var_os("PATH");
     installed
         .map(Path::to_path_buf)
         .into_iter()
-        .chain(on_path)
+        .chain(path.iter().flat_map(env::split_paths))
         .map(|dir| dir.join(SERVER))
         .find(|bin| is_executable(bin))
         .ok_or_else(|| match installed {

@@ -18,11 +18,7 @@ fn append_regions_bench() {
         ("long strings", Some("a value well past the inline cell")),
         ("integers", None),
     ] {
-        let tc = if cell.is_some() {
-            TypeCode::String
-        } else {
-            TypeCode::I64
-        };
+        let tc = cell.map_or(TypeCode::I64, |_| TypeCode::String);
         let schema = Schema::from_parts(
             vec![
                 ColumnDef::new("k", TypeCode::U64, false),

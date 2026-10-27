@@ -13,18 +13,16 @@ use crate::block_on;
 use crate::protocol::message::encode_frame;
 use crate::protocol::transport::poll_fd;
 use crate::test_support::{
-    interrupt_self_until, kv_schema, rel, reply_ctrl, reply_status, session_pair, sync_answer, Peer,
+    delta_terminal, interrupt_self_until, kv_rows, kv_schema, pushed_marker, rel, reply_ctrl, reply_status,
+    session_pair, sync_answer, Peer,
 };
 use crate::BlockingHost;
-use gnitz_wire::control::peek_control_block;
-use gnitz_wire::control::ControlHeader;
+use gnitz_wire::control::{peek_control_block, ControlHeader};
 use gnitz_wire::RelDescriptorBlob;
 use gnitz_wire::TypeCode;
-use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// The feed tag every cursor here carries.
 const TAG: u64 = 0xFEED;
@@ -208,44 +206,44 @@ impl Peer {
         held
     }
 
-    /// One view's answer inside a poll: a control-only terminal frame naming the
-    /// view and carrying the cursor `(tag, tick)`.
+    /// Send [`delta_terminal`]: one view's answer inside a poll.
     fn reply_watermark(&self, target_id: u64, tag: u64, tick: u64) {
-        let h = ControlHeader {
-            target_id,
-            arg0: tick,
-            arg1: tag,
-            ..Default::default()
-        };
-        self.send(&encode_frame(h, &[], None, None));
+        self.send(&delta_terminal(target_id, tag, tick));
     }
 
-    /// The next request's verb and control header.
-    fn expect_verb(&self, what: &str) -> (gnitz_wire::ClientVerb, ControlHeader) {
+    /// The next request, which must be a SYNC_PUSHED: its control header.
+    fn expect_sync(&self, what: &str) -> ControlHeader {
         let frame = self.expect_frame(what);
         let hdr = peek_control_block(&frame).expect("a control header").hdr;
-        (hdr.flags.verb, hdr)
+        assert_eq!(hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed, "{what}");
+        hdr
     }
 
-    /// The next request, which must be a SYNC_PUSHED.
-    fn expect_sync(&self, what: &str) {
-        assert_eq!(self.expect_verb(what).0, gnitz_wire::ClientVerb::SyncPushed, "{what}");
+    /// A data frame of `view`'s train carrying `rows`: a continuation, or with
+    /// `end` the terminal at round `end`.
+    fn send_rows(&self, view: u64, rows: &[(u64, i64, i64)], end: Option<u64>) {
+        let hdr = ControlHeader {
+            target_id: view,
+            flags: gnitz_wire::WireFlags {
+                continuation: end.is_none(),
+                ..Default::default()
+            },
+            arg0: end.unwrap_or(0),
+            arg1: TAG,
+            ..Default::default()
+        };
+        self.send(&encode_frame(hdr, &[], None, Some(&kv_rows(rows))));
     }
 
     /// One pushed train of subscription `sub` to `view`: `rows`, ending at
     /// round `tick` — or, with no round, in a fault.
     fn push_train(&self, view: u64, sub: u64, rows: &[(u64, i64, i64)], tick: Option<u64>) {
-        self.send(&crate::test_support::pushed_marker(view, sub));
+        self.send(&pushed_marker(view, sub));
         let Some(tick) = tick else {
             return self.send(&reply_status(view, WireStatus::Error, "lagged"));
         };
         if !rows.is_empty() {
-            let hdr = ControlHeader {
-                target_id: view,
-                flags: gnitz_wire::WireFlags { continuation: true, ..Default::default() },
-                ..Default::default()
-            };
-            self.send(&encode_frame(hdr, &[], None, Some(&crate::test_support::kv_rows(rows))));
+            self.send_rows(view, rows, None);
         }
         self.reply_watermark(view, TAG, tick);
     }
@@ -413,25 +411,15 @@ fn only_a_stale_registration_pays_a_resolve() {
 fn a_bootstrap_fills_the_store_frame_by_frame() {
     let (mut client, peer, log) = fixture(&[(7, "a", 0)]);
     let watched = log.clone();
-    let block = |rows: &[(u64, i64, i64)], tick: u64, continuation: bool| {
-        let hdr = ControlHeader {
-            target_id: 7,
-            flags: gnitz_wire::WireFlags { continuation, ..Default::default() },
-            arg0: tick,
-            arg1: TAG,
-            ..Default::default()
-        };
-        encode_frame(hdr, &[], None, Some(&crate::test_support::kv_rows(rows)))
-    };
     let h = std::thread::spawn(move || {
         assert_eq!(peer.expect_poll("the bootstrap"), vec![7]);
-        peer.send(&block(&[(1, 10, 1)], 0, true));
+        peer.send_rows(7, &[(1, 10, 1)], None);
         let until = Instant::now() + PATIENCE;
         while !watched.saw(|e| matches!(e, Ev::Fill(7))) {
             assert!(Instant::now() < until, "the first block never reached the store");
             std::thread::sleep(Duration::from_millis(1));
         }
-        peer.send(&block(&[(2, 20, 1)], 20, false));
+        peer.send_rows(7, &[(2, 20, 1)], Some(20));
     });
     let report = block_on(client.sync(Duration::ZERO))
         .map(|s| s.mirrored)
@@ -497,20 +485,12 @@ fn copies_without_a_cursor_are_read_whole_in_the_one_request() {
 fn a_refused_block_fails_its_view_and_no_other() {
     let (mut client, peer, log) = fixture(&[(7, "a", 0), (8, "b", 4)]);
     log.fail_next_fill_of(7);
-    let block = |rows: &[(u64, i64, i64)]| {
-        let hdr = ControlHeader {
-            target_id: 7,
-            flags: gnitz_wire::WireFlags { continuation: true, ..Default::default() },
-            ..Default::default()
-        };
-        encode_frame(hdr, &[], None, Some(&crate::test_support::kv_rows(rows)))
-    };
     let h = std::thread::spawn(move || {
         let mut kept = 0;
         for (tid, id) in peer.expect_kept("the poll") {
             if tid == 7 {
-                peer.send(&block(&[(1, 10, 1)]));
-                peer.send(&block(&[(2, 20, 1)]));
+                peer.send_rows(7, &[(1, 10, 1)], None);
+                peer.send_rows(7, &[(2, 20, 1)], None);
             } else {
                 kept = id;
             }
@@ -829,9 +809,10 @@ fn an_interrupted_poll_reannounces_its_reseed() {
     let peer = h.join().unwrap();
 
     let h = std::thread::spawn(move || {
-        peer.send(&reply_ctrl(0, 0)); // the abandoned re-resolve
-                                      // 7's whole read left it subscribed, so the first poll is a sync and
-                                      // 8's delta read; after it both are subscribed, and the next is a sync.
+        // The abandoned re-resolve.
+        peer.send(&reply_ctrl(0, 0));
+        // 7's whole read left it subscribed, so the first poll is a sync and
+        // 8's delta read; after it both are subscribed, and the next is a sync.
         peer.expect_sync("the first poll");
         peer.send(&sync_answer(None));
         assert_eq!(peer.expect_poll("a poll"), vec![8]);
@@ -1082,16 +1063,18 @@ fn a_subscription_that_ended_is_continued_by_a_delta_read() {
     assert_eq!(log.take(), [Ev::Advance(7, 13)]);
 }
 
-/// Subscribe a reader to view 40 after `from`, its read answered with no row
-/// and `from` again; the subscription's id.
-fn subscribe_reader(client: &mut GnitzClient, peer: Peer, from: DeltaCursor, whole: &[u8]) -> (u64, Peer) {
+/// Subscribe a reader to view 40 after round 9, its read answered with no row
+/// and that round again; the subscription's id.
+fn subscribe_reader(client: &mut GnitzClient, peer: Peer) -> (u64, Peer) {
+    let from = DeltaCursor::from_pair(TAG, 9).unwrap();
+    let whole = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
     let h = std::thread::spawn(move || {
         let kept = peer.expect_kept("the reader's subscription");
         peer.reply_watermark(40, from.tag, from.tick.get());
         (peer, kept)
     });
     let schema = Arc::new(kv_schema(TypeCode::I64));
-    let (sub, rows, at) = block_on(client.subscribe(Target::from(40), Some(from), &schema, whole)).expect("subscribe");
+    let (sub, rows, at) = block_on(client.subscribe(Target::from(40), Some(from), &schema, &whole)).expect("subscribe");
     let (peer, kept) = h.join().unwrap();
     assert_eq!((kept, rows.batch.len(), at), (vec![(40, sub)], 0, from));
     (sub, peer)
@@ -1100,9 +1083,7 @@ fn subscribe_reader(client: &mut GnitzClient, peer: Peer, from: DeltaCursor, who
 #[test]
 fn one_sync_serves_a_reader_and_the_mirror() {
     let (mut client, peer, log, subs) = subscribed();
-    let whole = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
-    let from = DeltaCursor::from_pair(TAG, 9).unwrap();
-    let (sub, peer) = subscribe_reader(&mut client, peer, from, &whole);
+    let (sub, peer) = subscribe_reader(&mut client, peer);
     let h = std::thread::spawn(move || {
         peer.expect_sync("the sync");
         peer.push_train(7, subs[&7], &[(1, 10, 1)], Some(11));
@@ -1127,9 +1108,7 @@ fn one_sync_serves_a_reader_and_the_mirror() {
 #[test]
 fn an_interrupted_sync_keeps_a_readers_deltas() {
     let (mut client, peer, _log) = fixture(&[(7, "a", 4)]);
-    let whole = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
-    let from = DeltaCursor::from_pair(TAG, 9).unwrap();
-    let (sub, peer) = subscribe_reader(&mut client, peer, from, &whole);
+    let (sub, peer) = subscribe_reader(&mut client, peer);
     let reading = Arc::new(AtomicBool::new(false));
     let watched = Arc::clone(&reading);
     client.host = Box::new(BlockingHost::with_hook(Box::new(move || {
@@ -1192,8 +1171,7 @@ fn a_view_that_keeps_failing_does_not_end_the_hold() {
                 _ => peer.send(&reply_status(id, WireStatus::Error, "gone")),
             }
         }
-        let (verb, hdr) = peer.expect_verb("the second sync");
-        assert_eq!(verb, gnitz_wire::ClientVerb::SyncPushed);
+        let hdr = peer.expect_sync("the second sync");
         peer.send(&sync_answer(None));
         assert_eq!(peer.expect_poll("the retry"), vec![8]);
         peer.send(&reply_status(8, WireStatus::Error, "gone"));
@@ -1219,7 +1197,7 @@ fn a_sync_over_an_untaken_train_asks_for_no_hold() {
         // Ahead of the reply, as the trains of a sync nobody finished are.
         peer.push_train(8, subs[&8], &[(2, 20, 1)], Some(15));
         peer.send(&reply_ctrl(0, 4242));
-        let (_, hdr) = peer.expect_verb("the sync");
+        let hdr = peer.expect_sync("the sync");
         peer.send(&sync_answer(None));
         hdr.arg0
     });

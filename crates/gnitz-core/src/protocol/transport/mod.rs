@@ -62,7 +62,7 @@ impl Inner {
     fn has_pending_ciphertext(&self) -> bool {
         match self {
             Inner::Unix(_) => false,
-            Inner::Tls(t) => t.wants_write(),
+            Inner::Tls(t) => t.conn.wants_write(),
         }
     }
 
@@ -77,7 +77,7 @@ impl Inner {
     fn as_fd(&self) -> BorrowedFd<'_> {
         match self {
             Inner::Unix(s) => s.as_fd(),
-            Inner::Tls(t) => t.as_fd(),
+            Inner::Tls(t) => t.sock.as_fd(),
         }
     }
 }
@@ -181,8 +181,7 @@ impl ClientTransport {
         Ok(ClientTransport::new(Inner::Unix(stream)))
     }
 
-    /// The stream socket every driver polls: the AF_UNIX socket, or the
-    /// `TcpStream` under TLS. Never used for framed I/O on the TLS variant.
+    /// The stream socket a driver polls: the AF_UNIX socket, or the `TcpStream` under TLS.
     pub fn as_raw_fd(&self) -> RawFd {
         self.inner.as_fd().as_raw_fd()
     }
@@ -202,7 +201,7 @@ impl ClientTransport {
             };
             match poll_fd(self.as_raw_fd(), events, Some(until)) {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                polled => polled.map_err(ProtocolError::from)?,
+                polled => polled?,
             };
             let mut frames = Vec::new();
             let read = self.read(|frame| {
@@ -246,7 +245,7 @@ impl ClientTransport {
         if let Some(tap) = &self.tap {
             tap.note(Direction::Sent, &payload);
         }
-        self.queue.push(gnitz_wire::frame_len_prefix(payload.len()), payload);
+        self.queue.push(payload);
     }
 
     /// Write what the fd accepts from the queue cursor. Never parks; what is
@@ -257,11 +256,10 @@ impl ClientTransport {
             if self.inner.has_pending_ciphertext() || self.queue.is_empty() {
                 return Ok(());
             }
-            let ClientTransport { inner, queue, .. } = self;
-            let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOV_MAX_CHUNK.min(2 * queue.len()));
-            queue.build_slices(&mut slices);
-            match inner.write_slices(&slices)? {
-                Some(n) => queue.advance(n),
+            let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOV_MAX_CHUNK.min(2 * self.queue.frames.len()));
+            self.queue.build_slices(&mut slices);
+            match self.inner.write_slices(&slices)? {
+                Some(n) => self.queue.advance(n),
                 None => return Ok(()),
             }
         }
@@ -282,7 +280,7 @@ impl ClientTransport {
     /// Shut the socket down so the peer sees EOF, and drop every queued frame.
     /// The fd stays open until the transport drops, since a reactor may still
     /// have it registered.
-    pub fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         // SAFETY: `as_raw_fd` is this transport's own open socket.
         let _ = unsafe { libc::shutdown(self.as_raw_fd(), libc::SHUT_RDWR) };
         self.queue = OutQueue::default();
@@ -342,21 +340,13 @@ impl ClientTransport {
 
 // ── Framing: the outbound queue ──────────────────────────────────────────────
 
-/// Slices per `flush` chunk: Linux's `UIO_MAXIOV`. std clamps to `IOV_MAX`
-/// itself, so this bounds the local slice array rather than the syscall.
+/// Slices per `flush` chunk, bounding the local slice array: Linux's `UIO_MAXIOV`.
 const IOV_MAX_CHUNK: usize = 1024;
 
 /// One queue entry: a frame's payload and its own length prefix.
 struct QueuedFrame {
     prefix: [u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES],
     payload: Vec<u8>,
-}
-
-impl QueuedFrame {
-    /// The two slices in wire order.
-    fn segments(&self) -> [&[u8]; 2] {
-        [&self.prefix, &self.payload]
-    }
 }
 
 /// The owned outbound queue and its partial-write cursor: one byte offset into
@@ -371,8 +361,9 @@ struct OutQueue {
 }
 
 impl OutQueue {
-    fn push(&mut self, prefix: [u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES], payload: Vec<u8>) {
+    fn push(&mut self, payload: Vec<u8>) {
         self.bytes += gnitz_wire::FRAME_LEN_PREFIX_BYTES + payload.len();
+        let prefix = gnitz_wire::frame_len_prefix(payload.len());
         self.frames.push_back(QueuedFrame { prefix, payload });
     }
 
@@ -380,15 +371,11 @@ impl OutQueue {
         self.frames.is_empty()
     }
 
-    fn len(&self) -> usize {
-        self.frames.len()
-    }
-
     /// Slices from the cursor forward, at most `IOV_MAX_CHUNK` of them.
     fn build_slices<'a>(&'a self, out: &mut Vec<IoSlice<'a>>) {
         let mut skip = self.off;
         for f in &self.frames {
-            for s in f.segments() {
+            for s in [&f.prefix[..], &f.payload[..]] {
                 if skip >= s.len() {
                     skip -= s.len();
                     continue;
@@ -410,7 +397,6 @@ impl OutQueue {
         self.bytes -= n;
         self.off += n;
         while let Some(f) = self.frames.front() {
-            // Ends the borrow before the pop.
             let total = gnitz_wire::FRAME_LEN_PREFIX_BYTES + f.payload.len();
             if self.off < total {
                 break;

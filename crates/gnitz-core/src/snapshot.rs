@@ -94,7 +94,7 @@ impl GnitzClient {
     }
 
     /// Every row of relation `tid` as snapshot `id` holds it, in one batch.
-    pub async fn snapshot_rows(&mut self, id: u64, tid: u64, schema: &Arc<Schema>) -> Result<ZSetBatch, ClientError> {
+    async fn snapshot_rows(&mut self, id: u64, tid: u64, schema: &Arc<Schema>) -> Result<ZSetBatch, ClientError> {
         let mut all = ZSetBatch::new(schema);
         self.snapshot_read(id, tid, schema, DEFAULT_PAGE_ROWS, |batch| {
             all.extend_from_owned(batch);

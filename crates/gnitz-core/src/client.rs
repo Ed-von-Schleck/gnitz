@@ -103,16 +103,6 @@ pub enum FkTarget {
     SelfTable { col: u32, on_delete: FkAction },
 }
 
-impl FkTarget {
-    /// The referenced column, once the table being created has the id `own_id`.
-    fn resolve(self, own_id: u64) -> FkRef {
-        match self {
-            FkTarget::Table(fk) => fk,
-            FkTarget::SelfTable { col, on_delete } => FkRef { table_id: own_id, col, on_delete },
-        }
-    }
-}
-
 /// The ids one SERIAL reservation takes when the statement asks for fewer. Each
 /// reservation is a round trip to the master.
 const SERIAL_RANGE_SIZE: u64 = 64;
@@ -214,30 +204,11 @@ fn passthrough_definition(source: &RelDescriptor) -> ViewDefinition {
     }
 }
 
-/// How an internal chain segment is named, from its own allocated view id.
-///
-/// Unique because vids are, and unspellable at every SQL surface because
-/// [`gnitz_wire::validate_user_identifier`] rejects a leading `_`. Ownership is the
-/// `owner_view_id` column, not the name.
-fn segment_name(vid: u64) -> String {
-    format!("_seg{vid}")
-}
-
 /// The symbolic id by which a [`ViewBundle`] circuit's `ScanDelta` names
 /// `segments[j]`. No durable relation id reaches
 /// [`gnitz_wire::CATALOG_ID_CEILING`], so it is no relation's own.
 pub fn segment_id(j: u64) -> u64 {
     gnitz_wire::CATALOG_ID_CEILING + j
-}
-
-/// The relation `source` names in a chain whose first member stands at `base`.
-/// A [`segment_id`] past the chain's end becomes an id no lower than the user-named
-/// view's own, which the engine refuses.
-fn source_at(source: u64, base: u64) -> u64 {
-    match source.checked_sub(gnitz_wire::CATALOG_ID_CEILING) {
-        Some(j) => base + j,
-        None => source,
-    }
 }
 
 /// One view in a [`ViewBundle`].
@@ -265,19 +236,26 @@ pub struct ViewBundle {
 
 impl ViewBundle {
     /// The chain's catalog rows at `+1`, its first member standing at `base`:
-    /// each segment named by [`segment_name`] and owned by the user-named view,
+    /// each segment named `_seg{vid}` and owned by the user-named view,
     /// which stands last under its own name and props, recording `definition`.
     fn put_rows(&self, b: &mut DdlBundle, definition: &[u8], schema_id: u64, base: u64) {
         let owner_vid = base + self.segments.len() as u64;
         for (pv, vid) in self.segments.iter().chain([&self.view]).zip(base..) {
             let mut circuit = pv.circuit.clone();
+            // A `segment_id` past the chain's end becomes an id no lower than the
+            // user-named view's own, which the engine refuses.
             for src in circuit.sources_mut() {
-                *src = source_at(*src, base);
+                if let Some(j) = src.checked_sub(gnitz_wire::CATALOG_ID_CEILING) {
+                    *src = base + j;
+                }
             }
+            // A segment's name is unique because vids are, and no SQL surface can
+            // spell it because gnitz_wire::validate_user_identifier rejects a leading
+            // `_`; the owner_view_id column records its ownership.
             let (name, owner_view_id, props, definition) = if vid == owner_vid {
                 (self.name.name().to_string(), 0, self.props, definition)
             } else {
-                (segment_name(vid), owner_vid, ViewProps::default(), &[][..])
+                (format!("_seg{vid}"), owner_vid, ViewProps::default(), &[][..])
             };
 
             // A foreign key constrains a base table, not a view.
@@ -616,6 +594,11 @@ impl GnitzClient {
         self.session.requests_sent()
     }
 
+    /// Whether the connection has ended, so no request on it can be answered.
+    pub fn is_closed(&self) -> bool {
+        self.session.is_closed()
+    }
+
     // ── Waiting ────────────────────────────────────────────────────────────
 
     pub(crate) fn ack(&mut self, req: Request<'_>) -> Pending<'_, u64> {
@@ -685,14 +668,9 @@ impl GnitzClient {
 
     // --- Raw ops ---
 
-    /// Allocate a run of `n` catalog object ids, returning its first.
-    async fn alloc_ids(&mut self, n: u64) -> Result<u64, ClientError> {
-        self.ack(Request::AllocIds(n)).await
-    }
-
     /// Allocate one catalog object id (schema, relation or index).
     pub async fn alloc_id(&mut self) -> Result<u64, ClientError> {
-        self.alloc_ids(1).await
+        self.ack(Request::AllocIds(1)).await
     }
 
     /// Push `batch` into `target` under `mode`. SQL `INSERT` uses `Error` to get
@@ -741,8 +719,7 @@ impl GnitzClient {
     /// The descriptor of the mirrored view `name`, while its copy answers
     /// reads. As stale as the copy.
     pub fn mirrored_desc(&self, name: &RelName) -> Option<Arc<RelDescriptor>> {
-        let view = self.mirror.as_deref()?.answering(name)?;
-        Some(Arc::clone(&view.desc))
+        self.mirror.as_deref()?.answering(name)
     }
 
     /// What the last RESOLVE answered for `name`. Only a request
@@ -940,11 +917,6 @@ impl GnitzClient {
     // then routes into, `txn_commit` ships it as one atomic frame, `txn_rollback`
     // discards it. All state-machine errors are raised here; the SQL dispatch
     // arms and the Python context manager only translate them.
-
-    /// Whether the connection has ended, so no request on it can be answered.
-    pub fn is_closed(&self) -> bool {
-        self.session.is_closed()
-    }
 
     /// True while a transaction is open.
     pub fn txn_active(&self) -> bool {
@@ -1255,7 +1227,7 @@ impl GnitzClient {
                 // Only the user-named view, ahead of the new chain's `+1`s: the
                 // engine cascades its segments.
                 b.retract(VIEW_TAB, views, i);
-                (schema_id, self.alloc_ids(n_views as u64).await?)
+                (schema_id, self.ack(Request::AllocIds(n_views as u64)).await?)
             }
             None => self.schema_and_ids(view.schema(), n_views as u64).await?,
         };
@@ -1411,11 +1383,6 @@ impl GnitzClient {
         self.commit_ddl(b).await
     }
 
-    /// [`Self::resolve`], with a missing relation an error.
-    pub async fn resolve_relation(&mut self, name: &RelName) -> Result<Arc<RelDescriptor>, ClientError> {
-        self.resolve(name).await?.ok_or_else(|| not_found("relation", name))
-    }
-
     // --- Relation resolution ---
 
     /// The descriptor for `name` as the server answers it now, or `None` when
@@ -1430,7 +1397,12 @@ impl GnitzClient {
         Ok(found)
     }
 
-    // --- Private catalog-lookup helpers ---
+    /// [`Self::resolve`], with a missing relation an error.
+    pub async fn resolve_relation(&mut self, name: &RelName) -> Result<Arc<RelDescriptor>, ClientError> {
+        self.resolve(name).await?.ok_or_else(|| not_found("relation", name))
+    }
+
+    // --- Catalog lookups ---
 
     /// The id of the live schema `schema_name` (already canonical), `None` when
     /// there is none.
@@ -1692,7 +1664,10 @@ impl TxnBuffer {
 /// column `i`'s target; a column past its end has none.
 fn append_col_rows(b: &mut DdlBundle, owner_id: u64, columns: &[ColumnDef], fks: &[Option<FkTarget>]) {
     for (i, cd) in columns.iter().enumerate() {
-        let fk = fks.get(i).copied().flatten().map(|t| t.resolve(owner_id));
+        let fk = fks.get(i).copied().flatten().map(|t| match t {
+            FkTarget::Table(fk) => fk,
+            FkTarget::SelfTable { col, on_delete } => FkRef { table_id: owner_id, col, on_delete },
+        });
         b.put(&ColTabRow::of(owner_id, i as u64, cd, fk), 1);
     }
 }

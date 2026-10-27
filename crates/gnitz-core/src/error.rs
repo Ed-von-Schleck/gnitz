@@ -16,9 +16,8 @@ pub enum ClientError {
     /// The connection failed: every request outstanding on it, and every later
     /// one, carries this one cause.
     ConnectionLost(ProtocolError),
-    /// A mirror store refused or failed. Kept as its own variant rather than
-    /// flattened to a message so [`MirrorError::Poisoned`] stays a class a host
-    /// can catch — a poisoned copy is recovered by
+    /// A mirror store refused or failed. [`MirrorError::Poisoned`] is a class a
+    /// host catches: a poisoned copy is recovered by
     /// [`GnitzClient::close_mirror`](crate::GnitzClient::close_mirror) and by
     /// nothing else.
     Mirror(MirrorError),
@@ -31,6 +30,12 @@ pub enum ClientError {
 impl From<ProtocolError> for ClientError {
     fn from(e: ProtocolError) -> Self {
         ClientError::Protocol(e)
+    }
+}
+
+impl From<MirrorError> for ClientError {
+    fn from(e: MirrorError) -> Self {
+        ClientError::Mirror(e)
     }
 }
 
