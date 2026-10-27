@@ -167,10 +167,13 @@ impl LocalServer {
     fn await_ready(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + BOOT_TIMEOUT;
         loop {
+            // The status before the log: a server that has exited has written
+            // all of its log, so one that served before exiting is read as served.
+            let status = self.child.try_wait();
             if self.log().contains(READY_LINE) {
                 return Ok(());
             }
-            let why = match self.child.try_wait() {
+            let why = match status {
                 Ok(Some(status)) => format!("exited ({status}) before it served"),
                 _ if Instant::now() >= deadline => format!("did not serve within {BOOT_TIMEOUT:?}"),
                 _ => {
