@@ -377,7 +377,7 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
     with_watchdog(120, move || {
         let (_setup, _, tid, schema) = client_with_table(&target);
         let mut s = Session::connect(&target).unwrap();
-        set_small_bufs(s.as_raw_fd());
+        set_small_bufs(s.as_fd().as_raw_fd());
 
         let (n_pushes, per) = (30u64, 25_000u64);
         let pushes: Vec<_> = (0..n_pushes)
@@ -414,7 +414,7 @@ fn a_stalled_scan_client_is_evicted_by_the_send_deadline() {
             block_on(setup.push(tid, &schema, rows(&schema, 0..200_000), WireConflictMode::Update)).unwrap();
 
             let mut s = Session::connect(&target).unwrap();
-            set_small_bufs(s.as_raw_fd());
+            set_small_bufs(s.as_fd().as_raw_fd());
             let all = ReadSpec::all_rows(ReadBound::None);
             let _unread = s.submit_scan(tid.into(), &all, &schema);
             assert!(write_out(&mut s));
@@ -440,7 +440,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
         block_on(setup.push(tid, &schema, rows(&schema, 0..200_000), WireConflictMode::Update)).unwrap();
 
         let mut s = Session::connect(&target).unwrap();
-        set_small_bufs(s.as_raw_fd());
+        set_small_bufs(s.as_fd().as_raw_fd());
         let all = ReadSpec::all_rows(ReadBound::None);
         let _unread = s.submit_scan(tid.into(), &all, &schema);
 

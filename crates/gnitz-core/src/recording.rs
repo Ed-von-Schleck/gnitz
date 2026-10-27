@@ -130,8 +130,9 @@ impl Tap {
         Tap { file: Arc::clone(&recording.file), conn }
     }
 
-    /// Record `frame`, which this connection sent or received. One write per
-    /// record, so the connections sharing a file never interleave inside one.
+    /// Record `frame`, which this connection sent or received, whole under the
+    /// file's lock: the connections sharing the file never interleave inside a
+    /// record.
     pub(crate) fn note(&self, dir: Direction, frame: &[u8]) {
         let mut w = Writer::with_capacity(1 + 4 + 4 + frame.len());
         Recorded { conn: self.conn, dir, frame }.write(&mut w);

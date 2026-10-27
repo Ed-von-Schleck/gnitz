@@ -1,6 +1,5 @@
 use crate::mirror::MirrorError;
-use crate::ProtocolError;
-use gnitz_wire::WireFault;
+use gnitz_wire::{FrameLenError, WireFault};
 use std::fmt;
 use std::sync::Arc;
 
@@ -66,3 +65,39 @@ impl fmt::Display for ClientError {
 }
 
 impl std::error::Error for ClientError {}
+
+#[derive(Debug, Clone)]
+pub enum ProtocolError {
+    DecodeError(String),
+    IoError(Arc<std::io::Error>),
+}
+
+impl fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtocolError::DecodeError(msg) => write!(f, "decode error: {msg}"),
+            ProtocolError::IoError(e) => write!(f, "io error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ProtocolError {}
+
+impl From<std::io::Error> for ProtocolError {
+    fn from(e: std::io::Error) -> Self {
+        ProtocolError::IoError(Arc::new(e))
+    }
+}
+
+impl From<FrameLenError> for ProtocolError {
+    fn from(e: FrameLenError) -> Self {
+        match e {
+            FrameLenError::Zero => ProtocolError::DecodeError("zero-length frame".into()),
+            FrameLenError::Oversize { len } => ProtocolError::DecodeError(format!(
+                "payload length {len} exceeds maximum {} bytes",
+                gnitz_wire::MAX_FRAME_PAYLOAD
+            )),
+            FrameLenError::Alloc { .. } => std::io::Error::from(std::io::ErrorKind::OutOfMemory).into(),
+        }
+    }
+}

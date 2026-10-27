@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{encode_wal_block, wide_rows, wide_schema};
+use crate::test_support::{wide_rows, wide_schema};
 use std::hint::black_box;
 
 /// Instructions to validate and to encode a push of four nullable columns, at
@@ -33,40 +33,5 @@ fn push_validate_bench() {
                 per_row(e),
             );
         }
-    }
-}
-
-/// Instructions to decode a one-row reply into a fresh batch and into one that
-/// already owns its buffers, by column count.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn reply_alloc_cost_bench() {
-    const ROUNDS: u64 = 2000;
-    let counter = gnitz_foundation::perf::Counter::instructions();
-    for ncols in [4usize, 16, 64] {
-        let schema = wide_schema(ncols, false);
-        let block = encode_wal_block(&wide_rows(&schema, 1, 0));
-        let (mut fresh, mut warm) = (0, 0);
-        for _ in 0..ROUNDS {
-            fresh += counter
-                .measure(|| {
-                    let mut sink = ZSetBatch::new(&schema);
-                    decode_wal_block_into(&mut sink, black_box(&block), &schema).unwrap();
-                    black_box(&sink);
-                })
-                .1;
-            let mut sink = ZSetBatch::with_capacity(&schema, 4);
-            warm += counter
-                .measure(|| {
-                    decode_wal_block_into(&mut sink, black_box(&block), &schema).unwrap();
-                    black_box(&sink);
-                })
-                .1;
-        }
-        println!(
-            "reply_alloc_cost_bench {ncols} cols: new + decode + drop {} instr, decode into owned buffers {}",
-            fresh / ROUNDS,
-            warm / ROUNDS
-        );
     }
 }

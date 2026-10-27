@@ -5,7 +5,7 @@
 use super::*;
 use gnitz_core::sys_schema;
 use gnitz_wire::sys_rows::{SchemaTabRow, SysRow};
-use gnitz_wire::{PkColList, ViewProps, SCHEMA_TAB, SEQ_TAB};
+use gnitz_wire::{PkColList, SCHEMA_TAB, SEQ_TAB};
 
 /// A SCHEMA_TAB batch registering `(schema_id, name)`.
 fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
@@ -48,8 +48,8 @@ fn a_bundle_the_handler_cannot_read_as_one_is_refused_whole() {
     assert!(err.contains("not writable from the wire"), "{err}");
 
     // Neither wrote anything: both names are still free.
-    block_on(client.create_schema("one")).unwrap();
-    block_on(client.create_schema("two")).unwrap();
+    block_on(client.create_schema("one", false)).unwrap();
+    block_on(client.create_schema("two", false)).unwrap();
 }
 
 /// A unique index the catalog's owner or dropped-column rule refuses is refused
@@ -72,8 +72,7 @@ fn a_unique_index_the_catalog_refuses_is_not_scanned_for_duplicates() {
     };
 
     // The backfill copies both rows into the view.
-    let source = block_on(client.resolve_relation(&rel(&sn, "t"))).unwrap();
-    let vid = block_on(client.create_view(&rel(&sn, "v"), &source, ViewProps::default())).unwrap();
+    let vid = block_on(client.create_view_chain(bundle(rel(&sn, "v"), Vec::new(), segment(tid, &schema)))).unwrap();
     let err = unique_on_v(&mut client, vid);
     assert!(err.contains("cannot carry a UNIQUE index"), "{err}");
 

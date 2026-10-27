@@ -469,7 +469,7 @@ fn a_qualified_name_reaches_another_schema() {
     let mut db = Db::boot(4);
     let sn = db.sn.clone();
     let other = unique_schema("o");
-    block_on(db.client.create_schema(&other)).unwrap();
+    block_on(db.client.create_schema(&other, false)).unwrap();
 
     // Two relations named `t`, one per schema.
     db.exec(&format!(

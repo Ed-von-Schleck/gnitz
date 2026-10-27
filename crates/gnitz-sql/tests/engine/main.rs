@@ -60,7 +60,7 @@ impl Db {
     fn on(srv: ServerHandle) -> Db {
         let sn = unique_schema("s");
         let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
-        block_on(client.create_schema(&sn)).unwrap();
+        block_on(client.create_schema(&sn, false)).unwrap();
         Db { client, sn, srv: Rc::new(srv) }
     }
 

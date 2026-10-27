@@ -116,7 +116,7 @@ impl AsyncClient {
     /// what it returns — [`ClientError::Closed`] if the driver is gone.
     ///
     /// ```ignore
-    /// client.run(|c| Box::pin(c.create_schema("s"))).await??;
+    /// client.run(|c| Box::pin(c.create_schema("s", false))).await??;
     /// ```
     pub fn run<T, F>(&self, f: F) -> Sent<T>
     where

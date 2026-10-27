@@ -23,16 +23,14 @@ mod view_def;
 pub use catalog::{Catalog, CatalogRelation, IndexRow, RelProps};
 pub use client::{
     block_on, key_reply, not_found, segment_id, serve, BlockingHost, BoxFut, FkTarget, GnitzClient, Host,
-    InlineUniqueIndex, Job, Op, ParkHook, Pending, PlannedView, TableDef, ViewBundle, MAX_CHAIN_SEGMENTS,
-    RMW_MAX_ATTEMPTS,
+    InlineUniqueIndex, Job, Op, ParkHook, Pending, PlannedView, TableDef, ViewBundle, RMW_MAX_ATTEMPTS,
 };
 pub use connection::{
     promise, DeltaCursor, Interest, Promise, RelDescriptor, Request, ScanReply, Sent, Session, SnapshotPage, Target,
     MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
-pub use error::ClientError;
+pub use error::{ClientError, ProtocolError};
 pub use mirror::{MirrorError, MirrorStore, Planner, PollOutcome, PollResult, Subscription};
-pub use protocol::error::ProtocolError;
 pub use protocol::message::{encode_ddl_txn, PushFamily};
 pub(crate) use protocol::message::{encode_frame, encode_push_txn};
 pub use protocol::transport::ClientTransport;

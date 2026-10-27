@@ -8,9 +8,8 @@
 //! entirely on the driver visiting a producer before its consumer.
 
 use super::*;
-use gnitz_core::{PlannedView, RelName, ViewBundle, ViewDefinition};
 use gnitz_wire::sys_rows::ViewTabSlot;
-use gnitz_wire::{Circuit, ViewProps, VIEW_TAB};
+use gnitz_wire::VIEW_TAB;
 
 /// Base table `t(pk BIGINT PK, v BIGINT)` in a fresh schema, holding pks 1..=3:
 /// `(schema name, tid, schema)`.
@@ -22,38 +21,6 @@ fn make_base(client: &mut GnitzClient) -> (String, u64, Arc<Schema>) {
 
 fn base_rows(schema: &Schema) -> ZSetBatch {
     rows(schema, 1..=3)
-}
-
-/// One identity segment reading `source_id`.
-fn segment(source_id: u64, schema: &Arc<Schema>) -> PlannedView {
-    let mut circuit = Circuit::default();
-    circuit.input_delta(source_id, ReadBound::None);
-    PlannedView {
-        circuit,
-        schema: Arc::clone(schema),
-        pk_repeats: false,
-    }
-}
-
-/// A definition no reader of these tests renders.
-fn definition() -> ViewDefinition {
-    ViewDefinition {
-        query: "SELECT 1".to_string(),
-        body_columns: Vec::new(),
-        refs: Vec::new(),
-    }
-}
-
-/// `segments` then `view`, created as `name` with default options.
-fn bundle(name: RelName, segments: Vec<PlannedView>, view: PlannedView) -> ViewBundle {
-    ViewBundle {
-        name,
-        props: ViewProps::default(),
-        replacing: None,
-        segments,
-        view,
-        definition: definition(),
-    }
 }
 
 /// A three-view bundle: segment `h` reads base, segment `g` reads `h`, and `f`
@@ -193,18 +160,6 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         live_views(&mut client),
         only_taken,
         "an over-wide circuit commits nothing"
-    );
-
-    let over = gnitz_core::MAX_CHAIN_SEGMENTS + 1;
-    let segments = (1..over).map(|_| segment(base_tid, &schema)).collect();
-    let planned = bundle(rel(&sn, "x"), segments, segment(base_tid, &schema));
-    let err = block_on(client.create_view_chain(planned)).unwrap_err().to_string();
-    assert!(
-        err.contains(&format!(
-            "{over} segments, exceeding the {}-segment limit",
-            gnitz_core::MAX_CHAIN_SEGMENTS
-        )),
-        "got: {err}"
     );
 }
 

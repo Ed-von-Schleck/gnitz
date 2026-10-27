@@ -13,14 +13,14 @@ use crate::block_on;
 use crate::protocol::message::encode_frame;
 use crate::protocol::transport::poll_fd;
 use crate::test_support::{
-    delta_terminal, interrupt_self_until, kv_rows, kv_schema, pushed_marker, rel, reply_ctrl, reply_status,
+    delta_terminal, framed, interrupt_self_until, kv_rows, kv_schema, pushed_marker, rel, reply_ctrl, reply_status,
     session_pair, sync_answer, Peer,
 };
 use crate::BlockingHost;
 use gnitz_wire::control::{peek_control_block, ControlHeader};
 use gnitz_wire::RelDescriptorBlob;
 use gnitz_wire::TypeCode;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -162,6 +162,22 @@ const PATIENCE: Duration = Duration::from_secs(5);
 // A script's peer is dropped when the script ends, so a request it does not
 // expect fails fast instead of parking the client; each test counts
 // `requests_sent` to catch one.
+/// A data frame of `view`'s train carrying `rows`: a continuation, or with
+/// `end` the terminal at round `end`.
+fn rows_frame(view: u64, rows: &[(u64, i64, i64)], end: Option<u64>) -> Vec<u8> {
+    let hdr = ControlHeader {
+        target_id: view,
+        flags: gnitz_wire::WireFlags {
+            continuation: end.is_none(),
+            ..Default::default()
+        },
+        arg0: end.unwrap_or(0),
+        arg1: TAG,
+        ..Default::default()
+    };
+    encode_frame(hdr, &[], None, Some(&kv_rows(rows)))
+}
+
 impl Peer {
     /// The next request frame, which must already be on its way.
     fn expect_frame(&self, what: &str) -> Vec<u8> {
@@ -219,20 +235,9 @@ impl Peer {
         hdr
     }
 
-    /// A data frame of `view`'s train carrying `rows`: a continuation, or with
-    /// `end` the terminal at round `end`.
+    /// Send [`rows_frame`].
     fn send_rows(&self, view: u64, rows: &[(u64, i64, i64)], end: Option<u64>) {
-        let hdr = ControlHeader {
-            target_id: view,
-            flags: gnitz_wire::WireFlags {
-                continuation: end.is_none(),
-                ..Default::default()
-            },
-            arg0: end.unwrap_or(0),
-            arg1: TAG,
-            ..Default::default()
-        };
-        self.send(&encode_frame(hdr, &[], None, Some(&kv_rows(rows))));
+        self.send(&rows_frame(view, rows, end));
     }
 
     /// One pushed train of subscription `sub` to `view`: `rows`, ending at
@@ -293,7 +298,17 @@ fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
             indexes: Vec::new(),
             token: 0,
         };
-        let entry = MirroredView::new(rel("s", name), Subscription::whole(Arc::new(desc)), None).unwrap();
+        let entry = MirroredView {
+            name: rel("s", name),
+            upstream: Target::from(&desc),
+            desc: Arc::new(desc),
+            spec: gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode(),
+            plan: None,
+            confirmed: false,
+            failed: false,
+            owed_reseed: false,
+            sub: None,
+        };
         block_on(client.bind(entry)).unwrap();
         client.mirror.as_mut().unwrap().views.get_mut(&tid).unwrap().confirmed = true;
     }
@@ -513,6 +528,37 @@ fn a_refused_block_fails_its_view_and_no_other() {
     assert_eq!(failed, [7], "{report:?}");
     assert!(log.saw(|e| *e == Ev::Advance(8, 20)), "the view behind it is read");
     assert!(!log.saw(|e| matches!(e, Ev::Fill(7) | Ev::Reseed(7, _))));
+}
+
+/// A whole read whose train ends refused in the same step as its blocks
+/// leaves the copy alone: nothing is registered, erased or filled for it.
+#[test]
+fn a_whole_read_refused_mid_train_leaves_the_copy() {
+    let (mut client, peer, log) = fixture(&[(7, "a", 0)]);
+    log.take();
+    let h = std::thread::spawn(move || {
+        assert_eq!(peer.expect_poll("the poll"), vec![7]);
+        let mut wire = framed(&rows_frame(7, &[(1, 10, 1)], None));
+        wire.extend(framed(&reply_status(7, WireStatus::Error, "refused")));
+        peer.send_bytes(&wire);
+        peer
+    });
+    let report = block_on(client.sync(Duration::ZERO))
+        .map(|s| s.mirrored)
+        .expect("a per-view failure is not the call's");
+    let _peer = h.join().unwrap();
+    assert!(
+        matches!(
+            report[..],
+            [PollOutcome {
+                view_id: 7,
+                result: PollResult::Failed(_),
+                ..
+            }]
+        ),
+        "{report:?}"
+    );
+    assert!(!log.saw(|e| matches!(e, Ev::Register(7) | Ev::Erase(7) | Ev::Fill(7) | Ev::Reseed(7, _))));
 }
 
 // ---------------------------------------------------------------------------

@@ -16,11 +16,11 @@ use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
-use gnitz_wire::{AuthStatus, Deframer, FrameLenError, HelloError};
+use gnitz_wire::{AuthStatus, Deframer, HelloError};
 
-use super::error::ProtocolError;
 use crate::recording::{Direction, Tap};
-use crate::ClientError;
+use crate::ProtocolError;
+use crate::{ClientError, Interest};
 
 mod tls;
 
@@ -194,11 +194,7 @@ impl ClientTransport {
         loop {
             // Every round: a read queues the TLS handshake's next flight.
             self.flush()?;
-            let events = if self.wants_write() {
-                libc::POLLIN | libc::POLLOUT
-            } else {
-                libc::POLLIN
-            };
+            let events = Interest { read: true, write: self.wants_write() }.poll_events();
             match poll_fd(self.as_raw_fd(), events, Some(until)) {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 polled => polled?,
@@ -403,19 +399,6 @@ impl OutQueue {
             }
             self.off -= total;
             self.frames.pop_front();
-        }
-    }
-}
-
-impl From<FrameLenError> for ProtocolError {
-    fn from(e: FrameLenError) -> Self {
-        match e {
-            FrameLenError::Zero => ProtocolError::DecodeError("zero-length frame".into()),
-            FrameLenError::Oversize { len } => ProtocolError::DecodeError(format!(
-                "payload length {len} exceeds maximum {} bytes",
-                gnitz_wire::MAX_FRAME_PAYLOAD
-            )),
-            FrameLenError::Alloc { .. } => std::io::Error::from(std::io::ErrorKind::OutOfMemory).into(),
         }
     }
 }

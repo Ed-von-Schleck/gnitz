@@ -15,9 +15,9 @@
 //! client.mirror_view(&RelName::new("public", "recent")?)?;
 //! ```
 //!
-//! Everything a *host* contracts for — freshness, what can be mirrored, the read
-//! ceiling, the cost — is stated in `gnitz_core::mirror`, because that is where a
-//! host meets it. What lives here is the store: the relation registry, the
+//! Everything a *host* contracts for — freshness, what can be mirrored, the cost —
+//! is stated in the header of `gnitz-core`'s mirror module and on
+//! `GnitzClient::mirror_view`, because that is where a host meets it. What lives here is the store: the relation registry, the
 //! copies, their feed positions, and the durability around them.
 //!
 //! It drives the engine's **relation rung** directly — the Z-set store and the

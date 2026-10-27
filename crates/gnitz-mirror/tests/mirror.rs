@@ -226,7 +226,7 @@ impl Fixture {
 /// PK stride look right. `v_repl` is replicated, so its feed lives on worker 0
 /// alone.
 fn seed(client: &mut GnitzClient) {
-    block_on(client.create_schema("s")).unwrap();
+    block_on(client.create_schema("s", false)).unwrap();
     sql(
         client,
         "s",
@@ -1551,7 +1551,7 @@ fn a_cursor_from_before_a_server_restart_reseeds() {
 const SH: &str = "sh";
 
 fn seed_shapes(client: &mut GnitzClient) {
-    block_on(client.create_schema(SH)).unwrap();
+    block_on(client.create_schema(SH, false)).unwrap();
     for table in [
         "t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL, body TEXT NOT NULL)",
         "u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT NOT NULL, w BIGINT NOT NULL)",
@@ -1755,7 +1755,7 @@ fn every_view_body_shape_mirrors() {
 #[test]
 fn a_bootstrap_and_a_poll_span_many_frames() {
     let mut fx = Fixture::start_with(WORKERS, &[("GNITZ_REPLY_FRAME_BUDGET", "16384")]);
-    block_on(fx.direct.create_schema("fr")).unwrap();
+    block_on(fx.direct.create_schema("fr", false)).unwrap();
     sql(
         &mut fx.direct,
         "fr",
@@ -2075,7 +2075,7 @@ fn a_ddl_that_retires_a_view_retires_its_copy() {
     churn(&mut fx.direct, 1, 40);
     fed_view(&mut fx.direct, "s", "v_drop", "SELECT a, b, v FROM t WHERE v >= 0");
     fed_view(&mut fx.direct, "s", "v_rep", "SELECT a, b, v FROM t WHERE b = 1");
-    block_on(fx.direct.create_schema("s2")).expect("a second schema");
+    block_on(fx.direct.create_schema("s2", false)).expect("a second schema");
     sql(
         &mut fx.direct,
         "s2",

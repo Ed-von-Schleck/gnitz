@@ -9,6 +9,7 @@ use crate::test_support::{
 };
 use crate::BatchAppender;
 use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireStatus};
+use std::os::fd::AsRawFd;
 
 /// Submit a read of every row of `tid`, decoded under `schema`.
 fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Sent<ScanReply> {
@@ -23,7 +24,7 @@ fn await_reply<T>(s: &mut Session, mut sent: Sent<T>) -> Result<T, ClientError> 
         if let Some(reply) = sent.try_take() {
             return reply;
         }
-        ready = Interest::from_revents(poll_fd(s.as_raw_fd(), s.interest().poll_events(), None).unwrap());
+        ready = Interest::from_revents(poll_fd(s.as_fd().as_raw_fd(), s.interest().poll_events(), None).unwrap());
     }
 }
 
@@ -338,7 +339,7 @@ fn a_peer_that_closes_surfaces_an_io_error_rather_than_a_park() {
     // reset. A hangup folds into read readiness, so the waiting driver wakes.
     drop(peer);
     let rev = poll_fd(
-        s.as_raw_fd(),
+        s.as_fd().as_raw_fd(),
         Interest::READ.poll_events(),
         Some(Instant::now() + std::time::Duration::from_secs(5)),
     )
@@ -466,7 +467,7 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
             s.step(Interest::READ);
         }
         assert_eq!(s.is_closed(), !refused);
-        let ends: Vec<PollEnd> = std::mem::take(&mut s.polls.queue)
+        let ends: Vec<PollEnd> = std::mem::take(&mut s.inbox.polls.queue)
             .into_iter()
             .map(|polled| match polled {
                 Polled::End(end) => end,
@@ -650,6 +651,28 @@ fn a_pushed_train_between_replies_is_set_aside() {
     assert!(s.take_pushed(sub + 1).is_err(), "nobody holds it");
 }
 
+/// A released subscription parks nothing pushed for it afterwards, so the next
+/// sync still waits.
+#[test]
+fn a_released_subscription_parks_no_pushed_train() {
+    let (mut s, peer) = pair();
+    let sub = subscribe(&mut s, &peer);
+    s.release(sub);
+    let after = s.submit(COMMIT);
+    let mut bytes = pushed_train(40, sub, &[1, 2], 9);
+    bytes.extend(framed(&reply_ctrl(0, 1)));
+    peer.send_bytes(&bytes);
+    assert_eq!(await_reply(&mut s, after).unwrap(), 1);
+    assert!(!s.inbox.polls.untaken(), "nothing parked");
+    assert!(s.take_pushed(sub).is_err(), "nobody holds it");
+    let _synced = s.submit_sync(&[], Duration::from_secs(60));
+    s.step(Interest::WRITE);
+    let (_read, _commit, request) = (peer.recv(), peer.recv(), peer.recv());
+    let hdr = peek_control_block(&request).unwrap().hdr;
+    assert_eq!(hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed);
+    assert_eq!(hdr.arg0, 60_000, "the sync waits");
+}
+
 /// A kept read is answered as any delta read is, and its terminal leaves the
 /// session holding the subscription at the cursor it carries: a train pushed
 /// right behind the reply is the subscription's.
@@ -706,7 +729,7 @@ fn an_abandoned_kept_poll_is_ended_by_the_next_sync() {
     await_reply(&mut s, synced).unwrap();
     let gone = s.take_pushed(first).expect_err("nobody named it");
     assert!(gone.to_string().contains("not held"), "{gone:?}");
-    assert!(s.polled_out() && !s.polls.untaken());
+    assert!(s.polled_out() && !s.inbox.polls.untaken());
 }
 
 /// The ids a SYNC_PUSHED request names.

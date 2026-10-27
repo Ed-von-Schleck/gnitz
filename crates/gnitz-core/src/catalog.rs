@@ -29,7 +29,7 @@ pub(crate) const CATALOG_FAMILIES: [u64; 6] = [
 /// One live secondary index, as its IDX_TAB row states it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexRow {
-    /// The id of the table it indexes.
+    /// The id of the relation it indexes: a table or a view.
     pub owner: u64,
     pub name: String,
     pub cols: PkColList,

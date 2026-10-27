@@ -12,13 +12,27 @@ use gnitz_wire::{ReadBound, ReadSpec};
 fn reply_fuzz() {
     let schema = wide_schema(4, true);
     let spec = ReadSpec::all_rows(ReadBound::None);
+    let spec_bytes = spec.encode();
     bolero::check!().for_each(|stream: &[u8]| {
         let (mut s, peer) = session_pair();
         let mut ack = s.submit(Request::AllocIds(1));
         let mut resolve = s.submit_resolve("s.t");
         let mut scan = s.submit_scan(Target::from(5), &spec, &schema);
         let mut multi = s.submit_scan_multi(&[(Target::from(5), &spec, &schema), (Target::from(6), &spec, &schema)]);
-        let mut delta = s.submit_delta_read(Target::from(7), None, &schema, &spec.encode(), Some(1));
+        let mut delta = s.submit_delta_read(Target::from(7), None, &schema, &spec_bytes, Some(1));
+        let mut page = s.submit_snapshot_page(1, 8, &[], 16, &schema);
+        s.submit_delta_poll(
+            100,
+            &[txn_frame::DeltaPollItem {
+                view: Target::from(9),
+                from: None,
+                reply_layout: schema.layout().layout_digest(),
+                spec: &spec_bytes,
+            }],
+        );
+        // A subscription the session holds, so a pushed train has a holder and the sync is sent.
+        s.inbox.polls.hold(2, DeltaCursor::from_pair(1, 1).unwrap());
+        let mut sync = s.submit_sync(&[2], Duration::ZERO);
 
         peer.send_bytes(stream);
         drop(peer);
@@ -30,11 +44,17 @@ fn reply_fuzz() {
             scan.try_take().is_some(),
             multi.try_take().is_some(),
             delta.try_take().is_some(),
+            page.try_take().is_some(),
+            sync.try_take().is_some(),
         ]
         .into_iter()
         .enumerate()
         {
             assert!(answered, "request {k} was never answered");
         }
+        let queue = &s.inbox.polls.queue;
+        let ends = queue.iter().filter(|p| matches!(p, Polled::End(_))).count();
+        assert_eq!(ends, 1, "the poll's one view ends exactly once");
+        assert!(matches!(queue.back(), Some(Polled::End(_))));
     });
 }

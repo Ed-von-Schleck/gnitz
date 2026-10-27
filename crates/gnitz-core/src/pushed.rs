@@ -56,7 +56,11 @@ impl GnitzClient {
     /// the server, and drops what was pushed for `id` until then. An id this
     /// client does not hold is ignored.
     pub fn unsubscribe(&mut self, id: u64) {
-        self.readers.remove(&id);
+        // A mirror's subscription ids come from the same counter, so only a
+        // reader's id is released.
+        if self.readers.remove(&id).is_some() {
+            self.session.release(id);
+        }
     }
 
     /// Bring every subscription of this connection, a reader's and a

@@ -266,6 +266,20 @@ fn a_transaction_refuses_a_batch_of_another_schema_and_stays_open() {
     assert_eq!(c.txn.as_ref().unwrap().families.len(), 1);
 }
 
+/// DDL inside a transaction is refused even when it has nothing to drop, and
+/// the transaction stays open.
+#[test]
+fn ddl_with_nothing_to_drop_is_refused_inside_a_transaction() {
+    let (s, _peer) = session_pair();
+    let mut c = GnitzClient::from_session(s);
+    c.txn_begin().unwrap();
+    let err = block_on(c.drop_table(&[], true)).unwrap_err().to_string();
+    assert!(err.contains("not allowed inside a transaction"), "{err}");
+    let err = block_on(c.drop_view(&[], true)).unwrap_err().to_string();
+    assert!(err.contains("not allowed inside a transaction"), "{err}");
+    assert!(c.txn_active());
+}
+
 /// Foreign-key slots that are neither absent nor one per column are refused
 /// before anything is sent — the peer is gone, so a request would fail as a
 /// transport error instead.
@@ -511,7 +525,7 @@ fn a_session_that_goes_resolves_what_it_owed() {
 #[test]
 fn serve_runs_calls_in_order_and_steps_for_detached_replies() {
     let (s, peer) = session_pair();
-    let fd = s.as_raw_fd();
+    let fd = s.as_fd().as_raw_fd();
     let peer = numbering_peer(peer);
     let c = GnitzClient::over(s, Box::new(PendingHost::default())).unwrap();
 
@@ -568,7 +582,7 @@ fn an_offloaded_job_is_the_hosts_to_run() {
     let here = std::thread::current().id();
     let ran_on = || std::thread::current().id();
     let (s, _peer) = session_pair();
-    let fd = s.as_raw_fd();
+    let fd = s.as_fd().as_raw_fd();
     let mut c = GnitzClient::over(s, Box::new(PendingHost::default())).unwrap();
     assert_ne!(drive(fd, c.offload(ran_on)).0.unwrap(), here);
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

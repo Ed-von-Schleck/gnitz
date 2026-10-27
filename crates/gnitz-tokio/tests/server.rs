@@ -13,13 +13,15 @@ use std::time::Duration;
 use std::future::Future;
 
 use gnitz_core::{
-    block_on, BatchAppender, ClientError, GnitzClient, PkColumn, PollResult, RelName, ScanReply, Schema, TableDef,
-    ZSetBatch,
+    block_on, BatchAppender, ClientError, GnitzClient, PkColumn, PlannedView, PollResult, RelName, ScanReply, Schema,
+    TableDef, ViewBundle, ViewDefinition, ZSetBatch,
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
 use gnitz_tokio::AsyncClient;
-use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TypeCode, ViewBudget, ViewProps, WireConflictMode};
+use gnitz_wire::{
+    read_i64_le, Circuit, ColumnDef, ReadBound, ReadSpec, TypeCode, ViewBudget, ViewProps, WireConflictMode,
+};
 use support::settled;
 use tokio::runtime::Runtime;
 
@@ -45,7 +47,7 @@ fn schema() -> Schema {
 fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
     let mut client = GnitzClient::connect(target).expect("connect");
     let sn = unique_schema("tokio");
-    block_on(client.create_schema(&sn)).unwrap();
+    block_on(client.create_schema(&sn, false)).unwrap();
     let schema = schema();
     let tid = block_on(client.create_table(&TableDef::new(rel(&sn, "t"), schema.clone()))).unwrap();
     (client, tid, Arc::new(schema), sn)
@@ -64,14 +66,31 @@ fn rows(schema: &Schema, pks: Range<i64>) -> ZSetBatch {
 /// [`table`] with a fed view `v` of all of `t`, whose id follows the table's.
 fn fed_table(target: &str) -> (GnitzClient, u64, u64, Arc<Schema>, String) {
     let (mut blocking, tid, schema, sn) = table(target);
-    let source = block_on(blocking.resolve_relation(&rel(&sn, "t"))).unwrap();
     let fed = ViewProps {
         budget: ViewBudget::Fed {
             delta_bytes: std::num::NonZeroU64::new(8 << 20).unwrap(),
         },
         compress: false,
     };
-    let vid = block_on(blocking.create_view(&rel(&sn, "v"), &source, fed)).unwrap();
+    let mut circuit = Circuit::default();
+    circuit.input_delta(tid, ReadBound::None);
+    let bundle = ViewBundle {
+        name: rel(&sn, "v"),
+        props: fed,
+        replacing: None,
+        segments: Vec::new(),
+        view: PlannedView {
+            circuit,
+            schema: Arc::clone(&schema),
+            pk_repeats: false,
+        },
+        definition: ViewDefinition {
+            query: "SELECT 1".to_string(),
+            body_columns: Vec::new(),
+            refs: Vec::new(),
+        },
+    };
+    let vid = block_on(blocking.create_view_chain(bundle)).unwrap();
     (blocking, tid, vid, schema, sn)
 }
 

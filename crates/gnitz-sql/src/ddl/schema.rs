@@ -28,9 +28,6 @@ pub(crate) async fn execute_create_schema(
     let name = single_part_ident(name)
         .ok_or_else(|| GnitzSqlError::Rejected(format!("{CTX}: a schema name is one identifier")))?;
     let canonical = gnitz_wire::canonical_identifier(name).map_err(GnitzSqlError::Rejected)?;
-    if if_not_exists && client.schema_id(&canonical).await?.is_some() {
-        return Ok(());
-    }
-    client.create_schema(&canonical).await?;
+    client.create_schema(&canonical, if_not_exists).await?;
     Ok(())
 }

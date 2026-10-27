@@ -20,8 +20,8 @@ use gnitz_core::{
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::{GnitzSqlError, SqlResult};
+use gnitz_wire::WireConflictMode;
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
-use gnitz_wire::{ViewProps, WireConflictMode};
 
 use crate::client_err;
 use crate::drive::{Blocking, LoopHandle, PyPipeline};
@@ -287,7 +287,7 @@ impl PyClient {
     // ----- DDL -----
 
     fn create_schema(slf: &Bound<'_, Self>, name: String) -> PyResult<Py<PyAny>> {
-        Self::run(slf, whole!(|c| c.create_schema(&name).await?), |py, id| {
+        Self::run(slf, whole!(|c| c.create_schema(&name, false).await?), |py, id| {
             id.into_py_any(py)
         })
     }
@@ -363,16 +363,25 @@ impl PyClient {
 
     // ----- Views -----
 
-    /// create_view(view_name, source_name) — a passthrough view, whose schema
-    /// is its source's.
+    /// create_view(view_name, source_name) — `CREATE VIEW view AS SELECT *
+    /// FROM source`.
     fn create_view(slf: &Bound<'_, Self>, view_name: String, source_name: String) -> PyResult<Py<PyAny>> {
         let view = Self::relation(slf, &view_name)?;
         let source = Self::relation(slf, &source_name)?;
+        let sn = Self::schema_name(slf)?;
+        let text = |r: &RelName| {
+            format!(
+                "{}.{}",
+                gnitz_sql::relation_text(r.schema()),
+                gnitz_sql::relation_text(r.name())
+            )
+        };
+        let sql = format!("CREATE VIEW {} AS SELECT * FROM {}", text(&view), text(&source));
         Self::run(
             slf,
             whole!(|c| {
-                let source = c.resolve_relation(&source).await?;
-                c.create_view(&view, &source, ViewProps::default()).await?
+                gnitz_sql::execute(c, &sn, &sql).await?;
+                c.resolve_relation(&view).await?.tid
             }),
             |py, vid| vid.into_py_any(py),
         )

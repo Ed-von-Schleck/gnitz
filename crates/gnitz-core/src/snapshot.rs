@@ -65,26 +65,26 @@ impl GnitzClient {
         let mut after: Vec<Option<Vec<u8>>> = Vec::new();
         loop {
             let SnapshotPage { batch, worker_ends } = self.snapshot_page(id, tid, &after, page_rows, schema).await?;
-            let segments = segments(&worker_ends);
             if after.is_empty() {
-                after = vec![None; segments.len()];
+                after = vec![None; worker_ends.len()];
             }
-            if segments.len() != after.len() {
+            if worker_ends.len() != after.len() {
                 return Err(ClientError::from(format!(
                     "a page of {} workers after one of {}",
-                    segments.len(),
+                    worker_ends.len(),
                     after.len()
                 ))
                 .into());
             }
-            let share = PageRequest::rows_per_store(page_rows, segments.len());
+            let share = PageRequest::rows_per_store(page_rows, worker_ends.len());
             // A worker that filled its share may hold more past its last row.
-            let mut more = false;
-            for (at, &(start, end)) in after.iter_mut().zip(&segments) {
+            let (mut more, mut start) = (false, 0);
+            for (at, &end) in after.iter_mut().zip(&worker_ends) {
                 if end > start {
                     *at = Some(batch.pks.get_bytes(end - 1).to_vec());
                 }
                 more |= (end - start) as u64 == share;
+                start = end;
             }
             each(batch)?;
             if !more {
@@ -130,16 +130,3 @@ impl GnitzClient {
             .collect())
     }
 }
-
-/// Each train's rows, `(start, end)`, in a page whose trains ended at
-/// `worker_ends`.
-fn segments(worker_ends: &[usize]) -> Vec<(usize, usize)> {
-    std::iter::once(0)
-        .chain(worker_ends.iter().copied())
-        .zip(worker_ends.iter().copied())
-        .collect()
-}
-
-#[cfg(test)]
-#[path = "tests/snapshot.rs"]
-mod tests;

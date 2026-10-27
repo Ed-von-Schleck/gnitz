@@ -2,13 +2,13 @@ use crate::catalog::{idx_rows, Catalog, IndexRow, CATALOG_FAMILIES};
 use crate::connection::{promise, DeltaCursor, Interest, RelDescriptor, Request, ScanReply, Sent, Session, Target};
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
-use crate::{sys_schema, BatchAppender, PkColumn, PushFamily, RelName, RelationRef, Schema, ViewDefinition, ZSetBatch};
+use crate::{sys_schema, BatchAppender, PkColumn, PushFamily, RelName, Schema, ViewDefinition, ZSetBatch};
 use gnitz_wire::{ColumnDef, PkBuf, PkKeys, WireConflictMode};
 use gnitz_wire::{WireFault, WireStatus};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::{poll_fn, Future};
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll, Waker};
@@ -125,15 +125,9 @@ impl DdlBundle {
         &mut self.0[at].1
     }
 
-    /// `scanned`'s row `i`, a stored `family` row, at `-1` — once: a row the
-    /// bundle already retracts is not retracted again. A system family holds
-    /// one live row per key, so the key names the row.
+    /// `scanned`'s row `i`, a stored `family` row, at `-1`.
     fn retract(&mut self, family: u64, scanned: &ZSetBatch, i: usize) {
-        let rows = self.batch(family);
-        let key = scanned.pks.get_bytes(i);
-        if !(0..rows.len()).any(|j| rows.weights[j] < 0 && rows.pks.get_bytes(j) == key) {
-            rows.copy_row_at(scanned, i, -1);
-        }
+        self.batch(family).copy_row_at(scanned, i, -1);
     }
 
     /// `row` at `weight`, in its own family's batch.
@@ -176,31 +170,6 @@ impl DdlBundle {
                     .iter()
                     .any(|(f, theirs)| f == family && in_key_order(*family, rows) == in_key_order(*family, theirs))
             })
-    }
-}
-
-/// Upper bound on the segments in one atomic view chain — a bound on the DDL
-/// bundle, not on planning: every segment is already built and in RAM by the time
-/// `create_view_chain` counts them.
-pub const MAX_CHAIN_SEGMENTS: usize = 64;
-
-/// The definition of a passthrough view over `source`: `SELECT *` of it, which
-/// is what the view computes. The name in the text only marks where `source`
-/// stands; writing the definition back out puts the name it holds then.
-fn passthrough_definition(source: &RelDescriptor) -> ViewDefinition {
-    const QUERY: &str = "SELECT * FROM source";
-    let at = QUERY.len() - "source".len();
-    let columns: Vec<String> = source.schema.visible_columns().map(|(_, c)| c.name.clone()).collect();
-    ViewDefinition {
-        query: QUERY.to_string(),
-        body_columns: columns.clone(),
-        refs: vec![RelationRef {
-            tid: source.tid,
-            name: at as u32..QUERY.len() as u32,
-            alias_end: None,
-            alias: "source".to_string(),
-            columns: Some(columns),
-        }],
     }
 }
 
@@ -480,14 +449,15 @@ pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_
                 }
             }
             let GnitzClient { session, host, .. } = &mut client;
-            if session.interest().is_empty() && !session.unread() {
-                return match more {
-                    true => Poll::Pending,
-                    false => Poll::Ready(None),
-                };
-            }
             match poll_turn(session, &mut **host, cx) {
                 Poll::Ready(Ok(())) => {}
+                // Nothing outstanding and nothing buffered.
+                Poll::Ready(Err(ClientError::Closed)) => {
+                    return match more {
+                        true => Poll::Pending,
+                        false => Poll::Ready(None),
+                    }
+                }
                 // No call is waiting to hand an interrupt to.
                 Poll::Ready(Err(e)) => session.end(e),
                 Poll::Pending => return Poll::Pending,
@@ -541,7 +511,7 @@ const _: fn() = || {
     assert_send::<Sent<ScanReply>>();
     let _ = |mut c: GnitzClient, schema: &Arc<Schema>, batch: &ZSetBatch| {
         assert_send_value(c.sync(Duration::ZERO));
-        assert_send_value(c.create_schema(""));
+        assert_send_value(c.create_schema("", false));
         assert_send_value(c.push(0, schema, batch, WireConflictMode::Update));
         assert_send_value(serve(c, |_| Poll::Ready(None)));
     };
@@ -679,7 +649,7 @@ impl GnitzClient {
     /// Inside an open transaction the batch is buffered instead of sent, and the
     /// returned LSN is `0` — nothing is durable until `txn_commit`, which returns
     /// the one zone LSN covering the whole bundle. A batch passed by value moves
-    /// into the buffer; a borrowed one is cloned into it.
+    /// into the buffer; a borrowed one is copied into it once.
     pub fn push<'a>(
         &mut self,
         target: impl Into<Target>,
@@ -689,7 +659,7 @@ impl GnitzClient {
     ) -> Pending<'_, u64> {
         let (target, batch) = (target.into(), batch.into());
         if let Some(txn) = &mut self.txn {
-            let buffered = txn.push(target, schema, batch.into_owned(), mode, BLIND);
+            let buffered = txn.push(target, schema, batch, mode, BLIND);
             return self.wait(Sent::ready(buffered.map(|()| 0)));
         }
         let batch = &*batch;
@@ -739,23 +709,20 @@ impl GnitzClient {
         reply_schema: &Arc<Schema>,
     ) -> Pending<'_, ScanReply> {
         let target = target.into();
-        let Some(store) = self
-            .mirror
-            .as_deref()
-            .filter(|m| m.cursor_of(target.tid).is_some())
-            .map(|m| &m.store)
-        else {
-            return self.scan_spec(target, &spec, reply_schema);
-        };
-        let reply = store
-            .get()
-            .scan_spec(target.tid, spec, reply_schema)
-            .map(|batch| ScanReply {
-                batch,
-                schema: Arc::clone(reply_schema),
-                lsn: None,
-            });
-        self.wait(Sent::ready(reply.map_err(ClientError::from)))
+        if let Some(m) = self.mirror.as_deref() {
+            // One guard covers the gate and the scan.
+            let mut store = m.store.get();
+            if m.views.get(&target.tid).and_then(|v| v.answers_at(&*store)).is_some() {
+                let reply = store.scan_spec(target.tid, spec, reply_schema).map(|batch| ScanReply {
+                    batch,
+                    schema: Arc::clone(reply_schema),
+                    lsn: None,
+                });
+                drop(store);
+                return self.wait(Sent::ready(reply.map_err(ClientError::from)));
+            }
+        }
+        self.scan_spec(target, &spec, reply_schema)
     }
 
     /// Replace the connection and keep the copies — what a host does after a
@@ -886,10 +853,15 @@ impl GnitzClient {
         let scanned = self.sys_rows(IDX_TAB, ReadBound::None).await?;
         let rows = idx_rows(&scanned)?;
         let mut b = DdlBundle::default();
+        let mut retracted = Vec::new();
         for name in names {
             let name = gnitz_wire::canonical_identifier(name)?;
             match rows.iter().find(|(_, r)| r.name == name && matches(r)) {
-                Some(&(i, _)) => b.retract(IDX_TAB, &scanned, i),
+                Some(&(i, _)) if retracted.contains(&i) => {}
+                Some(&(i, _)) => {
+                    retracted.push(i);
+                    b.retract(IDX_TAB, &scanned, i);
+                }
                 None if if_exists => {}
                 None => return Err(not_found(noun, name)),
             }
@@ -1039,13 +1011,14 @@ impl GnitzClient {
 
     // --- DDL ---
 
-    /// Commit `bundle` as one DDL zone. One that holds no row opens no zone.
+    /// Commit `bundle` as one DDL zone; refused inside a transaction. One that
+    /// holds no row opens no zone.
     async fn commit_ddl(&mut self, bundle: DdlBundle) -> Result<(), ClientError> {
-        if bundle.0.is_empty() {
-            return Ok(());
-        }
         if self.txn.is_some() {
             return Err(ClientError::from("DDL is not allowed inside a transaction".to_string()));
+        }
+        if bundle.0.is_empty() {
+            return Ok(());
         }
         self.ack(Request::DdlTxn(&bundle.0)).await?;
         let written = bundle.relations_written();
@@ -1054,11 +1027,27 @@ impl GnitzClient {
         Ok(())
     }
 
-    pub async fn create_schema(&mut self, name: &str) -> Result<u64, ClientError> {
+    /// `CREATE SCHEMA [IF NOT EXISTS]`. With `if_not_exists`, an existing
+    /// schema's id is returned, and the id fetched alongside the probe goes
+    /// unused: a gap in the id sequence and nothing more.
+    pub async fn create_schema(&mut self, name: &str, if_not_exists: bool) -> Result<u64, ClientError> {
         // Refuses the empty string, a leading `_` (the reserved system prefix)
         // and illegal characters.
         let name = gnitz_wire::canonical_identifier(name)?;
-        let schema_id = self.alloc_id().await?;
+        let schema_id = if if_not_exists {
+            let all = ReadSpec::all_rows(ReadBound::None);
+            let schemas = self
+                .session
+                .submit_scan(SCHEMA_TAB.into(), &all, sys_schema(SCHEMA_TAB));
+            let ids = self.session.submit(Request::AllocIds(1));
+            let schemas = self.wait(schemas).await?.batch;
+            if let Some(at) = schema_row(&schemas, &name) {
+                return Ok(schemas.pks.get(at) as u64);
+            }
+            self.wait(ids).await?
+        } else {
+            self.alloc_id().await?
+        };
         let mut b = DdlBundle::default();
         b.put(&SchemaTabRow { schema_id, name: name.as_str().into() }, 1);
         self.commit_ddl(b).await?;
@@ -1149,46 +1138,12 @@ impl GnitzClient {
         self.drop_relations(TABLE_TAB, "table", tables, if_exists).await
     }
 
-    /// Create a passthrough view over `source` and return its id.
-    pub async fn create_view(
-        &mut self,
-        view: &RelName,
-        source: &RelDescriptor,
-        props: ViewProps,
-    ) -> Result<u64, ClientError> {
-        // The one scan is the circuit's output.
-        let mut circuit = Circuit::default();
-        circuit.input_delta(source.tid, ReadBound::None);
-
-        // A passthrough's layout must equal its source's, so the whole output
-        // schema and its PK-repeat flag are the source's own.
-        let planned = PlannedView {
-            circuit,
-            schema: Arc::clone(&source.schema),
-            pk_repeats: source.pk_repeats,
-        };
-        let bundle = ViewBundle {
-            name: view.clone(),
-            props,
-            replacing: None,
-            segments: Vec::new(),
-            view: planned,
-            definition: passthrough_definition(source),
-        };
-        self.create_view_chain(bundle).await
-    }
-
     /// Create `bundle` in one atomic `DDL_TXN` and return its id. A view it
     /// replaces that already is `bundle` stays under its id, and nothing is
     /// written.
     pub async fn create_view_chain(&mut self, bundle: ViewBundle) -> Result<u64, ClientError> {
         let view = &bundle.name;
         let n_views = bundle.segments.len() + 1;
-        if n_views > MAX_CHAIN_SEGMENTS {
-            return Err(ClientError::from(format!(
-                "view chain has {n_views} segments, exceeding the {MAX_CHAIN_SEGMENTS}-segment limit",
-            )));
-        }
         let n_segments = bundle.segments.len() as u64;
 
         let mut b = DdlBundle::default();
@@ -1259,7 +1214,12 @@ impl GnitzClient {
         if_exists: bool,
     ) -> Result<(), ClientError> {
         let mut b = DdlBundle::default();
-        for name in names {
+        for (k, name) in names.iter().enumerate() {
+            // RelName compares by its folded `schema.name`, so a repeat spelled
+            // differently is still a repeat.
+            if names[..k].contains(name) {
+                continue;
+            }
             match self.relation_retraction(family, noun, name).await? {
                 Some((scanned, i)) => b.retract(family, &scanned, i),
                 None if if_exists => {}
@@ -1404,13 +1364,6 @@ impl GnitzClient {
 
     // --- Catalog lookups ---
 
-    /// The id of the live schema `schema_name` (already canonical), `None` when
-    /// there is none.
-    pub async fn schema_id(&mut self, schema_name: &str) -> Result<Option<u64>, ClientError> {
-        let schemas = self.sys_rows(SCHEMA_TAB, ReadBound::None).await?;
-        Ok(schema_row(&schemas, schema_name).map(|i| schemas.pks.get(i) as u64))
-    }
-
     /// The id of the live schema `schema_name` (already canonical) and the first
     /// of `n` fresh catalog ids, asked for in one round trip. The ids a missing
     /// schema leaves untaken are a gap in the id sequence and nothing more.
@@ -1510,15 +1463,15 @@ impl TxnBuffer {
     /// `[I(k)]`, in that order.
     ///
     /// Refused when `batch` is not in the layout `tid` already holds.
-    fn push(
+    fn push<'b>(
         &mut self,
         target: impl Into<Target>,
         schema: &Arc<Schema>,
-        batch: ZSetBatch,
+        batch: impl Into<Cow<'b, ZSetBatch>>,
         mode: WireConflictMode,
         basis: u64,
     ) -> Result<(), ClientError> {
-        let target = target.into();
+        let (target, batch) = (target.into(), batch.into());
         let tid = target.tid;
         batch
             .layout_matches(schema)
@@ -1536,7 +1489,7 @@ impl TxnBuffer {
         match last.filter(|&i| self.families[i].mode == mode) {
             Some(i) => {
                 let f = &mut self.families[i];
-                f.batch.extend_from_owned(batch);
+                f.batch.extend_from(&batch);
                 f.basis = f.basis.min(basis);
                 if f.target.token == 0 {
                     f.target = target;
@@ -1547,7 +1500,7 @@ impl TxnBuffer {
                 self.families.push(PushFamily {
                     target,
                     schema: Arc::clone(schema),
-                    batch,
+                    batch: batch.into_owned(),
                     mode,
                     basis,
                 });

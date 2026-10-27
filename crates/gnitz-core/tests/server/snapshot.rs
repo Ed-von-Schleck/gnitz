@@ -4,7 +4,7 @@
 
 use super::*;
 use gnitz_core::{BatchAppender, PkColumn, DEFAULT_PAGE_ROWS};
-use gnitz_wire::{TableDistribution, ViewProps};
+use gnitz_wire::TableDistribution;
 
 const WORKERS: usize = 4;
 
@@ -65,7 +65,7 @@ fn pages_of_a_compound_key_return_every_row_once() {
     let srv = ServerHandle::start_n(WORKERS);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let sn = unique_schema("c");
-    block_on(client.create_schema(&sn)).unwrap();
+    block_on(client.create_schema(&sn, false)).unwrap();
     let cols = vec![
         ColumnDef::new("a", TypeCode::I32, false),
         ColumnDef::new("b", TypeCode::U8, false),
@@ -104,7 +104,7 @@ fn a_replicated_table_is_read_once() {
     let srv = ServerHandle::start_n(WORKERS);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let sn = unique_schema("r");
-    block_on(client.create_schema(&sn)).unwrap();
+    block_on(client.create_schema(&sn, false)).unwrap();
     let schema = Arc::new(schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
     let props = TableProps {
         distribution: TableDistribution::Replicated,
@@ -140,7 +140,7 @@ fn a_page_takes_every_workers_share_however_its_keys_interleave() {
     let srv = ServerHandle::start_n(WORKERS);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let sn = unique_schema("k");
-    block_on(client.create_schema(&sn)).unwrap();
+    block_on(client.create_schema(&sn, false)).unwrap();
     let cols = vec![
         ColumnDef::new("a", TypeCode::I64, false),
         ColumnDef::new("b", TypeCode::I64, false),
@@ -214,7 +214,7 @@ fn a_snapshot_holds_the_serial_positions_of_its_cut() {
     let srv = ServerHandle::start_n(WORKERS);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let sn = unique_schema("s");
-    block_on(client.create_schema(&sn)).unwrap();
+    block_on(client.create_schema(&sn, false)).unwrap();
     let schema = schema_of(&[("id", TypeCode::I64), ("v", TypeCode::I64)]);
     let props = TableProps { serial: true, ..TableProps::default() };
     let tid = block_on(client.create_table(&TableDef {
@@ -281,8 +281,7 @@ fn a_backup_boots_as_the_server_stood_at_its_checkpoint() {
     let srv = ServerHandle::start_with_backups(WORKERS, &[]);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let (sn, tid, schema) = create_table(&mut client, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
-    let source = block_on(client.resolve_relation(&rel(&sn, "t"))).unwrap();
-    block_on(client.create_view(&rel(&sn, "v"), &source, ViewProps::default())).unwrap();
+    block_on(client.create_view_chain(bundle(rel(&sn, "v"), Vec::new(), segment(tid, &schema)))).unwrap();
     push(&mut client, tid, &schema, rows(&schema, 0..2000));
     push(&mut client, tid, &schema, retractions(&schema, 0..10));
 

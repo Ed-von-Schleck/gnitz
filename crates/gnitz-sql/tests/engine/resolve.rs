@@ -253,7 +253,7 @@ fn drop_schema_is_one_read_and_one_push_whatever_the_member_count() {
     let before = db.client.requests_sent();
     block_on(db.client.drop_schema(&db.sn)).unwrap();
     assert_eq!(db.client.requests_sent() - before, 2);
-    block_on(db.client.create_schema(&db.sn)).unwrap();
+    block_on(db.client.create_schema(&db.sn, false)).unwrap();
     assert!(!db.exists("m0") && !db.exists("vw0"));
 }
 
@@ -376,7 +376,7 @@ fn a_recreated_schema_resolves_its_new_members() {
     let old_tid = db.rel("t").tid;
 
     block_on(db.client.drop_schema(&db.sn)).unwrap();
-    block_on(db.client.create_schema(&db.sn)).unwrap();
+    block_on(db.client.create_schema(&db.sn, false)).unwrap();
     assert!(
         !db.exists("t"),
         "the old member must not resurrect under the recreated schema"

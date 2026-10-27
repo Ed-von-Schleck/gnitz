@@ -146,20 +146,17 @@ pub struct PkColumn {
 }
 
 impl PkColumn {
-    /// Empty `PkColumn` holding `schema`'s key column types. The stride is
-    /// derived from them here and only copied from a column after, so it is
-    /// never zero or wider than a key.
+    /// Empty `PkColumn` holding `schema`'s key column types.
     pub fn empty_for_schema(schema: &Schema) -> Self {
-        let n = schema.pk_cols().len();
+        let layout = schema.layout();
         let mut types = [TypeCode::U8; MAX_PK_COLUMNS];
-        for (t, &c) in types.iter_mut().zip(schema.pk_cols()) {
-            *t = schema.columns[c as usize].ty.tc;
+        for (t, (_, c)) in types.iter_mut().zip(layout.pk_columns()) {
+            *t = c.type_code;
         }
-        let stride: usize = types[..n].iter().map(|t| t.wire_stride()).sum();
         PkColumn {
             types,
-            n: n as u8,
-            stride: stride as u8,
+            n: layout.pk_cols().len() as u8,
+            stride: layout.pk_stride() as u8,
             buf: vec![],
         }
     }
@@ -300,10 +297,6 @@ pub struct PayloadColumn {
 }
 
 impl PayloadColumn {
-    pub fn new(tc: TypeCode) -> Self {
-        PayloadColumn { tc, bytes: Vec::new() }
-    }
-
     #[inline]
     pub(crate) fn tc(&self) -> TypeCode {
         self.tc
@@ -356,7 +349,7 @@ impl ZSetBatch {
             nulls: vec![],
             payload: schema
                 .payload_columns()
-                .map(|(_, _, c)| PayloadColumn::new(c.ty.tc))
+                .map(|(_, _, c)| PayloadColumn { tc: c.ty.tc, bytes: Vec::new() })
                 .collect(),
             blob: vec![],
         }
@@ -471,27 +464,33 @@ impl ZSetBatch {
         (0..self.len()).filter(move |&i| self.weights[i] > 0)
     }
 
-    /// Append all rows of `other`, consuming it: each region concatenates, and
-    /// `other`'s arena lands on this one's tail, so every German cell it carries
-    /// has its heap offset shifted by that much.
-    pub fn extend_from_owned(&mut self, mut other: ZSetBatch) {
+    /// Append all rows of `other`: each region concatenates, and `other`'s arena
+    /// lands on this one's tail, so every German cell it carries has its heap
+    /// offset shifted by that much.
+    pub(crate) fn extend_from(&mut self, other: &ZSetBatch) {
+        assert!(self.same_layout(other), "extend_from: layout mismatch");
+        self.pks.buf.extend_from_slice(&other.pks.buf);
+        self.weights.extend_from_slice(&other.weights);
+        self.nulls.extend_from_slice(&other.nulls);
+        let delta = self.blob.len();
+        self.blob.extend_from_slice(&other.blob);
+        for (dst, src) in self.payload.iter_mut().zip(&other.payload) {
+            let at = dst.bytes.len();
+            dst.bytes.extend_from_slice(&src.bytes);
+            if dst.tc().is_german_string() {
+                gnitz_wire::shift_german_string_heaps(&mut dst.bytes[at..], delta);
+            }
+        }
+    }
+
+    /// [`Self::extend_from`], taking `other` whole when `self` is empty.
+    pub fn extend_from_owned(&mut self, other: ZSetBatch) {
         assert!(self.same_layout(&other), "extend_from_owned: layout mismatch");
         if self.is_empty() {
             *self = other;
             return;
         }
-        self.pks.buf.append(&mut other.pks.buf);
-        self.weights.append(&mut other.weights);
-        self.nulls.append(&mut other.nulls);
-        let delta = self.blob.len();
-        self.blob.append(&mut other.blob);
-        for (dst, src) in self.payload.iter_mut().zip(&mut other.payload) {
-            let at = dst.bytes.len();
-            dst.bytes.append(&mut src.bytes);
-            if dst.tc().is_german_string() {
-                gnitz_wire::shift_german_string_heaps(&mut dst.bytes[at..], delta);
-            }
-        }
+        self.extend_from(&other);
     }
 
     /// The batch's current extent, for [`Self::rollback_to`].
@@ -705,7 +704,8 @@ pub struct BatchMark {
     blob: usize,
 }
 
-/// Builder for appending rows to a `ZSetBatch` with schema-aware column mapping.
+/// Appends rows to a [`ZSetBatch`] one payload slot at a time, each value
+/// checked against its slot's column type.
 ///
 /// Columns are appended in payload-slot order, so callers supply only payload
 /// values; the cursor is the payload slot.

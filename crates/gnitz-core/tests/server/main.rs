@@ -13,13 +13,17 @@ mod transport;
 mod view_chain;
 
 use gnitz_core::block_on;
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
 
 use gnitz_core::{
-    BatchAppender, ClientError, GnitzClient, Interest, RelName, Request, Schema, Sent, Session, TableDef, ZSetBatch,
+    BatchAppender, ClientError, GnitzClient, Interest, PlannedView, RelName, Request, Schema, Sent, Session, TableDef,
+    ViewBundle, ViewDefinition, ZSetBatch,
 };
 use gnitz_test_harness::{unique_schema, ServerHandle};
-use gnitz_wire::{read_i64_le, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, WireConflictMode};
+use gnitz_wire::{
+    read_i64_le, Circuit, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode,
+};
 
 /// `schema.name`.
 fn rel(schema: &str, name: &str) -> RelName {
@@ -41,9 +45,41 @@ fn schema_of(columns: &[(&str, TypeCode)]) -> Schema {
 /// `schema` created as table `t` in a fresh schema: `(schema name, tid, schema)`.
 fn create_table(client: &mut GnitzClient, schema: Schema) -> (String, u64, Arc<Schema>) {
     let sn = unique_schema("t");
-    block_on(client.create_schema(&sn)).unwrap();
+    block_on(client.create_schema(&sn, false)).unwrap();
     let tid = block_on(client.create_table(&TableDef::new(rel(&sn, "t"), schema.clone()))).unwrap();
     (sn, tid, Arc::new(schema))
+}
+
+/// One identity segment reading `source_id`.
+fn segment(source_id: u64, schema: &Arc<Schema>) -> PlannedView {
+    let mut circuit = Circuit::default();
+    circuit.input_delta(source_id, ReadBound::None);
+    PlannedView {
+        circuit,
+        schema: Arc::clone(schema),
+        pk_repeats: false,
+    }
+}
+
+/// A definition no reader of these tests renders.
+fn definition() -> ViewDefinition {
+    ViewDefinition {
+        query: "SELECT 1".to_string(),
+        body_columns: Vec::new(),
+        refs: Vec::new(),
+    }
+}
+
+/// `segments` then `view`, created as `name` with default options.
+fn bundle(name: RelName, segments: Vec<PlannedView>, view: PlannedView) -> ViewBundle {
+    ViewBundle {
+        name,
+        props: ViewProps::default(),
+        replacing: None,
+        segments,
+        view,
+        definition: definition(),
+    }
 }
 
 /// `pks` at weight 1, payload slot `j` of each holding `pk * 3 + j`; every
@@ -94,7 +130,7 @@ fn push_req<'a>(tid: u64, schema: &'a Schema, batch: &'a ZSetBatch) -> Request<'
 fn park(s: &Session, want: Interest) -> Interest {
     assert!(!want.is_empty(), "slots pending but nothing to wait for");
     let mut pfd = libc::pollfd {
-        fd: s.as_raw_fd(),
+        fd: s.as_fd().as_raw_fd(),
         events: want.poll_events(),
         revents: 0,
     };

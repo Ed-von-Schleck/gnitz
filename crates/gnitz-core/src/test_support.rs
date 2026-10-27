@@ -6,14 +6,15 @@
 //! host the rest.
 
 use std::io::{Read, Write};
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use gnitz_wire::{ColumnDef, TypeCode, WireStatus};
 
-use crate::protocol::error::ProtocolError;
 use crate::protocol::transport::{poll_fd, ClientTransport};
+use crate::ProtocolError;
 use crate::{BatchAppender, Interest, RelName, Schema, Session, ZSetBatch};
 
 /// `schema.name`.
@@ -145,7 +146,7 @@ pub(crate) fn session_pair() -> (Session, Peer) {
 pub(crate) fn step_until_idle(s: &mut Session) {
     while !s.interest().is_empty() {
         s.step(Interest::from_revents(
-            poll_fd(s.as_raw_fd(), s.interest().poll_events(), None).unwrap(),
+            poll_fd(s.as_fd().as_raw_fd(), s.interest().poll_events(), None).unwrap(),
         ));
     }
 }

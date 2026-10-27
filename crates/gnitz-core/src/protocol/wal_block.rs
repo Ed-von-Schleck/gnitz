@@ -1,7 +1,7 @@
 //! WAL-block encode/decode for the client wire codec.
 
-use super::error::ProtocolError;
 use super::types::{check_not_null, Schema, ZSetBatch};
+use crate::ProtocolError;
 use gnitz_wire::{as_le_bytes, Regions, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 impl ZSetBatch {

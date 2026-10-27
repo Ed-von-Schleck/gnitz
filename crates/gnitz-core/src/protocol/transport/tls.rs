@@ -14,8 +14,8 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
-use super::super::error::ProtocolError;
 use super::{timed_out, write_nonblocking, ClientTransport, Inner};
+use crate::ProtocolError;
 
 /// Parsed `HOST:PORT[?QUERY]` (the part after the `tls://` prefix).
 struct Target {
@@ -128,15 +128,19 @@ fn bad_file(path: &str, e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("tls {path:?}: {e}"))
 }
 
+fn pem_certs(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
+    CertificateDer::pem_file_iter(path)
+        .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| bad_file(path, e))
+}
+
 /// The `ClientConfig` for one connection, built on every connect so a replaced
 /// `ca=`/`cert=`/`key=` file is read afresh.
 fn build_client_config(target: &Target) -> io::Result<Arc<ClientConfig>> {
     let roots = match &target.ca {
         None => RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
         Some(path) => {
-            let certs = CertificateDer::pem_file_iter(path)
-                .and_then(|it| it.collect::<Result<Vec<_>, _>>())
-                .map_err(|e| bad_file(path, e))?;
+            let certs = pem_certs(path)?;
             let mut roots = RootCertStore::empty();
             for cert in certs {
                 roots.add(cert).map_err(|e| bad_file(path, e))?;
@@ -151,9 +155,7 @@ fn build_client_config(target: &Target) -> io::Result<Arc<ClientConfig>> {
     let mut cfg = match &target.client_auth {
         None => builder.with_no_client_auth(),
         Some((cert, key)) => {
-            let chain = CertificateDer::pem_file_iter(cert)
-                .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
-                .map_err(|e| bad_file(cert, e))?;
+            let chain = pem_certs(cert)?;
             let key_der = PrivateKeyDer::from_pem_file(key).map_err(|e| bad_file(key, e))?;
             builder.with_client_auth_cert(chain, key_der).map_err(|e| {
                 io::Error::new(

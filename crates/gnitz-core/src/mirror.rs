@@ -232,18 +232,6 @@ pub struct Subscription {
 pub type Planner =
     Arc<dyn for<'a> Fn(&'a mut GnitzClient) -> BoxFut<'a, Result<Subscription, ClientError>> + Send + Sync>;
 
-impl Subscription {
-    /// `upstream` read whole, in its own schema and under its own indexes.
-    fn whole(upstream: Arc<RelDescriptor>) -> Self {
-        Subscription {
-            spec: gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode(),
-            schema: Arc::clone(&upstream.schema),
-            indexes: upstream.indexes.clone(),
-            upstream,
-        }
-    }
-}
-
 /// The id an alias is mirrored under: outside the server's id space, and the
 /// same at every reopen.
 fn alias_id(name: &RelName) -> u64 {
@@ -251,41 +239,6 @@ fn alias_id(name: &RelName) -> u64 {
 }
 
 impl MirroredView {
-    /// `sub` mirrored as `name` — a view with no `plan`, an alias with one.
-    /// Refused where no copy can be fed from what `sub` reads.
-    fn new(name: RelName, sub: Subscription, plan: Option<Planner>) -> Result<Self, ClientError> {
-        let Subscription { upstream, spec, schema, indexes } = sub;
-        let desc = match &plan {
-            None => {
-                refuse_unfed(&format!("'{name}'"), upstream.class)?;
-                Arc::clone(&upstream)
-            }
-            Some(_) => {
-                refuse_unfed(&format!("what '{name}' reads"), upstream.class)?;
-                Arc::new(RelDescriptor {
-                    tid: alias_id(&name),
-                    class: RelClass::FedView,
-                    pk_repeats: upstream.pk_repeats,
-                    serial: false,
-                    schema,
-                    indexes,
-                    token: 0,
-                })
-            }
-        };
-        Ok(MirroredView {
-            name,
-            desc,
-            upstream: Target::from(&*upstream),
-            spec,
-            plan,
-            confirmed: false,
-            failed: false,
-            owed_reseed: false,
-            sub: None,
-        })
-    }
-
     /// Whether `other` reads the same rows of the same view.
     fn reads_what(&self, other: &MirroredView) -> bool {
         self.upstream.tid == other.upstream.tid && self.spec == other.spec
@@ -300,7 +253,7 @@ impl MirroredView {
     }
 
     /// The round this view's copy in `store` answers reads at, if it answers any.
-    fn answers_at(&self, store: &dyn MirrorStore) -> Option<DeltaCursor> {
+    pub(crate) fn answers_at(&self, store: &dyn MirrorStore) -> Option<DeltaCursor> {
         self.confirmed.then(|| store.cursor_of(self.desc.tid)).flatten()
     }
 }
@@ -312,8 +265,11 @@ impl MirroredView {
 pub(crate) struct Store(Arc<Mutex<dyn MirrorStore>>);
 
 impl Store {
-    /// The store, for a call that stays in memory. A panic under this lock is
-    /// the store's own to record: an implementor poisons itself.
+    /// The store, for a call made in place: a lookup, a cursor-only advance, or
+    /// a local read (which may read shards), answered without a job so a
+    /// mirrored read costs no dispatch. Work that writes the disk goes through
+    /// [`Self::run`]. A panic under this lock is the store's own to record: an
+    /// implementor poisons itself.
     pub(crate) fn get(&self) -> MutexGuard<'_, dyn MirrorStore + 'static> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -360,10 +316,12 @@ pub(crate) struct MirrorState {
 }
 
 impl MirrorState {
-    fn view(&self, tid: u64) -> Result<&MirroredView, ClientError> {
-        self.views
-            .get(&tid)
-            .ok_or_else(|| ClientError::from(format!("relation {tid} is not mirrored")))
+    /// Refuse a call on a poisoned store before it spends a round trip finding out.
+    fn refuse_poisoned(&self) -> Result<(), ClientError> {
+        match self.store.get().poisoned() {
+            Some(why) => Err(MirrorError::Poisoned(why.to_string()).into()),
+            None => Ok(()),
+        }
     }
 
     /// See [`GnitzClient::cursor_of`].
@@ -373,11 +331,8 @@ impl MirrorState {
 
     /// The descriptor `name` is mirrored under, while its copy answers reads.
     pub(crate) fn answering(&self, name: &RelName) -> Option<Arc<RelDescriptor>> {
-        let store = self.store.get();
-        let view = self
-            .views
-            .values()
-            .find(|v| v.name == *name && v.answers_at(&*store).is_some())?;
+        let view = self.views.values().find(|v| v.name == *name)?;
+        view.answers_at(&*self.store.get())?;
         Some(Arc::clone(&view.desc))
     }
 
@@ -450,13 +405,41 @@ impl GnitzClient {
     }
 
     /// What `name` reads upstream now — a view resolved, an alias planned —
-    /// as a registration.
+    /// as a registration. Refused where no copy can be fed from what it reads.
     async fn derive(&mut self, name: RelName, plan: Option<Planner>) -> Result<MirroredView, ClientError> {
-        let sub = match &plan {
-            None => Subscription::whole(self.resolve_relation(&name).await?),
-            Some(plan) => plan(self).await?,
+        let (upstream, desc, spec) = match &plan {
+            None => {
+                let upstream = self.resolve_relation(&name).await?;
+                refuse_unfed(&format!("'{name}'"), upstream.class)?;
+                let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode();
+                (Arc::clone(&upstream), upstream, spec)
+            }
+            Some(plan) => {
+                let Subscription { upstream, spec, schema, indexes } = plan(self).await?;
+                refuse_unfed(&format!("what '{name}' reads"), upstream.class)?;
+                let desc = Arc::new(RelDescriptor {
+                    tid: alias_id(&name),
+                    class: RelClass::FedView,
+                    pk_repeats: upstream.pk_repeats,
+                    serial: false,
+                    schema,
+                    indexes,
+                    token: 0,
+                });
+                (upstream, desc, spec)
+            }
         };
-        MirroredView::new(name, sub, plan)
+        Ok(MirroredView {
+            name,
+            desc,
+            upstream: Target::from(&*upstream),
+            spec,
+            plan,
+            confirmed: false,
+            failed: false,
+            owed_reseed: false,
+            sub: None,
+        })
     }
 
     /// Record `entry` as mirrored, under its descriptor's id, which is returned.
@@ -481,7 +464,8 @@ impl GnitzClient {
     /// Derive `tid`'s registration again and bind it; the id it is mirrored
     /// under now.
     async fn rebind(&mut self, tid: u64) -> Result<u64, ClientError> {
-        let v = self.mirror_state()?.view(tid)?;
+        let v = self.mirror_state()?.views.get(&tid);
+        let v = v.ok_or_else(|| ClientError::from(format!("relation {tid} is not mirrored")))?;
         let (name, plan) = (v.name.clone(), v.plan.clone());
         let entry = self.derive(name, plan).await?;
         self.bind(entry).await
@@ -489,7 +473,7 @@ impl GnitzClient {
 
     /// Mirror `name` and bring its copy up to date.
     async fn mirror_as(&mut self, name: RelName, plan: Option<Planner>) -> Result<PollOutcome, ClientError> {
-        self.refuse_poisoned_mirror()?;
+        self.mirror_state()?.refuse_poisoned()?;
         let entry = self.derive(name, plan).await?;
         let tid = self.bind(entry).await?;
         let done = self.settle([tid]).await?;
@@ -630,7 +614,7 @@ impl GnitzClient {
                 // session reads on, and is erased by the first of them.
                 (None, end) => {
                     let seal = end.as_ref().and_then(|end| end.as_ref().ok().copied());
-                    if failed.is_none() && (seal.is_some() || poll.drained() && !blocks.is_empty()) {
+                    if failed.is_none() && (seal.is_some() || end.is_none() && poll.drained() && !blocks.is_empty()) {
                         // Registered again, for a registration whose record the store lost, and
                         // owed from here: the job erases the copy whether or not this call lives
                         // to see it end.
@@ -813,8 +797,7 @@ impl GnitzClient {
     /// view it retracted, except a mirrored view it also wrote back — a rename —
     /// which is rebound under its new name.
     pub(crate) async fn ddl_committed(&mut self, families: &[(u64, ZSetBatch)]) {
-        let GnitzClient { mirror, host, .. } = self;
-        let Some(m) = mirror.as_deref_mut() else {
+        let Some(m) = self.mirror.as_deref() else {
             return;
         };
         let Some((_, b)) = families.iter().find(|(family, _)| *family == VIEW_TAB) else {
@@ -839,18 +822,8 @@ impl GnitzClient {
                 None => dropped.push(v),
             }
         }
-        if !dropped.is_empty() {
-            // Asked of the store whether or not this client registered them,
-            // as `forget_view` does.
-            for v in &dropped {
-                m.views.remove(v);
-            }
-            let forget = move |s: &mut dyn MirrorStore| {
-                for v in dropped {
-                    let _ = s.forget(v);
-                }
-            };
-            let _ = m.store.clone().run(&mut **host, forget).await;
+        for v in dropped {
+            let _ = self.forget_view(v).await;
         }
         for entry in renamed {
             let tid = entry.desc.tid;
@@ -873,16 +846,12 @@ impl GnitzClient {
     }
 
     /// The wait a sync may be held for: none while a copy is due a delta read.
-    pub(crate) fn mirror_hold(&mut self, wait: Duration) -> Result<Duration, ClientError> {
-        if self.mirror.is_none() {
+    pub(crate) fn mirror_hold(&self, wait: Duration) -> Result<Duration, ClientError> {
+        let Some(m) = self.mirror.as_deref() else {
             return Ok(wait);
-        }
-        self.refuse_poisoned_mirror()?;
-        let due = self
-            .mirror_state()?
-            .views
-            .values()
-            .any(|v| v.sub.is_none() && !v.failed);
+        };
+        m.refuse_poisoned()?;
+        let due = m.views.values().any(|v| v.sub.is_none() && !v.failed);
         Ok(if due { Duration::ZERO } else { wait })
     }
 
@@ -968,15 +937,6 @@ impl GnitzClient {
         self.mirror
             .as_deref()
             .and_then(|m| m.store.get().poisoned().map(str::to_owned))
-    }
-
-    /// Refuse a call with no store, or a poisoned one, before it spends a round
-    /// trip finding out.
-    fn refuse_poisoned_mirror(&mut self) -> Result<(), ClientError> {
-        match self.mirror_state()?.store.get().poisoned() {
-            Some(why) => Err(MirrorError::Poisoned(why.to_string()).into()),
-            None => Ok(()),
-        }
     }
 }
 
