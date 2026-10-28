@@ -4,6 +4,7 @@ use super::tests::spread;
 use super::tests::stride_schema;
 use super::tests::trailing_gk;
 use super::tests::trailing_key_batch;
+use crate::storage::Cut;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64, Rng};
 use gnitz_zset::schema::key::probe_key;
 
@@ -80,7 +81,7 @@ fn shard_probe_bench() {
             let (selected, instructions) = counter.measure(|| {
                 let mut selected = Vec::with_capacity(bounds.len());
                 for &(lo, hi) in &bounds {
-                    selected.push(idx.shard_arcs_in_range(lo, hi, true).count());
+                    selected.push(idx.shard_arcs_in_range(lo, hi, Cut::Now).count());
                 }
                 selected
             });

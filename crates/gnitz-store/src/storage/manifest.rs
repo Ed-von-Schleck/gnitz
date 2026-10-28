@@ -52,7 +52,7 @@ pub(crate) struct ManifestEntry {
 }
 
 /// Encode `m` as the file [`read`] decodes.
-pub(crate) fn encode(m: &Manifest) -> Vec<u8> {
+fn encode(m: &Manifest) -> Vec<u8> {
     let mut w = Writer::new();
     w.u64(MAGIC)
         .u64(VERSION)
@@ -204,19 +204,25 @@ pub(crate) fn read_at(dir: &str, generation: u64) -> Result<Option<Manifest>, St
     Ok(read_intact(dir)?.filter(|m| m.checkpoint_mark == generation))
 }
 
+/// Write `m` to `dir`'s [`staging_path`], for [`commit`] to publish.
+pub(crate) fn stage(dir: &str, m: &Manifest) -> Result<(), StorageError> {
+    fs::write(staging_path(dir), encode(m))?;
+    Ok(())
+}
+
 /// Rename the manifest staged at [`staging_path`] onto `dir`'s manifest path.
 pub(crate) fn commit(dir: &str) -> Result<(), StorageError> {
     fs::rename(staging_path(dir), manifest_path(dir))?;
     Ok(())
 }
 
-/// The directories a store directory's first sync makes durable: its own, for
-/// the files in it, and its parent's and grandparent's, for the entries that
-/// reach it.
-pub(super) fn entry_dirs(dir: &str) -> impl Iterator<Item = PathBuf> + '_ {
+/// The directories a sync of the store directory `dir` makes durable: its own,
+/// for the files in it, and on its `first` sync its parent's and grandparent's
+/// too, for the entries that reach it.
+pub(super) fn owed_dirs(dir: &str, first: bool) -> impl Iterator<Item = PathBuf> + '_ {
     Path::new(dir)
         .ancestors()
-        .take(3)
+        .take(if first { 3 } else { 1 })
         .filter(|d| !d.as_os_str().is_empty())
         .map(Path::to_path_buf)
 }
@@ -281,7 +287,7 @@ pub(crate) fn link_stores(pairs: &[(String, String)]) -> Result<(), StorageError
                 copies.push(to);
             }
         }
-        dirs.extend(entry_dirs(dst));
+        dirs.extend(owed_dirs(dst, true));
         stores.push(dst);
     }
     let mut sync = Syncer::default();

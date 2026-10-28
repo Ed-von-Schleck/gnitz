@@ -1,16 +1,18 @@
-//! In-memory FLSM index state + the compaction trigger/orchestration for
-//! [`ShardIndex`]: the one shard writer, PK probes, and the upkeep (`maintain`)
-//! with the folds it plans — the L0→L1 fold, the byte targets every level's
-//! guard partition is held at, and the vertical drain into the terminal level.
+//! What [`ShardIndex`] does with the tree its parent module declares: the one
+//! shard writer and the appends through it, the PK probes and shard listings a
+//! cursor opens over, publish tracking and retirement, and the upkeep
+//! (`maintain`) with the folds it plans and runs — the L0→L1 fold, the byte
+//! targets every level's guard partition is held at, and the vertical drain into
+//! the terminal level.
 
 use std::fs;
 use std::ops::Range;
 use std::rc::Rc;
 
-use super::super::manifest;
+use super::super::{manifest, Cut};
 use super::{
     fold_destinations, CompactionKind, FLSMLevel, LevelGuard, ShardEntry, ShardIndex, CANCEL_PERCENT,
-    GUARD_FILE_THRESHOLD, L0, L0_COMPACT_THRESHOLD, L1, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL,
+    GUARD_FILE_THRESHOLD, L0, L0_COMPACT_THRESHOLD, L1, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL, UPKEEP_LEVY,
 };
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
@@ -46,7 +48,15 @@ pub(super) struct Running {
 
 impl ShardIndex {
     pub(super) fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
-        self.settled_entries().chain(&self.pending)
+        self.settled_entries().chain(self.pending_at(Cut::Now))
+    }
+
+    /// The shards above the cut that `cut` reads.
+    fn pending_at(&self, cut: Cut) -> &[ShardEntry] {
+        match cut {
+            Cut::Now => &self.pending,
+            Cut::Sealed => &[],
+        }
     }
 
     /// Every shard at or below the store's cut.
@@ -126,26 +136,47 @@ impl ShardIndex {
         Ok(())
     }
 
-    /// The shards above the cut.
-    pub(crate) fn pending_arcs(&self) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
-        self.pending.iter().map(|e| Rc::clone(&e.shard))
+    /// Whether any shard sits above the cut.
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// The least key a shard above the cut holds.
+    pub(crate) fn pending_least(&self) -> Option<&[u8]> {
+        self.pending.iter().map(|e| e.pk_min.pk_bytes()).min()
     }
 
     /// Move the cut past every pending shard: each enters L0 as it stands.
-    pub(crate) fn seal_pending(&mut self) {
+    /// Answers their shards.
+    pub(crate) fn seal_pending(&mut self) -> Vec<Rc<MappedShard>> {
         if self.pending.is_empty() {
-            return;
+            return Vec::new();
         }
-        let whole = PkBuf::zeroed(self.schema.pk_stride());
         let pending = std::mem::take(&mut self.pending);
+        let shards = pending.iter().map(|e| Rc::clone(&e.shard)).collect();
+        let whole = PkBuf::zeroed(self.schema.pk_stride());
         self.levels[L0].get_or_create_guard(whole).entries.extend(pending);
         self.owed = true;
+        shards
     }
 
-    /// Whether the tree may owe a fold. Set by every shard that enters it and
-    /// cleared by the [`Self::maintain`] that finds none left.
+    /// Whether the tree may owe a fold.
+    #[cfg(test)]
     pub(crate) fn owed(&self) -> bool {
         self.owed
+    }
+
+    /// Pay the upkeep for `ingested` bytes: [`UPKEEP_LEVY`] bytes of fold input
+    /// for each, less what earlier calls overdrew. A store nothing is ingested
+    /// into keeps what it owes.
+    pub(crate) fn upkeep(&mut self, ingested: usize) -> Result<(), StorageError> {
+        if !self.owed {
+            return Ok(());
+        }
+        let levy = ingested as u64 * UPKEEP_LEVY;
+        let read = self.maintain(levy.saturating_sub(self.upkeep_overdraft))?;
+        self.upkeep_overdraft = (self.upkeep_overdraft + read).saturating_sub(levy);
+        Ok(())
     }
 
     /// The disk tier's upkeep: the folds the tree owes, one destination at a
@@ -162,7 +193,7 @@ impl ShardIndex {
                 }
                 continue;
             }
-            self.step(&mut read)?;
+            read += self.step()?;
         }
         Ok(read)
     }
@@ -170,9 +201,8 @@ impl ShardIndex {
     /// Finish the fold under way, if any: a manifest names a tree, and a
     /// half-written fold's outputs are in none.
     pub(crate) fn finish_fold(&mut self) -> Result<(), StorageError> {
-        let mut read = 0;
         while self.running.is_some() {
-            self.step(&mut read)?;
+            self.step()?;
         }
         Ok(())
     }
@@ -244,19 +274,19 @@ impl ShardIndex {
         self.published_through = self.shard_seq;
     }
 
-    /// Every shard; the pending ones iff `pending`.
-    pub(crate) fn shard_arcs(&self, pending: bool) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+    /// Every shard `cut` reads: the pending ones only at [`Cut::Now`].
+    pub(crate) fn shard_arcs(&self, cut: Cut) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
         self.settled_entries()
-            .chain(self.pending.iter().filter(move |_| pending))
+            .chain(self.pending_at(cut))
             .map(|e| Rc::clone(&e.shard))
     }
 
-    /// Every shard whose PK extent meets `[lo, hi]`; the pending ones iff `pending`.
+    /// Every shard `cut` reads whose PK extent meets `[lo, hi]`.
     pub(crate) fn shard_arcs_in_range(
         &self,
         lo: PkBuf,
         hi: PkBuf,
-        pending: bool,
+        cut: Cut,
     ) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
         self.levels
             .iter()
@@ -264,7 +294,7 @@ impl ShardIndex {
                 let run = level.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
                 level.guards[run].iter().flat_map(|g| g.entries.iter())
             })
-            .chain(self.pending.iter().filter(move |_| pending))
+            .chain(self.pending_at(cut))
             .filter(move |e| pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo.pk_bytes(), hi.pk_bytes()))
             .map(|e| Rc::clone(&e.shard))
     }
@@ -351,7 +381,8 @@ impl ShardIndex {
     /// after the last, exchange the fold's inputs for its outputs.
     ///
     /// A failure registers nothing and unlinks every output the fold wrote.
-    fn step(&mut self, read: &mut u64) -> Result<(), StorageError> {
+    /// Answers the input bytes it merged.
+    fn step(&mut self) -> Result<u64, StorageError> {
         let mut run = self.running.take().expect("a fold is under way");
         let before: usize = run.starts.iter().sum();
         let dehydrate = run.fold.kind == CompactionKind::Dehydrate;
@@ -370,7 +401,7 @@ impl ShardIndex {
             .iter()
             .fold((0, 0), |(r, b), s| (r + s.row_count(), b + s.file_len()));
         let merged_rows = (run.starts.iter().sum::<usize>() - before) as u128;
-        *read += (u128::from(bytes) * merged_rows / rows.max(1) as u128) as u64 + 1;
+        let read = (u128::from(bytes) * merged_rows / rows.max(1) as u128) as u64 + 1;
         if let Some(merged) = merged {
             // A store that has coded no heap yet codes the run under one of its own.
             let fresh = merged.plain().and_then(|b| self.codebook_for(b));
@@ -392,7 +423,7 @@ impl ShardIndex {
         } else {
             self.install(run);
         }
-        Ok(())
+        Ok(read)
     }
 
     /// Retire the inputs of a finished fold and register its outputs under
@@ -428,11 +459,7 @@ impl ShardIndex {
         let mut superseded = Vec::with_capacity(fold.sources.len());
         for level in &mut self.levels {
             for guard in &mut level.guards {
-                let (gone, kept) = std::mem::take(&mut guard.entries)
-                    .into_iter()
-                    .partition(|e| fold.sources.contains(&e.seq));
-                guard.entries = kept;
-                superseded.extend::<Vec<ShardEntry>>(gone);
+                superseded.extend(guard.entries.extract_if(.., |e| fold.sources.contains(&e.seq)));
             }
             level.guards.retain(|g| !g.entries.is_empty());
         }

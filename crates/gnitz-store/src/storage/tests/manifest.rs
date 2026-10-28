@@ -113,13 +113,23 @@ fn read_roundtrips_a_prepared_manifest_at_zero_one_and_many_entries() {
     assert_eq!(read(d).unwrap(), None, "no manifest reads as absent");
 
     for count in [0usize, 1, 2, 7] {
-        let m = sample(count);
-        // The barrier's publish step, minus the fsyncs a round-trip does
-        // not observe.
-        fs::write(staging_path(d), encode(&m)).unwrap();
-        commit(d).unwrap();
+        let m = published(d, count);
         assert_eq!(read(d).unwrap(), Some(m), "count={count}");
     }
+}
+
+/// `dir` holding a published manifest of `count` entries, each entry's shard
+/// file beside it: the barrier's publish step, minus the fsyncs a round-trip
+/// does not observe.
+fn published(dir: &str, count: usize) -> Manifest {
+    fs::create_dir_all(dir).unwrap();
+    let m = sample(count);
+    for e in &m.shards.entries {
+        fs::write(shard_path(dir, e.seq), e.seq.to_le_bytes()).unwrap();
+    }
+    stage(dir, &m).unwrap();
+    commit(dir).unwrap();
+    m
 }
 
 /// A name `u64::from_str` would read as a seq but `shard_name` never writes
@@ -136,19 +146,6 @@ fn only_the_canonical_shard_name_denotes_a_seq() {
     ] {
         assert_eq!(shard_seq(name), None, "{name}");
     }
-}
-
-/// `dir` holding a published manifest of `count` entries, each entry's shard
-/// file beside it.
-fn published(dir: &str, count: usize) -> Manifest {
-    fs::create_dir_all(dir).unwrap();
-    let m = sample(count);
-    for e in &m.shards.entries {
-        fs::write(shard_path(dir, e.seq), e.seq.to_le_bytes()).unwrap();
-    }
-    fs::write(staging_path(dir), encode(&m)).unwrap();
-    commit(dir).unwrap();
-    m
 }
 
 /// A batch retires every store it names, a store with no manifest or no

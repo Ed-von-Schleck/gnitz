@@ -9,7 +9,9 @@ use std::hint::black_box;
 
 use super::tests::layout_of;
 use crate::relation::{Cut as At, RelationKind};
-use crate::test_support::{cmp_all, col_range, cut, id_rows, img, map_of, order_by, relation_fixture, rows_spec};
+use crate::test_support::{
+    cmp_all, col_range, cut, id_rows, img, map_of, order_by, relation_fixture, rows_spec, table_shards,
+};
 use crate::test_support::{RelationFixture, TID};
 use gnitz_expr::{CmpOp, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::{AggDescriptor, AggFunc, ComputeMap, GroupAggs, ReadBound, ReadSink, ReadSpec, SinkKind, TypeCode};
@@ -36,7 +38,7 @@ fn fixture(payload: &[TypeCode], indexed: &[&[u32]], put_row: impl FnMut(&mut Ba
     let rows = id_rows(&schema, (0..ROWS).map(|id| (id, 1)), put_row);
     let r = relation_fixture(RelationKind::BaseTable, schema, indexed, [rows]);
     let table = r.relation(TID).unwrap().table();
-    assert_eq!((table.all_shard_arcs().len(), table.runs(At::Now).count()), (0, 1));
+    assert_eq!((table_shards(table).len(), table.runs(At::Now).count()), (0, 1));
     r
 }
 

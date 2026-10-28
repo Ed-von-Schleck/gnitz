@@ -1,5 +1,5 @@
 use super::{flush_barrier, Cut, RecoverySource, DEFAULT_RAM_TIER_BYTES};
-use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, new_table, scratch_table};
+use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, new_table, scratch_table, table_shards};
 use gnitz_foundation::perf::{self, Counter};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;
@@ -63,7 +63,7 @@ fn table_ingest_bench() {
             rows * 32 > tier || tier == DEFAULT_RAM_TIER_BYTES,
             "{label}: fits the tier"
         );
-        assert_eq!(!table.all_shard_arcs().is_empty(), spills, "{label}: spilled");
+        assert_eq!(!table_shards(&table).is_empty(), spills, "{label}: spilled");
         println!(
             "table_ingest_bench {label:<44} {:8.1} instr/row",
             instructions as f64 / rows as f64
@@ -119,7 +119,7 @@ fn ram_tier_ceiling_bench() {
             "ram_tier_ceiling_bench {fill:>2}% full {:>7.0} cycles/update {:>7.0} instr/update, {} shards",
             cyc as f64 / UPDATES as f64,
             instr as f64 / UPDATES as f64,
-            table.all_shard_arcs().len()
+            table_shards(&table).len()
         );
     }
 }
@@ -167,56 +167,6 @@ fn ingest_call_bench() {
             total as f64 / ticks as f64 / 1e3,
             costliest as f64 / 1e6,
             kept_up as f64 * 100.0 / ticks as f64,
-        );
-    }
-}
-
-/// Instructions per `Table::gather` of 1, 64 and 4096 keys spread over the key
-/// span of a table whose rows sit in shards and in the memtable, the open
-/// counted.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn pk_set_gather_bench() {
-    const ROWS: u64 = 1 << 18;
-    const ITERS: usize = 200;
-    let schema = make_schema_u64_i64();
-    let dir = tempfile::tempdir().unwrap();
-    // A tier of half a round, so every round spills.
-    let mut t = new_table(
-        dir.path(),
-        schema,
-        RecoverySource::Rederive { resume_at: None },
-        1 << 19,
-    );
-    for r in 0..8u64 {
-        let rows: Vec<(u64, i64, i64)> = (0..ROWS / 8).map(|k| (k * 8 + r, 1, (k * 8 + r) as i64)).collect();
-        t.ingest(make_batch(&schema, &rows)).unwrap();
-    }
-    let late: Vec<(u64, i64, i64)> = (0..64u64).map(|k| (k * (ROWS / 64) + 1, 1, 7)).collect();
-    t.ingest(make_batch(&schema, &late)).unwrap();
-    assert_eq!(
-        (
-            t.shard_index.total_rows(),
-            t.ram_tier.row_count(),
-            t.memtable.row_count()
-        ),
-        (ROWS as usize, 0, late.len()),
-        "every round in a shard, the late rows in the memtable"
-    );
-
-    let counter = Counter::instructions();
-    for n in [1u64, 64, 4096] {
-        let step = ROWS / (n + 1);
-        let key_bytes: Vec<[u8; 8]> = (1..=n).map(|i| (i * step).to_be_bytes()).collect();
-        let passes = vec![PkKeys::from_keys(8, key_bytes.iter().map(|k| &k[..])); ITERS];
-        let (rows, instructions) = counter.measure(|| {
-            let gather = |keys| t.gather(keys, Cut::Now).drain_chunk(usize::MAX).map_or(0, |b| b.len());
-            passes.into_iter().map(gather).sum::<usize>()
-        });
-        assert!(rows >= ITERS * n as usize, "every probed key holds a row");
-        println!(
-            "pk_set_gather_bench {n} keys: {} instr/gather",
-            instructions / ITERS as u64
         );
     }
 }
@@ -353,7 +303,7 @@ fn barrier_seal_bench() {
             let rows: Vec<_> = (from..from + PER).map(|k| (2 * k, 1, k as i64)).collect();
             t.ingest(make_batch(&schema, &rows)).unwrap();
         }
-        assert!(t.all_shard_arcs().is_empty(), "the tier's rows are held in RAM");
+        assert!(table_shards(&t).is_empty(), "the tier's rows are held in RAM");
         let span = tier.max(pending);
         for from in (0..pending).step_by(PER as usize) {
             let rows: Vec<(u64, i64, i64)> = match lie {
@@ -378,7 +328,7 @@ fn barrier_seal_bench() {
         let ((), barrier) = counter.measure(|| flush_barrier([&mut t], 1).unwrap());
         let barrier_peak = mib(resident);
         assert_eq!(
-            t.all_shard_arcs().len(),
+            table_shards(&t).len(),
             1 + usize::from(tier > 0),
             "the tier's shard, and the pending rows' own"
         );

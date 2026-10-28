@@ -1,6 +1,7 @@
 use super::super::manifest;
 use super::super::*;
 use super::Fold;
+use crate::storage::Cut;
 use crate::test_support::{
     make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema,
 };
@@ -212,12 +213,12 @@ fn assert_all_found(idx: &ShardIndex, keys: impl IntoIterator<Item = u64>) {
 
 /// Publish the index's manifest as the barrier does, minus the fsyncs.
 fn publish_manifest(idx: &mut ShardIndex) {
-    let bytes = manifest::encode(&manifest::Manifest {
+    let m = manifest::Manifest {
         checkpoint_mark: 0,
         caller_record: Vec::new(),
         shards: idx.shard_set(),
-    });
-    std::fs::write(manifest::staging_path(&idx.output_dir), bytes).unwrap();
+    };
+    manifest::stage(&idx.output_dir, &m).unwrap();
     manifest::commit(&idx.output_dir).unwrap();
     idx.mark_published();
     idx.unlink_retired();
@@ -261,12 +262,10 @@ fn a_fold_and_reload_keep_every_key_and_track_what_is_unsynced() {
     let mut idx2 = fresh(dir.path(), schema);
     assert!(idx2.shard_set() == idx.shard_set());
     assert!(idx2.unsynced_paths().next().is_none(), "a manifest names durable files");
+    let loaded = idx2.all_entries().map(|e| e.seq).max().unwrap();
     idx2.append_l0_run(&test_batch(&[99], &[990])).unwrap();
-    let mut seqs: Vec<u64> = idx2.all_entries().map(|e| e.seq).collect();
-    seqs.dedup();
-    assert_eq!(
-        seqs.len(),
-        idx2.shard_count(),
+    assert!(
+        idx2.levels[L0].entries().all(|e| e.seq > loaded),
         "a write after the reload takes a fresh name"
     );
     assert_all_found(&idx2, pks.iter().copied().chain([99]));
@@ -636,7 +635,7 @@ fn open_removes_exactly_the_unreferenced_files() {
     for seq in [99, 7] {
         std::fs::write(dir.path().join(manifest::shard_name(seq)), b"x").unwrap();
     }
-    std::fs::write(dir.path().join("manifest.bin.tmp"), b"x").unwrap();
+    std::fs::write(manifest::staging_path(dir.path().to_str().unwrap()), b"x").unwrap();
     std::fs::write(dir.path().join("other"), b"x").unwrap();
 
     let idx = fresh(dir.path(), make_schema_u64_i64());
@@ -960,11 +959,11 @@ fn a_range_gather_visits_only_the_guards_that_can_own_it() {
         seed_guard(&mut idx, L1, gk(base), &dense_batch(base, 200), i + 1);
     }
     let count = |lo: u64, hi: Option<u64>| {
-        idx.shard_arcs_in_range(gk(lo), hi.map_or_else(|| PkBuf::max(8), gk), true)
+        idx.shard_arcs_in_range(gk(lo), hi.map_or_else(|| PkBuf::max(8), gk), Cut::Now)
             .count()
     };
 
-    assert_eq!(idx.shard_arcs(true).count(), 4);
+    assert_eq!(idx.shard_arcs(Cut::Now).count(), 4);
     assert_eq!(count(1100, Some(1100)), 1, "a point read routes to one guard");
     assert_eq!(count(1100, Some(2100)), 2, "a range takes the run it spans");
     assert_eq!(count(0, None), 4, "an open end takes the rest of the key space");
@@ -1181,13 +1180,12 @@ fn dehydration_takes_the_oldest_written_terminal_guard_first() {
     // The last one seeded carries the smallest stamp.
     let oldest = 2;
     let oldest_key = gk(20_000);
-    let live_before: Vec<(u128, i64)> = {
-        let g = &idx.levels[TERMINAL].guards[oldest];
-        let s = &g.entries[0].shard;
+    let keys_and_weights = |s: &MappedShard| -> Vec<(u128, i64)> {
         (0..s.row_count())
             .map(|i| (gnitz_wire::widen_pk_be(s.get_pk_bytes(i)), s.get_weight(i)))
             .collect()
     };
+    let live_before = keys_and_weights(&idx.levels[TERMINAL].guards[oldest].entries[0].shard);
 
     // A capacity just under the current size dehydrates exactly one guard,
     // and it is that one.
@@ -1200,11 +1198,7 @@ fn dehydration_takes_the_oldest_written_terminal_guard_first() {
         idx.levels[TERMINAL].guards[dehy[0]].guard_key, oldest_key,
         "write-recency victim",
     );
-    let g = &idx.levels[TERMINAL].guards[dehy[0]];
-    let s = &g.entries[0].shard;
-    let live_after: Vec<(u128, i64)> = (0..s.row_count())
-        .map(|i| (gnitz_wire::widen_pk_be(s.get_pk_bytes(i)), s.get_weight(i)))
-        .collect();
+    let live_after = keys_and_weights(&idx.levels[TERMINAL].guards[dehy[0]].entries[0].shard);
     assert_eq!(live_after, live_before, "keys and coarse weights survive dehydration");
 }
 
@@ -1477,6 +1471,17 @@ struct Model {
 }
 
 impl Model {
+    /// Add `w` to the element `(pk, payload)`, dropping it at zero.
+    fn add(&mut self, pk: Vec<u8>, payload: i64, w: i64) {
+        self.seen.insert(pk.clone());
+        let elem = (pk, payload);
+        let n = self.rows.get(&elem).copied().unwrap_or(0) + w;
+        match n {
+            0 => self.rows.remove(&elem),
+            _ => self.rows.insert(elem, n),
+        };
+    }
+
     /// One spill's delta as a (PK, payload)-sorted batch, applied to the model.
     fn spill(&mut self, rng: &mut crate::test_support::Rng, pk_cols: usize, monotone: bool) -> Batch {
         let n = 200 + rng.gen_range(2800);
@@ -1485,14 +1490,10 @@ impl Model {
             if !monotone && !self.rows.is_empty() && rng.gen_range(4) == 0 {
                 // Retract one unit of a live element.
                 let nth = rng.gen_range(self.rows.len().min(64) as u64) as usize;
-                let (elem, _) = self.rows.iter().nth(nth).unwrap();
-                let elem = elem.clone();
-                *delta.entry(elem.clone()).or_default() -= 1;
-                let w = self.rows.get_mut(&elem).unwrap();
-                *w -= 1;
-                if *w == 0 {
-                    self.rows.remove(&elem);
-                }
+                let ((pk, payload), _) = self.rows.iter().nth(nth).unwrap();
+                let (pk, payload) = (pk.clone(), *payload);
+                *delta.entry((pk.clone(), payload)).or_default() -= 1;
+                self.add(pk, payload, -1);
             } else {
                 let i = if monotone {
                     self.next_key += 1 + rng.gen_range(3);
@@ -1503,9 +1504,8 @@ impl Model {
                 let pk = model_key(pk_cols, i);
                 self.next_payload += 1;
                 let w = 1 + rng.gen_range(2) as i64;
-                self.seen.insert(pk.clone());
                 *delta.entry((pk.clone(), self.next_payload)).or_default() += w;
-                *self.rows.entry((pk, self.next_payload)).or_default() += w;
+                self.add(pk, self.next_payload, w);
             }
         }
         let rows: Vec<(Vec<u8>, i64, i64)> = delta
@@ -1568,7 +1568,7 @@ fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
     }
 
     // The full cursor.
-    let mut cursor = from_runs(idx.shard_arcs(true).map(Run::Shard), idx.schema, idx.shard_count());
+    let mut cursor = from_runs(idx.shard_arcs(Cut::Now).map(Run::Shard), idx.schema, idx.shard_count());
     if skeleton {
         // A skeleton row is one merge group at its key's coarse weight.
         let mut sums: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
@@ -1704,8 +1704,6 @@ fn shard_index_model() {
 #[test]
 fn tier_folds_keep_the_zset() {
     use crate::test_support::Rng;
-    use gnitz_zset::repr::merge_guard;
-    use std::collections::BTreeMap;
     const KEYS: u64 = 400_000;
     for budget in [None, Some(3 << 20)] {
         let tmp = tempfile::tempdir().unwrap();
@@ -1713,7 +1711,7 @@ fn tier_folds_keep_the_zset() {
         let mut idx = open(tmp.path(), schema, budget);
         let mut rng = Rng::new(7);
         let mut version = vec![0u64; KEYS as usize];
-        let mut model: BTreeMap<(u64, i64), i64> = BTreeMap::new();
+        let mut m = Model::default();
         cstats::reset();
         for _ in 0..260 {
             let mut rows = Vec::new();
@@ -1732,7 +1730,7 @@ fn tier_folds_keep_the_zset() {
                 rows.push((k, 1, spread(k ^ *v << 40)));
             }
             for &(k, w, val) in &rows {
-                *model.entry((k, val)).or_default() += w;
+                m.add(k.to_be_bytes().to_vec(), val, w);
             }
             idx.append_l0_run(&make_batch_raw(&schema, &rows).into_consolidated())
                 .unwrap();
@@ -1749,37 +1747,13 @@ fn tier_folds_keep_the_zset() {
         ] {
             assert!(stats.contains_key(&kind), "no {kind:?} ran");
         }
-        model.retain(|_, w| *w != 0);
-        let skeleton = idx.has_skeleton_shard();
-        assert_eq!(skeleton, budget.is_some());
+        assert_eq!(idx.has_skeleton_shard(), budget.is_some());
         for reopen in [false, true] {
             if reopen {
                 idx = reopened_under(idx, budget);
             }
-            let shards: Vec<Rc<MappedShard>> = idx.shard_arcs(true).collect();
-            let mut held: BTreeMap<(u64, i64), i64> = BTreeMap::new();
-            let mut per_key: BTreeMap<u64, i64> = BTreeMap::new();
             idx.verify_shards().unwrap();
-            let mut starts = vec![0; shards.len()];
-            if let Some(run) = merge_guard(&shards, &mut starts, None, false, &schema, None) {
-                let batch = run.plain().unwrap();
-                for row in 0..batch.len() {
-                    let k = u64::from_be_bytes(batch.get_pk_bytes(row).try_into().unwrap());
-                    *per_key.entry(k).or_default() += batch.get_weight(row);
-                    if !skeleton {
-                        let val = i64::from_le_bytes(batch.get_col_ptr(row, 0, 8).try_into().unwrap());
-                        *held.entry((k, val)).or_default() += batch.get_weight(row);
-                    }
-                }
-            }
-            let mut expect: BTreeMap<u64, i64> = BTreeMap::new();
-            for (&(k, _), &w) in &model {
-                *expect.entry(k).or_default() += w;
-            }
-            assert_eq!(per_key, expect, "summed weight per key, reopen {reopen}");
-            if !skeleton {
-                assert_eq!(held, model, "rows, reopen {reopen}");
-            }
+            check_model(&idx, &m, &format!("budget {budget:?} reopen {reopen}"));
         }
     }
 }

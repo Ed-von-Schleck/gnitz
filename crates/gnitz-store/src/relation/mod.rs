@@ -105,8 +105,7 @@ impl SecondaryIndex {
 
     /// A cursor positioned on the key band `r` walks over this index's store.
     pub(crate) fn cursor_over(&self, r: &gnitz_wire::KeyRange) -> ReadCursor {
-        let t = self.store.held();
-        t.range_cursor(gnitz_zset::schema::key::range_band(t.schema(), r), Cut::Now)
+        self.store.held().range_cursor(r, Cut::Now)
     }
 
     /// Project `source` into this index's layout and ingest the result. A

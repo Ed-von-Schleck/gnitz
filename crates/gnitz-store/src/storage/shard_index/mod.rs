@@ -1,5 +1,7 @@
-//! FLSM Shard Index: the one shard writer — shard lifecycle, the PK filter
-//! policy, compaction ([`index`]), and the shard set a manifest publishes.
+//! FLSM Shard Index: the tree a store's shards form — levels of guards and the
+//! shard entries in them, the compaction policy's constants and its learned
+//! cancel yield — opened from and published as a manifest's shard set. The
+//! writer, probes and upkeep over the tree are [`index`]'s.
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -92,12 +94,12 @@ impl ShardIndex {
 const LEVELS: usize = 3;
 /// Spills as they arrive: at most one guard, keyed zero and so owning every key,
 /// whose shards overlap. Folded down into L1, never in place.
-pub(super) const L0: usize = 0;
+const L0: usize = 0;
 /// Guards of overlapping shards, each folding its newest ones in place past
 /// [`GUARD_FILE_THRESHOLD`] and drained into the terminal level.
-pub(super) const L1: usize = 1;
+const L1: usize = 1;
 /// The deepest level: one shard per guard, and the only one a sweep dehydrates.
-pub(super) const TERMINAL: usize = 2;
+const TERMINAL: usize = 2;
 /// L0 shards past this count trigger the fold into L1.
 pub(super) const L0_COMPACT_THRESHOLD: usize = 4;
 /// Files one guard holds at rest.
@@ -118,6 +120,11 @@ const SWEEP_STEPS: u64 = 8;
 const SPLIT_SAMPLES: usize = 1024;
 /// Most destination buckets one fold may write — one output shard each.
 const MAX_PARTS: u64 = 64;
+/// Fold input bytes an ingest pays for per byte it ingests. A chosen factor, not
+/// a derived one: it has to exceed what a store's folds read per ingested byte,
+/// or what the store owes grows with it, and that ratio is a property of the
+/// workload.
+const UPKEEP_LEVY: u64 = 64;
 
 pub(super) struct ShardEntry {
     shard: Rc<MappedShard>,
@@ -131,7 +138,7 @@ pub(super) struct ShardEntry {
 
 impl ShardEntry {
     /// Open the shard drawn at `seq` in the store at `dir`.
-    pub(crate) fn open(dir: &str, seq: u64, schema: &SchemaDescriptor, newest: u64) -> Result<Self, StorageError> {
+    fn open(dir: &str, seq: u64, schema: &SchemaDescriptor, newest: u64) -> Result<Self, StorageError> {
         let shard = Rc::new(MappedShard::open(&manifest::shard_path(dir, seq), schema)?);
         let (pk_min, pk_max) = (shard.pk_at(0), shard.pk_at(shard.row_count() - 1));
         Ok(ShardEntry { shard, seq, newest, pk_min, pk_max })
@@ -275,7 +282,7 @@ impl FLSMLevel {
 
 pub(super) struct ShardIndex {
     pub(super) output_dir: String,
-    pub schema: SchemaDescriptor,
+    pub(super) schema: SchemaDescriptor,
 
     levels: [FLSMLevel; LEVELS],
     /// Shards a flush wrote of rows above the store's cut: read by every reader
@@ -292,8 +299,9 @@ pub(super) struct ShardIndex {
     /// [`Self::unlink_retired`].
     retired: Vec<u64>,
     /// `R`, the unit every byte target is stated in: the running max of the
-    /// registered L0 bytes one L0 fold consumed, of one shard it wrote and of one terminal run, floored at [`MIN_GUARD_BYTES`] and
-    /// persisted in the manifest header.
+    /// registered L0 bytes one L0 fold consumed, of one shard it wrote and of
+    /// one terminal run, floored at [`MIN_GUARD_BYTES`] and persisted in the
+    /// manifest header.
     l0_run_bytes: u64,
     /// `CREATE VIEW … WITH (capacity = …)`: the registered shard bytes past
     /// which a sweep leaves skeleton rows behind. `None` for every store but a
@@ -310,8 +318,12 @@ pub(super) struct ShardIndex {
     codebook: Option<Rc<Codebook>>,
     /// What the in-place guard folds so far cancelled per retraction they read.
     cancel_yield: CancelYield,
-    /// Whether the tree may owe a fold; see [`Self::owed`].
+    /// Whether the tree may owe a fold: set by every shard that enters it and
+    /// cleared by the [`Self::maintain`] that finds none left.
     owed: bool,
+    /// Fold input bytes [`Self::upkeep`] merged past what its calls so far paid
+    /// for: a fold stops at a destination, not at a byte.
+    upkeep_overdraft: u64,
     /// The fold under way, between two calls of [`Self::maintain`].
     running: Option<index::Running>,
     /// The L1 guards a band cut left to fold down, by guard key, the lowest
@@ -381,6 +393,7 @@ impl ShardIndex {
             cancel_yield: CancelYield::FRESH,
             // A reopened tree is asked once whether it owes anything.
             owed: !shards.entries.is_empty(),
+            upkeep_overdraft: 0,
             running: None,
             bands: Vec::new(),
         };

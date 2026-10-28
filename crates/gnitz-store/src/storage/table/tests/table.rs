@@ -3,13 +3,13 @@ use super::*;
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::super::manifest::{manifest_path, shard_seqs};
+use super::super::manifest::{manifest_path, shard_seqs, staging_path};
 use super::super::shard_index::L0_COMPACT_THRESHOLD;
 use super::flush_barrier;
 
 use crate::test_support::{
-    arb_fold_case, fold_batch, make_batch_raw, make_schema_u64_i64, new_table, row_key, scratch_table, zset_of,
-    zset_sum, FoldRow, RowKey,
+    arb_fold_case, fold_batch, make_batch_raw, make_schema_u64_i64, new_table, row_key, scratch_table, table_shards,
+    zset_of, zset_sum, FoldRow, RowKey,
 };
 use gnitz_wire::PkKeys;
 use proptest::prelude::*;
@@ -51,6 +51,12 @@ fn elem(schema: &SchemaDescriptor, r: &FoldRow) -> RowKey {
     row_key(&fold_batch(schema, std::slice::from_ref(r)), schema, 0)
 }
 
+/// Every row `g` gathers, as a Z-set summed over its chunks.
+fn gathered(mut g: PkSetGather, s: &SchemaDescriptor) -> HashMap<RowKey, i64> {
+    let chunks: Vec<Batch> = std::iter::from_fn(|| g.drain_chunk(3)).collect();
+    zset_sum(&chunks, s)
+}
+
 /// Every read `t` serves agrees with `live`, and one at the cut with `sealed`.
 fn assert_serves(t: &Table, live: &HashMap<RowKey, i64>, sealed: &HashMap<RowKey, i64>, keys: &[Vec<u8>]) {
     let s = *t.schema();
@@ -72,12 +78,8 @@ fn assert_serves(t: &Table, live: &HashMap<RowKey, i64>, sealed: &HashMap<RowKey
     }
 
     for (cut, want) in [(Cut::Now, want.clone()), (Cut::Sealed, sealed.clone())] {
-        let mut gather = t.gather(PkKeys::from_sorted(s.pk_stride(), keys.concat()), cut);
-        let mut gathered: HashMap<RowKey, i64> = HashMap::new();
-        while let Some(b) = gather.drain_chunk(3) {
-            gathered.extend(zset_of(&b, &s));
-        }
-        assert_eq!(gathered, want, "gather at {cut:?}");
+        let gather = t.gather(PkKeys::from_sorted(s.pk_stride(), keys.concat()), cut);
+        assert_eq!(gathered(gather, &s), want, "gather at {cut:?}");
 
         // Every other key's leading column alone: a gather and a cursor between
         // the first and last answer every row under each, and nothing else.
@@ -92,12 +94,8 @@ fn assert_serves(t: &Table, live: &HashMap<RowKey, i64>, sealed: &HashMap<RowKey
                     .map(|(k, &w)| (k.clone(), w))
                     .collect()
             };
-            let mut gather = t.gather(PkKeys::from_sorted(p, prefixes.concat()), cut);
-            let mut gathered: HashMap<RowKey, i64> = HashMap::new();
-            while let Some(b) = gather.drain_chunk(3) {
-                gathered.extend(zset_of(&b, &s));
-            }
-            assert_eq!(gathered, under(&want), "prefix gather at {cut:?}");
+            let gather = t.gather(PkKeys::from_sorted(p, prefixes.concat()), cut);
+            assert_eq!(gathered(gather, &s), under(&want), "prefix gather at {cut:?}");
             let (first, last) = (prefixes[0], prefixes[prefixes.len() - 1]);
             let between = zset_of(&t.cursor_between(first, last, cut).materialize(), &s);
             assert_eq!(under(&between), under(&want), "prefix cursor at {cut:?}");
@@ -110,7 +108,7 @@ fn assert_serves(t: &Table, live: &HashMap<RowKey, i64>, sealed: &HashMap<RowKey
         );
         for w in keys.windows(2) {
             let (lo, hi) = (PkBuf::from_bytes(&w[0]), PkBuf::from_bytes(&w[1]));
-            let got = zset_of(&t.range_cursor(Some((lo, Some(hi))), cut).materialize(), &s);
+            let got = zset_of(&t.band_cursor((lo, Some(hi)), cut).materialize(), &s);
             let band: HashMap<RowKey, i64> = want
                 .iter()
                 .filter(|(k, _)| w[0] <= k.0 && k.0 < w[1])
@@ -259,8 +257,8 @@ fn store_cancelled_under_100(dir: &Path) -> Table {
     t
 }
 
-fn floor(t: &Table, cut: Cut) -> Option<Vec<u8>> {
-    t.live_floor(cut).get().at.map(|k| k.pk_bytes().to_vec())
+fn floor(t: &Table) -> Option<Vec<u8>> {
+    t.live_floor.get().at.map(|k| k.pk_bytes().to_vec())
 }
 
 fn scan(t: &Table, cut: Cut) -> HashMap<RowKey, i64> {
@@ -278,33 +276,45 @@ fn live(pks: &[u64]) -> HashMap<RowKey, i64> {
 fn an_open_keeps_the_first_live_key_as_the_floor() {
     let dir = tempfile::tempdir().unwrap();
     let t = store_cancelled_under_100(dir.path());
-    for cut in [Cut::Now, Cut::Sealed] {
-        assert_eq!(floor(&t, cut), None, "{cut:?}");
-        assert_eq!(scan(&t, cut), live(&[100]), "{cut:?}");
-        assert_eq!(floor(&t, cut), Some(key(100)), "{cut:?}");
-    }
+    assert_eq!(floor(&t), None);
+    assert_eq!(scan(&t, Cut::Now), live(&[100]));
+    assert_eq!(floor(&t), Some(key(100)));
+    assert_eq!(scan(&t, Cut::Sealed), live(&[100]));
     let band = |lo, hi| {
-        let band = Some((PkBuf::from_bytes(&key(lo)), Some(PkBuf::from_bytes(&key(hi)))));
-        zset_of(&t.range_cursor(band, Cut::Now).materialize(), &make_schema_u64_i64())
+        let band = (PkBuf::from_bytes(&key(lo)), Some(PkBuf::from_bytes(&key(hi))));
+        zset_of(&t.band_cursor(band, Cut::Now).materialize(), &make_schema_u64_i64())
     };
     assert_eq!(band(0, 100), live(&[]));
     assert_eq!(band(0, 101), live(&[100]));
 }
 
 #[test]
-fn a_pending_row_lowers_the_floor_its_cuts_read() {
+fn a_pending_row_lowers_the_floor_both_cuts_read() {
     let dir = tempfile::tempdir().unwrap();
     let mut t = store_cancelled_under_100(dir.path());
     scan(&t, Cut::Now);
-    scan(&t, Cut::Sealed);
     t.ingest_pending(rows(&[(50, 1, 0)]));
-    assert_eq!(floor(&t, Cut::Now), Some(key(50)));
-    assert_eq!(floor(&t, Cut::Sealed), Some(key(100)));
+    assert_eq!(floor(&t), Some(key(50)));
     assert_eq!(scan(&t, Cut::Now), live(&[50, 100]));
     assert_eq!(scan(&t, Cut::Sealed), live(&[100]));
     t.seal().unwrap();
-    assert_eq!(floor(&t, Cut::Sealed), Some(key(50)));
+    assert_eq!(floor(&t), Some(key(50)));
     assert_eq!(scan(&t, Cut::Sealed), live(&[50, 100]));
+}
+
+/// A read at the store's newest rows, where a pending retraction cancels a
+/// row, keeps the floor under that row, so a read at the cut still finds it.
+#[test]
+fn a_pending_retraction_keeps_its_row_over_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = store_cancelled_under_100(dir.path());
+    t.ingest(rows(&[(65, 1, 0)])).unwrap();
+    t.ingest_pending(rows(&[(65, -1, 0)]));
+    assert_eq!(scan(&t, Cut::Now), live(&[100]));
+    assert_eq!(floor(&t), Some(key(65)));
+    assert_eq!(scan(&t, Cut::Sealed), live(&[65, 100]));
+    t.seal().unwrap();
+    assert_eq!(scan(&t, Cut::Sealed), live(&[100]));
 }
 
 #[test]
@@ -313,9 +323,9 @@ fn a_floor_with_nothing_under_it_is_dropped() {
     let mut t = store_cancelled_under_100(dir.path());
     scan(&t, Cut::Now);
     t.ingest(rows(&[(0, 1, 0)])).unwrap();
-    assert_eq!(floor(&t, Cut::Now), Some(key(0)));
+    assert_eq!(floor(&t), Some(key(0)));
     assert_eq!(scan(&t, Cut::Now), live(&[0, 100]));
-    assert_eq!(floor(&t, Cut::Now), None);
+    assert_eq!(floor(&t), None);
 }
 
 #[test]
@@ -325,9 +335,9 @@ fn a_fold_under_the_floor_drops_it_at_the_next_open() {
     scan(&t, Cut::Now);
     t.fold_to_ram().unwrap();
     assert_eq!(t.ram_tier.row_count(), 1, "premise: the fold cancelled the pairs");
-    assert_eq!(floor(&t, Cut::Now), Some(key(100)));
+    assert_eq!(floor(&t), Some(key(100)));
     scan(&t, Cut::Now);
-    assert_eq!(floor(&t, Cut::Now), None);
+    assert_eq!(floor(&t), None);
 }
 
 #[test]
@@ -337,9 +347,9 @@ fn a_store_of_cancelled_rows_floors_at_the_top_key() {
     t.ingest(rows(&[(100, -1, 0)])).unwrap();
     assert_eq!(scan(&t, Cut::Now), live(&[]));
     let top = PkBuf::max(make_schema_u64_i64().pk_stride());
-    assert_eq!(floor(&t, Cut::Now), Some(top.pk_bytes().to_vec()));
+    assert_eq!(floor(&t), Some(top.pk_bytes().to_vec()));
     t.clear();
-    assert_eq!(floor(&t, Cut::Now), None);
+    assert_eq!(floor(&t), None);
 }
 
 /// An ingest past the memtable's budget folds it into the RAM tier on its own.
@@ -412,6 +422,7 @@ fn rederive_checkpointed_conditional_load() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let manifest = manifest_path(dir.path().to_str().unwrap());
+    let pushed = rows(&[(1, 1, 100), (2, 1, 200)]);
     let reopen = |at| {
         new_table(
             dir.path(),
@@ -422,12 +433,16 @@ fn rederive_checkpointed_conditional_load() {
     };
     {
         let mut t = new_table(dir.path(), schema, RecoverySource::SalReplay, 1 << 20);
-        t.ingest(rows(&[(1, 1, 100), (2, 1, 200)])).unwrap();
+        t.ingest(pushed.clone()).unwrap();
         flush_barrier([&mut t], 7).unwrap();
     }
     let t = reopen(7);
     assert!(t.loaded_mark().is_some());
-    assert_eq!(t.full_scan().len(), 2, "a matching generation loads");
+    assert_eq!(
+        zset_of(&t.full_scan(), &schema),
+        zset_of(&pushed, &schema),
+        "a matching generation loads"
+    );
     drop(t);
     let t = reopen(8);
     assert!(t.loaded_mark().is_none());
@@ -435,7 +450,8 @@ fn rederive_checkpointed_conditional_load() {
     assert!(!std::fs::exists(&manifest).unwrap());
 }
 
-/// A reopen reports the last published checkpoint mark; no manifest reports 0.
+/// A reopen reports the last published checkpoint mark; a store without a
+/// manifest reports none.
 #[test]
 fn a_barriers_checkpoint_mark_is_what_the_reopen_reports() {
     let dir = tempfile::tempdir().unwrap();
@@ -502,13 +518,16 @@ fn a_reopened_stores_first_barrier_rewrites_only_a_changed_manifest() {
     let schema = make_schema_u64_i64();
     let path = manifest_path(dir.path().to_str().unwrap());
     let inode = || std::fs::metadata(&path).unwrap().ino();
-    let staging = dir.path().join("manifest.bin.tmp");
+    let staging = Path::new(&staging_path(dir.path().to_str().unwrap())).to_path_buf();
     let resume = RecoverySource::Rederive { resume_at: Some(4) };
+    let mut pushed = Vec::new();
     {
         let mut t = new_table(dir.path(), schema, resume, 100);
         // Several shards over two levels, so the reloaded order is not trivial.
         for r in 0..2 * L0_COMPACT_THRESHOLD as u64 {
-            t.ingest(rows(&[(r, 1, 10)])).unwrap();
+            let b = rows(&[(r, 1, 10)]);
+            t.ingest(b.clone()).unwrap();
+            pushed.push(b);
             flush_barrier([&mut t], 4).unwrap();
         }
         t.set_caller_record(b"rec".to_vec());
@@ -522,7 +541,7 @@ fn a_reopened_stores_first_barrier_rewrites_only_a_changed_manifest() {
     flush_barrier([&mut t], 4).unwrap();
     assert_eq!(inode(), published, "the manifest this open read stays in place");
     assert!(t.flush_prepare(4).unwrap().is_none(), "and is durable from here on");
-    assert_eq!(t.full_scan().len(), 2 * L0_COMPACT_THRESHOLD);
+    assert_eq!(zset_of(&t.full_scan(), &schema), zset_sum(&pushed, &schema));
     drop(t);
 
     // Another mark is another manifest.
@@ -535,14 +554,16 @@ fn a_reopened_stores_first_barrier_rewrites_only_a_changed_manifest() {
     // So are new rows, and the manifest read at open stops counting once one is staged.
     let resume = RecoverySource::Rederive { resume_at: Some(5) };
     let mut t = new_table(dir.path(), schema, resume, 100);
-    t.ingest(rows(&[(900, 1, 10)])).unwrap();
+    let b = rows(&[(900, 1, 10)]);
+    t.ingest(b.clone()).unwrap();
+    pushed.push(b);
     assert!(t.flush_prepare(5).unwrap().is_some());
     assert!(staging.exists(), "new rows stage a manifest");
     flush_barrier([&mut t], 5).unwrap();
     assert_ne!(inode(), published);
     drop(t);
     let t = new_table(dir.path(), schema, resume, 100);
-    assert_eq!(t.full_scan().len(), 2 * L0_COMPACT_THRESHOLD + 1);
+    assert_eq!(zset_of(&t.full_scan(), &schema), zset_sum(&pushed, &schema));
 }
 
 /// Only base-table paths point-probe a store by PK, and they are the only
@@ -568,7 +589,7 @@ fn pk_filter_follows_whether_the_store_is_probed() {
             l0 > 0 && levels.iter().sum::<usize>() > 0,
             "spills and compaction outputs"
         );
-        let shards = t.all_shard_arcs();
+        let shards = table_shards(&t);
         assert!(shards.iter().all(|s| s.has_shard_filter() == filtered), "{rs:?}");
     }
 }
@@ -580,25 +601,32 @@ fn pk_filter_follows_whether_the_store_is_probed() {
 fn a_tier_folded_to_just_under_its_ceiling_spills() {
     const CEILING_ROWS: u64 = 1 << 15;
     let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
     for (held, spills) in [(CEILING_ROWS * 7 / 8, false), (CEILING_ROWS * 31 / 32, true)] {
         let mut t = new_table(
             dir.path().join(held.to_string()),
-            make_schema_u64_i64(),
+            schema,
             RecoverySource::Rederive { resume_at: None },
             CEILING_ROWS as usize * 32,
         );
-        t.ingest(rows(&(0..held).map(|k| (k, 1, 0)).collect::<Vec<_>>()))
-            .unwrap();
+        let mut pushed = vec![rows(&(0..held).map(|k| (k, 1, 0)).collect::<Vec<_>>())];
+        t.ingest(pushed[0].clone()).unwrap();
         t.fold_to_ram().unwrap();
-        assert_eq!(t.all_shard_arcs().len(), 0, "{held}: under the ceiling");
+        assert_eq!(table_shards(&t).len(), 0, "{held}: under the ceiling");
         // Updates of a quarter of the ceiling's rows, in pushes too small to merge.
         for half in [0..CEILING_ROWS / 8, CEILING_ROWS / 8..CEILING_ROWS / 4] {
             let updates = half.flat_map(|k| [(k, -1, 0), (k, 1, 1)]);
-            t.ingest(rows(&updates.collect::<Vec<_>>())).unwrap();
+            let b = rows(&updates.collect::<Vec<_>>());
+            t.ingest(b.clone()).unwrap();
+            pushed.push(b);
             t.fold_to_ram().unwrap();
         }
-        assert_eq!(!t.all_shard_arcs().is_empty(), spills, "{held} rows held");
-        assert_eq!(t.full_scan().len() as u64, held);
+        assert_eq!(!table_shards(&t).is_empty(), spills, "{held} rows held");
+        assert_eq!(
+            zset_of(&t.full_scan(), &schema),
+            zset_sum(&pushed, &schema),
+            "{held} rows held"
+        );
     }
 }
 
@@ -607,15 +635,22 @@ fn a_tier_folded_to_just_under_its_ceiling_spills() {
 #[test]
 fn a_store_held_in_ram_never_spills() {
     let dir = tempfile::tempdir().unwrap();
-    let mut t = new_table(dir.path(), make_schema_u64_i64(), RecoverySource::SalReplay, 96);
+    let schema = make_schema_u64_i64();
+    let mut t = new_table(dir.path(), schema, RecoverySource::SalReplay, 96);
     t.hold_in_ram();
+    let mut pushed = Vec::new();
     for r in 0..20u64 {
-        t.ingest(rows(&(0..10).map(|k| (r * 100 + k, 1, 1)).collect::<Vec<_>>()))
-            .unwrap();
+        let b = rows(&(0..10).map(|k| (r * 100 + k, 1, 1)).collect::<Vec<_>>());
+        t.ingest(b.clone()).unwrap();
+        pushed.push(b);
         t.fold_to_ram().unwrap();
     }
     assert_eq!(shard_files(dir.path()), 0, "no shard file was written");
-    assert_eq!(t.full_scan().len(), 200, "every row held in RAM");
+    assert_eq!(
+        zset_of(&t.full_scan(), &schema),
+        zset_sum(&pushed, &schema),
+        "every row held in RAM"
+    );
 }
 
 /// A seal folds its delta into the memtable unless the delta is a small
@@ -718,7 +753,7 @@ fn a_compressing_store_codes_its_shards_under_one_table() {
         crate::test_support::make_string_batch(&rows)
     };
     let digests = |t: &Table| -> Vec<Option<u64>> {
-        let shards = t.all_shard_arcs();
+        let shards = table_shards(t);
         shards
             .iter()
             .map(|s| Codebook::of_shard(s).map(|b| b.digest()))

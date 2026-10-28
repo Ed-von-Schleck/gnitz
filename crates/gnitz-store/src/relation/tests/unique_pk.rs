@@ -2,7 +2,7 @@ use super::enforce_unique_pk;
 use crate::storage::flush_barrier;
 use crate::test_support::{
     make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk, payload0_i64, pk_payload_schema,
-    scratch_table, zset_of,
+    scratch_table, table_shards, zset_of,
 };
 use gnitz_wire::TypeCode;
 
@@ -143,7 +143,7 @@ fn enforce_unique_pk_keeps_heap_strings_intact() {
     let seed = enforce_unique_pk(&pt, make_batch_bytes(&schema, &[(1, 1, long1)]));
     pt.ingest(seed).unwrap();
     flush_barrier([&mut pt], 0).unwrap();
-    assert!(!pt.all_shard_arcs().is_empty());
+    assert!(!table_shards(&pt).is_empty());
 
     let eff = enforce_unique_pk(
         &pt,

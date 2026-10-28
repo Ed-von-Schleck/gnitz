@@ -135,15 +135,14 @@ proptest! {
             table.settle().unwrap();
             prop_assert!(table.level_shape().1.iter().sum::<usize>() > 0, "no L0->L1 compaction");
             // Direct shard decode of the on-disk region layout.
-            let owned: Vec<Batch> = table
-                .all_shard_arcs()
+            let owned: Vec<Batch> = test_support::table_shards(&table)
                 .iter()
                 .map(|s| s.slice_to_owned_batch(0, s.row_count()))
                 .collect();
             prop_assert_eq!(&expected, &zset_sum(&owned, &schema));
         } else {
             // A sub-ceiling ephemeral store writes no shard.
-            prop_assert!(table.all_shard_arcs().is_empty());
+            prop_assert!(test_support::table_shards(&table).is_empty());
         }
         prop_assert_eq!(&expected, &zset_of(table.full_scan().as_ref(), &schema));
 

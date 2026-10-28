@@ -11,7 +11,7 @@
 //! reader at the cut leaves out.
 //!
 //! A row and its retraction stay stored until a fold merges their runs. An open
-//! starts at its cut's [`LiveFloor`] rather than walking the cancelled pairs
+//! starts at the store's [`LiveFloor`] rather than walking the cancelled pairs
 //! under it.
 
 use std::cell::Cell;
@@ -20,19 +20,16 @@ use std::io;
 use std::ops::Range;
 use std::rc::Rc;
 
-use gnitz_wire::PkKeys;
-
-use super::manifest::Manifest;
+use super::manifest::{Manifest, ShardSet};
 use super::run_set::RunSet;
 use super::shard_index::ShardIndex;
-use gnitz_wire::PkBuf;
+use super::Cut;
+use gnitz_wire::{KeyRange, PkBuf, PkKeys};
 use gnitz_zset::repr::Batch;
-#[cfg(test)]
-use gnitz_zset::repr::MappedShard;
 use gnitz_zset::repr::StorageError;
 use gnitz_zset::repr::{empty_cursor, from_runs, from_runs_at, from_runs_in_band, PkSetGather, ReadCursor};
 use gnitz_zset::repr::{first_live_payload_group, Run, StoredRow};
-use gnitz_zset::schema::key::{group_band, probe_key};
+use gnitz_zset::schema::key::{group_band, probe_key, range_band};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Ingest runs fold into the RAM tier once they pass this.
@@ -42,12 +39,6 @@ pub(super) const MEMTABLE_BYTES: usize = 192 << 10;
 /// memtable unfolded: beyond it a fold is mostly the copy of rows the delta
 /// does not touch.
 const SEAL_FOLD_RATIO: usize = 64;
-
-/// Fold input bytes an ingest pays for per byte it ingests. A chosen factor, not
-/// a derived one: it has to exceed what a store's folds read per ingested byte,
-/// or what the store owes grows with it, and that ratio is a property of the
-/// workload.
-const UPKEEP_LEVY: u64 = 64;
 
 /// The RAM-tier ceiling a registry's stores open with unless its `StoreConfig`
 /// overrides it: it bounds that one tier, not the table's heap. The ceiling trades
@@ -78,19 +69,9 @@ pub(crate) enum RecoverySource {
 // Table
 // ---------------------------------------------------------------------------
 
-/// Which time-prefix of a store's ingests a read sees. A store's runs are its
-/// history in order, so a prefix of them is the Z-set the store held then.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Cut {
-    /// Every ingest.
-    Now,
-    /// Every ingest up to the last [`Table::seal`]: the rows ingested as
-    /// pending since are left out.
-    Sealed,
-}
-
-/// A key under which no row nets nonzero at one cut. Every ingest lowers it,
-/// and the first open after the rows move judges whether it repays a seek.
+/// A key under which no row nets nonzero at either [`Cut`]. Every ingest lowers
+/// it, and the first open after the rows move judges whether it repays a seek.
+/// No row above the cut sits under it, so the two cuts agree on every key below.
 #[derive(Clone, Copy, Default)]
 struct LiveFloor {
     /// `None` where unknown, or where it skips too few rows to repay a seek.
@@ -102,7 +83,7 @@ pub(crate) struct Table {
     /// Runs ingested above the cut, folded among themselves only: [`Self::seal`]
     /// moves them into `memtable` as one run.
     pending: RunSet,
-    /// Ingest runs, folded into `ram_tier` once they pass its byte budget.
+    /// Ingest runs, folded into `ram_tier` once they pass [`MEMTABLE_BYTES`].
     memtable: RunSet,
     /// Folded memtable runs, spilled to a shard past the RAM-tier ceiling.
     ram_tier: RunSet,
@@ -121,9 +102,6 @@ pub(crate) struct Table {
     /// Set by [`Self::hold_in_ram`]: the RAM tier grows past its budget and never
     /// persists.
     held_in_ram: bool,
-    /// Fold input bytes [`Self::upkeep`] merged past what its calls so far paid
-    /// for: a fold stops at a destination, not at a byte.
-    upkeep_overdraft: u64,
 
     /// `live_row_at`'s candidate pool, kept between calls for its capacity.
     live_row_scratch: Cell<Vec<StoredRow>>,
@@ -131,13 +109,12 @@ pub(crate) struct Table {
     /// Last `full_scan` result, held until the row set moves.
     cached_full_scan: Cell<Option<Rc<Batch>>>,
 
-    /// Per cut, as [`Self::live_floor`] picks it.
-    live_floor: [Cell<LiveFloor>; 2],
+    live_floor: Cell<LiveFloor>,
 
-    /// The bytes of the manifest in place: the one this open read, or the one
-    /// this process's last barrier renamed. `None` for a store that has none,
-    /// and from the staging of another until its barrier completes.
-    manifest_in_place: Option<Vec<u8>>,
+    /// The manifest in place: the one this open read, or the one this
+    /// process's last barrier renamed. `None` for a store that has none, and
+    /// from the staging of another until its barrier completes.
+    manifest_in_place: Option<Manifest>,
     /// Whether a barrier of this process synced the directories behind
     /// `manifest_in_place`. The rename of a manifest read at open may predate a
     /// kill that came before them.
@@ -189,26 +166,25 @@ impl Table {
             // So a later re-open cannot reload what this one rejected.
             super::manifest::unlink(&[dir])?;
         }
-        let loaded_mark = loaded.as_ref().map(|m| m.checkpoint_mark);
-        let manifest_in_place = loaded.as_ref().map(super::manifest::encode);
-        let Manifest { caller_record, shards, .. } = loaded.unwrap_or_default();
+        let none = ShardSet::default();
+        let shards = loaded.as_ref().map_or(&none, |m| &m.shards);
         // A rederived store's shards carry no PK filter.
         let skip_pk_filter = rederived;
+        let shard_index = ShardIndex::open(dir, schema, capacity, skip_pk_filter, compress, shards)?;
         Ok(Table {
             // Never full: the budget only sizes its PK filter, to a tick's worth of rows.
             pending: RunSet::new(MEMTABLE_BYTES),
             memtable: RunSet::new(MEMTABLE_BYTES),
             ram_tier: RunSet::cancelling(ram_tier_bytes),
-            shard_index: ShardIndex::open(dir, schema, capacity, skip_pk_filter, compress, &shards)?,
+            shard_index,
             rederived,
-            loaded_mark,
-            caller_record,
+            loaded_mark: loaded.as_ref().map(|m| m.checkpoint_mark),
+            caller_record: loaded.as_ref().map(|m| m.caller_record.clone()).unwrap_or_default(),
             held_in_ram: false,
-            upkeep_overdraft: 0,
             live_row_scratch: Cell::new(Vec::new()),
             cached_full_scan: Cell::new(None),
             live_floor: Default::default(),
-            manifest_in_place,
+            manifest_in_place: loaded,
             manifest_synced: false,
         })
     }
@@ -236,7 +212,7 @@ impl Table {
 
     /// See [`ShardIndex::append_terminal_run`].
     pub(crate) fn append_terminal_run(&mut self, run: &Batch) -> Result<(), StorageError> {
-        self.admit(run, &[Cut::Now, Cut::Sealed]);
+        self.admit(run);
         self.shard_index.append_terminal_run(run)
     }
 
@@ -280,7 +256,7 @@ impl Table {
         if run.is_empty() {
             return Ok(());
         }
-        self.admit(&run, &[Cut::Now, Cut::Sealed]);
+        self.admit(&run);
         let ingested = run.total_bytes();
         self.memtable.push_run(run, &self.shard_index.schema);
         if self.memtable.is_full() {
@@ -307,13 +283,13 @@ impl Table {
         if batch.is_empty() {
             return;
         }
-        self.admit(&batch, &[Cut::Now]);
+        self.admit(&batch);
         self.pending.push(batch, &self.shard_index.schema);
     }
 
     /// Whether any row sits above the cut.
     pub(crate) fn has_pending(&self) -> bool {
-        self.pending.len() > 0 || self.shard_index.pending_arcs().next().is_some()
+        self.pending.len() > 0 || self.shard_index.has_pending()
     }
 
     /// Move the cut past every pending row and answer them, consolidated: the
@@ -332,20 +308,18 @@ impl Table {
         {
             self.memtable.fold(&schema);
         }
-        let shards: Vec<Run> = self.shard_index.pending_arcs().map(Run::Shard).collect();
+        let shards = self.shard_index.seal_pending();
         let delta = match shards.is_empty() {
             true => run,
             // A barrier since the last seal left part of the delta in shards.
             false => {
                 let cap = shards.len() + 1;
-                let mem = run.into_iter().map(Run::Mem);
-                Some(from_runs(mem.chain(shards), schema, cap).materialize())
+                let runs = run.into_iter().map(Run::Mem).chain(shards.into_iter().map(Run::Shard));
+                Some(from_runs(runs, schema, cap).materialize())
             }
         };
-        self.shard_index.seal_pending();
         // The cut now reads every ingest.
-        self.live_floor(Cut::Sealed).set(self.live_floor(Cut::Now).get());
-        self.rejudge_live_floors();
+        self.rejudge_live_floor();
         if self.memtable.is_full() {
             self.fold_to_ram()?;
         }
@@ -354,20 +328,13 @@ impl Table {
         Ok(delta.map(Rc::unwrap_or_clone).filter(|delta| !delta.is_empty()))
     }
 
-    /// Pay the disk tier's upkeep for `ingested` bytes: [`UPKEEP_LEVY`] bytes of
-    /// fold input for each, less what earlier calls overdrew. A store nothing
-    /// is ingested into keeps what it owes.
+    /// Pay the disk tier's [upkeep](ShardIndex::upkeep) for `ingested` bytes.
     fn upkeep(&mut self, ingested: usize) -> Result<(), StorageError> {
         // A read replica of another process's directory must not write into it.
-        if self.held_in_ram || !self.shard_index.owed() {
+        if self.held_in_ram {
             return Ok(());
         }
-        let levy = ingested as u64 * UPKEEP_LEVY;
-        let budget = levy.saturating_sub(self.upkeep_overdraft);
-        self.upkeep_overdraft = self.upkeep_overdraft.saturating_sub(levy);
-        let read = self.shard_index.maintain(budget)?;
-        self.upkeep_overdraft += read.saturating_sub(budget);
-        Ok(())
+        self.shard_index.upkeep(ingested)
     }
 
     /// Every fold the disk tier owes, in one call: for a caller with no ingest
@@ -376,7 +343,7 @@ impl Table {
         if self.held_in_ram {
             return Ok(());
         }
-        self.rejudge_live_floors();
+        self.rejudge_live_floor();
         self.shard_index.maintain(u64::MAX).map(drop)
     }
 
@@ -413,22 +380,25 @@ impl Table {
     /// Every run `cut` reads.
     pub(crate) fn runs(&self, cut: Cut) -> impl Iterator<Item = Run> + '_ {
         self.mem_runs(None, cut)
-            .chain(self.shard_index.shard_arcs(cut == Cut::Now).map(Run::Shard))
+            .chain(self.shard_index.shard_arcs(cut).map(Run::Shard))
     }
 
     /// Open a read-only cursor over the rows `cut` reads.
     pub(crate) fn open_cursor(&self, cut: Cut) -> ReadCursor {
-        let floor = self.live_floor(cut);
-        let LiveFloor { at, judged } = floor.get();
-        if judged {
-            return self.cursor_from(at, cut);
-        }
+        let LiveFloor { at, judged } = self.live_floor.get();
         let cursor = self.cursor_from(at, cut);
-        let at = cursor.passed_more_than_a_seek().then(|| match cursor.valid {
-            true => PkBuf::from_bytes(cursor.current_pk_bytes()),
-            false => PkBuf::max(self.shard_index.schema.pk_stride()),
-        });
-        floor.set(LiveFloor { at, judged: true });
+        if !judged {
+            let first_live = cursor.passed_more_than_a_seek().then(|| match cursor.valid {
+                true => PkBuf::from_bytes(cursor.current_pk_bytes()),
+                false => PkBuf::max(self.shard_index.schema.pk_stride()),
+            });
+            // Kept at or under every row above the cut, so it holds at both cuts.
+            let at = match (first_live, self.pending_least()) {
+                (Some(f), Some(p)) if p < f.pk_bytes() => Some(PkBuf::from_bytes(p)),
+                (f, _) => f,
+            };
+            self.live_floor.set(LiveFloor { at, judged: true });
+        }
         cursor
     }
 
@@ -443,32 +413,33 @@ impl Table {
         }
     }
 
-    fn live_floor(&self, cut: Cut) -> &Cell<LiveFloor> {
-        &self.live_floor[cut as usize]
+    /// The least key a row above the cut holds.
+    fn pending_least(&self) -> Option<&[u8]> {
+        self.pending
+            .runs_overlapping(None)
+            .map(|run| run.get_pk_bytes(0))
+            .chain(self.shard_index.pending_least())
+            .min()
     }
 
-    /// A fold leaves each floor valid, but can cancel the rows it skips.
-    fn rejudge_live_floors(&mut self) {
-        for floor in &mut self.live_floor {
-            floor.get_mut().judged = false;
-        }
+    /// A fold leaves the floor valid, but can cancel the rows it skips.
+    fn rejudge_live_floor(&mut self) {
+        self.live_floor.get_mut().judged = false;
     }
 
-    /// `rows`, a non-empty run, enter what each of `cuts` reads.
-    fn admit(&mut self, rows: &Batch, cuts: &[Cut]) {
+    /// `rows`, a non-empty run, enter the store.
+    fn admit(&mut self, rows: &Batch) {
         debug_assert!(
             !rows.is_empty() && rows.is_consolidated(),
             "a run's least key is its first"
         );
         self.cached_full_scan.set(None);
         let least = rows.get_pk_bytes(0);
-        for &cut in cuts {
-            let floor = self.live_floor[cut as usize].get_mut();
-            floor.judged = false;
-            match &mut floor.at {
-                Some(at) if least < at.pk_bytes() => *at = PkBuf::from_bytes(least),
-                _ => {}
-            }
+        let floor = self.live_floor.get_mut();
+        floor.judged = false;
+        match &mut floor.at {
+            Some(at) if least < at.pk_bytes() => *at = PkBuf::from_bytes(least),
+            _ => {}
         }
     }
 
@@ -483,18 +454,23 @@ impl Table {
         let stride = self.shard_index.schema.pk_stride();
         let band = group_band(first, last, stride)
             .expect("`first <= last`, so the band from one's group to the other's holds a key");
-        self.range_cursor(Some(band), cut)
+        self.band_cursor(band, cut)
+    }
+
+    /// A cursor positioned on the key band `r` walks, over the rows `cut` reads.
+    pub(crate) fn range_cursor(&self, r: &KeyRange, cut: Cut) -> ReadCursor {
+        match range_band(&self.shard_index.schema, r) {
+            Some(band) => self.band_cursor(band, cut),
+            None => empty_cursor(self.shard_index.schema),
+        }
     }
 
     /// A cursor positioned on the OPK key band `[start, end)` of the rows `cut`
     /// reads (`None` for `end`: the top of the key space), over the runs that can
-    /// hold a key of it; `None` opens empty.
-    pub(crate) fn range_cursor(&self, range: Option<(PkBuf, Option<PkBuf>)>, cut: Cut) -> ReadCursor {
+    /// hold a key of it.
+    fn band_cursor(&self, (mut start, end): (PkBuf, Option<PkBuf>), cut: Cut) -> ReadCursor {
         let schema = self.shard_index.schema;
-        let Some((mut start, end)) = range else {
-            return empty_cursor(schema);
-        };
-        match self.live_floor(cut).get().at {
+        match self.live_floor.get().at {
             Some(at) if at > start => {
                 if end.is_some_and(|end| end <= at) {
                     return empty_cursor(schema);
@@ -507,13 +483,11 @@ impl Table {
         let hi = end.unwrap_or_else(|| PkBuf::max(stride));
         debug_assert!(
             start.pk_bytes().len() == stride && hi.pk_bytes().len() == stride,
-            "range_cursor: a bound is not pk_stride wide",
+            "band_cursor: a bound is not pk_stride wide",
         );
-        let runs = self.mem_runs(Some((start, hi)), cut).chain(
-            self.shard_index
-                .shard_arcs_in_range(start, hi, cut == Cut::Now)
-                .map(Run::Shard),
-        );
+        let runs = self
+            .mem_runs(Some((start, hi)), cut)
+            .chain(self.shard_index.shard_arcs_in_range(start, hi, cut).map(Run::Shard));
         let cap = self.mem_run_count() + self.shard_index.narrow_range_shards();
         let end = end.as_ref().map(PkBuf::pk_bytes);
         from_runs_in_band(runs, schema, cap, start.pk_bytes(), end)
@@ -542,12 +516,6 @@ impl Table {
     /// Raw rows across every tier, cross-run duplicates and ghosts included.
     pub(crate) fn estimated_rows(&self) -> usize {
         self.ram_tiers(Cut::Now).map(|s| s.row_count()).sum::<usize>() + self.shard_index.total_rows()
-    }
-
-    /// Every registered shard.
-    #[cfg(test)]
-    pub(crate) fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
-        self.shard_index.shard_arcs(true).collect()
     }
 
     /// `(L0 shard count, L1 and terminal guard counts)`.

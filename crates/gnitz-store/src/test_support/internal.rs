@@ -3,16 +3,27 @@
 
 use std::num::NonZeroU64;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StoreConfig};
-use crate::storage::{RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
+use crate::storage::{Cut, RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{
     ComputeMap, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewBudget,
 };
 use gnitz_zset::algebra::{Placement, Slot};
-use gnitz_zset::repr::{Batch, BatchBuilder};
+use gnitz_zset::repr::{Batch, BatchBuilder, MappedShard, Run};
 use gnitz_zset::schema::SchemaDescriptor;
+
+/// Every shard `t` holds, the pending ones included, in read order.
+pub(crate) fn table_shards(t: &Table) -> Vec<Rc<MappedShard>> {
+    t.runs(Cut::Now)
+        .filter_map(|r| match r {
+            Run::Shard(s) => Some(s),
+            Run::Mem(_) => None,
+        })
+        .collect()
+}
 
 /// A table under `dir` at a RAM tier of `ram_tier_bytes`, its shards unbounded.
 pub(crate) fn new_table(

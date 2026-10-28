@@ -8,8 +8,8 @@ use super::*;
 use crate::relation::{relation_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use crate::storage::{read_intact, shard_files, DEFAULT_RAM_TIER_BYTES};
 use crate::test_support::{
-    flip_last_byte_in_place, make_batch_opk, make_schema_u64_i64, new_table, opk_pk, pk_payload_schema, spec, zset_of,
-    RowKey,
+    flip_last_byte_in_place, make_batch_opk, make_schema_u64_i64, new_table, opk_pk, pk_payload_schema, spec,
+    table_shards, zset_of, RowKey,
 };
 use gnitz_wire::TypeCode;
 
@@ -125,7 +125,7 @@ fn a_relayout_writes_filtered_terminal_runs() {
 
     for k in 0..2 {
         let t = open_child(rel, schema, k, 2);
-        let shards = t.all_shard_arcs();
+        let shards = table_shards(&t);
         assert!(shards.len() > 1, "child {k} cut {} run(s)", shards.len());
         assert!(
             shards.iter().all(|s| s.has_shard_filter()),

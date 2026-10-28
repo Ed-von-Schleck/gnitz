@@ -68,8 +68,9 @@ impl RunSet {
         }
     }
 
-    /// Append a consolidated run, folding the set when it gets crowded. Empty
-    /// runs are never stored.
+    /// Append a consolidated run: a [cancelling](Self::cancelling) set first
+    /// merges it into the runs before it, and the set folds once it holds
+    /// [`FOLD_THRESHOLD`] runs. Empty runs are never stored.
     pub(super) fn push(&mut self, run: Batch, schema: &SchemaDescriptor) {
         self.push_run(Rc::new(run.trimmed()), schema);
     }
