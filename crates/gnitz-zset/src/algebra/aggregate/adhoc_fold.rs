@@ -12,7 +12,7 @@
 //! a grouped fold emits one partial per present group, a global fold its one
 //! row even over no input, and neither needs a COUNT(*) emission gate.
 
-use gnitz_wire::AggReadSpec;
+use gnitz_wire::GroupAggs;
 
 use super::agg::{AggValues, RangeGroups};
 use super::shape::ReduceShape;
@@ -38,7 +38,7 @@ pub(crate) struct AdhocFold {
 impl AdhocFold {
     /// The fold of `agg` over `src_schema`, refused for a spec the schema cannot
     /// serve.
-    pub(crate) fn new(src_schema: &SchemaDescriptor, agg: &AggReadSpec, group_cap: usize) -> Result<Self, String> {
+    pub(crate) fn new(src_schema: &SchemaDescriptor, agg: &GroupAggs, group_cap: usize) -> Result<Self, String> {
         let (shape, leading) =
             ReduceShape::new(src_schema, &agg.group_cols, &agg.aggs).map_err(|e| format!("fold: {e}"))?;
         let mut groups = Batch::empty_with_schema(&leading);

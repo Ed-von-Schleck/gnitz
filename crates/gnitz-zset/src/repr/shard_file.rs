@@ -5,14 +5,17 @@ use std::borrow::Cow;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
-use super::batch::{Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use super::batch::Batch;
 use super::codebook::Codebook;
 use super::encoding::*;
 use super::layout::*;
 use super::shard_filter;
 use crate::repr::error::StorageError;
 use crate::schema::SchemaColumn;
-use gnitz_wire::{read_u64_le, write_u64_le, FixedInt, Heap, RowSource};
+use gnitz_wire::{
+    read_u64_le, write_u64_le, FixedInt, Heap, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK,
+    REG_WEIGHT,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Whether every `width`-byte element of `region` is the same. Every element
@@ -278,7 +281,7 @@ impl Batch {
         static PAD: [u8; ALIGNMENT] = [0; ALIGNMENT];
         let file = OpenOptions::new().write(true).create_new(true).mode(0o644).open(path)?;
         let mut header = vec![0u8; desc_len(npc)];
-        let mut body = gnitz_wire::RowHasher::default();
+        let mut body = gnitz_wire::ChecksumStream::default();
         let mut end = header.len();
         for (i, (encoding, image)) in images.iter().enumerate() {
             for bytes in [&PAD[..aligned(end) - end], &image[..]] {

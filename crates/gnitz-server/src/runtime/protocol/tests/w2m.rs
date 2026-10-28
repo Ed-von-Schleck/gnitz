@@ -1,7 +1,7 @@
 use super::fixtures::{make_ring, ring_capacity, test_rings};
 use super::*;
 use crate::runtime::test_support::within;
-use gnitz_wire::control::CTRL_HEADER_SIZE;
+use gnitz_wire::CTRL_HEADER_SIZE;
 use proptest::prelude::*;
 use std::collections::VecDeque;
 

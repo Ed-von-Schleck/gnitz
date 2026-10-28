@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::u64_i64_cols;
-use gnitz_wire::sys_rows::{FkAction, FkRef};
+use gnitz_wire::{FkAction, FkRef};
 
 // ── test_write_lock_set ─────────────────────────────────────────────────
 

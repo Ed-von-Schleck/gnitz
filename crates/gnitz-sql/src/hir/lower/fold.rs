@@ -12,7 +12,7 @@ use crate::ir::{BExpr, BoundExpr};
 use crate::project::{compute_map, payload_program};
 use gnitz_core::Schema;
 use gnitz_wire::ColumnDef;
-use gnitz_wire::{AggReadSpec, ComputeMap};
+use gnitz_wire::{ComputeMap, GroupAggs};
 use std::sync::Arc;
 
 /// Everything an ad-hoc grouped read needs, in layout terms: what the workers
@@ -25,7 +25,7 @@ pub(crate) struct FoldPieces {
     pub(crate) reduce_schema: Arc<Schema>,
     /// What the workers fold. It carries no cardinality COUNT: nothing stateless
     /// gates on one.
-    pub(crate) agg: AggReadSpec,
+    pub(crate) agg: GroupAggs,
     /// The workers' partial reply, laid out as a view's reduce output over the
     /// same group set; every `BoundExpr` below is written against it.
     pub(crate) partial_schema: Arc<Schema>,
@@ -92,7 +92,7 @@ pub(super) fn fold(
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
     Ok(FoldPieces {
         reduce_schema: reduce_in.schema,
-        agg: AggReadSpec { group_cols: group, aggs: specs },
+        agg: GroupAggs { group_cols: group, aggs: specs },
         partial_schema: partial.schema,
         pre: map,
         having,

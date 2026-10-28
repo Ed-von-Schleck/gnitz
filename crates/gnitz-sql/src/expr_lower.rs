@@ -16,7 +16,6 @@ use gnitz_expr::{
     CalendarOp, CmpOp, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LogicalInstr as L,
     LogicalProgram, Reg, ScalarEval, Sink,
 };
-use gnitz_wire::decimal::pow10;
 use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
 
 /// Lowers a `BoundExpr` to `LogicalInstr`s, each node into the register
@@ -792,6 +791,12 @@ pub(crate) fn compile_wire_conjuncts<'a>(
 /// A scalar (non-predicate) expression as a resolved evaluator.
 pub(crate) fn compile_scalar_evaluator(expr: &BoundExpr, schema: &Schema) -> Result<ScalarEval, GnitzSqlError> {
     Ok(compile_bound_expr_to_program(expr, schema.columns())?.resolve_scalar(schema.layout())?)
+}
+
+/// `10^scale`, for `scale <= MAX_DECIMAL_SCALE`.
+const fn pow10(scale: u8) -> i64 {
+    debug_assert!(scale <= gnitz_wire::MAX_DECIMAL_SCALE);
+    10i64.pow(scale as u32)
 }
 
 #[cfg(test)]

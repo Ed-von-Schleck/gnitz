@@ -26,9 +26,8 @@ use crate::test_support::{
 use gnitz_fuzz::input::Input;
 use gnitz_fuzz::seed::{Frame, Seed, Seeds, SEEDS_ENV};
 use gnitz_store::relation::RelationKind;
-use gnitz_wire::control::{append_frame, ControlHeader};
-use gnitz_wire::txn_frame::{decode_scan_multi, encode_items, FrameItem};
-use gnitz_wire::{PkKeys, Probe, ReadSpec};
+use gnitz_wire::txn_frame::{decode_scan_multi, encode_items, FrameItem, ScanItem};
+use gnitz_wire::{append_frame, ControlHeader, PkKeys, Probe, ReadSpec};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::encode_schema_block;
 
@@ -89,7 +88,7 @@ impl Session {
 
     /// Run the request `frame`; a refusal is an answer, and changes nothing.
     fn request(&mut self, frame: &[u8]) {
-        let Ok(ctrl) = gnitz_wire::control::peek_control_block(frame) else {
+        let Ok(ctrl) = gnitz_wire::peek_control_block(frame) else {
             return;
         };
         let Ok(verb) = ctrl.client_verb() else { return };
@@ -123,10 +122,10 @@ impl Session {
                     self.ingest(txn.families);
                 }
             }
-            ClientVerb::ScanSpec => self.scan(ctrl.hdr.target(), &frame[ctrl.blob.clone()], ctrl.hdr.arg0),
+            ClientVerb::ScanSpec => self.scan(ScanItem::of(frame, &ctrl)),
             ClientVerb::ScanMulti => {
                 for s in decode_scan_multi(body).unwrap_or_default() {
-                    self.scan(s.target, s.spec, s.reply_layout);
+                    self.scan(s);
                 }
             }
             ClientVerb::AllocIds => drop(self.cat.allocate_ids(ctrl.hdr.arg0)),
@@ -216,11 +215,11 @@ impl Session {
             .is_ok_and(|held| held.is_empty())
     }
 
-    /// Read `target` under the spec `spec`, as a worker answers a scan.
-    fn scan(&mut self, target: Target, spec: &[u8], reply_layout: u64) {
-        let readable = target_kind(&self.cat, target, Access::Read).is_ok();
-        if let (true, Ok(spec)) = (readable, ReadSpec::decode(spec)) {
-            let _ = self.cat.scan_spec(target.tid, spec, reply_layout);
+    /// Answer the scan `s` as a worker does.
+    fn scan(&mut self, s: ScanItem<'_>) {
+        let readable = target_kind(&self.cat, s.target, Access::Read).is_ok();
+        if let (true, Ok(spec)) = (readable, ReadSpec::decode(s.spec)) {
+            let _ = self.cat.scan_spec(s.target.tid, spec, s.reply_layout);
         }
     }
 
@@ -243,7 +242,7 @@ fn builtin() -> Seed {
     // The first ids a fresh catalog allocates.
     let base = gnitz_wire::FIRST_USER_TABLE_ID;
     let (a, b, view) = (base, base + 1, base + 2);
-    let table = |tid: u64, name: &str, cols: &[gnitz_wire::sys_rows::CatalogColumn]| {
+    let table = |tid: u64, name: &str, cols: &[gnitz_wire::CatalogColumn]| {
         ddl_frame([
             (SysFamily::Column, col_tab_batch(tid, cols, 1)),
             (SysFamily::Table, table_tab_batch(&[(tid, name, 1)])),

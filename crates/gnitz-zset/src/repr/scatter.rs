@@ -12,9 +12,7 @@
 
 use std::ops::Range;
 
-use super::batch::{
-    range_rows, write_to_batch, Batch, ColPtr, MemBatch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START,
-};
+use super::batch::{range_rows, write_to_batch, Batch, ColPtr, MemBatch};
 use super::batch_pool::PooledBuf;
 use super::codebook::Codebook;
 use super::merge::ColumnarSource;
@@ -23,7 +21,7 @@ use super::string_heap::{
 };
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::Heap;
+use gnitz_wire::{Heap, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START};
 
 /// Instantiate `$f` at the const width matching `$w`, which is also passed on.
 /// The literal width keeps the per-row copy a load/store instead of a `memcpy`

@@ -71,8 +71,8 @@ proptest! {
 #[test]
 fn a_client_bundle_decodes_to_the_rows_it_wrote() {
     use gnitz_core::{BatchAppender, ZSetBatch};
-    use gnitz_wire::sys_rows::*;
     use gnitz_wire::txn_frame::decode_items;
+    use gnitz_wire::{CircuitRow, ColTabRow, IdxTabRow, SchemaTabRow, SeqTabRow, SysRow, TableTabRow, ViewTabRow};
 
     fn block<R: SysRow>(rows: &[(R, i64)]) -> (u64, ZSetBatch) {
         let mut b = ZSetBatch::new(gnitz_core::sys_schema(R::FAMILY));
@@ -172,7 +172,7 @@ fn a_client_bundle_decodes_to_the_rows_it_wrote() {
         block(&circuits),
     ];
     let payload = gnitz_core::encode_ddl_txn(&bundle);
-    let ctrl = gnitz_wire::control::peek_control_block(&payload).expect("control header");
+    let ctrl = gnitz_wire::peek_control_block(&payload).expect("control header");
     let items = decode_items(&payload[ctrl.body], gnitz_wire::ClientVerb::DdlTxn).expect("decode_items");
     let ids: Vec<u64> = items.iter().map(|(_, item)| item.hdr.target_id).collect();
     assert_eq!(ids, bundle.iter().map(|(id, _)| *id).collect::<Vec<_>>());

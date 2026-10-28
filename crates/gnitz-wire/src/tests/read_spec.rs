@@ -1,8 +1,7 @@
-use super::*;
-use crate::PkColList;
-use crate::TypeCode;
-use crate::{AggFunc, MAX_COLUMNS};
 use std::num::NonZeroU64;
+
+use super::*;
+use crate::{AggDescriptor, AggFunc, PkColList, TypeCode, MAX_COLUMNS};
 
 fn sample_order() -> Vec<OrderKey> {
     vec![
@@ -51,7 +50,7 @@ fn roundtrips_every_bound_against_every_sink() {
         SinkKind::Rows { cut: cut(100, vec![]) },
         SinkKind::Rows { cut: cut(100, sample_order()) },
         // Every aggregate the enum names, at a distinct source column.
-        SinkKind::Fold(AggReadSpec {
+        SinkKind::Fold(GroupAggs {
             group_cols: vec![0, 3],
             aggs: AggFunc::ALL
                 .iter()
@@ -60,9 +59,9 @@ fn roundtrips_every_bound_against_every_sink() {
                 .collect(),
         }),
         // DISTINCT: group cols, no aggs.
-        SinkKind::Fold(AggReadSpec { group_cols: vec![1, 2, 5], aggs: vec![] }),
+        SinkKind::Fold(GroupAggs { group_cols: vec![1, 2, 5], aggs: vec![] }),
         // A global aggregate: no group cols.
-        SinkKind::Fold(AggReadSpec {
+        SinkKind::Fold(GroupAggs {
             group_cols: vec![],
             aggs: vec![AggDescriptor { agg_op: AggFunc::Min, col_idx: 4 }],
         }),
@@ -118,7 +117,7 @@ fn the_encoded_bytes_are_pinned() {
                 program: vec![7],
                 out_cols: vec![(TypeCode::I64, true)],
             }),
-            kind: SinkKind::Fold(AggReadSpec {
+            kind: SinkKind::Fold(GroupAggs {
                 group_cols: vec![2],
                 aggs: vec![AggDescriptor { agg_op: AggFunc::Min, col_idx: 4 }],
             }),
@@ -138,46 +137,6 @@ fn the_encoded_bytes_are_pinned() {
     assert_eq!(fold.encode(), want);
 }
 
-/// `from_keys` is the one sort: at every stride duplicates collapse and the
-/// list comes out ascending whatever order it went in, which `from_sorted` takes
-/// as given. At every narrow stride, sorting images builds the same list, both
-/// arms of the integer width included. Keys over a two-letter alphabet tie and
-/// share prefixes, so every byte of a wide key decides somewhere.
-#[test]
-fn pk_keys_from_images_is_the_byte_sort() {
-    assert_eq!(PkKeys::from_sorted(2, vec![]).bounds(), None);
-    let mut x = 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C834u128;
-    let mut next = || {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        x
-    };
-    for stride in 1..=MAX_PK_BYTES {
-        let mut raw: Vec<Vec<u8>> = (0..64)
-            .map(|_| (0..stride).map(|_| next() as u8 & 1).collect())
-            .collect();
-        raw.push(raw[3].clone());
-        let mut want = raw.clone();
-        want.sort_unstable();
-        want.dedup();
-        let k = PkKeys::from_keys(stride, raw.iter().map(|k| &k[..]));
-        assert_eq!(k.as_bytes(), want.concat(), "stride {stride}");
-        assert_eq!(k.len(), want.len(), "stride {stride}");
-        let (first, last) = (&want[0][..], &want[want.len() - 1][..]);
-        assert_eq!(k.bounds(), Some((first, last)), "stride {stride}");
-        assert_eq!(PkKeys::from_sorted(stride, want.concat()), k, "stride {stride}");
-        let mut ones = k.clone();
-        ones.retain(|key| key[stride - 1] == 1);
-        let want_ones = want.iter().filter(|key| key[stride - 1] == 1).map(|key| &key[..]);
-        assert_eq!(ones, PkKeys::from_keys(stride, want_ones), "stride {stride}");
-        if stride <= NARROW_PK_MAX_BYTES {
-            let images = raw.iter().map(|k| crate::widen_pk_be(k));
-            assert_eq!(PkKeys::from_images(stride, images), k, "stride {stride}");
-        }
-    }
-}
-
 /// A bound encoded alone decodes to itself; trailing bytes are refused.
 #[test]
 fn a_read_bound_round_trips_alone() {
@@ -187,12 +146,6 @@ fn a_read_bound_round_trips_alone() {
         assert!(ReadBound::decode(&[blob, vec![0]].concat()).is_err());
     }
     assert!(ReadBound::decode(&[]).is_err());
-}
-
-#[test]
-#[should_panic(expected = "strictly ascending")]
-fn pk_keys_from_sorted_refuses_a_repeat() {
-    PkKeys::from_sorted(2, vec![0, 1, 0, 1]);
 }
 
 /// A list longer than any 16-bit count round-trips whole: the frame is the only
@@ -207,7 +160,7 @@ fn a_long_pk_set_round_trips_whole() {
 
 /// A hand-built `PkSet` bound: stride, count, then `keys` verbatim.
 fn pk_set_blob(stride: u8, count: u32, keys: &[u8]) -> Vec<u8> {
-    let mut bytes = vec![BOUND_PK_SET, stride];
+    let mut bytes = vec![BoundTag::PkSet.as_wire(), stride];
     bytes.extend_from_slice(&count.to_le_bytes());
     bytes.extend_from_slice(keys);
     bytes
@@ -228,7 +181,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
     let fold = |aggs: Vec<AggDescriptor>| ReadSpec {
         sink: ReadSink {
             map: None,
-            kind: SinkKind::Fold(AggReadSpec { group_cols: vec![], aggs }),
+            kind: SinkKind::Fold(GroupAggs { group_cols: vec![], aggs }),
         },
         ..empty_spec()
     };
@@ -248,8 +201,16 @@ fn each_decode_guard_rejects_its_own_forgery() {
     trailing.push(0);
 
     let cases: &[(&str, Vec<u8>, &str)] = &[
-        ("bound kind", poke(0, 9), "bound kind"),
-        ("sink tag", poke(6, 9), "sink tag"),
+        (
+            "bound tag",
+            poke(0, crate::outside(BoundTag::from_wire)),
+            "unknown BoundTag",
+        ),
+        (
+            "sink tag",
+            poke(6, crate::outside(SinkTag::from_wire)),
+            "unknown SinkTag",
+        ),
         ("map presence", poke(5, 2), "boolean byte 2"),
         ("zero stride", pk_set_blob(0, 0, &[]), "PkSet stride"),
         (
@@ -283,7 +244,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
                 program: vec![4, 1],
                 out_cols: vec![(TypeCode::I64, true)],
             }),
-            kind: SinkKind::Fold(AggReadSpec { group_cols: vec![0], aggs: vec![min] }),
+            kind: SinkKind::Fold(GroupAggs { group_cols: vec![0], aggs: vec![min] }),
         },
     }
     .encode();

@@ -1,7 +1,6 @@
 use super::*;
 use crate::test_support::u64_i64_cols;
-use gnitz_wire::sys_rows::ColTabRow;
-use gnitz_wire::ColumnDef;
+use gnitz_wire::{ColTabRow, ColumnDef};
 use std::collections::HashMap;
 
 // ── test_bootstrap ───────────────────────────────────────────────────
@@ -59,10 +58,11 @@ fn assert_self_description(engine: &CatalogEngine) {
     while c.valid {
         if c.current_weight > 0 {
             let (src, row) = c.current_row_source();
-            // COL_TAB PK = `(owner_id, col_idx)`.
-            let (owner, col_idx) = gnitz_wire::unpack_pair_pk(gnitz_wire::widen_pk_be(c.current_pk_bytes()));
-            let entry = (col_idx, ColTabRow::read(src, row).unwrap().name.into_owned());
-            described.entry(owner).or_default().push(entry);
+            let r = ColTabRow::read(src, row).unwrap();
+            described
+                .entry(r.owner_id)
+                .or_default()
+                .push((r.col_idx, r.name.into_owned()));
         }
         c.advance();
     }

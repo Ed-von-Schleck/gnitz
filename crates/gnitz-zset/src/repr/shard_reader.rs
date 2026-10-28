@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use super::batch::ColPtr;
-use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use super::batch::{write_to_batch, Batch};
 use super::batch_pool::PooledBuf;
 use super::encoding::*;
 use super::layout::*;
@@ -21,10 +21,9 @@ use super::shard_filter;
 use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
 use crate::repr::error::StorageError;
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::read_u64_le;
-use gnitz_wire::Heap;
-use gnitz_wire::PkBuf;
-use gnitz_wire::RowSource;
+use gnitz_wire::{
+    read_u64_le, Heap, PkBuf, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
+};
 use xorf::{BinaryFuse8Ref, Filter};
 
 use StorageError::Corrupt;

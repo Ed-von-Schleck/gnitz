@@ -7,18 +7,9 @@
 //! The dead-byte bound is the writer's claim, which an untrusting reader
 //! recomputes.
 
-use crate::{read_u32_le, write_u32_le, Reader, SYS_SCHEMA_DIGEST};
+use crate::{read_u32_le, write_u32_le, Reader, FIXED_REGION_BYTES, WIRE_VERSION};
 
 pub const WAL_HEADER_SIZE: usize = 20;
-
-/// Bumped by hand for a block-layout change or a change to any payload the client and
-/// the engine both decode.
-pub(crate) const WAL_EPOCH: u32 = 35;
-
-/// WAL/SAL block format version, and the client↔server HELLO version — the
-/// only thing that rejects a stale SAL frame or an old client's catalog write.
-/// [`SYS_SCHEMA_DIGEST`] folds in so a system-family shape change moves it too.
-pub const WAL_FORMAT_VERSION: u32 = WAL_EPOCH ^ ((SYS_SCHEMA_DIGEST ^ (SYS_SCHEMA_DIGEST >> 32)) as u32);
 
 /// Total block size: header, fixed regions and heap.
 const WAL_OFF_SIZE: usize = 0;
@@ -42,7 +33,7 @@ pub fn write_head(dst: &mut [u8], rows: usize, fixed_len: usize, heap_len: usize
     debug_assert!(heap_dead <= heap_len, "a heap holds at most its own length dead");
     let total = WAL_HEADER_SIZE + fixed_len + heap_len;
     write_u32_le(dst, WAL_OFF_SIZE, total as u32);
-    write_u32_le(dst, WAL_OFF_VERSION, WAL_FORMAT_VERSION);
+    write_u32_le(dst, WAL_OFF_VERSION, WIRE_VERSION);
     write_u32_le(dst, WAL_OFF_ROWS, rows as u32);
     write_u32_le(dst, WAL_OFF_HEAP_LEN, heap_len as u32);
     write_u32_le(dst, WAL_OFF_HEAP_DEAD, heap_dead as u32);
@@ -53,8 +44,8 @@ pub fn write_head(dst: &mut [u8], rows: usize, fixed_len: usize, heap_len: usize
 /// region.
 fn region_rows(regions: &[&[u8]]) -> usize {
     let w = regions[crate::REG_WEIGHT].len();
-    debug_assert_eq!(w % 8, 0, "a weight region holds whole i64s");
-    w / 8
+    debug_assert_eq!(w % FIXED_REGION_BYTES, 0, "a weight region holds whole i64s");
+    w / FIXED_REGION_BYTES
 }
 
 /// The header of the block framing the canonical region list `regions`, and
@@ -103,21 +94,27 @@ pub(crate) fn block_slice(tail: &[u8]) -> Result<&[u8], &'static str> {
     Ok(&tail[..size])
 }
 
-/// A parsed block: its row count, its fixed-region bytes, its heap, and the
-/// writer's bound on that heap's unreferenced bytes.
-pub type ParsedBlock<'a> = (usize, &'a [u8], &'a [u8], usize);
+/// A parsed block.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ParsedBlock<'a> {
+    pub rows: usize,
+    /// The fixed regions, packed end to end.
+    pub fixed: &'a [u8],
+    pub heap: &'a [u8],
+    /// The writer's bound on the heap's unreferenced bytes.
+    pub heap_dead: usize,
+}
 
 /// Validate a block whose rows are `row_width` bytes of fixed regions each,
-/// and return its row count, its fixed-region bytes, its heap and its
-/// dead-byte bound. A block holds at least one row: an empty delta ships no
-/// block.
+/// and split it into its parts. A block holds at least one row: an empty delta
+/// ships no block.
 pub fn parse_block(block: &[u8], row_width: usize) -> Result<ParsedBlock<'_>, &'static str> {
     let block = block_slice(block)?;
     let mut r = Reader::new(block);
     // The header's words in layout order; `block_slice` has seen it whole.
     let [_, version, rows, heap_len, heap_dead] = [(); 5].map(|()| r.u32().expect("a whole header") as usize);
     debug_assert_eq!(r.pos(), WAL_HEADER_SIZE);
-    if version as u32 != WAL_FORMAT_VERSION {
+    if version as u32 != WIRE_VERSION {
         return Err("unknown block version");
     }
     let size = block.len();
@@ -131,12 +128,12 @@ pub fn parse_block(block: &[u8], row_width: usize) -> Result<ParsedBlock<'_>, &'
     if heap_dead > heap_len {
         return Err("block declares more dead heap than heap");
     }
-    Ok((
+    Ok(ParsedBlock {
         rows,
-        &block[WAL_HEADER_SIZE..fixed_end],
-        &block[fixed_end..size],
+        fixed: &block[WAL_HEADER_SIZE..fixed_end],
+        heap: &block[fixed_end..size],
         heap_dead,
-    ))
+    })
 }
 
 #[cfg(test)]

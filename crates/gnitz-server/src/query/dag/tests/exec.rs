@@ -72,7 +72,7 @@ pub(super) fn register_count(engine: &mut CatalogEngine, source: u64, name: &str
     let plan = ReducePlan::from_wire(&make_schema_u64_i64(), &[], &aggs, true).unwrap();
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(source, ReadBound::None);
-    circuit.reduce_multi(scan, &[], &aggs);
+    circuit.reduce(scan, &[], &aggs);
     let view = try_register_view(engine, circuit, name, &cols_of(plan.output_schema()), 0, 0).unwrap();
     (view, plan)
 }

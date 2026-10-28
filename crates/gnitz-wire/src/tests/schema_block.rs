@@ -45,7 +45,7 @@ fn column_meta_and_the_widest_pk_survive_the_record() {
             // Scale 0 is every non-DECIMAL column, and `MAX_DECIMAL_SCALE` the
             // widest a DECIMAL admits — so neither edge may bleed into a
             // neighbour.
-            for scale in [0u8, 7, crate::decimal::MAX_DECIMAL_SCALE] {
+            for scale in [0u8, 7, crate::MAX_DECIMAL_SCALE] {
                 cols.push(SchemaBlockCol {
                     ty: ColType::decimal(scale),
                     nullable,

@@ -204,3 +204,19 @@ fn a_coded_value_carries_its_code_count() {
         assert_eq!((value.stored(), value.end()), (&codes[..], framed.len()));
     }
 }
+
+#[test]
+fn plain_extent_truth_table() {
+    // In-bounds window resolves to the exact range.
+    assert_eq!(plain_extent(8, 2, 3), Some(2..5));
+    // Exact fit is in bounds; a zero-length extent at the end is too.
+    assert_eq!(plain_extent(8, 0, 8), Some(0..8));
+    assert_eq!(plain_extent(8, 8, 0), Some(8..8));
+    // offset + length past the end, and offset itself past the end.
+    assert_eq!(plain_extent(8, 6, 10), None);
+    assert_eq!(plain_extent(8, 99, 1), None);
+    // A corrupt length or offset near the top of the range does not wrap back
+    // in: the sum is checked, in u64.
+    assert_eq!(plain_extent(8, 4, usize::MAX), None);
+    assert_eq!(plain_extent(8, u64::MAX - 5, 20), None);
+}

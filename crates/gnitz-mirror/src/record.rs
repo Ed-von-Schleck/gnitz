@@ -33,7 +33,7 @@ impl MirrorRecord {
             .bool(self.pk_repeats)
             .u32(self.indexes.len() as u32);
         for cols in &self.indexes {
-            w.u64(cols.pack());
+            w.put(cols);
         }
         w.into_vec()
     }
@@ -51,7 +51,7 @@ impl MirrorRecord {
             let block = r.bytes32()?.to_vec();
             let pk_repeats = r.bool()?;
             let indexes = (0..r.u32()?)
-                .map(|_| PkColList::unpack(r.u64()?).map_err(|rule| format!("index columns: {rule:?}")))
+                .map(|_| r.get::<PkColList>())
                 .collect::<Result<Vec<_>, String>>()?;
             // Canonical, so a record holds no index twice.
             if !indexes.windows(2).all(|w| w[0].pack() < w[1].pack()) {

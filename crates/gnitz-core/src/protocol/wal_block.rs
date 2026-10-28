@@ -2,7 +2,7 @@
 
 use super::types::{check_not_null, Schema, ZSetBatch};
 use crate::ProtocolError;
-use gnitz_wire::{as_le_bytes, Regions, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use gnitz_wire::{as_le_bytes, Regions, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 impl ZSetBatch {
     /// This batch as its canonical region list.
@@ -23,7 +23,7 @@ impl ZSetBatch {
 /// `sink` is not usable.
 pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
     let layout = schema.layout();
-    let (rows, fixed, heap, _) = gnitz_wire::wal::parse_block(data, layout.row_width())
+    let gnitz_wire::wal::ParsedBlock { rows, fixed, heap, .. } = gnitz_wire::wal::parse_block(data, layout.row_width())
         .map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?;
     let mut regions = Regions::new();
     for r in 0..layout.num_regions() {
@@ -51,10 +51,10 @@ fn append_regions(
     foreign: bool,
 ) -> Result<(), ProtocolError> {
     debug_assert!(sink.layout_matches(schema).is_ok() && sink.check_columns().is_ok());
-    let count = regions.get(REG_WEIGHT).map_or(0, |w| w.len() / 8);
+    let count = regions.get(REG_WEIGHT).map_or(0, |w| w.len() / FIXED_REGION_BYTES);
     if regions.len() != gnitz_wire::num_regions(sink.payload.len())
         || regions[REG_PK].len() != count * sink.pks.stride()
-        || regions[REG_NULL_BMP].len() != count * 8
+        || regions[REG_NULL_BMP].len() != count * FIXED_REGION_BYTES
         || !sink
             .payload
             .iter()

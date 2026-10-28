@@ -28,9 +28,10 @@ use std::fs;
 use gnitz_store::relation::{
     relation_dir, ChildKind, IndexClaim, Relation, RelationKind, RelationSpec, SecondaryIndex, StoreConfig,
 };
-use gnitz_wire::payload_u64;
-use gnitz_wire::sys_rows::CatalogColumn;
-use gnitz_wire::{Circuit, NullKeys, PkColList, ReindexRole, TypeCode, PK_LIST_PACKED_FLAG};
+use gnitz_wire::{
+    payload_u64, CatalogColumn, Circuit, ColTabRow, NullKeys, PkColList, ReindexRole, SysRow, TypeCode,
+    PK_LIST_PACKED_FLAG,
+};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
 
@@ -266,7 +267,7 @@ fn discard(engine: CatalogEngine) {
 /// A one-row `public` TABLE_TAB `+1` under explicit packed `pk_col_idx` and
 /// `flags` words — the shapes `create_table` cannot make.
 fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: u64) -> Batch {
-    let row = gnitz_wire::sys_rows::TableTabRow {
+    let row = gnitz_wire::TableTabRow {
         table_id: tid,
         schema_id: PUBLIC_SCHEMA_ID,
         name: table_name.into(),
@@ -283,7 +284,7 @@ fn col_alter_pair(owner_id: u64, col_idx: i64, old: &CatalogColumn, mutate: impl
     let mut altered = old.clone();
     mutate(&mut altered);
     let mut bb = BatchBuilder::new(SysFamily::Column.schema());
-    old.write_col_tab_row(&mut bb, owner_id, col_idx as usize, -1);
-    altered.write_col_tab_row(&mut bb, owner_id, col_idx as usize, 1);
+    ColTabRow::of(owner_id, col_idx as u64, &old.def, old.fk).write(&mut bb, -1);
+    ColTabRow::of(owner_id, col_idx as u64, &altered.def, altered.fk).write(&mut bb, 1);
     bb.finish()
 }

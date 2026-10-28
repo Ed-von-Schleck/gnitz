@@ -1018,8 +1018,8 @@ fn a_round_of_another_view_moves_no_cursor() {
 /// answered in the order they were sent, outside the order of replies.
 #[test]
 fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
-    use gnitz_wire::control::{append_frame, ControlHeader};
     use gnitz_wire::txn_frame::{encode_delta_poll, DeltaPollItem};
+    use gnitz_wire::{append_frame, ControlHeader};
     use std::io::{Read, Write};
 
     let mut fx = Fixture::start();
@@ -1058,7 +1058,7 @@ fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
     };
     let next_is_sync = |raw: &mut std::os::unix::net::UnixStream, which: &str| {
         let reply = recv(raw);
-        let ctrl = gnitz_wire::control::peek_control_block(&reply).expect("a control header");
+        let ctrl = gnitz_wire::peek_control_block(&reply).expect("a control header");
         assert!(ctrl.fault(&reply).is_none(), "{which} is answered, not refused");
         match ctrl.hdr.flags.lane {
             gnitz_wire::WireLane::Reply => false,

@@ -15,9 +15,7 @@ use pyo3::IntoPyObjectExt;
 
 use gnitz_core::{ScanReply, Schema, ZSetBatch};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::decimal::format_decimal;
-use gnitz_wire::format_uuid;
-use gnitz_wire::{ColType, TypeCode};
+use gnitz_wire::{format_decimal, format_uuid, ColType, TypeCode};
 
 use crate::schema::PySchema;
 

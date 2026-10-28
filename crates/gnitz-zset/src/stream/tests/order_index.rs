@@ -10,8 +10,9 @@ use super::{OrderedEpoch, OrderedPlan};
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{cell, TestTrace, FLOATS, STRS};
+use gnitz_expr::ReduceOutSlot;
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::{OrderKey, ReduceOutSlot, TypeCode};
+use gnitz_wire::{OrderKey, TypeCode};
 
 /// `[U64 id (pk), I64 grp, I64 val NULL, STRING s NULL, F64 f]`.
 pub(in crate::stream) fn schema() -> SchemaDescriptor {

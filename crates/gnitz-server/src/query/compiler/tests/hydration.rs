@@ -35,7 +35,7 @@ fn a_shape_outside_the_equation_is_refused() {
         }),
         ("a reduce as the output", |c| {
             let a = scan(c, 1);
-            c.reduce_multi_local(a, &[0], &[gnitz_wire::AggDescriptor::COUNT_STAR]);
+            c.reduce_local(a, &[0], &[gnitz_wire::AggDescriptor::COUNT_STAR]);
         }),
         ("an exchange", |c| {
             let a = scan(c, 1);

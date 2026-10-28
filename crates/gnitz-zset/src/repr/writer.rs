@@ -2,10 +2,9 @@
 //! a region at a time.
 
 use super::batch::MemBatch;
-use super::batch::{FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::string_heap::{rebase_string_cells, BlobCache};
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::Heap;
+use gnitz_wire::{Heap, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 /// Writes rows `[at, at + rows)` of a pre-allocated arena, each region handed
 /// out as a slice of exactly those rows: a batch's tail, or a wire block's fixed

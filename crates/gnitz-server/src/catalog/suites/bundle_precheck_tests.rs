@@ -94,7 +94,7 @@ fn an_index_row_repeating_a_column_is_refused() {
     let (mut engine, tid, dir) = table_fixture("bundle_index_repeated_col", &u64_i64_cols());
     let index_id = engine.allocate_ids(1).unwrap();
 
-    let row = gnitz_wire::sys_rows::IdxTabRow {
+    let row = gnitz_wire::IdxTabRow {
         index_id,
         owner_id: tid,
         source_col_idx: PK_LIST_PACKED_FLAG | 2 | 1 << 4 | 1 << 11,

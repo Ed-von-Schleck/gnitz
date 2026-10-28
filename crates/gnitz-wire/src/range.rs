@@ -1,8 +1,7 @@
-// Range bounds — the wire form of an ordered range walk over a key list.
+//! Range bounds: the wire form of an ordered range walk over a key list.
 
-use crate::catalog::PK_LIST_MAX_COLS;
 use crate::codec::{Reader, Wire, Writer};
-use crate::{PkColList, PkListRole};
+use crate::{PkColList, PK_LIST_MAX_COLS};
 
 /// A range walk over the key list `cols`: the leading `eq_vals()` columns pinned to one
 /// key image ([`crate::key_image`]) each, the next bounded by the inclusive
@@ -75,7 +74,7 @@ impl KeyRange {
 
 impl Wire for KeyRange {
     fn write(&self, w: &mut Writer) {
-        w.u64(self.cols.pack()).u8(self.n_eq as u8);
+        w.put(&self.cols).u8(self.n_eq as u8);
         for v in self.eq_vals() {
             w.u128(*v);
         }
@@ -83,7 +82,7 @@ impl Wire for KeyRange {
     }
 
     fn read(r: &mut Reader) -> Result<KeyRange, String> {
-        let cols = PkColList::unpack_as(r.u64()?, PkListRole::ColumnList)?;
+        let cols: PkColList = r.get()?;
         let n_eq = r.u8()? as usize;
         if n_eq >= cols.as_slice().len() {
             return Err(format!(

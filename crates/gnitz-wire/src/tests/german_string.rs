@@ -116,22 +116,6 @@ fn region_ok_refuses_one_bad_cell() {
 }
 
 #[test]
-fn blob_extent_truth_table() {
-    // In-bounds window resolves to the exact range.
-    assert_eq!(blob_extent(8, 2, 3), Some(2..5));
-    // Exact fit is in bounds; a zero-length extent at the end is too.
-    assert_eq!(blob_extent(8, 0, 8), Some(0..8));
-    assert_eq!(blob_extent(8, 8, 0), Some(8..8));
-    // offset + length past the end, and offset itself past the end.
-    assert_eq!(blob_extent(8, 6, 10), None);
-    assert_eq!(blob_extent(8, 99, 1), None);
-    // A corrupt length or offset near the top of the range must not wrap
-    // back in — this is why the sum is checked, and checked in u64 space.
-    assert_eq!(blob_extent(8, 4, usize::MAX), None);
-    assert_eq!(blob_extent(8, u64::MAX - 5, 20), None);
-}
-
-#[test]
 fn compare_corrupt_long_cell_degrades_to_empty_without_panic() {
     // Two long-string cells with out-of-range heap offsets. Both contents
     // degrade to empty, so the comparison resolves rather than slicing OOB.

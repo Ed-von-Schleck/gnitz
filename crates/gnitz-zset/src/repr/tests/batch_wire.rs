@@ -1,4 +1,3 @@
-use super::super::batch::{REG_NULL_BMP, REG_PAYLOAD_START};
 use super::*;
 use crate::repr::{merge_consolidated, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
@@ -6,7 +5,7 @@ use crate::test_support::{
     encode_to_wire_vec, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     ragged_batch, ragged_schema, string_batch, u64_pk_schema, weighted_rows,
 };
-use gnitz_wire::TypeCode;
+use gnitz_wire::{TypeCode, REG_NULL_BMP, REG_PAYLOAD_START};
 
 /// Where region `r` of a `rows`-row block over `schema` starts.
 fn region_offset(schema: &SchemaDescriptor, rows: usize, r: usize) -> usize {

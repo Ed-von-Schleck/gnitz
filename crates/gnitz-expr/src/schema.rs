@@ -147,9 +147,9 @@ impl SchemaDescriptor {
         let payload = payload_to_ci[..num_payload].iter().map(|&ci| cols[ci as usize]);
         let mut region_off = [0u16; gnitz_wire::MAX_WIRE_REGIONS];
         let (mut string_slots, mut nullable_slots) = (0u64, 0u64);
-        let mut off = pk_stride + 16;
+        let mut off = pk_stride + 2 * gnitz_wire::FIXED_REGION_BYTES;
         region_off[gnitz_wire::REG_WEIGHT] = pk_stride as u16;
-        region_off[gnitz_wire::REG_NULL_BMP] = pk_stride as u16 + 8;
+        region_off[gnitz_wire::REG_NULL_BMP] = (pk_stride + gnitz_wire::FIXED_REGION_BYTES) as u16;
         for (pi, col) in payload.clone().enumerate() {
             region_off[gnitz_wire::REG_PAYLOAD_START + pi] = off as u16;
             off += col.size();
@@ -431,10 +431,19 @@ impl SchemaDescriptor {
         pk.chain(self.payload_columns().map(|(_, c)| c.type_code))
     }
 
-    /// The digest a read request names its reply layout by: its regions' types.
-    /// Column numbering and nullability are not part of it.
+    /// The digest a read request names its reply layout by: the PK column
+    /// count, then its regions' types. Column numbering and nullability are not
+    /// part of it.
     pub fn layout_digest(&self) -> u64 {
-        gnitz_wire::layout_digest(self.pk_cols().len(), self.region_types())
+        // One byte per region, and a schema holds at most `MAX_COLUMNS` of them.
+        let mut buf = [0u8; 1 + MAX_COLUMNS];
+        buf[0] = self.pk_cols().len() as u8;
+        let mut n = 1;
+        for tc in self.region_types() {
+            buf[n] = tc.as_wire();
+            n += 1;
+        }
+        gnitz_wire::checksum(&buf[..n])
     }
 
     /// Same PK list and per-column type codes: the same regions under the same
@@ -451,11 +460,18 @@ impl SchemaDescriptor {
     }
 
     /// The output-key kind a reduce grouped by `group` over this schema warrants.
-    pub fn reduce_out_key(&self, group: &[u32]) -> gnitz_wire::ReduceOutKey {
-        gnitz_wire::ReduceOutKey::for_group_cols(self.pk_cols(), group, |c| {
-            let col = self.columns[c as usize];
-            (col.type_code, col.nullable)
-        })
+    pub fn reduce_out_key(&self, group: &[u32]) -> ReduceOutKey {
+        let natural = group == self.pk_cols()
+            || matches!(*group, [c] if {
+                let col = self.columns[c as usize];
+                // The PK region carries no null bitmap.
+                !col.nullable && col.type_code.is_pk_eligible()
+            });
+        if natural {
+            ReduceOutKey::Natural
+        } else {
+            ReduceOutKey::SyntheticFold
+        }
     }
 
     /// One row's PK as OPK bytes, from one native value per PK column in PK-list
@@ -539,6 +555,51 @@ pub fn encode_schema_block(schema: &SchemaDescriptor) -> Vec<u8> {
         name: b"",
     });
     gnitz_wire::schema_block::encode(cols, schema.pk_cols())
+}
+
+/// How a reduce keys its output. For a `Reduce` node it is derived, never
+/// transmitted: the planner and the engine both call
+/// [`SchemaDescriptor::reduce_out_key`] over the reduce's input schema. The fold
+/// sink's reply is keyed the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReduceOutKey {
+    /// The group columns are the output PK: the source's whole PK list, or one
+    /// non-nullable PK-eligible column.
+    Natural,
+    /// A leading hidden `_group_pk` U128, a NULL-distinct key of the group
+    /// columns, which ride as payload. Every other group set, the empty
+    /// (global) one included.
+    SyntheticFold,
+}
+
+impl ReduceOutKey {
+    /// An output's layout ahead of its aggregates: the key region (or the synthetic
+    /// key), then each `row` column the key region does not spell.
+    pub fn output_layout(self, group_cols: &[u32], row: impl IntoIterator<Item = u32>) -> Vec<ReduceOutSlot> {
+        let (mut slots, spelled): (Vec<ReduceOutSlot>, &[u32]) = match self {
+            ReduceOutKey::SyntheticFold => (vec![ReduceOutSlot::SyntheticKey], &[]),
+            ReduceOutKey::Natural => (group_cols.iter().map(|&c| ReduceOutSlot::Key(c)).collect(), group_cols),
+        };
+        slots.extend(
+            row.into_iter()
+                .filter(|c| !spelled.contains(c))
+                .map(ReduceOutSlot::Carried),
+        );
+        slots
+    }
+}
+
+/// One slot of a reduce's output layout, ahead of the aggregate columns. See
+/// [`ReduceOutKey::output_layout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReduceOutSlot {
+    /// The synthetic `U128` fold key: slot 0 of the fold arm, and its whole PK.
+    SyntheticKey,
+    /// Source column `col`, in the output's PK region.
+    Key(u32),
+    /// Source column `col`, carried into the payload — a column of the output's
+    /// row the key region does not spell.
+    Carried(u32),
 }
 
 #[cfg(test)]

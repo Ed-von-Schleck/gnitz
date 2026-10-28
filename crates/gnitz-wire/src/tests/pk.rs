@@ -146,3 +146,49 @@ fn a_pk_buf_holds_max_pk_bytes_and_widens() {
 fn a_key_past_max_pk_bytes_panics() {
     PkBuf::from_bytes(&[0; crate::MAX_PK_BYTES + 1]);
 }
+
+/// `from_keys` is the one sort: at every stride duplicates collapse and the
+/// list comes out ascending whatever order it went in, which `from_sorted` takes
+/// as given. At every narrow stride, sorting images builds the same list, both
+/// arms of the integer width included. Keys over a two-letter alphabet tie and
+/// share prefixes, so every byte of a wide key decides somewhere.
+#[test]
+fn pk_keys_from_images_is_the_byte_sort() {
+    assert_eq!(PkKeys::from_sorted(2, vec![]).bounds(), None);
+    let mut x = 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C834u128;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for stride in 1..=MAX_PK_BYTES {
+        let mut raw: Vec<Vec<u8>> = (0..64)
+            .map(|_| (0..stride).map(|_| next() as u8 & 1).collect())
+            .collect();
+        raw.push(raw[3].clone());
+        let mut want = raw.clone();
+        want.sort_unstable();
+        want.dedup();
+        let k = PkKeys::from_keys(stride, raw.iter().map(|k| &k[..]));
+        assert_eq!(k.as_bytes(), want.concat(), "stride {stride}");
+        assert_eq!(k.len(), want.len(), "stride {stride}");
+        let (first, last) = (&want[0][..], &want[want.len() - 1][..]);
+        assert_eq!(k.bounds(), Some((first, last)), "stride {stride}");
+        assert_eq!(PkKeys::from_sorted(stride, want.concat()), k, "stride {stride}");
+        let mut ones = k.clone();
+        ones.retain(|key| key[stride - 1] == 1);
+        let want_ones = want.iter().filter(|key| key[stride - 1] == 1).map(|key| &key[..]);
+        assert_eq!(ones, PkKeys::from_keys(stride, want_ones), "stride {stride}");
+        if stride <= NARROW_PK_MAX_BYTES {
+            let images = raw.iter().map(|k| crate::widen_pk_be(k));
+            assert_eq!(PkKeys::from_images(stride, images), k, "stride {stride}");
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "strictly ascending")]
+fn pk_keys_from_sorted_refuses_a_repeat() {
+    PkKeys::from_sorted(2, vec![0, 1, 0, 1]);
+}

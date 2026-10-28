@@ -5,7 +5,7 @@ use crate::test_support::{
     relation_fixture, rows_spec, zset_of, RelationFixture, Rng, TID,
 };
 use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
-use gnitz_wire::{AggDescriptor, AggReadSpec, KeyRange, PkColList, ReadBound, ReadSink, SinkKind};
+use gnitz_wire::{AggDescriptor, GroupAggs, KeyRange, PkColList, ReadBound, ReadSink, SinkKind};
 use gnitz_wire::{PkKeys, TypeCode, ViewBudget};
 use gnitz_zset::repr::{BatchBuilder, SourceCursor};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
@@ -119,7 +119,7 @@ fn a_fold_counts_the_survivors_of_every_chunk() {
     let rows: Vec<_> = (0..20).map(|id| (id, 2, id as i64 % 3)).collect();
     let mut r = view(&rows);
     r.set_scan_chunk_rows(4);
-    let agg = AggReadSpec {
+    let agg = GroupAggs {
         group_cols: vec![1],
         aggs: vec![AggDescriptor::COUNT_STAR],
     };
@@ -161,7 +161,7 @@ fn a_malformed_request_is_refused() {
     let fold = ReadSpec {
         sink: ReadSink {
             map: None,
-            kind: SinkKind::Fold(AggReadSpec {
+            kind: SinkKind::Fold(GroupAggs {
                 group_cols: vec![1],
                 aggs: vec![AggDescriptor::COUNT_STAR],
             }),

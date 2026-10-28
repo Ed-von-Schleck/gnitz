@@ -6,8 +6,7 @@ use std::borrow::Cow;
 
 use super::SalMessageKind;
 use crate::runtime::wire::WireMsg;
-use gnitz_wire::control::ControlHeader;
-use gnitz_wire::{PkColList, PkListRole, Probe, WireFlags};
+use gnitz_wire::{ControlHeader, PkColList, PkListRole, Probe, WireFlags};
 
 /// A request answered with rows.
 #[derive(Clone, Debug, PartialEq, Eq)]

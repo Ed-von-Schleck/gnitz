@@ -18,8 +18,10 @@ use std::time::{Duration, Instant};
 
 use gnitz_core::{block_on, ClientError, ClientTransport, GnitzClient, RelName};
 use gnitz_test_harness::ServerHandle;
-use gnitz_wire::control::{append_frame, peek_control_block, ControlHeader, Target};
-use gnitz_wire::{ClientVerb, ReadBound, ReadSpec, WireStatus, CATALOG_ID_CEILING};
+use gnitz_wire::{
+    append_frame, peek_control_block, ClientVerb, ControlHeader, ReadBound, ReadSpec, Target, WireStatus,
+    CATALOG_ID_CEILING,
+};
 
 use crate::input::Input;
 use crate::seed::{Frame, Seed};

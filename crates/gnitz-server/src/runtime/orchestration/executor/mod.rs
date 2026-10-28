@@ -44,9 +44,8 @@ use crate::runtime::sal::{Read, SalExcl};
 use crate::runtime::tls::{Served, TlsListener};
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::{Relation, RelationKind};
-use gnitz_wire::control::{DecodedControl, Target};
 use gnitz_wire::txn_frame::ScanItem;
-use gnitz_wire::{ReadSpec, WireFault, WireStatus};
+use gnitz_wire::{DecodedControl, ReadSpec, Target, WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 
 /// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next tick emit, once, as a full SAL
@@ -744,7 +743,7 @@ async fn handle_message(
 ) {
     // ONE control-header parse for the whole request: routing, the schema-hint
     // decision and the push decode all read this same parse.
-    let ctrl = match gnitz_wire::control::peek_control_block(buf.as_slice()) {
+    let ctrl = match gnitz_wire::peek_control_block(buf.as_slice()) {
         Ok(c) => c,
         Err(e) => {
             send_fault(peer, 0, &format!("decode error: {e}").into());
@@ -765,7 +764,7 @@ async fn dispatch_request(
     subs: &mut Subscriptions,
     snapshots: &mut HeldSnapshots,
     buf: RecvBuf,
-    ctrl: gnitz_wire::control::DecodedControl,
+    ctrl: gnitz_wire::DecodedControl,
     shared: &Rc<Shared>,
 ) -> Result<(), WireFault> {
     let data = buf.as_slice();
@@ -798,14 +797,7 @@ async fn dispatch_request(
             Ok(())
         }
 
-        ClientVerb::ScanSpec => {
-            let scan = ScanItem {
-                target: ctrl.hdr.target(),
-                reply_layout: ctrl.hdr.arg0,
-                spec: &data[ctrl.blob.clone()],
-            };
-            handle_scan(shared, peer, &[scan]).await
-        }
+        ClientVerb::ScanSpec => handle_scan(shared, peer, &[ScanItem::of(data, &ctrl)]).await,
 
         // A plain read guard, not `fresh_read_lock`: a resolve answers catalog shape,
         // and a view tick moves a view's rows, never its shape — so the tick

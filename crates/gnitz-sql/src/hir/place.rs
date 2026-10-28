@@ -243,7 +243,7 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<ColType
                 left.name, left.ty, right.name, right.ty
             )),
         })?;
-    if !left.ty.decimal_domains_match(right.ty) {
+    if (left.ty.is_decimal() || right.ty.is_decimal()) && left.ty != right.ty {
         return Err(GnitzSqlError::Rejected(format!(
             "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ; a DECIMAL joins only a \
              DECIMAL of the same scale",

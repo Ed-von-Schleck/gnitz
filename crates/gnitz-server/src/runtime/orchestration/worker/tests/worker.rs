@@ -8,8 +8,9 @@ use crate::test_support::{
     make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema,
     register_identity_view, scan_all, u64_i64_cols, weighted_rows,
 };
-use gnitz_wire::control::{peek_control_block, DecodedControl};
-use gnitz_wire::{PkColList, PkKeys, Probe, ReadBound, ReadSpec, TypeCode, WireStatus};
+use gnitz_wire::{
+    peek_control_block, DecodedControl, PkColList, PkKeys, Probe, ReadBound, ReadSpec, TypeCode, WireStatus,
+};
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::schema::SchemaDescriptor;
 use std::borrow::Cow;

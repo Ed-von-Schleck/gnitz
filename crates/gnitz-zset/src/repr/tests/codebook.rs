@@ -54,7 +54,7 @@ fn a_table_out_of_trained_order_is_refused() {
     let book = Codebook::for_batch(None, &batch).unwrap();
     map_coded_shard(&path, &batch, &book);
     let mut image = std::fs::read(&path).unwrap();
-    let heap = spans_of(&image)[crate::repr::batch::REG_PAYLOAD_START + batch.schema().num_payload_cols()].off;
+    let heap = spans_of(&image)[gnitz_wire::REG_PAYLOAD_START + batch.schema().num_payload_cols()].off;
     let n = gnitz_wire::read_u64_le(&image, heap + SYMBOLS_COUNT_AT) as usize;
     let lens = &mut image[heap + SYMBOLS_AT + n * MAX_SYMBOL_LEN..][..n];
     assert!(lens[0] > 1 && lens[n - 1] == 1, "premise: multi-byte symbols lead");

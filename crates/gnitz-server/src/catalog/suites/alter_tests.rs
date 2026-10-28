@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::test_support::u64_i64_cols;
-use gnitz_wire::sys_rows::TableTabRow;
+use gnitz_wire::TableTabRow;
 use std::path::Path;
 
 /// A rename of `tid` to `new_name` as its two TABLE_TAB rows, `[-1, +1]`: the
@@ -274,7 +274,7 @@ fn a_duplicate_visible_column_name_is_named_before_dependent_views() {
     register_identity_view(&mut engine, tid, "vw", &cols);
 
     let mut bb = BatchBuilder::new(SysFamily::Column.schema());
-    nullable_def("v", TypeCode::U64).write_col_tab_row(&mut bb, tid, 2, 1);
+    ColTabRow::of(tid, 2, &nullable_def("v", TypeCode::U64).def, None).write(&mut bb, 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(err.contains("duplicate column name"), "add: {err}");
     let err = engine
@@ -361,7 +361,7 @@ fn a_column_alter_must_be_its_bundles_only_change() {
     let (mut engine, tid, dir) = table_fixture("alter_confined_to_bundle", &u64_i64_cols());
     let other = engine.create_table("public.u", &u64_i64_cols(), &[0]).unwrap();
     let append = |owner: u64, bb: &mut BatchBuilder| {
-        nullable_def("w", TypeCode::I64).write_col_tab_row(bb, owner, 2, 1);
+        ColTabRow::of(owner, 2, &nullable_def("w", TypeCode::I64).def, None).write(bb, 1);
     };
 
     // An append bundled with an index family.

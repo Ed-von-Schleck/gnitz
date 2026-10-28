@@ -134,7 +134,7 @@ impl<'a> EmitCtx<'a> {
         rekey.rekeys_onto_pk_prefix()?;
         // An equal-key probe alone walks rows keyed wider than its delta.
         let probes_are_equi = self.circuit.readers(of).all(|n| match self.circuit.op(n) {
-            OpNode::Join { kind } if self.circuit.inputs(n)[2..].contains(&of) => *kind == JoinKind::Equi,
+            OpNode::Join(kind) if self.circuit.inputs(n)[2..].contains(&of) => *kind == JoinKind::Equi,
             _ => true,
         });
         probes_are_equi.then_some((relation, entry, &**rekey))
@@ -261,7 +261,7 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
             Ok(ctx.prog.push(in_reg, schema, Op::WeightClamp { hist, kind: *kind }))
         }
 
-        gnitz_wire::OpNode::Reduce { group_cols, agg } => emit_reduce(ctx, nid, group_cols, agg),
+        gnitz_wire::OpNode::Reduce(g) => emit_reduce(ctx, nid, &g.group_cols, &g.aggs),
 
         gnitz_wire::OpNode::TopN { group_cols, order, limit, offset } => {
             let in_reg = ctx.unary_delta_in(nid);
@@ -287,7 +287,7 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
             Ok(push_ordered(ctx, nid, in_reg, "windowidx", plan))
         }
 
-        gnitz_wire::OpNode::Join { kind } => {
+        gnitz_wire::OpNode::Join(kind) => {
             let &[da, db, ia, ib] = ctx.circuit.inputs(nid) else {
                 unreachable!("a join is wired on four inputs")
             };
@@ -443,9 +443,8 @@ fn emit_partial(ctx: &mut EmitCtx, shard: NodeId, consumer: NodeId) -> Result<Op
     let in_reg = ctx.unary_delta_in(shard);
     let in_schema = ctx.prog.schema_of(in_reg);
     Ok(match ctx.circuit.op(consumer) {
-        gnitz_wire::OpNode::Reduce { agg, .. } => {
-            gnitz_zset::stream::ReducePlan::partial(&in_schema, agg)?.map(|plan| push_reduce(ctx, shard, in_reg, plan))
-        }
+        gnitz_wire::OpNode::Reduce(g) => gnitz_zset::stream::ReducePlan::partial(&in_schema, &g.aggs)?
+            .map(|plan| push_reduce(ctx, shard, in_reg, plan)),
         gnitz_wire::OpNode::TopN { order, limit, offset, .. } => {
             let plan = gnitz_zset::stream::OrderedPlan::top_n_partial(&in_schema, order, *limit, *offset)?;
             Some(push_ordered(ctx, shard, in_reg, "topnidx", plan))

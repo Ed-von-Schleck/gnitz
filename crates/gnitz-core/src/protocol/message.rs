@@ -1,7 +1,6 @@
 use super::types::{Schema, ZSetBatch};
-use gnitz_wire::control::{append_frame, ControlHeader};
 use gnitz_wire::txn_frame::{encode_items, FrameItem};
-use gnitz_wire::{ClientVerb, WireConflictMode};
+use gnitz_wire::{append_frame, ClientVerb, ControlHeader, WireConflictMode};
 use std::sync::Arc;
 
 /// One frame payload, without the 4-byte length prefix. An empty batch ships no

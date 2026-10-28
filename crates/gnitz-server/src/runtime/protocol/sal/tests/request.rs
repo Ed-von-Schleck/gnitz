@@ -4,7 +4,7 @@ use super::*;
 use crate::runtime::sal::fixtures::TestLog;
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalReader};
 use crate::test_support::{make_batch, make_schema_u64_i64};
-use gnitz_wire::control::peek_control_block;
+use gnitz_wire::peek_control_block;
 use gnitz_zset::schema::encode_schema_block;
 
 /// Every request, each field a value no other field of it holds, so a swapped

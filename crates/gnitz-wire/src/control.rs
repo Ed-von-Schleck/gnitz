@@ -1,12 +1,19 @@
 //! The frame control header: a fixed-width, little-endian header followed by the
-//! frame's blob. Both `gnitz-server` and `gnitz-core` (client) build and parse it
-//! through this one codec, so the two cannot drift.
+//! frame's blob, its optional schema record and its optional data block. Both
+//! `gnitz-server` and `gnitz-core` build and parse it through this one codec.
+//!
+//! The header carries a reply status ([`WireStatus`]; a refusal is a
+//! [`WireFault`]), the relation a request names ([`Target`]), two per-verb
+//! arguments, and the `flags` word ([`WireFlags`]): the request verb
+//! ([`ClientVerb`]), a push's conflict mode, a probe's mode, the lane a server
+//! frame answers on, and the continuation bits of a reply train. A `HasPk`
+//! request's probe mode and its two arguments decode to one [`Probe`].
 
+use std::num::NonZeroU64;
 use std::ops::Range;
 
 use crate::codec::Reader;
-use crate::flags::{FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
-use crate::{write_u32_le, write_u64_le, ClientVerb, WireFault, WireFlags, WireStatus};
+use crate::{write_u32_le, write_u64_le, PkColList, PkListRole};
 
 // Layout (all little-endian):
 //   [0,4)   STATUS     u32   `WireStatus`
@@ -24,6 +31,10 @@ const OFF_FLAGS: usize = 8;
 const OFF_TARGET_ID: usize = 16;
 const OFF_ARG0: usize = 24;
 const OFF_ARG1: usize = 32;
+
+/// FLAGS bits the codec owns: which sections follow the blob.
+const FLAG_HAS_SCHEMA: u64 = 1 << 32;
+const FLAG_HAS_DATA: u64 = 1 << 33;
 
 pub const CTRL_HEADER_SIZE: usize = 40;
 
@@ -79,7 +90,7 @@ pub struct DecodedControl {
     /// The bytes after the last declared section — blob, schema record, data
     /// block — to the end of the frame: a multi-item frame's items.
     pub body: Range<usize>,
-    /// Where the frame's schema block sits in the peeked buffer.
+    /// Where the frame's schema record sits in the peeked buffer.
     pub schema: Option<Range<usize>>,
     /// Where the frame's data block sits in the peeked buffer.
     pub data: Option<Range<usize>>,
@@ -148,14 +159,14 @@ pub fn append_frame(
     }
 }
 
-/// Write the control header, `blob` and the length-prefixed `schema_block` into
+/// Write the control header, `blob` and the length-prefixed `schema_record` into
 /// the front of `out`, returning the offset a data block follows at.
 #[inline]
 pub fn encode_frame_head(
     out: &mut [u8],
     hdr: &ControlHeader,
     blob: &[u8],
-    schema_block: Option<&[u8]>,
+    schema_record: Option<&[u8]>,
     has_data: bool,
 ) -> usize {
     let (head, tail) = out
@@ -166,7 +177,7 @@ pub fn encode_frame_head(
         "a fault frame names its cause"
     );
     let flags = hdr.flags.pack()
-        | if schema_block.is_some() { FLAG_HAS_SCHEMA } else { 0 }
+        | if schema_record.is_some() { FLAG_HAS_SCHEMA } else { 0 }
         | if has_data { FLAG_HAS_DATA } else { 0 };
     write_u32_le(head, OFF_STATUS, hdr.status.as_wire());
     write_u32_le(head, OFF_BLOB_LEN, blob.len() as u32);
@@ -176,11 +187,11 @@ pub fn encode_frame_head(
     write_u64_le(head, OFF_ARG1, hdr.arg1);
     tail[..blob.len()].copy_from_slice(blob);
     let mut pos = CTRL_HEADER_SIZE + blob.len();
-    if let Some(sb) = schema_block {
-        write_u32_le(out, pos, sb.len() as u32);
+    if let Some(record) = schema_record {
+        write_u32_le(out, pos, record.len() as u32);
         pos += 4;
-        out[pos..pos + sb.len()].copy_from_slice(sb);
-        pos += sb.len();
+        out[pos..pos + record.len()].copy_from_slice(record);
+        pos += record.len();
     }
     pos
 }
@@ -223,6 +234,312 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, String> {
         schema,
         data: data_block,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Client request verbs
+// ---------------------------------------------------------------------------
+
+wire_enum! {
+    /// The verb a client request frame names.
+    #[derive(Default)]
+    pub enum ClientVerb: u8 {
+        /// A parameterized bounded read (`ReadSpec`) of one relation, replied in
+        /// the layout whose digest is `arg0`, under the descriptor token `arg1`.
+        #[default]
+        ScanSpec = 0,
+        /// A data push under the descriptor token `arg1`, ACKed with its LSN in
+        /// `arg0`. An empty batch is still a push, ACKed at LSN 0.
+        Push = 1,
+        /// A delta read of N views: one frame naming N fed views, each with its
+        /// own cursor and client-authored reply schema. Each view's terminal
+        /// carries the cursor to read from next: the view's own last round.
+        ///
+        /// A prologue `arg0` other than `0` keeps item `i`, once answered with
+        /// a terminal, as the connection's subscription `arg0 + i` from that
+        /// terminal's cursor. The rounds reaching it afterwards are sent as
+        /// pushed trains ([`WireLane::PushedTrain`]); a fault ends it.
+        DeltaPoll = 4,
+        /// A relation's schema block and `RelDescriptorBlob`, named by the qualified
+        /// name in the blob; the reply's `arg0` is its descriptor token.
+        ///
+        /// A descriptor token names one answer to a RESOLVE. A request built
+        /// from that answer carries it, and is refused
+        /// [`WireStatus::StaleCatalog`] once a RESOLVE would answer otherwise;
+        /// `0` is a request built from no RESOLVE, which nothing compares.
+        Resolve = 5,
+        /// System-table batches committed as one SAL zone.
+        DdlTxn = 6,
+        /// User-table batches committed as one SAL zone; each family carries
+        /// its own OCC basis in `arg0` and its descriptor token in `arg1`.
+        PushTxn = 7,
+        /// N relations read at one SAL cut.
+        ScanMulti = 8,
+        /// `arg0` SERIAL ids of table `target_id`, under the descriptor token
+        /// `arg1`; the reply's `arg0` is the run's base.
+        AllocSerialRange = 9,
+        /// `arg0` catalog object ids (schema, relation or index); the reply's
+        /// `arg0` is the run's base.
+        AllocIds = 10,
+        /// Send every subscription the blob names ([`crate::txn_frame::encode_held`])
+        /// the pushes acknowledged before this request, and end the others. The
+        /// [`WireLane::SyncAnswer`] is held up to `arg0` ms while none was sent a row.
+        SyncPushed = 13,
+        /// Pin every base table and system family as one point of the log holds
+        /// them; the reply's `arg0` names the snapshot. It is the connection's,
+        /// and lives until a [`Self::SnapshotClose`] names it or the connection
+        /// ends.
+        SnapshotOpen = 14,
+        /// A page of relation `target_id` as snapshot `arg0` holds it — the rows
+        /// and the key the blob names ([`crate::snapshot::PageRequest`]) —
+        /// replied as a scan is: one train per worker, or one frame where the
+        /// master holds the relation, each in key order and full but for the
+        /// last.
+        SnapshotPage = 15,
+        /// Release snapshot `arg0`.
+        SnapshotClose = 16,
+        /// Copy the data directory, at a checkpoint, under the backup directory
+        /// the server was started with, as the entry the blob names.
+        Backup = 17,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The flags word
+// ---------------------------------------------------------------------------
+
+/// The control header's `flags` word. `pack`/`unpack` are the only code that knows
+/// the bit layout, so no two fields can overlap and no consumer re-derives one.
+///
+/// Bits 32/33 say which sections follow the blob; the frame codec sets and reads
+/// them, so `pack` leaves them clear and `unpack` ignores them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WireFlags {
+    /// Bits 0-7.
+    pub verb: ClientVerb,
+    /// Bits 8-15: a push's conflict mode.
+    pub conflict_mode: WireConflictMode,
+    /// Bit 34: more frames of this reply follow. Set on every per-worker reply
+    /// frame, absent on the master's terminal frame.
+    pub continuation: bool,
+    // Engine-authored.
+    /// Bit 35: a worker's last frame of a train.
+    pub scan_last: bool,
+    /// Bits 36-37: what a `HasPk` probe answers a matched key with.
+    pub probe_mode: WireProbeMode,
+    /// Bits 38-39.
+    pub lane: WireLane,
+}
+
+/// Bits 16-31 and 40-63: no field.
+const RESERVED_BITS: u64 = !crate::low_bits_mask(40) | (crate::low_bits_mask(32) & !crate::low_bits_mask(16));
+
+impl WireFlags {
+    /// A frame of a worker's reply train: `continuation` always, since the master's terminal
+    /// frame ends the client's reply; `scan_last` on the train's last frame.
+    pub const fn train_frame(last: bool) -> Self {
+        WireFlags {
+            verb: ClientVerb::ScanSpec,
+            conflict_mode: WireConflictMode::Update,
+            continuation: true,
+            scan_last: last,
+            probe_mode: WireProbeMode::Pk,
+            lane: WireLane::Reply,
+        }
+    }
+
+    pub(crate) const fn pack(self) -> u64 {
+        self.verb as u64
+            | (self.conflict_mode as u64) << 8
+            | (self.continuation as u64) << 34
+            | (self.scan_last as u64) << 35
+            | (self.probe_mode as u64) << 36
+            | (self.lane as u64) << 38
+    }
+
+    /// Rejects a word naming a verb or mode this build does not define, or setting a
+    /// bit outside the layout.
+    pub(crate) fn unpack(w: u64) -> Result<Self, &'static str> {
+        if w & RESERVED_BITS != 0 {
+            return Err("flags: reserved bits set");
+        }
+        let bit = |b: u32| (w >> b) & 1 != 0;
+        Ok(WireFlags {
+            verb: ClientVerb::from_wire(w as u8).ok_or("flags: unknown request verb")?,
+            conflict_mode: WireConflictMode::from_wire((w >> 8) as u8).ok_or("flags: unknown conflict mode")?,
+            continuation: bit(34),
+            scan_last: bit(35),
+            probe_mode: WireProbeMode::from_wire(((w >> 36) & 3) as u8).ok_or("flags: unknown probe mode")?,
+            lane: WireLane::from_wire(((w >> 38) & 3) as u8).ok_or("flags: unknown lane")?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The modes the flags word carries
+// ---------------------------------------------------------------------------
+
+wire_enum! {
+    /// Conflict-resolution mode a PUSH carries in [`WireFlags::conflict_mode`].
+    #[derive(Default)]
+    pub enum WireConflictMode: u8 {
+        /// Retract-and-insert on PK conflict. Used for SQL `UPDATE`,
+        /// `INSERT ... ON CONFLICT ... DO UPDATE` (after client-side
+        /// merging), and explicit Python `push(mode="update")`.
+        #[default]
+        Update = 0,
+        /// Reject the batch on any PK conflict. The master runs both an
+        /// intra-batch duplicate check and an against-store PK existence
+        /// check, and returns a PG-style `duplicate key value violates
+        /// unique constraint` error.
+        Error = 1,
+    }
+}
+
+wire_enum! {
+    /// The code a [`Probe`] rides [`WireFlags::probe_mode`] as.
+    #[derive(Default)]
+    pub enum WireProbeMode: u8 {
+        #[default]
+        Pk = 0,
+        PkColumn = 1,
+        Index = 2,
+    }
+}
+
+wire_enum! {
+    /// What a frame from the server answers ([`WireFlags::lane`]).
+    #[derive(Default)]
+    pub enum WireLane: u8 {
+        /// The connection's oldest unanswered request other than a sync — or,
+        /// while a pushed train is open, that train: only its opening frame
+        /// names [`Self::PushedTrain`].
+        #[default]
+        Reply = 0,
+        /// No request: it opens a train of the subscription `arg0`, the frames
+        /// after it to the first without `continuation`.
+        PushedTrain = 1,
+        /// The connection's oldest unanswered SYNC_PUSHED, whole in this frame.
+        SyncAnswer = 2,
+    }
+}
+
+impl std::str::FromStr for WireConflictMode {
+    type Err = String;
+
+    /// The two modes' user-facing names, for the bindings that let a caller
+    /// choose one. Owned here, so no binding invents a third spelling.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "update" => Ok(WireConflictMode::Update),
+            "error" => Ok(WireConflictMode::Error),
+            other => Err(format!("invalid conflict mode '{other}', expected 'update' or 'error'")),
+        }
+    }
+}
+
+/// One `HasPk` probe: the store it reads, and what it answers each matched key
+/// with.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Probe {
+    /// The relation's own PK store: each key a live row carries, echoed.
+    Pk,
+    /// The own PK store: each key a live row carries, with that row's column.
+    PkColumn(u32),
+    /// The secondary index on this exact column list: the stored entries
+    /// under the keys' spans, `[span ‖ holder PK]`, in key order, up to `cap`
+    /// in all.
+    Index(PkColList, NonZeroU64),
+}
+
+impl Probe {
+    /// The probe mode, `arg0` and `arg1` a `HasPk` group carries this as.
+    pub fn wire(self) -> (WireProbeMode, u64, u64) {
+        match self {
+            Probe::Pk => (WireProbeMode::Pk, 0, 0),
+            Probe::PkColumn(col) => (WireProbeMode::PkColumn, col as u64, 0),
+            Probe::Index(cols, cap) => (WireProbeMode::Index, cap.get(), cols.pack()),
+        }
+    }
+
+    /// The inverse of [`Self::wire`], refusing every other triple.
+    pub fn from_wire(mode: WireProbeMode, arg0: u64, arg1: u64) -> Result<Self, String> {
+        let refused = || format!("no probe is carried as ({mode:?}, {arg0}, {arg1:#x})");
+        match (mode, arg0, arg1) {
+            (WireProbeMode::Pk, 0, 0) => Ok(Probe::Pk),
+            (WireProbeMode::PkColumn, col, 0) => Ok(Probe::PkColumn(u32::try_from(col).map_err(|_| refused())?)),
+            (WireProbeMode::Index, cap, cols) => {
+                let cap = NonZeroU64::new(cap).ok_or_else(refused)?;
+                Ok(Probe::Index(PkColList::unpack_as(cols, PkListRole::ColumnList)?, cap))
+            }
+            _ => Err(refused()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reply status
+// ---------------------------------------------------------------------------
+
+wire_enum! {
+    /// A control header's `status` word. Under any status but `Ok`, the frame's
+    /// blob is the error text.
+    #[derive(Default)]
+    pub enum WireStatus: u32 {
+        #[default]
+        Ok = 0,
+        Error = 1,
+        /// An OCC precondition failed. Nothing was written, so it is retryable.
+        TxnConflict = 3,
+        /// A delta cursor below a worker's retention floor: re-read at `after_tick = 0`.
+        DeltaExpired = 4,
+        /// The SAL had no room for this request's group. A reclaim frees it within
+        /// a tick, so it is retryable.
+        SalFull = 5,
+        /// The named relation does not exist.
+        NotFound = 6,
+        /// The write would break a PK, unique-index or foreign-key constraint.
+        /// Nothing was written.
+        IntegrityViolation = 7,
+        /// The request carries a descriptor token its relation no longer
+        /// answers a RESOLVE with. Nothing was read or written, so the request
+        /// is retryable once it is built again from a fresh RESOLVE.
+        StaleCatalog = 8,
+    }
+}
+
+/// A refusal's class and message: what a non-`Ok` control header carries, and
+/// what a client-side check raises in the same terms. A plain message converts in
+/// as [`WireStatus::Error`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireFault {
+    pub status: WireStatus,
+    pub text: String,
+}
+
+impl<S: Into<String>> From<S> for WireFault {
+    fn from(text: S) -> Self {
+        WireFault {
+            status: WireStatus::Error,
+            text: text.into(),
+        }
+    }
+}
+
+impl WireFault {
+    /// Prefix the text with what the caller was doing; the status is kept.
+    pub fn in_context(self, what: impl std::fmt::Display) -> Self {
+        WireFault {
+            text: format!("{what}: {}", self.text),
+            status: self.status,
+        }
+    }
+}
+
+impl std::fmt::Display for WireFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
 }
 
 #[cfg(test)]

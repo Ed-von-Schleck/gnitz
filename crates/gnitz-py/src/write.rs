@@ -17,8 +17,7 @@ use pyo3::Borrowed;
 
 use gnitz_core::{PkColumn, Schema, ZSetBatch};
 use gnitz_expr::place::{place_scaled, Placed};
-use gnitz_wire::decimal::parse_decimal_text;
-use gnitz_wire::{ColType, ColumnDef, FixedInt, ReadBound, ReadSpec, TypeCode, MAX_PK_COLUMNS};
+use gnitz_wire::{parse_decimal_text, ColType, ColumnDef, FixedInt, ReadBound, ReadSpec, TypeCode, MAX_PK_COLUMNS};
 
 use crate::read::{present, PyScanResult};
 use crate::schema::PySchema;

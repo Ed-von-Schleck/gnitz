@@ -128,7 +128,7 @@ fn placement(
     }
     let moves = circuit
         .ops()
-        .any(|(_, op)| matches!(op, gnitz_wire::OpNode::Join { .. } | gnitz_wire::OpNode::ExchangeShard));
+        .any(|(_, op)| matches!(op, gnitz_wire::OpNode::Join(_) | gnitz_wire::OpNode::ExchangeShard));
     match scanned_row_locally(circuit, circuit.out()) {
         // The view's PK region is this source's, byte for byte, and its rows sit on
         // that source's owner only while nothing relays its delta: only a source
@@ -198,7 +198,7 @@ fn source_uses(circuit: &Circuit) -> Result<BTreeMap<u64, SourceUse>, String> {
             if let Some(tid) = owner[p] {
                 let use_ = uses.entry(tid).or_default();
                 match op {
-                    OpNode::Join { .. } => use_.reaches_join = true,
+                    OpNode::Join(_) => use_.reaches_join = true,
                     _ if propagates => {}
                     _ => use_.outside_join = true,
                 }

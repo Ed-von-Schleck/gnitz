@@ -4,7 +4,7 @@
 //! contract `crate::validate` states.
 
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
-use gnitz_wire::sys_rows::FkAction;
+use gnitz_wire::FkAction;
 
 /// The boolean a `WITH (key = …)` entry names; `false` where it is absent.
 pub(super) fn bool_option(key: &str, value: Option<&sqlparser::ast::Expr>) -> Result<bool, GnitzSqlError> {

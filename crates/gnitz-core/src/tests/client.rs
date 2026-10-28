@@ -292,7 +292,7 @@ fn create_table_refuses_an_fk_it_cannot_write() {
     let fk = Some(FkTarget::Table(FkRef {
         table_id: 16,
         col: 0,
-        on_delete: gnitz_wire::sys_rows::FkAction::Restrict,
+        on_delete: gnitz_wire::FkAction::Restrict,
     }));
     for fks in [vec![fk], vec![None, fk, None]] {
         let want = format!("{} foreign-key slots for 2 columns", fks.len());

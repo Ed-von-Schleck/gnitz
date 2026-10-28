@@ -1,4 +1,5 @@
-//! Column types: the typed `TypeCode` enum and the scale-carrying `ColType`.
+//! Column types: the typed `TypeCode` enum, the scale-carrying `ColType`, and the
+//! register forms a narrow column's value decodes to (`FixedInt`, `ScalarKind`).
 
 use core::cmp::Ordering;
 
@@ -65,8 +66,8 @@ impl TypeCode {
     }
 
     /// The two calendar types. Each is an integer of a fixed width under a
-    /// different name: every storage, ordering and VM path treats it as
-    /// [`Self::storage_type`].
+    /// different name: every storage, ordering and VM path treats it as its
+    /// storage integer (`storage_type`).
     #[inline(always)]
     pub const fn is_temporal(self) -> bool {
         matches!(self, TypeCode::Date | TypeCode::Timestamp)
@@ -76,7 +77,7 @@ impl TypeCode {
     /// `I32` for `Date`, `I64` for `Timestamp` and `Decimal`, `U8` for `Bool`,
     /// and the type itself otherwise.
     #[inline(always)]
-    pub const fn storage_type(self) -> TypeCode {
+    pub(crate) const fn storage_type(self) -> TypeCode {
         match self {
             TypeCode::Date => TypeCode::I32,
             TypeCode::Timestamp | TypeCode::Decimal => TypeCode::I64,
@@ -324,9 +325,9 @@ impl ColType {
     }
 
     /// Whether this is a type a column may have: a scale only on a DECIMAL, and
-    /// never past [`crate::decimal::MAX_DECIMAL_SCALE`].
+    /// never past [`crate::MAX_DECIMAL_SCALE`].
     pub const fn is_admissible(self) -> bool {
-        self.scale <= crate::decimal::MAX_DECIMAL_SCALE && (self.scale == 0 || self.is_decimal())
+        self.scale <= crate::MAX_DECIMAL_SCALE && (self.scale == 0 || self.is_decimal())
     }
 
     /// Decode a column type from its wire code and scale bytes, or `None` for an
@@ -335,16 +336,6 @@ impl ColType {
         TypeCode::from_wire(code)
             .map(|tc| ColType { tc, scale })
             .filter(|t| t.is_admissible())
-    }
-
-    /// Whether a DECIMAL may be matched with `other` across relations. Only the
-    /// identical DECIMAL: the stored integers of two scales never mean the same
-    /// number.
-    pub const fn decimal_domains_match(self, other: Self) -> bool {
-        if !self.is_decimal() && !other.is_decimal() {
-            return true;
-        }
-        self.tc.as_wire() == other.tc.as_wire() && self.scale == other.scale
     }
 
     /// [`TypeCode::register_image`] with the scale kept: a computed DECIMAL is
@@ -369,7 +360,7 @@ impl core::fmt::Display for ColType {
             // The precision is the `i64`'s own digit count, not what the column
             // was declared with: a DECIMAL's value is bounded by the integer
             // behind its scale, and `ColType` carries no declared precision.
-            TypeCode::Decimal => write!(f, "DECIMAL({}, {})", crate::decimal::MAX_DECIMAL_SCALE, self.scale),
+            TypeCode::Decimal => write!(f, "DECIMAL({}, {})", crate::MAX_DECIMAL_SCALE, self.scale),
             tc => write!(f, "{tc}"),
         }
     }
@@ -406,140 +397,6 @@ pub fn cmp_col_window(a: &[u8], b: &[u8], tc: TypeCode) -> Ordering {
         T::F64 => f64::from_le_bytes(arr(a)).total_cmp(&f64::from_le_bytes(arr(b))),
         T::String | T::Blob => unreachable!("cmp_col_window: a string window orders through its heap"),
     }
-}
-
-/// Which rule a candidate primary key broke, worded by [`PkRule::named`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PkRule {
-    /// The word carries no [`crate::PK_LIST_PACKED_FLAG`]. The one rule about the
-    /// *word*; every other presupposes a decoded list.
-    NotPacked,
-    /// No PK columns at all. Every base table has an enforced primary key.
-    Empty,
-    /// Arity past the cap the caller passed, which rides along so the message
-    /// names the bound that was actually applied.
-    TooManyColumns { count: usize, max: usize },
-    /// A PK index that names no column.
-    IndexOutOfRange { col: u32 },
-    /// The same column listed twice — it would double-count in the stride and
-    /// yield duplicates from the PK-column walk.
-    Duplicate { col: u32 },
-    /// STRING/BLOB (an unrelocatable heap offset) or a float (IEEE-754 breaks
-    /// the byte-equal key contract the OPK encoder rests on).
-    NotEligible { col: u32, type_code: TypeCode },
-    /// The PK region carries no null bitmap, so a NULL has nowhere to live.
-    Nullable { col: u32 },
-}
-
-/// Which list a [`PkRule`] is about: [`validate_pk_indices`]' four structural
-/// rules are equally a secondary index's column-list rules, so only the noun
-/// differs. Not a `&str`, which a call site could spell wrong unnoticed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PkListRole {
-    PrimaryKey,
-    ColumnList,
-}
-
-impl PkRule {
-    /// This rule's message, worded for the list it is about, with every column
-    /// rendered positionally.
-    pub fn for_role(&self, role: PkListRole) -> String {
-        self.named(role, |_| None)
-    }
-
-    /// [`Self::for_role`] with each column rendered as `'name'` where `name`
-    /// answers its index, and as the index where it does not.
-    pub fn named<'a>(&self, role: PkListRole, name: impl Fn(u32) -> Option<&'a str>) -> String {
-        let what = match role {
-            PkListRole::PrimaryKey => "primary key",
-            PkListRole::ColumnList => "column list",
-        };
-        let col = |c: u32| match name(c) {
-            Some(n) => format!("'{n}'"),
-            None => c.to_string(),
-        };
-        match *self {
-            PkRule::NotPacked => format!("{what} word carries no packed-list flag"),
-            PkRule::Empty => format!("{what} must name at least one column"),
-            PkRule::TooManyColumns { count, max } => {
-                format!("{what} column count {count} out of range 1..={max}")
-            }
-            PkRule::IndexOutOfRange { col } => format!("{what} index {col} out of bounds"),
-            PkRule::Duplicate { col: c } => format!("{what} names column {} twice", col(c)),
-            PkRule::NotEligible { col: c, type_code } => format!(
-                "{what} column {} has type_code {type_code}; only fixed-width integer, \
-                 U128, UUID, and I128 columns can be key columns \
-                 (String, Blob, and float columns cannot)",
-                col(c)
-            ),
-            PkRule::Nullable { col: c } => format!("{what} column {} must not be nullable", col(c)),
-        }
-    }
-}
-
-/// The structural half of the primary-key admission rule: non-empty, within the
-/// `max_pk` arity cap, every index naming a real column, no duplicates. Split
-/// from the column-type half so a caller holding only the PK list can run it
-/// alone; `ncols` is whatever bound that caller has — a real column count, or a
-/// field width for a list whose columns do not exist yet.
-///
-/// `max_pk` is the caller's own arity cap: [`crate::PK_LIST_MAX_COLS`] for a
-/// user-declared key, which must round-trip through the persisted PK-list word,
-/// and [`crate::MAX_PK_COLUMNS`] for an engine schema derived from one.
-pub(crate) fn validate_pk_indices(pk_cols: &[u32], ncols: usize, max_pk: usize) -> Result<(), PkRule> {
-    if pk_cols.is_empty() {
-        return Err(PkRule::Empty);
-    }
-    if pk_cols.len() > max_pk {
-        return Err(PkRule::TooManyColumns { count: pk_cols.len(), max: max_pk });
-    }
-    for (j, &c) in pk_cols.iter().enumerate() {
-        if c as usize >= ncols {
-            return Err(PkRule::IndexOutOfRange { col: c });
-        }
-        if pk_cols[..j].contains(&c) {
-            return Err(PkRule::Duplicate { col: c });
-        }
-    }
-    Ok(())
-}
-
-/// Both halves of the primary-key admission rule — the structural half, then
-/// each column's type and nullability — for the callers that hold the columns up
-/// front.
-pub fn validate_pk_tuple(
-    pk_cols: &[u32],
-    ncols: usize,
-    max_pk: usize,
-    col: impl Fn(u32) -> (TypeCode, bool),
-) -> Result<(), PkRule> {
-    debug_assert!(max_pk <= crate::MAX_PK_COLUMNS);
-    validate_pk_indices(pk_cols, ncols, max_pk)?;
-    for &c in pk_cols {
-        let (type_code, nullable) = col(c);
-        if !type_code.is_pk_eligible() {
-            return Err(PkRule::NotEligible { col: c, type_code });
-        }
-        if nullable {
-            return Err(PkRule::Nullable { col: c });
-        }
-    }
-    Ok(())
-}
-
-/// The rule an index key list `key` over a relation of `ncols` columns, `src_pk_len`
-/// of them its PK, must pass: an index key column is a PK column of the index, so
-/// the PK rule holds with nullability waived, and the index record — `key` then the
-/// source PK — keeps the PK arity limit.
-pub fn validate_index_key(
-    key: &[u32],
-    ncols: usize,
-    src_pk_len: usize,
-    type_code: impl Fn(u32) -> TypeCode,
-) -> Result<(), PkRule> {
-    validate_pk_tuple(key, ncols, crate::MAX_PK_COLUMNS - src_pk_len, |c| {
-        (type_code(c), false)
-    })
 }
 
 /// A fixed-width integer column type — ≤ 8 bytes, any sign. This is the exact
@@ -681,6 +538,48 @@ impl FixedInt {
             Self::I64 => i64::from_le_bytes(b[..8].try_into().unwrap()),
         }
     }
+}
+
+/// `$body` once per [`FixedInt`] variant, with `$c` that variant as a `const`,
+/// so a width or codec call on it is a literal inside the row loop.
+#[macro_export]
+macro_rules! for_each_fixed_int {
+    ($fi:expr, |$c:ident| $body:block) => {
+        match $fi {
+            $crate::FixedInt::U8 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::U8;
+                $body
+            }
+            $crate::FixedInt::I8 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::I8;
+                $body
+            }
+            $crate::FixedInt::U16 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::U16;
+                $body
+            }
+            $crate::FixedInt::I16 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::I16;
+                $body
+            }
+            $crate::FixedInt::U32 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::U32;
+                $body
+            }
+            $crate::FixedInt::I32 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::I32;
+                $body
+            }
+            $crate::FixedInt::U64 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::U64;
+                $body
+            }
+            $crate::FixedInt::I64 => {
+                const $c: $crate::FixedInt = $crate::FixedInt::I64;
+                $body
+            }
+        }
+    };
 }
 
 /// `v` rounded to F32; `None` when a finite `v` rounds past F32's range. The

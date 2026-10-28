@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_wire::control::Target;
+use gnitz_wire::Target;
 
 // ── test_orphaned_metadata_recovery ─────────────────────────────────
 
@@ -211,7 +211,7 @@ fn test_sequence_gap_recovery() {
 
         // Inject column record for tid=250
         let mut cbb = BatchBuilder::new(SysFamily::Column.schema());
-        col_def("id", TypeCode::U64).write_col_tab_row(&mut cbb, 250, 0, 1);
+        ColTabRow::of(250, 0, &col_def("id", TypeCode::U64).def, None).write(&mut cbb, 1);
         engine.registry.ingest(SysFamily::Column.id(), cbb.finish()).unwrap();
 
         let _ = engine.registry.checkpoint_system(engine.system_zone);
@@ -551,8 +551,8 @@ fn test_dependent_view_restricts_fire_from_registered_views() {
     let mut nullable = cols[1].clone();
     nullable.def.is_nullable = true;
     let mut bb = BatchBuilder::new(SysFamily::Column.schema());
-    cols[1].write_col_tab_row(&mut bb, tid, 1, -1);
-    nullable.write_col_tab_row(&mut bb, tid, 1, 1);
+    ColTabRow::of(tid, 1, &cols[1].def, cols[1].fk).write(&mut bb, -1);
+    ColTabRow::of(tid, 1, &nullable.def, nullable.fk).write(&mut bb, 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(err.contains("dependent views"), "DROP NOT NULL RESTRICT: {err}");
 

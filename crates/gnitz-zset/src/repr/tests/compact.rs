@@ -1,4 +1,3 @@
-use super::super::batch::REG_NULL_BMP;
 use super::super::encoding::Encoding;
 use super::super::layout::{spans_of, ShardHeader};
 use super::super::shard_file::ShardWriteOpts;
@@ -8,7 +7,7 @@ use crate::test_support::{
     arb_fold_case, assert_folds, fold_batch, make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     make_string_batch, map_coded_shard, map_shard, prose, FoldRow,
 };
-use gnitz_wire::PkBuf;
+use gnitz_wire::{PkBuf, REG_NULL_BMP};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::rc::Rc;

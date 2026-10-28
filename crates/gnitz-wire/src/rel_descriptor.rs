@@ -1,7 +1,7 @@
 //! The relation-descriptor blob a RESOLVE reply carries beside the schema block.
 
 use crate::codec::{decode_all, Writer};
-use crate::{PkColList, PkListRole, ViewBudget};
+use crate::{PkColList, ViewBudget};
 
 wire_enum! {
     /// What a relation is, as the client sees it.
@@ -82,7 +82,7 @@ impl RelDescriptorBlob {
             .bool(self.serial)
             .u16(index_count);
         for ix in &self.indexes {
-            w.u64(ix.cols.pack()).bool(ix.is_unique);
+            w.put(&ix.cols).bool(ix.is_unique);
         }
         w.into_vec()
     }
@@ -94,8 +94,7 @@ impl RelDescriptorBlob {
             let serial = r.bool()?;
             let indexes = (0..r.u16()?)
                 .map(|_| {
-                    let cols =
-                        PkColList::unpack_as(r.u64()?, PkListRole::ColumnList).map_err(|e| format!("index {e}"))?;
+                    let cols = r.get()?;
                     let is_unique = r.bool()?;
                     Ok(RelIndex { cols, is_unique })
                 })

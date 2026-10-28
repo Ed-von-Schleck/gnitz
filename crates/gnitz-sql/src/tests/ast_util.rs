@@ -108,3 +108,29 @@ fn a_numeric_literal_binds_as_its_narrowest_exact_form() {
         assert_eq!(got, want, "{src}");
     }
 }
+
+/// A numeric literal's text is the decimal it spells, exponent applied, at its
+/// smallest exact scale — digits no float print could carry included.
+#[test]
+fn a_number_text_is_the_decimal_it_spells() {
+    for (text, want) in [
+        ("1.10", Some((11, 1))),
+        ("1.0", Some((1, 0))),
+        ("0.0000000100", Some((1, 8))),
+        ("1.5e3", Some((1500, 0))),
+        ("25e-1", Some((25, 1))),
+        ("1234567890123456.78", Some((123456789012345678, 2))),
+        ("0.1234567890123456789", Some((1234567890123456789, 19))),
+        // Bounded by value and fractional digits, not by digit count.
+        (
+            "0.49999999999999999999999999999999999999",
+            Some((49999999999999999999999999999999999999, 38)),
+        ),
+        ("100000000000000000000000000000000000000", Some((10i128.pow(38), 0))),
+        ("999999999999999999999999999999999999999", None),
+        ("1e39", None),
+        ("1e-2147483648", None),
+    ] {
+        assert_eq!(decimal_of_number_text(text), want, "{text}");
+    }
+}

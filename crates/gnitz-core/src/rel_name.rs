@@ -2,9 +2,18 @@
 
 use std::hash::{Hash, Hasher};
 
+/// The schema a client's own aliases live in. No server holds it: it starts
+/// with `_`, which [`gnitz_wire::validate_user_identifier`] refuses every name a
+/// user gives.
+pub(crate) const LOCAL_SCHEMA: &str = "_local";
+
+/// The schemas a relation's name may spell that no user can create.
+const RESERVED_SCHEMAS: [&str; 2] = [LOCAL_SCHEMA, gnitz_wire::SYSTEM_SCHEMA];
+
 /// A relation's schema and its name there, each a name a user may give: the
 /// engine's internal relations have none. The schema may also be one of
-/// [`gnitz_wire::RESERVED_SCHEMAS`]. Two spellings of one catalog name are equal.
+/// the schemas no user can create, `_local` and `_system`. Two spellings of one
+/// catalog name are equal.
 #[derive(Clone, Debug)]
 pub struct RelName {
     /// `schema.name`, folded to its catalog form.
@@ -32,9 +41,7 @@ impl RelName {
     /// The catalog spelling of the schema `text` names: a reserved schema
     /// matched in any case, else the identifier folded as SQL folds it.
     pub fn schema_key(text: &str) -> Result<String, String> {
-        let reserved = gnitz_wire::RESERVED_SCHEMAS
-            .into_iter()
-            .find(|r| text.eq_ignore_ascii_case(r));
+        let reserved = RESERVED_SCHEMAS.into_iter().find(|r| text.eq_ignore_ascii_case(r));
         match reserved {
             Some(r) => Ok(r.to_string()),
             None => gnitz_wire::canonical_identifier(text),

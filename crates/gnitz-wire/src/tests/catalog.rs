@@ -8,99 +8,13 @@ use super::*;
 fn system_table_keys_are_valid_for_their_columns() {
     for f in SYS_FAMILIES {
         let (name, cols, pk) = (f.name, f.cols, f.pk_cols);
-        assert!(cols.len() <= MAX_COLUMNS, "{name}: too many columns");
-        crate::validate_pk_tuple(pk, cols.len(), PK_LIST_MAX_COLS, |c| {
+        assert!(cols.len() <= crate::MAX_COLUMNS, "{name}: too many columns");
+        crate::validate_pk_tuple(pk, cols.len(), crate::PK_LIST_MAX_COLS, |c| {
             let col = &cols[c as usize];
             (col.type_code, false)
         })
         .unwrap_or_else(|rule| panic!("{name}: {}", rule.for_role(crate::PkListRole::PrimaryKey)));
     }
-}
-
-/// The in-memory constructor and the persisted codec are the same list at every
-/// arity. The word is persisted, so its layout is pinned as a literal.
-#[test]
-fn a_pk_col_list_roundtrips_through_its_packed_word() {
-    for cols in [
-        &[0u32][..],
-        &[3],
-        &[1, MAX_COLUMNS as u32 - 1],
-        &[2, 5, 7],
-        &[9, 1, 4, 6],
-    ] {
-        let list = PkColList::from_slice(cols);
-        assert_eq!(list.as_slice(), cols);
-        assert_eq!(PkColList::unpack(list.pack()), Ok(list), "{cols:?}");
-    }
-    assert_eq!(PkColList::from_slice(&[3, 9]).pack(), 1 << 63 | 9 << 11 | 3 << 4 | 2);
-}
-
-/// Every probe round-trips through its wire words, and a triple no probe
-/// encodes to is refused.
-#[test]
-fn a_probe_roundtrips_through_its_wire_words() {
-    let cols = PkColList::from_slice(&[2, 5]);
-    let cap = |n| std::num::NonZeroU64::new(n).unwrap();
-    let probes = [
-        Probe::Pk,
-        Probe::PkColumn(4),
-        Probe::Index(cols, cap(1)),
-        Probe::Index(cols, cap(9)),
-        Probe::Index(cols, std::num::NonZeroU64::MAX),
-    ];
-    for probe in probes {
-        let (mode, arg0, arg1) = probe.wire();
-        assert_eq!(Probe::from_wire(mode, arg0, arg1), Ok(probe));
-    }
-    let index = cols.pack();
-    for (mode, arg0, arg1) in [
-        (WireProbeMode::Pk, 5, 0),
-        (WireProbeMode::Pk, 0, index),
-        (WireProbeMode::Pk, 0, 7),
-        (WireProbeMode::PkColumn, 1 << 32, 0),
-        (WireProbeMode::PkColumn, 4, index),
-        (WireProbeMode::Index, 0, index),
-        (WireProbeMode::Index, 9, 0),
-        (WireProbeMode::Index, 9, 7),
-    ] {
-        assert!(Probe::from_wire(mode, arg0, arg1).is_err(), "{mode:?} {arg0} {arg1}");
-    }
-}
-
-/// A flag-clear word names no column list, whatever its other bits say — `0` is
-/// the one an `arg1` carries when it means the relation's own PK store — and a
-/// crafted count of zero or past the cap, a repeated column and a column no
-/// schema has are refused.
-#[test]
-fn unpack_refuses_an_untagged_word_and_a_crafted_list() {
-    use crate::PkRule::*;
-    let over = PK_LIST_MAX_COLS + 1;
-    for (w, want) in [
-        (0, NotPacked),
-        (7, NotPacked),
-        (PK_LIST_PACKED_FLAG, Empty),
-        (
-            PK_LIST_PACKED_FLAG | over as u64,
-            TooManyColumns { count: over, max: PK_LIST_MAX_COLS },
-        ),
-        (
-            PK_LIST_PACKED_FLAG | 15,
-            TooManyColumns { count: 15, max: PK_LIST_MAX_COLS },
-        ),
-        (PK_LIST_PACKED_FLAG | 2 | 1 << 4 | 1 << 11, Duplicate { col: 1 }),
-        (
-            PK_LIST_PACKED_FLAG | 1 | (MAX_COLUMNS as u64) << 4,
-            IndexOutOfRange { col: MAX_COLUMNS as u32 },
-        ),
-    ] {
-        assert_eq!(PkColList::unpack(w), Err(want), "{w:#x}");
-    }
-}
-
-#[test]
-#[should_panic(expected = "at least one column")]
-fn from_slice_panics_on_empty() {
-    let _ = PkColList::from_slice(&[]);
 }
 
 /// The `TABLE_TAB` flags word round-trips, pins its persisted bits as literals —
@@ -109,7 +23,7 @@ fn from_slice_panics_on_empty() {
 /// boolean column holds `0` or `1`.
 #[test]
 fn catalog_flag_words_roundtrip_pin_and_refuse_undefined_bits() {
-    let dists = (0..=PK_LIST_MAX_COLS as u8)
+    let dists = (0..=crate::PK_LIST_MAX_COLS as u8)
         .map(|prefix_len| TableDistribution::Keyed { prefix_len })
         .chain([TableDistribution::Replicated]);
     for distribution in dists {
@@ -184,50 +98,21 @@ fn table_props_validate_refuses_what_the_pk_cannot_carry() {
 /// The system-shape digest moves with every axis of a family's stored identity.
 #[test]
 fn fold_family_separates_every_stored_axis() {
-    const A: &[WireSysCol] = &[col("id", TypeCode::U64), col("v", TypeCode::U64)];
-    const RENAMED: &[WireSysCol] = &[col("id", TypeCode::U64), col("w", TypeCode::U64)];
-    const RETYPED: &[WireSysCol] = &[col("id", TypeCode::U64), col("v", TypeCode::I64)];
-    let shape = |cols, key_len| SysShape { cols, key_len };
-    let base = fold_family(0, &fam(1, "_t", shape(A, 1)));
+    const ID: WireSysCol = WireSysCol { name: "id", type_code: TypeCode::U64 };
+    const A: &[WireSysCol] = &[ID, WireSysCol { name: "v", type_code: TypeCode::U64 }];
+    const RENAMED: &[WireSysCol] = &[ID, WireSysCol { name: "w", type_code: TypeCode::U64 }];
+    const RETYPED: &[WireSysCol] = &[ID, WireSysCol { name: "v", type_code: TypeCode::I64 }];
+    let fam = |id, name, cols, pk_cols| WireSysFamily { id, name, cols, pk_cols };
+    let base = fold_family(0, &fam(1, "_t", A, &[0]));
     let others = [
-        fam(2, "_t", shape(A, 1)),
-        fam(1, "_u", shape(A, 1)),
-        fam(1, "_t", shape(RENAMED, 1)),
-        fam(1, "_t", shape(RETYPED, 1)),
-        fam(1, "_t", shape(A, 2)),
+        fam(2, "_t", A, &[0]),
+        fam(1, "_u", A, &[0]),
+        fam(1, "_t", RENAMED, &[0]),
+        fam(1, "_t", RETYPED, &[0]),
+        fam(1, "_t", A, &[0, 1]),
     ];
     for (i, other) in others.iter().enumerate() {
         assert_ne!(fold_family(0, other), base, "variant {i}");
-    }
-}
-
-/// Every PK list of up to 4 distinct indices, in every order, over 1..=6
-/// columns, against the naive "position among the non-PK columns".
-#[test]
-fn payload_slot_numbers_the_non_pk_columns() {
-    fn lists(n: u32, len: usize, cur: &mut Vec<u32>, out: &mut Vec<Vec<u32>>) {
-        out.push(cur.clone());
-        if cur.len() == len {
-            return;
-        }
-        for c in 0..n {
-            if !cur.contains(&c) {
-                cur.push(c);
-                lists(n, len, cur, out);
-                cur.pop();
-            }
-        }
-    }
-    for n in 1..=6u32 {
-        let mut all = Vec::new();
-        lists(n, 4.min(n as usize), &mut Vec::new(), &mut all);
-        for pk in &all {
-            let payload: Vec<usize> = (0..n).filter(|c| !pk.contains(c)).map(|c| c as usize).collect();
-            for ci in 0..n as usize {
-                let want = payload.iter().position(|&c| c == ci);
-                assert_eq!(payload_slot(pk, ci), want, "n {n}, pk {pk:?}, ci {ci}");
-            }
-        }
     }
 }
 
@@ -251,4 +136,169 @@ fn a_user_identifier_is_nonempty_charset_and_not_underscore_led() {
     }
     assert_eq!(canonical_identifier("MyTab_1"), Ok("mytab_1".into()));
     assert!(canonical_identifier("_x").is_err());
+}
+
+/// A column and its foreign key read back out of the row they were laid into,
+/// with both booleans flipped across the cases so a transposed pair fails one.
+#[test]
+fn a_column_reads_back_out_of_its_row() {
+    let score = crate::ColumnDef::typed("score", crate::ColType::decimal(5), true);
+    let flipped = crate::ColumnDef {
+        is_nullable: false,
+        ..score.clone().hidden()
+    };
+    for (col, fk) in [
+        (
+            &score,
+            Some(FkRef {
+                table_id: 17,
+                col: 3,
+                on_delete: FkAction::Restrict,
+            }),
+        ),
+        (&score, None),
+        (
+            &flipped,
+            Some(FkRef {
+                table_id: 17,
+                col: 0,
+                on_delete: FkAction::Cascade,
+            }),
+        ),
+    ] {
+        assert_eq!(
+            ColTabRow::of(16, 2, col, fk).column(),
+            Ok(CatalogColumn { def: col.clone(), fk })
+        );
+    }
+}
+
+/// Every COL_TAB word must fit the width it is stored at and decode to a value
+/// `ColTabRow::of` could emit.
+#[test]
+fn a_column_row_refuses_forged_words() {
+    let col = crate::ColumnDef::new("c", crate::TypeCode::I64, false);
+    let sound = ColTabRow::of(16, 0, &col, None);
+    assert!(sound.column().is_ok());
+    for (r, expect) in [
+        (ColTabRow { type_code: 0x104, ..sound.clone() }, "type_code"),
+        (ColTabRow { type_code: 99, ..sound.clone() }, "invalid column type 99"),
+        (ColTabRow { is_nullable: 2, ..sound.clone() }, "is_nullable"),
+        (ColTabRow { is_hidden: 2, ..sound.clone() }, "is_hidden"),
+        (ColTabRow { fk_col_idx: 1 << 32, ..sound.clone() }, "fk_col_idx"),
+        (
+            ColTabRow { fk_col_idx: 3, ..sound.clone() },
+            "FK column 3 with no FK table",
+        ),
+        (ColTabRow { fk_on_delete: 2, ..sound.clone() }, "fk_on_delete"),
+        (
+            ColTabRow { fk_on_delete: 1, ..sound.clone() },
+            "an FK action with no FK table",
+        ),
+        (ColTabRow { scale: 256, ..sound.clone() }, "scale"),
+        (ColTabRow { scale: 3, ..sound.clone() }, "invalid column type"),
+    ] {
+        let err = r.column().unwrap_err();
+        assert!(err.contains(expect), "{expect}: {err}");
+    }
+}
+
+/// A relation row's `parts` read back the key and properties its writer packed,
+/// and refuse a word no writer emits.
+#[test]
+fn a_relation_rows_parts_invert_its_packed_words() {
+    let pk = crate::PkColList::from_slice(&[1, 0]);
+    let props = crate::TableProps {
+        serial: false,
+        distribution: crate::TableDistribution::Keyed { prefix_len: 1 },
+        ..Default::default()
+    };
+    let table = TableTabRow {
+        table_id: 17,
+        schema_id: 2,
+        name: "t".into(),
+        pk_col_idx: pk.pack(),
+        flags: props.pack(),
+    };
+    assert_eq!(table.parts(), Ok((pk, props)));
+    let stream_serial = crate::TableProps {
+        stream: true,
+        serial: true,
+        ..Default::default()
+    };
+    let err = TableTabRow {
+        flags: stream_serial.pack(),
+        ..table.clone()
+    }
+    .parts()
+    .unwrap_err();
+    assert!(err.contains("SERIAL"), "{err}");
+
+    let props = crate::ViewProps {
+        budget: crate::ViewBudget::Fed {
+            delta_bytes: std::num::NonZeroU64::new(64).unwrap(),
+        },
+        compress: true,
+    };
+    let (capacity_bytes, delta_bytes) = props.budget.row_words();
+    let view = ViewTabRow {
+        view_id: 18,
+        schema_id: 2,
+        name: "v".into(),
+        pk_col_idx: pk.pack(),
+        capacity_bytes,
+        delta_bytes,
+        owner_view_id: 0,
+        pk_repeats: 1,
+        compress: 1,
+        definition: Default::default(),
+    };
+    let parts = ViewParts { props, owner: None, pk_repeats: true };
+    assert_eq!(view.parts(), Ok((pk, parts)));
+    let segment = ViewTabRow {
+        name: "_seg19".into(),
+        capacity_bytes: 0,
+        delta_bytes: 0,
+        owner_view_id: 19,
+        compress: 0,
+        definition: Default::default(),
+        ..view.clone()
+    };
+    assert_eq!(segment.parts().map(|(_, p)| p.owner), Ok(Some(19)));
+    for (r, expect) in [
+        (ViewTabRow { capacity_bytes: 1, ..view.clone() }, "delta feed"),
+        (ViewTabRow { pk_repeats: 2, ..view.clone() }, "pk_repeats"),
+        (ViewTabRow { compress: 2, ..view.clone() }, "compress"),
+        (ViewTabRow { pk_col_idx: 0, ..view.clone() }, "packed-list flag"),
+        (ViewTabRow { owner_view_id: 19, ..view.clone() }, "WITH option"),
+        (
+            ViewTabRow { definition: b"x"[..].into(), ..segment },
+            "carrying a definition",
+        ),
+    ] {
+        let err = r.parts().unwrap_err();
+        assert!(err.contains(expect), "{expect}: {err}");
+    }
+
+    let index = IdxTabRow {
+        index_id: 100,
+        owner_id: 16,
+        source_col_idx: pk.pack(),
+        name: "idx".into(),
+        is_unique: 1,
+    };
+    assert_eq!(index.parts(), Ok((16, pk, true)));
+    for (r, expect) in [
+        (IdxTabRow { is_unique: 2, ..index.clone() }, "is_unique"),
+        (
+            IdxTabRow {
+                source_col_idx: pk.pack() & !crate::PK_LIST_PACKED_FLAG,
+                ..index
+            },
+            "column list word carries no packed-list flag",
+        ),
+    ] {
+        let err = r.parts().unwrap_err();
+        assert!(err.contains(expect), "{expect}: {err}");
+    }
 }

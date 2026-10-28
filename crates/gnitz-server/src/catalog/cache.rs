@@ -3,10 +3,11 @@ use std::collections::hash_map::Entry;
 use std::rc::Rc;
 
 use gnitz_store::relation::Relation;
-use gnitz_wire::control::Target;
 use gnitz_wire::schema_block::check_same_types;
-use gnitz_wire::{payload_str, payload_u64};
-use gnitz_wire::{RelDescriptorBlob, RelIndex, WireFault, WireStatus, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID};
+use gnitz_wire::{
+    payload_str, payload_u64, RelDescriptorBlob, RelIndex, Target, WireFault, WireStatus, RELTAB_PAY_NAME,
+    RELTAB_PAY_SCHEMA_ID,
+};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashMap;
@@ -86,7 +87,7 @@ impl CatalogEngine {
         };
         let desc = desc.encode();
         if entry.token.get() == 0 {
-            let mut h = gnitz_wire::RowHasher::default();
+            let mut h = gnitz_wire::ChecksumStream::default();
             h.update(self.qualified_name(tid).as_bytes());
             h.update(&desc);
             h.update(&entry.record);

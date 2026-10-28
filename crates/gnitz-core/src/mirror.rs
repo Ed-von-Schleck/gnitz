@@ -780,16 +780,16 @@ impl GnitzClient {
         self.mirror_as(name.clone(), None).await
     }
 
-    /// Mirror what `plan` compiles as the relation `alias` of
-    /// [`gnitz_wire::LOCAL_SCHEMA`], and bring its copy up to date. Idempotent,
-    /// as [`Self::mirror_view`] is: the same subscription resumes from its
-    /// persisted cursor, another one under the same alias replaces it.
+    /// Mirror what `plan` compiles as the relation `alias` of the client's own
+    /// schema `_local`, and bring its copy up to date. Idempotent, as
+    /// [`Self::mirror_view`] is: the same subscription resumes from its persisted
+    /// cursor, another one under the same alias replaces it.
     ///
     /// A read of the alias is answered off the copy and never upstream; the
     /// view itself is still read upstream, whole. The outcome's id is the
     /// alias's own.
     pub async fn mirror_subscription(&mut self, alias: &str, plan: Planner) -> Result<PollOutcome, ClientError> {
-        self.mirror_as(RelName::new(gnitz_wire::LOCAL_SCHEMA, alias)?, Some(plan))
+        self.mirror_as(RelName::new(crate::rel_name::LOCAL_SCHEMA, alias)?, Some(plan))
             .await
     }
 

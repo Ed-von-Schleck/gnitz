@@ -1,8 +1,7 @@
 use std::convert::Infallible;
 
 use gnitz_expr::CalendarOp;
-use gnitz_wire::decimal::MAX_DECIMAL_SCALE;
-use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode, MAX_DECIMAL_SCALE};
 
 /// Both are instruction selectors, so the evaluator crate owns their
 /// definitions; the IR carries each verbatim rather than restating it.

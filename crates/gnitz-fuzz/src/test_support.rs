@@ -4,10 +4,9 @@ use std::num::NonZeroU64;
 
 use gnitz_core::{encode_ddl_txn, sys_schema, BatchAppender, ZSetBatch};
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, Sink};
-use gnitz_wire::control::{append_frame, ControlHeader, Target};
-use gnitz_wire::sys_rows::{CircuitRow, SysRow};
 use gnitz_wire::{
-    Circuit, ClientVerb, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, CIRCUIT_TAB,
+    append_frame, Circuit, CircuitRow, ClientVerb, ControlHeader, KeyRange, OrderKey, PkColList, ReadBound, ReadSink,
+    ReadSpec, RowsCut, SinkKind, SysRow, Target, CIRCUIT_TAB,
 };
 
 /// `col > 7`, as an expression program's blob.

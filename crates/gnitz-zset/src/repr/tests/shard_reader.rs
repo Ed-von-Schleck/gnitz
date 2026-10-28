@@ -1,4 +1,4 @@
-use super::super::batch::{Batch, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use super::super::batch::Batch;
 use super::super::batch_builder::BatchBuilder;
 use super::super::codebook::Codebook;
 use super::super::merge::ColumnarSource;
@@ -12,7 +12,7 @@ use crate::test_support::{
     pk_only_schema, prose, sweep_bit_flips, u64_pk_schema,
 };
 use gnitz_wire::write_u64_le;
-use gnitz_wire::{num_regions, TypeCode};
+use gnitz_wire::{num_regions, TypeCode, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 /// Write `batch` through the production writer to `dir/name`, its heap coded
 /// under a codebook trained on it where that pays.

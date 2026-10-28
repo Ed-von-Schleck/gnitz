@@ -4,8 +4,7 @@
 //! standing where the original ones stood.
 
 use gnitz_core::{Catalog, CatalogRelation, RelProps, ViewDefinition};
-use gnitz_wire::sys_rows::FkAction;
-use gnitz_wire::TableDistribution;
+use gnitz_wire::{FkAction, TableDistribution};
 
 use super::{table_with_options, view_with_options};
 use crate::types::serial_type_name;

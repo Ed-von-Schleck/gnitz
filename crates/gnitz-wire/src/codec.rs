@@ -144,7 +144,7 @@ impl<'a> Reader<'a> {
         Reader { buf, off: 0 }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         match self.buf.get(self.off..).and_then(|rest| rest.get(..n)) {
             Some(s) => {

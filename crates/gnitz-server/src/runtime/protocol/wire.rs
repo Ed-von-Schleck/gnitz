@@ -1,7 +1,6 @@
 //! Wire protocol: IPC message codec, encode/decode.
 
-use gnitz_wire::control::{ControlHeader, DecodedControl};
-use gnitz_wire::{WireFault, WireFlags, WireStatus};
+use gnitz_wire::{ControlHeader, DecodedControl, WireFault, WireFlags, WireStatus};
 use gnitz_zset::repr::{Batch, WireRows};
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -58,7 +57,7 @@ impl<'a> WireMsg<'a> {
 
     /// Total encoded size, without allocating.
     pub fn size(&self) -> usize {
-        gnitz_wire::control::frame_head_size(self.blob.len(), self.schema_block.map(<[u8]>::len))
+        gnitz_wire::frame_head_size(self.blob.len(), self.schema_block.map(<[u8]>::len))
             + self.data.map_or(0, |d| d.byte_size())
     }
 
@@ -90,13 +89,8 @@ impl<'a> WireMsg<'a> {
 
     /// Encode into `out`, which must be exactly [`size`](WireMsg::size) bytes.
     pub fn encode(&self, out: &mut [u8]) {
-        let mut pos = gnitz_wire::control::encode_frame_head(
-            out,
-            &self.header(),
-            self.blob,
-            self.schema_block,
-            self.data.is_some(),
-        );
+        let mut pos =
+            gnitz_wire::encode_frame_head(out, &self.header(), self.blob, self.schema_block, self.data.is_some());
 
         if let Some(d) = self.data {
             pos += d.encode(&mut out[pos..]);

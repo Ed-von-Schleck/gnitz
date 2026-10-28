@@ -3,8 +3,7 @@
 //! refused write, what an applied bundle did, the zone pin, and the
 //! orphan-directory sweep.
 
-use gnitz_wire::sys_rows::{IdxTabRow, IdxTabSlot, ViewTabSlot};
-use gnitz_wire::{payload_u64, PkColList, WireFault};
+use gnitz_wire::{payload_u64, IdxTabRow, IdxTabSlot, PkColList, ViewTabSlot, WireFault};
 use gnitz_zset::repr::Batch;
 
 use super::sys_reads::IdSet;

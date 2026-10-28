@@ -1,8 +1,7 @@
 use super::*;
 use crate::test_support::rel;
 use crate::{sys_schema, BatchAppender};
-use gnitz_wire::sys_rows::{FkAction, FkRef, SysRow};
-use gnitz_wire::{ColumnDef, ReadBound, TableDistribution, TypeCode, ViewBudget};
+use gnitz_wire::{ColumnDef, FkAction, FkRef, ReadBound, SysRow, TableDistribution, TypeCode, ViewBudget};
 use std::num::NonZeroU64;
 
 /// The [`CATALOG_FAMILIES`]' rows, as a cut reads them back.

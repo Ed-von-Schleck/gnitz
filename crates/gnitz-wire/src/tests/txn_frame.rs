@@ -1,6 +1,5 @@
 use super::*;
-use crate::control::CTRL_HEADER_SIZE;
-use crate::WireConflictMode;
+use crate::{WireConflictMode, CTRL_HEADER_SIZE};
 
 fn rel(tid: u64, reply_layout: u64) -> ScanItem<'static> {
     ScanItem {
@@ -182,7 +181,7 @@ fn a_delta_poll_refuses_a_blob_shorter_than_a_cursor() {
 fn one_item(hdr: ControlHeader, blob: &[u8], schema: bool, data: bool) -> Vec<u8> {
     let mut out = Vec::new();
     let r = regions();
-    crate::control::append_frame(
+    crate::append_frame(
         &mut out,
         &hdr,
         blob,

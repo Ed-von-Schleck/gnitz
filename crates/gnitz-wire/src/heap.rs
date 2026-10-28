@@ -5,6 +5,7 @@
 //! its codes, which decode to the length its cell holds.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 /// The code byte whose next byte is the value's next byte, verbatim.
 pub const SYMBOL_ESCAPE: u8 = 255;
@@ -142,14 +143,12 @@ impl<'a> Heap<'a> {
     pub fn value(self, at: u64, len: usize) -> Option<HeapValue<'a>> {
         match self {
             Heap::Plain(bytes) => {
-                let end = usize::try_from(at.checked_add(len as u64)?)
-                    .ok()
-                    .filter(|&end| end <= bytes.len())?;
+                let r = plain_extent(bytes.len(), at, len)?;
                 Some(HeapValue {
-                    stored: &bytes[at as usize..end],
+                    stored: &bytes[r.clone()],
                     len,
                     table: None,
-                    end,
+                    end: r.end,
                 })
             }
             Heap::Coded(coded) => {
@@ -163,6 +162,17 @@ impl<'a> Heap<'a> {
             }
         }
     }
+}
+
+/// `at..at + len` if it lies inside a plain heap of `heap_len` bytes, checked
+/// in `u64` before any narrowing.
+#[inline(always)]
+pub(crate) fn plain_extent(heap_len: usize, at: u64, len: usize) -> Option<Range<usize>> {
+    let end = at.checked_add(len as u64)?;
+    if end > heap_len as u64 {
+        return None;
+    }
+    Some(at as usize..end as usize)
 }
 
 /// The codes of the coded value stored from `at` in `codes`, and where the next

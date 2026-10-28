@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::test_support::u64_i64_cols;
-use gnitz_wire::sys_rows::{TableTabRow, ViewTabRow};
+use gnitz_wire::{TableTabRow, ViewTabRow};
 
 const TABLES: u64 = gnitz_wire::TABLE_TAB;
 

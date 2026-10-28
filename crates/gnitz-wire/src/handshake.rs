@@ -1,10 +1,20 @@
 //! The HELLO both ends of a connection open with — the client's carrying its
-//! access token, the server's its verdict on it — and the TLS ALPN they pin.
+//! access token, the server's its verdict on it — the TLS ALPN they pin, and
+//! the wire version the HELLO and every data block carry.
 
 use std::fmt;
 use std::time::Duration;
 
-use crate::wal::WAL_FORMAT_VERSION;
+use crate::SYS_SCHEMA_DIGEST;
+
+/// Bumped by hand for any change to a payload client and engine both decode,
+/// the block layout included.
+const WIRE_EPOCH: u32 = 35;
+
+/// The wire version: every data block's version word, the HELLO's, and a frame
+/// recording's. [`SYS_SCHEMA_DIGEST`] folds in, so a system-family shape change
+/// moves it too.
+pub const WIRE_VERSION: u32 = WIRE_EPOCH ^ ((SYS_SCHEMA_DIGEST ^ (SYS_SCHEMA_DIGEST >> 32)) as u32);
 
 /// A client's deadline over its connect, TLS handshake and HELLO exchange together.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -17,7 +27,7 @@ pub const ALPN_GNITZ: &[u8] = b"gnitz/1";
 /// layout no version may change. A server refusing a client's HELLO answers it
 /// with [`refusal_hello`].
 pub const HELLO: [u8; 8] = {
-    let v = WAL_FORMAT_VERSION.to_le_bytes();
+    let v = WIRE_VERSION.to_le_bytes();
     [b'G', b'N', b'T', b'Z', v[0], v[1], v[2], v[3]]
 };
 
@@ -48,7 +58,7 @@ impl fmt::Display for HelloError {
             HelloError::Version { peer, release: Some(theirs) } if theirs == RELEASE => write!(
                 f,
                 "version mismatch: the server and this client are both gnitz {RELEASE}, but built from \
-                 different sources (wire versions {peer} and {WAL_FORMAT_VERSION}); use a client built \
+                 different sources (wire versions {peer} and {WIRE_VERSION}); use a client built \
                  from the server's source"
             ),
             HelloError::Version { release: Some(theirs), .. } => write!(
@@ -59,7 +69,7 @@ impl fmt::Display for HelloError {
             HelloError::Version { peer, release: None } => write!(
                 f,
                 "version mismatch: the peer speaks wire version {peer}, this build (gnitz {RELEASE}) wire \
-                 version {WAL_FORMAT_VERSION}"
+                 version {WIRE_VERSION}"
             ),
         }
     }
@@ -90,8 +100,8 @@ pub fn client_hello(token: &[u8]) -> Vec<u8> {
 /// The access token a client's HELLO carries, empty when it holds none.
 pub fn read_client_hello(payload: &[u8]) -> Result<&[u8], HelloError> {
     match split_hello(payload)? {
-        (WAL_FORMAT_VERSION, token) if token.len() <= MAX_TOKEN_BYTES => Ok(token),
-        (WAL_FORMAT_VERSION, _) => Err(HelloError::Malformed),
+        (WIRE_VERSION, token) if token.len() <= MAX_TOKEN_BYTES => Ok(token),
+        (WIRE_VERSION, _) => Err(HelloError::Malformed),
         (peer, _) => Err(HelloError::Version { peer, release: None }),
     }
 }
@@ -124,8 +134,8 @@ pub const fn server_hello(status: AuthStatus) -> [u8; HELLO.len() + 1] {
 /// The verdict a server's HELLO carries.
 pub fn read_server_hello(payload: &[u8]) -> Result<AuthStatus, HelloError> {
     match split_hello(payload)? {
-        (WAL_FORMAT_VERSION, &[v]) => AuthStatus::from_wire(v).ok_or(HelloError::Malformed),
-        (WAL_FORMAT_VERSION, _) => Err(HelloError::Malformed),
+        (WIRE_VERSION, &[v]) => AuthStatus::from_wire(v).ok_or(HelloError::Malformed),
+        (WIRE_VERSION, _) => Err(HelloError::Malformed),
         (peer, rest) => Err(HelloError::Version { peer, release: release_name(rest) }),
     }
 }

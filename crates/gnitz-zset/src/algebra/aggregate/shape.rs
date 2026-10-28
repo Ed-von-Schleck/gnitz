@@ -48,7 +48,9 @@ pub(crate) fn resolve_aggs(
 ) -> Result<(SchemaDescriptor, Rc<[Agg]>), String> {
     for d in aggs {
         let (src, _) = input.wire_col("aggregate column", d.col_idx)?;
-        let tc = gnitz_wire::agg_output_type(d.agg_op, src.type_code)
+        let tc = d
+            .agg_op
+            .output_type(src.type_code)
             .ok_or_else(|| format!("{:?} is not defined over type code {}", d.agg_op, src.type_code))?;
         prefix.push(SchemaColumn::new(tc, d.agg_op.raw_output_nullable(src.nullable, empty)));
     }

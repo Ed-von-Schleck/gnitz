@@ -2,23 +2,34 @@
 //! fold). The master routes a request blob by `peek_bound`; the worker's `decode`
 //! is the trust boundary.
 
-use crate::circuit::{AggDescriptor, ComputeMap};
 use std::num::NonZeroU64;
 use std::ops::Range;
 
+use crate::circuit::{ComputeMap, GroupAggs};
 use crate::codec::{decode_all, Reader, Wire, Writer};
+use crate::pk::{strictly_ascending, PkKeys};
 use crate::range::KeyRange;
-use crate::{widen_pk_be, MAX_COLUMNS, MAX_PK_BYTES, NARROW_PK_MAX_BYTES};
+use crate::MAX_PK_BYTES;
 
 /// ORDER BY keys apply in sequence; a spec carries at most this many.
 pub const MAX_ORDER_KEYS: usize = 16;
 
-const BOUND_NONE: u8 = 0;
-const BOUND_RANGE: u8 = 1;
-const BOUND_PK_SET: u8 = 2;
+wire_enum! {
+    /// The tag a [`ReadBound`] leads with.
+    pub(crate) enum BoundTag: u8 {
+        None = 0,
+        Range = 1,
+        PkSet = 2,
+    }
+}
 
-const SINK_ROWS: u8 = 0;
-const SINK_FOLD: u8 = 1;
+wire_enum! {
+    /// The tag a [`SinkKind`] leads with.
+    enum SinkTag: u8 {
+        Rows = 0,
+        Fold = 1,
+    }
+}
 
 /// One ORDER BY key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,14 +67,6 @@ impl Wire for OrderKey {
     }
 }
 
-/// The fold sink's per-worker hash-fold. `aggs` is the physical reduce layout,
-/// not the SELECT list. Its reply is a `Reduce`'s output over the same group set.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AggReadSpec {
-    pub group_cols: Vec<u32>,
-    pub aggs: Vec<AggDescriptor>,
-}
-
 /// What the worker does with the rows surviving `bound` + `predicate`: an
 /// optional map, then exactly one of the two sink kinds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,9 +98,10 @@ pub enum SinkKind {
     /// Forward rows, every one or the ones `cut` keeps.
     Rows { cut: Option<RowsCut> },
     /// Fold rows into per-group accumulators (GROUP BY / global aggregate /
-    /// DISTINCT) and emit partial reduce-output rows. `group_cols` /
-    /// `aggs[].col_idx` index the sink input.
-    Fold(AggReadSpec),
+    /// DISTINCT) on each worker and emit partial reduce-output rows: a `Reduce`'s
+    /// output over the same group set. `group_cols` and `aggs[].col_idx` index the
+    /// sink input, and `aggs` is the physical reduce layout, not the SELECT list.
+    Fold(GroupAggs),
 }
 
 impl ReadSink {
@@ -109,135 +113,6 @@ impl ReadSink {
             kind: SinkKind::Rows { cut: None },
         }
     }
-}
-
-/// OPK keys of one stride, strictly ascending — the order a forward gather
-/// sweeps. Any number of keys: the request frame is the only bound on a list.
-/// Fields private: every constructor sorts and dedups, or validates.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PkKeys {
-    stride: u8,
-    bytes: Vec<u8>,
-}
-
-impl PkKeys {
-    /// Sort and dedup `keys`, each exactly `stride` bytes.
-    pub fn from_keys<'a>(stride: usize, keys: impl IntoIterator<Item = &'a [u8]>) -> Self {
-        assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
-        let keys = keys
-            .into_iter()
-            .inspect(|k| assert_eq!(k.len(), stride, "PkKeys: key width"));
-        if stride <= NARROW_PK_MAX_BYTES {
-            return Self::from_images(stride, keys.map(widen_pk_be));
-        }
-        if stride <= 2 * NARROW_PK_MAX_BYTES {
-            // Two words, the second right-aligned: equal-width keys order as
-            // the pair does, and the sort moves no pointer into the keys.
-            let mut ks: Vec<[u128; 2]> = keys
-                .map(|k| {
-                    let (hi, lo) = k.split_at(NARROW_PK_MAX_BYTES);
-                    [widen_pk_be(hi), widen_pk_be(lo)]
-                })
-                .collect();
-            ks.sort_unstable();
-            ks.dedup();
-            let mut bytes = Vec::with_capacity(ks.len() * stride);
-            for [hi, lo] in ks {
-                bytes.extend_from_slice(&hi.to_be_bytes());
-                bytes.extend_from_slice(&lo.to_be_bytes()[2 * NARROW_PK_MAX_BYTES - stride..]);
-            }
-            return PkKeys { stride: stride as u8, bytes };
-        }
-        let mut ks: Vec<&[u8]> = keys.collect();
-        ks.sort_unstable();
-        ks.dedup();
-        PkKeys { stride: stride as u8, bytes: ks.concat() }
-    }
-
-    /// Sort and dedup key images, each stored as its low `stride` bytes
-    /// big-endian. An image orders as those bytes do; the `u64` arm is the
-    /// narrower sort for keys of at most 8 bytes.
-    pub fn from_images(stride: usize, images: impl IntoIterator<Item = u128>) -> Self {
-        assert!((1..=NARROW_PK_MAX_BYTES).contains(&stride), "PkKeys: stride {stride}");
-        let mut bytes = Vec::new();
-        if stride <= 8 {
-            let mut imgs: Vec<u64> = images.into_iter().map(|v| v as u64).collect();
-            imgs.sort_unstable();
-            imgs.dedup();
-            bytes.reserve(imgs.len() * stride);
-            imgs.iter()
-                .for_each(|v| bytes.extend_from_slice(&v.to_be_bytes()[8 - stride..]));
-        } else {
-            let mut imgs: Vec<u128> = images.into_iter().collect();
-            imgs.sort_unstable();
-            imgs.dedup();
-            bytes.reserve(imgs.len() * stride);
-            imgs.iter()
-                .for_each(|v| bytes.extend_from_slice(&v.to_be_bytes()[16 - stride..]));
-        }
-        PkKeys { stride: stride as u8, bytes }
-    }
-
-    /// Keys of `stride` already concatenated in strictly ascending order.
-    pub fn from_sorted(stride: usize, bytes: Vec<u8>) -> Self {
-        assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
-        assert_eq!(bytes.len() % stride, 0, "PkKeys: key width");
-        Self::checked(stride, bytes).expect("PkKeys")
-    }
-
-    /// [`Self::from_sorted`] for keys off the wire: `Err` where they do not
-    /// strictly ascend.
-    fn checked(stride: usize, bytes: Vec<u8>) -> Result<Self, String> {
-        match strictly_ascending(&bytes, stride) {
-            true => Ok(PkKeys { stride: stride as u8, bytes }),
-            false => Err("keys are not strictly ascending".to_string()),
-        }
-    }
-
-    pub fn stride(&self) -> usize {
-        self.stride as usize
-    }
-
-    pub fn len(&self) -> usize {
-        self.bytes.len() / self.stride()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    pub fn iter(&self) -> std::slice::ChunksExact<'_, u8> {
-        self.bytes.chunks_exact(self.stride())
-    }
-
-    /// Keep only the keys `keep` admits. A subsequence of an ascending list
-    /// ascends, so nothing is re-checked.
-    pub fn retain(&mut self, mut keep: impl FnMut(&[u8]) -> bool) {
-        let stride = self.stride();
-        let mut kept = 0;
-        for at in (0..self.bytes.len()).step_by(stride) {
-            if keep(&self.bytes[at..at + stride]) {
-                self.bytes.copy_within(at..at + stride, kept);
-                kept += stride;
-            }
-        }
-        self.bytes.truncate(kept);
-    }
-
-    /// The first and last key, or `None` for an empty list.
-    pub fn bounds(&self) -> Option<(&[u8], &[u8])> {
-        let first = self.iter().next()?;
-        Some((first, &self.bytes[self.bytes.len() - self.stride()..]))
-    }
-}
-
-/// Whether `bytes`, read as keys of `stride`, strictly ascend.
-fn strictly_ascending(bytes: &[u8], stride: usize) -> bool {
-    bytes.chunks_exact(stride).is_sorted_by(|a, b| a < b)
 }
 
 /// The bound a `ReadSpec` walks before the predicate and the sink. A range carries
@@ -297,9 +172,9 @@ impl ReadSpec {
 
         match &self.sink.kind {
             // `k`, or `0` for no cut; only a cut carries an order list.
-            SinkKind::Rows { cut: None } => w.u8(SINK_ROWS).u64(0),
-            SinkKind::Rows { cut: Some(cut) } => w.u8(SINK_ROWS).u64(cut.k.get()).list(&cut.order),
-            SinkKind::Fold(agg) => w.u8(SINK_FOLD).list(&agg.group_cols).list(&agg.aggs),
+            SinkKind::Rows { cut: None } => w.put(&SinkTag::Rows).u64(0),
+            SinkKind::Rows { cut: Some(cut) } => w.put(&SinkTag::Rows).u64(cut.k.get()).list(&cut.order),
+            SinkKind::Fold(g) => w.put(&SinkTag::Fold).put(g),
         };
         w.into_vec()
     }
@@ -313,8 +188,8 @@ impl ReadSpec {
 
             let map = r.get()?;
 
-            let kind = match r.u8()? {
-                SINK_ROWS => {
+            let kind = match r.get()? {
+                SinkTag::Rows => {
                     let cut = match NonZeroU64::new(r.u64()?) {
                         None => None,
                         Some(k) => Some(RowsCut {
@@ -324,12 +199,7 @@ impl ReadSpec {
                     };
                     SinkKind::Rows { cut }
                 }
-                SINK_FOLD => {
-                    let group_cols = r.list("column list", MAX_COLUMNS)?;
-                    let aggs = r.list("aggregate list", MAX_COLUMNS)?;
-                    SinkKind::Fold(AggReadSpec { group_cols, aggs })
-                }
-                other => return Err(format!("unknown sink tag {other}")),
+                SinkTag::Fold => SinkKind::Fold(r.get()?),
             };
 
             Ok(ReadSpec {
@@ -392,13 +262,13 @@ impl Wire for ReadBound {
     fn write(&self, w: &mut Writer) {
         match self {
             ReadBound::None => {
-                w.u8(BOUND_NONE);
+                w.put(&BoundTag::None);
             }
             ReadBound::Range(range) => {
-                w.u8(BOUND_RANGE).put(range);
+                w.put(&BoundTag::Range).put(range);
             }
             ReadBound::PkSet(keys) => {
-                w.u8(BOUND_PK_SET);
+                w.put(&BoundTag::PkSet);
                 write_pk_set(w, keys.stride(), keys.as_bytes());
             }
         }
@@ -406,14 +276,13 @@ impl Wire for ReadBound {
 
     /// At the trust boundary: a malformed bound is an `Err`.
     fn read(r: &mut Reader) -> Result<Self, String> {
-        Ok(match r.u8()? {
-            BOUND_NONE => ReadBound::None,
-            BOUND_RANGE => ReadBound::Range(r.get()?),
-            BOUND_PK_SET => {
+        Ok(match r.get()? {
+            BoundTag::None => ReadBound::None,
+            BoundTag::Range => ReadBound::Range(r.get()?),
+            BoundTag::PkSet => {
                 let (stride, bytes) = read_pk_set(r)?;
                 ReadBound::PkSet(PkKeys::checked(stride, bytes.to_vec()).map_err(|e| format!("PkSet {e}"))?)
             }
-            other => return Err(format!("unknown bound kind {other}")),
         })
     }
 }
@@ -455,21 +324,17 @@ impl PkSetPeek<'_> {
 /// a malformed prefix.
 pub fn peek_bound(blob: &[u8]) -> Option<BoundPeek<'_>> {
     let mut r = Reader::new(blob);
-    match r.u8().ok()? {
-        BOUND_RANGE => r.get().ok().map(BoundPeek::Range),
-        BOUND_PK_SET => {
+    match BoundTag::from_wire(r.u8().ok()?)? {
+        BoundTag::Range => r.get().ok().map(BoundPeek::Range),
+        BoundTag::PkSet => {
             let start = r.pos();
             let (stride, keys) = read_pk_set(&mut r).ok()?;
             Some(BoundPeek::PkSet(PkSetPeek { blob, span: start..r.pos(), stride, keys }))
         }
-        _ => None,
+        BoundTag::None => None,
     }
 }
 
 #[cfg(test)]
 #[path = "tests/read_spec.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "benches/read_spec.rs"]
-mod bench;

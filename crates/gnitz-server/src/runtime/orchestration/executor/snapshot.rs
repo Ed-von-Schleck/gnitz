@@ -18,9 +18,8 @@ use crate::runtime::reactor::SendBody;
 use crate::runtime::sal::Read;
 use crate::runtime::wire as ipc;
 use gnitz_store::relation::RelationKind;
-use gnitz_wire::control::ControlHeader;
 use gnitz_wire::snapshot::PageRequest;
-use gnitz_wire::WireFault;
+use gnitz_wire::{ControlHeader, WireFault};
 use gnitz_zset::algebra::Slot;
 
 /// The snapshots one connection may hold at a time.

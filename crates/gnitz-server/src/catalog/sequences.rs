@@ -2,7 +2,7 @@
 //! checkpoint generation, topology word), user SERIAL ranges and the checkpoint
 //! records.
 
-use gnitz_wire::sys_rows::{SeqTabRow, SysRow};
+use gnitz_wire::{SeqTabRow, SysRow};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
 use super::sys_tables::SysFamily;

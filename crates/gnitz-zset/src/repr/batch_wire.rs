@@ -316,7 +316,7 @@ pub(super) fn null_breach(mb: &MemBatch<'_>) -> Option<(&'static str, (usize, us
     let col = |pi| {
         (
             mb.col_data(pi),
-            schema.region_stride(super::batch::REG_PAYLOAD_START + pi),
+            schema.region_stride(gnitz_wire::REG_PAYLOAD_START + pi),
         )
     };
     gnitz_wire::first_valued_null(schema.nullable_payload_slots(), mb.null_bmp(), col)
@@ -372,14 +372,14 @@ impl<'a> MemBatch<'a> {
     /// them; a block a peer wrote goes through
     /// [`Batch::decode_foreign_wal_block`].
     pub fn of_wal_block(data: &'a [u8], schema: &'a SchemaDescriptor) -> Result<Self, &'static str> {
-        let (count, fixed, blob, dead_heap) = wal::parse_block(data, schema.row_width())?;
+        let block = wal::parse_block(data, schema.row_width())?;
         Ok(MemBatch {
-            data: fixed,
+            data: block.fixed,
             schema,
-            cap: count,
-            blob,
-            count,
-            dead_heap,
+            cap: block.rows,
+            blob: block.heap,
+            count: block.rows,
+            dead_heap: block.heap_dead,
         })
     }
 }

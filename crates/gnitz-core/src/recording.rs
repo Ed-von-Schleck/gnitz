@@ -17,8 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use gnitz_wire::wal::WAL_FORMAT_VERSION;
-use gnitz_wire::{Reader, Writer};
+use gnitz_wire::{Reader, Writer, WIRE_VERSION};
 
 /// The directory every connection of this process records into.
 const RECORD_ENV: &str = "GNITZ_RECORD_FRAMES";
@@ -53,7 +52,7 @@ impl Recorded<'_> {
 /// The recording of `records`, in order: what a recording file holds.
 pub fn encode(records: &[Recorded]) -> Vec<u8> {
     let mut w = Writer::new();
-    w.raw(MAGIC).u32(WAL_FORMAT_VERSION);
+    w.raw(MAGIC).u32(WIRE_VERSION);
     records.iter().for_each(|r| r.write(&mut w));
     w.into_vec()
 }
@@ -65,9 +64,9 @@ pub fn read(bytes: &[u8]) -> Result<Vec<Recorded<'_>>, String> {
         return Err("not a frame recording".into());
     }
     let version = r.u32().map_err(|_| "not a frame recording")?;
-    if version != WAL_FORMAT_VERSION {
+    if version != WIRE_VERSION {
         return Err(format!(
-            "recorded at wire format {version:#x}, this build speaks {WAL_FORMAT_VERSION:#x}"
+            "recorded at wire format {version:#x}, this build speaks {WIRE_VERSION:#x}"
         ));
     }
     let mut out = Vec::new();

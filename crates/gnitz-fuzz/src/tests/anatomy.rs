@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{circuit, ddl_frame, frames, predicate};
-use gnitz_wire::control::CTRL_HEADER_SIZE;
+use gnitz_wire::CTRL_HEADER_SIZE;
 
 /// A `DDL_TXN` is taken apart all the way down — its item, the item's block,
 /// the `circuits` row's string, the circuit in it and the program inside the

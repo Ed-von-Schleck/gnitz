@@ -11,8 +11,7 @@ use clap::ValueEnum;
 use gnitz_core::{Catalog, CatalogRelation, RelName, RelProps};
 use gnitz_expr::{LikeMatcher, LikePattern};
 use gnitz_sql::sqlparser::tokenizer::Token;
-use gnitz_wire::sys_rows::FkAction;
-use gnitz_wire::{qualified_key, RelClass, TypeCode};
+use gnitz_wire::{qualified_key, FkAction, RelClass, TypeCode};
 
 use crate::editor::{editor, editor_command, KEY_HELP};
 use crate::render::{render, Expanded, Format, Settings, Weights};

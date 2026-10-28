@@ -94,7 +94,7 @@ fn drive_tick_bench() {
     let grouped = cols_of(grouped.output_schema());
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(base, ReadBound::None);
-    circuit.reduce_multi(scan, &[1], &aggs);
+    circuit.reduce(scan, &[1], &aggs);
     let grouped = try_register_view(&mut engine, circuit, "grouped", &grouped, 0, 0).unwrap();
     let (counted, _) = register_count(&mut engine, base, "counted");
     let mut circuit = Circuit::default();

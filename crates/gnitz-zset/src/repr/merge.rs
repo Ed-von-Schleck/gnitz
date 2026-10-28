@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::ops::{ControlFlow, Range};
 
-use super::batch::{Batch, ColPtr, MemBatch, REG_PAYLOAD_START, REG_WEIGHT};
+use super::batch::{Batch, ColPtr, MemBatch};
 use super::loser_tree::{HeapNode, LoserTree};
 use super::scatter::{mem_batch_to_unified, DecodedColumns, UnifiedSource};
 use super::string_heap::{rebase_string_cells, row_long_bytes, BlobCache};
@@ -21,10 +21,7 @@ use super::writer::DirectWriter;
 use crate::schema::key::{pack_pk_be, pk_width_dispatch, PkSortKey};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::native_key_image;
-use gnitz_wire::Heap;
-use gnitz_wire::RowSource;
-use gnitz_wire::NARROW_PK_MAX_BYTES;
+use gnitz_wire::{native_key_image, Heap, RowSource, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT};
 
 /// A `RowSource` that also carries the Z-set weight: a storage row the N-way
 /// merge folds.

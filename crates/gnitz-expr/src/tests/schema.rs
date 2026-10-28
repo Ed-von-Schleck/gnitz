@@ -1,6 +1,9 @@
 //! The descriptor's layout facts, checked against absolute answers.
 
-use crate::{decode_schema_block, encode_schema_block, ColumnLocator, SchemaColumn, SchemaDescriptor};
+use crate::{
+    decode_schema_block, encode_schema_block, ColumnLocator, ReduceOutKey, ReduceOutSlot, SchemaColumn,
+    SchemaDescriptor,
+};
 use gnitz_wire::schema_block::SchemaBlockCol;
 use gnitz_wire::{ColType, TypeCode, MAX_COLUMNS};
 
@@ -278,4 +281,85 @@ fn no_flip_in_a_schema_records_arity_prefix_is_silently_inert() {
             buf[byte] ^= 1 << bit;
         }
     }
+}
+
+/// The reduce output key: the source PK list keys on itself, and so does a
+/// single NOT NULL PK-eligible column (eligibility is `TypeCode::is_pk_eligible`'s,
+/// swept there); anything else — no column, a nullable, float or string column,
+/// a partial, reordered or wider set — folds into a synthetic key. Each schema
+/// has three columns, the PK ones `U64 NOT NULL` and the rest of the case's type.
+#[test]
+#[allow(clippy::type_complexity)]
+fn reduce_out_key_picks_the_output_key() {
+    use ReduceOutKey::*;
+    use TypeCode as T;
+    // (pk, group, (non-PK type code, nullable), key)
+    let rows: &[(&[u32], &[u32], (TypeCode, bool), ReduceOutKey)] = &[
+        (&[0], &[], (T::U64, false), SyntheticFold),
+        (&[0], &[1], (T::U64, true), SyntheticFold),
+        (&[0], &[1], (T::U64, false), Natural),
+        (&[0], &[1], (T::F64, false), SyntheticFold),
+        (&[0], &[1], (T::String, false), SyntheticFold),
+        (&[0], &[0], (T::String, true), Natural),
+        (&[0, 1], &[0, 1], (T::String, true), Natural),
+        (&[0, 1], &[1, 0], (T::String, true), SyntheticFold),
+        (&[0, 1], &[0], (T::String, true), Natural),
+        (&[0, 1], &[0, 1, 2], (T::U64, false), SyntheticFold),
+        (&[0, 1], &[1, 2], (T::U64, false), SyntheticFold),
+    ];
+    for &(pk, group, (tc, nullable), want) in rows {
+        let cols: Vec<SchemaColumn> = (0..3)
+            .map(|c| match pk.contains(&c) {
+                true => col(T::U64),
+                false => SchemaColumn::new(tc, nullable),
+            })
+            .collect();
+        let schema = SchemaDescriptor::new(&cols, pk);
+        assert_eq!(schema.reduce_out_key(group), want, "{pk:?} {group:?} {tc:?} {nullable}");
+    }
+}
+
+#[test]
+fn output_layout_is_the_key_region_then_the_unspelled_row() {
+    use ReduceOutKey::*;
+    use ReduceOutSlot::{Carried, Key, SyntheticKey};
+    // The fold key spells no input column, so the whole row rides behind it —
+    // group columns included, since the synthetic key is not one of them.
+    assert_eq!(
+        SyntheticFold.output_layout(&[2], 0..4),
+        vec![SyntheticKey, Carried(0), Carried(1), Carried(2), Carried(3)]
+    );
+    // A natural key column is in the PK region, so it is not carried again.
+    assert_eq!(
+        Natural.output_layout(&[2], 0..4),
+        vec![Key(2), Carried(0), Carried(1), Carried(3)]
+    );
+    // The PK list keys on every PK column.
+    assert_eq!(
+        Natural.output_layout(&[0, 2], 0..4),
+        vec![Key(0), Key(2), Carried(1), Carried(3)]
+    );
+    // A fold's row is its group set, a repeated column carried once per occurrence.
+    assert_eq!(
+        SyntheticFold.output_layout(&[1, 1], [1, 1]),
+        vec![SyntheticKey, Carried(1), Carried(1)]
+    );
+}
+
+/// A layout digest moves with the column count, how many columns the PK holds,
+/// a type code and the order of two regions, and not with column numbering.
+#[test]
+fn layout_digest_separates_every_region_axis() {
+    use TypeCode::{String as Str, I64, U64};
+    let digest = |tcs: &[TypeCode], pk: &[u32]| {
+        let cols: Vec<SchemaColumn> = tcs.iter().map(|&tc| col(tc)).collect();
+        SchemaDescriptor::new(&cols, pk).layout_digest()
+    };
+    let base = digest(&[U64, I64], &[0]);
+    assert_ne!(base, digest(&[U64, I64, I64], &[0]), "column count");
+    assert_ne!(base, digest(&[U64], &[0]), "column count");
+    assert_ne!(base, digest(&[U64, I64], &[0, 1]), "PK arity");
+    assert_ne!(base, digest(&[U64, Str], &[0]), "type code");
+    assert_ne!(base, digest(&[I64, U64], &[0]), "region order");
+    assert_eq!(base, digest(&[I64, U64], &[1]), "column numbering");
 }

@@ -3,8 +3,7 @@
 //! and the bundle a plan carries.
 
 use gnitz_core::{FkTarget, InlineUniqueIndex};
-use gnitz_wire::sys_rows::{FkAction, FkRef};
-use gnitz_wire::{PkColList, RelClass, TableDistribution, TypeCode};
+use gnitz_wire::{FkAction, FkRef, PkColList, RelClass, TableDistribution, TypeCode};
 
 use super::*;
 

@@ -26,9 +26,10 @@ use crate::runtime::reactor::{AsyncRwLock, Reactor, WriteGuard};
 use crate::runtime::wire::WireMsg;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
-use gnitz_wire::control::{frame_head_size, peek_control_block, DecodedControl};
-use gnitz_wire::{low_bits_mask, BitIter, WireFault, WireStatus, MAX_WORKERS};
-use gnitz_wire::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
+use gnitz_wire::{
+    frame_head_size, low_bits_mask, peek_control_block, read_u32_le, read_u64_le, write_u32_le, write_u64_le, BitIter,
+    DecodedControl, WireFault, WireStatus, MAX_WORKERS,
+};
 use gnitz_zset::repr::{Batch, WireRows};
 use gnitz_zset::schema::{decode_schema_block, SchemaDescriptor};
 

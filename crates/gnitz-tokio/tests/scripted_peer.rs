@@ -18,9 +18,9 @@ use gnitz_core::{
     BatchAppender, ClientError, GnitzClient, ScanReply, Schema, ZSetBatch, MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
 use gnitz_tokio::{AsyncClient, Connection};
-use gnitz_wire::control::{append_frame, peek_control_block, ControlHeader};
 use gnitz_wire::{
-    frame_len_prefix, ColumnDef, ReadBound, ReadSpec, TypeCode, WireConflictMode, FRAME_LEN_PREFIX_BYTES,
+    append_frame, frame_len_prefix, peek_control_block, ColumnDef, ControlHeader, ReadBound, ReadSpec, TypeCode,
+    WireConflictMode, FRAME_LEN_PREFIX_BYTES,
 };
 use support::{settled, PATIENCE};
 use tokio::runtime::Runtime;

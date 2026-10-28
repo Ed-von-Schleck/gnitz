@@ -322,7 +322,7 @@ fn minmax_view_tick_bench() {
         );
         let mut circuit = Circuit::default();
         let scan = circuit.input_delta(t, ReadBound::None);
-        circuit.reduce_multi(scan, &group, &aggs);
+        circuit.reduce(scan, &group, &aggs);
         let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
         let out = *gnitz_zset::stream::ReducePlan::from_wire(&schema, &group, &aggs, false)
             .unwrap()
@@ -492,7 +492,7 @@ fn segment_view_tick_bench() {
         .output_schema();
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(segment, ReadBound::None);
-    circuit.reduce_multi_local(scan, &[0], &aggs);
+    circuit.reduce_local(scan, &[0], &aggs);
     let mut bb = BatchBuilder::new(crate::catalog::SysFamily::View.schema());
     crate::test_support::push_view_tab_row(&mut bb, 1, segment, "_segment", 0, 0, view);
     crate::test_support::push_view_tab_row(&mut bb, 1, view, "reduced", 0, 0, 0);

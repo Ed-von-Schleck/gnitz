@@ -1,10 +1,4 @@
-//! Canonical UUID text codec — the one format/parse pair every crate uses.
-//!
-//! A UUID is stored as a plain `u128` column value; only its text form is
-//! defined here. `format_uuid` renders the canonical lowercase hyphenated
-//! form; `parse_uuid` accepts exactly the canonical 36-char hyphenated form
-//! (hyphen positions validated) or exactly 32 plain hex digits — nothing
-//! else.
+//! Canonical UUID text: the one format/parse pair. A UUID is stored as a `u128`.
 
 /// Render a UUID value in the canonical lowercase 8-4-4-4-12 hyphenated form.
 pub fn format_uuid(v: u128) -> String {
@@ -22,8 +16,8 @@ pub fn format_uuid(v: u128) -> String {
 /// Parse a UUID string: the canonical 36-char hyphenated form (hyphens at
 /// positions 8/13/18/23, all other chars hex) or exactly 32 plain hex digits.
 /// Surrounding whitespace is trimmed (`str::trim`, so Unicode whitespace
-/// counts). Returns `None` for anything else
-/// — arbitrary hyphen placement and short hex are rejected.
+/// counts). Returns `None` for anything else: arbitrary hyphen placement and
+/// short hex are rejected.
 pub fn parse_uuid(s: &str) -> Option<u128> {
     let s = s.trim();
     let b = s.as_bytes();

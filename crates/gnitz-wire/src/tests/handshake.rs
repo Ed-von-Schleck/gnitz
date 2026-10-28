@@ -46,7 +46,7 @@ fn a_refusing_hello_names_its_release_to_a_client_of_another_version() {
     // The version is the little-endian word at offset 4, read before what follows it.
     let mut other = refusal.clone();
     other[4] ^= 1;
-    let peer = WAL_FORMAT_VERSION ^ 1;
+    let peer = WIRE_VERSION ^ 1;
     let want = HelloError::Version { peer, release: Some(RELEASE.to_string()) };
     assert_eq!(read_server_hello(&other), Err(want));
 

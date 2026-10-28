@@ -233,7 +233,7 @@ impl RangePrologue<'_> {
             AggDescriptor::COUNT_STAR,
         ];
         // [_group_pk:U128, m:Tc, count]
-        let red = cb.reduce_multi_local(keys, &[], &specs);
+        let red = cb.reduce_local(keys, &[], &specs);
         // `m` is never NULL: B's NULL range keys never reached the reduce.
         // `m` is a MIN/MAX of B's range slot.
         let reindex_m = cb.map_reindex(red, &[(1, self.range_tc)], &[], ReindexRole::Auxiliary, NullKeys::Keep);

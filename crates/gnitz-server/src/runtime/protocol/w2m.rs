@@ -29,7 +29,7 @@ use io_uring::types::FutexWaitV;
 use super::park::{futex_waitv_entry, Park};
 use crate::runtime::wire::WireMsg;
 use gnitz_foundation::posix_io;
-use gnitz_wire::control::{peek_control_block, DecodedControl};
+use gnitz_wire::{peek_control_block, DecodedControl};
 
 // ---------------------------------------------------------------------------
 // Geometry

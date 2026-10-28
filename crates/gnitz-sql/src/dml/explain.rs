@@ -8,7 +8,7 @@
 use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, GnitzClient, ScanReply, Schema, ZSetBatch};
-use gnitz_wire::{AggFunc, AggReadSpec, ReadBound, RowsCut, SinkKind};
+use gnitz_wire::{AggFunc, GroupAggs, ReadBound, RowsCut, SinkKind};
 use gnitz_wire::{ColumnDef, TypeCode};
 
 /// Describe `plan` without running it: the EXPLAIN reply. A read of a relation
@@ -160,7 +160,7 @@ fn projection_line(schema: &Schema, unprojected: bool) -> String {
 /// What the worker folds: the PHYSICAL aggregate list, which is why an AVG shows
 /// as its SUM and a count and why the match below is over the *wire*
 /// enum — the one carrying no `Avg`.
-fn fold_line(agg: &AggReadSpec, reduce_schema: &Schema, has_having: bool, is_distinct: bool) -> String {
+fn fold_line(agg: &GroupAggs, reduce_schema: &Schema, has_having: bool, is_distinct: bool) -> String {
     // Named against the reduce input, not the source: with a pre-map the reduce
     // groups and aggregates columns the source does not have, and the hidden
     // `_preN` the pre-map minted for the written expression is the only name one

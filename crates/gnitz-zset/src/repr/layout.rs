@@ -178,5 +178,13 @@ pub(crate) const fn desc_len(file_npc: usize) -> usize {
 /// another name fails to validate.
 pub(crate) fn desc_digest(path: &str, prefix: &[u8]) -> u64 {
     let basename = path.rsplit_once('/').map_or(path, |(_, name)| name);
-    gnitz_wire::digest_with_hole(basename.as_bytes(), prefix, OFF_DESC_CHECKSUM)
+    let mut h = gnitz_wire::ChecksumStream::default();
+    h.update(basename.as_bytes());
+    h.update(&prefix[..OFF_DESC_CHECKSUM]);
+    h.update(&prefix[OFF_DESC_CHECKSUM + 8..]);
+    h.digest()
 }
+
+#[cfg(test)]
+#[path = "tests/layout.rs"]
+mod tests;

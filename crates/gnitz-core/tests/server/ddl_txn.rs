@@ -4,8 +4,7 @@
 
 use super::*;
 use gnitz_core::sys_schema;
-use gnitz_wire::sys_rows::{SchemaTabRow, SysRow};
-use gnitz_wire::{PkColList, SCHEMA_TAB, SEQ_TAB};
+use gnitz_wire::{PkColList, SchemaTabRow, SysRow, SCHEMA_TAB, SEQ_TAB};
 
 /// A SCHEMA_TAB batch registering `(schema_id, name)`.
 fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {

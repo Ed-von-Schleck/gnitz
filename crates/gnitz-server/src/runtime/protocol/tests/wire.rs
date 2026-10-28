@@ -1,6 +1,6 @@
 use crate::runtime::wire::{decode_client_rows, WireMsg};
 use crate::test_support::{make_batch, make_schema_u64_i64, weighted_rows};
-use gnitz_wire::control::peek_control_block;
+use gnitz_wire::peek_control_block;
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::encode_schema_block;
 

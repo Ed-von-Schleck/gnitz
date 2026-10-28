@@ -245,13 +245,13 @@ fn a_view_store_stands_in_for_the_output_trace_of_the_output_node() {
     let cases: [(&str, Stage, bool); 2] = [
         (
             "the output",
-            |c, a| c.reduce_multi_local(a, &[1], &[AggDescriptor::COUNT_STAR]),
+            |c, a| c.reduce_local(a, &[1], &[AggDescriptor::COUNT_STAR]),
             true,
         ),
         (
             "behind a negate",
             |c, a| {
-                let r = c.reduce_multi_local(a, &[1], &[AggDescriptor::COUNT_STAR]);
+                let r = c.reduce_local(a, &[1], &[AggDescriptor::COUNT_STAR]);
                 c.negate(r)
             },
             false,
@@ -392,7 +392,7 @@ fn a_delta_is_relayed_only_where_it_is_not_already_in_place() {
                 let deltas = [7, 9].map(|source| scan_keyed(c, source, &key));
                 c.join(deltas, deltas, JoinKind::Equi);
                 // `scan_keyed` pushed 7's scan first.
-                c.reduce_multi(0, &[0], &[AggDescriptor::COUNT_STAR]);
+                c.reduce(0, &[0], &[AggDescriptor::COUNT_STAR]);
             },
             (3, 0),
         ),
@@ -507,7 +507,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         let (rounds, _) = relays(4, [source; 2], |c| {
             let a = scan(c, 7);
             let tip = mid(c, a);
-            c.reduce_multi(tip, group, &[AggDescriptor::COUNT_STAR]);
+            c.reduce(tip, group, &[AggDescriptor::COUNT_STAR]);
         });
         assert_eq!(rounds == 0, skipped, "{why}");
     }

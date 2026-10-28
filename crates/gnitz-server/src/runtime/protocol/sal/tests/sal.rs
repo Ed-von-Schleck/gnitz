@@ -11,9 +11,8 @@ use crate::runtime::wire::WireMsg;
 use crate::test_support::{
     make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, sweep_bit_flips, weighted_rows,
 };
-use gnitz_wire::control::{peek_control_block, CTRL_HEADER_SIZE};
 use gnitz_wire::wal::WAL_HEADER_SIZE;
-use gnitz_wire::{ClientVerb, TypeCode, WireFlags, WireStatus};
+use gnitz_wire::{peek_control_block, ClientVerb, TypeCode, WireFlags, WireStatus, CTRL_HEADER_SIZE};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{encode_schema_block, SchemaColumn, SchemaDescriptor};
 use std::fs::File;

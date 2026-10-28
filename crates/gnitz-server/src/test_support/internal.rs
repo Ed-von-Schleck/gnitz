@@ -5,11 +5,10 @@
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
 use crate::catalog::{CatalogEngine, DdlBundle, SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
-use gnitz_wire::sys_rows::{
-    CatalogColumn, CircuitRow, FkAction, FkRef, IdxTabRow, SchemaTabRow, SysRow, TableTabRow, ViewTabRow,
+use gnitz_wire::{
+    CatalogColumn, Circuit, CircuitRow, ColTabRow, ColumnDef, FkAction, FkRef, IdxTabRow, SchemaTabRow, SysRow,
+    TableTabRow, TypeCode, ViewTabRow,
 };
-use gnitz_wire::Circuit;
-use gnitz_wire::{ColumnDef, TypeCode};
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
 
 /// A scratch directory for a test that needs a real on-disk tree, wiped at the
@@ -450,7 +449,7 @@ pub fn schema_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
 pub fn col_tab_batch(owner_id: u64, defs: &[CatalogColumn], weight: i64) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Column.schema());
     for (i, cd) in defs.iter().enumerate() {
-        cd.write_col_tab_row(&mut bb, owner_id, i, weight);
+        ColTabRow::of(owner_id, i as u64, &cd.def, cd.fk).write(&mut bb, weight);
     }
     bb.finish()
 }

@@ -121,7 +121,7 @@ fn note(bytes: &[u8], f: impl FnOnce(&mut Mapping, usize)) {
     MAPPING.with_borrow_mut(|m| {
         let Some(m) = m else { return };
         let addr = bytes.as_ptr().addr();
-        if m.root.contains(&addr) || (bytes.is_empty() && addr == m.root.end) {
+        if m.root.contains(&addr) {
             let at = addr - m.root.start;
             f(m, at);
         }

@@ -51,7 +51,7 @@ fn connections_to_one_target_share_a_recording_in_order() {
 fn read_refuses_what_a_replay_could_not_send() {
     assert!(read(b"nonsense").is_err());
     let mut header = MAGIC.to_vec();
-    header.extend_from_slice(&(WAL_FORMAT_VERSION ^ 1).to_le_bytes());
+    header.extend_from_slice(&(WIRE_VERSION ^ 1).to_le_bytes());
     assert!(read(&header).unwrap_err().contains("wire format"));
 
     let mut torn = encode(&[]);

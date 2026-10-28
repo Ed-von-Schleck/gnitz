@@ -3,8 +3,12 @@ use crate::connection::{promise, DeltaCursor, Interest, RelDescriptor, Request, 
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
 use crate::{sys_schema, BatchAppender, PkColumn, PushFamily, RelName, Schema, ViewDefinition, ZSetBatch};
-use gnitz_wire::{ColumnDef, PkBuf, PkKeys, WireConflictMode};
-use gnitz_wire::{WireFault, WireStatus};
+use gnitz_wire::{
+    payload_bytes, payload_u64, Circuit, CircuitRow, ColTabRow, ColTabSlot, ColumnDef, ComputeMap, FkAction, FkRef,
+    IdxTabRow, IdxTabSlot, KeyRange, PkBuf, PkColList, PkKeys, ReadBound, ReadSink, ReadSpec, SchemaTabRow,
+    SchemaTabSlot, SysRow, TableProps, TableTabRow, ViewProps, ViewTabRow, WireConflictMode, WireFault, WireStatus,
+    CIRCUIT_TAB, COL_TAB, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
+};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::{poll_fn, Future};
@@ -15,17 +19,7 @@ use std::task::{ready, Context, Poll, Waker};
 use std::time::Duration;
 
 use gnitz_expr::{LogicalProgram, RowFilter};
-use gnitz_wire::sys_rows::{
-    CircuitRow, ColTabRow, ColTabSlot, FkAction, FkRef, IdxTabRow, IdxTabSlot, SchemaTabRow, SchemaTabSlot, SysRow,
-    TableTabRow, ViewTabRow,
-};
 use gnitz_wire::txn_frame::BLIND;
-use gnitz_wire::{payload_bytes, payload_u64};
-use gnitz_wire::{Circuit, ComputeMap, KeyRange, ReadBound, ReadSink, ReadSpec};
-use gnitz_wire::{
-    PkColList, TableProps, ViewProps, CIRCUIT_TAB, COL_TAB, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB,
-    TABLE_TAB, VIEW_TAB,
-};
 
 /// The absence a catalog lookup by name reports.
 pub fn not_found(noun: &'static str, name: impl std::fmt::Display) -> ClientError {

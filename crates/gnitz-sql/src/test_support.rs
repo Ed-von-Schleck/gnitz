@@ -247,7 +247,7 @@ pub(crate) const EXACT_CASES: &[ExactCase] = {
 /// The exact answer to `x op lit`, `x` an integer a `ty` column stores and `lit`
 /// a numeric literal's text, compared as the rationals they are.
 pub(crate) fn holds_exact(ty: ColType, x: i128, op: CmpOp, lit: &str) -> bool {
-    let (mag, scale) = gnitz_wire::decimal::decimal_of_number_text(lit.trim_start_matches('-')).expect(lit);
+    let (mag, scale) = crate::ast_util::decimal_of_number_text(lit.trim_start_matches('-')).expect(lit);
     let v = if lit.starts_with('-') { -mag } else { mag };
     holds(
         op,

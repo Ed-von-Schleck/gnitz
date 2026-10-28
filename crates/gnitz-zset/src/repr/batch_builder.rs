@@ -13,8 +13,8 @@ pub struct BatchBuilder {
 }
 
 /// The engine half of the shared catalog row codecs: the sink
-/// `gnitz_wire::sys_rows` writes a system-table row into.
-impl gnitz_wire::sys_rows::SysRowSink for BatchBuilder {
+/// a `gnitz_wire` system row writes itself into.
+impl gnitz_wire::SysRowSink for BatchBuilder {
     fn begin_row(&mut self, pk: &[u128], weight: i64) {
         BatchBuilder::begin_row_natives(self, pk, weight);
     }

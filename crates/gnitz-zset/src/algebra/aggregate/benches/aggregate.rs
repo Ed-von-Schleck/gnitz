@@ -3,7 +3,7 @@ use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::mix;
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, TypeCode};
+use gnitz_wire::{AggDescriptor, AggFunc, GroupAggs, TypeCode};
 
 const N: u64 = 1 << 20;
 /// A store's scan chunk.
@@ -16,7 +16,7 @@ const GROUP_CAP: usize = 65_536;
 fn instructions(
     counter: &Counter,
     schema: &SchemaDescriptor,
-    spec: &AggReadSpec,
+    spec: &GroupAggs,
     chunks: &[Batch],
     ranges: &[(usize, usize)],
 ) -> u64 {
@@ -99,7 +99,7 @@ fn adhoc_fold_bench() {
             .collect();
         let group_cols = if groups == 0 { vec![] } else { vec![1] };
         for (name, aggs) in &agg_sets {
-            let spec = AggReadSpec {
+            let spec = GroupAggs {
                 group_cols: group_cols.clone(),
                 aggs: aggs.clone(),
             };
@@ -206,7 +206,7 @@ fn adhoc_fold_shapes_bench() {
                 .collect();
             let group_cols = if groups == 0 { vec![] } else { vec![3] };
             for (name, aggs) in &agg_sets {
-                let spec = AggReadSpec {
+                let spec = GroupAggs {
                     group_cols: group_cols.clone(),
                     aggs: aggs.clone(),
                 };
@@ -264,7 +264,7 @@ fn adhoc_fold_sparse_bench() {
                 b.finish()
             })
             .collect();
-        let spec = AggReadSpec {
+        let spec = GroupAggs {
             group_cols: group_cols.clone(),
             aggs: vec![
                 AggDescriptor::COUNT_STAR,

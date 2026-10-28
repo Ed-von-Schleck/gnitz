@@ -14,12 +14,19 @@
 //!
 //! **A reply fault's `target_id`:** a `DELTA_POLL` fault naming one of its views
 //! ends that position alone; every other fault ends the request.
+//!
+//! **A `DELTA_POLL` reply** is one train per view, ended by a terminal whose
+//! `target_id` is the view, `arg0` the tick of the [`DeltaCursor`] to read from
+//! next and `arg1` its tag. Tick 0 is never sent.
+//!
+//! The module also holds the [`DeltaCursor`] a `DELTA_POLL` item and terminal
+//! carry, and the held-ids blob of a `SYNC_PUSHED` reply ([`encode_held`]).
 
-use crate::control::{
-    append_frame, frame_size, peek_control_block, ControlHeader, DecodedControl, Target, CTRL_HEADER_SIZE,
-};
 use crate::region::Regions;
-use crate::{ClientVerb, Reader, WireFlags, WireStatus};
+use crate::{
+    append_frame, frame_size, peek_control_block, ClientVerb, ControlHeader, DecodedControl, Reader, Target, WireFlags,
+    WireStatus, CTRL_HEADER_SIZE,
+};
 use std::num::NonZeroU64;
 use std::ops::Range;
 
@@ -153,6 +160,19 @@ pub struct ScanItem<'a> {
     pub spec: &'a [u8],
 }
 
+impl<'a> ScanItem<'a> {
+    /// The scan the frame `frame`, peeked as `ctrl`, spells: `target_id` and
+    /// the descriptor token in `arg1` name the relation, `arg0` is the reply
+    /// layout digest, and the blob is the spec.
+    pub fn of(frame: &'a [u8], ctrl: &DecodedControl) -> Self {
+        ScanItem {
+            target: ctrl.hdr.target(),
+            reply_layout: ctrl.hdr.arg0,
+            spec: &frame[ctrl.blob.clone()],
+        }
+    }
+}
+
 /// Encode a `SCAN_MULTI` frame, without the 4-byte frame length prefix.
 pub fn encode_scan_multi(scans: &[ScanItem<'_>]) -> Vec<u8> {
     let items: Vec<FrameItem> = scans
@@ -171,11 +191,7 @@ pub fn encode_scan_multi(scans: &[ScanItem<'_>]) -> Vec<u8> {
 pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<ScanItem<'_>>, String> {
     Ok(decode_items(body, ClientVerb::ScanMulti)?
         .into_iter()
-        .map(|(item, c)| ScanItem {
-            target: c.hdr.target(),
-            reply_layout: c.hdr.arg0,
-            spec: &item[c.blob],
-        })
+        .map(|(item, c)| ScanItem::of(item, &c))
         .collect())
 }
 
@@ -189,7 +205,8 @@ pub struct DeltaCursor {
 }
 
 impl DeltaCursor {
-    /// The cursor a flat `(tag, tick)` pair spells; tick 0 spells none.
+    /// The cursor a flat `(tag, tick)` pair spells; tick 0 spells none. A
+    /// `DELTA_POLL` terminal carries the pair as `(arg1, arg0)`.
     pub fn from_pair(tag: u64, tick: u64) -> Option<DeltaCursor> {
         NonZeroU64::new(tick).map(|tick| DeltaCursor { tag, tick })
     }

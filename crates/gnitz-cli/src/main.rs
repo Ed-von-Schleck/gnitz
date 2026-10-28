@@ -32,7 +32,7 @@ struct Cli {
     data: Option<PathBuf>,
 
     /// The schema unqualified names resolve in.
-    #[arg(short, long, default_value = "public", value_parser = RelName::schema_key)]
+    #[arg(short, long, default_value = gnitz_wire::PUBLIC_SCHEMA, value_parser = RelName::schema_key)]
     schema: String,
 
     /// Run COMMAND (SQL or a meta-command) and exit. Repeatable.

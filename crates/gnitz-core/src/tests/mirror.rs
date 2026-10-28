@@ -17,9 +17,7 @@ use crate::test_support::{
     session_pair, sync_answer, Peer,
 };
 use crate::BlockingHost;
-use gnitz_wire::control::{peek_control_block, ControlHeader};
-use gnitz_wire::RelDescriptorBlob;
-use gnitz_wire::TypeCode;
+use gnitz_wire::{peek_control_block, ControlHeader, RelDescriptorBlob, TypeCode};
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;

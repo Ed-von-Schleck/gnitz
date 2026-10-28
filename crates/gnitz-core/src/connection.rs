@@ -21,11 +21,11 @@ use crate::{
     encode_ddl_txn, encode_frame, encode_push_txn, sys_schema, ClientTransport, ProtocolError, PushFamily, Schema,
     ZSetBatch,
 };
-use gnitz_wire::control::{peek_control_block, ControlHeader, DecodedControl};
 use gnitz_wire::txn_frame::{self, kept_as};
-use gnitz_wire::CONNECT_TIMEOUT;
-use gnitz_wire::{ClientVerb, WireConflictMode, WireLane};
-use gnitz_wire::{RelClass, RelDescriptorBlob, RelIndex};
+use gnitz_wire::{
+    peek_control_block, ClientVerb, ControlHeader, DecodedControl, RelClass, RelDescriptorBlob, RelIndex,
+    WireConflictMode, WireLane, CONNECT_TIMEOUT,
+};
 
 /// Requests one connection may hold in flight; `submit` refuses past it. A bound
 /// on the memory a driver that never waits can pin, not a throughput knob.
@@ -63,7 +63,7 @@ pub struct SnapshotPage {
 pub struct RelDescriptor {
     pub tid: u64,
     pub class: RelClass,
-    /// A stream, or a view whose planner set [`gnitz_wire::sys_rows::ViewTabRow::pk_repeats`].
+    /// A stream, or a view whose planner set [`gnitz_wire::ViewTabRow::pk_repeats`].
     pub pk_repeats: bool,
     /// [`gnitz_wire::TableProps::serial`].
     pub serial: bool,
@@ -75,7 +75,7 @@ pub struct RelDescriptor {
     pub token: u64,
 }
 
-pub use gnitz_wire::control::Target;
+pub use gnitz_wire::Target;
 
 impl From<&RelDescriptor> for Target {
     fn from(rel: &RelDescriptor) -> Self {

@@ -5,8 +5,7 @@
 use crate::ir::BExpr;
 use gnitz_expr::calendar::MICROS_PER_DAY;
 use gnitz_expr::place::{place_ratio, place_scaled, Round};
-use gnitz_wire::decimal::parse_decimal_text;
-use gnitz_wire::{ColType, FixedInt, TypeCode};
+use gnitz_wire::{parse_decimal_text, ColType, FixedInt, TypeCode};
 
 pub(crate) use gnitz_expr::place::{Compared, Placed};
 

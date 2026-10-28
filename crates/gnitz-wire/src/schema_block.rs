@@ -25,9 +25,10 @@ use crate::{ColType, MAX_COLUMNS, MAX_PK_COLUMNS};
 pub struct SchemaBlockCol<'a> {
     pub ty: ColType,
     pub nullable: bool,
-    /// A hidden key slot: a physical schema column (it holds a real PK/routing
-    /// value) that no presentation surface exposes. The PK region, routing, sort
-    /// and consolidation are all blind to it.
+    /// A physical column no name the user writes reaches — a hidden key slot or
+    /// a dropped column. Name resolution, wildcard expansion and client rows
+    /// skip it; to the PK region, routing, sort and consolidation it is an
+    /// ordinary column.
     pub hidden: bool,
     pub name: &'a [u8],
 }

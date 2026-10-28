@@ -171,7 +171,7 @@ pub(super) fn rebase_string_cell(
 ) {
     match heap_at {
         Some(base) => gnitz_wire::shift_german_string_heaps(cell, base),
-        None => relocate_german_string(cell, src, dst_blob, cache),
+        None => relocate_cell(cell, src, dst_blob, cache),
     }
 }
 
@@ -222,7 +222,7 @@ fn relocate_coded_cells(
     }
 }
 
-/// `src_cell` rebased onto `dst_blob`; see [`relocate_german_string`].
+/// `src_cell` rebased onto `dst_blob`; see [`relocate_cell`].
 #[inline]
 pub(crate) fn relocate_german_string_vec(
     src_cell: &[u8],
@@ -233,27 +233,27 @@ pub(crate) fn relocate_german_string_vec(
     let mut cell: [u8; 16] = src_cell[..16]
         .try_into()
         .expect("relocate_german_string_vec: src must be a 16-byte German string cell");
-    relocate_german_string(&mut cell, src, dst_blob, cache);
+    relocate_cell(&mut cell, src, dst_blob, cache);
     cell
 }
 
 /// [`gnitz_wire::relocate_german_string`] in place, copying each source value
 /// once when `cache` is `Some`.
 #[inline]
-fn relocate_german_string(cell: &mut [u8; 16], src: Heap<'_>, dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCache>) {
+fn relocate_cell(cell: &mut [u8; 16], src: Heap<'_>, dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCache>) {
     match src {
         Heap::Plain(blob) => relocate_plain(cell, blob, dst_blob, cache),
         Heap::Coded(_) => relocate_value(cell, src, dst_blob, cache),
     }
 }
 
-/// [`relocate_german_string`] out of the plain heap `src_blob`.
+/// [`relocate_cell`] out of the plain heap `src_blob`.
 #[inline]
 fn relocate_plain(cell: &mut [u8; 16], src_blob: &[u8], dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCache>) {
     *cell = gnitz_wire::relocate_german_string_with(cell, src_blob, |content| place_span(content, dst_blob, cache));
 }
 
-/// [`relocate_german_string`] out of a coded heap, each value decoded into
+/// [`relocate_cell`] out of a coded heap, each value decoded into
 /// `dst_blob`. Out of line: a plain heap's relocation inlines without it.
 #[inline(never)]
 fn relocate_value(cell: &mut [u8; 16], src: Heap<'_>, dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCache>) {

@@ -13,6 +13,11 @@ use gnitz_wire::{push_coded, push_codes, HeapValue, SymbolTable, MAX_SYMBOL_LEN}
 use super::batch::Batch;
 use super::shard_reader::MappedShard;
 
+const _: () = assert!(
+    fsst::ESCAPE_CODE == gnitz_wire::SYMBOL_ESCAPE,
+    "the heap decoder reads the encoder's escape code"
+);
+
 /// Long-value bytes a heap must hold before a table is trained over it: below
 /// four full tables, the table alone takes a quarter of them.
 const MIN_CODED_HEAP: usize = 4 * super::encoding::symbols_head_len(gnitz_wire::MAX_SYMBOLS);

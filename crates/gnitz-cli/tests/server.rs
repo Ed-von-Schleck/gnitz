@@ -148,7 +148,9 @@ fn the_catalog_snapshot_sees_relations_columns_and_indexes() {
     assert_eq!(
         v.props,
         RelProps::View(ViewProps {
-            budget: ViewBudget::from_row(0, 1 << 20).unwrap(),
+            budget: ViewBudget::Fed {
+                delta_bytes: std::num::NonZeroU64::new(1 << 20).unwrap()
+            },
             compress: false
         })
     );

@@ -15,19 +15,10 @@ use crate::schema::key::compare_pk_ordering;
 use crate::schema::payload_order::{Generic, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::{BatchView, ColumnLocator};
-use gnitz_wire::RowSource;
-use gnitz_wire::{read_i64_le, read_u64_le, Heap, TypeCode};
-
-// ── Region indices ──────────────────────────────────────────────────────────
-//
-// Three fixed regions (PK is `pk_stride` bytes/row; weight and null_bmp are
-// 8 bytes/row); payload columns start at `REG_PAYLOAD_START` and continue for
-// `num_payload_cols()` slots. Use these constants instead of bare numeric
-// literals. Owned by `gnitz_wire::region` (the client, the wire codec, and the
-// engine all encode the same convention).
-pub(in crate::repr) use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
-/// Stride (in bytes) of the weight and null_bmp fixed regions.
-pub(in crate::repr) const FIXED_REGION_BYTES: usize = 8;
+use gnitz_wire::{
+    read_i64_le, read_u64_le, Heap, RowSource, TypeCode, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK,
+    REG_WEIGHT,
+};
 
 /// Total rows in a `[start, end)` row-range list — the shape every range-driven
 /// path sizes its destination by.

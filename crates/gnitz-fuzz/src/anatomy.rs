@@ -13,10 +13,11 @@ use std::sync::Arc;
 
 use gnitz_core::{sys_schema, Schema};
 use gnitz_expr::LogicalProgram;
-use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::fields::{self, Field, List, Section};
-use gnitz_wire::wal;
-use gnitz_wire::{txn_frame, Circuit, ClientVerb, ReadSpec, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use gnitz_wire::{
+    peek_control_block, txn_frame, wal, Circuit, ClientVerb, DecodedControl, ReadSpec, REG_NULL_BMP, REG_PAYLOAD_START,
+    REG_PK, REG_WEIGHT,
+};
 
 /// One data block, and the schema its rows decode under.
 #[derive(Clone, Debug)]
@@ -98,7 +99,7 @@ impl Anatomy {
     fn reencode(&self, frame: &[u8], b: usize, cell: usize, content: &[u8]) -> Vec<u8> {
         let block = &self.blocks[b];
         let layout = block.schema.layout();
-        let (rows, fixed, _, _) =
+        let wal::ParsedBlock { rows, fixed, .. } =
             wal::parse_block(&frame[block.range.clone()], layout.row_width()).expect("a block the anatomy read");
         let fixed_at = offset(frame, fixed);
         let mut fixed = fixed.to_vec();
@@ -216,7 +217,9 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
 /// string and what decodes inside one.
 fn walk_block(root: &[u8], block: &[u8], schema: Arc<Schema>, anatomy: &mut Anatomy) {
     let layout = schema.layout();
-    let Some((rows, fixed, heap, _)) = attempt(root, anatomy, || wal::parse_block(block, layout.row_width())) else {
+    let Some(wal::ParsedBlock { rows, fixed, heap, .. }) =
+        attempt(root, anatomy, || wal::parse_block(block, layout.row_width()))
+    else {
         return;
     };
     let fixed_at = offset(root, fixed);

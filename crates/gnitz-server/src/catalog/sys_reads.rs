@@ -2,13 +2,11 @@
 //! rows and the retraction of one, column records, schema and relation names.
 
 use gnitz_store::relation::{Cut, Relation};
-use gnitz_wire::sys_rows::{ColTabRow, SchemaTabRow, SchemaTabSlot};
-use gnitz_wire::{payload_bytes, payload_str, payload_u64};
+use gnitz_wire::{payload_bytes, payload_str, payload_u64, CatalogColumn, ColTabRow, SchemaTabRow, SchemaTabSlot};
 use gnitz_zset::repr::{Batch, ReadCursor, StoredRow};
 
 use super::sys_tables::SysFamily;
 use super::CatalogEngine;
-use gnitz_wire::sys_rows::CatalogColumn;
 
 /// A set of catalog ids, sorted once so every probe is a binary search: the
 /// probes run per row of a client-supplied block bounded only by the frame.
@@ -61,7 +59,7 @@ impl CatalogEngine {
     pub(in crate::catalog) fn read_circuit(&self, id: u64) -> Result<gnitz_wire::Circuit, String> {
         let row = self.live_sys_row(SysFamily::Circuit, id).ok_or("has no circuit row")?;
         let (src, ri) = row.source();
-        let Ok(stored) = gnitz_wire::sys_rows::CircuitRow::read(src, ri);
+        let Ok(stored) = gnitz_wire::CircuitRow::read(src, ri);
         gnitz_wire::Circuit::decode(&stored.circuit)
     }
 

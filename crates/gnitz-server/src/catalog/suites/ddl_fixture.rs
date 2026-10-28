@@ -9,9 +9,7 @@
 
 use super::super::*;
 use crate::test_support::{apply_ddl, col_tab_batch, idx_tab_batch, schema_tab_batch, sys_batch};
-use gnitz_wire::payload_u64;
-use gnitz_wire::sys_rows::{CatalogColumn, IdxTabSlot, TableTabRow};
-use gnitz_wire::validate_user_identifier;
+use gnitz_wire::{payload_u64, validate_user_identifier, CatalogColumn, IdxTabSlot, TableTabRow};
 use gnitz_zset::repr::Batch;
 
 /// Split `schema.name`, defaulting the schema half. Only these direct entry

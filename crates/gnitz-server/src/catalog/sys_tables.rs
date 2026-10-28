@@ -10,10 +10,10 @@ use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use gnitz_store::relation::RelationKind;
-use gnitz_wire::sys_rows::{
-    CatalogColumn, ColTabSlot, IdxTabRow, SchemaTabRow, SysRow, TableTabRow, ViewParts, ViewTabRow,
+use gnitz_wire::{
+    CatalogColumn, ColTabRow, ColTabSlot, IdxTabRow, PkColList, SchemaTabRow, SysRow, TableProps, TableTabRow,
+    ViewParts, ViewTabRow,
 };
-use gnitz_wire::{PkColList, TableProps};
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -369,8 +369,8 @@ impl SysFamily {
             }
             SysFamily::Column => {
                 for family in SysFamily::ALL {
-                    for (i, cd) in family.column_defs().iter().enumerate() {
-                        cd.write_col_tab_row(bb, family.id(), i, 1);
+                    for (i, def) in family.wire().column_defs().enumerate() {
+                        ColTabRow::of(family.id(), i as u64, &def, None).write(bb, 1);
                     }
                 }
             }
@@ -439,9 +439,9 @@ impl SysFamily {
     /// How a guard message names the row at `pk`: a pair-keyed family's two ids
     /// are meaningless rendered as the one number the widened key is.
     pub(in crate::catalog) fn pk_label(self, pk: u128) -> String {
-        let (hi, lo) = gnitz_wire::unpack_pair_pk(pk);
         match self {
-            SysFamily::Column => format!("column {lo} of owner {hi}"),
+            // COL_TAB's key is (owner_id, col_idx).
+            SysFamily::Column => format!("column {} of owner {}", pk as u64, (pk >> 64) as u64),
             _ => format!("{} {pk}", self.row_noun()),
         }
     }

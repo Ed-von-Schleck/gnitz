@@ -403,7 +403,7 @@ fn a_wide_value_in_a_narrow_column_panics() {
 #[cfg(debug_assertions)]
 #[should_panic(expected = "BatchAppender: row got")]
 fn closing_an_under_pushed_row_trips_the_tripwire() {
-    use gnitz_wire::sys_rows::SysRowSink;
+    use gnitz_wire::SysRowSink;
     let schema = Schema::from_parts(
         vec![
             ColumnDef::new("pk", TypeCode::U64, false),

@@ -1,5 +1,5 @@
 use gnitz_store::relation::{IndexClaim, RelationSpec};
-use gnitz_wire::TableDistribution;
+use gnitz_wire::{IdxTabRow, TableDistribution, ViewParts};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
 use std::rc::Rc;
@@ -11,7 +11,6 @@ use super::sys_tables::{
     build_schema_from_col_defs, encode_record, pk_signatures, read_rel_row, PkShape, RelDetail, RelRow, SysFamily,
 };
 use super::CatalogEngine;
-use gnitz_wire::sys_rows::{IdxTabRow, ViewParts};
 
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------

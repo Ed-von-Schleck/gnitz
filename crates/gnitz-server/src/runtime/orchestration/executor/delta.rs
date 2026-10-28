@@ -21,9 +21,8 @@ use super::{
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, PeerGone, ReadGuard, SendBody, TrainLease};
 use crate::runtime::wire as ipc;
-use gnitz_wire::control::{ControlHeader, Target};
 use gnitz_wire::txn_frame::{decode_delta_items, delta_poll_kept, DeltaPollItem};
-use gnitz_wire::{WireFault, WireStatus};
+use gnitz_wire::{ControlHeader, Target, WireFault, WireStatus};
 
 /// Delta reads at one SAL cut: the ceiling on the leases and trains a
 /// DELTA_POLL or a pump pass puts on the master at a time.

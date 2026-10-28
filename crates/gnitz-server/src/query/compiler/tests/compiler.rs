@@ -55,12 +55,12 @@ fn aggs(op: AggFunc) -> [AggDescriptor; 2] {
     [AggDescriptor { agg_op: op, col_idx: 1 }, AggDescriptor::COUNT_STAR]
 }
 
-const SUM: Stage = |c, a| c.reduce_multi(a, &[], &aggs(AggFunc::Sum));
-const MIN: Stage = |c, a| c.reduce_multi(a, &[], &aggs(AggFunc::Min));
+const SUM: Stage = |c, a| c.reduce(a, &[], &aggs(AggFunc::Sum));
+const MIN: Stage = |c, a| c.reduce(a, &[], &aggs(AggFunc::Min));
 const TOP_N: Stage = |c, a| c.top_n(a, &[], &BY_COL1, 10, 5);
 const WINDOW: Stage = |c, a| c.window(a, &[], &BY_COL1, &[], (true, false));
 /// A reduce of each worker's slice: no exchange in front of it.
-const LOCAL_SUM: Stage = |c, a| c.reduce_multi_local(a, &[], &aggs(AggFunc::Sum));
+const LOCAL_SUM: Stage = |c, a| c.reduce_local(a, &[], &aggs(AggFunc::Sum));
 
 /// `build` over a scan of 10, compiled as worker `slot` into the view its
 /// unsplit, one-worker plan outputs: a split plan must write that layout too.

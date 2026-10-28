@@ -8,6 +8,9 @@
 //! All PK columns are fixed-width integer scalars (floats/strings/blobs are
 //! rejected at DDL), so the transform is a fixed-width bijection: unsigned types
 //! map to big-endian, signed types map to big-endian with the sign bit flipped.
+//!
+//! The owned key forms live here too: [`PkBuf`], one key, and [`PkKeys`], a
+//! strictly ascending list of keys of one stride.
 
 use crate::TypeCode;
 
@@ -28,7 +31,7 @@ pub fn store_opk(dst: &mut [u8], v: u128, flip: bool) {
         4 => store!(u32),
         2 => store!(u16),
         1 => store!(u8),
-        _ => unreachable!("PK column width is 1/2/4/8/16"),
+        other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
     }
 }
 
@@ -48,7 +51,7 @@ pub fn push_opk(buf: &mut Vec<u8>, width: usize, v: u128, flip: bool) {
         4 => push!(4),
         2 => push!(2),
         1 => push!(1),
-        _ => unreachable!("PK column width is 1/2/4/8/16"),
+        other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
     }
 }
 
@@ -214,6 +217,135 @@ pub fn widen_pk_be(pk_bytes: &[u8]) -> u128 {
     }
 }
 
+/// OPK keys of one stride, strictly ascending — the order a forward gather
+/// sweeps. Any number of keys: the request frame is the only bound on a list.
+/// Fields private: every constructor sorts and dedups, or validates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PkKeys {
+    stride: u8,
+    bytes: Vec<u8>,
+}
+
+impl PkKeys {
+    /// Sort and dedup `keys`, each exactly `stride` bytes.
+    pub fn from_keys<'a>(stride: usize, keys: impl IntoIterator<Item = &'a [u8]>) -> Self {
+        assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
+        let keys = keys
+            .into_iter()
+            .inspect(|k| assert_eq!(k.len(), stride, "PkKeys: key width"));
+        if stride <= NARROW_PK_MAX_BYTES {
+            return Self::from_images(stride, keys.map(widen_pk_be));
+        }
+        if stride <= 2 * NARROW_PK_MAX_BYTES {
+            // Two words, the second right-aligned: equal-width keys order as
+            // the pair does, and the sort moves no pointer into the keys.
+            let mut ks: Vec<[u128; 2]> = keys
+                .map(|k| {
+                    let (hi, lo) = k.split_at(NARROW_PK_MAX_BYTES);
+                    [widen_pk_be(hi), widen_pk_be(lo)]
+                })
+                .collect();
+            ks.sort_unstable();
+            ks.dedup();
+            let mut bytes = Vec::with_capacity(ks.len() * stride);
+            for [hi, lo] in ks {
+                bytes.extend_from_slice(&hi.to_be_bytes());
+                bytes.extend_from_slice(&lo.to_be_bytes()[2 * NARROW_PK_MAX_BYTES - stride..]);
+            }
+            return PkKeys { stride: stride as u8, bytes };
+        }
+        let mut ks: Vec<&[u8]> = keys.collect();
+        ks.sort_unstable();
+        ks.dedup();
+        PkKeys { stride: stride as u8, bytes: ks.concat() }
+    }
+
+    /// Sort and dedup key images, each stored as its low `stride` bytes
+    /// big-endian. An image orders as those bytes do; the `u64` arm is the
+    /// narrower sort for keys of at most 8 bytes.
+    pub fn from_images(stride: usize, images: impl IntoIterator<Item = u128>) -> Self {
+        assert!((1..=NARROW_PK_MAX_BYTES).contains(&stride), "PkKeys: stride {stride}");
+        let mut bytes = Vec::new();
+        if stride <= 8 {
+            let mut imgs: Vec<u64> = images.into_iter().map(|v| v as u64).collect();
+            imgs.sort_unstable();
+            imgs.dedup();
+            bytes.reserve(imgs.len() * stride);
+            imgs.iter()
+                .for_each(|v| bytes.extend_from_slice(&v.to_be_bytes()[8 - stride..]));
+        } else {
+            let mut imgs: Vec<u128> = images.into_iter().collect();
+            imgs.sort_unstable();
+            imgs.dedup();
+            bytes.reserve(imgs.len() * stride);
+            imgs.iter()
+                .for_each(|v| bytes.extend_from_slice(&v.to_be_bytes()[16 - stride..]));
+        }
+        PkKeys { stride: stride as u8, bytes }
+    }
+
+    /// Keys of `stride` already concatenated in strictly ascending order.
+    pub fn from_sorted(stride: usize, bytes: Vec<u8>) -> Self {
+        assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
+        assert_eq!(bytes.len() % stride, 0, "PkKeys: key width");
+        Self::checked(stride, bytes).expect("PkKeys")
+    }
+
+    /// [`Self::from_sorted`] for keys off the wire: `Err` where they do not
+    /// strictly ascend.
+    pub(crate) fn checked(stride: usize, bytes: Vec<u8>) -> Result<Self, String> {
+        match strictly_ascending(&bytes, stride) {
+            true => Ok(PkKeys { stride: stride as u8, bytes }),
+            false => Err("keys are not strictly ascending".to_string()),
+        }
+    }
+
+    pub fn stride(&self) -> usize {
+        self.stride as usize
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len() / self.stride()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn iter(&self) -> std::slice::ChunksExact<'_, u8> {
+        self.bytes.chunks_exact(self.stride())
+    }
+
+    /// Keep only the keys `keep` admits. A subsequence of an ascending list
+    /// ascends, so nothing is re-checked.
+    pub fn retain(&mut self, mut keep: impl FnMut(&[u8]) -> bool) {
+        let stride = self.stride();
+        let mut kept = 0;
+        for at in (0..self.bytes.len()).step_by(stride) {
+            if keep(&self.bytes[at..at + stride]) {
+                self.bytes.copy_within(at..at + stride, kept);
+                kept += stride;
+            }
+        }
+        self.bytes.truncate(kept);
+    }
+
+    /// The first and last key, or `None` for an empty list.
+    pub fn bounds(&self) -> Option<(&[u8], &[u8])> {
+        let first = self.iter().next()?;
+        Some((first, &self.bytes[self.bytes.len() - self.stride()..]))
+    }
+}
+
+/// Whether `bytes`, read as keys of `stride`, strictly ascend.
+pub(crate) fn strictly_ascending(bytes: &[u8], stride: usize) -> bool {
+    bytes.chunks_exact(stride).is_sorted_by(|a, b| a < b)
+}
+
 /// Decode one OPK cell to `i64`, widened as [`crate::types::FixedInt`] defines.
 ///
 /// Spelled with byte-array literals, which at `-O0` spares a per-row caller an
@@ -257,13 +389,19 @@ pub fn int_cell<const OPK: bool>(fi: crate::FixedInt, cell: &[u8]) -> i64 {
 // Width-tagged PK byte buffer
 // ---------------------------------------------------------------------------
 
+/// Maximum byte width of a PK region per row. Product of `MAX_PK_COLUMNS`
+/// and the per-column ceiling (16 == max wire stride of any type valid as a
+/// PK column — U128, UUID, I128; STRING and BLOB are rejected by schema
+/// validation). Auto-tracks growth of `MAX_PK_COLUMNS`.
+pub const MAX_PK_BYTES: usize = crate::MAX_PK_COLUMNS * 16;
+
 /// An OPK key of up to `MAX_PK_BYTES` bytes, held by the engine's key encoders and
 /// the client's row-identity maps alike. `bytes[..len]` is the key and the tail past
 /// it is zero: every constructor starts from a zeroed array and no method shortens a
 /// key, which is what [`Self::widened`] reads.
 #[derive(Clone, Copy)]
 pub struct PkBuf {
-    bytes: [u8; crate::MAX_PK_BYTES],
+    bytes: [u8; MAX_PK_BYTES],
     len: u8,
 }
 
@@ -274,10 +412,8 @@ impl std::fmt::Debug for PkBuf {
     }
 }
 
-// Eq/Hash/Ord all read `bytes[..len]` and nothing else — no width prefix, which
-// the `Borrow<[u8]>` impl below requires and which keeps a `HashSet<PkBuf>`
-// touching `pk_stride` bytes per key. The order is byte-lexicographic, the same
-// `memcmp` order OPK regions are merged and seeked in.
+// Eq/Hash/Ord read `bytes[..len]` and nothing else, so they agree with `<[u8]>`'s,
+// as the `Borrow<[u8]>` impl below requires.
 impl PartialEq for PkBuf {
     fn eq(&self, other: &Self) -> bool {
         self.pk_bytes() == other.pk_bytes()
@@ -314,9 +450,9 @@ impl PkBuf {
     /// All-zero key of the given width — the empty-shard / placeholder form.
     #[inline(always)] // per-row across the crate boundary; dev builds inline nothing else
     pub fn zeroed(len: usize) -> Self {
-        debug_assert!(len <= crate::MAX_PK_BYTES);
+        debug_assert!(len <= MAX_PK_BYTES);
         PkBuf {
-            bytes: [0u8; crate::MAX_PK_BYTES],
+            bytes: [0u8; MAX_PK_BYTES],
             len: len as u8,
         }
     }
@@ -337,12 +473,12 @@ impl PkBuf {
         // Hard, not debug-only: `slice` is an externally-controlled length on the
         // client's decode paths, and the cast below would truncate a length >= 256.
         assert!(
-            slice.len() <= crate::MAX_PK_BYTES,
+            slice.len() <= MAX_PK_BYTES,
             "PkBuf::from_bytes: length {} exceeds MAX_PK_BYTES {}",
             slice.len(),
-            crate::MAX_PK_BYTES,
+            MAX_PK_BYTES,
         );
-        let mut bytes = [0u8; crate::MAX_PK_BYTES];
+        let mut bytes = [0u8; MAX_PK_BYTES];
         bytes[..slice.len()].copy_from_slice(slice);
         PkBuf { bytes, len: slice.len() as u8 }
     }
@@ -372,7 +508,7 @@ impl PkBuf {
     #[inline]
     pub fn widened(mut self, width: usize) -> Self {
         assert!(
-            self.len as usize <= width && width <= crate::MAX_PK_BYTES,
+            self.len as usize <= width && width <= MAX_PK_BYTES,
             "PkBuf::widened: width outside len..=MAX_PK_BYTES"
         );
         self.len = width as u8;
@@ -383,3 +519,7 @@ impl PkBuf {
 #[cfg(test)]
 #[path = "tests/pk.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/pk.rs"]
+mod bench;

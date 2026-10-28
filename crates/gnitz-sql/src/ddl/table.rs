@@ -11,9 +11,7 @@ use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
 use crate::types::column_def;
 use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema, TableDef};
-use gnitz_wire::sys_rows::{FkAction, FkRef};
-use gnitz_wire::TableDistribution;
-use gnitz_wire::{ColType, ColumnDef, PkColList, PkListRole, TableProps};
+use gnitz_wire::{ColType, ColumnDef, FkAction, FkRef, PkColList, PkListRole, TableDistribution, TableProps};
 use sqlparser::ast::{
     ColumnOption, CreateTableOptions, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
     UniqueConstraint, WrappedCollection,

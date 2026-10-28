@@ -11,7 +11,8 @@ use proptest::prelude::*;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{arb_ticks, assert_folds, cell, delta_to, le_cell, TestTrace, FLOATS, STRS};
-use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, ReadSink, ReduceOutKey, SinkKind, TypeCode};
+use gnitz_expr::ReduceOutKey;
+use gnitz_wire::{AggDescriptor, AggFunc, GroupAggs, ReadSink, SinkKind, TypeCode};
 
 use super::op_reduce::op_reduce;
 use super::plan::ReducePlan;
@@ -37,7 +38,7 @@ fn schema() -> SchemaDescriptor {
 
 /// The ad-hoc fold of `aggs` by `group_cols` over [`schema`], as a read's sink.
 fn fold_sink(group_cols: &[u32], aggs: Vec<AggDescriptor>, group_cap: usize) -> Result<SinkPlan, String> {
-    let spec = AggReadSpec { group_cols: group_cols.to_vec(), aggs };
+    let spec = GroupAggs { group_cols: group_cols.to_vec(), aggs };
     let sink = ReadSink { map: None, kind: SinkKind::Fold(spec) };
     SinkPlan::from_wire(&schema(), &sink, group_cap)
 }

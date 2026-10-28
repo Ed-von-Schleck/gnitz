@@ -67,17 +67,6 @@ pub fn shift_german_string_heaps(cells: &mut [u8], delta: usize) {
     }
 }
 
-/// `[heap_offset, heap_offset + length)` if it lies inside a heap of `blob_len`
-/// bytes, checked in `u64` before any narrowing.
-#[inline]
-fn blob_extent(blob_len: usize, heap_offset: u64, length: usize) -> Option<std::ops::Range<usize>> {
-    let end = heap_offset.checked_add(length as u64)?;
-    if end > blob_len as u64 {
-        return None;
-    }
-    Some(heap_offset as usize..end as usize)
-}
-
 /// A short cell's content, borrowed from the cell; `None` for a long cell.
 #[inline(always)]
 pub fn german_string_inline(cell: &[u8]) -> Option<&[u8]> {
@@ -96,7 +85,7 @@ pub fn german_string_heap(cell: &[u8], blob_len: usize) -> Option<std::ops::Rang
     let None = german_string_inline(cell) else {
         return None;
     };
-    blob_extent(blob_len, read_u64_le(cell, 8), read_u32_le(cell, 0) as usize)
+    crate::heap::plain_extent(blob_len, read_u64_le(cell, 8), read_u32_le(cell, 0) as usize)
 }
 
 /// True iff `cell` is in **canonical form** against `blob` — i.e. a cell
@@ -150,9 +139,9 @@ pub fn relocate_german_string_with(cell: &[u8; 16], src_blob: &[u8], place: impl
     out
 }
 
-/// [`relocate_german_string_with`] over any heap: a long cell points at the
-/// offset `place` returns for its value. A long cell `heap` does not hold
-/// becomes the empty string, as [`german_string_bytes`] reads it.
+/// `cell`, re-homed from `heap`: a short cell with its pad zeroed, a long one
+/// pointing at the offset `place` returns for its value; a long cell `heap` does
+/// not hold becomes the empty string, as [`german_string_bytes`] reads it.
 #[inline]
 pub fn relocate_german_value_with(
     cell: &[u8; 16],

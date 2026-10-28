@@ -21,8 +21,7 @@ use crate::runtime::reactor::WriteGuard;
 use crate::runtime::sal::Read;
 use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
-use gnitz_wire::control::{DecodedControl, Target};
-use gnitz_wire::{ClientVerb, PkColList, WireFault};
+use gnitz_wire::{ClientVerb, DecodedControl, PkColList, Target, WireFault};
 use gnitz_zset::repr::Batch;
 
 /// `GNITZ_INJECT_TICK_HOLD_FOR_DDL`: see `hold_tick_for_ddl`.

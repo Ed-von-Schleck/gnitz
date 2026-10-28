@@ -3,10 +3,10 @@
 use std::borrow::Cow;
 
 use gnitz_store::relation::{IndexClaim, RelationKind};
-use gnitz_wire::sys_rows::FkRef;
-use gnitz_wire::sys_rows::{CatalogColumn, ColTabRow, IdxTabRow, IdxTabSlot, SchemaTabRow, ViewParts};
-use gnitz_wire::{low_bits_mask, validate_user_identifier, BitIter, TableProps};
-use gnitz_wire::{payload_bytes, RowSource};
+use gnitz_wire::{
+    low_bits_mask, payload_bytes, validate_user_identifier, BitIter, CatalogColumn, ColTabRow, ColType, FixedInt,
+    FkRef, IdxTabRow, IdxTabSlot, RowSource, SchemaTabRow, TableProps, ViewParts,
+};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{key::KeySpec, SchemaDescriptor};
 use rustc_hash::FxHashSet;
@@ -17,6 +17,16 @@ use super::sys_tables::{
     SysFamily, SYSTEM_SCHEMA_ID,
 };
 use super::CatalogEngine;
+
+/// The type rule on a SERIAL table's PK columns, given as `(name, type)`.
+fn validate_serial_key<'a>(pk: impl IntoIterator<Item = (&'a str, ColType)>) -> Result<(), String> {
+    match pk.into_iter().find(|(_, ty)| FixedInt::exact(ty.tc).is_none()) {
+        Some((name, ty)) => Err(format!(
+            "SERIAL primary key column '{name}' is {ty}; SERIAL needs an integer of at most 8 bytes"
+        )),
+        None => Ok(()),
+    }
+}
 
 /// The name rule a catalog row must satisfy to be stored: a chain segment's
 /// name (`segment`) is `_` then `[A-Za-z0-9_]`, every other name a user
@@ -636,7 +646,7 @@ impl CatalogEngine {
                 RelDetail::Table(TableProps { serial, .. }) => {
                     if serial {
                         let pk_cols = rel.pk.as_slice().iter().map(|&c| &col_defs[c as usize]);
-                        gnitz_wire::validate_serial_key(pk_cols.map(|cd| (cd.def.name.as_str(), cd.def.ty)))
+                        validate_serial_key(pk_cols.map(|cd| (cd.def.name.as_str(), cd.def.ty)))
                             .map_err(|e| format!("{rel}: {e}"))?;
                     }
                     for cd in &col_defs {

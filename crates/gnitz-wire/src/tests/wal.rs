@@ -36,7 +36,12 @@ fn a_block_round_trips_through_both_framers() {
         assert_eq!(appended[1..], buf, "dead={dead}");
         assert_eq!(
             parse_block(&buf, ROW_WIDTH),
-            Ok((ROWS, &fixed_regions.concat()[..], *heap, dead)),
+            Ok(ParsedBlock {
+                rows: ROWS,
+                fixed: &fixed_regions.concat(),
+                heap,
+                heap_dead: dead
+            }),
             "dead={dead}"
         );
     }
@@ -55,7 +60,7 @@ fn a_block_round_trips_through_both_framers() {
     two.extend_from_slice(&encode_dead(&regions, 0));
     for off in [0, end1] {
         let block = block_slice(&two[off..]).expect("a framed block");
-        assert_eq!(parse_block(block, ROW_WIDTH).unwrap().0, ROWS);
+        assert_eq!(parse_block(block, ROW_WIDTH).unwrap().rows, ROWS);
     }
 }
 
@@ -127,7 +132,7 @@ fn each_guard_rejects_its_forgery() {
 
 /// The block layout, byte for byte: what a change to the header's words, a
 /// German cell's fields, the OPK byte order or a region's place would move
-/// without moving [`WAL_FORMAT_VERSION`].
+/// without moving [`WIRE_VERSION`].
 #[test]
 fn the_block_layout_is_pinned_byte_for_byte() {
     // A compound (I16, U8) PK, an I32 column and a STRING column.
@@ -153,7 +158,7 @@ fn the_block_layout_is_pinned_byte_for_byte() {
     ];
     let block = encode_dead(&regions, 0);
 
-    let version = WAL_FORMAT_VERSION.to_le_bytes();
+    let version = WIRE_VERSION.to_le_bytes();
     #[rustfmt::skip]
     let want: &[u8] = &[
         // Header: SIZE, VERSION, ROWS, HEAP_LEN, HEAP_DEAD, each u32 LE.
@@ -176,6 +181,10 @@ fn the_block_layout_is_pinned_byte_for_byte() {
         2, 0, 0, 0, b'a', b'b', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         LONG.len() as u8, 0, 0, 0, b'a', b' ', b'v', b'a', 0, 0, 0, 0, 0, 0, 0, 0,
     ];
-    assert_eq!(block, [want, LONG].concat(), "the block layout moved: bump `WAL_EPOCH`");
-    assert_eq!(parse_block(&block, ROW).map(|(rows, ..)| rows), Ok(2));
+    assert_eq!(
+        block,
+        [want, LONG].concat(),
+        "the block layout moved: bump `WIRE_EPOCH`"
+    );
+    assert_eq!(parse_block(&block, ROW).map(|b| b.rows), Ok(2));
 }

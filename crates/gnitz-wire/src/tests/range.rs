@@ -63,7 +63,7 @@ fn decode_rejects_malformed() {
         let err = dec(&bad).unwrap_err();
         assert!(err.contains("leave no range column"), "{err}");
     }
-    // The column list's own rules are `PkColList::unpack`'s; one shows the
+    // The column list's own rules are `PkColList`'s; one shows the
     // decode routes the word through it.
     let mut untagged = good.clone();
     untagged[..8].copy_from_slice(&1u64.to_le_bytes());

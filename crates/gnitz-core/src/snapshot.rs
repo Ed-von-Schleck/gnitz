@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gnitz_wire::snapshot::PageRequest;
-use gnitz_wire::sys_rows::SeqTabRow;
+use gnitz_wire::SeqTabRow;
 
 use crate::catalog::CATALOG_FAMILIES;
 use crate::connection::SnapshotPage;

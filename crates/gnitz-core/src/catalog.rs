@@ -1,5 +1,5 @@
 //! The catalog as a client reads it: the system families at one cut, each row
-//! decoded by the `gnitz_wire::sys_rows` reader the engine decodes it with.
+//! decoded by the `gnitz_wire` row reader the engine decodes it with.
 //!
 //! A chain segment is not a relation here. It is part of the user view that owns
 //! it: the relations a view [`reads`](CatalogRelation::reads) are those its whole
@@ -8,10 +8,10 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use gnitz_wire::sys_rows::{
-    CatalogColumn, CircuitRow, ColTabRow, FkRef, IdxTabRow, SchemaTabRow, TableTabRow, ViewParts, ViewTabRow,
+use gnitz_wire::{
+    qualified_key, CatalogColumn, Circuit, CircuitRow, ColTabRow, ColumnDef, FkRef, IdxTabRow, PkColList, RelClass,
+    SchemaTabRow, TableProps, TableTabRow, ViewParts, ViewProps, ViewTabRow, SYSTEM_SCHEMA,
 };
-use gnitz_wire::{qualified_key, Circuit, ColumnDef, PkColList, RelClass, TableProps, ViewProps, SYSTEM_SCHEMA};
 
 use crate::{ProtocolError, RelName, ViewDefinition, ZSetBatch};
 

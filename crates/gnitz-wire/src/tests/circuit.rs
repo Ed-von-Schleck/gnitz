@@ -10,20 +10,18 @@ fn sample(op: Opcode) -> OpNode {
         Opcode::Filter => OpNode::Filter(vec![1, 2, 3, 4]),
         Opcode::Negate => OpNode::Negate,
         Opcode::Union => OpNode::Union,
-        Opcode::JoinEqui => OpNode::Join { kind: JoinKind::Equi },
-        Opcode::JoinRange => OpNode::Join {
-            kind: JoinKind::Range { rel: RangeRel::Le },
-        },
-        Opcode::JoinCross => OpNode::Join { kind: JoinKind::Cross },
+        Opcode::JoinEqui => OpNode::Join(JoinKind::Equi),
+        Opcode::JoinRange => OpNode::Join(JoinKind::Range { rel: RangeRel::Le }),
+        Opcode::JoinCross => OpNode::Join(JoinKind::Cross),
         // Every aggregate, at a distinct source column.
-        Opcode::Reduce => OpNode::Reduce {
+        Opcode::Reduce => OpNode::Reduce(GroupAggs {
             group_cols: vec![2, 7],
-            agg: AggFunc::ALL
+            aggs: AggFunc::ALL
                 .iter()
                 .enumerate()
                 .map(|(i, &agg_op)| AggDescriptor { agg_op, col_idx: i as u32 })
                 .collect(),
-        },
+        }),
         Opcode::Distinct => OpNode::WeightClamp(ClampKind::Distinct),
         // A non-ascending index column list: `PkColList`'s `PartialEq` spans the
         // whole backing array, so a reordered list fails the round-trip.
@@ -135,10 +133,10 @@ fn every_op_node_variant_roundtrips() {
         OpNode::Map(MapKind::Compute(ComputeMap { program: vec![9, 9], out_cols: vec![] })),
         // A hash-row target's domain is the copy kernel's, not this decode's.
         OpNode::Map(MapKind::HashRow { cols: vec![(3, TypeCode::U128)] }),
-        OpNode::Reduce {
+        OpNode::Reduce(GroupAggs {
             group_cols: vec![],
-            agg: vec![AggDescriptor::COUNT_STAR],
-        },
+            aggs: vec![AggDescriptor::COUNT_STAR],
+        }),
         // The global shape: no group, one key, no offset — and a zero limit,
         // which frames fine: refusing it is the top-N kernel's.
         OpNode::TopN {
@@ -165,9 +163,9 @@ fn every_op_node_variant_roundtrips() {
     // Every join kind on either side, and every relation the range kind can carry
     // — `Join`'s own sample can only be one of them. Same for the null-extend's
     // two placements.
-    nodes.push(OpNode::Join { kind: JoinKind::Cross });
+    nodes.push(OpNode::Join(JoinKind::Cross));
     for &rel in RangeRel::ALL {
-        nodes.push(OpNode::Join { kind: JoinKind::Range { rel } });
+        nodes.push(OpNode::Join(JoinKind::Range { rel }));
     }
     for nulls_first in [false, true] {
         nodes.push(OpNode::NullExtend {
@@ -239,10 +237,10 @@ fn each_decode_guard_rejects_its_own_forgery() {
         nulls_first: false,
     };
     // tag 0 | group count 1..3 | agg count 3..5 | func 5
-    let reduce = OpNode::Reduce {
+    let reduce = OpNode::Reduce(GroupAggs {
         group_cols: vec![],
-        agg: vec![AggDescriptor::COUNT_STAR],
-    };
+        aggs: vec![AggDescriptor::COUNT_STAR],
+    });
     let cases = [
         (poke(&aux, 1, outside(NullKeys::from_wire)), "unknown NullKeys"),
         (poke(&aux, 8, 0), "unknown TypeCode 0"),
@@ -267,7 +265,10 @@ fn each_decode_guard_rejects_its_own_forgery() {
         ),
         // tag 0 | source 1..9 | bound tag 9. A malformed backfill hint is catalog
         // corruption, not a wider scan.
-        (poke(&scan(3), 9, 9), "unknown bound kind"),
+        (
+            poke(&scan(3), 9, outside(crate::BoundTag::from_wire)),
+            "unknown BoundTag",
+        ),
         // A circuit's output is its last node, so one of no nodes has none.
         (Circuit::default().encode(), "a circuit has no nodes"),
         // A cell holds at least its node count.
@@ -314,10 +315,10 @@ fn push_refuses_a_malformed_operator_built_or_decoded() {
     let scatter = |source_cols| ReindexRole::ScatterKey { source_cols };
     let forward = "a node's input is not an earlier node";
     let arity = "node's inputs do not match its operator's arity";
-    let reduce = OpNode::Reduce {
+    let reduce = OpNode::Reduce(GroupAggs {
         group_cols: vec![0],
-        agg: vec![AggDescriptor::COUNT_STAR],
-    };
+        aggs: vec![AggDescriptor::COUNT_STAR],
+    });
     let cases: [(OpNode, &[NodeId], &str); 7] = [
         (
             reindex(ReindexRole::Auxiliary, vec![]),
@@ -356,65 +357,6 @@ fn push_refuses_a_malformed_operator_built_or_decoded() {
     let input = c.push(scan(7), &[]).unwrap();
     assert_eq!(c.push(OpNode::Negate, &[input]), Ok(1));
     assert_eq!(c.inputs(1), [input]);
-}
-
-/// The reduce output key: the source PK list keys on itself, and so does a
-/// single NOT NULL PK-eligible column (eligibility is `TypeCode::is_pk_eligible`'s,
-/// swept there); anything else — no column, a nullable, float or string column,
-/// a partial, reordered or wider set — folds into a synthetic key.
-#[test]
-#[allow(clippy::type_complexity)]
-fn for_group_cols_picks_the_output_key() {
-    use crate::TypeCode as T;
-    use ReduceOutKey::*;
-    // (pk, group, (type code, nullable), key)
-    let rows: &[(&[u32], &[u32], (TypeCode, bool), ReduceOutKey)] = &[
-        (&[0], &[], (T::U64, false), SyntheticFold),
-        (&[0], &[1], (T::U64, true), SyntheticFold),
-        (&[0], &[1], (T::U64, false), Natural),
-        (&[0], &[1], (T::F64, false), SyntheticFold),
-        (&[0], &[1], (T::String, false), SyntheticFold),
-        (&[0], &[0], (T::I64, false), Natural),
-        (&[0, 1], &[0, 1], (T::I64, false), Natural),
-        (&[0, 1], &[1, 0], (T::I64, false), SyntheticFold),
-        (&[0, 1], &[0], (T::U64, false), Natural),
-        (&[0, 1], &[0, 1, 2], (T::U64, false), SyntheticFold),
-        (&[0, 1], &[1, 2], (T::U64, false), SyntheticFold),
-    ];
-    for (pk, group, col, want) in rows {
-        assert_eq!(
-            ReduceOutKey::for_group_cols(pk, group, |_| *col),
-            *want,
-            "{pk:?} {group:?} {col:?}"
-        );
-    }
-}
-
-#[test]
-fn output_layout_is_the_key_region_then_the_unspelled_row() {
-    use ReduceOutKey::*;
-    use ReduceOutSlot::{Carried, Key, SyntheticKey};
-    // The fold key spells no input column, so the whole row rides behind it —
-    // group columns included, since the synthetic key is not one of them.
-    assert_eq!(
-        SyntheticFold.output_layout(&[2], 0..4),
-        vec![SyntheticKey, Carried(0), Carried(1), Carried(2), Carried(3)]
-    );
-    // A natural key column is in the PK region, so it is not carried again.
-    assert_eq!(
-        Natural.output_layout(&[2], 0..4),
-        vec![Key(2), Carried(0), Carried(1), Carried(3)]
-    );
-    // The PK list keys on every PK column.
-    assert_eq!(
-        Natural.output_layout(&[0, 2], 0..4),
-        vec![Key(0), Key(2), Carried(1), Carried(3)]
-    );
-    // A fold's row is its group set, a repeated column carried once per occurrence.
-    assert_eq!(
-        SyntheticFold.output_layout(&[1, 1], [1, 1]),
-        vec![SyntheticKey, Carried(1), Carried(1)]
-    );
 }
 
 /// Each relation's two predicates, and `x OP y ⟺ y converse(OP) x`: the
@@ -468,9 +410,9 @@ fn the_reduce_builders_differ_in_the_exchange() {
     let mut c = Circuit::default();
     let input = c.input_delta(7, crate::ReadBound::None);
     let aggs = [AggDescriptor::COUNT_STAR];
-    let global = c.reduce_multi(input, &[], &aggs);
-    let grouped = c.reduce_multi(input, &[1], &aggs);
-    let local = c.reduce_multi_local(input, &[], &aggs);
+    let global = c.reduce(input, &[], &aggs);
+    let grouped = c.reduce(input, &[1], &aggs);
+    let local = c.reduce_local(input, &[], &aggs);
     assert_eq!(
         [global, grouped, local].map(|id| c.owes_ground_row(id)),
         [true, false, false]
@@ -481,12 +423,12 @@ fn the_reduce_builders_differ_in_the_exchange() {
 /// COUNT is always I64, and MIN/MAX select an existing row, so they keep the
 /// source type. A SUM needs a scalar register, and a calendar value does not add.
 #[test]
-fn agg_output_type_is_count_i64_min_max_identity_and_sum_widening() {
+fn output_type_is_count_i64_min_max_identity_and_sum_widening() {
     use TypeCode::*;
     for &tc in TypeCode::ALL {
-        assert_eq!(agg_output_type(AggFunc::Count, tc), Some(I64), "{tc}");
-        assert_eq!(agg_output_type(AggFunc::Min, tc), Some(tc), "{tc}");
-        assert_eq!(agg_output_type(AggFunc::Max, tc), Some(tc), "{tc}");
+        assert_eq!(AggFunc::Count.output_type(tc), Some(I64), "{tc}");
+        assert_eq!(AggFunc::Min.output_type(tc), Some(tc), "{tc}");
+        assert_eq!(AggFunc::Max.output_type(tc), Some(tc), "{tc}");
     }
     for (src, want) in [
         (F64, Some(F64)),
@@ -503,7 +445,7 @@ fn agg_output_type_is_count_i64_min_max_identity_and_sum_widening() {
         (Date, None),
         (Timestamp, None),
     ] {
-        assert_eq!(agg_output_type(AggFunc::Sum, src), want, "SUM over {src}");
+        assert_eq!(AggFunc::Sum.output_type(src), want, "SUM over {src}");
     }
 }
 
@@ -513,10 +455,10 @@ fn agg_merge_preserves_output_type() {
     for &f in AggFunc::ALL {
         let merge = f.merge_op();
         for &tc in TypeCode::ALL {
-            let Some(out) = agg_output_type(f, tc) else {
+            let Some(out) = f.output_type(tc) else {
                 continue;
             };
-            assert_eq!(agg_output_type(merge, out), Some(out), "{f:?} over {tc:?}");
+            assert_eq!(merge.output_type(out), Some(out), "{f:?} over {tc:?}");
         }
     }
 }

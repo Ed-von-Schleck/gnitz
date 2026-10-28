@@ -42,7 +42,7 @@ pub(super) fn derive_hydration(
             }
             (regs[origin], Integral::Relation(*source))
         }
-        OpNode::Join { kind: JoinKind::Equi } => {
+        OpNode::Join(JoinKind::Equi) => {
             let &[da, db, ia, ib] = circuit.inputs(origin) else {
                 unreachable!("a join is wired on four inputs")
             };

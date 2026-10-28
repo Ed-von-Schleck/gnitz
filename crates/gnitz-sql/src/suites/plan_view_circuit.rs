@@ -60,10 +60,10 @@ impl Node {
     fn matches(self, circuit: &Circuit, nid: gnitz_wire::NodeId) -> bool {
         let op = circuit.op(nid);
         match self {
-            EquiJoin => matches!(op, OpNode::Join { kind: JoinKind::Equi, .. }),
-            RangeJoin => matches!(op, OpNode::Join { kind: JoinKind::Range { .. }, .. }),
-            CrossJoin => matches!(op, OpNode::Join { kind: JoinKind::Cross, .. }),
-            Reduce => matches!(op, OpNode::Reduce { .. }),
+            EquiJoin => matches!(op, OpNode::Join(JoinKind::Equi)),
+            RangeJoin => matches!(op, OpNode::Join(JoinKind::Range { .. })),
+            CrossJoin => matches!(op, OpNode::Join(JoinKind::Cross)),
+            Reduce => matches!(op, OpNode::Reduce(_)),
             GlobalGround => circuit.owes_ground_row(nid),
             Distinct => matches!(op, OpNode::WeightClamp(ClampKind::Distinct)),
             PositivePart => matches!(op, OpNode::WeightClamp(ClampKind::PositivePart)),
@@ -422,9 +422,9 @@ fn a_having_without_a_group_by_is_the_whole_relation_group_on_both_surfaces() {
     let reduces: Vec<(Vec<u32>, Vec<gnitz_wire::AggFunc>, bool)> = all_views(&chain)
         .flat_map(|pv| pv.circuit.ops().map(|(nid, op)| (&pv.circuit, nid, op)))
         .filter_map(|(circuit, nid, op)| match op {
-            OpNode::Reduce { group_cols, agg } => Some((
-                group_cols.as_slice().to_vec(),
-                agg.iter().map(|d| d.agg_op).collect(),
+            OpNode::Reduce(g) => Some((
+                g.group_cols.clone(),
+                g.aggs.iter().map(|d| d.agg_op).collect(),
                 circuit.owes_ground_row(nid),
             )),
             _ => None,

@@ -57,8 +57,8 @@ pub(crate) const CIRCUIT_VERSION: u8 = 13;
 // ---------------------------------------------------------------------------
 
 wire_enum! {
-    /// Aggregate function discriminant. The values are durable catalog state
-    /// (a `Reduce` node's aggregates) and a wire value on the ad-hoc fold path.
+    /// Aggregate function discriminant. The values are durable catalog state and
+    /// a wire value, both inside an [`AggDescriptor`].
     pub enum AggFunc: u8 {
         Count = 1,
         Sum = 2,
@@ -92,13 +92,36 @@ impl AggFunc {
     pub const fn raw_output_nullable(self, src_nullable: bool, ungrouped: bool) -> bool {
         !self.is_linear() && (src_nullable || ungrouped)
     }
+
+    /// Output type code of this aggregate over a source column of type `src_tc`,
+    /// or `None` when that type does not admit it — the one rule both the
+    /// planner's declared schema and the engine's emitted batch read.
+    ///
+    /// A sum is typed as its 8-byte register image, so SUM over U64 is U64: the
+    /// wrapping i64 accumulator's bits are the true sum mod 2^64.
+    pub const fn output_type(self, src_tc: TypeCode) -> Option<TypeCode> {
+        match self {
+            AggFunc::Count | AggFunc::CountNonNull => Some(TypeCode::I64),
+            // Adding two calendar values, or two truth values, is meaningless.
+            AggFunc::Sum => {
+                if crate::ScalarKind::from_type_code(src_tc).is_some()
+                    && !src_tc.is_temporal()
+                    && !matches!(src_tc, TypeCode::Bool)
+                {
+                    Some(src_tc.register_image())
+                } else {
+                    None
+                }
+            }
+            AggFunc::Min | AggFunc::Max => Some(src_tc),
+        }
+    }
 }
 
 /// One aggregate of a reduce: which function, over which column of the reduce's
 /// input. Carries no column *type* — that is `schema.columns[col_idx]`, which
-/// every consumer already holds. The one spelling on both wire paths: a
-/// `Reduce` node's parameters and an ad-hoc fold's `ReadSpec` ship this, and
-/// the reduce and the ad-hoc fold consume it.
+/// every consumer already holds. Travels inside a [`GroupAggs`] and an
+/// [`OpNode::Window`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AggDescriptor {
     pub col_idx: u32,
@@ -117,6 +140,29 @@ impl Wire for AggDescriptor {
     }
     fn read(r: &mut Reader) -> Result<Self, String> {
         Ok(AggDescriptor { agg_op: r.get()?, col_idx: r.u32()? })
+    }
+}
+
+/// A grouped aggregation over an input: the columns it groups by, then the
+/// aggregates of each group. The one carrier of both a `Reduce` node and a
+/// `ReadSpec` fold sink, so the reduce and the ad-hoc fold consume the same
+/// parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupAggs {
+    pub group_cols: Vec<u32>,
+    pub aggs: Vec<AggDescriptor>,
+}
+
+/// The group columns, then the aggregates.
+impl Wire for GroupAggs {
+    fn write(&self, w: &mut Writer) {
+        w.list(&self.group_cols).list(&self.aggs);
+    }
+    fn read(r: &mut Reader) -> Result<Self, String> {
+        Ok(GroupAggs {
+            group_cols: r.list("column list", MAX_COLUMNS)?,
+            aggs: r.list("aggregate list", MAX_COLUMNS)?,
+        })
     }
 }
 
@@ -139,30 +185,6 @@ impl Wire for ComputeMap {
     fn read(r: &mut Reader) -> Result<Self, String> {
         let out_cols = r.list("compute map", MAX_COLUMNS)?;
         Ok(ComputeMap { program: r.bytes32()?.to_vec(), out_cols })
-    }
-}
-
-/// Output type code of an aggregate over a source column of type `src_tc`, or
-/// `None` when that type does not admit it — the one rule both the planner's
-/// declared schema and the engine's emitted batch read.
-///
-/// A sum is typed as its 8-byte register image, so SUM over U64 is U64: the
-/// wrapping i64 accumulator's bits are the true sum mod 2^64.
-pub const fn agg_output_type(func: AggFunc, src_tc: TypeCode) -> Option<TypeCode> {
-    match func {
-        AggFunc::Count | AggFunc::CountNonNull => Some(TypeCode::I64),
-        // Adding two calendar values, or two truth values, is meaningless.
-        AggFunc::Sum => {
-            if crate::ScalarKind::from_type_code(src_tc).is_some()
-                && !src_tc.is_temporal()
-                && !matches!(src_tc, TypeCode::Bool)
-            {
-                Some(src_tc.register_image())
-            } else {
-                None
-            }
-        }
-        AggFunc::Min | AggFunc::Max => Some(src_tc),
     }
 }
 
@@ -198,68 +220,6 @@ impl RangeRel {
     pub fn admits_equal(self) -> bool {
         matches!(self, RangeRel::Ge | RangeRel::Le)
     }
-}
-
-/// How a reduce keys its output. For a `Reduce` node it is derived, never
-/// transmitted: both sides call [`Self::for_group_cols`] over facts they already
-/// hold — the source PK column list and the GROUP BY column list. The fold sink's
-/// reply is keyed the same way.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReduceOutKey {
-    /// The group columns are the output PK: the source's whole PK list, or one
-    /// non-nullable PK-eligible column.
-    Natural,
-    /// A leading hidden `_group_pk` U128, a NULL-distinct key of the group
-    /// columns, which ride as payload. Every other group set, the empty
-    /// (global) one included.
-    SyntheticFold,
-}
-
-impl ReduceOutKey {
-    /// The output key a reduce grouped by `group_cols` warrants, from the facts
-    /// both sides already hold: the source's PK column list, the GROUP BY column
-    /// list, and a `(type_code, nullable)` reader for a group column.
-    pub fn for_group_cols(pk_cols: &[u32], group_cols: &[u32], col: impl Fn(u32) -> (TypeCode, bool)) -> Self {
-        let natural = group_cols == pk_cols
-            || matches!(*group_cols, [c] if {
-                let (type_code, nullable) = col(c);
-                // The PK region carries no null bitmap.
-                !nullable && type_code.is_pk_eligible()
-            });
-        if natural {
-            ReduceOutKey::Natural
-        } else {
-            ReduceOutKey::SyntheticFold
-        }
-    }
-
-    /// An output's layout ahead of its aggregates: the key region (or the synthetic
-    /// key), then each `row` column the key region does not spell.
-    pub fn output_layout(self, group_cols: &[u32], row: impl IntoIterator<Item = u32>) -> Vec<ReduceOutSlot> {
-        let (mut slots, spelled): (Vec<ReduceOutSlot>, &[u32]) = match self {
-            ReduceOutKey::SyntheticFold => (vec![ReduceOutSlot::SyntheticKey], &[]),
-            ReduceOutKey::Natural => (group_cols.iter().map(|&c| ReduceOutSlot::Key(c)).collect(), group_cols),
-        };
-        slots.extend(
-            row.into_iter()
-                .filter(|c| !spelled.contains(c))
-                .map(ReduceOutSlot::Carried),
-        );
-        slots
-    }
-}
-
-/// One slot of a reduce's output layout, ahead of the aggregate columns. See
-/// [`ReduceOutKey::output_layout`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReduceOutSlot {
-    /// The synthetic `U128` fold key: slot 0 of the fold arm, and its whole PK.
-    SyntheticKey,
-    /// Source column `col`, in the output's PK region.
-    Key(u32),
-    /// Source column `col`, carried into the payload — a column of the output's
-    /// row the key region does not spell.
-    Carried(u32),
 }
 
 /// Join physical strategy carried by `OpNode::Join`, one variant per join
@@ -352,19 +312,13 @@ pub enum OpNode {
     WeightClamp(ClampKind),
     /// Over no group columns, behind an `ExchangeShard` it aggregates the whole
     /// relation and owes one row over an empty input; with no exchange it
-    /// aggregates each worker's slice and owes none.
-    Reduce {
-        group_cols: Vec<u32>,
-        /// Aggregate specs `(func, source column)`. Carries a `Count`.
-        agg: Vec<AggDescriptor>,
-    },
+    /// aggregates each worker's slice and owes none. Carries a `Count`.
+    Reduce(GroupAggs),
     /// The bilinear join of SQL sides A and B over slots `[ΔA, ΔB, iA, iB]`:
     /// `ΔA ⋈ z⁻¹(I(iB)) + ΔB ⋈ z⁻¹(I(iA))`, written `[key, A payload…, B
     /// payload…]`. A side's integrand is its delta, or the slice of it a worker
     /// keeps.
-    Join {
-        kind: JoinKind,
-    },
+    Join(JoinKind),
     /// Co-locates its input by the key of what reads it — the group columns of a
     /// `Reduce`, `TopN` or `Window` reader, else the input's own PK.
     ExchangeShard,
@@ -407,16 +361,16 @@ impl OpNode {
     /// the key an [`OpNode::ExchangeShard`] in front of it co-locates by.
     pub fn group_cols(&self) -> Option<&[u32]> {
         match self {
-            OpNode::Reduce { group_cols, .. } | OpNode::TopN { group_cols, .. } | OpNode::Window { group_cols, .. } => {
-                Some(group_cols)
-            }
+            OpNode::Reduce(GroupAggs { group_cols, .. })
+            | OpNode::TopN { group_cols, .. }
+            | OpNode::Window { group_cols, .. } => Some(group_cols),
             OpNode::ScanDelta { .. }
             | OpNode::Filter(_)
             | OpNode::Map(_)
             | OpNode::Negate
             | OpNode::Union
             | OpNode::WeightClamp(_)
-            | OpNode::Join { .. }
+            | OpNode::Join(_)
             | OpNode::ExchangeShard
             | OpNode::NullExtend { .. }
             | OpNode::WorkerFilter => None,
@@ -424,17 +378,17 @@ impl OpNode {
     }
 
     /// How many input slots this operator is wired on.
-    pub const fn arity(&self) -> usize {
+    const fn arity(&self) -> usize {
         match self {
             // The circuit's own input: fed by the source drive, not by a producer.
             OpNode::ScanDelta { .. } => 0,
-            OpNode::Join { .. } => 4,
+            OpNode::Join(_) => 4,
             OpNode::Union => 2,
             OpNode::Filter(_)
             | OpNode::Map(_)
             | OpNode::Negate
             | OpNode::WeightClamp(_)
-            | OpNode::Reduce { .. }
+            | OpNode::Reduce(_)
             | OpNode::ExchangeShard
             | OpNode::NullExtend { .. }
             | OpNode::WorkerFilter
@@ -484,8 +438,8 @@ impl OpNode {
             OpNode::Union => w.put(&Opcode::Union),
             OpNode::WeightClamp(ClampKind::Distinct) => w.put(&Opcode::Distinct),
             OpNode::WeightClamp(ClampKind::PositivePart) => w.put(&Opcode::PositivePart),
-            OpNode::Reduce { group_cols, agg } => w.put(&Opcode::Reduce).list(group_cols).list(agg),
-            OpNode::Join { kind } => match kind {
+            OpNode::Reduce(g) => w.put(&Opcode::Reduce).put(g),
+            OpNode::Join(kind) => match kind {
                 JoinKind::Equi => w.put(&Opcode::JoinEqui),
                 JoinKind::Range { rel } => w.put(&Opcode::JoinRange).put(rel),
                 JoinKind::Cross => w.put(&Opcode::JoinCross),
@@ -545,14 +499,10 @@ impl OpNode {
             Opcode::Union => OpNode::Union,
             Opcode::Distinct => OpNode::WeightClamp(ClampKind::Distinct),
             Opcode::PositivePart => OpNode::WeightClamp(ClampKind::PositivePart),
-            Opcode::Reduce => {
-                let group_cols = cols(r)?;
-                let agg = r.list("aggregate list", MAX_COLUMNS)?;
-                OpNode::Reduce { group_cols, agg }
-            }
-            Opcode::JoinEqui => OpNode::Join { kind: JoinKind::Equi },
-            Opcode::JoinRange => OpNode::Join { kind: JoinKind::Range { rel: r.get()? } },
-            Opcode::JoinCross => OpNode::Join { kind: JoinKind::Cross },
+            Opcode::Reduce => OpNode::Reduce(r.get()?),
+            Opcode::JoinEqui => OpNode::Join(JoinKind::Equi),
+            Opcode::JoinRange => OpNode::Join(JoinKind::Range { rel: r.get()? }),
+            Opcode::JoinCross => OpNode::Join(JoinKind::Cross),
             Opcode::ExchangeShard => OpNode::ExchangeShard,
             Opcode::NullExtend => {
                 let nulls_first = r.bool()?;
@@ -571,7 +521,7 @@ impl OpNode {
                 let (rank, dense_rank) = (r.bool()?, r.bool()?);
                 let group_cols = cols(r)?;
                 let order = r.list("order keys", crate::MAX_ORDER_KEYS)?;
-                let aggs = r.list("aggregates", MAX_COLUMNS)?;
+                let aggs = r.list("aggregate list", MAX_COLUMNS)?;
                 OpNode::Window {
                     group_cols,
                     order,
@@ -592,7 +542,7 @@ pub type NodeId = usize;
 
 /// The most nodes one circuit may hold: the count [`Circuit::decode`] refuses
 /// past.
-pub const MAX_CIRCUIT_NODES: usize = 16_384;
+const MAX_CIRCUIT_NODES: usize = 16_384;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Node {
@@ -608,9 +558,9 @@ impl Node {
     }
 }
 
-/// A node's id is its index and every input names an earlier node: [`Self::push`]
-/// is the only constructor, so index order is a topological order. Its last node
-/// is its output.
+/// A node's id is its index and every input names an earlier node: every builder
+/// method and [`Self::decode`] append through one private `push`, so index order is
+/// a topological order. Its last node is its output.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Circuit {
     nodes: Vec<Node>,
@@ -620,7 +570,7 @@ impl Circuit {
     /// Append `op` wired on `inputs`, refusing an operator that holds under no
     /// schema, an input count other than its [`OpNode::arity`], and an input that
     /// is not an earlier node.
-    pub fn push(&mut self, op: OpNode, inputs: &[NodeId]) -> Result<NodeId, String> {
+    fn push(&mut self, op: OpNode, inputs: &[NodeId]) -> Result<NodeId, String> {
         op.check()?;
         if op.arity() != inputs.len() {
             return Err("node's inputs do not match its operator's arity".into());
@@ -648,8 +598,8 @@ impl Circuit {
         w.into_vec()
     }
 
-    /// [`Self::encode`]'s inverse, through [`Self::push`]: a decoded circuit is
-    /// held to everything a built one is, and has an output.
+    /// [`Self::encode`]'s inverse, appending through the builders' `push`: a decoded
+    /// circuit is held to everything a built one is, and has an output.
     pub fn decode(buf: &[u8]) -> Result<Circuit, String> {
         decode_all(buf, "circuit", |r| {
             let mut circuit = Circuit::default();
@@ -697,7 +647,7 @@ impl Circuit {
     /// `nid` is a reduce that owes a row over an empty input: one over no group
     /// columns reading an `ExchangeShard`.
     pub fn owes_ground_row(&self, nid: NodeId) -> bool {
-        matches!(self.op(nid), OpNode::Reduce { group_cols, .. } if group_cols.is_empty())
+        matches!(self.op(nid), OpNode::Reduce(g) if g.group_cols.is_empty())
             && matches!(self.op(self.inputs(nid)[0]), OpNode::ExchangeShard)
     }
 
@@ -798,7 +748,7 @@ impl Circuit {
     /// [`OpNode::Join`]: `da` joins the integral of `ib`, `db` that of `ia`, each
     /// as it stood before this epoch.
     pub fn join(&mut self, [da, db]: [NodeId; 2], [ia, ib]: [NodeId; 2], kind: JoinKind) -> NodeId {
-        self.add(OpNode::Join { kind }, &[da, db, ia, ib])
+        self.add(OpNode::Join(kind), &[da, db, ia, ib])
     }
 
     /// [`OpNode::WorkerFilter`].
@@ -808,18 +758,18 @@ impl Circuit {
 
     /// [`OpNode::Reduce`] behind an [`OpNode::ExchangeShard`] on its group columns.
     /// Over no group columns it owes a row over an empty input.
-    pub fn reduce_multi(&mut self, input: NodeId, group_cols: &[u32], agg_specs: &[AggDescriptor]) -> NodeId {
+    pub fn reduce(&mut self, input: NodeId, group_cols: &[u32], agg_specs: &[AggDescriptor]) -> NodeId {
         let sharded = self.shard(input);
-        self.reduce_multi_local(sharded, group_cols, agg_specs)
+        self.reduce_local(sharded, group_cols, agg_specs)
     }
 
     /// [`OpNode::Reduce`] with **no upstream exchange**: it aggregates `input` as
     /// each worker holds it, and emits nothing over an empty input.
-    pub fn reduce_multi_local(&mut self, input: NodeId, group_cols: &[u32], agg_specs: &[AggDescriptor]) -> NodeId {
-        let op = OpNode::Reduce {
+    pub fn reduce_local(&mut self, input: NodeId, group_cols: &[u32], agg_specs: &[AggDescriptor]) -> NodeId {
+        let op = OpNode::Reduce(GroupAggs {
             group_cols: group_cols.to_vec(),
-            agg: agg_specs.to_vec(),
-        };
+            aggs: agg_specs.to_vec(),
+        });
         self.add(op, &[input])
     }
 

@@ -11,7 +11,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use gnitz_wire::{ColumnDef, TypeCode, WireStatus};
+use gnitz_wire::{ColumnDef, ControlHeader, TypeCode, WireFlags, WireLane, WireStatus};
 
 use crate::protocol::transport::{poll_fd, ClientTransport};
 use crate::ProtocolError;
@@ -153,7 +153,7 @@ pub(crate) fn step_until_idle(s: &mut Session) {
 
 /// A control-only reply frame naming `tid` and carrying `lsn` in `arg0`.
 pub(crate) fn reply_ctrl(tid: u64, lsn: u64) -> Vec<u8> {
-    let hdr = gnitz_wire::control::ControlHeader {
+    let hdr = ControlHeader {
         target_id: tid,
         arg0: lsn,
         ..Default::default()
@@ -164,9 +164,9 @@ pub(crate) fn reply_ctrl(tid: u64, lsn: u64) -> Vec<u8> {
 /// A reply frame carrying `batch` and `lsn` in `arg0`, and no schema block;
 /// `cont` sets `continuation`.
 pub(crate) fn reply_rows(tid: u64, batch: &ZSetBatch, lsn: u64, cont: bool) -> Vec<u8> {
-    let hdr = gnitz_wire::control::ControlHeader {
+    let hdr = ControlHeader {
         target_id: tid,
-        flags: gnitz_wire::WireFlags { continuation: cont, ..Default::default() },
+        flags: WireFlags { continuation: cont, ..Default::default() },
         arg0: lsn,
         ..Default::default()
     };
@@ -176,7 +176,7 @@ pub(crate) fn reply_rows(tid: u64, batch: &ZSetBatch, lsn: u64, cont: bool) -> V
 /// `view`'s terminal of a delta read or poll: control-only, carrying the cursor
 /// `(tag, tick)`.
 pub(crate) fn delta_terminal(view: u64, tag: u64, tick: u64) -> Vec<u8> {
-    let hdr = gnitz_wire::control::ControlHeader {
+    let hdr = ControlHeader {
         target_id: view,
         arg0: tick,
         arg1: tag,
@@ -187,11 +187,11 @@ pub(crate) fn delta_terminal(view: u64, tag: u64, tick: u64) -> Vec<u8> {
 
 /// The frame that opens a pushed train of subscription `sub` to `view`.
 pub(crate) fn pushed_marker(view: u64, sub: u64) -> Vec<u8> {
-    let hdr = gnitz_wire::control::ControlHeader {
+    let hdr = ControlHeader {
         target_id: view,
         arg0: sub,
-        flags: gnitz_wire::WireFlags {
-            lane: gnitz_wire::WireLane::PushedTrain,
+        flags: WireFlags {
+            lane: WireLane::PushedTrain,
             ..Default::default()
         },
         ..Default::default()
@@ -201,10 +201,10 @@ pub(crate) fn pushed_marker(view: u64, sub: u64) -> Vec<u8> {
 
 /// The frame that answers the oldest sync: with `refusal`, a fault refusing it.
 pub(crate) fn sync_answer(refusal: Option<&str>) -> Vec<u8> {
-    let hdr = gnitz_wire::control::ControlHeader {
+    let hdr = ControlHeader {
         status: refusal.map_or(WireStatus::Ok, |_| WireStatus::Error),
-        flags: gnitz_wire::WireFlags {
-            lane: gnitz_wire::WireLane::SyncAnswer,
+        flags: WireFlags {
+            lane: WireLane::SyncAnswer,
             ..Default::default()
         },
         ..Default::default()
@@ -214,7 +214,7 @@ pub(crate) fn sync_answer(refusal: Option<&str>) -> Vec<u8> {
 
 /// A fault frame naming `tid`, with `text` as its body.
 pub(crate) fn reply_status(tid: u64, status: WireStatus, text: &str) -> Vec<u8> {
-    let hdr = gnitz_wire::control::ControlHeader {
+    let hdr = ControlHeader {
         target_id: tid,
         status,
         ..Default::default()

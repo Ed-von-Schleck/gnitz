@@ -12,7 +12,7 @@ use crate::relation::{Cut as At, RelationKind};
 use crate::test_support::{cmp_all, col_range, cut, id_rows, img, map_of, order_by, relation_fixture, rows_spec};
 use crate::test_support::{RelationFixture, TID};
 use gnitz_expr::{CmpOp, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Sink};
-use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, ComputeMap, ReadBound, ReadSink, ReadSpec, SinkKind, TypeCode};
+use gnitz_wire::{AggDescriptor, AggFunc, ComputeMap, GroupAggs, ReadBound, ReadSink, ReadSpec, SinkKind, TypeCode};
 use gnitz_zset::repr::{BatchBuilder, SourceCursor};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -53,7 +53,7 @@ fn fold(map: Option<ComputeMap>, group_cols: Vec<u32>, sum_col: u32) -> ReadSink
     ];
     ReadSink {
         map,
-        kind: SinkKind::Fold(AggReadSpec { group_cols, aggs }),
+        kind: SinkKind::Fold(GroupAggs { group_cols, aggs }),
     }
 }
 

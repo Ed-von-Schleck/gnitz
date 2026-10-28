@@ -8,8 +8,7 @@
 use std::sync::Arc;
 
 use gnitz_core::{Catalog, CatalogRelation, RelDescriptor, RelProps, ViewDefinition};
-use gnitz_wire::sys_rows::CatalogColumn;
-use gnitz_wire::{ColumnDef, PkColList, RelClass, TableProps, ViewProps};
+use gnitz_wire::{CatalogColumn, ColumnDef, PkColList, RelClass, TableProps, ViewProps};
 
 use crate::bind::Catalog as _;
 

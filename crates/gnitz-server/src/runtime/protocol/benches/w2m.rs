@@ -1,7 +1,7 @@
 use super::fixtures::make_ring;
 use super::*;
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::control::CTRL_HEADER_SIZE;
+use gnitz_wire::CTRL_HEADER_SIZE;
 use std::hint::black_box;
 
 /// Instructions per control frame through one ring, publish and drain apart,

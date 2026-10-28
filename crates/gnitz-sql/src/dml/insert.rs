@@ -471,7 +471,7 @@ fn extract_values_rows(query: &Query) -> Result<&[Parens<Vec<Expr>>], GnitzSqlEr
 fn serial_keys(base: u64, n: usize, schema: &Schema) -> Result<PkColumn, GnitzSqlError> {
     let tc = schema.columns()[schema.pk_cols()[0] as usize].ty.tc;
     let max = FixedInt::from_type_code(tc)
-        .expect("`validate_serial_key` admits only a fixed int")
+        .expect("the engine admits only a fixed-width integer SERIAL key")
         .range()
         .1;
     if i128::from(base) + n as i128 - 1 > max {

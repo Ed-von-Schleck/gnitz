@@ -155,7 +155,7 @@ pub fn import(recordings: &Path, seeds: &Path) -> io::Result<Imported> {
         let digest = seed
             .sent
             .iter()
-            .fold(gnitz_wire::RowHasher::default(), |mut h, f| {
+            .fold(gnitz_wire::ChecksumStream::default(), |mut h, f| {
                 h.update(&f.conn.to_le_bytes());
                 h.update(&(f.bytes.len() as u64).to_le_bytes());
                 h.update(&f.bytes);

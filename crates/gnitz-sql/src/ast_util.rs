@@ -7,7 +7,6 @@ use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::ir::{BExpr, NumLit};
 use crate::rules::canonical_user_name;
 use gnitz_core::RelName;
-use gnitz_wire::decimal::decimal_of_number_text;
 use gnitz_wire::ColumnDef;
 use sqlparser::ast::{
     ExcludeSelectItem, Ident, RenameSelectItem, SelectItem, Spanned, TableAliasColumnDef, Value, Visit, Visitor,
@@ -746,6 +745,27 @@ pub(crate) fn has_visible_column<'a>(cols: impl IntoIterator<Item = &'a ColumnDe
 /// rejected. `RENAME` names its output, so it gets the duplicate check.
 pub(crate) fn is_name_preserving_wildcard_projection(projection: &[SelectItem]) -> bool {
     matches!(projection, [SelectItem::Wildcard(o)] if wildcard_mods(o).rename.is_empty())
+}
+
+/// The decimal a SQL numeric literal spells, exponent included, as
+/// `(unscaled, scale)` at its smallest exact scale — `1.50` is `(15, 1)`.
+/// `None` past `i128` or 38 fractional digits.
+pub(crate) fn decimal_of_number_text(s: &str) -> Option<(i128, u8)> {
+    let (mantissa, exp) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (s, 0),
+    };
+    let (mut v, scale) = gnitz_wire::parse_decimal_text(mantissa)?;
+    let mut scale = i32::from(scale).checked_sub(exp)?;
+    if scale < 0 {
+        v = v.checked_mul(10i128.checked_pow(scale.unsigned_abs())?)?;
+        scale = 0;
+    }
+    while scale > 0 && v % 10 == 0 {
+        v /= 10;
+        scale -= 1;
+    }
+    Some((v, u8::try_from(scale).ok().filter(|s| *s <= 38)?))
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
-//! The region convention: the order a batch's column buffers are listed in, the
-//! list type that holds them, the null word one of those regions carries, and
-//! the per-row reader over them. `wal` frames a list into a block; nothing here
+//! The region convention: the order a batch's column buffers are listed in and
+//! a column's payload slot among them, the list type that holds them, the null
+//! word one of those regions carries and the column cap it sets, and the per-row
+//! reader over them. `wal` frames a list into a block; nothing here
 //! knows what a block looks like.
 
 use std::mem::MaybeUninit;
@@ -13,14 +14,37 @@ pub const REG_WEIGHT: usize = 1;
 pub const REG_NULL_BMP: usize = 2;
 pub const REG_PAYLOAD_START: usize = REG_NULL_BMP + 1;
 
+/// Bytes per row in the weight and null-bitmap regions.
+pub const FIXED_REGION_BYTES: usize = 8;
+
 /// The fixed three, one per payload column, and the blob heap.
 pub const fn num_regions(num_payload_cols: usize) -> usize {
     REG_PAYLOAD_START + num_payload_cols + 1
 }
 
+/// Maximum number of columns (PK + payload) in any table or view schema.
+/// Capped at 65 by the row-major null bitmap: each row stores one u64 word
+/// with one bit per payload column, so payload columns ≤ 64.
+pub const MAX_COLUMNS: usize = 65;
+
+/// Payload slot of column `ci`: its position among the columns not in `pk`, or
+/// `None` for a PK column.
+pub const fn payload_slot(pk: &[u32], ci: usize) -> Option<usize> {
+    let mut below = 0;
+    let mut k = 0;
+    while k < pk.len() {
+        if pk[k] as usize == ci {
+            return None;
+        }
+        below += ((pk[k] as usize) < ci) as usize;
+        k += 1;
+    }
+    Some(ci - below)
+}
+
 /// One payload column wider than any legal schema: a real one has at least one
 /// PK column, so at most `MAX_COLUMNS - 1` payload columns.
-pub const MAX_WIRE_REGIONS: usize = num_regions(crate::MAX_COLUMNS);
+pub const MAX_WIRE_REGIONS: usize = num_regions(MAX_COLUMNS);
 
 /// A block's canonical region list, held inline.
 pub struct Regions<'a> {
@@ -153,7 +177,6 @@ pub fn null_word_at(word: u64, at: usize) -> u64 {
 /// there would put an indirect call on every `ColumnLocator` read.
 /// A whole-batch consumer that resolves the regions once per morsel is not one
 /// of those, and the evaluator's kernels take `&dyn BatchView`.
-/// (Convention: the trait is dyn-compatible, nothing enforces this.)
 ///
 /// All lifetimes are tied to `&self`, NOT decoupled — a client adapter owns the
 /// buffers it materializes and can only lend them for `&self`.
