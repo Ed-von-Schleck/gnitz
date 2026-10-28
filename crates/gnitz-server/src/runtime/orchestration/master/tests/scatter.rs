@@ -1,7 +1,7 @@
 use super::*;
-use crate::runtime::sal::fixtures::{group_at, holders_of, TestLog};
-use crate::runtime::sal::DirectGroup;
-use crate::runtime::sal::WorkerSet;
+use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::fixtures::{group_at, holders_of, test_log};
+use crate::runtime::sal::{SalGroup, SalWriter};
 use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     weighted_rows, zset_of,
@@ -13,12 +13,11 @@ use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 /// Write `batch` to `log` as the master's push of it to relation 16, placed by
 /// `placement`, handing `inspect` the layout the scatter picked.
-fn push(log: &TestLog, batch: &Batch, placement: Placement, inspect: impl FnOnce(&GroupData)) {
+fn push(log: &SalWriter, batch: &Batch, placement: Placement, inspect: impl FnOnce(&GroupData)) {
     let record = encode_schema_block(batch.schema());
-    with_routed(batch, placement, log.writer.num_workers(), |data| {
+    with_routed(batch, placement, log.num_workers(), |data| {
         inspect(&data);
-        log.excl()
-            .write(&DirectGroup::push(16, &record, data, holders_of(&data)))
+        log.excl().write(&SalGroup::push(16, &record, data, holders_of(&data)))
     })
     .expect("group fits");
 }
@@ -92,7 +91,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
 
     for (case, (placement, batch), laid_out) in &cases {
         let schema = *batch.schema();
-        let log = TestLog::new(1 << 20, nw, 1);
+        let log = test_log(1 << 20, nw, 1);
         push(&log, batch, *placement, |g| assert!(laid_out(g, batch), "{case}"));
         let msg = group_at(log.log(), 0);
         let sent: Vec<(usize, Batch)> = (0..nw)
@@ -125,7 +124,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
         } else {
             let owners = (0..batch.len())
                 .map(|row| placement.owner(batch.get_pk_bytes(row), nw).expect("a keyed placement"))
-                .fold(WorkerSet::EMPTY, WorkerSet::with);
+                .collect::<WorkerSet>();
             assert_eq!(msg.head.targets, owners, "{case}: the owners alone are addressed");
             assert_eq!(msg.payloads().count(), owners.len(), "{case}: one payload each");
             for (w, s) in &sent {
@@ -167,7 +166,7 @@ fn a_keyed_push_of_rows_sharing_a_span_keeps_each_heap_within_the_pushed_one() {
     assert_eq!(batch.blob().len(), heap.len());
 
     let placement = Placement::full_pk(&schema);
-    let log = TestLog::new(1 << 20, nw, 1);
+    let log = test_log(1 << 20, nw, 1);
     push(&log, &batch, placement, |g| {
         assert!(matches!(g, GroupData::Each(e) if e.len() == nw))
     });

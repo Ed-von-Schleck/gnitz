@@ -42,7 +42,7 @@ use crate::runtime::reactor::{
 };
 use crate::runtime::sal::{Read, SalExcl};
 use crate::runtime::tls::{Served, TlsListener};
-use crate::runtime::wire as ipc;
+use crate::runtime::wire::WireMsg;
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_wire::txn_frame::ScanItem;
 use gnitz_wire::{DecodedControl, ReadSpec, Target, WireFault, WireStatus};
@@ -856,7 +856,11 @@ fn decode_push_frame(
         None if ctrl.data.is_some() => return Err("decode error: a data block without a schema block".into()),
         None => {}
     }
-    let batch = ipc::decode_client_rows(data, &ctrl, &schema).map_err(|e| format!("decode error: {e}"))?;
+    let batch = ctrl
+        .data
+        .map(|r| Batch::decode_foreign_wal_block(&data[r], &schema))
+        .transpose()
+        .map_err(|e| format!("decode error: {e}"))?;
     Ok((batch, target))
 }
 
@@ -1067,12 +1071,12 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, name_blob: &[u8]) -> Re
         resolve_request_target(shared, name_blob)?.and_then(|tid| shared.cat().resolve_answer(tid).map(|a| (tid, a)));
     let Some((tid, (desc, schema_block, token))) = answer else {
         // No such relation: a successful reply naming none.
-        send_msg(peer, ipc::WireMsg::default());
+        send_msg(peer, WireMsg::default());
         return Ok(());
     };
     send_msg(
         peer,
-        ipc::WireMsg {
+        WireMsg {
             target_id: tid,
             arg0: token,
             schema_block: Some(&schema_block),
@@ -1186,7 +1190,7 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -
         match &s.local {
             Some(rows) => send_msg(
                 peer,
-                ipc::WireMsg {
+                WireMsg {
                     target_id,
                     arg0: s.lsn,
                     data: rows.wire_whole(),
@@ -1225,30 +1229,11 @@ async fn forward_scan(peer: &Peer, lease: &TrainLease) -> Result<(), WireFault> 
     Ok(())
 }
 
-/// Append `msg`'s framed bytes to `out`, so a corked reply never passes through a
-/// buffer of its own.
-fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
-    const PFX: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
-    let sz = msg.size();
-    let base = out.len();
-    let total = base + PFX + sz;
-    out.reserve(PFX + sz);
-    // SAFETY: `encode` writes every byte of the payload — a block's header and
-    // regions pack end to end — and the length prefix is written immediately
-    // below.
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        out.set_len(total);
-    }
-    out[base..base + PFX].copy_from_slice(&gnitz_wire::frame_len_prefix(sz));
-    msg.encode(&mut out[base + PFX..total]);
-}
-
 /// Cork `msg` for the client, or a fault in its place past `MAX_FRAME_PAYLOAD`.
 /// The connection loop ships it.
-fn send_msg(peer: &Peer, msg: ipc::WireMsg<'_>) {
-    match msg.checked_size() {
-        Ok(_) => peer.cork_with(|out| encode_response_into(out, msg)),
+fn send_msg(peer: &Peer, msg: WireMsg<'_>) {
+    match msg.check_size() {
+        Ok(()) => peer.cork_with(|out| msg.encode_framed(out)),
         Err(fault) => send_fault(peer, msg.target_id, &fault),
     }
 }
@@ -1259,7 +1244,7 @@ fn send_msg(peer: &Peer, msg: ipc::WireMsg<'_>) {
 pub(super) fn send_ack(peer: &Peer, target_id: u64, value: u64) {
     send_msg(
         peer,
-        ipc::WireMsg {
+        WireMsg {
             target_id,
             arg0: value,
             ..Default::default()
@@ -1270,7 +1255,7 @@ pub(super) fn send_ack(peer: &Peer, target_id: u64, value: u64) {
 /// A failure carrying its own status, master-minted or forwarded from a worker.
 /// A failure describes no rows, so it carries no schema block.
 fn send_fault(peer: &Peer, target_id: u64, fault: &WireFault) {
-    send_msg(peer, ipc::WireMsg { target_id, ..ipc::WireMsg::fault(fault) })
+    send_msg(peer, WireMsg { target_id, ..WireMsg::fault(fault) })
 }
 
 /// Refuse a push a stream cannot accept; `batch` is `None` for an empty delta.

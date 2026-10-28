@@ -20,11 +20,11 @@ use std::cell::{Cell, RefCell};
 use rustc_hash::FxHashMap;
 
 use crate::catalog::CatalogEngine;
+use crate::runtime::park::WorkerSet;
 use crate::runtime::reactor::{Reactor, TrainLease};
-use crate::runtime::sal::WorkerSet;
-use crate::runtime::sal::{Apply, DirectGroup, GroupData, GroupTargets, Read, SalExcl, SalRequest, SalWriter};
+use crate::runtime::sal::{Apply, GroupData, Read, SalExcl, SalGroup, SalRequest, SalWriter};
 use gnitz_store::read::Probe;
-use gnitz_store::relation::Relation;
+use gnitz_store::relation::{Relation, RelationRegistry};
 use gnitz_wire::{BoundPeek, PkColList, WireFault};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
@@ -83,8 +83,22 @@ struct ReadRoute {
     per_worker: Option<Vec<Vec<u8>>>,
 }
 
-/// Which workers answer `read` of `rel`, and what each is sent.
-fn route_read(read: &Read<'_>, rel: &Relation, nw: usize) -> ReadRoute {
+/// Which workers answer `read`, and what each is sent: a read of no live
+/// relation's rows goes to every worker, any other by its relation's placement.
+fn route_read(read: &Read<'_>, registry: &RelationRegistry, nw: usize) -> ReadRoute {
+    let whole = |set| ReadRoute { set, per_worker: None };
+    let tid = match *read {
+        Read::HasPk { tid, .. } | Read::KeySpans { tid, .. } | Read::ScanSpec { tid, .. } => tid,
+        Read::Delta { view, .. } => view,
+        Read::Pin { .. }
+        | Read::Unpin { .. }
+        | Read::SnapshotPage { .. }
+        | Read::Backup { .. }
+        | Read::ReleasePreflight => return whole(WorkerSet::ALL),
+    };
+    let rel = registry
+        .relation(tid)
+        .unwrap_or_else(|| panic!("master: no relation for target_id={tid}"));
     let schema = rel.schema();
     let (bound, placement) = match read {
         // Index entries are partitioned by their source row, not by the probed span,
@@ -100,15 +114,8 @@ fn route_read(read: &Read<'_>, rel: &Relation, nw: usize) -> ReadRoute {
             },
         ),
         Read::ScanSpec { spec, .. } | Read::Delta { spec, .. } => (gnitz_wire::peek_bound(spec), rel.placement()),
-        Read::Pin { .. }
-        | Read::Unpin { .. }
-        | Read::SnapshotPage { .. }
-        | Read::Backup { .. }
-        | Read::ReleasePreflight => {
-            unreachable!("a read of no live relation's rows is routed by ScanCut::read_all")
-        }
+        _ => unreachable!("routed to every worker above"),
     };
-    let whole = |set| ReadRoute { set, per_worker: None };
     let owner = |k: &[u8]| placement.owner(k, nw).expect("a key-routed placement owns every key");
     match (placement, bound) {
         (Placement::Replicated, _) => whole(WorkerSet::one(Placement::REPLICA_OWNER as usize)),
@@ -119,7 +126,7 @@ fn route_read(read: &Read<'_>, rel: &Relation, nw: usize) -> ReadRoute {
         ),
         (_, Some(BoundPeek::PkSet(s))) if placement.is_key_routed() && s.stride == schema.pk_stride() => {
             let keys = || s.keys.chunks_exact(s.stride);
-            let set = keys().fold(WorkerSet::EMPTY, |set, k| set.with(owner(k)));
+            let set: WorkerSet = keys().map(owner).collect();
             match set.len() {
                 0 => whole(WorkerSet::one(0)),
                 1 => whole(set),
@@ -170,33 +177,12 @@ impl<'d> ScanCut<'d> {
     /// `read` written to the workers its target and bound reach, each sent its
     /// own key set when the bound splits one, under a reply id leased for them.
     pub(crate) fn read(&mut self, read: Read<'_>) -> Result<(), WireFault> {
-        let group = DirectGroup::new(read);
-        let SalRequest::Read(read) = &group.request else {
-            unreachable!("built from a read")
-        };
-        let target_id = group.request.template().target_id;
-        let rel = self
-            .disp
-            .cat()
-            .registry
-            .relation(target_id)
-            .unwrap_or_else(|| panic!("master: no relation for target_id={target_id}"));
-        let route = route_read(read, rel, self.disp.num_workers());
+        let route = route_read(&read, &self.disp.cat().registry, self.disp.num_workers());
+        let group = SalGroup::new(read);
         let data = route.per_worker.as_deref().map_or(group.data, GroupData::Blobs);
-        let lease = self.disp.reactor.lease_train(route.set, group.request.kind());
+        let lease = self.disp.reactor.lease_train(route.set, group.request.encode().0);
         debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
-        self.excl
-            .write(&DirectGroup { data, targets: lease.targets(), ..group })?;
-        self.scans.push(lease);
-        Ok(())
-    }
-
-    /// `read` written to every worker, under a reply id leased for them: a read
-    /// no live relation's placement routes.
-    pub(crate) fn read_all(&mut self, read: Read<'_>) -> Result<(), WireFault> {
-        let group = DirectGroup::new(read);
-        let lease = self.disp.reactor.lease_train(WorkerSet::ALL, group.request.kind());
-        self.excl.write(&DirectGroup { targets: lease.targets(), ..group })?;
+        self.excl.write(&SalGroup { data, targets: lease.targets(), ..group })?;
         self.scans.push(lease);
         Ok(())
     }
@@ -236,12 +222,6 @@ impl MasterDispatcher {
     /// One scan-shaped read under its own SAL hold.
     pub(crate) async fn scan(&self, read: Read<'_>) -> Result<TrainLease, WireFault> {
         let mut leases = self.scan_cut(|cut| cut.read(read)).await?;
-        Ok(leases.pop().expect("one read, one lease"))
-    }
-
-    /// [`Self::scan`] of a read every worker answers.
-    pub(crate) async fn scan_all(&self, read: Read<'_>) -> Result<TrainLease, WireFault> {
-        let mut leases = self.scan_cut(|cut| cut.read_all(read)).await?;
         Ok(leases.pop().expect("one read, one lease"))
     }
 }

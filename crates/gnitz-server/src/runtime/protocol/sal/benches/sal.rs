@@ -1,6 +1,6 @@
-use super::fixtures::TestLog;
+use super::fixtures::test_log;
 use super::tests::scan;
-use super::{DirectGroup, GroupData, GroupTargets, SalReader, WorkerSet};
+use super::{GroupData, GroupTargets, SalGroup, SalReader, SalWriter, WorkerSet};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
 
@@ -12,17 +12,17 @@ const LAYOUTS: [(&str, usize, bool); 3] = [("shared", 2, false), ("per worker", 
 
 /// A log of [`GROUPS`] control-only groups addressed to `set`, written under one
 /// hold, and the instructions writing them took.
-fn written_log(counter: &Counter, nw: usize, per_worker: bool, set: WorkerSet) -> (TestLog, u64) {
+fn written_log(counter: &Counter, nw: usize, per_worker: bool, set: WorkerSet) -> (SalWriter, u64) {
     let blobs = vec![Vec::new(); nw];
-    let log = TestLog::new(32 << 20, nw, 1);
-    let group = DirectGroup {
+    let log = test_log(32 << 20, nw, 1);
+    let group = SalGroup {
         data: if per_worker {
             GroupData::Blobs(&blobs)
         } else {
             GroupData::Same(None)
         },
-        targets: GroupTargets { set, ..GroupTargets::UNADDRESSED },
-        ..DirectGroup::new(scan(0, &[]))
+        targets: GroupTargets { set, ..GroupTargets::SILENT },
+        ..SalGroup::new(scan(0, &[]))
     };
     let excl = log.excl();
     let ((), written) = counter.measure(|| {

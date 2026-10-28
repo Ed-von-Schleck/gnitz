@@ -19,7 +19,6 @@ use crate::runtime::master::UniqueFilter;
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::WriteGuard;
 use crate::runtime::sal::Read;
-use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
 use gnitz_wire::{ClientVerb, DecodedControl, PkColList, Target, WireFault};
 use gnitz_zset::repr::Batch;
@@ -87,9 +86,9 @@ async fn hold_ddl_for_checkpoint(shared: &Shared) {
 fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, Batch), String> {
     let tid = ctrl.hdr.target_id;
     let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
-    let batch = ipc::decode_client_rows(frame, &ctrl, family.schema())
-        .map_err(|e| format!("family {tid} decode error: {e}"))?
-        .expect("a DDL_TXN item carries a data block");
+    let block = &frame[ctrl.data.expect("a DDL_TXN item carries a data block")];
+    let batch = Batch::decode_foreign_wal_block(block, family.schema())
+        .map_err(|e| format!("family {tid} decode error: {e}"))?;
     Ok((family, batch))
 }
 
@@ -233,8 +232,8 @@ async fn commit_bundle(
         let mut excl = shared.disp().sal().lock().await;
         let written = shared
             .disp()
-            .emit_zone(&mut excl, "DDL", |cat, sink| cat.apply_bundle(families, sink))?;
-        (written, excl.sync(shared.disp().reactor(), "DDL"))
+            .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(families, sink))?;
+        (written, excl.sync(shared.disp().reactor()))
     };
     synced.await;
     Ok(Committed { applied, zone_lsn, filter_seeds })
@@ -246,7 +245,7 @@ async fn commit_bundle(
 /// the pre-flight's. A claim left standing would keep an index no catalog row
 /// owns, whose directory the next checkpoint's sweep removes from under it.
 async fn release_preflight(shared: &Shared) {
-    let released = async { shared.disp().scan_all(Read::ReleasePreflight).await?.finish().await }.await;
+    let released = async { shared.disp().scan(Read::ReleasePreflight).await?.finish().await }.await;
     if let Err(e) = released {
         gnitz_fatal_abort!("releasing the unique-index pre-flight's claims failed: {}", e.text);
     }
@@ -268,8 +267,8 @@ pub(super) async fn reserve_serial_range(shared: &Rc<Shared>, seq: Target, count
     shared.cat().check_token(seq)?;
 
     let mut excl = shared.disp().sal().lock().await;
-    let (base, _) = shared.disp().emit_zone(&mut excl, "serial-range", |cat, sink| {
-        cat.reserve_user_sequence(seq.tid, count, sink)
-    })?;
+    let (base, _) = shared
+        .disp()
+        .emit_zone(&mut excl, |cat, sink| cat.reserve_user_sequence(seq.tid, count, sink))?;
     Ok(base)
 }

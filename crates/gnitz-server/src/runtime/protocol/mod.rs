@@ -1,4 +1,4 @@
-//! The protocol — the IPC wire format, the shared append-only log (SAL), the
+//! The protocol — the frame encoder (`wire`), the shared append-only log (SAL), the
 //! lock-free worker→master ring (`w2m`), the worker↔worker exchange `mesh`, and
 //! the futex `park` they sleep through.
 //!

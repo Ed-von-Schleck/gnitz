@@ -279,7 +279,7 @@ fn a_list_that_fills_the_outbox_exactly_defers_the_next() {
     let head = unsafe { &*mesh[0].outbox(0).cast::<Head>() };
     assert_eq!(
         head.blocks[0].at + head.blocks[0].len,
-        SMALL_OUTBOX as u64,
+        SMALL_OUTBOX as u32,
         "list 0 fills the outbox"
     );
     assert_eq!(head.blocks[1].len, 0, "list 1 waits for the next part");

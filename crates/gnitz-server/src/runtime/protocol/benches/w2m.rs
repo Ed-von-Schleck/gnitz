@@ -32,7 +32,7 @@ fn w2m_ring_bench() {
                 .measure(|| {
                     for req in 1..=lap {
                         let slot = receiver.try_read_slot(0).expect("a published frame");
-                        assert_eq!(slot.internal_req_id, req);
+                        assert_eq!(slot.request_id, req);
                         black_box(slot.bytes());
                     }
                 })

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::test_support::*;
 use super::*;
-use crate::runtime::sal::WorkerSet;
+use crate::runtime::park::WorkerSet;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 
 /// `fsync` submits its SQE before returning, so its CQE arrives with no tick

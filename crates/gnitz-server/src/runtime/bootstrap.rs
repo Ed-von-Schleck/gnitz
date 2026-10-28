@@ -17,10 +17,9 @@ use crate::runtime::executor;
 use crate::runtime::listen;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::mesh::{self, Mesh};
-use crate::runtime::park::{WorkerPark, WorkerParks};
+use crate::runtime::park::WorkerParks;
 use crate::runtime::reactor::{check_host, select2, AckLease, Either, Limits, Reactor, BOOT_READY_REQUEST_ID};
-use crate::runtime::sal::zone::CommittedTail;
-use crate::runtime::sal::{SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
+use crate::runtime::sal::{CommittedTail, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
 use crate::runtime::tls::{TlsArgs, TlsListener};
 use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
 use crate::runtime::worker::WorkerProcess;
@@ -28,7 +27,7 @@ use gnitz_store::relation::{Residency, StoreConfig};
 use gnitz_zset::algebra::Slot;
 
 // ---------------------------------------------------------------------------
-// SAL recovery: both drivers below read the log through `sal::zone::CommittedTail`
+// SAL recovery: both drivers below read the log through `sal::CommittedTail`
 // and differ only in which groups are theirs and what they do with the bytes.
 // A group whose rows do not decode fails the boot.
 // ---------------------------------------------------------------------------
@@ -207,7 +206,6 @@ pub fn server_main(
 struct WorkerIpc {
     tail: CommittedTail,
     w2m_writer: W2mWriter,
-    park: WorkerPark,
     mesh: Mesh,
 }
 
@@ -236,16 +234,8 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
     let (writers, receiver) = w2m::create(nw).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
     let meshes =
         mesh::create(mesh::outbox_bytes(), parks).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
-    let workers = writers
-        .into_iter()
-        .zip(meshes)
-        .enumerate()
-        .map(|(w, (w2m_writer, mesh))| WorkerIpc {
-            tail,
-            w2m_writer,
-            park: parks.park(w),
-            mesh,
-        })
+    let workers = (writers.into_iter().zip(meshes))
+        .map(|(w2m_writer, mesh)| WorkerIpc { tail, w2m_writer, mesh })
         .collect();
     Ok(SharedIpc { tail, workers, receiver, parks })
 }
@@ -303,7 +293,7 @@ fn run_worker_child(
     let sal_reader = SalReader::new(ipc.tail.log(), slot.rank, ipc.tail.live_epoch());
     // The id the master leases before it collects.
     ipc.w2m_writer.send_ack(BOOT_READY_REQUEST_ID);
-    WorkerProcess::new(catalog, sal_reader, ipc.w2m_writer, ipc.park, ipc.mesh).run()
+    WorkerProcess::new(catalog, sal_reader, ipc.w2m_writer, ipc.mesh).run()
 }
 
 /// The master's half of recovery before any worker exists: the catalog staged

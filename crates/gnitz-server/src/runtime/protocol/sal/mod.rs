@@ -9,9 +9,10 @@
 //! code entitled to know how either is stored.
 
 mod request;
-pub(crate) mod zone;
+mod zone;
 
 pub(crate) use request::{Apply, Read, SalRequest};
+pub(crate) use zone::CommittedTail;
 
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
@@ -21,14 +22,15 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::runtime::park::WorkerParks;
+use crate::catalog::SysFamily;
+use crate::runtime::park::{WorkerParks, WorkerSet};
 use crate::runtime::reactor::{AsyncRwLock, Reactor, WriteGuard};
 use crate::runtime::wire::WireMsg;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
 use gnitz_wire::{
-    frame_head_size, low_bits_mask, peek_control_block, read_u32_le, read_u64_le, write_u32_le, write_u64_le, BitIter,
-    DecodedControl, WireFault, WireStatus, MAX_WORKERS,
+    frame_head_size, peek_control_block, read_u32_le, read_u64_le, write_u32_le, write_u64_le, DecodedControl,
+    WireFault, WireStatus, MAX_WORKERS,
 };
 use gnitz_zset::repr::{Batch, WireRows};
 use gnitz_zset::schema::{decode_schema_block, SchemaDescriptor};
@@ -37,59 +39,6 @@ use gnitz_zset::schema::{decode_schema_block, SchemaDescriptor};
 /// groups publishing and its closing member. The tag (`"ddl"` / `"commit"`)
 /// picks which scope aborts.
 static ZONE_PANIC: Seam = Seam::new("GNITZ_INJECT_SAL_ZONE_PANIC");
-
-// ---------------------------------------------------------------------------
-// WorkerSet
-// ---------------------------------------------------------------------------
-
-/// A subset of the workers. `ALL` is unbounded; every other set holds only
-/// launched workers.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct WorkerSet(u64);
-
-const _: () = assert!(MAX_WORKERS <= u64::BITS as usize);
-
-impl WorkerSet {
-    pub(crate) const EMPTY: Self = WorkerSet(0);
-    pub(crate) const ALL: Self = WorkerSet(u64::MAX);
-
-    pub(crate) const fn one(w: usize) -> Self {
-        WorkerSet(1 << w)
-    }
-
-    pub(crate) const fn with(self, w: usize) -> Self {
-        WorkerSet(self.0 | 1 << w)
-    }
-
-    pub(crate) const fn without(self, w: usize) -> Self {
-        WorkerSet(self.0 & !(1 << w))
-    }
-
-    pub(crate) const fn within(self, nw: usize) -> Self {
-        WorkerSet(self.0 & low_bits_mask(nw))
-    }
-
-    pub(crate) const fn contains(self, w: usize) -> bool {
-        self.0 >> w & 1 == 1
-    }
-
-    pub(crate) const fn len(self) -> usize {
-        self.0.count_ones() as usize
-    }
-
-    pub(crate) const fn union(self, other: Self) -> Self {
-        WorkerSet(self.0 | other.0)
-    }
-
-    /// How many members of the set are below `w`: `w`'s position among them.
-    pub(crate) const fn rank(self, w: usize) -> usize {
-        (self.0 & low_bits_mask(w)).count_ones() as usize
-    }
-
-    pub(crate) fn iter(self) -> BitIter {
-        BitIter(self.0)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -172,16 +121,16 @@ fn header_len(fixed: &[u8; HDR_PREFIX]) -> usize {
     ))
 }
 
-/// Each payload as `(index, payload-relative offset, size)`, in directory order.
+/// Each payload as `(payload-relative offset, size)`, in directory order.
 /// The offset is a pure function of the sizes before it — a payload starts where
 /// the 8-byte-padded ones ahead of it end — so the directory stores sizes alone
 /// and an inconsistent offset is unrepresentable.
-fn payload_spans(sizes: impl Iterator<Item = usize>) -> impl Iterator<Item = (usize, usize, usize)> {
+fn payload_spans(sizes: impl Iterator<Item = usize>) -> impl Iterator<Item = (usize, usize)> {
     let mut off = 0;
-    sizes.enumerate().map(move |(i, sz)| {
+    sizes.map(move |sz| {
         let at = off;
         off += sz.next_multiple_of(8);
-        (i, at, sz)
+        (at, sz)
     })
 }
 
@@ -210,7 +159,7 @@ pub(crate) struct GroupTargets {
 
 impl GroupTargets {
     /// Every worker, nothing answers.
-    pub(crate) const UNADDRESSED: Self = GroupTargets { set: WorkerSet::ALL, request_id: 0 };
+    pub(crate) const SILENT: Self = GroupTargets { set: WorkerSet::ALL, request_id: 0 };
 }
 
 /// What a group sends each worker.
@@ -243,16 +192,15 @@ impl<'a> GroupData<'a> {
             Self::Each(each) => each
                 .iter()
                 .enumerate()
-                .filter(|(_, rows)| rows.is_some())
-                .fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w)),
+                .filter_map(|(w, rows)| rows.map(|_| w))
+                .collect(),
         }
     }
 }
 
-/// One SAL group as [`SalWriter::lay_out`] encodes it: the request every payload
+/// One SAL group as [`SalExcl::lay_out`] encodes it: the request every payload
 /// carries, plus what varies by worker.
-#[derive(Clone)]
-pub(crate) struct DirectGroup<'a> {
+pub(crate) struct SalGroup<'a> {
     pub(crate) request: SalRequest<'a>,
     /// The schema record of the rows in `data`; dropped from a payload that
     /// carries none.
@@ -261,22 +209,22 @@ pub(crate) struct DirectGroup<'a> {
     pub(crate) targets: GroupTargets,
 }
 
-impl<'a> DirectGroup<'a> {
+impl<'a> SalGroup<'a> {
     /// A control-only silent broadcast of `request`. Callers override what varies
     /// by struct update.
     pub(crate) fn new(request: impl Into<SalRequest<'a>>) -> Self {
-        DirectGroup {
+        SalGroup {
             request: request.into(),
             schema: None,
             data: GroupData::Same(None),
-            targets: GroupTargets::UNADDRESSED,
+            targets: GroupTargets::SILENT,
         }
     }
 
     /// A push of `data` into `tid`, whose schema record is `record`, written to
     /// `targets`.
     pub(crate) fn push(tid: u64, record: &'a [u8], data: GroupData<'a>, targets: GroupTargets) -> Self {
-        DirectGroup {
+        SalGroup {
             schema: Some(record),
             data,
             targets,
@@ -284,13 +232,18 @@ impl<'a> DirectGroup<'a> {
         }
     }
 
-    /// A catalog mutation of `family`, whose schema record is `record`: `batch`,
-    /// sent whole to every worker.
-    pub(crate) fn ddl_sync(family: u64, record: &'a [u8], batch: &'a Batch) -> Self {
-        DirectGroup {
-            schema: Some(record),
+    /// A catalog mutation of `family`: `batch`, sent whole to every worker, or
+    /// to none for a family no worker holds.
+    pub(crate) fn ddl_sync(family: SysFamily, batch: &'a Batch) -> Self {
+        let group = Self::new(Apply::DdlSync { family: family.id() });
+        SalGroup {
+            schema: Some(family.record()),
             data: GroupData::Same(batch.wire_whole()),
-            ..Self::new(Apply::DdlSync { family })
+            targets: match family.master_only() {
+                true => GroupTargets { set: WorkerSet::EMPTY, ..group.targets },
+                false => group.targets,
+            },
+            ..group
         }
     }
 
@@ -405,7 +358,7 @@ gnitz_wire::wire_enum! {
         Push = 9,
         Tick = 10,
         ScanSpec = 11,
-        DeltaRead = 12,
+        Delta = 12,
         Pin = 13,
         Unpin = 14,
         SnapshotPage = 15,
@@ -564,21 +517,22 @@ impl SalMessage {
     /// Each payload's bytes, in directory order.
     pub(crate) fn payloads(&self) -> impl Iterator<Item = &'static [u8]> + '_ {
         let payload = self.payload;
-        payload_spans(dir_sizes(self.dir)).map(move |(_, off, sz)| &payload[off..off + sz])
+        payload_spans(dir_sizes(self.dir)).map(move |(off, sz)| &payload[off..off + sz])
     }
 
     /// Worker `w`'s bytes, `None` when the group does not address it.
+    /// Outlined: inlined into [`SalReader::next`], it costs the drain more
+    /// instructions per group than the call does.
+    #[inline(never)]
     pub(crate) fn slot(&self, w: u32) -> Option<&'static [u8]> {
         let w = w as usize;
-        (w < MAX_WORKERS && self.head.targets.contains(w))
-            .then(|| {
-                self.payloads().nth(if self.head.shared() {
-                    0
-                } else {
-                    self.head.targets.rank(w)
-                })
-            })
-            .flatten()
+        if w >= MAX_WORKERS {
+            return None;
+        }
+        let i = self.head.targets.position(w)?;
+        let i = if self.head.shared() { 0 } else { i };
+        let (off, sz) = payload_spans(dir_sizes(self.dir)).nth(i)?;
+        Some(&self.payload[off..off + sz])
     }
 
     /// The rows `payload`, one of this group's, carries; `known` as
@@ -642,14 +596,6 @@ enum EpochGate {
     /// flipped prefix epoch changes nothing; only the digested header's epoch
     /// decides.
     Walk(u32),
-}
-
-impl EpochGate {
-    fn epoch(self) -> u32 {
-        match self {
-            EpochGate::Live(e) | EpochGate::Walk(e) => e,
-        }
-    }
 }
 
 /// Ask btrfs to overwrite the file in place (`FS_NOCOW_FL`): a copy-on-write
@@ -720,6 +666,17 @@ impl SalLog {
         })
     }
 
+    /// The header of the group laid out at `base`, sized by its own payload
+    /// count.
+    ///
+    /// # Safety
+    /// A group's header is laid out at `base`, and nothing else references it.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn header_mut(&self, base: u64) -> &'static mut [u8] {
+        let at = self.ring.add(base as usize + PREFIX_BYTES);
+        std::slice::from_raw_parts_mut(at, header_len(&*(at as *const [u8; HDR_PREFIX])))
+    }
+
     fn anchor_atomic(&self) -> &'static AtomicU64 {
         // SAFETY: the anchor page is mapped ahead of the ring.
         unsafe { prefix_atomic(self.ring.wrapping_sub(ANCHOR_BYTES), 0) }
@@ -756,11 +713,10 @@ impl SalLog {
         if word == 0 {
             return SalStep::Absent;
         }
-        if let EpochGate::Live(exp) = gate {
-            if word_epoch(word) != exp {
-                return SalStep::Absent;
-            }
-        }
+        let epoch = match gate {
+            EpochGate::Live(e) if word_epoch(word) != e => return SalStep::Absent,
+            EpochGate::Live(e) | EpochGate::Walk(e) => e,
+        };
 
         let hdr_off = cursor as usize + PREFIX_BYTES;
         let m = self.ring_len;
@@ -781,7 +737,7 @@ impl SalLog {
         let Some(head) = GroupHead::decode(fixed) else {
             return SalStep::Corrupt;
         };
-        if read_u32_le(fixed, OFF_EPOCH) != gate.epoch() {
+        if read_u32_le(fixed, OFF_EPOCH) != epoch {
             return match gate {
                 EpochGate::Live(_) => SalStep::Corrupt,
                 EpochGate::Walk(_) => SalStep::Absent,
@@ -825,15 +781,6 @@ impl SalLog {
 // SalWriter
 // ---------------------------------------------------------------------------
 
-/// The cursor and zone state a group laid out in a scope can be rolled back to.
-/// Taken before a group is laid out and consumed only by
-/// [`SalScope::roll_back`].
-#[derive(Clone, Copy)]
-pub(crate) struct Savepoint {
-    cursor: u64,
-    last_member: Option<u64>,
-}
-
 pub(crate) struct SalWriter {
     log: SalLog,
     write_cursor: Cell<u64>,
@@ -853,8 +800,6 @@ pub(crate) struct SalWriter {
     excl: AsyncRwLock,
     /// Every worker's park; its length is the worker count groups are written at.
     parks: WorkerParks,
-    /// The workers groups written since the last [`SalExcl::wake`] reached.
-    reached: Cell<WorkerSet>,
 }
 
 impl SalWriter {
@@ -877,7 +822,6 @@ impl SalWriter {
             holds_pushes: Cell::new(false),
             excl: AsyncRwLock::default(),
             parks,
-            reached: Cell::new(WorkerSet::EMPTY),
         }
     }
 
@@ -886,6 +830,7 @@ impl SalWriter {
         SalExcl {
             writer: self,
             wrote: Cell::new(false),
+            reached: Cell::new(WorkerSet::EMPTY),
             _guard: self.excl.write().await,
         }
     }
@@ -895,12 +840,13 @@ impl SalWriter {
         self.parks.len()
     }
 
-    /// Lay one group out at the write cursor, `fill(index, bytes)` per payload,
-    /// and return its base — the group is complete on the log but for its
-    /// digest, and unpublished; [`Self::publish`] does both. A group that does
-    /// not fit is refused with [`WireStatus::SalFull`] and leaves the log
-    /// untouched; the refusal reaches clients verbatim, so the cursor goes to the
-    /// operator log instead. A zone member (`lsn != 0`) checksums its payload bytes.
+    /// Lay one group out at the write cursor, `fill` writing each payload's bytes
+    /// in directory order, and return its base — the group is complete on the
+    /// log but for its digest, and unpublished; [`Self::publish`] does both. A
+    /// group that does not fit is refused with [`WireStatus::SalFull`] and leaves
+    /// the log untouched; the refusal reaches clients verbatim, so the cursor goes
+    /// to the operator log instead. A zone member (`lsn != 0`) checksums its
+    /// payload bytes.
     fn write_slots(&self, head: GroupHead, sizes: &[usize], mut fill: impl FnMut(&mut [u8])) -> Result<u64, WireFault> {
         let epoch = self.epoch.get();
         assert!(
@@ -954,13 +900,10 @@ impl SalWriter {
         // unwritten would read as whatever group last occupied this offset:
         // every one is written.
         head.encode(hdr, base, epoch);
-        for (i, &sz) in sizes.iter().enumerate() {
+        for (i, (off, sz)) in payload_spans(sizes.iter().copied()).enumerate() {
             write_u64_le(hdr, OFF_DIRECTORY + i * DIR_ENTRY_BYTES, sz as u64);
-        }
-
-        for (_, off, sz) in payload_spans(sizes.iter().copied()) {
             // SAFETY: `off + sz <= total - PREFIX_BYTES - hdr_size`, inside the mapped
-            // span, and the spans are disjoint.
+            // span past `hdr`, and the spans are disjoint.
             let slot = unsafe { std::slice::from_raw_parts_mut(self.log.ring.add(hdr_off + hdr_size + off), sz) };
             fill(slot);
         }
@@ -979,6 +922,8 @@ impl SalWriter {
         write_u64_le(hdr, OFF_PAYLOAD_SUM, sum);
 
         let end = base + total as u64;
+        // SAFETY: `end <= cap <= ring_len`, inside the mapping, and the word at
+        // `end` is past the write cursor, so no reader has reached it.
         unsafe { write_end_prefix(self.log.ring, end as usize) };
         self.write_cursor.set(end);
         Ok(base)
@@ -987,20 +932,16 @@ impl SalWriter {
     /// Stamp the digest of the group laid out at `base` and store its prefix: the
     /// group is readable from here on. Returns its end.
     fn publish(&self, base: u64) -> u64 {
-        let at = base as usize + PREFIX_BYTES;
-        // SAFETY: laid out by this writer, so mapped; its prefix word is still
-        // zero, so no reader has reached it.
-        let hdr = unsafe {
-            let fixed = &*(self.log.ring.add(at) as *const [u8; HDR_PREFIX]);
-            std::slice::from_raw_parts_mut(self.log.ring.add(at), header_len(fixed))
-        };
+        // SAFETY: laid out by this writer and, its prefix word still zero,
+        // reached by no reader.
+        let hdr = unsafe { self.log.header_mut(base) };
         stamp_digest(hdr);
         if hdr[OFF_KIND] == SalMessageKind::Push.as_wire() && read_u64_le(hdr, OFF_LSN) != 0 {
             self.holds_pushes.set(true);
         }
         let end = base + group_total_size(hdr.len(), dir_sizes(&hdr[OFF_DIRECTORY..])) as u64;
         let word = epoch_word(self.epoch.get(), PRESENT);
-        // SAFETY: as above.
+        // SAFETY: the group's prefix word, inside the mapping.
         unsafe { prefix_atomic(self.log.ring, base as usize).store(word, Ordering::Release) };
         end
     }
@@ -1016,61 +957,7 @@ impl SalWriter {
     /// Mark the unpublished group at `base` as its zone's last member.
     fn mark_zone_end(&self, base: u64) {
         // SAFETY: as `publish`.
-        unsafe { *self.log.ring.add(base as usize + PREFIX_BYTES + OFF_FLAGS) |= FLAG_ZONE_END };
-    }
-
-    /// Lay `g` out at the write cursor, unpublished, stamped with `lsn` and,
-    /// when `in_request_order`, as a later member of its cut. The one encode path.
-    fn lay_out(&self, g: &DirectGroup, lsn: u64, in_request_order: bool) -> Result<u64, WireFault> {
-        let nw = self.parks.len();
-        if let GroupData::Each(each) = g.data {
-            assert_eq!(each.len(), nw, "per-worker rows={} != num_workers={nw}", each.len());
-        }
-        if let GroupData::Blobs(blobs) = g.data {
-            assert_eq!(blobs.len(), nw, "per-worker blobs={} != num_workers={nw}", blobs.len());
-        }
-        debug_assert!(
-            g.schema.is_some() || g.data.is_dataless(),
-            "data without a schema — `decode_sal_frame` rejects a data block without a schema block",
-        );
-
-        let set = g.targets.set.within(nw);
-        let shared = matches!(g.data, GroupData::Same(_));
-        let template = g.request.template();
-        debug_assert!(
-            matches!(g.data, GroupData::Same(_)) || g.data.holders().union(set) == set,
-            "a group addresses every worker it has rows for"
-        );
-        let mut sizes = [0usize; MAX_WORKERS];
-        let n = if shared {
-            sizes[0] = g.msg(&template, 0).size();
-            1
-        } else {
-            for (i, w) in set.iter().enumerate() {
-                sizes[i] = g.msg(&template, w).size();
-            }
-            set.len()
-        };
-        let head = GroupHead {
-            lsn,
-            kind: g.request.kind(),
-            flags: if shared { FLAG_SHARED } else { 0 } | if in_request_order { FLAG_IN_REQUEST_ORDER } else { 0 },
-            width: nw as u8,
-            request_id: g.targets.request_id,
-            target_id: template.target_id,
-            targets: set,
-        };
-        let mut workers = set.iter();
-        let base = self.write_slots(head, &sizes[..n], |slot| {
-            let w = if shared {
-                0
-            } else {
-                workers.next().expect("one payload per addressed worker")
-            };
-            g.msg(&template, w).encode(slot)
-        })?;
-        self.reached.set(self.reached.get().union(set));
-        Ok(base)
+        unsafe { self.log.header_mut(base)[OFF_FLAGS] |= FLAG_ZONE_END };
     }
 
     /// Whether a checkpoint is warranted: the write cursor has crossed the
@@ -1113,13 +1000,6 @@ impl SalWriter {
         self.holds_pushes.get()
     }
 
-    /// The zone LSN a scope opened now would take: its position on the log.
-    /// The epoch is the high word, so LSNs follow SAL order across checkpoints
-    /// and restarts. Two scopes that published anything never share one.
-    fn next_zone_lsn(&self) -> u64 {
-        epoch_word(self.epoch.get(), self.write_cursor.get())
-    }
-
     /// Every scope that published anything took an LSN at or below this; every
     /// scope opened later takes one above it. Moves only when a scope commits.
     pub(crate) fn watermark(&self) -> u64 {
@@ -1134,14 +1014,63 @@ pub(crate) struct SalExcl<'a> {
     writer: &'a SalWriter,
     /// A group was written under this hold, so each later one joins its cut.
     wrote: Cell<bool>,
+    /// The workers groups laid out since the last [`Self::wake`] reached.
+    reached: Cell<WorkerSet>,
     _guard: WriteGuard,
 }
 
 impl<'a> SalExcl<'a> {
+    /// Lay `g` out at the write cursor, unpublished, stamped with `lsn` and,
+    /// when `in_request_order`, as a later member of its cut. The one encode path.
+    fn lay_out(&self, g: &SalGroup, lsn: u64, in_request_order: bool) -> Result<u64, WireFault> {
+        let nw = self.writer.parks.len();
+        let per_worker = match g.data {
+            GroupData::Same(_) => nw,
+            GroupData::Each(each) => each.len(),
+            GroupData::Blobs(blobs) => blobs.len(),
+        };
+        assert_eq!(per_worker, nw, "per-worker entries={per_worker} != num_workers={nw}");
+        debug_assert!(
+            g.schema.is_some() || g.data.is_dataless(),
+            "data without a schema — `decode_sal_frame` rejects a data block without a schema block",
+        );
+
+        let set = g.targets.set.within(nw);
+        let shared = matches!(g.data, GroupData::Same(_));
+        let (kind, template) = g.request.encode();
+        debug_assert!(
+            shared || g.data.holders().union(set) == set,
+            "a group addresses every worker it has rows for"
+        );
+        // A shared group carries one payload, which `msg` builds alike for every
+        // worker; any other carries one per addressed worker, in set order.
+        let payloads = if shared { WorkerSet::one(0) } else { set };
+        let mut sizes = [0usize; MAX_WORKERS];
+        for (i, w) in payloads.iter().enumerate() {
+            sizes[i] = g.msg(&template, w).size();
+        }
+        let head = GroupHead {
+            lsn,
+            kind,
+            flags: if shared { FLAG_SHARED } else { 0 } | if in_request_order { FLAG_IN_REQUEST_ORDER } else { 0 },
+            width: nw as u8,
+            request_id: g.targets.request_id,
+            target_id: template.target_id,
+            targets: set,
+        };
+        let mut workers = payloads.iter();
+        let base = self.writer.write_slots(head, &sizes[..payloads.len()], |slot| {
+            g.msg(&template, workers.next().expect("one payload per size"))
+                .encode(slot)
+        })?;
+        self.reached.set(self.reached.get().union(set));
+        Ok(base)
+    }
+
     /// Write and publish one group, outside every zone. The groups written
     /// under one hold are one cut.
-    pub(crate) fn write(&self, g: &DirectGroup) -> Result<(), WireFault> {
-        let base = self.writer.lay_out(g, 0, self.wrote.get())?;
+    pub(crate) fn write(&self, g: &SalGroup) -> Result<(), WireFault> {
+        let base = self.lay_out(g, 0, self.wrote.get())?;
         self.wrote.set(true);
         self.writer.publish(base);
         Ok(())
@@ -1152,25 +1081,25 @@ impl<'a> SalExcl<'a> {
     /// discards the span. `tag` names the scope for [`ZONE_PANIC`]. `&mut`, so
     /// no scope overlaps another or a rewind.
     pub(crate) fn begin(&mut self, tag: &'static str) -> SalScope<'_> {
-        let w = self.writer;
         SalScope {
-            writer: w,
-            from: w.write_cursor.get(),
-            lsn: w.next_zone_lsn(),
+            from: self.writer.write_cursor.get(),
+            excl: self,
             tag,
-            last_member: Cell::new(None),
+            last_member: None,
             committed: false,
         }
     }
 
     /// `fdatasync` the log, fatal on failure: every group published before the
-    /// call is durable once it resolves.
-    pub(crate) fn sync(&self, reactor: &Reactor, op: &'static str) -> impl Future<Output = ()> {
+    /// call is durable once it resolves. The abort names the caller's location.
+    #[track_caller]
+    pub(crate) fn sync(&self, reactor: &Reactor) -> impl Future<Output = ()> {
+        let at = std::panic::Location::caller();
         let done = reactor.fsync(self.writer.log.file.as_fd());
         async move {
             let rc = done.await;
             if rc < 0 {
-                gnitz_fatal_abort!("SAL fdatasync ({op}) failed rc={rc}");
+                gnitz_fatal_abort!("{at}: SAL fdatasync failed rc={rc}");
             }
         }
     }
@@ -1185,15 +1114,12 @@ impl<'a> SalExcl<'a> {
     pub(crate) fn boot_rewind(&mut self, live_epoch: u32) {
         let w = self.writer;
         w.rewind(live_epoch);
-        w.watermark.set(w.next_zone_lsn() - 1);
+        w.watermark.set(epoch_word(live_epoch, 0) - 1);
     }
 
     /// Wake every worker a group written since the last wake reached.
     pub(crate) fn wake(&self) {
-        let w = self.writer;
-        for worker in w.reached.replace(WorkerSet::EMPTY).iter() {
-            w.parks.wake(worker);
-        }
+        self.writer.parks.wake(self.reached.replace(WorkerSet::EMPTY));
     }
 }
 
@@ -1206,71 +1132,73 @@ impl Drop for SalExcl<'_> {
 /// One publication span on the SAL, holding at most one zone: its `zoned`
 /// groups. Nothing is visible until [`Self::commit`].
 pub(crate) struct SalScope<'a> {
-    writer: &'a SalWriter,
+    excl: &'a SalExcl<'a>,
     /// Where the scope opened — the start of its publish range, and where an
     /// uncommitted drop puts the write cursor back.
     from: u64,
-    /// The zone LSN every zoned group in the scope is stamped with.
-    lsn: u64,
     /// Which scope this is, for [`ZONE_PANIC`]: `"ddl"` or `"commit"`.
     tag: &'static str,
     /// The base of the latest zoned group; `Some` iff a zone is open.
-    last_member: Cell<Option<u64>>,
+    last_member: Option<u64>,
     committed: bool,
 }
 
 impl SalScope<'_> {
-    /// The LSN this scope's zone members carry.
+    /// The LSN this scope's zone members carry: its opening position on the
+    /// log, in an epoch that cannot move while the scope borrows the hold. The
+    /// epoch is the high word, so LSNs follow SAL order across checkpoints and
+    /// restarts; two scopes that published anything never share one.
     pub(crate) fn lsn(&self) -> u64 {
-        self.lsn
+        epoch_word(self.excl.writer.epoch.get(), self.from)
     }
 
     /// Lay `g` out inside the scope, unpublished. `zoned` puts it in the
     /// scope's atomic zone at the scope's LSN; otherwise it is written at LSN 0.
-    pub(crate) fn write(&self, g: &DirectGroup, zoned: bool) -> Result<(), WireFault> {
-        let base = self.writer.lay_out(g, if zoned { self.lsn } else { 0 }, false)?;
+    pub(crate) fn write(&mut self, g: &SalGroup, zoned: bool) -> Result<(), WireFault> {
+        let base = self.excl.lay_out(g, if zoned { self.lsn() } else { 0 }, false)?;
         if zoned {
-            self.last_member.set(Some(base));
+            self.last_member = Some(base);
         }
         Ok(())
     }
 
-    /// The point a group laid out in this scope can be rolled back to, taken
-    /// before laying it out.
-    pub(crate) fn savepoint(&self) -> Savepoint {
-        Savepoint {
-            cursor: self.writer.write_cursor.get(),
-            last_member: self.last_member.get(),
+    /// Run `f`, and take back every group it laid out when it fails: nothing in
+    /// a scope is published, so restoring the cursor and the zone's last member
+    /// is the whole undo.
+    pub(crate) fn all_or_nothing<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, WireFault>,
+    ) -> Result<T, WireFault> {
+        let (cursor, last_member) = (self.excl.writer.write_cursor.get(), self.last_member);
+        let done = f(self);
+        if done.is_err() {
+            self.excl.writer.write_cursor.set(cursor);
+            self.last_member = last_member;
         }
-    }
-
-    /// Take back every group laid out since `sp`: nothing was published, so
-    /// restoring the cursor and the zone's last member is the whole undo.
-    pub(crate) fn roll_back(&self, sp: Savepoint) {
-        self.writer.write_cursor.set(sp.cursor);
-        self.last_member.set(sp.last_member);
+        done
     }
 
     /// Publish the span in layout order. Answers whether a zone closed.
     pub(crate) fn commit(mut self) -> bool {
         self.committed = true;
-        let end = self.writer.write_cursor.get();
+        let w = self.excl.writer;
+        let end = w.write_cursor.get();
         // An empty scope's LSN is the next scope's too, so it must not count.
         if end > self.from {
-            self.writer.watermark.set(self.lsn);
+            w.watermark.set(self.lsn());
         }
-        let Some(last) = self.last_member.get() else {
-            self.writer.publish_range(self.from, end);
+        let Some(last) = self.last_member else {
+            w.publish_range(self.from, end);
             return false;
         };
-        self.writer.mark_zone_end(last);
-        self.writer.publish_range(self.from, last);
+        w.mark_zone_end(last);
+        w.publish_range(self.from, last);
         if ZONE_PANIC.at(self.tag) {
             // SAFETY: `libc::abort` is the whole reason this block is unsafe; it
             // takes no argument and cannot violate an invariant.
             unsafe { libc::abort() };
         }
-        self.writer.publish_range(last, end);
+        w.publish_range(last, end);
         true
     }
 }
@@ -1280,7 +1208,7 @@ impl Drop for SalScope<'_> {
     /// where it opened and the bytes stay for the next group to overwrite.
     fn drop(&mut self) {
         if !self.committed {
-            self.writer.write_cursor.set(self.from);
+            self.excl.writer.write_cursor.set(self.from);
         }
     }
 }
@@ -1340,8 +1268,10 @@ impl SalReader {
     /// addressed to others are stepped over. Stepping past a group that ends its
     /// epoch moves the drain to the start of the next one; a group from another
     /// epoch parks.
-    /// A digest failure under a passing epoch gate can only be corruption, and
-    /// parking on it would read as end-of-drain, so it fail-stops.
+    ///
+    /// A published header that fails verification behind a matching prefix epoch
+    /// can only be damage, and parking on it would read as end-of-drain, so it
+    /// fail-stops.
     fn next(&self) -> Option<(SalMessage, &'static [u8])> {
         loop {
             let cursor = self.read_cursor.get();
@@ -1379,10 +1309,6 @@ impl SalReader {
         catalog_schema: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
     ) -> Option<Inbound> {
         let (msg, wire) = self.next()?;
-        // The kinds [`DirectGroup::push`] and [`DirectGroup::ddl_sync`] frame with
-        // their target's catalog record: the only groups that carry rows.
-        let catalog_record = matches!(msg.head.kind, SalMessageKind::Push | SalMessageKind::DdlSync);
-        let known = |tid, record: &[u8]| catalog_record.then(|| catalog_schema(tid, record)).flatten();
         // Fail-stop: a dropped group diverges this worker from the master.
         let undecodable = |e: String| -> ! {
             gnitz_fatal_abort!(
@@ -1392,12 +1318,14 @@ impl SalReader {
             )
         };
         // Read in place: the rows move once, out of the decoded frame.
-        let mut decoded = decode_sal_frame(wire, known);
+        let mut decoded = decode_sal_frame(wire, catalog_schema);
         let (control, rows) = match &mut decoded {
             Ok(frame) => frame,
             Err(e) => undecodable(std::mem::take(e)),
         };
-        if rows.is_some() && !catalog_record {
+        // [`SalGroup::push`] and [`SalGroup::ddl_sync`] frame the only groups
+        // that carry rows.
+        if rows.is_some() && !matches!(msg.head.kind, SalMessageKind::Push | SalMessageKind::DdlSync) {
             undecodable(format!("a {:?} group carries no rows", msg.head.kind));
         }
         let what = match SalRequest::decode(msg.head.kind, &control.hdr, &wire[control.blob.clone()]) {

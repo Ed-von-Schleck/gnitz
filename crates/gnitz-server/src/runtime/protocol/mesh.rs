@@ -21,7 +21,7 @@ use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::runtime::park::WorkerParks;
+use crate::runtime::park::{Park, WorkerParks, WorkerSet};
 use gnitz_foundation::posix_io;
 use gnitz_wire::MAX_WORKERS;
 use gnitz_zset::algebra::ScatterPlan;
@@ -29,7 +29,7 @@ use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// The default and largest virtual size of one outbox.
-pub(crate) const OUTBOX_BYTES: usize = 1 << 30;
+const OUTBOX_BYTES: usize = 1 << 30;
 const _: () = assert!(
     OUTBOX_BYTES <= u32::MAX as usize,
     "a WAL block stores its size as a u32"
@@ -90,12 +90,8 @@ pub(crate) fn create(outbox_bytes: usize, parks: WorkerParks) -> std::io::Result
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Span {
-    at: u64,
-    len: u64,
-}
-
-impl Span {
-    const EMPTY: Span = Span { at: 0, len: 0 };
+    at: u32,
+    len: u32,
 }
 
 /// An outbox's first bytes: what the publisher's part is, and each receiver's
@@ -148,13 +144,13 @@ pub(crate) struct Round<'b> {
     /// This receiver's non-empty blocks from the round's earlier parts, copied
     /// out raw.
     saved: Vec<Vec<u8>>,
-    /// Every sender of a saved block was consolidated.
-    saved_consolidated: bool,
+    /// Every sender of a block this receiver took in so far this round was
+    /// consolidated, so the round's blocks are merged on close.
+    merge: bool,
 }
 
 /// How far a round's writing has come through its row lists: at
 /// `routed[list][offset..]`.
-#[derive(Clone, Copy)]
 struct Cursor {
     /// How many lists the round's plan routed into: one per receiver, or the
     /// one list every receiver is sent.
@@ -168,19 +164,27 @@ impl Mesh {
         self.parks.len()
     }
 
+    /// This worker's park: where it sleeps for an exchange part, and for a SAL
+    /// group too, since its peers' arrivals and the master's wakes land on it.
+    pub(crate) fn park(&self) -> &'static Park {
+        self.parks.park(self.rank)
+    }
+
     fn arrivals(&self) -> &AtomicU64 {
         // SAFETY: the region's first 8 bytes, 8-aligned, live for the process.
         unsafe { AtomicU64::from_ptr(self.base.cast()) }
     }
 
+    /// Where worker `w`'s outbox for the current part starts in the region.
+    fn outbox_at(&self, w: usize) -> usize {
+        assert!(w < self.nw(), "worker {w} of {}", self.nw());
+        HEADER_BYTES + (2 * w + self.parity()) * self.outbox_bytes
+    }
+
     /// Worker `w`'s outbox for the current part.
     fn outbox(&self, w: usize) -> *mut u8 {
-        assert!(w < self.nw(), "worker {w} of {}", self.nw());
-        // SAFETY: `w < nw`, so the outbox lies inside the region.
-        unsafe {
-            self.base
-                .add(HEADER_BYTES + (2 * w + self.parity()) * self.outbox_bytes)
-        }
+        // SAFETY: `outbox_at` checked `w < nw`, so the outbox lies inside the region.
+        unsafe { self.base.add(self.outbox_at(w)) }
     }
 
     fn parity(&self) -> usize {
@@ -210,7 +214,7 @@ impl Mesh {
             consolidated: fold && batch.is_consolidated(),
             unsent: Some((Cursor { lists, list: 0, offset: 0 }, batch)),
             saved: Vec::new(),
-            saved_consolidated: true,
+            merge: true,
         };
         self.send_part(&mut round);
         round
@@ -223,7 +227,7 @@ impl Mesh {
             drained: round.drained as u64,
             consolidated: round.consolidated as u64,
             more: 0,
-            blocks: [Span::EMPTY; MAX_WORKERS],
+            blocks: [Span { at: 0, len: 0 }; MAX_WORKERS],
         };
         let mut end = BLOCKS_AT;
         if let Some((at, batch)) = &mut round.unsent {
@@ -260,7 +264,7 @@ impl Mesh {
                 let Some((n, len)) = batch.encode_scattered_prefix(rest, out) else {
                     return (end, true);
                 };
-                let span = Span { at: end as u64, len: len as u64 };
+                let span = Span { at: end as u32, len: len as u32 };
                 match at.lists {
                     1 => blocks[..nw].fill(span),
                     _ => blocks[at.list] = span,
@@ -287,9 +291,7 @@ impl Mesh {
         let nw = self.nw() as u64;
         // Release: a peer that sees the count sees the outbox writes above.
         if self.arrivals().fetch_add(1, Ordering::AcqRel) == (self.part + 1) * nw - 1 {
-            for w in (0..self.nw()).filter(|&w| w != self.rank) {
-                self.parks.wake(w);
-            }
+            self.parks.wake(WorkerSet::ALL.without(self.rank));
         }
     }
 
@@ -299,7 +301,7 @@ impl Mesh {
         let p = self.parity();
         let end = end.next_multiple_of(PAGE_BYTES);
         if self.resident[p] > end + RESIDENT_SLACK_BYTES {
-            let at = HEADER_BYTES + (2 * self.rank + p) * self.outbox_bytes + end;
+            let at = self.outbox_at(self.rank) + end;
             // `[end, resident)` of this worker's own outbox, which every peer is done
             // with. Best-effort: a refusal only leaves the pages resident.
             let _ = posix_io::retry_eintr(|| unsafe {
@@ -330,7 +332,7 @@ impl Mesh {
             return None;
         }
         let view = round.view;
-        let (mut drained, mut more, mut consolidated) = (true, false, round.saved_consolidated);
+        let (mut drained, mut more) = (true, false);
         let mut blocks = Vec::with_capacity(self.nw());
         for peer in 0..self.nw() {
             // SAFETY: the peer wrote its head before the arrival `complete`
@@ -346,33 +348,32 @@ impl Mesh {
             more |= head.more != 0;
             let block = self.block(peer, head.blocks[self.rank]);
             if !block.is_empty() {
-                consolidated &= head.consolidated != 0;
+                round.merge &= head.consolidated != 0;
                 blocks.push(block);
             }
         }
         if more {
             round.saved.extend(blocks.into_iter().map(<[u8]>::to_vec));
-            round.saved_consolidated = consolidated;
             self.part += 1;
             self.send_part(round);
             return None;
         }
-        let schema = round.schema;
+        let schema = &round.schema;
         let slices: Vec<MemBatch> = round
             .saved
             .iter()
             .map(Vec::as_slice)
             .chain(blocks)
             .map(|block| {
-                MemBatch::of_wal_block(block, &schema)
+                MemBatch::of_wal_block(block, schema)
                     .unwrap_or_else(|e| gnitz_fatal_abort!("exchange of view {view}: a peer's block: {e}"))
             })
             .collect();
         // Z-set `+` over the round's slices: merged where every sender's were
         // consolidated, else concatenated in order.
-        let rows = match consolidated {
-            true => merge_consolidated(&slices, &schema),
-            false => Batch::concat(&schema, slices.iter().cloned()),
+        let rows = match round.merge {
+            true => merge_consolidated(&slices, schema),
+            false => Batch::concat(schema, slices.iter().cloned()),
         };
         self.part += 1;
         self.in_round = false;
@@ -381,24 +382,16 @@ impl Mesh {
 
     /// The block `span` names in `peer`'s outbox for the current part.
     fn block(&self, peer: usize, span: Span) -> &[u8] {
-        if span.len == 0 {
+        let (at, len) = (span.at as usize, span.len as usize);
+        if len == 0 {
             return &[];
         }
-        let inside = span.at >= BLOCKS_AT as u64
-            && span
-                .at
-                .checked_add(span.len)
-                .is_some_and(|e| e <= self.outbox_bytes as u64);
-        if !inside {
-            gnitz_fatal_abort!(
-                "exchange: worker {peer}'s head names bytes [{}, +{}) outside its outbox",
-                span.at,
-                span.len
-            );
+        if at < BLOCKS_AT || at + len > self.outbox_bytes {
+            gnitz_fatal_abort!("exchange: worker {peer}'s head names bytes [{at}, +{len}) outside its outbox");
         }
         // SAFETY: checked above to lie inside the peer's outbox, which it
         // rewrites only after this worker's next arrival.
-        unsafe { std::slice::from_raw_parts(self.outbox(peer).add(span.at as usize), span.len as usize) }
+        unsafe { std::slice::from_raw_parts(self.outbox(peer).add(at), len) }
     }
 }
 

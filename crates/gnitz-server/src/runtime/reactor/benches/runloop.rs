@@ -5,8 +5,8 @@ use gnitz_foundation::perf::{voluntary_ctx_switches, Counter};
 
 use super::super::test_support::*;
 use super::*;
+use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::SalMessageKind;
-use crate::runtime::sal::WorkerSet;
 use crate::runtime::wire::WireMsg;
 
 const PASSES: u64 = 100_000;

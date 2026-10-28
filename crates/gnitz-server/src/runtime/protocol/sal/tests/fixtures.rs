@@ -8,63 +8,51 @@
 use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::test_support::try_poll_once;
-use gnitz_zset::schema::encode_schema_block;
 
-/// A writer over a fresh `size`-byte ring, written at one worker per park of
-/// `parks`. Unrewound, as a boot's writer is before [`SalExcl::boot_rewind`].
-pub(crate) fn test_writer(size: usize, parks: WorkerParks) -> SalWriter {
+/// A writer over a fresh `size`-byte ring written at `workers` workers, rewound
+/// to cursor 0 of `epoch` as a boot leaves it.
+pub(crate) fn test_log(size: usize, workers: usize, epoch: u32) -> SalWriter {
     let len = ANCHOR_BYTES + size;
     // Leaked: open and mapped for the rest of the process.
     let file: &'static File = Box::leak(Box::new(gnitz_foundation::posix_io::memfd(c"test_sal").expect("memfd")));
-    SalWriter::new(SalLog::map(file, len).expect("map the test SAL"), parks)
+    let parks = WorkerParks::create(workers).expect("map the parks");
+    let writer = SalWriter::new(SalLog::map(file, len).expect("map the test SAL"), parks);
+    writer.excl().boot_rewind(epoch);
+    writer
 }
 
-/// A SAL over its own file.
-pub(crate) struct TestLog {
-    pub(crate) writer: SalWriter,
-}
-
-impl TestLog {
-    /// A log with a `size`-byte ring written at `workers` workers, rewound to
-    /// cursor 0 of `epoch`.
-    pub(crate) fn new(size: usize, workers: usize, epoch: u32) -> TestLog {
-        let parks = WorkerParks::create(workers).expect("map the parks");
-        let writer = test_writer(size, parks);
-        writer.rewind(epoch);
-        TestLog { writer }
-    }
-
+impl SalWriter {
     /// Every worker's park: where the writer's wakes land.
     pub(crate) fn parks(&self) -> WorkerParks {
-        self.writer.parks
+        self.parks
     }
 
     /// The ring's first byte — offset 0 of every group base.
     pub(crate) fn ptr(&self) -> *mut u8 {
-        self.writer.log.ring
+        self.log.ring
     }
 
     /// The anchor page's first byte, the start of the whole file.
     pub(crate) fn anchor_ptr(&self) -> *mut u8 {
-        self.writer.log.ring.wrapping_sub(ANCHOR_BYTES)
+        self.log.ring.wrapping_sub(ANCHOR_BYTES)
     }
 
     pub(crate) fn log(&self) -> SalLog {
-        self.writer.log
+        self.log
     }
 
     pub(crate) fn cursor(&self) -> u64 {
-        self.writer.write_cursor.get()
+        self.write_cursor.get()
     }
 
     /// Sole write access; nothing else in a test holds it.
     pub(crate) fn excl(&self) -> SalExcl<'_> {
-        try_poll_once(self.writer.lock()).expect("uncontended")
+        try_poll_once(self.lock()).expect("uncontended")
     }
 
     /// Place the write cursor by hand.
     pub(crate) fn seek(&self, cursor: u64) {
-        self.writer.write_cursor.set(cursor);
+        self.write_cursor.set(cursor);
     }
 
     /// Append one group sending worker `w` the bytes `payloads[w]` verbatim, an
@@ -87,23 +75,23 @@ impl TestLog {
             lsn,
             kind,
             flags: 0,
-            width: self.writer.parks.len() as u8,
+            width: self.parks.len() as u8,
             request_id: 0,
             target_id: target,
-            targets: written().fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w)),
+            targets: written().map(|(w, _)| w).collect(),
         };
         let mut bytes = written().map(|(_, p)| *p);
-        let base = self.writer.write_slots(head, &sizes, |slot| {
+        let base = self.write_slots(head, &sizes, |slot| {
             slot.copy_from_slice(bytes.next().expect("one payload per size"))
         })?;
-        self.writer.publish(base);
+        self.publish(base);
         Ok(base)
     }
 
     /// One committed zone of `groups`: its LSN and every member's base.
-    pub(crate) fn commit_zone(&self, groups: &[DirectGroup]) -> (u64, Vec<u64>) {
+    pub(crate) fn commit_zone(&self, groups: &[SalGroup]) -> (u64, Vec<u64>) {
         let mut excl = self.excl();
-        let scope = excl.begin("test");
+        let mut scope = excl.begin("test");
         let bases = groups
             .iter()
             .map(|g| {
@@ -119,26 +107,18 @@ impl TestLog {
 
     /// One committed zone of `DdlSync` groups, as a DDL's broadcasts write it.
     pub(crate) fn ddl_zone(&self, groups: &[(SysFamily, &Batch)]) {
-        let records: Vec<Vec<u8>> = groups
+        let groups: Vec<SalGroup> = groups
             .iter()
-            .map(|(family, _)| encode_schema_block(family.schema()))
-            .collect();
-        let groups: Vec<DirectGroup> = records
-            .iter()
-            .zip(groups)
-            .map(|(record, &(family, batch))| DirectGroup::ddl_sync(family.id(), record, batch))
+            .map(|&(family, batch)| SalGroup::ddl_sync(family, batch))
             .collect();
         self.commit_zone(&groups);
     }
 
     /// The header of the group at `base`, sized by its own payload count.
     pub(crate) fn header_mut(&mut self, base: u64) -> &mut [u8] {
-        let at = base as usize + PREFIX_BYTES;
-        // SAFETY: a test only asks for a header it wrote, so both reads are mapped.
-        unsafe {
-            let fixed = &*(self.ptr().add(at) as *const [u8; HDR_PREFIX]);
-            std::slice::from_raw_parts_mut(self.ptr().add(at), header_len(fixed))
-        }
+        // SAFETY: a test only asks for a header it wrote, and `&mut self` holds
+        // every other reference off.
+        unsafe { self.log.header_mut(base) }
     }
 
     /// Flip one bit of the header at `base`.
@@ -160,6 +140,6 @@ pub(crate) fn group_at(log: SalLog, base: u64) -> SalMessage {
 pub(crate) fn holders_of(data: &GroupData) -> GroupTargets {
     GroupTargets {
         set: data.holders(),
-        ..GroupTargets::UNADDRESSED
+        ..GroupTargets::SILENT
     }
 }

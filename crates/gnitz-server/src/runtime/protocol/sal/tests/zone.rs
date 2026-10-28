@@ -1,6 +1,8 @@
 use super::*;
-use crate::runtime::sal::fixtures::{group_at, TestLog};
-use crate::runtime::sal::{Apply, DirectGroup, GroupData, GroupTargets, SalMessageKind, PREFIX_BYTES};
+use crate::runtime::sal::fixtures::{group_at, test_log};
+use crate::runtime::sal::{
+    epoch_word, Apply, GroupData, GroupTargets, SalGroup, SalMessageKind, SalWriter, PREFIX_BYTES,
+};
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::encode_schema_block;
@@ -32,7 +34,7 @@ fn walk(log: SalLog) -> Vec<(u64, u64)> {
 /// generation from the header's own epoch, and no single flip zeroes the word.
 #[test]
 fn a_closing_members_prefix_is_not_single_bit_zeroable() {
-    let log = TestLog::new(SIZE, 1, 1);
+    let log = test_log(SIZE, 1, 1);
     let (lsn, bases) = log.zone(&[11]);
     log.command();
 
@@ -55,7 +57,7 @@ fn a_closing_members_prefix_is_not_single_bit_zeroable() {
 /// All-zero anchor bytes are a fresh file.
 #[test]
 fn a_fresh_file_anchors_epoch_0() {
-    let log = TestLog::new(SIZE, 1, 1);
+    let log = test_log(SIZE, 1, 1);
     unsafe { std::ptr::write_bytes(log.anchor_ptr(), 0, PREFIX_BYTES) };
     let view = log.log();
     assert_eq!(view.anchor(), Ok(0));
@@ -66,7 +68,7 @@ fn a_fresh_file_anchors_epoch_0() {
 /// Any flipped bit of the anchor fails the boot.
 #[test]
 fn a_flipped_anchor_bit_fails_the_boot() {
-    let log = TestLog::new(SIZE, 1, 3);
+    let log = test_log(SIZE, 1, 3);
     let view = log.log();
     assert_eq!(view.anchor(), Ok(3));
 
@@ -85,12 +87,12 @@ fn a_flipped_anchor_bit_fails_the_boot() {
 /// which the walk rejects by their header epoch.
 #[test]
 fn the_next_epochs_anchor_over_the_old_ring_is_an_empty_tail() {
-    let log = TestLog::new(SIZE, 1, 1);
+    let log = test_log(SIZE, 1, 1);
     log.zone(&[11]);
     log.zone(&[21]);
     assert_eq!(committed(log.log()).len(), 2);
 
-    log.writer.write_anchor(2);
+    log.write_anchor(2);
     let tail = CommittedTail::read(log.log()).expect("an empty tail");
     assert_eq!((tail.live_epoch(), tail.groups().count()), (3, 0));
 }
@@ -99,7 +101,7 @@ fn the_next_epochs_anchor_over_the_old_ring_is_an_empty_tail() {
 /// epoch's groups are leftovers, and the next group lands at 0.
 #[test]
 fn a_checkpoint_reset_durably_moves_the_anchor_epoch() {
-    let log = TestLog::new(SIZE, 1, 1);
+    let log = test_log(SIZE, 1, 1);
     log.zone(&[11]);
     log.zone(&[21]);
     log.excl().checkpoint_reset();
@@ -118,7 +120,7 @@ fn a_checkpoint_reset_durably_moves_the_anchor_epoch() {
 /// A previous epoch's leftover past the new frontier ends the log.
 #[test]
 fn a_previous_epochs_leftover_ends_the_walk() {
-    let log = TestLog::new(SIZE, 1, 1);
+    let log = test_log(SIZE, 1, 1);
     log.zone(&[11]);
     log.zone(&[22]);
     log.zone(&[33]);
@@ -138,9 +140,9 @@ fn a_previous_epochs_leftover_ends_the_walk() {
 /// a log, damages it, and returns the zones before the stop.
 #[test]
 fn a_defect_ends_the_committed_set_at_the_zone_before_it() {
-    type Row = fn(&mut TestLog) -> Vec<u64>;
+    type Row = fn(&mut SalWriter) -> Vec<u64>;
     // Damage to member `i` of the middle one of three three-member zones.
-    fn middle_zone_member(log: &mut TestLog, i: usize) -> Vec<u64> {
+    fn middle_zone_member(log: &mut SalWriter, i: usize) -> Vec<u64> {
         let (first, _) = log.zone(&[11, 12, 13]);
         let (_, second) = log.zone(&[21, 22, 23]);
         log.zone(&[31, 32, 33]);
@@ -185,7 +187,7 @@ fn a_defect_ends_the_committed_set_at_the_zone_before_it() {
         }),
     ];
     for (case, build) in rows {
-        let mut log = TestLog::new(SIZE, NW, 1);
+        let mut log = test_log(SIZE, NW, 1);
         let before = build(&mut log);
         assert_eq!(committed(log.log()), before, "{case}: the zones before the stop");
     }
@@ -194,7 +196,7 @@ fn a_defect_ends_the_committed_set_at_the_zone_before_it() {
 /// An unclosed tail zone costs nothing, torn or not.
 #[test]
 fn an_unclosed_tail_zone_costs_nothing() {
-    let mut log = TestLog::new(SIZE, 1, 1);
+    let mut log = test_log(SIZE, 1, 1);
     let (first, _) = log.zone(&[11]);
     let (second, _) = log.zone(&[21]);
     let torn = log.open_member();
@@ -212,7 +214,7 @@ fn an_unclosed_tail_zone_costs_nothing() {
 #[test]
 fn the_demotion_is_global_across_slots() {
     for victim in 0..NW as u32 {
-        let log = TestLog::new(SIZE, NW, 1);
+        let log = test_log(SIZE, NW, 1);
         let (_, bases) = log.push_zone(&[TID]);
         log.damage_slot(bases[0], victim);
         assert_eq!(committed(log.log()), [], "slot {victim}");
@@ -223,16 +225,16 @@ fn the_demotion_is_global_across_slots() {
 /// into a base table's batch — costs the zone nothing.
 #[test]
 fn slot_damage_in_an_unzoned_group_does_not_stop_the_walk() {
-    let log = TestLog::new(SIZE, NW, 1);
+    let log = test_log(SIZE, NW, 1);
     let batch = rows();
     let record = encode_schema_block(batch.schema());
     let data = GroupData::Same(batch.wire_whole());
     let (member, stream) = (
-        DirectGroup::push(TID, &record, data, GroupTargets::UNADDRESSED),
-        DirectGroup::push(TID + 1, &record, data, GroupTargets::UNADDRESSED),
+        SalGroup::push(TID, &record, data, GroupTargets::SILENT),
+        SalGroup::push(TID + 1, &record, data, GroupTargets::SILENT),
     );
     let mut excl = log.excl();
-    let scope = excl.begin("test");
+    let mut scope = excl.begin("test");
     scope.write(&member, true).expect("group fits");
     let unzoned = log.cursor();
     scope.write(&stream, false).expect("group fits");
@@ -259,13 +261,13 @@ fn rows() -> Batch {
 }
 
 /// Log shapes and damage for the recovery walk.
-impl TestLog {
+impl SalWriter {
     /// A committed zone of one control-only `DdlSync` group per target: its
     /// LSN and every member's base.
     fn zone(&self, targets: &[u64]) -> (u64, Vec<u64>) {
-        let groups: Vec<DirectGroup> = targets
+        let groups: Vec<SalGroup> = targets
             .iter()
-            .map(|&family| DirectGroup::new(Apply::DdlSync { family }))
+            .map(|&family| SalGroup::new(Apply::DdlSync { family }))
             .collect();
         self.commit_zone(&groups)
     }
@@ -274,11 +276,11 @@ impl TestLog {
     /// own payload of [`rows`].
     fn push_zone(&self, targets: &[u64]) -> (u64, Vec<u64>) {
         let batch = rows();
-        let each = vec![batch.wire_whole(); self.writer.num_workers()];
+        let each = vec![batch.wire_whole(); self.num_workers()];
         let record = encode_schema_block(batch.schema());
-        let groups: Vec<DirectGroup> = targets
+        let groups: Vec<SalGroup> = targets
             .iter()
-            .map(|&t| DirectGroup::push(t, &record, GroupData::Each(&each), GroupTargets::UNADDRESSED))
+            .map(|&t| SalGroup::push(t, &record, GroupData::Each(&each), GroupTargets::SILENT))
             .collect();
         self.commit_zone(&groups)
     }
@@ -291,7 +293,12 @@ impl TestLog {
     /// The first member of a zone that never closes, at the LSN the next scope
     /// would take — what a crash between a zone's groups leaves. Returns its base.
     fn open_member(&self) -> u64 {
-        self.write(21, self.writer.next_zone_lsn(), SalMessageKind::DdlSync, &[&[0u8; 64]])
+        self.write(
+            21,
+            epoch_word(self.epoch(), self.cursor()),
+            SalMessageKind::DdlSync,
+            &[&[0u8; 64]],
+        )
     }
 
     /// Corrupt one byte of worker `w`'s payload of the group at `base`.

@@ -1,11 +1,12 @@
 //! The futex park every transport sleeps through: [`Park`], one word a side
-//! sleeps on and its peer wakes, and [`WorkerParks`], the mapping where each
-//! worker sleeps for a SAL group or an exchange part.
+//! sleeps on and its peer wakes, [`WorkerParks`], the mapping where each
+//! worker sleeps for a SAL group or an exchange part, and [`WorkerSet`], a
+//! subset of the workers.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use gnitz_foundation::posix_io;
-use gnitz_wire::MAX_WORKERS;
+use gnitz_wire::{low_bits_mask, BitIter, MAX_WORKERS};
 
 // ---------------------------------------------------------------------------
 // Futex wait/wake
@@ -35,20 +36,22 @@ fn futex(word: *const AtomicU32, op: libc::c_int, val: u32) -> Result<(), i32> {
 
 /// Wake the waiter parked on `word`. Aborts rather than reporting: a lost wake
 /// leaves the peer blocked on a queue that has work in it, so there is no
-/// caller-side answer to distinguish. `site` names the caller in the abort.
+/// caller-side answer to distinguish. The abort names the caller's location.
 #[inline]
-fn futex_wake(word: *const AtomicU32, site: &str) {
+#[track_caller]
+fn futex_wake(word: *const AtomicU32) {
     if let Err(e) = futex(word, libc::FUTEX_WAKE, 1) {
-        futex_failed(site, e);
+        futex_failed(e);
     }
 }
 
-/// Outlined so `site` is not spilled onto the stack on the paths that never
-/// abort.
+/// Outlined so the caller's location is not spilled onto the stack on the
+/// paths that never abort.
 #[cold]
 #[inline(never)]
-fn futex_failed(site: &str, errno: i32) -> ! {
-    gnitz_fatal_abort!("{}: futex failed: errno={}", site, errno);
+#[track_caller]
+fn futex_failed(errno: i32) -> ! {
+    gnitz_fatal_abort!("{}: futex failed: errno={errno}", std::panic::Location::caller());
 }
 
 // ---------------------------------------------------------------------------
@@ -72,25 +75,29 @@ const ARMED: u64 = 1 << 63;
 ///   All four are SeqCst, so in each pair at least one side sees the other: the
 ///   peer sees the arm and takes it, or the parker's re-test sees the stored word
 ///   and does not sleep. A wake that finds no arm costs no RMW.
-#[repr(transparent)]
-pub(super) struct Park(AtomicU64);
+///
+/// A park is alone on its cache line.
+#[repr(C, align(64))]
+pub(crate) struct Park(AtomicU64);
 
 impl Park {
+    /// `n` parks in one fresh shared mapping, never unmapped.
+    pub(super) fn map(n: usize) -> std::io::Result<&'static [Park]> {
+        let base = posix_io::map_shared(None, (n * size_of::<Park>()).max(1))?;
+        // SAFETY: a fresh page-aligned shared mapping of at least `n` parks, never
+        // unmapped; zeroed is a `Park` nobody sleeps on.
+        Ok(unsafe { std::slice::from_raw_parts(base.cast(), n) })
+    }
+
     #[inline]
     pub(super) fn value(&self) -> u64 {
         self.0.load(Ordering::Acquire) & !ARMED
     }
 
-    /// Arm, returning the value the arm was taken at.
-    #[inline]
-    pub(super) fn arm(&self) -> u64 {
-        self.0.fetch_or(ARMED, Ordering::SeqCst) & !ARMED
-    }
-
     /// Drop the arm. The result is deliberately unused: binding it would force a
     /// `lock cmpxchg` retry loop where a discarded one lowers to a `lock and`.
     #[inline]
-    pub(super) fn disarm(&self) {
+    fn disarm(&self) {
         self.0.fetch_and(!ARMED, Ordering::SeqCst);
     }
 
@@ -104,7 +111,8 @@ impl Park {
     /// after the load and so followed by a re-test that sees the caller's word.
     /// So a failed CAS neither retries nor wakes.
     #[inline]
-    pub(super) fn take_arm(&self, site: &str) {
+    #[track_caller]
+    pub(super) fn take_arm(&self) {
         let cur = self.0.load(Ordering::SeqCst);
         if cur & ARMED != 0
             && self
@@ -112,17 +120,18 @@ impl Park {
                 .compare_exchange(cur, (cur + 1) & !ARMED, Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
         {
-            futex_wake(self.futex_word(), site);
+            futex_wake(self.futex_word());
         }
     }
 
     /// The value's one writer stores `v`, waking the parker iff it armed first.
     /// The swap takes the arm, so later publishes spend no syscall until a re-arm.
     #[inline]
-    pub(super) fn publish(&self, v: u64, site: &str) {
+    #[track_caller]
+    pub(super) fn publish(&self, v: u64) {
         debug_assert_eq!(v & ARMED, 0, "a value reached the armed bit");
         if self.0.swap(v, Ordering::AcqRel) & ARMED != 0 {
-            futex_wake(self.futex_word(), site);
+            futex_wake(self.futex_word());
         }
     }
 
@@ -130,32 +139,46 @@ impl Park {
     /// parker. The arm stays the parker's to clear: cleared here in a second RMW,
     /// it could erase an arm taken after the wake.
     #[inline]
-    pub(super) fn bump(&self, site: &str) {
+    #[track_caller]
+    pub(super) fn bump(&self) {
         if self.0.fetch_add(1, Ordering::AcqRel) & ARMED != 0 {
-            futex_wake(self.futex_word(), site);
+            futex_wake(self.futex_word());
         }
+    }
+
+    /// Arm unless `still_waiting`, tested behind the arm, says the wait is over:
+    /// the futex word and the value a wait on it compares, with the arm left
+    /// set; or `None`, disarmed.
+    #[inline]
+    pub(super) fn arm_for(&self, still_waiting: impl FnOnce() -> bool) -> Option<(*const AtomicU32, u32)> {
+        let at = self.0.fetch_or(ARMED, Ordering::SeqCst) & !ARMED;
+        if still_waiting() {
+            return Some((self.futex_word(), at as u32));
+        }
+        self.disarm();
+        None
     }
 
     /// Arm, then sleep until a wake unless `still_waiting`, tested behind the arm,
     /// says otherwise. Disarms either way.
-    pub(super) fn park(&self, site: &str, still_waiting: impl FnOnce() -> bool) {
-        let at = self.arm();
-        // A wake, a moved value and a signal all return; anything else aborts.
-        if still_waiting() {
-            if let Err(e) = futex(self.futex_word(), libc::FUTEX_WAIT, at as u32) {
+    #[track_caller]
+    pub(crate) fn park(&self, still_waiting: impl FnOnce() -> bool) {
+        if let Some((word, at)) = self.arm_for(still_waiting) {
+            // A wake, a moved value and a signal all return; anything else aborts.
+            if let Err(e) = futex(word, libc::FUTEX_WAIT, at) {
                 if e != libc::EAGAIN && e != libc::EINTR {
-                    futex_failed(site, e);
+                    futex_failed(e);
                 }
             }
+            self.disarm();
         }
-        self.disarm();
     }
 
     /// The 32-bit futex word aliasing the low half. A ring cursor advances by at
     /// most its ring's capacity, and a wake sequence or a take by one, so under
     /// 2^32 an advance always moves the half a futex compares.
     #[inline]
-    pub(super) fn futex_word(&self) -> *const AtomicU32 {
+    fn futex_word(&self) -> *const AtomicU32 {
         &self.0 as *const AtomicU64 as *const AtomicU32
     }
 
@@ -166,57 +189,100 @@ impl Park {
 }
 
 // ---------------------------------------------------------------------------
-// WorkerParks
+// WorkerSet
 // ---------------------------------------------------------------------------
 
-/// One worker's park word, alone on its cache line.
-#[repr(C, align(64))]
-struct Line(Park);
+/// A subset of the workers. `ALL` is unbounded; every other set holds only
+/// launched workers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct WorkerSet(pub(super) u64);
+
+const _: () = assert!(MAX_WORKERS <= u64::BITS as usize);
+
+impl WorkerSet {
+    pub(crate) const EMPTY: Self = WorkerSet(0);
+    pub(crate) const ALL: Self = WorkerSet(u64::MAX);
+
+    pub(crate) const fn one(w: usize) -> Self {
+        WorkerSet(1 << w)
+    }
+
+    pub(crate) const fn with(self, w: usize) -> Self {
+        WorkerSet(self.0 | 1 << w)
+    }
+
+    pub(crate) const fn without(self, w: usize) -> Self {
+        WorkerSet(self.0 & !(1 << w))
+    }
+
+    pub(crate) const fn within(self, nw: usize) -> Self {
+        WorkerSet(self.0 & low_bits_mask(nw))
+    }
+
+    pub(crate) const fn contains(self, w: usize) -> bool {
+        self.0 >> w & 1 == 1
+    }
+
+    pub(crate) const fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    pub(crate) const fn union(self, other: Self) -> Self {
+        WorkerSet(self.0 | other.0)
+    }
+
+    /// `w`'s position among the members, ascending; `None` when it is not one.
+    pub(crate) const fn position(self, w: usize) -> Option<usize> {
+        match self.contains(w) {
+            true => Some((self.0 & low_bits_mask(w)).count_ones() as usize),
+            false => None,
+        }
+    }
+
+    pub(crate) fn iter(self) -> BitIter {
+        BitIter(self.0)
+    }
+}
+
+impl FromIterator<usize> for WorkerSet {
+    fn from_iter<I: IntoIterator<Item = usize>>(workers: I) -> Self {
+        workers.into_iter().fold(WorkerSet::EMPTY, WorkerSet::with)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkerParks
+// ---------------------------------------------------------------------------
 
 /// Every worker's park: where a worker sleeps for a SAL group or an exchange part,
 /// and what the master and its peers wake. Mapped once before the fork, never unmapped.
 #[derive(Clone, Copy)]
-pub(crate) struct WorkerParks(&'static [Line]);
+pub(crate) struct WorkerParks(&'static [Park]);
 
 impl WorkerParks {
     pub(crate) fn create(nw: usize) -> std::io::Result<Self> {
         assert!(nw <= MAX_WORKERS, "{nw} workers: a WorkerSet holds at most MAX_WORKERS");
-        let base = posix_io::map_shared(None, (nw * size_of::<Line>()).max(1))?;
-        // SAFETY: a fresh page-aligned shared mapping of at least `nw` lines, never
-        // unmapped; zeroed is a `Park` nobody sleeps on.
-        Ok(WorkerParks(unsafe { std::slice::from_raw_parts(base.cast(), nw) }))
+        Ok(WorkerParks(Park::map(nw)?))
     }
 
-    pub(crate) fn len(self) -> usize {
+    pub(super) fn len(self) -> usize {
         self.0.len()
     }
 
-    /// Wake worker `w` if it sleeps.
-    pub(crate) fn wake(self, w: usize) {
-        self.0[w].0.bump("WorkerParks::wake");
+    /// Wake every worker of `set` that sleeps; members past the launched
+    /// workers are none.
+    #[track_caller]
+    pub(super) fn wake(self, set: WorkerSet) {
+        for w in set.within(self.0.len()).iter() {
+            self.0[w].bump();
+        }
     }
 
-    /// Worker `w`'s park; one per worker process.
-    pub(crate) fn park(self, w: usize) -> WorkerPark {
-        WorkerPark(&self.0[w].0)
-    }
-
-    /// Worker `w`'s park word: its value is how many wakes `w` was sent.
-    #[cfg(test)]
-    pub(super) fn word(self, w: usize) -> &'static Park {
-        &self.0[w].0
-    }
-}
-
-/// A worker's park on the SAL and its exchange rounds, ended by a
-/// [`WorkerParks::wake`].
-pub(crate) struct WorkerPark(&'static Park);
-
-impl WorkerPark {
-    /// Sleep until the next wake, unless `still_empty` says otherwise.
-    /// No timeout: `PR_SET_PDEATHSIG` kills the worker when the master dies.
-    pub(crate) fn park(&self, still_empty: impl FnOnce() -> bool) {
-        self.0.park("WorkerPark::park", still_empty);
+    /// Worker `w`'s park: where it sleeps for a SAL group or an exchange part; its
+    /// value counts the wakes `w` was sent. No timeout: `PR_SET_PDEATHSIG` kills
+    /// the worker when the master dies.
+    pub(crate) fn park(self, w: usize) -> &'static Park {
+        &self.0[w]
     }
 }
 

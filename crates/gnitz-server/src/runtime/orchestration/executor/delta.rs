@@ -15,12 +15,10 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 
-use super::{
-    all_ticked, encode_response_into, forward_scan, fresh_read_lock, send_fault, send_msg, target_kind, Access, Shared,
-};
+use super::{all_ticked, forward_scan, fresh_read_lock, send_fault, send_msg, target_kind, Access, Shared};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, PeerGone, ReadGuard, SendBody, TrainLease};
-use crate::runtime::wire as ipc;
+use crate::runtime::wire::WireMsg;
 use gnitz_wire::txn_frame::{decode_delta_items, delta_poll_kept, DeltaPollItem};
 use gnitz_wire::{ControlHeader, Target, WireFault, WireStatus};
 
@@ -166,8 +164,8 @@ pub(super) async fn handle_delta_poll(
 }
 
 /// The frame that ends a delta train: the cursor to read `view` from next.
-fn terminal(view: u64, round: u64, tag: u64) -> ipc::WireMsg<'static> {
-    ipc::WireMsg {
+fn terminal(view: u64, round: u64, tag: u64) -> WireMsg<'static> {
+    WireMsg {
         target_id: view,
         arg0: round,
         arg1: tag,
@@ -389,8 +387,8 @@ impl Subscriptions {
             if sub.told.replace(after) != after {
                 let tid = feed.key.view.tid;
                 peer.cork_with(|out| {
-                    out.extend_from_slice(&pushed_marker(tid, sub.id));
-                    encode_response_into(out, terminal(tid, after, feed.tag));
+                    pushed_marker(tid, sub.id).encode_framed(out);
+                    terminal(tid, after, feed.tag).encode_framed(out);
                 });
             }
         }
@@ -445,15 +443,15 @@ impl Subscriptions {
             Ok(()) => {
                 self.tell(peer);
                 self.out.synced();
-                ipc::WireMsg::default()
+                WireMsg::default()
             }
-            Err(fault) => ipc::WireMsg::fault(fault),
+            Err(fault) => WireMsg::fault(fault),
         };
         let flags = gnitz_wire::WireFlags {
             lane: gnitz_wire::WireLane::SyncAnswer,
             ..Default::default()
         };
-        peer.cork_with(|out| encode_response_into(out, ipc::WireMsg { flags, ..end }));
+        peer.cork_with(|out| WireMsg { flags, ..end }.encode_framed(out));
     }
 
     /// Ship every queued train behind what is corked.
@@ -472,38 +470,32 @@ impl Subscriptions {
 }
 
 /// The frame that opens a pushed train of subscription `id`.
-fn pushed_marker(view: u64, id: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_response_into(
-        &mut out,
-        ipc::WireMsg {
-            target_id: view,
-            arg0: id,
-            flags: gnitz_wire::WireFlags {
-                lane: gnitz_wire::WireLane::PushedTrain,
-                ..Default::default()
-            },
+fn pushed_marker(view: u64, id: u64) -> WireMsg<'static> {
+    WireMsg {
+        target_id: view,
+        arg0: id,
+        flags: gnitz_wire::WireFlags {
+            lane: gnitz_wire::WireLane::PushedTrain,
             ..Default::default()
         },
-    );
+        ..Default::default()
+    }
+}
+
+/// `msg`'s framed bytes, for a subscriber's queue.
+fn framed(msg: WireMsg<'_>) -> Vec<u8> {
+    let mut out = Vec::new();
+    msg.encode_framed(&mut out);
     out
 }
 
 /// End `members`' subscriptions with `fault`. A fault frame is queued whatever
 /// the queue holds: it is what tells the subscriber to stop waiting.
 fn fail_subscribers<'a>(view: u64, members: impl IntoIterator<Item = &'a Rc<Subscriber>>, fault: &WireFault) {
-    let mut frame = Vec::new();
-    encode_response_into(
-        &mut frame,
-        ipc::WireMsg {
-            target_id: view,
-            ..ipc::WireMsg::fault(fault)
-        },
-    );
-    let frame = Rc::new(frame);
+    let frame = Rc::new(framed(WireMsg { target_id: view, ..WireMsg::fault(fault) }));
     for m in members {
         m.after_tick.set(None);
-        m.out.send(pushed_marker(view, m.id), Rc::clone(&frame));
+        m.out.send(framed(pushed_marker(view, m.id)), Rc::clone(&frame));
     }
 }
 
@@ -660,7 +652,7 @@ async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, round: u64, 
         Ok(()) => {
             // Rounds that left the subscription no row are sent as no train.
             let rows = !body.is_empty();
-            encode_response_into(&mut body, terminal(tid, round, feed.tag));
+            terminal(tid, round, feed.tag).encode_framed(&mut body);
             let body = Rc::new(body);
             for m in reading {
                 if rows && m.out.unsynced() + body.len() > cap {
@@ -670,7 +662,7 @@ async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, round: u64, 
                 m.after_tick.set(Some(round));
                 if rows {
                     m.told.set(round);
-                    m.out.send(pushed_marker(tid, m.id), Rc::clone(&body));
+                    m.out.send(framed(pushed_marker(tid, m.id)), Rc::clone(&body));
                 }
             }
         }

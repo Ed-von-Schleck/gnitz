@@ -1,22 +1,23 @@
-//! Wire protocol: IPC message codec, encode/decode.
+//! The frame encoder: a [`WireMsg`] sized and written into a w2m slot, a SAL
+//! group's payload or a client reply.
 
-use gnitz_wire::{ControlHeader, DecodedControl, WireFault, WireFlags, WireStatus};
-use gnitz_zset::repr::{Batch, WireRows};
-use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_wire::{ControlHeader, WireFault, WireFlags, WireStatus};
+use gnitz_zset::repr::WireRows;
 
 // ---------------------------------------------------------------------------
 // WireMsg
 // ---------------------------------------------------------------------------
 
-/// One IPC/WAL wire message. Build it once, then [`size`](WireMsg::size) it and
-/// encode it: both read the same value, so the byte count a caller reserves and
-/// the bytes the encoder writes cannot disagree.
+/// One frame: its control header fields, blob, schema record and data block.
+/// Build it once, then [`size`](WireMsg::size) it and encode it: both read the
+/// same value, so the byte count a caller reserves and the bytes the encoder
+/// writes cannot disagree.
 ///
 /// Every field defaults to zero/absent (`status` defaults to `WireStatus::Ok`), so a
 /// caller names only what it sends:
 ///
 /// ```ignore
-/// let msg = ipc::WireMsg { status: WireStatus::Error, blob: text, ..Default::default() };
+/// let msg = WireMsg { status: WireStatus::Error, blob: text, ..Default::default() };
 /// writer.send_msg(request_id, &msg);
 /// ```
 #[derive(Clone, Copy, Default)]
@@ -28,9 +29,8 @@ pub struct WireMsg<'a> {
     pub status: WireStatus,
     /// The frame's data block; an empty delta ships none.
     pub data: Option<WireRows<'a>>,
-    /// These bytes *are* the frame's schema record, and their length sizes the
-    /// prefix that announces it; `None` emits none and leaves the frame's schema
-    /// bit clear.
+    /// The frame's schema record, written behind its length prefix; `None` writes
+    /// none and leaves the schema bit clear.
     pub schema_block: Option<&'a [u8]>,
     pub blob: &'a [u8],
 }
@@ -61,19 +61,18 @@ impl<'a> WireMsg<'a> {
             + self.data.map_or(0, |d| d.byte_size())
     }
 
-    /// [`size`](WireMsg::size), or the fault a reply past
-    /// [`gnitz_wire::MAX_FRAME_PAYLOAD`] answers with in its place.
-    pub(crate) fn checked_size(&self) -> Result<usize, WireFault> {
+    /// Refuse a frame past [`gnitz_wire::MAX_FRAME_PAYLOAD`], with the fault the
+    /// reply is answered with instead.
+    pub(crate) fn check_size(&self) -> Result<(), WireFault> {
         let sz = self.size();
         if sz > gnitz_wire::MAX_FRAME_PAYLOAD {
             return Err(format!(
-                "reply wire_size={sz} exceeds the maximum frame payload {}; \
-                 one row wider than the cap cannot be returned at all",
+                "a reply of {sz} bytes exceeds the maximum frame payload {}",
                 gnitz_wire::MAX_FRAME_PAYLOAD
             )
             .into());
         }
-        Ok(sz)
+        Ok(())
     }
 
     /// The control header this frame carries.
@@ -98,26 +97,23 @@ impl<'a> WireMsg<'a> {
 
         assert_eq!(pos, out.len(), "WireMsg::size and encode disagree");
     }
+
+    /// Append `self`'s framed bytes — its length prefix, then its payload — to
+    /// `out`, so a corked reply never passes through a buffer of its own.
+    pub(crate) fn encode_framed(&self, out: &mut Vec<u8>) {
+        const PFX: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
+        let sz = self.size();
+        let base = out.len();
+        let total = base + PFX + sz;
+        out.reserve(PFX + sz);
+        // SAFETY: `encode` writes every byte of the payload (it asserts so) — a
+        // block's header and regions pack end to end — and the length prefix is
+        // written immediately below.
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            out.set_len(total);
+        }
+        out[base..base + PFX].copy_from_slice(&gnitz_wire::frame_len_prefix(sz));
+        self.encode(&mut out[base + PFX..total]);
+    }
 }
-
-// ---------------------------------------------------------------------------
-// Decode
-// ---------------------------------------------------------------------------
-
-/// The rows of a client frame's data block under `schema`; `None` for a frame
-/// without one.
-pub fn decode_client_rows(
-    data: &[u8],
-    control: &DecodedControl,
-    schema: &SchemaDescriptor,
-) -> Result<Option<Batch>, &'static str> {
-    control
-        .data
-        .clone()
-        .map(|r| Batch::decode_foreign_wal_block(&data[r], schema))
-        .transpose()
-}
-
-#[cfg(test)]
-#[path = "tests/wire.rs"]
-mod tests;

@@ -56,6 +56,21 @@ pub fn as_le_bytes_mut<T: LeScalar>(v: &mut [T]) -> &mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
+/// The little-endian `T`s `src` holds, refused unless it is a whole number of
+/// them.
+pub fn le_scalars<T: LeScalar>(src: &[u8]) -> Result<Vec<T>, String> {
+    let size = std::mem::size_of::<T>();
+    if !src.len().is_multiple_of(size) {
+        return Err(format!(
+            "{} bytes are no whole number of {size}-byte scalars",
+            src.len()
+        ));
+    }
+    let mut v = Vec::new();
+    extend_from_le_bytes(&mut v, src);
+    Ok(v)
+}
+
 /// Append `src`, a whole number of little-endian `T`s, to `dst` in one copy.
 pub fn extend_from_le_bytes<T: LeScalar>(dst: &mut Vec<T>, src: &[u8]) {
     let size = std::mem::size_of::<T>();

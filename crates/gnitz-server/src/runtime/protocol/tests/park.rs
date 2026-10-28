@@ -8,11 +8,11 @@ fn a_park_returns_at_once_when_its_retest_finds_a_group() {
     let parks = WorkerParks::create(1).unwrap();
     let mut armed_when_tested = false;
     parks.park(0).park(|| {
-        armed_when_tested = parks.word(0).armed();
+        armed_when_tested = parks.park(0).armed();
         false
     });
     assert!(armed_when_tested, "the re-test runs behind the arm");
-    assert!(!parks.word(0).armed(), "and the park disarms");
+    assert!(!parks.park(0).armed(), "and the park disarms");
 }
 
 /// A worker parked on an empty SAL wakes on another process's wake.
@@ -20,16 +20,39 @@ fn a_park_returns_at_once_when_its_retest_finds_a_group() {
 fn a_parked_worker_wakes_on_a_forked_masters_wake() {
     let parks = WorkerParks::create(1).unwrap();
     let child = || {
-        while !parks.word(0).armed() {
+        while !parks.park(0).armed() {
             std::thread::yield_now();
         }
-        parks.wake(0);
+        parks.wake(WorkerSet::one(0));
     };
     let pid = unsafe { fork_child(child) };
     within(move || {
         // The wake count stands in for the SAL the worker re-tests.
-        parks.park(0).park(|| parks.word(0).value() == 0);
-        assert_eq!(parks.word(0).value(), 1, "the park ended on the wake");
+        parks.park(0).park(|| parks.park(0).value() == 0);
+        assert_eq!(parks.park(0).value(), 1, "the park ended on the wake");
     });
     unsafe { assert_child_exited_ok(pid) };
+}
+
+/// Membership, the launched-worker bound and position, at a small worker count and
+/// at the full word.
+#[test]
+fn a_worker_set_bounds_to_the_launched_workers() {
+    let s = WorkerSet::one(1).with(3).with(6);
+    assert_eq!(s.len(), 3);
+    assert!(s.contains(3) && !s.contains(2));
+    assert_eq!(s.without(3), WorkerSet::one(1).with(6));
+    assert_eq!(s.within(4), WorkerSet::one(1).with(3));
+    assert_eq!(s.iter().collect::<Vec<_>>(), vec![1, 3, 6]);
+    assert_eq!([1, 3, 6].map(|w| s.position(w)), [Some(0), Some(1), Some(2)]);
+    assert_eq!(s.position(2), None);
+
+    assert_eq!(WorkerSet::ALL.within(4).len(), 4);
+    assert_eq!(WorkerSet::ALL.within(MAX_WORKERS), WorkerSet::ALL);
+    assert_eq!(WorkerSet::EMPTY.len(), 0);
+    assert_eq!(WorkerSet::ALL.position(MAX_WORKERS - 1), Some(MAX_WORKERS - 1));
+    assert_eq!([1, 3, 6].into_iter().collect::<WorkerSet>(), s);
+
+    assert_eq!(WorkerSet::one(1).union(WorkerSet::one(3)), WorkerSet::one(1).with(3));
+    assert_eq!(s.union(WorkerSet::EMPTY), s);
 }

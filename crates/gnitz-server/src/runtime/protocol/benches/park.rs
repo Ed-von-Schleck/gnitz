@@ -15,14 +15,14 @@ fn park_wake_bench() {
     const N: u64 = 200_000;
 
     for (advance, publish) in [("bump", false), ("publish", true)] {
-        let park = WorkerParks::create(1).unwrap().word(0);
+        let park = WorkerParks::create(1).unwrap().park(0);
         // The child's voluntary context switches, written before it exits.
         let sleeps = posix_io::map_shared(None, 4096).unwrap().cast::<i64>();
         let child = || {
             let before = voluntary_ctx_switches();
             let mut seen = 0;
             while seen < N {
-                park.park("bench", || park.value() == seen);
+                park.park(|| park.value() == seen);
                 seen = park.value();
             }
             unsafe { sleeps.write(voluntary_ctx_switches() - before) };
@@ -38,8 +38,8 @@ fn park_wake_bench() {
         for k in 1..=N {
             spent += park.armed() as u64;
             match publish {
-                true => park.publish(k, "bench"),
-                false => park.bump("bench"),
+                true => park.publish(k),
+                false => park.bump(),
             }
         }
         unsafe { assert_child_exited_ok(pid) };

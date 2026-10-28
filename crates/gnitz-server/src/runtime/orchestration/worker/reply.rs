@@ -3,8 +3,8 @@
 
 use super::*;
 
+use crate::runtime::wire::WireMsg;
 use gnitz_store::read::KeySpans;
-use ipc::WireMsg;
 
 /// One reply this worker owes.
 // One per queued reply, which is not the path a one-frame reply takes.
@@ -66,7 +66,7 @@ impl Train {
         self.next_row += rows.map_or(0, |r| r.rows());
         let last = self.next_row == batch.len() && (whole || batch.is_empty());
         let msg = WireMsg::train_frame(self.route.target_id, last, rows);
-        msg.checked_size()?;
+        msg.check_size()?;
         w2m.send_msg(self.route.request_id, &msg);
         Ok(last)
     }

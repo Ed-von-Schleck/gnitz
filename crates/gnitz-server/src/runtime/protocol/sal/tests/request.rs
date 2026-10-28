@@ -1,9 +1,10 @@
 use std::num::NonZeroU64;
 
 use super::*;
-use crate::runtime::sal::fixtures::TestLog;
-use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalReader};
-use crate::test_support::{make_batch, make_schema_u64_i64};
+use crate::catalog::SysFamily;
+use crate::runtime::sal::fixtures::test_log;
+use crate::runtime::sal::{GroupData, GroupTargets, SalGroup, SalReader};
+use crate::test_support::{make_batch, make_schema_u64_i64, schema_tab_batch};
 use gnitz_wire::peek_control_block;
 use gnitz_zset::schema::encode_schema_block;
 
@@ -57,6 +58,15 @@ fn every_request() -> Vec<SalRequest<'static>> {
             spec: vec![33u8, 34, 35].into(),
         }
         .into(),
+        Read::Pin { snapshot: 44 }.into(),
+        Read::Unpin { snapshot: 45 }.into(),
+        Read::SnapshotPage {
+            snapshot: 46,
+            tid: 47,
+            page: vec![48u8, 49].into(),
+        }
+        .into(),
+        Read::Backup { dir: b"/backup".to_vec().into() }.into(),
     ]
 }
 
@@ -66,18 +76,23 @@ fn every_request() -> Vec<SalRequest<'static>> {
 fn every_request_decodes_from_its_written_group() {
     let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
     let record = encode_schema_block(batch.schema());
-    let mut groups: Vec<DirectGroup> = every_request().into_iter().map(DirectGroup::new).collect();
-    groups.push(DirectGroup::push(
+    let mut groups: Vec<SalGroup> = every_request().into_iter().map(SalGroup::new).collect();
+    groups.push(SalGroup::push(
         15,
         &record,
         GroupData::Same(batch.wire_whole()),
-        GroupTargets::UNADDRESSED,
+        GroupTargets::SILENT,
     ));
-    groups.push(DirectGroup::ddl_sync(12, &record, &batch));
+    let schemas = schema_tab_batch(&[(100, "s", 1)]);
+    groups.push(SalGroup::ddl_sync(SysFamily::Schema, &schemas));
+    let mut kinds: Vec<u8> = groups.iter().map(|g| g.request.encode().0.as_wire()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    assert_eq!(kinds.len(), SalMessageKind::ALL.len(), "every kind is written");
 
     for group in groups {
         // A fresh log each: a flush moves a reader to the next epoch.
-        let log = TestLog::new(1 << 20, 2, 1);
+        let log = test_log(1 << 20, 2, 1);
         log.excl().write(&group).expect("group fits");
         let (msg, slot) = SalReader::new(log.log(), 1, 1)
             .next()
@@ -85,8 +100,9 @@ fn every_request_decodes_from_its_written_group() {
         let control = peek_control_block(slot).expect("a control block");
         let decoded = SalRequest::decode(msg.head.kind, &control.hdr, &slot[control.blob.clone()]);
         assert_eq!(decoded.as_ref(), Ok(&group.request));
-        assert_eq!(msg.head.kind, group.request.kind());
-        assert_eq!(msg.head.target_id, group.request.template().target_id);
+        let (kind, template) = group.request.encode();
+        assert_eq!(msg.head.kind, kind);
+        assert_eq!(msg.head.target_id, template.target_id);
         assert_eq!(control.data.is_some(), group.schema.is_some(), "{:?}", group.request);
     }
 }

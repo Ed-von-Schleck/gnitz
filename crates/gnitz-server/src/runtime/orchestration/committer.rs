@@ -320,33 +320,26 @@ async fn commit_writes(shared: &Rc<Shared>, mut writes: Vec<PendingWrite>) {
         // write that runs out of SAL space part-way can take its earlier
         // families back. Every write, the commit and the fsync submit are in
         // this one synchronous block, so no reader ever observes the gap.
-        let scope = excl.begin("commit");
+        let mut scope = excl.begin("commit");
         let zone_lsn = scope.lsn();
 
         // The ACKs of every group laid out and kept, in unit order.
         let mut leases: Vec<AckLease> = Vec::with_capacity(units.len());
-        // A unit is all-or-nothing: a family that does not fit rolls the unit
-        // back to where it started, and the families before it were never
-        // published.
+        // A unit is all-or-nothing: a family that does not fit takes back the
+        // unit's earlier families, which were never published.
         for unit in &mut units {
-            let (savepoint, kept) = (scope.savepoint(), leases.len());
-            unit.failed = unit
-                .families
-                .iter()
-                .find_map(|f| match disp.write_commit_group(&scope, f.tid, &f.batch) {
-                    Ok(lease) => {
-                        leases.push(lease);
-                        None
-                    }
-                    Err(e) => Some(e),
-                });
-            if unit.failed.is_some() {
-                scope.roll_back(savepoint);
-                leases.truncate(kept);
+            let written = scope.all_or_nothing(|scope| {
+                (unit.families.iter())
+                    .map(|f| disp.write_commit_group(scope, f.tid, &f.batch))
+                    .collect::<Result<Vec<_>, _>>()
+            });
+            match written {
+                Ok(unit_leases) => leases.extend(unit_leases),
+                Err(e) => unit.failed = Some(e),
             }
         }
 
-        let synced = scope.commit().then(|| excl.sync(disp.reactor(), "committer"));
+        let synced = scope.commit().then(|| excl.sync(disp.reactor()));
         // The auto-tick this may fire overlaps the ACKs and the fsync.
         shared.note_commit_rows(
             &excl,

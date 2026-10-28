@@ -46,15 +46,6 @@ const W2M_WINDOW_FRAMES: u64 = 16;
 const W2M_REGION_SIZE: usize =
     (W2M_HEADER_SIZE as u64 + W2M_WINDOW_FRAMES * slot_stride(gnitz_wire::MAX_FRAME_PAYLOAD)) as usize;
 
-const _: () = assert!(
-    2 * gnitz_wire::FRAME_LEN_PREFIX_BYTES as u64 == RING_PREFIX_BYTES,
-    "the packed slot prefix is two client-prefix-sized halves"
-);
-const _: () = assert!(
-    cfg!(target_endian = "little"),
-    "the client's frame prefix is the u64's high half only on LE"
-);
-
 /// Size-prefix sentinel for "skip to the header, the real message is there".
 const SKIP_MARKER: u64 = u64::MAX;
 
@@ -69,56 +60,47 @@ const fn slot_stride(sz: usize) -> u64 {
 }
 
 /// The 8-byte prefix stamped in front of every slot: `sz` in the high half,
-/// `internal_req_id` in the low, so that on LE the 4 bytes in front of the
+/// `request_id` in the low, so that on LE the 4 bytes in front of the
 /// payload are the client's frame length prefix.
 #[inline]
-fn pack_prefix(sz: usize, internal_req_id: u32) -> u64 {
-    (internal_req_id as u64) | ((sz as u64) << 32)
+fn pack_prefix(sz: usize, request_id: u32) -> u64 {
+    (request_id as u64) | ((sz as u64) << 32)
 }
 
-/// The `(sz, internal_req_id)` [`pack_prefix`] stored.
+/// The `(sz, request_id)` [`pack_prefix`] stored.
 #[inline]
-fn unpack_prefix(prefix: u64) -> (u32, u32) {
-    ((prefix >> 32) as u32, prefix as u32)
+fn unpack_prefix(prefix: u64) -> (usize, u32) {
+    ((prefix >> 32) as usize, prefix as u32)
 }
+
+const _: () = assert!(
+    2 * gnitz_wire::FRAME_LEN_PREFIX_BYTES as u64 == RING_PREFIX_BYTES,
+    "the packed slot prefix is two client-prefix-sized halves"
+);
+const _: () = assert!(
+    cfg!(target_endian = "little"),
+    "the client's frame prefix is the u64's high half only on LE"
+);
 
 // ---------------------------------------------------------------------------
 // Header layout (128 bytes, one cache line per writer)
 // ---------------------------------------------------------------------------
 
 /// Cross-process ring state: what the worker publishes on one cache line, what
-/// the master publishes on the other.
-#[repr(C, align(64))]
+/// the master publishes on the other, a [`Park`] being a cache line of its own.
+#[repr(C)]
 struct W2mRingHeader {
     /// `write_cursor`: the worker publishes it, the master reads it.
     write: AtomicU64,
     /// The virtual offset the data head stands for, stored ahead of the publish
     /// of the message there.
     origin: AtomicU64,
-    _pad_write: [u8; 48],
     /// `release_cursor`: the master publishes it, the worker reads it and parks on it.
     release: Park,
-    _pad_release: [u8; 56],
 }
 
 const _: () = assert!(std::mem::size_of::<W2mRingHeader>() == W2M_HEADER_SIZE);
-const _: () = assert!(std::mem::align_of::<W2mRingHeader>() == 64);
-const _: () = assert!(std::mem::offset_of!(W2mRingHeader, write) == 0);
-const _: () = assert!(std::mem::offset_of!(W2mRingHeader, origin) == 8);
 const _: () = assert!(std::mem::offset_of!(W2mRingHeader, release) == 64);
-
-impl W2mRingHeader {
-    /// Reinterpret the start of a W2M mmap region as its header. The mapping is
-    /// created before `fork` and unmapped only at process exit, which is what
-    /// the `'static` rests on.
-    ///
-    /// # Safety
-    /// `ptr` must be the base of a ring [`rings`] mapped.
-    #[inline]
-    unsafe fn from_raw(ptr: *const u8) -> &'static Self {
-        &*(ptr as *const W2mRingHeader)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // RingCursor — the virtual cursor and its memoized physical mirror
@@ -155,8 +137,9 @@ impl RingCursor {
 
     #[inline]
     fn header(&self) -> &'static W2mRingHeader {
-        // SAFETY: `rings` builds every cursor, over a ring it mapped.
-        unsafe { W2mRingHeader::from_raw(self.base) }
+        // SAFETY: `rings` builds every cursor over the base of a ring it mapped,
+        // created before `fork` and never unmapped.
+        unsafe { &*(self.base as *const W2mRingHeader) }
     }
 
     /// Bytes from the physical position to the end of the region.
@@ -209,10 +192,7 @@ pub(crate) fn create(nw: usize) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver)
 /// A zeroed mapping is an empty ring with both cursors and its origin at 0, and
 /// an unarmed park, so nothing is stored here.
 fn rings(capacities: &[usize]) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver)> {
-    let master = posix_io::map_shared(None, size_of::<Park>())?;
-    // SAFETY: a fresh page-aligned shared mapping, never unmapped, alone on its
-    // cache line.
-    let master: &'static Park = unsafe { &*master.cast::<Park>() };
+    let master: &'static Park = &Park::map(1)?[0];
     let mut writers = Vec::with_capacity(capacities.len());
     let mut readers = Vec::with_capacity(capacities.len());
     for &capacity in capacities {
@@ -242,10 +222,7 @@ fn rings(capacities: &[usize]) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver)>
             cap: capacity as u64,
         };
         writers.push(W2mWriter { wc: start, master });
-        readers.push(WorkerRing {
-            hdr: start.header(),
-            in_flight: UnsafeCell::new(InFlightState::new(start)),
-        });
+        readers.push(WorkerRing(UnsafeCell::new(InFlightState::new(start))));
     }
     // Leaked with the mappings: a slot releases through its ring for as long as
     // it lives.
@@ -289,7 +266,6 @@ impl W2mWriter {
         let wc = &self.wc;
         let vrel = wc.header().release.value();
         debug_assert!(vrel <= wc.virt, "cursor inversion: vrel={vrel} vwc={}", wc.virt);
-        debug_assert!(total <= wc.dcap(), "a {total}-byte slot exceeds DCAP {}", wc.dcap());
         let used = wc.virt - vrel;
         debug_assert!(used <= wc.dcap(), "used {used} exceeds DCAP {}", wc.dcap());
         if used == 0 {
@@ -308,9 +284,9 @@ impl W2mWriter {
         }
     }
 
-    /// Publish one `sz`-byte message tagged `req`, written by `encode`. False,
-    /// writing nothing, when the ring has no room for it now.
-    fn try_publish(&mut self, req: u32, sz: usize, encode: impl FnOnce(&mut [u8])) -> bool {
+    /// Publish one `sz`-byte message tagged `request_id`, written by `encode`.
+    /// False, writing nothing, when the ring has no room for it now.
+    fn try_publish(&mut self, request_id: u32, sz: usize, encode: impl FnOnce(&mut [u8])) -> bool {
         let total = slot_stride(sz);
         assert!(sz > 0, "w2m: an empty message is a slot `take_next` aborts on");
         assert!(
@@ -336,7 +312,7 @@ impl W2mWriter {
                 }
             }
             debug_assert!(self.wc.in_step());
-            self.wc.store_prefix(self.wc.phys, pack_prefix(sz, req));
+            self.wc.store_prefix(self.wc.phys, pack_prefix(sz, request_id));
             let slot = self.wc.base.add((self.wc.phys + RING_PREFIX_BYTES) as usize);
             encode(std::slice::from_raw_parts_mut(slot, sz));
         }
@@ -344,22 +320,21 @@ impl W2mWriter {
         // SeqCst for the master's park; it also carries the Release that makes
         // the slot's bytes visible to the reader.
         self.wc.header().write.store(self.wc.virt, Ordering::SeqCst);
-        self.master.take_arm("W2mWriter::try_publish");
+        self.master.take_arm();
         true
     }
 
     /// Encode `msg` into one ring slot, unless the ring has no room for the
-    /// frame now. `ring_req` is the slot's prefix, which is what the master
-    /// routes the reply by.
-    pub fn try_send_msg(&mut self, ring_req: u32, msg: &WireMsg<'_>) -> bool {
-        self.try_publish(ring_req, msg.size(), |slot| msg.encode(slot))
+    /// frame now. `request_id` goes in the slot's prefix, which is what the
+    /// master routes the reply by.
+    pub fn try_send_msg(&mut self, request_id: u32, msg: &WireMsg<'_>) -> bool {
+        self.try_publish(request_id, msg.size(), |slot| msg.encode(slot))
     }
 
     /// [`Self::try_send_msg`], parking on `release_cursor` while the ring is full.
-    pub fn send_msg(&mut self, ring_req: u32, msg: &WireMsg<'_>) {
-        let sz = msg.size();
-        while !self.try_publish(ring_req, sz, |slot| msg.encode(slot)) {
-            self.wait_for_room(sz);
+    pub fn send_msg(&mut self, request_id: u32, msg: &WireMsg<'_>) {
+        while !self.try_send_msg(request_id, msg) {
+            self.wait_for_room(msg.size());
         }
     }
 
@@ -369,29 +344,18 @@ impl W2mWriter {
     #[inline(never)]
     fn wait_for_room(&self, sz: usize) {
         let release = &self.wc.header().release;
-        release.park("W2mWriter::wait_for_room", || self.placement(slot_stride(sz)).is_none());
+        release.park(|| self.placement(slot_stride(sz)).is_none());
     }
 
     /// ACK `request_id`: the bare `Ok` control frame.
     pub fn send_ack(&mut self, request_id: u32) {
         self.send_msg(request_id, &WireMsg::default());
     }
-
-    /// The master has armed its park, and no publish has taken it.
-    #[cfg(test)]
-    pub(crate) fn master_parked(&self) -> bool {
-        self.master.armed()
-    }
 }
 
 // ---------------------------------------------------------------------------
 // InFlightState — the master's read cursor and its outstanding slots
 // ---------------------------------------------------------------------------
-
-/// Initial capacity of a ring's in-flight queue. Not a bound: the queue grows,
-/// and the real backpressure is the ring's byte capacity, which parks the worker
-/// in [`W2mWriter::wait_for_room`] once the ring fills.
-const INFLIGHT_INITIAL_CAP: usize = 64;
 
 /// The master's per-ring state: its read cursor, which never leaves this
 /// process, and the slots it has handed out but not yet released.
@@ -412,7 +376,7 @@ impl InFlightState {
         InFlightState {
             read,
             front_idx: 0,
-            queue: VecDeque::with_capacity(INFLIGHT_INITIAL_CAP),
+            queue: VecDeque::new(),
         }
     }
 
@@ -431,7 +395,7 @@ impl InFlightState {
         }
 
         if let Some(vrc) = last_vrc {
-            self.read.header().release.publish(vrc, "W2mSlot release");
+            self.read.header().release.publish(vrc);
         }
     }
 }
@@ -449,9 +413,9 @@ pub struct W2mSlot {
     /// client send unchanged, and [`Self::bytes`] is its tail.
     frame: &'static [u8],
     push_idx: u64,
-    /// `internal_req_id` from the slot prefix, set by the worker's publish. Used
-    /// by the master to route scan responses without decoding the wire frame.
-    pub(crate) internal_req_id: u32,
+    /// The request id the worker's publish tagged the slot with: what the master
+    /// routes it by without decoding the frame.
+    pub(crate) request_id: u32,
     /// The worker whose ring this slot was read from.
     pub(crate) worker: u32,
     /// The ring it was read from, whose in-flight queue its drop releases through.
@@ -485,7 +449,7 @@ impl W2mSlot {
 impl Drop for W2mSlot {
     fn drop(&mut self) {
         // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
-        unsafe { (*self.ring.in_flight.get()).release(self.push_idx) };
+        unsafe { (*self.ring.0.get()).release(self.push_idx) };
     }
 }
 
@@ -493,19 +457,18 @@ impl Drop for W2mSlot {
 // W2mReceiver
 // ---------------------------------------------------------------------------
 
-/// One worker's W2M ring on the master side: the shared header and the master's
-/// own bookkeeping for that ring.
-struct WorkerRing {
-    hdr: &'static W2mRingHeader,
-    in_flight: UnsafeCell<InFlightState>,
-}
+/// One worker's W2M ring on the master side: the master's read cursor, through
+/// which it reaches the shared header, and its in-flight slots, behind the cell
+/// its slots release through.
+struct WorkerRing(UnsafeCell<InFlightState>);
 
 impl WorkerRing {
-    /// The master-local read cursor.
+    /// The worker has published past the master's read cursor.
     #[inline]
-    fn read_cursor(&self) -> u64 {
+    fn has_unread(&self) -> bool {
         // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
-        unsafe { (*self.in_flight.get()).read.virt }
+        let read = unsafe { &(*self.0.get()).read };
+        read.header().write.load(Ordering::SeqCst) != read.virt
     }
 
     /// Read the next message and register it as in-flight. `None` **iff** the
@@ -513,8 +476,9 @@ impl WorkerRing {
     #[inline]
     fn take_next(&'static self, worker: u32) -> Option<W2mSlot> {
         // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
-        let st = unsafe { &mut *self.in_flight.get() };
-        let vwc = self.hdr.write.load(Ordering::Acquire);
+        let st = unsafe { &mut *self.0.get() };
+        let hdr = st.read.header();
+        let vwc = hdr.write.load(Ordering::Acquire);
         debug_assert!(
             st.read.virt <= vwc,
             "read cursor {} ahead of write cursor {vwc}",
@@ -524,7 +488,7 @@ impl WorkerRing {
             return None;
         }
         // Loaded behind the `vwc` that shows the message at this offset.
-        if self.hdr.origin.load(Ordering::Acquire) == st.read.virt {
+        if hdr.origin.load(Ordering::Acquire) == st.read.virt {
             debug_assert!(st.queue.is_empty(), "a slot in flight across a rewind");
             st.read.rewind();
         }
@@ -544,9 +508,9 @@ impl WorkerRing {
             prefix = unsafe { st.read.load_prefix(st.read.phys) };
         }
         debug_assert!(st.read.in_step());
-        let (sz, internal_req_id) = unpack_prefix(prefix);
+        let (sz, request_id) = unpack_prefix(prefix);
         // `slot_stride(0)` is 8, so a zero-size slot would pass the span test.
-        if sz == 0 || st.read.virt + slot_stride(sz as usize) > vwc {
+        if sz == 0 || st.read.virt + slot_stride(sz) > vwc {
             gnitz_fatal_abort!(
                 "w2m::take_next: size={} at phys={} overruns the write cursor {} — ring corrupt",
                 sz,
@@ -560,17 +524,17 @@ impl WorkerRing {
         let frame = unsafe {
             std::slice::from_raw_parts(
                 st.read.base.add(payload_at - gnitz_wire::FRAME_LEN_PREFIX_BYTES),
-                sz as usize + gnitz_wire::FRAME_LEN_PREFIX_BYTES,
+                sz + gnitz_wire::FRAME_LEN_PREFIX_BYTES,
             )
         };
-        st.read.advance(slot_stride(sz as usize));
+        st.read.advance(slot_stride(sz));
 
         let push_idx = st.front_idx + st.queue.len() as u64;
         st.queue.push_back((st.read.virt, false));
         Some(W2mSlot {
             frame,
             push_idx,
-            internal_req_id,
+            request_id,
             worker,
             ring: self,
         })
@@ -601,43 +565,11 @@ impl W2mReceiver {
     /// stays set until a publish takes it, which moves the value; nothing else
     /// does.
     pub fn arm(&self) -> Option<(*const AtomicU32, u32)> {
-        let at = self.master.arm();
-        if self
-            .rings
-            .iter()
-            .any(|r| r.hdr.write.load(Ordering::SeqCst) != r.read_cursor())
-        {
-            self.master.disarm();
-            return None;
-        }
-        Some((self.master.futex_word(), at as u32))
+        self.master.arm_for(|| !self.rings.iter().any(WorkerRing::has_unread))
     }
 
     pub fn num_workers(&self) -> usize {
         self.rings.len()
-    }
-
-    #[cfg(test)]
-    fn header(&self, worker: usize) -> &'static W2mRingHeader {
-        self.rings[worker].hdr
-    }
-
-    /// The worker-visible free boundary: everything below it is reusable.
-    #[cfg(test)]
-    pub(crate) fn release_cursor(&self, worker: usize) -> u64 {
-        self.rings[worker].hdr.release.value()
-    }
-
-    /// The worker's published boundary: everything below it is readable.
-    #[cfg(test)]
-    pub(crate) fn write_cursor(&self, worker: usize) -> u64 {
-        self.rings[worker].hdr.write.load(Ordering::Acquire)
-    }
-
-    /// The publishes that took the master's arm, each one `FUTEX_WAKE`.
-    #[cfg(test)]
-    pub(crate) fn wakes(&self) -> u64 {
-        self.master.value()
     }
 }
 

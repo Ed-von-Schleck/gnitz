@@ -25,7 +25,9 @@ impl DriveHost for WorkerProcess<'_> {
     ) -> (Batch, bool) {
         let mut round = self.mesh.open(view_id, batch, plan, fold, drained);
         loop {
-            self.park.park(|| self.sal_reader.is_empty() && !self.mesh.complete());
+            self.mesh
+                .park()
+                .park(|| self.sal_reader.is_empty() && !self.mesh.complete());
             while let Some(req) = self.next_request() {
                 // Once the round is complete the drive goes on; the next wait, or
                 // the top level, serves what the SAL still holds, in order.

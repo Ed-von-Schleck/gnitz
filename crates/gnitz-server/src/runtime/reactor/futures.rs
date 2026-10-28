@@ -8,7 +8,7 @@ use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::SchemaDescriptor;
 
 use super::*;
-use crate::runtime::sal::WorkerSet;
+use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::{GroupTargets, SalMessageKind};
 
 /// The request id every worker's boot verdict answers on.
@@ -38,7 +38,7 @@ pub(super) struct TrainRoute {
 impl TrainRoute {
     /// Worker `w`'s frame queue, `None` when the scan was not written to `w`.
     fn queue(&mut self, w: usize) -> Option<&mut WakeQueue<W2mSlot>> {
-        self.set.contains(w).then(|| &mut self.queues[self.set.rank(w)])
+        self.set.position(w).map(|i| &mut self.queues[i])
     }
 }
 
@@ -53,7 +53,7 @@ impl Reactor {
     /// ring it was read from.
     pub(super) fn route(&self, slot: W2mSlot) {
         let w = slot.worker as usize;
-        match self.routes.borrow_mut().get_mut(&slot.internal_req_id) {
+        match self.routes.borrow_mut().get_mut(&slot.request_id) {
             Some(Route::Train(t)) => {
                 if let Some(q) = t.queue(w) {
                     q.push(slot);
@@ -76,7 +76,7 @@ impl Reactor {
         }
     }
 
-    /// A request id no live lease holds, never 0 (`GroupTargets::UNADDRESSED`'s).
+    /// A request id no live lease holds, never 0 (`GroupTargets::SILENT`'s).
     fn alloc_request_id(&self) -> u32 {
         let routes = self.routes.borrow();
         let mut id = self.next_request_id.get();

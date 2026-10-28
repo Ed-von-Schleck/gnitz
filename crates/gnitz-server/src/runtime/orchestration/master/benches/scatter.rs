@@ -1,6 +1,6 @@
 use super::*;
-use crate::runtime::sal::fixtures::{holders_of, TestLog};
-use crate::runtime::sal::DirectGroup;
+use crate::runtime::sal::fixtures::{holders_of, test_log};
+use crate::runtime::sal::SalGroup;
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64};
 use gnitz_foundation::perf::Counter;
 use gnitz_zset::algebra::Placement;
@@ -58,16 +58,16 @@ fn push_group_layout_bench() {
             Placement::Replicated
         };
         let record = encode_schema_block(&schema);
-        let log = TestLog::new(16 << 20, nw, 1);
+        let log = test_log(16 << 20, nw, 1);
         // One group on an empty SAL; the workers sent rows of their own.
         let push = || {
             let mut excl = log.excl();
             excl.checkpoint_reset();
             counter.measure(|| {
-                let scope = excl.begin("bench");
+                let mut scope = excl.begin("bench");
                 let own = with_routed(&batch, placement, nw, |data| {
                     scope
-                        .write(&DirectGroup::push(16, &record, data, holders_of(&data)), zoned)
+                        .write(&SalGroup::push(16, &record, data, holders_of(&data)), zoned)
                         .expect("group fits");
                     match data {
                         GroupData::Same(_) => None,

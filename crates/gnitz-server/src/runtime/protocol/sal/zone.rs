@@ -17,15 +17,14 @@ impl CommittedTail {
     pub(crate) fn read(log: SalLog) -> Result<Self, String> {
         let epoch = log.anchor()?;
         let (mut end, mut open) = (0u64, None);
-        for msg in log.walk(epoch) {
-            if msg.head.lsn != 0 {
-                if !msg.intact() || open.is_some_and(|zone| zone != msg.head.lsn) {
-                    break;
-                }
-                open = (!msg.head.zone_end()).then_some(msg.head.lsn);
-                if msg.head.zone_end() {
-                    end = msg.end;
-                }
+        for msg in log.walk(epoch).filter(|m| m.head.lsn != 0) {
+            if !msg.intact() || open.is_some_and(|zone| zone != msg.head.lsn) {
+                break;
+            }
+            if msg.head.zone_end() {
+                (open, end) = (None, msg.end);
+            } else {
+                open = Some(msg.head.lsn);
             }
         }
         Ok(CommittedTail { log, epoch, end })
@@ -43,7 +42,7 @@ impl CommittedTail {
     }
 
     /// The epoch this boot writes and drains at: one above the tail's.
-    pub(crate) fn live_epoch(&self) -> u32 {
+    pub(crate) fn live_epoch(self) -> u32 {
         next_epoch(self.epoch)
     }
 

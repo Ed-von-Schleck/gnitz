@@ -16,7 +16,7 @@ use super::{send_ack, send_msg, Shared};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::SendBody;
 use crate::runtime::sal::Read;
-use crate::runtime::wire as ipc;
+use crate::runtime::wire::WireMsg;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::snapshot::PageRequest;
 use gnitz_wire::{ControlHeader, WireFault};
@@ -52,7 +52,7 @@ pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u6
                 .registry
                 .pin(id, |k| k == RelationKind::SystemCatalog)
                 .map_err(WireFault::from)?;
-            cut.read_all(Read::Pin { snapshot: id })
+            cut.read(Read::Pin { snapshot: id })
         })
         .await;
     drop(catalog);
@@ -86,10 +86,10 @@ pub(super) async fn page(
     let request = PageRequest::decode(blob).map_err(|e| format!("decode error: {e}"))?;
     if shared.cat().registry.pins(id, tid) {
         let rows = shared.cat().registry.pinned_page(id, tid, &request, Slot::SOLO)?;
-        send_msg(peer, ipc::WireMsg::train_frame(tid, true, rows.wire_whole()));
+        send_msg(peer, WireMsg::train_frame(tid, true, rows.wire_whole()));
     } else {
         let read = Read::SnapshotPage { snapshot: id, tid, page: blob.into() };
-        let lease = shared.disp().scan_all(read).await?;
+        let lease = shared.disp().scan(read).await?;
         'forward: for w in lease.workers().iter() {
             let mut forwarded = false;
             while let Some(f) = lease.next_of(w).await? {
@@ -100,7 +100,7 @@ pub(super) async fn page(
             }
             // A train with no rows ends in a frame `next_of` does not hand out.
             if !forwarded {
-                send_msg(peer, ipc::WireMsg::train_frame(tid, true, None));
+                send_msg(peer, WireMsg::train_frame(tid, true, None));
             }
         }
     }
@@ -129,15 +129,7 @@ pub(super) async fn release_all(shared: &Shared, held: HeldSnapshots) {
 /// the release has left the cluster, which ends the server.
 async fn release(shared: &Shared, id: u64) {
     shared.cat_mut().registry.unpin(id);
-    let released = async {
-        shared
-            .disp()
-            .scan_all(Read::Unpin { snapshot: id })
-            .await?
-            .finish()
-            .await
-    }
-    .await;
+    let released = async { shared.disp().scan(Read::Unpin { snapshot: id }).await?.finish().await }.await;
     if let Err(e) = released {
         gnitz_warn!("snapshot {id}: release failed: {}", e.text);
     }

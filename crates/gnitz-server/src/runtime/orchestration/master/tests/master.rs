@@ -87,13 +87,13 @@ fn a_read_reaches_the_owners_its_bound_names() {
     };
     for (case, schema, placement, blob, want) in cases {
         let registry = registry(schema, placement);
-        let r = route_read(&scan(blob.unwrap_or_default()), registry.relation(16).unwrap(), NW);
+        let r = route_read(&scan(blob.unwrap_or_default()), &registry, NW);
         assert_eq!(r.set, want, "{case}");
         assert!(r.per_worker.is_none(), "{case}: every worker is sent the whole bound");
     }
 
     let registry = registry(schema, keyed);
-    let spread = route_read(&scan(set(&[0, b])), registry.relation(16).unwrap(), NW);
+    let spread = route_read(&scan(set(&[0, b])), &registry, NW);
     assert_eq!(spread.set, WorkerSet::one(owner(0)).with(owner(b)));
     let own_keys = (0..NW)
         .map(|w| match w {
@@ -120,9 +120,8 @@ fn a_probe_routes_by_the_store_it_reads() {
     let index = Probe::Index(PkColList::from_slice(&[1]), NonZeroU64::MAX);
 
     let replicated = registry(schema, Placement::Replicated);
-    let rel = replicated.relation(16).unwrap();
     for own in [Probe::Pk, Probe::PkColumn(1)] {
-        let r = route_read(&probe(own), rel, NW);
+        let r = route_read(&probe(own), &replicated, NW);
         assert_eq!(r.set, WorkerSet::one(owner(0)).with(owner(b)), "{own:?}");
         assert!(r.per_worker.is_some(), "{own:?}: each worker is sent its own keys");
     }
@@ -131,10 +130,10 @@ fn a_probe_routes_by_the_store_it_reads() {
         reply_layout: 0,
         spec: ReadSpec::all_rows(pk_set(8, &[0, b])).encode().into(),
     };
-    let r = route_read(&scan, rel, NW);
+    let r = route_read(&scan, &replicated, NW);
     assert_eq!(r.set, WorkerSet::one(Placement::REPLICA_OWNER as usize));
 
     let keyed = registry(schema, full);
-    let r = route_read(&probe(index), keyed.relation(16).unwrap(), NW);
+    let r = route_read(&probe(index), &keyed, NW);
     assert_eq!((r.set, r.per_worker), (WorkerSet::ALL, None));
 }

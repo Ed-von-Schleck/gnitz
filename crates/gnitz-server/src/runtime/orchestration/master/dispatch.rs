@@ -95,9 +95,9 @@ impl MasterDispatcher {
 
     /// Write `group` to every worker on a fresh ACK lease, and wake them now: a
     /// caller may await the ACKs under this hold.
-    fn write_acked(&self, excl: &SalExcl<'_>, group: DirectGroup<'_>) -> Result<AckLease, WireFault> {
+    fn write_acked(&self, excl: &SalExcl<'_>, group: SalGroup<'_>) -> Result<AckLease, WireFault> {
         let lease = self.reactor.lease_acks(WorkerSet::ALL);
-        excl.write(&DirectGroup { targets: lease.targets(), ..group })?;
+        excl.write(&SalGroup { targets: lease.targets(), ..group })?;
         excl.wake();
         Ok(lease)
     }
@@ -136,7 +136,7 @@ impl MasterDispatcher {
 
     /// Write `round`'s group, wait for every worker's ACK, finalize.
     async fn flush_round(&self, excl: &mut SalExcl<'_>, round: Apply<'_>) -> Result<(), WireFault> {
-        let lease = self.write_acked(excl, DirectGroup::new(round))?;
+        let lease = self.write_acked(excl, SalGroup::new(round))?;
         lease.acks().await;
         self.checkpoint_post_ack(excl)
     }
@@ -154,7 +154,7 @@ impl MasterDispatcher {
         if ordered.is_empty() {
             return Ok(());
         }
-        let group = DirectGroup::new(Apply::Backfill { views: ordered.into() });
+        let group = SalGroup::new(Apply::Backfill { views: ordered.into() });
         let lease = self.write_acked(&self.sal.lock().await, group)?;
         lease.acks().await;
         Ok(())
@@ -175,17 +175,9 @@ impl MasterDispatcher {
     /// A family that reaches no worker is logged and addresses none. Publishes
     /// nothing; that is the scope's commit. Reads no catalog, so it runs while
     /// the catalog is mutably borrowed.
-    fn broadcast_ddl(&self, scope: &SalScope, family: SysFamily, batch: &Batch) -> Result<(), WireFault> {
-        let target_id = family.id();
-        let mut group = DirectGroup::ddl_sync(target_id, family.record(), batch);
-        if family.master_only() {
-            group.targets = GroupTargets {
-                set: WorkerSet::EMPTY,
-                ..GroupTargets::UNADDRESSED
-            };
-        }
-        scope.write(&group, true)?;
-        gnitz_debug!("broadcast_ddl tid={} rows={}", target_id, batch.len());
+    fn broadcast_ddl(&self, scope: &mut SalScope, family: SysFamily, batch: &Batch) -> Result<(), WireFault> {
+        scope.write(&SalGroup::ddl_sync(family, batch), true)?;
+        gnitz_debug!("broadcast_ddl tid={} rows={}", family.id(), batch.len());
         Ok(())
     }
 
@@ -193,22 +185,22 @@ impl MasterDispatcher {
     /// the zone applied: the write's value and the zone LSN. A write the catalog or
     /// the log refuses leaves the catalog as it was and its scope unpublished. A
     /// diverged catalog is one no log describes, so the process ends on it.
-    /// Submits no fdatasync.
+    /// Submits no fdatasync. The divergence abort names the caller's location.
+    #[track_caller]
     pub(crate) fn emit_zone<T>(
         &self,
         excl: &mut SalExcl<'_>,
-        op: &'static str,
         write: impl FnOnce(&mut CatalogEngine, &mut ZoneSink<'_>) -> Result<T, ZoneError>,
     ) -> Result<(T, u64), WireFault> {
-        let scope = excl.begin("ddl");
+        let mut scope = excl.begin("ddl");
         let zone_lsn = scope.lsn();
         let written = write(self.cat_mut(), &mut |family, batch| {
-            self.broadcast_ddl(&scope, family, batch)
+            self.broadcast_ddl(&mut scope, family, batch)
         });
         let value = match written {
             Ok(v) => v,
             Err(ZoneError::Refused(e)) => return Err(e),
-            Err(ZoneError::Diverged(e)) => gnitz_fatal_abort!("{op}: {e}"),
+            Err(ZoneError::Diverged(e)) => gnitz_fatal_abort!("{}: {e}", std::panic::Location::caller()),
         };
         // Only a closed zone raises the replay floor: an LSN no member carries can
         // be the next scope's, whose zone boot replay would then skip.
@@ -227,7 +219,7 @@ impl MasterDispatcher {
             self.record_delta_round(tid, first + i as u64);
         }
         let tick = Apply::Tick { first_round: first, tids: tids.into() };
-        self.write_acked(excl, DirectGroup::new(tick))
+        self.write_acked(excl, SalGroup::new(tick))
     }
 
     /// Raise the last-reached round of every fed view in `tid`'s **forward**
@@ -311,7 +303,7 @@ impl MasterDispatcher {
     /// probes workers that exited on request.
     pub(crate) async fn shutdown_workers(&self) {
         // A refusal would hang the reap below, so it must not vanish.
-        if let Err(e) = self.sal.lock().await.write(&DirectGroup::new(SalRequest::Shutdown)) {
+        if let Err(e) = self.sal.lock().await.write(&SalGroup::new(SalRequest::Shutdown)) {
             gnitz_warn!("SAL refused the Shutdown broadcast: {}; the worker reap will block", e);
         }
         self.reap_workers();
@@ -335,7 +327,7 @@ impl MasterDispatcher {
     /// recovers, ride outside.
     pub(crate) fn write_commit_group(
         &self,
-        scope: &SalScope,
+        scope: &mut SalScope,
         target_id: u64,
         batch: &Batch,
     ) -> Result<AckLease, WireFault> {
@@ -351,10 +343,7 @@ impl MasterDispatcher {
         with_routed(batch, rel.placement(), self.num_workers(), |data| {
             // Leased before the group is laid out, so no ACK arrives unrouted.
             let lease = self.reactor.lease_acks(data.holders());
-            scope.write(
-                &DirectGroup::push(target_id, &record, data, lease.targets()),
-                recoverable,
-            )?;
+            scope.write(&SalGroup::push(target_id, &record, data, lease.targets()), recoverable)?;
             Ok(lease)
         })
     }
@@ -389,7 +378,7 @@ impl MasterDispatcher {
     /// the master puts its system families', each store with the entries that
     /// reach it durable. `dir` exists; everything under it is made here.
     pub(crate) async fn backup_round(&self, dir: &str) -> Result<(), WireFault> {
-        self.scan_all(Read::Backup { dir: dir.as_bytes().into() })
+        self.scan(Read::Backup { dir: dir.as_bytes().into() })
             .await?
             .finish()
             .await?;

@@ -285,14 +285,7 @@ pub fn encode_held(ids: impl IntoIterator<Item = u64>) -> Vec<u8> {
 
 /// The ids an [`encode_held`] blob names.
 pub fn decode_held(blob: &[u8]) -> Result<Vec<u64>, String> {
-    if !blob.len().is_multiple_of(8) {
-        return Err(format!(
-            "SyncPushed: {} bytes of held ids are no whole number of them",
-            blob.len()
-        ));
-    }
-    let mut r = Reader::new(blob);
-    (0..blob.len() / 8).map(|_| r.u64()).collect()
+    crate::le_scalars(blob).map_err(|e| format!("SyncPushed: held ids: {e}"))
 }
 
 /// Decode the items of a `DELTA_POLL` frame. View id `0` is refused: it is the

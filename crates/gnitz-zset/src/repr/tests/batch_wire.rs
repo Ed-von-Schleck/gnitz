@@ -12,13 +12,20 @@ fn region_offset(schema: &SchemaDescriptor, rows: usize, r: usize) -> usize {
     wal::WAL_HEADER_SIZE + schema.region_start(r, rows)
 }
 
-/// The foreign decode refuses a non-canonical string cell the engine's own decode admits.
+/// The foreign decode makes no consolidation claim, and refuses a non-canonical
+/// string cell the engine's own decode admits.
 #[test]
 fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
     let schema = make_schema_pk_u64_payload_string();
     let long: &[u8] = b"a string long enough to spill";
     let clean = encode_to_wire_vec(&make_batch_bytes(&schema, &[(1, 1, b"short"), (2, 1, long)]));
     assert_eq!(Batch::decode_foreign_wal_block(&clean, &schema).map(|b| b.len()), Ok(2));
+    assert!(
+        !Batch::decode_foreign_wal_block(&clean, &schema)
+            .unwrap()
+            .is_consolidated(),
+        "a foreign block carries no consolidation claim"
+    );
 
     let cells = region_offset(&schema, 2, REG_PAYLOAD_START);
     let forgeries: [fn(&mut [u8]); 2] = [

@@ -20,3 +20,32 @@ pub(super) fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> (W2mWriter,
     let (mut writers, receiver) = test_rings(&[ring_capacity(msg_sz, n_msgs, slack)]);
     (writers.pop().unwrap(), receiver)
 }
+
+impl W2mWriter {
+    /// The master has armed its park, and no publish has taken it.
+    pub(crate) fn master_parked(&self) -> bool {
+        self.master.armed()
+    }
+}
+
+impl W2mReceiver {
+    pub(super) fn header(&self, worker: usize) -> &'static W2mRingHeader {
+        // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
+        unsafe { (*self.rings[worker].0.get()).read.header() }
+    }
+
+    /// The worker-visible free boundary: everything below it is reusable.
+    pub(crate) fn release_cursor(&self, worker: usize) -> u64 {
+        self.header(worker).release.value()
+    }
+
+    /// The worker's published boundary: everything below it is readable.
+    pub(crate) fn write_cursor(&self, worker: usize) -> u64 {
+        self.header(worker).write.load(Ordering::Acquire)
+    }
+
+    /// The publishes that took the master's arm, each one `FUTEX_WAKE`.
+    pub(crate) fn wakes(&self) -> u64 {
+        self.master.value()
+    }
+}

@@ -1,8 +1,8 @@
 use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::master::scatter::with_routed;
-use crate::runtime::sal::fixtures::{holders_of, TestLog};
-use crate::runtime::sal::DirectGroup;
+use crate::runtime::sal::fixtures::{holders_of, test_log};
+use crate::runtime::sal::SalGroup;
 use crate::test_support::{
     batch_rows, circuit_batch, col_tab_batch, identity_circuit, make_batch, net_weight, push_view_tab_row,
     register_identity_view, table_tab_batch, u64_i64_cols,
@@ -26,7 +26,7 @@ fn replicated() -> TableProps {
 
 /// Boot the database at `dir` as `slot`'s worker over `log`'s committed tail:
 /// the master's recovery and then the worker's, with no fork between them.
-fn boot(dir: &str, slot: Slot, log: &TestLog) -> CatalogEngine {
+fn boot(dir: &str, slot: Slot, log: &SalWriter) -> CatalogEngine {
     let tail = CommittedTail::read(log.log()).unwrap();
     let opened = CatalogEngine::open_master(dir, slot.of, Default::default()).unwrap();
     let mut engine = master_pre_fork_recovery(opened, tail).unwrap();
@@ -35,11 +35,11 @@ fn boot(dir: &str, slot: Slot, log: &TestLog) -> CatalogEngine {
 }
 
 /// Write `rows` to `log` as the master's push of them to `tid`.
-fn push(log: &TestLog, engine: &CatalogEngine, tid: u64, rows: &Batch) {
+fn push(log: &SalWriter, engine: &CatalogEngine, tid: u64, rows: &Batch) {
     let placement = engine.registry.relation(tid).unwrap().placement();
     let record = engine.schema_record(tid).expect("a registered table");
-    with_routed(rows, placement, log.writer.num_workers(), |data| {
-        log.commit_zone(&[DirectGroup::push(tid, &record, data, holders_of(&data))]);
+    with_routed(rows, placement, log.num_workers(), |data| {
+        log.commit_zone(&[SalGroup::push(tid, &record, data, holders_of(&data))]);
     });
 }
 
@@ -66,7 +66,7 @@ fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
     engine.registry.ingest(SysFamily::View.id(), view_tab.finish()).unwrap();
     engine.close();
 
-    let log = TestLog::new(SAL_SIZE, 1, 1);
+    let log = test_log(SAL_SIZE, 1, 1);
     let circuit = circuit_batch(v, &identity_circuit(r, gnitz_wire::ReadBound::None));
     log.ddl_zone(&[(SysFamily::Circuit, &circuit)]);
     let engine = boot(dir, Slot::new(0, 1), &log);
@@ -92,7 +92,7 @@ fn a_tail_drop_nets_out_once_and_its_id_is_not_reissued() {
     engine.registry.ingest(SysFamily::Table.id(), table_tab(1)).unwrap();
     engine.close();
 
-    let log = TestLog::new(SAL_SIZE, 1, 1);
+    let log = test_log(SAL_SIZE, 1, 1);
     log.ddl_zone(&[(SysFamily::Table, &table_tab(-1)), (SysFamily::Column, &col_tab(t, -1))]);
     let nets = |engine: &CatalogEngine| [SysFamily::Table, SysFamily::Column].map(|f| net_weight(engine, f.id()));
     let mut engine = boot(dir, slot, &log);
@@ -136,7 +136,7 @@ fn a_tail_written_at_another_width_replays_for_the_launched_one() {
     let tails: Vec<_> = [(r, 4, &all), (k, 1, &own), (k, 2, &own)]
         .into_iter()
         .map(|(tid, written_at, expected)| {
-            let log = TestLog::new(SAL_SIZE, written_at, 1);
+            let log = test_log(SAL_SIZE, written_at, 1);
             push(&log, &engine, tid, &rows);
             (tid, written_at, log, expected)
         })
@@ -167,7 +167,7 @@ fn a_tail_lands_above_the_cut_only_under_a_kept_view() {
     // Created after the checkpoint, so the boot rebuilds it.
     register_identity_view(&mut engine, rejected, "v_rejected", &u64_i64_cols());
     let rows = [(1, 1, 10), (2, 1, 20)];
-    let log = TestLog::new(SAL_SIZE, slot.of as usize, 1);
+    let log = test_log(SAL_SIZE, slot.of as usize, 1);
     for tid in [kept, rejected] {
         push(
             &log,

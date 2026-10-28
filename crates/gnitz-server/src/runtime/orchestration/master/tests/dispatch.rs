@@ -1,8 +1,8 @@
 use super::super::fixtures::test_dispatcher;
 use crate::catalog::CatalogEngine;
-use crate::runtime::sal::WorkerSet;
-use crate::runtime::sal::{Apply, DirectGroup, GroupData, GroupTargets};
-use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_once, within};
+use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::{Apply, GroupData, GroupTargets, SalGroup};
+use crate::runtime::test_support::{assert_child_exited_ok, fork_child, within};
 use gnitz_foundation::posix_io::retry_eintr;
 use gnitz_wire::{ColTabRow, WireFault, WireStatus};
 
@@ -71,7 +71,7 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
                     first_round: 2,
                     tids: vec![0; if refused { 2 << 17 } else { 1 }].into(),
                 };
-                let lease = disp.write_acked(&disp.sal().lock().await, DirectGroup::new(tick))?;
+                let lease = disp.write_acked(&disp.sal().lock().await, SalGroup::new(tick))?;
                 writers.iter_mut().for_each(|w| w.send_ack(lease.targets().request_id));
                 lease.acks().await;
                 Ok::<(), WireFault>(())
@@ -92,7 +92,7 @@ fn fill_log(excl: &mut crate::runtime::sal::SalExcl<'_>) {
             first_round: 2,
             tids: vec![0; tids].into(),
         };
-        while excl.write(&DirectGroup::new(tick())).is_ok() {}
+        while excl.write(&SalGroup::new(tick())).is_ok() {}
     }
 }
 
@@ -124,14 +124,12 @@ fn a_zone_the_log_refuses_reaches_no_store_and_applies_after_a_checkpoint() {
     let before = held(&mut engine);
 
     let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
-    let mut excl = try_poll_once(disp.sal().lock()).expect("uncontended");
+    let mut excl = disp.sal().excl();
     fill_log(&mut excl);
     let watermark = disp.sal().watermark();
 
     let refused = disp
-        .emit_zone(&mut excl, "test", |cat, sink| {
-            cat.apply_bundle(create(), sink).map(drop)
-        })
+        .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(create(), sink).map(drop))
         .expect_err("no room for the zone");
     assert_eq!(refused.status, WireStatus::SalFull, "{refused}");
     assert!(!engine.registry.has_id(tid), "the refused table is not registered");
@@ -143,7 +141,7 @@ fn a_zone_the_log_refuses_reaches_no_store_and_applies_after_a_checkpoint() {
     );
 
     disp.checkpoint_post_ack(&mut excl).unwrap();
-    disp.emit_zone(&mut excl, "test", |cat, sink| cat.apply_bundle(create(), sink))
+    disp.emit_zone(&mut excl, |cat, sink| cat.apply_bundle(create(), sink))
         .expect("the reset log takes the zone");
     assert!(engine.registry.has_id(tid));
 
@@ -177,11 +175,11 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
     let col_rows = scan_all(&mut engine, SysFamily::Column.id()).len();
 
     let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
-    let mut excl = try_poll_once(disp.sal().lock()).expect("uncontended");
+    let mut excl = disp.sal().excl();
     fill_log(&mut excl);
 
     let refused = disp
-        .emit_zone(&mut excl, "test", |cat, sink| cat.apply_bundle(add(), sink).map(drop))
+        .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(add(), sink).map(drop))
         .expect_err("no room for the zone");
     assert_eq!(refused.status, WireStatus::SalFull, "{refused}");
     assert_eq!(width(&engine), 2, "the refused ADD COLUMN leaves the schema");
@@ -189,7 +187,7 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
     assert_eq!(scan_all(&mut engine, SysFamily::Column.id()).len(), col_rows);
 
     disp.checkpoint_post_ack(&mut excl).unwrap();
-    disp.emit_zone(&mut excl, "test", |cat, sink| cat.apply_bundle(add(), sink))
+    disp.emit_zone(&mut excl, |cat, sink| cat.apply_bundle(add(), sink))
         .expect("the reset log takes the zone");
     assert_eq!(width(&engine), 3, "the retry widens the schema");
     assert_eq!(scan_all(&mut engine, SysFamily::Column.id()).len(), col_rows + 1);
@@ -216,8 +214,7 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
         engine.reserve_user_sequence(user_seq, 64, &mut |_, _| Ok(())).unwrap();
 
         let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
-        disp.checkpoint_post_ack(&mut try_poll_once(disp.sal().lock()).expect("uncontended"))
-            .unwrap();
+        disp.checkpoint_post_ack(&mut disp.sal().excl()).unwrap();
         drop(disp);
 
         // Crash semantics: no `engine.close()`, and no Drop impl — only what the
@@ -259,17 +256,17 @@ fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
 
     assert_eq!(checkpoint(&disp), gen, "no push since the last base round");
     {
-        let mut excl = try_poll_once(disp.sal().lock()).expect("uncontended");
-        let scope = excl.begin("test");
+        let mut excl = disp.sal().excl();
+        let mut scope = excl.begin("test");
         // No rows, so no schema block is framed, and addressed to no worker, so
         // no ACK is owed.
-        let push = DirectGroup::push(
+        let push = SalGroup::push(
             1,
             &[],
             GroupData::Same(None),
             GroupTargets {
                 set: WorkerSet::EMPTY,
-                ..GroupTargets::UNADDRESSED
+                ..GroupTargets::SILENT
             },
         );
         scope.write(&push, true).unwrap();

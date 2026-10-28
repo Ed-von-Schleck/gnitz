@@ -1,9 +1,10 @@
 use super::*;
 use crate::catalog::SysFamily;
-use crate::runtime::sal::fixtures::TestLog;
-use crate::runtime::sal::WorkerSet;
-use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets};
+use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::fixtures::test_log;
+use crate::runtime::sal::{GroupData, GroupTargets, SalGroup, SalWriter};
 use crate::runtime::w2m::{self, W2mReceiver};
+use crate::runtime::wire::WireMsg;
 use crate::test_support::{
     make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema,
     register_identity_view, scan_all, u64_i64_cols, weighted_rows,
@@ -21,7 +22,7 @@ use std::borrow::Cow;
 /// reads its ring. The budget is pinned rather than read from the environment,
 /// so a shell that exports `GNITZ_REPLY_FRAME_BUDGET` does not reshape these
 /// frames.
-fn test_worker(catalog: &mut CatalogEngine) -> (WorkerProcess<'_>, TestLog, W2mReceiver) {
+fn test_worker(catalog: &mut CatalogEngine) -> (WorkerProcess<'_>, SalWriter, W2mReceiver) {
     worker_over(catalog, 1 << 22, 1 << 20)
 }
 
@@ -30,21 +31,15 @@ pub(super) fn worker_over(
     catalog: &mut CatalogEngine,
     ring_bytes: usize,
     sal_bytes: usize,
-) -> (WorkerProcess<'_>, TestLog, W2mReceiver) {
+) -> (WorkerProcess<'_>, SalWriter, W2mReceiver) {
     let (mut writers, receiver) = w2m::fixtures::test_rings(&[ring_bytes]);
-    let sal = TestLog::new(sal_bytes, 1, 1);
+    let sal = test_log(sal_bytes, 1, 1);
     // Over the SAL's parks, as at boot: the worker sleeps on one word for both.
-    let mesh = crate::runtime::mesh::create(crate::runtime::mesh::OUTBOX_BYTES, sal.parks())
+    let mesh = crate::runtime::mesh::create(1 << 16, sal.parks())
         .unwrap()
         .pop()
         .unwrap();
-    let mut wp = WorkerProcess::new(
-        catalog,
-        SalReader::new(sal.log(), 0, 1),
-        writers.pop().unwrap(),
-        sal.parks().park(0),
-        mesh,
-    );
+    let mut wp = WorkerProcess::new(catalog, SalReader::new(sal.log(), 0, 1), writers.pop().unwrap(), mesh);
     wp.reply_frame_budget = gnitz_wire::MAX_FRAME_PAYLOAD;
     (wp, sal, receiver)
 }
@@ -63,10 +58,10 @@ pub(super) fn engine_with_table(name: &str) -> (CatalogEngine, u64) {
 }
 
 /// `request` answered on `request_id`.
-pub(super) fn addressed<'a>(request: impl Into<SalRequest<'a>>, request_id: u32) -> DirectGroup<'a> {
-    DirectGroup {
-        targets: GroupTargets { request_id, ..GroupTargets::UNADDRESSED },
-        ..DirectGroup::new(request)
+pub(super) fn addressed<'a>(request: impl Into<SalRequest<'a>>, request_id: u32) -> SalGroup<'a> {
+    SalGroup {
+        targets: GroupTargets { request_id, ..GroupTargets::SILENT },
+        ..SalGroup::new(request)
     }
 }
 
@@ -87,15 +82,15 @@ pub(super) fn pk_keys(ids: &[u64]) -> Vec<u8> {
 }
 
 /// A PK probe of `tid` at `keys`.
-pub(super) fn probe(tid: u64, keys: &[u8], request_id: u32) -> DirectGroup<'_> {
+pub(super) fn probe(tid: u64, keys: &[u8], request_id: u32) -> SalGroup<'_> {
     addressed(Read::HasPk { tid, probe: Probe::Pk, keys: keys.into() }, request_id)
 }
 
 /// A push of `rows` into `tid`, whose schema record is `record`, ACKed on
 /// `request_id`.
-pub(super) fn push<'a>(tid: u64, record: &'a [u8], rows: &'a Batch, request_id: u32) -> DirectGroup<'a> {
-    let targets = GroupTargets { request_id, ..GroupTargets::UNADDRESSED };
-    DirectGroup::push(tid, record, GroupData::Same(rows.wire_whole()), targets)
+pub(super) fn push<'a>(tid: u64, record: &'a [u8], rows: &'a Batch, request_id: u32) -> SalGroup<'a> {
+    let targets = GroupTargets { request_id, ..GroupTargets::SILENT };
+    SalGroup::push(tid, record, GroupData::Same(rows.wire_whole()), targets)
 }
 
 /// One published ring message: its ring-prefix request id, control block and
@@ -124,7 +119,7 @@ pub(super) fn frames(rx: &W2mReceiver) -> Vec<Frame> {
     while let Some(slot) = rx.try_read_slot(0) {
         let bytes = slot.bytes().to_vec();
         out.push(Frame {
-            req: slot.internal_req_id,
+            req: slot.request_id,
             ctrl: peek_control_block(&bytes).expect("a control block"),
             bytes,
         });
@@ -169,7 +164,7 @@ fn drain_in_wait(wp: &mut WorkerProcess) {
 
 /// Wire size of `batch` sent whole as one frame.
 fn frame_size(batch: &Batch) -> usize {
-    ipc::WireMsg {
+    WireMsg {
         data: batch.wire_whole(),
         ..Default::default()
     }
@@ -212,12 +207,12 @@ fn in_wait_dispositions() {
             .into(),
     };
     let spans = Read::KeySpans { tid, cols, claim: false };
-    let ddl = DirectGroup {
+    let ddl = SalGroup {
         targets: GroupTargets {
             set: WorkerSet::EMPTY,
-            ..GroupTargets::UNADDRESSED
+            ..GroupTargets::SILENT
         },
-        ..DirectGroup::new(Apply::DdlSync { family: SysFamily::Sequence.id() })
+        ..SalGroup::new(Apply::DdlSync { family: SysFamily::Sequence.id() })
     };
     // A control-only push carries no rows, so it ACKs without reaching the
     // store. `Flush` goes last: the reader leaves the epoch on stepping past it.
@@ -654,7 +649,7 @@ fn a_full_ring_owes_instead_of_blocking() {
     let dir = crate::test_support::scratch_dir("worker", "full_ring");
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
     let (mut wp, _sal, rx) = worker_over(&mut engine, 4096, 1 << 20);
-    while wp.w2m_writer.try_send_msg(1, &ipc::WireMsg::default()) {}
+    while wp.w2m_writer.try_send_msg(1, &WireMsg::default()) {}
 
     wp.reply(route(1, 5, 1), Ok(Rows::Own(one.clone())));
     wp.reply(route(1, 6, 2), Err("boom".into()));
@@ -685,7 +680,7 @@ fn a_train_advances_with_every_request() {
     for _ in 0..GROUPS {
         // Control-only and unanswered: nothing of its own reaches the ring.
         sal.excl()
-            .write(&DirectGroup::new(Apply::Push { tid }))
+            .write(&SalGroup::new(Apply::Push { tid }))
             .expect("group fits");
     }
     wp.drain_sal();

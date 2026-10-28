@@ -2120,9 +2120,7 @@ fn int_set_is_canonical(bytes: &[u8]) -> bool {
 
 fn decode_int_set(bytes: &[u8]) -> Vec<i64> {
     debug_assert!(int_set_is_canonical(bytes), "construction rejects a non-canonical pool");
-    let mut v = Vec::new();
-    gnitz_wire::extend_from_le_bytes(&mut v, bytes);
-    v
+    gnitz_wire::le_scalars(bytes).expect("construction rejects a non-canonical pool")
 }
 
 // ---------------------------------------------------------------------------

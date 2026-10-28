@@ -11,10 +11,8 @@ use std::rc::Rc;
 use crate::catalog::CatalogEngine;
 use crate::query::{DagEngine, DriveHost};
 use crate::runtime::mesh::Mesh;
-use crate::runtime::park::WorkerPark;
 use crate::runtime::sal::{Apply, Inbound, Read, ReplyRoute, SalReader, SalRequest};
 use crate::runtime::w2m::W2mWriter;
-use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::{IndexClaim, RelationKind, RelationRegistry};
 use gnitz_wire::TypeCode;
@@ -30,9 +28,8 @@ pub struct WorkerProcess<'c> {
     catalog: &'c mut CatalogEngine,
     sal_reader: SalReader,
     w2m_writer: W2mWriter,
-    /// Where this worker sleeps for a SAL group or an exchange part.
-    park: WorkerPark,
-    /// Where this worker trades its exchange rounds with its peers.
+    /// Where this worker trades its exchange rounds with its peers, and parks
+    /// for a SAL group or an exchange part.
     mesh: Mesh,
     /// Replies this worker owes, in the order they reach the ring. A cut's reader
     /// drains its leases in request order and a ring frees only a released prefix,
@@ -53,18 +50,11 @@ use reply::{Owed, Rows};
 static KEY_SPANS_ERROR: Seam = Seam::new("GNITZ_INJECT_KEY_SPANS_ERROR");
 
 impl<'c> WorkerProcess<'c> {
-    pub fn new(
-        catalog: &'c mut CatalogEngine,
-        sal_reader: SalReader,
-        w2m_writer: W2mWriter,
-        park: WorkerPark,
-        mesh: Mesh,
-    ) -> Self {
+    pub fn new(catalog: &'c mut CatalogEngine, sal_reader: SalReader, w2m_writer: W2mWriter, mesh: Mesh) -> Self {
         WorkerProcess {
             catalog,
             sal_reader,
             w2m_writer,
-            park,
             mesh,
             replies: VecDeque::new(),
             reply_frame_budget: gnitz_foundation::env::env_num(
@@ -82,7 +72,7 @@ impl<'c> WorkerProcess<'c> {
         loop {
             // An owed reply emits its next frame without waiting on the SAL.
             if self.replies.is_empty() {
-                self.park.park(|| self.sal_reader.is_empty());
+                self.mesh.park().park(|| self.sal_reader.is_empty());
             }
 
             self.drain_sal();
