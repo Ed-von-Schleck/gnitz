@@ -1,5 +1,5 @@
 use super::*;
-use crate::hir::{ColIdGen, EqPair, HirRange};
+use crate::hir::{ColIdGen, KeyPair};
 use crate::test_support::{col, schema};
 use gnitz_wire::RangeRel;
 use std::sync::Arc;
@@ -27,15 +27,12 @@ fn join_keep_rules() {
     ];
     let mark = ids.next();
     let col = |side: usize, slot: usize| frames[side].layout[slot].unwrap();
-    let eq = EqPair {
-        left: col(0, 2),
-        right: col(1, 1),
+    let eq = KeyPair {
+        cols: [col(0, 2), col(1, 1)],
         ty: TypeCode::U64.into(),
     };
-    let range = HirRange {
-        left: col(0, 3),
-        right: col(1, 2),
-        op: RangeRel::Le,
+    let range = KeyPair {
+        cols: [col(0, 3), col(1, 2)],
         ty: TypeCode::U64.into(),
     };
     /// The shape, the kind, the demand's reads, and each side's keep list and
@@ -78,7 +75,7 @@ fn join_keep_rules() {
     for &(shape, kind, reads, want) in cases {
         let class = JoinClass {
             eq: matches!(shape, Equi | Band).then_some(eq).into_iter().collect(),
-            range: matches!(shape, Band | PureRange).then_some(range),
+            range: matches!(shape, Band | PureRange).then_some((range, RangeRel::Le)),
         };
         assert_eq!(class.shape(), shape);
         let refs: HashSet<ColId> = reads

@@ -179,8 +179,11 @@ impl Rename {
 
 /// A projection's slots over `input`, in output order — each entry resolved and
 /// classified, then the input's PK pinned to the leading slots — as the emission
-/// items and the identity and definition of each.
-pub(crate) fn project_slots(items: &[ProjEntry], input: &Frame) -> Result<(Vec<ProjItem>, Vec<Slot>), GnitzSqlError> {
+/// items and the output frame.
+pub(crate) fn physicalize_projection(
+    items: &[ProjEntry],
+    input: &Frame,
+) -> Result<(Vec<ProjItem>, Frame), GnitzSqlError> {
     let mut slots = items
         .iter()
         .map(|e| {
@@ -194,15 +197,7 @@ pub(crate) fn project_slots(items: &[ProjEntry], input: &Frame) -> Result<(Vec<P
         })
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
     place_pk_front(&mut slots, &input.schema);
-    Ok(slots.into_iter().map(|(item, id, def)| (item, (id, def))).unzip())
-}
-
-/// [`project_slots`] as emission items and the output frame.
-pub(crate) fn physicalize_projection(
-    items: &[ProjEntry],
-    input: &Frame,
-) -> Result<(Vec<ProjItem>, Frame), GnitzSqlError> {
-    let (proj, cols) = project_slots(items, input)?;
+    let (proj, cols): (Vec<ProjItem>, Vec<Slot>) = slots.into_iter().map(|(item, id, def)| (item, (id, def))).unzip();
     Ok((proj, Frame::new(cols, input.schema.pk_cols().len())?))
 }
 

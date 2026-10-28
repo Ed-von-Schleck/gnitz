@@ -34,7 +34,11 @@ fn catalog() -> TestCatalog {
 /// Bind one view body as `CREATE VIEW` binds it.
 pub(in crate::hir) fn bound(sql: &str) -> Rc<RelExpr> {
     let (cat, ids) = (catalog(), ColIdGen::new());
-    let mut cx = BindCx::new(&cat, &ids, ViewBody { stmt: "CREATE VIEW", replacing: None });
+    let mut cx = BindCx::new(
+        &cat,
+        &ids,
+        Surface::View(ViewBody { stmt: "CREATE VIEW", replacing: None }),
+    );
     bind_query(&mut cx, &parse_query(sql)).unwrap_or_else(|e| panic!("{sql}: {e:?}"))
 }
 

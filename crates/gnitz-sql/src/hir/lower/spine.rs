@@ -18,7 +18,7 @@ use std::rc::Rc;
 /// A single input as its consumer's circuit reads it: a source — a relation read
 /// in place, or a hidden segment — under the inline `Filter` / `Project` levels
 /// fused above it, innermost first, each with the columns read of it.
-pub(crate) struct Spine<'a> {
+pub(super) struct Spine<'a> {
     seg: SegInput,
     levels: Vec<(Level<'a>, HashSet<ColId>)>,
 }
@@ -32,16 +32,15 @@ enum Level<'a> {
 /// output, a top-N or window carrying every input column), or only a slot per column it
 /// reads (a reduce, a set operation's leaves).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Top {
+pub(super) enum Top {
     Output,
     Slots,
 }
 
 /// Where an opened input's columns come from in the scanned relation: the
-/// source, the source column behind each surviving column, and the source PK,
-/// which the levels carry verbatim at the front of the key region.
-pub(crate) struct SourceOrigin {
-    pub(super) src: SegSource,
+/// source column behind each surviving column, and the source PK, which the
+/// levels carry verbatim at the front of the key region.
+pub(super) struct SourceOrigin {
     /// Keyed by the id a column carries above the fused levels; a computed
     /// column is absent.
     cols: HashMap<ColId, u32>,
@@ -50,7 +49,7 @@ pub(crate) struct SourceOrigin {
 
 impl SourceOrigin {
     /// True iff `id` names a verbatim copy of a source column.
-    pub(crate) fn resolves(&self, id: ColId) -> bool {
+    pub(super) fn resolves(&self, id: ColId) -> bool {
         self.cols.contains_key(&id)
     }
 
@@ -79,7 +78,7 @@ impl SourceOrigin {
     }
 
     /// The columns of `key`, restated over the source relation.
-    pub(crate) fn scatter_role(&self, frame: &Frame, key: &[ReindexSlot]) -> Option<ReindexRole> {
+    pub(super) fn scatter_role(&self, frame: &Frame, key: &[ReindexSlot]) -> Option<ReindexRole> {
         let source_cols = key
             .iter()
             .map(|&(c, _)| self.slot(frame, c as usize))
@@ -91,7 +90,7 @@ impl SourceOrigin {
 /// Open `rel` for a consumer reading `live` of it. Its `Filter` / `Project` levels
 /// fuse when the node below them is read in place; otherwise that node is cut with
 /// whatever its shell lowers whole, and only the levels above the cut fuse.
-pub(crate) fn open<'a>(
+pub(super) fn open<'a>(
     chain: &mut ViewChain,
     rel: &'a Rc<RelExpr>,
     live: &HashSet<ColId>,
@@ -148,24 +147,24 @@ pub(crate) fn open<'a>(
 }
 
 impl Spine<'_> {
-    pub(crate) fn tid(&self) -> u64 {
+    pub(super) fn tid(&self) -> u64 {
         self.seg.src.tid()
     }
 
     /// The opened source's, since no fused level re-keys.
-    pub(crate) fn pk_repeats(&self) -> bool {
+    pub(super) fn pk_repeats(&self) -> bool {
         self.seg.src.pk_repeats()
     }
 
     /// A hidden segment read whole, with nothing fused above it.
-    pub(crate) fn segment(seg: SegInput) -> Spine<'static> {
+    pub(super) fn segment(seg: SegInput) -> Spine<'static> {
         Spine { seg, levels: Vec::new() }
     }
 
     /// Where this spine's columns come from in the opened relation. A bare
     /// column reference copies its column verbatim, whether [`Self::emit`]
     /// relabels it or emits it; anything else ends that column's chain.
-    pub(crate) fn origin(&self) -> SourceOrigin {
+    pub(super) fn origin(&self) -> SourceOrigin {
         let mut cols: HashMap<ColId, u32> = self
             .seg
             .frame
@@ -183,7 +182,6 @@ impl Spine<'_> {
                 .collect();
         }
         SourceOrigin {
-            src: self.seg.src.clone(),
             cols,
             pk: self.seg.frame.schema.pk_cols().to_vec(),
         }
@@ -191,7 +189,7 @@ impl Spine<'_> {
 
     /// Emit the levels into `cb`. A rename-only projection relabels the frame
     /// instead of emitting a node, except the outermost one under `Top::Output`.
-    pub(crate) fn emit(self, cb: &mut Circuit, top: Top) -> Result<(NodeId, Frame), GnitzSqlError> {
+    pub(super) fn emit(self, cb: &mut Circuit, top: Top) -> Result<(NodeId, Frame), GnitzSqlError> {
         let Spine { seg, levels } = self;
         let SegInput { src, mut frame } = seg;
         let output_at = match top {

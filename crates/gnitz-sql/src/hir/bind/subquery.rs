@@ -2,15 +2,15 @@
 //! the column its decorrelated join produces.
 
 use super::super::{
-    cross_comparison, hircol_of, side, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, Side,
-    SubqueryKind, SubqueryRef,
+    cross_comparison, hircol_of, side, ColId, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, Side, SubqueryKind,
+    SubqueryRef,
 };
-use super::{bind_body_suffix, resolve_table_ref, BindCx, BodyShape, JoinScope, ScopeLeaf, SubPolicy};
+use super::{resolve_table_ref, BindCx, JoinScope, ScopeLeaf, SubPolicy};
 use crate::agg::AggFunc;
 use crate::ast_util::{
     classify_agg_call, classify_from, col_ref_parts, extract_table_ref, is_agg_call, peel_nested, AggArg, FromShape,
 };
-use crate::bind::{bind_conjuncts, bind_structural, maybe_negate, single_relation_col_idx, unsupported_subquery};
+use crate::bind::{bind_conjuncts, bind_structural, maybe_negate, unsupported_subquery};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
 use crate::validate::{as_plain_select, reject_query_envelope_body, reject_unhonored_select_clauses, HonoredClauses};
@@ -20,15 +20,16 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 /// Everything a subquery bind resolves against: the body bind's own context,
-/// the outer scope it correlates to, and the record of subqueries bound so far.
-struct SubCtx<'a, 'c> {
-    cx: &'a mut BindCx<'c>,
-    outer_env: &'a [HirCol],
-    outer_alias: &'a str,
+/// the one-relation outer scope it correlates to, and the record of subqueries
+/// bound so far.
+#[derive(Clone, Copy)]
+struct SubCtx<'a> {
+    cx: &'a BindCx<'a>,
+    outer: &'a JoinScope,
     subs: &'a RefCell<Vec<SubqueryRef>>,
 }
 
-impl SubCtx<'_, '_> {
+impl SubCtx<'_> {
     /// Record `s`, and read it through its column.
     fn record(&self, s: SubqueryRef) -> HirExpr {
         let id = s.id;
@@ -37,42 +38,14 @@ impl SubCtx<'_, '_> {
     }
 }
 
-/// Bind a single-relation linear body reading subqueries, each bound to its column
-/// where `bind_structural` meets it.
-pub(super) fn bind_linear_subquery_body(
-    cx: &mut BindCx<'_>,
-    select: &Select,
-    get: Rc<RelExpr>,
-    scope: &JoinScope,
-    outer_alias: &str,
-    shape: BodyShape,
-    order_exprs: &[&Expr],
-) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
-    let ids = cx.ids;
-    let subs = RefCell::new(Vec::new());
-    let sub = RefCell::new(SubCtx {
-        cx,
-        outer_env: &scope.combined,
-        outer_alias,
-        subs: &subs,
-    });
-    let bind_sub = |e: &Expr| bind_one_subquery(&mut sub.borrow_mut(), e);
-    let leaf = ScopeLeaf {
-        scope,
-        sub: SubPolicy::Bind { bind: &bind_sub, subs: &subs },
-    };
-    bind_body_suffix(ids, select, get, &leaf, shape, order_exprs)
-}
-
-/// The resolved inner relation of a subquery: `Filter?(Get)` with the inner-local
-/// WHERE fused, plus the mixed-scope correlation conjuncts (over the outer ∪ inner
-/// `ColId` space) that become the decorrelated join's ON.
+/// The resolved inner relation of a subquery: a `Get` or a CTE's `Alias`, under an
+/// optional `Filter` of its local WHERE, plus the mixed-scope correlation conjuncts
+/// (over the outer ∪ inner `ColId` space) that become the decorrelated join's ON.
 struct InnerResolved<'e> {
     rel: Rc<RelExpr>,
-    inner_cols: Vec<HirCol>,
-    /// The inner relation's effective alias — what a qualified reference to an
-    /// inner column must name.
-    inner_alias: String,
+    /// The inner relation under its effective alias — what a qualified reference
+    /// to an inner column must name.
+    inner: JoinScope,
     inner_select: &'e Select,
     correlation: Vec<HirExpr>,
 }
@@ -81,8 +54,7 @@ struct InnerResolved<'e> {
 /// correlation conjuncts. The inner FROM must be one plain relation (no JOINs, no
 /// derived table, no GROUP BY / HAVING / DISTINCT); a conjunct referencing only
 /// the outer relation is rejected (hoisting would be wrong for NOT EXISTS).
-fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_>, subquery: &'e Query) -> Result<InnerResolved<'e>, GnitzSqlError> {
-    let (outer_env, outer_alias) = (cx.outer_env, cx.outer_alias);
+fn resolve_inner<'e>(cx: SubCtx<'_>, subquery: &'e Query) -> Result<InnerResolved<'e>, GnitzSqlError> {
     let ctx = "subquery";
     let inner_select = as_plain_select(reject_query_envelope_body(subquery, ctx)?, ctx)?;
     reject_unhonored_select_clauses(inner_select, HonoredClauses::PLAIN, ctx)?;
@@ -93,11 +65,6 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_>, subquery: &'e Query) -> Result<Inn
     };
     let tref = extract_table_ref(factor, cx.cx.cat.schema_name(), "subquery")?;
     let inner_alias = tref.alias.clone();
-    if outer_alias.eq_ignore_ascii_case(&inner_alias) {
-        return Err(GnitzSqlError::Rejected(format!(
-            "relation alias '{outer_alias}' is used by both the view FROM and its subquery; rename one"
-        )));
-    }
     let (inner_get, inner_cols) = resolve_table_ref(cx.cx, &tref)?;
 
     let mut local_preds: Vec<HirExpr> = Vec::new();
@@ -105,9 +72,8 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_>, subquery: &'e Query) -> Result<Inn
     if let Some(where_expr) = &inner_select.selection {
         // The (outer, inner) scope the split resolves against — built here, and
         // read nowhere else: a subquery with no WHERE has nothing to split.
-        let mut scope = JoinScope::new();
-        scope.push(outer_alias, outer_env.to_vec());
-        scope.push(&inner_alias, inner_cols.clone());
+        let mut scope = cx.outer.clone();
+        scope.push(&inner_alias, inner_cols.clone())?;
         let leaf = ScopeLeaf {
             scope: &scope,
             sub: SubPolicy::Reject(|_| {
@@ -117,9 +83,9 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_>, subquery: &'e Query) -> Result<Inn
             }),
         };
         for bound in bind_conjuncts(where_expr, &leaf).map_err(|e| e.in_clause("subquery"))? {
-            match side(&bound, &inner_cols, outer_env) {
-                Side::Left | Side::Neither => local_preds.push(bound),
-                Side::Right => {
+            match side(&bound, &inner_cols, &cx.outer.combined) {
+                Side::One(0) | Side::Neither => local_preds.push(bound),
+                Side::One(_) => {
                     return Err(GnitzSqlError::Rejected(
                         "a subquery WHERE conjunct references only the outer relation; \
                          hoist it into the view's own WHERE clause"
@@ -133,8 +99,7 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_>, subquery: &'e Query) -> Result<Inn
     let rel = RelExpr::filter(inner_get, local_preds)?;
     Ok(InnerResolved {
         rel,
-        inner_cols,
-        inner_alias,
+        inner: JoinScope::single(&inner_alias, inner_cols),
         inner_select,
         correlation,
     })
@@ -148,9 +113,16 @@ fn single_projection_expr<'e>(select: &'e Select, err: &str) -> Result<&'e Expr,
     }
 }
 
-/// Bind one subquery node to the column it is read through. ANY/ALL is normalized
+/// Bind one subquery node in `cx`, correlated to the one-relation `outer` scope,
+/// to the column it is read through, recording it in `subs`. ANY/ALL is normalized
 /// here (`= ANY → IN`, `<> ALL → NOT IN`, range → `x OP (SELECT MIN/MAX)`).
-fn bind_one_subquery(cx: &mut SubCtx<'_, '_>, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
+pub(super) fn bind_one_subquery(
+    cx: &BindCx<'_>,
+    outer: &JoinScope,
+    subs: &RefCell<Vec<SubqueryRef>>,
+    e: &Expr,
+) -> Result<HirExpr, GnitzSqlError> {
+    let cx = SubCtx { cx, outer, subs };
     match e {
         Expr::Exists { subquery, negated } => bind_exists_sub(cx, subquery, None, *negated),
         Expr::InSubquery { expr, subquery, negated } => bind_exists_sub(cx, subquery, Some(expr), *negated),
@@ -166,12 +138,11 @@ fn bind_one_subquery(cx: &mut SubCtx<'_, '_>, e: &Expr) -> Result<HirExpr, Gnitz
 /// Bind an EXISTS / IN subquery as an `Exists`-kind `SubqueryRef`. For IN, the
 /// `(outer, inner)` equality joins the correlation; an EXISTS must be correlated.
 fn bind_exists_sub(
-    cx: &mut SubCtx<'_, '_>,
+    cx: SubCtx<'_>,
     subquery: &Query,
     in_operand: Option<&Expr>,
     negated: bool,
 ) -> Result<HirExpr, GnitzSqlError> {
-    let (outer_env, outer_alias) = (cx.outer_env, cx.outer_alias);
     let ir = resolve_inner(cx, subquery)?;
     let mut correlation = ir.correlation;
     let mut nullable = false;
@@ -184,8 +155,7 @@ fn bind_exists_sub(
         }
         let outer = bind_plain_col(
             operand,
-            outer_env,
-            outer_alias,
+            cx.outer,
             "IN (SELECT …): the outer operand must be a plain column",
         )?;
         let inner_proj = single_projection_expr(
@@ -194,11 +164,11 @@ fn bind_exists_sub(
         )?;
         let inner = bind_plain_col(
             inner_proj,
-            &ir.inner_cols,
-            &ir.inner_alias,
+            &ir.inner,
             "IN (SELECT …): the subquery must select exactly one plain column",
         )?;
-        nullable = hircol_of(outer_env, outer).def.is_nullable || hircol_of(&ir.inner_cols, inner).def.is_nullable;
+        nullable = hircol_of(&cx.outer.combined, outer).def.is_nullable
+            || hircol_of(&ir.inner.combined, inner).def.is_nullable;
         correlation.push(BExpr::bin(BExpr::ColRef(outer), BinOp::Eq, BExpr::ColRef(inner)));
     }
     let subref = SubqueryRef {
@@ -212,13 +182,12 @@ fn bind_exists_sub(
 
 /// Bind a scalar aggregate subquery as a `Scalar`-kind `SubqueryRef` whose `rel`
 /// reduces grouped (correlated) or globally (uncorrelated).
-fn bind_scalar_sub(cx: &mut SubCtx<'_, '_>, q: &Query) -> Result<HirExpr, GnitzSqlError> {
-    let (ids, outer_env) = (cx.cx.ids, cx.outer_env);
+fn bind_scalar_sub(cx: SubCtx<'_>, q: &Query) -> Result<HirExpr, GnitzSqlError> {
     let ir = resolve_inner(cx, q)?;
     let err = "a scalar subquery must be a single aggregate over its correlation group";
     let proj_expr = single_projection_expr(ir.inner_select, err)?;
-    let (func, arg) = classify_scalar_agg(proj_expr, &ir.inner_cols, &ir.inner_alias, err)?;
-    let subref = scalar_leaf(ids, outer_env, ir, func, arg)?;
+    let (func, arg) = classify_scalar_agg(proj_expr, &ir.inner, err)?;
+    let subref = scalar_leaf(cx, ir, func, arg)?;
     Ok(cx.record(subref))
 }
 
@@ -226,7 +195,7 @@ fn bind_scalar_sub(cx: &mut SubCtx<'_, '_>, q: &Query) -> Result<HirExpr, GnitzS
 /// range ANY/ALL becomes `x OP (SELECT MIN/MAX)` — under the null test that
 /// settles an empty set.
 fn bind_quantifier_sub(
-    cx: &mut SubCtx<'_, '_>,
+    cx: SubCtx<'_>,
     left: &Expr,
     compare_op: &BinaryOperator,
     right: &Expr,
@@ -265,22 +234,20 @@ fn bind_quantifier_sub(
     } else {
         AggFunc::Min
     };
-    let (ids, outer_env, outer_alias) = (cx.cx.ids, cx.outer_env, cx.outer_alias);
     let ir = resolve_inner(cx, q)?;
     let err = "a range ANY/ALL subquery must select a single non-nullable column";
     let proj_expr = single_projection_expr(ir.inner_select, err)?;
-    let inner_col = bind_plain_col(proj_expr, &ir.inner_cols, &ir.inner_alias, err)?;
-    if hircol_of(&ir.inner_cols, inner_col).def.is_nullable {
+    let inner_col = bind_plain_col(proj_expr, &ir.inner, err)?;
+    if hircol_of(&ir.inner.combined, inner_col).def.is_nullable {
         return Err(GnitzSqlError::Rejected(
             "a range ANY/ALL subquery's column must be NOT NULL — a NULL in the set makes ANY/ALL \
              three-valued in a way the MIN/MAX rewrite cannot reproduce"
                 .into(),
         ));
     }
-    let m = cx.record(scalar_leaf(ids, outer_env, ir, agg_func, Some(inner_col))?);
-    let outer_scope = JoinScope::single(outer_alias, outer_env.to_vec());
+    let m = cx.record(scalar_leaf(cx, ir, agg_func, Some(inner_col))?);
     let outer_leaf = ScopeLeaf {
-        scope: &outer_scope,
+        scope: cx.outer,
         sub: SubPolicy::Reject(unsupported_subquery),
     };
     let x = bind_structural(left, &outer_leaf)?;
@@ -291,23 +258,17 @@ fn bind_quantifier_sub(
     Ok(BExpr::bin(m_test, if is_any { BinOp::And } else { BinOp::Or }, cmp))
 }
 
-/// Resolve `e` against `env` as a bare column reference, returning its `ColId`.
-/// Every rejection is `err`: the caller's surface states what shape it needed,
-/// which is more use here than "column 'x' not found".
-fn bind_plain_col(e: &Expr, env: &[HirCol], alias: &str, err: &str) -> Result<ColId, GnitzSqlError> {
+/// Resolve `e` against `scope` as a bare column reference, returning its `ColId`.
+/// Every rejection is `err`: the caller states what shape it needed, which is
+/// more use here than "column 'x' not found".
+fn bind_plain_col(e: &Expr, scope: &JoinScope, err: &str) -> Result<ColId, GnitzSqlError> {
     col_ref_parts(e)
-        .and_then(|(qual, name)| single_relation_col_idx(env.iter().map(|c| &c.def), alias, qual, name).ok())
-        .map(|i| env[i].id)
+        .and_then(|(qual, name)| scope.resolve(qual, name).ok())
         .ok_or_else(|| GnitzSqlError::Rejected(err.into()))
 }
 
 /// Classify a scalar subquery's single-aggregate projection into `(func, arg)`.
-fn classify_scalar_agg(
-    e: &Expr,
-    inner_cols: &[HirCol],
-    inner_alias: &str,
-    non_agg: &str,
-) -> Result<(AggFunc, Option<ColId>), GnitzSqlError> {
+fn classify_scalar_agg(e: &Expr, inner: &JoinScope, non_agg: &str) -> Result<(AggFunc, Option<ColId>), GnitzSqlError> {
     let Expr::Function(f) = peel_nested(e) else {
         return Err(GnitzSqlError::Rejected(non_agg.into()));
     };
@@ -318,8 +279,7 @@ fn classify_scalar_agg(
     let arg = match arg_expr.reject_distinct("a scalar subquery aggregate")? {
         Some(a) => Some(bind_plain_col(
             a,
-            inner_cols,
-            inner_alias,
+            inner,
             "a scalar subquery aggregate must be over a plain column or `*`",
         )?),
         None => None,
@@ -357,18 +317,18 @@ fn scalar_group_cols(correlation: &[HirExpr], outer: &[HirCol], inner: &[HirCol]
 /// A scalar subquery: `func(arg)` reduced per correlation group, finalized as its
 /// column.
 fn scalar_leaf(
-    ids: &ColIdGen,
-    outer_env: &[HirCol],
+    cx: SubCtx<'_>,
     ir: InnerResolved<'_>,
     func: AggFunc,
     arg: Option<ColId>,
 ) -> Result<SubqueryRef, GnitzSqlError> {
-    let group_cols = scalar_group_cols(&ir.correlation, outer_env, &ir.inner_cols)?;
+    let (ids, inner_cols) = (cx.cx.ids, &ir.inner.combined);
+    let group_cols = scalar_group_cols(&ir.correlation, &cx.outer.combined, inner_cols)?;
     let arg = arg.map_or(AggArg::Star, AggArg::All);
-    let agg = HirAgg::new(ids, func, arg, &ir.inner_cols, group_cols.is_empty(), &[])?;
+    let agg = HirAgg::new(ids, func, arg, inner_cols, group_cols.is_empty(), &[])?;
     let (expr, ty, nullable) = agg.as_value();
     let value = HirCol::new(ids.next(), ColumnDef::typed("_agg", ty, nullable).hidden());
-    let mut items = RelExpr::passthrough_items(group_cols.iter().map(|&id| hircol_of(&ir.inner_cols, id).clone()));
+    let mut items = RelExpr::passthrough_items(group_cols.iter().map(|&id| hircol_of(inner_cols, id).clone()));
     items.push(ProjEntry { expr, out: value.clone() });
     Ok(SubqueryRef {
         id: value.id,

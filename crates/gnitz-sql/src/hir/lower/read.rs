@@ -3,14 +3,14 @@
 //! CTE references over the relation compose by substitution into the tree the
 //! flat query binds to, which the rows reply and [`super::fold`] then lower.
 
-use super::super::physical::{self, Frame, Slot};
-use super::super::{as_col, hircol_of, AggCol, BoundRef, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
+use super::super::physical::{self, Frame};
+use super::super::{as_col, hircol_of, reduce_reads, AggCol, BoundRef, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
 use super::fold::{distinct_fold, fold, FoldPieces};
 use crate::error::{derivation, GnitzSqlError};
 use crate::ir::{BExpr, BoundExpr};
-use crate::project::{projection_program, ProjItem};
+use crate::project::{payload_program, ProjItem};
 use crate::tail::wire_keys;
-use gnitz_core::RelDescriptor;
+use gnitz_core::{RelDescriptor, Schema};
 use gnitz_wire::{ColumnDef, OrderKey};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -138,8 +138,9 @@ fn linear(rel: &Rc<RelExpr>) -> Result<Linear<'_>, GnitzSqlError> {
             Err(derivation("DISTINCT CTE"))
         }
         RelExpr::SetOp { .. } => Err(derivation("set operation")),
-        RelExpr::TopN { .. } => Err(GnitzSqlError::Internal("an ad-hoc read bound a top-N".into())),
-        RelExpr::Window { .. } => Err(GnitzSqlError::Internal("an ad-hoc read bound a window".into())),
+        RelExpr::Ordered { .. } => Err(GnitzSqlError::Internal(
+            "an ad-hoc read bound an ordered operator".into(),
+        )),
     }
 }
 
@@ -178,10 +179,14 @@ pub(crate) fn lower_read(rel: &Rc<RelExpr>, placed: Vec<usize>, refs: &[BoundRef
     };
     let (desc, source) = lin.source()?;
     let conjuncts = Frame::scan(desc, source).resolve_preds(&lin.preds)?;
-    let name = refs.iter().find(|r| r.tid == desc.tid).map(|r| r.name.clone());
+    let name = refs
+        .iter()
+        .find(|r| r.tid == desc.tid)
+        .map(|r| r.name.clone())
+        .ok_or_else(|| GnitzSqlError::Internal("an ad-hoc read's relation is not among the bound references".into()))?;
     Ok(AdhocRead::Relation {
         desc: Arc::clone(desc),
-        name: name.ok_or_else(internal)?,
+        name,
         conjuncts,
         shape,
     })
@@ -213,24 +218,12 @@ fn flat_reduce(
     items: &[ProjEntry],
 ) -> Result<FoldPieces, GnitzSqlError> {
     let (desc, source) = lin.source()?;
-    // What the reduce reads, in the order its own pre-map lists it.
-    let reads: Vec<ColId> = match input.as_ref() {
-        RelExpr::Project { items, .. } => items.iter().map(|it| it.out.id).collect(),
-        _ => {
-            let mut reads = group_cols.to_vec();
-            for id in aggs.iter().filter_map(|c| c.arg) {
-                if !reads.contains(&id) {
-                    reads.push(id);
-                }
-            }
-            reads
-        }
-    };
     let in_cols = input.cols();
     let mut copies: HashMap<ColId, ColId> = HashMap::new();
     let mut pre: Vec<ProjEntry> = Vec::new();
     let mut computed = 0;
-    for r in reads {
+    // What the reduce reads, in the order its pre-map lists it.
+    for r in reduce_reads(group_cols, aggs) {
         let e = &lin.map[&r];
         match as_col(e) {
             Some(src) => {
@@ -277,14 +270,15 @@ fn flat_reduce(
 
 /// A rows read's reply items, placed: what [`AdhocRows::reply`] numbers.
 pub(crate) struct AdhocRows {
-    src: Frame,
+    /// The schema of the relation read.
+    src: Arc<Schema>,
     /// The items' output columns, in item order: the SELECT list, then a hidden column per
     /// ORDER BY expression no item already computes.
     cols: Vec<HirCol>,
-    /// The items as the projection's slots, the source PK pinned in front, and each
-    /// slot's identity and definition.
+    /// The items as the projection's slots, the source PK pinned in front, and the
+    /// frame they produce.
     proj: Vec<ProjItem>,
-    layout: Vec<Slot>,
+    out: Frame,
     /// The item each ORDER BY expression key sorts on.
     placed: Vec<usize>,
 }
@@ -331,12 +325,12 @@ pub(crate) fn reply_rows(
         }
     }
     let src = Frame::scan(desc, source);
-    let (proj, layout) = physical::project_slots(&items, &src)?;
+    let (proj, out) = physical::physicalize_projection(&items, &src)?;
     Ok(AdhocRows {
-        src,
+        src: src.schema,
         cols: items.into_iter().map(|it| it.out).collect(),
         proj,
-        layout,
+        out,
         placed: placed.into_iter().map(|p| at[p]).collect(),
     })
 }
@@ -349,24 +343,19 @@ impl AdhocRows {
         keys: &[crate::tail::OrderKey<'_>],
         walks_in_pk_order: bool,
     ) -> Result<RowsReply, GnitzSqlError> {
-        let AdhocRows { src, cols, proj, layout, placed } = self;
+        let AdhocRows { src, cols, proj, out, placed } = self;
         let item_order = wire_keys(keys, cols.iter().map(|c| &c.def), placed)?;
-        let k = src.schema.pk_cols().len();
+        let k = src.pk_cols().len();
         // The relation's payload columns, each copied in place at its own type: the reply's
         // regions are the relation's.
         let payload = proj[k..]
             .iter()
-            .zip(&layout[k..])
-            .map(|(item, (_, def))| (item.passthrough_src(), def.ty));
-        let unmapped = payload.eq(src.schema.payload_columns().map(|(_, ci, col)| (Some(ci), col.ty)));
-        let program = match unmapped {
-            true => None,
-            false => {
-                let defs: Vec<ColumnDef> = layout[k..].iter().map(|(_, def)| def.clone()).collect();
-                Some(projection_program(&proj[k..], &defs, &src.schema)?)
-            }
-        };
-        let out = Frame::new(layout, k)?;
+            .zip(&out.schema.columns()[k..])
+            .map(|(item, def)| (item.passthrough_src(), def.ty));
+        let unmapped = payload.eq(src.payload_columns().map(|(_, ci, col)| (Some(ci), col.ty)));
+        let program = (!unmapped)
+            .then(|| payload_program(&proj, &out.schema, &src))
+            .transpose()?;
         let visible = cols.iter().filter(|c| !c.def.is_hidden).map(|c| c.id);
         let (schema, column_of) = out.schema_in_order(visible)?;
         // Each key with its slot of the projection's output.
@@ -392,7 +381,7 @@ impl AdhocRows {
         let pk_ordered = slots.len() <= k
             && slots
                 .iter()
-                .zip(src.schema.pk_cols())
+                .zip(src.pk_cols())
                 .all(|(&(slot, key), &pk)| !key.desc && source_col(slot) == Some(pk as usize));
         Ok(RowsReply {
             order: numbered(&|slot| column_of[slot] as usize),

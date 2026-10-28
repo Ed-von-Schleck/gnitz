@@ -81,7 +81,7 @@ pub(crate) fn compute_map(program: LogicalProgram, out: &Schema) -> ComputeMap {
 /// class-agnostic here — the engine splits it by the source register's class,
 /// storing the raw 8-byte image for a scalar and a German-string cell for a
 /// string.
-pub(crate) fn projection_program(
+fn projection_program(
     items: &[ProjItem],
     out_cols: &[ColumnDef],
     schema: &Schema,

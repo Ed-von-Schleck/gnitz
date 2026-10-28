@@ -39,19 +39,13 @@ pub(super) fn join_keys_and_type(join: &sqlparser::ast::Join) -> Result<(&JoinCo
 /// duplicate copy of each `USING` / `NATURAL` column, and widen the scope by the
 /// step's null semantics.
 pub(super) fn fold_join_step(
-    cx: &mut BindCx<'_>,
+    cx: &BindCx<'_>,
     scope: &mut JoinScope,
     left: Rc<RelExpr>,
     relation: &TableFactor,
     (keys, kind): (&JoinConstraint, JoinType),
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let (right_src, ralias, rcols) = resolve_table_factor(cx, relation)?;
-    // Under one alias twice, `alias.col` would name a column of either relation.
-    if scope.relations.iter().any(|(a, _)| a.eq_ignore_ascii_case(&ralias)) {
-        return Err(GnitzSqlError::Rejected(format!(
-            "relation alias '{ralias}' is used by two relations of one FROM; rename one"
-        )));
-    }
 
     // Before `scope.push` below: a `USING`/`NATURAL` name pairs against the left
     // side alone, where an `ON` (bound after the push) sees both sides.
@@ -77,7 +71,7 @@ pub(super) fn fold_join_step(
         JoinConstraint::On(_) | JoinConstraint::None => (Vec::new(), ""),
     };
 
-    scope.push(&ralias, rcols);
+    scope.push(&ralias, rcols)?;
 
     // Every other form states its keys as `pairs`, empty for a keyless step — so a
     // step with no constraint of its own needs no arm, and the WHERE may key it.
@@ -110,7 +104,7 @@ pub(super) fn fold_join_step(
     // reaches it — the two are distinct columns of the join output, and only the
     // one name they share was ambiguous.
     for &(l, r) in &pairs {
-        scope.merge_away(if kind == JoinType::Right { l } else { r });
+        scope.merged.push(if kind == JoinType::Right { l } else { r });
     }
 
     let out = RelExpr::join(left, right_src, kind, on)?;

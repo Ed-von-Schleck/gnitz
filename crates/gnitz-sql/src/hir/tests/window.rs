@@ -1,11 +1,14 @@
 use super::*;
 use crate::hir::bind::tests::bound;
+use crate::hir::OrderedOp;
 
 /// The `(limit, offset)` of the top-N `sql`'s body cuts, if it cuts one.
 fn cut(sql: &str) -> Option<(u64, u64)> {
     fn find(rel: &RelExpr) -> Option<(u64, u64)> {
         match rel {
-            RelExpr::TopN { limit, offset, .. } => Some((*limit, *offset)),
+            RelExpr::Ordered {
+                op: OrderedOp::TopN { limit, offset }, ..
+            } => Some((*limit, *offset)),
             RelExpr::Project { input, .. } | RelExpr::Filter { input, .. } => find(input),
             _ => None,
         }

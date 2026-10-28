@@ -4,7 +4,7 @@
 use super::super::physical::Frame;
 use super::super::{HirCol, RelExpr, SetOpKind};
 use super::spine::{open, Top};
-use super::{emit_filter, project_front, Demand, EmitPieces, ViewChain};
+use super::{project_front, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
 use gnitz_wire::{
     Circuit, ColumnDef, NodeId, NullKeys, ReadBound, ReindexRole, ReindexSlot, TypeCode, NARROW_PK_MAX_BYTES,
@@ -29,14 +29,10 @@ enum ElementKey {
     Hash,
 }
 
-/// Lower a `Distinct` or `SetOp` body — with `above`, the `Project(Filter?(…))`
-/// over it: its tree of directly nested clamps and set operations is one circuit
-/// over its leaves, each opened and emitted once.
-pub(super) fn lower_setop(
-    chain: &mut ViewChain,
-    rel: &Rc<RelExpr>,
-    above: Option<Demand<'_>>,
-) -> Result<EmitPieces, GnitzSqlError> {
+/// Lower a `Distinct` or `SetOp` to circuit pieces: its tree of directly nested
+/// clamps and set operations is one circuit over its leaves, each opened and
+/// emitted once.
+pub(super) fn lower_setop(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, GnitzSqlError> {
     let out = rel.cols();
     let unique = rel.unique_key();
     let mut cb = Circuit::default();
@@ -68,7 +64,7 @@ pub(super) fn lower_setop(
     };
 
     let mut next = leaves.iter();
-    let root = combine(&mut cb, rel, false, &mut |cb, _| {
+    combine(&mut cb, rel, false, &mut |cb, _| {
         let leaf = next.next().expect("one leaf per `combine` read, in the same order");
         if let ElementKey::Carried { order, .. } = &key {
             let items = RelExpr::passthrough_items(order.iter().map(|&p| leaf.cols[p].clone()));
@@ -99,13 +95,6 @@ pub(super) fn lower_setop(
             vec![ColumnDef::new("_set_pk", TypeCode::U128, false).hidden()],
             out.iter().map(HirCol::slot),
         )?,
-    };
-    let frame = match above {
-        Some(above) => {
-            let filtered = emit_filter(&mut cb, root, above.where_preds, &frame)?;
-            project_front(&mut cb, filtered, above.items, &frame)?.1
-        }
-        None => frame,
     };
     Ok(EmitPieces {
         circuit: cb,

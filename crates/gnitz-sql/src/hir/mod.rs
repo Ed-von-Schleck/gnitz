@@ -54,7 +54,7 @@ pub(crate) fn bind_and_lower<'a>(
 ) -> Result<LoweredView, GnitzSqlError> {
     let ids = ColIdGen::new();
     let stmt = view.stmt;
-    let mut cx = bind::BindCx::new(cat, &ids, view);
+    let mut cx = bind::BindCx::new(cat, &ids, bind::Surface::View(view));
     let rel = bind::bind_query(&mut cx, query)?;
     let mut names = rel.cols();
     let body_columns = names
@@ -67,7 +67,7 @@ pub(crate) fn bind_and_lower<'a>(
     Ok(LoweredView {
         segments,
         view,
-        refs: cx.refs,
+        refs: cx.refs.into_inner(),
         body_columns,
     })
 }
@@ -88,10 +88,10 @@ pub(crate) fn bind_adhoc_read(
     order_exprs: &[&sqlparser::ast::Expr],
 ) -> Result<AdhocRead, GnitzSqlError> {
     let ids = ColIdGen::new();
-    let mut cx = bind::BindCx::adhoc(cat, &ids, op);
+    let mut cx = bind::BindCx::new(cat, &ids, bind::Surface::Adhoc { op });
     bind::bind_ctes(&mut cx, query)?;
-    let (rel, placed) = bind::bind_select(&mut cx, select, order_exprs)?;
-    lower::read::lower_read(&rel, placed, &cx.refs)
+    let (rel, placed) = bind::bind_select(&cx, select, order_exprs)?;
+    lower::read::lower_read(&rel, placed, &cx.refs.into_inner())
 }
 
 /// An `INSERT … RETURNING` list as the reply items of a read of `desc`.
@@ -105,16 +105,14 @@ pub(crate) fn bind_returning(
     lower::read::reply_rows(desc, &source, items, Vec::new())
 }
 
-/// Opaque column identity, unique within one `bind_and_lower` invocation, never
+/// Opaque column identity, unique within one bind (one [`ColIdGen`]), never
 /// renumbered. Its `u32` payload is an allocation order, not a layout position —
 /// consumers compare ids, never arithmetic on them.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ColId(u32);
 
-/// Monotonic `ColId` minter, threaded through bind by shared reference. `Get`
-/// mints one per schema column at its reference site; `Project` mints one per
-/// output `ProjEntry`. Bind-only: lowering assigns positions and never mints an
-/// identity; a slot it adds carries none.
+/// Monotonic `ColId` minter: mints every column identity. Bind-only: lowering
+/// assigns positions and never mints; a slot it adds carries none.
 /// Interior-mutable: a leaf binder mints behind `&self`.
 pub(crate) struct ColIdGen(std::cell::Cell<u32>);
 
@@ -173,8 +171,8 @@ pub(crate) fn as_col(e: &HirExpr) -> Option<ColId> {
 /// Which of two inputs' columns a conjunct names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
-    Left,
-    Right,
+    /// Only input `0` (the left) or `1` (the right).
+    One(usize),
     Both,
     Neither,
 }
@@ -190,8 +188,8 @@ pub(crate) fn side(conj: &HirExpr, left: &[HirCol], right: &[HirCol]) -> Side {
     });
     match (l, r, other) {
         (true, true, _) | (_, _, true) => Side::Both,
-        (true, false, false) => Side::Left,
-        (false, true, false) => Side::Right,
+        (true, false, false) => Side::One(0),
+        (false, true, false) => Side::One(1),
         (false, false, false) => Side::Neither,
     }
 }
@@ -219,8 +217,9 @@ pub(crate) struct SubqueryRef {
     /// or its finalized aggregate.
     pub id: ColId,
     pub kind: SubqueryKind,
-    /// EXISTS/IN: `Filter?(Get)`. Scalar: `Project(Reduce)` passing the group
-    /// columns through and computing the finalized aggregate as `id`.
+    /// EXISTS/IN: the inner relation (a `Get`, or a CTE's `Alias`) under an
+    /// optional `Filter` of its local WHERE. Scalar: `Project(Reduce)` passing
+    /// the group columns through and computing the finalized aggregate as `id`.
     pub rel: Rc<RelExpr>,
     /// The mixed-scope conjuncts that become the join's ON, an IN's
     /// `outer = inner` equality among them.
@@ -249,10 +248,11 @@ pub(crate) struct ProjEntry {
     pub out: HirCol,
 }
 
-/// The logical relational IR: the linear variants (`Get`/`Filter`/`Project`) and
-/// the combine-class ones (`Join`/`Reduce`/`Distinct`/`SetOp`). Only `Get` stores
-/// columns (its ids are minted once and must stay stable); every other node's
-/// output columns are derived on demand by [`RelExpr::cols`].
+/// The logical relational IR. `Get`, `Alias` and `SetOp` store their whole
+/// output column list; `Reduce`, a window `Ordered` and a Mark join store only
+/// the columns they add (aggregate, rank and mark columns). Every other column
+/// is derived on demand by [`RelExpr::cols`] from the node's inputs. Ids are
+/// minted once at bind and stay stable.
 pub(crate) enum RelExpr {
     /// The one row of no columns a FROM-less SELECT reads. Only an ad-hoc read
     /// binds one.
@@ -283,7 +283,7 @@ pub(crate) enum RelExpr {
         input: Rc<RelExpr>,
         /// `ColId`s of `input`'s columns; an expression key is a `Project` column below.
         group_cols: Vec<ColId>,
-        aggs: AggCols,
+        aggs: Vec<AggCol>,
     },
     /// Every weight of `input` clamped to `[0, 1]`, its element identified by all
     /// its columns, hidden ones included.
@@ -313,37 +313,39 @@ pub(crate) enum RelExpr {
         right: Rc<RelExpr>,
         out: Vec<HirCol>,
     },
-    /// Per-partition top-N: the rows of `input` filling weight slots
-    /// `offset .. offset + limit` of each `partition` value in `order`, then the
-    /// whole row, which leads with the input's key — a total order, so the result
-    /// is a function of the Z-set. Its output is `input`'s columns. `ORDER BY …
-    /// LIMIT` on a view body is the empty partition; `QUALIFY ROW_NUMBER() OVER
-    /// (…) <= n` names one.
-    TopN {
+    /// An operator over each `partition` value of `input` kept in `order`; `op`
+    /// says what it computes there.
+    Ordered {
         input: Rc<RelExpr>,
         partition: Vec<ColId>,
         order: Vec<OrderCol>,
-        limit: u64,
-        offset: u64,
+        op: OrderedOp,
     },
-    /// Per-partition running values: every row of `input`, widened by its values
-    /// over the rows of its `partition` value at or before its peers — the rows
-    /// equal to it on every key of `order`. Its output is `input`'s columns, then
-    /// `rank` — one more than the number of rows before the row's peers — then
-    /// `dense_rank` — the number of peer groups up to and including the row's —
-    /// then each of `aggs` over those rows, the peers included.
+}
+
+/// What a [`RelExpr::Ordered`] computes over each partition.
+pub(crate) enum OrderedOp {
+    /// Top-N: the rows filling weight slots `offset .. offset + limit` in
+    /// `order`, then the whole row, which leads with the input's key — a total
+    /// order, so the result is a function of the Z-set. Its output is the
+    /// input's columns. `ORDER BY … LIMIT` on a view body is the empty
+    /// partition; `QUALIFY ROW_NUMBER() OVER (…) <= n` names one.
+    TopN { limit: u64, offset: u64 },
+    /// Running values: every row, widened by its values over the rows of its
+    /// partition at or before its peers — the rows equal to it on every key of
+    /// `order`. Its output is the input's columns, then `rank` — one more than
+    /// the number of rows before the row's peers — then `dense_rank` — the
+    /// number of peer groups up to and including the row's — then each of
+    /// `aggs` over those rows, the peers included.
     Window {
-        input: Rc<RelExpr>,
-        partition: Vec<ColId>,
-        order: Vec<OrderCol>,
-        aggs: AggCols,
+        aggs: Vec<AggCol>,
         rank: Option<HirCol>,
         dense_rank: Option<HirCol>,
     },
 }
 
-/// One ORDER BY key of a [`RelExpr::TopN`] or [`RelExpr::Window`]: a column of
-/// its input, its direction, and where NULLs go.
+/// One ORDER BY key of a [`RelExpr::Ordered`]: a column of its input, its
+/// direction, and where NULLs go.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OrderCol {
     pub col: ColId,
@@ -360,28 +362,17 @@ pub(crate) struct AggCol {
     pub col: HirCol,
 }
 
-/// A reduce's physical aggregate columns: each once, in first-use order.
-#[derive(Clone)]
-pub(crate) struct AggCols(Vec<AggCol>);
-
-impl std::ops::Deref for AggCols {
-    type Target = [AggCol];
-    fn deref(&self) -> &[AggCol] {
-        &self.0
+/// The columns a reduce over `group_cols` computing `aggs` reads: the group
+/// columns, then each aggregate argument not already listed.
+pub(crate) fn reduce_reads(group_cols: &[ColId], aggs: &[AggCol]) -> Vec<ColId> {
+    let mut reads = group_cols.to_vec();
+    for id in aggs.iter().filter_map(|c| c.arg) {
+        if !reads.contains(&id) {
+            reads.push(id);
+        }
     }
+    reads
 }
-
-impl IntoIterator for AggCols {
-    type Item = AggCol;
-    type IntoIter = std::vec::IntoIter<AggCol>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
-}
-
-/// A value column: what computes it, and the type and nullability it is declared
-/// with.
-pub(crate) type Value = (HirExpr, ColType, bool);
 
 /// One aggregate over a reduce: the logical `func(arg)` — a call's identity
 /// within its reduce — and the physical value and count columns
@@ -438,15 +429,15 @@ impl HirAgg {
         std::iter::once(&self.out).chain(&self.companion)
     }
 
-    /// The physical columns of `aggs`.
-    pub(crate) fn physical(aggs: &[HirAgg]) -> AggCols {
+    /// The physical columns of `aggs`: each once, in first-use order.
+    pub(crate) fn physical(aggs: &[HirAgg]) -> Vec<AggCol> {
         let mut out: Vec<AggCol> = Vec::new();
         for c in aggs.iter().flat_map(HirAgg::cols) {
             if !out.iter().any(|p| p.col.id == c.col.id) {
                 out.push(c.clone());
             }
         }
-        AggCols(out)
+        out
     }
 
     /// The finalize composite over this aggregate's raw reduce column(s).
@@ -455,19 +446,13 @@ impl HirAgg {
         crate::agg::finalize_agg_bexpr(col(&self.out), self.companion.as_ref().map(col), self.func)
     }
 
-    /// The type this aggregate renders where a view reads it.
-    pub(crate) fn view_type(&self) -> ColType {
-        crate::agg::agg_view_type(self.func, self.out.col.def.ty)
-    }
-
-    /// A companion carries the null-ness; otherwise the raw column's own.
-    pub(crate) fn view_nullable(&self) -> bool {
-        self.companion.is_some() || self.out.col.def.is_nullable
-    }
-
-    /// This aggregate as a view-facing value column.
-    pub(crate) fn as_value(&self) -> Value {
-        (self.finalize(), self.view_type(), self.view_nullable())
+    /// This aggregate as a view-facing value column: its finalize composite, and
+    /// the type and nullability it renders where a view reads it.
+    pub(crate) fn as_value(&self) -> (HirExpr, ColType, bool) {
+        let ty = crate::agg::agg_view_type(self.func, self.out.col.def.ty);
+        // A companion carries the null-ness; otherwise the raw column's own.
+        let nullable = self.companion.is_some() || self.out.col.def.is_nullable;
+        (self.finalize(), ty, nullable)
     }
 }
 
@@ -506,31 +491,14 @@ pub(crate) enum JoinType {
 }
 
 impl JoinType {
-    /// The mark column a [`JoinType::Mark`] appends after its left columns.
-    /// Hidden: nothing but the expressions reading the subquery reach it, and it
-    /// is addressed by id, never by name.
-    pub(crate) fn mark_col(id: ColId) -> HirCol {
-        HirCol::new(id, ColumnDef::new("_mark", TypeCode::Bool, false).hidden())
-    }
-
-    /// A left row survives unmatched ⇒ the right columns can be NULL, and
-    /// `ν_A`, A's rows no right row matches, is emitted.
-    pub(crate) fn preserves_left(self) -> bool {
-        matches!(self, JoinType::Left | JoinType::Full)
-    }
-
-    /// The mirror: a right row survives unmatched, and `ν_B` is emitted.
-    pub(crate) fn preserves_right(self) -> bool {
-        matches!(self, JoinType::Right | JoinType::Full)
-    }
-
-    /// [`Self::preserves_left`] or [`Self::preserves_right`], selected by side.
-    pub(crate) fn preserves(self, is_left: bool) -> bool {
-        if is_left {
-            self.preserves_left()
-        } else {
-            self.preserves_right()
-        }
+    /// A row of `side` (0 left, 1 right) survives unmatched ⇒ the other side's
+    /// columns can be NULL, and `side`'s unmatched rows (`ν_A` for the left,
+    /// `ν_B` for the right) are emitted.
+    pub(crate) fn preserves(self, side: usize) -> bool {
+        matches!(
+            (self, side),
+            (JoinType::Left | JoinType::Full, 0) | (JoinType::Right | JoinType::Full, 1)
+        )
     }
 
     /// Widen the two sides of one join step for its null semantics — a preserved
@@ -541,10 +509,10 @@ impl JoinType {
         left: impl Iterator<Item = &'a mut ColumnDef>,
         right: impl Iterator<Item = &'a mut ColumnDef>,
     ) {
-        if self.preserves_right() {
+        if self.preserves(1) {
             left.for_each(|d| d.is_nullable = true);
         }
-        if self.preserves_left() {
+        if self.preserves(0) {
             right.for_each(|d| d.is_nullable = true);
         }
     }
@@ -560,40 +528,31 @@ impl JoinType {
     /// rows no row of the other side matches. Wider than [`Self::preserves`], which
     /// answers "emit an outer null-fill branch": `Semi`/`Anti`/`Mark` preserve
     /// neither side yet all three decide per left row by match existence.
-    pub(crate) fn has_nu(self, is_left: bool) -> bool {
-        self.preserves(is_left) || (is_left && self.is_decorrelated())
+    pub(crate) fn has_nu(self, side: usize) -> bool {
+        self.preserves(side) || (side == 0 && self.is_decorrelated())
     }
 
     /// Whether this side's unmatched rows are an output: a null-fill, an anti row,
     /// or a mark-0 row. A Semi reads no complement.
-    pub(crate) fn emits_unmatched(self, is_left: bool) -> bool {
-        self.preserves(is_left) || (is_left && matches!(self, JoinType::Anti | JoinType::Mark(_)))
+    pub(crate) fn emits_unmatched(self, side: usize) -> bool {
+        self.preserves(side) || (side == 0 && matches!(self, JoinType::Anti | JoinType::Mark(_)))
     }
 }
 
-/// An equality join-key pair: the two `ColId`s and their promoted common type.
+/// A join-key column pair — `cols[0]` the left side's, `cols[1]` the right's —
+/// and its promoted common type.
 #[derive(Clone, Copy)]
-pub(crate) struct EqPair {
-    pub left: ColId,
-    pub right: ColId,
-    pub ty: ColType,
-}
-
-/// The one range/band conjunct of a join: the two `ColId`s, the canonicalized
-/// relation (left-to-right), and the promoted common type.
-#[derive(Clone, Copy)]
-pub(crate) struct HirRange {
-    pub left: ColId,
-    pub right: ColId,
-    pub op: RangeRel,
+pub(crate) struct KeyPair {
+    pub cols: [ColId; 2],
     pub ty: ColType,
 }
 
 /// A join's keys: its equality pairs and at most one range conjunct.
 #[derive(Clone, Default)]
 pub(crate) struct JoinClass {
-    pub eq: Vec<EqPair>,
-    pub range: Option<HirRange>,
+    pub eq: Vec<KeyPair>,
+    /// The range pair and its relation, canonicalized left-to-right.
+    pub range: Option<(KeyPair, RangeRel)>,
 }
 
 /// Which physical join a join's keys call for. A pure range join has an empty
@@ -608,71 +567,33 @@ pub(crate) enum JoinShape {
     Cross,
 }
 
-/// The key a join step's output rows carry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OutKey {
-    /// The equi join key: each match is made once, on the worker its operands meet on.
-    JoinKey,
-    /// Both sides' source PKs, computed after the join, away from the worker owning it.
-    PairPk,
-    /// The outer side's source PK; `owned` when every row was kept on that PK's
-    /// owner before the join.
-    OuterPk { owned: bool },
-}
-
-impl OutKey {
-    /// Which sides pin their `pk_cols` to the front of the keep list.
-    pub(crate) fn pins(self) -> [bool; 2] {
-        match self {
-            OutKey::JoinKey => [false, false],
-            OutKey::PairPk => [true, true],
-            OutKey::OuterPk { .. } => [true, false],
-        }
-    }
-
-    /// Whether the output needs an exchange onto its own PK.
-    pub(crate) fn exchanged(self) -> bool {
-        matches!(self, OutKey::PairPk | OutKey::OuterPk { owned: false })
-    }
-}
-
 impl JoinClass {
-    /// The key a step of `kind` over these keys emits its rows under.
-    pub(crate) fn out_key(&self, kind: JoinType) -> OutKey {
-        match (self.shape(), kind.is_decorrelated()) {
-            (JoinShape::Equi, _) => OutKey::JoinKey,
-            (JoinShape::Band, true) => OutKey::OuterPk { owned: false },
-            (JoinShape::PureRange, true) => OutKey::OuterPk { owned: true },
-            (JoinShape::Band | JoinShape::PureRange | JoinShape::Cross, _) => OutKey::PairPk,
-        }
+    /// Whether `rel`, this join's input `side`, has rows unique on its equality
+    /// columns, so a row of the other side matches at most one of them.
+    pub(crate) fn side_unique(&self, rel: &RelExpr, side: usize) -> bool {
+        rel.unique_key()
+            .is_some_and(|key| key.iter().all(|c| self.eq.iter().any(|p| p.cols[side] == *c)))
     }
 
-    /// Whether `side`'s rows are unique on this join's equality columns, so a row of
-    /// the other side matches at most one of them.
-    pub(crate) fn side_unique(&self, side: &RelExpr, is_left: bool) -> bool {
-        side.unique_key().is_some_and(|key| {
-            key.iter()
-                .all(|c| self.eq.iter().any(|p| (if is_left { p.left } else { p.right }) == *c))
-        })
+    /// The key pairs, one per key slot: the eq pairs, then the range's.
+    fn keys(&self) -> impl Iterator<Item = &KeyPair> {
+        self.eq.iter().chain(self.range.as_ref().map(|(p, _)| p))
     }
+
+    /// The number of key slots.
+    pub(crate) fn arity(&self) -> usize {
+        self.eq.len() + usize::from(self.range.is_some())
+    }
+
     /// The key columns this ON names on one side — what that side's reindex reads,
     /// and so what a cut input must keep however narrow the demand above it is.
-    pub(crate) fn key_cols(&self, is_left: bool) -> impl Iterator<Item = ColId> + '_ {
-        let pick = move |(l, r)| if is_left { l } else { r };
-        self.eq
-            .iter()
-            .map(move |p| pick((p.left, p.right)))
-            .chain(self.range.iter().map(move |r| pick((r.left, r.right))))
+    pub(crate) fn key_cols(&self, side: usize) -> impl Iterator<Item = ColId> + '_ {
+        self.keys().map(move |p| p.cols[side])
     }
 
-    /// Each key slot's common type, in [`Self::key_cols`] order: the eq pairs',
-    /// then the range's.
+    /// Each key slot's common type, in [`Self::key_cols`] order.
     pub(crate) fn key_types(&self) -> impl Iterator<Item = ColType> + '_ {
-        self.eq.iter().map(|p| p.ty).chain(self.range.iter().map(|r| r.ty))
-    }
-
-    pub(crate) fn key_tcs(&self) -> Vec<TypeCode> {
-        self.key_types().map(|t| t.tc).collect()
+        self.keys().map(|p| p.ty)
     }
 
     pub(crate) fn shape(&self) -> JoinShape {
@@ -735,7 +656,7 @@ impl RelExpr {
         Rc::new(RelExpr::Project { input, items })
     }
 
-    pub(crate) fn reduce(input: Rc<RelExpr>, group_cols: Vec<ColId>, aggs: AggCols) -> Rc<RelExpr> {
+    pub(crate) fn reduce(input: Rc<RelExpr>, group_cols: Vec<ColId>, aggs: Vec<AggCol>) -> Rc<RelExpr> {
         Rc::new(RelExpr::Reduce { input, group_cols, aggs })
     }
 
@@ -759,7 +680,12 @@ impl RelExpr {
         offset: u64,
     ) -> Rc<RelExpr> {
         debug_assert!(limit >= 1, "a top-N selects at least one slot");
-        Rc::new(RelExpr::TopN { input, partition, order, limit, offset })
+        Rc::new(RelExpr::Ordered {
+            input,
+            partition,
+            order,
+            op: OrderedOp::TopN { limit, offset },
+        })
     }
 
     /// The running values of `input` over `partition` in `order`. Every key
@@ -768,35 +694,23 @@ impl RelExpr {
         input: Rc<RelExpr>,
         partition: Vec<ColId>,
         order: Vec<OrderCol>,
-        aggs: AggCols,
+        aggs: Vec<AggCol>,
         rank: Option<HirCol>,
         dense_rank: Option<HirCol>,
     ) -> Rc<RelExpr> {
         debug_assert!(!order.is_empty() && (!aggs.is_empty() || rank.is_some() || dense_rank.is_some()));
-        Rc::new(RelExpr::Window {
+        Rc::new(RelExpr::Ordered {
             input,
             partition,
             order,
-            aggs,
-            rank,
-            dense_rank,
+            op: OrderedOp::Window { aggs, rank, dense_rank },
         })
     }
 
-    /// A fresh read of `input`: every column under a newly minted id.
-    pub(crate) fn alias(ids: &ColIdGen, input: Rc<RelExpr>) -> Rc<RelExpr> {
-        let cols = input
-            .cols()
-            .into_iter()
-            .map(|c| HirCol::new(ids.next(), c.def))
-            .collect();
-        Rc::new(RelExpr::Alias { input, cols })
-    }
-
-    /// A fresh read of `input` under `defs`, one per input column in order — a
-    /// CTE reference, whose columns carry the CTE's names.
-    pub(crate) fn alias_as(ids: &ColIdGen, input: Rc<RelExpr>, defs: &[ColumnDef]) -> Rc<RelExpr> {
-        let cols = defs.iter().map(|d| HirCol::new(ids.next(), d.clone())).collect();
+    /// A fresh read of `input` under `defs`, one per input column in order, each
+    /// under a newly minted id.
+    pub(crate) fn alias(ids: &ColIdGen, input: Rc<RelExpr>, defs: impl IntoIterator<Item = ColumnDef>) -> Rc<RelExpr> {
+        let cols = defs.into_iter().map(|def| HirCol::new(ids.next(), def)).collect();
         Rc::new(RelExpr::Alias { input, cols })
     }
 
@@ -811,9 +725,7 @@ impl RelExpr {
             RelExpr::Get { .. } => None,
             // Rows of its input — a subset of them, or each once — under its
             // input's identities.
-            RelExpr::Filter { input, .. } | RelExpr::TopN { input, .. } | RelExpr::Window { input, .. } => {
-                input.unique_key()
-            }
+            RelExpr::Filter { input, .. } | RelExpr::Ordered { input, .. } => input.unique_key(),
             RelExpr::Project { input, items } => input
                 .unique_key()?
                 .iter()
@@ -834,8 +746,8 @@ impl RelExpr {
             RelExpr::Join { left, right, kind, on } => match kind {
                 // One output row per left row.
                 k if k.is_decorrelated() => left.unique_key(),
-                JoinType::Inner | JoinType::Left if on.side_unique(right, false) => left.unique_key(),
-                JoinType::Inner | JoinType::Right if on.side_unique(left, true) => right.unique_key(),
+                JoinType::Inner | JoinType::Left if on.side_unique(right, 1) => left.unique_key(),
+                JoinType::Inner | JoinType::Right if on.side_unique(left, 0) => right.unique_key(),
                 _ => None,
             },
         }
@@ -909,7 +821,12 @@ impl RelExpr {
                 JoinType::Semi | JoinType::Anti => left.cols(),
                 JoinType::Mark(id) => {
                     let mut cols = left.cols();
-                    cols.push(JoinType::mark_col(*id));
+                    // Hidden: nothing but the expressions reading the subquery
+                    // reach it, and it is addressed by id, never by name.
+                    cols.push(HirCol::new(
+                        *id,
+                        ColumnDef::new("_mark", TypeCode::Bool, false).hidden(),
+                    ));
                     cols
                 }
                 _ => {
@@ -929,11 +846,13 @@ impl RelExpr {
                 cols.extend(aggs.iter().map(|c| c.col.clone()));
                 cols
             }
-            RelExpr::Distinct { input } | RelExpr::TopN { input, .. } => input.cols(),
-            RelExpr::Window { input, aggs, rank, dense_rank, .. } => {
+            RelExpr::Distinct { input } => input.cols(),
+            RelExpr::Ordered { input, op, .. } => {
                 let mut cols = input.cols();
-                cols.extend(rank.iter().chain(dense_rank).cloned());
-                cols.extend(aggs.iter().map(|c| c.col.clone()));
+                if let OrderedOp::Window { aggs, rank, dense_rank } = op {
+                    cols.extend(rank.iter().chain(dense_rank).cloned());
+                    cols.extend(aggs.iter().map(|c| c.col.clone()));
+                }
                 cols
             }
             RelExpr::Alias { cols, .. } => cols.clone(),

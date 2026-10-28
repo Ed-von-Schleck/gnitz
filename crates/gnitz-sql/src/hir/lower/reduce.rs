@@ -1,30 +1,24 @@
 //! The GROUP BY / aggregate shell: the reduce's input through the spine, then the
-//! reduce, HAVING and the finalize projection.
+//! reduce.
 
-use super::super::{ColId, HirExpr, ProjEntry, RelExpr};
+use super::super::{reduce_reads, AggCol, ColId, RelExpr};
 use super::spine::{open, Top};
-use super::{emit_filter, keyed_frame, project_front, resolve_reduce_specs, EmitPieces, ReduceSpecs, ViewChain};
+use super::{keyed_frame, resolve_reduce_specs, EmitPieces, ReduceSpecs, ViewChain};
 use crate::agg::agg_col_def;
 use crate::error::GnitzSqlError;
-use gnitz_wire::Circuit;
-use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc};
+use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, Circuit};
 use std::collections::HashSet;
+use std::rc::Rc;
 
-/// Lower a `Project(Filter_having?(Reduce(...)))` body's reduce to circuit pieces.
-/// `items` is the finalize projection; `having_preds` is the HAVING filter over
-/// the raw reduce output.
+/// Lower a `Reduce` of `input` to circuit pieces, whose frame addresses the raw
+/// reduce output, which HAVING reads.
 pub(super) fn lower_reduce(
     chain: &mut ViewChain,
-    items: &[ProjEntry],
-    having_preds: &[HirExpr],
-    reduce: &RelExpr,
+    input: &Rc<RelExpr>,
+    group_cols: &[ColId],
+    aggs: &[AggCol],
 ) -> Result<EmitPieces, GnitzSqlError> {
-    let RelExpr::Reduce { input, group_cols, aggs } = reduce else {
-        unreachable!("lower_reduce receives a Reduce");
-    };
-
-    let mut live: HashSet<ColId> = group_cols.iter().copied().collect();
-    live.extend(aggs.iter().filter_map(|c| c.arg));
+    let live: HashSet<ColId> = reduce_reads(group_cols, aggs).into_iter().collect();
     let spine = open(chain, input, &live)?;
     let mut cb = Circuit::default();
     // The spine's output is what the reduce groups and aggregates over, so the
@@ -44,12 +38,8 @@ pub(super) fn lower_reduce(
         );
     }
     let ReduceSpecs { group, specs, cols } = r;
-    let reduced = cb.reduce(node, &group, &specs);
-
-    // HAVING over the raw reduce output, then the finalize projection.
-    let having_frame = keyed_frame(&reduce_in, &group, group.iter().copied(), cols)?;
-    let filtered = emit_filter(&mut cb, reduced, having_preds, &having_frame)?;
-    let (_, out) = project_front(&mut cb, filtered, items, &having_frame)?;
+    cb.reduce(node, &group, &specs);
+    let out = keyed_frame(&reduce_in, &group, group.iter().copied(), cols)?;
     // One row per group key, which the reduce output is keyed on.
     Ok(EmitPieces { circuit: cb, out, pk_repeats: false })
 }

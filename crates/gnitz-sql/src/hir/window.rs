@@ -9,12 +9,12 @@
 //! one pipeline over `W`:
 //!
 //! 1. **The running values.** A specification with an order (the default `RANGE
-//!    … CURRENT ROW` frame) is one [`RelExpr::Window`] over the rows so far: every
-//!    row, widened by each aggregate folded up to and including the row's peers,
-//!    and by its rank among them. `ROW_NUMBER` is the rank under an order the
-//!    input's unique key makes total. Its partition is a reduce group key, so it
-//!    takes any key but a float; its order takes any type and honours the written
-//!    NULL placement.
+//!    … CURRENT ROW` frame) is one window [`RelExpr::Ordered`] over the rows so
+//!    far: every row, widened by each aggregate folded up to and including the
+//!    row's peers, and by its rank among them. `ROW_NUMBER` is the rank under an
+//!    order the input's unique key makes total. Its partition is a reduce group
+//!    key, so it takes any key but a float; its order takes any type and honours
+//!    the written NULL placement.
 //! 2. **The cut.** A `ROW_NUMBER` bounded by a QUALIFY conjunct (`<= n`, `< n`,
 //!    `= n`) and read by nothing else is a per-partition top-N of those rows,
 //!    under the rules of a window's keys.
@@ -63,7 +63,7 @@ use std::rc::Rc;
 /// A view body's SELECT list over the relation `rel` builds, with the item each
 /// ORDER BY key sorts on. Window calls in the list, in the ORDER BY keys and in
 /// QUALIFY are found by binding them; a body holding one is desugared. `leaf` is the body's own item leaf; `ctx` names the surface.
-pub(crate) fn bind_view_select_list<L: ItemLeaf>(
+pub(super) fn bind_view_select_list<L: ItemLeaf>(
     ids: &ColIdGen,
     select: &Select,
     rel: impl FnOnce() -> Result<Rc<RelExpr>, GnitzSqlError>,
@@ -536,14 +536,10 @@ struct Read {
 
 impl Read {
     fn of(ids: &ColIdGen, input: &Rc<RelExpr>) -> Read {
-        let rel = RelExpr::alias(ids, Rc::clone(input));
+        let in_cols = input.cols();
+        let rel = RelExpr::alias(ids, Rc::clone(input), in_cols.iter().map(|c| c.def.clone()));
         let cols = rel.cols();
-        let at = input
-            .cols()
-            .iter()
-            .map(|c| c.id)
-            .zip(cols.iter().map(|c| c.id))
-            .collect();
+        let at = in_cols.iter().map(|c| c.id).zip(cols.iter().map(|c| c.id)).collect();
         Read { rel, cols, at }
     }
     fn col(&self, src: ColId) -> HirExpr {
@@ -692,7 +688,7 @@ fn agg_value(
     arg: Option<ColId>,
 ) -> Result<HirExpr, GnitzSqlError> {
     let agg = HirAgg::new(ids, func, arg.map_or(AggArg::Star, AggArg::All), env, is_global, aggs)?;
-    let value = agg.as_value().0;
+    let value = agg.finalize();
     aggs.push(agg);
     Ok(value)
 }
@@ -716,7 +712,8 @@ fn running_values(
         let value = match c.func {
             // A row's own frame holds the row, so no aggregate is one over no rows.
             WinFunc::Agg(func) => agg_value(ids, &cols, false, &mut aggs, func, c.arg)?,
-            // The order is total over a set, so a row is its own peer group.
+            // ROW_NUMBER's order is total over a set, so each row is its own peer
+            // group and its number is its RANK.
             WinFunc::Rank | WinFunc::RowNumber => number(&mut rank),
             WinFunc::DenseRank => number(&mut dense_rank),
         };

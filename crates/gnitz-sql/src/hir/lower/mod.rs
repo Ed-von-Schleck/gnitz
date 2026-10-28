@@ -9,12 +9,12 @@
 //! * segment cut — [`cut_segment`];
 //! * source collision — [`materialize`];
 //! * reduce derivation — [`resolve_reduce_specs`], [`keyed_frame`];
+//! * the WHERE and projection above a core — `Demand::emit`;
 //! * addressing — `physical::Frame`, [`project_front`].
 
 mod chain;
 pub(crate) mod fold;
 mod join;
-mod joincore;
 mod ordered;
 pub(crate) mod read;
 mod reduce;
@@ -27,7 +27,7 @@ use crate::agg::group_pk_def;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use crate::project::{compute_map, payload_program, ProjItem};
-pub(crate) use chain::{EmitPieces, ViewChain};
+use chain::{EmitPieces, ViewChain};
 use gnitz_core::{PlannedView, RelDescriptor, Schema};
 use gnitz_expr::ReduceOutSlot;
 use gnitz_wire::{AggDescriptor, ColumnDef};
@@ -38,28 +38,24 @@ use std::sync::Arc;
 /// What a HIR `Reduce` becomes physically, before either lowering picks a sink:
 /// its group columns as reduce-input positions, and one spec per distinct
 /// physical aggregate column beside the output column it produces.
-pub(crate) struct ReduceSpecs {
+struct ReduceSpecs {
     /// Group columns as reduce-input positions, normalized.
-    pub(crate) group: Vec<u32>,
-    pub(crate) specs: Vec<AggDescriptor>,
+    group: Vec<u32>,
+    specs: Vec<AggDescriptor>,
     /// Each spec's output column, parallel to `specs`; `None` for one no reference
     /// names.
-    pub(crate) cols: Vec<Slot>,
+    cols: Vec<Slot>,
 }
 
 impl ReduceSpecs {
-    pub(crate) fn push(&mut self, spec: AggDescriptor, id: Option<ColId>, def: ColumnDef) {
+    fn push(&mut self, spec: AggDescriptor, id: Option<ColId>, def: ColumnDef) {
         self.specs.push(spec);
         self.cols.push((id, def));
     }
 }
 
 /// Resolve a `Reduce`'s group and aggregate columns against its input.
-pub(crate) fn resolve_reduce_specs(
-    group_cols: &[ColId],
-    aggs: &[AggCol],
-    input: &Frame,
-) -> Result<ReduceSpecs, GnitzSqlError> {
+fn resolve_reduce_specs(group_cols: &[ColId], aggs: &[AggCol], input: &Frame) -> Result<ReduceSpecs, GnitzSqlError> {
     let mut r = ReduceSpecs {
         group: input.reduce_group(group_cols)?,
         specs: Vec::with_capacity(aggs.len() + 1),
@@ -79,7 +75,7 @@ pub(crate) fn resolve_reduce_specs(
 
 /// A group-keyed operator's output frame over `input`: the `output_layout` of
 /// the key a reduce grouped by `group` gets, then `tail`.
-pub(crate) fn keyed_frame(
+fn keyed_frame(
     input: &Frame,
     group: &[u32],
     row: impl IntoIterator<Item = u32>,
@@ -99,23 +95,35 @@ pub(crate) fn keyed_frame(
 /// The downstream demand on a combine's output: the final projection and the
 /// WHERE over the node — whatever predicate placement left above it.
 #[derive(Clone, Copy)]
-pub(crate) struct Demand<'a> {
-    pub(crate) items: &'a [ProjEntry],
-    pub(crate) where_preds: &'a [HirExpr],
+struct Demand<'a> {
+    items: &'a [ProjEntry],
+    where_preds: &'a [HirExpr],
 }
 
 impl Demand<'_> {
     /// Every `ColId` the demand reads, into `out`.
-    pub(crate) fn refs(&self, out: &mut HashSet<ColId>) {
+    fn refs(&self, out: &mut HashSet<ColId>) {
         collect_live_cols(self.items.iter().map(|i| &i.expr).chain(self.where_preds), out);
+    }
+
+    /// The WHERE, then the projection, over the already-emitted `node` whose rows
+    /// `frame` addresses.
+    fn emit(
+        &self,
+        cb: &mut gnitz_wire::Circuit,
+        node: gnitz_wire::NodeId,
+        frame: &Frame,
+    ) -> Result<(gnitz_wire::NodeId, Frame), GnitzSqlError> {
+        let filtered = emit_filter(cb, node, self.where_preds, frame)?;
+        project_front(cb, filtered, self.items, frame)
     }
 }
 
 /// A source a spine reads, with the frame its references resolve against.
 #[derive(Clone)]
-pub(crate) struct SegInput {
-    pub src: SegSource,
-    pub frame: Frame,
+struct SegInput {
+    src: SegSource,
+    frame: Frame,
 }
 
 impl SegInput {
@@ -129,7 +137,7 @@ impl SegInput {
 
 /// Where a [`SegInput`]'s rows come from.
 #[derive(Clone)]
-pub(crate) enum SegSource {
+enum SegSource {
     /// A relation read in place; its index list bounds the scan.
     Catalog(Arc<RelDescriptor>),
     /// A subtree cut to a hidden segment via [`cut_segment`], under a chain-minted
@@ -138,7 +146,7 @@ pub(crate) enum SegSource {
 }
 
 impl SegSource {
-    pub(crate) fn tid(&self) -> u64 {
+    fn tid(&self) -> u64 {
         match self {
             SegSource::Catalog(d) => d.tid,
             SegSource::Segment { tid, .. } => *tid,
@@ -147,7 +155,7 @@ impl SegSource {
 
     /// Whether two of the source's rows may share its leading key, or one may stand
     /// at weight above 1.
-    pub(crate) fn pk_repeats(&self) -> bool {
+    fn pk_repeats(&self) -> bool {
         match self {
             SegSource::Catalog(d) => d.pk_repeats,
             SegSource::Segment { pk_repeats, .. } => *pk_repeats,
@@ -158,7 +166,7 @@ impl SegSource {
 /// Insert every `ColId` referenced anywhere in `exprs` into `live` — the
 /// one home for "which columns does this expression set demand", used to prune a
 /// cut input's segment to exactly the columns its parent reads.
-pub(crate) fn collect_live_cols<'a>(exprs: impl IntoIterator<Item = &'a HirExpr>, live: &mut HashSet<ColId>) {
+fn collect_live_cols<'a>(exprs: impl IntoIterator<Item = &'a HirExpr>, live: &mut HashSet<ColId>) {
     for e in exprs {
         e.for_each_ref(&mut |id| {
             live.insert(*id);
@@ -196,7 +204,7 @@ fn emit_projection(
 
 /// `items` over `input` with `input`'s PK pinned to the front — the linear
 /// projection.
-pub(crate) fn project_front(
+fn project_front(
     cb: &mut gnitz_wire::Circuit,
     node: gnitz_wire::NodeId,
     items: &[ProjEntry],
@@ -217,73 +225,71 @@ pub(crate) fn lower(
 ) -> Result<(Vec<PlannedView>, PlannedView), GnitzSqlError> {
     let mut chain = ViewChain::default();
     // A top-N carries its input's columns key first: the SELECT list is a
-    // projection over it.
+    // projection over it. A window body always ends in a projection.
     let rel = match rel.as_ref() {
-        RelExpr::TopN { .. } => RelExpr::project(Rc::clone(&rel), RelExpr::passthrough_items(rel.cols())),
+        RelExpr::Ordered { .. } => RelExpr::project(Rc::clone(&rel), RelExpr::passthrough_items(rel.cols())),
         _ => rel,
     };
-    let mut top = lower_body(&mut chain, &rel)?;
-    let schema = Arc::make_mut(&mut top.out.schema);
+    let top = lower_body(&mut chain, &rel)?;
+    let visible = names.iter().filter(|c| !c.def.is_hidden).map(|c| c.id);
+    let (mut schema, moved_to) = top.out.schema_in_order(visible)?;
     for (slot, id) in top.out.layout.iter().enumerate() {
         if let Some(c) = id.and_then(|id| col_by_id(names, id)) {
-            schema.rename_column(slot, c.def.name.clone());
+            schema.rename_column(moved_to[slot] as usize, c.def.name.clone());
         }
     }
-    let visible = names.iter().filter(|c| !c.def.is_hidden).map(|c| c.id);
-    top.out.schema = Arc::new(top.out.schema_in_order(visible)?.0);
     // A body whose inputs cut a segment of their own bounds a view over unbounded copies.
     if bounded && chain.has_segments() {
         return Err(GnitzSqlError::Rejected(
             "CREATE VIEW WITH (capacity …): a body that compiles to more than one view is not supported".into(),
         ));
     }
-    Ok(chain.finish(top))
+    Ok(chain.finish(top, Arc::new(schema)))
+}
+
+/// `rel` as `Project?(Filter?(core))`: the Project's items, the Filter's
+/// predicates (empty without one), and the core below them.
+fn peel(rel: &Rc<RelExpr>) -> (Option<&[ProjEntry]>, &[HirExpr], &Rc<RelExpr>) {
+    let (items, below) = match rel.as_ref() {
+        RelExpr::Project { input, items } => (Some(items.as_slice()), input),
+        _ => (None, rel),
+    };
+    let (preds, core) = split_filter(below);
+    (items, preds, core)
 }
 
 /// Lower a complete view body to circuit pieces.
 fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, GnitzSqlError> {
-    match rel.as_ref() {
-        RelExpr::Project { input, items } => {
-            let (fpreds, source) = split_filter(input);
-            match source.as_ref() {
-                RelExpr::Join { .. } => join::lower_join_view(chain, items, fpreds, source),
-                RelExpr::Reduce { .. } => reduce::lower_reduce(chain, items, fpreds, source),
-                RelExpr::TopN { .. } | RelExpr::Window { .. } => {
-                    let above = Demand { items, where_preds: fpreds };
-                    ordered::lower_ordered(chain, source, Some(above))
-                }
-                RelExpr::Distinct { .. } | RelExpr::SetOp { .. } => {
-                    let above = Demand { items, where_preds: fpreds };
-                    setop::lower_setop(chain, source, Some(above))
-                }
-                _ => spine::lower_linear(chain, rel, items),
-            }
+    let (items, preds, core) = peel(rel);
+    let above = items.map(|items| Demand { items, where_preds: preds });
+    let no_arm = || GnitzSqlError::Internal("HIR lowering has no body arm for this node".into());
+    let mut pieces = match (above, core.as_ref()) {
+        (None, _) if !preds.is_empty() => return Err(no_arm()),
+        (Some(above), RelExpr::Join { left, right, kind, on }) => {
+            return join::lower_join_view(chain, above, [left, right], *kind, on);
         }
-        RelExpr::Distinct { .. } | RelExpr::SetOp { .. } => setop::lower_setop(chain, rel, None),
-        RelExpr::TopN { .. } | RelExpr::Window { .. } => ordered::lower_ordered(chain, rel, None),
-        _ => Err(GnitzSqlError::Internal(
-            "HIR lowering has no body arm for this node".into(),
-        )),
+        (Some(_), RelExpr::Reduce { input, group_cols, aggs }) => reduce::lower_reduce(chain, input, group_cols, aggs)?,
+        (_, RelExpr::Ordered { .. }) => ordered::lower_ordered(chain, core)?,
+        (_, RelExpr::Distinct { .. } | RelExpr::SetOp { .. }) => setop::lower_setop(chain, core)?,
+        (Some(above), _) => return spine::lower_linear(chain, rel, above.items),
+        (None, _) => return Err(no_arm()),
+    };
+    // The shell's circuit ends in its core node, which `above` reads.
+    if let Some(above) = above {
+        let node = pieces.circuit.out();
+        pieces.out = above.emit(&mut pieces.circuit, node, &pieces.out)?.1;
     }
+    Ok(pieces)
 }
 
-/// `Project?(Filter?(Join | Reduce | TopN | Window | Distinct | SetOp))`: what a
+/// `Project?(Filter?(Join | Reduce | Ordered | Distinct | SetOp))`: what a
 /// shell lowers as one body.
-fn lowered_whole(rel: &RelExpr) -> bool {
-    let rel = match rel {
-        RelExpr::Project { input, .. } => input.as_ref(),
-        rel => rel,
-    };
-    let rel = match rel {
-        RelExpr::Filter { input, .. } => input.as_ref(),
-        rel => rel,
-    };
+fn lowered_whole(rel: &Rc<RelExpr>) -> bool {
     matches!(
-        rel,
+        peel(rel).2.as_ref(),
         RelExpr::Join { .. }
             | RelExpr::Reduce { .. }
-            | RelExpr::TopN { .. }
-            | RelExpr::Window { .. }
+            | RelExpr::Ordered { .. }
             | RelExpr::Distinct { .. }
             | RelExpr::SetOp { .. }
     )
@@ -292,7 +298,7 @@ fn lowered_whole(rel: &RelExpr) -> bool {
 /// `input` read in place: a catalog `Get`, or a rename of what is read in place.
 /// An alias renames its input's source, which is cut whole when it is not read
 /// in place.
-pub(crate) fn resolve_in_place(chain: &mut ViewChain, input: &Rc<RelExpr>) -> Result<Option<SegInput>, GnitzSqlError> {
+fn resolve_in_place(chain: &mut ViewChain, input: &Rc<RelExpr>) -> Result<Option<SegInput>, GnitzSqlError> {
     match input.as_ref() {
         RelExpr::Get { desc, cols } => Ok(Some(SegInput {
             src: SegSource::Catalog(Arc::clone(desc)),
@@ -327,11 +333,7 @@ fn materialize(chain: &mut ViewChain, rel: &Rc<RelExpr>, live: &HashSet<ColId>) 
 }
 
 /// Cut a subtree to a hidden segment pruned to `live`, once per subtree.
-pub(crate) fn cut_segment(
-    chain: &mut ViewChain,
-    subtree: &Rc<RelExpr>,
-    live: &HashSet<ColId>,
-) -> Result<SegInput, GnitzSqlError> {
+fn cut_segment(chain: &mut ViewChain, subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Result<SegInput, GnitzSqlError> {
     let key = Rc::as_ptr(subtree);
     if let Some(cached) = chain.cuts.get(&key) {
         return Ok(cached.clone());
@@ -342,9 +344,9 @@ pub(crate) fn cut_segment(
 }
 
 /// `subtree` as a complete, lowerable body pruned to `live`: a `Project` keeps its
-/// live items, a clamp, set operation, top-N or window stays whole
-/// (`π(distinct(X)) ≠ distinct(π(X))`), and anything else is wrapped in a
-/// projection of its live columns.
+/// live items, a clamp, set operation, top-N or window is cut with every column
+/// and no map over it, and anything else is wrapped in a projection of its live
+/// columns.
 fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
     match subtree.as_ref() {
         RelExpr::Project { input, items } => {
@@ -355,9 +357,7 @@ fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
                 RelExpr::project(Rc::clone(input), narrowed)
             }
         }
-        RelExpr::Distinct { .. } | RelExpr::SetOp { .. } | RelExpr::TopN { .. } | RelExpr::Window { .. } => {
-            Rc::clone(subtree)
-        }
+        RelExpr::Distinct { .. } | RelExpr::SetOp { .. } | RelExpr::Ordered { .. } => Rc::clone(subtree),
         // The HIR spelling of `SELECT <live cols> FROM <subtree>`.
         _ => {
             let items = RelExpr::passthrough_items(subtree.cols().into_iter().filter(|c| live.contains(&c.id)));
@@ -380,9 +380,8 @@ fn filter(
     }
 }
 
-/// Resolve `preds` against `frame` and emit the filter. Shared by the emits that
-/// filter an already-emitted node: HAVING, and the WHERE over each join branch.
-pub(crate) fn emit_filter(
+/// Resolve `preds` against `frame` and emit their AND over the already-emitted `node`.
+fn emit_filter(
     cb: &mut gnitz_wire::Circuit,
     node: gnitz_wire::NodeId,
     preds: &[HirExpr],

@@ -32,8 +32,8 @@ use crate::ir::{BExpr, BoundExpr, LeafTyping, BOOL};
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
 use crate::tail::{extract_limit, extract_offset, key_slots, order_exprs, parse_order_by, OrderKey};
 use crate::validate::{
-    cte_body, non_recursive_ctes, reject_query_envelope_body, reject_unhonored_query_clauses,
-    reject_unhonored_select_clauses, HonoredClauses, QueryEnvelope,
+    reject_query_envelope_body, reject_unhonored_query_clauses, reject_unhonored_select_clauses, HonoredClauses,
+    QueryEnvelope,
 };
 use gnitz_core::{RelDescriptor, Schema};
 use gnitz_wire::{ColType, ColumnDef};
@@ -49,22 +49,35 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use subquery::bind_linear_subquery_body;
 
 /// Bind a query's CTEs ahead of its body. Each binds to one subtree registered
 /// under its name, which the body (and later CTEs) read through an
 /// [`RelExpr::Alias`] and the lowering cuts once. Scoping precedence as SQL
 /// defines it: a CTE shadows a catalog name, and a later CTE sees earlier ones.
-pub(crate) fn bind_ctes(cx: &mut BindCx<'_>, query: &Query) -> Result<(), GnitzSqlError> {
-    for cte in non_recursive_ctes(query)? {
-        let name = &cte.alias.name.value;
+/// `WITH RECURSIVE` has no builder, and a CTE's trailing FROM is refused.
+pub(super) fn bind_ctes(cx: &mut BindCx<'_>, query: &Query) -> Result<(), GnitzSqlError> {
+    let Some(with) = &query.with else {
+        return Ok(());
+    };
+    reject_if(with.recursive, "WITH", "RECURSIVE")?;
+    for cte in &with.cte_tables {
+        // `materialized` parses only under PostgreSqlDialect — always `None` here.
+        let sqlparser::ast::Cte {
+            alias,
+            query,
+            from,
+            materialized: _,
+            closing_paren_token: _,
+        } = cte;
+        let name = &alias.name.value;
         // A CTE name is a relation name later references resolve, so it is held
         // to the reserved-prefix rule every such name passes.
         let canonical = canonical_user_name(name)?;
         let ctx = format!("CTE '{name}'");
-        let rel = bind_body(cx, cte_body(cte, &ctx)?)?;
+        reject_if(from.is_some(), &ctx, "a trailing FROM")?;
+        let rel = bind_body(cx, reject_query_envelope_body(query, &ctx)?)?;
         let (rel, mut defs) = collapse_identity(rel);
-        apply_positional_aliases(alias_column_names(&cte.alias.columns, &ctx)?, defs.iter_mut(), &ctx)?;
+        apply_positional_aliases(alias_column_names(&alias.columns, &ctx)?, defs.iter_mut(), &ctx)?;
         cx.ctes.insert(canonical, Cte { rel, defs });
     }
     Ok(())
@@ -73,7 +86,7 @@ pub(crate) fn bind_ctes(cx: &mut BindCx<'_>, query: &Query) -> Result<(), GnitzS
 /// A bound CTE: the shared subtree every reference aliases, and the column
 /// defs a reference carries — the subtree's own, renamed by the SELECT list's
 /// aliases and the CTE's positional ones.
-pub(crate) struct Cte {
+struct Cte {
     rel: Rc<RelExpr>,
     defs: Vec<ColumnDef>,
 }
@@ -109,46 +122,35 @@ fn collapse_identity(rel: Rc<RelExpr>) -> (Rc<RelExpr>, Vec<ColumnDef>) {
     (rel, defs)
 }
 
-/// The statement a body is bound for.
+/// The view statement a body is bound for.
 #[derive(Clone, Copy)]
 pub(crate) struct ViewBody {
-    /// `CREATE VIEW`, `ALTER VIEW`, or `SELECT` for an ad-hoc read, so a rejection
-    /// names the statement the user wrote.
+    /// `CREATE VIEW` or `ALTER VIEW`, so a rejection names the statement the user
+    /// wrote.
     pub stmt: &'static str,
     /// The id of the view this statement supersedes, which the body may not read.
     pub replacing: Option<u64>,
 }
 
-/// One body's bind state, threaded through the recursion.
-pub(crate) struct BindCx<'c> {
-    pub(crate) cat: &'c dyn Catalog,
-    pub(crate) ids: &'c ColIdGen,
-    pub(crate) view: ViewBody,
+/// One statement's bind state (its CTEs and body), shared by the whole recursion.
+pub(super) struct BindCx<'c> {
+    cat: &'c dyn Catalog,
+    ids: &'c ColIdGen,
     surface: Surface,
     /// Each place the text names a catalog relation, in bind order.
-    pub(crate) refs: Vec<BoundRef>,
+    pub(super) refs: RefCell<Vec<BoundRef>>,
     /// The CTEs bound so far, by canonical (ASCII-lowercase) name.
     ctes: HashMap<String, Cte>,
 }
 
 impl<'c> BindCx<'c> {
-    pub(crate) fn new(cat: &'c dyn Catalog, ids: &'c ColIdGen, view: ViewBody) -> Self {
+    pub(super) fn new(cat: &'c dyn Catalog, ids: &'c ColIdGen, surface: Surface) -> Self {
         BindCx {
             cat,
             ids,
-            view,
-            surface: Surface::ViewBody,
-            refs: Vec::new(),
+            surface,
+            refs: RefCell::new(Vec::new()),
             ctes: HashMap::new(),
-        }
-    }
-
-    /// The context of an ad-hoc read; `op` names it in a class rejection.
-    pub(crate) fn adhoc(cat: &'c dyn Catalog, ids: &'c ColIdGen, op: &'static str) -> Self {
-        let view = ViewBody { stmt: "SELECT", replacing: None };
-        BindCx {
-            surface: Surface::AdhocRead { op },
-            ..BindCx::new(cat, ids, view)
         }
     }
 }
@@ -175,7 +177,7 @@ pub(crate) struct BoundRef {
 /// The subtree a relation name reads, under the column aliases the reference
 /// declares: the CTE it names, else the catalog relation. Every relation a body
 /// names in FROM resolves here.
-fn resolve_table_ref(cx: &mut BindCx<'_>, tref: &TableRef<'_>) -> Result<(Rc<RelExpr>, Vec<HirCol>), GnitzSqlError> {
+fn resolve_table_ref(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<(Rc<RelExpr>, Vec<HirCol>), GnitzSqlError> {
     let rel = resolve_relation(cx, tref)?;
     let mut cols = rel.cols();
     if !tref.columns.is_empty() {
@@ -190,31 +192,30 @@ fn resolve_table_ref(cx: &mut BindCx<'_>, tref: &TableRef<'_>) -> Result<(Rc<Rel
 }
 
 /// The subtree a relation name reads: the CTE it names, else the catalog relation.
-fn resolve_relation(cx: &mut BindCx<'_>, tref: &TableRef<'_>) -> Result<Rc<RelExpr>, GnitzSqlError> {
+fn resolve_relation(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let name = &tref.name;
     // A CTE lives in no schema.
-    let cte = (!name.is_qualified()).then(|| cx.ctes.get(name.name()));
-    if let Some(cte) = cte.flatten() {
-        return Ok(RelExpr::alias_as(cx.ids, Rc::clone(&cte.rel), &cte.defs));
+    let cte = (!name.is_qualified()).then(|| cx.ctes.get(name.name())).flatten();
+    if let Some(cte) = cte {
+        return Ok(RelExpr::alias(cx.ids, Rc::clone(&cte.rel), cte.defs.iter().cloned()));
     }
     let rel = cx.cat.probe_relation(name)?;
-    // The replaced view is retracted in the same bundle, taking the body's input with it.
-    if cx.view.replacing == Some(rel.tid) {
-        return Err(GnitzSqlError::Rejected(format!(
-            "{} '{}' AS a query referencing the view itself is not supported",
-            cx.view.stmt, name
-        )));
-    }
     let (want, op) = match cx.surface {
-        Surface::AdhocRead { op } => (ClassWant::Readable, op),
-        Surface::ViewBody => (ClassWant::ViewSource, cx.view.stmt),
+        Surface::Adhoc { op } => (ClassWant::Readable, op),
+        // The replaced view is retracted in the same bundle, taking the body's input with it.
+        Surface::View(ViewBody { stmt, replacing }) if replacing == Some(rel.tid) => {
+            return Err(GnitzSqlError::Rejected(format!(
+                "{stmt} '{name}' AS a query referencing the view itself is not supported"
+            )))
+        }
+        Surface::View(v) => (ClassWant::ViewSource, v.stmt),
     };
     require_class(&rel, name, want, op)?;
     let columns = tref
         .columns
         .is_empty()
         .then(|| rel.schema.visible_columns().map(|(_, c)| c.name.clone()).collect());
-    cx.refs.push(BoundRef {
+    cx.refs.borrow_mut().push(BoundRef {
         tid: rel.tid,
         name: name.to_string(),
         name_span: tref.name_span,
@@ -229,7 +230,7 @@ fn resolve_relation(cx: &mut BindCx<'_>, tref: &TableRef<'_>) -> Result<Rc<RelEx
 /// maintains. Parsed once here so every body shape reads one rule: the two
 /// clauses need each other (a view is unordered, and a LIMIT with no order names
 /// no rows), and the counts are literals.
-pub(crate) struct QueryTail<'a> {
+struct QueryTail<'a> {
     keys: Vec<OrderKey<'a>>,
     limit: u64,
     offset: u64,
@@ -307,10 +308,11 @@ impl<'a> QueryTail<'a> {
 /// Bind a whole view query: its envelope checked, its CTEs, its body, then the
 /// `ORDER BY … LIMIT` tail as a top-N over it. A SELECT body places the keys in
 /// its own scope; any other body orders by its output columns.
-pub(crate) fn bind_query(cx: &mut BindCx<'_>, query: &Query) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, cx.view.stmt)?;
+pub(super) fn bind_query(cx: &mut BindCx<'_>, query: &Query) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, cx.surface.stmt())?;
     bind_ctes(cx, query)?;
-    let tail = QueryTail::parse(query, cx.view.stmt)?;
+    let cx = &*cx;
+    let tail = QueryTail::parse(query, cx.surface.stmt())?;
     match (query.body.as_ref(), tail) {
         (SetExpr::Select(select), tail) => {
             let order_exprs: Vec<&Expr> = tail.as_ref().map(QueryTail::exprs).unwrap_or_default();
@@ -323,7 +325,7 @@ pub(crate) fn bind_query(cx: &mut BindCx<'_>, query: &Query) -> Result<Rc<RelExp
         (body, None) => bind_body(cx, body),
         (body, Some(tail)) => {
             let rel = bind_body(cx, body)?;
-            tail.wrap_by_output(rel, cx.view.stmt)
+            tail.wrap_by_output(rel, cx.surface.stmt())
         }
     }
 }
@@ -331,27 +333,28 @@ pub(crate) fn bind_query(cx: &mut BindCx<'_>, query: &Query) -> Result<Rc<RelExp
 /// Bind one query body — a single SELECT (linear / join / grouped / DISTINCT) or
 /// a set operation whose sides bind recursively. A parenthesized side is a whole
 /// `Query`, whose envelope is rejected before its body binds.
-pub(crate) fn bind_body(cx: &mut BindCx<'_>, body: &SetExpr) -> Result<Rc<RelExpr>, GnitzSqlError> {
+fn bind_body(cx: &BindCx<'_>, body: &SetExpr) -> Result<Rc<RelExpr>, GnitzSqlError> {
     match body {
         SetExpr::Select(select) => Ok(bind_select(cx, select, &[])?.0),
         SetExpr::SetOperation { op, set_quantifier, left, right } => bind_set_op(cx, *op, *set_quantifier, left, right),
         SetExpr::Query(q) => bind_body(cx, reject_query_envelope_body(q, "parenthesized query")?),
         _ => Err(GnitzSqlError::Rejected(format!(
             "{} only supports SELECT and set operations",
-            cx.view.stmt
+            cx.surface.stmt()
         ))),
     }
 }
 
 /// Resolve one FROM table factor to `(source subtree, alias, output cols)`. A
-/// table/CTE name resolves via `resolve_relation` to a base or segment `Get`; a derived
-/// table binds its subquery recursively to an **inline** subtree (never a
-/// segment — single-use and non-LATERAL, so uncorrelated) whose `AS d(col…)`
-/// aliases are applied to the returned cols (same `ColId`s, overridden names) the
-/// caller pushes into its scope/env. The subtree itself keeps its own names; a
-/// derived alias resolves through the caller's scope, never the statement catalog.
+/// table name resolves via `resolve_relation` to a `Get`, a CTE name to an
+/// `Alias` over its shared subtree; a derived table binds its subquery
+/// recursively to an **inline** subtree (never a segment — single-use and
+/// non-LATERAL, so uncorrelated) whose `AS d(col…)` aliases are applied to the
+/// returned cols (same `ColId`s, overridden names) the caller pushes into its
+/// scope/env. The subtree itself keeps its own names; a derived alias resolves
+/// through the caller's scope, never the statement catalog.
 fn resolve_table_factor(
-    cx: &mut BindCx<'_>,
+    cx: &BindCx<'_>,
     factor: &TableFactor,
 ) -> Result<(Rc<RelExpr>, String, Vec<HirCol>), GnitzSqlError> {
     if let TableFactor::Derived { lateral, subquery, alias, sample } = factor {
@@ -374,47 +377,48 @@ fn resolve_table_factor(
         )?;
         return Ok((subtree, alias.name.value.clone(), cols));
     }
-    let tref = extract_table_ref(factor, cx.cat.schema_name(), cx.view.stmt)?;
+    let tref = extract_table_ref(factor, cx.cat.schema_name(), cx.surface.stmt())?;
     let (rel, cols) = resolve_table_ref(cx, &tref)?;
     Ok((rel, tref.alias, cols))
 }
 
-/// Bind one single-SELECT body to `Project(Filter?(source))`, where `source` is
-/// the FROM relation or the left-deep fold of its join steps — one relation
-/// being the same tree with no step. Steps fold in syntactic order (no
-/// reordering), so `a LEFT JOIN b JOIN c` is `(a LEFT JOIN b) JOIN c`, and a
-/// comma binds loosest: `FROM a JOIN b ON …, c` is `((a JOIN b) , c)`.
+/// Bind one single-SELECT body to its projection over `Filter?(source)`, in the
+/// body's shape: plain, DISTINCT, grouped or windowed. `source` is the FROM
+/// relation or the left-deep fold of its join steps — one relation being the
+/// same tree with no step. Steps fold in syntactic order (no reordering), so
+/// `a LEFT JOIN b JOIN c` is `(a LEFT JOIN b) JOIN c`, and a comma binds
+/// loosest: `FROM a JOIN b ON …, c` is `((a JOIN b) , c)`.
 ///
 /// Conjuncts are placed as each join and filter is built — the step's into its
 /// join, the WHERE's over the whole fold (`hir::place`).
-pub(crate) fn bind_select(
-    cx: &mut BindCx<'_>,
+pub(super) fn bind_select(
+    cx: &BindCx<'_>,
     select: &Select,
     order_exprs: &[&Expr],
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
+    let (stmt, surface) = (cx.surface.stmt(), cx.surface);
     let grouped = body_is_grouped(select);
     let distinct = select_is_distinct(select);
     let honored = HonoredClauses::for_body(distinct);
-    let honored = match cx.surface {
-        Surface::ViewBody => honored.with_windows(),
-        Surface::AdhocRead { .. } => honored,
+    let honored = if surface.is_view() {
+        honored.with_windows()
+    } else {
+        honored
     };
-    reject_unhonored_select_clauses(select, honored, cx.view.stmt)?;
+    reject_unhonored_select_clauses(select, honored, stmt)?;
 
     // The first FROM relation (a table, a CTE, or a derived table) seeds the
     // accumulator and the scope; its cols are what name resolution starts from.
-    let (mut left, alias, mut scope) = match (select.from.first(), cx.surface) {
+    let (mut left, mut scope) = match (select.from.first(), surface) {
         (Some(first), _) => {
             let (rel, alias, cols) = resolve_table_factor(cx, &first.relation)?;
-            let scope = JoinScope::single(&alias, cols);
-            (rel, alias, scope)
+            (rel, JoinScope::single(&alias, cols))
         }
         // No relation is in scope, so every written name is unresolvable.
-        (None, Surface::AdhocRead { .. }) => (Rc::new(RelExpr::Unit), String::new(), JoinScope::new()),
-        (None, Surface::ViewBody) => {
+        (None, Surface::Adhoc { .. }) => (Rc::new(RelExpr::Unit), JoinScope::new()),
+        (None, Surface::View(_)) => {
             return Err(GnitzSqlError::Rejected(format!(
-                "{}: a view body reads at least one relation; this one has no FROM clause",
-                cx.view.stmt
+                "{stmt}: a view body reads at least one relation; this one has no FROM clause"
             )))
         }
     };
@@ -433,39 +437,45 @@ pub(crate) fn bind_select(
         }
     }
 
-    let shape = BodyShape {
-        stmt: cx.view.stmt,
-        surface: cx.surface,
-        grouped,
-        distinct,
-    };
     // Whether a subquery may stand in this body is settled by what the body is:
     // only a view's one-relation body, neither grouped nor DISTINCT, binds one.
-    let reject: fn(&Expr) -> GnitzSqlError = match (cx.surface, scope.relations.len()) {
-        (Surface::AdhocRead { .. }, _) => adhoc_subquery,
-        (Surface::ViewBody, 1) if grouped => |_| {
+    let subs = RefCell::new(Vec::new());
+    let sub = match (surface, scope.relations.len()) {
+        (Surface::Adhoc { .. }, _) => SubPolicy::Reject(adhoc_subquery),
+        (Surface::View(_), 1) if grouped => SubPolicy::Reject(|_| {
             GnitzSqlError::Rejected(
                 "a subquery is not supported together with GROUP BY/aggregates; put the subquery in an inner view"
                     .into(),
             )
-        },
-        (Surface::ViewBody, 1) if distinct => |_| {
+        }),
+        (Surface::View(_), 1) if distinct => SubPolicy::Reject(|_| {
             GnitzSqlError::Rejected(
                 "a subquery is not supported together with SELECT DISTINCT; put the subquery in an inner view".into(),
             )
-        },
-        (Surface::ViewBody, 1) => {
-            return bind_linear_subquery_body(cx, select, left, &scope, &alias, shape, order_exprs)
-        }
-        (Surface::ViewBody, _) => unsupported_subquery,
+        }),
+        (Surface::View(_), 1) => SubPolicy::Bind { cx, subs: &subs },
+        (Surface::View(_), _) => SubPolicy::Reject(unsupported_subquery),
     };
+    let leaf = ScopeLeaf { scope: &scope, sub };
 
-    // A DISTINCT / GROUP BY over a join sits above it; lowering cuts the join.
-    let leaf = ScopeLeaf {
-        scope: &scope,
-        sub: SubPolicy::Reject(reject),
-    };
-    bind_body_suffix(cx.ids, select, left, &leaf, shape, order_exprs)
+    // WHERE, then the projection in whichever shape the body carries. DISTINCT
+    // outranks a grouped shape, and either sits above a join, which lowering
+    // cuts. The projection is bound in SELECT order (`place_pk_front` is
+    // physical, applied at lowering).
+    let ctx = &format!("{stmt} projection");
+    if let Some(where_expr) = &select.selection {
+        let preds = bind_conjuncts(where_expr, &leaf).map_err(|e| e.in_clause("WHERE"))?;
+        left = RelExpr::filter(left, preds)?;
+    }
+    if grouped && !distinct {
+        return bind_grouped_suffix(cx, select, left, &leaf, order_exprs);
+    }
+    let (projected, placed) = bind_select_list(cx, select, || Ok(left), &leaf, ctx, order_exprs)?;
+    if !distinct {
+        return Ok((projected, placed));
+    }
+    reject_unselected_distinct_keys(&projected, &placed, ctx)?;
+    Ok((RelExpr::distinct(projected, "SELECT DISTINCT")?, placed))
 }
 
 /// An ad-hoc read reads one relation, and a subquery derives another.
@@ -476,61 +486,20 @@ fn adhoc_subquery(e: &Expr) -> GnitzSqlError {
     })
 }
 
-/// What [`bind_select`] settled about a body before its suffix binds.
-#[derive(Clone, Copy)]
-struct BodyShape {
-    /// The statement, for the SELECT list's rejections.
-    stmt: &'static str,
-    surface: Surface,
-    grouped: bool,
-    distinct: bool,
-}
-
-/// WHERE, then the projection in whichever shape the body carries — the tail
-/// every body shares once its source relation and leaf binder are resolved.
-///
-/// DISTINCT outranks a grouped shape. The projection is bound in SELECT order
-/// (`place_pk_front` is physical, applied at lowering).
-fn bind_body_suffix(
-    ids: &ColIdGen,
-    select: &Select,
-    source: Rc<RelExpr>,
-    leaf: &ScopeLeaf<'_>,
-    shape: BodyShape,
-    order_exprs: &[&Expr],
-) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
-    let BodyShape { stmt, surface, grouped, distinct } = shape;
-    let ctx = &format!("{stmt} projection");
-    let mut rel = source;
-    if let Some(where_expr) = &select.selection {
-        let preds = bind_conjuncts(where_expr, leaf).map_err(|e| e.in_clause("WHERE"))?;
-        rel = RelExpr::filter(rel, preds)?;
-    }
-    if grouped && !distinct {
-        return bind_grouped_suffix(ids, select, rel, leaf, surface, order_exprs);
-    }
-    let (projected, placed) = bind_select_list(ids, select, || Ok(rel), leaf, ctx, order_exprs, surface)?;
-    if !distinct {
-        return Ok((projected, placed));
-    }
-    reject_unselected_distinct_keys(&projected, &placed, ctx)?;
-    Ok((RelExpr::distinct(projected, "SELECT DISTINCT")?, placed))
-}
-
 /// The SELECT list over the relation `rel` builds, and the item each ORDER BY key
 /// sorts on; a view body also binds its window calls and its QUALIFY. `rel` is
 /// called once everything that binds through `leaf` has, so a leaf that
 /// registers what it binds builds its relation from all of it.
 pub(super) fn bind_select_list<L: ItemLeaf>(
-    ids: &ColIdGen,
+    cx: &BindCx<'_>,
     select: &Select,
     rel: impl FnOnce() -> Result<Rc<RelExpr>, GnitzSqlError>,
     leaf: &L,
     ctx: &str,
     order_exprs: &[&Expr],
-    surface: Surface,
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
-    if surface == Surface::ViewBody {
+    let ids = cx.ids;
+    if cx.surface.is_view() {
         return super::window::bind_view_select_list(ids, select, rel, leaf, ctx, order_exprs);
     }
     let mut items = bind_projection(&select.projection, leaf, ids, ctx)?;
@@ -550,27 +519,9 @@ fn reject_unselected_distinct_keys(projected: &RelExpr, placed: &[usize], ctx: &
     Ok(())
 }
 
-/// Expand a bare `*` item over `cols` (honoring `EXCEPT`/`EXCLUDE`/`RENAME`,
-/// skipping hidden columns) into pass-through `ProjEntry`s — the one wildcard
-/// expansion, shared by the linear and join projections.
-fn expand_wildcard(
-    o: &sqlparser::ast::WildcardAdditionalOptions,
-    cols: &[&HirCol],
-    ctx: &str,
-    ids: &ColIdGen,
-) -> Result<Vec<ProjEntry>, GnitzSqlError> {
-    Ok(expand_wildcard_item(o, cols.iter().map(|c| &c.def), ctx)?
-        .into_iter()
-        .map(|(i, def)| ProjEntry {
-            expr: BExpr::ColRef(cols[i].id),
-            out: HirCol::new(ids.next(), def),
-        })
-        .collect())
-}
-
 /// What a SELECT list needs of the leaf it binds through, beyond expression
 /// binding.
-pub(crate) trait ItemLeaf: LeafBinder<ColId> {
+pub(super) trait ItemLeaf: LeafBinder<ColId> {
     /// The name a copied column is selected under: its visible source column's.
     fn source_name(&self, id: ColId) -> Option<String>;
     /// The projection of `items` over `source`. The subquery-binding leaf joins in
@@ -585,8 +536,9 @@ pub(crate) trait ItemLeaf: LeafBinder<ColId> {
 }
 
 /// Resolve every SELECT item into a `ProjEntry` in SELECT order, expanding a bare
-/// `*` via [`expand_wildcard`], and refuse two items of one name.
-pub(crate) fn bind_projection<L: ItemLeaf>(
+/// `*` over the leaf's columns (honoring `EXCEPT`/`EXCLUDE`/`RENAME`, skipping
+/// hidden columns), and refuse two items of one name.
+pub(super) fn bind_projection<L: ItemLeaf>(
     projection: &[SelectItem],
     leaf: &L,
     ids: &ColIdGen,
@@ -605,7 +557,11 @@ pub(crate) fn bind_projection<L: ItemLeaf>(
         };
         if let Some((qualifier, o)) = star {
             if let Some(cols) = leaf.wildcard_cols(qualifier)? {
-                items.extend(expand_wildcard(o, &cols, ctx, ids)?);
+                let expanded = expand_wildcard_item(o, cols.iter().map(|c| &c.def), ctx)?;
+                items.extend(expanded.into_iter().map(|(i, def)| ProjEntry {
+                    expr: BExpr::ColRef(cols[i].id),
+                    out: HirCol::new(ids.next(), def),
+                }));
                 continue;
             }
         }
@@ -656,9 +612,10 @@ fn bind_scalar_item<L: ItemLeaf>(
 
 /// What a leaf does with a subquery node it meets.
 enum SubPolicy<'a> {
-    /// Bind it as the column its decorrelation produces, recording it in `subs`.
+    /// Bind it in `cx` as the column its decorrelation produces, recording it in
+    /// `subs`.
     Bind {
-        bind: &'a dyn Fn(&Expr) -> Result<HirExpr, GnitzSqlError>,
+        cx: &'a BindCx<'a>,
         subs: &'a RefCell<Vec<SubqueryRef>>,
     },
     /// No subquery here, and why.
@@ -718,15 +675,12 @@ impl LeafTyping<ColId> for ScopeLeaf<'_> {
 
 impl LeafBinder<ColId> for ScopeLeaf<'_> {
     fn bind_column(&self, qual: Option<&str>, name: &str) -> Result<HirExpr, GnitzSqlError> {
-        Ok(BExpr::ColRef(match qual {
-            None => self.scope.resolve_unqualified(name)?,
-            Some(qual) => self.scope.resolve_qualified(qual, name)?,
-        }))
+        Ok(BExpr::ColRef(self.scope.resolve(qual, name)?))
     }
 
     fn bind_subquery(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         match self.sub {
-            SubPolicy::Bind { bind, .. } => bind(e),
+            SubPolicy::Bind { cx, subs } => subquery::bind_one_subquery(cx, self.scope, subs, e),
             SubPolicy::Reject(why) => Err(why(e)),
         }
     }
@@ -758,6 +712,7 @@ pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema, alias: &str) -> Re
 /// The name-resolution scope of a FROM-join body: all in-scope (null-widened)
 /// `HirCol`s in relation order, plus each relation's alias (as written) and span.
 /// Resolves a qualified or unqualified reference to a `ColId`.
+#[derive(Clone)]
 struct JoinScope {
     combined: Vec<HirCol>,
     /// The columns a `USING` / `NATURAL` step merged away. A `Vec` because it is
@@ -778,15 +733,8 @@ impl JoinScope {
     /// The scope of one relation — a `new` plus one `push`.
     fn single(alias: &str, cols: Vec<HirCol>) -> Self {
         let mut scope = JoinScope::new();
-        scope.push(alias, cols);
+        scope.push(alias, cols).expect("an empty scope takes any alias");
         scope
-    }
-
-    /// Mark the non-preserved side's copy of a `USING` / `NATURAL` column: it
-    /// stops answering an unqualified name and leaves `*`, but stays reachable as
-    /// `alias.col`.
-    fn merge_away(&mut self, id: ColId) {
-        self.merged.push(id);
     }
 
     /// The columns still answering an unqualified name and appearing in `*`.
@@ -812,10 +760,18 @@ impl JoinScope {
         names
     }
 
-    fn push(&mut self, alias: &str, cols: Vec<HirCol>) {
+    /// Add a relation under `alias`. Under one alias twice, `alias.col` would name
+    /// a column of either relation, so a taken alias is refused.
+    fn push(&mut self, alias: &str, cols: Vec<HirCol>) -> Result<(), GnitzSqlError> {
+        if self.relations.iter().any(|(a, _)| a.eq_ignore_ascii_case(alias)) {
+            return Err(GnitzSqlError::Rejected(format!(
+                "relation alias '{alias}' is used by two relations in one scope; rename one"
+            )));
+        }
         let start = self.combined.len();
         self.combined.extend(cols);
         self.relations.push((alias.to_string(), start..self.combined.len()));
+        Ok(())
     }
 
     /// Apply one join step's outer null-widening to the scope, in place, through
@@ -834,10 +790,6 @@ impl JoinScope {
         );
     }
 
-    fn rel_cols(&self, span: &Range<usize>) -> &[HirCol] {
-        &self.combined[span.clone()]
-    }
-
     /// The columns of the relation `alias` names.
     fn relation(&self, alias: &str) -> Result<&[HirCol], GnitzSqlError> {
         let (_, span) = self
@@ -845,7 +797,7 @@ impl JoinScope {
             .iter()
             .find(|(a, _)| a.eq_ignore_ascii_case(alias))
             .ok_or_else(|| GnitzSqlError::Rejected(format!("table alias '{alias}' not found")))?;
-        Ok(self.rel_cols(span))
+        Ok(&self.combined[span.clone()])
     }
 
     fn resolve_qualified(&self, alias: &str, name: &str) -> Result<ColId, GnitzSqlError> {
@@ -875,11 +827,19 @@ impl JoinScope {
         self.find_unqualified(name)?
             .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{name}' not found{scope}")))
     }
+
+    /// Resolve a column reference, qualified by `qual` or not.
+    fn resolve(&self, qual: Option<&str>, name: &str) -> Result<ColId, GnitzSqlError> {
+        match qual {
+            None => self.resolve_unqualified(name),
+            Some(qual) => self.resolve_qualified(qual, name),
+        }
+    }
 }
 
 /// A relation's own columns projected by `projection`, bound through the leaf a
 /// view body binds through — an `INSERT … RETURNING` list.
-pub(crate) fn bind_returning(
+pub(super) fn bind_returning(
     ids: &ColIdGen,
     projection: &[SelectItem],
     desc: Arc<RelDescriptor>,
@@ -896,13 +856,28 @@ pub(crate) fn bind_returning(
 }
 
 /// Which statement a body is bound for.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(super) enum Surface {
     /// A view body.
-    ViewBody,
+    View(ViewBody),
     /// An ad-hoc read, which lowers to one stateless read of one relation. `op`
     /// names the read in a class rejection.
-    AdhocRead { op: &'static str },
+    Adhoc { op: &'static str },
+}
+
+impl Surface {
+    /// The statement a rejection names: the view statement, or `SELECT` for an
+    /// ad-hoc read.
+    pub(super) fn stmt(self) -> &'static str {
+        match self {
+            Surface::View(v) => v.stmt,
+            Surface::Adhoc { .. } => "SELECT",
+        }
+    }
+
+    pub(super) fn is_view(self) -> bool {
+        matches!(self, Surface::View(_))
+    }
 }
 
 /// The projection item each key of `order_exprs` sorts on: the output column it
@@ -939,7 +914,7 @@ pub(super) fn place_order_keys<L: ItemLeaf>(
 /// Bind a set operation, binding both sides recursively; the `SetOp` constructor
 /// pairs columns positionally and promotes cross-width types.
 fn bind_set_op(
-    cx: &mut BindCx<'_>,
+    cx: &BindCx<'_>,
     op: SetOperator,
     quantifier: SetQuantifier,
     left: &SetExpr,

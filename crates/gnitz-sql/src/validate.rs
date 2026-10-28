@@ -1,5 +1,5 @@
 //! The clause guards more than one statement shares: what a `Select` and a
-//! `Query` envelope may carry on each surface, and the CTE and sub-query
+//! `Query` envelope may carry on each surface, and the sub-query
 //! unwraps over them. A guard for one statement sits beside that statement's
 //! planner; all of them keep one contract.
 //!
@@ -210,8 +210,8 @@ pub(crate) fn reject_unhonored_query_clauses(
 /// Reject a sub-`Query`'s whole envelope (no honored clause) and return its body
 /// `SetExpr` — the shared front step of every narrowing site that consumes a
 /// nested query and accepts any relational body (a CTE body, a derived table).
-/// The sites that require a plain SELECT (an EXISTS/IN or scalar subquery inner,
-/// the ad-hoc read route's CTE) layer [`as_plain_select`] on top.
+/// An EXISTS/IN or scalar subquery inner, which must be a plain SELECT, layers
+/// [`as_plain_select`] on top.
 pub(crate) fn reject_query_envelope_body<'a>(
     q: &'a sqlparser::ast::Query,
     ctx: &str,
@@ -221,7 +221,8 @@ pub(crate) fn reject_query_envelope_body<'a>(
 }
 
 /// A relational body narrowed to the plain `Select` a surface requires — one
-/// home for that rejection's message, shared by the sub-query and CTE unwraps.
+/// home for that rejection's message, shared by the direct SELECT and the
+/// sub-query unwrap.
 pub(crate) fn as_plain_select<'a>(
     body: &'a sqlparser::ast::SetExpr,
     ctx: &str,
@@ -232,37 +233,4 @@ pub(crate) fn as_plain_select<'a>(
             "{ctx}: only a plain SELECT body is supported"
         ))),
     }
-}
-
-/// The CTE list of a query with the one universal precondition applied —
-/// `WITH RECURSIVE` has no builder on any path. An absent `WITH` is the empty
-/// list. The shared entry of the two CTE consumers (CREATE VIEW's `bind_ctes`
-/// phase and the direct-SELECT read route).
-pub(crate) fn non_recursive_ctes(query: &sqlparser::ast::Query) -> Result<&[sqlparser::ast::Cte], GnitzSqlError> {
-    let Some(with) = &query.with else {
-        return Ok(&[]);
-    };
-    reject_if(with.recursive, "WITH", "RECURSIVE")?;
-    Ok(&with.cte_tables)
-}
-
-/// Reject a CTE's envelope (a trailing FROM plus every unhonored `Query` clause)
-/// and return its body `SetExpr` — the front step of the CREATE VIEW CTE phase,
-/// which binds any relational body (a set operation, a grouped or join body, a
-/// nested derived table). The ad-hoc read route, which supports only
-/// single-relation CTE bodies, layers [`as_plain_select`] on top.
-/// (`materialized` parses only under PostgreSqlDialect — always `None` here.)
-pub(crate) fn cte_body<'a>(
-    cte: &'a sqlparser::ast::Cte,
-    ctx: &str,
-) -> Result<&'a sqlparser::ast::SetExpr, GnitzSqlError> {
-    let sqlparser::ast::Cte {
-        alias: _,
-        query,
-        from,
-        materialized: _,
-        closing_paren_token: _,
-    } = cte;
-    reject_if(from.is_some(), ctx, "a trailing FROM")?;
-    reject_query_envelope_body(query, ctx)
 }

@@ -1,8 +1,10 @@
 //! GROUP BY / aggregate / HAVING binding: the reduce, the pre-map under it and
 //! the leaf its HAVING and SELECT list bind through.
 
-use super::super::{as_col, col_by_id, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr};
-use super::{bind_select_list, ItemLeaf, ScopeLeaf, Surface};
+use super::super::{
+    as_col, col_by_id, hircol_of, reduce_reads, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr,
+};
+use super::{bind_select_list, BindCx, ItemLeaf, ScopeLeaf};
 use crate::agg::AggFunc;
 use crate::ast_util::{group_by_exprs, AggArg};
 use crate::bind::{bind_conjuncts, bind_structural, LeafBinder};
@@ -153,13 +155,13 @@ fn distinct_arg(calls: &[HirAgg]) -> Result<Option<ColId>, GnitzSqlError> {
 /// `Project(Filter_having?(Reduce(input)))`, plus the projection item each
 /// ORDER BY key of `surface` sorts on.
 pub(super) fn bind_grouped_suffix(
-    ids: &ColIdGen,
+    cx: &BindCx<'_>,
     select: &Select,
     input: Rc<RelExpr>,
     leaf: &ScopeLeaf<'_>,
-    surface: Surface,
     order_exprs: &[&Expr],
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
+    let ids = cx.ids;
     let mut pre = PreMap::new(ids, leaf.scope.combined.clone());
     let group_cols = resolve_group_cols(select, leaf, &mut pre)?;
     let grouped = GroupedLeaf {
@@ -180,7 +182,7 @@ pub(super) fn bind_grouped_suffix(
         let Grouping { pre, aggs } = &*grouped.state.borrow();
         // An ad-hoc read lowers to one stateless fold over one scan, which has no
         // room for the `Distinct` below the reduce.
-        if surface != Surface::ViewBody && aggs.iter().any(|a| matches!(a.arg, AggArg::Distinct(_))) {
+        if !cx.surface.is_view() && aggs.iter().any(|a| matches!(a.arg, AggArg::Distinct(_))) {
             return Err(GnitzSqlError::Rejected(
                 "DISTINCT aggregates are supported in a CREATE VIEW body only".into(),
             ));
@@ -188,11 +190,9 @@ pub(super) fn bind_grouped_suffix(
         let phys = HirAgg::physical(aggs);
         // What the reduce reads, and under a DISTINCT aggregate the set it reduces over.
         let distinct = distinct_arg(aggs)?;
-        let mut reads = group_cols.clone();
-        for id in phys.iter().filter_map(|c| c.arg).chain(distinct) {
-            if !reads.contains(&id) {
-                reads.push(id);
-            }
+        let mut reads = reduce_reads(&group_cols, &phys);
+        if let Some(d) = distinct.filter(|d| !reads.contains(d)) {
+            reads.push(d);
         }
         let input = match distinct {
             Some(_) => RelExpr::distinct(RelExpr::project(input, pre.items_for(&reads)), "DISTINCT aggregate")?,
@@ -201,7 +201,7 @@ pub(super) fn bind_grouped_suffix(
         };
         RelExpr::filter(RelExpr::reduce(input, group_cols.clone(), phys), having)
     };
-    bind_select_list(ids, select, rel, &grouped, "GROUP BY", order_exprs, surface)
+    bind_select_list(cx, select, rel, &grouped, "GROUP BY", order_exprs)
 }
 
 /// What a grouped body's reduce computes, grown as its expressions bind.

@@ -36,7 +36,7 @@ pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
     Ok(ColType::of(tc))
 }
 
-/// The SQL spelling of a column type: [`sql_col_type`]'s inverse on every type
+/// The SQL spelling of a column type: the inverse of the SQL type parser on every type
 /// a `CREATE TABLE` accepts.
 pub fn sql_type_name(ty: ColType) -> String {
     let name = match ty.tc {

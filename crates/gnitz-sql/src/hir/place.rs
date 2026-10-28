@@ -2,7 +2,7 @@
 //! place each conjunct as low as it is exact — in an input, in the join's keys, or
 //! in a `Filter` above the join.
 
-use super::{cross_comparison, side, EqPair, HirCol, HirExpr, HirRange, JoinClass, JoinShape, JoinType, RelExpr, Side};
+use super::{cross_comparison, side, HirCol, HirExpr, JoinClass, JoinShape, JoinType, KeyPair, RelExpr, Side};
 use crate::error::GnitzSqlError;
 use crate::ir::BinOp;
 use crate::rules::{reject_arity, reject_float_keys};
@@ -26,11 +26,7 @@ impl RelExpr {
     ) -> Result<Rc<RelExpr>, GnitzSqlError> {
         let on = on.into_iter().flat_map(HirExpr::conjuncts).collect();
         let placed = place(&left, &right, kind, JoinClass::default(), on, Origin::On)?;
-        reject_arity(
-            "join key list",
-            placed.class.eq.len() + usize::from(placed.class.range.is_some()),
-            gnitz_wire::PK_LIST_MAX_COLS,
-        )?;
+        reject_arity("join key list", placed.class.arity(), gnitz_wire::PK_LIST_MAX_COLS)?;
         reject_join_shape(kind, placed.class.shape())?;
         reject_outer_with_residual(kind, &placed.above)?;
         placed.build(&left, &right, kind)
@@ -79,12 +75,12 @@ impl Placed {
 }
 
 /// Whether a conjunct naming only one input's columns stays exact inside it.
-fn admits(kind: JoinType, origin: Origin, is_left: bool) -> bool {
+fn admits(kind: JoinType, origin: Origin, side: usize) -> bool {
     match origin {
         // Exact unless this input's unmatched rows are emitted or counted.
-        Origin::On => !kind.has_nu(is_left),
+        Origin::On => !kind.has_nu(side),
         // Exact unless the join null-fills this input's columns.
-        Origin::Filter => !kind.preserves(!is_left),
+        Origin::Filter => !kind.preserves(1 - side),
     }
 }
 
@@ -102,9 +98,8 @@ fn place(
     let (mut below, mut above) = ([Vec::new(), Vec::new()], Vec::new());
     for conj in conjs {
         let input = match side(&conj, &lcols, &rcols) {
-            Side::Left => admits(kind, origin, true).then_some(0),
-            Side::Right => admits(kind, origin, false).then_some(1),
-            Side::Neither => (0..2).find(|&i| admits(kind, origin, i == 0)),
+            Side::One(i) => admits(kind, origin, i).then_some(i),
+            Side::Neither => (0..2).find(|&i| admits(kind, origin, i)),
             Side::Both => None,
         };
         if let Some(i) = input {
@@ -136,7 +131,7 @@ impl JoinClass {
         };
         let range = op.as_range_rel();
         // A pair already keyed on, in either orientation, adds nothing.
-        if op == BinOp::Eq && self.eq.iter().any(|p| (p.left, p.right) == (l.id, r.id)) {
+        if op == BinOp::Eq && self.eq.iter().any(|p| p.cols == [l.id, r.id]) {
             return Ok(None);
         }
         let slot = if range.is_some() {
@@ -146,8 +141,7 @@ impl JoinClass {
         };
         // Past the arity cap an ON comparison still claims its slot, so the cap's
         // error reports the count written; a filter comparison stays a filter.
-        let fits = origin == Origin::On
-            || self.eq.len() + 1 + usize::from(self.range.is_some()) <= gnitz_wire::PK_LIST_MAX_COLS;
+        let fits = origin == Origin::On || self.arity() < gnitz_wire::PK_LIST_MAX_COLS;
         if !(slot && fits) {
             return Ok(Some(conj));
         }
@@ -156,8 +150,8 @@ impl JoinClass {
             Some(_) => validate_range_join_key_pair(&l.def, &r.def),
         };
         match (tc, range) {
-            (Ok(ty), None) => self.eq.push(EqPair { left: l.id, right: r.id, ty }),
-            (Ok(ty), Some(op)) => self.range = Some(HirRange { left: l.id, right: r.id, op, ty }),
+            (Ok(ty), None) => self.eq.push(KeyPair { cols: [l.id, r.id], ty }),
+            (Ok(ty), Some(op)) => self.range = Some((KeyPair { cols: [l.id, r.id], ty }, op)),
             (Err(e), _) if origin == Origin::On => return Err(e),
             (Err(_), _) => return Ok(Some(conj)),
         }
@@ -201,7 +195,7 @@ fn reject_join_shape(kind: JoinType, shape: JoinShape) -> Result<(), GnitzSqlErr
              comma-separated FROM, or JOIN … ON with no cross-table comparison) may be keyless."
                 .into(),
         )),
-        (JoinShape::PureRange, k) if k.preserves_right() => Err(GnitzSqlError::Rejected(
+        (JoinShape::PureRange, k) if k.preserves(1) => Err(GnitzSqlError::Rejected(
             "pure-range RIGHT/FULL JOIN (a sole inequality range conjunct with no \
              equality prefix) is not supported; its mirror null-fill has no inner-join \
              witness on the preserved side. Use INNER/LEFT JOIN, or add an equality \
