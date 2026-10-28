@@ -3,7 +3,7 @@
 //!
 //! The circuit reduce in `stream` runs these same aggregates, group key and
 //! row emitter, so a maintained aggregate and an ad-hoc one over the same group
-//! set agree by construction. `tests/agg.rs` is the aggregates' own.
+//! set agree by construction.
 
 mod adhoc_fold;
 mod agg;
@@ -12,7 +12,3 @@ mod shape;
 pub(crate) use adhoc_fold::AdhocFold;
 pub(crate) use agg::{Agg, AggValues, RangeGroups};
 pub(crate) use shape::{resolve_aggs, ReduceShape};
-
-#[cfg(test)]
-#[path = "benches/aggregate.rs"]
-mod bench;

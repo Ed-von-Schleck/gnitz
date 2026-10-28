@@ -145,8 +145,8 @@ fn placement(
 // Circuit walks
 // ---------------------------------------------------------------------------
 
-/// One reindex key: a `(source column, slot type)` slot list, in
-/// the trace-side `ReindexPacker`'s own order.
+/// One reindex key: a `(source column, slot type)` slot list, in the order
+/// the trace side's reindex Map packs it.
 type ReindexKey = Vec<gnitz_wire::ReindexSlot>;
 
 /// What the circuit does with one scanned source's delta.

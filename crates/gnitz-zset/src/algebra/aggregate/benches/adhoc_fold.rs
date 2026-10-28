@@ -1,4 +1,4 @@
-use super::adhoc_fold::AdhocFold;
+use super::AdhocFold;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::mix;

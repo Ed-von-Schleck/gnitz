@@ -27,8 +27,8 @@ impl ReduceShape {
         aggs: &[AggDescriptor],
     ) -> Result<(Self, SchemaDescriptor), String> {
         let (key, prefix) = GroupOutKey::new(input, group_cols, group_cols.iter().copied())?;
-        // A prefix of the output's columns: it finishes wherever the output does,
-        // whose refusal comes first.
+        // The output's leading columns: they fit wherever the whole output does,
+        // so the output's refusal is the one reported.
         let leading = prefix.finish();
         // A global reduce's one group has a value over no rows.
         let (output_schema, aggs) = resolve_aggs(input, prefix, aggs, key.is_global())?;

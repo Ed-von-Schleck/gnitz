@@ -20,7 +20,7 @@
 
 use std::cmp::Ordering;
 
-use crate::algebra::{GroupOutKey, ReindexPacker};
+use crate::algebra::{GroupOutKey, KeyPacker};
 use crate::repr::{pk_group_end, Batch, MemBatch, ReadCursor};
 use crate::schema::key::compare_pk_ordering;
 use crate::schema::payload_order::{Generic, PayloadOrder};
@@ -29,7 +29,7 @@ use crate::stream::OpenAt;
 use gnitz_wire::RowSource;
 use gnitz_wire::{OrderKey, TypeCode};
 
-use crate::algebra::{copy_column, image_slot_col, rebase_copied_strings, ImageCol, RowWindow, IMAGE_COL};
+use crate::algebra::{copy_columns, image_slot_col, ImageCol, IMAGE_COL};
 use gnitz_expr::{ColCopy, ColMoves, ColumnLocator, WeightSlots};
 
 use window::{Running, Window};
@@ -366,7 +366,7 @@ impl Walk<'_> {
 
 /// The index resources a plan carries, baked once at compile time.
 struct OrderIndex {
-    key_packer: ReindexPacker,
+    key_packer: KeyPacker,
     /// How a row's group is keyed in the output.
     key: GroupOutKey,
     schema: SchemaDescriptor,
@@ -405,7 +405,7 @@ impl OrderIndex {
         let lead = order.next().ok_or_else(|| "order index: no order keys".to_string())??;
         let rest = order.collect::<Result<Vec<_>, String>>()?;
         let suffix: Vec<SchemaColumn> = lead.lead_cols().collect();
-        let (key_packer, mut b) = ReindexPacker::new_group_key(input, group_cols, &suffix)?;
+        let (key_packer, mut b) = KeyPacker::new_group_key(input, group_cols, &suffix)?;
         let images = rest.len() + usize::from(!lead.image.fits_slot());
         for _ in 0..images {
             b.push(IMAGE_COL);
@@ -498,10 +498,7 @@ impl OrderIndex {
             }
             w.weight_mut().copy_from_slice(delta.weight());
             self.moves.write_null_rows(mb.null_bmp(), 0, w.null_bmp_mut(), 0, n);
-            for c in self.moves.copies() {
-                copy_column(delta, w, c, RowWindow { src: 0, dst: 0, n });
-            }
-            rebase_copied_strings(self.moves.copies(), w, delta.blob(), heap_at);
+            copy_columns(delta, w, self.moves.copies(), n, heap_at);
         });
         out
     }

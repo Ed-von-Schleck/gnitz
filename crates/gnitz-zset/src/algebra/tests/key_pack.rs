@@ -1,5 +1,5 @@
 use super::*;
-use crate::repr::BatchBuilder;
+use crate::repr::{BatchBuilder, MemBatch};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     le_cell, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string, u64_pk_schema, STRS,
@@ -97,7 +97,7 @@ fn a_fold_keys_a_row_by_its_columns() {
 }
 
 // -----------------------------------------------------------------------
-// ReindexPacker::output_schema — the layout the per-row packer writes through
+// KeyPacker::output_schema — the layout the per-row packer writes through
 // -----------------------------------------------------------------------
 
 /// The synthetic PK is one slot per key column at its slot type — a
@@ -130,7 +130,7 @@ fn packer_output_schema_is_the_key_slots_then_the_kept_columns() {
     for (payload, key, keep, want) in cases {
         let cols: Vec<SchemaColumn> = payload.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
         let in_schema = u64_pk_schema(&cols);
-        let packer = ReindexPacker::new(&in_schema, key).unwrap();
+        let packer = KeyPacker::new(&in_schema, key).unwrap();
         let out = packer.output_schema(&in_schema, keep).unwrap();
         let types: Vec<TypeCode> = (0..out.num_columns()).map(|c| out.columns()[c].type_code).collect();
         assert_eq!(types, want, "{payload:?} keyed on {key:?}");
@@ -141,7 +141,7 @@ fn packer_output_schema_is_the_key_slots_then_the_kept_columns() {
 }
 
 // -----------------------------------------------------------------------
-// ReindexPacker — the content-hash arm
+// KeyPacker — the content-hash arm
 // -----------------------------------------------------------------------
 
 /// A STRING or BLOB key packs the big-endian `checksum_128` of its content,
@@ -157,7 +157,7 @@ fn a_content_key_packs_its_content_hash() {
             b.end_row();
         }
         let b = b.finish();
-        let packer = ReindexPacker::new(&schema, &[(1, TypeCode::U128)]).unwrap();
+        let packer = KeyPacker::new(&schema, &[(1, TypeCode::U128)]).unwrap();
         let want: Vec<u8> = contents
             .iter()
             .flat_map(|c| gnitz_wire::checksum_128(c).to_be_bytes())
@@ -172,7 +172,7 @@ fn a_content_key_packs_its_content_hash() {
 }
 
 // -----------------------------------------------------------------------
-// ReindexPacker::pack_into — property test over every PK-eligible type
+// KeyPacker::pack_into — property test over every PK-eligible type
 // -----------------------------------------------------------------------
 
 mod pack_proptest {
@@ -186,7 +186,7 @@ mod pack_proptest {
     /// slots `pad` bytes wider than the key and by `pack_prefix` one at a time,
     /// are each `want` of its row.
     fn assert_packs(
-        packer: &ReindexPacker,
+        packer: &KeyPacker,
         mb: &MemBatch,
         runs: &[(usize, usize)],
         want: impl Fn(usize) -> Vec<u8>,
@@ -280,7 +280,7 @@ mod pack_proptest {
             };
             for (schema, batch, first) in [(&pay_schema, &pb, 1u32), (&pk_schema, &kb, 0)] {
                 let key: Vec<gnitz_wire::ReindexSlot> = (first..).zip(slots.iter().copied()).collect();
-                let packer = ReindexPacker::new(schema, &key).unwrap();
+                let packer = KeyPacker::new(schema, &key).unwrap();
                 let mb = batch.as_mem_batch();
                 for runs in &windows {
                     assert_packs(&packer, &mb, runs, want, &format!("{key:?} first key column {first}"))?;
@@ -299,7 +299,7 @@ mod pack_proptest {
             }
 
             let group: Vec<u32> = (1..=types.len() as u32).collect();
-            let (packer, _) = ReindexPacker::new_group_key(&null_schema, &group, &[]).unwrap();
+            let (packer, _) = KeyPacker::new_group_key(&null_schema, &group, &[]).unwrap();
             let mb = nb.as_mem_batch();
             let by_row = |r: usize| {
                 let mut key = vec![0u8; packer.out_stride];
@@ -309,70 +309,6 @@ mod pack_proptest {
             for runs in &windows {
                 assert_packs(&packer, &mb, runs, by_row, "group key")?;
             }
-        }
-    }
-}
-
-/// Over PKs of every suffix width and a nullable indexed column of every
-/// indexable width: the projection holds exactly the rows `KeySpec::span` admits,
-/// each as its span followed by its own PK, in source order — and `spans` the
-/// positive-weight rows' spans.
-#[test]
-fn index_entries_are_each_admitted_rows_span_and_pk() {
-    use TypeCode::{I128, I16, I64, U128, U32, U64, U8};
-    let mut rng = crate::test_support::Rng::new(0x1dc5);
-    let pks: [&[TypeCode]; 6] = [&[U32, I64], &[U32], &[U64], &[U128], &[U64, U128], &[U128, U128]];
-    for (pk, tc) in pks
-        .into_iter()
-        .flat_map(|pk| [U8, I16, U32, I64, U128, I128].map(|tc| (pk, tc)))
-    {
-        let k = pk.len() as u32;
-        let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
-        cols.extend([SchemaColumn::new(tc, true), SchemaColumn::new(TypeCode::I32, false)]);
-        let owner = SchemaDescriptor::new(&cols, &(0..k).collect::<Vec<_>>());
-        let width = tc.wire_stride();
-        let mut b = BatchBuilder::new(&owner);
-        for row in 0..300u64 {
-            // Runs of live rows broken by ghosts and by NULLs.
-            let weight = [1, 1, 1, 0, -2, 1][(row % 6) as usize];
-            let mut natives = vec![row as u128];
-            natives.extend((1..k).map(|_| rng.next_u64() as u128));
-            b.begin_row_natives(&natives, weight);
-            let v = rng.gen_u128();
-            match rng.gen_range(5) {
-                0 => b.put_null(),
-                _ => b.put_int(v & gnitz_wire::image_mask(width)),
-            }
-            b.put_int(row as u128);
-            b.end_row();
-        }
-        let src = b.finish();
-        let mb = src.as_mem_batch();
-        for indexed in [&[k][..], &[k, k + 1], &[k - 1, k]] {
-            let (spec, idx_schema) = crate::schema::key::KeySpec::new(indexed, &owner)
-                .map(|spec| (spec, spec.index_schema(&owner)))
-                .unwrap();
-            let mut want: Vec<(Vec<u8>, i64)> = Vec::new();
-            for row in 0..src.len() {
-                if let Some(span) = spec.span(&mb, row).filter(|_| src.get_weight(row) != 0) {
-                    let mut e = span.pk_bytes().to_vec();
-                    e.extend_from_slice(src.get_pk_bytes(row));
-                    want.push((e, src.get_weight(row)));
-                }
-            }
-            let got = index_entries(&src, &spec, &idx_schema);
-            let got: Vec<(Vec<u8>, i64)> = (0..got.len())
-                .map(|r| (got.get_pk_bytes(r).to_vec(), got.get_weight(r)))
-                .collect();
-            assert_eq!(got, want, "{pk:?} {tc} indexed on {indexed:?}");
-
-            let key_size = spec.key_size();
-            let want_spans: Vec<u8> = want
-                .iter()
-                .filter(|(_, w)| *w > 0)
-                .flat_map(|(e, _)| e[..key_size].to_vec())
-                .collect();
-            assert_eq!(spans(&mb, &spec), want_spans, "{pk:?} {tc} indexed on {indexed:?}");
         }
     }
 }

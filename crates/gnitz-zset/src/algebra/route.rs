@@ -11,8 +11,7 @@ fn bucket(h: u64, num_workers: usize) -> usize {
     ((h as u128 * num_workers as u128) >> 64) as usize
 }
 
-/// Which worker this process is, of how many: the one input that decides which
-/// `w{k}of{n}` child every store of this process opens.
+/// Which worker this process is, of how many.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Slot {
     pub rank: u32,
@@ -139,8 +138,9 @@ pub(crate) fn worker_for_pk_bytes(bytes: &[u8], num_workers: usize) -> usize {
     }
 }
 
+/// [`worker_for_pk_bytes`] of a region wider than [`NARROW_PK_MAX_BYTES`].
 #[inline(never)]
-fn worker_for_wide_pk(bytes: &[u8], num_workers: usize) -> usize {
+pub(crate) fn worker_for_wide_pk(bytes: &[u8], num_workers: usize) -> usize {
     bucket(gnitz_wire::checksum(bytes), num_workers)
 }
 

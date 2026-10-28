@@ -1,9 +1,10 @@
-//! The group key shared by the reduce, the top-N, the ad-hoc fold and the
-//! exchange scatter: [`GroupKey`] resolves a group set to the output PK a reduce
-//! over it stamps, and the one grouping mechanism built on it — a group is its
-//! output PK.
+//! The key a row is grouped or routed by. [`GroupKey`] resolves a group set, a
+//! join key or a placement prefix to the PK bytes its consumer keys by: the
+//! exchange scatter routes by it, and [`GroupOutKey`] groups and keys the rows of
+//! an operator keyed like a reduce (the reduce, the ad-hoc fold, the top-N and
+//! the window) by it — a group is its output PK.
 
-use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
+use super::key_pack::{locate_key_col, pk_run, FoldCols, KeyPacker};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::key::{pk_width_dispatch, PkSortKey};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
@@ -21,7 +22,7 @@ pub(crate) enum GroupKey {
     Image(ColumnLocator),
     /// The group's packed key, NULLs marked: at most 16 bytes, held by the
     /// `_group_pk` — also a join key packed off the PK region, at any width.
-    Packed(ReindexPacker),
+    Packed(KeyPacker),
     /// The NULL-distinct XXH3 fold of the group columns: the `_group_pk` of a
     /// group whose own images do not fit one. Over no columns it is V₀.
     Fold(FoldCols),
@@ -34,31 +35,33 @@ impl GroupKey {
             .iter()
             .map(|&c| locate_key_col(schema, c, "group key").map(|(_, loc)| loc))
             .collect::<Result<_, _>>()?;
-        Ok(match (schema.reduce_out_key(group_cols), &locs[..]) {
-            (ReduceOutKey::Natural, &[loc]) => Self::column(loc),
-            (ReduceOutKey::Natural, _) => GroupKey::PkRange { at: 0, n: schema.pk_stride() },
+        Ok(match schema.reduce_out_key(group_cols) {
+            // The group's own columns: one PK run, or one payload column.
+            ReduceOutKey::Natural => Self::in_place(&locs).expect("a natural group key reads in place"),
             // A `_group_pk` holds the group itself where its packed key fits one.
-            (ReduceOutKey::SyntheticFold, _) => match ReindexPacker::new_group_key(schema, group_cols, &[])?.0 {
-                p if p.packs_whole() && (1..=GROUP_PK_BYTES).contains(&p.out_stride) => Self::packed(p),
+            ReduceOutKey::SyntheticFold => match KeyPacker::new_group_key(schema, group_cols, &[])?.0 {
+                // A folded column alone fills the 16 bytes, so a packer that fits folds none.
+                p if (1..=GROUP_PK_BYTES).contains(&p.out_stride) => Self::packed(p),
                 _ => GroupKey::Fold(FoldCols::new(locs)),
             },
         })
     }
 
-    /// One column as its own key.
-    fn column(loc: ColumnLocator) -> Self {
-        match loc {
-            ColumnLocator::Pk { byte_off, size, .. } => GroupKey::PkRange { at: byte_off as usize, n: size as usize },
-            ColumnLocator::Payload { .. } => GroupKey::Image(loc),
+    /// The key `packer` packs, read in place where the batch already spells it.
+    pub(crate) fn packed(packer: KeyPacker) -> Self {
+        match packer.identity_columns().and_then(|locs| Self::in_place(&locs)) {
+            Some(key) => key,
+            None => GroupKey::Packed(packer),
         }
     }
 
-    /// The key `packer` packs, read in place where the batch already spells it.
-    pub(crate) fn packed(packer: ReindexPacker) -> Self {
-        match (packer.pk_range(), packer.identity_columns().as_deref()) {
-            (Some((at, n)), _) => GroupKey::PkRange { at, n },
-            (None, Some(&[loc])) => Self::column(loc),
-            _ => GroupKey::Packed(packer),
+    /// `locs`' key read where a batch already spells it: consecutive PK columns,
+    /// or one payload column (a PK column is a run of its own).
+    fn in_place(locs: &[ColumnLocator]) -> Option<Self> {
+        match (pk_run(locs), locs) {
+            (Some((at, n)), _) => Some(GroupKey::PkRange { at, n }),
+            (None, &[loc @ ColumnLocator::Payload { .. }]) => Some(GroupKey::Image(loc)),
+            _ => None,
         }
     }
 
@@ -150,49 +153,34 @@ pub(crate) use for_key_cells;
 const GROUP_PK_COL: SchemaColumn = SchemaColumn::new(TypeCode::U128, false);
 const GROUP_PK_BYTES: usize = GROUP_PK_COL.size();
 
-/// The `stride`-byte OPK region of a narrow key, from its `u128` image: the
-/// inverse of `gnitz_wire::widen_pk_be`.
-pub(crate) struct NarrowPkOpk {
-    be: [u8; 16],
-    stride: usize,
-}
-
-impl NarrowPkOpk {
-    #[inline(always)]
-    pub(crate) fn new(image: u128, stride: usize) -> Self {
-        // Static message: `#[inline(always)]` puts this in every per-row caller,
-        // and an `Arguments` value costs a stack slot even on a cold panic path.
-        assert!(
-            stride <= NARROW_PK_MAX_BYTES,
-            "NarrowPkOpk::new: stride exceeds NARROW_PK_MAX_BYTES"
-        );
-        debug_assert!(
-            stride == 16 || (image >> (stride * 8)) == 0,
-            "narrow PK image {image} does not fit {stride} bytes",
-        );
-        NarrowPkOpk { be: image.to_be_bytes(), stride }
-    }
-
-    /// The `stride` order-preserving bytes — a full PK region for one row.
-    #[inline(always)]
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.be[16 - self.stride..]
-    }
-}
-
 /// One row's group output PK: borrowed out of the batch, or held inline.
 pub(crate) enum OutPk<'a> {
     Borrowed(&'a [u8]),
-    Narrow(NarrowPkOpk),
+    /// A narrow key's big-endian image, its OPK bytes from `at`.
+    Inline {
+        be: [u8; 16],
+        at: usize,
+    },
 }
 
 impl OutPk<'_> {
+    /// The `width`-byte OPK region of a narrow key, from its `u128` image: the
+    /// inverse of `gnitz_wire::widen_pk_be`.
+    #[inline(always)]
+    fn inline(image: u128, width: usize) -> Self {
+        debug_assert!(
+            width == 16 || (image >> (width * 8)) == 0,
+            "narrow PK image {image} does not fit {width} bytes",
+        );
+        OutPk::Inline { be: image.to_be_bytes(), at: 16 - width }
+    }
+
     /// The `pk_stride` OPK bytes of the key.
     #[inline]
     pub(crate) fn bytes(&self) -> &[u8] {
         match self {
             OutPk::Borrowed(b) => b,
-            OutPk::Narrow(k) => k.bytes(),
+            OutPk::Inline { be, at } => &be[*at..],
         }
     }
 }
@@ -205,8 +193,8 @@ pub(crate) trait IdentityLoop {
 
 /// V₀, the output PK of the empty group set's one group.
 #[inline]
-pub(crate) fn ground_pk() -> NarrowPkOpk {
-    NarrowPkOpk::new(gnitz_wire::global_group_key(), GROUP_PK_BYTES)
+pub(crate) fn ground_pk() -> [u8; GROUP_PK_BYTES] {
+    gnitz_wire::global_group_key().to_be_bytes()
 }
 
 /// How an operator keyed like a reduce (the reduce itself, the ad-hoc fold, the
@@ -253,13 +241,13 @@ impl GroupOutKey {
     /// The output PK of `row`'s group.
     #[inline]
     pub(crate) fn out_pk<'a>(&self, mb: &'a MemBatch, row: usize) -> OutPk<'a> {
-        let group_pk = |image| OutPk::Narrow(NarrowPkOpk::new(image, GROUP_PK_BYTES));
+        let group_pk = |image| OutPk::inline(image, GROUP_PK_BYTES);
         match &self.key {
             &GroupKey::PkRange { at, n } if self.synthetic => {
                 group_pk(gnitz_wire::widen_pk_be(mb.get_pk_range(row, at, n)))
             }
             &GroupKey::PkRange { at, n } => OutPk::Borrowed(mb.get_pk_range(row, at, n)),
-            &GroupKey::Image(loc) => OutPk::Narrow(NarrowPkOpk::new(loc.opk_image(mb, row), loc.size())),
+            &GroupKey::Image(loc) => OutPk::inline(loc.opk_image(mb, row), loc.size()),
             GroupKey::Packed(p) => group_pk(p.narrow_image(mb, row)),
             GroupKey::Fold(f) => group_pk(f.key_row(mb, row)),
         }
@@ -344,7 +332,7 @@ impl GroupOutKey {
 /// Out of line, so the loops that read their key in place compile as they do
 /// without it.
 #[inline(never)]
-fn packed_identity<L: IdentityLoop>(p: &ReindexPacker, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
+fn packed_identity<L: IdentityLoop>(p: &KeyPacker, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
     let few = |k: usize| k * PACK_ROWS_MIN_SPARSITY <= mb.count;
     let every = rows == [(0, mb.count)];
     if every || p.packs_by_column() && !(few(rows.len()) && few(crate::repr::range_rows(rows))) {

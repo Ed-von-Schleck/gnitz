@@ -1,8 +1,9 @@
-//! Linear operators: filter and union.
+//! Linear operators: filter and union, with the union's merged output schema and
+//! an outer join's null-extend output schema.
 //!
 //! The others live with the batch mechanics they are: negate is
-//! `Batch::negated`, MAP `crate::algebra::MapPlan::evaluate_map_batch`,
-//! null-extend `Batch::widened_with_nulls`.
+//! `Batch::negated`, MAP `crate::algebra::MapPlan::evaluate_map_batch`, and
+//! null-extend's rows `Batch::widened_with_nulls`.
 
 use std::borrow::Cow;
 
@@ -12,18 +13,11 @@ use crate::repr::{merge_consolidated, Batch};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::TypeCode;
 
-// ---------------------------------------------------------------------------
-// Linear operators
-// ---------------------------------------------------------------------------
-
-/// Filter: retain rows where predicate returns true, by contiguous-range bulk
-/// copy. When every row passes, the input is the output — moved when it is
-/// owned — rather than a whole-batch copy, blob heap included. An
-/// index-bounded backfill takes that path on every chunk: the access path
-/// already satisfies the predicate the circuit still carries.
+/// Filter: retain rows where the predicate returns true, by contiguous-range
+/// bulk copy. When every row passes, the input is the output, moved when it is
+/// owned. An index-bounded backfill takes that path on every chunk: the access
+/// path already satisfies the predicate the circuit still carries.
 pub fn op_filter(batch: Cow<'_, Batch>, pred: &mut RowFilter) -> Batch {
-    // `ranges` lends `out` so a *chunked* scan can carry one list; this caller
-    // has one batch.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     pred.ranges(&batch.as_mem_batch(), &mut ranges);
     if ranges == [(0, batch.len())] {

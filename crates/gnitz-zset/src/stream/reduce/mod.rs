@@ -85,7 +85,7 @@ impl ReducePlan {
         let ground = seeds_ground.then(|| {
             let mut v0 = Batch::with_capacity(&shape.output_schema, 1);
             let values = AggValues::new(&shape.aggs, 1);
-            values.emit_row(&mut v0, None, ground_pk().bytes(), 0);
+            values.emit_row(&mut v0, None, &ground_pk(), 0);
             v0
         });
         Ok(ReducePlan { shape, ground, count_star, value_index })

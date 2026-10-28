@@ -18,8 +18,13 @@ pub struct SinkPlan {
 }
 
 enum Kind {
-    /// Forward rows: every survivor, or the ones `cut` keeps.
-    Rows { keeper: Batch, cut: Option<Cut> },
+    /// Forward every survivor.
+    Rows(Batch),
+    /// Survivors until their summed weight reaches the window; `left` is the
+    /// weight still to reach.
+    Prefix { keeper: Batch, left: i64 },
+    /// The survivors a top-k keeps.
+    TopK { keeper: Batch, top: TopK },
     /// Partial reduce-output rows.
     Fold {
         /// The one mapped batch of the whole scan, used only under a map:
@@ -27,16 +32,6 @@ enum Kind {
         mapped: Batch,
         fold: Box<AdhocFold>,
     },
-}
-
-/// A rows sink's weight window.
-enum Cut {
-    /// Survivors until their summed weight reaches the window; `left` is the
-    /// weight still to reach.
-    Prefix {
-        left: i64,
-    },
-    TopK(TopK),
 }
 
 /// Every survivor, trimmed back down to the smallest under `order` whose summed
@@ -67,26 +62,24 @@ impl SinkPlan {
                 mapped: Batch::empty_with_schema(&sink_in),
             },
             SinkKind::Rows { cut } => {
-                let cut = match cut {
-                    None => None,
+                let keeper = Batch::empty_with_schema(&sink_in);
+                match cut {
+                    None => Kind::Rows(keeper),
                     Some(RowsCut { k, order }) => {
                         // Saturated: a wrapped negative window would truncate the answer.
                         let window = i64::try_from(k.get()).unwrap_or(i64::MAX);
-                        Some(if order.is_empty() {
-                            Cut::Prefix { left: window }
+                        if order.is_empty() {
+                            Kind::Prefix { keeper, left: window }
                         } else {
-                            Cut::TopK(TopK {
+                            let top = TopK {
                                 order: order_locators(order, &sink_in, true)?,
                                 window,
                                 summed: 0,
                                 bound: None,
-                            })
-                        })
+                            };
+                            Kind::TopK { keeper, top }
+                        }
                     }
-                };
-                Kind::Rows {
-                    keeper: Batch::empty_with_schema(&sink_in),
-                    cut,
                 }
             }
         };
@@ -96,7 +89,7 @@ impl SinkPlan {
     /// The layout [`Self::finish`] emits.
     pub fn output_schema(&self) -> &SchemaDescriptor {
         match &self.kind {
-            Kind::Rows { keeper, .. } => keeper.schema(),
+            Kind::Rows(keeper) | Kind::Prefix { keeper, .. } | Kind::TopK { keeper, .. } => keeper.schema(),
             Kind::Fold { fold, .. } => fold.output_schema(),
         }
     }
@@ -105,7 +98,7 @@ impl SinkPlan {
     /// no more than its window, any other sink no fewer than every row.
     pub fn first_drain(&self) -> usize {
         match &self.kind {
-            Kind::Rows { cut: Some(Cut::Prefix { left }), .. } => *left as usize,
+            Kind::Prefix { left, .. } => *left as usize,
             _ => usize::MAX,
         }
     }
@@ -116,11 +109,11 @@ impl SinkPlan {
     pub fn push(&mut self, chunk: &Batch, ranges: &mut [(usize, usize)]) -> Result<bool, String> {
         let map = self.map.as_mut();
         match &mut self.kind {
-            Kind::Rows { keeper, cut: None } => {
+            Kind::Rows(keeper) => {
                 append_survivors(map, chunk, keeper, ranges);
                 Ok(false)
             }
-            Kind::Rows { keeper, cut: Some(Cut::Prefix { left }) } => {
+            Kind::Prefix { keeper, left } => {
                 let mb = chunk.as_mem_batch();
                 // Cut at the row whose weight reaches the window: a range, or a
                 // hydrated group, can run far past it.
@@ -143,7 +136,7 @@ impl SinkPlan {
                 append_survivors(map, chunk, keeper, &ranges[..taken]);
                 Ok(*left <= 0)
             }
-            Kind::Rows { keeper, cut: Some(Cut::TopK(top)) } => {
+            Kind::TopK { keeper, top } => {
                 let before = keeper.len();
                 append_survivors(map, chunk, keeper, ranges);
                 top.summed = top
@@ -176,14 +169,13 @@ impl SinkPlan {
     /// The reply: the kept rows, or one partial row per group.
     pub fn finish(self) -> Batch {
         match self.kind {
-            Kind::Rows { mut keeper, cut, .. } => {
-                // The keeper is the reply now: shed an ordered keeper down to
-                // the smallest superset the client can still cut exactly. At or
-                // below the window that cuts nothing.
-                if let Some(Cut::TopK(mut top)) = cut {
-                    if top.summed > top.window {
-                        top.trim(&mut keeper);
-                    }
+            Kind::Rows(keeper) | Kind::Prefix { keeper, .. } => keeper,
+            Kind::TopK { mut keeper, mut top } => {
+                // The keeper is the reply now: shed it down to the smallest
+                // superset the client can still cut exactly. At or below the
+                // window that cuts nothing.
+                if top.summed > top.window {
+                    top.trim(&mut keeper);
                 }
                 keeper
             }
@@ -225,8 +217,8 @@ impl TopK {
     }
 }
 
-/// Append one chunk's survivor ranges onto the keeper — straight, or through the
-/// map. There is no intermediate survivor batch and no mapped batch.
+/// Append one chunk's survivor ranges onto the keeper, through the map when there
+/// is one.
 fn append_survivors(map: Option<&mut MapPlan>, chunk: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
     match map {
         None => keeper.append_ranges(&chunk.as_mem_batch(), ranges),

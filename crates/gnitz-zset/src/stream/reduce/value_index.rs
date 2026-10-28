@@ -10,7 +10,7 @@
 //! The ordinal names the aggregate, so `MIN(a)` and `MAX(a)` never collide, and
 //! a MAX image is complemented, so each ordinal's first entry is its extreme.
 
-use crate::algebra::ReindexPacker;
+use crate::algebra::KeyPacker;
 use crate::algebra::{image_slot_col, ImageCol, IMAGE_COL};
 use crate::algebra::{Agg, AggValues};
 use crate::repr::{copy_runs, range_rows, Batch, ReadCursor};
@@ -45,7 +45,7 @@ struct IndexedAgg {
 /// The value index a reduce's plan carries, baked once at compile time.
 pub(super) struct ValueIndex {
     /// Packs a row's group columns into the key's leading bytes.
-    key_packer: ReindexPacker,
+    key_packer: KeyPacker,
     pub(super) schema: SchemaDescriptor,
     aggs: Vec<IndexedAgg>,
 }
@@ -67,7 +67,7 @@ impl ValueIndex {
         let has_wide = aggs.iter().any(|a| a.image.is_wide());
         let has_payload = aggs.iter().any(|a| !a.image.fits_slot());
         let suffix = [ORDINAL_COL, image_slot_col(has_wide)];
-        let (key_packer, mut b) = ReindexPacker::new_group_key(src, group_cols, &suffix)?;
+        let (key_packer, mut b) = KeyPacker::new_group_key(src, group_cols, &suffix)?;
         if has_payload {
             b.push(IMAGE_COL);
         }

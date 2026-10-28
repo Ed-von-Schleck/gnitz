@@ -1,25 +1,21 @@
-//! The operator key composers: the hashed key bytes of a string column's content
-//! and a group key's fold slot, and [`ReindexPacker`], which packs a reindex
-//! column list into the contiguous OPK region a `_join_pk` or a group key holds.
-//! The reindex Map keys rows through it and the exchange scatter routes by the
-//! bytes it packs, so the reindexed trace side and the scattered delta
-//! co-partition byte-for-byte. [`index_entries`] is a secondary index's
-//! projection of its owner's rows, and [`spans`] their spans alone.
+//! The operator key composers: [`FoldCols`], the XXH3-128 row digest — a
+//! packed group key's fold slot, a fold-keyed `_group_pk`, a hash-row map's PK —
+//! and [`KeyPacker`], which packs a join key, a group key or an index span into a
+//! contiguous OPK region. The reindex Map keys rows through it and the exchange
+//! scatter routes by the bytes it packs, so the reindexed trace side and the
+//! scattered delta co-partition byte-for-byte.
 
 use std::cell::Cell;
 
 use gnitz_expr::{BatchView, ColumnLocator};
-use gnitz_wire::RowSource;
-use gnitz_wire::{TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS};
+use gnitz_wire::{zip_cells, RowSource, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS};
 
-use crate::repr::{copy_runs, range_rows, runs_where, write_to_batch, Batch, MemBatch};
-
+use crate::repr::range_rows;
 use crate::schema::key::{KeySpec, PADDING_LOCATOR};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 
 // ---------------------------------------------------------------------------
-// Row-content key material — the hashed key bytes, for the slots no scalar OPK
-// encode can produce: a string column's content and the group key's fold slot.
+// Key columns
 // ---------------------------------------------------------------------------
 
 /// Column `c` of `schema` as a key column, `what` naming the key in a refusal.
@@ -37,6 +33,29 @@ pub(crate) fn locate_key_col(
     }
     Ok((col, loc))
 }
+
+/// Where `locs` lie in the PK region, as `(at, n)`, when they are consecutive PK
+/// columns.
+pub(crate) fn pk_run(locs: &[ColumnLocator]) -> Option<(usize, usize)> {
+    let &ColumnLocator::Pk { byte_off: at, .. } = locs.first()? else {
+        return None;
+    };
+    let mut end = at as usize;
+    locs.iter()
+        .all(|l| match *l {
+            ColumnLocator::Pk { byte_off, size, .. } if byte_off as usize == end => {
+                end += size as usize;
+                true
+            }
+            _ => false,
+        })
+        .then_some((at as usize, end - at as usize))
+}
+
+// ---------------------------------------------------------------------------
+// Row digest — the hashed key bytes no scalar OPK encode produces: a string
+// column's content and a group key's fold slot.
+// ---------------------------------------------------------------------------
 
 /// Append one column's key bytes to `buf`: a null marker, then a German string's
 /// content behind its 4-byte LE length — which keeps "ab"+"c" from aliasing
@@ -145,7 +164,7 @@ const _: () = assert!(MAX_PK_COLUMNS - 1 <= 8 * BITMAP_BYTES);
 const _: () = assert!(MAX_PK_COLUMNS * TypeCode::U128.wire_stride() <= MAX_PK_BYTES);
 
 // ---------------------------------------------------------------------------
-// ReindexPacker — the synthetic-key composer
+// KeyPacker — the synthetic-key composer
 // ---------------------------------------------------------------------------
 
 /// One key column: where its source value lives, and the key column it packs
@@ -156,19 +175,12 @@ struct KeyCol {
     out: SchemaColumn,
 }
 
-impl KeyCol {
-    /// Padding for the fixed array's unused slots; nothing reads past `n`.
-    const EMPTY: KeyCol = KeyCol {
-        loc: PADDING_LOCATOR,
-        out: SchemaColumn::new(TypeCode::U8, false),
-    };
-}
-
-/// Packs a reindex column list into a contiguous OPK PK region.
-pub(crate) struct ReindexPacker {
-    /// `cols[..n]` are the packed columns, between the bitmap and the fold.
+/// Packs a join key, a group key or an index span into a contiguous OPK region.
+pub(crate) struct KeyPacker {
+    /// The packed columns in key order, between the bitmap and the fold: the
+    /// first `n_cols`. Inline, so a span's packer built per batch allocates nothing.
     cols: [KeyCol; MAX_PK_COLUMNS],
-    n: u8,
+    n_cols: u8,
     pub(crate) out_stride: usize,
     /// Group key only: a leading `U8` slot, bit *i* set iff packed column *i* is
     /// NULL.
@@ -178,7 +190,7 @@ pub(crate) struct ReindexPacker {
     fold: FoldCols,
 }
 
-impl ReindexPacker {
+impl KeyPacker {
     /// The packer for a join key: each slot's source column at its slot type,
     /// tightly packed. A key list off the wire is refused, never panicked on.
     pub(crate) fn new(schema: &SchemaDescriptor, key: &[gnitz_wire::ReindexSlot]) -> Result<Self, String> {
@@ -209,34 +221,34 @@ impl ReindexPacker {
     /// The packer over `packed` — each column and its slot type — its stride the
     /// sum of [`Self::key_columns`].
     fn finish(packed: impl IntoIterator<Item = (ColumnLocator, TypeCode)>, has_bitmap: bool, fold: FoldCols) -> Self {
-        let mut packer = ReindexPacker {
-            cols: [KeyCol::EMPTY; MAX_PK_COLUMNS],
-            n: 0,
+        let mut cols = [KeyCol { loc: PADDING_LOCATOR, out: BITMAP_COL }; MAX_PK_COLUMNS];
+        let mut n_cols = 0;
+        for (loc, tc) in packed {
+            cols[n_cols] = KeyCol { loc, out: SchemaColumn::new(tc, false) };
+            n_cols += 1;
+        }
+        let mut packer = KeyPacker {
+            cols,
+            n_cols: n_cols as u8,
             out_stride: 0,
             has_bitmap,
             fold,
         };
-        for (loc, tc) in packed {
-            packer.cols[packer.n as usize] = KeyCol { loc, out: SchemaColumn::new(tc, false) };
-            packer.n += 1;
-        }
         packer.out_stride = packer.key_columns().map(|c| c.size()).sum();
         packer
     }
 
     /// The packed columns, in key order.
-    fn columns(&self) -> &[KeyCol] {
-        &self.cols[..self.n as usize]
+    #[inline(always)]
+    fn cols(&self) -> &[KeyCol] {
+        &self.cols[..self.n_cols as usize]
     }
 
     /// The output PK columns this packer's bytes fill, in key order.
     fn key_columns(&self) -> impl Iterator<Item = SchemaColumn> + '_ {
         let bitmap = self.has_bitmap.then_some(BITMAP_COL);
         let fold = (!self.fold.is_empty()).then_some(FOLD_COL);
-        bitmap
-            .into_iter()
-            .chain(self.columns().iter().map(|c| c.out))
-            .chain(fold)
+        bitmap.into_iter().chain(self.cols().iter().map(|c| c.out)).chain(fold)
     }
 
     /// The columns, when the packed key is their own OPK images laid end to end.
@@ -247,33 +259,9 @@ impl ReindexPacker {
                 && c.out.size() == c.loc.size()
                 && gnitz_wire::opk_bias(src) == gnitz_wire::opk_bias(c.out.type_code)
         };
-        let cols = self.columns();
+        let cols = self.cols();
         (!self.has_bitmap && self.fold.is_empty() && cols.iter().all(identity))
             .then(|| cols.iter().map(|c| c.loc).collect())
-    }
-
-    /// Every column is packed: none is folded into the trailing hash slot.
-    pub(crate) fn packs_whole(&self) -> bool {
-        self.fold.is_empty()
-    }
-
-    /// Where the key lies in the input's own PK region, as `(at, n)`, when it is
-    /// consecutive PK columns' own images.
-    pub(crate) fn pk_range(&self) -> Option<(usize, usize)> {
-        let locs = self.identity_columns()?;
-        let &ColumnLocator::Pk { byte_off: at, .. } = locs.first()? else {
-            return None;
-        };
-        let mut end = at as usize;
-        locs.iter()
-            .all(|l| match *l {
-                ColumnLocator::Pk { byte_off, size, .. } if byte_off as usize == end => {
-                    end += size as usize;
-                    true
-                }
-                _ => false,
-            })
-            .then_some((at as usize, end - at as usize))
     }
 
     /// `row`'s packed key of at most 16 bytes, widened as `widen_pk_be` does.
@@ -369,7 +357,7 @@ impl ReindexPacker {
         let null_word = batch.get_null_word(row);
         let mut off = usize::from(self.has_bitmap) * BITMAP_BYTES;
         let mut null_bits = 0u8;
-        for (i, &KeyCol { loc, out }) in self.columns().iter().enumerate() {
+        for (i, &KeyCol { loc, out }) in self.cols().iter().enumerate() {
             let w = out.size();
             let cell = &mut dst[off..off + w];
             off += w;
@@ -397,22 +385,9 @@ impl ReindexPacker {
         }
     }
 
-    /// Every row of `batch` with its packed key.
-    pub(crate) fn for_each_key<B: BatchView>(&self, batch: &B, mut f: impl FnMut(usize, &[u8])) {
-        let (rows, width) = (batch.row_count(), self.out_stride);
-        let mut keys = vec![0u8; rows.min(KEY_CHUNK) * width];
-        for start in (0..rows).step_by(KEY_CHUNK) {
-            let n = (rows - start).min(KEY_CHUNK);
-            self.pack_rows(&mut keys, width, batch, &[(start, start + n)]);
-            for (i, key) in keys.chunks_exact(width).take(n).enumerate() {
-                f(start + i, key);
-            }
-        }
-    }
-
     /// Whether [`Self::pack_rows`] packs a column at a time.
     pub(crate) fn packs_by_column(&self) -> bool {
-        self.fold.is_empty() && self.columns().iter().all(|c| !c.loc.type_code().is_german_string())
+        self.fold.is_empty() && self.cols().iter().all(|c| !c.loc.type_code().is_german_string())
     }
 
     /// [`Self::pack_into`] for the rows of `runs` — ascending `[start, end)` — in order,
@@ -433,7 +408,7 @@ impl ReindexPacker {
         if self.has_bitmap {
             dst.chunks_exact_mut(stride).for_each(|key| key[0] = 0);
         }
-        for (i, &KeyCol { loc, out }) in self.columns().iter().enumerate() {
+        for (i, &KeyCol { loc, out }) in self.cols().iter().enumerate() {
             let (sw, dw) = (loc.size(), out.size());
             let col = IntCol {
                 dst: &mut *dst,
@@ -471,9 +446,6 @@ impl ReindexPacker {
         }
     }
 }
-
-/// Rows [`ReindexPacker::for_each_key`] packs per [`ReindexPacker::pack_rows`] call.
-const KEY_CHUNK: usize = 256;
 
 /// One integer key column's slot, at `off` of each of `dst`'s keys: one key per
 /// row of `runs`, in order.
@@ -560,14 +532,7 @@ impl IntCol<'_> {
             let (keys, rest) = std::mem::take(&mut dst).split_at_mut((e - s) * stride);
             dst = rest;
             let src = &src[s * src_stride..e * src_stride];
-            let keys = keys.chunks_exact_mut(stride);
-            match src_stride == SW {
-                true => src.as_chunks::<SW>().0.iter().zip(keys).for_each(|(c, k)| encode(c, k)),
-                false => src
-                    .chunks_exact(src_stride)
-                    .zip(keys)
-                    .for_each(|(row, k)| encode(row[src_off..src_off + SW].try_into().unwrap(), k)),
-            }
+            zip_cells::<SW, _>(src, src_stride, src_off, keys.chunks_exact_mut(stride), encode);
         }
     }
 }
@@ -589,89 +554,10 @@ fn promote_image(image: u128, src: TypeCode, out: TypeCode) -> u128 {
     v
 }
 
-// ---------------------------------------------------------------------------
-// Secondary-index entries
-// ---------------------------------------------------------------------------
-
-/// The row runs of `mb` that `spec` indexes — no NULL in an indexed column — and whose
-/// weight `keep` admits.
-fn indexed_runs(mb: &MemBatch<'_>, spec: &KeySpec, keep: impl Fn(i64) -> bool) -> Vec<(usize, usize)> {
-    let indexed_slots = spec.locators().iter().fold(0, |slots, loc| slots | loc.null_bit());
-    let weights = mb.weight().as_chunks::<8>().0;
-    let nulls = mb.null_bmp().as_chunks::<8>().0;
-    runs_where(weights.len(), |row| {
-        keep(i64::from_le_bytes(weights[row])) && u64::from_le_bytes(nulls[row]) & indexed_slots == 0
-    })
-}
-
-/// The `spec` span of each positive-weight row of `mb` that `spec` indexes, in row order.
-pub fn spans(mb: &MemBatch<'_>, spec: &KeySpec) -> Vec<u8> {
-    let runs = indexed_runs(mb, spec, |w| w > 0);
-    let key_size = spec.key_size();
-    let mut out = vec![0; range_rows(&runs) * key_size];
-    ReindexPacker::of_span(spec).pack_rows(&mut out, key_size, mb, &runs);
-    out
-}
-
-/// Each nonzero-weight row of `source` that `spec` indexes, as its index entry
-/// `[span ‖ source PK]` at that row's weight, in source order. A row NULL in an
-/// indexed column has no entry.
-pub fn index_entries(source: &Batch, spec: &KeySpec, idx_schema: &SchemaDescriptor) -> Batch {
-    /// Copy each `runs` row's `W`-byte PK behind its entry's span.
-    #[inline(always)]
-    fn suffix<const W: usize>(
-        entries: &mut [u8],
-        idx_stride: usize,
-        key_size: usize,
-        pks: &[u8],
-        runs: &[(usize, usize)],
-    ) {
-        let mut entries = entries.chunks_exact_mut(idx_stride);
-        for &(s, e) in runs {
-            // The PKs lead the zip: it stops on them without taking an entry it leaves unwritten.
-            for (pk, entry) in pks[s * W..e * W].as_chunks::<W>().0.iter().zip(entries.by_ref()) {
-                let d: &mut [u8; W] = (&mut entry[key_size..]).try_into().unwrap();
-                *d = *pk;
-            }
-        }
-    }
-
-    let (idx_stride, key_size) = (idx_schema.pk_stride(), spec.key_size());
-    let src_stride = source.schema().pk_stride();
-    assert_eq!(idx_stride, key_size + src_stride, "index schema of another spec");
-    let mb = source.as_mem_batch();
-    let runs = indexed_runs(&mb, spec, |w| w != 0);
-    let rows = range_rows(&runs);
-    write_to_batch(idx_schema, rows, 0, |w| {
-        let (entries, weights, nulls) = w.fixed_mut();
-        ReindexPacker::of_span(spec).pack_rows(entries, idx_stride, &mb, &runs);
-        let pks = source.pk();
-        match src_stride {
-            4 => suffix::<4>(entries, idx_stride, key_size, pks, &runs),
-            8 => suffix::<8>(entries, idx_stride, key_size, pks, &runs),
-            16 => suffix::<16>(entries, idx_stride, key_size, pks, &runs),
-            24 => suffix::<24>(entries, idx_stride, key_size, pks, &runs),
-            32 => suffix::<32>(entries, idx_stride, key_size, pks, &runs),
-            _ => {
-                let mut entries = entries.chunks_exact_mut(idx_stride);
-                for &(s, e) in &runs {
-                    let pks = pks[s * src_stride..e * src_stride].chunks_exact(src_stride);
-                    for (pk, entry) in pks.zip(entries.by_ref()) {
-                        entry[key_size..].copy_from_slice(pk);
-                    }
-                }
-            }
-        }
-        copy_runs::<8>(source.weight(), weights, runs.iter().copied(), 8);
-        // An index entry is all key: it has no payload column to be NULL.
-        nulls.fill(0);
-    })
-}
-
 #[cfg(test)]
-#[path = "tests/reindex.rs"]
+#[path = "tests/key_pack.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "benches/reindex.rs"]
+#[path = "benches/key_pack.rs"]
 mod bench;

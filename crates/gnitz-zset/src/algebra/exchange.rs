@@ -1,9 +1,9 @@
 //! The scatter plan of a worker exchange: [`ScatterPlan`] and the per-row
 //! routing-key kernels.
 
-use super::route::{ground_owner, worker_for_key, worker_for_pk_bytes, Placement, Slot};
-use crate::algebra::group_key::{cell_image, for_key_cells, GroupKey, KeyCells};
-use crate::algebra::reindex::{FoldCols, ReindexPacker};
+use super::group_key::{cell_image, for_key_cells, GroupKey, KeyCells};
+use super::key_pack::{FoldCols, KeyPacker};
+use super::route::{ground_owner, worker_for_key, worker_for_pk_bytes, worker_for_wide_pk, Placement, Slot};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::zip_cells;
@@ -21,7 +21,7 @@ impl ScatterPlan {
 
     /// An equi-join key, keyed by the `_join_pk` the reindex Map packs from `slots`.
     pub fn join(schema: &SchemaDescriptor, slots: &[gnitz_wire::ReindexSlot]) -> Result<Self, String> {
-        Ok(ScatterPlan(Some(GroupKey::packed(ReindexPacker::new(schema, slots)?))))
+        Ok(ScatterPlan(Some(GroupKey::packed(KeyPacker::new(schema, slots)?))))
     }
 
     /// The route a relation's own rows are placed by. Panics on `Placement::Local`,
@@ -85,7 +85,10 @@ impl ScatterPlan {
             Some(ref key) => match key.cells(mb) {
                 Some(cells) => for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(&cells, mb.weight(), sink, nw)),
                 None => match *key {
-                    GroupKey::PkRange { at, n } => route_rows(mb, sink, PkRangeW { at, n, nw }),
+                    GroupKey::PkRange { at, n } => {
+                        debug_assert!(n > gnitz_wire::NARROW_PK_MAX_BYTES, "a narrow PK range is one cell");
+                        route_rows(mb, sink, PkRangeW { at, n, nw })
+                    }
                     GroupKey::Packed(ref packer) => route_rows_packed(mb, sink, packer, nw),
                     // The one group of no columns has one owner, and no key to hash.
                     GroupKey::Fold(ref fold) if fold.is_empty() => route_rows(mb, sink, Owner(ground_owner(nw))),
@@ -134,7 +137,7 @@ trait RowWorker {
     fn worker(&self, mb: &MemBatch, row: usize) -> usize;
 }
 
-/// A PK range [`GroupKey::cells`] does not answer for.
+/// A PK range wider than a key cell, routed by its hash.
 struct PkRangeW {
     at: usize,
     n: usize,
@@ -144,7 +147,7 @@ struct PkRangeW {
 impl RowWorker for PkRangeW {
     #[inline(always)]
     fn worker(&self, mb: &MemBatch, row: usize) -> usize {
-        worker_for_pk_bytes(mb.get_pk_range(row, self.at, self.n), self.nw)
+        worker_for_wide_pk(mb.get_pk_range(row, self.at, self.n), self.nw)
     }
 }
 
@@ -191,14 +194,23 @@ fn route_cells<const W: usize, const OPK: bool>(cells: &KeyCells, weights: &[u8]
     });
 }
 
+/// Rows [`route_rows_packed`] packs per [`KeyPacker::pack_rows`] call.
+const KEY_CHUNK: usize = 256;
+
 /// [`route_rows`] for a packed key, packed a chunk of rows at a time.
 #[inline(never)]
-fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &ReindexPacker, nw: usize) {
-    packer.for_each_key(mb, |row, key| {
-        if mb.get_weight(row) != 0 {
-            sink.put(worker_for_pk_bytes(key, nw), row as u32);
+fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker, nw: usize) {
+    let (rows, width) = (mb.count, packer.out_stride);
+    let mut keys = vec![0u8; rows.min(KEY_CHUNK) * width];
+    for start in (0..rows).step_by(KEY_CHUNK) {
+        let n = (rows - start).min(KEY_CHUNK);
+        packer.pack_rows(&mut keys, width, mb, &[(start, start + n)]);
+        for (row, key) in (start..).zip(keys.chunks_exact(width).take(n)) {
+            if mb.get_weight(row) != 0 {
+                sink.put(worker_for_pk_bytes(key, nw), row as u32);
+            }
         }
-    });
+    }
 }
 
 // ---------------------------------------------------------------------------

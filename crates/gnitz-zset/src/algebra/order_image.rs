@@ -1,5 +1,6 @@
 //! Order images: the byte strings whose plain lexicographic order *is* a
-//! column's typed order, the keys of the indexes that walk a column in order.
+//! column's typed order — the keys of the indexes that walk a column in order,
+//! and the form a scalar MIN/MAX holds its running extreme in.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -53,8 +54,8 @@ impl WideKind {
 #[derive(Clone, Copy)]
 pub(crate) struct ImageCol {
     pub(crate) loc: ColumnLocator,
-    pub(super) kind: ImageKind,
-    pub(super) invert: bool,
+    kind: ImageKind,
+    invert: bool,
 }
 
 impl ImageCol {
@@ -107,7 +108,10 @@ impl ImageCol {
             ImageKind::Wide(WideKind::Bytes) => {
                 let at = whole.len();
                 append_bytes_image(*invert, &loc.content(src, row), whole);
-                write_image_slot(slot, &whole[at..]);
+                let image = &whole[at..];
+                let take = image.len().min(slot.len());
+                slot[..take].copy_from_slice(&image[..take]);
+                slot[take..].fill(0);
             }
         }
     }
@@ -167,14 +171,6 @@ fn append_bytes_image(invert: bool, content: &[u8], out: &mut Vec<u8>) {
 fn int16_image(loc: &ColumnLocator, invert: bool, src: &impl RowSource, row: usize) -> [u8; 16] {
     let image = loc.opk_image(src, row);
     (if invert { !image } else { image }).to_be_bytes()
-}
-
-/// Write `image` into an index key slot, zero-padding or truncating to its width.
-#[inline]
-fn write_image_slot(slot: &mut [u8], image: &[u8]) {
-    let take = image.len().min(slot.len());
-    slot[..take].copy_from_slice(&image[..take]);
-    slot[take..].fill(0);
 }
 
 /// [`append_bytes_image`]'s and [`int16_image`]'s inverse: the native bytes back

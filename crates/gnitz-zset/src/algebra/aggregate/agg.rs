@@ -361,7 +361,7 @@ impl Agg {
     #[inline(always)]
     pub(crate) fn index_image(&self) -> Option<ImageCol> {
         match self.kind {
-            StepKind::Extreme { max, kind } => Some(ImageCol { loc: self.src, kind, invert: max }),
+            StepKind::Extreme { max, .. } => Some(ImageCol::new(self.src, max)),
             _ => None,
         }
     }

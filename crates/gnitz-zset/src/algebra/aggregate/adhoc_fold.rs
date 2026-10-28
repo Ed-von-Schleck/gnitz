@@ -44,7 +44,7 @@ impl AdhocFold {
         let mut groups = Batch::empty_with_schema(&leading);
         if shape.key.is_global() {
             // A global fold's one group exists over no input: every worker emits it.
-            groups.push_key_row(ground_pk().bytes(), 1);
+            groups.push_key_row(&ground_pk(), 1);
         }
         Ok(AdhocFold {
             vals: AggValues::new(&shape.aggs, groups.len()),
@@ -65,6 +65,10 @@ impl AdhocFold {
     /// group state. `Err` past the per-worker group cap.
     pub(crate) fn fold_ranges(&mut self, chunk: &Batch, ranges: &[(usize, usize)]) -> Result<(), String> {
         let mb = chunk.as_mem_batch();
+        debug_assert!(
+            ranges.iter().flat_map(|&(s, e)| s..e).all(|r| mb.get_weight(r) > 0),
+            "adhoc fold: scan cursor must deliver positive weights"
+        );
         if self.shape.key.is_global() {
             for k in 0..self.shape.aggs.len() {
                 self.vals.fold(k, &mb, ranges, RangeGroups::FIRST);
@@ -119,35 +123,27 @@ impl IdentityLoop for AssignGroups<'_> {
     type Out = Result<(), String>;
 
     fn run(self, identity: impl Fn(usize) -> u128) -> Self::Out {
-        let AssignGroups {
-            key,
-            groups,
-            numbers,
-            ord,
-            group_cap,
-            mb,
-            ranges,
-        } = self;
-        for row in ranges.iter().flat_map(|&(s, e)| s..e) {
-            debug_assert!(
-                mb.get_weight(row) > 0,
-                "adhoc fold: scan cursor must deliver positive weights"
-            );
-            let g = numbers.ordinal(identity(row), || {
-                let g = groups.len();
-                if g >= group_cap {
+        for row in self.ranges.iter().flat_map(|&(s, e)| s..e) {
+            let g = self.numbers.ordinal(identity(row), || {
+                let g = self.groups.len();
+                if g >= self.group_cap {
                     return Err(format!(
-                        "GROUP BY exceeds {group_cap} distinct groups for ad-hoc execution; \
-                         CREATE VIEW to maintain this aggregation incrementally"
+                        "GROUP BY exceeds {} distinct groups for ad-hoc execution; \
+                         CREATE VIEW to maintain this aggregation incrementally",
+                        self.group_cap
                     ));
                 }
-                groups.begin_row(key.out_pk(mb, row).bytes(), 1);
-                groups.append_cells_from(key.carried(), mb, row);
-                groups.commit_row();
+                self.groups.begin_row(self.key.out_pk(self.mb, row).bytes(), 1);
+                self.groups.append_cells_from(self.key.carried(), self.mb, row);
+                self.groups.commit_row();
                 Ok(g as u32)
             })?;
-            ord.push(g);
+            self.ord.push(g);
         }
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "benches/adhoc_fold.rs"]
+mod bench;

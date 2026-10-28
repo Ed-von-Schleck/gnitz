@@ -7,19 +7,18 @@
 
 use gnitz_expr::{ColCopy, ColumnLocator, LogicalProgram, MapEval};
 
-use super::reindex::{locate_key_col, FoldCols, ReindexPacker};
+use super::key_pack::{locate_key_col, pk_run, FoldCols, KeyPacker};
 use crate::repr::{copy_runs, Batch, DirectWriter};
 use crate::schema::{project_schema, DerivedSchema, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::{int_cell, zip_cells, FixedInt, TypeCode};
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
-/// `[dst, dst + n)`: one value rather than three positional `usize`s a
-/// [`copy_column`] caller can transpose.
+/// `[dst, dst + n)`.
 #[derive(Clone, Copy)]
-pub(crate) struct RowWindow {
-    pub(crate) src: usize,
-    pub(crate) dst: usize,
-    pub(crate) n: usize,
+struct RowWindow {
+    src: usize,
+    dst: usize,
+    n: usize,
 }
 
 /// Average survivor-run length below which a map that computes, or that copies
@@ -31,19 +30,19 @@ const COMPACT_RUN_LEN: usize = 128;
 /// per-range setup is smaller.
 const PACK_COMPACT_RUN_LEN: usize = 24;
 
-/// Where a map's output PK region comes from. Owned by the plan rather than
-/// passed per call, so the region cannot be left unwritten between two
-/// statements and no caller can pair a plan with the wrong stamp.
+/// Where a map's output PK region comes from.
 enum PkSource {
     /// Copy the input PK region verbatim, into an output schema whose PK is the
     /// input's.
     Inherit,
     /// Pack the reindex columns' OPK bytes contiguously into the output PK — the
-    /// `_join_pk` of an equijoin / GROUP BY repartition. The output stride
-    /// legitimately differs from the input's (U64 input → U128 synthetic PK).
+    /// `_join_pk` of an equijoin / GROUP BY repartition. Its stride is the key
+    /// slots' summed widths, which may differ from the input's: a slot can be
+    /// wider than its column (U64 joined with I64 packs as I128), and a string
+    /// key packs as a U128 hash.
     /// A row with any of the `drop_nulls` null bits set is dropped: a
     /// [`gnitz_wire::NullKeys::Drop`] reindex's nullable key columns.
-    Pack { packer: ReindexPacker, drop_nulls: u64 },
+    Pack { packer: KeyPacker, drop_nulls: u64 },
     /// Hash each output row's payload columns into its PK.
     HashRow(FoldCols),
 }
@@ -52,14 +51,9 @@ enum PkSource {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Rebase the string columns [`copy_column`] wrote for `copies`, their cells
+/// Rebase the string columns [`copy_window`] wrote for `copies`, their cells
 /// read from `src_blob`, onto the heap [`Batch::carry_heap`] left at `heap_at`.
-pub(crate) fn rebase_copied_strings(
-    copies: &[ColCopy],
-    output: &mut DirectWriter<'_>,
-    src_blob: &[u8],
-    heap_at: Option<usize>,
-) {
+fn rebase_copied_strings(copies: &[ColCopy], output: &mut DirectWriter<'_>, src_blob: &[u8], heap_at: Option<usize>) {
     for c in copies {
         if matches!(c.src, ColumnLocator::Payload { type_code, .. } if type_code.is_german_string()) {
             output.rebase_string_col(c.slot, gnitz_wire::Heap::Plain(src_blob), heap_at);
@@ -67,40 +61,62 @@ pub(crate) fn rebase_copied_strings(
     }
 }
 
-/// Copy a single column from `in_batch` to `output` over `w`, a German-string
-/// cell verbatim: the caller rebases the column. The source is read at its own
-/// type's width and sign/zero-extended into a wider (promoted) destination slot.
-pub(crate) fn copy_column(
+/// Copy `copies` of `src` rows `0..n` onto `out` rows `0..n`, each German-string
+/// column rebased onto the heap [`Batch::carry_heap`] left at `heap_at`.
+pub(crate) fn copy_columns(
+    src: &Batch,
+    out: &mut DirectWriter<'_>,
+    copies: &[ColCopy],
+    n: usize,
+    heap_at: Option<usize>,
+) {
+    copy_window(src, out, copies, RowWindow { src: 0, dst: 0, n });
+    rebase_copied_strings(copies, out, src.blob(), heap_at);
+}
+
+/// Copy `copies` of `in_batch` onto `output` over `w`, a German-string cell
+/// verbatim: the caller rebases those columns.
+fn copy_window(in_batch: &Batch, output: &mut DirectWriter<'_>, copies: &[ColCopy], w: RowWindow) {
+    for c in copies {
+        copy_column(in_batch, output, c, w);
+    }
+}
+
+/// [`copy_window`] for one column. The source is read at its own type's width and
+/// sign/zero-extended into a wider (promoted) destination slot. Out of line:
+/// inlined into the loop over copies, the PK arm's setup is hoisted into a
+/// prologue every window pays, payload-only ones included.
+#[inline(never)]
+fn copy_column(
     in_batch: &Batch,
     output: &mut DirectWriter<'_>,
     &ColCopy {
         src: src_loc,
         slot: dst_payload,
-        width: stride,
+        width: dw,
     }: &ColCopy,
     w: RowWindow,
 ) {
     let RowWindow { src: src_start, dst: dst_base, n } = w;
-    // Destructured once, so each arm below is one column kernel over the window.
+    let dst = &mut output.col_mut(dst_payload)[dst_base * dw..(dst_base + n) * dw];
     match src_loc {
         ColumnLocator::Pk { byte_off, size, type_code } => {
             // The PK region holds OPK bytes, decoded back to native LE at the
             // source column's own width.
             let pk_stride = in_batch.schema().pk_stride();
             let pk = &in_batch.pk()[src_start * pk_stride..(src_start + n) * pk_stride];
-            let dst = &mut output.col_mut(dst_payload)[dst_base * stride..(dst_base + n) * stride];
             let (off, src_stride) = (byte_off as usize, size as usize);
-            if src_stride == stride {
-                gnitz_wire::decode_pk_cells(pk, pk_stride, off, stride, type_code.is_signed_int(), dst);
+            if src_stride == dw {
+                gnitz_wire::decode_pk_cells(pk, pk_stride, off, dw, type_code.is_signed_int(), dst);
             } else {
-                widen_column::<true>(pk, pk_stride, off, type_code, stride, dst);
+                widen_column::<true>(pk, pk_stride, off, type_code, dw, dst);
             }
         }
         ColumnLocator::Payload { slot, size, type_code } => {
             let in_pi = slot as usize;
-            let src_stride = size as usize; // source read width
+            let src_stride = size as usize;
             debug_assert!(
-                !type_code.is_german_string() || (src_stride, stride) == (16, 16),
+                !type_code.is_german_string() || (src_stride, dw) == (16, 16),
                 "German-string column moved at a non-16-byte stride",
             );
             debug_assert!(
@@ -109,11 +125,10 @@ pub(crate) fn copy_column(
                 src_start + n
             );
             let src = &in_batch.col_data(in_pi)[src_start * src_stride..(src_start + n) * src_stride];
-            let dst = &mut output.col_mut(dst_payload)[dst_base * stride..(dst_base + n) * stride];
-            if src_stride == stride {
+            if src_stride == dw {
                 dst.copy_from_slice(src);
             } else {
-                widen_column::<false>(src, src_stride, 0, type_code, stride, dst);
+                widen_column::<false>(src, src_stride, 0, type_code, dw, dst);
             }
         }
     }
@@ -159,7 +174,6 @@ fn widen_cells<const DW: usize, const PK: bool>(
 /// where the output PK comes from, and the output schema it stamps.
 pub struct MapPlan {
     ev: MapEval,
-    /// Where the output PK region comes from.
     pk_source: PkSource,
     output_schema: SchemaDescriptor,
 }
@@ -204,8 +218,7 @@ fn hashrow_output_schema(
     let mut b = DerivedSchema::new();
     b.push_pk(SchemaColumn::new(TypeCode::U128, false));
     for &(c, t) in cols {
-        // A key column, not merely an in-range one — the screen the reindex and
-        // top-N key kinds clear at this same boundary.
+        // A key column: a float is refused, as for a reindex key.
         let (src, _) = locate_key_col(in_schema, c, "hash-row map")?;
         b.push(SchemaColumn::new(t, src.nullable));
     }
@@ -222,7 +235,7 @@ impl MapPlan {
             gnitz_wire::MapKind::Compute(map) => return Self::from_compute_map(in_schema, map),
 
             gnitz_wire::MapKind::Reindex { keep, key, nulls, .. } => {
-                let packer = ReindexPacker::new(in_schema, key)?;
+                let packer = KeyPacker::new(in_schema, key)?;
                 let out_schema = packer.output_schema(in_schema, keep)?;
                 let drop_nulls = match nulls {
                     gnitz_wire::NullKeys::Drop => {
@@ -249,13 +262,12 @@ impl MapPlan {
                 (out_schema, LogicalProgram::copy_cols(cols), PkSource::Inherit)
             }
         };
-        Self::from_map(prog, in_schema, &out_schema, pk_source)
+        Self::from_map(prog, in_schema, out_schema, pk_source)
     }
 
     /// A computed projection: [`gnitz_wire::MapKind::Compute`]'s whole body, and
-    /// also a read spec's pre-map. The output schema is derived, never shipped —
-    /// the map inherits the input's PK region verbatim ([`PkSource::Inherit`]),
-    /// so no caller can describe a PK region the map does not produce.
+    /// also a read spec's pre-map. The PK region is the input's, copied verbatim
+    /// ([`PkSource::Inherit`]); the payload slots are the declared `out_cols`.
     pub(crate) fn from_compute_map(in_schema: &SchemaDescriptor, map: &gnitz_wire::ComputeMap) -> Result<Self, String> {
         // The input's PK region, then one payload column per declared
         // `(type_code, nullable)` slot. The declared slots are the layout;
@@ -267,10 +279,9 @@ impl MapPlan {
         }
         let out_schema = b.finish().map_err(|e| format!("compute map: output {e}"))?;
         // The only map whose program is client bytes; every other kind builds
-        // one from a column list. Rejected, not skipped: skipping a corrupt blob
-        // would leave the output at the default empty schema.
+        // one from a column list.
         let prog = LogicalProgram::from_blob(&map.program).map_err(|e| format!("map: invalid program: {e}"))?;
-        Self::from_map(prog, in_schema, &out_schema, PkSource::Inherit)
+        Self::from_map(prog, in_schema, out_schema, PkSource::Inherit)
     }
 
     /// Map plan from a logical expression program. A pure projection is the
@@ -280,17 +291,13 @@ impl MapPlan {
     fn from_map(
         logical: LogicalProgram,
         in_schema: &SchemaDescriptor,
-        out_schema: &SchemaDescriptor,
+        output_schema: SchemaDescriptor,
         pk_source: PkSource,
     ) -> Result<Self, String> {
         let ev = logical
-            .resolve_map(in_schema, out_schema)
+            .resolve_map(in_schema, &output_schema)
             .map_err(|e| format!("map: program/schema mismatch: {e}"))?;
-        Ok(MapPlan {
-            ev,
-            pk_source,
-            output_schema: *out_schema,
-        })
+        Ok(MapPlan { ev, pk_source, output_schema })
     }
 
     /// The schema this plan stamps on its output.
@@ -306,7 +313,11 @@ impl MapPlan {
         let PkSource::Pack { packer, drop_nulls } = &self.pk_source else {
             return None;
         };
-        packer.pk_range().filter(|&(at, _)| at == 0)?;
+        packer
+            .identity_columns()
+            .as_deref()
+            .and_then(pk_run)
+            .filter(|&(at, _)| at == 0)?;
         // A PK column is never NULL, and a reindex copies each kept column at
         // its own type.
         debug_assert!(*drop_nulls == 0 && !self.ev.emits_anything());
@@ -338,20 +349,17 @@ impl MapPlan {
             }
             _ => &whole,
         };
-        let n = crate::repr::range_rows(ranges);
-        if n == 0 {
-            return Batch::empty_with_schema(&self.output_schema);
-        }
-        // Uninitialized: `validate` makes every map write every payload slot,
-        // and the calls below cover the PK, weight and null regions.
-        let mut output = Batch::with_capacity(&self.output_schema, n);
+        // Sized exactly: a first reservation would round a small delta's rows up.
+        let mut output = Batch::with_capacity(&self.output_schema, crate::repr::range_rows(ranges));
         self.append_map_ranges(in_batch, &mut output, ranges);
         output
     }
 
     /// Map every `[start, end)` range of `src`, in order, onto the tail of `out`,
     /// which is in this plan's output schema. Ranges too short to feed the
-    /// per-window kernel are gathered into one first.
+    /// per-window kernel are gathered into one first. The ranges are mapped as
+    /// given: a [`gnitz_wire::NullKeys::Drop`] reindex's NULL-keyed rows are
+    /// dropped only by [`Self::evaluate_map_batch`].
     pub(crate) fn append_map_ranges(&mut self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)]) {
         let total = crate::repr::range_rows(ranges);
         if total == 0 {
@@ -372,10 +380,13 @@ impl MapPlan {
             Some(c) => (c, &whole[..]),
             None => (src, ranges),
         };
+        let mb = src.as_mem_batch();
         // Declined, the carry reserves for relocated copies and string emits alike.
-        let heap_at = out.carry_heap(&src.as_mem_batch(), self.ev.moves().string_slots(), ranges);
+        let heap_at = out.carry_heap(&mb, self.ev.moves().string_slots(), ranges);
+        // The reserved rows are uninitialized: `resolve_map` gives every output
+        // payload slot one sink, and the writes below cover the PK, weight and
+        // null regions.
         out.append_session(total).write(total, |out| {
-            let mb = src.as_mem_batch();
             match &self.pk_source {
                 PkSource::Inherit => {
                     let stride = src.schema().pk_stride();
@@ -393,9 +404,7 @@ impl MapPlan {
             let mut dst = 0;
             for &(start, end) in ranges {
                 let w = RowWindow { src: start, dst, n: end - start };
-                for c in self.ev.moves().copies() {
-                    copy_column(src, out, c, w);
-                }
+                copy_window(src, out, self.ev.moves().copies(), w);
                 self.ev.write_computed(&mb, start, w.n, out, dst);
                 dst += w.n;
             }
