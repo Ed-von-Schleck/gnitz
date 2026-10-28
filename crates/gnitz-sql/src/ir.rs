@@ -409,6 +409,14 @@ pub(crate) struct BinTypes {
     pub(crate) out: ColType,
 }
 
+impl BinTypes {
+    /// The range check the result ends in: DATE ± days is NULL outside DATE's
+    /// range, as every narrowing cast is.
+    pub(crate) fn result_check(&self) -> Option<FixedInt> {
+        (self.out.tc == TypeCode::Date).then_some(FixedInt::I32)
+    }
+}
+
 /// The [`BinTypes`] of `lt op rt`, the operand types read through
 /// [`operand_ty_pair`]; `Err` names the rule a pair the operator does not take
 /// breaks. `op` is any operator but `AND`/`OR`, which read two booleans.
@@ -761,9 +769,9 @@ impl<R> BExpr<R> {
     }
 
     /// The interval the integer this value's register holds lies in. A column
-    /// holds its type's, a CAST its target's, an integer literal is a point and
-    /// a BOOLEAN is 0 or 1; anything else computed may hold whatever its
-    /// register does, a DATE sum included.
+    /// holds its type's, a CAST its target's, an operator its result check's, an
+    /// integer literal is a point and a BOOLEAN is 0 or 1; anything else computed
+    /// is given its register's whole range.
     fn int_range(&self, t: &(impl LeafTyping<R> + ?Sized)) -> (i128, i128) {
         let point = |v: i128| (v, v);
         let stored = match self {
@@ -772,6 +780,10 @@ impl<R> BExpr<R> {
             BExpr::LitNull => return point(0),
             BExpr::ColRef(r) => FixedInt::from_type_code(t.decl(r).0.tc),
             BExpr::Cast { to, .. } => FixedInt::from_type_code(to.tc),
+            BExpr::BinOp(l, op, r) if !matches!(op, BinOp::And | BinOp::Or) => {
+                let (lt, rt) = operand_ty_pair(l, r, t);
+                bin_types(*op, lt, rt).ok().and_then(|b| b.result_check())
+            }
             _ => None,
         };
         let ty = self.infer_ty(t);
@@ -812,7 +824,9 @@ impl<R> BExpr<R> {
                 // A zero divisor is NULL.
                 let divides =
                     !matches!(op, BinOp::Div | BinOp::Mod) || matches!(r.as_ref(), BExpr::LitInt(n) if *n != 0);
-                divides && bin_types(*op, lt, rt).is_ok_and(|t| whole(l, lt, t.l) && whole(r, rt, t.r))
+                divides
+                    && bin_types(*op, lt, rt)
+                        .is_ok_and(|t| t.result_check().is_none() && whole(l, lt, t.l) && whole(r, rt, t.r))
             }
             BExpr::Not(inner) => go(inner),
             BExpr::NullTest { .. } => true,

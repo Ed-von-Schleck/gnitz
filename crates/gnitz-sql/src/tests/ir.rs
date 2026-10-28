@@ -243,6 +243,9 @@ fn never_null_follows_the_kernels_that_make_a_null() {
         // A DATE meeting a TIMESTAMP is widened to microseconds, which a day count
         // past `i64` microseconds has none of.
         ("d - d", true),
+        // DATE ± days is NULL outside DATE's range.
+        ("d + 1", false),
+        ("d - n", false),
         ("ts - d", false),
         ("d = ts", false),
         ("d + 1 < ts", false),

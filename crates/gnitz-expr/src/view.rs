@@ -25,9 +25,6 @@ pub trait BatchView: RowSource {
     /// The null-bitmap region in full (`rows * 8` bytes, u64 LE per row).
     fn null_bmp(&self) -> &[u8];
     /// The OPK PK region in full (`rows * stride` bytes) and its per-row stride.
-    /// Returned as one pair rather than two accessors so a kernel that walks the
-    /// region pays one call to obtain both, matching the single `col_data` call
-    /// its payload counterpart makes.
     fn pk_region(&self) -> (&[u8], usize);
     /// The heap in full: a batch holds its long values verbatim.
     fn blob(&self) -> &[u8];

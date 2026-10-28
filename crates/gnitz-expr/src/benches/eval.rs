@@ -1,102 +1,20 @@
-//! Instruction benchmarks for the evaluator's kernels, `#[ignore]`d and
-//! meaningful only in release:
-//!
-//!   cargo test -p gnitz-expr --release <bench> -- --ignored --nocapture --test-threads=1
-//!
-//! Each case prints the user-mode instructions and cycles per row of one warmed
-//! pass, at every instruction set its kernels can run at: `native`, and `avx2`
-//! on a CPU that has more, which is what a CPU without it runs. Between levels
-//! compare cycles: a wider instruction retires as one whatever it costs to
-//! execute. `GNITZ_BENCH_ROWS` sets the rows of an evaluator bench's batch.
+//! Instruction benchmarks for the evaluator's kernels, through `RowFilter`, `ScalarEval` and `MapEval`.
 
-use gnitz_foundation::perf::Counter;
-use gnitz_wire::{FixedInt, RowSource, TypeCode};
+use gnitz_wire::{FixedInt, TypeCode};
 
 use crate::batch::MORSEL;
 use crate::eval::Resolved;
 use crate::program::{FloatUnaryOp, IntUnaryOp};
 use crate::simd::encode_f64;
-use crate::simd::{self, Level};
+use crate::simd::Level;
 use crate::test_support::{
-    filter_prog, filter_verdicts, int, make_n_col_view, make_string_view, map_prog, map_rows, passing_rows, schema_pk,
-    schema_pk_ints, schema_pk_strings, simd_levels, view, Cell, Col, TestView,
+    bench_rows, filter_prog, filter_verdicts, in_set, int, make_n_col_view, make_string_view, map_prog, map_rows,
+    passing_rows, schema_pk, schema_pk_ints, schema_pk_strings, view, Cell, Col, Meter, TestView,
 };
 use crate::{
     CalendarOp, CmpOp, ConstIdx, FloatArithOp, IntArithOp, LikePattern, LogicalInstr as L, LogicalInstr,
     LogicalProgram, Reg, RowFilter, SchemaDescriptor, Sink, TrimMode,
 };
-
-/// The counters every case is read through.
-struct Meter {
-    instructions: Counter,
-    cycles: Counter,
-}
-
-impl Meter {
-    fn new() -> Self {
-        Meter {
-            instructions: Counter::instructions(),
-            cycles: Counter::cycles(),
-        }
-    }
-
-    /// Print `case`'s instructions and cycles per row of `pass`, which covers
-    /// `rows` rows, after one pass of warm-up.
-    fn pass<T>(&self, bench: &str, case: &str, rows: usize, mut pass: impl FnMut() -> T) {
-        std::hint::black_box(pass());
-        let ((_, instructions), cycles) = self
-            .cycles
-            .measure(|| self.instructions.measure(|| std::hint::black_box(pass())));
-        println!(
-            "{bench} {case:<36} {:8.2} instr/row {:8.2} cycles/row",
-            instructions as f64 / rows as f64,
-            cycles as f64 / rows as f64
-        );
-    }
-
-    /// [`Self::pass`] of `ev` at every instruction set of [`simd_levels`], on
-    /// the arm it is on.
-    fn levels<E: Resolved, T>(
-        &self,
-        bench: &str,
-        case: &str,
-        rows: usize,
-        ev: &mut E,
-        mut pass: impl FnMut(&mut E) -> T,
-    ) {
-        let null_regs = ev.null_regs();
-        for (level_name, level) in simd_levels() {
-            ev.set_arm(null_regs, level);
-            self.pass(bench, &format!("{case} @{level_name}"), rows, || pass(ev));
-        }
-        ev.set_arm(null_regs, Level::new());
-    }
-
-    /// [`Self::levels`] of a filter's `ranges` over `view`.
-    fn filter(&self, bench: &str, case: &str, f: &mut RowFilter, view: &TestView) {
-        let mut ranges = Vec::new();
-        self.levels(bench, case, view.row_count(), f, |f| {
-            f.ranges(view, &mut ranges);
-            ranges.len()
-        });
-    }
-}
-
-/// The rows a batch of the evaluator benches holds, from `GNITZ_BENCH_ROWS`: a
-/// count below [`MORSEL`] measures what a small delta pays per batch.
-fn bench_rows() -> usize {
-    gnitz_foundation::env::env_num("GNITZ_BENCH_ROWS", 200_000)
-}
-
-/// `col1 IN (…)` over `set`, which is sorted and distinct.
-fn in_set(set: impl IntoIterator<Item = i64>) -> (Vec<LogicalInstr>, Vec<Vec<u8>>) {
-    let set: Vec<i64> = set.into_iter().collect();
-    let instrs = vec![
-        L::LoadCol { col: 1 },
-        L::IntInSet { value_reg: Reg(0), set_idx: ConstIdx(0) },
-    ];
-    (instrs, vec![gnitz_wire::as_le_bytes(&set).to_vec()])
-}
 
 /// `k` values spread over 1..=1000.
 fn spread(k: usize) -> impl Iterator<Item = i64> {
@@ -448,7 +366,7 @@ type Shape = (String, LogicalProgram, SchemaDescriptor);
 
 fn slot(name: impl Into<String>, instrs: Vec<LogicalInstr>, consts: Vec<Vec<u8>>, tc: TypeCode) -> Shape {
     let result = Reg(instrs.len() as u16 - 1);
-    let prog = LogicalProgram::new(instrs, vec![Sink::Reg(result)], consts);
+    let prog = LogicalProgram::new(instrs, vec![Sink::Reg(result)], consts).unwrap();
     (name.into(), prog, schema_pk(&[tc], true))
 }
 
@@ -570,6 +488,7 @@ fn expr_kernel_bench() {
         slot("cal_year_date", cal(CalendarOp::Year, false), vec![], T::I64),
         slot("cal_year_ts", cal(CalendarOp::Year, true), vec![], T::I64),
         slot("cal_hour_ts", cal(CalendarOp::Hour, true), vec![], T::I64),
+        slot("cal_trunc_hour_ts", cal(CalendarOp::TruncHour, true), vec![], T::I64),
         slot("cal_trunc_month_ts", cal(CalendarOp::TruncMonth, true), vec![], T::I64),
         slot("cal_to_days", cal(CalendarOp::ToDays, true), vec![], T::I64),
         slot(
@@ -596,7 +515,12 @@ fn expr_kernel_bench() {
             vec![],
             T::I64,
         ),
-        slot("float_to_str", floats(L::FloatToStr { a: r(1) }), vec![], T::String),
+        slot(
+            "float_to_str",
+            floats(L::FloatToStr { a: r(1), f32: false }),
+            vec![],
+            T::String,
+        ),
     ]);
     // A real map: six compute opcodes and two register sinks.
     let map = LogicalProgram::new(
@@ -610,7 +534,8 @@ fn expr_kernel_bench() {
         ],
         vec![Sink::Reg(r(5)), Sink::Reg(r(3))],
         vec![],
-    );
+    )
+    .unwrap();
     shapes.push(("map".into(), map, schema_pk_ints(2, false)));
     run(&ints_nn, &nn_view, shapes);
     drop(nn_view);
@@ -893,117 +818,5 @@ fn expr_kernel_bench() {
     ];
     for (unit, len, shapes) in fixtures {
         run(&str1, &fixed_len_str_view(&str1, n, len, unit), shapes);
-    }
-}
-
-/// The null-word permutation of a copy-only map over eight nullable columns: a
-/// column prefix, every column moved one slot down, and the columns reversed.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn null_perm_bench() {
-    let meter = Meter::new();
-    let n = bench_rows();
-    let in_schema = schema_pk_ints(8, true);
-    let view = make_n_col_view(
-        &in_schema,
-        n,
-        |row, col| (row + col) as i64,
-        |row, col| (row * 7 + col * 13) % 5 == 0,
-    );
-    let shapes: [(&str, Vec<u32>); 3] = [
-        ("prefix", (1..=7).collect()),
-        ("shift", (2..=8).collect()),
-        ("reversed", (1..=8).rev().collect()),
-    ];
-    for (name, cols) in shapes {
-        let out_schema = schema_pk_ints(cols.len(), true);
-        let mut map = LogicalProgram::copy_cols(&cols)
-            .resolve_map(&in_schema, &out_schema)
-            .expect("a copy-only map");
-        let mut out = TestView::for_schema(&out_schema, n);
-        meter.pass("null_perm_bench", name, n, || {
-            map.write_computed(&view, 0, n, &mut out, 0)
-        });
-    }
-}
-
-/// The decode a predicate-only read pays per request per worker: `from_blob`
-/// and the `resolve_filter` that decodes an IN list's pool entry, per entry.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn from_blob_bench() {
-    let meter = Meter::new();
-    let schema = schema_pk_ints(1, false);
-    let n = 262_144usize;
-    let (instrs, consts) = in_set(0..n as i64);
-    let blob = LogicalProgram::new(instrs, vec![Sink::Reg(Reg(1))], consts).to_blob_bytes();
-    meter.pass("from_blob_bench", "IN list", n, || {
-        let prog = LogicalProgram::from_blob(std::hint::black_box(&blob)).expect("decodes");
-        prog.resolve_filter(&schema).expect("resolves")
-    });
-}
-
-/// [`crate::simd`]'s kernels alone, over one morsel that stays in cache, at
-/// each level.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn mask_kernel_bench() {
-    use std::hint::black_box;
-    /// Passes per measurement: a morsel alone is too few instructions to
-    /// outweigh the counter's own.
-    const PASSES: usize = 1000;
-    let meter = Meter::new();
-    let a: Vec<i64> = (0..MORSEL).map(|i| (i * 7919 % 1000) as i64).collect();
-    let b = vec![500i64; MORSEL];
-    let floats = |v: &[i64]| -> Vec<i64> { v.iter().map(|&x| encode_f64(x as f64)).collect() };
-    let (fa, fb) = (floats(&a), floats(&b));
-    let nulls: Vec<u8> = (0..MORSEL as u64)
-        .flat_map(|i| (i.is_multiple_of(5) as u64 * 2).to_le_bytes())
-        .collect();
-    let take = [0x5a5a_1234_dead_beef, 7, u64::MAX, 0x0f0f_0f0f_0f0f_0f0f];
-    let set: Vec<i64> = (0..32).map(|i| i * 31 + 1).collect();
-    let mut bits = [0u64; MORSEL / 64];
-    let mut lanes = vec![0i64; MORSEL];
-
-    for (level_name, level) in simd_levels() {
-        let (a, b, fa, fb) = (
-            black_box(&a[..]),
-            black_box(&b[..]),
-            black_box(&fa[..]),
-            black_box(&fb[..]),
-        );
-        macro_rules! drive {
-            ($name:expr, $kernel:expr) => {
-                meter.pass(
-                    "mask_kernel_bench",
-                    &format!("{} @{level_name}", $name),
-                    MORSEL * PASSES,
-                    || {
-                        for _ in 0..PASSES {
-                            $kernel;
-                            black_box((&bits, &lanes));
-                        }
-                    },
-                )
-            };
-        }
-        drive!("gt", simd::pred_bits::<simd::GtSigned>(level, a, b, &mut bits));
-        drive!(
-            "gt_unsigned",
-            simd::pred_bits::<simd::GtUnsigned>(level, a, b, &mut bits)
-        );
-        drive!("gt_float", simd::pred_bits::<simd::GtFloat>(level, fa, fb, &mut bits));
-        drive!("ne", simd::pred_bits::<simd::Not<simd::Eq>>(level, a, b, &mut bits));
-        drive!("gt_total", simd::pred_bits::<simd::GtTotal>(level, fa, fb, &mut bits));
-        drive!("truthy", simd::truthy_bits(level, a, &mut bits));
-        for k in [2, 4, 8, 32] {
-            drive!(
-                format!("in{k}"),
-                simd::in_set_bits(level, a, black_box(&set[..k]), &mut bits)
-            );
-        }
-        drive!("nulls", simd::null_bits(level, black_box(&nulls), 2, &mut bits));
-        drive!("blend", simd::blend(level, black_box(&take), a, b, &mut lanes));
-        drive!("bit_lanes", simd::bit_lanes(level, black_box(&take), &mut lanes));
     }
 }

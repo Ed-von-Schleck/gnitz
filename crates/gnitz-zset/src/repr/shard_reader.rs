@@ -22,7 +22,8 @@ use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
 use crate::repr::error::StorageError;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{
-    read_u64_le, Heap, PkBuf, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
+    read_u64_le, FixedInt, Heap, PkBuf, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK,
+    REG_WEIGHT,
 };
 use xorf::{BinaryFuse8Ref, Filter};
 
@@ -378,7 +379,7 @@ impl MappedShard {
                             .ok_or(Corrupt("region size"));
                     }
                     Encoding::For => {
-                        let fi = col.fixed_int().ok_or(Corrupt("encoding"))?;
+                        let fi = FixedInt::from_type_code(col.type_code).ok_or(Corrupt("encoding"))?;
                         ForImage::parse(image, count, fi.width() - 1).map(PackedImage::For)
                     }
                     Encoding::Seq if string => SeqImage::parse(image, count).map(PackedImage::Seq),

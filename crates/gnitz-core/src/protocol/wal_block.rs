@@ -26,7 +26,7 @@ pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &
     let gnitz_wire::wal::ParsedBlock { rows, fixed, heap, .. } = gnitz_wire::wal::parse_block(data, layout.row_width())
         .map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?;
     let mut regions = Regions::new();
-    for r in 0..layout.num_regions() {
+    for r in 0..layout.num_fixed_regions() {
         regions.push(&fixed[layout.region_start(r, rows)..][..rows * layout.region_stride(r)]);
     }
     regions.push(heap);

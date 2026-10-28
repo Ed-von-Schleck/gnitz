@@ -8,22 +8,23 @@ use super::*;
 use crate::batch::MORSEL;
 use crate::test_support::{filter_verdicts, TestView};
 use crate::{SchemaColumn, SchemaDescriptor};
-use gnitz_wire::TypeCode;
+use gnitz_wire::{FixedInt, TypeCode};
 
 #[test]
 fn program_fuzz() {
     let schema = every_type();
     let rows = edge_rows(&schema);
     bolero::check!().for_each(|blob: &[u8]| {
-        // Decoded once per resolution: a resolve consumes its program.
-        let program = || LogicalProgram::from_blob(blob);
-        if let Ok(mut filter) = program().and_then(|p| p.resolve_filter(&schema)) {
+        let Ok(program) = LogicalProgram::from_blob(blob) else {
+            return;
+        };
+        if let Ok(mut filter) = program.resolve_filter(&schema) {
             filter_verdicts(&mut filter, &rows);
         }
-        if let Ok(mut scalar) = program().and_then(|p| p.resolve_scalar(&schema)) {
+        if let Ok(mut scalar) = program.resolve_scalar(&schema) {
             scalar.eval_all(&rows);
         }
-        if let Ok(mut map) = program().and_then(|p| p.resolve_map(&schema, &schema)) {
+        if let Ok(mut map) = program.resolve_map(&schema, &schema) {
             let mut out = TestView::for_schema(&schema, ROWS);
             map.write_computed(&rows, 0, ROWS, &mut out, 0);
         }
@@ -48,7 +49,6 @@ fn every_type() -> SchemaDescriptor {
 /// Rows past one morsel, cycling each column through the values its kernels
 /// are written around; every third row of a nullable column is NULL.
 fn edge_rows(schema: &SchemaDescriptor) -> TestView {
-    const INTS: [i128; 6] = [0, 1, -1, i128::MIN, i128::MAX, 7];
     const FLOATS: [f64; 6] = [0.0, -0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.5];
     const TEXTS: [&str; 5] = ["", "a", "a string past the inline twelve", "ünïcødé", "%_\\"];
     let mut view = TestView::for_schema(schema, ROWS);
@@ -69,7 +69,11 @@ fn edge_rows(schema: &SchemaDescriptor) -> TestView {
                 TypeCode::F64 => float.to_bits().into(),
                 TypeCode::F32 => (float as f32).to_bits().into(),
                 TypeCode::Bool => (row % 2) as u128,
-                _ => INTS[row % INTS.len()] as u128,
+                // Each integer type's own ends; `set_native` keeps the cell's low bytes.
+                tc => {
+                    let (min, max) = FixedInt::from_type_code(tc).map_or((i128::MIN, i128::MAX), FixedInt::range);
+                    [0, 1, -1, min, max, 7][row % 6] as u128
+                }
             };
             view.set_native(schema, row, ci, native);
         }

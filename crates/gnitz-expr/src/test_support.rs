@@ -1,9 +1,10 @@
-//! An owned-buffer stand-in for a physical batch. The real one lives in a crate
-//! that depends on this one, and a stand-in holds the kernels to the
-//! [`BatchView`] contract alone.
+//! The crate's test and bench helpers, around an owned-buffer stand-in for a
+//! physical batch. The real one lives in a crate that depends on this one, and a
+//! stand-in holds the kernels to the [`BatchView`] contract alone.
 
 use std::fmt::Debug;
 
+use gnitz_foundation::perf::Counter;
 use gnitz_wire::TypeCode;
 
 use crate::batch::MORSEL;
@@ -11,7 +12,7 @@ use crate::eval::Resolved;
 use crate::simd::encode_f64;
 use crate::simd::Level;
 use crate::{
-    BatchView, ColumnLocator, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg, RowFilter,
+    BatchView, ColumnLocator, ConstIdx, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg, RowFilter,
     ScalarEval, SchemaColumn, SchemaDescriptor, Sink,
 };
 use gnitz_wire::{Heap, RowSource};
@@ -318,7 +319,7 @@ pub fn schema_pk_strings(n: usize, nullable: bool) -> SchemaDescriptor {
 /// `instrs` as a program whose one register sink is its last instruction.
 fn result_prog(instrs: Vec<LogicalInstr>, const_strings: Vec<Vec<u8>>) -> LogicalProgram {
     let result = Reg(instrs.len() as u16 - 1);
-    LogicalProgram::new(instrs, vec![Sink::Reg(result)], const_strings)
+    LogicalProgram::new(instrs, vec![Sink::Reg(result)], const_strings).expect("test program must validate")
 }
 
 /// Build and resolve a scalar program; its result is its last instruction. A
@@ -348,7 +349,7 @@ pub fn map_prog(
     const_strings: Vec<Vec<u8>>,
 ) -> MapEval {
     LogicalProgram::new(instrs, sinks, const_strings)
-        .resolve_map(in_schema, out_schema)
+        .and_then(|p| p.resolve_map(in_schema, out_schema))
         .expect("test map must validate")
 }
 
@@ -540,4 +541,106 @@ pub(crate) fn xorshift(state: &mut u64) -> u64 {
     *state ^= *state >> 7;
     *state ^= *state << 17;
     *state
+}
+
+/// Key values that tie, that differ only in the low half of 16 bytes, and that
+/// cross each width's sign bit.
+pub(crate) const PATTERNS: &[u128] = &[
+    0,
+    1,
+    0x7F,
+    0x80,
+    0xFF,
+    0x7FFF,
+    0x8000,
+    1 << 31,
+    i64::MAX as u128,
+    1 << 63,
+    u64::MAX as u128,
+    1 << 64,
+    (1 << 64) + 1,
+    i128::MAX as u128,
+    1 << 127,
+    u128::MAX,
+];
+
+/// The counters every instruction bench reads its cases through. The benches
+/// are `#[ignore]`d and meaningful only in release:
+///
+///   cargo test -p gnitz-expr --release <bench> -- --ignored --nocapture --test-threads=1
+///
+/// Each case prints the user-mode instructions and cycles per row of one warmed
+/// pass, at every instruction set its kernels can run at: `native`, and `avx2`
+/// on a CPU that has more, which is what a CPU without it runs. Between levels
+/// compare cycles: a wider instruction retires as one whatever it costs to
+/// execute.
+pub(crate) struct Meter {
+    instructions: Counter,
+    cycles: Counter,
+}
+
+impl Meter {
+    pub(crate) fn new() -> Self {
+        Meter {
+            instructions: Counter::instructions(),
+            cycles: Counter::cycles(),
+        }
+    }
+
+    /// Print `case`'s instructions and cycles per row of `pass`, which covers
+    /// `rows` rows, after one pass of warm-up.
+    pub(crate) fn pass<T>(&self, bench: &str, case: &str, rows: usize, mut pass: impl FnMut() -> T) {
+        std::hint::black_box(pass());
+        let ((_, instructions), cycles) = self
+            .cycles
+            .measure(|| self.instructions.measure(|| std::hint::black_box(pass())));
+        println!(
+            "{bench} {case:<36} {:8.2} instr/row {:8.2} cycles/row",
+            instructions as f64 / rows as f64,
+            cycles as f64 / rows as f64
+        );
+    }
+
+    /// [`Self::pass`] of `ev` at every instruction set of [`simd_levels`], on
+    /// the arm it is on.
+    pub(crate) fn levels<E: Resolved, T>(
+        &self,
+        bench: &str,
+        case: &str,
+        rows: usize,
+        ev: &mut E,
+        mut pass: impl FnMut(&mut E) -> T,
+    ) {
+        let null_regs = ev.null_regs();
+        for (level_name, level) in simd_levels() {
+            ev.set_arm(null_regs, level);
+            self.pass(bench, &format!("{case} @{level_name}"), rows, || pass(ev));
+        }
+        ev.set_arm(null_regs, Level::new());
+    }
+
+    /// [`Self::levels`] of a filter's `ranges` over `view`.
+    pub(crate) fn filter(&self, bench: &str, case: &str, f: &mut RowFilter, view: &TestView) {
+        let mut ranges = Vec::new();
+        self.levels(bench, case, view.row_count(), f, |f| {
+            f.ranges(view, &mut ranges);
+            ranges.len()
+        });
+    }
+}
+
+/// The rows a batch of the evaluator benches holds, from `GNITZ_BENCH_ROWS`: a
+/// count below [`MORSEL`] measures what a small delta pays per batch.
+pub(crate) fn bench_rows() -> usize {
+    gnitz_foundation::env::env_num("GNITZ_BENCH_ROWS", 200_000)
+}
+
+/// `col1 IN (…)` over `set`, which is sorted and distinct.
+pub(crate) fn in_set(set: impl IntoIterator<Item = i64>) -> (Vec<LogicalInstr>, Vec<Vec<u8>>) {
+    let set: Vec<i64> = set.into_iter().collect();
+    let instrs = vec![
+        LogicalInstr::LoadCol { col: 1 },
+        LogicalInstr::IntInSet { value_reg: Reg(0), set_idx: ConstIdx(0) },
+    ];
+    (instrs, vec![gnitz_wire::as_le_bytes(&set).to_vec()])
 }

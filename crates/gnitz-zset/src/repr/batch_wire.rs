@@ -198,7 +198,7 @@ impl Batch {
     /// Every fixed region followed by the blob heap, in canonical order.
     pub fn wire_regions(&self) -> Regions<'_> {
         let mut out = Regions::new();
-        for r in 0..self.schema().num_regions() {
+        for r in 0..self.schema().num_fixed_regions() {
             out.push(self.region(r));
         }
         out.push(&self.blob);

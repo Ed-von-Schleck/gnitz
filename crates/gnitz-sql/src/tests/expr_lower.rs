@@ -279,15 +279,18 @@ fn the_numeric_forms_compute_their_values() {
 /// two meet at TIMESTAMP: in a comparison, a difference and a CASE.
 #[test]
 fn the_temporal_forms_compute_their_values() {
-    let day = i128::from(gnitz_expr::calendar::MICROS_PER_DAY);
+    let day = i128::from(gnitz_wire::MICROS_PER_DAY);
     check(
         &[T::Date],
         &[
             ("EXTRACT(YEAR FROM c1)", &[Int(18262)], Int(2020)),
             ("CAST(c1 AS TIMESTAMP)", &[Int(18262)], Int(18262 * day)),
-            // A computed DATE is an unchecked i64 register, so no range is assumed,
-            // and a CAST of one to DATE checks it.
-            ("(c1 + 1) IN (2147483648, 5)", &[Int(2147483647)], Int(1)),
+            // DATE ± days outside DATE's range is NULL wherever it is read.
+            ("c1 + 1", &[Int(0)], Int(1)),
+            ("c1 + 3000000000", &[Int(0)], Null),
+            ("c1 + 3000000000 > c1", &[Int(0)], Null),
+            ("EXTRACT(YEAR FROM c1 + 3000000000)", &[Int(0)], Null),
+            ("(c1 + 1) IN (2147483648, 5)", &[Int(2147483647)], Null),
             ("CAST(c1 + 1 AS DATE) IN (2147483648, 5)", &[Int(2147483647)], Null),
             ("CAST(c1 + 1 AS DATE) = 2147483648", &[Int(2147483647)], Null),
             ("CAST(c1 + 1 AS DATE) = 2147483648", &[Int(5)], Int(0)),
@@ -456,7 +459,7 @@ fn an_operand_takes_the_signedness_of_its_result() {
         ],
     );
     // c1 = d = 1960-01-01, c2 = u, c3 = d2.
-    let d = i128::from(gnitz_expr::calendar::days_from_civil(1960, 1, 1));
+    let d = i128::from(gnitz_wire::days_from_civil(1960, 1, 1));
     check(
         &[T::Date, T::U64, T::Date],
         &[
@@ -513,6 +516,30 @@ fn cast_elision_preserves_u64_tracking() {
             instrs.iter().any(|i| matches!(i, L::IntCast { .. })),
             emits,
             "{sql}: {instrs:?}"
+        );
+    }
+}
+
+/// DATE ± days ends in one range check into DATE's width, and neither a CAST to
+/// DATE nor a DATE slot it is written into adds a second one.
+#[test]
+fn date_arithmetic_is_range_checked_once() {
+    let s = typed_schema(&[T::Date]);
+    for sql in ["c1 + 1", "CAST(c1 + 1 AS DATE)"] {
+        let mut eb = ExprBuilder::new();
+        let reg = compile_bound_expr(&bind_sql(sql, &s), s.columns(), &mut eb).unwrap();
+        let sink = eb.slot_sink(reg, T::Date);
+        let prog = eb.build(vec![sink]).unwrap();
+        let casts: Vec<&L> = prog
+            .instrs()
+            .iter()
+            .filter(|i| matches!(i, L::IntCast { .. }))
+            .collect();
+        assert_eq!(
+            casts,
+            [&L::IntCast { a: Reg(2), fi: FixedInt::I32 }],
+            "{sql}: {:?}",
+            prog.instrs()
         );
     }
 }

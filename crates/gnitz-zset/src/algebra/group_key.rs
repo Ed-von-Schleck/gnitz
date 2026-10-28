@@ -228,10 +228,9 @@ impl GroupOutKey {
         row: impl IntoIterator<Item = u32>,
     ) -> Result<(Self, DerivedSchema), String> {
         let key = GroupKey::new(input, group_cols)?;
-        let kind = input.reduce_out_key(group_cols);
         let mut b = DerivedSchema::new();
         let mut carried = Vec::new();
-        for slot in kind.output_layout(group_cols, row) {
+        for slot in input.reduce_out_layout(group_cols, row) {
             match slot {
                 ReduceOutSlot::SyntheticKey => b.push_pk(GROUP_PK_COL),
                 ReduceOutSlot::Key(c) => b.push_pk(input.columns()[c as usize]),
@@ -241,7 +240,7 @@ impl GroupOutKey {
                 }
             }
         }
-        let synthetic = kind == ReduceOutKey::SyntheticFold;
+        let synthetic = input.reduce_out_key(group_cols) == ReduceOutKey::SyntheticFold;
         Ok((GroupOutKey { key, synthetic, carried }, b))
     }
 

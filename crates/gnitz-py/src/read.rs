@@ -262,7 +262,7 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
         TypeCode::UUID => format_uuid(u128::from_le_bytes(b.try_into().unwrap())).into_py_any(py)?,
         TypeCode::Date => {
             let days = gnitz_wire::read_signed_exact(b);
-            let (y, m, d) = gnitz_expr::calendar::civil_from_days(days);
+            let (y, m, d) = gnitz_wire::civil_from_days(days);
             if PY_YEARS.contains(&y) {
                 PyDate::new(py, y as i32, m as u8, d as u8)?.into_any().unbind()
             } else {
@@ -271,8 +271,8 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
         }
         TypeCode::Timestamp => {
             let micros = gnitz_wire::read_signed_exact(b);
-            let (days, h, mi, s, us) = gnitz_expr::calendar::split_micros(micros);
-            let (y, m, d) = gnitz_expr::calendar::civil_from_days(days);
+            let (days, h, mi, s, us) = gnitz_wire::split_micros(micros);
+            let (y, m, d) = gnitz_wire::civil_from_days(days);
             if PY_YEARS.contains(&y) {
                 PyDateTime::new(py, y as i32, m as u8, d as u8, h as u8, mi as u8, s as u8, us, None)?
                     .into_any()

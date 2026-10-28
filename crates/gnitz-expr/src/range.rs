@@ -23,12 +23,9 @@ impl RangeMembership {
     /// key order.
     pub(crate) fn new(range: &KeyRange, schema: &SchemaDescriptor) -> Result<Self, ExprValidateErr> {
         let bad = |e: String| ExprValidateErr::BadWalk(format!("range walk: {e}"));
-        let cols = range.cols();
-        let n = schema.num_columns();
-        if let Some(&c) = cols.as_slice().iter().find(|&&c| c as usize >= n) {
-            return Err(bad(format!("column {c} is out of range for a {n}-column schema")));
-        }
-        let locs: Vec<ColumnLocator> = cols.as_slice().iter().map(|&c| schema.locate(c as usize)).collect();
+        let locs = (range.cols().as_slice().iter())
+            .map(|&c| schema.wire_col("column", c).map(|(_, l)| l).map_err(bad))
+            .collect::<Result<Vec<ColumnLocator>, _>>()?;
         if let Some(l) = locs.iter().find(|l| !l.type_code().is_pk_eligible()) {
             return Err(bad(format!("column type {} has no key order", l.type_code())));
         }
@@ -137,9 +134,7 @@ fn and_cells<const W: usize>(
 ) {
     for (word, rows) in words.iter_mut().zip(region.chunks(64 * stride)) {
         let mut bits = 0u64;
-        for (i, row) in rows.chunks_exact(stride).enumerate() {
-            bits |= (keep(row[off..off + W].try_into().unwrap()) as u64) << i;
-        }
+        gnitz_wire::zip_cells::<W, _>(rows, stride, off, 0..64usize, |c, i| bits |= (keep(*c) as u64) << i);
         *word &= bits;
     }
 }

@@ -511,7 +511,7 @@ struct MergeSink<'w> {
 impl<'w> MergeSink<'w> {
     fn new(srcs: &'w [MemBatch<'w>; 2], heap_at: [Option<usize>; 2], writer: &'w mut DirectWriter<'_>) -> Self {
         let (schema, room) = (writer.schema, writer.rows());
-        let last = schema.num_regions() - 1;
+        let last = schema.num_fixed_regions() - 1;
         for src in srcs {
             debug_assert!(src.schema.same_regions(schema), "a merge side of another layout");
             assert!(

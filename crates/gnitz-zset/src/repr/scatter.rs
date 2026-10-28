@@ -84,7 +84,7 @@ pub(crate) fn copy_ranges(
     match *ranges {
         // One run is one bulk copy per region.
         [(start, end)] => {
-            for r in 0..schema.num_regions() {
+            for r in 0..schema.num_fixed_regions() {
                 let stride = schema.region_stride(r);
                 writer
                     .region_mut(r)
@@ -99,7 +99,7 @@ pub(crate) fn copy_ranges(
                 writer.rows(),
                 "copy_ranges: a writer of another row count"
             );
-            for r in 0..schema.num_regions() {
+            for r in 0..schema.num_fixed_regions() {
                 width_dispatch!(
                     schema.region_stride(r),
                     copy_runs,

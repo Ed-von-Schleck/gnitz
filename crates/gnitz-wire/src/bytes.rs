@@ -142,12 +142,17 @@ impl Iterator for BitIter {
 }
 
 /// Append every maximal run of set bits below `n` to `out` as `[start, end)`,
-/// one step per run.
+/// one step per run. `bits` holds `n.div_ceil(64)` words; the bits of the last
+/// one at or past `n` are ignored.
 pub fn set_bit_runs(bits: &[u64], n: usize, out: &mut Vec<(usize, usize)>) {
+    debug_assert_eq!(bits.len(), n.div_ceil(64), "set_bit_runs: one bit per row");
+    let Some((&last, body)) = bits.split_last() else {
+        return;
+    };
     // The start of a run that reached the top of the previous word. It continues
     // into this one only while the low bit is still set.
     let mut open: Option<usize> = None;
-    for (w, &word) in bits.iter().enumerate() {
+    let mut scan = |w: usize, word: u64| {
         let base = w * 64;
         if word & 1 == 0 {
             if let Some(s) = open.take() {
@@ -169,9 +174,12 @@ pub fn set_bit_runs(bits: &[u64], n: usize, out: &mut Vec<(usize, usize)>) {
             out.push((start, base + end_bit));
             rest &= !((1u64 << end_bit) - 1);
         }
+    };
+    for (w, &word) in body.iter().enumerate() {
+        scan(w, word);
     }
-    // A run still open past the last word ends at the batch, not at the bitmap:
-    // `n` is not always a multiple of 64.
+    scan(body.len(), last & low_bits_mask(n - body.len() * 64));
+    // A run still open reached the top of the last word, which is `n`.
     if let Some(s) = open {
         out.push((s, n));
     }

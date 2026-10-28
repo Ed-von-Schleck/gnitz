@@ -71,7 +71,7 @@ fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
     let mut ev = map_prog(&in_schema, &out_schema, instrs, sinks, vec![]);
     assert!(ev.emits_anything());
     assert_eq!(
-        ev.copies(),
+        ev.moves().copies(),
         &[crate::ColCopy {
             src: in_schema.locate(1),
             slot: 0,
@@ -569,6 +569,7 @@ fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
         vec![Sink::Reg(Reg(2))],
         vec![],
     )
+    .unwrap()
     .to_blob_bytes();
     let null = |row: usize| row.is_multiple_of(5);
     let walk = |col: u32, first, last| Some(KeyRange::new(PkColList::from_slice(&[col]), &[], first, last));

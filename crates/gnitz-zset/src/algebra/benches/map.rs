@@ -104,7 +104,8 @@ fn map_ranges_bench() {
             ],
             vec![Sink::Reg(Reg(3)), Sink::Reg(Reg(4)), Sink::Reg(Reg(5))],
             vec![],
-        );
+        )
+        .unwrap();
         compute(&ints, prog, &[(I64, true); 3])
     };
     let (str1, str_batch) = source(&[STR], 0);
@@ -116,7 +117,8 @@ fn map_ranges_bench() {
             ],
             vec![Sink::Reg(Reg(1))],
             vec![],
-        );
+        )
+        .unwrap();
         compute(&str1, prog, &[(STR, true)])
     };
     whole("int3", int3(), &int_batch, N);

@@ -9,9 +9,8 @@ use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr;
 use crate::ir::BoundExpr;
 use gnitz_core::Schema;
-use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
-use gnitz_wire::ComputeMap;
-use gnitz_wire::{ColumnDef, FixedInt, TypeCode};
+use gnitz_expr::{ExprBuilder, LogicalProgram, Sink};
+use gnitz_wire::{ColumnDef, ComputeMap};
 
 /// One output column of a projection: a verbatim source column
 /// (`PassThrough`) or a value derived by an expression (`Computed`).
@@ -77,10 +76,8 @@ pub(crate) fn compute_map(program: LogicalProgram, out: &Schema) -> ComputeMap {
 
 /// Compile the *payload* slice of a projection (`items` must exclude the
 /// leading PK slots, which the engine carries verbatim) into one expr-map
-/// program: one sink per output payload slot, in slot order. A register sink is
-/// class-agnostic here — the engine splits it by the source register's class,
-/// storing the raw 8-byte image for a scalar and a German-string cell for a
-/// string.
+/// program: one sink per output payload slot, in slot order. A computed item's
+/// sink is the one [`ExprBuilder::slot_sink`] builds for its declared column type.
 fn projection_program(
     items: &[ProjItem],
     out_cols: &[ColumnDef],
@@ -95,15 +92,8 @@ fn projection_program(
             match item {
                 ProjItem::PassThrough { src_col } => Ok(Sink::Col(*src_col as u32)),
                 ProjItem::Computed { bound_expr } => {
-                    let mut reg = compile_bound_expr(bound_expr, schema.columns(), &mut eb)?;
-                    // A slot narrower than the register takes a value range-checked
-                    // into the slot's declared type; a BOOLEAN slot stores the
-                    // register's truth, which needs no check.
-                    let checked = |fi: &FixedInt| fi.width() < 8 && col.ty.tc != TypeCode::Bool;
-                    if let Some(fi) = FixedInt::from_type_code(col.ty.tc).filter(checked) {
-                        reg = eb.emit(LogicalInstr::IntCast { a: reg, fi });
-                    }
-                    Ok(Sink::Reg(reg))
+                    let reg = compile_bound_expr(bound_expr, schema.columns(), &mut eb)?;
+                    Ok(eb.slot_sink(reg, col.ty.tc))
                 }
             }
         })

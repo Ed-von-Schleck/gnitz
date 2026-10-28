@@ -4,9 +4,11 @@
 use std::fmt::Write as _;
 
 use gnitz_core::{ScanReply, ZSetBatch};
-use gnitz_expr::calendar::{format_date, format_timestamp};
 use gnitz_expr::{ColumnLocator, FloatText};
-use gnitz_wire::{format_decimal, format_uuid, read_signed_exact, read_unsigned_exact, ColType, TypeCode};
+use gnitz_wire::{
+    format_date, format_decimal, format_timestamp, format_uuid, read_signed_exact, read_unsigned_exact, ColType,
+    TypeCode,
+};
 
 /// One cell. Each variant keeps what its renderings need: the text a terminal
 /// shows, and the JSON type a script reads back.

@@ -684,7 +684,7 @@ fn the_shared_evaluator_reads_a_client_batch() {
             vec![Sink::Reg(Reg(2))],
             vec![],
         )
-        .resolve_scalar(schema.layout())
+        .and_then(|p| p.resolve_scalar(schema.layout()))
         .expect("program resolves against the client schema");
         let want: Vec<Option<i128>> = (0..3).map(|r| col[r].map(|v| i128::from(PK3[r] + v))).collect();
         assert_eq!(row_values(&mut ev, &batch), want, "ci3 + ci{ci}");
@@ -707,7 +707,7 @@ fn filter_over_the_region_path() {
         vec![Sink::Reg(Reg(2))],
         vec![],
     )
-    .resolve_filter(schema.layout())
+    .and_then(|p| p.resolve_filter(schema.layout()))
     .expect("predicate resolves against the client schema");
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -726,7 +726,7 @@ fn string_columns_compare_through_the_shared_blob_heap() {
         vec![Sink::Reg(Reg(0))],
         vec![],
     )
-    .resolve_scalar(schema.layout())
+    .and_then(|p| p.resolve_scalar(schema.layout()))
     .expect("string compare resolves against the client schema");
 
     // Row 0 spills both columns into the batch's one heap; row 2 nulls both.

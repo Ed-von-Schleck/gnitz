@@ -29,10 +29,8 @@ use crate::stream::OpenAt;
 use gnitz_wire::RowSource;
 use gnitz_wire::{OrderKey, TypeCode};
 
-use crate::algebra::{
-    copied_string_slots, copy_column, image_slot_col, rebase_copied_strings, ImageCol, RowWindow, IMAGE_COL,
-};
-use gnitz_expr::{ColCopy, ColumnLocator, NullPerm, WeightSlots};
+use crate::algebra::{copy_column, image_slot_col, rebase_copied_strings, ImageCol, RowWindow, IMAGE_COL};
+use gnitz_expr::{ColCopy, ColMoves, ColumnLocator, WeightSlots};
 
 use window::{Running, Window};
 
@@ -377,11 +375,7 @@ struct OrderIndex {
     rest: Vec<OrderSpec>,
     /// The columns an entry carries, each from the input into its payload slot:
     /// the output row's payload, then every other column asked for.
-    copies: Vec<ColCopy>,
-    /// How their null bits move from an input row's null word to an entry's.
-    nulls: NullPerm,
-    /// The input's string slots among them.
-    strings: u64,
+    moves: ColMoves,
     /// The output row's payload columns, as an entry holds them.
     row: Vec<ColumnLocator>,
     /// The image payload columns: with the PK, a row's whole ORDER BY key.
@@ -440,9 +434,7 @@ impl OrderIndex {
             lead,
             rest,
             row: (first..first + row_cols).map(|c| schema.locate(c)).collect(),
-            nulls: NullPerm::new(&copies, input.nullable_payload_slots()),
-            strings: copied_string_slots(&copies),
-            copies,
+            moves: ColMoves::new(copies, input.nullable_payload_slots()),
             images: (first - images..first).map(|c| schema.locate(c)).collect(),
             schema,
         };
@@ -451,8 +443,8 @@ impl OrderIndex {
 
     /// The index column carrying the input column at `loc`.
     fn column_of(&self, loc: ColumnLocator) -> Option<usize> {
-        let at = self.copies.iter().position(|c| c.src == loc)?;
-        Some(self.schema.num_columns() - self.copies.len() + at)
+        let at = self.moves.copies().iter().position(|c| c.src == loc)?;
+        Some(self.schema.num_columns() - self.moves.copies().len() + at)
     }
 
     /// Two entries by group, then by every ORDER BY key: the index order, less
@@ -475,7 +467,7 @@ impl OrderIndex {
         let n = delta.len();
         let mut out = Batch::with_capacity(&self.schema, n);
         // No carried string reads the delta's heap.
-        let heap_at = match self.strings {
+        let heap_at = match self.moves.string_slots() {
             0 => None,
             strings => out.carry_heap(&mb, strings, &[(0, n)]),
         };
@@ -505,11 +497,11 @@ impl OrderIndex {
                 }
             }
             w.weight_mut().copy_from_slice(delta.weight());
-            self.nulls.write_rows(mb.null_bmp(), 0, w.null_bmp_mut(), 0, n);
-            for c in &self.copies {
+            self.moves.write_null_rows(mb.null_bmp(), 0, w.null_bmp_mut(), 0, n);
+            for c in self.moves.copies() {
                 copy_column(delta, w, c, RowWindow { src: 0, dst: 0, n });
             }
-            rebase_copied_strings(&self.copies, w, delta.blob(), heap_at);
+            rebase_copied_strings(self.moves.copies(), w, delta.blob(), heap_at);
         });
         out
     }

@@ -73,15 +73,15 @@ fn resolve_reduce_specs(group_cols: &[ColId], aggs: &[AggCol], input: &Frame) ->
     Ok(r)
 }
 
-/// A group-keyed operator's output frame over `input`: the `output_layout` of
-/// the key a reduce grouped by `group` gets, then `tail`.
+/// A group-keyed operator's output frame over `input`: the reduce output layout of `group` and
+/// `row`, then `tail`.
 fn keyed_frame(
     input: &Frame,
     group: &[u32],
     row: impl IntoIterator<Item = u32>,
     tail: Vec<Slot>,
 ) -> Result<Frame, GnitzSqlError> {
-    let slots = input.schema.layout().reduce_out_key(group).output_layout(group, row);
+    let slots = input.schema.layout().reduce_out_layout(group, row);
     let npk = slots.iter().filter(|s| !matches!(s, ReduceOutSlot::Carried(_))).count();
     let lead = slots.into_iter().map(|s| match s {
         ReduceOutSlot::SyntheticKey => (None, group_pk_def()),

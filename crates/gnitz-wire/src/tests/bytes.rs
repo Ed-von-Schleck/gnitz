@@ -60,11 +60,8 @@ fn set_bit_runs_reports_every_maximal_run() {
     for a in words {
         for b in words {
             for c in words {
-                for n in [1, 63, 64, 65, 127, 128, 150, 191, 192] {
-                    let mut bits = [a, b, c];
-                    bits[n / 64..].iter_mut().enumerate().for_each(|(k, w)| {
-                        *w &= if k == 0 { low_bits_mask(n % 64) } else { 0 };
-                    });
+                for n in [1usize, 63, 64, 65, 127, 128, 150, 191, 192] {
+                    let bits = [a, b, c];
                     let mut got = Vec::new();
                     set_bit_runs(&bits[..n.div_ceil(64)], n, &mut got);
                     assert_eq!(got, naive(&bits, n), "{bits:x?} n={n}");

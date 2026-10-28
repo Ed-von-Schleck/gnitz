@@ -38,7 +38,11 @@ impl ClientMap {
             .map(|p| p.resolve_map(src.layout(), out_schema.layout()))
             .transpose()?
             .filter(|ev| !ev.is_identity());
-        if ev.iter().flat_map(|ev| ev.copies()).any(|c| c.src.size() != c.width) {
+        if ev
+            .iter()
+            .flat_map(|ev| ev.moves().copies())
+            .any(|c| c.src.size() != c.width)
+        {
             return Err(GnitzSqlError::Internal("a projection copies a promoted column".into()));
         }
         Ok(ClientMap { out_schema, ev })
@@ -71,7 +75,7 @@ impl ClientMap {
         ev.write_computed(&src, 0, n, &mut out, 0);
         // A key column's copy decodes it out of the key region; a key is never NULL.
         let mut moves = Vec::new();
-        for c in ev.copies() {
+        for c in ev.moves().copies() {
             match c.src {
                 ColumnLocator::Payload { slot, .. } => moves.push((c.slot, slot as usize)),
                 ColumnLocator::Pk { byte_off, type_code, .. } => gnitz_wire::decode_pk_cells(

@@ -52,14 +52,6 @@ enum PkSource {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// The input's German-string payload slots `copies` read.
-pub(crate) fn copied_string_slots(copies: &[ColCopy]) -> u64 {
-    copies.iter().fold(0, |slots, c| match c.src {
-        ColumnLocator::Payload { slot, type_code, .. } if type_code.is_german_string() => slots | 1 << slot,
-        _ => slots,
-    })
-}
-
 /// Rebase the string columns [`copy_column`] wrote for `copies`, their cells
 /// read from `src_blob`, onto the heap [`Batch::carry_heap`] left at `heap_at`.
 pub(crate) fn rebase_copied_strings(
@@ -163,15 +155,12 @@ fn widen_cells<const DW: usize, const PK: bool>(
 // MapPlan
 // ---------------------------------------------------------------------------
 
-/// Map/projection: the resolved program's columnar moves and computed columns,
-/// the null permutation, where the output PK comes from, and the output schema
-/// it stamps.
+/// Map/projection: the resolved program's column moves and computed columns,
+/// where the output PK comes from, and the output schema it stamps.
 pub struct MapPlan {
     ev: MapEval,
     /// Where the output PK region comes from.
     pk_source: PkSource,
-    /// The input's German-string payload slots some copy reads.
-    copied_string_slots: u64,
     output_schema: SchemaDescriptor,
 }
 
@@ -287,7 +276,7 @@ impl MapPlan {
     /// Map plan from a logical expression program. A pure projection is the
     /// special case where the program computes nothing and every sink is a
     /// column copy (see [`LogicalProgram::copy_cols`]): the plan reduces to the
-    /// copy list and the resolved program's null permutation.
+    /// map's column moves.
     fn from_map(
         logical: LogicalProgram,
         in_schema: &SchemaDescriptor,
@@ -298,7 +287,6 @@ impl MapPlan {
             .resolve_map(in_schema, out_schema)
             .map_err(|e| format!("map: program/schema mismatch: {e}"))?;
         Ok(MapPlan {
-            copied_string_slots: copied_string_slots(ev.copies()),
             ev,
             pk_source,
             output_schema: *out_schema,
@@ -322,8 +310,8 @@ impl MapPlan {
         // A PK column is never NULL, and a reindex copies each kept column at
         // its own type.
         debug_assert!(*drop_nulls == 0 && !self.ev.emits_anything());
-        debug_assert!(self.ev.copies().iter().all(|c| c.width == c.src.size()));
-        Some(self.ev.copies().iter().map(|c| c.src).collect())
+        debug_assert!(self.ev.moves().copies().iter().all(|c| c.width == c.src.size()));
+        Some(self.ev.moves().copies().iter().map(|c| c.src).collect())
     }
 
     /// True iff this map copies its input's PK region verbatim, and so keeps
@@ -385,7 +373,7 @@ impl MapPlan {
             None => (src, ranges),
         };
         // Declined, the carry reserves for relocated copies and string emits alike.
-        let heap_at = out.carry_heap(&src.as_mem_batch(), self.copied_string_slots, ranges);
+        let heap_at = out.carry_heap(&src.as_mem_batch(), self.ev.moves().string_slots(), ranges);
         out.append_session(total).write(total, |out| {
             let mb = src.as_mem_batch();
             match &self.pk_source {
@@ -405,13 +393,13 @@ impl MapPlan {
             let mut dst = 0;
             for &(start, end) in ranges {
                 let w = RowWindow { src: start, dst, n: end - start };
-                for c in self.ev.copies() {
+                for c in self.ev.moves().copies() {
                     copy_column(src, out, c, w);
                 }
                 self.ev.write_computed(&mb, start, w.n, out, dst);
                 dst += w.n;
             }
-            rebase_copied_strings(self.ev.copies(), out, src.blob(), heap_at);
+            rebase_copied_strings(self.ev.moves().copies(), out, src.blob(), heap_at);
             if let PkSource::HashRow(fold) = &self.pk_source {
                 reindex_hash_row(out, fold);
             }

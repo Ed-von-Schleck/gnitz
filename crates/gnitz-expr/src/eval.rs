@@ -1,6 +1,6 @@
-//! The evaluator ([`Evaluator`]),
-//! wrapped in one public type per consumer — [`RowFilter`], [`MapEval`],
-//! [`ScalarEval`] — each exposing only its own read-back.
+//! The evaluator ([`Evaluator`]) wrapped for a filter ([`RowFilter`]) and for a
+//! scalar ([`ScalarEval`]), each exposing only its own read-back. A map's
+//! wrapper, [`crate::MapEval`], is in `map.rs`.
 //!
 //! Row ranges are half-open everywhere in this file: `end` is EXCLUSIVE.
 
@@ -9,13 +9,13 @@ use gnitz_wire::KeyRange;
 use crate::batch::Evaluator;
 #[cfg(test)]
 use crate::batch::MorselOut;
-use crate::program::{ColCopy, MapSinks, ReadAs};
+use crate::program::ReadAs;
 use crate::range::RangeMembership;
 #[cfg(test)]
 use crate::simd::Level;
 #[cfg(test)]
 use crate::ResolvedProgram;
-use crate::{BatchView, ExprValidateErr, LogicalProgram, MapTarget, SchemaDescriptor, Sink};
+use crate::{BatchView, ExprValidateErr, LogicalProgram, SchemaDescriptor, Sink};
 
 /// One program's result for every row of a batch, in the shape its result
 /// register's class fixes.
@@ -35,7 +35,7 @@ pub enum ExprResults {
 /// against the schemas it will run on, which is what checks it against them.
 impl LogicalProgram {
     /// A filter predicate; its result must not be a string.
-    pub fn resolve_filter(self, schema: &SchemaDescriptor) -> Result<RowFilter, ExprValidateErr> {
+    pub fn resolve_filter(&self, schema: &SchemaDescriptor) -> Result<RowFilter, ExprValidateErr> {
         let [Sink::Reg(r)] = self.sinks[..] else {
             return Err(ExprValidateErr::OutputRoleMismatch);
         };
@@ -55,7 +55,7 @@ impl LogicalProgram {
     }
 
     /// A scalar expression, one value per row.
-    pub fn resolve_scalar(self, schema: &SchemaDescriptor) -> Result<ScalarEval, ExprValidateErr> {
+    pub fn resolve_scalar(&self, schema: &SchemaDescriptor) -> Result<ScalarEval, ExprValidateErr> {
         let [Sink::Reg(r)] = self.sinks[..] else {
             return Err(ExprValidateErr::OutputRoleMismatch);
         };
@@ -71,23 +71,6 @@ impl LogicalProgram {
             class,
         })
     }
-
-    /// A map from `in_schema` to `out_schema`, covering every output payload slot
-    /// exactly once.
-    pub fn resolve_map(
-        self,
-        in_schema: &SchemaDescriptor,
-        out_schema: &SchemaDescriptor,
-    ) -> Result<MapEval, ExprValidateErr> {
-        let prog = self.resolve_program(in_schema, ReadAs::Value)?;
-        let sinks = self.map_sinks(in_schema, out_schema)?;
-        let is_identity = self.is_identity_map(in_schema, out_schema);
-        Ok(MapEval {
-            ev: Evaluator::new(prog),
-            sinks,
-            is_identity,
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +78,7 @@ impl LogicalProgram {
 // ---------------------------------------------------------------------------
 
 /// A predicate's evaluator and the register its verdict lands in.
-pub(crate) struct FilterEval {
+struct FilterEval {
     ev: Evaluator,
     result_reg: usize,
 }
@@ -146,16 +129,11 @@ impl RowFilter {
         self.words.resize(n.div_ceil(64), 0);
         let words = &mut self.words[..];
         match &mut self.pred {
-            Some(FilterEval { ev, result_reg }) => ev.eval_morsels(mb, 0, n, |rel_start, out| {
+            Some(FilterEval { ev, result_reg }) => ev.eval_morsels(mb, 0, n, |rel_start, mo| {
                 let first = rel_start / 64;
-                out.filter_words(*result_reg, &mut words[first..first + out.rows().div_ceil(64)]);
+                mo.filter_words(*result_reg, &mut words[first..first + mo.rows().div_ceil(64)]);
             }),
-            None => {
-                words.fill(u64::MAX);
-                if !n.is_multiple_of(64) {
-                    words[n / 64] = gnitz_wire::low_bits_mask(n % 64);
-                }
-            }
+            None => words.fill(u64::MAX),
         }
         if let Some(w) = &self.walk {
             w.and_into(mb, words);
@@ -219,69 +197,6 @@ impl ScalarEval {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MapEval
-// ---------------------------------------------------------------------------
-
-/// A map: column moves the caller runs, and the computed columns
-/// [`Self::write_computed`] writes.
-pub struct MapEval {
-    ev: Evaluator,
-    sinks: MapSinks,
-    is_identity: bool,
-}
-
-impl MapEval {
-    pub fn copies(&self) -> &[ColCopy] {
-        &self.sinks.copies
-    }
-
-    /// True iff some output slot is computed rather than copied.
-    pub fn emits_anything(&self) -> bool {
-        !self.sinks.scalar_emits.is_empty() || !self.sinks.str_emits.is_empty()
-    }
-
-    /// True iff some computed output slot is a German string, whose cell may spill into the
-    /// output heap.
-    pub fn emits_a_string(&self) -> bool {
-        !self.sinks.str_emits.is_empty()
-    }
-
-    /// True iff the map reproduces its input, given the input's PK carried through.
-    pub fn is_identity(&self) -> bool {
-        self.is_identity
-    }
-
-    /// Write the null words and computed columns of source rows
-    /// `src_start..src_start + n` into `dst` rows from `dst_start`.
-    pub fn write_computed(
-        &mut self,
-        src: &dyn BatchView,
-        src_start: usize,
-        n: usize,
-        dst: &mut dyn MapTarget,
-        dst_start: usize,
-    ) {
-        let emits = self.emits_anything();
-        let MapEval { ev, sinks, .. } = self;
-        sinks
-            .null_perm
-            .write_rows(src.null_bmp(), src_start, dst.null_bmp_mut(), dst_start, n);
-        if !emits {
-            return;
-        }
-        ev.eval_morsels(src, src_start, n, |rel_start, out| {
-            let row0 = dst_start + rel_start;
-            for e in &sinks.scalar_emits {
-                out.emit_scalar(e, dst.slot_mut(e.slot), row0);
-            }
-            for e in &sinks.str_emits {
-                out.emit_str(e, dst.slot_mut(e.slot), row0);
-            }
-        });
-    }
-}
-
 /// The evaluator behind each public type, for tests that read its resolved
 /// program or switch its arm and level. A filter without a predicate has no
 /// evaluator.
@@ -340,15 +255,9 @@ impl Resolved for ScalarEval {
 }
 
 #[cfg(test)]
-impl Resolved for MapEval {
-    fn ev(&self) -> Option<&Evaluator> {
-        Some(&self.ev)
-    }
-    fn ev_mut(&mut self) -> Option<&mut Evaluator> {
-        Some(&mut self.ev)
-    }
-}
-
-#[cfg(test)]
 #[path = "tests/eval.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/eval.rs"]
+mod bench;

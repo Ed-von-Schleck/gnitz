@@ -130,7 +130,7 @@ impl<'a> DirectWriter<'a> {
     pub(crate) fn split_mut(&mut self) -> (impl Iterator<Item = &mut [u8]>, &mut Vec<u8>, Option<&mut BlobCache>) {
         let (schema, cap, at, rows) = (self.schema, self.cap, self.at, self.rows);
         let mut rest = &mut *self.data;
-        let regions = (0..schema.num_regions()).map(move |r| {
+        let regions = (0..schema.num_fixed_regions()).map(move |r| {
             let stride = schema.region_stride(r);
             let (region, tail) = std::mem::take(&mut rest).split_at_mut(cap * stride);
             rest = tail;

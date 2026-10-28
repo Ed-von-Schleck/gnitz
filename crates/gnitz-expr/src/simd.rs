@@ -307,3 +307,7 @@ fn bit_lanes_at<S: Simd>(simd: S, bits: &[u64], d: &mut [i64]) {
 #[cfg(test)]
 #[path = "tests/simd.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/simd.rs"]
+mod bench;

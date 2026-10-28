@@ -51,7 +51,8 @@ fn a_computed_map_copies_and_computes_every_row_at_its_weight() {
         ],
         vec![Sink::Col(2), Sink::Col(1), Sink::Reg(Reg(2))],
         vec![],
-    );
+    )
+    .unwrap();
     let mut plan = compute(&in_schema, prog, &[(TypeCode::I64, true); 3]);
 
     let input = make_int_batch(
@@ -211,7 +212,8 @@ fn appended_runs_map_as_their_rows_alone() {
         ],
         vec![Sink::Col(2), Sink::Reg(Reg(2))],
         vec![],
-    );
+    )
+    .unwrap();
     let plans = [
         (
             "compute",
@@ -286,7 +288,8 @@ fn a_string_emit_composes_with_a_copy_of_its_source() {
         ],
         vec![Sink::Col(1), Sink::Reg(Reg(2))],
         vec![b"-suffix".to_vec()],
-    );
+    )
+    .unwrap();
     let mut plan = compute(&in_schema, prog, &[(TypeCode::String, true); 2]);
     let out = plan.evaluate_map_batch(&batch);
 

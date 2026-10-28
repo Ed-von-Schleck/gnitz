@@ -57,15 +57,14 @@ fn pack_words(src: &[u8], word: FixedInt) -> Option<(Encoding, Vec<u8>)> {
 fn pack_fixed_column(col: &SchemaColumn, pi: usize, src: &[u8], nulls: &[u8]) -> Option<(Encoding, Vec<u8>)> {
     let n = nulls.len() / FIXED_REGION_BYTES;
     let width = col.size();
-    let framed = col
-        .fixed_int()
+    let framed = FixedInt::from_type_code(col.type_code)
         .and_then(|fi| for_encode(src, fi))
         .filter(|image| aligned(image.len()) < aligned(src.len()));
     let limit = framed.as_ref().map_or(src.len(), Vec::len) / 2;
     let is_null = |row: usize| gnitz_wire::null_word_get(read_u64_le(nulls, row * FIXED_REGION_BYTES), pi);
     // A column under half NULL has more cells than half the region holds.
     let sparse = (col.nullable && (0..n).filter(|&r| is_null(r)).count() > n / 2)
-        .then(|| sparse_encode(src, width, col.fixed_int(), is_null))
+        .then(|| sparse_encode(src, width, FixedInt::from_type_code(col.type_code), is_null))
         .filter(|image| aligned(image.len()) < aligned(limit));
     let limit = sparse.as_ref().map_or(limit, Vec::len);
     let dict = (dict_image_len(n, 2) < limit && sample_repeats(n, |row| &src[row * width..][..width]))

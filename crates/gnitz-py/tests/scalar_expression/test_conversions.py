@@ -27,7 +27,7 @@ F32_2_7 = struct.unpack("f", struct.pack("f", 2.7))[0]
 
 # `(i, u, f, g, w, s)` by id.
 _SEED = ("INSERT INTO t VALUES "
-         f"(1, 100, 5, 2.7, 1.5, 3000000000, '42'), "
+         f"(1, 100, 5, 2.7, 2.7, 3000000000, '42'), "
          f"(2, 300, {U64_HIGH}, 1e300, -0.25, 0, ' -7 '), "
          f"(3, -1, 0, 1e-300, 0.0, 1, '1.5'), "
          f"(4, {I64_MIN}, {U64_MAX}, 1.5, 1.5, 4, '42abc'), "
@@ -52,7 +52,7 @@ _CONVERSIONS = {
     # error.
     "CAST(f AS FLOAT)": (F64, [F32_2_7, None, 0.0, 1.5, 0.0]),
     "CAST(i AS DOUBLE)": (F64, [100.0, 300.0, -1.0, float(I64_MIN), float(I64_MAX)]),
-    "-g": (F64, [-1.5, 0.25, -0.0, -1.5, -2.0]),
+    "-g": (F64, [-F32_2_7, 0.25, -0.0, -1.5, -2.0]),
     # A U32 lands on I64 because every U32 value fits there, and a U32 sum
     # cannot reach 2^63.
     "-w": (I64, [-3000000000, 0, -1, -4, -7]),
@@ -66,6 +66,8 @@ _CONVERSIONS = {
     # Outside [1e-4, 1e15) the float form goes scientific, which is what keeps
     # the printed length bounded.
     "CAST(f AS TEXT)": (STR, ["2.7", "1e300", "1e-300", "1.5", "0"]),
+    # A FLOAT column prints as its own f32, not as the f64 it widens to.
+    "CAST(g AS TEXT)": (STR, ["2.7", "-0.25", "0", "1.5", "2"]),
     # The print side reads its operand's signedness from the register rather
     # than the column: a U64 above 2^63 must not print negative.
     "CAST(u AS TEXT)": (STR, ["5", str(U64_HIGH), "0", str(U64_MAX), "3"]),

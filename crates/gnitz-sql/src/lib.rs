@@ -35,7 +35,7 @@ pub use ddl::render::{
     view_body,
 };
 pub use error::GnitzSqlError;
-pub use literal::parse_bool;
+pub use literal::{parse_bool, place_scaled, Placed};
 pub use source::Offsets;
 pub use sqlparser;
 pub use types::{sql_type_name, type_names};

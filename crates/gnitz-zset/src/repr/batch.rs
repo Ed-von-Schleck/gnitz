@@ -43,12 +43,12 @@ pub(crate) fn runs_where(n: usize, keep: impl Fn(usize) -> bool) -> Vec<(usize, 
 /// hold every region at the same place, so they copy as one run.
 fn copy_regions(schema: &SchemaDescriptor, src: &[u8], src_cap: usize, dst: &mut [u8], dst_cap: usize, count: usize) {
     if src_cap == dst_cap {
-        let last = schema.num_regions() - 1;
+        let last = schema.num_fixed_regions() - 1;
         let used = schema.region_start(last, src_cap) + count * schema.region_stride(last);
         dst[..used].copy_from_slice(&src[..used]);
         return;
     }
-    for r in 0..schema.num_regions() {
+    for r in 0..schema.num_fixed_regions() {
         let len = count * schema.region_stride(r);
         let (s, d) = (schema.region_start(r, src_cap), schema.region_start(r, dst_cap));
         dst[d..d + len].copy_from_slice(&src[s..s + len]);
@@ -387,7 +387,7 @@ impl Batch {
             // SAFETY: `new_total` is within the capacity, and the bytes past the old
             // length are rows no reader reaches.
             unsafe { self.data.set_len(new_total) };
-            for r in (0..schema.num_regions()).rev() {
+            for r in (0..schema.num_fixed_regions()).rev() {
                 let old = schema.region_start(r, self.capacity);
                 let len = self.count * schema.region_stride(r);
                 self.data.copy_within(old..old + len, schema.region_start(r, new_cap));
@@ -401,7 +401,7 @@ impl Batch {
     /// nothing wrote sees an implausible value rather than a plausible leftover.
     fn debug_poison_rows(&mut self, rows: Range<usize>) {
         if cfg!(debug_assertions) {
-            for r in 0..self.schema.num_regions() {
+            for r in 0..self.schema.num_fixed_regions() {
                 let (start, s) = (self.region_start(r), self.schema.region_stride(r));
                 self.data[start + rows.start * s..start + rows.end * s].fill(0xA5);
             }
@@ -651,7 +651,7 @@ impl Batch {
         }
         self.consolidated = false;
         let (lo, hi) = (a.min(b), a.max(b));
-        for r in 0..self.schema.num_regions() {
+        for r in 0..self.schema.num_fixed_regions() {
             let stride = self.schema.region_stride(r);
             let start = self.region_start(r);
             let (head, tail) = self.data[start..start + self.count * stride].split_at_mut(hi * stride);

@@ -531,7 +531,7 @@ pub const SYS_SCHEMA_DIGEST: u64 = {
 
 /// Version of the compiled expression-program blob `gnitz-expr` lays out, folded
 /// into [`SYS_SCHEMA_DIGEST`].
-pub const EXPR_BLOB_VERSION: u8 = 7;
+pub const EXPR_BLOB_VERSION: u8 = 8;
 
 // ---------------------------------------------------------------------------
 // Object-id ranges

@@ -16,7 +16,7 @@ use pyo3::types::{PyDate, PyDateAccess, PyDateTime, PyDict, PyString, PyTimeAcce
 use pyo3::Borrowed;
 
 use gnitz_core::{PkColumn, Schema, ZSetBatch};
-use gnitz_expr::place::{place_scaled, Placed};
+use gnitz_sql::{place_scaled, Placed};
 use gnitz_wire::{parse_decimal_text, ColType, ColumnDef, FixedInt, ReadBound, ReadSpec, TypeCode, MAX_PK_COLUMNS};
 
 use crate::read::{present, PyScanResult};
@@ -598,7 +598,7 @@ fn extract_uuid(val: &Bound<'_, PyAny>) -> PyResult<u128> {
 
 /// Days since the epoch of a `datetime.date` (or the date of a `datetime`).
 fn py_days(d: &impl PyDateAccess) -> i64 {
-    gnitz_expr::calendar::days_from_civil(d.get_year() as i64, d.get_month() as u32, d.get_day() as u32)
+    gnitz_wire::days_from_civil(d.get_year() as i64, d.get_month() as u32, d.get_day() as u32)
 }
 
 /// An aware `datetime` carries an offset no column stores.
@@ -634,7 +634,7 @@ fn extract_days(item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<i32> {
 /// A TIMESTAMP value: a naive `datetime.datetime`, a `datetime.date` at
 /// midnight, or microseconds since the epoch as an int.
 fn extract_micros(item: &Bound<'_, PyAny>) -> PyResult<i64> {
-    use gnitz_expr::calendar::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MIN, MICROS_PER_SEC};
+    use gnitz_wire::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MIN, MICROS_PER_SEC};
     if let Ok(dt) = item.cast::<PyDateTime>() {
         refuse_aware(dt)?;
         return Ok(py_days(dt) * MICROS_PER_DAY

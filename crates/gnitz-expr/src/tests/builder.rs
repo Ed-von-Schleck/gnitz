@@ -86,3 +86,47 @@ fn a_to_micros_over_a_constant_folds_unless_it_overflows() {
     ));
     assert!(matches!(to_micros(i64::MAX)[..], [_, L::Calendar { .. }]));
 }
+
+/// Every integer-stored slot type takes the sink `slot_sink` builds, whatever the
+/// register's source: a wider column, a column of the slot's own type, a value
+/// already checked into the slot's type, which costs no second check, or one
+/// checked into another type of the same width, which a narrow slot checks again.
+#[test]
+fn a_slot_sink_resolves_into_its_slot_from_any_integer_source() {
+    use crate::test_support::schema_pk;
+    use gnitz_wire::{FixedInt, TypeCode};
+    for &tc in TypeCode::ALL {
+        let Some(fi) = FixedInt::from_type_code(tc) else {
+            continue;
+        };
+        use FixedInt as F;
+        let same_width = [F::U8, F::I8, F::U16, F::I16, F::U32, F::I32, F::U64, F::I64]
+            .into_iter()
+            .find(|other| other.width() == fi.width() && *other != fi)
+            .expect("each width has a signed and an unsigned type");
+        for (input, cast) in [
+            (TypeCode::I64, None),
+            (tc, None),
+            (TypeCode::I64, Some(fi)),
+            (TypeCode::I64, Some(same_width)),
+        ] {
+            let mut b = ExprBuilder::new();
+            let mut reg = b.emit(L::LoadCol { col: 1 });
+            if let Some(fi) = cast {
+                reg = b.emit(L::IntCast { a: reg, fi });
+            }
+            let before = b.instrs.len();
+            let sink = b.slot_sink(reg, tc);
+            let added = b.instrs.len() - before;
+            let prog = b.build(vec![sink]).expect("a well-formed program");
+            let got = prog.resolve_map(&schema_pk(&[input], true), &schema_pk(&[tc], true));
+            assert!(got.is_ok(), "{input:?} through {cast:?} into {tc:?}: {:?}", got.err());
+            let narrow = fi.width() < 8 && tc != TypeCode::Bool;
+            if cast == Some(fi) {
+                assert_eq!(added, 0, "{tc:?} from a value already checked into it");
+            } else if cast == Some(same_width) {
+                assert_eq!(added, usize::from(narrow), "{tc:?} from a {same_width:?} value");
+            }
+        }
+    }
+}

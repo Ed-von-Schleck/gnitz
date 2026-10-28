@@ -70,16 +70,13 @@ impl SinkPlan {
                 let cut = match cut {
                     None => None,
                     Some(RowsCut { k, order }) => {
-                        for key in order {
-                            sink_in.wire_col("order key column", key.col as u32)?;
-                        }
                         // Saturated: a wrapped negative window would truncate the answer.
                         let window = i64::try_from(k.get()).unwrap_or(i64::MAX);
                         Some(if order.is_empty() {
                             Cut::Prefix { left: window }
                         } else {
                             Cut::TopK(TopK {
-                                order: order_locators(order, &sink_in, true),
+                                order: order_locators(order, &sink_in, true)?,
                                 window,
                                 summed: 0,
                                 bound: None,

@@ -2,6 +2,9 @@
 //! [`LogicalProgram`]. A caller emits freely; [`ExprBuilder::build`] is where it
 //! is told, once, what is unsupported.
 
+use gnitz_wire::{FixedInt, TypeCode};
+
+use crate::map::EmitStore;
 use crate::{CalendarOp, ConstIdx, ExprValidateErr, LogicalInstr, LogicalProgram, Reg, Sink, MAX_REGS};
 
 /// Accumulates the instructions and constants of one expression program.
@@ -103,11 +106,24 @@ impl ExprBuilder {
         self.add_const_bytes(gnitz_wire::as_le_bytes(&values))
     }
 
+    /// The sink storing `reg` into an output slot of type `slot`: through a range
+    /// check into the slot's integer type unless a map already admits `reg` there.
+    pub fn slot_sink(&mut self, reg: Reg, slot: TypeCode) -> Sink {
+        let admitted = self
+            .instrs
+            .get(reg.0 as usize)
+            .is_some_and(|i| EmitStore::for_slot(slot, i).is_some());
+        match FixedInt::from_type_code(slot) {
+            Some(fi) if !admitted => Sink::Reg(self.emit(LogicalInstr::IntCast { a: reg, fi })),
+            _ => Sink::Reg(reg),
+        }
+    }
+
     /// The typed program, held to every structural rule a schema is not needed
     /// for. `sinks` is its output — one `Sink::Reg` for a filter or scalar, one
     /// sink per output payload slot for a map.
     pub fn build(self, sinks: Vec<Sink>) -> Result<LogicalProgram, ExprValidateErr> {
-        LogicalProgram::from_instrs(self.instrs, sinks, self.const_strings)
+        LogicalProgram::new(self.instrs, sinks, self.const_strings)
     }
 }
 

@@ -17,7 +17,7 @@ pub const REG_PAYLOAD_START: usize = REG_NULL_BMP + 1;
 /// Bytes per row in the weight and null-bitmap regions.
 pub const FIXED_REGION_BYTES: usize = 8;
 
-/// The fixed three, one per payload column, and the blob heap.
+/// Every region of a batch: PK, weight and null words, one per payload column, and the blob heap.
 pub const fn num_regions(num_payload_cols: usize) -> usize {
     REG_PAYLOAD_START + num_payload_cols + 1
 }

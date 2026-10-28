@@ -1,27 +1,14 @@
 //! The schema descriptor: a column table and PK list with every layout fact
 //! derived from them — the *schema* peer of [`crate::BatchView`]'s *access*
-//! contract, linked by the engine and the client alike.
+//! contract, linked by the engine and the client alike. A reduce's output key is
+//! one of those facts, and the descriptor's schema-block codec is here too.
 
 use gnitz_wire::schema_block::SchemaBlockCol;
 use gnitz_wire::{ColType, PkListRole, PkRule, TypeCode, MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS};
 
 use crate::ColumnLocator;
 
-/// Payload slot of column `ci`: its position among the columns not in `pk`, or
-/// `None` for a PK column.
-const fn payload_slot(pk: &[u32], ci: usize) -> Option<usize> {
-    let mut below = 0;
-    let mut k = 0;
-    while k < pk.len() {
-        if pk[k] as usize == ci {
-            return None;
-        }
-        below += ((pk[k] as usize) < ci) as usize;
-        k += 1;
-    }
-    Some(ci - below)
-}
-
+/// One column's type and nullability; its cell width and signedness are cached from `type_code`.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SchemaColumn {
@@ -63,13 +50,6 @@ impl SchemaColumn {
     pub const fn is_signed(&self) -> bool {
         self.is_signed != 0
     }
-
-    /// This column's type as a ≤ 8-byte integer, or `None` for any other type —
-    /// the one rule the shard writer packs FoR by and the reader accepts it by.
-    #[inline]
-    pub fn fixed_int(&self) -> Option<gnitz_wire::FixedInt> {
-        gnitz_wire::FixedInt::from_type_code(self.type_code)
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -80,7 +60,7 @@ pub struct SchemaDescriptor {
     /// Bit `pi` set iff payload slot `pi` admits NULL.
     nullable_slots: u64,
     /// Region `r`'s byte offset within one row's fixed bytes, in canonical
-    /// region order; entry `num_regions()` is the row width.
+    /// region order; entry `num_fixed_regions()` is the row width.
     region_off: [u16; gnitz_wire::MAX_WIRE_REGIONS],
     num_columns: u32,
     pk_count: u32,
@@ -153,10 +133,11 @@ impl SchemaDescriptor {
         let mut pk = [0u32; MAX_PK_COLUMNS];
         pk[..pk_indices.len()].copy_from_slice(pk_indices);
         let mut payload_to_ci = [0u8; MAX_COLUMNS];
-        for ci in 0..cols.len() {
-            if let Some(pi) = payload_slot(pk_indices, ci) {
-                payload_to_ci[pi] = ci as u8;
-            }
+        for (pi, ci) in (0..cols.len())
+            .filter(|&ci| !pk_indices.contains(&(ci as u32)))
+            .enumerate()
+        {
+            payload_to_ci[pi] = ci as u8;
         }
         let num_payload = cols.len() - pk_indices.len();
         let payload = payload_to_ci[..num_payload].iter().map(|&ci| cols[ci as usize]);
@@ -208,13 +189,16 @@ impl SchemaDescriptor {
         self.num_columns as usize
     }
 
-    /// True when `self` is `prev` with zero or more columns appended — every
-    /// column `prev` had keeping its position, `type_code` and PK membership.
-    /// What leaves a baked span-encode plan's offsets and payload slots valid.
+    /// True when `self` is `prev` with zero or more columns appended: every column `prev` had
+    /// keeps its position, `type_code` and PK membership.
     pub fn is_trailing_append_of(&self, prev: &SchemaDescriptor) -> bool {
         self.pk_cols() == prev.pk_cols()
             && self.num_columns() >= prev.num_columns()
-            && (0..prev.num_columns()).all(|i| self.columns[i].type_code == prev.columns[i].type_code)
+            && self
+                .columns()
+                .iter()
+                .zip(prev.columns())
+                .all(|(a, b)| a.type_code == b.type_code)
     }
 
     /// The PK columns in PK-list order, as `(col_idx, &SchemaColumn)`.
@@ -275,14 +259,14 @@ impl SchemaDescriptor {
 
     /// Fixed regions of a batch: PK, weight, null words, one per payload column.
     #[inline(always)]
-    pub const fn num_regions(&self) -> usize {
+    pub const fn num_fixed_regions(&self) -> usize {
         gnitz_wire::REG_PAYLOAD_START + self.num_payload_cols()
     }
 
     /// One row's bytes across the fixed regions.
     #[inline(always)]
     pub const fn row_width(&self) -> usize {
-        self.region_off[self.num_regions()] as usize
+        self.region_off[self.num_fixed_regions()] as usize
     }
 
     /// Where region `r` starts in an arena of `cap` rows: the regions lie back to
@@ -300,7 +284,7 @@ impl SchemaDescriptor {
 
     /// Whether `other` lays a batch's regions out as this schema does.
     pub fn same_regions(&self, other: &SchemaDescriptor) -> bool {
-        self.region_off[..=self.num_regions()] == other.region_off[..=other.num_regions()]
+        self.region_off[..=self.num_fixed_regions()] == other.region_off[..=other.num_fixed_regions()]
     }
 
     /// The capacity an arena for `rows` rows is allocated at: `rows` itself below
@@ -376,30 +360,27 @@ impl SchemaDescriptor {
 
     /// Where column `ci`'s value physically lives, or `None` when `ci` is out of
     /// range.
-    pub fn try_locate(&self, ci: usize) -> Option<ColumnLocator> {
+    pub(crate) fn try_locate(&self, ci: usize) -> Option<ColumnLocator> {
         if ci >= self.num_columns() {
             return None;
         }
         let SchemaColumn { type_code, size, .. } = self.columns[ci];
-        Some(match payload_slot(self.pk_cols(), ci) {
-            Some(slot) => ColumnLocator::Payload { slot: slot as u8, size, type_code },
-            None => {
-                let k = self
-                    .pk_cols()
-                    .iter()
-                    .position(|&p| p as usize == ci)
-                    .expect("a PK column");
-                ColumnLocator::Pk {
-                    byte_off: self.pk_prefix_stride(k) as u8,
-                    size,
-                    type_code,
-                }
-            }
+        let pk = self.pk_cols();
+        Some(match pk.iter().position(|&p| p as usize == ci) {
+            Some(k) => ColumnLocator::Pk {
+                byte_off: self.pk_prefix_stride(k) as u8,
+                size,
+                type_code,
+            },
+            None => ColumnLocator::Payload {
+                slot: (ci - pk.iter().filter(|&&p| (p as usize) < ci).count()) as u8,
+                size,
+                type_code,
+            },
         })
     }
 
-    /// [`Self::try_locate`] for a column that must exist. Panics on an
-    /// out-of-range `ci`.
+    /// Where column `ci`'s value physically lives. Panics on an out-of-range `ci`.
     pub fn locate(&self, ci: usize) -> ColumnLocator {
         self.try_locate(ci).unwrap_or_else(|| {
             panic!(
@@ -478,7 +459,7 @@ impl SchemaDescriptor {
     pub fn reduce_out_key(&self, group: &[u32]) -> ReduceOutKey {
         let natural = group == self.pk_cols()
             || matches!(*group, [c] if {
-                let col = self.columns[c as usize];
+                let col = self.columns()[c as usize];
                 // The PK region carries no null bitmap.
                 !col.nullable && col.type_code.is_pk_eligible()
             });
@@ -487,6 +468,22 @@ impl SchemaDescriptor {
         } else {
             ReduceOutKey::SyntheticFold
         }
+    }
+
+    /// A reduce's output layout ahead of its aggregates, grouped by `group` over this schema:
+    /// the key region (or the synthetic key), then each `row` column the key region does not
+    /// spell.
+    pub fn reduce_out_layout(&self, group: &[u32], row: impl IntoIterator<Item = u32>) -> Vec<ReduceOutSlot> {
+        let (mut slots, spelled): (Vec<ReduceOutSlot>, &[u32]) = match self.reduce_out_key(group) {
+            ReduceOutKey::SyntheticFold => (vec![ReduceOutSlot::SyntheticKey], &[]),
+            ReduceOutKey::Natural => (group.iter().map(|&c| ReduceOutSlot::Key(c)).collect(), group),
+        };
+        slots.extend(
+            row.into_iter()
+                .filter(|c| !spelled.contains(c))
+                .map(ReduceOutSlot::Carried),
+        );
+        slots
     }
 
     /// One row's PK as OPK bytes, from one native value per PK column in PK-list
@@ -538,10 +535,7 @@ impl std::fmt::Debug for SchemaDescriptor {
 
 impl PartialEq for SchemaDescriptor {
     fn eq(&self, other: &Self) -> bool {
-        if self.num_columns() != other.num_columns() || self.pk_cols() != other.pk_cols() {
-            return false;
-        }
-        self.columns[..self.num_columns()] == other.columns[..other.num_columns()]
+        self.pk_cols() == other.pk_cols() && self.columns() == other.columns()
     }
 }
 
@@ -563,7 +557,7 @@ pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
 /// Encode `schema`'s physical column shape — the inverse of
 /// [`decode_schema_block`]: no names, no hidden flag, every scale zero.
 pub fn encode_schema_block(schema: &SchemaDescriptor) -> Vec<u8> {
-    let cols = schema.columns[..schema.num_columns()].iter().map(|c| SchemaBlockCol {
+    let cols = schema.columns().iter().map(|c| SchemaBlockCol {
         ty: ColType::of(c.type_code),
         nullable: c.nullable,
         hidden: false,
@@ -587,25 +581,8 @@ pub enum ReduceOutKey {
     SyntheticFold,
 }
 
-impl ReduceOutKey {
-    /// An output's layout ahead of its aggregates: the key region (or the synthetic
-    /// key), then each `row` column the key region does not spell.
-    pub fn output_layout(self, group_cols: &[u32], row: impl IntoIterator<Item = u32>) -> Vec<ReduceOutSlot> {
-        let (mut slots, spelled): (Vec<ReduceOutSlot>, &[u32]) = match self {
-            ReduceOutKey::SyntheticFold => (vec![ReduceOutSlot::SyntheticKey], &[]),
-            ReduceOutKey::Natural => (group_cols.iter().map(|&c| ReduceOutSlot::Key(c)).collect(), group_cols),
-        };
-        slots.extend(
-            row.into_iter()
-                .filter(|c| !spelled.contains(c))
-                .map(ReduceOutSlot::Carried),
-        );
-        slots
-    }
-}
-
 /// One slot of a reduce's output layout, ahead of the aggregate columns. See
-/// [`ReduceOutKey::output_layout`].
+/// [`SchemaDescriptor::reduce_out_layout`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReduceOutSlot {
     /// The synthetic `U128` fold key: slot 0 of the fold arm, and its whole PK.

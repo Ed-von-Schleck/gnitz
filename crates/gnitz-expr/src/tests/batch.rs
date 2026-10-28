@@ -521,7 +521,8 @@ fn float_minmax2_uses_total_cmp_order() {
 /// microseconds; `ToMicros` NULLs a day count past `i64` microseconds.
 #[test]
 fn calendar_ops_read_their_columns_representation() {
-    use crate::calendar::{days_to_micros, eval, MICROS_PER_DAY};
+    use crate::calendar::{days_to_micros, eval};
+    use gnitz_wire::MICROS_PER_DAY;
     let days = [-719_528i64, -1, 0, 19_782, 2_932_896];
     let micros: Vec<i64> = days.iter().map(|d| d * MICROS_PER_DAY + 49_507_000_005).collect();
     for op in CalendarOp::ALL.iter().copied().filter(|&op| op != CalendarOp::ToMicros) {
@@ -594,16 +595,16 @@ fn every_string_column_addresses_its_own_region_in_place() {
         });
     }
     let mut ev = scalar_prog(&schema, instrs, vec![]);
+    let evaluator = ev.ev_mut().expect("an evaluated program");
 
     assert_eq!(
-        ev.prog().str_cols,
-        (1u64 << N) - 1,
-        "every string column the program loads is registered at its own slot",
+        evaluator.prog().payload_reads.to_vec(),
+        (0..N).map(|c| (c as u8, 16)).collect::<Vec<_>>(),
+        "every string column the program loads is read at its own slot",
     );
     // Drive the loads alone and read back which buffer each lane resolved
     // against — the claim the concatenation below cannot make, since its own
     // result always lands in the arena.
-    let evaluator = ev.ev_mut().expect("an evaluated program");
     evaluator.eval_morsels(&view, 0, 1, |_, _| {});
     let lanes = &evaluator.scratch.str_views;
     for (c, val) in vals.iter().enumerate() {
@@ -620,6 +621,28 @@ fn every_string_column_addresses_its_own_region_in_place() {
     }
 
     assert_eq!(text_rows(&mut ev, &view), [Some(vals.concat())]);
+}
+
+/// Each payload slot an instruction reads comes once, with the width its kernel
+/// reads it at, and a slot only a null test reads does not come.
+#[test]
+fn payload_reads_name_each_slot_at_its_cell_width() {
+    let cols = [
+        int(TypeCode::I16, [1]),
+        int(TypeCode::F32, [0]),
+        text(["s"]),
+        i64s([None::<i64>]),
+    ];
+    let (schema, _) = view(&cols);
+    let instrs = vec![
+        LogicalInstr::LoadCol { col: 1 },
+        LogicalInstr::LoadCol { col: 2 },
+        LogicalInstr::LoadColStr { col: 3 },
+        LogicalInstr::IsNull { col: 4, invert: false },
+    ];
+    let ev = scalar_prog(&schema, instrs, vec![]);
+    let prog = ev.ev().expect("an evaluated program").prog();
+    assert_eq!(*prog.payload_reads, [(0, 2), (1, 4), (2, 16)]);
 }
 
 /// UPPER and LOWER fold ASCII only: the neighbours of `a-z`/`A-Z` pass through,
@@ -885,7 +908,9 @@ fn float_to_text_is_bounded_and_round_trips() {
         f64::NEG_INFINITY,
         f64::NAN,
     ];
-    let got = strs(&[f64s(vals)], |r| vec![LogicalInstr::FloatToStr { a: r[0] }]);
+    let got = strs(&[f64s(vals)], |r| {
+        vec![LogicalInstr::FloatToStr { a: r[0], f32: false }]
+    });
     for (f, text) in vals.iter().zip(got) {
         let text = text.expect("a float's text is never NULL");
         assert!(text.len() <= 24, "{f} rendered {} bytes: {text}", text.len());
@@ -900,6 +925,19 @@ fn float_to_text_is_bounded_and_round_trips() {
                 "{f} must round-trip bit-exactly through {text}"
             ),
         }
+    }
+}
+
+/// An F32 column's text under `f32` is that f32's shortest form; without it,
+/// the widened f64's.
+#[test]
+fn float_to_text_spells_a_widened_f32_as_its_own() {
+    let col = int(TypeCode::F32, [i64::from(2.7f32.to_bits())]);
+    for (f32, want) in [(true, "2.7"), (false, "2.700000047683716")] {
+        let got = strs(std::slice::from_ref(&col), |r| {
+            vec![LogicalInstr::FloatToStr { a: r[0], f32 }]
+        });
+        assert_eq!(got, texts(&[Some(want)]), "f32: {f32}");
     }
 }
 

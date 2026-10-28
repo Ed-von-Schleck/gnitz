@@ -47,7 +47,8 @@ pub(crate) fn order_and_slice(
     } else {
         // A cut breaks ties by identity, so which tied rows it keeps is a function of the
         // rows alone. Uncut ties stay in input order.
-        let keys = order_locators(order, schema.layout(), cut);
+        let keys =
+            order_locators(order, schema.layout(), cut).expect("the planner orders by columns of its own schema");
         let mut ranking = RowRanking::new(&keys, &batch);
         ranking.keep_smallest(end);
         ranking.sorted()

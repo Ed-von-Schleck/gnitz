@@ -1,6 +1,6 @@
 //! Range membership over key images, driven through [`TestView`].
 
-use crate::test_support::{filter_verdicts, schema_pk, TestView};
+use crate::test_support::{filter_verdicts, schema_pk, TestView, PATTERNS};
 use crate::SchemaColumn;
 use crate::SchemaDescriptor;
 use crate::{ExprValidateErr, RowFilter};
@@ -11,7 +11,6 @@ use gnitz_wire::{image_mask, key_image, KeyRange, PkColList, TypeCode};
 /// type, walked through the key and through payload columns.
 #[test]
 fn every_walk_admits_exactly_the_rows_within_its_bounds() {
-    const PATTERNS: [u128; 9] = [0, 1, 0x7F, 0x80, 0xFF, 1 << 31, 1 << 63, 1 << 127, u128::MAX];
     const N: usize = 130;
     for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
         let mask = image_mask(tc.wire_stride());

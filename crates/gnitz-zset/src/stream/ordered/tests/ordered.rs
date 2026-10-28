@@ -35,7 +35,7 @@ pub(super) fn ordered_groups(
     keys: &[OrderKey],
 ) -> (Batch, Vec<OrderLocator>, Vec<Vec<usize>>) {
     let b = batch(rows);
-    let locs = order_locators(keys, &schema(), false);
+    let locs = order_locators(keys, &schema(), false).unwrap();
     let mut order: Vec<usize> = (0..rows.len()).collect();
     order.sort_by(|&x, &y| cmp_order_keys(&locs, &b.as_mem_batch(), x, y));
     let mut groups: BTreeMap<Cells, Vec<usize>> = BTreeMap::new();
@@ -81,9 +81,7 @@ impl Harness {
     /// columns the operator adds.
     pub(super) fn state(&self, group_cols: &[u32]) -> BTreeMap<(Cells, Cells), i64> {
         let n = schema().num_columns();
-        let layout = schema()
-            .reduce_out_key(group_cols)
-            .output_layout(group_cols, 0..n as u32);
+        let layout = schema().reduce_out_layout(group_cols, 0..n as u32);
         let b = self.out.cursor().materialize();
         let mb = b.as_mem_batch();
         let out = self.plan.output_schema();

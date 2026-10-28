@@ -269,8 +269,9 @@ impl Lowering<'_> {
                 self.eb.emit(L::IntToStr { a })
             }
             RegClass::Float | RegClass::Dec(_) => {
+                let f32 = self.ty(e).tc == TypeCode::F32;
                 let a = self.lower_to(e, ColType::of(TypeCode::F64))?;
-                self.eb.emit(L::FloatToStr { a })
+                self.eb.emit(L::FloatToStr { a, f32 })
             }
         })
     }
@@ -694,7 +695,7 @@ impl Lowering<'_> {
         }
         let a = self.lower_to(left, t.l)?;
         let b = self.lower_to(right, t.r)?;
-        Ok(self.eb.emit(match (op.as_cmp(), RegClass::of(t.l)) {
+        let r = self.eb.emit(match (op.as_cmp(), RegClass::of(t.l)) {
             (Some(op), RegClass::Str) => L::StrCmp { op, a, b },
             (Some(op), RegClass::Float) => L::FCmp { op, a, b },
             (Some(op), RegClass::Int | RegClass::Bool | RegClass::Dec(_)) => L::Cmp { op, a, b },
@@ -710,7 +711,11 @@ impl Lowering<'_> {
                     .expect("an operator over integers that is no comparison is arithmetic");
                 L::IntArith { op, a, b }
             }
-        }))
+        });
+        Ok(match t.result_check() {
+            Some(fi) => self.eb.emit(L::IntCast { a: r, fi }),
+            None => r,
+        })
     }
 }
 

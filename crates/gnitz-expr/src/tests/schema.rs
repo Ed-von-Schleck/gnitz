@@ -181,10 +181,10 @@ fn layout_facts_match_the_column_table() {
                     .map(|ci| cols[ci].0.wire_stride()),
             )
             .collect();
-        let strides: Vec<usize> = (0..s.num_regions()).map(|r| s.region_stride(r)).collect();
+        let strides: Vec<usize> = (0..s.num_fixed_regions()).map(|r| s.region_stride(r)).collect();
         assert_eq!(strides, widths, "{ctx}: region strides");
         for rows in [0, 1, 7, 8, 9, 100] {
-            let aligned = |cap: usize| (0..s.num_regions()).all(|r| s.region_start(r, cap).is_multiple_of(8));
+            let aligned = |cap: usize| (0..s.num_fixed_regions()).all(|r| s.region_start(r, cap).is_multiple_of(8));
             let want = match rows {
                 0..8 => rows,
                 _ => (rows..rows + 8)
@@ -320,29 +320,36 @@ fn reduce_out_key_picks_the_output_key() {
 }
 
 #[test]
-fn output_layout_is_the_key_region_then_the_unspelled_row() {
-    use ReduceOutKey::*;
+fn reduce_out_layout_is_the_key_region_then_the_unspelled_row() {
     use ReduceOutSlot::{Carried, Key, SyntheticKey};
-    // The fold key spells no input column, so the whole row rides behind it —
-    // group columns included, since the synthetic key is not one of them.
+    let schema = |c2_nullable: bool, pk: &[u32]| {
+        let u64_col = |nullable| SchemaColumn::new(TypeCode::U64, nullable);
+        SchemaDescriptor::new(
+            &[col(TypeCode::U64), u64_col(true), u64_col(c2_nullable), u64_col(true)],
+            pk,
+        )
+    };
+    // A nullable column takes the fold key, which spells no input column, so the whole row
+    // rides behind it — group columns included, since the synthetic key is not one of them.
+    let fold = schema(true, &[0]);
     assert_eq!(
-        SyntheticFold.output_layout(&[2], 0..4),
+        fold.reduce_out_layout(&[2], 0..4),
         vec![SyntheticKey, Carried(0), Carried(1), Carried(2), Carried(3)]
+    );
+    // A fold's row is its group set, a repeated column carried once per occurrence.
+    assert_eq!(
+        fold.reduce_out_layout(&[1, 1], [1, 1]),
+        vec![SyntheticKey, Carried(1), Carried(1)]
     );
     // A natural key column is in the PK region, so it is not carried again.
     assert_eq!(
-        Natural.output_layout(&[2], 0..4),
+        schema(false, &[0]).reduce_out_layout(&[2], 0..4),
         vec![Key(2), Carried(0), Carried(1), Carried(3)]
     );
     // The PK list keys on every PK column.
     assert_eq!(
-        Natural.output_layout(&[0, 2], 0..4),
+        schema(false, &[0, 2]).reduce_out_layout(&[0, 2], 0..4),
         vec![Key(0), Key(2), Carried(1), Carried(3)]
-    );
-    // A fold's row is its group set, a repeated column carried once per occurrence.
-    assert_eq!(
-        SyntheticFold.output_layout(&[1, 1], [1, 1]),
-        vec![SyntheticKey, Carried(1), Carried(1)]
     );
 }
 

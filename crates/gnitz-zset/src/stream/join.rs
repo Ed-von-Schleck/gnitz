@@ -18,7 +18,7 @@ use crate::schema::{DerivedSchema, SchemaDescriptor};
 
 use crate::algebra::MapPlan;
 use crate::stream::OpenAt;
-use gnitz_expr::{ColCopy, ColumnLocator, NullPerm};
+use gnitz_expr::{ColCopy, ColMoves, ColumnLocator};
 use gnitz_wire::{null_word_at, Heap, JoinKind, PkBuf, RangeRel, RowSource, TypeCode, MAX_PK_BYTES};
 
 // ---------------------------------------------------------------------------
@@ -32,11 +32,9 @@ pub struct JoinPlan {
     output_schema: SchemaDescriptor,
     walk: Walk,
     /// Each trace payload column: where the rows the cursor walks hold it, and
-    /// the output slot it fills. Those rows are the trace's own, or the rows of
-    /// the relation the trace re-keys.
-    t_cols: Box<[ColCopy]>,
-    /// The null bits `t_cols` carries, from a walked row's word to the output's.
-    t_nulls: NullPerm,
+    /// the output slot it fills, with the null bits it carries. Those rows are
+    /// the trace's own, or the rows of the relation the trace re-keys.
+    t_moves: ColMoves,
     /// The trace's columns lead the output payload: the delta is the right side.
     trace_leads: bool,
 }
@@ -146,16 +144,17 @@ impl JoinPlan {
             }
             JoinKind::Cross => Walk::Cross,
         };
-        let t_cols: Box<[ColCopy]> = (t_first..)
-            .zip(t_cols)
-            .map(|(slot, src)| ColCopy { src, slot, width: src.size() })
-            .collect();
-        let t_nulls = NullPerm::new(&t_cols, walked.nullable_payload_slots());
+        let t_moves = ColMoves::new(
+            (t_first..)
+                .zip(t_cols)
+                .map(|(slot, src)| ColCopy { src, slot, width: src.size() })
+                .collect(),
+            walked.nullable_payload_slots(),
+        );
         Ok(JoinPlan {
             output_schema,
             walk,
-            t_cols,
-            t_nulls,
+            t_moves,
             trace_leads: delta_is_right,
         })
     }
@@ -357,7 +356,11 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
 
     // The delta's payload follows the trace's where the trace is the left side,
     // and so does its key in a pair key.
-    let d_first = if plan.trace_leads { plan.t_cols.len() } else { 0 };
+    let d_first = if plan.trace_leads {
+        plan.t_moves.copies().len()
+    } else {
+        0
+    };
     let trace_row = |p: &Pairing| (cursor.source_at(p.src as usize), p.row as usize);
     let any_ghost = out.append_session(rows).write(rows, |w| {
         let mut any_ghost = false;
@@ -402,7 +405,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
             let mut dst = nulls.as_chunks_mut::<8>().0.iter_mut();
             for p in pairs {
                 let (t_src, t_row) = trace_row(p);
-                let t_bits = plan.t_nulls.apply(t_src.get_null_word(t_row));
+                let t_bits = plan.t_moves.null_word(t_src.get_null_word(t_row));
                 for (d_null, word) in src[p.delta_rows()].iter().zip(&mut dst) {
                     *word = (t_bits | null_word_at(u64::from_le_bytes(*d_null), d_first)).to_le_bytes();
                 }
@@ -423,7 +426,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
             }
         }
 
-        for &ColCopy { src, slot, .. } in &plan.t_cols {
+        for &ColCopy { src, slot, .. } in plan.t_moves.copies() {
             // Destructured once per column, so no pairing dispatches on the locator.
             match src {
                 ColumnLocator::Payload { slot: pi, type_code, .. } if type_code.is_german_string() => {
