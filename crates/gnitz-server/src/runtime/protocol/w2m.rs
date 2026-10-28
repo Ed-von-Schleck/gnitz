@@ -16,17 +16,15 @@
 //!
 //! ## The park rule
 //!
-//! Each side parks on the other's cursor word, through its [`Park`]: the worker
-//! on `release_cursor` (space freed), the master on `write_cursor` (a message
-//! published).
+//! The worker parks on `release_cursor` (space freed), through that word's
+//! [`Park`]. The master parks on one word of its own over all the rings, whose
+//! arm a publish on any ring takes.
 
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use io_uring::types::FutexWaitV;
-
-use super::park::{futex_waitv_entry, Park};
+use super::park::Park;
 use crate::runtime::wire::WireMsg;
 use gnitz_foundation::posix_io;
 use gnitz_wire::{peek_control_block, DecodedControl};
@@ -47,11 +45,6 @@ const W2M_WINDOW_FRAMES: u64 = 16;
 /// given back.
 const W2M_REGION_SIZE: usize =
     (W2M_HEADER_SIZE as u64 + W2M_WINDOW_FRAMES * slot_stride(gnitz_wire::MAX_FRAME_PAYLOAD)) as usize;
-
-// `arm_waitv` builds a `futex_waitv` word list of `num_workers` entries. The
-// kernel's `FUTEX_WAITV_MAX` is 128; past it the wait fails with EINVAL. Make a
-// `MAX_WORKERS` bump that outgrows it a build error.
-const _: () = assert!(gnitz_wire::MAX_WORKERS <= 128);
 
 const _: () = assert!(
     2 * gnitz_wire::FRAME_LEN_PREFIX_BYTES as u64 == RING_PREFIX_BYTES,
@@ -97,8 +90,8 @@ fn unpack_prefix(prefix: u64) -> (u32, u32) {
 /// the master publishes on the other.
 #[repr(C, align(64))]
 struct W2mRingHeader {
-    /// `write_cursor`: the worker publishes it, the master reads it and parks on it.
-    write: Park,
+    /// `write_cursor`: the worker publishes it, the master reads it.
+    write: AtomicU64,
     /// The virtual offset the data head stands for, stored ahead of the publish
     /// of the message there.
     origin: AtomicU64,
@@ -205,16 +198,21 @@ impl RingCursor {
 // create / publish
 // ---------------------------------------------------------------------------
 
-/// `nw` workers' rings, each a fresh shared mapping never unmapped: every worker's
-/// write end in rank order, and the master's read end over all of them.
+/// `nw` workers' rings and the master's park, each a fresh shared mapping never
+/// unmapped: every worker's write end in rank order, and the master's read end
+/// over all of them.
 pub(crate) fn create(nw: usize) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver)> {
     rings(&vec![W2M_REGION_SIZE; nw])
 }
 
 /// [`create`] over rings of `capacities` bytes: its body, and the test rings'.
-/// A zeroed mapping is an empty ring with both cursors and its origin at 0, so
-/// nothing is stored here.
+/// A zeroed mapping is an empty ring with both cursors and its origin at 0, and
+/// an unarmed park, so nothing is stored here.
 fn rings(capacities: &[usize]) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver)> {
+    let master = posix_io::map_shared(None, size_of::<Park>())?;
+    // SAFETY: a fresh page-aligned shared mapping, never unmapped, alone on its
+    // cache line.
+    let master: &'static Park = unsafe { &*master.cast::<Park>() };
     let mut writers = Vec::with_capacity(capacities.len());
     let mut readers = Vec::with_capacity(capacities.len());
     for &capacity in capacities {
@@ -243,7 +241,7 @@ fn rings(capacities: &[usize]) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver)>
             phys: W2M_HEADER_SIZE as u64,
             cap: capacity as u64,
         };
-        writers.push(W2mWriter { wc: start });
+        writers.push(W2mWriter { wc: start, master });
         readers.push(WorkerRing {
             hdr: start.header(),
             in_flight: UnsafeCell::new(InFlightState::new(start)),
@@ -252,7 +250,7 @@ fn rings(capacities: &[usize]) -> std::io::Result<(Vec<W2mWriter>, W2mReceiver)>
     // Leaked with the mappings: a slot releases through its ring for as long as
     // it lives.
     let rings = Box::leak(readers.into_boxed_slice());
-    Ok((writers, W2mReceiver { rings }))
+    Ok((writers, W2mReceiver { rings, master }))
 }
 
 /// How a message gets from the write position to its slot.
@@ -274,11 +272,13 @@ enum Placement {
 /// takes `&mut self`.
 pub struct W2mWriter {
     wc: RingCursor,
+    /// The master's park, which a publish takes.
+    master: &'static Park,
 }
 
-// SAFETY: the raw `base` inside the cursor is a `MAP_SHARED` region valid in
-// every process for its whole life, and moving the writer moves the ring's one
-// producer.
+// SAFETY: the raw `base` inside the cursor and the master's park are
+// `MAP_SHARED` regions valid in every process for their whole life, and moving
+// the writer moves the ring's one producer.
 unsafe impl Send for W2mWriter {}
 
 impl W2mWriter {
@@ -341,8 +341,10 @@ impl W2mWriter {
             encode(std::slice::from_raw_parts_mut(slot, sz));
         }
         self.wc.advance(total);
-        // Carries the Release that makes the slot's bytes visible to the reader.
-        self.wc.header().write.publish(self.wc.virt, "W2mWriter::try_publish");
+        // SeqCst for the master's park; it also carries the Release that makes
+        // the slot's bytes visible to the reader.
+        self.wc.header().write.store(self.wc.virt, Ordering::SeqCst);
+        self.master.take_arm("W2mWriter::try_publish");
         true
     }
 
@@ -375,10 +377,10 @@ impl W2mWriter {
         self.send_msg(request_id, &WireMsg::default());
     }
 
-    /// The master has armed its `FUTEX_WAITV` park on this ring.
+    /// The master has armed its park, and no publish has taken it.
     #[cfg(test)]
     pub(crate) fn master_parked(&self) -> bool {
-        self.wc.header().write.armed()
+        self.master.armed()
     }
 }
 
@@ -512,7 +514,7 @@ impl WorkerRing {
     fn take_next(&'static self, worker: u32) -> Option<W2mSlot> {
         // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
         let st = unsafe { &mut *self.in_flight.get() };
-        let vwc = self.hdr.write.value();
+        let vwc = self.hdr.write.load(Ordering::Acquire);
         debug_assert!(
             st.read.virt <= vwc,
             "read cursor {} ahead of write cursor {vwc}",
@@ -580,6 +582,8 @@ pub struct W2mReceiver {
     /// Leaked by [`rings`], so a `W2mSlot` may outlive the receiver it was read
     /// through.
     rings: &'static [WorkerRing],
+    /// The master's park: its value counts the publishes that took an arm.
+    master: &'static Park,
 }
 
 impl W2mReceiver {
@@ -590,27 +594,23 @@ impl W2mReceiver {
         self.rings[worker].take_next(worker as u32)
     }
 
-    /// Arm the reactor's `FUTEX_WAITV` park on every ring, filling `out` with the
-    /// words its SQE watches. `None` means a ring already has unread data: every
-    /// ring is disarmed again, and the caller drains and retries, never parks.
-    pub fn arm_waitv<'a>(&self, out: &'a mut [FutexWaitV]) -> Option<&'a [FutexWaitV]> {
-        for (w, ring) in self.rings.iter().enumerate() {
-            let park = &ring.hdr.write;
-            let vwc = park.arm();
-            if vwc != ring.read_cursor() {
-                self.clear_waitv();
-                return None;
-            }
-            out[w] = futex_waitv_entry(park.futex_word(), vwc as u32);
+    /// Arm the master's park unless a ring has unread data: the futex word and
+    /// the value a wait on it compares. `None` leaves it disarmed, and the caller
+    /// drains and retries, never parks. The arm and the cursor loads behind it
+    /// are SeqCst, the master's half of the pair [`Park`] describes. The arm
+    /// stays set until a publish takes it, which moves the value; nothing else
+    /// does.
+    pub fn arm(&self) -> Option<(*const AtomicU32, u32)> {
+        let at = self.master.arm();
+        if self
+            .rings
+            .iter()
+            .any(|r| r.hdr.write.load(Ordering::SeqCst) != r.read_cursor())
+        {
+            self.master.disarm();
+            return None;
         }
-        Some(&out[..self.rings.len()])
-    }
-
-    /// Drop the reactor's park on the rings no publish has taken it from.
-    pub fn clear_waitv(&self) {
-        for ring in self.rings.iter() {
-            ring.hdr.write.disarm();
-        }
+        Some((self.master.futex_word(), at as u32))
     }
 
     pub fn num_workers(&self) -> usize {
@@ -631,7 +631,13 @@ impl W2mReceiver {
     /// The worker's published boundary: everything below it is readable.
     #[cfg(test)]
     pub(crate) fn write_cursor(&self, worker: usize) -> u64 {
-        self.rings[worker].hdr.write.value()
+        self.rings[worker].hdr.write.load(Ordering::Acquire)
+    }
+
+    /// The publishes that took the master's arm, each one `FUTEX_WAKE`.
+    #[cfg(test)]
+    pub(crate) fn wakes(&self) -> u64 {
+        self.master.value()
     }
 }
 

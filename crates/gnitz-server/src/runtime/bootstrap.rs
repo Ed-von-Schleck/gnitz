@@ -464,8 +464,7 @@ fn run_server(
     let worker_pids = fork_workers(catalog, data_dir, workers, pinning.as_ref())?;
 
     // --- Parent process ---
-    // 256 SQEs sets submit batching, not depth: a full SQ is flushed.
-    let reactor = Reactor::new(256, limits, receiver).map_err(|e| format!("io_uring init failed: {e}"))?;
+    let reactor = Reactor::new(limits, receiver).map_err(|e| format!("io_uring init failed: {e}"))?;
     let dispatcher = Rc::new(MasterDispatcher::new(
         worker_pids,
         catalog,

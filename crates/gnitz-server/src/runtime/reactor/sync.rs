@@ -4,6 +4,9 @@
 //! All `!Send` and `Rc<RefCell<_>>`-based on purpose: the reactor never leaves
 //! its thread, so a channel send costs no atomic and a waker registration no
 //! lock.
+//!
+//! Each primitive wakes while holding its own `RefCell` borrow, which is sound
+//! only because a reactor wake queues and never polls (see `make_waker`).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -286,8 +289,9 @@ pub enum Either<A, B> {
     B(B),
 }
 
-/// Race two futures; return whichever completes first. The loser is dropped,
-/// and its `Drop` releases what it registered.
+/// Poll `a`, then `b`; the first found ready wins, so `a` wins a tie, which
+/// `Peer::until_request` relies on to answer a sync ahead of a ready request.
+/// The loser is dropped, and its `Drop` releases what it registered.
 pub async fn select2<A, B>(a: A, b: B) -> Either<A::Output, B::Output>
 where
     A: Future,

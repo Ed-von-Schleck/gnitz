@@ -231,23 +231,21 @@ pub struct Shared {
 }
 
 /// The table locks one task holds.
-struct HeldTables {
-    tids: Vec<u64>,
-    guards: TableGuards,
-}
-
-enum TableGuards {
-    Shared { _guard: ReadGuard },
-    Exclusive { _guards: Vec<WriteGuard> },
+enum HeldTables {
+    Shared { tid: u64, _guard: ReadGuard },
+    Exclusive { tids: Vec<u64>, _guards: Vec<WriteGuard> },
 }
 
 impl HeldTables {
     fn holds(&self, tid: u64) -> bool {
-        self.tids.contains(&tid)
+        match self {
+            Self::Shared { tid: t, .. } => *t == tid,
+            Self::Exclusive { tids, .. } => tids.contains(&tid),
+        }
     }
 
     fn holds_exclusive(&self, tid: u64) -> bool {
-        matches!(self.guards, TableGuards::Exclusive { .. }) && self.holds(tid)
+        matches!(self, Self::Exclusive { tids, .. } if tids.contains(&tid))
     }
 }
 
@@ -272,10 +270,7 @@ impl Shared {
     /// The read guard on `tid`.
     async fn lock_table_shared(&self, tid: u64) -> HeldTables {
         let guard = self.table_lock(tid).read().await;
-        HeldTables {
-            tids: vec![tid],
-            guards: TableGuards::Shared { _guard: guard },
-        }
+        HeldTables::Shared { tid, _guard: guard }
     }
 
     /// The write guard on every table in `tids`, taken in ascending order so a
@@ -290,10 +285,7 @@ impl Shared {
         for &tid in &tids {
             guards.push(self.table_lock(tid).write().await);
         }
-        HeldTables {
-            tids,
-            guards: TableGuards::Exclusive { _guards: guards },
-        }
+        HeldTables::Exclusive { tids, _guards: guards }
     }
 
     /// Queue `families` for commit as one write, or refuse it once a graceful

@@ -11,12 +11,6 @@ use crate::runtime::wire::WireMsg;
 
 const PASSES: u64 = 100_000;
 
-/// A one-shot op the kernel completes at its submit.
-fn nop(r: &Reactor) -> oneshot::Receiver<i32> {
-    // SAFETY: the SQE names no memory.
-    unsafe { r.push_op(opcode::Nop::new().build(), None) }
-}
-
 /// Spawn a task on `r` that parks in `park` over and over, then run `PASSES`
 /// passes under each counter, `publish` ahead of each pass and outside the count.
 /// Every pass must bring the task back from one park.
@@ -30,7 +24,8 @@ fn arm(label: &str, r: Reactor, park: impl AsyncFn() + 'static, mut publish: imp
         }
     });
     r.tick(false); // the first poll parks the task
-                   // One counter at a time: two open at once would count each other's ioctls.
+
+    // One counter at a time: two open at once would count each other's ioctls.
     let [user, all] = [Counter::instructions as fn() -> Counter, Counter::instructions_all].map(|open| {
         let counter = open();
         let mut instructions = 0;
@@ -108,14 +103,12 @@ fn reactor_pass_bench() {
     arm("train", r, next, || writers[0].send_msg(id, &frame));
 }
 
-/// What a flood of worker frames costs the master through its `FUTEX_WAITV`
-/// park, and what that park costs the workers.
+/// What a flood of worker frames costs the master through its park, and what
+/// that park costs the workers.
 ///
 /// Each worker publishes `N` frames from a thread of its own while the reactor
-/// runs its loop: frames no lease takes, then the ACK the run ends on. A publish
-/// that finds the park armed spends a `FUTEX_WAKE`, sampled just before each. The
-/// park arms every ring and a publish takes it from its own ring alone, so one
-/// master sleep can cost a wake per worker.
+/// runs its loop: frames no lease takes, then the ACK the run ends on. The
+/// publish that takes an arm spends a `FUTEX_WAKE`, counted by the park itself.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn reactor_flood_bench() {
@@ -125,32 +118,83 @@ fn reactor_flood_bench() {
     for nw in [1, 4, 16] {
         let (r, writers) = reactor_with_rings(nw);
         let lease = r.lease_ready();
-        let (instructions, sleeps, wakes) = std::thread::scope(|s| {
-            let floods: Vec<_> = writers
-                .into_iter()
-                .map(|mut writer| {
-                    s.spawn(move || {
-                        let mut wakes = 0u64;
-                        for id in (BOOT_READY_REQUEST_ID + 1..=N).chain([BOOT_READY_REQUEST_ID]) {
-                            wakes += writer.master_parked() as u64;
-                            writer.send_ack(id);
-                        }
-                        wakes
-                    })
-                })
-                .collect();
+        let wakes_before = r.w2m.wakes();
+        let (instructions, sleeps) = std::thread::scope(|s| {
+            for mut writer in writers {
+                s.spawn(move || {
+                    for id in (BOOT_READY_REQUEST_ID + 1..=N).chain([BOOT_READY_REQUEST_ID]) {
+                        writer.send_ack(id);
+                    }
+                });
+            }
             let before = voluntary_ctx_switches();
             let ((), instructions) = counter.measure(|| r.block_on(lease.acks()));
-            let sleeps = voluntary_ctx_switches() - before;
-            let wakes: u64 = floods.into_iter().map(|f| f.join().expect("a flood thread")).sum();
-            (instructions, sleeps, wakes)
+            (instructions, voluntary_ctx_switches() - before)
         });
+        let wakes = r.w2m.wakes() - wakes_before;
         let msgs = (nw as u64 * N as u64) as f64;
         println!(
             "reactor_flood_bench nw={nw:<2} {:>6.1} instr/msg, per 1k msgs {:>6.2} master sleeps and {:>6.2} worker wakes",
             instructions as f64 / msgs,
             sleeps as f64 * 1000.0 / msgs,
             wakes as f64 * 1000.0 / msgs,
+        );
+    }
+}
+
+/// What one broadcast round costs in the regime of every checkpoint, tick, DDL
+/// and scan: the master asleep in its park, and every worker answering one lease
+/// over all of them.
+///
+/// Each worker is a thread that polls for a new round every 100 µs with a plain
+/// sleep, which also stands for its answer latency, and ACKs it. The master runs
+/// `ROUNDS` leases, each resolving only on its last ACK, so the loop finishing is
+/// the proof every round took `nw` ACKs. The publish that takes an arm spends a
+/// `FUTEX_WAKE`, counted by the park itself; `perf stat -e
+/// syscalls:sys_enter_futex` over this test run alone counts the same wakes, the
+/// writers making no futex call of their own.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn reactor_round_bench() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    const ROUNDS: u32 = 3000;
+
+    for nw in [1, 4, 16] {
+        let (r, writers) = reactor_with_rings(nw);
+        let round = AtomicU32::new(0); // 0: no round yet
+        let stop = AtomicBool::new(false);
+        let wakes_before = r.w2m.wakes();
+        let sleeps = std::thread::scope(|s| {
+            for mut writer in writers {
+                let (round, stop) = (&round, &stop);
+                s.spawn(move || {
+                    let mut last = 0;
+                    while !stop.load(Ordering::Acquire) {
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                        let id = round.load(Ordering::Acquire);
+                        if id != last {
+                            writer.send_ack(id);
+                            last = id;
+                        }
+                    }
+                });
+            }
+            let before = voluntary_ctx_switches();
+            for _ in 0..ROUNDS {
+                let lease = r.lease_acks(WorkerSet::ALL);
+                round.store(lease.targets().request_id, Ordering::Release);
+                r.block_on(lease.acks());
+            }
+            let sleeps = voluntary_ctx_switches() - before;
+            stop.store(true, Ordering::Release);
+            sleeps
+        });
+        let wakes = r.w2m.wakes() - wakes_before;
+        println!(
+            "reactor_round_bench nw={nw:<2} per round {:.2} master sleeps, {:.2} waking publishes",
+            sleeps as f64 / ROUNDS as f64,
+            wakes as f64 / ROUNDS as f64,
         );
     }
 }

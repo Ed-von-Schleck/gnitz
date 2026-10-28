@@ -214,22 +214,29 @@ fn a_writer_short_of_room_after_a_release_waits_for_the_next() {
 
 // -- park / wake ---------------------------------------------------------
 
-/// The rings arm only while every one is quiet, and a publish takes its own
-/// ring's arm. Its slot names the ring it was read from.
+/// The master's park arms only while every ring is quiet, and the arm it waits
+/// on moves with the one publish, on either ring, that takes it. Its slot names
+/// the ring it was read from.
 #[test]
-fn arm_waitv_arms_only_while_every_ring_is_quiet() {
+fn the_master_park_arms_only_while_every_ring_is_quiet() {
     let (mut writers, receiver) = test_rings(&[ring_capacity(64, 4, 8); 2]);
-    let parked = |writers: &[W2mWriter]| [writers[0].master_parked(), writers[1].master_parked()];
-    let mut out = [FutexWaitV::new(); 2];
 
-    assert!(receiver.arm_waitv(&mut out).is_some(), "quiet rings arm");
-    assert_eq!(parked(&writers), [true, true]);
-    assert!(writers[1].try_publish(0, 64, |s| s[0] = 1));
-    assert_eq!(parked(&writers), [true, false], "a publish takes its ring's arm");
-    assert!(receiver.arm_waitv(&mut out).is_none(), "unread data refuses the arm");
-    assert_eq!(parked(&writers), [false, false], "and every ring is disarmed again");
-    assert!(receiver.try_read_slot(0).is_none());
-    assert_eq!(receiver.try_read_slot(1).expect("ring 1's publish").worker, 1);
+    for w in 0..2 {
+        receiver.arm().expect("quiet rings arm");
+        assert!(writers[w].master_parked());
+        let wakes = receiver.wakes();
+        assert!(writers[w].try_publish(0, 64, |s| s[0] = 1));
+        assert!(!writers[1 - w].master_parked(), "ring {w}'s publish took the one arm");
+        assert_eq!(receiver.wakes(), wakes + 1, "the take moved the waited value");
+        assert!(writers[1 - w].try_publish(0, 64, |s| s[0] = 2));
+        assert_eq!(receiver.wakes(), wakes + 1, "a publish behind the take wakes nobody");
+
+        assert!(receiver.arm().is_none(), "unread data refuses the arm");
+        assert!(!writers[0].master_parked(), "and leaves the park disarmed");
+        assert_eq!(receiver.try_read_slot(0).expect("ring 0's publish").worker, 0);
+        assert!(receiver.arm().is_none(), "ring 1's unread data refuses it too");
+        assert_eq!(receiver.try_read_slot(1).expect("ring 1's publish").worker, 1);
+    }
 }
 
 // -- concurrent publish/drain --------------------------------------------

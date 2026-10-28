@@ -27,7 +27,7 @@ cannot bring what the host lacks:
 
 | Requirement | Why | If it is missing, the boot says |
 |---|---|---|
-| Linux ≥ 6.7 | The master's event loop waits on `IORING_OP_FUTEX_WAITV` | `kernel … lacks io_uring IORING_OP_FUTEX_WAITV` |
+| Linux ≥ 6.7 | The master's event loop waits on `IORING_OP_FUTEX_WAIT` | `kernel … lacks io_uring IORING_OP_FUTEX_WAIT` |
 | A seccomp profile that allows `io_uring_setup`, `io_uring_enter`, `io_uring_register` | The default profile of Docker (since 25), podman, containerd and CRI-O denies them | `a seccomp filter denies it …` |
 | `kernel.io_uring_disabled = 0` | `1` admits only `CAP_SYS_ADMIN` and `kernel.io_uring_group`; `2` admits nobody | `kernel.io_uring_disabled=…` |
 | An x86-64-v3 (AVX2) CPU | The release build targets it | — the binary dies on an illegal instruction |

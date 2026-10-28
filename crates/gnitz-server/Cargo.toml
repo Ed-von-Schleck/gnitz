@@ -34,6 +34,8 @@ rcgen.workspace = true
 # The access tokens' SHA-256 and the CSPRNG that mints them: the crypto
 # provider rustls and rcgen already run on.
 ring = "0.17"
+# The reactor's task and op tables, keyed by slots reused once freed.
+slab = "0.4"
 
 [dev-dependencies]
 # Dev-only, and deliberately not a real dependency: the client half of the

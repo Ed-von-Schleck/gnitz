@@ -9,6 +9,10 @@ the feature actually is, maps the gnitz master/worker runtime in the detail
 needed to judge applicability, and assesses whether — and where — gnitz could
 use it.
 
+Since written, the master parks on one word with `IORING_OP_FUTEX_WAIT`, taken
+by the first publish; the per-ring `FUTEX_WAITV` park cycle described below is
+the design this memo assessed, not the current one.
+
 ---
 
 ## Table of Contents
@@ -434,8 +438,7 @@ on what BPF can absorb is exactly why the projected win is bounded.
 5. **No Rust binding story.** No mature `libbpf-rs` path for these specific kfuncs
    / the loop `struct_ops` yet. Early adoption means hand-rolling the BPF object
    build, skeleton, and arena plumbing.
-6. **Kernel floor.** gnitz already requires Linux 6.7+ for `IORING_OP_FUTEX_WAITV`
-   (probed at `reactor/mod.rs:264-311`). A 7.1 dependency for an *optional*
+6. **Kernel floor.** gnitz already requires Linux 6.7+ for `IORING_OP_FUTEX_WAIT`. A 7.1 dependency for an *optional*
    optimization is acceptable **only** if it stays optional (see §6).
 
 ---

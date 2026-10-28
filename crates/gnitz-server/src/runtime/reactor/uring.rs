@@ -29,7 +29,7 @@ const OPCODES: [(u8, &str); 5] = [
     (opcode::Recv::CODE, "RECV"),
     (opcode::Send::CODE, "SEND"),
     (opcode::Fsync::CODE, "FSYNC"),
-    (opcode::FutexWaitV::CODE, "FUTEX_WAITV"),
+    (opcode::FutexWait::CODE, "FUTEX_WAIT"),
 ];
 
 /// Whether this host gives the reactor what it runs on: a ring, and every

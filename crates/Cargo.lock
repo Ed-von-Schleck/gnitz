@@ -862,6 +862,7 @@ dependencies = [
  "ring",
  "rustc-hash",
  "rustls",
+ "slab",
  "tempfile",
 ]
 

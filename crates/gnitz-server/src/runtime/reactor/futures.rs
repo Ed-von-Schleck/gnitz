@@ -294,7 +294,7 @@ impl Reactor {
     pub fn sleep(&self, d: Duration) -> impl Future<Output = ()> {
         TimerFuture {
             deadline: Instant::now() + d,
-            id: self.alloc_op_id(),
+            id: self.alloc_timer_id(),
             reactor: self.clone(),
         }
     }

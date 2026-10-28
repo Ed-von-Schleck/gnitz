@@ -284,7 +284,7 @@ the schema, never `ci - 1`.
 
 ## Prerequisites
 
-Linux with an io_uring kernel (≥ 6.7: `IORING_OP_FUTEX_WAITV`); stable Rust; `uv` (drives Python + `maturin`). Nothing is version-pinned.
+Linux with an io_uring kernel (≥ 6.7: `IORING_OP_FUTEX_WAIT`); stable Rust; `uv` (drives Python + `maturin`). Nothing is version-pinned.
 
 ## Build targets
 

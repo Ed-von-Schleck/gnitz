@@ -18,7 +18,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 
 use super::config::{TLS_CERT_FILE, TLS_KEY_FILE};
 use super::*;
-use crate::runtime::reactor::{egress_pair, poll_until, read_nonblocking, Budget};
+use crate::runtime::reactor::{admitted_recv_queue, egress_pair, poll_until, read_nonblocking};
 use gnitz_wire::framed;
 
 const LOOPBACK: &str = "127.0.0.1:0";
@@ -230,8 +230,7 @@ fn frames_deframe_in_order_under_any_split_until_close_notify() {
             client.writer().write_all(&framed(f)).unwrap();
         }
         client.send_close_notify();
-        let mut q = RecvQueue::new(Budget::new(usize::MAX));
-        q.admit_full_frames();
+        let mut q = admitted_recv_queue();
 
         let ends: Vec<_> = ciphertext(&mut client)
             .chunks(chunk)

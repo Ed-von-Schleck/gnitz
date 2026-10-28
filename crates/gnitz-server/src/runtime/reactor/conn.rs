@@ -54,8 +54,12 @@ impl Armed {
         let mut q = self.conn.q.borrow_mut();
         let w = self.filter.window(&mut q);
         let sqe = opcode::Recv::new(types::Fd(fd), w.as_mut_ptr().cast(), w.len() as u32).build();
-        // SAFETY: only this recv's CQE removes or refills the entry, which holds the
-        // connection (so `fd`) and the filter owning the window; `ring` drops first.
+        // SAFETY: the window is the filter's own buffer or, for `Plain`, the payload
+        // in progress in `conn.q`'s deframer. Only the filter's `window`/`ingest` and
+        // `RecvQueue::feed`, which only an ingest calls, touch the deframer; the task
+        // side's borrows of `q` reach only the frame queue and `max_frame`. Only this
+        // recv's CQE removes or refills the entry, which holds the connection (so `fd`
+        // and `q`) and the filter; `ring` drops first.
         unsafe { ring.push(sqe, udata(KIND_RECV, fd as u32 as u64)) };
     }
 }
@@ -118,7 +122,7 @@ impl Reactor {
     pub(super) fn handle_recv_cqe(&self, fd: i32, res: i32) {
         let mut conns = self.conns.borrow_mut();
         let Entry::Occupied(mut entry) = conns.entry(fd) else {
-            return;
+            unreachable!("recv CQE for fd={fd} with no armed entry")
         };
         let armed = entry.get_mut();
         if armed.conn.is_gone() {
@@ -159,8 +163,11 @@ impl Reactor {
     /// Send `body`'s whole byte range on `conn`. Loops on short sends; each kernel
     /// send has its own `Limits::client_send_timeout` deadline, past which the
     /// client is evicted. A failed or evicted send finishes the connection
-    /// ([`ClientConn::fail`]).
+    /// ([`ClientConn::fail`]). An empty body sends nothing.
     pub(crate) async fn send_owned(&self, conn: &Rc<ClientConn>, body: SendBody) -> Result<(), PeerGone> {
+        if body.bytes().is_empty() {
+            return Ok(());
+        }
         let out = Rc::new(Outbound { _conn: Rc::clone(conn), body });
         let bytes = out.body.bytes();
         let mut sent = 0usize;

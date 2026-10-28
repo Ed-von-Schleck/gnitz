@@ -131,3 +131,21 @@ fn next_yields_the_row_frames_and_releases_the_rest() {
         assert_eq!(r.w2m.release_cursor(w), r.w2m.write_cursor(w), "worker {w}");
     }
 }
+
+/// A fault frame ends a train's read with the fault, its text naming the
+/// worker that sent it and the request it answered.
+#[test]
+fn a_fault_frame_names_its_worker() {
+    let (r, mut writers) = reactor_with_rings(2);
+    let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::ScanSpec);
+    let id = lease.targets().request_id;
+    writers[0].send_msg(id, &WireMsg::train_frame(0, true, None));
+    let fault = WireFault::from("boom");
+    writers[1].send_msg(id, &WireMsg::fault(&fault));
+    r.drain_all_w2m();
+
+    let err = try_poll_once(lease.finish()).expect("routed").expect_err("the fault");
+    assert!(err.text.contains("worker 1"), "{err}");
+    assert!(err.text.contains("ScanSpec"), "{err}");
+    assert!(err.text.contains("boom"), "{err}");
+}

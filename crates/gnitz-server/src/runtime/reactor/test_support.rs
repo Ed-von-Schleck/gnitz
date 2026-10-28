@@ -10,14 +10,26 @@ pub(super) use crate::runtime::test_support::{try_poll_once, within};
 use crate::runtime::w2m::fixtures::test_rings;
 use crate::runtime::w2m::W2mWriter;
 
-/// A reactor with no W2M rings, for the tests that route no worker traffic.
+impl Limits {
+    /// Every send carries `client_send_timeout`, so it is generous here: a drain
+    /// thread descheduled on a loaded box must not evict the sender of a socket
+    /// test. A test that waits a deadline out sets its own.
+    pub(super) const TEST: Limits = Limits {
+        inbound_cap: usize::MAX,
+        client_send_timeout: Duration::from_secs(30),
+        accept_rearm_backoff: Duration::from_millis(2),
+        max_conns: usize::MAX,
+    };
+}
+
+/// A reactor over one W2M ring, as production runs over at least one worker's.
 pub(super) fn make_reactor() -> Reactor {
     make_reactor_with(Limits::TEST)
 }
 
 /// [`make_reactor`] built with `limits`.
 pub(super) fn make_reactor_with(limits: Limits) -> Reactor {
-    Reactor::new(16, limits, test_rings(&[]).1).expect("reactor")
+    Reactor::new(limits, test_rings(&[64 * 1024]).1).expect("reactor")
 }
 
 /// The drivers every reactor suite runs on. An inherent impl here rather than in
@@ -42,7 +54,7 @@ impl Reactor {
 /// A reactor over `n` fresh W2M rings, with the writer of each.
 pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
     let (writers, receiver) = test_rings(&vec![64 * 1024; n]);
-    (Reactor::new(16, Limits::TEST, receiver).expect("reactor"), writers)
+    (Reactor::new(Limits::TEST, receiver).expect("reactor"), writers)
 }
 
 /// A fresh ring holding one frame whose error text is `pad` bytes, read back as a
@@ -54,6 +66,12 @@ pub(crate) fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
     writers[0].send_msg(1, &msg);
     let slot = receiver.try_read_slot(0).expect("a frame");
     (receiver, slot)
+}
+
+/// A one-shot op the kernel completes at its submit.
+pub(super) fn nop(r: &Reactor) -> oneshot::Receiver<i32> {
+    // SAFETY: the SQE names no memory.
+    unsafe { r.push_op(opcode::Nop::new().build(), None) }
 }
 
 /// Future that returns Pending exactly once, waking itself, then Ready.
@@ -87,6 +105,13 @@ pub(super) fn admitted(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
     let (conn, partner) = registered(r);
     conn.admit_full_frames();
     (conn, partner)
+}
+
+/// An inbound queue with an unbounded budget of its own, past the handshake.
+pub(crate) fn admitted_recv_queue() -> RecvQueue {
+    let mut q = RecvQueue::new(io::Budget::new(usize::MAX));
+    q.admit_full_frames();
+    q
 }
 
 /// A reactor, and a [`client_pair`] on it.

@@ -6,25 +6,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use gnitz_foundation::posix_io;
 use gnitz_wire::MAX_WORKERS;
-use io_uring::types::FutexWaitV;
 
 // ---------------------------------------------------------------------------
 // Futex wait/wake
 // ---------------------------------------------------------------------------
-
-/// `futex2(2)` flags byte for a 32-bit atomic. Matches the kernel constant
-/// `FUTEX2_SIZE_U32` (=2). No `FUTEX2_PRIVATE` bit — a park word is
-/// `MAP_SHARED` across `fork()`.
-const FUTEX2_SIZE_U32: u32 = 2;
-
-/// One `futex_waitv` entry: sleep on `word` while it still reads `expected`.
-#[inline]
-pub(super) fn futex_waitv_entry(word: *const AtomicU32, expected: u32) -> FutexWaitV {
-    FutexWaitV::new()
-        .val(expected as u64)
-        .uaddr(word as u64)
-        .flags(FUTEX2_SIZE_U32)
-}
 
 /// One v1 futex call on `word`, with no `FUTEX_PRIVATE_FLAG` — a park word is
 /// shared: `Err` holds the errno.
@@ -74,11 +59,19 @@ fn futex_failed(site: &str, errno: i32) -> ! {
 const ARMED: u64 = 1 << 63;
 
 /// One side's sleep, in one word: a value in bits 0..63 that only grows, and the
-/// parker's arm in bit 63.
+/// parker's arm in bit 63. The parker arms, re-tests what it waits for, and
+/// sleeps on the value the arm returned; a peer wakes it by moving that value.
+/// The two kinds of wake order against the arm differently.
 ///
-/// The arm and every advance are RMWs on the one atomic, so they are totally
-/// ordered: an advance behind the arm sees it and wakes, and an arm behind the
-/// advance returns the advanced value for the parker's re-test.
+/// - **An RMW wake** ([`Self::publish`], [`Self::bump`]): the arm and every
+///   advance are RMWs on the one atomic, so they are totally ordered: an advance
+///   behind the arm sees it and wakes, and an arm behind the advance reads
+///   everything the advance released, so the parker's re-test sees it.
+/// - **A load wake** ([`Self::take_arm`]): the peer stores the word the parker
+///   waits on and then loads the park; the parker arms and then loads that word.
+///   All four are SeqCst, so in each pair at least one side sees the other: the
+///   peer sees the arm and takes it, or the parker's re-test sees the stored word
+///   and does not sleep. A wake that finds no arm costs no RMW.
 #[repr(transparent)]
 pub(super) struct Park(AtomicU64);
 
@@ -91,14 +84,36 @@ impl Park {
     /// Arm, returning the value the arm was taken at.
     #[inline]
     pub(super) fn arm(&self) -> u64 {
-        self.0.fetch_or(ARMED, Ordering::AcqRel) & !ARMED
+        self.0.fetch_or(ARMED, Ordering::SeqCst) & !ARMED
     }
 
     /// Drop the arm. The result is deliberately unused: binding it would force a
     /// `lock cmpxchg` retry loop where a discarded one lowers to a `lock and`.
     #[inline]
     pub(super) fn disarm(&self) {
-        self.0.fetch_and(!ARMED, Ordering::AcqRel);
+        self.0.fetch_and(!ARMED, Ordering::SeqCst);
+    }
+
+    /// Take the arm, if set, and wake the parker: the load wake, called after the
+    /// caller's SeqCst store of the word the parker re-tests.
+    ///
+    /// One CAS clears the arm and advances the value by one, so an arm has one
+    /// taker, and a take ahead of the parker's futex wait still moves the value
+    /// it compares. A failed CAS read a value later than the load's: another
+    /// take, which woke the parker, or a disarm or a newer arm, which is ordered
+    /// after the load and so followed by a re-test that sees the caller's word.
+    /// So a failed CAS neither retries nor wakes.
+    #[inline]
+    pub(super) fn take_arm(&self, site: &str) {
+        let cur = self.0.load(Ordering::SeqCst);
+        if cur & ARMED != 0
+            && self
+                .0
+                .compare_exchange(cur, (cur + 1) & !ARMED, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+        {
+            futex_wake(self.futex_word(), site);
+        }
     }
 
     /// The value's one writer stores `v`, waking the parker iff it armed first.
@@ -137,8 +152,8 @@ impl Park {
     }
 
     /// The 32-bit futex word aliasing the low half. A ring cursor advances by at
-    /// most its ring's capacity and a wake sequence by one, so under 2^32 an
-    /// advance always moves the half a futex compares.
+    /// most its ring's capacity, and a wake sequence or a take by one, so under
+    /// 2^32 an advance always moves the half a futex compares.
     #[inline]
     pub(super) fn futex_word(&self) -> *const AtomicU32 {
         &self.0 as *const AtomicU64 as *const AtomicU32

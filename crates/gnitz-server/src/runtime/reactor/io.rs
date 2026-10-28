@@ -131,6 +131,8 @@ impl From<FrameLenError> for RecvEnd {
 /// completed, and the single task awaiting them.
 pub(crate) struct RecvQueue {
     /// Each payload in progress is charged to `budget` from its header on.
+    /// Touched only through a `RecvFilter`'s `window`/`ingest` and [`Self::feed`]:
+    /// a window it lent may be under a recv in flight.
     deframer: Deframer<Charge>,
     /// Complete messages awaiting pickup by `recv().await`, and the one task
     /// awaiting them. A queue, not a slot: with one slot a pipelined client
@@ -143,7 +145,7 @@ pub(crate) struct RecvQueue {
 }
 
 impl RecvQueue {
-    pub(crate) fn new(budget: Rc<Budget>) -> Self {
+    pub(super) fn new(budget: Rc<Budget>) -> Self {
         RecvQueue {
             deframer: Deframer::default(),
             frames: WakeQueue::default(),
@@ -152,7 +154,8 @@ impl RecvQueue {
         }
     }
 
-    /// Deframe `src`, queueing every frame it completes.
+    /// Deframe `src`, queueing every frame it completes. Called only from a
+    /// `RecvFilter::ingest`; see `deframer`.
     pub(crate) fn feed(&mut self, mut src: &[u8]) -> Result<(), RecvEnd> {
         let (budget, max_frame) = (&self.budget, self.max_frame);
         while let Some((buf, charge)) = self.deframer.feed(&mut src, |len| {
@@ -174,7 +177,7 @@ impl RecvQueue {
 
     /// Admit frames up to [`MAX_FRAME_PAYLOAD`]: the handshake admitted the
     /// client, which until then sends no frame past [`HANDSHAKE_FRAME_MAX`].
-    pub(crate) fn admit_full_frames(&mut self) {
+    pub(super) fn admit_full_frames(&mut self) {
         self.max_frame = MAX_FRAME_PAYLOAD;
     }
 

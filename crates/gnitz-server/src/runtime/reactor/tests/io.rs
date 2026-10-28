@@ -8,7 +8,7 @@ use super::super::{Limits, Reactor};
 use super::*;
 use gnitz_wire::framed;
 
-/// A reactor with no W2M rings and an inbound cap of `cap`.
+/// A reactor over one W2M ring with an inbound cap of `cap`.
 fn capped_reactor(cap: usize) -> Reactor {
     make_reactor_with(Limits { inbound_cap: cap, ..Limits::TEST })
 }
@@ -121,7 +121,7 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
         poll_until(&r, || r.inbound.held() == 10_000),
         "in-flight buffer was not accounted"
     );
-    assert!(conn1.try_recv().is_none(), "no frame completes from a partial payload");
+    assert!(!conn1.is_readable(), "no frame completes from a partial payload");
 
     let (conn2, partner2) = registered(&r);
     (&partner2).write_all(&framed(&[0x22u8; 100])).expect("write");

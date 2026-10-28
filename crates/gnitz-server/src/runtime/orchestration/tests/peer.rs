@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use super::*;
-use crate::runtime::reactor::{egress_pair, read_nonblocking, ring_slot, select2, Either};
+use crate::runtime::reactor::{egress_pair, poll_until, read_nonblocking, ring_slot, select2, Either};
 use gnitz_wire::framed;
 
 /// `send` corks a slot that fits beside the cork, ships the cork first when the
@@ -120,6 +120,23 @@ fn next_request_keeps_the_cork_while_requests_are_queued() {
 
     assert_eq!(peer.corked_len(), 5, "the reply stays corked");
     assert!(read_nonblocking(&partner, 64).is_none(), "nothing shipped");
+}
+
+/// A client that closed its sending side is still answered: `next_request`
+/// ships what is corked before it reports the last request taken.
+#[test]
+fn next_request_ships_to_a_half_closed_client() {
+    let (r, conn, partner) = egress_pair();
+    let peer = Peer::new(&r, conn, None);
+    (&partner).write_all(&framed(b"a")).expect("write");
+    partner.shutdown(std::net::Shutdown::Write).expect("shutdown");
+
+    r.block_on(peer.next_request()).expect("the one request");
+    assert!(poll_until(&r, || peer.conn.is_readable()), "the close lands");
+    peer.cork(b"reply");
+    assert!(r.block_on(peer.next_request()).is_none(), "no request follows it");
+
+    assert_eq!(read_nonblocking(&partner, 64).as_deref(), Some(&b"reply"[..]));
 }
 
 /// With nothing queued, `next_request` ships what is corked before it parks on

@@ -117,10 +117,11 @@ fn send_owned_loops_until_full_payload_sent_over_socketpair() {
 #[test]
 fn send_owned_evicts_a_client_that_never_drains() {
     const TIMEOUT: Duration = Duration::from_millis(10);
-    let r = make_reactor_with(Limits {
+    let limits = Limits {
         client_send_timeout: TIMEOUT,
         ..Limits::TEST
-    });
+    };
+    let r = make_reactor_with(limits);
     let (conn, receiver) = client_pair(&r);
     shrink(&conn, &receiver, 4 * 1024);
     // Far larger than both buffers, and nothing ever reads the other end: the

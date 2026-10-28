@@ -121,3 +121,63 @@ fn a_sleeping_tick_wakes_at_the_earliest_deadline() {
         r.tasks.borrow_mut().clear(); // the pending timer holds the reactor
     });
 }
+
+/// A pass polls only the tasks queued on its entry, so a task that wakes itself
+/// on every poll runs once a pass and the pass still reaches its deadlines.
+#[test]
+fn a_self_waking_task_does_not_starve_the_pass() {
+    within(|| {
+        let r = make_reactor();
+        r.spawn(async {
+            loop {
+                yield_once().await
+            }
+        });
+        r.block_on(r.sleep(Duration::from_millis(5)));
+    });
+}
+
+/// The caller of `block_on` may block outside the loop once it returns (a test
+/// reading a socket, or the process exiting), so the SQEs of the pass that
+/// completed its future are already in the kernel.
+#[test]
+fn block_on_submits_the_pass_that_completed_it() {
+    let r = make_reactor();
+    let mut op = r.block_on(std::future::poll_fn(|_| Poll::Ready(nop(&r))));
+    r.drain_cqes_into_wakers();
+    assert_eq!(
+        try_poll_once(&mut op),
+        Some(0),
+        "block_on returned with its last pass's SQE unsubmitted"
+    );
+}
+
+/// A thread holds one live reactor at a time: its wakes land in the one
+/// thread-local run queue.
+#[test]
+#[should_panic(expected = "second reactor")]
+fn a_second_live_reactor_on_one_thread_panics() {
+    let _first = make_reactor();
+    let _second = make_reactor();
+}
+
+/// The thread's claim ends with its reactor, so a later one may take it.
+#[test]
+fn a_dropped_reactor_frees_its_thread() {
+    drop(make_reactor());
+    drop(make_reactor());
+}
+
+/// More ops than the SQ holds, queued at once: the push that finds the SQ full
+/// submits it, the next pass drains those CQEs in several full drain batches, and
+/// the pass after drains the rest. No completion is lost. The count stays within
+/// the CQ (twice the SQ), which nothing drains while the ops are queued.
+#[test]
+fn a_pass_past_the_sq_and_the_drain_batch_loses_no_completion() {
+    let r = make_reactor();
+    let n = SQ_ENTRIES + SQ_ENTRIES / 2;
+    let ops: Vec<_> = (0..n).map(|_| nop(&r)).collect();
+    r.tick(false);
+    r.run_ready();
+    assert!(ops.into_iter().all(|op| try_poll_once(op) == Some(0)));
+}

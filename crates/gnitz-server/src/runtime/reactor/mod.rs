@@ -13,9 +13,9 @@ use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::{Duration, Instant};
 
-use io_uring::types::FutexWaitV;
 use io_uring::{opcode, types};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
+use slab::Slab;
 
 use self::uring::IoUringRing;
 
@@ -30,7 +30,8 @@ mod sync;
 mod test_support;
 #[cfg(test)]
 pub(crate) use test_support::{
-    client_pair, egress_pair, poll_until, reactor_with_rings, read_nonblocking, ring_slot, spawn_drain,
+    admitted_recv_queue, client_pair, egress_pair, poll_until, reactor_with_rings, read_nonblocking, ring_slot,
+    spawn_drain,
 };
 mod uring;
 mod wake_queue;
@@ -43,8 +44,6 @@ pub(crate) use futures::{AckLease, TrainFrame, TrainLease, BOOT_READY_REQUEST_ID
 use runloop::run_queue_is_empty;
 use wake_queue::WakeQueue;
 
-#[cfg(test)]
-pub(crate) use io::Budget;
 pub(crate) use io::{ClientConn, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue};
 pub use sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, WriteGuard};
 
@@ -82,17 +81,6 @@ impl Limits {
             max_conns: gnitz_foundation::env::env_num("GNITZ_MAX_CONNS", 256),
         }
     }
-
-    /// Every send carries `client_send_timeout`, so it is generous here: a drain
-    /// thread descheduled on a loaded box must not evict the sender of a socket
-    /// test. A test that waits a deadline out sets its own.
-    #[cfg(test)]
-    pub(crate) const TEST: Limits = Limits {
-        inbound_cap: usize::MAX,
-        client_send_timeout: Duration::from_secs(30),
-        accept_rearm_backoff: Duration::from_millis(2),
-        max_conns: usize::MAX,
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -101,7 +89,7 @@ impl Limits {
 
 /// A one-shot op whose CQE lands in `ops`.
 const KIND_OP: u64 = 1;
-const KIND_FUTEX_WAITV: u64 = 2;
+const KIND_PARK: u64 = 2;
 const KIND_RECV: u64 = 3;
 
 const KIND_SHIFT: u64 = 56;
@@ -123,27 +111,22 @@ type Task = Pin<Box<dyn Future<Output = ()>>>;
 pub struct ReactorShared {
     /// First, so it drops before the memory its SQEs point into.
     ring: RefCell<IoUringRing>,
-    /// Live tasks keyed by a monotonically-increasing id.
-    tasks: RefCell<FxHashMap<usize, Task>>,
-    next_task_key: Cell<usize>,
+    /// Live tasks; a task's waker key is its slot plus one. A slot holds `None`
+    /// while its task is polled, and is freed for reuse when it completes.
+    tasks: RefCell<Slab<Option<Task>>>,
     /// Every live lease's id and what its workers have answered on it.
     routes: RefCell<FxHashMap<u32, Route>>,
     /// The next request id a lease starts from.
     next_request_id: Cell<u32>,
-    /// In-flight one-shot ops, by op id.
-    ops: RefCell<FxHashMap<u64, PendingOp>>,
-    /// The array the `FUTEX_WAITV` SQE is prepped over, one entry per worker
-    /// ring. Read by the kernel when the SQE is submitted, which a failed submit
-    /// defers to a later pass; hence a field.
-    futex_waitv: RefCell<Box<[FutexWaitV]>>,
-    /// A `FUTEX_WAITV` SQE is outstanding. Cleared by its CQE.
-    futex_waitv_armed: Cell<bool>,
-    /// Every pending deadline, keyed by `(deadline, op id)` and valued by the
+    /// In-flight one-shot ops; an op's id is its slot, freed at its CQE.
+    ops: RefCell<Slab<PendingOp>>,
+    /// A `FUTEX_WAIT` SQE on the W2M park is outstanding. Cleared by its CQE.
+    parked: Cell<bool>,
+    /// Every pending deadline, keyed by `(deadline, timer id)` and valued by the
     /// waker to fire. A sleep never outlasts the first.
     deadlines: RefCell<BTreeMap<(Instant, u64), Waker>>,
-    /// One counter for every local op, so an id is unique in every map keyed on
-    /// it.
-    next_op_id: Cell<u64>,
+    /// The next timer id, which orders deadlines sharing an instant.
+    next_timer_id: Cell<u64>,
     /// Every connection with a recv armed on it, by fd. See [`conn::Armed`].
     conns: RefCell<FxHashMap<i32, conn::Armed>>,
     /// The OOM guard shared by every connection, charged per inbound frame.
@@ -174,24 +157,25 @@ impl std::ops::Deref for Reactor {
     }
 }
 
+/// The ring's SQ entries. This sets submit batching, not depth: a full SQ is
+/// flushed.
+const SQ_ENTRIES: u32 = 256;
+
 impl Reactor {
-    pub fn new(ring_capacity: u32, limits: Limits, w2m: W2mReceiver) -> std::io::Result<Self> {
-        let ring = IoUringRing::new(ring_capacity)?;
-        let futex_waitv = (0..w2m.num_workers()).map(|_| FutexWaitV::new()).collect();
+    pub fn new(limits: Limits, w2m: W2mReceiver) -> std::io::Result<Self> {
+        let ring = IoUringRing::new(SQ_ENTRIES)?;
         // Before the shared state exists: a refused claim then drops none of it,
         // and so does not end the live reactor's claim.
         runloop::claim_thread();
         Ok(Reactor(Rc::new(ReactorShared {
             ring: RefCell::new(ring),
-            tasks: RefCell::new(FxHashMap::default()),
-            next_task_key: Cell::new(0),
+            tasks: RefCell::new(Slab::new()),
             routes: RefCell::new(FxHashMap::default()),
             next_request_id: Cell::new(BOOT_READY_REQUEST_ID + 1),
-            ops: RefCell::new(FxHashMap::default()),
-            futex_waitv: RefCell::new(futex_waitv),
-            futex_waitv_armed: Cell::new(false),
+            ops: RefCell::new(Slab::new()),
+            parked: Cell::new(false),
             deadlines: RefCell::new(BTreeMap::new()),
-            next_op_id: Cell::new(1),
+            next_timer_id: Cell::new(0),
             conns: RefCell::new(FxHashMap::default()),
             inbound: io::Budget::new(limits.inbound_cap),
             conn_slots: io::Budget::new(limits.max_conns),
@@ -200,11 +184,11 @@ impl Reactor {
         })))
     }
 
-    /// Next local op id, lossless when packed into a CQE's `user_data`: the
-    /// 56-bit counter does not wrap within a process's life.
-    fn alloc_op_id(&self) -> u64 {
-        let id = self.next_op_id.get();
-        self.next_op_id.set(id + 1);
+    /// The next timer id; the 64-bit counter does not wrap within a process's
+    /// life.
+    fn alloc_timer_id(&self) -> u64 {
+        let id = self.next_timer_id.get();
+        self.next_timer_id.set(id + 1);
         id
     }
 
@@ -219,30 +203,31 @@ impl Reactor {
 
     /// Arm the W2M park for a sleep. False, arming nothing, when the drain run
     /// first woke a task.
-    fn arm_futex_waitv(&self) -> bool {
-        let w2m = &self.w2m;
-        if w2m.num_workers() == 0 {
-            return true; // nothing to watch, and a zero-length FUTEX_WAITV is -EINVAL
-        }
-        let mut waitv = self.futex_waitv.borrow_mut();
+    fn arm_park(&self) -> bool {
         loop {
             self.drain_all_w2m();
             if !run_queue_is_empty() {
                 return false;
             }
-            if let Some(armed) = w2m.arm_waitv(&mut waitv) {
-                let sqe = opcode::FutexWaitV::new(armed.as_ptr(), armed.len() as u32).build();
-                // SAFETY: the array lives in `futex_waitv`, which drops after
-                // `ring`; every `uaddr` is a word of a never-unmapped W2M mapping.
-                unsafe { self.ring.borrow_mut().push(sqe, udata(KIND_FUTEX_WAITV, 0)) };
-                self.futex_waitv_armed.set(true);
+            if let Some((word, at)) = self.w2m.arm() {
+                // A 32-bit word with no `FUTEX2_PRIVATE`, since the park is
+                // `MAP_SHARED` across `fork()`; the mask matches any waker.
+                const FUTEX2_SIZE_U32: u32 = 2;
+                let mask = libc::FUTEX_BITSET_MATCH_ANY as u32 as u64;
+                let sqe = opcode::FutexWait::new(word.cast(), at as u64, mask, FUTEX2_SIZE_U32).build();
+                // SAFETY: the word is in a never-unmapped shared mapping, and the
+                // SQE names no other memory.
+                unsafe { self.ring.borrow_mut().push(sqe, udata(KIND_PARK, 0)) };
+                self.parked.set(true);
                 return true;
             }
         }
     }
 
     /// Queue `sqe` as a one-shot op holding `carry` until its CQE, whose `res` the
-    /// receiver yields. Not submitted.
+    /// receiver yields. Not submitted. The op's slot, and with it `carry`, is
+    /// freed at its one CQE and then reused, so `sqe` must be an opcode that
+    /// posts exactly one CQE.
     ///
     /// # Safety
     /// As [`IoUringRing::push`]; what `carry` holds counts as valid until the CQE.
@@ -251,9 +236,8 @@ impl Reactor {
         sqe: io_uring::squeue::Entry,
         carry: Option<Rc<conn::Outbound>>,
     ) -> oneshot::Receiver<i32> {
-        let id = self.alloc_op_id();
         let (done, rx) = oneshot::channel();
-        self.ops.borrow_mut().insert(id, PendingOp { done, _carry: carry });
+        let id = self.ops.borrow_mut().insert(PendingOp { done, _carry: carry }) as u64;
         // SAFETY: forwarded to the caller.
         unsafe { self.ring.borrow_mut().push(sqe, udata(KIND_OP, id)) };
         rx

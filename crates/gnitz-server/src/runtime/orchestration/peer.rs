@@ -68,6 +68,8 @@ impl Peer {
     /// `None` once the client is gone or has sent its last request.
     pub async fn next_request(&self) -> Option<RecvBuf> {
         self.flush_if_full().await.ok()?;
+        // Not `is_readable`: a client that closed its sending side is readable,
+        // and is still owed what is corked.
         if let Some(buf) = self.conn.try_recv() {
             return Some(buf);
         }

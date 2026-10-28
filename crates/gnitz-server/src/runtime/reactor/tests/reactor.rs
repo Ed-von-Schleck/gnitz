@@ -21,7 +21,7 @@ fn fsync_is_submitted_eagerly_and_yields_the_cqe_res() {
         let mut fut = std::pin::pin!(r.fsync(leaked(fd)));
         let deadline = Instant::now() + Duration::from_secs(10);
         let got = loop {
-            r.drain_cqes_into_wakers();
+            r.run_ready();
             if let Some(rc) = try_poll_once(fut.as_mut()) {
                 break rc;
             }
@@ -57,11 +57,39 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
     });
 }
 
-/// A forked child publishes to a reactor parked through `FUTEX_WAITV` on two
-/// rings: a lost wake runs into the timeout, a torn frame loses an id. The child
+/// A pass that does not sleep leaves the park unarmed, so a worker's publish
+/// then spends no `FUTEX_WAKE`.
+#[test]
+fn a_pass_that_does_not_sleep_does_not_arm() {
+    let (r, writers) = reactor_with_rings(1);
+    r.tick(false);
+    assert!(!writers[0].master_parked());
+}
+
+/// A sleep arms the park, and the publish that ends it takes the arm.
+#[test]
+fn a_publish_wakes_the_sleep_and_takes_the_arm() {
+    within(|| {
+        let (r, mut writers) = reactor_with_rings(1);
+        let mut writer = writers.pop().expect("one ring");
+        let publisher = std::thread::spawn(move || {
+            while !writer.master_parked() {
+                std::thread::yield_now();
+            }
+            writer.send_ack(BOOT_READY_REQUEST_ID); // no lease holds it
+            writer
+        });
+        r.tick(true);
+        let writer = publisher.join().expect("the publisher");
+        assert!(!writer.master_parked(), "the publish took the arm");
+    });
+}
+
+/// A forked child publishes to a reactor parked on the one master park word over
+/// two rings: a lost wake runs into the timeout, a torn frame loses an id. The child
 /// waits until the reactor parks with nothing published, so only its answer on
 /// ring 1 can wake it; then it floods ring 0 as fast as it can, so the
-/// drain-refresh-arm race is under pressure: ids no lease routes, which are
+/// drain-arm race is under pressure: ids no lease routes, which are
 /// released unrouted, and the ready ACK last, so the lease resolves only once
 /// every one is drained.
 #[test]
@@ -73,7 +101,7 @@ fn w2m_publishes_from_another_process_wake_the_parked_reactor() {
     let child = || {
         let deadline = Instant::now() + TIMEOUT;
         while !writers[1].master_parked() {
-            assert!(Instant::now() < deadline, "the reactor never parked on ring 1");
+            assert!(Instant::now() < deadline, "the reactor never parked");
             std::thread::yield_now();
         }
         writers[1].send_ack(BOOT_READY_REQUEST_ID);
