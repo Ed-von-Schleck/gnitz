@@ -262,14 +262,16 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
     for tid in [500, 501] {
         engine
             .registry
-            .register(gnitz_store::relation::RelationSpec {
-                id: tid,
-                kind: gnitz_store::relation::RelationKind::BaseTable,
+            .register(
+                gnitz_store::relation::RelationSpec {
+                    id: tid,
+                    kind: gnitz_store::relation::RelationKind::BaseTable,
+                    placement: gnitz_zset::algebra::Placement::full_pk(&schema),
+                    pk_repeats: false,
+                    compress: false,
+                },
                 schema,
-                placement: gnitz_zset::algebra::Placement::full_pk(&schema),
-                pk_repeats: false,
-                compress: false,
-            })
+            )
             .unwrap();
         engine
             .registry

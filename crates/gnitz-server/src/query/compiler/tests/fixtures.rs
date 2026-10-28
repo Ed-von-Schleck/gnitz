@@ -83,12 +83,11 @@ fn registry_of<S: Into<Source>>(
         let spec = RelationSpec {
             id,
             kind,
-            schema,
             placement,
             pk_repeats: false,
             compress: false,
         };
-        registry.register(spec).expect("a relation registers");
+        registry.register(spec, schema).expect("a relation registers");
     }
     registry
 }

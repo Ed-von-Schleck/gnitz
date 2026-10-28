@@ -40,7 +40,7 @@ fn fixture(keys: usize, string: bool, rounds: u64, per_round: u64) -> (RelationF
             }
             bb.end_row();
         }
-        r.ingest_at(TID, bb.finish(), Some(round), false).unwrap();
+        r.ingest_round(TID, bb.finish(), round, false).unwrap();
     }
     (r, s)
 }

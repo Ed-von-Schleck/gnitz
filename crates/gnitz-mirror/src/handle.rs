@@ -115,7 +115,8 @@ impl Mirror {
         }
         // A failure may be transient, and the sweep would delete that copy.
         if all_reopened {
-            if let Err(e) = copies.registry.reclaim_orphan_relation_dirs() {
+            // A copy carries no operator state, so no trace child is its own.
+            if let Err(e) = copies.registry.reclaim_orphan_relation_dirs(|_| None) {
                 gnitz_debug!("mirror: orphan directory sweep failed: {}", e);
             }
         }
@@ -167,24 +168,17 @@ impl Copies {
         let spec = RelationSpec {
             id: tid,
             kind: RelationKind::View(ViewBudget::Plain),
-            schema,
             placement: Placement::Local,
             pk_repeats: rec.pk_repeats,
             compress: false,
         };
-        self.registry.register_at(spec, resume)?;
-        for &cols in &rec.indexes {
-            if let Err(e) = self.registry.add_index_at(tid, index_claim(cols), cols, resume) {
-                // Not erased: the fault may be transient, and the stores resumable.
-                self.registry.unregister(tid);
-                return Err(e);
-            }
-        }
+        let indexes: Vec<_> = rec.indexes.iter().map(|&cols| (index_claim(cols), cols)).collect();
+        // On `Err` nothing is entered, and nothing erased: the fault may be
+        // transient, and the stores resumable.
+        let filled = self.registry.register_at(spec, schema, &indexes, resume)?;
         self.records.insert(tid, rec);
         // An index that did not resume holds rows no manifest does.
-        if resume.is_some() {
-            self.unpublished |= self.copy(tid).indexes().iter().any(|ix| !ix.resumed());
-        }
+        self.unpublished |= resume.is_some() && filled > 0;
         Ok(())
     }
 

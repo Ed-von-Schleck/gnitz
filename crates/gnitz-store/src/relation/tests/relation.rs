@@ -64,7 +64,7 @@ fn only_a_store_naming_one_row_per_key_admits_an_index() {
     ];
     for (id, (kind, pk_repeats, want)) in (70..).zip(owners) {
         let spec = RelationSpec { pk_repeats, ..spec(id, kind, schema) };
-        registry.register(spec).unwrap();
+        registry.register(spec, schema).unwrap();
         let verdict = |unique| registry.index_owner(id, unique).map(drop);
         match want {
             Ok(unique_too) => {
@@ -145,32 +145,36 @@ fn a_unique_index_covering_the_pk_has_nothing_left_to_check() {
 
 /// An index reopened beside its owner resumes from the manifest the owner's
 /// checkpoint published it with, and is filled from the owner when its own
-/// manifest is of another generation or gone. Either way it holds the owner's
-/// entries.
+/// manifest is of another generation — one a release left behind — or gone.
+/// Either way it holds the owner's entries.
 #[test]
 fn a_reopened_index_resumes_only_at_its_owners_generation() {
     let tmp = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let spec = spec(9, RelationKind::View(ViewBudget::Plain), schema);
-    let cols = PkColList::from_slice(&[1]);
+    let indexes = [(index(1, false), PkColList::from_slice(&[1]))];
     let rows = make_batch_raw(&schema, &[(1, 1, 30), (2, 1, 10), (3, 1, 20)]);
     {
         let mut origin = solo(tmp.path());
-        origin.register(spec).unwrap();
-        origin.add_index(9, index(1, false), cols).unwrap();
+        origin.register_at(spec, schema, &indexes, None).unwrap();
         origin.ingest(9, rows.clone()).unwrap();
-        origin.checkpoint_ephemeral([], 5, |_| true).unwrap();
+        origin.checkpoint_ephemeral([], 4, |_| true).unwrap();
     }
-    let reopen = |index_generation: u64| {
+    // How many indexes a reopen at `generation` filled.
+    let reopen = |generation: u64| {
         let mut r = solo(tmp.path());
-        r.register_at(spec, Some(5)).unwrap();
-        r.add_index_at(9, index(1, false), cols, Some(index_generation))
-            .unwrap();
+        let filled = r.register_at(spec, schema, &indexes, Some(generation)).unwrap();
         let ix = r.relation(9).unwrap().index_on(&[1]).unwrap();
-        assert_index_holds(ix, &rows, format_args!("generation {index_generation}"));
-        ix.resumed()
+        assert_index_holds(ix, &rows, format_args!("generation {generation}"));
+        (r, filled)
     };
-    assert!(reopen(5), "published with its owner");
-    assert!(!reopen(4), "of another generation, so filled from the owner");
-    assert!(!reopen(5), "the refused manifest is gone");
+    assert_eq!(reopen(4).1, 0, "published with its owner");
+    {
+        // The owner alone publishes at 5: the released index keeps its manifest at 4.
+        let (mut r, _) = reopen(4);
+        r.release_index(9, index(1, false));
+        r.checkpoint_ephemeral([], 5, |_| true).unwrap();
+    }
+    assert_eq!(reopen(5).1, 1, "of another generation, so filled from the owner");
+    assert_eq!(reopen(5).1, 1, "the refused manifest is gone");
 }

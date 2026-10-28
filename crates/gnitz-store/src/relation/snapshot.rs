@@ -12,7 +12,7 @@ use gnitz_zset::repr::Run;
 use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashMap;
 
-use super::{RelationKind, RelationRegistry, Store};
+use super::{RelationKind, RelationRegistry};
 use crate::storage::Cut;
 
 /// One relation's store at the moment of a pin.
@@ -34,22 +34,16 @@ impl RelationRegistry {
             return Err(format!("snapshot {snapshot} is already pinned"));
         }
         let pinned = self
-            .tables
+            .relations
             .iter()
-            .filter(|(_, rel)| keep(rel.kind))
-            .filter_map(|(&id, rel)| match &rel.store {
-                Store::Held(table) => Some((
-                    id,
-                    PinnedStore {
-                        schema: *table.schema(),
-                        runs: if rel.placement.counts_on(self.slot.rank) {
-                            table.runs(Cut::Now).collect()
-                        } else {
-                            Vec::new()
-                        },
-                    },
-                )),
-                Store::Absent(_) => None,
+            .filter(|(_, rel)| keep(rel.kind()))
+            .filter_map(|(&id, rel)| {
+                let table = rel.rows.table()?;
+                let runs = match rel.placement().counts_on(self.slot.rank) {
+                    true => table.runs(Cut::Now).collect(),
+                    false => Vec::new(),
+                };
+                Some((id, PinnedStore { schema: *table.schema(), runs }))
             })
             .collect();
         self.snapshots.insert(snapshot, pinned);

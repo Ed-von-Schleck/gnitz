@@ -93,7 +93,6 @@ pub(crate) fn spec(id: u64, kind: RelationKind, schema: SchemaDescriptor) -> Rel
     RelationSpec {
         id,
         kind,
-        schema,
         placement: Placement::full_pk(&schema),
         pk_repeats: false,
         compress: false,
@@ -142,16 +141,13 @@ pub(crate) fn relation_fixture_with(
 ) -> RelationFixture {
     let dir = tempfile::tempdir().unwrap();
     let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, config);
-    registry.register(spec(TID, kind, schema)).unwrap();
-    for (id, &cols) in (TID + 1..).zip(indexed) {
-        registry
-            .add_index(
-                TID,
-                IndexClaim::Index { id, unique: false },
-                PkColList::from_slice(cols),
-            )
-            .unwrap();
-    }
+    let indexes: Vec<_> = (TID + 1..)
+        .zip(indexed)
+        .map(|(id, &cols)| (IndexClaim::Index { id, unique: false }, PkColList::from_slice(cols)))
+        .collect();
+    registry
+        .register_at(spec(TID, kind, schema), schema, &indexes, None)
+        .unwrap();
     for rows in rounds {
         registry.ingest(TID, rows).unwrap();
     }

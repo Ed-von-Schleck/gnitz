@@ -41,7 +41,10 @@ fn rename_fires_no_cascade_and_leaves_dir_untouched() {
     apply_ddl(&mut engine, [(SysFamily::Table, pair.clone())]).unwrap();
 
     // The registration survives, so its directory is live.
-    assert!(engine.registry.has_id(tid), "rename must not unregister the table");
+    assert!(
+        engine.registry.relation(tid).is_some(),
+        "rename must not unregister the table"
+    );
     assert!(Path::new(&table_path).exists(), "rename must not delete the table dir");
     // Caches reflect the new name; no persistent ghost row.
     assert!(engine.get_by_name("public", "renamed").is_some());
@@ -340,7 +343,7 @@ fn insert_first_rename_pair_lands_the_new_name() {
         "the catalog must name the table by its new name"
     );
     assert!(
-        engine.registry.has_id(tid),
+        engine.registry.relation(tid).is_some(),
         "a rename must not unregister the table, whatever the row order"
     );
     assert_eq!(

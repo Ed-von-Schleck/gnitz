@@ -185,7 +185,7 @@ fn a_dropped_relations_id_is_not_handed_out_again() {
         engine.close();
     }
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(!engine.registry.has_id(tid));
+    assert!(engine.registry.relation(tid).is_none());
     assert!(engine.allocate_ids(1).unwrap() > tid);
     engine.close();
     let _ = fs::remove_dir_all(&dir);

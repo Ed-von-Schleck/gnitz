@@ -25,8 +25,7 @@ impl CatalogEngine {
     ///   * the recorded topology matches the launched `(worker_count, STATE_FORMAT)`
     ///     — a different worker count re-shapes every keyed store's row placement;
     ///   * its output child and every trace child its compiled circuit declares
-    ///     ([`RelationRegistry::declare_traces`]) are stamped with the committed
-    ///     checkpoint generation, which
+    ///     are stamped with the committed checkpoint generation, which
     ///     [`RelationRegistry::view_children_resumable`] answers. That is
     ///     `resume_generation`, the recovered `G`: the durable one is `G+1`
     ///     before any store opens when the boot replays a push; and
@@ -60,7 +59,11 @@ impl CatalogEngine {
         // be at `g`.
         let mut invalid = self.views_over_unreplayed_sources();
         for &vid in &view_ids {
-            if !invalid.contains(&vid) && !self.registry.view_children_resumable(vid, self.resume_generation) {
+            let resumable = |layout| {
+                self.registry
+                    .view_children_resumable(vid, self.resume_generation, layout)
+            };
+            if !invalid.contains(&vid) && !self.dag.layout_of(vid).is_some_and(resumable) {
                 invalid.insert(vid);
             }
         }
@@ -109,7 +112,7 @@ impl CatalogEngine {
     /// launched rank's manifests, so it runs where no worker exists yet.
     pub(in crate::catalog) fn settle_derived_state(&mut self) -> Result<(), String> {
         self.registry
-            .reconcile_child_dirs()
+            .reconcile_child_dirs(|id| self.dag.layout_of(id))
             .map_err(|e| format!("child-dir sweep failed: {e}"))?;
         self.compute_invalid_views();
         Ok(())

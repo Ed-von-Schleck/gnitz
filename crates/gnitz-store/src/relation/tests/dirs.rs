@@ -71,7 +71,8 @@ fn children_at_generation_reads_the_rows_and_the_declared_scratch() {
     const G: u64 = 5;
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap().to_string();
-    let traces = ["agg".to_string()];
+    let mut traces = StateLayout::default();
+    traces.declare("agg".to_string(), make_schema_u64_i64());
     assert!(
         !children_at_generation(&dir, 2, G, &traces),
         "an absent rank is a mismatch"
@@ -133,7 +134,8 @@ fn a_published_store_put_elsewhere_opens_with_the_checkpointed_rows() {
     assert!(!std::path::Path::new(&index.dir(&relation_dir(dest, TID))).exists());
 
     let mut copy = RelationRegistry::new(dest, Slot::SOLO, spilling());
-    copy.register(spec(TID, RelationKind::BaseTable, schema)).unwrap();
+    copy.register(spec(TID, RelationKind::BaseTable, schema), schema)
+        .unwrap();
     assert_eq!(
         zset_of(&copy.relation(TID).unwrap().full_scan(), &schema),
         zset_of(&make_batch_raw(&schema, &rows), &schema)
@@ -148,8 +150,8 @@ fn persisted_records_reads_well_formed_relation_manifests() {
     let mut registry = solo(tmp.path());
     let (good, damaged) = (123, 124);
     let view = |id| spec(id, RelationKind::View(ViewBudget::Plain), make_schema_u64_i64());
-    registry.register(view(good)).unwrap();
-    registry.register(view(damaged)).unwrap();
+    registry.register(view(good), make_schema_u64_i64()).unwrap();
+    registry.register(view(damaged), make_schema_u64_i64()).unwrap();
     registry.set_caller_record(good, b"good".to_vec()).unwrap();
     registry.set_caller_record(damaged, b"damaged".to_vec()).unwrap();
     registry.checkpoint_ephemeral([], 3, |_| true).unwrap();
@@ -185,7 +187,7 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
     let base = tmp.path().to_str().unwrap();
     // Rank 0 of 3, holding a table indexed on its payload column.
     let mut r = RelationRegistry::new(base, Slot::new(0, 3), StoreConfig::default());
-    r.register(spec(TID, RelationKind::BaseTable, schema)).unwrap();
+    r.register(spec(TID, RelationKind::BaseTable, schema), schema).unwrap();
     r.add_index(
         TID,
         IndexClaim::Index { id: TID + 1, unique: false },
@@ -194,7 +196,6 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
     .unwrap();
     let mut traces = StateLayout::default();
     traces.declare("agg".to_string(), schema);
-    r.declare_traces(TID, &traces).unwrap();
     r.ingest(TID, make_batch_raw(&schema, &[(1, 1, 7)])).unwrap();
     r.checkpoint_base().unwrap();
 
@@ -219,7 +220,8 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
         std::fs::create_dir_all(dir).unwrap();
     }
     for _ in 0..2 {
-        r.reclaim_orphan_relation_dirs().unwrap();
+        r.reclaim_orphan_relation_dirs(|id| (id == TID).then_some(&traces))
+            .unwrap();
         for dir in &unowned {
             assert!(!std::path::Path::new(dir).exists(), "{dir} is reclaimed");
         }

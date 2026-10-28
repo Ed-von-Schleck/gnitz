@@ -95,10 +95,10 @@ impl DagEngine {
             .is_some_and(|v| v.chain != id && !v.code.vm.reads_view_store())
     }
 
-    /// The operator state the compiled circuit of view `id`, a registered view,
-    /// opens.
-    pub(crate) fn state_layout(&self, id: u64) -> &StateLayout {
-        self.views[&id].code.vm.layout()
+    /// The operator state the compiled circuit of view `id` opens; `None` for an
+    /// id that is no view here.
+    pub(crate) fn layout_of(&self, id: u64) -> Option<&StateLayout> {
+        self.views.get(&id).map(|v| v.code.vm.layout())
     }
 
     /// The user view whose chain holds view `id`: its owner, or `id` itself.

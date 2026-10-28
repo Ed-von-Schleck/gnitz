@@ -545,7 +545,7 @@ impl CatalogEngine {
             let owner_id = gnitz_wire::sys_leading_id(cols.get_pk_bytes(i));
             // An ALTER must be its bundle's only change, on one owner: nothing can undo
             // its descriptor swap, so the swap must be the bundle's last fallible step.
-            if self.registry.has_id(owner_id) {
+            if self.registry.relation(owner_id).is_some() {
                 if altered.is_some_and(|a| a != owner_id) || families.family_count() > 1 {
                     return Err("a column ALTER must be the only change in its DDL transaction".into());
                 }
@@ -605,7 +605,7 @@ impl CatalogEngine {
         // The retired ids a relation of the same name takes over: an ALTER VIEW.
         let mut replaced: Vec<u64> = Vec::new();
         let creates = IdSet::new(sigs.iter().filter(|s| s.shape() == PkShape::Create).map(|s| s.leading));
-        if let Some(id) = creates.ids().iter().find(|&&id| self.registry.has_id(id)) {
+        if let Some(id) = creates.ids().iter().find(|&&id| self.registry.relation(id).is_some()) {
             return Err(format!("relation id {id} already exists"));
         }
         // The only owners a created view may name: a chain is created whole.

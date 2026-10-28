@@ -87,12 +87,15 @@ fn expected(schema: SchemaDescriptor, placement: Placement, rows: &Rows, of: u32
 fn boot(base: &str, of: u32, schema: SchemaDescriptor, placement: Placement) -> Result<(), String> {
     let mut master = RelationRegistry::master(base, of, StoreConfig::default());
     master
-        .register(RelationSpec {
-            placement,
-            ..spec(ID, RelationKind::BaseTable, schema)
-        })
+        .register(
+            RelationSpec {
+                placement,
+                ..spec(ID, RelationKind::BaseTable, schema)
+            },
+            schema,
+        )
         .unwrap();
-    master.reconcile_child_dirs()
+    master.reconcile_child_dirs(|_| None)
 }
 
 /// Whether any child of `rel`'s `of`-worker set holds a manifest.

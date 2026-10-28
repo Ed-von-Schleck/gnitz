@@ -1,7 +1,8 @@
-//! The ingestion pipeline: unique-PK enforcement, store + secondary-index
-//! application, delta capture, and the flush / checkpoint table collection.
+//! The write path: unique-PK enforcement, store + secondary-index application,
+//! delta capture, the seal, and the checkpoint rounds.
 
-use super::{CircuitState, Cut, RelationKind, RelationRegistry, SecondaryIndex, Store};
+use super::store::Rows;
+use super::{CircuitState, Cut, Relation, RelationKind, RelationRegistry, SecondaryIndex};
 use crate::storage::Table;
 use gnitz_zset::repr::{Batch, StorageError};
 use std::rc::Rc;
@@ -21,16 +22,14 @@ fn inject_ingest_apply_error(which: &str, kind: RelationKind, r: Result<(), Stor
     r
 }
 
-/// Fill each of `targets`, all empty, from one chunked scan of `owner`, `owner_id`'s store.
+/// Fill each of `targets`, all empty, from one chunked scan of `owner`,
+/// `owner_id`'s store.
 pub(super) fn fill_indexes(
-    owner: &Store,
+    owner: &Table,
     chunk_rows: usize,
     owner_id: u64,
     targets: &mut [&mut SecondaryIndex],
 ) -> Result<(), String> {
-    if targets.is_empty() {
-        return Ok(());
-    }
     for ix in targets.iter() {
         assert_eq!(
             ix.store.held().estimated_rows(),
@@ -39,7 +38,7 @@ pub(super) fn fill_indexes(
             ix.cols.as_slice()
         );
     }
-    let mut source = owner.held().open_cursor(Cut::Now);
+    let mut source = owner.open_cursor(Cut::Now);
     while let Some(chunk) = source.drain_chunk(chunk_rows) {
         for ix in targets.iter_mut() {
             ix.project_and_ingest(&chunk).map_err(|e| {
@@ -53,103 +52,80 @@ pub(super) fn fill_indexes(
     Ok(())
 }
 
-impl RelationRegistry {
-    // ── Ingestion ───────────────────────────────────────────────────────
+/// Where a write lands in its relation's store.
+#[derive(Clone, Copy)]
+enum Landing {
+    /// Above the cut, until a seal answers it: neither captured nor echoed.
+    Pending,
+    /// At the cut: captured as `round` by the delta feed this process serves, and
+    /// the batch as applied echoed back iff `echo`.
+    Cut { round: Option<u64>, echo: bool },
+}
 
-    /// Apply `batch` to `id`'s store and its index projections, moving it in.
-    /// A base table's PK rule runs and a view's batch is consolidated; a stream
-    /// writes nothing, holding no rows; a system family's batch is written as it
-    /// stands.
-    pub fn ingest(&mut self, id: u64, batch: Batch) -> Result<(), String> {
-        // Rows left above the cut would stay there: nothing seals a relation no
-        // view reads.
-        if self.relation(id).is_some_and(|r| r.has_pending()) {
-            self.seal(id)?;
-        }
-        self.ingest_at(id, batch, None, false).map(drop)
-    }
-
-    /// [`Self::ingest`] above `id`'s cut: every reader sees the rows but one at
-    /// [`Cut::Sealed`](super::Cut::Sealed), until [`Self::seal`] answers them.
-    pub fn ingest_pending(&mut self, id: u64, batch: Batch) -> Result<(), String> {
-        self.apply(id, batch, None, false, true).map(drop)
-    }
-
-    /// Move `id`'s cut past every row ingested as pending since the last seal,
-    /// and answer those rows: the relation's delta, consolidated for a table and
-    /// as pushed for a stream. `None` when there is none.
-    pub fn seal(&mut self, id: u64) -> Result<Option<Batch>, String> {
-        let entry = self.relation_mut_or_err(id)?;
-        match entry.store.table_mut() {
-            Some(table) => table.seal().map_err(|e| format!("seal relation {id}: {e}")),
-            None => Ok(entry.unsealed.take().filter(|delta| !delta.is_empty())),
+impl Relation {
+    /// Whether rows sit above this relation's cut.
+    fn has_pending(&self) -> bool {
+        match &self.rows {
+            Rows::Stored { store, .. } => store.table().is_some_and(Table::has_pending),
+            Rows::Stream { unsealed, .. } => unsealed.is_some(),
         }
     }
 
-    /// Drop every row view `id`'s store holds; the next barrier publishes it
-    /// empty. For a view with no index and no delta feed.
-    pub fn clear_rows(&mut self, id: u64) -> Result<(), String> {
-        let entry = self.relation_mut_or_err(id)?;
-        debug_assert!(entry.kind.is_view() && entry.feed.is_none() && entry.indexes.is_empty());
-        entry.store.held_mut().clear();
-        Ok(())
+    /// See [`RelationRegistry::seal`].
+    #[inline]
+    fn seal(&mut self) -> Result<Option<Batch>, String> {
+        let id = self.spec.id;
+        match &mut self.rows {
+            Rows::Stored { store, .. } => match store.table_mut() {
+                Some(table) => table.seal().map_err(|e| format!("seal relation {id}: {e}")),
+                None => Ok(None),
+            },
+            Rows::Stream { unsealed, .. } => Ok(unsealed.take().filter(|delta| !delta.is_empty())),
+        }
     }
 
-    /// [`Self::ingest`] without its seal of pending rows (its callers write views,
-    /// which hold none), captured as round `round` by the delta feed this process
-    /// serves for `id`; the batch as applied comes back iff `echo` and it holds
-    /// a row.
-    pub fn ingest_at(
-        &mut self,
-        id: u64,
-        batch: Batch,
-        round: Option<u64>,
-        echo: bool,
-    ) -> Result<Option<Batch>, String> {
-        self.apply(id, batch, round, echo, false)
-    }
-
-    /// [`Self::ingest_at`], the store's rows landing above its cut iff `above`.
-    fn apply(
-        &mut self,
-        id: u64,
-        batch: Batch,
-        round: Option<u64>,
-        echo: bool,
-        above: bool,
-    ) -> Result<Option<Batch>, String> {
-        let entry = self.relation_mut_or_err(id)?;
+    /// Apply `batch` to this relation's store and its index projections where
+    /// `landing` puts it; the batch as applied comes back iff it asks for an echo
+    /// and the batch holds a row.
+    fn apply(&mut self, batch: Batch, landing: Landing) -> Result<Option<Batch>, String> {
+        let Relation { spec, rows, indexes } = self;
+        let id = spec.id;
         // Checked, not asserted: the append path sizes by the destination's region
         // count, so a mismatch would silently drop the extra column.
-        let want = entry.store.schema().num_payload_cols();
+        let want = rows.schema().num_payload_cols();
         let got = batch.schema().num_payload_cols();
         if got != want {
             return Err(format!(
                 "batch for relation {id} carries {got} payload columns, its schema has {want}"
             ));
         }
-        let kind = entry.kind;
-        let effective = match kind {
+        let (table, feed) = match rows {
             // A stream's rows exist only as the deltas they produce.
-            RelationKind::Stream if above => {
-                match &mut entry.unsealed {
-                    Some(held) => held.append_batch(&batch),
-                    held => *held = Some(batch),
+            Rows::Stream { unsealed, .. } => {
+                if let Landing::Pending = landing {
+                    match unsealed {
+                        Some(held) => held.append_batch(&batch),
+                        held => *held = Some(batch),
+                    }
                 }
                 return Ok(None);
             }
-            RelationKind::Stream => return Ok(echo.then_some(batch)),
-            RelationKind::BaseTable => super::unique_pk::enforce_unique_pk(entry.store.held(), batch),
-            // Folded once for the store, the delta capture and every reader of the
-            // echo, which all read a view's output at net weights.
-            RelationKind::View(_) => batch.into_consolidated(),
-            RelationKind::SystemCatalog => batch,
+            Rows::Stored { store, feed } => (store.held_mut(), feed),
         };
+        let kind = spec.kind;
+        let mut effective = match kind.is_base_table() {
+            true => super::unique_pk::enforce_unique_pk(table, batch),
+            false => batch,
+        };
+        // Folded once for every reader below — the indexes, the store, the delta
+        // capture and the echo — which all read net weights. In place: a batch
+        // moved through a by-value call is copied once more.
+        effective.consolidate_in_place();
         if effective.is_empty() {
             return Ok(None);
         }
 
-        for ix in entry.indexes.iter_mut() {
+        for ix in indexes.iter_mut() {
             let res = ix.project_and_ingest(&effective);
             inject_ingest_apply_error("index", kind, res).map_err(|e| {
                 format!(
@@ -159,33 +135,85 @@ impl RelationRegistry {
             })?;
         }
 
-        let store = entry.store.held_mut();
-        if above {
-            // No round has rows above the cut yet, so no feed captures them.
-            debug_assert!(
-                round.is_none() && !echo,
-                "rows above the cut are neither captured nor echoed"
-            );
-            store.ingest_pending(effective);
+        let Landing::Cut { round, echo } = landing else {
+            table.ingest_pending(effective);
             return Ok(None);
-        }
+        };
+        // An echo hands back the caller's batch: its copy, tight, is the run.
         let (run, applied) = match echo {
             true => (effective.to_consolidated(), Some(effective)),
-            false => (effective.into_consolidated(), None),
+            false => (effective, None),
         };
-        let capture = entry.feed.as_mut().zip(round);
+        let capture = feed.as_mut().zip(round);
         // One allocation for the store's run and the feed's round, which is
         // charged every byte it holds: none it has no row in.
         let run = Rc::new(match capture {
             Some(_) => run.shrunk(),
             None => run.trimmed(),
         });
-        let res = store.ingest_run(Rc::clone(&run));
+        let res = table.ingest_run(Rc::clone(&run));
         inject_ingest_apply_error("store", kind, res).map_err(|e| format!("ingest into relation {id}: {e}"))?;
         if let Some((feed, round)) = capture {
             feed.record(round, run);
         }
         Ok(applied)
+    }
+}
+
+impl RelationRegistry {
+    // ── Ingestion ───────────────────────────────────────────────────────
+    //
+    // Each verb is one lookup and one call, inlined into its caller: out of
+    // line, a batch moving through it by value is copied once more.
+
+    /// Apply `batch` to `id`'s store and its index projections, moving it in.
+    /// Every batch is consolidated, a base table's after its PK rule; a stream
+    /// writes nothing, holding no rows.
+    #[inline]
+    pub fn ingest(&mut self, id: u64, batch: Batch) -> Result<(), String> {
+        let relation = self.relation_mut_or_err(id)?;
+        // Rows left above the cut would stay there: nothing seals a relation no
+        // view reads.
+        if relation.has_pending() {
+            relation.seal()?;
+        }
+        relation
+            .apply(batch, Landing::Cut { round: None, echo: false })
+            .map(drop)
+    }
+
+    /// [`Self::ingest`] above `id`'s cut: every reader sees the rows but one at
+    /// [`Cut::Sealed`](super::Cut::Sealed), until [`Self::seal`] answers them.
+    #[inline]
+    pub fn ingest_pending(&mut self, id: u64, batch: Batch) -> Result<(), String> {
+        self.relation_mut_or_err(id)?.apply(batch, Landing::Pending).map(drop)
+    }
+
+    /// [`Self::ingest`], without its seal of pending rows (a view holds none), of
+    /// one round of view `id`'s output, captured as round `round` by the delta
+    /// feed this process serves for it; the batch as applied comes back iff
+    /// `echo` and it holds a row.
+    #[inline]
+    pub fn ingest_round(&mut self, id: u64, batch: Batch, round: u64, echo: bool) -> Result<Option<Batch>, String> {
+        let landing = Landing::Cut { round: Some(round), echo };
+        self.relation_mut_or_err(id)?.apply(batch, landing)
+    }
+
+    /// Move `id`'s cut past every row ingested as pending since the last seal,
+    /// and answer those rows: the relation's delta, consolidated for a table and
+    /// as pushed for a stream. `None` when there is none.
+    #[inline]
+    pub fn seal(&mut self, id: u64) -> Result<Option<Batch>, String> {
+        self.relation_mut_or_err(id)?.seal()
+    }
+
+    /// Drop every row view `id`'s store holds; the next barrier publishes it
+    /// empty. For a view with no index and no delta feed.
+    pub fn clear_rows(&mut self, id: u64) -> Result<(), String> {
+        let entry = self.relation_mut_or_err(id)?;
+        debug_assert!(entry.kind().is_view() && entry.feed().is_none() && entry.indexes.is_empty());
+        entry.rows.held_mut().clear();
+        Ok(())
     }
 
     // ── Flush / checkpoint collection ───────────────────────────────────
@@ -195,54 +223,50 @@ impl RelationRegistry {
     /// included: no manifest publish, no barrier, and nothing of the relation's
     /// indexes. Unregistered is an `Err`.
     pub fn fold_to_ram(&mut self, id: u64) -> Result<(), String> {
-        let store = self.relation_mut_or_err(id)?.store.held_mut();
+        let store = self.relation_mut_or_err(id)?.rows.held_mut();
         store
             .fold_to_ram()
             .and_then(|()| store.settle())
             .map_err(|e| format!("fold relation {id} to RAM: {e}"))
     }
 
-    /// The own `Table` plus the index tables of each user relation `picked`
-    /// keeps. System families are excluded, so a forked worker cannot flush its
-    /// inherited copy.
-    fn collect_user_tables(&mut self, picked: impl Fn(u64) -> bool) -> impl Iterator<Item = &mut Table> {
-        self.tables
+    /// The stores this process holds of the relations whose kind `keep` accepts.
+    pub(super) fn held_rows(&mut self, keep: impl Fn(RelationKind) -> bool) -> impl Iterator<Item = &mut Table> {
+        self.relations
             .values_mut()
-            .filter(move |e| e.kind != RelationKind::SystemCatalog && picked(e.id))
-            .flat_map(|e| {
-                e.store
-                    .table_mut()
-                    .into_iter()
-                    .chain(e.indexes.iter_mut().filter_map(|ix| ix.store.table_mut()))
-            })
-    }
-
-    /// The system families' stores: the complement of [`Self::collect_user_tables`].
-    pub(super) fn collect_system_tables(&mut self) -> impl Iterator<Item = &mut Table> {
-        self.tables
-            .values_mut()
-            .filter(|e| e.kind == RelationKind::SystemCatalog)
-            .filter_map(|e| e.store.table_mut())
+            .filter(move |e| keep(e.kind()))
+            .filter_map(|e| e.rows.table_mut())
     }
 
     // ── The checkpoint rounds ───────────────────────────────────────────
 
-    /// The base round: every user store that is not rederived, in one barrier.
+    /// The bytes `id`'s next published manifest carries beside its rows.
+    pub fn set_caller_record(&mut self, id: u64, record: Vec<u8>) -> Result<(), String> {
+        self.relation_mut_or_err(id)?
+            .rows
+            .table_mut()
+            .ok_or_else(|| format!("relation {id} holds no store in this process"))?
+            .set_caller_record(record);
+        Ok(())
+    }
+
+    /// The base round: every base table's rows — the one user store a boot does
+    /// not rebuild — in one barrier.
     pub fn checkpoint_base(&mut self) -> Result<(), String> {
-        crate::storage::flush_barrier(self.collect_user_tables(|_| true).filter(|t| !t.is_rederived()), 0)
+        crate::storage::flush_barrier(self.held_rows(RelationKind::is_base_table), 0)
             .map_err(|e| format!("base flush: {e}"))
     }
 
     /// The system round: every system family's store, in one barrier.
     pub fn checkpoint_system(&mut self, replay_floor: u64) -> Result<(), String> {
-        crate::storage::flush_barrier(self.collect_system_tables(), replay_floor)
+        crate::storage::flush_barrier(self.held_rows(|k| k == RelationKind::SystemCatalog), replay_floor)
             .map_err(|e| format!("system catalog flush: {e}"))
     }
 
-    /// The ephemeral round at `generation`: the rederived stores of every
-    /// relation `resumes` picks and `state`, those relations' operator traces,
-    /// in one barrier. A relation no round ever picks has no manifest, so every
-    /// open rebuilds it.
+    /// The ephemeral round at `generation`: the stores a boot rebuilds — a view's
+    /// rows and every index — of each user relation `resumes` picks, and `state`,
+    /// those relations' operator traces, in one barrier. A relation no round ever
+    /// picks has no manifest, so every open rebuilds it.
     pub fn checkpoint_ephemeral<'s>(
         &mut self,
         state: impl IntoIterator<Item = &'s mut CircuitState>,
@@ -250,7 +274,16 @@ impl RelationRegistry {
         resumes: impl Fn(u64) -> bool,
     ) -> Result<(), String> {
         let mut tables: Vec<&mut Table> = state.into_iter().flat_map(CircuitState::tables_mut).collect();
-        tables.extend(self.collect_user_tables(resumes).filter(|t| t.is_rederived()));
+        let picked = self
+            .relations
+            .values_mut()
+            .filter(|e| e.kind() != RelationKind::SystemCatalog && resumes(e.id()));
+        for e in picked {
+            if e.kind().is_view() {
+                tables.extend(e.rows.table_mut());
+            }
+            tables.extend(e.indexes.iter_mut().filter_map(|ix| ix.store.table_mut()));
+        }
         crate::storage::flush_barrier(tables, generation).map_err(|e| format!("ephemeral flush: {e}"))
     }
 }

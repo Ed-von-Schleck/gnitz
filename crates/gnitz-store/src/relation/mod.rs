@@ -24,14 +24,13 @@ mod ingest;
 mod repartition;
 mod snapshot;
 mod store;
-mod store_lifecycle;
 mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
 pub use dirs::{lock_data_dir, relation_dir, ChildAddr, ChildKind, DirLock};
 pub use disk_usage::{disk_usage, DiskUsage};
 use feed::Feed;
-use store::Store;
+use store::{Rows, Store};
 
 // ---------------------------------------------------------------------------
 // Secondary index
@@ -251,54 +250,43 @@ impl Residency {
 /// One relation in this process: its identity, its shape, and this process's
 /// store for it.
 pub struct Relation {
-    /// The relation id — the key it is registered under, held here too so a
-    /// borrowed `Relation` names itself: nothing that has one needs the id
-    /// threaded in beside it to log or to phrase an error.
-    id: u64,
-    store: Store,
-    /// A stream's pushes since its last seal. Nothing reads them before it, so
-    /// they are held as they arrived.
-    unsealed: Option<Batch>,
-    feed: Option<Feed>,
+    /// What it was registered as. Its id is the key it is registered under, held
+    /// here too so a borrowed `Relation` names itself: nothing that has one needs
+    /// the id threaded in beside it to log or to phrase an error.
+    spec: RelationSpec,
+    rows: Rows,
     indexes: Vec<SecondaryIndex>,
-    /// The trace children a view's compiled operator state declares, by name:
-    /// the scratch children the resume verdict reads and the reclaim keeps.
-    traces: Box<[String]>,
-    kind: RelationKind,
-    placement: Placement,
-    pk_repeats: bool,
-    compress: bool,
 }
 
 impl Relation {
     /// This relation's delta feed, if this process serves it.
     pub(crate) fn feed(&self) -> Option<&Feed> {
-        self.feed.as_ref()
+        self.rows.feed()
     }
 
-    /// By value, for the reason [`SecondaryIndex::cols`] is: the `tables` borrow
+    /// By value, for the reason [`SecondaryIndex::cols`] is: the `relations` borrow
     /// ends with the call, so the descriptor survives a later `&mut` on the
     /// registry.
     pub fn schema(&self) -> SchemaDescriptor {
-        *self.store.schema()
+        *self.rows.schema()
     }
 
     pub fn id(&self) -> u64 {
-        self.id
+        self.spec.id
     }
 
     pub fn kind(&self) -> RelationKind {
-        self.kind
+        self.spec.kind
     }
 
     /// Where this relation's rows live.
     pub fn placement(&self) -> Placement {
-        self.placement
+        self.spec.placement
     }
 
     /// Whether two of its rows may share a PK.
     pub fn pk_repeats(&self) -> bool {
-        self.pk_repeats
+        self.spec.pk_repeats
     }
 
     /// The unique secondary indexes a write must still check: one covering the
@@ -360,17 +348,9 @@ impl Relation {
             .ok_or_else(|| format!("relation {} has no index on columns {cols:?}", self.id()))
     }
 
-    /// Whether rows sit above this relation's cut.
-    pub(crate) fn has_pending(&self) -> bool {
-        match &self.store {
-            Store::Held(t) => t.has_pending(),
-            Store::Absent(_) => self.unsealed.is_some(),
-        }
-    }
-
     /// This process's store of the relation; panics when it holds none.
     pub(crate) fn table(&self) -> &Table {
-        self.store.held()
+        self.rows.held()
     }
 }
 
@@ -378,12 +358,13 @@ impl Relation {
 // The relation to register
 // ---------------------------------------------------------------------------
 
-/// A relation to [`RelationRegistry::register_at`].
+/// What a relation is registered as: everything about it that is fixed from its
+/// registration to its drop. Its schema is not — a column ALTER swaps it — so it
+/// is registered beside the spec and lives in the relation's rows.
 #[derive(Clone, Copy)]
 pub struct RelationSpec {
     pub id: u64,
     pub kind: RelationKind,
-    pub schema: SchemaDescriptor,
     pub placement: Placement,
     /// Whether two of its rows may share a PK. `false` is a promise the index
     /// gather relies on, so a host that cannot vouch for it passes `true`.
@@ -447,7 +428,7 @@ impl StoreConfig {
 /// `Rc`-bearing value it handed out is still alive outside it: those refcounts
 /// are non-atomic.
 pub struct RelationRegistry {
-    tables: FxHashMap<u64, Relation>,
+    relations: FxHashMap<u64, Relation>,
     /// The data directory every relation's [`relation_dir`] sits under.
     base_dir: String,
     /// Which worker this process is, of how many: names the `w{k}of{n}` child
@@ -464,7 +445,7 @@ impl RelationRegistry {
     /// An empty [`Residency::Origin`] registry over the data directory `base_dir`.
     pub fn new(base_dir: &str, slot: Slot, config: StoreConfig) -> Self {
         RelationRegistry {
-            tables: FxHashMap::default(),
+            relations: FxHashMap::default(),
             base_dir: base_dir.to_string(),
             slot,
             config: StoreConfig {
@@ -488,68 +469,20 @@ impl RelationRegistry {
 
     /// Drop `id`'s entry, and with it its owned stores and fds.
     pub fn unregister(&mut self, id: u64) {
-        self.tables.remove(&id);
-    }
-
-    /// Enter a secondary index on `owner` over `cols`, filled from this process's
-    /// slice of the owner, or add a claim to the one already on `cols`. On
-    /// `Err` nothing is entered. A claim's `unique` is trusted: a duplicate can
-    /// straddle two workers' slices, so only the caller can check it.
-    pub fn add_index(&mut self, owner: u64, claim: IndexClaim, cols: PkColList) -> Result<(), String> {
-        self.add_index_at(owner, claim, cols, None)
-    }
-
-    /// [`Self::add_index`]; beside an owner [reopened](Self::register_at) at
-    /// `Some(generation)`, the index's store resumes from its manifest at that
-    /// generation, and is filled from the owner when it carries none.
-    pub fn add_index_at(
-        &mut self,
-        owner: u64,
-        claim: IndexClaim,
-        cols: PkColList,
-        resume_at: Option<u64>,
-    ) -> Result<(), String> {
-        let unique = matches!(claim, IndexClaim::Index { unique: true, .. });
-        let owner_schema = self.index_owner(owner, unique)?.schema();
-        let entry = self.tables.get_mut(&owner).expect("resolved above");
-        if let Some(ix) = entry.indexes.iter_mut().find(|ix| ix.cols == cols) {
-            debug_assert!(!ix.claims.contains(&claim), "{claim:?} claimed twice");
-            ix.claims.push(claim);
-            return Ok(());
-        }
-        let key_spec = KeySpec::new(cols.as_slice(), &owner_schema)?;
-        let index_schema = key_spec.index_schema(&owner_schema);
-        let store = if self.residency.owns_stores() {
-            self.open_index_store(owner, cols, index_schema, resume_at)?
-        } else {
-            Store::Absent(Box::new(index_schema))
-        };
-        let mut ix = SecondaryIndex {
-            cols,
-            store,
-            key_spec,
-            claims: vec![claim],
-            covers_pk: owner_schema.covers_pk(cols.as_slice()),
-        };
-        let entry = self.tables.get_mut(&owner).expect("resolved above");
-        if matches!(ix.store, Store::Held(_)) && !ix.resumed() {
-            ingest::fill_indexes(&entry.store, self.config.scan_chunk_rows, owner, &mut [&mut ix])?;
-        }
-        entry.indexes.push(ix);
-        Ok(())
+        self.relations.remove(&id);
     }
 
     /// Remove `claim` from whichever of `owner`'s circuits hold it, dropping a
     /// circuit left with none. A no-op when the owner or claim is absent.
     pub fn release_index(&mut self, owner: u64, claim: IndexClaim) {
-        if let Some(entry) = self.tables.get_mut(&owner) {
+        if let Some(entry) = self.relations.get_mut(&owner) {
             entry.release(claim);
         }
     }
 
     /// [`Self::release_index`] over every relation.
     pub fn release_claim(&mut self, claim: IndexClaim) {
-        self.tables.values_mut().for_each(|entry| entry.release(claim));
+        self.relations.values_mut().for_each(|entry| entry.release(claim));
     }
 
     /// Publish a new column schema for relation `id` in place (any column
@@ -560,22 +493,18 @@ impl RelationRegistry {
         let entry = self.relation_mut_or_err(id)?;
         // Checked, not asserted: what a stale `key_spec` produces is a silently
         // wrong index projection, which release codegen would not guard at all.
-        if !schema.is_trailing_append_of(entry.store.schema()) {
+        if !schema.is_trailing_append_of(entry.rows.schema()) {
             return Err(format!(
                 "ALTER on table {id}: the new descriptor is not a trailing append of the stored one"
             ));
         }
         entry
-            .store
+            .rows
             .swap_schema(schema)
             .map_err(|e| format!("ALTER on table {id}: rebinding shards: {e}"))
     }
 
     // ── Registry reads ──────────────────────────────────────────────────
-
-    pub fn has_id(&self, id: u64) -> bool {
-        self.tables.contains_key(&id)
-    }
 
     /// The data directory every relation's [`relation_dir`] sits under.
     pub fn base_dir(&self) -> &str {
@@ -604,7 +533,7 @@ impl RelationRegistry {
 
     /// The relation `id` names, or `None` for an unknown id.
     pub fn relation(&self, id: u64) -> Option<&Relation> {
-        self.tables.get(&id)
+        self.relations.get(&id)
     }
 
     /// [`Self::relation`] plus the one "not registered" sentence — spelled the
@@ -617,20 +546,20 @@ impl RelationRegistry {
     /// that enters an index asks here.
     pub fn index_owner(&self, owner: u64, unique: bool) -> Result<&Relation, String> {
         let e = self.relation_or_err(owner)?;
-        if !e.kind.admits_index() {
+        if !e.kind().admits_index() {
             return Err(format!(
                 "Index: owner {owner} is a {}; only a base table or a view without a capacity can be indexed",
-                e.kind.noun()
+                e.kind().noun()
             ));
         }
-        if unique && e.kind.is_view() {
+        if unique && e.kind().is_view() {
             return Err(format!(
                 "Index: view {owner} cannot carry a UNIQUE index: its circuit cannot refuse a duplicate"
             ));
         }
         // An index walk gathers every row under an in-range entry's source PK, so
         // a second row under that PK would come back whatever its own key.
-        if e.pk_repeats {
+        if e.pk_repeats() {
             return Err(format!(
                 "Index: owner {owner} repeats its primary key, so an index entry does not name one row"
             ));
@@ -640,7 +569,7 @@ impl RelationRegistry {
 
     /// [`Self::relation_or_err`] as `&mut`.
     fn relation_mut_or_err(&mut self, id: u64) -> Result<&mut Relation, String> {
-        self.tables.get_mut(&id).ok_or_else(|| Self::unregistered(id))
+        self.relations.get_mut(&id).ok_or_else(|| Self::unregistered(id))
     }
 
     fn unregistered(id: u64) -> String {
@@ -649,12 +578,15 @@ impl RelationRegistry {
 
     /// True iff at least one registered relation carries a delta feed.
     pub fn any_delta_feed(&self) -> bool {
-        self.tables.values().any(|r| r.kind.has_delta_feed())
+        self.relations.values().any(|r| r.kind().has_delta_feed())
     }
 
     /// Every registered view id.
     pub fn view_ids(&self) -> impl Iterator<Item = u64> + '_ {
-        self.tables.iter().filter(|(_, e)| e.kind.is_view()).map(|(&id, _)| id)
+        self.relations
+            .iter()
+            .filter(|(_, e)| e.kind().is_view())
+            .map(|(&id, _)| id)
     }
 }
 

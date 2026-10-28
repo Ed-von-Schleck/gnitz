@@ -258,7 +258,7 @@ fn a_creating_bundle_registers_its_table() {
     )
     .unwrap();
     assert_eq!(engine.get_by_name("public", "t"), Some(tid));
-    assert!(engine.registry.has_id(tid));
+    assert!(engine.registry.relation(tid).is_some());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -283,7 +283,7 @@ fn an_all_drop_bundle_drops_a_schema_with_its_members() {
     ]);
     engine.apply_bundle(drops, &mut |_, _| Ok(())).unwrap();
     assert!(engine.schema_id("s").is_none());
-    assert!(!engine.registry.has_id(tid) && !engine.registry.has_id(vid));
+    assert!(engine.registry.relation(tid).is_none() && engine.registry.relation(vid).is_none());
     assert!(engine.dag.dependents_of(tid).is_empty());
 
     engine.close();
@@ -338,7 +338,10 @@ fn a_refused_view_bundle_leaves_the_prior_catalog() {
         assert!(err.contains(want), "{want}: {err}");
 
         assert_eq!(sys_row_counts(&engine), before, "{want}");
-        assert!(engine.registry.has_id(base) && !engine.registry.has_id(vid), "{want}");
+        assert!(
+            engine.registry.relation(base).is_some() && engine.registry.relation(vid).is_none(),
+            "{want}"
+        );
         assert_eq!(engine.get_by_name("public", "base"), Some(base), "{want}");
         assert!(engine.dag.dependents_of(base).is_empty(), "{want}");
     }

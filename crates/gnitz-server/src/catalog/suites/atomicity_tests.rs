@@ -266,7 +266,7 @@ fn ddl_txn_hook_failure_is_undone() {
         "COL_TAB rows must net to zero (negated exactly once)"
     );
     assert!(
-        !engine.registry.has_id(new_tid),
+        engine.registry.relation(new_tid).is_none(),
         "no registered table survives the rollback"
     );
 
@@ -323,7 +323,7 @@ fn undoing_a_drop_keeps_the_restored_relation_directory() {
         "the fixture table must have one live TABLE_TAB row"
     );
     // The DROP of a bundle the log refuses at its Column group, after its Table
-    // group applied. The refusing sink makes the restoring `build_relation_store`
+    // group applied. The refusing sink makes the restoring `build_rows`
     // fail: a plain file where the per-worker child directory belongs, which
     // `Table::new` cannot open.
     let mut sink = |family: SysFamily, _: &Batch| {
@@ -394,7 +394,7 @@ fn refused_create_table_leaves_no_trace() {
     assert!(!err.contains("undoing"), "the bundle is undone: {err}");
 
     assert!(!engine.caches.relations.contains_key(&tid));
-    assert!(!engine.registry.has_id(tid));
+    assert!(engine.registry.relation(tid).is_none());
     assert!(engine.index_ids_of(tid).is_empty());
     assert!(
         !engine.fk_children_of(parent).iter().any(|e| e.child_tid == tid),

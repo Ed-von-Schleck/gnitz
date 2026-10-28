@@ -178,7 +178,7 @@ fn the_system_schema_takes_no_relation() {
         assert!(err.contains("the system schema takes no relation"), "{err}");
         assert_eq!(sys_row_counts(&engine), before);
     }
-    assert!(!engine.registry.has_id(tid) && !engine.registry.has_id(vid));
+    assert!(engine.registry.relation(tid).is_none() && engine.registry.relation(vid).is_none());
     assert!(!engine.dag.is_scanned(TABLES));
 
     discard(engine);
@@ -203,7 +203,7 @@ fn no_view_scans_sequences() {
 
     assert!(!engine.dag.is_scanned(seq), "the refused view left no edge");
     assert!(engine.dag.sources_of(vid).is_empty());
-    assert!(!engine.registry.has_id(vid));
+    assert!(engine.registry.relation(vid).is_none());
     // allocate_ids moved `sequences` itself; every other family is as it was.
     let after = sys_row_counts(&engine);
     for family in SysFamily::ALL {

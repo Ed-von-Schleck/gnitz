@@ -267,8 +267,8 @@ fn creating_a_child_of_a_parent_the_same_delta_drops_is_refused() {
     ];
     let err = apply_ddl(&mut engine, blocks).expect_err("a child of a parent this delta drops must be refused");
     assert!(err.contains("which this transaction drops"), "{err}");
-    assert!(engine.registry.has_id(parent_tid));
-    assert!(!engine.registry.has_id(child_tid));
+    assert!(engine.registry.relation(parent_tid).is_some());
+    assert!(engine.registry.relation(child_tid).is_none());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

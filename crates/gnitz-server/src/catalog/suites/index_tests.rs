@@ -165,7 +165,7 @@ fn test_drop_table_cleans_up_indices() {
     let tid = engine.create_table("public.idx_tbl", &cols, &[0]).unwrap();
     engine.create_index("public.idx_tbl", &["val"], true).unwrap();
 
-    assert!(engine.registry.has_id(tid));
+    assert!(engine.registry.relation(tid).is_some());
     assert_eq!(engine.registry.relation_or_err(tid).unwrap().indexes().len(), 1);
 
     // Drop index then table
@@ -174,7 +174,7 @@ fn test_drop_table_cleans_up_indices() {
     assert_eq!(engine.registry.relation_or_err(tid).unwrap().indexes().len(), 0);
 
     engine.drop_table("public.idx_tbl").unwrap();
-    assert!(!engine.registry.has_id(tid));
+    assert!(engine.registry.relation(tid).is_none());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -207,12 +207,12 @@ fn test_drop_table_cascades_fk_index() {
     );
 
     engine.drop_table("public.child").unwrap();
-    assert!(!engine.registry.has_id(child_tid));
+    assert!(engine.registry.relation(child_tid).is_none());
 
     // Reopen catalog — must succeed, and no catalog index names the child.
     engine.close();
     let engine2 = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(!engine2.registry.has_id(child_tid));
+    assert!(engine2.registry.relation(child_tid).is_none());
     assert!(
         engine2.index_ids_of(child_tid).is_empty(),
         "no index row may exist for the dropped child"
@@ -256,7 +256,7 @@ fn test_drop_table_cascades_multiple_indices() {
     // Drop the table — cascade must retract both indices
     engine.drop_table("public.t").unwrap();
 
-    assert!(!engine.registry.has_id(tid), "table DAG entry must be gone");
+    assert!(engine.registry.relation(tid).is_none(), "table DAG entry must be gone");
     assert!(!engine.has_index_by_name(&name1), "idx1 must be gone");
     assert!(!engine.has_index_by_name(&name2), "idx2 must be gone");
     assert!(

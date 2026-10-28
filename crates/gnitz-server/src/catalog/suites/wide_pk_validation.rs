@@ -33,14 +33,16 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24
     let schema = wide_unique_schema();
     engine
         .registry
-        .register(RelationSpec {
-            id: tid,
-            kind: RelationKind::BaseTable,
+        .register(
+            RelationSpec {
+                id: tid,
+                kind: RelationKind::BaseTable,
+                placement: Placement::full_pk(&schema),
+                pk_repeats: false,
+                compress: false,
+            },
             schema,
-            placement: Placement::full_pk(&schema),
-            pk_repeats: false,
-            compress: false,
-        })
+        )
         .unwrap();
     engine
         .registry
@@ -107,14 +109,16 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
     let pb = wide_val_batch(&parent_schema, &[(parent_pk, 555, 1)]);
     engine
         .registry
-        .register(RelationSpec {
-            id: parent_tid,
-            kind: RelationKind::BaseTable,
-            schema: parent_schema,
-            placement: Placement::full_pk(&parent_schema),
-            pk_repeats: false,
-            compress: false,
-        })
+        .register(
+            RelationSpec {
+                id: parent_tid,
+                kind: RelationKind::BaseTable,
+                placement: Placement::full_pk(&parent_schema),
+                pk_repeats: false,
+                compress: false,
+            },
+            parent_schema,
+        )
         .unwrap();
     engine.registry.ingest(parent_tid, pb).unwrap();
     engine.registry.checkpoint_base().unwrap();

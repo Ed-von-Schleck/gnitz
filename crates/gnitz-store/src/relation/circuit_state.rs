@@ -55,7 +55,7 @@ impl CircuitState {
             .iter()
             .map(|(child, schema)| {
                 // Unbounded: a bounded view's hydration reads these traces back.
-                reg.open_child_as(view_id, ChildKind::Scratch(child), *schema, recovery, None, false)
+                reg.open_child(view_id, ChildKind::Scratch(child), *schema, recovery, None, false)
             })
             .collect::<Result<_, _>>()?;
         Ok(CircuitState { tables })

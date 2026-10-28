@@ -108,14 +108,14 @@ fn unique_pk_bench() {
                 let mut r = relation_fixture_with(config, RelationKind::BaseTable, schema, &[], held);
                 let spilled = tier == SPILL_TIER;
                 let in_shards = |r: &crate::test_support::RelationFixture| {
-                    !table_shards(r.relation(TID).unwrap().store.held()).is_empty()
+                    !table_shards(r.relation(TID).unwrap().table()).is_empty()
                 };
                 assert_eq!(in_shards(&r), spilled, "{label}: held in shards");
 
                 let (mut enforce, mut write, mut eff_rows) = (0, 0, 0);
                 for (push, b) in (1..).zip(pushes(&schema, per, row)) {
                     let probe = b.clone();
-                    let table = r.relation(TID).unwrap().store.held();
+                    let table = r.relation(TID).unwrap().table();
                     let (eff, e) = counter.measure(|| enforce_unique_pk(table, probe));
                     eff_rows += eff.len() as u64;
                     drop(eff);

@@ -90,9 +90,6 @@ pub(crate) struct Table {
     /// The disk tier, and the one owner of this store's schema and directory.
     shard_index: ShardIndex,
 
-    /// Whether this store is rebuilt from its sources at open.
-    rederived: bool,
-
     /// The checkpoint mark of the manifest this open loaded.
     loaded_mark: Option<u64>,
 
@@ -177,7 +174,6 @@ impl Table {
             memtable: RunSet::new(MEMTABLE_BYTES),
             ram_tier: RunSet::cancelling(ram_tier_bytes),
             shard_index,
-            rederived,
             loaded_mark: loaded.as_ref().map(|m| m.checkpoint_mark),
             caller_record: loaded.as_ref().map(|m| m.caller_record.clone()).unwrap_or_default(),
             held_in_ram: false,
@@ -198,11 +194,6 @@ impl Table {
     /// See [`ShardIndex::has_skeleton_shard`].
     pub(crate) fn has_skeleton_rows(&self) -> bool {
         self.shard_index.has_skeleton_shard()
-    }
-
-    /// True when this store is rebuilt from its sources at open.
-    pub(crate) fn is_rederived(&self) -> bool {
-        self.rederived
     }
 
     /// The checkpoint mark of the manifest this open loaded; `None` without one.

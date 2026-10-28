@@ -1,7 +1,8 @@
 //! The relation directory tree: relation directory naming, the names of the
-//! child directories under one and the sweeps over them, the orphan sweep, and
-//! the data-directory lock. A child directory is one store's directory, whose
-//! file names storage owns.
+//! child directories under one and the sweeps over them — the boot relay, the
+//! resume verdict over a view's children, the orphan sweep — and the
+//! data-directory lock. A child directory is one store's directory, whose file
+//! names storage owns.
 
 use std::fs::{self, TryLockError};
 use std::thread;
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 use gnitz_foundation::posix_io::fsync_dir;
 use gnitz_wire::PkColList;
 
-use super::{RelationKind, RelationRegistry, Residency};
+use super::{RelationKind, RelationRegistry, Residency, StateLayout};
 use crate::storage::{link_stores, manifest_path, read_at, read_intact, retire_stores};
 use gnitz_zset::algebra::Slot;
 
@@ -102,12 +103,12 @@ pub(super) fn cluster_children(kind: ChildKind<'_>, num_workers: u32) -> impl It
 }
 
 /// Whether, on each of `num_workers` ranks under `rel_dir`, the rows child and
-/// the scratch child of every name in `traces` carry a manifest at
+/// the scratch child of every trace `layout` declares carry a manifest at
 /// `generation`; `false` on any I/O failure. A trace with no directory is a
 /// mismatch: a crash part-way through retiring a view's children can take it
 /// and leave its siblings.
-pub(super) fn children_at_generation(rel_dir: &str, num_workers: u32, generation: u64, traces: &[String]) -> bool {
-    let kinds = std::iter::once(ChildKind::Rows).chain(traces.iter().map(|t| ChildKind::Scratch(t)));
+fn children_at_generation(rel_dir: &str, num_workers: u32, generation: u64, layout: &StateLayout) -> bool {
+    let kinds = std::iter::once(ChildKind::Rows).chain(layout.names().map(ChildKind::Scratch));
     kinds
         .flat_map(|kind| cluster_children(kind, num_workers))
         .all(|c| matches!(read_at(&c.dir(rel_dir), generation), Ok(Some(_))))
@@ -236,7 +237,7 @@ impl RelationRegistry {
             Residency::Origin,
             "erasing a directory other processes' stores live in"
         );
-        if self.tables.remove(&id).is_none() {
+        if self.relations.remove(&id).is_none() {
             return Ok(());
         }
         let dir = relation_dir(&self.base_dir, id);
@@ -250,16 +251,57 @@ impl RelationRegistry {
         Ok(())
     }
 
+    /// Relay each base table's children onto this boot's worker count, then
+    /// [`Self::reclaim_orphan_relation_dirs`]. Idempotent.
+    pub fn reconcile_child_dirs<'l>(&self, layout_of: impl Fn(u64) -> Option<&'l StateLayout>) -> Result<(), String> {
+        // A relay removes the set it read, and the reclaim deletes directories.
+        assert_eq!(
+            self.residency,
+            Residency::Master,
+            "reconcile_child_dirs runs on a process holding no user store"
+        );
+        // Only a base table carries rows across a worker-count change.
+        for (&id, entry) in self.relations.iter().filter(|(_, e)| e.kind().is_base_table()) {
+            super::repartition::repartition_relation(
+                &relation_dir(&self.base_dir, id),
+                &entry.schema(),
+                entry.placement(),
+                self.slot.of,
+                self.config.ram_tier_bytes,
+                self.config.scan_chunk_rows,
+            )?;
+        }
+        self.reclaim_orphan_relation_dirs(layout_of)
+    }
+
+    /// Whether the rows child and every trace child `layout`, its compiled
+    /// operator state, declares of view `view_id` carry a manifest at
+    /// `generation` on **every launched rank** — the store half of the resume
+    /// verdict.
+    pub fn view_children_resumable(&self, view_id: u64, generation: u64, layout: &StateLayout) -> bool {
+        // A worker cannot speak for its peers.
+        assert!(
+            matches!(self.residency, Residency::Master | Residency::Origin),
+            "view_children_resumable reads every rank's children"
+        );
+        children_at_generation(&relation_dir(&self.base_dir, view_id), self.slot.of, generation, layout)
+    }
+
     /// Remove every relation directory and child this registry does not own — a
-    /// child of another worker count, an index nothing declares, a trace no
-    /// compiled circuit declares — the children retired in one batch. Sound only once every process sharing
+    /// child of another worker count, an index nothing declares, a trace that
+    /// `layout_of(id)`, view `id`'s compiled operator state, does not declare — the
+    /// children retired in one batch. Sound only once every process sharing
     /// `base_dir` has applied this catalog.
-    pub fn reclaim_orphan_relation_dirs(&self) -> Result<(), String> {
+    pub fn reclaim_orphan_relation_dirs<'l>(
+        &self,
+        layout_of: impl Fn(u64) -> Option<&'l StateLayout>,
+    ) -> Result<(), String> {
         let root = relations_dir(&self.base_dir);
         let mut dead = Vec::new();
         for name in subdir_names(&root)? {
             let dir = format!("{root}/{name}");
-            let Some(entry) = parse_relation_dir_name(&name).and_then(|id| self.tables.get(&id)) else {
+            let owner = parse_relation_dir_name(&name).and_then(|id| self.relations.get(&id));
+            let Some(entry) = owner else {
                 // Unowned: no manifest in it is ever read again, so no fsync.
                 if let Err(e) = fs::remove_dir_all(&dir) {
                     gnitz_debug!("relation: failed to remove orphan dir {}: {}", dir, e);
@@ -271,7 +313,9 @@ impl RelationRegistry {
                 c.slot.of != of
                     || match c.kind {
                         ChildKind::Index(cols) => entry.index_on(cols.as_slice()).is_none(),
-                        ChildKind::Scratch(name) => !entry.traces.iter().any(|t| t == name),
+                        ChildKind::Scratch(name) => {
+                            !layout_of(entry.id()).is_some_and(|l| l.names().any(|t| t == name))
+                        }
                         ChildKind::Rows => false,
                     }
             })?);
@@ -288,7 +332,7 @@ impl RelationRegistry {
     /// store with none is left for the boot over `dest` to rebuild.
     pub fn link_published_into(&self, dest: &str) -> Result<(), String> {
         let mut pairs = Vec::new();
-        for (&id, entry) in &self.tables {
+        for (&id, entry) in &self.relations {
             let (src_rel, dst_rel) = (relation_dir(&self.base_dir, id), relation_dir(dest, id));
             if entry.kind() == RelationKind::SystemCatalog {
                 // Its one store is the relation directory itself, which a worker

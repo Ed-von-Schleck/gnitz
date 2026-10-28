@@ -64,15 +64,17 @@ impl CatalogEngine {
         for family in SysFamily::ALL {
             engine
                 .registry
-                .register(RelationSpec {
-                    id: family.id(),
-                    kind: RelationKind::SystemCatalog,
-                    schema: *family.schema(),
-                    // DDL is master-broadcast, so each worker holds a full copy.
-                    placement: Placement::Replicated,
-                    pk_repeats: false,
-                    compress: false,
-                })
+                .register(
+                    RelationSpec {
+                        id: family.id(),
+                        kind: RelationKind::SystemCatalog,
+                        // DDL is master-broadcast, so each worker holds a full copy.
+                        placement: Placement::Replicated,
+                        pk_repeats: false,
+                        compress: false,
+                    },
+                    *family.schema(),
+                )
                 .map_err(|e| format!("Failed to create system table '{}': error {e}", family.name()))?;
             engine.caches.enter(
                 family.id(),

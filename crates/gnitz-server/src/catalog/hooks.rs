@@ -116,25 +116,21 @@ impl CatalogEngine {
             })
             .collect();
         let record = Rc::from(encode_record(schema.pk_cols(), &col_defs));
-        self.registry.register(RelationSpec {
+        // Derived, not stored: every process builds the same FK indexes from the same
+        // column records. Every FK column carries one, a PK column included.
+        let fk_indexes: Vec<_> = fks
+            .iter()
+            .map(|e| (IndexClaim::ForeignKey, e.child_index_cols()))
+            .collect();
+        let spec = RelationSpec {
             id: rel.id,
             kind: rel.kind(),
-            schema,
             placement,
             pk_repeats,
             compress,
-        })?;
-        if rel.kind().is_view() {
-            self.registry.declare_traces(rel.id, self.dag.state_layout(rel.id))?;
-        }
+        };
+        self.registry.register_at(spec, schema, &fk_indexes, None)?;
         self.caches.enter(rel.id, RelationEntry::new(record, fks, serial));
-        // Derived, not stored: every process builds the same FK indexes from the same
-        // column records. Every FK column carries one, a PK column included.
-        for e in &self.caches.relations[&rel.id].fks {
-            self.registry
-                .add_index(rel.id, IndexClaim::ForeignKey, e.child_index_cols())
-                .map_err(|err| format!("FK index on column {}: {err}", e.fk_col))?;
-        }
         Ok(())
     }
 

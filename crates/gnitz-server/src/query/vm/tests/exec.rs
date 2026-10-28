@@ -21,7 +21,6 @@ fn spec(id: u64, kind: RelationKind) -> RelationSpec {
     RelationSpec {
         id,
         kind,
-        schema,
         placement: Placement::full_pk(&schema),
         pk_repeats: false,
         compress: false,
@@ -86,7 +85,10 @@ impl TestVm {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, StoreConfig::default());
         registry
-            .register(spec(VIEW_ID, RelationKind::View(ViewBudget::Plain)))
+            .register(
+                spec(VIEW_ID, RelationKind::View(ViewBudget::Plain)),
+                make_schema_u128_i64(),
+            )
             .unwrap();
         let vm = p.finish(out);
         TestVm {
@@ -352,7 +354,9 @@ fn a_join_over_its_source_reads_it_up_to_its_cut() {
         },
     );
     let mut vm = TestVm::open(p, out);
-    vm.registry.register(spec(TABLE, RelationKind::BaseTable)).unwrap();
+    vm.registry
+        .register(spec(TABLE, RelationKind::BaseTable), make_schema_u128_i64())
+        .unwrap();
     let sealed = make_batch_u128(&schema, &[(1, 1, 100), (2, 1, 200)]);
     vm.registry.ingest(TABLE, sealed.clone()).unwrap();
     let pending = make_batch_u128(&schema, &[(2, -1, 200), (3, 1, 300)]);

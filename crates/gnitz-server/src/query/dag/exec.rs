@@ -81,7 +81,7 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
     let (code, mut stores) = opened(&mut dag.views, registry, view, &sources)?;
     if mints_ground_row(registry.slot(), code.self_contained) {
         let minted = vm::mint_ground_rows(&mut code.vm, &mut stores)?;
-        registry.ingest_at(view, minted, None, false)?;
+        registry.ingest(view, minted)?;
     }
     for (at, &source) in sources.iter().enumerate() {
         let (dag, registry) = host.parts();
@@ -96,7 +96,7 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
             // `None` once drained, until every worker is: all run the same rounds.
             let mut drained = chunk.is_none();
             if let Some(out) = run_view_epoch(host, view, chunk.as_mut(), true, source, unfed, &mut drained)? {
-                host.parts().1.ingest_at(view, out, None, false)?;
+                host.parts().1.ingest(view, out)?;
             }
             if drained {
                 break;
@@ -133,7 +133,7 @@ fn run_tick(host: &mut impl DriveHost, source: u64, round: u64, delta: Option<Ba
         let echo = match dag.passes_through(view) {
             // A tick's delta reaches its readers in this schedule.
             true => needed.then_some(out),
-            false => registry.ingest_at(view, out, Some(round), needed)?,
+            false => registry.ingest_round(view, out, round, needed)?,
         };
         if let Some(out) = echo {
             match outputs.entry(view) {

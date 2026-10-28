@@ -238,7 +238,7 @@ impl CatalogEngine {
     /// Remove every relation and index directory no live entity owns. Only sound once
     /// every worker has ACKed a round written after the last DdlSync.
     pub(crate) fn reclaim_orphan_dirs(&self) {
-        if let Err(e) = self.registry.reclaim_orphan_relation_dirs() {
+        if let Err(e) = self.registry.reclaim_orphan_relation_dirs(|id| self.dag.layout_of(id)) {
             gnitz_warn!("catalog: orphan directory sweep failed: {}", e);
         }
     }

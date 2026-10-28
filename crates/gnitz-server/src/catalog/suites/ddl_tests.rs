@@ -171,7 +171,7 @@ fn test_ddl() {
     // Table creation
     let cols = vec![col_def("id", TypeCode::U64), col_def("name", TypeCode::String)];
     let tid = engine.create_table("sales.orders", &cols, &[0]).unwrap();
-    assert!(engine.registry.has_id(tid));
+    assert!(engine.registry.relation(tid).is_some());
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Table).cursor()),
         init_tables + 1
@@ -183,7 +183,7 @@ fn test_ddl() {
 
     // Drop table (retractions)
     engine.drop_table("sales.orders").unwrap();
-    assert!(!engine.registry.has_id(tid));
+    assert!(engine.registry.relation(tid).is_none());
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Table).cursor()),
         init_tables
@@ -447,11 +447,11 @@ fn test_edge_cases_extended() {
     // #17. get_by_name on non-existent returns None
     assert!(engine.get_by_name("public", "nonexistent").is_none());
 
-    // #20. has_id / get_schema for valid and invalid IDs
+    // #20. relation / get_schema for valid and invalid IDs
     let tid = engine.create_table("public.reg_test", &cols, &[0]).unwrap();
-    assert!(engine.registry.has_id(tid));
+    assert!(engine.registry.relation(tid).is_some());
     assert!(engine.registry.relation(tid).map(Relation::schema).is_some());
-    assert!(!engine.registry.has_id(999999));
+    assert!(engine.registry.relation(999999).is_none());
     assert!(engine.registry.relation(999999).map(Relation::schema).is_none());
     engine.drop_table("public.reg_test").unwrap();
 
@@ -1008,7 +1008,7 @@ fn set_based_table_drop_applies_one_group_per_family() {
         .apply_bundle(bundle([(SysFamily::Table, drop)]), &mut sink)
         .unwrap();
     assert_eq!(families, [SysFamily::Index, SysFamily::Table, SysFamily::Column]);
-    assert!(tids.iter().all(|&t| !engine.registry.has_id(t)));
+    assert!(tids.iter().all(|&t| engine.registry.relation(t).is_none()));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -1060,7 +1060,7 @@ fn applied_ddl_reports_the_cascade_and_what_it_created() {
     assert_eq!(created.held_above, [gnitz_wire::VIEW_TAB]);
     assert!(created.dropped_relations.is_empty() && created.dropped_indexes.is_empty());
     engine.drop_view("public.w").unwrap();
-    assert!(!engine.registry.has_id(watcher));
+    assert!(engine.registry.relation(watcher).is_none());
 
     let (v, s) = view_with_segment(&mut engine);
     let drop = engine.retract_under(SysFamily::View, &[v]);
@@ -1108,7 +1108,7 @@ fn view_drop_retracts_its_segments() {
         .unwrap();
     assert_eq!(families, [SysFamily::View, SysFamily::Circuit, SysFamily::Column]);
     for id in [v, s] {
-        assert!(!engine.registry.has_id(id));
+        assert!(engine.registry.relation(id).is_none());
         assert_eq!(rows_under(&engine, SysFamily::Circuit, id), 0);
         assert_eq!(rows_under(&engine, SysFamily::Column, id), 0);
     }
@@ -1126,7 +1126,7 @@ fn dropping_a_view_with_its_segment_retracts_the_segment_once() {
     let drop = engine.retract_under(SysFamily::View, &[v, s]);
     apply_ddl(&mut engine, [(SysFamily::View, drop)]).unwrap();
 
-    assert!(!engine.registry.has_id(v) && !engine.registry.has_id(s));
+    assert!(engine.registry.relation(v).is_none() && engine.registry.relation(s).is_none());
     assert_eq!(
         count_negative_records(engine.sys_relation(SysFamily::View).cursor()),
         0,
@@ -1160,7 +1160,7 @@ fn a_view_create_at_a_registered_table_id_is_refused() {
     ];
     let err = apply_ddl(&mut engine, blocks).expect_err("one bundle may not create one id as a table and a view");
     assert!(err.contains(&format!("relation id {both} already exists")), "{err}");
-    assert!(!engine.registry.has_id(both));
+    assert!(engine.registry.relation(both).is_none());
     assert_eq!(
         engine.qualified_name_or_unknown(both),
         ("?".to_string(), "?".to_string())

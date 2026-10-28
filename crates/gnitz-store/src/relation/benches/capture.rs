@@ -76,9 +76,7 @@ fn run(counter: &Counter, kind: RelationKind, strings: bool, rounds: u64, per_ro
     let mut instr = 0;
     for n in 0..rounds {
         let batch = round(&s, strings, n * per_round, per_round);
-        instr += counter
-            .measure(|| r.ingest_at(TID, batch, Some(2 + n), false).unwrap())
-            .1;
+        instr += counter.measure(|| r.ingest_round(TID, batch, 2 + n, false).unwrap()).1;
     }
     let (w1, b1) = io_written();
     Run {

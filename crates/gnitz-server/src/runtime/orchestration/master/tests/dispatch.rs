@@ -132,7 +132,10 @@ fn a_zone_the_log_refuses_reaches_no_store_and_applies_after_a_checkpoint() {
         .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(create(), sink).map(drop))
         .expect_err("no room for the zone");
     assert_eq!(refused.status, WireStatus::SalFull, "{refused}");
-    assert!(!engine.registry.has_id(tid), "the refused table is not registered");
+    assert!(
+        engine.registry.relation(tid).is_none(),
+        "the refused table is not registered"
+    );
     assert_eq!(held(&mut engine), before);
     assert_eq!(
         disp.sal().watermark(),
@@ -143,7 +146,7 @@ fn a_zone_the_log_refuses_reaches_no_store_and_applies_after_a_checkpoint() {
     disp.checkpoint_post_ack(&mut excl).unwrap();
     disp.emit_zone(&mut excl, |cat, sink| cat.apply_bundle(create(), sink))
         .expect("the reset log takes the zone");
-    assert!(engine.registry.has_id(tid));
+    assert!(engine.registry.relation(tid).is_some());
 
     drop(excl);
     drop(disp);

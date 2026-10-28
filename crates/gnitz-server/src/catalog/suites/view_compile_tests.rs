@@ -49,7 +49,7 @@ fn test_compile_verdict() {
     let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 100)]).to_blob_bytes();
     let ok_vid =
         try_register_filtered_view(&mut engine, base_tid, "vok", &pred).expect("a well-formed circuit compiles");
-    assert!(engine.registry.has_id(ok_vid));
+    assert!(engine.registry.relation(ok_vid).is_some());
 
     // A predicate blob the expression decoder refuses — only a corrupt circuit
     // can carry one, since the client's builder cannot — and the message is the
@@ -61,7 +61,10 @@ fn test_compile_verdict() {
         msg.contains("expr blob"),
         "the rejection must be the decoder's, got: {msg}"
     );
-    assert!(!engine.registry.has_id(bad_vid), "the refused view is not registered");
+    assert!(
+        engine.registry.relation(bad_vid).is_none(),
+        "the refused view is not registered"
+    );
     assert!(engine.live_sys_row(SysFamily::View, bad_vid).is_none());
 
     engine.close();
@@ -86,7 +89,7 @@ fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
         err.contains(&format!("source {a} feeds a join and states no scatter key")),
         "got: {err}"
     );
-    assert!(!engine.registry.has_id(vid), "the view is not registered");
+    assert!(engine.registry.relation(vid).is_none(), "the view is not registered");
     assert!(
         engine.live_sys_row(SysFamily::View, vid).is_none(),
         "no VIEW_TAB row of it is live"
@@ -134,7 +137,7 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
         assert!(err.contains(want), "got: {err}");
 
         assert!(engine.dag.dependents_of(base).is_empty(), "{want}");
-        assert!(!engine.registry.has_id(vid), "the view is not registered");
+        assert!(engine.registry.relation(vid).is_none(), "the view is not registered");
         assert_eq!(
             count_records(engine.sys_relation(SysFamily::Circuit).cursor()),
             circuits_before,
@@ -174,7 +177,7 @@ fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
         assert!(engine.dag.dependents_of(id).is_empty(), "{id}");
         assert!(engine.dag.sources_of(id).is_empty(), "{id}");
     }
-    assert!(!engine.registry.has_id(bounded) && !engine.registry.has_id(over));
+    assert!(engine.registry.relation(bounded).is_none() && engine.registry.relation(over).is_none());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -265,14 +268,17 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     engine.reclaim_orphan_dirs();
 
     assert!(
-        engine.registry.has_id(old_vid),
+        engine.registry.relation(old_vid).is_some(),
         "the incumbent must be registered again"
     );
     assert!(
         std::path::Path::new(&old_dir).exists(),
         "the incumbent's data directory must survive: {old_dir}"
     );
-    assert!(!engine.registry.has_id(new_vid), "the replacement must be unregistered");
+    assert!(
+        engine.registry.relation(new_vid).is_none(),
+        "the replacement must be unregistered"
+    );
     assert!(
         !std::path::Path::new(&new_dir).exists(),
         "the sweep must reclaim the replacement's directory: {new_dir}"

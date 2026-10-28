@@ -13,12 +13,11 @@ fn registry(schema: SchemaDescriptor, placement: Placement) -> RelationRegistry 
     let spec = RelationSpec {
         id: 16,
         kind: RelationKind::Stream,
-        schema,
         placement,
         pk_repeats: false,
         compress: false,
     };
-    registry.register(spec).unwrap();
+    registry.register(spec, schema).unwrap();
     registry
 }
 
