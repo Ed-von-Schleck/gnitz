@@ -4,7 +4,7 @@ use crate::runtime::sal::WorkerSet;
 use crate::runtime::sal::{Apply, DirectGroup, GroupData, GroupTargets};
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_once, within};
 use gnitz_foundation::posix_io::retry_eintr;
-use gnitz_wire::{ColTabRow, SysRow, WireFault, WireStatus};
+use gnitz_wire::{ColTabRow, WireFault, WireStatus};
 
 /// Fork a child that exits immediately, and wait until it is a zombie *without*
 /// reaping it, so the probe's own `waitpid(WNOHANG)` finds it on the first call.
@@ -168,9 +168,9 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
     ];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let add = || {
-        let mut bb = gnitz_zset::repr::BatchBuilder::new(SysFamily::Column.schema());
-        ColTabRow::of(tid, 2, &nullable_def("w", gnitz_wire::TypeCode::U64).def, None).write(&mut bb, 1);
-        bundle([(SysFamily::Column, bb.finish())])
+        let w = nullable_def("w", gnitz_wire::TypeCode::U64);
+        let row = ColTabRow::of(tid, 2, &w.def, None);
+        bundle([(SysFamily::Column, crate::test_support::sys_batch([(row, 1)]))])
     };
     let width = |engine: &CatalogEngine| engine.registry.relation(tid).unwrap().schema().num_columns();
     let record = engine.schema_record(tid).unwrap();

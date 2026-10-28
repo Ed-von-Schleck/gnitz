@@ -406,6 +406,48 @@ pub fn sys_batch<R: SysRow>(rows: impl IntoIterator<Item = (R, i64)>) -> Batch {
     bb.finish()
 }
 
+/// `row` as a one-row `+1` batch of its family, with payload slot `slot` holding
+/// the raw U64 word `word` in place of the value `row` states: a word no writer
+/// emits, for a test of the decode that refuses it.
+pub fn forged_sys_batch<R: SysRow>(row: R, slot: usize, word: u64) -> Batch {
+    struct Forge {
+        bb: BatchBuilder,
+        col: usize,
+        slot: usize,
+        word: u64,
+    }
+    impl gnitz_wire::SysRowSink for Forge {
+        fn begin_row(&mut self, pk: &[u128], weight: i64) {
+            self.col = 0;
+            self.bb.begin_row_natives(pk, weight);
+        }
+        fn put_u64(&mut self, v: u64) {
+            self.bb.put_u64(if self.col == self.slot { self.word } else { v });
+            self.col += 1;
+        }
+        fn put_string(&mut self, s: &str) {
+            self.bb.put_string(s);
+            self.col += 1;
+        }
+        fn put_bytes(&mut self, b: &[u8]) {
+            self.bb.put_blob(b);
+            self.col += 1;
+        }
+        fn end_row(&mut self) {
+            self.bb.end_row();
+        }
+    }
+    let family = SysFamily::from_id(R::FAMILY).expect("a SysRow names a system family");
+    let mut forge = Forge {
+        bb: BatchBuilder::new(family.schema()),
+        col: 0,
+        slot,
+        word,
+    };
+    row.write(&mut forge, 1);
+    forge.bb.finish()
+}
+
 /// Append one `family` row keyed `key` — the leading id, then the member a
 /// pair-keyed family adds — at `weight`. Payload column `pi` holds `cell(pi)`: a
 /// U64 as it is, a STRING or BLOB as a text of it too long to sit inline, so a
@@ -430,7 +472,7 @@ pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
             table_id,
             schema_id: PUBLIC_SCHEMA_ID,
             name: name.into(),
-            pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]).pack(),
+            pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]),
             flags: gnitz_wire::TableProps::default().pack(),
         };
         (row, weight)
@@ -447,11 +489,11 @@ pub fn schema_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
 
 /// `defs` as `owner_id`'s COL_TAB batch at `weight`, numbered by position.
 pub fn col_tab_batch(owner_id: u64, defs: &[CatalogColumn], weight: i64) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
-    for (i, cd) in defs.iter().enumerate() {
-        ColTabRow::of(owner_id, i as u64, &cd.def, cd.fk).write(&mut bb, weight);
-    }
-    bb.finish()
+    sys_batch(
+        defs.iter()
+            .enumerate()
+            .map(|(i, cd)| (ColTabRow::of(owner_id, i as u64, &cd.def, cd.fk), weight)),
+    )
 }
 
 /// The one-row IDX_TAB batch of an index over `cols` at `weight`.
@@ -459,9 +501,9 @@ pub fn idx_tab_batch(index_id: u64, owner_id: u64, cols: &[u32], name: &str, is_
     let row = IdxTabRow {
         index_id,
         owner_id,
-        source_col_idx: gnitz_wire::PkColList::from_slice(cols).pack(),
+        source_col_idx: gnitz_wire::PkColList::from_slice(cols),
         name: name.into(),
-        is_unique: is_unique as u64,
+        is_unique,
     };
     sys_batch([(row, weight)])
 }
@@ -482,12 +524,12 @@ pub fn push_view_tab_row(
         view_id: vid,
         schema_id: PUBLIC_SCHEMA_ID,
         name: view_name.into(),
-        pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]).pack(),
+        pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]),
         capacity_bytes,
         delta_bytes,
         owner_view_id,
-        pk_repeats: 0,
-        compress: 0,
+        pk_repeats: false,
+        compress: false,
         definition: Default::default(),
     };
     row.write(bb, weight);

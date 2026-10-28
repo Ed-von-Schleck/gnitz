@@ -202,14 +202,12 @@ impl CatalogEngine {
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
             let idx_id = gnitz_wire::sys_leading_id(batch.get_pk_bytes(i));
-            let (owner_id, cols, unique) = IdxTabRow::read(batch, i)
-                .and_then(|r| r.parts())
-                .map_err(|e| format!("index {idx_id}: {e}"))?;
-            let claim = IndexClaim::Index { id: idx_id, unique };
+            let r = IdxTabRow::read(batch, i).map_err(|e| format!("index {idx_id}: {e}"))?;
+            let claim = IndexClaim::Index { id: idx_id, unique: r.is_unique };
             if batch.get_weight(i) > 0 {
-                self.registry.add_index(owner_id, claim, cols)?;
+                self.registry.add_index(r.owner_id, claim, r.source_col_idx)?;
             } else {
-                self.registry.release_index(owner_id, claim);
+                self.registry.release_index(r.owner_id, claim);
             }
         }
         Ok(())

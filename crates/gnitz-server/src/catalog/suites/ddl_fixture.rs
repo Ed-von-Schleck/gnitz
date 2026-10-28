@@ -154,7 +154,7 @@ impl CatalogEngine {
             table_id: tid,
             schema_id: sid,
             name: table_name.into(),
-            pk_col_idx: gnitz_wire::PkColList::from_slice(pk_cols).pack(),
+            pk_col_idx: gnitz_wire::PkColList::from_slice(pk_cols),
             flags: props.pack(),
         };
         let blocks = [
@@ -252,7 +252,7 @@ impl CatalogEngine {
             table_id: tid,
             schema_id,
             name: name.into(),
-            pk_col_idx: gnitz_wire::PkColList::from_slice(pk).pack(),
+            pk_col_idx: gnitz_wire::PkColList::from_slice(pk),
             flags: gnitz_wire::TableProps::default().pack(),
         };
         self.ddl_sync(SysFamily::Table.id(), sys_batch([(row, 1)]))

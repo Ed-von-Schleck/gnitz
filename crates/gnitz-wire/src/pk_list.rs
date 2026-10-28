@@ -121,17 +121,19 @@ pub fn validate_pk_tuple(
     Ok(())
 }
 
-/// The rule an index key list `key` over a relation of `ncols` columns, `src_pk_len`
-/// of them its PK, must pass: an index key column is a PK column of the index, so
-/// the PK rule holds with nullability waived, and the index record — `key` then the
-/// source PK — keeps the PK arity limit.
+/// `key` as the column list of an index over a relation of `ncols` columns,
+/// `src_pk_len` of them its PK, or the rule it breaks: an index key column is a
+/// PK column of the index, so the PK rule holds with nullability waived, and the
+/// index record — `key` then the source PK — keeps the PK arity limit, which is
+/// within the list's.
 pub fn validate_index_key(
     key: &[u32],
     ncols: usize,
     src_pk_len: usize,
     type_code: impl Fn(u32) -> TypeCode,
-) -> Result<(), PkRule> {
-    validate_pk_tuple(key, ncols, MAX_PK_COLUMNS - src_pk_len, |c| (type_code(c), false))
+) -> Result<PkColList, PkRule> {
+    validate_pk_tuple(key, ncols, MAX_PK_COLUMNS - src_pk_len, |c| (type_code(c), false))?;
+    PkColList::checked(key, ncols)
 }
 
 /// Sizing cap for an engine schema's PK: the widest user-declared PK plus the
@@ -252,6 +254,20 @@ impl PkColList {
     /// Decode the persisted `u64` form, its refusal rendered for `role`.
     pub fn unpack_as(word: u64, role: PkListRole) -> Result<Self, String> {
         Self::unpack(word).map_err(|rule| rule.for_role(role))
+    }
+}
+
+/// Lists order by their packed word: the order a persisted set of them is kept
+/// canonical in.
+impl Ord for PkColList {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.pack().cmp(&other.pack())
+    }
+}
+
+impl PartialOrd for PkColList {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 

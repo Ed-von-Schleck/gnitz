@@ -271,10 +271,10 @@ fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: u64) 
         table_id: tid,
         schema_id: PUBLIC_SCHEMA_ID,
         name: table_name.into(),
-        pk_col_idx,
+        pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]),
         flags,
     };
-    crate::test_support::sys_batch([(row, 1)])
+    crate::test_support::forged_sys_batch(row, gnitz_wire::TableTabSlot::pk_col_idx as usize, pk_col_idx)
 }
 
 /// A COL_TAB rewrite pair on column `col_idx` of `owner_id`: `mutate` produces
@@ -283,8 +283,8 @@ fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: u64) 
 fn col_alter_pair(owner_id: u64, col_idx: i64, old: &CatalogColumn, mutate: impl FnOnce(&mut CatalogColumn)) -> Batch {
     let mut altered = old.clone();
     mutate(&mut altered);
-    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
-    ColTabRow::of(owner_id, col_idx as u64, &old.def, old.fk).write(&mut bb, -1);
-    ColTabRow::of(owner_id, col_idx as u64, &altered.def, altered.fk).write(&mut bb, 1);
-    bb.finish()
+    crate::test_support::sys_batch([
+        (ColTabRow::of(owner_id, col_idx as u64, &old.def, old.fk), -1),
+        (ColTabRow::of(owner_id, col_idx as u64, &altered.def, altered.fk), 1),
+    ])
 }

@@ -1,6 +1,6 @@
 //! The relation-descriptor blob a RESOLVE reply carries beside the schema block.
 
-use crate::codec::{decode_all, Writer};
+use crate::codec::{decode_all, Reader, Wire, Writer};
 use crate::{PkColList, ViewBudget};
 
 wire_enum! {
@@ -63,6 +63,20 @@ pub struct RelIndex {
     pub is_unique: bool,
 }
 
+impl Wire for RelIndex {
+    fn write(&self, w: &mut Writer) {
+        w.put(&self.cols).bool(self.is_unique);
+    }
+    fn read(r: &mut Reader) -> Result<Self, String> {
+        Ok(RelIndex { cols: r.get()?, is_unique: r.bool()? })
+    }
+}
+
+/// The most indexes a descriptor carries: a count the `u16` list header holds
+/// without saturating, so a relation past it is refused on decode rather than
+/// truncated.
+const MAX_DESCRIPTOR_INDEXES: usize = u16::MAX as usize - 1;
+
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct RelDescriptorBlob {
     pub class: RelClass,
@@ -75,15 +89,11 @@ pub struct RelDescriptorBlob {
 
 impl RelDescriptorBlob {
     pub fn encode(&self) -> Vec<u8> {
-        let index_count = u16::try_from(self.indexes.len()).expect("a relation's index count fits a u16");
         let mut w = Writer::new();
         w.put(&self.class)
             .bool(self.pk_repeats)
             .bool(self.serial)
-            .u16(index_count);
-        for ix in &self.indexes {
-            w.put(&ix.cols).bool(ix.is_unique);
-        }
+            .list(&self.indexes);
         w.into_vec()
     }
 
@@ -92,13 +102,7 @@ impl RelDescriptorBlob {
             let class = r.get()?;
             let pk_repeats = r.bool()?;
             let serial = r.bool()?;
-            let indexes = (0..r.u16()?)
-                .map(|_| {
-                    let cols = r.get()?;
-                    let is_unique = r.bool()?;
-                    Ok(RelIndex { cols, is_unique })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
+            let indexes = r.list("index list", MAX_DESCRIPTOR_INDEXES)?;
             Ok(RelDescriptorBlob { class, pk_repeats, serial, indexes })
         })
     }

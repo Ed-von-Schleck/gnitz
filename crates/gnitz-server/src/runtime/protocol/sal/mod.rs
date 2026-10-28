@@ -411,6 +411,8 @@ gnitz_wire::wire_enum! {
         SnapshotPage = 15,
         Backup = 16,
         ReleasePreflight = 17,
+        HasPkColumn = 18,
+        HasPkIndex = 19,
     }
 }
 

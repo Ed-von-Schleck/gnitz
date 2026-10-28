@@ -35,7 +35,7 @@ impl Rows {
             table_id,
             schema_id,
             name: name.into(),
-            pk_col_idx: PkColList::from_slice(&[0]).pack(),
+            pk_col_idx: PkColList::from_slice(&[0]),
             flags: props.pack(),
         };
         self.put(&row, 1)
@@ -48,12 +48,12 @@ impl Rows {
             view_id,
             schema_id: 16,
             name: name.into(),
-            pk_col_idx: PkColList::from_slice(&[0]).pack(),
+            pk_col_idx: PkColList::from_slice(&[0]),
             capacity_bytes,
             delta_bytes,
             owner_view_id: owner,
-            pk_repeats: 0,
-            compress: props.compress as u64,
+            pk_repeats: false,
+            compress: props.compress,
             definition: Default::default(),
         };
         let mut circuit = Circuit::default();
@@ -133,9 +133,9 @@ fn a_table_carries_its_columns_key_fks_and_indexes() {
     let index = IdxTabRow {
         index_id: 19,
         owner_id: 18,
-        source_col_idx: PkColList::from_slice(&[2, 1]).pack(),
+        source_col_idx: PkColList::from_slice(&[2, 1]),
         name: "child_note".into(),
-        is_unique: 1,
+        is_unique: true,
     };
     rows.put(&index, 1);
     let catalog = rows.decode();

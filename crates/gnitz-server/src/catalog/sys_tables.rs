@@ -68,12 +68,12 @@ pub(super) fn read_rel_row(family: SysFamily, batch: &Batch, row: usize) -> Resu
     let (schema_id, name, parts) = match family {
         SysFamily::Table => {
             let r = TableTabRow::read(batch, row).map_err(unreadable)?;
-            let parts = r.parts().map(|(pk, props)| (pk, RelDetail::Table(props)));
+            let parts = r.props().map(|props| (r.pk_col_idx, RelDetail::Table(props)));
             (r.schema_id, r.name, parts)
         }
         SysFamily::View => {
             let r = ViewTabRow::read(batch, row).map_err(unreadable)?;
-            let parts = r.parts().map(|(pk, view)| (pk, RelDetail::View(view)));
+            let parts = r.parts().map(|view| (r.pk_col_idx, RelDetail::View(view)));
             (r.schema_id, r.name, parts)
         }
         _ => unreachable!("{} is not a relation family", family.name()),
@@ -85,9 +85,10 @@ pub(super) fn read_rel_row(family: SysFamily, batch: &Batch, row: usize) -> Resu
 /// What one delta does to one PK: where its `-1` and `+1` rows are. A PK
 /// carrying both signs is a **rewrite pair** (a rename).
 pub(super) struct PkSignature {
-    pub(super) pk: u128,
-    /// `sys_leading_id` of the key, so no consumer re-derives it.
+    /// The key's leading column: the id of the object the row describes.
     pub(super) leading: u64,
+    /// A pair-keyed family's second key column (COL_TAB's `col_idx`).
+    pub(super) member: Option<u64>,
     /// First row index carrying this PK; its OPK bytes address the live row.
     pub(super) row: usize,
     /// First `-1` / `+1` row index for this PK.
@@ -129,17 +130,21 @@ impl PkSignature {
 /// any row order. Zero-weight rows are skipped.
 pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
     let mut sigs: Vec<PkSignature> = Vec::new();
-    let mut by_pk: FxHashMap<u128, usize> = FxHashMap::default();
+    let mut by_pk: FxHashMap<(u64, Option<u64>), usize> = FxHashMap::default();
     for i in 0..batch.len() {
-        let pk = gnitz_wire::widen_pk_be(batch.get_pk_bytes(i));
         let w = batch.get_weight(i);
         if w == 0 {
             continue;
         }
-        let slot = *by_pk.entry(pk).or_insert_with(|| {
+        let key = batch.get_pk_bytes(i);
+        let (leading, member) = (
+            gnitz_wire::sys_leading_id(key),
+            (key.len() > 8).then(|| gnitz_wire::sys_leading_id(&key[8..])),
+        );
+        let slot = *by_pk.entry((leading, member)).or_insert_with(|| {
             sigs.push(PkSignature {
-                pk,
-                leading: gnitz_wire::sys_leading_id(batch.get_pk_bytes(i)),
+                leading,
+                member,
                 row: i,
                 neg: None,
                 pos: None,
@@ -163,10 +168,10 @@ pub(crate) fn unique_index_creates(batch: &Batch) -> Vec<(u64, PkColList)> {
     let mut creates: Vec<_> = pk_signatures(batch)
         .into_iter()
         .filter(|s| s.shape() == PkShape::Create)
-        .filter_map(|s| IdxTabRow::read(batch, s.row).and_then(|r| r.parts()).ok())
-        .filter_map(|(owner, cols, unique)| unique.then_some((owner, cols)))
+        .filter_map(|s| IdxTabRow::read(batch, s.row).ok())
+        .filter_map(|r| r.is_unique.then_some((r.owner_id, r.source_col_idx)))
         .collect();
-    creates.sort_unstable_by_key(|&(owner, cols)| (owner, cols.pack()));
+    creates.sort_unstable();
     creates.dedup();
     creates
 }
@@ -361,7 +366,7 @@ impl SysFamily {
                         table_id: family.id(),
                         schema_id: SYSTEM_SCHEMA_ID,
                         name: family.name().into(),
-                        pk_col_idx: PkColList::from_slice(family.wire().pk_cols).pack(),
+                        pk_col_idx: PkColList::from_slice(family.wire().pk_cols),
                         flags: gnitz_wire::TableProps::default().pack(),
                     };
                     row.write(bb, 1);
@@ -436,13 +441,12 @@ impl SysFamily {
         }
     }
 
-    /// How a guard message names the row at `pk`: a pair-keyed family's two ids
-    /// are meaningless rendered as the one number the widened key is.
-    pub(in crate::catalog) fn pk_label(self, pk: u128) -> String {
-        match self {
+    /// How a guard message names the row `sig` keys.
+    pub(in crate::catalog) fn pk_label(self, sig: &PkSignature) -> String {
+        match sig.member {
             // COL_TAB's key is (owner_id, col_idx).
-            SysFamily::Column => format!("column {} of owner {}", pk as u64, (pk >> 64) as u64),
-            _ => format!("{} {pk}", self.row_noun()),
+            Some(col_idx) => format!("{} {col_idx} of owner {}", self.row_noun(), sig.leading),
+            None => format!("{} {}", self.row_noun(), sig.leading),
         }
     }
 

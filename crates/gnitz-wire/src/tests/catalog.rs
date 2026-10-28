@@ -183,8 +183,6 @@ fn a_column_row_refuses_forged_words() {
     for (r, expect) in [
         (ColTabRow { type_code: 0x104, ..sound.clone() }, "type_code"),
         (ColTabRow { type_code: 99, ..sound.clone() }, "invalid column type 99"),
-        (ColTabRow { is_nullable: 2, ..sound.clone() }, "is_nullable"),
-        (ColTabRow { is_hidden: 2, ..sound.clone() }, "is_hidden"),
         (ColTabRow { fk_col_idx: 1 << 32, ..sound.clone() }, "fk_col_idx"),
         (
             ColTabRow { fk_col_idx: 3, ..sound.clone() },
@@ -203,8 +201,8 @@ fn a_column_row_refuses_forged_words() {
     }
 }
 
-/// A relation row's `parts` read back the key and properties its writer packed,
-/// and refuse a word no writer emits.
+/// A relation row's properties read back what its writer packed, and refuse a
+/// word no writer emits.
 #[test]
 fn a_relation_rows_parts_invert_its_packed_words() {
     let pk = crate::PkColList::from_slice(&[1, 0]);
@@ -217,10 +215,10 @@ fn a_relation_rows_parts_invert_its_packed_words() {
         table_id: 17,
         schema_id: 2,
         name: "t".into(),
-        pk_col_idx: pk.pack(),
+        pk_col_idx: pk,
         flags: props.pack(),
     };
-    assert_eq!(table.parts(), Ok((pk, props)));
+    assert_eq!(table.props(), Ok(props));
     let stream_serial = crate::TableProps {
         stream: true,
         serial: true,
@@ -230,7 +228,7 @@ fn a_relation_rows_parts_invert_its_packed_words() {
         flags: stream_serial.pack(),
         ..table.clone()
     }
-    .parts()
+    .props()
     .unwrap_err();
     assert!(err.contains("SERIAL"), "{err}");
 
@@ -245,57 +243,32 @@ fn a_relation_rows_parts_invert_its_packed_words() {
         view_id: 18,
         schema_id: 2,
         name: "v".into(),
-        pk_col_idx: pk.pack(),
+        pk_col_idx: pk,
         capacity_bytes,
         delta_bytes,
         owner_view_id: 0,
-        pk_repeats: 1,
-        compress: 1,
+        pk_repeats: true,
+        compress: true,
         definition: Default::default(),
     };
     let parts = ViewParts { props, owner: None, pk_repeats: true };
-    assert_eq!(view.parts(), Ok((pk, parts)));
+    assert_eq!(view.parts(), Ok(parts));
     let segment = ViewTabRow {
         name: "_seg19".into(),
         capacity_bytes: 0,
         delta_bytes: 0,
         owner_view_id: 19,
-        compress: 0,
+        compress: false,
         definition: Default::default(),
         ..view.clone()
     };
-    assert_eq!(segment.parts().map(|(_, p)| p.owner), Ok(Some(19)));
+    assert_eq!(segment.parts().map(|p| p.owner), Ok(Some(19)));
     for (r, expect) in [
         (ViewTabRow { capacity_bytes: 1, ..view.clone() }, "delta feed"),
-        (ViewTabRow { pk_repeats: 2, ..view.clone() }, "pk_repeats"),
-        (ViewTabRow { compress: 2, ..view.clone() }, "compress"),
-        (ViewTabRow { pk_col_idx: 0, ..view.clone() }, "packed-list flag"),
         (ViewTabRow { owner_view_id: 19, ..view.clone() }, "WITH option"),
         (
             ViewTabRow { definition: b"x"[..].into(), ..segment },
             "carrying a definition",
-        ),
-    ] {
-        let err = r.parts().unwrap_err();
-        assert!(err.contains(expect), "{expect}: {err}");
-    }
-
-    let index = IdxTabRow {
-        index_id: 100,
-        owner_id: 16,
-        source_col_idx: pk.pack(),
-        name: "idx".into(),
-        is_unique: 1,
-    };
-    assert_eq!(index.parts(), Ok((16, pk, true)));
-    for (r, expect) in [
-        (IdxTabRow { is_unique: 2, ..index.clone() }, "is_unique"),
-        (
-            IdxTabRow {
-                source_col_idx: pk.pack() & !crate::PK_LIST_PACKED_FLAG,
-                ..index
-            },
-            "column list word carries no packed-list flag",
         ),
     ] {
         let err = r.parts().unwrap_err();

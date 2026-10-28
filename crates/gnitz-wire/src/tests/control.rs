@@ -10,7 +10,6 @@ fn probe_header() -> ControlHeader {
             conflict_mode: WireConflictMode::Error,
             continuation: true,
             scan_last: true,
-            probe_mode: WireProbeMode::Index,
             lane: WireLane::SyncAnswer,
         },
         arg0: 0xDDDD_EEEE_FFFF_0011,
@@ -180,18 +179,15 @@ fn peek_rejects_an_unreadable_header_word() {
 fn wire_flags_roundtrip_every_combination() {
     for &verb in ClientVerb::ALL {
         for &conflict_mode in WireConflictMode::ALL {
-            for &probe_mode in WireProbeMode::ALL {
-                for (bits, &lane) in (0..4u8).flat_map(|bits| WireLane::ALL.iter().map(move |l| (bits, l))) {
-                    let f = WireFlags {
-                        verb,
-                        conflict_mode,
-                        probe_mode,
-                        continuation: bits & 1 != 0,
-                        scan_last: bits & 2 != 0,
-                        lane,
-                    };
-                    assert_eq!(WireFlags::unpack(f.pack()), Ok(f), "{f:?}");
-                }
+            for (bits, &lane) in (0..4u8).flat_map(|bits| WireLane::ALL.iter().map(move |l| (bits, l))) {
+                let f = WireFlags {
+                    verb,
+                    conflict_mode,
+                    continuation: bits & 1 != 0,
+                    scan_last: bits & 2 != 0,
+                    lane,
+                };
+                assert_eq!(WireFlags::unpack(f.pack()), Ok(f), "{f:?}");
             }
         }
     }
@@ -202,57 +198,23 @@ fn wire_flags_roundtrip_every_combination() {
 /// mode the server does not implement into a silent upsert on a client's push.
 #[test]
 fn wire_flags_reject_unknown() {
-    for bit in (16..32).chain(40..64) {
+    for bit in (16..32).chain(36..38).chain(40..64) {
         assert!(WireFlags::unpack(1 << bit).is_err(), "bit {bit}");
     }
     // Bits 32/33 are the frame codec's, so the flags word neither refuses nor
     // carries them.
     assert_eq!(WireFlags::unpack(3 << 32), Ok(WireFlags::default()));
-    // The two-bit fields leave one value unused.
-    let probe = u64::from(crate::outside(WireProbeMode::from_wire));
+    // The two-bit lane leaves one value unused.
     let lane = u64::from(crate::outside(WireLane::from_wire));
-    assert!(probe < 4 && lane < 4, "a two-bit field holds no unknown value");
+    assert!(lane < 4, "a two-bit field holds no unknown value");
     for (w, want) in [
         (u64::from(crate::outside(ClientVerb::from_wire)), "unknown request verb"),
         (
             u64::from(crate::outside(WireConflictMode::from_wire)) << 8,
             "unknown conflict mode",
         ),
-        (probe << 36, "unknown probe mode"),
         (lane << 38, "unknown lane"),
     ] {
         assert_eq!(WireFlags::unpack(w), Err(format!("flags: {want}").as_str()), "{w:#x}");
-    }
-}
-
-/// Every probe round-trips through its wire words, and a triple no probe
-/// encodes to is refused.
-#[test]
-fn a_probe_roundtrips_through_its_wire_words() {
-    let cols = PkColList::from_slice(&[2, 5]);
-    let cap = |n| std::num::NonZeroU64::new(n).unwrap();
-    let probes = [
-        Probe::Pk,
-        Probe::PkColumn(4),
-        Probe::Index(cols, cap(1)),
-        Probe::Index(cols, cap(9)),
-        Probe::Index(cols, std::num::NonZeroU64::MAX),
-    ];
-    for probe in probes {
-        let (mode, arg0, arg1) = probe.wire();
-        assert_eq!(Probe::from_wire(mode, arg0, arg1), Ok(probe));
-    }
-    let index = cols.pack();
-    for (mode, arg0, arg1) in [
-        (WireProbeMode::Pk, 5, 0),
-        (WireProbeMode::Pk, 0, index),
-        (WireProbeMode::Pk, 0, 7),
-        (WireProbeMode::PkColumn, 1 << 32, 0),
-        (WireProbeMode::PkColumn, 4, index),
-        (WireProbeMode::Index, 0, index),
-        (WireProbeMode::Index, 9, 0),
-        (WireProbeMode::Index, 9, 7),
-    ] {
-        assert!(Probe::from_wire(mode, arg0, arg1).is_err(), "{mode:?} {arg0} {arg1}");
     }
 }

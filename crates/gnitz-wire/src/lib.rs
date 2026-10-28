@@ -8,7 +8,7 @@
 //!
 //! So this is the shared **model**, not only a byte format: a rule both sides
 //! compute belongs here even when it crosses no wire, as
-//! `TypeCode::join_key_common_type` does.
+//! `AggFunc::output_type` does.
 //!
 //! The crate is organized into topic modules under one export rule: a private
 //! module is glob-re-exported flat at the crate root (`gnitz_wire::FOO`), so

@@ -68,7 +68,7 @@ fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), Str
     if sig.repeats_a_sign {
         return Err(format!(
             "system-catalog write carries more than one row for {}",
-            family.pk_label(sig.pk)
+            family.pk_label(sig)
         ));
     }
     Ok(())
@@ -86,13 +86,13 @@ fn check_id_range(family: SysFamily, sig: &PkSignature, next_id: u64) -> Result<
             "cannot {} a system {} ({})",
             sig.verb(),
             family.row_noun(),
-            family.pk_label(sig.pk)
+            family.pk_label(sig)
         ));
     }
     if family.allocates_ids() && id >= next_id {
         return Err(format!(
             "{} was never allocated (next id {next_id})",
-            family.pk_label(sig.pk)
+            family.pk_label(sig)
         ));
     }
     Ok(())
@@ -127,13 +127,13 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
         return Err(format!(
             "a {} admits no rewrite pair ({})",
             family.row_noun(),
-            family.pk_label(sig.pk)
+            family.pk_label(sig)
         ));
     };
     if payload_differs(family.schema(), mask, batch, nj, batch, pj) {
         return Err(format!(
             "a system-catalog rewrite pair on {} changes a field it may not",
-            family.pk_label(sig.pk)
+            family.pk_label(sig)
         ));
     }
     Ok(())
@@ -150,7 +150,7 @@ fn check_batch_shape(family: SysFamily, batch: &Batch, next_id: u64) -> Result<V
             return Err(format!(
                 "a {} is retracted only with its owner ({})",
                 family.row_noun(),
-                family.pk_label(sig.pk)
+                family.pk_label(sig)
             ));
         }
         check_id_range(family, sig, next_id)?;
@@ -301,7 +301,7 @@ impl CatalogEngine {
         if !(0..=1).contains(&net) {
             return Err(format!(
                 "system-catalog write would leave {} at net weight {net} (expected 0 or 1)",
-                family.pk_label(sig.pk)
+                family.pk_label(sig)
             ));
         }
         Ok(net)
@@ -329,7 +329,7 @@ impl CatalogEngine {
     fn precheck_column_family(&self, batch: &Batch, sigs: &[PkSignature]) -> Result<(), String> {
         for sig in sigs {
             // COL_TAB PK = `(owner_id, col_idx)`.
-            let (owner_id, col_idx) = (sig.leading, sig.pk as u64);
+            let (owner_id, col_idx) = (sig.leading, sig.member.expect("a COL_TAB key is a pair"));
             let decode = |r| ColTabRow::read(batch, r).and_then(|r| r.column());
             let old = sig.neg.map(decode).transpose()?;
             let new = sig.pos.map(decode).transpose()?;
@@ -754,10 +754,9 @@ impl CatalogEngine {
         let noun = SysFamily::Index.row_noun();
         for i in batch.live_rows() {
             let r = IdxTabRow::read(batch, i).map_err(|e| format!("Index: {e}"))?;
-            let (owner_id, cols, unique) = r.parts().map_err(|e| format!("Index: {e}"))?;
             let index_name = r.name;
             check_stored_name(&index_name, noun, false)?;
-            self.validate_index_create(owner_id, cols.as_slice(), unique)?;
+            self.validate_index_create(r.owner_id, r.source_col_idx.as_slice(), r.is_unique)?;
             if !taken.insert(Cow::Owned(index_name.as_bytes().to_vec())) {
                 return Err(format!("Index already exists: {index_name}"));
             }
@@ -766,9 +765,8 @@ impl CatalogEngine {
         for i in batch.retracted_rows() {
             // The row, not `net_dead`: this needs `cols`, which a list of ids
             // does not carry.
-            let (owner_id, cols, _) = IdxTabRow::read(batch, i)
-                .and_then(|r| r.parts())
-                .map_err(|e| format!("Index: {e}"))?;
+            let IdxTabRow { owner_id, source_col_idx: cols, .. } =
+                IdxTabRow::read(batch, i).map_err(|e| format!("Index: {e}"))?;
             // FK backing is single-column: a composite index never satisfies a
             // single-column FK/uniqueness requirement, so dropping one is never
             // blocked by the FK-target guard.

@@ -273,9 +273,8 @@ fn a_duplicate_visible_column_name_is_named_before_dependent_views() {
     let (mut engine, tid, dir) = table_fixture("alter_add_dup_dep", &cols);
     register_identity_view(&mut engine, tid, "vw", &cols);
 
-    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
-    ColTabRow::of(tid, 2, &nullable_def("v", TypeCode::U64).def, None).write(&mut bb, 1);
-    let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
+    let add = crate::test_support::sys_batch([(ColTabRow::of(tid, 2, &nullable_def("v", TypeCode::U64).def, None), 1)]);
+    let err = engine.precheck_family(SysFamily::Column, &add).unwrap_err();
     assert!(err.contains("duplicate column name"), "add: {err}");
     let err = engine
         .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], rename_to("id")))

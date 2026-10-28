@@ -3,10 +3,12 @@
 //! [`SalRequest::decode`] are the one mapping between its fields and a frame head.
 
 use std::borrow::Cow;
+use std::num::NonZeroU64;
 
 use super::SalMessageKind;
 use crate::runtime::wire::WireMsg;
-use gnitz_wire::{ControlHeader, PkColList, PkListRole, Probe, WireFlags};
+use gnitz_store::read::Probe;
+use gnitz_wire::{ControlHeader, PkColList, PkListRole};
 
 /// A request answered with rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,7 +83,9 @@ impl SalRequest<'_> {
     pub(crate) fn kind(&self) -> SalMessageKind {
         match self {
             SalRequest::Shutdown => SalMessageKind::Shutdown,
-            SalRequest::Read(Read::HasPk { .. }) => SalMessageKind::HasPk,
+            SalRequest::Read(Read::HasPk { probe: Probe::Pk, .. }) => SalMessageKind::HasPk,
+            SalRequest::Read(Read::HasPk { probe: Probe::PkColumn(_), .. }) => SalMessageKind::HasPkColumn,
+            SalRequest::Read(Read::HasPk { probe: Probe::Index(..), .. }) => SalMessageKind::HasPkIndex,
             SalRequest::Read(Read::KeySpans { .. }) => SalMessageKind::KeySpans,
             SalRequest::Read(Read::ReleasePreflight) => SalMessageKind::ReleasePreflight,
             SalRequest::Read(Read::ScanSpec { .. }) => SalMessageKind::ScanSpec,
@@ -118,13 +122,16 @@ impl SalRequest<'_> {
                 ..head
             },
             SalRequest::Read(Read::HasPk { tid, probe, ref keys }) => {
-                let (probe_mode, arg0, arg1) = probe.wire();
+                let (arg0, arg1) = match probe {
+                    Probe::Pk => (0, 0),
+                    Probe::PkColumn(col) => (col.into(), 0),
+                    Probe::Index(cols, cap) => (cap.get(), cols.pack()),
+                };
                 WireMsg {
                     target_id: tid,
                     arg0,
                     arg1,
                     blob: keys,
-                    flags: WireFlags { probe_mode, ..Default::default() },
                     ..head
                 }
             }
@@ -177,9 +184,26 @@ impl SalRequest<'static> {
                 tids: ids_of(blob, "tick")?.into(),
             }
             .into(),
-            SalMessageKind::HasPk => {
-                let probe =
-                    Probe::from_wire(hdr.flags.probe_mode, hdr.arg0, hdr.arg1).map_err(|e| format!("has_pk: {e}"))?;
+            SalMessageKind::HasPk | SalMessageKind::HasPkColumn | SalMessageKind::HasPkIndex => {
+                let refused = || {
+                    format!(
+                        "has_pk: no {kind:?} probe is carried as ({}, {:#x})",
+                        hdr.arg0, hdr.arg1
+                    )
+                };
+                let probe = match (kind, hdr.arg0, hdr.arg1) {
+                    (SalMessageKind::HasPk, 0, 0) => Probe::Pk,
+                    (SalMessageKind::HasPkColumn, col, 0) => {
+                        Probe::PkColumn(u32::try_from(col).map_err(|_| refused())?)
+                    }
+                    (SalMessageKind::HasPkIndex, cap, cols) => {
+                        let cap = NonZeroU64::new(cap).ok_or_else(refused)?;
+                        let cols =
+                            PkColList::unpack_as(cols, PkListRole::ColumnList).map_err(|e| format!("has_pk: {e}"))?;
+                        Probe::Index(cols, cap)
+                    }
+                    _ => return Err(refused()),
+                };
                 Read::HasPk { tid, probe, keys: blob.to_vec().into() }.into()
             }
             SalMessageKind::KeySpans => {

@@ -27,21 +27,6 @@ pub const fn num_regions(num_payload_cols: usize) -> usize {
 /// with one bit per payload column, so payload columns ≤ 64.
 pub const MAX_COLUMNS: usize = 65;
 
-/// Payload slot of column `ci`: its position among the columns not in `pk`, or
-/// `None` for a PK column.
-pub const fn payload_slot(pk: &[u32], ci: usize) -> Option<usize> {
-    let mut below = 0;
-    let mut k = 0;
-    while k < pk.len() {
-        if pk[k] as usize == ci {
-            return None;
-        }
-        below += ((pk[k] as usize) < ci) as usize;
-        k += 1;
-    }
-    Some(ci - below)
-}
-
 /// One payload column wider than any legal schema: a real one has at least one
 /// PK column, so at most `MAX_COLUMNS - 1` payload columns.
 pub const MAX_WIRE_REGIONS: usize = num_regions(MAX_COLUMNS);

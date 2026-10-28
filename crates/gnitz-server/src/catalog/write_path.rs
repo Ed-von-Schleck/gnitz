@@ -61,10 +61,8 @@ impl AppliedDdl {
                     (SysFamily::View, PkShape::Create) => out.created_views.push(sig.leading),
                     (SysFamily::Table | SysFamily::View, PkShape::Drop) => out.dropped_relations.push(sig.leading),
                     (SysFamily::Index, PkShape::Drop) => {
-                        let (owner, cols, _) = IdxTabRow::read(&g.batch, sig.row)
-                            .and_then(|r| r.parts())
-                            .expect("an applied index row decoded in its hook");
-                        out.dropped_indexes.push((owner, cols));
+                        let r = IdxTabRow::read(&g.batch, sig.row).expect("an applied index row decoded in its hook");
+                        out.dropped_indexes.push((r.owner_id, r.source_col_idx));
                     }
                     _ => {}
                 }

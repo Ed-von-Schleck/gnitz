@@ -7,6 +7,21 @@ use gnitz_wire::{ColType, PkListRole, PkRule, TypeCode, MAX_COLUMNS, MAX_PK_BYTE
 
 use crate::ColumnLocator;
 
+/// Payload slot of column `ci`: its position among the columns not in `pk`, or
+/// `None` for a PK column.
+const fn payload_slot(pk: &[u32], ci: usize) -> Option<usize> {
+    let mut below = 0;
+    let mut k = 0;
+    while k < pk.len() {
+        if pk[k] as usize == ci {
+            return None;
+        }
+        below += ((pk[k] as usize) < ci) as usize;
+        k += 1;
+    }
+    Some(ci - below)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SchemaColumn {
@@ -139,7 +154,7 @@ impl SchemaDescriptor {
         pk[..pk_indices.len()].copy_from_slice(pk_indices);
         let mut payload_to_ci = [0u8; MAX_COLUMNS];
         for ci in 0..cols.len() {
-            if let Some(pi) = gnitz_wire::payload_slot(pk_indices, ci) {
+            if let Some(pi) = payload_slot(pk_indices, ci) {
                 payload_to_ci[pi] = ci as u8;
             }
         }
@@ -366,7 +381,7 @@ impl SchemaDescriptor {
             return None;
         }
         let SchemaColumn { type_code, size, .. } = self.columns[ci];
-        Some(match gnitz_wire::payload_slot(self.pk_cols(), ci) {
+        Some(match payload_slot(self.pk_cols(), ci) {
             Some(slot) => ColumnLocator::Payload { slot: slot as u8, size, type_code },
             None => {
                 let k = self

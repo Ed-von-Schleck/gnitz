@@ -67,8 +67,7 @@ fn index_key(cols: &[ColumnDef], key: &[u32], src_pk_count: usize, role: &str) -
         });
         GnitzSqlError::Rejected(format!("{role}: {named}"))
     };
-    gnitz_wire::validate_index_key(key, cols.len(), src_pk_count, |c| cols[c as usize].ty.tc).map_err(rejected)?;
-    PkColList::checked(key, cols.len()).map_err(rejected)
+    gnitz_wire::validate_index_key(key, cols.len(), src_pk_count, |c| cols[c as usize].ty.tc).map_err(rejected)
 }
 
 /// The FK child-type rule: a child adopts the referenced type, so its type must

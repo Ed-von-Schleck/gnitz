@@ -210,9 +210,8 @@ fn test_sequence_gap_recovery() {
             .unwrap();
 
         // Inject column record for tid=250
-        let mut cbb = BatchBuilder::new(SysFamily::Column.schema());
-        ColTabRow::of(250, 0, &col_def("id", TypeCode::U64).def, None).write(&mut cbb, 1);
-        engine.registry.ingest(SysFamily::Column.id(), cbb.finish()).unwrap();
+        let columns = col_tab_batch(250, &[col_def("id", TypeCode::U64)], 1);
+        engine.registry.ingest(SysFamily::Column.id(), columns).unwrap();
 
         let _ = engine.registry.checkpoint_system(engine.system_zone);
         let _ = engine.registry.checkpoint_system(engine.system_zone);
@@ -548,12 +547,8 @@ fn test_dependent_view_restricts_fire_from_registered_views() {
     assert!(err.contains("dependent views (public.v)"), "DROP TABLE RESTRICT: {err}");
 
     // DROP NOT NULL on `val` — an `is_nullable 0→1` rewrite pair.
-    let mut nullable = cols[1].clone();
-    nullable.def.is_nullable = true;
-    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
-    ColTabRow::of(tid, 1, &cols[1].def, cols[1].fk).write(&mut bb, -1);
-    ColTabRow::of(tid, 1, &nullable.def, nullable.fk).write(&mut bb, 1);
-    let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
+    let pair = col_alter_pair(tid, 1, &cols[1], |c| c.def.is_nullable = true);
+    let err = engine.precheck_family(SysFamily::Column, &pair).unwrap_err();
     assert!(err.contains("dependent views"), "DROP NOT NULL RESTRICT: {err}");
 
     engine.close();

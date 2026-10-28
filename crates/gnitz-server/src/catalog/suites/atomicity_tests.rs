@@ -36,11 +36,11 @@ fn a_malformed_create_is_refused_at_the_precheck() {
     let too_wide = with_cols(&too_wide);
     // Column records at indices 0 and 2: `col_tab_batch` numbers by position.
     let gapped = engine.allocate_ids(1).unwrap();
-    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
-    for col_idx in [0, 2] {
-        ColTabRow::of(gapped, col_idx, &col_def("c", TypeCode::U64).def, None).write(&mut bb, 1);
-    }
-    engine.ddl_sync(SysFamily::Column.id(), bb.finish()).unwrap();
+    let c = col_def("c", TypeCode::U64).def;
+    let rows = [0, 2].map(|col_idx| (ColTabRow::of(gapped, col_idx, &c, None), 1));
+    engine
+        .ddl_sync(SysFamily::Column.id(), crate::test_support::sys_batch(rows))
+        .unwrap();
     let unregistered = engine.allocate_ids(2).unwrap();
     let index_on = |owner: u64, cols: &[u32], name: &str| idx_tab_batch(unregistered + 1, owner, cols, name, false, 1);
 

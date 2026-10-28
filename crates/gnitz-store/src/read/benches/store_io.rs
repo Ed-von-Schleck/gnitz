@@ -5,11 +5,12 @@
 use std::hint::black_box;
 use std::num::NonZeroU64;
 
+use super::Probe;
 use crate::relation::{Cut as At, RelationKind};
 use crate::test_support::{
     make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture, RelationFixture, TID,
 };
-use gnitz_wire::{PkColList, PkKeys, Probe, TypeCode};
+use gnitz_wire::{PkColList, PkKeys, TypeCode};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Sorted runs a probe's cursor merges (one ingest round each).

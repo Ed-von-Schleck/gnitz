@@ -15,9 +15,12 @@ fn a_name_that_is_not_utf8_is_refused() {
         let schema = family.schema();
         let mut bb = BatchBuilder::new(schema);
         bb.begin_row(id as u128, 1);
+        // A packed column list: a word every U64 cell decoded before the name
+        // reads as sound, IDX_TAB's `source_col_idx` among them.
+        let word = gnitz_wire::PkColList::from_slice(&[0]).pack();
         for (_, col) in schema.payload_columns() {
             match col.type_code {
-                TypeCode::U64 => bb.put_u64(0),
+                TypeCode::U64 => bb.put_u64(word),
                 _ => bb.put_blob(b"\xff\xfe"),
             }
         }
@@ -97,13 +100,13 @@ fn an_index_row_repeating_a_column_is_refused() {
     let row = gnitz_wire::IdxTabRow {
         index_id,
         owner_id: tid,
-        source_col_idx: PK_LIST_PACKED_FLAG | 2 | 1 << 4 | 1 << 11,
+        source_col_idx: gnitz_wire::PkColList::from_slice(&[1]),
         name: "ix".into(),
-        is_unique: 0,
+        is_unique: false,
     };
-    let err = engine
-        .precheck_family(SysFamily::Index, &crate::test_support::sys_batch([(row, 1)]))
-        .unwrap_err();
+    let word = PK_LIST_PACKED_FLAG | 2 | 1 << 4 | 1 << 11;
+    let batch = crate::test_support::forged_sys_batch(row, gnitz_wire::IdxTabSlot::source_col_idx as usize, word);
+    let err = engine.precheck_family(SysFamily::Index, &batch).unwrap_err();
     assert!(err.contains("names column 1 twice"), "{err}");
 
     engine.close();

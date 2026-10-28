@@ -5,15 +5,13 @@
 //! The header carries a reply status ([`WireStatus`]; a refusal is a
 //! [`WireFault`]), the relation a request names ([`Target`]), two per-verb
 //! arguments, and the `flags` word ([`WireFlags`]): the request verb
-//! ([`ClientVerb`]), a push's conflict mode, a probe's mode, the lane a server
-//! frame answers on, and the continuation bits of a reply train. A `HasPk`
-//! request's probe mode and its two arguments decode to one [`Probe`].
+//! ([`ClientVerb`]), a push's conflict mode, the lane a server frame answers
+//! on, and the continuation bits of a reply train.
 
-use std::num::NonZeroU64;
 use std::ops::Range;
 
 use crate::codec::Reader;
-use crate::{write_u32_le, write_u64_le, PkColList, PkListRole};
+use crate::{write_u32_le, write_u64_le};
 
 // Layout (all little-endian):
 //   [0,4)   STATUS     u32   `WireStatus`
@@ -325,14 +323,12 @@ pub struct WireFlags {
     // Engine-authored.
     /// Bit 35: a worker's last frame of a train.
     pub scan_last: bool,
-    /// Bits 36-37: what a `HasPk` probe answers a matched key with.
-    pub probe_mode: WireProbeMode,
     /// Bits 38-39.
     pub lane: WireLane,
 }
 
-/// Bits 16-31 and 40-63: no field.
-const RESERVED_BITS: u64 = !crate::low_bits_mask(40) | (crate::low_bits_mask(32) & !crate::low_bits_mask(16));
+/// Bits 16-31, 36-37 and 40-63: no field.
+const RESERVED_BITS: u64 = !crate::low_bits_mask(40) | (crate::low_bits_mask(32) & !crate::low_bits_mask(16)) | 3 << 36;
 
 impl WireFlags {
     /// A frame of a worker's reply train: `continuation` always, since the master's terminal
@@ -343,7 +339,6 @@ impl WireFlags {
             conflict_mode: WireConflictMode::Update,
             continuation: true,
             scan_last: last,
-            probe_mode: WireProbeMode::Pk,
             lane: WireLane::Reply,
         }
     }
@@ -353,7 +348,6 @@ impl WireFlags {
             | (self.conflict_mode as u64) << 8
             | (self.continuation as u64) << 34
             | (self.scan_last as u64) << 35
-            | (self.probe_mode as u64) << 36
             | (self.lane as u64) << 38
     }
 
@@ -369,7 +363,6 @@ impl WireFlags {
             conflict_mode: WireConflictMode::from_wire((w >> 8) as u8).ok_or("flags: unknown conflict mode")?,
             continuation: bit(34),
             scan_last: bit(35),
-            probe_mode: WireProbeMode::from_wire(((w >> 36) & 3) as u8).ok_or("flags: unknown probe mode")?,
             lane: WireLane::from_wire(((w >> 38) & 3) as u8).ok_or("flags: unknown lane")?,
         })
     }
@@ -393,17 +386,6 @@ wire_enum! {
         /// check, and returns a PG-style `duplicate key value violates
         /// unique constraint` error.
         Error = 1,
-    }
-}
-
-wire_enum! {
-    /// The code a [`Probe`] rides [`WireFlags::probe_mode`] as.
-    #[derive(Default)]
-    pub enum WireProbeMode: u8 {
-        #[default]
-        Pk = 0,
-        PkColumn = 1,
-        Index = 2,
     }
 }
 
@@ -434,45 +416,6 @@ impl std::str::FromStr for WireConflictMode {
             "update" => Ok(WireConflictMode::Update),
             "error" => Ok(WireConflictMode::Error),
             other => Err(format!("invalid conflict mode '{other}', expected 'update' or 'error'")),
-        }
-    }
-}
-
-/// One `HasPk` probe: the store it reads, and what it answers each matched key
-/// with.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Probe {
-    /// The relation's own PK store: each key a live row carries, echoed.
-    Pk,
-    /// The own PK store: each key a live row carries, with that row's column.
-    PkColumn(u32),
-    /// The secondary index on this exact column list: the stored entries
-    /// under the keys' spans, `[span ‖ holder PK]`, in key order, up to `cap`
-    /// in all.
-    Index(PkColList, NonZeroU64),
-}
-
-impl Probe {
-    /// The probe mode, `arg0` and `arg1` a `HasPk` group carries this as.
-    pub fn wire(self) -> (WireProbeMode, u64, u64) {
-        match self {
-            Probe::Pk => (WireProbeMode::Pk, 0, 0),
-            Probe::PkColumn(col) => (WireProbeMode::PkColumn, col as u64, 0),
-            Probe::Index(cols, cap) => (WireProbeMode::Index, cap.get(), cols.pack()),
-        }
-    }
-
-    /// The inverse of [`Self::wire`], refusing every other triple.
-    pub fn from_wire(mode: WireProbeMode, arg0: u64, arg1: u64) -> Result<Self, String> {
-        let refused = || format!("no probe is carried as ({mode:?}, {arg0}, {arg1:#x})");
-        match (mode, arg0, arg1) {
-            (WireProbeMode::Pk, 0, 0) => Ok(Probe::Pk),
-            (WireProbeMode::PkColumn, col, 0) => Ok(Probe::PkColumn(u32::try_from(col).map_err(|_| refused())?)),
-            (WireProbeMode::Index, cap, cols) => {
-                let cap = NonZeroU64::new(cap).ok_or_else(refused)?;
-                Ok(Probe::Index(PkColList::unpack_as(cols, PkListRole::ColumnList)?, cap))
-            }
-            _ => Err(refused()),
         }
     }
 }

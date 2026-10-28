@@ -6,9 +6,24 @@
 
 use super::check_stride;
 use crate::relation::{Cut, Relation, RelationKind, RelationRegistry};
-use gnitz_wire::{KeyRange, PkKeys, Probe, ReadBound};
+use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound};
 use gnitz_zset::repr::{empty_cursor, Batch, BoundedIndexCursor, SourceCursor};
 use gnitz_zset::schema::{project_schema, SchemaDescriptor};
+use std::num::NonZeroU64;
+
+/// One `HasPk` probe: the store it reads, and what it answers each matched key
+/// with.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Probe {
+    /// The relation's own PK store: each key a live row carries, echoed.
+    Pk,
+    /// The own PK store: each key a live row carries, with that row's column.
+    PkColumn(u32),
+    /// The secondary index on this exact column list: the stored entries
+    /// under the keys' spans, `[span ‖ holder PK]`, in key order, up to `cap`
+    /// in all.
+    Index(PkColList, NonZeroU64),
+}
 
 /// A range walks an index only while the walk's estimated entries are at most
 /// one in this many of the store's rows; past that it scans the store under

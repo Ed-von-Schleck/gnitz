@@ -62,22 +62,24 @@ impl WireSysFamily {
     }
 }
 
-/// Declare one system family from one field list: its [`WireSysFamily`], the
-/// struct holding the cells a row stores, its payload-slot enum, and the writer
-/// and reader.
+/// Declare one system family from one field list: its table id const, its
+/// [`WireSysFamily`], the struct holding the cells a row stores, its payload-slot
+/// enum, and the writer and the reader, which decodes every typed cell.
 macro_rules! sys_row {
     (
         $(#[$meta:meta])*
-        $FAMILY:ident = $name:literal, $fam:ident, $Row:ident $(<$lt:lifetime>)?, $Slot:ident -> $E:ty,
+        $FAMILY:ident = $id:literal, $name:literal, $fam:ident, $Row:ident $(<$lt:lifetime>)?, $Slot:ident -> $E:ty,
         key { $($k:ident),+ $(,)? }
         payload { $($(#[$pmeta:meta])* $p:ident: $tc:ident),+ $(,)? }
     ) => {
+        pub const $FAMILY: u64 = $id;
+
         pub(crate) const $fam: WireSysFamily = WireSysFamily {
             id: $FAMILY,
             name: $name,
             cols: &[
                 $(WireSysCol { name: stringify!($k), type_code: TypeCode::U64 },)+
-                $(WireSysCol { name: stringify!($p), type_code: TypeCode::$tc },)+
+                $(WireSysCol { name: stringify!($p), type_code: sys_row!(@tc $tc) },)+
             ],
             pk_cols: SYS_KEY_COLS.split_at([$(stringify!($k)),+].len()).0,
         };
@@ -121,35 +123,54 @@ macro_rules! sys_row {
             }
         }
     };
+    // `Bool`, `Key` and `Cols` are stored as `U64` words: a boolean, and a
+    // [`PkColList::pack`] read as a primary key or as an index's column list.
+    (@tc String) => { TypeCode::String };
+    (@tc Blob) => { TypeCode::Blob };
+    (@tc $other:ident) => { TypeCode::U64 };
     (@ty U64) => { u64 };
+    (@ty Bool) => { bool };
+    (@ty Key) => { PkColList };
+    (@ty Cols) => { PkColList };
     (@ty String) => { std::borrow::Cow<'a, str> };
     (@ty Blob) => { std::borrow::Cow<'a, [u8]> };
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, U64) => { crate::payload_u64($s, $r, $pi) };
+    (@get $s:ident, $r:ident, $pi:expr, $p:ident, Bool) => {
+        bool_word(crate::payload_u64($s, $r, $pi)).map_err(|e| format!("{}: {e}", stringify!($p)))?
+    };
+    (@get $s:ident, $r:ident, $pi:expr, $p:ident, Key) => {
+        PkColList::unpack_as(crate::payload_u64($s, $r, $pi), PkListRole::PrimaryKey)?
+    };
+    (@get $s:ident, $r:ident, $pi:expr, $p:ident, Cols) => {
+        PkColList::unpack_as(crate::payload_u64($s, $r, $pi), PkListRole::ColumnList)?
+    };
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, Blob) => { crate::payload_bytes($s, $r, $pi) };
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, String) => {
         crate::payload_str($s, $r, $pi).map_err(|_| format!("{} is not UTF-8", stringify!($p)))?
     };
     (@put $s:ident, $v:expr, U64) => { $s.put_u64($v) };
+    (@put $s:ident, $v:expr, Bool) => { $s.put_u64($v as u64) };
+    (@put $s:ident, $v:expr, Key) => { $s.put_u64($v.pack()) };
+    (@put $s:ident, $v:expr, Cols) => { $s.put_u64($v.pack()) };
     (@put $s:ident, $v:expr, String) => { $s.put_string(&$v) };
     (@put $s:ident, $v:expr, Blob) => { $s.put_bytes(&$v) };
 }
 
 sys_row! {
     /// One `SCHEMA_TAB` row: the schema `schema_id`, named `name`.
-    SCHEMA_TAB = "schemas", SCHEMA_TAB_FAMILY, SchemaTabRow<'a>, SchemaTabSlot -> String,
+    SCHEMA_TAB = 1, "schemas", SCHEMA_TAB_FAMILY, SchemaTabRow<'a>, SchemaTabSlot -> String,
     key { schema_id }
     payload { name: String }
 }
 
 sys_row! {
     /// One `TABLE_TAB` row.
-    TABLE_TAB = "tables", TABLE_TAB_FAMILY, TableTabRow<'a>, TableTabSlot -> String,
+    TABLE_TAB = 2, "tables", TABLE_TAB_FAMILY, TableTabRow<'a>, TableTabSlot -> String,
     key { table_id }
     payload {
         schema_id: U64,
         name: String,
-        /// [`PkColList::pack`].
-        pk_col_idx: U64,
+        pk_col_idx: Key,
         /// [`TableProps::pack`].
         flags: U64,
     }
@@ -157,13 +178,12 @@ sys_row! {
 
 sys_row! {
     /// One `VIEW_TAB` row.
-    VIEW_TAB = "views", VIEW_TAB_FAMILY, ViewTabRow<'a>, ViewTabSlot -> String,
+    VIEW_TAB = 3, "views", VIEW_TAB_FAMILY, ViewTabRow<'a>, ViewTabSlot -> String,
     key { view_id }
     payload {
         schema_id: U64,
         name: String,
-        /// [`PkColList::pack`].
-        pk_col_idx: U64,
+        pk_col_idx: Key,
         /// [`ViewBudget::row_words`]: `WITH (capacity = …)` in bytes, `0`
         /// absent.
         capacity_bytes: U64,
@@ -172,13 +192,13 @@ sys_row! {
         /// The user view this row is an internal chain segment of; `0` is a user
         /// view. A column, so the precheck can validate it against a forger.
         owner_view_id: U64,
-        /// A boolean ([`bool_word`]): two of the view's rows may carry the
-        /// same PK, or one may stand at weight above 1, so its PK region
-        /// identifies no single row. The planner that compiled the view states
-        /// it; the engine stores it verbatim.
-        pk_repeats: U64,
-        /// A boolean ([`bool_word`]): [`ViewProps::compress`].
-        compress: U64,
+        /// Two of the view's rows may carry the same PK, or one may stand at
+        /// weight above 1, so its PK region identifies no single row. The
+        /// planner that compiled the view states it; the engine stores it
+        /// verbatim.
+        pk_repeats: Bool,
+        /// [`ViewProps::compress`].
+        compress: Bool,
         /// The user view's body as its planner recorded it, for a client to
         /// write the view again; the engine stores it verbatim and reads none of
         /// it. Empty for a chain segment, and for a view no planner wrote.
@@ -189,23 +209,23 @@ sys_row! {
 sys_row! {
     /// One `COL_TAB` row: column `col_idx` of the table or view `owner_id`. The
     /// pair is a column record's identity.
-    COL_TAB = "columns", COL_TAB_FAMILY, ColTabRow<'a>, ColTabSlot -> String,
+    COL_TAB = 4, "columns", COL_TAB_FAMILY, ColTabRow<'a>, ColTabSlot -> String,
     key { owner_id, col_idx }
     payload {
         name: String,
         /// [`ColType`]'s type code.
         type_code: U64,
-        /// A boolean ([`bool_word`]): the column admits NULL.
-        is_nullable: U64,
+        /// The column admits NULL.
+        is_nullable: Bool,
         /// The parent table of a foreign key; `0` for none, which no relation has.
         fk_table_id: U64,
         fk_col_idx: U64,
         /// [`FkAction`]'s word: what a delete of the referenced row does to
         /// this one. `0` where the column references nothing.
         fk_on_delete: U64,
-        /// A boolean ([`bool_word`]): the column is hidden — a hidden key slot or
-        /// a dropped column — echoed into schema records.
-        is_hidden: U64,
+        /// The column is hidden — a hidden key slot or a dropped column — echoed
+        /// into schema records.
+        is_hidden: Bool,
         /// [`ColType`]'s scale: a DECIMAL column's, else `0`.
         scale: U64,
     }
@@ -213,29 +233,28 @@ sys_row! {
 
 sys_row! {
     /// One `IDX_TAB` row: the index `index_id` on columns of `owner_id`.
-    IDX_TAB = "indices", IDX_TAB_FAMILY, IdxTabRow<'a>, IdxTabSlot -> String,
+    IDX_TAB = 5, "indices", IDX_TAB_FAMILY, IdxTabRow<'a>, IdxTabSlot -> String,
     key { index_id }
     payload {
         owner_id: U64,
-        /// The indexed columns' [`PkColList::pack`], single- and
-        /// multi-column indexes alike.
-        source_col_idx: U64,
+        /// The indexed columns, single- and multi-column indexes alike.
+        source_col_idx: Cols,
         name: String,
-        /// A boolean ([`bool_word`]): the index enforces uniqueness.
-        is_unique: U64,
+        /// The index enforces uniqueness.
+        is_unique: Bool,
     }
 }
 
 sys_row! {
     /// One `SEQ_TAB` row.
-    SEQ_TAB = "sequences", SEQ_TAB_FAMILY, SeqTabRow, SeqTabSlot -> std::convert::Infallible,
+    SEQ_TAB = 7, "sequences", SEQ_TAB_FAMILY, SeqTabRow, SeqTabSlot -> std::convert::Infallible,
     key { seq_id }
     payload { next_val: U64 }
 }
 
 sys_row! {
     /// `view_id`'s one `CIRCUIT_TAB` row.
-    CIRCUIT_TAB = "circuits", CIRCUIT_TAB_FAMILY, CircuitRow<'a>, CircuitSlot -> std::convert::Infallible,
+    CIRCUIT_TAB = 11, "circuits", CIRCUIT_TAB_FAMILY, CircuitRow<'a>, CircuitSlot -> std::convert::Infallible,
     key { view_id }
     payload {
         /// The view's whole circuit, as [`crate::Circuit::encode`] lays it out.
@@ -349,11 +368,11 @@ impl<'a> ColTabRow<'a> {
             col_idx,
             name: col.name.as_str().into(),
             type_code: col.ty.tc.as_wire() as u64,
-            is_nullable: col.is_nullable as u64,
+            is_nullable: col.is_nullable,
             fk_table_id,
             fk_col_idx,
             fk_on_delete,
-            is_hidden: col.is_hidden as u64,
+            is_hidden: col.is_hidden,
             scale: col.ty.scale as u64,
         }
     }
@@ -403,21 +422,20 @@ impl<'a> ColTabRow<'a> {
         let def = ColumnDef {
             name: self.name.to_string(),
             ty,
-            is_nullable: bool_word(self.is_nullable).map_err(|e| format!("is_nullable: {e}"))?,
-            is_hidden: bool_word(self.is_hidden).map_err(|e| format!("is_hidden: {e}"))?,
+            is_nullable: self.is_nullable,
+            is_hidden: self.is_hidden,
         };
         Ok(CatalogColumn { def, fk })
     }
 }
 
 impl TableTabRow<'_> {
-    /// The row's `(pk, props)` — the one decoding of `pk_col_idx` and `flags`,
-    /// held to the rules the flags word cannot encode against that key.
-    pub fn parts(&self) -> Result<(PkColList, TableProps), String> {
+    /// The row's `flags`, decoded and held to the rules the word cannot encode
+    /// against its key.
+    pub fn props(&self) -> Result<TableProps, String> {
         let props = TableProps::from_flags(self.flags)?;
-        let pk = PkColList::unpack_as(self.pk_col_idx, PkListRole::PrimaryKey)?;
-        props.validate(pk.as_slice().len())?;
-        Ok((pk, props))
+        props.validate(self.pk_col_idx.as_slice().len())?;
+        Ok(props)
     }
 }
 
@@ -432,14 +450,11 @@ pub struct ViewParts {
 }
 
 impl ViewTabRow<'_> {
-    /// The row's `(pk, parts)` — the one decoding of its words, held to the rule
-    /// that a chain segment, which the planner mints, carries no `WITH` option.
-    pub fn parts(&self) -> Result<(PkColList, ViewParts), String> {
-        let pk = PkColList::unpack_as(self.pk_col_idx, PkListRole::PrimaryKey)?;
+    /// The row's words beyond its name and key, decoded and held to the rule that
+    /// a chain segment, which the planner mints, carries no `WITH` option.
+    pub fn parts(&self) -> Result<ViewParts, String> {
         let budget = ViewBudget::from_row(self.capacity_bytes, self.delta_bytes)?;
-        let compress = bool_word(self.compress).map_err(|e| format!("compress: {e}"))?;
-        let pk_repeats = bool_word(self.pk_repeats).map_err(|e| format!("pk_repeats: {e}"))?;
-        let props = ViewProps { budget, compress };
+        let props = ViewProps { budget, compress: self.compress };
         let owner = (self.owner_view_id != 0).then_some(self.owner_view_id);
         if owner.is_some() && props != ViewProps::default() {
             return Err("is a chain segment carrying a WITH option".to_string());
@@ -447,19 +462,11 @@ impl ViewTabRow<'_> {
         if owner.is_some() && !self.definition.is_empty() {
             return Err("is a chain segment carrying a definition".to_string());
         }
-        Ok((pk, ViewParts { props, owner, pk_repeats }))
-    }
-}
-
-impl IdxTabRow<'_> {
-    /// The row's `(owner_id, col_indices, is_unique)` — the one decoding of
-    /// `source_col_idx`, so no consumer holds its undecoded word.
-    pub fn parts(&self) -> Result<(u64, PkColList, bool), String> {
-        Ok((
-            self.owner_id,
-            PkColList::unpack_as(self.source_col_idx, PkListRole::ColumnList)?,
-            bool_word(self.is_unique).map_err(|e| format!("is_unique: {e}"))?,
-        ))
+        Ok(ViewParts {
+            props,
+            owner,
+            pk_repeats: self.pk_repeats,
+        })
     }
 }
 
@@ -527,16 +534,8 @@ pub const SYS_SCHEMA_DIGEST: u64 = {
 pub const EXPR_BLOB_VERSION: u8 = 7;
 
 // ---------------------------------------------------------------------------
-// System table IDs
+// Object-id ranges
 // ---------------------------------------------------------------------------
-
-pub const SCHEMA_TAB: u64 = 1;
-pub const TABLE_TAB: u64 = 2;
-pub const VIEW_TAB: u64 = 3;
-pub const COL_TAB: u64 = 4;
-pub const IDX_TAB: u64 = 5;
-pub const SEQ_TAB: u64 = 7;
-pub const CIRCUIT_TAB: u64 = 11;
 
 pub const FIRST_USER_TABLE_ID: u64 = 16;
 

@@ -96,3 +96,24 @@ fn a_blob_of_the_wrong_width_is_refused() {
     let hdr = ControlHeader::default();
     assert!(SalRequest::decode(SalMessageKind::Tick, &hdr, &[0u8; 12]).is_err());
 }
+
+/// A `HasPk` group's arguments must be the ones its probe kind writes.
+#[test]
+fn a_probe_no_kind_writes_is_refused() {
+    let index = PkColList::from_slice(&[2, 5]).pack();
+    for (kind, arg0, arg1) in [
+        (SalMessageKind::HasPk, 5, 0),
+        (SalMessageKind::HasPk, 0, index),
+        (SalMessageKind::HasPkColumn, 1 << 32, 0),
+        (SalMessageKind::HasPkColumn, 4, index),
+        (SalMessageKind::HasPkIndex, 0, index),
+        (SalMessageKind::HasPkIndex, 9, 0),
+        (SalMessageKind::HasPkIndex, 9, 7),
+    ] {
+        let hdr = ControlHeader { arg0, arg1, ..Default::default() };
+        assert!(
+            SalRequest::decode(kind, &hdr, &[]).is_err(),
+            "{kind:?} {arg0} {arg1:#x}"
+        );
+    }
+}

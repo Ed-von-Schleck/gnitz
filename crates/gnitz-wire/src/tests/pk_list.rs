@@ -75,7 +75,7 @@ fn validate_pk_tuple_names_each_rule() {
     }
     // An index key waives nullability; its arity shares the limit with the source PK.
     let index = |key: &[u32], src_pk_len| validate_index_key(key, cols.len(), src_pk_len, |c| cols[c as usize].0);
-    assert_eq!(index(&[4], MAX_PK_COLUMNS - 1), Ok(()));
+    assert_eq!(index(&[4], MAX_PK_COLUMNS - 1), Ok(PkColList::from_slice(&[4])));
     assert_eq!(
         index(&[0, 4], MAX_PK_COLUMNS - 1),
         Err(PkRule::TooManyColumns { count: 2, max: 1 })

@@ -177,21 +177,20 @@ impl Catalog {
         let mut relations = Vec::new();
         for i in tables.live_rows() {
             let r = TableTabRow::read(tables, i).map_err(|e| bad(format_args!("table row {i}"), e))?;
-            let (pk, props) = r.parts().map_err(|e| bad(format_args!("table '{}'", r.name), e))?;
+            let props = r.props().map_err(|e| bad(format_args!("table '{}'", r.name), e))?;
             relations.push(CatalogRelation::new(
                 r.table_id,
                 schema_of(r.schema_id),
                 r.name.into_owned(),
                 RelProps::Table(props),
-                pk,
+                r.pk_col_idx,
             ));
         }
         // Each chain member's owner: itself for a user view.
         let mut chain_of: HashMap<u64, u64> = HashMap::new();
         for i in views.live_rows() {
             let r = ViewTabRow::read(views, i).map_err(|e| bad(format_args!("view row {i}"), e))?;
-            let (pk, ViewParts { props, owner, .. }) =
-                r.parts().map_err(|e| bad(format_args!("view '{}'", r.name), e))?;
+            let ViewParts { props, owner, .. } = r.parts().map_err(|e| bad(format_args!("view '{}'", r.name), e))?;
             chain_of.insert(r.view_id, owner.unwrap_or(r.view_id));
             if owner.is_none() {
                 let mut rel = CatalogRelation::new(
@@ -199,7 +198,7 @@ impl Catalog {
                     schema_of(r.schema_id),
                     r.name.into_owned(),
                     RelProps::View(props),
-                    pk,
+                    r.pk_col_idx,
                 );
                 rel.definition = r.definition.into_owned();
                 relations.push(rel);
@@ -254,12 +253,11 @@ pub(crate) fn idx_rows(batch: &ZSetBatch) -> Result<Vec<(usize, IndexRow)>, Prot
         .live_rows()
         .map(|i| {
             let r = IdxTabRow::read(batch, i).map_err(|e| bad(format_args!("index row {i}"), e))?;
-            let (owner, cols, is_unique) = r.parts().map_err(|e| bad(format_args!("index '{}'", r.name), e))?;
             let index = IndexRow {
-                owner,
+                owner: r.owner_id,
                 name: r.name.into_owned(),
-                cols,
-                is_unique,
+                cols: r.source_col_idx,
+                is_unique: r.is_unique,
             };
             Ok((i, index))
         })

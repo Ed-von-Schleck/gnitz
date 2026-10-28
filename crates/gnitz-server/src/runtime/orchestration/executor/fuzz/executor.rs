@@ -25,9 +25,10 @@ use crate::test_support::{
 };
 use gnitz_fuzz::input::Input;
 use gnitz_fuzz::seed::{Frame, Seed, Seeds, SEEDS_ENV};
+use gnitz_store::read::Probe;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::txn_frame::{decode_scan_multi, encode_items, FrameItem, ScanItem};
-use gnitz_wire::{append_frame, ControlHeader, PkKeys, Probe, ReadSpec};
+use gnitz_wire::{append_frame, ControlHeader, PkKeys, ReadSpec};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::encode_schema_block;
 

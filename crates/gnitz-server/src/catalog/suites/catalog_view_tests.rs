@@ -137,7 +137,7 @@ fn the_system_schema_takes_no_relation() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let before = sys_row_counts(&engine);
-    let pk_col_idx = PkColList::from_slice(&[0]).pack();
+    let pk_col_idx = PkColList::from_slice(&[0]);
 
     let tid = engine.allocate_ids(1).unwrap();
     let table = TableTabRow {
@@ -161,8 +161,8 @@ fn the_system_schema_takes_no_relation() {
         capacity_bytes: 0,
         delta_bytes: 0,
         owner_view_id: 0,
-        pk_repeats: 0,
-        compress: 0,
+        pk_repeats: false,
+        compress: false,
         definition: Default::default(),
     };
     let family_cols = SysFamily::Table.column_defs();

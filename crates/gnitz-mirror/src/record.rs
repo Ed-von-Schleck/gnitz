@@ -54,7 +54,7 @@ impl MirrorRecord {
                 .map(|_| r.get::<PkColList>())
                 .collect::<Result<Vec<_>, String>>()?;
             // Canonical, so a record holds no index twice.
-            if !indexes.windows(2).all(|w| w[0].pack() < w[1].pack()) {
+            if !indexes.windows(2).all(|w| w[0] < w[1]) {
                 return Err("index column lists out of order".into());
             }
             Ok(MirrorRecord { cursor, name, block, pk_repeats, indexes })
@@ -65,10 +65,10 @@ impl MirrorRecord {
     }
 }
 
-/// The column list of each index `desc` names, ascending by packing, none twice.
+/// The column list of each index `desc` names, ascending, none twice.
 pub(crate) fn index_lists(desc: &RelDescriptor) -> Vec<PkColList> {
     let mut lists: Vec<PkColList> = desc.indexes.iter().map(|ix| ix.cols).collect();
-    lists.sort_unstable_by_key(|cols| cols.pack());
+    lists.sort_unstable();
     lists.dedup();
     lists
 }

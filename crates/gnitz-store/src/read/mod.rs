@@ -24,6 +24,7 @@ mod scan_spec;
 mod store_io;
 
 pub use key_spans::KeySpans;
+pub use store_io::Probe;
 
 use crate::relation::RelationRegistry;
 use gnitz_wire::PkKeys;
