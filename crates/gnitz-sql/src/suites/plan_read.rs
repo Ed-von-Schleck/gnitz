@@ -254,7 +254,7 @@ fn explain_names_every_decision() {
                 "order/limit: client sort",
             ],
         ),
-        // The per-worker cut is OFFSET+LIMIT deep because the client windows.
+        // The per-worker cut is OFFSET+LIMIT deep because the client cuts the exact slice.
         (
             "SELECT v FROM t ORDER BY v LIMIT 10 OFFSET 2",
             [
@@ -262,7 +262,7 @@ fn explain_names_every_decision() {
                 "access: full scan",
                 "predicate: none",
                 "projection: 1 column",
-                "order/limit: server top-12, client sort, client window",
+                "order/limit: server top-12, client sort, client slice",
             ],
         ),
         (
@@ -272,7 +272,7 @@ fn explain_names_every_decision() {
                 "access: full scan",
                 "predicate: none",
                 "projection: 1 column",
-                "order/limit: server early-stop 10, client window",
+                "order/limit: server early-stop 10, client slice",
             ],
         ),
         // `LIMIT 0` is answered from the reply schema; the plan still describes
@@ -336,7 +336,7 @@ fn explain_names_every_decision() {
                 "access: full scan",
                 "predicate: none",
                 "fold: group by (v): COUNT(*); HAVING applied client-side",
-                "order/limit: client sort, client window",
+                "order/limit: client sort, client slice",
             ],
         ),
         (
@@ -484,7 +484,7 @@ fn a_cut_ordered_by_the_key_stops_each_worker_early() {
         let lines = explain(&cat, sql);
         assert_eq!(
             lines[4],
-            format!("order/limit: server {cut}, client sort, client window"),
+            format!("order/limit: server {cut}, client sort, client slice"),
             "`{sql}`"
         );
     }
@@ -1095,7 +1095,7 @@ fn a_from_less_select_plans_a_constant_row() {
             "access: none",
             "predicate: none",
             "projection: 1 column",
-            "order/limit: client window",
+            "order/limit: client slice",
         ]
     );
     for (sql, msg) in [

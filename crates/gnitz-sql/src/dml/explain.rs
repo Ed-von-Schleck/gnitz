@@ -41,10 +41,7 @@ pub(crate) fn explain_lines(plan: &ReadPlan, local: bool) -> Vec<String> {
             let SinkKind::Fold(agg) = &read.spec.sink.kind else {
                 unreachable!("a fold read ships a fold sink")
             };
-            (
-                read,
-                fold_line(agg, reduce_schema, finish.having.is_some(), *is_distinct),
-            )
+            (read, fold_line(agg, reduce_schema, finish.has_having(), *is_distinct))
         }
     };
     let predicate = match (read.spec.predicate.is_empty(), local) {
@@ -67,7 +64,7 @@ fn order_limit_line(plan: &ReadPlan, local: bool) -> String {
         return "order/limit: no request (LIMIT 0)".to_string();
     }
     let mut facts = Vec::new();
-    // The per-worker cut is OFFSET+LIMIT deep, because the client windows. A cut
+    // The per-worker cut is OFFSET+LIMIT deep, because the client cuts the exact slice. A cut
     // shipping no ORDER BY keys stops the worker at its first rows.
     if let ReadCase::Rows { read, .. } = &plan.case {
         if let SinkKind::Rows { cut: Some(RowsCut { k, order }) } = &read.spec.sink.kind {
@@ -82,8 +79,8 @@ fn order_limit_line(plan: &ReadPlan, local: bool) -> String {
     if !plan.order.is_empty() {
         facts.push("client sort".to_string());
     }
-    if plan.window.cuts() {
-        facts.push("client window".to_string());
+    if plan.slice.cuts() {
+        facts.push("client slice".to_string());
     }
     if facts.is_empty() {
         "order/limit: none".to_string()

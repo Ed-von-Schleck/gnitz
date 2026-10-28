@@ -23,14 +23,14 @@ fn keyed(rows: usize, tc: TypeCode, write: impl Fn(&mut BatchAppender<'_>, u64))
 /// second key, and the key in and against input order.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn order_window_bench() {
+fn order_slice_bench() {
     const ROWS: usize = 262_144;
     let counter = gnitz_foundation::perf::Counter::instructions();
     let key = |col, desc| OrderKey { col, desc, nulls_first: false };
     let (by_v, by_id, by_id_desc) = ([key(1, false)], [key(0, false)], [key(0, true)]);
     let by_v_id_desc = [key(1, false), key(0, true)];
-    let uncut = Window { offset: 0, limit: None };
-    let top10 = Window { offset: 0, limit: Some(10) };
+    let uncut = Slice { offset: 0, limit: None };
+    let top10 = Slice { offset: 0, limit: Some(10) };
     let ints = |card: u64| {
         keyed(ROWS, TypeCode::I64, move |app, r| {
             app.i64_val(if card == 0 { r as i64 } else { (r % card) as i64 });
@@ -51,7 +51,7 @@ fn order_window_bench() {
             app.u128_val((r >> 1) as u128);
         })
     };
-    for (name, (sch, b), order, window) in [
+    for (name, (sch, b), order, slice) in [
         ("distinct I64, uncut", ints(0), &by_v[..], uncut),
         ("16 values, uncut", ints(16), &by_v[..], uncut),
         ("1024 values, uncut", ints(1024), &by_v[..], uncut),
@@ -66,11 +66,11 @@ fn order_window_bench() {
         ("16 values, LIMIT 10", ints(16), &by_v[..], top10),
         ("pk, LIMIT 10", ints(0), &by_id[..], top10),
     ] {
-        let (out, sort) = counter.measure(|| order_and_window(&sch, b, order, window));
-        assert_eq!(out.len(), window.limit.unwrap_or(ROWS), "{name}");
+        let (out, sort) = counter.measure(|| order_and_slice(&sch, b, order, slice));
+        assert_eq!(out.len(), slice.limit.unwrap_or(ROWS), "{name}");
         std::hint::black_box(out);
         println!(
-            "order_window_bench {name:<30} {:7.1} instr/row",
+            "order_slice_bench {name:<30} {:7.1} instr/row",
             sort as f64 / ROWS as f64
         );
     }

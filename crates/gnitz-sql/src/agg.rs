@@ -3,7 +3,6 @@
 
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
-use gnitz_core::Schema;
 use gnitz_wire::AggFunc as WireAggFunc;
 use gnitz_wire::{ColType, ColumnDef, TypeCode};
 
@@ -106,13 +105,6 @@ pub(crate) fn agg_col_def(op: WireAggFunc, src: Option<&ColumnDef>, ungrouped: b
 /// column, so `SELECT *` shows the grouping values and aggregates, not the hash.
 pub(crate) fn group_pk_def() -> ColumnDef {
     ColumnDef::new("_group_pk", TypeCode::U128, false).hidden()
-}
-
-/// The fold's partial layout with no group columns and no aggregates: the one
-/// hidden `_group_pk`. A FROM-less SELECT finalizes its constant row over it,
-/// through the same `FoldFinish` a global aggregate takes.
-pub(crate) fn ground_partial_schema() -> Schema {
-    Schema::from_parts(vec![group_pk_def()], &[0]).expect("one hidden U128 key is a valid schema")
 }
 
 /// An aggregate's SELECT/HAVING value from its raw value and count ([`agg_ops`]).

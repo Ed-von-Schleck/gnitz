@@ -4,8 +4,7 @@
 //! or, for aggregate / DISTINCT shapes, through the **fold sink** (a per-worker
 //! hash-fold + client finishing) — except a DISTINCT over rows already a set,
 //! which reads as rows. A FROM-less SELECT reads nothing: its one
-//! constant row is the fold sink's client finish over the global ground row,
-//! computed at plan time.
+//! constant row is a projection over the global ground row, computed at plan time.
 //!
 //! A query that *derives* a new relation — a JOIN, a set operation, an EXISTS/IN
 //! or scalar subquery, a derived table — has no single-relation sink and is
@@ -22,13 +21,14 @@
 //! shape without reaching a server; [`execute_select`] runs the resulting plan and
 //! `dml::explain` formats the same plan instead of dispatching it.
 
-use crate::agg::ground_partial_schema;
+use crate::agg::group_pk_def;
 use crate::ast_util::{body_is_grouped, classify_from, extract_table_ref, select_is_distinct, FromShape};
 use crate::bind::Catalog;
 use crate::dml::plan::{bound_and_predicate, walks_in_pk_order};
 use crate::error::{derivation, reject_if, GnitzSqlError};
 use crate::exec::agg_finish::FoldFinish;
-use crate::exec::order::{order_and_window, Window};
+use crate::exec::client_map::ClientMap;
+use crate::exec::order::{order_and_slice, Slice};
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::hir::{bind_adhoc_read, AdhocRead, AdhocShape, FoldPieces, RowsReply};
 use crate::ir::BoundExpr;
@@ -54,7 +54,7 @@ pub(crate) struct ReadPlan {
     /// ORDER BY over the finished result's columns; empty for a constant row, which one row
     /// sorts to itself.
     pub(super) order: Vec<gnitz_wire::OrderKey>,
-    pub(super) window: Window,
+    pub(super) slice: Slice,
 }
 
 pub(super) enum ReadCase {
@@ -91,7 +91,7 @@ impl ReadPlan {
     pub(crate) fn reply_schema(&self) -> &Schema {
         match &self.case {
             ReadCase::Rows { reply_schema, .. } => reply_schema,
-            ReadCase::Fold { finish, .. } => &finish.partial_schema,
+            ReadCase::Fold { finish, .. } => finish.partial_schema(),
             ReadCase::Constant { schema, .. } => schema,
         }
     }
@@ -106,8 +106,8 @@ impl ReadPlan {
     /// nothing ordered, cut or folded, since a delta of any of those is not
     /// that read of a delta.
     pub(crate) fn into_subscription(self) -> Result<gnitz_core::Subscription, GnitzSqlError> {
-        // Only a LIMIT cuts the sink, so no window is no cut.
-        let plain = self.order.is_empty() && !self.window.cuts();
+        // The sink ships a cut for a LIMIT only; the slice counts an OFFSET too.
+        let plain = self.order.is_empty() && !self.slice.cuts();
         match self.case {
             ReadCase::Rows { read, reply_schema, copied } if plain => {
                 // An index survives where every column it lists does, under the
@@ -145,7 +145,7 @@ impl ReadPlan {
     /// Whether the result is `LIMIT 0`'s: answered from the schema alone, with
     /// no request issued.
     pub(crate) fn answers_from_schema(&self) -> bool {
-        self.window.limit == Some(0)
+        self.slice.limit == Some(0)
     }
 
     /// The schema the finished result is built under.
@@ -216,7 +216,7 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
         // Not the derivation template: CREATE VIEW refuses these bodies too.
         body => as_plain_select(body, "direct SELECT")?,
     };
-    let window = Window {
+    let slice = Slice {
         limit: extract_limit(query)?,
         offset: extract_offset(query)?,
     };
@@ -255,7 +255,7 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
             return Ok(ReadPlan {
                 case: ReadCase::Constant { schema, row },
                 order: Vec::new(),
-                window,
+                slice,
             });
         }
     };
@@ -303,11 +303,11 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
                 copied,
             } = rows.reply(&keys, in_pk_order)?;
             // OFFSET+LIMIT logical rows; an OFFSET with no LIMIT cuts nothing.
-            let cut = window
+            let cut = slice
                 .end()
                 .and_then(|end| NonZeroU64::new(end as u64))
                 // A worker walking in the order asked for meets its smallest rows
-                // first, so it stops at the window instead of ranking every row.
+                // first, so it stops at the slice's end instead of ranking every row.
                 .map(|k| RowsCut { k, order: sink_order });
             let sink = ReadSink {
                 map: program.map(|p| compute_map(p, &reply_schema)),
@@ -316,22 +316,23 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
             (ReadCase::Rows { read: read(sink), reply_schema, copied }, order)
         }
     };
-    Ok(ReadPlan { case, order, window })
+    Ok(ReadPlan { case, order, slice })
 }
 
 /// A FROM-less SELECT's one row, finished at plan time: each item is a constant
-/// expression, compiled as a fold's finalize item over the ground row. A hidden
-/// item is an ORDER BY key, which is compiled and dropped.
+/// expression, projected over the ground row. A hidden item is an ORDER BY key,
+/// which is compiled and dropped.
 fn plan_constant(items: Vec<(BoundExpr, gnitz_wire::ColumnDef)>) -> Result<(Arc<Schema>, ZSetBatch), GnitzSqlError> {
-    let ground = ground_partial_schema();
+    // The global ground row: one hidden `_group_pk`, keyed by the global group key.
+    let ground = Schema::from_parts(vec![group_pk_def()], &[0]).expect("one hidden U128 key is a valid schema");
     let (keys, items): (Vec<_>, Vec<_>) = items.into_iter().partition(|(_, def)| def.is_hidden);
     for (key, _) in &keys {
         compile_scalar_evaluator(key, &ground)?;
     }
-    let mut finish = FoldFinish::new(Arc::new(ground), &[], &[], items)?;
-    let mut ground_row = ZSetBatch::with_capacity(&finish.partial_schema, 1);
+    let mut map = ClientMap::projecting(items, &ground)?;
+    let mut ground_row = ZSetBatch::with_capacity(&ground, 1);
     BatchAppender::new(&mut ground_row).add_row(gnitz_wire::global_group_key(), 1);
-    Ok((Arc::clone(finish.out_schema()), finish.finish(ground_row)))
+    Ok((Arc::clone(map.out_schema()), map.apply(ground_row)))
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +350,7 @@ pub(crate) async fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> 
             lsn: None,
         }));
     }
-    let ReadPlan { case, order, window } = plan;
+    let ReadPlan { case, order, slice } = plan;
     let (schema, batch, lsn) = match case {
         ReadCase::Constant { schema, row } => (schema, row, None),
         ReadCase::Rows { read, reply_schema, .. } => {
@@ -362,7 +363,7 @@ pub(crate) async fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> 
             // A wire error (the per-worker group cap included) is hard: the fold is
             // mid-flight on the workers and cannot fall back.
             let partial = client
-                .scan_spec_local_first(&*read.desc, read.spec, &finish.partial_schema)
+                .scan_spec_local_first(&*read.desc, read.spec, finish.partial_schema())
                 .await?;
             (
                 Arc::clone(finish.out_schema()),
@@ -371,6 +372,6 @@ pub(crate) async fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> 
             )
         }
     };
-    let batch = order_and_window(&schema, batch, &order, window);
+    let batch = order_and_slice(&schema, batch, &order, slice);
     Ok(SqlResult::Rows(ScanReply { schema, batch, lsn }))
 }

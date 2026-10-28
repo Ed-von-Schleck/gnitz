@@ -1,5 +1,4 @@
 use super::*;
-use crate::project::reply_program;
 use crate::test_support::Cell::{Int, Null, Str};
 use crate::test_support::{col, keyed_batch, ncol, rows_of, schema};
 use gnitz_wire::{ColumnDef, TypeCode};
@@ -31,8 +30,7 @@ pub(super) fn map_of(src: &Schema, sql: &[&str]) -> ClientMap {
             (bound, def)
         })
         .collect();
-    let (out, program) = reply_program(payload, src).unwrap();
-    ClientMap::new(Some(program), src, Arc::new(out)).unwrap()
+    ClientMap::projecting(payload, src).unwrap()
 }
 
 /// Every row keeps its key and weight. A PK copy is the key's native value — the OPK sign

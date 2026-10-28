@@ -1,19 +1,19 @@
 //! The ad-hoc SELECT finish: ORDER BY / OFFSET / LIMIT applied as one client-side
-//! pass over a fetched result (base tables and views).
+//! pass over the result the client holds.
 
 use gnitz_core::{Schema, ZSetBatch};
 use gnitz_expr::{order_locators, RowRanking, WeightSlots};
 
-/// The client-side cut a sink applies to its own result. `limit: None` is
-/// unbounded.
+/// The OFFSET / LIMIT slice of a result, cut exactly by the client after any worker's
+/// superset cut. `limit: None` is unbounded.
 #[derive(Clone, Copy)]
-pub(crate) struct Window {
+pub(crate) struct Slice {
     pub(crate) offset: usize,
     pub(crate) limit: Option<usize>,
 }
 
-impl Window {
-    /// Whether this window skips or bounds anything.
+impl Slice {
+    /// Whether this slice skips or bounds anything.
     pub(crate) fn cuts(&self) -> bool {
         self.offset > 0 || self.limit.is_some()
     }
@@ -25,24 +25,24 @@ impl Window {
 }
 
 /// Sort `batch` by `order` — wire keys over `schema`, hidden appended keys included —
-/// and cut it to `window`, counting logical rows by weight.
-pub(crate) fn order_and_window(
+/// and cut it to `slice`, counting logical rows by weight.
+pub(crate) fn order_and_slice(
     schema: &Schema,
     batch: ZSetBatch,
     order: &[gnitz_wire::OrderKey],
-    window: Window,
+    slice: Slice,
 ) -> ZSetBatch {
-    let cut = window.cuts();
+    let cut = slice.cuts();
     if order.is_empty() && !cut {
         return batch;
     }
     debug_assert!(
         batch.weights.iter().all(|&w| w > 0),
-        "ordering sink: non-positive weight violates the bag invariant"
+        "client cut: non-positive weight violates the bag invariant"
     );
-    let end = window.end().unwrap_or(usize::MAX);
+    let end = slice.end().unwrap_or(usize::MAX);
     let rows: Vec<u32> = if order.is_empty() {
-        // Every entry holds at least one logical row, so the first `end` entries cover the window.
+        // Every entry holds at least one logical row, so the first `end` entries cover the slice.
         (0..batch.len().min(end) as u32).collect()
     } else {
         // A cut breaks ties by identity, so which tied rows it keeps is a function of the
@@ -56,8 +56,8 @@ pub(crate) fn order_and_window(
         return batch.gather(&rows);
     }
     let mut slots = WeightSlots {
-        skip: window.offset as u64,
-        keep: window.limit.map_or(u64::MAX, |l| l as u64),
+        skip: slice.offset as u64,
+        keep: slice.limit.map_or(u64::MAX, |l| l as u64),
     };
     let (mut kept, mut takes) = (Vec::new(), Vec::new());
     for &r in &rows {

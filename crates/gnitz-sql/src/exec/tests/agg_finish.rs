@@ -60,7 +60,7 @@ type Rows<'a> = &'a [(&'a [u128], &'a [Cell<'a>])];
 /// groups and finalize maps them. Each row is `(key, cells)` at weight 1.
 #[test]
 fn partials_finish_to_one_row_per_group() {
-    let (t, pk2, wide) = (
+    let (t, pk2, wide, nat) = (
         t(),
         table(
             2,
@@ -72,13 +72,46 @@ fn partials_finish_to_one_row_per_group() {
             vec![0, 1],
         ),
         wide(),
+        table(
+            4,
+            vec![
+                col("pk", TypeCode::U64),
+                col("n", TypeCode::I64),
+                ncol("x", TypeCode::I64),
+            ],
+            vec![0],
+        ),
     );
     let v0: &[u128] = &[global_group_key()];
     let global = "SELECT COUNT(*), SUM(x), SUM(f), MIN(sm), MAX(s), AVG(u) FROM t";
     // COUNT(*), then SUM(x), SUM(f) and AVG(u)'s sum each with its non-null count, MIN, MAX.
     let ground: &[Cell] = &[Int(0), Int(0), Int(0), F64(0.0), Int(0), Null, Null, Int(0), Int(0)];
     let neg = -1i32 as u128;
-    let cases: [(&str, &Arc<RelDescriptor>, Rows, Rows); 9] = [
+    let neg3 = -3i64 as u64 as u128;
+    let cases: [(&str, &Arc<RelDescriptor>, Rows, Rows); 11] = [
+        // A lone non-NULL group column is the partial's key, decoded back out by finalize.
+        (
+            "SELECT n, COUNT(*), SUM(x) FROM t GROUP BY n",
+            &nat,
+            &[
+                (&[neg3], &[Int(1), Int(4), Int(1)]),
+                (&[5], &[Int(2), Int(7), Int(2)]),
+                (&[neg3], &[Int(3), Int(-1), Int(3)]),
+            ],
+            &[(&[neg3], &[Int(-3), Int(4), Int(3)]), (&[5], &[Int(5), Int(2), Int(7)])],
+        ),
+        // An inline string against spilled ones.
+        (
+            "SELECT MAX(s) FROM t",
+            &t,
+            &[
+                (v0, &[Str(LONG_M)]),
+                (v0, &[Str("zz")]),
+                (v0, &[Null]),
+                (v0, &[Str("b")]),
+            ],
+            &[(v0, &[Str("zz")])],
+        ),
         (
             "SELECT g, COUNT(*) FROM t GROUP BY g",
             &t,
@@ -235,4 +268,29 @@ fn partials_finish_to_one_row_per_group() {
         assert_eq!(got.pks, want.pks, "{sql}");
         assert_eq!(rows_of(f.out_schema(), &got), rows_of(f.out_schema(), &want), "{sql}");
     }
+}
+
+/// A float extreme takes the total order's winner: -0.0 below 0.0, NaN above every number.
+#[test]
+fn float_extremes_follow_the_total_order() {
+    let mut f = plan("SELECT MIN(f), MAX(f) FROM t", &t());
+    let v0: &[u128] = &[global_group_key()];
+    let rows: [(&[u128], i64, &[Cell]); 4] = [
+        (v0, 1, &[F64(0.0), F64(-0.0)]),
+        (v0, 1, &[F64(-0.0), F64(0.0)]),
+        (v0, 1, &[F64(f64::NAN), F64(f64::NAN)]),
+        (v0, 1, &[Null, Null]),
+    ];
+    let got = f.finish(keyed_batch(f.partial_schema(), &rows));
+    let bits: Vec<_> = rows_of(f.out_schema(), &got)
+        .into_iter()
+        .map(|(cells, w)| {
+            let bits = cells.iter().map(|c| match c {
+                F64(v) => v.to_bits(),
+                other => panic!("not a float: {other:?}"),
+            });
+            (bits.collect::<Vec<_>>(), w)
+        })
+        .collect();
+    assert_eq!(bits, [(vec![(-0.0f64).to_bits(), f64::NAN.to_bits()], 1)]);
 }

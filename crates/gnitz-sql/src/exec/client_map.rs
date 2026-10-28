@@ -1,12 +1,16 @@
 //! A compiled projection run client-side over a batch: the finalize map of an ad-hoc
-//! fold, and an `INSERT … RETURNING` list over the rows it wrote.
+//! fold, a FROM-less SELECT's constant row, and an `INSERT … RETURNING` list over the
+//! rows it wrote.
 
 use std::sync::Arc;
 
 use gnitz_core::{PayloadColumn, Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, LogicalProgram, MapEval};
+use gnitz_wire::ColumnDef;
 
 use crate::error::GnitzSqlError;
+use crate::ir::BoundExpr;
+use crate::project::reply_program;
 
 /// A projection program resolved over a source schema, and the output schema it fills:
 /// the source's key, then what the program writes.
@@ -38,6 +42,12 @@ impl ClientMap {
             return Err(GnitzSqlError::Internal("a projection copies a promoted column".into()));
         }
         Ok(ClientMap { out_schema, ev })
+    }
+
+    /// The projection of `items` over `src`: `src`'s key, hidden, then one column per item.
+    pub(crate) fn projecting(items: Vec<(BoundExpr, ColumnDef)>, src: &Schema) -> Result<Self, GnitzSqlError> {
+        let (out_schema, program) = reply_program(items, src)?;
+        ClientMap::new(Some(program), src, Arc::new(out_schema))
     }
 
     pub(crate) fn out_schema(&self) -> &Arc<Schema> {

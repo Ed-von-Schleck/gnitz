@@ -12,7 +12,7 @@ const fn key(col: u16, desc: bool, nulls_first: bool) -> OrderKey {
 /// `ORDER BY v`.
 const BY_V: [OrderKey; 1] = [key(1, false, false)];
 
-const UNCUT: Window = Window { offset: 0, limit: None };
+const UNCUT: Slice = Slice { offset: 0, limit: None };
 
 /// `(id U64 pk, v I64 nullable, s STRING nullable)`.
 fn kv_schema() -> Schema {
@@ -39,8 +39,8 @@ fn kv(rows: &[(u128, Cell, Cell, i64)]) -> ZSetBatch {
 }
 
 /// The sort and cut of `b`, checked to be a well-formed batch.
-fn run(b: &ZSetBatch, order: &[OrderKey], window: Window) -> ZSetBatch {
-    let out = order_and_window(&kv_schema(), b.clone(), order, window);
+fn run(b: &ZSetBatch, order: &[OrderKey], slice: Slice) -> ZSetBatch {
+    let out = order_and_slice(&kv_schema(), b.clone(), order, slice);
     out.validate(&kv_schema()).unwrap();
     out
 }
@@ -60,16 +60,17 @@ fn orders_by_the_written_keys() {
         (3, Null, Str("a"), 1),
         (2, Int(10), Str("b"), 1),
     ]);
-    let cut = |offset, limit| Window { offset, limit: Some(limit) };
-    for (keys, window, want) in [
+    let cut = |offset, limit| Slice { offset, limit: Some(limit) };
+    for (keys, slice, want) in [
         (&[][..], UNCUT, &[1, 4, 3, 2][..]),
         (&[], cut(1, 2), &[4, 3]),
         (&BY_V, UNCUT, &[4, 2, 1, 3]),
         (&BY_V, cut(0, 4), &[2, 4, 1, 3]),
         (&[key(1, true, true), key(2, false, false)], UNCUT, &[3, 1, 4, 2]),
         (&[key(0, true, true)], UNCUT, &[4, 3, 2, 1]),
+        (&[key(1, true, true)], cut(0, 4), &[3, 1, 2, 4]),
     ] {
-        assert_eq!(ids(&run(&b, keys, window)), want, "{keys:?} {:?}", window.limit);
+        assert_eq!(ids(&run(&b, keys, slice)), want, "{keys:?} {:?}", slice.limit);
     }
 }
 
@@ -86,7 +87,7 @@ fn bag(out: &ZSetBatch) -> Vec<(u64, i64)> {
     bag
 }
 
-/// A window clips the first and the last entry it reaches and no entry between them. Id 1
+/// A slice clips the first and the last entry it reaches and no entry between them. Id 1
 /// arrives as two entries, which the partial selection may split.
 #[test]
 fn offset_and_limit_count_logical_rows() {
@@ -111,7 +112,7 @@ fn offset_and_limit_count_logical_rows() {
         // Unsorted, the cut walks input order.
         (&[], 2, Some(3), vec![(3, 1), (1, 1), (2, 1)]),
     ] {
-        let out = run(&b, order, Window { offset, limit });
+        let out = run(&b, order, Slice { offset, limit });
         assert_eq!(bag(&out), want, "{order:?} OFFSET {offset} LIMIT {limit:?}");
     }
 }
@@ -123,5 +124,5 @@ fn cut_names_a_ghost_it_would_discard_unseen() {
     // n = 3, k = 2 — the ghost sorts last, so the truncation drops it and the
     // multiplicity walk never reaches it. Only the whole-batch check sees it.
     let b = kv(&[(1, Int(10), Null, 1), (2, Int(20), Null, 1), (3, Int(30), Null, 0)]);
-    let _ = order_and_window(&kv_schema(), b, &BY_V, Window { offset: 0, limit: Some(2) });
+    let _ = order_and_slice(&kv_schema(), b, &BY_V, Slice { offset: 0, limit: Some(2) });
 }

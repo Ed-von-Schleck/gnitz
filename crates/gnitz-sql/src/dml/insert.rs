@@ -17,6 +17,7 @@ use crate::bind::{require_column, Catalog};
 use crate::dml::mutate::{apply_set, bind_set_list, SetClause, SetCol};
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::exec::client_map::ClientMap;
+use crate::exec::keys::{firsts, Firsts};
 use crate::hir::RowsReply;
 use crate::ir::BExpr;
 use crate::rules::{require_class, ClassWant};
@@ -363,8 +364,8 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<InsertPl
 /// `rows` down to each key's first row, the one an ON CONFLICT resolves; under
 /// DO UPDATE (`refuse_repeat`) a second row for a key is refused instead.
 fn first_per_key(mut rows: ZSetBatch, refuse_repeat: bool) -> Result<ZSetBatch, GnitzSqlError> {
-    let (_, keep) = crate::exec::agg_finish::firsts(&rows);
-    if refuse_repeat && keep != [(0, rows.len())] {
+    let Firsts { absorbed, keep } = firsts(&rows.pks);
+    if refuse_repeat && !absorbed.is_empty() {
         return Err(GnitzSqlError::Rejected(
             "ON CONFLICT DO UPDATE cannot affect row a second time \
              (duplicate PK in the same batch)"
