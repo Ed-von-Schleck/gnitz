@@ -60,7 +60,7 @@ impl SinkPlan {
             .as_ref()
             .map(|m| MapPlan::from_compute_map(src_schema, m))
             .transpose()?;
-        let sink_in = map.as_ref().map_or(*src_schema, |m| *m.out_schema());
+        let sink_in = map.as_ref().map_or(*src_schema, |m| *m.output_schema());
         let kind = match &sink.kind {
             SinkKind::Fold(agg) => Kind::Fold {
                 fold: Box::new(AdhocFold::new(&sink_in, agg, group_cap)?),

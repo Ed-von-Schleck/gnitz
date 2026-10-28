@@ -67,9 +67,9 @@ fn the_output_lays_out_the_key_then_both_payloads() {
         ),
     ];
     for (kind, left, right, pk, types) in cases {
-        let joined = plan(kind, false, &left, &right).out_schema;
+        let joined = plan(kind, false, &left, &right).output_schema;
         assert_eq!(
-            plan(kind, true, &right, &left).out_schema,
+            plan(kind, true, &right, &left).output_schema,
             joined,
             "{kind:?}: the delta's port"
         );
@@ -263,7 +263,7 @@ fn assert_matches_reference(
         let out = op_join_delta_trace(delta, &mut |f, l| trace.cursor_within(f, l), &p);
         let at = format!("kind={kind:?} delta_is_right={delta_is_right}, {runs} runs");
         assert_eq!(out.len(), want_rows, "{at}: row count");
-        assert_eq!(zset_of(&out, &p.out_schema), want, "{at}: z-set");
+        assert_eq!(zset_of(&out, &p.output_schema), want, "{at}: z-set");
     }
 }
 
@@ -373,7 +373,7 @@ fn a_join_over_its_traces_source_is_the_join_over_the_trace() {
     for &(key, keep) in cases {
         let mut map = rekey_plan(&source_schema, key, keep, NullKeys::Drop);
         let trace = map.evaluate_map_batch(&source).into_consolidated();
-        let trace_schema = *map.out_schema();
+        let trace_schema = *map.output_schema();
 
         // A delta on the same key: a payload of its own, keys present and absent.
         let delta_schema = SchemaDescriptor::new(
@@ -411,13 +411,13 @@ fn a_join_over_its_traces_source_is_the_join_over_the_trace() {
                 &trace,
             );
             let over = JoinPlan::over_source(delta_is_right, &delta_schema, &source_schema, &map).unwrap();
-            assert!(over.out_schema.same_layout(&stored.out_schema));
+            assert!(over.output_schema.same_layout(&stored.output_schema));
             assert!(!want.is_empty(), "premise: key {key:?} matches something");
             for runs in [1, 3] {
                 let source = TestTrace::dealt(&source, runs);
                 let got = op_join_delta_trace(&delta, &mut |f, l| source.cursor_within(f, l), &over);
                 assert_eq!(
-                    zset_of(&got, &over.out_schema),
+                    zset_of(&got, &over.output_schema),
                     want,
                     "key {key:?} keep {keep:?} delta_is_right={delta_is_right} runs={runs}"
                 );

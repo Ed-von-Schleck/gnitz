@@ -1,5 +1,6 @@
-//! `ReduceShape`: what a reduce's rows look like, shared by the circuit reduce,
-//! the ad-hoc fold and the window.
+//! `ReduceShape`: what a reduce's rows look like, shared by the circuit reduce
+//! and the ad-hoc fold; and `resolve_aggs`, which the window lays its
+//! aggregates out with too.
 use std::rc::Rc;
 
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};

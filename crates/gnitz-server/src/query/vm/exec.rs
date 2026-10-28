@@ -361,17 +361,17 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
                 let delta = &batches[in_reg.at()];
                 // Ingested before the index is opened, so a prefix seek over
                 // it sees the rows this epoch wrote.
-                if let Some((idx, entries)) = index.zip(plan.index_batch(delta)) {
+                if let Some((idx, entries)) = index.zip(plan.index_entries(delta)) {
                     let res = stores.own.ingest(idx, entries);
-                    res.map_err(|e| ingest_err("avi", idx, e))?;
+                    res.map_err(|e| ingest_err("value index", idx, e))?;
                 }
 
-                gnitz_debug!("vm: REDUCE in_count={} avi={}", delta.len(), index.is_some());
+                gnitz_debug!("vm: REDUCE in_count={} value_index={}", delta.len(), index.is_some());
 
                 let mut open_out = stores.open(stores.trace(*out_trace)?);
                 let mut open_index = index.map(|idx| stores.open(Trace::Child(idx)));
-                let history = open_index.as_mut().map(|open| open as stream::OpenAt<'_>);
-                stream::op_reduce(delta, &mut open_out, history, plan)
+                let index_at = open_index.as_mut().map(|open| open as stream::OpenAt<'_>);
+                stream::op_reduce(delta, &mut open_out, index_at, plan)
             }
 
             Op::Ordered { index, plan } => {

@@ -286,7 +286,7 @@ fn a_two_term_join_joins_each_delta_with_the_other_sides_past() {
     ];
     for kind in [JoinKind::Equi, JoinKind::Cross] {
         let plan = |right| stream::JoinPlan::from_wire(kind, right, &schema, &schema).unwrap();
-        let out_schema = *plan(false).out_schema();
+        let out_schema = *plan(false).output_schema();
         let mut p = ProgramBuilder::default();
         let (trace_a, trace_b) = (p.declare("ta".into(), schema), p.declare("tb".into(), schema));
         let (a, b) = (p.seed(schema), p.seed(schema));
@@ -340,7 +340,7 @@ fn a_join_over_its_source_reads_it_up_to_its_cut() {
     };
     let rekey = MapPlan::from_wire(&schema, &rekey).unwrap();
     let plan = stream::JoinPlan::over_source(false, &schema, &schema, &rekey).unwrap();
-    let out_schema = *plan.out_schema();
+    let out_schema = *plan.output_schema();
     let mut p = ProgramBuilder::default();
     let a = p.seed(schema);
     let out = p.push(

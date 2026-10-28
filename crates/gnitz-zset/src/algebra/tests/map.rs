@@ -63,7 +63,7 @@ fn a_computed_map_copies_and_computes_every_row_at_its_weight() {
         ],
     );
     let want = make_int_batch(
-        plan.out_schema(),
+        plan.output_schema(),
         &[
             (1, 3, &[Some(20), Some(10), Some(30)]),
             (2, -2, &[Some(40), None, None]),
@@ -73,7 +73,7 @@ fn a_computed_map_copies_and_computes_every_row_at_its_weight() {
     assert_eq!(weighted_rows(&plan.evaluate_map_batch(&input)), weighted_rows(&want));
 
     let empty = plan.evaluate_map_batch(&Batch::empty_with_schema(&in_schema));
-    assert_eq!((empty.len(), empty.schema()), (0, plan.out_schema()));
+    assert_eq!((empty.len(), empty.schema()), (0, plan.output_schema()));
 }
 
 /// A projection of string columns, reordered, moves each row's content; one
@@ -96,7 +96,7 @@ fn a_string_projection_moves_content_and_leaves_a_dead_heap() {
     for cols in [&[2, 1][..], &[1]] {
         let mut plan = project(&in_schema, cols);
         let out = plan.evaluate_map_batch(&batch);
-        let mut want = BatchBuilder::new(plan.out_schema());
+        let mut want = BatchBuilder::new(plan.output_schema());
         for (pk, strs) in rows {
             want.begin_row(pk, 1);
             cols.iter().for_each(|&c| want.put_string(strs[c as usize - 1]));
@@ -236,7 +236,7 @@ fn appended_runs_map_as_their_rows_alone() {
             let ranges: Vec<(usize, usize)> = (0..N).step_by(run + 3).map(|s| (s, (s + run).min(N))).collect();
             let rows: Vec<u32> = ranges.iter().flat_map(|&(s, e)| s as u32..e as u32).collect();
             let want = weighted_rows(&plan.evaluate_map_batch(&src.ascending_subset(&rows)));
-            let mut out = Batch::empty_with_schema(plan.out_schema());
+            let mut out = Batch::empty_with_schema(plan.output_schema());
             plan.append_map_ranges(&src, &mut out, &[(0, N)]);
             plan.append_map_ranges(&src, &mut out, &ranges);
             let tail: Vec<u32> = (N as u32..out.len() as u32).collect();
@@ -290,7 +290,7 @@ fn a_string_emit_composes_with_a_copy_of_its_source() {
     let mut plan = compute(&in_schema, prog, &[(TypeCode::String, true); 2]);
     let out = plan.evaluate_map_batch(&batch);
 
-    let mut want = BatchBuilder::new(plan.out_schema());
+    let mut want = BatchBuilder::new(plan.output_schema());
     for (pk, cells) in [
         (1u128, Some((long, b"a-long-value-past-twelve-suffix".as_slice()))),
         (2, Some((b"short", b"short-suffix"))),
@@ -543,7 +543,7 @@ fn a_map_is_an_identity_only_under_the_inherited_pk() {
     ] {
         assert_eq!(plan.is_identity(), identity, "{what}");
         if what.ends_with("same layout") {
-            assert_eq!(plan.out_schema(), &in_schema, "{what}");
+            assert_eq!(plan.output_schema(), &in_schema, "{what}");
         }
     }
 }
@@ -582,7 +582,7 @@ fn a_drop_reindex_is_filter_then_reindex_and_keep_keeps_null_keys() {
             let run = |nulls| rekey_plan(&s, &[1], &keep, nulls);
             let mut drop = run(NullKeys::Drop);
             let dropped = drop.evaluate_map_batch(&batch);
-            assert_eq!(dropped.schema(), drop.out_schema());
+            assert_eq!(dropped.schema(), drop.output_schema());
             assert_eq!(
                 weighted_rows(&dropped),
                 weighted_rows(&run(NullKeys::Keep).evaluate_map_batch(&filtered)),

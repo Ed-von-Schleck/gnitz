@@ -157,7 +157,7 @@ fn map_ranges_bench() {
     for (name, mut plan, src, runs) in survivors {
         for &run in runs {
             let ranges: Vec<(usize, usize)> = (0..N).step_by(run + GAP).map(|s| (s, (s + run).min(N))).collect();
-            let mut keeper = Batch::empty_with_schema(plan.out_schema());
+            let mut keeper = Batch::empty_with_schema(plan.output_schema());
             plan.append_map_ranges(src, &mut keeper, &ranges);
             keeper.clear();
             let ((), instructions) = counter.measure(|| plan.append_map_ranges(black_box(src), &mut keeper, &ranges));

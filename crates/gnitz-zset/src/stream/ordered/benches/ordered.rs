@@ -2,8 +2,8 @@ use super::tests::Harness;
 use super::OrderIndex;
 use super::OrderedPlan;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::mix;
+use crate::schema::SchemaColumn;
+use crate::test_support::{mix, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{OrderKey, TypeCode};
 
@@ -15,7 +15,7 @@ const N: u64 = 1 << 16;
 /// and the retraction of the first.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn order_index_batch_bench() {
+fn order_index_entries_bench() {
     let counter = Counter::instructions();
     const INT: SchemaColumn = SchemaColumn::new(TypeCode::I64, false);
     const INT_NULL: SchemaColumn = SchemaColumn::new(TypeCode::I64, true);
@@ -121,9 +121,7 @@ fn order_index_batch_bench() {
         ),
     ];
     for (label, tail, group_cols, order, leads, groups) in cases {
-        let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
-        cols.extend_from_slice(tail);
-        let schema = SchemaDescriptor::new(&cols, &[0]);
+        let schema = u64_pk_schema(tail);
         let make = |salt: u64| -> Batch {
             let mut b = BatchBuilder::new(&schema);
             for i in salt * N..(salt + 1) * N {
@@ -151,17 +149,16 @@ fn order_index_batch_bench() {
             .map(|&col| OrderKey { col, desc: false, nulls_first: false })
             .collect();
         let (index, _) = OrderIndex::new(&schema, group_cols, &keys, []).unwrap();
-        let (entries, build) = counter.measure(|| std::hint::black_box(index.batch(&d1)));
+        let (entries, build) = counter.measure(|| std::hint::black_box(index.entries(&d1)));
         assert_eq!(entries.len(), d1.len(), "one entry per delta row");
         let bytes = entries.total_bytes() as f64 / N as f64;
         let pk = index.schema.pk_stride();
         let (folded, fold) = counter.measure(|| std::hint::black_box(entries.to_consolidated()));
         assert_eq!(folded.len(), d1.len(), "no two entries are one element");
         let mut h = Harness::new(OrderedPlan::top_n(&schema, group_cols, &keys, 10, 0).unwrap());
-        let retraction = d1.clone().negated().into_consolidated();
-        let [e1, e2, e3] = [&d1, &d2, &retraction].map(|d| h.measure(&counter, d) as f64 / N as f64);
+        let [e1, e2, e3] = h.bulk_epochs(&counter, &d1, &d2);
         println!(
-            "order_index_batch_bench {label:<33} index {bytes:6.1} B/row (pk {pk:2}), build {:6.1}, fold {:7.1}; \
+            "order_index_entries_bench {label:<33} index {bytes:6.1} B/row (pk {pk:2}), build {:6.1}, fold {:7.1}; \
              top-10 empty {e1:7.1}, populated {e2:7.1}, retraction {e3:7.1} instr/row",
             build as f64 / N as f64,
             fold as f64 / N as f64,

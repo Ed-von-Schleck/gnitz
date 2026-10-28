@@ -1,7 +1,8 @@
-//! The order index: every input row of an operator that reads its groups in
-//! ORDER BY order — the top-N and the window — keyed so that a prefix walk of
-//! one group visits its rows in that order. It shares its group-key packer and
-//! its order images with the reduce's aggregate-value index.
+//! The operators that read their groups in ORDER BY order — the top-N (`topn`)
+//! and the window (`window`) — and the order index they are maintained through:
+//! every input row, keyed so that a prefix walk of one group visits its rows in
+//! that order. It shares its group-key packer and its order images with the
+//! reduce's aggregate-value index.
 //!
 //! ```text
 //! PK      = group key ‖ rank_0 ‖ image_0, a string's cut to its slot
@@ -24,8 +25,6 @@ use crate::repr::{pk_group_end, Batch, MemBatch, ReadCursor};
 use crate::schema::key::compare_pk_ordering;
 use crate::schema::payload_order::{Generic, PayloadOrder};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
-use crate::stream::topn::{op_topn, TopN};
-use crate::stream::window::{op_window, Window};
 use crate::stream::OpenAt;
 use gnitz_wire::RowSource;
 use gnitz_wire::{OrderKey, TypeCode};
@@ -33,7 +32,12 @@ use gnitz_wire::{OrderKey, TypeCode};
 use crate::algebra::{
     copied_string_slots, copy_column, image_slot_col, rebase_copied_strings, ImageCol, RowWindow, IMAGE_COL,
 };
-use gnitz_expr::{ColCopy, ColumnLocator, NullPerm};
+use gnitz_expr::{ColCopy, ColumnLocator, NullPerm, WeightSlots};
+
+use window::{Running, Window};
+
+mod topn;
+mod window;
 
 /// The most rows an epoch's output batch reserves up front; it grows past that.
 const MAX_OUT_CAP_HINT: usize = 1 << 16;
@@ -105,16 +109,17 @@ impl OrderSpec {
 /// The baked plan of an operator maintained through an order index of every
 /// input row: a top-N or a window.
 pub struct OrderedPlan {
-    pub(in crate::stream) index: OrderIndex,
+    index: OrderIndex,
     /// The group key region a reduce over the same group set would have, every
     /// input column not in that region, in input schema order, then the columns
     /// the operator adds.
-    pub(in crate::stream) output_schema: SchemaDescriptor,
-    pub(in crate::stream) kind: OrderedKind,
+    output_schema: SchemaDescriptor,
+    kind: OrderedKind,
 }
 
-pub(in crate::stream) enum OrderedKind {
-    TopN(TopN),
+enum OrderedKind {
+    /// The slots each touched group starts from; `keep ≥ 1`.
+    TopN(WeightSlots),
     Window(Window),
 }
 
@@ -129,17 +134,74 @@ impl OrderedPlan {
         &self.output_schema
     }
 
-    /// One epoch over `delta`. `history` opens the index, read without the
+    /// One epoch over `delta`. `index` opens the order index, read without the
     /// epoch's entries.
-    pub fn epoch(&self, delta: &Batch, history: OpenAt<'_>) -> OrderedEpoch {
+    pub fn epoch(&self, delta: &Batch, index: OpenAt<'_>) -> OrderedEpoch {
         match &self.kind {
-            OrderedKind::TopN(top) => op_topn(delta, history, self, top),
-            OrderedKind::Window(window) => op_window(delta, history, self, window),
+            OrderedKind::TopN(slots) => {
+                self.walk_groups(delta, index, |out, out_pk, walk| topn::group(*slots, out, out_pk, walk))
+            }
+            OrderedKind::Window(window) => {
+                let mut running = Running::new(window);
+                self.walk_groups(delta, index, |out, out_pk, walk| running.group(out, out_pk, walk))
+            }
         }
+    }
+
+    /// One epoch over `delta`: `per_group` once per group the delta touches, in
+    /// group order, handed δ_out, the group's output PK and its walk. `open`
+    /// opens the index, read without the epoch's entries.
+    #[inline]
+    fn walk_groups(
+        &self,
+        delta: &Batch,
+        open: OpenAt<'_>,
+        mut per_group: impl FnMut(&mut Batch, &[u8], &mut Walk<'_>),
+    ) -> OrderedEpoch {
+        let index = &self.index;
+        let mut folded = index.entries(delta);
+        debug_assert_eq!(folded.len(), delta.len());
+        // Entry `i` is delta row `i`'s, unless a fold moved the entries: then
+        // `moved` records every entry's.
+        let mut moved: Vec<(u32, u32, i64)> = Vec::new();
+        folded.consolidate_recording(&mut moved);
+        let entries = &folded.as_mem_batch();
+        let n = entries.count;
+        if n == 0 {
+            return OrderedEpoch {
+                out: Batch::empty_with_schema(&self.output_schema),
+                index_entries: folded,
+            };
+        }
+        // Entries of one group, and no others, agree on the group key leading their PK.
+        let width = index.key_packer.out_stride;
+        let prefix = |row: usize| &entries.get_pk_bytes(row)[..width];
+        let mut history = open(prefix(0), prefix(n - 1));
+
+        let mb = delta.as_mem_batch();
+        let mut out = Batch::with_capacity(&self.output_schema, n.min(MAX_OUT_CAP_HINT));
+        let mut walk = Walk {
+            index,
+            history: &mut history,
+            entries,
+            group: prefix(0),
+            next: 0,
+            end: 0,
+        };
+        while walk.end < n {
+            walk.next = walk.end;
+            walk.end = pk_group_end(entries, walk.next, width);
+            let delta_row = moved.get(walk.next).map_or(walk.next, |m| m.1 as usize);
+            let out_pk = index.key.out_pk(&mb, delta_row);
+            walk.group = prefix(walk.next);
+            walk.history.seek_pk_group_ascending(walk.group);
+            per_group(&mut out, out_pk.bytes(), &mut walk);
+        }
+        OrderedEpoch { out, index_entries: folded }
     }
 }
 
-/// One epoch of an operator maintained through an [`OrderIndex`].
+/// One epoch of an operator maintained through the order index.
 pub struct OrderedEpoch {
     /// δ_out.
     pub out: Batch,
@@ -150,7 +212,7 @@ pub struct OrderedEpoch {
 /// A row of the group a [`Walk`] is in: a stored one, by its cursor position, or
 /// one of the epoch's entries.
 #[derive(Clone, Copy)]
-pub(in crate::stream) enum At {
+enum At {
     Stored(u32, u32),
     Entry(u32),
 }
@@ -159,37 +221,37 @@ pub(in crate::stream) enum At {
 macro_rules! with_row {
     ($walk:expr, $at:expr, |$src:ident, $row:ident| $body:expr) => {
         match $at {
-            $crate::stream::order_index::At::Stored(source, $row) => {
+            $crate::stream::ordered::At::Stored(source, $row) => {
                 let ($src, $row) = ($walk.history.source_at(source as usize), $row as usize);
                 $body
             }
-            $crate::stream::order_index::At::Entry($row) => {
+            $crate::stream::ordered::At::Entry($row) => {
                 let ($src, $row) = ($walk.entries, $row as usize);
                 $body
             }
         }
     };
 }
-pub(in crate::stream) use with_row;
+use with_row;
 
 /// An element of a group: a stored row, an entry, or both as one.
 #[derive(Clone, Copy)]
-pub(in crate::stream) struct Element {
+struct Element {
     /// Its row: the stored one, where it has one.
-    pub(in crate::stream) at: At,
+    at: At,
     /// Its weight before the epoch, and after it.
-    pub(in crate::stream) old: i64,
-    pub(in crate::stream) new: i64,
+    old: i64,
+    new: i64,
     /// Whether the epoch touches it.
-    pub(in crate::stream) entry: bool,
+    entry: bool,
 }
 
 /// One touched group of an epoch: its stored rows and the epoch's entries for
 /// it, read together in index order.
-pub(in crate::stream) struct Walk<'a> {
+struct Walk<'a> {
     index: &'a OrderIndex,
-    pub(in crate::stream) history: &'a mut ReadCursor,
-    pub(in crate::stream) entries: &'a MemBatch<'a>,
+    history: &'a mut ReadCursor,
+    entries: &'a MemBatch<'a>,
     /// The key every row of the group leads with.
     group: &'a [u8],
     /// The group's entries not yet read.
@@ -200,7 +262,7 @@ pub(in crate::stream) struct Walk<'a> {
 impl Walk<'_> {
     /// Whether an entry of the group is still to be read.
     #[inline]
-    pub(in crate::stream) fn pending(&self) -> bool {
+    fn pending(&self) -> bool {
         self.next < self.end
     }
 
@@ -245,27 +307,27 @@ impl Walk<'_> {
 
     /// Take the group's next element in index order, `None` past its last.
     #[inline(always)]
-    pub(in crate::stream) fn next(&mut self) -> Option<Element> {
+    fn next(&mut self) -> Option<Element> {
         let element = self.peek()?;
         self.step(&element);
         Some(element)
     }
 
-    /// [`Self::next`] where the element is a peer of the row `of`, or `of` is `None`.
+    /// [`Self::next`] where the element is a peer of the row `of`.
     #[inline(always)]
-    pub(in crate::stream) fn next_peer(&mut self, of: Option<At>) -> Option<Element> {
+    fn next_peer(&mut self, of: At) -> Option<Element> {
         let element = self.peek()?;
-        if of.is_some_and(|of| !self.peers(of, element.at)) {
+        if !self.peers(of, element.at) {
             return None;
         }
         self.step(&element);
         Some(element)
     }
 
-    /// Take the stored row the cursor stands on, where it sorts before the next
-    /// entry's peers. An entry is pending.
+    /// Take the stored row the cursor stands on, with its weight, where it sorts
+    /// before the next entry's peers. An entry is pending.
     #[inline(always)]
-    pub(in crate::stream) fn next_stored_before_entry(&mut self) -> Option<Element> {
+    fn next_stored_before_entry(&mut self) -> Option<(At, i64)> {
         debug_assert!(self.pending());
         if !self.history.valid {
             return None;
@@ -278,23 +340,18 @@ impl Walk<'_> {
         let (source, row) = self.history.current_position();
         let weight = self.history.current_weight;
         self.history.advance();
-        Some(Element {
-            at: At::Stored(source as u32, row as u32),
-            old: weight,
-            new: weight,
-            entry: false,
-        })
+        Some((At::Stored(source as u32, row as u32), weight))
     }
 
     /// Leave the group's remaining entries unread.
     #[inline]
-    pub(in crate::stream) fn skip_entries(&mut self) {
+    fn skip_entries(&mut self) {
         self.next = self.end;
     }
 
     /// Whether two rows of the group are peers: equal on every ORDER BY key.
     #[inline(always)]
-    pub(in crate::stream) fn peers(&self, a: At, b: At) -> bool {
+    fn peers(&self, a: At, b: At) -> bool {
         with_row!(self, a, |a, a_row| with_row!(self, b, |b, b_row| self
             .index
             .cmp_keys(a, a_row, b, b_row)
@@ -304,17 +361,17 @@ impl Walk<'_> {
     /// Append the output row's carried cells of the row `at` to the row `out`
     /// has open.
     #[inline(always)]
-    pub(in crate::stream) fn append_row(&self, out: &mut Batch, at: At) {
+    fn append_row(&self, out: &mut Batch, at: At) {
         with_row!(self, at, |src, row| out.append_cells_from(&self.index.row, src, row));
     }
 }
 
 /// The index resources a plan carries, baked once at compile time.
-pub(in crate::stream) struct OrderIndex {
+struct OrderIndex {
     key_packer: ReindexPacker,
     /// How a row's group is keyed in the output.
     key: GroupOutKey,
-    pub(in crate::stream) schema: SchemaDescriptor,
+    schema: SchemaDescriptor,
     /// The first ORDER BY key, whose image leads the PK.
     lead: OrderSpec,
     rest: Vec<OrderSpec>,
@@ -326,18 +383,17 @@ pub(in crate::stream) struct OrderIndex {
     /// The input's string slots among them.
     strings: u64,
     /// The output row's payload columns, as an entry holds them.
-    pub(in crate::stream) row: Vec<ColumnLocator>,
+    row: Vec<ColumnLocator>,
     /// The image payload columns: with the PK, a row's whole ORDER BY key.
     images: Vec<ColumnLocator>,
 }
 
 impl OrderIndex {
-    /// The index of `input` grouped by `group_cols` in `order`, with how a row's
-    /// group is keyed in the output and the output's leading columns: the group
-    /// key region a reduce over the same group set would have, then every input
-    /// column not in that region, in input schema order. An entry carries those
-    /// columns and each of `also`.
-    pub(in crate::stream) fn new(
+    /// The index of `input` grouped by `group_cols` in `order`, and the output's
+    /// leading columns: the group key region a reduce over the same group set
+    /// would have, then every input column not in that region, in input schema
+    /// order. An entry carries those columns and each of `also`.
+    fn new(
         input: &SchemaDescriptor,
         group_cols: &[u32],
         order: &[OrderKey],
@@ -394,7 +450,7 @@ impl OrderIndex {
     }
 
     /// The index column carrying the input column at `loc`.
-    pub(in crate::stream) fn column_of(&self, loc: ColumnLocator) -> Option<usize> {
+    fn column_of(&self, loc: ColumnLocator) -> Option<usize> {
         let at = self.copies.iter().position(|c| c.src == loc)?;
         Some(self.schema.num_columns() - self.copies.len() + at)
     }
@@ -414,10 +470,10 @@ impl OrderIndex {
 
     /// The index entries `delta` contributes, entry `i` delta row `i`'s at its
     /// weight, unsorted: a region at a time.
-    pub(in crate::stream) fn batch(&self, delta: &Batch) -> Batch {
+    fn entries(&self, delta: &Batch) -> Batch {
         let mb = delta.as_mem_batch();
         let n = delta.len();
-        let mut out = Batch::with_capacity(&self.schema, n.max(1));
+        let mut out = Batch::with_capacity(&self.schema, n);
         // No carried string reads the delta's heap.
         let heap_at = match self.strings {
             0 => None,
@@ -457,64 +513,12 @@ impl OrderIndex {
         });
         out
     }
-
-    /// One epoch over `delta`: `group` once per group the delta touches, in
-    /// group order, handed δ_out, the group's output PK and its walk. The history
-    /// is read without the epoch's entries.
-    #[inline]
-    pub(in crate::stream) fn epoch(
-        &self,
-        delta: &Batch,
-        history: OpenAt<'_>,
-        output: &SchemaDescriptor,
-        mut group: impl FnMut(&mut Batch, &[u8], &mut Walk<'_>),
-    ) -> OrderedEpoch {
-        let mut folded = self.batch(delta);
-        debug_assert_eq!(folded.len(), delta.len());
-        // Entry `i` is delta row `i`'s, unless a fold moved the entries: then
-        // `moved` records every entry's.
-        let mut moved: Vec<(u32, u32, i64)> = Vec::new();
-        folded.consolidate_recording(&mut moved);
-        let entries = &folded.as_mem_batch();
-        let n = entries.count;
-        if n == 0 {
-            return OrderedEpoch {
-                out: Batch::empty_with_schema(output),
-                index_entries: folded,
-            };
-        }
-        // Entries of one group, and no others, agree on the group key leading their PK.
-        let width = self.key_packer.out_stride;
-        let prefix = |row: usize| &entries.get_pk_bytes(row)[..width];
-        let mut history = history(prefix(0), prefix(n - 1));
-
-        let mb = delta.as_mem_batch();
-        let mut out = Batch::with_capacity(output, n.min(MAX_OUT_CAP_HINT));
-        let mut walk = Walk {
-            index: self,
-            history: &mut history,
-            entries,
-            group: prefix(0),
-            next: 0,
-            end: 0,
-        };
-        while walk.end < n {
-            walk.next = walk.end;
-            walk.end = pk_group_end(entries, walk.next, width);
-            let delta_row = moved.get(walk.next).map_or(walk.next, |m| m.1 as usize);
-            let out_pk = self.key.out_pk(&mb, delta_row);
-            walk.group = prefix(walk.next);
-            walk.history.seek_pk_group_ascending(walk.group);
-            group(&mut out, out_pk.bytes(), &mut walk);
-        }
-        OrderedEpoch { out, index_entries: folded }
-    }
 }
 
 #[cfg(test)]
-#[path = "tests/order_index.rs"]
-pub(in crate::stream) mod tests;
+#[path = "tests/ordered.rs"]
+mod tests;
 
 #[cfg(test)]
-#[path = "benches/order_index.rs"]
+#[path = "benches/ordered.rs"]
 mod bench;

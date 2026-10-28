@@ -366,7 +366,7 @@ fn emit_join_term(
         }
     };
     ctx.integrals[integrand] = Some((trace, entry));
-    let out_schema = *plan.out_schema();
+    let out_schema = *plan.output_schema();
     let op = Op::JoinDT { trace, plan: Box::new(plan) };
     Ok(ctx.prog.push(delta_reg, out_schema, op))
 }
@@ -386,7 +386,7 @@ fn emit_map(ctx: &mut EmitCtx, nid: NodeId, mk: &gnitz_wire::MapKind) -> Result<
     if plan.is_identity() {
         return Ok(in_reg);
     }
-    Ok(ctx.prog.push(in_reg, *plan.out_schema(), Op::Map(Box::new(plan))))
+    Ok(ctx.prog.push(in_reg, *plan.output_schema(), Op::Map(Box::new(plan))))
 }
 
 // ---------------------------------------------------------------------------

@@ -9,10 +9,10 @@ use gnitz_expr::{order_bits, ColumnLocator};
 use gnitz_wire::{cmp_col_window, ScalarKind};
 use gnitz_wire::{RowSource, TypeCode};
 
-/// The column types outside [`ScalarKind`] that MIN/MAX still select over: the
-/// 16-byte integers and the German-string pair.
+/// The column types outside [`ScalarKind`]: the 16-byte integers and the
+/// German-string pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WideKind {
+pub(super) enum WideKind {
     Fixed(TypeCode),
     Bytes,
 }
@@ -21,13 +21,13 @@ pub(crate) enum WideKind {
 /// image, or as the native bytes of a [`WideKind`] value too wide for one.
 /// Every type has exactly one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ImageKind {
+pub(super) enum ImageKind {
     Scalar(ScalarKind),
     Wide(WideKind),
 }
 
 impl ImageKind {
-    pub(crate) const fn of(tc: TypeCode) -> Self {
+    pub(super) const fn of(tc: TypeCode) -> Self {
         match ScalarKind::from_type_code(tc) {
             Some(kind) => Self::Scalar(kind),
             None if tc.is_german_string() => Self::Wide(WideKind::Bytes),
@@ -40,7 +40,7 @@ impl WideKind {
     /// Order two values by their **native** bytes — a string's content, already
     /// resolved out of its blob heap, not its 16-byte cell.
     #[inline(always)]
-    pub(crate) fn cmp_native(self, a: &[u8], b: &[u8]) -> Ordering {
+    pub(super) fn cmp_native(self, a: &[u8], b: &[u8]) -> Ordering {
         match self {
             Self::Fixed(tc) => cmp_col_window(a, b, tc),
             Self::Bytes => a.cmp(b),
@@ -53,8 +53,8 @@ impl WideKind {
 #[derive(Clone, Copy)]
 pub(crate) struct ImageCol {
     pub(crate) loc: ColumnLocator,
-    pub(crate) kind: ImageKind,
-    pub(crate) invert: bool,
+    pub(super) kind: ImageKind,
+    pub(super) invert: bool,
 }
 
 impl ImageCol {
@@ -95,7 +95,8 @@ impl ImageCol {
         let ImageCol { loc, kind, invert } = self;
         match *kind {
             ImageKind::Scalar(kind) => {
-                // Padded where a wide ordinal shares the slot.
+                // Zero-padded where the slot is 16 bytes wide: a value index's, when
+                // another of its aggregates is wide.
                 let (image, pad) = slot.split_at_mut(8);
                 image.copy_from_slice(&scalar_image(loc, kind, *invert, src, row).to_be_bytes());
                 if let Ok(pad) = <&mut [u8; 8]>::try_from(pad) {
@@ -124,7 +125,7 @@ pub(crate) const IMAGE_COL: SchemaColumn = SchemaColumn::new(TypeCode::Blob, fal
 /// The native bytes of the wide column at `loc` in `row`: a string's content,
 /// or the 16-byte little-endian integer.
 #[inline(always)]
-pub(crate) fn wide_native<'a>(
+pub(super) fn wide_native<'a>(
     loc: &ColumnLocator,
     kind: WideKind,
     mb: &'a impl RowSource,
@@ -178,7 +179,7 @@ fn write_image_slot(slot: &mut [u8], image: &[u8]) {
 
 /// [`append_bytes_image`]'s and [`int16_image`]'s inverse: the native bytes back
 /// out of an index image.
-pub(crate) fn wide_native_of_image(kind: WideKind, invert: bool, image: &[u8]) -> Vec<u8> {
+pub(super) fn wide_native_of_image(kind: WideKind, invert: bool, image: &[u8]) -> Vec<u8> {
     let mut v = image.to_vec();
     if invert {
         v.iter_mut().for_each(|b| *b = !*b);
@@ -209,7 +210,7 @@ pub(crate) fn wide_native_of_image(kind: WideKind, invert: bool, image: &[u8]) -
 /// The order image of a scalar column at `loc` in `row`, **known non-NULL**:
 /// [`order_bits`], complemented when `invert`.
 #[inline]
-pub(crate) fn scalar_image(
+pub(super) fn scalar_image(
     loc: &ColumnLocator,
     kind: ScalarKind,
     invert: bool,
@@ -227,7 +228,7 @@ pub(crate) fn scalar_image(
 /// [`scalar_image`]'s inverse: the value's own little-endian bits back out of
 /// an image.
 #[inline(always)]
-pub(crate) fn scalar_native_of_image(kind: ScalarKind, invert: bool, image: u64) -> u64 {
+pub(super) fn scalar_native_of_image(kind: ScalarKind, invert: bool, image: u64) -> u64 {
     kind.order_inverse(if invert { !image } else { image })
 }
 

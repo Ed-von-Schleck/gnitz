@@ -161,7 +161,7 @@ fn a_join_scatter_routes_each_row_to_its_reindexed_owner() {
             nulls: NullKeys::Keep,
         };
         let mut map = MapPlan::from_wire(&schema, &reindex).expect("the fixture key packs");
-        let (keyed, at) = (map.evaluate_map_batch(&b), Placement::full_pk(map.out_schema()));
+        let (keyed, at) = (map.evaluate_map_batch(&b), Placement::full_pk(map.output_schema()));
         assert_routes(&plan, &b, &format!("join {slots:?}"), |_, row, nw| {
             at.owner(keyed.get_pk_bytes(row), nw).unwrap()
         });

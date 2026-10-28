@@ -172,7 +172,7 @@ pub struct MapPlan {
     pk_source: PkSource,
     /// The input's German-string payload slots some copy reads.
     copied_string_slots: u64,
-    out_schema: SchemaDescriptor,
+    output_schema: SchemaDescriptor,
 }
 
 /// Set the PK of each of `output`'s rows, whose payload and null words are
@@ -301,13 +301,13 @@ impl MapPlan {
             copied_string_slots: copied_string_slots(ev.copies()),
             ev,
             pk_source,
-            out_schema: *out_schema,
+            output_schema: *out_schema,
         })
     }
 
     /// The schema this plan stamps on its output.
-    pub fn out_schema(&self) -> &SchemaDescriptor {
-        &self.out_schema
+    pub fn output_schema(&self) -> &SchemaDescriptor {
+        &self.output_schema
     }
 
     /// The input column behind each output payload slot, when this map only
@@ -352,11 +352,11 @@ impl MapPlan {
         };
         let n = crate::repr::range_rows(ranges);
         if n == 0 {
-            return Batch::empty_with_schema(&self.out_schema);
+            return Batch::empty_with_schema(&self.output_schema);
         }
         // Uninitialized: `validate` makes every map write every payload slot,
         // and the calls below cover the PK, weight and null regions.
-        let mut output = Batch::with_capacity(&self.out_schema, n);
+        let mut output = Batch::with_capacity(&self.output_schema, n);
         self.append_map_ranges(in_batch, &mut output, ranges);
         output
     }

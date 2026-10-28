@@ -19,19 +19,17 @@ use crate::schema::{DerivedSchema, SchemaDescriptor};
 use crate::algebra::MapPlan;
 use crate::stream::OpenAt;
 use gnitz_expr::{ColCopy, ColumnLocator, NullPerm};
-use gnitz_wire::{null_word_at, Heap, JoinKind, PkBuf, RangeRel, TypeCode};
-use gnitz_wire::{RowSource, MAX_PK_BYTES};
+use gnitz_wire::{null_word_at, Heap, JoinKind, PkBuf, RangeRel, RowSource, TypeCode, MAX_PK_BYTES};
 
 // ---------------------------------------------------------------------------
 // The plan
 // ---------------------------------------------------------------------------
 
-/// One join instruction's compiler-baked artifact: how it probes its trace,
-/// where each input's columns land in the output row, and the schema it writes
-/// under — baked by the compiler, which holds the two input schemas the kernel
-/// never sees.
+/// One join instruction's plan: how it probes its trace, where each input's
+/// columns land in the output row, and the schema it writes under. The compiler
+/// bakes it from the two input schemas, which the kernel never sees.
 pub struct JoinPlan {
-    out_schema: SchemaDescriptor,
+    output_schema: SchemaDescriptor,
     walk: Walk,
     /// Each trace payload column: where the rows the cursor walks hold it, and
     /// the output slot it fills. Those rows are the trace's own, or the rows of
@@ -41,17 +39,20 @@ pub struct JoinPlan {
     t_nulls: NullPerm,
     /// The trace's columns lead the output payload: the delta is the right side.
     trace_leads: bool,
-    /// The walked rows are the trace's own, so they arrive in the order the
-    /// output gives their columns.
-    trace_ordered: bool,
 }
 
 /// Which trace walk a probe drives.
 #[derive(Clone, Copy)]
 enum Walk {
-    /// Equal key: the trace group at each delta group's own PK — the rows it
-    /// prefixes, over a cursor keyed wider than the delta.
-    Equi,
+    /// Equal key: the walked rows each delta group's PK prefixes. Over a stored
+    /// trace, those rows are the trace group at that PK. Over a source's rows,
+    /// they are every source row under that leading key.
+    Equi {
+        /// The walked rows are the trace's own, so a group's rows arrive in the
+        /// order the output gives their columns; otherwise they are the rows of
+        /// the relation the trace re-keys.
+        trace_ordered: bool,
+    },
     /// An ordered span within an equality group.
     Range(RangeProbe),
     /// Every trace row, for every delta row: the keyless join. No key decides a
@@ -61,8 +62,8 @@ enum Walk {
 
 impl JoinPlan {
     /// The layout [`op_join_delta_trace`] writes under this plan.
-    pub fn out_schema(&self) -> &SchemaDescriptor {
-        &self.out_schema
+    pub fn output_schema(&self) -> &SchemaDescriptor {
+        &self.output_schema
     }
 
     /// Resolve a wire join node against its two input schemas, or name the
@@ -97,7 +98,7 @@ impl JoinPlan {
             JoinKind::Equi,
             delta_is_right,
             delta,
-            rekey.out_schema(),
+            rekey.output_schema(),
             Walked::Source(source, cols),
         )
     }
@@ -127,7 +128,7 @@ impl JoinPlan {
         }
         b.push_payload_of(left);
         b.push_payload_of(right);
-        let out_schema = b.finish().map_err(|e| format!("join: merged schema {e}"))?;
+        let output_schema = b.finish().map_err(|e| format!("join: merged schema {e}"))?;
 
         // The left SQL side's payload leads.
         let t_first = match delta_is_right {
@@ -137,7 +138,7 @@ impl JoinPlan {
         let walk = match kind {
             JoinKind::Equi => {
                 same_pk_types(delta, trace)?;
-                Walk::Equi
+                Walk::Equi { trace_ordered }
             }
             JoinKind::Range { rel } => {
                 same_pk_types(delta, trace)?;
@@ -151,12 +152,11 @@ impl JoinPlan {
             .collect();
         let t_nulls = NullPerm::new(&t_cols, walked.nullable_payload_slots());
         Ok(JoinPlan {
-            out_schema,
+            output_schema,
             walk,
             t_cols,
             t_nulls,
             trace_leads: delta_is_right,
-            trace_ordered,
         })
     }
 }
@@ -272,12 +272,12 @@ impl Pairing {
 }
 
 /// Join delta rows against the trace, writing `[key, left payload…, right
-/// payload…]` under [`JoinPlan::out_schema`].
+/// payload…]` under [`JoinPlan::output_schema`].
 ///
 /// The walk only records which delta run meets which trace row; the output is
 /// then written one region at a time over that list. Emission is trace-major
-/// under every probe: each trace row is walked once and producted against a
-/// contiguous delta run. So the output is in general unfolded and not
+/// under every probe: each trace row is walked once and meets one contiguous
+/// delta run. So the output is in general unfolded and not
 /// (PK, payload)-sorted — under `Cross` not even PK-sorted, since each trace row
 /// re-emits the whole delta — and downstream re-sorts and consolidates it.
 ///
@@ -285,34 +285,23 @@ impl Pairing {
 /// output's own: each delta run met one trace row, or the trace's rows arrived
 /// in output order and either lead the payload or met single delta rows.
 pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) -> Batch {
-    let out_schema = &plan.out_schema;
     debug_assert!(delta.is_consolidated());
     let n = delta.len();
     if n == 0 {
-        return Batch::empty_with_schema(out_schema);
+        return Batch::empty_with_schema(&plan.output_schema);
     }
     // Every trace row a walk can meet begins with a delta row's key under `Equi`,
     // with its equality prefix under `Range`, and with nothing under `Cross`.
     let prefix = match plan.walk {
-        Walk::Equi => delta.schema().pk_stride(),
+        Walk::Equi { .. } => delta.schema().pk_stride(),
         Walk::Range(range) => range.eq_size,
         Walk::Cross => 0,
     };
     let cursor = &mut trace(&delta.get_pk_bytes(0)[..prefix], &delta.get_pk_bytes(n - 1)[..prefix]);
     // Grown, not pre-sized: a walk can match nothing.
     let mut pairs: Vec<Pairing> = Vec::new();
-    let mut rows = 0usize;
-    let mut ordered = matches!(plan.walk, Walk::Equi);
-    let mut last_run = usize::MAX;
     let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
-        if rs == re {
-            return;
-        }
-        // A delta run's second trace row: its rows follow the first's.
-        if ordered && rs == last_run {
-            ordered = plan.trace_ordered && (plan.trace_leads || re - rs == 1);
-        }
-        last_run = rs;
+        debug_assert!(rs < re, "every walk emits a non-empty delta run");
         let (src, row) = c.current_position();
         pairs.push(Pairing {
             rs: rs as u32,
@@ -321,15 +310,23 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
             row: row as u32,
             w_trace: c.current_weight,
         });
-        rows += re - rs;
     };
     match plan.walk {
-        Walk::Equi => equi_merge_walk(delta, cursor, emit),
+        Walk::Equi { .. } => equi_merge_walk(delta, cursor, emit),
         Walk::Range(range) => range_merge_walk(delta, cursor, range, emit),
         Walk::Cross => cursor.for_each_row_while(|_| true, |c| emit(0, n, c)),
     }
+    let rows: usize = pairs.iter().map(Pairing::len).sum();
+    let ordered = match plan.walk {
+        // A delta run that meets several trace rows keeps the output order only
+        // when they arrive in it and lead the payload or the run is one row.
+        Walk::Equi { trace_ordered } => pairs
+            .windows(2)
+            .all(|w| w[0].rs != w[1].rs || (trace_ordered && (plan.trace_leads || w[0].len() == 1))),
+        Walk::Range(_) | Walk::Cross => false,
+    };
     let mut out = write_pairings(delta, cursor, plan, &pairs, rows);
-    if ordered && !out.is_empty() {
+    if ordered {
         out.certify_consolidated();
     }
     out
@@ -338,12 +335,12 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
 /// The `rows` output rows `pairs` names, in list order, one region at a time,
 /// less any whose weight product is zero.
 fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[Pairing], rows: usize) -> Batch {
-    let out_schema = &plan.out_schema;
+    let output_schema = &plan.output_schema;
     if rows == 0 {
-        return Batch::empty_with_schema(out_schema);
+        return Batch::empty_with_schema(output_schema);
     }
     let d_schema = delta.schema();
-    let mut out = Batch::with_capacity(out_schema, rows);
+    let mut out = Batch::with_capacity(output_schema, rows);
 
     // The delta's heap rides whole unless relocating the emitted cells is
     // cheaper; the rows no pairing names are what it then holds dead.
@@ -369,7 +366,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
             // No key decides a match, so the pair `[left PK…, right PK…]` is minted
             // per row.
             Walk::Cross => {
-                let (pk_len, d_len) = (out_schema.pk_stride(), d_schema.pk_stride());
+                let (pk_len, d_len) = (output_schema.pk_stride(), d_schema.pk_stride());
                 let (d_key, t_key) = match plan.trace_leads {
                     true => (pk_len - d_len..pk_len, 0..pk_len - d_len),
                     false => (0..d_len, d_len..pk_len),
@@ -519,17 +516,17 @@ fn repeat_pk_cells<const N: usize>(
 /// The cursor's rows may be keyed wider than the delta: a delta group then
 /// matches the rows its PK prefixes, which sit together because the cursor
 /// orders by the whole PK.
-fn equi_merge_walk(delta: &Batch, m: &mut ReadCursor, mut emit: impl FnMut(usize, usize, &ReadCursor)) {
+fn equi_merge_walk(delta: &Batch, cursor: &mut ReadCursor, mut emit: impl FnMut(usize, usize, &ReadCursor)) {
     let (n, k) = (delta.len(), delta.schema().pk_stride());
     let mut i = 0;
     while i < n {
         let dk = delta.get_pk_bytes(i);
-        if m.seek_pk_group_ascending(dk) {
+        if cursor.seek_pk_group_ascending(dk) {
             let j = pk_group_end(delta, i, k); // delta group
-            m.for_each_pk_group_row(dk, |c| emit(i, j, c));
+            cursor.for_each_pk_group_row(dk, |c| emit(i, j, c));
             i = j;
-        } else if m.valid {
-            i = delta.seek(&m.current_pk_bytes()[..k], Some(i)); // skip delta
+        } else if cursor.valid {
+            i = delta.seek(&cursor.current_pk_bytes()[..k], Some(i)); // skip delta
         } else {
             break;
         }
@@ -542,7 +539,9 @@ fn equi_merge_walk(delta: &Batch, m: &mut ReadCursor, mut emit: impl FnMut(usize
 
 /// Trace-driven equality-group merge walk. One cut spans a whole delta equality
 /// group, so a group costs one seek and one pass over the covered trace span,
-/// with a monotone delta pointer naming the matching run per trace row.
+/// with a monotone delta pointer naming the matching run per trace row. Every
+/// trace row of a span matches the delta row that cut it, so no emitted run is
+/// empty.
 fn range_merge_walk(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -592,20 +591,15 @@ fn range_merge_walk(
             return;
         }
         // The cursor sits past the span, so its equality prefix names the next
-        // group the trace can match. `advance_to` is an absolute lower bound,
-        // not a forward one, so `hi` floors it.
+        // group the trace can match: the delta groups below it are skipped.
         let trace_group = &cursor.current_pk_bytes()[..eq_size];
         lo = hi;
         if hi < delta.len() && compare_pk_ordering(&delta.get_pk_bytes(hi)[..eq_size], trace_group).is_lt() {
             group_lb[..eq_size].copy_from_slice(trace_group);
-            lo = delta.seek(&group_lb[..stride], Some(hi)).max(hi);
+            lo = delta.seek(&group_lb[..stride], Some(hi));
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[path = "tests/join.rs"]

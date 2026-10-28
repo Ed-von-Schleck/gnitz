@@ -5,14 +5,6 @@ use gnitz_wire::ClampKind;
 use crate::repr::{materialize_carrying, Batch};
 use crate::stream::OpenAt;
 
-/// The weight a clamp caps at; every clamp's floor is 0.
-fn cap(kind: ClampKind) -> i64 {
-    match kind {
-        ClampKind::Distinct => 1,
-        ClampKind::PositivePart => i64::MAX,
-    }
-}
-
 /// Per consolidated (PK, payload) of `delta`, emits `clamp(w_old + Δw, 0, cap) −
 /// clamp(w_old, 0, cap)` against its weight `w_old` in the history `hist` opens —
 /// the lift of a per-element weight clamp to its delta. `hist_holds_delta`: what
@@ -23,10 +15,14 @@ pub fn op_weight_clamp(delta: &Batch, hist: OpenAt<'_>, hist_holds_delta: bool, 
         return Batch::empty_with_schema(delta.schema());
     }
     let cursor = &mut hist(delta.get_pk_bytes(0), delta.get_pk_bytes(delta.len() - 1));
-    let cap = cap(kind);
+    // The clamp's upper bound; every clamp's floor is 0.
+    let cap = match kind {
+        ClampKind::Distinct => 1,
+        ClampKind::PositivePart => i64::MAX,
+    };
     let mb = delta.as_mem_batch();
     let mut rows: Vec<(u32, u32, i64)> = Vec::new();
-    // Every row emitting its own weight — an insert-only tick — is the delta itself.
+    // Where every row emits its own weight, the output is the delta itself.
     let mut identity = true;
     cursor.for_each_mem_row_weight(&mb, |i, w_hist| {
         let dw = mb.get_weight(i);
@@ -49,10 +45,6 @@ pub fn op_weight_clamp(delta: &Batch, hist: OpenAt<'_>, hist_holds_delta: bool, 
     out.certify_consolidated();
     out
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[path = "tests/clamp.rs"]

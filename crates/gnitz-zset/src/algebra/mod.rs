@@ -20,10 +20,6 @@
 //!
 //! A `pub use` below is named by another crate; a `pub(crate) use` is what
 //! `stream` reaches. The submodules stay private.
-//!
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover, so each stays that module's own `tests` child and reaches its
-//! private items.
 
 mod aggregate;
 mod exchange;

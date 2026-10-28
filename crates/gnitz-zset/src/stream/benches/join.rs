@@ -95,7 +95,7 @@ fn join_equi_bench() {
         let wide = schema_for(&[TypeCode::U64, TypeCode::U64], p);
         let keep: Vec<u32> = (1..wide.num_columns() as u32).collect();
         let mut map = rekey_plan(&wide, &[0], &keep, NullKeys::Drop);
-        let stored = JoinPlan::from_wire(JoinKind::Equi, false, &narrow, map.out_schema()).unwrap();
+        let stored = JoinPlan::from_wire(JoinKind::Equi, false, &narrow, map.output_schema()).unwrap();
         let over = JoinPlan::over_source(false, &narrow, &wide, &map).unwrap();
         for (name, d, t, miss_stride) in SHAPES {
             let keys = N / d.max(t);

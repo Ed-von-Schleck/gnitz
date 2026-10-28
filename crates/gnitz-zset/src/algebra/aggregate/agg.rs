@@ -374,7 +374,7 @@ impl AggValues {
     pub(crate) fn count_value(&self, k: usize, g: usize) -> i64 {
         debug_assert!(matches!(
             self.aggs[k].kind,
-            StepKind::Count | StepKind::CountNonNull | StepKind::Sum(ScalarKind::Int(FixedInt::I64))
+            StepKind::Count | StepKind::Sum(ScalarKind::Int(FixedInt::I64))
         ));
         self.acc[self.at(k, g)]
     }
@@ -451,7 +451,7 @@ impl AggValues {
         }
     }
 
-    /// Step this aggregate over rows `ranges` of `mb`, each into its group: one
+    /// Step aggregate `k` over rows `ranges` of `mb`, each into its group: one
     /// pass over its column, in row order. A row at a non-positive weight steps no
     /// extreme.
     pub(crate) fn fold(&mut self, k: usize, mb: &MemBatch, ranges: &[(usize, usize)], groups: impl Groups) {
