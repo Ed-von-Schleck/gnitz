@@ -1,0 +1,438 @@
+//! The MasterDispatcher's writes: ACKed rounds (checkpoint halves, the boot-end
+//! stamp, backfill, tick), the DDL zone, push groups, the backup round, the
+//! tick ledger and its delta rounds, and worker reaping.
+
+use std::time::Duration;
+
+use super::route::with_routed;
+use super::*;
+use crate::catalog::{ZoneError, ZoneSink};
+use crate::runtime::reactor::AckLease;
+use crate::runtime::sal::{Apply, SalRequest, SalScope};
+use gnitz_foundation::fault::Seam;
+use gnitz_foundation::posix_io::retry_eintr;
+
+/// How often a worker's death is probed for.
+pub(crate) const WORKER_WATCH: Duration = Duration::from_millis(100);
+
+/// `GNITZ_INJECT_BACKUP_ABORT`: abort the master between the workers' copies and
+/// its own, as a crash part-way through a backup would.
+static BACKUP_ABORT: Seam = Seam::new("GNITZ_INJECT_BACKUP_ABORT");
+
+/// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next tick emit, once, as a full SAL
+/// would.
+static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
+
+impl MasterDispatcher {
+    pub(crate) fn new(worker_pids: Vec<i32>, catalog: *mut CatalogEngine, sal: SalWriter, reactor: Reactor) -> Self {
+        debug_assert_eq!(
+            sal.num_workers(),
+            worker_pids.len(),
+            "the SAL is written at the worker count"
+        );
+        MasterDispatcher {
+            worker_pids,
+            sal,
+            reactor,
+            catalog,
+            unique_filters: RefCell::new(FxHashMap::default()),
+            fk_presence: RefCell::new(FxHashMap::default()),
+            fk_presence_cap: gnitz_foundation::env::env_num("GNITZ_FK_PRESENCE_KEYS", 1usize << 20),
+            ledger: TickLedger {
+                pending: RefCell::new(FxHashMap::default()),
+                coalesce_rows: gnitz_foundation::env::env_num("GNITZ_TICK_COALESCE_ROWS", 10_000),
+                last_lsn: Cell::new(0),
+                round: Cell::new(1),
+                last_delta_round: RefCell::new(FxHashMap::default()),
+            },
+            cascade_bytes: gnitz_foundation::env::env_num("GNITZ_CASCADE_BYTES", gnitz_wire::MAX_FRAME_PAYLOAD)
+                .min(gnitz_wire::MAX_FRAME_PAYLOAD),
+        }
+    }
+
+    /// The catalog, which outlives the dispatcher.
+    pub(crate) fn cat(&self) -> &CatalogEngine {
+        unsafe { &*self.catalog }
+    }
+
+    /// The catalog, exclusively: no reference from this or [`Self::cat`] may be
+    /// alive across a call.
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) fn cat_mut(&self) -> &mut CatalogEngine {
+        unsafe { &mut *self.catalog }
+    }
+
+    /// The SAL writer: its queries, and the [`SalExcl`] every write goes through.
+    pub(crate) fn sal(&self) -> &SalWriter {
+        &self.sal
+    }
+
+    // -----------------------------------------------------------------------
+    // Core send/receive helpers
+    // -----------------------------------------------------------------------
+
+    /// The master's event loop.
+    pub(crate) fn reactor(&self) -> &Reactor {
+        &self.reactor
+    }
+
+    pub(crate) fn num_workers(&self) -> usize {
+        self.sal.num_workers()
+    }
+
+    /// Resolves with the first worker found dead, probing every `WORKER_WATCH`.
+    pub(crate) async fn worker_death(&self) -> usize {
+        loop {
+            self.reactor.sleep(WORKER_WATCH).await;
+            if let Some(w) = self.check_workers() {
+                return w;
+            }
+        }
+    }
+
+    /// Write `group` to every worker on a fresh ACK lease, and wake them now: a
+    /// caller may await the ACKs under this hold.
+    fn write_acked(&self, excl: &mut SalExcl<'_>, group: SalGroup<'_>) -> Result<AckLease, WireFault> {
+        let lease = self.reactor.lease_acks(WorkerSet::ALL);
+        excl.write(&SalGroup { targets: lease.targets(), ..group })?;
+        excl.wake();
+        Ok(lease)
+    }
+
+    // -----------------------------------------------------------------------
+    // SAL Checkpoint
+    // -----------------------------------------------------------------------
+
+    /// A checkpoint's first half: the round that flushes base and system tables.
+    ///
+    /// When a push to a base table was published since the last one, the round
+    /// moves the base stores past what the checkpointed views integrate, so a
+    /// generation bump goes ahead of it: every checkpointed view and index is
+    /// invalid until the next ephemeral round restamps it. Otherwise the round
+    /// moves no base store, the generation stands, and the ephemeral round
+    /// republishes only the stores whose manifests changed.
+    pub(crate) async fn checkpoint_base(&self) -> Result<(), WireFault> {
+        let mut excl = self.sal.lock().await;
+        if self.sal.holds_pushes() {
+            self.cat_mut().advance_durable_generation()?;
+        }
+        self.flush_round(&mut excl, Apply::Flush).await
+    }
+
+    /// A checkpoint's second half: the round that flushes every resumable
+    /// view's traces and output stores, stamped with the durable generation.
+    pub(crate) async fn checkpoint_ephemeral(&self) -> Result<(), WireFault> {
+        let mut excl = self.sal.lock().await;
+        debug_assert!(
+            !self.sal.holds_pushes(),
+            "an ephemeral round's reset would discard pushes no base round flushed"
+        );
+        let generation = self.cat().durable_generation();
+        self.flush_round(&mut excl, Apply::FlushEph { generation }).await
+    }
+
+    /// Write `round`'s group, wait for every worker's ACK, finalize.
+    async fn flush_round(&self, excl: &mut SalExcl<'_>, round: Apply<'_>) -> Result<(), WireFault> {
+        let lease = self.write_acked(excl, SalGroup::new(round))?;
+        lease.acks().await;
+        self.checkpoint_post_ack(excl)
+    }
+
+    // -----------------------------------------------------------------------
+    // Fan-out operations
+    // -----------------------------------------------------------------------
+
+    /// Backfill `view_ids` as one group, in id order: a view's id exceeds that of
+    /// every relation it scans.
+    pub(crate) async fn backfill_views_in_dep_order(&self, view_ids: &[u64]) -> Result<(), WireFault> {
+        let mut ordered = view_ids.to_vec();
+        ordered.sort_unstable();
+        ordered.dedup();
+        if ordered.is_empty() {
+            return Ok(());
+        }
+        let group = SalGroup::new(Apply::Backfill { views: ordered.into() });
+        let lease = self.write_acked(&mut self.sal.lock().await, group)?;
+        lease.acks().await;
+        Ok(())
+    }
+
+    /// Tick every one of `tids`, in order, in one group, and await its ACKs.
+    pub(crate) async fn drain_tick(&self, tids: &[u64]) -> Result<(), WireFault> {
+        if tids.is_empty() {
+            return Ok(());
+        }
+        let lease = self.emit_tick(&mut self.sal.lock().await, tids)?;
+        lease.acks().await;
+        Ok(())
+    }
+
+    /// Run catalog write `write` with its groups laid out as one SAL zone, and mark
+    /// the zone applied: the write's value and the zone LSN. A write the catalog or
+    /// the log refuses leaves the catalog as it was and its scope unpublished. A
+    /// diverged catalog is one no log describes, so the process ends on it.
+    /// Submits no fdatasync. The divergence abort names the caller's location.
+    #[track_caller]
+    pub(crate) fn emit_zone<T>(
+        &self,
+        excl: &mut SalExcl<'_>,
+        write: impl FnOnce(&mut CatalogEngine, &mut ZoneSink<'_>) -> Result<T, ZoneError>,
+    ) -> Result<(T, u64), WireFault> {
+        let mut scope = excl.begin("ddl");
+        let zone_lsn = scope.lsn();
+        // Each DDL batch is logged inside the zone, under its one LSN, so recovery
+        // groups a DDL's groups atomically. The sink reads no catalog, so it runs
+        // while `write` holds the catalog mutably.
+        let written = write(self.cat_mut(), &mut |family, batch| {
+            scope.write(&SalGroup::ddl_sync(family, batch), true)?;
+            gnitz_debug!("ddl group tid={} rows={}", family.id(), batch.len());
+            Ok(())
+        });
+        let value = match written {
+            Ok(v) => v,
+            Err(ZoneError::Refused(e)) => return Err(e),
+            Err(ZoneError::Diverged(e)) => gnitz_fatal_abort!("{}: {e}", std::panic::Location::caller()),
+        };
+        // Only a closed zone raises the replay floor: an LSN no member carries can
+        // be the next scope's, whose zone boot replay would then skip.
+        if scope.commit() {
+            self.cat_mut().mark_zone_applied(zone_lsn);
+        }
+        Ok((value, zone_lsn))
+    }
+
+    /// Credit `rows` against each scanned tid's pending-tick count; whether any
+    /// tid now stands at or above the coalesce threshold, so an auto-tick is due.
+    /// Below it a push only accumulates, and nothing ticks until a read or a
+    /// delta poll asks for a drain. `_laid_out` is the SAL hold the rows' groups
+    /// were written under.
+    pub(crate) fn note_pending(&self, _laid_out: &SalExcl<'_>, rows: impl Iterator<Item = (u64, usize)>) -> bool {
+        let mut pending = self.ledger.pending.borrow_mut();
+        let dag = &self.cat().dag;
+        for (tid, n) in rows.filter(|&(tid, _)| dag.is_scanned(tid)) {
+            *pending.entry(tid).or_insert(0) += n;
+        }
+        pending.values().any(|&rows| rows >= self.ledger.coalesce_rows)
+    }
+
+    /// Tick every table with a pending delta as one Tick group, and answer the
+    /// lease its workers ACK on; `None` when nothing was pending. A refused emit
+    /// leaves every delta pending.
+    pub(crate) async fn emit_pending_tick(&self) -> Result<Option<AckLease>, WireFault> {
+        if self.ledger.pending.borrow().is_empty() {
+            self.ledger.last_lsn.set(self.sal.watermark());
+            return Ok(None);
+        }
+        // The hold `note_pending` is called under, so the tids and the
+        // watermark read here are of the same commits.
+        let mut excl = self.sal.lock().await;
+        if TICK_EMIT_ERROR.take_once() {
+            return Err("injected tick emit error".to_string().into());
+        }
+        let tids: Vec<u64> = self.ledger.pending.borrow().keys().copied().collect();
+        let lease = self.emit_tick(&mut excl, &tids)?;
+        self.ledger.pending.borrow_mut().clear();
+        self.ledger.last_lsn.set(self.sal.watermark());
+        Ok(Some(lease))
+    }
+
+    /// True when no relation of `sources` has a commit no emitted tick has
+    /// taken, so a read of a view whose source closure they are misses nothing.
+    /// A commit is pending from its layout on, ahead of its ACK, so this errs
+    /// towards false, which costs one extra drain.
+    pub(crate) fn all_ticked(&self, sources: &FxHashSet<u64>) -> bool {
+        let pending = self.ledger.pending.borrow();
+        sources.iter().all(|s| !pending.contains_key(s))
+    }
+
+    /// The SAL watermark the last emitted tick snapshotted: every commit at or
+    /// below it is reflected in every view.
+    pub(crate) fn last_tick_lsn(&self) -> u64 {
+        self.ledger.last_lsn.get()
+    }
+
+    /// Seed the last tick's LSN with `lsn`. Called once, after the recovery
+    /// tick sweep, with the SAL watermark the executor takes as its boot seed:
+    /// every commit recovered at boot is then reflected in every view.
+    pub(crate) fn seed_tick_lsn(&self, lsn: u64) {
+        debug_assert_eq!(self.ledger.last_lsn.get(), 0, "the tick LSN is seeded once");
+        self.ledger.last_lsn.set(lsn);
+    }
+
+    /// Write one Tick group for `tids` at consecutive tick rounds, on a fresh ACK
+    /// lease. A refused write burns its rounds.
+    fn emit_tick(&self, excl: &mut SalExcl<'_>, tids: &[u64]) -> Result<AckLease, WireFault> {
+        let first = self.ledger.round.get() + 1;
+        self.ledger.round.set(first + tids.len() as u64 - 1);
+        for (i, &tid) in tids.iter().enumerate() {
+            self.record_delta_round(tid, first + i as u64);
+        }
+        let tick = Apply::Tick { first_round: first, tids: tids.into() };
+        self.write_acked(excl, SalGroup::new(tick))
+    }
+
+    /// Raise the last-reached round of every fed view in `tid`'s **forward**
+    /// closure — which views this source reaches. Skipped outright when no view
+    /// carries a feed, which is every server that does not use the feature.
+    ///
+    /// At **emit** time, not at ACK time: a round emitted but not yet ACKed has
+    /// already reached the view's workers, and an ACK-time update would let the
+    /// gate answer "nothing changed" over a round whose rows are already in flight.
+    fn record_delta_round(&self, tid: u64, round: u64) {
+        let cat = self.cat();
+        if !cat.registry.any_delta_feed() {
+            return;
+        }
+        let reached = cat.dag.dependent_closure([tid]);
+        let mut map = self.ledger.last_delta_round.borrow_mut();
+        for vid in reached {
+            if cat.registry.relation(vid).is_some_and(|r| r.kind().has_delta_feed()) {
+                map.insert(vid, round);
+            }
+        }
+    }
+
+    /// The last round that reached `view_id`, or `1` for a view no round has
+    /// reached — the boot round, which is never emitted and captures nothing, so a
+    /// bootstrap at `after_tick = 0` always falls through to the store.
+    pub(crate) fn last_delta_round(&self, view_id: u64) -> u64 {
+        self.ledger
+            .last_delta_round
+            .borrow()
+            .get(&view_id)
+            .copied()
+            .unwrap_or(1)
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle
+    // -----------------------------------------------------------------------
+
+    /// The first dead worker, reported on every probe: a reaped pid answers
+    /// ECHILD.
+    fn check_workers(&self) -> Option<usize> {
+        self.worker_pids.iter().position(|&pid| {
+            let mut status: i32 = 0;
+            pid > 0
+                && match retry_eintr(|| unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }) {
+                    Ok(0) => false, // still running
+                    Ok(_) => true,  // its zombie was ours to reap
+                    // ECHILD: reaped elsewhere, so equally dead. Any other errno is
+                    // unexpected and read as alive rather than as a crash.
+                    Err(e) => e.raw_os_error() == Some(libc::ECHILD),
+                }
+        })
+    }
+
+    /// `SIGKILL` every worker, then reap each: a survivor parked for W2M ring
+    /// space would never read a `Shutdown`.
+    pub(crate) fn kill_workers(&self) {
+        for pid in self.live_pids() {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        self.reap_workers();
+    }
+
+    /// Broadcast `Shutdown` and reap the worker processes, blocking on each. No
+    /// await separates the write from the reap, so [`Self::worker_death`] never
+    /// probes workers that exited on request.
+    pub(crate) async fn shutdown_workers(&self) {
+        // A refusal would hang the reap below, so it must not vanish.
+        if let Err(e) = self.sal.lock().await.write(&SalGroup::new(SalRequest::Shutdown)) {
+            gnitz_warn!("SAL refused the Shutdown broadcast: {}; the worker reap will block", e);
+        }
+        self.reap_workers();
+    }
+
+    fn live_pids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.worker_pids.iter().copied().filter(|&pid| pid > 0)
+    }
+
+    /// Block until every worker has exited.
+    fn reap_workers(&self) {
+        for pid in self.live_pids() {
+            let mut status: i32 = 0;
+            let _ = retry_eintr(|| unsafe { libc::waitpid(pid, &mut status, 0) });
+        }
+    }
+
+    /// Lay one push batch out as a SAL group inside `scope`, written to the
+    /// workers that own its rows, and answer the lease those workers ACK on.
+    /// A base table's rows go inside the zone; a stream's, which no restart
+    /// recovers, ride outside.
+    pub(crate) fn write_commit_group(
+        &self,
+        scope: &mut SalScope,
+        target_id: u64,
+        batch: &Batch,
+    ) -> Result<AckLease, WireFault> {
+        let cat = self.cat();
+        let record = cat
+            .schema_record(target_id)
+            .expect("a wire target is registered under the catalog lock");
+        let rel = cat
+            .registry
+            .relation(target_id)
+            .expect("a push target is registered under the catalog lock");
+        let recoverable = rel.kind().is_base_table();
+        with_routed(batch, rel.placement(), self.num_workers(), |data| {
+            // Leased before the group is laid out, so no ACK arrives unrouted.
+            let lease = self.reactor.lease_acks(data.holders());
+            scope.write(&SalGroup::push(target_id, &record, data, lease.targets()), recoverable)?;
+            Ok(lease)
+        })
+    }
+
+    /// Post-ACK checkpoint cleanup, run once a round's Flush ACKs are in: flush
+    /// the system tables before resetting the SAL cursor (their data lives in
+    /// SAL entries about to be discarded), then advance the epoch.
+    ///
+    /// Finalizes **both** rounds. The ephemeral one must flush too: a
+    /// `reserve_serial_range` advance can land in the `sys_sequences`
+    /// MemTable during the drain window, after the base round's reset, so this
+    /// flush is its only durability event before the ephemeral reset makes the
+    /// SAL tail useless for recovery.
+    ///
+    /// Returns the flush error WITHOUT resetting the SAL when the system-table
+    /// flush fails: the SAL entries about to be discarded are that data's only
+    /// durable copy, so resetting on a swallowed failure destroys it. The caller
+    /// leaves the SAL intact and aborts or fails the boot.
+    fn checkpoint_post_ack(&self, excl: &mut SalExcl<'_>) -> Result<(), WireFault> {
+        let cat = self.cat_mut();
+        cat.flush_all_system_tables()?;
+        // Every worker ACKed the FLUSH, so each has applied every DdlSync written
+        // before it; the flush above made every applied DROP durable.
+        cat.reclaim_orphan_dirs();
+        let epoch = excl.checkpoint_reset();
+        gnitz_note!("SAL checkpoint epoch={epoch}");
+        Ok(())
+    }
+
+    /// A backup's copy, run by the committer right behind a checkpoint: every
+    /// worker puts the stores it published into the data directory `dir`, then
+    /// the master puts its system families', each store with the entries that
+    /// reach it durable. `dir` exists; everything under it is made here.
+    pub(crate) async fn backup_round(&self, dir: &str) -> Result<(), WireFault> {
+        self.command(Read::Backup { dir: dir.as_bytes().into() }).await?;
+        if BACKUP_ABORT.armed() {
+            gnitz_fatal_abort!("injected backup abort");
+        }
+        self.cat().registry.link_published_into(dir)?;
+        gnitz_info!("backup copied into {}", dir);
+        Ok(())
+    }
+
+    /// Boot-end checkpoint: record the launched topology, then stamp every
+    /// resumable view and every index at the durable generation, which a boot
+    /// that replayed a push advanced pre-fork. The workers published their base
+    /// stores during recovery, and no push is admitted yet.
+    pub(crate) async fn boot_checkpoint(&self) -> Result<(), WireFault> {
+        let cat = self.cat_mut();
+        cat.record_topology(cat.registry.slot().of)?;
+        self.checkpoint_ephemeral().await
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/dispatch.rs"]
+mod tests;

@@ -1,4 +1,12 @@
-//! Runtime coordination subsystem: IPC channels, master/worker/executor/committer/bootstrap.
+//! The server's processes and what they speak to each other.
+//!
+//! - Processes: `bootstrap` boots the server and forks the workers; `executor`
+//!   serves clients on the master's `reactor`, through the `master` dispatcher;
+//!   `worker` is a worker's event loop. `signals` and `affinity` set up each
+//!   process; `listen` and `tls` are the client listeners.
+//! - Inter-process protocol: the master→worker `sal` (shared append-only log),
+//!   the worker→master `w2m` rings, the worker↔worker exchange `mesh`, the
+//!   futex `park` all three sleep through, and the `frame` encoder they write.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -13,28 +21,27 @@
 // The submodules are private `mod`, so cross-submodule refs resolve through
 // `crate::runtime::X::…` / `super::X::…` — descendants can name a private
 // sibling module.
-//
-// `orchestration` and `protocol` group the submodules by layer, and the aliases
-// below are what `crate::runtime::<mod>` resolves through — no path names the
-// grouping directory. There is no syscall tier: every syscall lives in the
-// module holding the protocol or policy it serves.
+
 // First: `#[macro_use]` reaches only the submodules declared after it.
 #[macro_use]
 mod fatal;
 
 mod affinity;
 mod bootstrap;
+mod executor;
+mod frame;
 mod listen;
-mod orchestration;
-mod protocol;
+mod master;
+mod mesh;
+mod park;
 mod reactor;
+mod sal;
+mod signals;
 mod tls;
+mod w2m;
+mod worker;
 
-use orchestration::{committer, executor, master, peer, worker};
-use protocol::{mesh, park, sal, w2m, wire};
-
-pub(crate) use bootstrap::server_main;
-pub(crate) use gnitz_wire::MAX_WORKERS;
+pub(crate) use bootstrap::{server_main, ServerArgs};
 pub(crate) use tls::{mint_token, CertSource, TlsArgs};
 
 #[cfg(test)]

@@ -3,6 +3,13 @@
 //! one-CQE awaiters hold a [`oneshot`], next-of-many awaiters park in a
 //! [`wake_queue::WakeQueue`], an all-workers round parks on its ACK route, and
 //! every deadline sits in one deadline map.
+//!
+//! This file holds the reactor's state, its limits, the CQE `user_data`
+//! encoding, one-shot ops and `fsync`. The rest is split by concept:
+//! `runloop` (scheduling, the pass and its sleep on the W2M park, CQE dispatch),
+//! `lease` (W2M ingest and the leases it routes to), `conn` (client
+//! connections), `timer` (deadlines), `uring` (the ring), `sync` (the channels
+//! and lock tasks share) and `wake_queue`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -19,11 +26,10 @@ use slab::Slab;
 
 use self::uring::IoUringRing;
 
-use crate::runtime::w2m::{W2mReceiver, W2mSlot};
+use crate::runtime::w2m::{W2mReceiver, W2mSlot, BOOT_READY_REQUEST_ID};
 
 mod conn;
-mod futures;
-mod io;
+mod lease;
 mod runloop;
 mod sync;
 #[cfg(test)]
@@ -33,19 +39,16 @@ pub(crate) use test_support::{
     admitted_recv_queue, client_pair, egress_pair, poll_until, reactor_with_rings, read_nonblocking, ring_slot,
     spawn_drain,
 };
+mod timer;
 mod uring;
 mod wake_queue;
 
-pub(crate) use conn::{PeerGone, SendBody};
-pub(crate) use uring::check_host;
-
-use futures::Route;
-pub(crate) use futures::{AckLease, TrainFrame, TrainLease, BOOT_READY_REQUEST_ID};
-use runloop::run_queue_is_empty;
-use wake_queue::WakeQueue;
-
-pub(crate) use io::{ClientConn, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue};
+pub(crate) use conn::{ClientConn, PeerGone, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue, SendBody};
+use lease::Route;
+pub(crate) use lease::{AckLease, GroupTargets, TrainFrame, TrainLease};
 pub use sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, WriteGuard};
+pub(crate) use uring::check_host;
+use wake_queue::WakeQueue;
 
 /// The ceilings and deadlines a reactor is built with, fixed for its life.
 /// Startup resolves them from the environment; a test that has to wait one out
@@ -72,7 +75,7 @@ impl Limits {
     /// The server's, resolved from the environment.
     pub(crate) fn from_env() -> Limits {
         Limits {
-            inbound_cap: io::resolve_inbound_cap(),
+            inbound_cap: conn::resolve_inbound_cap(),
             client_send_timeout: Duration::from_millis(gnitz_foundation::env::env_num(
                 "GNITZ_CLIENT_SEND_TIMEOUT_MS",
                 30_000,
@@ -130,10 +133,10 @@ pub struct ReactorShared {
     /// Every connection with a recv armed on it, by fd. See [`conn::Armed`].
     conns: RefCell<FxHashMap<i32, conn::Armed>>,
     /// The OOM guard shared by every connection, charged per inbound frame.
-    inbound: Rc<io::Budget>,
+    inbound: Rc<conn::Budget>,
     /// Open client connections under `Limits::max_conns`; each [`ClientConn`]
     /// holds one charge of it.
-    conn_slots: Rc<io::Budget>,
+    conn_slots: Rc<conn::Budget>,
     /// The deadlines and ceilings this reactor was built with.
     limits: Limits,
     w2m: W2mReceiver,
@@ -157,13 +160,9 @@ impl std::ops::Deref for Reactor {
     }
 }
 
-/// The ring's SQ entries. This sets submit batching, not depth: a full SQ is
-/// flushed.
-const SQ_ENTRIES: u32 = 256;
-
 impl Reactor {
     pub fn new(limits: Limits, w2m: W2mReceiver) -> std::io::Result<Self> {
-        let ring = IoUringRing::new(SQ_ENTRIES)?;
+        let ring = IoUringRing::new()?;
         // Before the shared state exists: a refused claim then drops none of it,
         // and so does not end the live reactor's claim.
         runloop::claim_thread();
@@ -177,51 +176,11 @@ impl Reactor {
             deadlines: RefCell::new(BTreeMap::new()),
             next_timer_id: Cell::new(0),
             conns: RefCell::new(FxHashMap::default()),
-            inbound: io::Budget::new(limits.inbound_cap),
-            conn_slots: io::Budget::new(limits.max_conns),
+            inbound: conn::Budget::new(limits.inbound_cap),
+            conn_slots: conn::Budget::new(limits.max_conns),
             limits,
             w2m,
         })))
-    }
-
-    /// The next timer id; the 64-bit counter does not wrap within a process's
-    /// life.
-    fn alloc_timer_id(&self) -> u64 {
-        let id = self.next_timer_id.get();
-        self.next_timer_id.set(id + 1);
-        id
-    }
-
-    /// Route every unread slot of every worker's ring.
-    fn drain_all_w2m(&self) {
-        for w in 0..self.w2m.num_workers() {
-            while let Some(slot) = self.w2m.try_read_slot(w) {
-                self.route(slot);
-            }
-        }
-    }
-
-    /// Arm the W2M park for a sleep. False, arming nothing, when the drain run
-    /// first woke a task.
-    fn arm_park(&self) -> bool {
-        loop {
-            self.drain_all_w2m();
-            if !run_queue_is_empty() {
-                return false;
-            }
-            if let Some((word, at)) = self.w2m.arm() {
-                // A 32-bit word with no `FUTEX2_PRIVATE`, since the park is
-                // `MAP_SHARED` across `fork()`; the mask matches any waker.
-                const FUTEX2_SIZE_U32: u32 = 2;
-                let mask = libc::FUTEX_BITSET_MATCH_ANY as u32 as u64;
-                let sqe = opcode::FutexWait::new(word.cast(), at as u64, mask, FUTEX2_SIZE_U32).build();
-                // SAFETY: the word is in a never-unmapped shared mapping, and the
-                // SQE names no other memory.
-                unsafe { self.ring.borrow_mut().push(sqe, udata(KIND_PARK, 0)) };
-                self.parked.set(true);
-                return true;
-            }
-        }
     }
 
     /// Queue `sqe` as a one-shot op holding `carry` until its CQE, whose `res` the

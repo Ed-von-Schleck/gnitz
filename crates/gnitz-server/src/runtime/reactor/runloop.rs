@@ -1,6 +1,6 @@
 //! The reactor's loop: `spawn` task scheduling, the `block_on` driver and the two
-//! halves of a pass it runs, the CQE dispatch table, and the run queue and waker
-//! vtable the wakes land in.
+//! halves of a pass it runs, the W2M park the second arms before it sleeps, the
+//! CQE dispatch table, and the run queue and waker vtable the wakes land in.
 
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
@@ -86,15 +86,26 @@ impl Reactor {
         }
     }
 
-    /// Wake every deadline that has passed.
-    fn fire_deadlines(&self) {
-        let now = Instant::now();
-        let mut d = self.deadlines.borrow_mut();
-        while let Some(e) = d.first_entry() {
-            if e.key().0 > now {
-                break;
+    /// Arm the W2M park for a sleep. False, arming nothing, when the drain run
+    /// first woke a task.
+    fn arm_park(&self) -> bool {
+        loop {
+            self.drain_all_w2m();
+            if !run_queue_is_empty() {
+                return false;
             }
-            e.remove().wake();
+            if let Some((word, at)) = self.w2m.arm() {
+                // A 32-bit word with no `FUTEX2_PRIVATE`, since the park is
+                // `MAP_SHARED` across `fork()`; the mask matches any waker.
+                const FUTEX2_SIZE_U32: u32 = 2;
+                let mask = libc::FUTEX_BITSET_MATCH_ANY as u32 as u64;
+                let sqe = opcode::FutexWait::new(word.cast(), at as u64, mask, FUTEX2_SIZE_U32).build();
+                // SAFETY: the word is in a never-unmapped shared mapping, and the
+                // SQE names no other memory.
+                unsafe { self.ring.borrow_mut().push(sqe, udata(KIND_PARK, 0)) };
+                self.parked.set(true);
+                return true;
+            }
         }
     }
 
@@ -219,7 +230,7 @@ thread_local! {
     static REACTOR_LIVE: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(super) fn run_queue_is_empty() -> bool {
+fn run_queue_is_empty() -> bool {
     RUN_QUEUE.with(|q| q.borrow().len() == 0)
 }
 

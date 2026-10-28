@@ -5,6 +5,10 @@ use std::time::Duration;
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring, Probe};
 
+/// The ring's SQ entries. This sets submit batching, not depth: [`IoUringRing::push`]
+/// flushes a full SQ.
+pub(super) const SQ_ENTRIES: u32 = 256;
+
 pub(super) struct IoUringRing {
     ring: IoUring,
 }
@@ -62,8 +66,8 @@ pub(crate) fn check_host() -> Result<(), String> {
 }
 
 impl IoUringRing {
-    pub(super) fn new(entries: u32) -> std::io::Result<Self> {
-        Ok(IoUringRing { ring: IoUring::new(entries)? })
+    pub(super) fn new() -> std::io::Result<Self> {
+        Ok(IoUringRing { ring: IoUring::new(SQ_ENTRIES)? })
     }
 
     /// Queue `sqe` under `user_data`, first submitting the pending batch if the SQ

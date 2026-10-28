@@ -139,7 +139,8 @@ Exit codes:
   0    clean shutdown
   64   the arguments above are refused; nothing was created, and a restart
        with the same arguments is refused again
-  1    boot or runtime failure
+  1    boot failure
+  2    a worker process died while serving
   134  fail-stop abort (128 + SIGABRT)
 ";
 
@@ -158,7 +159,7 @@ fn parse_level(s: &str) -> Result<Level, String> {
 
 /// Parse `--workers=N` into `1..=MAX_WORKERS`, or `--workers=auto` into `None`.
 fn parse_workers(val: &str) -> Result<Option<u32>, String> {
-    const MAX: u32 = runtime::MAX_WORKERS as u32;
+    const MAX: u32 = gnitz_wire::MAX_WORKERS as u32;
     if val == "auto" {
         return Ok(None);
     }
@@ -170,15 +171,10 @@ fn parse_workers(val: &str) -> Result<Option<u32>, String> {
 }
 
 /// What argv asks for: each flag parsed, and the TLS flags checked against each
-/// other. `tls` is `None` when no TLS listener was asked for.
+/// other.
 struct Args {
-    data_dir: String,
-    socket_path: String,
-    /// `None`: `--workers=auto`.
-    workers: Option<u32>,
     level: Level,
-    tls: Option<runtime::TlsArgs>,
-    backup_dir: Option<String>,
+    server: runtime::ServerArgs,
 }
 
 /// Parse argv (program name excluded), with `GNITZ_LOG_LEVEL` as `env_level`.
@@ -260,12 +256,14 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
         None => None,
     };
     Ok(Args {
-        data_dir: data_dir.clone(),
-        socket_path: socket_path.clone(),
-        workers,
         level,
-        tls,
-        backup_dir,
+        server: runtime::ServerArgs {
+            data_dir: data_dir.clone(),
+            socket_path: socket_path.clone(),
+            workers,
+            tls,
+            backup_dir,
+        },
     })
 }
 
@@ -326,22 +324,18 @@ fn main() {
         eprintln!("Try 'gnitz-server --help' for usage information");
         process::exit(EX_USAGE);
     };
-    let args = parse_args(&args, env_level.as_deref()).unwrap_or_else(|e| refuse(e));
+    let mut args = parse_args(&args, env_level.as_deref()).unwrap_or_else(|e| refuse(e));
     gnitz_foundation::log::init(args.level, gnitz_foundation::log::Tag::Master);
     // Here and not in the boot: a bind the policy refuses and a PEM file that
     // does not load are refusals of argv.
-    let tls = args
+    args.server.tls = args
+        .server
         .tls
+        .take()
         .map(runtime::TlsArgs::resolve)
         .transpose()
         .unwrap_or_else(|e| refuse(e));
-    process::exit(runtime::server_main(
-        &args.data_dir,
-        &args.socket_path,
-        args.workers,
-        tls,
-        args.backup_dir,
-    ));
+    process::exit(runtime::server_main(args.server));
 }
 
 #[cfg(test)]

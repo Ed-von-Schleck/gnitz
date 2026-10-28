@@ -1,11 +1,10 @@
-//! Helpers shared by `runtime`'s tests, across `orchestration`, `protocol` and
-//! `reactor`.
+//! Helpers shared by `runtime`'s tests, across its submodules.
 //!
 //! Here rather than in the engine's testkit because nothing below this crate
 //! uses them: a ring is a `runtime` shape, and a helper that crosses no crate
 //! boundary should not sit on one's published surface.
 
-impl crate::runtime::wire::WireMsg<'_> {
+impl crate::runtime::frame::WireMsg<'_> {
     /// Encode into a fresh `Vec` sized by `WireMsg::size`.
     pub(crate) fn encode_to_vec(&self) -> Vec<u8> {
         let mut buf = vec![0u8; self.size()];

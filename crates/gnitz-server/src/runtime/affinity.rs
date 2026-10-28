@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use super::MAX_WORKERS;
+use gnitz_wire::MAX_WORKERS;
 
 const CPU_ROOT: &str = "/sys/devices/system/cpu";
 const NODE_ROOT: &str = "/sys/devices/system/node";

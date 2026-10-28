@@ -1,13 +1,14 @@
 //! Server bootstrap: single entry point for server startup.
 //!
 //! `server_main()` opens the catalog, allocates shared IPC resources, forks workers,
-//! runs SAL recovery, and enters the executor event loop.
+//! runs SAL recovery, and enters the executor event loop. It also picks the
+//! master's exit code: 0 after a shutdown signal, 1 for a failed boot, 2 when a
+//! worker died while serving.
 //!
 //! **Recovery order is a crash guard**: every step is placed so a crash at any
 //! point rebuilds a view rather than silently resuming a stale one.
 
 use std::os::fd::AsRawFd;
-use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, UnreplayedCatalog};
 use gnitz_foundation::fault::Seam;
@@ -18,10 +19,11 @@ use crate::runtime::listen;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::mesh::{self, Mesh};
 use crate::runtime::park::WorkerParks;
-use crate::runtime::reactor::{check_host, select2, AckLease, Either, Limits, Reactor, BOOT_READY_REQUEST_ID};
+use crate::runtime::reactor::{check_host, select2, AckLease, Either, Limits, Reactor};
 use crate::runtime::sal::{CommittedTail, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
+use crate::runtime::signals;
 use crate::runtime::tls::{TlsArgs, TlsListener};
-use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
+use crate::runtime::w2m::{self, W2mReceiver, W2mWriter, BOOT_READY_REQUEST_ID};
 use crate::runtime::worker::WorkerProcess;
 use gnitz_store::relation::{Residency, StoreConfig};
 use gnitz_zset::algebra::Slot;
@@ -181,19 +183,26 @@ fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: CommittedTail, slot: 
 // Server main entry point
 // ---------------------------------------------------------------------------
 
+/// What argv asks the server to run.
+pub(crate) struct ServerArgs {
+    pub(crate) data_dir: String,
+    pub(crate) socket_path: String,
+    /// The worker count, or `None` (`--workers=auto`) to size it from the host.
+    pub(crate) workers: Option<u32>,
+    /// `None` when no TLS listener was asked for.
+    pub(crate) tls: Option<TlsArgs>,
+    /// The directory BACKUP writes into; `None` refuses BACKUP.
+    pub(crate) backup_dir: Option<String>,
+}
+
 /// Single entry point for the entire server bootstrap: opens the catalog,
 /// allocates the shared IPC regions, forks the workers, runs recovery, and
 /// enters the executor event loop.
 ///
-/// Returns 0 on clean exit, non-zero on error.
-pub fn server_main(
-    data_dir: &str,
-    socket_path: &str,
-    workers: Option<u32>,
-    tls: Option<TlsArgs>,
-    backup_dir: Option<String>,
-) -> i32 {
-    match run_server(data_dir, socket_path, workers, tls, backup_dir) {
+/// Returns the process's exit code: 0 after a shutdown signal, 1 when the boot
+/// failed, 2 when a worker died while serving.
+pub(crate) fn server_main(args: ServerArgs) -> i32 {
+    match run_server(args) {
         Ok(rc) => rc,
         Err(e) => {
             gnitz_error!("{e}");
@@ -202,22 +211,17 @@ pub fn server_main(
     }
 }
 
-/// One worker's share of the IPC: the SAL it reads, and its own ends.
+/// One worker's own ends of the IPC regions.
 struct WorkerIpc {
-    tail: CommittedTail,
     w2m_writer: W2mWriter,
     mesh: Mesh,
 }
 
-/// The SAL and every end of the regions the master and its forked workers talk
-/// through.
+/// Every end of the regions the master and its forked workers talk through.
 ///
 /// Nothing here is reclaimed on error: the only response to a failed boot is to
 /// exit the process, which returns all of it to the kernel.
 struct SharedIpc {
-    /// The committed tail every recovery replays, and the epoch the next writer
-    /// epoch starts above. Read once with the mapping, before the fork.
-    tail: CommittedTail,
     /// In rank order.
     workers: Vec<WorkerIpc>,
     /// The master's ends: the reader over every ring, and every worker's park
@@ -226,18 +230,22 @@ struct SharedIpc {
     parks: WorkerParks,
 }
 
-/// Open and map the SAL, the workers' parks, one W2M ring per worker, and the
-/// exchange mesh.
-fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
-    let tail = CommittedTail::read(SalLog::open(data_dir)?)?;
+/// Map the workers' parks, one W2M ring per worker, and the exchange mesh.
+fn acquire_shared_ipc(nw: usize) -> Result<SharedIpc, String> {
     let parks = WorkerParks::create(nw).map_err(|e| format!("failed to map the worker parks: {e}"))?;
     let (writers, receiver) = w2m::create(nw).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
     let meshes =
         mesh::create(mesh::outbox_bytes(), parks).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
     let workers = (writers.into_iter().zip(meshes))
-        .map(|(w2m_writer, mesh)| WorkerIpc { tail, w2m_writer, mesh })
+        .map(|(w2m_writer, mesh)| WorkerIpc { w2m_writer, mesh })
         .collect();
-    Ok(SharedIpc { tail, workers, receiver, parks })
+    Ok(SharedIpc { workers, receiver, parks })
+}
+
+/// Worker `w`'s log file, which its stdout and stderr are redirected to. The
+/// name is also read by the test harnesses, which find a worker's log by it.
+fn worker_log(data_dir: &str, w: usize) -> String {
+    format!("{data_dir}/worker_{w}.log")
 }
 
 /// The forked child's whole life: latch its rank, redirect its logs to
@@ -248,25 +256,15 @@ fn run_worker_child(
     data_dir: &str,
     master_pid: i32,
     catalog: &mut CatalogEngine,
+    tail: CommittedTail,
     mut ipc: WorkerIpc,
     pinning: Option<&affinity::Pinning>,
 ) -> ! {
     let w = slot.rank as usize;
 
-    // Die immediately if the master exits for any reason: a worker parks on the
-    // SAL with no timeout, so this is its only notice.
-    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
-    // A reload and a stop are the master's: a Ctrl-C or a `pkill` reaching the
-    // whole group must not kill a worker ahead of the master's checkpoint.
-    for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
-        unsafe { libc::signal(sig, libc::SIG_IGN) };
-    }
-    // Re-check: parent may have died in the fork→prctl window.
-    if unsafe { libc::getppid() } != master_pid {
-        unsafe { libc::_exit(0) };
-    }
+    signals::detach_worker(master_pid);
 
-    if let Ok(log) = std::fs::File::create(format!("{data_dir}/worker_{w}.log")) {
+    if let Ok(log) = std::fs::File::create(worker_log(data_dir, w)) {
         unsafe {
             libc::dup2(log.as_raw_fd(), 1);
             libc::dup2(log.as_raw_fd(), 2);
@@ -281,7 +279,7 @@ fn run_worker_child(
     // Pinned before the recovery below allocates, so its pages land on this core's node.
     let boot = pinning
         .map_or(Ok(()), |p| p.enter_worker(w))
-        .and_then(|()| worker_boot_recovery(catalog, ipc.tail, slot));
+        .and_then(|()| worker_boot_recovery(catalog, tail, slot));
     if let Err(e) = boot {
         // No frame: the master's death watch fails the boot.
         gnitz_error!("{e}");
@@ -290,7 +288,7 @@ fn run_worker_child(
 
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
-    let sal_reader = SalReader::new(ipc.tail.log(), slot.rank, ipc.tail.live_epoch());
+    let sal_reader = SalReader::new(tail.log(), slot.rank, tail.live_epoch());
     // The id the master leases before it collects.
     ipc.w2m_writer.send_ack(BOOT_READY_REQUEST_ID);
     WorkerProcess::new(catalog, sal_reader, ipc.w2m_writer, ipc.mesh).run()
@@ -323,6 +321,7 @@ fn master_pre_fork_recovery(mut opened: UnreplayedCatalog, tail: CommittedTail) 
 fn fork_workers(
     catalog: &mut CatalogEngine,
     data_dir: &str,
+    tail: CommittedTail,
     workers: Vec<WorkerIpc>,
     pinning: Option<&affinity::Pinning>,
 ) -> Result<Vec<i32>, String> {
@@ -337,6 +336,7 @@ fn fork_workers(
                 data_dir,
                 master_pid,
                 catalog,
+                tail,
                 ipc,
                 pinning,
             ),
@@ -409,18 +409,19 @@ fn raise_fd_limit(target: u64) {
     }
 }
 
-/// `workers`: the worker count, or `None` to size it from the host.
-fn run_server(
-    data_dir: &str,
-    socket_path: &str,
-    workers: Option<u32>,
-    tls: Option<TlsArgs>,
-    backup_dir: Option<String>,
-) -> Result<i32, String> {
+fn run_server(args: ServerArgs) -> Result<i32, String> {
+    let ServerArgs {
+        data_dir,
+        socket_path,
+        workers,
+        tls,
+        backup_dir,
+    } = args;
+    let data_dir = data_dir.as_str();
     // Ahead of anything a refusal would have to undo: the reactor cannot run
     // without io_uring, and nothing else tells a container why.
     check_host()?;
-    executor::install_reload_handler();
+    signals::catch_reload();
     let limits = Limits::from_env();
     // Client connections are the one descriptor demand that grows: a shard is
     // held by its mapping, and an fsync batch opens a bounded chunk.
@@ -443,24 +444,22 @@ fn run_server(
     let tls = tls.map(|args| TlsListener::open(args, data_dir)).transpose()?;
 
     gnitz_note!("Starting {num_workers} workers");
+    // The template of `worker_log`.
     gnitz_note!("Worker logs: {}/worker_N.log (N=0..{})", data_dir, num_workers - 1);
 
-    let ipc = acquire_shared_ipc(data_dir, nw)?;
+    // The committed tail every recovery replays, and the epoch the next writer
+    // epoch starts above. Read once, before the fork.
+    let tail = CommittedTail::read(SalLog::open(data_dir)?)?;
+    let SharedIpc { workers, receiver, parks } = acquire_shared_ipc(nw)?;
 
     // Leaked: the dispatcher and reactor borrow it for the life of the process.
-    let catalog: &'static mut CatalogEngine = Box::leak(Box::new(master_pre_fork_recovery(opened, ipc.tail)?));
+    let catalog: &'static mut CatalogEngine = Box::leak(Box::new(master_pre_fork_recovery(opened, tail)?));
 
-    let SharedIpc { tail, workers, receiver, parks } = ipc;
-    let worker_pids = fork_workers(catalog, data_dir, workers, pinning.as_ref())?;
+    let worker_pids = fork_workers(catalog, data_dir, tail, workers, pinning.as_ref())?;
 
     // --- Parent process ---
     let reactor = Reactor::new(limits, receiver).map_err(|e| format!("io_uring init failed: {e}"))?;
-    let dispatcher = Rc::new(MasterDispatcher::new(
-        worker_pids,
-        catalog,
-        SalWriter::new(tail.log(), parks),
-        reactor,
-    ));
+    let dispatcher = MasterDispatcher::new(worker_pids, catalog, SalWriter::new(tail.log(), parks), reactor);
 
     // The workers' ready ACKs. Leased before the loop first runs, which drops
     // every W2M frame no lease routes.
@@ -472,13 +471,22 @@ fn run_server(
         match select2(recovery, dispatcher.worker_death()).await {
             Either::A(r) => r,
             Either::B(w) => Err(format!(
-                "worker {w} exited during recovery (log: {data_dir}/worker_{w}.log)"
+                "worker {w} exited during recovery (log: {})",
+                worker_log(data_dir, w)
             )),
         }
     })?;
 
-    let listeners = listen::bind_listeners(data_dir, socket_path, tls)?;
-    Ok(executor::run(dispatcher, data_dir, backup_dir, listeners))
+    let listeners = listen::bind_listeners(data_dir, &socket_path, tls)?;
+    // `2` separates a dead worker from a failed boot's `1` and from
+    // `gnitz_fatal_abort!`'s `134`.
+    match executor::run(dispatcher, backup_dir, listeners) {
+        None => Ok(0),
+        Some(w) => {
+            gnitz_error!("Worker {w} crashed (log: {}); workers stopped", worker_log(data_dir, w));
+            Ok(2)
+        }
+    }
 }
 
 #[cfg(test)]

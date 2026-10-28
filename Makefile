@@ -191,10 +191,10 @@ fuzz-server: ## Fuzz real servers with edited seed traffic under AFL++ (JOBS=, T
 # random inputs. Their inputs touch far more code than libFuzzer is built for, so
 # hit counts are left out of its features, and an input may grow to its full
 # length at once.
-FUZZ_TARGETS := traffic@gnitz@runtime::orchestration::executor::fuzz::traffic_fuzz \
+FUZZ_TARGETS := traffic@gnitz@runtime::executor::fuzz::traffic_fuzz \
                 program@gnitz-expr@program::fuzz::program_fuzz \
                 reply@gnitz-core@connection::fuzz::reply_fuzz \
-                hello@gnitz@runtime::reactor::io::fuzz::hello_fuzz
+                hello@gnitz@runtime::reactor::conn::fuzz::hello_fuzz
 fuzz_target   = $(subst @, ,$(filter $(T)@%,$(FUZZ_TARGETS)))
 
 fuzz: ## Fuzz an in-process target under libFuzzer + ASan: T=traffic (DDL, pushes, scans), program (expression VM), reply (client), hello (before admission); TIME=

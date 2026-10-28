@@ -29,9 +29,10 @@ compile_error!("GnitzDB requires a little-endian target; the wire format is LE-o
 /// Declare a **wire enum**: a closed set of values crossing the wire, with the
 /// total encode and partial decode every such set needs.
 ///
-/// `ALL`, `as_wire` and `from_wire` are all generated from the one variant list,
-/// so a decode table cannot disagree with the discriminants it mirrors and a new
-/// variant is covered without a second edit.
+/// `ALL`, `as_wire`, `from_wire` and `variant_name` (which `Debug` prints) are
+/// all generated from the one variant list, so a decode table cannot disagree
+/// with the discriminants it mirrors and a new variant is covered without a
+/// second edit.
 #[macro_export]
 macro_rules! wire_enum {
     (
@@ -41,7 +42,7 @@ macro_rules! wire_enum {
         }
     ) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[derive(Clone, Copy, PartialEq, Eq)]
         #[repr($repr)]
         $vis enum $name {
             $($(#[$vmeta])* $variant = $value),+
@@ -68,6 +69,19 @@ macro_rules! wire_enum {
                     i += 1;
                 }
                 None
+            }
+
+            /// This variant's name, as declared.
+            pub const fn variant_name(self) -> &'static str {
+                match self {
+                    $($name::$variant => stringify!($variant)),+
+                }
+            }
+        }
+
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                f.write_str(self.variant_name())
             }
         }
 

@@ -31,7 +31,7 @@ from _sql import insert, values
     ("v", "CREATE VIEW v AS SELECT id, g FROM t; CREATE INDEX ON v(g)", False),
 ], ids=["table", "unique", "view"])
 def test_an_index_crosses_a_clean_restart(own_server, wrote, launched, rebuilt, owner, ddl, unique):
-    """A graceful stop's shutdown barrier runs a full checkpoint sequence, whose
+    """A graceful stop runs a full checkpoint sequence after its queued writes, whose
     ephemeral round publishes every worker's index at the committed generation.
     A restart at the same count must reload it: the seeks alone would pass on a
     silent rebuild, so the marker is the discriminating assertion. A restart at

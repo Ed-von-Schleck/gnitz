@@ -1,6 +1,6 @@
 use super::*;
 use crate::catalog::SysFamily;
-use crate::runtime::master::scatter::with_routed;
+use crate::runtime::master::route::with_routed;
 use crate::runtime::sal::fixtures::{holders_of, test_log};
 use crate::runtime::sal::SalGroup;
 use crate::test_support::{
