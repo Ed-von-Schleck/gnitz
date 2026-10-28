@@ -1,19 +1,20 @@
 """Real text: the paragraphs of public-domain books from Project Gutenberg.
 
-Each book is fetched once and kept under `tmp/corpus/`; its body — the text
-between Gutenberg's start and end markers, the licence boilerplate left out — is
-pinned by its SHA-256, so every machine runs a scenario over the same bytes.
+Each book's body — the text between Gutenberg's start and end markers, the
+licence boilerplate left out — is checked in xz-compressed under
+`benchmarks/corpus/`, so a run reads no network. Each body is pinned by its
+SHA-256, so a corpus file that changed fails the run instead of silently moving
+every number taken over it.
 """
 
 from __future__ import annotations
 
 import hashlib
+import lzma
 import re
-import urllib.request
 from pathlib import Path
 
-CACHE = Path(__file__).resolve().parents[2] / "tmp" / "corpus"
-URL = "https://www.gutenberg.org/cache/epub/{id}/pg{id}.txt"
+CORPUS = Path(__file__).resolve().parents[1] / "corpus"
 
 # (Gutenberg id, what it is, SHA-256 of its body)
 BOOKS = [
@@ -21,10 +22,10 @@ BOOKS = [
     (10, "King James Bible (en)", "177648b66a029c3ec8a77368226c976954b14fd1d6f001f509e9f08ce22ae753"),
     (2600, "Tolstoy, War and Peace (en)", "cb6c666a1e9088f5993524c4c435db30aa2e87b28066a854284a2838ee210c36"),
     (135, "Hugo, Les Misérables (en)", "f6efd041668276b9275faba052fb0e0051f3520247b8613d7acb85e4aff841bc"),
-    (1184, "Dumas, The Count of Monte Cristo (en)", "2aafcc204f5262d0e0f1babcb8b3427fa608f3db8319325e491088aa6aa51e46"),
+    (1184, "Dumas, The Count of Monte Cristo (en)", "df2a3159996aff92642cc36db067025555c82fa72c3e57d53c0604c7ba9a0347"),
     (28054, "Dostoyevsky, The Brothers Karamazov (en)", "5079966b332aae5834fec75c9aedb7572a0f42c75ce18a342b27607f5cb3c0fa"),
     (6593, "Fielding, Tom Jones (en)", "da513abb211ae6bf0f4002033630753391f466c599e9299914c2c0c7fc8c48b1"),
-    (2554, "Dostoyevsky, Crime and Punishment (en)", "25809270f8085c6eeb426287052fc0c82a2051736705f995f37313d7622f3c2e"),
+    (2554, "Dostoyevsky, Crime and Punishment (en)", "c85aa6e6e6ffe85aa1cc7c50b824ed568bb7dc47ddff884306a31eb835ec269e"),
     (2000, "Cervantes, Don Quijote (es)", "9b66a97b875b88b999f0c198b243bf3d396a2785b0126140d0f1f0e68f016ae6"),
     (2650, "Proust, Du côté de chez Swann (fr)", "9626e3c01bf4ac978c0e67ba32bc15cf71430a0b707c51aee0831b2173d09fd7"),
     (17489, "Hugo, Les misérables I: Fantine (fr)", "b313b3239c29ec1e5fb829995e0f263151c1a1943466550753a6d95fdf18a054"),
@@ -35,21 +36,11 @@ BOOKS = [
 
 
 def _body(book_id: int, sha256: str) -> str:
-    path = CACHE / f"{book_id}.txt"
-    if not path.exists():
-        with urllib.request.urlopen(URL.format(id=book_id), timeout=60) as resp:
-            raw = resp.read().decode("utf-8-sig").replace("\r\n", "\n")
-        start = raw.index("\n", raw.index("*** START OF"))
-        body = raw[start:raw.index("*** END OF")]
-        got = hashlib.sha256(body.encode()).hexdigest()
-        if got != sha256:
-            raise RuntimeError(f"Gutenberg #{book_id} changed: its body hashes to {got}, pinned {sha256}; "
-                               "pin the new hash in benchmarks/scenarios/corpus.py once its text checks out")
-        CACHE.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".part")
-        tmp.write_text(body, encoding="utf-8")
-        tmp.rename(path)
-    return path.read_text(encoding="utf-8")
+    body = lzma.decompress((CORPUS / f"{book_id}.txt.xz").read_bytes())
+    got = hashlib.sha256(body).hexdigest()
+    if got != sha256:
+        raise RuntimeError(f"benchmarks/corpus/{book_id}.txt.xz hashes to {got}, pinned {sha256}")
+    return body.decode("utf-8")
 
 
 def paragraphs() -> list[str]:
