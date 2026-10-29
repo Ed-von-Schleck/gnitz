@@ -13,35 +13,23 @@ use sqlparser::ast::{Query, Statement};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
-/// Which descriptors the client holds a plan may read before it asks the server.
+/// Which descriptors the client holds a plan may read before it asks the server:
+/// a mirrored copy's, then a kept one.
 #[derive(Clone, Copy)]
-enum Descriptors {
-    /// Only the server's: DDL, a subscription, and DML no longer trusting kept ones.
-    Server,
-    /// A mirrored copy's: an EXPLAIN, and a SELECT no longer trusting kept ones.
-    Mirrored,
-    /// A mirrored copy's, then a kept one: a SELECT.
-    MirroredOrKept,
-    /// A kept one: DML.
-    Kept,
+struct Descriptors {
+    mirrored: bool,
+    kept: bool,
 }
 
 impl Descriptors {
-    fn mirrored(self) -> bool {
-        matches!(self, Descriptors::Mirrored | Descriptors::MirroredOrKept)
-    }
-
-    fn kept(self) -> bool {
-        matches!(self, Descriptors::MirroredOrKept | Descriptors::Kept)
-    }
-
-    /// The same source with kept descriptors no longer read.
-    fn without_kept(self) -> Self {
-        match self {
-            Descriptors::MirroredOrKept | Descriptors::Mirrored => Descriptors::Mirrored,
-            Descriptors::Kept | Descriptors::Server => Descriptors::Server,
-        }
-    }
+    /// Only the server's: DDL, a subscription, and DML no longer trusting kept ones.
+    const SERVER: Self = Descriptors { mirrored: false, kept: false };
+    /// A mirrored copy's: an EXPLAIN, and a SELECT no longer trusting kept ones.
+    const MIRRORED: Self = Descriptors { mirrored: true, kept: false };
+    /// A mirrored copy's, then a kept one: a SELECT.
+    const MIRRORED_OR_KEPT: Self = Descriptors { mirrored: true, kept: true };
+    /// A kept one: DML.
+    const KEPT: Self = Descriptors { mirrored: false, kept: true };
 }
 
 /// One run of a plan: the names the server answered in earlier runs, then what
@@ -69,13 +57,13 @@ impl Catalog for Run<'_> {
         }
         if let Some(desc) = self
             .descriptors
-            .mirrored()
+            .mirrored
             .then(|| self.client.mirrored_desc(name))
             .flatten()
         {
             return Ok(Some(desc));
         }
-        if let Some(desc) = self.descriptors.kept().then(|| self.client.kept_desc(name)).flatten() {
+        if let Some(desc) = self.descriptors.kept.then(|| self.client.kept_desc(name)).flatten() {
             self.kept.set(true);
             return Ok(Some(desc));
         }
@@ -151,7 +139,7 @@ async fn planned_kept<P>(
             (Ok(plan), from_kept) if !from_kept || checked(&plan) => plan,
             (Err(e), false) => return Err(e),
             _ => {
-                descriptors = descriptors.without_kept();
+                descriptors.kept = false;
                 continue;
             }
         };
@@ -159,7 +147,7 @@ async fn planned_kept<P>(
             Err(GnitzSqlError::Client(e))
                 if e.status() == Some(WireStatus::StaleCatalog) && attempt < STALE_MAX_ATTEMPTS =>
             {
-                descriptors = descriptors.without_kept()
+                descriptors.kept = false
             }
             done => return done,
         }
@@ -179,7 +167,7 @@ pub(crate) async fn execute_statement(
         // the catch-all below; `explained_query` rejects the EXPLAIN of a non-SELECT.
         Statement::Explain { .. } => {
             let query = dml::explained_query(stmt)?;
-            let plan = planned(client, schema_name, Descriptors::Mirrored, |cat| {
+            let plan = planned(client, schema_name, Descriptors::MIRRORED, |cat| {
                 dml::plan_read(query, cat)
             })
             .await
@@ -190,7 +178,7 @@ pub(crate) async fn execute_statement(
             planned_kept(
                 client,
                 schema_name,
-                Descriptors::MirroredOrKept,
+                Descriptors::MIRRORED_OR_KEPT,
                 |cat| dml::plan_read(query, cat),
                 |plan| !plan.answers_from_schema(),
                 dml::execute_select,
@@ -246,7 +234,7 @@ pub(crate) async fn execute_statement(
             planned_kept(
                 client,
                 schema_name,
-                Descriptors::Kept,
+                Descriptors::KEPT,
                 |cat| dml::plan_insert(insert, cat),
                 |_| true,
                 dml::execute_insert,
@@ -257,7 +245,7 @@ pub(crate) async fn execute_statement(
             planned_kept(
                 client,
                 schema_name,
-                Descriptors::Kept,
+                Descriptors::KEPT,
                 |cat| dml::plan_update(update, cat),
                 |_| true,
                 dml::execute_mutation,
@@ -268,7 +256,7 @@ pub(crate) async fn execute_statement(
             planned_kept(
                 client,
                 schema_name,
-                Descriptors::Kept,
+                Descriptors::KEPT,
                 |cat| dml::plan_delete(del, cat),
                 |_| true,
                 dml::execute_mutation,
@@ -306,7 +294,7 @@ async fn execute_ddl(
 ) -> Result<&'static str, GnitzSqlError> {
     match stmt {
         Statement::CreateTable(create) => {
-            if let Some(plan) = planned(client, schema_name, Descriptors::Server, |cat| {
+            if let Some(plan) = planned(client, schema_name, Descriptors::SERVER, |cat| {
                 ddl::plan_create_table(create, cat)
             })
             .await
@@ -354,7 +342,7 @@ async fn execute_ddl(
             Ok("CREATE SCHEMA")
         }
         Statement::CreateView(cv) => {
-            if let Some(chain) = planned(client, schema_name, Descriptors::Server, |cat| {
+            if let Some(chain) = planned(client, schema_name, Descriptors::SERVER, |cat| {
                 ddl::plan_create_view(cv, text, cat)
             })
             .await
@@ -373,7 +361,7 @@ async fn execute_ddl(
             Ok("ALTER TABLE")
         }
         Statement::AlterView { name, query, columns, with_options } => {
-            let chain = planned(client, schema_name, Descriptors::Server, |cat| {
+            let chain = planned(client, schema_name, Descriptors::SERVER, |cat| {
                 ddl::plan_alter_view(name, columns, query, with_options, text, cat)
             })
             .await
@@ -392,7 +380,7 @@ pub(crate) async fn plan_subscription(
     schema_name: &str,
     query: &Query,
 ) -> Result<gnitz_core::Subscription, GnitzSqlError> {
-    planned(client, schema_name, Descriptors::Server, |cat| {
+    planned(client, schema_name, Descriptors::SERVER, |cat| {
         dml::plan_read(query, cat)
     })
     .await
