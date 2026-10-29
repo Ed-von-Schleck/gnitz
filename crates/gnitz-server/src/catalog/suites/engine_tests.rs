@@ -388,7 +388,7 @@ fn test_master_holds_no_user_store() {
     );
     for family in [SysFamily::Schema, SysFamily::Table, SysFamily::Column] {
         assert!(
-            engine.sys_relation(family).cursor().valid,
+            engine.sys_relation(family).cursor().is_valid(),
             "{} still reads its seed rows",
             family.name()
         );

@@ -2,7 +2,7 @@ use super::tests::create_read_cursor;
 use super::*;
 use crate::repr::{Batch, BatchBuilder, MappedShard, Run};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{map_shard, pk_payload_schema, pk_u64_two_i64_schema};
+use crate::test_support::{map_shard, pk_payload_schema, pk_u64_two_i64_schema, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{PkKeys, TypeCode};
 use std::hint::black_box;
@@ -11,15 +11,11 @@ use std::rc::Rc;
 
 /// U64 PK, an I64, a nullable I64 and a column that is a STRING or an I64.
 fn mixed_schema(last: TypeCode) -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, true),
-            SchemaColumn::new(last, false),
-        ],
-        &[0],
-    )
+    u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::I64, true),
+        SchemaColumn::new(last, false),
+    ])
 }
 
 /// A cursor over several shards, drained whole and read as a band: instructions
@@ -142,7 +138,7 @@ fn adv_cost(c: &mut ReadCursor, [instructions, cycles]: &[Counter; 2], keys: imp
         let sweep = || {
             for key in keys.chunks_exact(stride) {
                 c.advance_to(black_box(key));
-                black_box(c.current_weight);
+                black_box(c.current_weight());
             }
         };
         counter.measure(sweep).1 as f64 / (keys.len() / stride) as f64

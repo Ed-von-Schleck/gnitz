@@ -13,9 +13,7 @@ use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 /// A schema with one PK column per type code in `tcs`, plus a single trailing
-/// I64 payload column — the generic PK-shape builder for the merge/sort/OPK
-/// tests, parameterized by the whole key rather than by one named shape.
-/// [`pk_only_schema`] is the no-payload counterpart.
+/// I64 payload column. [`pk_only_schema`] is the no-payload counterpart.
 pub fn pk_payload_schema(tcs: &[TypeCode]) -> SchemaDescriptor {
     let mut cols: Vec<SchemaColumn> = tcs.iter().map(|&t| SchemaColumn::new(t, false)).collect();
     cols.push(SchemaColumn::new(TypeCode::I64, false));
@@ -55,8 +53,7 @@ pub fn make_batch_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Ba
     make_batch_u128_raw(schema, &rows)
 }
 
-/// A U64 PK ahead of the `payload` columns — the counterpart to
-/// [`pk_payload_schema`] parameterized by the payload columns rather than the key.
+/// A U64 PK ahead of the `payload` columns.
 pub fn u64_pk_schema(payload: &[SchemaColumn]) -> SchemaDescriptor {
     let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
     cols.extend_from_slice(payload);
@@ -224,9 +221,6 @@ pub fn pk_only_schema(types: &[TypeCode]) -> SchemaDescriptor {
 /// the canonical order-preserving key — the exact bytes the ingest path
 /// produces. Signed columns are passed as `v as u128` (the low `size()`
 /// little-endian bytes are the two's-complement image the encoder sign-flips).
-///
-/// The oracle is `opk_key_cols` itself — the encoder the ingest path writes
-/// through — not a second spelling of it.
 pub fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
     schema.opk_key_cols(vals).pk_bytes().to_vec()
 }
@@ -294,12 +288,7 @@ pub fn make_batch_bytes_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])
 /// string both drop out, which is what lets two independently produced batches
 /// be compared.
 pub fn zset_of(batch: &Batch, schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
-    let mut z: HashMap<RowKey, i64> = std::collections::HashMap::new();
-    for row in 0..batch.len() {
-        *z.entry(row_key(batch, schema, row)).or_insert(0) += batch.get_weight(row);
-    }
-    z.retain(|_, w| *w != 0);
-    z
+    zset_sum(std::slice::from_ref(batch), schema)
 }
 
 /// Every row of `batch` as its logical identity and weight, in batch order —
@@ -354,7 +343,7 @@ pub fn join_reference(
         gnitz_wire::JoinKind::Range { .. } => trace_schema.pk_prefix_stride(trace_schema.pk_cols().len() - 1),
         _ => 0,
     };
-    let mut m: HashMap<RowKey, i64> = std::collections::HashMap::new();
+    let mut m: HashMap<RowKey, i64> = HashMap::new();
     let mut rows = 0usize;
     for i in 0..delta.len() {
         let dpk = delta.get_pk_bytes(i);
@@ -405,9 +394,8 @@ pub fn pk_u64_two_i64_schema() -> SchemaDescriptor {
 /// with a single non-null I64 payload at slot 0.
 ///
 /// The PK is stored verbatim. Every consumer below the encode boundary treats it
-/// as an opaque ordered byte string, so this one builder serves every stride —
-/// which is what keeps a new PK width from growing another near-identical
-/// builder. [`opk_pk`] produces the bytes from native column values.
+/// as an opaque ordered byte string, so this one builder serves every stride.
+/// [`opk_pk`] produces the bytes from native column values.
 pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(impl AsRef<[u8]>, i64, i64)]) -> Batch {
     let mut b = BatchBuilder::new(schema);
     for (pk, w, val) in rows {
@@ -421,7 +409,7 @@ pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(impl AsRef<[u8]>, i64,
 }
 
 /// Payload column 0 of row `row`, an 8-byte integer.
-pub fn payload0_i64<S: gnitz_wire::RowSource>(src: &S, row: usize) -> i64 {
+pub fn payload0_i64<S: RowSource>(src: &S, row: usize) -> i64 {
     gnitz_wire::payload_u64(src, row, 0) as i64
 }
 
@@ -443,14 +431,14 @@ pub fn batch_rows(batch: &Batch) -> Vec<(u64, i64, i64)> {
 
 /// The Z-set sum of `inputs`, net-zero elements dropped.
 pub fn zset_sum(inputs: &[Batch], schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
-    let mut want: HashMap<RowKey, i64> = HashMap::new();
+    let mut z: HashMap<RowKey, i64> = HashMap::new();
     for b in inputs {
-        for (key, w) in zset_of(b, schema) {
-            *want.entry(key).or_insert(0) += w;
+        for row in 0..b.len() {
+            *z.entry(row_key(b, schema, row)).or_insert(0) += b.get_weight(row);
         }
     }
-    want.retain(|_, w| *w != 0);
-    want
+    z.retain(|_, w| *w != 0);
+    z
 }
 
 /// Fixed-int schemas at both edges of every argsort key form — `≤8` (strides 1,

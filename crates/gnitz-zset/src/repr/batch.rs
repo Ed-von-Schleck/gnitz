@@ -8,7 +8,7 @@ use std::ops::Range;
 use super::batch_pool::{is_tight, PooledBuf};
 use super::merge;
 use super::run::StoredRow;
-use super::scatter::copy_ranges;
+use super::scatter::{copy_ranges, Pick};
 use super::seek::ColPtr;
 use super::string_heap::{self, relocated_cell, BlobCache};
 use super::writer::DirectWriter;
@@ -793,7 +793,7 @@ impl Batch {
         let new_null_bits = gnitz_wire::low_bits_mask(n_new);
 
         let mut output = self.copied_into(out_schema, first_slot, |w| {
-            // The appended columns are NULL, and a NULL cell is zeroed.
+            // The new columns are NULL, and a NULL cell is zeroed.
             for pi in new_slots {
                 w.col_mut(pi).fill(0);
             }
@@ -1120,7 +1120,7 @@ impl Batch {
     /// into a fresh batch, `survivors` then holding what
     /// [`merge::consolidate_groups`] found — per output row, the row it
     /// was. Left empty when the rows stood.
-    pub(crate) fn consolidate_recording(&mut self, survivors: &mut Vec<(u32, u32, i64)>) {
+    pub(crate) fn consolidate_recording(&mut self, survivors: &mut Vec<Pick>) {
         match self.stands_consolidated() {
             true => self.certify_consolidated(),
             false => {
@@ -1154,7 +1154,7 @@ impl Batch {
     /// `survivors` what [`merge::consolidate_groups`] found: per output
     /// row, the `batch` row it is.
     #[inline(always)]
-    fn consolidated_from(batch: &Batch, survivors: &mut Vec<(u32, u32, i64)>) -> Batch {
+    fn consolidated_from(batch: &Batch, survivors: &mut Vec<Pick>) -> Batch {
         let schema = &batch.schema;
         let mb = batch.as_mem_batch();
         // Folded first, so the arena is sized to the survivors.
@@ -1385,11 +1385,9 @@ impl<'a> MemBatch<'a> {
 
 /// Each method forwards via UFCS to the inherent accessor of the same name, so
 /// the call binds to the concrete read rather than recursing into the trait.
-///
-/// Every forwarder — **and every inherent accessor it UFCS-calls** — is
-/// `#[inline(always)]`; see [`BatchView`] for why the plain hint is not enough.
-/// Promoting only the forwarder would leave the terminus a real call and do half
-/// the job.
+/// The forwarder and the accessor it calls are both `#[inline(always)]`: at
+/// `-O0`, which the E2E suite's debug build runs at, a plain `#[inline]` is
+/// not inlined.
 impl<'a> RowSource for MemBatch<'a> {
     #[inline(always)]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {

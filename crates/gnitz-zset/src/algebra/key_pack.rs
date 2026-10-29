@@ -186,7 +186,7 @@ struct KeyCol {
 #[derive(Clone)]
 pub(crate) struct KeyPacker {
     /// The packed columns in key order, between the bitmap and the fold: the
-    /// first `n_cols`. Inline, so a span's packer built per batch allocates nothing.
+    /// first `n_cols`. Inline, so a span's packer cloned per push allocates nothing.
     cols: [KeyCol; MAX_PK_COLUMNS],
     n_cols: u8,
     pub(crate) out_stride: usize,

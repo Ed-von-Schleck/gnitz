@@ -16,7 +16,7 @@ fn materialize_carrying_charges_each_sources_dropped_rows() {
     };
     let (a, b) = (side(1, b'a', &[b'x'; 30]), side(2, b'b', &[b'y'; 50]));
     let sources = [a.as_mem_batch(), b.as_mem_batch()];
-    let rows: Vec<(u32, u32, i64)> = (0..8)
+    let rows: Vec<Pick> = (0..8)
         .filter(|&r| r != 3)
         .flat_map(|r| [(0, r, 1), (1, r, 1)])
         .collect();

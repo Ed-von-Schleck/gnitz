@@ -71,28 +71,32 @@ pub(crate) struct AggValues {
     heap: Vec<u8>,
     /// The list, shared with its plan: aggregate `k` owns value column `k`.
     aggs: Rc<[Agg]>,
-    /// Whether an aggregate of the list is an extreme, a wide one.
-    extremes: bool,
-    wides: bool,
     groups: usize,
     /// Groups each aggregate has room for: aggregate `k`'s values start at
     /// `k * cap`.
     cap: usize,
 }
 
+/// Whether a list carries an extremum, and so a `has` value per group.
+fn extremes(aggs: &[Agg]) -> bool {
+    aggs.iter().any(|a| !a.is_linear())
+}
+
+/// Whether a list carries a wide aggregate, and so a `wide` value per group.
+fn wides(aggs: &[Agg]) -> bool {
+    aggs.iter().any(Agg::is_wide)
+}
+
 impl AggValues {
     /// `groups` empty groups of `aggs`.
     pub(crate) fn new(aggs: &Rc<[Agg]>, groups: usize) -> Self {
-        let (extremes, wides) = (aggs.iter().any(|a| !a.is_linear()), aggs.iter().any(Agg::is_wide));
         let n = aggs.len() * groups;
         AggValues {
             acc: vec![0; n],
-            has: vec![false; if extremes { n } else { 0 }],
-            wide: vec![(0, 0, 0); if wides { n } else { 0 }],
+            has: vec![false; if extremes(aggs) { n } else { 0 }],
+            wide: vec![(0, 0, 0); if wides(aggs) { n } else { 0 }],
             heap: Vec::new(),
             aggs: Rc::clone(aggs),
-            extremes,
-            wides,
             groups,
             cap: groups,
         }
@@ -112,10 +116,10 @@ impl AggValues {
             let (aggs, old) = (self.aggs.len(), self.cap);
             let cap = groups.max(2 * old);
             regrow(&mut self.acc, aggs, old, cap, 0);
-            if self.extremes {
+            if extremes(&self.aggs) {
                 regrow(&mut self.has, aggs, old, cap, false);
             }
-            if self.wides {
+            if wides(&self.aggs) {
                 regrow(&mut self.wide, aggs, old, cap, (0, 0, 0));
             }
             self.cap = cap;

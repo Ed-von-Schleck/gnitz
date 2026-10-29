@@ -88,7 +88,7 @@ fn weight_clamp_bench() {
         let [_, (out, instructions)] = [(); 2].map(|()| {
             counter.measure(|| {
                 op_weight_clamp(
-                    &delta,
+                    Cow::Borrowed(&delta),
                     &mut |first, last| trace.cursor_within(first, last),
                     false,
                     Distinct,

@@ -1,15 +1,19 @@
 //! The weight clamps: distinct (`[0, 1]`) and positive_part (`[0, ∞)`).
 
+use std::borrow::Cow;
+
 use gnitz_wire::ClampKind;
 
-use crate::repr::{materialize_carrying, Batch};
+use crate::repr::{materialize_carrying, Batch, Pick};
 use crate::stream::OpenAt;
 
 /// Per consolidated (PK, payload) of `delta`, emits `clamp(w_old + Δw, 0, cap) −
 /// clamp(w_old, 0, cap)` against its weight `w_old` in the history `hist` opens —
 /// the lift of a per-element weight clamp to its delta. `hist_holds_delta`: what
-/// `hist` opens has absorbed `delta` already, so it holds `w_old + Δw`.
-pub fn op_weight_clamp(delta: &Batch, hist: OpenAt<'_>, hist_holds_delta: bool, kind: ClampKind) -> Batch {
+/// `hist` opens has absorbed `delta` already, so it holds `w_old + Δw`. When
+/// every row emits its own weight, the input is the output, moved when it is
+/// owned.
+pub fn op_weight_clamp(delta: Cow<'_, Batch>, hist: OpenAt<'_>, hist_holds_delta: bool, kind: ClampKind) -> Batch {
     debug_assert!(delta.is_consolidated());
     if delta.is_empty() {
         return Batch::empty_with_schema(delta.schema());
@@ -21,8 +25,7 @@ pub fn op_weight_clamp(delta: &Batch, hist: OpenAt<'_>, hist_holds_delta: bool, 
         ClampKind::PositivePart => i64::MAX,
     };
     let mb = delta.as_mem_batch();
-    let mut rows: Vec<(u32, u32, i64)> = Vec::new();
-    // Where every row emits its own weight, the output is the delta itself.
+    let mut rows: Vec<Pick> = Vec::new();
     let mut identity = true;
     cursor.for_each_mem_row_weight(&mb, |i, w_hist| {
         let dw = mb.get_weight(i);
@@ -38,7 +41,7 @@ pub fn op_weight_clamp(delta: &Batch, hist: OpenAt<'_>, hist_holds_delta: bool, 
         }
     });
     if identity {
-        return delta.clone();
+        return delta.into_owned();
     }
     let mut out = materialize_carrying(std::slice::from_ref(&mb), delta.schema(), &rows);
     // One row per transitioning element, in delta order: (PK, payload)-sorted, no ghosts.

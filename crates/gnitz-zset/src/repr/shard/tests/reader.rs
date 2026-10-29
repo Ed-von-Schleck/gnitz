@@ -1,7 +1,7 @@
 use super::super::codebook::Codebook;
 use super::super::file::ShardWriteOpts;
 use super::*;
-use crate::repr::scatter::{ColumnarSource, UnifiedSet};
+use crate::repr::scatter::{ColumnarSource, Pick, UnifiedSet};
 use crate::repr::StorageError;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
@@ -148,7 +148,7 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
         }
     }
     for w in [0..n, mid] {
-        let rows: Vec<(u32, u32, i64)> = w.clone().map(|r| (0, r as u32, want.get_weight(r))).collect();
+        let rows: Vec<Pick> = w.clone().map(|r| (0, r as u32, want.get_weight(r))).collect();
         let b =
             UnifiedSet::of(std::slice::from_ref(shard), schema, std::iter::once(w.clone())).materialize(&rows, None);
         assert_eq!(
@@ -205,19 +205,8 @@ fn shapes() -> Vec<Shape> {
     let u64_u8 = u64_pk_schema(&[SchemaColumn::new(TypeCode::U8, false)]);
     let u64_u128 = u64_pk_schema(&[SchemaColumn::new(TypeCode::U128, false)]);
     let opt_i64 = SchemaColumn::new(TypeCode::I64, true);
-    let three_nullable = SchemaDescriptor::new(
-        &[SchemaColumn::new(TypeCode::U64, false), opt_i64, opt_i64, opt_i64],
-        &[0],
-    );
-    let sparse_mix = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::U128, true),
-            opt_i64,
-            opt_i64,
-        ],
-        &[0],
-    );
+    let three_nullable = u64_pk_schema(&[opt_i64; 3]);
+    let sparse_mix = u64_pk_schema(&[SchemaColumn::new(TypeCode::U128, true), opt_i64, opt_i64]);
     let u128_i64 = make_schema_u128_i64();
     let all_pk = pk_only_schema(&[TypeCode::U64; 3]);
     let compound = SchemaDescriptor::new(
@@ -232,11 +221,8 @@ fn shapes() -> Vec<Shape> {
     let string = make_schema_pk_u64_payload_string();
     let nullable_string = u64_pk_schema(&[SchemaColumn::new(TypeCode::String, true)]);
     let str_col = SchemaColumn::new(TypeCode::String, false);
-    let two_strings = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false), str_col, str_col], &[0]);
-    let three_strings = SchemaDescriptor::new(
-        &[SchemaColumn::new(TypeCode::U64, false), str_col, str_col, str_col],
-        &[0],
-    );
+    let two_strings = u64_pk_schema(&[str_col; 2]);
+    let three_strings = u64_pk_schema(&[str_col; 3]);
     let heap_of = |schema: &SchemaDescriptor| REG_PAYLOAD_START + schema.num_payload_cols();
     let narrow = || {
         build(u64_i64, 40, |b, i| {
@@ -819,7 +805,7 @@ fn a_point_read_decodes_one_block_and_keeps_its_address() {
     assert_eq!(shard.pk_at(row).pk_bytes(), key);
     assert_eq!(shard.pk_rows(&key), row..row + 1);
     std::hint::black_box(shard.slice_to_owned_batch(100, n - 200));
-    let rows: Vec<(u32, u32, i64)> = (0..n as u32).map(|r| (0, r, 1)).collect();
+    let rows: Vec<Pick> = (0..n as u32).map(|r| (0, r, 1)).collect();
     let schema = make_schema_u64_i64();
     std::hint::black_box(UnifiedSet::whole(std::slice::from_ref(&shard), &schema).materialize(&rows, None));
     assert_eq!((shard.decoded_blocks(0), shard.decoded_key_blocks()), (0, 0));

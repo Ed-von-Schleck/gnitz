@@ -1572,8 +1572,8 @@ fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
     if skeleton {
         // A skeleton row is one merge group at its key's coarse weight.
         let mut sums: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
-        while cursor.valid {
-            *sums.entry(cursor.current_pk_bytes().to_vec()).or_default() += cursor.current_weight;
+        while cursor.is_valid() {
+            *sums.entry(cursor.current_pk_bytes().to_vec()).or_default() += cursor.current_weight();
             cursor.advance();
         }
         sums.retain(|_, w| *w != 0);

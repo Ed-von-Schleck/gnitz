@@ -194,8 +194,10 @@ impl WordRegion {
 /// A shard file mapped read-only and bound to the schema it reads under;
 /// every region it reads was checked when it was bound.
 pub struct MappedShard {
-    /// The mapping every pointer and `'static` slice below points into, shared
-    /// by every handle [`rebind`](Self::rebind) derives from this one.
+    /// The mapping the regions below read, shared by every handle
+    /// [`rebind`](Self::rebind) derives from this one. Two regions read
+    /// elsewhere: a column the file predates reads `ZERO_CELL` at stride 0,
+    /// and a narrowed `null_bmp` reads `_narrowed_nulls`.
     mmap: Rc<Mmap>,
     header: ShardHeader,
     schema: SchemaDescriptor,

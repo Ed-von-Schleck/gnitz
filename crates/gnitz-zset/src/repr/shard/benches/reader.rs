@@ -2,7 +2,7 @@ use super::super::codebook::Codebook;
 use super::super::file::ShardWriteOpts;
 use super::tests::{build, wide_string};
 use super::*;
-use crate::repr::scatter::UnifiedSet;
+use crate::repr::scatter::{Pick, UnifiedSet};
 use crate::repr::string_heap::{carried_dead, long_bytes_outside};
 use crate::repr::Batch;
 use crate::schema::key::probe_key;
@@ -288,7 +288,7 @@ fn shard_read_bench() {
             }
             black_box(sink)
         });
-        let rows: Vec<(u32, u32, i64)> = (0..N).map(|r| (0, r as u32, batch.get_weight(r))).collect();
+        let rows: Vec<Pick> = (0..N).map(|r| (0, r as u32, batch.get_weight(r))).collect();
         let (merged, merge_i) = instructions.measure(|| {
             let set = UnifiedSet::whole(std::slice::from_ref(&shard), &schema);
             black_box(set.materialize(&rows, None))

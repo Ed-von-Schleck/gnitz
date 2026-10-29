@@ -74,9 +74,7 @@ fn the_output_lays_out_the_key_then_both_payloads() {
             "{kind:?}: the delta's port"
         );
         assert_eq!(joined.pk_cols(), pk, "{kind:?}");
-        let got: Vec<TypeCode> = (0..joined.num_columns())
-            .map(|c| joined.columns()[c].type_code)
-            .collect();
+        let got: Vec<TypeCode> = joined.columns().iter().map(|c| c.type_code).collect();
         assert_eq!(got, types, "{kind:?}");
     }
 }

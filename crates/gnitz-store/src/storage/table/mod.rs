@@ -379,7 +379,7 @@ impl Table {
         let LiveFloor { at, judged } = self.live_floor.get();
         let cursor = self.cursor_from(at, cut);
         if !judged {
-            let first_live = cursor.passed_more_than_a_seek().then(|| match cursor.valid {
+            let first_live = cursor.passed_more_than_a_seek().then(|| match cursor.is_valid() {
                 true => PkBuf::from_bytes(cursor.current_pk_bytes()),
                 false => PkBuf::max(self.shard_index.schema.pk_stride()),
             });

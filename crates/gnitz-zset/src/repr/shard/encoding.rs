@@ -64,7 +64,7 @@ const TWO_VALUE_B_AT: usize = 8;
 const TWO_VALUE_BITS_AT: usize = 16;
 
 /// A word region's TwoValue image, bit *i* set ⇔ row *i* holds `value_b`; or
-/// `None` at a third distinct word.
+/// `None` unless the region holds exactly two distinct words.
 pub(crate) fn two_value_encode(src: &[u8]) -> Option<Vec<u8>> {
     let n = src.len() / 8;
     let first = read_u64_le(src, 0);

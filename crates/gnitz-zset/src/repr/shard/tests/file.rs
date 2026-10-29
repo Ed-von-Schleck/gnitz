@@ -1,9 +1,8 @@
 use super::*;
 use crate::repr::{merge_consolidated, BatchBuilder};
-use crate::schema::SchemaDescriptor;
 use crate::test_support::{
     make_batch, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch, map_shard, read_strings,
-    string_batch,
+    string_batch, u64_pk_schema,
 };
 use gnitz_wire::{write_u64_le, Heap, TypeCode};
 
@@ -13,19 +12,8 @@ use gnitz_wire::{write_u64_le, Heap, TypeCode};
 fn shard_bytes_are_pinned() {
     const PINNED: (u64, u64) = (30, 5542345507825367142);
     let int = SchemaColumn::new(TypeCode::I64, false);
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            int,
-            int,
-            SchemaColumn::new(TypeCode::String, false),
-            SchemaColumn::new(TypeCode::String, false),
-            SchemaColumn::new(TypeCode::I64, true),
-            int,
-            SchemaColumn::new(TypeCode::String, false),
-        ],
-        &[0],
-    );
+    let str = SchemaColumn::new(TypeCode::String, false);
+    let schema = u64_pk_schema(&[int, int, str, str, SchemaColumn::new(TypeCode::I64, true), int, str]);
     let mut b = BatchBuilder::new(&schema);
     for i in 0..64i64 {
         b.begin_row((i * 3 + 1) as u128, 1 + i % 2);

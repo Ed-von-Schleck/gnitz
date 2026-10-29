@@ -51,8 +51,8 @@ fn assert_self_description(engine: &CatalogEngine) {
     // Every live COL_TAB row, grouped by the table it describes.
     let mut described: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
     let mut c = engine.sys_relation(SysFamily::Column).cursor();
-    while c.valid {
-        if c.current_weight > 0 {
+    while c.is_valid() {
+        if c.current_weight() > 0 {
             let (src, row) = c.current_row_source();
             let r = ColTabRow::read(src, row).unwrap();
             described

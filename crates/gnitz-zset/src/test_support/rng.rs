@@ -1,9 +1,5 @@
 //! The test-only deterministic PRNG, compiled here and as part of
-//! `gnitz-zset-testkit`.
-//!
-//! Tiny xorshift64* — no `rand` crate dependency, deterministic across hosts. One
-//! copy for every property / differential test in the crate (k-way merge, range
-//! join, …) instead of a per-module re-implementation.
+//! `gnitz-zset-testkit`: xorshift64*, deterministic across hosts.
 
 pub struct Rng(u64);
 

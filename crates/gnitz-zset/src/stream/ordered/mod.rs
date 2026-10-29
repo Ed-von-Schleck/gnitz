@@ -21,7 +21,7 @@
 use std::cmp::Ordering;
 
 use crate::algebra::{GroupOutKey, KeyPacker};
-use crate::repr::{pk_group_end, Batch, CursorRow, MemBatch, ReadCursor};
+use crate::repr::{pk_group_end, Batch, CursorRow, MemBatch, Pick, ReadCursor};
 use crate::schema::key::compare_pk_ordering;
 use crate::schema::payload_order::{Generic, PayloadOrder};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
@@ -161,7 +161,7 @@ impl OrderedPlan {
         debug_assert_eq!(folded.len(), delta.len());
         // Entry `i` is delta row `i`'s, unless a fold moved the entries: then
         // `moved` records every entry's.
-        let mut moved: Vec<(u32, u32, i64)> = Vec::new();
+        let mut moved: Vec<Pick> = Vec::new();
         folded.consolidate_recording(&mut moved);
         let entries = &folded.as_mem_batch();
         let n = entries.len();
@@ -189,7 +189,7 @@ impl OrderedPlan {
         while walk.end < n {
             walk.next = walk.end;
             walk.end = pk_group_end(entries, walk.next, width);
-            let delta_row = moved.get(walk.next).map_or(walk.next, |m| m.1 as usize);
+            let delta_row = moved.get(walk.next).map_or(walk.next, |&(_, row, _)| row as usize);
             let out_pk = index.key.out_pk(&mb, delta_row);
             walk.group = prefix(walk.next);
             walk.history.seek_pk_group_ascending(walk.group);
@@ -267,7 +267,7 @@ impl Walk<'_> {
     /// The group's next element, `None` past its last.
     #[inline(always)]
     fn peek(&self) -> Option<Element> {
-        let ord = match (self.history.valid, self.pending()) {
+        let ord = match (self.history.is_valid(), self.pending()) {
             // No entry bounds the stored rows, so the group's own key does.
             (stored, false) => match stored && self.history.current_pk_bytes().starts_with(self.group) {
                 true => Ordering::Less,
@@ -283,7 +283,10 @@ impl Walk<'_> {
         };
         let (stored, entry) = (ord.is_le(), ord.is_ge());
         let (at, old) = match stored {
-            true => (At::Stored(self.history.current_position()), self.history.current_weight),
+            true => (
+                At::Stored(self.history.current_position()),
+                self.history.current_weight(),
+            ),
             false => (At::Entry(self.next as u32), 0),
         };
         let new = old.wrapping_add(if entry { self.entries.get_weight(self.next) } else { 0 });
@@ -324,7 +327,7 @@ impl Walk<'_> {
     #[inline(always)]
     fn next_stored_before_entry(&mut self) -> Option<(At, i64)> {
         debug_assert!(self.pending());
-        if !self.history.valid {
+        if !self.history.is_valid() {
             return None;
         }
         // As in `peek`: a row before the entry is the group's.
@@ -333,7 +336,7 @@ impl Walk<'_> {
             return None;
         }
         let at = At::Stored(self.history.current_position());
-        let weight = self.history.current_weight;
+        let weight = self.history.current_weight();
         self.history.advance();
         Some((at, weight))
     }

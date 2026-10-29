@@ -20,12 +20,13 @@ use gnitz_wire::{Regions, RowSource, TypeCode};
 #[derive(Clone, Copy)]
 pub struct WireRows<'a> {
     batch: &'a Batch,
-    pick: Pick<'a>,
+    selection: Selection<'a>,
     heap: usize,
 }
 
+/// Which rows of the batch a block holds.
 #[derive(Clone, Copy)]
-enum Pick<'a> {
+enum Selection<'a> {
     /// Every row, over the batch's heap as it stands.
     Whole,
     /// Rows `[start, start + rows)`, their strings relocated.
@@ -38,10 +39,10 @@ enum Pick<'a> {
 impl WireRows<'_> {
     /// Rows the block holds; never zero.
     pub fn rows(&self) -> usize {
-        match self.pick {
-            Pick::Whole => self.batch.count,
-            Pick::Range { rows, .. } => rows,
-            Pick::Listed { rows, .. } => rows.len(),
+        match self.selection {
+            Selection::Whole => self.batch.count,
+            Selection::Range { rows, .. } => rows,
+            Selection::Listed { rows, .. } => rows.len(),
         }
     }
 
@@ -53,19 +54,19 @@ impl WireRows<'_> {
     /// The block at the front of `out`. Returns bytes written.
     pub fn encode(&self, out: &mut [u8]) -> usize {
         let b = self.batch;
-        match self.pick {
-            Pick::Whole => {
+        match self.selection {
+            Selection::Whole => {
                 b.debug_verify_dead_heap();
                 wal::write_block(&b.wire_regions(), b.dead_heap, out)
             }
-            Pick::Range { start, rows } => b
+            Selection::Range { start, rows } => b
                 .encode_relocating(rows, self.heap, out, true, |writer| {
                     // An empty heap is carried: its cells name no byte of it.
                     let heap_at = b.blob.is_empty().then_some(0);
                     copy_ranges(&b.as_mem_batch(), heap_at, &[(start, start + rows)], writer);
                 })
                 .expect("a sized range fits the bytes its size reserved"),
-            Pick::Listed { rows, dedup } => b
+            Selection::Listed { rows, dedup } => b
                 .encode_listed(rows, self.heap, out, dedup)
                 .expect("a sized list fits the bytes its size reserved"),
         }
@@ -73,8 +74,6 @@ impl WireRows<'_> {
 }
 
 impl Batch {
-    // ── Wire serialization (used by the server's SAL and frame codecs) ─────
-
     /// Every row, over the heap as it stands and under its dead-byte bound;
     /// `None` for an empty batch.
     pub fn wire_whole(&self) -> Option<WireRows<'_>> {
@@ -90,7 +89,7 @@ impl Batch {
         }
         let whole = WireRows {
             batch: self,
-            pick: Pick::Whole,
+            selection: Selection::Whole,
             heap: self.blob.len(),
         };
         if start == 0 && whole.byte_size() <= budget {
@@ -106,7 +105,7 @@ impl Batch {
         };
         let out = WireRows {
             batch: self,
-            pick: Pick::Range { start, rows },
+            selection: Selection::Range { start, rows },
             heap,
         };
         debug_assert!(
@@ -141,7 +140,7 @@ impl Batch {
         };
         Some(WireRows {
             batch: self,
-            pick: Pick::Listed { rows: indices, dedup },
+            selection: Selection::Listed { rows: indices, dedup },
             heap,
         })
     }

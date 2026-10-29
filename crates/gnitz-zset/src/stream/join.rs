@@ -19,7 +19,7 @@ use crate::schema::{DerivedSchema, SchemaDescriptor};
 use crate::algebra::MapPlan;
 use crate::stream::OpenAt;
 use gnitz_expr::{ColCopy, ColMoves, ColumnLocator};
-use gnitz_wire::{null_word_at, Heap, JoinKind, PkBuf, RangeRel, RowSource, TypeCode, MAX_PK_BYTES};
+use gnitz_wire::{null_word_at, Heap, JoinKind, PkBuf, RangeRel, RowSource, TypeCode};
 
 // ---------------------------------------------------------------------------
 // The plan
@@ -304,7 +304,7 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
             rs: rs as u32,
             re: re as u32,
             at: c.current_position(),
-            w_trace: c.current_weight,
+            w_trace: c.current_weight(),
         });
     };
     match plan.walk {
@@ -526,7 +526,7 @@ fn equi_merge_walk(delta: &Batch, cursor: &mut ReadCursor, mut emit: impl FnMut(
             let j = pk_group_end(delta, i, k); // delta group
             cursor.for_each_pk_group_row(dk, |c| emit(i, j, c));
             i = j;
-        } else if cursor.valid {
+        } else if cursor.is_valid() {
             i = delta.seek(&cursor.current_pk_bytes()[..k], Some(i)); // skip delta
         } else {
             break;
@@ -551,9 +551,6 @@ fn range_merge_walk(
 ) {
     let (eq_size, above) = (probe.eq_size, probe.above);
     let (stride, last) = (delta.schema().pk_stride(), probe.last_before_split());
-    // A group's lower bound: its equality prefix over an all-zero range slot,
-    // so only the prefix is ever rewritten.
-    let mut group_lb = [0u8; MAX_PK_BYTES];
     let mut lo = 0;
     while lo < delta.len() {
         let hi = pk_group_end(delta, lo, eq_size);
@@ -588,16 +585,16 @@ fn range_merge_walk(
         );
         // Group spans ascend, so once the trace runs out inside one span no later
         // group can match either.
-        if !cursor.valid {
+        if !cursor.is_valid() {
             return;
         }
         // The cursor sits past the span, so its equality prefix names the next
-        // group the trace can match: the delta groups below it are skipped.
+        // group the trace can match: the delta groups below it are skipped by
+        // seeking to that group's zero-padded floor.
         let trace_group = &cursor.current_pk_bytes()[..eq_size];
         lo = hi;
         if hi < delta.len() && compare_pk_ordering(&delta.get_pk_bytes(hi)[..eq_size], trace_group).is_lt() {
-            group_lb[..eq_size].copy_from_slice(trace_group);
-            lo = delta.seek(&group_lb[..stride], Some(hi));
+            lo = delta.seek(group_floor(trace_group, stride).pk_bytes(), Some(hi));
         }
     }
 }

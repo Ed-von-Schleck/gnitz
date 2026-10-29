@@ -1,7 +1,7 @@
 use super::AdhocFold;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::mix;
+use crate::test_support::{mix, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{AggDescriptor, AggFunc, GroupAggs, TypeCode};
 
@@ -40,16 +40,12 @@ fn instructions(
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn adhoc_fold_bench() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TypeCode::U64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I64, false),
-            SchemaColumn::new(TypeCode::I32, true),
-            SchemaColumn::new(TypeCode::F64, false),
-        ],
-        &[0],
-    );
+    let schema = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::I32, true),
+        SchemaColumn::new(TypeCode::F64, false),
+    ]);
     let agg = |col_idx: u32, agg_op: AggFunc| AggDescriptor { col_idx, agg_op };
     let agg_sets: [(&str, Vec<AggDescriptor>); 10] = [
         ("count", vec![AggDescriptor::COUNT_STAR]),

@@ -5,6 +5,9 @@ use gnitz_wire::{key_image, PkBuf, PkColList, TypeCode};
 /// The largest worker count a server launches.
 const NW_MAX: usize = 64;
 
+/// Worker count the owner and confinement checks route against; any count works.
+const NW: usize = 4;
+
 /// Peak worker load divided by the mean, over `keys` at `nw` workers.
 fn load_spread(keys: &[u128], nw: usize) -> f64 {
     let mut counts = vec![0usize; nw];
@@ -132,9 +135,6 @@ fn an_owner_reads_the_distribution_prefix_alone() {
     }
     assert!(moved > 0, "the prefix reaches the owner");
 }
-
-/// Worker count the confinement checks route against; any count works.
-const NW: usize = 4;
 
 /// `range_band` over the PK is the band of exactly the keys a range admits, and
 /// `confined_worker` names the band's worker iff every key in it shares the

@@ -80,9 +80,7 @@ impl ScatterPlan {
 
     fn route_into(&self, mb: &MemBatch, nw: usize, sink: &mut impl RowSink) {
         match self.0 {
-            // One worker owns every key, so no key is read or hashed.
-            _ if nw == 1 => route_rows(mb, sink, Owner(0)),
-            Some(ref key) => match key.cells(mb) {
+            Some(ref key) if nw > 1 => match key.cells(mb) {
                 Some(cells) => for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(&cells, mb.weight(), sink, nw)),
                 None => match *key {
                     GroupKey::PkRange { at, n } => {
@@ -96,7 +94,9 @@ impl ScatterPlan {
                     GroupKey::Image(_) => unreachable!("an image key is one cell"),
                 },
             },
-            None => route_rows(mb, sink, Owner(0)),
+            // One worker owns every key, and a broadcast is the one list, so no
+            // key is read or hashed.
+            _ => route_rows(mb, sink, Owner(0)),
         }
     }
 }

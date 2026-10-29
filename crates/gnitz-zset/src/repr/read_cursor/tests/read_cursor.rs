@@ -38,11 +38,11 @@ fn u128_run(rows: &[(u128, i64, i64)]) -> Rc<Batch> {
 /// single-I64-payload schema of stride ≤ 16.
 fn walk(c: &mut ReadCursor) -> Vec<(u128, i64, i64)> {
     let mut rows = Vec::new();
-    while c.valid {
+    while c.is_valid() {
         let (src, row) = c.current_row_source();
         rows.push((
             gnitz_wire::widen_pk_be(c.current_pk_bytes()),
-            c.current_weight,
+            c.current_weight(),
             payload0_i64(src, row),
         ));
         c.advance();
@@ -53,7 +53,7 @@ fn walk(c: &mut ReadCursor) -> Vec<(u128, i64, i64)> {
 /// The cursor's current row, as its identity and net weight.
 fn current(c: &ReadCursor) -> (RowKey, i64) {
     let mut one = Batch::with_capacity(&c.schema, 1);
-    c.copy_current_row_into(&mut one, c.current_weight);
+    c.copy_current_row_into(&mut one, c.current_weight());
     weighted_rows(&one).remove(0)
 }
 
@@ -96,7 +96,7 @@ proptest! {
         // The walk, with its size estimate bounding what is left of it.
         let mut c = open();
         let mut walked = Vec::new();
-        while c.valid {
+        while c.is_valid() {
             prop_assert!(c.estimated_length() >= want.len() - walked.len());
             prop_assert!(!c.current_is_skeleton());
             walked.push(current(&c));
@@ -141,7 +141,7 @@ proptest! {
             fresh.seek_range_bytes(k, None);
             adv.advance_to(k);
             for c in [&fresh, &adv] {
-                prop_assert_eq!(c.valid, lower.is_some());
+                prop_assert_eq!(c.is_valid(), lower.is_some());
                 if let Some(r) = lower {
                     prop_assert_eq!(current(c), want[r].clone());
                 }
@@ -266,7 +266,7 @@ fn mode_follows_the_live_source_set() {
     let mut c = create_read_cursor(&b, &[], schema);
     c.seek_range_bytes(&opk(41), Some(&opk(51)));
     assert!(c.mode.is_none());
-    assert!(!c.valid, "no live source, so the merge drives to invalid");
+    assert!(!c.is_valid(), "no live source, so the merge drives to invalid");
     assert!(c.drain_chunk(usize::MAX).is_none());
 }
 
@@ -350,7 +350,7 @@ fn bounded_string_read_carries_only_its_own_rows() {
         .map(|pk| format!("{pk:0>40}").into_bytes())
         .collect();
     assert_eq!(strings, want);
-    assert!(!c.valid, "the window is fully drained");
+    assert!(!c.is_valid(), "the window is fully drained");
 }
 
 /// A PK group holding a skeleton row collapses to one coarse row under both
@@ -390,10 +390,10 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
 
         let mut c = create_read_cursor(std::slice::from_ref(&mem), std::slice::from_ref(&sk), schema);
         let mut groups = Vec::new();
-        while c.valid {
+        while c.is_valid() {
             groups.push((
                 gnitz_wire::widen_pk_be(c.current_pk_bytes()),
-                c.current_weight,
+                c.current_weight(),
                 c.current_is_skeleton(),
             ));
             c.advance();

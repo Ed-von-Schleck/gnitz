@@ -109,8 +109,8 @@ pub fn sum_weights(c: ReadCursor) -> i64 {
 /// The weight of every row a cursor yields, in cursor order.
 pub fn weights(mut c: ReadCursor) -> Vec<i64> {
     let mut out = Vec::new();
-    while c.valid {
-        out.push(c.current_weight);
+    while c.is_valid() {
+        out.push(c.current_weight());
         c.advance();
     }
     out

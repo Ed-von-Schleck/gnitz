@@ -11,7 +11,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use crate::repr::{
-    from_runs, from_runs_in_band, Batch, Codebook, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts,
+    from_runs, from_runs_in_band, Batch, BatchBuilder, Codebook, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts,
 };
 use crate::schema::key::group_band;
 use crate::schema::payload_order::{Generic, PayloadOrder};
@@ -21,7 +21,8 @@ use gnitz_wire::{PkBuf, TypeCode};
 
 use proptest::strategy::Strategy;
 
-use super::shared::{self_typed_slots, u64_pk_schema, zset_of, zset_sum};
+use super::rng::Rng;
+use super::shared::{make_schema_pk_u64_payload_string, self_typed_slots, u64_pk_schema, zset_of, zset_sum};
 
 /// The reindex of `source` onto its columns `key`, each at its own slot type,
 /// keeping `keep` and doing `nulls` with a NULL key: with `Drop`, the map a
@@ -111,7 +112,7 @@ pub(crate) fn le_cell(cell: &[u8]) -> u128 {
 /// A native of the integer type `tc` drawn from its zero, one, signed extremes
 /// and all-ones, zero-extended: values tie often, so a tie falls through to the
 /// next column.
-pub(crate) fn edge_native(rng: &mut crate::test_support::Rng, tc: TypeCode) -> u128 {
+pub(crate) fn edge_native(rng: &mut Rng, tc: TypeCode) -> u128 {
     let mask = gnitz_wire::image_mask(tc.wire_stride());
     let top = (mask >> 1) + 1;
     rng.pick(&[0, 1, top - 1, top, mask])
@@ -120,11 +121,7 @@ pub(crate) fn edge_native(rng: &mut crate::test_support::Rng, tc: TypeCode) -> u
 /// A random schema: `1..=MAX_PK_COLUMNS` PK columns of PK-eligible types and
 /// `0..=6` payload columns drawn from `payload`, nullable or not, all
 /// interleaved at random positions, with the PK list in random order.
-pub(crate) fn random_schema(
-    rng: &mut crate::test_support::Rng,
-    payload: &[TypeCode],
-    nullable: bool,
-) -> SchemaDescriptor {
+pub(crate) fn random_schema(rng: &mut Rng, payload: &[TypeCode], nullable: bool) -> SchemaDescriptor {
     let pk_types: Vec<TypeCode> = TypeCode::ALL.iter().copied().filter(|t| t.is_pk_eligible()).collect();
     let n_pk = 1 + rng.gen_range(gnitz_wire::MAX_PK_COLUMNS as u64) as usize;
     let n_payload = rng.gen_range(7) as usize;
@@ -179,7 +176,7 @@ pub(crate) fn ragged_schema() -> SchemaDescriptor {
 
 /// `rows` rows of [`ragged_schema`], every fifth with its `I64` NULL.
 pub(crate) fn ragged_batch(rows: usize) -> Batch {
-    let mut b = crate::repr::BatchBuilder::new(&ragged_schema());
+    let mut b = BatchBuilder::new(&ragged_schema());
     for i in 0..rows as u128 {
         b.begin_row(i, 1 + i as i64 % 3);
         b.put_int(i % 251);
@@ -193,7 +190,7 @@ pub(crate) fn ragged_batch(rows: usize) -> Batch {
 /// `(pk, value)` rows at weight 1 over a U64 PK and one STRING payload column,
 /// in the order given.
 pub(crate) fn string_batch(rows: &[(u64, impl AsRef<str>)]) -> Batch {
-    let mut b = crate::repr::BatchBuilder::new(&super::shared::make_schema_pk_u64_payload_string());
+    let mut b = BatchBuilder::new(&make_schema_pk_u64_payload_string());
     for (pk, v) in rows {
         b.begin_row(*pk as u128, 1);
         b.put_string(v.as_ref());
@@ -303,7 +300,7 @@ pub(crate) fn mix(i: u64) -> u64 {
 
 /// `(pk, weight, payload cells)` rows against `schema`, `None` a NULL cell.
 pub(crate) fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &[Option<i64>])]) -> Batch {
-    let mut batch = crate::repr::BatchBuilder::new(schema);
+    let mut batch = BatchBuilder::new(schema);
     for &(pk, weight, cells) in rows {
         batch.begin_row(pk as u128, weight);
         for &cell in cells {

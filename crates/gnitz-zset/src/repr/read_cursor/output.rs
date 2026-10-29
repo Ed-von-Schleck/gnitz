@@ -6,7 +6,7 @@ use std::rc::Rc;
 use super::super::run::Run;
 use super::{ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
-use crate::repr::scatter::{ColumnarSource, UnifiedSet};
+use crate::repr::scatter::{ColumnarSource, Pick, UnifiedSet};
 use crate::schema::payload_order::with_payload_cmp;
 use gnitz_wire::RowSource;
 
@@ -82,7 +82,8 @@ impl ReadCursor {
 
     /// Up to `max_rows` rows of `i`, the one live source, as one slice copy.
     fn drain_single(&mut self, i: usize, max_rows: usize, skeletons: &mut SkeletonKeys) -> Batch {
-        // `start` is already past the committed row.
+        // `states[i].start` is already past the committed row, so the slice
+        // starts at `current.row`.
         let start = self.current.row as usize;
         let row_count = (self.states[i].end - start).min(max_rows);
         let batch = match &self.sources[i] {
@@ -108,9 +109,9 @@ impl ReadCursor {
         batch
     }
 
-    /// Replace `out` with up to `max_rows` merge groups as `(source, row, net weight)`,
-    /// in merge order.
-    fn drain_sorted_into(&mut self, max_rows: usize, out: &mut Vec<(u32, u32, i64)>) {
+    /// Replace `out` with up to `max_rows` merge groups, one [`Pick`] each at its
+    /// net weight, in merge order.
+    fn drain_sorted_into(&mut self, max_rows: usize, out: &mut Vec<Pick>) {
         out.clear();
         out.reserve(max_rows.min(self.estimated_length()));
         out.push(self.current_pick());

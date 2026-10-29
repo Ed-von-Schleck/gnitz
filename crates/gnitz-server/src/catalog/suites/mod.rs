@@ -70,13 +70,13 @@ fn count_negative_records(c: ReadCursor) -> usize {
 
 /// Every stored weight under `idx_id` in IDX_TAB: empty once a `(+1, -1)` pair
 /// has cancelled, `[1]` for a live index, `[-1]` for a durable ghost — which
-/// [`count_records`], gating on `current_weight > 0`, cannot see at all.
+/// [`count_records`], gating on `current_weight() > 0`, cannot see at all.
 fn idx_weights_for(engine: &CatalogEngine, idx_id: u64) -> Vec<i64> {
     let mut c = engine.sys_relation(SysFamily::Index).cursor();
     let mut v = Vec::new();
-    while c.valid {
+    while c.is_valid() {
         if gnitz_wire::sys_leading_id(c.current_pk_bytes()) == idx_id {
-            v.push(c.current_weight);
+            v.push(c.current_weight());
         }
         c.advance();
     }

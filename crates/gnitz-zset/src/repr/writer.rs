@@ -5,6 +5,7 @@ use super::batch::MemBatch;
 use super::string_heap::{rebase_string_cells, BlobCache};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{Heap, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use std::ops::Range;
 
 /// Writes rows `[at, at + rows)` of a pre-allocated arena, each region handed
 /// out as a slice of exactly those rows: a batch's tail, or a wire block's fixed
@@ -86,12 +87,19 @@ impl<'a> DirectWriter<'a> {
         self.at
     }
 
+    /// The bytes of `data` that hold this writer's rows of region `r`.
+    #[inline(always)]
+    fn span(&self, r: usize) -> Range<usize> {
+        let stride = self.schema.region_stride(r);
+        let start = self.schema.region_start(r, self.cap) + self.at * stride;
+        start..start + self.rows * stride
+    }
+
     /// Region `r`, bounded to this writer's rows.
     #[inline(always)]
     pub(super) fn region_mut(&mut self, r: usize) -> &mut [u8] {
-        let stride = self.schema.region_stride(r);
-        let start = self.schema.region_start(r, self.cap) + self.at * stride;
-        &mut self.data[start..start + self.rows * stride]
+        let s = self.span(r);
+        &mut self.data[s]
     }
 
     /// The PK region, bounded to this writer's rows.
@@ -115,14 +123,11 @@ impl<'a> DirectWriter<'a> {
     /// The PK, weight and null-word regions, each bounded to this writer's rows.
     #[inline]
     pub(crate) fn fixed_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
-        let pk_stride = self.schema.pk_stride();
-        let (pk, rest) = self.data.split_at_mut(self.cap * pk_stride);
-        let (weight, rest) = rest.split_at_mut(self.cap * FIXED_REGION_BYTES);
-        (
-            &mut pk[self.at * pk_stride..][..self.rows * pk_stride],
-            &mut weight[self.at * FIXED_REGION_BYTES..][..self.rows * FIXED_REGION_BYTES],
-            &mut rest[self.at * FIXED_REGION_BYTES..][..self.rows * FIXED_REGION_BYTES],
-        )
+        let (pk, wt, nb) = (self.span(REG_PK), self.span(REG_WEIGHT), self.span(REG_NULL_BMP));
+        debug_assert!(wt.len() == self.rows * FIXED_REGION_BYTES && nb.len() == self.rows * FIXED_REGION_BYTES);
+        let (lo, hi) = self.data.split_at_mut(nb.start);
+        let (lo, mid) = lo.split_at_mut(wt.start);
+        (&mut lo[pk], &mut mid[..wt.len()], &mut hi[..nb.len()])
     }
 
     /// Every region in order, each bounded to this writer's rows, with the heap
@@ -149,12 +154,9 @@ impl<'a> DirectWriter<'a> {
     /// to and the dedup cache it runs under.
     #[inline(always)]
     pub(crate) fn string_col_mut(&mut self, pi: usize) -> (&mut [u8], &mut Vec<u8>, Option<&mut BlobCache>) {
-        let start = self.schema.region_start(REG_PAYLOAD_START + pi, self.cap) + self.at * 16;
-        (
-            &mut self.data[start..start + self.rows * 16],
-            &mut *self.blob,
-            self.blob_cache.as_deref_mut(),
-        )
+        debug_assert_eq!(self.schema.region_stride(REG_PAYLOAD_START + pi), 16);
+        let s = self.span(REG_PAYLOAD_START + pi);
+        (&mut self.data[s], &mut *self.blob, self.blob_cache.as_deref_mut())
     }
 
     /// Rebase string column `pi`, whose cells were copied verbatim from a source
@@ -181,15 +183,9 @@ impl gnitz_expr::MapTarget for DirectWriter<'_> {
     }
     #[inline(always)]
     fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
-        let r = REG_PAYLOAD_START + pi;
-        let stride = self.schema.region_stride(r);
+        let (cells, nulls) = (self.span(REG_PAYLOAD_START + pi), self.span(REG_NULL_BMP));
         // The null words lie below every payload column.
-        let (lo, hi) = self.data.split_at_mut(self.schema.region_start(r, self.cap));
-        let nulls = self.schema.region_start(REG_NULL_BMP, self.cap) + self.at * FIXED_REGION_BYTES;
-        (
-            &mut hi[self.at * stride..][..self.rows * stride],
-            &mut lo[nulls..][..self.rows * FIXED_REGION_BYTES],
-            &mut *self.blob,
-        )
+        let (lo, hi) = self.data.split_at_mut(cells.start);
+        (&mut hi[..cells.len()], &mut lo[nulls], &mut *self.blob)
     }
 }

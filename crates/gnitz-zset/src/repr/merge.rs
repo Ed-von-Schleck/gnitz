@@ -15,7 +15,7 @@ use std::ops::{ControlFlow, Range};
 
 use super::batch::{Batch, MemBatch};
 use super::loser_tree::{HeapNode, LoserTree};
-use super::scatter::ColumnarSource;
+use super::scatter::{ColumnarSource, Pick};
 use super::string_heap::{rebase_string_cells, row_long_bytes, BlobCache};
 use super::writer::DirectWriter;
 use crate::schema::key::{pack_pk_be, pk_width_dispatch, PkSortKey};
@@ -107,13 +107,13 @@ fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
 ///
 /// The PK axis is settled by each row's key under a [`MergeOrder`], and past it
 /// by [`merge_less`]; source `i` is walked over the `i`-th of `windows`.
-/// Returns `(group_src, group_row, net_weight)` per surviving (net ≠ 0) group,
-/// in (PK, payload) order.
+/// Returns one [`Pick`] per surviving (net ≠ 0) group, at its net weight, in
+/// (PK, payload) order.
 pub(crate) fn run_merge<S: ColumnarSource>(
     sources: &[S],
     schema: &SchemaDescriptor,
     windows: impl IntoIterator<Item = Range<usize>>,
-) -> Vec<(u32, u32, i64)> {
+) -> Vec<Pick> {
     if sources.is_empty() {
         return Vec::new();
     }
@@ -641,11 +641,11 @@ where
 // ---------------------------------------------------------------------------
 
 /// Sort a single batch by (PK, payload) and consolidate: sum the weights of
-/// identical rows, drop ghosts. Appends one `(0, row, net weight)` survivor per
+/// identical rows, drop ghosts. Appends one [`Pick`] `(0, row, net weight)` per
 /// group to `out` — [`run_merge`]'s single-source counterpart, in the shape
 /// [`super::scatter::UnifiedSet::materialize`] copies out and the caller sizes
 /// its arena from.
-pub(crate) fn consolidate_groups(batch: &MemBatch, out: &mut Vec<(u32, u32, i64)>) {
+pub(crate) fn consolidate_groups(batch: &MemBatch, out: &mut Vec<Pick>) {
     if batch.count == 0 {
         return;
     }
@@ -750,7 +750,7 @@ impl ArgEntry for PackedEntry {
 /// a batch whose PKs already stand in order sorts in one pass — and each run of
 /// a PK sorted by its payload as [`fold_runs`] folds it.
 #[inline]
-fn consolidate_groups_inner<P: PayloadOrder>(batch: &MemBatch, out: &mut Vec<(u32, u32, i64)>, payload: P) {
+fn consolidate_groups_inner<P: PayloadOrder>(batch: &MemBatch, out: &mut Vec<Pick>, payload: P) {
     let (n, schema, stride) = (batch.count, batch.schema, batch.pk_stride());
     if (17..=PACKED_MAX_STRIDE).contains(&stride) {
         let mut entries: Vec<PackedEntry> = (0..n as u32)
@@ -780,7 +780,7 @@ fn fold_runs<E: ArgEntry, P: PayloadOrder>(
     batch: &MemBatch,
     schema: &SchemaDescriptor,
     payload: P,
-    out: &mut Vec<(u32, u32, i64)>,
+    out: &mut Vec<Pick>,
 ) {
     let weights = batch.weight().as_chunks::<8>().0;
     // The run in hand's payload keys and rows, in a buffer every run reuses.
@@ -808,7 +808,7 @@ fn fold_run<E: ArgEntry, P: PayloadOrder>(
     payload: P,
     weights: &[[u8; 8]],
     keyed: &mut Vec<(u128, u32)>,
-    out: &mut Vec<(u32, u32, i64)>,
+    out: &mut Vec<Pick>,
 ) {
     let cmp = |a: usize, b: usize| payload.compare(schema, batch, a, batch, b);
     if let [a, b] = run {
@@ -847,7 +847,7 @@ fn fold_keyed(
     from: usize,
     keyed: &mut [(u128, u32)],
     weights: &[[u8; 8]],
-    out: &mut Vec<(u32, u32, i64)>,
+    out: &mut Vec<Pick>,
 ) {
     /// Shift each key left past the column and put the column's bits in.
     #[inline(always)]
@@ -893,7 +893,7 @@ fn fold_sorted<T>(
     idx: impl Fn(&T) -> usize,
     same: impl Fn(&T, &T) -> bool,
     weights: &[[u8; 8]],
-    out: &mut Vec<(u32, u32, i64)>,
+    out: &mut Vec<Pick>,
 ) {
     for group in sorted.chunk_by(same) {
         let weight: i64 = group.iter().map(|e| i64::from_le_bytes(weights[idx(e)])).sum();

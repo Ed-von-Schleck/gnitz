@@ -11,7 +11,7 @@ use std::ops::{ControlFlow, Range};
 use crate::repr::batch::{Batch, MemBatch};
 use crate::repr::loser_tree::{HeapNode, LoserTree};
 use crate::repr::merge::{self, MergeOrder};
-use crate::repr::scatter::ColumnarSource;
+use crate::repr::scatter::{ColumnarSource, Pick};
 use crate::repr::seek::gallop_by;
 use crate::repr::shard::MappedShard;
 use crate::schema::key::{compare_pk_ordering, group_floor};
@@ -99,12 +99,13 @@ pub struct ReadCursor {
     /// would read every run's last row at each open.
     order: MergeOrder,
     /// The drain's merge-order scratch, reused across chunks.
-    merge_order: Vec<(u32, u32, i64)>,
+    merge_order: Vec<Pick>,
     /// The drain's per-source row windows, reused across chunks.
     drain_windows: Vec<Range<usize>>,
-    // Current row state
-    pub valid: bool,
-    pub current_weight: i64,
+    /// Whether the cursor stands on a row. Written only by `commit_emitted`.
+    valid: bool,
+    /// The current row's net weight, while `valid`.
+    current_weight: i64,
     /// The row the cursor stands on, while `valid`.
     current: CursorRow,
 }
@@ -288,6 +289,19 @@ impl ReadCursor {
         }
     }
 
+    /// Whether the cursor stands on a row. The `current_*` accessors are
+    /// meaningful only while this returns `true`.
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// The current row's net weight: its group's weights summed across sources.
+    #[inline]
+    pub fn current_weight(&self) -> i64 {
+        self.current_weight
+    }
+
     /// PK region of the current row as raw bytes, without copying. The single PK
     /// accessor for any width — correct for compound/wide PKs.
     pub fn current_pk_bytes(&self) -> &[u8] {
@@ -334,9 +348,9 @@ impl ReadCursor {
         self.current
     }
 
-    /// The current row as a merge pick: `(source, row, net weight)`.
+    /// The current row as a [`Pick`] at its net weight.
     #[inline]
-    fn current_pick(&self) -> (u32, u32, i64) {
+    fn current_pick(&self) -> Pick {
         (self.current.src, self.current.row, self.current_weight)
     }
 
@@ -523,8 +537,8 @@ impl ReadCursor {
     }
 
     /// Commit (or invalidate from) the `(source_idx, row, net_weight)` an advance
-    /// emitted — the one writer of the `current_*` state, for both modes. The PK
-    /// stays as `current` and is decoded on demand.
+    /// emitted — the one writer of `valid` and the `current_*` state, for both
+    /// modes. The PK stays as `current` and is decoded on demand.
     #[inline]
     fn commit_emitted(&mut self, emitted: Option<(usize, usize, i64)>) {
         if let Some((idx, row, weight)) = emitted {

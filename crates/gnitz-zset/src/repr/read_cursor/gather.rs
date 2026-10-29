@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 
 use super::{ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
-use crate::repr::scatter::gather_rows;
+use crate::repr::scatter::{gather_rows, Pick};
 use crate::schema::{project_schema, SchemaDescriptor};
 use gnitz_expr::ColumnLocator;
 
@@ -96,7 +96,7 @@ impl PkSetGather {
             return None;
         }
         let split = self.cursor.order.coarsen;
-        let mut picks: Vec<(u32, u32, i64)> = Vec::with_capacity(self.remaining_keys().min(max_rows));
+        let mut picks: Vec<Pick> = Vec::with_capacity(self.remaining_keys().min(max_rows));
         let visited = self.for_each_live_row(max_rows, |c| {
             if split && c.current_is_skeleton() {
                 skeletons.push(c.current_pk_bytes(), c.current_weight);
@@ -104,9 +104,12 @@ impl PkSetGather {
                 picks.push(c.current_pick());
             }
         });
+        if visited == 0 {
+            return None;
+        }
         let mut out = gather_rows(&self.cursor.sources, &self.cursor.schema, &picks);
         out.certify_consolidated();
-        (visited > 0).then_some(out)
+        Some(out)
     }
 
     /// Every remaining live row at weight 1, in the [`project_schema`] layout of

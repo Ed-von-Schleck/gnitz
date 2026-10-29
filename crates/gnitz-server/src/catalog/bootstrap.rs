@@ -100,7 +100,7 @@ impl CatalogEngine {
     fn seed_system_tables(&mut self) -> Result<(), String> {
         // Per family: a crashed first boot may have published any subset of them.
         for family in SysFamily::ALL {
-            if self.sys_relation(family).cursor().valid {
+            if self.sys_relation(family).cursor().is_valid() {
                 continue;
             }
             let mut bb = BatchBuilder::new(family.schema());

@@ -132,7 +132,7 @@ fn packer_output_schema_is_the_key_slots_then_the_kept_columns() {
         let in_schema = u64_pk_schema(&cols);
         let packer = KeyPacker::new(&in_schema, key).unwrap();
         let out = packer.output_schema(&in_schema, keep).unwrap();
-        let types: Vec<TypeCode> = (0..out.num_columns()).map(|c| out.columns()[c].type_code).collect();
+        let types: Vec<TypeCode> = out.columns().iter().map(|c| c.type_code).collect();
         assert_eq!(types, want, "{payload:?} keyed on {key:?}");
         assert_eq!(out.pk_cols(), (0..key.len() as u32).collect::<Vec<_>>(), "{payload:?}");
         let slots: usize = key.iter().map(|&(_, t)| t.wire_stride()).sum();
@@ -209,11 +209,25 @@ mod pack_proptest {
             let mut got = vec![0xA5u8; rows.len() * stride];
             packer.pack_rows(&mut got, stride, mb, runs);
             for (key, &row) in got.chunks_exact(stride).zip(&rows) {
-                let want = want(row);
-                prop_assert_eq!(&key[..packer.out_stride], &want[..], "{} row {} pad {}", what, row, pad);
-                let mut one = [0u8; MAX_PK_BYTES];
-                prop_assert_eq!(packer.pack_prefix(&mut one, mb, row), &want[..], "{} row {}", what, row);
+                prop_assert_eq!(
+                    &key[..packer.out_stride],
+                    &want(row)[..],
+                    "{} row {} pad {}",
+                    what,
+                    row,
+                    pad
+                );
             }
+        }
+        for &row in &rows {
+            let mut one = [0u8; MAX_PK_BYTES];
+            prop_assert_eq!(
+                packer.pack_prefix(&mut one, mb, row),
+                &want(row)[..],
+                "{} row {}",
+                what,
+                row
+            );
         }
         Ok(())
     }

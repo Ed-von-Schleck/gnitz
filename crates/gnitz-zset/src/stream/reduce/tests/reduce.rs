@@ -443,7 +443,7 @@ fn a_wide_extreme_steps_its_own_group_past_another_groups_retraction() {
         (row(4, 0, 20, "z"), 1),
     ];
     for targets in [&first[..], &second[..]] {
-        h.tick(batch(&delta_to(&mut model, targets)).into_consolidated());
+        h.tick(batch(&delta_to(&mut model, targets)));
         assert_eq!(h.state(&[3]), aggregates(&model, &[3], &aggs, false));
     }
 }
@@ -480,7 +480,7 @@ fn two_string_extremes_keep_their_own_index_images() {
     let first = [(row(1, "aa"), 1), (row(2, "mm"), 1), (row(3, "zz"), 1)];
     let second = [(row(1, "aa"), 0), (row(3, "zz"), 0), (row(4, "b\0b"), 1)];
     for targets in [&first[..], &second[..]] {
-        h.tick(batch(&delta_to(&mut model, targets)).into_consolidated());
+        h.tick(batch(&delta_to(&mut model, targets)));
         assert_eq!(h.state(&[3]), aggregates(&model, &[3], &aggs, false));
     }
 }

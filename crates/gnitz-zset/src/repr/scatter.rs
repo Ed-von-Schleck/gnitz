@@ -4,11 +4,10 @@
 //! [`copy_ranges`] copies `[start, end)` ranges of one batch of the writer's
 //! layout and [`scatter_copy`] an index list; each row keeps its own weight.
 //! [`scatter_unified_sources`] (through [`UnifiedSet`]) takes the weight from
-//! the caller's `(src, row, weight)` triple instead: a `UnifiedSource` has no
-//! weight region, so the triple is the only channel for a merge fold's net
-//! weight — which is not any one source row's weight. [`gather_rows`] takes the
-//! same triples and reads each cell through its source, for picks sparse in
-//! their sources.
+//! the caller's [`Pick`] instead: a `UnifiedSource` has no weight region, so the
+//! pick is the only channel for a merge fold's net weight — which is not any one
+//! source row's weight. [`gather_rows`] takes the same picks and reads each cell
+//! through its source, for picks sparse in their sources.
 //!
 //! A merge source is a [`ColumnarSource`]: a row source that also carries the
 //! Z-set weight, which every N-way merge and these kernels read sources through.
@@ -25,6 +24,12 @@ use super::string_heap::{
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{Heap, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START};
+
+/// One output row of a pick-driven copy: `(source, row, weight)` — the index of
+/// the source the row is read from, its row there, and the weight it is copied
+/// out at, which overrides that row's own weight. A merge emits one per surviving
+/// (PK, payload) group, at the group's net weight.
+pub(crate) type Pick = (u32, u32, i64);
 
 /// Instantiate `$f` at the const width matching `$w`, which is also passed on.
 /// The literal width keeps the per-row copy a load/store instead of a `memcpy`
@@ -295,7 +300,7 @@ impl<'a> ColumnarSource for MemBatch<'a> {
     }
 }
 
-/// Copy the rows `rows` names, in the order given, each at the weight its triple
+/// Copy the rows `rows` names, in the order given, each at the weight its pick
 /// carries: exactly the writer's rows. The sources may be any mix of `MemBatch`
 /// and shard backings.
 ///
@@ -304,7 +309,7 @@ impl<'a> ColumnarSource for MemBatch<'a> {
 fn scatter_unified_sources(
     sources: &[UnifiedSource<'_>],
     cols: &[ColPtr],
-    rows: &[(u32, u32, i64)],
+    rows: &[Pick],
     codebook: Option<&Codebook>,
     writer: &mut DirectWriter<'_>,
 ) {
@@ -363,7 +368,7 @@ fn scatter_unified_sources(
 #[inline(always)]
 fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     sources: &[UnifiedSource<'_>],
-    rows: &[(u32, u32, i64)],
+    rows: &[Pick],
     writer: &mut DirectWriter<'_>,
     width: usize,
 ) {
@@ -400,7 +405,7 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
 fn gather_unified_col<const N: usize>(
     sources: &[UnifiedSource<'_>],
     cols: &[ColPtr],
-    rows: &[(u32, u32, i64)],
+    rows: &[Pick],
     pi: usize,
     dst: &mut [u8],
     width: usize,
@@ -415,16 +420,12 @@ fn gather_unified_col<const N: usize>(
 }
 
 /// Copy the rows `picks` names out of `sources`, in the order given, each at
-/// the weight its triple carries, into a fresh unconsolidated batch.
+/// the weight its pick carries, into a fresh unconsolidated batch.
 ///
 /// Every cell is read through its source's row accessor, so a packed shard
 /// column decodes only the blocks the picks land in: the kernel for picks
 /// sparse in their sources, where [`UnifiedSet`] would decode whole windows.
-pub(crate) fn gather_rows(
-    sources: &[impl ColumnarSource],
-    schema: &SchemaDescriptor,
-    picks: &[(u32, u32, i64)],
-) -> Batch {
+pub(crate) fn gather_rows(sources: &[impl ColumnarSource], schema: &SchemaDescriptor, picks: &[Pick]) -> Batch {
     write_to_batch(schema, picks.len(), 0, |w| {
         width_dispatch!(schema.pk_stride(), gather_pk_wt_nbm, sources, picks, w);
         for (pi, col) in schema.payload_columns() {
@@ -445,7 +446,7 @@ pub(crate) fn gather_rows(
 #[inline(always)]
 fn gather_pk_wt_nbm<const PKS: usize>(
     sources: &[impl ColumnarSource],
-    picks: &[(u32, u32, i64)],
+    picks: &[Pick],
     w: &mut DirectWriter<'_>,
     width: usize,
 ) {
@@ -467,7 +468,7 @@ fn gather_pk_wt_nbm<const PKS: usize>(
 #[inline(always)]
 fn gather_cells<const N: usize>(
     sources: &[impl ColumnarSource],
-    picks: &[(u32, u32, i64)],
+    picks: &[Pick],
     pi: usize,
     dst: &mut [u8],
     width: usize,
@@ -553,12 +554,12 @@ impl<'a> UnifiedSet<'a> {
     }
 
     /// Copy the rows `rows` names, in the order given, each at the weight its
-    /// triple carries, into a fresh unconsolidated batch under the set's schema,
+    /// pick carries, into a fresh unconsolidated batch under the set's schema,
     /// its heap coded under `codebook` where one is given (see
     /// [`Codebook::append`]). The heap reserved is prorated from the whole
     /// sources, and none under a schema without a string column, such as a
     /// skeleton merge's PK-only one over sources that hold strings.
-    pub(crate) fn materialize(&self, rows: &[(u32, u32, i64)], codebook: Option<&Codebook>) -> Batch {
+    pub(crate) fn materialize(&self, rows: &[Pick], codebook: Option<&Codebook>) -> Batch {
         let blob_cap = match self.schema.has_german_string() {
             true => prorated_blob_cap(self.src_blob, self.src_rows, rows.len()),
             false => 0,
@@ -568,7 +569,7 @@ impl<'a> UnifiedSet<'a> {
 
     /// [`materialize`](Self::materialize) reserving `blob_cap` heap bytes, with
     /// each carried source heap adopted at its `heap_at` before any cell lands.
-    fn write(&self, rows: &[(u32, u32, i64)], blob_cap: usize, codebook: Option<&Codebook>) -> Batch {
+    fn write(&self, rows: &[Pick], blob_cap: usize, codebook: Option<&Codebook>) -> Batch {
         #[cfg(debug_assertions)]
         for &(si, ri, _) in rows {
             debug_assert!(
@@ -591,11 +592,7 @@ impl<'a> UnifiedSet<'a> {
 
 /// [`UnifiedSet::materialize`] over whole `sources`, each heap carried whole
 /// when [`carried_dead`] prefers it for the rows `rows` keeps of that source.
-pub(crate) fn materialize_carrying(
-    sources: &[MemBatch<'_>],
-    schema: &SchemaDescriptor,
-    rows: &[(u32, u32, i64)],
-) -> Batch {
+pub(crate) fn materialize_carrying(sources: &[MemBatch<'_>], schema: &SchemaDescriptor, rows: &[Pick]) -> Batch {
     let mut set = UnifiedSet::whole(sources, schema);
     let mask = schema.string_payload_slots();
     if mask == 0 {
