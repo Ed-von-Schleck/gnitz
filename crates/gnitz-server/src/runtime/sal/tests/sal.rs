@@ -10,6 +10,7 @@ use crate::runtime::frame::WireMsg;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 use crate::runtime::w2m::fixtures::{id, test_rings};
 use crate::runtime::w2m::RequestId;
+use crate::runtime::ServerExit;
 use crate::test_support::{
     make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, sweep_bit_flips, weighted_rows,
 };
@@ -796,7 +797,7 @@ fn the_live_path_aborts_on_a_damaged_header() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(134),
+        Some(ServerExit::FailStop.code()),
         "{name} must fail-stop (exit 134)\nstdout:\n{}\nstderr:\n{stderr}",
         String::from_utf8_lossy(&out.stdout)
     );
@@ -834,7 +835,7 @@ fn a_read_group_without_a_request_id_aborts() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(134),
+        Some(ServerExit::FailStop.code()),
         "{name} must fail-stop (exit 134)\nstderr:\n{stderr}"
     );
     assert!(

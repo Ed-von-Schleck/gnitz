@@ -244,7 +244,7 @@ fn run_worker_child(
     if let Err(e) = boot {
         // No frame: the master's death watch fails the boot.
         gnitz_error!("{e}");
-        unsafe { libc::_exit(1) };
+        unsafe { libc::_exit(ServerExit::BootFailed.code()) };
     }
 
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);

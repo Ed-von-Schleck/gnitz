@@ -313,9 +313,9 @@ fn main() {
     if let Some(done) = one_shot {
         if let Err(e) = done {
             eprintln!("Error: {e}");
-            process::exit(1);
+            process::exit(ServerExit::BootFailed.code());
         }
-        process::exit(0);
+        process::exit(ServerExit::Clean.code());
     }
     let env_level = env::var("GNITZ_LOG_LEVEL").ok();
     let refuse = |e: String| -> ! {
