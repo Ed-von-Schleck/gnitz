@@ -1,6 +1,7 @@
 //! A reply decoded into display values: one `Value` per visible cell, and each
 //! row's weight beside it.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use gnitz_core::{ScanReply, ZSetBatch};
@@ -26,15 +27,15 @@ pub enum Value {
 impl Value {
     /// The cell as a terminal shows it; `None` for NULL, which the caller
     /// spells as it is configured to.
-    pub fn text(&self) -> Option<String> {
-        Some(match self {
+    pub fn text(&self) -> Option<Cow<'_, str>> {
+        Some(Cow::Owned(match self {
             Value::Null => return None,
+            Value::Text(s) => return Some(Cow::Borrowed(s)),
             Value::Bool(b) => b.to_string(),
             Value::Int(v) => v.to_string(),
             Value::UInt(v) => v.to_string(),
             Value::F32(v) => FloatText(*v).to_string(),
             Value::F64(v) => FloatText(*v).to_string(),
-            Value::Text(s) => s.clone(),
             Value::Bytes(b) => {
                 let mut s = String::with_capacity(2 + 2 * b.len());
                 s.push_str("\\x");
@@ -43,24 +44,31 @@ impl Value {
                 }
                 s
             }
-        })
+        }))
     }
 
-    pub fn to_json(&self) -> serde_json::Value {
-        use serde_json::Value as J;
-        match self {
-            Value::Null => J::Null,
-            Value::Bool(b) => J::Bool(*b),
-            Value::Int(v) => i64::try_from(*v).map_or_else(|_| J::String(v.to_string()), J::from),
-            Value::UInt(v) => u64::try_from(*v).map_or_else(|_| J::String(v.to_string()), J::from),
-            // A non-finite float has no JSON number; serde would write it as null.
-            Value::F32(v) if v.is_finite() => J::from(f64::from(*v)),
-            Value::F64(v) if v.is_finite() => J::from(*v),
-            Value::F32(_) | Value::F64(_) | Value::Text(_) | Value::Bytes(_) => {
-                J::String(self.text().unwrap_or_default())
-            }
-        }
+    /// Append the cell as JSON to `out`: a number where JSON holds it exactly,
+    /// else its text as a string, so no precision is lost.
+    pub fn write_json(&self, out: &mut String) {
+        let _ = match self {
+            Value::Null => write!(out, "null"),
+            Value::Bool(b) => write!(out, "{b}"),
+            Value::Int(v) if i64::try_from(*v).is_ok() => write!(out, "{v}"),
+            Value::UInt(v) if u64::try_from(*v).is_ok() => write!(out, "{v}"),
+            // The shortest text that reads back as the float itself, of its
+            // own width; a non-finite float has no JSON number.
+            Value::F32(v) if v.is_finite() => write!(out, "{}", serde_json::to_string(v).expect(SERIALIZES)),
+            Value::F64(v) if v.is_finite() => write!(out, "{}", serde_json::to_string(v).expect(SERIALIZES)),
+            _ => write_json_string(out, &self.text().unwrap_or_default()),
+        };
     }
+}
+
+const SERIALIZES: &str = "a finite float or a string serializes";
+
+/// Append `s` to `out` as a JSON string.
+pub fn write_json_string(out: &mut String, s: &str) -> std::fmt::Result {
+    write!(out, "{}", serde_json::to_string(s).expect(SERIALIZES))
 }
 
 /// Whether a column of `tc` reads right-aligned.

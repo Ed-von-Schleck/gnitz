@@ -1,6 +1,7 @@
 //! `\watch`: a view's delta feed, live. The subscription's first answer is the
 //! view whole; every later one is the deltas a push brought, printed weights
-//! and all, until Ctrl-C.
+//! and all, until Ctrl-C. A CSV stream carries its header with the view whole:
+//! the snapshot, and each reseed.
 
 use std::time::Duration;
 
@@ -9,7 +10,8 @@ use gnitz_sql::GnitzSqlError;
 use gnitz_wire::WireStatus;
 use nu_ansi_term::{Color, Style};
 
-use crate::render::{Expanded, Format, Weights};
+use crate::render::{render, Target, Weights};
+use crate::settings::{Expanded, Format, Settings};
 use crate::shell::{Failed, Shell};
 use crate::value::Rows;
 
@@ -20,7 +22,7 @@ const HOLD: Duration = Duration::from_millis(500);
 
 /// The `SELECT` a `\watch` argument stands for: a relation name alone, as
 /// SQL reads one in `schema`, reads the view whole.
-pub fn watch_query(arg: &str, schema: &str) -> String {
+pub(crate) fn watch_query(arg: &str, schema: &str) -> String {
     let arg = arg.trim().trim_end_matches(';').trim();
     match gnitz_sql::parse_relation_name(arg, schema).is_some() {
         true => format!("SELECT * FROM {arg}"),
@@ -49,7 +51,7 @@ impl Shell {
 
     /// A line naming what follows. Among the results only where they are for
     /// reading: a CSV or JSON stream stays parseable.
-    fn watch_banner(&mut self, label: &str, rows: &Rows) {
+    fn watch_banner(&mut self, label: &str, rows: &Rows, target: Target) {
         let plus: i64 = rows.rows.iter().map(|&(_, w)| w.max(0)).sum();
         let minus: i64 = rows.rows.iter().map(|&(_, w)| (-w).max(0)).sum();
         let line = format!(
@@ -60,35 +62,44 @@ impl Shell {
             self.status(&line);
             return;
         }
-        let line = self.settings.paint(Style::new().fg(Color::Cyan), &line);
-        self.write_result(&format!("{line}\n"));
+        let line = format!("{}\n", target.paint(Style::new().fg(Color::Cyan), &line));
+        self.write_result(&line);
     }
 
-    /// `first` is whether this is the watch's first batch: a CSV stream has
-    /// one header.
-    fn watch_print(&mut self, label: &str, reply: &ScanReply, first: bool) {
+    /// Print one answer of the feed. `whole` is whether it is the view whole —
+    /// the snapshot, or a reseed — which a CSV stream heads with its header:
+    /// a reseed's columns are those of the `SELECT` as planned again.
+    fn watch_print(&mut self, label: &str, reply: &ScanReply, whole: bool) {
         let rows = Rows::decode(reply);
-        self.watch_banner(label, &rows);
-        if rows.rows.is_empty() && !first {
-            return;
-        }
-        let mut settings = self.settings.clone();
-        settings.footer = false;
-        if settings.expanded == Expanded::Auto {
-            settings.expanded = Expanded::Off;
-        }
-        let (width, _) = self.terminal_size();
-        let text = crate::render::render(&rows, Weights::Column, &settings, width, true);
-        let text = match (settings.format, first) {
-            (Format::Csv, false) => text.split_once('\n').map_or("", |(_, rest)| rest),
-            _ => &text,
+        let target = Target { header: whole, ..self.target_for(true) };
+        self.watch_banner(label, &rows, target);
+        let settings = Settings {
+            footer: false,
+            expanded: match self.settings.expanded {
+                Expanded::Auto => Expanded::Off,
+                e => e,
+            },
+            ..self.settings.clone()
         };
-        self.write_result(text);
+        let text = render(&rows, Weights::Column, &settings, target);
+        self.write_result(&text);
+    }
+
+    /// The end of a watch a wait ended with `e`: a Ctrl-C ends it as asked.
+    fn watch_ended(&mut self, e: ClientError) -> Result<(), Failed> {
+        match e {
+            ClientError::Interrupted(_) => {
+                // Past the `^C` the terminal echoed.
+                self.write_result("\n");
+                Ok(())
+            }
+            e => self.fail(e),
+        }
     }
 
     /// Follow the delta feed of the view `arg` names, or of the `SELECT` over
     /// one it is, until interrupted.
-    pub fn watch(&mut self, arg: &str) -> Result<(), Failed> {
+    pub(crate) fn watch(&mut self, arg: &str) -> Result<(), Failed> {
         let sql = watch_query(arg, &self.schema);
         let mut plan = self.plan_watch(&sql).or_else(|e| self.fail(e))?;
         let (mut id, first) = self.subscribe(&plan).or_else(|e| self.fail(e))?;
@@ -100,12 +111,7 @@ impl Shell {
             }
             let synced = match block_on(self.client.sync(HOLD)) {
                 Ok(s) => s,
-                Err(ClientError::Interrupted(_)) => {
-                    // Past the `^C` the terminal echoed.
-                    self.write_result("\n");
-                    break Ok(());
-                }
-                Err(e) => break self.fail(e),
+                Err(e) => break self.watch_ended(e),
             };
             let mut restart = None;
             let mut ended = None;
@@ -137,9 +143,9 @@ impl Shell {
                 match self.subscribe(&plan) {
                     Ok((new_id, whole)) => {
                         id = new_id;
-                        self.watch_print("reseeded", &whole, false);
+                        self.watch_print("reseeded", &whole, true);
                     }
-                    Err(e) => break self.fail(e),
+                    Err(e) => break self.watch_ended(e),
                 }
             }
         };

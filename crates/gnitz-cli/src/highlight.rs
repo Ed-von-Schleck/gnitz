@@ -1,10 +1,10 @@
 //! Syntax highlighting of the input line, by the tokens `sqlparser` reads.
 
-use gnitz_sql::sqlparser::tokenizer::Token;
+use gnitz_sql::sqlparser::tokenizer::{Token, Whitespace};
 use nu_ansi_term::{Color, Style};
 use reedline::{Highlighter, StyledText};
 
-use crate::lex::{is_comment, is_keyword, lex_prefix, Lexeme};
+use crate::lex::{is_keyword, lex_prefix, Lexeme};
 use crate::meta::{ArgKind, MetaLine};
 
 /// The style of each token class.
@@ -78,7 +78,7 @@ impl SqlHighlighter {
             if l.range.start > at {
                 spans.push((Style::new(), at..l.range.start));
             }
-            let style = if brackets.contains(&i) {
+            let style = if brackets.is_some_and(|b| b.contains(&i)) {
                 p.bracket
             } else {
                 self.token_style(&lexemes, i)
@@ -115,16 +115,27 @@ impl SqlHighlighter {
             Token::Number(..) => p.number,
             Token::SingleQuotedString(_)
             | Token::DoubleQuotedString(_)
-            | Token::NationalStringLiteral(_)
-            | Token::EscapedStringLiteral(_)
-            | Token::UnicodeStringLiteral(_)
-            | Token::HexStringLiteral(_)
+            | Token::TripleSingleQuotedString(_)
+            | Token::TripleDoubleQuotedString(_)
             | Token::DollarQuotedString(_)
             | Token::SingleQuotedByteStringLiteral(_)
-            | Token::DoubleQuotedByteStringLiteral(_) => p.string,
-            t if is_comment(t) => p.comment,
-            Token::Whitespace(_) => Style::new(),
-            Token::Comma | Token::SemiColon | Token::Period | Token::LParen | Token::RParen => Style::new(),
+            | Token::DoubleQuotedByteStringLiteral(_)
+            | Token::TripleSingleQuotedByteStringLiteral(_)
+            | Token::TripleDoubleQuotedByteStringLiteral(_)
+            | Token::SingleQuotedRawStringLiteral(_)
+            | Token::DoubleQuotedRawStringLiteral(_)
+            | Token::TripleSingleQuotedRawStringLiteral(_)
+            | Token::TripleDoubleQuotedRawStringLiteral(_)
+            | Token::NationalStringLiteral(_)
+            | Token::QuoteDelimitedStringLiteral(_)
+            | Token::NationalQuoteDelimitedStringLiteral(_)
+            | Token::EscapedStringLiteral(_)
+            | Token::UnicodeStringLiteral(_)
+            | Token::HexStringLiteral(_) => p.string,
+            Token::Whitespace(Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)) => p.comment,
+            Token::Whitespace(_) | Token::Comma | Token::SemiColon | Token::Period | Token::LParen | Token::RParen => {
+                Style::new()
+            }
             _ => p.operator,
         }
     }
@@ -136,35 +147,25 @@ fn is_function(name: &str) -> bool {
 
 /// The bracket at or just before `cursor` and the one it pairs with, as
 /// lexeme indices.
-fn matching_brackets(lexemes: &[Lexeme], cursor: usize) -> Vec<usize> {
-    let at = lexemes.iter().position(|l| {
-        matches!(l.token, Token::LParen | Token::RParen) && (l.range.start == cursor || l.range.end == cursor)
-    });
-    let Some(at) = at else {
-        return Vec::new();
+fn matching_brackets(lexemes: &[Lexeme], cursor: usize) -> Option<[usize; 2]> {
+    let depth_step = |t: &Token| match t {
+        Token::LParen => 1isize,
+        Token::RParen => -1,
+        _ => 0,
     };
-    let forward = lexemes[at].token == Token::LParen;
-    let (open, close) = match forward {
-        true => (Token::LParen, Token::RParen),
-        false => (Token::RParen, Token::LParen),
-    };
-    let order: Box<dyn Iterator<Item = usize>> = match forward {
-        true => Box::new(at..lexemes.len()),
-        false => Box::new((0..=at).rev()),
-    };
-    let mut depth = 0usize;
-    for j in order {
-        let t = &lexemes[j].token;
-        if *t == open {
-            depth += 1;
-        } else if *t == close {
-            depth -= 1;
-            if depth == 0 {
-                return vec![at, j];
-            }
+    let at = lexemes
+        .iter()
+        .position(|l| depth_step(&l.token) != 0 && (l.range.start == cursor || l.range.end == cursor))?;
+    // Towards the partner: forward from a `(`, back from a `)`.
+    let direction = depth_step(&lexemes[at].token);
+    let (mut depth, mut j) = (0, at);
+    loop {
+        depth += depth_step(&lexemes.get(j)?.token);
+        if depth == 0 {
+            return Some([at, j]);
         }
+        j = j.checked_add_signed(direction)?;
     }
-    Vec::new()
 }
 
 impl Highlighter for SqlHighlighter {

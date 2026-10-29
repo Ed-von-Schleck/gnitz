@@ -12,8 +12,9 @@ use reedline::{Completer, CompletionResult, Span, Suggestion};
 
 use gnitz_core::{Catalog, CatalogRelation};
 
-use crate::lex::{lex_prefix, word_at, Lexeme, KEYWORDS};
-use crate::meta::{self, choose, variants, ArgKind, MetaLine, Setting};
+use crate::lex::{lex_prefix, vocabulary, word_at, Lexeme};
+use crate::meta::{self, ArgKind, MetaLine};
+use crate::settings::{choose, variants, Setting};
 
 /// What completion reads: the catalog snapshot and the current schema. The
 /// shell builds one at each prompt.
@@ -380,18 +381,7 @@ fn sql_candidates(ctx: &Context, sql: &str, pos: usize, keep: fn(RelClass) -> bo
         value: cased(f, word),
         description: Some("function".to_string()),
     }));
-    // Completion replaces one word, so a type spelled in several is offered
-    // word by word.
-    let words = KEYWORDS
-        .iter()
-        .map(Keyword::to_string)
-        .chain(
-            gnitz_sql::type_names()
-                .flat_map(str::split_whitespace)
-                .map(str::to_string),
-        )
-        .chain(gnitz_sql::calendar_field_names().map(str::to_string));
-    out.extend(words.map(|k| Candidate {
+    out.extend(vocabulary().map(|k| Candidate {
         kind: Kind::Keyword,
         value: cased(&k, word),
         description: None,

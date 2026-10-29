@@ -1,17 +1,33 @@
 use super::*;
 
+/// The pieces of `lines` fed one at a time, then finished.
+fn pieces(lines: &[&str]) -> Vec<Piece> {
+    let mut s = Splitter::default();
+    let mut out: Vec<Piece> = lines.iter().flat_map(|l| s.push_line(l)).collect();
+    out.extend(s.finish());
+    out
+}
+
+fn sql(texts: &[&str]) -> Vec<Piece> {
+    texts.iter().map(|t| Piece::Sql(t.to_string())).collect()
+}
+
 #[test]
 fn statements_split_on_top_level_semicolons_only() {
-    let src = "SELECT 'a;b' FROM t; -- c; d\nINSERT INTO t VALUES (1) ;  ";
-    let parts: Vec<&str> = statements(src).into_iter().map(|r| &src[r]).collect();
-    assert_eq!(parts, ["SELECT 'a;b' FROM t", "INSERT INTO t VALUES (1)"]);
+    assert_eq!(
+        pieces(&["SELECT 'a;b' FROM t; -- c; d", "INSERT INTO t VALUES (1) ;  "]),
+        sql(&["SELECT 'a;b' FROM t", "INSERT INTO t VALUES (1)"])
+    );
 }
 
 #[test]
 fn statements_skip_empty_ones_and_keep_a_trailing_one() {
-    let src = ";; SELECT 1; SELECT 2";
-    let parts: Vec<&str> = statements(src).into_iter().map(|r| &src[r]).collect();
-    assert_eq!(parts, ["SELECT 1", "SELECT 2"]);
+    assert_eq!(pieces(&[";; SELECT 1; SELECT 2"]), sql(&["SELECT 1", "SELECT 2"]));
+}
+
+#[test]
+fn input_that_does_not_tokenize_runs_whole_for_the_planner_to_report() {
+    assert_eq!(pieces(&["SELECT 1; SELECT 'open"]), sql(&["SELECT 1; SELECT 'open\n"]));
 }
 
 #[test]
@@ -28,44 +44,42 @@ fn a_buffer_is_complete_once_its_last_token_is_a_semicolon() {
 }
 
 #[test]
-fn complete_prefix_ends_after_the_last_semicolon() {
-    assert_eq!(complete_prefix("SELECT 1; SELECT"), Some(9));
-    assert_eq!(complete_prefix("SELECT 'x;"), None);
-    assert_eq!(complete_prefix("SELECT 1"), None);
-}
-
-#[test]
 fn the_splitter_runs_meta_lines_alone_and_sql_at_its_semicolon() {
     let mut s = Splitter::default();
-    assert_eq!(s.push_line("\\dt"), Some(Piece::Meta("\\dt".to_string())));
-    assert_eq!(s.push_line("SELECT a,"), None);
+    assert_eq!(s.push_line("\\dt"), [Piece::Meta("\\dt".to_string())]);
+    assert_eq!(s.push_line("SELECT a,"), []);
     // A backslash inside a statement is SQL, not a meta-command.
-    assert_eq!(s.push_line("  b FROM t WHERE x = '\\n'"), None);
-    assert_eq!(s.push_line("\\dt"), None);
+    assert_eq!(s.push_line("  b FROM t WHERE x = '\\n'"), []);
+    assert_eq!(s.push_line("\\dt"), []);
     assert_eq!(
         s.push_line("; SELECT"),
-        Some(Piece::Sql("SELECT a,\n  b FROM t WHERE x = '\\n'\n\\dt\n;".to_string()))
+        sql(&["SELECT a,\n  b FROM t WHERE x = '\\n'\n\\dt"])
     );
-    assert_eq!(s.finish(), Some(Piece::Sql(" SELECT\n".to_string())));
-    assert_eq!(s.finish(), None);
+    assert_eq!(s.finish(), sql(&["SELECT"]));
+    assert_eq!(s.finish(), []);
 }
 
 #[test]
 fn a_semicolon_inside_an_open_string_ends_nothing() {
     let mut s = Splitter::default();
-    assert_eq!(s.push_line("SELECT 'a;"), None);
-    assert_eq!(
-        s.push_line("b' AS x;"),
-        Some(Piece::Sql("SELECT 'a;\nb' AS x;".to_string()))
-    );
+    assert_eq!(s.push_line("SELECT 'a;"), []);
+    assert_eq!(s.push_line("b' AS x;"), sql(&["SELECT 'a;\nb' AS x"]));
 }
 
 #[test]
 fn a_comment_only_remainder_runs_nothing() {
     let mut s = Splitter::default();
-    assert!(s.push_line("SELECT 1;").is_some());
-    assert_eq!(s.push_line("-- done"), None);
-    assert_eq!(s.finish(), None);
+    assert_eq!(s.push_line("SELECT 1;"), sql(&["SELECT 1"]));
+    assert_eq!(s.push_line("-- done"), []);
+    assert_eq!(s.finish(), []);
+}
+
+#[test]
+fn a_meta_line_after_a_finished_statement_and_a_comment_is_a_meta_command() {
+    assert_eq!(
+        pieces(&["SELECT 1; -- note", "\\x"]),
+        [Piece::Sql("SELECT 1".to_string()), Piece::Meta("\\x".to_string())]
+    );
 }
 
 #[test]

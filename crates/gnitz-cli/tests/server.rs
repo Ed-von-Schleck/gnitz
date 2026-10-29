@@ -8,8 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gnitz_cli::render::{Format, Settings};
-use gnitz_cli::shell::{Flow, Options, Shell};
+use gnitz_cli::{Flow, Format, Options, Settings, Shell};
 use gnitz_core::{RelName, RelProps};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{RelClass, ViewBudget, ViewProps};
@@ -25,6 +24,7 @@ fn shell(sock: &str, interrupt: Option<Arc<AtomicBool>>) -> Shell {
             format: Format::Csv,
             ..Settings::default()
         },
+        color: false,
         interactive: false,
         stop_on_error: true,
         interrupt,
@@ -197,22 +197,9 @@ fn describe_shows_keys_and_what_reads_what() {
     );
 }
 
-#[test]
-fn listings_are_results_in_the_output_format() {
-    let server = ServerHandle::start_n(WORKERS);
-    let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join("out.csv");
-    let mut sh = shell(server.sock_path(), None);
-    let text = results(
-        &mut sh,
-        &out,
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, kind BIGINT, note TEXT);\n\\dt",
-    );
-    assert_eq!(text, "Schema,Name,Type,Columns\npublic,t,table,3\n");
-}
-
 /// A name a meta-command takes is read as SQL reads one: quoted, qualified,
-/// and a pattern over the qualified name.
+/// and a pattern over the qualified name; a listing is a result in the output
+/// format.
 #[test]
 fn meta_command_names_read_as_sql_reads_them() {
     let server = ServerHandle::start_n(WORKERS);
@@ -233,6 +220,16 @@ fn meta_command_names_read_as_sql_reads_them() {
         results(&mut sh, &out, "\\di public.*"),
         "Schema,Name,Table,Columns,Unique\npublic,t_kind,t,kind,false\n"
     );
+    sh.run_script("CREATE SCHEMA \"table\";").unwrap();
+    sh.meta("\\use \"table\"").expect("a quoted schema name");
+    sh.run_script("CREATE TABLE u (id BIGINT PRIMARY KEY);").unwrap();
+    assert!(
+        sh.meta("\\d u").is_ok(),
+        "an unqualified name resolves in the schema used"
+    );
+    sh.meta("\\use PUBLIC").expect("a schema name in any case");
+    assert!(sh.meta("\\d u").is_err(), "and in no other");
+    assert!(sh.meta("\\use nope").is_err());
 }
 
 #[test]
@@ -252,14 +249,6 @@ fn describe_lists_the_with_options_a_view_was_created_with() {
         text.contains("With:\n    capacity = '4 MB'\n    compress = true\n"),
         "{text}"
     );
-}
-
-#[test]
-fn watch_with_no_argument_fails_before_planning() {
-    let server = ServerHandle::start_n(WORKERS);
-    let mut sh = shell(server.sock_path(), None);
-    assert!(sh.meta("\\watch").is_err());
-    assert!(sh.meta("\\watch   ").is_err());
 }
 
 #[test]
@@ -305,9 +294,11 @@ fn watch_prints_the_view_then_its_deltas_until_interrupted() {
 }
 
 #[test]
-fn watch_refuses_a_view_without_a_delta_feed() {
+fn watch_refuses_no_argument_and_a_view_without_a_delta_feed() {
     let server = ServerHandle::start_n(WORKERS);
     let mut sh = shell(server.sock_path(), None);
+    assert!(sh.meta("\\watch").is_err());
+    assert!(sh.meta("\\watch   ").is_err());
     sh.run_script(
         "CREATE TABLE e (id BIGINT PRIMARY KEY, kind BIGINT);\n\
          CREATE VIEW plain AS SELECT kind FROM e;",
@@ -395,6 +386,60 @@ fn stdout_of(mut cmd: std::process::Command) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// The run of the shell binary on the server at `sock` with `args`, CSV
+/// output and `stdin` as its input.
+fn run_at(sock: &str, args: &[&str], stdin: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_gnitz"))
+        .arg(sock)
+        .args(["-F", "csv"])
+        .args(args)
+        .env_remove("GNITZ_TARGET")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// A script stops at its first failed statement, and with
+/// `--continue-on-error` runs every other; either way it exits 1, whatever
+/// follows the failure. `-c` and `-f` run in the order given, and a `\i -`
+/// in a script read from stdin reads on from it.
+#[test]
+fn a_script_runs_its_inputs_in_order_and_its_exit_status_says_whether_one_failed() {
+    let server = ServerHandle::start_n(WORKERS);
+    let sock = server.sock_path();
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).into_owned();
+
+    let failing = "SELECT * FROM missing; SELECT 1 AS one;";
+    let out = run_at(sock, &["-c", failing], "");
+    assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(1), ""));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ERROR:"));
+    let out = run_at(sock, &["--continue-on-error", "-c", failing], "");
+    assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(1), "one\n1\n"));
+
+    let quit_after = dir.path().join("quit.sql");
+    std::fs::write(&quit_after, "SELECT * FROM missing;\n\\q\nSELECT 2 AS two;\n").unwrap();
+    let out = run_at(sock, &["--continue-on-error", "-f", quit_after.to_str().unwrap()], "");
+    assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(1), ""));
+
+    let setup = dir.path().join("setup.sql");
+    std::fs::write(
+        &setup,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY);\nINSERT INTO t VALUES (5);\n",
+    )
+    .unwrap();
+    let out = run_at(sock, &["-f", setup.to_str().unwrap(), "-c", "SELECT * FROM t"], "");
+    assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(0), "id\n5\n"));
+
+    let out = run_at(sock, &[], "SELECT 1 AS a;\n\\i -\nSELECT 2 AS b;\n");
+    assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(0), "a\n1\nb\n2\n"));
+}
+
 fn is_empty_dir(dir: &Path) -> bool {
     std::fs::read_dir(dir).unwrap().next().is_none()
 }
@@ -402,7 +447,7 @@ fn is_empty_dir(dir: &Path) -> bool {
 #[test]
 fn with_no_target_a_session_runs_a_server_of_its_own_and_removes_it() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = stdout_of(gnitz(
+    let mut cmd = gnitz(
         tmp.path(),
         &[
             "-F",
@@ -414,8 +459,11 @@ fn with_no_target_a_session_runs_a_server_of_its_own_and_removes_it() {
             "-c",
             "SELECT * FROM t ORDER BY id",
         ],
-    ));
-    assert!(out.ends_with("id,v\n1,10\n2,20\n"), "{out}");
+    );
+    // An empty GNITZ_TARGET names no server.
+    cmd.env("GNITZ_TARGET", "");
+    let out = stdout_of(cmd);
+    assert_eq!(out, "id,v\n1,10\n2,20\n");
     assert!(
         is_empty_dir(tmp.path()),
         "the session left its scratch directory behind"
@@ -438,11 +486,12 @@ fn a_session_given_a_data_directory_leaves_its_rows_to_the_next() {
             "INSERT INTO t VALUES (7, 70)",
         ],
     ));
-    let out = stdout_of(gnitz(
-        tmp.path(),
-        &["--data", data, "-F", "csv", "-c", "SELECT * FROM t"],
-    ));
-    assert!(out.ends_with("id,v\n7,70\n"), "{out}");
+    // `--data` asks for the session's own server, whatever the environment
+    // names.
+    let mut cmd = gnitz(tmp.path(), &["--data", data, "-F", "csv", "-c", "SELECT * FROM t"]);
+    cmd.env("GNITZ_TARGET", tmp.path().join("no-server.sock"));
+    let out = stdout_of(cmd);
+    assert_eq!(out, "id,v\n7,70\n");
 }
 
 #[test]
@@ -456,6 +505,17 @@ fn a_session_with_no_server_to_start_says_so_and_starts_nothing() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("GNITZ_SERVER_BIN names"), "{stderr}");
+    assert!(is_empty_dir(tmp.path()));
+
+    // A target the environment names but that cannot be read starts nothing.
+    use std::os::unix::ffi::OsStrExt;
+    let out = gnitz(tmp.path(), &["-c", "SELECT 1"])
+        .env("GNITZ_TARGET", std::ffi::OsStr::from_bytes(b"/tmp/\xff.sock"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("GNITZ_TARGET is not UTF-8"), "{stderr}");
     assert!(is_empty_dir(tmp.path()));
 }
 

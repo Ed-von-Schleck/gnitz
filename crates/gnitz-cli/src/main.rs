@@ -4,12 +4,8 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use clap::Parser;
-use gnitz_cli::editor::{self, ShellPrompt};
-use gnitz_cli::render::{Expanded, Format, Settings};
-use gnitz_cli::shell::{Flow, Options, Shell};
-use gnitz_core::RelName;
-use reedline::{EditCommand, Signal};
+use clap::{CommandFactory, FromArgMatches, Parser};
+use gnitz_cli::{Expanded, Flow, Format, Options, Settings, Shell};
 
 mod local;
 
@@ -20,19 +16,19 @@ mod local;
 #[derive(Parser)]
 #[command(name = "gnitz", version)]
 struct Cli {
-    /// The server: its Unix socket path, or a tls:// target. Without one, the
-    /// shell runs a gnitz-server installed beside it or on PATH for the
-    /// session.
-    #[arg(env = "GNITZ_TARGET")]
+    /// The server: its Unix socket path, or a tls:// target. Without one,
+    /// GNITZ_TARGET names it; with neither, the shell runs a gnitz-server
+    /// installed beside it or on PATH for the session.
     target: Option<String>,
 
-    /// With no target: keep the session's data in DIR, where the next session
-    /// given DIR finds it, instead of deleting it when the shell exits.
+    /// Run the session's own server, whatever GNITZ_TARGET names, and keep
+    /// its data in DIR, where the next session given DIR finds it, instead of
+    /// deleting it when the shell exits.
     #[arg(long, value_name = "DIR", conflicts_with = "target")]
     data: Option<PathBuf>,
 
     /// The schema unqualified names resolve in.
-    #[arg(short, long, default_value = gnitz_wire::PUBLIC_SCHEMA, value_parser = RelName::schema_key)]
+    #[arg(short, long, default_value = gnitz_wire::PUBLIC_SCHEMA, value_parser = schema_name)]
     schema: String,
 
     /// Run COMMAND (SQL or a meta-command) and exit. Repeatable.
@@ -64,9 +60,35 @@ struct Cli {
     no_color: bool,
 }
 
+/// `-s`'s value, read as SQL reads a schema name.
+fn schema_name(text: &str) -> Result<String, String> {
+    gnitz_sql::parse_schema_name(text).ok_or_else(|| format!("\"{text}\" is not a schema name"))
+}
+
+/// One input of a script run, in command-line order.
+enum Input<'a> {
+    Command(&'a str),
+    File(&'a str),
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let scripted = !cli.command.is_empty() || !cli.file.is_empty();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let mut inputs: Vec<(usize, Input<'_>)> = matches
+        .indices_of("command")
+        .into_iter()
+        .flatten()
+        .zip(cli.command.iter().map(|c| Input::Command(c)))
+        .chain(
+            matches
+                .indices_of("file")
+                .into_iter()
+                .flatten()
+                .zip(cli.file.iter().map(|f| Input::File(f))),
+        )
+        .collect();
+    inputs.sort_by_key(|&(at, _)| at);
+    let scripted = !inputs.is_empty();
     let interactive = !scripted && std::io::stdin().is_terminal();
     let color = interactive
         && !cli.no_color
@@ -82,9 +104,23 @@ fn main() -> ExitCode {
         flag
     });
 
+    // An empty GNITZ_TARGET is none, and --data asks for a server of the
+    // session's own whatever the environment names.
+    let given = match (cli.target.clone(), &cli.data) {
+        (Some(target), _) => Some(target),
+        (None, Some(_)) => None,
+        (None, None) => match std::env::var("GNITZ_TARGET") {
+            Ok(target) => (!target.is_empty()).then_some(target),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                eprintln!("gnitz: GNITZ_TARGET is not UTF-8");
+                return ExitCode::from(2);
+            }
+        },
+    };
     // Declared ahead of the shell, so the shell's connection closes before the
     // server it dials is stopped.
-    let (target, _local) = match cli.target.clone() {
+    let (target, _local) = match given {
         Some(target) => (target, None),
         None => match local::Held::start(cli.data.as_deref(), interactive) {
             Ok(held) => (held.socket().to_string_lossy().into_owned(), Some(held)),
@@ -98,13 +134,13 @@ fn main() -> ExitCode {
     let settings = Settings {
         format: cli.format,
         expanded: if cli.expanded { Expanded::On } else { Expanded::Off },
-        color,
         ..Settings::default()
     };
     let options = Options {
         target: target.clone(),
         schema: cli.schema.clone(),
         settings,
+        color,
         interactive,
         stop_on_error: !cli.continue_on_error,
         interrupt,
@@ -118,79 +154,24 @@ fn main() -> ExitCode {
     };
 
     if interactive {
-        return repl(&mut shell, cli.vi);
+        return gnitz_cli::repl(&mut shell, cli.vi);
     }
-
-    // `-c` and `-f` in order, or stdin when there are none.
-    let stdin = ["-".to_string()];
-    let files = match scripted {
-        true => &cli.file[..],
-        false => &stdin[..],
-    };
-    let inputs = cli
-        .command
-        .iter()
-        .map(|c| (true, c))
-        .chain(files.iter().map(|f| (false, f)));
-    let mut ok = true;
-    for (is_command, input) in inputs {
-        let run = match is_command {
-            true => shell.run_script(input),
-            false => shell.run_file(input),
+    if !scripted {
+        inputs.push((0, Input::File("-")));
+    }
+    for (_, input) in inputs {
+        let run = match input {
+            Input::Command(c) => shell.run_script(c),
+            Input::File(f) => shell.run_file(f),
         };
         match run {
             Ok(Flow::Quit) => break,
-            Ok(Flow::Continue) => {}
-            Err(_) => {
-                ok = false;
-                if !cli.continue_on_error {
-                    break;
-                }
-            }
+            Err(_) if !cli.continue_on_error => break,
+            Ok(Flow::Continue) | Err(_) => {}
         }
     }
-    match ok {
-        true => ExitCode::SUCCESS,
-        false => ExitCode::FAILURE,
+    match shell.failed() {
+        true => ExitCode::FAILURE,
+        false => ExitCode::SUCCESS,
     }
-}
-
-fn repl(shell: &mut Shell, vi: bool) -> ExitCode {
-    let Ok(buffer) = shell.scratch().map(|dir| dir.join("buffer.sql")) else {
-        return ExitCode::FAILURE;
-    };
-    let mut line_editor = editor::build(vi, shell.settings.color, buffer);
-    println!(
-        "gnitz {} — connected to {}. Type \\? for help, \\q to quit.",
-        gnitz_wire::RELEASE,
-        shell.target()
-    );
-    loop {
-        // Completion offers what the catalog holds now, whichever session
-        // changed it; a failed read keeps the previous completer.
-        if let Some(ctx) = shell.completion() {
-            line_editor = line_editor.with_completer(Box::new(ctx));
-        }
-        if let Some(text) = shell.prefill.take() {
-            line_editor.run_edit_commands(&[EditCommand::InsertString(text)]);
-        }
-        let prompt = ShellPrompt {
-            schema: shell.schema().to_string(),
-            in_transaction: shell.in_transaction(),
-        };
-        match line_editor.read_line(&prompt) {
-            Ok(Signal::Success(buffer)) => {
-                if let Ok(Flow::Quit) = shell.run_script(&buffer) {
-                    break;
-                }
-            }
-            Ok(Signal::CtrlD) => break,
-            Ok(_) => continue,
-            Err(e) => {
-                eprintln!("gnitz: terminal error: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-    ExitCode::SUCCESS
 }

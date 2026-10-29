@@ -31,19 +31,18 @@ gnitz-wire.workspace = true
 reedline = "0.52"
 nu-ansi-term = "0.50"
 comfy-table = { version = "8", features = ["custom_styling"] }
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive"] }
 csv = "1"
 serde_json = "1"
 dirs = "7"
 signal-hook = "0.3"
-crossterm = "0.29"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 console = "0.16"
 tempfile.workspace = true
-libc.workspace = true
 
 [dev-dependencies]
 gnitz-test-harness = { path = "../gnitz-test-harness" }
+libc.workspace = true
 
 [lints]
 workspace = true

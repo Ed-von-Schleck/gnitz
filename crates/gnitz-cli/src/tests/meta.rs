@@ -27,61 +27,24 @@ fn every_command_name_is_unique_and_found() {
 }
 
 #[test]
-fn a_boolean_setting_reads_postgres_spellings_in_any_case() {
-    let mut s = Settings::default();
-    Setting::Timing.set(&mut s, Some("ON")).unwrap();
-    assert!(s.timing);
-    Setting::Pager.set(&mut s, Some("no")).unwrap();
-    assert!(!s.pager);
-    Setting::Pager.set(&mut s, Some("yes")).unwrap();
-    assert!(s.pager);
-    Setting::Footer.set(&mut s, None).unwrap();
-    assert!(!s.footer);
-    assert!(Setting::Footer.set(&mut s, Some("maybe")).is_err());
-}
-
-#[test]
-fn null_takes_the_whole_value_and_no_value_keeps_it() {
-    let mut s = Settings::default();
-    Setting::Null.set(&mut s, Some("'a b'")).unwrap();
-    assert_eq!(s.null, "a b");
-    Setting::Null.set(&mut s, None).unwrap();
-    assert_eq!(s.null, "a b");
-    Setting::Format.set(&mut s, None).unwrap();
-    assert_eq!(s.format, Format::Aligned);
-    Setting::Format.set(&mut s, Some("CSV")).unwrap();
-    assert_eq!(s.format, Format::Csv);
-    assert!(Setting::Format.set(&mut s, Some("xml")).is_err());
-}
-
-#[test]
-fn expanded_toggles_between_off_and_on() {
-    let mut s = Settings::default();
-    Setting::Expanded.set(&mut s, None).unwrap();
-    assert_eq!(s.expanded, Expanded::On);
-    Setting::Expanded.set(&mut s, Some("auto")).unwrap();
-    Setting::Expanded.set(&mut s, None).unwrap();
-    assert_eq!(s.expanded, Expanded::Off);
-}
-
-#[test]
 fn expand_home_reads_only_the_own_home() {
     let home = dirs::home_dir().unwrap();
     assert_eq!(expand_home("~/x"), format!("{}/x", home.display()));
     assert_eq!(expand_home("~"), home.display().to_string());
     assert_eq!(expand_home("~bob/x"), "~bob/x");
     assert_eq!(expand_home("a/~/x"), "a/~/x");
+    assert_eq!(expand_home(""), "");
 }
 
 #[test]
-fn expanded_reads_boolean_spellings_and_null_reads_a_sql_string() {
-    let mut s = Settings::default();
-    Setting::Expanded.set(&mut s, Some("yes")).unwrap();
-    assert_eq!(s.expanded, Expanded::On);
-    Setting::Expanded.set(&mut s, Some("off")).unwrap();
-    assert_eq!(s.expanded, Expanded::Off);
-    Setting::Null.set(&mut s, Some("'it''s'")).unwrap();
-    assert_eq!(s.null, "it's");
-    Setting::Null.set(&mut s, Some("(none)")).unwrap();
-    assert_eq!(s.null, "(none)");
+fn a_synopsis_out_of_brackets_is_an_argument_the_command_needs() {
+    let needs = |name| lookup(name).is_some_and(MetaCommand::needs_arg);
+    for name in ["\\use", "\\watch", "\\i", "\\dump", "\\restore", "\\backup"] {
+        assert!(needs(name), "{name}");
+    }
+    for name in [
+        "\\c", "\\d", "\\dt", "\\o", "\\e", "\\echo", "\\!", "\\pset", "\\x", "\\q",
+    ] {
+        assert!(!needs(name), "{name}");
+    }
 }

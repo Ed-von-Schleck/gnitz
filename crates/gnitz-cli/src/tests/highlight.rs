@@ -85,3 +85,29 @@ fn only_the_shell_s_vocabulary_is_a_keyword() {
     assert_eq!(style_of("SELECT 1 = ANY (SELECT 1)", "ANY"), p.keyword);
     assert_eq!(style_of("SELECT EXTRACT(year FROM d) FROM t", "year"), p.keyword);
 }
+
+#[test]
+fn every_string_literal_the_dialect_reads_is_a_string() {
+    let p = Palette::default();
+    let src = "SELECT r'a', q'[b]', E'c', X'0f'";
+    for lit in ["r'a'", "q'[b]'", "E'c'", "X'0f'"] {
+        assert_eq!(style_of(src, lit), p.string, "{lit}");
+    }
+}
+
+#[test]
+fn a_bracket_at_the_cursor_finds_its_partner_backwards_too() {
+    let src = "SELECT f((1), 2)";
+    let h = SqlHighlighter::default();
+    let marked: Vec<usize> = h
+        .spans(src, src.len())
+        .into_iter()
+        .filter(|(s, _)| *s == Palette::default().bracket)
+        .map(|(_, r)| r.start)
+        .collect();
+    assert_eq!(marked, vec![src.find('(').unwrap(), src.len() - 1]);
+    assert!(h
+        .spans("SELECT (1", 7)
+        .iter()
+        .all(|(s, _)| *s != Palette::default().bracket));
+}

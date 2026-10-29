@@ -4,17 +4,17 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::ValueEnum;
-use gnitz_core::{Catalog, CatalogRelation, RelName, RelProps};
+use gnitz_core::{block_on, Catalog, CatalogRelation, RelProps};
 use gnitz_expr::{LikeMatcher, LikePattern};
-use gnitz_sql::sqlparser::tokenizer::Token;
 use gnitz_wire::{qualified_key, FkAction, RelClass, TypeCode};
 
 use crate::editor::{editor, editor_command, KEY_HELP};
-use crate::render::{render, Expanded, Format, Settings, Weights};
+use crate::render::{render, Target, Weights};
+use crate::settings::{choose, name_of, Expanded, Format, Setting, Settings};
 use crate::shell::{Failed, Flow, Shell};
 use crate::value::{Rows, Value};
 
@@ -46,14 +46,15 @@ pub struct Call<'a> {
 }
 
 impl Call<'_> {
-    /// The first argument.
-    pub fn arg(&self) -> Option<&str> {
-        self.rest.split_whitespace().next()
+    /// The first argument; empty when there is none.
+    pub fn arg(&self) -> &str {
+        self.rest.split_whitespace().next().unwrap_or_default()
     }
 
-    /// The first argument, a path, with a leading `~` expanded.
-    pub fn path(&self) -> Option<Cow<'_, str>> {
-        self.arg().map(expand_home)
+    /// The first argument, a path, with a leading `~` expanded; empty when
+    /// there is none.
+    pub fn path(&self) -> Cow<'_, str> {
+        expand_home(self.arg())
     }
 
     /// The relation classes the command's argument names.
@@ -93,6 +94,12 @@ impl MetaCommand {
     pub fn name(&self) -> &'static str {
         self.names[0]
     }
+
+    /// Whether the command takes an argument it cannot run without: one its
+    /// synopsis does not bracket.
+    fn needs_arg(&self) -> bool {
+        !self.args.is_empty() && !self.args.starts_with('[')
+    }
 }
 
 pub const COMMANDS: &[MetaCommand] = &[
@@ -115,7 +122,7 @@ pub const COMMANDS: &[MetaCommand] = &[
         args: "[TARGET]",
         help: "reconnect, to TARGET if given",
         arg: ArgKind::Path,
-        run: |sh, c| sh.connect_to(c.path().as_deref()),
+        run: |sh, c| sh.connect_to(&c.path()),
     },
     MetaCommand {
         names: &["\\conninfo"],
@@ -129,10 +136,7 @@ pub const COMMANDS: &[MetaCommand] = &[
         args: "SCHEMA",
         help: "resolve unqualified names in SCHEMA",
         arg: ArgKind::Schema,
-        run: |sh, c| match c.arg() {
-            Some(schema) => sh.use_schema(schema),
-            None => sh.fail("\\use needs a schema name"),
-        },
+        run: |sh, c| sh.use_schema(c.arg()),
     },
     MetaCommand {
         names: &["\\d"],
@@ -140,8 +144,8 @@ pub const COMMANDS: &[MetaCommand] = &[
         help: "list relations, or describe NAME (\\d+ shows hidden columns and a view's definition)",
         arg: ArgKind::Relation(|_| true),
         run: |sh, c| match c.arg() {
-            Some(name) => sh.describe(name, c.verbose),
-            None => sh.list(None, |k| k != RelClass::Catalog),
+            "" => sh.list("", |k| k != RelClass::Catalog),
+            name => sh.describe(name, c.verbose),
         },
     },
     MetaCommand {
@@ -191,10 +195,7 @@ pub const COMMANDS: &[MetaCommand] = &[
         args: "VIEW | SELECT ...",
         help: "stream a delta-fed view's changes, weights and all, until Ctrl-C",
         arg: ArgKind::Sql(|k| k == RelClass::FedView),
-        run: |sh, c| match c.rest.is_empty() {
-            true => sh.fail("\\watch needs a view name or a SELECT over one"),
-            false => sh.watch(c.rest).map(|()| Flow::Continue),
-        },
+        run: |sh, c| sh.watch(c.rest).map(|()| Flow::Continue),
     },
     MetaCommand {
         names: &["\\x"],
@@ -213,7 +214,7 @@ pub const COMMANDS: &[MetaCommand] = &[
                 Format::Aligned => "unaligned",
                 _ => "aligned",
             };
-            sh.set_option(Setting::Format, Some(to))
+            sh.set_option(Setting::Format, to)
         },
     },
     MetaCommand {
@@ -236,9 +237,9 @@ pub const COMMANDS: &[MetaCommand] = &[
         help: "send results to FILE, or back to stdout",
         arg: ArgKind::Path,
         run: |sh, c| {
-            match c.path() {
-                Some(path) => sh.output_to_file(&path)?,
-                None => sh.output_to_stdout(),
+            match &*c.path() {
+                "" => sh.output_to_stdout(),
+                path => sh.output_to_file(path)?,
             }
             Ok(Flow::Continue)
         },
@@ -248,51 +249,39 @@ pub const COMMANDS: &[MetaCommand] = &[
         args: "FILE",
         help: "run the commands in FILE",
         arg: ArgKind::Path,
-        run: |sh, c| match c.path() {
-            Some(path) => sh.run_file(&path),
-            None => sh.fail("\\i needs a file name"),
-        },
+        run: |sh, c| sh.run_file(&c.path()),
     },
     MetaCommand {
         names: &["\\dump"],
         args: "DIR",
         help: "dump the database into DIR: its schema as SQL, its rows as Parquet",
         arg: ArgKind::Path,
-        run: |sh, c| match c.path() {
-            Some(dir) => sh.dump(&dir),
-            None => sh.fail("\\dump needs a directory"),
-        },
+        run: |sh, c| sh.dump(&c.path()),
     },
     MetaCommand {
         names: &["\\restore"],
         args: "DIR",
         help: "restore the dump in DIR into this database",
         arg: ArgKind::Path,
-        run: |sh, c| match c.path() {
-            Some(dir) => sh.restore(&dir),
-            None => sh.fail("\\restore needs a directory"),
-        },
+        run: |sh, c| sh.restore(&c.path()),
     },
     MetaCommand {
         names: &["\\backup"],
         args: "NAME",
         help: "copy the server's data directory, at a checkpoint, into its backup directory as NAME",
         arg: ArgKind::None,
-        run: |sh, c| match c.arg() {
-            Some(name) => sh.backup(name),
-            None => sh.fail("\\backup needs a name"),
-        },
+        run: |sh, c| sh.backup(c.arg()),
     },
     MetaCommand {
         names: &["\\e"],
         args: "[FILE]",
         help: "edit the last statement, or FILE, in $EDITOR",
         arg: ArgKind::Path,
-        run: |sh, c| sh.edit(c.path().as_deref()),
+        run: |sh, c| sh.edit(&c.path()),
     },
     MetaCommand {
         names: &["\\echo"],
-        args: "TEXT",
+        args: "[TEXT]",
         help: "print TEXT",
         arg: ArgKind::None,
         run: |sh, c| {
@@ -342,131 +331,13 @@ impl MetaLine {
     }
 }
 
-/// How a `\pset` value is spelled.
-pub fn name_of(v: &impl clap::ValueEnum) -> String {
-    v.to_possible_value()
-        .expect("no variant is skipped")
-        .get_name()
-        .to_string()
-}
-
-/// Every variant's spelling.
-pub fn variants<E: clap::ValueEnum>() -> Vec<String> {
-    E::value_variants().iter().map(name_of).collect()
-}
-
-/// The variant `v` spells, in any case; the error lists [`variants`].
-pub fn choose<E: clap::ValueEnum>(v: &str) -> Result<E, String> {
-    E::from_str(v, true).map_err(|_| format!("\"{v}\" is not one of {}", variants::<E>().join(", ")))
-}
-
-/// An option `\pset` shows and sets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Setting {
-    Format,
-    Null,
-    Footer,
-    Pager,
-    Expanded,
-    Timing,
-}
-
-impl Setting {
-    /// What its status line calls it: "Output format is csv."
-    fn label(self) -> &'static str {
-        match self {
-            Setting::Format => "Output format",
-            Setting::Null => "Null display",
-            Setting::Footer => "Footer",
-            Setting::Pager => "Pager",
-            Setting::Expanded => "Expanded display",
-            Setting::Timing => "Timing",
-        }
-    }
-
-    /// The values completion offers.
-    pub fn values(self) -> Vec<String> {
-        match self {
-            Setting::Format => variants::<Format>(),
-            Setting::Expanded => variants::<Expanded>(),
-            Setting::Footer | Setting::Pager | Setting::Timing => vec![on_off(true).into(), on_off(false).into()],
-            Setting::Null => Vec::new(),
-        }
-    }
-
-    fn show(self, s: &Settings) -> String {
-        match self {
-            Setting::Format => name_of(&s.format),
-            Setting::Null => format!("\"{}\"", s.null),
-            Setting::Footer => on_off(s.footer).to_string(),
-            Setting::Pager => on_off(s.pager).to_string(),
-            Setting::Expanded => name_of(&s.expanded),
-            Setting::Timing => on_off(s.timing).to_string(),
-        }
-    }
-
-    /// Apply `value`. `None` toggles `Footer`, `Pager`, `Timing` and `Expanded`
-    /// (`Off`↔`On`), and leaves `Format` and `Null` as they are.
-    fn set(self, s: &mut Settings, value: Option<&str>) -> Result<(), String> {
-        let flag = |current: bool| match value {
-            None => Ok(!current),
-            Some(v) => gnitz_sql::parse_bool(v).ok_or_else(|| format!("\"{v}\" is not on or off")),
-        };
-        match self {
-            Setting::Format => {
-                if let Some(v) = value {
-                    s.format = choose(v)?;
-                }
-            }
-            Setting::Null => {
-                if let Some(v) = value {
-                    s.null = single_quoted(v).unwrap_or_else(|| v.to_string());
-                }
-            }
-            Setting::Footer => s.footer = flag(s.footer)?,
-            Setting::Pager => s.pager = flag(s.pager)?,
-            Setting::Timing => s.timing = flag(s.timing)?,
-            Setting::Expanded => {
-                s.expanded = match value {
-                    None if s.expanded == Expanded::Off => Expanded::On,
-                    None => Expanded::Off,
-                    Some(v) => match gnitz_sql::parse_bool(v) {
-                        Some(true) => Expanded::On,
-                        Some(false) => Expanded::Off,
-                        None => choose(v)?,
-                    },
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-fn on_off(b: bool) -> &'static str {
-    if b {
-        "on"
-    } else {
-        "off"
-    }
-}
-
-/// The text of `v` when it lexes as one single-quoted string.
-fn single_quoted(v: &str) -> Option<String> {
-    match crate::lex::lex(v)?.as_slice() {
-        [l] => match &l.token {
-            Token::SingleQuotedString(text) => Some(text.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 /// `pattern`, a psql wildcard pattern, as a case-insensitive test of a
 /// relation's or index's schema and name: of the qualified name when the
-/// pattern has a `.`, else of the name. Double quotes are dropped, as psql reads
-/// them as quoting; a catalog name holds none.
-fn glob(pattern: Option<&str>) -> impl FnMut(&str, &str) -> bool {
-    let pattern = pattern.map(|p| p.replace('"', ""));
+/// pattern has a `.`, else of the name; an empty pattern keeps everything.
+/// Double quotes are dropped, as psql reads them as quoting; a catalog name
+/// holds none.
+fn glob(pattern: &str) -> impl FnMut(&str, &str) -> bool {
+    let pattern = (!pattern.is_empty()).then(|| pattern.replace('"', ""));
     let qualified = pattern.as_ref().is_some_and(|p| p.contains('.'));
     let m = pattern.map(|p| LikeMatcher::compile(LikePattern::glob(&p).as_bytes(), true));
     let mut folded = Vec::new();
@@ -492,6 +363,9 @@ impl Shell {
             rest: line[name.end..].trim(),
             verbose,
         };
+        if cmd.needs_arg() && call.rest.is_empty() {
+            return self.fail(format!("{} needs {}", cmd.name(), cmd.args));
+        }
         (cmd.run)(self, &call)
     }
 
@@ -515,22 +389,26 @@ impl Shell {
         Ok(Flow::Continue)
     }
 
-    fn connect_to(&mut self, target: Option<&str>) -> Result<Flow, Failed> {
-        let target = target.map_or_else(|| self.target().to_string(), str::to_string);
+    /// Reconnect, to `target` unless it is empty.
+    fn connect_to(&mut self, target: &str) -> Result<Flow, Failed> {
+        let target = match target {
+            "" => self.target().to_string(),
+            t => t.to_string(),
+        };
         self.reconnect(&target)?;
         self.status(&format!("connected to {target}"));
         Ok(Flow::Continue)
     }
 
     fn conninfo(&mut self) -> Result<Flow, Failed> {
-        let msg = format!("connected to \"{}\", schema \"{}\"", self.target(), self.schema());
+        let msg = format!("connected to \"{}\", schema \"{}\"", self.target(), self.schema);
         self.status(&msg);
         Ok(Flow::Continue)
     }
 
     fn use_schema(&mut self, schema: &str) -> Result<Flow, Failed> {
         let catalog = self.catalog()?;
-        let key = RelName::schema_key(schema).ok();
+        let key = gnitz_sql::parse_schema_name(schema);
         let Some(known) = key.filter(|k| catalog.schemas.contains(k)) else {
             return self.fail(format!("schema \"{schema}\" does not exist"));
         };
@@ -538,10 +416,11 @@ impl Shell {
         Ok(Flow::Continue)
     }
 
-    /// Apply `value` to `setting`, then report what it is.
-    fn set_option(&mut self, setting: Setting, value: Option<&str>) -> Result<Flow, Failed> {
+    /// Apply `value` to `setting`, or toggle it where `value` is empty, then
+    /// report what it is.
+    fn set_option(&mut self, setting: Setting, value: &str) -> Result<Flow, Failed> {
         setting
-            .set(&mut self.settings, value)
+            .set(&mut self.settings, (!value.is_empty()).then_some(value))
             .or_else(|e| self.fail(format!("{}: {e}", name_of(&setting))))?;
         self.status(&format!("{} is {}.", setting.label(), setting.show(&self.settings)));
         Ok(Flow::Continue)
@@ -559,11 +438,10 @@ impl Shell {
             return Ok(Flow::Continue);
         };
         let setting = choose::<Setting>(option).or_else(|e| self.fail(format!("\\pset: {e}")))?;
-        let value = rest[option.len()..].trim();
-        self.set_option(setting, (!value.is_empty()).then_some(value))
+        self.set_option(setting, rest[option.len()..].trim())
     }
 
-    fn list(&mut self, pattern: Option<&str>, keep: fn(RelClass) -> bool) -> Result<Flow, Failed> {
+    fn list(&mut self, pattern: &str, keep: fn(RelClass) -> bool) -> Result<Flow, Failed> {
         let catalog = self.catalog()?;
         let mut matches = glob(pattern);
         let rows = catalog
@@ -588,7 +466,7 @@ impl Shell {
         self.print_listing("relations", &columns, rows)
     }
 
-    fn list_indexes(&mut self, pattern: Option<&str>) -> Result<Flow, Failed> {
+    fn list_indexes(&mut self, pattern: &str) -> Result<Flow, Failed> {
         let catalog = self.catalog()?;
         let mut matches = glob(pattern);
         let rows = catalog
@@ -694,13 +572,12 @@ impl Shell {
             footer: false,
             ..self.settings.clone()
         };
-        out.push_str(&render(
-            &Rows::of(&columns, rows),
-            Weights::Repeat,
-            &settings,
-            None,
-            false,
-        ));
+        let target = Target {
+            width: None,
+            wrap: false,
+            ..self.target_for(false)
+        };
+        out.push_str(&render(&Rows::of(&columns, rows), Weights::Repeat, &settings, target));
 
         let mut section = |title: &str, lines: Vec<String>| {
             if lines.is_empty() {
@@ -749,37 +626,39 @@ impl Shell {
     }
 
     fn dump(&mut self, dir: &str) -> Result<Flow, Failed> {
-        let done = gnitz_core::block_on(gnitz_dump::dump(&mut self.client, std::path::Path::new(dir)));
+        let done = block_on(gnitz_dump::dump(&mut self.client, Path::new(dir)));
         let s = done.or_else(|e| self.fail(format!("\\dump: {e}")))?;
         self.status(&format!("dumped {s} into {dir}"));
         Ok(Flow::Continue)
     }
 
     fn restore(&mut self, dir: &str) -> Result<Flow, Failed> {
-        let done = gnitz_core::block_on(gnitz_dump::restore(&mut self.client, std::path::Path::new(dir)));
+        let done = block_on(gnitz_dump::restore(&mut self.client, Path::new(dir)));
         let s = done.or_else(|e| self.fail(format!("\\restore: {e}")))?;
         self.status(&format!("restored {s} from {dir}"));
         Ok(Flow::Continue)
     }
 
     fn backup(&mut self, name: &str) -> Result<Flow, Failed> {
-        gnitz_core::block_on(self.client.backup(name)).or_else(|e| self.fail(format!("\\backup: {e}")))?;
+        block_on(self.client.backup(name)).or_else(|e| self.fail(format!("\\backup: {e}")))?;
         self.status(&format!("backed up as {name}"));
         Ok(Flow::Continue)
     }
 
-    fn edit(&mut self, file: Option<&str>) -> Result<Flow, Failed> {
-        if !self.interactive {
+    /// `\e`: `file`, else the last statement, in the editor, then in the
+    /// next prompt's buffer.
+    fn edit(&mut self, file: &str) -> Result<Flow, Failed> {
+        let Some(scratch) = &self.scratch else {
             return self.fail("\\e needs an interactive session");
-        }
+        };
         let path = match file {
-            Some(f) => PathBuf::from(f),
-            None => {
-                let path = self.scratch()?.join("edit.sql");
+            "" => {
+                let path = scratch.path().join("edit.sql");
                 std::fs::write(&path, &self.last_statement)
                     .or_else(|e| self.fail(format!("{}: {e}", path.display())))?;
                 path
             }
+            f => PathBuf::from(f),
         };
         match editor_command(&path).status() {
             Ok(s) if s.success() => {}

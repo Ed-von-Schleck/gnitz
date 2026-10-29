@@ -1,26 +1,28 @@
-//! The line editor: reedline, with the highlighter, completer, validator and
-//! prompt of this shell.
+//! The interactive session: reedline, with the highlighter, completer,
+//! validator and prompt of this shell, reading what the shell runs.
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitCode};
 
 use nu_ansi_term::{Color, Style};
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
     default_vi_visual_keybindings, DefaultHinter, DescriptionMode, EditCommand, Emacs, FileBackedHistory, IdeMenu,
     InputMode, KeyCode, KeyModifiers, Keybindings, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, PromptViMode, Reedline, ReedlineEvent, ReedlineMenu, ValidationResult, Validator, Vi,
+    PromptHistorySearchStatus, PromptViMode, Reedline, ReedlineEvent, ReedlineMenu, Signal, ValidationResult,
+    Validator, Vi,
 };
 
 use crate::highlight::SqlHighlighter;
 use crate::lex;
+use crate::shell::{Flow, Shell};
 
 const COMPLETION_MENU: &str = "completion_menu";
 const HISTORY_CAPACITY: usize = 10_000;
 
 /// A buffer is submitted once it ends a statement or is a meta-command.
-pub struct SqlValidator;
+struct SqlValidator;
 
 impl Validator for SqlValidator {
     fn validate(&self, line: &str) -> ValidationResult {
@@ -33,9 +35,9 @@ impl Validator for SqlValidator {
 
 /// `schema=>`, psql's shape: `=*>` inside a transaction, `->` on a
 /// continuation line.
-pub struct ShellPrompt {
-    pub schema: String,
-    pub in_transaction: bool,
+struct ShellPrompt {
+    schema: String,
+    in_transaction: bool,
 }
 
 impl Prompt for ShellPrompt {
@@ -68,14 +70,14 @@ impl Prompt for ShellPrompt {
         Cow::Owned(format!("({prefix}reverse-search: {}) ", search.term))
     }
 
-    fn get_prompt_color(&self) -> reedline::Color {
-        reedline::Color::Green
+    fn get_prompt_color(&self) -> Color {
+        Color::Green
     }
 
-    fn get_indicator_color(&self) -> reedline::Color {
+    fn get_indicator_color(&self) -> Color {
         match self.in_transaction {
-            true => reedline::Color::Yellow,
-            false => reedline::Color::Green,
+            true => Color::Yellow,
+            false => Color::Green,
         }
     }
 }
@@ -123,9 +125,9 @@ pub fn editor_command(path: &Path) -> Command {
     cmd
 }
 
-/// The editor, without a completer: the shell sets one at each prompt. Alt-E
+/// The editor, without a completer: [`run`] sets one at each prompt. Alt-E
 /// writes the buffer to `buffer` for `$EDITOR`.
-pub fn build(vi: bool, color: bool, buffer: PathBuf) -> Reedline {
+fn build(vi: bool, color: bool, buffer: PathBuf) -> Reedline {
     // The whole buffer, so the completer reads references past the cursor.
     let menu = IdeMenu::default()
         .with_name(COMPLETION_MENU)
@@ -172,4 +174,51 @@ pub fn build(vi: bool, color: bool, buffer: PathBuf) -> Reedline {
         }
     }
     line_editor
+}
+
+/// The session: read a buffer at each prompt and run it, until `\q`, an exit
+/// word or Ctrl-D.
+pub fn run(shell: &mut Shell, vi: bool) -> ExitCode {
+    let scratch = match tempfile::Builder::new().prefix("gnitz-").tempdir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("gnitz: cannot make a scratch directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut line_editor = build(vi, shell.color, scratch.path().join("buffer.sql"));
+    shell.scratch = Some(scratch);
+    println!(
+        "gnitz {} — connected to {}. Type \\? for help, \\q to quit.",
+        gnitz_wire::RELEASE,
+        shell.target()
+    );
+    loop {
+        // Completion offers what the catalog holds now, whichever session
+        // changed it; a failed read keeps the previous completer.
+        if let Some(ctx) = shell.completion() {
+            line_editor = line_editor.with_completer(Box::new(ctx));
+        }
+        if let Some(text) = shell.prefill.take() {
+            line_editor.run_edit_commands(&[EditCommand::InsertString(text)]);
+        }
+        let prompt = ShellPrompt {
+            schema: shell.schema.clone(),
+            in_transaction: shell.client.txn_active(),
+        };
+        match line_editor.read_line(&prompt) {
+            Ok(Signal::Success(buffer)) => {
+                if let Ok(Flow::Quit) = shell.run_script(&buffer) {
+                    break;
+                }
+            }
+            Ok(Signal::CtrlD) => break,
+            Ok(_) => continue,
+            Err(e) => {
+                eprintln!("gnitz: terminal error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }

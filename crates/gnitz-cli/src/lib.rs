@@ -3,16 +3,22 @@
 //! and `\watch` over a view's delta feed. Given no server, the binary runs a
 //! separately installed one for the session.
 //!
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover; the crate-root `tests/` is the integration suite, gated on the
-//! `integration` feature.
+//! The library is the shell the binary and the integration suite drive; its
+//! parts are private. Unit tests live in `tests/<module>.rs`, attached with
+//! `#[path]` to the module they cover; the crate-root `tests/` is the
+//! integration suite, gated on the `integration` feature.
 
-pub mod complete;
-pub mod editor;
-pub mod highlight;
-pub mod lex;
-pub mod meta;
-pub mod render;
-pub mod shell;
-pub mod value;
-pub mod watch;
+mod complete;
+mod editor;
+mod highlight;
+mod lex;
+mod meta;
+mod render;
+mod settings;
+mod shell;
+mod value;
+mod watch;
+
+pub use editor::run as repl;
+pub use settings::{Expanded, Format, Settings};
+pub use shell::{Failed, Flow, Options, Shell};

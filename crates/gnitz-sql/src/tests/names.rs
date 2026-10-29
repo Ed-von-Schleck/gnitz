@@ -27,6 +27,7 @@ fn a_name_is_written_as_sql_reads_it_back() {
         let text = format!("{}.{}", relation_text(&n), relation_text(&n));
         let rel = parse_relation_name(&text, "public").unwrap_or_else(|| panic!("{text}"));
         assert_eq!((rel.schema(), rel.name()), (&n[..], &n[..]), "{text}");
+        assert_eq!(parse_schema_name(&relation_text(&n)).as_deref(), Some(&n[..]), "{n}");
     }
     assert_eq!(column_text("id"), "id");
     assert_eq!(relation_text("orders"), "orders");
@@ -40,4 +41,14 @@ fn a_relation_name_reads_as_sql_reads_it() {
     assert!(parse_relation_name("hot oops", "public").is_none());
     assert!(parse_relation_name("a.b.c", "public").is_none());
     assert!(parse_relation_name("", "public").is_none());
+}
+
+#[test]
+fn a_schema_name_reads_as_the_schema_of_a_qualified_name() {
+    assert_eq!(parse_schema_name("App").as_deref(), Some("app"));
+    assert_eq!(parse_schema_name("\"app\"").as_deref(), Some("app"));
+    assert_eq!(parse_schema_name("\"table\"").as_deref(), Some("table"));
+    assert_eq!(parse_schema_name("_SYSTEM").as_deref(), Some("_system"));
+    assert!(parse_schema_name("a.b").is_none());
+    assert!(parse_schema_name("").is_none());
 }

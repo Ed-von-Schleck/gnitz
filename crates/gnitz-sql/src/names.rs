@@ -29,6 +29,12 @@ pub fn parse_relation_name(text: &str, schema: &str) -> Option<RelName> {
     relation_name(&read_back(text, |p| p.parse_object_name(false))?, schema)
 }
 
+/// `text`, the whole of it, read as a schema name: canonical, as the schema
+/// part of a qualified name reads.
+pub fn parse_schema_name(text: &str) -> Option<String> {
+    RelName::schema_key(&read_back(text, |p| p.parse_identifier())?.value).ok()
+}
+
 /// `text` parsed whole by `parse`.
 fn read_back<T>(
     text: &str,

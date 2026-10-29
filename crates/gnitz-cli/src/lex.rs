@@ -55,7 +55,7 @@ pub fn lex(src: &str) -> Option<Vec<Lexeme>> {
 /// The statement and clause words the shell styles and completes as keywords,
 /// beside the planner's type names and calendar fields. A function spelled as
 /// a keyword (`CAST`, `EXTRACT`) is a function name instead.
-pub const KEYWORDS: &[Keyword] = &[
+const KEYWORDS: &[Keyword] = &[
     Keyword::ACTION,
     Keyword::ADD,
     Keyword::ALL,
@@ -167,14 +167,26 @@ pub const KEYWORDS: &[Keyword] = &[
     Keyword::WITH,
 ];
 
-/// Whether `w` is a word of the shell's SQL vocabulary: one of [`KEYWORDS`], a
-/// word of a type name, or a calendar field.
+/// The words of the shell's SQL vocabulary besides [`KEYWORDS`]: each word of a
+/// type name, and the calendar fields.
+fn planner_words() -> impl Iterator<Item = &'static str> {
+    gnitz_sql::type_names()
+        .flat_map(str::split_whitespace)
+        .chain(gnitz_sql::calendar_field_names())
+}
+
+/// Every word of the shell's SQL vocabulary, as completion offers it: one word
+/// at a time, so a type spelled in several is offered word by word.
+pub fn vocabulary() -> impl Iterator<Item = String> {
+    KEYWORDS
+        .iter()
+        .map(Keyword::to_string)
+        .chain(planner_words().map(str::to_string))
+}
+
+/// Whether `w` is a word of the shell's SQL [`vocabulary`].
 pub fn is_keyword(w: &Word) -> bool {
-    KEYWORDS.contains(&w.keyword)
-        || gnitz_sql::type_names()
-            .flat_map(str::split_whitespace)
-            .chain(gnitz_sql::calendar_field_names())
-            .any(|k| k.eq_ignore_ascii_case(&w.value))
+    KEYWORDS.contains(&w.keyword) || planner_words().any(|k| k.eq_ignore_ascii_case(&w.value))
 }
 
 /// Where the SQL word `before` ends in starts: the chain of adjacent words and
@@ -210,46 +222,6 @@ pub fn word_at(before: &str) -> Option<usize> {
     }
 }
 
-/// One statement of a buffer: its text, without the terminating `;`.
-pub fn statements(src: &str) -> Vec<Range<usize>> {
-    let Some(lexemes) = lex(src) else {
-        // The planner reports what does not tokenize.
-        return std::iter::once(0..src.len()).collect();
-    };
-    let mut out = Vec::new();
-    let mut start: Option<usize> = None;
-    let mut end = 0;
-    for l in &lexemes {
-        if l.token == Token::SemiColon {
-            if let Some(s) = start.take() {
-                out.push(s..end);
-            }
-            continue;
-        }
-        if l.is_trivia() {
-            continue;
-        }
-        start.get_or_insert(l.range.start);
-        end = l.range.end;
-    }
-    if let Some(s) = start {
-        out.push(s..end);
-    }
-    out
-}
-
-/// The byte just past the last top-level `;` of `src`: everything before it is
-/// whole statements. `None` when there is none, or when `src` does not
-/// tokenize because a string or comment is still open.
-pub fn complete_prefix(src: &str) -> Option<usize> {
-    let lexemes = lex(src)?;
-    lexemes
-        .iter()
-        .rev()
-        .find(|l| l.token == Token::SemiColon)
-        .map(|l| l.range.end)
-}
-
 /// Whether `src` holds nothing but whitespace and comments.
 pub fn is_blank(src: &str) -> bool {
     match lex(src) {
@@ -281,16 +253,8 @@ pub fn is_exit_word(s: &str) -> bool {
     s.eq_ignore_ascii_case("exit") || s.eq_ignore_ascii_case("quit")
 }
 
-/// Whether a token is a comment.
-pub fn is_comment(t: &Token) -> bool {
-    matches!(
-        t,
-        Token::Whitespace(Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_))
-    )
-}
-
 /// Turns a stream of input lines into the pieces the shell runs: a
-/// meta-command line, or the SQL up to and including a line's last `;`.
+/// meta-command line, or one statement.
 #[derive(Default)]
 pub struct Splitter {
     pending: String,
@@ -298,34 +262,71 @@ pub struct Splitter {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Piece {
+    /// One statement, without its `;`.
     Sql(String),
     Meta(String),
 }
 
 impl Splitter {
-    /// Feed one line, without its newline. Only a line that is a
-    /// meta-command or holds a `;` can complete a piece, so only such a line
-    /// re-reads what is pending.
-    pub fn push_line(&mut self, line: &str) -> Option<Piece> {
+    /// Feed one line, without its newline: the pieces it completes. Only a
+    /// line that is a meta-command or holds a `;` can complete one, so only
+    /// such a line re-reads what is pending.
+    pub fn push_line(&mut self, line: &str) -> Vec<Piece> {
         if line.trim_start().starts_with('\\') && is_blank(&self.pending) {
             self.pending.clear();
-            return Some(Piece::Meta(line.trim().to_string()));
+            return vec![Piece::Meta(line.trim().to_string())];
         }
         self.pending.push_str(line);
         self.pending.push('\n');
         if !line.contains(';') {
-            return None;
+            return Vec::new();
         }
-        let end = complete_prefix(&self.pending)?;
-        let rest = self.pending.split_off(end);
-        Some(Piece::Sql(std::mem::replace(&mut self.pending, rest)))
+        let Some(lexemes) = lex(&self.pending) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let done = split(&self.pending, &lexemes, false, &mut out);
+        self.pending.drain(..done);
+        out
     }
 
     /// What is left at the end of the input: SQL with no closing `;` runs too.
-    pub fn finish(&mut self) -> Option<Piece> {
+    pub fn finish(&mut self) -> Vec<Piece> {
         let rest = std::mem::take(&mut self.pending);
-        (!is_blank(&rest)).then_some(Piece::Sql(rest))
+        let mut out = Vec::new();
+        match lex(&rest) {
+            Some(lexemes) => {
+                split(&rest, &lexemes, true, &mut out);
+            }
+            // The planner reports what does not tokenize.
+            None => out.push(Piece::Sql(rest)),
+        }
+        out
     }
+}
+
+/// Push each statement of `src` that a top-level `;` ends onto `out`, and
+/// with `tail` the one after the last `;` too; a statement of nothing but
+/// whitespace and comments is none. The byte just past the last `;`, or 0.
+fn split(src: &str, lexemes: &[Lexeme], tail: bool, out: &mut Vec<Piece>) -> usize {
+    let mut start: Option<usize> = None;
+    let mut end = 0;
+    let mut done = 0;
+    for l in lexemes {
+        if l.token == Token::SemiColon {
+            if let Some(s) = start.take() {
+                out.push(Piece::Sql(src[s..end].to_string()));
+            }
+            done = l.range.end;
+        } else if !l.is_trivia() {
+            start.get_or_insert(l.range.start);
+            end = l.range.end;
+        }
+    }
+    if let Some(s) = start.filter(|_| tail) {
+        out.push(Piece::Sql(src[s..end].to_string()));
+    }
+    done
 }
 
 #[cfg(test)]

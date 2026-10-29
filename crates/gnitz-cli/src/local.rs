@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use gnitz_core::local_server::{self, LocalServer};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 /// A [`LocalServer`] held for the session: stopped when the session ends, and
 /// also when one of the signals it was held under ends the process, which runs
@@ -35,9 +36,9 @@ impl Held {
             }
         }
         // An interactive session's Ctrl-C cancels a statement; a script's ends it.
-        let signals: &[libc::c_int] = match interactive {
-            true => &[libc::SIGTERM, libc::SIGHUP],
-            false => &[libc::SIGTERM, libc::SIGHUP, libc::SIGINT],
+        let signals: &[i32] = match interactive {
+            true => &[SIGTERM, SIGHUP],
+            false => &[SIGTERM, SIGHUP, SIGINT],
         };
         let socket = server.socket().to_path_buf();
         let server = Arc::new(Mutex::new(Some(server)));
