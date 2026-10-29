@@ -463,7 +463,7 @@ impl ZSetBatch {
             return Err(format!("nulls length {} != row count {}", self.nulls.len(), n));
         }
         self.check_columns()?;
-        check_not_null(&self.nulls, schema)?;
+        check_not_null(gnitz_wire::as_le_bytes(&self.nulls), schema)?;
         let col = |pi: usize| (self.payload[pi].bytes.as_slice(), self.payload[pi].stride());
         match gnitz_wire::first_valued_null(
             schema.layout().nullable_payload_slots(),
@@ -559,9 +559,8 @@ fn gather_cells(src: &[u8], stride: usize, rows: &[u32]) -> Vec<u8> {
 /// No row sets a null bit `schema` does not admit: one on a NOT NULL payload
 /// column, whose declaration every reader past the decoder trusts, or one past
 /// the last payload column.
-pub(crate) fn check_not_null(nulls: &[u64], schema: &Schema) -> Result<(), String> {
-    match gnitz_wire::first_not_null_violation(schema.layout().not_null_payload_slots(), gnitz_wire::as_le_bytes(nulls))
-    {
+pub(crate) fn check_not_null(null_bmp: &[u8], schema: &Schema) -> Result<(), String> {
+    match gnitz_wire::first_not_null_violation(schema.layout().not_null_payload_slots(), null_bmp) {
         None => Ok(()),
         Some((row, slot)) if slot >= schema.layout().num_payload_cols() => {
             Err(format!("row {row} sets null bit {slot}, past the last payload column"))
@@ -889,35 +888,34 @@ fn append_regions(
             "a region list that does not lay out its schema".into(),
         ));
     }
-    let mark = sink.mark();
+    check_not_null(regions[REG_NULL_BMP], schema).map_err(ProtocolError::DecodeError)?;
+    // A German cell's heap offset is relative to its own block's heap.
+    let block_blob = regions[REG_PAYLOAD_START + sink.payload.len()];
+    if foreign {
+        let bad = sink.payload.iter().enumerate().find(|&(pi, col)| {
+            col.tc().is_german_string()
+                && !gnitz_wire::german_string_region_ok(regions[REG_PAYLOAD_START + pi], block_blob)
+        });
+        if let Some((pi, _)) = bad {
+            return Err(ProtocolError::DecodeError(format!(
+                "column {}: German string cell is not in canonical form",
+                schema.layout().payload_col_idx(pi)
+            )));
+        }
+    }
+
     sink.reserve(count);
     sink.pks.push_region_bytes(regions[REG_PK]);
     gnitz_wire::extend_from_le_bytes(&mut sink.weights, regions[REG_WEIGHT]);
-    let nulls_at = sink.nulls.len();
     gnitz_wire::extend_from_le_bytes(&mut sink.nulls, regions[REG_NULL_BMP]);
-    if let Err(why) = check_not_null(&sink.nulls[nulls_at..], schema) {
-        sink.rollback_to(mark);
-        return Err(ProtocolError::DecodeError(why));
-    }
-
-    // A German cell's heap offset is relative to its own block's heap.
-    let block_blob = regions[REG_PAYLOAD_START + sink.payload.len()];
     let blob_base = sink.blob.len();
     sink.blob.extend_from_slice(block_blob);
-
     for (pi, col) in sink.payload.iter_mut().enumerate() {
         let german = col.tc().is_german_string();
         let dst = &mut col.bytes;
         let at = dst.len();
         dst.extend_from_slice(regions[REG_PAYLOAD_START + pi]);
         if german {
-            if foreign && !gnitz_wire::german_string_region_ok(&dst[at..], block_blob) {
-                sink.rollback_to(mark);
-                return Err(ProtocolError::DecodeError(format!(
-                    "column {}: German string cell is not in canonical form",
-                    schema.layout().payload_col_idx(pi)
-                )));
-            }
             gnitz_wire::shift_german_string_heaps(&mut dst[at..], blob_base);
         }
     }
