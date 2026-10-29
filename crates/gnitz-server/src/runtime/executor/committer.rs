@@ -1,7 +1,6 @@
 //! The group-commit task: every user write's SAL groups, its fdatasync and its
 //! worker ACKs, batched from whatever is queued behind the first request (see
-//! [`drain_ready_batch`]). Checkpoints, backups, DDL barriers and DDL pauses
-//! end a batch. Once serving, it is the one task that runs a checkpoint.
+//! [`drain_ready_batch`]). Checkpoints, backups and DDL pauses end a batch. Once serving, it is the one task that runs a checkpoint.
 
 use super::validate::TxnFamily;
 use super::Shared;
@@ -31,8 +30,6 @@ enum CommitRequest {
 
 /// A request that ends a committer batch, run once the batch has committed.
 enum BatchEnd {
-    /// DDL drain: signalled once the batch has committed.
-    Barrier(oneshot::Sender<()>),
     /// The checkpoint sequence over everything committed. A failed round
     /// aborts, so it has no error to report.
     Checkpoint(oneshot::Sender<()>),
@@ -70,8 +67,8 @@ struct PendingWrite {
 }
 
 /// The way to the committer task. A write and a backup are refused once a
-/// graceful shutdown has been requested; the barrier, the pause, the reclaim
-/// poke and the final checkpoint itself are always queued.
+/// graceful shutdown has been requested; the pause, the reclaim poke and the
+/// final checkpoint itself are always queued.
 ///
 /// Everything a refusing request admits is queued ahead of the final
 /// checkpoint: the check and the send share no await, and the signal loop
@@ -101,11 +98,6 @@ impl Committer {
     pub(super) async fn backup(&self, dir: String) -> Result<(), WireFault> {
         self.admit(|done| CommitRequest::End(BatchEnd::Backup { dir, done }))?
             .await
-    }
-
-    /// Resolves once the batch queued ahead has committed.
-    pub(super) fn barrier(&self) -> oneshot::Receiver<()> {
-        self.queue(|done| CommitRequest::End(BatchEnd::Barrier(done)))
     }
 
     /// Resolves once the batch queued ahead has committed and the committer has
@@ -170,7 +162,6 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
 
         match end {
             None => {}
-            Some(BatchEnd::Barrier(done)) => done.send(()),
             Some(BatchEnd::Checkpoint(done)) => {
                 run_checkpoint_sequence(&shared).await;
                 done.send(());

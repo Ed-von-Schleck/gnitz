@@ -42,10 +42,10 @@ struct DdlLocks {
 /// the committer ahead of a write the catalog write waits out. It comes before
 /// the gate: a checkpoint the committer runs ahead of its park drains ticks.
 ///
-/// The barrier ahead of them all lets a checkpoint already queued finish before
-/// the catalog write starts holding off readers.
+/// A pause released at once ahead of them all lets a checkpoint already queued
+/// finish before the catalog write starts holding off readers.
 async fn enter_ddl(shared: &Shared) -> DdlLocks {
-    shared.committer.barrier().await;
+    drop(shared.committer.pause().await);
     let catalog = shared.catalog_rwlock.write().await;
     let committer = shared.committer.pause().await;
     let counted = TICK_HOLD_FOR_DDL.armed();

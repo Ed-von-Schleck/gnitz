@@ -32,11 +32,6 @@ fn write_of(family_rows: &[usize]) -> CommitRequest {
     })
 }
 
-fn barrier() -> CommitRequest {
-    let (done, _rx) = oneshot::channel();
-    CommitRequest::End(BatchEnd::Barrier(done))
-}
-
 fn checkpoint() -> CommitRequest {
     let (done, _rx) = oneshot::channel();
     CommitRequest::End(BatchEnd::Checkpoint(done))
@@ -55,7 +50,6 @@ fn pause() -> CommitRequest {
 
 fn end_label(end: &Option<BatchEnd>) -> Option<&'static str> {
     end.as_ref().map(|end| match end {
-        BatchEnd::Barrier(_) => "barrier",
         BatchEnd::Checkpoint(_) => "checkpoint",
         BatchEnd::Backup { .. } => "backup",
         BatchEnd::Pause { .. } => "pause",
@@ -77,7 +71,6 @@ fn a_batch_ends_at_the_row_cap_or_an_end_request() {
             (2, None, 1),
         ),
         (vec![write_of(&[half, half]), push_of(1)], (1, None, 1)),
-        (vec![push_of(1), barrier(), push_of(1)], (1, Some("barrier"), 1)),
         (vec![checkpoint(), push_of(1)], (0, Some("checkpoint"), 1)),
         (
             vec![push_of(1), push_of(1), backup(), push_of(1)],
