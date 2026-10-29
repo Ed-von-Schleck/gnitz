@@ -120,3 +120,22 @@ fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
     dag.dep.unlink(4);
     assert_eq!(steps(&mut dag), [(2, 1, false, false), (3, 1, true, false)]);
 }
+
+/// A view scans only relations older than it: ticks and backfills take ascending
+/// id order as dependency order. The refusal links nothing.
+#[test]
+fn a_view_scanning_a_relation_not_older_than_it_is_refused() {
+    use crate::test_support::{identity_circuit, make_schema_u64_i64};
+    use gnitz_store::relation::StoreConfig;
+    let registry = RelationRegistry::new("", Slot::SOLO, StoreConfig::default());
+    let mut dag = DagEngine::default();
+    for source in [5, 6] {
+        let circuit = identity_circuit(source, gnitz_wire::ReadBound::None);
+        let refused = dag.register_view(&registry, 5, &make_schema_u64_i64(), false, 5, &circuit);
+        assert_eq!(
+            refused.map(drop),
+            Err(format!("scans relation {source}, which is not older than it"))
+        );
+    }
+    assert!(dag.sources_of(5).is_empty() && !dag.is_scanned(5) && dag.layout_of(5).is_none());
+}

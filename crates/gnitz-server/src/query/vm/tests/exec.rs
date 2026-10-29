@@ -474,7 +474,7 @@ fn a_second_topn_epoch_displaces_the_first_ones_row() {
 
 /// A round sends its operand under the operand register's label, the program
 /// resumes from what it gathered rather than from what it sent, and the operand
-/// is left to a later reader.
+/// is lent, left to a later reader.
 #[test]
 fn a_round_sends_its_operand_and_resumes_from_what_it_gathered() {
     let schema = nullable();
@@ -488,11 +488,14 @@ fn a_round_sends_its_operand_and_resumes_from_what_it_gathered() {
     // The seed comes under its producer's narrower label.
     let mut seed = make_batch_u128(&make_schema_u128_i64(), &[(1, 1, 10)]);
     let mut sent = Vec::new();
-    let got = vm.epoch_with(r0, &mut seed, true, |rows, _| {
-        sent.push((*rows.schema() == schema, weighted_rows(rows)));
+    let got = vm.epoch_with(r0, &mut seed, true, |rows, lent| {
+        sent.push((*rows.schema() == schema, lent, weighted_rows(rows)));
         make_batch_u128(&schema, &[(7, 2, 70)])
     });
-    assert_eq!(sent, [(true, weighted_rows(&make_batch_u128(&schema, &[(1, -1, 10)])))]);
+    assert_eq!(
+        sent,
+        [(true, true, weighted_rows(&make_batch_u128(&schema, &[(1, -1, 10)])))]
+    );
     assert_rows(&got, &[(1, -1, 10), (7, 2, 70)]);
 }
 

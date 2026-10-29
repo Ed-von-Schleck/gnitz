@@ -45,9 +45,13 @@ impl ProgramBuilder {
     }
 
     /// The instruction writing `reg`, with its position and its first operand;
-    /// `None` for a seeded register.
+    /// `None` for a seeded register. Instructions are in out-register order:
+    /// [`Self::push`] gives each a fresh register above every earlier one.
     pub(in crate::query) fn writer(&self, reg: DeltaReg) -> Option<(usize, &Op, DeltaReg)> {
-        let pc = self.instructions.iter().position(|i| i.out_reg == reg)?;
+        let pc = self
+            .instructions
+            .binary_search_by_key(&reg.at(), |i| i.out_reg.at())
+            .ok()?;
         let instr = &self.instructions[pc];
         Some((pc, &instr.op, instr.in_reg))
     }

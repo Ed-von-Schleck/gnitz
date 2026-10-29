@@ -9,7 +9,8 @@
 
 use super::*;
 use crate::query::vm::{ClampHistory, HistoryTerm, Op, ProgramBuilder};
-use gnitz_zset::stream::JoinPlan;
+use gnitz_zset::algebra::null_extend_output_schema;
+use gnitz_zset::stream::{JoinPlan, OrderedPlan, ReducePlan};
 
 // ---------------------------------------------------------------------------
 // EmitCtx — the per-plan build state every emit arm works against
@@ -41,10 +42,10 @@ pub(super) struct EmitCtx<'a> {
 
 /// One scanned source: the register its delta seeds, the register its scans read — the
 /// seed's, or the relay's the source's route puts behind it — and its backfill bound.
-pub(super) struct Scan {
-    pub(super) seed: DeltaReg,
+pub(in crate::query) struct Scan {
+    pub(in crate::query) seed: DeltaReg,
     reg: DeltaReg,
-    pub(super) bound: ReadBound,
+    pub(in crate::query) bound: ReadBound,
 }
 
 impl<'a> EmitCtx<'a> {
@@ -122,10 +123,19 @@ impl<'a> EmitCtx<'a> {
         (!relayed).then_some(relation)
     }
 
+    /// True when the `ExchangeShard` at `enid` moves nothing: `scatter`, the plan
+    /// over the shard's input, hashes the bytes the scan behind it placed its rows by.
+    fn exchange_moves_nothing(&self, enid: NodeId, scatter: &ScatterPlan) -> bool {
+        scanned_row_locally(self.circuit, self.circuit.inputs(enid)[0])
+            // A relayed delta no longer sits where its source's store places it.
+            .filter(|&tid| self.meta.source_route(tid).is_none())
+            .and_then(|tid| self.registry.relation(tid))
+            .is_some_and(|source| scatter.routes_to_native_owner(source.placement()))
+    }
+
     /// The base table whose store is already the integral of `of`, the register
     /// its scan reads, and `of`'s re-key of that register.
     fn source_rekey(&self, of: NodeId) -> Option<(&'a Relation, DeltaReg, &MapPlan)> {
-        use gnitz_wire::{JoinKind, OpNode};
         let (_, Op::Map(rekey), entry) = self.prog.writer(self.regs[of])? else {
             return None;
         };
@@ -197,17 +207,15 @@ impl<'a> EmitCtx<'a> {
 
 /// Emit `nid`'s instructions and return the register its output lands in: its
 /// own, or an input's when the node emits nothing.
-fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<DeltaReg, String> {
+fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<DeltaReg, String> {
     match op {
         // Every worker computes the view's whole result: nothing moves, and a trim
         // would drop rows this worker legitimately owns a copy of.
-        gnitz_wire::OpNode::ExchangeShard | gnitz_wire::OpNode::WorkerFilter if ctx.meta.self_contained => {
-            Ok(ctx.unary_delta_in(nid))
-        }
+        OpNode::ExchangeShard | OpNode::WorkerFilter if ctx.meta.self_contained => Ok(ctx.unary_delta_in(nid)),
 
         // `bound` is a backfill-scan hint consumed by the source drive, not by the
         // VM: emission is identical bounded or not.
-        gnitz_wire::OpNode::ScanDelta { source: tid, bound } => {
+        OpNode::ScanDelta { source: tid, bound } => {
             // A circuit scanning an unknown table is corrupt: the planner
             // registers every source before shipping the circuit.
             let relation = ctx.registry.relation_or_err(*tid)?;
@@ -227,7 +235,7 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
             Ok(reg)
         }
 
-        gnitz_wire::OpNode::Filter(blob) => {
+        OpNode::Filter(blob) => {
             let in_reg = ctx.unary_delta_in(nid);
             let in_schema = ctx.prog.schema_of(in_reg);
             // A present-but-corrupt blob, or a rejected program, is catalog
@@ -239,19 +247,19 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
             Ok(ctx.prog.push(in_reg, in_schema, Op::Filter(Box::new(pred))))
         }
 
-        gnitz_wire::OpNode::Map(mk) => emit_map(ctx, nid, mk),
+        OpNode::Map(mk) => emit_map(ctx, nid, mk),
 
-        gnitz_wire::OpNode::Negate => {
+        OpNode::Negate => {
             let in_reg = ctx.unary_delta_in(nid);
             Ok(ctx.prog.push(in_reg, ctx.prog.schema_of(in_reg), Op::Negate))
         }
 
-        gnitz_wire::OpNode::Union => {
+        OpNode::Union => {
             let inputs = ctx.circuit.inputs(nid);
             ctx.prog.union(ctx.regs[inputs[0]], ctx.regs[inputs[1]])
         }
 
-        gnitz_wire::OpNode::WeightClamp(kind) => {
+        OpNode::WeightClamp(kind) => {
             let in_reg = ctx.unary_delta_in(nid);
             let schema = ctx.prog.schema_of(in_reg);
             let hist = match ctx.source_history(in_reg) {
@@ -261,19 +269,19 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
             Ok(ctx.prog.push(in_reg, schema, Op::WeightClamp { hist, kind: *kind }))
         }
 
-        gnitz_wire::OpNode::Reduce(g) => emit_reduce(ctx, nid, &g.group_cols, &g.aggs),
+        OpNode::Reduce(g) => emit_reduce(ctx, nid, &g.group_cols, &g.aggs),
 
-        gnitz_wire::OpNode::TopN { group_cols, order, limit, offset } => {
+        OpNode::TopN { group_cols, order, limit, offset } => {
             let in_reg = ctx.unary_delta_in(nid);
             let in_schema = ctx.prog.schema_of(in_reg);
             let plan = match ctx.reads_partials(nid) {
-                true => gnitz_zset::stream::OrderedPlan::top_n_combine(&in_schema, order, *limit, *offset)?,
-                false => gnitz_zset::stream::OrderedPlan::top_n(&in_schema, group_cols, order, *limit, *offset)?,
+                true => OrderedPlan::top_n_combine(&in_schema, order, *limit, *offset)?,
+                false => OrderedPlan::top_n(&in_schema, group_cols, order, *limit, *offset)?,
             };
             Ok(push_ordered(ctx, nid, in_reg, "topnidx", plan))
         }
 
-        gnitz_wire::OpNode::Window {
+        OpNode::Window {
             group_cols,
             order,
             aggs,
@@ -282,12 +290,11 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
         } => {
             let in_reg = ctx.unary_delta_in(nid);
             let in_schema = ctx.prog.schema_of(in_reg);
-            let plan =
-                gnitz_zset::stream::OrderedPlan::window(&in_schema, group_cols, order, aggs, *rank, *dense_rank)?;
+            let plan = OrderedPlan::window(&in_schema, group_cols, order, aggs, *rank, *dense_rank)?;
             Ok(push_ordered(ctx, nid, in_reg, "windowidx", plan))
         }
 
-        gnitz_wire::OpNode::Join(kind) => {
+        OpNode::Join(kind) => {
             let &[da, db, ia, ib] = ctx.circuit.inputs(nid) else {
                 unreachable!("a join is wired on four inputs")
             };
@@ -301,7 +308,7 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
             ctx.prog.union(ab, ba)
         }
 
-        gnitz_wire::OpNode::ExchangeShard => {
+        OpNode::ExchangeShard => {
             let whole = ctx.meta.held_whole(ctx.circuit.inputs(nid)[0]);
             let reader = keyed_reader(ctx.circuit, nid);
             // A worker holding the whole input has nothing to pre-aggregate.
@@ -316,22 +323,21 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<
                 Some((_, group)) => ScatterPlan::group(&schema, group)?,
                 None => ScatterPlan::native(Placement::full_pk(&schema)),
             });
-            if routing::exchange_moves_nothing(ctx.circuit, nid, &scatter, ctx.meta, ctx.registry) {
+            if ctx.exchange_moves_nothing(nid, &scatter) {
                 return Ok(reg);
             }
             Ok(ctx.relay(reg, scatter, whole))
         }
 
-        gnitz_wire::OpNode::WorkerFilter => {
+        OpNode::WorkerFilter => {
             let in_reg = ctx.unary_delta_in(nid);
             let own = ScatterPlan::native(Placement::full_pk(&ctx.prog.schema_of(in_reg)));
             Ok(ctx.share(in_reg, Rc::new(own)))
         }
 
-        gnitz_wire::OpNode::NullExtend { type_codes, nulls_first } => {
+        OpNode::NullExtend { type_codes, nulls_first } => {
             let in_reg = ctx.unary_delta_in(nid);
-            let out_schema =
-                gnitz_zset::algebra::null_extend_output_schema(&ctx.prog.schema_of(in_reg), type_codes, *nulls_first)?;
+            let out_schema = null_extend_output_schema(&ctx.prog.schema_of(in_reg), type_codes, *nulls_first)?;
             let op = Op::NullExtend { nulls_first: *nulls_first };
             Ok(ctx.prog.push(in_reg, out_schema, op))
         }
@@ -348,7 +354,7 @@ fn emit_join_term(
     ctx: &mut EmitCtx,
     delta: NodeId,
     integrand: NodeId,
-    kind: gnitz_wire::JoinKind,
+    kind: JoinKind,
     delta_is_right: bool,
 ) -> Result<DeltaReg, String> {
     let delta_reg = ctx.regs[delta];
@@ -378,7 +384,7 @@ fn emit_join_term(
 /// Every `MapKind`'s output schema, program and PK source are one fact, derived
 /// by [`MapPlan::from_wire`]; this arm resolves the operand, asks for the plan,
 /// and either elides it or allocates a register for it.
-fn emit_map(ctx: &mut EmitCtx, nid: NodeId, mk: &gnitz_wire::MapKind) -> Result<DeltaReg, String> {
+fn emit_map(ctx: &mut EmitCtx, nid: NodeId, mk: &MapKind) -> Result<DeltaReg, String> {
     let in_reg = ctx.unary_delta_in(nid);
     let plan = MapPlan::from_wire(&ctx.prog.schema_of(in_reg), mk)?;
     // A MAP that reproduces its input row verbatim emits nothing; the node's
@@ -399,14 +405,14 @@ fn emit_reduce(ctx: &mut EmitCtx, nid: NodeId, group_cols: &[u32], agg: &[AggDes
     // Minted by the view's backfill, in an epoch of its own.
     let seeds_ground = ctx.circuit.owes_ground_row(nid);
     let plan = match ctx.reads_partials(nid) {
-        true => gnitz_zset::stream::ReducePlan::combine(&in_schema, agg, seeds_ground)?,
-        false => gnitz_zset::stream::ReducePlan::from_wire(&in_schema, group_cols, agg, seeds_ground)?,
+        true => ReducePlan::combine(&in_schema, agg, seeds_ground)?,
+        false => ReducePlan::from_wire(&in_schema, group_cols, agg, seeds_ground)?,
     };
     Ok(push_reduce(ctx, nid, in_reg, plan))
 }
 
 /// Declare `plan`'s children under `nid`, and push the reduce over `in_reg`.
-fn push_reduce(ctx: &mut EmitCtx, nid: NodeId, in_reg: DeltaReg, plan: gnitz_zset::stream::ReducePlan) -> DeltaReg {
+fn push_reduce(ctx: &mut EmitCtx, nid: NodeId, in_reg: DeltaReg, plan: ReducePlan) -> DeltaReg {
     let out_schema = *plan.output_schema();
     // The view's store where the node is the output.
     let out_trace = match ctx.circuit.out() == nid {
@@ -423,13 +429,7 @@ fn push_reduce(ctx: &mut EmitCtx, nid: NodeId, in_reg: DeltaReg, plan: gnitz_zse
 
 /// Declare `plan`'s index — every input row in order, the operator's whole
 /// history — as a `kind` child, and push the operator over `in_reg`.
-fn push_ordered(
-    ctx: &mut EmitCtx,
-    nid: NodeId,
-    in_reg: DeltaReg,
-    kind: &'static str,
-    plan: gnitz_zset::stream::OrderedPlan,
-) -> DeltaReg {
+fn push_ordered(ctx: &mut EmitCtx, nid: NodeId, in_reg: DeltaReg, kind: &'static str, plan: OrderedPlan) -> DeltaReg {
     let out_schema = *plan.output_schema();
     let index = ctx.declare_child(kind, nid, *plan.index_schema());
     let plan = Box::new(plan);
@@ -443,13 +443,14 @@ fn emit_partial(ctx: &mut EmitCtx, shard: NodeId, consumer: NodeId) -> Result<Op
     let in_reg = ctx.unary_delta_in(shard);
     let in_schema = ctx.prog.schema_of(in_reg);
     Ok(match ctx.circuit.op(consumer) {
-        gnitz_wire::OpNode::Reduce(g) => gnitz_zset::stream::ReducePlan::partial(&in_schema, &g.aggs)?
-            .map(|plan| push_reduce(ctx, shard, in_reg, plan)),
-        gnitz_wire::OpNode::TopN { order, limit, offset, .. } => {
-            let plan = gnitz_zset::stream::OrderedPlan::top_n_partial(&in_schema, order, *limit, *offset)?;
+        OpNode::Reduce(g) => {
+            ReducePlan::partial(&in_schema, &g.aggs)?.map(|plan| push_reduce(ctx, shard, in_reg, plan))
+        }
+        OpNode::TopN { order, limit, offset, .. } => {
+            let plan = OrderedPlan::top_n_partial(&in_schema, order, *limit, *offset)?;
             Some(push_ordered(ctx, shard, in_reg, "topnidx", plan))
         }
-        gnitz_wire::OpNode::Window { .. } => None,
+        OpNode::Window { .. } => None,
         _ => unreachable!("`keyed_reader` names only a Reduce, a TopN or a Window"),
     })
 }

@@ -105,6 +105,9 @@ fn ingest_err(op: &str, idx: StateIdx, e: StorageError) -> String {
 /// register folds, and empty where `take` let its last reader have it.
 pub(in crate::query) struct Epoch<'e> {
     reg: DeltaReg,
+    /// The one slot a batch leaves the program through: the seed until the
+    /// epoch begins, then the batch its register held, swapped for a round's
+    /// operand while that round is out.
     seed: &'e mut Batch,
     take: bool,
     /// The next instruction.
@@ -142,12 +145,12 @@ pub(in crate::query) fn run<'f>(
     epoch: &'f mut Epoch<'_>,
     gathered: Option<Batch>,
 ) -> Result<Ran<'f>, String> {
-    // The seed stands in its register while the program runs.
-    std::mem::swap(&mut vm.batches[epoch.reg.at()], epoch.seed);
     match gathered {
         None => begin(vm, epoch),
         Some(rows) => {
-            let out_reg = vm.instructions[epoch.pc].out_reg;
+            let Instr { in_reg, out_reg, .. } = vm.instructions[epoch.pc];
+            // The round's operand comes back from the epoch's slot.
+            std::mem::swap(&mut vm.batches[in_reg.at()], epoch.seed);
             vm.batches[out_reg.at()] = rows;
             fold_written(&mut vm.batches, &vm.regs, out_reg);
             epoch.pc += 1;
@@ -173,17 +176,15 @@ pub(in crate::query) fn run<'f>(
     let fold = vm.regs[instr.out_reg.at()].fold;
     let take = takes(&vm.regs, epoch, in_reg, LastRead::Instr(pc));
     epoch.pc = pc;
-    std::mem::swap(&mut vm.batches[epoch.reg.at()], epoch.seed);
-    let batch = match in_reg == epoch.reg {
-        true => operand(epoch.seed, take),
-        false => {
-            // The label every worker sends its rows under.
-            let mut batch = operand(&mut vm.batches[in_reg.at()], take).into_owned();
-            batch.set_schema(&vm.regs[in_reg.at()].schema);
-            Cow::Owned(batch)
-        }
-    };
-    Ok(Ran::Round { plan, batch, fold })
+    // The operand leaves for the round through the epoch's slot, lent or given.
+    std::mem::swap(&mut vm.batches[in_reg.at()], epoch.seed);
+    // Every worker sends its rows, and decodes theirs, under this label.
+    debug_assert_eq!(epoch.seed.schema(), &vm.regs[in_reg.at()].schema);
+    Ok(Ran::Round {
+        plan,
+        batch: operand(epoch.seed, take),
+        fold,
+    })
 }
 
 /// One chunk of a capacity-bounded view's hydration replay.
@@ -230,24 +231,23 @@ fn run_through(
     }
 }
 
-/// Label the seed with its register's schema, and fold it where its register
-/// folds.
-fn begin(vm: &mut Vm, epoch: &Epoch<'_>) {
+/// Stand the seed in its register, until the epoch ends, labelled with the
+/// register's schema and folded where the register folds.
+fn begin(vm: &mut Vm, epoch: &mut Epoch<'_>) {
+    std::mem::swap(&mut vm.batches[epoch.reg.at()], epoch.seed);
     let seed = &mut vm.batches[epoch.reg.at()];
     let want = &vm.regs[epoch.reg.at()].schema;
     // Rows under the wrong layout would scramble every downstream read
-    // silently. An empty batch has no rows to misread, so it is exempt.
-    if !seed.is_empty() {
-        assert_eq!(
-            seed.schema().num_columns(),
-            want.num_columns(),
-            "VM register {} schema/batch column-count mismatch",
-            epoch.reg.0,
-        );
-        // A producer's label may be narrower in nullability, and a round sends
-        // the seed under the label every worker sends it under.
-        seed.set_schema(want);
-    }
+    // silently.
+    assert!(
+        seed.schema().same_region_types(want),
+        "VM register {} schema/batch region mismatch",
+        epoch.reg.0,
+    );
+    // A producer's label may be narrower in nullability. Every kernel labels
+    // what it writes with its register's schema, so from here on every
+    // register's batch carries its own.
+    seed.set_schema(want);
     fold_written(&mut vm.batches, &vm.regs, epoch.reg);
 }
 
@@ -289,7 +289,8 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
         let (in_reg, out_reg) = (instr.in_reg, instr.out_reg);
         let takes = |r: DeltaReg| takes(regs, epoch, r, LastRead::Instr(pc));
 
-        let all_empty = instr.reads().into_iter().flatten().all(|r| batches[r.at()].is_empty());
+        let reads = instr.reads();
+        let all_empty = reads.into_iter().flatten().all(|r| batches[r.at()].is_empty());
         let out = match &mut instr.op {
             Op::Round { seeds, .. } => match seeds.contains(&epoch.reg) {
                 true => return Ok(Some(pc)),
@@ -298,8 +299,8 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
             },
 
             // The kernel would return an empty batch, and the out register is
-            // already one: every run leaves every register empty, and an empty
-            // register's label is never read.
+            // already one, under its own label: every run leaves every
+            // register empty.
             _ if all_empty => continue,
 
             Op::Filter(pred) => algebra::op_filter(operand(&mut batches[in_reg.at()], takes(in_reg)), pred),
@@ -387,7 +388,7 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
         // Free every operand this instruction was the last reader of, here
         // rather than per arm — so a register's lifetime follows the dataflow
         // instead of whether some kernel happens to take `Batch` by value.
-        for r in instr.reads().into_iter().flatten() {
+        for r in reads.into_iter().flatten() {
             if takes(r) {
                 batches[r.at()].release_buffers();
             }
@@ -425,18 +426,14 @@ fn run_integrates(vm: &mut Vm, state: &mut CircuitState, epoch: &Epoch<'_>) -> R
     Ok(())
 }
 
-/// End a run: extract the output, labelled with the output register's own
-/// schema, hand a lent seed back, and free every register — so none holds rows
-/// between runs, whether the run completed, failed, or left a register nothing
-/// reads. A seed arrives under its producer's label and the operators that hand
-/// their input through keep it, so the label here may be narrower in
-/// nullability than the register's.
+/// End a run: extract the output, hand a lent seed back, and free every
+/// register — so none holds rows between runs, whether the run completed,
+/// failed, or left a register nothing reads.
 fn end(vm: &mut Vm, epoch: &mut Epoch<'_>) -> Batch {
     let Vm { regs, batches, out_reg, .. } = vm;
-    let want = &regs[out_reg.at()].schema;
     // The output register has no reader to take it but this extraction.
     let take = takes(regs, epoch, *out_reg, LastRead::Nobody);
-    let mut batch = operand(&mut batches[out_reg.at()], take).into_owned();
+    let batch = operand(&mut batches[out_reg.at()], take).into_owned();
     // A seed that was given is not handed back: the caller holds the
     // register's empty batch, and the loop below frees what nothing read.
     if !epoch.take {
@@ -445,10 +442,7 @@ fn end(vm: &mut Vm, epoch: &mut Epoch<'_>) -> Batch {
     for held in batches.iter_mut() {
         held.release_buffers();
     }
-    if batch.is_empty() {
-        return Batch::empty_with_schema(want);
-    }
-    batch.set_schema(want);
+    debug_assert_eq!(batch.schema(), &regs[out_reg.at()].schema);
     batch
 }
 

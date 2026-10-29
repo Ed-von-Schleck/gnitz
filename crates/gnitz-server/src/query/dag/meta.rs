@@ -78,7 +78,7 @@ impl DepMap {
     /// One [`Step`] per dependency edge out of `source`'s forward closure, in
     /// execution order. A tick runs these every time, so they are derived once
     /// per shape of the graph.
-    pub(super) fn tick_steps(&mut self, source: u64) -> Rc<[Step]> {
+    fn tick_steps(&mut self, source: u64) -> Rc<[Step]> {
         if let Some(steps) = self.tick_steps.get(&source) {
             return Rc::clone(steps);
         }

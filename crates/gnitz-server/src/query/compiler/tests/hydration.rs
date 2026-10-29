@@ -1,18 +1,8 @@
 use super::*;
-use crate::query::compiler::fixtures::{compile, predicate, rejection, scan, sources, tables_at, Build, Source, Stage};
+use crate::query::compiler::fixtures::{compile, predicate, rejection, scan, sources, tables_at, Build, Source};
 use crate::test_support::{make_schema_u64_i64, reindexed_on_col1};
 use gnitz_wire::{Circuit, JoinKind, TypeCode};
 use gnitz_zset::algebra::Slot;
-
-/// The two-term join of the reindexed `sources`, its side-B delta through `b`,
-/// of join kind `kind`.
-fn join_with(sources: [u64; 2], b: Stage, kind: JoinKind) -> Circuit {
-    let mut c = Circuit::default();
-    let [da, db] = sources.map(|s| reindexed_on_col1(&mut c, s, TypeCode::I64));
-    let db = b(&mut c, db);
-    c.join([da, db], [da, db], kind);
-    c
-}
 
 /// Every broken clause of the two-term form, and every other shape, is refused.
 #[test]
@@ -21,14 +11,16 @@ fn a_shape_outside_the_equation_is_refused() {
     let refused = |c: &Circuit, why: &str| {
         assert_eq!(rejection(compile(c, &registry, true)), UNSUPPORTED, "{why}");
     };
-    let mut c = Circuit::default();
-    let [da, db] = [100, 200].map(|s| reindexed_on_col1(&mut c, s, TypeCode::I64));
-    let slice = c.worker_filter(db);
-    c.join([da, db], [da, slice], JoinKind::Equi);
-    refused(&c, "a delta joins another integral than the other delta's");
-    refused(&join_with([100, 200], |_, n| n, JoinKind::Cross), "a non-equi kind");
-
-    let cases: [(&str, Build); 3] = [
+    let cases: [(&str, Build); 5] = [
+        ("a delta joins another integral than the other delta's", |c| {
+            let [da, db] = [100, 200].map(|s| reindexed_on_col1(c, s, TypeCode::I64));
+            let slice = c.worker_filter(db);
+            c.join([da, db], [da, slice], JoinKind::Equi);
+        }),
+        ("a non-equi kind", |c| {
+            let deltas = [100, 200].map(|s| reindexed_on_col1(c, s, TypeCode::I64));
+            c.join(deltas, deltas, JoinKind::Cross);
+        }),
         ("a union as the output", |c| {
             let (a, b) = (scan(c, 1), scan(c, 2));
             c.union(a, b);

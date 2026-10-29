@@ -12,10 +12,8 @@ use std::rc::Rc;
 use crate::query::vm::{DeltaReg, Integral, Vm};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::relation::{Relation, RelationRegistry, StateIdx};
-use gnitz_wire::{AggDescriptor, Circuit, NodeId, ReadBound};
-use gnitz_zset::algebra::MapPlan;
-use gnitz_zset::algebra::Placement;
-use gnitz_zset::algebra::ScatterPlan;
+use gnitz_wire::{AggDescriptor, Circuit, JoinKind, MapKind, NodeId, OpNode, ReadBound};
+use gnitz_zset::algebra::{MapPlan, Placement, ScatterPlan};
 use gnitz_zset::schema::SchemaDescriptor;
 
 mod emit;
@@ -39,8 +37,7 @@ use routing::ViewMeta;
 
 /// True iff `op` carries every row through on its own worker with the PK region
 /// intact.
-fn keeps_rows_and_pk_region(op: &gnitz_wire::OpNode) -> bool {
-    use gnitz_wire::{MapKind, OpNode};
+fn keeps_rows_and_pk_region(op: &OpNode) -> bool {
     matches!(
         op,
         OpNode::Filter(_) | OpNode::Map(MapKind::Projection(_) | MapKind::Compute(_))
@@ -54,6 +51,14 @@ fn row_local_origin(circuit: &Circuit, mut from: NodeId) -> NodeId {
         from = circuit.inputs(from)[0];
     }
     from
+}
+
+/// The source of the `ScanDelta` the row-local walk back from `from` ends at.
+fn scanned_row_locally(circuit: &Circuit, from: NodeId) -> Option<u64> {
+    match circuit.op(row_local_origin(circuit, from)) {
+        OpNode::ScanDelta { source, .. } => Some(*source),
+        _ => None,
+    }
 }
 
 /// The reader of `shard` that groups its input, and its group columns — the key
@@ -73,9 +78,8 @@ fn keyed_reader(circuit: &Circuit, shard: NodeId) -> Option<(NodeId, &[u32])> {
 /// program, exchanges included.
 pub(super) struct CompileOutput {
     pub(in crate::query) vm: Vm,
-    /// source id → the register its delta seeds, and the bound its backfill scan
-    /// narrows by.
-    pub(in crate::query) sources: FxHashMap<u64, (DeltaReg, ReadBound)>,
+    /// Every scanned source's scan, by source id.
+    pub(in crate::query) sources: FxHashMap<u64, Scan>,
     /// `Some` iff the view is capacity-bounded.
     pub(in crate::query) hydration: Option<Hydration>,
     /// Each worker computes the view's whole result locally: it is replicated, or
@@ -103,10 +107,6 @@ pub(super) fn compile_view(
     let hydration = bounded
         .then(|| derive_hydration(circuit, registry, &vm, &regs, &integrals))
         .transpose()?;
-    let sources = sources
-        .into_iter()
-        .map(|(tid, scan)| (tid, (scan.seed, scan.bound)))
-        .collect();
     let output = CompileOutput {
         vm,
         sources,

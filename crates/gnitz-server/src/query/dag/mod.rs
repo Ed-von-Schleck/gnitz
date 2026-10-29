@@ -11,8 +11,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::query::compiler::{self, CompileOutput};
 use crate::query::vm;
 use gnitz_store::relation::{CircuitState, Cut, RelationRegistry, StateLayout};
-use gnitz_zset::algebra::Placement;
-use gnitz_zset::algebra::{self, ScatterPlan, Slot};
+use gnitz_zset::algebra::{self, Placement, ScatterPlan, Slot};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 

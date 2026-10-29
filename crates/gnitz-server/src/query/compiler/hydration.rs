@@ -26,7 +26,6 @@ pub(super) fn derive_hydration(
     regs: &[DeltaReg],
     integrals: &[Option<(Integral, DeltaReg)>],
 ) -> Result<Hydration, String> {
-    use gnitz_wire::{JoinKind, OpNode};
     // A replay runs on one worker, and so no exchange round.
     if circuit.ops().any(|(_, op)| matches!(op, OpNode::ExchangeShard)) {
         return Err(UNSUPPORTED.into());

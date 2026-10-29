@@ -2,11 +2,9 @@
 //! into it, and the placement its store registers under. Nothing here emits.
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use super::*;
-use gnitz_wire::ClampKind;
-use gnitz_zset::algebra::Placement;
+use gnitz_wire::{ClampKind, ReindexRole};
 
 /// Per-view circuit metadata, derived from one circuit load: every worker routes
 /// its own partitions by it, so no two workers can route one round differently.
@@ -33,7 +31,10 @@ impl ViewMeta {
         view: &SchemaDescriptor,
     ) -> Result<(ViewMeta, Placement), String> {
         let uses = source_uses(circuit)?;
-        let sources = scanned_relations(&uses, registry)?;
+        let sources: BTreeMap<u64, &Relation> = uses
+            .keys()
+            .map(|&tid| Ok((tid, registry.relation_or_err(tid)?)))
+            .collect::<Result<_, String>>()?;
         if let Some((tid, _)) = uses.iter().find(|(_, u)| u.reaches_join && u.key.is_none()) {
             return Err(format!("source {tid} feeds a join and states no scatter key"));
         }
@@ -53,8 +54,9 @@ impl ViewMeta {
         for (tid, use_, key) in keyed() {
             let source = sources[&tid];
             let partner_makes_every_match = has_replicated_partner
-                // An owner filter drops every row the relay did not place.
-                && !use_.owner_trimmed
+                // Unless only an owner filter reads its re-key: it drops every
+                // row the relay did not place.
+                && use_.key_read_untrimmed
                 // A clamp over one worker's slice admits the key once per worker.
                 && (replicated(tid) || !use_.set_fed);
             let plan = match key.is_empty() {
@@ -101,16 +103,6 @@ impl ViewMeta {
     }
 }
 
-/// Each source `uses` names: every one a registered relation.
-fn scanned_relations<'r>(
-    uses: &BTreeMap<u64, SourceUse>,
-    registry: &'r RelationRegistry,
-) -> Result<BTreeMap<u64, &'r Relation>, String> {
-    uses.keys()
-        .map(|&tid| Ok((tid, registry.relation_or_err(tid)?)))
-        .collect()
-}
-
 /// Where the rows of a view of schema `view` live, folded from its sources'
 /// placements and where its circuit leaves its rows.
 fn placement(
@@ -128,7 +120,7 @@ fn placement(
     }
     let moves = circuit
         .ops()
-        .any(|(_, op)| matches!(op, gnitz_wire::OpNode::Join(_) | gnitz_wire::OpNode::ExchangeShard));
+        .any(|(_, op)| matches!(op, OpNode::Join(_) | OpNode::ExchangeShard));
     match scanned_row_locally(circuit, circuit.out()) {
         // The view's PK region is this source's, byte for byte, and its rows sit on
         // that source's owner only while nothing relays its delta: only a source
@@ -150,13 +142,14 @@ fn placement(
 type ReindexKey = Vec<gnitz_wire::ReindexSlot>;
 
 /// What the circuit does with one scanned source's delta.
+#[derive(Default)]
 struct SourceUse {
     /// The scatter key it states, in the source relation's own column indices;
     /// empty for a broadcast.
     key: Option<ReindexKey>,
-    /// Every direct reader of every `ScatterKey` Map over this source is a
+    /// Some `ScatterKey` Map over this source is read by something other than a
     /// `WorkerFilter`, which keeps only rows already on their PK's owner.
-    owner_trimmed: bool,
+    key_read_untrimmed: bool,
     /// The scan's rows reach something other than a join operand.
     outside_join: bool,
     /// They cross a `Distinct` on the way to a join.
@@ -165,49 +158,20 @@ struct SourceUse {
     reaches_join: bool,
 }
 
-impl Default for SourceUse {
-    fn default() -> SourceUse {
-        SourceUse {
-            key: None,
-            // Vacuously true until a reader that is not a `WorkerFilter` appears.
-            owner_trimmed: true,
-            outside_join: false,
-            set_fed: false,
-            reaches_join: false,
-        }
-    }
-}
-
 /// One forward pass over the circuit: what it does with each source's delta, by
 /// source in ascending order — so every process reports the same offender.
 fn source_uses(circuit: &Circuit) -> Result<BTreeMap<u64, SourceUse>, String> {
-    use gnitz_wire::{MapKind, OpNode, ReindexRole};
-
     let mut uses: BTreeMap<u64, SourceUse> = BTreeMap::new();
-    // Whose scan's delta flows into each node — propagated along the way — and
-    // which node IS that source's `ScatterKey` Map, read by its readers alone.
+    // Whose scan's delta flows into each node, propagated along the way.
     let mut owner: Vec<Option<u64>> = vec![None; circuit.ops().len()];
-    let mut states_key: Vec<Option<u64>> = vec![None; circuit.ops().len()];
 
     for (nid, op) in circuit.ops() {
-        let propagates = matches!(
-            op,
-            OpNode::Filter(_) | OpNode::Map(_) | OpNode::WeightClamp(ClampKind::Distinct)
-        );
         for &p in circuit.inputs(nid) {
             if let Some(tid) = owner[p] {
-                let use_ = uses.entry(tid).or_default();
-                match op {
-                    OpNode::Join(_) => use_.reaches_join = true,
-                    _ if propagates => {}
-                    _ => use_.outside_join = true,
-                }
-            }
-            if let Some(tid) = states_key[p].filter(|_| !matches!(op, OpNode::WorkerFilter)) {
-                uses.entry(tid).or_default().owner_trimmed = false;
+                note_read(uses.entry(tid).or_default(), circuit.op(p), Some(op));
             }
         }
-        if propagates {
+        if propagates(op) {
             owner[nid] = owner[circuit.inputs(nid)[0]];
         }
         match op {
@@ -224,11 +188,10 @@ fn source_uses(circuit: &Circuit) -> Result<BTreeMap<u64, SourceUse>, String> {
                 // node reads, each at its key slot's type.
                 let tid = owner[nid].ok_or("a scatter key over no scanned source")?;
                 let stated: ReindexKey = source_cols.iter().copied().zip(key.iter().map(|s| s.1)).collect();
-                let known = uses.entry(tid).or_default().key.get_or_insert_with(|| stated.clone());
-                if *known != stated {
+                let use_ = uses.entry(tid).or_default();
+                if *use_.key.get_or_insert_with(|| stated.clone()) != stated {
                     return Err(format!("source {tid} feeds several distinct scatter keys"));
                 }
-                states_key[nid] = Some(tid);
             }
             OpNode::WeightClamp(ClampKind::Distinct) => {
                 if let Some(tid) = owner[nid] {
@@ -238,14 +201,33 @@ fn source_uses(circuit: &Circuit) -> Result<BTreeMap<u64, SourceUse>, String> {
             _ => {}
         }
     }
-    // The output reads its node as any other reader does.
     if let Some(tid) = owner[circuit.out()] {
-        uses.entry(tid).or_default().outside_join = true;
-    }
-    if let Some(tid) = states_key[circuit.out()] {
-        uses.entry(tid).or_default().owner_trimmed = false;
+        note_read(uses.entry(tid).or_default(), circuit.op(circuit.out()), None);
     }
     Ok(uses)
+}
+
+/// `op` hands its input's rows on as that input's source's delta.
+fn propagates(op: &OpNode) -> bool {
+    matches!(
+        op,
+        OpNode::Filter(_) | OpNode::Map(_) | OpNode::WeightClamp(ClampKind::Distinct)
+    )
+}
+
+/// Record in `use_` that `reader` — `None` for the view's output — reads the
+/// node `read`, which carries the source's delta.
+fn note_read(use_: &mut SourceUse, read: &OpNode, reader: Option<&OpNode>) {
+    match reader {
+        Some(OpNode::Join(_)) => use_.reaches_join = true,
+        Some(op) if propagates(op) => {}
+        _ => use_.outside_join = true,
+    }
+    let states_key = matches!(
+        read,
+        OpNode::Map(MapKind::Reindex { role: ReindexRole::ScatterKey { .. }, .. })
+    );
+    use_.key_read_untrimmed |= states_key && !matches!(reader, Some(OpNode::WorkerFilter));
 }
 
 /// One forward pass: per node, whether every worker computes the same rows into
@@ -253,7 +235,6 @@ fn source_uses(circuit: &Circuit) -> Result<BTreeMap<u64, SourceUse>, String> {
 /// placement no worker count could serve, so a view's acceptance never depends on
 /// the worker count.
 fn whole_nodes(circuit: &Circuit, whole_scan: impl Fn(u64) -> bool) -> Result<Vec<bool>, String> {
-    use gnitz_wire::OpNode;
     let n = circuit.ops().len();
     let mut whole: Vec<bool> = Vec::with_capacity(n);
     // Some node it reads, directly or transitively, owes a ground row.
@@ -282,30 +263,6 @@ fn whole_nodes(circuit: &Circuit, whole_scan: impl Fn(u64) -> bool) -> Result<Ve
         whole.push(own && inputs.iter().all(|&p| whole[p]));
     }
     Ok(whole)
-}
-
-/// The source of the `ScanDelta` the row-local walk back from `from` ends at.
-fn scanned_row_locally(circuit: &Circuit, from: NodeId) -> Option<u64> {
-    match circuit.op(row_local_origin(circuit, from)) {
-        gnitz_wire::OpNode::ScanDelta { source, .. } => Some(*source),
-        _ => None,
-    }
-}
-
-/// True when the `ExchangeShard` at `enid` moves nothing: `scatter`, the plan
-/// over the shard's input, hashes the bytes the scan behind it placed its rows by.
-pub(super) fn exchange_moves_nothing(
-    circuit: &Circuit,
-    enid: NodeId,
-    scatter: &ScatterPlan,
-    meta: &ViewMeta,
-    registry: &RelationRegistry,
-) -> bool {
-    scanned_row_locally(circuit, circuit.inputs(enid)[0])
-        // A relayed delta no longer sits where its source's store places it.
-        .filter(|&tid| meta.source_route(tid).is_none())
-        .and_then(|tid| registry.relation(tid))
-        .is_some_and(|source| scatter.routes_to_native_owner(source.placement()))
 }
 
 // ---------------------------------------------------------------------------

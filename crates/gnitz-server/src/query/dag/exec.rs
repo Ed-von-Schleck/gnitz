@@ -23,32 +23,31 @@ fn run_view_epoch(
     drained: &mut bool,
 ) -> Result<Option<Batch>, String> {
     let mut empty;
-    let (reg, input) = {
-        let (dag, registry) = host.parts();
-        let (code, _) = opened(&mut dag.views, registry, view_id, unfed)?;
-        let scan = code.sources.get(&src_id);
-        let reg = scan.expect("the dep map names only sources the view's circuit scans").0;
-        match input.filter(|input| !input.is_empty()) {
-            Some(input) => (reg, input),
-            None if code.vm.idles_on_empty(reg) => return Ok(None),
-            // Its round runs on every worker, whatever this one holds.
-            None => {
-                empty = Batch::empty_with_schema(code.vm.schema_of(reg));
-                (reg, &mut empty)
-            }
+    let (dag, registry) = host.parts();
+    let (mut code, mut stores) = opened(&mut dag.views, registry, view_id, unfed)?;
+    // The dep map names only sources the view's circuit scans.
+    let reg = code.sources[&src_id].seed;
+    let input = match input.filter(|input| !input.is_empty()) {
+        Some(input) => input,
+        None if code.vm.idles_on_empty(reg) => return Ok(None),
+        // Its round runs on every worker, whatever this one holds.
+        None => {
+            empty = Batch::empty_with_schema(code.vm.schema_of(reg));
+            &mut empty
         }
     };
     let mut epoch = vm::Epoch::tick(reg, input, take);
     let mut gathered = None;
     loop {
-        let (dag, registry) = host.parts();
-        let (code, mut stores) = opened(&mut dag.views, registry, view_id, unfed)?;
         match vm::run(&mut code.vm, &mut stores, &mut epoch, gathered.take())? {
             vm::Ran::Done(out) => return Ok((!out.is_empty()).then_some(out)),
             vm::Ran::Round { plan, batch, fold } => {
                 let rows;
                 (rows, *drained) = host.exchange(view_id, batch, &plan, fold, *drained);
                 gathered = Some(rows);
+                // The exchange held the host: the plan and its stores are looked up again.
+                let (dag, registry) = host.parts();
+                (code, stores) = opened(&mut dag.views, registry, view_id, unfed)?;
             }
         }
     }
@@ -87,7 +86,7 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
         let (dag, registry) = host.parts();
         // `sources_of` names only registered views, and of each only the
         // relations its circuit scans.
-        let bound = dag.views[&view].code.sources[&source].1.clone();
+        let bound = dag.views[&view].code.sources[&source].bound.clone();
         let relation = registry.relation_or_err(source)?;
         let (mut cursor, _unapplied) = relation.open_bound(bound, Cut::Sealed)?;
         let unfed = &sources[at + 1..];
