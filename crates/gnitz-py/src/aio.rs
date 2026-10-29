@@ -16,7 +16,7 @@ use std::time::Duration;
 use pyo3::intern;
 use pyo3::prelude::*;
 
-use gnitz_core::{serve, BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Sent, Session};
+use gnitz_core::{serve, BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Sent};
 
 use crate::client::{resolve_target, verb, whole, Mode, PyClient, Unconverted, Verb};
 use crate::reply::{none, synced};
@@ -298,13 +298,14 @@ impl LoopCore {
             .import(intern!(py, "asyncio"))?
             .call_method0(intern!(py, "get_running_loop"))?
             .unbind();
-        let session = py.detach(|| Session::connect(target)).map_err(client_err)?;
         let shared = Arc::new(Shared {
             event_loop,
             state: Mutex::new(State::default()),
         });
         let host = LoopHost { shared: Arc::clone(&shared), jobs: None };
-        let client = GnitzClient::over(session, Box::new(host)).map_err(client_err)?;
+        let client = py
+            .detach(|| GnitzClient::connect_on(target, Box::new(host)))
+            .map_err(client_err)?;
         let queue = Arc::clone(&shared);
         let next = move |_: &mut Context<'_>| {
             let mut st = queue.state();
@@ -341,24 +342,33 @@ impl LoopCore {
     /// Queue a sync, which leaves the client free while the server holds it:
     /// its answer has no place among the replies. A loop future cancelled
     /// before the answer arrives never finishes the sync, so what it would
-    /// take from the client stays there for the next sync to bring.
+    /// take from the client stays there for the next sync to bring; one
+    /// cancelled while the client finishes it hands its delivery to
+    /// `GnitzClient::unclaimed`, for the same.
     pub(crate) fn sync(&self, py: Python<'_>, wait: Duration) -> PyResult<Py<PyAny>> {
         self.queue(py, |owed| {
             Box::new(move |client| {
                 Box::pin(async move {
-                    match client.begin_sync(wait) {
-                        // The step that reads the answer queues the rest, and
-                        // the `serve` loop takes it up before it waits again.
-                        Ok(sent) => sent.then(move |reply| {
-                            if owed.abandoned() {
-                                return;
-                            }
-                            let shared = Arc::clone(&owed.shared);
-                            let rest = owed.call(verb(whole!(|c| c.finish_sync(reply).await?), synced));
-                            shared.state().queue.push_back(rest);
-                        }),
-                        Err(fail) => owed.land(Err(client_err(fail))),
-                    }
+                    // The step that reads the answer queues the rest, and
+                    // the `serve` loop takes it up before it waits again.
+                    client.begin_sync(wait).then(move |reply| {
+                        if owed.abandoned() {
+                            return;
+                        }
+                        let shared = Arc::clone(&owed.shared);
+                        let rest: Op = Box::new(move |client| {
+                            Box::pin(async move {
+                                match client.finish_sync(reply).await {
+                                    Ok(unreceived) if owed.abandoned() => client.unclaimed(unreceived),
+                                    done => owed.land(
+                                        done.map_err(client_err)
+                                            .map(|s| Box::new(move |py: Python<'_>| synced(py, s)) as Unconverted),
+                                    ),
+                                }
+                            })
+                        });
+                        shared.state().queue.push_back(rest);
+                    })
                 })
             })
         })

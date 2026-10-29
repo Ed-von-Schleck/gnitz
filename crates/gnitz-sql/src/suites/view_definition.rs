@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use gnitz_core::{Catalog, CatalogRelation, RelDescriptor, RelProps, ViewDefinition};
+use gnitz_core::{Catalog, CatalogRelation, RelDescriptor, RelProps};
 use gnitz_wire::{CatalogColumn, ColumnDef, PkColList, RelClass, TableProps, ViewProps};
 
 use crate::catalog::Catalog as _;
@@ -15,6 +15,7 @@ use crate::catalog::Catalog as _;
 use super::*;
 use crate::create_view_statement;
 use crate::ddl::render::view_body;
+use crate::ddl::view_def::ViewDefinition;
 
 /// The base relations the bodies below read.
 const SOURCES: &[&str] = &["t", "u", "a", "b", "n", "c", "r"];
@@ -72,8 +73,8 @@ fn client_catalog(cat: &TestCatalog, names: &[String]) -> Catalog {
     Catalog { schemas: vec![SN.to_string()], relations }
 }
 
-fn definition(chain: &ViewBundle) -> &ViewDefinition {
-    &chain.definition
+fn definition(chain: &ViewBundle) -> ViewDefinition {
+    ViewDefinition::decode(&chain.definition).unwrap()
 }
 
 /// One chain member as committed: its encoded circuit, its key and its
@@ -135,7 +136,7 @@ fn a_body_written_back_over_renamed_sources_plans_the_original_chain() {
     let mut checked = 0;
     for body in BODIES {
         let before = view(&orig, body);
-        let written = view_body(&catalog, definition(&before)).unwrap();
+        let written = view_body(&catalog, &definition(&before)).unwrap();
         let after = plan(&ren, &format!("CREATE VIEW v AS {written}"))
             .unwrap_or_else(|e| panic!("`{body}` written back as `{written}`: {e:?}"));
         assert!(
@@ -166,7 +167,7 @@ fn a_body_written_back_unrenamed_is_its_text_with_qualified_names() {
     ];
     for (body, written) in cases {
         let chain = view(&cat, body);
-        assert_eq!(view_body(&catalog, definition(&chain)).unwrap(), written, "{body}");
+        assert_eq!(view_body(&catalog, &definition(&chain)).unwrap(), written, "{body}");
     }
 }
 
@@ -220,7 +221,7 @@ fn a_view_column_list_survives_only_where_the_body_names_differ() {
             pk: PkColList::from_slice(pv.schema.pk_cols()),
             indexes: Vec::new(),
             reads: Vec::new(),
-            definition: definition(chain).encode(),
+            definition: chain.definition.clone(),
         });
     }
     let statement = |name: &str| {

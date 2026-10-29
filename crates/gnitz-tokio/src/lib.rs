@@ -83,6 +83,9 @@ impl Host for TokioHost {
 
 /// Connect to `target`, on the blocking pool, and hand back a client whose
 /// verbs wait on this runtime.
+///
+/// A panic in the connect resumes here; a connect the shutting-down runtime
+/// dropped is `Closed`.
 pub async fn connect(target: &str) -> Result<GnitzClient, ClientError> {
     GnitzClient::connect_with(target, Box::new(TokioHost::default())).await
 }
@@ -152,10 +155,25 @@ impl AsyncClient {
 
     /// [`GnitzClient::sync`], leaving the client to the handle's other calls
     /// while the server holds the reply.
+    ///
+    /// Cancel-safe: a sync dropped before it has its answer leaves what it
+    /// would have taken for the next sync, and one dropped while the client
+    /// finishes it hands its delivery to [`GnitzClient::unclaimed`].
     pub async fn sync(&self, wait: Duration) -> Result<Synced, ClientError> {
-        let sent = self.run(move |c| Box::pin(async move { c.begin_sync(wait) })).await??;
+        let sent = self
+            .run(move |c| Box::pin(std::future::ready(c.begin_sync(wait))))
+            .await?;
         let reply = sent.await;
-        self.run(move |c| Box::pin(c.finish_sync(reply))).await?
+        let (mut to, synced) = promise();
+        // A driver that is gone drops the op, and with it `to`.
+        let _ = self.tx.send(Box::new(move |client| {
+            Box::pin(async move {
+                if let Some(Ok(unreceived)) = to.offer(client.finish_sync(reply).await) {
+                    client.unclaimed(unreceived);
+                }
+            })
+        }));
+        synced.await
     }
 }
 

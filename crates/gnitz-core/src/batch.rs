@@ -1,133 +1,12 @@
-use gnitz_expr::{SchemaColumn, SchemaDescriptor, SchemaRefusal};
+//! The client batch: a Z-set in the canonical region order, its builders, and
+//! its WAL-block encode and decode.
+
 use std::borrow::Cow;
-use std::sync::{Arc, OnceLock};
 
-use gnitz_wire::{ColumnDef, PkKeys, PkListRole, PkRule, TypeCode};
-use gnitz_wire::{MAX_PK_COLUMNS, PK_LIST_MAX_COLS};
+use gnitz_wire::{as_le_bytes, PkKeys, Regions, TypeCode};
+use gnitz_wire::{FIXED_REGION_BYTES, MAX_PK_COLUMNS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Schema {
-    columns: Vec<ColumnDef>,
-    layout: SchemaDescriptor,
-}
-
-impl Schema {
-    /// The one constructor. `Err` for a column list over `MAX_COLUMNS`, an
-    /// inadmissible column type, or a PK list that breaks the PK rules at
-    /// `PK_LIST_MAX_COLS`, the capacity of a persisted PK list.
-    pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: &[u32]) -> Result<Schema, String> {
-        if let Some(cd) = columns.iter().find(|cd| !cd.ty.is_admissible()) {
-            return Err(format!(
-                "column '{}' ({:?}) carries scale {}",
-                cd.name, cd.ty.tc, cd.ty.scale
-            ));
-        }
-        let pk_refusal = |rule: PkRule| {
-            rule.named(PkListRole::PrimaryKey, |c| {
-                columns.get(c as usize).map(|cd| cd.name.as_str())
-            })
-        };
-        if pk_cols.len() > PK_LIST_MAX_COLS {
-            return Err(pk_refusal(PkRule::TooManyColumns {
-                count: pk_cols.len(),
-                max: PK_LIST_MAX_COLS,
-            }));
-        }
-        let cols: Vec<SchemaColumn> = columns
-            .iter()
-            .map(|cd| SchemaColumn::new(cd.ty.tc, cd.is_nullable))
-            .collect();
-        let layout = SchemaDescriptor::try_new(&cols, pk_cols).map_err(|refusal| match refusal {
-            SchemaRefusal::Pk(rule) => pk_refusal(rule),
-            other => other.to_string(),
-        })?;
-        Ok(Schema { columns, layout })
-    }
-
-    pub fn columns(&self) -> &[ColumnDef] {
-        &self.columns
-    }
-
-    /// PK column indices in compound-key order; length >= 1.
-    pub fn pk_cols(&self) -> &[u32] {
-        self.layout.pk_cols()
-    }
-
-    /// The layout facts of this schema's columns and PK list.
-    pub fn layout(&self) -> &SchemaDescriptor {
-        &self.layout
-    }
-
-    /// A name carries no layout.
-    pub fn rename_column(&mut self, ci: usize, name: String) {
-        self.columns[ci].name = name;
-    }
-
-    /// The PK columns in PK-list order, hidden: the leading key of a reply that
-    /// carries this schema's key.
-    pub fn hidden_key_columns(&self) -> impl Iterator<Item = ColumnDef> + '_ {
-        self.pk_cols()
-            .iter()
-            .map(|&c| self.columns[c as usize].clone().hidden())
-    }
-
-    /// The non-PK ("payload") columns as `(payload slot, col_idx, &ColumnDef)`,
-    /// in slot order.
-    #[inline]
-    pub fn payload_columns(&self) -> impl Iterator<Item = (usize, usize, &ColumnDef)> {
-        (0..self.layout.num_payload_cols()).map(|pi| {
-            let ci = self.layout.payload_col_idx(pi);
-            (pi, ci, &self.columns[ci])
-        })
-    }
-
-    /// The visible (non-hidden) columns as `(col_idx, &ColumnDef)`. `col_idx` is
-    /// the position in the full schema, so a hidden column does not shift the
-    /// ones after it.
-    #[inline]
-    pub fn visible_columns(&self) -> impl Iterator<Item = (usize, &ColumnDef)> {
-        self.columns.iter().enumerate().filter(|(_, c)| !c.is_hidden)
-    }
-
-    /// This schema's meta-schema record — the bytes a schema-bearing push embeds.
-    pub fn to_block(&self) -> Vec<u8> {
-        gnitz_wire::schema_block::encode(self.columns.iter().map(ColumnDef::block_col), self.pk_cols())
-    }
-
-    /// The schema a meta-schema record describes.
-    pub fn from_block(block: &[u8]) -> Result<Schema, String> {
-        let mut columns = Vec::new();
-        let pk = gnitz_wire::schema_block::decode(block, |c| {
-            let name = std::str::from_utf8(c.name).map_err(|e| format!("utf8 in column name: {e}"))?;
-            columns.push(ColumnDef {
-                name: name.to_owned(),
-                ty: c.ty,
-                is_nullable: c.nullable,
-                is_hidden: c.hidden,
-            });
-            Ok(())
-        })?;
-        Schema::from_parts(columns, pk.as_slice())
-    }
-}
-
-/// The client `Schema` of system table `tid`, built from `gnitz_wire::SYS_FAMILIES`.
-///
-/// Panics on an id that is not a system table.
-pub fn sys_schema(tid: u64) -> &'static Arc<Schema> {
-    static INSTANCE: OnceLock<Vec<Arc<Schema>>> = OnceLock::new();
-    let schemas = INSTANCE.get_or_init(|| {
-        gnitz_wire::SYS_FAMILIES
-            .iter()
-            .map(|f| {
-                let columns = f.column_defs().collect();
-                Arc::new(Schema::from_parts(columns, f.pk_cols).expect("a system family is an admissible schema"))
-            })
-            .collect()
-    });
-    let idx = gnitz_wire::sys_family_index(tid).unwrap_or_else(|| panic!("not a system table id: {tid}"));
-    &schemas[idx]
-}
+use crate::{ProtocolError, Schema};
 
 /// A batch's PK region: `stride` bytes per row of **order-preserving key** (OPK,
 /// §4) — the bytes the wire carries and the engine stores, so a client batch's
@@ -347,10 +226,7 @@ impl ZSetBatch {
             pks: PkColumn::empty_for_schema(schema),
             weights: vec![],
             nulls: vec![],
-            payload: schema
-                .payload_columns()
-                .map(|(_, _, c)| PayloadColumn { tc: c.ty.tc, bytes: Vec::new() })
-                .collect(),
+            payload: Self::filler_columns(schema, 0),
             blob: vec![],
         }
     }
@@ -426,7 +302,7 @@ impl ZSetBatch {
     }
 
     /// Overwrite the 8-byte fixed-width cell at `(row, pi)` with `v`, little-endian.
-    pub fn set_u64_cell(&mut self, row: usize, pi: usize, v: u64) {
+    pub(crate) fn set_u64_cell(&mut self, row: usize, pi: usize, v: u64) {
         gnitz_wire::write_u64_le(&mut self.payload[pi].bytes, row * 8, v);
     }
 
@@ -483,7 +359,7 @@ impl ZSetBatch {
         }
     }
 
-    /// [`Self::extend_from`], taking `other` whole when `self` is empty.
+    /// `extend_from`, taking `other` whole when `self` is empty.
     pub fn extend_from_owned(&mut self, other: ZSetBatch) {
         assert!(self.same_layout(&other), "extend_from_owned: layout mismatch");
         if self.is_empty() {
@@ -549,7 +425,7 @@ impl ZSetBatch {
     /// The batch's layout is `schema`'s: key column types, payload slot count,
     /// and each slot's type.
     pub(crate) fn layout_matches(&self, schema: &Schema) -> Result<(), String> {
-        let want = schema.pk_cols().iter().map(|&c| schema.columns[c as usize].ty.tc);
+        let want = schema.pk_cols().iter().map(|&c| schema.columns()[c as usize].ty.tc);
         let got = self.pks.key_types();
         if !got.iter().copied().eq(want.clone()) {
             let want: Vec<TypeCode> = want.collect();
@@ -597,7 +473,7 @@ impl ZSetBatch {
             None => Ok(()),
             Some((row, slot)) => Err(format!(
                 "row {row} holds a value under NULL in column '{}'",
-                schema.columns[schema.layout().payload_col_idx(slot)].name
+                schema.columns()[schema.layout().payload_col_idx(slot)].name
             )),
         }
     }
@@ -692,7 +568,7 @@ pub(crate) fn check_not_null(nulls: &[u64], schema: &Schema) -> Result<(), Strin
         }
         Some((row, slot)) => Err(format!(
             "row {row} sets a null bit on NOT NULL column '{}'",
-            schema.columns[schema.layout().payload_col_idx(slot)].name
+            schema.columns()[schema.layout().payload_col_idx(slot)].name
         )),
     }
 }
@@ -948,10 +824,104 @@ impl gnitz_expr::MapTarget for ZSetBatch {
     }
 }
 
+// ── WAL-block encode and decode ────────────────────────────────────────────
+
+impl ZSetBatch {
+    /// This batch as its canonical region list.
+    pub(crate) fn wire_regions(&self) -> Regions<'_> {
+        let mut out = Regions::new();
+        out.push(self.pks.region());
+        out.push(as_le_bytes(&self.weights));
+        out.push(as_le_bytes(&self.nulls));
+        for c in &self.payload {
+            out.push(&c.bytes);
+        }
+        out.push(&self.blob);
+        out
+    }
+}
+
+/// Decode a WAL block under `schema`, appending its rows to `sink`. On error
+/// `sink` is not usable.
+pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
+    let layout = schema.layout();
+    let gnitz_wire::wal::ParsedBlock { rows, fixed, heap, .. } = gnitz_wire::wal::parse_block(data, layout.row_width())
+        .map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?;
+    let mut regions = Regions::new();
+    for r in 0..layout.num_fixed_regions() {
+        regions.push(&fixed[layout.region_start(r, rows)..][..rows * layout.region_stride(r)]);
+    }
+    regions.push(heap);
+    append_regions(sink, &regions, schema, true)
+}
+
+/// Append to `sink`, a batch of `schema`, the rows of a canonical region list
+/// this process's own store produced. Its German cells are rebased and not
+/// checked, the store having checked them when it ingested them; the layout
+/// and NOT NULL are checked as for a block. On error `sink` is not usable.
+pub fn append_own_regions(sink: &mut ZSetBatch, regions: &[&[u8]], schema: &Schema) -> Result<(), ProtocolError> {
+    append_regions(sink, regions, schema, false)
+}
+
+/// Append the rows laid out as the canonical region list `regions` under
+/// `schema` to `sink`, a batch of `schema`. `foreign` regions crossed a trust
+/// boundary, so each German cell is checked for canonical form as it is copied.
+fn append_regions(
+    sink: &mut ZSetBatch,
+    regions: &[&[u8]],
+    schema: &Schema,
+    foreign: bool,
+) -> Result<(), ProtocolError> {
+    debug_assert!(sink.layout_matches(schema).is_ok() && sink.check_columns().is_ok());
+    let count = regions.get(REG_WEIGHT).map_or(0, |w| w.len() / FIXED_REGION_BYTES);
+    if regions.len() != gnitz_wire::num_regions(sink.payload.len())
+        || regions[REG_WEIGHT].len() != count * FIXED_REGION_BYTES
+        || regions[REG_PK].len() != count * sink.pks.stride()
+        || regions[REG_NULL_BMP].len() != count * FIXED_REGION_BYTES
+        || !sink
+            .payload
+            .iter()
+            .zip(&regions[REG_PAYLOAD_START..])
+            .all(|(c, r)| r.len() == count * c.stride())
+    {
+        return Err(ProtocolError::DecodeError(
+            "a region list that does not lay out its schema".into(),
+        ));
+    }
+    sink.reserve(count);
+    sink.pks.push_region_bytes(regions[REG_PK]);
+    gnitz_wire::extend_from_le_bytes(&mut sink.weights, regions[REG_WEIGHT]);
+    let nulls_at = sink.nulls.len();
+    gnitz_wire::extend_from_le_bytes(&mut sink.nulls, regions[REG_NULL_BMP]);
+    check_not_null(&sink.nulls[nulls_at..], schema).map_err(ProtocolError::DecodeError)?;
+
+    // A German cell's heap offset is relative to its own block's heap.
+    let block_blob = regions[REG_PAYLOAD_START + sink.payload.len()];
+    let blob_base = sink.blob.len();
+    sink.blob.extend_from_slice(block_blob);
+
+    for (pi, col) in sink.payload.iter_mut().enumerate() {
+        let german = col.tc().is_german_string();
+        let dst = &mut col.bytes;
+        let at = dst.len();
+        dst.extend_from_slice(regions[REG_PAYLOAD_START + pi]);
+        if german {
+            if foreign && !gnitz_wire::german_string_region_ok(&dst[at..], block_blob) {
+                return Err(ProtocolError::DecodeError(format!(
+                    "column {}: German string cell is not in canonical form",
+                    schema.layout().payload_col_idx(pi)
+                )));
+            }
+            gnitz_wire::shift_german_string_heaps(&mut dst[at..], blob_base);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
-#[path = "tests/types.rs"]
+#[path = "tests/batch.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "benches/types.rs"]
+#[path = "benches/batch.rs"]
 mod bench;

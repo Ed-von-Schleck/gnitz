@@ -168,9 +168,14 @@ impl PyClient {
         lock(&slf.get().schema).clone()
     }
 
-    /// The relation a verb's `name` or `schema.name` argument names.
+    /// The relation a verb's `name` or `schema.name` argument names, split at
+    /// its first `.`; a bare name is in the client's current schema.
     fn relation(slf: &Bound<'_, Self>, text: &str) -> PyResult<RelName> {
-        RelName::parse(&lock(&slf.get().schema), text).map_err(|e| client_err(e.into()))
+        match text.split_once('.') {
+            Some((schema, name)) => RelName::new(schema, name),
+            None => RelName::unqualified(&lock(&slf.get().schema), text),
+        }
+        .map_err(|e| client_err(e.into()))
     }
 
     /// The rows `spec` selects of relation `tid` in `schema`'s layout, off this
@@ -481,8 +486,9 @@ impl PyClient {
     /// before its answer arrives loses nothing, which the next sync brings.
     ///
     /// A subscription that ended and a view that failed carry the exception
-    /// in their entry's `error`. The call raises only for a poisoned store or
-    /// a `KeyboardInterrupt`.
+    /// in their entry's `error`; on a poisoned store every mirrored view's is
+    /// a `GnitzMirrorPoisonedError`. The call raises only for a
+    /// `KeyboardInterrupt`.
     #[pyo3(signature = (wait = 0.0))]
     fn sync(slf: &Bound<'_, Self>, wait: f64) -> PyResult<Py<PyAny>> {
         let wait = sync_wait(wait)?;
@@ -581,8 +587,8 @@ impl PyClient {
         Self::peek(slf, move |c| c.cursor_of(view_id).map(DeltaCursor::pair), value)
     }
 
-    /// The message that poisoned this client's copy, or `None`. Answers on a
-    /// poisoned store — diagnosing one is what it is for.
+    /// Whether this client's store is poisoned. Answers on a poisoned store —
+    /// diagnosing one is what it is for.
     #[getter]
     fn mirror_poisoned(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
         Self::peek(slf, |c| c.mirror_poisoned(), value)

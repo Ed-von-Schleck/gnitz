@@ -1,94 +1,17 @@
 use super::*;
-use crate::protocol::transport::poll_fd;
-use crate::test_support::{flush_all, framed, io_kind, pass, read_frame, recv_frames, write_frame};
-use crate::ClientError;
-use gnitz_wire::CONNECT_TIMEOUT;
+use crate::test_support::{
+    flush_all, handshake, io_kind, pass, read_frame, recv_frames, tls_pair, write_frame, Loopback,
+};
+use crate::{poll_fd, ClientError, Interest};
+use gnitz_wire::{framed, CONNECT_TIMEOUT};
 use std::io::ErrorKind;
-use std::net::TcpListener;
+use std::os::fd::AsFd;
 use std::sync::mpsc;
 use std::time::Duration;
-
-/// A rustls server on a loopback thread with a freshly minted `127.0.0.1` cert,
-/// reached through the public `tls://…?ca=` target.
-struct Loopback<T> {
-    target: String,
-    thread: std::thread::JoinHandle<T>,
-    /// Holds the minted cert's PEM for as long as the target names it.
-    _ca_dir: tempfile::TempDir,
-}
-
-/// The far end of a connection: a blocking rustls stream.
-pub(in crate::protocol::transport) type ServerEnd = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
-
-/// Complete the server side of the TLS handshake. `StreamOwned` handshakes
-/// lazily on first I/O, which a peer that only waits never does.
-fn handshake(sock: TcpStream, cfg: Arc<rustls::ServerConfig>) -> ServerEnd {
-    let mut end = rustls::StreamOwned::new(rustls::ServerConnection::new(cfg).unwrap(), sock);
-    while end.conn.is_handshaking() {
-        end.conn.complete_io(&mut end.sock).unwrap();
-    }
-    end
-}
-
-/// Answer the client's HELLO, which carries no token.
-fn hello(mut end: ServerEnd) -> ServerEnd {
-    assert_eq!(read_frame(&mut end), gnitz_wire::HELLO);
-    write_frame(&mut end, &gnitz_wire::server_hello(gnitz_wire::AuthStatus::Accepted));
-    end
-}
 
 /// Read and discard until the client closes: a peer that never answers.
 fn drain(mut r: impl std::io::Read) {
     let _ = std::io::copy(&mut r, &mut std::io::sink());
-}
-
-impl<T: Send + 'static> Loopback<T> {
-    /// `serve` gets the accepted socket (`TCP_NODELAY`, as the server sets it)
-    /// and the server config. `rcvbuf` pins the socket's `SO_RCVBUF`, set on the
-    /// listener so the window the handshake advertises honours it.
-    fn serve(
-        rcvbuf: Option<libc::c_int>,
-        serve: impl FnOnce(TcpStream, Arc<rustls::ServerConfig>) -> T + Send + 'static,
-    ) -> Self {
-        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
-        let ca_dir = tempfile::tempdir().unwrap();
-        let pem = ca_dir.path().join("ca.pem");
-        std::fs::write(&pem, cert.cert.pem()).unwrap();
-        let key = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
-        let mut cfg = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert.cert.der().clone()], key)
-            .unwrap();
-        cfg.alpn_protocols = vec![ALPN_GNITZ.to_vec()];
-        let cfg = Arc::new(cfg);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        if let Some(sz) = rcvbuf {
-            set_sockopt_int(listener.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, sz).unwrap();
-        }
-        let port = listener.local_addr().unwrap().port();
-        let thread = std::thread::spawn(move || {
-            let (sock, _) = listener.accept().unwrap();
-            sock.set_nodelay(true).unwrap();
-            serve(sock, cfg)
-        });
-        Loopback {
-            target: format!("tls://127.0.0.1:{port}?ca={}", pem.display()),
-            thread,
-            _ca_dir: ca_dir,
-        }
-    }
-
-    fn join(self) -> T {
-        self.thread.join().unwrap()
-    }
-}
-
-/// A connected transport and its far end, the HELLOs exchanged. `rcvbuf` as
-/// [`Loopback::serve`] takes it.
-pub(in crate::protocol::transport) fn pair(rcvbuf: Option<libc::c_int>) -> (ClientTransport, ServerEnd) {
-    let lb = Loopback::serve(rcvbuf, |sock, cfg| hello(handshake(sock, cfg)));
-    let t = ClientTransport::connect(&lb.target, Instant::now() + CONNECT_TIMEOUT).unwrap();
-    (t, lb.join())
 }
 
 /// The client profile: TLS 1.3 alone, and early data off, so that the access
@@ -125,13 +48,13 @@ fn ca_file_with_an_unparsable_certificate_is_refused() {
 fn one_wakeup_drains_every_frame_rustls_holds() {
     // Two frames in one record and a third in the next: one readable wakeup
     // and one reading pass bring out all three.
-    let (mut t, mut peer) = pair(None);
+    let (mut t, mut peer) = tls_pair(None);
     let mut both = framed(b"one");
     both.extend(framed(b"two"));
     peer.write_all(&both).unwrap();
     peer.flush().unwrap();
     write_frame(&mut peer, b"three");
-    poll_fd(t.as_raw_fd(), libc::POLLIN, None).unwrap();
+    poll_fd(t.as_fd(), Interest::READ, None).unwrap();
     let (got, end) = pass(&mut t);
     end.unwrap();
     assert_eq!(got, [b"one".as_slice(), b"two", b"three"]);
@@ -146,7 +69,7 @@ fn large_reply_spanning_many_records_is_intact() {
     // Many 16 KiB records: the window is refilled repeatedly and records
     // straddle the refills.
     let payload: Vec<u8> = (0u8..=255).collect::<Vec<_>>().repeat(1024);
-    let (mut t, mut end) = pair(None);
+    let (mut t, mut end) = tls_pair(None);
     let p = payload.clone();
     let writer = std::thread::spawn(move || write_frame(&mut end, &p));
     assert_eq!(recv_frames(&mut t, 1), [payload]);
@@ -158,8 +81,8 @@ fn flush_can_empty_the_queue_with_ciphertext_still_pending() {
     // 60 KiB fits rustls's send buffer but not the pinned socket buffers: the
     // queue empties into rustls while its ciphertext still waits on the socket.
     let frame: Vec<u8> = (0u8..=255).collect::<Vec<_>>().repeat(240);
-    let (mut t, mut end) = pair(Some(8 * 1024));
-    set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 8 * 1024).unwrap();
+    let (mut t, mut end) = tls_pair(Some(8 * 1024));
+    set_sockopt_int(t.as_fd().as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 8 * 1024).unwrap();
     t.enqueue(frame.clone());
     t.flush().unwrap();
     assert_eq!(t.queued_bytes(), 0, "rustls took the whole frame");
@@ -176,8 +99,8 @@ fn a_frame_larger_than_the_send_buffer_leaves_its_tail_queued() {
     let big: Vec<u8> = (0u8..=255)
         .collect::<Vec<_>>()
         .repeat((SEND_BUFFER_BYTES + 256 * 1024) / 256);
-    let (mut t, mut end) = pair(None);
-    set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 16 * 1024).unwrap();
+    let (mut t, mut end) = tls_pair(None);
+    set_sockopt_int(t.as_fd().as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 16 * 1024).unwrap();
     t.enqueue(big.clone());
     t.flush().unwrap();
     assert!(t.queued_bytes() > 0, "the tail is queue state, not rustls's");
@@ -236,7 +159,7 @@ fn close_notify_with_bytes_behind_it_surfaces_eof() {
     // The last frame, the close_notify and bytes past it, all in one socket
     // read: the frame comes out, then EOF — never a spin on bytes past the
     // close that rustls refuses.
-    let (t, mut end) = pair(None);
+    let (t, mut end) = tls_pair(None);
     write_frame(&mut end, b"last");
     end.conn.send_close_notify();
     end.flush().unwrap();

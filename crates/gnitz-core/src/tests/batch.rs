@@ -1,8 +1,8 @@
 use super::*;
-use crate::protocol::wal_block::decode_wal_block_into;
 use crate::test_support::{decode_wal_block, encode_wal_block, kv_schema};
+use crate::BatchAppender;
 use gnitz_expr::{BatchView, CmpOp, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarEval, Sink};
-use gnitz_wire::{payload_str, payload_u64};
+use gnitz_wire::{payload_str, payload_u64, ColumnDef};
 
 /// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
 /// a NULL cell, which the region zero-fills.
@@ -25,44 +25,6 @@ fn payload_of(schema: &Schema, regions: Vec<Vec<u8>>) -> Vec<PayloadColumn> {
         .zip(regions)
         .map(|((_, _, c), bytes)| PayloadColumn { tc: c.ty.tc, bytes })
         .collect()
-}
-
-#[test]
-fn from_parts_enforces_full_rule_set() {
-    let cols = vec![
-        ColumnDef::new("a", TypeCode::U64, false),    // 0: eligible, non-null
-        ColumnDef::new("b", TypeCode::I32, false),    // 1: eligible, non-null
-        ColumnDef::new("s", TypeCode::String, false), // 2: ineligible type
-        ColumnDef::new("n", TypeCode::U64, true),     // 3: nullable
-    ];
-
-    let schema = |pk: &[u32], columns: &[ColumnDef]| Schema::from_parts(columns.to_vec(), pk);
-
-    assert!(schema(&[0], &cols).is_ok());
-    assert!(schema(&[0, 1], &cols).is_ok());
-
-    // The rule set is `gnitz_wire::validate_pk_tuple`'s, tested there; these
-    // pin what this caller hands it — its arity cap and each column's type and
-    // nullability.
-    for (pk, want) in [
-        (&[0, 1, 0, 1, 0][..], "out of range 1..=4"),
-        (&[3][..], "primary key column 'n' must not be nullable"),
-        (
-            &[2][..],
-            "primary key column 's' has type_code STRING; only fixed-width integer",
-        ),
-    ] {
-        let got = schema(pk, &cols).unwrap_err();
-        assert!(got.contains(want), "pk {pk:?}: {got:?} does not mention {want:?}");
-    }
-
-    // Column-count cap: the null bitmap is one u64, so > MAX_COLUMNS rejects.
-    let wide: Vec<ColumnDef> = (0..=gnitz_wire::MAX_COLUMNS)
-        .map(|i| ColumnDef::new(format!("c{i}"), TypeCode::U64, i > 0))
-        .collect();
-    let got = schema(&[0], &wide).unwrap_err();
-    assert!(got.contains("MAX_COLUMNS"), "{got}");
-    assert!(schema(&[0], &wide[..gnitz_wire::MAX_COLUMNS]).is_ok());
 }
 
 /// Each way a batch can disagree with its schema or with itself is refused and
@@ -783,37 +745,100 @@ fn batches_round_trip_through_a_wal_block() {
     }
 }
 
-/// Every fact a `Schema` carries must survive the block round-trip: column
-/// types, nullability, names, the `hidden` marker, and the declared PK order
-/// (which is not column order here).
+// ── WAL blocks and region lists ─────────────────────────────────────────
+
+/// A German cell whose heap offset overruns the heap is a `DecodeError`.
 #[test]
-fn schema_survives_the_block_roundtrip() {
-    let original = Schema::from_parts(
-        vec![
-            ColumnDef::new("id", TypeCode::U64, false).hidden(),
-            ColumnDef::new("name", TypeCode::String, true),
-            ColumnDef::new("score", TypeCode::F64, false),
-            ColumnDef::new("tag", TypeCode::I32, true),
-            ColumnDef::new("uuid", TypeCode::U128, false),
-        ],
-        &[4, 0],
-    )
-    .unwrap();
-    assert_eq!(Schema::from_block(&original.to_block()).unwrap(), original);
+fn a_string_cell_pointing_past_the_blob_is_refused() {
+    let schema = kv_schema(TypeCode::String);
+    let mut batch = ZSetBatch::new(&schema);
+    BatchAppender::new(&mut batch)
+        .add_row(1, 1)
+        .str_val("a value well past the inline cell");
+    let mut forged = batch.clone();
+    // A German cell's bytes 8..16 are its heap offset; the block copies it verbatim.
+    forged.payload[0].bytes[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+
+    match decode_wal_block(&encode_wal_block(&forged), &schema) {
+        Err(ProtocolError::DecodeError(m)) => assert!(m.contains("not in canonical form"), "{m}"),
+        other => panic!("expected a decode error, got {other:?}"),
+    }
 }
 
-/// The client's PK arity cap is `gnitz_wire::PK_LIST_MAX_COLS` — a key it accepts must
-/// round-trip through the persisted PK-list word — so it must refuse a record
-/// the shared codec, capped wider, admits.
+/// A process's own regions are appended behind the rows a batch already holds,
+/// each long cell reading its content at the heap's new place, and their layout
+/// is checked as a block's is.
 #[test]
-fn a_pk_wider_than_the_client_codec_is_rejected() {
-    let n = gnitz_wire::PK_LIST_MAX_COLS + 1;
-    let key = ColumnDef::new("k", TypeCode::U64, false);
-    let pk: Vec<u32> = (0..n as u32).collect();
-    let block = gnitz_wire::schema_block::encode((0..n).map(|_| key.block_col()), &pk);
-    assert!(
-        gnitz_wire::schema_block::decode(&block, |_| Ok(())).is_ok(),
-        "the codec admits it"
-    );
-    assert!(Schema::from_block(&block).is_err());
+fn own_regions_are_appended_with_their_long_cells_rebased() {
+    let schema = kv_schema(TypeCode::String);
+    let mut batch = ZSetBatch::new(&schema);
+    BatchAppender::new(&mut batch)
+        .add_row(1, 1)
+        .str_val("ab")
+        .add_row(2, -1)
+        .str_val("a value well past the inline cell");
+    let regions = batch.wire_regions();
+
+    let mut sink = batch.clone();
+    append_own_regions(&mut sink, &regions, &schema).unwrap();
+    assert_eq!(sink.len(), 4);
+    assert_eq!(sink.weights, [1, -1, 1, -1]);
+    let cells = sink.payload[0].bytes.as_chunks::<16>().0;
+    let content = |i: usize| gnitz_wire::german_string_content(&cells[i], &sink.blob);
+    assert_eq!(content(1), content(3));
+    assert_eq!(content(3), b"a value well past the inline cell");
+    assert_eq!(content(2), b"ab");
+
+    let short = &regions[..regions.len() - 1];
+    assert!(append_own_regions(&mut ZSetBatch::new(&schema), short, &schema).is_err());
+}
+
+/// A block of zero rows is refused: an empty batch ships no block.
+#[test]
+fn a_zero_row_block_is_refused() {
+    let schema = kv_schema(TypeCode::I64);
+    match decode_wal_block(&encode_wal_block(&ZSetBatch::new(&schema)), &schema) {
+        Err(ProtocolError::DecodeError(m)) => assert!(m.contains("block holds no rows"), "{m}"),
+        other => panic!("expected a decode error, got {other:?}"),
+    }
+}
+
+/// A region list that does not lay out its schema — a region short, or one
+/// not as long as its rows — is a `DecodeError`.
+#[test]
+fn a_region_list_that_does_not_lay_out_its_schema_is_refused() {
+    let schema = kv_schema(TypeCode::I64);
+    let mut batch = ZSetBatch::new(&schema);
+    BatchAppender::new(&mut batch).add_row(1, 1).i64_val(7);
+    let regions = batch.wire_regions();
+    let decode = |regions: &[&[u8]]| append_regions(&mut ZSetBatch::new(&schema), regions, &schema, true);
+    decode(&regions).expect("the batch's own regions decode");
+
+    let short = &regions[..regions.len() - 1];
+    let mut ragged = regions.to_vec();
+    ragged[gnitz_wire::REG_PAYLOAD_START] = &[0; 4];
+    for (case, list) in [
+        ("a region short", short),
+        ("a ragged region", &ragged[..]),
+        ("no regions", &[]),
+    ] {
+        assert!(matches!(decode(list), Err(ProtocolError::DecodeError(_))), "{case}");
+    }
+}
+
+/// A null bit under a NOT NULL column is refused at decode, naming the column.
+#[test]
+fn a_null_bit_under_a_not_null_column_is_a_decode_error() {
+    let schema = kv_schema(TypeCode::I64);
+    let mut b = ZSetBatch::new(&schema);
+    {
+        let mut a = BatchAppender::new(&mut b);
+        a.add_row(1, 1).i64_val(7);
+        a.add_row(2, 1).i64_val(8);
+    }
+    b.nulls[1] = 1;
+    match decode_wal_block(&encode_wal_block(&b), &schema) {
+        Err(ProtocolError::DecodeError(m)) => assert!(m.contains("NOT NULL column 'v'"), "{m}"),
+        other => panic!("expected a NOT NULL decode error, got {other:?}"),
+    }
 }

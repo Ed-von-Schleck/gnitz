@@ -23,7 +23,7 @@ def erase(base, target, sn):
         raise SystemExit("one copy's fault must not poison the store")
     except gnitz.GnitzError:
         pass
-    assert m.mirror_poisoned is None, "the store stays usable"
+    assert not m.mirror_poisoned, "the store stays usable"
 
     # Intact, so the calls that span the store still answer.
     m.sync()
@@ -63,7 +63,7 @@ def panic(base, target, sn):
         raise SystemExit("the armed seam must panic inside the apply")
     except BaseException as e:  # pyo3 raises PanicException, a BaseException
         assert "panic" in type(e).__name__.lower(), f"unexpected {type(e).__name__}: {e}"
-    assert m.mirror_poisoned is not None, "the unwind through the store's lock poisons it"
+    assert m.mirror_poisoned, "the unwind through the store's lock poisons it"
 
     # The copy is still gated in, so these are reads it would have answered.
     assert m.cursor(vid) is not None

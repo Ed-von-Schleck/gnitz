@@ -14,7 +14,7 @@ use std::future::Future;
 
 use gnitz_core::{
     block_on, BatchAppender, ClientError, GnitzClient, PkColumn, PlannedView, PollResult, RelName, ScanReply, Schema,
-    TableDef, ViewBundle, ViewDefinition, ZSetBatch,
+    TableDef, ViewBundle, ZSetBatch,
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
@@ -84,11 +84,7 @@ fn fed_table(target: &str) -> (GnitzClient, u64, u64, Arc<Schema>, String) {
             schema: Arc::clone(&schema),
             pk_repeats: false,
         },
-        definition: ViewDefinition {
-            query: "SELECT 1".to_string(),
-            body_columns: Vec::new(),
-            refs: Vec::new(),
-        },
+        definition: Vec::new(),
     };
     let vid = block_on(blocking.create_view_chain(bundle)).unwrap();
     (blocking, tid, vid, schema, sn)

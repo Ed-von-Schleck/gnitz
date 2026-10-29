@@ -32,15 +32,17 @@
 
 use std::collections::HashMap;
 use std::future::poll_fn;
+use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use crate::client::{offload, poll_turn, BoxFut, GnitzClient, Host};
+use crate::client::GnitzClient;
 use crate::connection::{DeltaCursor, Polled, RawBlock, RelDescriptor, Session, Target};
 use crate::error::ClientError;
+use crate::host::{offload, BoxFut, Host};
 use crate::{RelName, Schema, ZSetBatch};
 use gnitz_wire::txn_frame::{kept_as, DeltaPollItem};
-use gnitz_wire::{payload_str, RelClass, WireFault, WireStatus, RELTAB_PAY_NAME, VIEW_TAB};
+use gnitz_wire::{payload_str, RelClass, WireStatus, RELTAB_PAY_NAME, VIEW_TAB};
 
 // ---------------------------------------------------------------------------
 // The store
@@ -112,14 +114,17 @@ pub enum MirrorError {
     /// teardown costs that copy alone.
     ///
     /// [`GnitzClient::close_mirror`] is the only recovery.
-    Poisoned(String),
+    Poisoned,
 }
 
 impl std::fmt::Display for MirrorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MirrorError::Engine(m) => write!(f, "engine: {m}"),
-            MirrorError::Poisoned(m) => write!(f, "mirror store is poisoned: {m}"),
+            MirrorError::Poisoned => write!(
+                f,
+                "mirror store is poisoned: a store call panicked; the store may be torn"
+            ),
         }
     }
 }
@@ -173,7 +178,7 @@ impl PollResult {
 /// One mirrored view, as the client tracks it: what to derive its registration
 /// from again, and the descriptor its reads and polls are answered under.
 #[derive(Clone)]
-pub(crate) struct MirroredView {
+struct MirroredView {
     name: RelName,
     /// The descriptor handed back verbatim to every local resolve: the one
     /// registration resolved upstream, or an alias's own — a local id, and its
@@ -192,17 +197,28 @@ pub(crate) struct MirroredView {
     /// Whether a sync on this connection succeeded for what this registration
     /// reads.
     confirmed: bool,
-    /// Whether its last delta read failed.
-    failed: bool,
+    /// How the next poll moves its copy.
+    link: Link,
     /// Whether its copy was read whole and no caller has been handed the
     /// [`PollResult::Reseeded`] yet. Cleared only by [`MirrorState::report`],
-    /// so an interrupt that discards a report re-announces it next poll.
+    /// so an interrupt that discards a report re-announces it next poll; set
+    /// again for a report handed back unclaimed.
     owed_reseed: bool,
-    /// This connection's subscription to what this registration reads, by the
-    /// id it was asked for under. While it holds one, a poll advances the copy
-    /// by the trains pushed for it, and no delta read may. A sync names it to
-    /// the server from here, so clearing it is what ends the subscription.
-    pub(crate) sub: Option<u64>,
+}
+
+/// How a poll moves a mirrored view's copy. A copy that keeps answering at its
+/// old cursor after its feed failed is `Failed` and still confirmed, so this is
+/// no measure of whether the copy answers reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Link {
+    /// By a delta read, which the next sync is not held up for.
+    Due,
+    /// By a delta read, after the last one failed; a sync waits as asked.
+    Failed,
+    /// By the trains pushed for this connection's subscription, by the id it
+    /// was asked for under; no delta read may. A sync names it to the server
+    /// from here, so leaving this state is what ends the subscription.
+    Subscribed(u64),
 }
 
 /// A view read under a spec, as a planner compiled it — what
@@ -240,13 +256,12 @@ impl MirroredView {
     /// A delta read brought this copy up to date and left it subscribed as
     /// `id`: from here it answers reads.
     fn subscribed(&mut self, id: u64) {
-        self.sub = Some(id);
+        self.link = Link::Subscribed(id);
         self.confirmed = true;
-        self.failed = false;
     }
 
     /// The round this view's copy in `store` answers reads at, if it answers any.
-    pub(crate) fn answers_at(&self, store: &dyn MirrorStore) -> Option<DeltaCursor> {
+    fn answers_at(&self, store: &dyn MirrorStore) -> Option<DeltaCursor> {
         self.confirmed.then(|| store.cursor_of(self.desc.tid)).flatten()
     }
 }
@@ -255,23 +270,20 @@ impl MirroredView {
 /// lock is contended only by the job of a call its caller abandoned, which the
 /// next call waits out.
 #[derive(Clone)]
-pub(crate) struct Store(Arc<Mutex<dyn MirrorStore>>);
-
-/// What a poisoned store answers with.
-const TORN: &str = "a store call panicked; the store may be torn";
+struct Store(Arc<Mutex<dyn MirrorStore>>);
 
 impl Store {
     /// The store, poisoned or not, for a lookup made in place.
-    pub(crate) fn get(&self) -> MutexGuard<'_, dyn MirrorStore + 'static> {
+    fn get(&self) -> MutexGuard<'_, dyn MirrorStore + 'static> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Refused once a call panicked under the lock — the store's poison, and so
     /// the one source of [`MirrorError::Poisoned`]: a torn store answers no
     /// read and publishes nothing.
-    pub(crate) fn refusal(&self) -> Result<(), MirrorError> {
+    fn refusal(&self) -> Result<(), MirrorError> {
         match self.0.is_poisoned() {
-            true => Err(MirrorError::Poisoned(TORN.into())),
+            true => Err(MirrorError::Poisoned),
             false => Ok(()),
         }
     }
@@ -280,7 +292,7 @@ impl Store {
     /// local read in place, so a mirrored read costs no dispatch, and work that
     /// writes the disk through [`Self::run`]. Refused as [`Self::refusal`] is.
     fn touch(&self) -> Result<MutexGuard<'_, dyn MirrorStore + 'static>, MirrorError> {
-        self.0.lock().map_err(|_| MirrorError::Poisoned(TORN.into()))
+        self.0.lock().map_err(|_| MirrorError::Poisoned)
     }
 
     /// Run `work`, which may touch the disk, where `host` lets work block.
@@ -318,17 +330,38 @@ impl Store {
 
 /// Everything a mirroring client holds beyond a plain one.
 pub(crate) struct MirrorState {
-    pub(crate) store: Store,
+    store: Store,
     /// The client's registrations — the poll's work list, and what
     /// [`GnitzClient::cursor_of`] reports a round for. Survives a
     /// [`GnitzClient::reconnect`].
-    pub(crate) views: HashMap<u64, MirroredView>,
+    views: HashMap<u64, MirroredView>,
 }
 
 impl MirrorState {
     /// See [`GnitzClient::cursor_of`].
     pub(crate) fn cursor_of(&self, tid: u64) -> Option<DeltaCursor> {
         self.views.get(&tid)?.answers_at(&*self.store.get())
+    }
+
+    /// Run `spec` against `tid`'s copy when the copy answers reads, under one
+    /// guard for the gate and the scan, and break with its answer; a copy that
+    /// answers none continues with `spec`, for the read upstream. A poisoned
+    /// store answers with its refusal.
+    pub(crate) fn scan_local(
+        &self,
+        tid: u64,
+        spec: gnitz_wire::ReadSpec,
+        reply_schema: &Schema,
+    ) -> ControlFlow<Result<ZSetBatch, MirrorError>, gnitz_wire::ReadSpec> {
+        let mut store = self.store.get();
+        match self.views.get(&tid).and_then(|v| v.answers_at(&*store)) {
+            Some(_) => ControlFlow::Break(
+                self.store
+                    .refusal()
+                    .and_then(|()| store.scan_spec(tid, spec, reply_schema)),
+            ),
+            None => ControlFlow::Continue(spec),
+        }
     }
 
     /// The descriptor `name` is mirrored under, while its copy answers reads.
@@ -343,9 +376,36 @@ impl MirrorState {
     pub(crate) fn connection_replaced(&mut self) {
         for v in self.views.values_mut() {
             v.confirmed = false;
-            v.failed = false;
-            v.sub = None;
+            v.link = Link::Due;
         }
+    }
+
+    /// One failed entry for each view, its copy answering at no round: the
+    /// store is poisoned, so a sync names none of its subscriptions, which
+    /// ends them.
+    fn poisoned(&mut self) -> Vec<PollOutcome> {
+        let failed = |(&view_id, view): (&u64, &mut MirroredView)| {
+            view.link = Link::Failed;
+            PollOutcome {
+                view_id,
+                cursor: None,
+                result: PollResult::Failed(ClientError::Mirror(MirrorError::Poisoned)),
+            }
+        };
+        self.views.iter_mut().map(failed).collect()
+    }
+
+    /// Owe each view `outcomes` reports reseeded, and still registered, its
+    /// [`PollResult::Reseeded`] again: whether any is.
+    pub(crate) fn owe_reseeds(&mut self, outcomes: &[PollOutcome]) -> bool {
+        let mut owed = false;
+        for o in outcomes.iter().filter(|o| matches!(o.result, PollResult::Reseeded)) {
+            if let Some(view) = self.views.get_mut(&o.view_id) {
+                view.owed_reseed = true;
+                owed = true;
+            }
+        }
+        owed
     }
 
     /// One entry for each view of `done` still registered, for a caller that is
@@ -438,9 +498,8 @@ impl GnitzClient {
             spec,
             plan,
             confirmed: false,
-            failed: false,
+            link: Link::Due,
             owed_reseed: false,
-            sub: None,
         })
     }
 
@@ -529,7 +588,7 @@ impl GnitzClient {
                     Err(e @ ClientError::Interrupted(_)) => return Err(e),
                     Err(e) => {
                         if let Some(v) = self.mirror_state()?.views.get_mut(&tid) {
-                            v.failed = true;
+                            v.link = Link::Failed;
                         }
                         done.push((tid, Err(e)))
                     }
@@ -543,14 +602,11 @@ impl GnitzClient {
     /// sync next; a failure that names none is handed back. A view to read
     /// whole joins `expired`.
     async fn recover(&mut self, tid: u64, failure: ClientError, expired: &mut Vec<u64>) -> Result<u64, ClientError> {
-        let ClientError::Refused(WireFault { status, .. }) = &failure else {
-            return Err(failure);
-        };
-        match status {
+        match failure.status() {
             // The registration no longer resolves as it was derived.
-            WireStatus::StaleCatalog => self.rebind(tid).await,
+            Some(WireStatus::StaleCatalog) => self.rebind(tid).await,
             // The cursor does not continue.
-            WireStatus::DeltaExpired => {
+            Some(WireStatus::DeltaExpired) => {
                 expired.push(tid);
                 Ok(tid)
             }
@@ -579,7 +635,10 @@ impl GnitzClient {
         let mut poll = {
             let item = |(tid, &from): (&u64, &Option<DeltaCursor>)| {
                 let view = &views[tid];
-                debug_assert!(view.sub.is_none(), "a subscribed copy is moved by its trains alone");
+                debug_assert!(
+                    !matches!(view.link, Link::Subscribed(_)),
+                    "a subscribed copy is moved by its trains alone"
+                );
                 DeltaPollItem {
                     view: view.upstream,
                     from,
@@ -598,7 +657,12 @@ impl GnitzClient {
         let (mut opened, mut failed) = (false, None);
         // The views holding a cursor that one step ended — each its id, its
         // blocks and the cursor they ended at, and in `ended` its item —
-        // applied together before the session reads on.
+        // applied together before the session reads on. Such a copy takes its
+        // train whole, with the cursor past it, in one advance: rows and cursor
+        // move together, so a read abandoned mid-train reads again from a
+        // cursor none of its rows were applied past. A copy read whole is
+        // unreadable until sealed and erased by its next refill, so it takes
+        // each step's blocks as they come.
         let mut ended: Vec<usize> = Vec::new();
         let mut due: Vec<(u64, Vec<RawBlock>, DeltaCursor)> = Vec::new();
         while let Some((i, polled)) = poll.next(host).await? {
@@ -689,13 +753,13 @@ impl GnitzClient {
         {
             let store = store.get();
             for (&tid, view) in views.iter_mut() {
-                let Some(id) = view.sub else { continue };
+                let Link::Subscribed(id) = view.link else { continue };
                 let pushed = match (store.cursor_of(tid), synced) {
                     (Some(at), Ok(())) => session.take_pushed(id).ok().map(|taken| (at, taken)),
                     _ => None,
                 };
                 let Some((at, (blocks, next))) = pushed else {
-                    view.sub = None;
+                    view.link = Link::Due;
                     continue;
                 };
                 done.push((tid, Ok(())));
@@ -712,7 +776,7 @@ impl GnitzClient {
                 // its own cursor again.
                 for tid in &taken {
                     if let Some(view) = views.get_mut(tid) {
-                        view.sub = None;
+                        view.link = Link::Due;
                     }
                 }
                 return Err(lost);
@@ -722,7 +786,7 @@ impl GnitzClient {
             let Err(e) = advanced else { continue };
             // A copy its store let go of is read whole by the next poll.
             if let Some(view) = views.get_mut(&tid) {
-                view.sub = None;
+                view.link = Link::Due;
             }
             if let Some(failed) = done.iter_mut().find(|(done, _)| *done == tid) {
                 failed.1 = Err(e);
@@ -848,28 +912,39 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// The wait a sync may be held for: none while a copy is due a delta read.
-    pub(crate) fn mirror_hold(&self, wait: Duration) -> Result<Duration, ClientError> {
-        let Some(m) = self.mirror.as_deref() else {
-            return Ok(wait);
-        };
-        m.store.refusal()?;
-        let due = m.views.values().any(|v| v.sub.is_none() && !v.failed);
-        Ok(if due { Duration::ZERO } else { wait })
+    /// The wait a sync may be held for — none while a copy is due a delta
+    /// read — and the copies' subscriptions it names. A poisoned store names
+    /// none and leaves `wait` as asked: a sync advances none of its copies, so
+    /// their subscriptions end, and a reader's are synced as on any client.
+    pub(crate) fn mirror_hold(&self, wait: Duration) -> (Duration, impl Iterator<Item = u64> + '_) {
+        let live = self.mirror.as_deref().filter(|m| m.store.refusal().is_ok());
+        let views = live.into_iter().flat_map(|m| m.views.values());
+        let due = views.clone().any(|v| v.link == Link::Due);
+        let held = views.filter_map(|v| match v.link {
+            Link::Subscribed(id) => Some(id),
+            Link::Due | Link::Failed => None,
+        });
+        (if due { Duration::ZERO } else { wait }, held)
     }
 
     /// Advance every mirrored view, a subscribed one by what the sync `synced`
-    /// answers brought it and any other by a delta read. `Err` is an interrupt.
+    /// answers brought it and any other by a delta read. On a poisoned store
+    /// each view is reported failed with [`MirrorError::Poisoned`], and the
+    /// store is not touched. `Err` is an interrupt.
     pub(crate) async fn advance_mirror(
         &mut self,
         synced: &Result<(), ClientError>,
     ) -> Result<Vec<PollOutcome>, ClientError> {
-        if self.mirror.is_none() {
+        let Some(m) = self.mirror.as_deref_mut() else {
             return Ok(Vec::new());
+        };
+        if m.store.refusal().is_err() {
+            return Ok(m.poisoned());
         }
         let mut done = self.advance_pushed(synced).await?;
         let views = &self.mirror_state()?.views;
-        let unsubscribed = views.iter().filter(|(_, v)| v.sub.is_none()).map(|(tid, _)| *tid);
+        let unsubscribed = views.iter().filter(|(_, v)| !matches!(v.link, Link::Subscribed(_)));
+        let unsubscribed = unsubscribed.map(|(tid, _)| *tid);
         let polled: Vec<u64> = unsubscribed
             .filter(|tid| done.iter().all(|(done, _)| done != tid))
             .collect();
@@ -878,8 +953,9 @@ impl GnitzClient {
     }
 
     /// The views this client holds a registration for — the set
-    /// [`Self::sync`] advances, which is wider than [`Self::mirrors`] by
-    /// the ones whose copy the next poll has yet to make valid.
+    /// [`Self::sync`] advances, which is wider than the views
+    /// [`Self::cursor_of`] answers by the ones whose copy the next poll has yet
+    /// to make valid.
     ///
     /// Answered off the client's own map, and provisional between a
     /// [`Self::reconnect`] and the next poll: the keys are still the previous
@@ -888,12 +964,6 @@ impl GnitzClient {
         self.mirror
             .as_deref()
             .map_or_else(Vec::new, |m| m.views.keys().copied().collect())
-    }
-
-    /// Whether a read of `table_id` is answered locally — which is exactly
-    /// whether there is a round to answer it at.
-    pub fn mirrors(&self, table_id: u64) -> bool {
-        self.cursor_of(table_id).is_some()
     }
 
     /// The round a local read of `table_id` answers at, or `None` when there is
@@ -929,17 +999,15 @@ impl GnitzClient {
         // Dropping the store, in the job that holds its last handle, releases
         // the directory lock.
         match m.store.run(&mut *self.host, |s| s.checkpoint()).await? {
-            Err(MirrorError::Poisoned(_)) => Ok(()),
+            Err(MirrorError::Poisoned) => Ok(()),
             other => other.map_err(ClientError::from),
         }
     }
 
-    /// The message that poisoned this client's store, if any. Answers on a
-    /// poisoned store — diagnosing one is what it is for.
-    pub fn mirror_poisoned(&self) -> Option<String> {
-        self.mirror
-            .as_deref()
-            .and_then(|m| m.store.0.is_poisoned().then(|| TORN.to_string()))
+    /// Whether this client's store is poisoned. Answers on a poisoned store —
+    /// diagnosing one is what it is for.
+    pub fn mirror_poisoned(&self) -> bool {
+        self.mirror.as_deref().is_some_and(|m| m.store.refusal().is_err())
     }
 }
 
@@ -984,7 +1052,7 @@ impl<'s> DeltaPoll<'s> {
             if self.answered == self.items {
                 return Ok(None);
             }
-            poll_fn(|cx| poll_turn(self.session, host, cx)).await?;
+            poll_fn(|cx| self.session.turn(host, cx)).await?;
         }
     }
 }

@@ -1,6 +1,7 @@
 use super::*;
-use crate::test_support::{flush_all, framed, io_kind, pass, recv_frames, transport_pair, Peer};
+use crate::test_support::{flush_all, io_kind, pass, recv_frames, transport_pair, Peer};
 use gnitz_foundation::posix_io::set_sockopt_int;
+use gnitz_wire::framed;
 use std::io::{ErrorKind, Read};
 use std::time::Duration;
 
@@ -40,7 +41,7 @@ fn queue_survives_chunked_and_partial_writes() {
     // Far more slices than one chunk, through a 4 KiB send buffer: every
     // writev is clamped or cut short mid-frame, and the cursor resumes each time.
     let (mut t, peer) = transport_pair();
-    set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096).unwrap();
+    set_sockopt_int(t.as_fd().as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096).unwrap();
     let n = 3000usize;
     let expected: Vec<Vec<u8>> = (0..n).map(|i| format!("f{i}").repeat(i % 7 + 1).into_bytes()).collect();
     for f in &expected {

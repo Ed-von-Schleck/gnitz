@@ -3,13 +3,14 @@
 //! records, and commit it atomically.
 
 use super::options::decode_view_options;
+use super::view_def::{RelationRef, ViewDefinition};
 use crate::catalog::Catalog;
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::{BoundRef, LoweredView, ViewBody};
 use crate::names::extract_object_name;
 use crate::rules::{require_class, ClassWant};
 use crate::source::StatementText;
-use gnitz_core::{RelName, RelationRef, ViewBundle, ViewDefinition};
+use gnitz_core::{RelName, ViewBundle};
 use gnitz_wire::{ViewBudget, ViewProps};
 use sqlparser::ast::{CreateView, Ident, ObjectName, Query};
 use sqlparser::tokenizer::Location;
@@ -145,7 +146,7 @@ fn plan_segments<'a>(
         replacing,
         segments,
         view,
-        definition,
+        definition: definition.encode(),
     })
 }
 

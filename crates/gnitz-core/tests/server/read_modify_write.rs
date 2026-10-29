@@ -4,7 +4,7 @@
 
 use super::*;
 use gnitz_core::{PkColumn, RelDescriptor, RMW_MAX_ATTEMPTS};
-use gnitz_wire::{WireFault, WireStatus};
+use gnitz_wire::{write_u64_le, WireStatus};
 
 struct Fixture {
     _srv: ServerHandle,
@@ -48,7 +48,7 @@ fn run_increment(
             attempts += 1;
             for r in 0..rows.len() {
                 let v = read_i64_le(&rows.payload[0].bytes, r * 8);
-                rows.set_u64_cell(r, 0, (v + 1) as u64);
+                write_u64_le(&mut rows.payload[0].bytes, r * 8, (v + 1) as u64);
             }
             Ok::<_, ClientError>(rows)
         }),
@@ -73,13 +73,7 @@ fn sustained_contention_surfaces_a_conflict_naming_the_table() {
     let mut f = boot();
     let (result, attempts) = run_increment(&mut f, |b, t, i| commit(b, t, 2, i as i64));
     let err = result.expect_err("every attempt conflicts");
-    assert!(
-        matches!(
-            &err,
-            ClientError::Refused(WireFault { status: WireStatus::TxnConflict, .. })
-        ),
-        "{err:?}"
-    );
+    assert_eq!(err.status(), Some(WireStatus::TxnConflict), "{err:?}");
     assert!(err.to_string().contains(&format!("'{}.t'", f.schema_name)), "{err}");
     assert_eq!(attempts, RMW_MAX_ATTEMPTS);
     assert_eq!(row_1(&mut f.a, &f.target), [(0, 1)]);

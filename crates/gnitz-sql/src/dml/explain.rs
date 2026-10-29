@@ -52,7 +52,9 @@ pub(crate) fn explained_query(stmt: &Statement) -> Result<&Query, GnitzSqlError>
 /// Describe `plan` without running it: the EXPLAIN reply. A read of a relation
 /// `client` mirrors is described as the local read it is served as.
 pub(crate) fn execute_explain(client: &GnitzClient, plan: &ReadPlan) -> SqlResult {
-    let local = plan.spec_read().is_some_and(|read| client.mirrors(read.desc.tid));
+    let local = plan
+        .spec_read()
+        .is_some_and(|read| client.cursor_of(read.desc.tid).is_some());
     plan_rows(&explain_lines(plan, local))
 }
 

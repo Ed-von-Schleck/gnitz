@@ -8,7 +8,7 @@ use crate::error::{missing_relation, reject_if, unsupported_clause, GnitzSqlErro
 use crate::names::extract_object_name;
 use crate::rules::{canonical_user_name, find_unique_column, require_class, require_column, ClassWant};
 use crate::types::column_def;
-use gnitz_core::{GnitzClient, RelName};
+use gnitz_core::{ColumnChange, GnitzClient, RelName};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, IndexColumn, RenameTableNameKind,
     TableConstraint,
@@ -20,20 +20,16 @@ enum Action<'a> {
     RenameRelation {
         new_name: String,
     },
-    RenameColumn {
-        old: &'a str,
-        new: &'a str,
+    /// A change to one existing column's catalog row. `if_exists` is set only
+    /// by `DROP COLUMN IF EXISTS`.
+    AlterColumn {
+        name: &'a str,
+        change: ColumnChange<'a>,
+        if_exists: bool,
     },
     AddColumn {
         def: gnitz_wire::ColumnDef,
         if_not_exists: bool,
-    },
-    DropColumn {
-        name: &'a str,
-        if_exists: bool,
-    },
-    DropNotNull {
-        name: &'a str,
     },
     AddUnique {
         columns: &'a [IndexColumn],
@@ -107,16 +103,14 @@ pub(crate) async fn execute_alter_table(
     let cols = rel.schema.columns();
     match action {
         Action::RenameRelation { new_name } => client.alter_rename_relation(&rel, &new_name).await?,
-        Action::RenameColumn { old, new } => {
-            client
-                .alter_rename_column(rel.tid, require_column(cols, old)?, new)
-                .await?
-        }
         Action::AddColumn { def, if_not_exists: true } if find_unique_column(cols, &def.name)?.is_some() => {}
         Action::AddColumn { def, .. } => client.alter_add_column(&rel, &def).await?,
-        Action::DropColumn { name, if_exists: true } if find_unique_column(cols, name)?.is_none() => {}
-        Action::DropColumn { name, .. } => client.alter_drop_column(rel.tid, require_column(cols, name)?).await?,
-        Action::DropNotNull { name } => client.alter_drop_not_null(rel.tid, require_column(cols, name)?).await?,
+        Action::AlterColumn { name, if_exists: true, .. } if find_unique_column(cols, name)?.is_none() => {}
+        Action::AlterColumn { name, change, .. } => {
+            client
+                .alter_column(rel.tid, require_column(cols, name)?, change)
+                .await?
+        }
         Action::AddUnique { columns, explicit_name } => {
             return super::table::create_index_core(
                 client,
@@ -158,9 +152,10 @@ fn parse<'a>(
         }
         AlterTableOperation::RenameColumn { old_column_name, new_column_name } => Ok((
             "ALTER TABLE RENAME COLUMN",
-            Action::RenameColumn {
-                old: &old_column_name.value,
-                new: &new_column_name.value,
+            Action::AlterColumn {
+                name: &old_column_name.value,
+                change: ColumnChange::Rename(&new_column_name.value),
+                if_exists: false,
             },
         )),
         AlterTableOperation::AddColumn {
@@ -197,7 +192,14 @@ fn parse<'a>(
                     column_names.len()
                 )));
             };
-            Ok((CTX, Action::DropColumn { name: &col.value, if_exists: *if_exists }))
+            Ok((
+                CTX,
+                Action::AlterColumn {
+                    name: &col.value,
+                    change: ColumnChange::Drop,
+                    if_exists: *if_exists,
+                },
+            ))
         }
         AlterTableOperation::AlterColumn { column_name, op } => {
             use AlterColumnOperation as Op;
@@ -205,7 +207,11 @@ fn parse<'a>(
                 Op::DropNotNull => {
                     return Ok((
                         "ALTER TABLE ALTER COLUMN DROP NOT NULL",
-                        Action::DropNotNull { name: &column_name.value },
+                        Action::AlterColumn {
+                            name: &column_name.value,
+                            change: ColumnChange::DropNotNull,
+                            if_exists: false,
+                        },
                     ))
                 }
                 Op::SetNotNull => "ALTER COLUMN SET NOT NULL is not supported (needs a full-table validation scan)",

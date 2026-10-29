@@ -5,18 +5,18 @@ fn a_name_is_its_folded_parts() {
     let t = RelName::new("S", "T").unwrap();
     assert_eq!((t.schema(), t.name(), t.key()), ("s", "t", "s.t"));
     assert_eq!((t.to_string().as_str(), t.spelled_name()), ("S.T", "T"));
-    assert_eq!(RelName::parse("other", "s.T").unwrap(), t);
-    assert_eq!(RelName::parse("S", "t").unwrap(), t);
+    assert_eq!(RelName::new("s", "T").unwrap(), t);
+    assert_eq!(RelName::unqualified("S", "t").unwrap(), t);
     assert_eq!(t.sibling("U").unwrap(), RelName::new("s", "u").unwrap());
     assert_ne!(RelName::new("other", "t").unwrap(), t);
 }
 
 #[test]
 fn a_name_prints_as_it_was_written() {
-    let written = RelName::parse("other", "S.T").unwrap();
+    let written = RelName::new("S", "T").unwrap();
     assert!(written.is_qualified());
     assert_eq!(written.to_string(), "S.T");
-    let alone = RelName::parse("S", "T").unwrap();
+    let alone = RelName::unqualified("S", "T").unwrap();
     assert!(!alone.is_qualified());
     assert_eq!(alone.to_string(), "T");
     assert_eq!(alone, written);
@@ -39,8 +39,8 @@ fn each_part_is_a_users_identifier() {
     ] {
         assert!(RelName::new(schema, name).is_err(), "{schema:?} {name:?}");
     }
-    for text in ["a.b.c", ".t", "s.", ""] {
-        assert!(RelName::parse("s", text).is_err(), "{text:?}");
+    for name in ["", "a.b", "_x"] {
+        assert!(RelName::unqualified("s", name).is_err(), "{name:?}");
     }
 }
 
@@ -48,7 +48,7 @@ fn each_part_is_a_users_identifier() {
 fn the_system_schema_is_spelled_in_any_case() {
     let t = RelName::new("_system", "tables").unwrap();
     assert_eq!((t.schema(), t.name(), t.key()), ("_system", "tables", "_system.tables"));
-    let shouted = RelName::parse("public", "_SYSTEM.Tables").unwrap();
+    let shouted = RelName::new("_SYSTEM", "Tables").unwrap();
     assert_eq!(shouted, t);
     assert_eq!(shouted.to_string(), "_SYSTEM.Tables");
 }

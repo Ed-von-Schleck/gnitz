@@ -1,21 +1,26 @@
-//! Shared `#[cfg(test)]` scaffolding: the socketpair loopback, the framing
-//! helpers a scripted peer is written with, the reply frames it sends, and the
-//! batch fixtures and their WAL-block codecs. It sits at the crate root because
+//! Shared `#[cfg(test)]` scaffolding: the socketpair and TLS loopbacks and the
+//! sessions and clients over them, the framing helpers a scripted peer is
+//! written with, the frames it sends and decodes, and the batch fixtures and
+//! their WAL-block codecs. It sits at the crate root because
 //! the tests, benchmarks and fuzz targets that read it are spread over several
 //! directories — a `tests` module is private to its parent, so none of them can
 //! host the rest.
 
 use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
-use gnitz_wire::{ColumnDef, ControlHeader, TypeCode, WireFlags, WireLane, WireStatus};
+use gnitz_foundation::posix_io::set_sockopt_int;
+use gnitz_wire::{framed, peek_control_block, ColumnDef, ControlHeader, TypeCode, WireFlags, WireLane, WireStatus};
 
-use crate::protocol::transport::{poll_fd, ClientTransport};
-use crate::ProtocolError;
-use crate::{BatchAppender, Interest, RelName, Schema, Session, ZSetBatch};
+use crate::{
+    poll_fd, BatchAppender, BlockingHost, ClientTransport, GnitzClient, Interest, ProtocolError, RelName, Schema,
+    Session, ZSetBatch,
+};
 
 /// `schema.name`.
 pub(crate) fn rel(schema: &str, name: &str) -> RelName {
@@ -96,6 +101,85 @@ pub(crate) fn transport_pair() -> (ClientTransport, Peer) {
     (ClientTransport::unix(a).unwrap(), Peer(b))
 }
 
+/// A rustls server on a loopback thread with a freshly minted `127.0.0.1` cert,
+/// reached through the public `tls://…?ca=` target.
+pub(crate) struct Loopback<T> {
+    pub(crate) target: String,
+    thread: std::thread::JoinHandle<T>,
+    /// Holds the minted cert's PEM for as long as the target names it.
+    _ca_dir: tempfile::TempDir,
+}
+
+/// The far end of a TLS connection: a blocking rustls stream.
+pub(crate) type ServerEnd = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
+
+/// Complete the server side of the TLS handshake. `StreamOwned` handshakes
+/// lazily on first I/O, which a peer that only waits never does.
+pub(crate) fn handshake(sock: TcpStream, cfg: Arc<rustls::ServerConfig>) -> ServerEnd {
+    let mut end = rustls::StreamOwned::new(rustls::ServerConnection::new(cfg).unwrap(), sock);
+    while end.conn.is_handshaking() {
+        end.conn.complete_io(&mut end.sock).unwrap();
+    }
+    end
+}
+
+/// Answer the client's HELLO, which carries no token.
+fn hello(mut end: ServerEnd) -> ServerEnd {
+    assert_eq!(read_frame(&mut end), gnitz_wire::HELLO);
+    write_frame(&mut end, &gnitz_wire::server_hello(gnitz_wire::AuthStatus::Accepted));
+    end
+}
+
+impl<T: Send + 'static> Loopback<T> {
+    /// `serve` gets the accepted socket (`TCP_NODELAY`, as the server sets it)
+    /// and the server config. `rcvbuf` pins the socket's `SO_RCVBUF`, set on the
+    /// listener so the window the handshake advertises honours it.
+    pub(crate) fn serve(
+        rcvbuf: Option<libc::c_int>,
+        serve: impl FnOnce(TcpStream, Arc<rustls::ServerConfig>) -> T + Send + 'static,
+    ) -> Self {
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let ca_dir = tempfile::tempdir().unwrap();
+        let pem = ca_dir.path().join("ca.pem");
+        std::fs::write(&pem, cert.cert.pem()).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+        let mut cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap();
+        cfg.alpn_protocols = vec![gnitz_wire::ALPN_GNITZ.to_vec()];
+        let cfg = Arc::new(cfg);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        if let Some(sz) = rcvbuf {
+            set_sockopt_int(listener.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, sz).unwrap();
+        }
+        let port = listener.local_addr().unwrap().port();
+        let thread = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_nodelay(true).unwrap();
+            serve(sock, cfg)
+        });
+        Loopback {
+            target: format!("tls://127.0.0.1:{port}?ca={}", pem.display()),
+            thread,
+            _ca_dir: ca_dir,
+        }
+    }
+
+    /// What `serve` returned.
+    pub(crate) fn join(self) -> T {
+        self.thread.join().unwrap()
+    }
+}
+
+/// A TLS transport over [`Loopback`] and its far end, the HELLOs exchanged.
+/// `rcvbuf` as [`Loopback::serve`] takes it.
+pub(crate) fn tls_pair(rcvbuf: Option<libc::c_int>) -> (ClientTransport, ServerEnd) {
+    let lb = Loopback::serve(rcvbuf, |sock, cfg| hello(handshake(sock, cfg)));
+    let t = ClientTransport::connect(&lb.target, Instant::now() + gnitz_wire::CONNECT_TIMEOUT).unwrap();
+    (t, lb.join())
+}
+
 /// One reading pass: `read` until it returns false or fails. The frames it
 /// handed out, and how it ended.
 pub(crate) fn pass(t: &mut ClientTransport) -> (Vec<Vec<u8>>, Result<(), ProtocolError>) {
@@ -117,7 +201,7 @@ pub(crate) fn pass(t: &mut ClientTransport) -> (Vec<Vec<u8>>, Result<(), Protoco
 pub(crate) fn recv_frames(t: &mut ClientTransport, n: usize) -> Vec<Vec<u8>> {
     let mut frames = Vec::new();
     while frames.len() < n {
-        poll_fd(t.as_raw_fd(), libc::POLLIN, None).unwrap();
+        poll_fd(t.as_fd(), Interest::READ, None).unwrap();
         let (got, end) = pass(t);
         end.unwrap();
         frames.extend(got);
@@ -132,7 +216,7 @@ pub(crate) fn flush_all(t: &mut ClientTransport) {
         if !t.wants_write() {
             return;
         }
-        poll_fd(t.as_raw_fd(), libc::POLLOUT, None).unwrap();
+        poll_fd(t.as_fd(), Interest::WRITE, None).unwrap();
     }
 }
 
@@ -142,12 +226,16 @@ pub(crate) fn session_pair() -> (Session, Peer) {
     (Session::over(t), peer)
 }
 
+/// A blocking client over [`session_pair`], and the peer.
+pub(crate) fn client_pair() -> (GnitzClient, Peer) {
+    let (s, peer) = session_pair();
+    (GnitzClient::over(s, Box::new(BlockingHost::default())).unwrap(), peer)
+}
+
 /// Step `s` on what its socket reports ready, parked between steps, until it owes nothing.
 pub(crate) fn step_until_idle(s: &mut Session) {
     while !s.interest().is_empty() {
-        s.step(Interest::from_revents(
-            poll_fd(s.as_fd().as_raw_fd(), s.interest().poll_events(), None).unwrap(),
-        ));
+        s.step(poll_fd(s.as_fd(), s.interest(), None).unwrap());
     }
 }
 
@@ -158,7 +246,7 @@ pub(crate) fn reply_ctrl(tid: u64, lsn: u64) -> Vec<u8> {
         arg0: lsn,
         ..Default::default()
     };
-    crate::encode_frame(hdr, &[], None, None)
+    crate::connection::encode_frame(hdr, &[], None, None)
 }
 
 /// A reply frame carrying `batch` and `lsn` in `arg0`, and no schema block;
@@ -170,19 +258,30 @@ pub(crate) fn reply_rows(tid: u64, batch: &ZSetBatch, lsn: u64, cont: bool) -> V
         arg0: lsn,
         ..Default::default()
     };
-    crate::encode_frame(hdr, &[], None, Some(batch))
+    crate::connection::encode_frame(hdr, &[], None, Some(batch))
+}
+
+/// A frame of `view`'s delta train carrying `rows`, if any: a continuation, or
+/// with `end` the terminal at the cursor `(tag, tick)`.
+pub(crate) fn delta_frame(view: u64, rows: Option<&ZSetBatch>, end: Option<(u64, u64)>) -> Vec<u8> {
+    let (tag, tick) = end.unwrap_or_default();
+    let hdr = ControlHeader {
+        target_id: view,
+        flags: WireFlags {
+            continuation: end.is_none(),
+            ..Default::default()
+        },
+        arg0: tick,
+        arg1: tag,
+        ..Default::default()
+    };
+    crate::connection::encode_frame(hdr, &[], None, rows)
 }
 
 /// `view`'s terminal of a delta read or poll: control-only, carrying the cursor
 /// `(tag, tick)`.
 pub(crate) fn delta_terminal(view: u64, tag: u64, tick: u64) -> Vec<u8> {
-    let hdr = ControlHeader {
-        target_id: view,
-        arg0: tick,
-        arg1: tag,
-        ..Default::default()
-    };
-    crate::encode_frame(hdr, &[], None, None)
+    delta_frame(view, None, Some((tag, tick)))
 }
 
 /// The frame that opens a pushed train of subscription `sub` to `view`.
@@ -196,7 +295,42 @@ pub(crate) fn pushed_marker(view: u64, sub: u64) -> Vec<u8> {
         },
         ..Default::default()
     };
-    crate::encode_frame(hdr, &[], None, None)
+    crate::connection::encode_frame(hdr, &[], None, None)
+}
+
+/// One pushed train of subscription `sub` to `view`, framed: its opening frame,
+/// `rows` unless there are none, and the terminal at the cursor `end` — or, with
+/// `end` an error, a fault carrying that text.
+pub(crate) fn pushed_train(view: u64, sub: u64, rows: &ZSetBatch, end: Result<(u64, u64), &str>) -> Vec<u8> {
+    let mut out = framed(&pushed_marker(view, sub));
+    let end = match end {
+        Ok(cursor) => cursor,
+        Err(text) => {
+            out.extend(framed(&reply_status(view, WireStatus::Error, text)));
+            return out;
+        }
+    };
+    if !rows.is_empty() {
+        out.extend(framed(&delta_frame(view, Some(rows), None)));
+    }
+    out.extend(framed(&delta_frame(view, None, Some(end))));
+    out
+}
+
+/// The control header of `request`, which must be a SYNC_PUSHED.
+pub(crate) fn sync_header(request: &[u8]) -> ControlHeader {
+    let hdr = peek_control_block(request).expect("a control header").hdr;
+    assert_eq!(hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed);
+    hdr
+}
+
+/// The subscription ids `request`, a SYNC_PUSHED, names as held, ascending.
+pub(crate) fn sync_held(request: &[u8]) -> Vec<u64> {
+    let ctrl = peek_control_block(request).expect("a control header");
+    assert_eq!(ctrl.hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed);
+    let mut held = gnitz_wire::txn_frame::decode_held(&request[ctrl.blob]).expect("held ids");
+    held.sort_unstable();
+    held
 }
 
 /// The frame that answers the oldest sync: with `refusal`, a fault refusing it.
@@ -209,7 +343,7 @@ pub(crate) fn sync_answer(refusal: Option<&str>) -> Vec<u8> {
         },
         ..Default::default()
     };
-    crate::encode_frame(hdr, refusal.unwrap_or_default().as_bytes(), None, None)
+    crate::connection::encode_frame(hdr, refusal.unwrap_or_default().as_bytes(), None, None)
 }
 
 /// A fault frame naming `tid`, with `text` as its body.
@@ -219,7 +353,7 @@ pub(crate) fn reply_status(tid: u64, status: WireStatus, text: &str) -> Vec<u8> 
         status,
         ..Default::default()
     };
-    crate::encode_frame(hdr, text.as_bytes(), None, None)
+    crate::connection::encode_frame(hdr, text.as_bytes(), None, None)
 }
 
 /// Deliver `SIGUSR1` to the calling thread until `stop` is set, with a no-op
@@ -246,8 +380,6 @@ pub(crate) fn interrupt_self_until(stop: Arc<AtomicBool>) -> std::thread::JoinHa
         }
     })
 }
-
-pub(crate) use gnitz_wire::framed;
 
 /// The I/O error kind `r` failed with, if it failed with one.
 pub(crate) fn io_kind<T>(r: &Result<T, ProtocolError>) -> Option<std::io::ErrorKind> {
@@ -282,6 +414,6 @@ pub(crate) fn encode_wal_block(batch: &ZSetBatch) -> Vec<u8> {
 /// A WAL block decoded under `schema` into a fresh batch.
 pub(crate) fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<ZSetBatch, ProtocolError> {
     let mut sink = ZSetBatch::new(schema);
-    crate::protocol::wal_block::decode_wal_block_into(&mut sink, data, schema)?;
+    crate::batch::decode_wal_block_into(&mut sink, data, schema)?;
     Ok(sink)
 }

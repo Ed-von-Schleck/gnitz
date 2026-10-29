@@ -90,7 +90,7 @@ pub(crate) fn client_err(e: ClientError) -> PyErr {
             Some(py_err) => Python::attach(|py| py_err.clone_ref(py)),
             None => gnitz_err(inner),
         },
-        ClientError::Mirror(MirrorError::Poisoned(_)) => GnitzMirrorPoisonedError::new_err(e.to_string()),
+        ClientError::Mirror(MirrorError::Poisoned) => GnitzMirrorPoisonedError::new_err(e.to_string()),
         e @ ClientError::Mirror(MirrorError::Engine(_)) => gnitz_err(e),
     }
 }

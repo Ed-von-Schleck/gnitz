@@ -3,8 +3,7 @@
 //! rejected before any request could be issued.
 
 use crate::dml::explain_lines;
-use gnitz_core::ClientError;
-use gnitz_wire::{RelClass, TypeCode, WireFault, WireStatus};
+use gnitz_wire::{RelClass, TypeCode, WireStatus};
 use sqlparser::ast::Statement;
 
 use super::*;
@@ -1193,13 +1192,7 @@ fn a_plan_resolves_only_the_relations_it_reads() {
 
     let e = read(&catalog(vec![]), "SELECT id FROM t").err();
     assert!(
-        matches!(
-            e,
-            Some(GnitzSqlError::Client(ClientError::Refused(WireFault {
-                status: WireStatus::NotFound,
-                ..
-            })))
-        ),
+        matches!(&e, Some(GnitzSqlError::Client(c)) if c.status() == Some(WireStatus::NotFound)),
         "got {e:?}"
     );
 

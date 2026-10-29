@@ -3,10 +3,10 @@
 //!
 //! The body is kept as text so a client can write the view again — `\d+`, a
 //! dump — and each relation it names is kept by id, so a rename of that
-//! relation or of its columns leaves the definition true. Writing the body back
-//! out puts the names the catalog holds then where the original ones stood; the
-//! SQL layer does that, since it owns quoting. The engine stores the encoding
-//! verbatim and reads none of it.
+//! relation or of its columns leaves the definition true. `render` writes the
+//! body back out with the names the catalog holds then where the original ones
+//! stood. The engine and the client core store the encoding verbatim and read
+//! none of it.
 
 use std::ops::Range;
 
@@ -21,38 +21,38 @@ const MAX_ENTRIES: usize = u16::MAX as usize - 1;
 
 /// A user view's body as written, and the relations it names.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ViewDefinition {
+pub(crate) struct ViewDefinition {
     /// The query after the statement's `AS`, verbatim.
-    pub query: String,
+    pub(crate) query: String,
     /// The names the body gives its visible output columns, before the
     /// statement's own column list renames them.
-    pub body_columns: Vec<String>,
+    pub(crate) body_columns: Vec<String>,
     /// Each place `query` names a catalog relation, ascending by position and
     /// disjoint.
-    pub refs: Vec<RelationRef>,
+    pub(crate) refs: Vec<RelationRef>,
 }
 
 /// One place a view body names a catalog relation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RelationRef {
+pub(crate) struct RelationRef {
     /// The relation named.
-    pub tid: u64,
+    pub(crate) tid: u64,
     /// The byte range of the relation's name in [`ViewDefinition::query`].
-    pub name: Range<u32>,
+    pub(crate) name: Range<u32>,
     /// The byte offset in the query just past the declared alias's name; `None`
     /// where the reference declares no alias.
-    pub alias_end: Option<u32>,
+    pub(crate) alias_end: Option<u32>,
     /// The name the body reads the relation by: the declared alias, else the
     /// relation's name as written.
-    pub alias: String,
+    pub(crate) alias: String,
     /// The relation's visible column names when the view was created, which the
     /// body reads it by; `None` where the reference renames them with a column
     /// alias list of its own.
-    pub columns: Option<Vec<String>>,
+    pub(crate) columns: Option<Vec<String>>,
 }
 
 impl ViewDefinition {
-    pub fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.u8(ENCODING_VERSION)
             .put(&self.query)
@@ -62,7 +62,7 @@ impl ViewDefinition {
     }
 
     /// The definition `bytes` encodes, held to [`Self::check`].
-    pub fn decode(bytes: &[u8]) -> Result<ViewDefinition, String> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<ViewDefinition, String> {
         decode_all(bytes, "view definition", |r| {
             let version = r.u8()?;
             if version != ENCODING_VERSION {
@@ -82,7 +82,7 @@ impl ViewDefinition {
 
     /// The rules [`Self::encode`]'s output keeps: every range lies on character
     /// boundaries of the query, in order and apart.
-    pub fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), String> {
         let mut floor = 0;
         for r in &self.refs {
             let ends_in_order = r.alias_end.is_none_or(|end| end >= r.name.end);

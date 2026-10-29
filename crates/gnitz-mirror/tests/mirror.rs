@@ -596,17 +596,20 @@ fn storage_fault_child() {
     let err =
         block_on(mirror.mirror_view(&rel("s", "v_keyed"))).expect_err("the armed seam must fail the bootstrap ingest");
     assert!(
-        !matches!(err, ClientError::Mirror(MirrorError::Poisoned(_))),
+        !matches!(err, ClientError::Mirror(MirrorError::Poisoned)),
         "an ingest fault damages one copy, so it must not poison the store: {err}",
     );
-    assert!(mirror.mirror_poisoned().is_none(), "the handle stays usable");
+    assert!(!mirror.mirror_poisoned(), "the handle stays usable");
 
     // The registration outlives the failed bootstrap; the copy behind it does
     // not, so the read is delegated rather than answered off an erased copy.
     let [tid] = mirror.mirrored_ids()[..] else {
         panic!("the failed ingest must leave exactly its own registration behind")
     };
-    assert!(!mirror.mirrors(tid), "an erased copy is not answered locally");
+    assert!(
+        mirror.cursor_of(tid).is_none(),
+        "an erased copy is not answered locally"
+    );
     differential(&mut mirror, &mut direct, "s", "SELECT * FROM v_keyed", Answer::Upstream);
 
     // The store is intact, so it still publishes.
@@ -1065,7 +1068,7 @@ fn a_held_poll_leaves_its_client_free() {
     fx.drain();
 
     let t0 = std::time::Instant::now();
-    let mut synced = fx.mirror().begin_sync(HELD).expect("the first half");
+    let mut synced = fx.mirror().begin_sync(HELD);
     block_on(fx.mirror().resolve_relation(&rel("s", "t"))).expect("a request beside the held poll");
     assert!(
         t0.elapsed() < RELEASED,
@@ -1083,7 +1086,7 @@ fn a_held_poll_leaves_its_client_free() {
 
     // A view forgotten between the halves is left out, and the rest go on.
     sql(&mut fx.direct, "s", "INSERT INTO t VALUES (4000, 1, 5, 0.5, 'between')");
-    let synced = fx.mirror().begin_sync(Duration::ZERO).expect("the first half");
+    let synced = fx.mirror().begin_sync(Duration::ZERO);
     block_on(fx.mirror().forget_view(repl)).expect("forget");
     let synced = block_on(fx.mirror().wait(synced));
     let report = block_on(fx.mirror().finish_sync(synced))
@@ -1410,7 +1413,10 @@ fn a_cursor_from_before_a_server_restart_reseeds() {
     fx.differential("s", "SELECT * FROM v_repl");
     // Spelled out rather than run through the differential: both sides are empty,
     // which it refuses as a pass that agrees about nothing.
-    assert!(fx.mirror().mirrors(stream), "the stream view's copy answers locally");
+    assert!(
+        fx.mirror().cursor_of(stream).is_some(),
+        "the stream view's copy answers locally"
+    );
     assert!(
         canonical(&fx.local("SELECT * FROM v_stream")).is_empty(),
         "a view over a stream comes back with zero rows, and the copy must follow it there",
@@ -1722,7 +1728,7 @@ fn two_schemas_share_one_handle() {
 
     block_on(fx.mirror().forget_view(lin)).expect("forget v_lin");
     assert!(
-        fx.mirror().mirrors(keyed),
+        fx.mirror().cursor_of(keyed).is_some(),
         "forgetting one view must not disturb another schema's copy"
     );
     fx.drain();
@@ -1760,7 +1766,7 @@ fn a_view_dropped_upstream_names_itself_and_stops_nothing_else() {
         .find(|o| o.view_id == repl_id)
         .expect("the dropped view is reported under its own id");
     assert!(
-        matches!(&dead.result, PollResult::Failed(ClientError::Refused(f)) if f.status == WireStatus::NotFound),
+        matches!(&dead.result, PollResult::Failed(e) if e.status() == Some(WireStatus::NotFound)),
         "the dropped view fails as not found: {:?}",
         dead.result,
     );
@@ -1837,7 +1843,7 @@ fn a_recreated_view_is_followed_to_its_new_id() {
             !fx.mirror().mirrored_ids().contains(&old),
             "round {round}: the stale id is retracted, not kept beside the new one",
         );
-        assert!(fx.mirror().mirrors(new));
+        assert!(fx.mirror().cursor_of(new).is_some());
         assert_eq!(
             fx.local("SELECT * FROM v_keyed").0.columns().len(),
             cols.len(),
@@ -1871,7 +1877,7 @@ fn a_reconnect_keeps_the_registrations_and_closes_the_read_gate() {
     assert_eq!(ids, [keyed, repl].into(), "the poll's work list survives a reconnect");
     for tid in [keyed, repl] {
         assert!(
-            !fx.mirror().mirrors(tid),
+            fx.mirror().cursor_of(tid).is_none(),
             "no copy is confirmed on this connection, so the gate is shut"
         );
     }
@@ -1883,7 +1889,7 @@ fn a_reconnect_keeps_the_registrations_and_closes_the_read_gate() {
     assert_eq!(report.len(), 2);
     // The server continues every cursor, so nothing is re-read.
     assert_advanced(&report);
-    assert!(fx.mirror().mirrors(keyed) && fx.mirror().mirrors(repl));
+    assert!(fx.mirror().cursor_of(keyed).is_some() && fx.mirror().cursor_of(repl).is_some());
     fx.differential("s", "SELECT * FROM v_keyed");
     fx.differential("s", "SELECT * FROM v_repl");
 }
@@ -1955,9 +1961,12 @@ fn a_ddl_that_retires_a_view_retires_its_copy() {
     for (schema, view, retire) in cases {
         let tid = fx.mirror_id(schema, view);
         fx.drain();
-        assert!(fx.mirror().mirrors(tid), "{view}: the copy answers before the DDL");
+        assert!(
+            fx.mirror().cursor_of(tid).is_some(),
+            "{view}: the copy answers before the DDL"
+        );
         retire(fx.mirror());
-        assert!(!fx.mirror().mirrors(tid), "{view}: the copy stops answering");
+        assert!(fx.mirror().cursor_of(tid).is_none(), "{view}: the copy stops answering");
         assert!(
             !fx.mirror().mirrored_ids().contains(&tid),
             "{view}: and the registration goes with it",
@@ -2124,7 +2133,7 @@ fn a_view_renamed_by_another_client_fails_until_its_new_name_is_mirrored() {
                 &report[..],
                 [o] if o.view_id == tid
                     && o.cursor == Some(before)
-                    && matches!(&o.result, PollResult::Failed(ClientError::Refused(f)) if f.status == WireStatus::NotFound)
+                    && matches!(&o.result, PollResult::Failed(e) if e.status() == Some(WireStatus::NotFound))
             ),
             "the old name resolves to nothing: {report:?}",
         );
@@ -2152,10 +2161,10 @@ fn a_view_renamed_by_another_client_fails_until_its_new_name_is_mirrored() {
     let fresh = fx.mirror_id("s", "v_keyed");
     assert_ne!(fresh, tid);
     assert!(
-        fx.mirror().mirrors(tid),
+        fx.mirror().cursor_of(tid).is_some(),
         "the renamed view's copy survives a new view under its old name",
     );
-    assert!(fx.mirror().mirrors(fresh));
+    assert!(fx.mirror().cursor_of(fresh).is_some());
     fx.drain();
     fx.differential("s", "SELECT * FROM v_moved");
     fx.differential("s", "SELECT * FROM v_keyed");
@@ -2289,7 +2298,10 @@ fn poisoned_read_child() {
     let tid = block_on(mirror.mirror_view(&rel("s", "v_keyed")))
         .expect("the bootstrap succeeds")
         .view_id;
-    assert!(mirror.mirrors(tid), "the copy is valid before the poll that panics");
+    assert!(
+        mirror.cursor_of(tid).is_some(),
+        "the copy is valid before the poll that panics"
+    );
 
     churn(&mut direct, 41, 80);
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2297,37 +2309,47 @@ fn poisoned_read_child() {
     }));
     assert!(unwound.is_err(), "the armed seam must panic under the store's lock");
     assert!(
-        mirror.mirror_poisoned().is_some(),
+        mirror.mirror_poisoned(),
         "the unwind through the store's lock poisons it",
     );
 
     // The copy is still gated in — cursor and registration both stand — so this
     // is a read the store would otherwise have answered.
-    assert!(mirror.mirrors(tid));
+    assert!(mirror.cursor_of(tid).is_some());
     let err = block_on(gnitz_sql::execute(&mut mirror, "s", "SELECT * FROM v_keyed"))
         .expect_err("a poisoned copy must refuse the read it would answer");
     assert!(
-        matches!(
-            err,
-            GnitzSqlError::Client(ClientError::Mirror(MirrorError::Poisoned(_)))
-        ),
+        matches!(err, GnitzSqlError::Client(ClientError::Mirror(MirrorError::Poisoned))),
         "{err}"
     );
 
-    // Neither call-level verb spends a round trip finding out.
-    let (refused, sent) = cost(&mut mirror, |m| {
-        [
-            block_on(m.sync(Duration::ZERO)).map(|s| s.mirrored).err(),
-            block_on(m.mirror_view(&rel("s", "v_repl"))).err(),
-        ]
-    });
+    // Mirroring another view is refused before a round trip finds out.
+    let (refused, sent) = cost(&mut mirror, |m| block_on(m.mirror_view(&rel("s", "v_repl"))).err());
     assert!(
-        refused
-            .iter()
-            .all(|e| matches!(e, Some(ClientError::Mirror(MirrorError::Poisoned(_))))),
+        matches!(refused, Some(ClientError::Mirror(MirrorError::Poisoned))),
         "{refused:?}"
     );
     assert_eq!(sent, 0);
+
+    // A sync goes on for the connection and reports each copy failed, without
+    // touching the store. The first names none of the copies' subscriptions,
+    // which ends them; with no reader subscribed, the next is no request.
+    for (round, owed) in [(1, 1), (2, 0)] {
+        let (report, sent) = cost(&mut mirror, |m| block_on(m.sync(Duration::ZERO)));
+        let report = report.expect("a sync is not the store's").mirrored;
+        assert_eq!(sent, owed, "sync {round}");
+        assert!(!report.is_empty(), "sync {round}");
+        for out in &report {
+            assert!(
+                matches!(
+                    out.result,
+                    PollResult::Failed(ClientError::Mirror(MirrorError::Poisoned))
+                ),
+                "sync {round}: {report:?}"
+            );
+            assert_eq!(out.cursor, None, "sync {round}: {report:?}");
+        }
+    }
 
     // A relation the copy does not hold is unaffected: poison must not take
     // every read on the connection down with it.
@@ -2338,7 +2360,10 @@ fn poisoned_read_child() {
     // answering, and everything past it is reclamation.
     block_on(gnitz_sql::execute(&mut mirror, "s", "DROP VIEW v_keyed"))
         .expect("a poisoned store must not fail a DDL that already committed");
-    assert!(!mirror.mirrors(tid), "and the copy stops answering all the same");
+    assert!(
+        mirror.cursor_of(tid).is_none(),
+        "and the copy stops answering all the same"
+    );
 
     // `close_mirror` publishes no checkpoint, releases the directory, and leaves
     // the connection usable — the only recovery a poisoned copy has.
@@ -2347,7 +2372,7 @@ fn poisoned_read_child() {
         !has_manifest(&dir, tid),
         "a poisoned store must publish nothing on the way out",
     );
-    assert!(mirror.mirror_poisoned().is_none(), "the poison went with the store");
+    assert!(!mirror.mirror_poisoned(), "the poison went with the store");
     block_on(mirror.attach_mirror(opener(&dir, MirrorConfig::default())))
         .expect("a later attach on the same connection is legal");
     let recovered = block_on(mirror.mirror_view(&rel("s", "v_repl"))).expect("and it bootstraps again");
@@ -2923,7 +2948,7 @@ mod cut_short {
             inner: BlockingHost::default(),
             s: s.clone(),
         };
-        let mut client = block_on(GnitzClient::connect_with(target, Box::new(host))).unwrap();
+        let mut client = GnitzClient::connect_on(target, Box::new(host)).unwrap();
         block_on(client.attach_mirror(opener(dir, MirrorConfig::default()))).unwrap();
         (client, s)
     }

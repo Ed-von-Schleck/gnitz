@@ -49,7 +49,7 @@ def blocking(client: gnitz.GnitzClient) -> None:
     assert_type(client.mirror_view("v"), PollResult)
     assert_type(client.sync().mirrored, list[PollResult])
     assert_type(client.cursor(tid), tuple[int, int] | None)
-    assert_type(client.mirror_poisoned, str | None)
+    assert_type(client.mirror_poisoned, bool)
     assert_type(client.requests_sent, int)
     client.frobnicate()  # type: ignore[attr-defined]
 

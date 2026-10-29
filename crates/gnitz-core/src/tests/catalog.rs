@@ -204,3 +204,37 @@ fn a_column_gap_fails_the_read() {
         "{err}"
     );
 }
+
+/// Only a row of positive weight states a relation or an index: a retraction
+/// or a zero-weight row in the cut names neither.
+#[test]
+fn a_row_of_no_positive_weight_is_no_relation() {
+    let table = |table_id: u64, name: &'static str| TableTabRow {
+        table_id,
+        schema_id: 16,
+        name: name.into(),
+        pk_col_idx: PkColList::from_slice(&[0]),
+        flags: TableProps::default().pack(),
+    };
+    let mut rows = Rows::new();
+    rows.schema(16, "app")
+        .table(17, 16, "t", TableProps::default())
+        .columns(17, &[("id", None), ("v", None)])
+        .put(&table(18, "retracted"), -1)
+        .put(&table(19, "ghost"), 0);
+    for (index_id, weight) in [(20, -1), (21, 0)] {
+        let index = IdxTabRow {
+            index_id,
+            owner_id: 17,
+            source_col_idx: PkColList::from_slice(&[1]),
+            name: format!("t_v_{index_id}").into(),
+            is_unique: false,
+        };
+        rows.put(&index, weight);
+    }
+    let catalog = rows.decode();
+
+    assert_eq!(names(catalog.relations.iter()), ["app.t"]);
+    assert!(catalog.relation(18).is_none() && catalog.relation(19).is_none());
+    assert!(catalog.get(&rel("app", "t")).unwrap().indexes.is_empty());
+}

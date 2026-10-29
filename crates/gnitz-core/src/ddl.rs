@@ -1,0 +1,702 @@
+//! Catalog DDL as a client writes it: every create, drop and alter is one
+//! bundle of system-family rows, committed as one DDL zone.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use gnitz_wire::{
+    payload_bytes, payload_u64, Circuit, CircuitRow, ColTabRow, ColTabSlot, ColumnDef, FkAction, FkRef, IdxTabRow,
+    IdxTabSlot, KeyRange, PkColList, ReadBound, ReadSpec, SchemaTabRow, SchemaTabSlot, SysRow, TableProps, TableTabRow,
+    ViewProps, ViewTabRow, CIRCUIT_TAB, COL_TAB, IDX_TAB, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB, TABLE_TAB,
+    VIEW_TAB,
+};
+
+use crate::catalog::{idx_rows, Catalog, IndexRow, CATALOG_FAMILIES};
+use crate::client::GnitzClient;
+use crate::connection::{RelDescriptor, Request, Target};
+use crate::error::{absent, not_found, ClientError};
+use crate::{sys_schema, BatchAppender, PkColumn, ProtocolError, RelName, Schema, ZSetBatch};
+
+/// The index in `schemas`, SCHEMA_TAB's rows, of the live row named
+/// `schema_name` (already canonical).
+fn schema_row(schemas: &ZSetBatch, schema_name: &str) -> Option<usize> {
+    schemas
+        .live_rows()
+        .find(|&i| payload_bytes(schemas, i, SchemaTabSlot::name as usize) == schema_name.as_bytes())
+}
+
+/// One inline `UNIQUE` constraint of a `CREATE TABLE`. `name` is the catalog
+/// index name `DROP INDEX` matches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineUniqueIndex {
+    pub cols: PkColList,
+    pub name: String,
+}
+
+/// A `CREATE TABLE`: the table, its FOREIGN KEY columns and its inline UNIQUE
+/// indexes, which [`GnitzClient::create_table`] writes as one DDL bundle.
+pub struct TableDef {
+    pub name: RelName,
+    pub schema: Schema,
+    /// `fks[i]` is column `i`'s target; an empty `fks` gives no column one.
+    pub fks: Vec<Option<FkTarget>>,
+    pub props: TableProps,
+    /// Each inline UNIQUE constraint's columns and the catalog name its index
+    /// takes.
+    pub unique_indexes: Vec<InlineUniqueIndex>,
+}
+
+impl TableDef {
+    /// `name` over `schema`, with no foreign key, unique index or option.
+    pub fn new(name: RelName, schema: Schema) -> Self {
+        TableDef {
+            name,
+            schema,
+            fks: Vec::new(),
+            props: TableProps::default(),
+            unique_indexes: Vec::new(),
+        }
+    }
+}
+
+/// The column a FOREIGN KEY column references. `SelfTable` names the table
+/// being created, which has no id yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FkTarget {
+    Table(FkRef),
+    SelfTable { col: u32, on_delete: FkAction },
+}
+
+/// What [`GnitzClient::alter_column`] changes about one column: one cell of
+/// its COL_TAB row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnChange<'a> {
+    /// `ALTER TABLE … RENAME COLUMN … TO`.
+    Rename(&'a str),
+    /// `ALTER TABLE … DROP COLUMN`: the column stays physically present, so
+    /// the table keeps its layout and comparator.
+    Drop,
+    /// `ALTER TABLE … ALTER COLUMN … DROP NOT NULL`: once the catalog reports
+    /// the column nullable, `ZSetBatch::validate` permits a null bit there.
+    DropNotNull,
+}
+
+/// The rows of one DDL transaction: one batch per system family it writes.
+#[derive(Default)]
+struct DdlBundle(Vec<(u64, ZSetBatch)>);
+
+impl DdlBundle {
+    /// `family`'s batch, opened on first use — so a family nothing wrote to has
+    /// no entry, and no family has two.
+    fn batch(&mut self, family: u64) -> &mut ZSetBatch {
+        let at = match self.0.iter().position(|(f, _)| *f == family) {
+            Some(at) => at,
+            None => {
+                self.0.push((family, ZSetBatch::new(sys_schema(family))));
+                self.0.len() - 1
+            }
+        };
+        &mut self.0[at].1
+    }
+
+    /// `scanned`'s row `i`, a stored `family` row, at `-1`.
+    fn retract(&mut self, family: u64, scanned: &ZSetBatch, i: usize) {
+        self.batch(family).copy_row_at(scanned, i, -1);
+    }
+
+    /// `row` at `weight`, in its own family's batch.
+    fn put<R: SysRow>(&mut self, row: &R, weight: i64) {
+        row.write(&mut BatchAppender::new(self.batch(R::FAMILY)), weight);
+    }
+
+    /// The relations whose descriptor the bundle changes: every row names its
+    /// relation in its leading key column, an index row in `owner_id`.
+    fn relations_written(&self) -> HashSet<u64> {
+        let mut ids = HashSet::new();
+        for (family, rows) in &self.0 {
+            for i in 0..rows.len() {
+                ids.insert(match *family {
+                    IDX_TAB => payload_u64(rows, i, IdxTabSlot::owner_id as usize),
+                    _ => gnitz_wire::sys_leading_id(rows.pks.get_bytes(i)),
+                });
+            }
+        }
+        ids
+    }
+
+    /// Whether `other` holds the same live rows, family for family.
+    fn same_rows(&self, other: &DdlBundle) -> bool {
+        // A German cell's offset is relative to the arena of the batch it sits
+        // in, so each side is copied onto an arena laid out in key order.
+        fn in_key_order(family: u64, rows: &ZSetBatch) -> ZSetBatch {
+            let mut live: Vec<usize> = rows.live_rows().collect();
+            live.sort_unstable_by_key(|&i| rows.pks.get_bytes(i));
+            let mut out = ZSetBatch::new(sys_schema(family));
+            for i in live {
+                out.copy_row_at(rows, i, rows.weights[i]);
+            }
+            out
+        }
+        self.0.len() == other.0.len()
+            && self.0.iter().all(|(family, rows)| {
+                other
+                    .0
+                    .iter()
+                    .any(|(f, theirs)| f == family && in_key_order(*family, rows) == in_key_order(*family, theirs))
+            })
+    }
+}
+
+/// The symbolic id by which a [`ViewBundle`] circuit's `ScanDelta` names
+/// `segments[j]`. No durable relation id reaches
+/// [`gnitz_wire::CATALOG_ID_CEILING`], so it is no relation's own.
+pub fn segment_id(j: u64) -> u64 {
+    gnitz_wire::CATALOG_ID_CEILING + j
+}
+
+/// One view in a [`ViewBundle`].
+pub struct PlannedView {
+    pub circuit: Circuit,
+    pub schema: Arc<Schema>,
+    /// [`ViewTabRow::pk_repeats`], stated by the emitter that minted the key.
+    pub pk_repeats: bool,
+}
+
+/// A [`GnitzClient::create_view_chain`] bundle: the user-named view and the
+/// hidden segments it owns, in dependency order. [`segment_id`]`(j)` names
+/// `segments[j]`.
+pub struct ViewBundle {
+    /// The user-named view's name and options.
+    pub name: RelName,
+    pub props: ViewProps,
+    /// The id of the view the chain supersedes in the same zone.
+    pub replacing: Option<u64>,
+    pub segments: Vec<PlannedView>,
+    pub view: PlannedView,
+    /// The encoded record of the user-named view's body that its row stores,
+    /// verbatim: opaque to this crate and to the engine.
+    pub definition: Vec<u8>,
+}
+
+impl ViewBundle {
+    /// The chain's catalog rows at `+1`, its first member standing at `base`:
+    /// each segment named `_seg{vid}` and owned by the user-named view,
+    /// which stands last under its own name and props, recording `definition`.
+    fn put_rows(&self, b: &mut DdlBundle, definition: &[u8], schema_id: u64, base: u64) {
+        let owner_vid = base + self.segments.len() as u64;
+        for (pv, vid) in self.segments.iter().chain([&self.view]).zip(base..) {
+            let mut circuit = pv.circuit.clone();
+            // A `segment_id` past the chain's end becomes an id no lower than the
+            // user-named view's own, which the engine refuses.
+            for src in circuit.sources_mut() {
+                if let Some(j) = src.checked_sub(gnitz_wire::CATALOG_ID_CEILING) {
+                    *src = base + j;
+                }
+            }
+            // A segment's name is unique because vids are, and no SQL surface can
+            // spell it because gnitz_wire::validate_user_identifier rejects a leading
+            // `_`; the owner_view_id column records its ownership.
+            let (name, owner_view_id, props, definition) = if vid == owner_vid {
+                (self.name.name().to_string(), 0, self.props, definition)
+            } else {
+                (format!("_seg{vid}"), owner_vid, ViewProps::default(), &[][..])
+            };
+
+            // A foreign key constrains a base table, not a view.
+            append_col_rows(b, vid, pv.schema.columns(), &[]);
+            let circuit = circuit.encode();
+            b.put(
+                &CircuitRow {
+                    view_id: vid,
+                    circuit: circuit.as_slice().into(),
+                },
+                1,
+            );
+            let (capacity_bytes, delta_bytes) = props.budget.row_words();
+            // The VIEW_TAB register hook triggers server-side compilation.
+            b.put(
+                &ViewTabRow {
+                    view_id: vid,
+                    schema_id,
+                    name: name.as_str().into(),
+                    pk_col_idx: PkColList::from_slice(pv.schema.pk_cols()),
+                    capacity_bytes,
+                    delta_bytes,
+                    owner_view_id,
+                    pk_repeats: pv.pk_repeats,
+                    compress: props.compress,
+                    definition: definition.into(),
+                },
+                1,
+            );
+        }
+    }
+}
+
+impl GnitzClient {
+    // ── Indexes and the catalog ────────────────────────────────────────────
+
+    /// Index `cols` of relation `owner_id`, in that order, under the catalog name
+    /// `index_name`.
+    pub async fn create_index(
+        &mut self,
+        owner_id: u64,
+        cols: PkColList,
+        index_name: &str,
+        is_unique: bool,
+    ) -> Result<u64, ClientError> {
+        let index_name = gnitz_wire::canonical_identifier(index_name)?;
+        let index_id = self.alloc_ids(1).await?;
+        let mut b = DdlBundle::default();
+        b.put(
+            &IdxTabRow {
+                index_id,
+                owner_id,
+                source_col_idx: cols,
+                name: index_name.as_str().into(),
+                is_unique,
+            },
+            1,
+        );
+        self.commit_ddl(b).await?;
+        Ok(index_id)
+    }
+
+    /// Drop indexes by name as **one** DDL zone: the whole set retires or none of
+    /// it does, and a name repeated in `index_names` retires once.
+    pub async fn drop_indexes_by_name(&mut self, index_names: &[&str], if_exists: bool) -> Result<(), ClientError> {
+        self.drop_index_rows(index_names, "index", if_exists, |_| true).await
+    }
+
+    /// `ALTER TABLE … DROP CONSTRAINT`: the UNIQUE index `name` of table `tid`.
+    /// The `-1` is the stored row, so the engine's CAS re-proves owner and
+    /// uniqueness against the live row.
+    pub async fn drop_unique_constraint(&mut self, tid: u64, name: &str, if_exists: bool) -> Result<(), ClientError> {
+        self.drop_index_rows(&[name], "constraint", if_exists, |r| r.owner == tid && r.is_unique)
+            .await
+    }
+
+    /// Retract the live IDX_TAB rows named in `names` that pass `matches`.
+    async fn drop_index_rows(
+        &mut self,
+        names: &[&str],
+        noun: &'static str,
+        if_exists: bool,
+        matches: impl Fn(&IndexRow) -> bool,
+    ) -> Result<(), ClientError> {
+        let scanned = self.sys_rows(IDX_TAB, ReadBound::None).await?;
+        let rows = idx_rows(&scanned)?;
+        let mut b = DdlBundle::default();
+        let mut retracted = Vec::new();
+        for name in names {
+            let name = gnitz_wire::canonical_identifier(name)?;
+            match rows.iter().find(|(_, r)| r.name == name && matches(r)) {
+                Some(&(i, _)) if retracted.contains(&i) => {}
+                Some(&(i, _)) => {
+                    retracted.push(i);
+                    b.retract(IDX_TAB, &scanned, i);
+                }
+                None if if_exists => {}
+                None => return Err(not_found(noun, name)),
+            }
+        }
+        self.commit_ddl(b).await
+    }
+
+    /// Every live secondary index. Names come back canonical (lowercase): every
+    /// writer folds them at store time.
+    pub async fn index_rows(&mut self) -> Result<Vec<IndexRow>, ClientError> {
+        let scanned = self.sys_rows(IDX_TAB, ReadBound::None).await?;
+        Ok(idx_rows(&scanned)?.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// The whole catalog, read at one cut.
+    pub async fn catalog(&mut self) -> Result<Catalog, ClientError> {
+        let all = ReadSpec::all_rows(ReadBound::None);
+        let families = self.sys_cut(CATALOG_FAMILIES, &all).await?;
+        Ok(Catalog::decode(&families)?)
+    }
+
+    // ── Schemas and relations ──────────────────────────────────────────────
+
+    /// Commit `bundle` as one DDL zone; refused inside a transaction. One that
+    /// holds no row opens no zone.
+    async fn commit_ddl(&mut self, bundle: DdlBundle) -> Result<(), ClientError> {
+        if self.txn.is_some() {
+            return Err(ClientError::from("DDL is not allowed inside a transaction".to_string()));
+        }
+        if bundle.0.is_empty() {
+            return Ok(());
+        }
+        self.ack(Request::DdlTxn(&bundle.0)).await?;
+        let written = bundle.relations_written();
+        self.kept.retain(|_, rel| !written.contains(&rel.tid));
+        self.ddl_committed(&bundle.0).await;
+        Ok(())
+    }
+
+    /// `CREATE SCHEMA [IF NOT EXISTS]`. With `if_not_exists`, an existing
+    /// schema's id is returned, and the id fetched alongside the probe goes
+    /// unused: a gap in the id sequence and nothing more.
+    pub async fn create_schema(&mut self, name: &str, if_not_exists: bool) -> Result<u64, ClientError> {
+        // Refuses the empty string, a leading `_` (the reserved system prefix)
+        // and illegal characters.
+        let name = gnitz_wire::canonical_identifier(name)?;
+        let schema_id = if if_not_exists {
+            match self.schema_and_ids(&name, 1).await? {
+                (Some(standing), _) => return Ok(standing),
+                (None, fresh) => fresh,
+            }
+        } else {
+            self.alloc_ids(1).await?
+        };
+        let mut b = DdlBundle::default();
+        b.put(&SchemaTabRow { schema_id, name: name.as_str().into() }, 1);
+        self.commit_ddl(b).await?;
+        Ok(schema_id)
+    }
+
+    /// `DROP SCHEMA … CASCADE`: the schema and every table and view in it, as
+    /// one DDL bundle. A relation outside the schema that depends on one inside
+    /// fails the bundle, and nothing is dropped.
+    pub async fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
+        let name = gnitz_wire::canonical_identifier(name)?;
+        let all = ReadSpec::all_rows(ReadBound::None);
+        let [schemas, views, tables] = self.sys_cut([SCHEMA_TAB, VIEW_TAB, TABLE_TAB], &all).await?;
+        let at = schema_row(&schemas, &name).ok_or_else(|| not_found("schema", &name))?;
+        let schema_id = schemas.pks.get(at) as u64;
+
+        let mut b = DdlBundle::default();
+        for (family, scanned) in [(VIEW_TAB, views), (TABLE_TAB, tables)] {
+            for i in scanned.live_rows() {
+                if payload_u64(&scanned, i, RELTAB_PAY_SCHEMA_ID) == schema_id {
+                    b.retract(family, &scanned, i);
+                }
+            }
+        }
+        b.retract(SCHEMA_TAB, &schemas, at);
+        self.commit_ddl(b).await
+    }
+
+    /// Register `def` as one DDL bundle and return the table's id.
+    pub async fn create_table(&mut self, def: &TableDef) -> Result<u64, ClientError> {
+        let TableDef {
+            name: table,
+            schema,
+            fks,
+            props,
+            unique_indexes,
+        } = def;
+        let index_names: Vec<String> = unique_indexes
+            .iter()
+            .map(|spec| gnitz_wire::canonical_identifier(&spec.name))
+            .collect::<Result<Vec<_>, String>>()?;
+        let pk = PkColList::from_slice(schema.pk_cols());
+        if !fks.is_empty() && fks.len() != schema.columns().len() {
+            return Err(ClientError::from(format!(
+                "create_table: {} foreign-key slots for {} columns",
+                fks.len(),
+                schema.columns().len()
+            )));
+        }
+
+        // The table's id, then one per inline UNIQUE index.
+        let (schema_id, new_tid) = self
+            .schema_and_ids(table.schema(), 1 + unique_indexes.len() as u64)
+            .await?;
+        let schema_id = schema_id.ok_or_else(|| not_found("schema", table.schema()))?;
+
+        let mut b = DdlBundle::default();
+        append_col_rows(&mut b, new_tid, schema.columns(), fks);
+        b.put(
+            &TableTabRow {
+                table_id: new_tid,
+                schema_id,
+                name: table.name().into(),
+                pk_col_idx: pk,
+                flags: props.pack(),
+            },
+            1,
+        );
+        for (k, spec) in unique_indexes.iter().enumerate() {
+            b.put(
+                &IdxTabRow {
+                    index_id: new_tid + 1 + k as u64,
+                    owner_id: new_tid,
+                    source_col_idx: spec.cols,
+                    name: index_names[k].as_str().into(),
+                    is_unique: true,
+                },
+                1,
+            );
+        }
+        self.commit_ddl(b).await?;
+
+        Ok(new_tid)
+    }
+
+    /// Drop tables as one DDL zone; the engine cascades each one's indexes off
+    /// their owner. See `drop_relations` for the batch rules.
+    pub async fn drop_table(&mut self, tables: &[RelName], if_exists: bool) -> Result<(), ClientError> {
+        self.drop_relations(TABLE_TAB, "table", tables, if_exists).await
+    }
+
+    /// Create `bundle` in one atomic `DDL_TXN` and return its id. A view it
+    /// replaces that already is `bundle` stays under its id, and nothing is
+    /// written.
+    pub async fn create_view_chain(&mut self, bundle: ViewBundle) -> Result<u64, ClientError> {
+        let view = &bundle.name;
+        let n_views = bundle.segments.len() + 1;
+        let n_segments = bundle.segments.len() as u64;
+
+        let mut b = DdlBundle::default();
+        let (schema_id, base) = match bundle.replacing {
+            Some(vid) => {
+                // Where `bundle` stands if it is the chain under `vid`: one
+                // allocation holds a chain, the user-named view last.
+                let base = vid.saturating_sub(n_segments);
+                let members = ReadSpec::all_rows(ReadBound::Range(KeyRange::new(
+                    PkColList::from_slice(&[0]),
+                    &[],
+                    base as u128,
+                    vid as u128,
+                )));
+                let families = [VIEW_TAB, COL_TAB, CIRCUIT_TAB];
+                let rows = self.sys_cut(families, &members).await?;
+                let standing = DdlBundle(families.into_iter().zip(rows).collect());
+                let views = &standing.0[0].1;
+                let i = views
+                    .live_rows()
+                    .find(|&i| views.pks.get(i) as u64 == vid)
+                    .ok_or_else(|| not_found("view", view))?;
+                let schema_id = payload_u64(views, i, RELTAB_PAY_SCHEMA_ID);
+
+                // The definition says how the body was spelled, which is no
+                // part of what the view is: another spelling of the same body
+                // is the same view, and keeps the standing definition.
+                let standing_definition = ViewTabRow::read(views, i)
+                    .map_err(|e| ProtocolError::DecodeError(format!("view {vid}: {e}")))?
+                    .definition;
+                let mut want = DdlBundle::default();
+                bundle.put_rows(&mut want, &standing_definition, schema_id, base);
+                if want.same_rows(&standing) {
+                    return Ok(vid);
+                }
+                // Only the user-named view, ahead of the new chain's `+1`s: the
+                // engine cascades its segments.
+                b.retract(VIEW_TAB, views, i);
+                (schema_id, self.alloc_ids(n_views as u64).await?)
+            }
+            None => {
+                let (schema_id, base) = self.schema_and_ids(view.schema(), n_views as u64).await?;
+                (schema_id.ok_or_else(|| not_found("schema", view.schema()))?, base)
+            }
+        };
+
+        bundle.put_rows(&mut b, &bundle.definition, schema_id, base);
+        self.commit_ddl(b).await?;
+        Ok(base + n_segments)
+    }
+
+    /// Drop views as one DDL zone; the engine cascades each one's hidden segments
+    /// off `owner_view_id`, so the client never names a segment. See
+    /// `drop_relations` for the batch rules.
+    pub async fn drop_view(&mut self, views: &[RelName], if_exists: bool) -> Result<(), ClientError> {
+        self.drop_relations(VIEW_TAB, "view", views, if_exists).await
+    }
+
+    /// Retire every named relation of `family` in **one** DDL zone: the whole set
+    /// goes or none does, and a name repeated in `names` retires once.
+    ///
+    /// `if_exists` answers a name that does not resolve, and nothing else: a name
+    /// that resolves to another family, a dependent view and an FK child outside
+    /// the batch all still fail the statement.
+    async fn drop_relations(
+        &mut self,
+        family: u64,
+        noun: &'static str,
+        names: &[RelName],
+        if_exists: bool,
+    ) -> Result<(), ClientError> {
+        let mut b = DdlBundle::default();
+        for (k, name) in names.iter().enumerate() {
+            // RelName compares by its folded `schema.name`, so a repeat spelled
+            // differently is still a repeat.
+            if names[..k].contains(name) {
+                continue;
+            }
+            match self.relation_retraction(family, noun, name).await? {
+                Some((scanned, i)) => b.retract(family, &scanned, i),
+                None if if_exists => {}
+                None => return Err(not_found(noun, name)),
+            }
+        }
+        self.commit_ddl(b).await
+    }
+
+    /// The live `family` row of `name`, by one master-local seek. `Ok(None)` is the
+    /// *resolve* miss alone; a name held by the other kind — `DROP TABLE <view>` —
+    /// is refused as such, never as a `not_found` a caller may read as "already gone".
+    async fn relation_retraction(
+        &mut self,
+        family: u64,
+        noun: &'static str,
+        name: &RelName,
+    ) -> Result<Option<(ZSetBatch, usize)>, ClientError> {
+        let Some(desc) = self.resolve(name).await? else {
+            return Ok(None);
+        };
+        if desc.class.is_view() != (family == VIEW_TAB) {
+            return Err(format!(
+                "'{name}' is a {}; DROP {} requires a {noun}",
+                desc.class.describe(),
+                noun.to_uppercase()
+            )
+            .into());
+        }
+        let (scanned, i) = self
+            .seek_sys_row(family, &[desc.tid as u128], || not_found(noun, name))
+            .await?;
+        // Renamed since the resolve: the name no longer denotes this relation.
+        if payload_bytes(&scanned, i, RELTAB_PAY_NAME) != name.name().as_bytes() {
+            return Ok(None);
+        }
+        Ok(Some((scanned, i)))
+    }
+
+    /// Rename `rel`: a `(-1, +1)` rewrite pair of its TABLE_TAB / VIEW_TAB row.
+    pub async fn alter_rename_relation(&mut self, rel: &RelDescriptor, new_name: &str) -> Result<(), ClientError> {
+        let new_name = gnitz_wire::canonical_identifier(new_name)?;
+        let tid = rel.tid;
+        let family = if rel.class.is_view() { VIEW_TAB } else { TABLE_TAB };
+        self.rewrite_sys_row(
+            family,
+            &[tid as u128],
+            || absent(format!("relation {tid} not found")),
+            |b, row| b.set_string_cell(row, RELTAB_PAY_NAME, &new_name),
+        )
+        .await
+    }
+
+    /// Apply `change` to column `col_idx` of relation `tid`: a `(-1, +1)`
+    /// COL_TAB rewrite pair, the one cell `change` names edited at `+1`.
+    pub async fn alter_column(
+        &mut self,
+        tid: u64,
+        col_idx: usize,
+        change: ColumnChange<'_>,
+    ) -> Result<(), ClientError> {
+        self.rewrite_sys_row(
+            COL_TAB,
+            &[tid as u128, col_idx as u128],
+            || absent(format!("column index {col_idx} not found on table {tid}")),
+            |b, row| match change {
+                ColumnChange::Rename(name) => b.set_string_cell(row, ColTabSlot::name as usize, name),
+                ColumnChange::Drop => b.set_u64_cell(row, ColTabSlot::is_hidden as usize, 1),
+                ColumnChange::DropNotNull => b.set_u64_cell(row, ColTabSlot::is_nullable as usize, 1),
+            },
+        )
+        .await
+    }
+
+    /// `ALTER TABLE … ADD COLUMN`: `def` appended to `rel` after every physical
+    /// column, dropped ones included.
+    pub async fn alter_add_column(&mut self, rel: &RelDescriptor, def: &ColumnDef) -> Result<(), ClientError> {
+        let (tid, col_idx) = (rel.tid, rel.schema.layout().num_columns());
+
+        let mut b = DdlBundle::default();
+        b.put(&ColTabRow::of(tid, col_idx as u64, def, None), 1);
+        self.commit_ddl(b).await
+    }
+
+    /// Push a `(-1, +1)` rewrite pair on the live `family` row keyed `key`: the
+    /// stored row at `-1`, and a copy of it at `+1` that `patch` edits in place.
+    async fn rewrite_sys_row(
+        &mut self,
+        family: u64,
+        key: &[u128],
+        missing: impl FnOnce() -> ClientError,
+        patch: impl FnOnce(&mut ZSetBatch, usize),
+    ) -> Result<(), ClientError> {
+        let (scanned, i) = self.seek_sys_row(family, key, missing).await?;
+        let mut b = DdlBundle::default();
+        b.retract(family, &scanned, i);
+        let rows = b.batch(family);
+        rows.copy_row_at(&scanned, i, 1);
+        patch(rows, 1);
+        self.commit_ddl(b).await
+    }
+
+    // ── System-family reads ────────────────────────────────────────────────
+
+    /// The id of the live schema `schema_name` (already canonical), `None` where
+    /// there is none, and the first of `n` fresh catalog ids, asked for in one
+    /// round trip. Ids a caller leaves untaken are a gap in the id sequence and
+    /// nothing more.
+    async fn schema_and_ids(&mut self, schema_name: &str, n: u64) -> Result<(Option<u64>, u64), ClientError> {
+        let all = ReadSpec::all_rows(ReadBound::None);
+        let schemas = self
+            .session
+            .submit_scan(SCHEMA_TAB.into(), &all, sys_schema(SCHEMA_TAB));
+        let ids = self.session.submit(Request::AllocIds(n));
+        let schemas = self.wait(schemas).await?.batch;
+        let schema_id = schema_row(&schemas, schema_name).map(|at| schemas.pks.get(at) as u64);
+        Ok((schema_id, self.wait(ids).await?))
+    }
+
+    /// `families`' rows under `spec`, with no DDL between them.
+    async fn sys_cut<const N: usize>(
+        &mut self,
+        families: [u64; N],
+        spec: &ReadSpec,
+    ) -> Result<[ZSetBatch; N], ClientError> {
+        let scans = families.map(|family| (Target::from(family), spec, sys_schema(family)));
+        let mut replies = self.scan_many(&scans).await?.into_iter();
+        Ok(std::array::from_fn(|_| {
+            replies.next().expect("one reply per scan").batch
+        }))
+    }
+
+    /// System family `family`'s rows under `bound`, decoded under its own schema;
+    /// the server checks the reply against that schema's layout.
+    async fn sys_rows(&mut self, family: u64, bound: ReadBound) -> Result<ZSetBatch, ClientError> {
+        Ok(self
+            .scan_spec(family, &ReadSpec::all_rows(bound), sys_schema(family))
+            .await?
+            .batch)
+    }
+
+    /// The live `family` row keyed `key` — its PK columns' native values in
+    /// PK-list order — by one master-local keyed read: the
+    /// reply batch and the row's index in it, for a caller to copy the stored row
+    /// out of. `PkSet` is exact, so a live row in the reply is that key's; none is
+    /// `missing()`.
+    async fn seek_sys_row(
+        &mut self,
+        family: u64,
+        key: &[u128],
+        missing: impl FnOnce() -> ClientError,
+    ) -> Result<(ZSetBatch, usize), ClientError> {
+        let mut keys = PkColumn::empty_for_schema(sys_schema(family));
+        keys.push_natives(key);
+        let batch = self.sys_rows(family, ReadBound::PkSet(keys.keys())).await?;
+        let i = batch.live_rows().next().ok_or_else(missing)?;
+        Ok((batch, i))
+    }
+}
+
+/// Append one `COL_TAB` row per column of `owner_id`, at `+1`. `fks[i]` is
+/// column `i`'s target; a column past its end has none.
+fn append_col_rows(b: &mut DdlBundle, owner_id: u64, columns: &[ColumnDef], fks: &[Option<FkTarget>]) {
+    for (i, cd) in columns.iter().enumerate() {
+        let fk = fks.get(i).copied().flatten().map(|t| match t {
+            FkTarget::Table(fk) => fk,
+            FkTarget::SelfTable { col, on_delete } => FkRef { table_id: owner_id, col, on_delete },
+        });
+        b.put(&ColTabRow::of(owner_id, i as u64, cd, fk), 1);
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/ddl.rs"]
+mod tests;

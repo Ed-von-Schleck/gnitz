@@ -29,15 +29,16 @@ fn chain(name: RelName, base_tid: u64, schema: &Arc<Schema>) -> ViewBundle {
     bundle(name, segments, segment(gnitz_core::segment_id(1), schema))
 }
 
-/// `(vid, owner_view_id)` of every live VIEW_TAB row, sorted.
+/// `(vid, owner_view_id)` of every VIEW_TAB row, sorted; each row is held at
+/// weight 1.
 fn live_views(client: &mut GnitzClient) -> Vec<(u64, u64)> {
     let view_tab = gnitz_core::sys_schema(VIEW_TAB);
     let b = block_on(client.scan_spec(VIEW_TAB, &ReadSpec::all_rows(ReadBound::None), view_tab))
         .unwrap()
         .batch;
     let owners = &b.payload[ViewTabSlot::owner_view_id as usize].bytes;
+    assert!(b.weights.iter().all(|&w| w == 1), "{:?}", b.weights);
     let mut out: Vec<_> = (0..b.len())
-        .filter(|&i| b.weights[i] > 0)
         .map(|i| (b.pks.get(i) as u64, gnitz_wire::read_u64_le(owners, i * 8)))
         .collect();
     out.sort();

@@ -59,14 +59,6 @@ impl RelName {
         })
     }
 
-    /// `text` as `schema.name`, or as a name in `default_schema`.
-    pub fn parse(default_schema: &str, text: &str) -> Result<Self, String> {
-        match text.split_once('.') {
-            Some((schema, name)) => Self::new(schema, name),
-            None => Self::unqualified(default_schema, text),
-        }
-    }
-
     /// Whether the schema was written.
     pub fn is_qualified(&self) -> bool {
         self.qualified

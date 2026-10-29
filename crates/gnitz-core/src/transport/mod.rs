@@ -19,8 +19,7 @@ use std::time::Instant;
 use gnitz_wire::{AuthStatus, Deframer, HelloError};
 
 use crate::recording::{Direction, Tap};
-use crate::ProtocolError;
-use crate::{ClientError, Interest};
+use crate::{ClientError, ProtocolError};
 
 mod tls;
 
@@ -119,10 +118,46 @@ fn timed_out() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, "socket operation timed out")
 }
 
-/// One `poll(2)` on one fd for `events` until `until`; `None` waits untimed.
-/// Expiry surfaces as `TimedOut`; `EINTR` is returned, and since `until` is
-/// absolute a caller may simply call again.
-pub(crate) fn poll_fd(fd: RawFd, events: libc::c_short, until: Option<Instant>) -> std::io::Result<libc::c_short> {
+/// What a driver should wait for before its next
+/// [`Session::step`](crate::Session::step), and what it hands back: two
+/// booleans on the connection.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Interest {
+    pub read: bool,
+    pub write: bool,
+}
+
+impl Interest {
+    pub const NONE: Interest = Interest { read: false, write: false };
+    pub const READ: Interest = Interest { read: true, write: false };
+    pub const WRITE: Interest = Interest { read: false, write: true };
+
+    pub fn is_empty(self) -> bool {
+        self == Interest::NONE
+    }
+
+    /// The `poll(2)` event mask to wait for.
+    fn poll_events(self) -> libc::c_short {
+        (if self.read { libc::POLLIN } else { 0 }) | (if self.write { libc::POLLOUT } else { 0 })
+    }
+
+    /// What a `poll(2)` wakeup says is ready. `POLLHUP`, `POLLERR` and
+    /// `POLLNVAL` fold into `read`: they arrive whether requested or not, and
+    /// the read that follows surfaces the EOF, the reset or the `EBADF`; a
+    /// driver that ignored them would park forever on a dead peer, or spin on
+    /// a closed fd.
+    fn from_revents(revents: libc::c_short) -> Interest {
+        Interest {
+            read: revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0,
+            write: revents & libc::POLLOUT != 0,
+        }
+    }
+}
+
+/// One `poll(2)` on `fd` for `want` until `until`, and what is ready; `None`
+/// waits untimed. Expiry surfaces as `TimedOut`; `EINTR` is returned, and since
+/// `until` is absolute a caller may simply call again.
+pub fn poll_fd(fd: BorrowedFd<'_>, want: Interest, until: Option<Instant>) -> std::io::Result<Interest> {
     let timeout_ms: libc::c_int = match until {
         None => -1,
         Some(t) => {
@@ -135,12 +170,24 @@ pub(crate) fn poll_fd(fd: RawFd, events: libc::c_short, until: Option<Instant>) 
             left.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int
         }
     };
-    let mut pfd = libc::pollfd { fd, events, revents: 0 };
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: want.poll_events(),
+        revents: 0,
+    };
     // SAFETY: one valid pollfd, count 1.
     match unsafe { libc::poll(&mut pfd, 1, timeout_ms) } {
         rc if rc < 0 => Err(std::io::Error::last_os_error()),
         0 => Err(timed_out()),
-        _ => Ok(pfd.revents),
+        _ => Ok(Interest::from_revents(pfd.revents)),
+    }
+}
+
+/// The stream socket a driver polls: the AF_UNIX socket, or the `TcpStream`
+/// under TLS.
+impl AsFd for ClientTransport {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
     }
 }
 
@@ -154,12 +201,6 @@ impl ClientTransport {
             queue: OutQueue::default(),
             tap: None,
         }
-    }
-
-    /// The underlying stream socket — the AF_UNIX socket, or the `TcpStream`
-    /// under TLS — for a host to register.
-    pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
-        self.inner.as_fd()
     }
 
     /// Connect to a `tls://` target, or else to an AF_UNIX socket path, and
@@ -181,11 +222,6 @@ impl ClientTransport {
         Ok(ClientTransport::new(Inner::Unix(stream)))
     }
 
-    /// The stream socket a driver polls: the AF_UNIX socket, or the `TcpStream` under TLS.
-    pub fn as_raw_fd(&self) -> RawFd {
-        self.inner.as_fd().as_raw_fd()
-    }
-
     /// Exchange HELLOs, ours carrying `token`, no later than `until`. On TLS
     /// this is also where the handshake completes and certificate failures
     /// surface.
@@ -194,8 +230,8 @@ impl ClientTransport {
         loop {
             // Every round: a read queues the TLS handshake's next flight.
             self.flush()?;
-            let events = Interest { read: true, write: self.wants_write() }.poll_events();
-            match poll_fd(self.as_raw_fd(), events, Some(until)) {
+            let want = Interest { read: true, write: self.wants_write() };
+            match poll_fd(self.as_fd(), want, Some(until)) {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 polled => polled?,
             };
@@ -277,8 +313,8 @@ impl ClientTransport {
     /// The fd stays open until the transport drops, since a reactor may still
     /// have it registered.
     pub(crate) fn close(&mut self) {
-        // SAFETY: `as_raw_fd` is this transport's own open socket.
-        let _ = unsafe { libc::shutdown(self.as_raw_fd(), libc::SHUT_RDWR) };
+        // SAFETY: this transport's own open socket.
+        let _ = unsafe { libc::shutdown(self.as_fd().as_raw_fd(), libc::SHUT_RDWR) };
         self.queue = OutQueue::default();
     }
 

@@ -3,7 +3,7 @@
 //! checks.
 
 use super::*;
-use gnitz_core::sys_schema;
+use gnitz_core::{sys_schema, ColumnChange};
 use gnitz_wire::{PkColList, SchemaTabRow, SysRow, SCHEMA_TAB, SEQ_TAB};
 
 /// A SCHEMA_TAB batch registering `(schema_id, name)`.
@@ -31,8 +31,8 @@ fn a_bundle_the_handler_cannot_read_as_one_is_refused_whole() {
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let mut s = Session::connect(srv.sock_path()).unwrap();
     let (a, b) = (
-        block_on(client.alloc_id()).unwrap(),
-        block_on(client.alloc_id()).unwrap(),
+        block_on(client.alloc_ids(1)).unwrap(),
+        block_on(client.alloc_ids(1)).unwrap(),
     );
     let err = refusal(
         &mut s,
@@ -76,7 +76,7 @@ fn a_unique_index_the_catalog_refuses_is_not_scanned_for_duplicates() {
     assert!(err.contains("cannot carry a UNIQUE index"), "{err}");
 
     block_on(client.drop_view(&[rel(&sn, "v")], false)).unwrap();
-    block_on(client.alter_drop_column(tid, 1)).unwrap();
+    block_on(client.alter_column(tid, 1, ColumnChange::Drop)).unwrap();
     let err = unique_on_v(&mut client, tid);
     assert!(err.contains("is dropped"), "{err}");
 }

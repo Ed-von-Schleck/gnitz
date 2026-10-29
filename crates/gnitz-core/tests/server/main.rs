@@ -15,10 +15,11 @@ mod view_chain;
 use gnitz_core::block_on;
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gnitz_core::{
-    BatchAppender, ClientError, GnitzClient, Interest, PlannedView, RelName, Request, Schema, Sent, Session, TableDef,
-    ViewBundle, ViewDefinition, ZSetBatch,
+    poll_fd, BatchAppender, ClientError, GnitzClient, Interest, PlannedView, RelName, Request, Schema, Sent, Session,
+    TableDef, ViewBundle, ZSetBatch,
 };
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{
@@ -61,16 +62,8 @@ fn segment(source_id: u64, schema: &Arc<Schema>) -> PlannedView {
     }
 }
 
-/// A definition no reader of these tests renders.
-fn definition() -> ViewDefinition {
-    ViewDefinition {
-        query: "SELECT 1".to_string(),
-        body_columns: Vec::new(),
-        refs: Vec::new(),
-    }
-}
-
-/// `segments` then `view`, created as `name` with default options.
+/// `segments` then `view`, created as `name` with default options and an empty
+/// definition, which the engine stores verbatim and no reader here renders.
 fn bundle(name: RelName, segments: Vec<PlannedView>, view: PlannedView) -> ViewBundle {
     ViewBundle {
         name,
@@ -78,7 +71,7 @@ fn bundle(name: RelName, segments: Vec<PlannedView>, view: PlannedView) -> ViewB
         replacing: None,
         segments,
         view,
-        definition: definition(),
+        definition: Vec::new(),
     }
 }
 
@@ -129,15 +122,7 @@ fn push_req<'a>(tid: u64, schema: &'a Schema, batch: &'a ZSetBatch) -> Request<'
 /// Park until `s`'s fd is ready for `want` (at most 30 s) and say what is.
 fn park(s: &Session, want: Interest) -> Interest {
     assert!(!want.is_empty(), "slots pending but nothing to wait for");
-    let mut pfd = libc::pollfd {
-        fd: s.as_fd().as_raw_fd(),
-        events: want.poll_events(),
-        revents: 0,
-    };
-    // SAFETY: one valid pollfd.
-    let rc = unsafe { libc::poll(&mut pfd, 1, 30_000) };
-    assert!(rc > 0, "poll: {}", std::io::Error::last_os_error());
-    Interest::from_revents(pfd.revents)
+    poll_fd(s.as_fd(), want, Some(Instant::now() + Duration::from_secs(30))).expect("poll")
 }
 
 /// The driver: step with what `poll` reported, parking on `interest()`, until

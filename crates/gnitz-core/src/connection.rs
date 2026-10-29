@@ -1,5 +1,6 @@
-//! The protocol session: a connection state machine that does its I/O but
-//! never waits; whoever drives [`Session::step`] does.
+//! The protocol session: a connection state machine. [`Session::step`] does
+//! its I/O without waiting; [`Session::turn`] waits on the client's [`Host`]
+//! only when the socket must report readiness first.
 //!
 //! A frame is of what its [`WireLane`] names. Replies arrive in request order,
 //! each the head slot's until its last train terminates; a pushed train and
@@ -8,23 +9,20 @@
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
-use std::future::Future;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 use std::time::{Duration, Instant};
 
+use crate::batch::decode_wal_block_into;
 use crate::error::ClientError;
-use crate::protocol::wal_block::decode_wal_block_into;
-use crate::{
-    encode_ddl_txn, encode_frame, encode_push_txn, sys_schema, ClientTransport, ProtocolError, PushFamily, Schema,
-    ZSetBatch,
-};
-use gnitz_wire::txn_frame::{self, kept_as};
+use crate::host::{promise, Host, Promise, Sent};
+use crate::transport::Interest;
+use crate::{sys_schema, ClientTransport, ProtocolError, Schema, ZSetBatch};
+use gnitz_wire::txn_frame::{self, encode_items, kept_as, FrameItem};
 use gnitz_wire::{
-    peek_control_block, ClientVerb, ControlHeader, DecodedControl, RelClass, RelDescriptorBlob, RelIndex,
-    WireConflictMode, WireLane, CONNECT_TIMEOUT,
+    append_frame, peek_control_block, ClientVerb, ControlHeader, DecodedControl, RelClass, RelDescriptorBlob, RelIndex,
+    WireConflictMode, WireLane, WireStatus, CONNECT_TIMEOUT,
 };
 
 /// Requests one connection may hold in flight; `submit` refuses past it. A bound
@@ -43,8 +41,9 @@ pub const MAX_QUEUED_BYTES: usize = 64 << 20;
 pub struct ScanReply {
     pub schema: Arc<Schema>,
     pub batch: ZSetBatch,
-    /// The server LSN the read was served at. `None` for rows no server read
-    /// produced: an answer off a mirrored copy, a constant, `EXPLAIN` or
+    /// The server LSN the read was served at. `None` where the rows are no
+    /// point read of the log: a delta read or a pushed train, whose position is
+    /// its cursor, an answer off a mirrored copy, a constant, `EXPLAIN` or
     /// `RETURNING`.
     pub lsn: Option<u64>,
 }
@@ -101,40 +100,6 @@ impl RawBlock {
 pub use gnitz_wire::txn_frame::DeltaCursor;
 
 // ── The request vocabulary ───────────────────────────────────────────────────
-
-/// What a driver should wait for before its next `step`, and what it hands
-/// back: two booleans on the connection.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct Interest {
-    pub read: bool,
-    pub write: bool,
-}
-
-impl Interest {
-    pub const NONE: Interest = Interest { read: false, write: false };
-    pub const READ: Interest = Interest { read: true, write: false };
-    pub const WRITE: Interest = Interest { read: false, write: true };
-
-    pub fn is_empty(self) -> bool {
-        self == Interest::NONE
-    }
-
-    /// The `poll(2)` event mask to wait for.
-    pub fn poll_events(self) -> libc::c_short {
-        (if self.read { libc::POLLIN } else { 0 }) | (if self.write { libc::POLLOUT } else { 0 })
-    }
-
-    /// What a `poll(2)` wakeup says is ready, as the set to hand `step`.
-    /// `POLLHUP` / `POLLERR` fold into `read` — they arrive whether requested
-    /// or not, and the step that follows reads the EOF or reset and surfaces
-    /// it; a driver that ignored them would park forever on a dead peer.
-    pub fn from_revents(revents: libc::c_short) -> Interest {
-        Interest {
-            read: revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0,
-            write: revents & libc::POLLOUT != 0,
-        }
-    }
-}
 
 /// A request answered by one value — an LSN, or the base id of a run. It
 /// borrows its inputs; the borrow ends at [`Session::submit`].
@@ -207,6 +172,79 @@ impl Request<'_> {
     }
 }
 
+/// One frame payload, without the 4-byte length prefix. An empty batch ships no
+/// data block, and still ships the schema record.
+pub(crate) fn encode_frame(
+    hdr: ControlHeader,
+    blob: &[u8],
+    schema: Option<&[u8]>,
+    data: Option<&ZSetBatch>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    append_frame(
+        &mut out,
+        &hdr,
+        blob,
+        schema,
+        data.filter(|b| !b.is_empty()).map(|b| b.wire_regions()).as_deref(),
+    );
+    out
+}
+
+/// One family of a user-table push transaction: a maximal run of same-mode
+/// writes into `target`.
+pub struct PushFamily {
+    /// The relation, under the descriptor token of the first of the family's
+    /// batches built from a descriptor; `0` while none was.
+    pub target: Target,
+    pub schema: Arc<Schema>,
+    pub batch: ZSetBatch,
+    pub mode: WireConflictMode,
+    /// The commit fails if `target` was written after `basis`, the oldest
+    /// watermark among the reads this family's writes were built from; `BLIND`
+    /// when none was.
+    pub basis: u64,
+}
+
+/// Encode an atomic user-table push transaction frame (`ClientVerb::PushTxn`) into
+/// wire bytes (without the 4-byte frame header). Every family carries its schema
+/// record, which the master validates it against.
+pub(crate) fn encode_push_txn(families: &[PushFamily]) -> Vec<u8> {
+    let schemas: Vec<Vec<u8>> = families.iter().map(|f| f.schema.to_block()).collect();
+    let items: Vec<FrameItem> = families
+        .iter()
+        .zip(&schemas)
+        .map(|(f, schema)| {
+            let mut hdr = ControlHeader::naming(ClientVerb::PushTxn, f.target, f.basis);
+            hdr.flags.conflict_mode = f.mode;
+            FrameItem {
+                hdr,
+                blob: &[],
+                schema: Some(schema),
+                data: Some(f.batch.wire_regions()),
+            }
+        })
+        .collect();
+    encode_items(ClientVerb::PushTxn, &items)
+}
+
+/// Encode an atomic DDL transaction frame (`ClientVerb::DdlTxn`) into wire bytes
+/// (without the 4-byte frame header). Each family is named by its system table id
+/// alone; its batch carries its own layout, which `Session::submit` validates
+/// against that id's system schema.
+pub fn encode_ddl_txn(families: &[(u64, ZSetBatch)]) -> Vec<u8> {
+    let items: Vec<FrameItem> = families
+        .iter()
+        .map(|(tid, b)| FrameItem {
+            hdr: ControlHeader { target_id: *tid, ..Default::default() },
+            blob: &[],
+            schema: None,
+            data: Some(b.wire_regions()),
+        })
+        .collect();
+    encode_items(ClientVerb::DdlTxn, &items)
+}
+
 /// One request in flight, or a pushed train: how its reply decodes, the reply
 /// read so far, and where it goes. A slot is answered only while it heads its
 /// queue, so its state is the one train in progress, and it goes when the slot
@@ -264,127 +302,6 @@ enum Slot {
     /// A train the server pushed for subscription `sub`, its blocks kept for
     /// whoever holds it.
     Pushed { tid: u64, sub: u64, blocks: Vec<RawBlock> },
-}
-
-/// Where a reply is, between its writer and its reader.
-#[derive(Default)]
-enum Awaited<T> {
-    #[default]
-    Outstanding,
-    Arrived(Result<T, ClientError>),
-    /// Handed on as it arrives.
-    Routed(Box<dyn FnOnce(Result<T, ClientError>) + Send>),
-    /// Awaited by a task its arrival wakes.
-    Watched(Waker),
-}
-
-struct Cell<T>(Mutex<Awaited<T>>);
-
-impl<T> Cell<T> {
-    /// A panic under this lock leaves what it guards whole.
-    fn lock(&self) -> MutexGuard<'_, Awaited<T>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// A reply on its way, borrowing nothing. One to a request arrives as the
-/// session is stepped: [`GnitzClient::wait`](crate::GnitzClient::wait) steps
-/// until it has, and awaiting it directly leaves the stepping to someone else.
-pub struct Sent<T>(Arc<Cell<T>>);
-
-/// The writer of a [`Sent`]. Dropped unfulfilled, the reply is `Closed`.
-pub struct Promise<T>(Option<Arc<Cell<T>>>);
-
-/// A reply yet to arrive, and its writer.
-pub fn promise<T>() -> (Promise<T>, Sent<T>) {
-    let cell = Arc::new(Cell(Mutex::new(Awaited::Outstanding)));
-    (Promise(Some(Arc::clone(&cell))), Sent(cell))
-}
-
-impl<T> Promise<T> {
-    /// The reply arrives; a second one goes nowhere.
-    pub fn fulfil(&mut self, reply: Result<T, ClientError>) {
-        let Some(cell) = self.0.take() else {
-            return;
-        };
-        let mut state = cell.lock();
-        match std::mem::take(&mut *state) {
-            Awaited::Routed(route) => {
-                drop(state);
-                route(reply)
-            }
-            Awaited::Watched(waiter) => {
-                *state = Awaited::Arrived(reply);
-                drop(state);
-                waiter.wake()
-            }
-            Awaited::Outstanding => *state = Awaited::Arrived(reply),
-            Awaited::Arrived(_) => unreachable!("a cell has one writer, which fulfils once"),
-        }
-    }
-}
-
-impl<T> Drop for Promise<T> {
-    fn drop(&mut self) {
-        self.fulfil(Err(ClientError::Closed));
-    }
-}
-
-impl<T> Sent<T> {
-    /// A reply that needed no request.
-    pub fn ready(value: Result<T, ClientError>) -> Self {
-        Sent(Arc::new(Cell(Mutex::new(Awaited::Arrived(value)))))
-    }
-
-    /// The reply, if it has arrived. It is handed out once.
-    pub fn try_take(&mut self) -> Option<Result<T, ClientError>> {
-        let mut state = self.0.lock();
-        match std::mem::take(&mut *state) {
-            Awaited::Arrived(reply) => Some(reply),
-            other => {
-                *state = other;
-                None
-            }
-        }
-    }
-
-    /// Hand the reply to `route` — now if it has arrived, else from wherever
-    /// it does: for a request's, inside the step that reads it.
-    pub fn then(self, route: impl FnOnce(Result<T, ClientError>) + Send + 'static) {
-        let mut state = self.0.lock();
-        match std::mem::take(&mut *state) {
-            Awaited::Arrived(reply) => {
-                drop(state);
-                route(reply)
-            }
-            _ => *state = Awaited::Routed(Box::new(route)),
-        }
-    }
-
-    /// The reply `f` makes of this one, arriving with it.
-    pub fn map<U: Send + 'static>(self, f: impl FnOnce(T) -> U + Send + 'static) -> Sent<U>
-    where
-        T: 'static,
-    {
-        let (mut to, mapped) = promise();
-        self.then(move |reply| to.fulfil(reply.map(f)));
-        mapped
-    }
-}
-
-impl<T> Future for Sent<T> {
-    type Output = Result<T, ClientError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.0.lock();
-        match std::mem::take(&mut *state) {
-            Awaited::Arrived(reply) => Poll::Ready(reply),
-            _ => {
-                *state = Awaited::Watched(cx.waker().clone());
-                Poll::Pending
-            }
-        }
-    }
 }
 
 /// How one view's train ends: the cursor its terminal carries, or the fault
@@ -486,6 +403,18 @@ impl Inbox {
                 ))
             }
             WireLane::PushedTrain => {
+                let h = &ctrl.hdr;
+                if h.flags.continuation
+                    || h.status != WireStatus::Ok
+                    || ctrl.data.is_some()
+                    || ctrl.schema.is_some()
+                    || !ctrl.blob.is_empty()
+                    || !ctrl.body.is_empty()
+                {
+                    return Err(ProtocolError::DecodeError(
+                        "a pushed train opens with a bare head".into(),
+                    ));
+                }
                 self.pushed = Some(Slot::Pushed {
                     tid: ctrl.hdr.target_id,
                     sub: ctrl.hdr.arg0,
@@ -535,7 +464,7 @@ impl Inbox {
     }
 }
 
-/// A protocol session: the transport plus the [`Inbox`] its frames are fed to
+/// A protocol session: the transport plus the `Inbox` its frames are fed to
 /// (reply, sync and pushed lanes, delta-poll/subscription routing). Exactly one
 /// owner of that state: a [`crate::GnitzClient`], whose host decides how it
 /// waits.
@@ -553,7 +482,7 @@ pub struct Session {
     refused: bool,
 }
 
-/// The connection's socket, for a [`Host`](crate::Host) to register.
+/// The connection's socket, for a [`Host`] to register.
 impl AsFd for Session {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.transport.as_fd()
@@ -834,10 +763,8 @@ impl Session {
     }
 
     /// Do the I/O `ready` allows — one read, then one flush; every reply it
-    /// completes arrives. Afterwards a driver steps again without waiting
-    /// while [`Self::unread`], or while `interest().write` and not
-    /// [`Self::refused`], since a socket takes bytes until it refuses them;
-    /// otherwise it may park on `interest()`.
+    /// completes arrives. `turn` decides when to step again without
+    /// waiting and when to park on `interest()`.
     ///
     /// A failure ends the session: every reply still owed arrives as
     /// [`ClientError::ConnectionLost`], after those that completed.
@@ -859,6 +786,46 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Step once, waiting on `host` only when the socket must report an edge
+    /// first. A read the last step left unfinished is stepped again without
+    /// waiting, since the socket has no new edge to report; so is a write
+    /// while the last flush left no bytes the socket refused, since a socket
+    /// takes bytes until it refuses them, and asking the host first would cost
+    /// a wait per request. Otherwise it parks on `interest()`.
+    ///
+    /// `Closed` when the session will answer nothing more: it ended, or the
+    /// reply awaited belongs to a session since replaced.
+    pub(crate) fn turn(&mut self, host: &mut dyn Host, cx: &mut Context<'_>) -> Poll<Result<(), ClientError>> {
+        if self.unread {
+            self.step(Interest::READ);
+            return Poll::Ready(Ok(()));
+        }
+        let want = self.interest();
+        if want.is_empty() {
+            return Poll::Ready(Err(ClientError::Closed));
+        }
+        if want.write && !self.refused {
+            self.step(Interest::WRITE);
+            return Poll::Ready(Ok(()));
+        }
+        let waited = ready!(host.poll_io(want, cx, &mut |ready| {
+            self.step(ready);
+            self.interest().write
+        }));
+        Poll::Ready(match waited {
+            // A wait that failed is the connection's end, which every reply owed
+            // arrives as; an interrupt leaves the session as it stood.
+            Err(e) if !matches!(e, ClientError::Interrupted(_)) => {
+                self.end(match e {
+                    ClientError::Protocol(lost) => ClientError::ConnectionLost(lost),
+                    e => e,
+                });
+                Ok(())
+            }
+            waited => waited,
+        })
     }
 
     /// One read of the socket, each frame it completes fed to the head slot. A
@@ -889,18 +856,6 @@ impl Session {
     pub(crate) fn abandon_poll(&mut self) {
         self.inbox.polls.live += 1;
         self.inbox.polls.queue.clear();
-    }
-
-    /// The last step left a read unfinished: step `READ` again without waiting
-    /// for the socket, which has no new edge to report.
-    pub(crate) fn unread(&self) -> bool {
-        self.unread
-    }
-
-    /// The last flush left bytes the socket refused. Until one does, a write
-    /// needs no wait: a socket takes bytes until it says otherwise.
-    pub(crate) fn refused(&self) -> bool {
-        self.refused
     }
 
     /// Either of the caps [`Self::submit`] refuses on — in-flight slots or
@@ -1047,6 +1002,11 @@ impl Slot {
             Slot::Resolve { to } => to.fulfil(Ok(resolve_descriptor(&ctrl, &buf)?)),
             Slot::Scan { reply_schema, data, to, .. } => to.fulfil(Ok(scan_reply(reply_schema, data))),
             Slot::Page { reply_schema, data, worker_ends, to, .. } => {
+                // The next page's rows are shared over the stores this one
+                // names, so a page naming none is no reply to a page request.
+                if worker_ends.is_empty() {
+                    return Err(ProtocolError::DecodeError("a snapshot page naming no worker".into()));
+                }
                 let batch = data.take().unwrap_or_else(|| ZSetBatch::new(reply_schema));
                 let worker_ends = std::mem::take(worker_ends);
                 to.fulfil(Ok(SnapshotPage { batch, worker_ends }))

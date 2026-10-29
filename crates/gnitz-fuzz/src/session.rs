@@ -14,6 +14,7 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::os::fd::{AsFd, AsRawFd};
 use std::time::{Duration, Instant};
 
 use gnitz_core::{block_on, ClientError, ClientTransport, GnitzClient, RelName};
@@ -139,7 +140,7 @@ fn pump(conns: &mut BTreeMap<u32, Conn>, key: u32, deadline: Instant, trace: boo
                     libc::POLLIN
                 };
                 libc::pollfd {
-                    fd: c.transport.as_raw_fd(),
+                    fd: c.transport.as_fd().as_raw_fd(),
                     events,
                     revents: 0,
                 }

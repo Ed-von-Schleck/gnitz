@@ -1,5 +1,5 @@
 use crate::mirror::MirrorError;
-use gnitz_wire::{FrameLenError, WireFault};
+use gnitz_wire::{FrameLenError, WireFault, WireStatus};
 use std::fmt;
 use std::sync::Arc;
 
@@ -24,6 +24,26 @@ pub enum ClientError {
     /// handler raised. Carries the host's own error so the binding re-raises
     /// exactly what the handler produced.
     Interrupted(Arc<dyn std::error::Error + Send + Sync>),
+}
+
+impl ClientError {
+    /// The status of a refusal; `None` for every other failure.
+    pub fn status(&self) -> Option<WireStatus> {
+        match self {
+            ClientError::Refused(fault) => Some(fault.status),
+            _ => None,
+        }
+    }
+}
+
+/// A `WireStatus::NotFound` refusal raised on this side, worded by the caller.
+pub(crate) fn absent(text: String) -> ClientError {
+    ClientError::Refused(WireFault { status: WireStatus::NotFound, text })
+}
+
+/// The absence a catalog lookup by name reports.
+pub fn not_found(noun: &'static str, name: impl std::fmt::Display) -> ClientError {
+    absent(format!("{noun} '{name}' not found"))
 }
 
 impl From<ProtocolError> for ClientError {

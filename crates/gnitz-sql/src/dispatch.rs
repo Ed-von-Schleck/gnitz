@@ -7,8 +7,8 @@ use crate::error::GnitzSqlError;
 use crate::source::StatementText;
 use crate::SqlResult;
 use crate::{ddl, dml};
-use gnitz_core::{ClientError, GnitzClient, RelDescriptor, RelName};
-use gnitz_wire::{WireFault, WireStatus};
+use gnitz_core::{GnitzClient, RelDescriptor, RelName};
+use gnitz_wire::WireStatus;
 use sqlparser::ast::{Query, Statement};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -124,9 +124,11 @@ async fn planned_kept<P>(
             }
         };
         match run(client, plan).await {
-            Err(GnitzSqlError::Client(ClientError::Refused(WireFault {
-                status: WireStatus::StaleCatalog, ..
-            }))) if attempt < STALE_MAX_ATTEMPTS => use_kept = false,
+            Err(GnitzSqlError::Client(e))
+                if e.status() == Some(WireStatus::StaleCatalog) && attempt < STALE_MAX_ATTEMPTS =>
+            {
+                use_kept = false
+            }
             done => return done,
         }
     }

@@ -12,15 +12,17 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use gnitz_core::{
-    BatchAppender, ClientError, GnitzClient, ScanReply, Schema, ZSetBatch, MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
+    BatchAppender, ClientError, DeltaCursor, GnitzClient, ScanReply, Schema, Target, ZSetBatch, MAX_IN_FLIGHT,
+    MAX_QUEUED_BYTES,
 };
 use gnitz_tokio::{AsyncClient, Connection};
 use gnitz_wire::{
-    append_frame, frame_len_prefix, peek_control_block, ColumnDef, ControlHeader, ReadBound, ReadSpec, TypeCode,
-    WireConflictMode, FRAME_LEN_PREFIX_BYTES,
+    append_frame, frame_len_prefix, peek_control_block, ClientVerb, ColumnDef, ControlHeader, ReadBound, ReadSpec,
+    TypeCode, WireConflictMode, WireFlags, WireLane, FRAME_LEN_PREFIX_BYTES,
 };
 use support::{settled, PATIENCE};
 use tokio::runtime::Runtime;
@@ -377,4 +379,135 @@ fn an_owned_client_waits_on_the_runtime_and_reconnects() {
         assert_eq!(client.scan_spec(4, &spec, &schema()).await.unwrap().lsn, Some(44));
     });
     answered.join().unwrap();
+}
+
+/// The feed tag every cursor of the sync test carries.
+const TAG: u64 = 0xFEED;
+
+/// A frame of `hdr`, carrying `rows` — `(key, weight)` of [`schema`] — if any.
+fn frame(hdr: ControlHeader, rows: &[(u64, i64)]) -> Vec<u8> {
+    let pks: Vec<u8> = rows.iter().flat_map(|&(k, _)| k.to_be_bytes()).collect();
+    let weights: Vec<u8> = rows.iter().flat_map(|&(_, w)| w.to_le_bytes()).collect();
+    let nulls = vec![0u8; rows.len() * 8];
+    let regions: [&[u8]; 4] = [&pks, &weights, &nulls, &[]];
+    let mut out = Vec::new();
+    append_frame(&mut out, &hdr, &[], None, (!rows.is_empty()).then_some(&regions[..]));
+    out
+}
+
+/// One pushed train of subscription `sub` to view 40: `rows`, ending at round
+/// `tick`, then the sync's answer.
+fn push_train_and_answer(s: &mut UnixStream, sub: u64, rows: &[(u64, i64)], tick: u64) {
+    let lane = |lane| WireFlags { lane, ..Default::default() };
+    let opener = ControlHeader {
+        target_id: 40,
+        arg0: sub,
+        flags: lane(WireLane::PushedTrain),
+        ..Default::default()
+    };
+    write_frame(s, &frame(opener, &[]));
+    let data = ControlHeader {
+        target_id: 40,
+        arg1: TAG,
+        flags: WireFlags { continuation: true, ..Default::default() },
+        ..Default::default()
+    };
+    write_frame(s, &frame(data, rows));
+    let terminal = ControlHeader {
+        target_id: 40,
+        arg0: tick,
+        arg1: TAG,
+        ..Default::default()
+    };
+    write_frame(s, &frame(terminal, &[]));
+    let answer = ControlHeader {
+        flags: lane(WireLane::SyncAnswer),
+        ..Default::default()
+    };
+    write_frame(s, &frame(answer, &[]));
+}
+
+/// The header of the next request, which must be a SYNC_PUSHED.
+fn expect_sync(s: &mut UnixStream) -> ControlHeader {
+    let hdr = peek_control_block(&read_frame(s)).expect("a control header").hdr;
+    assert_eq!(hdr.flags.verb, ClientVerb::SyncPushed);
+    hdr
+}
+
+/// `f`'s output, polling `conn` alongside it on this thread and nothing else.
+fn drive<F: Future>(rt: &Runtime, conn: &mut Connection, f: F) -> F::Output {
+    let mut f = std::pin::pin!(f);
+    settled(
+        rt,
+        std::future::poll_fn(move |cx| {
+            let _ = conn.as_mut().poll(cx);
+            f.as_mut().poll(cx)
+        }),
+    )
+}
+
+/// A sync dropped while the client finishes it loses nothing: the next sync
+/// reports the rows it took in front of its own, weights and all.
+#[test]
+fn a_sync_cancelled_after_its_answer_hands_its_rows_to_the_next() {
+    let rt = Runtime::new().unwrap();
+    let (client, mut conn, mut peer) = connect_to_peer(&rt);
+
+    let script = std::thread::spawn(move || {
+        let poll = peek_control_block(&read_frame(&mut peer))
+            .expect("a control header")
+            .hdr;
+        assert_eq!(poll.flags.verb, ClientVerb::DeltaPoll);
+        let sub = poll.arg0;
+        let terminal = ControlHeader {
+            target_id: 40,
+            arg0: 9,
+            arg1: TAG,
+            ..Default::default()
+        };
+        write_frame(&mut peer, &frame(terminal, &[]));
+
+        expect_sync(&mut peer);
+        assert_eq!(request(&mut peer), 5, "the probe");
+        push_train_and_answer(&mut peer, sub, &[(1, 1), (2, 2)], 11);
+        reply(&mut peer, 5, 55);
+
+        let next = expect_sync(&mut peer);
+        assert_eq!(next.arg0, 0, "a held delivery is no reason to wait");
+        push_train_and_answer(&mut peer, sub, &[(1, -1)], 12);
+        peer
+    });
+
+    let from = DeltaCursor::from_pair(TAG, 9).unwrap();
+    let spec = ReadSpec::all_rows(ReadBound::None).encode();
+    let subscribed =
+        client.run(move |c| Box::pin(async move { c.subscribe(Target::from(40), Some(from), &schema(), &spec).await }));
+    let (sub, _, _) = drive(&rt, &mut conn, subscribed).unwrap().expect("subscribed");
+
+    // The sync's request goes first, then the probe's; the probe's reply
+    // follows the sync's answer, so once it is in the answer is too.
+    let mut sync = Box::pin(client.sync(Duration::from_secs(30)));
+    let noop = std::task::Waker::noop();
+    assert!(sync
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(noop))
+        .is_pending());
+    assert_eq!(drive(&rt, &mut conn, scan(&client, 5)).unwrap().lsn, Some(55));
+    // Its answer in, the sync queues the client's half and awaits it.
+    let polled = rt.block_on(std::future::poll_fn(|cx| Poll::Ready(sync.as_mut().poll(cx))));
+    assert!(polled.is_pending());
+    drop(sync);
+
+    rt.spawn(conn);
+    let synced = settled(&rt, client.sync(Duration::from_secs(30))).expect("the next sync");
+    drop(script.join().unwrap());
+    let [pushed] = &synced.pushed[..] else {
+        panic!("one entry per subscription")
+    };
+    let (rows, at) = pushed.result.as_ref().expect("the subscription is held");
+    assert_eq!((pushed.sub, at.tick.get()), (sub, 12), "under the later cursor");
+    let rows: Vec<(u128, i64)> = (0..rows.batch.len())
+        .map(|i| (rows.batch.pks.get(i), rows.batch.weights[i]))
+        .collect();
+    assert_eq!(rows, [(1, 1), (2, 2), (1, -1)], "the cancelled sync's rows first");
 }

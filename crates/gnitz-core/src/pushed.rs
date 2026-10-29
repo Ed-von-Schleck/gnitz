@@ -5,11 +5,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::batch::decode_wal_block_into;
 use crate::client::GnitzClient;
-use crate::connection::{DeltaCursor, ScanReply, Sent, Target};
+use crate::connection::{DeltaCursor, ScanReply, Target};
 use crate::error::ClientError;
+use crate::host::Sent;
 use crate::mirror::PollOutcome;
-use crate::protocol::wal_block::decode_wal_block_into;
 use crate::{Schema, ZSetBatch};
 
 /// What a sync hands a reader for one of its subscriptions.
@@ -61,6 +62,9 @@ impl GnitzClient {
         if self.readers.remove(&id).is_some() {
             self.session.release(id);
         }
+        if let Some(unclaimed) = &mut self.unclaimed {
+            unclaimed.retain(|p| p.sub != id);
+        }
     }
 
     /// Bring every subscription of this connection, a reader's and a
@@ -70,7 +74,7 @@ impl GnitzClient {
     /// `Err` fails the sync as a whole; what failed one subscription or view
     /// is in its entry.
     pub async fn sync(&mut self, wait: Duration) -> Result<Synced, ClientError> {
-        let synced = self.begin_sync(wait)?;
+        let synced = self.begin_sync(wait);
         let synced = self.wait(synced).await;
         if let Err(e @ ClientError::Interrupted(_)) = synced {
             return Err(e);
@@ -81,19 +85,48 @@ impl GnitzClient {
     /// The first half of [`Self::sync`]: its request, sent. The client is free
     /// until the answer arrives: a request made meanwhile is answered while the
     /// server holds the sync, and leaves it held.
-    pub fn begin_sync(&mut self, wait: Duration) -> Result<Sent<()>, ClientError> {
-        let wait = self.mirror_hold(wait)?;
-        let mirrored = self.mirror.iter().flat_map(|m| m.views.values().filter_map(|v| v.sub));
+    pub fn begin_sync(&mut self, wait: Duration) -> Sent<()> {
+        let wait = if self.unclaimed.is_some() { Duration::ZERO } else { wait };
+        let (wait, mirrored) = self.mirror_hold(wait);
         let held: Vec<u64> = self.readers.keys().copied().chain(mirrored).collect();
-        Ok(self.session.submit_sync(&held, wait))
+        self.session.submit_sync(&held, wait)
     }
 
     /// The second half of [`Self::sync`], given the reply to the first's
     /// request. A sync that failed is the end of every subscription.
+    ///
+    /// What it takes from the client is the caller's alone: a driver whose
+    /// caller is gone by the time it completes hands it to
+    /// [`Self::unclaimed`].
     pub async fn finish_sync(&mut self, synced: Result<(), ClientError>) -> Result<Synced, ClientError> {
         let mirrored = self.advance_mirror(&synced).await?;
-        let pushed = self.drain_readers(&synced);
+        let mut pushed = self.drain_readers(&synced);
+        if let Some(earlier) = self.unclaimed.take() {
+            put_in_front(earlier, &mut pushed);
+        }
         Ok(Synced { pushed, mirrored })
+    }
+
+    /// Hand back a sync's delivery its caller never received: the next sync
+    /// reports it in front of what that one brings, and is not held. Each
+    /// subscription's rows come before the next sync's, under that sync's
+    /// cursor, and an end is reported once; a view reported
+    /// [`PollResult::Reseeded`](crate::PollResult::Reseeded) is reported so
+    /// again by the next sync that advances it.
+    pub fn unclaimed(&mut self, synced: Synced) {
+        let Synced { mut pushed, mirrored } = synced;
+        let reseeded = match self.mirror.as_deref_mut() {
+            Some(m) => m.owe_reseeds(&mirrored),
+            None => false,
+        };
+        // Rows-free entries carry nothing the next sync's cursor does not.
+        pushed.retain(|p| p.result.as_ref().map_or(true, |(rows, _)| !rows.batch.is_empty()));
+        if let Some(earlier) = self.unclaimed.take() {
+            put_in_front(earlier, &mut pushed);
+            self.unclaimed = Some(pushed);
+        } else if reseeded || !pushed.is_empty() {
+            self.unclaimed = Some(pushed);
+        }
     }
 
     /// Take what was pushed for each of a reader's subscriptions, and let go
@@ -117,4 +150,25 @@ impl GnitzClient {
         });
         pushed
     }
+}
+
+/// Put the deliveries of an earlier sync, `earlier`, in front of a later one's,
+/// `later`: a subscription's rows before the later sync's under its cursor,
+/// and an end that sync no longer reports kept. A subscription `later` does
+/// not report and that had not ended was let go of since.
+fn put_in_front(earlier: Vec<Pushed>, later: &mut Vec<Pushed>) {
+    for Pushed { sub, result } in earlier {
+        match (result, later.iter_mut().find(|p| p.sub == sub)) {
+            (Ok((first, _)), Some(Pushed { result: Ok((rows, _)), .. })) => {
+                let next = std::mem::replace(&mut rows.batch, first.batch);
+                rows.batch.extend_from_owned(next);
+            }
+            // The later end stands: the reader reads again from the cursor
+            // it was last handed, which is before these rows.
+            (Ok(_), _) => {}
+            (Err(end), Some(p)) => p.result = Err(end),
+            (Err(end), None) => later.push(Pushed { sub, result: Err(end) }),
+        }
+    }
+    later.sort_by_key(|p| p.sub);
 }

@@ -2,14 +2,13 @@
 //! end of a socketpair feeds reply frames one `step` at a time.
 
 use super::*;
-use crate::protocol::transport::poll_fd;
 use crate::test_support::{
-    decode_wal_block, delta_terminal, framed, kv_rows, kv_schema, pushed_marker, reply_ctrl, reply_rows, reply_status,
-    session_pair as pair, step_until_idle, sync_answer, Peer,
+    decode_wal_block, delta_frame, delta_terminal, kv_rows, kv_schema, pushed_marker, pushed_train, reply_ctrl,
+    reply_rows, reply_status, session_pair as pair, step_until_idle, sync_answer, sync_header, sync_held, Peer,
 };
-use crate::BatchAppender;
-use gnitz_wire::{ColumnDef, ReadBound, ReadSpec, TypeCode, WireStatus};
-use std::os::fd::AsRawFd;
+use crate::transport::poll_fd;
+use crate::{BatchAppender, PkColumn};
+use gnitz_wire::{framed, ColumnDef, ReadBound, ReadSpec, TypeCode, WireStatus};
 
 /// Submit a read of every row of `tid`, decoded under `schema`.
 fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Sent<ScanReply> {
@@ -24,7 +23,7 @@ fn await_reply<T>(s: &mut Session, mut sent: Sent<T>) -> Result<T, ClientError> 
         if let Some(reply) = sent.try_take() {
             return reply;
         }
-        ready = Interest::from_revents(poll_fd(s.as_fd().as_raw_fd(), s.interest().poll_events(), None).unwrap());
+        ready = poll_fd(s.as_fd(), s.interest(), None).unwrap();
     }
 }
 
@@ -338,13 +337,13 @@ fn a_peer_that_closes_surfaces_an_io_error_rather_than_a_park() {
     // The request is on the wire and unread, so dropping the peer draws a
     // reset. A hangup folds into read readiness, so the waiting driver wakes.
     drop(peer);
-    let rev = poll_fd(
-        s.as_fd().as_raw_fd(),
-        Interest::READ.poll_events(),
+    let ready = poll_fd(
+        s.as_fd(),
+        Interest::READ,
         Some(Instant::now() + std::time::Duration::from_secs(5)),
     )
     .expect("poll");
-    assert!(Interest::from_revents(rev).read, "a hangup wakes a read park");
+    assert!(ready.read, "a hangup wakes a read park");
     s.step(Interest::READ);
     let lost = sent.try_take().unwrap();
     assert!(
@@ -497,7 +496,7 @@ fn an_abandoned_poll_queues_nothing() {
     s.step(Interest::WRITE);
     let mut wire = Vec::new();
     for tid in [7, 8] {
-        wire.extend(framed(&reply_rows(tid, &batch_a(&[tid]), 0, true)));
+        wire.extend(framed(&delta_frame(tid, Some(&batch_a(&[tid])), None)));
         wire.extend(framed(&delta_terminal(tid, 1, 9)));
     }
     peer.send_bytes(&wire);
@@ -522,8 +521,8 @@ fn a_delta_read_yields_its_trains_rows_and_the_terminals_cursor() {
     let sent = submit_delta_read(&mut s, &schema);
     s.step(Interest::WRITE);
     peer.recv();
-    peer.send(&reply_rows(7, &batch_a(&[1, 2]), 0, true));
-    peer.send(&reply_rows(7, &batch_a(&[3]), 0, true));
+    peer.send(&delta_frame(7, Some(&batch_a(&[1, 2])), None));
+    peer.send(&delta_frame(7, Some(&batch_a(&[3])), None));
     peer.send(&delta_terminal(7, 1, 9));
     let (reply, cursor) = await_reply(&mut s, sent).unwrap();
     assert_eq!(reply.batch, batch_a(&[1, 2, 3]));
@@ -592,16 +591,36 @@ fn a_resolve_reply_that_does_not_decode_ends_the_session() {
     }
 }
 
-// ── Pushed trains ────────────────────────────────────────────────────────────
+/// A snapshot page's reply names each worker train it carries by its last
+/// frame; a page naming none ends the session, and one naming a worker is
+/// answered with where that worker's rows end.
+#[test]
+fn a_snapshot_page_naming_no_worker_ends_the_session() {
+    let named = |scan_last| ControlHeader {
+        target_id: 7,
+        flags: gnitz_wire::WireFlags { scan_last, ..Default::default() },
+        ..Default::default()
+    };
+    let (mut s, peer) = pair();
+    let sent = s.submit_snapshot_page(1, 7, &[], 10, &schema_a());
+    s.step(Interest::WRITE);
+    peer.recv();
+    peer.send(&encode_frame(named(true), &[], None, None));
+    assert_eq!(await_reply(&mut s, sent).unwrap().worker_ends, [0]);
 
-/// One pushed train of subscription `sub`: its opening frame, one block of
-/// `rows` and the terminal at `(tag 1, round)`.
-fn pushed_train(view: u64, sub: u64, rows: &[u64], round: u64) -> Vec<u8> {
-    let mut out = framed(&pushed_marker(view, sub));
-    out.extend(framed(&reply_rows(view, &batch_a(rows), 0, true)));
-    out.extend(framed(&delta_terminal(view, 1, round)));
-    out
+    let sent = s.submit_snapshot_page(1, 7, &[], 10, &schema_a());
+    s.step(Interest::WRITE);
+    peer.recv();
+    peer.send(&encode_frame(named(false), &[], None, None));
+    let e = await_reply(&mut s, sent).expect_err("a page naming no worker");
+    assert!(
+        matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
+        "{e:?}"
+    );
+    assert!(s.is_closed());
 }
+
+// ── Pushed trains ────────────────────────────────────────────────────────────
 
 /// The cursor `(tag 1, tick)`.
 fn cursor(tick: u64) -> DeltaCursor {
@@ -637,9 +656,9 @@ fn a_pushed_train_between_replies_is_set_aside() {
     let first = s.submit(COMMIT);
     let second = s.submit(COMMIT);
     let mut bytes = framed(&reply_ctrl(0, 1));
-    bytes.extend(pushed_train(40, sub, &[1, 2], 9));
-    bytes.extend(pushed_train(40, sub + 1, &[3], 9));
-    bytes.extend(pushed_train(40, sub, &[4], 11));
+    bytes.extend(pushed_train(40, sub, &batch_a(&[1, 2]), Ok((1, 9))));
+    bytes.extend(pushed_train(40, sub + 1, &batch_a(&[3]), Ok((1, 9))));
+    bytes.extend(pushed_train(40, sub, &batch_a(&[4]), Ok((1, 11))));
     bytes.extend(framed(&reply_ctrl(0, 2)));
     peer.send_bytes(&bytes);
     assert_eq!(await_reply(&mut s, first).unwrap(), 1);
@@ -659,7 +678,7 @@ fn a_released_subscription_parks_no_pushed_train() {
     let sub = subscribe(&mut s, &peer);
     s.release(sub);
     let after = s.submit(COMMIT);
-    let mut bytes = pushed_train(40, sub, &[1, 2], 9);
+    let mut bytes = pushed_train(40, sub, &batch_a(&[1, 2]), Ok((1, 9)));
     bytes.extend(framed(&reply_ctrl(0, 1)));
     peer.send_bytes(&bytes);
     assert_eq!(await_reply(&mut s, after).unwrap(), 1);
@@ -681,9 +700,9 @@ fn a_kept_reads_terminal_parks_its_cursor() {
     let (mut s, peer) = pair();
     let sent = submit_kept_read(&mut s, 5);
     assert!(s.take_pushed(5).is_err(), "unanswered, nothing is held");
-    let mut bytes = framed(&reply_rows(40, &batch_a(&[1, 2]), 0, true));
+    let mut bytes = framed(&delta_frame(40, Some(&batch_a(&[1, 2])), None));
     bytes.extend(framed(&delta_terminal(40, 1, 9)));
-    bytes.extend(pushed_train(40, 5, &[3], 11));
+    bytes.extend(pushed_train(40, 5, &batch_a(&[3]), Ok((1, 11))));
     peer.send_bytes(&bytes);
     let (reply, at) = await_reply(&mut s, sent).unwrap();
     assert_eq!((reply.batch, at), (batch_a(&[1, 2]), cursor(9)));
@@ -714,7 +733,7 @@ fn an_abandoned_kept_poll_is_ended_by_the_next_sync() {
     s.abandon_poll();
     assert_eq!(s.requests_sent(), 1, "the poll alone");
     let mut bytes = framed(&delta_terminal(8, 1, 9));
-    bytes.extend(pushed_train(8, first + 1, &[1], 11));
+    bytes.extend(pushed_train(8, first + 1, &batch_a(&[1]), Ok((1, 11))));
     peer.send_bytes(&bytes);
     step_until_idle(&mut s);
     assert!(!s.is_closed());
@@ -724,21 +743,12 @@ fn an_abandoned_kept_poll_is_ended_by_the_next_sync() {
 
     let synced = s.submit_sync(&[], Duration::from_secs(60));
     s.step(Interest::WRITE);
-    assert_eq!(held_named(&peer.recv()), [0u64; 0], "no owner named either");
+    assert_eq!(sync_held(&peer.recv()), [0u64; 0], "no owner named either");
     peer.send(&sync_answer(None));
     await_reply(&mut s, synced).unwrap();
     let gone = s.take_pushed(first).expect_err("nobody named it");
     assert!(gone.to_string().contains("not held"), "{gone:?}");
     assert!(s.polled_out() && !s.inbox.polls.untaken());
-}
-
-/// The ids a SYNC_PUSHED request names.
-fn held_named(request: &[u8]) -> Vec<u64> {
-    let ctrl = peek_control_block(request).unwrap();
-    assert_eq!(ctrl.hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed);
-    let mut held = txn_frame::decode_held(&request[ctrl.blob]).unwrap();
-    held.sort_unstable();
-    held
 }
 
 #[test]
@@ -767,7 +777,7 @@ fn a_sync_names_what_is_held_and_ends_the_rest() {
                 break request;
             }
         };
-        assert_eq!(held_named(&request), named, "holding {held:?}");
+        assert_eq!(sync_held(&request), named, "holding {held:?}");
         peer.send(&sync_answer(None));
         await_reply(&mut s, synced).unwrap();
     }
@@ -799,7 +809,7 @@ fn a_request_behind_a_sync_is_answered_before_it() {
     let first = s.submit(COMMIT);
     let second = s.submit(COMMIT);
     let mut bytes = framed(&reply_ctrl(0, 1));
-    bytes.extend(pushed_train(40, sub, &[1], 9));
+    bytes.extend(pushed_train(40, sub, &batch_a(&[1]), Ok((1, 9))));
     bytes.extend(framed(&reply_ctrl(0, 2)));
     peer.send_bytes(&bytes);
     assert_eq!(await_reply(&mut s, first).unwrap(), 1);
@@ -828,13 +838,6 @@ fn syncs_are_answered_in_order() {
     await_reply(&mut s, behind).expect("the second answer is the second sync's");
 }
 
-/// The wait a SYNC_PUSHED request asks to be held for, in milliseconds.
-fn wait_asked(request: &[u8]) -> u64 {
-    let ctrl = peek_control_block(request).unwrap();
-    assert_eq!(ctrl.hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed);
-    ctrl.hdr.arg0
-}
-
 /// A sync sent behind an unanswered one asks for no hold, whatever its caller
 /// asked for: the one ahead may be answered with trains whose reader is gone.
 #[test]
@@ -845,8 +848,8 @@ fn a_sync_behind_an_unanswered_one_is_not_held() {
     let _first = s.submit_sync(&[sub], Duration::from_secs(60));
     let _behind = s.submit_sync(&[sub], Duration::from_secs(60));
     s.step(Interest::WRITE);
-    assert_eq!(wait_asked(&peer.recv()), 60_000);
-    assert_eq!(wait_asked(&peer.recv()), 0);
+    assert_eq!(sync_header(&peer.recv()).arg0, 60_000);
+    assert_eq!(sync_header(&peer.recv()).arg0, 0);
 }
 
 /// An answer to a sync nobody sent is a frame this session cannot place, and
@@ -881,7 +884,7 @@ fn a_pushed_fault_ends_its_subscription_and_no_request() {
     let (mut s, peer) = pair();
     let sub = subscribe(&mut s, &peer);
     let sent = s.submit(COMMIT);
-    let mut bytes = pushed_train(40, sub, &[1], 9);
+    let mut bytes = pushed_train(40, sub, &batch_a(&[1]), Ok((1, 9)));
     bytes.extend(framed(&pushed_marker(40, sub)));
     bytes.extend(framed(&reply_status(40, WireStatus::Error, "lagged")));
     bytes.extend(framed(&reply_ctrl(0, 3)));
@@ -904,7 +907,7 @@ fn a_refused_kept_read_parks_nothing() {
         peer.send(&reply_status(named, WireStatus::DeltaExpired, "refused"));
         let refused = await_reply(&mut s, sent);
         assert!(
-            matches!(&refused, Err(ClientError::Refused(f)) if f.status == WireStatus::DeltaExpired),
+            matches!(&refused, Err(e) if e.status() == Some(WireStatus::DeltaExpired)),
             "naming {named}: {refused:?}"
         );
         let gone = s.take_pushed(5).expect_err("nothing is held");
@@ -926,4 +929,119 @@ fn a_pushed_train_naming_another_view_ends_the_session() {
     peer.send_bytes(&bytes);
     assert!(matches!(await_reply(&mut s, sent), Err(ClientError::ConnectionLost(_))));
     assert!(s.is_closed());
+}
+
+/// A pushed train opens with a bare head naming its subscription: an opener
+/// carrying anything else ends the session.
+#[test]
+fn a_pushed_train_opener_that_is_not_bare_ends_the_session() {
+    let marker = |flags: gnitz_wire::WireFlags, status| ControlHeader {
+        target_id: 40,
+        arg0: 5,
+        status,
+        flags: gnitz_wire::WireFlags { lane: WireLane::PushedTrain, ..flags },
+        ..Default::default()
+    };
+    let bare = gnitz_wire::WireFlags::default();
+    let continued = gnitz_wire::WireFlags { continuation: true, ..bare };
+    let ok = WireStatus::Ok;
+    for (what, frame) in [
+        (
+            "a data block",
+            encode_frame(marker(bare, ok), &[], None, Some(&batch_a(&[1]))),
+        ),
+        (
+            "a schema block",
+            encode_frame(marker(bare, ok), &[], Some(&schema_a().to_block()), None),
+        ),
+        ("a blob", encode_frame(marker(bare, ok), b"why", None, None)),
+        ("a continuation", encode_frame(marker(continued, ok), &[], None, None)),
+        (
+            "a fault",
+            encode_frame(marker(bare, WireStatus::Error), b"lagged", None, None),
+        ),
+    ] {
+        let (mut s, peer) = pair();
+        let sent = s.submit(COMMIT);
+        peer.send(&frame);
+        let e = await_reply(&mut s, sent).expect_err(what);
+        assert!(
+            matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(_))),
+            "{what}: {e:?}"
+        );
+        assert!(s.is_closed(), "{what}");
+    }
+}
+
+// ── Request frames ───────────────────────────────────────────────────────────
+
+/// A frame's schema block, decoded.
+fn frame_schema(buf: &[u8], ctrl: &DecodedControl) -> Option<Schema> {
+    ctrl.schema
+        .clone()
+        .map(|r| Schema::from_block(&buf[r]).expect("a schema block decodes"))
+}
+
+/// A frame's data block, decoded under `schema`.
+fn frame_data(buf: &[u8], ctrl: &DecodedControl, schema: &Schema) -> Option<ZSetBatch> {
+    ctrl.data
+        .clone()
+        .map(|r| decode_wal_block(&buf[r], schema).expect("a data block decodes"))
+}
+
+/// A multi-family `PUSH_TXN` frame (both modes, a repeated tid, a delete
+/// family). The frame layout is `gnitz_wire::txn_frame`'s and is tested there;
+/// what this pins is the adapter above it: each family's two blocks are built
+/// from *that* family's schema, batch, tid and basis, in that order.
+#[test]
+fn push_txn_families_carry_their_own_schema_and_batch() {
+    let schema = Arc::new(kv_schema(TypeCode::I64));
+    let b0 = kv_rows(&[(1, 10, 1), (2, 20, 1)]);
+    let b1 = kv_rows(&[(3, 30, 1)]);
+    let b2 = ZSetBatch::retraction(&schema, PkColumn::from_natives(&schema, [4]));
+
+    let family = |tid: u64, batch, mode, basis| PushFamily {
+        target: tid.into(),
+        schema: Arc::clone(&schema),
+        batch,
+        mode,
+        basis,
+    };
+    let blind = gnitz_wire::txn_frame::BLIND;
+    let families = [
+        family(16, b0, WireConflictMode::Update, 42),
+        family(17, b1, WireConflictMode::Error, blind),
+        family(16, b2, WireConflictMode::Update, blind),
+    ];
+    let payload = encode_push_txn(&families);
+
+    let ctrl = peek_control_block(&payload).unwrap();
+    let decoded = gnitz_wire::txn_frame::decode_items(&payload[ctrl.body], ClientVerb::PushTxn).unwrap();
+    assert_eq!(decoded.len(), families.len());
+    for ((frame, fam), want) in decoded.iter().zip(&families) {
+        let got = (fam.hdr.target_id, fam.hdr.flags.conflict_mode, fam.hdr.arg0);
+        assert_eq!(got, (want.target.tid, want.mode, want.basis));
+        let block_schema = frame_schema(frame, fam).unwrap();
+        assert_eq!(block_schema, *schema);
+        assert_eq!(frame_data(frame, fam, &block_schema).as_ref(), Some(&want.batch));
+    }
+}
+
+/// A frame carries its schema record and its rows; an empty batch still ships
+/// the schema, but no data block.
+#[test]
+fn a_frame_carries_its_schema_and_its_rows_unless_empty() {
+    let schema = kv_schema(TypeCode::I64);
+    let hdr = ControlHeader { target_id: 42, ..Default::default() };
+    for batch in [
+        kv_rows(&[(1, 100, 1), (2, 200, 1), (3, 300, 1)]),
+        ZSetBatch::new(&schema),
+    ] {
+        let buf = encode_frame(hdr, &[], Some(&schema.to_block()), Some(&batch));
+        let ctrl = peek_control_block(&buf).unwrap();
+        assert_eq!(ctrl.hdr, hdr);
+        assert_eq!(frame_schema(&buf, &ctrl).as_ref(), Some(&schema));
+        let want = (!batch.is_empty()).then_some(&batch);
+        assert_eq!(frame_data(&buf, &ctrl, &schema).as_ref(), want);
+    }
 }

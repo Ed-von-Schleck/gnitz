@@ -79,7 +79,7 @@ fn host(interrupt: Option<Arc<AtomicBool>>) -> BlockingHost {
 }
 
 fn connect(target: &str, interrupt: Option<Arc<AtomicBool>>) -> Result<GnitzClient, ClientError> {
-    block_on(GnitzClient::connect_with(target, Box::new(host(interrupt))))
+    GnitzClient::connect_on(target, Box::new(host(interrupt)))
 }
 
 impl Shell {

@@ -1,44 +1,44 @@
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover, so each stays that module's own `tests` child and reaches its
-//! private items.
+//! The gnitz client core: the connection to a server and the wire protocol it
+//! speaks, the client-side schema and batch, the DDL and transaction verbs,
+//! and the mirror state machine.
 //!
-//! `src/tests/` holds those; the crate-root `tests/` beside `src/` is the
-//! integration suite, gated on the `integration` feature.
+//! A module's unit tests sit in the `tests/` directory beside it; the crate-root
+//! `tests/` beside `src/` is the integration suite, gated on the `integration`
+//! feature.
 
+mod batch;
 mod catalog;
 mod client;
 mod connection;
+mod ddl;
 mod error;
+mod host;
 pub mod local_server;
 mod mirror;
-mod protocol;
 mod pushed;
 pub mod recording;
 mod rel_name;
+mod schema;
 mod snapshot;
 #[cfg(test)]
 mod test_support;
-mod view_def;
+mod transport;
+mod txn;
 
+pub use batch::{append_own_regions, push_zero_cell, BatchAppender, BatchMark, PayloadColumn, PkColumn, ZSetBatch};
 pub use catalog::{Catalog, CatalogRelation, IndexRow, RelProps};
-pub use client::{
-    block_on, key_reply, not_found, segment_id, serve, BlockingHost, BoxFut, FkTarget, GnitzClient, Host,
-    InlineUniqueIndex, Job, Op, ParkHook, Pending, PlannedView, TableDef, ViewBundle, RMW_MAX_ATTEMPTS,
-};
+pub use client::GnitzClient;
 pub use connection::{
-    promise, DeltaCursor, Interest, Promise, RelDescriptor, Request, ScanReply, Sent, Session, SnapshotPage, Target,
-    MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
+    encode_ddl_txn, DeltaCursor, RelDescriptor, Request, ScanReply, Session, SnapshotPage, Target, MAX_IN_FLIGHT,
+    MAX_QUEUED_BYTES,
 };
-pub use error::{ClientError, ProtocolError};
+pub use ddl::{segment_id, ColumnChange, FkTarget, InlineUniqueIndex, PlannedView, TableDef, ViewBundle};
+pub use error::{not_found, ClientError, ProtocolError};
+pub use host::{block_on, promise, serve, BlockingHost, BoxFut, Host, Job, Op, ParkHook, Pending, Promise, Sent};
 pub use mirror::{MirrorError, MirrorStore, Planner, PollOutcome, PollResult, Subscription};
-pub use protocol::message::{encode_ddl_txn, PushFamily};
-pub(crate) use protocol::message::{encode_frame, encode_push_txn};
-pub use protocol::transport::ClientTransport;
-pub use protocol::types::{
-    push_zero_cell, sys_schema, BatchAppender, BatchMark, PayloadColumn, PkColumn, Schema, ZSetBatch,
-};
-pub use protocol::wal_block::append_own_regions;
 pub use pushed::{Pushed, Synced};
 pub use rel_name::RelName;
+pub use schema::{sys_schema, Schema};
 pub use snapshot::DEFAULT_PAGE_ROWS;
-pub use view_def::{RelationRef, ViewDefinition};
+pub use transport::{poll_fd, ClientTransport, Interest};
+pub use txn::{key_reply, RMW_MAX_ATTEMPTS};

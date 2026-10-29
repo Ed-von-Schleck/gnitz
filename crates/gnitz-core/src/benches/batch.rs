@@ -1,4 +1,8 @@
 use super::*;
+use crate::test_support::{encode_wal_block, wide_rows, wide_schema};
+use crate::BatchAppender;
+use gnitz_wire::{ColumnDef, TypeCode};
+use std::hint::black_box;
 
 /// Instructions per pushed key row: one key column and three through
 /// `push_natives`, whose cost is per column, and one through `from_natives`.
@@ -88,5 +92,91 @@ fn gather_bench() {
                 (gather - clone) as f64 / len as f64
             );
         }
+    }
+}
+
+/// Instructions per row to append a region list of two payload columns to an
+/// empty batch, as a foreign list and as the process's own: what the German
+/// cell check costs, over all-short cells, all-long cells and integer columns,
+/// which carry no cell to check.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn append_regions_bench() {
+    const ROWS: usize = 10_000;
+    const ITERS: usize = 200;
+    let counter = gnitz_foundation::perf::Counter::instructions();
+    for (shape, cell) in [
+        ("short strings", Some("ab")),
+        ("long strings", Some("a value well past the inline cell")),
+        ("integers", None),
+    ] {
+        let tc = cell.map_or(TypeCode::I64, |_| TypeCode::String);
+        let schema = Schema::from_parts(
+            vec![
+                ColumnDef::new("k", TypeCode::U64, false),
+                ColumnDef::new("a", tc, false),
+                ColumnDef::new("b", tc, false),
+            ],
+            &[0],
+        )
+        .unwrap();
+        let mut batch = ZSetBatch::new(&schema);
+        let mut rows = BatchAppender::new(&mut batch);
+        for i in 0..ROWS {
+            rows.add_row(i as u128, 1);
+            match cell {
+                Some(s) => rows.str_val(s).str_val(s),
+                None => rows.i64_val(i as i64).i64_val(7),
+            };
+        }
+        let regions = batch.wire_regions();
+        for foreign in [true, false] {
+            let ((), instr) = counter.measure(|| {
+                for _ in 0..ITERS {
+                    let mut sink = ZSetBatch::with_capacity(&schema, ROWS);
+                    append_regions(&mut sink, black_box(&regions), &schema, black_box(foreign)).unwrap();
+                    black_box(&sink);
+                }
+            });
+            println!(
+                "append_regions_bench {shape}, foreign={foreign}: {:.1} instr/row",
+                instr as f64 / (ITERS * ROWS) as f64
+            );
+        }
+    }
+}
+
+/// Instructions to decode a one-row reply into a fresh batch and into one that
+/// already owns its buffers, by column count.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn reply_alloc_cost_bench() {
+    const ROUNDS: u64 = 2000;
+    let counter = gnitz_foundation::perf::Counter::instructions();
+    for ncols in [4usize, 16, 64] {
+        let schema = wide_schema(ncols, false);
+        let block = encode_wal_block(&wide_rows(&schema, 1, 0));
+        let (mut fresh, mut warm) = (0, 0);
+        for _ in 0..ROUNDS {
+            fresh += counter
+                .measure(|| {
+                    let mut sink = ZSetBatch::new(&schema);
+                    decode_wal_block_into(&mut sink, black_box(&block), &schema).unwrap();
+                    black_box(&sink);
+                })
+                .1;
+            let mut sink = ZSetBatch::with_capacity(&schema, 4);
+            warm += counter
+                .measure(|| {
+                    decode_wal_block_into(&mut sink, black_box(&block), &schema).unwrap();
+                    black_box(&sink);
+                })
+                .1;
+        }
+        println!(
+            "reply_alloc_cost_bench {ncols} cols: new + decode + drop {} instr, decode into owned buffers {}",
+            fresh / ROUNDS,
+            warm / ROUNDS
+        );
     }
 }

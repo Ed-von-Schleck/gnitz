@@ -3,10 +3,11 @@
 //! a view's body is its recorded text with the names the catalog holds now
 //! standing where the original ones stood.
 
-use gnitz_core::{Catalog, CatalogRelation, RelProps, ViewDefinition};
+use gnitz_core::{Catalog, CatalogRelation, RelProps};
 use gnitz_wire::{FkAction, TableDistribution};
 
 use super::options::with_options;
+use super::view_def::ViewDefinition;
 use crate::names::{column_text, relation_text};
 use crate::types::{serial_type_name, sql_type_name};
 
@@ -116,7 +117,7 @@ pub fn create_view_statement(catalog: &Catalog, rel: &CatalogRelation) -> Result
     let RelProps::View(_) = rel.props else {
         return Err(format!("{} is not a view", rel.qualified()));
     };
-    let def = rel.definition().map_err(|e| format!("{}: {e}", rel.qualified()))?;
+    let def = ViewDefinition::decode(&rel.definition).map_err(|e| format!("{}: {e}", rel.qualified()))?;
     let mut out = format!("CREATE VIEW {}", qualified_name(rel));
     let names: Vec<&str> = rel.visible_columns().map(|c| c.name.as_str()).collect();
     if !same_names(&def.body_columns, &names) {

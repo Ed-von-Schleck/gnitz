@@ -1,6 +1,7 @@
 use super::*;
-use crate::test_support::{framed, transport_pair};
+use crate::test_support::{tls_pair, transport_pair};
 use gnitz_foundation::posix_io::set_sockopt_int;
+use gnitz_wire::framed;
 
 /// Instructions per burst over the reading passes that take it, by transport
 /// and burst shape, each burst written whole before the first pass.
@@ -12,7 +13,7 @@ fn read_burst_bench() {
     let (unix, peer) = transport_pair();
     // The largest burst is written with nobody reading.
     set_sockopt_int(peer.0.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 1 << 20).unwrap();
-    let (tls, end) = tls::tests::pair(None);
+    let (tls, end) = tls_pair(None);
     let mut ends: [(&str, ClientTransport, Box<dyn Write>); 2] =
         [("unix", unix, Box::new(peer.0)), ("tls", tls, Box::new(end))];
     // Frame lengths: one small frame, many in one read, and a payload wide
@@ -30,7 +31,7 @@ fn read_burst_bench() {
                 peer.flush().unwrap();
                 let mut left = frames.len();
                 while left > 0 {
-                    poll_fd(t.as_raw_fd(), libc::POLLIN, None).unwrap();
+                    poll_fd(t.as_fd(), Interest::READ, None).unwrap();
                     let ((), instr) = counter.measure(|| {
                         while t
                             .read(|f| {

@@ -10,15 +10,15 @@
 
 use super::*;
 use crate::block_on;
-use crate::protocol::message::encode_frame;
-use crate::protocol::transport::poll_fd;
+use crate::connection::encode_frame;
 use crate::test_support::{
-    delta_terminal, framed, interrupt_self_until, kv_rows, kv_schema, pushed_marker, rel, reply_ctrl, reply_status,
-    session_pair, sync_answer, Peer,
+    client_pair, delta_frame, delta_terminal, interrupt_self_until, kv_rows, kv_schema, pushed_train, rel, reply_ctrl,
+    reply_status, sync_answer, sync_header, sync_held, Peer,
 };
 use crate::BlockingHost;
-use gnitz_wire::{peek_control_block, ControlHeader, RelDescriptorBlob, TypeCode};
-use std::os::fd::{AsFd, AsRawFd};
+use crate::{poll_fd, Interest};
+use gnitz_wire::{framed, peek_control_block, ControlHeader, RelDescriptorBlob, TypeCode};
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -157,35 +157,17 @@ impl MirrorStore for StubStore {
 
 /// How long a request that is on its way may take. Only ever paid in full by a
 /// regression, which then fails rather than hangs.
+///
+/// A script's peer is dropped when the script ends, so a request it does not
+/// expect fails fast instead of parking the client; each test counts
+/// `requests_sent` to catch one.
 const PATIENCE: Duration = Duration::from_secs(5);
-
-// A script's peer is dropped when the script ends, so a request it does not
-// expect fails fast instead of parking the client; each test counts
-// `requests_sent` to catch one.
-/// A data frame of `view`'s train carrying `rows`: a continuation, or with
-/// `end` the terminal at round `end`.
-fn rows_frame(view: u64, rows: &[(u64, i64, i64)], end: Option<u64>) -> Vec<u8> {
-    let hdr = ControlHeader {
-        target_id: view,
-        flags: gnitz_wire::WireFlags {
-            continuation: end.is_none(),
-            ..Default::default()
-        },
-        arg0: end.unwrap_or(0),
-        arg1: TAG,
-        ..Default::default()
-    };
-    encode_frame(hdr, &[], None, Some(&kv_rows(rows)))
-}
 
 impl Peer {
     /// The next request frame, which must already be on its way.
     fn expect_frame(&self, what: &str) -> Vec<u8> {
-        let ready = poll_fd(self.0.as_raw_fd(), libc::POLLIN, Some(Instant::now() + PATIENCE));
-        assert!(
-            ready.is_ok_and(|revents| revents & libc::POLLIN != 0),
-            "{what}: the request never arrived"
-        );
+        let ready = poll_fd(self.0.as_fd(), Interest::READ, Some(Instant::now() + PATIENCE));
+        assert!(ready.is_ok_and(|ready| ready.read), "{what}: the request never arrived");
         self.recv()
     }
 
@@ -214,12 +196,7 @@ impl Peer {
     /// The subscription ids the next request, a SYNC_PUSHED, names as held,
     /// in ascending order.
     fn expect_sync_naming(&self, what: &str) -> Vec<u64> {
-        let frame = self.expect_frame(what);
-        let ctrl = peek_control_block(&frame).expect("a control header");
-        assert_eq!(ctrl.hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed, "{what}");
-        let mut held = gnitz_wire::txn_frame::decode_held(&frame[ctrl.blob]).expect("held ids");
-        held.sort_unstable();
-        held
+        sync_held(&self.expect_frame(what))
     }
 
     /// Send [`delta_terminal`]: one view's answer inside a poll.
@@ -229,28 +206,14 @@ impl Peer {
 
     /// The next request, which must be a SYNC_PUSHED: its control header.
     fn expect_sync(&self, what: &str) -> ControlHeader {
-        let frame = self.expect_frame(what);
-        let hdr = peek_control_block(&frame).expect("a control header").hdr;
-        assert_eq!(hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed, "{what}");
-        hdr
+        sync_header(&self.expect_frame(what))
     }
 
-    /// Send [`rows_frame`].
-    fn send_rows(&self, view: u64, rows: &[(u64, i64, i64)], end: Option<u64>) {
-        self.send(&rows_frame(view, rows, end));
-    }
-
-    /// One pushed train of subscription `sub` to `view`: `rows`, ending at
+    /// One [`pushed_train`] of subscription `sub` to `view`: `rows`, ending at
     /// round `tick` — or, with no round, in a fault.
     fn push_train(&self, view: u64, sub: u64, rows: &[(u64, i64, i64)], tick: Option<u64>) {
-        self.send(&pushed_marker(view, sub));
-        let Some(tick) = tick else {
-            return self.send(&reply_status(view, WireStatus::Error, "lagged"));
-        };
-        if !rows.is_empty() {
-            self.send_rows(view, rows, None);
-        }
-        self.reply_watermark(view, TAG, tick);
+        let end = tick.map(|tick| (TAG, tick)).ok_or("lagged");
+        self.send_bytes(&pushed_train(view, sub, &kv_rows(rows), end));
     }
 
     /// A RESOLVE answering with `tid`: the schema block plus a view descriptor
@@ -279,8 +242,7 @@ impl Peer {
 /// `(tid, name, tick)` is registered under `s.name`, confirmed, and, at a
 /// non-zero tick, holds a feed position. Nothing goes over the wire.
 fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
-    let (session, peer) = session_pair();
-    let mut client = GnitzClient::from_session(session);
+    let (mut client, peer) = client_pair();
     let log = Log::default();
     let cursors = views
         .iter()
@@ -306,9 +268,8 @@ fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
             spec: gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode(),
             plan: None,
             confirmed: false,
-            failed: false,
+            link: Link::Due,
             owed_reseed: false,
-            sub: None,
         };
         block_on(client.bind(entry)).unwrap();
         client.mirror.as_mut().unwrap().views.get_mut(&tid).unwrap().confirmed = true;
@@ -318,6 +279,12 @@ fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
         "registration tears nothing down"
     );
     (client, peer, log)
+}
+
+/// Put `host` in place of `client`'s, attached to its session.
+fn rehost(client: &mut GnitzClient, host: BlockingHost) {
+    client.host = Box::new(host);
+    client.host.attach(client.session.as_fd()).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +379,7 @@ fn only_a_stale_registration_pays_a_resolve() {
             "status {status:?}: got {report:?}"
         );
         assert!(
-            client.mirrors(7),
+            client.cursor_of(7).is_some(),
             "status {status:?}: a failed poll leaves the copy answering its last round",
         );
     }
@@ -425,13 +392,13 @@ fn a_bootstrap_fills_the_store_frame_by_frame() {
     let watched = log.clone();
     let h = std::thread::spawn(move || {
         assert_eq!(peer.expect_poll("the bootstrap"), vec![7]);
-        peer.send_rows(7, &[(1, 10, 1)], None);
+        peer.send(&delta_frame(7, Some(&kv_rows(&[(1, 10, 1)])), None));
         let until = Instant::now() + PATIENCE;
         while !watched.saw(|e| matches!(e, Ev::Fill(7))) {
             assert!(Instant::now() < until, "the first block never reached the store");
             std::thread::sleep(Duration::from_millis(1));
         }
-        peer.send_rows(7, &[(2, 20, 1)], Some(20));
+        peer.send(&delta_frame(7, Some(&kv_rows(&[(2, 20, 1)])), Some((TAG, 20))));
     });
     let report = poll(&mut client);
     h.join().unwrap();
@@ -486,8 +453,8 @@ fn a_refused_block_fails_its_view_and_no_other() {
         let mut kept = 0;
         for (tid, id) in peer.expect_kept("the poll") {
             if tid == 7 {
-                peer.send_rows(7, &[(1, 10, 1)], None);
-                peer.send_rows(7, &[(2, 20, 1)], None);
+                peer.send(&delta_frame(7, Some(&kv_rows(&[(1, 10, 1)])), None));
+                peer.send(&delta_frame(7, Some(&kv_rows(&[(2, 20, 1)])), None));
             } else {
                 kept = id;
             }
@@ -497,7 +464,7 @@ fn a_refused_block_fails_its_view_and_no_other() {
     });
     let report = poll(&mut client);
     let (peer, kept) = h.join().unwrap();
-    drop(client.begin_sync(Duration::ZERO).expect("a sync is sent"));
+    drop(client.begin_sync(Duration::ZERO));
     client.session.step(crate::Interest::WRITE);
     assert_eq!(peer.expect_sync_naming("the next sync"), [kept], "8's, and not 7's");
     let failed: Vec<u64> = report
@@ -518,7 +485,7 @@ fn a_whole_read_refused_mid_train_leaves_the_copy() {
     log.take();
     let h = std::thread::spawn(move || {
         assert_eq!(peer.expect_poll("the poll"), vec![7]);
-        let mut wire = framed(&rows_frame(7, &[(1, 10, 1)], None));
+        let mut wire = framed(&delta_frame(7, Some(&kv_rows(&[(1, 10, 1)])), None));
         wire.extend(framed(&reply_status(7, WireStatus::Error, "refused")));
         peer.send_bytes(&wire);
         peer
@@ -741,7 +708,7 @@ fn a_recovery_that_moves_and_then_fails_is_reported_at_the_new_id() {
         "{report:?}"
     );
     assert_eq!(client.mirrored_ids(), [9]);
-    assert!(!client.mirrors(9), "a copy never synced answers no read");
+    assert!(client.cursor_of(9).is_none(), "a copy never synced answers no read");
 }
 
 /// A registration whose store record went with a `register` that failed after
@@ -787,14 +754,16 @@ fn an_interrupted_poll_reannounces_its_reseed() {
     // As a view never read on this connection stands.
     client.mirror.as_mut().unwrap().views.get_mut(&7).unwrap().confirmed = false;
     let watched = log.clone();
-    client.host = Box::new(BlockingHost::with_hook(Box::new(move || {
-        if watched.saw(|e| matches!(e, Ev::Seal(7, _))) {
-            Err("interrupted".into())
-        } else {
-            Ok(())
-        }
-    })));
-    client.host.attach(client.session.as_fd()).unwrap();
+    rehost(
+        &mut client,
+        BlockingHost::with_hook(Box::new(move || {
+            if watched.saw(|e| matches!(e, Ev::Seal(7, _))) {
+                Err("interrupted".into())
+            } else {
+                Ok(())
+            }
+        })),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let sig = interrupt_self_until(Arc::clone(&stop));
 
@@ -814,8 +783,7 @@ fn an_interrupted_poll_reannounces_its_reseed() {
     assert!(matches!(r, Err(ClientError::Interrupted(_))), "{r:?}");
     stop.store(true, Ordering::Relaxed);
     sig.join().unwrap();
-    client.host = Box::new(BlockingHost::default());
-    client.host.attach(client.session.as_fd()).unwrap();
+    rehost(&mut client, BlockingHost::default());
     let peer = h.join().unwrap();
 
     let h = std::thread::spawn(move || {
@@ -956,7 +924,7 @@ fn a_dead_connection_fails_each_view_rather_than_the_call() {
             "lost before: {lost_before}: {report:?}",
         );
         assert!(
-            client.mirrors(7) && client.mirrors(8),
+            client.cursor_of(7).is_some() && client.cursor_of(8).is_some(),
             "and both copies still answer at the round they reached",
         );
     }
@@ -1025,7 +993,7 @@ fn a_train_behind_another_reply_waits_for_its_poll() {
         peer.expect_sync("the poll");
         peer.send(&sync_answer(None));
     });
-    assert_eq!(block_on(client.alloc_id()).unwrap(), 4242);
+    assert_eq!(block_on(client.alloc_ids(1)).unwrap(), 4242);
     assert!(log.take().is_empty(), "a copy moves only in a poll");
     poll(&mut client);
     h.join().unwrap();
@@ -1100,19 +1068,85 @@ fn one_sync_serves_a_reader_and_the_mirror() {
 }
 
 #[test]
+fn a_sync_nobody_received_is_reported_by_the_next() {
+    let (mut client, peer, _log) = fixture(&[]);
+    let (sub, peer) = subscribe_reader(&mut client, peer);
+    let h = std::thread::spawn(move || {
+        peer.expect_sync("the sync");
+        peer.push_train(40, sub, &[(1, 10, 1), (2, 20, 2)], Some(11));
+        peer.send(&sync_answer(None));
+        peer
+    });
+    let synced = block_on(client.sync(Duration::ZERO)).expect("the sync");
+    let peer = h.join().unwrap();
+    // A driver whose caller dropped the sync's `Sent` gets the delivery back.
+    let (mut to, sent) = crate::promise();
+    drop(sent);
+    let back = to.offer(Ok(synced)).expect("nobody holds the reply");
+    client.unclaimed(back.expect("the sync succeeded"));
+
+    let h = std::thread::spawn(move || {
+        let hdr = peer.expect_sync("the next sync");
+        assert_eq!(hdr.arg0, 0, "a held delivery is no reason to wait");
+        peer.push_train(40, sub, &[(1, 10, -1)], Some(12));
+        peer.send(&sync_answer(None));
+    });
+    let synced = block_on(client.sync(Duration::from_secs(30))).expect("the next sync");
+    h.join().unwrap();
+    let [pushed] = &synced.pushed[..] else {
+        panic!("one entry per subscription")
+    };
+    let (rows, at) = pushed.result.as_ref().expect("the subscription is held");
+    assert_eq!((pushed.sub, at.tick.get()), (sub, 12), "under the later cursor");
+    let pks: Vec<u128> = (0..rows.batch.len()).map(|i| rows.batch.pks.get(i)).collect();
+    assert_eq!(pks, [1, 2, 1], "the unreceived rows first");
+    assert_eq!(rows.batch.weights, [1, 2, -1]);
+    assert!(client.unclaimed.is_none(), "reported once");
+}
+
+#[test]
+fn an_unreceived_end_is_reported_once() {
+    let (mut client, peer, _log) = fixture(&[]);
+    let (sub, peer) = subscribe_reader(&mut client, peer);
+    let h = std::thread::spawn(move || {
+        peer.expect_sync("the sync");
+        peer.push_train(40, sub, &[], None);
+        peer.send(&sync_answer(None));
+        peer
+    });
+    let synced = block_on(client.sync(Duration::ZERO)).expect("the sync");
+    let peer = h.join().unwrap();
+    assert!(matches!(synced.pushed[..], [crate::Pushed { result: Err(_), .. }]));
+    client.unclaimed(synced);
+
+    let h = std::thread::spawn(move || {
+        let held = peer.expect_sync_naming("the next sync");
+        assert!(held.is_empty(), "{held:?}");
+        peer.send(&sync_answer(None));
+    });
+    let synced = block_on(client.sync(Duration::ZERO)).expect("the next sync");
+    h.join().unwrap();
+    assert!(matches!(synced.pushed[..], [crate::Pushed { sub: s, result: Err(_) }] if s == sub));
+    let synced = block_on(client.sync(Duration::ZERO)).expect("the sync after");
+    assert!(synced.pushed.is_empty(), "the end is reported once");
+}
+
+#[test]
 fn an_interrupted_sync_keeps_a_readers_deltas() {
     let (mut client, peer, _log) = fixture(&[(7, "a", 4)]);
     let (sub, peer) = subscribe_reader(&mut client, peer);
     let reading = Arc::new(AtomicBool::new(false));
     let watched = Arc::clone(&reading);
-    client.host = Box::new(BlockingHost::with_hook(Box::new(move || {
-        if watched.load(Ordering::Relaxed) {
-            Err("interrupted".into())
-        } else {
-            Ok(())
-        }
-    })));
-    client.host.attach(client.session.as_fd()).unwrap();
+    rehost(
+        &mut client,
+        BlockingHost::with_hook(Box::new(move || {
+            if watched.load(Ordering::Relaxed) {
+                Err("interrupted".into())
+            } else {
+                Ok(())
+            }
+        })),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let sig = interrupt_self_until(Arc::clone(&stop));
 
@@ -1131,8 +1165,7 @@ fn an_interrupted_sync_keeps_a_readers_deltas() {
     assert!(matches!(r, Err(ClientError::Interrupted(_))), "{r:?}");
     stop.store(true, Ordering::Relaxed);
     sig.join().unwrap();
-    client.host = Box::new(BlockingHost::default());
-    client.host.attach(client.session.as_fd()).unwrap();
+    rehost(&mut client, BlockingHost::default());
     let (peer, abandoned) = h.join().unwrap();
 
     let h = std::thread::spawn(move || {
@@ -1195,7 +1228,7 @@ fn a_sync_over_an_untaken_train_asks_for_no_hold() {
         peer.send(&sync_answer(None));
         hdr.arg0
     });
-    assert_eq!(block_on(client.alloc_id()).unwrap(), 4242);
+    assert_eq!(block_on(client.alloc_ids(1)).unwrap(), 4242);
     let synced = block_on(client.sync(Duration::from_secs(30))).unwrap();
     assert_eq!(synced.mirrored.len(), 2);
     assert_eq!(h.join().unwrap(), 0, "no hold in front of a train already here");

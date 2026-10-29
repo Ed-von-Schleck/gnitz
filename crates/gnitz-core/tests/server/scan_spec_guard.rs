@@ -4,7 +4,7 @@
 
 use super::*;
 use gnitz_core::sys_schema;
-use gnitz_wire::{WireFault, WireStatus, TABLE_TAB};
+use gnitz_wire::{WireStatus, TABLE_TAB};
 
 #[test]
 fn scan_spec_at_a_system_tid_is_served_once_and_checks_its_layout() {
@@ -29,12 +29,13 @@ fn scan_spec_at_a_system_tid_is_served_once_and_checks_its_layout() {
     assert_ne!(one_col.layout().layout_digest(), tables.layout().layout_digest());
     let err = block_on(client.scan_spec(TABLE_TAB, &ReadSpec::all_rows(ReadBound::None), &one_col))
         .expect_err("a reply layout that is not the family's must be refused");
-    assert!(
-        matches!(&err, ClientError::Refused(WireFault { status: WireStatus::Error, .. })),
+    assert_eq!(
+        err.status(),
+        Some(WireStatus::Error),
         "expected a WireStatus::Error reply, got {err:?}"
     );
 
     // The error frame is non-continuation, so the connection is still usable for
     // a full round trip.
-    block_on(client.alloc_id()).unwrap();
+    block_on(client.alloc_ids(1)).unwrap();
 }

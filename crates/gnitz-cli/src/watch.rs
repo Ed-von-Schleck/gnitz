@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use gnitz_core::{block_on, ClientError, ScanReply, Subscription};
 use gnitz_sql::GnitzSqlError;
-use gnitz_wire::{WireFault, WireStatus};
+use gnitz_wire::WireStatus;
 use nu_ansi_term::{Color, Style};
 
 use crate::render::{Expanded, Format, Weights};
@@ -32,13 +32,8 @@ pub fn watch_query(arg: &str, schema: &str) -> String {
 /// no longer continues the cursor, or (`StaleCatalog`) the view resolves
 /// differently and the `SELECT` is planned again.
 fn restart_status(e: &ClientError) -> Option<WireStatus> {
-    match e {
-        ClientError::Refused(WireFault {
-            status: s @ (WireStatus::DeltaExpired | WireStatus::StaleCatalog),
-            ..
-        }) => Some(*s),
-        _ => None,
-    }
+    e.status()
+        .filter(|s| matches!(s, WireStatus::DeltaExpired | WireStatus::StaleCatalog))
 }
 
 impl Shell {

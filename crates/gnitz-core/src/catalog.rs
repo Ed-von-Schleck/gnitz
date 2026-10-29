@@ -13,7 +13,7 @@ use gnitz_wire::{
     SchemaTabRow, TableProps, TableTabRow, ViewParts, ViewProps, ViewTabRow, SYSTEM_SCHEMA,
 };
 
-use crate::{ProtocolError, RelName, ViewDefinition, ZSetBatch};
+use crate::{ProtocolError, RelName, ZSetBatch};
 
 /// The families a [`Catalog`] is decoded from, in the order
 /// [`Catalog::decode`] takes their rows.
@@ -60,7 +60,7 @@ pub struct CatalogRelation {
     /// The relations a view's chain scans, ascending; empty for any other
     /// relation.
     pub reads: Vec<u64>,
-    /// A user view's [`ViewDefinition`] as its row stores it, undecoded so one
+    /// A user view's encoded definition as its row stores it, undecoded so one
     /// unreadable definition costs only its own view; empty for every other
     /// relation.
     pub definition: Vec<u8>,
@@ -79,11 +79,6 @@ impl CatalogRelation {
             reads: Vec::new(),
             definition: Vec::new(),
         }
-    }
-
-    /// A user view's definition; an error for a relation that stores none.
-    pub fn definition(&self) -> Result<ViewDefinition, String> {
-        ViewDefinition::decode(&self.definition)
     }
 
     /// What this relation is, as a RESOLVE of it answers.

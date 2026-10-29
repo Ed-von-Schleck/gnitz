@@ -277,4 +277,4 @@ impl TlsInner {
 
 #[cfg(test)]
 #[path = "tests/tls.rs"]
-pub(super) mod tests;
+mod tests;

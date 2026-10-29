@@ -24,10 +24,7 @@ fn resolve_reports_found_absent_and_missing_schema() {
     assert_eq!(visible_names(&rel.schema), ["id", "v"]);
     assert!(!db.exists("nope"));
     let err = block_on(db.client.resolve(&crate::rel("no_such_schema", "t"))).unwrap_err();
-    assert!(
-        matches!(&err, ClientError::Refused(WireFault { status: NotFound, .. })),
-        "got: {err:?}"
-    );
+    assert_eq!(err.status(), Some(NotFound), "got: {err:?}");
 }
 
 /// A name longer than the PK-region head rides the request's explicit blob, so
@@ -325,7 +322,7 @@ fn an_interrupted_resolve_ends_the_statement() {
         host: BlockingHost::default(),
         armed: Arc::clone(&armed),
     };
-    let mut client = block_on(GnitzClient::connect_with(db.srv.sock_path(), Box::new(host))).unwrap();
+    let mut client = GnitzClient::connect_on(db.srv.sock_path(), Box::new(host)).unwrap();
     block_on(gnitz_sql::execute(&mut client, &db.sn, "SELECT * FROM t1")).unwrap();
 
     let before = client.requests_sent();
