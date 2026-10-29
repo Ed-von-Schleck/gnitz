@@ -27,18 +27,29 @@ pub fn assert_ladder(src_root: &Path, ladder: &[&[&str]]) {
         );
     }
     for (tier, rungs) in ladder.iter().enumerate() {
-        let beneath = ladder[..tier].concat();
         for rung in *rungs {
-            for f in rung_files(src_root, rung) {
-                let src = fs::read_to_string(&f).unwrap();
-                for path in src.split("crate::").skip(1) {
-                    let named = path.split(|c: char| c != '_' && !c.is_alphanumeric()).next().unwrap();
-                    assert!(
-                        named == *rung || beneath.contains(&named) || UNLADDERED.contains(&named),
-                        "{}: {rung}/ names crate::{named}, which is not beneath it",
-                        f.display(),
-                    );
-                }
+            let allowed = [&[*rung], &ladder[..tier].concat()[..], &UNLADDERED[..]].concat();
+            assert_rungs_name_only(src_root, &[rung], "crate", &allowed);
+        }
+    }
+}
+
+/// Assert that every path into crate `krate` from a file of `rungs` leads with
+/// one of `allowed`: the modules of a crate beneath that these rungs may reach.
+///
+/// It reads paths as [`assert_ladder`] does: a grouped `krate::{…}` import is
+/// refused and a module renamed on import is checked under its own name, but a
+/// reach through an alias of `krate` itself goes unseen.
+pub fn assert_rungs_name_only(src_root: &Path, rungs: &[&str], krate: &str, allowed: &[&str]) {
+    for rung in rungs {
+        for f in rung_files(src_root, rung) {
+            let src = fs::read_to_string(&f).unwrap();
+            for named in heads(&src, krate) {
+                assert!(
+                    allowed.contains(&named),
+                    "{}: {rung}/ names {krate}::{named}, which is not beneath it",
+                    f.display(),
+                );
             }
         }
     }
@@ -64,6 +75,17 @@ pub fn rung_files(src_root: &Path, rung: &str) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// The name each `root::` path in `src` leads with; `""` for a grouped
+/// `root::{…}`. A `root` that ends a longer identifier (`my_crate::`) is not
+/// this one.
+fn heads<'a>(src: &'a str, root: &'a str) -> impl Iterator<Item = &'a str> {
+    let ident = |c: char| c == '_' || c.is_alphanumeric();
+    src.match_indices(root).filter_map(move |(at, _)| {
+        let rest = src[at + root.len()..].strip_prefix("::")?;
+        (!src[..at].ends_with(ident)).then(|| &rest[..rest.find(|c: char| !ident(c)).unwrap_or(rest.len())])
+    })
 }
 
 fn entries(dir: &Path) -> Vec<PathBuf> {
