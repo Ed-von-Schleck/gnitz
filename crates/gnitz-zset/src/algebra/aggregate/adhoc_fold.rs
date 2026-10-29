@@ -122,7 +122,7 @@ struct AssignGroups<'a> {
 impl IdentityLoop for AssignGroups<'_> {
     type Out = Result<(), String>;
 
-    fn run(self, identity: impl Fn(usize) -> u128, _: bool) -> Self::Out {
+    fn run(self, identity: impl Fn(usize) -> u128) -> Self::Out {
         for row in self.ranges.iter().flat_map(|&(s, e)| s..e) {
             let g = self.numbers.ordinal(identity(row), || {
                 let g = self.groups.len();

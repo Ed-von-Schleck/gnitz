@@ -50,21 +50,6 @@ macro_rules! stride_dispatch {
 }
 pub(crate) use stride_dispatch;
 
-/// Instantiate `$f` at the const width of one column cell, `$w`.
-macro_rules! cell_width_dispatch {
-    ($w:expr, $f:ident, $($arg:expr),* $(,)?) => {
-        match $w {
-            1 => $f::<1>($($arg),*),
-            2 => $f::<2>($($arg),*),
-            4 => $f::<4>($($arg),*),
-            8 => $f::<8>($($arg),*),
-            16 => $f::<16>($($arg),*),
-            w => unreachable!("a column cell is 1, 2, 4, 8 or 16 bytes, not {w}"),
-        }
-    };
-}
-pub(crate) use cell_width_dispatch;
-
 /// The width a [`stride_dispatch!`] target runs at: `N`, or `width` in the
 /// runtime arm.
 #[inline(always)]
@@ -186,7 +171,11 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
             }
         } else {
             let src_col = batch.col_data(pi);
-            cell_width_dispatch!(cs, gather_col, src_col, writer.col_mut(pi), indices);
+            gnitz_wire::by_cell_width!(cs, |T| gather_col::<{ size_of::<T>() }>(
+                src_col,
+                writer.col_mut(pi),
+                indices
+            ));
         }
     }
 }
@@ -381,7 +370,13 @@ fn scatter_unified_sources(
                 }
             }
         } else {
-            cell_width_dispatch!(cs, gather_unified_col, sources, cols, rows, pi, writer.col_mut(pi));
+            gnitz_wire::by_cell_width!(cs, |T| gather_unified_col::<{ size_of::<T>() }>(
+                sources,
+                cols,
+                rows,
+                pi,
+                writer.col_mut(pi)
+            ));
         }
     }
 }
@@ -461,7 +456,9 @@ pub(crate) fn gather_rows(sources: &[impl ColumnarSource], schema: &SchemaDescri
                 }
             } else {
                 let dst = w.col_mut(pi);
-                cell_width_dispatch!(col.size(), gather_cells, sources, picks, pi, dst);
+                gnitz_wire::by_cell_width!(col.size(), |T| gather_cells::<{ size_of::<T>() }>(
+                    sources, picks, pi, dst
+                ));
             }
         }
     })

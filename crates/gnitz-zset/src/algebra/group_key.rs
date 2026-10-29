@@ -204,9 +204,7 @@ impl OutPk<'_> {
 /// A row loop keyed by group identity; see [`GroupOutKey::with_identity`].
 pub(crate) trait IdentityLoop {
     type Out;
-    /// `is_out_pk`: each identity is its row's output PK read as a big-endian
-    /// integer; else it is a digest of it.
-    fn run(self, identity: impl Fn(usize) -> u128, is_out_pk: bool) -> Self::Out;
+    fn run(self, identity: impl Fn(usize) -> u128) -> Self::Out;
 }
 
 /// V₀, the output PK of the empty group set's one group.
@@ -282,11 +280,11 @@ impl GroupOutKey {
         match self.key.form(mb) {
             KeyForm::Cells(cells) => {
                 for_key_cells!(cells, |W, OPK| body
-                    .run(|r| cell_image::<W, OPK>(cells.cell::<W>(r), cells.signed), true))
+                    .run(|r| cell_image::<W, OPK>(cells.cell::<W>(r), cells.signed)))
             }
-            KeyForm::Fold(f) => body.run(|r| f.key_row(mb, r), true),
+            KeyForm::Fold(f) => body.run(|r| f.key_row(mb, r)),
             KeyForm::Packed(p) => packed_identity(p, mb, rows, body),
-            KeyForm::WidePk { at, n } => body.run(|r| gnitz_wire::checksum_128(mb.get_pk_range(r, at, n)), false),
+            KeyForm::WidePk { at, n } => body.run(|r| gnitz_wire::checksum_128(mb.get_pk_range(r, at, n))),
         }
     }
 
@@ -318,8 +316,10 @@ impl GroupOutKey {
     pub(crate) fn numbered(&self, batch: &Batch) -> GroupOrdinals {
         let mb = &batch.as_mem_batch();
         let n = mb.len();
-        // Too few rows do not pay for a hash table.
-        if let Some(groups) = (n >= HASH_MIN_ROWS)
+        // Too few rows do not pay for a hash table. A wide PK's identity is a
+        // digest, which does not sort as the PK.
+        let hashable = n >= HASH_MIN_ROWS && !matches!(self.key.form(mb), KeyForm::WidePk { .. });
+        if let Some(groups) = hashable
             .then(|| self.with_identity(mb, &[(0, n)], Hashed { n }))
             .flatten()
         {
@@ -359,9 +359,9 @@ fn packed_identity<L: IdentityLoop>(p: &KeyPacker, mb: &MemBatch, rows: &[(usize
     let every = rows == [(0, mb.len())];
     if every || p.packs_by_column() && !(few(rows.len()) && few(crate::repr::range_rows(rows))) {
         let (keys, w) = (p.keys(mb), p.out_stride);
-        return body.run(|r| gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w]), true);
+        return body.run(|r| gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w]));
     }
-    body.run(|r| p.narrow_image(mb, r), true)
+    body.run(|r| p.narrow_image(mb, r))
 }
 
 /// Fewest rows per row read at which [`packed_identity`] packs a column-packed
@@ -479,14 +479,10 @@ struct Hashed {
 
 impl IdentityLoop for Hashed {
     /// `None` once the batch holds more groups than
-    /// [`HASH_MIN_ROWS_PER_GROUP`] admits for its rows, or where an identity
-    /// does not sort as its output PK.
+    /// [`HASH_MIN_ROWS_PER_GROUP`] admits for its rows.
     type Out = Option<GroupOrdinals>;
 
-    fn run(self, identity: impl Fn(usize) -> u128, is_out_pk: bool) -> Self::Out {
-        if !is_out_pk {
-            return None;
-        }
+    fn run(self, identity: impl Fn(usize) -> u128) -> Self::Out {
         let limit = self.n / HASH_MIN_ROWS_PER_GROUP;
         let mut numbers = GroupNumbers::default();
         let mut ord: Vec<u32> = Vec::with_capacity(self.n);

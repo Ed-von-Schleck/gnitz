@@ -10,8 +10,8 @@
 use std::cmp::Ordering;
 
 use crate::repr::{
-    cell_width_dispatch, copy_runs, pk_group_end, relocated_cell, runs_where, should_relocate_blob, stride_dispatch,
-    Batch, CursorRow, ReadCursor,
+    copy_runs, pk_group_end, relocated_cell, runs_where, should_relocate_blob, stride_dispatch, Batch, CursorRow,
+    ReadCursor,
 };
 use crate::schema::key::{band, compare_pk_ordering, group_floor, key_above};
 use crate::schema::{DerivedSchema, SchemaDescriptor};
@@ -442,17 +442,22 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
                     }
                 }
                 ColumnLocator::Payload { slot: pi, size, .. } => {
-                    cell_width_dispatch!(size as usize, repeat_cells, cursor, pi as usize, w.col_mut(slot), pairs)
+                    gnitz_wire::by_cell_width!(size as usize, |T| repeat_cells::<{ size_of::<T>() }>(
+                        cursor,
+                        pi as usize,
+                        w.col_mut(slot),
+                        pairs
+                    ))
                 }
-                ColumnLocator::Pk { byte_off, size, type_code } => cell_width_dispatch!(
-                    size as usize,
-                    repeat_pk_cells,
-                    cursor,
-                    byte_off as usize,
-                    type_code.is_signed_int(),
-                    w.col_mut(slot),
-                    pairs
-                ),
+                ColumnLocator::Pk { byte_off, size, type_code } => {
+                    gnitz_wire::by_cell_width!(size as usize, |T| repeat_pk_cells::<{ size_of::<T>() }>(
+                        cursor,
+                        byte_off as usize,
+                        type_code.is_signed_int(),
+                        w.col_mut(slot),
+                        pairs
+                    ))
+                }
             }
         }
         any_ghost
