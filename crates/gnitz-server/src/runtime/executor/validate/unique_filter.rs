@@ -1,12 +1,11 @@
-//! Master-side unique-index filters: for each `(table_id, col_indices)`, the
-//! spans that unique index holds, so a write probes only the spans it cannot
-//! prove absent.
+//! Unique-index filters: for each `(table_id, col_indices)`, the spans that
+//! unique index holds, so a write probes only the spans it cannot prove absent.
 
 use rustc_hash::FxHashSet;
 
 use super::*;
 use gnitz_wire::PkKeys;
-use gnitz_zset::algebra::{spans, KeySpec};
+use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::schema::probe_key;
 
 /// Spans a filter tracks before it disables itself.
@@ -44,8 +43,14 @@ impl UniqueFilter {
         true
     }
 
+    /// Records every span of `spans` up to the first the cap refuses; false
+    /// once the filter has capped.
+    pub(super) fn insert_all<'s>(&mut self, spans: impl IntoIterator<Item = &'s [u8]>) -> bool {
+        spans.into_iter().all(|span| self.insert(span))
+    }
+
     /// Whether the cap has disabled the filter.
-    fn is_capped(&self) -> bool {
+    pub(super) fn is_capped(&self) -> bool {
         self.values.is_none()
     }
 
@@ -58,20 +63,7 @@ impl UniqueFilter {
     }
 }
 
-/// Insert the indexed span of every live row of `batch` into `filter`; a NULL
-/// in an indexed column means no span and no occupancy.
-pub(super) fn extract_into_filter(filter: &mut UniqueFilter, batch: &gnitz_zset::repr::MemBatch<'_>, spec: &KeySpec) {
-    if filter.is_capped() {
-        return;
-    }
-    for span in spans(batch, spec).chunks_exact(spec.key_size()) {
-        if !filter.insert(span) {
-            return;
-        }
-    }
-}
-
-impl MasterDispatcher {
+impl Checks {
     /// The spans of `keys` the filter for `(table_id, cols)` cannot prove
     /// absent: all of them where it has none.
     pub(super) fn unique_filter_retain_possible(&self, table_id: u64, cols: PkColList, mut keys: PkKeys) -> PkKeys {
@@ -81,32 +73,18 @@ impl MasterDispatcher {
         keys
     }
 
-    /// Record every indexed span of a durable `batch` on `table_id`.
-    pub(super) fn unique_filter_ingest_batch(&self, table_id: u64, batch: &Batch) {
-        let Some(relation) = self.cat().registry.relation(table_id) else {
-            return;
-        };
-        let mb = batch.as_mem_batch();
-        let mut filters = self.unique_filters.borrow_mut();
-        for ic in relation.unique_indexes_to_check() {
-            if let Some(filter) = filters.get_mut(&(table_id, ic.cols())) {
-                extract_into_filter(filter, &mb, ic.key_spec());
-            }
-        }
-    }
-
-    /// Drop every filter of `table_id`.
-    pub(super) fn unique_filter_invalidate_table(&self, table_id: u64) {
-        self.unique_filters.borrow_mut().retain(|&(t, _), _| t != table_id);
-    }
-
     /// Drop the filter for one index, leaving the table's other filters.
-    pub(crate) fn unique_filter_remove(&self, owner_id: u64, cols: PkColList) {
+    pub(in crate::runtime::executor) fn unique_filter_remove(&self, owner_id: u64, cols: PkColList) {
         self.unique_filters.borrow_mut().remove(&(owner_id, cols));
     }
 
     /// Publish a filter holding every span of the index on `cols`.
-    pub(crate) fn unique_filter_seed(&self, table_id: u64, cols: PkColList, filter: UniqueFilter) {
+    pub(in crate::runtime::executor) fn unique_filter_seed(
+        &self,
+        table_id: u64,
+        cols: PkColList,
+        filter: UniqueFilter,
+    ) {
         self.unique_filters.borrow_mut().insert((table_id, cols), filter);
     }
 
@@ -114,6 +92,7 @@ impl MasterDispatcher {
     /// spans the workers' index stores hold.
     pub(super) async fn ensure_unique_filters_warm(
         &self,
+        disp: &MasterDispatcher,
         table_id: u64,
         uniques: &[(PkColList, KeySpec)],
     ) -> Result<(), WireFault> {
@@ -121,15 +100,13 @@ impl MasterDispatcher {
             if self.unique_filters.borrow().contains_key(&(table_id, cols)) {
                 continue;
             }
-            let lease = self.scan(Read::KeySpans { tid: table_id, cols, claim: false }).await?;
+            let lease = disp.scan(Read::KeySpans { tid: table_id, cols, claim: false }).await?;
             let (span_schema, mut filter) = (spec.span_schema(), UniqueFilter::new());
             // A capped filter reads no further; the lease drop discards the rest.
-            'train: while let Some(frame) = lease.next().await? {
-                let spans = frame.rows(&span_schema);
-                for i in 0..spans.len() {
-                    if !filter.insert(spans.get_pk_bytes(i)) {
-                        break 'train;
-                    }
+            while let Some(frame) = lease.next().await? {
+                let spans = frame.rows(&span_schema).pk().chunks_exact(span_schema.pk_stride());
+                if !filter.insert_all(spans) {
+                    break;
                 }
             }
             self.unique_filter_seed(table_id, cols, filter);

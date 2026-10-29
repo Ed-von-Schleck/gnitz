@@ -3,7 +3,8 @@
 //! (`PreflightKeyStream`) and their k-way merge (`merge_index_scan`).
 //!
 //! Nothing here is on the write path — `preflight.rs` holds that — and the only
-//! state shared with it is the `UniqueFilter` this pre-flight seeds.
+//! state shared with it is the `UniqueFilter` this pre-flight seeds. It reads
+//! no cache.
 
 use super::*;
 
@@ -60,7 +61,8 @@ async fn merge_index_scan(
     use std::collections::BinaryHeap;
 
     let mut streams: Vec<PreflightKeyStream> = scan
-        .workers()
+        .targets()
+        .set
         .iter()
         .map(|w| PreflightKeyStream { lease: scan, w, frame: None, keys: 0..0 })
         .collect();
@@ -87,56 +89,54 @@ async fn merge_index_scan(
     Ok(Some(seed))
 }
 
-impl MasterDispatcher {
-    /// Pre-flight global uniqueness check for CREATE UNIQUE INDEX, distributed:
-    /// each worker enters the index on `cols` under the pre-flight's claim,
-    /// filled from its committed partition, and streams its spans back off it,
-    /// sorted; the master's streaming k-way merge (`merge_index_scan`) finds any
-    /// adjacent equal pair, within or across partitions — which no worker's own
-    /// slice can show. Master memory is `O(num_workers)` plus the (≤ cap) filter seed.
-    ///
-    /// MUST run inside the DDL critical section (committer barrier drained,
-    /// catalog write lock held) and BEFORE the IDX_TAB +1 is appended, so the
-    /// index each worker filled is the one its catalog claim adopts. The caller
-    /// releases the pre-flight's claims, committed or not.
-    ///
-    /// `Some(filter)` seeds the master's unique-filter cache; `None` when the
-    /// index covers the owner's PK and so can never collide.
-    pub async fn validate_unique_index_create(
-        &self,
-        owner_id: u64,
-        cols: PkColList,
-    ) -> Result<Option<UniqueFilter>, WireFault> {
-        let spec = {
-            let cat = self.cat();
-            let Some(owner_schema) = cat.registry.relation(owner_id).map(Relation::schema) else {
-                // Created in this same bundle, so empty.
-                return Ok(Some(UniqueFilter::new()));
-            };
-            // What the IDX_TAB precheck refuses is refused before any scan.
-            let spec = cat.validate_index_create(owner_id, cols.as_slice(), true)?;
-            // A PK-covering index skips the scan, and every check it would ever plan.
-            if owner_schema.covers_pk(cols.as_slice()) {
-                return Ok(None);
-            }
-            spec
+/// Pre-flight global uniqueness check for CREATE UNIQUE INDEX, distributed:
+/// each worker enters the index on `cols` under the pre-flight's claim,
+/// filled from its committed partition, and streams its spans back off it,
+/// sorted; the master's streaming k-way merge (`merge_index_scan`) finds any
+/// adjacent equal pair, within or across partitions — which no worker's own
+/// slice can show. Master memory is `O(num_workers)` plus the (≤ cap) filter seed.
+///
+/// MUST run inside the DDL critical section (committer barrier drained,
+/// catalog write lock held) and BEFORE the IDX_TAB +1 is appended, so the
+/// index each worker filled is the one its catalog claim adopts. The caller
+/// releases the pre-flight's claims, committed or not.
+///
+/// `Some(filter)` seeds the index's unique filter; `None` when the
+/// index covers the owner's PK and so can never collide.
+pub(in crate::runtime::executor) async fn validate_unique_index_create(
+    disp: &MasterDispatcher,
+    owner_id: u64,
+    cols: PkColList,
+) -> Result<Option<UniqueFilter>, WireFault> {
+    let spec = {
+        let cat = disp.cat();
+        let Some(owner_schema) = cat.registry.relation(owner_id).map(Relation::schema) else {
+            // Created in this same bundle, so empty.
+            return Ok(Some(UniqueFilter::new()));
         };
-        let frame_schema = spec.span_schema();
+        // What the IDX_TAB precheck refuses is refused before any scan.
+        let spec = cat.validate_index_create(owner_id, cols.as_slice(), true)?;
+        // A PK-covering index skips the scan, and every check it would ever plan.
+        if owner_schema.covers_pk(cols.as_slice()) {
+            return Ok(None);
+        }
+        spec
+    };
+    let frame_schema = spec.span_schema();
 
-        // A replicated owner is read on one worker: every worker's copy would
-        // pop each value `nw` times.
-        let lease = self.scan(Read::KeySpans { tid: owner_id, cols, claim: true }).await?;
+    // A replicated owner is read on one worker: every worker's copy would
+    // pop each value `nw` times.
+    let lease = disp.scan(Read::KeySpans { tid: owner_id, cols, claim: true }).await?;
 
-        let Some(seed) = merge_index_scan(&lease, &frame_schema).await? else {
-            let cat = self.cat();
-            return Err(integrity_violation(format!(
-                "cannot create unique index on '{}' column '{}': column contains duplicate values",
-                cat.qualified_name(owner_id),
-                cat.column_names(owner_id, cols.as_slice()),
-            )));
-        };
-        Ok(Some(seed))
-    }
+    let Some(seed) = merge_index_scan(&lease, &frame_schema).await? else {
+        let cat = disp.cat();
+        return Err(integrity_violation(format!(
+            "cannot create unique index on '{}' column '{}': column contains duplicate values",
+            cat.qualified_name(owner_id),
+            cat.column_names(owner_id, cols.as_slice()),
+        )));
+    };
+    Ok(Some(seed))
 }
 
 #[cfg(test)]

@@ -12,6 +12,14 @@ use gnitz_zset::schema::SchemaColumn;
 
 // ── Fixtures ─────────────────────────────────────────────────────────────
 
+impl Vm {
+    /// Every instruction's op, in program order; the compiler's tests read
+    /// emitted programs through it.
+    pub(in crate::query) fn ops(&self) -> impl Iterator<Item = &Op> {
+        self.instructions.iter().map(|i| &i.op)
+    }
+}
+
 /// The view a test program's children are opened under.
 const VIEW_ID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
 

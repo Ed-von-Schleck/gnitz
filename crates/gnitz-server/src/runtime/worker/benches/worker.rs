@@ -1,7 +1,9 @@
-use super::tests::{addressed, engine_with_table, frames, pk_keys, probe, push, worker_over};
+use super::tests::{addressed, frames, pk_keys, probe, push, worker_over};
 use super::*;
 use crate::runtime::sal::SalExcl;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, net_weight, register_identity_view, u64_i64_cols};
+use crate::test_support::{
+    make_batch_raw, make_schema_u64_i64, net_weight, register_identity_view, table_engine, u64_i64_cols,
+};
 use gnitz_foundation::perf::Counter;
 use gnitz_store::relation::IndexClaim;
 use gnitz_wire::{PkColList, PkKeys, ReadBound, ReadSpec, WireStatus};
@@ -26,7 +28,7 @@ fn arm(
     frames_owed: usize,
     holds: u64,
 ) {
-    let (mut engine, tid) = engine_with_table(&format!("request_bench_{label}"));
+    let (mut engine, tid) = table_engine("worker", &format!("request_bench_{label}"), 1, &u64_i64_cols());
     prepare(&mut engine, tid);
     let rows: Vec<_> = (0..held).map(|i| (i, 1, i as i64)).collect();
     let batch = make_batch_raw(&make_schema_u64_i64(), &rows);

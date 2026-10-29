@@ -18,23 +18,31 @@ fn lock_set(engine: &CatalogEngine, tid: u64) -> Vec<u64> {
     lock_set_of(engine, tid, true)
 }
 
+/// Create `public.parent(pid U64)` on PK [0]; its id.
+fn parent(engine: &mut CatalogEngine) -> u64 {
+    engine
+        .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
+        .unwrap()
+}
+
+/// A child's columns `(cid U64, fk U64)`, `fk` referencing `parent`'s column 0.
+fn child_cols(parent: u64) -> [CatalogColumn; 2] {
+    [col_def("cid", TypeCode::U64), fk_def("fk", TypeCode::U64, parent, 0)]
+}
+
 #[test]
 fn test_write_lock_set() {
     let mut engine = fresh("write_lock_set");
 
     // A base table with no FK yet: needs a lock for itself (its writes run
     // enforce_unique_pk against the store), but no peers.
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
-        .unwrap();
+    let parent_tid = parent(&mut engine);
     assert_eq!(lock_set(&engine, parent_tid), vec![parent_tid]);
 
     // Add a child with FK to parent. Now both tables share a lock neighborhood.
-    let child_cols = vec![
-        col_def("cid", TypeCode::U64),
-        fk_def("fk", TypeCode::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
+    let child_tid = engine
+        .create_table("public.child", &child_cols(parent_tid), &[0])
+        .unwrap();
     let mut expected = vec![parent_tid, child_tid];
     expected.sort_unstable();
     assert_eq!(
@@ -49,11 +57,9 @@ fn test_write_lock_set() {
     );
 
     // Second child: parent's neighborhood grows; each child only sees itself + parent.
-    let child2_cols = vec![
-        col_def("cid", TypeCode::U64),
-        fk_def("fk", TypeCode::U64, parent_tid, 0),
-    ];
-    let child2_tid = engine.create_table("public.child2", &child2_cols, &[0]).unwrap();
+    let child2_tid = engine
+        .create_table("public.child2", &child_cols(parent_tid), &[0])
+        .unwrap();
     let mut expected3 = vec![parent_tid, child_tid, child2_tid];
     expected3.sort_unstable();
     assert_eq!(lock_set(&engine, parent_tid), expected3);
@@ -139,14 +145,10 @@ fn a_self_cascading_table_locks_itself_once() {
 fn test_fk_drop_protections() {
     let mut engine = fresh("fk_prot");
 
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
+    let parent_tid = parent(&mut engine);
+    let child_tid = engine
+        .create_table("public.child", &child_cols(parent_tid), &[0])
         .unwrap();
-    let child_cols = vec![
-        col_def("cid", TypeCode::U64),
-        fk_def("pid_fk", TypeCode::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // The FK column carries a derived circuit, claimed under its column index.
     let fk_circuit = |engine: &CatalogEngine| {
@@ -175,14 +177,10 @@ fn test_fk_drop_protections() {
 #[test]
 fn dropped_fk_child_leaves_no_edge() {
     let mut engine = fresh("fk_child_drop_lock");
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
+    let parent_tid = parent(&mut engine);
+    let child_tid = engine
+        .create_table("public.child", &child_cols(parent_tid), &[0])
         .unwrap();
-    let child_cols = vec![
-        col_def("cid", TypeCode::U64),
-        fk_def("pid_fk", TypeCode::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     engine.drop_table("public.child").unwrap();
 
@@ -204,14 +202,10 @@ fn dropped_fk_child_leaves_no_edge() {
 fn co_dropped_fk_parent_and_child_leave_no_edge() {
     for child_first in [false, true] {
         let mut engine = fresh(&format!("fk_co_drop_lock_{child_first}"));
-        let parent_tid = engine
-            .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
+        let parent_tid = parent(&mut engine);
+        let child_tid = engine
+            .create_table("public.child", &child_cols(parent_tid), &[0])
             .unwrap();
-        let child_cols = vec![
-            col_def("cid", TypeCode::U64),
-            fk_def("pid_fk", TypeCode::U64, parent_tid, 0),
-        ];
-        let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
         let order = if child_first {
             [child_tid, parent_tid]
@@ -237,19 +231,13 @@ fn co_dropped_fk_parent_and_child_leave_no_edge() {
 #[test]
 fn creating_a_child_of_a_parent_the_same_delta_drops_is_refused() {
     let mut engine = fresh("fk_child_of_dropped_parent");
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
-        .unwrap();
+    let parent_tid = parent(&mut engine);
     let child_tid = engine.allocate_ids(1).unwrap();
-    let child_cols = [
-        col_def("cid", TypeCode::U64),
-        fk_def("pid_fk", TypeCode::U64, parent_tid, 0),
-    ];
 
     let mut batch = engine.retract_under(SysFamily::Table, &[parent_tid]);
     batch.append_batch(&table_tab_batch(&[(child_tid, "child", 1)]));
     let blocks = [
-        (SysFamily::Column, col_tab_batch(child_tid, &child_cols, 1)),
+        (SysFamily::Column, col_tab_batch(child_tid, &child_cols(parent_tid), 1)),
         (SysFamily::Table, batch),
     ];
     let err = apply_ddl(&mut engine, blocks).expect_err("a child of a parent this delta drops must be refused");
@@ -478,11 +466,7 @@ fn test_push_reads_committed_state() {
     let parent_tid = engine
         .create_table("public.p", &[col_def("pid", TypeCode::U64)], &[0])
         .unwrap();
-    let child_cols = vec![
-        col_def("cid", TypeCode::U64),
-        fk_def("fk", TypeCode::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.c", &child_cols, &[0]).unwrap();
+    let child_tid = engine.create_table("public.c", &child_cols(parent_tid), &[0]).unwrap();
     assert!(engine.push_reads_committed_state(child_tid, Update));
     assert!(engine.push_reads_committed_state(parent_tid, Update));
 
@@ -514,19 +498,10 @@ fn test_push_reads_committed_state() {
 fn test_fk_multiple_children_same_parent() {
     let mut engine = fresh("fk_multi_child");
 
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
-        .unwrap();
-
-    let mk_child = |engine: &mut CatalogEngine, name: &str| -> u64 {
-        let cols = vec![
-            col_def("cid", TypeCode::U64),
-            fk_def("fk", TypeCode::U64, parent_tid, 0),
-        ];
-        engine.create_table(name, &cols, &[0]).unwrap()
-    };
-    let _child1_tid = mk_child(&mut engine, "public.child1");
-    let _child2_tid = mk_child(&mut engine, "public.child2");
+    let parent_tid = parent(&mut engine);
+    for child in ["public.child1", "public.child2"] {
+        engine.create_table(child, &child_cols(parent_tid), &[0]).unwrap();
+    }
 
     // Both children should reference the parent
     let children = engine.fks_as_parent(parent_tid);

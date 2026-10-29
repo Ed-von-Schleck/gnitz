@@ -1,7 +1,7 @@
-use super::super::fixtures::test_dispatcher;
 use super::*;
+use crate::runtime::master::fixtures::test_dispatcher;
 use crate::runtime::test_support::try_poll_once;
-use crate::test_support::{make_batch_raw, scratch_dir, u64_i64_cols};
+use crate::test_support::{make_batch_raw, table_engine, u64_i64_cols};
 use gnitz_foundation::perf::Counter;
 
 /// What the master spends on an insert before it can commit it, in instructions
@@ -11,10 +11,7 @@ use gnitz_foundation::perf::Counter;
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn preflight_probe_bench() {
-    let dir = scratch_dir("master", "preflight_probe_bench");
-    let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
-    let cols = u64_i64_cols();
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let (mut engine, tid) = table_engine("validate", "preflight_probe_bench", 1, &u64_i64_cols());
     let schema = engine.registry.relation(tid).unwrap().schema();
 
     let counter = Counter::instructions();
@@ -36,12 +33,13 @@ fn preflight_probe_bench() {
         let inserted: Vec<_> = ids.iter().map(|&i| (i, 1, i as i64)).collect();
         // Its own: no worker drains the SAL the validations write to.
         let (disp, _) = test_dispatcher(vec![0; 4], &mut engine);
+        let checks = Checks::new();
         let mut families = vec![TxnFamily {
             tid,
             mode: WireConflictMode::Error,
             batch: make_batch_raw(&schema, &inserted),
         }];
-        let mut validate = || counter.measure(|| try_poll_once(disp.validate_txn_distributed(&mut families)));
+        let mut validate = || counter.measure(|| try_poll_once(checks.validate_txn(&disp, &mut families)));
         validate(); // the fold's and the scatter's first allocations
         let (verdict, instructions) = validate();
         assert!(verdict.is_none(), "{rows} rows: a verdict with no worker answering");
@@ -51,6 +49,7 @@ fn preflight_probe_bench() {
         );
     }
 
+    let dir = engine.registry.base_dir().to_owned();
     drop(engine);
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -59,18 +59,21 @@ fn a_bulk_write_evicts_and_records_nothing() {
 /// invalidated, and a durable batch reaches that table's cache alone.
 #[test]
 fn a_table_has_a_cache_from_its_first_found_key() {
-    let (disp, _writers) = super::super::fixtures::test_dispatcher(vec![0], std::ptr::null_mut());
-    let held = |keys: [u64; 3]| disp.fk_presence_of(9).map(|cache| held(&cache, keys));
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
+    let checks = Checks::new();
+    let held = |keys: [u64; 3]| checks.fk_presence_of(9).map(|cache| held(&cache, keys));
     assert_eq!(held([5, 6, 7]), None);
 
-    disp.fk_presence_found(9, 5);
-    disp.fk_presence_found(9, 7);
+    checks.fk_presence_found(9, 5);
+    checks.fk_presence_found(9, 7);
     assert_eq!(held([5, 6, 7]), Some(vec![5, 7]));
 
-    disp.fk_presence_ingest_batch(8, &batch([(7, -1)]));
-    disp.fk_presence_ingest_batch(9, &batch([(5, -1)]));
-    disp.fk_presence_invalidate_table(8);
+    checks.committed(&engine, 8, &batch([(7, -1)]));
+    checks.committed(&engine, 9, &batch([(5, -1)]));
+    checks.forget(8);
     assert_eq!(held([5, 6, 7]), Some(vec![7]));
-    disp.fk_presence_invalidate_table(9);
+    checks.forget(9);
     assert_eq!(held([5, 6, 7]), None);
+    engine.close();
 }

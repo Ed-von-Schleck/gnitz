@@ -43,10 +43,11 @@ pub(super) async fn backup(shared: &Shared, name: &[u8]) -> Result<(), WireFault
         }
         Err(e) => return Err(format!("create backup '{partial}': {e}").into()),
     }
-    let result = match shared.committer.backup(partial.clone()) {
-        Ok(rx) => rx.await.and_then(|()| publish(&partial, &dest, root)),
-        Err(e) => Err(e),
-    };
+    let result = shared
+        .committer
+        .backup(partial.clone())
+        .await
+        .and_then(|()| publish(&partial, &dest, root));
     drop(catalog);
     if result.is_err() {
         // Only this request made the directory, and it is no backup.

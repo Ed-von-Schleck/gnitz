@@ -134,7 +134,12 @@ impl<'c> WorkerProcess<'c> {
                 if in_drive && !beside_drive {
                     gnitz_fatal_abort!("{apply:?} inside an exchange wait — diverged from the master");
                 }
-                self.apply_request(route, apply, rows);
+                if let Err(e) = self.apply(&apply, rows) {
+                    gnitz_fatal_abort!("worker: {apply:?} failed: {e} — aborting for restart");
+                }
+                if route.request_id != NO_REPLY_REQUEST_ID {
+                    self.w2m_writer.send_ack(route.request_id);
+                }
                 // Before the next group: a parked read answers from the state its
                 // drive left.
                 if drives {
@@ -144,18 +149,9 @@ impl<'c> WorkerProcess<'c> {
         }
     }
 
-    /// Apply a state change and ACK it. The SAL holds the change and every other
-    /// worker applies it: a worker that cannot has diverged from the log, and only
-    /// a restart brings it back.
-    fn apply_request(&mut self, route: ReplyRoute, apply: Apply<'_>, rows: Option<Box<Batch>>) {
-        if let Err(e) = self.apply(&apply, rows) {
-            gnitz_fatal_abort!("worker: {apply:?} failed: {e} — aborting for restart");
-        }
-        if route.request_id != NO_REPLY_REQUEST_ID {
-            self.w2m_writer.send_ack(route.request_id);
-        }
-    }
-
+    /// Apply a state change. The SAL holds the change and every other worker
+    /// applies it: a worker that cannot has diverged from the log, and only a
+    /// restart brings it back.
     fn apply(&mut self, apply: &Apply<'_>, rows: Option<Box<Batch>>) -> Result<(), String> {
         match *apply {
             Apply::Flush => self.catalog.registry.checkpoint_base(),
@@ -164,7 +160,7 @@ impl<'c> WorkerProcess<'c> {
             Apply::DdlSync { family } => {
                 let Some(rows) = rows else { return Ok(()) };
                 self.catalog.ddl_sync(family, *rows)?;
-                gnitz_debug!("ddl_sync tid={}", family);
+                gnitz_debug!("ddl_sync tid={}", family.id());
                 Ok(())
             }
             Apply::Push { tid } => {

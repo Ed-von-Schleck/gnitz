@@ -219,9 +219,8 @@ impl CatalogEngine {
 
     /// Apply one DdlSync group: above the store's cut when a view scans the
     /// family, for the tick the master sends behind the zone.
-    pub(crate) fn ddl_sync(&mut self, table_id: u64, batch: Batch) -> Result<(), String> {
-        let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
-        self.apply_family(family, &batch, self.dag.is_scanned(table_id))
+    pub(crate) fn ddl_sync(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
+        self.apply_family(family, &batch, self.dag.is_scanned(family.id()))
     }
 
     // -- Applied zone -------------------------------------------------------------

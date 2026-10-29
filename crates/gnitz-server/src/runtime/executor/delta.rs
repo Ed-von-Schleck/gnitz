@@ -19,7 +19,9 @@ use super::peer::Peer;
 use super::tick::fresh_read_lock;
 use super::{forward_scan, send_fault, send_msg, target_kind, Access, Shared};
 use crate::runtime::frame::WireMsg;
+use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{PeerGone, SendBody, TrainLease};
+use crate::runtime::sal::Read;
 use crate::runtime::sync::{chan, oneshot, select2, ReadGuard};
 use gnitz_wire::txn_frame::{decode_delta_items, delta_poll_kept, DeltaPollItem};
 use gnitz_wire::{ControlHeader, Target, WireFault, WireStatus};
@@ -30,6 +32,36 @@ const DELTA_CUT_READS: usize = 64;
 
 /// The longest a SYNC_PUSHED is held, whatever wait it asks for.
 const SYNC_MAX_WAIT: Duration = Duration::from_secs(3600);
+
+/// One cut of delta reads, each given as `(view, after_tick, spec,
+/// reply_layout)`: a read of `view`'s deltas after `after_tick`. Each lease is
+/// paired with the round its read reaches, the view's last when the read was
+/// written. No reads take no SAL hold.
+async fn delta_cut<'s>(
+    disp: &MasterDispatcher,
+    reads: impl IntoIterator<Item = (u64, u64, &'s [u8], u64)>,
+) -> Result<Vec<(TrainLease, u64)>, WireFault> {
+    let mut reads = reads.into_iter().peekable();
+    if reads.peek().is_none() {
+        return Ok(Vec::new());
+    }
+    let mut reached = Vec::with_capacity(reads.size_hint().0);
+    let leases = disp
+        .scan_cut(|cut| {
+            for (view, after_tick, spec, reply_layout) in reads {
+                cut.read(Read::Delta {
+                    view,
+                    after_tick,
+                    reply_layout,
+                    spec: spec.into(),
+                })?;
+                reached.push(disp.last_delta_round(view));
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(leases.into_iter().zip(reached).collect())
+}
 
 // ---------------------------------------------------------------------------
 // DELTA_POLL
@@ -123,10 +155,12 @@ pub(super) async fn handle_delta_poll(
             judged.filter_map(|(v, p)| matches!(p, PollPosition::Moved { .. }).then_some(v))
         };
         // Each moved view's read, with the round it reaches.
-        let mut dispatches = disp
-            .delta_cut(moved().map(|i| (i.view.tid, i.from.map_or(0, |c| c.tick.get()), i.spec, i.reply_layout)))
-            .await?
-            .into_iter();
+        let mut dispatches = delta_cut(
+            disp,
+            moved().map(|i| (i.view.tid, i.from.map_or(0, |c| c.tick.get()), i.spec, i.reply_layout)),
+        )
+        .await?
+        .into_iter();
         // Phase 2 reads no catalog state, and holding the lock across the
         // forward would block DDL.
         drop(catalog);
@@ -195,7 +229,7 @@ async fn hold_lock(
     // No await from the test to the park, so no commit is acknowledged between
     // them. The drain above was one: a commit it did not take is un-ticked here.
     let mut watched = shared.cat().dag.source_closure(ids());
-    if !(shared.dispatcher.all_ticked(&watched) && quiet()) {
+    if !(shared.ticks.all_ticked(&watched) && quiet()) {
         return Ok(g);
     }
     // A commit or a drop reaches a view through the view or anything it reads.
@@ -704,13 +738,13 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
                     Err(fault) => feeds.end(feed, &fault),
                 }
             }
-            let cut = disp
-                .delta_cut(
-                    reads
-                        .iter()
-                        .map(|&(feed, cursor)| (feed.key.view.tid, cursor, &*feed.key.spec, feed.key.layout)),
-                )
-                .await;
+            let cut = delta_cut(
+                disp,
+                reads
+                    .iter()
+                    .map(|&(feed, cursor)| (feed.key.view.tid, cursor, &*feed.key.spec, feed.key.layout)),
+            )
+            .await;
             drop(catalog);
             match cut {
                 Ok(cut) => {

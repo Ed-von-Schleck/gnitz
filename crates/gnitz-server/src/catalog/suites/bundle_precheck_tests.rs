@@ -65,7 +65,7 @@ fn a_schema_row_takes_the_full_identifier_rule_once_per_name() {
 #[test]
 fn an_index_row_name_must_be_canonical() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("b", TypeCode::I64)];
-    let (mut engine, tid) = table_fixture("bundle_index_names", &cols);
+    let (mut engine, tid) = table_engine("catalog", "bundle_index_names", 1, &cols);
     let id = engine.allocate_ids(1).unwrap();
 
     let mixed = idx_tab_batch(id, tid, &[1], "MixedCase", false, 1);
@@ -79,7 +79,7 @@ fn an_index_row_name_must_be_canonical() {
 /// directory would carry a name the directory grammar does not parse.
 #[test]
 fn an_index_row_repeating_a_column_is_refused() {
-    let (mut engine, tid) = table_fixture("bundle_index_repeated_col", &u64_i64_cols());
+    let (mut engine, tid) = table_engine("catalog", "bundle_index_repeated_col", 1, &u64_i64_cols());
     let index_id = engine.allocate_ids(1).unwrap();
 
     let row = gnitz_wire::IdxTabRow {
@@ -109,7 +109,7 @@ fn a_view_row_names_a_real_owner_and_a_canonical_name() {
     // Staged as a worker applies them: no bundle carries an ownerless column block.
     for id in [vid, user, other] {
         engine
-            .ddl_sync(SysFamily::Column.id(), col_tab_batch(id, &u64_i64_cols(), 1))
+            .ddl_sync(SysFamily::Column, col_tab_batch(id, &u64_i64_cols(), 1))
             .unwrap();
     }
     // `rows` of `(view id, name, owner, capacity)`.

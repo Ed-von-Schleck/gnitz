@@ -1,6 +1,6 @@
 //! The MasterDispatcher's writes: ACKed rounds (checkpoint halves, the boot-end
-//! stamp, backfill, tick), the DDL zone, push groups, the backup round, the
-//! tick ledger and its delta rounds, and worker reaping.
+//! stamp, backfill, tick) and the tick rounds they allocate, the DDL zone, push
+//! groups, the backup round, and worker reaping.
 
 use std::time::Duration;
 
@@ -19,77 +19,7 @@ pub(crate) const WORKER_WATCH: Duration = Duration::from_millis(100);
 /// its own, as a crash part-way through a backup would.
 static BACKUP_ABORT: Seam = Seam::new("GNITZ_INJECT_BACKUP_ABORT");
 
-/// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next tick emit, once, as a full SAL
-/// would.
-static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
-
 impl MasterDispatcher {
-    pub(crate) fn new(worker_pids: Vec<i32>, catalog: *mut CatalogEngine, sal: SalWriter, reactor: Reactor) -> Self {
-        debug_assert_eq!(
-            sal.num_workers(),
-            worker_pids.len(),
-            "the SAL is written at the worker count"
-        );
-        MasterDispatcher {
-            worker_pids,
-            sal,
-            reactor,
-            catalog,
-            unique_filters: RefCell::new(FxHashMap::default()),
-            fk_presence: RefCell::new(FxHashMap::default()),
-            fk_presence_cap: gnitz_foundation::env::env_num("GNITZ_FK_PRESENCE_KEYS", 1usize << 20),
-            ledger: TickLedger {
-                pending: RefCell::new(FxHashMap::default()),
-                coalesce_rows: gnitz_foundation::env::env_num("GNITZ_TICK_COALESCE_ROWS", 10_000),
-                last_lsn: Cell::new(0),
-                round: Cell::new(1),
-                last_delta_round: RefCell::new(FxHashMap::default()),
-            },
-            cascade_bytes: gnitz_foundation::env::env_num("GNITZ_CASCADE_BYTES", gnitz_wire::MAX_FRAME_PAYLOAD)
-                .min(gnitz_wire::MAX_FRAME_PAYLOAD),
-        }
-    }
-
-    /// The catalog, which outlives the dispatcher.
-    pub(crate) fn cat(&self) -> &CatalogEngine {
-        unsafe { &*self.catalog }
-    }
-
-    /// The catalog, exclusively: no reference from this or [`Self::cat`] may be
-    /// alive across a call.
-    #[allow(clippy::mut_from_ref)]
-    pub(crate) fn cat_mut(&self) -> &mut CatalogEngine {
-        unsafe { &mut *self.catalog }
-    }
-
-    /// The SAL writer: its queries, and the [`SalExcl`] every write goes through.
-    pub(crate) fn sal(&self) -> &SalWriter {
-        &self.sal
-    }
-
-    // -----------------------------------------------------------------------
-    // Core send/receive helpers
-    // -----------------------------------------------------------------------
-
-    /// The master's event loop.
-    pub(crate) fn reactor(&self) -> &Reactor {
-        &self.reactor
-    }
-
-    pub(crate) fn num_workers(&self) -> usize {
-        self.sal.num_workers()
-    }
-
-    /// Resolves with the first worker found dead, probing every `WORKER_WATCH`.
-    pub(crate) async fn worker_death(&self) -> usize {
-        loop {
-            self.reactor.sleep(WORKER_WATCH).await;
-            if let Some(w) = self.check_workers() {
-                return w;
-            }
-        }
-    }
-
     /// Write `group` to every worker on a fresh ACK lease, and wake them now: a
     /// caller may await the ACKs under this hold.
     fn write_acked(&self, excl: &mut SalExcl<'_>, group: SalGroup<'_>) -> Result<AckLease, WireFault> {
@@ -201,69 +131,11 @@ impl MasterDispatcher {
         Ok((value, zone_lsn))
     }
 
-    /// Credit `rows` against each scanned tid's pending-tick count; whether any
-    /// tid now stands at or above the coalesce threshold, so an auto-tick is due.
-    /// Below it a push only accumulates, and nothing ticks until a read or a
-    /// delta poll asks for a drain. `_laid_out` is the SAL hold the rows' groups
-    /// were written under.
-    pub(crate) fn note_pending(&self, _laid_out: &SalExcl<'_>, rows: impl Iterator<Item = (u64, usize)>) -> bool {
-        let mut pending = self.ledger.pending.borrow_mut();
-        let dag = &self.cat().dag;
-        for (tid, n) in rows.filter(|&(tid, _)| dag.is_scanned(tid)) {
-            *pending.entry(tid).or_insert(0) += n;
-        }
-        pending.values().any(|&rows| rows >= self.ledger.coalesce_rows)
-    }
-
-    /// Tick every table with a pending delta as one Tick group, and answer the
-    /// lease its workers ACK on; `None` when nothing was pending. A refused emit
-    /// leaves every delta pending.
-    pub(crate) async fn emit_pending_tick(&self) -> Result<Option<AckLease>, WireFault> {
-        if self.ledger.pending.borrow().is_empty() {
-            self.ledger.last_lsn.set(self.sal.watermark());
-            return Ok(None);
-        }
-        // The hold `note_pending` is called under, so the tids and the
-        // watermark read here are of the same commits.
-        let mut excl = self.sal.lock().await;
-        if TICK_EMIT_ERROR.take_once() {
-            return Err("injected tick emit error".to_string().into());
-        }
-        let tids: Vec<u64> = self.ledger.pending.borrow().keys().copied().collect();
-        let lease = self.emit_tick(&mut excl, &tids)?;
-        self.ledger.pending.borrow_mut().clear();
-        self.ledger.last_lsn.set(self.sal.watermark());
-        Ok(Some(lease))
-    }
-
-    /// True when no relation of `sources` has a commit no emitted tick has
-    /// taken, so a read of a view whose source closure they are misses nothing.
-    /// A commit is pending from its layout on, ahead of its ACK, so this errs
-    /// towards false, which costs one extra drain.
-    pub(crate) fn all_ticked(&self, sources: &FxHashSet<u64>) -> bool {
-        let pending = self.ledger.pending.borrow();
-        sources.iter().all(|s| !pending.contains_key(s))
-    }
-
-    /// The SAL watermark the last emitted tick snapshotted: every commit at or
-    /// below it is reflected in every view.
-    pub(crate) fn last_tick_lsn(&self) -> u64 {
-        self.ledger.last_lsn.get()
-    }
-
-    /// Seed the last tick's LSN with `lsn`. Called once, after the recovery
-    /// tick sweep, with the SAL watermark the executor takes as its boot seed:
-    /// every commit recovered at boot is then reflected in every view.
-    pub(crate) fn seed_tick_lsn(&self, lsn: u64) {
-        debug_assert_eq!(self.ledger.last_lsn.get(), 0, "the tick LSN is seeded once");
-        self.ledger.last_lsn.set(lsn);
-    }
-
     /// Write one Tick group for `tids` at consecutive tick rounds, on a fresh ACK
     /// lease. A refused write burns its rounds.
-    fn emit_tick(&self, excl: &mut SalExcl<'_>, tids: &[u64]) -> Result<AckLease, WireFault> {
-        let first = self.ledger.round.get() + 1;
-        self.ledger.round.set(first + tids.len() as u64 - 1);
+    pub(crate) fn emit_tick(&self, excl: &mut SalExcl<'_>, tids: &[u64]) -> Result<AckLease, WireFault> {
+        let first = self.rounds.round.get() + 1;
+        self.rounds.round.set(first + tids.len() as u64 - 1);
         for (i, &tid) in tids.iter().enumerate() {
             self.record_delta_round(tid, first + i as u64);
         }
@@ -284,7 +156,7 @@ impl MasterDispatcher {
             return;
         }
         let reached = cat.dag.dependent_closure([tid]);
-        let mut map = self.ledger.last_delta_round.borrow_mut();
+        let mut map = self.rounds.last_delta_round.borrow_mut();
         for vid in reached {
             if cat.registry.relation(vid).is_some_and(|r| r.kind().has_delta_feed()) {
                 map.insert(vid, round);
@@ -296,7 +168,7 @@ impl MasterDispatcher {
     /// reached — the boot round, which is never emitted and captures nothing, so a
     /// bootstrap at `after_tick = 0` always falls through to the store.
     pub(crate) fn last_delta_round(&self, view_id: u64) -> u64 {
-        self.ledger
+        self.rounds
             .last_delta_round
             .borrow()
             .get(&view_id)
@@ -307,6 +179,16 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------
+
+    /// Resolves with the first worker found dead, probing every `WORKER_WATCH`.
+    pub(crate) async fn worker_death(&self) -> usize {
+        loop {
+            self.reactor.sleep(WORKER_WATCH).await;
+            if let Some(w) = self.check_workers() {
+                return w;
+            }
+        }
+    }
 
     /// The first dead worker, reported on every probe: a reaped pid answers
     /// ECHILD.

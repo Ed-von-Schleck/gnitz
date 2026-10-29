@@ -1,5 +1,6 @@
-//! Test-only in-process DDL: the direct `create_table` / `drop_view` /
+//! Test-only in-process DDL: the direct `drop_table` / `drop_view` /
 //! `create_index` … entry points the catalog tests drive the applier with.
+//! `create_table`, which tests across the crate use, is `test_support`'s.
 //!
 //! **Not** a production code path. Every real DDL statement (SQL planner,
 //! C-API, `gnitz-py`) is built client-side and pushed over the wire as a
@@ -8,41 +9,9 @@
 //! same way, without a server.
 
 use super::super::*;
-use crate::test_support::{apply_ddl, col_tab_batch, idx_tab_batch, schema_tab_batch, sys_batch, table_tab_row};
-use gnitz_wire::{payload_u64, CatalogColumn, IdxTabSlot, PkColList, TableProps, TableTabRow};
+use crate::test_support::{apply_ddl, idx_tab_batch, parse_qualified_name, schema_tab_batch, table_blocks};
+use gnitz_wire::{payload_u64, CatalogColumn, IdxTabSlot, TableProps};
 use gnitz_zset::repr::Batch;
-
-/// Split `schema.name`, defaulting the schema half. Only these direct entry
-/// points take qualified-name strings; the wire path ships schema and entity ids
-/// separately.
-pub(super) fn parse_qualified_name<'a>(name: &'a str, default_schema: &'a str) -> (&'a str, &'a str) {
-    match name.find('.') {
-        Some(dot) => (&name[..dot], &name[dot + 1..]),
-        None => (default_schema, name),
-    }
-}
-
-/// The COL_TAB records and TABLE_TAB `+1` that register table `tid` named `name`
-/// in schema `sid`, in apply order.
-fn table_blocks(
-    tid: u64,
-    sid: u64,
-    name: &str,
-    cols: &[CatalogColumn],
-    pk: &[u32],
-    props: TableProps,
-) -> [(SysFamily, Batch); 2] {
-    let row = TableTabRow {
-        schema_id: sid,
-        pk_col_idx: PkColList::from_slice(pk),
-        flags: props,
-        ..table_tab_row(tid, name)
-    };
-    [
-        (SysFamily::Column, col_tab_batch(tid, cols, 1)),
-        (SysFamily::Table, sys_batch([(row, 1)])),
-    ]
-}
 
 /// Production index names arrive pre-built over the wire; only `create_index`
 /// below names one engine-side.
@@ -118,53 +87,7 @@ impl CatalogEngine {
         apply_ddl(self, blocks)
     }
 
-    // -- DDL: CREATE/DROP TABLE --------------------------------------------
-
-    /// Build a table directly in the catalog: allocate the id, then apply its
-    /// COL_TAB records and TABLE_TAB `+1` as one bundle.
-    pub(crate) fn create_table(
-        &mut self,
-        qualified_name: &str,
-        col_defs: &[CatalogColumn],
-        pk_cols: &[u32],
-    ) -> Result<u64, String> {
-        self.create_table_with(qualified_name, col_defs, pk_cols, TableProps::default())
-    }
-
-    /// A SERIAL table `(id U64 PRIMARY KEY)`.
-    pub(crate) fn create_serial_table(&mut self, qualified_name: &str) -> Result<u64, String> {
-        let serial = TableProps { serial: true, ..Default::default() };
-        self.create_table_with(
-            qualified_name,
-            &[crate::test_support::col_def("id", gnitz_wire::TypeCode::U64)],
-            &[0],
-            serial,
-        )
-    }
-
-    /// [`Self::create_table`] under `props`.
-    pub(crate) fn create_table_with(
-        &mut self,
-        qualified_name: &str,
-        col_defs: &[CatalogColumn],
-        pk_cols: &[u32],
-        props: TableProps,
-    ) -> Result<u64, String> {
-        let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
-
-        // Only what the bundle cannot derive for itself: the schema id, and an id
-        // for the new table. Every rule this shape must satisfy is the
-        // production precheck's — restating one here would let a test asserting
-        // that rejection pass against this copy while the production arm was
-        // broken.
-        let sid = self
-            .schema_id(schema_name)
-            .ok_or_else(|| format!("Schema does not exist: {schema_name}"))?;
-        let tid = self.allocate_ids(1).unwrap();
-
-        apply_ddl(self, table_blocks(tid, sid, table_name, col_defs, pk_cols, props))?;
-        Ok(tid)
-    }
+    // -- DDL: DROP TABLE ---------------------------------------------------
 
     pub(in crate::catalog) fn drop_table(&mut self, qualified_name: &str) -> Result<(), String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
@@ -244,7 +167,7 @@ impl CatalogEngine {
         pk: &[u32],
     ) -> Result<(), String> {
         for (family, batch) in table_blocks(tid, schema_id, name, cols, pk, TableProps::default()) {
-            self.ddl_sync(family.id(), batch)?;
+            self.ddl_sync(family, batch)?;
         }
         Ok(())
     }

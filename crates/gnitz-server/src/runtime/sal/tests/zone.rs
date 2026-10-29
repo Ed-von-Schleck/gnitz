@@ -1,7 +1,8 @@
 use super::*;
 use crate::runtime::sal::fixtures::{group_at, test_log};
-use crate::runtime::sal::{epoch_word, Apply, GroupData, SalGroup, SalMessageKind, SalWriter, PREFIX_BYTES};
-use crate::runtime::w2m::GroupTargets;
+use crate::runtime::sal::{
+    epoch_word, Apply, GroupData, GroupTargets, SalGroup, SalMessageKind, SalWriter, PREFIX_BYTES,
+};
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::encode_schema_block;
@@ -261,13 +262,10 @@ fn rows() -> Batch {
 
 /// Log shapes and damage for the recovery walk.
 impl SalWriter {
-    /// A committed zone of one control-only `DdlSync` group per target: its
-    /// LSN and every member's base.
+    /// A committed zone of one control-only `Push` group per target, carrying no
+    /// rows: its LSN and every member's base.
     fn zone(&self, targets: &[u64]) -> (u64, Vec<u64>) {
-        let groups: Vec<SalGroup> = targets
-            .iter()
-            .map(|&family| SalGroup::new(Apply::DdlSync { family }))
-            .collect();
+        let groups: Vec<SalGroup> = targets.iter().map(|&tid| SalGroup::new(Apply::Push { tid })).collect();
         self.commit_zone(&groups)
     }
 

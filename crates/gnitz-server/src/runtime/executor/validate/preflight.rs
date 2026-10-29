@@ -2,7 +2,7 @@
 //! SAL byte is written.
 //!
 //! Every user write — a plain push and an atomic multi-family transaction
-//! alike — is validated by `validate_txn_distributed`: a plain push is a
+//! alike — is validated by `Checks::validate_txn`: a plain push is a
 //! bundle of one family, so each rule has one implementation:
 //!
 //! - **U-PK**: an Error-mode insert's key is not held.
@@ -194,32 +194,30 @@ struct TxnTable<'a> {
 /// A decoded transaction bundle plus everything its rules share. Built once;
 /// every rule reads it instead of re-walking the families.
 struct TxnBundle<'a> {
-    /// One borrowed columnar view per family, so a rule's row walk takes
-    /// `&MemBatch` by family index instead of threading the owning `Batch`.
-    mems: Vec<MemBatch<'a>>,
+    /// The bundle's families, indexed by family number.
+    families: &'a [TxnFamily],
     /// The tables with an Error family or a constraint, in first-appearance
     /// order, found by linear scan over the write's own table count.
     tables: Vec<TxnTable<'a>>,
 }
 
 impl<'a> TxnBundle<'a> {
-    fn new(disp: &MasterDispatcher, families: &'a [TxnFamily]) -> Result<Self, WireFault> {
+    fn new(cat: &CatalogEngine, families: &'a [TxnFamily]) -> Result<Self, WireFault> {
         let mut tables: Vec<TxnTable<'a>> = Vec::new();
         for fam in families {
             if tables.iter().any(|t| t.tid == fam.tid) {
                 continue;
             }
-            let error = families
+            let reads_committed = families
                 .iter()
-                .any(|f| f.tid == fam.tid && matches!(f.mode, WireConflictMode::Error));
-            let cons = disp.cat().row_constraints(fam.tid);
-            if !error && cons.is_empty() {
+                .any(|f| f.tid == fam.tid && cat.push_reads_committed_state(f.tid, f.mode));
+            if !reads_committed {
                 continue;
             }
             tables.push(TxnTable {
                 tid: fam.tid,
-                schema: disp.cat().registry.relation_or_err(fam.tid)?.schema(),
-                cons,
+                schema: cat.registry.relation_or_err(fam.tid)?.schema(),
+                cons: cat.row_constraints(fam.tid),
                 fold: Fold::default(),
                 probe_keys: Vec::new(),
             });
@@ -241,7 +239,7 @@ impl<'a> TxnBundle<'a> {
                     } else {
                         FoldOp::Deleted
                     };
-                    let in_batch = || pk_violation_err(disp.cat(), tid, &schema, pk, Clash::InBatch);
+                    let in_batch = || pk_violation_err(cat, tid, &schema, pk, Clash::InBatch);
                     let inserts = error && w > 0;
                     match t.fold.entry(pk) {
                         Entry::Occupied(o) => {
@@ -252,7 +250,7 @@ impl<'a> TxnBundle<'a> {
                                     // Existence is cumulative in frame order, and a
                                     // cascade's families come later and only delete.
                                     FoldOp::Inserted(..) => {
-                                        return Err(pk_violation_err(disp.cat(), tid, &schema, pk, Clash::Committed))
+                                        return Err(pk_violation_err(cat, tid, &schema, pk, Clash::Committed))
                                     }
                                     FoldOp::Deleted => {}
                                 }
@@ -277,10 +275,7 @@ impl<'a> TxnBundle<'a> {
                 }
             }
         }
-        Ok(TxnBundle {
-            mems: families.iter().map(|f| f.batch.as_mem_batch()).collect(),
-            tables,
-        })
+        Ok(TxnBundle { families, tables })
     }
 
     fn get(&self, tid: u64) -> Option<&TxnTable<'a>> {
@@ -295,9 +290,9 @@ impl<'a> TxnBundle<'a> {
         self.get(tid).expect("a bundled table")
     }
 
-    /// Family `fam`'s columnar view, built once in `new`.
-    fn mem(&self, fam: u32) -> &MemBatch<'a> {
-        &self.mems[fam as usize]
+    /// Family `fam`'s rows.
+    fn mem(&self, fam: u32) -> &'a Batch {
+        &self.families[fam as usize].batch
     }
 
     /// The rows of `tid` that survive the whole bundle: `(pk, family, row)`.
@@ -374,17 +369,21 @@ async fn execute_probe_burst<P>(
     Ok(())
 }
 
-impl MasterDispatcher {
+impl Checks {
     /// Validate a write bundle against the state its families leave together,
     /// appending the families its deletes cascade to; an Error family's PK
     /// existence alone is cumulative in frame order. The first violation, in
     /// the order U-PK, U-SEC, F1, F2, refuses the bundle; U-PK's is final at
     /// once, where the others wait out the cascade.
-    pub async fn validate_txn_distributed(&self, families: &mut Vec<TxnFamily>) -> Result<(), WireFault> {
+    pub(in crate::runtime::executor) async fn validate_txn(
+        &self,
+        disp: &MasterDispatcher,
+        families: &mut Vec<TxnFamily>,
+    ) -> Result<(), WireFault> {
         // No family whose write reads committed state ⇒ no table would be folded
         // and no rule would probe, so a plain push returns without building the
         // bundle.
-        let cat = self.cat();
+        let cat = disp.cat();
         let reads_committed = families.iter().any(|f| cat.push_reads_committed_state(f.tid, f.mode));
         if !reads_committed {
             return Ok(());
@@ -396,7 +395,7 @@ impl MasterDispatcher {
         // A pass that finds further rows to delete gives no verdict: the rules
         // hold of the bundle those rows are part of.
         loop {
-            let further = self.validate_bundle(families, &mut cascade).await?;
+            let further = self.validate_bundle(disp, families, &mut cascade).await?;
             if further.is_empty() {
                 return Ok(());
             }
@@ -408,14 +407,15 @@ impl MasterDispatcher {
     /// outside them, those rows' families and no verdict.
     async fn validate_bundle(
         &self,
+        disp: &MasterDispatcher,
         families: &[TxnFamily],
         cascade: &mut Cascade,
     ) -> Result<Vec<TxnFamily>, WireFault> {
-        let mut b = TxnBundle::new(self, families)?;
+        let mut b = TxnBundle::new(disp.cat(), families)?;
 
         for t in &b.tables {
             if !t.cons.uniques.is_empty() && b.surviving(t.tid).next().is_some() {
-                self.ensure_unique_filters_warm(t.tid, &t.cons.uniques).await?;
+                self.ensure_unique_filters_warm(disp, t.tid, &t.cons.uniques).await?;
             }
         }
 
@@ -425,11 +425,11 @@ impl MasterDispatcher {
         let mut checks: Vec<Check<Rule>> = Vec::new();
         // U-PK's checks go first: its sink refuses before any other rule's
         // reply is read.
-        plan_pk_checks(self, &b, &mut checks)?;
-        plan_unique_checks(self, &b, &mut checks, &mut unique_violation)?;
-        plan_fk_existence(self, &b, &mut checks)?;
+        plan_pk_checks(disp, &b, &mut checks)?;
+        plan_unique_checks(disp, self, &b, &mut checks, &mut unique_violation)?;
+        plan_fk_existence(disp, self, &b, &mut checks)?;
 
-        execute_probe_burst(self, &mut checks, |check, rows| {
+        execute_probe_burst(disp, &mut checks, |check, rows| {
             let Check { tid, probe, reply, plan, .. } = check;
             let mut answered = (0..rows.len())
                 .filter(|&j| rows.get_weight(j) == 1)
@@ -441,7 +441,7 @@ impl MasterDispatcher {
                     return Ok(false);
                 };
                 if e.needs_probe {
-                    return Err(pk_violation_err(self.cat(), t.tid, &t.schema, pk, Clash::Committed));
+                    return Err(pk_violation_err(disp.cat(), t.tid, &t.schema, pk, Clash::Committed));
                 }
                 e.committed = true;
                 Ok(true)
@@ -469,7 +469,7 @@ impl MasterDispatcher {
                 Rule::Unique { cols, spec } => {
                     let fold = &b.table(*tid).fold;
                     if unique_violation.is_none() && answered.any(|(_, e)| !fold.contains_key(spec.split_entry(e).1)) {
-                        let err = unique_violation_err(self.cat(), *tid, cols.as_slice(), Clash::Committed);
+                        let err = unique_violation_err(disp.cat(), *tid, cols.as_slice(), Clash::Committed);
                         unique_violation = Some(err);
                     }
                 }
@@ -496,7 +496,7 @@ impl MasterDispatcher {
             .flat_map(|t| t.cons.fks_as_parent.iter().copied())
             .collect();
         let deltas = resolve_parent_deltas(&b, &checks, &children);
-        let (further, restricted) = removed_references(self, &b, &children, &deltas, cascade).await?;
+        let (further, restricted) = removed_references(disp, &b, &children, &deltas, cascade).await?;
         if !further.is_empty() {
             return Ok(further);
         }
@@ -504,7 +504,7 @@ impl MasterDispatcher {
         if let Some(e) = unique_violation {
             return Err(e);
         }
-        fk_existence_verdict(self, &checks, &deltas)?;
+        fk_existence_verdict(disp, &checks, &deltas)?;
         restricted.map_or(Ok(Vec::new()), Err)
     }
 }
@@ -556,6 +556,7 @@ fn plan_pk_checks<'a>(
 /// `violation`, and their index plans no probe.
 fn plan_unique_checks<'a>(
     disp: &MasterDispatcher,
+    caches: &Checks,
     b: &TxnBundle<'a>,
     checks: &mut Vec<Check<Rule<'a>>>,
     violation: &mut Option<WireFault>,
@@ -583,7 +584,7 @@ fn plan_unique_checks<'a>(
             }
 
             // A span the filter proves absent has no committed holder to answer for.
-            let keys = disp.unique_filter_retain_possible(tid, col_indices, keys);
+            let keys = caches.unique_filter_retain_possible(tid, col_indices, keys);
             if keys.is_empty() {
                 continue;
             }
@@ -601,6 +602,7 @@ fn plan_unique_checks<'a>(
 /// the bundle writes into the parent or its presence cache proves committed.
 fn plan_fk_existence<'a>(
     disp: &MasterDispatcher,
+    caches: &Checks,
     b: &TxnBundle<'a>,
     checks: &mut Vec<Check<Rule<'a>>>,
 ) -> Result<(), WireFault> {
@@ -644,7 +646,7 @@ fn plan_fk_existence<'a>(
             // The reference is the parent's whole key, so a key the bundle writes
             // is decided by the bundle and any other by whether it is committed.
             let fold = b.get(parent_tid).map(|t| &t.fold);
-            let cache = disp.fk_presence_of(parent_tid);
+            let cache = caches.fk_presence_of(parent_tid);
             let mut key = [0u8; 16];
             values.retain(|&v, _| {
                 gnitz_wire::store_opk(&mut key[..span], v, false);
@@ -711,20 +713,17 @@ fn resolve_parent_deltas(b: &TxnBundle<'_>, checks: &[Check<Rule<'_>>], children
                 let lone = t.schema.lone_pk_col() == Some(pcol);
                 // A surviving row holds its own key; a deleted one's value is the
                 // whole key, which no other row holds, where it is the lone column.
-                let old = t
-                    .fold
-                    .iter()
-                    .filter(|(_, e)| matches!(e.last, FoldOp::Deleted) && (lone || e.committed))
-                    .map(|(pk, _)| (*pk, gnitz_wire::widen_pk_be(&pk[off..off + size])))
-                    .collect();
-                parent_retired_added(b, ptid, pcol, &old)
+                parent_retired_added(b, ptid, pcol, |pk, e| {
+                    (matches!(e.last, FoldOp::Deleted) && (lone || e.committed))
+                        .then(|| gnitz_wire::widen_pk_be(&pk[off..off + size]))
+                })
             }
             _ => {
                 let gathered = checks.iter().find_map(|c| match &c.plan {
                     Rule::Gather { col, old, .. } if c.tid == ptid && *col == pcol => Some(old),
                     _ => None,
                 });
-                parent_retired_added(b, ptid, pcol, gathered.unwrap_or(&FxHashMap::default()))
+                parent_retired_added(b, ptid, pcol, |pk, _| gathered.and_then(|g| g.get(pk).copied()))
             }
         };
         deltas.insert((ptid, pcol), delta);
@@ -733,13 +732,13 @@ fn resolve_parent_deltas(b: &TxnBundle<'_>, checks: &[Check<Rule<'_>>], children
 }
 
 /// One parent column's `(retired, added)` sets: `added` are the surviving rows'
-/// non-NULL values; `retired` are the `old` values, by PK, that the PK's
-/// surviving state no longer holds.
+/// non-NULL values; `retired` are the before-image values `old_of` yields that
+/// the PK's surviving state no longer holds.
 fn parent_retired_added(
     b: &TxnBundle<'_>,
     parent_tid: u64,
     ref_col: usize,
-    old: &FxHashMap<&[u8], u128>,
+    old_of: impl Fn(&[u8], &PkFold) -> Option<u128>,
 ) -> ParentDelta {
     let t = b.table(parent_tid);
     let loc = t.schema.locate(ref_col);
@@ -756,7 +755,7 @@ fn parent_retired_added(
         if let Some(sv) = surviving_val {
             added.insert(sv);
         }
-        if let Some(&ov) = old.get(p) {
+        if let Some(ov) = old_of(p, e) {
             if surviving_val != Some(ov) {
                 // A value both deleted and updated away reads as deleted, so
                 // the verb does not depend on the fold's iteration order.

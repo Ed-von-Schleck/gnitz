@@ -18,10 +18,10 @@
 
 use std::collections::HashSet;
 
+use super::validate::TxnFamily;
 use super::write::{check_stream_push, decode_push_frame, decode_push_txn_frame};
 use super::*;
 use crate::catalog::{SysFamily, ZoneError};
-use crate::runtime::master::TxnFamily;
 use crate::test_support::{
     col_def, col_tab_batch, left_join_circuit, nullable_def, sys_batch, table_tab_batch, view_blocks, view_tab_row,
 };

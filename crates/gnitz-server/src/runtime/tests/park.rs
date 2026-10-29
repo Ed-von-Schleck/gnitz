@@ -1,6 +1,13 @@
 use super::*;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, within};
 
+impl Park {
+    /// Whether a sleeper is armed on this park.
+    pub(in crate::runtime) fn armed(&self) -> bool {
+        self.0.load(Ordering::Acquire) & ARMED != 0
+    }
+}
+
 /// A park whose re-test behind the arm finds a group returns without sleeping,
 /// and leaves the park disarmed.
 #[test]

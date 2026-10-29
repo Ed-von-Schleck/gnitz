@@ -304,20 +304,7 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// [`check_batch_shape`], then the CAS and net bound per PK against the live
-    /// store. Returns the per-PK signatures and the ids the delta drops: the PKs
-    /// of Drop shape (a rename pair's `-1` is not a drop). With every system PK
-    /// held to net weight 0 or 1, those are exactly the PKs the delta leaves dead.
-    fn check_family_contract(&self, family: SysFamily, batch: &Batch) -> Result<(Vec<PkSignature>, IdSet), String> {
-        let sigs = check_batch_shape(family, batch, self.next_id)?;
-        for sig in &sigs {
-            self.check_cas_and_net(family, batch, sig)?;
-        }
-        let dropped = IdSet::new(sigs.iter().filter(|s| s.shape() == PkShape::Drop).map(|s| s.leading));
-        Ok((sigs, dropped))
-    }
-
-    /// What a COL_TAB write means once [`Self::check_family_contract`] has settled
+    /// What a COL_TAB write means once [`Self::precheck_family`] has settled
     /// its shape: everything below depends on the *owner*, which the contract
     /// cannot see. The guards are scoped to the transition rather than blanket —
     /// a blanket one would reject RENAME COLUMN, which is legal on a PK column
@@ -460,13 +447,21 @@ impl CatalogEngine {
     }
 
     /// Validate one family of a `DDL_TXN` against the catalog as the bundle's
-    /// earlier families left it. Returns the ids the delta drops.
+    /// earlier families left it: [`check_batch_shape`], the CAS and net bound per
+    /// PK against the live store, then the family's own guards. Returns the ids
+    /// the delta drops: the PKs of Drop shape (a rename pair's `-1` is not a
+    /// drop). With every system PK held to net weight 0 or 1, those are exactly
+    /// the PKs the delta leaves dead.
     ///
     /// Exhaustive over `SysFamily` (like `fire_hooks`): a newly-added family must
     /// decide here whether it carries guards beyond the contract, rather than
     /// falling into a silent `_` arm.
     pub(in crate::catalog) fn precheck_family(&self, family: SysFamily, batch: &Batch) -> Result<IdSet, String> {
-        let (sigs, dropped) = self.check_family_contract(family, batch)?;
+        let sigs = check_batch_shape(family, batch, self.next_id)?;
+        for sig in &sigs {
+            self.check_cas_and_net(family, batch, sig)?;
+        }
+        let dropped = IdSet::new(sigs.iter().filter(|s| s.shape() == PkShape::Drop).map(|s| s.leading));
         match family {
             SysFamily::Schema => self.precheck_schema_family(batch, &dropped),
             SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch, &sigs, &dropped),

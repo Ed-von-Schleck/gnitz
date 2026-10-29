@@ -7,7 +7,7 @@ use crate::runtime::w2m::W2mWriter;
 /// A dispatcher over one fresh W2M ring per worker, its SAL rewound as a boot
 /// leaves it, with each ring's writer for a test that answers in a worker's
 /// place. `catalog` may be null where the path under test never calls `cat()`.
-pub(super) fn test_dispatcher(
+pub(crate) fn test_dispatcher(
     worker_pids: Vec<i32>,
     catalog: *mut CatalogEngine,
 ) -> (MasterDispatcher, Vec<W2mWriter>) {

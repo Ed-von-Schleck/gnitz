@@ -24,8 +24,8 @@
 //!   ahead of it has committed — used by DDL to drain the committer before
 //!   catalog mutation.
 
+use super::validate::TxnFamily;
 use super::Shared;
-use crate::runtime::master::TxnFamily;
 use crate::runtime::reactor::AckLease;
 use crate::runtime::signals;
 use crate::runtime::sync::{chan, oneshot};
@@ -97,31 +97,26 @@ impl Committer {
     }
 
     /// Commit `families` as one write; resolves to the write's zone LSN.
-    pub(super) fn write(
-        &self,
-        families: Vec<TxnFamily>,
-    ) -> Result<oneshot::Receiver<Result<u64, WireFault>>, WireFault> {
-        self.admit(|done| CommitRequest::Write(PendingWrite { families, done }))
+    pub(super) async fn write(&self, families: Vec<TxnFamily>) -> Result<u64, WireFault> {
+        self.admit(|done| CommitRequest::Write(PendingWrite { families, done }))?
+            .await
     }
 
     /// Checkpoint, then copy every published store into `dir`.
-    pub(super) fn backup(&self, dir: String) -> Result<oneshot::Receiver<Result<(), WireFault>>, WireFault> {
-        self.admit(|done| CommitRequest::End(BatchEnd::Backup { dir, done }))
+    pub(super) async fn backup(&self, dir: String) -> Result<(), WireFault> {
+        self.admit(|done| CommitRequest::End(BatchEnd::Backup { dir, done }))?
+            .await
     }
 
     /// Resolves once the batch queued ahead has committed.
     pub(super) fn barrier(&self) -> oneshot::Receiver<()> {
-        let (done, rx) = oneshot::channel();
-        self.tx.send(CommitRequest::End(BatchEnd::Barrier(done)));
-        rx
+        self.queue(|done| CommitRequest::End(BatchEnd::Barrier(done)))
     }
 
     /// Resolves once every write queued ahead has committed and a checkpoint
     /// sequence has run over them.
     pub(super) fn final_checkpoint(&self) -> oneshot::Receiver<()> {
-        let (done, rx) = oneshot::channel();
-        self.tx.send(CommitRequest::End(BatchEnd::Checkpoint(done)));
-        rx
+        self.queue(|done| CommitRequest::End(BatchEnd::Checkpoint(done)))
     }
 
     /// Wake the committer so it re-tests `needs_checkpoint`.
@@ -136,9 +131,13 @@ impl Committer {
         if signals::shutdown_requested() {
             return Err("server shutting down".to_string().into());
         }
+        Ok(self.queue(req))
+    }
+
+    fn queue<T>(&self, req: impl FnOnce(oneshot::Sender<T>) -> CommitRequest) -> oneshot::Receiver<T> {
         let (done, rx) = oneshot::channel();
         self.tx.send(req(done));
-        Ok(rx)
+        rx
     }
 }
 
@@ -150,14 +149,13 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
         // Drain any additional requests already queued — no timer wait.
         // Pipelined clients still get batched; serial clients don't pay
         // a latency tax.
-        let batch = drain_ready_batch(&mut rx, first);
+        let PendingBatch { writes, end } = drain_ready_batch(&mut rx, first);
 
         // Before this batch's groups: the checkpoint makes room for them.
         if shared.dispatcher.sal().needs_checkpoint() {
             run_checkpoint_sequence(&shared).await;
         }
 
-        let PendingBatch { writes, end } = batch;
         if !writes.is_empty() {
             commit_writes(&shared, writes).await;
         }
@@ -302,7 +300,7 @@ fn write_disjoint_tables(units: &[CommitUnit]) -> bool {
 /// Commit one batch of writes. Emits every group's SAL writes, queues their tids
 /// for the tick and submits the fsync SQE under one SAL hold, THEN awaits worker
 /// ACKs (Phase C) and the fsync CQE (Phase D). `done.send` and the update of the
-/// master's caches of committed rows happen after fsync.
+/// validation caches of committed rows happen after fsync.
 async fn commit_writes(shared: &Rc<Shared>, mut writes: Vec<PendingWrite>) {
     // One-family writes in tid runs. Stable: arrival order within a run is what
     // makes intra-batch last-insert-wins mean last *inserted*.
@@ -384,7 +382,7 @@ async fn commit_writes(shared: &Rc<Shared>, mut writes: Vec<PendingWrite>) {
     // ------------------------------------------------------------------
     // Phase C (no lock): await push ACKs, per group in unit order. Replies for
     // later groups wait in their routes meanwhile.
-    // The master's caches of committed rows are NOT updated here: they hold
+    // The validation caches of committed rows are NOT updated here: they hold
     // only what is durable, so that runs after Phase D's fsync.
     // ------------------------------------------------------------------
     for lease in &leases {
@@ -401,10 +399,10 @@ async fn commit_writes(shared: &Rc<Shared>, mut writes: Vec<PendingWrite>) {
         synced.await;
     }
 
-    // The master's caches of committed rows follow, now that fsync confirms
+    // The validation caches of committed rows follow, now that fsync confirms
     // durability and before any writer is answered.
     for f in units.iter().flat_map(|u| &u.families) {
-        shared.dispatcher.committed(f.tid, &f.batch);
+        shared.writes.checks.committed(shared.cat(), f.tid, &f.batch);
     }
 
     // Send responses: every client of a unit gets the unit's verdict.

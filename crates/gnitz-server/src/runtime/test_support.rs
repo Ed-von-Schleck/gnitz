@@ -17,6 +17,19 @@ impl crate::runtime::frame::WireMsg<'_> {
     }
 }
 
+impl crate::runtime::tls::TlsArgs {
+    /// A listener on `listen` with every other flag at its default.
+    pub(crate) fn on(listen: &str) -> Self {
+        Self {
+            listen: listen.parse().unwrap(),
+            cert: crate::runtime::tls::CertSource::Minted(Vec::new()),
+            client_ca: None,
+            auth_tokens: None,
+            allow_unauthenticated: false,
+        }
+    }
+}
+
 /// Run `body` in a child process that shares this process's fd table, and return
 /// its pid. The child exits 0, or 1 if `body` panics.
 ///

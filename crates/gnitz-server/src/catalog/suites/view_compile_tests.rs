@@ -202,7 +202,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     // checked: staged as a worker applies them, since no bundle carries them alone.
     let new_vid = engine.allocate_ids(1).unwrap();
     engine
-        .ddl_sync(SysFamily::Column.id(), col_tab_batch(new_vid, &u64_i64_cols(), 1))
+        .ddl_sync(SysFamily::Column, col_tab_batch(new_vid, &u64_i64_cols(), 1))
         .unwrap();
 
     // Reusing the live name without retiring the incumbent is still a collision.

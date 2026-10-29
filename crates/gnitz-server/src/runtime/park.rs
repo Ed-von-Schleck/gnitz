@@ -181,11 +181,6 @@ impl Park {
     fn futex_word(&self) -> *const AtomicU32 {
         &self.0 as *const AtomicU64 as *const AtomicU32
     }
-
-    #[cfg(test)]
-    pub(super) fn armed(&self) -> bool {
-        self.0.load(Ordering::Acquire) & ARMED != 0
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -335,7 +335,10 @@ fn main() {
         .map(runtime::TlsArgs::resolve)
         .transpose()
         .unwrap_or_else(|e| refuse(e));
-    process::exit(runtime::server_main(args.server));
+    process::exit(runtime::server_main(args.server).unwrap_or_else(|e| {
+        gnitz_error!("{e}");
+        1
+    }));
 }
 
 #[cfg(test)]

@@ -54,18 +54,6 @@ pub(crate) struct Served {
 }
 
 impl TlsArgs {
-    /// A listener on `listen` with every other flag at its default.
-    #[cfg(test)]
-    pub(crate) fn on(listen: &str) -> TlsArgs {
-        TlsArgs {
-            listen: listen.parse().unwrap(),
-            cert: CertSource::Minted(Vec::new()),
-            client_ca: None,
-            auth_tokens: None,
-            allow_unauthenticated: false,
-        }
-    }
-
     /// Apply the bind policy, and load every file the flags name so an unusable
     /// one is refused as argv.
     pub(crate) fn resolve(self) -> Result<TlsArgs, String> {

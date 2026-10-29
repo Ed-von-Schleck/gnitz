@@ -72,7 +72,7 @@ impl CatalogEngine {
         seq_id: u64,
         count: u64,
         sink: &mut ZoneSink<'_>,
-    ) -> Result<i64, ZoneError> {
+    ) -> Result<u64, ZoneError> {
         if !self.caches.relations.get(&seq_id).is_some_and(|e| e.serial) {
             return Err(ZoneError::Refused(
                 format!("relation {seq_id} is not a SERIAL table").into(),
@@ -89,7 +89,7 @@ impl CatalogEngine {
         self.registry
             .ingest(SysFamily::Sequence.id(), delta)
             .map_err(ZoneError::Diverged)?;
-        Ok(base as i64)
+        Ok(base)
     }
 
     /// Move `sequences` row `seq_id` to `value`.

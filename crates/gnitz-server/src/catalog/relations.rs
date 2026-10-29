@@ -34,7 +34,7 @@ pub(in crate::catalog) struct RelationEntry {
     pub(in crate::catalog) fks: Vec<FkEdge>,
     /// [`gnitz_wire::TableProps::serial`].
     pub(in crate::catalog) serial: bool,
-    /// [`CatalogEngine::resolve_token`], computed on first use; `0` until then.
+    /// The token of [`CatalogEngine::resolve_answer`], computed on first use; `0` until then.
     /// Reset by every hook of a family that can change a RESOLVE answer.
     pub(in crate::catalog) token: Cell<u64>,
 }
@@ -108,19 +108,17 @@ impl CatalogEngine {
         Some((desc, entry.record.clone(), entry.token.get()))
     }
 
-    /// `tid`'s descriptor token (see [`Self::resolve_answer`]); `None` for an
-    /// unregistered id.
-    pub(in crate::catalog) fn resolve_token(&self, tid: u64) -> Option<u64> {
-        match self.caches.relations.get(&tid)?.token.get() {
-            0 => self.resolve_answer(tid).map(|(_, _, token)| token),
-            token => Some(token),
-        }
-    }
-
     /// Refuse a request built under `token` once `tid` answers a RESOLVE
     /// differently. `0` is a request built from no RESOLVE.
     pub(crate) fn check_token(&self, Target { tid, token }: Target) -> Result<(), WireFault> {
-        if token == 0 || self.resolve_token(tid) == Some(token) {
+        if token == 0 {
+            return Ok(());
+        }
+        let current = match self.caches.relations.get(&tid).map(|e| e.token.get()) {
+            Some(0) => self.resolve_answer(tid).map(|(_, _, t)| t),
+            t => t,
+        };
+        if current == Some(token) {
             return Ok(());
         }
         Err(WireFault {
@@ -227,12 +225,6 @@ pub(crate) struct RowConstraints {
     pub(crate) uniques: Vec<(PkColList, KeySpec)>,
 }
 
-impl RowConstraints {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.fks_as_child.is_empty() && self.fks_as_parent.is_empty() && self.uniques.is_empty()
-    }
-}
-
 impl CatalogEngine {
     /// All FK edges where `table_id` is the child.
     pub(in crate::catalog) fn fks_as_child(&self, table_id: u64) -> &[FkEdge] {
@@ -278,9 +270,20 @@ impl CatalogEngine {
         }
     }
 
+    /// Whether `tid` has a constraint whose validation reads committed state:
+    /// whether [`Self::row_constraints`] would list any.
+    fn has_row_constraints(&self, tid: u64) -> bool {
+        !self.fks_as_child(tid).is_empty()
+            || !self.fks_as_parent(tid).is_empty()
+            || self
+                .registry
+                .relation(tid)
+                .is_some_and(|r| r.unique_indexes_to_check().next().is_some())
+    }
+
     /// Does validating a write of `mode` to `tid` read committed state? One that
     /// does not may hold its table lock shared.
     pub(crate) fn push_reads_committed_state(&self, tid: u64, mode: gnitz_wire::WireConflictMode) -> bool {
-        matches!(mode, gnitz_wire::WireConflictMode::Error) || !self.row_constraints(tid).is_empty()
+        matches!(mode, gnitz_wire::WireConflictMode::Error) || self.has_row_constraints(tid)
     }
 }

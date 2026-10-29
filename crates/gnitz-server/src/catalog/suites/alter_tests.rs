@@ -193,7 +193,7 @@ fn hiding_a_foreign_key_column_rejected() {
 #[test]
 fn hiding_an_indexed_column_rejected_but_unnulling_it_accepted() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("c", TypeCode::U64)];
-    let (mut engine, tid) = table_fixture("alter_hide_indexed", &cols);
+    let (mut engine, tid) = table_engine("catalog", "alter_hide_indexed", 1, &cols);
     engine.create_index("public.t", &["c"], false).unwrap();
 
     let err = engine
@@ -210,7 +210,7 @@ fn hiding_an_indexed_column_rejected_but_unnulling_it_accepted() {
 #[test]
 fn hiding_or_unnulling_a_pk_column_rejected() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
-    let (engine, tid) = table_fixture("alter_pk_col", &cols);
+    let (engine, tid) = table_engine("catalog", "alter_pk_col", 1, &cols);
 
     for mutate in [hide as fn(&mut CatalogColumn), unnull] {
         let err = engine
@@ -258,7 +258,7 @@ fn a_serial_table_has_one_narrow_integer_pk() {
 #[test]
 fn a_duplicate_visible_column_name_is_named_before_dependent_views() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
-    let (mut engine, tid) = table_fixture("alter_add_dup_dep", &cols);
+    let (mut engine, tid) = table_engine("catalog", "alter_add_dup_dep", 1, &cols);
     register_identity_view(&mut engine, tid, "vw", &cols);
 
     let add = crate::test_support::sys_batch([(ColTabRow::of(tid, 2, &nullable_def("v", TypeCode::U64).def, None), 1)]);
@@ -277,7 +277,7 @@ fn a_duplicate_visible_column_name_is_named_before_dependent_views() {
 #[test]
 fn a_dropped_column_cannot_be_renamed_or_indexed() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("a", TypeCode::U64)];
-    let (mut engine, tid) = table_fixture("alter_dropped_col", &cols);
+    let (mut engine, tid) = table_engine("catalog", "alter_dropped_col", 1, &cols);
     apply_ddl(
         &mut engine,
         [(SysFamily::Column, col_alter_pair(tid, 1, &cols[1], hide))],
@@ -341,7 +341,7 @@ fn insert_first_rename_pair_lands_the_new_name() {
 
 #[test]
 fn a_column_alter_must_be_its_bundles_only_change() {
-    let (mut engine, tid) = table_fixture("alter_confined_to_bundle", &u64_i64_cols());
+    let (mut engine, tid) = table_engine("catalog", "alter_confined_to_bundle", 1, &u64_i64_cols());
     let other = engine.create_table("public.u", &u64_i64_cols(), &[0]).unwrap();
     let append = |owner: u64, bb: &mut BatchBuilder| {
         ColTabRow::of(owner, 2, &nullable_def("w", TypeCode::I64).def, None).write(bb, 1);

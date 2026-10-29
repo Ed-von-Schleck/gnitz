@@ -9,10 +9,9 @@ use rustc_hash::FxHashMap;
 
 use gnitz_foundation::fault::Seam;
 
-use super::peer::Peer;
-use super::{not_found, park_until, send_ack, target_kind, Access, Shared};
+use super::validate::{Checks, TxnFamily};
+use super::{not_found, park_until, target_kind, Access, Shared};
 use crate::catalog::CatalogEngine;
-use crate::runtime::master::TxnFamily;
 use crate::runtime::reactor::RecvBuf;
 use crate::runtime::sync::{AsyncRwLock, ReadGuard, WriteGuard};
 use gnitz_store::relation::RelationKind;
@@ -38,7 +37,8 @@ async fn hold_push_for_ddl(shared: &Shared, target_id: u64, seen: &Rc<[u8]>) {
     .await
 }
 
-/// The per-table write state: the table locks and the OCC commit-LSN map.
+/// The per-table write state: the table locks, the OCC commit-LSN map, and the
+/// validation caches.
 pub(super) struct Writes {
     /// Per-table write serialization. A push whose validation reads committed
     /// state (`push_reads_committed_state`) and every transaction take the write
@@ -53,6 +53,10 @@ pub(super) struct Writes {
     /// The SAL watermark when the executor started: every read watermark this
     /// boot is at or above it, and every commit's zone above it.
     boot_seed: u64,
+    /// The caches write validation probes less through. A cache entry stays
+    /// true of committed rows because a write that changes them holds the
+    /// table's write guard in `table_locks`.
+    pub(super) checks: Checks,
 }
 
 /// The table locks one task holds.
@@ -81,6 +85,7 @@ impl Writes {
             table_locks: RefCell::default(),
             table_commit_lsn: RefCell::default(),
             boot_seed,
+            checks: Checks::new(),
         }
     }
 
@@ -119,11 +124,13 @@ impl Writes {
         committed.unwrap_or(self.boot_seed) > basis
     }
 
-    /// Drop relation `id`'s table lock and commit LSN. The caller proves no task
-    /// holds or awaits the lock; see [`Shared::forget_relation`].
+    /// Drop relation `id`'s table lock, commit LSN and validation caches. The
+    /// caller proves no task holds or awaits the lock; see
+    /// [`Shared::forget_relation`].
     pub(super) fn forget(&self, id: u64) {
         self.table_locks.borrow_mut().remove(&id);
         self.table_commit_lsn.borrow_mut().remove(&id);
+        self.checks.forget(id);
     }
 }
 
@@ -143,13 +150,13 @@ impl Shared {
                 .all(|f| held.holds_exclusive(f.tid) || !self.cat().push_reads_committed_state(f.tid, f.mode)),
             "a write whose validation reads committed state holds its table exclusively"
         );
-        self.dispatcher.validate_txn_distributed(&mut families).await?;
+        self.writes.checks.validate_txn(&self.dispatcher, &mut families).await?;
         let tids: Vec<u64> = families.iter().map(|f| f.tid).collect();
         assert!(
             tids.iter().all(|&t| held.holds(t)),
             "a commit bumps only tables whose lock it holds"
         );
-        let lsn = self.committer.write(families)?.await?;
+        let lsn = self.committer.write(families).await?;
         let mut map = self.writes.table_commit_lsn.borrow_mut();
         for tid in tids {
             // Pushes sharing a read guard resume from the await in any order.
@@ -201,12 +208,7 @@ pub(super) fn decode_push_frame(
 /// client bug that happens to produce an empty batch (a `delete` with an empty
 /// pk list) fails the way a non-empty one would instead of being masked by a
 /// no-op ACK.
-pub(super) async fn handle_push(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    buf: RecvBuf,
-    ctrl: DecodedControl,
-) -> Result<(), WireFault> {
+pub(super) async fn handle_push(shared: &Rc<Shared>, buf: RecvBuf, ctrl: DecodedControl) -> Result<u64, WireFault> {
     let target = ctrl.hdr.target();
     let target_id = target.tid;
     let mode = ctrl.hdr.flags.conflict_mode;
@@ -225,43 +227,35 @@ pub(super) async fn handle_push(
     }
 
     let Some(batch) = batch else {
-        send_ack(peer, target_id, 0);
-        return Ok(());
+        return Ok(0);
     };
 
     shared.cat().recheck_record(target_id, &seen)?;
 
     // See `Writes::table_locks`. The exclusive set covers the tables this
     // push's deletes cascade to.
-    let families = vec![TxnFamily { tid: target_id, mode, batch }];
     let held = if shared.cat().push_reads_committed_state(target_id, mode) {
-        let deletes = !families[0].batch.all_weights_positive();
+        let deletes = !batch.all_weights_positive();
         let locks = shared.cat().write_lock_set(target_id, deletes);
         shared.writes.lock_tables_exclusive(locks).await
     } else {
         shared.writes.lock_table_shared(target_id).await
     };
+    let families = vec![TxnFamily { tid: target_id, mode, batch }];
     let zone_lsn = shared.commit(&catalog, &held, families).await?;
     // A stream replies `0`: its push is not durable, and an ACK reports an LSN
     // only for a write a restart must recover. Keyed on the target rather than on
     // whether this batch happened to open a zone, so a stream push the committer
     // coalesced with a base-table push still answers `0`.
-    let reply_lsn = if is_stream { 0 } else { zone_lsn };
-    send_ack(peer, target_id, reply_lsn);
-    Ok(())
+    Ok(if is_stream { 0 } else { zone_lsn })
 }
 
 /// PUSH_TXN: validate the bundle under the catalog read lock and its tables'
 /// lock union — the plain-push arm's order — check OCC, and commit it as one
 /// zone. Every rejection is pre-SAL, so a fault or a conflict commits nothing.
-pub(super) async fn handle_push_txn(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    ctrl: &DecodedControl,
-    buf: RecvBuf,
-) -> Result<(), WireFault> {
+pub(super) async fn handle_push_txn(shared: &Rc<Shared>, buf: RecvBuf, ctrl: DecodedControl) -> Result<u64, WireFault> {
     // 1. Decode.
-    let (decoded, _charge) = buf.decode(|data| decode_push_txn_frame(shared.cat(), &data[ctrl.body.clone()]));
+    let (decoded, _charge) = buf.decode(|data| decode_push_txn_frame(shared.cat(), &data[ctrl.body]));
     let items = decoded?;
 
     // 2. Catalog read lock (excludes a concurrent DROP/DDL), then the
@@ -295,9 +289,7 @@ pub(super) async fn handle_push_txn(
 
     // 4. Distributed bundle validation, and the commit.
     let families = items.into_iter().map(|(_, f)| f).collect();
-    let lsn = shared.commit(&catalog, &held, families).await?;
-    send_ack(peer, 0, lsn);
-    Ok(())
+    shared.commit(&catalog, &held, families).await
 }
 
 /// What the gate and the OCC check read of one `PUSH_TXN` family.

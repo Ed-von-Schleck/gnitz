@@ -69,7 +69,7 @@ fn test_reserve_user_sequence_rejects_exhausted_range() {
 
     reserve(&mut engine, edge, (i64::MAX - 65) as u64).unwrap();
     let (base, delta) = reserve(&mut engine, edge, 64).unwrap();
-    assert_eq!(base, i64::MAX - 64);
+    assert_eq!(base, (i64::MAX - 64) as u64);
     assert_eq!(payload_u64(&delta, 1, 0), (i64::MAX - 1) as u64, "last = i64::MAX - 1");
 
     finish(engine);
@@ -304,7 +304,7 @@ fn test_ddl_sync() {
     assert!(engine.schema_id("app").is_some());
 
     engine
-        .ddl_sync(gnitz_wire::SCHEMA_TAB, schema_tab_batch(&[(100, "synced", 1)]))
+        .ddl_sync(SysFamily::Schema, schema_tab_batch(&[(100, "synced", 1)]))
         .unwrap();
 
     // Hooks should have registered the schema
@@ -355,7 +355,7 @@ fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
     let mut unreplayed = CatalogEngine::open_master(&dir, 1, Default::default()).unwrap();
 
     unreplayed
-        .stage(gnitz_wire::SCHEMA_TAB, 500, schema_tab_batch(&[(100, "synced", 1)]))
+        .stage(SysFamily::Schema, 500, schema_tab_batch(&[(100, "synced", 1)]))
         .unwrap();
 
     unreplayed.replay().unwrap().close();
@@ -517,7 +517,7 @@ fn test_circuit_table_surface_introspectable() {
     let mut circuit = gnitz_wire::Circuit::default();
     circuit.input_delta(100, gnitz_wire::ReadBound::None);
     engine
-        .ddl_sync(gnitz_wire::CIRCUIT_TAB, circuit_batch(107, &circuit))
+        .ddl_sync(SysFamily::Circuit, circuit_batch(107, &circuit))
         .unwrap();
 
     // The family is SQL-introspectable — `SELECT * FROM _system.circuits` must return
@@ -567,26 +567,27 @@ fn a_descriptor_token_follows_the_resolve_answer() {
     let mut engine = fresh("descriptor_token");
     let cols = vec![col_def("id", TypeCode::U64), col_def("a", TypeCode::I64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let token = engine.resolve_token(tid).unwrap();
+    let resolve_token = |engine: &CatalogEngine, tid| engine.resolve_answer(tid).map(|(_, _, t)| t);
+    let token = resolve_token(&engine, tid).unwrap();
     assert_ne!(token, 0);
     engine.check_token(Target { tid, token }).unwrap();
     engine.check_token(tid.into()).unwrap();
 
     let other = engine.create_table("public.other", &cols, &[0]).unwrap();
     engine.create_index("public.other", &["a"], false).unwrap();
-    assert_eq!(engine.resolve_token(tid), Some(token));
-    assert_ne!(engine.resolve_token(other), Some(token));
+    assert_eq!(resolve_token(&engine, tid), Some(token));
+    assert_ne!(resolve_token(&engine, other), Some(token));
 
     let serial = engine.create_serial_table("public.sr").unwrap();
-    let before = engine.resolve_token(serial);
+    let before = resolve_token(&engine, serial);
     reserve(&mut engine, serial, 64).unwrap();
-    assert_eq!(engine.resolve_token(serial), before);
-    assert_eq!(engine.resolve_token(tid), Some(token));
+    assert_eq!(resolve_token(&engine, serial), before);
+    assert_eq!(resolve_token(&engine, tid), Some(token));
 
     let stale = |engine: &CatalogEngine, token| {
         let fault = engine.check_token(Target { tid, token }).unwrap_err();
         assert_eq!(fault.status, gnitz_wire::WireStatus::StaleCatalog);
-        engine.resolve_token(tid)
+        resolve_token(engine, tid)
     };
     let pair = table_tab_batch(&[(tid, "t", -1), (tid, "renamed", 1)]);
     apply_ddl(&mut engine, [(SysFamily::Table, pair)]).unwrap();
@@ -608,7 +609,7 @@ fn an_index_name_is_claimed_once() {
         col_def("a", TypeCode::I64),
         col_def("b", TypeCode::I64),
     ];
-    let (mut engine, tid) = table_fixture("index_name_claimed_once", &cols);
+    let (mut engine, tid) = table_engine("catalog", "index_name_claimed_once", 1, &cols);
     let index = |engine: &mut CatalogEngine, col: u32, name: &str| {
         let id = engine.allocate_ids(1).unwrap();
         idx_tab_batch(id, tid, &[col], name, false, 1)

@@ -5,9 +5,10 @@
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
 use crate::catalog::{CatalogEngine, DdlBundle, SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
+use gnitz_store::relation::StoreConfig;
 use gnitz_wire::{
-    CatalogColumn, Circuit, CircuitRow, ColTabRow, ColumnDef, FkAction, FkRef, IdxTabRow, SchemaTabRow, SysRow,
-    TableTabRow, TypeCode, ViewTabRow,
+    CatalogColumn, Circuit, CircuitRow, ColTabRow, ColumnDef, FkAction, FkRef, IdxTabRow, PkColList, SchemaTabRow,
+    SysRow, TableProps, TableTabRow, TypeCode, ViewTabRow,
 };
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
 
@@ -101,13 +102,18 @@ pub fn scan_all(engine: &mut CatalogEngine, tid: u64) -> std::rc::Rc<Batch> {
 /// Net weight summed over every (PK, payload) a store's cursor yields — what a
 /// Z-set store actually holds. A row *count* would hide a double-drive, which
 /// leaves the row set identical and only doubles the weights.
-pub fn sum_weights(mut c: ReadCursor) -> i64 {
-    let mut sum = 0;
+pub fn sum_weights(c: ReadCursor) -> i64 {
+    weights(c).iter().sum()
+}
+
+/// The weight of every row a cursor yields, in cursor order.
+pub fn weights(mut c: ReadCursor) -> Vec<i64> {
+    let mut out = Vec::new();
     while c.valid {
-        sum += c.current_weight;
+        out.push(c.current_weight);
         c.advance();
     }
-    sum
+    out
 }
 
 /// The summed weight of relation `id`'s rows.
@@ -372,6 +378,112 @@ pub fn refusal(e: ZoneError) -> String {
     match e {
         ZoneError::Refused(f) => f.text,
         ZoneError::Diverged(e) => e,
+    }
+}
+
+// ── Engine fixtures ──────────────────────────────────────────────────────
+
+/// A fresh engine at `workers` on the emptied scratch directory of `scope` and
+/// `name`, holding an empty `public.t` over `cols` on PK column 0; and its id.
+pub fn table_engine(scope: &str, name: &str, workers: u32, cols: &[CatalogColumn]) -> (CatalogEngine, u64) {
+    let mut engine = CatalogEngine::open(&scratch_dir(scope, name), workers).unwrap();
+    let tid = engine.create_table("public.t", cols, &[0]).unwrap();
+    (engine, tid)
+}
+
+/// Split `schema.name`, defaulting the schema half. Only the in-process DDL
+/// entry points take qualified-name strings; the wire path ships schema and
+/// entity ids separately.
+pub fn parse_qualified_name<'a>(name: &'a str, default_schema: &'a str) -> (&'a str, &'a str) {
+    match name.find('.') {
+        Some(dot) => (&name[..dot], &name[dot + 1..]),
+        None => (default_schema, name),
+    }
+}
+
+/// The COL_TAB records and TABLE_TAB `+1` that register table `tid` named `name`
+/// in schema `sid`, in apply order.
+pub fn table_blocks(
+    tid: u64,
+    sid: u64,
+    name: &str,
+    cols: &[CatalogColumn],
+    pk: &[u32],
+    props: TableProps,
+) -> [(SysFamily, Batch); 2] {
+    let row = TableTabRow {
+        schema_id: sid,
+        pk_col_idx: PkColList::from_slice(pk),
+        flags: props,
+        ..table_tab_row(tid, name)
+    };
+    [
+        (SysFamily::Column, col_tab_batch(tid, cols, 1)),
+        (SysFamily::Table, sys_batch([(row, 1)])),
+    ]
+}
+
+impl CatalogEngine {
+    /// [`Self::open_with`] under the environment's [`StoreConfig`].
+    pub(crate) fn open(base_dir: &str, num_workers: u32) -> Result<Self, String> {
+        Self::open_with(base_dir, num_workers, StoreConfig::from_env("GNITZ_"))
+    }
+
+    /// [`Self::open_master`] and its replay, then the rest of a store-owning
+    /// boot, as a standalone host at rank 0.
+    pub(crate) fn open_with(base_dir: &str, num_workers: u32, config: StoreConfig) -> Result<Self, String> {
+        let mut engine = Self::open_master(base_dir, num_workers, config)?.replay()?;
+        engine.open_stores(0, gnitz_store::relation::Residency::Origin)?;
+        Ok(engine)
+    }
+
+    /// Flush every base and system store, then drop the engine. Dropping one
+    /// without `close` is a crash.
+    pub(crate) fn close(mut self) {
+        let _ = self.registry.checkpoint_base();
+        let _ = self.flush_all_system_tables();
+    }
+
+    /// Build a table directly in the catalog: allocate the id, then apply its
+    /// COL_TAB records and TABLE_TAB `+1` as one bundle, as a client's
+    /// `CREATE TABLE` does over the wire.
+    pub(crate) fn create_table(
+        &mut self,
+        qualified_name: &str,
+        col_defs: &[CatalogColumn],
+        pk_cols: &[u32],
+    ) -> Result<u64, String> {
+        self.create_table_with(qualified_name, col_defs, pk_cols, TableProps::default())
+    }
+
+    /// A SERIAL table `(id U64 PRIMARY KEY)`.
+    pub(crate) fn create_serial_table(&mut self, qualified_name: &str) -> Result<u64, String> {
+        let serial = TableProps { serial: true, ..Default::default() };
+        self.create_table_with(qualified_name, &[col_def("id", TypeCode::U64)], &[0], serial)
+    }
+
+    /// [`Self::create_table`] under `props`.
+    pub(crate) fn create_table_with(
+        &mut self,
+        qualified_name: &str,
+        col_defs: &[CatalogColumn],
+        pk_cols: &[u32],
+        props: TableProps,
+    ) -> Result<u64, String> {
+        let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
+
+        // Only what the bundle cannot derive for itself: the schema id, and an id
+        // for the new table. Every rule this shape must satisfy is the
+        // production precheck's — restating one here would let a test asserting
+        // that rejection pass against this copy while the production arm was
+        // broken.
+        let sid = self
+            .schema_id(schema_name)
+            .ok_or_else(|| format!("Schema does not exist: {schema_name}"))?;
+        let tid = self.allocate_ids(1).unwrap();
+
+        apply_ddl(self, table_blocks(tid, sid, table_name, col_defs, pk_cols, props))?;
+        Ok(tid)
     }
 }
 

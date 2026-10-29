@@ -24,7 +24,7 @@ use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use super::park::{Park, WorkerSet};
+use super::park::Park;
 use crate::runtime::frame::WireMsg;
 use gnitz_foundation::posix_io;
 use gnitz_wire::{peek_control_block, DecodedControl};
@@ -83,7 +83,7 @@ const _: () = assert!(
 );
 
 // ---------------------------------------------------------------------------
-// Request ids and group targets
+// Request ids
 // ---------------------------------------------------------------------------
 
 /// The request id of a group no worker answers.
@@ -92,22 +92,6 @@ pub(crate) const NO_REPLY_REQUEST_ID: u32 = 0;
 /// The request id every worker's boot ACK carries; the master leases it before
 /// its loop first runs.
 pub(crate) const BOOT_READY_REQUEST_ID: u32 = 1;
-
-/// The workers a group is written to and the request id they answer on.
-#[derive(Clone, Copy)]
-pub(crate) struct GroupTargets {
-    pub(crate) set: WorkerSet,
-    /// [`NO_REPLY_REQUEST_ID`]: nothing answers.
-    pub(crate) request_id: u32,
-}
-
-impl GroupTargets {
-    /// Every worker, nothing answers.
-    pub(crate) const SILENT: Self = GroupTargets {
-        set: WorkerSet::ALL,
-        request_id: NO_REPLY_REQUEST_ID,
-    };
-}
 
 // ---------------------------------------------------------------------------
 // Header layout (128 bytes, one cache line per writer)

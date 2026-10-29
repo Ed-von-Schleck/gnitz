@@ -73,9 +73,12 @@ impl Train {
 }
 
 impl WorkerProcess<'_> {
-    /// Send `answer` now when it is one frame, it `may_pass` what is queued and the
-    /// ring has room for it; otherwise the entry it leaves owed. Never blocks.
-    fn send_or_owe(&mut self, route: ReplyRoute, may_pass: bool, answer: Result<Rows, WireFault>) -> Option<Owed> {
+    /// Send `answer`, at queue position `at`, now when it is one frame, may pass
+    /// what is queued and the ring has room for it; otherwise return the entry it
+    /// leaves owed. A reply may pass what is queued only when the entry directly
+    /// ahead of it is of another cut. Never blocks.
+    fn send_or_owe(&mut self, at: usize, route: ReplyRoute, answer: Result<Rows, WireFault>) -> Option<Owed> {
+        let may_pass = at.checked_sub(1).is_none_or(|p| self.replies[p].cut() != route.cut);
         let sent = may_pass
             && match &answer {
                 Err(fault) => self.w2m_writer.try_send_msg(route.request_id, &WireMsg::fault(fault)),
@@ -102,8 +105,7 @@ impl WorkerProcess<'_> {
     /// Answer `route`. Its cut's groups are consecutive in the SAL, so whatever the
     /// cut still owes sits at the back of the queue.
     pub(super) fn reply(&mut self, route: ReplyRoute, answer: Result<Rows, WireFault>) {
-        let may_pass = self.replies.back().is_none_or(|owed| owed.cut() != route.cut);
-        if let Some(owed) = self.send_or_owe(route, may_pass, answer) {
+        if let Some(owed) = self.send_or_owe(self.replies.len(), route, answer) {
             self.replies.push_back(owed);
         }
     }
@@ -118,8 +120,7 @@ impl WorkerProcess<'_> {
             };
             let route = *route;
             let answer = answer(self.catalog, read);
-            let may_pass = i == 0 || self.replies[i - 1].cut() != route.cut;
-            match self.send_or_owe(route, may_pass, answer) {
+            match self.send_or_owe(i, route, answer) {
                 Some(owed) => {
                     self.replies[i] = owed;
                     i += 1;

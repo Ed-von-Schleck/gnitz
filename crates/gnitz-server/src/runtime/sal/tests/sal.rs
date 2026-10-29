@@ -1,15 +1,14 @@
 use super::fixtures::{group_at, test_log};
 use super::{
     decode_sal_frame, epoch_word, group_header_size, prefix_atomic, stamp_digest, Apply, EpochGate, GroupData,
-    GroupHead, Read, SalGroup, SalLog, SalMessageKind, SalReader, SalRequest, SalStep, SalWriter, WorkerSet,
-    ANCHOR_BYTES, CHECKPOINT_RESERVE, FLAG_IN_REQUEST_ORDER, FLAG_SHARED, FLAG_ZONE_END, HDR_PREFIX, KNOWN_FLAGS,
-    MAX_WORKERS, OFF_FLAGS, OFF_KIND, OFF_LSN, OFF_TARGETS, OFF_WIDTH, PREFIX_BYTES, PRESENT,
+    GroupHead, GroupTargets, Read, SalGroup, SalLog, SalMessageKind, SalReader, SalRequest, SalStep, SalWriter,
+    WorkerSet, ANCHOR_BYTES, CHECKPOINT_RESERVE, FLAG_IN_REQUEST_ORDER, FLAG_SHARED, FLAG_ZONE_END, HDR_PREFIX,
+    KNOWN_FLAGS, MAX_WORKERS, OFF_FLAGS, OFF_KIND, OFF_LSN, OFF_TARGETS, OFF_WIDTH, PREFIX_BYTES, PRESENT,
 };
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 use crate::runtime::w2m::fixtures::test_rings;
-use crate::runtime::w2m::GroupTargets;
 use crate::test_support::{
     make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, sweep_bit_flips, weighted_rows,
 };
@@ -20,9 +19,9 @@ use gnitz_zset::schema::{encode_schema_block, SchemaColumn, SchemaDescriptor};
 use std::fs::File;
 use std::sync::atomic::Ordering;
 
-/// A control-only group addressed to `target_id`.
-fn to(target_id: u64) -> SalGroup<'static> {
-    SalGroup::new(Apply::DdlSync { family: target_id })
+/// A control-only group addressed to `tid`: a push that carries no rows.
+fn to(tid: u64) -> SalGroup<'static> {
+    SalGroup::new(Apply::Push { tid })
 }
 
 /// A read of `tid` under the blob `spec`.
@@ -262,7 +261,9 @@ fn a_committed_zoned_push_marks_the_writer_as_holding_pushes() {
     assert!(!log.holds_pushes(), "an unzoned push is outside every zone");
 
     let mut scope = excl.begin("test");
-    scope.write(&to(1), true).expect("group fits");
+    scope
+        .write(&SalGroup::ddl_sync(SysFamily::Table, &batch), true)
+        .expect("group fits");
     scope
         .all_or_nothing(|s| {
             s.write(&push(), true)?;
@@ -339,7 +340,7 @@ fn a_reader_leaves_its_epoch_on_stepping_past_a_flush() {
         excl.write(&round).expect("group fits");
         excl.write(&to(2)).expect("group fits");
 
-        assert_eq!(read(&mut reader), Some((SalMessageKind::DdlSync, 1)));
+        assert_eq!(read(&mut reader), Some((SalMessageKind::Push, 1)));
         assert_eq!(read(&mut reader), Some((kind, 0)));
         assert_eq!(read(&mut reader), None, "{kind:?}: nothing behind it is read");
         assert!(reader.is_empty(), "{kind:?}: the old epoch's groups are leftovers");
@@ -348,7 +349,7 @@ fn a_reader_leaves_its_epoch_on_stepping_past_a_flush() {
         excl.write(&to(3)).expect("group fits");
         assert_eq!(
             read(&mut reader),
-            Some((SalMessageKind::DdlSync, 3)),
+            Some((SalMessageKind::Push, 3)),
             "{kind:?}: the next epoch"
         );
     }

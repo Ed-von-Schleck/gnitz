@@ -1,4 +1,3 @@
-use super::super::fixtures::test_dispatcher;
 use super::*;
 use crate::test_support::u64_pk_schema;
 use gnitz_wire::TypeCode;
@@ -26,7 +25,7 @@ fn filter_proves_absence_only_until_it_caps() {
 /// A retraction is not an occupancy, and a NULL in an indexed column is not a
 /// key: only the live, non-NULL rows' spans enter the filter.
 #[test]
-fn extract_into_filter_takes_only_live_non_null_spans() {
+fn insert_all_of_spans_takes_only_live_non_null_spans() {
     let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::U64, true)]);
     let mut bb = BatchBuilder::new(&schema);
     for (pk, weight, payload) in [(1, 1, Some(100)), (2, 1, None), (3, -1, Some(300))] {
@@ -39,7 +38,7 @@ fn extract_into_filter_takes_only_live_non_null_spans() {
     for (col, present, absent) in [(0, &[1, 2][..], &[3][..]), (1, &[100], &[0, 300])] {
         let spec = KeySpec::new(&[col], &schema).unwrap();
         let mut f = UniqueFilter::new();
-        extract_into_filter(&mut f, &batch.as_mem_batch(), &spec);
+        f.insert_all(spans(&batch.as_mem_batch(), &spec).chunks_exact(spec.key_size()));
         let held = |v: u64| f.may_contain(&v.to_be_bytes());
         for &v in present {
             assert!(held(v), "column {col}: {v} is present");
@@ -54,33 +53,33 @@ fn extract_into_filter_takes_only_live_non_null_spans() {
 /// `(table, columns)`, until it caps or its index or its table drops it.
 #[test]
 fn a_seed_drops_absent_spans_under_its_own_index() {
-    let (disp, _) = test_dispatcher(Vec::new(), std::ptr::null_mut());
+    let checks = Checks::new();
     let (a, ab) = (PkColList::from_slice(&[0]), PkColList::from_slice(&[0, 1]));
     let mut seed = UniqueFilter::new();
     seed.insert(&1u64.to_be_bytes());
-    disp.unique_filter_seed(7, a, seed);
-    disp.unique_filter_seed(7, ab, UniqueFilter::new());
-    disp.unique_filter_seed(8, a, UniqueFilter::new());
+    checks.unique_filter_seed(7, a, seed);
+    checks.unique_filter_seed(7, ab, UniqueFilter::new());
+    checks.unique_filter_seed(8, a, UniqueFilter::new());
     // Of spans 1 and 5, the ones the filter keeps.
     let kept = |tid, cols| {
         let spans = [1u64.to_be_bytes(), 5u64.to_be_bytes()];
         let keys = PkKeys::from_keys(8, spans.iter().map(|s| &s[..]));
-        let kept = disp.unique_filter_retain_possible(tid, cols, keys);
+        let kept = checks.unique_filter_retain_possible(tid, cols, keys);
         kept.iter()
             .map(|k| u64::from_be_bytes(k.try_into().unwrap()))
             .collect::<Vec<_>>()
     };
 
     assert_eq!(kept(7, a), [1], "the seeded span alone");
-    disp.unique_filter_remove(7, a);
+    checks.unique_filter_remove(7, a);
     assert_eq!(kept(7, a), [1, 5], "a removed filter proves nothing");
     assert_eq!(kept(7, ab), [], "the composite index keeps its own");
-    disp.unique_filter_invalidate_table(7);
+    checks.forget(7);
     assert_eq!(kept(7, ab), [1, 5]);
     assert_eq!(kept(8, a), [], "another table's filter survives");
 
     let mut capped = UniqueFilter { cap: 0, ..UniqueFilter::new() };
     assert!(!capped.insert(&9u64.to_be_bytes()));
-    disp.unique_filter_seed(8, a, capped);
+    checks.unique_filter_seed(8, a, capped);
     assert_eq!(kept(8, a), [1, 5], "a capped filter proves nothing");
 }

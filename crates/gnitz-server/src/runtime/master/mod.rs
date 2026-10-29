@@ -1,35 +1,31 @@
-//! Master-side dispatcher: fans out push/scan operations to worker processes
-//! via the shared append-only log (SAL) and collects responses via per-worker
-//! W2M regions.
+//! Master-side dispatcher: the master's handle on its workers. It fans out
+//! push/scan operations to worker processes via the shared append-only log
+//! (SAL) and collects responses via per-worker W2M regions. The child `route`
+//! decides which workers a read or push reaches; `dispatch` holds its writes,
+//! the tick rounds they allocate and worker reaping.
 
 pub(crate) mod route;
 
 mod dispatch;
-mod fk_presence;
-mod preflight;
-mod unique_filter;
-mod unique_preflight;
 
-/// The inert dispatcher the `master` submodules' unit tests construct.
+/// The inert dispatcher the unit tests of the `master` submodules and of the
+/// executor's write validation construct.
 #[cfg(test)]
 #[path = "tests/fixtures.rs"]
-mod fixtures;
+pub(crate) mod fixtures;
 
 use std::cell::{Cell, RefCell};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::catalog::CatalogEngine;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::reactor::{Reactor, TrainLease};
 use crate::runtime::sal::{GroupData, Read, SalExcl, SalGroup, SalWriter};
-use gnitz_store::read::Probe;
-use gnitz_wire::{PkColList, WireFault};
+use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;
 
 pub(crate) use dispatch::WORKER_WATCH;
-pub(crate) use preflight::TxnFamily;
-pub(crate) use unique_filter::UniqueFilter;
 
 // ---------------------------------------------------------------------------
 // MasterDispatcher
@@ -42,41 +38,14 @@ pub struct MasterDispatcher {
     reactor: Reactor,
     /// Dereferenced by [`MasterDispatcher::cat`] and [`MasterDispatcher::cat_mut`] alone.
     catalog: *mut CatalogEngine,
-    /// The filter of each unique index that has one, by (table_id, column
-    /// list). Every entry holds all of its index's spans.
-    unique_filters: RefCell<FxHashMap<(u64, PkColList), UniqueFilter>>,
-
-    /// The presence cache of each table an FK probe found a key of, by table id.
-    fk_presence: RefCell<FxHashMap<u64, fk_presence::FkPresence>>,
-    /// Keys one presence cache holds before it is dropped whole.
-    /// `GNITZ_FK_PRESENCE_KEYS` lowers it, so tests reach it on small tables.
-    fk_presence_cap: usize,
-
-    /// The tick ledger: what the next tick owes, what the last one covered, and
-    /// the rounds it allocated.
-    ledger: TickLedger,
-
-    /// Bytes of rows one write's cascade may delete, at each row's fixed width:
-    /// what a client's own delete of them could carry in one frame.
-    /// `GNITZ_CASCADE_BYTES` lowers it, so tests reach it on small tables.
-    cascade_bytes: usize,
+    /// The tick rounds the dispatcher's tick groups allocated.
+    rounds: TickRounds,
 }
 
-/// The tick ledger of a [`MasterDispatcher`]. `pending`, `round` and
-/// `last_delta_round` grow under the SAL hold their tick or commit groups are
-/// written under; a dropped relation's entries are removed under the catalog
-/// write guard.
-struct TickLedger {
-    /// Tables with a pending delta, each with the row count feeding the
-    /// coalesce threshold.
-    pending: RefCell<FxHashMap<u64, usize>>,
-    /// The pending rows of one table that fire an auto-tick.
-    /// `GNITZ_TICK_COALESCE_ROWS` lowers it, so tests reach it on small tables.
-    coalesce_rows: usize,
-    /// The SAL watermark the last emitted tick snapshotted: every commit at or
-    /// below it is reflected in every view, as a read written to the SAL from
-    /// now on sees it. 0 until [`MasterDispatcher::seed_tick_lsn`] seeds it.
-    last_lsn: Cell<u64>,
+/// The tick rounds of a [`MasterDispatcher`]. `round` and `last_delta_round`
+/// grow under the SAL hold their tick groups are written under; a dropped
+/// relation's entries are removed under the catalog write guard.
+struct TickRounds {
     /// The last tick round allocated, one per tid a tick group carries. Starts at 1, which is
     /// never emitted, so `after_tick = 0` names no round.
     round: Cell<u64>,
@@ -85,12 +54,82 @@ struct TickLedger {
     last_delta_round: RefCell<FxHashMap<u64, u64>>,
 }
 
-/// An integrity-violation refusal: a write, or an index build, that a PK,
-/// unique-index or FK constraint forbids.
-fn integrity_violation(text: String) -> WireFault {
-    WireFault {
-        status: gnitz_wire::WireStatus::IntegrityViolation,
-        text,
+impl MasterDispatcher {
+    pub(crate) fn new(worker_pids: Vec<i32>, catalog: *mut CatalogEngine, sal: SalWriter, reactor: Reactor) -> Self {
+        debug_assert_eq!(
+            sal.num_workers(),
+            worker_pids.len(),
+            "the SAL is written at the worker count"
+        );
+        MasterDispatcher {
+            worker_pids,
+            sal,
+            reactor,
+            catalog,
+            rounds: TickRounds {
+                round: Cell::new(1),
+                last_delta_round: RefCell::new(FxHashMap::default()),
+            },
+        }
+    }
+
+    /// The catalog, which outlives the dispatcher.
+    pub(crate) fn cat(&self) -> &CatalogEngine {
+        unsafe { &*self.catalog }
+    }
+
+    /// The catalog, exclusively: no reference from this or [`Self::cat`] may be
+    /// alive across a call.
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) fn cat_mut(&self) -> &mut CatalogEngine {
+        unsafe { &mut *self.catalog }
+    }
+
+    /// The SAL writer: its queries, and the [`SalExcl`] every write goes through.
+    pub(crate) fn sal(&self) -> &SalWriter {
+        &self.sal
+    }
+
+    /// The master's event loop.
+    pub(crate) fn reactor(&self) -> &Reactor {
+        &self.reactor
+    }
+
+    pub(crate) fn num_workers(&self) -> usize {
+        self.sal.num_workers()
+    }
+
+    /// Drop a dropped relation's last delta round. Ids are never reused, so
+    /// nothing else would ever reclaim it.
+    pub(crate) fn forget_relation(&self, id: u64) {
+        self.rounds.last_delta_round.borrow_mut().remove(&id);
+    }
+
+    /// The scan-shaped requests `build` writes under one SAL hold, one lease
+    /// each; each worker replies in request order.
+    pub(crate) async fn scan_cut(
+        &self,
+        build: impl FnOnce(&mut ScanCut<'_>) -> Result<(), WireFault>,
+    ) -> Result<Vec<TrainLease>, WireFault> {
+        let mut cut = ScanCut {
+            disp: self,
+            excl: self.sal.lock().await,
+            scans: Vec::new(),
+        };
+        build(&mut cut)?;
+        Ok(cut.scans)
+    }
+
+    /// One scan-shaped read under its own SAL hold.
+    pub(crate) async fn scan(&self, read: Read<'_>) -> Result<TrainLease, WireFault> {
+        let mut leases = self.scan_cut(|cut| cut.read(read)).await?;
+        Ok(leases.pop().expect("one read, one lease"))
+    }
+
+    /// `read`, answered with no rows by every worker it reaches, under its own
+    /// SAL hold; the first worker fault.
+    pub(crate) async fn command(&self, read: Read<'_>) -> Result<(), WireFault> {
+        self.scan(read).await?.finish().await
     }
 }
 
@@ -113,84 +152,9 @@ impl<'d> ScanCut<'d> {
             .disp
             .reactor
             .lease_train(route.set, group.request.encode().0.variant_name());
-        debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
+        debug_assert!(lease.targets().set.len() > 0, "every read owes at least one reply");
         self.excl.write(&SalGroup { data, targets: lease.targets(), ..group })?;
         self.scans.push(lease);
         Ok(())
-    }
-}
-
-impl MasterDispatcher {
-    /// Bring every cache derived from `tid`'s committed rows up to a `batch` of
-    /// it that is now durable.
-    pub(crate) fn committed(&self, tid: u64, batch: &Batch) {
-        self.unique_filter_ingest_batch(tid, batch);
-        self.fk_presence_ingest_batch(tid, batch);
-    }
-
-    /// Drop everything held for a dropped relation. Ids are never reused, so
-    /// nothing else would ever reclaim it.
-    pub(crate) fn forget_relation(&self, id: u64) {
-        self.ledger.pending.borrow_mut().remove(&id);
-        self.ledger.last_delta_round.borrow_mut().remove(&id);
-        self.unique_filter_invalidate_table(id);
-        self.fk_presence_invalidate_table(id);
-    }
-
-    /// The scan-shaped requests `build` writes under one SAL hold, one lease
-    /// each; each worker replies in request order.
-    pub(crate) async fn scan_cut(
-        &self,
-        build: impl FnOnce(&mut ScanCut<'_>) -> Result<(), WireFault>,
-    ) -> Result<Vec<TrainLease>, WireFault> {
-        let mut cut = ScanCut {
-            disp: self,
-            excl: self.sal.lock().await,
-            scans: Vec::new(),
-        };
-        build(&mut cut)?;
-        Ok(cut.scans)
-    }
-
-    /// One cut of delta reads, each given as `(view, after_tick, spec,
-    /// reply_layout)`: a read of `view`'s deltas after `after_tick`. Each lease
-    /// is paired with the round its read reaches, the view's last when the read
-    /// was written. No reads take no SAL hold.
-    pub(crate) async fn delta_cut<'s>(
-        &self,
-        reads: impl IntoIterator<Item = (u64, u64, &'s [u8], u64)>,
-    ) -> Result<Vec<(TrainLease, u64)>, WireFault> {
-        let mut reads = reads.into_iter().peekable();
-        if reads.peek().is_none() {
-            return Ok(Vec::new());
-        }
-        let mut reached = Vec::with_capacity(reads.size_hint().0);
-        let leases = self
-            .scan_cut(|cut| {
-                for (view, after_tick, spec, reply_layout) in reads {
-                    cut.read(Read::Delta {
-                        view,
-                        after_tick,
-                        reply_layout,
-                        spec: spec.into(),
-                    })?;
-                    reached.push(self.last_delta_round(view));
-                }
-                Ok(())
-            })
-            .await?;
-        Ok(leases.into_iter().zip(reached).collect())
-    }
-
-    /// One scan-shaped read under its own SAL hold.
-    pub(crate) async fn scan(&self, read: Read<'_>) -> Result<TrainLease, WireFault> {
-        let mut leases = self.scan_cut(|cut| cut.read(read)).await?;
-        Ok(leases.pop().expect("one read, one lease"))
-    }
-
-    /// `read`, answered with no rows by every worker it reaches, under its own
-    /// SAL hold; the first worker fault.
-    pub(crate) async fn command(&self, read: Read<'_>) -> Result<(), WireFault> {
-        self.scan(read).await?.finish().await
     }
 }

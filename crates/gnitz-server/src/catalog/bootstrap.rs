@@ -19,12 +19,11 @@ impl UnreplayedCatalog {
         self.0.registry.system_replay_floors()
     }
 
-    /// Ingest one recovered DdlSync group into `table_id`'s store, firing no hook.
-    pub(crate) fn stage(&mut self, table_id: u64, lsn: u64, batch: Batch) -> Result<(), String> {
-        let family = SysFamily::from_id(table_id).ok_or_else(|| format!("{table_id} is not a system table"))?;
+    /// Ingest one recovered DdlSync group into `family`'s store, firing no hook.
+    pub(crate) fn stage(&mut self, family: SysFamily, lsn: u64, batch: Batch) -> Result<(), String> {
         let engine = &mut self.0;
         engine.raise_next_id(family, &batch);
-        engine.registry.ingest(table_id, batch)?;
+        engine.registry.ingest(family.id(), batch)?;
         engine.mark_zone_applied(lsn);
         Ok(())
     }
@@ -94,21 +93,6 @@ impl CatalogEngine {
         Ok(UnreplayedCatalog(engine))
     }
 
-    /// [`Self::open_with`] under the environment's [`StoreConfig`].
-    #[cfg(test)]
-    pub(crate) fn open(base_dir: &str, num_workers: u32) -> Result<Self, String> {
-        Self::open_with(base_dir, num_workers, StoreConfig::from_env("GNITZ_"))
-    }
-
-    /// [`Self::open_master`] and its replay, then the rest of a store-owning
-    /// boot, as a standalone host at rank 0.
-    #[cfg(test)]
-    pub(crate) fn open_with(base_dir: &str, num_workers: u32, config: StoreConfig) -> Result<Self, String> {
-        let mut engine = Self::open_master(base_dir, num_workers, config)?.replay()?;
-        engine.open_stores(0, gnitz_store::relation::Residency::Origin)?;
-        Ok(engine)
-    }
-
     // -- Seed (fresh database) ---------------------------------------------
 
     /// Seed every family whose store has never published, straight into the
@@ -137,15 +121,5 @@ impl CatalogEngine {
             self.fire_hooks(family, &rows)?;
         }
         Ok(())
-    }
-
-    // -- Close engine ------------------------------------------------------
-
-    /// Flush every base and system store, then drop the engine. Dropping one
-    /// without `close` is a crash.
-    #[cfg(test)]
-    pub(crate) fn close(mut self) {
-        let _ = self.registry.checkpoint_base();
-        let _ = self.flush_all_system_tables();
     }
 }

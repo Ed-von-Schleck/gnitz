@@ -27,7 +27,7 @@ use crate::runtime::frame::WireMsg;
 use crate::runtime::park::{WorkerParks, WorkerSet};
 use crate::runtime::reactor::Reactor;
 use crate::runtime::sync::{AsyncRwLock, WriteGuard};
-use crate::runtime::w2m::GroupTargets;
+use crate::runtime::w2m::NO_REPLY_REQUEST_ID;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
 use gnitz_wire::{
@@ -187,6 +187,22 @@ impl<'a> GroupData<'a> {
     }
 }
 
+/// The workers a group is written to and the request id they answer on.
+#[derive(Clone, Copy)]
+pub(crate) struct GroupTargets {
+    pub(crate) set: WorkerSet,
+    /// [`NO_REPLY_REQUEST_ID`]: nothing answers.
+    pub(crate) request_id: u32,
+}
+
+impl GroupTargets {
+    /// Every worker, nothing answers.
+    pub(crate) const SILENT: Self = GroupTargets {
+        set: WorkerSet::ALL,
+        request_id: NO_REPLY_REQUEST_ID,
+    };
+}
+
 /// One SAL group as [`SalExcl::lay_out`] encodes it: the request every payload
 /// carries, plus what varies by worker.
 pub(crate) struct SalGroup<'a> {
@@ -235,7 +251,7 @@ impl<'a> SalGroup<'a> {
             } else {
                 GroupTargets::SILENT
             },
-            ..Self::new(Apply::DdlSync { family: family.id() })
+            ..Self::new(Apply::DdlSync { family })
         }
     }
 

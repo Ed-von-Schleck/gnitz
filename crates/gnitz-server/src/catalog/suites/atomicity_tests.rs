@@ -20,9 +20,7 @@ fn a_malformed_create_is_refused_at_the_precheck() {
     // worker applies them, since no bundle carries an ownerless column block.
     let mut with_cols = |cols: &[CatalogColumn]| {
         let id = engine.allocate_ids(1).unwrap();
-        engine
-            .ddl_sync(SysFamily::Column.id(), col_tab_batch(id, cols, 1))
-            .unwrap();
+        engine.ddl_sync(SysFamily::Column, col_tab_batch(id, cols, 1)).unwrap();
         id
     };
     let no_cols = with_cols(&[]);
@@ -38,7 +36,7 @@ fn a_malformed_create_is_refused_at_the_precheck() {
     let c = col_def("c", TypeCode::U64).def;
     let rows = [0, 2].map(|col_idx| (ColTabRow::of(gapped, col_idx, &c, None), 1));
     engine
-        .ddl_sync(SysFamily::Column.id(), crate::test_support::sys_batch(rows))
+        .ddl_sync(SysFamily::Column, crate::test_support::sys_batch(rows))
         .unwrap();
     let unregistered = engine.allocate_ids(2).unwrap();
     let index_on = |owner: u64, cols: &[u32], name: &str| idx_tab_batch(unregistered + 1, owner, cols, name, false, 1);
@@ -120,7 +118,7 @@ fn a_recovered_row_raises_the_id_counter_past_its_id() {
         gnitz_wire::FIRST_USER_TABLE_ID + 900,
     );
     unreplayed
-        .stage(gnitz_wire::SCHEMA_TAB, 500, schema_tab_batch(&[(sid, "recovered", 1)]))
+        .stage(SysFamily::Schema, 500, schema_tab_batch(&[(sid, "recovered", 1)]))
         .unwrap();
     let mut engine = unreplayed.replay().unwrap();
     assert_eq!(engine.allocate_ids(1).unwrap(), sid + 1);
@@ -128,7 +126,7 @@ fn a_recovered_row_raises_the_id_counter_past_its_id() {
 
     let mut unreplayed = CatalogEngine::open_master(&dir, 1, Default::default()).unwrap();
     let schema = schema_tab_batch(&[(tail, "recovered_too", 1)]);
-    unreplayed.stage(gnitz_wire::SCHEMA_TAB, 501, schema).unwrap();
+    unreplayed.stage(SysFamily::Schema, 501, schema).unwrap();
     assert_eq!(unreplayed.replay().unwrap().allocate_ids(1).unwrap(), tail + 1);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -294,7 +292,7 @@ fn sequence_advances_leave_no_negative_ghost() {
 #[test]
 fn undoing_a_drop_keeps_the_restored_relation_directory() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
-    let (mut engine, tid) = table_fixture("undo_drop_keeps_dir", &cols);
+    let (mut engine, tid) = table_engine("catalog", "undo_drop_keeps_dir", 1, &cols);
     let reldir = relation_dir(engine.registry.base_dir(), tid);
     // The DROP of a bundle the log then refuses: applied, its zone in hand.
     let drop_batch = engine.retract_under(SysFamily::Table, &[tid]);

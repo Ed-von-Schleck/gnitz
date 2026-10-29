@@ -8,12 +8,12 @@
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 
-use super::tests::{base_rows, engine_with_base, engine_with_views, register_count};
+use super::tests::{base_rows, engine_with_views, register_count};
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    col_def, cols_of, make_schema_u64_i64, net_weight, register_identity_view, try_register_view, u64_i64_cols,
-    EchoDrive,
+    col_def, cols_of, make_schema_u64_i64, net_weight, register_identity_view, table_engine, try_register_view,
+    u64_i64_cols, EchoDrive,
 };
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{AggDescriptor, Circuit, GroupAggs, ReadBound, TypeCode};
@@ -88,7 +88,7 @@ fn drive_tick_bench() {
 
     // A `GROUP BY`, a global `COUNT(*)` and a hash-keyed `DISTINCT`, each behind
     // an exchange.
-    let (mut engine, base) = engine_with_base("tick_bench_rounds", 4);
+    let (mut engine, base) = table_engine("dag_exec", "tick_bench_rounds", 4, &u64_i64_cols());
     let aggs = [AggDescriptor::COUNT_STAR];
     let grouped = ReducePlan::from_wire(&make_schema_u64_i64(), &[1], &aggs, false).unwrap();
     let grouped = cols_of(grouped.output_schema());
@@ -116,7 +116,7 @@ fn drive_tick_bench() {
     // Wide ticks of a source one view reads and eight do, every reader but the
     // last taking a copy of the delta.
     for readers in [1, 8] {
-        let (mut engine, base) = engine_with_base(&format!("tick_bench_fanout_{readers}"), 1);
+        let (mut engine, base) = table_engine("dag_exec", &format!("tick_bench_fanout_{readers}"), 1, &u64_i64_cols());
         let views: Vec<u64> = (0..readers)
             .map(|r| register_identity_view(&mut engine, base, &format!("v{r}"), &u64_i64_cols()))
             .collect();

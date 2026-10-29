@@ -84,17 +84,6 @@ fn assert_self_description(engine: &CatalogEngine) {
     );
 }
 
-/// Every stored weight in `family`'s store.
-fn family_weights(engine: &CatalogEngine, family: SysFamily) -> Vec<i64> {
-    let mut c = engine.sys_relation(family).cursor();
-    let mut v = Vec::new();
-    while c.valid {
-        v.push(c.current_weight);
-        c.advance();
-    }
-    v
-}
-
 /// Open a fresh database, close it, and unlink `family`'s manifest — a first
 /// boot that crashed inside its flush barrier with every other family published.
 fn fresh_db_missing_manifest(name: &str, family: SysFamily) -> String {
@@ -118,15 +107,13 @@ fn an_unpublished_tables_family_is_reseeded_alone() {
         (SysFamily::Column, col_rows),
         (SysFamily::Table, SysFamily::COUNT),
     ] {
-        let weights = family_weights(&engine, family);
+        let weights = weights(engine.sys_relation(family).cursor());
         assert_eq!(weights.len(), rows, "{} row count", family.name());
         assert!(
             weights.iter().all(|&w| w == 1),
             "{} weights: {weights:?}",
             family.name()
         );
-        assert_eq!(count_records(engine.sys_relation(family).cursor()), rows);
-        assert_eq!(count_negative_records(engine.sys_relation(family).cursor()), 0);
     }
 
     finish(engine);
@@ -1074,7 +1061,7 @@ fn a_view_create_at_a_registered_table_id_is_refused() {
 fn only_a_scanned_table_holds_a_push_for_its_tick() {
     use crate::test_support::make_batch;
     let cols = u64_i64_cols();
-    let (mut engine, tid) = table_fixture("unscanned_push", &cols);
+    let (mut engine, tid) = table_engine("catalog", "unscanned_push", 1, &cols);
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     engine.ingest_unticked(tid, make_batch(&schema, &[(1, 1, 10)])).unwrap();

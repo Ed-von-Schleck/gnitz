@@ -1,7 +1,6 @@
 use super::fixtures::test_log;
 use super::tests::scan;
-use super::{GroupData, SalGroup, SalReader, SalWriter, WorkerSet};
-use crate::runtime::w2m::GroupTargets;
+use super::{GroupData, GroupTargets, SalGroup, SalReader, SalWriter, WorkerSet};
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
 

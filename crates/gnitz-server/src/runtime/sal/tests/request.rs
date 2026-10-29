@@ -3,8 +3,7 @@ use std::num::NonZeroU64;
 use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::sal::fixtures::test_log;
-use crate::runtime::sal::{GroupData, SalGroup, SalReader};
-use crate::runtime::w2m::GroupTargets;
+use crate::runtime::sal::{GroupData, GroupTargets, SalGroup, SalReader};
 use crate::test_support::{make_batch, make_schema_u64_i64, schema_tab_batch};
 use gnitz_wire::peek_control_block;
 use gnitz_zset::schema::encode_schema_block;
@@ -17,7 +16,7 @@ fn every_request() -> Vec<SalRequest<'static>> {
         SalRequest::Shutdown,
         Apply::Flush.into(),
         Apply::FlushEph { generation: 11 }.into(),
-        Apply::DdlSync { family: 12 }.into(),
+        Apply::DdlSync { family: SysFamily::Sequence }.into(),
         Apply::Backfill { views: vec![13, 14].into() }.into(),
         Apply::Push { tid: 15 }.into(),
         Apply::Tick {

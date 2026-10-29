@@ -10,8 +10,9 @@ use rustc_hash::FxHashMap;
 
 use super::*;
 use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::GroupTargets;
 use crate::runtime::sync::WakeQueue;
-use crate::runtime::w2m::{GroupTargets, W2mSlot, BOOT_READY_REQUEST_ID, NO_REPLY_REQUEST_ID};
+use crate::runtime::w2m::{W2mSlot, BOOT_READY_REQUEST_ID, NO_REPLY_REQUEST_ID};
 
 // ---------------------------------------------------------------------------
 // Routes
@@ -116,7 +117,10 @@ impl Reactor {
     fn lease(&self, id: u32, set: WorkerSet, route: impl FnOnce(WorkerSet) -> Route) -> Lease {
         let workers = set.within(self.w2m.num_workers());
         self.routes.map.borrow_mut().insert(id, route(workers));
-        Lease { reactor: self.clone(), id, workers }
+        Lease {
+            reactor: self.clone(),
+            targets: GroupTargets { set: workers, request_id: id },
+        }
     }
 
     /// `id`, answered by one ACK from every worker in `set`.
@@ -143,7 +147,7 @@ impl Reactor {
             let queues = (0..set.len()).map(|_| WakeQueue::default()).collect();
             Route::Train(TrainRoute { set, queues })
         });
-        let left = Cell::new(lease.workers);
+        let left = Cell::new(lease.targets.set);
         TrainLease { lease, left, what }
     }
 }
@@ -152,25 +156,17 @@ impl Reactor {
 // Lease
 // ---------------------------------------------------------------------------
 
-/// A live route: its request id and the set it was built over. Dropping it
-/// removes the route, and with it whatever the route still holds.
+/// A live route. Dropping it removes the route, and with it whatever the route
+/// still holds.
 struct Lease {
     reactor: Reactor,
-    id: u32,
-    /// The set its route was built over.
-    workers: WorkerSet,
-}
-
-impl Lease {
-    /// The targets of the group this lease's workers answer.
-    fn targets(&self) -> GroupTargets {
-        GroupTargets { set: self.workers, request_id: self.id }
-    }
+    /// The route's request id and the set it was built over.
+    targets: GroupTargets,
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.reactor.routes.map.borrow_mut().remove(&self.id);
+        self.reactor.routes.map.borrow_mut().remove(&self.targets.request_id);
     }
 }
 
@@ -185,7 +181,7 @@ pub(crate) struct AckLease(Lease);
 impl AckLease {
     /// The targets of the group this lease's workers answer.
     pub(crate) fn targets(&self) -> GroupTargets {
-        self.0.targets()
+        self.0.targets
     }
 
     /// Resolves once every worker of the set has ACKed. A worker that cannot
@@ -193,7 +189,7 @@ impl AckLease {
     pub(crate) async fn acks(&self) {
         std::future::poll_fn(|cx| {
             let mut routes = self.0.reactor.routes.map.borrow_mut();
-            let Some(Route::Acks(r)) = routes.get_mut(&self.0.id) else {
+            let Some(Route::Acks(r)) = routes.get_mut(&self.0.targets.request_id) else {
                 unreachable!("an ACK lease's id routes to its ACKs")
             };
             if r.left == WorkerSet::EMPTY {
@@ -240,14 +236,9 @@ impl TrainFrame {
 }
 
 impl TrainLease {
-    /// The workers answering, each launched.
-    pub(crate) fn workers(&self) -> WorkerSet {
-        self.lease.workers
-    }
-
     /// The targets of the group this lease's workers answer.
     pub(crate) fn targets(&self) -> GroupTargets {
-        self.lease.targets()
+        self.lease.targets
     }
 
     /// Worker `w`'s next frame, row-less ones included, with the range of its
@@ -306,7 +297,7 @@ impl TrainLease {
     async fn next_slot(&self, w: usize) -> W2mSlot {
         std::future::poll_fn(|cx| {
             let mut routes = self.lease.reactor.routes.map.borrow_mut();
-            let Some(Route::Train(route)) = routes.get_mut(&self.lease.id) else {
+            let Some(Route::Train(route)) = routes.get_mut(&self.lease.targets.request_id) else {
                 unreachable!("a train lease's id routes to its train")
             };
             route

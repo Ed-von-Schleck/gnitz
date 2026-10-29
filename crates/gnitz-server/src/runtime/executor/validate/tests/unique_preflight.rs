@@ -1,5 +1,6 @@
 use super::*;
 use crate::runtime::frame::WireMsg;
+use crate::runtime::park::WorkerSet;
 use crate::runtime::reactor::test_support::reactor_with_rings;
 use crate::test_support::pk_only_schema;
 use gnitz_wire::TypeCode;

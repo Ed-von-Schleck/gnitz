@@ -84,7 +84,7 @@ pub(super) async fn page(
     } else {
         let read = Read::SnapshotPage { snapshot: id, tid, page: blob.into() };
         let lease = shared.dispatcher.scan(read).await?;
-        'forward: for w in lease.workers().iter() {
+        'forward: for w in lease.targets().set.iter() {
             while let Some((slot, _)) = lease.frame_of(w).await? {
                 if peer.send(SendBody::Slot(slot)).await.is_err() {
                     break 'forward;
@@ -114,7 +114,9 @@ pub(super) async fn release_all(shared: &Shared, held: HeldSnapshots) {
 }
 
 /// Release snapshot `id` here and on every worker. A worker that cannot answer
-/// the release has left the cluster, which ends the server.
+/// the release has left the cluster, which ends the server; the one failure
+/// returned is the SAL refusing the Unpin group, after which the workers keep
+/// the pin until restart, so it is logged rather than fail-stopped.
 async fn release(shared: &Shared, id: u64) {
     shared.cat_mut().registry.unpin(id);
     let released = shared.dispatcher.command(Read::Unpin { snapshot: id }).await;

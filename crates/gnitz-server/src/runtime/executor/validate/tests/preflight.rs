@@ -7,7 +7,7 @@ use gnitz_wire::TypeCode;
 /// retraction waits on the child-index probe of the key it removes.
 #[test]
 fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
-    use super::super::fixtures::test_dispatcher;
+    use crate::runtime::master::fixtures::test_dispatcher;
     use crate::runtime::test_support::try_poll_once;
     use crate::test_support::{col_def, fk_def, make_batch_raw};
 
@@ -19,6 +19,7 @@ fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
     engine.create_table("public.child", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(parent).unwrap().schema();
     let (disp, _) = test_dispatcher(vec![0], &mut engine);
+    let checks = Checks::new();
 
     let write = |rows: &[(u64, i64, i64)]| {
         vec![TxnFamily {
@@ -29,11 +30,11 @@ fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
     };
     let mut upsert = write(&[(1, 1, 10), (2, 1, 20)]);
     assert!(matches!(
-        try_poll_once(disp.validate_txn_distributed(&mut upsert)),
+        try_poll_once(checks.validate_txn(&disp, &mut upsert)),
         Some(Ok(()))
     ));
     let mut retraction = write(&[(1, -1, 10)]);
-    assert!(try_poll_once(disp.validate_txn_distributed(&mut retraction)).is_none());
+    assert!(try_poll_once(checks.validate_txn(&disp, &mut retraction)).is_none());
 
     drop(disp);
     engine.close();

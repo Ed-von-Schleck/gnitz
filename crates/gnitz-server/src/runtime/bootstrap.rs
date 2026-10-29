@@ -1,16 +1,16 @@
 //! Server bootstrap: single entry point for server startup.
 //!
 //! `server_main()` opens the catalog, allocates shared IPC resources, forks workers,
-//! runs SAL recovery, and enters the executor event loop. It also picks the
-//! master's exit code: 0 after a shutdown signal, 1 for a failed boot, 2 when a
-//! worker died while serving.
+//! runs SAL recovery, and enters the executor event loop. It returns the
+//! master's exit code: 0 after a shutdown signal, 2 when a worker died while
+//! serving; a failed boot is an `Err`, which `main` exits 1 on.
 //!
 //! **Recovery order is a crash guard**: every step is placed so a crash at any
 //! point rebuilds a view rather than silently resuming a stale one.
 
 use std::os::fd::AsRawFd;
 
-use crate::catalog::{CatalogEngine, UnreplayedCatalog};
+use crate::catalog::{CatalogEngine, SysFamily, UnreplayedCatalog};
 use gnitz_foundation::fault::Seam;
 
 use crate::runtime::affinity;
@@ -24,7 +24,7 @@ use crate::runtime::sal::{CommittedTail, SalLog, SalMessage, SalMessageKind, Sal
 use crate::runtime::signals;
 use crate::runtime::sync::{select2, Either};
 use crate::runtime::tls::{TlsArgs, TlsListener};
-use crate::runtime::w2m::{self, W2mReceiver, W2mWriter, BOOT_READY_REQUEST_ID};
+use crate::runtime::w2m::{self, W2mWriter, BOOT_READY_REQUEST_ID};
 use crate::runtime::worker::WorkerProcess;
 use gnitz_store::relation::{Residency, StoreConfig};
 use gnitz_zset::algebra::Slot;
@@ -39,12 +39,17 @@ use gnitz_zset::algebra::Slot;
 /// system stores.
 fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Result<(), String> {
     let floors = catalog.system_replay_floors();
-    let mine = |msg: &SalMessage| {
-        msg.head.kind == SalMessageKind::DdlSync && floors.get(&msg.head.target_id).is_some_and(|&f| msg.head.lsn > f)
+    let mine = |msg: SalMessage| {
+        if msg.head.kind != SalMessageKind::DdlSync {
+            return None;
+        }
+        let family = SysFamily::from_id(msg.head.target_id)?;
+        let floor = *floors.get(&family.id())?;
+        (msg.head.lsn > floor).then_some((msg, family))
     };
 
     let mut replayed: u32 = 0;
-    for msg in tail.groups().filter(mine) {
+    for (msg, family) in tail.groups().filter_map(mine) {
         // A system family's group holds its batch as one payload.
         let Some(data) = msg.payloads().next() else {
             return Err(format!(
@@ -56,7 +61,7 @@ fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Re
             continue;
         };
         // Master-validated rows that already carry a drop's children.
-        catalog.stage(msg.head.target_id, msg.head.lsn, batch).map_err(|e| {
+        catalog.stage(family, msg.head.lsn, batch).map_err(|e| {
             format!(
                 "SAL system-table recovery apply failed (table_id={}, lsn={}): {e}",
                 msg.head.target_id, msg.head.lsn
@@ -196,51 +201,10 @@ pub(crate) struct ServerArgs {
     pub(crate) backup_dir: Option<String>,
 }
 
-/// Single entry point for the entire server bootstrap: opens the catalog,
-/// allocates the shared IPC regions, forks the workers, runs recovery, and
-/// enters the executor event loop.
-///
-/// Returns the process's exit code: 0 after a shutdown signal, 1 when the boot
-/// failed, 2 when a worker died while serving.
-pub(crate) fn server_main(args: ServerArgs) -> i32 {
-    match run_server(args) {
-        Ok(rc) => rc,
-        Err(e) => {
-            gnitz_error!("{e}");
-            1
-        }
-    }
-}
-
 /// One worker's own ends of the IPC regions.
 struct WorkerIpc {
     w2m_writer: W2mWriter,
     mesh: Mesh,
-}
-
-/// Every end of the regions the master and its forked workers talk through.
-///
-/// Nothing here is reclaimed on error: the only response to a failed boot is to
-/// exit the process, which returns all of it to the kernel.
-struct SharedIpc {
-    /// In rank order.
-    workers: Vec<WorkerIpc>,
-    /// The master's ends: the reader over every ring, and every worker's park
-    /// to wake.
-    receiver: W2mReceiver,
-    parks: WorkerParks,
-}
-
-/// Map the workers' parks, one W2M ring per worker, and the exchange mesh.
-fn acquire_shared_ipc(nw: usize) -> Result<SharedIpc, String> {
-    let parks = WorkerParks::create(nw).map_err(|e| format!("failed to map the worker parks: {e}"))?;
-    let (writers, receiver) = w2m::create(nw).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
-    let meshes =
-        mesh::create(mesh::outbox_bytes(), parks).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
-    let workers = (writers.into_iter().zip(meshes))
-        .map(|(w2m_writer, mesh)| WorkerIpc { w2m_writer, mesh })
-        .collect();
-    Ok(SharedIpc { workers, receiver, parks })
 }
 
 /// Worker `w`'s log file, which its stdout and stderr are redirected to. The
@@ -410,7 +374,13 @@ fn raise_fd_limit(target: u64) {
     }
 }
 
-fn run_server(args: ServerArgs) -> Result<i32, String> {
+/// Single entry point for the entire server bootstrap: opens the catalog,
+/// allocates the shared IPC regions, forks the workers, runs recovery, and
+/// enters the executor event loop.
+///
+/// Returns the process's exit code: 0 after a shutdown signal, 2 when a worker
+/// died while serving; `Err` when the boot failed.
+pub(crate) fn server_main(args: ServerArgs) -> Result<i32, String> {
     let ServerArgs {
         data_dir,
         socket_path,
@@ -451,7 +421,16 @@ fn run_server(args: ServerArgs) -> Result<i32, String> {
     // The committed tail every recovery replays, and the epoch the next writer
     // epoch starts above. Read once, before the fork.
     let tail = CommittedTail::read(SalLog::open(data_dir)?)?;
-    let SharedIpc { workers, receiver, parks } = acquire_shared_ipc(nw)?;
+    // The workers' parks, one W2M ring per worker, and the exchange mesh. None of
+    // it is reclaimed on error: a failed boot exits the process, which returns
+    // all of it to the kernel.
+    let parks = WorkerParks::create(nw).map_err(|e| format!("failed to map the worker parks: {e}"))?;
+    let (writers, receiver) = w2m::create(nw).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
+    let meshes =
+        mesh::create(mesh::outbox_bytes(), parks).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
+    let workers: Vec<WorkerIpc> = (writers.into_iter().zip(meshes))
+        .map(|(w2m_writer, mesh)| WorkerIpc { w2m_writer, mesh })
+        .collect();
 
     // Leaked: the dispatcher and reactor borrow it for the life of the process.
     let catalog: &'static mut CatalogEngine = Box::leak(Box::new(master_pre_fork_recovery(opened, tail)?));

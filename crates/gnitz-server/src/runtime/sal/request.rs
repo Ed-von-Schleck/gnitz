@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use std::num::NonZeroU64;
 
 use super::SalMessageKind;
+use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use gnitz_store::read::Probe;
 use gnitz_wire::{ControlHeader, PkColList, PkListRole};
@@ -65,7 +66,7 @@ pub(crate) enum Apply<'a> {
     /// stores, stamped with `generation`.
     FlushEph { generation: u64 },
     /// The catalog rows the group carries.
-    DdlSync { family: u64 },
+    DdlSync { family: SysFamily },
     /// The fill of each of `views`, in order, from the relations it scans.
     Backfill { views: Cow<'a, [u64]> },
     /// The rows the group carries.
@@ -91,7 +92,7 @@ impl SalRequest<'_> {
             SalRequest::Shutdown => (K::Shutdown, head),
             SalRequest::Apply(Apply::Flush) => (K::Flush, head),
             SalRequest::Apply(Apply::FlushEph { generation }) => (K::FlushEph, WireMsg { arg0: generation, ..head }),
-            SalRequest::Apply(Apply::DdlSync { family }) => (K::DdlSync, WireMsg { target_id: family, ..head }),
+            SalRequest::Apply(Apply::DdlSync { family }) => (K::DdlSync, WireMsg { target_id: family.id(), ..head }),
             SalRequest::Apply(Apply::Push { tid }) => (K::Push, WireMsg { target_id: tid, ..head }),
             SalRequest::Apply(Apply::Backfill { ref views }) => (
                 K::Backfill,
@@ -179,7 +180,10 @@ impl SalRequest<'static> {
             SalMessageKind::Shutdown => SalRequest::Shutdown,
             SalMessageKind::Flush => Apply::Flush.into(),
             SalMessageKind::FlushEph => Apply::FlushEph { generation: hdr.arg0 }.into(),
-            SalMessageKind::DdlSync => Apply::DdlSync { family: tid }.into(),
+            SalMessageKind::DdlSync => Apply::DdlSync {
+                family: SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?,
+            }
+            .into(),
             SalMessageKind::Backfill => Apply::Backfill {
                 views: gnitz_wire::le_scalars(blob)?.into(),
             }

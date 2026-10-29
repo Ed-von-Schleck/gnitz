@@ -1,8 +1,8 @@
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    col_def, make_batch, make_schema_u64_i64, push_and_tick, scan_all, scratch_dir, try_register_identity_view,
-    try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, RowKey,
+    col_def, make_batch, make_schema_u64_i64, push_and_tick, scan_all, scratch_dir, table_engine,
+    try_register_identity_view, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, RowKey,
 };
 use gnitz_wire::TypeCode;
 use std::collections::HashMap;
@@ -18,9 +18,8 @@ fn hydrate(engine: &mut CatalogEngine, view: u64, ids: &[u64]) -> HashMap<RowKey
 /// one gathered row per chunk.
 #[test]
 fn a_relation_seed_reads_the_source_as_of_its_last_tick() {
-    let mut engine = CatalogEngine::open(&scratch_dir("dag_hydrate", "relation_seed"), 1).unwrap();
     let cols = u64_i64_cols();
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let (mut engine, tid) = table_engine("dag_hydrate", "relation_seed", 1, &cols);
     let view = try_register_identity_view(&mut engine, tid, "bounded", &cols, 1 << 20, 0).unwrap();
     let rows: Vec<(u64, i64, i64)> = (1..=8).map(|id| (id, 1, id as i64 * 10)).collect();
     let schema = make_schema_u64_i64();

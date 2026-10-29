@@ -39,8 +39,10 @@ fn test_index_live_fanout() {
 fn test_create_index_duplicate_rejected() {
     // Creating the same index twice must fail on the second attempt rather
     // than silently orphaning the first index circuit.
-    let (mut engine, _tid) = table_fixture(
+    let (mut engine, _tid) = table_engine(
+        "catalog",
         "idx_dup_create",
+        1,
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)],
     );
 
@@ -62,8 +64,10 @@ fn test_create_index_duplicate_rejected() {
 /// for the `+1` it never sent.
 #[test]
 fn test_failed_create_index_rolls_back() {
-    let (mut engine, tid) = table_fixture(
+    let (mut engine, tid) = table_engine(
+        "catalog",
         "failed_create_index_rollback",
+        1,
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     engine
@@ -155,8 +159,10 @@ fn test_drop_table_cascades_fk_index() {
 
 #[test]
 fn test_drop_table_cascades_multiple_indices() {
-    let (mut engine, tid) = table_fixture(
+    let (mut engine, tid) = table_engine(
+        "catalog",
         "cascade_multi_idx",
+        1,
         &[
             col_def("id", TypeCode::U64),
             col_def("val1", TypeCode::I64),
@@ -210,8 +216,10 @@ fn test_drop_table_cascades_multiple_indices() {
 
 #[test]
 fn drop_table_removes_the_relation_entry() {
-    let (mut engine, tid) = table_fixture(
+    let (mut engine, tid) = table_engine(
+        "catalog",
         "drop_removes_relation_entry",
+        1,
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)],
     );
     engine.create_index("public.t", &["val"], false).unwrap();
@@ -372,8 +380,10 @@ fn apply_index_drop_then_refuse(engine: &mut CatalogEngine, idx_ids: &[u64]) {
 /// the workers, which never saw the undone drop, still hold.
 #[test]
 fn undone_drop_of_a_shared_index_keeps_its_directory() {
-    let (mut engine, tid) = table_fixture(
+    let (mut engine, tid) = table_engine(
+        "catalog",
         "shared_index_dir_stable",
+        1,
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     let mut ids = Vec::new();
@@ -490,8 +500,10 @@ fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
 #[test]
 fn test_unique_index_chunked_fill_distinct_succeeds() {
     // Every row must be projected exactly once across several chunks.
-    let (mut engine, tid) = table_fixture(
+    let (mut engine, tid) = table_engine(
+        "catalog",
         "unique_idx_chunked_ok",
+        1,
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     engine
@@ -520,8 +532,10 @@ fn test_unique_index_chunked_fill_distinct_succeeds() {
 fn test_composite_index_drop_exact_list() {
     // With both a single-column (a) index and a composite (a, b) index, dropping
     // (a, b) leaves the (a) index serving and removes only the (a, b) circuit.
-    let (mut engine, tid) = table_fixture(
+    let (mut engine, tid) = table_engine(
+        "catalog",
         "composite_drop",
+        1,
         &[
             col_def("id", TypeCode::U64),
             col_def("a", TypeCode::U64),
@@ -562,8 +576,10 @@ fn test_composite_unique_index_registers_unique_circuit() {
     // CREATE UNIQUE INDEX over multiple columns registers one circuit carrying
     // the whole column list and the uniqueness flag. Enforcement over the
     // composite span runs distributed and is covered end-to-end.
-    let (mut engine, tid) = table_fixture(
+    let (mut engine, tid) = table_engine(
+        "catalog",
         "composite_unique_ok",
+        1,
         &[
             col_def("id", TypeCode::U64),
             col_def("a", TypeCode::U64),
@@ -593,8 +609,10 @@ fn test_composite_unique_index_registers_unique_circuit() {
 
 #[test]
 fn undone_drop_index_refills_the_restored_circuit() {
-    let (mut engine, tid) = table_fixture(
+    let (mut engine, tid) = table_engine(
+        "catalog",
         "undone_drop_index_refills",
+        1,
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     engine

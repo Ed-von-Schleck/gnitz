@@ -57,22 +57,15 @@ use crate::test_support::{
     apply_ddl, bundle, circuit_batch, cmp_all, col_def, col_tab_batch, cols_of, distinct_circuit, equi_join_circuit,
     fk_def, fk_def_on_delete, idx_tab_batch, left_join_engine, negate_chain, net_weight, nullable_def, opk_pk,
     pk_payload_schema, push_and_tick, push_sys_row, read_rows, refusal, register_identity_view, scan_all,
-    schema_tab_batch, scratch_dir, sum_weights, sys_batch, table_tab_batch, table_tab_row, try_register_identity_view,
-    try_register_view, two_term_join_circuit, uuid_def, view_blocks, view_tab_row,
+    schema_tab_batch, scratch_dir, sum_weights, sys_batch, table_engine, table_tab_batch, table_tab_row,
+    try_register_identity_view, try_register_view, two_term_join_circuit, uuid_def, view_blocks, view_tab_row, weights,
 };
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
 /// (system families included) must hold none. A `-1` that retracts a row nothing
 /// ever inserted never cancels, so it sits here forever.
-fn count_negative_records(mut c: ReadCursor) -> usize {
-    let mut count = 0;
-    while c.valid {
-        if c.current_weight < 0 {
-            count += 1;
-        }
-        c.advance();
-    }
-    count
+fn count_negative_records(c: ReadCursor) -> usize {
+    weights(c).iter().filter(|&&w| w < 0).count()
 }
 
 /// Every stored weight under `idx_id` in IDX_TAB: empty once a `(+1, -1)` pair
@@ -98,20 +91,13 @@ fn rows_under(engine: &CatalogEngine, family: SysFamily, leading: u64) -> usize 
     count
 }
 
-fn count_records(mut c: ReadCursor) -> usize {
-    let mut count = 0;
-    while c.valid {
-        if c.current_weight > 0 {
-            count += 1;
-        }
-        c.advance();
-    }
-    count
+fn count_records(c: ReadCursor) -> usize {
+    weights(c).iter().filter(|&&w| w > 0).count()
 }
 
 /// Reserve `count` SERIAL ids of `seq`: their base and the `sequences` delta it
 /// applied, or the refusal's text.
-fn reserve(engine: &mut CatalogEngine, seq: u64, count: u64) -> Result<(i64, Batch), String> {
+fn reserve(engine: &mut CatalogEngine, seq: u64, count: u64) -> Result<(u64, Batch), String> {
     let mut laid = Vec::new();
     let base = engine
         .reserve_user_sequence(seq, count, &mut |_, b| {
@@ -177,13 +163,6 @@ fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
     opk_pk(&schema, &[a as u128, b as u128, c as u128])
         .try_into()
         .expect("three U64 PK columns encode to 24 bytes")
-}
-
-/// An empty `public.t` with `cols` (PK = column 0) in a fresh temp dir.
-fn table_fixture(name: &str, cols: &[CatalogColumn]) -> (CatalogEngine, u64) {
-    let mut engine = fresh(name);
-    let tid = engine.create_table("public.t", cols, &[0]).unwrap();
-    (engine, tid)
 }
 
 /// Backfill `view`, as a worker's `Backfill` does.
@@ -331,7 +310,7 @@ fn rows<const N: usize>(
     bb.finish()
 }
 
-/// [`table_fixture`] holding ids `0..n`, every row at weight 1, ingested as one
+/// [`table_engine`] holding ids `0..n`, every row at weight 1, ingested as one
 /// batch.
 fn ingest_fixture<const N: usize>(
     name: &str,
@@ -339,7 +318,7 @@ fn ingest_fixture<const N: usize>(
     n: u64,
     cells: impl Fn(u64) -> [u64; N],
 ) -> (CatalogEngine, u64) {
-    let (mut engine, tid) = table_fixture(name, cols);
+    let (mut engine, tid) = table_engine("catalog", name, 1, cols);
     engine.registry.ingest(tid, rows(&engine, tid, 1, 0..n, cells)).unwrap();
     (engine, tid)
 }

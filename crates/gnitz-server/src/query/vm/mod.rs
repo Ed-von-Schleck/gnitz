@@ -248,12 +248,6 @@ impl Vm {
         &self.layout
     }
 
-    /// Every instruction's op, in program order.
-    #[cfg(test)]
-    pub(in crate::query) fn ops(&self) -> impl Iterator<Item = &Op> {
-        self.instructions.iter().map(|i| &i.op)
-    }
-
     /// True iff a reduce reads the view's own store as its output trace.
     pub(in crate::query) fn reads_view_store(&self) -> bool {
         self.instructions

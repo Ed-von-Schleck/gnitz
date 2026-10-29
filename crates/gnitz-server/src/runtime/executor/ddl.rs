@@ -10,13 +10,11 @@
 
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use super::committer::CHECKPOINTS_BEHIND_DDL;
-use super::peer::Peer;
-use super::{park_until, send_ack, Shared};
+use super::validate::{self, UniqueFilter};
+use super::{park_until, Shared};
 use crate::catalog::{AppliedDdl, DdlBundle, SysFamily};
-use crate::runtime::master::UniqueFilter;
 use crate::runtime::sal::Read;
 use crate::runtime::sync::WriteGuard;
 use gnitz_foundation::fault::Seam;
@@ -117,21 +115,18 @@ pub(super) fn decode_bundle(body: &[u8]) -> Result<DdlBundle, WireFault> {
 /// with no await between: a bundle the catalog or the log refuses is negated in
 /// master memory there, so no system flush sees a row no zone carries.
 ///
-/// The ACK is a header-only frame carrying the zone LSN in `arg0`, sent once the
-/// DDL guards have dropped — so a client stalled on its
-/// `GNITZ_CLIENT_SEND_TIMEOUT_MS` deadline cannot block every other reader for the
-/// length of the window. Sound outside the tick gate too: the gate exists to keep
-/// a worker from being mid-epoch at *broadcast* time, and the ACK goes out only
-/// after the broadcast, its wake and the fsync.
+/// Returns the zone LSN, which the router ACKs once the DDL guards have dropped —
+/// so a client stalled on its `GNITZ_CLIENT_SEND_TIMEOUT_MS` deadline cannot
+/// block every other reader for the length of the window. Sound outside the
+/// tick gate too: the gate exists to keep a worker from being mid-epoch at
+/// *broadcast* time, and the ACK goes out only after the broadcast, its wake
+/// and the fsync.
 ///
 /// No schema block: a `DDL_TXN` names no relation (its reply target is `0`), so
 /// one could only describe a relation that does not exist.
-pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]) -> Result<(), WireFault> {
-    let t_ddl_start = Instant::now();
+pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, body: &[u8]) -> Result<u64, WireFault> {
     // Decoded up front, before any lock.
     let families = decode_bundle(body)?;
-    let family_count = families.family_count();
-
     let unique_creates = families.unique_index_creates();
 
     let locks = enter_ddl(shared).await;
@@ -155,14 +150,14 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     // Keying by the whole column list means dropping `(a, b)` never clears a
     // distinct single-column filter on `a`.
     for &(owner_id, cols) in &applied.dropped_indexes {
-        shared.dispatcher.unique_filter_remove(owner_id, cols);
+        shared.writes.checks.unique_filter_remove(owner_id, cols);
     }
 
     // Post-fsync: a refused zone has returned and an fsync failure has aborted
     // the process before this point, so no filter is published for an index
     // that never committed.
     for (owner_id, cols, filter) in filter_seeds {
-        shared.dispatcher.unique_filter_seed(owner_id, cols, filter);
+        shared.writes.checks.unique_filter_seed(owner_id, cols, filter);
     }
 
     // Populate every new view. A post-fsync Err cannot be rolled back (the CREATE
@@ -188,12 +183,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
         hold_ddl_for_checkpoint(shared).await;
     }
     drop(locks);
-    send_ack(peer, 0, zone_lsn);
-    let total = t_ddl_start.elapsed();
-    if total > Duration::from_millis(20) {
-        gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
-    }
-    Ok(())
+    Ok(zone_lsn)
 }
 
 /// A bundle made durable: what it applied, its zone, and the unique-filter seed of
@@ -217,7 +207,7 @@ async fn commit_bundle(
     let mut filter_seeds = Vec::new();
     for &(owner_id, cols) in unique_creates {
         // `None`: the index covers the owner's PK, so nothing will consult a filter.
-        if let Some(filter) = shared.dispatcher.validate_unique_index_create(owner_id, cols).await? {
+        if let Some(filter) = validate::validate_unique_index_create(&shared.dispatcher, owner_id, cols).await? {
             filter_seeds.push((owner_id, cols, filter));
         }
     }
@@ -225,7 +215,7 @@ async fn commit_bundle(
     // Before the views exist: a tick owed now carries rows pushed ahead of them,
     // and a stream's must not reach them.
     if families.get(SysFamily::Circuit).is_some() {
-        if let Some(lease) = shared.dispatcher.emit_pending_tick().await? {
+        if let Some(lease) = shared.emit_pending_tick().await? {
             lease.acks().await;
         }
     }
@@ -260,7 +250,7 @@ async fn release_preflight(shared: &Shared) {
 /// through a later zone's fdatasync of the same log or through a checkpoint, and
 /// either makes this zone durable first. An advance a crash loses was used by no
 /// durable row, and a client drops its reserved ids with its connection.
-pub(super) async fn reserve_serial_range(shared: &Rc<Shared>, seq: Target, count: u64) -> Result<i64, WireFault> {
+pub(super) async fn reserve_serial_range(shared: &Rc<Shared>, seq: Target, count: u64) -> Result<u64, WireFault> {
     // A read guard holds the token and the sequence's table against a DDL; the
     // SAL lock orders reservations among themselves, and everything under it is
     // synchronous. Lock order catalog -> SAL, matching INSERT and every read.

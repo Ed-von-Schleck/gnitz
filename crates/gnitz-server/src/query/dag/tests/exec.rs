@@ -4,18 +4,11 @@ use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
     col_def, cols_of, make_batch, make_schema_u64_i64, push_and_tick, register_identity_view, scan_all, scan_keyed,
-    scratch_dir, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, EchoDrive, RowKey,
+    scratch_dir, table_engine, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, EchoDrive, RowKey,
 };
 use gnitz_wire::{AggDescriptor, Circuit, GroupAggs, ReadBound, TypeCode};
 use gnitz_zset::stream::ReducePlan;
 use std::collections::HashMap;
-
-/// A base table `(id U64 PK, v I64)` in a fresh catalog of `workers`.
-pub(super) fn engine_with_base(name: &str, workers: u32) -> (CatalogEngine, u64) {
-    let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", name), workers).unwrap();
-    let base = engine.create_table("public.base", &u64_i64_cols(), &[0]).unwrap();
-    (engine, base)
-}
 
 /// The views of [`engine_with_views`], each holding a multiple of the base's
 /// delta so that reading the wrong input shows in its weights.
@@ -38,10 +31,10 @@ impl Views {
     }
 }
 
-/// [`engine_with_base`] at one worker plus [`Views`].
+/// A base table `(id U64 PK, v I64)` in a fresh catalog plus [`Views`].
 pub(super) fn engine_with_views(name: &str) -> (CatalogEngine, u64, Views) {
-    let (mut engine, base) = engine_with_base(name, 1);
     let cols = u64_i64_cols();
+    let (mut engine, base) = table_engine("dag_exec", name, 1, &cols);
     let mut circuit = Circuit::default();
     let sides = [0, 1].map(|_| {
         let scan = circuit.input_delta(base, ReadBound::None);
@@ -60,7 +53,7 @@ pub(super) fn engine_with_views(name: &str) -> (CatalogEngine, u64, Views) {
     (engine, base, Views { twice, once, deep, union, over_union })
 }
 
-/// `(pk, weight, payload)` rows of a [`engine_with_base`] base.
+/// `(pk, weight, payload)` rows of a base table `(id U64 PK, v I64)`.
 pub(super) fn base_rows(rows: &[(u64, i64, i64)]) -> Batch {
     make_batch(&make_schema_u64_i64(), rows)
 }
@@ -123,7 +116,7 @@ fn a_tick_drives_the_whole_closure() {
 /// rounds wait on it.
 #[test]
 fn an_empty_tick_runs_every_round() {
-    let (mut engine, base) = engine_with_base("empty_rounds", 4);
+    let (mut engine, base) = table_engine("dag_exec", "empty_rounds", 4, &u64_i64_cols());
     let once = register_identity_view(&mut engine, base, "once", &u64_i64_cols());
     for (source, name) in [(base, "count"), (once, "count_once")] {
         register_count(&mut engine, source, name);
@@ -138,7 +131,7 @@ fn an_empty_tick_runs_every_round() {
 /// moves the count to what a backfill over it holds.
 #[test]
 fn an_empty_tick_lands_only_an_owed_ground_row() {
-    let (mut engine, base) = engine_with_base("empty_tick", 1);
+    let (mut engine, base) = table_engine("dag_exec", "empty_tick", 1, &u64_i64_cols());
     let once = register_identity_view(&mut engine, base, "once", &u64_i64_cols());
     let (count, plan) = register_count(&mut engine, base, "count");
     let ground = plan.ground_row().unwrap();

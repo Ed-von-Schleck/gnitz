@@ -3,12 +3,11 @@ use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::test_log;
-use crate::runtime::sal::{GroupData, SalGroup, SalWriter};
-use crate::runtime::w2m::GroupTargets;
+use crate::runtime::sal::{GroupData, GroupTargets, SalGroup, SalWriter};
 use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{
     make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema,
-    register_identity_view, scan_all, u64_i64_cols, weighted_rows,
+    register_identity_view, scan_all, table_engine, u64_i64_cols, weighted_rows,
 };
 use gnitz_store::read::Probe;
 use gnitz_wire::{peek_control_block, DecodedControl, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode, WireStatus};
@@ -48,14 +47,6 @@ pub(super) fn worker_over(
 /// The route of request `request_id`, written in cut `cut`.
 fn route(target_id: u64, request_id: u32, cut: u64) -> ReplyRoute {
     ReplyRoute { target_id, request_id, cut }
-}
-
-/// A fresh catalog holding `public.t` over [`table_cols`]; its id.
-pub(super) fn engine_with_table(name: &str) -> (CatalogEngine, u64) {
-    let dir = crate::test_support::scratch_dir("worker", name);
-    let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
-    let tid = engine.create_table("public.t", &u64_i64_cols(), &[0]).unwrap();
-    (engine, tid)
 }
 
 /// `request` answered on `request_id`.
@@ -191,7 +182,7 @@ fn weight(i: u64) -> i64 {
 /// a worker blocked on it would stall the round every peer waits on.
 #[test]
 fn in_wait_dispositions() {
-    let (mut engine, tid) = engine_with_table("in_wait_dispositions");
+    let (mut engine, tid) = table_engine("worker", "in_wait_dispositions", 1, &u64_i64_cols());
     let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let cols = PkColList::from_slice(&[1]);
     let claim = IndexClaim::Index { id: vid + 1, unique: false };
@@ -213,7 +204,7 @@ fn in_wait_dispositions() {
             set: WorkerSet::EMPTY,
             ..GroupTargets::SILENT
         },
-        ..SalGroup::new(Apply::DdlSync { family: SysFamily::Sequence.id() })
+        ..SalGroup::new(Apply::DdlSync { family: SysFamily::Sequence })
     };
     // A control-only push carries no rows, so it ACKs without reaching the
     // store. `Flush` goes last: the reader leaves the epoch on stepping past it.
@@ -301,7 +292,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
 /// SAL: the push behind it is applied, and is not in the reply.
 #[test]
 fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
-    let (mut engine, tid) = engine_with_table("push_behind_read");
+    let (mut engine, tid) = table_engine("worker", "push_behind_read", 1, &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let record = engine.wire_target(tid).unwrap().1.clone();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
@@ -323,7 +314,7 @@ fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
 /// reply reaches the ring first.
 #[test]
 fn a_parked_view_read_answers_ahead_of_the_cut_member_behind_it() {
-    let (mut engine, tid) = engine_with_table("parked_view_read");
+    let (mut engine, tid) = table_engine("worker", "parked_view_read", 1, &u64_i64_cols());
     let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let held = make_batch_raw(&schema, &[(1, 1, 10)]);
@@ -352,7 +343,7 @@ fn a_parked_view_read_answers_ahead_of_the_cut_member_behind_it() {
 /// past what another cut owes.
 #[test]
 fn a_burst_passes_what_another_cut_owes() {
-    let (mut engine, tid) = engine_with_table("burst");
+    let (mut engine, tid) = table_engine("worker", "burst", 1, &u64_i64_cols());
     let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let (mut wp, sal, rx) = test_worker(&mut engine);
@@ -386,7 +377,7 @@ fn a_burst_passes_what_another_cut_owes() {
 /// drive goes on after one and leaves the next on the SAL.
 #[test]
 fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
-    let (mut engine, tid) = engine_with_table("round_first");
+    let (mut engine, tid) = table_engine("worker", "round_first", 1, &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let (mut wp, sal, rx) = test_worker(&mut engine);
     for request_id in [1, 2] {
@@ -408,7 +399,7 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
 /// worker's: a peer whose source is not drained overturns it.
 #[test]
 fn exchange_answers_the_rounds_verdict() {
-    let (mut engine, _) = engine_with_table("exchange_verdict");
+    let (mut engine, _) = table_engine("worker", "exchange_verdict", 1, &u64_i64_cols());
     let (mut wp, _sal, _rx) = test_worker(&mut engine);
     let part = make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 10)]);
     let plan = ScatterPlan::broadcast();
@@ -675,7 +666,7 @@ fn a_train_advances_with_every_request() {
     const GROUPS: usize = 5;
     let fixed = make_schema_u64_i64();
     let rows = make_batch_raw(&fixed, &(0..40).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
-    let (mut engine, tid) = engine_with_table("train_advances");
+    let (mut engine, tid) = table_engine("worker", "train_advances", 1, &u64_i64_cols());
     let (mut wp, sal, rx) = test_worker(&mut engine);
     wp.reply_frame_budget = frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 4]));
     wp.reply(route(1, 11, 1), Ok(Rows::Own(rows)));
@@ -696,7 +687,7 @@ fn a_train_advances_with_every_request() {
 /// claim holds.
 #[test]
 fn a_claiming_span_read_holds_its_index_until_its_release() {
-    let (mut engine, tid) = engine_with_table("preflight_claim");
+    let (mut engine, tid) = table_engine("worker", "preflight_claim", 1, &u64_i64_cols());
     let held: Vec<_> = (0..5).map(|i| (i, 1, -(i as i64))).collect();
     engine
         .registry
@@ -749,7 +740,7 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
         (24, 400, 1024, 2..=24),
     ];
     for (n, budget, chunk_rows, carrying) in cases {
-        let (mut engine, tid) = engine_with_table(&format!("span_train_{n}"));
+        let (mut engine, tid) = table_engine("worker", &format!("span_train_{n}"), 1, &u64_i64_cols());
         let claim = IndexClaim::Index { id: tid + 1, unique: false };
         engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
         // Values descend as ids ascend, so span order is not row order.

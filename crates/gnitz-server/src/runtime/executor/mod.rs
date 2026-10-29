@@ -1,18 +1,22 @@
 //! Server executor: the serving loop (accept, the signal loop, the race against
 //! a worker's death), the `Shared` state, the request router, the scan and
-//! resolve handlers, and the reply-frame vocabulary. Tick scheduling and read
-//! freshness are the child `tick`; PUSH and PUSH_TXN, with the table locks and
-//! the OCC check, the child `write`. The catalog-zone write path is the child
-//! `ddl`; the delta feed's readers are the child `delta`; a connection's
-//! snapshots are the child `snapshot`, and BACKUP the child `backup`. The
-//! durable-commit batcher is the child `committer`; a client connection's
-//! handle and cork is the child `peer`.
+//! resolve handlers, and the reply-frame vocabulary. Tick scheduling, the
+//! pending-tick ledger and read freshness are the child `tick`; PUSH and
+//! PUSH_TXN, with the table locks and the OCC check, the child `write`, which
+//! checks each write through the child `validate`: the PK / FK / unique-index
+//! rules and the caches that let them probe less. The catalog-zone write path
+//! is the child `ddl`; the delta feed's readers are the child `delta`; a
+//! connection's snapshots are the child `snapshot`, and BACKUP the child
+//! `backup`. The durable-commit batcher is the child `committer`; a client
+//! connection's handle and cork is the child `peer`.
 //!
 //! The master owns one `Reactor`: [`run`] spawns its tasks on it
 //! and races the signal loop against a worker's death.
 //!
-//! A request handler rejects by returning `Err`, and the router sends it: no
-//! handler writes a fault frame for its request as a whole.
+//! A verb whose reply is one frame returns it, its ACK value or an `Err`, and
+//! the router sends it. A verb that streams its reply (a scan, a delta poll, a
+//! resolve, a snapshot page, a sync) writes every frame of it itself; only a
+//! fault of the request as a whole comes back as `Err`.
 //!
 //! One connection's replies leave in request order, written by its own task.
 //! The one thing another task sends a client is a pushed train, and it only
@@ -25,6 +29,7 @@ mod delta;
 mod peer;
 mod snapshot;
 mod tick;
+mod validate;
 mod write;
 
 use std::cell::Cell;
@@ -111,11 +116,12 @@ impl Shared {
     /// catalog *read* guard, so holding the write guard is what proves no task
     /// holds or awaits the lock being removed.
     ///
-    /// Every per-relation master state a drop must reclaim is cleared here: ids
-    /// are never reused, so nothing else would ever reclaim it.
+    /// Every per-relation state a drop must reclaim is cleared here: ids are
+    /// never reused, so nothing else would ever reclaim it.
     fn forget_relation(&self, _catalog_write: &WriteGuard, id: u64) {
         self.feeds.wake(id);
         self.writes.forget(id);
+        self.ticks.forget(id);
         self.dispatcher.forget_relation(id);
     }
 }
@@ -129,10 +135,9 @@ impl Shared {
 pub fn run(dispatcher: MasterDispatcher, backup_dir: Option<String>, listeners: Vec<ClientListener>) -> Option<usize> {
     let reactor = dispatcher.reactor().clone();
     let boot_seed = dispatcher.sal().watermark();
-    dispatcher.seed_tick_lsn(boot_seed);
 
     let (committer, committer_rx) = Committer::new();
-    let (ticks, tick_rx) = Ticks::new();
+    let (ticks, tick_rx) = Ticks::new(boot_seed);
     let (feeds, asks) = Feeds::new();
     let shared = Rc::new(Shared {
         dispatcher,
@@ -341,14 +346,17 @@ async fn handle_message(
         }
     };
     let target_id = ctrl.hdr.target_id;
-    if let Err(f) = dispatch_request(peer, subs, snapshots, buf, ctrl, shared).await {
-        send_fault(peer, target_id, &f);
+    match dispatch_request(peer, subs, snapshots, buf, ctrl, shared).await {
+        Ok(Some(value)) => send_ack(peer, target_id, value),
+        Ok(None) => {}
+        Err(f) => send_fault(peer, target_id, &f),
     }
 }
 
-/// Run the verb `ctrl` names. [`handle_message`] answers an `Err` with one fault
-/// frame, which fails the whole request at the client; a fault confined to one
-/// position of a streamed reply is the handler's own to send.
+/// Run the verb `ctrl` names. [`handle_message`] answers `Some(value)` with the
+/// request's one ACK and an `Err` with one fault frame, which fails the whole
+/// request at the client. A streamed reply is the handler's own to write, a
+/// fault confined to one position of it included, and answers `None`.
 async fn dispatch_request(
     peer: &Peer,
     subs: &mut Subscriptions,
@@ -356,75 +364,68 @@ async fn dispatch_request(
     buf: RecvBuf,
     ctrl: gnitz_wire::DecodedControl,
     shared: &Rc<Shared>,
-) -> Result<(), WireFault> {
+) -> Result<Option<u64>, WireFault> {
     let data = buf.as_slice();
-    let target_id = ctrl.hdr.target_id;
     match ctrl.client_verb()? {
         // The multi-item frames name no single relation in `target_id`; each
         // decodes its items from the frame's body.
-        ClientVerb::DdlTxn => handle_ddl_txn(shared, peer, &data[ctrl.body]).await,
-        ClientVerb::PushTxn => handle_push_txn(shared, peer, &ctrl, buf).await,
+        ClientVerb::DdlTxn => handle_ddl_txn(shared, &data[ctrl.body]).await.map(Some),
+        ClientVerb::PushTxn => handle_push_txn(shared, buf, ctrl).await.map(Some),
         ClientVerb::ScanMulti => {
             let scans =
                 gnitz_wire::txn_frame::decode_scan_multi(&data[ctrl.body]).map_err(|e| format!("decode error: {e}"))?;
-            handle_scan(shared, peer, &scans).await
+            handle_scan(shared, peer, &scans).await.map(|()| None)
         }
-        ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, subs, &ctrl.hdr, &data[ctrl.body]).await,
+        ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, subs, &ctrl.hdr, &data[ctrl.body])
+            .await
+            .map(|()| None),
 
         // `target_id` is the sequence key (= the owning table's id).
-        ClientVerb::AllocSerialRange => {
-            let base = reserve_serial_range(shared, ctrl.hdr.target(), ctrl.hdr.arg0).await?;
-            send_ack(peer, target_id, base as u64);
-            Ok(())
-        }
+        ClientVerb::AllocSerialRange => reserve_serial_range(shared, ctrl.hdr.target(), ctrl.hdr.arg0)
+            .await
+            .map(Some),
 
         // An id allocation names no relation, so `target_id` is only echoed —
         // and a frame that sets one is still allocated, rather than falling
         // through to a scan of that id.
-        ClientVerb::AllocIds => {
-            let base = shared.cat_mut().allocate_ids(ctrl.hdr.arg0);
-            send_ack(peer, target_id, base.map_err(|e| format!("id allocation failed: {e}"))?);
-            Ok(())
-        }
+        ClientVerb::AllocIds => shared
+            .cat_mut()
+            .allocate_ids(ctrl.hdr.arg0)
+            .map(Some)
+            .map_err(|e| format!("id allocation failed: {e}").into()),
 
-        ClientVerb::ScanSpec => handle_scan(shared, peer, &[ScanItem::of(data, &ctrl)]).await,
+        ClientVerb::ScanSpec => handle_scan(shared, peer, &[ScanItem::of(data, &ctrl)])
+            .await
+            .map(|()| None),
 
         // A plain read guard, not `fresh_read_lock`: a resolve answers catalog shape,
         // and a view tick moves a view's rows, never its shape — so the tick
         // drain that one waits for buys nothing here.
         ClientVerb::Resolve => {
             let _g = shared.catalog_rwlock.read().await;
-            build_resolve_reply(shared, peer, &data[ctrl.blob.clone()])
+            build_resolve_reply(shared, peer, &data[ctrl.blob.clone()]).map(|()| None)
         }
 
-        ClientVerb::Push => handle_push(shared, peer, buf, ctrl).await,
+        ClientVerb::Push => handle_push(shared, buf, ctrl).await.map(Some),
 
         ClientVerb::SyncPushed => {
             // Refused or not, it is answered as a sync is: out of the order of replies.
             let held = gnitz_wire::txn_frame::decode_held(&data[ctrl.blob.clone()])
                 .map_err(|e| WireFault::from(format!("decode error: {e}")));
             subs.ask_sync(shared, held, ctrl.hdr.arg0);
-            Ok(())
+            Ok(None)
         }
 
         // A snapshot and a backup name no relation of the live catalog in
         // `target_id`: a page names one of the snapshot's.
-        ClientVerb::SnapshotOpen => {
-            let id = snapshot::open(shared, snapshots).await?;
-            send_ack(peer, target_id, id);
-            Ok(())
-        }
-        ClientVerb::SnapshotPage => snapshot::page(shared, peer, snapshots, &ctrl.hdr, &data[ctrl.blob.clone()]).await,
-        ClientVerb::SnapshotClose => {
-            snapshot::close(shared, snapshots, ctrl.hdr.arg0).await?;
-            send_ack(peer, target_id, 0);
-            Ok(())
-        }
-        ClientVerb::Backup => {
-            backup::backup(shared, &data[ctrl.blob.clone()]).await?;
-            send_ack(peer, target_id, 0);
-            Ok(())
-        }
+        ClientVerb::SnapshotOpen => snapshot::open(shared, snapshots).await.map(Some),
+        ClientVerb::SnapshotPage => snapshot::page(shared, peer, snapshots, &ctrl.hdr, &data[ctrl.blob.clone()])
+            .await
+            .map(|()| None),
+        ClientVerb::SnapshotClose => snapshot::close(shared, snapshots, ctrl.hdr.arg0)
+            .await
+            .map(|()| Some(0)),
+        ClientVerb::Backup => backup::backup(shared, &data[ctrl.blob.clone()]).await.map(|()| Some(0)),
     }
 }
 
