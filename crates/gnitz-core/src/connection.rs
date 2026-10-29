@@ -104,7 +104,7 @@ pub use gnitz_wire::txn_frame::DeltaCursor;
 
 /// What a driver should wait for before its next `step`, and what it hands
 /// back: two booleans on the connection.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Interest {
     pub read: bool,
     pub write: bool,
@@ -359,6 +359,16 @@ impl<T> Sent<T> {
             }
             _ => *state = Awaited::Routed(Box::new(route)),
         }
+    }
+
+    /// The reply `f` makes of this one, arriving with it.
+    pub fn map<U: Send + 'static>(self, f: impl FnOnce(T) -> U + Send + 'static) -> Sent<U>
+    where
+        T: 'static,
+    {
+        let (mut to, mapped) = promise();
+        self.then(move |reply| to.fulfil(reply.map(f)));
+        mapped
     }
 }
 

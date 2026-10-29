@@ -35,8 +35,9 @@ def shutdown(target):
     """An exception escapes `asyncio.run` with work in flight."""
     async def main():
         conn = await aio.connect(target)
-        conn.scan(*SCHEMAS)
-        conn.scan(*SCHEMAS)
+        schemas = await conn.resolve_table(SCHEMAS)
+        conn.scan(*schemas)
+        conn.scan(*schemas)
         raise RuntimeError("boom")
 
     asyncio.run(main())

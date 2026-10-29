@@ -49,7 +49,6 @@ tmp_path_retention_count  = 1
 tmp_path_retention_policy = "failed"
 
 [tool.maturin]
-features       = ["pyo3/extension-module"]
 module-name    = "gnitz._native"
 python-source  = "python"
 exclude        = ["**/__pycache__/**"]

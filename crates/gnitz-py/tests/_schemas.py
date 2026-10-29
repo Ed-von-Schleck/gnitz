@@ -13,5 +13,5 @@ def kv(*rows):
     return gnitz.ZSetBatch(KV).extend(dict(zip(("pk", "val", "_weight"), r)) for r in rows)
 
 
-# `_system.schemas`, as `scan`'s arguments: a relation every connection can read.
-SCHEMAS = (gnitz.SCHEMA_TAB, gnitz.sys_schema(gnitz.SCHEMA_TAB))
+# A relation every connection can read.
+SCHEMAS = "_system.schemas"

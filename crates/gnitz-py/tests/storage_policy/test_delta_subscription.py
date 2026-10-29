@@ -89,14 +89,14 @@ def test_a_cursor_of_another_subscription_is_refused(client):
     b = Subscriber(client, "f", "SELECT id, v FROM f WHERE v > 200")
     a.bootstrap()
     b.bootstrap()
-    _, whole = client.delta_bootstrap(a.vid, a.view_schema)
+    _, whole = client.delta_read(a.vid, a.view_schema)
     assert len({a.cursor[0], b.cursor[0], whole[0]}) == 3
     churn(client, 201, 300)
     b.cursor = a.cursor
     with pytest.raises(gnitz.GnitzDeltaExpiredError):
         b.poll()
     with pytest.raises(gnitz.GnitzDeltaExpiredError):
-        client.delta_poll(a.vid, a.view_schema, a.cursor)
+        client.delta_read(a.vid, a.view_schema, a.cursor)
 
 
 def test_a_synced_cursor_passes_the_rounds_it_kept_nothing_of(client, peer):

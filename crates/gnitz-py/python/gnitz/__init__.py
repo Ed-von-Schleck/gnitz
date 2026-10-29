@@ -5,9 +5,8 @@ from gnitz._native import (
     GnitzIntegrityError, Row, ScanResult,
     ColumnDef, Schema, ZSetBatch, GnitzClient, AsyncGnitzClient,
     PollResult, Pushed, Synced, Pending,
-    SCHEMA_TAB, TABLE_TAB, COL_TAB, IDX_TAB,
     FIRST_USER_TABLE_ID, MAX_COLUMNS, MAX_IN_FLIGHT,
-    debug_assertions, sys_schema,
+    debug_assertions,
 )
 from gnitz.server import LocalServer, find_server, local_server
 from gnitz._types import (
@@ -26,9 +25,8 @@ __all__ = [
     "GnitzIntegrityError", "Row", "ScanResult",
     "ColumnDef", "Schema", "ZSetBatch", "GnitzClient", "AsyncGnitzClient",
     "PollResult", "Pushed", "Synced", "Pending",
-    "SCHEMA_TAB", "TABLE_TAB", "COL_TAB", "IDX_TAB",
     "FIRST_USER_TABLE_ID", "MAX_COLUMNS", "MAX_IN_FLIGHT",
-    "debug_assertions", "sys_schema",
+    "debug_assertions",
     "TypeCode", "SqlResult",
     "DdlResult", "RowsAffectedResult", "RowsResult",
     "TransactionStartedResult", "TransactionCommittedResult",

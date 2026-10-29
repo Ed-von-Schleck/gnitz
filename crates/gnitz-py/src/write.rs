@@ -3,7 +3,7 @@
 //!
 //! The per-cell encode table is private: what leaves this module is the key- and
 //! column-level entry points the client's own verbs call. `ZSetBatch.rows()`
-//! reads back through `read::scan_result`.
+//! reads back through `read::present`.
 
 use std::borrow::Cow;
 use std::ffi::CStr;
@@ -17,7 +17,7 @@ use pyo3::Borrowed;
 
 use gnitz_core::{PkColumn, Schema, ZSetBatch};
 use gnitz_sql::{place_scaled, Placed};
-use gnitz_wire::{parse_decimal_text, ColType, ColumnDef, FixedInt, ReadBound, ReadSpec, TypeCode, MAX_PK_COLUMNS};
+use gnitz_wire::{parse_decimal_text, ColType, ColumnDef, FixedInt, TypeCode, MAX_PK_COLUMNS};
 
 use crate::read::{present, PyScanResult};
 use crate::schema::PySchema;
@@ -27,7 +27,6 @@ use crate::schema::PySchema;
 pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyResult<PkColumn> {
     let mut pk_col = PkColumn::empty_for_schema(schema);
     pk_col.reserve(pks.len());
-    let mut scratch = Vec::with_capacity(16);
     for pk in pks {
         let tuple;
         let vals = if schema.pk_cols().len() == 1 {
@@ -51,68 +50,55 @@ pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyR
             if v.is_none() {
                 return Err(not_nullable_err(&col.name));
             }
-            *native = py_native(&mut scratch, col.ty, v, Inexact::Refuse)?;
+            *native = py_native(col.ty, v, Inexact::Refuse)?;
         }
         pk_col.push_natives(&natives[..vals.len()]);
     }
     Ok(pk_col)
 }
 
-/// A read of the rows keyed `pk` — a single-column key's value, or a compound
-/// key's tuple.
-pub(crate) fn pk_point_spec(schema: &Schema, pk: &Bound<'_, PyAny>) -> PyResult<ReadSpec> {
-    let keys = py_pks_to_column(schema, std::slice::from_ref(pk))?.keys();
-    Ok(ReadSpec::all_rows(ReadBound::PkSet(keys)))
-}
-
 /// Stores batch data in Rust Vecs with a cached Schema. `append` / `extend`
 /// handle all type extraction, null tracking, and PK handling in Rust, so
 /// `push()` reuses the cached schema and batch without any Python→Rust
 /// re-extraction.
-#[pyclass(name = "ZSetBatch")]
+#[pyclass(name = "ZSetBatch", module = "gnitz")]
 pub struct PyZSetBatch {
-    pub(crate) schema: Arc<Schema>,
     /// Shared with a push still on its way, which sends the rows as they were
     /// at its call: a later append copies them first.
     pub(crate) batch: Arc<ZSetBatch>,
+    writer: RowWriter,
+}
+
+/// What a row is written through.
+struct RowWriter {
+    schema: Arc<Schema>,
     /// Is [`WEIGHT_KW`] the name of a visible column? Then it means that column,
     /// not the row weight: the schema is the authority on what a name means, and
     /// `extend`'s own `_weight` parameter still sets the weight for such a batch.
     weight_is_column: bool,
     /// The plan the last row was written through — see [`KwPlan`].
-    kw_plan: Option<KwPlan>,
-    /// [`py_native`]'s buffer, reused by every row written.
-    key_scratch: Vec<u8>,
-}
-
-/// A [`PyZSetBatch`] open for one surface's rows: its batch, unshared, and
-/// what a row is written through.
-struct Rows<'b> {
-    batch: &'b mut ZSetBatch,
-    schema: &'b Schema,
-    weight_is_column: bool,
-    kw_plan: &'b mut Option<KwPlan>,
-    key_scratch: &'b mut Vec<u8>,
+    plan: Option<KwPlan>,
 }
 
 impl PyZSetBatch {
-    /// Run `body` against this batch's rows; on error, truncate every per-row
-    /// vector back to the pre-call row count, so a half-written row never
-    /// leaves the batch with mismatched column lengths. Wrap once per surface —
-    /// `append` its one row, `extend` its whole loop — and never nested.
+    /// Run `body` against this batch's rows, unshared; on error, truncate every
+    /// per-row vector back to the pre-call row count, so a half-written row
+    /// never leaves the batch with mismatched column lengths. Wrap once per
+    /// surface — `append` its one row, `extend` its whole loop — and never
+    /// nested.
     fn with_rollback<F>(&mut self, body: F) -> PyResult<()>
     where
-        F: FnOnce(&mut Rows<'_>) -> PyResult<()>,
+        F: FnOnce(&mut ZSetBatch, &mut RowWriter) -> PyResult<()>,
     {
-        let mut rows = Rows {
-            batch: Arc::make_mut(&mut self.batch),
-            schema: &self.schema,
-            weight_is_column: self.weight_is_column,
-            kw_plan: &mut self.kw_plan,
-            key_scratch: &mut self.key_scratch,
-        };
-        let mark = rows.batch.mark();
-        body(&mut rows).inspect_err(|_| rows.batch.rollback_to(mark))
+        let PyZSetBatch { batch, writer } = self;
+        let batch = Arc::make_mut(batch);
+        let mark = batch.mark();
+        body(batch, writer).inspect_err(|_| batch.rollback_to(mark))
+    }
+
+    /// The schema the rows are written in.
+    pub(crate) fn schema(&self) -> &Arc<Schema> {
+        &self.writer.schema
     }
 }
 
@@ -290,11 +276,12 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
     })
 }
 
-impl Rows<'_> {
-    /// Write one row: resolve this call's shape against the cached plan, then
-    /// read each column's value through `arg`, which maps a name's position in
-    /// `names` to its value. `tuple` is those names as a Python tuple where the
-    /// caller holds one, which the plan is matched against by pointer first.
+impl RowWriter {
+    /// Write one row into `batch`: resolve this call's shape against the cached
+    /// plan, then read each column's value through `arg`, which maps a name's
+    /// position in `names` to its value. `tuple` is those names as a Python
+    /// tuple where the caller holds one, which the plan is matched against by
+    /// pointer first.
     ///
     /// The key is appended once every PK column has extracted, then each payload
     /// cell into its column, and the weight and null word close the row. Rolls
@@ -304,19 +291,14 @@ impl Rows<'_> {
     fn write_row<'a, 'py>(
         &mut self,
         py: Python<'py>,
+        batch: &mut ZSetBatch,
         names: &[Bound<'py, PyAny>],
         tuple: Option<&Bound<'py, PyTuple>>,
         arg: impl Fn(usize) -> Borrowed<'a, 'py, PyAny>,
         default_weight: i64,
     ) -> PyResult<()> {
-        let Rows {
-            batch,
-            schema,
-            weight_is_column,
-            kw_plan,
-            key_scratch,
-        } = self;
-        let plan = match kw_plan {
+        let RowWriter { schema, weight_is_column, plan } = self;
+        let plan = match plan {
             Some(p) if plan_hits(py, p, names, tuple) => p,
             slot => {
                 let t = match tuple {
@@ -338,7 +320,7 @@ impl Rows<'_> {
             if v.is_none() {
                 return Err(not_nullable_err(&schema.columns()[ci].name));
             }
-            *native = py_native(key_scratch, ty, &v, Inexact::Round)?;
+            *native = py_native(ty, &v, Inexact::Round)?;
         }
         batch.pks.push_natives(&natives[..plan.pks.len()]);
         let mut nulls = 0u64;
@@ -355,7 +337,7 @@ impl Rows<'_> {
             };
             match v {
                 Some(v) if !v.is_none() => {
-                    let ZSetBatch { payload: cols, blob, .. } = &mut *batch;
+                    let ZSetBatch { payload: cols, blob, .. } = batch;
                     push_column_value(&mut cols[payload_idx].bytes, blob, ty, &v)?
                 }
                 _ => {
@@ -390,7 +372,7 @@ impl Rows<'_> {
         let mut supplied = None;
         // A key the cached plan names at this position needs no text compare.
         let planned = self
-            .kw_plan
+            .plan
             .as_ref()
             .map_or(&[][..], |p| p.kwnames.bind(dict.py()).as_slice());
         for (key, val) in dict.iter() {
@@ -458,7 +440,7 @@ unsafe fn append_fastcall(
     // SAFETY: the fastcall convention above — `args` holds one value per name in
     // `kwnames`, live for the duration of this call.
     let arg = |pos: usize| unsafe { Borrowed::from_ptr(py, *args.add(pos)) };
-    b.with_rollback(|s| s.write_row(py, kwnames.as_slice(), Some(kwnames), arg, 1))?;
+    b.with_rollback(|batch, w| w.write_row(py, batch, kwnames.as_slice(), Some(kwnames), arg, 1))?;
     drop(b);
     // Chainable: `b.append(…).append(…)`.
     Ok(batch.clone().into_ptr())
@@ -506,13 +488,9 @@ impl PyZSetBatch {
     pub fn new(schema: PySchema) -> Self {
         let schema = schema.rust;
         let weight_is_column = schema.visible_columns().any(|(_, c)| c.name == WEIGHT_KW);
-        let batch = Arc::new(ZSetBatch::new(&schema));
         PyZSetBatch {
-            batch,
-            weight_is_column,
-            kw_plan: None,
-            key_scratch: Vec::with_capacity(16),
-            schema,
+            batch: Arc::new(ZSetBatch::new(&schema)),
+            writer: RowWriter { schema, weight_is_column, plan: None },
         }
     }
 
@@ -533,17 +511,17 @@ impl PyZSetBatch {
         // `try_borrow_mut`, as `append` does: a row value that re-enters this
         // batch raises instead of aborting the interpreter. Wrapping the whole
         // loop in one rollback gives `extend` the same all-or-nothing contract.
-        slf.try_borrow_mut()?.with_rollback(|s| {
+        slf.try_borrow_mut()?.with_rollback(|batch, w| {
             // A sized sequence lets every growth stream skip its climb from
             // zero; a generator has no `__len__`, so the probe is discarded.
             if let Ok(n) = rows.len() {
-                s.batch.reserve(n);
+                batch.reserve(n);
             }
             for row_item in rows.try_iter()? {
                 let row_item = row_item?;
                 let dict: &Bound<'_, PyDict> = row_item.cast()?;
-                let weight = s.capture_row(dict, &mut names, &mut args, _weight)?;
-                s.write_row(py, &names, None, |pos| args[pos].as_borrowed(), weight)?;
+                let weight = w.capture_row(dict, &mut names, &mut args, _weight)?;
+                w.write_row(py, batch, &names, None, |pos| args[pos].as_borrowed(), weight)?;
             }
             Ok(())
         })?;
@@ -552,11 +530,8 @@ impl PyZSetBatch {
 
     /// The rows appended so far, as a `ScanResult`: a snapshot, since a later
     /// append copies the batch it shares.
-    pub fn rows(&self, py: Python<'_>) -> PyResult<Py<PyScanResult>> {
-        Py::new(
-            py,
-            present(py, Arc::clone(&self.schema), Arc::clone(&self.batch), false, None)?,
-        )
+    pub fn rows(&self, py: Python<'_>) -> PyResult<PyScanResult> {
+        present(py, Arc::clone(self.schema()), Arc::clone(&self.batch), false, None)
     }
 
     pub fn __len__(&self) -> usize {
@@ -667,7 +642,8 @@ fn extract_decimal(item: &Bound<'_, PyAny>, scale: u8, inexact: Inexact) -> PyRe
         let text = match item.cast::<PyString>() {
             Ok(s) => s.to_cow()?,
             Err(_) => {
-                formatted = item.call_method1(pyo3::intern!(item.py(), "__format__"), ("f",))?;
+                let py = item.py();
+                formatted = item.call_method1(pyo3::intern!(py, "__format__"), (pyo3::intern!(py, "f"),))?;
                 formatted.cast::<PyString>()?.to_cow()?
             }
         };
@@ -692,34 +668,60 @@ enum Inexact {
     Refuse,
 }
 
-/// Append one non-null fixed-width value to `buf` as its native little-endian
+/// Where [`push_fixed_le`] writes a value's native little-endian bytes: a
+/// payload column, or the low bytes of a key's native image. Each arm writes a
+/// constant width, so a payload cell compiles to one fixed-size append.
+trait FixedSink {
+    fn put<const N: usize>(&mut self, bytes: [u8; N]);
+}
+
+impl FixedSink for Vec<u8> {
+    #[inline(always)]
+    fn put<const N: usize>(&mut self, bytes: [u8; N]) {
+        self.extend_from_slice(&bytes);
+    }
+}
+
+impl FixedSink for [u8; 16] {
+    #[inline(always)]
+    fn put<const N: usize>(&mut self, bytes: [u8; N]) {
+        self[..N].copy_from_slice(&bytes);
+    }
+}
+
+/// Write one non-null fixed-width value to `buf` as its native little-endian
 /// bytes. Each integer arm's `extract` is its range check.
-fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<()> {
+///
+/// Out of line: inlined into a caller, the arms' extracts and constant-size
+/// copies stop being inlined themselves, and every payload cell pays a call
+/// and a `memmove` more.
+#[inline(never)]
+fn push_fixed_le(buf: &mut impl FixedSink, ty: ColType, item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<()> {
     match ty.tc {
-        TypeCode::U8 => buf.push(item.extract::<u8>()?),
+        TypeCode::U8 => buf.put([item.extract::<u8>()?]),
         // A `bool` only: `1` is an integer, as it is in SQL.
-        TypeCode::Bool => buf.push(u8::from(item.extract::<bool>()?)),
-        TypeCode::I8 => buf.push(item.extract::<i8>()? as u8),
-        TypeCode::U16 => buf.extend_from_slice(&item.extract::<u16>()?.to_le_bytes()),
-        TypeCode::I16 => buf.extend_from_slice(&item.extract::<i16>()?.to_le_bytes()),
-        TypeCode::U32 => buf.extend_from_slice(&item.extract::<u32>()?.to_le_bytes()),
-        TypeCode::I32 => buf.extend_from_slice(&item.extract::<i32>()?.to_le_bytes()),
+        TypeCode::Bool => buf.put([u8::from(item.extract::<bool>()?)]),
+        TypeCode::I8 => buf.put(item.extract::<i8>()?.to_le_bytes()),
+        TypeCode::U16 => buf.put(item.extract::<u16>()?.to_le_bytes()),
+        TypeCode::I16 => buf.put(item.extract::<i16>()?.to_le_bytes()),
+        TypeCode::U32 => buf.put(item.extract::<u32>()?.to_le_bytes()),
+        TypeCode::I32 => buf.put(item.extract::<i32>()?.to_le_bytes()),
         TypeCode::F32 => {
             let v = item.extract::<f64>()?;
             let f = gnitz_wire::narrow_f32(v).ok_or_else(|| {
                 pyo3::exceptions::PyOverflowError::new_err(format!("{v} is out of range for an F32 column"))
             })?;
-            buf.extend_from_slice(&f.to_le_bytes())
+            buf.put(f.to_le_bytes())
         }
-        TypeCode::U64 => buf.extend_from_slice(&item.extract::<u64>()?.to_le_bytes()),
-        TypeCode::I64 => buf.extend_from_slice(&item.extract::<i64>()?.to_le_bytes()),
-        TypeCode::F64 => buf.extend_from_slice(&item.extract::<f64>()?.to_le_bytes()),
-        TypeCode::U128 => buf.extend_from_slice(&item.extract::<u128>()?.to_le_bytes()),
-        TypeCode::I128 => buf.extend_from_slice(&item.extract::<i128>()?.to_le_bytes()),
-        TypeCode::UUID => buf.extend_from_slice(&extract_uuid(item)?.to_le_bytes()),
-        TypeCode::Date => buf.extend_from_slice(&extract_days(item, inexact)?.to_le_bytes()),
-        TypeCode::Timestamp => buf.extend_from_slice(&extract_micros(item)?.to_le_bytes()),
-        TypeCode::Decimal => buf.extend_from_slice(&extract_decimal(item, ty.scale, inexact)?.to_le_bytes()),
+        TypeCode::U64 => buf.put(item.extract::<u64>()?.to_le_bytes()),
+        TypeCode::I64 => buf.put(item.extract::<i64>()?.to_le_bytes()),
+        TypeCode::F64 => buf.put(item.extract::<f64>()?.to_le_bytes()),
+        TypeCode::U128 => buf.put(item.extract::<u128>()?.to_le_bytes()),
+        TypeCode::I128 => buf.put(item.extract::<i128>()?.to_le_bytes()),
+        TypeCode::UUID => buf.put(extract_uuid(item)?.to_le_bytes()),
+        TypeCode::Date => buf.put(extract_days(item, inexact)?.to_le_bytes()),
+        TypeCode::Timestamp => buf.put(extract_micros(item)?.to_le_bytes()),
+        TypeCode::Decimal => buf.put(extract_decimal(item, ty.scale, inexact)?.to_le_bytes()),
         TypeCode::String | TypeCode::Blob => {
             unreachable!("a German-string column is never a fixed-width column or a PK column")
         }
@@ -727,12 +729,10 @@ fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>, inexac
     Ok(())
 }
 
-/// `v` as `ty`'s native value, zero-extended. `scratch` is reused across calls.
-fn py_native(scratch: &mut Vec<u8>, ty: ColType, v: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<u128> {
-    scratch.clear();
-    push_fixed_le(scratch, ty, v, inexact)?;
+/// `v` as `ty`'s native value, zero-extended.
+fn py_native(ty: ColType, v: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<u128> {
     let mut le = [0u8; 16];
-    le[..scratch.len()].copy_from_slice(scratch);
+    push_fixed_le(&mut le, ty, v, inexact)?;
     Ok(u128::from_le_bytes(le))
 }
 
@@ -744,6 +744,6 @@ pub(crate) fn py_key_image(col: &ColumnDef, v: &Bound<'_, PyAny>) -> PyResult<u1
             col.name
         )));
     }
-    let native = py_native(&mut Vec::with_capacity(16), col.ty, v, Inexact::Refuse)?;
+    let native = py_native(col.ty, v, Inexact::Refuse)?;
     Ok(gnitz_wire::key_image(col.ty.tc, native))
 }

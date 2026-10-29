@@ -1,22 +1,32 @@
 //! The Python extension module: the exception hierarchy every surface raises
 //! through, and the `_native` registration.
+//!
+//! `client` holds every verb; `blocking` and `aio` are how each client class
+//! waits; `write` and `read` encode and decode values; `reply` turns the
+//! other replies into Python objects; `schema` describes columns.
+
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use pyo3::prelude::*;
 
 use gnitz_core::{ClientError, MirrorError};
 use gnitz_wire::{TypeCode, WireStatus};
 
+mod aio;
+mod blocking;
 mod client;
-mod drive;
 mod local_server;
 mod read;
+mod reply;
 mod schema;
 mod write;
 
-use client::{PyAsyncClient, PyClient, PyGnitzClient, PyPollResult, PyPushed, PySynced, PyTxn};
-use drive::{LoopCore, PyPending, PyPipeline};
+use aio::PyAsyncClient;
+use blocking::{PyGnitzClient, PyPending, PyPipeline};
+use client::{PyClient, PyTxn};
 use local_server::PyLocalServer;
-use read::{PyRow, PyRowIterator, PyScanResult};
+use read::{PyRow, PyScanResult};
+use reply::{PyPollResult, PyPushed, PySynced};
 use schema::{PyColumnDef, PySchema};
 use write::{install_append_method, PyZSetBatch};
 
@@ -24,32 +34,35 @@ use write::{install_append_method, PyZSetBatch};
 // GnitzError Python exception
 // ---------------------------------------------------------------------------
 
-pyo3::create_exception!(_native, GnitzError, pyo3::exceptions::PyException);
+// Created under `gnitz`, which re-exports every one of them: an exception is
+// pickled by its module and name, and `_native` is no module an unpickler can
+// import.
+pyo3::create_exception!(gnitz, GnitzError, pyo3::exceptions::PyException);
 
 // Every class below subclasses GnitzError, so `except GnitzError` catches them
 // all while a caller that branches on one can name it instead of matching prose.
 
 // The request was understood and declined: `ClientError::Refused` at any
 // status, and a statement the SQL planner rejects. The connection is intact.
-pyo3::create_exception!(_native, GnitzRefusedError, GnitzError);
+pyo3::create_exception!(gnitz, GnitzRefusedError, GnitzError);
 // The connection is unusable: it failed, was lost, or was closed.
-pyo3::create_exception!(_native, GnitzConnectionError, GnitzError);
+pyo3::create_exception!(gnitz, GnitzConnectionError, GnitzError);
 // MirrorError::Poisoned. Recovery is `close_mirror()`, and nothing else.
-pyo3::create_exception!(_native, GnitzMirrorPoisonedError, GnitzError);
+pyo3::create_exception!(gnitz, GnitzMirrorPoisonedError, GnitzError);
 
 // A refusal whose status a caller branches on.
 
 // WireStatus::TxnConflict, and WireStatus::StaleCatalog: nothing was written,
 // and the caller's recovery is to run it again.
-pyo3::create_exception!(_native, GnitzConflictError, GnitzRefusedError);
+pyo3::create_exception!(gnitz, GnitzConflictError, GnitzRefusedError);
 // WireStatus::DeltaExpired.
-pyo3::create_exception!(_native, GnitzDeltaExpiredError, GnitzRefusedError);
+pyo3::create_exception!(gnitz, GnitzDeltaExpiredError, GnitzRefusedError);
 // WireStatus::SalFull.
-pyo3::create_exception!(_native, GnitzSalFullError, GnitzRefusedError);
+pyo3::create_exception!(gnitz, GnitzSalFullError, GnitzRefusedError);
 // WireStatus::NotFound.
-pyo3::create_exception!(_native, GnitzNotFoundError, GnitzRefusedError);
+pyo3::create_exception!(gnitz, GnitzNotFoundError, GnitzRefusedError);
 // WireStatus::IntegrityViolation.
-pyo3::create_exception!(_native, GnitzIntegrityError, GnitzRefusedError);
+pyo3::create_exception!(gnitz, GnitzIntegrityError, GnitzRefusedError);
 
 /// Wrap any `Display` error as a plain `GnitzError`.
 pub(crate) fn gnitz_err(e: impl std::fmt::Display) -> PyErr {
@@ -78,7 +91,7 @@ pub(crate) fn client_err(e: ClientError) -> PyErr {
             None => gnitz_err(inner),
         },
         ClientError::Mirror(MirrorError::Poisoned(_)) => GnitzMirrorPoisonedError::new_err(e.to_string()),
-        other => gnitz_err(other),
+        e @ ClientError::Mirror(MirrorError::Engine(_)) => gnitz_err(e),
     }
 }
 
@@ -89,6 +102,11 @@ pub(crate) fn sql_err(e: gnitz_sql::GnitzSqlError) -> PyErr {
         gnitz_sql::GnitzSqlError::Rejected(text) => GnitzRefusedError::new_err(text),
         internal @ gnitz_sql::GnitzSqlError::Internal(_) => gnitz_err(internal),
     }
+}
+
+/// A lock that guards plain state: a panic under it leaves that state whole.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The `(name, code)` column-type table, straight off `TypeCode::ALL`, which
@@ -121,11 +139,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyZSetBatch>()?;
     install_append_method(m.py())?;
     m.add_class::<PyScanResult>()?;
-    m.add_class::<PyRowIterator>()?;
     m.add_class::<PyClient>()?;
     m.add_class::<PyGnitzClient>()?;
     m.add_class::<PyAsyncClient>()?;
-    m.add_class::<LoopCore>()?;
     m.add_class::<PyTxn>()?;
     m.add_class::<PyPipeline>()?;
     m.add_class::<PyPending>()?;
@@ -145,13 +161,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("GnitzNotFoundError", m.py().get_type::<GnitzNotFoundError>())?;
     m.add("GnitzIntegrityError", m.py().get_type::<GnitzIntegrityError>())?;
-    // System-table IDs — single-sourced from gnitz_wire (delegating codec, not
-    // a re-typed copy), as is the table behind `type_codes()`.
-    // Only the ids something addresses a relation by are exported.
-    m.add("SCHEMA_TAB", gnitz_wire::SCHEMA_TAB)?;
-    m.add("TABLE_TAB", gnitz_wire::TABLE_TAB)?;
-    m.add("COL_TAB", gnitz_wire::COL_TAB)?;
-    m.add("IDX_TAB", gnitz_wire::IDX_TAB)?;
+    // The first id a user relation takes, single-sourced from gnitz_wire.
     m.add("FIRST_USER_TABLE_ID", gnitz_wire::FIRST_USER_TABLE_ID)?;
     // The schema-width cap, so a test locates the boundary instead of naming it.
     m.add("MAX_COLUMNS", gnitz_wire::MAX_COLUMNS)?;
@@ -167,7 +177,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("debug_assertions", cfg!(debug_assertions))?;
     m.add_function(wrap_pyfunction!(type_codes, m)?)?;
     m.add_function(wrap_pyfunction!(instructions_retired, m)?)?;
-    m.add_function(wrap_pyfunction!(schema::sys_schema, m)?)?;
     m.add_function(wrap_pyfunction!(local_server::find_server, m)?)?;
     Ok(())
 }

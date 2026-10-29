@@ -136,10 +136,10 @@ def test_a_system_family_is_read_beside_user_relations(client):
     at each of its positions."""
     t = client.create_table("t", KV)
     client.push(t, kv((1, 1)))
-    tables = gnitz.sys_schema(gnitz.TABLE_TAB)
-    first, family, last = client.scan_many([(t, KV), (gnitz.TABLE_TAB, tables), (t, KV)])
+    tables = client.resolve_table("_system.tables")
+    first, family, last = client.scan_many([(t, KV), tables, (t, KV)])
     assert bag(first) == bag(last) == {(1, 1): 1}
-    assert bag(family) == bag(client.scan(gnitz.TABLE_TAB, tables))
+    assert bag(family) == bag(client.scan(*tables))
 
 
 def test_a_chunked_train_does_not_let_its_siblings_jump_it(own_server):

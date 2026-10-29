@@ -87,6 +87,15 @@ async def test_a_gathered_burst_resolves_every_future(aconn, table):
         assert bag(result) == expected
 
 
+async def test_a_burst_past_the_in_flight_cap_makes_room(client, aconn):
+    """More calls than a connection may hold in flight: the later ones wait for
+    room, as a blocking pipeline's do."""
+    schemas = client.resolve_table(SCHEMAS)
+    scans = await asyncio.gather(*[aconn.scan(*schemas) for _ in range(gnitz.MAX_IN_FLIGHT + 200)])
+    sizes = {len(s) for s in scans}
+    assert len(sizes) == 1 and sizes.pop() > 0
+
+
 async def test_an_abandoned_operation_is_not_a_cancellation(aconn, table):
     """`aio`'s stated limitation: abandoning a future does not stop the frame or
     the commit, only the waiting. The reply still arrives for a slot nobody is
@@ -135,9 +144,10 @@ async def test_connection_loss_resolves_every_queued_request(own_server):
     that into a failure.
     """
     conn = await aio.connect(own_server.start().target)
+    schemas = await conn.resolve_table(SCHEMAS)
     own_server.stop()
 
-    futs = [conn.scan(*SCHEMAS) for _ in range(3000)]
+    futs = [conn.scan(*schemas) for _ in range(3000)]
     results = await asyncio.wait_for(
         asyncio.gather(*futs, return_exceptions=True), timeout=30)
     resolved_ok = [r for r in results if not isinstance(r, BaseException)]
@@ -148,7 +158,7 @@ async def test_connection_loss_resolves_every_queued_request(own_server):
 
     # A request submitted after the failure was observed must resolve too.
     with pytest.raises(gnitz.GnitzConnectionError):
-        await asyncio.wait_for(conn.scan(*SCHEMAS), timeout=30)
+        await asyncio.wait_for(conn.scan(*schemas), timeout=30)
 
     await conn.aclose()
 
@@ -173,12 +183,13 @@ async def test_a_dropped_connection_frees_its_socket(server):
     before = _open_sockets()      # the loop's self-pipe already exists
 
     conn = await aio.connect(server)
-    assert len(await conn.scan(*SCHEMAS)) > 0
+    schemas = await conn.resolve_table(SCHEMAS)
+    assert len(await conn.scan(*schemas)) > 0
     del conn
     await asyncio.sleep(0)
     assert _open_sockets() == before
 
-    fut = (await aio.connect(server)).scan(*SCHEMAS)
+    fut = (await aio.connect(server)).scan(*schemas)
     assert len(await fut) > 0
     await asyncio.sleep(0)
     assert _open_sockets() == before

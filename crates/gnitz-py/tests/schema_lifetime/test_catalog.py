@@ -53,8 +53,8 @@ def test_a_dropped_relation_stops_answering_while_its_siblings_serve(client):
     exactly that id — it stops answering scans — and leaves the other
     maintained. A dropped populated table's id retires the same way."""
     tid = client.create_table("src", KV)
-    va = client.create_view("va", "src")
-    vb = client.create_view("vb", "src")
+    client.execute_sql("CREATE VIEW va AS SELECT * FROM src; CREATE VIEW vb AS SELECT * FROM src")
+    va, vb = (client.resolve_table(v)[0] for v in ("va", "vb"))
 
     client.push(tid, kv((1, 10)))
     for vid in (va, vb):

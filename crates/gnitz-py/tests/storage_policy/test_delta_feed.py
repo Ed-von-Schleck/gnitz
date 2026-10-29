@@ -14,7 +14,7 @@ copy against a scan as a multiset of `(row, weight)`.
 The mirroring client drives the same feed through its own poll path; its suites
 are `client_surface/test_mirror.py` and `crates/gnitz-mirror/tests`, which also
 hold how a held sync waits and which rounds move a cursor. These drive the raw
-`delta_bootstrap` / `delta_poll` verbs, whose refusals a mirror hides, through
+`delta_read` verb, whose refusals a mirror hides, through
 the Python binding.
 """
 import asyncio
@@ -247,8 +247,8 @@ def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client):
     client.execute_sql(f"CREATE VIEW plain AS {LINEAR}")
     vid, schema = client.resolve_table("plain")
     for verb in (
-        lambda: client.delta_bootstrap(vid, schema),
-        lambda: client.delta_poll(vid, schema, (0, 1)),
+        lambda: client.delta_read(vid, schema),
+        lambda: client.delta_read(vid, schema, (0, 1)),
     ):
         with pytest.raises(gnitz.GnitzRefusedError, match="carries no delta feed") as e:
             verb()

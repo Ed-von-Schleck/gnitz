@@ -6,9 +6,11 @@ The engine — not the SQL planner — has to hold the writes, because a binary
 push or delete is a shipped client binding no planner stands in front of.
 """
 
+import pickle
 from decimal import Decimal
 
 import pytest
+
 import gnitz
 from _read import bag
 from _schemas import KV
@@ -51,7 +53,7 @@ def test_a_write_to_no_base_table_is_refused_and_changes_nothing(client, target)
         tid, schema = client.resolve_table("v")
         row = {"pk": 999, "val": 999}
     else:
-        tid, schema = gnitz.TABLE_TAB, gnitz.sys_schema(gnitz.TABLE_TAB)
+        tid, schema = client.resolve_table("_system.tables")
         row = {"table_id": 999999, "schema_id": 1, "name": "forged", "pk_col_idx": 0, "flags": 0}
     before = bag(client.scan(tid, schema))
     assert before
@@ -70,6 +72,15 @@ def test_a_write_to_no_base_table_is_refused_and_changes_nothing(client, target)
 
     t_tid, t_schema = client.resolve_table("t")
     assert client.push(t_tid, gnitz.ZSetBatch(t_schema)) == 0
+
+
+def test_an_error_pickles_as_its_own_class(client):
+    """An exception pickles by its module and name — what a multiprocessing
+    queue or a process pool sends."""
+    with pytest.raises(gnitz.GnitzNotFoundError) as e:
+        client.resolve_table("nosuch")
+    again = pickle.loads(pickle.dumps(e.value))
+    assert type(again) is gnitz.GnitzNotFoundError and again.args == e.value.args
 
 
 def test_an_absent_relation_is_a_miss_not_a_writability_failure(client):
@@ -94,7 +105,7 @@ def test_a_live_view_blocks_dropping_its_base_even_from_another_schema(client, o
     the view lives in. The rejected drops leave the table intact, and dropping
     the view lifts both: the cascade at teardown is the second."""
     tid = other_client.create_table("t", KV)
-    client.create_view("v", f"{other_client.schema}.t")
+    client.execute_sql(f"CREATE VIEW v AS SELECT * FROM {other_client.schema}.t")
 
     for drop in (lambda: other_client.drop_table("t"),
                  lambda: other_client.drop_schema(other_client.schema)):

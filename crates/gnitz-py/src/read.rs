@@ -1,8 +1,9 @@
 //! The wire→Python direction: every decode from a `ZSetBatch` to a Python
 //! object, and the read-side pyclasses built on them.
 //!
-//! The per-cell decode is private: what leaves this module is [`scan_result`],
-//! so no other module dispatches on a `TypeCode` to read a value.
+//! The per-cell decode is private: what leaves this module is the `ScanResult`
+//! build — [`scan_result`] for a reply, [`present`] for a batch the binding
+//! holds — so no other module dispatches on a `TypeCode` to read a value.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -22,7 +23,7 @@ use crate::schema::PySchema;
 /// `subclass` because a result presents its rows as a synthesised subclass
 /// carrying its field names and one [`ColumnDescriptor`] per column
 /// ([`RowType`]). `frozen` drops the borrow flag.
-#[pyclass(name = "Row", frozen, subclass)]
+#[pyclass(name = "Row", frozen, subclass, module = "gnitz")]
 pub struct PyRow {
     values: Py<PyTuple>,
     weight: i64,
@@ -30,7 +31,7 @@ pub struct PyRow {
 
 /// One presented column, as a descriptor in a row subclass's type dict, so
 /// `row.col` is served by CPython's type-attribute cache.
-#[pyclass(frozen)]
+#[pyclass(frozen, module = "gnitz._native")]
 struct ColumnDescriptor {
     pos: usize,
 }
@@ -57,7 +58,7 @@ impl RowType {
     fn of(py: Python<'_>, names: &[(&str, bool)]) -> PyResult<RowType> {
         static CACHE: LazyLock<Mutex<HashMap<Vec<u8>, Py<PyType>>>> = LazyLock::new(Default::default);
         // Length-prefixed, so no two column lists share a key.
-        let mut key = Vec::new();
+        let mut key = Vec::with_capacity(names.iter().map(|(n, _)| n.len() + 5).sum());
         for &(name, hidden) in names {
             key.extend_from_slice(&(name.len() as u32).to_le_bytes());
             key.extend_from_slice(name.as_bytes());
@@ -91,15 +92,33 @@ impl RowType {
         let ns = PyDict::new(py);
         // No `__dict__` / `__weakref__` per row: a row's namespace is its columns.
         ns.set_item(intern!(py, "__slots__"), PyTuple::empty(py))?;
+        // Else `type()` takes the module of whichever Python frame first
+        // presented these columns.
+        ns.set_item(intern!(py, "__module__"), intern!(py, "gnitz"))?;
         ns.set_item(intern!(py, "_fields"), &fields)?;
         ns.set_item(intern!(py, "_keys"), &keys)?;
         let base = py.get_type::<PyRow>();
+        // What a row answers by itself: the class dicts its own attribute
+        // lookup walks, in `mro` order.
+        let mro = base.mro();
+        let answered = |name: &Bound<'_, PyString>| -> PyResult<bool> {
+            for class in mro.iter() {
+                if class.getattr(intern!(py, "__dict__"))?.contains(name)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
         for (pos, name) in keys.iter().enumerate() {
             let Ok(name) = name.cast::<PyString>() else {
                 continue;
             };
-            // A name the row object itself answers keeps that meaning.
-            if !(base.hasattr(name)? || ns.contains(name)?) {
+            // A name the row object itself answers keeps that meaning, and so
+            // does every dunder: `type()` reads some (`__qualname__`,
+            // `__classcell__`) and the protocols the rest.
+            let text = name.to_cow()?;
+            let dunder = text.len() > 4 && text.starts_with("__") && text.ends_with("__");
+            if !(dunder || answered(name)? || ns.contains(name)?) {
                 ns.set_item(name, Bound::new(py, ColumnDescriptor { pos })?)?;
             }
         }
@@ -149,11 +168,11 @@ impl PyRow {
     /// so a *column* named `_weight` is shadowed here and read through
     /// `_asdict()` or by position.
     #[getter(_weight)]
-    pub fn weight_(&self) -> i64 {
+    fn weight_(&self) -> i64 {
         self.weight
     }
 
-    pub fn __getitem__(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    fn __getitem__(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
         let values = slf.get().values.bind(py);
         let pos = if key.cast::<pyo3::types::PyInt>().is_ok() {
@@ -175,15 +194,15 @@ impl PyRow {
         Ok(values.get_item(pos)?.unbind())
     }
 
-    pub fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.values.bind(py).as_any().try_iter()?.into_any().unbind())
     }
 
-    pub fn __len__(&self, py: Python<'_>) -> usize {
+    fn __len__(&self, py: Python<'_>) -> usize {
         self.values.bind(py).len()
     }
 
-    pub fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
+    fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
         let py = slf.py();
         let parts = type_tuple(slf, intern!(py, "_fields"))?
             .as_slice()
@@ -194,7 +213,7 @@ impl PyRow {
         Ok(format!("Row({}, _weight={})", parts.join(", "), slf.get().weight))
     }
 
-    pub fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         if let Ok(other_row) = other.cast::<PyRow>() {
             let eq: bool = self.values.bind(py).eq(other_row.get().values.bind(py))?;
             eq.into_py_any(py)
@@ -203,11 +222,11 @@ impl PyRow {
         }
     }
 
-    pub fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
+    fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
         self.values.bind(py).hash()
     }
 
-    pub fn _asdict(slf: &Bound<'_, Self>) -> PyResult<Py<PyDict>> {
+    fn _asdict(slf: &Bound<'_, Self>) -> PyResult<Py<PyDict>> {
         let py = slf.py();
         let dict = PyDict::new(py);
         for (name, val) in type_tuple(slf, intern!(py, "_keys"))?
@@ -231,13 +250,9 @@ impl PyRow {
 const PY_YEARS: std::ops::RangeInclusive<i64> = 1..=9999;
 
 /// `decimal.Decimal`, imported once.
-fn py_decimal(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
-    static DECIMAL: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-    DECIMAL
-        .get_or_try_init(py, || {
-            Ok::<_, PyErr>(py.import("decimal")?.getattr("Decimal")?.unbind())
-        })
-        .map(|d| d.bind(py))
+fn py_decimal(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    static DECIMAL: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+    DECIMAL.import(py, "decimal", "Decimal")
 }
 
 /// The cell at `loc` in `row`, PK or payload.
@@ -316,14 +331,14 @@ pub(crate) fn present(
     Ok(PyScanResult { schema, batch, cols, row_type, lsn })
 }
 
-/// The one `ScanResult` build: read verbs, SQL rows, delta rows, `ZSetBatch.rows()`.
+/// A reply's `ScanResult`: read verbs, SQL rows, delta rows.
 pub(crate) fn scan_result(py: Python<'_>, reply: ScanReply) -> PyResult<Py<PyScanResult>> {
     Py::new(py, present(py, reply.schema, Arc::new(reply.batch), false, reply.lsn)?)
 }
 
 /// One result's presentation over a shared batch: the columns shown, in order,
 /// and the `Row` subclass that names them.
-#[pyclass(name = "ScanResult", frozen)]
+#[pyclass(name = "ScanResult", frozen, module = "gnitz")]
 pub struct PyScanResult {
     schema: Arc<Schema>,
     batch: Arc<ZSetBatch>,
@@ -366,8 +381,8 @@ impl PyScanResult {
     }
 }
 
-#[pyclass(name = "RowIterator")]
-pub struct PyRowIterator {
+#[pyclass(name = "RowIterator", module = "gnitz._native")]
+struct PyRowIterator {
     data: Py<PyScanResult>,
     row_buf: Vec<Py<PyAny>>,
     pos: usize,

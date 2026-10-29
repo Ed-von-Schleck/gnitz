@@ -1,175 +1,73 @@
-//! The client classes: every verb, written once, and the two classes that run
-//! them — `GnitzClient` on the calling thread, `AsyncGnitzClient` on an asyncio
-//! event loop.
+//! Every verb, written once on the `_Client` base, and transactions.
 //!
-//! How a verb waits is `drive`'s. Every schema, key and row it hands to the
-//! wire is encoded by `write`, and every reply decoded by `read`; nothing here
-//! dispatches on a column type.
+//! A verb is `op`, what it does with the client, and `convert`, what turns the
+//! client's answer into its Python value under the GIL. How it waits is the
+//! class's: `blocking` runs it on the calling thread, `aio` on an asyncio event
+//! loop. Every key and row it hands the wire is encoded by `write`, and every
+//! row it gets back decoded by `read`; nothing here dispatches on a column type.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyList};
 use pyo3::IntoPyObjectExt;
 
-use gnitz_core::{
-    BoxFut, ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, Pushed, RelName, ScanReply, Sent, Synced,
-    TableDef, ZSetBatch,
-};
+use gnitz_core::{BoxFut, ClientError, DeltaCursor, GnitzClient, RelName, Sent, TableDef, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
-use gnitz_sql::{GnitzSqlError, SqlResult};
-use gnitz_wire::WireConflictMode;
-use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
+use gnitz_sql::GnitzSqlError;
+use gnitz_wire::{KeyRange, PkColList, PkListRole, ReadBound, ReadSpec, WireConflictMode};
 
-use crate::client_err;
-use crate::drive::{Blocking, LoopHandle, PyPipeline};
+use crate::aio::{LoopCore, LoopHandle};
+use crate::blocking::Blocking;
 use crate::read::scan_result;
+use crate::reply::{delta, none, polled, scanned, sql_results, synced, value};
 use crate::schema::PySchema;
-use crate::write::{pk_point_spec, py_key_image, py_pks_to_column, PyZSetBatch};
+use crate::write::{py_key_image, py_pks_to_column, PyZSetBatch};
+use crate::{client_err, lock};
 
-/// What one view's poll did. `PollOutcome` flattened for Python, which has no
-/// cheap payload-carrying enum.
-#[pyclass(name = "PollResult", frozen, get_all)]
-pub struct PyPollResult {
-    /// The relation's server id, which a recreated view moves.
-    view_id: u64,
-    /// The copy was discarded and re-read whole — the discontinuity a subscriber
-    /// has to react to, which no cursor carries.
-    reseeded: bool,
-    /// The exception this one view's poll failed with, or `None`.
-    error: Option<Py<PyAny>>,
-    /// `(tag, tick)`, or `None` when the view has no valid copy.
-    cursor: Option<(u64, u64)>,
-}
+/// A verb's answer, waiting to become its Python value under the GIL.
+pub(crate) type Unconverted = Box<dyn FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + Send>;
 
-impl PyPollResult {
-    fn new(py: Python<'_>, o: PollOutcome) -> PyPollResult {
-        PyPollResult {
-            view_id: o.view_id,
-            reseeded: o.result.reseeded(),
-            cursor: o.cursor.map(DeltaCursor::pair),
-            error: match o.result {
-                PollResult::Failed(e) => Some(client_err(e).into_value(py).into_any()),
-                _ => None,
-            },
-        }
-    }
-}
+/// A verb as both drivers run it: what it does with the client, and the
+/// answer that yields, still to be converted.
+pub(crate) type Verb =
+    Box<dyn for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<Unconverted>, GnitzSqlError>> + Send>;
 
-/// What one sync brought. `gnitz_core::Synced` for Python.
-#[pyclass(name = "Synced", frozen, get_all)]
-pub struct PySynced {
-    /// One `Pushed` per subscription `subscribe` made, in the order made.
-    pushed: Py<PyAny>,
-    /// One `PollResult` per mirrored view.
-    mirrored: Py<PyAny>,
-}
-
-impl PySynced {
-    fn new(py: Python<'_>, synced: Synced) -> PyResult<PySynced> {
-        let pushed: PyResult<Vec<PyPushed>> = synced.pushed.into_iter().map(|p| PyPushed::new(py, p)).collect();
-        let mirrored: Vec<PyPollResult> = synced.mirrored.into_iter().map(|o| PyPollResult::new(py, o)).collect();
-        Ok(PySynced {
-            pushed: pushed?.into_py_any(py)?,
-            mirrored: mirrored.into_py_any(py)?,
+/// The verb that runs `op` and converts its answer with `convert`.
+pub(crate) fn verb<T, O, C>(op: O, convert: C) -> Verb
+where
+    T: Send + 'static,
+    O: for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>> + Send + 'static,
+    C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
+{
+    Box::new(move |c| {
+        Box::pin(async move {
+            let sent = op(c).await?;
+            Ok(sent.map(move |t| Box::new(move |py: Python<'_>| convert(py, t)) as Unconverted))
         })
-    }
-}
-
-/// What a sync handed one subscription. `gnitz_core::Pushed` flattened for
-/// Python, as [`PyPollResult`] is.
-#[pyclass(name = "Pushed", frozen, get_all)]
-pub struct PyPushed {
-    /// The id `subscribe` returned.
-    sub: u64,
-    /// The deltas pushed since the last sync, weights and all; `None` once
-    /// the subscription ended.
-    rows: Option<Py<PyAny>>,
-    /// `(tag, tick)` past `rows`; `None` once the subscription ended.
-    cursor: Option<(u64, u64)>,
-    /// The exception the subscription ended with, or `None`.
-    error: Option<Py<PyAny>>,
-}
-
-impl PyPushed {
-    fn new(py: Python<'_>, pushed: Pushed) -> PyResult<PyPushed> {
-        let sub = pushed.sub;
-        Ok(match pushed.result {
-            Ok((reply, cursor)) => PyPushed {
-                sub,
-                rows: Some(scan_result(py, reply)?.into_any()),
-                cursor: Some(cursor.pair()),
-                error: None,
-            },
-            Err(e) => PyPushed {
-                sub,
-                rows: None,
-                cursor: None,
-                error: Some(client_err(e).into_value(py).into_any()),
-            },
-        })
-    }
-}
-
-#[pymethods]
-impl PyPushed {
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        let cursor = self
-            .cursor
-            .map_or("None".to_string(), |(tag, tick)| format!("({tag}, {tick})"));
-        let show = |value: &Option<Py<PyAny>>| match value {
-            Some(v) => Ok::<_, PyErr>(v.bind(py).repr()?.to_string()),
-            None => Ok("None".to_string()),
-        };
-        Ok(format!(
-            "Pushed(sub={}, rows={}, cursor={cursor}, error={})",
-            self.sub,
-            show(&self.rows)?,
-            show(&self.error)?,
-        ))
-    }
-}
-
-#[pymethods]
-impl PyPollResult {
-    /// Rendered the way Python prints the same values, not the way Rust does.
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        let cursor = self
-            .cursor
-            .map_or("None".to_string(), |(tag, tick)| format!("({tag}, {tick})"));
-        let error = match &self.error {
-            Some(e) => e.bind(py).repr()?.to_string(),
-            None => "None".to_string(),
-        };
-        Ok(format!(
-            "PollResult(view_id={}, reseeded={}, cursor={cursor}, error={error})",
-            self.view_id,
-            if self.reseeded { "True" } else { "False" },
-        ))
-    }
+    })
 }
 
 /// How a client waits, which is the whole difference between its two classes.
 pub(crate) enum Mode {
-    Closed,
-    Blocking(Box<Blocking>),
+    /// `None` once closed. Held by the verb running on it: one that finds it
+    /// held — from another thread, or from Python the running verb ran — is
+    /// refused.
+    Blocking(Mutex<Option<Box<Blocking>>>),
     Loop(LoopHandle),
 }
 
 /// The verbs both client classes inherit. A verb's value is its result on a
 /// `GnitzClient`, a future of it on an `AsyncGnitzClient`, and a `Pending`
 /// inside `GnitzClient.pipeline()`.
-#[pyclass(name = "_Client", subclass)]
+#[pyclass(name = "_Client", subclass, frozen, module = "gnitz._native")]
 pub struct PyClient {
-    /// A `Sync` shim: `#[pyclass]` demands `Sync` and a client is `Send` only,
-    /// as its host is. Never locked — [`Self::mode`] is the only way in.
-    mode: Mutex<Mode>,
+    mode: Mode,
     /// The schema of a relation named without one, in SQL and in every verb
     /// that takes a name.
-    #[pyo3(get, set)]
-    schema: String,
+    schema: Mutex<String>,
 }
 
 /// A verb the client finishes itself: `body` runs with the client `c` to
@@ -179,6 +77,7 @@ macro_rules! whole {
         move |$c| Box::pin(async move { Ok(Sent::ready(Ok($body))) })
     };
 }
+pub(crate) use whole;
 
 /// A verb that is one request: `pending` is submitted, and its reply awaited
 /// with the client already free for the next call.
@@ -189,19 +88,49 @@ macro_rules! single {
 }
 
 impl PyClient {
-    fn mode(&mut self) -> &mut Mode {
-        self.mode.get_mut().unwrap_or_else(PoisonError::into_inner)
+    /// A client that waits as `mode` does.
+    pub(crate) fn init(mode: Mode, schema: &str) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyClient {
+            mode,
+            schema: Mutex::new(schema.to_owned()),
+        })
     }
 
-    /// The blocking client: an error on a closed one, and on a client that
-    /// lives on an event loop.
-    pub(crate) fn blocking(&mut self) -> PyResult<&mut Blocking> {
-        match self.mode() {
-            Mode::Blocking(blocking) => Ok(blocking),
-            Mode::Closed => Err(client_err(ClientError::Closed)),
-            Mode::Loop(_) => Err(PyTypeError::new_err(
+    /// The blocking client's slot: an error on a client that lives on an event
+    /// loop, and on one a verb is running on.
+    fn blocking_slot(&self) -> PyResult<MutexGuard<'_, Option<Box<Blocking>>>> {
+        let Mode::Blocking(slot) = &self.mode else {
+            return Err(PyTypeError::new_err(
                 "this client lives on an event loop; await its verbs",
-            )),
+            ));
+        };
+        match slot.try_lock() {
+            Ok(slot) => Ok(slot),
+            Err(TryLockError::Poisoned(slot)) => Ok(slot.into_inner()),
+            Err(TryLockError::WouldBlock) => Err(PyRuntimeError::new_err("this client is running another call")),
+        }
+    }
+
+    /// Run `f` on the blocking client: an error on a closed one, as
+    /// [`Self::blocking_slot`] gives.
+    pub(crate) fn blocking<R>(&self, f: impl FnOnce(&mut Blocking) -> PyResult<R>) -> PyResult<R> {
+        match self.blocking_slot()?.as_deref_mut() {
+            Some(blocking) => f(blocking),
+            None => Err(client_err(ClientError::Closed)),
+        }
+    }
+
+    /// Close a blocking client: its driver, which the caller drops. `None`
+    /// once closed.
+    pub(crate) fn take_blocking(&self) -> PyResult<Option<Box<Blocking>>> {
+        Ok(self.blocking_slot()?.take())
+    }
+
+    /// The event loop's half of a client on one: an error on a blocking client.
+    pub(crate) fn on_loop(&self) -> PyResult<&LoopCore> {
+        match &self.mode {
+            Mode::Loop(handle) => Ok(handle.get()),
+            Mode::Blocking(_) => Err(PyTypeError::new_err("this client blocks: use `with`, not `async with`")),
         }
     }
 
@@ -212,10 +141,10 @@ impl PyClient {
         O: for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>> + Send + 'static,
         C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
     {
-        match slf.try_borrow_mut()?.mode() {
-            Mode::Closed => Err(client_err(ClientError::Closed)),
-            Mode::Blocking(blocking) => blocking.run(slf, op, convert),
-            Mode::Loop(handle) => handle.submit(slf.py(), op, convert),
+        let verb = verb(op, convert);
+        match &slf.get().mode {
+            Mode::Blocking(_) => slf.get().blocking(|blocking| blocking.run(slf, verb)),
+            Mode::Loop(handle) => handle.get().submit(slf.py(), verb),
         }
     }
 
@@ -227,34 +156,48 @@ impl PyClient {
         R: FnOnce(&mut GnitzClient) -> T + Send + 'static,
         C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
     {
-        if let Mode::Blocking(blocking) = slf.try_borrow_mut()?.mode() {
-            return convert(slf.py(), read(&mut blocking.client));
+        match &slf.get().mode {
+            Mode::Blocking(_) => slf
+                .get()
+                .blocking(|blocking| convert(slf.py(), read(&mut blocking.client))),
+            Mode::Loop(_) => Self::run(slf, whole!(|c| read(c)), convert),
         }
-        Self::run(slf, whole!(|c| read(c)), convert)
     }
 
-    fn schema_name(slf: &Bound<'_, Self>) -> PyResult<String> {
-        Ok(slf.try_borrow()?.schema.clone())
+    fn schema_name(slf: &Bound<'_, Self>) -> String {
+        lock(&slf.get().schema).clone()
     }
 
     /// The relation a verb's `name` or `schema.name` argument names.
     fn relation(slf: &Bound<'_, Self>, text: &str) -> PyResult<RelName> {
-        RelName::parse(&slf.try_borrow()?.schema, text).map_err(|e| client_err(e.into()))
+        RelName::parse(&lock(&slf.get().schema), text).map_err(|e| client_err(e.into()))
+    }
+
+    /// The rows `spec` selects of relation `tid` in `schema`'s layout, off this
+    /// client's local copy if it mirrors one.
+    fn read(slf: &Bound<'_, Self>, tid: u64, schema: PySchema, spec: ReadSpec) -> PyResult<Py<PyAny>> {
+        Self::run(
+            slf,
+            single!(|c| c.scan_spec_local_first(tid, spec, &schema.rust)),
+            scanned,
+        )
     }
 }
 
-/// The handle is gone: a client on an event loop closes once it owes nothing.
-impl Drop for PyClient {
-    fn drop(&mut self) {
-        if let Mode::Loop(handle) = self.mode() {
-            Python::attach(|py| handle.release(py));
-        }
-    }
-}
-
-/// The spec of a delta read that names none: the view whole.
-fn whole_view() -> Vec<u8> {
-    gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None).encode()
+/// A delta read's `cursor` and `spec` arguments: `(tag, tick)` or none, and
+/// the view whole where no spec is given.
+fn delta_args(cursor: Option<(u64, u64)>, spec: Option<Vec<u8>>) -> PyResult<(Option<DeltaCursor>, Vec<u8>)> {
+    let cursor = cursor
+        .map(|(tag, tick)| {
+            DeltaCursor::from_pair(tag, tick).ok_or_else(|| {
+                PyValueError::new_err("a delta cursor at tick 0 continues no round; read the view whole")
+            })
+        })
+        .transpose()?;
+    Ok((
+        cursor,
+        spec.unwrap_or_else(|| ReadSpec::all_rows(ReadBound::None).encode()),
+    ))
 }
 
 /// A sync's `wait`, given in seconds.
@@ -263,33 +206,29 @@ fn sync_wait(seconds: f64) -> PyResult<Duration> {
         .map_err(|_| PyValueError::new_err(format!("wait must be a non-negative number of seconds, not {seconds}")))
 }
 
-fn none(py: Python<'_>, _: ()) -> PyResult<Py<PyAny>> {
-    Ok(py.None())
-}
-
-fn scanned(py: Python<'_>, reply: ScanReply) -> PyResult<Py<PyAny>> {
-    Ok(scan_result(py, reply)?.into_any())
-}
-
-fn delta(py: Python<'_>, (reply, cursor): (ScanReply, DeltaCursor)) -> PyResult<Py<PyAny>> {
-    (scan_result(py, reply)?, cursor.pair()).into_py_any(py)
-}
-
 #[pymethods]
 impl PyClient {
+    #[getter]
+    fn schema(slf: &Bound<'_, Self>) -> String {
+        Self::schema_name(slf)
+    }
+
+    #[setter]
+    fn set_schema(&self, schema: String) {
+        *lock(&self.schema) = schema;
+    }
+
     /// Request frames this connection has written — what a test asserts a
     /// mirrored read does not move. Answers on a poisoned store.
     #[getter]
     fn requests_sent(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        Self::peek(slf, |c| c.requests_sent(), |py, n| n.into_py_any(py))
+        Self::peek(slf, |c| c.requests_sent(), value)
     }
 
     // ----- DDL -----
 
     fn create_schema(slf: &Bound<'_, Self>, name: String) -> PyResult<Py<PyAny>> {
-        Self::run(slf, whole!(|c| c.create_schema(&name, false).await?), |py, id| {
-            id.into_py_any(py)
-        })
+        Self::run(slf, whole!(|c| c.create_schema(&name, false).await?), value)
     }
 
     fn drop_schema(slf: &Bound<'_, Self>, name: String) -> PyResult<Py<PyAny>> {
@@ -303,13 +242,18 @@ impl PyClient {
         Self::run(
             slf,
             whole!(|c| c.create_table(&TableDef::new(table, (*schema.rust).clone())).await?),
-            |py, tid| tid.into_py_any(py),
+            value,
         )
     }
 
     fn drop_table(slf: &Bound<'_, Self>, table_name: String) -> PyResult<Py<PyAny>> {
         let table = Self::relation(slf, &table_name)?;
         Self::run(slf, whole!(|c| c.drop_table(&[table], false).await?), none)
+    }
+
+    fn drop_view(slf: &Bound<'_, Self>, view_name: String) -> PyResult<Py<PyAny>> {
+        let view = Self::relation(slf, &view_name)?;
+        Self::run(slf, whole!(|c| c.drop_view(&[view], false).await?), none)
     }
 
     // ----- DML -----
@@ -324,15 +268,14 @@ impl PyClient {
     #[pyo3(signature = (target_id, batch, mode = "update"))]
     fn push(slf: &Bound<'_, Self>, target_id: u64, batch: PyRef<'_, PyZSetBatch>, mode: &str) -> PyResult<Py<PyAny>> {
         let mode: WireConflictMode = mode.parse().map_err(|e: String| PyValueError::new_err(e))?;
-        let (schema, rows) = (Arc::clone(&batch.schema), Arc::clone(&batch.batch));
+        let (schema, rows) = (Arc::clone(batch.schema()), Arc::clone(&batch.batch));
         drop(batch);
-        Self::run(slf, single!(|c| c.push(target_id, &schema, &*rows, mode)), |py, lsn| {
-            lsn.into_py_any(py)
-        })
+        Self::run(slf, single!(|c| c.push(target_id, &schema, &*rows, mode)), value)
     }
 
-    /// delete(target_id, schema, pks) — `pks` is a list where each element is the key's value
-    /// (single-column PK) or a tuple of its column values (compound PK).
+    /// delete(target_id, schema, pks) — `pks` is a sequence where each element
+    /// is the key's value (single-column PK) or a tuple of its column values
+    /// (compound PK).
     fn delete(
         slf: &Bound<'_, Self>,
         target_id: u64,
@@ -343,7 +286,7 @@ impl PyClient {
         Self::run(
             slf,
             single!(|c| c.push(target_id, &schema.rust, batch, WireConflictMode::Update)),
-            |py, _lsn| Ok(py.None()),
+            none,
         )
     }
 
@@ -361,42 +304,13 @@ impl PyClient {
         PyTxn { client: slf.clone().unbind() }
     }
 
-    // ----- Views -----
-
-    /// create_view(view_name, source_name) — `CREATE VIEW view AS SELECT *
-    /// FROM source`.
-    fn create_view(slf: &Bound<'_, Self>, view_name: String, source_name: String) -> PyResult<Py<PyAny>> {
-        let view = Self::relation(slf, &view_name)?;
-        let source = Self::relation(slf, &source_name)?;
-        let sn = Self::schema_name(slf)?;
-        let text = |r: &RelName| {
-            format!(
-                "{}.{}",
-                gnitz_sql::relation_text(r.schema()),
-                gnitz_sql::relation_text(r.name())
-            )
-        };
-        let sql = format!("CREATE VIEW {} AS SELECT * FROM {}", text(&view), text(&source));
-        Self::run(
-            slf,
-            whole!(|c| {
-                gnitz_sql::execute(c, &sn, &sql).await?;
-                c.resolve_relation(&view).await?.tid
-            }),
-            |py, vid| vid.into_py_any(py),
-        )
-    }
-
-    fn drop_view(slf: &Bound<'_, Self>, view_name: String) -> PyResult<Py<PyAny>> {
-        let view = Self::relation(slf, &view_name)?;
-        Self::run(slf, whole!(|c| c.drop_view(&[view], false).await?), none)
-    }
+    // ----- Reads -----
 
     /// resolve_table(table_name) -> (tid: int, schema: Schema)
     fn resolve_table(slf: &Bound<'_, Self>, table_name: String) -> PyResult<Py<PyAny>> {
         let table = Self::relation(slf, &table_name)?;
         Self::run(slf, whole!(|c| c.resolve_relation(&table).await?), |py, rel| {
-            (rel.tid, PySchema { rust: Arc::clone(&rel.schema) }).into_py_any(py)
+            value(py, (rel.tid, PySchema { rust: Arc::clone(&rel.schema) }))
         })
     }
 
@@ -406,115 +320,7 @@ impl PyClient {
     /// copy if it mirrors one. `lsn` is `None` for a local answer; a copy's
     /// freshness is `cursor(view_id)`.
     fn scan(slf: &Bound<'_, Self>, target_id: u64, schema: PySchema) -> PyResult<Py<PyAny>> {
-        let spec = ReadSpec::all_rows(ReadBound::None);
-        Self::run(
-            slf,
-            single!(|c| c.scan_spec_local_first(target_id, spec, &schema.rust)),
-            scanned,
-        )
-    }
-
-    /// subscription(sql) -> (view_id, schema, spec)
-    ///
-    /// Plan `sql`, one `SELECT` over one view with a delta feed, as what
-    /// `delta_bootstrap` and `delta_poll` take to answer with only the rows and
-    /// columns it keeps: the view's id, the schema the replies come in, and the
-    /// spec to pass. The view's key rides along, hidden where the `SELECT` does
-    /// not name it. An aggregate, `DISTINCT`, `ORDER BY` and `LIMIT` are refused.
-    fn subscription(slf: &Bound<'_, Self>, sql: String) -> PyResult<Py<PyAny>> {
-        let sn = Self::schema_name(slf)?;
-        Self::run(
-            slf,
-            whole!(|c| gnitz_sql::plan_subscription(c, &sn, &sql).await?),
-            |py, s| {
-                (
-                    s.upstream.tid,
-                    PySchema { rust: s.schema },
-                    pyo3::types::PyBytes::new(py, &s.spec),
-                )
-                    .into_py_any(py)
-            },
-        )
-    }
-
-    /// delta_bootstrap(view_id, schema, spec=None) -> (rows, cursor)
-    ///
-    /// The view's whole current value, and the cursor `delta_poll` continues
-    /// from. Under a `subscription`'s `spec` and `schema` it is what the
-    /// subscription keeps of the view; every later `delta_poll` of that copy
-    /// takes the same two.
-    #[pyo3(signature = (view_id, schema, spec = None))]
-    fn delta_bootstrap(
-        slf: &Bound<'_, Self>,
-        view_id: u64,
-        schema: PySchema,
-        spec: Option<Vec<u8>>,
-    ) -> PyResult<Py<PyAny>> {
-        let spec = spec.unwrap_or_else(whole_view);
-        Self::run(
-            slf,
-            single!(|c| c.delta_read(view_id, None, &schema.rust, &spec)),
-            delta,
-        )
-    }
-
-    /// delta_poll(view_id, schema, cursor, spec=None) -> (rows, cursor)
-    ///
-    /// The view's deltas since `cursor`, and the cursor past them: every push
-    /// acknowledged before the call is in them. Raises
-    /// `GnitzDeltaExpiredError` for a cursor whose rounds are gone, or that is
-    /// another boot's, another relation's or another `spec`'s: bootstrap again.
-    #[pyo3(signature = (view_id, schema, cursor, spec = None))]
-    fn delta_poll(
-        slf: &Bound<'_, Self>,
-        view_id: u64,
-        schema: PySchema,
-        cursor: (u64, u64),
-        spec: Option<Vec<u8>>,
-    ) -> PyResult<Py<PyAny>> {
-        let cursor = DeltaCursor::from_pair(cursor.0, cursor.1)
-            .ok_or_else(|| PyValueError::new_err("a delta cursor at tick 0 continues no round; bootstrap"))?;
-        let spec = spec.unwrap_or_else(whole_view);
-        Self::run(
-            slf,
-            single!(|c| c.delta_read(view_id, Some(cursor), &schema.rust, &spec)),
-            delta,
-        )
-    }
-
-    /// subscribe(view_id, schema, cursor=None, spec=None) -> (int, ScanResult, (int, int))
-    ///
-    /// A delta read after `cursor` — whole with none — that stays subscribed
-    /// from the cursor it answers with. `sync` answers with the deltas since.
-    #[pyo3(signature = (view_id, schema, cursor = None, spec = None))]
-    fn subscribe(
-        slf: &Bound<'_, Self>,
-        view_id: u64,
-        schema: PySchema,
-        cursor: Option<(u64, u64)>,
-        spec: Option<Vec<u8>>,
-    ) -> PyResult<Py<PyAny>> {
-        let cursor = match cursor {
-            Some((tag, tick)) => Some(
-                DeltaCursor::from_pair(tag, tick)
-                    .ok_or_else(|| PyValueError::new_err("a delta cursor at tick 0 continues no round; bootstrap"))?,
-            ),
-            None => None,
-        };
-        let spec = spec.unwrap_or_else(whole_view);
-        Self::run(
-            slf,
-            whole!(|c| c.subscribe(view_id, cursor, &schema.rust, &spec).await?),
-            |py, (id, rows, cursor)| (id, scan_result(py, rows)?, cursor.pair()).into_py_any(py),
-        )
-    }
-
-    /// unsubscribe(sub) -> None
-    ///
-    /// End a subscription: no `sync` reports it again, and the next one tells
-    /// the server. An id this client does not hold is ignored.
-    fn unsubscribe(slf: &Bound<'_, Self>, sub: u64) -> PyResult<Py<PyAny>> {
-        Self::run(slf, whole!(|c| c.unsubscribe(sub)), none)
+        Self::read(slf, target_id, schema, ReadSpec::all_rows(ReadBound::None))
     }
 
     /// scan_many(pairs) -> list[ScanResult]
@@ -531,8 +337,8 @@ impl PyClient {
                 c.scan_many(&scans)
             }),
             |py, replies| {
-                let results: PyResult<Vec<_>> = replies.into_iter().map(|reply| scan_result(py, reply)).collect();
-                results?.into_py_any(py)
+                let results = replies.into_iter().map(|reply| scan_result(py, reply));
+                value(py, results.collect::<PyResult<Vec<_>>>()?)
             },
         )
     }
@@ -542,12 +348,8 @@ impl PyClient {
     /// The rows keyed `pk` — a single-column key's value, or a compound key's
     /// tuple of column values in PK order — read where `scan` reads.
     fn seek(slf: &Bound<'_, Self>, table_id: u64, schema: PySchema, pk: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let spec = pk_point_spec(&schema.rust, &pk)?;
-        Self::run(
-            slf,
-            single!(|c| c.scan_spec_local_first(table_id, spec, &schema.rust)),
-            scanned,
-        )
+        let keys = py_pks_to_column(&schema.rust, std::slice::from_ref(&pk))?.keys();
+        Self::read(slf, table_id, schema, ReadSpec::all_rows(ReadBound::PkSet(keys)))
     }
 
     /// seek_by_index(table_id, schema, col_indices, key_vals) -> ScanResult.
@@ -562,11 +364,9 @@ impl PyClient {
         col_indices: Vec<u32>,
         key_vals: Bound<'_, PyList>,
     ) -> PyResult<Py<PyAny>> {
-        let cols = PkColList::checked(&col_indices, schema.rust.columns().len()).map_err(|rule| {
-            PyValueError::new_err(format!(
-                "seek_by_index: {}",
-                rule.for_role(gnitz_wire::PkListRole::ColumnList)
-            ))
+        let columns = schema.rust.columns();
+        let cols = PkColList::checked(&col_indices, columns.len()).map_err(|rule| {
+            PyValueError::new_err(format!("seek_by_index: {}", rule.for_role(PkListRole::ColumnList)))
         })?;
         if !(1..=col_indices.len()).contains(&key_vals.len()) {
             return Err(PyValueError::new_err(format!(
@@ -578,21 +378,16 @@ impl PyClient {
         let keys = col_indices
             .iter()
             .zip(key_vals.iter())
-            .map(|(&c, v)| py_key_image(&schema.rust.columns()[c as usize], &v))
+            .map(|(&c, v)| py_key_image(&columns[c as usize], &v))
             .collect::<PyResult<Vec<u128>>>()?;
         let (&last, eq) = keys.split_last().expect("at least one key value");
         let range = KeyRange::point(cols, eq, last);
-        if !range.is_exact(|c| schema.rust.columns()[c as usize].is_nullable) {
+        if !range.is_exact(|c| columns[c as usize].is_nullable) {
             return Err(PyValueError::new_err(
                 "seek_by_index: the key values stop short of a nullable column, whose NULL rows no walk reaches",
             ));
         }
-        let spec = ReadSpec::all_rows(ReadBound::Range(range));
-        Self::run(
-            slf,
-            single!(|c| c.scan_spec_local_first(table_id, spec, &schema.rust)),
-            scanned,
-        )
+        Self::read(slf, table_id, schema, ReadSpec::all_rows(ReadBound::Range(range)))
     }
 
     /// execute_sql(sql) -> list of result dicts
@@ -601,12 +396,100 @@ impl PyClient {
     /// planned and answered against the local copy; every other statement, and
     /// every read of a relation the copy does not hold, runs on the connection.
     fn execute_sql(slf: &Bound<'_, Self>, sql: String) -> PyResult<Py<PyAny>> {
-        let sn = Self::schema_name(slf)?;
+        let sn = Self::schema_name(slf);
+        Self::run(slf, whole!(|c| gnitz_sql::execute(c, &sn, &sql).await?), sql_results)
+    }
+
+    // ----- Delta feeds -----
+
+    /// subscription(sql) -> (view_id, schema, spec)
+    ///
+    /// Plan `sql`, one `SELECT` over one view with a delta feed, as what
+    /// `delta_read` and `subscribe` take to answer with only the rows and
+    /// columns it keeps: the view's id, the schema the replies come in, and the
+    /// spec to pass. The view's key rides along, hidden where the `SELECT` does
+    /// not name it. An aggregate, `DISTINCT`, `ORDER BY` and `LIMIT` are refused.
+    fn subscription(slf: &Bound<'_, Self>, sql: String) -> PyResult<Py<PyAny>> {
+        let sn = Self::schema_name(slf);
         Self::run(
             slf,
-            whole!(|c| gnitz_sql::execute(c, &sn, &sql).await?),
-            sql_results_to_py,
+            whole!(|c| gnitz_sql::plan_subscription(c, &sn, &sql).await?),
+            |py, s| (s.upstream.tid, PySchema { rust: s.schema }, PyBytes::new(py, &s.spec)).into_py_any(py),
         )
+    }
+
+    /// delta_read(view_id, schema, cursor=None, spec=None) -> (rows, cursor)
+    ///
+    /// With no `cursor`, the view's whole current value; with one, the view's
+    /// deltas since it, which carry every push acknowledged before the call.
+    /// Either way, the cursor past them, which the next read continues from.
+    /// Under a `subscription`'s `spec` and `schema` it is what the subscription
+    /// keeps of the view; every later read of that copy takes the same two.
+    /// Raises `GnitzDeltaExpiredError` for a cursor whose rounds are gone, or
+    /// that is another boot's, another relation's or another `spec`'s: read
+    /// the view whole again.
+    #[pyo3(signature = (view_id, schema, cursor = None, spec = None))]
+    fn delta_read(
+        slf: &Bound<'_, Self>,
+        view_id: u64,
+        schema: PySchema,
+        cursor: Option<(u64, u64)>,
+        spec: Option<Vec<u8>>,
+    ) -> PyResult<Py<PyAny>> {
+        let (cursor, spec) = delta_args(cursor, spec)?;
+        Self::run(
+            slf,
+            single!(|c| c.delta_read(view_id, cursor, &schema.rust, &spec)),
+            delta,
+        )
+    }
+
+    /// subscribe(view_id, schema, cursor=None, spec=None) -> (int, ScanResult, (int, int))
+    ///
+    /// A delta read after `cursor` — whole with none — that stays subscribed
+    /// from the cursor it answers with. `sync` answers with the deltas since.
+    #[pyo3(signature = (view_id, schema, cursor = None, spec = None))]
+    fn subscribe(
+        slf: &Bound<'_, Self>,
+        view_id: u64,
+        schema: PySchema,
+        cursor: Option<(u64, u64)>,
+        spec: Option<Vec<u8>>,
+    ) -> PyResult<Py<PyAny>> {
+        let (cursor, spec) = delta_args(cursor, spec)?;
+        Self::run(
+            slf,
+            whole!(|c| c.subscribe(view_id, cursor, &schema.rust, &spec).await?),
+            |py, (id, rows, cursor)| (id, scan_result(py, rows)?, cursor.pair()).into_py_any(py),
+        )
+    }
+
+    /// unsubscribe(sub) -> None
+    ///
+    /// End a subscription: no `sync` reports it again, and the next one tells
+    /// the server. An id this client does not hold is ignored.
+    fn unsubscribe(slf: &Bound<'_, Self>, sub: u64) -> PyResult<Py<PyAny>> {
+        Self::run(slf, whole!(|c| c.unsubscribe(sub)), none)
+    }
+
+    /// sync(wait=0.0) -> Synced
+    ///
+    /// Bring every subscription of this connection up to every push
+    /// acknowledged before the call. With nothing to report, the server holds
+    /// the reply for up to `wait` seconds. On an event loop the client's other
+    /// calls are answered meanwhile, and leave the sync held; a sync cancelled
+    /// before its answer arrives loses nothing, which the next sync brings.
+    ///
+    /// A subscription that ended and a view that failed carry the exception
+    /// in their entry's `error`. The call raises only for a poisoned store or
+    /// a `KeyboardInterrupt`.
+    #[pyo3(signature = (wait = 0.0))]
+    fn sync(slf: &Bound<'_, Self>, wait: f64) -> PyResult<Py<PyAny>> {
+        let wait = sync_wait(wait)?;
+        match &slf.get().mode {
+            Mode::Loop(handle) => handle.get().sync(slf.py(), wait),
+            Mode::Blocking(_) => Self::run(slf, whole!(|c| c.sync(wait).await?), synced),
+        }
     }
 
     // ----- Mirroring -----
@@ -637,9 +520,7 @@ impl PyClient {
     /// now.
     fn mirror_view(slf: &Bound<'_, Self>, name: String) -> PyResult<Py<PyAny>> {
         let view = Self::relation(slf, &name)?;
-        Self::run(slf, whole!(|c| c.mirror_view(&view).await?), |py, outcome| {
-            PyPollResult::new(py, outcome).into_py_any(py)
-        })
+        Self::run(slf, whole!(|c| c.mirror_view(&view).await?), polled)
     }
 
     /// mirror_subscription(alias, sql) -> PollResult
@@ -655,11 +536,11 @@ impl PyClient {
     /// one view. `sync` advances an alias with the mirrored views, and may
     /// plan `sql` again.
     fn mirror_subscription(slf: &Bound<'_, Self>, alias: String, sql: String) -> PyResult<Py<PyAny>> {
-        let sn = Self::schema_name(slf)?;
+        let sn = Self::schema_name(slf);
         Self::run(
             slf,
             whole!(|c| gnitz_sql::mirror_subscription(c, &sn, &alias, &sql).await?),
-            |py, outcome| PyPollResult::new(py, outcome).into_py_any(py),
+            polled,
         )
     }
 
@@ -667,34 +548,6 @@ impl PyClient {
     /// later read of it is delegated upstream.
     fn forget_view(slf: &Bound<'_, Self>, view_id: u64) -> PyResult<Py<PyAny>> {
         Self::run(slf, whole!(|c| c.forget_view(view_id).await?), none)
-    }
-
-    /// sync(wait=0.0) -> Synced
-    ///
-    /// Bring every subscription of this connection up to every push
-    /// acknowledged before the call. With nothing to report, the server holds
-    /// the reply for up to `wait` seconds. On an event loop the client's other
-    /// calls are answered meanwhile, and leave the sync held; a sync cancelled
-    /// before its answer arrives loses nothing, which the next sync brings.
-    ///
-    /// A subscription that ended and a view that failed carry the exception
-    /// in their entry's `error`. The call raises only for a poisoned store or
-    /// a `KeyboardInterrupt`.
-    #[pyo3(signature = (wait = 0.0))]
-    fn sync(slf: &Bound<'_, Self>, wait: f64) -> PyResult<Py<PyAny>> {
-        let wait = sync_wait(wait)?;
-        let convert = |py: Python<'_>, synced: Synced| PySynced::new(py, synced)?.into_py_any(py);
-        // On an event loop the client is free while the server holds the
-        // sync: its answer has no place among the replies.
-        if let Mode::Loop(handle) = slf.try_borrow_mut()?.mode() {
-            return handle.submit_then(
-                slf.py(),
-                move |c| c.begin_sync(wait),
-                |c, synced| Box::pin(async move { Ok(Sent::ready(Ok(c.finish_sync(synced).await?))) }),
-                convert,
-            );
-        }
-        Self::run(slf, whole!(|c| c.sync(wait).await?), convert)
     }
 
     /// Make every copy and its cursor durable. A failure leaves the store
@@ -716,7 +569,7 @@ impl PyClient {
     /// Every registration this client holds, valid copy or not — wider than the
     /// views `cursor` answers for by the ones a poll has yet to seed.
     fn mirrored_ids(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        Self::peek(slf, |c| c.mirrored_ids(), |py, ids| ids.into_py_any(py))
+        Self::peek(slf, |c| c.mirrored_ids(), value)
     }
 
     /// cursor(view_id) -> (tag, tick) | None
@@ -725,18 +578,14 @@ impl PyClient {
     /// valid copy. A discarded copy is told by `PollResult.reseeded`, never by
     /// its cursor.
     fn cursor(slf: &Bound<'_, Self>, view_id: u64) -> PyResult<Py<PyAny>> {
-        Self::peek(
-            slf,
-            move |c| c.cursor_of(view_id).map(DeltaCursor::pair),
-            |py, cursor| cursor.into_py_any(py),
-        )
+        Self::peek(slf, move |c| c.cursor_of(view_id).map(DeltaCursor::pair), value)
     }
 
     /// The message that poisoned this client's copy, or `None`. Answers on a
     /// poisoned store — diagnosing one is what it is for.
     #[getter]
     fn mirror_poisoned(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        Self::peek(slf, |c| c.mirror_poisoned(), |py, why| why.into_py_any(py))
+        Self::peek(slf, |c| c.mirror_poisoned(), value)
     }
 
     /// reconnect(target)
@@ -749,174 +598,14 @@ impl PyClient {
     }
 }
 
-/// One `SqlResult` per statement as a dict — the shape every SQL entry point
-/// hands back.
-fn sql_results_to_py(py: Python<'_>, results: Vec<SqlResult>) -> PyResult<Py<PyAny>> {
-    let k_type = pyo3::intern!(py, "type");
-    let dicts = results.into_iter().map(|r| {
-        let d = PyDict::new(py);
-        match r {
-            SqlResult::Ddl { .. } => {
-                d.set_item(k_type, pyo3::intern!(py, "Ddl"))?;
-            }
-            SqlResult::RowsAffected { count, .. } => {
-                d.set_item(k_type, pyo3::intern!(py, "RowsAffected"))?;
-                d.set_item(pyo3::intern!(py, "count"), count)?;
-            }
-            SqlResult::Rows(reply) => {
-                d.set_item(k_type, pyo3::intern!(py, "Rows"))?;
-                d.set_item(pyo3::intern!(py, "rows"), scan_result(py, reply)?)?;
-            }
-            SqlResult::TransactionStarted => {
-                d.set_item(k_type, pyo3::intern!(py, "TransactionStarted"))?;
-            }
-            SqlResult::TransactionCommitted { lsn } => {
-                d.set_item(k_type, pyo3::intern!(py, "TransactionCommitted"))?;
-                d.set_item(pyo3::intern!(py, "lsn"), lsn)?;
-            }
-            SqlResult::TransactionRolledBack => {
-                d.set_item(k_type, pyo3::intern!(py, "TransactionRolledBack"))?;
-            }
-        }
-        Ok(d)
-    });
-    dicts.collect::<PyResult<Vec<_>>>()?.into_py_any(py)
-}
-
 /// The server a connection dials: `target`, or `GNITZ_TARGET` where it is not
 /// given.
-fn resolve_target(target: Option<String>) -> PyResult<String> {
+pub(crate) fn resolve_target(target: Option<String>) -> PyResult<String> {
     target
         .or_else(|| std::env::var("GNITZ_TARGET").ok().filter(|t| !t.is_empty()))
         .ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(
-                "no target: pass the server's socket path or tls:// target, or set GNITZ_TARGET",
-            )
+            PyValueError::new_err("no target: pass the server's socket path or tls:// target, or set GNITZ_TARGET")
         })
-}
-
-// ---------------------------------------------------------------------------
-// The blocking class
-// ---------------------------------------------------------------------------
-
-/// A connection whose verbs return once they are answered.
-#[pyclass(name = "GnitzClient", extends = PyClient)]
-pub struct PyGnitzClient;
-
-#[pymethods]
-impl PyGnitzClient {
-    #[new]
-    #[pyo3(signature = (target = None, schema = "public"))]
-    fn new(py: Python<'_>, target: Option<String>, schema: &str) -> PyResult<PyClassInitializer<Self>> {
-        let target = resolve_target(target)?;
-        let base = PyClient {
-            mode: Mutex::new(Mode::Blocking(Box::new(Blocking::connect(py, &target)?))),
-            schema: schema.to_string(),
-        };
-        Ok(PyClassInitializer::from(base).add_subclass(PyGnitzClient))
-    }
-
-    /// Close the connection, checkpointing and releasing the mirror store first,
-    /// and raise if that final checkpoint failed; the connection closes either
-    /// way. Idempotent. The GIL goes down for it: the checkpoint is fsync-bound.
-    fn close(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<()> {
-        let base: &mut PyClient = slf.as_super();
-        match std::mem::replace(base.mode(), Mode::Closed) {
-            Mode::Blocking(mut blocking) => blocking.call(py, async |c| c.close_mirror().await),
-            Mode::Closed | Mode::Loop(_) => Ok(()),
-        }
-    }
-
-    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __exit__(
-        slf: PyRefMut<'_, Self>,
-        py: Python<'_>,
-        _exc_type: Py<PyAny>,
-        _exc_val: Py<PyAny>,
-        _exc_tb: Py<PyAny>,
-    ) -> PyResult<bool> {
-        Self::close(slf, py)?;
-        Ok(false)
-    }
-
-    /// A context manager inside which every verb returns a `Pending`, and one
-    /// that is a single request returns it with the request queued — so the
-    /// block's requests share round trips. The block's name is the client
-    /// itself, typed as what it returns there:
-    ///
-    /// ```python
-    /// with client.pipeline() as piped:
-    ///     lsns = [piped.push(tid, b) for b in batches]
-    /// print([lsn.result() for lsn in lsns])
-    /// ```
-    fn pipeline(slf: &Bound<'_, Self>) -> PyPipeline {
-        PyPipeline { client: slf.as_super().clone().unbind() }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The event-loop class
-// ---------------------------------------------------------------------------
-
-/// A connection on the running asyncio event loop: every verb submits when
-/// called and returns a future of its result. It is connected when built, so
-/// awaiting it yields itself, and `async with` closes it on exit.
-#[pyclass(name = "AsyncGnitzClient", extends = PyClient)]
-pub struct PyAsyncClient;
-
-impl PyAsyncClient {
-    fn on_loop<R>(slf: &Bound<'_, Self>, f: impl FnOnce(&LoopHandle) -> PyResult<R>) -> PyResult<R> {
-        match slf.as_super().try_borrow_mut()?.mode() {
-            Mode::Loop(handle) => f(handle),
-            Mode::Closed | Mode::Blocking(_) => unreachable!("this class is built on an event loop and stays there"),
-        }
-    }
-}
-
-#[pymethods]
-impl PyAsyncClient {
-    /// Connect on the calling thread, and serve on the running loop.
-    #[new]
-    #[pyo3(signature = (target = None, schema = "public"))]
-    fn new(py: Python<'_>, target: Option<String>, schema: &str) -> PyResult<PyClassInitializer<Self>> {
-        let target = resolve_target(target)?;
-        let base = PyClient {
-            mode: Mutex::new(Mode::Loop(LoopHandle::connect(py, &target)?)),
-            schema: schema.to_string(),
-        };
-        Ok(PyClassInitializer::from(base).add_subclass(PyAsyncClient))
-    }
-
-    /// Checkpoint and release the mirror store behind every call already
-    /// made, then close the connection, whether or not that checkpoint failed.
-    /// Awaits to `None`; idempotent.
-    fn aclose(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        Self::on_loop(slf, |handle| {
-            handle.finish(slf.py(), whole!(|c| c.close_mirror().await?))
-        })
-    }
-
-    fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        Self::on_loop(slf, |handle| handle.settled(slf.py(), slf.clone().into_any().unbind()))
-    }
-
-    /// `await connect(p)`, beside `async with connect(p)`.
-    fn __await__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        Self::__aenter__(slf)?.call_method0(slf.py(), pyo3::intern!(slf.py(), "__await__"))
-    }
-
-    /// `aclose()`, whose `None` lets the block's exception through.
-    fn __aexit__(
-        slf: &Bound<'_, Self>,
-        _exc_type: Py<PyAny>,
-        _exc_val: Py<PyAny>,
-        _exc_tb: Py<PyAny>,
-    ) -> PyResult<Py<PyAny>> {
-        Self::aclose(slf)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -925,7 +614,7 @@ impl PyAsyncClient {
 
 /// The context manager `transaction()` returns: entering it opens the client's
 /// transaction and hands back the client.
-#[pyclass(name = "Txn", frozen, generic)]
+#[pyclass(name = "Txn", frozen, generic, module = "gnitz._native")]
 pub struct PyTxn {
     client: Py<PyClient>,
 }
@@ -933,17 +622,21 @@ pub struct PyTxn {
 #[pymethods]
 impl PyTxn {
     fn __enter__(&self, py: Python<'_>) -> PyResult<Py<PyClient>> {
-        let mut client = self.client.bind(py).try_borrow_mut()?;
-        client.blocking()?.client.txn_begin().map_err(client_err)?;
+        self.client
+            .get()
+            .blocking(|blocking| blocking.client.txn_begin().map_err(client_err))?;
         Ok(self.client.clone_ref(py))
     }
 
     /// Ends the transaction and lets the block's exception through.
     fn __exit__(&self, py: Python<'_>, exc_type: Py<PyAny>, _exc_val: Py<PyAny>, _exc_tb: Py<PyAny>) -> PyResult<bool> {
-        let mut client = self.client.bind(py).try_borrow_mut()?;
         let clean = exc_type.is_none(py);
-        match client.blocking() {
-            Ok(blocking) => blocking.call(py, async |c| end_txn(c, clean).await)?,
+        let ended = self
+            .client
+            .get()
+            .blocking(|blocking| Ok(blocking.call(py, async |c| end_txn(c, clean).await)));
+        match ended {
+            Ok(ended) => ended?,
             // The block's own exception outranks a client it left unusable.
             Err(_) if !clean => {}
             Err(e) => return Err(e),
@@ -952,10 +645,9 @@ impl PyTxn {
     }
 
     fn __aenter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let client = self.client.bind(py);
-        self.on_loop(client)?;
         let entered = self.client.clone_ref(py);
-        PyClient::run(client, whole!(|c| c.txn_begin()?), move |_, ()| Ok(entered.into_any()))
+        let begin = verb(whole!(|c| c.txn_begin()?), move |_, ()| Ok(entered.into_any()));
+        self.client.get().on_loop()?.submit(py, begin)
     }
 
     /// As `__exit__`, awaited.
@@ -966,21 +658,17 @@ impl PyTxn {
         _exc_val: Py<PyAny>,
         _exc_tb: Py<PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let client = self.client.bind(py);
-        self.on_loop(client)?;
+        let core = self.client.get().on_loop()?;
         let clean = exc_type.is_none(py);
-        if !clean {
-            if let Mode::Loop(handle) = client.try_borrow_mut()?.mode() {
-                // The block's own exception outranks a client it closed, whose
-                // transaction closed with it.
-                if handle.closing() {
-                    return handle.settled(py, false.into_py_any(py)?);
-                }
-            }
+        // The block's own exception outranks a client it closed, whose
+        // transaction closed with it.
+        if !clean && core.closing() {
+            return core.settled(py, false.into_py_any(py)?);
         }
-        PyClient::run(client, whole!(|c| end_txn(c, clean).await?), |py, ()| {
-            false.into_py_any(py)
-        })
+        core.submit(
+            py,
+            verb(whole!(|c| end_txn(c, clean).await?), |py, ()| value(py, false)),
+        )
     }
 }
 
@@ -993,16 +681,4 @@ async fn end_txn(c: &mut GnitzClient, clean: bool) -> Result<(), ClientError> {
         c.txn_rollback()?;
     }
     Ok(())
-}
-
-impl PyTxn {
-    /// `async with` is for a client on an event loop.
-    fn on_loop(&self, client: &Bound<'_, PyClient>) -> PyResult<()> {
-        match client.try_borrow_mut()?.mode() {
-            Mode::Blocking(_) => Err(PyTypeError::new_err(
-                "this client blocks; enter its transaction with `with`",
-            )),
-            Mode::Closed | Mode::Loop(_) => Ok(()),
-        }
-    }
 }

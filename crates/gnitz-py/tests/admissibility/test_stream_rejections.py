@@ -30,7 +30,7 @@ def test_no_binary_read_verb_serves_a_stream(conn):
         lambda: conn.seek(tid, schema, 1),
         lambda: conn.seek_by_index(tid, schema, [1], [0]),
         lambda: conn.scan_many([(tid, schema)]),
-        lambda: conn.delta_bootstrap(tid, schema),
+        lambda: conn.delta_read(tid, schema),
     ):
         with pytest.raises(gnitz.GnitzRefusedError, match="a stream holds no rows and cannot be read"):
             verb()

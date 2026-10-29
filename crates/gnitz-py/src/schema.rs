@@ -21,7 +21,7 @@ use gnitz_wire::{ColType, ColumnDef};
 /// `c.name` would hand back a different object each time. Interned, every read
 /// returns the identical object — the one a dict keyed by that name, or a
 /// `**kwargs` splat built from it, hits on by pointer.
-#[pyclass(name = "ColumnDef", frozen)]
+#[pyclass(name = "ColumnDef", frozen, module = "gnitz")]
 pub struct PyColumnDef {
     #[pyo3(get)]
     name: Py<PyString>,
@@ -104,7 +104,7 @@ impl PyColumnDef {
 ///
 /// The PK is `pk_indices`, held in **sort order** — e.g. `pk_indices=[2, 1]`
 /// sorts by col 2 first, then col 1. Order matters for seek/range semantics.
-#[pyclass(name = "Schema", frozen, from_py_object)]
+#[pyclass(name = "Schema", frozen, from_py_object, module = "gnitz")]
 #[derive(Clone)]
 pub struct PySchema {
     pub(crate) rust: Arc<Schema>,
@@ -142,16 +142,4 @@ impl PySchema {
             self.rust.columns().len()
         )
     }
-}
-
-/// sys_schema(table_id) -> Schema: the schema of system table `table_id`, the
-/// layout a read of it must name.
-#[pyfunction]
-pub(crate) fn sys_schema(table_id: u64) -> PyResult<PySchema> {
-    if gnitz_wire::sys_family_index(table_id).is_none() {
-        return Err(PyValueError::new_err(format!("{table_id} is not a system table id")));
-    }
-    Ok(PySchema {
-        rust: Arc::clone(gnitz_core::sys_schema(table_id)),
-    })
 }

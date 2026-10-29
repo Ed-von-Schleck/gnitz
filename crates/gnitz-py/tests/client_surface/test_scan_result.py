@@ -117,9 +117,9 @@ def test_the_row_object_keeps_only_the_names_it_answers(scans):
     surface already states by spelling the row weight `_weight`.
 
     So a column named `weight` *is* `row.weight`, and `row._weight` is the Z-set
-    weight. A name the row object itself answers (`_fields`, `_asdict`,
-    `_weight`) keeps that meaning; every other column, underscore-prefixed or
-    not, is an attribute.
+    weight. A name the row object itself answers (`_fields`, `_keys`,
+    `_asdict`, `_weight`) keeps that meaning; every other column,
+    underscore-prefixed or not, is an attribute.
     """
     row = next(iter(scans["under"]))
     assert row.weight == row["weight"] == 77
@@ -127,6 +127,18 @@ def test_the_row_object_keeps_only_the_names_it_answers(scans):
     assert row._weight == 1                      # the Z-set weight, not 77
     assert row._fields == ("pk", "weight", "_x")
     assert row._asdict() == {"pk": 1, "weight": 77, "_x": 5}
+
+
+def test_a_name_only_the_row_class_answers_is_a_column():
+    """An attribute is what a row instance answers, not its class: `mro` is the
+    metatype's, so a column of that name is `row.mro`. A dunder column is read
+    by name alone, since building the row class claims some of those names
+    (`__qualname__`, `__classcell__`) for itself."""
+    schema = Schema([ColumnDef(n, TypeCode.I64) for n in ("id", "mro", "__qualname__", "__classcell__")], [0])
+    (row,) = ZSetBatch(schema).extend([{"id": 1, "mro": 2, "__qualname__": 3, "__classcell__": 4}]).rows()
+    assert row.mro == row["mro"] == 2
+    assert (row["__qualname__"], row["__classcell__"]) == (3, 4)
+    assert type(row).__module__ == "gnitz"
 
 
 _ID = ColumnDef("id", TypeCode.I64)

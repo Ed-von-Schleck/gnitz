@@ -14,9 +14,9 @@ variable is sent).
 
 A verb submits when called and returns its future; calls run in the order they
 were made, one at a time. A verb that is one request — ``push``, ``delete``,
-``scan``, ``seek``, ``seek_by_index``, ``scan_many`` — is done with the
-connection once the request is sent, so those started together share a round
-trip::
+``scan``, ``seek``, ``seek_by_index``, ``scan_many``, ``delta_read`` — is done
+with the connection once the request is sent, so those started together share a
+round trip::
 
     lsns = await asyncio.gather(conn.push(table_id, batch1),
                                 conn.push(table_id, batch2))

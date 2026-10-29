@@ -18,10 +18,10 @@ def test_a_family_reads_as_the_scan_of_its_id(client):
     """The SQL name and the family's id are one relation: every row once, in
     any spelling of the schema."""
     _three_tables(client)
-    want = bag(client.scan(gnitz.TABLE_TAB, gnitz.sys_schema(gnitz.TABLE_TAB)), "table_id", "name")
+    want = bag(scanned(client, "_system.tables"), "table_id", "name")
+    assert (client.resolve_table("_system.tables")[0], "tables") in want
     assert family(client, "tables", "table_id", "name") == want
     assert bag(rows(client, "SELECT table_id, name FROM _SYSTEM.Tables")) == want
-    assert bag(scanned(client, "_system.tables"), "table_id", "name") == want
     assert set(want.values()) == {1}
     assert {name for (tid, name) in want if tid < gnitz.FIRST_USER_TABLE_ID} == {
         "schemas", "tables", "views", "columns", "indices", "circuits", "sequences"}

@@ -42,7 +42,7 @@ class Subscriber:
             vid, self.schema, self.spec = client.subscription(sql)
             assert vid == self.vid
         self.copy = {}
-        self.cursor = (0, 0)
+        self.cursor = None
 
     def _bag(self, rows):
         return bag(rows) if self.sql is not None else bag(rows.including_hidden())
@@ -55,14 +55,15 @@ class Subscriber:
         return rows
 
     def bootstrap(self):
-        rows, self.cursor = self.client.delta_bootstrap(self.vid, self.schema, self.spec)
-        # A bootstrap replaces state; it does not add to it.
-        self.copy = self._bag(rows)
+        # A bootstrap replaces state, so it is a poll of an empty copy from no
+        # cursor, which reads the view whole.
+        self.copy, self.cursor = {}, None
+        return self.poll()
 
     def poll(self):
-        # No hand-written tag check: `delta_poll` refuses a foreign cursor
+        # No hand-written tag check: `delta_read` refuses a foreign cursor
         # itself, so a reply that arrives here is one this copy may apply.
-        rows, self.cursor = self.client.delta_poll(self.vid, self.schema, self.cursor, self.spec)
+        rows, self.cursor = self.client.delta_read(self.vid, self.schema, self.cursor, self.spec)
         return self._apply(rows)
 
     def subscribe(self):

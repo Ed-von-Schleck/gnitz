@@ -161,11 +161,11 @@ async def test_a_delta_feed_on_the_loop(aconn, client):
     churn(client, 1, 50)
 
     vid, schema = await aconn.resolve_table("f")
-    seed, cursor = await aconn.delta_bootstrap(vid, schema)
+    seed, cursor = await aconn.delta_read(vid, schema)
     assert bag(seed.including_hidden()) == bag(client.scan(vid, schema).including_hidden())
 
     churn(client, 51, 100)
-    delta, cursor2 = await aconn.delta_poll(vid, schema, cursor)
+    delta, cursor2 = await aconn.delta_read(vid, schema, cursor)
     assert cursor2[0] == cursor[0] and cursor2[1] > cursor[1]
     copy = bag([*seed.including_hidden(), *delta.including_hidden()])
     assert copy == bag(client.scan(vid, schema).including_hidden())
@@ -318,11 +318,22 @@ def test_a_pipeline_that_raises_waits_for_nothing(client):
                 pass
 
 
+def test_a_pipeline_that_closes_its_client_raises_its_own_exception(server):
+    """A block's exception outranks the client it left unusable, as a
+    transaction block's does."""
+    conn = gnitz.connect(server)
+    with pytest.raises(RuntimeError, match="boom"):
+        with conn.pipeline():
+            conn.close()
+            raise RuntimeError("boom")
+
+
 def test_a_pipeline_past_the_in_flight_cap_makes_room(client):
     """More requests than a connection may hold in flight: the pipeline waits
     for room instead of taking the refusal a connection raises at the cap."""
+    schemas = client.resolve_table(SCHEMAS)
     with client.pipeline():
-        scans = [client.scan(*SCHEMAS) for _ in range(gnitz.MAX_IN_FLIGHT + 200)]
+        scans = [client.scan(*schemas) for _ in range(gnitz.MAX_IN_FLIGHT + 200)]
     sizes = {len(s.result()) for s in scans}
     assert len(sizes) == 1 and sizes.pop() > 0
 

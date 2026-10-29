@@ -40,8 +40,8 @@ def test_a_qualified_name_reaches_a_relation_of_another_schema(server, client, i
 
         # A view placed beside its source, by a connection in neither's schema.
         view = f"{client.schema}.v"
-        vid = public.create_view(view, items)
-        assert client.resolve_table("v")[0] == vid
+        public.execute_sql(f"CREATE VIEW {view} AS SELECT * FROM {items}")
+        assert client.resolve_table("v")[0] == public.resolve_table(view)[0]
         assert bag(rows(client, "SELECT pk, val FROM v")) == want
         public.drop_view(view)
         public.drop_table(items)
