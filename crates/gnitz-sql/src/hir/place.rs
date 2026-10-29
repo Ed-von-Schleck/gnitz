@@ -2,7 +2,7 @@
 //! place each conjunct as low as it is exact — in an input, in the join's keys, or
 //! in a `Filter` above the join.
 
-use super::{cross_comparison, side, HirCol, HirExpr, JoinClass, JoinType, KeyPair, RelExpr, Side};
+use super::{cross_comparison, side, HirCol, HirExpr, JoinClass, JoinPlan, JoinType, KeyPair, RelExpr, Side};
 use crate::error::GnitzSqlError;
 use crate::ir::BinOp;
 use crate::rules::{reject_arity, reject_float_keys};
@@ -27,9 +27,9 @@ impl RelExpr {
         let on = on.into_iter().flat_map(HirExpr::conjuncts).collect();
         let placed = place(&left, &right, kind, JoinClass::default(), on, Origin::On)?;
         reject_arity("join key list", placed.class.arity(), gnitz_wire::PK_LIST_MAX_COLS)?;
-        placed.class.plan(kind)?;
+        let plan = placed.class.plan(kind)?;
         reject_outer_with_residual(kind, &placed.above)?;
-        placed.build(&left, &right, kind)
+        placed.build(&left, &right, kind, plan)
     }
 
     /// `input` filtered by `preds`, each conjunct placed as low as it is exact.
@@ -42,8 +42,10 @@ impl RelExpr {
             RelExpr::Filter { input: below, preds: first } => {
                 RelExpr::filter(Rc::clone(below), first.iter().cloned().chain(preds).collect())
             }
-            RelExpr::Join { left, right, kind, on } => {
-                place(left, right, *kind, on.clone(), preds, Origin::Filter)?.build(left, right, *kind)
+            RelExpr::Join { left, right, kind, on, .. } => {
+                let placed = place(left, right, *kind, on.clone(), preds, Origin::Filter)?;
+                let plan = placed.class.plan(*kind)?;
+                placed.build(left, right, *kind, plan)
             }
             _ => Ok(Rc::new(RelExpr::Filter { input, preds })),
         }
@@ -59,15 +61,21 @@ struct Placed {
 }
 
 impl Placed {
-    /// The join node, refused where its keys and `kind` plan no join.
-    fn build(self, left: &Rc<RelExpr>, right: &Rc<RelExpr>, kind: JoinType) -> Result<Rc<RelExpr>, GnitzSqlError> {
-        self.class.plan(kind)?;
+    /// The join node, planned as `plan`, the plan of its keys and `kind`.
+    fn build(
+        self,
+        left: &Rc<RelExpr>,
+        right: &Rc<RelExpr>,
+        kind: JoinType,
+        plan: JoinPlan,
+    ) -> Result<Rc<RelExpr>, GnitzSqlError> {
         let [l, r] = self.below;
         let join = Rc::new(RelExpr::Join {
             left: RelExpr::filter(Rc::clone(left), l)?,
             right: RelExpr::filter(Rc::clone(right), r)?,
             kind,
             on: self.class,
+            plan,
         });
         Ok(match self.above.is_empty() {
             true => join,

@@ -68,12 +68,12 @@ pub(super) fn lower_join_view(
     [left, right]: [&Rc<RelExpr>; 2],
     kind: JoinType,
     class: &JoinClass,
+    plan: JoinPlan,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let mut refs = HashSet::new();
     above.refs(&mut refs);
 
     let mut cb = Circuit::default();
-    let plan = class.plan(kind)?;
     let out_key = out_key(plan, kind);
     let sides = emit_join_inputs(chain, &mut cb, &refs, [left, right], kind, class, plan)?;
 

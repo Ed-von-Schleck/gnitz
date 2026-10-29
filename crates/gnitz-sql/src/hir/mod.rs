@@ -261,6 +261,8 @@ pub(crate) enum RelExpr {
         /// The join's keys. Every other predicate was placed into an input or
         /// left in a `Filter` above the join as it was built.
         on: JoinClass,
+        /// `on.plan(kind)`, decided as the node is built.
+        plan: JoinPlan,
     },
     /// A GROUP BY / aggregate reduce: the group columns, then the aggregate
     /// columns the finalize `Project` above renders.
@@ -798,7 +800,7 @@ impl RelExpr {
                     SetOpKind::Intersect => kept(left).or_else(|| kept(right)),
                 }
             }
-            RelExpr::Join { left, right, kind, on } => match kind {
+            RelExpr::Join { left, right, kind, on, .. } => match kind {
                 // One output row per left row.
                 k if k.is_decorrelated() => left.unique_key(),
                 JoinType::Inner | JoinType::Left if on.side_unique(right, 1) => left.unique_key(),

@@ -254,8 +254,8 @@ fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, Gn
     let no_arm = || GnitzSqlError::Internal("HIR lowering has no body arm for this node".into());
     let mut pieces = match (above, core.as_ref()) {
         (None, _) if !preds.is_empty() => return Err(no_arm()),
-        (Some(above), RelExpr::Join { left, right, kind, on }) => {
-            return join::lower_join_view(chain, above, [left, right], *kind, on);
+        (Some(above), RelExpr::Join { left, right, kind, on, plan }) => {
+            return join::lower_join_view(chain, above, [left, right], *kind, on, *plan);
         }
         (Some(_), RelExpr::Reduce { input, group_cols, aggs }) => reduce::lower_reduce(chain, input, group_cols, aggs)?,
         (_, RelExpr::Ordered { input, partition, order, op }) => {
