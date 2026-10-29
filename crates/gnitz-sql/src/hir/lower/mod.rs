@@ -26,7 +26,7 @@ use super::{col_by_id, split_filter, AggCol, ColId, HirCol, HirExpr, ProjEntry, 
 use crate::agg::group_pk_def;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use crate::project::{compute_map, payload_program, ProjItem};
+use crate::project::{compute_map, payload_program};
 use chain::{EmitPieces, ViewChain};
 use gnitz_core::{PlannedView, RelDescriptor, Schema};
 use gnitz_expr::ReduceOutSlot;
@@ -114,7 +114,7 @@ impl Demand<'_> {
         node: gnitz_wire::NodeId,
         frame: &Frame,
     ) -> Result<(gnitz_wire::NodeId, Frame), GnitzSqlError> {
-        let filtered = emit_filter(cb, node, self.where_preds, frame)?;
+        let filtered = filter(cb, node, &frame.resolve_preds(self.where_preds)?, &frame.schema)?;
         project_front(cb, filtered, self.items, frame)
     }
 }
@@ -174,36 +174,10 @@ fn collect_live_cols<'a>(exprs: impl IntoIterator<Item = &'a HirExpr>, live: &mu
     }
 }
 
-/// The cheapest node producing `items` over `input`, whose key region the engine
-/// carries verbatim: the input itself, a copy list, or the payload expression map.
-fn emit_projection(
-    cb: &mut gnitz_wire::Circuit,
-    node: gnitz_wire::NodeId,
-    items: &[ProjItem],
-    out: &Schema,
-    input: &Schema,
-) -> Result<gnitz_wire::NodeId, GnitzSqlError> {
-    let k = input.pk_cols().len();
-    // A payload slot naming a key column is a second copy of a value the key
-    // region already carries; only the expression map can write one.
-    let payload: Option<Vec<u32>> = items[k..]
-        .iter()
-        .map(|i| {
-            i.passthrough_src()
-                .filter(|&c| !input.layout().is_pk_col(c))
-                .map(|c| c as u32)
-        })
-        .collect();
-    let Some(payload) = payload else {
-        return Ok(cb.map_expr(node, compute_map(payload_program(items, out, input)?, out)));
-    };
-    let identity =
-        items.len() == input.columns().len() && items.iter().enumerate().all(|(i, it)| it.passthrough_src() == Some(i));
-    Ok(if identity { node } else { cb.map(node, &payload) })
-}
-
-/// `items` over `input` with `input`'s PK pinned to the front — the linear
-/// projection.
+/// `items` over `input` with `input`'s PK pinned to the front, the linear
+/// projection, as the cheapest node producing them: the input itself, a copy
+/// list, or the payload expression map. The engine carries the key region
+/// verbatim through each.
 fn project_front(
     cb: &mut gnitz_wire::Circuit,
     node: gnitz_wire::NodeId,
@@ -211,7 +185,21 @@ fn project_front(
     input: &Frame,
 ) -> Result<(gnitz_wire::NodeId, Frame), GnitzSqlError> {
     let (items, out) = physical::physicalize_projection(items, input)?;
-    let node = emit_projection(cb, node, &items, &out.schema, &input.schema)?;
+    let input = &input.schema;
+    let k = input.pk_cols().len();
+    // A payload slot naming a key column is a second copy of a value the key
+    // region already carries; only the expression map can write one.
+    let payload: Option<Vec<u32>> = items[k..]
+        .iter()
+        .map(|i| i.as_col().filter(|&c| !input.layout().is_pk_col(c)).map(|c| c as u32))
+        .collect();
+    let Some(payload) = payload else {
+        let map = compute_map(payload_program(&items, &out.schema, input)?, &out.schema);
+        return Ok((cb.map_expr(node, map), out));
+    };
+    let identity =
+        items.len() == input.columns().len() && items.iter().enumerate().all(|(i, it)| it.as_col() == Some(i));
+    let node = if identity { node } else { cb.map(node, &payload) };
     Ok((node, out))
 }
 
@@ -227,7 +215,7 @@ pub(crate) fn lower(
     // A top-N carries its input's columns key first: the SELECT list is a
     // projection over it. A window body always ends in a projection.
     let rel = match rel.as_ref() {
-        RelExpr::Ordered { .. } => RelExpr::project(Rc::clone(&rel), RelExpr::passthrough_items(rel.cols())),
+        RelExpr::Ordered { .. } => RelExpr::project(Rc::clone(&rel), ProjEntry::passthroughs(rel.cols())),
         _ => rel,
     };
     let top = lower_body(&mut chain, &rel)?;
@@ -360,7 +348,7 @@ fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
         RelExpr::Distinct { .. } | RelExpr::SetOp { .. } | RelExpr::Ordered { .. } => Rc::clone(subtree),
         // The HIR spelling of `SELECT <live cols> FROM <subtree>`.
         _ => {
-            let items = RelExpr::passthrough_items(subtree.cols().into_iter().filter(|c| live.contains(&c.id)));
+            let items = ProjEntry::passthroughs(subtree.cols().into_iter().filter(|c| live.contains(&c.id)));
             RelExpr::project(Rc::clone(subtree), items)
         }
     }
@@ -378,14 +366,4 @@ fn filter(
         Some(prog) => Ok(cb.filter(node, prog.to_blob_bytes())),
         None => Ok(node),
     }
-}
-
-/// Resolve `preds` against `frame` and emit their AND over the already-emitted `node`.
-fn emit_filter(
-    cb: &mut gnitz_wire::Circuit,
-    node: gnitz_wire::NodeId,
-    preds: &[HirExpr],
-    frame: &Frame,
-) -> Result<gnitz_wire::NodeId, GnitzSqlError> {
-    filter(cb, node, &frame.resolve_preds(preds)?, &frame.schema)
 }

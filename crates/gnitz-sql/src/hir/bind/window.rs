@@ -42,16 +42,16 @@
 //! specification). An ordered specification also reads the rows of the
 //! partition before the changed one, and keeps one index entry per row of `W`.
 
-use super::bind::{bind_projection, place_order_keys, ItemLeaf};
-use super::{as_col, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr};
-use crate::agg::{agg_func_from_name, AggFunc};
-use crate::ast_util::{classify_agg_shape, single_part_ident, unknown_function, AggArg, CallSurface, PlainCall};
-use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, LeafBinder};
+use super::super::{ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr};
+use super::{bind_projection, place_order_keys, ItemLeaf};
+use crate::agg::{agg_func_from_name, AggArg, AggFunc};
+use crate::ast_util::{classify_agg_shape, single_part_ident, unknown_function, CallSurface, PlainCall};
+use crate::bind::{bind_conjuncts, bind_structural, LeafBinder};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, LeafTyping};
-use crate::rules::reject_float_key;
+use crate::rules::{find_unique_column, reject_float_key};
 use crate::tail::parse_order_key;
-use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
+use gnitz_wire::{ColType, ColumnDef, TypeCode};
 use sqlparser::ast::{
     Expr, Function, Ident, NamedWindowDefinition, NamedWindowExpr, Select, WindowFrame, WindowFrameBound,
     WindowFrameUnits, WindowSpec, WindowType,
@@ -140,12 +140,9 @@ impl Windows {
         if let Some(it) = self.w.iter().find(|it| it.expr == *e) {
             return it.out.id;
         }
-        let ty = e.infer_ty(leaf);
-        // A slot narrower than the register is written through a range check,
-        // which is NULL for a value past it.
-        let checked = FixedInt::from_type_code(ty.tc).is_some_and(|fi| !e.within(fi, leaf));
-        let nullable = checked || !e.never_null(leaf);
-        let name = as_col(e)
+        let (ty, nullable) = e.declared(leaf);
+        let name = e
+            .as_col()
             .and_then(|id| leaf.source_name(id))
             .unwrap_or_else(|| format!("_w{}", self.w.len()));
         let out = HirCol::new(ids.next(), ColumnDef::typed(name, ty, nullable));
@@ -407,21 +404,20 @@ pub(crate) fn ranking_names() -> impl Iterator<Item = &'static str> {
 fn classify_window_call(f: &Function) -> Result<(WinFunc, Option<&Expr>), GnitzSqlError> {
     let call = PlainCall::check(f, CallSurface::Window)?;
     let name = single_part_ident(&f.name).ok_or_else(|| unknown_function(f))?;
-    let ranking = RANKING_NAMES
-        .into_iter()
-        .find_map(|(n, f)| name.eq_ignore_ascii_case(n).then_some(f));
-    let Some(func) = ranking else {
-        if agg_func_from_name(name).is_none() {
-            return Err(GnitzSqlError::Rejected(format!(
-                "{}: not supported as a window function",
-                name.to_ascii_uppercase()
-            )));
+    match RANKING_NAMES.into_iter().find(|(n, _)| name.eq_ignore_ascii_case(n)) {
+        Some((_, func)) => {
+            call.args(&name.to_ascii_uppercase(), (0, Some(0)))?;
+            Ok((func, None))
         }
-        let (agg, arg) = classify_agg_shape(call)?;
-        return Ok((WinFunc::Agg(agg), arg));
-    };
-    call.args(&name.to_ascii_uppercase(), (0, Some(0)))?;
-    Ok((func, None))
+        None if agg_func_from_name(name).is_some() => {
+            let (agg, arg) = classify_agg_shape(call)?;
+            Ok((WinFunc::Agg(agg), arg))
+        }
+        None => Err(GnitzSqlError::Rejected(format!(
+            "{}: not supported as a window function",
+            name.to_ascii_uppercase()
+        ))),
+    }
 }
 
 /// Whether a frame covers the partition whole (`true`) or folds it up to the
@@ -430,10 +426,12 @@ fn frame_is_whole(frame: Option<&WindowFrame>) -> Result<bool, GnitzSqlError> {
     let Some(frame) = frame else {
         return Ok(false);
     };
-    let end = frame.end_bound.as_ref().unwrap_or(&WindowFrameBound::CurrentRow);
-    match (&frame.start_bound, end) {
+    // Exhaustive (no `..`): a frame field sqlparser adds (EXCLUDE) stops the build.
+    let WindowFrame { units, start_bound, end_bound } = frame;
+    let end = end_bound.as_ref().unwrap_or(&WindowFrameBound::CurrentRow);
+    match (start_bound, end) {
         (WindowFrameBound::Preceding(None), WindowFrameBound::Following(None)) => Ok(true),
-        (WindowFrameBound::Preceding(None), WindowFrameBound::CurrentRow) => match frame.units {
+        (WindowFrameBound::Preceding(None), WindowFrameBound::CurrentRow) => match units {
             WindowFrameUnits::Range => Ok(false),
             WindowFrameUnits::Rows | WindowFrameUnits::Groups => Err(GnitzSqlError::Rejected(
                 "window frames: ROWS / GROUPS … CURRENT ROW excludes the current row's peers, which \
@@ -634,8 +632,9 @@ fn desugar<L: ItemLeaf>(
     let mut values: HashMap<ColId, HirExpr> = HashMap::new();
     // The rows: W under every ordered specification's values, then the cut. Every
     // later node carries the columns a window adds.
+    let (ordered, unordered): (Vec<Spec>, Vec<Spec>) = specs.into_iter().partition(|s| !s.order.is_empty());
     let mut rows = Rc::clone(&w);
-    for spec in specs.iter().filter(|s| !s.order.is_empty()) {
+    for spec in ordered {
         rows = running_values(ids, rows, spec, &mut values)?;
     }
     if let Some((call, (limit, offset))) = cut {
@@ -644,11 +643,10 @@ fn desugar<L: ItemLeaf>(
     // Every unordered specification's `γ_P(W)`, joined onto an outer read of the
     // rows. One with no partition key is a keyless (cross) join against the one
     // global row.
-    let mut unordered = specs.iter().filter(|s| s.order.is_empty()).peekable();
-    let outer = unordered.peek().is_some().then(|| Read::of(ids, &rows));
+    let outer = (!unordered.is_empty()).then(|| Read::of(ids, &rows));
     if let Some(outer) = &outer {
         rows = Rc::clone(&outer.rel);
-        for spec in unordered {
+        for spec in &unordered {
             let (rel, keys) = partition_values(ids, &w, spec, &mut values)?;
             let on = spec
                 .partition
@@ -698,9 +696,10 @@ fn agg_value(
 fn running_values(
     ids: &ColIdGen,
     rows: Rc<RelExpr>,
-    spec: &Spec,
+    spec: Spec,
     values: &mut HashMap<ColId, HirExpr>,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    let Spec { partition, order, calls } = spec;
     let cols = rows.cols();
     let mut aggs = Vec::new();
     let (mut rank, mut dense_rank) = (None, None);
@@ -708,7 +707,7 @@ fn running_values(
         let def = || ColumnDef::typed("_win", ColType::of(TypeCode::I64), false);
         BExpr::ColRef(col.get_or_insert_with(|| HirCol::new(ids.next(), def())).id)
     };
-    for c in &spec.calls {
+    for c in &calls {
         let value = match c.func {
             // A row's own frame holds the row, so no aggregate is one over no rows.
             WinFunc::Agg(func) => agg_value(ids, &cols, false, &mut aggs, func, c.arg)?,
@@ -719,7 +718,6 @@ fn running_values(
         };
         values.insert(c.out.id, value);
     }
-    let (partition, order) = (spec.partition.clone(), spec.order.clone());
     Ok(RelExpr::window(
         rows,
         partition,

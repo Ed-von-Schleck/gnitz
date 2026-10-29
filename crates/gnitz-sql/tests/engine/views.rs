@@ -511,3 +511,71 @@ fn create_schema_and_a_blob_column_are_sql() {
     let types: Vec<TypeCode> = files.schema.columns().iter().map(|c| c.ty.tc).collect();
     assert_eq!(types, [TypeCode::I64, TypeCode::Blob, TypeCode::Blob]);
 }
+
+// ── Subscriptions ────────────────────────────────────────────────────────────
+
+/// A boot with a fed view `fv` over `t`.
+fn fed_view() -> Db {
+    let mut db = Db::boot(1);
+    db.exec(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT);
+         CREATE VIEW fv WITH (delta = '1 MB') AS SELECT id, v FROM t",
+    );
+    db
+}
+
+/// `plan_subscription`'s refusal of `sql`, as its message.
+fn subscription_refusal(db: &mut Db, sql: &str) -> String {
+    match block_on(gnitz_sql::plan_subscription(&mut db.client, &db.sn, sql)) {
+        Ok(_) => panic!("`{sql}` was accepted"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// A subscription's text is its one statement whole: an `END` after it is
+/// refused as the stray token it is.
+#[test]
+fn a_subscription_refuses_text_after_its_statement() {
+    let mut db = fed_view();
+    for sql in ["SELECT id, v FROM fv END whatever here", "SELECT id, v FROM fv END"] {
+        let e = subscription_refusal(&mut db, sql);
+        assert!(e.contains("end of statement"), "`{sql}`: {e}");
+    }
+}
+
+/// Text holding no statement is refused as missing its SELECT, two statements
+/// as too many.
+#[test]
+fn a_subscription_is_exactly_one_statement() {
+    let mut db = fed_view();
+    for sql in ["", ";", " ; ;"] {
+        let e = subscription_refusal(&mut db, sql);
+        assert!(e.contains("a subscription needs a SELECT"), "`{sql}`: {e}");
+    }
+    let e = subscription_refusal(&mut db, "SELECT id FROM fv; SELECT v FROM fv");
+    assert!(e.contains("more than one statement"), "{e}");
+}
+
+/// A subscription is planned from a SELECT alone: the EXPLAIN of one, or any
+/// other statement, is refused.
+#[test]
+fn a_subscription_is_planned_only_from_a_select() {
+    let mut db = fed_view();
+    assert!(block_on(gnitz_sql::plan_subscription(
+        &mut db.client,
+        &db.sn,
+        "SELECT id, v FROM fv"
+    ))
+    .is_ok());
+    for sql in [
+        "EXPLAIN SELECT id, v FROM fv",
+        "DESCRIBE SELECT id, v FROM fv",
+        "INSERT INTO t VALUES (1, 1)",
+    ] {
+        let e = subscription_refusal(&mut db, sql);
+        assert!(
+            e.contains("a subscription: a statement other than SELECT"),
+            "`{sql}`: {e}"
+        );
+    }
+}

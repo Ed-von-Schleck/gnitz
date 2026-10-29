@@ -10,12 +10,21 @@ use super::*;
 use crate::ddl::plan_create_table;
 use gnitz_core::TableDef;
 
-/// Plan `sql` against `cat`. The statement must parse as a `CREATE TABLE`.
-fn plan_table(cat: &dyn Catalog, sql: &str) -> Result<Option<TableDef>, GnitzSqlError> {
+/// Plan `sql` against `cat`, its auto-names freed of the index names `live`. The
+/// statement must parse as a `CREATE TABLE`.
+fn plan_table_live(cat: &dyn Catalog, sql: &str, live: &[String]) -> Result<Option<TableDef>, GnitzSqlError> {
     match parse_stmt(sql) {
-        sqlparser::ast::Statement::CreateTable(c) => plan_create_table(&c, cat),
+        sqlparser::ast::Statement::CreateTable(c) => {
+            plan_create_table(&c, cat).map(|p| p.map(|p| p.named(live.iter().cloned())))
+        }
         other => panic!("`{sql}` is not a CREATE TABLE: {other}"),
     }
+}
+
+/// Plan `sql` against `cat` with no index standing. The statement must parse as
+/// a `CREATE TABLE`.
+fn plan_table(cat: &dyn Catalog, sql: &str) -> Result<Option<TableDef>, GnitzSqlError> {
+    plan_table_live(cat, sql, &[])
 }
 
 /// The bundle of a plan expected to create.
@@ -158,13 +167,16 @@ fn primary_key_precedence() {
             "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT PRIMARY KEY)",
             "Multiple PRIMARY KEYs",
         ),
-        // The list resolves before the conflict is reported, so the typo is named.
+        // A table-level list resolves before the conflict is reported, so the typo
+        // is named.
         ("CREATE TABLE t (id BIGINT PRIMARY KEY, PRIMARY KEY (typo))", "typo"),
         // Two table-level clauses: the second is the conflict.
         (
             "CREATE TABLE t (a BIGINT, b BIGINT, PRIMARY KEY (a), PRIMARY KEY (b))",
             "Multiple PRIMARY KEYs",
         ),
+        // A second table-level clause resolves before its conflict is reported too.
+        ("CREATE TABLE t (a BIGINT, PRIMARY KEY (a), PRIMARY KEY (typo))", "typo"),
     ] {
         assert_rejects(sql, plan_table(&cat, sql), needle);
     }
@@ -291,6 +303,16 @@ fn a_stream_refuses_serial_a_foreign_key_and_a_unique() {
             "CREATE TABLE s (id BIGINT PRIMARY KEY, a BIGINT, UNIQUE(a)) WITH (stream = true)",
             "UNIQUE",
         ),
+        // A compound PK covers no UNIQUE, and the full-PK list builds an index.
+        (
+            "CREATE TABLE s (a BIGINT, b BIGINT, PRIMARY KEY (a, b), UNIQUE(a, b)) WITH (stream = true)",
+            "UNIQUE",
+        ),
+        // Named, the PK-covered UNIQUE is refused as naming no index, stream or not.
+        (
+            "CREATE TABLE s (id BIGINT, CONSTRAINT u1 UNIQUE(id), PRIMARY KEY (id)) WITH (stream = true)",
+            "names no index",
+        ),
         // A stream holds no rows, so it has no store to compress.
         (
             "CREATE TABLE s (id BIGINT PRIMARY KEY, b TEXT) WITH (stream = true, compress = true)",
@@ -380,6 +402,24 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
             "CREATE TABLE t (x BIGINT UNSIGNED, y BIGINT UNSIGNED, id BIGINT PRIMARY KEY, \
              FOREIGN KEY (x, y) REFERENCES cp (a, b))",
             "multi-column",
+        ),
+        // The referential action is read before the column list is.
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT, s BIGINT, \
+             FOREIGN KEY (r, s) REFERENCES cp(a, b) ON UPDATE CASCADE)",
+            "ON UPDATE",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT, CONSTRAINT pk PRIMARY KEY (id) DEFERRABLE)",
+            "DEFERRABLE",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, UNIQUE NULLS NOT DISTINCT (a))",
+            "NULLS [NOT] DISTINCT",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, CONSTRAINT k UNIQUE USING INDEX i)",
+            "UNIQUE USING INDEX",
         ),
     ] {
         let (plan, _) = resolving(&known, |c| plan_table(c, sql).map(|_| ()));
@@ -588,6 +628,33 @@ fn a_repeated_column_name_is_rejected_before_it_is_resolved() {
         plan_table(&catalog(vec![]), sql),
         "duplicate column name 'A' in table definition",
     );
+}
+
+/// Index names are global: an auto-name routes around a live index of any owner,
+/// and a written name is left for the engine to refuse.
+#[test]
+fn auto_names_route_around_live_index_names() {
+    let cat = catalog(vec![]);
+    let live = [
+        format!("{SN}__t__idx_a"),
+        format!("{SN}__t__idx_a_2"),
+        "keep".to_string(),
+    ];
+    let c = plan_table_live(
+        &cat,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT UNIQUE, b BIGINT, CONSTRAINT keep UNIQUE(b))",
+        &live,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        c.unique_indexes,
+        vec![unique(&[1], &format!("{SN}__t__idx_a_3")), unique(&[2], "keep")]
+    );
+    // A written name equal to a base auto-name is still a written name.
+    let sql = format!("CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT {SN}__t__idx_a UNIQUE(a))");
+    let c = plan_table_live(&cat, &sql, &live).unwrap().unwrap();
+    assert_eq!(c.unique_indexes, vec![unique(&[1], &format!("{SN}__t__idx_a"))]);
 }
 
 /// Distinct column sets can render the same auto-name base when a column name

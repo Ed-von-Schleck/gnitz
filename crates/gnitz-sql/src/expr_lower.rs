@@ -7,7 +7,7 @@
 
 use crate::error::GnitzSqlError;
 use crate::ir::{
-    bin_types, blend_type, check_decimal_scale, operand_ty_pair, operand_tys, range_step, reads_unsigned, BExpr, BinOp,
+    bin_types, blended, case_results, check_decimal_scale, operand_ty_pair, range_step, reads_unsigned, BExpr, BinOp,
     BoundExpr, NumFunc, RangeStep, RegClass, StrArg, StrFunc, BOOL, STRING,
 };
 use crate::literal::{assign, invalid_literal, place, Compared, Placed};
@@ -173,22 +173,21 @@ impl Lowering<'_> {
         if let RegClass::Dec(scale) = class {
             check_decimal_scale(scale)?;
         }
-        let constant = match (e, class) {
+        match (e, class) {
             (BoundExpr::LitNull, RegClass::Str) => return Ok(self.eb.emit(L::LoadNullStr)),
             (BoundExpr::LitNull, _) => return Ok(self.eb.emit(L::LoadNull)),
-            (BoundExpr::LitStr(_), RegClass::Dec(_)) => Some(to),
-            (_, RegClass::Dec(_)) if e.decimal_literal().is_some() => Some(to),
+            (_, RegClass::Dec(_)) if matches!(e, BoundExpr::LitStr(_)) || e.decimal_literal().is_some() => {
+                let val = FixedInt::I64.unpack(assign(e, to).map_err(GnitzSqlError::Rejected)?);
+                return Ok(self.eb.emit(L::LoadConst { val, unsigned: false }));
+            }
             // A computed float is whatever binary64 makes of the literal, an
             // infinity included: only a stored cell refuses one.
-            (_, RegClass::Float) => match e.float_literal() {
-                Some(v) => return Ok(self.eb.const_f64(v)),
-                None => None,
-            },
-            _ => None,
-        };
-        if let Some(ty) = constant {
-            let val = FixedInt::I64.unpack(assign(e, ty).map_err(GnitzSqlError::Rejected)?);
-            return Ok(self.eb.emit(L::LoadConst { val, unsigned: false }));
+            (_, RegClass::Float) => {
+                if let Some(v) = e.float_literal() {
+                    return Ok(self.eb.const_f64(v));
+                }
+            }
+            _ => {}
         }
         let from = self.ty(e);
         let r = self.lower(e)?;
@@ -452,11 +451,10 @@ impl Lowering<'_> {
 
     /// GREATEST/LEAST as a left fold of 2-ary extremum opcodes.
     fn min_max_n(&mut self, is_max: bool, args: &[BoundExpr]) -> Result<Reg, GnitzSqlError> {
-        let types = operand_tys(&args.iter().collect::<Vec<_>>(), self.cols);
+        let (types, ty) = blended(args.iter(), self.cols);
         if let Some((a, _)) = args.iter().zip(&types).find(|(_, t)| t.tc == TypeCode::String) {
             return Err(self.not_scalar(a));
         }
-        let ty = blend_type(&types);
         let mut acc = self.lower_blended(&args[0], ty)?;
         for a in &args[1..] {
             let b = self.lower_blended(a, ty)?;
@@ -549,8 +547,7 @@ impl Lowering<'_> {
     /// WHEN wins. `Select` blends raw bit patterns, so every result is lowered
     /// at the type they blend to.
     fn case(&mut self, branches: &[(BoundExpr, BoundExpr)], else_: &BoundExpr) -> Result<Reg, GnitzSqlError> {
-        let results: Vec<&BoundExpr> = branches.iter().map(|(_, r)| r).chain([else_]).collect();
-        let ty = blend_type(&operand_tys(&results, self.cols));
+        let (_, ty) = blended(case_results(branches, else_), self.cols);
         let mut arms = Vec::with_capacity(branches.len());
         for (cond, result) in branches {
             arms.push((self.lower_bool(cond)?, self.lower_blended(result, ty)?));

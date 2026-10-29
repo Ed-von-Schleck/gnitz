@@ -6,54 +6,61 @@
 //! table binds its subquery recursively to an inline subtree
 //! (`resolve_table_factor`).
 //!
-//! The body's shape-specific parts are this module's children: `join` folds
-//! the FROM clause's join steps, `subquery` binds the subqueries a linear body
-//! reads, and `group` binds the GROUP BY / aggregate / HAVING suffix.
+//! The body's shape-specific parts are this module's children: `join` folds the
+//! FROM clause's join steps, `subquery` binds the subqueries a linear body reads
+//! and `decorrelate` joins them in where the projection is built, `group` binds
+//! the GROUP BY / aggregate / HAVING suffix, `window` desugars window calls, and
+//! `wildcard` expands `SELECT *`.
 
+mod decorrelate;
 mod group;
 mod join;
 mod subquery;
+mod wildcard;
+mod window;
+
+pub(crate) use window::ranking_names;
 
 use super::{
-    as_col, col_by_id, ColId, ColIdGen, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr, SetOpKind,
-    SubqueryKind, SubqueryRef,
+    col_by_id, schema_cols, ColId, ColIdGen, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr, SetOpKind,
 };
 use crate::ast_util::{
-    alias_column_names, body_is_grouped, expand_wildcard_item, extract_table_ref, has_visible_column, is_agg_call,
-    peel_nested, scalar_projection_item, select_is_distinct, single_part_ident, TableRef,
+    body_is_grouped, col_ref_parts, is_agg_call, peel_nested, select_is_distinct, single_part_ident,
 };
-use crate::bind::apply_positional_aliases;
-use crate::bind::{
-    bind_conjuncts, bind_structural, find_unique_column, output_column, single_relation_col_idx, unsupported_subquery,
-    Catalog, LeafBinder,
-};
+use crate::bind::{bind_conjuncts, bind_structural, unsupported_subquery, LeafBinder};
+use crate::catalog::Catalog;
 use crate::error::{derivation, reject_if, GnitzSqlError};
-use crate::ir::{BExpr, BoundExpr, LeafTyping, BOOL};
-use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, ClassWant};
-use crate::tail::{extract_limit, extract_offset, key_slots, order_exprs, parse_order_by, OrderKey};
+use crate::ir::{BExpr, LeafTyping, BOOL};
+use crate::names::{extract_table_ref, TableRef};
+use crate::rules::{
+    canonical_user_name, find_unique_column, has_visible_column, reject_duplicate_names, require_class,
+    single_relation_col_idx, ClassWant,
+};
+use crate::tail::{extract_limit_offset, key_slots, order_exprs, parse_order_by, OrderKey};
 use crate::validate::{
     reject_query_envelope_body, reject_unhonored_query_clauses, reject_unhonored_select_clauses, HonoredClauses,
     QueryEnvelope,
 };
-use gnitz_core::{RelDescriptor, Schema};
+use gnitz_core::Schema;
 use gnitz_wire::{ColType, ColumnDef};
 use group::bind_grouped_suffix;
 use join::{fold_join_step, join_keys_and_type};
 use sqlparser::ast::{
-    Expr, JoinConstraint, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator,
-    SetQuantifier, TableFactor,
+    Expr, Ident, JoinConstraint, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator,
+    SetQuantifier, TableAliasColumnDef, TableFactor,
 };
 use sqlparser::tokenizer::Span;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
+use subquery::{SubqueryKind, SubqueryRef};
 
 /// Bind a query's CTEs ahead of its body. Each binds to one subtree registered
 /// under its name, which the body (and later CTEs) read through an
 /// [`RelExpr::Alias`] and the lowering cuts once. Scoping precedence as SQL
-/// defines it: a CTE shadows a catalog name, and a later CTE sees earlier ones.
+/// defines it: a CTE shadows a catalog name, a later CTE sees earlier ones, and
+/// one WITH list names each CTE once.
 /// `WITH RECURSIVE` has no builder, and a CTE's trailing FROM is refused.
 pub(super) fn bind_ctes(cx: &mut BindCx<'_>, query: &Query) -> Result<(), GnitzSqlError> {
     let Some(with) = &query.with else {
@@ -74,13 +81,77 @@ pub(super) fn bind_ctes(cx: &mut BindCx<'_>, query: &Query) -> Result<(), GnitzS
         // to the reserved-prefix rule every such name passes.
         let canonical = canonical_user_name(name)?;
         let ctx = format!("CTE '{name}'");
+        if cx.ctes.contains_key(&canonical) {
+            return Err(GnitzSqlError::Rejected(format!(
+                "WITH query name '{name}' is specified more than once"
+            )));
+        }
         reject_if(from.is_some(), &ctx, "a trailing FROM")?;
         let rel = bind_body(cx, reject_query_envelope_body(query, &ctx)?)?;
         let (rel, mut defs) = collapse_identity(rel);
-        apply_positional_aliases(alias_column_names(&alias.columns, &ctx)?, defs.iter_mut(), &ctx)?;
+        apply_alias_columns(&alias.columns, defs.iter_mut(), &ctx)?;
         cx.ctes.insert(canonical, Cte { rel, defs });
     }
     Ok(())
+}
+
+/// Apply a reference's column alias list (`WITH d(a, b)`, `FROM t AS d(a, b)`,
+/// `(subquery) AS d(a, b)`) to `defs`. A type on an alias is refused: it would
+/// have to be checked against the body's own or silently ignored.
+fn apply_alias_columns<'b>(
+    columns: &[TableAliasColumnDef],
+    defs: impl IntoIterator<Item = &'b mut ColumnDef>,
+    ctx: &str,
+) -> Result<(), GnitzSqlError> {
+    reject_if(
+        columns.iter().any(|c| c.data_type.is_some()),
+        ctx,
+        "a type on a column alias",
+    )?;
+    apply_positional_aliases(columns.iter().map(|c| &c.name), defs, ctx)
+}
+
+/// Apply positional column aliases (`WITH d(a, b) AS …` / `(subquery) AS d(a, b)`
+/// / `CREATE VIEW v (a, b) AS …`) to the *visible* columns of a body's output, in
+/// order — a rename only, leaving `ColId`s and layout untouched. Hidden columns
+/// (a JOIN body's synthetic-PK region) are skipped, so an alias list names exactly
+/// what a downstream query sees.
+///
+/// A rename can collide where the original names did not, so the result is checked
+/// for duplicates.
+pub(super) fn apply_positional_aliases<'a, 'b>(
+    aliases: impl ExactSizeIterator<Item = &'a Ident>,
+    defs: impl IntoIterator<Item = &'b mut ColumnDef>,
+    ctx: &str,
+) -> Result<(), GnitzSqlError> {
+    let n_aliases = aliases.len();
+    if n_aliases == 0 {
+        return Ok(());
+    }
+    let mut visible: Vec<&mut ColumnDef> = defs.into_iter().filter(|c| !c.is_hidden).collect();
+    if n_aliases != visible.len() {
+        return Err(GnitzSqlError::Rejected(format!(
+            "{ctx} defines {n_aliases} column aliases but body returns {} columns",
+            visible.len(),
+        )));
+    }
+    for (col, alias) in visible.iter_mut().zip(aliases) {
+        col.name = alias.value.clone();
+    }
+    reject_duplicate_names(
+        visible.iter().map(|c| c.name.as_str()),
+        &format!("{ctx} column aliases"),
+    )
+}
+
+/// The output column `e` names, if it names one. Only an unqualified name can:
+/// an output column belongs to no relation, so a qualified reference is left to
+/// the caller's scope, which checks the qualifier.
+fn output_column<'a>(e: &Expr, cols: impl IntoIterator<Item = &'a ColumnDef>) -> Result<Option<usize>, GnitzSqlError> {
+    match col_ref_parts(e) {
+        Some((None, name)) => find_unique_column(cols, name),
+        _ => Ok(None),
+    }
 }
 
 /// A bound CTE: the shared subtree every reference aliases, and the column
@@ -102,7 +173,7 @@ fn collapse_identity(rel: Rc<RelExpr>) -> (Rc<RelExpr>, Vec<ColumnDef>) {
             && items
                 .iter()
                 .zip(&visible)
-                .all(|(it, c)| as_col(&it.expr) == Some(c.id) && !it.out.def.is_hidden);
+                .all(|(it, c)| it.expr.as_col() == Some(c.id) && !it.out.def.is_hidden);
         if identity {
             let mut renamed = items.iter();
             let defs = in_cols
@@ -180,14 +251,11 @@ pub(crate) struct BoundRef {
 fn resolve_table_ref(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<(Rc<RelExpr>, Vec<HirCol>), GnitzSqlError> {
     let rel = resolve_relation(cx, tref)?;
     let mut cols = rel.cols();
-    if !tref.columns.is_empty() {
-        let ctx = format!("table '{}'", tref.alias);
-        apply_positional_aliases(
-            alias_column_names(tref.columns, &ctx)?,
-            cols.iter_mut().map(|c| &mut c.def),
-            &ctx,
-        )?;
-    }
+    apply_alias_columns(
+        tref.columns,
+        cols.iter_mut().map(|c| &mut c.def),
+        &format!("table '{}'", tref.alias),
+    )?;
     Ok((rel, cols))
 }
 
@@ -201,7 +269,7 @@ fn resolve_relation(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<Rc<RelExpr>,
     }
     let rel = cx.cat.probe_relation(name)?;
     let (want, op) = match cx.surface {
-        Surface::Adhoc { op } => (ClassWant::Readable, op),
+        Surface::Adhoc => (ClassWant::Readable, cx.surface.stmt()),
         // The replaced view is retracted in the same bundle, taking the body's input with it.
         Surface::View(ViewBody { stmt, replacing }) if replacing == Some(rel.tid) => {
             return Err(GnitzSqlError::Rejected(format!(
@@ -239,7 +307,7 @@ struct QueryTail<'a> {
 impl<'a> QueryTail<'a> {
     fn parse(query: &'a Query, stmt: &str) -> Result<Option<Self>, GnitzSqlError> {
         let keys = parse_order_by(query.order_by.as_ref())?;
-        let limit = extract_limit(query)?;
+        let (limit, offset) = extract_limit_offset(query)?;
         match (keys.is_empty(), limit) {
             // The envelope guard waves the whole sink through to this parse, so
             // what this parse does not consume it must refuse — a bare `OFFSET`.
@@ -258,19 +326,13 @@ impl<'a> QueryTail<'a> {
             (false, Some(limit)) => Ok(Some(QueryTail {
                 keys,
                 limit: limit as u64,
-                offset: extract_offset(query)? as u64,
+                offset: offset as u64,
             })),
         }
     }
 
-    /// The expression keys, in key order — what a body's projection places one
-    /// hidden item each for.
-    fn exprs(&self) -> Vec<&'a Expr> {
-        order_exprs(&self.keys)
-    }
-
     /// Wrap `rel` in the top-N this tail names. `placed` is the output slot of
-    /// each *expression* key, parallel to [`Self::exprs`]; a positional key
+    /// each *expression* key, parallel to [`order_exprs`] of its keys; a positional key
     /// names a visible output column.
     fn wrap(&self, rel: Rc<RelExpr>, placed: &[usize]) -> Result<Rc<RelExpr>, GnitzSqlError> {
         let cols = rel.cols();
@@ -291,7 +353,7 @@ impl<'a> QueryTail<'a> {
     fn wrap_by_output(&self, rel: Rc<RelExpr>, stmt: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
         let cols = rel.cols();
         let mut placed = Vec::new();
-        for e in self.exprs() {
+        for e in order_exprs(&self.keys) {
             match output_column(e, cols.iter().map(|c| &c.def))? {
                 Some(at) => placed.push(at),
                 None => {
@@ -315,8 +377,8 @@ pub(super) fn bind_query(cx: &mut BindCx<'_>, query: &Query) -> Result<Rc<RelExp
     let tail = QueryTail::parse(query, cx.surface.stmt())?;
     match (query.body.as_ref(), tail) {
         (SetExpr::Select(select), tail) => {
-            let order_exprs: Vec<&Expr> = tail.as_ref().map(QueryTail::exprs).unwrap_or_default();
-            let (rel, placed) = bind_select(cx, select, &order_exprs)?;
+            let keyed: Vec<&Expr> = tail.as_ref().map(|t| order_exprs(&t.keys)).unwrap_or_default();
+            let (rel, placed) = bind_select(cx, select, &keyed)?;
             match tail {
                 Some(t) => t.wrap(rel, &placed),
                 None => Ok(rel),
@@ -370,11 +432,7 @@ fn resolve_table_factor(
         let body = reject_query_envelope_body(subquery, &ctx)?;
         let subtree = bind_body(cx, body)?;
         let mut cols = subtree.cols();
-        apply_positional_aliases(
-            alias_column_names(&alias.columns, &ctx)?,
-            cols.iter_mut().map(|c| &mut c.def),
-            &ctx,
-        )?;
+        apply_alias_columns(&alias.columns, cols.iter_mut().map(|c| &mut c.def), &ctx)?;
         return Ok((subtree, alias.name.value.clone(), cols));
     }
     let tref = extract_table_ref(factor, cx.cat.schema_name(), cx.surface.stmt())?;
@@ -415,7 +473,7 @@ pub(super) fn bind_select(
             (rel, JoinScope::single(&alias, cols))
         }
         // No relation is in scope, so every written name is unresolvable.
-        (None, Surface::Adhoc { .. }) => (Rc::new(RelExpr::Unit), JoinScope::new()),
+        (None, Surface::Adhoc) => (Rc::new(RelExpr::Unit), JoinScope::default()),
         (None, Surface::View(_)) => {
             return Err(GnitzSqlError::Rejected(format!(
                 "{stmt}: a view body reads at least one relation; this one has no FROM clause"
@@ -441,7 +499,7 @@ pub(super) fn bind_select(
     // only a view's one-relation body, neither grouped nor DISTINCT, binds one.
     let subs = RefCell::new(Vec::new());
     let sub = match (surface, scope.relations.len()) {
-        (Surface::Adhoc { .. }, _) => SubPolicy::Reject(adhoc_subquery),
+        (Surface::Adhoc, _) => SubPolicy::Reject(adhoc_subquery),
         (Surface::View(_), 1) if grouped => SubPolicy::Reject(|_| {
             GnitzSqlError::Rejected(
                 "a subquery is not supported together with GROUP BY/aggregates; put the subquery in an inner view"
@@ -490,7 +548,7 @@ fn adhoc_subquery(e: &Expr) -> GnitzSqlError {
 /// sorts on; a view body also binds its window calls and its QUALIFY. `rel` is
 /// called once everything that binds through `leaf` has, so a leaf that
 /// registers what it binds builds its relation from all of it.
-pub(super) fn bind_select_list<L: ItemLeaf>(
+fn bind_select_list<L: ItemLeaf>(
     cx: &BindCx<'_>,
     select: &Select,
     rel: impl FnOnce() -> Result<Rc<RelExpr>, GnitzSqlError>,
@@ -500,7 +558,7 @@ pub(super) fn bind_select_list<L: ItemLeaf>(
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
     let ids = cx.ids;
     if cx.surface.is_view() {
-        return super::window::bind_view_select_list(ids, select, rel, leaf, ctx, order_exprs);
+        return window::bind_view_select_list(ids, select, rel, leaf, ctx, order_exprs);
     }
     let mut items = bind_projection(&select.projection, leaf, ids, ctx)?;
     let placed = place_order_keys(order_exprs, &mut items, ids, leaf)?;
@@ -521,7 +579,7 @@ fn reject_unselected_distinct_keys(projected: &RelExpr, placed: &[usize], ctx: &
 
 /// What a SELECT list needs of the leaf it binds through, beyond expression
 /// binding.
-pub(super) trait ItemLeaf: LeafBinder<ColId> {
+trait ItemLeaf: LeafBinder<ColId> {
     /// The name a copied column is selected under: its visible source column's.
     fn source_name(&self, id: ColId) -> Option<String>;
     /// The projection of `items` over `source`. The subquery-binding leaf joins in
@@ -538,7 +596,7 @@ pub(super) trait ItemLeaf: LeafBinder<ColId> {
 /// Resolve every SELECT item into a `ProjEntry` in SELECT order, expanding a bare
 /// `*` over the leaf's columns (honoring `EXCEPT`/`EXCLUDE`/`RENAME`, skipping
 /// hidden columns), and refuse two items of one name.
-pub(super) fn bind_projection<L: ItemLeaf>(
+fn bind_projection<L: ItemLeaf>(
     projection: &[SelectItem],
     leaf: &L,
     ids: &ColIdGen,
@@ -557,7 +615,7 @@ pub(super) fn bind_projection<L: ItemLeaf>(
         };
         if let Some((qualifier, o)) = star {
             if let Some(cols) = leaf.wildcard_cols(qualifier)? {
-                let expanded = expand_wildcard_item(o, cols.iter().map(|c| &c.def), ctx)?;
+                let expanded = wildcard::expand_wildcard_item(o, cols.iter().map(|c| &c.def), ctx)?;
                 items.extend(expanded.into_iter().map(|(i, def)| ProjEntry {
                     expr: BExpr::ColRef(cols[i].id),
                     out: HirCol::new(ids.next(), def),
@@ -570,10 +628,29 @@ pub(super) fn bind_projection<L: ItemLeaf>(
     }
     // A projection naming nothing of its own (`*`, `* EXCEPT/EXCLUDE`) is exempt: a
     // duplicate among the source's own names rides through positionally.
-    if !crate::ast_util::is_name_preserving_wildcard_projection(projection) {
+    if !wildcard::is_name_preserving_wildcard_projection(projection) {
         reject_duplicate_names(items.iter().map(|e| e.out.def.name.as_str()), ctx)?;
     }
     Ok(items)
+}
+
+/// A non-wildcard SELECT item as `(expr, alias)` — the alias-carrying sibling of
+/// `crate::ast_util::projection_item_expr`. Anything that is not one scalar
+/// expression rejects, naming the shape written; `ctx` names the clause.
+fn scalar_projection_item<'a>(item: &'a SelectItem, ctx: &str) -> Result<(&'a Expr, Option<String>), GnitzSqlError> {
+    match item {
+        SelectItem::UnnamedExpr(expr) => Ok((expr, None)),
+        SelectItem::ExprWithAlias { expr, alias } => Ok((expr, Some(alias.value.clone()))),
+        SelectItem::ExprWithAliases { .. } => Err(GnitzSqlError::Rejected(format!(
+            "{ctx}: a multi-alias (`AS (a, b)`) SELECT item is not a supported SELECT item"
+        ))),
+        SelectItem::Wildcard(_) => Err(GnitzSqlError::Rejected(format!(
+            "{ctx}: SELECT * is not a supported SELECT item"
+        ))),
+        SelectItem::QualifiedWildcard(..) => Err(GnitzSqlError::Rejected(format!(
+            "{ctx}: SELECT <table>.* is not a supported SELECT item"
+        ))),
+    }
 }
 
 /// Bind one scalar SELECT item to its output column. Unaliased, the item at
@@ -586,7 +663,7 @@ fn bind_scalar_item<L: ItemLeaf>(
     ids: &ColIdGen,
 ) -> Result<ProjEntry, GnitzSqlError> {
     let bound = bind_structural(expr, leaf)?;
-    let copied = as_col(&bound);
+    let copied = bound.as_col();
     let src_name = copied.and_then(|id| leaf.source_name(id));
     // An aggregate or window call is named for its function.
     let stem = match peel_nested(expr) {
@@ -595,15 +672,11 @@ fn bind_scalar_item<L: ItemLeaf>(
         }
         _ => None,
     };
-    let ty = bound.infer_ty(leaf);
-    let def = ColumnDef::typed(
-        alias
-            .or(src_name)
-            .unwrap_or_else(|| format!("_{}{idx}", stem.as_deref().unwrap_or("expr"))),
-        // A copied column keeps its type; a computed one is stored as its register.
-        if copied.is_some() { ty } else { ty.register_image() },
-        copied.is_none_or(|id| leaf.decl(&id).1),
-    );
+    let (ty, nullable) = bound.declared(leaf);
+    let name = alias
+        .or(src_name)
+        .unwrap_or_else(|| format!("_{}{idx}", stem.as_deref().unwrap_or("expr")));
+    let def = ColumnDef::typed(name, ty, nullable);
     Ok(ProjEntry {
         expr: bound,
         out: HirCol::new(ids.next(), def),
@@ -630,7 +703,15 @@ struct ScopeLeaf<'a> {
     sub: SubPolicy<'a>,
 }
 
-impl ScopeLeaf<'_> {
+impl<'a> ScopeLeaf<'a> {
+    /// A leaf over `scope` that binds no subquery.
+    fn plain(scope: &'a JoinScope) -> Self {
+        ScopeLeaf {
+            scope,
+            sub: SubPolicy::Reject(unsupported_subquery),
+        }
+    }
+
     /// The kind of the subquery `id` is the column of, when this leaf bound one.
     fn recorded(&self, id: ColId) -> Option<SubqueryKind> {
         match self.sub {
@@ -655,7 +736,7 @@ impl ItemLeaf for ScopeLeaf<'_> {
     }
     fn project(&self, source: Rc<RelExpr>, items: Vec<ProjEntry>) -> Result<Rc<RelExpr>, GnitzSqlError> {
         match self.sub {
-            SubPolicy::Bind { subs, .. } => super::decorrelate::decorrelate(source, items, &subs.borrow()),
+            SubPolicy::Bind { subs, .. } => decorrelate::decorrelate(source, items, &subs.borrow()),
             SubPolicy::Reject(_) => Ok(RelExpr::project(source, items)),
         }
     }
@@ -686,33 +767,10 @@ impl LeafBinder<ColId> for ScopeLeaf<'_> {
     }
 }
 
-/// Bind an expression against one relation's schema under `alias`, the qualifier
-/// a written column reference must name: a column to its schema position. It
-/// hosts no aggregate, window call or subquery.
-pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema, alias: &str) -> Result<BoundExpr, GnitzSqlError> {
-    let ids = ColIdGen::new();
-    let cols = schema
-        .columns()
-        .iter()
-        .map(|c| HirCol::new(ids.next(), c.clone()))
-        .collect();
-    let scope = JoinScope::single(alias, cols);
-    let leaf = ScopeLeaf {
-        scope: &scope,
-        sub: SubPolicy::Reject(unsupported_subquery),
-    };
-    // A column's position in a one-relation scope is its schema position.
-    let at = |id: &ColId| {
-        let pos = scope.combined.iter().position(|c| c.id == *id);
-        pos.expect("bound in this scope")
-    };
-    Ok(bind_structural(expr, &leaf)?.rebuild(&mut |id| BExpr::ColRef(at(id))))
-}
-
 /// The name-resolution scope of a FROM-join body: all in-scope (null-widened)
 /// `HirCol`s in relation order, plus each relation's alias (as written) and span.
 /// Resolves a qualified or unqualified reference to a `ColId`.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct JoinScope {
     combined: Vec<HirCol>,
     /// The columns a `USING` / `NATURAL` step merged away. A `Vec` because it is
@@ -722,17 +780,9 @@ struct JoinScope {
 }
 
 impl JoinScope {
-    fn new() -> Self {
-        JoinScope {
-            combined: Vec::new(),
-            merged: Vec::new(),
-            relations: Vec::new(),
-        }
-    }
-
-    /// The scope of one relation — a `new` plus one `push`.
+    /// The scope of one relation — an empty scope plus one `push`.
     fn single(alias: &str, cols: Vec<HirCol>) -> Self {
-        let mut scope = JoinScope::new();
+        let mut scope = JoinScope::default();
         scope.push(alias, cols).expect("an empty scope takes any alias");
         scope
     }
@@ -801,12 +851,6 @@ impl JoinScope {
     }
 
     fn resolve_qualified(&self, alias: &str, name: &str) -> Result<ColId, GnitzSqlError> {
-        // One relation in scope: the single-relation rule, worded as every other
-        // statement words it.
-        if let [(only, _)] = self.relations.as_slice() {
-            let defs = self.combined.iter().map(|c| &c.def);
-            return Ok(self.combined[single_relation_col_idx(defs, only, Some(alias), name)?].id);
-        }
         let cols = self.relation(alias)?;
         let idx = find_unique_column(cols.iter().map(|c| &c.def), name)?
             .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{name}' not found in table '{alias}'")))?;
@@ -823,13 +867,21 @@ impl JoinScope {
     }
 
     fn resolve_unqualified(&self, name: &str) -> Result<ColId, GnitzSqlError> {
-        let scope = if self.relations.len() > 1 { " in any table" } else { "" };
+        let scope = if self.relations.is_empty() { "" } else { " in any table" };
         self.find_unqualified(name)?
             .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{name}' not found{scope}")))
     }
 
     /// Resolve a column reference, qualified by `qual` or not.
     fn resolve(&self, qual: Option<&str>, name: &str) -> Result<ColId, GnitzSqlError> {
+        // One relation in scope resolves by the single-relation rule every surface
+        // shares: a qualifier must name it, so `SELECT b.val FROM a` is a rejection
+        // rather than a read of `a.val`, and it disambiguates nothing more. One
+        // relation merges no column, so the whole scope is its columns.
+        if let [(only, _)] = self.relations.as_slice() {
+            let cols = self.combined.iter().map(|c| &c.def);
+            return Ok(self.combined[single_relation_col_idx(cols, only, qual, name)?].id);
+        }
         match qual {
             None => self.resolve_unqualified(name),
             Some(qual) => self.resolve_qualified(qual, name),
@@ -842,15 +894,11 @@ impl JoinScope {
 pub(super) fn bind_returning(
     ids: &ColIdGen,
     projection: &[SelectItem],
-    desc: Arc<RelDescriptor>,
+    schema: &Schema,
     alias: &str,
 ) -> Result<(Vec<HirCol>, Vec<ProjEntry>), GnitzSqlError> {
-    let source = RelExpr::get(ids, desc);
-    let scope = JoinScope::single(alias, source.cols());
-    let leaf = ScopeLeaf {
-        scope: &scope,
-        sub: SubPolicy::Reject(unsupported_subquery),
-    };
+    let scope = JoinScope::single(alias, schema_cols(ids, schema));
+    let leaf = ScopeLeaf::plain(&scope);
     let items = bind_projection(projection, &leaf, ids, "SELECT")?;
     Ok((scope.combined, items))
 }
@@ -860,9 +908,8 @@ pub(super) fn bind_returning(
 pub(super) enum Surface {
     /// A view body.
     View(ViewBody),
-    /// An ad-hoc read, which lowers to one stateless read of one relation. `op`
-    /// names the read in a class rejection.
-    Adhoc { op: &'static str },
+    /// An ad-hoc read, which lowers to one stateless read of one relation.
+    Adhoc,
 }
 
 impl Surface {
@@ -871,7 +918,7 @@ impl Surface {
     pub(super) fn stmt(self) -> &'static str {
         match self {
             Surface::View(v) => v.stmt,
-            Surface::Adhoc { .. } => "SELECT",
+            Surface::Adhoc => "SELECT",
         }
     }
 
@@ -883,7 +930,7 @@ impl Surface {
 /// The projection item each key of `order_exprs` sorts on: the output column it
 /// names, else the item whose bound expression equals the key's — so `t.a + b` and
 /// `a + b` are one item — else a hidden one appended here.
-pub(super) fn place_order_keys<L: ItemLeaf>(
+fn place_order_keys<L: ItemLeaf>(
     order_exprs: &[&Expr],
     items: &mut Vec<ProjEntry>,
     ids: &ColIdGen,

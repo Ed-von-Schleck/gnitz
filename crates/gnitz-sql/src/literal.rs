@@ -202,6 +202,27 @@ pub(crate) fn place<R>(lit: &BExpr<R>, ty: ColType) -> Option<Placed> {
     }
 }
 
+/// The decimal a SQL numeric literal spells, exponent included, as
+/// `(unscaled, scale)` at its smallest exact scale — `1.50` is `(15, 1)`.
+/// `None` past `i128` or 38 fractional digits.
+pub(crate) fn decimal_of_number_text(s: &str) -> Option<(i128, u8)> {
+    let (mantissa, exp) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (s, 0),
+    };
+    let (mut v, scale) = parse_decimal_text(mantissa)?;
+    let mut scale = i32::from(scale).checked_sub(exp)?;
+    if scale < 0 {
+        v = v.checked_mul(10i128.checked_pow(scale.unsigned_abs())?)?;
+        scale = 0;
+    }
+    while scale > 0 && v % 10 == 0 {
+        v /= 10;
+        scale -= 1;
+    }
+    Some((v, u8::try_from(scale).ok().filter(|s| *s <= 38)?))
+}
+
 #[cfg(test)]
 #[path = "tests/literal.rs"]
 mod tests;

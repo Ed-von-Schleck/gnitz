@@ -1,10 +1,11 @@
 //! FROM-join binding: one join step folded onto the accumulated left input.
 
 use super::super::{ColId, HirCol, JoinType, RelExpr};
-use super::{resolve_table_factor, BindCx, JoinScope, ScopeLeaf, SubPolicy};
-use crate::bind::{bind_conjuncts, find_unique_column, unsupported_subquery};
+use super::{resolve_table_factor, BindCx, JoinScope, ScopeLeaf};
+use crate::bind::bind_conjuncts;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
+use crate::rules::find_unique_column;
 use sqlparser::ast::{JoinConstraint, JoinOperator, TableFactor};
 use std::rc::Rc;
 
@@ -77,10 +78,7 @@ pub(super) fn fold_join_step(
     // step with no constraint of its own needs no arm, and the WHERE may key it.
     let on = match keys {
         JoinConstraint::On(e) => {
-            let leaf = ScopeLeaf {
-                scope,
-                sub: SubPolicy::Reject(unsupported_subquery),
-            };
+            let leaf = ScopeLeaf::plain(scope);
             bind_conjuncts(e, &leaf).map_err(|e| e.in_clause("JOIN ON"))?
         }
         _ => pairs

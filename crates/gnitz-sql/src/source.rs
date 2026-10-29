@@ -56,7 +56,9 @@ impl<'a> StatementText<'a> {
 }
 
 /// `script`'s statements, each with its [`StatementText`]: what
-/// `Parser::parse_sql` returns, and where each statement stands.
+/// `Parser::parse_sql` returns, and where each statement stands. An `END` after
+/// a statement is refused, where `Parser::parse_sql` stops there and drops the
+/// rest of the script.
 pub(crate) fn split_statements(script: &str) -> Result<Vec<(Statement, StatementText<'_>)>, ParserError> {
     let mut parser = Parser::new(&DIALECT).try_with_sql(script)?;
     let mut offsets = Offsets::new(script);

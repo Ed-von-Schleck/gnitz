@@ -1,64 +1,9 @@
-//! The clause guards DDL statements share: a `WITH (…)` option list, and the
-//! column options and PRIMARY KEY / UNIQUE / FOREIGN KEY constraint fields that
-//! CREATE TABLE, CREATE INDEX and ALTER TABLE each meet. They keep the guard
-//! contract `crate::validate` states.
+//! The clause guards DDL statements share: the column options and PRIMARY KEY /
+//! UNIQUE / FOREIGN KEY constraint fields that CREATE TABLE, CREATE INDEX and
+//! ALTER TABLE each meet. They keep the guard contract `crate::validate` states.
 
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use gnitz_wire::FkAction;
-
-/// The boolean a `WITH (key = …)` entry names; `false` where it is absent.
-pub(super) fn bool_option(key: &str, value: Option<&sqlparser::ast::Expr>) -> Result<bool, GnitzSqlError> {
-    match value.map(crate::bind::bind_constant) {
-        None => Ok(false),
-        Some(Ok(crate::ir::BExpr::LitBool(b))) => Ok(b),
-        Some(_) => Err(GnitzSqlError::Rejected(format!(
-            "WITH ({key} = …) expects a boolean (true/false)"
-        ))),
-    }
-}
-
-/// The values of a `CREATE` statement's `WITH (key = value, …)` clause, one slot per
-/// entry of `keys`. Any other option form, unknown key or repeated key is rejected.
-pub(super) fn kv_options<'a, const N: usize>(
-    options: &'a sqlparser::ast::CreateTableOptions,
-    context: &str,
-    keys: [&str; N],
-) -> Result<[Option<&'a sqlparser::ast::Expr>; N], GnitzSqlError> {
-    let mut slots = [None; N];
-    let form = match options {
-        sqlparser::ast::CreateTableOptions::With(opts) => {
-            for opt in opts {
-                let sqlparser::ast::SqlOption::KeyValue { key, value } = opt else {
-                    return Err(GnitzSqlError::Rejected(format!(
-                        "unsupported {context} option in WITH (…), which takes `key = value` entries: {opt:?}"
-                    )));
-                };
-                let Some(at) = keys.iter().position(|k| key.value.eq_ignore_ascii_case(k)) else {
-                    let listed: Vec<String> = keys.iter().map(|k| format!("`{k}`")).collect();
-                    return Err(GnitzSqlError::Rejected(format!(
-                        "unknown {context} option '{}'; the supported options are {}",
-                        key.value,
-                        listed.join(", ")
-                    )));
-                };
-                if slots[at].replace(value).is_some() {
-                    return Err(GnitzSqlError::Rejected(format!(
-                        "{context} option `{}` is given more than once",
-                        keys[at]
-                    )));
-                }
-            }
-            return Ok(slots);
-        }
-        sqlparser::ast::CreateTableOptions::None => return Ok(slots),
-        sqlparser::ast::CreateTableOptions::Options(_) => "OPTIONS (…)",
-        sqlparser::ast::CreateTableOptions::Plain(_) => "space-separated options",
-        sqlparser::ast::CreateTableOptions::TableProperties(_) => "TBLPROPERTIES (…)",
-    };
-    Err(GnitzSqlError::Rejected(format!(
-        "{form} is not supported; options must be given as WITH (…)"
-    )))
-}
 
 /// A FOREIGN KEY's `ON DELETE` action, rejecting every field gnitz does not
 /// implement. Column-level and table-level FKs both read through here.
@@ -289,7 +234,3 @@ pub(super) fn reject_unhonored_column_options(
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "tests/guard.rs"]
-mod tests;

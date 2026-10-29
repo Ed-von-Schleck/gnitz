@@ -17,6 +17,13 @@ fn statements_run_together_without_a_delimiter_are_refused() {
 }
 
 #[test]
+fn an_end_after_a_statement_is_refused() {
+    assert!(split_statements("SELECT * FROM v END garbage here").is_err());
+    assert!(split_statements("SELECT * FROM v END").is_err());
+    assert!(split_statements(" ; ;").unwrap().is_empty());
+}
+
+#[test]
 fn a_view_body_starts_after_the_first_top_level_as() {
     let cases = [
         ("CREATE VIEW v AS SELECT a AS b FROM t", "SELECT a AS b FROM t"),

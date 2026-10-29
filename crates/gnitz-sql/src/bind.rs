@@ -1,16 +1,20 @@
+//! Scalar binding: the one `Expr → BExpr<R>` recursion, parametrized by a leaf
+//! ([`LeafBinder`]) that makes every schema-aware decision, the leaf-free constant
+//! decoder ([`bind_constant`]), and the leaf over one relation's columns
+//! ([`bind_single_table`]).
+
 use std::convert::Infallible;
 
-use super::resolve::require_column;
-use crate::agg::AggFunc;
-use crate::ast_util::{
-    bind_literal, classify_agg_call, col_ref_parts, peel_nested, single_part_ident, AggArg, CallSurface, PlainCall,
-};
+use crate::agg::{AggArg, AggFunc};
+use crate::ast_util::{classify_agg_call, col_ref_parts, peel_nested, single_part_ident, CallSurface, PlainCall};
 use crate::error::{reject_if, GnitzSqlError};
-use crate::ir::{BExpr, BinOp, FloatUnaryOp, LeafTyping, NumFunc, StrArg, StrFunc, TrimMode, BOOL};
-use crate::literal::{invalid_literal, parse_bool, parse_temporal};
+use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, LeafTyping, NumFunc, NumLit, StrArg, StrFunc, TrimMode, BOOL};
+use crate::literal::{decimal_of_number_text, invalid_literal, parse_bool, parse_temporal};
+use crate::rules::single_relation_col_idx;
 use crate::types::sql_col_type;
+use gnitz_core::Schema;
 use gnitz_expr::{CalendarOp, LikePattern};
-use gnitz_wire::ColumnDef;
+use gnitz_wire::{ColType, ColumnDef};
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CeilFloorKind, DataType, DateTimeField, Expr, Function, TrimWhereField, TypedString,
     UnaryOperator, Value, ValueWithSpan,
@@ -82,6 +86,62 @@ pub(crate) fn unsupported_subquery(e: &Expr) -> GnitzSqlError {
               (in the WHERE clause or the SELECT list)"
             .into(),
     })
+}
+
+/// SQL literal → `BExpr`. Leaf-free (no `ColRef` produced), so it is generic
+/// over `R` without a `Clone` bound. An integer past `i64` binds to `LitWide`
+/// up to `u128::MAX`; a fraction, an exponent or a longer integer to `LitFloat`.
+fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
+    match v {
+        Value::Null => Ok(BExpr::LitNull),
+        Value::Number(n, _) => {
+            if let Ok(i) = n.parse::<i64>() {
+                return Ok(BExpr::LitInt(i));
+            }
+            if n.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(mag) = n.parse::<u128>() {
+                    return Ok(BExpr::LitWide(NumLit { mag, neg: false }));
+                }
+            }
+            n.parse::<f64>()
+                .map(|v| BExpr::LitFloat { v, dec: decimal_of_number_text(n) })
+                .map_err(|_| GnitzSqlError::Rejected(format!("invalid number literal: {n}")))
+        }
+        Value::SingleQuotedString(s) => Ok(BExpr::LitStr(s.clone())),
+        Value::Boolean(b) => Ok(BExpr::LitBool(*b)),
+        _ => Err(GnitzSqlError::Rejected(format!(
+            "value type not supported in expressions: {v:?}"
+        ))),
+    }
+}
+
+/// One relation's columns as a leaf: a reference binds to its schema position,
+/// and a written qualifier must name `alias`. Aggregates, window calls and
+/// subqueries keep the trait's rejecting defaults.
+struct SchemaLeaf<'a> {
+    cols: &'a [ColumnDef],
+    alias: &'a str,
+}
+
+impl LeafTyping<usize> for SchemaLeaf<'_> {
+    fn decl(&self, i: &usize) -> (ColType, bool) {
+        self.cols.decl(i)
+    }
+}
+
+impl LeafBinder<usize> for SchemaLeaf<'_> {
+    fn bind_column(&self, qual: Option<&str>, name: &str) -> Result<BoundExpr, GnitzSqlError> {
+        Ok(BExpr::ColRef(single_relation_col_idx(
+            self.cols, self.alias, qual, name,
+        )?))
+    }
+}
+
+/// Bind an expression against one relation's schema under `alias`, the qualifier
+/// a written column reference must name: a column to its schema position. It
+/// hosts no aggregate, window call or subquery.
+pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema, alias: &str) -> Result<BoundExpr, GnitzSqlError> {
+    bind_structural(expr, &SchemaLeaf { cols: schema.columns(), alias })
 }
 
 /// `CAST(e AS dt)`; a string literal cast to DATE/TIMESTAMP folds to its value,
@@ -447,8 +507,8 @@ fn like_escape(escape_char: Option<&ValueWithSpan>) -> Result<Option<char>, Gnit
     let Some(v) = escape_char else { return Ok(Some('\\')) };
     let bad = || GnitzSqlError::Rejected("LIKE: ESCAPE must be a single character or ''".into());
     // A `ValueWithSpan`, not an `Expr`: the parser puts the escape in its own
-    // slot, so there is no sign or parenthesis for `bind_constant` to peel.
-    let Ok(BExpr::LitStr(s)) = bind_literal::<Infallible>(&v.value) else {
+    // slot, so there is no sign or parenthesis to peel.
+    let Value::SingleQuotedString(s) = &v.value else {
         return Err(bad());
     };
     let mut chars = s.chars();
@@ -823,24 +883,6 @@ fn null_test<R>(value: BExpr<R>, want_null: bool, leaf: &dyn LeafBinder<R>) -> B
     }
 }
 
-/// The position of the column `name` within one relation's columns. A written
-/// qualifier must name `alias`, the relation's effective alias, so
-/// `SELECT b.val FROM a` is a rejection rather than a read of `a.val`; it
-/// disambiguates nothing beyond that.
-pub(crate) fn single_relation_col_idx<'a>(
-    cols: impl IntoIterator<Item = &'a ColumnDef>,
-    alias: &str,
-    qual: Option<&str>,
-    name: &str,
-) -> Result<usize, GnitzSqlError> {
-    if let Some(q) = qual.filter(|q| !q.eq_ignore_ascii_case(alias)) {
-        return Err(GnitzSqlError::Rejected(format!(
-            "table alias '{q}' not found (the relation in scope is '{alias}')"
-        )));
-    }
-    require_column(cols, name)
-}
-
 #[cfg(test)]
-#[path = "tests/structural.rs"]
+#[path = "tests/bind.rs"]
 mod tests;

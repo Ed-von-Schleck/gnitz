@@ -176,6 +176,10 @@ const SHAPES: &[Row] = &[
     ("SELECT c.v AS cv, b.id AS bid FROM c CROSS JOIN b", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
     ("SELECT c.v AS cv, ty.id AS tid FROM c NATURAL JOIN ty", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
     ("SELECT x.id AS xa, y.id AS yb FROM a x, a y", 2, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
+    // A self-join with a computed key cuts the computed side alone: its segment is a
+    // second source.
+    ("SELECT x.id AS xid, y.v FROM (SELECT id, v + 1 AS s FROM a) x JOIN a y ON x.s = y.k", 2, &[], &[(EquiJoin, 1)]),
+    ("SELECT x.id AS xid, y.v FROM (SELECT id, v + 1 AS s FROM a) x LEFT JOIN a y ON x.s = y.k", 2, &[], &[(EquiJoin, 2), (Distinct, 1), (NullExtend, 1)]),
     ("SELECT a.id AS aid, b.id AS bid, u.id AS uid FROM a, b, u", 2, &[PK, PK], &[(CrossJoin, 2), (WorkerFilter, 4)]),
     // Semi / anti / mark / IN: a join against B's key set, no exchange.
     ("SELECT a.v FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", 1, &[], &[(EquiJoin, 1), (Distinct, 1)]),

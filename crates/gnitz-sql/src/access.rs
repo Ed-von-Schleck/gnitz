@@ -1,9 +1,13 @@
-//! Access-path recognition over bound conjuncts, shared by the DML planners and the
-//! view compiler: [`candidates`] lists every bound a WHERE admits, best first.
+//! Access-path recognition over bound conjuncts: [`candidates`] lists every bound a
+//! WHERE admits, best first, and [`bound_and_predicate`] takes the first whose
+//! residual compiles, the choice of an ad-hoc read and of the DML verbs; the view
+//! compiler ranks the same list by its own policy.
 //!
-//! An **AST-free leaf** — `ir`, `literal` and the client crates, nothing else.
+//! AST-free: `ir`, `literal`, `expr_lower` and the client crates.
 
-use crate::ir::{BExpr, BinOp, BoundExpr};
+use crate::error::GnitzSqlError;
+use crate::expr_lower::compile_wire_conjuncts;
+use crate::ir::{BExpr, BoundExpr};
 use crate::literal::{place, Compared, Placed};
 use gnitz_core::Schema;
 use gnitz_expr::CmpOp;
@@ -12,19 +16,21 @@ use gnitz_wire::{RelIndex, TypeCode, PK_LIST_MAX_COLS};
 use std::cmp::Reverse;
 use std::ops::RangeInclusive;
 
-/// Classify a bound binary op as `col OP literal`, the `ColRef` on either side,
-/// with the literal placed among the column's values. The returned operator
-/// always reads `col OP lit`.
-fn bound_col_vs_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, Placed, BinOp)> {
+/// Classify a bound binary op as `col CMP literal` that a key range can serve: an
+/// ordering comparison or `=`, never `<>`, the `ColRef` on either side, with the
+/// literal placed among the column's values. The returned comparison always reads
+/// `col CMP lit`.
+fn bound_col_vs_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, Placed, CmpOp)> {
     let BExpr::BinOp(left, op, right) = expr else {
         return None;
     };
-    let placed = |idx: usize, lit: &BoundExpr| place(lit, schema.columns()[idx].ty);
-    match (left.as_ref(), right.as_ref()) {
-        (BExpr::ColRef(idx), lit) => Some((*idx, placed(*idx, lit)?, *op)),
-        (lit, BExpr::ColRef(idx)) => Some((*idx, placed(*idx, lit)?, op.converse())),
-        _ => None,
-    }
+    let (col, lit, op) = match (left.as_ref(), right.as_ref()) {
+        (BExpr::ColRef(idx), lit) => (*idx, lit, *op),
+        (lit, BExpr::ColRef(idx)) => (*idx, lit, op.converse()),
+        _ => return None,
+    };
+    let cmp = op.as_cmp().filter(|c| *c != CmpOp::Ne)?;
+    Some((col, place(lit, schema.columns()[col].ty)?, cmp))
 }
 
 /// A key column's greatest image; `None` for a type that is no key column.
@@ -82,8 +88,7 @@ fn term(conjunct: &BoundExpr, schema: &Schema) -> Option<(usize, Pin)> {
         keys.dedup();
         return Some((*col, Pin::In(keys)));
     }
-    let (col, p, op) = bound_col_vs_literal(conjunct, schema)?;
-    let cmp = op.as_cmp().filter(|c| *c != CmpOp::Ne)?;
+    let (col, p, cmp) = bound_col_vs_literal(conjunct, schema)?;
     let tc = schema.columns()[col].ty.tc;
     let max = image_max(tc)?;
     let admits = match p.compare(cmp) {
@@ -112,6 +117,8 @@ fn term(conjunct: &BoundExpr, schema: &Schema) -> Option<(usize, Pin)> {
 /// intersection is exact, so a consumed conjunct needs no re-imposing.
 struct Folded {
     admits: RangeInclusive<u128>,
+    /// The column's greatest image: the top of the interval no pin bounds.
+    max: u128,
     consumed: Vec<usize>,
 }
 
@@ -123,8 +130,10 @@ impl Folded {
 
 /// Every `Range` pin on `col` intersected. `None` when no such pin names `col`.
 fn fold(col: u32, terms: &[Term], schema: &Schema) -> Option<Folded> {
+    let max = image_max(schema.columns()[col as usize].ty.tc)?;
     let mut f = Folded {
-        admits: 0..=image_max(schema.columns()[col as usize].ty.tc)?,
+        admits: 0..=max,
+        max,
         consumed: Vec::new(),
     };
     for t in terms.iter().filter(|t| t.col as u32 == col) {
@@ -163,18 +172,17 @@ fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option
                 consumed.extend(f.consumed);
             }
             None => {
-                next = Some((col, f));
+                next = Some(f);
                 break;
             }
         }
     }
     let pinned = eq.len();
     let (range, bounded_sides) = match next {
-        Some((col, f)) => {
-            let max = image_max(schema.columns()[col as usize].ty.tc)?;
+        Some(f) => {
             consumed.extend(f.consumed);
             let (&first, &last) = (f.admits.start(), f.admits.end());
-            let sides = (first != 0) as u32 + (last != max) as u32;
+            let sides = (first != 0) as u32 + (last != f.max) as u32;
             (KeyRange::new(cols, &eq, first, last), sides)
         }
         None => {
@@ -265,7 +273,7 @@ pub(crate) struct Candidate {
 }
 
 /// The conjuncts a candidate's walk does not apply, kept as a post-walk filter.
-pub(crate) fn residual<'e>(conjuncts: &'e [BoundExpr], consumed: &[usize]) -> Vec<&'e BoundExpr> {
+fn residual<'e>(conjuncts: &'e [BoundExpr], consumed: &[usize]) -> Vec<&'e BoundExpr> {
     conjuncts
         .iter()
         .enumerate()
@@ -291,6 +299,33 @@ enum Tier {
 /// residual does not compile gives way to the next.
 pub(crate) fn candidates(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec<Candidate> {
     ranked(conjuncts, schema, indexes).into_iter().map(|(_, c)| c).collect()
+}
+
+/// Bind-once WHERE → the access path that serves it: the first of [`candidates`]
+/// whose residual compiles, else an unbounded scan under the whole WHERE.
+/// `indexes` is the relation's declared secondary-index list.
+pub(crate) fn bound_and_predicate(
+    schema: &Schema,
+    conjuncts: &[BoundExpr],
+    indexes: &[RelIndex],
+) -> Result<(ReadBound, Vec<u8>), GnitzSqlError> {
+    let mut blocked = None;
+    for Candidate { bound, consumed } in candidates(conjuncts, schema, indexes) {
+        let residual = residual(conjuncts, &consumed);
+        match compile_wire_conjuncts(residual.iter().copied(), schema.columns()) {
+            Ok(predicate) => return Ok((bound, predicate)),
+            // A conjunct the VM cannot carry; a later candidate may consume it.
+            Err(e @ GnitzSqlError::Rejected(_)) => {
+                blocked.get_or_insert(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // A candidate's residual is part of the whole WHERE, which then fails too.
+    if let Some(e) = blocked {
+        return Err(e);
+    }
+    Ok((ReadBound::None, compile_wire_conjuncts(conjuncts, schema.columns())?))
 }
 
 /// [`candidates`], each beside the tier that placed it.

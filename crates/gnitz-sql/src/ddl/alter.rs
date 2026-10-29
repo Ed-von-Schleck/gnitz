@@ -4,10 +4,9 @@
 //! the catalog is the engine precheck's.
 
 use super::guard::{reject_unhonored_column_options, reject_unhonored_unique_fields, ColumnOptionSite};
-use crate::ast_util::extract_object_name;
-use crate::bind::{find_unique_column, require_column};
 use crate::error::{missing_relation, reject_if, unsupported_clause, GnitzSqlError};
-use crate::rules::{canonical_user_name, require_class, validate_user_name, ClassWant};
+use crate::names::extract_object_name;
+use crate::rules::{canonical_user_name, find_unique_column, require_class, require_column, ClassWant};
 use crate::types::column_def;
 use gnitz_core::{GnitzClient, RelName};
 use sqlparser::ast::{
@@ -41,7 +40,7 @@ enum Action<'a> {
         explicit_name: Option<String>,
     },
     DropConstraint {
-        name: &'a str,
+        name: String,
         if_exists: bool,
     },
 }
@@ -122,16 +121,14 @@ pub(crate) async fn execute_alter_table(
             return super::table::create_index_core(
                 client,
                 &rel,
-                &super::table::IndexRequest {
-                    owner_name: &source_name,
-                    columns,
-                    explicit_name,
-                    site: super::table::IndexSite::AddConstraint,
-                },
+                &source_name,
+                columns,
+                explicit_name,
+                super::table::IndexSite::AddConstraint,
             )
             .await;
         }
-        Action::DropConstraint { name, if_exists } => client.drop_unique_constraint(rel.tid, name, if_exists).await?,
+        Action::DropConstraint { name, if_exists } => client.drop_unique_constraint(rel.tid, &name, if_exists).await?,
     }
     Ok(())
 }
@@ -243,8 +240,13 @@ fn parse<'a>(
         AlterTableOperation::DropConstraint { if_exists, name, drop_behavior } => {
             const CTX: &str = "ALTER TABLE DROP CONSTRAINT";
             reject_if(matches!(drop_behavior, Some(DropBehavior::Cascade)), CTX, "CASCADE")?;
-            validate_user_name(&name.value)?;
-            Ok((CTX, Action::DropConstraint { name: &name.value, if_exists: *if_exists }))
+            Ok((
+                CTX,
+                Action::DropConstraint {
+                    name: canonical_user_name(&name.value)?,
+                    if_exists: *if_exists,
+                },
+            ))
         }
         _ => Err(unsupported_clause("ALTER TABLE", &operation.to_string())),
     }

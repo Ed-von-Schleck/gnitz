@@ -4,11 +4,11 @@
 //! flat query binds to, which the rows reply and [`super::fold`] then lower.
 
 use super::super::physical::{self, Frame};
-use super::super::{as_col, hircol_of, reduce_reads, AggCol, BoundRef, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
+use super::super::{hircol_of, reduce_reads, AggCol, BoundRef, ColId, HirCol, HirExpr, ProjEntry, RelExpr};
 use super::fold::{distinct_fold, fold, FoldPieces};
 use crate::error::{derivation, GnitzSqlError};
 use crate::ir::{BExpr, BoundExpr};
-use crate::project::{payload_program, ProjItem};
+use crate::project::payload_program;
 use crate::tail::wire_keys;
 use gnitz_core::{RelDescriptor, Schema};
 use gnitz_wire::{ColumnDef, OrderKey};
@@ -34,8 +34,13 @@ pub(crate) enum AdhocRead {
 
 pub(crate) enum AdhocShape {
     Rows(AdhocRows),
-    /// The fold, and the finalize item each ORDER BY expression key sorts on.
-    Fold(Box<FoldPieces>, Vec<usize>),
+    Fold {
+        pieces: Box<FoldPieces>,
+        /// The finalize item each ORDER BY expression key sorts on.
+        order_cols: Vec<usize>,
+        /// Nothing in the fold's layout tells a DISTINCT from a zero-aggregate GROUP BY.
+        is_distinct: bool,
+    },
 }
 
 /// The ceiling on the column references one projection's composed expressions
@@ -82,8 +87,9 @@ impl Linear<'_> {
         match self.base.as_ref() {
             RelExpr::Get { desc, cols } => Ok((desc, cols)),
             RelExpr::Reduce { .. } => Err(derivation("an aggregate over a grouped CTE")),
+            // A DISTINCT over no relation is a set already, so only an aggregate meets it.
             _ => Err(GnitzSqlError::Rejected(
-                "SELECT without FROM: aggregates and DISTINCT are not supported".into(),
+                "an aggregate over a SELECT without FROM is not supported".into(),
             )),
         }
     }
@@ -156,7 +162,12 @@ pub(crate) fn lower_read(rel: &Rc<RelExpr>, placed: Vec<usize>, refs: &[BoundRef
             let lin = linear(base)?;
             let (desc, source) = lin.source()?;
             let pieces = distinct_fold(Frame::scan(desc, source), &lin.items(items)?)?;
-            (lin, AdhocShape::Fold(Box::new(pieces), placed))
+            let shape = AdhocShape::Fold {
+                pieces: Box::new(pieces),
+                order_cols: placed,
+                is_distinct: true,
+            };
+            (lin, shape)
         }
         RelExpr::Project { input, items } => {
             let top = linear(input)?;
@@ -166,7 +177,12 @@ pub(crate) fn lower_read(rel: &Rc<RelExpr>, placed: Vec<usize>, refs: &[BoundRef
                 RelExpr::Reduce { input, group_cols, aggs } => {
                     let lin = linear(input)?;
                     let pieces = flat_reduce(&lin, input, group_cols, aggs, &top.preds, &top.items(items)?)?;
-                    (lin, AdhocShape::Fold(Box::new(pieces), placed))
+                    let shape = AdhocShape::Fold {
+                        pieces: Box::new(pieces),
+                        order_cols: placed,
+                        is_distinct: false,
+                    };
+                    (lin, shape)
                 }
                 _ => {
                     let (desc, source) = top.source()?;
@@ -195,7 +211,9 @@ pub(crate) fn lower_read(rel: &Rc<RelExpr>, placed: Vec<usize>, refs: &[BoundRef
 /// The constant row `items` compute over no relation.
 fn constant(lin: &Linear<'_>, items: &[ProjEntry]) -> Result<AdhocRead, GnitzSqlError> {
     if !lin.preds.is_empty() {
-        return Err(crate::error::unsupported_clause("SELECT without FROM", "WHERE"));
+        return Err(GnitzSqlError::Rejected(
+            "a WHERE over a SELECT without FROM is not supported".into(),
+        ));
     }
     let mut no_column = |_: &ColId| Err(GnitzSqlError::Internal("a constant item references a column".into()));
     let items = lin
@@ -225,16 +243,16 @@ fn flat_reduce(
     // What the reduce reads, in the order its pre-map lists it.
     for r in reduce_reads(group_cols, aggs) {
         let e = &lin.map[&r];
-        match as_col(e) {
+        match e.as_col() {
             Some(src) => {
                 copies.insert(r, src);
                 if !pre.iter().any(|p| p.out.id == src) {
-                    pre.push(RelExpr::passthrough_item(hircol_of(source, src).clone()));
+                    pre.push(ProjEntry::passthrough(hircol_of(source, src).clone()));
                 }
             }
             None => {
                 let def = &hircol_of(&in_cols, r).def;
-                let def = ColumnDef::typed(format!("_pre{computed}"), def.ty, true).hidden();
+                let def = ColumnDef::typed(format!("_pre{computed}"), def.ty, def.is_nullable).hidden();
                 computed += 1;
                 pre.push(ProjEntry {
                     expr: e.clone(),
@@ -277,7 +295,7 @@ pub(crate) struct AdhocRows {
     cols: Vec<HirCol>,
     /// The items as the projection's slots, the source PK pinned in front, and the
     /// frame they produce.
-    proj: Vec<ProjItem>,
+    proj: Vec<BoundExpr>,
     out: Frame,
     /// The item each ORDER BY expression key sorts on.
     placed: Vec<usize>,
@@ -351,7 +369,7 @@ impl AdhocRows {
         let payload = proj[k..]
             .iter()
             .zip(&out.schema.columns()[k..])
-            .map(|(item, def)| (item.passthrough_src(), def.ty));
+            .map(|(item, def)| (item.as_col(), def.ty));
         let unmapped = payload.eq(src.payload_columns().map(|(_, ci, col)| (Some(ci), col.ty)));
         let program = (!unmapped)
             .then(|| payload_program(&proj, &out.schema, &src))
@@ -363,7 +381,7 @@ impl AdhocRows {
             .into_iter()
             .map(|key| Ok((out.slot(cols[key.col as usize].id)?, key)))
             .collect::<Result<Vec<_>, GnitzSqlError>>()?;
-        let source_col = |slot: usize| proj[slot].passthrough_src();
+        let source_col = |slot: usize| proj[slot].as_col();
         let numbered = |col: &dyn Fn(usize) -> usize| -> Vec<OrderKey> {
             slots
                 .iter()
@@ -372,7 +390,7 @@ impl AdhocRows {
         };
         let mut copied: Vec<(u32, u32)> = Vec::new();
         for (slot, item) in proj.iter().enumerate() {
-            let src = item.passthrough_src().map(|s| s as u32);
+            let src = item.as_col().map(|s| s as u32);
             if let Some(src) = src.filter(|s| copied.iter().all(|(c, _)| c != s)) {
                 copied.push((src, column_of[slot]));
             }

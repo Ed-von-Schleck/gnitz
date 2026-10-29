@@ -1,30 +1,31 @@
 //! INSERT, including the `ON CONFLICT` upsert family. The default form pushes
 //! with `WireConflictMode::Error`; `DO NOTHING` / `DO UPDATE` filter or merge the
 //! VALUES against the rows their keys hold, as a read-modify-write. `DO UPDATE
-//! SET` runs `mutate`'s SET list, so it behaves exactly like an `UPDATE ... SET`.
+//! SET` runs the SET list `UPDATE` runs, so it behaves exactly like an `UPDATE ... SET`.
 //!
 //! [`plan_insert`] reads only the catalog, so a refused statement issues no
 //! request and consumes no SERIAL id; [`execute_insert`] runs what it planned.
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use super::colwrite::{append_value_to_col, check_not_null, native_value};
-use crate::ast_util::{extract_object_name, single_part_ident};
+use super::set::{apply_set, bind_set_list, SetClause, SetCol};
+use crate::ast_util::single_part_ident;
 use crate::bind::bind_constant;
-use crate::bind::{require_column, Catalog};
-use crate::dml::mutate::{apply_set, bind_set_list, SetClause, SetCol};
+use crate::catalog::Catalog;
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::exec::client_map::ClientMap;
 use crate::exec::keys::{firsts, Firsts};
 use crate::hir::RowsReply;
 use crate::ir::BExpr;
-use crate::rules::{require_class, ClassWant};
+use crate::names::extract_object_name;
+use crate::rules::{require_class, require_column, ClassWant};
 use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, PkColumn, RelDescriptor, ScanReply, Schema, ZSetBatch};
+use gnitz_core::{ClientError, GnitzClient, PkColumn, ProtocolError, RelDescriptor, ScanReply, Schema, ZSetBatch};
 use gnitz_wire::{FixedInt, ReadBound, RelClass, WireConflictMode};
+use rustc_hash::FxHashMap;
 use sqlparser::ast::{
     ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query, SetExpr,
     TableObject, Values,
@@ -427,19 +428,23 @@ pub(crate) async fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -
 
 /// The delta an ON CONFLICT pushes, given the rows `held` under the keys of
 /// `rows` (one row per key): a row whose key nothing holds passes through; a
-/// held key is dropped (DO NOTHING) or merged with the SET list (DO UPDATE).
+/// held key is dropped (DO NOTHING) or merged with the SET list (DO UPDATE). A
+/// `held` holding a key outside `rows`, or one key twice, is a malformed reply.
 fn resolve_conflicts(
     rows: &ZSetBatch,
     held: ZSetBatch,
     set: Option<&mut [SetCol]>,
     schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let at: HashMap<&[u8], usize> = (0..rows.len()).map(|i| (rows.pks.get_bytes(i), i)).collect();
-    let collided: Vec<usize> = (0..held.len()).map(|r| at[held.pks.get_bytes(r)]).collect();
+    let at: FxHashMap<&[u8], usize> = (0..rows.len()).map(|i| (rows.pks.get_bytes(i), i)).collect();
     let mut is_held = vec![false; rows.len()];
-    for &i in &collided {
-        is_held[i] = true;
-    }
+    let collided = (0..held.len())
+        .map(|r| match at.get(held.pks.get_bytes(r)) {
+            Some(&i) if !std::mem::replace(&mut is_held[i], true) => Ok(i),
+            Some(_) => Err(malformed_reply("a key held twice")),
+            None => Err(malformed_reply("a key that was not read")),
+        })
+        .collect::<Result<Vec<usize>, _>>()?;
     let mut out = ZSetBatch::with_capacity(schema, rows.len());
     for i in (0..rows.len()).filter(|&i| !is_held[i]) {
         out.copy_row_at(rows, i, 1);
@@ -454,6 +459,14 @@ fn resolve_conflicts(
         out.extend_from_owned(apply_set(set, held, Some(&excluded), schema)?);
     }
     Ok(out)
+}
+
+/// A read reply that does not answer the keys it was asked for.
+#[cold]
+fn malformed_reply(what: &str) -> GnitzSqlError {
+    GnitzSqlError::Client(ClientError::Protocol(ProtocolError::DecodeError(format!(
+        "ON CONFLICT read reply carries {what}"
+    ))))
 }
 
 fn extract_values_rows(query: &Query) -> Result<&[Parens<Vec<Expr>>], GnitzSqlError> {

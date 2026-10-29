@@ -5,7 +5,7 @@
 //! the DISTINCT's projection, directly over the relation read.
 
 use super::super::physical::{self, Frame};
-use super::super::{as_col, AggCol, ColId, HirExpr, ProjEntry};
+use super::super::{AggCol, ColId, HirExpr, ProjEntry};
 use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
@@ -46,7 +46,7 @@ pub(crate) struct FoldPieces {
 /// `SELECT DISTINCT items` over `src`. Bare items group the source columns where they lie; any
 /// computed item makes the projection the pre-map and groups its columns.
 pub(super) fn distinct_fold(src: Frame, items: &[ProjEntry]) -> Result<FoldPieces, GnitzSqlError> {
-    let (pre, group_cols) = match items.iter().map(|e| as_col(&e.expr)).collect::<Option<Vec<_>>>() {
+    let (pre, group_cols) = match items.iter().map(|e| e.expr.as_col()).collect::<Option<Vec<_>>>() {
         Some(ids) => (None, ids),
         None => (Some(items), items.iter().map(|e| e.out.id).collect()),
     };

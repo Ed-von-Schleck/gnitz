@@ -1,23 +1,48 @@
 //! Subquery binding: EXISTS / IN, a scalar aggregate, and ANY / ALL, each bound to
 //! the column its decorrelated join produces.
 
-use super::super::{
-    cross_comparison, hircol_of, side, ColId, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, Side, SubqueryKind,
-    SubqueryRef,
-};
+use super::super::{cross_comparison, hircol_of, side, ColId, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, Side};
 use super::{resolve_table_ref, BindCx, JoinScope, ScopeLeaf, SubPolicy};
-use crate::agg::AggFunc;
+use crate::agg::{AggArg, AggFunc};
 use crate::ast_util::{
-    classify_agg_call, classify_from, col_ref_parts, extract_table_ref, is_agg_call, peel_nested, AggArg, FromShape,
+    body_is_grouped, classify_agg_call, classify_from, col_ref_parts, is_agg_call, peel_nested, FromShape,
 };
-use crate::bind::{bind_conjuncts, bind_structural, maybe_negate, unsupported_subquery};
+use crate::bind::{bind_conjuncts, bind_structural, maybe_negate};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
+use crate::names::extract_table_ref;
 use crate::validate::{as_plain_select, reject_query_envelope_body, reject_unhonored_select_clauses, HonoredClauses};
-use gnitz_wire::ColumnDef;
+use gnitz_wire::{ColType, ColumnDef};
 use sqlparser::ast::{BinaryOperator, Expr, Query, Select, SelectItem};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+/// A subquery bound where its expression was written: the column it is read
+/// through, and what joins that column in when the body's projection is built.
+#[derive(Clone)]
+pub(super) struct SubqueryRef {
+    /// The column this subquery is read through: its Mark join's BOOLEAN column,
+    /// or its finalized aggregate.
+    pub(super) id: ColId,
+    pub(super) kind: SubqueryKind,
+    /// EXISTS/IN: the inner relation (a `Get`, or a CTE's `Alias`) under an
+    /// optional `Filter` of its local WHERE. Scalar: `Project(Reduce)` passing
+    /// the group columns through and computing the finalized aggregate as `id`.
+    pub(super) rel: Rc<RelExpr>,
+    /// The mixed-scope conjuncts that become the join's ON, an IN's
+    /// `outer = inner` equality among them.
+    pub(super) correlation: Vec<HirExpr>,
+}
+
+/// How a subquery joins in: `Exists` (EXISTS / IN) as a Semi/Anti/Mark join,
+/// `Scalar` (an aggregate, or a range ANY/ALL's MIN/MAX) as its reduce.
+#[derive(Clone, Copy)]
+pub(super) enum SubqueryKind {
+    /// `nullable`: an IN whose operands can be NULL, so its truth can be.
+    Exists { nullable: bool },
+    /// `count`: a COUNT, which a group of no rows renders as 0, never NULL.
+    Scalar { ty: ColType, count: bool },
+}
 
 /// Everything a subquery bind resolves against: the body bind's own context,
 /// the one-relation outer scope it correlates to, and the record of subqueries
@@ -146,6 +171,13 @@ fn bind_exists_sub(
     let ir = resolve_inner(cx, subquery)?;
     let mut correlation = ir.correlation;
     let mut nullable = false;
+    if in_operand.is_none() && body_is_grouped(ir.inner_select) {
+        // An ungrouped aggregate yields one row over any input, so the subquery
+        // always has a row; a semi-join would test for a match.
+        return Err(GnitzSqlError::Rejected(
+            "EXISTS (SELECT <aggregate> …) is always true: an aggregate subquery returns one row".into(),
+        ));
+    }
     if let Some(operand) = in_operand {
         // IN shape: reject a tuple / non-plain-column LHS before extracting the pair.
         if matches!(operand, Expr::Tuple(_)) {
@@ -246,10 +278,7 @@ fn bind_quantifier_sub(
         ));
     }
     let m = cx.record(scalar_leaf(cx, ir, agg_func, Some(inner_col))?);
-    let outer_leaf = ScopeLeaf {
-        scope: cx.outer,
-        sub: SubPolicy::Reject(unsupported_subquery),
-    };
+    let outer_leaf = ScopeLeaf::plain(cx.outer);
     let x = bind_structural(left, &outer_leaf)?;
     let cmp = BExpr::bin(x, bop, m.clone());
     // ANY over ∅ = FALSE, ALL over ∅ = TRUE: `m` is NULL over no rows, so the
@@ -326,10 +355,12 @@ fn scalar_leaf(
     let group_cols = scalar_group_cols(&ir.correlation, &cx.outer.combined, inner_cols)?;
     let arg = arg.map_or(AggArg::Star, AggArg::All);
     let agg = HirAgg::new(ids, func, arg, inner_cols, group_cols.is_empty(), &[])?;
-    let (expr, ty, nullable) = agg.as_value();
+    let ty = crate::agg::agg_view_type(func, agg.out.col.def.ty);
+    // A companion carries the null-ness; otherwise the raw column's own.
+    let nullable = agg.companion.is_some() || agg.out.col.def.is_nullable;
     let value = HirCol::new(ids.next(), ColumnDef::typed("_agg", ty, nullable).hidden());
-    let mut items = RelExpr::passthrough_items(group_cols.iter().map(|&id| hircol_of(inner_cols, id).clone()));
-    items.push(ProjEntry { expr, out: value.clone() });
+    let mut items = ProjEntry::passthroughs(group_cols.iter().map(|&id| hircol_of(inner_cols, id).clone()));
+    items.push(ProjEntry { expr: agg.finalize(), out: value.clone() });
     Ok(SubqueryRef {
         id: value.id,
         kind: SubqueryKind::Scalar { ty, count: func == AggFunc::Count },

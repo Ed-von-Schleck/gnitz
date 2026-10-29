@@ -6,10 +6,48 @@
 //! It reaches nothing: describing a query is as server-free as compiling one.
 
 use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
+use crate::error::{reject_if, GnitzSqlError};
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, GnitzClient, ScanReply, Schema, ZSetBatch};
 use gnitz_wire::{AggFunc, GroupAggs, ReadBound, RowsCut, SinkKind};
 use gnitz_wire::{ColumnDef, TypeCode};
+use sqlparser::ast::{Query, Statement};
+
+/// The SELECT an `EXPLAIN` describes. EXPLAIN describes the plan a query *would*
+/// take, so it consumes only the statement it wraps. `describe_alias` is inert
+/// phrasing: `EXPLAIN`, `DESCRIBE` and `DESC` introduce the same statement.
+pub(crate) fn explained_query(stmt: &Statement) -> Result<&Query, GnitzSqlError> {
+    if let Statement::Explain {
+        describe_alias: _,
+        analyze,
+        verbose,
+        query_plan,
+        estimate,
+        statement,
+        format,
+        options,
+    } = stmt
+    {
+        const CTX: &str = "EXPLAIN";
+        // `analyze` runs the query, the one option that changes what EXPLAIN
+        // does; the rest each ask for a rendering this output shape lacks.
+        reject_if(*analyze, CTX, "ANALYZE")?;
+        reject_if(*verbose, CTX, "VERBOSE")?;
+        reject_if(*query_plan, CTX, "QUERY PLAN")?;
+        reject_if(*estimate, CTX, "ESTIMATE")?;
+        reject_if(format.is_some(), CTX, "FORMAT")?;
+        // `GenericDialect` sets `supports_explain_with_utility_options`, so the
+        // parenthesized Postgres form parses into `options` rather than failing
+        // at parse time.
+        reject_if(options.is_some(), CTX, "the parenthesized option list")?;
+        if let Statement::Query(q) = statement.as_ref() {
+            return Ok(q);
+        }
+    }
+    Err(GnitzSqlError::Rejected(
+        "EXPLAIN describes a SELECT; this statement is not one".to_string(),
+    ))
+}
 
 /// Describe `plan` without running it: the EXPLAIN reply. A read of a relation
 /// `client` mirrors is described as the local read it is served as.
@@ -129,19 +167,13 @@ fn access_line(bound: &ReadBound, schema: &Schema) -> String {
     }
 }
 
-/// Whether column `i` is a hidden **payload** column: one appended to order the
-/// reply. A hidden PK column carries the reply's key instead.
-fn is_hidden_payload(schema: &Schema, i: usize) -> bool {
-    schema.columns()[i].is_hidden && !schema.layout().is_pk_col(i)
-}
-
 /// How wide the reply is: its visible columns, the hidden ones appended to order it, and
 /// whether it ships no map.
 fn projection_line(schema: &Schema, unprojected: bool) -> String {
     let visible = schema.visible_columns().count();
-    let extra = (0..schema.columns().len())
-        .filter(|&i| is_hidden_payload(schema, i))
-        .count();
+    // A hidden payload column is appended to order the reply; a hidden PK column
+    // carries its key.
+    let extra = schema.payload_columns().filter(|(_, _, d)| d.is_hidden).count();
     let noun = if visible == 1 { "column" } else { "columns" };
     let mut line = if extra > 0 {
         format!("projection: {visible} {noun} (+{extra} for ordering)")

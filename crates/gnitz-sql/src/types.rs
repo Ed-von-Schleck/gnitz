@@ -12,7 +12,7 @@ pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
         DataType::IntUnsigned(_) | DataType::IntegerUnsigned(_) | DataType::UnsignedInteger => TypeCode::U32,
         DataType::SmallIntUnsigned(_) => TypeCode::U16,
         DataType::TinyIntUnsigned(_) => TypeCode::U8,
-        DataType::Float(_) => TypeCode::F32,
+        DataType::Float(info) => float_type(info)?,
         DataType::Double(_) | DataType::DoublePrecision | DataType::Real => TypeCode::F64,
         DataType::Varchar(_) | DataType::Text | DataType::Char(_) => TypeCode::String,
         DataType::Blob(None) | DataType::Bytea => TypeCode::Blob,
@@ -63,6 +63,21 @@ pub fn sql_type_name(ty: ColType) -> String {
     name.to_string()
 }
 
+/// `FLOAT` / `FLOAT(p)`: `p` counts binary digits of mantissa, so `1..=24` is single
+/// precision and `25..=53` double; any other modifier is refused.
+fn float_type(info: &ExactNumberInfo) -> Result<TypeCode, GnitzSqlError> {
+    match *info {
+        ExactNumberInfo::None | ExactNumberInfo::Precision(1..=24) => Ok(TypeCode::F32),
+        ExactNumberInfo::Precision(25..=53) => Ok(TypeCode::F64),
+        ExactNumberInfo::Precision(p) => Err(GnitzSqlError::Rejected(format!(
+            "FLOAT({p}): the precision must be 1..=53"
+        ))),
+        ExactNumberInfo::PrecisionAndScale(p, s) => Err(GnitzSqlError::Rejected(format!(
+            "FLOAT({p}, {s}): a FLOAT takes no scale; write DECIMAL({p}, {s}) for fixed point"
+        ))),
+    }
+}
+
 /// `DECIMAL(p, s)` / `NUMERIC(p, s)`: fixed-point at scale `s` (`DECIMAL(p)` is
 /// scale 0), `p` in `1..=MAX_DECIMAL_SCALE`. The precision bounds nothing finer — a value is
 /// bounded by the `i64` behind its scale.
@@ -100,7 +115,8 @@ pub(crate) fn column_def(col: &sqlparser::ast::ColumnDef) -> Result<(ColumnDef, 
     Ok((ColumnDef::typed(name, sql_col_type(&col.data_type)?, nullable), false))
 }
 
-/// The SERIAL family's signed integer; a modifier (`SERIAL(5)`) makes it no SERIAL.
+/// The SERIAL family's signed integer; a modifier (`SERIAL(5)`) or a qualifier
+/// (`foo.SERIAL`) makes it no SERIAL.
 fn serial_type(dt: &DataType) -> Option<TypeCode> {
     let DataType::Custom(name, mods) = dt else {
         return None;
@@ -108,10 +124,10 @@ fn serial_type(dt: &DataType) -> Option<TypeCode> {
     if !mods.is_empty() {
         return None;
     }
-    let ident = crate::ast_util::object_name_ident(name)?;
+    let ident = crate::ast_util::single_part_ident(name)?;
     SERIAL_TYPES
         .iter()
-        .find(|(n, _)| ident.value.eq_ignore_ascii_case(n))
+        .find(|(n, _)| ident.eq_ignore_ascii_case(n))
         .map(|&(_, tc)| tc)
 }
 
@@ -132,7 +148,7 @@ const SERIAL_TYPES: &[(&str, TypeCode)] = &[
 ];
 
 /// Every spelling [`sql_col_type`] accepts, without its modifiers.
-pub(crate) const TYPE_NAMES: &[&str] = &[
+const TYPE_NAMES: &[&str] = &[
     "TINYINT",
     "SMALLINT",
     "INT",

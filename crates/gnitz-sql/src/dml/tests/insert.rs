@@ -1,9 +1,9 @@
 use super::*;
-use crate::dml::plan::access_path;
+use crate::access::bound_and_predicate;
 use crate::test_support::Cell::{self, Int, Null, Str, F64};
 use crate::test_support::{
-    assert_rejects, batch_of, catalog, col, ncol, parse_expr_sql, parse_stmt, pk_schema, rel, rows_of, schema, table,
-    TestCatalog,
+    assert_rejects, batch_of, bind_where, catalog, col, keyed_batch, ncol, parse_stmt, pk_schema, rel, rows_of, schema,
+    table, TestCatalog,
 };
 use gnitz_wire::TypeCode;
 use sqlparser::ast::Statement;
@@ -160,7 +160,7 @@ fn an_inserted_key_is_the_key_its_literal_seeks() {
         let plan =
             insert(&cat, &format!("INSERT INTO t VALUES ({lit}, 0)")).unwrap_or_else(|e| panic!("{tc:?}: {e:?}"));
         for pred in [format!("id = {lit}"), format!("id IN ({lit}, {lit})")] {
-            let (bound, _) = access_path(&s, "t", Some(&parse_expr_sql(&pred)), &[]).unwrap();
+            let (bound, _) = bound_and_predicate(&s, &bind_where(&pred, &s), &[]).unwrap();
             assert_eq!(bound, ReadBound::PkSet(plan.rows.pks.keys()), "{tc:?}: {pred}");
         }
     }
@@ -368,6 +368,39 @@ fn on_conflict_resolves_each_row_against_the_row_its_key_holds() {
         assert_eq!(&keys(&out), want_keys, "`{sql}`");
         let want: Vec<_> = want_rows.iter().map(|cells| (cells.to_vec(), 1)).collect();
         assert_eq!(rows_of(schema, &out), want, "`{sql}`");
+    }
+}
+
+/// A read reply holding a key the statement did not read, or one key twice, is a
+/// malformed reply: refused, never resolved as a conflict.
+#[test]
+fn on_conflict_refuses_a_reply_outside_the_read_keys() {
+    let cat = cat();
+    for sql in [
+        "INSERT INTO t VALUES (1, 100, 'a') ON CONFLICT DO NOTHING",
+        "INSERT INTO t VALUES (1, 100, 'a') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+    ] {
+        let InsertPlan {
+            target,
+            rows,
+            conflict: ConflictPlan::Resolve { mut set },
+            ..
+        } = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
+        else {
+            panic!("`{sql}` has no ON CONFLICT");
+        };
+        let schema = &target.schema;
+        // Keys 1 and 2; key 2 was never read.
+        let foreign = batch_of(schema, &[&[Int(10), Null], &[Int(20), Null]]);
+        let twice = keyed_batch(schema, &[(&[1], 1, &[Int(10), Null]), (&[1], 1, &[Int(20), Null])]);
+        for (held, what) in [(foreign, "a key that was not read"), (twice, "a key held twice")] {
+            match resolve_conflicts(&rows, held, set.as_deref_mut(), schema) {
+                Err(GnitzSqlError::Client(ClientError::Protocol(e))) => {
+                    assert!(e.to_string().contains(what), "`{sql}`: {e}")
+                }
+                other => panic!("`{sql}`: {what}: {:?}", other.map(|b| b.len())),
+            }
+        }
     }
 }
 

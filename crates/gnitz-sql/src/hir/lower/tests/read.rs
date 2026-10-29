@@ -12,12 +12,10 @@ fn u64_table(cols: &[&str], pk: &[u32]) -> Arc<RelDescriptor> {
 /// in PK order when `walks_in_pk_order`.
 fn rows_reply_of(sql: &str, desc: &Arc<RelDescriptor>, walks_in_pk_order: bool) -> RowsReply {
     let q = crate::test_support::parse_query(sql);
-    let sel = crate::validate::as_plain_select(&q.body, sql).unwrap();
     let cat = crate::test_support::catalog(vec![("t", Arc::clone(desc))]);
     let keys = crate::tail::parse_order_by(q.order_by.as_ref()).unwrap();
     let exprs = crate::tail::order_exprs(&keys);
-    let read =
-        crate::hir::bind_adhoc_read(&cat, &q, sel, "SELECT", &exprs).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+    let read = crate::hir::bind_adhoc_read(&cat, &q, &exprs).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
     let crate::hir::AdhocRead::Relation {
         shape: crate::hir::AdhocShape::Rows(rows),
         ..

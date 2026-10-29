@@ -1,7 +1,7 @@
 //! Shared `#[cfg(test)]` helpers: column, schema, catalog and batch builders,
 //! and the parse/bind entry points the unit tests and the suites drive.
 
-use crate::bind::Catalog;
+use crate::catalog::Catalog;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{BatchAppender, PlannedView, RelDescriptor, RelName, Schema, ZSetBatch};
@@ -24,6 +24,13 @@ pub(crate) fn col(name: &str, tc: TypeCode) -> ColumnDef {
 /// A nullable column.
 pub(crate) fn ncol(name: &str, tc: TypeCode) -> ColumnDef {
     ColumnDef::new(name, tc, true)
+}
+
+/// `[_k hidden, id, a, ID hidden, A]` — a visible name shared with a hidden
+/// column, and a visible name written twice (as a `SELECT *` join view carries).
+pub(crate) fn shadowed_cols() -> Vec<ColumnDef> {
+    let u = |n| col(n, TypeCode::U64);
+    vec![u("_k").hidden(), u("id"), u("a"), u("ID").hidden(), u("A")]
 }
 
 /// A schema, held to the rules every decoded schema is.
@@ -247,7 +254,7 @@ pub(crate) const EXACT_CASES: &[ExactCase] = {
 /// The exact answer to `x op lit`, `x` an integer a `ty` column stores and `lit`
 /// a numeric literal's text, compared as the rationals they are.
 pub(crate) fn holds_exact(ty: ColType, x: i128, op: CmpOp, lit: &str) -> bool {
-    let (mag, scale) = crate::ast_util::decimal_of_number_text(lit.trim_start_matches('-')).expect(lit);
+    let (mag, scale) = crate::literal::decimal_of_number_text(lit.trim_start_matches('-')).expect(lit);
     let v = if lit.starts_with('-') { -mag } else { mag };
     holds(
         op,
@@ -335,7 +342,7 @@ pub(crate) fn rows_of<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a
 /// Parse + bind an expression against `schema` as relation `t`, which is what
 /// every qualified reference in these tests writes; a refusal panics, naming `sql`.
 pub(crate) fn bind_sql(sql: &str, schema: &Schema) -> BoundExpr {
-    crate::hir::bind_single_table(&parse_expr_sql(sql), schema, "t").unwrap_or_else(|e| panic!("{sql}: {e}"))
+    crate::bind::bind_single_table(&parse_expr_sql(sql), schema, "t").unwrap_or_else(|e| panic!("{sql}: {e}"))
 }
 
 /// The message of the `Rejected` error `r` must be.

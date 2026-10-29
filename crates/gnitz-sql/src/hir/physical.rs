@@ -1,13 +1,14 @@
 //! The positional pass, run at lowering. Assigns physical column positions to
 //! the layout-free logical IR: [`Frame`] substitutes each `ColId` leaf with a
 //! `ColRef(position)` against a node's column layout, and
-//! [`physicalize_projection`] physicalizes a projection (the pass-through/computed
-//! split + the PK-front convention, whose single home is `place_pk_front`).
+//! [`physicalize_projection`] physicalizes a projection: each slot a resolved
+//! expression, a bare `ColRef` being a copy, under the PK-front convention, whose
+//! single home is `place_pk_front`.
 
-use super::{as_col, ColId, HirCol, HirExpr, ProjEntry};
+use super::{ColId, HirCol, HirExpr, ProjEntry};
 use crate::error::GnitzSqlError;
-use crate::ir::BoundExpr;
-use crate::project::{leading_schema, ProjItem};
+use crate::ir::{BExpr, BoundExpr};
+use crate::project::leading_schema;
 use gnitz_core::{RelDescriptor, Schema};
 use gnitz_wire::ColumnDef;
 use std::collections::HashSet;
@@ -166,7 +167,7 @@ impl Rename {
         let mut seen = HashSet::new();
         items
             .iter()
-            .map(|it| Some((as_col(&it.expr).filter(|id| seen.insert(*id))?, it.out.clone())))
+            .map(|it| Some((it.expr.as_col().filter(|id| seen.insert(*id))?, it.out.clone())))
             .collect::<Option<_>>()
             .map(Rename)
     }
@@ -183,21 +184,17 @@ impl Rename {
 pub(crate) fn physicalize_projection(
     items: &[ProjEntry],
     input: &Frame,
-) -> Result<(Vec<ProjItem>, Frame), GnitzSqlError> {
+) -> Result<(Vec<BoundExpr>, Frame), GnitzSqlError> {
     let mut slots = items
         .iter()
         .map(|e| {
             // The expression's error: the schema's would name a hidden column.
             crate::ir::check_decimal_scale(e.out.def.ty.scale)?;
-            Ok((
-                ProjItem::from_bound(input.resolve(&e.expr)?),
-                Some(e.out.id),
-                e.out.def.clone(),
-            ))
+            Ok((input.resolve(&e.expr)?, Some(e.out.id), e.out.def.clone()))
         })
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
     place_pk_front(&mut slots, &input.schema);
-    let (proj, cols): (Vec<ProjItem>, Vec<Slot>) = slots.into_iter().map(|(item, id, def)| (item, (id, def))).unzip();
+    let (proj, cols): (Vec<BoundExpr>, Vec<Slot>) = slots.into_iter().map(|(item, id, def)| (item, (id, def))).unzip();
     Ok((proj, Frame::new(cols, input.schema.pk_cols().len())?))
 }
 
@@ -205,10 +202,10 @@ pub(crate) fn physicalize_projection(
 /// `project_schema` does: each PK column's first pass-through moves there, and
 /// one nothing passes through is prepended hidden. A hidden key slot carries the
 /// source's definition of its column.
-fn place_pk_front(slots: &mut Vec<(ProjItem, Option<ColId>, ColumnDef)>, source: &Schema) {
+fn place_pk_front(slots: &mut Vec<(BoundExpr, Option<ColId>, ColumnDef)>, source: &Schema) {
     for (target, &pk) in source.pk_cols().iter().enumerate() {
         let pk = pk as usize;
-        let slot = match slots.iter().position(|(item, ..)| item.passthrough_src() == Some(pk)) {
+        let slot = match slots.iter().position(|(item, ..)| item.as_col() == Some(pk)) {
             Some(pos) => {
                 let (item, id, def) = slots.remove(pos);
                 let def = match def.is_hidden {
@@ -217,11 +214,7 @@ fn place_pk_front(slots: &mut Vec<(ProjItem, Option<ColId>, ColumnDef)>, source:
                 };
                 (item, id, def)
             }
-            None => (
-                ProjItem::PassThrough { src_col: pk },
-                None,
-                source.columns()[pk].clone().hidden(),
-            ),
+            None => (BExpr::ColRef(pk), None, source.columns()[pk].clone().hidden()),
         };
         slots.insert(target, slot);
     }

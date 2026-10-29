@@ -68,8 +68,10 @@ impl ClientMap {
         out.nulls = vec![0; n];
         out.payload = ZSetBatch::filler_columns(&self.out_schema, n);
         let computes_a_string = ev.emits_a_string();
-        if computes_a_string {
-            // Appended to, so copied: a copied German cell keeps its offset into it.
+        // A computed string is re-encoded into the output arena. A copied German cell keeps
+        // its offset into the source's, so the output arena starts as a copy of it only
+        // when the map does both.
+        if computes_a_string && ev.moves().string_slots() != 0 {
             out.blob = src.blob.clone();
         }
         ev.write_computed(&src, 0, n, &mut out, 0);

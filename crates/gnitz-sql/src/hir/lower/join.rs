@@ -161,20 +161,23 @@ fn emit_join_inputs(
         spine::open(chain, rels[0], &live[0])?,
         spine::open(chain, rels[1], &live[1])?,
     ];
-    // A join reads two distinct sources, one delta per epoch: a right side over the
-    // left's source is re-read as a second relation.
-    if spines[0].tid() == spines[1].tid() {
-        spines[1] = Spine::segment(materialize(chain, rels[1], &live[1])?);
-    }
     // A key the spine computes (`ON x.s = u.k` over `SELECT a + 1 AS s`) is no
     // column of the scanned relation, so nothing over that relation can state
     // where its delta scatters. Cut to a segment, the computed column is one.
+    let mut origins = spines.each_ref().map(Spine::origin);
     for i in 0..2 {
-        if !class.key_cols(i).all(|id| spines[i].origin().resolves(id)) {
+        if !class.key_cols(i).all(|id| origins[i].resolves(id)) {
             spines[i] = Spine::segment(materialize(chain, rels[i], &live[i])?);
+            origins[i] = spines[i].origin();
         }
     }
-    let origins = spines.each_ref().map(Spine::origin);
+    // A join reads two distinct sources, one delta per epoch: a right side over the
+    // left's source is re-read as a second relation. A side cut above reads a fresh
+    // segment, so it collides with nothing.
+    if spines[0].tid() == spines[1].tid() {
+        spines[1] = Spine::segment(materialize(chain, rels[1], &live[1])?);
+        origins[1] = spines[1].origin();
+    }
     let pk_repeats = spines.each_ref().map(Spine::pk_repeats);
     // A backfill feeds the sources in scan order, and the first is joined against
     // nothing: where one side alone outputs its unmatched rows, it goes second.

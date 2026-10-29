@@ -43,10 +43,12 @@ pub(super) fn wide() -> Arc<RelDescriptor> {
 /// The finisher the ad-hoc read path plans for `sql` over `rel`, bound as `t`.
 pub(super) fn plan(sql: &str, rel: &Arc<RelDescriptor>) -> FoldFinish {
     let query = parse_query(sql);
-    let select = crate::validate::as_plain_select(&query.body, sql).unwrap();
     let cat = catalog(vec![("t", Arc::clone(rel))]);
-    let read = bind_adhoc_read(&cat, &query, select, "SELECT", &[]).unwrap();
-    let crate::hir::AdhocRead::Relation { shape: AdhocShape::Fold(pieces, _), .. } = read else {
+    let read = bind_adhoc_read(&cat, &query, &[]).unwrap();
+    let crate::hir::AdhocRead::Relation {
+        shape: AdhocShape::Fold { pieces, .. }, ..
+    } = read
+    else {
         panic!("{sql}: not a fold");
     };
     FoldFinish::new(pieces.partial_schema, &pieces.agg.aggs, &pieces.having, pieces.finalize).unwrap()

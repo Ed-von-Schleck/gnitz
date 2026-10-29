@@ -21,6 +21,7 @@ from _read import bag, rows, scanned
 
 TC = gnitz.TypeCode
 I64, U64, F64, STR = (TC.I64, 0), (TC.U64, 0), (TC.F64, 0), (TC.STRING, 0)
+I8, I16, I32 = (TC.I8, 0), (TC.I16, 0), (TC.I32, 0)
 U64_HIGH, U64_MAX = 2**63 + 5, 2**64 - 1  # past the signed boundary; the top
 I64_MIN, I64_MAX = -(2**63), 2**63 - 1
 F32_2_7 = struct.unpack("f", struct.pack("f", 2.7))[0]
@@ -35,18 +36,17 @@ _SEED = ("INSERT INTO t VALUES "
 
 # Each conversion against its declared type and its value on ids 1..5.
 _CONVERSIONS = {
-    # A computed column is declared at its register's image, so a narrow target
-    # lands in an I64 column holding the range-checked value.
-    "CAST(i AS SMALLINT)": (I64, [100, 300, -1, None, None]),
-    "CAST(i AS TINYINT)": (I64, [100, None, -1, None, None]),
+    # A narrowing cast is declared at its target, and a value outside it is NULL.
+    "CAST(i AS SMALLINT)": (I16, [100, 300, -1, None, None]),
+    "CAST(i AS TINYINT)": (I8, [100, None, -1, None, None]),
     # A literal that cannot convert is not a CREATE-time error either.
-    "CAST(300 AS TINYINT)": (I64, [None] * 5),
+    "CAST(300 AS TINYINT)": (I8, [None] * 5),
     # The unsigned image is the one that is not merely wider: U64 is a distinct
     # domain.
     "CAST(i AS BIGINT UNSIGNED)": (U64, [100, 300, None, None, I64_MAX]),
     "CAST(u AS BIGINT)": (I64, [5, None, 0, None, 3]),
     # float -> int truncates toward zero.
-    "CAST(f AS INT)": (I64, [2, None, 0, 1, 0]),
+    "CAST(f AS INT)": (I32, [2, None, 0, 1, 0]),
     # A value really goes through f32 precision; a finite overflow of f32's
     # range is NULL, and underflow flushes to zero rather than being a domain
     # error.
@@ -60,7 +60,7 @@ _CONVERSIONS = {
     # A parse that does not consume the whole trimmed input is a NULL: a
     # fraction, trailing garbage, and a value that fits BIGINT but not INT.
     "CAST(s AS BIGINT)": (I64, [42, -7, None, None, 3000000000]),
-    "CAST(s AS INT)": (I64, [42, -7, None, None, None]),
+    "CAST(s AS INT)": (I32, [42, -7, None, None, None]),
     "CAST(s AS DOUBLE)": (F64, [42.0, -7.0, 1.5, None, 3e9]),
     "CAST(i AS TEXT)": (STR, ["100", "300", "-1", str(I64_MIN), str(I64_MAX)]),
     # Outside [1e-4, 1e15) the float form goes scientific, which is what keeps
@@ -75,7 +75,7 @@ _CONVERSIONS = {
 }
 
 
-def test_a_conversion_lands_on_its_register_image_or_a_null_never_a_dropped_row(
+def test_a_conversion_lands_on_its_declared_type_or_a_null_never_a_dropped_row(
         client):
     """No fault-delivery mechanism exists at row granularity, so a failed
     conversion nulls the value and keeps the row at its weight — asserted as one

@@ -95,16 +95,6 @@ pub(crate) struct OrderKey<'a> {
     pub(crate) nulls_first: bool,
 }
 
-impl OrderKey<'_> {
-    pub(crate) fn wire(&self, col: usize) -> gnitz_wire::OrderKey {
-        gnitz_wire::OrderKey {
-            col: col as u16,
-            desc: self.desc,
-            nulls_first: self.nulls_first,
-        }
-    }
-}
-
 /// One ORDER BY key: its expression, whether it descends, and its absolute NULL
 /// placement (default NULLS LAST ascending, FIRST descending). `clause` names the
 /// ORDER BY in the refusal.
@@ -128,33 +118,13 @@ pub(crate) fn order_exprs<'a>(keys: &[OrderKey<'a>]) -> Vec<&'a Expr> {
         .collect()
 }
 
-/// Classify one ORDER BY expression: an integer literal is positional, by the
-/// same rule GROUP BY reads; everything else is an expression.
-fn order_target(e: &Expr) -> Result<OrderTarget<'_>, GnitzSqlError> {
-    Ok(match clause_position(e, "ORDER BY position")? {
-        Some(pos) => OrderTarget::Position(pos),
-        None => OrderTarget::Expr(e),
-    })
-}
-
-/// The ORDER BY clause as key specs, or none for an absent clause.
+/// The ORDER BY clause as key specs, or none for an absent clause. An integer
+/// literal key is positional, by the same rule GROUP BY reads; the unsupported
+/// ClickHouse/DuckDB extensions are refused.
 pub(crate) fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<OrderKey<'_>>, GnitzSqlError> {
     let Some(ob) = order_by else {
         return Ok(Vec::new());
     };
-    let keys = resolve_order_by(ob)?;
-    if keys.len() > gnitz_wire::MAX_ORDER_KEYS {
-        return Err(GnitzSqlError::Rejected(format!(
-            "ORDER BY has more than {} keys",
-            gnitz_wire::MAX_ORDER_KEYS
-        )));
-    }
-    Ok(keys)
-}
-
-/// Parse the whole ORDER BY clause into resolved key specs, rejecting the
-/// unsupported ClickHouse/DuckDB extensions.
-fn resolve_order_by(ob: &OrderBy) -> Result<Vec<OrderKey<'_>>, GnitzSqlError> {
     // Exhaustive (no `..`) here and in `parse_order_key`: a dropped ORDER BY
     // modifier is a wrong result, so a future `sqlparser` field stops the build.
     let OrderBy { kind, interpolate } = ob;
@@ -166,13 +136,26 @@ fn resolve_order_by(ob: &OrderBy) -> Result<Vec<OrderKey<'_>>, GnitzSqlError> {
     let mut keys = Vec::with_capacity(exprs.len());
     for obe in exprs {
         let (expr, desc, nulls_first) = parse_order_key(obe, "ORDER BY")?;
-        keys.push(OrderKey {
-            target: order_target(expr)?,
-            desc,
-            nulls_first,
-        });
+        let target = match clause_position(expr, "ORDER BY position")? {
+            Some(pos) => OrderTarget::Position(pos),
+            None => OrderTarget::Expr(expr),
+        };
+        keys.push(OrderKey { target, desc, nulls_first });
     }
+    reject_order_key_count(keys.len())?;
     Ok(keys)
+}
+
+/// Refuse an order of more than the keys the wire carries — a query's ORDER BY
+/// and a window's effective order alike.
+pub(crate) fn reject_order_key_count(n: usize) -> Result<(), GnitzSqlError> {
+    if n > gnitz_wire::MAX_ORDER_KEYS {
+        return Err(GnitzSqlError::Rejected(format!(
+            "ORDER BY has more than {} keys",
+            gnitz_wire::MAX_ORDER_KEYS
+        )));
+    }
+    Ok(())
 }
 
 /// The column each key of `keys` sorts on, over a result whose columns are `cols`. A
@@ -213,41 +196,33 @@ pub(crate) fn wire_keys<'c>(
     Ok(key_slots(keys, cols, placed)?
         .into_iter()
         .zip(keys)
-        .map(|(col, k)| k.wire(col))
+        .map(|(col, k)| gnitz_wire::OrderKey {
+            col: col as u16,
+            desc: k.desc,
+            nulls_first: k.nulls_first,
+        })
         .collect())
 }
 
-/// The `LIMIT n` value, or `None` when absent. A non-integer-literal LIMIT
-/// (`LIMIT 1+1`, `LIMIT 'x'`) is a clean error — silently degrading it would
-/// return every row, violating the unhonored-clause contract. So is the
-/// ClickHouse `LIMIT … BY` sub-form, which no surface has an operator for:
-/// rejected on the way past, so every caller of this gets it.
-pub(crate) fn extract_limit(query: &sqlparser::ast::Query) -> Result<Option<usize>, GnitzSqlError> {
-    let limit = match &query.limit_clause {
-        // Exhaustive (no `..`): a future `sqlparser` field stops the build.
-        Some(LimitClause::LimitOffset { limit, offset: _, limit_by }) => {
+/// The `LIMIT n` count (`None` when absent) and the `OFFSET m` skip (`0` when
+/// absent), in both the `LIMIT … OFFSET m` and the MySQL `LIMIT m, n` forms. A
+/// non-integer-literal value (`LIMIT 1+1`, `OFFSET 'x'`) is a clean error:
+/// degrading it would return every row or skip nothing, violating the
+/// unhonored-clause contract. So is the ClickHouse `LIMIT … BY` sub-form, which
+/// no surface has an operator for.
+pub(crate) fn extract_limit_offset(query: &sqlparser::ast::Query) -> Result<(Option<usize>, usize), GnitzSqlError> {
+    // Exhaustive (no `..`): a future `sqlparser` field stops the build.
+    let (limit, offset) = match &query.limit_clause {
+        Some(LimitClause::LimitOffset { limit, offset, limit_by }) => {
             reject_if(!limit_by.is_empty(), "LIMIT", "BY")?;
-            match limit {
-                Some(e) => e,
-                None => return Ok(None),
-            }
+            (limit.as_ref(), offset.as_ref().map(|o| &o.value))
         }
-        Some(LimitClause::OffsetCommaLimit { limit: e, offset: _ }) => e,
-        None => return Ok(None),
+        Some(LimitClause::OffsetCommaLimit { limit, offset }) => (Some(limit), Some(offset)),
+        None => (None, None),
     };
-    expr_usize_literal(limit, "LIMIT").map(Some)
-}
-
-/// The `OFFSET n` value (both `LIMIT … OFFSET n` and the MySQL `LIMIT off, lim`
-/// form), or `0` when absent. Mirrors [`extract_limit`]: a non-integer-literal
-/// value errors rather than silently skipping nothing.
-pub(crate) fn extract_offset(query: &sqlparser::ast::Query) -> Result<usize, GnitzSqlError> {
-    let offset = match &query.limit_clause {
-        Some(LimitClause::LimitOffset { offset: Some(o), limit: _, limit_by: _ }) => &o.value,
-        Some(LimitClause::OffsetCommaLimit { offset, limit: _ }) => offset,
-        _ => return Ok(0),
-    };
-    expr_usize_literal(offset, "OFFSET")
+    let limit = limit.map(|e| expr_usize_literal(e, "LIMIT")).transpose()?;
+    let offset = offset.map_or(Ok(0), |e| expr_usize_literal(e, "OFFSET"))?;
+    Ok((limit, offset))
 }
 
 #[cfg(test)]

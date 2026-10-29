@@ -303,6 +303,9 @@ fn subquery_rules() {
             ("SELECT DISTINCT k FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", "a subquery is not supported together with SELECT DISTINCT"),
             ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k)", "single FROM table without JOINs"),
             ("SELECT * FROM a WHERE EXISTS (SELECT k FROM b WHERE b.k = a.k GROUP BY k)", "GROUP BY"),
+            ("SELECT a.id FROM a WHERE EXISTS (SELECT COUNT(*) FROM b WHERE b.k = a.k)", "aggregate subquery returns one row"),
+            ("SELECT a.id FROM a WHERE NOT EXISTS (SELECT COUNT(*) FROM b WHERE b.k = a.k)", "aggregate subquery returns one row"),
+            ("SELECT a.id, EXISTS (SELECT 1 + SUM(w) FROM b WHERE b.k = a.k) AS e FROM a", "aggregate subquery returns one row"),
             ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND EXISTS (SELECT 1 FROM b AS z WHERE z.k = b.w))", "nested subqueries"),
             ("SELECT * FROM a WHERE k IN (SELECT k, w FROM b)", "exactly one plain column"),
             ("SELECT * FROM a AS t WHERE EXISTS (SELECT 1 FROM b AS t WHERE t.k = t.k)", "rename one"),
@@ -631,6 +634,14 @@ fn cte_and_derived_table_rules() {
             (
                 "WITH _cte AS (SELECT id FROM t WHERE id > 0) SELECT id FROM _cte",
                 "cannot start with '_'",
+            ),
+            (
+                "WITH c AS (SELECT id, g FROM t), c AS (SELECT id, g FROM c WHERE g > 1) SELECT id FROM c",
+                "specified more than once",
+            ),
+            (
+                "WITH c AS (SELECT id FROM t), C AS (SELECT id FROM t) SELECT id FROM c",
+                "specified more than once",
             ),
             ("SELECT * FROM _seg4096", "cannot start with '_'"),
             ("SELECT id FROM (SELECT id, v FROM t WHERE v > 10)", "needs an alias"),

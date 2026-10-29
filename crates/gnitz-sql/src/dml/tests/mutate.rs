@@ -4,7 +4,7 @@ use crate::test_support::{
     assert_rejects, batch_of, catalog, col, ncol, parse_stmt, rel, rows_of, table, typed_schema, TestCatalog,
 };
 use gnitz_core::BatchAppender;
-use gnitz_wire::{RelClass, TypeCode};
+use gnitz_wire::{ColType, RelClass, TypeCode};
 use sqlparser::ast::Statement;
 
 fn plan(cat: &dyn Catalog, sql: &str) -> Result<MutationPlan, GnitzSqlError> {

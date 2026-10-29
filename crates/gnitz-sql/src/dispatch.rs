@@ -1,7 +1,7 @@
 //! Statement dispatch: routes a `Statement` to its handler in `ddl` or `dml`,
 //! each planned against the statement's catalog and then run on the client.
 
-use crate::bind::Catalog;
+use crate::catalog::Catalog;
 use crate::error::reject_if;
 use crate::error::GnitzSqlError;
 use crate::source::StatementText;
@@ -9,7 +9,7 @@ use crate::SqlResult;
 use crate::{ddl, dml};
 use gnitz_core::{ClientError, GnitzClient, RelDescriptor, RelName};
 use gnitz_wire::{WireFault, WireStatus};
-use sqlparser::ast::{ObjectType, Statement};
+use sqlparser::ast::{Query, Statement};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
@@ -143,19 +143,20 @@ pub(crate) async fn execute_statement(
 ) -> Result<SqlResult, GnitzSqlError> {
     match stmt {
         // Bare `DESC t` is `Statement::ExplainTable`, table introspection, and falls to
-        // the catch-all below; `plan_read` rejects the EXPLAIN of a non-SELECT.
+        // the catch-all below; `explained_query` rejects the EXPLAIN of a non-SELECT.
         Statement::Explain { .. } => {
-            let plan = planned(client, schema_name, true, false, |cat| dml::plan_read(stmt, cat))
+            let query = dml::explained_query(stmt)?;
+            let plan = planned(client, schema_name, true, false, |cat| dml::plan_read(query, cat))
                 .await
                 .0?;
             Ok(dml::execute_explain(client, &plan))
         }
-        Statement::Query(_) => {
+        Statement::Query(query) => {
             planned_kept(
                 client,
                 schema_name,
                 true,
-                |cat| dml::plan_read(stmt, cat),
+                |cat| dml::plan_read(query, cat),
                 |plan| !plan.answers_from_schema(),
                 dml::execute_select,
             )
@@ -224,7 +225,7 @@ pub(crate) async fn execute_statement(
                 false,
                 |cat| dml::plan_update(update, cat),
                 |_| true,
-                async |client, plan| dml::execute_mutation(client, plan, "UPDATE").await,
+                dml::execute_mutation,
             )
             .await
         }
@@ -235,23 +236,9 @@ pub(crate) async fn execute_statement(
                 false,
                 |cat| dml::plan_delete(del, cat),
                 |_| true,
-                async |client, plan| dml::execute_mutation(client, plan, "DELETE").await,
+                dml::execute_mutation,
             )
             .await
-        }
-        // Refused, not failed: the transaction stays open.
-        Statement::CreateTable(_)
-        | Statement::CreateSchema { .. }
-        | Statement::Drop { .. }
-        | Statement::CreateView(_)
-        | Statement::CreateIndex(_)
-        | Statement::AlterTable(_)
-        | Statement::AlterView { .. }
-            if client.txn_active() =>
-        {
-            Err(GnitzSqlError::Rejected(
-                "this statement is not allowed inside a transaction".to_string(),
-            ))
         }
         Statement::CreateTable(_)
         | Statement::CreateSchema { .. }
@@ -260,39 +247,43 @@ pub(crate) async fn execute_statement(
         | Statement::CreateIndex(_)
         | Statement::AlterTable(_)
         | Statement::AlterView { .. } => {
-            execute_ddl(client, schema_name, stmt, text).await?;
-            Ok(SqlResult::Ddl { tag: ddl_tag(stmt) })
+            // Refused, not failed: the transaction stays open.
+            if client.txn_active() {
+                return Err(GnitzSqlError::Rejected(
+                    "this statement is not allowed inside a transaction".to_string(),
+                ));
+            }
+            Ok(SqlResult::Ddl {
+                tag: execute_ddl(client, schema_name, stmt, text).await?,
+            })
         }
         _ => Err(GnitzSqlError::Rejected(format!("unsupported SQL statement: {stmt}"))),
     }
 }
 
-/// Run one DDL statement; [`execute_statement`] has refused it inside a
-/// transaction.
+/// Run one DDL statement and return its command tag; [`execute_statement`]
+/// has refused it inside a transaction.
 async fn execute_ddl(
     client: &mut GnitzClient,
     schema_name: &str,
     stmt: &Statement,
     text: StatementText<'_>,
-) -> Result<(), GnitzSqlError> {
+) -> Result<&'static str, GnitzSqlError> {
     match stmt {
         Statement::CreateTable(create) => {
-            match planned(client, schema_name, false, false, |cat| {
+            if let Some(plan) = planned(client, schema_name, false, false, |cat| {
                 ddl::plan_create_table(create, cat)
             })
             .await
             .0?
             {
-                Some(def) => {
-                    client.create_table(&def).await?;
-                    Ok(())
-                }
-                None => Ok(()),
+                ddl::create_planned_table(client, plan).await?;
             }
+            Ok("CREATE TABLE")
         }
-        // The one statement whose clause rejections live in the router: sqlparser
-        // gives `Drop` no payload struct, so `execute_drop` could destructure it
-        // only by taking the whole `Statement` back.
+        // `Drop` and `CreateSchema` reject their clauses in the router: sqlparser
+        // gives neither a payload struct, so their executors could destructure
+        // them only by taking the whole `Statement` back.
         Statement::Drop {
             object_type,
             names,
@@ -311,21 +302,6 @@ async fn execute_ddl(
             reject_if(table.is_some(), CTX, "ON <table> (MySQL DROP INDEX target)")?;
             ddl::execute_drop(client, schema_name, object_type, names, *if_exists).await
         }
-        Statement::CreateView(cv) => {
-            match planned(client, schema_name, false, false, |cat| {
-                ddl::plan_create_view(cv, text, cat)
-            })
-            .await
-            .0?
-            {
-                Some(chain) => {
-                    client.create_view_chain(chain).await?;
-                    Ok(())
-                }
-                None => Ok(()),
-            }
-        }
-        Statement::CreateIndex(ci) => ddl::execute_create_index(client, schema_name, ci).await,
         Statement::CreateSchema {
             schema_name: name,
             if_not_exists,
@@ -334,18 +310,33 @@ async fn execute_ddl(
             default_collate_spec,
             clone,
         } => {
-            ddl::execute_create_schema(
-                client,
-                name,
-                *if_not_exists,
-                with.as_deref(),
-                options.as_deref(),
-                default_collate_spec.as_ref(),
-                clone.as_ref(),
-            )
-            .await
+            const CTX: &str = "CREATE SCHEMA";
+            reject_if(with.is_some(), CTX, "WITH options")?;
+            reject_if(options.is_some(), CTX, "OPTIONS")?;
+            reject_if(default_collate_spec.is_some(), CTX, "DEFAULT COLLATE")?;
+            reject_if(clone.is_some(), CTX, "CLONE")?;
+            ddl::execute_create_schema(client, name, *if_not_exists).await?;
+            Ok("CREATE SCHEMA")
         }
-        Statement::AlterTable(a) => ddl::execute_alter_table(client, schema_name, a).await,
+        Statement::CreateView(cv) => {
+            if let Some(chain) = planned(client, schema_name, false, false, |cat| {
+                ddl::plan_create_view(cv, text, cat)
+            })
+            .await
+            .0?
+            {
+                client.create_view_chain(chain).await?;
+            }
+            Ok("CREATE VIEW")
+        }
+        Statement::CreateIndex(ci) => {
+            ddl::execute_create_index(client, schema_name, ci).await?;
+            Ok("CREATE INDEX")
+        }
+        Statement::AlterTable(a) => {
+            ddl::execute_alter_table(client, schema_name, a).await?;
+            Ok("ALTER TABLE")
+        }
         Statement::AlterView { name, query, columns, with_options } => {
             let chain = planned(client, schema_name, false, false, |cat| {
                 ddl::plan_alter_view(name, columns, query, with_options, text, cat)
@@ -353,36 +344,20 @@ async fn execute_ddl(
             .await
             .0?;
             client.create_view_chain(chain).await?;
-            Ok(())
+            Ok("ALTER VIEW")
         }
         _ => unreachable!("execute_statement routes only DDL here"),
     }
 }
 
-/// The command tag of a DDL statement [`execute_ddl`] ran.
-fn ddl_tag(stmt: &Statement) -> &'static str {
-    match stmt {
-        Statement::CreateTable(_) => "CREATE TABLE",
-        Statement::CreateSchema { .. } => "CREATE SCHEMA",
-        Statement::CreateView(_) => "CREATE VIEW",
-        Statement::CreateIndex(_) => "CREATE INDEX",
-        Statement::AlterTable(_) => "ALTER TABLE",
-        Statement::AlterView { .. } => "ALTER VIEW",
-        Statement::Drop { object_type: ObjectType::Table, .. } => "DROP TABLE",
-        Statement::Drop { object_type: ObjectType::View, .. } => "DROP VIEW",
-        Statement::Drop { object_type: ObjectType::Index, .. } => "DROP INDEX",
-        _ => unreachable!("execute_ddl runs only these"),
-    }
-}
-
-/// Plan `stmt`, a `SELECT` over one fed view, as a subscription, against the
+/// Plan `query`, a `SELECT` over one fed view, as a subscription, against the
 /// server's own descriptors: what a copy holds is no source to subscribe to.
 pub(crate) async fn plan_subscription(
     client: &mut GnitzClient,
     schema_name: &str,
-    stmt: &Statement,
+    query: &Query,
 ) -> Result<gnitz_core::Subscription, GnitzSqlError> {
-    planned(client, schema_name, false, false, |cat| dml::plan_read(stmt, cat))
+    planned(client, schema_name, false, false, |cat| dml::plan_read(query, cat))
         .await
         .0?
         .into_subscription()

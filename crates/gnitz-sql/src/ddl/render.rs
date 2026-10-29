@@ -6,9 +6,9 @@
 use gnitz_core::{Catalog, CatalogRelation, RelProps, ViewDefinition};
 use gnitz_wire::{FkAction, TableDistribution};
 
-use super::{table_with_options, view_with_options};
-use crate::types::serial_type_name;
-use crate::{column_text, relation_text, sql_type_name};
+use super::options::with_options;
+use crate::names::{column_text, relation_text};
+use crate::types::{serial_type_name, sql_type_name};
 
 /// `CREATE SCHEMA <name>`.
 pub fn create_schema_statement(name: &str) -> String {
@@ -18,6 +18,15 @@ pub fn create_schema_statement(name: &str) -> String {
 /// `rel`'s name as a statement names it: schema-qualified.
 pub fn qualified_name(rel: &CatalogRelation) -> String {
     format!("{}.{}", relation_text(&rel.schema), relation_text(&rel.name))
+}
+
+/// ` WITH (…)` declaring `props`, or nothing where every option is the default.
+fn with_clause(props: &RelProps) -> String {
+    let options = with_options(props);
+    match options.is_empty() {
+        true => String::new(),
+        false => format!(" WITH ({})", options.join(", ")),
+    }
 }
 
 /// The `CREATE TABLE` that declares base table or stream `rel`: its visible
@@ -74,10 +83,7 @@ pub fn create_table_statement(catalog: &Catalog, rel: &CatalogRelation) -> Resul
         qualified_name(rel),
         lines.join(",\n    ")
     );
-    let options = table_with_options(&props);
-    if !options.is_empty() {
-        out.push_str(&format!(" WITH ({})", options.join(", ")));
-    }
+    out.push_str(&with_clause(&rel.props));
     if let TableDistribution::Keyed { prefix_len } = props.distribution {
         if prefix_len > 0 {
             let prefix = &rel.column_names(&rel.pk)[..usize::from(prefix_len).min(pk.len())];
@@ -107,7 +113,7 @@ pub fn create_index_statements(rel: &CatalogRelation) -> impl Iterator<Item = St
 
 /// The `CREATE VIEW` that declares user view `rel` as it stands now.
 pub fn create_view_statement(catalog: &Catalog, rel: &CatalogRelation) -> Result<String, String> {
-    let RelProps::View(props) = rel.props else {
+    let RelProps::View(_) = rel.props else {
         return Err(format!("{} is not a view", rel.qualified()));
     };
     let def = rel.definition().map_err(|e| format!("{}: {e}", rel.qualified()))?;
@@ -116,10 +122,7 @@ pub fn create_view_statement(catalog: &Catalog, rel: &CatalogRelation) -> Result
     if !same_names(&def.body_columns, &names) {
         out.push_str(&format!(" ({})", column_list(names.iter().copied())));
     }
-    let options = view_with_options(&props);
-    if !options.is_empty() {
-        out.push_str(&format!(" WITH ({})", options.join(", ")));
-    }
+    out.push_str(&with_clause(&rel.props));
     out.push_str(" AS\n");
     out.push_str(&view_body(catalog, &def)?);
     Ok(out)
@@ -128,7 +131,7 @@ pub fn create_view_statement(catalog: &Catalog, rel: &CatalogRelation) -> Result
 /// `def`'s body under the names `catalog` holds: each relation it names written
 /// qualified, read by the name the body reads it by, and — where its columns
 /// were renamed since — under its old column names.
-pub fn view_body(catalog: &Catalog, def: &ViewDefinition) -> Result<String, String> {
+pub(crate) fn view_body(catalog: &Catalog, def: &ViewDefinition) -> Result<String, String> {
     let q = &def.query;
     let mut out = String::with_capacity(q.len());
     let mut at = 0;

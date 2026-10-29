@@ -2,7 +2,7 @@
 //! projections over a relation read in place fuse into the consumer's circuit.
 
 use super::super::physical::{Frame, Rename};
-use super::super::{as_col, ColId, HirExpr, ProjEntry, RelExpr};
+use super::super::{ColId, HirExpr, ProjEntry, RelExpr};
 use super::{
     collect_live_cols, cut_segment, filter, lowered_whole, project_front, resolve_in_place, EmitPieces, SegInput,
     SegSource, ViewChain,
@@ -26,6 +26,24 @@ pub(super) struct Spine<'a> {
 enum Level<'a> {
     Where(&'a [HirExpr]),
     Project(&'a [ProjEntry]),
+}
+
+impl Level<'_> {
+    /// What is read of this level's input when `above` is read of its output.
+    fn reads(&self, above: &HashSet<ColId>) -> HashSet<ColId> {
+        let mut below = HashSet::new();
+        match self {
+            Level::Where(preds) => {
+                below.extend(above.iter().copied());
+                collect_live_cols(*preds, &mut below);
+            }
+            Level::Project(items) => collect_live_cols(
+                items.iter().filter(|it| above.contains(&it.out.id)).map(|it| &it.expr),
+                &mut below,
+            ),
+        }
+        below
+    }
 }
 
 /// What the consumer needs of the top projection: its exact columns (a view's
@@ -95,54 +113,34 @@ pub(super) fn open<'a>(
     rel: &'a Rc<RelExpr>,
     live: &HashSet<ColId>,
 ) -> Result<Spine<'a>, GnitzSqlError> {
+    // Peel the levels top-down, each paired with what is read of its output;
+    // `read` ends as what is read of the node below them.
     let mut nodes: Vec<&'a Rc<RelExpr>> = vec![rel];
-    let mut last: &'a Rc<RelExpr> = rel;
-    while let RelExpr::Project { input, .. } | RelExpr::Filter { input, .. } = last.as_ref() {
+    let mut levels: Vec<(Level<'a>, HashSet<ColId>)> = Vec::new();
+    let mut read = live.clone();
+    loop {
+        let (level, input) = match nodes[nodes.len() - 1].as_ref() {
+            RelExpr::Filter { input, preds } => (Level::Where(preds), input),
+            RelExpr::Project { input, items } => (Level::Project(items), input),
+            _ => break,
+        };
+        let below = level.reads(&read);
+        levels.push((level, std::mem::replace(&mut read, below)));
         nodes.push(input);
-        last = input;
     }
-    let bottom = nodes.len() - 1;
-    // What is read of each node, top-down.
-    let mut read = vec![live.clone()];
-    for node in &nodes[..bottom] {
-        let above = &read[read.len() - 1];
-        let mut below = HashSet::new();
-        match node.as_ref() {
-            RelExpr::Filter { preds, .. } => {
-                below.extend(above.iter().copied());
-                collect_live_cols(preds, &mut below);
-            }
-            RelExpr::Project { items, .. } => collect_live_cols(
-                items.iter().filter(|it| above.contains(&it.out.id)).map(|it| &it.expr),
-                &mut below,
-            ),
-            _ => unreachable!("only a Filter or Project was peeled"),
-        }
-        read.push(below);
-    }
+    let bottom = levels.len();
     let (seg, fused) = match resolve_in_place(chain, nodes[bottom])? {
         Some(seg) => (seg, bottom),
         None => {
             let cut = (bottom.saturating_sub(2)..bottom)
                 .find(|&i| lowered_whole(nodes[i]))
                 .unwrap_or(bottom);
-            (cut_segment(chain, nodes[cut], &read[cut])?, cut)
+            let cut_read = levels.get(cut).map_or(&read, |(_, r)| r);
+            (cut_segment(chain, nodes[cut], cut_read)?, cut)
         }
     };
-    let levels = nodes[..fused]
-        .iter()
-        .copied()
-        .zip(read)
-        .rev()
-        .map(|(node, read)| {
-            let level = match &**node {
-                RelExpr::Filter { preds, .. } => Level::Where(preds),
-                RelExpr::Project { items, .. } => Level::Project(items),
-                _ => unreachable!("only a Filter or Project was peeled"),
-            };
-            (level, read)
-        })
-        .collect();
+    levels.truncate(fused);
+    levels.reverse();
     Ok(Spine { seg, levels })
 }
 
@@ -178,7 +176,7 @@ impl Spine<'_> {
             cols = items
                 .iter()
                 .filter(|it| read.contains(&it.out.id))
-                .filter_map(|it| Some((it.out.id, *cols.get(&as_col(&it.expr)?)?)))
+                .filter_map(|it| Some((it.out.id, *cols.get(&it.expr.as_col()?)?)))
                 .collect();
         }
         SourceOrigin {

@@ -2,7 +2,7 @@
 //! keyed by its element's identity and combined by weight arithmetic.
 
 use super::super::physical::Frame;
-use super::super::{HirCol, RelExpr, SetOpKind};
+use super::super::{HirCol, ProjEntry, RelExpr, SetOpKind};
 use super::spine::{open, Top};
 use super::{project_front, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
@@ -67,7 +67,7 @@ pub(super) fn lower_setop(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<Em
     combine(&mut cb, rel, false, &mut |cb, _| {
         let leaf = next.next().expect("one leaf per `combine` read, in the same order");
         if let ElementKey::Carried { order, .. } = &key {
-            let items = RelExpr::passthrough_items(order.iter().map(|&p| leaf.cols[p].clone()));
+            let items = ProjEntry::passthroughs(order.iter().map(|&p| leaf.cols[p].clone()));
             let (node, _) = project_front(cb, leaf.node, &items, &leaf.frame)?;
             return Ok(cb.shard(node));
         }

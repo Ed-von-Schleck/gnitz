@@ -1,5 +1,5 @@
 //! Schema and naming rules that read no SQL text: what a key, a name or a
-//! relation's class must satisfy.
+//! relation's class must satisfy, and which visible column a name names.
 
 use crate::error::GnitzSqlError;
 use gnitz_core::RelDescriptor;
@@ -18,12 +18,8 @@ pub(crate) fn reject_duplicate_names<'a>(
     }
 }
 
-/// Reject a name the user may not give a relation, an index or a constraint.
-pub(crate) fn validate_user_name(name: &str) -> Result<(), GnitzSqlError> {
-    gnitz_wire::validate_user_identifier(name).map_err(GnitzSqlError::Rejected)
-}
-
-/// [`validate_user_name`], returning the name's canonical form.
+/// Reject a name the user may not give a relation, an index or a constraint;
+/// otherwise return its canonical form.
 pub(crate) fn canonical_user_name(name: &str) -> Result<String, GnitzSqlError> {
     gnitz_wire::canonical_identifier(name).map_err(GnitzSqlError::Rejected)
 }
@@ -147,3 +143,73 @@ pub(crate) fn reject_arity(what: &str, cols: usize, cap: usize) -> Result<(), Gn
     }
     Ok(())
 }
+
+/// The one visible column of `columns` named `col_name`, matched
+/// case-insensitively, as its physical index into `columns`.
+///
+/// - `Ok(Some(idx))` — exactly one visible column matches.
+/// - `Ok(None)` — no visible column matches (callers attach their own "not
+///   found" text).
+/// - `Err(Bind)` — more than one matches. A `SELECT *` join view carries
+///   same-named columns from both sides; an unqualified reference to such a name
+///   is ambiguous (standard SQL) and must be rejected, not silently bound to the
+///   first match.
+///
+/// Hidden columns are never candidates but keep their position, so a synthetic
+/// view key is unnameable and a visible name shared with a hidden column is not
+/// ambiguous.
+pub(crate) fn find_unique_column<'a>(
+    columns: impl IntoIterator<Item = &'a ColumnDef>,
+    col_name: &str,
+) -> Result<Option<usize>, GnitzSqlError> {
+    let mut found: Option<usize> = None;
+    for (i, c) in columns.into_iter().enumerate() {
+        if !c.is_hidden && c.name.eq_ignore_ascii_case(col_name) {
+            if found.is_some() {
+                return Err(GnitzSqlError::Rejected(format!(
+                    "column reference '{col_name}' is ambiguous"
+                )));
+            }
+            found = Some(i);
+        }
+    }
+    Ok(found)
+}
+
+/// [`find_unique_column`] for a name that must resolve.
+pub(crate) fn require_column<'a>(
+    columns: impl IntoIterator<Item = &'a ColumnDef>,
+    col_name: &str,
+) -> Result<usize, GnitzSqlError> {
+    find_unique_column(columns, col_name)?
+        .ok_or_else(|| GnitzSqlError::Rejected(format!("column '{col_name}' not found")))
+}
+
+/// The column of the one relation in scope, under `alias`, that a reference
+/// names: a written qualifier must name `alias`, and it disambiguates nothing
+/// more.
+pub(crate) fn single_relation_col_idx<'a>(
+    cols: impl IntoIterator<Item = &'a ColumnDef>,
+    alias: &str,
+    qual: Option<&str>,
+    name: &str,
+) -> Result<usize, GnitzSqlError> {
+    if let Some(qual) = qual.filter(|q| !q.eq_ignore_ascii_case(alias)) {
+        return Err(GnitzSqlError::Rejected(format!(
+            "table alias '{qual}' not found (the relation in scope is '{alias}')"
+        )));
+    }
+    require_column(cols, name)
+}
+
+/// Whether `cols` holds a *visible* (non-hidden) column named `name`, matched
+/// case-insensitively. Unlike [`find_unique_column`], two matches are not an
+/// error: `SELECT * EXCEPT (id)` over a two-`id` join deliberately drops both.
+pub(crate) fn has_visible_column<'a>(cols: impl IntoIterator<Item = &'a ColumnDef>, name: &str) -> bool {
+    cols.into_iter()
+        .any(|c| !c.is_hidden && c.name.eq_ignore_ascii_case(name))
+}
+
+#[cfg(test)]
+#[path = "tests/rules.rs"]
+mod tests;

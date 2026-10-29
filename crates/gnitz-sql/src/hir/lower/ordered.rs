@@ -35,12 +35,7 @@ pub(super) fn lower_ordered(chain: &mut ViewChain, rel: &RelExpr) -> Result<Emit
         OrderedOp::TopN { .. } => &[],
     };
     let ReduceSpecs { group, specs, .. } = resolve_reduce_specs(partition, aggs, &frame)?;
-    if order.len() > gnitz_wire::MAX_ORDER_KEYS {
-        return Err(GnitzSqlError::Rejected(format!(
-            "ORDER BY has more than {} keys",
-            gnitz_wire::MAX_ORDER_KEYS
-        )));
-    }
+    crate::tail::reject_order_key_count(order.len())?;
     let keys = order
         .iter()
         .map(|k| {

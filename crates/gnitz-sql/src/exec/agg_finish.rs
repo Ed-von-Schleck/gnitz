@@ -35,14 +35,16 @@ impl FoldFinish {
         finalize: Vec<(BoundExpr, ColumnDef)>,
     ) -> Result<FoldFinish, GnitzSqlError> {
         // The aggregate columns trail the group columns.
-        let n_group = partial_schema.layout().num_payload_cols() - aggs.len();
-        let locs = partial_schema.layout().payload_locators();
-        let cols = partial_schema.payload_columns().skip(n_group);
+        let layout = partial_schema.layout();
+        let n_group = layout.num_payload_cols() - aggs.len();
+        let locs = layout.payload_locators();
+        let nullable = layout.nullable_payload_slots();
         let aggs = aggs
             .iter()
             .zip(&locs[n_group..])
-            .zip(cols)
-            .map(|((d, &loc), (pi, _, col))| {
+            .enumerate()
+            .map(|(k, (d, &loc))| {
+                let pi = n_group + k;
                 let extreme = match d.agg_op.merge_op() {
                     WireAggFunc::Min => Some(Ordering::Less),
                     WireAggFunc::Max => Some(Ordering::Greater),
@@ -50,7 +52,7 @@ impl FoldFinish {
                 };
                 // `combine` adds a linear partial as one 8-byte register image.
                 debug_assert!(
-                    extreme.is_some() || (!col.is_nullable && loc.size() == 8),
+                    extreme.is_some() || (!gnitz_wire::null_word_get(nullable, pi) && loc.size() == 8),
                     "a linear partial is a non-NULL 8-byte cell"
                 );
                 (pi, loc, extreme)
@@ -97,10 +99,6 @@ impl FoldFinish {
             "a fold partial is one reduce row"
         );
         let Firsts { absorbed, keep } = firsts(&partial.pks);
-        // Every row its own group: nothing to merge or drop.
-        if absorbed.is_empty() {
-            return partial;
-        }
         for &(pi, loc, extreme) in &self.aggs {
             match extreme {
                 Some(wins) => {

@@ -10,10 +10,11 @@ use std::sync::Arc;
 use gnitz_core::{Catalog, CatalogRelation, RelDescriptor, RelProps, ViewDefinition};
 use gnitz_wire::{CatalogColumn, ColumnDef, PkColList, RelClass, TableProps, ViewProps};
 
-use crate::bind::Catalog as _;
+use crate::catalog::Catalog as _;
 
 use super::*;
-use crate::{create_view_statement, view_body};
+use crate::create_view_statement;
+use crate::ddl::render::view_body;
 
 /// The base relations the bodies below read.
 const SOURCES: &[&str] = &["t", "u", "a", "b", "n", "c", "r"];

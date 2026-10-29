@@ -2,14 +2,15 @@
 //! Bind reads each subquery through its column ([`SubqueryRef::id`]); its join
 //! produces that column.
 
-use super::{as_col, split_filter, ColId, HirExpr, JoinType, ProjEntry, RelExpr, SubqueryKind, SubqueryRef};
+use super::super::{split_filter, ColId, HirExpr, JoinType, ProjEntry, RelExpr};
+use super::subquery::{SubqueryKind, SubqueryRef};
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
 use std::rc::Rc;
 
 /// `Project(items)` over `source`, with every subquery in `subs` that `source`'s
 /// filter or `items` read joined in below it.
-pub(crate) fn decorrelate(
+pub(super) fn decorrelate(
     source: Rc<RelExpr>,
     items: Vec<ProjEntry>,
     subs: &[SubqueryRef],
@@ -70,7 +71,8 @@ impl<'s> Joins<'s> {
     /// whether it did.
     fn consume(&mut self, pred: &HirExpr) -> Result<bool, GnitzSqlError> {
         let (bare, negated) = peel_not(pred);
-        if let Some(s) = as_col(bare)
+        if let Some(s) = bare
+            .as_col()
             .and_then(|id| self.unjoined(id))
             .filter(|s| matches!(s.kind, SubqueryKind::Exists { .. }))
         {

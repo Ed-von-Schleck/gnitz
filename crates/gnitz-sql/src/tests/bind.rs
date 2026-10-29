@@ -1,6 +1,4 @@
 use super::*;
-use crate::hir::bind_single_table;
-use crate::ir::{BoundExpr, NumLit};
 use crate::test_support::{bind_sql, col, ncol, parse_expr_sql, rejected};
 use gnitz_wire::TypeCode;
 
@@ -549,4 +547,28 @@ fn a_calendar_field_ignores_case_and_a_plural_s() {
     assert_eq!(calendar_field("DayOfYear"), Some(CalendarOp::Doy));
     assert_eq!(calendar_field("s"), None);
     assert_eq!(calendar_field("fortnight"), None);
+}
+
+/// A numeric literal binds as the narrowest exact form its text has: an `i64`, a
+/// wide magnitude up to `u128`, and past that — or with a fraction or exponent —
+/// the float it reads as, beside the decimal it spells.
+#[test]
+fn a_numeric_literal_binds_as_its_narrowest_exact_form() {
+    let wide = |mag| BExpr::LitWide(NumLit { mag, neg: false });
+    for (src, want) in [
+        ("42", BExpr::<usize>::LitInt(42)),
+        ("9223372036854775807", BExpr::LitInt(i64::MAX)),
+        ("9223372036854775808", wide(1 << 63)),
+        ("18446744073709551615", wide(u64::MAX.into())),
+        ("340282366920938463463374607431768211455", wide(u128::MAX)),
+        (
+            "340282366920938463463374607431768211456",
+            BExpr::LitFloat { v: 3.402823669209385e38, dec: None },
+        ),
+        ("1.5", BExpr::LitFloat { v: 1.5, dec: Some((15, 1)) }),
+        ("1e3", BExpr::LitFloat { v: 1000.0, dec: Some((1000, 0)) }),
+    ] {
+        let got = bind_literal(&Value::Number(src.into(), false)).unwrap();
+        assert_eq!(got, want, "{src}");
+    }
 }

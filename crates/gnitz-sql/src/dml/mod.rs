@@ -9,12 +9,12 @@ mod colwrite;
 mod explain;
 mod insert;
 mod mutate;
-mod plan;
 mod select;
+mod set;
 
-pub(crate) use explain::execute_explain;
 #[cfg(test)]
 pub(crate) use explain::explain_lines;
+pub(crate) use explain::{execute_explain, explained_query};
 pub(crate) use insert::{execute_insert, plan_insert};
 pub(crate) use mutate::{execute_mutation, plan_delete, plan_update};
 #[cfg(test)]

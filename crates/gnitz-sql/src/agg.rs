@@ -1,8 +1,7 @@
 //! The per-aggregate rules the binder, both reduce lowerings and the window
 //! desugar share, and the one SQL-name ↔ aggregate map. It reads no SQL text.
 
-use crate::error::GnitzSqlError;
-use crate::ir::{BExpr, BinOp};
+use crate::error::{unsupported_clause, GnitzSqlError};
 use gnitz_wire::AggFunc as WireAggFunc;
 use gnitz_wire::{ColType, ColumnDef, TypeCode};
 
@@ -13,6 +12,51 @@ pub(crate) enum AggFunc {
     Min,
     Max,
     Avg,
+}
+
+/// An aggregate call's argument. `COUNT(*)` is the only argument-less shape and
+/// `COUNT(DISTINCT *)` is not a shape at all, so a `Distinct` always carries one.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum AggArg<T> {
+    Star,
+    All(T),
+    Distinct(T),
+}
+
+impl<T> AggArg<T> {
+    /// The argument of a call whose DISTINCT the caller honours, or has refused.
+    pub(crate) fn ignoring_distinct(self) -> Option<T> {
+        match self {
+            AggArg::Star => None,
+            AggArg::All(a) | AggArg::Distinct(a) => Some(a),
+        }
+    }
+
+    /// The argument of a call on a surface that does not implement DISTINCT and
+    /// would otherwise compute the plain aggregate. `on` names that surface.
+    pub(crate) fn reject_distinct(self, on: &str) -> Result<Option<T>, GnitzSqlError> {
+        match self {
+            AggArg::Distinct(_) => Err(unsupported_clause(on, "DISTINCT")),
+            other => Ok(other.ignoring_distinct()),
+        }
+    }
+
+    /// Resolve the argument through `f`, keeping the qualifier.
+    pub(crate) fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<AggArg<U>, E> {
+        Ok(match self {
+            AggArg::Star => AggArg::Star,
+            AggArg::All(a) => AggArg::All(f(a)?),
+            AggArg::Distinct(a) => AggArg::Distinct(f(a)?),
+        })
+    }
+
+    /// Drop a DISTINCT the aggregate is indifferent to.
+    pub(crate) fn without_distinct(self) -> Self {
+        match self {
+            AggArg::Distinct(a) => AggArg::All(a),
+            other => other,
+        }
+    }
 }
 
 /// The one SQL-name ↔ aggregate map, read in both directions by
@@ -105,28 +149,6 @@ pub(crate) fn agg_col_def(op: WireAggFunc, src: Option<&ColumnDef>, ungrouped: b
 /// column, so `SELECT *` shows the grouping values and aggregates, not the hash.
 pub(crate) fn group_pk_def() -> ColumnDef {
     ColumnDef::new("_group_pk", TypeCode::U128, false).hidden()
-}
-
-/// An aggregate's SELECT/HAVING value from its raw value and count ([`agg_ops`]).
-/// A zero count renders NULL in both shapes.
-pub(crate) fn finalize_agg_bexpr<R>(value: BExpr<R>, count: Option<BExpr<R>>, func: AggFunc) -> BExpr<R> {
-    let Some(cnt) = count else {
-        return value;
-    };
-    if func == AggFunc::Avg {
-        // The cast makes the division a float one; dividing by a zero count is NULL.
-        let value = BExpr::Cast {
-            expr: Box::new(value),
-            to: ColType::of(TypeCode::F64),
-        };
-        BExpr::bin(value, BinOp::Div, cnt)
-    } else {
-        let present = BExpr::bin(cnt, BinOp::Ne, BExpr::LitInt(0));
-        BExpr::Case {
-            branches: vec![(present, value)],
-            else_: Box::new(BExpr::LitNull),
-        }
-    }
 }
 
 /// AVG divides to F64; every other aggregate renders its raw value type.

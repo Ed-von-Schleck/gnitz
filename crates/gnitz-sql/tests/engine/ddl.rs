@@ -56,6 +56,27 @@ fn inline_uniques_land_as_one_index_each() {
     assert_eq!(db.indexes("u"), [unique(&["a"]), unique(&["b"]), unique(&["refc"])]);
 }
 
+/// An inline UNIQUE's auto-name avoids every live index name: one a renamed
+/// table left behind, and one written by hand on another table.
+#[test]
+fn an_inline_unique_auto_name_avoids_live_index_names() {
+    let mut db = Db::boot(1);
+    let sn = db.sn.clone();
+    db.exec(&format!(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, b BIGINT UNIQUE);
+         ALTER TABLE t RENAME TO u;
+         CREATE TABLE t (id BIGINT PRIMARY KEY, b BIGINT UNIQUE);
+         CREATE TABLE o (id BIGINT PRIMARY KEY, x BIGINT);
+         CREATE INDEX {sn}__w__idx_b ON o(x);
+         CREATE TABLE w (id BIGINT PRIMARY KEY, b BIGINT UNIQUE)"
+    ));
+    let b = || (vec!["b".to_string()], true);
+    assert_eq!(db.indexes("u"), [b()]);
+    db.exec(&format!("DROP INDEX {sn}__t__idx_b_2; DROP INDEX {sn}__w__idx_b_2"));
+    assert!(db.indexes("t").is_empty() && db.indexes("w").is_empty());
+    assert_eq!(db.indexes("u"), [b()]);
+}
+
 #[test]
 fn relation_names_are_case_insensitive() {
     let mut db = Db::boot(1);
@@ -188,6 +209,27 @@ fn create_index_naming_and_rejections() {
     assert_eq!(db.indexes("t"), [(vec!["c".to_string()], false)]);
 }
 
+/// `IF NOT EXISTS` tests the index name alone: under a taken name the owner,
+/// its kind and the column list are never resolved.
+#[test]
+fn create_index_if_not_exists_skips_a_taken_name_before_resolving() {
+    let mut db = Db::boot(1);
+    db.exec(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT);
+         CREATE VIEW vw AS SELECT * FROM t;
+         CREATE INDEX ix_a ON t(a)",
+    );
+    db.exec(
+        "CREATE INDEX IF NOT EXISTS ix_a ON t(nosuch);
+         CREATE INDEX IF NOT EXISTS ix_a ON t(id);
+         CREATE INDEX IF NOT EXISTS ix_a ON nosuch(a);
+         CREATE INDEX IF NOT EXISTS ix_a ON vw(a)",
+    );
+    assert_eq!(db.indexes("t"), [(vec!["a".to_string()], false)]);
+    // A free name is still resolved and refused.
+    db.refuses("CREATE INDEX IF NOT EXISTS ix_z ON t(nosuch)", Rejected, "nosuch");
+}
+
 /// A view whose store holds each of its keys once, in full, takes an index; one
 /// whose store cannot is refused, as is a replacement that would drop an index.
 #[test]
@@ -254,6 +296,8 @@ fn alter_results_and_if_exists_no_ops() {
     assert_eq!(visible_names(&db.read("SELECT * FROM t2").0), ["id", "w", "a", "b"]);
     assert_eq!(db.scan("vw2", &["id", "v"]), at_weight_one(&[vec![2, 20], vec![3, 30]]));
 
+    // A constraint name resolves case-insensitively.
+    db.exec("ALTER TABLE t2 ADD CONSTRAINT uq2 UNIQUE (a); ALTER TABLE t2 DROP CONSTRAINT UQ2");
     db.exec("ALTER TABLE t2 ADD CONSTRAINT uq UNIQUE (b)");
     db.refuses(
         "INSERT INTO t2 VALUES (4, 40, 4, 100)",
@@ -378,6 +422,7 @@ fn alter_rejection_matrix() {
         ("ALTER TABLE t ADD CONSTRAINT cq CHECK (b > 0)", Rejected, "UNIQUE"),
         ("ALTER TABLE t DROP CONSTRAINT nope", Refused(NotFound), "not found"),
         ("ALTER TABLE t DROP CONSTRAINT ix CASCADE", Rejected, "CASCADE"),
+        ("ALTER TABLE t DROP CONSTRAINT _x", Rejected, "reserved"),
         // DROP CONSTRAINT drops a UNIQUE index of its own table only.
         (
             "ALTER TABLE t DROP CONSTRAINT ix",

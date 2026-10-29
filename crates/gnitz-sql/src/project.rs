@@ -1,5 +1,6 @@
-//! Physical projections: [`ProjItem`]s over a source schema → output layout and
-//! the compiled payload program.
+//! Physical projections: resolved [`BoundExpr`] slots over a source schema →
+//! output layout and the compiled payload program. A bare `ColRef` slot copies
+//! its source column; any other expression is compiled.
 //!
 //! [`payload_program`] compiles a leading-key projection's payload;
 //! [`reply_program`] builds the reply schema and program of one over a source's
@@ -12,33 +13,6 @@ use gnitz_core::Schema;
 use gnitz_expr::{ExprBuilder, LogicalProgram, Sink};
 use gnitz_wire::{ColumnDef, ComputeMap};
 
-/// One output column of a projection: a verbatim source column
-/// (`PassThrough`) or a value derived by an expression (`Computed`).
-pub(crate) enum ProjItem {
-    PassThrough { src_col: usize },
-    Computed { bound_expr: BoundExpr },
-}
-
-impl ProjItem {
-    /// Classify a *resolved* expression into an emission item: a bare column ref
-    /// is a zero-cost `PassThrough`, everything else a `Computed` program. The one
-    /// home for the split every physicalized projection makes.
-    pub(crate) fn from_bound(bound: BoundExpr) -> ProjItem {
-        match bound {
-            BoundExpr::ColRef(src_col) => ProjItem::PassThrough { src_col },
-            bound_expr => ProjItem::Computed { bound_expr },
-        }
-    }
-
-    /// The source column a pass-through copies, `None` for a computed item.
-    pub(crate) fn passthrough_src(&self) -> Option<usize> {
-        match self {
-            ProjItem::PassThrough { src_col } => Some(*src_col),
-            ProjItem::Computed { .. } => None,
-        }
-    }
-}
-
 /// `columns` behind a leading key region of `npk`, admitted as a schema the engine
 /// can hold.
 pub(crate) fn leading_schema(columns: Vec<ColumnDef>, npk: usize) -> Result<Schema, GnitzSqlError> {
@@ -49,14 +23,14 @@ pub(crate) fn leading_schema(columns: Vec<ColumnDef>, npk: usize) -> Result<Sche
 /// The payload program of a physicalized projection, whose first `k` items copy
 /// `input`'s PK.
 pub(crate) fn payload_program(
-    items: &[ProjItem],
+    items: &[BoundExpr],
     out: &Schema,
     input: &Schema,
 ) -> Result<LogicalProgram, GnitzSqlError> {
     let k = input.pk_cols().len();
     debug_assert_eq!(out.pk_cols().len(), k, "a projection keeps its input's key");
     debug_assert!(
-        (0..k).all(|i| items[i].passthrough_src() == Some(input.pk_cols()[i] as usize)),
+        (0..k).all(|i| items[i].as_col() == Some(input.pk_cols()[i] as usize)),
         "a physicalized projection copies its input's PK in front"
     );
     projection_program(&items[k..], &out.columns()[k..], input)
@@ -79,7 +53,7 @@ pub(crate) fn compute_map(program: LogicalProgram, out: &Schema) -> ComputeMap {
 /// program: one sink per output payload slot, in slot order. A computed item's
 /// sink is the one [`ExprBuilder::slot_sink`] builds for its declared column type.
 fn projection_program(
-    items: &[ProjItem],
+    items: &[BoundExpr],
     out_cols: &[ColumnDef],
     schema: &Schema,
 ) -> Result<LogicalProgram, GnitzSqlError> {
@@ -90,9 +64,9 @@ fn projection_program(
         .zip(out_cols)
         .map(|(item, col)| -> Result<Sink, GnitzSqlError> {
             match item {
-                ProjItem::PassThrough { src_col } => Ok(Sink::Col(*src_col as u32)),
-                ProjItem::Computed { bound_expr } => {
-                    let reg = compile_bound_expr(bound_expr, schema.columns(), &mut eb)?;
+                BoundExpr::ColRef(c) => Ok(Sink::Col(*c as u32)),
+                e => {
+                    let reg = compile_bound_expr(e, schema.columns(), &mut eb)?;
                     Ok(eb.slot_sink(reg, col.ty.tc))
                 }
             }
@@ -108,10 +82,7 @@ pub(crate) fn reply_program(
     payload: impl IntoIterator<Item = (BoundExpr, ColumnDef)>,
     source: &Schema,
 ) -> Result<(Schema, LogicalProgram), GnitzSqlError> {
-    let (items, cols): (Vec<ProjItem>, Vec<ColumnDef>) = payload
-        .into_iter()
-        .map(|(e, def)| (ProjItem::from_bound(e), def))
-        .unzip();
+    let (items, cols): (Vec<BoundExpr>, Vec<ColumnDef>) = payload.into_iter().unzip();
     let program = projection_program(&items, &cols, source)?;
     let columns = source.hidden_key_columns().chain(cols).collect();
     Ok((leading_schema(columns, source.pk_cols().len())?, program))

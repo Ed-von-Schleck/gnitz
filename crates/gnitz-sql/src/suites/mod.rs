@@ -13,7 +13,7 @@ mod plan_view_schema;
 mod plan_view_window;
 mod view_definition;
 
-use crate::bind::Catalog;
+use crate::catalog::Catalog;
 use crate::ddl::{plan_alter_view, plan_create_view};
 use crate::dml::ReadPlan;
 use crate::error::GnitzSqlError;
@@ -99,9 +99,12 @@ fn plan(cat: &dyn Catalog, sql: &str) -> Result<ViewBundle, GnitzSqlError> {
     }
 }
 
-/// Plan a read (`SELECT` / `EXPLAIN`) against `cat`.
+/// Plan a read (`SELECT` / `EXPLAIN`) against `cat`, as dispatch does.
 fn read(cat: &dyn Catalog, sql: &str) -> Result<ReadPlan, GnitzSqlError> {
-    crate::dml::plan_read(&parse_stmt(sql), cat)
+    match parse_stmt(sql) {
+        Statement::Query(q) => crate::dml::plan_read(&q, cat),
+        stmt => crate::dml::plan_read(crate::dml::explained_query(&stmt)?, cat),
+    }
 }
 
 /// The user-named view of a planned chain.

@@ -244,6 +244,8 @@ SHAPES = {
     # The repeated occurrence is wrapped in a pass-through that must seed first.
     "self_join": _a({"v": ("SELECT x.id AS xid, y.id AS yid FROM a x JOIN a y ON x.k = y.id",
                            ("xid", "yid"), {(i, k): 1 for i, k, _ in _A})}),
+    "self_join_computed": _a({"v": ("SELECT x.id AS xid, y.id AS yid FROM (SELECT id, k + 1 AS s FROM a) x JOIN a y ON x.s = y.id",
+                                    ("xid", "yid"), {(i, k + 1): 1 for i, k, _ in _A})}),
     # `x` reaches `a` by two paths; within one drive it is evaluated once per
     # incoming edge, which is correct multi-input behaviour and not a re-run.
     "diamond": (

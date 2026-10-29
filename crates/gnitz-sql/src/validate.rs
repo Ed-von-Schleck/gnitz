@@ -34,8 +34,7 @@ pub(crate) struct HonoredClauses {
 }
 
 impl HonoredClauses {
-    /// A shape consuming neither GROUP BY nor DISTINCT: a subquery body, a
-    /// FROM-less SELECT, a plain ungrouped SELECT.
+    /// A shape consuming neither GROUP BY nor DISTINCT: a subquery body.
     pub(crate) const PLAIN: HonoredClauses = HonoredClauses {
         grouping: false,
         distinct: false,

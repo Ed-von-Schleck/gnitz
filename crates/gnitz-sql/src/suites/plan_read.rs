@@ -666,6 +666,10 @@ fn a_read_the_planner_rejects_names_its_rule() {
             "WITH x AS (SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.v)) SELECT id FROM x",
             "(EXISTS/IN subquery)",
         ),
+        (
+            "WITH c AS (SELECT * FROM t), c AS (SELECT * FROM t WHERE v > 1) SELECT id FROM c",
+            "specified more than once",
+        ),
         ("SELECT x FROM (SELECT v AS x FROM t) d", "(derived table in FROM)"),
         ("SELECT t.id FROM t, u WHERE t.v = u.k", "CREATE VIEW"),
         // A clause the parser accepts and the read path would otherwise drop.
@@ -687,6 +691,8 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ("SELECT * FROM t FETCH FIRST 2 ROWS ONLY", "FETCH"),
         ("SELECT id FROM t PREWHERE v > 5", "PREWHERE"),
         ("SELECT TOP 2 id FROM t", "TOP"),
+        // DISTINCT wins the split, and its fold does not group.
+        ("SELECT DISTINCT v FROM t GROUP BY v", "GROUP BY is not supported"),
         (
             "SELECT id FROM t QUALIFY ROW_NUMBER() OVER (ORDER BY id) = 1",
             "QUALIFY",
@@ -764,7 +770,10 @@ fn a_subscription_is_a_plain_rows_read() {
         "SELECT id FROM tv ORDER BY v",
         "SELECT id FROM tv LIMIT 3",
     ] {
-        assert_rejects(sql, sub(sql), "a subscription");
+        assert_rejects(sql, sub(sql), "an aggregate, DISTINCT, ORDER BY, LIMIT or OFFSET");
+    }
+    for sql in ["SELECT 1", "SELECT 1 AS a LIMIT 2"] {
+        assert_rejects(sql, sub(sql), "a subscription: a SELECT without FROM");
     }
 }
 
@@ -1064,6 +1073,14 @@ fn a_grouped_guard_refuses_a_read_as_it_does_a_view() {
             "SELECT g FROM t GROUP BY g HAVING -(SUM(g) * 0.0)",
             "this operand is F64; a condition must be BOOLEAN",
         ),
+        // A grouping modifier asks for more than one grouping per row.
+        ("SELECT g, SUM(v) AS s FROM t GROUP BY g WITH ROLLUP", "WITH ROLLUP"),
+        ("SELECT g, SUM(v) AS s FROM t GROUP BY g WITH CUBE", "WITH CUBE"),
+        ("SELECT g, SUM(v) AS s FROM t GROUP BY g WITH TOTALS", "WITH TOTALS"),
+        (
+            "SELECT g, SUM(v) AS s FROM t GROUP BY g GROUPING SETS ((g), ())",
+            "GROUPING SETS",
+        ),
     ] {
         assert_rejects(body, read(&cat, body), msg);
         assert_rejects(body, plan(&cat, &format!("CREATE VIEW v AS {body}")), msg);
@@ -1082,6 +1099,9 @@ fn a_from_less_select_plans_a_constant_row() {
         ("SELECT 1 AS a ORDER BY a DESC LIMIT 1", vec!["a"]),
         ("SELECT 1 AS a ORDER BY 1 + 1", vec!["a"]),
         ("WITH x AS (SELECT 40 + 2 AS a) SELECT a + 1 AS b FROM x", vec!["b"]),
+        ("SELECT DISTINCT 1", vec!["_expr0"]),
+        ("SELECT DISTINCT 1 AS a ORDER BY a", vec!["a"]),
+        ("WITH c AS (SELECT * FROM (SELECT 1 AS x) d) SELECT x FROM c", vec!["x"]),
     ] {
         let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
         assert_eq!(explain(&cat, sql)[0], "read nothing (constant row)", "`{sql}`");
@@ -1102,7 +1122,24 @@ fn a_from_less_select_plans_a_constant_row() {
         ("SELECT x", "column 'x' not found"),
         ("SELECT 1 + t.x", "table alias 't' not found"),
         ("SELECT *", "SELECT * is not a supported SELECT item"),
-        ("SELECT 1 WHERE 1 = 1", "SELECT without FROM: WHERE is not supported"),
+        (
+            "SELECT 1 WHERE 1 = 1",
+            "a WHERE over a SELECT without FROM is not supported",
+        ),
+        (
+            "WITH c AS (SELECT 1 AS x WHERE 1 = 1) SELECT x FROM c",
+            "a WHERE over a SELECT without FROM",
+        ),
+        (
+            "WITH c AS (SELECT 1 AS x) SELECT x FROM c WHERE x > 0",
+            "a WHERE over a SELECT without FROM",
+        ),
+        ("SELECT 1 GROUP BY 1", "an aggregate over a SELECT without FROM"),
+        (
+            "WITH c AS (SELECT 1 AS x) SELECT COUNT(*) FROM c",
+            "an aggregate over a SELECT without FROM",
+        ),
+        ("SELECT DISTINCT 2.5", "cannot be a key"),
         ("SELECT COUNT(*)", "aggregate"),
         ("SELECT 1 AS a, 2 AS a", "duplicate column name 'a'"),
         ("SELECT 1 AS a ORDER BY 2", "ORDER BY position 2 is out of range"),

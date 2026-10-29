@@ -1,9 +1,8 @@
 //! The relational HIR: one IR between the sqlparser AST and what a query
 //! lowers to, compiled by `bind → lower`; bind places each predicate
-//! (`place.rs`) and joins in each subquery (`decorrelate.rs`) as it builds. A
-//! view body lowers to its `Circuit`s ([`bind_and_lower`]); an ad-hoc SELECT
-//! binds through the same binder and lowers to one read of one relation
-//! ([`bind_adhoc_read`]).
+//! (`place.rs`) and joins in each subquery as it builds. A view body lowers to
+//! its `Circuit`s ([`bind_and_lower`]); an ad-hoc SELECT binds through the same
+//! binder and lowers to one read of one relation ([`bind_adhoc_read`]).
 //!
 //! The discipline: a column is an **opaque `ColId`** minted once at bind and
 //! never renumbered, so a resolved reference survives every tree built over it
@@ -13,19 +12,16 @@
 //! PK-front convention and the `ColId → ColRef(position)` substitution.
 
 mod bind;
-mod decorrelate;
 mod lower;
 mod physical;
 mod place;
-mod window;
 
-pub(crate) use bind::{bind_single_table, BoundRef, ViewBody};
+pub(crate) use bind::{BoundRef, ViewBody};
 
-use crate::agg::AggFunc;
-use crate::ast_util::AggArg;
+use crate::agg::{AggArg, AggFunc};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, LeafTyping};
-use gnitz_core::{PlannedView, RelDescriptor};
+use gnitz_core::{PlannedView, RelDescriptor, Schema};
 use gnitz_wire::AggFunc as WireAggFunc;
 use gnitz_wire::{ColType, ColumnDef, RangeRel, TypeCode};
 use std::rc::Rc;
@@ -46,7 +42,7 @@ pub(crate) struct LoweredView {
 /// tree shared by every `Alias` naming it, so nothing compiles before the tree is
 /// whole.
 pub(crate) fn bind_and_lower<'a>(
-    cat: &dyn crate::bind::Catalog,
+    cat: &dyn crate::catalog::Catalog,
     query: &sqlparser::ast::Query,
     view: bind::ViewBody,
     bounded: bool,
@@ -62,7 +58,7 @@ pub(crate) fn bind_and_lower<'a>(
         .filter(|c| !c.def.is_hidden)
         .map(|c| c.def.name.clone())
         .collect();
-    crate::bind::apply_positional_aliases(aliases, names.iter_mut().map(|c| &mut c.def), stmt)?;
+    bind::apply_positional_aliases(aliases, names.iter_mut().map(|c| &mut c.def), stmt)?;
     let (segments, view) = lower::lower(rel, bounded, &names)?;
     Ok(LoweredView {
         segments,
@@ -72,23 +68,34 @@ pub(crate) fn bind_and_lower<'a>(
     })
 }
 
+pub(crate) use bind::ranking_names;
 pub(crate) use lower::fold::FoldPieces;
 pub(crate) use lower::read::{AdhocRead, AdhocRows, AdhocShape, RowsReply};
-pub(crate) use window::ranking_names;
 
 /// The ad-hoc read path's entry to the same core: bind a query that reads one
 /// relation — its CTEs, then its body — and lower it to one read of that
 /// relation. One binder, two sinks, so a statement means the same thing as an
 /// ad-hoc read and as a view body.
 pub(crate) fn bind_adhoc_read(
-    cat: &dyn crate::bind::Catalog,
+    cat: &dyn crate::catalog::Catalog,
     query: &sqlparser::ast::Query,
-    select: &sqlparser::ast::Select,
-    op: &'static str,
     order_exprs: &[&sqlparser::ast::Expr],
 ) -> Result<AdhocRead, GnitzSqlError> {
+    use crate::ast_util::{classify_from, FromShape};
+    use crate::error::derivation;
+    // The top-level body reads through one relation's sink, so a set operation or a
+    // FROM that derives is refused before anything is resolved; a CTE may derive,
+    // and the read lowering refuses what it cannot compose to one read.
+    let select = match query.body.as_ref() {
+        sqlparser::ast::SetExpr::SetOperation { .. } => return Err(derivation("set operation")),
+        // Not the derivation template: CREATE VIEW refuses these bodies too.
+        body => crate::validate::as_plain_select(body, "direct SELECT")?,
+    };
+    if let FromShape::Derived(construct) = classify_from(&select.from) {
+        return Err(derivation(construct));
+    }
     let ids = ColIdGen::new();
-    let mut cx = bind::BindCx::new(cat, &ids, bind::Surface::Adhoc { op });
+    let mut cx = bind::BindCx::new(cat, &ids, bind::Surface::Adhoc);
     bind::bind_ctes(&mut cx, query)?;
     let (rel, placed) = bind::bind_select(&cx, select, order_exprs)?;
     lower::read::lower_read(&rel, placed, &cx.refs.into_inner())
@@ -101,7 +108,7 @@ pub(crate) fn bind_returning(
     alias: &str,
 ) -> Result<AdhocRows, GnitzSqlError> {
     let ids = ColIdGen::new();
-    let (source, items) = bind::bind_returning(&ids, projection, Arc::clone(desc), alias)?;
+    let (source, items) = bind::bind_returning(&ids, projection, &desc.schema, alias)?;
     lower::read::reply_rows(desc, &source, items, Vec::new())
 }
 
@@ -159,15 +166,6 @@ impl LeafTyping<ColId> for [HirCol] {
     }
 }
 
-/// The `ColId` of a bare `ColRef` leaf, else `None` (a literal or a computed
-/// expression).
-pub(crate) fn as_col(e: &HirExpr) -> Option<ColId> {
-    match e {
-        BExpr::ColRef(id) => Some(*id),
-        _ => None,
-    }
-}
-
 /// Which of two inputs' columns a conjunct names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
@@ -202,38 +200,11 @@ pub(crate) fn cross_comparison<'a>(
     right: &'a [HirCol],
 ) -> Option<(&'a HirCol, &'a HirCol, BinOp)> {
     let BExpr::BinOp(a, op, b) = conj else { return None };
-    let (a, b) = (as_col(a)?, as_col(b)?);
+    let (a, b) = (a.as_col()?, b.as_col()?);
     match (col_by_id(left, a), col_by_id(right, b)) {
         (Some(l), Some(r)) => Some((l, r, *op)),
         _ => Some((col_by_id(left, b)?, col_by_id(right, a)?, op.converse())),
     }
-}
-
-/// A subquery bound where its expression was written: the column it is read
-/// through, and what joins that column in when the body's projection is built.
-#[derive(Clone)]
-pub(crate) struct SubqueryRef {
-    /// The column this subquery is read through: its Mark join's BOOLEAN column,
-    /// or its finalized aggregate.
-    pub id: ColId,
-    pub kind: SubqueryKind,
-    /// EXISTS/IN: the inner relation (a `Get`, or a CTE's `Alias`) under an
-    /// optional `Filter` of its local WHERE. Scalar: `Project(Reduce)` passing
-    /// the group columns through and computing the finalized aggregate as `id`.
-    pub rel: Rc<RelExpr>,
-    /// The mixed-scope conjuncts that become the join's ON, an IN's
-    /// `outer = inner` equality among them.
-    pub correlation: Vec<HirExpr>,
-}
-
-/// How a subquery joins in: `Exists` (EXISTS / IN) as a Semi/Anti/Mark join,
-/// `Scalar` (an aggregate, or a range ANY/ALL's MIN/MAX) as its reduce.
-#[derive(Clone, Copy)]
-pub(crate) enum SubqueryKind {
-    /// `nullable`: an IN whose operands can be NULL, so its truth can be.
-    Exists { nullable: bool },
-    /// `count`: a COUNT, which a group of no rows renders as 0, never NULL.
-    Scalar { ty: ColType, count: bool },
 }
 
 /// The bound-expression IR hosted on the HIR leaf. Structurally identical to the
@@ -246,6 +217,20 @@ pub(crate) type HirExpr = crate::ir::BExpr<ColId>;
 pub(crate) struct ProjEntry {
     pub expr: HirExpr,
     pub out: HirCol,
+}
+
+impl ProjEntry {
+    /// A projection item passing one column through to itself, keeping its
+    /// identity.
+    pub(crate) fn passthrough(c: HirCol) -> ProjEntry {
+        ProjEntry { expr: BExpr::ColRef(c.id), out: c }
+    }
+
+    /// Projection items passing each column through to itself, keeping its
+    /// identity — the item half of `SELECT <cols>`.
+    pub(crate) fn passthroughs(cols: impl IntoIterator<Item = HirCol>) -> Vec<ProjEntry> {
+        cols.into_iter().map(ProjEntry::passthrough).collect()
+    }
 }
 
 /// The logical relational IR. `Get`, `Alias` and `SetOp` store their whole
@@ -440,19 +425,30 @@ impl HirAgg {
         out
     }
 
-    /// The finalize composite over this aggregate's raw reduce column(s).
+    /// The SELECT/HAVING value over this aggregate's raw reduce column(s): the
+    /// raw value when it has no count companion ([`crate::agg::agg_ops`]), else
+    /// NULL on a zero count — AVG as a float division by the count, every other
+    /// aggregate as a CASE on it.
     pub(crate) fn finalize(&self) -> HirExpr {
-        let col = |c: &AggCol| BExpr::ColRef(c.col.id);
-        crate::agg::finalize_agg_bexpr(col(&self.out), self.companion.as_ref().map(col), self.func)
-    }
-
-    /// This aggregate as a view-facing value column: its finalize composite, and
-    /// the type and nullability it renders where a view reads it.
-    pub(crate) fn as_value(&self) -> (HirExpr, ColType, bool) {
-        let ty = crate::agg::agg_view_type(self.func, self.out.col.def.ty);
-        // A companion carries the null-ness; otherwise the raw column's own.
-        let nullable = self.companion.is_some() || self.out.col.def.is_nullable;
-        (self.finalize(), ty, nullable)
+        let value = BExpr::ColRef(self.out.col.id);
+        let Some(count) = &self.companion else {
+            return value;
+        };
+        let cnt = BExpr::ColRef(count.col.id);
+        if self.func == AggFunc::Avg {
+            // The cast makes the division a float one; dividing by a zero count is NULL.
+            let value = BExpr::Cast {
+                expr: Box::new(value),
+                to: ColType::of(TypeCode::F64),
+            };
+            BExpr::bin(value, BinOp::Div, cnt)
+        } else {
+            let present = BExpr::bin(cnt, BinOp::Ne, BExpr::LitInt(0));
+            BExpr::Case {
+                branches: vec![(present, value)],
+                else_: Box::new(BExpr::LitNull),
+            }
+        }
     }
 }
 
@@ -624,30 +620,21 @@ fn set_op_common_type(l: ColType, r: ColType) -> Option<ColType> {
     (widens(l.tc) && widens(r.tc)).then_some(ColType::of(t))
 }
 
+/// One fresh `ColId` per column of `schema`, in schema order (so a `ColId`'s env
+/// position is its schema position).
+fn schema_cols(ids: &ColIdGen, schema: &Schema) -> Vec<HirCol> {
+    schema
+        .columns()
+        .iter()
+        .map(|c| HirCol::new(ids.next(), c.clone()))
+        .collect()
+}
+
 impl RelExpr {
-    /// A base table or committed/hidden-view source: one fresh `ColId` per
-    /// registered schema column, in schema order (so a `ColId`'s env position is
-    /// its schema position).
+    /// A base table or committed/hidden-view source: its columns from [`schema_cols`].
     pub(crate) fn get(ids: &ColIdGen, desc: Arc<RelDescriptor>) -> Rc<RelExpr> {
-        let cols = desc
-            .schema
-            .columns()
-            .iter()
-            .map(|c| HirCol::new(ids.next(), c.clone()))
-            .collect();
+        let cols = schema_cols(ids, &desc.schema);
         Rc::new(RelExpr::Get { desc, cols })
-    }
-
-    /// A projection item passing one column through to itself, keeping its
-    /// identity.
-    pub(crate) fn passthrough_item(c: HirCol) -> ProjEntry {
-        ProjEntry { expr: BExpr::ColRef(c.id), out: c }
-    }
-
-    /// Projection items passing each column through to itself, keeping its
-    /// identity — the item half of `SELECT <cols>`.
-    pub(crate) fn passthrough_items(cols: impl IntoIterator<Item = HirCol>) -> Vec<ProjEntry> {
-        cols.into_iter().map(RelExpr::passthrough_item).collect()
     }
 
     /// A projection: its output columns are the `ProjEntry.out`s (SELECT order —
@@ -729,7 +716,7 @@ impl RelExpr {
             RelExpr::Project { input, items } => input
                 .unique_key()?
                 .iter()
-                .map(|k| items.iter().find(|it| as_col(&it.expr) == Some(*k)).map(|it| it.out.id))
+                .map(|k| items.iter().find(|it| it.expr.as_col() == Some(*k)).map(|it| it.out.id))
                 .collect(),
             RelExpr::Alias { input, cols } => rename_key(input.unique_key()?, &input.cols(), cols),
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),

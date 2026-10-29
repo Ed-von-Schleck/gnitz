@@ -26,7 +26,10 @@ fn each_accepted_spelling_declares_its_type() {
         ("UNSIGNED INTEGER", t(U32)),
         ("UINT128", t(U128)),
         ("INT128", t(I128)),
+        ("FLOAT(1)", t(F32)),
         ("FLOAT(24)", t(F32)),
+        ("FLOAT(25)", t(F64)),
+        ("FLOAT(53)", t(F64)),
         ("DOUBLE PRECISION", t(F64)),
         ("REAL", t(F64)),
         ("VARCHAR", t(String)),
@@ -85,6 +88,13 @@ fn each_refused_spelling_names_its_reason() {
         ("HYPERLOGLOG", "unsupported SQL type: HYPERLOGLOG"),
         // A modifier makes it no SERIAL spelling, so it falls to the type map.
         ("SERIAL(5)", "unsupported SQL type: SERIAL(5)"),
+        // So does a qualifier.
+        ("foo.SERIAL", "unsupported SQL type: foo.SERIAL"),
+        ("pg_catalog.BIGSERIAL", "unsupported SQL type: pg_catalog.BIGSERIAL"),
+        // FLOAT(p) counts mantissa bits: 1..=53, and no scale.
+        ("FLOAT(0)", "the precision must be 1..=53"),
+        ("FLOAT(54)", "the precision must be 1..=53"),
+        ("FLOAT(7, 2)", "a FLOAT takes no scale"),
         // A BLOB is unbounded; a length would have to be enforced or ignored.
         ("BLOB(16)", "unsupported SQL type: BLOB(16)"),
     ] {

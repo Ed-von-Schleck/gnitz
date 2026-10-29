@@ -1,38 +1,6 @@
 use super::*;
 use gnitz_wire::TypeCode;
 
-fn table_options_of(with: &str) -> CreateTableOptions {
-    match crate::test_support::parse_stmt(&format!("CREATE TABLE t (id BIGINT PRIMARY KEY) {with}")) {
-        sqlparser::ast::Statement::CreateTable(c) => c.table_options,
-        other => panic!("not a CREATE TABLE: {other}"),
-    }
-}
-
-#[test]
-fn with_options_carry_replicated_and_stream_independently() {
-    let (keyed, repl) = (TableDistribution::default(), TableDistribution::Replicated);
-    for (with, stream, distribution) in [
-        ("", false, keyed),
-        ("WITH (replicated = true)", false, repl),
-        ("WITH (stream = true)", true, keyed),
-        ("WITH (stream = true, replicated = false)", true, keyed),
-        ("WITH (stream = true, replicated = true)", true, repl),
-    ] {
-        let want = TableProps {
-            stream,
-            distribution,
-            serial: false,
-            compress: false,
-        };
-        assert_eq!(parse_table_options(&table_options_of(with)).unwrap(), want, "{with}");
-    }
-    let e = parse_table_options(&table_options_of("WITH (stream = 1)")).unwrap_err();
-    assert!(
-        matches!(&e, GnitzSqlError::Rejected(m) if m.contains("WITH (stream = …) expects a boolean")),
-        "{e:?}"
-    );
-}
-
 /// A child adopts the referenced type: identity, or an integer domain that fits
 /// inside it. The integer ladder itself is `int_domain_fits`'s own test.
 #[test]
@@ -117,29 +85,4 @@ fn a_dist_prefix_is_a_leading_pk_prefix_in_pk_order() {
         matches!(&e, GnitzSqlError::Rejected(m) if m.contains("column 'd' is not a PRIMARY KEY column")),
         "{e:?}"
     );
-}
-
-#[test]
-fn with_options_spell_every_table_property_a_with_clause_reads_back() {
-    for replicated in [false, true] {
-        for stream in [false, true] {
-            for compress in [false, true] {
-                let props = TableProps {
-                    stream,
-                    serial: false,
-                    distribution: match replicated {
-                        true => TableDistribution::Replicated,
-                        false => TableDistribution::default(),
-                    },
-                    compress,
-                };
-                let entries = table_with_options(&props);
-                let with = match entries.is_empty() {
-                    true => String::new(),
-                    false => format!("WITH ({})", entries.join(", ")),
-                };
-                assert_eq!(parse_table_options(&table_options_of(&with)).unwrap(), props, "{with}");
-            }
-        }
-    }
 }

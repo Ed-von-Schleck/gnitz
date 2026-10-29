@@ -81,11 +81,13 @@ fn limit_and_offset_read_every_clause_form() {
         ("SELECT * FROM t LIMIT 2, 3", Some(3), 2),
     ] {
         let q = parse_query(sql);
-        assert_eq!(
-            (extract_limit(&q).unwrap(), extract_offset(&q).unwrap()),
-            (limit, offset),
-            "{sql}"
-        );
+        assert_eq!(extract_limit_offset(&q).unwrap(), (limit, offset), "{sql}");
+    }
+    for (sql, want) in [
+        ("SELECT * FROM t LIMIT 1 OFFSET 'x'", "OFFSET"),
+        ("SELECT * FROM t LIMIT 1+1", "LIMIT"),
+    ] {
+        assert_rejects(sql, extract_limit_offset(&parse_query(sql)), want);
     }
 }
 

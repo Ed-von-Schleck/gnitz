@@ -28,7 +28,7 @@ fn types(chain: &ViewBundle) -> Vec<TypeCode> {
 /// A view lists its columns in SELECT order over the full source PK: a
 /// projected PK column sits at its SELECT slot, an omitted one rides hidden in
 /// front, a duplicate reference is a payload copy, and a computed item is
-/// nullable and named by its raw projection index.
+/// named by its raw projection index, nullable only where its value can be NULL.
 #[test]
 fn a_view_lists_its_select_order_over_the_source_pk() {
     let i = TypeCode::I64;
@@ -86,7 +86,7 @@ fn a_view_lists_its_select_order_over_the_source_pk() {
         ),
         (
             "SELECT id + 1, name FROM tn",
-            sh(&[("id", true, false), ("_expr0", false, true), ("name", false, true)]),
+            sh(&[("id", true, false), ("_expr0", false, false), ("name", false, true)]),
             &[0],
         ),
         (
@@ -106,7 +106,7 @@ fn a_view_lists_its_select_order_over_the_source_pk() {
         ),
         (
             "SELECT a, b, c + 1 FROM cabn",
-            sh(&[("a", false, false), ("b", false, false), ("_expr2", false, true)]),
+            sh(&[("a", false, false), ("b", false, false), ("_expr2", false, false)]),
             &[0, 1],
         ),
         (
@@ -121,7 +121,7 @@ fn a_view_lists_its_select_order_over_the_source_pk() {
         ),
         (
             "SELECT a + 1 AS x FROM tab",
-            sh(&[("id", true, false), ("x", false, true)]),
+            sh(&[("id", true, false), ("x", false, false)]),
             &[0],
         ),
         (
@@ -130,7 +130,7 @@ fn a_view_lists_its_select_order_over_the_source_pk() {
                 ("id", false, false),
                 ("a", false, false),
                 ("b", false, false),
-                ("_expr1", false, true),
+                ("_expr1", false, false),
             ]),
             &[0],
         ),
@@ -313,12 +313,12 @@ fn a_cte_body_reads_in_place_only_when_it_renames() {
         (
             "WITH c AS (SELECT a, b FROM ab WHERE a > 0), cte AS (SELECT a + 1 AS s FROM c) SELECT s FROM cte",
             3,
-            sh(&[("a", true, false), ("s", false, true)]),
+            sh(&[("a", true, false), ("s", false, false)]),
         ),
         (
             "WITH cte AS (SELECT a + 1 AS s FROM ab) SELECT s FROM cte",
             2,
-            sh(&[("a", true, false), ("s", false, true)]),
+            sh(&[("a", true, false), ("s", false, false)]),
         ),
         // The same-named derived alias shadows the CTE in the final body, so the
         // CTE is never read and never cut.
@@ -690,12 +690,12 @@ fn an_aggregate_output_column_is_typed_by_its_argument_and_grouping() {
     }
 }
 
-/// A copied column keeps its type and the nullability its leaf answers for it,
-/// whatever minted it; a computed one is nullable, at its register image, under
-/// its alias or `_expr{idx}`.
+/// Every item is declared at its expression's type, under its alias or
+/// `_expr{idx}`, and is nullable unless provably never NULL: a copied column
+/// keeps the nullability its leaf answers for it, whatever minted it.
 #[test]
 fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
-    use TypeCode::{String as Str, F32, F64, I32, I64};
+    use TypeCode::{String as Str, F32, F64, I16, I32, I64};
     let cat = catalog(vec![
         ("o", table(30, vec![col("id", I64), col("k", I64)], vec![0])),
         (
@@ -754,12 +754,15 @@ fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
             false,
         ),
         ("SELECT id, s || 'x' FROM d", "_expr1", Str, true),
-        ("SELECT id, k, CAST(k AS SMALLINT) FROM d", "_expr2", I64, true),
+        // A narrowing cast is its target, and NULL for a value past it.
+        ("SELECT id, k, CAST(k AS SMALLINT) FROM d", "_expr2", I16, true),
+        ("SELECT DISTINCT CAST(k AS SMALLINT) AS c FROM d", "c", I16, true),
         ("SELECT id, CAST(k AS FLOAT) AS x FROM d", "x", F64, true),
-        ("SELECT id, w + 1 AS x FROM d", "x", I64, true),
+        ("SELECT id, w + 1 AS x FROM d", "x", I64, false),
+        ("SELECT id, w / 0 AS x FROM d", "x", I64, true),
         // A test is a BOOLEAN, stored as one.
-        ("SELECT id, w > 1 AS x FROM d", "x", TypeCode::Bool, true),
-        ("SELECT id, w > 1 AND k IS NULL AS x FROM d", "x", TypeCode::Bool, true),
+        ("SELECT id, w > 1 AS x FROM d", "x", TypeCode::Bool, false),
+        ("SELECT id, w > 1 AND k IS NULL AS x FROM d", "x", TypeCode::Bool, false),
     ];
     for &(body, name, tc, nullable) in rows {
         let chain = view(&cat, body);

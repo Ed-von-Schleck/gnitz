@@ -1,21 +1,35 @@
 //! GROUP BY / aggregate / HAVING binding: the reduce, the pre-map under it and
 //! the leaf its HAVING and SELECT list bind through.
 
-use super::super::{
-    as_col, col_by_id, hircol_of, reduce_reads, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr,
-};
+use super::super::{col_by_id, hircol_of, reduce_reads, ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr};
 use super::{bind_select_list, BindCx, ItemLeaf, ScopeLeaf};
-use crate::agg::AggFunc;
-use crate::ast_util::{group_by_exprs, AggArg};
+use crate::agg::{AggArg, AggFunc};
 use crate::bind::{bind_conjuncts, bind_structural, LeafBinder};
-use crate::error::GnitzSqlError;
+use crate::error::{unsupported_clause, GnitzSqlError};
 use crate::ir::{BExpr, LeafTyping};
 use crate::rules::reject_float_keys;
 use crate::tail::group_by_target;
 use gnitz_wire::{ColType, ColumnDef};
-use sqlparser::ast::{Expr, Select};
+use sqlparser::ast::{Expr, GroupByExpr, Select};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+/// The GROUP BY clause's expression list. Only the plain list form is supported —
+/// `GROUPING SETS` / `CUBE` / `ROLLUP` / `ALL`, written in the list or as a trailing
+/// `WITH …` / `GROUPING SETS (…)` modifier, produce multiple grouping keys per row,
+/// which no reduce shape models.
+fn group_by_exprs(select: &Select) -> Result<&[Expr], GnitzSqlError> {
+    match &select.group_by {
+        GroupByExpr::Expressions(exprs, mods) if mods.is_empty() => Ok(exprs),
+        GroupByExpr::Expressions(..) => Err(unsupported_clause(
+            "GROUP BY",
+            "WITH ROLLUP / WITH CUBE / WITH TOTALS / GROUPING SETS",
+        )),
+        _ => Err(GnitzSqlError::Rejected(
+            "GROUP BY: only expression list supported".to_string(),
+        )),
+    }
+}
 
 /// The columns a grouped query computes below its reduce: a GROUP BY key or an
 /// aggregate argument that is not already a bare column reference becomes one
@@ -48,13 +62,11 @@ impl<'a> PreMap<'a> {
         if let Some(id) = find_bound(&self.extra, &bound) {
             return Ok(id);
         }
-        let ty = bound.infer_ty(&self.env[..]);
-        // Declared nullable unconditionally (a computed value can be NULL: `a / 0`),
-        // so an aggregate over one takes the null-skipping shape. Hidden because
-        // only the expression that minted it may reach it.
+        let (ty, nullable) = bound.declared(&self.env[..]);
+        // Hidden because only the expression that minted it may reach it.
         let out = HirCol::new(
             self.ids.next(),
-            ColumnDef::typed(format!("_pre{}", self.extra.len()), ty, true).hidden(),
+            ColumnDef::typed(format!("_pre{}", self.extra.len()), ty, nullable).hidden(),
         );
         let id = out.id;
         self.env.push(out.clone());
@@ -75,7 +87,7 @@ impl<'a> PreMap<'a> {
         ids.iter()
             .map(|id| match self.extra.iter().find(|x| x.out.id == *id) {
                 Some(e) => e.clone(),
-                None => RelExpr::passthrough_item(hircol_of(self.source_cols(), *id).clone()),
+                None => ProjEntry::passthrough(hircol_of(self.source_cols(), *id).clone()),
             })
             .collect()
     }
@@ -86,7 +98,9 @@ impl<'a> PreMap<'a> {
 /// minting and for looking up, so an expression cannot resolve to one column in
 /// the reduce and another above it.
 fn find_bound(extra: &[ProjEntry], bound: &HirExpr) -> Option<ColId> {
-    as_col(bound).or_else(|| extra.iter().find(|x| &x.expr == bound).map(|x| x.out.id))
+    bound
+        .as_col()
+        .or_else(|| extra.iter().find(|x| &x.expr == bound).map(|x| x.out.id))
 }
 
 /// Resolve the GROUP BY list to the `ColId`s the reduce groups by: a 1-based
@@ -280,7 +294,7 @@ impl LeafBinder<ColId> for GroupedLeaf<'_> {
     /// grouping does not cover was written outside both.
     fn bind_column(&self, qual: Option<&str>, name: &str) -> Result<HirExpr, GnitzSqlError> {
         let bound = self.leaf.bind_column(qual, name)?;
-        match as_col(&bound).filter(|id| self.group_cols.contains(id)) {
+        match bound.as_col().filter(|id| self.group_cols.contains(id)) {
             Some(_) => Ok(bound),
             None => Err(GnitzSqlError::Rejected(format!(
                 "column '{name}' must appear in GROUP BY or an aggregate function"

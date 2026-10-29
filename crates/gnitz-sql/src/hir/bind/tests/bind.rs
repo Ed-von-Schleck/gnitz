@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{col, ncol, parse_query, rel, table, TestCatalog};
+use crate::test_support::{col, ncol, parse_expr_sql, parse_query, rejected, rel, shadowed_cols, table, TestCatalog};
 use gnitz_wire::{RelClass, TypeCode};
 use std::rc::Rc;
 
@@ -47,7 +47,7 @@ pub(in crate::hir) fn bound(sql: &str) -> Rc<RelExpr> {
 /// the preserved side's copy. A derived table's `AS d(col…)` names its columns
 /// through a join and a GROUP BY. A computed group key reads as computed, and an
 /// aggregate over a computed argument takes its default name and the argument's
-/// type, nullable because the pre-map column holding it is minted nullable.
+/// type, nullable only where the pre-map column holding it can be NULL.
 #[test]
 fn a_body_declares_its_output_columns() {
     use TypeCode::{F64, I64};
@@ -77,7 +77,7 @@ fn a_body_declares_its_output_columns() {
         ),
         (
             "SELECT a + 1, SUM(a * 2) FROM t GROUP BY a + 1",
-            &[("_expr0", I64, true), ("_sum1", I64, true)],
+            &[("_expr0", I64, false), ("_sum1", I64, false)],
         ),
         (
             "SELECT a, SUM(f * 2) FROM t GROUP BY a",
@@ -113,7 +113,7 @@ fn a_reduce_reads_one_distinct_set_and_shares_its_columns() {
         (
             "SELECT COUNT(DISTINCT a + 1) FROM t GROUP BY b",
             Some("b <computed>"),
-            &[CountNonNull],
+            &[Count],
         ),
         (
             "SELECT a, COUNT(DISTINCT b), SUM(DISTINCT b), MAX(DISTINCT b) FROM t GROUP BY a \
@@ -169,4 +169,41 @@ fn a_reduce_reads_one_distinct_set_and_shares_its_columns() {
         assert_eq!(set.as_deref(), want_set, "{sql}");
         assert_eq!(aggs.iter().map(|c| c.op).collect::<Vec<_>>(), want_ops, "{sql}");
     }
+}
+
+/// Only an unqualified name can name an output column; a qualified one is left
+/// to the caller's scope, which checks the qualifier.
+#[test]
+fn output_column_matches_unqualified_names_only() {
+    let cols = shadowed_cols();
+    for (src, want) in [
+        ("ID", Some(1)),
+        ("(id)", Some(1)),
+        ("t.id", None),
+        ("id + 1", None),
+        ("_k", None),
+    ] {
+        assert_eq!(output_column(&parse_expr_sql(src), &cols).unwrap(), want, "{src}");
+    }
+}
+
+#[test]
+fn positional_aliases_rename_the_visible_columns_in_order() {
+    let rename = |aliases: &[&str]| {
+        let aliases: Vec<Ident> = aliases.iter().map(|a| Ident::new(*a)).collect();
+        let mut defs = vec![
+            col("_k", TypeCode::U64).hidden(),
+            col("a", TypeCode::U64),
+            col("b", TypeCode::U64),
+        ];
+        apply_positional_aliases(aliases.iter(), &mut defs, "CTE 'd'")
+            .map(|()| defs.into_iter().map(|c| c.name).collect::<Vec<_>>())
+    };
+    assert_eq!(rename(&["x", "y"]).unwrap(), ["_k", "x", "y"]);
+    assert_eq!(rename(&[]).unwrap(), ["_k", "a", "b"]);
+    assert_eq!(
+        rejected(rename(&["x"])),
+        "CTE 'd' defines 1 column aliases but body returns 2 columns"
+    );
+    assert!(rejected(rename(&["x", "X"])).contains("duplicate column name 'X'"));
 }

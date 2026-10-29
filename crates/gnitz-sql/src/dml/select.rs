@@ -8,10 +8,9 @@
 //!
 //! A query that *derives* a new relation — a JOIN, a set operation, an EXISTS/IN
 //! or scalar subquery, a derived table — has no single-relation sink and is
-//! rejected ([`crate::error::derivation`]), pointing at CREATE VIEW:
-//! [`plan_query`] refuses a set operation and a deriving FROM, the binder a
-//! subquery where it meets one, and the read lowering a CTE that derives. A
-//! read the direct path merely cannot
+//! rejected ([`crate::error::derivation`]), pointing at CREATE VIEW: the binder
+//! refuses a set operation, a deriving FROM and a subquery where it meets one,
+//! and the read lowering a CTE that derives. A read the direct path merely cannot
 //! express is a feature-named rejection, never that template. The body and its
 //! CTEs bind through the view binder (`hir::bind_adhoc_read`), so a CTE reads
 //! through the sink of the flat query it composes to.
@@ -21,11 +20,10 @@
 //! shape without reaching a server; [`execute_select`] runs the resulting plan and
 //! `dml::explain` formats the same plan instead of dispatching it.
 
+use crate::access::bound_and_predicate;
 use crate::agg::group_pk_def;
-use crate::ast_util::{body_is_grouped, classify_from, extract_table_ref, select_is_distinct, FromShape};
-use crate::bind::Catalog;
-use crate::dml::plan::{bound_and_predicate, walks_in_pk_order};
-use crate::error::{derivation, reject_if, GnitzSqlError};
+use crate::catalog::Catalog;
+use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::FoldFinish;
 use crate::exec::client_map::ClientMap;
 use crate::exec::order::{order_and_slice, Slice};
@@ -33,14 +31,12 @@ use crate::expr_lower::compile_scalar_evaluator;
 use crate::hir::{bind_adhoc_read, AdhocRead, AdhocShape, FoldPieces, RowsReply};
 use crate::ir::BoundExpr;
 use crate::project::compute_map;
-use crate::tail::{extract_limit, extract_offset, key_slots, order_exprs, parse_order_by, wire_keys};
-use crate::validate::{
-    as_plain_select, reject_unhonored_query_clauses, reject_unhonored_select_clauses, HonoredClauses, QueryEnvelope,
-};
+use crate::tail::{extract_limit_offset, key_slots, order_exprs, parse_order_by, wire_keys};
+use crate::validate::{reject_unhonored_query_clauses, QueryEnvelope};
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, GnitzClient, RelDescriptor, ScanReply, Schema, ZSetBatch};
-use gnitz_wire::{ReadSink, ReadSpec, RowsCut, SinkKind};
-use sqlparser::ast::{Query, SetExpr, Statement};
+use gnitz_wire::{ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind};
+use sqlparser::ast::Query;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
@@ -127,6 +123,11 @@ impl ReadPlan {
                     upstream: read.desc,
                 })
             }
+            // A FROM-less SELECT reads no relation, so it has no feed to subscribe to.
+            ReadCase::Constant { .. } => Err(crate::error::unsupported_clause(
+                "a subscription",
+                "a SELECT without FROM",
+            )),
             _ => Err(crate::error::unsupported_clause(
                 "a subscription",
                 "an aggregate, DISTINCT, ORDER BY, LIMIT or OFFSET",
@@ -158,94 +159,16 @@ impl ReadPlan {
     }
 }
 
-/// Plan a `SELECT`, or the `EXPLAIN` of one, into the read it runs. Both
-/// statement forms yield the same plan.
-pub(crate) fn plan_read(stmt: &Statement, cat: &dyn Catalog) -> Result<ReadPlan, GnitzSqlError> {
-    let query = match stmt {
-        Statement::Query(q) => q.as_ref(),
-        // EXPLAIN describes the plan a query *would* take, so it consumes only
-        // the statement it wraps. `describe_alias` is inert phrasing: `EXPLAIN`,
-        // `DESCRIBE` and `DESC` all introduce the same statement.
-        Statement::Explain {
-            describe_alias: _,
-            analyze,
-            verbose,
-            query_plan,
-            estimate,
-            statement,
-            format,
-            options,
-        } => {
-            const CTX: &str = "EXPLAIN";
-            // `analyze` runs the query — the one option that changes what EXPLAIN
-            // does; the rest each ask for a rendering this output shape lacks.
-            reject_if(*analyze, CTX, "ANALYZE")?;
-            reject_if(*verbose, CTX, "VERBOSE")?;
-            reject_if(*query_plan, CTX, "QUERY PLAN")?;
-            reject_if(*estimate, CTX, "ESTIMATE")?;
-            reject_if(format.is_some(), CTX, "FORMAT")?;
-            // `GenericDialect` sets `supports_explain_with_utility_options`, so the
-            // parenthesized Postgres form parses into `options` rather than failing
-            // at parse time.
-            reject_if(options.is_some(), CTX, "the parenthesized option list")?;
-            match statement.as_ref() {
-                Statement::Query(q) => q.as_ref(),
-                _ => {
-                    return Err(GnitzSqlError::Rejected(
-                        "EXPLAIN describes a SELECT; this statement is not one".to_string(),
-                    ))
-                }
-            }
-        }
-        _ => {
-            return Err(GnitzSqlError::Rejected(
-                "plan_read describes a SELECT or the EXPLAIN of one; this statement is neither".to_string(),
-            ))
-        }
-    };
-    plan_query(cat, query)
-}
-
 /// Validate an ad-hoc SELECT's shape, bind it to the one relation it reads, and
-/// decide its access and sink.
-fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlError> {
+/// decide its access and sink. An EXPLAIN plans the query it wraps through this
+/// same function.
+pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, GnitzSqlError> {
     // ORDER BY / LIMIT / OFFSET are the client finish's; any other query clause is refused.
     reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, "direct SELECT")?;
-    let select = match query.body.as_ref() {
-        SetExpr::SetOperation { .. } => return Err(derivation("set operation")),
-        // Not the derivation template: CREATE VIEW refuses these bodies too.
-        body => as_plain_select(body, "direct SELECT")?,
-    };
-    let slice = Slice {
-        limit: extract_limit(query)?,
-        offset: extract_offset(query)?,
-    };
-    // DISTINCT wins the split: its fold does not group, so DISTINCT + GROUP BY keeps the
-    // GROUP BY rejection.
-    let distinct = select_is_distinct(select);
-    let fold = distinct || body_is_grouped(select);
-    let ctx = if distinct {
-        "SELECT DISTINCT"
-    } else if fold {
-        "aggregate SELECT"
-    } else {
-        "direct SELECT"
-    };
-    match classify_from(&select.from) {
-        FromShape::Empty => {
-            const CTX: &str = "SELECT without FROM";
-            reject_unhonored_select_clauses(select, HonoredClauses::PLAIN, CTX)?;
-            reject_if(select.selection.is_some(), CTX, "WHERE")?;
-        }
-        FromShape::SinglePlainRelation(factor) => {
-            // The FROM name is checked before the clause gate.
-            extract_table_ref(factor, cat.schema_name(), "FROM")?;
-            reject_unhonored_select_clauses(select, HonoredClauses::for_body(distinct), ctx)?;
-        }
-        FromShape::Derived(construct) => return Err(derivation(construct)),
-    }
+    let (limit, offset) = extract_limit_offset(query)?;
+    let slice = Slice { limit, offset };
     let keys = parse_order_by(query.order_by.as_ref())?;
-    let (desc, name, conjuncts, shape) = match bind_adhoc_read(cat, query, select, ctx, &order_exprs(&keys))? {
+    let (desc, name, conjuncts, shape) = match bind_adhoc_read(cat, query, &order_exprs(&keys))? {
         AdhocRead::Relation { desc, name, conjuncts, shape } => (desc, name, conjuncts, shape),
         AdhocRead::Constant(items) => {
             // One row sorts to itself: a positional key is range-checked and no key
@@ -267,7 +190,7 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
         spec: ReadSpec { bound, predicate, sink },
     };
     let (case, order) = match shape {
-        AdhocShape::Fold(pieces, order_cols) => {
+        AdhocShape::Fold { pieces, order_cols, is_distinct } => {
             let FoldPieces {
                 reduce_schema,
                 agg,
@@ -290,7 +213,7 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
                 read: read(sink),
                 finish: Box::new(finish),
                 reduce_schema,
-                is_distinct: distinct,
+                is_distinct,
             };
             (case, order)
         }
@@ -317,6 +240,15 @@ fn plan_query(cat: &dyn Catalog, query: &Query) -> Result<ReadPlan, GnitzSqlErro
         }
     };
     Ok(ReadPlan { case, order, slice })
+}
+
+/// Whether a worker reading under `bound` yields its rows in ascending PK order:
+/// every walk but a secondary index's.
+fn walks_in_pk_order(bound: &ReadBound, pk_cols: &[u32]) -> bool {
+    match bound {
+        ReadBound::None | ReadBound::PkSet(_) => true,
+        ReadBound::Range(r) => r.walks_pk(pk_cols),
+    }
 }
 
 /// A FROM-less SELECT's one row, finished at plan time: each item is a constant

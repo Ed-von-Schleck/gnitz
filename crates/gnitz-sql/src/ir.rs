@@ -356,7 +356,7 @@ impl RegClass {
 /// classes rather than two widths of one: a CASE with any string branch is a
 /// string CASE, and lowering rejects the genuinely mixed shapes when it reads
 /// the branches.
-pub(crate) fn unify_blend_type(a: ColType, b: ColType) -> ColType {
+fn unify_blend_type(a: ColType, b: ColType) -> ColType {
     // Per-operand this is exactly `register_image`; unifying a pair is the
     // String > F64 > DECIMAL > U64 > I64 join of the two images. Past the
     // String, F64, DECIMAL and U64 arms only {I64, DATE, TIMESTAMP, BOOLEAN}
@@ -552,23 +552,38 @@ pub(crate) fn check_decimal_scale(scale: u8) -> Result<(), crate::error::GnitzSq
     Ok(())
 }
 
-/// The types of a node's operands as it combines them: each its own, except a
-/// float literal beside a DECIMAL operand, which is read as the exact decimal
-/// it spells — so `price * 1.1` stays exact over a DECIMAL column where it
-/// stays a float over a DOUBLE one.
-pub(crate) fn operand_tys<R>(items: &[&BExpr<R>], t: &(impl LeafTyping<R> + ?Sized)) -> Vec<ColType> {
-    let mut tys: Vec<ColType> = items.iter().map(|e| e.infer_ty(t)).collect();
+/// The types of a node's operands as it combines them, and the type they
+/// blend to. Each operand's type is its own, except a float literal beside a
+/// DECIMAL operand, which is read as the exact decimal it spells — so
+/// `price * 1.1` stays exact over a DECIMAL column where it stays a float over
+/// a DOUBLE one. The blend is [`unify_blend_type`] over each, seeded with I64 —
+/// so a one-item list types as its own register image. `LitNull` types as that
+/// neutral I64, so a NULL item never drags a U64/float sibling down.
+pub(crate) fn blended<'e, R: 'e>(
+    items: impl Iterator<Item = &'e BExpr<R>> + Clone,
+    t: &(impl LeafTyping<R> + ?Sized),
+) -> (Vec<ColType>, ColType) {
+    let mut tys: Vec<ColType> = items.clone().map(|e| e.infer_ty(t)).collect();
     adopt_decimal_literals(items, &mut tys);
-    tys
+    let blend = tys.iter().copied().fold(ColType::of(TypeCode::I64), unify_blend_type);
+    (tys, blend)
 }
 
-/// [`operand_tys`] for a binary node's two operands. A NULL literal beside a
+/// A CASE's results in order: each branch's, then the ELSE.
+pub(crate) fn case_results<'e, R>(
+    branches: &'e [(BExpr<R>, BExpr<R>)],
+    else_: &'e BExpr<R>,
+) -> impl Iterator<Item = &'e BExpr<R>> + Clone {
+    branches.iter().map(|(_, r)| r).chain([else_])
+}
+
+/// [`blended`]'s operand types for a binary node's two operands. A NULL literal beside a
 /// string is a string NULL here, and one beside a BOOLEAN a BOOLEAN NULL: a
 /// blend needs no such rule, its neutral I64 yielding to either sibling, but a
 /// comparison takes two operands of one class.
 pub(crate) fn operand_ty_pair<R>(l: &BExpr<R>, r: &BExpr<R>, t: &(impl LeafTyping<R> + ?Sized)) -> (ColType, ColType) {
     let mut tys = [l.infer_ty(t), r.infer_ty(t)];
-    adopt_decimal_literals(&[l, r], &mut tys);
+    adopt_decimal_literals([l, r], &mut tys);
     let adopts = |t: ColType| t == STRING || t == BOOL;
     match (l, r) {
         (BExpr::LitNull, _) if adopts(tys[1]) => tys[0] = tys[1],
@@ -582,11 +597,11 @@ pub(crate) fn operand_ty_pair<R>(l: &BExpr<R>, r: &BExpr<R>, t: &(impl LeafTypin
 /// any operand is a DECIMAL and the literal is itself a DECIMAL value — a scale
 /// a register holds and an unscaled value in `i64`. A literal past that keeps
 /// its float type.
-fn adopt_decimal_literals<R>(items: &[&BExpr<R>], tys: &mut [ColType]) {
+fn adopt_decimal_literals<'e, R: 'e>(items: impl IntoIterator<Item = &'e BExpr<R>>, tys: &mut [ColType]) {
     if !tys.iter().any(|t| t.is_decimal()) {
         return;
     }
-    for (e, ty) in items.iter().zip(tys) {
+    for (e, ty) in items.into_iter().zip(tys) {
         if let BExpr::LitFloat { dec: Some((v, s)), .. } = e {
             if *s <= MAX_DECIMAL_SCALE && i64::try_from(*v).is_ok() {
                 *ty = ColType::decimal(*s);
@@ -595,12 +610,14 @@ fn adopt_decimal_literals<R>(items: &[&BExpr<R>], tys: &mut [ColType]) {
     }
 }
 
-/// The type a CASE's results or a GREATEST/LEAST's arguments blend to, from
-/// their [`operand_tys`]: [`unify_blend_type`] over each, seeded with I64 — so a
-/// one-item list types as its own register image. `LitNull` types as that
-/// neutral I64, so a NULL item never drags a U64/float sibling down.
-pub(crate) fn blend_type(tys: &[ColType]) -> ColType {
-    tys.iter().copied().fold(ColType::of(TypeCode::I64), unify_blend_type)
+impl<R: Copy> BExpr<R> {
+    /// The leaf of a bare `ColRef`, else `None` (a literal or a computed expression).
+    pub(crate) fn as_col(&self) -> Option<R> {
+        match self {
+            BExpr::ColRef(r) => Some(*r),
+            _ => None,
+        }
+    }
 }
 
 impl<R> BExpr<R> {
@@ -702,21 +719,16 @@ impl<R> BExpr<R> {
                 .checked_neg()
                 .map_or(BExpr::LitWide(NumLit { mag: 1 << 63, neg: false }), BExpr::LitInt),
             BExpr::LitFloat { v, dec } => BExpr::LitFloat { v: -v, dec: dec.map(|(u, s)| (-u, s)) },
-            BExpr::LitWide(n) => BExpr::LitWide(NumLit { mag: n.mag, neg: !n.neg }).fit_wide(),
+            // A negated wide literal that fits i64 is the LitInt it is.
+            BExpr::LitWide(n) => {
+                let n = NumLit { mag: n.mag, neg: !n.neg };
+                n.to_i128()
+                    .and_then(|v| i64::try_from(v).ok())
+                    .map_or(BExpr::LitWide(n), BExpr::LitInt)
+            }
             BExpr::LitNull => BExpr::LitNull,
             other => return Err(other),
         })
-    }
-
-    /// A `LitWide` whose value fits `i64` as the `LitInt` it is.
-    fn fit_wide(self) -> Self {
-        match self {
-            BExpr::LitWide(n) => match n.to_i128().and_then(|v| i64::try_from(v).ok()) {
-                Some(v) => BExpr::LitInt(v),
-                None => self,
-            },
-            other => other,
-        }
     }
 
     /// The type of the value this node computes, a leaf reference typed through
@@ -746,19 +758,25 @@ impl<R> BExpr<R> {
                 let (lt, rt) = operand_ty_pair(l, r, t);
                 bin_types(*op, lt, rt).map_or(int, |t| t.out)
             }
-            BExpr::Case { branches, else_ } => {
-                let results: Vec<&BExpr<R>> = branches.iter().map(|(_, r)| r).chain([else_.as_ref()]).collect();
-                blend_type(&operand_tys(&results, t))
-            }
+            BExpr::Case { branches, else_ } => blended(case_results(branches, else_), t).1,
             BExpr::Func { f, arg } => f.result_type(arg.infer_ty(t)),
             BExpr::Calendar { op, arg } if op.keeps_type() => arg.infer_ty(t),
             BExpr::Calendar { .. } => int,
-            BExpr::MinMaxN { args, .. } => blend_type(&operand_tys(&args.iter().collect::<Vec<_>>(), t)),
+            BExpr::MinMaxN { args, .. } => blended(args.iter(), t).1,
             BExpr::Cast { to, .. } if to.tc.is_float() => ColType::of(TypeCode::F64),
             BExpr::Cast { to, .. } => *to,
             BExpr::StrCall { f, .. } => ColType::of(f.result_type()),
             BExpr::TrimCall { .. } | BExpr::ConcatN { .. } => STRING,
         }
+    }
+
+    /// How a column holding this value is declared: its [`Self::infer_ty`], and
+    /// nullable unless the value is never NULL and the slot of that type takes it
+    /// without the range check a narrower slot is written through.
+    pub(crate) fn declared(&self, t: &(impl LeafTyping<R> + ?Sized)) -> (ColType, bool) {
+        let ty = self.infer_ty(t);
+        let checked = FixedInt::from_type_code(ty.tc).is_some_and(|fi| !self.within(fi, t));
+        (ty, checked || !self.never_null(t))
     }
 
     /// Whether every integer this value's register can hold is a value of `fi`,
@@ -831,10 +849,9 @@ impl<R> BExpr<R> {
             BExpr::Not(inner) => go(inner),
             BExpr::NullTest { .. } => true,
             BExpr::Case { branches, else_ } => {
-                let results: Vec<&BExpr<R>> = branches.iter().map(|(_, r)| r).chain([else_.as_ref()]).collect();
-                let tys = operand_tys(&results, t);
-                let blend = blend_type(&tys);
-                results.iter().zip(&tys).all(|(e, ty)| whole(e, *ty, blend))
+                let results = case_results(branches, else_);
+                let (tys, blend) = blended(results.clone(), t);
+                results.zip(&tys).all(|(e, ty)| whole(e, *ty, blend))
             }
             // The numeric kernels, LIKE and TRIM introduce no NULL of their own.
             BExpr::Func { arg, .. } | BExpr::Like { s: arg, .. } | BExpr::TrimCall { s: arg, .. } => go(arg),
@@ -846,8 +863,7 @@ impl<R> BExpr<R> {
             }),
             // GREATEST/LEAST skip a NULL argument, one a range check made included.
             BExpr::MinMaxN { args, .. } => {
-                let tys = operand_tys(&args.iter().collect::<Vec<_>>(), t);
-                let blend = blend_type(&tys);
+                let (tys, blend) = blended(args.iter(), t);
                 args.iter().zip(&tys).any(|(a, ty)| whole(a, *ty, blend))
             }
             BExpr::StrCall { f, args } => !f.may_null(args.len()) && args.iter().all(go),
@@ -929,7 +945,6 @@ impl<R> BExpr<R> {
     pub(crate) fn for_each_ref(&self, f: &mut impl FnMut(&R)) {
         match self {
             BExpr::ColRef(r) => f(r),
-            BExpr::NullTest { inner, .. } => inner.for_each_ref(f),
             BExpr::LitInt(_)
             | BExpr::LitFloat { .. }
             | BExpr::LitStr(_)
@@ -937,14 +952,20 @@ impl<R> BExpr<R> {
             | BExpr::LitTemporal { .. }
             | BExpr::LitBool(_)
             | BExpr::LitNull => {}
+            BExpr::NullTest { inner: e, .. }
+            | BExpr::Not(e)
+            | BExpr::Func { arg: e, .. }
+            | BExpr::Calendar { arg: e, .. }
+            | BExpr::Cast { expr: e, .. }
+            | BExpr::TrimCall { s: e, .. }
+            | BExpr::Like { s: e, .. } => e.for_each_ref(f),
+            BExpr::MinMaxN { args, .. } | BExpr::StrCall { args, .. } | BExpr::ConcatN { args } => {
+                args.iter().for_each(|a| a.for_each_ref(f))
+            }
             BExpr::BinOp(l, _, r) => {
                 l.for_each_ref(f);
                 r.for_each_ref(f);
             }
-            BExpr::Not(inner) => inner.for_each_ref(f),
-            BExpr::Func { arg, .. } | BExpr::Calendar { arg, .. } => arg.for_each_ref(f),
-            BExpr::MinMaxN { args, .. } => args.iter().for_each(|a| a.for_each_ref(f)),
-            BExpr::Cast { expr, .. } => expr.for_each_ref(f),
             BExpr::Case { branches, else_ } => {
                 for (c, r) in branches {
                     c.for_each_ref(f);
@@ -958,9 +979,6 @@ impl<R> BExpr<R> {
                     i.for_each_ref(f);
                 }
             }
-            BExpr::StrCall { args, .. } => args.iter().for_each(|a| a.for_each_ref(f)),
-            BExpr::TrimCall { s, .. } | BExpr::Like { s, .. } => s.for_each_ref(f),
-            BExpr::ConcatN { args } => args.iter().for_each(|a| a.for_each_ref(f)),
         }
     }
 }

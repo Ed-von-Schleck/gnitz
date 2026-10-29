@@ -1,107 +1,18 @@
 //! CREATE / ALTER VIEW: decode the statement's own clauses and options, compile
-//! the body (`hir::bind_and_lower`) into a view bundle, and commit it atomically.
+//! the body (`hir::bind_and_lower`) into a view bundle carrying the definition it
+//! records, and commit it atomically.
 
-use super::definition::record_definition;
-use super::guard::{bool_option, kv_options};
-use crate::ast_util::extract_object_name;
-use crate::bind::{bind_constant, Catalog};
+use super::options::decode_view_options;
+use crate::catalog::Catalog;
 use crate::error::{reject_if, GnitzSqlError};
-use crate::hir::ViewBody;
-use crate::ir::BExpr;
+use crate::hir::{BoundRef, LoweredView, ViewBody};
+use crate::names::extract_object_name;
 use crate::rules::{require_class, ClassWant};
 use crate::source::StatementText;
-use gnitz_core::{RelName, ViewBundle};
+use gnitz_core::{RelName, RelationRef, ViewBundle, ViewDefinition};
 use gnitz_wire::{ViewBudget, ViewProps};
-use std::num::NonZeroU64;
-
-use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query};
-
-/// The `CREATE VIEW … WITH (…)` keys.
-pub(crate) const VIEW_OPTIONS: [&str; 3] = ["capacity", "delta", "compress"];
-
-/// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string,
-/// ascending.
-const SIZE_UNITS: [(&str, u64); 4] = [("B", 1), ("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
-
-/// Decode the `WITH (...)` clause of a `CREATE VIEW`.
-fn decode_view_options(options: &CreateTableOptions) -> Result<ViewProps, GnitzSqlError> {
-    let [capacity, delta, compress] = kv_options(options, "CREATE VIEW", VIEW_OPTIONS)?;
-    let budget = ViewBudget::from_budgets(
-        capacity.map(|v| size_option("capacity", v)).transpose()?,
-        delta.map(|v| size_option("delta", v)).transpose()?,
-    )
-    .map_err(|e| GnitzSqlError::Rejected(format!("CREATE VIEW WITH (capacity …, delta …): {e}")))?;
-    Ok(ViewProps {
-        budget,
-        compress: bool_option("compress", compress)?,
-    })
-}
-
-/// The `WITH (…)` entries that declare `props`, as a `CREATE VIEW` writes them;
-/// the defaults are omitted. [`decode_view_options`]'s inverse.
-pub(crate) fn view_with_options(props: &ViewProps) -> Vec<String> {
-    let ViewProps { budget, compress } = *props;
-    let mut out = Vec::new();
-    if let Some(bytes) = budget.capacity_bytes() {
-        out.push(format!("capacity = '{}'", size_text(bytes)));
-    }
-    if let Some(bytes) = budget.delta_bytes() {
-        out.push(format!("delta = '{}'", size_text(bytes)));
-    }
-    if compress {
-        out.push("compress = true".to_string());
-    }
-    out
-}
-
-/// `bytes` in the largest of [`SIZE_UNITS`] that divides it: [`parse_size`]'s
-/// inverse.
-fn size_text(bytes: u64) -> String {
-    let (unit, mult) = SIZE_UNITS
-        .iter()
-        .rev()
-        .find(|&&(_, m)| bytes.is_multiple_of(m))
-        .expect("every count is a whole number of bytes");
-    format!("{} {unit}", bytes / mult)
-}
-
-/// The byte count of one size-valued `CREATE VIEW` option.
-fn size_option(option: &str, value: &sqlparser::ast::Expr) -> Result<NonZeroU64, GnitzSqlError> {
-    let Ok(BExpr::LitStr(text)) = bind_constant(value) else {
-        return Err(GnitzSqlError::Rejected(format!(
-            "CREATE VIEW option `{option}` takes a single-quoted size string, e.g. '256 MB'"
-        )));
-    };
-    parse_size(option, &text)
-}
-
-/// `<uint><unit>` with an optional space, unit in {B, KB, MB, GB}, binary
-/// (KB = 2^10). Zero and a `u64`-overflowing product are rejected: a zero
-/// capacity names a store that cannot hold its own skeleton, and a zero delta
-/// budget one that retains nothing.
-fn parse_size(option: &str, text: &str) -> Result<NonZeroU64, GnitzSqlError> {
-    let bad = || {
-        GnitzSqlError::Rejected(format!(
-            "CREATE VIEW option `{option}`: '{text}' is not a size like '256 MB' \
-             (a positive integer followed by B, KB, MB or GB)"
-        ))
-    };
-    let trimmed = text.trim();
-    let digits = trimmed.len() - trimmed.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    let (num, unit) = trimmed.split_at(digits);
-    let num: u64 = num.parse().map_err(|_| bad())?;
-    let unit = unit.trim();
-    let mult = SIZE_UNITS
-        .iter()
-        .find(|(u, _)| unit.eq_ignore_ascii_case(u))
-        .map(|&(_, m)| m)
-        .ok_or_else(bad)?;
-    num.checked_mul(mult).and_then(NonZeroU64::new).ok_or_else(|| {
-        GnitzSqlError::Rejected(format!(
-            "CREATE VIEW option `{option}`: '{text}' is out of range (must be positive and fit a u64)"
-        ))
-    })
-}
+use sqlparser::ast::{CreateView, Ident, ObjectName, Query};
+use sqlparser::tokenizer::Location;
 
 /// Reject every `CREATE VIEW` clause the planner does not consume. Exhaustive
 /// destructure (no `..`): a future `sqlparser` field stops the build.
@@ -225,18 +136,55 @@ fn plan_segments<'a>(
 ) -> Result<ViewBundle, GnitzSqlError> {
     let bounded = matches!(props.budget, ViewBudget::Bounded { .. });
     let replacing = view.replacing;
-    let lowered = crate::hir::bind_and_lower(cat, query, view, bounded, aliases)?;
-    let definition = record_definition(text, &lowered)?;
+    let LoweredView { segments, view, refs, body_columns } =
+        crate::hir::bind_and_lower(cat, query, view, bounded, aliases)?;
+    let definition = record_definition(text, refs, body_columns)?;
     Ok(ViewBundle {
         name,
         props,
         replacing,
-        segments: lowered.segments,
-        view: lowered.view,
+        segments,
+        view,
         definition,
     })
 }
 
-#[cfg(test)]
-#[path = "tests/view.rs"]
-mod tests;
+/// The definition of the view `text` declares, as `CREATE VIEW` and `ALTER VIEW`
+/// record it: the body's text and every place it names a catalog relation
+/// (`refs`, as binding found them), relative to that text.
+fn record_definition(
+    text: StatementText<'_>,
+    refs: Vec<BoundRef>,
+    body_columns: Vec<String>,
+) -> Result<ViewDefinition, GnitzSqlError> {
+    let unrecorded = |why: &str| GnitzSqlError::Rejected(format!("cannot record the view's definition: {why}"));
+    let body = text
+        .body_after_as()
+        .ok_or_else(|| unrecorded("no AS ahead of the body"))?;
+    let query = text.script[body.clone()].to_string();
+    // A location in the script, as an offset into the body.
+    let in_body = |at: Location| -> Result<u32, GnitzSqlError> {
+        text.offset(at)
+            .and_then(|at| at.checked_sub(body.start))
+            .filter(|&at| at <= query.len())
+            .and_then(|at| u32::try_from(at).ok())
+            .ok_or_else(|| unrecorded("a relation reference lies outside the body"))
+    };
+    let mut recorded = Vec::with_capacity(refs.len());
+    for r in refs {
+        recorded.push(RelationRef {
+            tid: r.tid,
+            name: in_body(r.name_span.start)?..in_body(r.name_span.end)?,
+            alias_end: r.alias_span.map(|s| in_body(s.end)).transpose()?,
+            alias: r.alias,
+            columns: r.columns,
+        });
+    }
+    // A body bound twice over one stretch of text names each relation once.
+    recorded.sort_by_key(|r| r.name.start);
+    recorded.dedup_by_key(|r| r.name.start);
+    let def = ViewDefinition { query, body_columns, refs: recorded };
+    // Held to exactly the rules a reader holds it to.
+    def.check().map_err(|e| unrecorded(&e))?;
+    Ok(def)
+}
