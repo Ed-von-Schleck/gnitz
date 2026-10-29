@@ -83,8 +83,8 @@ pub(super) fn fold(
             (out, Some(map))
         }
     };
-    let ReduceSpecs { group, specs, cols } = resolve_reduce_specs(group_cols, aggs, &reduce_in)?;
-    let partial = keyed_frame(&reduce_in, &group, group.iter().copied(), cols)?;
+    let ReduceSpecs { agg, cols } = resolve_reduce_specs(group_cols, aggs, &reduce_in)?;
+    let partial = keyed_frame(&reduce_in, &agg.group_cols, agg.group_cols.iter().copied(), cols)?;
     let having = partial.resolve_preds(having)?;
     let finalize = finalize
         .iter()
@@ -92,7 +92,7 @@ pub(super) fn fold(
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
     Ok(FoldPieces {
         reduce_schema: reduce_in.schema,
-        agg: GroupAggs { group_cols: group, aggs: specs },
+        agg,
         partial_schema: partial.schema,
         pre: map,
         having,

@@ -5,7 +5,7 @@ use crate::test_support::{
     identity_circuit, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema, pk_payload_schema,
     u64_pk_schema,
 };
-use gnitz_wire::{AggDescriptor, AggFunc, Circuit, OrderKey, ReadBound, TypeCode};
+use gnitz_wire::{AggDescriptor, AggFunc, Circuit, GroupAggs, OrderKey, ReadBound, TypeCode};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::schema::SchemaColumn;
 
@@ -51,16 +51,47 @@ fn an_output_schema_unequal_to_the_view_schema_is_rejected() {
 
 const BY_COL1: [OrderKey; 1] = [OrderKey { col: 1, desc: false, nulls_first: false }];
 
-fn aggs(op: AggFunc) -> [AggDescriptor; 2] {
-    [AggDescriptor { agg_op: op, col_idx: 1 }, AggDescriptor::COUNT_STAR]
+fn aggs(op: AggFunc) -> Vec<AggDescriptor> {
+    vec![AggDescriptor { agg_op: op, col_idx: 1 }, AggDescriptor::COUNT_STAR]
 }
 
-const SUM: Stage = |c, a| c.reduce(a, &[], &aggs(AggFunc::Sum));
-const MIN: Stage = |c, a| c.reduce(a, &[], &aggs(AggFunc::Min));
+const SUM: Stage = |c, a| {
+    c.reduce(
+        a,
+        GroupAggs {
+            group_cols: vec![],
+            aggs: aggs(AggFunc::Sum),
+        },
+    )
+};
+const MIN: Stage = |c, a| {
+    c.reduce(
+        a,
+        GroupAggs {
+            group_cols: vec![],
+            aggs: aggs(AggFunc::Min),
+        },
+    )
+};
 const TOP_N: Stage = |c, a| c.top_n(a, &[], &BY_COL1, 10, 5);
-const WINDOW: Stage = |c, a| c.window(a, &[], &BY_COL1, &[], (true, false));
+const WINDOW: Stage = |c, a| {
+    c.window(
+        a,
+        GroupAggs { group_cols: vec![], aggs: vec![] },
+        &BY_COL1,
+        (true, false),
+    )
+};
 /// A reduce of each worker's slice: no exchange in front of it.
-const LOCAL_SUM: Stage = |c, a| c.reduce_local(a, &[], &aggs(AggFunc::Sum));
+const LOCAL_SUM: Stage = |c, a| {
+    c.reduce_local(
+        a,
+        GroupAggs {
+            group_cols: vec![],
+            aggs: aggs(AggFunc::Sum),
+        },
+    )
+};
 
 /// `build` over a scan of 10, compiled as worker `slot` into the view its
 /// unsplit, one-worker plan outputs: a split plan must write that layout too.
@@ -177,7 +208,7 @@ fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
 fn a_source_scanned_once_keeps_its_backfill_bound() {
     use gnitz_wire::{KeyRange, PkColList};
     let schema = make_schema_u64_i64();
-    let bound = |col: u32| ReadBound::Range(KeyRange::point(PkColList::from_slice(&[col]), &[], 0));
+    let bound = |col: u32| ReadBound::Range(KeyRange::point(PkColList::from_slice(&[col]), &[0]));
     let bounds_of = |scans: [(u64, ReadBound); 2]| {
         let mut c = Circuit::default();
         let [a, b] = scans.clone().map(|(source, bound)| c.input_delta(source, bound));

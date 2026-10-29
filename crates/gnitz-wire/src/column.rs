@@ -3,7 +3,7 @@
 //! row each describe.
 
 use crate::schema_block::SchemaBlockCol;
-use crate::{ColType, TypeCode};
+use crate::ColType;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnDef {
@@ -16,17 +16,13 @@ pub struct ColumnDef {
 }
 
 impl ColumnDef {
-    /// A visible column.
-    pub fn new(name: impl Into<String>, type_code: TypeCode, is_nullable: bool) -> Self {
-        Self::typed(name, ColType::of(type_code), is_nullable)
-    }
-
-    /// [`ColumnDef::new`] from a logical type, which is how a DECIMAL column,
-    /// or a column declared from a computed expression, states its scale.
-    pub fn typed(name: impl Into<String>, ty: ColType, is_nullable: bool) -> Self {
+    /// A visible column of logical type `ty`; a bare [`TypeCode`](crate::TypeCode) converts to
+    /// its scale-0 type, and a DECIMAL column states its scale through
+    /// [`ColType::decimal`].
+    pub fn new(name: impl Into<String>, ty: impl Into<ColType>, is_nullable: bool) -> Self {
         Self {
             name: name.into(),
-            ty,
+            ty: ty.into(),
             is_nullable,
             is_hidden: false,
         }

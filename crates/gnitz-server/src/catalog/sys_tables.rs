@@ -62,8 +62,9 @@ impl std::fmt::Display for RelRow<'_> {
     }
 }
 
-/// Decode row `row` of relation family `family` (Table or View). The raw `flags`
-/// word does not escape, so the rejections below hold for every caller.
+/// Decode row `row` of relation family `family` (Table or View) and hold it to
+/// the rules its words cannot encode against its key, so every caller gets the
+/// same refusals.
 pub(super) fn read_rel_row(family: SysFamily, batch: &Batch, row: usize) -> Result<RelRow<'_>, String> {
     let (noun, id) = (family.row_noun(), gnitz_wire::sys_leading_id(batch.get_pk_bytes(row)));
     let unreadable = |e: String| format!("catalog invariant violated: {noun} (id={id}) {e}");
@@ -267,11 +268,10 @@ pub(super) fn build_schema_from_col_defs(
             return Err(format!("has duplicate column name '{name}'"));
         }
     }
-    let cols: Vec<SchemaColumn> = col_defs
-        .iter()
-        .map(|cd| SchemaColumn::new(cd.def.ty.tc, cd.def.is_nullable))
-        .collect();
-    Ok(SchemaDescriptor::try_new(&cols, pk_cols)?)
+    Ok(SchemaDescriptor::try_collect(
+        col_defs.iter().map(|c| SchemaColumn::of_def(&c.def)),
+        pk_cols,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -382,7 +382,7 @@ impl SysFamily {
                         schema_id: SYSTEM_SCHEMA_ID,
                         name: family.name().into(),
                         pk_col_idx: PkColList::from_slice(family.wire().pk_cols),
-                        flags: gnitz_wire::TableProps::default().pack(),
+                        flags: gnitz_wire::TableProps::default(),
                     };
                     row.write(bb, 1);
                 }

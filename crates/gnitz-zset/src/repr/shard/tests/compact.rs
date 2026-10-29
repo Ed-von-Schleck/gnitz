@@ -194,7 +194,7 @@ fn string_rows(src: &impl RowSource, weight: impl Fn(usize) -> i64) -> Vec<(u64,
 
 /// The bytes `src`'s heap stores for row `row`'s long value.
 fn stored(src: &impl RowSource, row: usize) -> Vec<u8> {
-    let cell = src.get_col_ptr(row, 0, 16);
+    let cell = src.german_cell(row, 0);
     gnitz_wire::german_string_value(cell, src.heap())
         .unwrap()
         .stored()

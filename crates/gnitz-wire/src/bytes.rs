@@ -90,30 +90,6 @@ pub fn extend_from_le_bytes<T: LeScalar>(dst: &mut Vec<T>, src: &[u8]) {
     }
 }
 
-/// A 1/2/4/8-byte little-endian signed cell, sign-extended to `i64`.
-#[inline(always)]
-pub fn read_signed_exact(bytes: &[u8]) -> i64 {
-    match bytes.len() {
-        1 => bytes[0] as i8 as i64,
-        2 => i16::from_le_bytes(bytes.try_into().unwrap()) as i64,
-        4 => i32::from_le_bytes(bytes.try_into().unwrap()) as i64,
-        8 => i64::from_le_bytes(bytes.try_into().unwrap()),
-        _ => unreachable!("read_signed_exact: unexpected column width"),
-    }
-}
-
-/// A 1/2/4/8-byte little-endian unsigned cell, zero-extended to `u64`.
-#[inline(always)]
-pub fn read_unsigned_exact(bytes: &[u8]) -> u64 {
-    match bytes.len() {
-        1 => bytes[0] as u64,
-        2 => u16::from_le_bytes(bytes.try_into().unwrap()) as u64,
-        4 => u32::from_le_bytes(bytes.try_into().unwrap()) as u64,
-        8 => u64::from_le_bytes(bytes.try_into().unwrap()),
-        _ => unreachable!("read_unsigned_exact: unexpected column width"),
-    }
-}
-
 /// A `u64` with its low `n` bits set; all ones for `n >= 64`.
 #[inline(always)]
 pub const fn low_bits_mask(n: usize) -> u64 {

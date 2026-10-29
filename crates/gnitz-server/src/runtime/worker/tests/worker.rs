@@ -75,11 +75,11 @@ fn scan(tid: u64, schema: &SchemaDescriptor) -> Read<'static> {
     }
 }
 
-/// `ids` as the keys a PK probe of a `U64`-keyed relation carries: an encoded
-/// `ReadBound::PkSet`.
+/// `ids` as the keys a PK probe of a `U64`-keyed relation carries, encoded by
+/// [`PkKeys::encode_probe`].
 pub(super) fn pk_keys(ids: &[u64]) -> Vec<u8> {
     let keys: Vec<[u8; 8]> = ids.iter().map(|id| id.to_be_bytes()).collect();
-    ReadBound::PkSet(PkKeys::from_keys(8, keys.iter().map(|k| &k[..]))).encode()
+    PkKeys::from_keys(8, keys.iter().map(|k| &k[..])).encode_probe()
 }
 
 /// A PK probe of `tid` at `keys`.
@@ -250,7 +250,7 @@ fn in_wait_dispositions() {
     );
     assert!(out[0].ctrl.hdr.flags.scan_last);
     let fault = out[1].ctrl.fault(&out[1].bytes).expect("a fault frame");
-    assert!(fault.text.contains("read_bound"), "{fault}");
+    assert!(fault.text.contains("pk_probe"), "{fault}");
 }
 
 /// One Tick group carrying two tids ticks both — each drains its buffered

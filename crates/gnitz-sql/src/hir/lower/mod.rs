@@ -30,7 +30,7 @@ use crate::project::{compute_map, payload_program};
 use chain::{EmitPieces, ViewChain};
 use gnitz_core::{PlannedView, RelDescriptor, Schema};
 use gnitz_expr::ReduceOutSlot;
-use gnitz_wire::{AggDescriptor, ColumnDef};
+use gnitz_wire::{AggDescriptor, ColumnDef, GroupAggs};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -39,17 +39,16 @@ use std::sync::Arc;
 /// its group columns as reduce-input positions, and one spec per distinct
 /// physical aggregate column beside the output column it produces.
 struct ReduceSpecs {
-    /// Group columns as reduce-input positions, normalized.
-    group: Vec<u32>,
-    specs: Vec<AggDescriptor>,
-    /// Each spec's output column, parallel to `specs`; `None` for one no reference
-    /// names.
+    /// Group columns as reduce-input positions, normalized, and the specs.
+    agg: GroupAggs,
+    /// Each spec's output column, parallel to `agg.aggs`; `None` for one no
+    /// reference names.
     cols: Vec<Slot>,
 }
 
 impl ReduceSpecs {
     fn push(&mut self, spec: AggDescriptor, id: Option<ColId>, def: ColumnDef) {
-        self.specs.push(spec);
+        self.agg.aggs.push(spec);
         self.cols.push((id, def));
     }
 }
@@ -57,8 +56,10 @@ impl ReduceSpecs {
 /// Resolve a `Reduce`'s group and aggregate columns against its input.
 fn resolve_reduce_specs(group_cols: &[ColId], aggs: &[AggCol], input: &Frame) -> Result<ReduceSpecs, GnitzSqlError> {
     let mut r = ReduceSpecs {
-        group: input.reduce_group(group_cols)?,
-        specs: Vec::with_capacity(aggs.len() + 1),
+        agg: GroupAggs {
+            group_cols: input.reduce_group(group_cols)?,
+            aggs: Vec::with_capacity(aggs.len() + 1),
+        },
         cols: Vec::with_capacity(aggs.len() + 1),
     };
     for c in aggs {

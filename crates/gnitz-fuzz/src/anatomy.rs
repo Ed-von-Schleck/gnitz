@@ -248,14 +248,10 @@ fn walk_block(root: &[u8], block: &[u8], schema: Arc<Schema>, anatomy: &mut Anat
     for pi in gnitz_wire::BitIter(layout.string_payload_slots()) {
         let start = layout.region_start(REG_PAYLOAD_START + pi, rows);
         for row in 0..rows {
-            let cell = &fixed[start + row * 16..][..16];
-            let content = match gnitz_wire::german_string_inline(cell) {
-                Some(text) => text,
-                // A long cell that overruns the heap is no string.
-                None => match gnitz_wire::german_string_heap(cell, heap.len()) {
-                    Some(r) => &heap[r],
-                    None => continue,
-                },
+            let cell = fixed[start + row * 16..].first_chunk::<16>().unwrap();
+            // A long cell that overruns the heap is no string.
+            let Some(content) = gnitz_wire::german_string_checked(cell, heap) else {
+                continue;
             };
             let content_at = offset(root, content);
             strings.push(StringCell {

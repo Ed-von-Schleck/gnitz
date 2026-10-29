@@ -231,3 +231,34 @@ fn compare_matches_byte_order_across_classes_and_arenas() {
         }
     }
 }
+
+/// A cell's long length counts a long cell's content
+/// and nothing for a short one, and its lead is the content's first eight bytes
+/// zero-padded, with a short cell's pad left dirty.
+#[test]
+fn long_len_and_lead_agree_with_the_encoder() {
+    for len in 0..=40usize {
+        let content: Vec<u8> = (0..len).map(|i| b'a' + i as u8).collect();
+        let mut blob = vec![0x5Au8; 3];
+        let cell = encode_german_string(&content, &mut blob);
+        let mut lead = [0u8; 8];
+        lead[..len.min(8)].copy_from_slice(&content[..len.min(8)]);
+        if len <= SHORT_STRING_THRESHOLD {
+            assert_eq!(german_string_long_len(&cell), 0, "short {len}");
+            let mut dirty = cell;
+            dirty[4 + len..].fill(0xFF);
+            assert_eq!(
+                german_string_lead(&dirty, Heap::Plain(&[])),
+                u64::from_be_bytes(lead),
+                "dirty {len}"
+            );
+        } else {
+            assert_eq!(german_string_long_len(&cell), len, "long {len}");
+        }
+        assert_eq!(
+            german_string_lead(&cell, Heap::Plain(&blob)),
+            u64::from_be_bytes(lead),
+            "{len}"
+        );
+    }
+}

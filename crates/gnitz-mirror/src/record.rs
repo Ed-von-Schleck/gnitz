@@ -2,7 +2,7 @@
 //! the copy's rows.
 
 use gnitz_core::{DeltaCursor, MirrorError, RelDescriptor, RelName};
-use gnitz_wire::{decode_all, PkColList, Reader, Writer};
+use gnitz_wire::{decode_all, PkColList, Writer, MAX_LIST_LEN};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// What one copy's registration fixed, and where its feed got to.
@@ -44,18 +44,13 @@ impl MirrorRecord {
     /// The bytes a copy's manifest carries for it.
     pub(crate) fn encode(&self) -> Vec<u8> {
         // Round 0 is no cursor here as on the wire, where it asks for a bootstrap.
-        let (tag, tick) = self.feed.cursor().map_or((0, 0), DeltaCursor::pair);
         let mut w = Writer::new();
-        w.u64(tag)
-            .u64(tick)
-            .bytes32(self.name.schema().as_bytes())
+        DeltaCursor::write_opt(&mut w, self.feed.cursor());
+        w.bytes32(self.name.schema().as_bytes())
             .bytes32(self.name.name().as_bytes())
             .bytes32(&self.block)
             .bool(self.pk_repeats)
-            .u32(self.indexes.len() as u32);
-        for cols in &self.indexes {
-            w.put(cols);
-        }
+            .list(&self.indexes);
         w.into_vec()
     }
 
@@ -63,17 +58,11 @@ impl MirrorRecord {
     /// [`Self::encode`] did not produce, or whose block describes no layout.
     pub(crate) fn decode(bytes: &[u8]) -> Option<(Self, SchemaDescriptor)> {
         let rec = decode_all(bytes, "mirror record", |r| {
-            let (tag, tick) = (r.u64()?, r.u64()?);
-            let feed = DeltaCursor::from_pair(tag, tick).map_or(Feed::Empty, Feed::At);
-            fn text<'a>(r: &mut Reader<'a>) -> Result<&'a str, String> {
-                std::str::from_utf8(r.bytes32()?).map_err(|e| e.to_string())
-            }
-            let name = RelName::new(text(r)?, text(r)?)?;
+            let feed = DeltaCursor::read_opt(r)?.map_or(Feed::Empty, Feed::At);
+            let name = RelName::new(r.str32()?, r.str32()?)?;
             let block = r.bytes32()?.to_vec();
             let pk_repeats = r.bool()?;
-            let indexes = (0..r.u32()?)
-                .map(|_| r.get::<PkColList>())
-                .collect::<Result<Vec<_>, String>>()?;
+            let indexes: Vec<PkColList> = r.list("index list", MAX_LIST_LEN)?;
             // Canonical, so a record holds no index twice.
             if !indexes.windows(2).all(|w| w[0] < w[1]) {
                 return Err("index column lists out of order".into());

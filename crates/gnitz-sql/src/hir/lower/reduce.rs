@@ -27,19 +27,19 @@ pub(super) fn lower_reduce(
     let (node, reduce_in) = spine.emit(&mut cb, Top::Slots)?;
 
     let mut r = resolve_reduce_specs(group_cols, aggs, &reduce_in)?;
-    let ungrouped = r.group.is_empty();
+    let ungrouped = r.agg.group_cols.is_empty();
     // The engine reads group existence off a COUNT(*); a hidden one if no
     // aggregate is one.
-    if !r.specs.iter().any(|d| d.agg_op == WireAggFunc::Count) {
+    if !r.agg.aggs.iter().any(|d| d.agg_op == WireAggFunc::Count) {
         r.push(
             AggDescriptor::COUNT_STAR,
             None,
             agg_col_def(WireAggFunc::Count, None, ungrouped),
         );
     }
-    let ReduceSpecs { group, specs, cols } = r;
-    cb.reduce(node, &group, &specs);
-    let out = keyed_frame(&reduce_in, &group, group.iter().copied(), cols)?;
+    let ReduceSpecs { agg, cols } = r;
+    let out = keyed_frame(&reduce_in, &agg.group_cols, agg.group_cols.iter().copied(), cols)?;
+    cb.reduce(node, agg);
     // One row per group key, which the reduce output is keyed on.
     Ok(EmitPieces { circuit: cb, out, pk_repeats: false })
 }

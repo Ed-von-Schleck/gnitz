@@ -36,7 +36,7 @@ impl Rows {
             schema_id,
             name: name.into(),
             pk_col_idx: PkColList::from_slice(&[0]),
-            flags: props.pack(),
+            flags: props,
         };
         self.put(&row, 1)
     }
@@ -214,7 +214,7 @@ fn a_row_of_no_positive_weight_is_no_relation() {
         schema_id: 16,
         name: name.into(),
         pk_col_idx: PkColList::from_slice(&[0]),
-        flags: TableProps::default().pack(),
+        flags: TableProps::default(),
     };
     let mut rows = Rows::new();
     rows.schema(16, "app")

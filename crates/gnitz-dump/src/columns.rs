@@ -283,7 +283,7 @@ fn write_column(
         Codec::Bytes { .. } => put::<ByteArrayType>(
             writer,
             byte_values(present, |c, all| {
-                all.extend_from_slice(gnitz_wire::german_string_content(c, &batch.blob))
+                all.extend_from_slice(gnitz_wire::german_string_content(c.first_chunk().unwrap(), &batch.blob))
             }),
             levels,
         ),

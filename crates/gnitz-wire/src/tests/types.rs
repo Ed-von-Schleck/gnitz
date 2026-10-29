@@ -196,7 +196,7 @@ fn cmp_col_window_orders_every_fixed_width_type() {
 /// exactly the low `width()` bytes — so `-1` on an `I8` column packs to `0xFF`,
 /// not to a sign-extended `0xFFFF…`; and `unpack` answers what `decode_le_i64`
 /// answers over any `u128`'s bytes, its unsigned arm masking the bits past the
-/// width; the width-keyed `read_*_exact` readers agree with `decode_le_i64`.
+/// width.
 #[test]
 fn fixed_int_packs_unpacks_and_decodes_its_own_width() {
     assert_eq!(FixedInt::U8.decode_le_i64(&[0xff]), 255i64);
@@ -220,11 +220,6 @@ fn fixed_int_packs_unpacks_and_decodes_its_own_width() {
             let cell = &v.to_le_bytes()[..fi.width()];
             let want = fi.decode_le_i64(cell);
             assert_eq!(fi.unpack(v), want, "{fi:?} v={v:#x}");
-            let exact = match fi.is_signed() {
-                true => crate::read_signed_exact(cell),
-                false => crate::read_unsigned_exact(cell) as i64,
-            };
-            assert_eq!(exact, want, "{fi:?} v={v:#x}: the width-keyed reader");
         }
     }
 }
@@ -310,4 +305,11 @@ fn a_floats_order_image_is_the_total_order() {
             }
         }
     }
+}
+
+#[test]
+fn with_code_keeps_a_scale_only_on_a_decimal() {
+    assert_eq!(ColType::decimal(3).with_code(TypeCode::I64), ColType::of(TypeCode::I64));
+    assert_eq!(ColType::decimal(3).with_code(TypeCode::Decimal), ColType::decimal(3));
+    assert_eq!(ColType::decimal(3).register_image(), ColType::decimal(3));
 }

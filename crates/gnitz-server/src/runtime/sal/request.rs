@@ -14,7 +14,7 @@ use gnitz_wire::{ControlHeader, PkColList, PkListRole};
 /// asker, so it may change only state the asker can retry or release.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Read<'a> {
-    /// `probe` at `keys`, an encoded `ReadBound::PkSet`.
+    /// `probe` at `keys`, encoded by [`gnitz_wire::PkKeys::encode_probe`].
     HasPk {
         tid: u64,
         probe: Probe,

@@ -12,7 +12,7 @@ use crate::names::{extract_index_name, extract_object_name};
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, require_column, ClassWant};
 use crate::types::column_def;
 use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema, TableDef};
-use gnitz_wire::{ColType, ColumnDef, FkAction, FkRef, PkColList, PkListRole, TableDistribution};
+use gnitz_wire::{ColType, ColumnDef, FkAction, FkRef, PkColList, PkListRole};
 use sqlparser::ast::{
     ColumnOption, Expr, ForeignKeyConstraint, IndexColumn, ObjectType, TableConstraint, WrappedCollection,
 };
@@ -776,10 +776,10 @@ pub(crate) fn plan_create_table(
         // `validate_dist_prefix` bounded the prefix by the PK arity, so the `u8`
         // is lossless.
         let prefix_len = cluster_indices.len() as u8;
-        if props.distribution == TableDistribution::Replicated {
-            return Err(GnitzSqlError::Rejected(gnitz_wire::replicated_with_prefix(prefix_len)));
-        }
-        props.distribution = TableDistribution::Keyed { prefix_len };
+        props.distribution = props
+            .distribution
+            .cluster_by(prefix_len)
+            .map_err(GnitzSqlError::Rejected)?;
     }
     props.validate(pk_indices.len()).map_err(GnitzSqlError::Rejected)?;
 

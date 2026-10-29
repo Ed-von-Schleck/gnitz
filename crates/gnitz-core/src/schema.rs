@@ -34,14 +34,13 @@ impl Schema {
                 max: PK_LIST_MAX_COLS,
             }));
         }
-        let cols: Vec<SchemaColumn> = columns
-            .iter()
-            .map(|cd| SchemaColumn::new(cd.ty.tc, cd.is_nullable))
-            .collect();
-        let layout = SchemaDescriptor::try_new(&cols, pk_cols).map_err(|refusal| match refusal {
-            SchemaRefusal::Pk(rule) => pk_refusal(rule),
-            other => other.to_string(),
-        })?;
+        let layout =
+            SchemaDescriptor::try_collect(columns.iter().map(SchemaColumn::of_def), pk_cols).map_err(|refusal| {
+                match refusal {
+                    SchemaRefusal::Pk(rule) => pk_refusal(rule),
+                    other => other.to_string(),
+                }
+            })?;
         Ok(Schema { columns, layout })
     }
 

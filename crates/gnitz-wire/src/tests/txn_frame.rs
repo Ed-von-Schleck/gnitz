@@ -45,9 +45,8 @@ fn block() -> Vec<u8> {
 fn ddl_item(tid: u64) -> FrameItem<'static> {
     FrameItem {
         hdr: ControlHeader::naming(ClientVerb::DdlTxn, tid.into(), 0),
-        blob: &[],
         schema: None,
-        data: Some(regions()),
+        data: regions(),
     }
 }
 
@@ -57,9 +56,8 @@ fn family(tid: u64, conflict_mode: WireConflictMode, basis: u64, schema: &[u8]) 
             flags: WireFlags { conflict_mode, ..Default::default() },
             ..ControlHeader::naming(ClientVerb::PushTxn, Target { tid, token: !tid }, basis)
         },
-        blob: &[],
         schema: Some(schema),
-        data: Some(regions()),
+        data: regions(),
     }
 }
 

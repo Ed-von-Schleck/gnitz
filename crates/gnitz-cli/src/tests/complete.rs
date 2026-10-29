@@ -2,7 +2,7 @@ use super::*;
 use std::num::NonZeroU64;
 
 use gnitz_core::{IndexRow, RelProps};
-use gnitz_wire::{CatalogColumn, ColType, ColumnDef, PkColList, TableProps, TypeCode, ViewBudget, ViewProps};
+use gnitz_wire::{CatalogColumn, ColumnDef, PkColList, TableProps, TypeCode, ViewBudget, ViewProps};
 
 fn rel(id: u64, schema: &str, name: &str, cols: &[&str]) -> CatalogRelation {
     CatalogRelation {
@@ -13,7 +13,7 @@ fn rel(id: u64, schema: &str, name: &str, cols: &[&str]) -> CatalogRelation {
         columns: cols
             .iter()
             .map(|c| CatalogColumn {
-                def: ColumnDef::typed(c.to_string(), ColType::of(TypeCode::I64), true),
+                def: ColumnDef::new(c.to_string(), TypeCode::I64, true),
                 fk: None,
             })
             .collect(),

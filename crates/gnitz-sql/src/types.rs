@@ -112,7 +112,7 @@ pub(crate) fn column_def(col: &sqlparser::ast::ColumnDef) -> Result<(ColumnDef, 
         return Ok((ColumnDef::new(name, tc, false), true));
     }
     let nullable = !col.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull));
-    Ok((ColumnDef::typed(name, sql_col_type(&col.data_type)?, nullable), false))
+    Ok((ColumnDef::new(name, sql_col_type(&col.data_type)?, nullable), false))
 }
 
 /// The SERIAL family's signed integer; a modifier (`SERIAL(5)`) or a qualifier

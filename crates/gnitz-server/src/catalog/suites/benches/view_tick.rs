@@ -11,7 +11,7 @@
 
 use super::*;
 use gnitz_foundation::perf;
-use gnitz_wire::{AggDescriptor, AggFunc, Circuit, ReadBound};
+use gnitz_wire::{AggDescriptor, AggFunc, Circuit, GroupAggs, ReadBound};
 
 /// Base rows a table-sourced fixture loads before its view is created.
 const ROWS: u64 = 1_000_000;
@@ -315,7 +315,13 @@ fn minmax_view_tick_bench() {
         );
         let mut circuit = Circuit::default();
         let scan = circuit.input_delta(t, ReadBound::None);
-        circuit.reduce(scan, &group, &aggs);
+        circuit.reduce(
+            scan,
+            GroupAggs {
+                group_cols: group.to_vec(),
+                aggs: aggs.to_vec(),
+            },
+        );
         let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
         let out = *gnitz_zset::stream::ReducePlan::from_wire(&schema, &group, &aggs, false)
             .unwrap()
@@ -404,7 +410,12 @@ fn window_bulk_view_tick_bench() {
         let aggs = [AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum }];
         let mut circuit = Circuit::default();
         let scan = circuit.input_delta(t, ReadBound::None);
-        circuit.window(scan, &[1], &order, &aggs, (true, false));
+        circuit.window(
+            scan,
+            GroupAggs { group_cols: vec![1], aggs: aggs.to_vec() },
+            &order,
+            (true, false),
+        );
         let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
         let out = *gnitz_zset::stream::OrderedPlan::window(&schema, &[1], &order, &aggs, true, false)
             .unwrap()
@@ -485,7 +496,7 @@ fn segment_view_tick_bench() {
         .output_schema();
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(segment, ReadBound::None);
-    circuit.reduce_local(scan, &[0], &aggs);
+    circuit.reduce_local(scan, GroupAggs { group_cols: vec![0], aggs: aggs.to_vec() });
     let segment_row = ViewTabRow {
         owner_view_id: view,
         ..view_tab_row(segment, "_segment")

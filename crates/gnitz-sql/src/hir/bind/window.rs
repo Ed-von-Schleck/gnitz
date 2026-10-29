@@ -145,7 +145,7 @@ impl Windows {
             .as_col()
             .and_then(|id| leaf.source_name(id))
             .unwrap_or_else(|| format!("_w{}", self.w.len()));
-        let out = HirCol::new(ids.next(), ColumnDef::typed(name, ty, nullable));
+        let out = HirCol::new(ids.next(), ColumnDef::new(name, ty, nullable));
         let id = out.id;
         self.w.push(ProjEntry { expr: e.clone(), out });
         id
@@ -303,7 +303,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
         // Addressed by id only: its value column is minted under this id.
         let out = HirCol::new(
             self.ids.next(),
-            ColumnDef::typed(format!("_win{}", st.calls.len()), ty, is_nullable).hidden(),
+            ColumnDef::new(format!("_win{}", st.calls.len()), ty, is_nullable).hidden(),
         );
         st.calls.push(Call {
             func,
@@ -704,7 +704,7 @@ fn running_values(
     let mut aggs = Vec::new();
     let (mut rank, mut dense_rank) = (None, None);
     let number = |col: &mut Option<HirCol>| {
-        let def = || ColumnDef::typed("_win", ColType::of(TypeCode::I64), false);
+        let def = || ColumnDef::new("_win", TypeCode::I64, false);
         BExpr::ColRef(col.get_or_insert_with(|| HirCol::new(ids.next(), def())).id)
     };
     for c in &calls {

@@ -202,7 +202,7 @@ pub fn row_key<S: RowSource>(src: &S, schema: &SchemaDescriptor, row: usize) -> 
             let tc = schema.columns()[schema.payload_col_idx(pi)].type_code;
             let raw = src.get_col_ptr(row, pi, tc.wire_stride());
             Some(if tc.is_german_string() {
-                gnitz_wire::german_string_bytes(raw, src.heap()).into_owned()
+                gnitz_wire::german_string_bytes(raw.first_chunk().unwrap(), src.heap()).into_owned()
             } else {
                 raw.to_vec()
             })

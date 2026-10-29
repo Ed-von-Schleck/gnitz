@@ -347,14 +347,7 @@ impl<'a> DictImage<'a> {
     /// Decode rows `first_row..` to their `width`-byte cells, `out.len() / width`
     /// rows.
     pub(crate) fn decode(&self, first_row: usize, width: usize, out: &mut [u8]) {
-        match width {
-            1 => self.decode_cells::<1>(first_row, out),
-            2 => self.decode_cells::<2>(first_row, out),
-            4 => self.decode_cells::<4>(first_row, out),
-            8 => self.decode_cells::<8>(first_row, out),
-            16 => self.decode_cells::<16>(first_row, out),
-            _ => unreachable!("a fixed-width cell is 1, 2, 4, 8 or 16 bytes"),
-        }
+        gnitz_wire::by_cell_width!(width, |T| self.decode_cells::<{ size_of::<T>() }>(first_row, out))
     }
 
     fn decode_cells<const W: usize>(&self, first_row: usize, out: &mut [u8]) {
@@ -1228,14 +1221,8 @@ impl<'a> SparseImage<'a> {
     /// first row of `first_row`'s block on, of which bit `pi` is this column's.
     /// A row they place past the last value reads zero too.
     pub(crate) fn decode(&self, first_row: usize, width: usize, out: &mut [u8], nulls: &[u8], pi: usize) {
-        match width {
-            1 => self.decode_cells::<1>(first_row, out, nulls, pi),
-            2 => self.decode_cells::<2>(first_row, out, nulls, pi),
-            4 => self.decode_cells::<4>(first_row, out, nulls, pi),
-            8 => self.decode_cells::<8>(first_row, out, nulls, pi),
-            16 => self.decode_cells::<16>(first_row, out, nulls, pi),
-            _ => unreachable!("a fixed-width cell is 1, 2, 4, 8 or 16 bytes"),
-        }
+        gnitz_wire::by_cell_width!(width, |T| self
+            .decode_cells::<{ size_of::<T>() }>(first_row, out, nulls, pi))
     }
 
     fn decode_cells<const W: usize>(&self, first_row: usize, out: &mut [u8], nulls: &[u8], pi: usize) {

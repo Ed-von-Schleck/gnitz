@@ -62,14 +62,9 @@ impl RangeMembership {
             }
         }
         for &(loc, lo, span) in &self.bounds {
-            match loc.size() {
-                1 => and_column::<u8, 1>(words, mb, loc, lo, span),
-                2 => and_column::<u16, 2>(words, mb, loc, lo, span),
-                4 => and_column::<u32, 4>(words, mb, loc, lo, span),
-                8 => and_column::<u64, 8>(words, mb, loc, lo, span),
-                16 => and_column::<u128, 16>(words, mb, loc, lo, span),
-                w => unreachable!("RangeMembership: a key column is 1/2/4/8/16 bytes, not {w}"),
-            }
+            gnitz_wire::by_cell_width!(loc.size(), |T| and_column::<T, { size_of::<T>() }>(
+                words, mb, loc, lo, span
+            ))
         }
     }
 }

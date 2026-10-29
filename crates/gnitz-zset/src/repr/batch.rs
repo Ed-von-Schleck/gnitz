@@ -10,7 +10,7 @@ use super::merge;
 use super::run::StoredRow;
 use super::scatter::copy_ranges;
 use super::seek::ColPtr;
-use super::string_heap::{self, relocate_german_string_vec, BlobCache};
+use super::string_heap::{self, relocated_cell, BlobCache};
 use super::writer::DirectWriter;
 use crate::schema::payload_order::{Generic, PayloadOrder};
 use crate::schema::SchemaDescriptor;
@@ -1062,7 +1062,7 @@ impl Batch {
         blob_cache: Option<&mut BlobCache>,
     ) {
         if type_code.is_german_string() {
-            let dest = relocate_german_string_vec(cell, src_heap, &mut self.blob, blob_cache);
+            let dest = relocated_cell(cell.first_chunk().unwrap(), src_heap, &mut self.blob, blob_cache);
             self.extend_col(out_pi, &dest);
         } else {
             self.extend_col(out_pi, cell);

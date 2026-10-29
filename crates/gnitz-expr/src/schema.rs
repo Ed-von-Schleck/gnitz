@@ -39,6 +39,11 @@ impl SchemaColumn {
         }
     }
 
+    /// The physical column of a logical one: its type code and nullability.
+    pub const fn of_def(def: &gnitz_wire::ColumnDef) -> Self {
+        Self::new(def.ty.tc, def.is_nullable)
+    }
+
     /// On-disk byte width of one cell of this column.
     #[inline(always)]
     pub const fn size(&self) -> usize {
@@ -119,17 +124,36 @@ impl SchemaDescriptor {
     /// The schema of `cols` keyed by `pk_indices`. `Err` for a list over the
     /// column limit and for a PK list that breaks the PK admission rules.
     pub fn try_new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Result<Self, SchemaRefusal> {
-        if cols.len() > MAX_COLUMNS {
-            return Err(SchemaRefusal::TooManyColumns(cols.len()));
+        Self::try_collect(cols.iter().copied(), pk_indices)
+    }
+
+    /// [`Self::try_new`] over the columns `cols` yields.
+    pub fn try_collect(
+        cols: impl IntoIterator<Item = SchemaColumn>,
+        pk_indices: &[u32],
+    ) -> Result<Self, SchemaRefusal> {
+        let mut columns = [SchemaColumn::EMPTY; MAX_COLUMNS];
+        let mut cols = cols.into_iter();
+        let mut n = 0;
+        for c in cols.by_ref() {
+            if n == MAX_COLUMNS {
+                return Err(SchemaRefusal::TooManyColumns(n + 1 + cols.count()));
+            }
+            columns[n] = c;
+            n += 1;
         }
+        Self::from_columns(columns, n, pk_indices)
+    }
+
+    /// [`Self::try_new`] over the first `n` of `columns`, the rest empty.
+    fn from_columns(columns: [SchemaColumn; MAX_COLUMNS], n: usize, pk_indices: &[u32]) -> Result<Self, SchemaRefusal> {
+        let cols = &columns[..n];
         gnitz_wire::validate_pk_tuple(pk_indices, cols.len(), MAX_PK_COLUMNS, |c| {
             let col = &cols[c as usize];
             (col.type_code, col.nullable)
         })
         .map_err(SchemaRefusal::Pk)?;
         let pk_stride: usize = pk_indices.iter().map(|&c| cols[c as usize].size()).sum();
-        let mut columns = [SchemaColumn::EMPTY; MAX_COLUMNS];
-        columns[..cols.len()].copy_from_slice(cols);
         let mut pk = [0u32; MAX_PK_COLUMNS];
         pk[..pk_indices.len()].copy_from_slice(pk_indices);
         let mut payload_to_ci = [0u8; MAX_COLUMNS];
@@ -551,7 +575,7 @@ pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
         n += 1;
         Ok(())
     })?;
-    Ok(SchemaDescriptor::try_new(&cols[..n], pk.as_slice())?)
+    Ok(SchemaDescriptor::from_columns(cols, n, pk.as_slice())?)
 }
 
 /// Encode `schema`'s physical column shape — the inverse of

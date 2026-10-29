@@ -30,6 +30,23 @@ fn a_map_locates_every_field_section_and_list_a_decode_read() {
     );
 }
 
+/// A circuit's node list is a counted list: its count leads the cell, and
+/// each node, opcode through input ids, is one of its items.
+#[test]
+fn a_circuit_cell_maps_its_nodes_as_a_list() {
+    let mut c = crate::Circuit::default();
+    let scan = c.input_delta(7, crate::ReadBound::None);
+    c.negate(scan);
+    let bytes = c.encode();
+    let (decoded, map) = map(&bytes, || crate::Circuit::decode(&bytes));
+    assert!(decoded.is_ok());
+    let nodes = map.lists.iter().find(|l| l.count == 0).expect("the node list");
+    assert_eq!(nodes.items.len(), 2);
+    assert_eq!(nodes.items[0].start, 2);
+    assert_eq!(nodes.items[0].end, nodes.items[1].start);
+    assert_eq!(nodes.items[1].end, bytes.len());
+}
+
 /// The control header's six words are fields, in layout order, and its blob
 /// is a section behind its length word, wherever the frame lies inside the
 /// mapped string.

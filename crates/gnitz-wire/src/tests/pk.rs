@@ -27,8 +27,9 @@ const PATTERNS: &[u128] = &[
 /// independently), so a wrong sign flip fails here rather than as silently
 /// mis-summed weights downstream. `decode_pk_cell` inverts the encode — the
 /// bijection byte-equal ⟺ key-equal rests on — `key_image` is the key read as
-/// a big-endian integer and its own inverse, `push_opk` appends what `store_opk`
-/// stores, and `decode_opk_i64` fuses the decode with `FixedInt`'s widening.
+/// a big-endian integer and its own inverse, `decode_opk_u128` reads the native
+/// value back, `push_opk` appends what `store_opk` stores, and `decode_opk_i64`
+/// fuses the decode with `FixedInt`'s widening.
 #[test]
 fn opk_codec_over_every_pk_type() {
     for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
@@ -51,6 +52,11 @@ fn opk_codec_over_every_pk_type() {
             assert_eq!(back[..sz], le[..sz], "tc={tc} p={i}: decode(encode(v)) != v");
             let image = key_image(tc, PATTERNS[i]);
             assert_eq!(image, widen_pk_be(opk), "tc={tc} p={i}: key_image");
+            assert_eq!(
+                decode_opk_u128(opk, tc),
+                PATTERNS[i] & image_mask(sz),
+                "tc={tc} p={i}: decode_opk_u128"
+            );
             assert_eq!(
                 key_image(tc, image),
                 PATTERNS[i] & image_mask(sz),
@@ -145,6 +151,23 @@ fn a_pk_buf_holds_max_pk_bytes_and_widens() {
 #[should_panic(expected = "PkBuf::from_bytes: length")]
 fn a_key_past_max_pk_bytes_panics() {
     PkBuf::from_bytes(&[0; crate::MAX_PK_BYTES + 1]);
+}
+
+/// A key reads back as written at every width up to `MAX_PK_BYTES`, the empty
+/// one included; a section one byte wider is refused, not truncated.
+#[test]
+fn a_pk_buf_reads_back_as_written_or_is_refused() {
+    use crate::codec::{decode_all, Writer};
+    for len in [0, crate::MAX_PK_BYTES] {
+        let key = PkBuf::from_bytes(&vec![0xcd; len]);
+        let mut w = Writer::new();
+        w.put(&key);
+        assert_eq!(decode_all(&w.into_vec(), "k", |r| r.get::<PkBuf>()), Ok(key));
+    }
+    let mut w = Writer::new();
+    w.bytes32(&[0; crate::MAX_PK_BYTES + 1]);
+    let err = decode_all(&w.into_vec(), "k", |r| r.get::<PkBuf>()).unwrap_err();
+    assert!(err.contains("-byte key exceeds"), "{err}");
 }
 
 /// `from_keys` is the one sort: at every stride duplicates collapse and the

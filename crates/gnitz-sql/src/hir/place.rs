@@ -244,8 +244,8 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<ColType
             left.name, left.ty, right.name, right.ty
         )));
     }
-    // A DECIMAL pair shares its scale, and any other pair has none.
-    Ok(ColType { tc: t, scale: left.ty.scale })
+    // A DECIMAL pair shares its scale.
+    Ok(left.ty.with_code(t))
 }
 
 /// Validate the range conjunct's key pair and return its common reindex output

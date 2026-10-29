@@ -27,7 +27,7 @@ use super::*;
 use crate::catalog::{FkEdge, RowConstraints};
 use gnitz_expr::ColumnLocator;
 use gnitz_store::relation::Relation;
-use gnitz_wire::{FkAction, PkBuf, PkKeys, ReadBound, WireConflictMode};
+use gnitz_wire::{FkAction, PkBuf, PkKeys, WireConflictMode};
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::SchemaDescriptor;
@@ -47,7 +47,7 @@ pub(crate) struct TxnFamily {
 struct Check<P> {
     tid: u64,
     probe: Probe,
-    /// The probed keys, an encoded `ReadBound::PkSet`.
+    /// The probed keys, as [`PkKeys::encode_probe`] lays them out.
     keys: Vec<u8>,
     /// The schema the replies decode against.
     reply: SchemaDescriptor,
@@ -60,7 +60,7 @@ impl<P> Check<P> {
         Ok(Check {
             tid: rel.id(),
             probe,
-            keys: ReadBound::PkSet(keys).encode(),
+            keys: keys.encode_probe(),
             reply,
             plan,
         })
@@ -113,7 +113,7 @@ fn format_pk_bytes(schema: &SchemaDescriptor, pk_bytes: &[u8]) -> String {
                 Some(fi) if fi.is_signed() => format!("{}", gnitz_wire::decode_opk_i64(cell, fi)),
                 Some(fi) => format!("{}", gnitz_wire::decode_opk_i64(cell, fi) as u64),
                 None => {
-                    let native = gnitz_wire::key_image(tc, gnitz_wire::widen_pk_be(cell));
+                    let native = gnitz_wire::decode_opk_u128(cell, tc);
                     match tc {
                         TypeCode::UUID => gnitz_wire::format_uuid(native),
                         TypeCode::I128 => format!("{}", native as i128),

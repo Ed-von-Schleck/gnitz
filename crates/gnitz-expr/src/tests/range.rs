@@ -69,7 +69,7 @@ fn every_walk_admits_exactly_the_rows_within_its_bounds() {
 fn a_malformed_walk_is_refused() {
     let schema = schema_pk(&[TypeCode::F64, TypeCode::U64], true);
     let walk = |col| {
-        let range = KeyRange::point(PkColList::from_slice(&[col]), &[], 0);
+        let range = KeyRange::point(PkColList::from_slice(&[col]), &[0]);
         RowFilter::for_read(&[], Some(&range), &schema).err()
     };
     assert!(matches!(walk(1), Some(ExprValidateErr::BadWalk(_))));

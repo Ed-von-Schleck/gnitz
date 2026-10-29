@@ -11,8 +11,8 @@ use crate::ir::BExpr;
 use crate::rules::reject_arity;
 
 use gnitz_core::Schema;
-use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, JoinKind};
-use gnitz_wire::{Circuit, ColType, ColumnDef, NodeId, NullKeys, RangeRel, ReindexRole, ReindexSlot, TypeCode};
+use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, GroupAggs, JoinKind};
+use gnitz_wire::{Circuit, ColumnDef, NodeId, NullKeys, RangeRel, ReindexRole, ReindexSlot, TypeCode};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -382,7 +382,7 @@ fn join_pk_coldefs(class: &JoinClass) -> Vec<ColumnDef> {
             } else {
                 format!("_join_pk_{i}")
             };
-            ColumnDef::typed(name, ty, false).hidden()
+            ColumnDef::new(name, ty, false).hidden()
         })
         .collect()
 }
@@ -398,11 +398,8 @@ fn rekey_pk_coldefs<'a>(
         .enumerate()
         .map(|(slot, (schema, c))| {
             let src = &schema.columns()[c as usize];
-            let ty = ColType {
-                tc: src.ty.tc.reindex_output_type(),
-                ..src.ty
-            };
-            ColumnDef::typed(name(slot, src), ty, false).hidden()
+            let ty = src.ty.with_code(src.ty.tc.reindex_output_type());
+            ColumnDef::new(name(slot, src), ty, false).hidden()
         })
         .collect()
 }
@@ -668,12 +665,15 @@ fn threshold(cb: &mut Circuit, side_a: &JoinSide, reindex_b: NodeId, int_a: Node
     // ground row: a `m = NULL` seed would break `A − 0 = A` over an empty B.
     // The COUNT is the cardinality gate every reduce carries; the reindex
     // below keeps no payload, so it goes no further.
-    let specs = [
-        AggDescriptor { agg_op: agg_func, col_idx: 0 },
-        AggDescriptor::COUNT_STAR,
-    ];
+    let agg = GroupAggs {
+        group_cols: vec![],
+        aggs: vec![
+            AggDescriptor { agg_op: agg_func, col_idx: 0 },
+            AggDescriptor::COUNT_STAR,
+        ],
+    };
     // [_group_pk:U128, m:Tc, count]
-    let red = cb.reduce_local(keys, &[], &specs);
+    let red = cb.reduce_local(keys, agg);
     // `m` is a MIN/MAX of B's non-NULL range keys, so never NULL, and is typed as
     // the range pair's common type, which A's range key also carries.
     let reindex_m = cb.map_reindex(

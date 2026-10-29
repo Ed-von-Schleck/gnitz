@@ -338,13 +338,19 @@ impl ColType {
             .filter(|t| t.is_admissible())
     }
 
-    /// [`TypeCode::register_image`] with the scale kept: a computed DECIMAL is
-    /// still the same DECIMAL.
-    pub fn register_image(self) -> Self {
+    /// The type of code `tc` that keeps this type's scale when `tc` is DECIMAL
+    /// and has none otherwise.
+    pub const fn with_code(self, tc: TypeCode) -> Self {
         ColType {
-            tc: self.tc.register_image(),
-            scale: self.scale,
+            tc,
+            scale: if matches!(tc, TypeCode::Decimal) { self.scale } else { 0 },
         }
+    }
+
+    /// [`TypeCode::register_image`] through [`Self::with_code`]: a computed
+    /// DECIMAL is still the same DECIMAL.
+    pub fn register_image(self) -> Self {
+        self.with_code(self.tc.register_image())
     }
 }
 

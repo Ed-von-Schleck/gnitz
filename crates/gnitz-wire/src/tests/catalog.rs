@@ -17,82 +17,12 @@ fn system_table_keys_are_valid_for_their_columns() {
     }
 }
 
-/// The `TABLE_TAB` flags word round-trips, pins its persisted bits as literals —
-/// comparing against the constants the packer is written from would hold for any
-/// value it gave them — and accepts exactly the single bits its layout defines. A
-/// boolean column holds `0` or `1`.
+/// A boolean column holds `0` or `1`.
 #[test]
-fn catalog_flag_words_roundtrip_pin_and_refuse_undefined_bits() {
-    let dists = (0..=crate::PK_LIST_MAX_COLS as u8)
-        .map(|prefix_len| TableDistribution::Keyed { prefix_len })
-        .chain([TableDistribution::Replicated]);
-    for distribution in dists {
-        for stream in [false, true] {
-            for serial in [false, true] {
-                for compress in [false, true] {
-                    let p = TableProps { stream, serial, distribution, compress };
-                    assert_eq!(TableProps::from_flags(p.pack()), Ok(p));
-                }
-            }
-        }
-    }
-
-    let t = |stream, serial, distribution| {
-        TableProps {
-            stream,
-            serial,
-            distribution,
-            compress: false,
-        }
-        .pack()
-    };
-    assert_eq!(TableProps::default().pack(), 0);
-    assert_eq!(t(false, false, TableDistribution::Replicated), 0b001);
-    assert_eq!(t(true, false, TableDistribution::default()), 0b010);
-    assert_eq!(t(false, true, TableDistribution::default()), 0b100);
-    let compressed = TableProps { compress: true, ..TableProps::default() };
-    assert_eq!(compressed.pack(), 0b1000);
-    assert_eq!(t(false, false, TableDistribution::Keyed { prefix_len: 2 }), 2 << 8);
-
-    for bit in 0..64u32 {
-        let w = 1u64 << bit;
-        assert_eq!(
-            TableProps::from_flags(w).is_ok(),
-            bit <= 3 || (8..16).contains(&bit),
-            "table bit {bit}"
-        );
-    }
-    // The one state the packing can hold and `TableProps` cannot.
-    assert!(TableProps::from_flags(0b01 | 2 << 8)
-        .unwrap_err()
-        .contains("mutually exclusive"));
-
+fn a_bool_word_is_zero_or_one() {
     assert_eq!(bool_word(0), Ok(false));
     assert_eq!(bool_word(1), Ok(true));
     assert!(bool_word(2).is_err());
-}
-
-/// `validate` refuses what the flags word can hold but the table cannot: a
-/// distribution prefix longer than the PK, a compressed stream, and a SERIAL
-/// table that is a stream or whose PK is not its one generated column.
-#[test]
-fn table_props_validate_refuses_what_the_pk_cannot_carry() {
-    let keyed = |prefix_len| TableProps {
-        distribution: TableDistribution::Keyed { prefix_len },
-        ..TableProps::default()
-    };
-    assert_eq!(keyed(3).validate(3), Ok(()));
-    assert!(keyed(4).validate(3).unwrap_err().contains("exceeds PK column count"));
-    let serial = TableProps { serial: true, ..TableProps::default() };
-    assert_eq!(serial.validate(1), Ok(()));
-    assert!(serial.validate(2).unwrap_err().contains("one SERIAL column"));
-    let stream = TableProps { stream: true, ..serial };
-    assert!(stream.validate(1).unwrap_err().contains("a stream cannot be SERIAL"));
-    let compressed = TableProps { compress: true, ..stream };
-    assert!(compressed
-        .validate(1)
-        .unwrap_err()
-        .contains("a stream cannot be compressed"));
 }
 
 /// The system-shape digest moves with every axis of a family's stored identity.
@@ -116,33 +46,11 @@ fn fold_family_separates_every_stored_axis() {
     }
 }
 
-#[test]
-fn a_user_identifier_is_nonempty_charset_and_not_underscore_led() {
-    for name in ["orders", "Orders123", "my_table", "a", "A1_b2", "1a", "99_problems"] {
-        assert!(validate_user_identifier(name).is_ok(), "rejected valid: {name}");
-    }
-    for name in [
-        "_private",
-        "_",
-        "__init__",
-        "",
-        "has space",
-        "has-dash",
-        "has.dot",
-        "has@",
-        "table$",
-    ] {
-        assert!(validate_user_identifier(name).is_err(), "accepted invalid: {name}");
-    }
-    assert_eq!(canonical_identifier("MyTab_1"), Ok("mytab_1".into()));
-    assert!(canonical_identifier("_x").is_err());
-}
-
 /// A column and its foreign key read back out of the row they were laid into,
 /// with both booleans flipped across the cases so a transposed pair fails one.
 #[test]
 fn a_column_reads_back_out_of_its_row() {
-    let score = crate::ColumnDef::typed("score", crate::ColType::decimal(5), true);
+    let score = crate::ColumnDef::new("score", crate::ColType::decimal(5), true);
     let flipped = crate::ColumnDef {
         is_nullable: false,
         ..score.clone().hidden()
@@ -216,7 +124,7 @@ fn a_relation_rows_parts_invert_its_packed_words() {
         schema_id: 2,
         name: "t".into(),
         pk_col_idx: pk,
-        flags: props.pack(),
+        flags: props,
     };
     assert_eq!(table.props(), Ok(props));
     let stream_serial = crate::TableProps {
@@ -224,12 +132,9 @@ fn a_relation_rows_parts_invert_its_packed_words() {
         serial: true,
         ..Default::default()
     };
-    let err = TableTabRow {
-        flags: stream_serial.pack(),
-        ..table.clone()
-    }
-    .props()
-    .unwrap_err();
+    let err = TableTabRow { flags: stream_serial, ..table.clone() }
+        .props()
+        .unwrap_err();
     assert!(err.contains("SERIAL"), "{err}");
 
     let props = crate::ViewProps {

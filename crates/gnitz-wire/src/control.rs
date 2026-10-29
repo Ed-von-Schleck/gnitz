@@ -327,8 +327,21 @@ pub struct WireFlags {
     pub lane: WireLane,
 }
 
-/// Bits 16-31, 36-37 and 40-63: no field.
-const RESERVED_BITS: u64 = !crate::low_bits_mask(40) | (crate::low_bits_mask(32) & !crate::low_bits_mask(16)) | 3 << 36;
+const CONFLICT_MODE_SHIFT: u32 = 8;
+const CONTINUATION_SHIFT: u32 = 34;
+const SCAN_LAST_SHIFT: u32 = 35;
+const LANE_SHIFT: u32 = 38;
+
+/// The bits a field occupies: `verb` and `conflict_mode` (0-15), the section
+/// bits (32-33), `continuation`, `scan_last` and the two `lane` bits.
+const DEFINED_BITS: u64 = crate::low_bits_mask(16)
+    | FLAG_HAS_SCHEMA
+    | FLAG_HAS_DATA
+    | 1 << CONTINUATION_SHIFT
+    | 1 << SCAN_LAST_SHIFT
+    | 3 << LANE_SHIFT;
+/// Every bit no field occupies.
+const RESERVED_BITS: u64 = !DEFINED_BITS;
 
 impl WireFlags {
     /// A frame of a worker's reply train: `continuation` always, since the master's terminal
@@ -345,10 +358,10 @@ impl WireFlags {
 
     pub(crate) const fn pack(self) -> u64 {
         self.verb as u64
-            | (self.conflict_mode as u64) << 8
-            | (self.continuation as u64) << 34
-            | (self.scan_last as u64) << 35
-            | (self.lane as u64) << 38
+            | (self.conflict_mode as u64) << CONFLICT_MODE_SHIFT
+            | (self.continuation as u64) << CONTINUATION_SHIFT
+            | (self.scan_last as u64) << SCAN_LAST_SHIFT
+            | (self.lane as u64) << LANE_SHIFT
     }
 
     /// Rejects a word naming a verb or mode this build does not define, or setting a
@@ -360,10 +373,11 @@ impl WireFlags {
         let bit = |b: u32| (w >> b) & 1 != 0;
         Ok(WireFlags {
             verb: ClientVerb::from_wire(w as u8).ok_or("flags: unknown request verb")?,
-            conflict_mode: WireConflictMode::from_wire((w >> 8) as u8).ok_or("flags: unknown conflict mode")?,
-            continuation: bit(34),
-            scan_last: bit(35),
-            lane: WireLane::from_wire(((w >> 38) & 3) as u8).ok_or("flags: unknown lane")?,
+            conflict_mode: WireConflictMode::from_wire((w >> CONFLICT_MODE_SHIFT) as u8)
+                .ok_or("flags: unknown conflict mode")?,
+            continuation: bit(CONTINUATION_SHIFT),
+            scan_last: bit(SCAN_LAST_SHIFT),
+            lane: WireLane::from_wire(((w >> LANE_SHIFT) & 3) as u8).ok_or("flags: unknown lane")?,
         })
     }
 }

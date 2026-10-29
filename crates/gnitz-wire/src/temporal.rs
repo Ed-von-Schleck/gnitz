@@ -90,7 +90,7 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     };
     let days = parse_date(date)? as i64;
     let Some(time) = time else {
-        return days.checked_mul(MICROS_PER_DAY);
+        return join_micros(days, 0, 0, 0, 0);
     };
     let (hms, frac) = match time.split_once('.') {
         Some((a, f)) => (a, Some(f)),
@@ -112,8 +112,7 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
         Some(_) => return None,
         None => 0,
     };
-    let tod = h * MICROS_PER_HOUR + mi * MICROS_PER_MIN + sec * MICROS_PER_SEC + micros;
-    days.checked_mul(MICROS_PER_DAY)?.checked_add(tod)
+    join_micros(days, h as u32, mi as u32, sec as u32, micros as u32)
 }
 
 /// A day count as `YYYY-MM-DD`: [`parse_date`]'s inverse.
@@ -146,6 +145,22 @@ pub const fn split_micros(us: i64) -> (i64, u32, u32, u32, u32) {
         (tod % MICROS_PER_MIN / MICROS_PER_SEC) as u32,
         (tod % MICROS_PER_SEC) as u32,
     )
+}
+
+/// [`split_micros`]' inverse: the microsecond count of a day count and a time
+/// of day, `None` where it falls outside an `i64`.
+pub const fn join_micros(days: i64, h: u32, mi: u32, s: u32, us: u32) -> Option<i64> {
+    // Every term is under 2^100, so the i128 sum cannot overflow.
+    let us = days as i128 * MICROS_PER_DAY as i128
+        + h as i128 * MICROS_PER_HOUR as i128
+        + mi as i128 * MICROS_PER_MIN as i128
+        + s as i128 * MICROS_PER_SEC as i128
+        + us as i128;
+    if us < i64::MIN as i128 || us > i64::MAX as i128 {
+        None
+    } else {
+        Some(us as i64)
+    }
 }
 
 #[cfg(test)]

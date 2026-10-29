@@ -10,14 +10,10 @@
 
 use std::ops::Range;
 
-use gnitz_wire::{decode_all, Reader, Wire, Writer};
+use gnitz_wire::{decode_all, Reader, Wire, Writer, MAX_LIST_LEN};
 
 /// Bumped by hand for any change to [`ViewDefinition::encode`]'s layout.
 const ENCODING_VERSION: u8 = 1;
-
-/// A list in an encoding holds at most this many entries: the most a count
-/// encodes and still tells apart from one too long to count.
-const MAX_ENTRIES: usize = u16::MAX as usize - 1;
 
 /// A user view's body as written, and the relations it names.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,8 +68,8 @@ impl ViewDefinition {
             }
             let def = ViewDefinition {
                 query: r.get()?,
-                body_columns: r.list("names", MAX_ENTRIES)?,
-                refs: r.list("relation references", MAX_ENTRIES)?,
+                body_columns: r.list("names", MAX_LIST_LEN)?,
+                refs: r.list("relation references", MAX_LIST_LEN)?,
             };
             def.check()?;
             Ok(def)
@@ -117,7 +113,7 @@ impl Wire for RelationRef {
             name: r.u32()?..r.u32()?,
             alias_end: r.get()?,
             alias: r.get()?,
-            columns: r.bool()?.then(|| r.list("names", MAX_ENTRIES)).transpose()?,
+            columns: r.bool()?.then(|| r.list("names", MAX_LIST_LEN)).transpose()?,
         })
     }
 }

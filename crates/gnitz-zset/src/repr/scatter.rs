@@ -20,7 +20,7 @@ use super::batch_pool::PooledBuf;
 use super::seek::ColPtr;
 use super::shard::Codebook;
 use super::string_heap::{
-    carried_dead, prorated_blob_cap, rebase_string_cell, recode_string_cell, relocate_german_string_vec, row_long_bytes,
+    carried_dead, prorated_blob_cap, rebase_string_cell, recode_string_cell, relocated_cell, row_long_bytes,
 };
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
@@ -152,8 +152,7 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
             let src = batch.col_data(pi).as_chunks::<16>().0;
             let (cells, blob, mut cache) = writer.string_col_mut(pi);
             for (cell, &idx) in cells.as_chunks_mut::<16>().0.iter_mut().zip(indices) {
-                *cell =
-                    relocate_german_string_vec(&src[idx as usize], Heap::Plain(batch.blob), blob, cache.as_deref_mut());
+                *cell = relocated_cell(&src[idx as usize], Heap::Plain(batch.blob), blob, cache.as_deref_mut());
             }
         } else {
             let src_col = batch.col_data(pi);
@@ -433,7 +432,7 @@ pub(crate) fn gather_rows(
                 let (cells, blob, _) = w.string_col_mut(pi);
                 for (cell, &(si, ri, _)) in cells.as_chunks_mut::<16>().0.iter_mut().zip(picks) {
                     let s = &sources[si as usize];
-                    *cell = relocate_german_string_vec(s.get_col_ptr(ri as usize, pi, 16), s.heap(), blob, None);
+                    *cell = relocated_cell(s.german_cell(ri as usize, pi), s.heap(), blob, None);
                 }
             } else {
                 let dst = w.col_mut(pi);

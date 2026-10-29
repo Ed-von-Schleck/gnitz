@@ -2,12 +2,9 @@
 //! row, payload slots, writer and reader one `sys_row!` declaration yields, so
 //! the client's rows and the engine's are laid out and read back by the same
 //! list — the stored-shape digest and [`EXPR_BLOB_VERSION`], the system and user
-//! id ranges, the `TABLE_TAB`/`VIEW_TAB` property codecs and [`bool_word`], and
-//! the identifier and schema-name rules.
+//! id ranges, and [`bool_word`].
 
-use std::num::NonZeroU64;
-
-use crate::{ColType, ColumnDef, PkColList, PkListRole, RowSource, TypeCode};
+use crate::{ColType, ColumnDef, PkColList, PkListRole, RowSource, TableProps, TypeCode, ViewBudget, ViewProps};
 
 /// Where a row writer emits a row. Both sides already build batches this way —
 /// begin a row with its key and weight, push one value per payload column in
@@ -123,8 +120,9 @@ macro_rules! sys_row {
             }
         }
     };
-    // `Bool`, `Key` and `Cols` are stored as `U64` words: a boolean, and a
-    // [`PkColList::pack`] read as a primary key or as an index's column list.
+    // `Bool`, `Key`, `Cols` and `Props` are stored as `U64` words: a boolean, a
+    // [`PkColList::pack`] read as a primary key or as an index's column list,
+    // and a [`TableProps::pack`].
     (@tc String) => { TypeCode::String };
     (@tc Blob) => { TypeCode::Blob };
     (@tc $other:ident) => { TypeCode::U64 };
@@ -132,6 +130,7 @@ macro_rules! sys_row {
     (@ty Bool) => { bool };
     (@ty Key) => { PkColList };
     (@ty Cols) => { PkColList };
+    (@ty Props) => { TableProps };
     (@ty String) => { std::borrow::Cow<'a, str> };
     (@ty Blob) => { std::borrow::Cow<'a, [u8]> };
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, U64) => { crate::payload_u64($s, $r, $pi) };
@@ -144,6 +143,9 @@ macro_rules! sys_row {
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, Cols) => {
         PkColList::unpack_as(crate::payload_u64($s, $r, $pi), PkListRole::ColumnList)?
     };
+    (@get $s:ident, $r:ident, $pi:expr, $p:ident, Props) => {
+        TableProps::from_flags(crate::payload_u64($s, $r, $pi)).map_err(|e| format!("{}: {e}", stringify!($p)))?
+    };
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, Blob) => { crate::payload_bytes($s, $r, $pi) };
     (@get $s:ident, $r:ident, $pi:expr, $p:ident, String) => {
         crate::payload_str($s, $r, $pi).map_err(|_| format!("{} is not UTF-8", stringify!($p)))?
@@ -152,6 +154,7 @@ macro_rules! sys_row {
     (@put $s:ident, $v:expr, Bool) => { $s.put_u64($v as u64) };
     (@put $s:ident, $v:expr, Key) => { $s.put_u64($v.pack()) };
     (@put $s:ident, $v:expr, Cols) => { $s.put_u64($v.pack()) };
+    (@put $s:ident, $v:expr, Props) => { $s.put_u64($v.pack()) };
     (@put $s:ident, $v:expr, String) => { $s.put_string(&$v) };
     (@put $s:ident, $v:expr, Blob) => { $s.put_bytes(&$v) };
 }
@@ -171,8 +174,8 @@ sys_row! {
         schema_id: U64,
         name: String,
         pk_col_idx: Key,
-        /// [`TableProps::pack`].
-        flags: U64,
+        /// The table's non-column properties, packed by [`TableProps::pack`].
+        flags: Props,
     }
 }
 
@@ -430,12 +433,11 @@ impl<'a> ColTabRow<'a> {
 }
 
 impl TableTabRow<'_> {
-    /// The row's `flags`, decoded and held to the rules the word cannot encode
-    /// against its key.
+    /// The row's `flags`, held to the rules the word cannot encode against its
+    /// key.
     pub fn props(&self) -> Result<TableProps, String> {
-        let props = TableProps::from_flags(self.flags)?;
-        props.validate(self.pk_col_idx.as_slice().len())?;
-        Ok(props)
+        self.flags.validate(self.pk_col_idx.as_slice().len())?;
+        Ok(self.flags)
     }
 }
 
@@ -545,97 +547,8 @@ pub const FIRST_USER_TABLE_ID: u64 = 16;
 pub const CATALOG_ID_CEILING: u64 = 1 << 31;
 
 // ---------------------------------------------------------------------------
-// Identifier validation (shared between the SQL planner and the engine)
+// Boolean cells
 // ---------------------------------------------------------------------------
-
-/// The character set every stored catalog name is drawn from. Public because the
-/// engine applies the same charset at its own trust boundary without taking the
-/// rest of [`validate_user_identifier`]'s client-side policy.
-pub fn is_valid_ident_char(ch: u8) -> bool {
-    ch.is_ascii_alphanumeric() || ch == b'_'
-}
-
-/// The first name `names` repeats, folded case-insensitively as SQL identifiers
-/// are, and returned as it was spelled at the repeat.
-pub fn first_duplicate<'a>(mut names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    names.find(|n| !seen.insert(n.to_ascii_lowercase()))
-}
-
-/// The schema the system families live in. No user can create it: it starts
-/// with `_`, which [`validate_user_identifier`] refuses every name a user gives.
-pub const SYSTEM_SCHEMA: &str = "_system";
-
-/// The schema every database holds from its first boot, where an unqualified
-/// name resolves unless a session names another.
-pub const PUBLIC_SCHEMA: &str = "public";
-
-/// Reject empty names, names starting with `_` (reserved for the engine's own
-/// internal relation and index names) and names outside `[A-Za-z0-9_]`.
-pub fn validate_user_identifier(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("Identifier cannot be empty".into());
-    }
-    if name.starts_with('_') {
-        return Err(format!(
-            "User identifiers cannot start with '_' (reserved for system prefix): {name}"
-        ));
-    }
-    if !name.bytes().all(is_valid_ident_char) {
-        return Err(format!("Identifier contains invalid characters: {name}"));
-    }
-    Ok(())
-}
-
-/// [`validate_user_identifier`], then the canonical stored form: an ASCII
-/// lowercase fold. Validating first is what makes the fold safe — over
-/// `[A-Za-z0-9_]` it is injective on the classes SQL already considers equal,
-/// which it is not over arbitrary bytes.
-///
-/// The single definition of catalog-name case-insensitivity: every user-supplied
-/// relation, schema or index name crosses it on the way to a catalog row.
-pub fn canonical_identifier(name: &str) -> Result<String, String> {
-    validate_user_identifier(name)?;
-    Ok(name.to_ascii_lowercase())
-}
-
-/// `"schema.relation"`: the catalog key when both names are canonical. `.`
-/// is outside [`is_valid_ident_char`], so no pair can produce another pair's key.
-pub fn qualified_key(schema_name: &str, name: &str) -> String {
-    [schema_name, ".", name].concat()
-}
-
-// ---------------------------------------------------------------------------
-// TABLE_TAB.flags layout. Every bit outside the constants below is refused on
-// decode. `replicated` and a non-default prefix length are mutually exclusive (a
-// CLUSTER BY prefix is meaningless when every worker holds the full copy):
-// [`TableDistribution`] cannot represent both, and `TableProps::from_flags`
-// refuses a word that carries both.
-// ---------------------------------------------------------------------------
-
-/// Bit 0: the table is **replicated** — every worker holds an identical full
-/// copy (writes broadcast, reads single-source).
-const TABLE_FLAG_REPLICATED: u64 = 1;
-/// Bit 1: the table is a **stream** — a storeless, append-only ingestion point.
-/// Independent of the distribution: a stream may be replicated or CLUSTER BY'd.
-const TABLE_FLAG_STREAM: u64 = 1 << 1;
-/// Bit 2: the table's single PK column is **SERIAL** — INSERT draws it from the
-/// table's sequence.
-const TABLE_FLAG_SERIAL: u64 = 1 << 2;
-/// Bit 3: the table's store **compresses** its heaps — `WITH (compress = true)`.
-const TABLE_FLAG_COMPRESS: u64 = 1 << 3;
-/// Bit position of the distribution-prefix-length byte in `TABLE_TAB.flags`;
-/// `0` there is the default, the full PK.
-const TABLE_FLAG_DIST_SHIFT: u32 = 8;
-/// Mask for the distribution-prefix-length byte (one byte: 0..=255). An
-/// explicit prefix is `1..=PK_LIST_MAX_COLS`, well within the byte.
-const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
-/// Every bit a `TABLE_TAB.flags` word may carry.
-const TABLE_FLAGS_DEFINED: u64 = TABLE_FLAG_REPLICATED
-    | TABLE_FLAG_STREAM
-    | TABLE_FLAG_SERIAL
-    | TABLE_FLAG_COMPRESS
-    | (TABLE_FLAG_DIST_MASK << TABLE_FLAG_DIST_SHIFT);
 
 /// A boolean carried as a u64 word (a catalog column or a request arg): `0` or
 /// `1`, any other word refused.
@@ -644,166 +557,6 @@ pub fn bool_word(w: u64) -> Result<bool, String> {
         0 => Ok(false),
         1 => Ok(true),
         _ => Err(format!("boolean word {w} is neither 0 nor 1")),
-    }
-}
-
-/// How a table's rows are spread over the workers.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum TableDistribution {
-    /// Hash-distributed by the first `prefix_len` PK columns; `0` = the full PK.
-    Keyed { prefix_len: u8 },
-    /// A full copy on every worker.
-    Replicated,
-}
-
-/// Hash-distributed by the full PK.
-impl Default for TableDistribution {
-    fn default() -> Self {
-        TableDistribution::Keyed { prefix_len: 0 }
-    }
-}
-
-/// The logical content of `TABLE_TAB.flags`: the non-column properties of a
-/// `CREATE TABLE`.
-#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
-pub struct TableProps {
-    /// A storeless, append-only ingestion point rather than a table: it holds no
-    /// rows and nothing it ingests survives a restart.
-    pub stream: bool,
-    /// INSERT draws the table's single PK column from a sequence.
-    pub serial: bool,
-    /// Where the rows live. A `Keyed` prefix is `CLUSTER BY` the PK's leading
-    /// prefix; the SQL planner validates it against the PK before packing.
-    pub distribution: TableDistribution,
-    /// The table's store codes its shards' heaps under a symbol table where
-    /// that pays.
-    pub compress: bool,
-}
-
-impl TableProps {
-    /// Pack the persisted `TABLE_TAB.flags` u64. Inverse of `from_flags`.
-    #[inline]
-    pub fn pack(self) -> u64 {
-        let dist = match self.distribution {
-            TableDistribution::Keyed { prefix_len } => (prefix_len as u64) << TABLE_FLAG_DIST_SHIFT,
-            TableDistribution::Replicated => TABLE_FLAG_REPLICATED,
-        };
-        let bit = |set: bool, flag: u64| if set { flag } else { 0 };
-        dist | bit(self.stream, TABLE_FLAG_STREAM)
-            | bit(self.serial, TABLE_FLAG_SERIAL)
-            | bit(self.compress, TABLE_FLAG_COMPRESS)
-    }
-
-    /// Decode a persisted `TABLE_TAB.flags` u64, refusing a bit outside the
-    /// defined set and a replicated table that also carries a prefix.
-    pub(crate) fn from_flags(flags: u64) -> Result<TableProps, String> {
-        if flags & !TABLE_FLAGS_DEFINED != 0 {
-            return Err(format!("table flags {flags:#x} carry unknown bits"));
-        }
-        let prefix_len = ((flags >> TABLE_FLAG_DIST_SHIFT) & TABLE_FLAG_DIST_MASK) as u8;
-        let distribution = if flags & TABLE_FLAG_REPLICATED == 0 {
-            TableDistribution::Keyed { prefix_len }
-        } else if prefix_len == 0 {
-            TableDistribution::Replicated
-        } else {
-            return Err(replicated_with_prefix(prefix_len));
-        };
-        Ok(TableProps {
-            stream: flags & TABLE_FLAG_STREAM != 0,
-            serial: flags & TABLE_FLAG_SERIAL != 0,
-            distribution,
-            compress: flags & TABLE_FLAG_COMPRESS != 0,
-        })
-    }
-
-    /// The rules against a PK of `pk_len` columns that the flags word cannot
-    /// encode.
-    pub fn validate(&self, pk_len: usize) -> Result<(), String> {
-        if let TableDistribution::Keyed { prefix_len } = self.distribution {
-            if prefix_len as usize > pk_len {
-                return Err(format!(
-                    "distribution prefix length {prefix_len} exceeds PK column count {pk_len}"
-                ));
-            }
-        }
-        if self.compress && self.stream {
-            return Err("a stream cannot be compressed: it holds no rows".to_string());
-        }
-        if self.serial && self.stream {
-            return Err("a stream cannot be SERIAL: it holds no rows to seed the generator from".to_string());
-        }
-        if self.serial && pk_len != 1 {
-            return Err("a SERIAL table's primary key is its one SERIAL column".to_string());
-        }
-        Ok(())
-    }
-}
-
-/// The refusal for a table that is both replicated and `CLUSTER BY`'d.
-pub fn replicated_with_prefix(prefix_len: u8) -> String {
-    format!(
-        "REPLICATED and CLUSTER BY are mutually exclusive: a replicated table keeps \
-         a full copy on every worker, so a hash-distribution prefix (k={prefix_len}) is meaningless"
-    )
-}
-
-/// The `WITH (…)` options of one user-named view.
-#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
-pub struct ViewProps {
-    pub budget: ViewBudget,
-    /// `WITH (compress = …)`: the view's output store codes its heaps.
-    pub compress: bool,
-}
-
-/// The byte budget a view's `WITH (…)` names, if any.
-#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
-pub enum ViewBudget {
-    #[default]
-    Plain,
-    /// `WITH (capacity = …)`: the view's output store is bounded, dehydrating past it.
-    Bounded { capacity_bytes: NonZeroU64 },
-    /// `WITH (delta = …)`: the view keeps its recent deltas in a store of its own.
-    Fed { delta_bytes: NonZeroU64 },
-}
-
-impl ViewBudget {
-    /// The props two optional budgets name.
-    pub fn from_budgets(
-        capacity_bytes: Option<NonZeroU64>,
-        delta_bytes: Option<NonZeroU64>,
-    ) -> Result<ViewBudget, String> {
-        match (capacity_bytes, delta_bytes) {
-            (None, None) => Ok(ViewBudget::Plain),
-            (Some(capacity_bytes), None) => Ok(ViewBudget::Bounded { capacity_bytes }),
-            (None, Some(delta_bytes)) => Ok(ViewBudget::Fed { delta_bytes }),
-            (Some(_), Some(_)) => Err("a capacity-bounded view cannot carry a delta feed: its bootstrap read \
-                                       hydrates from the source relation's live store, which no tick round governs"
-                .to_string()),
-        }
-    }
-
-    /// Decode the `(capacity, delta)` `VIEW_TAB` words, where `0` is absent.
-    pub(crate) fn from_row(capacity: u64, delta: u64) -> Result<ViewBudget, String> {
-        Self::from_budgets(NonZeroU64::new(capacity), NonZeroU64::new(delta))
-    }
-
-    /// The `(capacity, delta)` `VIEW_TAB` words.
-    pub fn row_words(self) -> (u64, u64) {
-        (self.capacity_bytes().unwrap_or(0), self.delta_bytes().unwrap_or(0))
-    }
-
-    pub fn capacity_bytes(self) -> Option<u64> {
-        match self {
-            ViewBudget::Bounded { capacity_bytes } => Some(capacity_bytes.get()),
-            _ => None,
-        }
-    }
-
-    pub fn delta_bytes(self) -> Option<u64> {
-        match self {
-            ViewBudget::Fed { delta_bytes } => Some(delta_bytes.get()),
-            _ => None,
-        }
     }
 }
 

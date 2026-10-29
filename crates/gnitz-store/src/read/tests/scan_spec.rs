@@ -217,7 +217,7 @@ fn keyed_reads_return_each_named_keys_whole_group() {
         (pk_range(5, u64::MAX as u128), (5..10).collect()),
         (pk_range(5, 7), vec![5, 6, 7]),
         (
-            ReadBound::Range(KeyRange::point(PkColList::from_slice(&[0]), &[], 7)),
+            ReadBound::Range(KeyRange::point(PkColList::from_slice(&[0]), &[7])),
             vec![7],
         ),
     ];

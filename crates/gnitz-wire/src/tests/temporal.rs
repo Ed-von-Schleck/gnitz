@@ -76,3 +76,23 @@ fn formatted_dates_and_timestamps_parse_back() {
     }
     assert_eq!(format_timestamp(1_500_000), "1970-01-01 00:00:01.5");
 }
+
+#[test]
+fn joined_micros_invert_the_split() {
+    for micros in [
+        0,
+        1,
+        -1,
+        1_500_000,
+        86_399_999_999,
+        1_700_000_000_123_400,
+        -86_400_000_001,
+    ] {
+        let (days, h, mi, s, us) = split_micros(micros);
+        assert_eq!(join_micros(days, h, mi, s, us), Some(micros), "{micros}");
+    }
+    assert_eq!(join_micros(i64::MAX / MICROS_PER_DAY + 1, 0, 0, 0, 0), None);
+    assert_eq!(join_micros(i64::MAX / MICROS_PER_DAY, 23, 59, 59, 999_999), None);
+    assert_eq!(join_micros(0, u32::MAX, u32::MAX, u32::MAX, u32::MAX), None);
+    assert_eq!(join_micros(i64::MIN / MICROS_PER_DAY - 1, 0, 0, 0, 0), None);
+}

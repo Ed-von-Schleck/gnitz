@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gnitz_wire::snapshot::PageRequest;
-use gnitz_wire::SeqTabRow;
+use gnitz_wire::{PkBuf, SeqTabRow};
 
 use crate::catalog::CATALOG_FAMILIES;
 use crate::connection::SnapshotPage;
@@ -42,7 +42,7 @@ impl GnitzClient {
         &mut self,
         id: u64,
         tid: u64,
-        after: &[Option<Vec<u8>>],
+        after: &[Option<PkBuf>],
         limit: u64,
         schema: &Arc<Schema>,
     ) -> Pending<'_, SnapshotPage> {
@@ -62,7 +62,7 @@ impl GnitzClient {
         mut each: impl FnMut(ZSetBatch) -> Result<(), E>,
     ) -> Result<(), E> {
         // Each worker's last key handed out; empty until the first page names the workers.
-        let mut after: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut after: Vec<Option<PkBuf>> = Vec::new();
         loop {
             let SnapshotPage { batch, worker_ends } = self.snapshot_page(id, tid, &after, page_rows, schema).await?;
             if after.is_empty() {
@@ -81,7 +81,7 @@ impl GnitzClient {
             let (mut more, mut start) = (false, 0);
             for (at, &end) in after.iter_mut().zip(&worker_ends) {
                 if end > start {
-                    *at = Some(batch.pks.get_bytes(end - 1).to_vec());
+                    *at = Some(PkBuf::from_bytes(batch.pks.get_bytes(end - 1)));
                 }
                 more |= (end - start) as u64 == share;
                 start = end;

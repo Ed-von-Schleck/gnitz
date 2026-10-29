@@ -783,7 +783,7 @@ fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
 #[test]
 fn a_synthetic_key_over_a_decimal_keeps_its_scale() {
     let i = TypeCode::I64;
-    let d = |name| ColumnDef::typed(name, ColType::decimal(2), false);
+    let d = |name| ColumnDef::new(name, ColType::decimal(2), false);
     let cat = catalog(vec![
         ("a", table(30, vec![d("k"), col("x", i)], vec![0])),
         ("b", table(31, vec![d("k"), col("y", i)], vec![0])),

@@ -385,8 +385,7 @@ impl PyClient {
             .zip(key_vals.iter())
             .map(|(&c, v)| py_key_image(&columns[c as usize], &v))
             .collect::<PyResult<Vec<u128>>>()?;
-        let (&last, eq) = keys.split_last().expect("at least one key value");
-        let range = KeyRange::point(cols, eq, last);
+        let range = KeyRange::point(cols, &keys);
         if !range.is_exact(|c| columns[c as usize].is_nullable) {
             return Err(PyValueError::new_err(
                 "seek_by_index: the key values stop short of a nullable column, whose NULL rows no walk reaches",

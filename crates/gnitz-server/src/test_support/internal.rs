@@ -471,7 +471,7 @@ pub fn table_tab_row(table_id: u64, name: &str) -> TableTabRow<'_> {
         schema_id: PUBLIC_SCHEMA_ID,
         name: name.into(),
         pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]),
-        flags: gnitz_wire::TableProps::default().pack(),
+        flags: gnitz_wire::TableProps::default(),
     }
 }
 

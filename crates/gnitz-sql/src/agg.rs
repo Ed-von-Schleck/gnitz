@@ -137,12 +137,8 @@ pub(crate) fn agg_ops(
 pub(crate) fn agg_col_def(op: WireAggFunc, src: Option<&ColumnDef>, ungrouped: bool) -> ColumnDef {
     let src_ty = src.map_or(ColType::of(TypeCode::I64), |c| c.ty);
     let tc = op.output_type(src_ty.tc).expect("agg_ops admitted this aggregate");
-    let ty = ColType {
-        tc,
-        scale: if tc == TypeCode::Decimal { src_ty.scale } else { 0 },
-    };
     let nullable = op.raw_output_nullable(src.is_some_and(|c| c.is_nullable), ungrouped);
-    ColumnDef::typed("_agg", ty, nullable).hidden()
+    ColumnDef::new("_agg", src_ty.with_code(tc), nullable).hidden()
 }
 
 /// Hidden: the synthetic group key is a physical PK column but not a presentation

@@ -296,7 +296,7 @@ fn a_list_product_past_the_cap_is_no_set() {
 fn a_pk_range_is_the_interval_its_conjuncts_fold_to() {
     use TypeCode::*;
     let decimal = schema(
-        vec![ColumnDef::typed("id", ColType::decimal(2), false), col("v", I64)],
+        vec![ColumnDef::new("id", ColType::decimal(2), false), col("v", I64)],
         &[0],
     );
     for (s, sql, tier, lo, hi) in [

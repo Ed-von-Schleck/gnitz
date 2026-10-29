@@ -85,6 +85,9 @@ fn each_guard_rejects_its_forgery() {
         buf
     };
     let mismatch = "block size does not match its rows and heap";
+    let not_its_length = "declared size is not the block's length";
+    let mut overlong = clean.clone();
+    overlong.push(0);
 
     let heap_len = b"a heap".len();
     let mut cases: Vec<(String, Vec<u8>, Option<&str>)> = vec![
@@ -96,19 +99,14 @@ fn each_guard_rejects_its_forgery() {
         (
             "size past the buffer".into(),
             clean[..clean.len() - 1].to_vec(),
-            Some("declared size past buffer"),
+            Some(not_its_length),
         ),
+        ("a trailing byte".into(), overlong, Some(not_its_length)),
         ("one row fewer".into(), forged(WAL_OFF_ROWS, &|r| r - 1), Some(mismatch)),
     ];
     for bit in 0..32 {
         let flip = |off| forged(off, &|v| v ^ (1 << bit));
-        let block = flip(WAL_OFF_SIZE);
-        let size_err = if read_u32_le(&block, WAL_OFF_SIZE) as usize > clean.len() {
-            "declared size past buffer"
-        } else {
-            mismatch
-        };
-        cases.push((format!("SIZE bit {bit}"), block, Some(size_err)));
+        cases.push((format!("SIZE bit {bit}"), flip(WAL_OFF_SIZE), Some(not_its_length)));
         cases.push((
             format!("VERSION bit {bit}"),
             flip(WAL_OFF_VERSION),

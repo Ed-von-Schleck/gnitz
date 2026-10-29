@@ -100,7 +100,7 @@ pub(super) fn carry_dead(src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, us
         let cells = src.col_data(pi).as_chunks::<16>().0;
         for &(start, end) in kept {
             for run in cells[start..end].chunks(DEAD_CHECK_CELLS) {
-                dead += run.iter().map(|cell| cell_long_bytes(cell)).sum::<usize>();
+                dead += run.iter().map(gnitz_wire::german_string_long_len).sum::<usize>();
                 if heap_is_wasteful(dead, heap) {
                     return None;
                 }
@@ -109,12 +109,6 @@ pub(super) fn carry_dead(src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, us
     }
     let excluded = || long_bytes_outside(src, mask, kept);
     carried_dead(heap, dead, src.count, range_rows(kept), excluded)
-}
-
-/// The heap bytes a long German-string cell names; none for a short one.
-#[inline]
-fn cell_long_bytes(cell: &[u8]) -> usize {
-    gnitz_wire::german_string_heap(cell, usize::MAX).map_or(0, |span| span.len())
 }
 
 /// [`row_long_bytes`] summed over every row of `src` outside the ascending,
@@ -134,7 +128,7 @@ pub(super) fn long_bytes_outside<S: RowSource>(src: &S, mask: u64, kept: &[(usiz
 #[inline]
 pub(super) fn row_long_bytes<S: RowSource>(src: &S, mask: u64, row: usize) -> usize {
     gnitz_wire::BitIter(mask)
-        .map(|pi| cell_long_bytes(src.get_col_ptr(row, pi, 16)))
+        .map(|pi| gnitz_wire::german_string_long_len(src.german_cell(row, pi)))
         .sum()
 }
 
@@ -171,7 +165,7 @@ pub(super) fn rebase_string_cell(
 ) {
     match heap_at {
         Some(base) => gnitz_wire::shift_german_string_heaps(cell, base),
-        None => relocate_cell(cell, src, dst_blob, cache),
+        None => *cell = relocated_cell(cell, src, dst_blob, cache),
     }
 }
 
@@ -222,38 +216,30 @@ fn relocate_coded_cells(
     }
 }
 
-/// `src_cell` rebased onto `dst_blob`; see [`relocate_cell`].
+/// `cell` rebased onto `dst_blob`: [`gnitz_wire::relocate_german_string`],
+/// copying each source value once when `cache` is `Some`.
 #[inline]
-pub(crate) fn relocate_german_string_vec(
-    src_cell: &[u8],
+pub(crate) fn relocated_cell(
+    cell: &[u8; 16],
     src: Heap<'_>,
     dst_blob: &mut Vec<u8>,
     cache: Option<&mut BlobCache>,
 ) -> [u8; 16] {
-    let mut cell: [u8; 16] = src_cell[..16]
-        .try_into()
-        .expect("relocate_german_string_vec: src must be a 16-byte German string cell");
-    relocate_cell(&mut cell, src, dst_blob, cache);
+    let mut cell = *cell;
+    match src {
+        Heap::Plain(blob) => relocate_plain(&mut cell, blob, dst_blob, cache),
+        Heap::Coded(_) => relocate_value(&mut cell, src, dst_blob, cache),
+    }
     cell
 }
 
-/// [`gnitz_wire::relocate_german_string`] in place, copying each source value
-/// once when `cache` is `Some`.
-#[inline]
-fn relocate_cell(cell: &mut [u8; 16], src: Heap<'_>, dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCache>) {
-    match src {
-        Heap::Plain(blob) => relocate_plain(cell, blob, dst_blob, cache),
-        Heap::Coded(_) => relocate_value(cell, src, dst_blob, cache),
-    }
-}
-
-/// [`relocate_cell`] out of the plain heap `src_blob`.
+/// [`relocated_cell`] out of the plain heap `src_blob`.
 #[inline]
 fn relocate_plain(cell: &mut [u8; 16], src_blob: &[u8], dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCache>) {
     *cell = gnitz_wire::relocate_german_string_with(cell, src_blob, |content| place_span(content, dst_blob, cache));
 }
 
-/// [`relocate_cell`] out of a coded heap, each value decoded into
+/// [`relocated_cell`] out of a coded heap, each value decoded into
 /// `dst_blob`. Out of line: a plain heap's relocation inlines without it.
 #[inline(never)]
 fn relocate_value(cell: &mut [u8; 16], src: Heap<'_>, dst_blob: &mut Vec<u8>, cache: Option<&mut BlobCache>) {

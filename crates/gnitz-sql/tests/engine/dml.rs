@@ -163,7 +163,7 @@ fn a_text_table_past_one_frame_reads_back_whole() {
         );
         assert_eq!(cell(&schema, &batch, v_ci, row) as u64, id % GROUPS, "row {row}");
         assert_eq!(
-            gnitz_wire::german_string_content(s.bytes(&batch, row), &batch.blob),
+            gnitz_wire::german_string_content(s.german_cell(&batch, row), &batch.blob),
             text.as_bytes(),
             "row {row}"
         );

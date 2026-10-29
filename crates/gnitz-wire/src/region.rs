@@ -1,8 +1,8 @@
 //! The region convention: the order a batch's column buffers are listed in and
 //! a column's payload slot among them, the list type that holds them, the null
-//! word one of those regions carries and the column cap it sets, and the per-row
-//! reader over them. `wal` frames a list into a block; nothing here
-//! knows what a block looks like.
+//! word one of those regions carries and the column cap it sets, the per-row
+//! reader over them, and the walk over one fixed-width cell of each strided row.
+//! `wal` frames a list into a block; nothing here knows what a block looks like.
 
 use std::mem::MaybeUninit;
 use std::ops::Deref;
@@ -112,14 +112,7 @@ pub fn first_valued_null<'a>(
     // One pass per slot that holds a NULL anywhere.
     for slot in crate::BitIter(present) {
         let (cells, width) = col(slot);
-        let row = match width {
-            1 => valued_null_row::<1>(words, cells, slot),
-            2 => valued_null_row::<2>(words, cells, slot),
-            4 => valued_null_row::<4>(words, cells, slot),
-            8 => valued_null_row::<8>(words, cells, slot),
-            16 => valued_null_row::<16>(words, cells, slot),
-            _ => unreachable!("a payload cell is 1/2/4/8/16 bytes"),
-        };
+        let row = crate::by_cell_width!(width, |T| valued_null_row::<{ size_of::<T>() }>(words, cells, slot));
         if let Some(row) = row.filter(|&r| first.is_none_or(|(f, _)| r < f)) {
             first = Some((row, slot));
         }
@@ -174,6 +167,12 @@ pub trait RowSource {
     fn get_null_word(&self, row: usize) -> u64;
     /// `col_size` bytes of payload column `payload_col` (native LE) in `row`.
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8];
+    /// The 16-byte German-string cell of STRING or BLOB payload column
+    /// `payload_col` in `row`.
+    #[inline(always)]
+    fn german_cell(&self, row: usize, payload_col: usize) -> &[u8; 16] {
+        self.get_col_ptr(row, payload_col, 16).first_chunk().unwrap()
+    }
     /// The heap the German-string cells' long values lie in.
     fn heap(&self) -> crate::Heap<'_>;
     /// Rows in this source. The bound every whole-source walk reads — the
@@ -199,6 +198,10 @@ impl<T: RowSource + ?Sized> RowSource for &T {
         (**self).get_col_ptr(row, payload_col, col_size)
     }
     #[inline(always)]
+    fn german_cell(&self, row: usize, payload_col: usize) -> &[u8; 16] {
+        (**self).german_cell(row, payload_col)
+    }
+    #[inline(always)]
     fn heap(&self) -> crate::Heap<'_> {
         (**self).heap()
     }
@@ -217,7 +220,7 @@ pub fn payload_u64<S: RowSource>(src: &S, row: usize, pi: usize) -> u64 {
 /// heap.
 #[inline(always)]
 pub fn payload_bytes<S: RowSource>(src: &S, row: usize, pi: usize) -> std::borrow::Cow<'_, [u8]> {
-    crate::german_string_bytes(src.get_col_ptr(row, pi, 16), src.heap())
+    crate::german_string_bytes(src.german_cell(row, pi), src.heap())
 }
 
 /// [`payload_bytes`] as a string; an error when the cell is not UTF-8.
@@ -230,6 +233,28 @@ pub fn payload_str<S: RowSource>(
     match payload_bytes(src, row, pi) {
         Cow::Borrowed(bytes) => std::str::from_utf8(bytes).map(Cow::Borrowed),
         Cow::Owned(bytes) => String::from_utf8(bytes).map(Cow::Owned).map_err(|e| e.utf8_error()),
+    }
+}
+
+/// `f` over the `W`-byte cell at byte `off` of each `stride`-byte row of `src`, paired
+/// with `dst`'s items in order.
+#[inline(always)]
+pub fn zip_cells<const W: usize, D>(
+    src: &[u8],
+    stride: usize,
+    off: usize,
+    dst: impl Iterator<Item = D>,
+    mut f: impl FnMut(&[u8; W], D),
+) {
+    assert!(off + W <= stride, "a cell lies inside its row");
+    if stride == W {
+        for (cell, d) in src.as_chunks::<W>().0.iter().zip(dst) {
+            f(cell, d);
+        }
+    } else {
+        for (row, d) in src.chunks_exact(stride).zip(dst) {
+            f(row[off..off + W].try_into().unwrap(), d);
+        }
     }
 }
 

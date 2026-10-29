@@ -186,8 +186,10 @@ fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option
             (KeyRange::new(cols, &eq, first, last), sides)
         }
         None => {
-            let (&last, init) = eq.split_last()?;
-            (KeyRange::point(cols, init, last), 0)
+            if eq.is_empty() {
+                return None;
+            }
+            (KeyRange::point(cols, &eq), 0)
         }
     };
     range

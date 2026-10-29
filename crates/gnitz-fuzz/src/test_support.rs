@@ -20,10 +20,14 @@ pub(crate) fn predicate() -> Vec<u8> {
         .to_blob_bytes()
 }
 
-/// A scan of source 50 filtered by `predicate`, encoded.
+/// A scan of source 50 filtered by `predicate`, behind a scan of source 51
+/// nothing reads, encoded. The filter's input is node 0 with any one node
+/// dropped or repeated, so every item edit of the node list leaves a circuit
+/// that decodes.
 pub(crate) fn circuit(predicate: &[u8]) -> Vec<u8> {
     let mut c = Circuit::default();
     let scan = c.input_delta(50, ReadBound::None);
+    c.input_delta(51, ReadBound::None);
     c.filter(scan, predicate.to_vec());
     c.encode()
 }
@@ -65,7 +69,7 @@ pub(crate) fn cut(order: &[u16]) -> ReadSpec {
 /// One frame of each shape the anatomy takes apart: a `circuits` row, a scan
 /// filtered and cut in order, and a scan of one 16-byte key image.
 pub(crate) fn frames() -> [Vec<u8>; 3] {
-    let point = KeyRange::point(PkColList::from_slice(&[0]), &[], u128::MAX);
+    let point = KeyRange::point(PkColList::from_slice(&[0]), &[u128::MAX]);
     [
         ddl_frame(&circuit(&predicate())),
         scan_frame(&cut(&[1, 2])),

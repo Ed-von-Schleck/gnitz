@@ -262,13 +262,16 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
     }
     let mut scratch = [0u8; 16];
     let b = loc.native_le_bytes(batch, row, &mut scratch);
+    let int = || {
+        loc.decode_i64(
+            batch,
+            row,
+            gnitz_wire::FixedInt::from_type_code(ty.tc).expect("an integer-stored type"),
+        )
+    };
     Ok(match ty.tc {
-        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => {
-            gnitz_wire::read_unsigned_exact(b).into_py_any(py)?
-        }
-        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
-            gnitz_wire::read_signed_exact(b).into_py_any(py)?
-        }
+        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => (int() as u64).into_py_any(py)?,
+        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => int().into_py_any(py)?,
         TypeCode::Bool => (b[0] != 0).into_py_any(py)?,
         TypeCode::F32 => f32::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
         TypeCode::F64 => f64::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
@@ -276,7 +279,7 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
         TypeCode::I128 => i128::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
         TypeCode::UUID => format_uuid(u128::from_le_bytes(b.try_into().unwrap())).into_py_any(py)?,
         TypeCode::Date => {
-            let days = gnitz_wire::read_signed_exact(b);
+            let days = int();
             let (y, m, d) = gnitz_wire::civil_from_days(days);
             if PY_YEARS.contains(&y) {
                 PyDate::new(py, y as i32, m as u8, d as u8)?.into_any().unbind()
@@ -285,7 +288,7 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
             }
         }
         TypeCode::Timestamp => {
-            let micros = gnitz_wire::read_signed_exact(b);
+            let micros = int();
             let (days, h, mi, s, us) = gnitz_wire::split_micros(micros);
             let (y, m, d) = gnitz_wire::civil_from_days(days);
             if PY_YEARS.contains(&y) {
@@ -297,7 +300,7 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
             }
         }
         TypeCode::Decimal => py_decimal(py)?
-            .call1((format_decimal(gnitz_wire::read_signed_exact(b).into(), ty.scale),))?
+            .call1((format_decimal(int().into(), ty.scale),))?
             .unbind(),
         // CPython validates the UTF-8 and raises `UnicodeDecodeError`.
         TypeCode::String => PyString::from_bytes(py, &loc.content(batch, row))?.into_any().unbind(),

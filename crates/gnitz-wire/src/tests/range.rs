@@ -23,7 +23,7 @@ fn roundtrips_every_shape() {
         KeyRange::new(cols(&[1, 2]), &[7], 1, u128::MAX),
         KeyRange::new(cols(&[3, 0, 1, 2]), &[1, 2, 3], 11, 49), // max arity
         KeyRange::new(cols(&[0]), &[], 6, 5),                   // empty
-        KeyRange::point(cols(&[4, 5]), &[u128::MAX], 0),
+        KeyRange::point(cols(&[4, 5]), &[u128::MAX, 0]),
     ];
     for r in shapes {
         assert_eq!(dec(&enc(&r)), Ok(r), "{r:?}");
@@ -32,16 +32,16 @@ fn roundtrips_every_shape() {
 
 #[test]
 fn a_walk_is_exact_iff_no_unbounded_column_is_nullable() {
-    let prefix = KeyRange::point(cols(&[4, 5, 6]), &[1], 2);
+    let prefix = KeyRange::point(cols(&[4, 5, 6]), &[1, 2]);
     assert!(prefix.is_exact(|_| false));
     assert!(prefix.is_exact(|c| c != 6), "a nullable bounded column loses no row");
     assert!(!prefix.is_exact(|c| c == 6));
-    assert!(KeyRange::point(cols(&[4, 5]), &[1], 2).is_exact(|_| true));
+    assert!(KeyRange::point(cols(&[4, 5]), &[1, 2]).is_exact(|_| true));
 }
 
 #[test]
 fn walks_pk_iff_the_list_leads_the_pk() {
-    let r = KeyRange::point(cols(&[2, 0]), &[1], 2);
+    let r = KeyRange::point(cols(&[2, 0]), &[1, 2]);
     assert!(r.walks_pk(&[2, 0]));
     assert!(r.walks_pk(&[2, 0, 1]));
     assert!(!r.walks_pk(&[0, 2]));

@@ -11,7 +11,6 @@ use io_uring::types::FsyncFlags;
 
 use super::batch_fsync::Syncer;
 use gnitz_wire::PkBuf;
-use gnitz_wire::MAX_PK_BYTES;
 use gnitz_wire::{Reader, Writer};
 use gnitz_zset::repr::StorageError;
 
@@ -60,7 +59,7 @@ fn encode(m: &Manifest) -> Vec<u8> {
         .u64(m.shards.run_bytes)
         .bytes32(&m.caller_record);
     for e in &m.shards.entries {
-        w.u64(e.seq).u64(e.newest).u64(e.level).bytes32(e.guard_key.pk_bytes());
+        w.u64(e.seq).u64(e.newest).u64(e.level).put(&e.guard_key);
     }
     let mut buf = w.into_vec();
     let digest = gnitz_wire::checksum(&buf);
@@ -96,16 +95,8 @@ fn decode_body(r: &mut Reader) -> Result<Manifest, String> {
     };
     while r.remaining() > 0 {
         let (seq, newest, level) = (r.u64()?, r.u64()?, r.u64()?);
-        let key = r.bytes32()?;
-        if key.len() > MAX_PK_BYTES {
-            return Err("guard key too wide".into());
-        }
-        m.shards.entries.push(ManifestEntry {
-            seq,
-            newest,
-            level,
-            guard_key: PkBuf::from_bytes(key),
-        });
+        let guard_key = r.get::<PkBuf>()?;
+        m.shards.entries.push(ManifestEntry { seq, newest, level, guard_key });
     }
     Ok(m)
 }

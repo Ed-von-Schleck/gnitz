@@ -5,14 +5,11 @@
 use std::num::NonZeroU64;
 use std::ops::Range;
 
-use crate::circuit::{ComputeMap, GroupAggs};
 use crate::codec::{decode_all, Reader, Wire, Writer};
+use crate::operator::{order_keys, ComputeMap, GroupAggs, OrderKey};
 use crate::pk::{strictly_ascending, PkKeys};
 use crate::range::KeyRange;
 use crate::MAX_PK_BYTES;
-
-/// ORDER BY keys apply in sequence; a spec carries at most this many.
-pub const MAX_ORDER_KEYS: usize = 16;
 
 wire_enum! {
     /// The tag a [`ReadBound`] leads with.
@@ -28,42 +25,6 @@ wire_enum! {
     enum SinkTag: u8 {
         Rows = 0,
         Fold = 1,
-    }
-}
-
-/// One ORDER BY key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OrderKey {
-    /// A full reply-schema column index (not a dense payload index).
-    pub col: u16,
-    pub desc: bool,
-    pub nulls_first: bool,
-}
-
-const ORDER_DESC: u8 = 1 << 0;
-const ORDER_NULLS_FIRST: u8 = 1 << 1;
-
-/// The column, then a flag byte; an unknown flag bit is a refusal.
-impl Wire for OrderKey {
-    fn write(&self, w: &mut Writer) {
-        let mut flags = 0u8;
-        if self.desc {
-            flags |= ORDER_DESC;
-        }
-        if self.nulls_first {
-            flags |= ORDER_NULLS_FIRST;
-        }
-        w.u16(self.col).u8(flags);
-    }
-
-    fn read(r: &mut Reader) -> Result<Self, String> {
-        let col = r.u16()?;
-        let flags = r.flags(ORDER_DESC | ORDER_NULLS_FIRST)?;
-        Ok(OrderKey {
-            col,
-            desc: flags & ORDER_DESC != 0,
-            nulls_first: flags & ORDER_NULLS_FIRST != 0,
-        })
     }
 }
 
@@ -192,10 +153,7 @@ impl ReadSpec {
                 SinkTag::Rows => {
                     let cut = match NonZeroU64::new(r.u64()?) {
                         None => None,
-                        Some(k) => Some(RowsCut {
-                            k,
-                            order: r.list("order keys", MAX_ORDER_KEYS)?,
-                        }),
+                        Some(k) => Some(RowsCut { k, order: order_keys(r)? }),
                     };
                     SinkKind::Rows { cut }
                 }
@@ -243,17 +201,23 @@ impl ReadBound {
             _ => 0,
         }
     }
+}
 
-    /// The bound alone, as a `HasPk` request carries its keys.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::with_capacity(16 + self.key_bytes());
-        w.put(self);
+impl PkKeys {
+    /// A `HasPk` probe's blob: the keys as a `PkSet` bound, the layout
+    /// [`peek_bound`] routes.
+    pub fn encode_probe(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.put(&BoundTag::PkSet).put(self);
         w.into_vec()
     }
 
-    /// The inverse of [`Self::encode`], at the trust boundary.
-    pub fn decode(buf: &[u8]) -> Result<Self, String> {
-        decode_all(buf, "read_bound", |r| r.get())
+    /// [`Self::encode_probe`]'s inverse, at the trust boundary.
+    pub fn decode_probe(buf: &[u8]) -> Result<PkKeys, String> {
+        decode_all(buf, "pk_probe", |r| match r.get()? {
+            ReadBound::PkSet(keys) => Ok(keys),
+            ReadBound::None | ReadBound::Range(_) => Err("a probe carries a PkSet bound".into()),
+        })
     }
 }
 
@@ -268,8 +232,7 @@ impl Wire for ReadBound {
                 w.put(&BoundTag::Range).put(range);
             }
             ReadBound::PkSet(keys) => {
-                w.put(&BoundTag::PkSet);
-                write_pk_set(w, keys.stride(), keys.as_bytes());
+                w.put(&BoundTag::PkSet).put(keys);
             }
         }
     }
@@ -279,11 +242,21 @@ impl Wire for ReadBound {
         Ok(match r.get()? {
             BoundTag::None => ReadBound::None,
             BoundTag::Range => ReadBound::Range(r.get()?),
-            BoundTag::PkSet => {
-                let (stride, bytes) = read_pk_set(r)?;
-                ReadBound::PkSet(PkKeys::checked(stride, bytes.to_vec()).map_err(|e| format!("PkSet {e}"))?)
-            }
+            BoundTag::PkSet => ReadBound::PkSet(r.get()?),
         })
+    }
+}
+
+/// The stride, the count, then the keys; [`peek_bound`] reads the same layout.
+impl Wire for PkKeys {
+    fn write(&self, w: &mut Writer) {
+        write_pk_set(w, self.stride(), self.as_bytes());
+    }
+
+    /// At the trust boundary: keys out of order are an `Err`.
+    fn read(r: &mut Reader) -> Result<Self, String> {
+        let (stride, bytes) = read_pk_set(r)?;
+        PkKeys::checked(stride, bytes.to_vec()).map_err(|e| format!("PkSet {e}"))
     }
 }
 

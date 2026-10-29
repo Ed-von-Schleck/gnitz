@@ -24,11 +24,10 @@
 
 use crate::region::Regions;
 use crate::{
-    append_frame, frame_size, peek_control_block, ClientVerb, ControlHeader, DecodedControl, Reader, Target, WireFlags,
-    WireStatus, CTRL_HEADER_SIZE,
+    append_frame, peek_control_block, ClientVerb, ControlHeader, DecodedControl, Reader, Target, WireFlags, WireStatus,
+    Writer,
 };
 use std::num::NonZeroU64;
-use std::ops::Range;
 
 /// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
 /// one reply train of bookkeeping per relation; a handful of related tables
@@ -39,47 +38,50 @@ const SCAN_MULTI_MAX_RELATIONS: usize = 16;
 /// no commit exceeds it.
 pub const BLIND: u64 = u64::MAX;
 
-/// One item to encode: its header (the verb is the frame's) and its sections.
+/// One family of a `PUSH_TXN` or `DDL_TXN`: its header (the verb is the
+/// frame's), its schema record where the verb carries one, and its rows.
 pub struct FrameItem<'a> {
     pub hdr: ControlHeader,
-    /// Empty for none; only a verb whose items may carry one decodes with it.
-    pub blob: &'a [u8],
     pub schema: Option<&'a [u8]>,
-    pub data: Option<Regions<'a>>,
+    pub data: Regions<'a>,
 }
 
-/// Encode a multi-item `verb` frame, without the 4-byte frame length prefix.
-pub fn encode_items(verb: ClientVerb, items: &[FrameItem<'_>]) -> Vec<u8> {
-    encode_items_under(verb, 0, items)
-}
-
-/// [`encode_items`] with the prologue's `arg0`.
-fn encode_items_under(verb: ClientVerb, arg0: u64, items: &[FrameItem<'_>]) -> Vec<u8> {
-    let size = CTRL_HEADER_SIZE
-        + items
-            .iter()
-            .map(|it| frame_size(it.blob, it.schema, it.data.as_deref()))
-            .sum::<usize>();
-    let mut out = Vec::with_capacity(size);
-    let prologue = ControlHeader {
+/// A `verb` frame's prologue: `arg0` as given, every other field zero. Each
+/// item's `append_frame` reserves its own bytes.
+fn prologue(verb: ClientVerb, arg0: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    let hdr = ControlHeader {
         flags: WireFlags { verb, ..Default::default() },
         arg0,
         ..Default::default()
     };
-    append_frame(&mut out, &prologue, &[], None, None);
+    append_frame(&mut out, &hdr, &[], None, None);
+    out
+}
+
+/// Encode a `PUSH_TXN` or `DDL_TXN` frame, without the 4-byte frame length
+/// prefix.
+pub fn encode_items(verb: ClientVerb, items: &[FrameItem<'_>]) -> Vec<u8> {
+    debug_assert!(
+        item_shape(verb).is_some_and(|s| s.data),
+        "{verb:?} items carry no data block"
+    );
+    let mut out = prologue(verb, 0);
     for it in items {
-        let mut hdr = it.hdr;
-        hdr.flags.verb = verb;
-        append_frame(&mut out, &hdr, it.blob, it.schema, it.data.as_deref());
+        let hdr = ControlHeader {
+            flags: WireFlags { verb, ..it.hdr.flags },
+            ..it.hdr
+        };
+        append_frame(&mut out, &hdr, &[], it.schema, Some(&it.data[..]));
     }
-    debug_assert_eq!(out.len(), size);
     out
 }
 
 /// The sections an item of a multi-item verb carries, and how many items one
 /// frame may hold.
 pub(crate) struct ItemShape {
-    /// Whether an item may carry a blob.
+    /// Whether a decoded item may carry a blob; an item carrying one where
+    /// this is false is refused.
     pub(crate) blob: bool,
     pub(crate) schema: bool,
     pub(crate) data: bool,
@@ -175,16 +177,12 @@ impl<'a> ScanItem<'a> {
 
 /// Encode a `SCAN_MULTI` frame, without the 4-byte frame length prefix.
 pub fn encode_scan_multi(scans: &[ScanItem<'_>]) -> Vec<u8> {
-    let items: Vec<FrameItem> = scans
-        .iter()
-        .map(|s| FrameItem {
-            hdr: ControlHeader::naming(ClientVerb::ScanMulti, s.target, s.reply_layout),
-            blob: s.spec,
-            schema: None,
-            data: None,
-        })
-        .collect();
-    encode_items(ClientVerb::ScanMulti, &items)
+    let mut out = prologue(ClientVerb::ScanMulti, 0);
+    for s in scans {
+        let hdr = ControlHeader::naming(ClientVerb::ScanMulti, s.target, s.reply_layout);
+        append_frame(&mut out, &hdr, s.spec, None, None);
+    }
+    out
 }
 
 /// Decode a `SCAN_MULTI` frame body into its items, in request order.
@@ -215,6 +213,19 @@ impl DeltaCursor {
     pub fn pair(self) -> (u64, u64) {
         (self.tag, self.tick.get())
     }
+
+    /// Write `cursor` as the words it is carried in: its tag, then its tick,
+    /// both zero for none.
+    pub fn write_opt(w: &mut Writer, cursor: Option<Self>) {
+        let (tag, tick) = cursor.map_or((0, 0), Self::pair);
+        w.u64(tag).u64(tick);
+    }
+
+    /// [`Self::write_opt`]'s inverse.
+    pub fn read_opt(r: &mut Reader) -> Result<Option<Self>, String> {
+        let (tag, tick) = (r.u64()?, r.u64()?);
+        Ok(Self::from_pair(tag, tick))
+    }
 }
 
 /// One item of a DELTA_POLL: `spec` applied to every delta `view` recorded
@@ -233,36 +244,18 @@ pub struct DeltaPollItem<'a> {
     pub spec: &'a [u8],
 }
 
-/// The bytes an item's blob opens with: the cursor's tag, then its tick, both
-/// zero for none.
-const CURSOR_SIZE: usize = 16;
-
 /// Encode a `DELTA_POLL` frame, without the 4-byte frame length prefix. Item
 /// `i` is kept as the subscription `keep + i`.
 pub fn encode_delta_poll(views: &[DeltaPollItem<'_>], keep: Option<u64>) -> Vec<u8> {
-    let mut blobs = Vec::with_capacity(views.iter().map(|v| CURSOR_SIZE + v.spec.len()).sum());
-    let ranges: Vec<Range<usize>> = views
-        .iter()
-        .map(|v| {
-            let start = blobs.len();
-            let (tag, tick) = v.from.map_or((0, 0), DeltaCursor::pair);
-            blobs.extend_from_slice(&tag.to_le_bytes());
-            blobs.extend_from_slice(&tick.to_le_bytes());
-            blobs.extend_from_slice(v.spec);
-            start..blobs.len()
-        })
-        .collect();
-    let items: Vec<FrameItem> = views
-        .iter()
-        .zip(ranges)
-        .map(|(v, blob)| FrameItem {
-            hdr: ControlHeader::naming(ClientVerb::DeltaPoll, v.view, v.reply_layout),
-            blob: &blobs[blob],
-            schema: None,
-            data: None,
-        })
-        .collect();
-    encode_items_under(ClientVerb::DeltaPoll, keep.unwrap_or(0), &items)
+    let mut out = prologue(ClientVerb::DeltaPoll, keep.unwrap_or(0));
+    for v in views {
+        let mut blob = Writer::new();
+        DeltaCursor::write_opt(&mut blob, v.from);
+        blob.raw(v.spec);
+        let hdr = ControlHeader::naming(ClientVerb::DeltaPoll, v.view, v.reply_layout);
+        append_frame(&mut out, &hdr, &blob.into_vec(), None, None);
+    }
+    out
 }
 
 /// The subscription id item `item` of a `DELTA_POLL` keeping from `first` is
@@ -299,14 +292,13 @@ pub fn decode_delta_items(body: &[u8]) -> Result<Vec<DeltaPollItem<'_>>, String>
             }
             let blob = &item[c.blob];
             let mut r = Reader::new(blob);
-            let (Ok(tag), Ok(tick)) = (r.u64(), r.u64()) else {
-                return Err(format!("DeltaPoll: view {} carries no cursor", c.hdr.target_id));
-            };
+            let from = DeltaCursor::read_opt(&mut r)
+                .map_err(|_| format!("DeltaPoll: view {} carries no cursor", c.hdr.target_id))?;
             Ok(DeltaPollItem {
                 view: c.hdr.target(),
-                from: DeltaCursor::from_pair(tag, tick),
+                from,
                 reply_layout: c.hdr.arg0,
-                spec: &blob[CURSOR_SIZE..],
+                spec: &blob[r.pos()..],
             })
         })
         .collect()

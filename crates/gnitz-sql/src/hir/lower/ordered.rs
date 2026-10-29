@@ -4,7 +4,7 @@
 
 use super::super::{AggCol, ColId, HirCol, OrderedOp, RelExpr};
 use super::spine::{open, Top};
-use super::{keyed_frame, resolve_reduce_specs, EmitPieces, ReduceSpecs, ViewChain};
+use super::{keyed_frame, resolve_reduce_specs, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
 use gnitz_wire::{Circuit, OrderKey};
 use std::collections::HashSet;
@@ -34,7 +34,7 @@ pub(super) fn lower_ordered(chain: &mut ViewChain, rel: &RelExpr) -> Result<Emit
         OrderedOp::Window { aggs, .. } => aggs,
         OrderedOp::TopN { .. } => &[],
     };
-    let ReduceSpecs { group, specs, .. } = resolve_reduce_specs(partition, aggs, &frame)?;
+    let group = resolve_reduce_specs(partition, aggs, &frame)?.agg;
     crate::tail::reject_order_key_count(order.len())?;
     let keys = order
         .iter()
@@ -47,19 +47,19 @@ pub(super) fn lower_ordered(chain: &mut ViewChain, rel: &RelExpr) -> Result<Emit
         })
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
 
+    // The columns the operator adds behind its input's.
+    let tail = rel.cols()[in_cols.len()..].iter().map(HirCol::slot).collect();
+    let out = keyed_frame(&frame, &group.group_cols, 0..frame.schema.columns().len() as u32, tail)?;
     // The operator, and whether a partition — the key — holds more than one row.
     let pk_repeats = match op {
         OrderedOp::TopN { limit, offset } => {
-            cb.top_n(node, &group, &keys, *limit, *offset);
+            cb.top_n(node, &group.group_cols, &keys, *limit, *offset);
             *limit > 1
         }
         OrderedOp::Window { rank, dense_rank, .. } => {
-            cb.window(node, &group, &keys, &specs, (rank.is_some(), dense_rank.is_some()));
+            cb.window(node, group, &keys, (rank.is_some(), dense_rank.is_some()));
             true
         }
     };
-    // The columns the operator adds behind its input's.
-    let tail = rel.cols()[in_cols.len()..].iter().map(HirCol::slot).collect();
-    let out = keyed_frame(&frame, &group, 0..frame.schema.columns().len() as u32, tail)?;
     Ok(EmitPieces { circuit: cb, out, pk_repeats })
 }

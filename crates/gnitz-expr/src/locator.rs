@@ -94,11 +94,21 @@ impl ColumnLocator {
         }
     }
 
+    /// A STRING/BLOB column's 16-byte cell in `row`. STRING and BLOB are never
+    /// PK columns, so the column is a payload one.
+    #[inline(always)]
+    pub fn german_cell<'b>(&self, mb: &'b impl RowSource, row: usize) -> &'b [u8; 16] {
+        match *self {
+            ColumnLocator::Payload { slot, .. } => mb.german_cell(row, slot as usize),
+            ColumnLocator::Pk { .. } => unreachable!("a STRING/BLOB column is never a PK column"),
+        }
+    }
+
     /// A STRING/BLOB column's content in `row`, resolved through the source's
     /// heap.
     #[inline(always)]
     pub fn content<'b>(&self, mb: &'b impl RowSource, row: usize) -> std::borrow::Cow<'b, [u8]> {
-        gnitz_wire::german_string_bytes(self.bytes(mb, row), mb.heap())
+        gnitz_wire::german_string_bytes(self.german_cell(mb, row), mb.heap())
     }
 
     /// Native little-endian value bytes of the column in `row`; a PK column is
@@ -138,13 +148,7 @@ impl ColumnLocator {
         match *self {
             ColumnLocator::Pk { .. } => self.bytes(a, ra).cmp(self.bytes(b, rb)),
             ColumnLocator::Payload { type_code, .. } if type_code.is_german_string() => {
-                let cell = |s: &[u8]| -> [u8; 16] { s.try_into().unwrap() };
-                gnitz_wire::compare_german_strings(
-                    &cell(self.bytes(a, ra)),
-                    a.heap(),
-                    &cell(self.bytes(b, rb)),
-                    b.heap(),
-                )
+                gnitz_wire::compare_german_strings(self.german_cell(a, ra), a.heap(), self.german_cell(b, rb), b.heap())
             }
             ColumnLocator::Payload { type_code, .. } => {
                 gnitz_wire::cmp_col_window(self.bytes(a, ra), self.bytes(b, rb), type_code)
@@ -160,14 +164,9 @@ impl ColumnLocator {
         let cell = self.bytes(mb, row);
         match *self {
             ColumnLocator::Pk { .. } => gnitz_wire::widen_pk_be(cell),
-            ColumnLocator::Payload { size, type_code, .. } => {
-                let signed = type_code.is_signed_int();
-                if size == 16 {
-                    u128::from_le_bytes(cell.try_into().unwrap()) ^ ((signed as u128) << 127)
-                } else {
-                    (gnitz_wire::read_unsigned_exact(cell) ^ ((signed as u64) << (size * 8 - 1))) as u128
-                }
-            }
+            ColumnLocator::Payload { size, type_code, .. } => gnitz_wire::by_cell_width!(size, |T| {
+                gnitz_wire::native_key_image::<{ size_of::<T>() }>(cell.try_into().unwrap(), type_code.is_signed_int())
+            }),
         }
     }
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::outside;
+use crate::{AggDescriptor, AggFunc};
 
 /// One node per opcode, exhaustive with no wildcard, so a new `Opcode` variant
 /// cannot reach the wire without a round-trip. Each sample carries a non-empty
@@ -65,9 +66,11 @@ fn sample(op: Opcode) -> OpNode {
             offset: 5,
         },
         Opcode::Window => OpNode::Window {
-            group_cols: vec![1, 4],
+            group: GroupAggs {
+                group_cols: vec![1, 4],
+                aggs: vec![AggDescriptor { col_idx: 2, agg_op: AggFunc::Max }],
+            },
             order: vec![crate::OrderKey { col: 3, desc: true, nulls_first: true }],
-            aggs: vec![AggDescriptor { col_idx: 2, agg_op: AggFunc::Max }],
             rank: true,
             dense_rank: false,
         },
@@ -210,7 +213,7 @@ fn each_opcode_cell_refuses_every_perturbation() {
 #[test]
 fn the_cell_layout_is_pinned_to_its_version() {
     let cells: Vec<u8> = Opcode::ALL.iter().flat_map(|&op| wired(sample(op)).encode()).collect();
-    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (13, 0xd27c_8648_462b_474a));
+    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (14, 0xbc8b_cf4e_e566_97e1));
 }
 
 /// Every framing guard, against the forgery that trips it.
@@ -409,74 +412,16 @@ fn sources_are_the_scans_sources() {
 fn the_reduce_builders_differ_in_the_exchange() {
     let mut c = Circuit::default();
     let input = c.input_delta(7, crate::ReadBound::None);
-    let aggs = [AggDescriptor::COUNT_STAR];
-    let global = c.reduce(input, &[], &aggs);
-    let grouped = c.reduce(input, &[1], &aggs);
-    let local = c.reduce_local(input, &[], &aggs);
+    let agg = |group_cols| GroupAggs {
+        group_cols,
+        aggs: vec![AggDescriptor::COUNT_STAR],
+    };
+    let global = c.reduce(input, agg(vec![]));
+    let grouped = c.reduce(input, agg(vec![1]));
+    let local = c.reduce_local(input, agg(vec![]));
     assert_eq!(
         [global, grouped, local].map(|id| c.owes_ground_row(id)),
         [true, false, false]
     );
     assert_eq!(c.op(c.inputs(grouped)[0]), &OpNode::ExchangeShard);
-}
-
-/// COUNT is always I64, and MIN/MAX select an existing row, so they keep the
-/// source type. A SUM needs a scalar register, and a calendar value does not add.
-#[test]
-fn output_type_is_count_i64_min_max_identity_and_sum_widening() {
-    use TypeCode::*;
-    for &tc in TypeCode::ALL {
-        assert_eq!(AggFunc::Count.output_type(tc), Some(I64), "{tc}");
-        assert_eq!(AggFunc::Min.output_type(tc), Some(tc), "{tc}");
-        assert_eq!(AggFunc::Max.output_type(tc), Some(tc), "{tc}");
-    }
-    for (src, want) in [
-        (F64, Some(F64)),
-        (I32, Some(I64)),
-        (F32, Some(F64)),
-        // The i64 accumulator's bit pattern is the correct unsigned sum, so a
-        // downstream unsigned compare re-seeds right.
-        (U64, Some(U64)),
-        (Decimal, Some(Decimal)),
-        (Bool, None),
-        (String, None),
-        (Blob, None),
-        (U128, None),
-        (Date, None),
-        (Timestamp, None),
-    ] {
-        assert_eq!(AggFunc::Sum.output_type(src), want, "SUM over {src}");
-    }
-}
-
-/// A partial's merge aggregate keeps the partial's type.
-#[test]
-fn agg_merge_preserves_output_type() {
-    for &f in AggFunc::ALL {
-        let merge = f.merge_op();
-        for &tc in TypeCode::ALL {
-            let Some(out) = f.output_type(tc) else {
-                continue;
-            };
-            assert_eq!(merge.output_type(out), Some(out), "{f:?} over {tc:?}");
-        }
-    }
-}
-
-/// COUNT and SUM never render NULL; MIN/MAX do over a nullable source or with no group.
-#[test]
-fn raw_output_nullable_matches_emit_semantics() {
-    for f in [AggFunc::Count, AggFunc::CountNonNull, AggFunc::Sum] {
-        for src_nullable in [false, true] {
-            for ungrouped in [false, true] {
-                assert!(!f.raw_output_nullable(src_nullable, ungrouped), "{f:?}");
-            }
-        }
-    }
-    for f in [AggFunc::Min, AggFunc::Max] {
-        assert!(!f.raw_output_nullable(false, false), "{f:?} grouped, non-nullable");
-        assert!(f.raw_output_nullable(true, false), "{f:?} grouped, nullable");
-        assert!(f.raw_output_nullable(false, true), "{f:?} global, non-nullable");
-        assert!(f.raw_output_nullable(true, true), "{f:?} global, nullable");
-    }
 }

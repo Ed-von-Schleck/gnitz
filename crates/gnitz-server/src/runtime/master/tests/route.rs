@@ -212,8 +212,12 @@ fn registry(schema: SchemaDescriptor, placement: Placement) -> RelationRegistry 
 
 /// `keys` of `stride`-byte big-endian ids, as a `PkSet` bound.
 fn pk_set(stride: usize, keys: &[u64]) -> ReadBound {
+    ReadBound::PkSet(pk_keys(stride, keys))
+}
+
+fn pk_keys(stride: usize, keys: &[u64]) -> PkKeys {
     let keys: Vec<Vec<u8>> = keys.iter().map(|k| k.to_be_bytes()[8 - stride..].to_vec()).collect();
-    ReadBound::PkSet(PkKeys::from_keys(stride, keys.iter().map(Vec::as_slice)))
+    PkKeys::from_keys(stride, keys.iter().map(Vec::as_slice))
 }
 
 /// A read reaches exactly the workers its bound names: a replicated relation's
@@ -303,7 +307,7 @@ fn a_probe_routes_by_the_store_it_reads() {
     let full = Placement::full_pk(&schema);
     let owner = |k: u64| full.owner(&k.to_be_bytes(), NW).unwrap();
     let b = (1..).find(|&k| owner(k) != owner(0)).expect("keys spread");
-    let keys = pk_set(8, &[0, b]).encode();
+    let keys = pk_keys(8, &[0, b]).encode_probe();
     let probe = |probe| Read::HasPk { tid: 16, probe, keys: (&keys[..]).into() };
     let index = Probe::Index(PkColList::from_slice(&[1]), NonZeroU64::MAX);
 

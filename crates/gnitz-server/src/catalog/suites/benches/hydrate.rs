@@ -59,7 +59,7 @@ fn sweep(engine: &mut CatalogEngine) {
 fn point(engine: &CatalogEngine, view: u64, key: u64) -> ReadSpec {
     let schema = engine.registry.relation(view).map(Relation::schema).unwrap();
     let pk = PkColList::from_slice(schema.pk_cols());
-    ReadSpec::all_rows(ReadBound::Range(KeyRange::point(pk, &[], key as u128)))
+    ReadSpec::all_rows(ReadBound::Range(KeyRange::point(pk, &[key as u128])))
 }
 
 /// The engine's own hydrator, counting the rows it recomputes.

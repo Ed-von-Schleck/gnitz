@@ -2,6 +2,10 @@
 //! read bounds-checked. Reader errors are bare; [`decode_all`] labels a format's
 //! errors once, at its entry point.
 
+/// The longest list a [`Writer::count`] states without saturating, so a reader
+/// capping at it still refuses one longer.
+pub const MAX_LIST_LEN: usize = u16::MAX as usize - 1;
+
 /// A little-endian forward writer — the inverse of [`Reader`].
 #[derive(Default)]
 pub struct Writer(Vec<u8>);
@@ -56,8 +60,8 @@ impl Writer {
         self
     }
 
-    /// A list's length. One too long to count saturates, which every reader's cap
-    /// refuses.
+    /// A list's length. One longer than [`MAX_LIST_LEN`] saturates, which every
+    /// reader's cap refuses.
     pub fn count(&mut self, n: usize) -> &mut Self {
         self.u16(u16::try_from(n).unwrap_or(u16::MAX))
     }
@@ -119,7 +123,7 @@ impl Wire for String {
         w.bytes32(self.as_bytes());
     }
     fn read(r: &mut Reader) -> Result<Self, String> {
-        String::from_utf8(r.bytes32()?.to_vec()).map_err(|_| "text is not UTF-8".to_string())
+        r.str32().map(str::to_owned)
     }
 }
 
@@ -190,6 +194,7 @@ impl<'a> Reader<'a> {
     pub fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.int()?))
     }
+    #[inline]
     pub fn u128(&mut self) -> Result<u128, String> {
         Ok(u128::from_le_bytes(self.int()?))
     }
@@ -225,14 +230,19 @@ impl<'a> Reader<'a> {
         Ok(content)
     }
 
+    /// A [`Self::bytes32`] section that is UTF-8 text.
+    pub fn str32(&mut self) -> Result<&'a str, String> {
+        std::str::from_utf8(self.bytes32()?).map_err(|_| "text is not UTF-8".to_string())
+    }
+
     pub fn get<T: Wire>(&mut self) -> Result<T, String> {
         T::read(self)
     }
 
     /// [`Writer::count`]'s inverse, refusing a length past `cap` before anything is
     /// sized off it.
-    pub fn count(&mut self, what: &str, cap: usize) -> Result<usize, String> {
-        debug_assert!(cap < u16::MAX as usize, "a saturated count must stay refusable");
+    fn count(&mut self, what: &str, cap: usize) -> Result<usize, String> {
+        debug_assert!(cap <= MAX_LIST_LEN, "a saturated count must stay refusable");
         let n = self.u16()? as usize;
         if n > cap {
             return Err(format!("{what}: {n} entries exceeds cap {cap}"));
@@ -240,8 +250,14 @@ impl<'a> Reader<'a> {
         Ok(n)
     }
 
-    /// A counted list of at most `cap` items — the inverse of [`Writer::list`].
-    pub fn list<T: Wire>(&mut self, what: &str, cap: usize) -> Result<Vec<T>, String> {
+    /// A counted list of at most `cap` items, each read by `item`: the inverse of
+    /// a [`Writer::count`] and that many items.
+    pub fn items<T>(
+        &mut self,
+        what: &str,
+        cap: usize,
+        mut item: impl FnMut(&mut Self) -> Result<T, String>,
+    ) -> Result<Vec<T>, String> {
         let n = self.count(what, cap)?;
         #[cfg(feature = "field-map")]
         let (count, mut spans) = (self.off - 2, Vec::with_capacity(n));
@@ -250,13 +266,18 @@ impl<'a> Reader<'a> {
         for _ in 0..n {
             #[cfg(feature = "field-map")]
             let start = self.off - count;
-            items.push(T::read(self)?);
+            items.push(item(self)?);
             #[cfg(feature = "field-map")]
             spans.push(start..self.off - count);
         }
         #[cfg(feature = "field-map")]
         crate::fields::note_list(&self.buf[count..count + 2], &spans);
         Ok(items)
+    }
+
+    /// A counted list of at most `cap` items — the inverse of [`Writer::list`].
+    pub fn list<T: Wire>(&mut self, what: &str, cap: usize) -> Result<Vec<T>, String> {
+        self.items(what, cap, T::read)
     }
 
     /// Bytes consumed so far.

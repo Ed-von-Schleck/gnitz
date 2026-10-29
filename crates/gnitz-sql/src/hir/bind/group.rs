@@ -66,7 +66,7 @@ impl<'a> PreMap<'a> {
         // Hidden because only the expression that minted it may reach it.
         let out = HirCol::new(
             self.ids.next(),
-            ColumnDef::typed(format!("_pre{}", self.extra.len()), ty, nullable).hidden(),
+            ColumnDef::new(format!("_pre{}", self.extra.len()), ty, nullable).hidden(),
         );
         let id = out.id;
         self.env.push(out.clone());

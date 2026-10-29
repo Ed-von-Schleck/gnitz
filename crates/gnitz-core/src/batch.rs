@@ -116,7 +116,7 @@ impl PkColumn {
     /// one is read as bytes.
     pub fn get(&self, i: usize) -> u128 {
         assert_eq!(self.n, 1, "PkColumn::get: a compound key has no scalar form");
-        gnitz_wire::key_image(self.types[0], gnitz_wire::widen_pk_be(self.get_bytes(i)))
+        gnitz_wire::decode_opk_u128(self.get_bytes(i), self.types[0])
     }
 
     /// Borrow row `i`'s `stride` OPK bytes.

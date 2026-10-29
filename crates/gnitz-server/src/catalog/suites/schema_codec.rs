@@ -104,7 +104,11 @@ fn a_client_bundle_decodes_to_the_rows_it_wrote() {
             schema_id: 7,
             name: "a_long_table_name_past_twelve".into(),
             pk_col_idx: gnitz_wire::PkColList::from_slice(&[1, 3]),
-            flags: 5,
+            flags: gnitz_wire::TableProps {
+                serial: true,
+                distribution: gnitz_wire::TableDistribution::Replicated,
+                ..Default::default()
+            },
         },
         -1,
     )];

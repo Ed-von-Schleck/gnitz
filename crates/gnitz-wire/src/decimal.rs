@@ -5,10 +5,14 @@
 /// The largest scale a column may declare: `i64` holds 18 full decimal digits.
 pub const MAX_DECIMAL_SCALE: u8 = 18;
 
+/// The most fractional digits a decimal text may spell: `i128` holds 38 full
+/// decimal digits.
+pub const MAX_DECIMAL_TEXT_SCALE: u8 = 38;
+
 /// The digits and scale a plain decimal spelling carries — an optional sign,
 /// digits, an optional fraction — as `(unscaled, scale)`. `None` for anything
-/// else, an exponent included, for a value past `i128`, and for more than 38
-/// fractional digits.
+/// else, an exponent included, for a value past `i128`, and for more than
+/// [`MAX_DECIMAL_TEXT_SCALE`] fractional digits.
 pub fn parse_decimal_text(s: &str) -> Option<(i128, u8)> {
     let (neg, body) = match s.as_bytes().first()? {
         b'-' => (true, &s[1..]),
@@ -16,7 +20,7 @@ pub fn parse_decimal_text(s: &str) -> Option<(i128, u8)> {
         _ => (false, s),
     };
     let (int, frac) = body.split_once('.').unwrap_or((body, ""));
-    if int.is_empty() && frac.is_empty() || frac.len() > 38 {
+    if int.is_empty() && frac.is_empty() || frac.len() > MAX_DECIMAL_TEXT_SCALE as usize {
         return None;
     }
     let mut v: i128 = 0;

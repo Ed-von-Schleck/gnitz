@@ -6,7 +6,7 @@ use crate::test_support::{
     col_def, cols_of, make_batch, make_schema_u64_i64, push_and_tick, register_identity_view, scan_all, scan_keyed,
     scratch_dir, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, EchoDrive, RowKey,
 };
-use gnitz_wire::{AggDescriptor, Circuit, ReadBound, TypeCode};
+use gnitz_wire::{AggDescriptor, Circuit, GroupAggs, ReadBound, TypeCode};
 use gnitz_zset::stream::ReducePlan;
 use std::collections::HashMap;
 
@@ -72,7 +72,7 @@ pub(super) fn register_count(engine: &mut CatalogEngine, source: u64, name: &str
     let plan = ReducePlan::from_wire(&make_schema_u64_i64(), &[], &aggs, true).unwrap();
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(source, ReadBound::None);
-    circuit.reduce(scan, &[], &aggs);
+    circuit.reduce(scan, GroupAggs { group_cols: vec![], aggs: aggs.to_vec() });
     let view = try_register_view(engine, circuit, name, &cols_of(plan.output_schema()), 0, 0).unwrap();
     (view, plan)
 }

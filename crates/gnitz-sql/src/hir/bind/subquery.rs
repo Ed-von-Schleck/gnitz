@@ -358,7 +358,7 @@ fn scalar_leaf(
     let ty = crate::agg::agg_view_type(func, agg.out.col.def.ty);
     // A companion carries the null-ness; otherwise the raw column's own.
     let nullable = agg.companion.is_some() || agg.out.col.def.is_nullable;
-    let value = HirCol::new(ids.next(), ColumnDef::typed("_agg", ty, nullable).hidden());
+    let value = HirCol::new(ids.next(), ColumnDef::new("_agg", ty, nullable).hidden());
     let mut items = ProjEntry::passthroughs(group_cols.iter().map(|&id| hircol_of(inner_cols, id).clone()));
     items.push(ProjEntry { expr: agg.finalize(), out: value.clone() });
     Ok(SubqueryRef {

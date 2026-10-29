@@ -25,7 +25,7 @@ fn typed() -> Schema {
         ("q", dec(3)),
     ];
     let mut columns = vec![col("pk", U64)];
-    columns.extend(payload.map(|(n, ty)| ColumnDef::typed(n, ty, true)));
+    columns.extend(payload.map(|(n, ty)| ColumnDef::new(n, ty, true)));
     schema(columns, &[0])
 }
 
@@ -180,7 +180,7 @@ fn never_null_follows_the_kernels_that_make_a_null() {
             col("ts", TypeCode::Timestamp),
             ncol("nts", TypeCode::Timestamp),
             ncol("nu", TypeCode::U64),
-            ColumnDef::typed("p", ColType::decimal(2), false),
+            ColumnDef::new("p", ColType::decimal(2), false),
         ],
         &[0],
     );

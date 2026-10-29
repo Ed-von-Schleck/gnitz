@@ -137,15 +137,21 @@ fn the_encoded_bytes_are_pinned() {
     assert_eq!(fold.encode(), want);
 }
 
-/// A bound encoded alone decodes to itself; trailing bytes are refused.
+/// A probe's keys decode to themselves and route as a `PkSet` bound; trailing
+/// bytes, an empty blob and any other bound are refused.
 #[test]
-fn a_read_bound_round_trips_alone() {
-    for bound in [ReadBound::None, ReadBound::PkSet(keys(8))] {
-        let blob = bound.encode();
-        assert_eq!(ReadBound::decode(&blob), Ok(bound));
-        assert!(ReadBound::decode(&[blob, vec![0]].concat()).is_err());
-    }
-    assert!(ReadBound::decode(&[]).is_err());
+fn a_pk_probe_round_trips() {
+    let keys = keys(8);
+    let blob = keys.encode_probe();
+    let mut bound = Writer::new();
+    bound.put(&ReadBound::PkSet(keys.clone()));
+    assert_eq!(blob, bound.into_vec(), "a probe is a PkSet bound's bytes");
+    assert_eq!(PkKeys::decode_probe(&blob), Ok(keys));
+    assert!(PkKeys::decode_probe(&[blob, vec![0]].concat()).is_err());
+    assert!(PkKeys::decode_probe(&[]).is_err());
+    assert!(PkKeys::decode_probe(&[BoundTag::None.as_wire()])
+        .unwrap_err()
+        .contains("PkSet"));
 }
 
 /// A list longer than any 16-bit count round-trips whole: the frame is the only

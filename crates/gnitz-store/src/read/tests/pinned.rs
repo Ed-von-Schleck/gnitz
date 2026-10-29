@@ -3,13 +3,14 @@ use crate::relation::RelationKind;
 use crate::test_support::{
     make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, relation_fixture_with, spilling, TID,
 };
+use gnitz_wire::PkBuf;
 
 /// A page of `limit` rows after `after`, in `make_schema_u64_i64`'s layout.
 fn page(limit: u64, after: Option<&[u8]>) -> PageRequest {
     PageRequest {
         layout: make_schema_u64_i64().layout_digest(),
         limit,
-        after: vec![after.map(<[u8]>::to_vec)],
+        after: vec![after.map(PkBuf::from_bytes)],
     }
 }
 
@@ -76,7 +77,7 @@ fn a_store_reads_its_share_after_its_own_cursor() {
     let schema = make_schema_u64_i64();
     let at_10 = opk_pk(&schema, &[10]);
     let req = PageRequest {
-        after: vec![None, Some(at_10)],
+        after: vec![None, Some(PkBuf::from_bytes(&at_10))],
         ..page(14, None)
     };
     assert_eq!(

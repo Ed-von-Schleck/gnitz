@@ -1,6 +1,6 @@
 //! The relation-descriptor blob a RESOLVE reply carries beside the schema block.
 
-use crate::codec::{decode_all, Reader, Wire, Writer};
+use crate::codec::{decode_all, Reader, Wire, Writer, MAX_LIST_LEN};
 use crate::{PkColList, ViewBudget};
 
 wire_enum! {
@@ -72,11 +72,6 @@ impl Wire for RelIndex {
     }
 }
 
-/// The most indexes a descriptor carries: a count the `u16` list header holds
-/// without saturating, so a relation past it is refused on decode rather than
-/// truncated.
-const MAX_DESCRIPTOR_INDEXES: usize = u16::MAX as usize - 1;
-
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct RelDescriptorBlob {
     pub class: RelClass,
@@ -102,7 +97,7 @@ impl RelDescriptorBlob {
             let class = r.get()?;
             let pk_repeats = r.bool()?;
             let serial = r.bool()?;
-            let indexes = r.list("index list", MAX_DESCRIPTOR_INDEXES)?;
+            let indexes = r.list("index list", MAX_LIST_LEN)?;
             Ok(RelDescriptorBlob { class, pk_repeats, serial, indexes })
         })
     }

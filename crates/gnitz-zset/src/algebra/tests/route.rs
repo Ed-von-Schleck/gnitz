@@ -195,6 +195,6 @@ fn pk_range_and_confinement_follow_key_membership() {
     }
 
     // A range over a column that does not lead the PK walks an index or a scan.
-    let off_pk = KeyRange::point(PkColList::from_slice(&[1]), &[], 7);
+    let off_pk = KeyRange::point(PkColList::from_slice(&[1]), &[7]);
     assert_eq!(placed[0].confined_worker(&s, &off_pk, NW), None);
 }

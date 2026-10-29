@@ -676,7 +676,7 @@ fn bind_scalar_item<L: ItemLeaf>(
     let name = alias
         .or(src_name)
         .unwrap_or_else(|| format!("_{}{idx}", stem.as_deref().unwrap_or("expr")));
-    let def = ColumnDef::typed(name, ty, nullable);
+    let def = ColumnDef::new(name, ty, nullable);
     Ok(ProjEntry {
         expr: bound,
         out: HirCol::new(ids.next(), def),

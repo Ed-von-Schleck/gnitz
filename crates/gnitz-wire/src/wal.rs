@@ -106,18 +106,22 @@ pub struct ParsedBlock<'a> {
 }
 
 /// Validate a block whose rows are `row_width` bytes of fixed regions each,
-/// and split it into its parts. A block holds at least one row: an empty delta
-/// ships no block.
+/// and split it into its parts. `block` is exactly one block: its declared size
+/// is its length. A block holds at least one row: an empty delta ships no block.
 pub fn parse_block(block: &[u8], row_width: usize) -> Result<ParsedBlock<'_>, &'static str> {
-    let block = block_slice(block)?;
+    if block.len() < WAL_HEADER_SIZE {
+        return Err("block shorter than header");
+    }
     let mut r = Reader::new(block);
-    // The header's words in layout order; `block_slice` has seen it whole.
-    let [_, version, rows, heap_len, heap_dead] = [(); 5].map(|()| r.u32().expect("a whole header") as usize);
+    // The header's words in layout order; the length check has seen it whole.
+    let [size, version, rows, heap_len, heap_dead] = [(); 5].map(|()| r.u32().expect("a whole header") as usize);
     debug_assert_eq!(r.pos(), WAL_HEADER_SIZE);
+    if size != block.len() {
+        return Err("declared size is not the block's length");
+    }
     if version as u32 != WIRE_VERSION {
         return Err("unknown block version");
     }
-    let size = block.len();
     if rows == 0 {
         return Err("block holds no rows");
     }

@@ -139,7 +139,7 @@ fn rank_rows<S: RowSource>(key: &OrderLocator, src: &S, rows: impl Iterator<Item
         }),
         Some(kind) => fill(key, src, rows, out, |r| order_bits(&loc, src, r, kind)),
         None if tc.is_german_string() => fill(key, src, rows, out, |r| {
-            gnitz_wire::german_string_lead(loc.bytes(src, r), src.heap())
+            gnitz_wire::german_string_lead(loc.german_cell(src, r), src.heap())
         }),
         // A 16-byte integer's high half.
         None => fill(key, src, rows, out, |r| (loc.opk_image(src, r) >> 64) as u64),

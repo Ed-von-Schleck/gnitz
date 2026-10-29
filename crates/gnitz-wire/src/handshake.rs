@@ -9,7 +9,7 @@ use crate::SYS_SCHEMA_DIGEST;
 
 /// Bumped by hand for any change to a payload client and engine both decode,
 /// the block layout included.
-const WIRE_EPOCH: u32 = 35;
+const WIRE_EPOCH: u32 = 36;
 
 /// The wire version: every data block's version word, the HELLO's, and a frame
 /// recording's. [`SYS_SCHEMA_DIGEST`] folds in, so a system-family shape change

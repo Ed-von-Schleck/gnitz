@@ -156,7 +156,7 @@ pub(crate) fn typed_schema<T: Into<ColType> + Copy>(tys: &[T]) -> Schema {
     columns.extend(
         tys.iter()
             .enumerate()
-            .map(|(i, &ty)| ColumnDef::typed(format!("c{}", i + 1), ty.into(), true)),
+            .map(|(i, &ty)| ColumnDef::new(format!("c{}", i + 1), ty, true)),
     );
     schema(columns, &[0])
 }
@@ -317,7 +317,7 @@ pub(crate) fn rows_of<'a>(schema: &Schema, b: &'a ZSetBatch) -> Vec<(Vec<Cell<'a
         if loc.is_null(b, r) {
             Cell::Null
         } else if tc.is_german_string() {
-            let cell = b.get_col_ptr(r, pi, 16);
+            let cell = b.german_cell(r, pi);
             Cell::Str(
                 std::str::from_utf8(gnitz_wire::german_string_content(cell, gnitz_expr::BatchView::blob(b))).unwrap(),
             )

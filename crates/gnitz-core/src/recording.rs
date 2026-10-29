@@ -27,11 +27,12 @@ pub const EXT: &str = "frames";
 
 const MAGIC: &[u8; 4] = b"GNZR";
 
-/// Which way a recorded frame went.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Direction {
-    Sent = 0,
-    Received = 1,
+gnitz_wire::wire_enum! {
+    /// Which way a recorded frame went.
+    pub enum Direction: u8 {
+        Sent = 0,
+        Received = 1,
+    }
 }
 
 /// One recorded frame.
@@ -45,7 +46,7 @@ pub struct Recorded<'a> {
 
 impl Recorded<'_> {
     fn write(&self, w: &mut Writer) {
-        w.u8(self.dir as u8).u32(self.conn).bytes32(self.frame);
+        w.put(&self.dir).u32(self.conn).bytes32(self.frame);
     }
 }
 
@@ -71,13 +72,12 @@ pub fn read(bytes: &[u8]) -> Result<Vec<Recorded<'_>>, String> {
     }
     let mut out = Vec::new();
     while r.remaining() > 0 {
-        let mut record = || {
-            let dir = match r.u8()? {
-                0 => Direction::Sent,
-                1 => Direction::Received,
-                d => return Err(format!("names direction {d}")),
-            };
-            Ok(Recorded { dir, conn: r.u32()?, frame: r.bytes32()? })
+        let mut record = || -> Result<_, String> {
+            Ok(Recorded {
+                dir: r.get()?,
+                conn: r.u32()?,
+                frame: r.bytes32()?,
+            })
         };
         let record = record().map_err(|e| format!("record {}: {e}", out.len()))?;
         out.push(record);

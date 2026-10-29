@@ -2,7 +2,7 @@
 
 use crate::{
     decode_schema_block, encode_schema_block, ColumnLocator, ReduceOutKey, ReduceOutSlot, SchemaColumn,
-    SchemaDescriptor,
+    SchemaDescriptor, SchemaRefusal,
 };
 use gnitz_wire::schema_block::SchemaBlockCol;
 use gnitz_wire::{ColType, TypeCode, MAX_COLUMNS};
@@ -258,6 +258,16 @@ fn admission_refuses_what_the_constructor_aborts_on() {
         assert!(decode_schema_block(&record).is_err(), "decode: {what}");
     }
     assert!(SchemaDescriptor::try_new(&[k, k], &[1, 0]).is_ok());
+}
+
+/// `try_new` refuses a list past `MAX_COLUMNS` by its whole length.
+#[test]
+fn try_new_refuses_a_list_past_max_columns_by_its_length() {
+    let cols = vec![SchemaColumn::new(TypeCode::U64, false); MAX_COLUMNS + 2];
+    assert_eq!(
+        SchemaDescriptor::try_new(&cols, &[0]),
+        Err(SchemaRefusal::TooManyColumns(MAX_COLUMNS + 2))
+    );
 }
 
 /// A schema record's arity prefix carries no redundancy of its own, so every

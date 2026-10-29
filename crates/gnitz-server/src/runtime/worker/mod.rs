@@ -16,7 +16,7 @@ use crate::runtime::w2m::{W2mWriter, NO_REPLY_REQUEST_ID};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::{IndexClaim, RelationKind, RelationRegistry};
 use gnitz_wire::TypeCode;
-use gnitz_wire::{ReadBound, WireFault};
+use gnitz_wire::{PkKeys, WireFault};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -197,9 +197,7 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
     // would be copied at the width of the widest one.
     match *read {
         Read::HasPk { tid, probe, ref keys } => {
-            let ReadBound::PkSet(keys) = ReadBound::decode(keys)? else {
-                return Err("has_pk: a probe carries a PkSet".into());
-            };
+            let keys = PkKeys::decode_probe(keys)?;
             Ok(Rows::Own(cat.registry.probe(tid, probe, keys)?))
         }
         Read::ScanSpec { tid, reply_layout, ref spec } => Ok(Rows::Shared(cat.scan_spec(

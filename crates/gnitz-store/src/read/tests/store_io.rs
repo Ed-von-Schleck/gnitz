@@ -61,7 +61,7 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
     // chunk end on the base's last PK group — exhausting the base cursor — and every
     // later chunk's first probe sorts below it: a backward re-seek.
     let anti = |id: u64| (NBASE - id) as i64 * 10;
-    let point = ReadBound::Range(KeyRange::point(PkColList::from_slice(&[1]), &[], img(730)));
+    let point = ReadBound::Range(KeyRange::point(PkColList::from_slice(&[1]), &[img(730)]));
     let inverted = col_range(1, img(901), img(299));
     // (val_of, indexed, bound, walks the index, ids).
     let x10: fn(u64) -> i64 = x10;
@@ -365,7 +365,7 @@ fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
     }
     let r = relation_fixture(RelationKind::BaseTable, schema, &[&[0]], [bb.finish()]);
 
-    let range = KeyRange::point(PkColList::from_slice(&[0]), &[], 5);
+    let range = KeyRange::point(PkColList::from_slice(&[0]), &[5]);
     let (mut cur, unapplied) = r
         .relation(TID)
         .unwrap()

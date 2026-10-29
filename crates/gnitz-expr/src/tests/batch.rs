@@ -608,10 +608,11 @@ fn every_string_column_addresses_its_own_region_in_place() {
     evaluator.eval_morsels(&view, 0, 1, |_, _| {});
     let lanes = &evaluator.scratch.str_views;
     for (c, val) in vals.iter().enumerate() {
-        let want = match gnitz_wire::german_string_inline(crate::BatchView::col_data(&view, c, 16)) {
-            Some(_) => super::SRC_COL_BASE + c as u32,
-            None => super::SRC_BLOB,
-        };
+        let want =
+            match gnitz_wire::german_string_inline(crate::BatchView::col_data(&view, c, 16).first_chunk().unwrap()) {
+                Some(_) => super::SRC_COL_BASE + c as u32,
+                None => super::SRC_BLOB,
+            };
         assert_eq!(
             lanes[c][0].src,
             want,

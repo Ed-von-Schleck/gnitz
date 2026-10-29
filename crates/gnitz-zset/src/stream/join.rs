@@ -10,8 +10,8 @@
 use std::cmp::Ordering;
 
 use crate::repr::{
-    copy_runs, pk_group_end, relocate_german_string_vec, runs_where, should_relocate_blob, width_dispatch, Batch,
-    CursorRow, ReadCursor,
+    copy_runs, pk_group_end, relocated_cell, runs_where, should_relocate_blob, width_dispatch, Batch, CursorRow,
+    ReadCursor,
 };
 use crate::schema::key::{band, compare_pk_ordering, group_floor, key_above};
 use crate::schema::{DerivedSchema, SchemaDescriptor};
@@ -432,8 +432,8 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
                     let mut cells = dst.as_chunks_mut::<16>().0.iter_mut();
                     for p in pairs {
                         let (t_src, t_row) = trace_row(p);
-                        let cell = relocate_german_string_vec(
-                            t_src.get_col_ptr(t_row, pi as usize, 16),
+                        let cell = relocated_cell(
+                            t_src.german_cell(t_row, pi as usize),
                             t_src.heap(),
                             dst_blob,
                             cache.as_deref_mut(),

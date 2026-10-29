@@ -12,7 +12,7 @@ use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::wal;
-use gnitz_wire::{Regions, TypeCode};
+use gnitz_wire::{Regions, RowSource, TypeCode};
 
 /// One or more rows of a batch as one WAL block: which rows, and the heap
 /// bytes the block holds for them. Its size and its bytes are read off the
@@ -159,7 +159,7 @@ impl Batch {
     /// `slots`: the spans a relocation of the row copies.
     fn long_spans(&self, row: usize, slots: u64) -> impl Iterator<Item = Range<usize>> + '_ {
         gnitz_wire::BitIter(slots)
-            .filter_map(move |pi| gnitz_wire::german_string_heap(self.get_col_ptr(row, pi, 16), self.blob.len()))
+            .filter_map(move |pi| gnitz_wire::german_string_heap(self.german_cell(row, pi), self.blob.len()))
     }
 
     /// How many of `rows`, from the front, fit `budget` once the heap bytes they

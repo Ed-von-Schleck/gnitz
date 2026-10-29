@@ -12,7 +12,7 @@ const GROUP: usize = gnitz_core::DEFAULT_PAGE_ROWS as usize;
 fn table(ty: ColType, nullable: bool) -> Arc<Schema> {
     let cols = vec![
         ColumnDef::new("id", TypeCode::I64, false),
-        ColumnDef::typed("v".to_string(), ty, nullable),
+        ColumnDef::new("v".to_string(), ty, nullable),
     ];
     Arc::new(Schema::from_parts(cols, &[0]).unwrap())
 }

@@ -252,7 +252,7 @@ fn flat_reduce(
             }
             None => {
                 let def = &hircol_of(&in_cols, r).def;
-                let def = ColumnDef::typed(format!("_pre{computed}"), def.ty, def.is_nullable).hidden();
+                let def = ColumnDef::new(format!("_pre{computed}"), def.ty, def.is_nullable).hidden();
                 computed += 1;
                 pre.push(ProjEntry {
                     expr: e.clone(),

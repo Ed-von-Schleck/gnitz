@@ -609,17 +609,14 @@ fn extract_days(item: &Bound<'_, PyAny>, inexact: Inexact) -> PyResult<i32> {
 /// A TIMESTAMP value: a naive `datetime.datetime`, a `datetime.date` at
 /// midnight, or microseconds since the epoch as an int.
 fn extract_micros(item: &Bound<'_, PyAny>) -> PyResult<i64> {
-    use gnitz_wire::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MIN, MICROS_PER_SEC};
+    const FITS: &str = "a Python datetime's year 1..=9999 fits a TIMESTAMP";
     if let Ok(dt) = item.cast::<PyDateTime>() {
         refuse_aware(dt)?;
-        return Ok(py_days(dt) * MICROS_PER_DAY
-            + dt.get_hour() as i64 * MICROS_PER_HOUR
-            + dt.get_minute() as i64 * MICROS_PER_MIN
-            + dt.get_second() as i64 * MICROS_PER_SEC
-            + dt.get_microsecond() as i64);
+        let (h, mi, s, us) = (dt.get_hour(), dt.get_minute(), dt.get_second(), dt.get_microsecond());
+        return Ok(gnitz_wire::join_micros(py_days(dt), h.into(), mi.into(), s.into(), us).expect(FITS));
     }
     match item.cast::<PyDate>() {
-        Ok(d) => Ok(py_days(d) * MICROS_PER_DAY),
+        Ok(d) => Ok(gnitz_wire::join_micros(py_days(d), 0, 0, 0, 0).expect(FITS)),
         Err(_) => item.extract::<i64>(),
     }
 }

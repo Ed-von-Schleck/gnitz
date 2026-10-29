@@ -281,16 +281,10 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<DeltaReg, St
             Ok(push_ordered(ctx, nid, in_reg, "topnidx", plan))
         }
 
-        OpNode::Window {
-            group_cols,
-            order,
-            aggs,
-            rank,
-            dense_rank,
-        } => {
+        OpNode::Window { group, order, rank, dense_rank } => {
             let in_reg = ctx.unary_delta_in(nid);
             let in_schema = ctx.prog.schema_of(in_reg);
-            let plan = OrderedPlan::window(&in_schema, group_cols, order, aggs, *rank, *dense_rank)?;
+            let plan = OrderedPlan::window(&in_schema, &group.group_cols, order, &group.aggs, *rank, *dense_rank)?;
             Ok(push_ordered(ctx, nid, in_reg, "windowidx", plan))
         }
 

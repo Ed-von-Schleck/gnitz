@@ -6,7 +6,7 @@
 
 use crate::ir::BExpr;
 use gnitz_expr::CmpOp;
-use gnitz_wire::{parse_decimal_text, ColType, FixedInt, TypeCode, MICROS_PER_DAY};
+use gnitz_wire::{parse_decimal_text, ColType, FixedInt, TypeCode, MAX_DECIMAL_TEXT_SCALE, MICROS_PER_DAY};
 
 /// The text spellings of a BOOLEAN, PostgreSQL's: case and surrounding
 /// whitespace are ignored.
@@ -204,7 +204,7 @@ pub(crate) fn place<R>(lit: &BExpr<R>, ty: ColType) -> Option<Placed> {
 
 /// The decimal a SQL numeric literal spells, exponent included, as
 /// `(unscaled, scale)` at its smallest exact scale — `1.50` is `(15, 1)`.
-/// `None` past `i128` or 38 fractional digits.
+/// `None` past `i128` or [`MAX_DECIMAL_TEXT_SCALE`] fractional digits.
 pub(crate) fn decimal_of_number_text(s: &str) -> Option<(i128, u8)> {
     let (mantissa, exp) = match s.split_once(['e', 'E']) {
         Some((m, e)) => (m, e.parse::<i32>().ok()?),
@@ -220,7 +220,7 @@ pub(crate) fn decimal_of_number_text(s: &str) -> Option<(i128, u8)> {
         v /= 10;
         scale -= 1;
     }
-    Some((v, u8::try_from(scale).ok().filter(|s| *s <= 38)?))
+    Some((v, u8::try_from(scale).ok().filter(|s| *s <= MAX_DECIMAL_TEXT_SCALE)?))
 }
 
 #[cfg(test)]

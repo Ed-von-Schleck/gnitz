@@ -148,8 +148,7 @@ fn key_spans_encode_the_typed_order_of_their_columns() {
             );
             if let (Some(span), Some(vals)) = (span, want) {
                 let images: Vec<u128> = vals.iter().zip(&types).map(|(&v, &t)| key_image(t, v)).collect();
-                let (&last, eq) = images.split_last().unwrap();
-                let point = KeyRange::point(PkColList::from_slice(&span_cols), eq, last);
+                let point = KeyRange::point(PkColList::from_slice(&span_cols), &images);
                 let (start, _) = range_band(&span_schema, &point).expect("a point walk holds its key");
                 assert_eq!(span.pk_bytes(), start.pk_bytes(), "{s:?} {cols:?} row={row}");
                 spans.push((vals, span.pk_bytes().to_vec()));

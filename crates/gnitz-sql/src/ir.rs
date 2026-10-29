@@ -20,8 +20,8 @@ pub(crate) enum BExpr<R> {
     ColRef(R),
     LitInt(i64),
     /// A fractional or exponent literal: the float it reads as, and the decimal
-    /// its text spells at its smallest exact scale — `None` past `i128` or 38
-    /// fractional digits. A DECIMAL consumer reads `dec`, never `v`.
+    /// its text spells at its smallest exact scale — `None` past `i128` or
+    /// [`gnitz_wire::MAX_DECIMAL_TEXT_SCALE`] fractional digits. A DECIMAL consumer reads `dec`, never `v`.
     LitFloat {
         v: f64,
         dec: Option<(i128, u8)>,

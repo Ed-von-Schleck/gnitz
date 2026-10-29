@@ -1,7 +1,7 @@
 use super::*;
 use crate::query::compiler::fixtures::{compile, predicate, rejection, scan, sources, tables_at, Build, Source};
 use crate::test_support::{make_schema_u64_i64, reindexed_on_col1};
-use gnitz_wire::{Circuit, JoinKind, TypeCode};
+use gnitz_wire::{AggDescriptor, Circuit, GroupAggs, JoinKind, TypeCode};
 use gnitz_zset::algebra::Slot;
 
 /// Every broken clause of the two-term form, and every other shape, is refused.
@@ -27,7 +27,13 @@ fn a_shape_outside_the_equation_is_refused() {
         }),
         ("a reduce as the output", |c| {
             let a = scan(c, 1);
-            c.reduce_local(a, &[0], &[gnitz_wire::AggDescriptor::COUNT_STAR]);
+            c.reduce_local(
+                a,
+                GroupAggs {
+                    group_cols: vec![0],
+                    aggs: vec![AggDescriptor::COUNT_STAR],
+                },
+            );
         }),
         ("an exchange", |c| {
             let a = scan(c, 1);

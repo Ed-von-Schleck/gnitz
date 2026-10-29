@@ -28,12 +28,9 @@ pub struct KeyRange {
 impl KeyRange {
     /// Panics when `eq` leaves no column of `cols` for the range.
     pub fn new(cols: PkColList, eq: &[u128], first: u128, last: u128) -> Self {
-        assert!(
-            eq.len() < cols.as_slice().len(),
-            "KeyRange: {} equality values leave no range column within its {} key columns",
-            eq.len(),
-            cols.as_slice().len(),
-        );
+        if let Err(e) = check_eq_count(eq.len(), &cols) {
+            panic!("KeyRange: {e}");
+        }
         let mut vals = [0u128; PK_LIST_MAX_COLS];
         vals[..eq.len()].copy_from_slice(eq);
         KeyRange {
@@ -45,8 +42,10 @@ impl KeyRange {
         }
     }
 
-    /// `eq` pins the leading columns and the next column is exactly `v`.
-    pub fn point(cols: PkColList, eq: &[u128], v: u128) -> Self {
+    /// The walk pinning the leading `vals.len()` columns of `cols` to `vals`.
+    /// Panics when `vals` is empty or longer than `cols`.
+    pub fn point(cols: PkColList, vals: &[u128]) -> Self {
+        let (&v, eq) = vals.split_last().expect("KeyRange::point: no value");
         KeyRange::new(cols, eq, v, v)
     }
 
@@ -72,6 +71,17 @@ impl KeyRange {
     }
 }
 
+/// `Err` when `n_eq` equality values leave no column of `cols` for the range.
+fn check_eq_count(n_eq: usize, cols: &PkColList) -> Result<(), String> {
+    let n_cols = cols.as_slice().len();
+    if n_eq >= n_cols {
+        return Err(format!(
+            "{n_eq} equality values leave no range column within its {n_cols} key columns"
+        ));
+    }
+    Ok(())
+}
+
 impl Wire for KeyRange {
     fn write(&self, w: &mut Writer) {
         w.put(&self.cols).u8(self.n_eq as u8);
@@ -84,12 +94,7 @@ impl Wire for KeyRange {
     fn read(r: &mut Reader) -> Result<KeyRange, String> {
         let cols: PkColList = r.get()?;
         let n_eq = r.u8()? as usize;
-        if n_eq >= cols.as_slice().len() {
-            return Err(format!(
-                "{n_eq} equality values leave no range column within its {} key columns",
-                cols.as_slice().len()
-            ));
-        }
+        check_eq_count(n_eq, &cols)?;
         let mut eq = [0u128; PK_LIST_MAX_COLS];
         for slot in &mut eq[..n_eq] {
             *slot = r.u128()?;

@@ -21,8 +21,8 @@ use crate::transport::Interest;
 use crate::{sys_schema, ClientTransport, ProtocolError, Schema, ZSetBatch};
 use gnitz_wire::txn_frame::{self, encode_items, kept_as, FrameItem};
 use gnitz_wire::{
-    append_frame, peek_control_block, ClientVerb, ControlHeader, DecodedControl, RelClass, RelDescriptorBlob, RelIndex,
-    WireConflictMode, WireLane, WireStatus, CONNECT_TIMEOUT,
+    append_frame, peek_control_block, ClientVerb, ControlHeader, DecodedControl, PkBuf, RelClass, RelDescriptorBlob,
+    RelIndex, WireConflictMode, WireLane, WireStatus, CONNECT_TIMEOUT,
 };
 
 /// Requests one connection may hold in flight; `submit` refuses past it. A bound
@@ -219,9 +219,8 @@ pub(crate) fn encode_push_txn(families: &[PushFamily]) -> Vec<u8> {
             hdr.flags.conflict_mode = f.mode;
             FrameItem {
                 hdr,
-                blob: &[],
                 schema: Some(schema),
-                data: Some(f.batch.wire_regions()),
+                data: f.batch.wire_regions(),
             }
         })
         .collect();
@@ -237,9 +236,8 @@ pub fn encode_ddl_txn(families: &[(u64, ZSetBatch)]) -> Vec<u8> {
         .iter()
         .map(|(tid, b)| FrameItem {
             hdr: ControlHeader { target_id: *tid, ..Default::default() },
-            blob: &[],
             schema: None,
-            data: Some(b.wire_regions()),
+            data: b.wire_regions(),
         })
         .collect();
     encode_items(ClientVerb::DdlTxn, &items)
@@ -567,7 +565,7 @@ impl Session {
         &mut self,
         snapshot: u64,
         tid: u64,
-        after: &[Option<Vec<u8>>],
+        after: &[Option<PkBuf>],
         limit: u64,
         reply_schema: &Arc<Schema>,
     ) -> Sent<SnapshotPage> {

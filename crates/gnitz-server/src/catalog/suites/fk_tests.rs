@@ -342,7 +342,7 @@ fn test_fk_child_type_must_equal_parent() {
 fn a_decimal_fk_child_must_carry_the_parents_scale() {
     let mut engine = fresh("fk_decimal_scale");
     let decimal = |name: &str, scale: u8| CatalogColumn {
-        def: gnitz_wire::ColumnDef::typed(name, gnitz_wire::ColType::decimal(scale), false),
+        def: gnitz_wire::ColumnDef::new(name, gnitz_wire::ColType::decimal(scale), false),
         fk: None,
     };
     let parent_tid = engine.create_table("public.p", &[decimal("id", 4)], &[0]).unwrap();

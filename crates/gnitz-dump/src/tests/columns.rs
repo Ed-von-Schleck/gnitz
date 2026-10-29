@@ -15,7 +15,7 @@ fn every_type() -> Arc<Schema> {
         } else {
             ColType::of(tc)
         };
-        cols.push(ColumnDef::typed(format!("c{i}"), ty, i % 2 == 1));
+        cols.push(ColumnDef::new(format!("c{i}"), ty, i % 2 == 1));
     }
     Arc::new(Schema::from_parts(cols, &[0, 1]).unwrap())
 }
@@ -176,7 +176,7 @@ fn a_cell_its_column_cannot_hold_is_refused() {
     {
         let schema = Arc::new(
             Schema::from_parts(
-                vec![ColumnDef::new("k", key, false), ColumnDef::typed("v", v, false)],
+                vec![ColumnDef::new("k", key, false), ColumnDef::new("v", v, false)],
                 &[0],
             )
             .unwrap(),

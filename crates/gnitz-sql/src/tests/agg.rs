@@ -45,7 +45,7 @@ fn agg_ops_picks_the_value_op_and_the_count_its_nullness_needs() {
 /// The raw reduce column carries a DECIMAL argument's scale.
 #[test]
 fn a_decimal_aggregate_keeps_its_arguments_scale() {
-    let price = ColumnDef::typed("price", ColType::decimal(2), true);
+    let price = ColumnDef::new("price", ColType::decimal(2), true);
     for op in [W::Sum, W::Min, W::Max] {
         assert_eq!(agg_col_def(op, Some(&price), false).ty, ColType::decimal(2), "{op:?}");
     }

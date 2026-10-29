@@ -312,9 +312,8 @@ fn ddl_frame(blocks: impl IntoIterator<Item = (SysFamily, Batch)>) -> Vec<u8> {
                 target_id: family.id(),
                 ..Default::default()
             },
-            blob: &[],
             schema: None,
-            data: Some(batch.wire_regions()),
+            data: batch.wire_regions(),
         })
         .collect();
     encode_items(ClientVerb::DdlTxn, &items)

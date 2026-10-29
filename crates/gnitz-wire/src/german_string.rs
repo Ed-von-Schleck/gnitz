@@ -69,7 +69,7 @@ pub fn shift_german_string_heaps(cells: &mut [u8], delta: usize) {
 
 /// A short cell's content, borrowed from the cell; `None` for a long cell.
 #[inline(always)]
-pub fn german_string_inline(cell: &[u8]) -> Option<&[u8]> {
+pub fn german_string_inline(cell: &[u8; 16]) -> Option<&[u8]> {
     let length = read_u32_le(cell, 0) as usize;
     if length <= SHORT_STRING_THRESHOLD {
         Some(&cell[GERMAN_INLINE_OFF..GERMAN_INLINE_OFF + length])
@@ -81,7 +81,7 @@ pub fn german_string_inline(cell: &[u8]) -> Option<&[u8]> {
 /// A long cell's content range in a heap of `blob_len` bytes; `None` for a
 /// short cell or one that overruns the heap.
 #[inline(always)]
-pub fn german_string_heap(cell: &[u8], blob_len: usize) -> Option<std::ops::Range<usize>> {
+pub fn german_string_heap(cell: &[u8; 16], blob_len: usize) -> Option<std::ops::Range<usize>> {
     let None = german_string_inline(cell) else {
         return None;
     };
@@ -176,24 +176,24 @@ pub fn german_string_short_ascii(cell: &[u8; 16]) -> bool {
     german_string_inline(cell).is_some() && u128::from_le_bytes(*cell) & u128::from_le_bytes([0x80; 16]) == 0
 }
 
-/// The content of cell `s` over the plain heap `blob`, with a long cell that
-/// overruns `blob` read as empty — the one degrading accessor, so every path
-/// degrades alike.
+/// The content of cell `s` over the plain heap `blob`; `None` for a long cell
+/// that overruns `blob`.
 #[inline]
-pub fn german_string_content<'a>(s: &'a [u8], blob: &'a [u8]) -> &'a [u8] {
-    match german_string_inline(s) {
-        Some(inline) => inline,
-        None => match german_string_heap(s, blob.len()) {
-            Some(r) => &blob[r],
-            None => &[],
-        },
-    }
+pub fn german_string_checked<'a>(s: &'a [u8; 16], blob: &'a [u8]) -> Option<&'a [u8]> {
+    german_string_inline(s).or_else(|| german_string_heap(s, blob.len()).map(|r| &blob[r]))
+}
+
+/// [`german_string_checked`] with an overrunning cell read as empty — the one
+/// degrading accessor, so every path degrades alike.
+#[inline]
+pub fn german_string_content<'a>(s: &'a [u8; 16], blob: &'a [u8]) -> &'a [u8] {
+    german_string_checked(s, blob).unwrap_or(&[])
 }
 
 /// A long cell's value in `heap`; `None` for a short cell or one `heap` does
 /// not hold.
 #[inline(always)]
-pub fn german_string_value<'a>(cell: &[u8], heap: Heap<'a>) -> Option<HeapValue<'a>> {
+pub fn german_string_value<'a>(cell: &[u8; 16], heap: Heap<'a>) -> Option<HeapValue<'a>> {
     let None = german_string_inline(cell) else {
         return None;
     };
@@ -204,7 +204,7 @@ pub fn german_string_value<'a>(cell: &[u8], heap: Heap<'a>) -> Option<HeapValue<
 /// plain heap, decoded from a coded one. A long cell `heap` does not hold reads
 /// as empty, as [`german_string_content`] reads one.
 #[inline]
-pub fn german_string_bytes<'c, 'a: 'c>(s: &'c [u8], heap: Heap<'a>) -> Cow<'c, [u8]> {
+pub fn german_string_bytes<'c, 'a: 'c>(s: &'c [u8; 16], heap: Heap<'a>) -> Cow<'c, [u8]> {
     match heap {
         Heap::Plain(blob) => Cow::Borrowed(german_string_content(s, blob)),
         Heap::Coded(_) => decoded_bytes(s, heap),
@@ -213,7 +213,7 @@ pub fn german_string_bytes<'c, 'a: 'c>(s: &'c [u8], heap: Heap<'a>) -> Cow<'c, [
 
 /// [`german_string_bytes`] over a coded heap.
 #[inline(never)]
-fn decoded_bytes<'c, 'a: 'c>(s: &'c [u8], heap: Heap<'a>) -> Cow<'c, [u8]> {
+fn decoded_bytes<'c, 'a: 'c>(s: &'c [u8; 16], heap: Heap<'a>) -> Cow<'c, [u8]> {
     match german_string_inline(s) {
         Some(inline) => Cow::Borrowed(inline),
         None => german_string_value(s, heap).map_or(Cow::Borrowed(&[]), HeapValue::bytes),
@@ -223,17 +223,28 @@ fn decoded_bytes<'c, 'a: 'c>(s: &'c [u8], heap: Heap<'a>) -> Cow<'c, [u8]> {
 /// A cell's first 8 content bytes, zero-padded, big-endian: an integer whose order never
 /// contradicts [`compare_german_strings`].
 #[inline(always)]
-pub fn german_string_lead(cell: &[u8], heap: Heap<'_>) -> u64 {
-    let lead = match german_string_inline(cell) {
+pub fn german_string_lead(cell: &[u8; 16], heap: Heap<'_>) -> u64 {
+    match german_string_inline(cell) {
+        // The cell's first 8 inline bytes, masked to the content they hold.
         Some(inline) => {
-            let mut lead = [0u8; 8];
-            let n = inline.len().min(8);
-            lead[..n].copy_from_slice(&inline[..n]);
-            lead
+            let n = inline.len().min(8) as u32;
+            u64::from_be_bytes(*cell[GERMAN_INLINE_OFF..].first_chunk().unwrap())
+                & u64::MAX.checked_shl(8 * (8 - n)).unwrap_or(0)
         }
-        None => german_string_value(cell, heap).map_or([0; 8], HeapValue::lead),
-    };
-    u64::from_be_bytes(lead)
+        None => u64::from_be_bytes(german_string_value(cell, heap).map_or([0; 8], HeapValue::lead)),
+    }
+}
+
+/// A long cell's content length; zero for a short cell, whose content lies in
+/// no heap.
+#[inline(always)]
+pub fn german_string_long_len(cell: &[u8; 16]) -> usize {
+    let n = read_u32_le(cell, 0) as usize;
+    if n > SHORT_STRING_THRESHOLD {
+        n
+    } else {
+        0
+    }
 }
 
 /// Byte-lexicographic order over two German string cells.

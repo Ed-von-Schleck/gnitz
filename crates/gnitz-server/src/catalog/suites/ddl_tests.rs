@@ -459,7 +459,10 @@ fn test_hook_relation_register_rejects_malformed_pk() {
     let mut assert_rejects = |raw_pk_cols: u64, snippet: &str| {
         let blocks = [
             (SysFamily::Column, col_tab_batch(tid, &col_defs, 1)),
-            (SysFamily::Table, table_tab_row_words(tid, "bad_table", raw_pk_cols, 0)),
+            (
+                SysFamily::Table,
+                table_tab_row_words(tid, "bad_table", raw_pk_cols, gnitz_wire::TableProps::default()),
+            ),
         ];
         let res = apply_ddl(&mut engine, blocks);
         let err = res.expect_err(&format!("expected Err containing '{snippet}', got Ok"));
@@ -853,7 +856,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
     let mut engine = fresh("duplicate_column_names");
 
     let stream = gnitz_wire::TableProps { stream: true, ..Default::default() };
-    for (name, flags) in [("dup_table", 0), ("dup_stream", stream.pack())] {
+    for (name, flags) in [("dup_table", gnitz_wire::TableProps::default()), ("dup_stream", stream)] {
         let col_defs = vec![
             col_def("id", TypeCode::U64),
             col_def("a", TypeCode::I64),

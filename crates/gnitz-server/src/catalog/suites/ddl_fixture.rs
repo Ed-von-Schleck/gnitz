@@ -35,7 +35,7 @@ fn table_blocks(
     let row = TableTabRow {
         schema_id: sid,
         pk_col_idx: PkColList::from_slice(pk),
-        flags: props.pack(),
+        flags: props,
         ..table_tab_row(tid, name)
     };
     [

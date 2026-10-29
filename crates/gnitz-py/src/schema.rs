@@ -94,7 +94,7 @@ impl PyColumnDef {
         let name = self.name.bind(py).to_cow()?.into_owned();
         Ok(ColumnDef {
             is_hidden: self.is_hidden,
-            ..ColumnDef::typed(name, self.ty, self.is_nullable)
+            ..ColumnDef::new(name, self.ty, self.is_nullable)
         })
     }
 }

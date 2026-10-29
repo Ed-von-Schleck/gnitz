@@ -349,9 +349,9 @@ fn scramble(id: u64) -> u64 {
     id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
-/// A one-row `public` TABLE_TAB `+1` under explicit packed `pk_col_idx` and
-/// `flags` words — the shapes `create_table` cannot make.
-fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: u64) -> Batch {
+/// A one-row `public` TABLE_TAB `+1` under an explicit packed `pk_col_idx`
+/// word and `flags` — the shapes `create_table` cannot make.
+fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: gnitz_wire::TableProps) -> Batch {
     let row = TableTabRow { flags, ..table_tab_row(tid, table_name) };
     crate::test_support::forged_sys_batch(row, gnitz_wire::TableTabSlot::pk_col_idx as usize, pk_col_idx)
 }

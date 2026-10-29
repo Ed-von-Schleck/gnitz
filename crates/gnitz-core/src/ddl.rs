@@ -414,7 +414,7 @@ impl GnitzClient {
                 schema_id,
                 name: table.name().into(),
                 pk_col_idx: pk,
-                flags: props.pack(),
+                flags: *props,
             },
             1,
         );
@@ -469,16 +469,15 @@ impl GnitzClient {
                     .live_rows()
                     .find(|&i| views.pks.get(i) as u64 == vid)
                     .ok_or_else(|| not_found("view", view))?;
-                let schema_id = payload_u64(views, i, RELTAB_PAY_SCHEMA_ID);
+                let row =
+                    ViewTabRow::read(views, i).map_err(|e| ProtocolError::DecodeError(format!("view {vid}: {e}")))?;
+                let schema_id = row.schema_id;
 
                 // The definition says how the body was spelled, which is no
                 // part of what the view is: another spelling of the same body
                 // is the same view, and keeps the standing definition.
-                let standing_definition = ViewTabRow::read(views, i)
-                    .map_err(|e| ProtocolError::DecodeError(format!("view {vid}: {e}")))?
-                    .definition;
                 let mut want = DdlBundle::default();
-                bundle.put_rows(&mut want, &standing_definition, schema_id, base);
+                bundle.put_rows(&mut want, &row.definition, schema_id, base);
                 if want.same_rows(&standing) {
                     return Ok(vid);
                 }

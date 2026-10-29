@@ -39,11 +39,14 @@ impl SymbolTable {
         {
             return None;
         }
+        let mut digest = crate::ChecksumStream::default();
+        digest.update(symbols.as_flattened());
+        digest.update(lens);
         let mut table = Box::new(SymbolTable {
             symbols: [[0; MAX_SYMBOL_LEN]; 256],
             lens: [1; 256],
             count: symbols.len(),
-            digest: crate::checksum(&[symbols.as_flattened(), lens].concat()),
+            digest: digest.digest(),
         });
         table.symbols[..symbols.len()].copy_from_slice(symbols);
         table.lens[..lens.len()].copy_from_slice(lens);

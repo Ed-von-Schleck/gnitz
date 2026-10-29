@@ -220,3 +220,14 @@ fn plain_extent_truth_table() {
     assert_eq!(plain_extent(8, 4, usize::MAX), None);
     assert_eq!(plain_extent(8, u64::MAX - 5, 20), None);
 }
+
+#[test]
+fn a_tables_digest_is_the_checksum_of_its_symbols_then_lengths() {
+    let symbols = [*b"abcdefgh", *b"xy\0\0\0\0\0\0"];
+    let lens = [8, 2];
+    let table = SymbolTable::new(&symbols, &lens).unwrap();
+    assert_eq!(
+        table.digest(),
+        crate::checksum(&[symbols.as_flattened(), &lens[..]].concat())
+    );
+}

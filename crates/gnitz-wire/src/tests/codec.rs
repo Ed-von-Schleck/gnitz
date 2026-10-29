@@ -8,7 +8,7 @@ fn a_saturated_count_is_refused_under_any_cap() {
     w.list(&vec![0u32; 70_000]);
     let blob = w.into_vec();
     assert_eq!(blob[..2], u16::MAX.to_le_bytes());
-    for cap in [0, 1, u16::MAX as usize - 1] {
+    for cap in [0, 1, MAX_LIST_LEN] {
         let err = Reader::new(&blob).list::<u32>("xs", cap).unwrap_err();
         assert_eq!(err, format!("xs: 65535 entries exceeds cap {cap}"));
     }

@@ -12,47 +12,60 @@
 //! The owned key forms live here too: [`PkBuf`], one key, and [`PkKeys`], a
 //! strictly ascending list of keys of one stride.
 
-use crate::TypeCode;
+use crate::codec::{Reader, Wire, Writer};
+use crate::{zip_cells, TypeCode};
+
+/// `$body` once per fixed cell width — 1/2/4/8/16 bytes, the widths of a PK
+/// column and of every non-string payload cell — with `$t` the unsigned integer
+/// of `$width` bytes.
+#[macro_export]
+macro_rules! by_cell_width {
+    ($width:expr, |$t:ident| $body:expr) => {
+        match $width {
+            16 => {
+                type $t = u128;
+                $body
+            }
+            8 => {
+                type $t = u64;
+                $body
+            }
+            4 => {
+                type $t = u32;
+                $body
+            }
+            2 => {
+                type $t = u16;
+                $body
+            }
+            1 => {
+                type $t = u8;
+                $body
+            }
+            other => unreachable!("a fixed cell is 1/2/4/8/16 bytes, got {other}"),
+        }
+    };
+}
 
 /// Write the low `dst.len()` bytes of `v` big-endian into `dst`, the top bit of that
 /// width flipped when `flip`. With `v` a native value and `flip = tc.is_signed_int()`
 /// that is the column's OPK bytes; with `flip = false` it stores a key image as it is.
 #[inline(always)]
 pub fn store_opk(dst: &mut [u8], v: u128, flip: bool) {
-    macro_rules! store {
-        ($ty:ty) => {{
-            let d: &mut [u8; std::mem::size_of::<$ty>()] = dst.try_into().unwrap();
-            *d = ((v as $ty) ^ ((flip as $ty) << (<$ty>::BITS - 1))).to_be_bytes();
-        }};
-    }
-    match dst.len() {
-        16 => store!(u128),
-        8 => store!(u64),
-        4 => store!(u32),
-        2 => store!(u16),
-        1 => store!(u8),
-        other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
-    }
+    by_cell_width!(dst.len(), |T| {
+        let d: &mut [u8; std::mem::size_of::<T>()] = dst.try_into().unwrap();
+        *d = ((v as T) ^ ((flip as T) << (T::BITS - 1))).to_be_bytes();
+    })
 }
 
 /// [`store_opk`] appended to `buf` as one `width`-byte column.
 #[inline(always)]
 pub fn push_opk(buf: &mut Vec<u8>, width: usize, v: u128, flip: bool) {
-    macro_rules! push {
-        ($w:literal) => {{
-            let mut cell = [0u8; $w];
-            store_opk(&mut cell, v, flip);
-            buf.extend_from_slice(&cell);
-        }};
-    }
-    match width {
-        16 => push!(16),
-        8 => push!(8),
-        4 => push!(4),
-        2 => push!(2),
-        1 => push!(1),
-        other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
-    }
+    by_cell_width!(width, |T| {
+        let mut cell = [0u8; std::mem::size_of::<T>()];
+        store_opk(&mut cell, v, flip);
+        buf.extend_from_slice(&cell);
+    })
 }
 
 /// The mask of a `width`-byte column's images: its low `8·width` bits.
@@ -63,10 +76,17 @@ pub const fn image_mask(width: usize) -> u128 {
 
 /// A native value's image in its column's key order: masked to the type's width, sign bit
 /// flipped for a signed type — the OPK bytes read as a big-endian integer. Its own
-/// inverse on a masked value.
+/// inverse on a masked value, which is how [`decode_opk_u128`] reads a cell back.
 #[inline(always)]
 pub fn key_image(tc: TypeCode, native: u128) -> u128 {
     (native & image_mask(tc.wire_stride())) ^ opk_bias(tc)
+}
+
+/// Decode one OPK cell of a column of type `tc` to its native value, zero-extended
+/// from the type's width.
+#[inline(always)]
+pub fn decode_opk_u128(opk: &[u8], tc: TypeCode) -> u128 {
+    key_image(tc, widen_pk_be(opk))
 }
 
 /// The image of zero in a column of type `tc`: its sign bit if signed, else 0.
@@ -92,93 +112,42 @@ pub fn native_key_image<const W: usize>(cell: &[u8; W], signed: bool) -> u128 {
 #[inline(always)]
 pub fn decode_pk_cell(src: &[u8], signed: bool, dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), src.len());
-    macro_rules! decode {
-        ($ty:ty) => {{
-            const W: usize = std::mem::size_of::<$ty>();
-            let v = <$ty>::from_be_bytes(src.try_into().unwrap()) ^ ((signed as $ty) << (<$ty>::BITS - 1));
-            let d: &mut [u8; W] = dst.try_into().unwrap();
-            *d = v.to_le_bytes();
-        }};
-    }
-    match src.len() {
-        16 => decode!(u128),
-        8 => decode!(u64),
-        4 => decode!(u32),
-        2 => decode!(u16),
-        1 => decode!(u8),
-        other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
-    }
-}
-
-/// `f` over the `W`-byte cell at byte `off` of each `stride`-byte row of `src`, paired
-/// with `dst`'s items in order.
-#[inline(always)]
-pub fn zip_cells<const W: usize, D>(
-    src: &[u8],
-    stride: usize,
-    off: usize,
-    dst: impl Iterator<Item = D>,
-    mut f: impl FnMut(&[u8; W], D),
-) {
-    assert!(off + W <= stride, "a cell lies inside its row");
-    if stride == W {
-        for (cell, d) in src.as_chunks::<W>().0.iter().zip(dst) {
-            f(cell, d);
-        }
-    } else {
-        for (row, d) in src.chunks_exact(stride).zip(dst) {
-            f(row[off..off + W].try_into().unwrap(), d);
-        }
-    }
+    by_cell_width!(src.len(), |T| {
+        let v = T::from_be_bytes(src.try_into().unwrap()) ^ ((signed as T) << (T::BITS - 1));
+        let d: &mut [u8; std::mem::size_of::<T>()] = dst.try_into().unwrap();
+        *d = v.to_le_bytes();
+    })
 }
 
 /// Decode the `width`-byte PK column at byte `off` of each `stride`-byte row of `pk`
 /// into `dst`'s native little-endian cells, `width` bytes each.
 pub fn decode_pk_cells(pk: &[u8], stride: usize, off: usize, width: usize, signed: bool, dst: &mut [u8]) {
-    macro_rules! decode_rows {
-        ($w:literal) => {
-            zip_cells::<$w, _>(pk, stride, off, dst.as_chunks_mut::<$w>().0.iter_mut(), |s, d| {
-                decode_pk_cell(s, signed, d)
-            })
-        };
-    }
-    match width {
-        1 => decode_rows!(1),
-        2 => decode_rows!(2),
-        4 => decode_rows!(4),
-        8 => decode_rows!(8),
-        16 => decode_rows!(16),
-        other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
-    }
+    by_cell_width!(width, |T| {
+        const W: usize = std::mem::size_of::<T>();
+        zip_cells::<W, _>(pk, stride, off, dst.as_chunks_mut::<W>().0.iter_mut(), |s, d| {
+            decode_pk_cell(s, signed, d)
+        })
+    })
 }
 
 /// Encode `src`'s native little-endian cells, `width` bytes each, as the OPK column at
 /// byte `off` of each `stride`-byte row of `pk`: the inverse of [`decode_pk_cells`].
+#[allow(clippy::unnecessary_cast)] // `as u128` is the identity in the 16-byte arm
 pub fn encode_pk_cells(src: &[u8], width: usize, signed: bool, pk: &mut [u8], stride: usize, off: usize) {
-    macro_rules! encode_rows {
-        ($ty:ty) => {{
-            const W: usize = std::mem::size_of::<$ty>();
-            assert!(off + W <= stride, "a cell lies inside its row");
-            let cells = src.as_chunks::<W>().0;
-            if stride == W {
-                for (cell, dst) in cells.iter().zip(pk.as_chunks_mut::<W>().0) {
-                    store_opk(dst, <$ty>::from_le_bytes(*cell) as u128, signed);
-                }
-            } else {
-                for (cell, row) in cells.iter().zip(pk.chunks_exact_mut(stride)) {
-                    store_opk(&mut row[off..off + W], <$ty>::from_le_bytes(*cell) as u128, signed);
-                }
+    by_cell_width!(width, |T| {
+        const W: usize = std::mem::size_of::<T>();
+        assert!(off + W <= stride, "a cell lies inside its row");
+        let cells = src.as_chunks::<W>().0;
+        if stride == W {
+            for (cell, dst) in cells.iter().zip(pk.as_chunks_mut::<W>().0) {
+                store_opk(dst, T::from_le_bytes(*cell) as u128, signed);
             }
-        }};
-    }
-    match width {
-        1 => encode_rows!(u8),
-        2 => encode_rows!(u16),
-        4 => encode_rows!(u32),
-        8 => encode_rows!(u64),
-        16 => encode_rows!(u128),
-        other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
-    }
+        } else {
+            for (cell, row) in cells.iter().zip(pk.chunks_exact_mut(stride)) {
+                store_opk(&mut row[off..off + W], T::from_le_bytes(*cell) as u128, signed);
+            }
+        }
+    })
 }
 
 /// Widest PK region [`widen_pk_be`] packs into a `u128`; a wider key is ordered
@@ -395,6 +364,9 @@ pub fn int_cell<const OPK: bool>(fi: crate::FixedInt, cell: &[u8]) -> i64 {
 /// validation). Auto-tracks growth of `MAX_PK_COLUMNS`.
 pub const MAX_PK_BYTES: usize = crate::MAX_PK_COLUMNS * 16;
 
+// PkBuf::len, PkKeys::stride and a PkSet's stride byte hold a key width as a u8.
+const _: () = assert!(MAX_PK_BYTES <= u8::MAX as usize);
+
 /// An OPK key of up to `MAX_PK_BYTES` bytes, held by the engine's key encoders and
 /// the client's row-identity maps alike. `bytes[..len]` is the key and the tail past
 /// it is zero: every constructor starts from a zeroed array and no method shortens a
@@ -443,6 +415,21 @@ impl PartialOrd for PkBuf {
 impl Ord for PkBuf {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.pk_bytes().cmp(other.pk_bytes())
+    }
+}
+
+/// The key as a `u32`-length-prefixed section; one wider than `MAX_PK_BYTES` is
+/// refused.
+impl Wire for PkBuf {
+    fn write(&self, w: &mut Writer) {
+        w.bytes32(self.pk_bytes());
+    }
+    fn read(r: &mut Reader) -> Result<Self, String> {
+        let key = r.bytes32()?;
+        if key.len() > MAX_PK_BYTES {
+            return Err(format!("a {}-byte key exceeds {MAX_PK_BYTES}", key.len()));
+        }
+        Ok(PkBuf::from_bytes(key))
     }
 }
 

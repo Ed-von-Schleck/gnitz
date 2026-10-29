@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::sweep_bit_flips;
+use gnitz_wire::MAX_PK_BYTES;
 
 /// A manifest with `count` entries alternating an empty and a widest guard key
 /// over two levels, and a `count`-byte caller record, so every field shape

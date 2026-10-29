@@ -46,7 +46,7 @@ fn each_accepted_spelling_declares_its_type() {
     ];
     for &(decl, ty) in plain {
         let got = declared(decl).unwrap_or_else(|e| panic!("{decl}: {e}"));
-        assert_eq!(got, (ColumnDef::typed("c", ty, true), false), "{decl}");
+        assert_eq!(got, (ColumnDef::new("c", ty, true), false), "{decl}");
     }
     assert_eq!(
         declared("BIGINT NOT NULL").unwrap(),
