@@ -8,7 +8,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gnitz_foundation::posix_io::fsync_dir;
+use gnitz_foundation::posix_io::fsync_parent;
 use gnitz_wire::ALPN_GNITZ;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -273,11 +273,6 @@ pub(super) fn write_file(path: &str, bytes: &[u8], mode: u32) -> Result<(), Stri
         .open(&tmp)
         .and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
         .and_then(|()| std::fs::rename(&tmp, path))
-        .and_then(
-            |()| match std::path::Path::new(path).parent().and_then(|p| p.to_str()) {
-                Some("") | None => fsync_dir("."),
-                Some(dir) => fsync_dir(dir),
-            },
-        )
+        .and_then(|()| fsync_parent(path))
         .map_err(|e| format!("failed to write {path}: {e}"))
 }

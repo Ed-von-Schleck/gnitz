@@ -85,6 +85,29 @@ pub fn fsync_dir(dir: impl AsRef<std::path::Path>) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// Make `path`'s own entry durable: sync its parent, the working directory for
+/// a bare name.
+pub fn fsync_parent(path: impl AsRef<std::path::Path>) -> io::Result<()> {
+    match path.as_ref().parent() {
+        Some(p) if !p.as_os_str().is_empty() => fsync_dir(p),
+        _ => fsync_dir("."),
+    }
+}
+
+/// Create `dir` and its missing ancestors; once this returns, `dir`'s entry and
+/// every entry it created are durable. `dir`'s is synced even where it already
+/// exists, since a creator killed before its sync left it unsynced.
+pub fn create_dir_all_durable(dir: impl AsRef<std::path::Path>) -> io::Result<()> {
+    let dir = dir.as_ref();
+    let missing: Vec<&std::path::Path> = dir
+        .ancestors()
+        .skip(1)
+        .take_while(|d| !d.as_os_str().is_empty() && !d.is_dir())
+        .collect();
+    std::fs::create_dir_all(dir)?;
+    std::iter::once(dir).chain(missing).try_for_each(fsync_parent)
+}
+
 /// Rename `from` to `to`, refused with `AlreadyExists` where `to` exists:
 /// `std::fs::rename` replaces a file, or an empty directory, in its place.
 #[cfg(target_os = "linux")]

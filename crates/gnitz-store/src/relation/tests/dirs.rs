@@ -255,5 +255,5 @@ fn lock_data_dir_creates_missing_ancestors() {
     let base = tmp.path().join("a/b/data");
     let base = base.to_str().unwrap();
     let _lock = lock_data_dir(base).unwrap();
-    assert!(Path::new(&relations_dir(base)).is_dir());
+    assert!(std::path::Path::new(&relations_dir(base)).is_dir());
 }
