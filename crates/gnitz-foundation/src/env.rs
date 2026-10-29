@@ -23,17 +23,19 @@ pub(crate) fn flag(v: &str) -> Option<bool> {
     }
 }
 
-/// `name`'s override: `default` when unset, else `raw` as `rule` reads it.
+/// `raw`, `name`'s value, as `rule` reads it.
 ///
 /// # Panics
 ///
 /// On a value `rule` rejects, naming the variable, the value and `what` it
 /// should have been.
+pub(crate) fn parsed<T>(name: &str, raw: &str, rule: impl Fn(&str) -> Option<T>, what: &str) -> T {
+    rule(raw).unwrap_or_else(|| panic!("{name}={raw:?} is not {what}"))
+}
+
+/// `name`'s override: `default` when unset, else [`parsed`].
 fn read<T>(name: &str, raw: Option<&str>, default: T, rule: impl Fn(&str) -> Option<T>, what: &str) -> T {
-    match raw {
-        None => default,
-        Some(raw) => rule(raw).unwrap_or_else(|| panic!("{name}={raw:?} is not {what}")),
-    }
+    raw.map_or(default, |raw| parsed(name, raw, rule, what))
 }
 
 /// A positive-integer env override; unset reads as `default`, and a zero or

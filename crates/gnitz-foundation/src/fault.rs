@@ -65,7 +65,12 @@ impl Seam {
     /// On an armed setting that is not a positive integer.
     pub fn count(&self) -> Option<u64> {
         let v = self.armed_setting()?;
-        Some(crate::env::positive(v).unwrap_or_else(|| panic!("{}={v:?} is not a positive integer", self.var)))
+        Some(crate::env::parsed(
+            self.var,
+            v,
+            crate::env::positive,
+            "a positive integer",
+        ))
     }
 
     /// Consume the seam's one-shot latch: true on the first call while armed,
