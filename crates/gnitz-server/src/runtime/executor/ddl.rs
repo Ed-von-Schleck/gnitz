@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use super::committer::CHECKPOINTS_BEHIND_DDL;
 use super::peer::Peer;
 use super::{park_until, send_ack, Shared};
-use crate::catalog::{unique_index_creates, AppliedDdl, DdlBundle, SysFamily};
+use crate::catalog::{AppliedDdl, DdlBundle, SysFamily};
 use crate::runtime::master::UniqueFilter;
 use crate::runtime::sal::Read;
 use crate::runtime::sync::WriteGuard;
@@ -132,10 +132,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, body: &[u8]
     let families = decode_bundle(body)?;
     let family_count = families.family_count();
 
-    let unique_creates = families
-        .get(SysFamily::Index)
-        .map(unique_index_creates)
-        .unwrap_or_default();
+    let unique_creates = families.unique_index_creates();
 
     let locks = enter_ddl(shared).await;
     // Only an owner that already exists is scanned, so only it leaves claims.

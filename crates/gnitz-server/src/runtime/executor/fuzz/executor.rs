@@ -20,10 +20,10 @@ use std::collections::HashSet;
 
 use super::write::{check_stream_push, decode_push_frame, decode_push_txn_frame};
 use super::*;
-use crate::catalog::{unique_index_creates, SysFamily, ZoneError};
+use crate::catalog::{SysFamily, ZoneError};
 use crate::runtime::master::TxnFamily;
 use crate::test_support::{
-    col_def, col_tab_batch, left_join_circuit, nullable_def, push_view_tab_row, table_tab_batch, view_blocks,
+    col_def, col_tab_batch, left_join_circuit, nullable_def, sys_batch, table_tab_batch, view_blocks, view_tab_row,
 };
 use gnitz_fuzz::input::Input;
 use gnitz_fuzz::seed::{Frame, Seed, Seeds, SEEDS_ENV};
@@ -165,11 +165,10 @@ impl Session {
         let Ok(families) = ddl::decode_bundle(body) else { return };
         // The master refuses a unique index over rows a duplicate may be
         // among, by asking its workers; this one has none to ask.
-        let unique_over_rows = families.get(SysFamily::Index).is_some_and(|b| {
-            unique_index_creates(b)
-                .iter()
-                .any(|(owner, _)| self.filled.contains(owner))
-        });
+        let unique_over_rows = families
+            .unique_index_creates()
+            .iter()
+            .any(|(owner, _)| self.filled.contains(owner));
         if unique_over_rows {
             return;
         }
@@ -265,8 +264,6 @@ fn builtin() -> Seed {
         nullable_def("w", U64),
     ];
     let (circuit, _) = left_join_circuit(a, b, 1);
-    let mut row = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut row, 1, view, "v", 0, 0, 0);
     let ddl = [
         alloc,
         table(
@@ -275,7 +272,10 @@ fn builtin() -> Seed {
             &[col_def("id", U64), col_def("nn", U64), nullable_def("nullable", U64)],
         ),
         table(b, "b", &[col_def("id", U64), col_def("k", U64), col_def("w", U64)]),
-        ddl_frame(view_blocks([(view, &circuit, &view_cols[..])], row.finish())),
+        ddl_frame(view_blocks(
+            [(view, &circuit, &view_cols[..])],
+            sys_batch([(view_tab_row(view, "v"), 1)]),
+        )),
     ];
     ddl.iter().for_each(|f| session.request(f));
     let rows = |tid: u64| {

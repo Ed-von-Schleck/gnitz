@@ -7,8 +7,7 @@ use super::*;
 
 #[test]
 fn a_write_must_retract_the_live_row_and_leave_one_or_none() {
-    let dir = temp_dir("sysretract_contract");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("sysretract_contract");
 
     // One live user row in every family, under names long enough to sit in the
     // blob heap.
@@ -61,16 +60,14 @@ fn a_write_must_retract_the_live_row_and_leave_one_or_none() {
         }
     }
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// The accepted path: `drop_index` builds its `-1` by copying the live row, so
 /// the pair must consolidate away and leave no stored row at all.
 #[test]
 fn create_then_drop_unique_index_cancels_to_empty() {
-    let dir = temp_dir("idx_create_drop_cancels");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("idx_create_drop_cancels");
 
     let cols = vec![col_def("pk", TypeCode::U64), col_def("val", TypeCode::I64)];
     engine.create_table("public.cancels", &cols, &[0]).unwrap();
@@ -89,6 +86,5 @@ fn create_then_drop_unique_index_cancels_to_empty() {
         "the drop's `-1` must cancel the create's `+1`, leaving no stored row"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }

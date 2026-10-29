@@ -49,7 +49,7 @@ fn forgetting_a_view_drops_only_what_it_linked() {
     assert_eq!(dag.dependents_of(1), [5, 6]);
     assert_eq!(dag.dependents_of(2), [5]);
     assert!(!dag.dep.reverse.contains_key(&7));
-    dag.set_rebuild([5]);
+    dag.rebuild = [5].into_iter().collect();
 
     for _ in 0..2 {
         dag.forget(5);
@@ -72,9 +72,9 @@ fn a_relation_is_ticked_while_a_view_scanning_it_is_not_awaiting_its_rebuild() {
     dag.dep.link(6, [1]);
     assert!(dag.is_ticked(1) && !dag.is_ticked(2));
 
-    dag.set_rebuild([5]);
+    dag.rebuild = [5].into_iter().collect();
     assert!(dag.is_ticked(1));
-    dag.set_rebuild([5, 6]);
+    dag.rebuild = [5, 6].into_iter().collect();
     assert!(!dag.is_ticked(1) && dag.is_scanned(1));
 }
 
@@ -105,7 +105,7 @@ fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
     assert_eq!(steps(&mut dag), every);
 
     // A rebuild set is closed under dependents.
-    dag.set_rebuild([2, 4, 5]);
+    dag.rebuild = [2, 4, 5].into_iter().collect();
     assert_eq!(steps(&mut dag), [(3, 1, true, false)], "of the steps it runs");
     dag.rebuild.remove(&2);
     assert_eq!(steps(&mut dag), [(2, 1, false, false), (3, 1, true, false)]);

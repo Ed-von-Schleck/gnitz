@@ -1,6 +1,5 @@
 //! Catalog object-id allocation and `sequences`: the master scalars (next id,
-//! checkpoint generation, topology word), user SERIAL ranges and the checkpoint
-//! records.
+//! checkpoint generation, topology word) and user SERIAL ranges.
 
 use gnitz_wire::{SeqTabRow, SysRow};
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -23,7 +22,7 @@ const STATE_FORMAT: u32 = 16;
 
 /// The durable topology word recorded in `sequences` ([`SEQ_ID_TOPOLOGY`]):
 /// `(worker_count << 32) | STATE_FORMAT`. One packer, shared by the boot-time
-/// recorder and the resume-verdict validator.
+/// recorder and the resume latch.
 fn topology_word(worker_count: u32) -> u64 {
     ((worker_count as u64) << 32) | STATE_FORMAT as u64
 }
@@ -51,11 +50,6 @@ impl CatalogEngine {
     }
 
     // -- `sequences` -------------------------------------------------------
-
-    /// Whether persisted derived state was written under this boot's topology.
-    pub(in crate::catalog) fn topology_matches(&self) -> bool {
-        self.sequence_value(SEQ_ID_TOPOLOGY) == Some(topology_word(self.registry.slot().of))
-    }
 
     /// The checkpoint generation, `0` on a fresh database.
     pub(crate) fn durable_generation(&self) -> u64 {
@@ -115,16 +109,18 @@ impl CatalogEngine {
         self.registry.checkpoint_system(self.system_zone)
     }
 
-    /// Load the next catalog id stored in `sequences`, and latch the resume
-    /// generation from the checkpoint rows beside it.
+    /// Load the next catalog id stored in `sequences`, and latch the resume point:
+    /// the recovered checkpoint generation when the recorded topology is the
+    /// launched one, `None` otherwise.
     pub(in crate::catalog) fn load_sequence_scalars(&mut self) {
         if let Some(v) = self.sequence_value(SEQ_ID_NEXT_ID) {
             self.next_id = self.next_id.max(v);
         }
-        self.resume_generation = self.durable_generation();
+        self.resume_at = (self.sequence_value(SEQ_ID_TOPOLOGY) == Some(topology_word(self.registry.slot().of)))
+            .then(|| self.durable_generation());
     }
 
-    // -- Checkpoint records -------------------------------------------------
+    // -- Checkpoint generation and topology -----------------------------------
 
     /// Advance the checkpoint generation and flush it durable. Returns it.
     pub(crate) fn advance_durable_generation(&mut self) -> Result<u64, String> {
@@ -133,16 +129,6 @@ impl CatalogEngine {
         self.flush_all_system_tables()
             .map_err(|e| format!("checkpoint generation flush failed: {e}"))?;
         Ok(g)
-    }
-
-    /// The ephemeral checkpoint round: persist the operator traces, output store
-    /// and indexes of every view a boot can resume, and every table's indexes, at
-    /// `generation`.
-    pub(crate) fn flush_ephemeral_round(&mut self, generation: u64) -> Result<(), String> {
-        let never = self.never_resumed_views();
-        let resumes = |id| !never.contains(&id);
-        let states = self.dag.ephemeral_states(&self.registry, resumes)?;
-        self.registry.checkpoint_ephemeral(states, generation, resumes)
     }
 
     /// Record the launched topology. Durable at the next system flush.

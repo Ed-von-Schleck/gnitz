@@ -9,18 +9,10 @@ use crate::test_support::u64_i64_cols;
 /// `RelationKind`, so the flag-to-kind dispatch is what is under test.
 #[test]
 fn stream_flag_registers_storeless_with_no_directory() {
-    let dir = temp_dir("stream_registers_storeless");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("stream_registers_storeless");
     let cols = u64_i64_cols();
 
-    let sid = engine
-        .create_table_with(
-            "public.s",
-            &cols,
-            &[0],
-            gnitz_wire::TableProps { stream: true, ..Default::default() },
-        )
-        .unwrap();
+    let sid = create_stream(&mut engine, "public.s", &cols);
     let tid = engine
         .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
         .unwrap();
@@ -30,7 +22,7 @@ fn stream_flag_registers_storeless_with_no_directory() {
     assert!(entry.pk_repeats());
     // No directory is what says it holds no store: `build_rows`
     // creates one for every kind that opens one.
-    let stream_dir = relation_dir(&dir, sid);
+    let stream_dir = relation_dir(engine.registry.base_dir(), sid);
     assert!(
         !std::path::Path::new(&stream_dir).exists(),
         "a stream gets no directory: {stream_dir}"
@@ -47,46 +39,30 @@ fn stream_flag_registers_storeless_with_no_directory() {
     let base = engine.registry.relation_or_err(tid).expect("table registered");
     assert_eq!(base.kind(), RelationKind::BaseTable);
     assert!(!base.pk_repeats());
-    assert!(std::path::Path::new(&relation_dir(&dir, tid)).exists());
+    assert!(std::path::Path::new(&relation_dir(engine.registry.base_dir(), tid)).exists());
 
-    fs::remove_dir_all(&dir).ok();
+    discard(engine);
 }
 
 /// A stream is not a push-conflict target and not an FK parent, so the two
 /// predicates that gate the master preflight must stay false for one.
 #[test]
 fn stream_reads_no_committed_state() {
-    let dir = temp_dir("stream_reads_no_committed_state");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("stream_reads_no_committed_state");
     let cols = u64_i64_cols();
-    let sid = engine
-        .create_table_with(
-            "public.s",
-            &cols,
-            &[0],
-            gnitz_wire::TableProps { stream: true, ..Default::default() },
-        )
-        .unwrap();
+    let sid = create_stream(&mut engine, "public.s", &cols);
 
     assert!(!engine.push_reads_committed_state(sid, gnitz_wire::WireConflictMode::Update));
-    fs::remove_dir_all(&dir).ok();
+    discard(engine);
 }
 
 /// A bounded filter/projection over a stream is refused at compile; over a table,
 /// and a bounded join over a stream, it compiles.
 #[test]
 fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
-    let dir = temp_dir("bounded_view_over_stream");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("bounded_view_over_stream");
     let cols = u64_i64_cols();
-    let sid = engine
-        .create_table_with(
-            "public.s",
-            &cols,
-            &[0],
-            gnitz_wire::TableProps { stream: true, ..Default::default() },
-        )
-        .unwrap();
+    let sid = create_stream(&mut engine, "public.s", &cols);
     let tid = engine
         .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
         .unwrap();
@@ -109,24 +85,16 @@ fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
 
     register_identity_view(&mut engine, sid, "unbounded_over_stream", &cols);
 
-    fs::remove_dir_all(&dir).ok();
+    discard(engine);
 }
 
 /// Boot's recovery sweep ticks no stream: it reads this one function, which is
 /// what is under test.
 #[test]
 fn the_drive_set_excludes_a_stream() {
-    let dir = temp_dir("stream_excluded_from_sweep");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("stream_excluded_from_sweep");
     let cols = u64_i64_cols();
-    let sid = engine
-        .create_table_with(
-            "public.s",
-            &cols,
-            &[0],
-            gnitz_wire::TableProps { stream: true, ..Default::default() },
-        )
-        .unwrap();
+    let sid = create_stream(&mut engine, "public.s", &cols);
     let tid = engine
         .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
         .unwrap();
@@ -136,99 +104,23 @@ fn the_drive_set_excludes_a_stream() {
     let driven = engine.dag.scanned_base_tables(&engine.registry);
     assert_eq!(driven, [tid], "the base table a view scans, and not the stream");
 
-    fs::remove_dir_all(&dir).ok();
+    discard(engine);
 }
 
-/// A stream-fed view's checkpointed state must never be resumed: its stream inputs
-/// are gone at boot. The verdict propagates to a view over it.
-///
-/// Every view here is put in the state that *would* resume — matching topology and an
-/// output manifest at the committed generation, published past the engine's own round,
-/// which leaves these views out — because that is the only state in which the stream
-/// clause decides anything. Without those manifests every view is invalid on that term
-/// alone, and the test passes with the clause deleted.
+/// A view reaching a stream awaits a rebuild at reopen, and so does one over it.
 #[test]
 fn stream_fed_views_are_invalid_at_boot() {
-    let dir = temp_dir("stream_fed_views_invalid");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("stream_fed_views_invalid");
     let cols = u64_i64_cols();
-    let sid = engine
-        .create_table_with(
-            "public.s",
-            &cols,
-            &[0],
-            gnitz_wire::TableProps { stream: true, ..Default::default() },
-        )
-        .unwrap();
-    let tid = engine
-        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
-        .unwrap();
-
-    let direct = register_identity_view(&mut engine, sid, "v_direct", &cols);
-    let downstream = register_identity_view(&mut engine, direct, "v_downstream", &cols);
-    let over_table = register_identity_view(&mut engine, tid, "v_table", &cols);
-
-    // The two halves of the resume verdict, written the way a boot writes them,
-    // then every view's output store published through an ephemeral round at that
-    // generation — a completed checkpoint.
-    engine.record_topology(1).unwrap();
-    let g = engine.advance_durable_generation().unwrap();
-    engine.registry.checkpoint_ephemeral([], g, |_| true).unwrap();
-    engine.close();
-
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(engine.dag.awaits_rebuild(direct), "a direct stream source invalidates");
-    assert!(engine.dag.awaits_rebuild(downstream), "and the verdict cascades");
-    assert!(
-        !engine.dag.awaits_rebuild(over_table),
-        "a checkpointed view over a base table resumes, so the rejection is about the stream"
-    );
-
-    fs::remove_dir_all(&dir).ok();
+    let sid = create_stream(&mut engine, "public.s", &cols);
+    assert_unreplayed_source_rebuilds_at_reopen(engine, sid, &cols);
 }
 
-/// An ephemeral round publishes nothing of a view a stream reaches — neither its
-/// output store nor a trace — and everything of a view over a table.
+/// An ephemeral round publishes no store of a view a stream reaches.
 #[test]
 fn an_ephemeral_round_publishes_no_view_a_stream_reaches() {
-    let dir = temp_dir("stream_views_unpublished");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("stream_views_unpublished");
     let cols = u64_i64_cols();
-    let sid = engine
-        .create_table_with(
-            "public.s",
-            &cols,
-            &[0],
-            gnitz_wire::TableProps { stream: true, ..Default::default() },
-        )
-        .unwrap();
-    let tid = engine
-        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
-        .unwrap();
-
-    let direct = traced_view(&mut engine, sid, "v_direct", &cols);
-    let downstream = traced_view(&mut engine, direct, "v_downstream", &cols);
-    let over_table = traced_view(&mut engine, tid, "v_table", &cols);
-
-    engine.record_topology(1).unwrap();
-    let g = engine.advance_durable_generation().unwrap();
-    engine.flush_ephemeral_round(g).unwrap();
-
-    assert_eq!(published_children(&dir, direct), Vec::<String>::new());
-    assert_eq!(published_children(&dir, downstream), Vec::<String>::new());
-    let table_children = published_children(&dir, over_table);
-    assert!(table_children.contains(&"w0of1".to_string()), "got {table_children:?}");
-    assert!(
-        table_children.iter().any(|c| c.starts_with("scratch_")),
-        "the trace of a view over a table is published: {table_children:?}"
-    );
-    engine.close();
-
-    // What the round left out is what the boot rebuilds, and nothing else.
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(engine.dag.awaits_rebuild(direct));
-    assert!(engine.dag.awaits_rebuild(downstream));
-    assert!(!engine.dag.awaits_rebuild(over_table));
-
-    fs::remove_dir_all(&dir).ok();
+    let sid = create_stream(&mut engine, "public.s", &cols);
+    assert_round_publishes_nothing_reaching(engine, sid, &cols);
 }

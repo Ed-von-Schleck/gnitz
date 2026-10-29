@@ -1,6 +1,8 @@
 //! System table constants, the per-family descriptor table, the per-family row
 //! decoders over those constants, and the batch-shape analyses (per-PK
-//! signatures and their shapes) every guard and hook keys on.
+//! signatures and their shapes) every guard and hook keys on; the `DDL_TXN`
+//! bundle and its wire-shape rules; and `IdSet`, the sorted id set the guards
+//! and hooks probe.
 //!
 //! Pure data, stateless codecs and batch-local analysis — no state, no
 //! CatalogEngine dependency.
@@ -161,28 +163,22 @@ pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
     sigs
 }
 
-/// The distinct `(owner, cols)` of every unique index `batch` (an IDX_TAB delta)
-/// creates: the DDL driver's pre-flight input, read before the precheck. A row
-/// that does not decode is skipped; the precheck refuses the bundle over it.
-pub(crate) fn unique_index_creates(batch: &Batch) -> Vec<(u64, PkColList)> {
-    let mut creates: Vec<_> = pk_signatures(batch)
-        .into_iter()
-        .filter(|s| s.shape() == PkShape::Create)
-        .filter_map(|s| IdxTabRow::read(batch, s.row).ok())
-        .filter_map(|r| r.is_unique.then_some((r.owner_id, r.source_col_idx)))
-        .collect();
-    creates.sort_unstable();
-    creates.dedup();
-    creates
-}
-
-/// One `DDL_TXN` bundle: at most one block per system family.
+/// One `DDL_TXN` bundle: at most one block per system family, and none for a
+/// family only the master writes (see [`SysFamily::master_only`]).
 #[derive(Default)]
 pub(crate) struct DdlBundle([Option<Batch>; SysFamily::COUNT]);
 
 impl DdlBundle {
-    /// Add `family`'s block; `Err` when the bundle already carries one.
+    /// Add `family`'s block; `Err` for a family the wire may not write, or when
+    /// the bundle already carries one.
     pub(crate) fn insert(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
+        if family.master_only() {
+            return Err(format!(
+                "family {} ({}) is not writable from the wire",
+                family.id(),
+                family.name()
+            ));
+        }
         match &mut self.0[family.index()] {
             Some(_) => Err(format!("bundle carries two blocks for family {}", family.id())),
             slot => {
@@ -200,6 +196,25 @@ impl DdlBundle {
     /// How many families the bundle carries a block for.
     pub(crate) fn family_count(&self) -> usize {
         self.0.iter().flatten().count()
+    }
+
+    /// The distinct `(owner, cols)` of every unique index the bundle's IDX_TAB
+    /// block creates: the DDL driver's pre-flight input, read before the
+    /// precheck. A row that does not decode is skipped; the precheck refuses the
+    /// bundle over it.
+    pub(crate) fn unique_index_creates(&self) -> Vec<(u64, PkColList)> {
+        let Some(batch) = self.get(SysFamily::Index) else {
+            return Vec::new();
+        };
+        let mut creates: Vec<_> = pk_signatures(batch)
+            .into_iter()
+            .filter(|s| s.shape() == PkShape::Create)
+            .filter_map(|s| IdxTabRow::read(batch, s.row).ok())
+            .filter_map(|r| r.is_unique.then_some((r.owner_id, r.source_col_idx)))
+            .collect();
+        creates.sort_unstable();
+        creates.dedup();
+        creates
     }
 
     /// The blocks in [`SysFamily::ALL`] order.
@@ -283,7 +298,7 @@ pub(crate) enum SysFamily {
 }
 
 impl SysFamily {
-    pub(crate) const COUNT: usize = gnitz_wire::SYS_FAMILIES.len();
+    pub(in crate::catalog) const COUNT: usize = gnitz_wire::SYS_FAMILIES.len();
 
     /// Every family in `gnitz_wire::SYS_FAMILIES` order: the index the
     /// per-family arrays share, and the order a bundle's families and a boot's
@@ -302,7 +317,7 @@ impl SysFamily {
     /// per-family array here is laid out by. A seven-entry scan, at DDL-bundle
     /// or boot rate.
     #[inline]
-    pub(crate) const fn index(self) -> usize {
+    pub(in crate::catalog) const fn index(self) -> usize {
         match gnitz_wire::sys_family_index(self as u64) {
             Some(i) => i,
             None => panic!("SysFamily variant is not a wire family"),
@@ -325,7 +340,7 @@ impl SysFamily {
 
     /// This family's name.
     #[inline]
-    pub(crate) fn name(self) -> &'static str {
+    pub(in crate::catalog) fn name(self) -> &'static str {
         self.wire().name
     }
 
@@ -495,3 +510,35 @@ const _: () = {
         i += 1;
     }
 };
+
+/// A set of catalog ids, sorted once so every probe is a binary search: the
+/// probes run per row of a client-supplied block bounded only by the frame.
+#[derive(Debug, Default)]
+pub(in crate::catalog) struct IdSet(Vec<u64>);
+
+impl IdSet {
+    pub(in crate::catalog) fn new(ids: impl IntoIterator<Item = u64>) -> Self {
+        let mut ids: Vec<u64> = ids.into_iter().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        IdSet(ids)
+    }
+
+    pub(in crate::catalog) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(in crate::catalog) fn contains(&self, id: u64) -> bool {
+        self.0.binary_search(&id).is_ok()
+    }
+
+    /// The ids, strictly ascending.
+    pub(in crate::catalog) fn ids(&self) -> &[u64] {
+        &self.0
+    }
+
+    /// These ids and `more`.
+    pub(in crate::catalog) fn with(self, more: impl IntoIterator<Item = u64>) -> Self {
+        IdSet::new(self.0.into_iter().chain(more))
+    }
+}

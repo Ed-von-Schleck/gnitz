@@ -303,7 +303,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
 fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
     let (mut engine, tid) = engine_with_table("push_behind_read");
     let schema = make_schema_u64_i64();
-    let record = engine.schema_record(tid).expect("a registered table");
+    let record = engine.wire_target(tid).unwrap().1.clone();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 

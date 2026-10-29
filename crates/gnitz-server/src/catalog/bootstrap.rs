@@ -4,7 +4,7 @@ use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreC
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 
-use super::cache::{CatalogCacheSet, RelationEntry};
+use super::relations::{CatalogCacheSet, RelationEntry};
 use super::sys_tables::SysFamily;
 use super::CatalogEngine;
 use crate::query::DagEngine;
@@ -29,14 +29,21 @@ impl UnreplayedCatalog {
         Ok(())
     }
 
-    /// Load the sequence scalars and fire every family's hooks over its rows, then
-    /// lay every relation's children out for the launched worker count and decide
-    /// which views rebuild — what a store open reads.
+    /// Load the sequence scalars, fire every family's hooks over its rows, relay
+    /// and reclaim children for the launched worker count, then decide which views
+    /// rebuild — what a store open reads.
     pub(crate) fn replay(self) -> Result<CatalogEngine, String> {
         let mut engine = self.0;
         engine.load_sequence_scalars();
         engine.replay_catalog()?;
-        engine.settle_derived_state()?;
+        // Relay each base table onto the launched worker count and drop the children
+        // no relation owns any more before the verdict reads every launched rank's
+        // manifests — here, where no worker exists yet.
+        engine
+            .registry
+            .reconcile_child_dirs(|id| engine.dag.layout_of(id))
+            .map_err(|e| format!("child-dir sweep failed: {e}"))?;
+        engine.dag.decide_rebuild(&engine.registry, engine.resume_at);
         Ok(engine)
     }
 }
@@ -58,7 +65,7 @@ impl CatalogEngine {
             caches: CatalogCacheSet::default(),
             next_id: gnitz_wire::FIRST_USER_TABLE_ID,
             system_zone: 0,
-            resume_generation: 0,
+            resume_at: None,
         };
 
         for family in SysFamily::ALL {
@@ -127,11 +134,7 @@ impl CatalogEngine {
         for family in SysFamily::ALL {
             let rows = self.sys_relation(family).full_scan();
             self.raise_next_id(family, &rows);
-            // Each registration reads its own column records; the system families'
-            // entries are compile-time data.
-            if family != SysFamily::Column {
-                self.fire_hooks(family, &rows)?;
-            }
+            self.fire_hooks(family, &rows)?;
         }
         Ok(())
     }

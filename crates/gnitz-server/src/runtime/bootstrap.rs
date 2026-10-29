@@ -167,7 +167,7 @@ fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: CommittedTail, slot: 
     // Before the master's boot rewind puts the write cursor back to 0: these rows
     // still live only in SAL entries a second crash would then overwrite.
     debug_assert!(
-        !tail.holds_pushes() || catalog.durable_generation() > catalog.resume_generation,
+        !tail.holds_pushes() || catalog.resume_at.is_none_or(|g| catalog.durable_generation() > g),
         "boot base flush of replayed pushes without the pre-fork generation advance ahead of it",
     );
     catalog
@@ -301,7 +301,7 @@ fn master_pre_fork_recovery(mut opened: UnreplayedCatalog, tail: CommittedTail) 
     stage_system_tail(tail, &mut opened)?;
     let mut catalog = opened.replay().map_err(|e| format!("failed to replay catalog: {e}"))?;
     if tail.holds_pushes() {
-        // G → G+1, the resume generation left at G: the workers' boot flush moves
+        // G → G+1, the resume point left at G: the workers' boot flush moves
         // the base stores past what the views at G integrate, so until
         // `boot_checkpoint` restamps at G+1 a crash rebuilds every view instead
         // of resuming it.

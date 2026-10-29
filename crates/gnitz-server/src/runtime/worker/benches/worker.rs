@@ -31,7 +31,7 @@ fn arm(
     let rows: Vec<_> = (0..held).map(|i| (i, 1, i as i64)).collect();
     let batch = make_batch_raw(&make_schema_u64_i64(), &rows);
     engine.registry.ingest(tid, batch).unwrap();
-    let record = engine.schema_record(tid).expect("a registered table");
+    let record = engine.wire_target(tid).unwrap().1.clone();
     let (mut wp, sal, rx) = worker_over(&mut engine, 1 << 26, 32 << 20);
     // Independent client requests: each under a hold of its own.
     for id in 1..=requests {

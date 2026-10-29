@@ -115,8 +115,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
         "index must rebuild from source exactly once on reopen, not double"
     );
 
-    engine2.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine2);
 }
 
 // ── index_rebuilds_across_chunk_boundary ─────────────────────────────────
@@ -132,16 +131,11 @@ fn index_rebuilds_across_chunk_boundary() {
 
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     let mut next = 0usize;
     while next < n {
-        let mut bb = BatchBuilder::new(&schema);
-        for i in next..(next + 8192).min(n) {
-            bb.begin_row(i as u128, 1);
-            bb.put_u64((i * 10) as u64);
-            bb.end_row();
-        }
-        engine.registry.ingest(tid, bb.finish()).unwrap();
+        let end = (next + 8192).min(n);
+        let chunk = rows(&engine, tid, 1, next as u64..end as u64, |i| [i * 10]);
+        engine.registry.ingest(tid, chunk).unwrap();
         next += 8192;
     }
 
@@ -168,8 +162,7 @@ fn index_rebuilds_across_chunk_boundary() {
         "index must rebuild across the chunk boundary exactly once"
     );
 
-    engine2.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine2);
 }
 
 // ── Index checkpoint resume ─────────────────────────────────────────────
@@ -212,7 +205,7 @@ fn index_rebuild_is_skipped_after_resume() {
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(
-        engine.topology_matches() && engine.resume_generation == g,
+        engine.resume_at == Some(g),
         "a matching topology leaves the recovered generation as the whole verdict"
     );
     assert!(
@@ -225,8 +218,7 @@ fn index_rebuild_is_skipped_after_resume() {
         "the resumed index holds exactly one materialisation"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── index_rebuild_forced_by_topology_change ─────────────────────────────
@@ -239,7 +231,7 @@ fn index_rebuild_forced_by_topology_change() {
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(
-        !engine.topology_matches(),
+        engine.resume_at.is_none(),
         "a foreign topology must refuse every manifest"
     );
     assert!(
@@ -252,8 +244,7 @@ fn index_rebuild_forced_by_topology_change() {
         "the open's rebuild replaces the erased state, never adds to it"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── The view twin: one policy for a view's output store and its traces ───
@@ -266,8 +257,7 @@ fn index_rebuild_forced_by_topology_change() {
 /// A push of row `(id, val)` into [`seed_base`]'s table `tid`, and its tick.
 fn tick(engine: &mut CatalogEngine, tid: u64, id: u64, val: u64) {
     let pushed = rows(engine, tid, 1, [id], |_| [val]);
-    engine.ingest_unticked(tid, pushed).unwrap();
-    seal_and_tick(engine, tid);
+    push_and_tick(engine, tid, pushed);
 }
 
 /// `public.vbase` plus a backfilled `DISTINCT` view over it, whose operator trace
@@ -304,8 +294,7 @@ fn view_traces_resume_with_their_output_store() {
     tick(&mut engine, tid, 0, 1);
     assert_eq!(net_weight(&engine, vid), N, "a resumed trace already holds the row");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── an_unrun_view_checkpoints_its_traces_and_resumes ────────────────────
@@ -329,8 +318,7 @@ fn an_unrun_view_checkpoints_its_traces_and_resumes() {
     tick(&mut engine, tid, 0, 1);
     assert_eq!(net_weight(&engine, vid), N, "a resumed trace still holds the row");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── a_missing_trace_child_invalidates_the_view ──────────────────────────
@@ -350,8 +338,7 @@ fn a_missing_trace_child_invalidates_the_view() {
         "a view missing a trace child must be rebuilt, not resumed"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// Remove the trace child view `vid` published in `dir`, as a crash part-way
@@ -379,11 +366,24 @@ fn register_chain(
     let top = seg + 1;
     let identity = crate::test_support::identity_circuit(tid, gnitz_wire::ReadBound::None);
     let distinct = distinct_circuit(seg);
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, 1, seg, &format!("_seg{seg}"), 0, 0, top);
-    push_view_tab_row(&mut bb, 1, top, &format!("top{top}"), capacity_bytes, 0, 0);
+    let rows = sys_batch([
+        (
+            ViewTabRow {
+                owner_view_id: top,
+                ..view_tab_row(seg, &format!("_seg{seg}"))
+            },
+            1,
+        ),
+        (
+            ViewTabRow {
+                capacity_bytes,
+                ..view_tab_row(top, &format!("top{top}"))
+            },
+            1,
+        ),
+    ]);
     let created = [(seg, &identity, cols), (top, &distinct, cols)];
-    apply_ddl(engine, view_blocks(created, bb.finish()))?;
+    apply_ddl(engine, view_blocks(created, rows))?;
     Ok((seg, top))
 }
 
@@ -436,8 +436,7 @@ fn a_chain_resumes_or_rebuilds_as_one() {
     assert!(engine.dag.awaits_rebuild(top), "the owner lost its trace");
     assert!(engine.dag.awaits_rebuild(seg), "its segment rebuilds with it");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── only_its_own_unbounded_chain_scans_a_segment ────────────────────────
@@ -445,8 +444,7 @@ fn a_chain_resumes_or_rebuilds_as_one() {
 // nothing, and a capacity-bounded owner would hydrate from nothing.
 #[test]
 fn only_its_own_unbounded_chain_scans_a_segment() {
-    let dir = temp_dir("only_its_chain_scans_a_segment");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("only_its_chain_scans_a_segment");
     let (tid, cols) = seed_base(&mut engine, "public.sbase");
     let (seg, _) = register_chain(&mut engine, tid, &cols, 0).unwrap();
 
@@ -461,8 +459,7 @@ fn only_its_own_unbounded_chain_scans_a_segment() {
         .unwrap_err();
     assert!(indexed.contains("a segment of a view's chain"), "got: {indexed}");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── a_rejected_view_opens_empty_and_loses_its_stale_traces ──────────────
@@ -486,6 +483,5 @@ fn a_rejected_view_opens_empty_and_loses_its_stale_traces() {
     assert!(!std::path::Path::new(&stale).exists(), "a stale trace is erased");
     assert_eq!(net_weight(&engine, vid), 0, "the output store opens empty");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }

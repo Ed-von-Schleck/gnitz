@@ -930,7 +930,7 @@ async fn removed_references(
             }
             let cascading = disp
                 .cat()
-                .fk_children_of(tid)
+                .fks_as_parent(tid)
                 .iter()
                 .filter(|e| e.on_delete == FkAction::Cascade);
             for &edge in cascading {

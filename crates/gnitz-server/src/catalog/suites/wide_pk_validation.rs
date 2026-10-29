@@ -64,8 +64,7 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24
 
 #[test]
 fn index_circuit_for_col_finds_index_and_uniqueness() {
-    let dir = temp_dir("index_circuit_for_col");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("index_circuit_for_col");
     let tid = engine.next_id;
 
     // setup_wide_unique installs a UNIQUE secondary index on source col 3.
@@ -93,14 +92,12 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
         "unknown table has no circuit"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
 fn wide_pk_seek_family_resolves_non_pk_col() {
-    let dir = temp_dir("wide_fk_nonpk");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("wide_fk_nonpk");
 
     // Parent: wide PK (cols 0..3) + non-PK column `email` (col 3). This is the
     // only test that resolves a genuinely wide (24-byte) PK via the byte-keyed
@@ -130,8 +127,7 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
     assert_eq!(seen.len(), 1, "the live wide-PK parent row");
     assert_eq!(read_u64_col(&seen, 0), 555, "resolved the referenced email value");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 fn read_u64_col(batch: &Batch, payload_idx: usize) -> u64 {
@@ -143,8 +139,7 @@ fn read_u64_col(batch: &Batch, payload_idx: usize) -> u64 {
 
 #[test]
 fn native_and_byte_point_reads_agree_narrow() {
-    let dir = temp_dir("seek_bytes_narrow");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("seek_bytes_narrow");
 
     // Plain narrow U64-PK table created through the normal path.
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
@@ -183,6 +178,5 @@ fn native_and_byte_point_reads_agree_narrow() {
         }
     }
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }

@@ -2,7 +2,6 @@ mod alter_tests;
 mod atomicity_tests;
 mod bundle_precheck_tests;
 mod catalog_view_tests;
-mod compound_pk_smoke;
 mod ddl_fixture;
 use ddl_fixture::make_secondary_index_name;
 mod ddl_tests;
@@ -29,8 +28,8 @@ use gnitz_store::relation::{
     relation_dir, ChildKind, IndexClaim, Relation, RelationKind, RelationSpec, SecondaryIndex, StoreConfig,
 };
 use gnitz_wire::{
-    payload_u64, CatalogColumn, Circuit, ColTabRow, NullKeys, PkColList, ReindexRole, SysRow, TypeCode,
-    PK_LIST_PACKED_FLAG,
+    payload_u64, CatalogColumn, Circuit, ColTabRow, NullKeys, PkColList, ReindexRole, SysRow, TableTabRow, TypeCode,
+    ViewTabRow, PK_LIST_PACKED_FLAG,
 };
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
@@ -57,9 +56,9 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::
 use crate::test_support::{
     apply_ddl, bundle, circuit_batch, cmp_all, col_def, col_tab_batch, cols_of, distinct_circuit, equi_join_circuit,
     fk_def, fk_def_on_delete, idx_tab_batch, left_join_engine, negate_chain, net_weight, nullable_def, opk_pk,
-    pk_payload_schema, push_sys_row, push_view_tab_row, read_rows, refusal, register_identity_view, scan_all,
-    schema_tab_batch, scratch_dir, sum_weights, table_tab_batch, try_register_identity_view, try_register_view,
-    two_term_join_circuit, uuid_def, view_blocks,
+    pk_payload_schema, push_and_tick, push_sys_row, read_rows, refusal, register_identity_view, scan_all,
+    schema_tab_batch, scratch_dir, sum_weights, sys_batch, table_tab_batch, table_tab_row, try_register_identity_view,
+    try_register_view, two_term_join_circuit, uuid_def, view_blocks, view_tab_row,
 };
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
@@ -83,7 +82,7 @@ fn idx_weights_for(engine: &CatalogEngine, idx_id: u64) -> Vec<i64> {
     let mut c = engine.sys_relation(SysFamily::Index).cursor();
     let mut v = Vec::new();
     while c.valid {
-        if gnitz_wire::widen_pk_be(c.current_pk_bytes()) as u64 == idx_id {
+        if gnitz_wire::sys_leading_id(c.current_pk_bytes()) == idx_id {
             v.push(c.current_weight);
         }
         c.advance();
@@ -108,14 +107,6 @@ fn count_records(mut c: ReadCursor) -> usize {
         c.advance();
     }
     count
-}
-
-/// A single-row unbounded-VIEW_TAB batch for tests that register a view via the
-/// raw system-table path.
-fn build_view_tab_row(vid: u64, view_name: &str) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, 1, vid, view_name, 0, 0, 0);
-    bb.finish()
 }
 
 /// Reserve `count` SERIAL ids of `seq`: their base and the `sequences` delta it
@@ -149,6 +140,25 @@ fn temp_dir(name: &str) -> String {
     scratch_dir("catalog", name)
 }
 
+/// A fresh engine on an emptied scratch directory named `name`.
+fn fresh(name: &str) -> CatalogEngine {
+    CatalogEngine::open(&temp_dir(name), 1).unwrap()
+}
+
+/// Close `engine`, flushing it, then remove its data directory.
+fn finish(engine: CatalogEngine) {
+    let dir = engine.registry.base_dir().to_owned();
+    engine.close();
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Drop `engine` unflushed and remove its data directory.
+fn discard(engine: CatalogEngine) {
+    let dir = engine.registry.base_dir().to_owned();
+    drop(engine);
+    let _ = fs::remove_dir_all(dir);
+}
+
 // An arbitrary fixed 128-bit value for UUID columns; the bit pattern is
 // irrelevant, only that it round-trips through a U128/UUID column.
 const UUID_A: u128 = 0x0000_0000_0000_AAAA_0000_0000_0000_BBBB;
@@ -169,13 +179,11 @@ fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
         .expect("three U64 PK columns encode to 24 bytes")
 }
 
-/// An empty `public.t` with `cols` (PK = column 0) in a fresh temp dir. Returns
-/// the dir too, so a test that inspects or removes it does not re-derive it.
-fn table_fixture(name: &str, cols: &[CatalogColumn]) -> (CatalogEngine, u64, String) {
-    let dir = temp_dir(name);
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+/// An empty `public.t` with `cols` (PK = column 0) in a fresh temp dir.
+fn table_fixture(name: &str, cols: &[CatalogColumn]) -> (CatalogEngine, u64) {
+    let mut engine = fresh(name);
     let tid = engine.create_table("public.t", cols, &[0]).unwrap();
-    (engine, tid, dir)
+    (engine, tid)
 }
 
 /// Backfill `view`, as a worker's `Backfill` does.
@@ -207,6 +215,90 @@ fn traced_view(engine: &mut CatalogEngine, source: u64, name: &str, cols: &[Cata
     let vid = try_register_view(engine, circuit, name, cols, 0, 0).unwrap();
     backfill(engine, vid);
     vid
+}
+
+/// A stream `name` with `cols`, PK = column 0.
+fn create_stream(engine: &mut CatalogEngine, name: &str, cols: &[CatalogColumn]) -> u64 {
+    engine
+        .create_table_with(
+            name,
+            cols,
+            &[0],
+            gnitz_wire::TableProps { stream: true, ..Default::default() },
+        )
+        .unwrap()
+}
+
+/// `source` holds rows no SAL replay brings back, so a view reaching it must
+/// await a rebuild at reopen, and the verdict cascades to a view over that one.
+///
+/// Every view here gets a matching topology and an output manifest at the
+/// committed generation, published by an ephemeral round that skips the filter
+/// `flush_ephemeral_round` applies, so the `source` clause alone decides the
+/// verdict. A view over the base table `public.t` is the control: it resumes.
+fn assert_unreplayed_source_rebuilds_at_reopen(mut engine: CatalogEngine, source: u64, source_cols: &[CatalogColumn]) {
+    let dir = &engine.registry.base_dir().to_owned();
+    let cols = crate::test_support::u64_i64_cols();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+
+    let direct = register_identity_view(&mut engine, source, "v_direct", source_cols);
+    let downstream = register_identity_view(&mut engine, direct, "v_downstream", source_cols);
+    let over_table = register_identity_view(&mut engine, tid, "v_table", &cols);
+
+    // The two halves of the resume verdict, written the way a boot writes them,
+    // then every view's output store published through an ephemeral round at
+    // that generation — a completed checkpoint.
+    engine.record_topology(1).unwrap();
+    let g = engine.advance_durable_generation().unwrap();
+    engine.registry.checkpoint_ephemeral([], g, |_| true).unwrap();
+    engine.close();
+
+    let engine = CatalogEngine::open(dir, 1).unwrap();
+    assert!(
+        engine.dag.awaits_rebuild(direct),
+        "a direct unreplayed source invalidates"
+    );
+    assert!(engine.dag.awaits_rebuild(downstream), "and the verdict cascades");
+    assert!(
+        !engine.dag.awaits_rebuild(over_table),
+        "a checkpointed view over a base table resumes, so the rejection is about the source"
+    );
+
+    discard(engine);
+}
+
+/// An ephemeral round publishes nothing of a view `source` reaches — neither
+/// its output store nor a trace — and everything of a view over the base table
+/// `public.t`; the boot then rebuilds exactly what the round left out.
+fn assert_round_publishes_nothing_reaching(mut engine: CatalogEngine, source: u64, source_cols: &[CatalogColumn]) {
+    let dir = &engine.registry.base_dir().to_owned();
+    let cols = crate::test_support::u64_i64_cols();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+
+    let direct = traced_view(&mut engine, source, "v_direct", source_cols);
+    let downstream = traced_view(&mut engine, direct, "v_downstream", source_cols);
+    let over_table = traced_view(&mut engine, tid, "v_table", &cols);
+
+    engine.record_topology(1).unwrap();
+    let g = engine.advance_durable_generation().unwrap();
+    engine.flush_ephemeral_round(g).unwrap();
+
+    assert_eq!(published_children(dir, direct), Vec::<String>::new());
+    assert_eq!(published_children(dir, downstream), Vec::<String>::new());
+    let table_children = published_children(dir, over_table);
+    assert!(table_children.contains(&"w0of1".to_string()), "got {table_children:?}");
+    assert!(
+        table_children.iter().any(|c| c.starts_with("scratch_")),
+        "the trace of a view over a table is published: {table_children:?}"
+    );
+    engine.close();
+
+    let engine = CatalogEngine::open(dir, 1).unwrap();
+    assert!(engine.dag.awaits_rebuild(direct));
+    assert!(engine.dag.awaits_rebuild(downstream));
+    assert!(!engine.dag.awaits_rebuild(over_table));
+
+    discard(engine);
 }
 
 /// `(rows, summed weight)` of relation `id`: equal iff every row stands at weight 1.
@@ -247,7 +339,7 @@ fn ingest_fixture<const N: usize>(
     n: u64,
     cells: impl Fn(u64) -> [u64; N],
 ) -> (CatalogEngine, u64) {
-    let (mut engine, tid, _dir) = table_fixture(name, cols);
+    let (mut engine, tid) = table_fixture(name, cols);
     engine.registry.ingest(tid, rows(&engine, tid, 1, 0..n, cells)).unwrap();
     (engine, tid)
 }
@@ -257,23 +349,10 @@ fn scramble(id: u64) -> u64 {
     id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
-/// Drop `engine` unflushed and remove its data directory.
-fn discard(engine: CatalogEngine) {
-    let dir = engine.registry.base_dir().to_owned();
-    drop(engine);
-    let _ = fs::remove_dir_all(dir);
-}
-
 /// A one-row `public` TABLE_TAB `+1` under explicit packed `pk_col_idx` and
 /// `flags` words — the shapes `create_table` cannot make.
 fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: u64) -> Batch {
-    let row = gnitz_wire::TableTabRow {
-        table_id: tid,
-        schema_id: PUBLIC_SCHEMA_ID,
-        name: table_name.into(),
-        pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]),
-        flags,
-    };
+    let row = TableTabRow { flags, ..table_tab_row(tid, table_name) };
     crate::test_support::forged_sys_batch(row, gnitz_wire::TableTabSlot::pk_col_idx as usize, pk_col_idx)
 }
 
@@ -283,7 +362,7 @@ fn table_tab_row_words(tid: u64, table_name: &str, pk_col_idx: u64, flags: u64) 
 fn col_alter_pair(owner_id: u64, col_idx: i64, old: &CatalogColumn, mutate: impl FnOnce(&mut CatalogColumn)) -> Batch {
     let mut altered = old.clone();
     mutate(&mut altered);
-    crate::test_support::sys_batch([
+    sys_batch([
         (ColTabRow::of(owner_id, col_idx as u64, &old.def, old.fk), -1),
         (ColTabRow::of(owner_id, col_idx as u64, &altered.def, altered.fk), 1),
     ])

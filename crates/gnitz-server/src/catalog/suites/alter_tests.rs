@@ -30,11 +30,10 @@ fn table_rename_pair(engine: &CatalogEngine, tid: u64, new_name: &str) -> Batch 
 
 #[test]
 fn rename_fires_no_cascade_and_leaves_dir_untouched() {
-    let dir = temp_dir("alter_no_cascade");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("alter_no_cascade");
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
     let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
-    let table_path = relation_dir(&dir, tid);
+    let table_path = relation_dir(engine.registry.base_dir(), tid);
     assert!(Path::new(&table_path).exists());
 
     let pair = table_rename_pair(&engine, tid, "renamed");
@@ -55,8 +54,7 @@ fn rename_fires_no_cascade_and_leaves_dir_untouched() {
         "a rename must leave exactly one live row"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── Id-only dirs resume after a rename + reopen ─────────────────────────────
@@ -96,8 +94,7 @@ fn rename_then_reopen_resolves_flushed_data() {
         "flushed row must resolve after rename + reopen (id-only dir was untouched)"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
@@ -105,15 +102,13 @@ fn valid_long_name_rename_accepted() {
     // Regression against a naive region `memcmp`: a name > 12 bytes lives in the
     // blob heap, so the `-1` and live rows carry independent heap offsets. The CAS
     // compares German-string content, so a valid rename to a long name is accepted.
-    let dir = temp_dir("alter_long_ok");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("alter_long_ok");
     let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.original_long_name", &cols, &[0]).unwrap();
     let pair = table_rename_pair(&engine, tid, "renamed_to_a_long_name");
     apply_ddl(&mut engine, [(SysFamily::Table, pair.clone())]).unwrap();
     assert!(engine.get_by_name("public", "renamed_to_a_long_name").is_some());
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── The column-ALTER owner guard covers every rewrite pair ──────────────────
@@ -126,8 +121,7 @@ fn rename_to(new_name: &str) -> impl FnOnce(&mut CatalogColumn) + '_ {
 /// the trust boundary that stops it.
 #[test]
 fn column_rename_on_non_base_owner_rejected() {
-    let dir = temp_dir("alter_col_owner");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("alter_col_owner");
 
     let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
@@ -138,16 +132,14 @@ fn column_rename_on_non_base_owner_rejected() {
         .unwrap_err();
     assert!(err.contains("not a user base table"), "view owner: {err}");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// The two guards a rename skips: a rename is legal on a PK column and on a
 /// table with dependent views (views bind columns by ordinal).
 #[test]
 fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
-    let dir = temp_dir("alter_col_rename_ok");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("alter_col_rename_ok");
 
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
@@ -167,8 +159,7 @@ fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
             .expect("renaming a column with dependent views is legal");
     }
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── The column-ALTER arm owns every drop guard ──────────────────────────────
@@ -184,8 +175,7 @@ fn unnull(c: &mut CatalogColumn) {
 /// A column an FK binds cannot be hidden.
 #[test]
 fn hiding_a_foreign_key_column_rejected() {
-    let dir = temp_dir("alter_hide_fk");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("alter_hide_fk");
     let ptid = engine
         .create_table("public.p", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
@@ -197,14 +187,13 @@ fn hiding_a_foreign_key_column_rejected() {
         .unwrap_err();
     assert!(err.contains("carries a foreign key"), "{err}");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
 fn hiding_an_indexed_column_rejected_but_unnulling_it_accepted() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("c", TypeCode::U64)];
-    let (mut engine, tid, dir) = table_fixture("alter_hide_indexed", &cols);
+    let (mut engine, tid) = table_fixture("alter_hide_indexed", &cols);
     engine.create_index("public.t", &["c"], false).unwrap();
 
     let err = engine
@@ -215,14 +204,13 @@ fn hiding_an_indexed_column_rejected_but_unnulling_it_accepted() {
         .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], unnull))
         .expect("DROP NOT NULL on an indexed column is legal");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
 fn hiding_or_unnulling_a_pk_column_rejected() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
-    let (engine, tid, dir) = table_fixture("alter_pk_col", &cols);
+    let (engine, tid) = table_fixture("alter_pk_col", &cols);
 
     for mutate in [hide as fn(&mut CatalogColumn), unnull] {
         let err = engine
@@ -231,15 +219,13 @@ fn hiding_or_unnulling_a_pk_column_rejected() {
         assert!(err.contains("primary-key"), "{err}");
     }
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// The engine holds a SERIAL table to one PK column of a SERIAL-eligible type.
 #[test]
 fn a_serial_table_has_one_narrow_integer_pk() {
-    let dir = temp_dir("serial_pk");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("serial_pk");
     let serial = gnitz_wire::TableProps { serial: true, ..Default::default() };
     let cols = |pk_tc| vec![col_def("id", pk_tc), col_def("v", TypeCode::U64)];
 
@@ -263,8 +249,7 @@ fn a_serial_table_has_one_narrow_integer_pk() {
         .create_table_with("public.ok", &cols(TypeCode::I64), &[0], serial)
         .expect("a lone I64 SERIAL PK is legal");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// Two visible columns of one name make the relation unregisterable at the next
@@ -273,7 +258,7 @@ fn a_serial_table_has_one_narrow_integer_pk() {
 #[test]
 fn a_duplicate_visible_column_name_is_named_before_dependent_views() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
-    let (mut engine, tid, dir) = table_fixture("alter_add_dup_dep", &cols);
+    let (mut engine, tid) = table_fixture("alter_add_dup_dep", &cols);
     register_identity_view(&mut engine, tid, "vw", &cols);
 
     let add = crate::test_support::sys_batch([(ColTabRow::of(tid, 2, &nullable_def("v", TypeCode::U64).def, None), 1)]);
@@ -284,8 +269,7 @@ fn a_duplicate_visible_column_name_is_named_before_dependent_views() {
         .unwrap_err();
     assert!(err.contains("duplicate column name"), "rename: {err}");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// Once hidden, a column is gone from every surface: neither a rename nor a new
@@ -293,7 +277,7 @@ fn a_duplicate_visible_column_name_is_named_before_dependent_views() {
 #[test]
 fn a_dropped_column_cannot_be_renamed_or_indexed() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("a", TypeCode::U64)];
-    let (mut engine, tid, dir) = table_fixture("alter_dropped_col", &cols);
+    let (mut engine, tid) = table_fixture("alter_dropped_col", &cols);
     apply_ddl(
         &mut engine,
         [(SysFamily::Column, col_alter_pair(tid, 1, &cols[1], hide))],
@@ -311,8 +295,7 @@ fn a_dropped_column_cannot_be_renamed_or_indexed() {
     let err = engine.precheck_family(SysFamily::Index, &idx).unwrap_err();
     assert!(err.contains("dropped"), "index: {err}");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── The hook canonicalizer repairs a `+1`-first rewrite pair ────────────────
@@ -320,8 +303,7 @@ fn a_dropped_column_cannot_be_renamed_or_indexed() {
 
 #[test]
 fn insert_first_rename_pair_lands_the_new_name() {
-    let dir = temp_dir("alter_insert_first_pair");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("alter_insert_first_pair");
     let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
     let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
 
@@ -352,15 +334,14 @@ fn insert_first_rename_pair_lands_the_new_name() {
         "a rename leaves exactly one live row"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── A column ALTER is confined to its own bundle ─────────────────────────────
 
 #[test]
 fn a_column_alter_must_be_its_bundles_only_change() {
-    let (mut engine, tid, dir) = table_fixture("alter_confined_to_bundle", &u64_i64_cols());
+    let (mut engine, tid) = table_fixture("alter_confined_to_bundle", &u64_i64_cols());
     let other = engine.create_table("public.u", &u64_i64_cols(), &[0]).unwrap();
     let append = |owner: u64, bb: &mut BatchBuilder| {
         ColTabRow::of(owner, 2, &nullable_def("w", TypeCode::I64).def, None).write(bb, 1);
@@ -387,6 +368,14 @@ fn a_column_alter_must_be_its_bundles_only_change() {
     let err = apply_ddl(&mut engine, [(SysFamily::Column, bb.finish())]).unwrap_err();
     assert!(err.contains("only change"), "{err}");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    // One column block changing two columns of one owner: a rename pair on
+    // column 1 and an append at index 2.
+    let mut cols = col_alter_pair(tid, 1, &u64_i64_cols()[1], rename_to("v2"));
+    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
+    append(tid, &mut bb);
+    cols.append_batch(&bb.finish());
+    let err = apply_ddl(&mut engine, [(SysFamily::Column, cols)]).unwrap_err();
+    assert!(err.contains("only change"), "{err}");
+
+    finish(engine);
 }

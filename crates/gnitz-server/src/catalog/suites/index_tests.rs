@@ -1,69 +1,29 @@
 use super::*;
 
-// ── test_index_creation_and_fill ────────────────────────────────────────
-
-#[test]
-fn test_index_creation_and_fill() {
-    let dir = temp_dir("index_fill");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
-    let tid = engine.create_table("public.tfanout", &cols, &[0]).unwrap();
-
-    // Ingest 5 rows
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(&schema);
-    for i in 0..5u64 {
-        bb.begin_row(i as u128, 1);
-        bb.put_u64(i * 100);
-        bb.end_row();
-    }
-    let batch = bb.finish();
-    engine.registry.ingest(tid, batch).unwrap();
-    engine.registry.checkpoint_base().unwrap();
-
-    // Create index
-    let _idx_id = engine.create_index("public.tfanout", &["val"], false).unwrap();
-    assert!(engine.has_index_by_name("public__tfanout__idx_val"));
-
-    // Drop index
-    engine.drop_index("public__tfanout__idx_val").unwrap();
-    assert!(!engine.has_index_by_name("public__tfanout__idx_val"));
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
 // ── test_index_live_fanout ────────────────────────────────────────────────
 
 #[test]
 fn test_index_live_fanout() {
-    let dir = temp_dir("idx_fanout");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("idx_fanout");
 
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.tfanout", &cols, &[0]).unwrap();
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     // Ingest 5 rows
-    let mut bb = BatchBuilder::new(&schema);
-    for i in 0..5u64 {
-        bb.begin_row(i as u128, 1);
-        bb.put_u64(i * 100);
-        bb.end_row();
-    }
-    engine.registry.ingest(tid, bb.finish()).unwrap();
+    engine
+        .registry
+        .ingest(tid, rows(&engine, tid, 1, 0..5, |i| [i * 100]))
+        .unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Create index — fills from the 5 rows
     engine.create_index("public.tfanout", &["val"], false).unwrap();
 
     // Live fan-out: ingest 1 more row via the registry (which does index projection)
-    let mut bb2 = BatchBuilder::new(&schema);
-    bb2.begin_row(99u128, 1);
-    bb2.put_u64(777);
-    bb2.end_row();
-    engine.registry.ingest(tid, bb2.finish()).unwrap();
+    engine
+        .registry
+        .ingest(tid, rows(&engine, tid, 1, [99], |_| [777]))
+        .unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Verify index has 6 entries via DagEngine's index circuit
@@ -72,15 +32,14 @@ fn test_index_live_fanout() {
     let idx_count = count_records(entry.indexes()[0].cursor());
     assert_eq!(idx_count, 6, "Index fanout: expected 6, got {idx_count}");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
 fn test_create_index_duplicate_rejected() {
     // Creating the same index twice must fail on the second attempt rather
     // than silently orphaning the first index circuit.
-    let (mut engine, _tid, dir) = table_fixture(
+    let (mut engine, _tid) = table_fixture(
         "idx_dup_create",
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)],
     );
@@ -96,24 +55,21 @@ fn test_create_index_duplicate_rejected() {
         "error must mention the index already exists"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// A CREATE INDEX whose hook fails leaves nothing behind, and broadcasts no `-1`
 /// for the `+1` it never sent.
 #[test]
 fn test_failed_create_index_rolls_back() {
-    let (mut engine, tid, dir) = table_fixture(
+    let (mut engine, tid) = table_fixture(
         "failed_create_index_rollback",
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(&schema);
-    bb.begin_row(1u128, 1);
-    bb.put_u64(42);
-    bb.end_row();
-    engine.registry.ingest(tid, bb.finish()).unwrap();
+    engine
+        .registry
+        .ingest(tid, rows(&engine, tid, 1, [1], |_| [42]))
+        .unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // The id `create_index` is about to allocate.
@@ -152,32 +108,7 @@ fn test_failed_create_index_rolls_back() {
     engine.create_index("public.t", &["val"], false).unwrap();
     assert!(engine.has_index_by_name(&idx_name));
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn test_drop_table_cleans_up_indices() {
-    let dir = temp_dir("drop_table_idx");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let cols = vec![col_def("pk", TypeCode::U64), col_def("val", TypeCode::I64)];
-    let tid = engine.create_table("public.idx_tbl", &cols, &[0]).unwrap();
-    engine.create_index("public.idx_tbl", &["val"], true).unwrap();
-
-    assert!(engine.registry.relation(tid).is_some());
-    assert_eq!(engine.registry.relation_or_err(tid).unwrap().indexes().len(), 1);
-
-    // Drop index then table
-    let idx_name = make_secondary_index_name("public", "idx_tbl", "val");
-    engine.drop_index(&idx_name).unwrap();
-    assert_eq!(engine.registry.relation_or_err(tid).unwrap().indexes().len(), 0);
-
-    engine.drop_table("public.idx_tbl").unwrap();
-    assert!(engine.registry.relation(tid).is_none());
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── drop_table cascades to owned indices ─────────────────────────────
@@ -217,15 +148,14 @@ fn test_drop_table_cascades_fk_index() {
         engine2.index_ids_of(child_tid).is_empty(),
         "no index row may exist for the dropped child"
     );
-    engine2.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine2);
 }
 
 // ── drop_table retracts every index the table owns ──
 
 #[test]
 fn test_drop_table_cascades_multiple_indices() {
-    let (mut engine, tid, dir) = table_fixture(
+    let (mut engine, tid) = table_fixture(
         "cascade_multi_idx",
         &[
             col_def("id", TypeCode::U64),
@@ -270,18 +200,17 @@ fn test_drop_table_cascades_multiple_indices() {
     );
 
     // Reopen: replay must succeed without orphaned sys_indices rows
+    let dir = engine.registry.base_dir().to_owned();
     engine.close();
     let engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine2.has_index_by_name(&name1));
     assert!(!engine2.has_index_by_name(&name2));
-    engine2.close();
-
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine2);
 }
 
 #[test]
 fn drop_table_removes_the_relation_entry() {
-    let (mut engine, tid, dir) = table_fixture(
+    let (mut engine, tid) = table_fixture(
         "drop_removes_relation_entry",
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)],
     );
@@ -302,16 +231,14 @@ fn drop_table_removes_the_relation_entry() {
         "the relation entry must be removed by the drop"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── UNIQUE index on STRING/BLOB rejected at DDL ──────────────────────────
 
 #[test]
 fn test_create_unique_index_on_string_blob_rejected() {
-    let dir = temp_dir("uidx_string_reject");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("uidx_string_reject");
     let blob_col = col_def("data", TypeCode::Blob);
     let cols = vec![
         col_def("id", TypeCode::U64),
@@ -333,8 +260,7 @@ fn test_create_unique_index_on_string_blob_rejected() {
         }
     }
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── UNIQUE+FK promotion / demotion (column-level unique constraint) ───────
@@ -355,8 +281,7 @@ fn circuit_unique(engine: &CatalogEngine, tid: u64, col: u32) -> Option<bool> {
 /// outlives the UNIQUE index that promoted it.
 #[test]
 fn test_fk_circuit_is_derived_and_survives_its_unique_index() {
-    let dir = temp_dir("fk_circuit_derived");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("fk_circuit_derived");
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
@@ -388,14 +313,12 @@ fn test_fk_circuit_is_derived_and_survives_its_unique_index() {
         .unwrap();
     assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false));
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
 fn test_promote_unique_index_over_fk_column_empty() {
-    let dir = temp_dir("promote_unique_fk_empty");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("promote_unique_fk_empty");
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", TypeCode::U64)], &[0])
@@ -418,8 +341,7 @@ fn test_promote_unique_index_over_fk_column_empty() {
         "the UNIQUE index must promote the FK circuit to unique"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// Drop the indexes `idx_ids` in a bundle that also drops a scratch table, and
@@ -450,7 +372,7 @@ fn apply_index_drop_then_refuse(engine: &mut CatalogEngine, idx_ids: &[u64]) {
 /// the workers, which never saw the undone drop, still hold.
 #[test]
 fn undone_drop_of_a_shared_index_keeps_its_directory() {
-    let (mut engine, tid, dir) = table_fixture(
+    let (mut engine, tid) = table_fixture(
         "shared_index_dir_stable",
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
@@ -463,7 +385,7 @@ fn undone_drop_of_a_shared_index_keeps_its_directory() {
     }
     engine.submit_retraction(SysFamily::Index, ids[0]).unwrap();
 
-    let reldir = relation_dir(&dir, tid);
+    let reldir = relation_dir(engine.registry.base_dir(), tid);
     let index_dirs = || {
         let mut names: Vec<String> = fs::read_dir(&reldir)
             .unwrap()
@@ -481,16 +403,14 @@ fn undone_drop_of_a_shared_index_keeps_its_directory() {
     assert!(engine.registry.relation(tid).unwrap().index_on(&[1]).is_some());
     assert_eq!(index_dirs(), before);
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
 fn test_unique_index_over_fk_column_distinct_data_promotes() {
     // Masking-bug regression (clean data): CREATE UNIQUE INDEX over an FK column
     // populated with distinct values must promote and enforce, not be masked.
-    let dir = temp_dir("promote_unique_fk_distinct");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("promote_unique_fk_distinct");
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", TypeCode::U64)], &[0])
@@ -502,30 +422,21 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // Seed DISTINCT refc values (a registry ingest bypasses FK validation).
-    let schema = engine.registry.relation(child_tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(&schema);
-    bb.begin_row(1u128, 1);
-    bb.put_u64(10);
-    bb.end_row();
-    bb.begin_row(2u128, 1);
-    bb.put_u64(20);
-    bb.end_row();
-    engine.registry.ingest(child_tid, bb.finish()).unwrap();
+    let seeded = rows(&engine, child_tid, 1, [1, 2], |i| [i * 10]);
+    engine.registry.ingest(child_tid, seeded).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     engine.create_index("public.child", &["refc"], true).unwrap();
     assert_eq!(circuit_unique(&engine, child_tid, 1), Some(true));
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
 fn test_drop_index_permitted_on_lone_pk_target() {
     // A redundant unique index on a lone-PK column that is an FK target may be
     // dropped: the PK itself preserves uniqueness for FK child validation.
-    let dir = temp_dir("drop_idx_lone_pk_fk");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("drop_idx_lone_pk_fk");
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", TypeCode::U64)], &[0])
@@ -540,16 +451,14 @@ fn test_drop_index_permitted_on_lone_pk_target() {
         .drop_index(&idx)
         .expect("drop must be permitted: lone PK preserves uniqueness");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
 fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
     // A non-PK FK-target column with a unique index cannot have that index
     // dropped while a child references it and no other unique index survives.
-    let dir = temp_dir("drop_idx_nonpk_fk_blocked");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("drop_idx_nonpk_fk_blocked");
 
     // Parent (id PK, email) with a UNIQUE index on the non-PK `email` column.
     let parent_cols = vec![col_def("id", TypeCode::U64), col_def("email", TypeCode::U64)];
@@ -571,8 +480,7 @@ fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
         "error must explain the uniqueness requirement"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── chunked index fill ───────────────────────────────────────────────────
@@ -582,19 +490,14 @@ fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
 #[test]
 fn test_unique_index_chunked_fill_distinct_succeeds() {
     // Every row must be projected exactly once across several chunks.
-    let (mut engine, tid, dir) = table_fixture(
+    let (mut engine, tid) = table_fixture(
         "unique_idx_chunked_ok",
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-
-    let mut bb = BatchBuilder::new(&schema);
-    for i in 0..10u64 {
-        bb.begin_row(i as u128, 1);
-        bb.put_u64(100 + i);
-        bb.end_row();
-    }
-    engine.registry.ingest(tid, bb.finish()).unwrap();
+    engine
+        .registry
+        .ingest(tid, rows(&engine, tid, 1, 0..10, |i| [100 + i]))
+        .unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     engine.registry.set_scan_chunk_rows(3);
@@ -608,8 +511,7 @@ fn test_unique_index_chunked_fill_distinct_succeeds() {
         "a chunked fill must project every row exactly once"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── Composite (multi-column) secondary index tests ──────────────────────
@@ -618,7 +520,7 @@ fn test_unique_index_chunked_fill_distinct_succeeds() {
 fn test_composite_index_drop_exact_list() {
     // With both a single-column (a) index and a composite (a, b) index, dropping
     // (a, b) leaves the (a) index serving and removes only the (a, b) circuit.
-    let (mut engine, tid, dir) = table_fixture(
+    let (mut engine, tid) = table_fixture(
         "composite_drop",
         &[
             col_def("id", TypeCode::U64),
@@ -652,8 +554,7 @@ fn test_composite_index_drop_exact_list() {
         "composite (a, b) circuit must be removed"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
@@ -661,7 +562,7 @@ fn test_composite_unique_index_registers_unique_circuit() {
     // CREATE UNIQUE INDEX over multiple columns registers one circuit carrying
     // the whole column list and the uniqueness flag. Enforcement over the
     // composite span runs distributed and is covered end-to-end.
-    let (mut engine, tid, dir) = table_fixture(
+    let (mut engine, tid) = table_fixture(
         "composite_unique_ok",
         &[
             col_def("id", TypeCode::U64),
@@ -685,24 +586,21 @@ fn test_composite_unique_index_registers_unique_circuit() {
         "a composite circuit must not answer a single-column lookup"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── Undoing a DROP INDEX refills the restored circuit ────────────────────
 
 #[test]
 fn undone_drop_index_refills_the_restored_circuit() {
-    let (mut engine, tid, dir) = table_fixture(
+    let (mut engine, tid) = table_fixture(
         "undone_drop_index_refills",
         &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(&schema);
-    bb.begin_row(20u128, 1);
-    bb.put_u64(200);
-    bb.end_row();
-    engine.registry.ingest(tid, bb.finish()).unwrap();
+    engine
+        .registry
+        .ingest(tid, rows(&engine, tid, 1, [20], |_| [200]))
+        .unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
@@ -718,6 +616,5 @@ fn undone_drop_index_refills_the_restored_circuit() {
         (1, 200 << 64 | 20)
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }

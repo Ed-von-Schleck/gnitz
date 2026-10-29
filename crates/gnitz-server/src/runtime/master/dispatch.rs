@@ -367,18 +367,14 @@ impl MasterDispatcher {
         batch: &Batch,
     ) -> Result<AckLease, WireFault> {
         let cat = self.cat();
-        let record = cat
-            .schema_record(target_id)
-            .expect("a wire target is registered under the catalog lock");
-        let rel = cat
-            .registry
-            .relation(target_id)
+        let (rel, record) = cat
+            .wire_target(target_id)
             .expect("a push target is registered under the catalog lock");
         let recoverable = rel.kind().is_base_table();
         with_routed(batch, rel.placement(), self.num_workers(), |data| {
             // Leased before the group is laid out, so no ACK arrives unrouted.
             let lease = self.reactor.lease_acks(data.holders());
-            scope.write(&SalGroup::push(target_id, &record, data, lease.targets()), recoverable)?;
+            scope.write(&SalGroup::push(target_id, record, data, lease.targets()), recoverable)?;
             Ok(lease)
         })
     }

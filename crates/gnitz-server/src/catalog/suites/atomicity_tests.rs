@@ -5,8 +5,7 @@ use std::fs;
 /// catalog by `&self`: a refusal there has written nothing.
 #[test]
 fn a_malformed_create_is_refused_at_the_precheck() {
-    let dir = temp_dir("atomicity_precheck");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("atomicity_precheck");
     let cols = vec![
         col_def("id", TypeCode::U64),
         col_def("val", TypeCode::I64),
@@ -70,12 +69,12 @@ fn a_malformed_create_is_refused_at_the_precheck() {
         ),
         (
             SysFamily::View,
-            build_view_tab_row(no_cols, "v"),
+            sys_batch([(view_tab_row(no_cols, "v"), 1)]),
             "has no column records",
         ),
         (
             SysFamily::View,
-            build_view_tab_row(too_wide, "v"),
+            sys_batch([(view_tab_row(too_wide, "v"), 1)]),
             "exceeds MAX_COLUMNS",
         ),
         (
@@ -105,8 +104,7 @@ fn a_malformed_create_is_refused_at_the_precheck() {
         assert!(err.contains(why), "{why}: {err}");
     }
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── the id counter at boot ───────────────────────────────────────────────────
@@ -141,8 +139,7 @@ fn a_recovered_row_raises_the_id_counter_past_its_id() {
 fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     // A client chooses the id its SCHEMA_TAB row carries, so a schema id can equal
     // a table id; dropping that schema must not read the table's dependents.
-    let dir = temp_dir("atomicity_schema_id_collision");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("atomicity_schema_id_collision");
 
     // Table T (in schema `owner`) with a dependent view V → dep_map[T] = [V].
     engine.create_schema("owner").unwrap();
@@ -175,7 +172,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
         "victim schema must be gone after a successful DROP SCHEMA"
     );
 
-    let _ = fs::remove_dir_all(&dir);
+    discard(engine);
 }
 
 // ---------------------------------------------------------------------------
@@ -186,16 +183,14 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
 /// (duplicate name) must leave neither an orphan COL_TAB nor a ghost `-1` TABLE_TAB.
 #[test]
 fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
-    let dir = temp_dir("ddl_txn_precheck_ghost");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("ddl_txn_precheck_ghost");
 
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     // Occupy the qualified name "public.dupname".
     engine.create_table("public.dupname", &cols, &[0]).unwrap();
-    let cols_before = count_records(engine.sys_relation(SysFamily::Column).cursor());
-    let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
     let new_tid = engine.allocate_ids(1).unwrap();
+    let before = sys_row_counts(&engine);
     // COL_TAB is applied first; TABLE_TAB then fails its precheck, so nothing of
     // it is applied.
     let blocks = [
@@ -207,14 +202,9 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 
     // The durable property: no orphan COL_TAB, no ghost -1 TABLE_TAB.
     assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Column).cursor()),
-        cols_before,
-        "orphan COL_TAB rows must be negated to zero"
-    );
-    assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Table).cursor()),
-        tables_before,
-        "no ghost -1 TABLE_TAB row"
+        sys_row_counts(&engine),
+        before,
+        "orphan COL_TAB rows must be negated to zero, and no ghost -1 TABLE_TAB row is left"
     );
     assert_eq!(
         engine.qualified_name_or_unknown(new_tid),
@@ -222,7 +212,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
         "no phantom entity survives for the reusable new_tid"
     );
 
-    let _ = fs::remove_dir_all(&dir);
+    discard(engine);
 }
 
 /// A CREATE bundle `[COL_TAB, TABLE_TAB]` whose TABLE_TAB passes precheck but fails
@@ -230,15 +220,13 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 /// must net both families to zero.
 #[test]
 fn ddl_txn_hook_failure_is_undone() {
-    let dir = temp_dir("ddl_txn_hook_rollback");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("ddl_txn_hook_rollback");
 
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
-    let cols_before = count_records(engine.sys_relation(SysFamily::Column).cursor());
-    let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
     let new_tid = engine.allocate_ids(1).unwrap();
-    let blocker = relation_dir(&dir, new_tid);
+    let before = sys_row_counts(&engine);
+    let blocker = relation_dir(engine.registry.base_dir(), new_tid);
     fs::write(&blocker, b"not a directory").unwrap();
 
     // The precheck reads no path, so the blocker is invisible to it.
@@ -256,29 +244,23 @@ fn ddl_txn_hook_failure_is_undone() {
     );
 
     assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Table).cursor()),
-        tables_before,
-        "the failed TABLE_TAB row must net to zero"
-    );
-    assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Column).cursor()),
-        cols_before,
-        "COL_TAB rows must net to zero (negated exactly once)"
+        sys_row_counts(&engine),
+        before,
+        "the failed TABLE_TAB row and its COL_TAB rows must net to zero, each negated exactly once"
     );
     assert!(
         engine.registry.relation(new_tid).is_none(),
         "no registered table survives the rollback"
     );
 
-    let _ = fs::remove_dir_all(&dir);
+    discard(engine);
 }
 
 // ── `sequences` never accumulates an unmatched retraction ───────────────────
 
 #[test]
 fn sequence_advances_leave_no_negative_ghost() {
-    let dir = temp_dir("atomicity_seq_no_ghost");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("atomicity_seq_no_ghost");
 
     // First use of every master scalar: the next id, the checkpoint generation
     // and the topology word are all seeded on demand.
@@ -299,8 +281,7 @@ fn sequence_advances_leave_no_negative_ghost() {
         "sequences must hold no net-negative row"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── Undoing a DROP must not stage the restored relation's directory ──────────
@@ -313,8 +294,8 @@ fn sequence_advances_leave_no_negative_ghost() {
 #[test]
 fn undoing_a_drop_keeps_the_restored_relation_directory() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
-    let (mut engine, tid, dir) = table_fixture("undo_drop_keeps_dir", &cols);
-    let reldir = relation_dir(&dir, tid);
+    let (mut engine, tid) = table_fixture("undo_drop_keeps_dir", &cols);
+    let reldir = relation_dir(engine.registry.base_dir(), tid);
     // The DROP of a bundle the log then refuses: applied, its zone in hand.
     let drop_batch = engine.retract_under(SysFamily::Table, &[tid]);
     assert_eq!(
@@ -354,7 +335,7 @@ fn undoing_a_drop_keeps_the_restored_relation_directory() {
         "the restored relation's directory must survive a failure inside its re-registration"
     );
 
-    let _ = fs::remove_dir_all(&dir);
+    discard(engine);
 }
 
 // ── A refused CREATE TABLE leaves nothing of the table behind ────────────────
@@ -362,8 +343,7 @@ fn undoing_a_drop_keeps_the_restored_relation_directory() {
 
 #[test]
 fn refused_create_table_leaves_no_trace() {
-    let dir = temp_dir("refused_create_table");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("refused_create_table");
     let parent = engine
         .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
         .unwrap();
@@ -377,7 +357,7 @@ fn refused_create_table_leaves_no_trace() {
         col_def("val", TypeCode::I64),
     ];
     // The blocker's path is a pure function of the ids; the precheck reads no path.
-    fs::create_dir_all(relation_dir(&dir, tid)).unwrap();
+    fs::create_dir_all(relation_dir(engine.registry.base_dir(), tid)).unwrap();
     let blocker = engine
         .registry
         .child_dir(tid, ChildKind::Index(gnitz_wire::PkColList::from_slice(&[2])));
@@ -397,7 +377,7 @@ fn refused_create_table_leaves_no_trace() {
     assert!(engine.registry.relation(tid).is_none());
     assert!(engine.index_ids_of(tid).is_empty());
     assert!(
-        !engine.fk_children_of(parent).iter().any(|e| e.child_tid == tid),
+        !engine.fks_as_parent(parent).iter().any(|e| e.child_tid == tid),
         "the parent must keep no edge from the uncreated child"
     );
     assert_eq!(
@@ -407,9 +387,9 @@ fn refused_create_table_leaves_no_trace() {
     );
     engine.reclaim_orphan_dirs();
     assert!(
-        !std::path::Path::new(&relation_dir(&dir, tid)).exists(),
+        !std::path::Path::new(&relation_dir(engine.registry.base_dir(), tid)).exists(),
         "the sweep must reclaim the uncreated table's directory"
     );
 
-    let _ = fs::remove_dir_all(&dir);
+    discard(engine);
 }

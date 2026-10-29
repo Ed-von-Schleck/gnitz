@@ -15,7 +15,7 @@ use crate::catalog::CatalogEngine;
 use crate::runtime::master::TxnFamily;
 use crate::runtime::reactor::RecvBuf;
 use crate::runtime::sync::{AsyncRwLock, ReadGuard, WriteGuard};
-use gnitz_store::relation::{Relation, RelationKind};
+use gnitz_store::relation::RelationKind;
 use gnitz_wire::{ClientVerb, DecodedControl, Target, WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 
@@ -32,8 +32,8 @@ async fn hold_push_for_ddl(shared: &Shared, target_id: u64, seen: &Rc<[u8]>) {
     park_until(shared, PUSH_HOLD_MAX_POLLS, "push hold", || {
         shared
             .cat()
-            .schema_record(target_id)
-            .is_none_or(|now| !Rc::ptr_eq(seen, &now))
+            .wire_target(target_id)
+            .is_none_or(|(_, now)| !Rc::ptr_eq(seen, now))
     })
     .await
 }
@@ -176,14 +176,10 @@ pub(super) fn decode_push_frame(
 ) -> Result<(Option<Batch>, Rc<[u8]>), WireFault> {
     let tid = ctrl.hdr.target_id;
     cat.check_token(ctrl.hdr.target())?;
-    let target = cat.schema_record(tid).ok_or_else(|| not_found(tid))?;
-    let schema = cat
-        .registry
-        .relation(tid)
-        .map(Relation::schema)
-        .ok_or_else(|| not_found(tid))?;
+    let (rel, target) = cat.wire_target(tid).ok_or_else(|| not_found(tid))?;
+    let schema = rel.schema();
     match &ctrl.schema {
-        Some(r) => gnitz_wire::schema_block::check_same_types(&data[r.clone()], &target)
+        Some(r) => gnitz_wire::schema_block::check_same_types(&data[r.clone()], target)
             .map_err(|e| format!("decode error: {e}"))?,
         None if ctrl.data.is_some() => return Err("decode error: a data block without a schema block".into()),
         None => {}
@@ -193,7 +189,7 @@ pub(super) fn decode_push_frame(
         .map(|r| Batch::decode_foreign_wal_block(&data[r], &schema))
         .transpose()
         .map_err(|e| format!("decode error: {e}"))?;
-    Ok((batch, target))
+    Ok((batch, target.clone()))
 }
 
 /// Handle a client push: decode the frame, then commit it under the catalog read

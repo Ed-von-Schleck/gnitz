@@ -40,8 +40,7 @@ fn filtered_view_blocks(vid: u64, base_tid: u64, pred: &[u8], views: Batch) -> [
 /// is still undoable, and a compilable one must come back clean.
 #[test]
 fn test_compile_verdict() {
-    let dir = temp_dir("view_compile_verdict");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("view_compile_verdict");
     let base_cols = u64_i64_cols();
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
@@ -67,16 +66,14 @@ fn test_compile_verdict() {
     );
     assert!(engine.live_sys_row(SysFamily::View, bad_vid).is_none());
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// A circuit whose routing the engine refuses is rejected before the DDL is
 /// durable.
 #[test]
 fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
-    let dir = temp_dir("view_compile_routing");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("view_compile_routing");
     let cols = u64_i64_cols();
     let a = engine.create_table("public.a", &cols, &[0]).unwrap();
     let b = engine.create_table("public.b", &cols, &[0]).unwrap();
@@ -95,8 +92,7 @@ fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
         "no VIEW_TAB row of it is live"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// A view bundle whose circuit cell does not decode, one whose circuit the
@@ -105,8 +101,7 @@ fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
 /// nothing depending on the source.
 #[test]
 fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
-    let dir = temp_dir("view_compile_unusable_circuit");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("view_compile_unusable_circuit");
     let cols = u64_i64_cols();
     let base = engine.create_table("public.base", &cols, &[0]).unwrap();
     let other = engine.create_table("public.other", &cols, &[0]).unwrap();
@@ -130,7 +125,7 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
         let blocks = [
             (SysFamily::Column, col_tab_batch(vid, &cols, 1)),
             (SysFamily::Circuit, rows(vid)),
-            (SysFamily::View, build_view_tab_row(vid, "v")),
+            (SysFamily::View, sys_batch([(view_tab_row(vid, "v"), 1)])),
         ];
         let err = apply_ddl(&mut engine, blocks).expect_err("the view's registration is refused");
         assert!(err.starts_with(&format!("view 'v' (id={vid}) ")), "got: {err}");
@@ -145,16 +140,14 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
         );
     }
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// A capacity-bounded view is a leaf even to a view its own bundle creates, and the
 /// refused bundle leaves neither view an edge.
 #[test]
 fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
-    let dir = temp_dir("view_compile_bounded_in_bundle");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("view_compile_bounded_in_bundle");
     let cols = u64_i64_cols();
     let base = engine.create_table("public.base", &cols, &[0]).unwrap();
     let bounded = engine.allocate_ids(1).unwrap();
@@ -163,11 +156,18 @@ fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
     let identity = |source| crate::test_support::identity_circuit(source, gnitz_wire::ReadBound::None);
     let circuits = [identity(base), identity(bounded)];
     let created = [(bounded, &circuits[0], &cols[..]), (over, &circuits[1], &cols[..])];
-    let mut views = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut views, 1, over, "over", 0, 0, 0);
-    push_view_tab_row(&mut views, 1, bounded, "bounded", 4 << 20, 0, 0);
+    let views = sys_batch([
+        (view_tab_row(over, "over"), 1),
+        (
+            ViewTabRow {
+                capacity_bytes: 4 << 20,
+                ..view_tab_row(bounded, "bounded")
+            },
+            1,
+        ),
+    ]);
 
-    let err = apply_ddl(&mut engine, view_blocks(created, views.finish())).expect_err("a bounded view is a leaf");
+    let err = apply_ddl(&mut engine, view_blocks(created, views)).expect_err("a bounded view is a leaf");
     assert!(
         err.contains("reads 'public.bounded', which is a capacity-bounded view"),
         "got: {err}"
@@ -179,8 +179,7 @@ fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
     }
     assert!(engine.registry.relation(bounded).is_none() && engine.registry.relation(over).is_none());
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── The one-bundle replacement ──────────────────────────────────────────────
@@ -193,8 +192,7 @@ fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
 /// collision; one it does not retire still is.
 #[test]
 fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
-    let dir = temp_dir("view_compile_qname");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("view_compile_qname");
     let base_cols = u64_i64_cols();
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 100)]).to_blob_bytes();
@@ -208,9 +206,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
         .unwrap();
 
     // Reusing the live name without retiring the incumbent is still a collision.
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
-    let collide = bb.finish();
+    let collide = sys_batch([(view_tab_row(new_vid, "vw"), 1)]);
     assert!(
         engine.precheck_family(SysFamily::View, &collide).is_err(),
         "a second live view under one name must still be rejected"
@@ -219,48 +215,38 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     // The same `+1` preceded by the incumbent's `-1` — one ALTER VIEW bundle —
     // is admitted. The `-1` reproduces the live row's full payload, which the
     // the retraction CAS requires.
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
-    push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
-    let replace = bb.finish();
+    let replace = sys_batch([(view_tab_row(old_vid, "vw"), -1), (view_tab_row(new_vid, "vw"), 1)]);
     engine
         .precheck_family(SysFamily::View, &replace)
         .expect("a bundle that retires the incumbent may reuse its name");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// One VIEW_TAB batch registers the replacement and retires the incumbent; its
 /// rollback must restore the incumbent and retire the replacement.
 #[test]
 fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
-    let dir = temp_dir("view_compile_rollback");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("view_compile_rollback");
     let base_cols = u64_i64_cols();
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 100)]).to_blob_bytes();
     let old_vid = try_register_filtered_view(&mut engine, base_tid, "vw", &pred).unwrap();
-    let old_dir = relation_dir(&dir, old_vid);
+    let old_dir = relation_dir(engine.registry.base_dir(), old_vid);
 
     // The replacing bundle: the new chain's own rows, and one VIEW_TAB batch
     // carrying the incumbent's `-1` and the replacement's `+1`.
     let new_vid = engine.allocate_ids(1).unwrap();
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
-    push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
+    let views = sys_batch([(view_tab_row(old_vid, "vw"), -1), (view_tab_row(new_vid, "vw"), 1)]);
     let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 50)]).to_blob_bytes();
-    let new_dir = relation_dir(&dir, new_vid);
+    let new_dir = relation_dir(engine.registry.base_dir(), new_vid);
     // The log refuses the bundle's last group, the incumbent's retracted column
     // records, once the rest of it has applied: the catalog undoes it.
     let mut sink = |f: SysFamily, b: &Batch| match f {
         SysFamily::Column if b.get_weight(0) < 0 => Err("the log refuses the zone".into()),
         _ => Ok(()),
     };
-    let refused = engine.apply_bundle(
-        bundle(filtered_view_blocks(new_vid, base_tid, &pred, bb.finish())),
-        &mut sink,
-    );
+    let refused = engine.apply_bundle(bundle(filtered_view_blocks(new_vid, base_tid, &pred, views)), &mut sink);
     assert!(
         matches!(refused, Err(ZoneError::Refused(_))),
         "the bundle must be refused and undone"
@@ -284,8 +270,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
         "the sweep must reclaim the replacement's directory: {new_dir}"
     );
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// `a EXCEPT ALL b` over leaves keyed by their own PK equals its definition,
@@ -293,8 +278,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
 #[test]
 fn a_clamp_over_its_sources_stores_holds_its_definition_through_ticks() {
     use std::collections::BTreeMap;
-    let dir = temp_dir("clamp_over_source_stores");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("clamp_over_source_stores");
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let [a, b] = ["public.a", "public.b"].map(|name| engine.create_table(name, &cols, &[0]).unwrap());
     // `b` agrees with `a` on ids 5..10 but 7.
@@ -361,10 +345,8 @@ fn a_clamp_over_its_sources_stores_holds_its_definition_through_ticks() {
                 rows(&engine, tid, -1, [id], |_| [val])
             }
         };
-        engine.ingest_unticked(tid, batch).unwrap();
-        seal_and_tick(&mut engine, tid);
+        push_and_tick(&mut engine, tid, batch);
         check(&mut engine, &held, &format!("side {side} id {id} {write:?}"));
     }
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }

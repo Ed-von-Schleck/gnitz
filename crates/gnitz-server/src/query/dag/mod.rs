@@ -1,5 +1,6 @@
-//! DagEngine: every registered view's compiled plan, and the operator state of
-//! the views this process runs. Epoch execution lives in `exec`, per-key
+//! DagEngine: every registered view's compiled plan, the operator state of the
+//! views this process runs, and the boot verdict on which views rebuild rather
+//! than resume. Epoch execution lives in `exec`, per-key
 //! hydration in `hydrate`, the dependency map in `meta`.
 
 use std::borrow::Cow;
@@ -58,7 +59,8 @@ pub(crate) struct DagEngine {
     dep: DepMap,
     /// Every registered view, from its registration to its drop.
     views: FxHashMap<u64, RegisteredView>,
-    /// Views the boot verdict rejected, each until its rebuild backfill starts.
+    /// Views the boot verdict ([`Self::decide_rebuild`]) rejected, closed under
+    /// dependents and chains, each until its rebuild backfill starts.
     rebuild: FxHashSet<u64>,
 }
 
@@ -120,9 +122,82 @@ impl DagEngine {
         self.rebuild.contains(&id)
     }
 
-    /// Replace the set of views awaiting a rebuild backfill.
-    pub(crate) fn set_rebuild(&mut self, ids: impl IntoIterator<Item = u64>) {
-        self.rebuild = ids.into_iter().collect();
+    /// Decide which views this boot rebuilds rather than resumes — their
+    /// checkpointed state, output stores and operator traces alike. A view is
+    /// **valid** (resumed) iff:
+    ///   * `resume_at` is `Some`. It is `None` when the recorded topology (worker
+    ///     count, STATE_FORMAT) is not the launched one: every view rebuilds and
+    ///     no manifest is read;
+    ///   * its output child and every trace child its compiled circuit declares
+    ///     are stamped with `resume_at`'s G, the committed checkpoint generation,
+    ///     which [`RelationRegistry::view_children_resumable`] answers. The
+    ///     durable generation is `G+1` before any store opens when the boot
+    ///     replays a push; and
+    ///   * every VIEW it scans is itself valid — else it could read a rebuilt
+    ///     sibling's freshly-emptied output store; and
+    ///   * every view of its chain is valid — a segment's rows are dropped once
+    ///     its chain is built, so a chain member's rebuild needs them rebuilt; and
+    ///   * none of its sources is a STREAM or a system family — its state
+    ///     integrates stream rows that are gone, or catalog rows no boot replays
+    ///     into it.
+    ///
+    /// Each view's **local** validity is decided first (direct sources + child
+    /// manifests), then [`Self::rebuilt_with`] propagates invalidity to any view
+    /// scanning an invalid source and to the whole chain of any invalid view.
+    pub(crate) fn decide_rebuild(&mut self, registry: &RelationRegistry, resume_at: Option<u64>) {
+        let Some(g) = resume_at else {
+            self.rebuild = self.views.keys().copied().collect();
+            return;
+        };
+        // A view over a stream or a system family needs no manifest read. An
+        // unreadable manifest reads as a mismatch, the verdict a child whose
+        // manifest a previous open erased must get: its siblings may still be at `g`.
+        let mut invalid = self.over_unreplayed_sources(registry);
+        let stale: Vec<u64> = self
+            .views
+            .iter()
+            .filter(|(id, v)| !invalid.contains(*id) && !registry.view_children_resumable(**id, g, v.code.vm.layout()))
+            .map(|(&id, _)| id)
+            .collect();
+        invalid.extend(stale);
+        self.rebuild = self.rebuilt_with(invalid);
+    }
+
+    /// The views every boot rebuilds whatever their stores hold: those a stream or
+    /// a system family reaches, and their chains — a subset of what the boot
+    /// verdict rejects, so a checkpoint round has no reason to publish one.
+    pub(crate) fn never_resumed(&self, registry: &RelationRegistry) -> FxHashSet<u64> {
+        self.rebuilt_with(self.over_unreplayed_sources(registry))
+    }
+
+    /// The views with a direct source whose deltas no boot replays into a kept view.
+    /// Boot replays a base table's tail alone: a stream's rows are gone, and a system
+    /// family's tail is applied before any view exists.
+    fn over_unreplayed_sources(&self, registry: &RelationRegistry) -> FxHashSet<u64> {
+        let unreplayed = |s: &u64| {
+            registry.relation(*s).is_some_and(|r| {
+                let k = r.kind();
+                !(k.is_view() || k.is_base_table())
+            })
+        };
+        self.views
+            .keys()
+            .copied()
+            .filter(|&vid| self.sources_of(vid).iter().any(unreplayed))
+            .collect()
+    }
+
+    /// Every view a rebuild of `invalid` takes with it: each view downstream of one,
+    /// then every view of a chain holding one. `tick_schedule` relies on this closure.
+    fn rebuilt_with(&self, mut invalid: FxHashSet<u64>) -> FxHashSet<u64> {
+        let downstream = self.dependent_closure(invalid.iter().copied());
+        invalid.extend(downstream);
+        let chains: FxHashSet<u64> = invalid.iter().map(|&v| self.chain_of(v)).collect();
+        self.views
+            .iter()
+            .filter(|(_, v)| chains.contains(&v.chain))
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     /// Every view awaiting a rebuild backfill, removed.

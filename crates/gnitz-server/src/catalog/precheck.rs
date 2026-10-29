@@ -2,32 +2,21 @@
 //! system-table deltas.
 use std::borrow::Cow;
 
-use gnitz_store::relation::{IndexClaim, RelationKind};
+use gnitz_store::relation::{IndexClaim, Relation, RelationKind};
 use gnitz_wire::{
-    low_bits_mask, payload_bytes, validate_user_identifier, BitIter, CatalogColumn, ColTabRow, ColType, FixedInt,
-    FkRef, IdxTabRow, IdxTabSlot, RowSource, SchemaTabRow, TableProps, ViewParts,
+    low_bits_mask, payload_bytes, validate_user_identifier, BitIter, CatalogColumn, ColTabRow, FixedInt, FkRef,
+    IdxTabRow, IdxTabSlot, RowSource, SchemaTabRow, SchemaTabSlot, TableProps, ViewParts,
 };
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashSet;
 
-use super::sys_reads::IdSet;
 use super::sys_tables::{
-    build_schema_from_col_defs, pk_signatures, read_rel_row, DdlBundle, PkShape, PkSignature, RelDetail, RelRow,
+    build_schema_from_col_defs, pk_signatures, read_rel_row, DdlBundle, IdSet, PkShape, PkSignature, RelDetail, RelRow,
     SysFamily, SYSTEM_SCHEMA_ID,
 };
 use super::CatalogEngine;
-
-/// The type rule on a SERIAL table's PK columns, given as `(name, type)`.
-fn validate_serial_key<'a>(pk: impl IntoIterator<Item = (&'a str, ColType)>) -> Result<(), String> {
-    match pk.into_iter().find(|(_, ty)| FixedInt::exact(ty.tc).is_none()) {
-        Some((name, ty)) => Err(format!(
-            "SERIAL primary key column '{name}' is {ty}; SERIAL needs an integer of at most 8 bytes"
-        )),
-        None => Ok(()),
-    }
-}
 
 /// The name rule a catalog row must satisfy to be stored: a chain segment's
 /// name (`segment`) is `_` then `[A-Za-z0-9_]`, every other name a user
@@ -160,6 +149,19 @@ fn check_batch_shape(family: SysFamily, batch: &Batch, next_id: u64) -> Result<V
     Ok(sigs)
 }
 
+/// Whether column `col` of `parent` is a legal FK target: its lone PK column, or a
+/// column a single-column UNIQUE index covers through a claim outside `dropping`.
+/// A composite index never qualifies: a unique `(a, b)` does not make `a` alone
+/// unique.
+fn holds_fk_target(parent: &Relation, col: u32, dropping: &IdSet) -> bool {
+    parent.schema().lone_pk_col() == Some(col as usize)
+        || parent.index_on(&[col]).is_some_and(|ix| {
+            ix.claims()
+                .iter()
+                .any(|c| matches!(*c, IndexClaim::Index { id, unique: true } if !dropping.contains(id)))
+        })
+}
+
 /// A circuit `+1` may only name a view this same transaction creates — one under
 /// a foreign `view_id` would pin its source table's drop or rewrite a running
 /// circuit.
@@ -177,7 +179,7 @@ fn check_circuit_rows(batch: &Batch, created: &IdSet) -> Result<(), String> {
 
 impl CatalogEngine {
     /// Check FK column `col` of relation `self_table_id`, about to be registered
-    /// with `self_schema` over `self_cols`. `net_dead` is what the same TABLE_TAB
+    /// with `self_schema` over `self_cols`. `dropped` is what the same TABLE_TAB
     /// delta drops.
     fn validate_fk_column(
         &self,
@@ -186,10 +188,9 @@ impl CatalogEngine {
         self_table_id: u64,
         self_cols: &[CatalogColumn],
         self_schema: &SchemaDescriptor,
-        net_dead: &IdSet,
+        dropped: &IdSet,
     ) -> Result<(), String> {
-        // The target is a legal reference iff it is the parent's lone PK column,
-        // or it carries its own UNIQUE index. Mirrors the production planner gate.
+        // Mirrors the production planner gate.
         let target_type = if fk.table_id == self_table_id {
             // Self-referential FK: the table has no UNIQUE index yet, so the
             // target must be its lone PK column. The downstream probe reads the
@@ -200,7 +201,7 @@ impl CatalogEngine {
             }
             self_cols[fk.col as usize].def.ty
         } else {
-            if net_dead.contains(fk.table_id) {
+            if dropped.contains(fk.table_id) {
                 return Err(format!(
                     "FK references table {}, which this transaction drops",
                     fk.table_id
@@ -220,14 +221,10 @@ impl CatalogEngine {
                     entry.kind().noun()
                 ));
             }
-            if entry.schema().lone_pk_col() != Some(fk.col as usize) {
-                // A composite index does not satisfy a single-column FK: a
-                // unique (a, b) does not guarantee uniqueness of `a` alone, so
-                // match only a single-column unique index on the referenced col.
-                let has_unique = entry.index_on(&[fk.col]).is_some_and(|ic| ic.is_unique());
-                if !has_unique {
-                    return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
-                }
+            // No index counts as dropping here: `dropped` holds this delta's
+            // relation ids, and an index drop arrives in the index family's delta.
+            if !holds_fk_target(entry, fk.col, &IdSet::default()) {
+                return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
             }
             // In range: the checks above admit only the parent's lone PK column
             // or a column a unique index names.
@@ -250,24 +247,23 @@ impl CatalogEngine {
     /// holds it. A rewrite pair that leaves the name unchanged re-registers the
     /// incumbent, so `existing == self_id` is not one.
     ///
-    /// `net_dead` is this same bundle's net-dead PKs in this same family. An
-    /// incumbent among them is not a collision either: one bundle may retire an
-    /// id and register a different one under the same name — an ALTER VIEW is
-    /// exactly that — and that retired id is returned. Precheck reads the name
-    /// index *before* apply, so it still maps the name to the outgoing id.
+    /// `dropped` is what this same family's delta drops. An incumbent among them
+    /// is not a collision: an ALTER VIEW retires an id and registers another
+    /// under the same name, and the retired id is returned. The name index is
+    /// read before apply, so it still maps the name to the outgoing id.
     fn claim_qname<'a>(
         &self,
         sid: u64,
         name: Cow<'a, str>,
         self_id: u64,
-        net_dead: &IdSet,
+        dropped: &IdSet,
         claimed: &mut FxHashSet<(u64, Cow<'a, str>)>,
     ) -> Result<Option<u64>, String> {
         let schema_name = self
             .schema_name(sid)
             .ok_or_else(|| format!("Schema with ID {sid} does not exist"))?;
         let incumbent = self.relation_id(sid, &name).filter(|&existing| existing != self_id);
-        let displaced = incumbent.filter(|&e| net_dead.contains(e));
+        let displaced = incumbent.filter(|&e| dropped.contains(e));
         if incumbent != displaced || !claimed.insert((sid, name.clone())) {
             return Err(format!(
                 "Table or view already exists: {}",
@@ -280,8 +276,8 @@ impl CatalogEngine {
     /// The `-1` must content-equal the live row — you may only retract the
     /// element that exists — and `live + Σ batch` must land in `{0, 1}`: the sys
     /// stores run no `enforce_unique_pk`, so nothing else stops a duplicate live
-    /// head or a persistent negative ghost. Returns the net weight.
-    fn check_cas_and_net(&self, family: SysFamily, batch: &Batch, sig: &PkSignature) -> Result<i64, String> {
+    /// head or a persistent negative ghost.
+    fn check_cas_and_net(&self, family: SysFamily, batch: &Batch, sig: &PkSignature) -> Result<(), String> {
         let noun = family.row_noun();
         let (live_weight, live) = self.sys_relation(family).live_row_at(batch.get_pk_bytes(sig.row));
         if let Some(nj) = sig.neg {
@@ -305,21 +301,20 @@ impl CatalogEngine {
                 family.pk_label(sig)
             ));
         }
-        Ok(net)
+        Ok(())
     }
 
     /// [`check_batch_shape`], then the CAS and net bound per PK against the live
-    /// store. Returns the per-PK signatures and the PKs whose net is dead: the
-    /// genuine drops, which a rename pair's net-live `-1` is not.
+    /// store. Returns the per-PK signatures and the ids the delta drops: the PKs
+    /// of Drop shape (a rename pair's `-1` is not a drop). With every system PK
+    /// held to net weight 0 or 1, those are exactly the PKs the delta leaves dead.
     fn check_family_contract(&self, family: SysFamily, batch: &Batch) -> Result<(Vec<PkSignature>, IdSet), String> {
         let sigs = check_batch_shape(family, batch, self.next_id)?;
-        let mut net_dead: Vec<u64> = Vec::new();
         for sig in &sigs {
-            if self.check_cas_and_net(family, batch, sig)? <= 0 {
-                net_dead.push(sig.leading);
-            }
+            self.check_cas_and_net(family, batch, sig)?;
         }
-        Ok((sigs, IdSet::new(net_dead)))
+        let dropped = IdSet::new(sigs.iter().filter(|s| s.shape() == PkShape::Drop).map(|s| s.leading));
+        Ok((sigs, dropped))
     }
 
     /// What a COL_TAB write means once [`Self::check_family_contract`] has settled
@@ -331,18 +326,17 @@ impl CatalogEngine {
         for sig in sigs {
             // COL_TAB PK = `(owner_id, col_idx)`.
             let (owner_id, col_idx) = (sig.leading, sig.member.expect("a COL_TAB key is a pair"));
+            // Decoded before the owner lookup, so a CREATE bundle's malformed
+            // record is refused here, before anything is written.
             let decode = |r| ColTabRow::read(batch, r).and_then(|r| r.column());
+            // The shape rules refuse a column PK with no `+1`.
+            let new = decode(sig.pos.expect("a column PK carries a +1"))?;
             let old = sig.neg.map(decode).transpose()?;
-            let new = sig.pos.map(decode).transpose()?;
 
+            // An unregistered owner is one this bundle creates;
+            // `check_column_owners` owns those rows. A `-1` names a live record,
+            // whose owner is registered.
             let Some(owner) = self.registry.relation(owner_id) else {
-                if sig.neg.is_some() {
-                    return Err(format!(
-                        "catalog changed concurrently: retracting a column of unregistered owner {owner_id}"
-                    ));
-                }
-                // Normal: a CREATE TABLE bundle's COL_TAB block applies before
-                // TABLE_TAB. `check_column_owners` owns these rows.
                 continue;
             };
 
@@ -351,11 +345,32 @@ impl CatalogEngine {
             if !owner.kind().is_base_table() {
                 return Err(format!("cannot ALTER a column of {owner_id}: not a user base table"));
             }
-
-            let Some(new) = new else {
-                unreachable!("the contract refuses a column PK with no `+1`");
-            };
-            match old {
+            let schema = owner.schema();
+            let op: Option<&str> = match old {
+                None => {
+                    // ADD COLUMN. The append must be *trailing*, and this is the
+                    // only check that makes it so: the rebuild path maps the
+                    // owner's defs positionally, so a gap would silently shift
+                    // every column past it rather than fail. (A duplicate index
+                    // is a duplicate COL_TAB PK, which the net bound already
+                    // rejects.)
+                    if col_idx as usize != schema.num_columns() {
+                        return Err(format!(
+                            "cannot ADD COLUMN at index {col_idx} on table {owner_id}: \
+                             columns must be appended at index {}",
+                            schema.num_columns()
+                        ));
+                    }
+                    // A new column over existing rows is unconditionally
+                    // nullable, carries no FK, and is visible.
+                    if !new.def.is_nullable {
+                        return Err("ADD COLUMN must append a nullable column".into());
+                    }
+                    if new.def.is_hidden || new.fk.is_some() {
+                        return Err("ADD COLUMN must not append a hidden or foreign-key column".into());
+                    }
+                    Some("ADD COLUMN")
+                }
                 Some(old) => {
                     // A dropped column is gone from every surface: nothing may
                     // rename, re-show or re-null it.
@@ -376,13 +391,11 @@ impl CatalogEngine {
                     let name = &old.def.name;
                     // Before the schema build, whose PK rules would refuse a PK
                     // column's DROP NOT NULL with a less direct message.
-                    if let Some(op) = op.filter(|_| owner.schema().is_pk_col(col_idx as usize)) {
+                    if let Some(op) = op.filter(|_| schema.is_pk_col(col_idx as usize)) {
                         return Err(format!("cannot {op} '{name}': it is a primary-key column"));
                     }
-                    let prospective = self.col_defs_with(owner_id, col_idx, new)?;
-                    build_schema_from_col_defs(RelationKind::BaseTable, &prospective, owner.schema().pk_cols())
-                        .map_err(|e| format!("cannot ALTER COLUMN on table {owner_id}: {e}"))?;
-                    let Some(op) = op else { continue };
+                    // Hiding a column cannot fail the schema build, so these
+                    // refusals may precede it.
                     if hides {
                         // Before the index test: an FK column also carries its FK index.
                         if old.fk.is_some() {
@@ -399,9 +412,22 @@ impl CatalogEngine {
                             ));
                         }
                     }
-                    self.reject_if_dependent_views(owner_id, op, &IdSet::default())?;
+                    op
                 }
-                None => self.precheck_column_append(new, owner_id, col_idx, &owner.schema())?,
+            };
+            // The owner's column records as this `+1` leaves them: it replaces
+            // the live record at `col_idx`, or extends the set on an append.
+            let mut defs = self.read_column_defs(owner_id)?;
+            match defs.get_mut(col_idx as usize) {
+                Some(live) => *live = new,
+                None => defs.push(new),
+            }
+            build_schema_from_col_defs(RelationKind::BaseTable, &defs, schema.pk_cols())
+                .map_err(|e| format!("cannot {} on table {owner_id}: {e}", op.unwrap_or("RENAME COLUMN")))?;
+            // Last: a malformed ALTER is reported as malformed whatever depends
+            // on the table.
+            if let Some(op) = op {
+                self.reject_if_dependent_views(owner_id, op, &IdSet::default())?;
             }
         }
         Ok(())
@@ -433,55 +459,6 @@ impl CatalogEngine {
         ))
     }
 
-    /// `owner_id`'s column records as this batch's `+1` row for `col_idx` leaves
-    /// them: the decoded row replaces the live record at that index, or extends
-    /// the set when the transition appends one.
-    fn col_defs_with(&self, owner_id: u64, col_idx: u64, row: CatalogColumn) -> Result<Vec<CatalogColumn>, String> {
-        let mut defs = self.read_column_defs(owner_id)?;
-        match defs.get_mut(col_idx as usize) {
-            Some(live) => *live = row,
-            None => defs.push(row),
-        }
-        Ok(defs)
-    }
-
-    /// ADD COLUMN: one unpaired `+1` appending a trailing nullable payload
-    /// column to registered base table `owner_id`.
-    fn precheck_column_append(
-        &self,
-        appended: CatalogColumn,
-        owner_id: u64,
-        col_idx: u64,
-        owner_schema: &SchemaDescriptor,
-    ) -> Result<(), String> {
-        // The append must be *trailing*, and this is the only check that makes
-        // it so: the rebuild path maps the owner's defs positionally, so a gap
-        // would silently shift every column past it rather than fail. (A
-        // duplicate index is a duplicate COL_TAB PK, which the net bound already
-        // rejects.)
-        if col_idx as usize != owner_schema.num_columns() {
-            return Err(format!(
-                "cannot ADD COLUMN at index {col_idx} on table {owner_id}: \
-                 columns must be appended at index {}",
-                owner_schema.num_columns()
-            ));
-        }
-        let prospective = self.col_defs_with(owner_id, col_idx, appended.clone())?;
-        build_schema_from_col_defs(RelationKind::BaseTable, &prospective, owner_schema.pk_cols())
-            .map_err(|e| format!("cannot ADD COLUMN on table {owner_id}: {e}"))?;
-        // A new column over existing rows is unconditionally nullable, carries
-        // no FK, and is visible.
-        if !appended.def.is_nullable {
-            return Err("ADD COLUMN must append a nullable column".into());
-        }
-        if appended.def.is_hidden || appended.fk.is_some() {
-            return Err("ADD COLUMN must not append a hidden or foreign-key column".into());
-        }
-        // Last, as in the rewrite-pair arm: a malformed append is reported as
-        // malformed whatever depends on the table.
-        self.reject_if_dependent_views(owner_id, "ADD COLUMN", &IdSet::default())
-    }
-
     /// Validate one family of a `DDL_TXN` against the catalog as the bundle's
     /// earlier families left it. Returns the ids the delta drops.
     ///
@@ -489,15 +466,15 @@ impl CatalogEngine {
     /// decide here whether it carries guards beyond the contract, rather than
     /// falling into a silent `_` arm.
     pub(in crate::catalog) fn precheck_family(&self, family: SysFamily, batch: &Batch) -> Result<IdSet, String> {
-        let (sigs, net_dead) = self.check_family_contract(family, batch)?;
+        let (sigs, dropped) = self.check_family_contract(family, batch)?;
         match family {
-            SysFamily::Schema => self.precheck_schema_family(batch, &net_dead),
-            SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch, &sigs, &net_dead),
+            SysFamily::Schema => self.precheck_schema_family(batch, &dropped),
+            SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch, &sigs, &dropped),
             SysFamily::Column => self.precheck_column_family(batch, &sigs),
-            SysFamily::Index => self.precheck_index_family(batch, &net_dead),
+            SysFamily::Index => self.precheck_index_family(batch, &dropped),
             SysFamily::Sequence | SysFamily::Circuit => Ok(()),
         }?;
-        Ok(net_dead)
+        Ok(dropped)
     }
 
     /// The cross-family rules of one `DDL_TXN` bundle: what no family's own arm
@@ -505,52 +482,40 @@ impl CatalogEngine {
     /// families have not reached yet. Run before the first family is applied, so
     /// a rejection has written nothing.
     pub(in crate::catalog) fn precheck_bundle(&self, families: &DdlBundle) -> Result<(), String> {
-        if let Some(f) = SysFamily::ALL
-            .into_iter()
-            .find(|&f| f.master_only() && families.get(f).is_some())
-        {
-            return Err(format!(
-                "family {} ({}) is not writable from the wire",
-                f.id(),
-                f.name()
-            ));
-        }
+        let creates = |f: SysFamily| {
+            families
+                .get(f)
+                .map(pk_signatures)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| s.shape() == PkShape::Create)
+                .map(|s| s.leading)
+        };
+        let created_views = IdSet::new(creates(SysFamily::View));
         if let Some(cols) = families.get(SysFamily::Column) {
-            self.check_column_owners(cols, families)?;
+            let created = IdSet::new(creates(SysFamily::Table).chain(created_views.ids().iter().copied()));
+            self.check_column_owners(cols, &created, families.family_count() == 1)?;
         }
         if let Some(b) = families.get(SysFamily::Circuit) {
-            let created = families.get(SysFamily::View).map_or_else(IdSet::default, |v| {
-                IdSet::new(
-                    pk_signatures(v)
-                        .into_iter()
-                        .filter(|s| s.shape() == PkShape::Create)
-                        .map(|s| s.leading),
-                )
-            });
-            check_circuit_rows(b, &created)?;
+            check_circuit_rows(b, &created_views)?;
         }
         Ok(())
     }
 
-    /// Every column record must name an owner this bundle creates or the registry
-    /// holds: a phantom owner is never dropped, so nothing would ever retract the row.
-    fn check_column_owners(&self, cols: &Batch, families: &DdlBundle) -> Result<(), String> {
-        let created = IdSet::new(
-            [SysFamily::Table, SysFamily::View]
-                .into_iter()
-                .filter_map(|family| families.get(family))
-                .flat_map(|b| b.live_rows().map(|i| gnitz_wire::sys_leading_id(b.get_pk_bytes(i)))),
-        );
-        let mut altered: Option<u64> = None;
+    /// Every column record must name an owner this bundle creates (`created`) or
+    /// the registry holds: a phantom owner is never dropped, so nothing would ever
+    /// retract the row. `alone` is whether COL_TAB is the bundle's only family.
+    fn check_column_owners(&self, cols: &Batch, created: &IdSet, alone: bool) -> Result<(), String> {
         for i in cols.live_rows() {
             let owner_id = gnitz_wire::sys_leading_id(cols.get_pk_bytes(i));
-            // An ALTER must be its bundle's only change, on one owner: nothing can undo
-            // its descriptor swap, so the swap must be the bundle's last fallible step.
+            // An ALTER changes one column and is its bundle's only change (a
+            // rewrite pair is one live row): nothing can undo its descriptor
+            // swap, so the swap must be the bundle's last fallible step, and the
+            // precheck's prospective build must be the one the hook makes.
             if self.registry.relation(owner_id).is_some() {
-                if altered.is_some_and(|a| a != owner_id) || families.family_count() > 1 {
+                if !alone || cols.live_rows().nth(1).is_some() {
                     return Err("a column ALTER must be the only change in its DDL transaction".into());
                 }
-                altered = Some(owner_id);
             } else if !created.contains(owner_id) {
                 return Err(format!(
                     "column record names owner {owner_id}, which this transaction \
@@ -561,25 +526,31 @@ impl CatalogEngine {
         Ok(())
     }
 
+    /// The names the live rows of `family` hold at payload slot `slot`. A caller
+    /// inserts each name its batch's `+1` rows claim, so a name is claimed once:
+    /// two `+1` rows under one name would both miss the live names and both
+    /// apply, leaving the first id live and unreachable.
+    fn live_names(&self, family: SysFamily, slot: usize) -> FxHashSet<Box<[u8]>> {
+        let live = self.sys_relation(family).full_scan();
+        (0..live.len()).map(|i| payload_bytes(&*live, i, slot).into()).collect()
+    }
+
     /// SCHEMA_TAB: a CREATE must not collide with a live schema name — nor with one
     /// this batch already claims — and a DROP must find the schema empty. Schema ids
     /// share one id space with relation ids, so the member count, not the
     /// relation-keyed dep map, is the whole drop guard.
-    fn precheck_schema_family(&self, batch: &Batch, net_dead: &IdSet) -> Result<(), String> {
-        // Two `+1` rows under one name both miss the live schemas and both apply:
-        // the name would resolve to the second, leaving the first id live and
-        // unreachable.
-        let mut claimed: FxHashSet<Cow<'_, str>> = FxHashSet::default();
+    fn precheck_schema_family(&self, batch: &Batch, dropped: &IdSet) -> Result<(), String> {
+        let mut taken = self.live_names(SysFamily::Schema, SchemaTabSlot::name as usize);
         for i in batch.live_rows() {
             let name = SchemaTabRow::read(batch, i).map_err(|e| format!("Schema: {e}"))?.name;
             // Nothing synthesizes a schema name, so the reserved `_` prefix
             // applies with no carve-out.
             check_stored_name(&name, "schema", false)?;
-            if self.schema_id(&name).is_some() || !claimed.insert(name.clone()) {
+            if !taken.insert(name.as_bytes().into()) {
                 return Err(format!("Schema already exists: {name}"));
             }
         }
-        for &sid in net_dead.ids() {
+        for &sid in dropped.ids() {
             let n = self.caches.relation_by_name.get(&sid).map_or(0, |names| names.len());
             if n > 0 {
                 return Err(format!("Schema not empty: {n} relation(s) remain; drop them first"));
@@ -588,19 +559,68 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// TABLE_TAB / VIEW_TAB: the CREATE guards (a free relation id, column-record
-    /// admissibility, FK column types, qualified-name uniqueness) and the DROP
-    /// guards (FK children, view dependents).
-    ///
-    /// The drop guards key on `net_dead` — the PKs whose bundle net is dead — not
-    /// raw `weight < 0`, so a rename pair's net-live `-1` is never rejected as
-    /// "referenced by FK" / "has dependent views".
+    /// The rules a created relation's row and column records must satisfy.
+    /// `created_users` are the user views this bundle creates, the only owners a
+    /// created segment may name.
+    fn precheck_relation_create(&self, rel: &RelRow<'_>, created_users: &IdSet, dropped: &IdSet) -> Result<(), String> {
+        // The system schema holds the catalog's own relations and nothing else.
+        if rel.schema_id == SYSTEM_SCHEMA_ID {
+            return Err(format!("{rel}: the system schema takes no relation"));
+        }
+        let col_defs = self.read_column_defs(rel.id)?;
+        let schema =
+            build_schema_from_col_defs(rel.kind(), &col_defs, rel.pk.as_slice()).map_err(|e| format!("{rel} {e}"))?;
+        // An FK probes its parent's store on every write of the child, which only
+        // a base table's ingest runs; a stream push must stay a pure append.
+        if !rel.kind().is_base_table() {
+            if let Some(cd) = col_defs.iter().find(|cd| cd.fk.is_some()) {
+                return Err(format!(
+                    "{rel}: column '{}' may not carry a FOREIGN KEY; only a base table's may",
+                    cd.def.name
+                ));
+            }
+        }
+        match rel.detail {
+            RelDetail::Table(TableProps { serial, .. }) => {
+                // `TableProps::validate` holds a SERIAL table to one PK column.
+                if serial {
+                    let pk = &col_defs[rel.pk.as_slice()[0] as usize].def;
+                    if FixedInt::exact(pk.ty.tc).is_none() {
+                        return Err(format!(
+                            "{rel}: SERIAL primary key column '{}' is {}; SERIAL needs an integer of at most 8 bytes",
+                            pk.name, pk.ty
+                        ));
+                    }
+                }
+                for cd in &col_defs {
+                    if let Some(fk) = cd.fk {
+                        self.validate_fk_column(cd, fk, rel.id, &col_defs, &schema, dropped)?;
+                    }
+                }
+            }
+            RelDetail::View(ViewParts { owner: Some(owner), .. }) if !created_users.contains(owner) => {
+                return Err(format!(
+                    "{rel} names owner {owner}, which is not a user view this bundle creates"
+                ));
+            }
+            RelDetail::View(_) => {}
+        }
+        Ok(())
+    }
+
+    /// TABLE_TAB / VIEW_TAB: on every live row the name rule and qualified-name
+    /// uniqueness; on a create also a free relation id and the rules of
+    /// [`Self::precheck_relation_create`]; and the DROP guards (FK children, view
+    /// dependents). A rename pair's `+1` differs from the live row only in `name`
+    /// (the pair mask plus the CAS), so it is not re-derived. The drop guards key
+    /// on `dropped`, the PKs of Drop shape, so a rename pair is never rejected as
+    /// referenced or depended on.
     fn precheck_relation_family(
         &self,
         family: SysFamily,
         batch: &Batch,
         sigs: &[PkSignature],
-        net_dead: &IdSet,
+        dropped: &IdSet,
     ) -> Result<(), String> {
         let mut claimed: FxHashSet<(u64, Cow<'_, str>)> = FxHashSet::default();
         // The retired ids a relation of the same name takes over: an ALTER VIEW.
@@ -609,11 +629,11 @@ impl CatalogEngine {
         if let Some(id) = creates.ids().iter().find(|&&id| self.registry.relation(id).is_some()) {
             return Err(format!("relation id {id} already exists"));
         }
-        // The only owners a created view may name: a chain is created whole.
         let rels: Vec<RelRow<'_>> = batch
             .live_rows()
             .map(|i| read_rel_row(family, batch, i))
             .collect::<Result<_, _>>()?;
+        // The only owners a created view may name: a chain is created whole.
         let created_users = IdSet::new(
             rels.iter()
                 .filter(|rel| {
@@ -623,73 +643,33 @@ impl CatalogEngine {
         );
 
         for rel in &rels {
-            // The system schema holds the catalog's own relations and nothing else.
-            if rel.schema_id == SYSTEM_SCHEMA_ID {
-                return Err(format!("{rel}: the system schema takes no relation"));
-            }
-            let col_defs = self.read_column_defs(rel.id)?;
-            let schema = build_schema_from_col_defs(rel.kind(), &col_defs, rel.pk.as_slice())
-                .map_err(|e| format!("{rel} {e}"))?;
             // A leading `_` names a chain segment and nothing else.
             let segment = matches!(rel.detail, RelDetail::View(ViewParts { owner: Some(_), .. }));
             check_stored_name(&rel.name, rel.kind().noun(), segment)?;
-            // An FK probes its parent's store on every write of the child, which only
-            // a base table's ingest runs; a stream push must stay a pure append.
-            if !rel.kind().is_base_table() {
-                if let Some(cd) = col_defs.iter().find(|cd| cd.fk.is_some()) {
-                    return Err(format!(
-                        "{rel}: column '{}' may not carry a FOREIGN KEY; only a base table's may",
-                        cd.def.name
-                    ));
-                }
+            if creates.contains(rel.id) {
+                self.precheck_relation_create(rel, &created_users, dropped)?;
             }
-            match rel.detail {
-                RelDetail::Table(TableProps { serial, .. }) => {
-                    if serial {
-                        let pk_cols = rel.pk.as_slice().iter().map(|&c| &col_defs[c as usize]);
-                        validate_serial_key(pk_cols.map(|cd| (cd.def.name.as_str(), cd.def.ty)))
-                            .map_err(|e| format!("{rel}: {e}"))?;
-                    }
-                    for cd in &col_defs {
-                        if let Some(fk) = cd.fk {
-                            self.validate_fk_column(cd, fk, rel.id, &col_defs, &schema, net_dead)?;
-                        }
-                    }
-                }
-                RelDetail::View(ViewParts { owner: Some(owner), .. })
-                    if creates.contains(rel.id) && !created_users.contains(owner) =>
-                {
-                    return Err(format!(
-                        "{rel} names owner {owner}, which is not a user view this bundle creates"
-                    ));
-                }
-                RelDetail::View(_) => {}
-            }
-            let displaced = self.claim_qname(rel.schema_id, rel.name.clone(), rel.id, net_dead, &mut claimed)?;
-            // The drop cascade would take the outgoing relation's indexes with it.
-            let owns_index = |old: u64| {
+            if let Some(old) = self.claim_qname(rel.schema_id, rel.name.clone(), rel.id, dropped, &mut claimed)? {
+                // The drop cascade would take the outgoing relation's indexes with it.
                 let named = |c: &IndexClaim| matches!(c, IndexClaim::Index { .. });
-                self.registry
-                    .relation(old)
-                    .is_some_and(|e| e.indexes().iter().any(|ix| ix.claims().iter().any(named)))
-            };
-            if displaced.is_some_and(owns_index) {
-                return Err(format!(
-                    "{rel} owns an index, which replacing it would drop; DROP INDEX first"
-                ));
+                let outgoing = self.registry.relation(old);
+                if let Some(e) = outgoing.filter(|e| e.indexes().iter().any(|ix| ix.claims().iter().any(named))) {
+                    return Err(format!(
+                        "{} '{}' (id={old}) owns an index, which replacing it would drop; DROP INDEX first",
+                        e.kind().noun(),
+                        rel.name
+                    ));
+                }
+                replaced.push(old);
             }
-            replaced.extend(displaced);
         }
 
         if family == SysFamily::Table {
-            for &tid in net_dead.ids() {
+            for &tid in dropped.ids() {
                 // A FK child being co-dropped in this same batch is
                 // self-resolving — only a child *outside* the batch blocks the
                 // drop. Mirrors the view-dependency filter below.
-                let blocking = self
-                    .fk_children_of(tid)
-                    .iter()
-                    .find(|r| !net_dead.contains(r.child_tid));
+                let blocking = self.fks_as_parent(tid).iter().find(|r| !dropped.contains(r.child_tid));
                 if let Some(r) = blocking {
                     let child = self.qualified_name(r.child_tid);
                     return Err(format!("Integrity violation: table referenced by '{child}'"));
@@ -699,9 +679,9 @@ impl CatalogEngine {
 
         // A dependent that is itself being dropped in this same batch is
         // self-resolving — only an *outside* dependent blocks the drop.
-        net_dead.ids().iter().try_for_each(|&id| {
+        dropped.ids().iter().try_for_each(|&id| {
             let op = if replaced.contains(&id) { "replace" } else { "DROP" };
-            self.reject_if_dependent_views(id, op, net_dead)
+            self.reject_if_dependent_views(id, op, dropped)
         })
     }
 
@@ -744,55 +724,44 @@ impl CatalogEngine {
     /// depends on. The drop guards read the batch row rather than probing: the
     /// contract's CAS proved every `-1` content-equals the live one, `name` and
     /// `source_cols` included.
-    fn precheck_index_family(&self, batch: &Batch, net_dead: &IdSet) -> Result<(), String> {
-        // Every live index name, then the ones this batch claims: only live
-        // indexes are scanned, and a `+1` on one already failed the net bound, so
-        // any hit is a different index.
-        let live = self.sys_relation(SysFamily::Index).full_scan();
-        let mut taken: FxHashSet<Cow<'_, [u8]>> = (0..live.len())
-            .map(|i| payload_bytes(&*live, i, IdxTabSlot::name as usize))
-            .collect();
+    fn precheck_index_family(&self, batch: &Batch, dropped: &IdSet) -> Result<(), String> {
+        // A `+1` on a live index already failed the net bound, so any hit is a
+        // different index.
+        let mut taken = self.live_names(SysFamily::Index, IdxTabSlot::name as usize);
         let noun = SysFamily::Index.row_noun();
         for i in batch.live_rows() {
             let r = IdxTabRow::read(batch, i).map_err(|e| format!("Index: {e}"))?;
             let index_name = r.name;
             check_stored_name(&index_name, noun, false)?;
             self.validate_index_create(r.owner_id, r.source_col_idx.as_slice(), r.is_unique)?;
-            if !taken.insert(Cow::Owned(index_name.as_bytes().to_vec())) {
+            if !taken.insert(index_name.as_bytes().into()) {
                 return Err(format!("Index already exists: {index_name}"));
             }
         }
 
         for i in batch.retracted_rows() {
-            // The row, not `net_dead`: this needs `cols`, which a list of ids
+            // The row, not `dropped`: this needs `cols`, which a list of ids
             // does not carry.
             let IdxTabRow { owner_id, source_col_idx: cols, .. } =
                 IdxTabRow::read(batch, i).map_err(|e| format!("Index: {e}"))?;
-            // FK backing is single-column: a composite index never satisfies a
-            // single-column FK/uniqueness requirement, so dropping one is never
-            // blocked by the FK-target guard.
+            // FK backing is single-column: a composite index is never an FK
+            // target, so dropping one is never blocked by the FK-target guard.
             if cols.as_slice().len() != 1 {
                 continue;
             }
             let src_col = cols.as_slice()[0] as usize;
-            if !self.fk_children_of(owner_id).iter().any(|r| r.parent_col == src_col) {
+            if !self.fks_as_parent(owner_id).iter().any(|r| r.parent_col == src_col) {
                 continue;
             }
-            // The FK target column must retain uniqueness for FK child inserts
-            // to validate. The drop is allowed when uniqueness is structurally
-            // preserved: the column is the lone PK, or another unique secondary
-            // index survives the drop.
-            let owner = self.registry.relation(owner_id);
-            if owner.is_some_and(|e| e.schema().lone_pk_col() == Some(src_col)) {
-                continue;
-            }
-            // The claims are pre-drop: this batch has not been applied yet.
-            let unique_remains = owner.and_then(|r| r.index_on(&[src_col as u32])).is_some_and(|ix| {
-                ix.claims()
-                    .iter()
-                    .any(|c| matches!(*c, IndexClaim::Index { id, unique: true } if !net_dead.contains(id)))
-            });
-            if !unique_remains {
+            // The FK target column must stay a legal target for FK child inserts
+            // to validate: the lone PK, or a column a unique index this batch does
+            // not drop still covers. The claims are pre-drop: this batch has not
+            // been applied yet.
+            let remains = self
+                .registry
+                .relation(owner_id)
+                .is_some_and(|o| holds_fk_target(o, src_col as u32, dropped));
+            if !remains {
                 return Err(format!(
                     "Integrity violation: index on '{}' is referenced by a \
                      foreign key and no unique index would remain on the column",

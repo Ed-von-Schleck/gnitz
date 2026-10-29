@@ -4,12 +4,12 @@ use crate::runtime::master::route::with_routed;
 use crate::runtime::sal::fixtures::{holders_of, test_log};
 use crate::runtime::sal::SalGroup;
 use crate::test_support::{
-    batch_rows, circuit_batch, col_tab_batch, identity_circuit, make_batch, net_weight, push_view_tab_row,
-    register_identity_view, table_tab_batch, u64_i64_cols,
+    batch_rows, circuit_batch, col_tab_batch, identity_circuit, make_batch, net_weight, register_identity_view,
+    sys_batch, table_tab_batch, u64_i64_cols, view_tab_row,
 };
 use gnitz_wire::{TableDistribution, TableProps};
 use gnitz_zset::algebra::Placement;
-use gnitz_zset::repr::{Batch, BatchBuilder};
+use gnitz_zset::repr::Batch;
 
 const SAL_SIZE: usize = 1 << 20;
 
@@ -36,10 +36,9 @@ fn boot(dir: &str, slot: Slot, log: &SalWriter) -> CatalogEngine {
 
 /// Write `rows` to `log` as the master's push of them to `tid`.
 fn push(log: &SalWriter, engine: &CatalogEngine, tid: u64, rows: &Batch) {
-    let placement = engine.registry.relation(tid).unwrap().placement();
-    let record = engine.schema_record(tid).expect("a registered table");
-    with_routed(rows, placement, log.num_workers(), |data| {
-        log.commit_zone(&[SalGroup::push(tid, &record, data, holders_of(&data))]);
+    let (rel, record) = engine.wire_target(tid).unwrap();
+    with_routed(rows, rel.placement(), log.num_workers(), |data| {
+        log.commit_zone(&[SalGroup::push(tid, record, data, holders_of(&data))]);
     });
 }
 
@@ -60,10 +59,11 @@ fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
         .create_table_with("public.r", &u64_i64_cols(), &[0], replicated())
         .unwrap();
     let v = engine.allocate_ids(1).unwrap();
-    let mut view_tab = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut view_tab, 1, v, "v", 0, 0, 0);
     engine.registry.ingest(SysFamily::Column.id(), col_tab(v, 1)).unwrap();
-    engine.registry.ingest(SysFamily::View.id(), view_tab.finish()).unwrap();
+    engine
+        .registry
+        .ingest(SysFamily::View.id(), sys_batch([(view_tab_row(v, "v"), 1)]))
+        .unwrap();
     engine.close();
 
     let log = test_log(SAL_SIZE, 1, 1);

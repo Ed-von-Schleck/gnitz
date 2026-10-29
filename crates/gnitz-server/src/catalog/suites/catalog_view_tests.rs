@@ -3,8 +3,6 @@
 //! view, and the two relations the catalog refuses beside its own.
 
 use super::*;
-use crate::test_support::u64_i64_cols;
-use gnitz_wire::{TableTabRow, ViewTabRow};
 
 const TABLES: u64 = gnitz_wire::TABLE_TAB;
 
@@ -18,8 +16,7 @@ fn tables_view(engine: &mut CatalogEngine, name: &str) -> u64 {
 /// brings the delta to both views once.
 #[test]
 fn a_scanned_familys_delta_waits_above_the_cut_for_its_tick() {
-    let dir = temp_dir("catalog_view_delta_above_cut");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("catalog_view_delta_above_cut");
     let seeds = SysFamily::ALL.len();
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
 
@@ -55,8 +52,7 @@ fn a_scanned_familys_delta_waits_above_the_cut_for_its_tick() {
 
 #[test]
 fn a_ddl_sync_into_an_unscanned_family_leaves_nothing_above_its_cut() {
-    let dir = temp_dir("catalog_unscanned_family_sealed");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("catalog_unscanned_family_sealed");
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     // A view over `tables` alone: `columns` stays unscanned.
     let view = tables_view(&mut engine, "v_tables");
@@ -71,107 +67,50 @@ fn a_ddl_sync_into_an_unscanned_family_leaves_nothing_above_its_cut() {
     discard(engine);
 }
 
-/// The verdict's own clause: every view here holds a manifest at the committed
-/// generation, published past the engine's round, so nothing but its source
-/// rejects the two that reach a family.
+/// A view reaching a family awaits a rebuild at reopen, and so does one over it.
 #[test]
 fn a_view_reaching_a_family_awaits_rebuild_at_reopen() {
-    let dir = temp_dir("catalog_views_invalid_at_boot");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = u64_i64_cols();
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-
-    let direct = tables_view(&mut engine, "v_direct");
-    let downstream = register_identity_view(&mut engine, direct, "v_downstream", &SysFamily::Table.column_defs());
-    let over_table = register_identity_view(&mut engine, tid, "v_table", &cols);
-
-    engine.record_topology(1).unwrap();
-    let g = engine.advance_durable_generation().unwrap();
-    engine.registry.checkpoint_ephemeral([], g, |_| true).unwrap();
-    engine.close();
-
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(engine.dag.awaits_rebuild(direct), "a family source invalidates");
-    assert!(engine.dag.awaits_rebuild(downstream), "and the verdict cascades");
-    assert!(
-        !engine.dag.awaits_rebuild(over_table),
-        "a view over a base table resumes"
+    assert_unreplayed_source_rebuilds_at_reopen(
+        fresh("catalog_views_invalid_at_boot"),
+        TABLES,
+        &SysFamily::Table.column_defs(),
     );
-
-    fs::remove_dir_all(&dir).ok();
 }
 
+/// An ephemeral round publishes no store of a view a family reaches.
 #[test]
 fn an_ephemeral_round_publishes_no_view_a_family_reaches() {
-    let dir = temp_dir("catalog_views_unpublished");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = u64_i64_cols();
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let family_cols = SysFamily::Table.column_defs();
-
-    let direct = traced_view(&mut engine, TABLES, "v_direct", &family_cols);
-    let downstream = traced_view(&mut engine, direct, "v_downstream", &family_cols);
-    let over_table = traced_view(&mut engine, tid, "v_table", &cols);
-
-    engine.record_topology(1).unwrap();
-    let g = engine.advance_durable_generation().unwrap();
-    engine.flush_ephemeral_round(g).unwrap();
-
-    assert_eq!(published_children(&dir, direct), Vec::<String>::new());
-    assert_eq!(published_children(&dir, downstream), Vec::<String>::new());
-    let table_children = published_children(&dir, over_table);
-    assert!(table_children.contains(&"w0of1".to_string()), "got {table_children:?}");
-    engine.close();
-
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(engine.dag.awaits_rebuild(direct));
-    assert!(engine.dag.awaits_rebuild(downstream));
-    assert!(!engine.dag.awaits_rebuild(over_table));
-
-    fs::remove_dir_all(&dir).ok();
+    assert_round_publishes_nothing_reaching(
+        fresh("catalog_views_unpublished"),
+        TABLES,
+        &SysFamily::Table.column_defs(),
+    );
 }
 
 #[test]
 fn the_system_schema_takes_no_relation() {
-    let dir = temp_dir("catalog_system_schema_closed");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("catalog_system_schema_closed");
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let before = sys_row_counts(&engine);
-    let pk_col_idx = PkColList::from_slice(&[0]);
 
     let tid = engine.allocate_ids(1).unwrap();
     let table = TableTabRow {
-        table_id: tid,
         schema_id: SYSTEM_SCHEMA_ID,
-        name: "mine".into(),
-        pk_col_idx,
-        flags: gnitz_wire::TableProps::default().pack(),
+        ..table_tab_row(tid, "mine")
     };
     let table = vec![
         (SysFamily::Column, col_tab_batch(tid, &cols, 1)),
-        (SysFamily::Table, crate::test_support::sys_batch([(table, 1)])),
+        (SysFamily::Table, sys_batch([(table, 1)])),
     ];
 
     let vid = engine.allocate_ids(1).unwrap();
     let view = ViewTabRow {
-        view_id: vid,
         schema_id: SYSTEM_SCHEMA_ID,
-        name: "mine".into(),
-        pk_col_idx,
-        capacity_bytes: 0,
-        delta_bytes: 0,
-        owner_view_id: 0,
-        pk_repeats: false,
-        compress: false,
-        definition: Default::default(),
+        ..view_tab_row(vid, "mine")
     };
     let family_cols = SysFamily::Table.column_defs();
     let circuit = crate::test_support::identity_circuit(TABLES, gnitz_wire::ReadBound::None);
-    let view: Vec<_> = view_blocks(
-        [(vid, &circuit, &family_cols[..])],
-        crate::test_support::sys_batch([(view, 1)]),
-    )
-    .into();
+    let view: Vec<_> = view_blocks([(vid, &circuit, &family_cols[..])], sys_batch([(view, 1)])).into();
 
     for blocks in [table, view] {
         let err = apply_ddl(&mut engine, blocks).expect_err("a relation in the system schema");
@@ -186,18 +125,16 @@ fn the_system_schema_takes_no_relation() {
 
 #[test]
 fn no_view_scans_sequences() {
-    let dir = temp_dir("catalog_sequences_unscanned");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("catalog_sequences_unscanned");
     let before = sys_row_counts(&engine);
     let seq = SysFamily::Sequence.id();
     let cols = SysFamily::Sequence.column_defs();
 
     let vid = engine.allocate_ids(1).unwrap();
-    let mut view = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut view, 1, vid, "v_seq", 0, 0, 0);
+    let view = sys_batch([(view_tab_row(vid, "v_seq"), 1)]);
     let circuit = crate::test_support::identity_circuit(seq, gnitz_wire::ReadBound::None);
-    let err = apply_ddl(&mut engine, view_blocks([(vid, &circuit, &cols[..])], view.finish()))
-        .expect_err("a view over sequences");
+    let err =
+        apply_ddl(&mut engine, view_blocks([(vid, &circuit, &cols[..])], view)).expect_err("a view over sequences");
     assert!(err.contains("holds no set a view can scan"), "{err}");
     assert!(err.contains("_system.sequences"), "{err}");
 

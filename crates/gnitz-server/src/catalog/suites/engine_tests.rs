@@ -17,7 +17,6 @@ fn test_orphaned_metadata_recovery() {
                 idx_tab_batch(888, 99999, &[1], "orphaned_idx", false, 1),
             )
             .unwrap();
-        let _ = engine.registry.checkpoint_system(engine.system_zone);
         engine.close();
     }
 
@@ -32,8 +31,7 @@ fn test_orphaned_metadata_recovery() {
 
 #[test]
 fn test_reserve_user_sequence_seed_and_contiguous() {
-    let dir = temp_dir("reserve_user_seq");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("reserve_user_seq");
     let seq_id = engine.create_serial_table("public.t").unwrap();
 
     let (base1, delta1) = reserve(&mut engine, seq_id, 64).unwrap();
@@ -51,14 +49,12 @@ fn test_reserve_user_sequence_seed_and_contiguous() {
     assert_eq!(payload_u64(&delta2, 1, 0), 128);
     assert_eq!(engine.sequence_value(seq_id), Some(128));
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
 fn test_reserve_user_sequence_rejects_exhausted_range() {
-    let dir = temp_dir("reserve_user_seq_exhausted");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("reserve_user_seq_exhausted");
 
     // A run whose last id would be i64::MAX, the ceiling.
     let full = engine.create_serial_table("public.full").unwrap();
@@ -76,15 +72,13 @@ fn test_reserve_user_sequence_rejects_exhausted_range() {
     assert_eq!(base, i64::MAX - 64);
     assert_eq!(payload_u64(&delta, 1, 0), (i64::MAX - 1) as u64, "last = i64::MAX - 1");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// `count` arrives raw off the wire.
 #[test]
 fn allocate_ids_hands_out_contiguous_runs_under_the_ceiling() {
-    let dir = temp_dir("alloc_ids");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("alloc_ids");
     let a = engine.allocate_ids(3).unwrap();
     assert_eq!(engine.allocate_ids(1).unwrap(), a + 3);
     for count in [0, gnitz_wire::CATALOG_ID_CEILING, u64::MAX] {
@@ -95,8 +89,7 @@ fn allocate_ids_hands_out_contiguous_runs_under_the_ceiling() {
     let rest = gnitz_wire::CATALOG_ID_CEILING - engine.next_id;
     engine.allocate_ids(rest + 1).unwrap_err();
     assert_eq!(engine.allocate_ids(rest).unwrap(), a + 5);
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// An id enters the catalog only through `allocate_ids`. A `+1` row at one the
@@ -104,8 +97,7 @@ fn allocate_ids_hands_out_contiguous_runs_under_the_ceiling() {
 /// raise the counter to the ceiling and exhaust every later allocation.
 #[test]
 fn a_row_at_an_unallocated_id_is_refused_and_leaves_allocation_working() {
-    let dir = temp_dir("unallocated_id");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("unallocated_id");
     let next = engine.allocate_ids(1).unwrap() + 1;
     for id in [next, next + 4096, gnitz_wire::CATALOG_ID_CEILING - 1] {
         let err = apply_ddl(
@@ -121,8 +113,7 @@ fn a_row_at_an_unallocated_id_is_refused_and_leaves_allocation_working() {
         [(SysFamily::Schema, schema_tab_batch(&[(next, "granted", 1)]))],
     )
     .unwrap();
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
@@ -135,15 +126,13 @@ fn test_user_sequence_durable_roundtrip() {
         let (base, _) = reserve(&mut engine, user_seq, 64).unwrap();
         assert_eq!(base, 1);
         assert_eq!(engine.sequence_value(user_seq), Some(64));
-        let _ = engine.registry.checkpoint_system(engine.system_zone);
         engine.close();
     }
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(engine.sequence_value(user_seq), Some(64));
     let (base2, _delta) = reserve(&mut engine, user_seq, 64).unwrap();
     assert_eq!(base2, 65, "next id continues after the recovered high-water");
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
@@ -151,7 +140,7 @@ fn test_boot_generation_advance_monotonic() {
     let dir = temp_dir("recovery_start_gen_bump");
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        engine.record_topology(4).unwrap();
+        engine.record_topology(1).unwrap();
         assert_eq!(engine.advance_durable_generation().unwrap(), 1);
         assert_eq!(engine.advance_durable_generation().unwrap(), 2);
         engine.close();
@@ -160,14 +149,13 @@ fn test_boot_generation_advance_monotonic() {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert_eq!(engine.durable_generation(), 2);
         assert_eq!(engine.advance_durable_generation().unwrap(), 3);
-        assert_eq!(engine.resume_generation, 2);
+        assert_eq!(engine.resume_at, Some(2));
         assert_eq!(engine.advance_durable_generation().unwrap(), 4);
         engine.close();
     }
     let engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(engine.durable_generation(), 4);
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// A drop, a system flush and a reopen must not hand out again an id a dropped
@@ -187,8 +175,7 @@ fn a_dropped_relations_id_is_not_handed_out_again() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(engine.registry.relation(tid).is_none());
     assert!(engine.allocate_ids(1).unwrap() > tid);
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── test_sequence_gap_recovery ───────────────────────────────────────
@@ -213,8 +200,6 @@ fn test_sequence_gap_recovery() {
         let columns = col_tab_batch(250, &[col_def("id", TypeCode::U64)], 1);
         engine.registry.ingest(SysFamily::Column.id(), columns).unwrap();
 
-        let _ = engine.registry.checkpoint_system(engine.system_zone);
-        let _ = engine.registry.checkpoint_system(engine.system_zone);
         engine.close();
     }
 
@@ -223,34 +208,23 @@ fn test_sequence_gap_recovery() {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         let new_tid = engine.create_table("public.tnext", &cols, &[0]).unwrap();
         assert_eq!(new_tid, 251, "Sequence recovery: expected 251, got {new_tid}");
-        engine.close();
+        finish(engine);
     }
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 // ── test_ingest_scan_seek_family ──────────────────────────────────────
 
 #[test]
 fn test_ingest_scan_seek_family() {
-    let dir = temp_dir("catalog_ingest_scan_seek");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("catalog_ingest_scan_seek");
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     // Ingest via CatalogEngine (user table path)
-    let mut bb = BatchBuilder::new(&schema);
-    bb.begin_row(1u128, 1);
-    bb.put_u64(100);
-    bb.end_row();
-    bb.begin_row(2u128, 1);
-    bb.put_u64(200);
-    bb.end_row();
-    bb.begin_row(3u128, 1);
-    bb.put_u64(300);
-    bb.end_row();
-    engine.registry.ingest(tid, bb.finish()).unwrap();
+    engine
+        .registry
+        .ingest(tid, rows(&engine, tid, 1, [1, 2, 3], |i| [i * 100]))
+        .unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Scan
@@ -265,8 +239,7 @@ fn test_ingest_scan_seek_family() {
     // Point read, missing
     assert!(pk_group_native(&mut engine, tid, 99).is_empty());
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── a point read resolves a system-table row ───────────
@@ -275,8 +248,7 @@ fn test_ingest_scan_seek_family() {
 /// TABLE_TAB row keyed by the new table id.
 #[test]
 fn point_read_resolves_system_table_row() {
-    let dir = temp_dir("catalog_seek_system_table");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("catalog_seek_system_table");
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
@@ -287,34 +259,29 @@ fn point_read_resolves_system_table_row() {
     );
     assert!(pk_group_native(&mut engine, gnitz_wire::TABLE_TAB, 9_999_999).is_empty());
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── test_ingest_pk_enforced_through_the_store ───────────────────────────────
 
 #[test]
 fn test_ingest_pk_enforced_through_the_store() {
-    let dir = temp_dir("catalog_pk_enforced_store");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("catalog_pk_enforced_store");
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     // Insert row with PK=1, val=100
-    let mut bb = BatchBuilder::new(&schema);
-    bb.begin_row(1u128, 1);
-    bb.put_u64(100);
-    bb.end_row();
-    engine.registry.ingest(tid, bb.finish()).unwrap();
+    engine
+        .registry
+        .ingest(tid, rows(&engine, tid, 1, [1], |_| [100]))
+        .unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Insert row with PK=1 again, val=200 (should retract old + insert new)
-    let mut bb = BatchBuilder::new(&schema);
-    bb.begin_row(1u128, 1);
-    bb.put_u64(200);
-    bb.end_row();
-    engine.registry.ingest(tid, bb.finish()).unwrap();
+    engine
+        .registry
+        .ingest(tid, rows(&engine, tid, 1, [1], |_| [200]))
+        .unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Scan — should have exactly 1 row with val=200
@@ -323,16 +290,14 @@ fn test_ingest_pk_enforced_through_the_store() {
     assert_eq!(gnitz_wire::widen_pk_be(scan.get_pk_bytes(0)), 1);
     assert_eq!(payload_u64(&*scan, 0, 0), 200, "the later write must win the PK");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── test_ddl_sync ─────────────────────────────────────────────────────
 
 #[test]
 fn test_ddl_sync() {
-    let dir = temp_dir("catalog_ddl_sync");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("catalog_ddl_sync");
 
     // Create a schema via normal DDL
     engine.create_schema("app").unwrap();
@@ -345,8 +310,7 @@ fn test_ddl_sync() {
     // Hooks should have registered the schema
     assert!(engine.schema_id("synced").is_some());
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── the_newest_applied_zone_is_every_familys_replay_floor ──────────────
@@ -378,8 +342,7 @@ fn the_newest_applied_zone_is_every_familys_replay_floor() {
     );
     assert_eq!(engine.system_zone, 9);
 
-    drop(engine);
-    let _ = fs::remove_dir_all(&dir);
+    discard(engine);
 }
 
 // ── replayed_ddl_sync_group_is_not_replayed_after_a_flush ────────────
@@ -401,8 +364,7 @@ fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
     assert_eq!(flushed, 500, "the flushed SCHEMA_TAB must dedup the group at lsn 500");
     assert!(engine.schema_id("synced").is_some());
 
-    drop(engine);
-    let _ = fs::remove_dir_all(&dir);
+    discard(engine);
 }
 
 // ── test_master_holds_no_user_store ───────────────────────────────
@@ -432,16 +394,14 @@ fn test_master_holds_no_user_store() {
         );
     }
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── test_fk_index_metadata_queries ───────────────────────────────────
 
 #[test]
 fn test_fk_index_metadata_queries() {
-    let dir = temp_dir("catalog_fk_idx_meta");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("catalog_fk_idx_meta");
 
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.parent", &cols, &[0]).unwrap();
@@ -454,8 +414,8 @@ fn test_fk_index_metadata_queries() {
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // FK count
-    assert!(!engine.fk_constraints_of(child_tid).is_empty());
-    let target_id = engine.fk_constraints_of(child_tid)[0].parent_tid;
+    assert!(!engine.fks_as_child(child_tid).is_empty());
+    let target_id = engine.fks_as_child(child_tid)[0].parent_tid;
     assert_eq!(target_id, tid);
 
     // Create an explicit index
@@ -472,8 +432,7 @@ fn test_fk_index_metadata_queries() {
     // The index circuit resolves, so its store is reachable.
     assert!(engine.registry.relation(tid).and_then(|r| r.index_on(&[1])).is_some());
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
@@ -493,16 +452,14 @@ fn test_dep_map_view_on_view_chain() {
     assert_eq!(engine.dag.dependents_of(tid), [v1]);
     assert_eq!(engine.dag.dependents_of(v1), [v2]);
     assert_eq!(engine.dag.sources_of(v2), [v1]);
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// A retired view contributes no edges: DROP VIEW and the ALTER VIEW
 /// `replaces` path both unregister the outgoing view, and the map forgets it.
 #[test]
 fn test_dep_map_drops_a_retired_views_edges() {
-    let dir = temp_dir("dep_map_retired");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("dep_map_retired");
 
     let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
@@ -512,11 +469,9 @@ fn test_dep_map_drops_a_retired_views_edges() {
 
     // ALTER VIEW: one VIEW_TAB batch retiring v1 and registering v2.
     let v2 = engine.allocate_ids(1).unwrap();
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, -1, v1, "v1", 0, 0, 0);
-    push_view_tab_row(&mut bb, 1, v2, "v1", 0, 0, 0);
+    let views = sys_batch([(view_tab_row(v1, "v1"), -1), (view_tab_row(v2, "v1"), 1)]);
     let identity = crate::test_support::identity_circuit(tid, gnitz_wire::ReadBound::None);
-    apply_ddl(&mut engine, view_blocks([(v2, &identity, &cols[..])], bb.finish())).unwrap();
+    apply_ddl(&mut engine, view_blocks([(v2, &identity, &cols[..])], views)).unwrap();
     assert_eq!(
         engine.dag.dependents_of(tid),
         &[v2][..],
@@ -527,16 +482,14 @@ fn test_dep_map_drops_a_retired_views_edges() {
     engine.drop_view("public.v1").unwrap();
     assert!(engine.dag.dependents_of(tid).is_empty());
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// The two dependent-view RESTRICTs — DROP TABLE and DROP COLUMN — both read
 /// the dependency map.
 #[test]
 fn test_dependent_view_restricts_fire_from_registered_views() {
-    let dir = temp_dir("dep_map_restrict");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("dep_map_restrict");
 
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
@@ -551,14 +504,12 @@ fn test_dependent_view_restricts_fire_from_registered_views() {
     let err = engine.precheck_family(SysFamily::Column, &pair).unwrap_err();
     assert!(err.contains("dependent views"), "DROP NOT NULL RESTRICT: {err}");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 #[test]
 fn test_circuit_table_surface_introspectable() {
-    let dir = temp_dir("circuit_surface");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("circuit_surface");
 
     // Inject a row directly into CIRCUIT_TAB so the store is non-empty: view 107,
     // with a single node, through the shared row codec — as a worker applies it,
@@ -579,8 +530,7 @@ fn test_circuit_table_surface_introspectable() {
     let found = pk_group(&mut engine, gnitz_wire::CIRCUIT_TAB, &pk_bytes);
     assert_eq!(found.len(), 1, "the circuit row by PK");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 // ── The name indexes ────────────────────────────────────────────────────────
@@ -589,8 +539,7 @@ fn test_circuit_table_surface_introspectable() {
 /// schema's entry goes with its last relation.
 #[test]
 fn the_relation_name_index_follows_renames_and_drops() {
-    let dir = temp_dir("relation_name_index");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("relation_name_index");
     engine.create_schema("s").unwrap();
     let sid = engine.schema_id("s").unwrap();
     let cols = vec![col_def("id", TypeCode::U64)];
@@ -606,10 +555,8 @@ fn the_relation_name_index_follows_renames_and_drops() {
 
     engine.drop_table("s.only").unwrap();
     assert!(!engine.caches.relation_by_name.contains_key(&sid));
-    assert!(engine.schema_is_empty("s"));
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// A relation's descriptor token changes exactly when a RESOLVE of its name
@@ -617,8 +564,7 @@ fn the_relation_name_index_follows_renames_and_drops() {
 /// on another relation or an advance of its own sequence do not.
 #[test]
 fn a_descriptor_token_follows_the_resolve_answer() {
-    let dir = temp_dir("descriptor_token");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = fresh("descriptor_token");
     let cols = vec![col_def("id", TypeCode::U64), col_def("a", TypeCode::I64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let token = engine.resolve_token(tid).unwrap();
@@ -650,8 +596,7 @@ fn a_descriptor_token_follows_the_resolve_answer() {
     engine.drop_table("public.renamed").unwrap();
     assert_eq!(stale(&engine, indexed), None);
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }
 
 /// An index name is taken by a live index and by an earlier row of the same batch,
@@ -663,7 +608,7 @@ fn an_index_name_is_claimed_once() {
         col_def("a", TypeCode::I64),
         col_def("b", TypeCode::I64),
     ];
-    let (mut engine, tid, dir) = table_fixture("index_name_claimed_once", &cols);
+    let (mut engine, tid) = table_fixture("index_name_claimed_once", &cols);
     let index = |engine: &mut CatalogEngine, col: u32, name: &str| {
         let id = engine.allocate_ids(1).unwrap();
         idx_tab_batch(id, tid, &[col], name, false, 1)
@@ -685,6 +630,5 @@ fn an_index_name_is_claimed_once() {
         .precheck_family(SysFamily::Index, &second)
         .expect("a dropped index frees its name");
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
+    finish(engine);
 }

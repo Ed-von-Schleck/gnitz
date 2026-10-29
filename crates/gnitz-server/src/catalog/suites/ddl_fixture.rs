@@ -8,8 +8,8 @@
 //! same way, without a server.
 
 use super::super::*;
-use crate::test_support::{apply_ddl, col_tab_batch, idx_tab_batch, schema_tab_batch, sys_batch};
-use gnitz_wire::{payload_u64, validate_user_identifier, CatalogColumn, IdxTabSlot, TableTabRow};
+use crate::test_support::{apply_ddl, col_tab_batch, idx_tab_batch, schema_tab_batch, sys_batch, table_tab_row};
+use gnitz_wire::{payload_u64, CatalogColumn, IdxTabSlot, PkColList, TableProps, TableTabRow};
 use gnitz_zset::repr::Batch;
 
 /// Split `schema.name`, defaulting the schema half. Only these direct entry
@@ -22,6 +22,28 @@ pub(super) fn parse_qualified_name<'a>(name: &'a str, default_schema: &'a str) -
     }
 }
 
+/// The COL_TAB records and TABLE_TAB `+1` that register table `tid` named `name`
+/// in schema `sid`, in apply order.
+fn table_blocks(
+    tid: u64,
+    sid: u64,
+    name: &str,
+    cols: &[CatalogColumn],
+    pk: &[u32],
+    props: TableProps,
+) -> [(SysFamily, Batch); 2] {
+    let row = TableTabRow {
+        schema_id: sid,
+        pk_col_idx: PkColList::from_slice(pk),
+        flags: props.pack(),
+        ..table_tab_row(tid, name)
+    };
+    [
+        (SysFamily::Column, col_tab_batch(tid, cols, 1)),
+        (SysFamily::Table, sys_batch([(row, 1)])),
+    ]
+}
+
 /// Production index names arrive pre-built over the wire; only `create_index`
 /// below names one engine-side.
 pub(super) fn make_secondary_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
@@ -29,11 +51,6 @@ pub(super) fn make_secondary_index_name(schema_name: &str, table_name: &str, col
 }
 
 impl CatalogEngine {
-    pub(in crate::catalog) fn schema_is_empty(&self, schema_name: &str) -> bool {
-        self.schema_id(schema_name)
-            .is_none_or(|sid| !self.caches.relation_by_name.contains_key(&sid))
-    }
-
     pub(in crate::catalog) fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<u64> {
         self.relation_id(self.schema_id(schema_name)?, table_name)
     }
@@ -50,7 +67,7 @@ impl CatalogEngine {
         let rows = self.sys_rows_where(SysFamily::Index, |s, i| {
             gnitz_wire::payload_bytes(s, i, IdxTabSlot::name as usize) == name.as_bytes()
         });
-        (!rows.is_empty()).then(|| gnitz_wire::widen_pk_be(rows.get_pk_bytes(0)) as u64)
+        (!rows.is_empty()).then(|| gnitz_wire::sys_leading_id(rows.get_pk_bytes(0)))
     }
 
     pub(in crate::catalog) fn has_index_by_name(&self, name: &str) -> bool {
@@ -63,7 +80,7 @@ impl CatalogEngine {
             payload_u64(s, i, IdxTabSlot::owner_id as usize) == owner
         });
         (0..rows.len())
-            .map(|i| gnitz_wire::widen_pk_be(rows.get_pk_bytes(i)) as u64)
+            .map(|i| gnitz_wire::sys_leading_id(rows.get_pk_bytes(i)))
             .collect()
     }
 
@@ -80,10 +97,6 @@ impl CatalogEngine {
     // -- DDL: CREATE/DROP SCHEMA -------------------------------------------
 
     pub(in crate::catalog) fn create_schema(&mut self, name: &str) -> Result<(), String> {
-        validate_user_identifier(name)?;
-        if self.schema_id(name).is_some() {
-            return Err(format!("Schema already exists: {name}"));
-        }
         let sid = self.allocate_ids(1).unwrap();
 
         apply_ddl(self, [(SysFamily::Schema, schema_tab_batch(&[(sid, name, 1)]))])
@@ -94,7 +107,6 @@ impl CatalogEngine {
     /// `DROP SCHEMA CASCADE`: `precheck_schema_family` rejects a non-empty drop,
     /// and the bundle's reverse apply order retires the members first.
     pub(in crate::catalog) fn drop_schema(&mut self, name: &str) -> Result<(), String> {
-        validate_user_identifier(name)?;
         let sid = self.schema_id(name).ok_or("Schema does not exist")?;
         let mut blocks = vec![(SysFamily::Schema, self.retract_under(SysFamily::Schema, &[sid]))];
         for family in [SysFamily::View, SysFamily::Table] {
@@ -116,12 +128,12 @@ impl CatalogEngine {
         col_defs: &[CatalogColumn],
         pk_cols: &[u32],
     ) -> Result<u64, String> {
-        self.create_table_with(qualified_name, col_defs, pk_cols, gnitz_wire::TableProps::default())
+        self.create_table_with(qualified_name, col_defs, pk_cols, TableProps::default())
     }
 
     /// A SERIAL table `(id U64 PRIMARY KEY)`.
     pub(crate) fn create_serial_table(&mut self, qualified_name: &str) -> Result<u64, String> {
-        let serial = gnitz_wire::TableProps { serial: true, ..Default::default() };
+        let serial = TableProps { serial: true, ..Default::default() };
         self.create_table_with(
             qualified_name,
             &[crate::test_support::col_def("id", gnitz_wire::TypeCode::U64)],
@@ -136,7 +148,7 @@ impl CatalogEngine {
         qualified_name: &str,
         col_defs: &[CatalogColumn],
         pk_cols: &[u32],
-        props: gnitz_wire::TableProps,
+        props: TableProps,
     ) -> Result<u64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
 
@@ -150,26 +162,12 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Schema does not exist: {schema_name}"))?;
         let tid = self.allocate_ids(1).unwrap();
 
-        let row = TableTabRow {
-            table_id: tid,
-            schema_id: sid,
-            name: table_name.into(),
-            pk_col_idx: gnitz_wire::PkColList::from_slice(pk_cols),
-            flags: props.pack(),
-        };
-        let blocks = [
-            (SysFamily::Column, col_tab_batch(tid, col_defs, 1)),
-            (SysFamily::Table, sys_batch([(row, 1)])),
-        ];
-        apply_ddl(self, blocks)?;
+        apply_ddl(self, table_blocks(tid, sid, table_name, col_defs, pk_cols, props))?;
         Ok(tid)
     }
 
     pub(in crate::catalog) fn drop_table(&mut self, qualified_name: &str) -> Result<(), String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
-        validate_user_identifier(schema_name)?;
-        validate_user_identifier(table_name)?;
-
         let tid = self
             .get_by_name(schema_name, table_name)
             .ok_or_else(|| format!("Table does not exist: {schema_name}.{table_name}"))?;
@@ -190,7 +188,7 @@ impl CatalogEngine {
 
     // -- DDL: CREATE/DROP INDEX --------------------------------------------
 
-    pub(crate) fn create_index(
+    pub(in crate::catalog) fn create_index(
         &mut self,
         qualified_owner: &str,
         col_names: &[&str],
@@ -221,13 +219,13 @@ impl CatalogEngine {
         apply_ddl(self, [(SysFamily::Index, batch)]).map(|()| index_id)
     }
 
-    pub(crate) fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
+    pub(in crate::catalog) fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
         let idx_id = self
             .index_id_by_name(index_name)
             .ok_or_else(|| format!("Index does not exist: {index_name}"))?;
 
         // precheck_family enforces the FK-target uniqueness guard on the -1;
-        // hook_index_register releases the index's claim on its circuit.
+        // hook_index_register releases the index's claim on its owner.
         self.submit_retraction(SysFamily::Index, idx_id)
     }
 
@@ -237,7 +235,7 @@ impl CatalogEngine {
     /// COL_TAB and TABLE_TAB rows a DDL bundle carries, each through `ddl_sync`,
     /// so the register hooks fire and the relation store is built. `pk` names PK
     /// column indices into `cols`, in key order.
-    pub(crate) fn register_table(
+    pub(in crate::catalog) fn register_table(
         &mut self,
         tid: u64,
         schema_id: u64,
@@ -245,16 +243,9 @@ impl CatalogEngine {
         cols: &[CatalogColumn],
         pk: &[u32],
     ) -> Result<(), String> {
-        let col_batch = col_tab_batch(tid, cols, 1);
-        self.ddl_sync(SysFamily::Column.id(), col_batch)?;
-
-        let row = TableTabRow {
-            table_id: tid,
-            schema_id,
-            name: name.into(),
-            pk_col_idx: gnitz_wire::PkColList::from_slice(pk),
-            flags: gnitz_wire::TableProps::default().pack(),
-        };
-        self.ddl_sync(SysFamily::Table.id(), sys_batch([(row, 1)]))
+        for (family, batch) in table_blocks(tid, schema_id, name, cols, pk, TableProps::default()) {
+            self.ddl_sync(family.id(), batch)?;
+        }
+        Ok(())
     }
 }

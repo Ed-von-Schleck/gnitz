@@ -580,14 +580,6 @@ impl RelationRegistry {
     pub fn any_delta_feed(&self) -> bool {
         self.relations.values().any(|r| r.kind().has_delta_feed())
     }
-
-    /// Every registered view id.
-    pub fn view_ids(&self) -> impl Iterator<Item = u64> + '_ {
-        self.relations
-            .iter()
-            .filter(|(_, e)| e.kind().is_view())
-            .map(|(&id, _)| id)
-    }
 }
 
 // ---------------------------------------------------------------------------

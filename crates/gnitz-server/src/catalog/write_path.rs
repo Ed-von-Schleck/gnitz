@@ -1,13 +1,11 @@
 //! Catalog write path: `apply_bundle` over `submit` (precheck → owned-row cascade →
 //! layout through the caller's sink → ingest → `fire_hooks`), the undo of a
-//! refused write, what an applied bundle did, the zone pin, and the
-//! orphan-directory sweep.
+//! refused write, what an applied bundle did, and the zone pin.
 
 use gnitz_wire::{payload_u64, IdxTabRow, IdxTabSlot, PkColList, ViewTabSlot, WireFault};
 use gnitz_zset::repr::Batch;
 
-use super::sys_reads::IdSet;
-use super::sys_tables::{pk_signatures, DdlBundle, PkShape, SysFamily};
+use super::sys_tables::{pk_signatures, DdlBundle, IdSet, PkShape, SysFamily};
 use super::CatalogEngine;
 
 /// Where a catalog write lays each group out, before applying it. An `Err`
@@ -86,14 +84,11 @@ impl CatalogEngine {
         zone: &mut Vec<ZoneGroup>,
         sink: &mut ZoneSink<'_>,
     ) -> Result<(), WireFault> {
-        let net_dead = self.precheck_family(family, &batch)?;
-        for (family, mut batch) in self.with_owned_retractions(family, batch, net_dead) {
+        let dropped = self.precheck_family(family, &batch)?;
+        for (family, batch) in self.with_owned_retractions(family, batch, dropped) {
             if batch.is_empty() {
                 continue;
             }
-            // The hooks read the rows through the catalog's descriptor, not the
-            // descriptor the delta arrived under.
-            batch.set_schema(family.schema());
             sink(family, &batch)?;
             // What a worker's `ddl_sync` of this group will read: it applies the
             // same groups in the same order.
@@ -108,11 +103,11 @@ impl CatalogEngine {
     /// `batch` with the retraction of every row its dropped relations own, in
     /// reversed apply order: an index's hook reads its owner, and undoing the drop
     /// re-registers the owner from its circuit and column rows.
-    fn with_owned_retractions(&self, family: SysFamily, mut batch: Batch, net_dead: IdSet) -> Vec<(SysFamily, Batch)> {
-        if !matches!(family, SysFamily::Table | SysFamily::View) || net_dead.is_empty() {
+    fn with_owned_retractions(&self, family: SysFamily, mut batch: Batch, dropped: IdSet) -> Vec<(SysFamily, Batch)> {
+        if !matches!(family, SysFamily::Table | SysFamily::View) || dropped.is_empty() {
             return vec![(family, batch)];
         }
-        let mut owners = net_dead;
+        let mut owners = dropped;
         // A view's segments drop in its own batch, unless the bundle already names them.
         if family == SysFamily::View {
             let segs = self.sys_rows_where(SysFamily::View, |s, i| {
@@ -193,6 +188,11 @@ impl CatalogEngine {
     /// Ingest one delta, under its family's schema, into its family's store —
     /// above its cut iff `above` — and fire its hooks.
     fn apply_family(&mut self, family: SysFamily, batch: &Batch, above: bool) -> Result<(), String> {
+        debug_assert!(
+            *batch.schema() == *family.schema(),
+            "a {} delta under another descriptor",
+            family.name()
+        );
         let id = family.id();
         match above {
             true => self.registry.ingest_pending(id, batch.clone()),
@@ -219,27 +219,16 @@ impl CatalogEngine {
 
     /// Apply one DdlSync group: above the store's cut when a view scans the
     /// family, for the tick the master sends behind the zone.
-    pub(crate) fn ddl_sync(&mut self, table_id: u64, mut batch: Batch) -> Result<(), String> {
+    pub(crate) fn ddl_sync(&mut self, table_id: u64, batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
-        // The hooks read the rows through the catalog's descriptor, not the
-        // descriptor the delta arrived under.
-        batch.set_schema(family.schema());
         self.apply_family(family, &batch, self.dag.is_scanned(table_id))
     }
 
-    // -- Applied zone, directory sweep -------------------------------------------
+    // -- Applied zone -------------------------------------------------------------
 
     /// Record that the system families hold every row of zone `zone_lsn`: every
     /// system flush after it records this floor.
     pub(crate) fn mark_zone_applied(&mut self, zone_lsn: u64) {
         self.system_zone = self.system_zone.max(zone_lsn);
-    }
-
-    /// Remove every relation and index directory no live entity owns. Only sound once
-    /// every worker has ACKed a round written after the last DdlSync.
-    pub(crate) fn reclaim_orphan_dirs(&self) {
-        if let Err(e) = self.registry.reclaim_orphan_relation_dirs(|id| self.dag.layout_of(id)) {
-            gnitz_warn!("catalog: orphan directory sweep failed: {}", e);
-        }
     }
 }

@@ -98,15 +98,8 @@ fn echo_fold_view_tick_bench() {
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
     let cells = |id: u64| [scramble(id)];
     for readers in [0usize, 1, 2, 4] {
-        let mut engine = CatalogEngine::open(&temp_dir(&format!("echo_fold_{readers}")), 1).unwrap();
-        let s = engine
-            .create_table_with(
-                "public.s",
-                &cols,
-                &[0],
-                gnitz_wire::TableProps { stream: true, ..Default::default() },
-            )
-            .unwrap();
+        let mut engine = fresh(&format!("echo_fold_{readers}"));
+        let s = create_stream(&mut engine, "public.s", &cols);
         let a = register_identity_view(&mut engine, s, "a", &cols);
         let last = (0..readers).fold(a, |_, r| {
             try_register_view(&mut engine, distinct_circuit(a), &format!("d{r}"), &cols, 0, 0).unwrap()
@@ -468,7 +461,7 @@ fn segment_view_tick_bench() {
     const KEYS: u64 = 1_000;
     let counter = perf::Counter::instructions();
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
-    let mut engine = CatalogEngine::open(&temp_dir("segment_view_tick_bench"), 1).unwrap();
+    let mut engine = fresh("segment_view_tick_bench");
     let t = engine.create_table("public.t", &cols, &[0]).unwrap();
     let u = engine.create_table("public.u", &cols, &[0]).unwrap();
     let matches = rows(&engine, u, 1, 0..2 * KEYS, |id| [id % KEYS]);
@@ -493,13 +486,15 @@ fn segment_view_tick_bench() {
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(segment, ReadBound::None);
     circuit.reduce_local(scan, &[0], &aggs);
-    let mut bb = BatchBuilder::new(crate::catalog::SysFamily::View.schema());
-    crate::test_support::push_view_tab_row(&mut bb, 1, segment, "_segment", 0, 0, view);
-    crate::test_support::push_view_tab_row(&mut bb, 1, view, "reduced", 0, 0, 0);
+    let segment_row = ViewTabRow {
+        owner_view_id: view,
+        ..view_tab_row(segment, "_segment")
+    };
+    let rows = sys_batch([(segment_row, 1), (view_tab_row(view, "reduced"), 1)]);
     let join = two_term_join_circuit(t, u, TypeCode::U64);
     let reduced_cols = cols_of(&reduced);
     let created = [(segment, &join, &joined[..]), (view, &circuit, &reduced_cols[..])];
-    crate::test_support::apply_ddl(&mut engine, view_blocks(created, bb.finish())).unwrap();
+    crate::test_support::apply_ddl(&mut engine, view_blocks(created, rows)).unwrap();
     backfill(&mut engine, segment);
     backfill(&mut engine, view);
 

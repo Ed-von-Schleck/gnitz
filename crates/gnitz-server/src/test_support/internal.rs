@@ -464,19 +464,20 @@ pub fn push_sys_row(bb: &mut BatchBuilder, family: SysFamily, key: [u64; 2], wei
     bb.end_row();
 }
 
-/// A TABLE_TAB batch of `(table_id, name, weight)` rows: `public` tables keyed
-/// on column 0, under default props.
+/// A `public` TABLE_TAB row keyed on column 0, under default props.
+pub fn table_tab_row(table_id: u64, name: &str) -> TableTabRow<'_> {
+    TableTabRow {
+        table_id,
+        schema_id: PUBLIC_SCHEMA_ID,
+        name: name.into(),
+        pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]),
+        flags: gnitz_wire::TableProps::default().pack(),
+    }
+}
+
+/// A TABLE_TAB batch of `(table_id, name, weight)` rows, each a [`table_tab_row`].
 pub fn table_tab_batch(rows: &[(u64, &str, i64)]) -> Batch {
-    sys_batch(rows.iter().map(|&(table_id, name, weight)| {
-        let row = TableTabRow {
-            table_id,
-            schema_id: PUBLIC_SCHEMA_ID,
-            name: name.into(),
-            pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]),
-            flags: gnitz_wire::TableProps::default().pack(),
-        };
-        (row, weight)
-    }))
+    sys_batch(rows.iter().map(|&(id, name, weight)| (table_tab_row(id, name), weight)))
 }
 
 /// A SCHEMA_TAB batch of `(schema_id, name, weight)` rows.
@@ -508,31 +509,22 @@ pub fn idx_tab_batch(index_id: u64, owner_id: u64, cols: &[u32], name: &str, is_
     sys_batch([(row, weight)])
 }
 
-/// Append one VIEW_TAB row with PK list `[0]`. Every budget field is a raw
-/// word, so a test can forge one no `ViewBudget` holds (`0` = off;
-/// `owner_view_id` `0` = a user view).
-pub fn push_view_tab_row(
-    bb: &mut BatchBuilder,
-    weight: i64,
-    vid: u64,
-    view_name: &str,
-    capacity_bytes: u64,
-    delta_bytes: u64,
-    owner_view_id: u64,
-) {
-    let row = ViewTabRow {
-        view_id: vid,
+/// A `public` user VIEW_TAB row with PK list `[0]` and every budget off. Every
+/// budget field is a raw word, so a test can forge one no `ViewBudget` holds by
+/// struct update (`0` = off; `owner_view_id` `0` = a user view).
+pub fn view_tab_row(view_id: u64, name: &str) -> ViewTabRow<'_> {
+    ViewTabRow {
+        view_id,
         schema_id: PUBLIC_SCHEMA_ID,
-        name: view_name.into(),
+        name: name.into(),
         pk_col_idx: gnitz_wire::PkColList::from_slice(&[0]),
-        capacity_bytes,
-        delta_bytes,
-        owner_view_id,
+        capacity_bytes: 0,
+        delta_bytes: 0,
+        owner_view_id: 0,
         pk_repeats: false,
         compress: false,
         definition: Default::default(),
-    };
-    row.write(bb, weight);
+    }
 }
 
 /// Register a view running `circuit` as one DDL bundle, returning its vid or
@@ -547,9 +539,12 @@ pub fn try_register_view(
     delta_bytes: u64,
 ) -> Result<u64, String> {
     let vid = engine.allocate_ids(1).unwrap();
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, 1, vid, name, capacity_bytes, delta_bytes, 0);
-    apply_ddl(engine, view_blocks([(vid, &circuit, cols)], bb.finish()))?;
+    let row = ViewTabRow {
+        capacity_bytes,
+        delta_bytes,
+        ..view_tab_row(vid, name)
+    };
+    apply_ddl(engine, view_blocks([(vid, &circuit, cols)], sys_batch([(row, 1)])))?;
     Ok(vid)
 }
 

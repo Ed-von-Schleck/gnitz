@@ -175,7 +175,7 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
         bundle([(SysFamily::Column, crate::test_support::sys_batch([(row, 1)]))])
     };
     let width = |engine: &CatalogEngine| engine.registry.relation(tid).unwrap().schema().num_columns();
-    let record = engine.schema_record(tid).unwrap();
+    let record = engine.wire_target(tid).unwrap().1.clone();
     let col_rows = scan_all(&mut engine, SysFamily::Column.id()).len();
 
     let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
@@ -187,7 +187,7 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
         .expect_err("no room for the zone");
     assert_eq!(refused.status, WireStatus::SalFull, "{refused}");
     assert_eq!(width(&engine), 2, "the refused ADD COLUMN leaves the schema");
-    assert_eq!(engine.schema_record(tid).unwrap(), record);
+    assert_eq!(engine.wire_target(tid).unwrap().1, &record);
     assert_eq!(scan_all(&mut engine, SysFamily::Column.id()).len(), col_rows);
 
     disp.checkpoint_post_ack(&mut excl).unwrap();

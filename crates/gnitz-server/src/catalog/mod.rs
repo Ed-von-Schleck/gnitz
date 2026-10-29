@@ -8,9 +8,10 @@
 //! [`fire_hooks`](CatalogEngine::fire_hooks), which runs, per family, that family's
 //! register hook. A registration reads the relation's COL_TAB rows, and a view's
 //! its CIRCUIT_TAB row, from the store, so those families are applied first:
-//! [`SysFamily::ALL`] is the apply order, which `apply_bundle` walks for a live
-//! bundle and `replay_catalog` at boot, and `with_owned_retractions` in reverse
-//! for a drop's owned rows.
+//! [`SysFamily::ALL`] is the apply order — of a live bundle, of `replay_catalog`
+//! at boot — reversed for a bundle that only retracts, so a dependent is retired
+//! before what it depends on, and reversed around a drop's own group by
+//! `with_owned_retractions`.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -21,10 +22,9 @@
 //! private items.
 
 mod bootstrap;
-mod cache;
-mod constraints;
 mod hooks;
 mod precheck;
+mod relations;
 mod sequences;
 mod sys_reads;
 mod sys_tables;
@@ -37,16 +37,14 @@ mod suites;
 use gnitz_store::relation::RelationRegistry;
 
 use crate::query::DagEngine;
-use cache::CatalogCacheSet;
+use relations::CatalogCacheSet;
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 pub(crate) use bootstrap::UnreplayedCatalog;
-pub(crate) use constraints::{FkEdge, RowConstraints};
+pub(crate) use relations::{FkEdge, RowConstraints};
 #[cfg(test)]
 pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
 pub(crate) use sys_tables::{DdlBundle, SysFamily};
-// The DDL_TXN driver's unique-index pre-flight input.
-pub(crate) use sys_tables::unique_index_creates;
 pub(crate) use write_path::{AppliedDdl, ZoneError, ZoneSink};
 
 // ---------------------------------------------------------------------------
@@ -73,7 +71,8 @@ pub(crate) struct CatalogEngine {
     /// The newest SAL zone applied to the system families; every system flush
     /// records it as its replay floor.
     pub(in crate::catalog) system_zone: u64,
-    /// The checkpoint generation this boot recovered, which a manifest must
-    /// carry to be resumed from.
-    pub(crate) resume_generation: u64,
+    /// The checkpoint generation this boot's rederived stores resume from: the
+    /// recovered one, or `None` when the recorded topology (worker count,
+    /// STATE_FORMAT) is not the launched one and nothing resumes.
+    pub(crate) resume_at: Option<u64>,
 }

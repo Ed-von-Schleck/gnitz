@@ -8,38 +8,6 @@ use gnitz_zset::repr::{Batch, ReadCursor, StoredRow};
 use super::sys_tables::SysFamily;
 use super::CatalogEngine;
 
-/// A set of catalog ids, sorted once so every probe is a binary search: the
-/// probes run per row of a client-supplied block bounded only by the frame.
-#[derive(Debug, Default)]
-pub(in crate::catalog) struct IdSet(Vec<u64>);
-
-impl IdSet {
-    pub(in crate::catalog) fn new(ids: impl IntoIterator<Item = u64>) -> Self {
-        let mut ids: Vec<u64> = ids.into_iter().collect();
-        ids.sort_unstable();
-        ids.dedup();
-        IdSet(ids)
-    }
-
-    pub(in crate::catalog) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub(in crate::catalog) fn contains(&self, id: u64) -> bool {
-        self.0.binary_search(&id).is_ok()
-    }
-
-    /// The ids, strictly ascending.
-    pub(in crate::catalog) fn ids(&self) -> &[u64] {
-        &self.0
-    }
-
-    /// These ids and `more`.
-    pub(in crate::catalog) fn with(self, more: impl IntoIterator<Item = u64>) -> Self {
-        IdSet::new(self.0.into_iter().chain(more))
-    }
-}
-
 impl CatalogEngine {
     // -- System-table reads ---------------------------------------------------
 
@@ -119,11 +87,6 @@ impl CatalogEngine {
         (0..scan.len())
             .find(|&i| payload_bytes(&*scan, i, SchemaTabSlot::name as usize) == name.as_bytes())
             .map(|i| gnitz_wire::sys_leading_id(scan.get_pk_bytes(i)))
-    }
-
-    /// The id of relation `name` in schema `schema_id`.
-    pub(crate) fn relation_id(&self, schema_id: u64, name: &str) -> Option<u64> {
-        self.caches.relation_by_name.get(&schema_id)?.get(name).copied()
     }
 
     /// The name of schema `sid`, from its live SCHEMA_TAB row.

@@ -4,11 +4,10 @@ use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
 use std::rc::Rc;
 
-use super::cache::RelationEntry;
-use super::constraints::FkEdge;
-use super::sys_reads::IdSet;
+use super::relations::{FkEdge, RelationEntry};
 use super::sys_tables::{
-    build_schema_from_col_defs, encode_record, pk_signatures, read_rel_row, PkShape, RelDetail, RelRow, SysFamily,
+    build_schema_from_col_defs, encode_record, pk_signatures, read_rel_row, IdSet, PkShape, RelDetail, RelRow,
+    SysFamily,
 };
 use super::CatalogEngine;
 
@@ -135,7 +134,7 @@ impl CatalogEngine {
     }
 
     /// Tear relation `id` out of the registry and the DAG. Its owned system rows are
-    /// retracted by the rows that dropped it (see `submit`), never from here; its
+    /// retracted by the rows that dropped it (see `with_owned_retractions`), never from here; its
     /// directory is left to the orphan sweep.
     fn unregister_relation(&mut self, id: u64) {
         self.dag.forget(id);
@@ -175,7 +174,14 @@ impl CatalogEngine {
     fn hook_column_change(&mut self, batch: &Batch) -> Result<(), String> {
         let owners = IdSet::new((0..batch.len()).map(|i| gnitz_wire::sys_leading_id(batch.get_pk_bytes(i))));
         for &owner in owners.ids() {
-            let Some((kind, cur)) = self.registry.relation(owner).map(|e| (e.kind(), e.schema())) else {
+            // Only a base table's columns change; a system family's are compile-time
+            // data, and at replay COL_TAB precedes every user relation's registration.
+            let Some((kind, cur)) = self
+                .registry
+                .relation(owner)
+                .filter(|e| e.kind().is_base_table())
+                .map(|e| (e.kind(), e.schema()))
+            else {
                 continue;
             };
             let defs = self.read_column_defs(owner)?;

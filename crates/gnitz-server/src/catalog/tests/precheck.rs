@@ -22,14 +22,24 @@ fn a_stored_name_is_an_identifier_or_a_segment_and_canonical() {
         ("MixedCase", false, "not canonical"),
         ("_Seg", true, "not canonical"),
     ] {
-        let got = check_stored_name(name, "table", segment).err().unwrap_or_default();
-        let holds = if want.is_empty() {
-            got.is_empty()
-        } else {
-            got.contains(want)
-        };
-        assert!(holds, "{name:?} (segment: {segment}): want {want:?}, got {got:?}");
+        assert_verdict(
+            check_stored_name(name, "table", segment),
+            want,
+            format_args!("{name:?} (segment: {segment})"),
+        );
     }
+}
+
+/// Assert that `got` failed with an error containing `want`, or passed when
+/// `want` is `""`; `ctx` labels the failure.
+fn assert_verdict(got: Result<impl Sized, String>, want: &str, ctx: impl std::fmt::Display) {
+    let got = got.err().unwrap_or_default();
+    let holds = if want.is_empty() {
+        got.is_empty()
+    } else {
+        got.contains(want)
+    };
+    assert!(holds, "{ctx}: want {want:?}, got {got:?}");
 }
 
 /// An id every family's range admits.
@@ -51,15 +61,11 @@ fn assert_shape(family: SysFamily, rows: &[(u64, i64, &str)], want: &str) {
             (payload[pi].name == differing) as u64
         });
     }
-    let got = check_batch_shape(family, &bb.finish(), NEXT_ID)
-        .err()
-        .unwrap_or_default();
-    let holds = if want.is_empty() {
-        got.is_empty()
-    } else {
-        got.contains(want)
-    };
-    assert!(holds, "{family:?} {rows:?}: want {want:?}, got {got:?}");
+    assert_verdict(
+        check_batch_shape(family, &bb.finish(), NEXT_ID),
+        want,
+        format_args!("{family:?} {rows:?}"),
+    );
 }
 
 #[test]
