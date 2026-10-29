@@ -1,8 +1,12 @@
-//! The single-threaded async primitives: `oneshot`, `AsyncRwLock` and
+//! The single-threaded async primitives: `oneshot`, `AsyncRwLock`, `select2` and
 //! the cancellation shapes each must survive.
 
-use super::super::test_support::*;
-use super::super::*;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use super::*;
+use crate::runtime::reactor::test_support::{make_reactor, poll_until, yield_once};
+use crate::runtime::test_support::try_poll_once;
 
 /// Sending to a cancelled receiver is not an error and never was to any caller:
 /// the value is parked where nothing will read it and dropped with the channel.
@@ -229,4 +233,33 @@ fn async_rwlock_write_release_admits_one_writer() {
 
     r.block_until_idle();
     assert_eq!(polls.get(), 2 * N - 1, "each release must wake one writer");
+}
+
+/// A release hands the lock to the first queued writer: a fresh writer polled
+/// between the release and that writer's poll queues behind it.
+#[test]
+fn async_rwlock_a_fresh_writer_queues_behind_a_woken_one() {
+    let lock = AsyncRwLock::default();
+    let held = try_poll_once(lock.write()).expect("a free lock admits a writer");
+    let mut queued = Box::pin(lock.write());
+    assert!(try_poll_once(&mut queued).is_none(), "a held lock parks the writer");
+
+    drop(held);
+    assert!(
+        try_poll_once(lock.write()).is_none(),
+        "a fresh writer must not take the lock from the woken one"
+    );
+    assert!(try_poll_once(&mut queued).is_some(), "the woken writer acquires");
+}
+
+// ─────────────────────────────────────────────────────────────────
+// select2
+// ─────────────────────────────────────────────────────────────────
+
+/// Both sides ready at once: the first wins, which `Peer::until_request` relies
+/// on to answer a sync ahead of a ready request.
+#[test]
+fn select2_prefers_its_first_argument_on_a_tie() {
+    let won = try_poll_once(select2(std::future::ready(1), std::future::ready(2)));
+    assert!(matches!(won, Some(Either::A(1))));
 }

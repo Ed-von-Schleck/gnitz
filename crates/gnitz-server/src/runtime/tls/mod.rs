@@ -16,9 +16,8 @@ use std::sync::Arc;
 
 use gnitz_zset::repr::PooledBuf;
 
-use crate::runtime::reactor::{
-    chan, AsyncRwLock, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,
-};
+use crate::runtime::reactor::{Accepted, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody};
+use crate::runtime::sync::{chan, AsyncRwLock, WriteGuard};
 
 /// Size of the ciphertext window each recv lands in.
 const CIPHER_WINDOW_BYTES: usize = 64 * 1024;
@@ -68,24 +67,24 @@ pub(crate) struct TlsShared {
 }
 
 impl TlsShared {
-    /// Build the connection, arm its recv filter and spawn its flusher; between them
-    /// they drive the handshake.
-    pub(crate) fn start(reactor: Reactor, conn: Rc<ClientConn>, cfg: Arc<rustls::ServerConfig>) -> Rc<TlsShared> {
+    /// Build the connection over `accepted`, arm its recv filter and spawn its
+    /// flusher; between them they drive the handshake.
+    pub(crate) fn start(reactor: Reactor, accepted: Accepted, cfg: Arc<rustls::ServerConfig>) -> Rc<TlsShared> {
         /// rustls's outgoing-buffer limit: what one `writer().write()` accepts, and
         /// so how much ciphertext one encrypt-and-send turn carries.
         const SEND_BUFFER_BYTES: usize = 256 * 1024;
 
+        let (flush_tx, flush_rx) = chan::unbounded::<()>();
+        let conn = reactor.client_conn(accepted, Some(flush_tx));
         let mut sess = rustls::ServerConnection::new(cfg)
             .expect("a session fails to build only on a max_fragment_size TlsArgs::serve never sets");
         sess.set_buffer_limit(Some(SEND_BUFFER_BYTES));
-        let (flush_tx, flush_rx) = chan::unbounded::<()>();
         let tls = Rc::new(TlsShared {
             reactor,
             conn,
             state: RefCell::new(sess),
             send_lock: AsyncRwLock::default(),
         });
-        tls.conn.set_egress_owner(flush_tx);
         let ingress = TlsIngress {
             tls: Rc::clone(&tls),
             cipher: Box::new_uninit_slice(CIPHER_WINDOW_BYTES),
@@ -93,6 +92,11 @@ impl TlsShared {
         tls.reactor.register_conn(&tls.conn, Box::new(ingress));
         tls.reactor.spawn(flusher(Rc::clone(&tls), flush_rx));
         tls
+    }
+
+    /// The connection this session runs over.
+    pub(crate) fn conn(&self) -> &Rc<ClientConn> {
+        &self.conn
     }
 
     /// Send everything rustls has queued. Callers hold `send_lock`, which is

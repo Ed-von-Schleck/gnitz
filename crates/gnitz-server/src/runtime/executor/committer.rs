@@ -26,14 +26,14 @@
 
 use super::Shared;
 use crate::runtime::master::TxnFamily;
-use crate::runtime::reactor::{chan, oneshot, AckLease};
+use crate::runtime::reactor::AckLease;
 use crate::runtime::signals;
+use crate::runtime::sync::{chan, oneshot};
 use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 /// Row ceiling on one committer batch. Tested before the receive, so a batch is
 /// capped at this plus one whole request — and one request is itself bounded
@@ -251,7 +251,7 @@ async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
     // generation-valid. Unstamped, they stay behind the generation the base
     // round that flushed those deltas' rows advanced to, and are rebuilt at the
     // next boot. Not an abort: this path also serves the shutdown checkpoint.
-    if let Err(e) = shared.ticks.drain(Instant::now()).await {
+    if let Err(e) = shared.ticks.drain(shared.dispatcher.reactor().now()).await {
         gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);
         return;
     }

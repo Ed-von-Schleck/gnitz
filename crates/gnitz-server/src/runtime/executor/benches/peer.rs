@@ -1,5 +1,6 @@
 use super::*;
-use crate::runtime::reactor::{egress_pair, spawn_drain};
+use crate::runtime::reactor::test_support::make_reactor;
+use crate::runtime::test_support::spawn_drain;
 use std::time::{Duration, Instant};
 
 /// W frames as W sends versus `Peer` corking them into one send, by frame
@@ -15,8 +16,8 @@ fn fanout_coalesced_egress_bench() {
     for w in [2usize, 8] {
         for frame_len in [CAP / 32, CAP / 8, CAP / 2, CAP, 2 * CAP] {
             let total = w * frame_len;
-            let (r, conn, receiver) = egress_pair();
-            let peer = Peer::new(&r, conn, None);
+            let r = make_reactor();
+            let (peer, receiver) = Peer::over_socketpair(&r);
             // The reader keeps the socket buffers from ever stalling a send, so
             // the timed region is kernel-op cost, not backpressure.
             let expect = 2 * ROUNDS * total;
@@ -73,7 +74,6 @@ fn fanout_coalesced_egress_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn pushed_train_band_bench() {
-    use crate::runtime::reactor::client_pair;
     use gnitz_foundation::perf::Counter;
     const ROUNDS: usize = 2000;
     const CAP: usize = COALESCE_MAX_BYTES;
@@ -93,14 +93,13 @@ fn pushed_train_band_bench() {
             CAP + 1,
             4 * CAP,
         ] {
-            let (r, conn0, receiver0) = egress_pair();
-            let mut first = Some((conn0, receiver0));
+            let r = make_reactor();
             let per_peer = 3 * 2 * ROUNDS * (HEAD + body_len + ANSWER);
             let mut peers = Vec::new();
             let mut drains = Vec::new();
             for _ in 0..n {
-                let (conn, receiver) = first.take().unwrap_or_else(|| client_pair(&r));
-                peers.push(Peer::new(&r, conn, None));
+                let (peer, receiver) = Peer::over_socketpair(&r);
+                peers.push(peer);
                 drains.push(spawn_drain(receiver, per_peer));
             }
             let body = Rc::new(vec![0xA5u8; body_len]);

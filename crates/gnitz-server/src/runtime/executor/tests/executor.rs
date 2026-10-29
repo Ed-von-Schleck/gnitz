@@ -1,7 +1,9 @@
 use super::*;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
-use crate::runtime::reactor::{client_pair, reactor_with_rings, read_nonblocking, Reactor};
+use crate::runtime::reactor::test_support::reactor_with_rings;
+use crate::runtime::reactor::Reactor;
+use crate::runtime::test_support::read_nonblocking;
 use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::W2mWriter;
 use crate::test_support::{make_batch, make_schema_u64_i64};
@@ -48,8 +50,7 @@ fn forward_scan_sends_every_row_frame_in_worker_order() {
         Some(&make_batch(&schema, &[(2, 1, 20)])),
     ));
 
-    let (conn, partner) = client_pair(&reactor);
-    let peer = Peer::new(&reactor, conn, None);
+    let (peer, partner) = Peer::over_socketpair(&reactor);
     reactor.block_on(async {
         forward_scan(&peer, &lease).await.expect("healthy trains");
         peer.flush_egress().await.expect("the partner is open");
@@ -68,8 +69,7 @@ fn forward_scan_stops_at_a_failed_send() {
     frame(&mut writers[0], req, true, Some(&rows));
     frame(&mut writers[1], req, true, Some(&rows));
 
-    let (conn, _partner) = client_pair(&reactor);
-    let peer = Peer::new(&reactor, conn, None);
+    let (peer, _partner) = Peer::over_socketpair(&reactor);
     peer.close();
     reactor
         .block_on(forward_scan(&peer, &lease))

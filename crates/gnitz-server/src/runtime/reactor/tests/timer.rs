@@ -10,11 +10,11 @@ use super::*;
 fn a_timer_holds_a_deadline_only_while_pending() {
     let r = make_reactor();
     assert!(try_poll_once(r.sleep(Duration::ZERO)).is_some());
-    assert!(r.deadlines.borrow().is_empty());
+    assert!(r.timers.deadlines.borrow().is_empty());
 
     let mut tf = Box::pin(r.sleep(Duration::from_secs(3600)));
     assert!(try_poll_once(tf.as_mut()).is_none());
-    assert_eq!(r.deadlines.borrow().len(), 1, "the poll registers the deadline");
+    assert_eq!(r.timers.deadlines.borrow().len(), 1, "the poll registers the deadline");
     drop(tf);
-    assert!(r.deadlines.borrow().is_empty(), "the drop removes it");
+    assert!(r.timers.deadlines.borrow().is_empty(), "the drop removes it");
 }

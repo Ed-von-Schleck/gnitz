@@ -1,37 +1,40 @@
-//! The reactor's timers: a [`Reactor::sleep`] holds one entry in the deadline
-//! map while it is pending, and each pass wakes every entry whose deadline has
-//! passed.
+//! The reactor's timers: a [`Reactor::sleep_until`] holds one entry in the
+//! deadline map while it is pending, and each pass wakes every entry whose
+//! deadline has passed.
+
+use std::collections::BTreeMap;
 
 use super::*;
 
-/// A deadline. Its entry in the deadline map lives until the future drops.
-struct TimerFuture {
-    deadline: Instant,
-    id: u64,
-    reactor: Reactor,
+/// Every pending deadline, and the clock they are measured against.
+pub(super) struct Timers {
+    /// Keyed by `(deadline, timer id)` and valued by the waker to fire.
+    pub(super) deadlines: RefCell<BTreeMap<(Instant, u64), Waker>>,
+    /// The next timer id, which orders deadlines sharing an instant; the 64-bit
+    /// counter does not wrap within a process's life.
+    next_id: Cell<u64>,
+    /// Read once per pass by [`Timers::fire`]; see [`Reactor::now`].
+    now: Cell<Instant>,
 }
 
-impl Reactor {
-    /// Future that completes once `d` has passed.
-    pub fn sleep(&self, d: Duration) -> impl Future<Output = ()> {
-        TimerFuture {
-            deadline: Instant::now() + d,
-            id: self.alloc_timer_id(),
-            reactor: self.clone(),
+impl Timers {
+    pub(super) fn new() -> Self {
+        Timers {
+            deadlines: RefCell::new(BTreeMap::new()),
+            next_id: Cell::new(0),
+            now: Cell::new(Instant::now()),
         }
     }
 
-    /// The next timer id; the 64-bit counter does not wrap within a process's
-    /// life.
-    fn alloc_timer_id(&self) -> u64 {
-        let id = self.next_timer_id.get();
-        self.next_timer_id.set(id + 1);
-        id
+    /// The first pending deadline: the loop's blocking wait never outlasts it.
+    pub(super) fn earliest(&self) -> Option<Instant> {
+        self.deadlines.borrow().first_key_value().map(|(&(at, _), _)| at)
     }
 
-    /// Wake every deadline that has passed.
-    pub(super) fn fire_deadlines(&self) {
+    /// Read the clock for this pass, and wake every deadline it has passed.
+    pub(super) fn fire(&self) {
         let now = Instant::now();
+        self.now.set(now);
         let mut d = self.deadlines.borrow_mut();
         while let Some(e) = d.first_entry() {
             if e.key().0 > now {
@@ -42,13 +45,42 @@ impl Reactor {
     }
 }
 
+/// A deadline. Its entry in the deadline map lives until the future drops.
+struct TimerFuture {
+    deadline: Instant,
+    id: u64,
+    reactor: Reactor,
+}
+
+impl Reactor {
+    /// Future that completes once `at` has passed.
+    pub(crate) fn sleep_until(&self, at: Instant) -> impl Future<Output = ()> {
+        let id = self.timers.next_id.get();
+        self.timers.next_id.set(id + 1);
+        TimerFuture { deadline: at, id, reactor: self.clone() }
+    }
+
+    /// Future that completes once `d` has passed since this pass began.
+    pub(crate) fn sleep(&self, d: Duration) -> impl Future<Output = ()> {
+        self.sleep_until(self.now() + d)
+    }
+
+    /// The clock this pass read: every timer is polled against it, so a deadline
+    /// taken from it that has passed is ready at its first poll. Outside a pass
+    /// it is the last pass's (or `Reactor::new`'s).
+    pub(crate) fn now(&self) -> Instant {
+        self.timers.now.get()
+    }
+}
+
 impl Future for TimerFuture {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if Instant::now() >= self.deadline {
+        let timers = &self.reactor.timers;
+        if timers.now.get() >= self.deadline {
             return Poll::Ready(());
         }
-        self.reactor
+        timers
             .deadlines
             .borrow_mut()
             .insert((self.deadline, self.id), cx.waker().clone());
@@ -58,7 +90,11 @@ impl Future for TimerFuture {
 
 impl Drop for TimerFuture {
     fn drop(&mut self) {
-        self.reactor.deadlines.borrow_mut().remove(&(self.deadline, self.id));
+        self.reactor
+            .timers
+            .deadlines
+            .borrow_mut()
+            .remove(&(self.deadline, self.id));
     }
 }
 

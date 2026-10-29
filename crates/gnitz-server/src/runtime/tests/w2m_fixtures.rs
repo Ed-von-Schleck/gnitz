@@ -49,3 +49,14 @@ impl W2mReceiver {
         self.master.value()
     }
 }
+
+/// A fresh ring holding one frame whose error text is `pad` bytes, read back as a
+/// slot.
+pub(crate) fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
+    let (mut writers, receiver) = test_rings(1, 256 * 1024);
+    let text = vec![0x42u8; pad];
+    let msg = crate::runtime::frame::WireMsg { blob: &text, ..Default::default() };
+    writers[0].send_msg(1, &msg);
+    let slot = receiver.try_read_slot(0).expect("a frame");
+    (receiver, slot)
+}

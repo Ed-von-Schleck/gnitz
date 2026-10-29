@@ -6,33 +6,35 @@ use std::ops::Range;
 use gnitz_wire::WireFault;
 use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::SchemaDescriptor;
+use rustc_hash::FxHashMap;
 
 use super::*;
 use crate::runtime::park::WorkerSet;
-use crate::runtime::w2m::NO_REPLY_REQUEST_ID;
-
-/// The workers a group is written to and the request id they answer on.
-#[derive(Clone, Copy)]
-pub(crate) struct GroupTargets {
-    pub(crate) set: WorkerSet,
-    /// [`NO_REPLY_REQUEST_ID`]: nothing answers.
-    pub(crate) request_id: u32,
-}
-
-impl GroupTargets {
-    /// Every worker, nothing answers.
-    pub(crate) const SILENT: Self = GroupTargets {
-        set: WorkerSet::ALL,
-        request_id: NO_REPLY_REQUEST_ID,
-    };
-}
+use crate::runtime::sync::WakeQueue;
+use crate::runtime::w2m::{GroupTargets, W2mSlot, BOOT_READY_REQUEST_ID, NO_REPLY_REQUEST_ID};
 
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
 
+/// Every live lease's request id and what its workers have answered on it.
+pub(super) struct Routes {
+    map: RefCell<FxHashMap<u32, Route>>,
+    /// The next request id a lease starts from.
+    next_id: Cell<u32>,
+}
+
+impl Routes {
+    pub(super) fn new() -> Self {
+        Routes {
+            map: RefCell::new(FxHashMap::default()),
+            next_id: Cell::new(BOOT_READY_REQUEST_ID + 1),
+        }
+    }
+}
+
 /// What the workers have answered on one [`AckLease`] id.
-pub(super) struct AckRoute {
+struct AckRoute {
     /// The workers yet to answer.
     left: WorkerSet,
     /// The `acks` awaiter parked on this id.
@@ -41,7 +43,7 @@ pub(super) struct AckRoute {
 
 /// The undecoded frames of one [`TrainLease`]; each pins its ring space until
 /// dropped.
-pub(super) struct TrainRoute {
+struct TrainRoute {
     /// The workers the scan was written to.
     set: WorkerSet,
     /// One queue per worker of `set`, ascending.
@@ -56,7 +58,7 @@ impl TrainRoute {
 }
 
 /// What a live lease's request id routes to.
-pub(super) enum Route {
+enum Route {
     Acks(AckRoute),
     Train(TrainRoute),
 }
@@ -75,12 +77,12 @@ impl Reactor {
     /// ring it was read from.
     fn route(&self, slot: W2mSlot) {
         let w = slot.worker as usize;
-        match self.routes.borrow_mut().get_mut(&slot.request_id) {
-            Some(Route::Train(t)) => {
-                if let Some(q) = t.queue(w) {
-                    q.push(slot);
-                }
-            }
+        match self.routes.map.borrow_mut().get_mut(&slot.request_id) {
+            Some(Route::Train(t)) => match t.queue(w) {
+                Some(q) => q.push(slot),
+                // Dropped here, releasing its ring space.
+                None => debug_assert!(false, "worker {w} answered a read it was not sent"),
+            },
             Some(Route::Acks(r)) => {
                 debug_assert!(
                     r.left.contains(w),
@@ -100,12 +102,12 @@ impl Reactor {
 
     /// A request id no live lease holds, never [`NO_REPLY_REQUEST_ID`].
     fn alloc_request_id(&self) -> u32 {
-        let routes = self.routes.borrow();
-        let mut id = self.next_request_id.get();
+        let routes = self.routes.map.borrow();
+        let mut id = self.routes.next_id.get();
         while id == NO_REPLY_REQUEST_ID || routes.contains_key(&id) {
             id = id.wrapping_add(1);
         }
-        self.next_request_id.set(id.wrapping_add(1));
+        self.routes.next_id.set(id.wrapping_add(1));
         id
     }
 
@@ -113,7 +115,7 @@ impl Reactor {
     /// workers.
     fn lease(&self, id: u32, set: WorkerSet, route: impl FnOnce(WorkerSet) -> Route) -> Lease {
         let workers = set.within(self.w2m.num_workers());
-        self.routes.borrow_mut().insert(id, route(workers));
+        self.routes.map.borrow_mut().insert(id, route(workers));
         Lease { reactor: self.clone(), id, workers }
     }
 
@@ -168,7 +170,7 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.reactor.routes.borrow_mut().remove(&self.id);
+        self.reactor.routes.map.borrow_mut().remove(&self.id);
     }
 }
 
@@ -190,7 +192,7 @@ impl AckLease {
     /// apply what it is to ACK exits instead, which the master's death watch sees.
     pub(crate) async fn acks(&self) {
         std::future::poll_fn(|cx| {
-            let mut routes = self.0.reactor.routes.borrow_mut();
+            let mut routes = self.0.reactor.routes.map.borrow_mut();
             let Some(Route::Acks(r)) = routes.get_mut(&self.0.id) else {
                 unreachable!("an ACK lease's id routes to its ACKs")
             };
@@ -303,7 +305,7 @@ impl TrainLease {
     /// Worker `w`'s next routed slot.
     async fn next_slot(&self, w: usize) -> W2mSlot {
         std::future::poll_fn(|cx| {
-            let mut routes = self.lease.reactor.routes.borrow_mut();
+            let mut routes = self.lease.reactor.routes.map.borrow_mut();
             let Some(Route::Train(route)) = routes.get_mut(&self.lease.id) else {
                 unreachable!("a train lease's id routes to its train")
             };

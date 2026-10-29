@@ -1,6 +1,6 @@
 use super::MasterDispatcher;
 use crate::catalog::CatalogEngine;
-use crate::runtime::reactor::reactor_with_rings;
+use crate::runtime::reactor::test_support::reactor_with_rings;
 use crate::runtime::sal::fixtures::test_log;
 use crate::runtime::w2m::W2mWriter;
 

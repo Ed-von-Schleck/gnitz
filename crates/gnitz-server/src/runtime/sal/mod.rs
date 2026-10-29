@@ -25,8 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::{WorkerParks, WorkerSet};
-use crate::runtime::reactor::GroupTargets;
-use crate::runtime::reactor::{AsyncRwLock, Reactor, WriteGuard};
+use crate::runtime::reactor::Reactor;
+use crate::runtime::sync::{AsyncRwLock, WriteGuard};
+use crate::runtime::w2m::GroupTargets;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
 use gnitz_wire::{

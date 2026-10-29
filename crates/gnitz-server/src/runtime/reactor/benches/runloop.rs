@@ -7,6 +7,7 @@ use super::super::test_support::*;
 use super::*;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
+use crate::runtime::w2m::BOOT_READY_REQUEST_ID;
 
 const PASSES: u64 = 100_000;
 
@@ -67,7 +68,7 @@ fn reactor_pass_bench() {
     let r = make_reactor();
     let r2 = r.clone();
     let send = async move || {
-        let op = select2(nop(&r2), r2.sleep(r2.limits.client_send_timeout)).await;
+        let op = select2(nop(&r2), r2.sleep(Limits::TEST.client_send_timeout)).await;
         assert!(matches!(op, Either::A(_)));
     };
     arm("op+deadline", r, send, || ());

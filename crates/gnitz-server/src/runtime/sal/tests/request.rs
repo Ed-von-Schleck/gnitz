@@ -2,9 +2,9 @@ use std::num::NonZeroU64;
 
 use super::*;
 use crate::catalog::SysFamily;
-use crate::runtime::reactor::GroupTargets;
 use crate::runtime::sal::fixtures::test_log;
 use crate::runtime::sal::{GroupData, SalGroup, SalReader};
+use crate::runtime::w2m::GroupTargets;
 use crate::test_support::{make_batch, make_schema_u64_i64, schema_tab_batch};
 use gnitz_wire::peek_control_block;
 use gnitz_zset::schema::encode_schema_block;

@@ -1,12 +1,13 @@
 //! Helpers shared by the reactor's test suites; the `pub(crate)` ones also serve
-//! suites elsewhere that drive a reactor over test rings.
+//! `runtime`'s other suites that drive a reactor or a connection.
 
-use std::io::Read;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 use super::*;
-pub(super) use crate::runtime::test_support::{try_poll_once, within};
+pub(super) use crate::runtime::sync::{oneshot, select2, Either};
+pub(super) use crate::runtime::test_support::{read_nonblocking, spawn_drain, try_poll_once, within};
+pub(super) use crate::runtime::w2m::fixtures::ring_slot;
 use crate::runtime::w2m::fixtures::test_rings;
 use crate::runtime::w2m::W2mWriter;
 
@@ -23,7 +24,7 @@ impl Limits {
 }
 
 /// A reactor over one W2M ring, as production runs over at least one worker's.
-pub(super) fn make_reactor() -> Reactor {
+pub(crate) fn make_reactor() -> Reactor {
     make_reactor_with(Limits::TEST)
 }
 
@@ -38,14 +39,14 @@ impl Reactor {
     /// Tick until no task is left. Bounded as [`poll_until`] is: the tests that
     /// use this guard against lost wakes and lock deadlocks, which an unbounded
     /// loop would turn into a wedged test run rather than a failure.
-    pub(super) fn block_until_idle(&self) {
+    pub(crate) fn block_until_idle(&self) {
         let idle = poll_until(self, || self.tasks.borrow().is_empty());
         assert!(idle, "reactor never reached idle: lost wake or deadlock");
     }
 
     /// One pass of the loop `block_on` runs; with `block`, it sleeps whenever
     /// nothing is runnable.
-    pub(super) fn tick(&self, block: bool) {
+    pub(crate) fn tick(&self, block: bool) {
         self.run_ready();
         self.submit_or_sleep(block);
     }
@@ -57,17 +58,6 @@ pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
     (Reactor::new(Limits::TEST, receiver).expect("reactor"), writers)
 }
 
-/// A fresh ring holding one frame whose error text is `pad` bytes, read back as a
-/// slot.
-pub(crate) fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
-    let (mut writers, receiver) = test_rings(1, 256 * 1024);
-    let text = vec![0x42u8; pad];
-    let msg = crate::runtime::frame::WireMsg { blob: &text, ..Default::default() };
-    writers[0].send_msg(1, &msg);
-    let slot = receiver.try_read_slot(0).expect("a frame");
-    (receiver, slot)
-}
-
 /// A one-shot op the kernel completes at its submit.
 pub(super) fn nop(r: &Reactor) -> oneshot::Receiver<i32> {
     // SAFETY: the SQE names no memory.
@@ -75,7 +65,7 @@ pub(super) fn nop(r: &Reactor) -> oneshot::Receiver<i32> {
 }
 
 /// Future that returns Pending exactly once, waking itself, then Ready.
-pub(super) fn yield_once() -> impl Future<Output = ()> {
+pub(crate) fn yield_once() -> impl Future<Output = ()> {
     let mut yielded = false;
     std::future::poll_fn(move |cx| {
         if std::mem::replace(&mut yielded, true) {
@@ -86,11 +76,18 @@ pub(super) fn yield_once() -> impl Future<Output = ()> {
     })
 }
 
-/// A connection over one end of a fresh socketpair, nothing armed on it, and the
+/// One end of a fresh socketpair admitted under the connection cap, and the
 /// other end.
-pub(crate) fn client_pair(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
+pub(crate) fn accepted_pair(r: &Reactor) -> (Accepted, UnixStream) {
     let (local, partner) = UnixStream::pair().expect("socketpair");
-    (r.client_conn(OwnedFd::from(local)).expect("under the cap"), partner)
+    (r.admit(OwnedFd::from(local)).expect("under the cap"), partner)
+}
+
+/// A connection over an [`accepted_pair`], nothing armed on it and no egress
+/// owner, and the other end.
+pub(super) fn client_pair(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
+    let (accepted, partner) = accepted_pair(r);
+    (r.client_conn(accepted, None), partner)
 }
 
 /// [`client_pair`] with a recv armed on the connection.
@@ -112,34 +109,6 @@ pub(crate) fn admitted_recv_queue() -> RecvQueue {
     let mut q = RecvQueue::new(conn::Budget::new(usize::MAX));
     q.admit_full_frames();
     q
-}
-
-/// A reactor, and a [`client_pair`] on it.
-pub(crate) fn egress_pair() -> (Reactor, Rc<ClientConn>, UnixStream) {
-    let r = make_reactor();
-    let (conn, partner) = client_pair(&r);
-    (r, conn, partner)
-}
-
-/// Read `expect` bytes off `s` and close it, so the send under test never
-/// stalls on a full socket buffer. Returns how many it saw before `expect` or EOF.
-pub(crate) fn spawn_drain(s: UnixStream, expect: usize) -> std::thread::JoinHandle<u64> {
-    std::thread::spawn(move || std::io::copy(&mut (&s).take(expect as u64), &mut std::io::sink()).expect("drain"))
-}
-
-/// One non-blocking read of up to `cap` bytes off `s`: empty at EOF, `None` when
-/// nothing is readable yet. `s` stays blocking for its other readers.
-pub(crate) fn read_nonblocking(s: &UnixStream, cap: usize) -> Option<Vec<u8>> {
-    let mut buf = vec![0u8; cap];
-    // SAFETY: `buf` is `cap` writable bytes.
-    let n = unsafe { libc::recv(s.as_raw_fd(), buf.as_mut_ptr().cast(), cap, libc::MSG_DONTWAIT) };
-    if n < 0 {
-        let e = std::io::Error::last_os_error();
-        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "recv: {e}");
-        return None;
-    }
-    buf.truncate(n as usize);
-    Some(buf)
 }
 
 /// Drive the reactor in non-blocking ticks until `cond` holds after one, for at

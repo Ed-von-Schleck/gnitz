@@ -1,18 +1,21 @@
 //! Single-threaded io_uring reactor: the master process's one event loop, driven
 //! by [`Reactor::block_on`] alone. A task's waker is its key (see `waker_wake`);
 //! one-CQE awaiters hold a [`oneshot`], next-of-many awaiters park in a
-//! [`wake_queue::WakeQueue`], an all-workers round parks on its ACK route, and
-//! every deadline sits in one deadline map.
+//! [`WakeQueue`](crate::runtime::sync::WakeQueue), an ACK round parks on its
+//! lease's route until every worker of its set has answered, and every deadline
+//! sits in one deadline map.
 //!
-//! This file holds the reactor's state, its limits, the CQE `user_data`
-//! encoding, one-shot ops and `fsync`. The rest is split by concept:
-//! `runloop` (scheduling, the pass and its sleep on the W2M park, CQE dispatch),
-//! `lease` (W2M ingest and the leases it routes to), `conn` (client
-//! connections), `timer` (deadlines), `uring` (the ring), `sync` (the channels
-//! and lock tasks share) and `wake_queue`.
+//! This file holds the reactor's state, the CQE `user_data` encoding, one-shot
+//! ops and `fsync`. The rest is split by concept, each owning its part of the
+//! state: `runloop` (scheduling, the pass and its sleep on the W2M park, CQE
+//! dispatch), `lease` (W2M ingest and the leases it routes to), `conn` (client
+//! connections and their limits), `timer` (deadlines) and `uring` (the ring).
+//!
+//! The reactor reads the W2M rings (`w2m`, `park`) and shares the task
+//! primitives of `sync`; it names nothing that schedules work on it (`sal`,
+//! `master`, `executor`, `tls`).
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::pin::Pin;
@@ -21,70 +24,26 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::{Duration, Instant};
 
 use io_uring::{opcode, types};
-use rustc_hash::FxHashMap;
 use slab::Slab;
 
 use self::uring::IoUringRing;
 
-use crate::runtime::w2m::{W2mReceiver, W2mSlot, BOOT_READY_REQUEST_ID};
+use crate::runtime::sync::oneshot;
+use crate::runtime::w2m::W2mReceiver;
 
 mod conn;
 mod lease;
 mod runloop;
-mod sync;
 #[cfg(test)]
-mod test_support;
-#[cfg(test)]
-pub(crate) use test_support::{
-    admitted_recv_queue, client_pair, egress_pair, poll_until, reactor_with_rings, read_nonblocking, ring_slot,
-    spawn_drain,
-};
+pub(super) mod test_support;
 mod timer;
 mod uring;
-mod wake_queue;
 
-pub(crate) use conn::{ClientConn, PeerGone, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue, SendBody};
-use lease::Route;
-pub(crate) use lease::{AckLease, GroupTargets, TrainFrame, TrainLease};
-pub use sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, WriteGuard};
+pub(crate) use conn::{
+    Accepted, ClientConn, Limits, PeerGone, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue, SendBody,
+};
+pub(crate) use lease::{AckLease, TrainFrame, TrainLease};
 pub(crate) use uring::check_host;
-use wake_queue::WakeQueue;
-
-/// The ceilings and deadlines a reactor is built with, fixed for its life.
-/// Startup resolves them from the environment; a test that has to wait one out
-/// picks its own instead, which is why they are arguments rather than globals.
-#[derive(Clone, Copy)]
-pub(crate) struct Limits {
-    /// Ceiling on in-flight inbound frame payload bytes, across every
-    /// connection.
-    pub inbound_cap: usize,
-    /// One kernel send making no progress for this long evicts the client, whose
-    /// stalled sends would otherwise pin W2M ring space and block a worker
-    /// (`GNITZ_CLIENT_SEND_TIMEOUT_MS`).
-    pub client_send_timeout: Duration,
-    /// A failed accept is retried after this long, so closing connections get a
-    /// window to free fds.
-    pub accept_rearm_backoff: Duration,
-    /// Ceiling on open client connections, across every listener and
-    /// transport (`GNITZ_MAX_CONNS`). A connection accepted past it is closed
-    /// at once.
-    pub max_conns: usize,
-}
-
-impl Limits {
-    /// The server's, resolved from the environment.
-    pub(crate) fn from_env() -> Limits {
-        Limits {
-            inbound_cap: conn::resolve_inbound_cap(),
-            client_send_timeout: Duration::from_millis(gnitz_foundation::env::env_num(
-                "GNITZ_CLIENT_SEND_TIMEOUT_MS",
-                30_000,
-            )),
-            accept_rearm_backoff: Duration::from_millis(50),
-            max_conns: gnitz_foundation::env::env_num("GNITZ_MAX_CONNS", 256),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // CQE user_data encoding (high 8 bits = kind, low 56 bits = id)
@@ -111,34 +70,19 @@ type Task = Pin<Box<dyn Future<Output = ()>>>;
 
 /// The state behind every [`Reactor`] handle. Field order is drop order, and
 /// its head is fixed; see `ring`.
-pub struct ReactorShared {
+pub(crate) struct ReactorShared {
     /// First, so it drops before the memory its SQEs point into.
     ring: RefCell<IoUringRing>,
     /// Live tasks; a task's waker key is its slot plus one. A slot holds `None`
     /// while its task is polled, and is freed for reuse when it completes.
     tasks: RefCell<Slab<Option<Task>>>,
-    /// Every live lease's id and what its workers have answered on it.
-    routes: RefCell<FxHashMap<u32, Route>>,
-    /// The next request id a lease starts from.
-    next_request_id: Cell<u32>,
     /// In-flight one-shot ops; an op's id is its slot, freed at its CQE.
     ops: RefCell<Slab<PendingOp>>,
     /// A `FUTEX_WAIT` SQE on the W2M park is outstanding. Cleared by its CQE.
     parked: Cell<bool>,
-    /// Every pending deadline, keyed by `(deadline, timer id)` and valued by the
-    /// waker to fire. A sleep never outlasts the first.
-    deadlines: RefCell<BTreeMap<(Instant, u64), Waker>>,
-    /// The next timer id, which orders deadlines sharing an instant.
-    next_timer_id: Cell<u64>,
-    /// Every connection with a recv armed on it, by fd. See [`conn::Armed`].
-    conns: RefCell<FxHashMap<i32, conn::Armed>>,
-    /// The OOM guard shared by every connection, charged per inbound frame.
-    inbound: Rc<conn::Budget>,
-    /// Open client connections under `Limits::max_conns`; each [`ClientConn`]
-    /// holds one charge of it.
-    conn_slots: Rc<conn::Budget>,
-    /// The deadlines and ceilings this reactor was built with.
-    limits: Limits,
+    timers: timer::Timers,
+    routes: lease::Routes,
+    conns: conn::Conns,
     w2m: W2mReceiver,
 }
 
@@ -151,7 +95,7 @@ struct PendingOp {
 
 /// A handle on the master's one event loop; clones share it.
 #[derive(Clone)]
-pub struct Reactor(Rc<ReactorShared>);
+pub(crate) struct Reactor(Rc<ReactorShared>);
 
 impl std::ops::Deref for Reactor {
     type Target = ReactorShared;
@@ -161,7 +105,7 @@ impl std::ops::Deref for Reactor {
 }
 
 impl Reactor {
-    pub fn new(limits: Limits, w2m: W2mReceiver) -> std::io::Result<Self> {
+    pub(crate) fn new(limits: Limits, w2m: W2mReceiver) -> std::io::Result<Self> {
         let ring = IoUringRing::new()?;
         // Before the shared state exists: a refused claim then drops none of it,
         // and so does not end the live reactor's claim.
@@ -169,16 +113,11 @@ impl Reactor {
         Ok(Reactor(Rc::new(ReactorShared {
             ring: RefCell::new(ring),
             tasks: RefCell::new(Slab::new()),
-            routes: RefCell::new(FxHashMap::default()),
-            next_request_id: Cell::new(BOOT_READY_REQUEST_ID + 1),
             ops: RefCell::new(Slab::new()),
             parked: Cell::new(false),
-            deadlines: RefCell::new(BTreeMap::new()),
-            next_timer_id: Cell::new(0),
-            conns: RefCell::new(FxHashMap::default()),
-            inbound: conn::Budget::new(limits.inbound_cap),
-            conn_slots: conn::Budget::new(limits.max_conns),
-            limits,
+            timers: timer::Timers::new(),
+            routes: lease::Routes::new(),
+            conns: conn::Conns::new(limits),
             w2m,
         })))
     }

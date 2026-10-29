@@ -19,7 +19,8 @@ use super::peer::Peer;
 use super::tick::fresh_read_lock;
 use super::{forward_scan, send_fault, send_msg, target_kind, Access, Shared};
 use crate::runtime::frame::WireMsg;
-use crate::runtime::reactor::{chan, oneshot, select2, PeerGone, ReadGuard, SendBody, TrainLease};
+use crate::runtime::reactor::{PeerGone, SendBody, TrainLease};
+use crate::runtime::sync::{chan, oneshot, select2, ReadGuard};
 use gnitz_wire::txn_frame::{decode_delta_items, delta_poll_kept, DeltaPollItem};
 use gnitz_wire::{ControlHeader, Target, WireFault, WireStatus};
 
@@ -95,7 +96,14 @@ pub(super) async fn handle_delta_poll(
     let disp = &shared.dispatcher;
     let mut kept = delta_poll_kept(prologue);
     // The poll drained once, for this lock; a later slice takes the lock alone.
-    let mut first_lock = Some(fresh_read_lock(shared, views.iter().map(|v| v.view.tid), Instant::now()).await?);
+    let mut first_lock = Some(
+        fresh_read_lock(
+            shared,
+            views.iter().map(|v| v.view.tid),
+            shared.dispatcher.reactor().now(),
+        )
+        .await?,
+    );
 
     // One slice at a time: one catalog lock and — for however many of its views
     // moved — one broadcast. A view read whole is a slice of its own: a cut holds
@@ -179,8 +187,7 @@ async fn hold_lock(
     quiet: impl FnOnce() -> bool,
 ) -> Result<ReadGuard, WireFault> {
     let ids = || ids.iter().copied();
-    let wait = until.saturating_duration_since(Instant::now());
-    let waiting = !wait.is_zero();
+    let waiting = until > shared.dispatcher.reactor().now();
     let g = fresh_read_lock(shared, ids(), until).await?;
     if !waiting {
         return Ok(g);
@@ -195,7 +202,7 @@ async fn hold_lock(
     watched.extend(ids());
     let mut parked = shared.feeds.waiters.park(watched);
     drop(g);
-    select2(&mut parked.woken, shared.dispatcher.reactor().sleep(wait)).await;
+    select2(&mut parked.woken, shared.dispatcher.reactor().sleep_until(until)).await;
     drop(parked);
     fresh_read_lock(shared, ids(), until).await
 }
@@ -495,13 +502,14 @@ impl Subscriptions {
     /// SYNC_PUSHED: end every subscription `held` does not name, and owe the
     /// connection a sync held up to `wait_ms`. An undecodable `held` is what
     /// that sync is refused with.
-    pub(super) fn ask_sync(&mut self, feeds: &Feeds, held: Result<Vec<u64>, WireFault>, wait_ms: u64) {
+    pub(super) fn ask_sync(&mut self, shared: &Shared, held: Result<Vec<u64>, WireFault>, wait_ms: u64) {
         if let Ok(held) = &held {
-            self.leave(feeds, |id| !held.contains(&id));
+            self.leave(&shared.feeds, |id| !held.contains(&id));
         }
+        let now = shared.dispatcher.reactor().now();
         self.asked_mut()
             .syncs
-            .push_back(held.map(|_| Instant::now() + Duration::from_millis(wait_ms).min(SYNC_MAX_WAIT)));
+            .push_back(held.map(|_| now + Duration::from_millis(wait_ms).min(SYNC_MAX_WAIT)));
     }
 
     /// The [`sync_wait`] of the oldest unanswered sync, begun if none is
@@ -513,7 +521,7 @@ impl Subscriptions {
                 0 => return None,
                 1 => syncs[0].clone(),
                 // Answered in the order asked, so held no longer.
-                _ => syncs[0].clone().map(|_| Instant::now()),
+                _ => syncs[0].clone().map(|_| shared.dispatcher.reactor().now()),
             };
             held.retain(|(sub, _)| sub.after_tick.get().is_some());
             let (shared, out, held) = (Rc::clone(shared), Rc::clone(&self.out), held.clone());
@@ -620,7 +628,11 @@ async fn sync_wait(
         held.retain(|(sub, _)| sub.after_tick.get().is_some());
         let ids: Vec<u64> = held.iter().map(|(_, feed)| feed.key.view.tid).collect();
         // With no subscription there is nothing to hold for.
-        let until = if ids.is_empty() { Instant::now() } else { deadline };
+        let until = if ids.is_empty() {
+            shared.dispatcher.reactor().now()
+        } else {
+            deadline
+        };
         let quiet = || out.unsynced() == 0 && held.iter().all(caught_up);
         let catalog = hold_lock(shared, &ids, until, quiet).await?;
         // Every commit acknowledged before the sync is ticked here, so only a
@@ -640,7 +652,7 @@ async fn sync_wait(
         } else {
             drop(catalog);
         }
-        if out.unsynced() > 0 || Instant::now() >= until {
+        if out.unsynced() > 0 || shared.dispatcher.reactor().now() >= until {
             return Ok(());
         }
     }

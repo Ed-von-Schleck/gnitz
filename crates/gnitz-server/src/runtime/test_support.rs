@@ -4,6 +4,10 @@
 //! uses them: a ring is a `runtime` shape, and a helper that crosses no crate
 //! boundary should not sit on one's published surface.
 
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
+
 impl crate::runtime::frame::WireMsg<'_> {
     /// Encode into a fresh `Vec` sized by `WireMsg::size`.
     pub(crate) fn encode_to_vec(&self) -> Vec<u8> {
@@ -74,4 +78,25 @@ pub(crate) fn try_poll_once<T>(fut: impl std::future::Future<Output = T>) -> Opt
         Poll::Ready(r) => Some(r),
         Poll::Pending => None,
     }
+}
+
+/// Read `expect` bytes off `s` and close it, so the send under test never
+/// stalls on a full socket buffer. Returns how many it saw before `expect` or EOF.
+pub(crate) fn spawn_drain(s: UnixStream, expect: usize) -> std::thread::JoinHandle<u64> {
+    std::thread::spawn(move || std::io::copy(&mut (&s).take(expect as u64), &mut std::io::sink()).expect("drain"))
+}
+
+/// One non-blocking read of up to `cap` bytes off `s`: empty at EOF, `None` when
+/// nothing is readable yet. `s` stays blocking for its other readers.
+pub(crate) fn read_nonblocking(s: &UnixStream, cap: usize) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; cap];
+    // SAFETY: `buf` is `cap` writable bytes.
+    let n = unsafe { libc::recv(s.as_raw_fd(), buf.as_mut_ptr().cast(), cap, libc::MSG_DONTWAIT) };
+    if n < 0 {
+        let e = std::io::Error::last_os_error();
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "recv: {e}");
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(buf)
 }

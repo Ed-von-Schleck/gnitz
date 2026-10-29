@@ -5,8 +5,19 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use super::*;
-use crate::runtime::reactor::{egress_pair, poll_until, read_nonblocking, ring_slot, select2, Either};
+use crate::runtime::reactor::test_support::{accepted_pair, make_reactor, poll_until};
+use crate::runtime::sync::{select2, Either};
+use crate::runtime::test_support::read_nonblocking;
+use crate::runtime::w2m::fixtures::ring_slot;
 use gnitz_wire::framed;
+
+impl Peer {
+    /// A plain peer over one end of a fresh socketpair, and the other end.
+    pub(crate) fn over_socketpair(reactor: &Reactor) -> (Peer, std::os::unix::net::UnixStream) {
+        let (accepted, partner) = accepted_pair(reactor);
+        (Peer::new(reactor, accepted, None), partner)
+    }
+}
 
 /// `send` corks a slot that fits beside the cork, ships the cork first when the
 /// slot would overflow it, and sends a slot over half the ceiling alone; the bytes
@@ -29,8 +40,8 @@ fn send_corks_what_fits_and_never_reorders() {
     ] {
         let (_ring, slot) = ring_slot(pad);
         let all = [vec![0x5Au8; pre], slot.frame_bytes().to_vec()].concat();
-        let (r, conn, receiver) = egress_pair();
-        let peer = Peer::new(&r, conn, None);
+        let r = make_reactor();
+        let (peer, receiver) = Peer::over_socketpair(&r);
         peer.cork(&all[..pre]);
         r.block_on(peer.send(SendBody::Slot(slot))).expect("an open peer");
 
@@ -57,8 +68,8 @@ fn send_corks_what_fits_and_never_reorders() {
 #[test]
 fn flush_if_full_ships_only_a_full_cork() {
     for corked in [COALESCE_MAX_BYTES - 1, COALESCE_MAX_BYTES] {
-        let (r, conn, receiver) = egress_pair();
-        let peer = Peer::new(&r, conn, None);
+        let r = make_reactor();
+        let (peer, receiver) = Peer::over_socketpair(&r);
         peer.cork(&vec![0x3Cu8; corked]);
         r.block_on(peer.flush_if_full()).expect("an open peer");
         let left = peer.corked_len();
@@ -80,8 +91,8 @@ fn a_failed_send_finishes_the_peer() {
     let (_big_ring, big) = ring_slot(COALESCE_MAX_BYTES);
     let (_small_ring, small) = ring_slot(64);
 
-    let (r, conn, receiver) = egress_pair();
-    let peer = Peer::new(&r, conn, None);
+    let r = make_reactor();
+    let (peer, receiver) = Peer::over_socketpair(&r);
     drop(receiver);
 
     r.block_on(async {
@@ -106,8 +117,8 @@ fn a_failed_send_finishes_the_peer() {
 /// cork alone, so a pipelined run of replies leaves as one send.
 #[test]
 fn next_request_keeps_the_cork_while_requests_are_queued() {
-    let (r, conn, partner) = egress_pair();
-    let peer = Peer::new(&r, conn, None);
+    let r = make_reactor();
+    let (peer, partner) = Peer::over_socketpair(&r);
     (&partner)
         .write_all(&[framed(b"a"), framed(b"b")].concat())
         .expect("write");
@@ -126,8 +137,8 @@ fn next_request_keeps_the_cork_while_requests_are_queued() {
 /// ships what is corked before it reports the last request taken.
 #[test]
 fn next_request_ships_to_a_half_closed_client() {
-    let (r, conn, partner) = egress_pair();
-    let peer = Peer::new(&r, conn, None);
+    let r = make_reactor();
+    let (peer, partner) = Peer::over_socketpair(&r);
     (&partner).write_all(&framed(b"a")).expect("write");
     partner.shutdown(std::net::Shutdown::Write).expect("shutdown");
 
@@ -143,8 +154,8 @@ fn next_request_ships_to_a_half_closed_client() {
 /// the client.
 #[test]
 fn next_request_ships_before_parking() {
-    let (r, conn, receiver) = egress_pair();
-    let peer = Peer::new(&r, conn, None);
+    let r = make_reactor();
+    let (peer, receiver) = Peer::over_socketpair(&r);
     let frame = vec![0x6Bu8; 300];
     peer.cork(&frame);
 
@@ -163,8 +174,8 @@ fn next_request_ships_before_parking() {
 /// otherwise leaves alone behind a flush of what was corked.
 #[test]
 fn a_shared_body_is_sent_behind_what_is_corked() {
-    let (r, conn, receiver) = egress_pair();
-    let peer = Peer::new(&r, conn, None);
+    let r = make_reactor();
+    let (peer, receiver) = Peer::over_socketpair(&r);
     let small = Rc::new(vec![0x11u8; 100]);
     let large = Rc::new(vec![0x21u8; COALESCE_MAX_BYTES]);
 

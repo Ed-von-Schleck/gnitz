@@ -98,7 +98,7 @@ fn a_refusal_discards_the_queue_and_shuts_the_socket_down() {
             matches!(try_poll_once(conn.recv()), Some(None)),
             "cap={cap}: recv never parks after a refusal"
         );
-        assert_eq!(r.inbound.held(), 0, "cap={cap}");
+        assert_eq!(r.conns.inbound.held(), 0, "cap={cap}");
         assert_eq!(
             read_nonblocking(&partner, 1),
             Some(vec![]),
@@ -123,7 +123,7 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
     (&partner1).write_all(&hdr_and_part).expect("write");
 
     assert!(
-        poll_until(&r, || r.inbound.held() == 10_000),
+        poll_until(&r, || r.conns.inbound.held() == 10_000),
         "in-flight buffer was not accounted"
     );
     assert!(!conn1.is_readable(), "no frame completes from a partial payload");
@@ -134,7 +134,11 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
         poll_until(&r, || conn2.is_gone()),
         "over-cap second connection was not closed"
     );
-    assert_eq!(r.inbound.held(), 10_000, "the refused connection allocated nothing");
+    assert_eq!(
+        r.conns.inbound.held(),
+        10_000,
+        "the refused connection allocated nothing"
+    );
 }
 
 /// Consumption refunds the budget, so traffic far above the cap never trips while
@@ -155,7 +159,7 @@ fn inbound_cap_accounting_balances_on_consume() {
             }
         });
     }
-    assert_eq!(r.inbound.held(), 0, "every frame consumed");
+    assert_eq!(r.conns.inbound.held(), 0, "every frame consumed");
 }
 
 /// `readable` resolves on a queued frame and on the end of the recv side, and
@@ -235,7 +239,7 @@ fn the_connection_cap_refuses_past_it_until_a_connection_drops() {
     let r = make_reactor_with(Limits { max_conns: 1, ..Limits::TEST });
     let (first, _a) = client_pair(&r);
     let (b, b_partner) = UnixStream::pair().expect("socketpair");
-    assert!(r.client_conn(OwnedFd::from(b)).is_none(), "the cap refuses a second");
+    assert!(r.admit(OwnedFd::from(b)).is_none(), "the cap refuses a second");
     assert_eq!(
         read_nonblocking(&b_partner, 1),
         Some(vec![]),
@@ -252,9 +256,10 @@ fn the_connection_cap_refuses_past_it_until_a_connection_drops() {
 #[test]
 fn retire_defers_the_shutdown_to_the_egress_owner_and_fail_ends_the_recv() {
     let r = make_reactor();
-    let (conn, partner) = registered(&r);
     let (owner, mut woken) = chan::unbounded::<()>();
-    conn.set_egress_owner(owner);
+    let (accepted, partner) = accepted_pair(&r);
+    let conn = r.client_conn(accepted, Some(owner));
+    r.register_conn(&conn, Box::new(Plain::new()));
 
     conn.retire();
     assert!(woken.try_recv().is_some() && woken.try_recv().is_none(), "one wake");
@@ -267,11 +272,38 @@ fn retire_defers_the_shutdown_to_the_egress_owner_and_fail_ends_the_recv() {
     );
 }
 
+/// A recv in flight when its connection retires completes into nothing: its
+/// bytes are dropped uncharged and the reactor lets go of the connection.
+#[test]
+fn a_recv_landing_after_retire_is_discarded() {
+    let r = make_reactor();
+    // Owned egress, so `retire` leaves the socket open for the late bytes.
+    let (owner, _woken) = chan::unbounded::<()>();
+    let (accepted, mut partner) = accepted_pair(&r);
+    let conn = r.client_conn(accepted, Some(owner));
+    r.register_conn(&conn, Box::new(Plain::new()));
+    r.tick(false); // the recv is submitted
+
+    conn.retire();
+    partner.write_all(&gnitz_wire::framed(b"late")).expect("write");
+    assert!(
+        poll_until(&r, || Rc::strong_count(&conn) == 1),
+        "the recv's completion releases the connection"
+    );
+    assert_eq!(r.conns.inbound.held(), 0, "the late bytes were never charged");
+    assert_eq!(
+        try_poll_once(conn.recv()).map(|f| f.is_none()),
+        Some(true),
+        "the late frame was not queued"
+    );
+}
+
 /// A payload far larger than the socket buffers completes across many short
 /// sends, each CQE retiring its op.
 #[test]
 fn send_owned_loops_until_full_payload_sent_over_socketpair() {
-    let (r, conn, receiver) = egress_pair();
+    let r = make_reactor();
+    let (conn, receiver) = client_pair(&r);
     shrink(&conn, &receiver, 8 * 1024);
     let payload_len = 200 * 1024;
     let drain_t = spawn_drain(receiver, payload_len);
@@ -350,7 +382,7 @@ fn accept_retries_after_a_failure() {
     let (r2, a) = (r.clone(), Rc::clone(&accepted));
     r.spawn(async move { *a.borrow_mut() = Some(r2.accept(listener).await) });
     assert!(
-        poll_until(&r, || !r.deadlines.borrow().is_empty()),
+        poll_until(&r, || r.timers.earliest().is_some()),
         "an accept the socket refuses backs off"
     );
 
@@ -363,6 +395,24 @@ fn accept_retries_after_a_failure() {
         poll_until(&r, || accepted.borrow().is_some()),
         "the retry takes the connection"
     );
-    let accepted = std::net::TcpStream::from(accepted.take().expect("just seen"));
-    assert_eq!(accepted.peer_addr().ok(), client.local_addr().ok());
+    let conn = r.client_conn(accepted.take().expect("just seen"), None);
+    assert_eq!(conn.peer_addr(), client.local_addr().ok());
+}
+
+/// `peer_addr` names a TCP peer through a borrow that leaves the fd open, and is
+/// `None` for an AF_UNIX peer.
+#[test]
+fn peer_addr_names_a_tcp_peer_and_leaves_the_fd_open() {
+    let r = make_reactor();
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let client = std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+    let (server, _) = listener.accept().expect("accept");
+    let conn = r.client_conn(r.admit(OwnedFd::from(server)).expect("under the cap"), None);
+    assert_eq!(conn.peer_addr(), client.local_addr().ok(), "a TCP peer's address");
+    assert_eq!(
+        conn.peer_addr(),
+        client.local_addr().ok(),
+        "a second call still finds the fd open"
+    );
+    assert_eq!(client_pair(&r).0.peer_addr(), None, "an AF_UNIX peer has no address");
 }

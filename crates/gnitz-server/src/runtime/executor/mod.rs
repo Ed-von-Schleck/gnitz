@@ -30,7 +30,7 @@ mod write;
 use std::cell::Cell;
 use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use self::committer::Committer;
 use self::ddl::{handle_ddl_txn, reserve_serial_range};
@@ -43,9 +43,10 @@ use crate::catalog::CatalogEngine;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::listen::ClientListener;
 use crate::runtime::master::{MasterDispatcher, WORKER_WATCH};
-use crate::runtime::reactor::{select2, AsyncRwLock, Either, RecvBuf, SendBody, TrainLease, WriteGuard};
+use crate::runtime::reactor::{RecvBuf, SendBody, TrainLease};
 use crate::runtime::sal::Read;
 use crate::runtime::signals;
+use crate::runtime::sync::{select2, AsyncRwLock, Either, WriteGuard};
 use crate::runtime::tls::{Served, TlsListener};
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_wire::txn_frame::ScanItem;
@@ -187,11 +188,9 @@ async fn accept_loop(shared: Rc<Shared>, listener: ClientListener) {
     let fd: &'static OwnedFd = Box::leak(Box::new(fd));
     let reactor = shared.dispatcher.reactor().clone();
     loop {
-        let Some(conn) = reactor.client_conn(reactor.accept(fd.as_fd()).await) else {
-            continue;
-        };
+        let accepted = reactor.accept(fd.as_fd()).await;
         let served = tls.as_ref().map(|t| t.current());
-        let peer = Peer::new(&reactor, conn, served.as_ref().map(|s| &s.cfg));
+        let peer = Peer::new(&reactor, accepted, served.as_ref().map(|s| &s.cfg));
         reactor.spawn(connection_loop(peer, Rc::clone(&shared), served));
     }
 }
@@ -404,7 +403,7 @@ async fn dispatch_request(
             // Refused or not, it is answered as a sync is: out of the order of replies.
             let held = gnitz_wire::txn_frame::decode_held(&data[ctrl.blob.clone()])
                 .map_err(|e| WireFault::from(format!("decode error: {e}")));
-            subs.ask_sync(&shared.feeds, held, ctrl.hdr.arg0);
+            subs.ask_sync(shared, held, ctrl.hdr.arg0);
             Ok(())
         }
 
@@ -535,7 +534,12 @@ struct Scanned {
 async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -> Result<(), WireFault> {
     // Every target's kind is resolved under this guard, so a DDL during the
     // drain is caught there and an unknown tid is rejected there.
-    let catalog = fresh_read_lock(shared, scans.iter().map(|s| s.target.tid), Instant::now()).await?;
+    let catalog = fresh_read_lock(
+        shared,
+        scans.iter().map(|s| s.target.tid),
+        shared.dispatcher.reactor().now(),
+    )
+    .await?;
     let mut scanned: Vec<Scanned> = Vec::with_capacity(scans.len());
     for scan in scans {
         let kind = target_kind(shared.cat(), scan.target, Access::Read)?;

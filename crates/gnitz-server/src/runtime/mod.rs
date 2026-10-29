@@ -4,6 +4,8 @@
 //!   serves clients on the master's `reactor`, through the `master` dispatcher;
 //!   `worker` is a worker's event loop. `signals` and `affinity` set up each
 //!   process; `listen` and `tls` are the client listeners.
+//! - Within the master: `sync` holds the single-threaded primitives (oneshot,
+//!   chan, the rwlock, select2, the wake queue) its tasks and its reactor share.
 //! - Inter-process protocol: the master→worker `sal` (shared append-only log),
 //!   the worker→master `w2m` rings, the worker↔worker exchange `mesh`, the
 //!   futex `park` all three sleep through, and the `frame` encoder they write.
@@ -37,6 +39,7 @@ mod park;
 mod reactor;
 mod sal;
 mod signals;
+mod sync;
 mod tls;
 mod w2m;
 mod worker;

@@ -1,7 +1,7 @@
 use super::*;
-use crate::runtime::reactor::GroupTargets;
 use crate::runtime::sal::fixtures::{group_at, test_log};
 use crate::runtime::sal::{epoch_word, Apply, GroupData, SalGroup, SalMessageKind, SalWriter, PREFIX_BYTES};
+use crate::runtime::w2m::GroupTargets;
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::encode_schema_block;

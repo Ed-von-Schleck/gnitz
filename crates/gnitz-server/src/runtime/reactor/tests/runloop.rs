@@ -9,6 +9,7 @@ use super::super::uring::SQ_ENTRIES;
 use super::*;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
+use crate::runtime::w2m::BOOT_READY_REQUEST_ID;
 
 /// A panic during poll must propagate rather than be swallowed: it unwinds
 /// through the pass and, in real use, up to `block_on`'s caller.
@@ -66,6 +67,38 @@ fn repeated_wakes_for_one_key_collapse_to_a_single_poll() {
     );
 }
 
+/// A waker that outlived its task wakes whichever task took its key since, or
+/// none; either costs at most one spurious poll. `send_owned`'s eviction leaves
+/// such a waker behind: the abandoned send's op keeps its receiver's waker, which
+/// the late CQE fires.
+#[test]
+fn a_stale_wake_costs_at_most_a_spurious_poll() {
+    let r = make_reactor();
+    let kept: Rc<RefCell<Option<Waker>>> = Rc::default();
+    let k = Rc::clone(&kept);
+    r.spawn(std::future::poll_fn(move |cx| {
+        *k.borrow_mut() = Some(cx.waker().clone());
+        Poll::Ready(())
+    }));
+    r.tick(false);
+    let stale = kept.take().expect("the task kept its waker");
+    stale.wake_by_ref();
+    r.tick(false); // its key is vacant: nothing to poll
+
+    let polls = Rc::new(Cell::new(0u32));
+    let p = Rc::clone(&polls);
+    r.spawn(std::future::poll_fn(move |_| {
+        p.set(p.get() + 1);
+        Poll::<()>::Pending
+    }));
+    r.tick(false); // the spawn takes the freed key
+    assert_eq!(polls.get(), 1);
+    stale.wake();
+    r.tick(false);
+    r.tick(false);
+    assert_eq!(polls.get(), 2, "the stale wake costs one spurious poll, and no more");
+}
+
 /// `block_on` returns in the pass that completes its future, whatever else is
 /// parked: nothing would ever end a sleep there.
 #[test]
@@ -97,8 +130,10 @@ fn block_on_is_woken_by_a_task() {
 #[test]
 fn a_sleeping_tick_wakes_at_the_earliest_deadline() {
     within(|| {
-        let r = make_reactor();
+        // Read before the reactor: a timer created outside a pass counts from
+        // the clock the reactor read when it was built, which is no earlier.
         let start = Instant::now();
+        let r = make_reactor();
         let fired = Rc::new(Cell::new(false));
         let f = Rc::clone(&fired);
         let early = r.sleep(Duration::from_millis(20));
@@ -121,7 +156,7 @@ fn a_sleeping_tick_wakes_at_the_earliest_deadline() {
         }
         assert!(start.elapsed() >= Duration::from_millis(20), "woke before the deadline");
         assert!(ticks <= 16, "{ticks} ticks: the reactor spun instead of sleeping");
-        assert_eq!(r.deadlines.borrow().len(), 1, "only the later deadline is left");
+        assert_eq!(r.timers.deadlines.borrow().len(), 1, "only the later deadline is left");
         r.tasks.borrow_mut().clear(); // the pending timer holds the reactor
     });
 }

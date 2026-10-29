@@ -43,10 +43,10 @@ fn agree((a, a_end): &Deframed, (b, b_end): &Deframed, step: usize) {
     }
 }
 
-/// A HELLO carrying [`TOKEN`] and then a frame past the handshake's ceiling is
-/// read alike in one read and in many, and its HELLO is admitted.
+/// A HELLO carrying the seeds' [`TOKEN`] fits under the handshake's ceiling,
+/// which refuses the larger frame behind it until the client is admitted.
 #[test]
-fn an_admitted_hello_deframes_alike_in_any_reads() {
+fn the_handshake_ceiling_admits_the_seed_hello_and_refuses_a_bigger_frame() {
     let hello = gnitz_wire::client_hello(TOKEN.as_bytes());
     let big = vec![7u8; gnitz_wire::HANDSHAKE_FRAME_MAX + 1];
     let stream = [gnitz_wire::framed(&hello), gnitz_wire::framed(&big)].concat();
@@ -54,7 +54,7 @@ fn an_admitted_hello_deframes_alike_in_any_reads() {
     assert!(frames.len() == 2 && end.is_none(), "{end:?}");
     let (frames, end) = deframe(&stream, stream.len(), false, BUDGET);
     assert_eq!(frames.len(), 1, "the handshake's ceiling refuses the second");
-    assert!(end.is_some());
+    assert_eq!(end, Some(RecvEnd::Oversize));
     let token = gnitz_wire::read_client_hello(&frames[0]).unwrap();
     assert_eq!(token, TOKEN.as_bytes());
 }

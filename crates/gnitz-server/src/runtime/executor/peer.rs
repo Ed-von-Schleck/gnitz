@@ -9,7 +9,8 @@ use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::runtime::reactor::{select2, ClientConn, Either, PeerGone, Plain, Reactor, RecvBuf, SendBody};
+use crate::runtime::reactor::{Accepted, ClientConn, PeerGone, Plain, Reactor, RecvBuf, SendBody};
+use crate::runtime::sync::{select2, Either};
 use crate::runtime::tls::TlsShared;
 use gnitz_zset::repr::PooledBuf;
 
@@ -37,15 +38,19 @@ enum Transport {
 }
 
 impl Peer {
-    /// Arm `conn`'s recv and start serving it: a TLS session under `tls`, the
-    /// socket's own bytes otherwise.
-    pub fn new(reactor: &Reactor, conn: Rc<ClientConn>, tls: Option<&Arc<rustls::ServerConfig>>) -> Peer {
-        let transport = match tls {
+    /// Build a connection over `accepted`, arm its recv and start serving it: a
+    /// TLS session under `tls`, the socket's own bytes otherwise.
+    pub fn new(reactor: &Reactor, accepted: Accepted, tls: Option<&Arc<rustls::ServerConfig>>) -> Peer {
+        let (conn, transport) = match tls {
             None => {
+                let conn = reactor.client_conn(accepted, None);
                 reactor.register_conn(&conn, Box::new(Plain::new()));
-                Transport::Plain(reactor.clone())
+                (conn, Transport::Plain(reactor.clone()))
             }
-            Some(cfg) => Transport::Tls(TlsShared::start(reactor.clone(), Rc::clone(&conn), Arc::clone(cfg))),
+            Some(cfg) => {
+                let tls = TlsShared::start(reactor.clone(), accepted, Arc::clone(cfg));
+                (Rc::clone(tls.conn()), Transport::Tls(tls))
+            }
         };
         Peer {
             conn,

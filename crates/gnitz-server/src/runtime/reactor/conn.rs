@@ -1,17 +1,56 @@
-//! A client connection: its socket, the inbound budget and deframed frame queue,
-//! the armed recv, the send loop and its eviction, and how the connection ends.
-//! Nothing here flushes: an SQE ships with the loop's own submit, before the task
-//! awaiting it can run.
+//! Client connections: their limits, the inbound budget and deframed frame
+//! queue, the armed recv, the send loop and its eviction, and how a connection
+//! ends. Nothing here flushes: an SQE ships with the loop's own submit, before the
+//! task awaiting it can run.
 
-use std::cell::OnceCell;
 use std::collections::hash_map::Entry;
 use std::mem::MaybeUninit;
 use std::os::fd::{FromRawFd, OwnedFd};
 
 use gnitz_wire::{Deframer, FrameLenError, HANDSHAKE_FRAME_MAX, MAX_FRAME_PAYLOAD};
 use gnitz_zset::repr::PooledBuf;
+use rustc_hash::FxHashMap;
 
 use super::*;
+use crate::runtime::sync::{chan, select2, Either, WakeQueue};
+use crate::runtime::w2m::W2mSlot;
+
+/// The ceilings and deadlines a reactor's connections are held to, fixed for its
+/// life. Startup resolves them from the environment; a test that has to wait one
+/// out picks its own instead, which is why they are arguments rather than
+/// globals.
+#[derive(Clone, Copy)]
+pub(crate) struct Limits {
+    /// Ceiling on in-flight inbound frame payload bytes, across every
+    /// connection.
+    pub inbound_cap: usize,
+    /// One kernel send making no progress for this long evicts the client, whose
+    /// stalled sends would otherwise pin W2M ring space and block a worker
+    /// (`GNITZ_CLIENT_SEND_TIMEOUT_MS`).
+    pub client_send_timeout: Duration,
+    /// A failed accept is retried after this long, so closing connections get a
+    /// window to free fds.
+    pub accept_rearm_backoff: Duration,
+    /// Ceiling on open client connections, across every listener and
+    /// transport (`GNITZ_MAX_CONNS`). A connection accepted past it is closed
+    /// at once.
+    pub max_conns: usize,
+}
+
+impl Limits {
+    /// The server's, resolved from the environment.
+    pub(crate) fn from_env() -> Limits {
+        Limits {
+            inbound_cap: resolve_inbound_cap(),
+            client_send_timeout: Duration::from_millis(gnitz_foundation::env::env_num(
+                "GNITZ_CLIENT_SEND_TIMEOUT_MS",
+                30_000,
+            )),
+            accept_rearm_backoff: Duration::from_millis(50),
+            max_conns: gnitz_foundation::env::env_num("GNITZ_MAX_CONNS", 256),
+        }
+    }
+}
 
 /// Lower/upper bounds on the global inbound-memory cap (see
 /// [`resolve_inbound_cap`]). The floor guarantees even a tiny memory budget
@@ -24,7 +63,7 @@ const INBOUND_CAP_CEIL: usize = 4usize << 30; // 4 GiB
 /// process memory budget, or `GNITZ_INBOUND_MEM_BYTES`, never outside the bounds
 /// above. A fraction of the *actual* budget scales with the deployment where a
 /// flat constant would OOM a mid-size box yet never trip in a small container.
-pub(super) fn resolve_inbound_cap() -> usize {
+fn resolve_inbound_cap() -> usize {
     let host = gnitz_foundation::host::available_memory_bytes();
     let default = (host / 4).clamp(INBOUND_CAP_FLOOR, INBOUND_CAP_CEIL);
     gnitz_foundation::env::env_num("GNITZ_INBOUND_MEM_BYTES", default).max(INBOUND_CAP_FLOOR)
@@ -189,6 +228,13 @@ impl RecvQueue {
     }
 }
 
+/// An accepted socket and its slot under the connection cap, which the
+/// connection built over it holds for its life.
+pub(crate) struct Accepted {
+    fd: OwnedFd,
+    slot: Charge,
+}
+
 /// One client connection: its socket and the frames deframed off it. The socket
 /// closes with the last holder, and every SQE naming it is queued through one.
 pub(crate) struct ClientConn {
@@ -200,20 +246,10 @@ pub(crate) struct ClientConn {
     gone: Cell<bool>,
     /// Wakes the task that sends on this socket outside requests, which then
     /// owns the shutdown.
-    egress_owner: OnceCell<chan::Sender<()>>,
+    egress_owner: Option<chan::Sender<()>>,
 }
 
 impl ClientConn {
-    fn new(fd: OwnedFd, slot: Charge, budget: Rc<Budget>) -> Self {
-        ClientConn {
-            fd,
-            _slot: slot,
-            q: RefCell::new(RecvQueue::new(budget)),
-            gone: Cell::new(false),
-            egress_owner: OnceCell::new(),
-        }
-    }
-
     fn fd(&self) -> i32 {
         self.fd.as_raw_fd()
     }
@@ -233,6 +269,8 @@ impl ClientConn {
     /// `shutdown(SHUT_RDWR)`: errors out a pending recv or send on the socket, which
     /// `close` would not. Never closes the fd; a peer already gone is not an error.
     pub(crate) fn shutdown(&self) {
+        // SAFETY: the connection's own fd, open while `self` lives; shutdown
+        // reads or writes no memory.
         unsafe { libc::shutdown(self.fd(), libc::SHUT_RDWR) };
     }
 
@@ -257,7 +295,7 @@ impl ClientConn {
             q.frames.clear();
             q.frames.close();
         }
-        match self.egress_owner.get() {
+        match &self.egress_owner {
             Some(owner) => owner.send(()),
             None => self.shutdown(),
         }
@@ -269,14 +307,8 @@ impl ClientConn {
         self.shutdown();
     }
 
-    /// Hand egress to the task behind `owner`.
-    pub(crate) fn set_egress_owner(&self, owner: chan::Sender<()>) {
-        debug_assert!(!self.is_gone(), "egress handed over after the end");
-        assert!(self.egress_owner.set(owner).is_ok(), "egress has one owner");
-    }
-
     pub(crate) fn wake_egress(&self) {
-        if let Some(owner) = self.egress_owner.get() {
+        if let Some(owner) = &self.egress_owner {
             owner.send(());
         }
     }
@@ -338,9 +370,33 @@ impl RecvFilter for Plain {
     }
 }
 
+/// The reactor's connection state: every armed recv, the budgets connections
+/// are charged to, and their limits.
+pub(super) struct Conns {
+    /// Every connection with a recv armed on it, by fd.
+    armed: RefCell<FxHashMap<i32, Armed>>,
+    /// The OOM guard shared by every connection, charged per inbound frame.
+    inbound: Rc<Budget>,
+    /// Open client connections under `Limits::max_conns`; each [`ClientConn`]
+    /// holds one charge of it.
+    slots: Rc<Budget>,
+    limits: Limits,
+}
+
+impl Conns {
+    pub(super) fn new(limits: Limits) -> Self {
+        Conns {
+            armed: RefCell::new(FxHashMap::default()),
+            inbound: Budget::new(limits.inbound_cap),
+            slots: Budget::new(limits.max_conns),
+            limits,
+        }
+    }
+}
+
 /// A connection with a recv armed on it — the reactor's whole per-connection
 /// state. The entry exists exactly while the recv SQE is outstanding.
-pub(super) struct Armed {
+struct Armed {
     conn: Rc<ClientConn>,
     filter: Box<dyn RecvFilter>,
 }
@@ -400,7 +456,7 @@ impl Reactor {
     ///
     /// Not cancel-safe: a future dropped mid-accept leaves an op whose later
     /// result is a raw fd nothing owns.
-    pub(crate) async fn accept(&self, listener: BorrowedFd<'static>) -> OwnedFd {
+    pub(crate) async fn accept(&self, listener: BorrowedFd<'static>) -> Accepted {
         loop {
             let sqe = opcode::Accept::new(
                 types::Fd(listener.as_raw_fd()),
@@ -411,34 +467,49 @@ impl Reactor {
             // SAFETY: the SQE names no memory, and `listener` is open for the
             // process's life.
             let res = unsafe { self.push_op(sqe, None) }.await;
-            if res >= 0 {
-                // SAFETY: a fresh fd from the kernel, owned by nothing else.
-                return unsafe { OwnedFd::from_raw_fd(res) };
+            if res < 0 {
+                self.sleep(self.conns.limits.accept_rearm_backoff).await;
+                continue;
             }
-            self.sleep(self.limits.accept_rearm_backoff).await;
+            // SAFETY: a fresh fd from the kernel, owned by nothing else.
+            if let Some(accepted) = self.admit(unsafe { OwnedFd::from_raw_fd(res) }) {
+                return accepted;
+            }
         }
     }
 
-    /// A connection over `fd`, taking one slot under the connection cap and
-    /// charging frames to the inbound budget; `None`, closing `fd`, at the cap.
-    /// Nothing is armed on it yet.
-    pub(crate) fn client_conn(&self, fd: OwnedFd) -> Option<Rc<ClientConn>> {
-        let Some(slot) = self.conn_slots.charge(1) else {
+    /// `fd`, holding one slot under the connection cap; `None`, closing `fd`, at
+    /// the cap.
+    pub(super) fn admit(&self, fd: OwnedFd) -> Option<Accepted> {
+        let Some(slot) = self.conns.slots.charge(1) else {
             gnitz_warn!(
                 "connection cap {} reached; closing fd={}",
-                self.conn_slots.cap(),
+                self.conns.slots.cap(),
                 fd.as_raw_fd()
             );
             return None;
         };
-        Some(Rc::new(ClientConn::new(fd, slot, Rc::clone(&self.inbound))))
+        Some(Accepted { fd, slot })
+    }
+
+    /// A connection over `accepted`, charging frames to the inbound budget.
+    /// `egress_owner` wakes the task that sends on the socket outside requests,
+    /// if one does. Nothing is armed on it yet.
+    pub(crate) fn client_conn(&self, accepted: Accepted, egress_owner: Option<chan::Sender<()>>) -> Rc<ClientConn> {
+        Rc::new(ClientConn {
+            fd: accepted.fd,
+            _slot: accepted.slot,
+            q: RefCell::new(RecvQueue::new(Rc::clone(&self.conns.inbound))),
+            gone: Cell::new(false),
+            egress_owner,
+        })
     }
 
     /// Arm `conn`'s first recv into `filter`'s window, and hold the connection
     /// until the recv side ends.
     pub(crate) fn register_conn(&self, conn: &Rc<ClientConn>, filter: Box<dyn RecvFilter>) {
         let fd = conn.fd();
-        let mut conns = self.conns.borrow_mut();
+        let mut conns = self.conns.armed.borrow_mut();
         let Entry::Vacant(slot) = conns.entry(fd) else {
             // An entry holds its connection, so its fd is open and cannot be
             // reissued.
@@ -449,7 +520,7 @@ impl Reactor {
     }
 
     pub(super) fn handle_recv_cqe(&self, fd: i32, res: i32) {
-        let mut conns = self.conns.borrow_mut();
+        let mut conns = self.conns.armed.borrow_mut();
         let Entry::Occupied(mut entry) = conns.entry(fd) else {
             unreachable!("recv CQE for fd={fd} with no armed entry")
         };
@@ -478,8 +549,8 @@ impl Reactor {
         }
         gnitz_warn!(
             "reactor: fd={fd} recv side ended: {end} (res={res}, inbound held={} of {} B)",
-            self.inbound.held(),
-            self.inbound.cap(),
+            self.conns.inbound.held(),
+            self.conns.inbound.cap(),
         );
         match end {
             // The transport may owe the client a reply to the violation.
@@ -502,10 +573,12 @@ impl Reactor {
         let mut sent = 0usize;
         while sent < bytes.len() {
             let rest = &bytes[sent..];
-            let sqe = opcode::Send::new(types::Fd(conn.fd()), rest.as_ptr(), rest.len() as u32).build();
+            // A send longer than an SQE carries goes out over several.
+            let len = u32::try_from(rest.len()).unwrap_or(u32::MAX);
+            let sqe = opcode::Send::new(types::Fd(conn.fd()), rest.as_ptr(), len).build();
             // SAFETY: the op holds `out` until the CQE.
             let op = unsafe { self.push_op(sqe, Some(Rc::clone(&out))) };
-            let rc = match select2(op, self.sleep(self.limits.client_send_timeout)).await {
+            let rc = match select2(op, self.sleep(self.conns.limits.client_send_timeout)).await {
                 Either::A(rc) => rc,
                 // Evicted; a completion that raced the timer still counts as failed.
                 // The abandoned send completes only once the socket errors; its
@@ -514,7 +587,7 @@ impl Reactor {
                     gnitz_warn!(
                         "client fd={} made no send progress for {:?}; evicting",
                         conn.fd(),
-                        self.limits.client_send_timeout
+                        self.conns.limits.client_send_timeout
                     );
                     0
                 }

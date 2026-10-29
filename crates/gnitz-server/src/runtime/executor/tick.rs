@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use super::ddl::{hold_tick_for_ddl, TICK_HOLD_FOR_DDL};
 use super::Shared;
-use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard};
 use crate::runtime::sal::SalExcl;
+use crate::runtime::sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard};
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::WireFault;
 
@@ -80,13 +80,14 @@ impl Shared {
 pub(super) async fn tick_loop(shared: Rc<Shared>, TickTriggers(mut rx): TickTriggers) {
     // The batch's `Drain` repliers.
     let mut dones: Vec<oneshot::Sender<Result<(), WireFault>>> = Vec::new();
-    let mut patient_from = Instant::now();
+    let reactor = shared.dispatcher.reactor();
+    let mut patient_from = reactor.now();
     loop {
         let mut due = patient_from;
         let mut trigger = rx.recv().await;
         loop {
             match trigger {
-                TickTrigger::Auto => due = Instant::now(),
+                TickTrigger::Auto => due = reactor.now(),
                 TickTrigger::Drain { done, by } => {
                     due = due.min(by);
                     dones.push(done);
@@ -94,16 +95,10 @@ pub(super) async fn tick_loop(shared: Rc<Shared>, TickTriggers(mut rx): TickTrig
             }
             trigger = match rx.try_recv() {
                 Some(t) => t,
-                None => {
-                    let hold = due.saturating_duration_since(Instant::now());
-                    if hold.is_zero() {
-                        break;
-                    }
-                    match select2(rx.recv(), shared.dispatcher.reactor().sleep(hold)).await {
-                        Either::A(t) => t,
-                        Either::B(()) => break,
-                    }
-                }
+                None => match select2(rx.recv(), reactor.sleep_until(due)).await {
+                    Either::A(t) => t,
+                    Either::B(()) => break,
+                },
             };
         }
 
@@ -124,7 +119,7 @@ pub(super) async fn tick_loop(shared: Rc<Shared>, TickTriggers(mut rx): TickTrig
             }
             lease.acks().await;
         }
-        patient_from = Instant::now() + shared.ticks.patient_gap;
+        patient_from = reactor.now() + shared.ticks.patient_gap;
     }
 }
 

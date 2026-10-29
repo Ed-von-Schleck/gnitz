@@ -7,9 +7,9 @@ use super::{
 };
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
-use crate::runtime::reactor::GroupTargets;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 use crate::runtime::w2m::fixtures::test_rings;
+use crate::runtime::w2m::GroupTargets;
 use crate::test_support::{
     make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, sweep_bit_flips, weighted_rows,
 };

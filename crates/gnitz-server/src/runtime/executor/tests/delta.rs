@@ -1,7 +1,7 @@
 use std::io::Read;
 
 use super::*;
-use crate::runtime::reactor::egress_pair;
+use crate::runtime::reactor::test_support::make_reactor;
 use crate::runtime::test_support::try_poll_once;
 
 /// Trains queued for a connection reach the wire whole and in queue order
@@ -10,8 +10,8 @@ use crate::runtime::test_support::try_poll_once;
 #[test]
 fn queued_trains_are_shipped_whole_behind_the_reply() {
     const LARGE: usize = 1 << 20;
-    let (r, conn, receiver) = egress_pair();
-    let peer = Peer::new(&r, conn, None);
+    let r = make_reactor();
+    let (peer, receiver) = Peer::over_socketpair(&r);
     let subs = Subscriptions::default();
     subs.out.send(7, 1, Rc::new(vec![0x11; 100]));
     subs.out.send(7, 2, Rc::new(vec![0x21; LARGE]));

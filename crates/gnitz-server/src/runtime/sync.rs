@@ -1,12 +1,12 @@
-//! Async primitives for the reactor's single thread: `oneshot`, `chan`,
+//! Async primitives for one thread's tasks: `WakeQueue`, `oneshot`, `chan`,
 //! `AsyncRwLock` and `select2`.
 //!
-//! All `!Send` and `Rc<RefCell<_>>`-based on purpose: the reactor never leaves
-//! its thread, so a channel send costs no atomic and a waker registration no
-//! lock.
+//! All `!Send` and `Rc<RefCell<_>>`-based on purpose: the master's tasks never
+//! leave the reactor's thread, so a channel send costs no atomic and a waker
+//! registration no lock.
 //!
 //! Each primitive wakes while holding its own `RefCell` borrow, which is sound
-//! only because a reactor wake queues and never polls (see `make_waker`).
+//! only for a waker that queues and never polls, as the reactor's does.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -16,13 +16,96 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 // ---------------------------------------------------------------------------
+// WakeQueue
+// ---------------------------------------------------------------------------
+
+/// Slots a drained queue keeps; a burst past this returns its excess on draining.
+const RETAINED_SLOTS: usize = 1024;
+
+/// Where one awaiter waits for the *next* of many values, and learns when there
+/// will be none.
+pub(crate) struct WakeQueue<T> {
+    queue: VecDeque<T>,
+    /// The one awaiter. A dropped awaiter's waker stays behind; its wake is a
+    /// spurious poll.
+    waker: Option<Waker>,
+    closed: bool,
+}
+
+impl<T> Default for WakeQueue<T> {
+    fn default() -> Self {
+        WakeQueue {
+            queue: VecDeque::new(),
+            waker: None,
+            closed: false,
+        }
+    }
+}
+
+impl<T> WakeQueue<T> {
+    /// Queue `v` and wake the awaiter, if one is parked.
+    pub(crate) fn push(&mut self, v: T) {
+        debug_assert!(!self.closed, "a value pushed after the end");
+        self.queue.push_back(v);
+        self.wake();
+    }
+
+    /// End the stream: once the queued values are handed out, `poll` yields `None`.
+    pub(crate) fn close(&mut self) {
+        self.closed = true;
+        self.wake();
+    }
+
+    /// Hand the next value to the awaiter, `None` once the stream has ended and
+    /// is drained, or park it.
+    pub(crate) fn poll(&mut self, cx: &Context<'_>) -> Poll<Option<T>> {
+        self.poll_ready(cx).map(|()| self.pop())
+    }
+
+    /// Park the awaiter until [`Self::poll`] would not: a value is queued or
+    /// the stream has ended. Takes nothing.
+    pub(crate) fn poll_ready(&mut self, cx: &Context<'_>) -> Poll<()> {
+        if self.is_ready() {
+            return Poll::Ready(());
+        }
+        self.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    /// Whether [`Self::poll`] would not park.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.closed || !self.queue.is_empty()
+    }
+
+    fn wake(&mut self) {
+        if let Some(w) = self.waker.take() {
+            w.wake();
+        }
+    }
+
+    /// Take the next value without parking. For a caller that must not await.
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        let v = self.queue.pop_front();
+        if self.queue.is_empty() && self.queue.capacity() > RETAINED_SLOTS {
+            self.queue.shrink_to(RETAINED_SLOTS);
+        }
+        v
+    }
+
+    /// Drop every queued value and the capacity they held.
+    pub(crate) fn clear(&mut self) {
+        self.queue = VecDeque::new();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // oneshot
 // ---------------------------------------------------------------------------
 //
 // Single-threaded. A receiver resolves only on a send: a sender dropped unsent
 // leaves it pending forever.
 
-pub mod oneshot {
+pub(crate) mod oneshot {
     use super::*;
 
     struct State<T> {
@@ -30,14 +113,14 @@ pub mod oneshot {
         waker: Option<Waker>,
     }
 
-    pub struct Sender<T> {
+    pub(crate) struct Sender<T> {
         inner: Rc<RefCell<State<T>>>,
     }
-    pub struct Receiver<T> {
+    pub(crate) struct Receiver<T> {
         inner: Rc<RefCell<State<T>>>,
     }
 
-    pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    pub(crate) fn channel<T>() -> (Sender<T>, Receiver<T>) {
         let s = Rc::new(RefCell::new(State { value: None, waker: None }));
         (Sender { inner: Rc::clone(&s) }, Receiver { inner: s })
     }
@@ -45,7 +128,7 @@ pub mod oneshot {
     impl<T> Sender<T> {
         /// Send the result. A cancelled receiver is not an error: the value is
         /// parked in state nothing will read, and dropped with the `Rc`.
-        pub fn send(self, v: T) {
+        pub(crate) fn send(self, v: T) {
             let mut s = self.inner.borrow_mut();
             s.value = Some(v);
             if let Some(w) = s.waker.take() {
@@ -74,30 +157,29 @@ pub mod oneshot {
 // Unbounded, with every sender reaching the one `Sender` through a shared
 // owner. The stream has no end: a receiving task ends by being dropped.
 
-pub mod chan {
+pub(crate) mod chan {
     use super::*;
-    use crate::runtime::reactor::wake_queue::WakeQueue;
 
-    pub struct Sender<T> {
+    pub(crate) struct Sender<T> {
         inner: Rc<RefCell<WakeQueue<T>>>,
     }
-    pub struct Receiver<T> {
+    pub(crate) struct Receiver<T> {
         inner: Rc<RefCell<WakeQueue<T>>>,
     }
 
-    pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
+    pub(crate) fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
         let q = Rc::new(RefCell::new(WakeQueue::default()));
         (Sender { inner: Rc::clone(&q) }, Receiver { inner: q })
     }
 
     impl<T> Sender<T> {
-        pub fn send(&self, v: T) {
+        pub(crate) fn send(&self, v: T) {
             self.inner.borrow_mut().push(v);
         }
     }
 
     impl<T> Receiver<T> {
-        pub async fn recv(&mut self) -> T {
+        pub(crate) async fn recv(&mut self) -> T {
             std::future::poll_fn(|cx| {
                 self.inner
                     .borrow_mut()
@@ -107,7 +189,7 @@ pub mod chan {
             .await
         }
 
-        pub fn try_recv(&mut self) -> Option<T> {
+        pub(crate) fn try_recv(&mut self) -> Option<T> {
             self.inner.borrow_mut().pop()
         }
     }
@@ -130,10 +212,12 @@ struct RwLockInner {
     readers: usize,
     has_writer: bool,
     /// Woken as a set: `read_ok` admits all of them or none, so there is nothing
-    /// here to choose between. A cancelled reader's waker stays behind, harmlessly.
+    /// here to choose between. One entry per pending poll; a cancelled reader's
+    /// waker stays behind, harmlessly.
     read_waiters: VecDeque<Waker>,
-    /// Parked `WriteFuture`s, woken one at a time in queue order. A woken entry
-    /// keeps its place, its slot emptied, until its future acquires or drops.
+    /// Parked `WriteFuture`s, admitted one at a time in queue order. A woken
+    /// entry keeps its place, its slot emptied, until its future acquires or
+    /// drops.
     write_waiters: VecDeque<Rc<WakerSlot>>,
 }
 
@@ -148,28 +232,39 @@ impl RwLockInner {
         !self.has_writer && self.write_waiters.is_empty()
     }
 
-    /// A writer may enter: nobody holds the lock in either mode.
-    fn write_ok(&self) -> bool {
+    /// Nobody holds the lock in either mode.
+    fn free(&self) -> bool {
         !self.has_writer && self.readers == 0
+    }
+
+    /// The writer queued as `me` (`None`: not queued) may enter: the lock is free
+    /// and no writer is queued ahead of it, so a fresh writer cannot take the lock
+    /// from a woken one that has yet to poll.
+    fn write_ok(&self, me: Option<&Rc<WakerSlot>>) -> bool {
+        self.free()
+            && self
+                .write_waiters
+                .front()
+                .is_none_or(|first| me.is_some_and(|me| Rc::ptr_eq(first, me)))
     }
 }
 
 /// A handle on one lock; clones share it. Every future and guard holds a clone,
 /// so none borrows the handle it came from.
 #[derive(Clone, Default)]
-pub struct AsyncRwLock(Rc<RefCell<RwLockInner>>);
+pub(crate) struct AsyncRwLock(Rc<RefCell<RwLockInner>>);
 
 impl AsyncRwLock {
-    pub fn read(&self) -> ReadFuture {
+    pub(crate) fn read(&self) -> ReadFuture {
         ReadFuture { lock: self.clone() }
     }
 
-    pub fn write(&self) -> WriteFuture {
+    pub(crate) fn write(&self) -> WriteFuture {
         WriteFuture { lock: self.clone(), waiter: None }
     }
 
     /// A writer holds the lock.
-    pub fn is_write_held(&self) -> bool {
+    pub(crate) fn is_write_held(&self) -> bool {
         self.0.borrow().has_writer
     }
 
@@ -177,7 +272,7 @@ impl AsyncRwLock {
     /// parked reader when no writer waits.
     fn wake_next(&self) {
         let mut s = self.0.borrow_mut();
-        if s.write_ok() {
+        if s.free() {
             if let Some(slot) = s.write_waiters.front() {
                 if let Some(w) = slot.borrow_mut().take() {
                     w.wake();
@@ -203,7 +298,7 @@ impl AsyncRwLock {
     }
 }
 
-pub struct ReadFuture {
+pub(crate) struct ReadFuture {
     lock: AsyncRwLock,
 }
 
@@ -220,7 +315,7 @@ impl Future for ReadFuture {
     }
 }
 
-pub struct ReadGuard {
+pub(crate) struct ReadGuard {
     lock: AsyncRwLock,
 }
 
@@ -230,7 +325,7 @@ impl Drop for ReadGuard {
     }
 }
 
-pub struct WriteFuture {
+pub(crate) struct WriteFuture {
     lock: AsyncRwLock,
     /// This future's entry in `write_waiters`: `Some` iff it is queued.
     waiter: Option<Rc<WakerSlot>>,
@@ -241,10 +336,12 @@ impl Future for WriteFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WriteGuard> {
         let Self { lock, waiter } = self.get_mut();
         let mut s = lock.0.borrow_mut();
-        if s.write_ok() {
+        if s.write_ok(waiter.as_ref()) {
             s.has_writer = true;
+            // `write_ok` admits a queued writer only at the front.
             if let Some(w) = waiter.take() {
-                s.unqueue(&w);
+                let first = s.write_waiters.pop_front();
+                debug_assert!(first.is_some_and(|f| Rc::ptr_eq(&f, &w)));
             }
             return Poll::Ready(WriteGuard { lock: lock.clone() });
         }
@@ -269,7 +366,7 @@ impl Drop for WriteFuture {
     }
 }
 
-pub struct WriteGuard {
+pub(crate) struct WriteGuard {
     lock: AsyncRwLock,
 }
 
@@ -284,7 +381,7 @@ impl Drop for WriteGuard {
 // ---------------------------------------------------------------------------
 
 /// Result of `select2`: which side resolved first.
-pub enum Either<A, B> {
+pub(crate) enum Either<A, B> {
     A(A),
     B(B),
 }
@@ -292,7 +389,7 @@ pub enum Either<A, B> {
 /// Poll `a`, then `b`; the first found ready wins, so `a` wins a tie, which
 /// `Peer::until_request` relies on to answer a sync ahead of a ready request.
 /// The loser is dropped, and its `Drop` releases what it registered.
-pub async fn select2<A, B>(a: A, b: B) -> Either<A::Output, B::Output>
+pub(crate) async fn select2<A, B>(a: A, b: B) -> Either<A::Output, B::Output>
 where
     A: Future,
     B: Future,

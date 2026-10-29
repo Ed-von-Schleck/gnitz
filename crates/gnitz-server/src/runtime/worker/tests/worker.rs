@@ -2,9 +2,9 @@ use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
-use crate::runtime::reactor::GroupTargets;
 use crate::runtime::sal::fixtures::test_log;
 use crate::runtime::sal::{GroupData, SalGroup, SalWriter};
+use crate::runtime::w2m::GroupTargets;
 use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{
     make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema,

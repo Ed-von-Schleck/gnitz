@@ -13,13 +13,13 @@ fn lease_ids_wrap_past_zero_and_skip_live_ids() {
     let dropped = r.lease_acks(WorkerSet::ALL).targets().request_id;
     assert_ne!(r.lease_acks(WorkerSet::ALL).targets().request_id, dropped);
 
-    r.next_request_id.set(u32::MAX);
+    r.routes.next_id.set(u32::MAX);
     let top = r.lease_acks(WorkerSet::ALL);
     assert_eq!(top.targets().request_id, u32::MAX);
     let wrapped = r.lease_acks(WorkerSet::ALL);
     assert_eq!(wrapped.targets().request_id, 1, "the id after u32::MAX is 1, not 0");
 
-    r.next_request_id.set(1);
+    r.routes.next_id.set(1);
     let skipped = r.lease_train(WorkerSet::ALL, "ScanSpec");
     assert_eq!(skipped.targets().request_id, 2, "a live lease's id is skipped");
 }

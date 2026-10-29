@@ -15,7 +15,7 @@ const ROOT: usize = 0;
 
 impl Reactor {
     /// Spawn a task that runs detached.
-    pub fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
+    pub(crate) fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
         let slot = self.tasks.borrow_mut().insert(Some(Box::pin(fut)));
         // Schedule immediate first poll.
         RUN_QUEUE.with(|q| q.borrow_mut().push(slot + 1));
@@ -54,7 +54,7 @@ impl Reactor {
     pub(super) fn run_ready(&self) -> bool {
         self.drain_cqes_into_wakers();
         self.drain_all_w2m();
-        self.fire_deadlines();
+        self.timers.fire();
 
         let mut root = false;
         for _ in 0..RUN_QUEUE.with(|q| q.borrow().len()) {
@@ -72,7 +72,7 @@ impl Reactor {
     /// The park is armed only on a pass that sleeps: the publish that takes an
     /// arm spends a cross-process `FUTEX_WAKE`.
     pub(super) fn submit_or_sleep(&self, block: bool) {
-        let until = self.deadlines.borrow().first_key_value().map(|(&(at, _), _)| at);
+        let until = self.timers.earliest();
         let sleep = block
             && run_queue_is_empty()
             && until.is_none_or(|at| at > Instant::now())
@@ -180,7 +180,7 @@ impl Reactor {
 
 /// The keys of tasks whose wakers have fired, in wake order. A task woken several
 /// times before its poll is queued once; `queued[key]` is set while it is.
-pub(super) struct RunQueue {
+struct RunQueue {
     queue: VecDeque<usize>,
     queued: Vec<bool>,
 }
@@ -211,7 +211,7 @@ impl RunQueue {
         key
     }
 
-    pub(super) fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.queue.len()
     }
 
