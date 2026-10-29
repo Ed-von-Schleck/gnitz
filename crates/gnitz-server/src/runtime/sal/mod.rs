@@ -1263,17 +1263,21 @@ pub(crate) struct ReplyRoute {
 
 /// One group addressed to a worker, decoded and owned: a parked read outlives the
 /// SAL bytes it came in, which an inline `Flush` lets the master rewrite.
-pub(crate) struct Inbound {
-    pub(crate) target_id: u64,
-    /// The id the group is answered on; `None` when nothing waits for an
-    /// answer, which [`SalReader::next_request`] refuses for a read.
-    pub(crate) reply: Option<RequestId>,
-    pub(crate) cut: Cut,
-    pub(crate) what: SalRequest<'static>,
-    /// Boxed, so a request moves from its decode to where it is served or parked
-    /// as a few words: held inline, the batch would be copied whole at each of
-    /// those moves, for a request that carries none as well.
-    pub(crate) rows: Option<Box<Batch>>,
+pub(crate) enum Inbound {
+    Read {
+        route: ReplyRoute,
+        read: Read<'static>,
+    },
+    Apply {
+        /// The id the change is acknowledged on; `None` when nothing waits for it.
+        ack: Option<RequestId>,
+        apply: Apply<'static>,
+        /// Boxed, so a request moves from its decode to where it is served as a
+        /// few words: held inline, the batch would be copied whole at each of
+        /// those moves, for a request that carries none as well.
+        rows: Option<Box<Batch>>,
+    },
+    Shutdown,
 }
 
 pub(crate) struct SalReader {
@@ -1369,15 +1373,24 @@ impl SalReader {
             Ok(what) => what,
             Err(e) => undecodable(e),
         };
-        if msg.head.reply.is_none() && matches!(what, SalRequest::Read(_)) {
-            undecodable("a read group carries no request id".into());
-        }
-        Some(Inbound {
-            target_id: control.hdr.target_id,
-            reply: msg.head.reply,
-            cut: self.cut,
-            what,
-            rows: rows.take().map(Box::new),
+        Some(match what {
+            SalRequest::Read(read) => {
+                let Some(request_id) = msg.head.reply else {
+                    undecodable("a read group carries no request id".into())
+                };
+                let route = ReplyRoute {
+                    target_id: control.hdr.target_id,
+                    request_id,
+                    cut: self.cut,
+                };
+                Inbound::Read { route, read }
+            }
+            SalRequest::Apply(apply) => Inbound::Apply {
+                ack: msg.head.reply,
+                apply,
+                rows: rows.take().map(Box::new),
+            },
+            SalRequest::Shutdown => Inbound::Shutdown,
         })
     }
 

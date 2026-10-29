@@ -11,7 +11,7 @@ use std::rc::Rc;
 use crate::catalog::CatalogEngine;
 use crate::query::{DagEngine, DriveHost};
 use crate::runtime::mesh::Mesh;
-use crate::runtime::sal::{Apply, Inbound, Read, ReplyRoute, SalReader, SalRequest};
+use crate::runtime::sal::{Apply, Inbound, Read, ReplyRoute, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::{IndexClaim, PinScope, RelationRegistry};
@@ -100,34 +100,27 @@ impl<'c> WorkerProcess<'c> {
     /// the request arrived inside an exchange wait of a `Tick` or `Backfill`.
     /// Total, so a new request cannot compile without a decision.
     pub(super) fn dispatch(&mut self, req: Inbound, in_drive: bool) {
-        let Inbound { target_id, reply, cut, what, rows } = req;
-        let route = || ReplyRoute {
-            target_id,
-            request_id: reply.expect("a read nobody answers is refused at its decode"),
-            cut,
-        };
-        match what {
-            SalRequest::Shutdown => unsafe { libc::_exit(0) },
+        match req {
+            Inbound::Shutdown => unsafe { libc::_exit(0) },
             // A drive writes views, so a read of one would see the tick half-run:
             // it parks.
-            SalRequest::Read(read)
+            Inbound::Read { route, read }
                 if in_drive
                     && self
                         .catalog
                         .registry
-                        .relation(target_id)
+                        .relation(route.target_id)
                         .is_some_and(|r| r.kind().is_view()) =>
             {
-                self.replies.push_back(Owed::Parked(route(), read))
+                self.replies.push_back(Owed::Parked(route, read))
             }
             // A drive writes no other store, so every other read is answered here,
             // at its place in the SAL — a push behind it must not reach it.
-            SalRequest::Read(read) => {
-                let route = route();
+            Inbound::Read { route, read } => {
                 let answer = answer(self.catalog, &read);
                 self.reply(route, answer);
             }
-            SalRequest::Apply(apply) => {
+            Inbound::Apply { ack, apply, rows } => {
                 let role = drive_role(&apply);
                 if in_drive && role != DriveRole::BesideDrive {
                     gnitz_fatal_abort!("{apply:?} inside an exchange wait — diverged from the master");
@@ -135,7 +128,7 @@ impl<'c> WorkerProcess<'c> {
                 if let Err(e) = self.apply(&apply, rows) {
                     gnitz_fatal_abort!("worker: {apply:?} failed: {e} — aborting for restart");
                 }
-                if let Some(id) = reply {
+                if let Some(id) = ack {
                     self.w2m_writer.send_ack(id);
                 }
                 // Before the next group: a parked read answers from the state its

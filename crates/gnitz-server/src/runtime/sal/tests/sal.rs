@@ -858,10 +858,7 @@ fn a_read_group_without_a_request_id_aborts_internal() {
     log.excl().write(&SalGroup::new(scan(0, &[]))).expect("group fits");
     let mut reader = SalReader::new(log.log(), 0, 1);
     assert!(
-        matches!(
-            reader.next_request(|_, _| None),
-            Some(Inbound { what: SalRequest::Read(_), .. })
-        ),
+        matches!(reader.next_request(|_, _| None), Some(Inbound::Read { .. })),
         "an answered read decodes"
     );
     let _ = reader.next_request(|_, _| None);

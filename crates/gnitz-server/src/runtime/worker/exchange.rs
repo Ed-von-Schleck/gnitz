@@ -30,7 +30,7 @@ impl DriveHost for WorkerProcess<'_> {
             while let Some(req) = self.next_request() {
                 // Once the round is complete the drive goes on; the next wait, or
                 // the top level, serves what the SAL still holds, in order.
-                let read = matches!(req.what, SalRequest::Read(_));
+                let read = matches!(req, Inbound::Read { .. });
                 self.dispatch(req, true);
                 if read && self.mesh.complete() {
                     break;

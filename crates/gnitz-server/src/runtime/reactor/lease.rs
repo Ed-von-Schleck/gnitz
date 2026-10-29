@@ -20,8 +20,7 @@ use crate::runtime::w2m::{RequestId, W2mSlot};
 
 /// Every live lease's request id and what its workers have answered on it.
 pub(super) struct Routes {
-    /// Keyed by [`RequestId::get`], the value a slot is tagged with.
-    map: RefCell<FxHashMap<u32, Route>>,
+    map: RefCell<FxHashMap<RequestId, Route>>,
     /// The next request id a lease starts from.
     next_id: Cell<RequestId>,
 }
@@ -106,7 +105,7 @@ impl Reactor {
     fn alloc_request_id(&self) -> RequestId {
         let routes = self.routes.map.borrow();
         let mut id = self.routes.next_id.get();
-        while routes.contains_key(&id.get()) {
+        while routes.contains_key(&id) {
             id = id.next();
         }
         self.routes.next_id.set(id.next());
@@ -117,7 +116,7 @@ impl Reactor {
     /// workers.
     fn lease(&self, id: RequestId, set: WorkerSet, route: impl FnOnce(WorkerSet) -> Route) -> Lease {
         let workers = set.within(self.w2m.num_workers());
-        self.routes.map.borrow_mut().insert(id.get(), route(workers));
+        self.routes.map.borrow_mut().insert(id, route(workers));
         Lease { reactor: self.clone(), id, set: workers }
     }
 
@@ -171,7 +170,7 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        let route = self.reactor.routes.map.borrow_mut().remove(&self.id.get());
+        let route = self.reactor.routes.map.borrow_mut().remove(&self.id);
         // Matched so an ACK route, which every round drops, drops inline rather
         // than through the route's drop glue.
         match route {
@@ -200,7 +199,7 @@ impl AckLease {
     pub(crate) async fn acks(&self) {
         std::future::poll_fn(|cx| {
             let mut routes = self.0.reactor.routes.map.borrow_mut();
-            let Some(Route::Acks(r)) = routes.get_mut(&self.0.id.get()) else {
+            let Some(Route::Acks(r)) = routes.get_mut(&self.0.id) else {
                 unreachable!("an ACK lease's id routes to its ACKs")
             };
             if r.left == WorkerSet::EMPTY {
@@ -324,7 +323,7 @@ impl TrainLease {
     async fn next_slot(&self, w: usize) -> W2mSlot {
         std::future::poll_fn(|cx| {
             let mut routes = self.lease.reactor.routes.map.borrow_mut();
-            let Some(Route::Train(route)) = routes.get_mut(&self.lease.id.get()) else {
+            let Some(Route::Train(route)) = routes.get_mut(&self.lease.id) else {
                 unreachable!("a train lease's id routes to its train")
             };
             route

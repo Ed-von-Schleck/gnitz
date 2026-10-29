@@ -122,7 +122,7 @@ pub(super) fn frames(rx: &W2mReceiver) -> Vec<Frame> {
     while let Some(slot) = rx.try_read_slot(0) {
         let bytes = slot.bytes().to_vec();
         out.push(Frame {
-            req: slot.request_id,
+            req: slot.request_id.get(),
             ctrl: peek_control_block(&bytes).expect("a control block"),
             bytes,
         });
@@ -403,7 +403,7 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
     assert_eq!(weighted_rows(&got), weighted_rows(&part));
     assert_eq!(reqs(&frames(&rx)), [1]);
     let next = wp.next_request().expect("the second read is still on the SAL");
-    assert_eq!(next.reply, Some(id(2)));
+    assert!(matches!(next, Inbound::Read { route, .. } if route.request_id == id(2)));
 }
 
 /// A round is opened with the drive's own claim, and its close answers every

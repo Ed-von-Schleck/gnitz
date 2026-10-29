@@ -68,11 +68,11 @@ fn pack_prefix(sz: usize, request_id: RequestId) -> u64 {
     (request_id.get() as u64) | ((sz as u64) << 32)
 }
 
-/// The `(sz, request_id)` [`pack_prefix`] stored, the id as [`RequestId::get`]
-/// gave it.
+/// The `(sz, request_id)` [`pack_prefix`] stored; `None` for an id of 0, which
+/// no publish writes.
 #[inline]
-fn unpack_prefix(prefix: u64) -> (usize, u32) {
-    ((prefix >> 32) as usize, prefix as u32)
+fn unpack_prefix(prefix: u64) -> (usize, Option<RequestId>) {
+    ((prefix >> 32) as usize, RequestId::from_wire(prefix as u32))
 }
 
 const _: () = assert!(
@@ -457,9 +457,9 @@ pub struct W2mSlot {
     /// client send unchanged, and [`Self::bytes`] is its tail.
     frame: &'static [u8],
     push_idx: u64,
-    /// The [`RequestId::get`] the worker's publish tagged the slot with: what the
-    /// master routes it by without decoding the frame.
-    pub(crate) request_id: u32,
+    /// The id the worker's publish tagged the slot with: what the master routes
+    /// it by without decoding the frame.
+    pub(crate) request_id: RequestId,
     /// The worker whose ring this slot was read from.
     pub(crate) worker: u32,
     /// The ring it was read from, whose in-flight queue its drop releases through.
@@ -553,6 +553,9 @@ impl WorkerRing {
         }
         debug_assert!(st.read.in_step());
         let (sz, request_id) = unpack_prefix(prefix);
+        let Some(request_id) = request_id else {
+            gnitz_fatal_abort!("w2m::take_next: request id 0 at phys={} — ring corrupt", st.read.phys)
+        };
         // `slot_stride(0)` is 8, so a zero-size slot would pass the span test.
         if sz == 0 || st.read.virt + slot_stride(sz) > vwc {
             gnitz_fatal_abort!(

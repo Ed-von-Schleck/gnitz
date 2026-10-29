@@ -34,7 +34,7 @@ fn an_empty_ring_starts_over_at_its_head() {
         // The second one is published into a ring that holds the first.
         assert!(writer.try_publish(id(1), MSG, |slot| slot.fill(round * 2 + 1)));
         let first = recv.try_read_slot(0).expect("the first message");
-        assert_eq!(first.request_id, round as u32 + 1);
+        assert_eq!(first.request_id.get(), round as u32 + 1);
         assert_eq!(first.frame_bytes(), gnitz_wire::framed(&[round * 2; MSG]));
         assert_eq!(
             first.bytes().as_ptr(),
@@ -208,7 +208,7 @@ fn a_writer_short_of_room_after_a_release_waits_for_the_next() {
             drop(receiver.try_read_slot(0).expect("slot"));
         }
         writer.join().expect("writer thread panicked");
-        assert_eq!(receiver.try_read_slot(0).expect("the big message").request_id, 9);
+        assert_eq!(receiver.try_read_slot(0).expect("the big message").request_id.get(), 9);
     });
 }
 
@@ -257,7 +257,7 @@ fn concurrent_publishes_drain_in_order() {
             while next <= n {
                 match receiver.try_read_slot(0) {
                     Some(s) => {
-                        assert_eq!(s.request_id, next, "{n} frames: out of order");
+                        assert_eq!(s.request_id.get(), next, "{n} frames: out of order");
                         assert_eq!(&s.bytes()[s.control().blob], pad, "{n} frames: blob of {next}");
                         next += 1;
                     }
