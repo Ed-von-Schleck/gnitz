@@ -168,7 +168,7 @@ impl Batch {
     fn rows_with_heap(&self, rows: impl ExactSizeIterator<Item = usize>, slots: u64, budget: usize) -> (usize, usize) {
         let slope = self.schema().row_width();
         let base = wal::WAL_HEADER_SIZE;
-        let mut seen = BlobCache::new(self.string_cells(rows.len()));
+        let mut seen = self.blob_cache(rows.len());
         let mut heap = 0usize;
         let mut fit = 0usize;
         for row in rows {
@@ -235,7 +235,7 @@ impl Batch {
             return None;
         }
         let mut heap = PooledBuf::with_capacity(heap_bytes);
-        let mut cache = BlobCache::new(self.string_cells(count));
+        let mut cache = self.blob_cache(count);
         let block = &mut out[wal::WAL_HEADER_SIZE..heap_at];
         let cache = dedup.then_some(&mut cache);
         fill(&mut DirectWriter::over(

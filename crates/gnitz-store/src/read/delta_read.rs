@@ -73,11 +73,7 @@ impl RelationRegistry {
         let mut filter =
             RowFilter::for_read(&predicate, bound.range(), &view).map_err(|e| format!("delta_read: {e}"))?;
         let chunk_rows = self.config.scan_chunk_rows;
-        let mut ranges = Vec::new();
-        let mut read = |rows: &Batch| {
-            filter.ranges(&rows.as_mem_batch(), &mut ranges);
-            plan.push(rows, &mut ranges).map(drop)
-        };
+        let mut read = |rows: &Batch| plan.push(rows, &mut filter).map(drop);
         if let ReadBound::PkSet(keys) = &bound {
             check_stride("delta_read", id, keys, view.pk_stride())?;
             // The keyed rows of every round, read a chunk at a time.

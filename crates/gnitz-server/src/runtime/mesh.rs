@@ -373,7 +373,7 @@ impl Mesh {
         // consolidated, else concatenated in order.
         let rows = match round.merge {
             true => merge_consolidated(&slices, schema),
-            false => Batch::concat(schema, slices.iter().cloned()),
+            false => Batch::concat(schema, slices.iter().copied()),
         };
         self.part += 1;
         self.in_round = false;

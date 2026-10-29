@@ -9,9 +9,9 @@ use super::batch_pool::{is_tight, PooledBuf};
 use super::merge;
 use super::run::StoredRow;
 use super::scatter::copy_ranges;
+use super::seek::ColPtr;
 use super::string_heap::{self, relocate_german_string_vec, BlobCache};
 use super::writer::DirectWriter;
-use crate::schema::key::compare_pk_ordering;
 use crate::schema::payload_order::{Generic, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::{BatchView, ColumnLocator};
@@ -197,7 +197,7 @@ impl Batch {
     // ── Read accessors ──────────────────────────────────────────────────
 
     /// Live row count.
-    #[inline]
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.count
     }
@@ -351,16 +351,16 @@ impl Batch {
         read_u64_le(&self.data, self.region_start(REG_NULL_BMP) + row * FIXED_REGION_BYTES)
     }
     #[inline(always)]
-    pub fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+    pub(crate) fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
         let off = self.region_start(REG_PAYLOAD_START + payload_col) + row * col_size;
         &self.data[off..off + col_size]
     }
 
-    /// The most string cells `rows` rows of this batch's schema hold: what a
-    /// span-dedup session over them is sized by.
+    /// A span-dedup cache sized for `rows` rows of this batch's schema: the most
+    /// string cells they hold.
     #[inline]
-    pub(super) fn string_cells(&self, rows: usize) -> usize {
-        rows * self.schema.string_payload_slots().count_ones() as usize
+    pub(super) fn blob_cache(&self, rows: usize) -> BlobCache {
+        BlobCache::new(rows * self.schema.string_payload_slots().count_ones() as usize)
     }
 
     // ── Extend methods (building batches row-by-row) ────────────────────
@@ -492,38 +492,49 @@ impl Batch {
         self.commit_row();
     }
 
-    /// Open an [`AppendSession`] over this batch; `hint_rows` sizes its blob
-    /// dedup cache.
-    pub(crate) fn append_session(&mut self, hint_rows: usize) -> AppendSession<'_> {
-        AppendSession {
-            cache: BlobCache::new(self.string_cells(hint_rows)),
-            dst: self,
-        }
-    }
-}
-
-/// An open append into one destination batch: the blob dedup cache every push
-/// reuses.
-pub(crate) struct AppendSession<'d> {
-    dst: &'d mut Batch,
-    cache: BlobCache,
-}
-
-impl AppendSession<'_> {
-    /// [`Batch::carry_heap`] into the session's destination: the `heap_at` to
-    /// push `src`'s rows at.
-    pub(super) fn carry(&mut self, src: &MemBatch<'_>, kept: &[(usize, usize)]) -> Option<usize> {
-        let slots = self.dst.schema.string_payload_slots();
-        self.dst.carry_heap(src, slots, kept)
+    /// Write `rows` rows past the last through `fill`, relocating strings under
+    /// one span-dedup cache. They are counted once `fill` returns, so no reader
+    /// reaches a row before its regions are written.
+    #[inline(always)]
+    pub(crate) fn write_rows<R>(&mut self, rows: usize, fill: impl FnOnce(&mut DirectWriter<'_>) -> R) -> R {
+        let mut cache = self.blob_cache(rows);
+        self.write_at_most(rows, &mut cache, |w| (rows, fill(w)))
     }
 
-    /// Append every listed range of `src`, a batch of the destination's layout,
-    /// in list order: fixed-width regions in bulk, its string cells shifted onto
-    /// its heap when [`Self::carry`] carries it, or relocated under the session's
-    /// cache.
-    pub(crate) fn push_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
+    /// [`Self::write_rows`] under the caller's `cache`, whose every relocation
+    /// landed in this batch's heap, for a `fill` that may write fewer than `rows`
+    /// rows: it returns how many it wrote beside its result, and only those are
+    /// counted.
+    #[inline(always)]
+    pub(super) fn write_at_most<R>(
+        &mut self,
+        rows: usize,
+        cache: &mut BlobCache,
+        fill: impl FnOnce(&mut DirectWriter<'_>) -> (usize, R),
+    ) -> R {
+        self.reserve_rows(rows);
+        self.consolidated = false;
+        let (written, out) = fill(&mut DirectWriter::over(
+            &mut self.data,
+            self.capacity,
+            self.count,
+            rows,
+            &self.schema,
+            &mut self.blob,
+            Some(cache),
+        ));
+        assert!(written <= rows, "write_at_most: more rows written than it had room for");
+        self.count += written;
+        out
+    }
+
+    /// Append every listed range of `src`, a batch of this one's layout, in list
+    /// order: fixed-width regions in bulk, its string cells shifted onto its heap
+    /// when [`Self::carry_heap`] carries it, or relocated under `cache`, whose
+    /// every relocation landed in this batch's heap.
+    fn push_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)], cache: &mut BlobCache) {
         debug_assert!(
-            self.dst.schema.same_regions(src.schema),
+            self.schema.same_regions(src.schema),
             "push_ranges: a source of another layout"
         );
         let total: usize = ranges
@@ -537,41 +548,8 @@ impl AppendSession<'_> {
         if total == 0 {
             return;
         }
-        let heap_at = self.carry(src, ranges);
-        self.write(total, |w| copy_ranges(src, heap_at, ranges, w));
-    }
-
-    /// Write `rows` rows past the destination's last through `fill`, relocating
-    /// strings under the session's cache. They are counted once `fill` returns,
-    /// so no reader reaches a row before its regions are written.
-    #[inline(always)]
-    pub(crate) fn write<R>(&mut self, rows: usize, fill: impl FnOnce(&mut DirectWriter<'_>) -> R) -> R {
-        self.write_at_most(rows, |w| (rows, fill(w)))
-    }
-
-    /// [`Self::write`] for a `fill` that writes only the first of the `rows` it
-    /// has room for, and answers how many ahead of its own result.
-    #[inline(always)]
-    pub(super) fn write_at_most<R>(
-        &mut self,
-        rows: usize,
-        fill: impl FnOnce(&mut DirectWriter<'_>) -> (usize, R),
-    ) -> R {
-        let dst = &mut *self.dst;
-        dst.reserve_rows(rows);
-        dst.consolidated = false;
-        let (written, out) = fill(&mut DirectWriter::over(
-            &mut dst.data,
-            dst.capacity,
-            dst.count,
-            rows,
-            &dst.schema,
-            &mut dst.blob,
-            Some(&mut self.cache),
-        ));
-        assert!(written <= rows, "write_at_most: more rows written than it had room for");
-        dst.count += written;
-        out
+        let heap_at = self.carry_heap(src, self.schema.string_payload_slots(), ranges);
+        self.write_at_most(total, cache, |w| (total, copy_ranges(src, heap_at, ranges, w)));
     }
 }
 
@@ -767,7 +745,7 @@ impl Batch {
         let n = self.count;
         let mut out = Self::with_capacity(out_schema, n);
         let heap_at = out.carry_heap(&self.as_mem_batch(), in_schema.string_payload_slots(), &[(0, n)]);
-        out.append_session(n).write(n, |w| {
+        out.write_rows(n, |w| {
             w.weight_mut().copy_from_slice(self.weight());
             for (pi, col) in in_schema.payload_columns() {
                 w.col_mut(first_slot + pi).copy_from_slice(self.col_data(pi));
@@ -851,17 +829,14 @@ impl Batch {
     pub(crate) fn seek(&self, key: &[u8], hint: Option<usize>) -> usize {
         let (count, stride, pk) = (self.count, self.schema.pk_stride(), self.pk_col_ptr());
         // SAFETY: the PK region holds a key for every row.
-        match hint {
-            None => unsafe { super::seek::seek_lower_bound(count, stride, pk, key) },
-            Some(hint) => unsafe { super::seek::seek_advance_to(count, stride, pk, key, hint) },
-        }
+        unsafe { super::seek::seek_lower_bound(count, stride, pk, key, hint) }
     }
 
     /// The rows whose PK is the OPK `key`, exactly `pk_stride` bytes: none, at
     /// its lower bound, where the batch, which is in key order, holds no such row.
     pub fn pk_rows(&self, key: &[u8]) -> Range<usize> {
         // SAFETY: the PK region holds a key for every row.
-        unsafe { super::seek::seek_pk_rows(self.count, self.schema.pk_stride(), self.pk_col_ptr(), key) }
+        unsafe { super::seek::seek_pk_rows(self.count, self.schema.pk_stride(), self.pk_col_ptr(), key, None) }
     }
 
     /// Whether this batch holds the element of `src`'s row `row`, at any weight.
@@ -877,18 +852,19 @@ impl Batch {
     pub fn key_ranges<'k>(&self, keys: impl IntoIterator<Item = &'k [u8]>, out: &mut Vec<(usize, usize)>) {
         debug_assert!(merge::in_consolidated_order(self));
         out.clear();
+        let (count, stride, pk) = (self.count, self.schema.pk_stride(), self.pk_col_ptr());
         let mut from = 0;
         for key in keys {
-            let lo = self.seek(key, Some(from));
-            from = lo;
-            if lo == self.count {
+            // SAFETY: the PK region holds a key for every row.
+            let rows = unsafe { super::seek::seek_pk_rows(count, stride, pk, key, Some(from)) };
+            if rows.start == count {
                 break;
             }
-            if compare_pk_ordering(self.get_pk_bytes(lo), key).is_eq() {
-                from = super::seek::pk_group_end(self, lo, self.schema.pk_stride());
+            from = rows.end;
+            if !rows.is_empty() {
                 match out.last_mut() {
-                    Some(last) if last.1 == lo => last.1 = from,
-                    _ => out.push((lo, from)),
+                    Some(last) if last.1 == rows.start => last.1 = rows.end,
+                    _ => out.push((rows.start, rows.end)),
                 }
             }
         }
@@ -898,12 +874,13 @@ impl Batch {
     /// this batch's tail, one append setup serving the whole list.
     pub fn append_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
         let rows = range_rows(ranges);
-        // Before the session, which would be opened to copy nothing. An
+        // Before the dedup cache, which would be set up to copy nothing. An
         // all-DELETE push emits one empty range per row.
         if rows == 0 {
             return;
         }
-        self.append_session(rows).push_ranges(src, ranges);
+        let mut cache = self.blob_cache(rows);
+        self.push_ranges(src, ranges, &mut cache);
     }
 
     /// Copy each of `rows` onto this batch's tail at `weight`.
@@ -912,7 +889,7 @@ impl Batch {
             return;
         }
         self.reserve_rows(rows.len());
-        let mut cache = BlobCache::new(self.string_cells(rows.len()));
+        let mut cache = self.blob_cache(rows.len());
         for r in rows {
             self.append_row_from_source(weight, &r.run, r.row, Some(&mut cache));
         }
@@ -983,11 +960,11 @@ impl Batch {
             blob += src.blob.len();
         }
         let mut out = Batch::with_capacity_blob(schema, rows, blob);
-        // One session for every source: its setup would otherwise be paid
-        // per source, which a fold of one-row runs is made of.
-        let mut session = out.append_session(rows);
+        // One dedup cache serves every source, so a fold of one-row runs pays its
+        // setup once.
+        let mut cache = out.blob_cache(rows);
         for src in sources {
-            session.push_ranges(&src, &[(0, src.count)]);
+            out.push_ranges(&src, &[(0, src.count)], &mut cache);
         }
         out
     }
@@ -1059,9 +1036,10 @@ impl Batch {
         row: usize,
         mut blob_cache: Option<&mut BlobCache>,
     ) {
-        if weight == 0 {
-            return;
-        }
+        debug_assert_ne!(
+            weight, 0,
+            "append_row_from_source: zero-weight row (filter before copying)"
+        );
         self.open_row(source.get_pk_bytes(row), weight, source.get_null_word(row));
         let src_heap = source.heap();
         for pi in 0..self.schema.num_payload_cols() {
@@ -1140,8 +1118,8 @@ impl Batch {
     /// Consolidate this batch: rows that stand in consolidated order are
     /// certified where they are, and any others are sorted and weight-folded
     /// into a fresh batch, `survivors` then holding what
-    /// [`merge::consolidate_groups`] found — per output row, the row it was. Left
-    /// empty when the rows stood.
+    /// [`merge::consolidate_groups`] found — per output row, the row it
+    /// was. Left empty when the rows stood.
     pub(crate) fn consolidate_recording(&mut self, survivors: &mut Vec<(u32, u32, i64)>) {
         match self.stands_consolidated() {
             true => self.certify_consolidated(),
@@ -1173,8 +1151,8 @@ impl Batch {
     }
 
     /// Sort and weight-fold `batch` into a fresh certified batch, handing back in
-    /// `survivors` what [`merge::consolidate_groups`] found: per output row, the
-    /// `batch` row it is.
+    /// `survivors` what [`merge::consolidate_groups`] found: per output
+    /// row, the `batch` row it is.
     #[inline(always)]
     fn consolidated_from(batch: &Batch, survivors: &mut Vec<(u32, u32, i64)>) -> Batch {
         let schema = &batch.schema;
@@ -1237,7 +1215,7 @@ impl Batch {
     fn compacted(&self) -> Batch {
         let (n, mb) = (self.count, self.as_mem_batch());
         let mut out = Batch::with_capacity_blob(&self.schema, n, self.blob.len());
-        out.append_session(n).write(n, |w| copy_ranges(&mb, None, &[(0, n)], w));
+        out.write_rows(n, |w| copy_ranges(&mb, None, &[(0, n)], w));
         out.inherit_consolidated(self);
         out
     }
@@ -1296,60 +1274,10 @@ impl RowSource for Batch {
     }
 }
 
-/// A column as `base + row * stride`. Stride 0 reads one shared element for
-/// every row. `base` itself need not lie inside the column: a decoded window is
-/// rebased so that its first row lands on its first cell.
-#[derive(Clone, Copy)]
-pub(crate) struct ColPtr {
-    pub base: *const u8,
-    pub stride: usize,
-}
-
-impl ColPtr {
-    /// Row `i`'s address.
-    #[inline(always)]
-    pub(crate) fn row_ptr(self, i: usize) -> *const u8 {
-        self.base.wrapping_add(i * self.stride)
-    }
-
-    /// Row `i`'s first `len` bytes.
-    ///
-    /// # Safety
-    /// Row `i` is a row of a live column this addresses, and `len` does not
-    /// exceed its element width.
-    #[inline(always)]
-    pub(crate) unsafe fn row<'a>(self, i: usize, len: usize) -> &'a [u8] {
-        std::slice::from_raw_parts(self.row_ptr(i), len)
-    }
-
-    /// Copy rows `start..` of this column of `width`-byte elements onto `dst`,
-    /// `dst.len() / width` rows.
-    ///
-    /// # Safety
-    /// Those rows are rows of a live column this addresses.
-    pub(crate) unsafe fn copy_rows(self, start: usize, width: usize, dst: &mut [u8]) {
-        if self.stride != 0 {
-            return dst.copy_from_slice(std::slice::from_raw_parts(self.row_ptr(start), dst.len()));
-        }
-        if dst.is_empty() {
-            return;
-        }
-        // One element repeated: write it once, then double the written prefix,
-        // so any element width costs O(log rows) copies.
-        dst[..width].copy_from_slice(self.row(0, width));
-        let mut filled = width;
-        while filled < dst.len() {
-            let n = filled.min(dst.len() - filled);
-            dst.copy_within(..n, filled);
-            filled += n;
-        }
-    }
-}
-
 /// A borrowed view of batch rows: an arena of `cap` rows laid out under
 /// `schema`, of which the first `count` are rows. A [`Batch`]'s own, or a WAL
 /// block's fixed bytes, which are an arena exactly as large as its rows.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct MemBatch<'a> {
     pub(in crate::repr) data: &'a [u8],
     /// The layout: region `r` starts at `schema.region_start(r, cap)`.
@@ -1357,14 +1285,14 @@ pub struct MemBatch<'a> {
     pub(in crate::repr) cap: usize,
     pub(in crate::repr) blob: &'a [u8],
     /// Row count of the view. Read from outside through [`MemBatch::len`].
-    pub(crate) count: usize,
+    pub(in crate::repr) count: usize,
     /// An upper bound on the bytes of `blob` no cell references.
     pub(in crate::repr) dead_heap: usize,
 }
 
 impl<'a> MemBatch<'a> {
     /// Row count of the view.
-    #[inline]
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.count
     }
@@ -1375,7 +1303,7 @@ impl<'a> MemBatch<'a> {
 
     /// Byte width of the PK region per row.
     #[inline(always)]
-    pub fn pk_stride(&self) -> usize {
+    pub(crate) fn pk_stride(&self) -> usize {
         self.schema.pk_stride()
     }
 
@@ -1407,7 +1335,7 @@ impl<'a> MemBatch<'a> {
     /// Wrapping sum of the weights of rows `[start, end)`, over one
     /// bounds-checked slice of the weight region.
     #[inline]
-    pub fn sum_weights(&self, start: usize, end: usize) -> i64 {
+    pub(crate) fn sum_weights(&self, start: usize, end: usize) -> i64 {
         self.weight()[start * FIXED_REGION_BYTES..end * FIXED_REGION_BYTES]
             .as_chunks::<FIXED_REGION_BYTES>()
             .0
@@ -1423,7 +1351,7 @@ impl<'a> MemBatch<'a> {
 
     /// Payload column `pi` as a contiguous slice (`count * width` bytes).
     #[inline(always)]
-    pub fn col_data(&self, pi: usize) -> &'a [u8] {
+    pub(crate) fn col_data(&self, pi: usize) -> &'a [u8] {
         self.region(REG_PAYLOAD_START + pi)
     }
 
@@ -1445,7 +1373,7 @@ impl<'a> MemBatch<'a> {
         read_i64_le(self.data, self.region_start(REG_WEIGHT) + row * FIXED_REGION_BYTES)
     }
     #[inline(always)]
-    pub fn get_null_word(&self, row: usize) -> u64 {
+    pub(crate) fn get_null_word(&self, row: usize) -> u64 {
         read_u64_le(self.data, self.region_start(REG_NULL_BMP) + row * FIXED_REGION_BYTES)
     }
     #[inline(always)]
@@ -1520,7 +1448,7 @@ pub(crate) fn write_to_batch(
         return Batch::empty_with_schema(schema);
     }
     let mut b = Batch::with_capacity_blob(schema, rows, max_blob);
-    b.append_session(rows).write(rows, write_fn);
+    b.write_rows(rows, write_fn);
     if b.blob.is_empty() {
         b.blob = PooledBuf::default();
     }

@@ -3,7 +3,7 @@
 //! read. What a region's bytes mean is `encoding`'s.
 
 use super::encoding::Encoding;
-use crate::repr::error::StorageError;
+use super::error::StorageError;
 use gnitz_wire::{read_u64_le, write_u64_le};
 
 use StorageError::Corrupt;
@@ -78,15 +78,31 @@ impl ShardHeader {
         })
     }
 
-    /// Every field but the descriptor digest, which is stamped over the result.
-    pub(crate) fn write(&self, header: &mut [u8]) {
-        write_u64_le(header, OFF_MAGIC, SHARD_MAGIC);
-        write_u64_le(header, OFF_VERSION, SHARD_VERSION);
-        write_u64_le(header, OFF_ROW_COUNT, self.row_count as u64);
-        write_u64_le(header, OFF_RETRACTIONS, self.retractions as u64);
-        write_u64_le(header, OFF_FILE_NPC, self.file_npc as u64);
-        write_u64_le(header, OFF_FLAGS, if self.skeleton { SHARD_FLAG_SKELETON } else { 0 });
-        write_u64_le(header, OFF_BODY_CHECKSUM, self.body_checksum);
+    /// [`read`](Self::read), then the descriptive prefix it sizes, refused where
+    /// it is cut short or does not match the digest stamped over it.
+    pub(crate) fn read_prefix(path: &str, data: &[u8]) -> Result<Self, StorageError> {
+        let header = Self::read(data)?;
+        let prefix = data
+            .get(..desc_len(header.file_npc))
+            .ok_or(Corrupt("shorter than its directory"))?;
+        if desc_digest(path, prefix) != read_u64_le(prefix, OFF_DESC_CHECKSUM) {
+            return Err(Corrupt("descriptor digest"));
+        }
+        Ok(header)
+    }
+
+    /// Every field, then the descriptor digest over `prefix` (this header and the
+    /// directory already written into it), seeded with `path`'s basename.
+    pub(crate) fn stamp(&self, path: &str, prefix: &mut [u8]) {
+        write_u64_le(prefix, OFF_MAGIC, SHARD_MAGIC);
+        write_u64_le(prefix, OFF_VERSION, SHARD_VERSION);
+        write_u64_le(prefix, OFF_ROW_COUNT, self.row_count as u64);
+        write_u64_le(prefix, OFF_RETRACTIONS, self.retractions as u64);
+        write_u64_le(prefix, OFF_FILE_NPC, self.file_npc as u64);
+        write_u64_le(prefix, OFF_FLAGS, if self.skeleton { SHARD_FLAG_SKELETON } else { 0 });
+        write_u64_le(prefix, OFF_BODY_CHECKSUM, self.body_checksum);
+        let desc = desc_digest(path, prefix);
+        write_u64_le(prefix, OFF_DESC_CHECKSUM, desc);
     }
 }
 

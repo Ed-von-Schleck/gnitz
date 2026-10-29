@@ -1,10 +1,10 @@
-use super::super::batch::Batch;
 use super::super::codebook::Codebook;
-use super::super::scatter::UnifiedSet;
-use super::super::shard_file::ShardWriteOpts;
-use super::super::string_heap::{carried_dead, long_bytes_outside};
+use super::super::file::ShardWriteOpts;
 use super::tests::{build, wide_string};
 use super::*;
+use crate::repr::scatter::UnifiedSet;
+use crate::repr::string_heap::{carried_dead, long_bytes_outside};
+use crate::repr::Batch;
 use crate::schema::key::probe_key;
 use crate::schema::SchemaColumn;
 use crate::test_support::{
@@ -334,13 +334,13 @@ fn pk_filter_bench() {
             };
             let (path, i) = instructions.measure(|| write("instructions"));
             let shard = MappedShard::open(path.to_str().unwrap(), &schema).unwrap();
-            assert_eq!(shard.has_shard_filter(), !skip_pk_filter);
+            assert_eq!(shard.has_pk_filter(), !skip_pk_filter);
             let per_row = [i, cycles.measure(|| write("cycles")).1].map(|n| n as f64 / rows as f64);
             (shard, per_row)
         });
         let probes: Vec<u64> = (0..rows).map(|row| probe_key(with.0.get_pk_bytes(row))).collect();
         let (admitted, probe) =
-            instructions.measure(|| probes.iter().filter(|&&p| with.0.shard_filter_may_contain(p)).count());
+            instructions.measure(|| probes.iter().filter(|&&p| with.0.pk_filter_may_contain(p)).count());
         assert_eq!(admitted, rows);
         println!(
             "pk_filter_bench {rows:>7} rows: {:.1} instr/row and {:.1} cycles/row with the filter, \

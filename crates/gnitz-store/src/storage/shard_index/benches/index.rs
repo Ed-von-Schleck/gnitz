@@ -6,7 +6,7 @@ use super::tests::trailing_gk;
 use super::tests::trailing_key_batch;
 use crate::storage::Cut;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64, Rng};
-use gnitz_zset::schema::key::probe_key;
+use gnitz_zset::schema::probe_key;
 
 /// The two read entries over a tree the upkeep built from scattered spills, at
 /// a PK stride in each width arm: instructions per `ShardIndex::find_pk_bytes`,

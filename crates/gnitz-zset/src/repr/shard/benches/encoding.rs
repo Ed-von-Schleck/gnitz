@@ -1,7 +1,6 @@
 use super::tests::{key_region, pack};
 use super::*;
-use crate::repr::batch::ColPtr;
-use crate::repr::seek::seek_lower_bound;
+use crate::repr::seek::{seek_lower_bound, ColPtr};
 use crate::test_support::Rng;
 use gnitz_wire::{FixedInt, TypeCode};
 
@@ -152,7 +151,7 @@ fn key_bench() {
             // SAFETY: `raw` holds `N` rows of `stride` bytes.
             probes
                 .iter()
-                .map(|p| unsafe { seek_lower_bound(N, stride, pk, black_box(p)) })
+                .map(|p| unsafe { seek_lower_bound(N, stride, pk, black_box(p), None) })
                 .sum::<usize>()
         });
         let (in_image, packed) = instructions.measure(|| {

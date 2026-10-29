@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 
 use super::batch::{range_rows, MemBatch};
 use super::batch_pool::{self, is_tight};
-use super::codebook::Codebook;
+use super::shard::Codebook;
 use gnitz_wire::TypeCode;
 use gnitz_wire::{Heap, HeapValue, RowSource};
 use rustc_hash::FxHashMap;
@@ -314,7 +314,7 @@ thread_local! {
 /// copied once. Its map is pooled, and taken at the first relocation.
 pub(crate) struct BlobCache {
     map: Option<SpanMap>,
-    /// String cells the session relocates at most: what its map is sized and
+    /// String cells the cache relocates at most: what its map is sized and
     /// chosen by.
     cells: usize,
 }
@@ -328,7 +328,7 @@ impl BlobCache {
     pub(super) fn map(&mut self) -> &mut SpanMap {
         let cells = self.cells;
         self.map.get_or_insert_with(|| {
-            // Clearing a map costs its capacity, whatever it held, so a session
+            // Clearing a map costs its capacity, whatever it held, so a cache
             // takes none larger than twice its own cells — and none smaller
             // than its reserve, which would grow it.
             let reserve = cells.min(BLOB_CACHE_RESERVE_CAP);

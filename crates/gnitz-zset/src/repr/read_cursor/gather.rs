@@ -101,8 +101,7 @@ impl PkSetGather {
             if split && c.current_is_skeleton() {
                 skeletons.push(c.current_pk_bytes(), c.current_weight);
             } else {
-                let (src, row) = c.current_position();
-                picks.push((src as u32, row as u32, c.current_weight));
+                picks.push(c.current_pick());
             }
         });
         let mut out = gather_rows(&self.cursor.sources, &self.cursor.schema, &picks);

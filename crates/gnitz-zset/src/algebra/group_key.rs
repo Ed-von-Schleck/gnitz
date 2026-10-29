@@ -280,7 +280,7 @@ impl GroupOutKey {
     /// output-PK order; `None` where they need not.
     pub(crate) fn runs(&self, batch: &Batch) -> Option<Vec<(usize, usize)>> {
         let mb = &batch.as_mem_batch();
-        let n = mb.count;
+        let n = mb.len();
         match &self.key {
             // One run, with no key to compute.
             _ if n <= 1 || self.is_global() => Some(equal_runs(n, |_| ())),
@@ -297,7 +297,7 @@ impl GroupOutKey {
     /// else sorted.
     pub(crate) fn numbered(&self, batch: &Batch) -> GroupOrdinals {
         let mb = &batch.as_mem_batch();
-        let n = mb.count;
+        let n = mb.len();
         // A wide key's identity is a digest, and a sort compares the bytes.
         // Nor do too few rows pay for a hash table.
         let hashes =
@@ -333,8 +333,8 @@ impl GroupOutKey {
 /// without it.
 #[inline(never)]
 fn packed_identity<L: IdentityLoop>(p: &KeyPacker, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
-    let few = |k: usize| k * PACK_ROWS_MIN_SPARSITY <= mb.count;
-    let every = rows == [(0, mb.count)];
+    let few = |k: usize| k * PACK_ROWS_MIN_SPARSITY <= mb.len();
+    let every = rows == [(0, mb.len())];
     if every || p.packs_by_column() && !(few(rows.len()) && few(crate::repr::range_rows(rows))) {
         let (keys, w) = (p.keys(mb), p.out_stride);
         return body.run(|r| gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w]));

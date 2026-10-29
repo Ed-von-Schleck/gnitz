@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_zset::schema::key::probe_key;
+use gnitz_zset::schema::probe_key;
 
 /// Keys are derived exactly as production derives them — from a PK's OPK
 /// bytes — so these exercise the real fingerprint, not raw counters.

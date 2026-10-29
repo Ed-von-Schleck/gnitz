@@ -12,7 +12,7 @@ const UNLADDERED: [&str; 4] = ["lib", "main", "tests", "test_support"];
 ///
 /// `ladder` lists the tiers bottom first: a rung may name itself and the rungs
 /// of every earlier tier, and rungs sharing a tier are incomparable. Every
-/// entry of `src_root` must be a rung or one of [`UNLADDERED`].
+/// entry of `src_root` must be a rung or one of `UNLADDERED`.
 ///
 /// It reads the name each `crate::` path leads with, so a crate-root item and a
 /// grouped `crate::{…}` import are refused along with a higher rung. It does

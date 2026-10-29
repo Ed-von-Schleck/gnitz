@@ -590,7 +590,7 @@ fn pk_filter_follows_whether_the_store_is_probed() {
             "spills and compaction outputs"
         );
         let shards = table_shards(&t);
-        assert!(shards.iter().all(|s| s.has_shard_filter() == filtered), "{rs:?}");
+        assert!(shards.iter().all(|s| s.has_pk_filter() == filtered), "{rs:?}");
     }
 }
 

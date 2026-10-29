@@ -1,8 +1,10 @@
 //! `Run` — one sorted row block, whatever backs it.
 //!
-//! Every tier of the LSM stores the same thing: a `(PK, payload)`-ordered,
-//! consolidated block of rows. Only the backing differs — an in-heap [`Batch`]
-//! for the memtable and RAM tiers, an mmap'd [`MappedShard`] on disk.
+//! Every tier of the LSM stores a sorted, consolidated block of rows:
+//! `(PK, payload)`-ordered, or, for a capacity-bounded view's skeleton shard, one
+//! (PK, summed weight) row per key with no payload. Only the backing differs — an
+//! in-heap [`Batch`] for the memtable and RAM tiers, an mmap'd [`MappedShard`] on
+//! disk.
 //!
 //! Both variants own their backing via `Rc`, so a `ReadCursor` or [`StoredRow`]
 //! holding a `Run` carries no borrow of the table that produced it.
@@ -10,10 +12,10 @@
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::repr::batch::{Batch, ColPtr};
-use crate::repr::merge::ColumnarSource;
-use crate::repr::scatter::{mem_batch_to_unified, DecodedColumns, UnifiedSource};
-use crate::repr::shard_reader::MappedShard;
+use crate::repr::batch::Batch;
+use crate::repr::scatter::{mem_batch_to_unified, ColumnarSource, DecodedColumns, UnifiedSource};
+use crate::repr::seek::ColPtr;
+use crate::repr::shard::MappedShard;
 use crate::schema::payload_order::{Generic, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{Heap, RowSource};

@@ -200,7 +200,7 @@ const KEY_CHUNK: usize = 256;
 /// [`route_rows`] for a packed key, packed a chunk of rows at a time.
 #[inline(never)]
 fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker, nw: usize) {
-    let (rows, width) = (mb.count, packer.out_stride);
+    let (rows, width) = (mb.len(), packer.out_stride);
     let mut keys = vec![0u8; rows.min(KEY_CHUNK) * width];
     for start in (0..rows).step_by(KEY_CHUNK) {
         let n = (rows - start).min(KEY_CHUNK);

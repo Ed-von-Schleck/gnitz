@@ -11,8 +11,14 @@ use gnitz_expr::{BatchView, ColumnLocator};
 use gnitz_wire::{zip_cells, RowSource, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS};
 
 use crate::repr::range_rows;
-use crate::schema::key::{KeySpec, PADDING_LOCATOR};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
+
+/// Filler for a fixed locator array's unused slots; nothing reads it.
+const PADDING_LOCATOR: ColumnLocator = ColumnLocator::Pk {
+    byte_off: 0,
+    size: 0,
+    type_code: TypeCode::U8,
+};
 
 // ---------------------------------------------------------------------------
 // Key columns
@@ -88,6 +94,7 @@ const FOLD_INLINE_COLS: usize = MAX_PK_COLUMNS;
 
 /// The columns one 128-bit row digest folds, and which of its two byte layouts
 /// the digest is taken over. Over no columns it is the digest of no bytes.
+#[derive(Clone)]
 pub(crate) struct FoldCols {
     locs: Vec<ColumnLocator>,
     /// One to `FOLD_INLINE_COLS` columns, each fixed-width: the key bytes are
@@ -176,6 +183,7 @@ struct KeyCol {
 }
 
 /// Packs a join key, a group key or an index span into a contiguous OPK region.
+#[derive(Clone)]
 pub(crate) struct KeyPacker {
     /// The packed columns in key order, between the bitmap and the fold: the
     /// first `n_cols`. Inline, so a span's packer built per batch allocates nothing.
@@ -212,9 +220,10 @@ impl KeyPacker {
         Ok(Self::finish(cols, false, FoldCols::new(Vec::new())))
     }
 
-    /// The packer of `span` alone, each column at its own type: no bitmap, no fold.
-    pub(crate) fn of_span(span: &KeySpec) -> Self {
-        let cols = span.locators().iter().map(|&loc| (loc, loc.type_code()));
+    /// The packer of a span over `locs`, each column at its own type: no bitmap,
+    /// no fold.
+    pub(crate) fn of_span(locs: impl IntoIterator<Item = ColumnLocator>) -> Self {
+        let cols = locs.into_iter().map(|loc| (loc, loc.type_code()));
         Self::finish(cols, false, FoldCols::new(Vec::new()))
     }
 
@@ -245,7 +254,7 @@ impl KeyPacker {
     }
 
     /// The output PK columns this packer's bytes fill, in key order.
-    fn key_columns(&self) -> impl Iterator<Item = SchemaColumn> + '_ {
+    pub(super) fn key_columns(&self) -> impl Iterator<Item = SchemaColumn> + '_ {
         let bitmap = self.has_bitmap.then_some(BITMAP_COL);
         let fold = (!self.fold.is_empty()).then_some(FOLD_COL);
         bitmap.into_iter().chain(self.cols().iter().map(|c| c.out)).chain(fold)

@@ -7,8 +7,9 @@ use gnitz_wire::{
     low_bits_mask, payload_bytes, validate_user_identifier, BitIter, CatalogColumn, ColTabRow, ColType, FixedInt,
     FkRef, IdxTabRow, IdxTabSlot, RowSource, SchemaTabRow, TableProps, ViewParts,
 };
+use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{key::KeySpec, SchemaDescriptor};
+use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashSet;
 
 use super::sys_reads::IdSet;

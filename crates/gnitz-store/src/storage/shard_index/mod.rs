@@ -8,11 +8,11 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use super::manifest::{self, ManifestEntry, ShardSet};
+use super::pk_ranges_overlap;
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
 use gnitz_zset::repr::StorageError;
 use gnitz_zset::repr::{guard_slot, Codebook, MappedShard};
-use gnitz_zset::schema::key::pk_ranges_overlap;
 use gnitz_zset::schema::SchemaDescriptor;
 
 mod index;
@@ -151,7 +151,7 @@ impl ShardEntry {
         if !pk_ranges_overlap(self.pk_min.pk_bytes(), self.pk_max.pk_bytes(), key, key) {
             return None;
         }
-        if !self.shard.shard_filter_may_contain(filter_key) {
+        if !self.shard.pk_filter_may_contain(filter_key) {
             return None;
         }
         Some(self.shard.pk_rows(key)).filter(|rows| !rows.is_empty())

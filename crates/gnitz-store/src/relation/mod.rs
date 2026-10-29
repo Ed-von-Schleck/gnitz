@@ -6,8 +6,8 @@
 use gnitz_foundation::env::env_num;
 use rustc_hash::FxHashMap;
 
-use gnitz_zset::algebra::index_entries;
-use gnitz_zset::schema::{key::KeySpec, SchemaDescriptor};
+use gnitz_zset::algebra::{index_entries, KeySpec};
+use gnitz_zset::schema::SchemaDescriptor;
 
 pub use crate::storage::Cut;
 use crate::storage::{RecoverySource, Table};
@@ -77,8 +77,8 @@ impl SecondaryIndex {
         *self.store.schema()
     }
 
-    pub fn key_spec(&self) -> KeySpec {
-        self.key_spec
+    pub fn key_spec(&self) -> &KeySpec {
+        &self.key_spec
     }
 
     pub fn is_unique(&self) -> bool {

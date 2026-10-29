@@ -1,17 +1,32 @@
 use super::*;
 use crate::repr::batch_pool::MAX_POOLED_BYTES;
-use crate::repr::shard_file::ShardWriteOpts;
+use crate::repr::ShardWriteOpts;
 use crate::repr::{Batch, BatchBuilder, MappedShard};
 use crate::schema::SchemaColumn;
 use crate::test_support::{
-    arb_fold_case, assert_folds, create_read_cursor, fold_batch, make_batch_u128, make_schema_pk_u64_payload_string,
-    make_schema_u128_i64, make_schema_u64_i64, map_shard, payload0_i64, row_key, u64_pk_schema, weighted_rows, zset_of,
-    RowKey,
+    arb_fold_case, assert_folds, fold_batch, make_batch_u128, make_schema_pk_u64_payload_string, make_schema_u128_i64,
+    make_schema_u64_i64, map_shard, payload0_i64, row_key, u64_pk_schema, weighted_rows, zset_of, RowKey,
 };
 use gnitz_wire::{PkKeys, TypeCode};
 use proptest::prelude::*;
 use std::ops::ControlFlow;
 use std::rc::Rc;
+
+/// A cursor over `batches` and `shards`, one run each.
+pub(super) fn create_read_cursor(
+    batches: &[Rc<Batch>],
+    shards: &[Rc<MappedShard>],
+    schema: SchemaDescriptor,
+) -> ReadCursor {
+    from_runs(
+        batches
+            .iter()
+            .map(|b| Run::Mem(Rc::clone(b)))
+            .chain(shards.iter().cloned().map(Run::Shard)),
+        schema,
+        batches.len() + shards.len(),
+    )
+}
 
 /// A consolidated `Rc<Batch>` over [`make_schema_u128_i64`]: `(pk, weight, payload)`
 /// rows, (PK, payload)-sorted.
@@ -180,7 +195,7 @@ proptest! {
                 let mut capped = Vec::new();
                 let cursor = match prefixes.first() {
                     Some(first) => {
-                        let first = PkBuf::from_bytes(first).widened(stride);
+                        let first = group_floor(first, stride);
                         from_runs_in_band(runs.iter().cloned(), s, runs.len(), first.pk_bytes(), None)
                     }
                     None => empty_cursor(s),

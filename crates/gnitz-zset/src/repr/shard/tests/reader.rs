@@ -1,11 +1,9 @@
-use super::super::batch::Batch;
-use super::super::batch_builder::BatchBuilder;
 use super::super::codebook::Codebook;
-use super::super::merge::ColumnarSource;
-use super::super::scatter::UnifiedSet;
-use super::super::shard_file::ShardWriteOpts;
+use super::super::file::ShardWriteOpts;
 use super::*;
-use crate::repr::error::StorageError;
+use crate::repr::scatter::{ColumnarSource, UnifiedSet};
+use crate::repr::StorageError;
+use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     make_batch, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, mix, payload0_i64,
@@ -164,7 +162,7 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
         assert_eq!(shard.pk_at(r).pk_bytes(), key, "{label}: key by value, row {r}");
         assert_eq!(shard.pk_rows(key), want.pk_rows(key), "{label}: rows of row {r}'s key");
         assert!(
-            shard.shard_filter_may_contain(crate::schema::key::probe_key(key)),
+            shard.pk_filter_may_contain(crate::schema::key::probe_key(key)),
             "{label}: PK filter false negative on row {r}"
         );
         let lb = (0..n).find(|&i| want.get_pk_bytes(i) == key).unwrap();
@@ -1088,7 +1086,7 @@ fn a_filterless_shard_has_an_empty_trailing_entry() {
     let filter = spans_of(&image).pop().unwrap();
     assert_eq!((filter.size, filter.encoding), (0, Encoding::Raw));
     let shard = MappedShard::open(&shard_path, &schema).unwrap();
-    assert!(!shard.has_shard_filter());
+    assert!(!shard.has_pk_filter());
     assert_eq!(shard.verify_body(), Ok(()));
 }
 

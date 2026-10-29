@@ -14,13 +14,13 @@ use super::{
     fold_destinations, CompactionKind, FLSMLevel, LevelGuard, ShardEntry, ShardIndex, CANCEL_PERCENT,
     GUARD_FILE_THRESHOLD, L0, L0_COMPACT_THRESHOLD, L1, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL, UPKEEP_LEVY,
 };
+use crate::storage::pk_ranges_overlap;
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::ShardWriteOpts;
 use gnitz_zset::repr::StorageError;
 use gnitz_zset::repr::{merge_guard, Codebook, MappedShard};
-use gnitz_zset::schema::key::pk_ranges_overlap;
 
 /// One fold the tree owes: the shards it merges and where the merge goes.
 struct Fold {

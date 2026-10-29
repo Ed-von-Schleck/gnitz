@@ -5,8 +5,8 @@ use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    make_batch, make_int_batch, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk, pk_payload_schema, rekey_plan,
-    u64_pk_schema, weighted_rows,
+    make_batch, make_int_batch, make_schema_u64_i64, opk_pk, pk_payload_schema, rekey_plan, u64_pk_schema,
+    weighted_rows,
 };
 use gnitz_wire::MAX_COLUMNS;
 
@@ -330,7 +330,10 @@ fn a_reindex_keys_each_row_by_the_opk_image_of_its_key_column() {
     let out = rekey_plan(&schema, &[1], &[1], NullKeys::Keep).evaluate_map_batch(&batch);
     assert_eq!(out.len(), rows.len());
     for (r, &(_, w, v)) in rows.iter().enumerate() {
-        assert_eq!(out.get_pk_bytes(r), opk_pk(&make_schema_i64pk_i64(), &[v as u128]));
+        assert_eq!(
+            out.get_pk_bytes(r),
+            opk_pk(&pk_payload_schema(&[TypeCode::I64]), &[v as u128])
+        );
         assert_eq!(out.get_weight(r), w);
         assert_eq!(gnitz_wire::read_i64_le(out.col_data(0), r * 8), v);
     }

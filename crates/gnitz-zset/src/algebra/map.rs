@@ -35,8 +35,8 @@ enum PkSource {
     /// Copy the input PK region verbatim, into an output schema whose PK is the
     /// input's.
     Inherit,
-    /// Pack the reindex columns' OPK bytes contiguously into the output PK — the
-    /// `_join_pk` of an equijoin / GROUP BY repartition. Its stride is the key
+    /// Pack the reindex columns' OPK bytes contiguously into the output PK: a
+    /// join's `_join_pk`, or a set operation's element key. Its stride is the key
     /// slots' summed widths, which may differ from the input's: a slot can be
     /// wider than its column (U64 joined with I64 packs as I128), and a string
     /// key packs as a U128 hash.
@@ -182,7 +182,7 @@ pub struct MapPlan {
 /// written, to the [`FoldCols`] digest of its payload columns, so equal rows
 /// share a PK. Two distinct rows whose 128-bit digests collide become one
 /// element; accepted, not checked.
-fn reindex_hash_row(output: &mut DirectWriter<'_>, fold: &FoldCols) {
+fn stamp_hash_row_pks(output: &mut DirectWriter<'_>, fold: &FoldCols) {
     let (first, n) = (output.first_row(), output.rows());
     // The PK *is* the digest, so the OPK region is its big-endian bytes.
     const KEY_BYTES: usize = std::mem::size_of::<u128>();
@@ -386,7 +386,7 @@ impl MapPlan {
         // The reserved rows are uninitialized: `resolve_map` gives every output
         // payload slot one sink, and the writes below cover the PK, weight and
         // null regions.
-        out.append_session(total).write(total, |out| {
+        out.write_rows(total, |out| {
             match &self.pk_source {
                 PkSource::Inherit => {
                     let stride = src.schema().pk_stride();
@@ -410,7 +410,7 @@ impl MapPlan {
             }
             rebase_copied_strings(self.ev.moves().copies(), out, src.blob(), heap_at);
             if let PkSource::HashRow(fold) = &self.pk_source {
-                reindex_hash_row(out, fold);
+                stamp_hash_row_pks(out, fold);
             }
         });
     }

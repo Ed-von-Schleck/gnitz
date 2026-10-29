@@ -5,16 +5,15 @@ use std::borrow::Cow;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
-use super::batch::Batch;
 use super::codebook::Codebook;
 use super::encoding::*;
+use super::error::StorageError;
 use super::layout::*;
-use super::shard_filter;
-use crate::repr::error::StorageError;
+use super::pk_filter;
+use crate::repr::Batch;
 use crate::schema::SchemaColumn;
 use gnitz_wire::{
-    read_u64_le, write_u64_le, FixedInt, Heap, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK,
-    REG_WEIGHT,
+    read_u64_le, FixedInt, Heap, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -57,14 +56,15 @@ fn pack_words(src: &[u8], word: FixedInt) -> Option<(Encoding, Vec<u8>)> {
 fn pack_fixed_column(col: &SchemaColumn, pi: usize, src: &[u8], nulls: &[u8]) -> Option<(Encoding, Vec<u8>)> {
     let n = nulls.len() / FIXED_REGION_BYTES;
     let width = col.size();
-    let framed = FixedInt::from_type_code(col.type_code)
+    let fi = FixedInt::from_type_code(col.type_code);
+    let framed = fi
         .and_then(|fi| for_encode(src, fi))
         .filter(|image| aligned(image.len()) < aligned(src.len()));
     let limit = framed.as_ref().map_or(src.len(), Vec::len) / 2;
     let is_null = |row: usize| gnitz_wire::null_word_get(read_u64_le(nulls, row * FIXED_REGION_BYTES), pi);
     // A column under half NULL has more cells than half the region holds.
     let sparse = (col.nullable && (0..n).filter(|&r| is_null(r)).count() > n / 2)
-        .then(|| sparse_encode(src, width, FixedInt::from_type_code(col.type_code), is_null))
+        .then(|| sparse_encode(src, width, fi, is_null))
         .filter(|image| aligned(image.len()) < aligned(limit));
     let limit = sparse.as_ref().map_or(limit, Vec::len);
     let dict = (dict_image_len(n, 2) < limit && sample_repeats(n, |row| &src[row * width..][..width]))
@@ -234,7 +234,7 @@ impl Batch {
         );
         // A store nothing point-probes writes no filter.
         let filter = (!opts.skip_pk_filter)
-            .then(|| shard_filter::build(regions[REG_PK], schema.pk_stride()))
+            .then(|| pk_filter::build(regions[REG_PK], schema.pk_stride()))
             .flatten();
         let nulls = regions[REG_NULL_BMP];
         let mut images: Vec<(Encoding, Cow<[u8]>)> = Vec::with_capacity(regions.len() + 1);
@@ -302,14 +302,12 @@ impl Batch {
             skeleton,
             body_checksum: body.digest(),
         }
-        .write(&mut header);
-        let desc = desc_digest(path, &header);
-        write_u64_le(&mut header, OFF_DESC_CHECKSUM, desc);
+        .stamp(path, &mut header);
         file.write_all_at(&header, 0)?;
         Ok(())
     }
 }
 
 #[cfg(test)]
-#[path = "tests/shard_file.rs"]
+#[path = "tests/file.rs"]
 mod tests;

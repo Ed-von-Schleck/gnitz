@@ -6,8 +6,7 @@ use std::rc::Rc;
 use super::super::run::Run;
 use super::{ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
-use crate::repr::merge::ColumnarSource;
-use crate::repr::scatter::UnifiedSet;
+use crate::repr::scatter::{ColumnarSource, UnifiedSet};
 use crate::schema::payload_order::with_payload_cmp;
 use gnitz_wire::RowSource;
 
@@ -19,7 +18,8 @@ impl ReadCursor {
             !self.current_is_skeleton(),
             "a skeleton row has no payload to copy; hydrate its key"
         );
-        batch.append_row_from_source(weight, &self.sources[self.current_entry_idx], self.current_row, None);
+        let (src, row) = self.row_at(self.current);
+        batch.append_row_from_source(weight, src, row, None);
     }
 
     /// Up to `max_rows` rows in merge order, consolidated, each a whole (PK, payload)
@@ -41,12 +41,12 @@ impl ReadCursor {
         // Per source, the rows this drain can emit: its current row on to where the drive stops.
         let mut windows = std::mem::take(&mut self.drain_windows);
         windows.clear();
-        windows.extend(self.states.iter().map(|s| s.position..s.position));
-        windows[self.current_entry_idx].start = self.current_row;
+        windows.extend(self.states.iter().map(|s| s.start..s.start));
+        windows[self.current.src as usize].start = self.current.row as usize;
         let mut order = std::mem::take(&mut self.merge_order);
         self.drain_sorted_into(max_rows, &mut order);
         for (w, s) in windows.iter_mut().zip(&self.states) {
-            w.end = s.position;
+            w.end = s.start;
         }
         if self.order.coarsen {
             let sources = &self.sources;
@@ -70,7 +70,7 @@ impl ReadCursor {
     /// Every remaining row in merge order, consolidated.
     pub fn materialize(mut self) -> Rc<Batch> {
         if let [Run::Mem(rc)] = &self.sources[..] {
-            let whole = self.valid && self.current_row == 0 && self.states[0].end == rc.count;
+            let whole = self.valid && self.current.row == 0 && self.states[0].end == rc.count;
             if whole {
                 return Rc::clone(rc);
             }
@@ -82,8 +82,8 @@ impl ReadCursor {
 
     /// Up to `max_rows` rows of `i`, the one live source, as one slice copy.
     fn drain_single(&mut self, i: usize, max_rows: usize, skeletons: &mut SkeletonKeys) -> Batch {
-        // `position` is already past the committed row.
-        let start = self.current_row;
+        // `start` is already past the committed row.
+        let start = self.current.row as usize;
         let row_count = (self.states[i].end - start).min(max_rows);
         let batch = match &self.sources[i] {
             Run::Shard(shard) if shard.is_skeleton() => {
@@ -103,7 +103,7 @@ impl ReadCursor {
                 slice
             }
         };
-        self.states[i].position = start + row_count;
+        self.states[i].start = start + row_count;
         self.advance_single(i);
         batch
     }
@@ -113,11 +113,7 @@ impl ReadCursor {
     fn drain_sorted_into(&mut self, max_rows: usize, out: &mut Vec<(u32, u32, i64)>) {
         out.clear();
         out.reserve(max_rows.min(self.estimated_length()));
-        out.push((
-            self.current_entry_idx as u32,
-            self.current_row as u32,
-            self.current_weight,
-        ));
+        out.push(self.current_pick());
         let mut first_undrained = None;
         with_payload_cmp!(self.schema, |payload| self.drive(payload, |gs, gr, nw| {
             if out.len() == max_rows {

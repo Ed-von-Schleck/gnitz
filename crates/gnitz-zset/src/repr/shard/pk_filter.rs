@@ -25,12 +25,9 @@ use xorf::{BinaryFuse8, BinaryFuse8Ref, Descriptor, DmaSerializable, FilterRef};
 /// digest, so distinct PKs collide, and the construction requires distinct keys
 /// (asserted under `debug_assertions`).
 ///
-/// `None` on a construction failure, which writes the shard filterless: a
-/// permanent read-cost regression for that one file, and a repeated one means
-/// the key derivation has broken, hence the warning here rather than a silent
-/// `None` at the call site. Do not add a caller-side retry — the crate already
-/// reseeds up to 1000 times internally, each iteration O(n), and a second
-/// unbounded loop would sit on the compaction path.
+/// `None` on a construction failure, which writes the shard filterless — a
+/// permanent read-cost regression for that one file — and logs a warning: a
+/// repeated one means the key derivation has broken.
 pub(crate) fn build(pk_region: &[u8], stride: usize) -> Option<Vec<u8>> {
     let mut keys: Vec<u64> = Vec::with_capacity(pk_region.len() / stride);
     let mut prev: Option<&[u8]> = None;
@@ -104,5 +101,5 @@ pub(crate) fn parse(region: &[u8]) -> Option<BinaryFuse8Ref<'_>> {
 }
 
 #[cfg(test)]
-#[path = "tests/shard_filter.rs"]
+#[path = "tests/pk_filter.rs"]
 mod tests;

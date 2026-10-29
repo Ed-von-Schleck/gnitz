@@ -12,10 +12,10 @@ fn a_cached_relocation_copies_a_span_once() {
     assert_eq!((dst_blob, first), (src_blob, second));
 }
 
-/// A session takes a pooled map sized for its own cells, so a one-cell session
-/// is not handed the map a 50 000-span one returned.
+/// A cache takes a pooled map sized for its own cells, so a one-cell cache is
+/// not handed the map a 50 000-span one returned.
 #[test]
-fn a_session_takes_a_map_of_its_own_size() {
+fn a_cache_takes_a_map_of_its_own_size() {
     const SPANS: usize = 50_000;
     let mut src_blob = Vec::new();
     let cells: Vec<[u8; 16]> = (0..SPANS)

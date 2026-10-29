@@ -53,8 +53,8 @@ fn map_ranges_bench() {
         MapPlan::from_wire(schema, &MapKind::HashRow { cols }).unwrap()
     };
 
-    // --- Reindex on column 1, the source PK and both payload columns kept — the
-    // equijoin / GROUP BY repartition shape. Column 0 is what puts a
+    // --- Reindex on column 1, the source PK and both payload columns kept — an
+    // equijoin's repartition shape. Column 0 is what puts a
     // `ColumnLocator::Pk` copy in the loop. Then the same map dropping NULL keys,
     // whose survivor runs shorten as the NULLs thicken.
     let reindex = |schema: &SchemaDescriptor, nulls| rekey_plan(schema, &[1], &[0, 1, 2], nulls);

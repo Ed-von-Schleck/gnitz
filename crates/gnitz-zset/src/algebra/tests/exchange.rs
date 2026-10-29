@@ -53,7 +53,7 @@ fn assert_routes(plan: &ScatterPlan, b: &Batch, what: &str, owner: impl Fn(&MemB
     let mb = b.as_mem_batch();
     for nw in [1, 2, 4, 7] {
         let mut want = vec![Vec::new(); if plan.is_broadcast() { 1 } else { nw }];
-        for row in (0..mb.count).filter(|&r| mb.get_weight(r) != 0) {
+        for row in (0..mb.len()).filter(|&r| mb.get_weight(r) != 0) {
             want[owner(&mb, row, nw)].push(row as u32);
         }
         // A pool left over from a wider round.

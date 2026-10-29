@@ -1,20 +1,22 @@
 //! Opaque read cursor: N-way merge over in-memory batches + mmap'd shards.
 //!
 //! Produces rows in (PK, payload) order with inline ghost elimination
-//! (net weight=0 rows are skipped).
+//! (net weight=0 rows are skipped). Over a skeleton run, a PK group holding a
+//! skeleton row comes out as that one coarse row: a split drain sets its key
+//! aside for hydration, and a raw drain refuses it.
 
 use std::cmp::Ordering;
 use std::ops::{ControlFlow, Range};
 
 use crate::repr::batch::{Batch, MemBatch};
 use crate::repr::loser_tree::{HeapNode, LoserTree};
-use crate::repr::merge::{self, ColumnarSource, MergeOrder, PosCursor};
+use crate::repr::merge::{self, MergeOrder};
+use crate::repr::scatter::ColumnarSource;
 use crate::repr::seek::gallop_by;
-use crate::repr::shard_reader::MappedShard;
-use crate::schema::key::compare_pk_ordering;
+use crate::repr::shard::MappedShard;
+use crate::schema::key::{compare_pk_ordering, group_floor};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::PkBuf;
 
 mod gather;
 mod output;
@@ -62,6 +64,14 @@ impl SkeletonKeys {
     }
 }
 
+/// A row the cursor stood on, by source and row: readable through
+/// [`ReadCursor::row_at`] after the cursor has moved on.
+#[derive(Clone, Copy)]
+pub(crate) struct CursorRow {
+    src: u32,
+    row: u32,
+}
+
 // ---------------------------------------------------------------------------
 // ReadCursor
 // ---------------------------------------------------------------------------
@@ -72,7 +82,10 @@ pub struct ReadCursor {
     /// clamps them all, so an identity two runs share cannot reach single-source
     /// mode.
     sources: Vec<Run>,
-    states: Vec<PosCursor>,
+    /// Per source, the rows still to walk: `start` is the next row, `end` the row
+    /// count or a range seek's clamp for the cursor's life. A reposition may
+    /// leave `start` past `end`, which leaves the walk empty.
+    states: Vec<Range<usize>>,
     /// The N-way merge tournament, sized once from `sources.len()` — which never
     /// changes — and re-played in place by each reposition. Idle while `mode` is
     /// `Some`.
@@ -92,19 +105,19 @@ pub struct ReadCursor {
     // Current row state
     pub valid: bool,
     pub current_weight: i64,
-    current_entry_idx: usize,
-    current_row: usize,
+    /// The row the cursor stands on, while `valid`.
+    current: CursorRow,
 }
 
 impl ReadCursor {
     /// The one live source, or `None` for none or several. Re-derived rather than
     /// the source set being narrowed: a seek is backward-capable, so a later one
     /// at a lower key can re-liven a source an earlier range seek emptied.
-    fn live_single(states: &[PosCursor]) -> Option<usize> {
+    fn live_single(states: &[Range<usize>]) -> Option<usize> {
         let mut live = states
             .iter()
             .enumerate()
-            .filter_map(|(i, st)| st.is_valid().then_some(i));
+            .filter_map(|(i, st)| (!st.is_empty()).then_some(i));
         match (live.next(), live.next()) {
             (Some(a), None) => Some(a),
             _ => None,
@@ -146,10 +159,10 @@ impl ReadCursor {
         debug_assert_eq!(start.len(), self.schema.pk_stride());
         debug_assert!(end.is_none_or(|e| e.len() == self.schema.pk_stride()));
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
-            state.position = src.seek(start, None);
+            state.start = src.seek(start, None);
             if let Some(end) = end {
                 // `end` lands at or after `start`'s landing.
-                state.end = state.end.min(src.seek(end, Some(state.position)));
+                state.end = state.end.min(src.seek(end, Some(state.start)));
             }
         }
         self.rebuild_and_advance();
@@ -160,7 +173,7 @@ impl ReadCursor {
     #[cfg(test)]
     pub(crate) fn rewind(&mut self) {
         for state in self.states.iter_mut() {
-            state.position = 0;
+            state.start = 0;
         }
         self.rebuild_and_advance();
     }
@@ -198,7 +211,7 @@ impl ReadCursor {
     /// Backward-capable: each source searches its full row range.
     fn reposition_to(&mut self, key: &[u8]) {
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
-            state.position = src.seek(key, Some(state.position));
+            state.start = src.seek(key, Some(state.start));
         }
         self.rebuild_and_advance();
     }
@@ -236,7 +249,7 @@ impl ReadCursor {
         heap: &mut LoserTree,
         sources: &[Run],
         order: MergeOrder,
-        states: &mut [PosCursor],
+        states: &mut [Range<usize>],
         lags: impl Fn(&Run, usize) -> bool,
         gallop: impl Fn(&Run, usize) -> usize,
         less: &impl Fn(&HeapNode, &HeapNode) -> bool,
@@ -247,7 +260,7 @@ impl ReadCursor {
             if !lags(&sources[src], row) {
                 break;
             }
-            states[src].position = gallop(&sources[src], states[src].position);
+            states[src].start = gallop(&sources[src], states[src].start);
             heap.step_top(order.head(sources, src, &states[src]), less);
         }
     }
@@ -268,8 +281,7 @@ impl ReadCursor {
                 if key.len() == stride {
                     self.advance_to_forward(key);
                 } else {
-                    // The prefix over an all-zero rest is its group's lower bound.
-                    self.advance_to_forward(PkBuf::from_bytes(key).widened(stride).pk_bytes());
+                    self.advance_to_forward(group_floor(key, stride).pk_bytes());
                 }
                 self.valid && self.current_pk_starts_with(key)
             }
@@ -279,14 +291,15 @@ impl ReadCursor {
     /// PK region of the current row as raw bytes, without copying. The single PK
     /// accessor for any width — correct for compound/wide PKs.
     pub fn current_pk_bytes(&self) -> &[u8] {
-        self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
+        let (src, row) = self.row_at(self.current);
+        src.get_pk_bytes(row)
     }
 
     /// Whether the rows under this cursor's position outnumber its sources: a
     /// row walked costs more than one source's seek.
     #[inline]
     pub fn passed_more_than_a_seek(&self) -> bool {
-        self.states.iter().map(|s| s.position).sum::<usize>() > self.sources.len()
+        self.states.iter().map(|s| s.start).sum::<usize>() > self.sources.len()
     }
 
     /// Whether the current row came out of a capacity-bounded view's skeleton
@@ -299,7 +312,7 @@ impl ReadCursor {
     #[inline]
     fn current_is_skeleton(&self) -> bool {
         debug_assert!(self.valid, "current_is_skeleton on an invalid cursor");
-        self.sources[self.current_entry_idx].is_skeleton()
+        self.row_at(self.current).0.is_skeleton()
     }
 
     /// The current row as a `(source, row)` pair for the shared [`RowSource`]
@@ -310,21 +323,27 @@ impl ReadCursor {
     #[inline]
     pub fn current_row_source(&self) -> (&impl RowSource, usize) {
         debug_assert!(self.valid, "current_row_source on an invalid cursor");
-        (&self.sources[self.current_entry_idx], self.current_row)
+        self.row_at(self.current)
     }
 
-    /// The current row as `(source index, row)`: with [`Self::source_at`], a
-    /// handle on the row that stays readable after the cursor moves on.
+    /// The current row as a handle that stays readable through [`Self::row_at`]
+    /// after the cursor moves on.
     #[inline]
-    pub(crate) fn current_position(&self) -> (usize, usize) {
+    pub(crate) fn current_position(&self) -> CursorRow {
         debug_assert!(self.valid, "current_position on an invalid cursor");
-        (self.current_entry_idx, self.current_row)
+        self.current
     }
 
-    /// The source [`Self::current_position`] indexes.
+    /// The current row as a merge pick: `(source, row, net weight)`.
+    #[inline]
+    fn current_pick(&self) -> (u32, u32, i64) {
+        (self.current.src, self.current.row, self.current_weight)
+    }
+
+    /// The source and row of a handle [`Self::current_position`] issued.
     #[inline(always)]
-    pub(crate) fn source_at(&self, idx: usize) -> &Run {
-        &self.sources[idx]
+    pub(crate) fn row_at(&self, at: CursorRow) -> (&Run, usize) {
+        (&self.sources[at.src as usize], at.row as usize)
     }
 
     /// Whether the current row's PK begins with `key`, a whole PK included.
@@ -395,13 +414,8 @@ impl ReadCursor {
 
     #[inline]
     fn cmp_current_payload<P: PayloadOrder>(&self, mb: &MemBatch, i: usize, payload: P) -> Ordering {
-        payload.compare(
-            &self.schema,
-            &self.sources[self.current_entry_idx],
-            self.current_row,
-            mb,
-            i,
-        )
+        let (src, row) = self.row_at(self.current);
+        payload.compare(&self.schema, src, row, mb, i)
     }
 
     /// Inside `mb[i]`'s PK group, forward-seek to the first live element `>= mb[i]`.
@@ -418,10 +432,10 @@ impl ReadCursor {
         } = &mut *self;
         let (sources, schema) = (&*sources, &*schema);
         let lags = |s: &Run, r: usize| payload.compare_full(schema, s, r, mb, i).is_lt();
-        let gallop = |s: &Run, pos: usize| gallop_by(s.row_count(), pos, |r| lags(s, r));
+        let gallop = |s: &Run, pos: usize| gallop_by(s.row_count(), Some(pos), |r| lags(s, r));
         match *mode {
             // The other sources' windows are empty, and a forward seek keeps them so.
-            Some(src) => states[src].position = gallop(&sources[src], states[src].position),
+            Some(src) => states[src].start = gallop(&sources[src], states[src].start),
             None => {
                 let less = merge::merge_less(schema, sources, *order, payload);
                 Self::seek_phase(tree, sources, *order, states, lags, gallop, &less);
@@ -454,9 +468,7 @@ impl ReadCursor {
     /// Land on the first positive-weight row whose PK begins with `prefix`, no
     /// longer than the PK; `true` iff there is one.
     pub(crate) fn seek_positive_with_prefix(&mut self, prefix: &[u8]) -> bool {
-        let stride = self.schema.pk_stride();
-        // Zero-padded, a prefix is the least key beginning with it.
-        self.advance_to(PkBuf::from_bytes(prefix).widened(stride).pk_bytes());
+        self.advance_to(group_floor(prefix, self.schema.pk_stride()).pk_bytes());
         self.walk_positive_with_prefix_until(prefix, |_| ControlFlow::Break(()))
     }
 
@@ -512,14 +524,13 @@ impl ReadCursor {
 
     /// Commit (or invalidate from) the `(source_idx, row, net_weight)` an advance
     /// emitted — the one writer of the `current_*` state, for both modes. The PK
-    /// stays as `(current_entry_idx, current_row)` and is decoded on demand.
+    /// stays as `current` and is decoded on demand.
     #[inline]
     fn commit_emitted(&mut self, emitted: Option<(usize, usize, i64)>) {
         if let Some((idx, row, weight)) = emitted {
             self.valid = true;
             self.current_weight = weight;
-            self.current_entry_idx = idx;
-            self.current_row = row;
+            self.current = CursorRow { src: idx as u32, row: row as u32 };
         } else {
             self.valid = false;
         }
@@ -531,9 +542,9 @@ impl ReadCursor {
     #[inline]
     fn advance_single(&mut self, i: usize) {
         let state = &mut self.states[i];
-        let emitted = state.is_valid().then(|| {
-            let row = state.position;
-            state.position += 1;
+        let emitted = (state.start < state.end).then(|| {
+            let row = state.start;
+            state.start += 1;
             (i, row, self.sources[i].get_weight(row))
         });
         self.commit_emitted(emitted);
@@ -577,9 +588,9 @@ impl ReadCursor {
     /// Upper bound on the rows a walk from HERE emits — the pre-size a batch that
     /// walk fills wants. The per-source windows (so a range seek's clamp is in
     /// it) PLUS the row the cursor sits on: a drive CONSUMES the group it emits,
-    /// so `position` is already past a row still to be visited.
+    /// so `start` is already past a row still to be visited.
     pub fn estimated_length(&self) -> usize {
-        let ahead: usize = self.states.iter().map(|s| s.end.saturating_sub(s.position)).sum();
+        let ahead: usize = self.states.iter().map(|s| s.len()).sum();
         ahead + usize::from(self.valid)
     }
 }
@@ -635,8 +646,12 @@ fn build(
         );
         let count = run.row_count();
         if count > 0 {
+            debug_assert!(
+                count < u32::MAX as usize,
+                "merge source exceeds the heap node's u32 row"
+            );
             sources.push(run);
-            states.push(PosCursor::over(0..count));
+            states.push(0..count);
         }
     });
     let order = MergeOrder::leading(schema.pk_stride(), sources.iter().any(ColumnarSource::is_skeleton));
@@ -652,8 +667,7 @@ fn build(
         schema,
         valid: false,
         current_weight: 0,
-        current_entry_idx: 0,
-        current_row: 0,
+        current: CursorRow { src: 0, row: 0 },
     };
     position(&mut cursor);
     cursor

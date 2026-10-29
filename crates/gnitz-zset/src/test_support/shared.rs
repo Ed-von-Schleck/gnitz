@@ -51,13 +51,8 @@ pub fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch 
 /// honestly unconsolidated, for tests whose rows are unsorted or that exercise the
 /// sort/fold paths themselves.
 pub fn make_batch_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-    let mut b = BatchBuilder::new(schema);
-    for &(pk, w, val) in rows {
-        b.begin_row(pk as u128, w);
-        b.put_int(val as u128);
-        b.end_row();
-    }
-    b.finish()
+    let rows: Vec<(u128, i64, i64)> = rows.iter().map(|&(pk, w, v)| (pk as u128, w, v)).collect();
+    make_batch_u128_raw(schema, &rows)
 }
 
 /// A U64 PK ahead of the `payload` columns — the counterpart to
@@ -66,12 +61,6 @@ pub fn u64_pk_schema(payload: &[SchemaColumn]) -> SchemaDescriptor {
     let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
     cols.extend_from_slice(payload);
     SchemaDescriptor::new(&cols, &[0])
-}
-
-/// Every wire `TypeCode`; since any column type is a valid payload, this
-/// doubles as the arbitrary-payload-type strategy.
-pub fn arb_type_code() -> impl Strategy<Value = TypeCode> {
-    prop::sample::select(TypeCode::ALL)
 }
 
 /// A schema of 1..=8 columns interleaving `1..=max_pk` PK columns — PK-eligible,
@@ -87,7 +76,7 @@ pub fn arb_schema(max_pk: usize) -> impl Strategy<Value = SchemaDescriptor> {
     (1usize..=8)
         .prop_flat_map(move |n_cols| {
             (
-                prop::collection::vec((arb_type_code(), any::<bool>()), n_cols),
+                prop::collection::vec((prop::sample::select(TypeCode::ALL), any::<bool>()), n_cols),
                 Just((0..n_cols as u32).collect::<Vec<u32>>()).prop_shuffle(),
                 1usize..=n_cols.min(max_pk),
             )
@@ -471,7 +460,7 @@ pub fn zset_sum(inputs: &[Batch], schema: &SchemaDescriptor) -> HashMap<RowKey, 
 /// nullable-string schema under the generic comparator at a narrow PK, a wide
 /// one, and one whose PK columns sit among the payload columns in an order other
 /// than the schema's.
-pub fn fold_schemas() -> Vec<SchemaDescriptor> {
+fn fold_schemas() -> Vec<SchemaDescriptor> {
     use TypeCode::*;
     let generic = |pk: &[TypeCode]| {
         let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
@@ -521,7 +510,7 @@ const FOLD_STRS: [&[u8]; 4] = [
     b"another-long-spilling-value",
 ];
 
-/// A [`fold_schemas`] schema and rows over up to eight keys of its stride that
+/// A `fold_schemas` schema and rows over up to eight keys of its stride that
 /// differ in their first byte, their middle one and their last — so a wide key's
 /// rows can share a prefix, tie on the span past it and differ behind it — with
 /// small weight and payload domains, so folds and ghost cancels are common.
@@ -554,7 +543,7 @@ pub fn arb_fold_case() -> impl Strategy<Value = (SchemaDescriptor, Vec<FoldRow>)
     })
 }
 
-/// `rows` as an unconsolidated batch over a [`fold_schemas`] schema. A NULL and a
+/// `rows` as an unconsolidated batch over a `fold_schemas` schema. A NULL and a
 /// zero hold the same cell bytes and must not fold; each long string lands at its
 /// own heap offset, and equal ones must.
 ///

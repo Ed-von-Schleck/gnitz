@@ -10,7 +10,7 @@ use crate::test_support::{
 use gnitz_wire::TypeCode;
 
 /// `append_row_from_source` copies the PK verbatim and carries the
-/// caller's weight, not the source row's; a zero weight appends nothing.
+/// caller's weight, not the source row's.
 #[test]
 fn append_row_from_source_carries_the_callers_weight() {
     let schema = make_schema_u64_i64();
@@ -18,7 +18,6 @@ fn append_row_from_source_carries_the_callers_weight() {
 
     let mut dst = Batch::with_capacity(&schema, 1);
     dst.append_row_from_source(-1, &src, 0, None);
-    dst.append_row_from_source(0, &src, 0, None);
 
     assert_eq!(dst.count, 1);
     assert_eq!(dst.get_pk_bytes(0), &0xDEAD_BEEFu64.to_be_bytes());

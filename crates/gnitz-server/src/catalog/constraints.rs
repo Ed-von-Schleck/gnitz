@@ -3,7 +3,7 @@
 
 use gnitz_store::relation::Relation;
 use gnitz_wire::{FkAction, PkColList};
-use gnitz_zset::schema::key::KeySpec;
+use gnitz_zset::algebra::KeySpec;
 
 use super::CatalogEngine;
 
@@ -104,7 +104,7 @@ impl CatalogEngine {
             fks_as_parent: as_parent.to_vec(),
             uniques: rel.map_or_else(Vec::new, |r| {
                 r.unique_indexes_to_check()
-                    .map(|ic| (ic.cols(), ic.key_spec()))
+                    .map(|ic| (ic.cols(), ic.key_spec().clone()))
                     .collect()
             }),
         }

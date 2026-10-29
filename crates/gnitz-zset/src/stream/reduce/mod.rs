@@ -268,7 +268,6 @@ fn emit_groups(
         consolidate_group(&mut out, mark);
     }
 
-    gnitz_debug!("op_reduce: in={} groups={groups} out={}", delta.count, out.len());
     out.certify_consolidated();
     out
 }

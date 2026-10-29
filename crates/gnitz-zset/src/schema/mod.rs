@@ -7,8 +7,9 @@ use gnitz_expr::SchemaRefusal;
 /// The schema descriptor, homed in `gnitz-expr` so the client links the same
 /// definition. Re-exported so a crate linking `gnitz-zset` alone can name it.
 pub use gnitz_expr::{decode_schema_block, encode_schema_block, SchemaColumn, SchemaDescriptor};
+pub use key::{group_band, key_above, probe_key, range_band};
 
-pub mod key;
+pub(crate) mod key;
 pub(crate) mod payload_order;
 
 /// Builder for a derived schema: its PK columns, then its payload columns.

@@ -17,7 +17,7 @@ impl IdentityLoop for Over<'_> {
 
 /// Every row's identity.
 fn identities(key: &GroupOutKey, mb: &MemBatch) -> Vec<u128> {
-    let all = [(0, mb.count)];
+    let all = [(0, mb.len())];
     key.with_identity(mb, &all, Over(&all))
 }
 

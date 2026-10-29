@@ -1,17 +1,14 @@
 //! Order-preserving primary-key (OPK) primitives.
 //!
 //! These pure layout/key operations compare two OPK regions in byte order,
-//! pack a region into a fixed-width sort key, derive the half-open key band a
-//! `KeyRange` walks over a store's PK, and compose a multi-column key span
-//! ([`KeySpec`]). The per-column codec is `gnitz_wire::pk`'s, shared with the
-//! client.
+//! pack a region into a fixed-width sort key, fingerprint an OPK span, and
+//! derive the half-open key band a `KeyRange` walks over a store's PK. The
+//! per-column codec is `gnitz_wire::pk`'s, shared with the client.
 use std::cmp::Ordering;
 
-use gnitz_wire::{KeyRange, PkBuf, PkListRole, NARROW_PK_MAX_BYTES};
-use gnitz_wire::{RowSource, TypeCode, MAX_PK_COLUMNS};
+use gnitz_wire::{KeyRange, PkBuf, NARROW_PK_MAX_BYTES};
 
-use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
-use gnitz_expr::ColumnLocator;
+use crate::schema::SchemaDescriptor;
 
 /// Typed lexicographic OPK ordering of two **equal-length** PK regions — the
 /// comparator of seeks, group walks and probes. Slice order
@@ -26,15 +23,6 @@ pub(crate) fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
         Ordering::Equal if a.len() > NARROW_PK_MAX_BYTES => a.cmp(b),
         ord => ord,
     }
-}
-
-/// The **inclusive** OPK ranges `[min, max]` and `[lo, hi]` intersect — whether a
-/// run or shard holding `[min, max]` can answer about a key the caller's bound
-/// admits. A half-open upper bound passed as `hi` over-approximates, which is
-/// the safe direction.
-#[inline]
-pub fn pk_ranges_overlap(min: &[u8], max: &[u8], lo: &[u8], hi: &[u8]) -> bool {
-    max >= lo && min <= hi
 }
 
 // ---------------------------------------------------------------------------
@@ -187,101 +175,6 @@ pub fn probe_key(opk: &[u8]) -> u64 {
     gnitz_wire::checksum(opk)
 }
 
-/// Filler for a fixed locator array's unused slots; nothing reads it.
-pub(crate) const PADDING_LOCATOR: ColumnLocator = ColumnLocator::Pk {
-    byte_off: 0,
-    size: 0,
-    type_code: TypeCode::U8,
-};
-
-/// A key span: columns at their own types, packed tightly in order. A fixed
-/// array, so a spec is `Copy` and building one allocates nothing.
-#[derive(Clone, Copy)]
-pub struct KeySpec {
-    n: u8,
-    /// Sum of the column widths, so the row path re-sums nothing.
-    key_size: u8,
-    locs: [ColumnLocator; MAX_PK_COLUMNS],
-}
-
-impl KeySpec {
-    /// The span's columns, in order.
-    pub(crate) fn locators(&self) -> &[ColumnLocator] {
-        &self.locs[..self.n as usize]
-    }
-
-    /// The span of a secondary index on `cols` of `owner`.
-    ///
-    /// `Err` where `cols` breaks `gnitz_wire::validate_index_key`.
-    pub fn new(cols: &[u32], owner: &SchemaDescriptor) -> Result<Self, String> {
-        gnitz_wire::validate_index_key(cols, owner.num_columns(), owner.pk_cols().len(), |c| {
-            owner.columns()[c as usize].type_code
-        })
-        .map_err(|rule| format!("Index: {}", rule.for_role(PkListRole::ColumnList)))?;
-        let mut spec = KeySpec {
-            n: 0,
-            key_size: 0,
-            locs: [PADDING_LOCATOR; MAX_PK_COLUMNS],
-        };
-        for &c in cols {
-            let loc = owner.locate(c as usize);
-            spec.locs[spec.n as usize] = loc;
-            spec.n += 1;
-            spec.key_size += loc.size() as u8;
-        }
-        Ok(spec)
-    }
-
-    /// The index schema this spec's entries land in: the key columns, then
-    /// `source`'s PK columns, all in the PK.
-    pub fn index_schema(&self, source: &SchemaDescriptor) -> SchemaDescriptor {
-        let mut b = self.key_columns();
-        b.push_pk_of(source);
-        b.finish().expect("KeySpec::new bounds the index schema")
-    }
-
-    /// The key columns alone, all in the PK: one row's PK region is one span.
-    pub fn span_schema(&self) -> SchemaDescriptor {
-        self.key_columns()
-            .finish()
-            .expect("KeySpec::new admits its key columns")
-    }
-
-    fn key_columns(&self) -> DerivedSchema {
-        let mut b = DerivedSchema::new();
-        self.locators()
-            .iter()
-            .for_each(|loc| b.push_pk(SchemaColumn::new(loc.type_code(), false)));
-        b
-    }
-
-    /// Span width in bytes — the sum of the column widths.
-    #[inline]
-    pub fn key_size(&self) -> usize {
-        self.key_size as usize
-    }
-
-    /// One row's leading-key span, `key_size()` bytes; `None` when any indexed
-    /// column is NULL: the row is unindexed.
-    pub fn span(&self, mb: &impl RowSource, row: usize) -> Option<PkBuf> {
-        let mut key = PkBuf::zeroed(0);
-        for loc in self.locators() {
-            if loc.is_null(mb, row) {
-                return None;
-            }
-            key.push(loc.size(), loc.opk_image(mb, row), false);
-        }
-        Some(key)
-    }
-
-    /// Split an index entry `[span ‖ source PK]` at `key_size()`; nothing is
-    /// decoded.
-    pub fn split_entry<'a>(&self, entry: &'a [u8]) -> (&'a [u8], &'a [u8]) {
-        debug_assert!(entry.len() > self.key_size(), "index entry shorter than its span");
-        entry.split_at(self.key_size())
-    }
-}
-
 /// The half-open OPK key band `[start, end)` `range` walks over a store keyed by
 /// `schema`, whose leading PK columns are `range`'s columns at their own widths:
 /// every key from the group of `eq ‖ first` through the group of `eq ‖ last`.
@@ -304,10 +197,15 @@ pub fn range_band(schema: &SchemaDescriptor, range: &KeyRange) -> Option<(PkBuf,
 
 /// The half-open band `[start, end)` of every `stride`-wide key beginning with a
 /// group in `[first, last]`; `end == None` runs to the top of the key space.
-/// Zero-padding `first` to the key width is what makes it its group's minimum.
 /// `None` = provably empty.
 pub fn group_band(first: &[u8], last: &[u8], stride: usize) -> Option<(PkBuf, Option<PkBuf>)> {
-    band(PkBuf::from_bytes(first).widened(stride), key_above(last, stride))
+    band(group_floor(first, stride), key_above(last, stride))
+}
+
+/// The least `stride`-wide key beginning with `group`: the group zero-padded.
+#[inline(always)]
+pub(crate) fn group_floor(group: &[u8], stride: usize) -> PkBuf {
+    PkBuf::from_bytes(group).widened(stride)
 }
 
 /// The least `stride`-wide key above every key beginning with `group`: the group

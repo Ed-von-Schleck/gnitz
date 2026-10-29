@@ -8,18 +8,16 @@ use std::cell::OnceCell;
 use std::ops::Range;
 use std::rc::Rc;
 
-use super::batch::ColPtr;
-use super::batch::{write_to_batch, Batch};
-use super::batch_pool::PooledBuf;
 use super::encoding::*;
+use super::error::StorageError;
 use super::layout::*;
-use super::merge::ColumnarSource;
 use super::mmap::Mmap;
-use super::scatter::DecodedColumns;
-use super::scatter::UnifiedSource;
-use super::shard_filter;
-use super::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
-use crate::repr::error::StorageError;
+use super::pk_filter;
+use crate::repr::batch::{write_to_batch, Batch};
+use crate::repr::scatter::{ColumnarSource, DecodedColumns, UnifiedSource};
+use crate::repr::seek::{seek_lower_bound, seek_pk_rows, ColPtr};
+use crate::repr::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
+use crate::repr::PooledBuf;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{
     read_u64_le, FixedInt, Heap, PkBuf, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK,
@@ -212,7 +210,7 @@ pub struct MappedShard {
     null_pad_mask: u64,
     heap: ShardHeap,
     /// The validated PK filter, or `None` when the file carries none.
-    shard_filter: Option<BinaryFuse8Ref<'static>>,
+    pk_filter: Option<BinaryFuse8Ref<'static>>,
     /// The words `null_bmp` points into when the file is wider than `schema`:
     /// the file's null words without the bits of the columns `schema` lacks.
     _narrowed_nulls: Option<Box<[u8]>>,
@@ -237,8 +235,9 @@ pub struct ShardDirectory {
 }
 
 impl ShardDirectory {
-    /// The directory of the shard at `path`, checked as [`MappedShard::open`]
-    /// checks it.
+    /// The header and directory of the shard at `path`, refused wherever
+    /// [`MappedShard::open`] would refuse it under every schema; no region is
+    /// checked against one.
     pub fn read(path: &str) -> Result<Self, StorageError> {
         let (mmap, header) = MappedShard::map(path)?;
         let spans = region_spans(mmap.as_slice(), header.file_npc)?;
@@ -316,14 +315,7 @@ impl MappedShard {
             return Err(Corrupt("empty file"));
         }
         let mmap = Mmap::from_file(&file, len)?;
-        let data = mmap.as_slice();
-        let header = ShardHeader::read(data)?;
-        let prefix = data
-            .get(..desc_len(header.file_npc))
-            .ok_or(Corrupt("shorter than its directory"))?;
-        if desc_digest(path, prefix) != read_u64_le(prefix, OFF_DESC_CHECKSUM) {
-            return Err(Corrupt("descriptor digest"));
-        }
+        let header = ShardHeader::read_prefix(path, mmap.as_slice())?;
         Ok((mmap, header))
     }
 
@@ -408,9 +400,9 @@ impl MappedShard {
         if filter.encoding != Encoding::Raw {
             return Err(Corrupt("encoding"));
         }
-        let shard_filter = match filter.size {
+        let pk_filter = match filter.size {
             0 => None,
-            _ => Some(shard_filter::parse(filter.bytes(data)).ok_or(Corrupt("filter descriptor"))?),
+            _ => Some(pk_filter::parse(filter.bytes(data)).ok_or(Corrupt("filter descriptor"))?),
         };
 
         Ok(MappedShard {
@@ -423,7 +415,7 @@ impl MappedShard {
             col_regions,
             null_pad_mask,
             heap,
-            shard_filter,
+            pk_filter,
             mmap,
         })
     }
@@ -521,15 +513,13 @@ impl MappedShard {
     }
 
     /// Whether this shard carries a PK filter.
-    pub fn has_shard_filter(&self) -> bool {
-        self.shard_filter.is_some()
+    pub fn has_pk_filter(&self) -> bool {
+        self.pk_filter.is_some()
     }
 
     /// A shard carrying no filter admits every key.
-    pub fn shard_filter_may_contain(&self, probe_key: u64) -> bool {
-        self.shard_filter
-            .as_ref()
-            .is_none_or(|filter| filter.contains(&probe_key))
+    pub fn pk_filter_may_contain(&self, probe_key: u64) -> bool {
+        self.pk_filter.as_ref().is_none_or(|filter| filter.contains(&probe_key))
     }
 
     /// Row `row`'s key by value, decoded alone where the key is packed.
@@ -554,7 +544,7 @@ impl MappedShard {
         let (count, stride) = (self.header.row_count, self.schema.pk_stride());
         match &self.pk {
             // SAFETY: the region holds a key for every row of the shard.
-            KeyRegion::Mapped(cp) => unsafe { super::seek::seek_pk_rows(count, stride, *cp, key) },
+            KeyRegion::Mapped(cp) => unsafe { seek_pk_rows(count, stride, *cp, key, None) },
             KeyRegion::Packed(packed) => packed.image.rows_of(key),
         }
     }
@@ -564,13 +554,10 @@ impl MappedShard {
     #[inline]
     pub(crate) fn seek(&self, key: &[u8], hint: Option<usize>) -> usize {
         let (count, stride) = (self.header.row_count, self.schema.pk_stride());
-        match (&self.pk, hint) {
+        match &self.pk {
             // SAFETY: the region holds a key for every row of the shard.
-            (KeyRegion::Mapped(cp), None) => unsafe { super::seek::seek_lower_bound(count, stride, *cp, key) },
-            (KeyRegion::Mapped(cp), Some(hint)) => unsafe {
-                super::seek::seek_advance_to(count, stride, *cp, key, hint)
-            },
-            (KeyRegion::Packed(packed), hint) => packed.image.seek(key, hint),
+            KeyRegion::Mapped(cp) => unsafe { seek_lower_bound(count, stride, *cp, key, hint) },
+            KeyRegion::Packed(packed) => packed.image.seek(key, hint),
         }
     }
 
@@ -813,9 +800,9 @@ impl ColumnarSource for ShardWindow<'_> {
 }
 
 #[cfg(test)]
-#[path = "tests/shard_reader.rs"]
+#[path = "tests/reader.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "benches/shard_reader.rs"]
+#[path = "benches/reader.rs"]
 mod bench;

@@ -22,22 +22,27 @@ fn seek_matches_the_linear_lower_bound_at_every_width() {
                 let key = enc(p, stride);
                 let expected = (0..n).find(|&i| row(i) >= &key[..]).unwrap_or(n);
                 assert_eq!(
-                    unsafe { seek_lower_bound(n, stride, pk, &key) },
+                    unsafe { seek_lower_bound(n, stride, pk, &key, None) },
                     expected,
                     "lower bound stride={stride} n={n} p={p}"
                 );
                 let upper = (0..n).find(|&i| row(i) > &key[..]).unwrap_or(n);
                 assert_eq!(
-                    unsafe { seek_pk_rows(n, stride, pk, &key) },
+                    unsafe { seek_pk_rows(n, stride, pk, &key, None) },
                     expected..upper,
                     "rows of stride={stride} n={n} p={p}"
                 );
                 // Hints past `n` included: a caller's hint may have run off the end.
                 for hint in 0..=vals.len() {
                     assert_eq!(
-                        unsafe { seek_advance_to(n, stride, pk, &key, hint) },
+                        unsafe { seek_lower_bound(n, stride, pk, &key, Some(hint)) },
                         expected,
                         "gallop stride={stride} n={n} p={p} hint={hint}"
+                    );
+                    assert_eq!(
+                        unsafe { seek_pk_rows(n, stride, pk, &key, Some(hint)) },
+                        expected..upper,
+                        "hinted rows of stride={stride} n={n} p={p} hint={hint}"
                     );
                 }
             }

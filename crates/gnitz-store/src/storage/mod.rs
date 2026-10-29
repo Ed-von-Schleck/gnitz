@@ -25,3 +25,12 @@ pub enum Cut {
     /// pending since are left out.
     Sealed,
 }
+
+/// The **inclusive** OPK ranges `[min, max]` and `[lo, hi]` intersect — whether a
+/// run or shard holding `[min, max]` can answer about a key the caller's bound
+/// admits. A half-open upper bound passed as `hi` over-approximates, which is
+/// the safe direction.
+#[inline]
+fn pk_ranges_overlap(min: &[u8], max: &[u8], lo: &[u8], hi: &[u8]) -> bool {
+    max >= lo && min <= hi
+}

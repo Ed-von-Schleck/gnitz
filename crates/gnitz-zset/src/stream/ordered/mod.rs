@@ -21,7 +21,7 @@
 use std::cmp::Ordering;
 
 use crate::algebra::{GroupOutKey, KeyPacker};
-use crate::repr::{pk_group_end, Batch, MemBatch, ReadCursor};
+use crate::repr::{pk_group_end, Batch, CursorRow, MemBatch, ReadCursor};
 use crate::schema::key::compare_pk_ordering;
 use crate::schema::payload_order::{Generic, PayloadOrder};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
@@ -164,7 +164,7 @@ impl OrderedPlan {
         let mut moved: Vec<(u32, u32, i64)> = Vec::new();
         folded.consolidate_recording(&mut moved);
         let entries = &folded.as_mem_batch();
-        let n = entries.count;
+        let n = entries.len();
         if n == 0 {
             return OrderedEpoch {
                 out: Batch::empty_with_schema(&self.output_schema),
@@ -207,11 +207,11 @@ pub struct OrderedEpoch {
     pub index_entries: Batch,
 }
 
-/// A row of the group a [`Walk`] is in: a stored one, by its cursor position, or
+/// A row of the group a [`Walk`] is in: a stored one, by its cursor handle, or
 /// one of the epoch's entries.
 #[derive(Clone, Copy)]
 enum At {
-    Stored(u32, u32),
+    Stored(CursorRow),
     Entry(u32),
 }
 
@@ -219,8 +219,8 @@ enum At {
 macro_rules! with_row {
     ($walk:expr, $at:expr, |$src:ident, $row:ident| $body:expr) => {
         match $at {
-            $crate::stream::ordered::At::Stored(source, $row) => {
-                let ($src, $row) = ($walk.history.source_at(source as usize), $row as usize);
+            $crate::stream::ordered::At::Stored(pos) => {
+                let ($src, $row) = $walk.history.row_at(pos);
                 $body
             }
             $crate::stream::ordered::At::Entry($row) => {
@@ -283,10 +283,7 @@ impl Walk<'_> {
         };
         let (stored, entry) = (ord.is_le(), ord.is_ge());
         let (at, old) = match stored {
-            true => {
-                let (source, row) = self.history.current_position();
-                (At::Stored(source as u32, row as u32), self.history.current_weight)
-            }
+            true => (At::Stored(self.history.current_position()), self.history.current_weight),
             false => (At::Entry(self.next as u32), 0),
         };
         let new = old.wrapping_add(if entry { self.entries.get_weight(self.next) } else { 0 });
@@ -335,10 +332,10 @@ impl Walk<'_> {
         if !self.index.cmp_keys(src, row, self.entries, self.next).is_lt() {
             return None;
         }
-        let (source, row) = self.history.current_position();
+        let at = At::Stored(self.history.current_position());
         let weight = self.history.current_weight;
         self.history.advance();
-        Some((At::Stored(source as u32, row as u32), weight))
+        Some((at, weight))
     }
 
     /// Leave the group's remaining entries unread.
@@ -473,7 +470,7 @@ impl OrderIndex {
         };
         let (stride, group) = (self.schema.pk_stride(), self.key_packer.out_stride);
         let mut image = Vec::new();
-        out.append_session(n).write(n, |w| {
+        out.write_rows(n, |w| {
             self.key_packer.pack_rows(w.pk_mut(), stride, &mb, &[(0, n)]);
             let (mut regions, blob, _) = w.split_mut();
             let keys = regions.next().expect("the PK region");

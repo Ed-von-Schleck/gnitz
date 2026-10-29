@@ -6,8 +6,8 @@ use rustc_hash::FxHashSet;
 
 use super::*;
 use gnitz_wire::PkKeys;
-use gnitz_zset::algebra::spans;
-use gnitz_zset::schema::key::{probe_key, KeySpec};
+use gnitz_zset::algebra::{spans, KeySpec};
+use gnitz_zset::schema::probe_key;
 
 /// Spans a filter tracks before it disables itself.
 const UNIQUE_FILTER_CAP: usize = 7 << 20;
@@ -90,7 +90,7 @@ impl MasterDispatcher {
         let mut filters = self.unique_filters.borrow_mut();
         for ic in relation.unique_indexes_to_check() {
             if let Some(filter) = filters.get_mut(&(table_id, ic.cols())) {
-                extract_into_filter(filter, &mb, &ic.key_spec());
+                extract_into_filter(filter, &mb, ic.key_spec());
             }
         }
     }
@@ -117,7 +117,7 @@ impl MasterDispatcher {
         table_id: u64,
         uniques: &[(PkColList, KeySpec)],
     ) -> Result<(), WireFault> {
-        for &(cols, spec) in uniques {
+        for &(cols, ref spec) in uniques {
             if self.unique_filters.borrow().contains_key(&(table_id, cols)) {
                 continue;
             }

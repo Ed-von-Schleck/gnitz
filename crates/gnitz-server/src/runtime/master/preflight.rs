@@ -28,8 +28,8 @@ use crate::catalog::{FkEdge, RowConstraints};
 use gnitz_expr::ColumnLocator;
 use gnitz_store::relation::Relation;
 use gnitz_wire::{FkAction, PkBuf, PkKeys, ReadBound, WireConflictMode};
+use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::MemBatch;
-use gnitz_zset::schema::key::KeySpec;
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// One decoded, shape-validated transaction family: the target `tid`, its
@@ -562,7 +562,7 @@ fn plan_unique_checks<'a>(
 ) -> Result<(), WireFault> {
     for t in &b.tables {
         let tid = t.tid;
-        for &(col_indices, spec) in &t.cons.uniques {
+        for &(col_indices, ref spec) in &t.cons.uniques {
             let key_size = spec.key_size();
 
             let mut spans: Vec<u8> = Vec::with_capacity(t.fold.len() * key_size);
@@ -588,7 +588,7 @@ fn plan_unique_checks<'a>(
                 continue;
             }
             let rel = disp.cat().registry.relation_or_err(tid)?;
-            let plan = Rule::Unique { cols: col_indices, spec };
+            let plan = Rule::Unique { cols: col_indices, spec: spec.clone() };
             checks.push(Check::new(rel, Probe::Index(col_indices, NonZeroU64::MAX), keys, plan)?);
         }
     }
@@ -880,7 +880,7 @@ async fn removed_references(
             let spec = index.key_spec();
             // The parent column has the FK column's type, so its image is the span's.
             let keys = PkKeys::from_images(spec.key_size(), values);
-            let plan = ReferencePlan { edge, spec, cascades };
+            let plan = ReferencePlan { edge, spec: spec.clone(), cascades };
             checks.push(Check::new(child, Probe::Index(cols, cap), keys, plan)?);
         }
         let found: Vec<usize> = cascaded.values().map(|c| c.pks.len()).collect();

@@ -19,7 +19,7 @@ fn region(rows: usize, stride: usize) -> Vec<u8> {
 
 /// Instructions and cycles per probe over a region of ascending keys, row `r`
 /// holding key `r`, at a stride in each width arm and each key-packing band: a
-/// [`seek_lower_bound`] at random keys, then a [`seek_advance_to`] by the gap
+/// [`seek_lower_bound`] at random keys, then a hinted one by the gap
 /// between probes and by where the hint stands — at the last landing of an
 /// ascending or a descending sweep, at row 0, and at the boundary itself.
 #[test]
@@ -47,7 +47,7 @@ fn seek_bench() {
             for &r in &probes {
                 let k = key(r);
                 // SAFETY: `region` holds `ROWS` rows of `stride` bytes.
-                landed += unsafe { seek_lower_bound(ROWS, stride, pk, black_box(&k[..stride])) };
+                landed += unsafe { seek_lower_bound(ROWS, stride, pk, black_box(&k[..stride]), None) };
             }
             landed
         };
@@ -69,7 +69,7 @@ fn seek_bench() {
                     for &r in &probes {
                         let k = key(r);
                         // SAFETY: `region` holds `ROWS` rows of `stride` bytes.
-                        at = unsafe { seek_advance_to(ROWS, stride, pk, black_box(&k[..stride]), hint(at, r)) };
+                        at = unsafe { seek_lower_bound(ROWS, stride, pk, black_box(&k[..stride]), Some(hint(at, r))) };
                         landed += at;
                     }
                     landed

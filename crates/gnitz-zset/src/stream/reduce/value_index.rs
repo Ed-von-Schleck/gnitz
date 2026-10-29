@@ -147,7 +147,7 @@ impl ValueIndex {
             // A NULL has no image: MIN/MAX skips it.
             let runs = delta.runs_without_nulls(a.image.loc.null_bit());
             let rows = range_rows(&runs);
-            out.append_session(rows).write(rows, |w| {
+            out.write_rows(rows, |w| {
                 self.key_packer.pack_rows(w.pk_mut(), width, &mb, &runs);
                 copy_runs::<8>(delta.weight(), w.weight_mut(), runs.iter().copied(), 8);
                 w.null_bmp_mut().fill(0);

@@ -5,9 +5,10 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use super::bloom::BloomFilter;
+use super::pk_ranges_overlap;
 use gnitz_wire::PkBuf;
 use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch, StorageError};
-use gnitz_zset::schema::key::{pk_ranges_overlap, probe_key};
+use gnitz_zset::schema::probe_key;
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Runs to accumulate before folding them into one: bounds how many runs a

@@ -131,7 +131,7 @@ fn a_relayout_writes_filtered_terminal_runs() {
         let shards = table_shards(&t);
         assert!(shards.len() > 1, "child {k} cut {} run(s)", shards.len());
         assert!(
-            shards.iter().all(|s| s.has_shard_filter()),
+            shards.iter().all(|s| s.has_pk_filter()),
             "child {k}: every run carries a PK filter"
         );
         assert_eq!(t.level_shape(), (0, [0, shards.len()]), "child {k}: terminal placement");

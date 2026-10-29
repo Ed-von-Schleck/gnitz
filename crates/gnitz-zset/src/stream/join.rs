@@ -11,9 +11,9 @@ use std::cmp::Ordering;
 
 use crate::repr::{
     copy_runs, pk_group_end, relocate_german_string_vec, runs_where, should_relocate_blob, width_dispatch, Batch,
-    ReadCursor,
+    CursorRow, ReadCursor,
 };
-use crate::schema::key::{band, compare_pk_ordering, key_above};
+use crate::schema::key::{band, compare_pk_ordering, group_floor, key_above};
 use crate::schema::{DerivedSchema, SchemaDescriptor};
 
 use crate::algebra::MapPlan;
@@ -227,7 +227,7 @@ impl RangeProbe {
         };
         match self.above {
             true => band(split?, key_above(group, stride)),
-            false => band(PkBuf::from_bytes(group).widened(stride), split),
+            false => band(group_floor(group, stride), split),
         }
     }
 
@@ -247,14 +247,13 @@ impl RangeProbe {
 // The operator
 // ---------------------------------------------------------------------------
 
-/// One emission of a walk: the delta run `[rs, re)` against one trace row, named
-/// by its cursor position.
+/// One emission of a walk: the delta run `[rs, re)` against one trace row, by
+/// its cursor handle.
 #[derive(Clone, Copy)]
 struct Pairing {
     rs: u32,
     re: u32,
-    src: u32,
-    row: u32,
+    at: CursorRow,
     w_trace: i64,
 }
 
@@ -301,12 +300,10 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
     let mut pairs: Vec<Pairing> = Vec::new();
     let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
         debug_assert!(rs < re, "every walk emits a non-empty delta run");
-        let (src, row) = c.current_position();
         pairs.push(Pairing {
             rs: rs as u32,
             re: re as u32,
-            src: src as u32,
-            row: row as u32,
+            at: c.current_position(),
             w_trace: c.current_weight,
         });
     };
@@ -315,7 +312,6 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
         Walk::Range(range) => range_merge_walk(delta, cursor, range, emit),
         Walk::Cross => cursor.for_each_row_while(|_| true, |c| emit(0, n, c)),
     }
-    let rows: usize = pairs.iter().map(Pairing::len).sum();
     let ordered = match plan.walk {
         // A delta run that meets several trace rows keeps the output order only
         // when they arrive in it and lead the payload or the run is one row.
@@ -324,16 +320,17 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
             .all(|w| w[0].rs != w[1].rs || (trace_ordered && (plan.trace_leads || w[0].len() == 1))),
         Walk::Range(_) | Walk::Cross => false,
     };
-    let mut out = write_pairings(delta, cursor, plan, &pairs, rows);
+    let mut out = write_pairings(delta, cursor, plan, &pairs);
     if ordered {
         out.certify_consolidated();
     }
     out
 }
 
-/// The `rows` output rows `pairs` names, in list order, one region at a time,
-/// less any whose weight product is zero.
-fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[Pairing], rows: usize) -> Batch {
+/// The output rows `pairs` names, in list order, one region at a time, less any
+/// whose weight product is zero.
+fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[Pairing]) -> Batch {
+    let rows: usize = pairs.iter().map(Pairing::len).sum();
     let output_schema = &plan.output_schema;
     if rows == 0 {
         return Batch::empty_with_schema(output_schema);
@@ -361,8 +358,8 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
     } else {
         0
     };
-    let trace_row = |p: &Pairing| (cursor.source_at(p.src as usize), p.row as usize);
-    let any_ghost = out.append_session(rows).write(rows, |w| {
+    let trace_row = |p: &Pairing| cursor.row_at(p.at);
+    let any_ghost = out.write_rows(rows, |w| {
         let mut any_ghost = false;
         let (pk, weights, nulls) = w.fixed_mut();
         match plan.walk {
@@ -482,8 +479,8 @@ fn repeat_cells<const N: usize>(cursor: &ReadCursor, pi: usize, dst: &mut [u8], 
     assert!(N != 0, "a payload column is 1, 2, 4, 8 or 16 bytes, not {width}");
     let mut cells = dst.as_chunks_mut::<N>().0.iter_mut();
     for p in pairs {
-        let src = cursor.source_at(p.src as usize);
-        let cell: [u8; N] = src.get_col_ptr(p.row as usize, pi, N).try_into().unwrap();
+        let (src, row) = cursor.row_at(p.at);
+        let cell: [u8; N] = src.get_col_ptr(row, pi, N).try_into().unwrap();
         cells.by_ref().take(p.len()).for_each(|c| *c = cell);
     }
 }
@@ -502,7 +499,8 @@ fn repeat_pk_cells<const N: usize>(
     assert!(N != 0, "a PK column is 1, 2, 4, 8 or 16 bytes, not {width}");
     let mut cells = dst.as_chunks_mut::<N>().0.iter_mut();
     for p in pairs {
-        let pk = cursor.source_at(p.src as usize).get_pk_bytes(p.row as usize);
+        let (src, row) = cursor.row_at(p.at);
+        let pk = src.get_pk_bytes(row);
         let mut cell = [0u8; N];
         gnitz_wire::decode_pk_cell(&pk[off..off + N], signed, &mut cell);
         cells.by_ref().take(p.len()).for_each(|c| *c = cell);

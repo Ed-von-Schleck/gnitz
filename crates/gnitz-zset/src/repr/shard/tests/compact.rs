@@ -1,6 +1,6 @@
 use super::super::encoding::Encoding;
+use super::super::file::ShardWriteOpts;
 use super::super::layout::{spans_of, ShardHeader};
-use super::super::shard_file::ShardWriteOpts;
 use super::*;
 use crate::repr::merge_consolidated;
 use crate::test_support::{

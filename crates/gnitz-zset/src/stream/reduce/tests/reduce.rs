@@ -10,7 +10,7 @@ use proptest::prelude::*;
 use crate::repr::Batch;
 use crate::test_support::stream_input::{agg, agg_of, arb_row, batch, cells, schema, shard, Cells, Row, GROUPS};
 use crate::test_support::{arb_ticks, assert_folds, cell, delta_to, TestTrace};
-use gnitz_expr::ReduceOutKey;
+use gnitz_expr::{CmpOp, ReduceOutKey, RowFilter};
 use gnitz_wire::{AggDescriptor, AggFunc, GroupAggs, ReadSink, SinkKind, TypeCode};
 
 use super::{op_reduce, ReducePlan};
@@ -196,33 +196,29 @@ proptest! {
         }
     }
 
-    /// The ad-hoc fold, over any chunking of a scan and any survivor ranges of
-    /// each chunk, is the aggregates of the rows in those ranges, in the layout
-    /// the view's reduce emits.
+    /// The ad-hoc fold, over any chunking of a scan and any filter over it, is
+    /// the aggregates of the rows the filter keeps, in the layout the view's
+    /// reduce emits.
     #[test]
-    fn the_adhoc_fold_is_the_aggregates_of_the_ranges_it_folded(
+    fn the_adhoc_fold_is_the_aggregates_of_the_rows_its_filter_keeps(
         group_cols in prop::sample::select(&GROUPS[..]),
         aggs in arb_aggs(),
-        scan in prop::collection::btree_map(arb_row(), (1i64..=3, any::<bool>()), 0..12),
+        scan in prop::collection::btree_map(arb_row(), 1i64..=3, 0..12),
+        // `grp` is -1 or 0, so `lo` = -1 keeps every row, 0 the interleaved
+        // `grp = 0` rows, 1 none.
+        lo in -1i64..=1,
         chunk in 1usize..5,
     ) {
         let mut fold = fold_sink(group_cols, aggs.clone(), usize::MAX).unwrap();
         let view = ReducePlan::from_wire(&schema(), group_cols, &aggs, false).unwrap();
         prop_assert_eq!(fold.output_schema(), view.output_schema());
 
-        let scan: Vec<(Row, i64, bool)> = scan.into_iter().map(|(r, (w, survives))| (r, w, survives)).collect();
+        let mut keep = crate::test_support::cmp_all(&[(CmpOp::Ge, 3, lo)]).resolve_filter(&schema()).unwrap();
+        let scan: Vec<(Row, i64)> = scan.into_iter().collect();
         for rows in scan.chunks(chunk) {
-            let mut ranges: Vec<(usize, usize)> = Vec::new();
-            for i in (0..rows.len()).filter(|&i| rows[i].2) {
-                match ranges.last_mut() {
-                    Some(last) if last.1 == i => last.1 = i + 1,
-                    _ => ranges.push((i, i + 1)),
-                }
-            }
-            let rows: Vec<(Row, i64)> = rows.iter().map(|&(r, w, _)| (r, w)).collect();
-            fold.push(&batch(&rows), &mut ranges).unwrap();
+            fold.push(&batch(rows), &mut keep).unwrap();
         }
-        let folded: BTreeMap<Row, i64> = scan.iter().filter(|r| r.2).map(|&(r, w, _)| (r, w)).collect();
+        let folded: BTreeMap<Row, i64> = scan.iter().filter(|(r, _)| r.grp >= lo).copied().collect();
         prop_assert_eq!(
             output_rows(&fold.finish(), group_cols),
             aggregates(&folded, group_cols, &aggs, group_cols.is_empty())
@@ -271,8 +267,9 @@ fn the_adhoc_fold_refuses_a_group_past_its_cap() {
                 .collect::<Vec<_>>(),
         )
     };
-    fold.push(&rows(&[7, 8, 7]), &mut [(0, 3)]).unwrap();
-    let err = fold.push(&rows(&[8, 9]), &mut [(0, 2)]).unwrap_err();
+    let mut all = RowFilter::for_read(&[], None, &schema()).unwrap();
+    fold.push(&rows(&[7, 8, 7]), &mut all).unwrap();
+    let err = fold.push(&rows(&[8, 9]), &mut all).unwrap_err();
     assert!(err.contains("exceeds 2 distinct groups"), "{err}");
 }
 
@@ -415,7 +412,8 @@ fn a_float_sum_weighs_each_value() {
         assert_eq!(h.state(group_cols), want, "group {group_cols:?}");
 
         let mut fold = fold_sink(group_cols, aggs.to_vec(), usize::MAX).unwrap();
-        fold.push(&batch(&rows), &mut [(0, rows.len())]).unwrap();
+        let mut all = RowFilter::for_read(&[], None, &schema()).unwrap();
+        fold.push(&batch(&rows), &mut all).unwrap();
         assert_eq!(
             output_rows(&fold.finish(), group_cols),
             want,
@@ -523,7 +521,8 @@ fn a_float_sum_is_carried_in_f64() {
             "reduce, group {group_cols:?}"
         );
         let mut fold = fold_sink(group_cols, aggs.to_vec(), usize::MAX).unwrap();
-        fold.push(&batch(&rows), &mut [(0, rows.len())]).unwrap();
+        let mut all = RowFilter::for_read(&[], None, &schema()).unwrap();
+        fold.push(&batch(&rows), &mut all).unwrap();
         assert_eq!(read(&fold.finish()), (want_f, want_x), "ad hoc, group {group_cols:?}");
     }
 }

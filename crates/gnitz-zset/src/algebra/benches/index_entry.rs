@@ -18,8 +18,8 @@ fn index_entries_bench() {
     let counter = Counter::instructions();
     // `live`: the rows NULL in no indexed column, each an entry.
     let measure = |label: &str, batch: &Batch, cols: &[u32], live: usize| {
-        let (spec, idx_schema) = crate::schema::key::KeySpec::new(cols, batch.schema())
-            .map(|spec| (spec, spec.index_schema(batch.schema())))
+        let (idx_schema, spec) = KeySpec::new(cols, batch.schema())
+            .map(|spec| (spec.index_schema(batch.schema()), spec))
             .unwrap();
         let mb = batch.as_mem_batch();
         let key_size = spec.key_size();

@@ -134,9 +134,7 @@ fn shared_span() -> Batch {
     let one = string_batch(&[(1, "v".repeat(200))]);
     let mut shared = Batch::with_capacity(one.schema(), 20);
     let src = one.as_mem_batch();
-    shared
-        .append_session(20)
-        .write(20, |w| crate::repr::scatter::copy_ranges(&src, None, &[(0, 1); 20], w));
+    shared.write_rows(20, |w| crate::repr::scatter::copy_ranges(&src, None, &[(0, 1); 20], w));
     assert_eq!(shared.blob.len(), 200, "precondition: one span for every row");
     shared
 }
@@ -280,7 +278,7 @@ fn a_viewed_wal_block_reads_as_its_batch() {
         two.append_ranges(&mb, &[(0, cut), (cut, rows)]);
         assert_eq!(weighted_rows(&two), want, "{rows} rows: two ranges");
 
-        let merged = merge_consolidated(&[mb.clone(), mb.clone()], &schema);
+        let merged = merge_consolidated(&[mb, mb], &schema);
         let doubled: Vec<_> = want.iter().map(|(row, w)| (row.clone(), 2 * w)).collect();
         assert_eq!(weighted_rows(&merged), doubled, "{rows} rows: merge");
     }

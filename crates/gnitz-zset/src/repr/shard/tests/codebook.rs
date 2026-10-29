@@ -46,8 +46,8 @@ fn a_codebook_is_kept_until_a_batch_drifts_from_it() {
 /// handed to the rebuild that asserts that order.
 #[test]
 fn a_table_out_of_trained_order_is_refused() {
-    use crate::repr::encoding::{SYMBOLS_AT, SYMBOLS_COUNT_AT};
-    use crate::repr::layout::spans_of;
+    use super::super::encoding::{SYMBOLS_AT, SYMBOLS_COUNT_AT};
+    use super::super::layout::spans_of;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.db");
     let batch = prose_batch(0..400);

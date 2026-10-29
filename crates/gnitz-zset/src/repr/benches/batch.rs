@@ -206,14 +206,14 @@ fn from_ranges_run_length_bench() {
     }
 }
 
-/// Retired instructions and cycles of a relocating append session — one long
-/// cell, and 100 rows of two long cells — on a thread whose last session left
-/// the pool a small map, and on one whose last session relocated 50 000
+/// Retired instructions and cycles of a relocating write — one long
+/// cell, and 100 rows of two long cells — on a thread whose last cache left
+/// the pool a small map, and on one whose last cache relocated 50 000
 /// distinct spans.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn blob_cache_session_bench() {
-    const SESSIONS: u64 = 200;
+fn blob_cache_bench() {
+    const WRITES: u64 = 200;
     let two_strings = u64_pk_schema(&[
         SchemaColumn::new(TypeCode::String, false),
         SchemaColumn::new(TypeCode::String, false),
@@ -229,30 +229,30 @@ fn blob_cache_session_bench() {
         b.finish()
     };
     let (one, hundred, many) = (make_string_batch(&[(1, 1, &[b'x'; 40])]), build(100), build(25_000));
-    // A relocating session over every row of `src`: `compacted` carries no heap.
-    let session = |src: &Batch| black_box(black_box(src).compacted()).count;
+    // A relocating write of every row of `src`: `compacted` carries no heap.
+    let write = |src: &Batch| black_box(black_box(src).compacted()).count;
     for src in [&one, &hundred, &many] {
-        assert_eq!(session(src), src.count);
+        assert_eq!(write(src), src.count);
     }
     let counters = [("instr", Counter::instructions()), ("cycles", Counter::cycles())];
     for (shape, src) in [("one cell", &one), ("100 rows x 2 string columns", &hundred)] {
         for (unit, counter) in &counters {
-            let small: u64 = (0..SESSIONS)
+            let small: u64 = (0..WRITES)
                 .map(|_| {
-                    session(src);
-                    counter.measure(|| session(src)).1
+                    write(src);
+                    counter.measure(|| write(src)).1
                 })
                 .sum();
-            let large: u64 = (0..SESSIONS)
+            let large: u64 = (0..WRITES)
                 .map(|_| {
-                    session(&many);
-                    counter.measure(|| session(src)).1
+                    write(&many);
+                    counter.measure(|| write(src)).1
                 })
                 .sum();
             println!(
-                "blob_cache_session_bench: {shape}: {} {unit} after a session of its own shape, {} after a 50 000-span session",
-                small / SESSIONS,
-                large / SESSIONS,
+                "blob_cache_bench: {shape}: {} {unit} after a write of its own shape, {} after a 50 000-span write",
+                small / WRITES,
+                large / WRITES,
             );
         }
     }

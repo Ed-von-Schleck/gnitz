@@ -21,23 +21,7 @@ use gnitz_wire::{PkBuf, TypeCode};
 
 use proptest::strategy::Strategy;
 
-use super::shared::{arb_type_code, pk_payload_schema, self_typed_slots, u64_pk_schema, zset_of, zset_sum};
-
-/// A cursor over `batches` and `shards`, one run each.
-pub(crate) fn create_read_cursor(
-    batches: &[Rc<Batch>],
-    shards: &[Rc<MappedShard>],
-    schema: SchemaDescriptor,
-) -> ReadCursor {
-    from_runs(
-        batches
-            .iter()
-            .map(|b| Run::Mem(Rc::clone(b)))
-            .chain(shards.iter().cloned().map(Run::Shard)),
-        schema,
-        batches.len() + shards.len(),
-    )
-}
+use super::shared::{self_typed_slots, u64_pk_schema, zset_of, zset_sum};
 
 /// The reindex of `source` onto its columns `key`, each at its own slot type,
 /// keeping `keep` and doing `nulls` with a NULL key: with `Drop`, the map a
@@ -91,7 +75,7 @@ impl TestTrace {
 
     /// A cursor over every run.
     pub(crate) fn cursor(&self) -> ReadCursor {
-        create_read_cursor(&self.runs, &[], self.schema)
+        from_runs(self.runs.iter().cloned().map(Run::Mem), self.schema, self.runs.len())
     }
 
     /// A cursor over the rows whose PK begins with a key in `[first, last]` and
@@ -262,26 +246,12 @@ pub(crate) fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
     u64_pk_schema(&[SchemaColumn::new(TypeCode::Blob, false)])
 }
 
-/// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving
-/// key (negatives sort before positives only because the encoder sign-flips).
-pub(crate) fn make_schema_i64pk_i64() -> SchemaDescriptor {
-    pk_payload_schema(&[TypeCode::I64])
-}
-
 /// `batch` written to `path` and mapped back, as a store maps the shards it
 /// writes.
 pub(crate) fn map_shard(path: &Path, batch: &Batch) -> Rc<MappedShard> {
     let path = path.to_str().unwrap();
     batch.write_as_shard(path, ShardWriteOpts::default()).unwrap();
     Rc::new(MappedShard::open(path, batch.schema()).unwrap())
-}
-
-/// The PK-eligible type codes, derived from [`gnitz_wire::is_pk_eligible`] so the
-/// set can never drift from the predicate the schema layer enforces (fixed-width
-/// integer scalars: U8..U64, I8..I64, U128, I128, UUID — STRING / BLOB / float
-/// are rejected by `SchemaDescriptor::new`).
-pub(crate) fn arb_pk_type() -> impl Strategy<Value = TypeCode> {
-    arb_type_code().prop_filter("type code must be PK-eligible", |&tc| tc.is_pk_eligible())
 }
 
 /// Strings that are prefixes of one another, one escaping `0x00`, and two that

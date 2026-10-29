@@ -7,7 +7,7 @@ use crate::test_support::{
 };
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::key::probe_key;
+use gnitz_zset::schema::probe_key;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use std::path::Path;
 

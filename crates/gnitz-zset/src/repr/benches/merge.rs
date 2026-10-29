@@ -124,7 +124,7 @@ fn striped_sum_bench() {
             let mem: Vec<MemBatch<'_>> = stripes.iter().map(|b| b.as_mem_batch()).collect();
             let rows = per * k;
             assert_eq!(merge_consolidated(&mem, &schema).count, rows, "the merge dropped rows");
-            assert_eq!(Batch::concat(&schema, mem.iter().cloned()).count, rows);
+            assert_eq!(Batch::concat(&schema, mem.iter().copied()).count, rows);
             let ((), merged) = instructions.measure(|| {
                 for _ in 0..iters {
                     black_box(merge_consolidated(&mem, &schema));
@@ -132,7 +132,7 @@ fn striped_sum_bench() {
             });
             let ((), concatenated) = instructions.measure(|| {
                 for _ in 0..iters {
-                    black_box(Batch::concat(&schema, mem.iter().cloned()));
+                    black_box(Batch::concat(&schema, mem.iter().copied()));
                 }
             });
             println!(

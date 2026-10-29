@@ -207,7 +207,7 @@ pub(crate) fn id_rows(
 
 /// Assert `ix` holds exactly the entries `rows` project to, weights included.
 pub(crate) fn assert_index_holds(ix: &SecondaryIndex, rows: &Batch, what: impl std::fmt::Display) {
-    let want = gnitz_zset::algebra::index_entries(rows, &ix.key_spec(), &ix.schema());
+    let want = gnitz_zset::algebra::index_entries(rows, ix.key_spec(), &ix.schema());
     assert_eq!(
         gnitz_zset_testkit::zset_of(&ix.cursor().materialize(), &ix.schema()),
         gnitz_zset_testkit::zset_of(&want, &ix.schema()),

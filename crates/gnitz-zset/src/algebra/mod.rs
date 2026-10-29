@@ -1,12 +1,12 @@
 //! Z-set algebra: the functions of one Z-set, and the key encoders they share.
 //!
-//!   - `linear`      — filter, union (Theorem 3.3: no state added), and their output schemas
+//!   - `linear`      — filter and union (Theorem 3.3: no state added), and the output schemas of a union and a null-extend
 //!   - `map`         — `MapPlan`, the columnar driver behind every map and projection
 //!   - `exchange`    — the scatter plan of a worker exchange
 //!   - `aggregate`   — the aggregates, a reduce's row shape, and the ad-hoc fold
 //!   - `group_key`   — the key a row is grouped or routed by, and the output PK a reduce stamps
 //!   - `key_pack`    — the packed keys of a join, a group and an index span, and the row digest
-//!   - `index_entry` — a secondary index's entries, and their spans alone
+//!   - `index_entry` — a secondary index's key span, its entries, and their spans alone
 //!   - `order_image` — the byte images an ordered index keys by
 //!   - `route`       — which worker owns a key, and where a relation's rows live
 //!   - `sink`        — the sink of an ad-hoc read: map, then forward, a prefix cut, a top-k or a fold
@@ -33,7 +33,7 @@ mod route;
 mod sink;
 
 pub use exchange::ScatterPlan;
-pub use index_entry::{index_entries, spans};
+pub use index_entry::{index_entries, spans, KeySpec};
 pub use linear::{null_extend_output_schema, op_filter, op_union, union_nullability_merge};
 pub use map::MapPlan;
 pub use route::{ground_owner, Placement, Slot};

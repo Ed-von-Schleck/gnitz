@@ -1,6 +1,6 @@
 //! Ad-hoc aggregation hash-fold — the stateless per-worker sink behind a
-//! fold-sink `ReadSpec` (single-relation GROUP BY / global aggregate / DISTINCT
-//! over the committed base). No circuit, no operator traces, no exchange: each
+//! fold-sink `ReadSpec` (a single-relation GROUP BY, global aggregate or
+//! DISTINCT over one relation's stored rows). No circuit, no operator traces, no exchange: each
 //! surviving scan chunk folds into per-group aggregate values in bounded RAM, then
 //! one partial reduce-output batch is emitted.
 //!

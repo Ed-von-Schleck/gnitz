@@ -3,18 +3,16 @@
 //!
 //! [`merge_guard`] merges the rows one guard owns → column-first scatter → one
 //! output batch, handed to the caller to write, one guard of a fold per call.
-//! The merge kernel itself is the shared
-//! [`run_merge`](crate::repr::merge::run_merge), which owns the merge
+//! The merge kernel itself is the shared [`run_merge`], which owns the merge
 //! order; this module only drives it and materializes survivors.
 
-use super::batch::Batch;
 use super::codebook::Codebook;
-use super::merge::run_merge;
-use super::scatter::UnifiedSet;
-use super::shard_file::ShardWriteOpts;
-use super::shard_reader::MappedShard;
-use super::string_heap::row_long_bytes;
-use super::StorageError;
+use super::file::ShardWriteOpts;
+use super::reader::MappedShard;
+use crate::repr::merge::run_merge;
+use crate::repr::scatter::UnifiedSet;
+use crate::repr::string_heap::row_long_bytes;
+use crate::repr::{Batch, StorageError};
 use crate::schema::key::compare_pk_ordering;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::RowSource;

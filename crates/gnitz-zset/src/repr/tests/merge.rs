@@ -47,7 +47,7 @@ proptest::proptest! {
                 merge_consolidated(&[acc.as_mem_batch(), b.as_mem_batch()], &s)
             });
         for (path, got) in [
-            ("consolidate", Batch::concat(&s, mem.iter().cloned()).into_consolidated()),
+            ("consolidate", Batch::concat(&s, mem.iter().copied()).into_consolidated()),
             ("N-way", merge_rows(&mem, &s)),
             ("N-way sum", merge_consolidated(&consolidated_mem, &s)),
             ("pairwise", pairwise),

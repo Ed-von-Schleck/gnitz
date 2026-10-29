@@ -19,8 +19,8 @@
 //! ```
 //!
 //! The submodules under each root are private; what a root re-exports is what
-//! it publishes, plus `schema::key`, named as a module. An item is `pub`
-//! because another crate names it; everything else is `pub(crate)`.
+//! it publishes. An item is `pub` because another crate names it; everything
+//! else is `pub(crate)`.
 //!
 //! There is no crate-root re-export façade: a type's rung is part of what its
 //! path says, and the root itself holds no name.

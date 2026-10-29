@@ -9,19 +9,22 @@
 //! weight — which is not any one source row's weight. [`gather_rows`] takes the
 //! same triples and reads each cell through its source, for picks sparse in
 //! their sources.
+//!
+//! A merge source is a [`ColumnarSource`]: a row source that also carries the
+//! Z-set weight, which every N-way merge and these kernels read sources through.
 
 use std::ops::Range;
 
-use super::batch::{range_rows, write_to_batch, Batch, ColPtr, MemBatch};
+use super::batch::{range_rows, write_to_batch, Batch, MemBatch};
 use super::batch_pool::PooledBuf;
-use super::codebook::Codebook;
-use super::merge::ColumnarSource;
+use super::seek::ColPtr;
+use super::shard::Codebook;
 use super::string_heap::{
     carried_dead, prorated_blob_cap, rebase_string_cell, recode_string_cell, relocate_german_string_vec, row_long_bytes,
 };
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::{Heap, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START};
+use gnitz_wire::{Heap, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START};
 
 /// Instantiate `$f` at the const width matching `$w`, which is also passed on.
 /// The literal width keeps the per-row copy a load/store instead of a `memcpy`
@@ -246,6 +249,50 @@ pub(crate) fn mem_batch_to_unified<'a>(
         cols_off,
         heap: Heap::Plain(mb.blob),
         heap_at: None,
+    }
+}
+
+/// A `RowSource` that also carries the Z-set weight: a storage row the N-way
+/// merge folds.
+pub(crate) trait ColumnarSource: RowSource {
+    /// The row's signed Z-set weight / multiplicity (region 1).
+    fn get_weight(&self, row: usize) -> i64;
+
+    /// A [`UnifiedSource`] over this source's regions, readable at rows in
+    /// `window`, with one payload `ColPtr` per payload column of `schema`
+    /// appended to `cols`.
+    fn to_unified(
+        &self,
+        schema: &SchemaDescriptor,
+        cols: &mut Vec<ColPtr>,
+        window: Range<usize>,
+        decoded: &mut DecodedColumns,
+    ) -> UnifiedSource<'_>;
+
+    /// Whether this source's rows are (PK, coarse weight) pairs with no payload —
+    /// a capacity-bounded view's skeleton shard.
+    fn is_skeleton(&self) -> bool;
+}
+
+impl<'a> ColumnarSource for MemBatch<'a> {
+    #[inline(always)]
+    fn get_weight(&self, row: usize) -> i64 {
+        MemBatch::get_weight(self, row)
+    }
+
+    fn to_unified(
+        &self,
+        schema: &SchemaDescriptor,
+        cols: &mut Vec<ColPtr>,
+        _window: Range<usize>,
+        _decoded: &mut DecodedColumns,
+    ) -> UnifiedSource<'_> {
+        mem_batch_to_unified(self, schema, cols)
+    }
+
+    #[inline(always)]
+    fn is_skeleton(&self) -> bool {
+        false
     }
 }
 

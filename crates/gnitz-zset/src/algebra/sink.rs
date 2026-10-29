@@ -1,7 +1,7 @@
 //! [`SinkPlan`]: the sink of an ad-hoc read over one worker's surviving rows —
 //! the map, then a forward, a prefix cut, a top-k or a fold.
 
-use gnitz_expr::{order_locators, Lead, OrderLocator, RowRanking};
+use gnitz_expr::{order_locators, Lead, OrderLocator, RowFilter, RowRanking};
 
 use gnitz_wire::{ReadSink, RowsCut, SinkKind};
 
@@ -15,6 +15,8 @@ pub struct SinkPlan {
     /// The map every survivor goes through first, if any.
     map: Option<MapPlan>,
     kind: Kind,
+    /// The surviving row ranges of the chunk being pushed; reused across chunks.
+    ranges: Vec<(usize, usize)>,
 }
 
 enum Kind {
@@ -83,7 +85,7 @@ impl SinkPlan {
                 }
             }
         };
-        Ok(SinkPlan { map, kind })
+        Ok(SinkPlan { map, kind, ranges: Vec::new() })
     }
 
     /// The layout [`Self::finish`] emits.
@@ -103,12 +105,14 @@ impl SinkPlan {
         }
     }
 
-    /// Take the surviving `[start, end)` row `ranges` of one source chunk,
-    /// cutting the last range a window ends in. `Ok(true)` once the sink needs
-    /// no more rows; `Err` past a fold's group cap.
-    pub fn push(&mut self, chunk: &Batch, ranges: &mut [(usize, usize)]) -> Result<bool, String> {
-        let map = self.map.as_mut();
-        match &mut self.kind {
+    /// Take the rows of one source chunk `filter` keeps, cutting at the row a
+    /// window ends in. `Ok(true)` once the sink needs no more rows; `Err` past a
+    /// fold's group cap.
+    pub fn push(&mut self, chunk: &Batch, filter: &mut RowFilter) -> Result<bool, String> {
+        let SinkPlan { map, kind, ranges } = self;
+        filter.ranges(&chunk.as_mem_batch(), ranges);
+        let map = map.as_mut();
+        match kind {
             Kind::Rows(keeper) => {
                 append_survivors(map, chunk, keeper, ranges);
                 Ok(false)

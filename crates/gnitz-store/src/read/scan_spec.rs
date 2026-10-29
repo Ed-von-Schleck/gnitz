@@ -45,7 +45,6 @@ impl RelationRegistry {
         let mut filter =
             RowFilter::for_read(&predicate, walk.as_ref(), &src_schema).map_err(|e| format!("scan_spec: {e}"))?;
         let chunk_rows = self.config.scan_chunk_rows;
-        let mut ranges = Vec::new();
         let mut hydrate = |keys| match hydrator.as_deref_mut() {
             Some(h) => h
                 .hydrate_keys(self, target_id, keys)
@@ -58,8 +57,7 @@ impl RelationRegistry {
             let Some(chunk) = source.drain_hydrated(drain_rows, &mut hydrate)? else {
                 break;
             };
-            filter.ranges(&chunk.as_mem_batch(), &mut ranges);
-            if sink.push(&chunk, &mut ranges)? {
+            if sink.push(&chunk, &mut filter)? {
                 break;
             }
         }

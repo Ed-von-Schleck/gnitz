@@ -10,8 +10,8 @@ use std::rc::Rc;
 
 use gnitz_wire::{push_coded, push_codes, HeapValue, SymbolTable, MAX_SYMBOL_LEN};
 
-use super::batch::Batch;
-use super::shard_reader::MappedShard;
+use super::reader::MappedShard;
+use crate::repr::Batch;
 
 const _: () = assert!(
     fsst::ESCAPE_CODE == gnitz_wire::SYMBOL_ESCAPE,

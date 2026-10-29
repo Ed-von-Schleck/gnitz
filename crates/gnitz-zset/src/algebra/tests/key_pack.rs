@@ -177,10 +177,21 @@ fn a_content_key_packs_its_content_hash() {
 
 mod pack_proptest {
     use super::*;
-    use crate::test_support::{arb_pk_type, pk_only_schema};
+    use crate::test_support::pk_only_schema;
     use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
     use proptest::prelude::*;
     use proptest::sample::Index;
+
+    /// The PK-eligible type codes.
+    fn arb_pk_type() -> impl Strategy<Value = TypeCode> {
+        prop::sample::select(
+            TypeCode::ALL
+                .iter()
+                .copied()
+                .filter(|t| t.is_pk_eligible())
+                .collect::<Vec<_>>(),
+        )
+    }
 
     /// `packer`'s keys of the rows of `runs`, packed by `pack_rows` over dirty
     /// slots `pad` bytes wider than the key and by `pack_prefix` one at a time,

@@ -29,8 +29,8 @@ use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::StorageError;
 use gnitz_zset::repr::{empty_cursor, from_runs, from_runs_at, from_runs_in_band, PkSetGather, ReadCursor};
 use gnitz_zset::repr::{first_live_payload_group, Run, StoredRow};
-use gnitz_zset::schema::key::{group_band, probe_key, range_band};
 use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::{group_band, probe_key, range_band};
 
 /// Ingest runs fold into the RAM tier once they pass this.
 pub(super) const MEMTABLE_BYTES: usize = 192 << 10;

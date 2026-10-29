@@ -13,59 +13,15 @@ use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::ops::{ControlFlow, Range};
 
-use super::batch::{Batch, ColPtr, MemBatch};
+use super::batch::{Batch, MemBatch};
 use super::loser_tree::{HeapNode, LoserTree};
-use super::scatter::{mem_batch_to_unified, DecodedColumns, UnifiedSource};
+use super::scatter::ColumnarSource;
 use super::string_heap::{rebase_string_cells, row_long_bytes, BlobCache};
 use super::writer::DirectWriter;
 use crate::schema::key::{pack_pk_be, pk_width_dispatch, PkSortKey};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::{native_key_image, Heap, RowSource, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT};
-
-/// A `RowSource` that also carries the Z-set weight: a storage row the N-way
-/// merge folds.
-pub(crate) trait ColumnarSource: RowSource {
-    /// The row's signed Z-set weight / multiplicity (region[1]).
-    fn get_weight(&self, row: usize) -> i64;
-
-    /// A [`UnifiedSource`] over this source's regions, readable at rows in
-    /// `window`, with one payload `ColPtr` per payload column of `schema`
-    /// appended to `cols`.
-    fn to_unified(
-        &self,
-        schema: &SchemaDescriptor,
-        cols: &mut Vec<ColPtr>,
-        window: Range<usize>,
-        decoded: &mut DecodedColumns,
-    ) -> UnifiedSource<'_>;
-
-    /// Whether this source's rows are (PK, coarse weight) pairs with no payload —
-    /// a capacity-bounded view's skeleton shard.
-    fn is_skeleton(&self) -> bool;
-}
-
-impl<'a> ColumnarSource for MemBatch<'a> {
-    #[inline(always)]
-    fn get_weight(&self, row: usize) -> i64 {
-        MemBatch::get_weight(self, row)
-    }
-
-    fn to_unified(
-        &self,
-        schema: &SchemaDescriptor,
-        cols: &mut Vec<ColPtr>,
-        _window: Range<usize>,
-        _decoded: &mut DecodedColumns,
-    ) -> UnifiedSource<'_> {
-        mem_batch_to_unified(self, schema, cols)
-    }
-
-    #[inline(always)]
-    fn is_skeleton(&self) -> bool {
-        false
-    }
-}
+use gnitz_wire::{native_key_image, Heap, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT};
 
 // ---------------------------------------------------------------------------
 // Z-Set `+` over consolidated batches
@@ -85,7 +41,7 @@ pub fn merge_consolidated(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -
         .zip(held.skip(1))
         .all(|(a, b)| a.get_pk_bytes(a.count - 1) < b.get_pk_bytes(0));
     let mut out = match ascending {
-        true => Batch::concat(schema, sources.iter().cloned()),
+        true => Batch::concat(schema, sources.iter().copied()),
         false => merge_interleaved(sources, schema),
     };
     out.certify_consolidated();
@@ -109,17 +65,17 @@ fn merge_interleaved(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Bat
         .iter()
         .enumerate()
         .filter(|&(i, s)| i != big && s.count > 0)
-        .map(|(_, s)| s.clone())
+        .map(|(_, s)| *s)
         .collect();
     let summed;
     let other = match &rest[..] {
-        [one] => one.clone(),
+        [one] => *one,
         rest => {
             summed = merge_consolidated(rest, schema);
             summed.as_mem_batch()
         }
     };
-    let srcs = [dominant.clone(), other];
+    let srcs = [*dominant, other];
     pk_width_dispatch!(schema.pk_stride(), |K| {
         with_payload_cmp!(schema, |p| two_way::<K, _>(&srcs, schema, p))
     })
@@ -135,44 +91,11 @@ fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
 }
 
 // ---------------------------------------------------------------------------
-// PosCursor: one source's position within the N-way merge
-// ---------------------------------------------------------------------------
-
-/// One source's merge position: `position` walks up to `end`, exclusive.
-/// Sources are ghost-free by construction (a shard is *written* consolidated, a
-/// RAM-tier run folded on the way in) and [`drive`]'s fold drops a stray ghost
-/// anyway, so advancing is a bare `position + 1`.
-///
-/// `end` need not be the source's row count: a read cursor's range seek clamps
-/// it to the range's exclusive end so the walk simply exhausts at the cut.
-pub(crate) struct PosCursor {
-    pub(crate) position: usize,
-    pub(crate) end: usize,
-}
-
-impl PosCursor {
-    /// A cursor over `rows`, from its first.
-    #[inline]
-    pub(crate) fn over(rows: Range<usize>) -> Self {
-        debug_assert!(
-            rows.end < u32::MAX as usize,
-            "merge source exceeds the heap node's u32 row"
-        );
-        PosCursor { position: rows.start, end: rows.end }
-    }
-
-    #[inline]
-    pub(crate) fn is_valid(&self) -> bool {
-        self.position < self.end
-    }
-}
-
-// ---------------------------------------------------------------------------
 // run_merge: the generic N-way (PK, payload) merge + consolidation
 // ---------------------------------------------------------------------------
 
 /// N-way (PK, payload) merge + consolidation over any sorted columnar sources —
-/// the kernel of shard compaction (`compact::merge_guard`) and of
+/// the kernel of shard compaction (`shard::merge_guard`) and of
 /// [`merge_consolidated`]'s N-way arm.
 ///
 /// Rows with the same (PK, payload) have their weights summed; zero-weight
@@ -194,13 +117,17 @@ pub(crate) fn run_merge<S: ColumnarSource>(
     if sources.is_empty() {
         return Vec::new();
     }
-    let mut cursors: Vec<PosCursor> = windows.into_iter().map(PosCursor::over).collect();
+    let mut cursors: Vec<Range<usize>> = windows.into_iter().collect();
     debug_assert_eq!(cursors.len(), sources.len(), "run_merge: one window per source");
+    debug_assert!(
+        cursors.iter().all(|c| c.end < u32::MAX as usize),
+        "merge source exceeds the heap node's u32 row"
+    );
     debug_assert!(
         schema.num_payload_cols() == 0 || !sources.iter().any(S::is_skeleton),
         "a skeleton row merges under the PK-only schema: this order is never coarsened"
     );
-    let mut rows = Vec::with_capacity(cursors.iter().map(|c| c.end - c.position).sum());
+    let mut rows = Vec::with_capacity(cursors.iter().map(|c| c.len()).sum());
 
     // Dispatch the payload order, monomorphizing one branch-free copy of the
     // merge loop.
@@ -316,15 +243,15 @@ impl MergeOrder {
     /// Keyed past the prefix every row `cursors` walk of `sources` shares —
     /// what each walk's first and last rows share, a source being sorted — so
     /// that keys of small values in wide columns do not all tie.
-    fn past_shared_prefix<S: ColumnarSource>(sources: &[S], cursors: &[PosCursor], stride: usize) -> Self {
+    fn past_shared_prefix<S: ColumnarSource>(sources: &[S], cursors: &[Range<usize>], stride: usize) -> Self {
         if stride <= NARROW_PK_MAX_BYTES {
             return Self::leading(stride, false);
         }
         let mut bounds = sources
             .iter()
             .zip(cursors)
-            .filter(|(_, c)| c.is_valid())
-            .flat_map(|(s, c)| [s.get_pk_bytes(c.position), s.get_pk_bytes(c.end - 1)]);
+            .filter(|(_, c)| !c.is_empty())
+            .flat_map(|(s, c)| [s.get_pk_bytes(c.start), s.get_pk_bytes(c.end - 1)]);
         let first = bounds.next().unwrap_or(&[]);
         let shared = |pk: &[u8]| first.iter().zip(pk).take_while(|(a, b)| a == b).count();
         let at = bounds.map(shared).min().unwrap_or(0);
@@ -345,9 +272,11 @@ impl MergeOrder {
     /// The tournament leaf of source `src`'s walk `c`: its current row and that
     /// row's key, or `None` once the walk is exhausted.
     #[inline(always)]
-    pub(crate) fn head<S: ColumnarSource>(self, sources: &[S], src: usize, c: &PosCursor) -> Option<(u32, u128)> {
-        c.is_valid()
-            .then(|| (c.position as u32, self.key(&sources[src], c.position)))
+    pub(crate) fn head<S: ColumnarSource>(self, sources: &[S], src: usize, c: &Range<usize>) -> Option<(u32, u128)> {
+        match c.start < c.end {
+            true => Some((c.start as u32, self.key(&sources[src], c.start))),
+            false => None,
+        }
     }
 
     /// A row's tournament key.
@@ -385,7 +314,7 @@ pub(crate) fn drive<S, P>(
     schema: &SchemaDescriptor,
     sources: &[S],
     order: MergeOrder,
-    cursors: &mut [PosCursor],
+    cursors: &mut [Range<usize>],
     payload: P,
     mut emit: impl FnMut(usize, usize, i64) -> ControlFlow<()>,
 ) where
@@ -399,7 +328,7 @@ pub(crate) fn drive<S, P>(
     macro_rules! step {
         ($src:expr) => {{
             let c = &mut cursors[$src];
-            c.position += 1;
+            c.start += 1;
             tree.step_top(order.head(sources, $src, c), &less);
         }};
     }
@@ -636,9 +565,13 @@ where
     let (n_a, n_b) = (a.count, b.count);
     let (keys_a, keys_b) = (Keys::<K>::of(a), Keys::<K>::of(b));
     let mut out = Batch::with_capacity(schema, n_a + n_b);
-    let mut session = out.append_session(n_a + n_b);
-    let heap_at = [session.carry(a, &[(0, n_a)]), session.carry(b, &[(0, n_b)])];
-    let dead = session.write_at_most(n_a + n_b, |writer| {
+    let slots = schema.string_payload_slots();
+    let heap_at = [
+        out.carry_heap(a, slots, &[(0, n_a)]),
+        out.carry_heap(b, slots, &[(0, n_b)]),
+    ];
+    let mut cache = out.blob_cache(n_a + n_b);
+    let dead = out.write_at_most(n_a + n_b, &mut cache, |writer| {
         let mut sink = MergeSink::new(srcs, heap_at, writer);
         let (mut ia, mut jb) = (0usize, 0usize);
         // SAFETY: `ia` and `jb` only grow, each stays within its side's rows

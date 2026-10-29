@@ -9,7 +9,7 @@
 use std::ops::Range;
 
 use super::codebook::Codebook;
-use super::seek::{gallop_by, lower_bound_by};
+use crate::repr::seek::{gallop_by, lower_bound_by};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{
     read_u32_le, read_u64_le, write_u32_le, write_u64_le, CodedHeap, FixedInt, Heap, HeapValue, ScalarKind,
@@ -772,11 +772,7 @@ impl<'a> KeyImage<'a> {
                 return self.count;
             };
             // A row's word runs into the rows after it, where the probe is zero.
-            let lt = |row: usize| self.word::<W>(row) < probe;
-            match hint {
-                Some(hint) => gallop_by(self.count, hint, lt),
-                None => lower_bound_by(0, self.count, lt),
-            }
+            gallop_by(self.count, hint, |row: usize| self.word::<W>(row) < probe)
         })
     }
 

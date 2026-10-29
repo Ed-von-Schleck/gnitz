@@ -9,7 +9,7 @@ use gnitz_wire::{Heap, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_
 /// Writes rows `[at, at + rows)` of a pre-allocated arena, each region handed
 /// out as a slice of exactly those rows: a batch's tail, or a wire block's fixed
 /// bytes. A batch counts the rows only once its writer is done with them (see
-/// `AppendSession::write`), so no reader reaches a row before its regions are
+/// `Batch::write_rows`), so no reader reaches a row before its regions are
 /// written.
 ///
 /// **Whoever fills a writer writes every byte of every one of its rows** — the
@@ -88,7 +88,7 @@ impl<'a> DirectWriter<'a> {
 
     /// Region `r`, bounded to this writer's rows.
     #[inline(always)]
-    pub(crate) fn region_mut(&mut self, r: usize) -> &mut [u8] {
+    pub(super) fn region_mut(&mut self, r: usize) -> &mut [u8] {
         let stride = self.schema.region_stride(r);
         let start = self.schema.region_start(r, self.cap) + self.at * stride;
         &mut self.data[start..start + self.rows * stride]
