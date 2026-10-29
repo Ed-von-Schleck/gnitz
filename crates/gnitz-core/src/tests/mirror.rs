@@ -25,6 +25,11 @@ use std::time::Instant;
 /// The feed tag every cursor here carries.
 const TAG: u64 = 0xFEED;
 
+/// One poll of every mirrored view, which must succeed at the call level.
+fn poll(client: &mut GnitzClient) -> Vec<PollOutcome> {
+    block_on(client.sync(Duration::ZERO)).expect("poll").mirrored
+}
+
 // ---------------------------------------------------------------------------
 // A recording store
 // ---------------------------------------------------------------------------
@@ -34,38 +39,44 @@ const TAG: u64 = 0xFEED;
 enum Ev {
     Register(u64),
     Forget(u64),
-    /// `tid`'s copy erased for a refill.
-    Erase(u64),
+    /// `tid` registered again, erased and opened for its whole value.
+    Refill(u64),
     /// One block of a refill of `tid`.
     Fill(u64),
     /// `(tid, the round the refill was sealed at)`.
-    Reseed(u64, u64),
+    Seal(u64, u64),
     /// `(tid, the round the copy moved to)`.
     Advance(u64, u64),
 }
 
 #[derive(Clone, Default)]
-struct Log(Arc<Mutex<Vec<Ev>>>, Arc<Mutex<Option<u64>>>, Arc<Mutex<Option<u64>>>);
+struct Log {
+    events: Arc<Mutex<Vec<Ev>>>,
+    /// The copy the next `register` retracts before it fails.
+    fail_register_retracting: Arc<Mutex<Option<u64>>>,
+    /// The copy whose next `fill` fails.
+    fail_fill_of: Arc<Mutex<Option<u64>>>,
+}
 
 impl Log {
     fn push(&self, e: Ev) {
-        self.0.lock().unwrap().push(e);
+        self.events.lock().unwrap().push(e);
     }
     fn take(&self) -> Vec<Ev> {
-        std::mem::take(&mut *self.0.lock().unwrap())
+        std::mem::take(&mut *self.events.lock().unwrap())
     }
     /// Fail the store's next `register`, once, after it retracted `old`.
     fn fail_next_register_retracting(&self, old: u64) {
-        *self.1.lock().unwrap() = Some(old);
+        *self.fail_register_retracting.lock().unwrap() = Some(old);
     }
     /// Fail the store's next `fill` of `tid`, once.
     fn fail_next_fill_of(&self, tid: u64) {
-        *self.2.lock().unwrap() = Some(tid);
+        *self.fail_fill_of.lock().unwrap() = Some(tid);
     }
     /// Whether any event so far matches, without draining — for a test that
     /// watches the log while the call under test is still running.
     fn saw(&self, f: impl Fn(&Ev) -> bool) -> bool {
-        self.0.lock().unwrap().iter().any(f)
+        self.events.lock().unwrap().iter().any(f)
     }
 }
 
@@ -77,13 +88,9 @@ struct StubStore {
 }
 
 impl MirrorStore for StubStore {
-    fn base_dir(&self) -> &str {
-        "stub"
-    }
-
     fn register(&mut self, _name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError> {
         self.log.push(Ev::Register(desc.tid));
-        if let Some(old) = self.log.1.lock().unwrap().take() {
+        if let Some(old) = self.log.fail_register_retracting.lock().unwrap().take() {
             self.cursors.remove(&old);
             return Err(MirrorError::Engine("stub: the copy could not be entered".into()));
         }
@@ -96,23 +103,22 @@ impl MirrorStore for StubStore {
         Ok(())
     }
 
-    fn refill(&mut self, tid: u64) -> Result<(), MirrorError> {
-        self.log.push(Ev::Erase(tid));
-        self.cursors.remove(&tid);
+    fn refill(&mut self, _name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError> {
+        self.log.push(Ev::Refill(desc.tid));
+        self.cursors.remove(&desc.tid);
         Ok(())
     }
 
-    fn fill(&mut self, tid: u64, blocks: &[&[u8]]) -> Result<(), MirrorError> {
-        if self.log.2.lock().unwrap().take_if(|failing| *failing == tid).is_some() {
+    fn fill(&mut self, tid: u64, blocks: &[&[u8]], sealed_at: Option<DeltaCursor>) -> Result<(), MirrorError> {
+        let failing = self.log.fail_fill_of.lock().unwrap().take_if(|failing| *failing == tid);
+        if failing.is_some() {
             return Err(MirrorError::Engine("stub: the block could not be applied".into()));
         }
         blocks.iter().for_each(|_| self.log.push(Ev::Fill(tid)));
-        Ok(())
-    }
-
-    fn seal(&mut self, tid: u64, cursor: DeltaCursor) -> Result<(), MirrorError> {
-        self.log.push(Ev::Reseed(tid, cursor.tick.get()));
-        self.cursors.insert(tid, cursor);
+        if let Some(cursor) = sealed_at {
+            self.log.push(Ev::Seal(tid, cursor.tick.get()));
+            self.cursors.insert(tid, cursor);
+        }
         Ok(())
     }
 
@@ -142,10 +148,6 @@ impl MirrorStore for StubStore {
 
     fn checkpoint(&mut self) -> Result<(), MirrorError> {
         Ok(())
-    }
-
-    fn poisoned(&self) -> Option<&str> {
-        None
     }
 }
 
@@ -284,7 +286,8 @@ fn fixture(views: &[(u64, &str, u64)]) -> (GnitzClient, Peer, Log) {
         .iter()
         .filter_map(|&(tid, _, tick)| Some((tid, DeltaCursor::from_pair(TAG, tick)?)))
         .collect();
-    client.attach_mirror(StubStore { cursors, log: log.clone() }).unwrap();
+    let store = StubStore { cursors, log: log.clone() };
+    block_on(client.attach_mirror(move || Ok(store))).unwrap();
     let schema = Arc::new(kv_schema(TypeCode::I64));
     for &(tid, name, _) in views {
         let desc = RelDescriptor {
@@ -342,9 +345,7 @@ fn one_poll_writes_one_request_for_every_view() {
             }
             ids
         });
-        let report = block_on(client.sync(Duration::ZERO))
-            .map(|s| s.mirrored)
-            .expect("every view advances");
+        let report = poll(&mut client);
         let seen = h.join().unwrap();
 
         assert_eq!(
@@ -392,9 +393,7 @@ fn only_a_stale_registration_pays_a_resolve() {
                 _ => {}
             }
         });
-        let report = block_on(client.sync(Duration::ZERO))
-            .map(|s| s.mirrored)
-            .expect("a per-view failure is not the call's");
+        let report = poll(&mut client);
         h.join().unwrap();
         let (requests, reseeded) = match status {
             WireStatus::StaleCatalog => (2, false),
@@ -434,24 +433,13 @@ fn a_bootstrap_fills_the_store_frame_by_frame() {
         }
         peer.send_rows(7, &[(2, 20, 1)], Some(20));
     });
-    let report = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("the bootstrap lands");
+    let report = poll(&mut client);
     h.join().unwrap();
     assert!(
         matches!(report.as_slice(), [o] if o.view_id == 7 && o.result.reseeded()),
         "{report:?}"
     );
-    assert_eq!(
-        log.take(),
-        [
-            Ev::Register(7),
-            Ev::Erase(7),
-            Ev::Fill(7),
-            Ev::Fill(7),
-            Ev::Reseed(7, 20),
-        ],
-    );
+    assert_eq!(log.take(), [Ev::Refill(7), Ev::Fill(7), Ev::Fill(7), Ev::Seal(7, 20)]);
 }
 
 /// Copies holding no cursor are read whole in the request that advances the
@@ -466,9 +454,7 @@ fn copies_without_a_cursor_are_read_whole_in_the_one_request() {
         }
         ids.len()
     });
-    let report = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("every view is read");
+    let report = poll(&mut client);
     assert_eq!(h.join().unwrap(), 3, "every view rides the request");
     assert_eq!(client.requests_sent(), 1);
     let mut reseeded: Vec<(u64, bool)> = report.iter().map(|o| (o.view_id, o.result.reseeded())).collect();
@@ -480,12 +466,10 @@ fn copies_without_a_cursor_are_read_whole_in_the_one_request() {
         events,
         [
             Ev::Advance(9, 20),
-            Ev::Erase(7),
-            Ev::Erase(8),
-            Ev::Register(7),
-            Ev::Register(8),
-            Ev::Reseed(7, 20),
-            Ev::Reseed(8, 20),
+            Ev::Refill(7),
+            Ev::Refill(8),
+            Ev::Seal(7, 20),
+            Ev::Seal(8, 20),
         ],
     );
 }
@@ -511,9 +495,7 @@ fn a_refused_block_fails_its_view_and_no_other() {
         }
         (peer, kept)
     });
-    let report = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("a store refusal is the view's failure");
+    let report = poll(&mut client);
     let (peer, kept) = h.join().unwrap();
     drop(client.begin_sync(Duration::ZERO).expect("a sync is sent"));
     client.session.step(crate::Interest::WRITE);
@@ -525,7 +507,7 @@ fn a_refused_block_fails_its_view_and_no_other() {
         .collect();
     assert_eq!(failed, [7], "{report:?}");
     assert!(log.saw(|e| *e == Ev::Advance(8, 20)), "the view behind it is read");
-    assert!(!log.saw(|e| matches!(e, Ev::Fill(7) | Ev::Reseed(7, _))));
+    assert!(!log.saw(|e| matches!(e, Ev::Fill(7) | Ev::Seal(7, _))));
 }
 
 /// A whole read whose train ends refused in the same step as its blocks
@@ -541,9 +523,7 @@ fn a_whole_read_refused_mid_train_leaves_the_copy() {
         peer.send_bytes(&wire);
         peer
     });
-    let report = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("a per-view failure is not the call's");
+    let report = poll(&mut client);
     let _peer = h.join().unwrap();
     assert!(
         matches!(
@@ -556,7 +536,7 @@ fn a_whole_read_refused_mid_train_leaves_the_copy() {
         ),
         "{report:?}"
     );
-    assert!(!log.saw(|e| matches!(e, Ev::Register(7) | Ev::Erase(7) | Ev::Fill(7) | Ev::Reseed(7, _))));
+    assert!(!log.saw(|e| matches!(e, Ev::Register(7) | Ev::Refill(7) | Ev::Fill(7) | Ev::Seal(7, _))));
 }
 
 // ---------------------------------------------------------------------------
@@ -595,9 +575,7 @@ fn a_leftover_poll_does_not_shift_the_replies() {
             peer.reply_watermark(tid, TAG, 100 + tid);
         }
     });
-    block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("the leftover train is drained, not applied");
+    poll(&mut client);
     h.join().unwrap();
 
     let mut applied = log.take();
@@ -632,9 +610,7 @@ fn no_recovery_runs_before_every_ingest_has() {
         peer.reply_watermark(9, TAG, 20);
         (ids[0], ids[1])
     });
-    let report = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("a recovered view is not the call's failure");
+    let report = poll(&mut client);
     let (gone, alive) = h.join().unwrap();
     assert_eq!(
         client.requests_sent(),
@@ -653,7 +629,7 @@ fn no_recovery_runs_before_every_ingest_has() {
         "a recovery ran before its round finished ingesting: {events:?}",
     );
     assert!(
-        events.contains(&Ev::Reseed(9, 20)) && !events.iter().any(|e| matches!(e, Ev::Erase(t) if *t == gone)),
+        events.contains(&Ev::Seal(9, 20)) && !events.iter().any(|e| matches!(e, Ev::Refill(t) if *t == gone)),
         "the moved view is read whole at its new id: {events:?}",
     );
     let mut ids: Vec<u64> = report.iter().map(|o| o.view_id).collect();
@@ -688,15 +664,13 @@ fn a_reseed_onto_a_live_copy_does_not_erase_it() {
         assert!(matches!(next[..], [(8, id)] if id != kept), "{next:?}");
         peer.reply_watermark(8, TAG, 12);
     });
-    let report = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("the recovery lands on a live copy");
+    let report = poll(&mut client);
     h.join().unwrap();
     assert_eq!(client.requests_sent(), 3, "the poll, the resolve, the next round");
 
     let events = log.take();
     assert!(
-        !events.iter().any(|e| matches!(e, Ev::Erase(8) | Ev::Reseed(8, _))),
+        !events.iter().any(|e| matches!(e, Ev::Refill(8) | Ev::Seal(8, _))),
         "the live copy must be neither erased nor re-read whole: {events:?}",
     );
     assert!(
@@ -726,18 +700,16 @@ fn a_recovery_onto_an_expired_view_reads_it_whole_once() {
         assert_eq!(peer.expect_poll("the whole read"), vec![8]);
         peer.reply_watermark(8, TAG, 20);
     });
-    let report = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("both recoveries land");
+    let report = poll(&mut client);
     h.join().unwrap();
     assert_eq!(client.requests_sent(), 3, "the poll, the resolve, the whole read");
 
     let events = log.take();
     let whole: Vec<&Ev> = events
         .iter()
-        .filter(|e| matches!(e, Ev::Erase(_) | Ev::Reseed(..)))
+        .filter(|e| matches!(e, Ev::Refill(_) | Ev::Seal(..)))
         .collect();
-    assert_eq!(whole, [&Ev::Erase(8), &Ev::Reseed(8, 20)], "{events:?}");
+    assert_eq!(whole, [&Ev::Refill(8), &Ev::Seal(8, 20)], "{events:?}");
     assert!(
         matches!(report.as_slice(), [o] if o.view_id == 8 && o.result.reseeded()),
         "{report:?}"
@@ -758,9 +730,7 @@ fn a_recovery_that_moves_and_then_fails_is_reported_at_the_new_id() {
         // The connection goes with the whole read unanswered.
         assert_eq!(peer.expect_poll("the whole read"), vec![9]);
     });
-    let report = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("a lost connection is each view's failure");
+    let report = poll(&mut client);
     h.join().unwrap();
 
     assert!(
@@ -788,9 +758,7 @@ fn a_registration_the_store_lost_is_entered_again_by_the_next_poll() {
         peer.reply_resolved(9);
         peer
     });
-    let report = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("a store refusal is the view's failure");
+    let report = poll(&mut client);
     let peer = h.join().unwrap();
     assert!(
         matches!(report.as_slice(), [o] if o.view_id == 7 && matches!(o.result, PollResult::Failed(ClientError::Mirror(_)))),
@@ -802,15 +770,13 @@ fn a_registration_the_store_lost_is_entered_again_by_the_next_poll() {
         assert_eq!(peer.expect_poll("the whole read"), vec![7]);
         peer.reply_watermark(7, TAG, 20);
     });
-    let report = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("the view is read whole");
+    let report = poll(&mut client);
     h.join().unwrap();
     assert!(
         matches!(report.as_slice(), [o] if o.view_id == 7 && o.result.reseeded()),
         "{report:?}"
     );
-    assert_eq!(log.take(), [Ev::Register(7), Ev::Erase(7), Ev::Reseed(7, 20)]);
+    assert_eq!(log.take(), [Ev::Refill(7), Ev::Seal(7, 20)]);
 }
 
 /// An interrupted poll discards its report, so a reseed it ran is still owed:
@@ -822,7 +788,7 @@ fn an_interrupted_poll_reannounces_its_reseed() {
     client.mirror.as_mut().unwrap().views.get_mut(&7).unwrap().confirmed = false;
     let watched = log.clone();
     client.host = Box::new(BlockingHost::with_hook(Box::new(move || {
-        if watched.saw(|e| matches!(e, Ev::Reseed(7, _))) {
+        if watched.saw(|e| matches!(e, Ev::Seal(7, _))) {
             Err("interrupted".into())
         } else {
             Ok(())
@@ -866,9 +832,7 @@ fn an_interrupted_poll_reannounces_its_reseed() {
     });
     let mut results = Vec::new();
     for _ in 0..2 {
-        let mut report: Vec<(u64, bool)> = block_on(client.sync(Duration::ZERO))
-            .map(|s| s.mirrored)
-            .expect("both views advance")
+        let mut report: Vec<(u64, bool)> = poll(&mut client)
             .iter()
             .map(|o| (o.view_id, o.result.reseeded()))
             .collect();
@@ -916,9 +880,7 @@ fn a_broken_poll_reply_fails_the_views_it_never_answered() {
             script(&peer, &ids);
             ids
         });
-        let report = block_on(client.sync(Duration::ZERO))
-            .map(|s| s.mirrored)
-            .expect("a broken reply is reported per view");
+        let report = poll(&mut client);
         let ids = h.join().unwrap();
 
         for (i, id) in ids.iter().enumerate() {
@@ -931,7 +893,7 @@ fn a_broken_poll_reply_fails_the_views_it_never_answered() {
             } else {
                 assert!(matches!(o.result, PollResult::Failed(_)), "{what}: {report:?}");
                 assert!(
-                    !log.saw(|e| matches!(e, Ev::Reseed(t, _) | Ev::Advance(t, _) if t == id)),
+                    !log.saw(|e| matches!(e, Ev::Seal(t, _) | Ev::Advance(t, _) if t == id)),
                     "{what}: nothing is ingested under an unanswered view",
                 );
             }
@@ -954,7 +916,7 @@ fn each_view_is_ingested_before_the_next_one_is_answered() {
         // Nothing else is on the wire, so an ingest seen before the second
         // terminal goes out ran off the first position's.
         let deadline = Instant::now() + PATIENCE;
-        while !watched.saw(|e| matches!(e, Ev::Reseed(t, _) | Ev::Advance(t, _) if *t == ids[0])) {
+        while !watched.saw(|e| matches!(e, Ev::Seal(t, _) | Ev::Advance(t, _) if *t == ids[0])) {
             assert!(
                 Instant::now() < deadline,
                 "the first view's blocks must reach the store before the second view is answered",
@@ -963,9 +925,7 @@ fn each_view_is_ingested_before_the_next_one_is_answered() {
         }
         peer.reply_watermark(ids[1], TAG, 12);
     });
-    let report = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("both views advance");
+    let report = poll(&mut client);
     h.join().unwrap();
 
     assert!(report.iter().all(|o| matches!(o.result, PollResult::Advanced)));
@@ -985,9 +945,7 @@ fn a_dead_connection_fails_each_view_rather_than_the_call() {
             assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
         }
 
-        let report = block_on(client.sync(Duration::ZERO))
-            .map(|s| s.mirrored)
-            .expect("a dead socket is not the call's own failure");
+        let report = poll(&mut client);
         let mut ids: Vec<u64> = report.iter().map(|o| o.view_id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![7, 8], "one entry per view: {report:?}");
@@ -1019,9 +977,7 @@ fn subscribed() -> (GnitzClient, Peer, Log, HashMap<u64, u64>) {
         }
         (peer, kept.into_iter().collect())
     });
-    block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("both views advance");
+    poll(&mut client);
     let (peer, subs) = h.join().unwrap();
     log.take();
     (client, peer, log, subs)
@@ -1041,9 +997,7 @@ fn a_subscribed_copy_is_advanced_by_what_was_pushed() {
         peer.send(&sync_answer(None));
     });
     let before = client.requests_sent();
-    let mut report: Vec<(u64, u64)> = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("both views advance")
+    let mut report: Vec<(u64, u64)> = poll(&mut client)
         .iter()
         .map(|o| {
             assert!(matches!(o.result, PollResult::Advanced), "{o:?}");
@@ -1073,9 +1027,7 @@ fn a_train_behind_another_reply_waits_for_its_poll() {
     });
     assert_eq!(block_on(client.alloc_id()).unwrap(), 4242);
     assert!(log.take().is_empty(), "a copy moves only in a poll");
-    block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("both views advance");
+    poll(&mut client);
     h.join().unwrap();
     assert_eq!(log.take(), [Ev::Advance(8, 15)], "a view sent nothing does not move");
 }
@@ -1095,9 +1047,7 @@ fn a_subscription_that_ended_is_continued_by_a_delta_read() {
         peer.reply_watermark(7, TAG, 13);
     });
     let before = client.requests_sent();
-    let report = block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("both views advance");
+    let report = poll(&mut client);
     h.join().unwrap();
     assert_eq!(client.requests_sent() - before, 2, "the sync, then the delta read");
     assert!(
@@ -1264,12 +1214,8 @@ fn a_forgotten_view_ends_its_subscription() {
         assert_eq!(peer.expect_sync_naming("the poll after"), [subs[&8]]);
         peer.send(&sync_answer(None));
     });
-    block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("both views advance");
+    poll(&mut client);
     block_on(client.forget_view(7)).unwrap();
-    block_on(client.sync(Duration::ZERO))
-        .map(|s| s.mirrored)
-        .expect("the view kept advances");
+    poll(&mut client);
     h.join().unwrap();
 }

@@ -41,7 +41,7 @@ TARGET_CPU ?= x86-64-v3
 # The features that compile the suites driving a real server.
 INTEGRATION := --features gnitz-sql/integration --features gnitz-core/integration \
                --features gnitz-tokio/integration --features gnitz/integration \
-               --features gnitz-dump/integration
+               --features gnitz-dump/integration --features gnitz-mirror/integration
 
 .PHONY: all help \
         test rust-engine-test fmt fmt-check clippy check verify \

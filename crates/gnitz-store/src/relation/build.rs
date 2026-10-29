@@ -42,16 +42,17 @@ impl RelationRegistry {
         filled
     }
 
-    /// Enter a secondary index on `owner` over `cols`, filled from this process's
-    /// slice of the owner, or add a claim to the one already on `cols`. On `Err`
-    /// nothing is entered. A claim's `unique` is trusted: a duplicate can straddle
-    /// two workers' slices, so only the caller can check it.
-    pub fn add_index(&mut self, owner: u64, claim: IndexClaim, cols: PkColList) -> Result<(), String> {
+    /// Enter a secondary index on `owner` for each `(claim, cols)`, the new ones
+    /// filled by one scan of this process's slice of the owner, or add a claim
+    /// to the one already on `cols`. On `Err` nothing is entered. A claim's
+    /// `unique` is trusted: a duplicate can straddle two workers' slices, so
+    /// only the caller can check it.
+    pub fn add_indexes(&mut self, owner: u64, indexes: &[(IndexClaim, PkColList)]) -> Result<(), String> {
         // Always rebuilt: a manifest a released index left on `cols` is stale.
-        self.enter_indexes(owner, &[(claim, cols)], None).map(drop)
+        self.enter_indexes(owner, indexes, None).map(drop)
     }
 
-    /// Enter `indexes` on `owner`, each as [`Self::add_index`] does, their new
+    /// Enter `indexes` on `owner`, each as [`Self::add_indexes`] does, their new
     /// stores resumed at `resume_at` and the ones that did not filled by one scan
     /// of the owner. On `Err` nothing is entered. Returns how many it filled.
     fn enter_indexes(

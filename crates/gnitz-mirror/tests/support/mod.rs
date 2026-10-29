@@ -3,8 +3,9 @@
 use gnitz_core::block_on;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use gnitz_core::{GnitzClient, ScanReply, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, PollOutcome, PollResult, ScanReply, Schema, ZSetBatch};
 use gnitz_sql::SqlResult;
 use gnitz_zset_testkit::{row_key, RowKey};
 
@@ -54,6 +55,19 @@ pub fn canonical_rows((schema, batch): &Reply) -> Vec<(RowKey, i64)> {
     (0..batch.weights.len())
         .map(|row| (row_key(batch, schema.as_ref().layout(), row), batch.weights[row]))
         .collect()
+}
+
+/// One poll of every mirrored view, held up to `wait` while nothing is reported.
+pub fn poll(c: &mut GnitzClient, wait: Duration) -> Vec<PollOutcome> {
+    block_on(c.sync(wait)).expect("poll").mirrored
+}
+
+/// Assert every view `report` names advanced.
+pub fn assert_advanced(report: &[PollOutcome]) {
+    assert!(
+        report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+        "{report:?}"
+    );
 }
 
 /// `f`'s result, and how many requests it sent through `client`.

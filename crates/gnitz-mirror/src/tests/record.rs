@@ -5,28 +5,31 @@ use gnitz_zset_testkit::make_schema_u64_i64;
 
 use super::*;
 
-fn record(cursor: Option<DeltaCursor>) -> MirrorRecord {
+fn record(feed: Feed) -> MirrorRecord {
     MirrorRecord {
         name: RelName::new("public", "recent").unwrap(),
         block: encode_schema_block(&make_schema_u64_i64()),
         pk_repeats: false,
         indexes: vec![PkColList::from_slice(&[1]), PkColList::from_slice(&[1, 0])],
-        cursor,
+        feed,
     }
 }
 
-fn one_cursor() -> Option<DeltaCursor> {
-    DeltaCursor::from_pair(0xFEED, 41)
+fn one_cursor() -> Feed {
+    Feed::At(DeltaCursor::from_pair(0xFEED, 41).unwrap())
 }
 
 /// A registration round-trips with its cursor and decodes to the layout its
-/// block describes; one with no feed position comes back with none.
+/// block describes; one with no feed position comes back with none, as does
+/// one being refilled.
 #[test]
 fn a_record_round_trips() {
-    for cursor in [one_cursor(), None] {
-        let rec = record(cursor);
+    for feed in [one_cursor(), Feed::Empty] {
+        let rec = record(feed);
         assert_eq!(MirrorRecord::decode(&rec.encode()), Some((rec, make_schema_u64_i64())));
     }
+    let filling = MirrorRecord::decode(&record(Feed::Filling).encode()).map(|(rec, _)| rec.feed);
+    assert_eq!(filling, Some(Feed::Empty), "a refill in progress persists as no value");
 }
 
 #[test]
@@ -47,6 +50,16 @@ fn bytes_that_are_no_record_are_refused() {
         ..record(one_cursor())
     };
     refused.push(("a block describing no layout".into(), no_layout.encode()));
+    let descending = MirrorRecord {
+        indexes: vec![PkColList::from_slice(&[1, 0]), PkColList::from_slice(&[1])],
+        ..record(one_cursor())
+    };
+    refused.push(("index lists out of order".into(), descending.encode()));
+    let twice = MirrorRecord {
+        indexes: vec![PkColList::from_slice(&[1]); 2],
+        ..record(one_cursor())
+    };
+    refused.push(("an index listed twice".into(), twice.encode()));
 
     for (what, bytes) in refused {
         assert!(MirrorRecord::decode(&bytes).is_none(), "{what}");

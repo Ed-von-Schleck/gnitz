@@ -16,10 +16,12 @@ fn a_master_creates_the_relation_directory_and_no_child() {
         )
         .unwrap();
     registry
-        .add_index(
+        .add_indexes(
             50,
-            IndexClaim::Index { id: 999, unique: false },
-            PkColList::from_slice(&[1]),
+            &[(
+                IndexClaim::Index { id: 999, unique: false },
+                PkColList::from_slice(&[1]),
+            )],
         )
         .unwrap();
     let dir = relation_dir(registry.base_dir(), 50);

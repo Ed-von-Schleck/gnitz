@@ -215,7 +215,7 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
         )?)),
         Read::KeySpans { tid, cols, claim } => {
             if claim {
-                cat.registry.add_index(tid, IndexClaim::Preflight, cols)?;
+                cat.registry.add_indexes(tid, &[(IndexClaim::Preflight, cols)])?;
             }
             if KEY_SPANS_ERROR.armed() {
                 return Err("injected key-spans fault".into());

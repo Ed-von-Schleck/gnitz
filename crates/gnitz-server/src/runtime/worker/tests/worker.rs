@@ -195,7 +195,7 @@ fn in_wait_dispositions() {
     let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let cols = PkColList::from_slice(&[1]);
     let claim = IndexClaim::Index { id: vid + 1, unique: false };
-    engine.registry.add_index(tid, claim, cols).unwrap();
+    engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
     let schema = make_schema_u64_i64();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
@@ -751,7 +751,7 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
     for (n, budget, chunk_rows, carrying) in cases {
         let (mut engine, tid) = engine_with_table(&format!("span_train_{n}"));
         let claim = IndexClaim::Index { id: tid + 1, unique: false };
-        engine.registry.add_index(tid, claim, cols).unwrap();
+        engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
         // Values descend as ids ascend, so span order is not row order.
         let held: Vec<_> = (0..n).map(|i| (i, 1, -(i as i64))).collect();
         engine

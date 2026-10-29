@@ -290,12 +290,13 @@ fn a_shared_client_mirrors() {
             assert_eq!(unit_rows(&served.batch), 50);
 
             let dir = tempfile::tempdir().unwrap();
-            let store = Mirror::open(dir.path().to_str().unwrap(), MirrorConfig::default()).unwrap();
+            let path = dir.path().to_str().unwrap().to_string();
             let name = sn.clone();
             let mirrored = client
                 .run(move |c| {
                     Box::pin(async move {
-                        c.attach_mirror(store)?;
+                        c.attach_mirror(move || Mirror::open(&path, MirrorConfig::default()))
+                            .await?;
                         c.mirror_view(&rel(&name, "v")).await
                     })
                 })

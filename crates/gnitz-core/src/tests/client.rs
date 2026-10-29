@@ -584,21 +584,25 @@ fn an_offloaded_job_is_the_hosts_to_run() {
     let (s, _peer) = session_pair();
     let fd = s.as_fd().as_raw_fd();
     let mut c = GnitzClient::over(s, Box::new(PendingHost::default())).unwrap();
-    assert_ne!(drive(fd, c.offload(ran_on)).0.unwrap(), here);
+    assert_ne!(drive(fd, offload(&mut *c.host, ran_on)).0.unwrap(), here);
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drive(fd, c.offload(|| panic!("the job's own failure")))
+        drive(fd, offload(&mut *c.host, || panic!("the job's own failure")))
     }));
     assert!(panicked.is_err(), "a job's panic resumes in its caller");
 
     // A blocking host runs it in place.
     let (s, _peer) = session_pair();
-    assert_eq!(block_on(GnitzClient::from_session(s).offload(ran_on)).unwrap(), here);
+    let mut c = GnitzClient::from_session(s);
+    assert_eq!(block_on(offload(&mut *c.host, ran_on)).unwrap(), here);
 
     // A host that drops the job ends the call rather than leaving it waiting.
     let (s, _peer) = session_pair();
     let host = PendingHost { drops_jobs: true, ..Default::default() };
     let mut c = GnitzClient::over(s, Box::new(host)).unwrap();
-    assert!(matches!(drive(fd, c.offload(|| 7)).0, Err(ClientError::Closed)));
+    assert!(matches!(
+        drive(fd, offload(&mut *c.host, || 7)).0,
+        Err(ClientError::Closed)
+    ));
 }
 
 /// `block_on` is for a host that never pends; over any other it would spin.

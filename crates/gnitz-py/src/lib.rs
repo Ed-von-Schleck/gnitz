@@ -160,9 +160,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // What a server logs once it serves, for the code that starts one.
     m.add("READY_LINE", gnitz_foundation::log::READY_LINE)?;
     // Whether *this extension* keeps its `#[cfg(debug_assertions)]` fault seams.
-    // The seams a mirroring test arms live in gnitz-mirror and gnitz-store, which
-    // are linked here and not into the server, so the server's build says nothing
-    // about them: `e2e-release` pairs a release server with a debug extension.
+    // A mirroring test arms seams that fire in this process — the mirror's
+    // ingest, in this extension's own copies of gnitz-mirror and gnitz-store — so
+    // the server's build says nothing about them: `e2e-release` pairs a release
+    // server with a debug extension.
     m.add("debug_assertions", cfg!(debug_assertions))?;
     m.add_function(wrap_pyfunction!(type_codes, m)?)?;
     m.add_function(wrap_pyfunction!(instructions_retired, m)?)?;

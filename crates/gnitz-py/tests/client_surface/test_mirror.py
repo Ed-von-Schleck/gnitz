@@ -213,8 +213,8 @@ def test_a_fault_degrades_one_copy_and_the_process_lives(client, server, mirror_
     variable goes to the mirror child and nowhere else**: a server that inherited
     it would fail its own ingest and drop the connection.
 
-    Gated on the *extension's* build, not the server's: these seams live in
-    crates the extension links and the server does not.
+    Gated on the *extension's* build, not the server's: the seams fire in the
+    mirror's process, which runs the extension's code.
     """
     if not gnitz.debug_assertions:
         pytest.skip("fault seams require a debug extension")

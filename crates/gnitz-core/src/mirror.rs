@@ -56,10 +56,6 @@ use gnitz_wire::{payload_str, RelClass, WireFault, WireStatus, RELTAB_PAY_NAME, 
 /// `Send`, because the client runs its disk work where its host lets work
 /// block, which may be another thread. Not `Sync`: one call runs at a time.
 pub trait MirrorStore: Send {
-    /// The data directory this store holds. What a second `attach_mirror` names
-    /// when it refuses.
-    fn base_dir(&self) -> &str;
-
     /// Register `desc.tid` as `name`, with `desc`'s schema and indexes,
     /// retracting whatever the store held at that id as another relation, or
     /// under that name at another id. A registration that already stands as
@@ -67,18 +63,22 @@ pub trait MirrorStore: Send {
     fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError>;
 
     /// Retract `tid`: its cursor, its rows, its record and its directory.
-    /// Idempotent, and a `tid` the store does not hold is `Ok(())`.
+    /// Idempotent, and a `tid` the store does not hold is `Ok(())`. On `Err` the
+    /// store no longer holds it, and a later open may find it at its last
+    /// checkpoint.
     fn forget(&mut self, tid: u64) -> Result<(), MirrorError>;
 
-    /// Erase `tid`'s copy and open it for the view's whole value: until
-    /// [`Self::seal`] it holds no cursor and answers no read.
-    fn refill(&mut self, tid: u64) -> Result<(), MirrorError>;
+    /// Register `desc.tid` as `name`, as [`Self::register`] does, then erase its
+    /// copy and open it for the view's whole value. Until a [`Self::fill`] seals
+    /// it, it holds no cursor, so [`Self::cursor_of`] gates every read of it out.
+    fn refill(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError>;
 
-    /// Add `blocks` of the value to the copy [`Self::refill`] opened.
-    fn fill(&mut self, tid: u64, blocks: &[&[u8]]) -> Result<(), MirrorError>;
-
-    /// The blocks filled are `tid`'s whole value at `cursor`.
-    fn seal(&mut self, tid: u64, cursor: DeltaCursor) -> Result<(), MirrorError>;
+    /// Add `blocks` of the value to the copy [`Self::refill`] opened. At
+    /// `Some(cursor)` the blocks filled so far and these are `tid`'s whole value
+    /// at that cursor, and the copy answers at it. A block that fails erases the
+    /// copy and ends the refill: no further block or seal is taken until the
+    /// next refill.
+    fn fill(&mut self, tid: u64, blocks: &[&[u8]], sealed_at: Option<DeltaCursor>) -> Result<(), MirrorError>;
 
     /// Apply `blocks`, the view's deltas after the copy's cursor, and advance it to
     /// `next`. Refused for a copy holding no cursor. With no block it moves the
@@ -98,14 +98,7 @@ pub trait MirrorStore: Send {
     fn cursor_of(&self, tid: u64) -> Option<DeltaCursor>;
 
     /// Make every copy and its cursor durable.
-    ///
-    /// **A torn store publishes nothing**: an implementor that poisoned itself
-    /// answers [`MirrorError::Poisoned`] instead. The client asks
-    /// unconditionally, so that refusal is the store's alone to make.
     fn checkpoint(&mut self) -> Result<(), MirrorError>;
-
-    /// The message that poisoned this store, if any.
-    fn poisoned(&self) -> Option<&str>;
 }
 
 /// Why a mirror operation did not happen.
@@ -114,9 +107,9 @@ pub enum MirrorError {
     /// The local engine refused or failed: a storage fault, a registration the
     /// registry rejected, a read the spec could not express.
     Engine(String),
-    /// The store is poisoned and refuses every further call that touches a copy.
-    /// Raised for a teardown that could not erase the copy it was clearing, and
-    /// for a panic caught mid-call. A failed apply erases that copy instead.
+    /// The store is poisoned and refuses every further call that touches a copy:
+    /// a store call panicked, so the store may be torn. A failed apply or
+    /// teardown costs that copy alone.
     ///
     /// [`GnitzClient::close_mirror`] is the only recovery.
     Poisoned(String),
@@ -264,23 +257,39 @@ impl MirroredView {
 #[derive(Clone)]
 pub(crate) struct Store(Arc<Mutex<dyn MirrorStore>>);
 
+/// What a poisoned store answers with.
+const TORN: &str = "a store call panicked; the store may be torn";
+
 impl Store {
-    /// The store, for a call made in place: a lookup, a cursor-only advance, or
-    /// a local read (which may read shards), answered without a job so a
-    /// mirrored read costs no dispatch. Work that writes the disk goes through
-    /// [`Self::run`]. A panic under this lock is the store's own to record: an
-    /// implementor poisons itself.
+    /// The store, poisoned or not, for a lookup made in place.
     pub(crate) fn get(&self) -> MutexGuard<'_, dyn MirrorStore + 'static> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Refused once a call panicked under the lock — the store's poison, and so
+    /// the one source of [`MirrorError::Poisoned`]: a torn store answers no
+    /// read and publishes nothing.
+    pub(crate) fn refusal(&self) -> Result<(), MirrorError> {
+        match self.0.is_poisoned() {
+            true => Err(MirrorError::Poisoned(TORN.into())),
+            false => Ok(()),
+        }
+    }
+
+    /// The store, for a call that touches a copy: a cursor-only advance or a
+    /// local read in place, so a mirrored read costs no dispatch, and work that
+    /// writes the disk through [`Self::run`]. Refused as [`Self::refusal`] is.
+    fn touch(&self) -> Result<MutexGuard<'_, dyn MirrorStore + 'static>, MirrorError> {
+        self.0.lock().map_err(|_| MirrorError::Poisoned(TORN.into()))
     }
 
     /// Run `work`, which may touch the disk, where `host` lets work block.
     async fn run<R: Send + 'static>(
         self,
         host: &mut dyn Host,
-        work: impl FnOnce(&mut dyn MirrorStore) -> R + Send + 'static,
-    ) -> Result<R, ClientError> {
-        offload(host, move || work(&mut *self.get())).await
+        work: impl FnOnce(&mut dyn MirrorStore) -> Result<R, MirrorError> + Send + 'static,
+    ) -> Result<Result<R, MirrorError>, ClientError> {
+        offload(host, move || work(&mut *self.touch()?)).await
     }
 
     /// Advance each copy of `trains` — its id, its blocks and the cursor past
@@ -291,17 +300,18 @@ impl Store {
         trains: Vec<(u64, Vec<RawBlock>, DeltaCursor)>,
     ) -> Result<Vec<(u64, Result<(), ClientError>)>, ClientError> {
         let idle = trains.iter().all(|(_, blocks, _)| blocks.is_empty());
-        let apply = move |s: &mut dyn MirrorStore| {
+        let apply = move |store: &Store| {
             let advance = |(tid, blocks, next): (u64, Vec<RawBlock>, DeltaCursor)| {
                 let blocks: Vec<&[u8]> = blocks.iter().map(RawBlock::block).collect();
-                (tid, s.advance(tid, &blocks, next).map_err(ClientError::from))
+                let advanced = store.touch().and_then(|mut s| s.advance(tid, &blocks, next));
+                (tid, advanced.map_err(ClientError::from))
             };
             trains.into_iter().map(advance).collect::<Vec<_>>()
         };
         Ok(match idle {
             // Only cursors move, so there is nothing to block on.
-            true => apply(&mut *self.get()),
-            false => self.run(host, apply).await?,
+            true => apply(&self),
+            false => offload(host, move || apply(&self)).await?,
         })
     }
 }
@@ -316,14 +326,6 @@ pub(crate) struct MirrorState {
 }
 
 impl MirrorState {
-    /// Refuse a call on a poisoned store before it spends a round trip finding out.
-    fn refuse_poisoned(&self) -> Result<(), ClientError> {
-        match self.store.get().poisoned() {
-            Some(why) => Err(MirrorError::Poisoned(why.to_string()).into()),
-            None => Ok(()),
-        }
-    }
-
     /// See [`GnitzClient::cursor_of`].
     pub(crate) fn cursor_of(&self, tid: u64) -> Option<DeltaCursor> {
         self.views.get(&tid)?.answers_at(&*self.store.get())
@@ -473,7 +475,8 @@ impl GnitzClient {
 
     /// Mirror `name` and bring its copy up to date.
     async fn mirror_as(&mut self, name: RelName, plan: Option<Planner>) -> Result<PollOutcome, ClientError> {
-        self.mirror_state()?.refuse_poisoned()?;
+        // Refused before a round trip finds the store poisoned.
+        self.mirror_state()?.store.refusal()?;
         let entry = self.derive(name, plan).await?;
         let tid = self.bind(entry).await?;
         let done = self.settle([tid]).await?;
@@ -613,11 +616,12 @@ impl GnitzClient {
                 // A copy read whole takes each step's blocks before the
                 // session reads on, and is erased by the first of them.
                 (None, end) => {
-                    let seal = end.as_ref().and_then(|end| end.as_ref().ok().copied());
-                    if failed.is_none() && (seal.is_some() || end.is_none() && poll.drained() && !blocks.is_empty()) {
-                        // Registered again, for a registration whose record the store lost, and
-                        // owed from here: the job erases the copy whether or not this call lives
-                        // to see it end.
+                    let sealed_at = end.as_ref().and_then(|end| end.as_ref().ok().copied());
+                    if failed.is_none()
+                        && (sealed_at.is_some() || end.is_none() && poll.drained() && !blocks.is_empty())
+                    {
+                        // Owed from here: the job erases the copy whether or not this call
+                        // lives to see it end.
                         let open = match std::mem::replace(&mut opened, true) {
                             true => None,
                             false => views.get_mut(&tid).map(|v| {
@@ -628,14 +632,10 @@ impl GnitzClient {
                         let taken = std::mem::take(&mut blocks);
                         let fill = move |s: &mut dyn MirrorStore| {
                             if let Some((name, desc)) = open {
-                                s.register(&name, &desc)?;
-                                s.refill(tid)?;
+                                s.refill(&name, &desc)?;
                             }
-                            if !taken.is_empty() {
-                                let taken: Vec<&[u8]> = taken.iter().map(RawBlock::block).collect();
-                                s.fill(tid, &taken)?;
-                            }
-                            seal.map_or(Ok(()), |cursor| s.seal(tid, cursor))
+                            let taken: Vec<&[u8]> = taken.iter().map(RawBlock::block).collect();
+                            s.fill(tid, &taken, sealed_at)
                         };
                         failed = store.clone().run(host, fill).await?.err().map(ClientError::from);
                     }
@@ -737,28 +737,31 @@ impl GnitzClient {
 // ---------------------------------------------------------------------------
 
 impl GnitzClient {
-    /// Read a local copy of one or more views through `store`.
+    /// Read a local copy of one or more views through the store `open` opens.
     ///
-    /// It takes an opened store rather than a directory, because opening one is
-    /// the engine's job and this crate does not link it: a host writes
-    /// `client.attach_mirror(gnitz_mirror::Mirror::open(dir, config)?)?`, and the
-    /// dependency is the host's. The directory has no default — a derived one
-    /// would collide on the engine's `flock`.
+    /// It takes an opener rather than a directory, because opening one is the
+    /// engine's job and this crate does not link it: a host writes
+    /// `client.attach_mirror(move || gnitz_mirror::Mirror::open(&dir, config)).await?`,
+    /// and the dependency is the host's. The directory has no default — a
+    /// derived one would collide on the engine's `flock`.
     ///
-    /// A second call is refused, naming the path already held and dropping the
-    /// store it was passed (which releases that store's `flock`).
+    /// `open` runs where the host lets work block, and only while no store is
+    /// attached: a second call is refused and opens nothing.
     ///
     /// **Dropping a mirroring client does not checkpoint**: [`Self::close_mirror`]
     /// is where a host pays the exit checkpoint, and reports it. A drop forfeits
     /// the rounds since the last checkpoint — at most one bootstrap per view,
     /// when the feed no longer covers them.
-    pub fn attach_mirror(&mut self, store: impl MirrorStore + 'static) -> Result<(), ClientError> {
-        if let Some(m) = &self.mirror {
-            return Err(ClientError::from(format!(
-                "this client already mirrors at '{}'; close_mirror before attaching another store",
-                m.store.get().base_dir()
-            )));
+    pub async fn attach_mirror<S: MirrorStore + 'static>(
+        &mut self,
+        open: impl FnOnce() -> Result<S, MirrorError> + Send + 'static,
+    ) -> Result<(), ClientError> {
+        if self.mirror.is_some() {
+            return Err(ClientError::from(
+                "this client already mirrors; close_mirror before attaching another store".to_string(),
+            ));
         }
+        let store = offload(&mut *self.host, open).await??;
         self.mirror = Some(Box::new(MirrorState {
             store: Store(Arc::new(Mutex::new(store))),
             views: HashMap::new(),
@@ -850,7 +853,7 @@ impl GnitzClient {
         let Some(m) = self.mirror.as_deref() else {
             return Ok(wait);
         };
-        m.refuse_poisoned()?;
+        m.store.refusal()?;
         let due = m.views.values().any(|v| v.sub.is_none() && !v.failed);
         Ok(if due { Duration::ZERO } else { wait })
     }
@@ -936,7 +939,7 @@ impl GnitzClient {
     pub fn mirror_poisoned(&self) -> Option<String> {
         self.mirror
             .as_deref()
-            .and_then(|m| m.store.get().poisoned().map(str::to_owned))
+            .and_then(|m| m.store.0.is_poisoned().then(|| TORN.to_string()))
     }
 }
 

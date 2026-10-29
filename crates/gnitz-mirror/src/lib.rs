@@ -11,18 +11,19 @@
 //! A host opens one and hands it to a client:
 //!
 //! ```ignore
-//! client.attach_mirror(gnitz_mirror::Mirror::open(dir, MirrorConfig::from_env())?)?;
-//! client.mirror_view(&RelName::new("public", "recent")?)?;
+//! client.attach_mirror(move || gnitz_mirror::Mirror::open(&dir, MirrorConfig::from_env())).await?;
+//! client.mirror_view(&RelName::new("public", "recent")?).await?;
 //! ```
 //!
 //! Everything a *host* contracts for — freshness, what can be mirrored, the cost —
 //! is stated in the header of `gnitz-core`'s mirror module and on
-//! `GnitzClient::mirror_view`, because that is where a host meets it. What lives here is the store: the relation registry, the
-//! copies, their feed positions, and the durability around them.
+//! `GnitzClient::mirror_view`, because that is where a host meets it. What
+//! lives here is the store: the relation registry, the copies, their feed
+//! positions, and the durability around them.
 //!
-//! It drives the engine's **relation rung** directly — the Z-set store and the
-//! `ReadSpec` executor — and links neither the circuit compiler, the DBSP VM,
-//! epoch execution nor the system-table catalog.
+//! It drives `gnitz-store` — the relation registry and its `ReadSpec` executor —
+//! directly, and links no DBSP layer: that is `gnitz-server`'s, which nothing
+//! links.
 //!
 //! The store is `Send` and `!Sync`, and a [`gnitz_core::GnitzClient`] holds it
 //! behind a lock; the argument is beside the `unsafe impl` in `handle.rs`.
@@ -34,7 +35,6 @@
 //! The store keeps to a subdirectory of its own, lock included, so whatever
 //! else the directory holds is left as it was.
 
-mod guard;
 mod handle;
 mod record;
 

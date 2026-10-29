@@ -15,15 +15,36 @@ pub(crate) struct MirrorRecord {
     pub(crate) pk_repeats: bool,
     /// The column list of each index the copy holds: [`index_lists`]' order.
     pub(crate) indexes: Vec<PkColList>,
-    /// Where the copy's feed got to; `None` says the copy is not valid to read.
-    pub(crate) cursor: Option<DeltaCursor>,
+    pub(crate) feed: Feed,
+}
+
+/// Where a copy's feed got to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Feed {
+    /// The copy holds no value: it is not valid to read.
+    Empty,
+    /// The copy is being filled with its view's whole value, and is not valid
+    /// to read until it is sealed. Persisted as [`Feed::Empty`].
+    Filling,
+    /// The copy is the view's value at this round.
+    At(DeltaCursor),
+}
+
+impl Feed {
+    /// The round the copy answers reads at, if it answers any.
+    pub(crate) fn cursor(self) -> Option<DeltaCursor> {
+        match self {
+            Feed::At(cursor) => Some(cursor),
+            Feed::Empty | Feed::Filling => None,
+        }
+    }
 }
 
 impl MirrorRecord {
     /// The bytes a copy's manifest carries for it.
     pub(crate) fn encode(&self) -> Vec<u8> {
         // Round 0 is no cursor here as on the wire, where it asks for a bootstrap.
-        let (tag, tick) = self.cursor.map_or((0, 0), DeltaCursor::pair);
+        let (tag, tick) = self.feed.cursor().map_or((0, 0), DeltaCursor::pair);
         let mut w = Writer::new();
         w.u64(tag)
             .u64(tick)
@@ -43,7 +64,7 @@ impl MirrorRecord {
     pub(crate) fn decode(bytes: &[u8]) -> Option<(Self, SchemaDescriptor)> {
         let rec = decode_all(bytes, "mirror record", |r| {
             let (tag, tick) = (r.u64()?, r.u64()?);
-            let cursor = DeltaCursor::from_pair(tag, tick);
+            let feed = DeltaCursor::from_pair(tag, tick).map_or(Feed::Empty, Feed::At);
             fn text<'a>(r: &mut Reader<'a>) -> Result<&'a str, String> {
                 std::str::from_utf8(r.bytes32()?).map_err(|e| e.to_string())
             }
@@ -57,7 +78,7 @@ impl MirrorRecord {
             if !indexes.windows(2).all(|w| w[0] < w[1]) {
                 return Err("index column lists out of order".into());
             }
-            Ok(MirrorRecord { cursor, name, block, pk_repeats, indexes })
+            Ok(MirrorRecord { feed, name, block, pk_repeats, indexes })
         })
         .ok()?;
         let schema = descriptor_of_block(&rec.block).ok()?;

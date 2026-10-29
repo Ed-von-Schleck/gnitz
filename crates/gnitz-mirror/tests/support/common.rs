@@ -26,15 +26,16 @@ pub fn manifest_path(base_dir: &str, tid: u64) -> String {
     ROWS.manifest(&relation_dir(&root(base_dir), tid))
 }
 
-/// The manifest of `tid`'s copy's index on `cols`.
-#[allow(dead_code)]
-pub fn index_manifest_path(base_dir: &str, tid: u64, cols: &[u32]) -> String {
-    let kind = ChildKind::Index(gnitz_wire::PkColList::from_slice(cols));
-    ChildAddr { kind, slot: Slot::SOLO }.manifest(&relation_dir(&root(base_dir), tid))
-}
-
 pub fn has_manifest(base_dir: &str, tid: u64) -> bool {
     std::path::Path::new(&manifest_path(base_dir, tid)).exists()
+}
+
+/// The inode of `tid`'s copy's manifest: a publish renames a new one in place.
+pub fn manifest_inode(base_dir: &str, tid: u64) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(manifest_path(base_dir, tid))
+        .expect("a published manifest")
+        .ino()
 }
 
 /// Put a regular file where `tid`'s rows directory belongs, moving the

@@ -43,7 +43,7 @@ fn mirror_call_cost_bench() {
     churn(&mut fx.direct, 2_001, 4_000);
     fx.tick("s", &["v_keyed"]);
     cell("poll carrying a round", 1, fx.mirror(), |m| {
-        block_on(m.sync(Duration::ZERO)).map(|s| s.mirrored).expect("poll");
+        poll(m, Duration::ZERO);
     });
 
     let rel = block_on(fx.mirror().resolve_relation(&rel("s", "v_keyed"))).expect("resolve");
@@ -86,10 +86,10 @@ fn mirror_call_cost_bench() {
     // Three steps of one registry, each view bootstrapped and drained before the
     // polls over it are measured.
     for (prefix, more) in [("a", 1), ("b", 15), ("c", 46)] {
-        fx.many_views(prefix, more, "a, b, v");
+        fx.many_views(prefix, more);
         let views = fx.mirror().mirrored_ids().len();
         cell(&format!("idle poll, {views} views"), CALLS, fx.mirror(), |m| {
-            block_on(m.sync(Duration::ZERO)).map(|s| s.mirrored).expect("poll");
+            poll(m, Duration::ZERO);
         });
     }
 }
@@ -133,10 +133,7 @@ fn resident_footprint_bench() {
     let dir = fx.base_dir();
     let mut config = MirrorConfig::default();
     config.store.ram_tier_bytes = 256 * 1024;
-    let mut mirror = GnitzClient::connect(fx.server.sock_path()).unwrap();
-    mirror
-        .attach_mirror(Mirror::open(&dir, config).expect("a store opens"))
-        .expect("a fresh client attaches it");
+    let mut mirror = mirroring_client_with(fx.server.sock_path(), &dir, config);
 
     let resident = perf::Resident::baseline();
     block_on(mirror.mirror_view(&rel("s", "v_big"))).expect("mirror");

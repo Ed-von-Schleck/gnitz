@@ -54,13 +54,12 @@ fn copy_index_bench() {
             indexes: indexed.then_some(index).into_iter().collect(),
             token: 1,
         };
-        store.register(&RelName::new("s", "v").unwrap(), &desc).unwrap();
-        store.refill(TID).unwrap();
+        store.refill(&RelName::new("s", "v").unwrap(), &desc).unwrap();
         let held: Vec<_> = (0..ROWS).map(|id| (id, 1, id as i64)).collect();
         for chunk in held.chunks(10_000) {
-            store.fill(TID, &[&block(chunk)]).unwrap();
+            store.fill(TID, &[&block(chunk)], None).unwrap();
         }
-        store.seal(TID, cursor(1)).unwrap();
+        store.fill(TID, &[], Some(cursor(1))).unwrap();
 
         // Each round moves `ROUND` rows of the upper half to a `v` past every
         // held one.

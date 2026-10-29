@@ -116,7 +116,7 @@ fn worker_request_bench() {
     let indexed = |engine: &mut CatalogEngine, tid| {
         engine.registry.set_scan_chunk_rows(CHUNK_ROWS);
         let claim = IndexClaim::Index { id: tid + 1, unique: false };
-        engine.registry.add_index(tid, claim, cols).unwrap();
+        engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
     };
     let spans =
         |excl: &mut SalExcl, tid, _: &[u8], id| excl.write(&addressed(Read::KeySpans { tid, cols, claim: false }, id));

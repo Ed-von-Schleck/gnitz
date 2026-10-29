@@ -188,10 +188,12 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
     // Rank 0 of 3, holding a table indexed on its payload column.
     let mut r = RelationRegistry::new(base, Slot::new(0, 3), StoreConfig::default());
     r.register(spec(TID, RelationKind::BaseTable, schema), schema).unwrap();
-    r.add_index(
+    r.add_indexes(
         TID,
-        IndexClaim::Index { id: TID + 1, unique: false },
-        PkColList::from_slice(&[1]),
+        &[(
+            IndexClaim::Index { id: TID + 1, unique: false },
+            PkColList::from_slice(&[1]),
+        )],
     )
     .unwrap();
     let mut traces = StateLayout::default();

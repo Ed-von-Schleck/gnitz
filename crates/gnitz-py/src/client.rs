@@ -620,13 +620,9 @@ impl PyClient {
     fn mirror_at(slf: &Bound<'_, Self>, base_dir: String) -> PyResult<Py<PyAny>> {
         Self::run(
             slf,
-            whole!(|c| {
-                let store = c
-                    .offload(move || Mirror::open(&base_dir, MirrorConfig::from_env()))
-                    .await?
-                    .map_err(ClientError::from)?;
-                c.attach_mirror(store)?
-            }),
+            whole!(|c| c
+                .attach_mirror(move || Mirror::open(&base_dir, MirrorConfig::from_env()))
+                .await?),
             none,
         )
     }

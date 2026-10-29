@@ -47,7 +47,7 @@ def erase(base, target, sn):
 
 
 def panic(base, target, sn):
-    """A panic inside the guarded apply poisons a copy that is still gated in,
+    """A panic inside the apply poisons a copy that is still gated in,
     and every read that would have come off it is refused — including the one
     that arrives through the SQL layer, whose own error channel would otherwise
     flatten the poison into a plain GnitzError."""
@@ -60,10 +60,10 @@ def panic(base, target, sn):
     churn(m, 61, 120)
     try:
         m.sync()
-        raise SystemExit("the armed seam must panic inside the guarded apply")
+        raise SystemExit("the armed seam must panic inside the apply")
     except BaseException as e:  # pyo3 raises PanicException, a BaseException
         assert "panic" in type(e).__name__.lower(), f"unexpected {type(e).__name__}: {e}"
-    assert m.mirror_poisoned is not None, "the guard poisons before the unwind continues"
+    assert m.mirror_poisoned is not None, "the unwind through the store's lock poisons it"
 
     # The copy is still gated in, so these are reads it would have answered.
     assert m.cursor(vid) is not None

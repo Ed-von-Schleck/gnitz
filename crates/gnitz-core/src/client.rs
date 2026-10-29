@@ -592,14 +592,6 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// Run `job` where this client's host lets work block.
-    pub async fn offload<R: Send + 'static>(
-        &mut self,
-        job: impl FnOnce() -> R + Send + 'static,
-    ) -> Result<R, ClientError> {
-        offload(&mut *self.host, job).await
-    }
-
     /// Reserve `count` contiguous SERIAL ids for `table` and return the first,
     /// so an INSERT that knows its row count pays one round trip rather than
     /// `ceil(count / SERIAL_RANGE_SIZE)`. An abandoned tail — the old
@@ -707,7 +699,11 @@ impl GnitzClient {
             // One guard covers the gate and the scan.
             let mut store = m.store.get();
             if m.views.get(&target.tid).and_then(|v| v.answers_at(&*store)).is_some() {
-                let reply = store.scan_spec(target.tid, spec, reply_schema).map(|batch| ScanReply {
+                let scanned = m
+                    .store
+                    .refusal()
+                    .and_then(|()| store.scan_spec(target.tid, spec, reply_schema));
+                let reply = scanned.map(|batch| ScanReply {
                     batch,
                     schema: Arc::clone(reply_schema),
                     lsn: None,
@@ -735,7 +731,7 @@ impl GnitzClient {
             ));
         }
         let target = target.to_owned();
-        let fresh = self.offload(move || Session::connect(&target)).await??;
+        let fresh = offload(&mut *self.host, move || Session::connect(&target)).await??;
         // Every field, so one added later is decided here too.
         let GnitzClient {
             host,

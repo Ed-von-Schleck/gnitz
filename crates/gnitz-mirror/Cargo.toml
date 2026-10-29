@@ -10,6 +10,9 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+integration = []
+
 [dependencies]
 gnitz-foundation.workspace = true
 gnitz-core.workspace = true

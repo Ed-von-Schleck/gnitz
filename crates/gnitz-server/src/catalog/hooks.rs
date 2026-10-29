@@ -201,7 +201,7 @@ impl CatalogEngine {
             let r = IdxTabRow::read(batch, i).map_err(|e| format!("index {idx_id}: {e}"))?;
             let claim = IndexClaim::Index { id: idx_id, unique: r.is_unique };
             if batch.get_weight(i) > 0 {
-                self.registry.add_index(r.owner_id, claim, r.source_col_idx)?;
+                self.registry.add_indexes(r.owner_id, &[(claim, r.source_col_idx)])?;
             } else {
                 self.registry.release_index(r.owner_id, claim);
             }

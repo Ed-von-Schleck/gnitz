@@ -12,10 +12,10 @@ fn index(id: u64, unique: bool) -> IndexClaim {
 fn a_circuit_lives_while_one_claim_remains() {
     let mut registry = relation_fixture(RelationKind::BaseTable, pk_u64_two_i64_schema(), &[], []);
     registry
-        .add_index(TID, index(70, false), PkColList::from_slice(&[2]))
+        .add_indexes(TID, &[(index(70, false), PkColList::from_slice(&[2]))])
         .unwrap();
     registry
-        .add_index(TID, index(71, true), PkColList::from_slice(&[2]))
+        .add_indexes(TID, &[(index(71, true), PkColList::from_slice(&[2]))])
         .unwrap();
     let circuit = |r: &RelationRegistry| r.relation(TID).unwrap().index_on(&[2]).map(|ix| ix.is_unique());
     assert_eq!(
@@ -94,7 +94,7 @@ fn a_preflight_index_lives_on_only_under_the_claim_that_adopts_it() {
     let mut registry = relation_fixture(RelationKind::BaseTable, schema, &[], [rows]);
     let (adopted, abandoned) = (PkColList::from_slice(&[2]), PkColList::from_slice(&[1]));
     for cols in [adopted, abandoned] {
-        registry.add_index(TID, IndexClaim::Preflight, cols).unwrap();
+        registry.add_indexes(TID, &[(IndexClaim::Preflight, cols)]).unwrap();
     }
     // Whether the index on `cols` is unique, and how many spans it holds.
     let index = |r: &RelationRegistry, cols: PkColList| {
@@ -110,7 +110,7 @@ fn a_preflight_index_lives_on_only_under_the_claim_that_adopts_it() {
     assert_eq!(index(&registry, adopted), Some((false, 3)), "filled from the held rows");
 
     registry
-        .add_index(TID, IndexClaim::Index { id: 80, unique: true }, adopted)
+        .add_indexes(TID, &[(IndexClaim::Index { id: 80, unique: true }, adopted)])
         .unwrap();
     registry.release_index(TID, IndexClaim::Preflight);
     assert_eq!(index(&registry, adopted), Some((true, 3)));
@@ -122,16 +122,16 @@ fn a_preflight_index_lives_on_only_under_the_claim_that_adopts_it() {
 fn a_unique_index_covering_the_pk_has_nothing_left_to_check() {
     let mut registry = relation_fixture(RelationKind::BaseTable, pk_u64_two_i64_schema(), &[], []);
     registry
-        .add_index(TID, index(901, true), PkColList::from_slice(&[0]))
+        .add_indexes(TID, &[(index(901, true), PkColList::from_slice(&[0]))])
         .unwrap(); // exactly the PK
     registry
-        .add_index(TID, index(902, true), PkColList::from_slice(&[2, 0]))
+        .add_indexes(TID, &[(index(902, true), PkColList::from_slice(&[2, 0]))])
         .unwrap(); // the PK plus a payload column
     registry
-        .add_index(TID, index(903, true), PkColList::from_slice(&[1]))
+        .add_indexes(TID, &[(index(903, true), PkColList::from_slice(&[1]))])
         .unwrap(); // the only real check
     registry
-        .add_index(TID, index(904, false), PkColList::from_slice(&[2]))
+        .add_indexes(TID, &[(index(904, false), PkColList::from_slice(&[2]))])
         .unwrap(); // not unique at all
 
     let cols: Vec<Vec<u32>> = registry

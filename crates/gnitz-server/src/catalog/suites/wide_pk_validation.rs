@@ -46,10 +46,12 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24
         .unwrap();
     engine
         .registry
-        .add_index(
+        .add_indexes(
             tid,
-            IndexClaim::Index { id: tid + 1, unique: true },
-            gnitz_wire::PkColList::from_slice(&[3]),
+            &[(
+                IndexClaim::Index { id: tid + 1, unique: true },
+                gnitz_wire::PkColList::from_slice(&[3]),
+            )],
         )
         .unwrap();
     // The registry projects the index itself, from the same `key_spec` and index

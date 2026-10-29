@@ -207,12 +207,18 @@ impl RelationRegistry {
         self.relation_mut_or_err(id)?.seal()
     }
 
-    /// Drop every row view `id`'s store holds; the next barrier publishes it
-    /// empty. For a view with no index and no delta feed.
+    /// Drop every row view `id`'s store and its indexes hold; the next barrier
+    /// publishes them empty, and until then a reopen finds what the last one
+    /// published. For a view with no delta feed.
     pub fn clear_rows(&mut self, id: u64) -> Result<(), String> {
         let entry = self.relation_mut_or_err(id)?;
-        debug_assert!(entry.kind().is_view() && entry.feed().is_none() && entry.indexes.is_empty());
+        debug_assert!(entry.kind().is_view() && entry.feed().is_none());
         entry.rows.held_mut().clear();
+        entry
+            .indexes
+            .iter_mut()
+            .filter_map(|ix| ix.store.table_mut())
+            .for_each(Table::clear);
         Ok(())
     }
 
