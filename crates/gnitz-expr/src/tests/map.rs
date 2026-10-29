@@ -93,7 +93,7 @@ fn each_map_sink_is_held_to_its_output_slot() {
         cases.push((reg_in.clone(), reg1(instrs), vec![tc], want));
     }
     for (input, prog, output, want) in cases {
-        let label = format!("{:?} into {output:?}: {:?}", prog.instrs(), prog.sinks);
+        let label = format!("{:?} into {output:?}: {:?}", prog.instrs(), prog.sinks());
         let got = prog.resolve_map(&schema_pk(&input, true), &schema_pk(&output, true));
         assert_eq!(got.map(drop), want, "{label}");
     }

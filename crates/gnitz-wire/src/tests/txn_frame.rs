@@ -1,5 +1,5 @@
 use super::*;
-use crate::{WireConflictMode, CTRL_HEADER_SIZE};
+use crate::{WireConflictMode, WireLane, WireStatus, CTRL_HEADER_SIZE};
 
 fn rel(tid: u64, reply_layout: u64) -> ScanItem<'static> {
     ScanItem {
@@ -44,7 +44,9 @@ fn block() -> Vec<u8> {
 
 fn ddl_item(tid: u64) -> FrameItem<'static> {
     FrameItem {
-        hdr: ControlHeader::naming(ClientVerb::DdlTxn, tid.into(), 0),
+        target: tid.into(),
+        conflict_mode: WireConflictMode::default(),
+        basis: 0,
         schema: None,
         data: regions(),
     }
@@ -52,13 +54,16 @@ fn ddl_item(tid: u64) -> FrameItem<'static> {
 
 fn family(tid: u64, conflict_mode: WireConflictMode, basis: u64, schema: &[u8]) -> FrameItem<'_> {
     FrameItem {
-        hdr: ControlHeader {
-            flags: WireFlags { conflict_mode, ..Default::default() },
-            ..ControlHeader::naming(ClientVerb::PushTxn, Target { tid, token: !tid }, basis)
-        },
+        target: Target { tid, token: !tid },
+        conflict_mode,
+        basis,
         schema: Some(schema),
         data: regions(),
     }
+}
+
+fn sub(id: u64) -> SubId {
+    SubId::new(id).unwrap()
 }
 
 /// Peek `frame`'s prologue — it carries only its verb, and its body starts right
@@ -76,8 +81,8 @@ fn peeked<'a, T>(frame: &'a [u8], decode: impl Fn(&'a [u8]) -> Result<T, String>
     decode(&frame[ctrl.body.clone()])
 }
 
-/// Each item is its own frame: its header is the one it was built from under
-/// the frame's verb, its bytes end where its last section does, its body is
+/// Each item is its own frame: its header names the frame's verb and the
+/// item's fields, its bytes end where its last section does, its body is
 /// empty, and its sections are the ones it was built from.
 #[test]
 fn txn_frames_roundtrip_every_item_in_order() {
@@ -97,8 +102,18 @@ fn txn_frames_roundtrip_every_item_in_order() {
         let got = peeked(&frame, |b| decode_items(b, verb)).unwrap();
         assert_eq!(got.len(), items.len());
         for ((bytes, c), it) in got.iter().zip(&items) {
-            let flags = WireFlags { verb, ..it.hdr.flags };
-            assert_eq!(c.hdr, ControlHeader { flags, ..it.hdr });
+            let flags = WireFlags {
+                verb,
+                conflict_mode: it.conflict_mode,
+                ..Default::default()
+            };
+            assert_eq!(
+                c.hdr,
+                ControlHeader {
+                    flags,
+                    ..ControlHeader::naming(verb, it.target, it.basis)
+                }
+            );
             assert_eq!(c.schema.clone().map(|s| &bytes[s]), it.schema);
             assert_eq!(&bytes[c.data.clone().unwrap()], &d[..]);
             assert_eq!(c.body, bytes.len()..bytes.len());
@@ -130,16 +145,33 @@ fn delta_poll_roundtrips_every_view_in_order() {
 /// The first id rides the prologue's `arg0` and nothing else of it moves.
 #[test]
 fn a_kept_delta_poll_carries_its_first_id_in_the_prologue() {
-    let views = [item(1, 5, 1)];
-    let frame = encode_delta_poll(&views, Some(1_500));
+    let views = [item(1, 5, 1), item(2, 5, 1)];
+    let frame = encode_delta_poll(&views, Some(sub(1_500)));
     let ctrl = peek_control_block(&frame).unwrap();
+    assert_eq!(ctrl.client_verb(), Ok(ClientVerb::DeltaPoll));
     assert_eq!(ctrl.hdr, ControlHeader::naming(ClientVerb::DeltaPoll, 0.into(), 1_500));
     assert_eq!(decode_delta_items(&frame[ctrl.body.clone()]).unwrap(), views.to_vec());
-    let kept = delta_poll_kept(&ctrl.hdr).expect("a kept poll");
-    assert_eq!(kept.take(2).collect::<Vec<_>>(), [1_500, 1_501]);
+    let kept = delta_poll_kept(&ctrl.hdr, views.len()).unwrap().expect("a kept poll");
+    assert_eq!(kept.collect::<Vec<_>>(), [sub(1_500), sub(1_501)]);
 
     let unkept = encode_delta_poll(&views, None);
-    assert!(delta_poll_kept(&peek_control_block(&unkept).unwrap().hdr).is_none());
+    let unkept = delta_poll_kept(&peek_control_block(&unkept).unwrap().hdr, views.len());
+    assert!(unkept.unwrap().is_none());
+}
+
+/// A kept poll whose last id would run past `u64::MAX` is refused; one ending
+/// on it is kept.
+#[test]
+fn a_kept_delta_poll_refuses_ids_past_the_last() {
+    let last = ControlHeader::naming(ClientVerb::DeltaPoll, 0.into(), u64::MAX);
+    let kept = delta_poll_kept(&last, 1).unwrap().expect("a kept poll");
+    assert_eq!(kept.collect::<Vec<_>>(), [sub(u64::MAX)]);
+    let err = delta_poll_kept(&last, 2).map(|_| ()).unwrap_err();
+    assert!(err.contains("past u64::MAX"), "{err}");
+
+    let near = ControlHeader { arg0: u64::MAX - 2, ..last };
+    assert_eq!(delta_poll_kept(&near, 3).unwrap().unwrap().count(), 3);
+    assert!(delta_poll_kept(&near, 4).is_err());
 }
 
 /// A delta poll names no view `0`: it is the id of a fault ending the request.
@@ -193,8 +225,9 @@ fn one_item(hdr: ControlHeader, blob: &[u8], schema: bool, data: bool) -> Vec<u8
 /// empty list is refused; a truncation inside an item is an error rather than a
 /// short list (a cut on an item boundary is a shorter well-formed body, since
 /// items run to the end); and an item is refused whose sections differ from the
-/// verb's shape, that names another verb, that carries a non-`Ok` status, or
-/// that carries a blob its verb's items do not.
+/// verb's shape, that names another verb, that carries a non-`Ok` status or a
+/// reply's flag, that sets a conflict mode outside a `PUSH_TXN`, or that
+/// carries a blob its verb's items do not.
 #[test]
 fn decode_items_enforces_each_verbs_item_rules() {
     let multi: Vec<ClientVerb> = ClientVerb::ALL
@@ -244,6 +277,24 @@ fn decode_items_enforces_each_verbs_item_rules() {
             ),
             "status",
         );
+        for flags in [
+            WireFlags { continuation: true, ..hdr.flags },
+            WireFlags { scan_last: true, ..hdr.flags },
+            WireFlags { lane: WireLane::PushedTrain, ..hdr.flags },
+        ] {
+            refused(&one_item(ControlHeader { flags, ..hdr }, b"", schema, data), "flag");
+        }
+        let error_mode = ControlHeader {
+            flags: WireFlags {
+                conflict_mode: WireConflictMode::Error,
+                ..hdr.flags
+            },
+            ..hdr
+        };
+        match verb {
+            ClientVerb::PushTxn => assert!(decode_items(&one_item(error_mode, b"", schema, data), verb).is_ok()),
+            _ => refused(&one_item(error_mode, b"", schema, data), "conflict mode"),
+        }
         match blob {
             true => assert_eq!(
                 decode_items(&one_item(hdr, b"blob", schema, data), verb).unwrap().len(),
@@ -260,11 +311,11 @@ fn decode_items_enforces_each_verbs_item_rules() {
     assert!(err.contains("not a multi-item verb"), "{err}");
 }
 
-/// A held-ids blob names its ids in order, and one that is no whole number of
-/// ids is refused.
+/// A held-ids blob names its ids in order; one that is no whole number of ids,
+/// or that names `0`, is refused.
 #[test]
 fn held_ids_roundtrip_and_a_ragged_blob_is_refused() {
-    let ids = [1, u64::MAX, 1 << 40, 1];
+    let ids = [1, u64::MAX, 1 << 40, 1].map(sub);
     assert_eq!(decode_held(&encode_held(ids)).unwrap(), ids);
     assert_eq!(decode_held(&[]).unwrap(), []);
     let blob = encode_held(ids);
@@ -272,4 +323,7 @@ fn held_ids_roundtrip_and_a_ragged_blob_is_refused() {
         let err = decode_held(&blob[..len]).unwrap_err();
         assert!(err.contains("no whole number"), "{len}: {err}");
     }
+    let zero = [&blob[..8], &0u64.to_le_bytes()].concat();
+    let err = decode_held(&zero).unwrap_err();
+    assert!(err.contains("0 names no subscription"), "{err}");
 }

@@ -63,7 +63,7 @@ fn a_resumed_view_refuses_a_missing_manifest() {
     trace(&reopen().unwrap()).expect("a published trace resumes");
     worker(true).expect("a published view resumes on a worker");
 
-    std::fs::remove_file(child(ChildKind::Scratch("t"))).unwrap();
+    std::fs::remove_file(child(ChildKind::Scratch(layout.names().next().unwrap()))).unwrap();
     assert!(trace(&reopen().expect("the rows resume without the trace")).is_err());
 
     std::fs::remove_file(child(ChildKind::Rows)).unwrap();

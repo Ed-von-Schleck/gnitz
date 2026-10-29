@@ -4,24 +4,25 @@
 use super::super::test_support::*;
 use super::*;
 use crate::runtime::frame::WireMsg;
+use crate::runtime::w2m::fixtures::id;
 
 /// Lease ids wrap past 0, which no lease takes; a lease never takes an id a live
 /// lease still routes, nor a dropped lease's straight back.
 #[test]
 fn lease_ids_wrap_past_zero_and_skip_live_ids() {
     let (r, _writers) = reactor_with_rings(1);
-    let dropped = r.lease_acks(WorkerSet::ALL).targets().request_id;
-    assert_ne!(r.lease_acks(WorkerSet::ALL).targets().request_id, dropped);
+    let dropped = r.lease_acks(WorkerSet::ALL).id();
+    assert_ne!(r.lease_acks(WorkerSet::ALL).id(), dropped);
 
-    r.routes.next_id.set(u32::MAX);
+    r.routes.next_id.set(id(u32::MAX));
     let top = r.lease_acks(WorkerSet::ALL);
-    assert_eq!(top.targets().request_id, u32::MAX);
+    assert_eq!(top.id(), id(u32::MAX));
     let wrapped = r.lease_acks(WorkerSet::ALL);
-    assert_eq!(wrapped.targets().request_id, 1, "the id after u32::MAX is 1, not 0");
+    assert_eq!(wrapped.id(), id(1), "the id after u32::MAX is 1, not 0");
 
-    r.routes.next_id.set(1);
+    r.routes.next_id.set(id(1));
     let skipped = r.lease_train(WorkerSet::ALL, "ScanSpec");
-    assert_eq!(skipped.targets().request_id, 2, "a live lease's id is skipped");
+    assert_eq!(skipped.id(), id(2), "a live lease's id is skipped");
 }
 
 /// An ACK lease is complete on its own set's ACKs — the other workers are never
@@ -35,7 +36,7 @@ fn an_ack_lease_resolves_on_its_own_sets_acks() {
     assert!(try_poll_once(r.lease_acks(WorkerSet::EMPTY).acks()).is_some());
 
     let lease = r.lease_acks(WorkerSet::one(1).with(3));
-    let id = lease.targets().request_id;
+    let id = lease.id();
     writers[3].send_ack(id);
     r.tick(false); // drained before any awaiter
     let done = Rc::new(Cell::new(false));
@@ -58,7 +59,7 @@ fn an_ack_lease_resolves_on_its_own_sets_acks() {
 fn a_frame_no_lease_holds_is_released() {
     let (r, mut writers) = reactor_with_rings(1);
     let lease = r.lease_train(WorkerSet::ALL, "ScanSpec");
-    let id = lease.targets().request_id;
+    let id = lease.id();
     for _ in 0..3 {
         writers[0].send_msg(id, &Default::default());
     }
@@ -80,7 +81,7 @@ fn a_frame_no_lease_holds_is_released() {
 fn next_yields_the_row_frames_and_releases_the_rest() {
     let (r, mut writers) = reactor_with_rings(2);
     let lease = r.lease_train(WorkerSet::ALL, "ScanSpec");
-    let id = lease.targets().request_id;
+    let id = lease.id();
     let schema = crate::test_support::make_schema_u64_i64();
     let mut send = |w: usize, last, pk: Option<u64>| {
         let rows = pk.map(|pk| crate::test_support::make_batch(&schema, &[(pk, 1, 0)]));
@@ -121,7 +122,7 @@ fn next_yields_the_row_frames_and_releases_the_rest() {
 fn frame_of_hands_out_a_row_less_terminal() {
     let (r, mut writers) = reactor_with_rings(2);
     let lease = r.lease_train(WorkerSet::ALL, "SnapshotPage");
-    let id = lease.targets().request_id;
+    let id = lease.id();
     let schema = crate::test_support::make_schema_u64_i64();
     let rows = crate::test_support::make_batch(&schema, &[(7, 1, 0)]);
     writers[0].send_msg(id, &WireMsg::train_frame(0, false, None));
@@ -149,7 +150,7 @@ fn frame_of_hands_out_a_row_less_terminal() {
 fn a_fault_frame_names_its_worker() {
     let (r, mut writers) = reactor_with_rings(2);
     let lease = r.lease_train(WorkerSet::ALL, "ScanSpec");
-    let id = lease.targets().request_id;
+    let id = lease.id();
     writers[0].send_msg(id, &WireMsg::train_frame(0, true, None));
     let fault = WireFault::from("boom");
     writers[1].send_msg(id, &WireMsg::fault(&fault));

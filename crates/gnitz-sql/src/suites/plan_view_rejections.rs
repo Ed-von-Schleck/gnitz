@@ -659,6 +659,7 @@ fn top_n_rules() {
             ("SELECT id FROM t LIMIT 3", "LIMIT without ORDER BY"),
             ("SELECT id FROM t ORDER BY v LIMIT 0", "LIMIT 0"),
             ("SELECT id FROM t OFFSET 5", "OFFSET without"),
+            ("SELECT id FROM t OFFSET 0", "OFFSET without"),
             ("SELECT id FROM t ORDER BY v WITH FILL LIMIT 1", "WITH FILL"),
             ("SELECT DISTINCT g FROM t ORDER BY v LIMIT 1", "selected column"),
             (
@@ -667,6 +668,8 @@ fn top_n_rules() {
             ),
         ],
     );
+    // `LIMIT ALL` is no limit, so it needs no order.
+    view(&cat, "SELECT id FROM t LIMIT ALL");
     // An ORDER BY key a SELECT item already computes sorts on that item: the same
     // stored output as ordering by the item's name, DISTINCT included.
     let cols = |body: &str| final_view(&view(&cat, body)).schema.columns().to_vec();

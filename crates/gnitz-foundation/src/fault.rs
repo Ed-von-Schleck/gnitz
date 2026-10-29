@@ -40,10 +40,15 @@ impl Seam {
         }
     }
 
+    /// The setting while it is anything `env`'s flag rule does not read as off.
+    fn armed_setting(&self) -> Option<&str> {
+        self.setting().filter(|v| crate::env::flag(v) != Some(false))
+    }
+
     /// True while the seam is set to anything `env`'s flag rule does not read as
     /// off, so a seam carrying a stage or a count is armed too.
     pub fn armed(&self) -> bool {
-        self.setting().is_some_and(|v| crate::env::flag(v) != Some(false))
+        self.armed_setting().is_some()
     }
 
     /// True while the seam names this stage — for seams that pick one of several
@@ -53,10 +58,14 @@ impl Seam {
     }
 
     /// The seam's setting as a positive count (milliseconds, rows, bytes —
-    /// whatever the caller's unit is), under `env`'s rule: a zero or
-    /// unparseable value reads as unset.
+    /// whatever the caller's unit is); `None` while the seam is not armed.
+    ///
+    /// # Panics
+    ///
+    /// On an armed setting that is not a positive integer.
     pub fn count(&self) -> Option<u64> {
-        self.setting().and_then(crate::env::positive)
+        let v = self.armed_setting()?;
+        Some(crate::env::positive(v).unwrap_or_else(|| panic!("{}={v:?} is not a positive integer", self.var)))
     }
 
     /// Consume the seam's one-shot latch: true on the first call while armed,

@@ -12,7 +12,8 @@ use std::ops::Range;
 
 use gnitz_wire::{decode_all, Reader, Wire, Writer, MAX_LIST_LEN};
 
-/// Bumped by hand for any change to [`ViewDefinition::encode`]'s layout.
+/// The version of the layout [`ViewDefinition::encode`] writes, whose bytes a
+/// test pins.
 const ENCODING_VERSION: u8 = 1;
 
 /// A user view's body as written, and the relations it names.

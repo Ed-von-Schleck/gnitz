@@ -68,8 +68,9 @@ struct RegBuf {
     /// A NULL row's lane holds whatever its branch-free kernel computed. Lanes
     /// past a morsel's last row hold no row; a string register uses none.
     lanes: [i64; MORSEL],
-    /// Zero for the scratch's life outside [`ResolvedProgram::null_regs`]. Bits
-    /// past a morsel's last row are undefined.
+    /// Zero for the scratch's life outside
+    /// [`ProgramFacts::null_regs`](crate::program::ProgramFacts::null_regs).
+    /// Bits past a morsel's last row are undefined.
     nulls: [u64; NULL_WORDS_PER_REG],
     /// Packed truth bits, what a boolean reader reads. Bits past a morsel's last
     /// row are undefined.
@@ -136,6 +137,11 @@ impl Evaluator {
             start + n
         );
         let Evaluator { prog, scratch } = self;
+        #[cfg(debug_assertions)]
+        if n > 0 {
+            let reads = prog.payload_reads.iter().map(|&(pi, w)| (pi as usize, w as usize));
+            crate::view::debug_assert_coherent(mb, start, reads);
+        }
         // Hoisted: LLVM cannot fold repeated `&dyn` calls.
         let mut cols: [&[u8]; PAYLOAD_SLOTS] = [&[]; PAYLOAD_SLOTS];
         for &(pi, width) in &prog.payload_reads {
@@ -164,7 +170,7 @@ impl Evaluator {
     /// kernels at `level`. Sound for any superset of the resolved mask.
     #[cfg(test)]
     pub(crate) fn set_arm(&mut self, null_regs: u64, level: Level) {
-        self.prog.null_regs = null_regs;
+        self.prog.facts.null_regs = null_regs;
         self.scratch = EvalScratch::new(&self.prog, level);
     }
 }
@@ -407,8 +413,7 @@ fn null_or_all(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, srcs: impl Iterat
     }
 }
 
-/// Propagate unary null: dst_null = src_null (word-at-a-time). `#[inline]` for
-/// [`null_or2`]'s reason.
+/// Propagate unary null: dst_null = src_null (word-at-a-time).
 #[inline]
 fn null_copy1(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, src: u16) {
     if !mo.prog.may_null(dst) {
@@ -1451,27 +1456,27 @@ fn eval_batch(
                 IntUnaryOp::Sign => un_op(scratch, mo, dst, a, |x| (x != 0) as i64),
             },
             // One loop per (op, unit), so each inlines `calendar::eval` as that
-            // op's arithmetic alone. Only the op that can NULL pays for a fail mask.
+            // op's arithmetic alone. An op that may NULL runs through the fail mask.
             Instr::Calendar { op, a, micros } => {
                 macro_rules! per_op {
                     ($($v:ident)*) => {
                         match (op, micros) {
-                            (CalendarOp::ToMicros, _) => {
-                                unary_null_like(scratch, mo, dst, a, calendar::days_to_micros)
-                            }
                             $(
-                                (CalendarOp::$v, true) => {
-                                    un_op(scratch, mo, dst, a, |x| calendar::eval(CalendarOp::$v, x, true))
-                                }
-                                (CalendarOp::$v, false) => {
-                                    un_op(scratch, mo, dst, a, |x| calendar::eval(CalendarOp::$v, x, false))
-                                }
+                                (CalendarOp::$v, true) => per_op!(@arm $v, true),
+                                (CalendarOp::$v, false) => per_op!(@arm $v, false),
                             )*
+                        }
+                    };
+                    (@arm $v:ident, $m:literal) => {
+                        if const { CalendarOp::$v.may_null() } {
+                            unary_null_like(scratch, mo, dst, a, |x| calendar::eval(CalendarOp::$v, x, $m))
+                        } else {
+                            un_op(scratch, mo, dst, a, |x| calendar::eval(CalendarOp::$v, x, $m).0)
                         }
                     };
                 }
                 per_op!(Year Quarter Month Week Day Dow Isodow Doy Hour Minute Second Epoch TruncYear
-                    TruncQuarter TruncMonth TruncWeek TruncDay TruncHour TruncMinute TruncSecond ToDays)
+                    TruncQuarter TruncMonth TruncWeek TruncDay TruncHour TruncMinute TruncSecond ToMicros ToDays)
             }
             Instr::FloatUnary { op, a } => match op {
                 FloatUnaryOp::Neg => un_op(scratch, mo, dst, a, |x| encode_f64(-decode_f64(x))),

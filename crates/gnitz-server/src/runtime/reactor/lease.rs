@@ -12,7 +12,7 @@ use super::*;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::GroupTargets;
 use crate::runtime::sync::WakeQueue;
-use crate::runtime::w2m::{W2mSlot, BOOT_READY_REQUEST_ID, NO_REPLY_REQUEST_ID};
+use crate::runtime::w2m::{RequestId, W2mSlot};
 
 // ---------------------------------------------------------------------------
 // Routes
@@ -20,16 +20,17 @@ use crate::runtime::w2m::{W2mSlot, BOOT_READY_REQUEST_ID, NO_REPLY_REQUEST_ID};
 
 /// Every live lease's request id and what its workers have answered on it.
 pub(super) struct Routes {
+    /// Keyed by [`RequestId::get`], the value a slot is tagged with.
     map: RefCell<FxHashMap<u32, Route>>,
     /// The next request id a lease starts from.
-    next_id: Cell<u32>,
+    next_id: Cell<RequestId>,
 }
 
 impl Routes {
     pub(super) fn new() -> Self {
         Routes {
             map: RefCell::new(FxHashMap::default()),
-            next_id: Cell::new(BOOT_READY_REQUEST_ID + 1),
+            next_id: Cell::new(RequestId::BOOT_READY.next()),
         }
     }
 }
@@ -101,30 +102,27 @@ impl Reactor {
         }
     }
 
-    /// A request id no live lease holds, never [`NO_REPLY_REQUEST_ID`].
-    fn alloc_request_id(&self) -> u32 {
+    /// A request id no live lease holds.
+    fn alloc_request_id(&self) -> RequestId {
         let routes = self.routes.map.borrow();
         let mut id = self.routes.next_id.get();
-        while id == NO_REPLY_REQUEST_ID || routes.contains_key(&id) {
-            id = id.wrapping_add(1);
+        while routes.contains_key(&id.get()) {
+            id = id.next();
         }
-        self.routes.next_id.set(id.wrapping_add(1));
+        self.routes.next_id.set(id.next());
         id
     }
 
     /// `id`, routed to what `route` builds over `set` clipped to the launched
     /// workers.
-    fn lease(&self, id: u32, set: WorkerSet, route: impl FnOnce(WorkerSet) -> Route) -> Lease {
+    fn lease(&self, id: RequestId, set: WorkerSet, route: impl FnOnce(WorkerSet) -> Route) -> Lease {
         let workers = set.within(self.w2m.num_workers());
-        self.routes.map.borrow_mut().insert(id, route(workers));
-        Lease {
-            reactor: self.clone(),
-            targets: GroupTargets { set: workers, request_id: id },
-        }
+        self.routes.map.borrow_mut().insert(id.get(), route(workers));
+        Lease { reactor: self.clone(), id, set: workers }
     }
 
     /// `id`, answered by one ACK from every worker in `set`.
-    fn lease_acks_on(&self, id: u32, set: WorkerSet) -> AckLease {
+    fn lease_acks_on(&self, id: RequestId, set: WorkerSet) -> AckLease {
         AckLease(self.lease(id, set, |left| Route::Acks(AckRoute { left, waker: None })))
     }
 
@@ -134,9 +132,9 @@ impl Reactor {
         self.lease_acks_on(self.alloc_request_id(), set)
     }
 
-    /// The lease every worker's ready ACK answers.
-    pub(crate) fn lease_ready(&self) -> AckLease {
-        self.lease_acks_on(BOOT_READY_REQUEST_ID, WorkerSet::ALL)
+    /// The lease every worker's ready ACK answers; [`Reactor::new`] takes it.
+    pub(super) fn ready_lease(&self) -> ReadyLease {
+        ReadyLease(self.lease_acks_on(RequestId::BOOT_READY, WorkerSet::ALL))
     }
 
     /// One request id, answered by a train of frames from every worker in `set`.
@@ -147,7 +145,7 @@ impl Reactor {
             let queues = (0..set.len()).map(|_| WakeQueue::default()).collect();
             Route::Train(TrainRoute { set, queues })
         });
-        let left = Cell::new(lease.targets.set);
+        let left = Cell::new(lease.set);
         TrainLease { lease, left, what }
     }
 }
@@ -160,13 +158,26 @@ impl Reactor {
 /// still holds.
 struct Lease {
     reactor: Reactor,
-    /// The route's request id and the set it was built over.
-    targets: GroupTargets,
+    id: RequestId,
+    /// The set the route was built over.
+    set: WorkerSet,
+}
+
+impl Lease {
+    fn targets(&self) -> GroupTargets {
+        GroupTargets { set: self.set, reply: Some(self.id) }
+    }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.reactor.routes.map.borrow_mut().remove(&self.targets.request_id);
+        let route = self.reactor.routes.map.borrow_mut().remove(&self.id.get());
+        // Matched so an ACK route, which every round drops, drops inline rather
+        // than through the route's drop glue.
+        match route {
+            Some(Route::Acks(acks)) => drop(acks),
+            other => drop(other),
+        }
     }
 }
 
@@ -181,7 +192,7 @@ pub(crate) struct AckLease(Lease);
 impl AckLease {
     /// The targets of the group this lease's workers answer.
     pub(crate) fn targets(&self) -> GroupTargets {
-        self.0.targets
+        self.0.targets()
     }
 
     /// Resolves once every worker of the set has ACKed. A worker that cannot
@@ -189,7 +200,7 @@ impl AckLease {
     pub(crate) async fn acks(&self) {
         std::future::poll_fn(|cx| {
             let mut routes = self.0.reactor.routes.map.borrow_mut();
-            let Some(Route::Acks(r)) = routes.get_mut(&self.0.targets.request_id) else {
+            let Some(Route::Acks(r)) = routes.get_mut(&self.0.id.get()) else {
                 unreachable!("an ACK lease's id routes to its ACKs")
             };
             if r.left == WorkerSet::EMPTY {
@@ -201,6 +212,22 @@ impl AckLease {
         .await
     }
 }
+
+/// The lease every worker's ready ACK answers, which [`Reactor::new`] hands out.
+pub(crate) struct ReadyLease(AckLease);
+
+impl ReadyLease {
+    /// Resolves once every worker has ACKed its boot recovery.
+    pub(crate) async fn all_acked(self) -> ReadyAcked {
+        self.0.acks().await;
+        ReadyAcked(())
+    }
+}
+
+/// Every worker has ACKed its boot recovery, which flushes the rows it replayed
+/// from the SAL tail to its stores. Until then the tail is those rows' only
+/// durable copy, so only this token lets a writer rewind the SAL at boot.
+pub(crate) struct ReadyAcked(());
 
 // ---------------------------------------------------------------------------
 // TrainLease
@@ -238,7 +265,7 @@ impl TrainFrame {
 impl TrainLease {
     /// The targets of the group this lease's workers answer.
     pub(crate) fn targets(&self) -> GroupTargets {
-        self.lease.targets
+        self.lease.targets()
     }
 
     /// Worker `w`'s next frame, row-less ones included, with the range of its
@@ -297,7 +324,7 @@ impl TrainLease {
     async fn next_slot(&self, w: usize) -> W2mSlot {
         std::future::poll_fn(|cx| {
             let mut routes = self.lease.reactor.routes.map.borrow_mut();
-            let Some(Route::Train(route)) = routes.get_mut(&self.lease.targets.request_id) else {
+            let Some(Route::Train(route)) = routes.get_mut(&self.lease.id.get()) else {
                 unreachable!("a train lease's id routes to its train")
             };
             route

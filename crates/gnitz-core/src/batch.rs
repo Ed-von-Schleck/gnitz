@@ -749,7 +749,7 @@ impl<'a> BatchAppender<'a> {
     }
 }
 
-/// Every method is `#[inline(always)]`; see [`gnitz_expr::BatchView`] for why
+/// Every method is `#[inline(always)]`; see [`gnitz_wire::RowSource`] for why
 /// the plain hint is not enough. The bodies slice `&[u8]`, not `Vec<u8>`, whose
 /// indexing stays an out-of-line call at opt-level 0.
 impl gnitz_wire::RowSource for ZSetBatch {
@@ -842,7 +842,7 @@ impl ZSetBatch {
 }
 
 /// Decode a WAL block under `schema`, appending its rows to `sink`. On error
-/// `sink` is not usable.
+/// `sink` is as it was.
 pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
     let layout = schema.layout();
     let gnitz_wire::wal::ParsedBlock { rows, fixed, heap, .. } = gnitz_wire::wal::parse_block(data, layout.row_width())
@@ -858,7 +858,7 @@ pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &
 /// Append to `sink`, a batch of `schema`, the rows of a canonical region list
 /// this process's own store produced. Its German cells are rebased and not
 /// checked, the store having checked them when it ingested them; the layout
-/// and NOT NULL are checked as for a block. On error `sink` is not usable.
+/// and NOT NULL are checked as for a block. On error `sink` is as it was.
 pub fn append_own_regions(sink: &mut ZSetBatch, regions: &[&[u8]], schema: &Schema) -> Result<(), ProtocolError> {
     append_regions(sink, regions, schema, false)
 }
@@ -866,6 +866,7 @@ pub fn append_own_regions(sink: &mut ZSetBatch, regions: &[&[u8]], schema: &Sche
 /// Append the rows laid out as the canonical region list `regions` under
 /// `schema` to `sink`, a batch of `schema`. `foreign` regions crossed a trust
 /// boundary, so each German cell is checked for canonical form as it is copied.
+/// On error `sink` is as it was.
 fn append_regions(
     sink: &mut ZSetBatch,
     regions: &[&[u8]],
@@ -888,12 +889,16 @@ fn append_regions(
             "a region list that does not lay out its schema".into(),
         ));
     }
+    let mark = sink.mark();
     sink.reserve(count);
     sink.pks.push_region_bytes(regions[REG_PK]);
     gnitz_wire::extend_from_le_bytes(&mut sink.weights, regions[REG_WEIGHT]);
     let nulls_at = sink.nulls.len();
     gnitz_wire::extend_from_le_bytes(&mut sink.nulls, regions[REG_NULL_BMP]);
-    check_not_null(&sink.nulls[nulls_at..], schema).map_err(ProtocolError::DecodeError)?;
+    if let Err(why) = check_not_null(&sink.nulls[nulls_at..], schema) {
+        sink.rollback_to(mark);
+        return Err(ProtocolError::DecodeError(why));
+    }
 
     // A German cell's heap offset is relative to its own block's heap.
     let block_blob = regions[REG_PAYLOAD_START + sink.payload.len()];
@@ -907,6 +912,7 @@ fn append_regions(
         dst.extend_from_slice(regions[REG_PAYLOAD_START + pi]);
         if german {
             if foreign && !gnitz_wire::german_string_region_ok(&dst[at..], block_blob) {
+                sink.rollback_to(mark);
                 return Err(ProtocolError::DecodeError(format!(
                     "column {}: German string cell is not in canonical form",
                     schema.layout().payload_col_idx(pi)

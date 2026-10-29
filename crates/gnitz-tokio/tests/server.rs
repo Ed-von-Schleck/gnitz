@@ -14,7 +14,7 @@ use std::future::Future;
 
 use gnitz_core::{
     block_on, BatchAppender, ClientError, GnitzClient, PkColumn, PlannedView, PollResult, RelName, ScanReply, Schema,
-    TableDef, ViewBundle, ZSetBatch,
+    SubId, TableDef, ViewBundle, ZSetBatch,
 };
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
@@ -348,7 +348,7 @@ const HELD: Duration = Duration::from_secs(30);
 
 /// Subscribe `client` to the view `vid` whole; the subscription's id and how
 /// many rows the read brought.
-async fn subscribe(client: &AsyncClient, vid: u64, schema: &Arc<Schema>) -> (u64, usize) {
+async fn subscribe(client: &AsyncClient, vid: u64, schema: &Arc<Schema>) -> (SubId, usize) {
     let schema = Arc::clone(schema);
     let subscribed = client.run(move |c| {
         Box::pin(async move {
@@ -365,7 +365,7 @@ async fn started<F: Future + Unpin>(f: &mut F) -> bool {
 }
 
 /// The rows a sync brought `sub`, the connection's one subscription.
-fn pushed_rows(synced: gnitz_core::Synced, sub: u64) -> usize {
+fn pushed_rows(synced: gnitz_core::Synced, sub: SubId) -> usize {
     let [pushed] = &synced.pushed[..] else {
         panic!("one entry per subscription")
     };

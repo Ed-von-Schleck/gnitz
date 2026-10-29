@@ -2,21 +2,22 @@
 //! subscribe, then sync, which answers with the view's deltas since and
 //! advances every mirrored view.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use crate::batch::decode_wal_block_into;
 use crate::client::GnitzClient;
-use crate::connection::{DeltaCursor, ScanReply, Target};
+use crate::connection::{DeltaCursor, ScanReply, SubId, Target};
 use crate::error::ClientError;
-use crate::host::Sent;
+use crate::host::{promise_returning, Promise, Sent};
 use crate::mirror::PollOutcome;
 use crate::{Schema, ZSetBatch};
+use gnitz_wire::txn_frame::kept_as;
 
 /// What a sync hands a reader for one of its subscriptions.
 pub struct Pushed {
     /// The id [`GnitzClient::subscribe`] returned.
-    pub sub: u64,
+    pub sub: SubId,
     /// The deltas pushed since the last sync and the cursor past them, or
     /// the end of the subscription.
     pub result: Result<(ScanReply, DeltaCursor), ClientError>,
@@ -42,9 +43,9 @@ impl GnitzClient {
         from: Option<DeltaCursor>,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
-    ) -> Result<(u64, ScanReply, DeltaCursor), ClientError> {
+    ) -> Result<(SubId, ScanReply, DeltaCursor), ClientError> {
         let id = self.next_sub;
-        self.next_sub += 1;
+        self.next_sub = kept_as(id, 1);
         let sent = self
             .session
             .submit_delta_read(view.into(), from, reply_schema, spec, Some(id));
@@ -56,15 +57,14 @@ impl GnitzClient {
     /// End subscription `id`: no sync reports it again. The next sync tells
     /// the server, and drops what was pushed for `id` until then. An id this
     /// client does not hold is ignored.
-    pub fn unsubscribe(&mut self, id: u64) {
+    pub fn unsubscribe(&mut self, id: SubId) {
         // A mirror's subscription ids come from the same counter, so only a
         // reader's id is released.
         if self.readers.remove(&id).is_some() {
             self.session.release(id);
         }
-        if let Some(unclaimed) = &mut self.unclaimed {
-            unclaimed.retain(|p| p.sub != id);
-        }
+        self.reclaim();
+        self.unclaimed.retain(|p| p.sub != id);
     }
 
     /// Bring every subscription of this connection, a reader's and a
@@ -86,9 +86,14 @@ impl GnitzClient {
     /// until the answer arrives: a request made meanwhile is answered while the
     /// server holds the sync, and leaves it held.
     pub fn begin_sync(&mut self, wait: Duration) -> Sent<()> {
-        let wait = if self.unclaimed.is_some() { Duration::ZERO } else { wait };
+        self.reclaim();
+        let wait = if self.unclaimed.is_empty() {
+            wait
+        } else {
+            Duration::ZERO
+        };
         let (wait, mirrored) = self.mirror_hold(wait);
-        let held: Vec<u64> = self.readers.keys().copied().chain(mirrored).collect();
+        let held: Vec<SubId> = self.readers.keys().copied().chain(mirrored).collect();
         self.session.submit_sync(&held, wait)
     }
 
@@ -97,14 +102,20 @@ impl GnitzClient {
     ///
     /// What it takes from the client is the caller's alone: a driver whose
     /// caller is gone by the time it completes hands it to
-    /// [`Self::unclaimed`].
+    /// [`Self::unclaimed`], or delivers it through a [`Self::sync_reply`] cell.
     pub async fn finish_sync(&mut self, synced: Result<(), ClientError>) -> Result<Synced, ClientError> {
+        self.reclaim();
         let mirrored = self.advance_mirror(&synced).await?;
         let mut pushed = self.drain_readers(&synced);
-        if let Some(earlier) = self.unclaimed.take() {
-            put_in_front(earlier, &mut pushed);
-        }
+        put_in_front(std::mem::take(&mut self.unclaimed), &mut pushed);
         Ok(Synced { pushed, mirrored })
+    }
+
+    /// A cell for [`Self::finish_sync`]'s delivery whose [`Sent`], dropped
+    /// with the delivery unread, hands it back as [`Self::unclaimed`] does.
+    pub fn sync_reply(&self) -> (Promise<Synced>, Sent<Synced>) {
+        let returned = Arc::clone(&self.returned);
+        promise_returning(move |synced| returned.lock().unwrap_or_else(PoisonError::into_inner).push(synced))
     }
 
     /// Hand back a sync's delivery its caller never received: the next sync
@@ -115,17 +126,20 @@ impl GnitzClient {
     /// again by the next sync that advances it.
     pub fn unclaimed(&mut self, synced: Synced) {
         let Synced { mut pushed, mirrored } = synced;
-        let reseeded = match self.mirror.as_deref_mut() {
-            Some(m) => m.owe_reseeds(&mirrored),
-            None => false,
-        };
+        if let Some(m) = self.mirror.as_deref_mut() {
+            m.owe_reseeds(&mirrored);
+        }
+        put_in_front(std::mem::take(&mut self.unclaimed), &mut pushed);
         // Rows-free entries carry nothing the next sync's cursor does not.
         pushed.retain(|p| p.result.as_ref().map_or(true, |(rows, _)| !rows.batch.is_empty()));
-        if let Some(earlier) = self.unclaimed.take() {
-            put_in_front(earlier, &mut pushed);
-            self.unclaimed = Some(pushed);
-        } else if reseeded || !pushed.is_empty() {
-            self.unclaimed = Some(pushed);
+        self.unclaimed = pushed;
+    }
+
+    /// Take up what [`Self::sync_reply`] cells handed back.
+    fn reclaim(&mut self) {
+        let returned = std::mem::take(&mut *self.returned.lock().unwrap_or_else(PoisonError::into_inner));
+        for synced in returned {
+            self.unclaimed(synced);
         }
     }
 

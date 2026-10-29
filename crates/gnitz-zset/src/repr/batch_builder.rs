@@ -35,8 +35,8 @@ impl gnitz_wire::SysRowSink for BatchBuilder {
 impl BatchBuilder {
     pub fn new(schema: &SchemaDescriptor) -> Self {
         BatchBuilder {
-            // Uninitialized, like every batch arena: every row writes every
-            // column (`put_null` zero-fills rather than skipping).
+            // Every row writes every column, as `DirectWriter` says: `put_null`
+            // zero-fills its cell.
             batch: Batch::with_capacity(schema, 8),
             curr_col: 0,
         }
@@ -63,8 +63,7 @@ impl BatchBuilder {
     }
 
     /// Put an integer value for the current payload column, in that column's own
-    /// width — so a value and its column cannot be mismatched, the shape
-    /// [`Self::put_null`] below already has.
+    /// width.
     ///
     /// Signed values are passed as `v as u128`: sign-extending to 128 bits leaves
     /// the low `size()` bytes exactly the two's-complement image the column

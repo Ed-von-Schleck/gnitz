@@ -322,7 +322,11 @@ fn push_refuses_a_malformed_operator_built_or_decoded() {
         group_cols: vec![0],
         aggs: vec![AggDescriptor::COUNT_STAR],
     });
-    let cases: [(OpNode, &[NodeId], &str); 7] = [
+    let countless = OpNode::Reduce(GroupAggs {
+        group_cols: vec![0],
+        aggs: vec![AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum }],
+    });
+    let cases: [(OpNode, &[NodeId], &str); 8] = [
         (
             reindex(ReindexRole::Auxiliary, vec![]),
             &[0],
@@ -339,6 +343,7 @@ fn push_refuses_a_malformed_operator_built_or_decoded() {
             &[0],
             "a hash-row map names no columns",
         ),
+        (countless, &[0], "a reduce carries no COUNT(*)"),
         (OpNode::Negate, &[1], forward),
         (OpNode::Negate, &[7], forward),
         (OpNode::Union, &[0], arity),

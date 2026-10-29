@@ -5,7 +5,7 @@ use super::{ChildKind, RelationRegistry};
 use crate::storage::{Cut, RecoverySource, Table};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::{Batch, PkSetGather, ReadCursor, StorageError};
-use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::{encode_schema_block, SchemaDescriptor};
 
 /// An index into one [`CircuitState`], minted only by
 /// [`StateLayout::declare`].
@@ -19,15 +19,20 @@ pub struct StateLayout {
 }
 
 impl StateLayout {
-    /// Declare one rederived child store named `child`: a name of its own, since
-    /// each child opens the store it names.
+    /// Declare one rederived child store for `child`: a name of its own, since
+    /// each child opens the store it names. The store's name carries a digest of
+    /// `schema`, so a checkpoint taken under another schema is not resumed.
     pub fn declare(&mut self, child: String, schema: SchemaDescriptor) -> StateIdx {
+        let digest = gnitz_wire::checksum(&encode_schema_block(&schema));
+        let name = format!("{child}_{digest:016x}");
         debug_assert!(
-            self.children.iter().all(|(name, _)| *name != child),
+            self.children
+                .iter()
+                .all(|(n, _)| n.rsplit_once('_').is_none_or(|(c, _)| c != child)),
             "child {child} declared twice"
         );
         let idx = StateIdx(self.children.len());
-        self.children.push((child, schema));
+        self.children.push((name, schema));
         idx
     }
 

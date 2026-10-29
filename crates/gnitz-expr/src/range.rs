@@ -52,6 +52,14 @@ impl RangeMembership {
             words.fill(0);
             return;
         }
+        #[cfg(debug_assertions)]
+        if mb.row_count() > 0 {
+            let reads = self.bounds.iter().filter_map(|&(loc, ..)| match loc {
+                ColumnLocator::Payload { slot, size, .. } => Some((slot as usize, size as usize)),
+                ColumnLocator::Pk { .. } => None,
+            });
+            crate::view::debug_assert_coherent(mb, 0, reads);
+        }
         if self.null_mask != 0 {
             for (words, rows) in words.chunks_mut(4).zip(mb.null_bmp().chunks(4 * 64 * 8)) {
                 let mut nulls = [0u64; 4];

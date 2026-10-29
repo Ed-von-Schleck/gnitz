@@ -42,3 +42,44 @@ fn another_format_or_version_is_refused() {
     assert!(Manifest::from_json(&text.replace("gnitz-dump", "pg_dump")).is_err());
     assert!(Manifest::from_json("{").is_err());
 }
+
+/// A version 1 manifest as a release wrote it, which every build restoring
+/// version 1 reads as [`sample`].
+const V1: &str = r#"{
+  "format": "gnitz-dump",
+  "version": 1,
+  "gnitz": "0.1.0",
+  "schemas": [
+    "sales"
+  ],
+  "tables": [
+    {
+      "schema": "public",
+      "name": "t",
+      "file": "data/0.parquet",
+      "rows": 12,
+      "serial": 40
+    },
+    {
+      "schema": "sales",
+      "name": "events",
+      "file": null,
+      "rows": 0,
+      "serial": null
+    }
+  ],
+  "views": [
+    {
+      "schema": "sales",
+      "name": "hot"
+    }
+  ],
+  "indexes": [
+    "hot_k"
+  ]
+}"#;
+
+#[test]
+fn a_version_1_manifest_reads() {
+    assert_eq!(Manifest::from_json(V1).unwrap(), sample());
+}

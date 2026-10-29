@@ -40,9 +40,9 @@ impl RelationRegistry {
                 from_runs_in_band(runs, schema, cap, start.pk_bytes(), None)
             }
         };
-        // A drain passes over cancelled groups without counting them, and a
-        // pinned store holds no skeleton rows, so one drain falls short of
-        // `limit` only where the store ends.
+        // A drain passes over cancelled groups without counting them, and a pin
+        // holds no view's skeleton rows, so one drain falls short of `limit`
+        // only where the store ends.
         Ok(cursor
             .drain_chunk(limit)
             .unwrap_or_else(|| Batch::empty_with_schema(&schema)))

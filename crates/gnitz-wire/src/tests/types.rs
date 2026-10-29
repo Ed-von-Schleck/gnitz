@@ -1,20 +1,10 @@
 use super::*;
 
-/// Every type-code predicate, as one partition of the type table. The row count
-/// is guarded against `TypeCode::ALL`, so a new variant fails here rather than
-/// falling silently outside a hand-listed set in each predicate's own test.
+/// Every type-code predicate over every `TypeCode`.
 #[test]
 fn type_predicates_partition_the_type_table() {
     /// `(type, fixed_int, signed_int, int, float, german_string, wide_int,
-    /// pk_eligible, serial_eligible, reindex_output_type)` — one row per
-    /// `TypeCode`, one column per predicate. A SERIAL key is exactly the plain
-    /// integers of at most 8 bytes: not a DATE's days, a DECIMAL's scaled units,
-    /// nor a 16-byte type. A BOOLEAN, a DATE, a TIMESTAMP and a DECIMAL are
-    /// stored as a fixed int and key as one, and are no integer. The reindex /
-    /// `_join_pk` key a type packs at — the one policy the engine compiler and
-    /// SQL planner both derive from — is the type itself for a ≤8-byte stored
-    /// int, `I128` keeps width 16 **with** its sign, and everything else (U128,
-    /// UUID, the STRING/BLOB content hash, floats) is the unsigned 16-byte U128.
+    /// pk_eligible, serial_eligible, reindex_output_type)`, one row per type.
     use TypeCode::*;
     type Row = (TypeCode, bool, bool, bool, bool, bool, bool, bool, bool, TypeCode);
     let table: &[Row] = &[
@@ -191,12 +181,8 @@ fn cmp_col_window_orders_every_fixed_width_type() {
     }
 }
 
-/// `decode_le_i64` reads the column's own width into the i64 register; `pack`
-/// is its encode-side inverse over `range()`, writing an in-range value into
-/// exactly the low `width()` bytes — so `-1` on an `I8` column packs to `0xFF`,
-/// not to a sign-extended `0xFFFF…`; and `unpack` answers what `decode_le_i64`
-/// answers over any `u128`'s bytes, its unsigned arm masking the bits past the
-/// width.
+/// `pack` writes an in-range value into exactly a `FixedInt`'s width, and
+/// `decode_le_i64` and `unpack` read that width back.
 #[test]
 fn fixed_int_packs_unpacks_and_decodes_its_own_width() {
     assert_eq!(FixedInt::U8.decode_le_i64(&[0xff]), 255i64);

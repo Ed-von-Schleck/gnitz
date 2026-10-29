@@ -26,7 +26,7 @@ fn a_pin_answers_as_the_store_stood_whatever_it_takes_after() {
     let before = batch_rows(&r.scan_spec(TID, rows_spec(None, None), layout, None).unwrap());
     assert_eq!(before, (0..80).map(|k| (k, 1, 1)).collect::<Vec<_>>());
 
-    r.pin(7, |k| k == RelationKind::BaseTable).unwrap();
+    r.pin(7, PinScope::BaseTables).unwrap();
     // Overwrite every row, delete half, and keep spilling and flushing so the
     // pinned runs are folded away and their shard files retired.
     for i in 0..8 {
@@ -53,16 +53,16 @@ fn a_pin_answers_as_the_store_stood_whatever_it_takes_after() {
 }
 
 #[test]
-fn a_pin_holds_only_what_its_filter_keeps_and_its_id_is_its_own() {
+fn a_pin_holds_only_what_its_scope_takes_and_its_id_is_its_own() {
     let schema = make_schema_u64_i64();
     let mut r = relation_fixture(RelationKind::BaseTable, schema, &[], [round(0, 3, 1)]);
-    r.pin(1, |k| k == RelationKind::SystemCatalog).unwrap();
+    r.pin(1, PinScope::SystemCatalog).unwrap();
     let err = r
         .pinned_page(1, TID, &page(schema.layout_digest(), 1), Slot::SOLO)
         .err()
         .unwrap();
     assert!(err.contains("holds no relation"), "{err}");
-    assert!(r.pin(1, |_| true).is_err());
+    assert!(r.pin(1, PinScope::Durable).is_err());
     assert_eq!(r.snapshots.len(), 1);
     assert!(!r.pins(1, TID));
 }

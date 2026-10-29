@@ -357,13 +357,7 @@ impl RegClass {
 /// string CASE, and lowering rejects the genuinely mixed shapes when it reads
 /// the branches.
 fn unify_blend_type(a: ColType, b: ColType) -> ColType {
-    // Per-operand this is exactly `register_image`; unifying a pair is the
-    // String > F64 > DECIMAL > U64 > I64 join of the two images. Past the
-    // String, F64, DECIMAL and U64 arms only {I64, DATE, TIMESTAMP, BOOLEAN}
-    // are left: a temporal or boolean image absorbs the neutral I64, an equal
-    // pair is itself, and DATE with TIMESTAMP meets at TIMESTAMP, the finer
-    // unit. Lowering refuses a BOOLEAN beside any other type, whatever this
-    // names the pair.
+    // The String > F64 > DECIMAL > U64 > I64 join of the two register images.
     let (a, b) = (a.register_image(), b.register_image());
     match (a.tc, b.tc) {
         (TypeCode::String, _) | (_, TypeCode::String) => STRING,
@@ -374,7 +368,13 @@ fn unify_blend_type(a: ColType, b: ColType) -> ColType {
         (TypeCode::U64, _) | (_, TypeCode::U64) => ColType::of(TypeCode::U64),
         (x, TypeCode::I64) | (TypeCode::I64, x) => ColType::of(x),
         (x, y) if x == y => ColType::of(x),
-        _ => ColType::of(TypeCode::Timestamp),
+        // DATE meets TIMESTAMP at the finer unit.
+        (TypeCode::Date, TypeCode::Timestamp) | (TypeCode::Timestamp, TypeCode::Date) => {
+            ColType::of(TypeCode::Timestamp)
+        }
+        // Lowering refuses a BOOLEAN beside another type.
+        (TypeCode::Bool, _) | (_, TypeCode::Bool) => BOOL,
+        _ => unreachable!("register_image yields no other type"),
     }
 }
 

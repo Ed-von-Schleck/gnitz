@@ -190,7 +190,6 @@ impl CatalogEngine {
         self_schema: &SchemaDescriptor,
         dropped: &IdSet,
     ) -> Result<(), String> {
-        // Mirrors the production planner gate.
         let target_type = if fk.table_id == self_table_id {
             // Self-referential FK: the table has no UNIQUE index yet, so the
             // target must be its lone PK column. The downstream probe reads the
@@ -503,10 +502,9 @@ impl CatalogEngine {
     fn check_column_owners(&self, cols: &Batch, created: &IdSet, alone: bool) -> Result<(), String> {
         for i in cols.live_rows() {
             let owner_id = gnitz_wire::sys_leading_id(cols.get_pk_bytes(i));
-            // An ALTER changes one column and is its bundle's only change (a
-            // rewrite pair is one live row): nothing can undo its descriptor
-            // swap, so the swap must be the bundle's last fallible step, and the
-            // precheck's prospective build must be the one the hook makes.
+            // An ALTER changes one column (a rewrite pair is one live row) and is
+            // its bundle's only change: its descriptor swap runs last, and an ADD
+            // COLUMN's cannot be undone, since the store refuses to narrow a schema.
             if self.registry.relation(owner_id).is_some() {
                 if !alone || cols.live_rows().nth(1).is_some() {
                     return Err("a column ALTER must be the only change in its DDL transaction".into());

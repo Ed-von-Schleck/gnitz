@@ -51,8 +51,8 @@ impl MirrorConfig {
 /// The store's directory under the one a host names.
 const ROOT: &str = "_mirror";
 
-/// `GNITZ_INJECT_MIRROR_INGEST_PANIC`: panic once on an advance, idle polls
-/// included. A panic rather than an `Err`: nothing else poisons the client's
+/// `GNITZ_INJECT_MIRROR_INGEST_PANIC`: panic once on an advance or a cursor
+/// move. A panic rather than an `Err`: nothing else poisons the client's
 /// lock on the store.
 static INGEST_PANIC: Seam = Seam::new("GNITZ_INJECT_MIRROR_INGEST_PANIC");
 
@@ -220,6 +220,20 @@ impl Mirror {
         })
     }
 
+    /// Refuse deltas for a copy of `tid` that holds no cursor to continue. Where
+    /// [`INGEST_PANIC`] fires.
+    fn continuing(&self, tid: u64) -> Result<(), MirrorError> {
+        if self.cursor_of(tid).is_none() {
+            return Err(MirrorError::Engine(format!(
+                "relation {tid}'s copy holds no cursor for deltas to continue"
+            )));
+        }
+        if INGEST_PANIC.take_once() {
+            panic!("injected mirror ingest panic");
+        }
+        Ok(())
+    }
+
     /// Set `tid`'s value to its view's at `at`.
     fn settle(&mut self, tid: u64, at: DeltaCursor) {
         let rec = self.record(tid);
@@ -333,22 +347,18 @@ impl MirrorStore for Mirror {
     }
 
     fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError> {
-        if self.cursor_of(tid).is_none() {
-            return Err(MirrorError::Engine(format!(
-                "relation {tid}'s copy holds no cursor for deltas to continue"
-            )));
-        }
-        if INGEST_PANIC.take_once() {
-            panic!("injected mirror ingest panic");
-        }
+        self.continuing(tid)?;
         for &block in blocks {
             self.ingest(tid, block)?;
         }
         self.settle(tid, next);
-        // Not for an advance that carried nothing, which touches no disk.
-        if !blocks.is_empty() {
-            self.checkpoint_if_due();
-        }
+        self.checkpoint_if_due();
+        Ok(())
+    }
+
+    fn move_cursor(&mut self, tid: u64, next: DeltaCursor) -> Result<(), MirrorError> {
+        self.continuing(tid)?;
+        self.settle(tid, next);
         Ok(())
     }
 

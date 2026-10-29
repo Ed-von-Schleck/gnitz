@@ -209,7 +209,9 @@ pub(crate) fn commit(dir: &str) -> Result<(), StorageError> {
 
 /// The directories a sync of the store directory `dir` makes durable: its own,
 /// for the files in it, and on its `first` sync its parent's and grandparent's
-/// too, for the entries that reach it.
+/// too, for the entries that reach it. A store directory sits at most two below
+/// the data directory's `_relations` (`relation_dir[/child]`), whose own entry
+/// `lock_data_dir` syncs.
 pub(super) fn owed_dirs(dir: &str, first: bool) -> impl Iterator<Item = PathBuf> + '_ {
     Path::new(dir)
         .ancestors()

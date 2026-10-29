@@ -92,7 +92,7 @@ pub struct PyPushed {
 
 impl PyPushed {
     fn new(py: Python<'_>, pushed: Pushed) -> PyResult<PyPushed> {
-        let sub = pushed.sub;
+        let sub = pushed.sub.get();
         Ok(match pushed.result {
             Ok((reply, cursor)) => PyPushed {
                 sub,

@@ -63,3 +63,27 @@ fn a_failed_fsync_reports_its_errno() {
         assert_eq!(got, Err(StorageError::Io(libc::EINVAL)), "a pipe cannot be synced");
     }
 }
+
+/// A failed batch drops the ring it ran on, and the next batch syncs through a
+/// fresh one.
+#[test]
+fn a_failed_batch_leaves_the_syncer_reusable() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = (0..8)
+        .map(|i| {
+            let p = dir.path().join(i.to_string());
+            File::create(&p).unwrap();
+            p
+        })
+        .collect();
+    let mut sync = Syncer::default();
+    // A character device cannot be synced.
+    let devnull = [Path::new("/dev/null"); 8];
+    assert_eq!(
+        sync.sync_paths(devnull, FsyncFlags::DATASYNC),
+        Err(StorageError::Io(libc::EINVAL))
+    );
+    assert!(sync.ring.is_none());
+    sync.sync_paths(&paths, FsyncFlags::DATASYNC).expect("a fresh ring");
+    assert!(sync.ring.is_some());
+}

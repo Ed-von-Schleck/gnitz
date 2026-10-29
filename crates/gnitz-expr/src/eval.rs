@@ -36,7 +36,7 @@ pub enum ExprResults {
 impl LogicalProgram {
     /// A filter predicate; its result must not be a string.
     pub fn resolve_filter(&self, schema: &SchemaDescriptor) -> Result<RowFilter, ExprValidateErr> {
-        let [Sink::Reg(r)] = self.sinks[..] else {
+        let [Sink::Reg(r)] = self.sinks()[..] else {
             return Err(ExprValidateErr::OutputRoleMismatch);
         };
         if self.is_str(r) {
@@ -56,11 +56,11 @@ impl LogicalProgram {
 
     /// A scalar expression, one value per row.
     pub fn resolve_scalar(&self, schema: &SchemaDescriptor) -> Result<ScalarEval, ExprValidateErr> {
-        let [Sink::Reg(r)] = self.sinks[..] else {
+        let [Sink::Reg(r)] = self.sinks()[..] else {
             return Err(ExprValidateErr::OutputRoleMismatch);
         };
         let prog = self.resolve_program(schema, ReadAs::Value)?;
-        let class = match (self.is_str(r), (prog.reg_u64 >> r.0) & 1 != 0) {
+        let class = match (self.is_str(r), prog.is_u64(r.0)) {
             (true, _) => ResultClass::Str,
             (false, true) => ResultClass::Unsigned,
             (false, false) => ResultClass::Signed,
@@ -210,7 +210,7 @@ pub(crate) trait Resolved {
     }
 
     fn null_regs(&self) -> u64 {
-        self.ev().map_or(0, |ev| ev.prog().null_regs)
+        self.ev().map_or(0, |ev| ev.prog().null_regs())
     }
 
     fn set_arm(&mut self, null_regs: u64, level: Level) {

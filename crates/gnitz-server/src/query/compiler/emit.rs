@@ -34,9 +34,7 @@ pub(super) struct EmitCtx<'a> {
     /// re-key reads.
     pub(super) integrals: Vec<Option<(Integral, DeltaReg)>>,
     pub(super) sources: FxHashMap<u64, Scan>,
-    /// The view, whose store is the integral of its output node's register. A
-    /// bounded view's store may hold a skeleton row in a row's place, so its
-    /// output node is never a reduce: hydration refuses that shape.
+    /// The view, whose store is the integral of its output node's register.
     view: u64,
 }
 
@@ -431,8 +429,9 @@ fn push_ordered(ctx: &mut EmitCtx, nid: NodeId, in_reg: DeltaReg, kind: &'static
 }
 
 /// `consumer`'s per-worker partial over `shard`'s input, or `None` for a reduce
-/// whose partials do not combine and for a window, whose every row reads the
-/// rows before it. Its children are the shard's.
+/// whose partials do not combine and for any other reader (a window's every row
+/// reads the rows before it): the exchange then carries the raw rows. Its
+/// children are the shard's.
 fn emit_partial(ctx: &mut EmitCtx, shard: NodeId, consumer: NodeId) -> Result<Option<DeltaReg>, String> {
     let in_reg = ctx.unary_delta_in(shard);
     let in_schema = ctx.prog.schema_of(in_reg);
@@ -444,8 +443,7 @@ fn emit_partial(ctx: &mut EmitCtx, shard: NodeId, consumer: NodeId) -> Result<Op
             let plan = OrderedPlan::top_n_partial(&in_schema, order, *limit, *offset)?;
             Some(push_ordered(ctx, shard, in_reg, "topnidx", plan))
         }
-        OpNode::Window { .. } => None,
-        _ => unreachable!("`keyed_reader` names only a Reduce, a TopN or a Window"),
+        _ => None,
     })
 }
 

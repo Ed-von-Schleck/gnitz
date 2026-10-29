@@ -6,7 +6,7 @@ use gnitz_wire::ReadSpec;
 use std::rc::Rc;
 
 use super::{check_layout, SkeletonHydrator};
-use crate::relation::{Cut, RelationKind, RelationRegistry};
+use crate::relation::{Cut, RelationRegistry};
 use gnitz_expr::RowFilter;
 use gnitz_zset::algebra::SinkPlan;
 use gnitz_zset::repr::Batch;
@@ -23,11 +23,7 @@ impl RelationRegistry {
         mut hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Rc<Batch>, String> {
         let entry = self.relation_or_err(target_id)?;
-        if entry.kind() == RelationKind::Stream {
-            return Err(format!(
-                "relation {target_id} is a stream: a stream holds no rows and cannot be read"
-            ));
-        }
+        let table = entry.table_or_err()?;
         let src_schema = entry.schema();
         let whole = spec.is_whole();
         let ReadSpec { bound, predicate, sink } = spec;
@@ -38,7 +34,7 @@ impl RelationRegistry {
         check_layout(reply_layout, sink.output_schema())?;
         // Nothing to hydrate either: the relation whole, off the store's cached
         // snapshot.
-        if whole && !entry.table().has_skeleton_rows() {
+        if whole && !table.has_skeleton_rows() {
             return Ok(entry.full_scan());
         }
         let (mut source, walk) = entry.open_bound(bound, Cut::Now)?;

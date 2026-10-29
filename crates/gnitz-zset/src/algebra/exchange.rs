@@ -1,7 +1,7 @@
 //! The scatter plan of a worker exchange: [`ScatterPlan`] and the per-row
 //! routing-key kernels.
 
-use super::group_key::{cell_image, for_key_cells, GroupKey, KeyCells};
+use super::group_key::{cell_image, for_key_cells, GroupKey, KeyCells, KeyForm};
 use super::key_pack::{FoldCols, KeyPacker};
 use super::route::{ground_owner, worker_for_key, worker_for_pk_bytes, worker_for_wide_pk, Placement, Slot};
 use crate::repr::{Batch, MemBatch};
@@ -80,19 +80,15 @@ impl ScatterPlan {
 
     fn route_into(&self, mb: &MemBatch, nw: usize, sink: &mut impl RowSink) {
         match self.0 {
-            Some(ref key) if nw > 1 => match key.cells(mb) {
-                Some(cells) => for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(&cells, mb.weight(), sink, nw)),
-                None => match *key {
-                    GroupKey::PkRange { at, n } => {
-                        debug_assert!(n > gnitz_wire::NARROW_PK_MAX_BYTES, "a narrow PK range is one cell");
-                        route_rows(mb, sink, PkRangeW { at, n, nw })
-                    }
-                    GroupKey::Packed(ref packer) => route_rows_packed(mb, sink, packer, nw),
-                    // The one group of no columns has one owner, and no key to hash.
-                    GroupKey::Fold(ref fold) if fold.is_empty() => route_rows(mb, sink, Owner(ground_owner(nw))),
-                    GroupKey::Fold(ref fold) => route_rows(mb, sink, FoldW { fold, nw }),
-                    GroupKey::Image(_) => unreachable!("an image key is one cell"),
-                },
+            Some(ref key) if nw > 1 => match key.form(mb) {
+                KeyForm::Cells(cells) => {
+                    for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(&cells, mb.weight(), sink, nw))
+                }
+                KeyForm::WidePk { at, n } => route_rows(mb, sink, PkRangeW { at, n, nw }),
+                KeyForm::Packed(packer) => route_rows_packed(mb, sink, packer, nw),
+                // The one group of no columns has one owner, and no key to hash.
+                KeyForm::Fold(fold) if fold.is_empty() => route_rows(mb, sink, Owner(ground_owner(nw))),
+                KeyForm::Fold(fold) => route_rows(mb, sink, FoldW { fold, nw }),
             },
             // One worker owns every key, and a broadcast is the one list, so no
             // key is read or hashed.
@@ -212,10 +208,6 @@ fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker,
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[path = "tests/exchange.rs"]

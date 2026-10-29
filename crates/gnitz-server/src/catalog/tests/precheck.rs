@@ -30,6 +30,15 @@ fn a_stored_name_is_an_identifier_or_a_segment_and_canonical() {
     }
 }
 
+/// Every name the client's fold admits is stored as it folded it.
+#[test]
+fn a_canonical_identifier_is_a_stored_name() {
+    for name in ["a", "Mixed_Case9", "UPPER", "x_1_Y"] {
+        let canonical = gnitz_wire::canonical_identifier(name).unwrap();
+        assert_eq!(check_stored_name(&canonical, "table", false), Ok(()), "{name:?}");
+    }
+}
+
 /// Assert that `got` failed with an error containing `want`, or passed when
 /// `want` is `""`; `ctx` labels the failure.
 fn assert_verdict(got: Result<impl Sized, String>, want: &str, ctx: impl std::fmt::Display) {

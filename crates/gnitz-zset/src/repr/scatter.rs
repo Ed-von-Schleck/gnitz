@@ -31,11 +31,11 @@ use gnitz_wire::{Heap, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_
 /// (PK, payload) group, at the group's net weight.
 pub(crate) type Pick = (u32, u32, i64);
 
-/// Instantiate `$f` at the const width matching `$w`, which is also passed on.
-/// The literal width keeps the per-row copy a load/store instead of a `memcpy`
-/// call. `N = 0` is the runtime arm: a compound PK stride (U64+U32 = 12) reaches
-/// it, a payload column width never does — those targets reject it.
-macro_rules! width_dispatch {
+/// Instantiate `$f` at the const width matching the region stride `$w`, which
+/// is also passed on. The literal width keeps the per-row copy a load/store
+/// instead of a `memcpy` call. `N = 0` is the runtime arm, which a compound PK
+/// stride (U64+U32 = 12) reaches; a target reads its width through [`stride`].
+macro_rules! stride_dispatch {
     ($w:expr, $f:ident, $($arg:expr),* $(,)?) => {{
         let w = $w;
         match w {
@@ -48,7 +48,33 @@ macro_rules! width_dispatch {
         }
     }};
 }
-pub(crate) use width_dispatch;
+pub(crate) use stride_dispatch;
+
+/// Instantiate `$f` at the const width of one column cell, `$w`.
+macro_rules! cell_width_dispatch {
+    ($w:expr, $f:ident, $($arg:expr),* $(,)?) => {
+        match $w {
+            1 => $f::<1>($($arg),*),
+            2 => $f::<2>($($arg),*),
+            4 => $f::<4>($($arg),*),
+            8 => $f::<8>($($arg),*),
+            16 => $f::<16>($($arg),*),
+            w => unreachable!("a column cell is 1, 2, 4, 8 or 16 bytes, not {w}"),
+        }
+    };
+}
+pub(crate) use cell_width_dispatch;
+
+/// The width a [`stride_dispatch!`] target runs at: `N`, or `width` in the
+/// runtime arm.
+#[inline(always)]
+pub(crate) const fn stride<const N: usize>(width: usize) -> usize {
+    if N == 0 {
+        width
+    } else {
+        N
+    }
+}
 
 /// Each `[start, end)` run of `width`-byte cells of `src`, copied onto `dst`
 /// back to back.
@@ -59,8 +85,7 @@ pub(crate) fn copy_runs<const N: usize>(
     runs: impl Iterator<Item = (usize, usize)>,
     width: usize,
 ) {
-    // `N = 0` is the runtime width a compound PK stride takes.
-    let w = if N == 0 { width } else { N };
+    let w = stride::<N>(width);
     let mut at = 0usize;
     for (start, end) in runs {
         let n = end - start;
@@ -108,7 +133,7 @@ pub(crate) fn copy_ranges(
                 "copy_ranges: a writer of another row count"
             );
             for r in 0..schema.num_fixed_regions() {
-                width_dispatch!(
+                stride_dispatch!(
                     schema.region_stride(r),
                     copy_runs,
                     src.region(r),
@@ -148,7 +173,7 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
         );
     }
 
-    width_dispatch!(writer.schema.pk_stride(), scatter_pk_wt_nbm, batch, indices, writer);
+    stride_dispatch!(writer.schema.pk_stride(), scatter_pk_wt_nbm, batch, indices, writer);
 
     let schema = writer.schema;
     for (pi, col) in schema.payload_columns() {
@@ -161,7 +186,7 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
             }
         } else {
             let src_col = batch.col_data(pi);
-            width_dispatch!(cs, gather_col, src_col, writer.col_mut(pi), indices);
+            cell_width_dispatch!(cs, gather_col, src_col, writer.col_mut(pi), indices);
         }
     }
 }
@@ -174,7 +199,7 @@ fn scatter_pk_wt_nbm<const PKS: usize>(
     width: usize,
 ) {
     const FB: usize = FIXED_REGION_BYTES;
-    let pks = if PKS == 0 { width } else { PKS };
+    let pks = stride::<PKS>(width);
     let pk_src = batch.pk();
     let wt_src = batch.weight();
     let nb_src = batch.null_bmp();
@@ -194,8 +219,7 @@ fn scatter_pk_wt_nbm<const PKS: usize>(
 }
 
 #[inline(always)]
-fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32], width: usize) {
-    assert!(N != 0, "a payload column is 1, 2, 4, 8 or 16 bytes, not {width}");
+fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
     assert_eq!(dst.len(), indices.len() * N);
     for (out, &idx) in indices.iter().enumerate() {
         let i = idx as usize;
@@ -323,7 +347,7 @@ fn scatter_unified_sources(
         debug_assert_ne!(w, 0, "scatter_unified_sources: zero-weight row (filter before scatter)");
     }
 
-    width_dispatch!(
+    stride_dispatch!(
         writer.schema.pk_stride(),
         scatter_unified_pk_wt_nbm,
         sources,
@@ -357,7 +381,7 @@ fn scatter_unified_sources(
                 }
             }
         } else {
-            width_dispatch!(cs, gather_unified_col, sources, cols, rows, pi, writer.col_mut(pi));
+            cell_width_dispatch!(cs, gather_unified_col, sources, cols, rows, pi, writer.col_mut(pi));
         }
     }
 }
@@ -373,7 +397,7 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     width: usize,
 ) {
     const FB: usize = FIXED_REGION_BYTES;
-    let pks = if PKS == 0 { width } else { PKS };
+    let pks = stride::<PKS>(width);
     let keep = gnitz_wire::low_bits_mask(writer.schema.num_payload_cols());
     let (pk_dst, wt_dst, nbm_dst) = writer.fixed_mut();
     assert!(pk_dst.len() == rows.len() * pks && wt_dst.len() == rows.len() * FB);
@@ -401,16 +425,16 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     }
 }
 
-#[inline(always)]
+/// Out of line: inlined, it changes how [`scatter_unified_sources`]'s other
+/// loops compile.
+#[inline(never)]
 fn gather_unified_col<const N: usize>(
     sources: &[UnifiedSource<'_>],
     cols: &[ColPtr],
     rows: &[Pick],
     pi: usize,
     dst: &mut [u8],
-    width: usize,
 ) {
-    assert!(N != 0, "a payload column is 1, 2, 4, 8 or 16 bytes, not {width}");
     assert_eq!(dst.len(), rows.len() * N);
     for (out, &(si, ri, _)) in rows.iter().enumerate() {
         let src = unsafe { sources.get_unchecked(si as usize) };
@@ -427,7 +451,7 @@ fn gather_unified_col<const N: usize>(
 /// sparse in their sources, where [`UnifiedSet`] would decode whole windows.
 pub(crate) fn gather_rows(sources: &[impl ColumnarSource], schema: &SchemaDescriptor, picks: &[Pick]) -> Batch {
     write_to_batch(schema, picks.len(), 0, |w| {
-        width_dispatch!(schema.pk_stride(), gather_pk_wt_nbm, sources, picks, w);
+        stride_dispatch!(schema.pk_stride(), gather_pk_wt_nbm, sources, picks, w);
         for (pi, col) in schema.payload_columns() {
             if col.type_code.is_german_string() {
                 let (cells, blob, _) = w.string_col_mut(pi);
@@ -437,7 +461,7 @@ pub(crate) fn gather_rows(sources: &[impl ColumnarSource], schema: &SchemaDescri
                 }
             } else {
                 let dst = w.col_mut(pi);
-                width_dispatch!(col.size(), gather_cells, sources, picks, pi, dst);
+                cell_width_dispatch!(col.size(), gather_cells, sources, picks, pi, dst);
             }
         }
     })
@@ -450,7 +474,7 @@ fn gather_pk_wt_nbm<const PKS: usize>(
     w: &mut DirectWriter<'_>,
     width: usize,
 ) {
-    let pks = if PKS == 0 { width } else { PKS };
+    let pks = stride::<PKS>(width);
     let keep = gnitz_wire::low_bits_mask(w.schema.num_payload_cols());
     let (pk, weight, null_bmp) = w.fixed_mut();
     let weights = weight.as_chunks_mut::<8>().0.iter_mut();
@@ -466,14 +490,7 @@ fn gather_pk_wt_nbm<const PKS: usize>(
 }
 
 #[inline(always)]
-fn gather_cells<const N: usize>(
-    sources: &[impl ColumnarSource],
-    picks: &[Pick],
-    pi: usize,
-    dst: &mut [u8],
-    width: usize,
-) {
-    assert!(N != 0, "a payload column is 1, 2, 4, 8 or 16 bytes, not {width}");
+fn gather_cells<const N: usize>(sources: &[impl ColumnarSource], picks: &[Pick], pi: usize, dst: &mut [u8]) {
     for (&(si, ri, _), cell) in picks.iter().zip(dst.as_chunks_mut::<N>().0) {
         *cell = sources[si as usize].get_col_ptr(ri as usize, pi, N).try_into().unwrap();
     }

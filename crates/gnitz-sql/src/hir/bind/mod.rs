@@ -3,7 +3,7 @@
 //! relational body (linear / join / grouped / DISTINCT / set operation). The CTE
 //! phase (`bind_ctes`) binds each CTE body to a shared subtree ahead of the
 //! main bind and registers it by name, so a reference aliases it; a derived
-//! table binds its subquery recursively to an inline subtree
+//! table binds its subquery recursively to an unshared subtree
 //! (`resolve_table_factor`).
 //!
 //! The body's shape-specific parts are this module's children: `join` folds the
@@ -29,7 +29,7 @@ use crate::ast_util::{
 };
 use crate::bind::{bind_conjuncts, bind_structural, unsupported_subquery, LeafBinder};
 use crate::catalog::Catalog;
-use crate::error::{derivation, reject_if, GnitzSqlError};
+use crate::error::{derivation, reject_if, unsupported_clause, GnitzSqlError};
 use crate::ir::{BExpr, LeafTyping, BOOL};
 use crate::names::{extract_table_ref, TableRef};
 use crate::rules::{
@@ -308,25 +308,21 @@ impl<'a> QueryTail<'a> {
     fn parse(query: &'a Query, stmt: &str) -> Result<Option<Self>, GnitzSqlError> {
         let keys = parse_order_by(query.order_by.as_ref())?;
         let (limit, offset) = extract_limit_offset(query)?;
-        match (keys.is_empty(), limit) {
-            // The envelope guard waves the whole sink through to this parse, so
-            // what this parse does not consume it must refuse — a bare `OFFSET`.
-            (true, None) => {
-                reject_if(query.limit_clause.is_some(), stmt, "OFFSET without ORDER BY … LIMIT")?;
-                Ok(None)
-            }
-            (false, None) => Err(GnitzSqlError::Rejected(format!(
+        match (keys.is_empty(), limit, offset) {
+            (true, None, Some(_)) => Err(unsupported_clause(stmt, "OFFSET without ORDER BY … LIMIT")),
+            (true, None, None) => Ok(None),
+            (false, None, _) => Err(GnitzSqlError::Rejected(format!(
                 "{stmt}: ORDER BY without LIMIT — a view holds an unordered set, so an order alone \
                  maintains nothing; add LIMIT n to maintain the top n rows"
             ))),
-            (true, Some(_)) => Err(GnitzSqlError::Rejected(format!(
+            (true, Some(_), _) => Err(GnitzSqlError::Rejected(format!(
                 "{stmt}: LIMIT without ORDER BY names no rows in particular; add ORDER BY"
             ))),
-            (false, Some(0)) => Err(GnitzSqlError::Rejected(format!("{stmt}: LIMIT 0 selects nothing"))),
-            (false, Some(limit)) => Ok(Some(QueryTail {
+            (false, Some(0), _) => Err(GnitzSqlError::Rejected(format!("{stmt}: LIMIT 0 selects nothing"))),
+            (false, Some(limit), offset) => Ok(Some(QueryTail {
                 keys,
                 limit: limit as u64,
-                offset: offset as u64,
+                offset: offset.unwrap_or(0) as u64,
             })),
         }
     }
@@ -407,14 +403,10 @@ fn bind_body(cx: &BindCx<'_>, body: &SetExpr) -> Result<Rc<RelExpr>, GnitzSqlErr
     }
 }
 
-/// Resolve one FROM table factor to `(source subtree, alias, output cols)`. A
-/// table name resolves via `resolve_relation` to a `Get`, a CTE name to an
-/// `Alias` over its shared subtree; a derived table binds its subquery
-/// recursively to an **inline** subtree (never a segment — single-use and
-/// non-LATERAL, so uncorrelated) whose `AS d(col…)` aliases are applied to the
-/// returned cols (same `ColId`s, overridden names) the caller pushes into its
-/// scope/env. The subtree itself keeps its own names; a derived alias resolves
-/// through the caller's scope, never the statement catalog.
+/// Resolve one FROM table factor to `(subtree, alias, output cols)`: a table name
+/// to a `Get`, a CTE name to an `Alias` over its shared subtree, a derived table
+/// to its bound subquery, unshared. A column alias list renames the returned
+/// cols, keeping their `ColId`s; the subtree keeps its own names.
 fn resolve_table_factor(
     cx: &BindCx<'_>,
     factor: &TableFactor,
@@ -773,8 +765,7 @@ impl LeafBinder<ColId> for ScopeLeaf<'_> {
 #[derive(Clone, Default)]
 struct JoinScope {
     combined: Vec<HirCol>,
-    /// The columns a `USING` / `NATURAL` step merged away. A `Vec` because it is
-    /// empty for every query without one, where `contains` is a length check.
+    /// The columns a `USING` / `NATURAL` step merged away.
     merged: Vec<ColId>,
     relations: Vec<(String, Range<usize>)>,
 }
@@ -824,20 +815,19 @@ impl JoinScope {
         Ok(())
     }
 
-    /// Apply one join step's outer null-widening to the scope, in place, through
-    /// the same [`JoinType::widen_sides`] the join's logical output uses.
-    ///
-    /// In place rather than adopting `join.cols()`: a derived table's `AS d(col…)`
-    /// aliases live only on the cols `resolve_table_factor` handed the scope — the
-    /// bound subtree keeps its own inner names — so rebuilding the scope from the
-    /// tree would drop every positional alias in a join body.
-    fn widen_step(&mut self, kind: JoinType) {
-        let split = self.relations.last().expect("a right relation was pushed").1.start;
-        let (left, right) = self.combined.split_at_mut(split);
-        kind.widen_sides(
-            left.iter_mut().map(|c| &mut c.def),
-            right.iter_mut().map(|c| &mut c.def),
+    /// Take the nullability of `cols`, the output of the join step over every
+    /// relation pushed: the scope's columns, same ids in the same order. The
+    /// names stay the scope's, since a column alias list renames only these.
+    fn adopt_nullability(&mut self, cols: &[HirCol]) {
+        debug_assert_eq!(
+            cols.len(),
+            self.combined.len(),
+            "a join step's output is its scope's columns"
         );
+        for (c, out) in self.combined.iter_mut().zip(cols) {
+            debug_assert_eq!(c.id, out.id, "a join step's output is its scope's columns");
+            c.def.is_nullable = out.def.is_nullable;
+        }
     }
 
     /// The columns of the relation `alias` names.

@@ -48,8 +48,8 @@ pub(crate) fn reject_float_keys<'a>(
         .try_for_each(|c| reject_float_key(c.ty.tc, (!c.is_hidden).then_some(c.name.as_str()), role))
 }
 
-/// What a surface requires of the relation a name resolved to. The wording rides
-/// the variant rather than a parameter beside it, which a caller could pair wrongly.
+/// What a surface requires of the relation a name resolved to, and how a
+/// refusal words it.
 #[derive(Clone, Copy)]
 pub(crate) enum ClassWant {
     /// A stored, writable base table.

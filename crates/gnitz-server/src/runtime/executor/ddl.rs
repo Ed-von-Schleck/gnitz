@@ -11,9 +11,9 @@
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::committer::CHECKPOINTS_BEHIND_DDL;
+use super::committer::Paused;
 use super::validate::{self, UniqueFilter};
-use super::{park_until, Shared};
+use super::{park_until, CatalogLock, Shared};
 use crate::catalog::{AppliedDdl, DdlBundle, SysFamily};
 use crate::runtime::sal::Read;
 use crate::runtime::sync::WriteGuard;
@@ -28,20 +28,26 @@ pub(super) static TICK_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_TICK_HOLD_FO
 /// armed: its one reader.
 static DDL_GATE_WAITERS: AtomicU64 = AtomicU64::new(0);
 
-/// What a DDL body runs under: the catalog write, and the tick gate's write, so
-/// no tick is in flight and every broadcast DdlSync lands between epochs.
+/// What a DDL body runs under: the catalog write; the committer paused, so no
+/// checkpoint round runs inside the DDL; and the tick gate's write, so no tick
+/// is in flight and every broadcast DdlSync lands between epochs.
 struct DdlLocks {
-    catalog: WriteGuard,
+    catalog: WriteGuard<CatalogLock>,
+    _committer: Paused,
     _ticks: WriteGuard,
 }
 
-/// Take [`DdlLocks`]. The committer barrier comes first, holding no lock: a
-/// checkpoint sequence it is deferred behind drains ticks the gate would stop,
-/// and a low SAL gets its checkpoint there. A committer round in flight holds
-/// the SAL lock to its end, which the driver waits on before it mutates.
+/// Take [`DdlLocks`]. The pause comes after the catalog write: a writer holds a
+/// catalog read while it awaits the committer, so a pause taken first would park
+/// the committer ahead of a write the catalog write waits out. It comes before
+/// the gate: a checkpoint the committer runs ahead of its park drains ticks.
+///
+/// The barrier ahead of them all lets a checkpoint already queued finish before
+/// the catalog write starts holding off readers.
 async fn enter_ddl(shared: &Shared) -> DdlLocks {
     shared.committer.barrier().await;
     let catalog = shared.catalog_rwlock.write().await;
+    let committer = shared.committer.pause().await;
     let counted = TICK_HOLD_FOR_DDL.armed();
     if counted {
         DDL_GATE_WAITERS.fetch_add(1, Ordering::Relaxed);
@@ -50,7 +56,11 @@ async fn enter_ddl(shared: &Shared) -> DdlLocks {
     if counted {
         DDL_GATE_WAITERS.fetch_sub(1, Ordering::Relaxed);
     }
-    DdlLocks { catalog, _ticks: ticks }
+    DdlLocks {
+        catalog,
+        _committer: committer,
+        _ticks: ticks,
+    }
 }
 
 /// Poll bound for [`TICK_HOLD_FOR_DDL`], in 1 ms ticks.
@@ -69,13 +79,12 @@ pub(super) async fn hold_tick_for_ddl(shared: &Shared) {
 static DDL_HOLD_FOR_CHECKPOINT: Seam = Seam::new("GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT");
 
 /// Hold the first DDL, its zone written and its locks still held, until a
-/// checkpoint sequence waits on its tick gate, so that sequence provably starts
-/// inside the DDL. The zone moves the SAL cursor, so a checkpoint threshold
-/// below one zone has the watchdog wake the committer into that wait. One-shot.
+/// request is queued behind its pause of the committer. Below a checkpoint
+/// threshold of one zone, that request is the watchdog's reclaim wake, so a
+/// checkpoint is asked for inside the DDL. One-shot.
 async fn hold_ddl_for_checkpoint(shared: &Shared) {
-    let seen = CHECKPOINTS_BEHIND_DDL.load(Ordering::Relaxed);
     park_until(shared, HOLD_TICK_MAX_POLLS, "ddl hold", || {
-        CHECKPOINTS_BEHIND_DDL.load(Ordering::Relaxed) > seen
+        shared.committer.has_queued()
     })
     .await
 }
@@ -106,56 +115,34 @@ pub(super) fn decode_bundle(body: &[u8]) -> Result<DdlBundle, WireFault> {
     Ok(families)
 }
 
-/// Atomic DDL transaction: ingest a bundle of system-table family batches under
-/// one durable SAL zone. Reached only via the `DDL_TXN` route. Every catalog
-/// write — a CREATE's N families or a DROP/CREATE INDEX/CREATE SCHEMA's single
-/// family — flows here, so there is one system-write code path end to end.
+/// DDL_TXN: apply a bundle of system-family batches as one durable SAL zone,
+/// under [`DdlLocks`]; a refused bundle leaves the catalog as it was. Returns
+/// the zone LSN.
 ///
 /// The bundle is applied and its zone laid out under one hold of the SAL lock,
 /// with no await between: a bundle the catalog or the log refuses is negated in
 /// master memory there, so no system flush sees a row no zone carries.
-///
-/// Returns the zone LSN, which the router ACKs once the DDL guards have dropped —
-/// so a client stalled on its `GNITZ_CLIENT_SEND_TIMEOUT_MS` deadline cannot
-/// block every other reader for the length of the window. Sound outside the
-/// tick gate too: the gate exists to keep a worker from being mid-epoch at
-/// *broadcast* time, and the ACK goes out only after the broadcast, its wake
-/// and the fsync.
-///
-/// No schema block: a `DDL_TXN` names no relation (its reply target is `0`), so
-/// one could only describe a relation that does not exist.
 pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, body: &[u8]) -> Result<u64, WireFault> {
     // Decoded up front, before any lock.
     let families = decode_bundle(body)?;
     let unique_creates = families.unique_index_creates();
 
     let locks = enter_ddl(shared).await;
-    // Only an owner that already exists is scanned, so only it leaves claims.
-    let claims = {
-        let cat = shared.cat();
-        unique_creates
-            .iter()
-            .any(|&(owner, _)| cat.registry.relation(owner).is_some())
-    };
     let committed = commit_bundle(shared, families, &unique_creates).await;
-    if claims {
+    if !unique_creates.is_empty() {
         release_preflight(shared).await;
     }
     let Committed { applied, zone_lsn, filter_seeds } = committed?;
 
-    // Relation ids are never reissued within a boot, so these entries are dead.
     for &id in &applied.dropped_relations {
         shared.forget_relation(&locks.catalog, id);
     }
-    // Keying by the whole column list means dropping `(a, b)` never clears a
-    // distinct single-column filter on `a`.
     for &(owner_id, cols) in &applied.dropped_indexes {
         shared.writes.checks.unique_filter_remove(owner_id, cols);
     }
 
-    // Post-fsync: a refused zone has returned and an fsync failure has aborted
-    // the process before this point, so no filter is published for an index
-    // that never committed.
+    // After the fsync, which aborts on failure: a seed is published only for an
+    // index that committed.
     for (owner_id, cols, filter) in filter_seeds {
         shared.writes.checks.unique_filter_seed(owner_id, cols, filter);
     }
@@ -230,8 +217,8 @@ async fn commit_bundle(
     Ok(Committed { applied, zone_lsn, filter_seeds })
 }
 
-/// Release the pre-flight's index claims, committed or not, while the DDL's locks
-/// still hold off every checkpoint. The release follows the zone in the log, so a
+/// Release the pre-flight's index claims, committed or not, while the DDL still
+/// holds the committer paused. The release follows the zone in the log, so a
 /// worker enters the catalog's claim on an index the DDL created before it drops
 /// the pre-flight's. A claim left standing would keep an index no catalog row
 /// owns, whose directory the next checkpoint's sweep removes from under it.
@@ -253,7 +240,7 @@ async fn release_preflight(shared: &Shared) {
 pub(super) async fn reserve_serial_range(shared: &Rc<Shared>, seq: Target, count: u64) -> Result<u64, WireFault> {
     // A read guard holds the token and the sequence's table against a DDL; the
     // SAL lock orders reservations among themselves, and everything under it is
-    // synchronous. Lock order catalog -> SAL, matching INSERT and every read.
+    // synchronous.
     let _read = shared.catalog_rwlock.read().await;
     shared.cat().check_token(seq)?;
 

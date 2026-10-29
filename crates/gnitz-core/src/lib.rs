@@ -29,8 +29,8 @@ pub use batch::{append_own_regions, push_zero_cell, BatchAppender, BatchMark, Pa
 pub use catalog::{Catalog, CatalogRelation, IndexRow, RelProps};
 pub use client::GnitzClient;
 pub use connection::{
-    encode_ddl_txn, DeltaCursor, RelDescriptor, Request, ScanReply, Session, SnapshotPage, Target, MAX_IN_FLIGHT,
-    MAX_QUEUED_BYTES,
+    encode_ddl_txn, DeltaCursor, RelDescriptor, Request, ScanReply, Session, SnapshotPage, SubId, Target,
+    MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
 pub use ddl::{segment_id, ColumnChange, FkTarget, InlineUniqueIndex, PlannedView, TableDef, ViewBundle};
 pub use error::{not_found, ClientError, ProtocolError};

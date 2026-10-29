@@ -32,7 +32,7 @@ impl CatalogEngine {
         };
         // Every family that reaches here can change what a RESOLVE answers.
         for entry in self.caches.relations.values_mut() {
-            *entry.token.get_mut() = 0;
+            *entry.token.get_mut() = None;
         }
         hooked
     }

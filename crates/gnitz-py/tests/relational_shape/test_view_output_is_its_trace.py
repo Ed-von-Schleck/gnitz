@@ -14,6 +14,7 @@ not the view's output, and keeps its trace.
 """
 
 import random
+import re
 
 import gnitz
 from _read import bag, scanned
@@ -79,12 +80,13 @@ def test_a_view_ending_in_an_aggregate_reads_its_own_store_as_history(sweeping):
 
     sweeping.restart(graceful=True)
     # The report reads the files alone, beside the server now running on them:
-    # each relation's stores holding shards, without the node each is numbered by.
+    # each relation's stores holding shards, without the node each is numbered by
+    # or the digest of its schema.
     report, stores = disk_usage(sweeping.data_dir)
     kinds = {name: set() for name in ids.values()}
     for s in stores:
         if s["relation"] in ids:
-            kinds[ids[s["relation"]]].add(s["store"].rstrip("0123456789").rstrip("_"))
+            kinds[ids[s["relation"]]].add(re.sub(r"_\d+_[0-9a-f]{16}$", "", s["store"]))
     assert kinds == {
         "t": {"rows"},
         "by_g": {"rows"},

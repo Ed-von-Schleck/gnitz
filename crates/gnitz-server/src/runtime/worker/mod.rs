@@ -12,9 +12,9 @@ use crate::catalog::CatalogEngine;
 use crate::query::{DagEngine, DriveHost};
 use crate::runtime::mesh::Mesh;
 use crate::runtime::sal::{Apply, Inbound, Read, ReplyRoute, SalReader, SalRequest};
-use crate::runtime::w2m::{W2mWriter, NO_REPLY_REQUEST_ID};
+use crate::runtime::w2m::W2mWriter;
 use gnitz_foundation::fault::Seam;
-use gnitz_store::relation::{IndexClaim, RelationKind, RelationRegistry};
+use gnitz_store::relation::{IndexClaim, PinScope, RelationRegistry};
 use gnitz_wire::TypeCode;
 use gnitz_wire::{PkKeys, WireFault};
 use gnitz_zset::repr::Batch;
@@ -31,10 +31,8 @@ pub struct WorkerProcess<'c> {
     /// Where this worker trades its exchange rounds with its peers, and parks
     /// for a SAL group or an exchange part.
     mesh: Mesh,
-    /// Replies this worker owes, in the order they reach the ring. A cut's reader
-    /// drains its leases in request order and a ring frees only a released prefix,
-    /// so within a cut ring order must be request order. Replies of different cuts
-    /// go to different leases and need no order between them.
+    /// Replies this worker owes, in the order they reach the ring, which is
+    /// request order within a [`Cut`](crate::runtime::sal::Cut).
     replies: VecDeque<Owed>,
     /// Per-frame wire budget of every W2M train. `GNITZ_REPLY_FRAME_BUDGET`
     /// lowers it, so tests reach multi-frame trains on small tables.
@@ -102,7 +100,12 @@ impl<'c> WorkerProcess<'c> {
     /// the request arrived inside an exchange wait of a `Tick` or `Backfill`.
     /// Total, so a new request cannot compile without a decision.
     pub(super) fn dispatch(&mut self, req: Inbound, in_drive: bool) {
-        let Inbound { route, what, rows } = req;
+        let Inbound { target_id, reply, cut, what, rows } = req;
+        let route = || ReplyRoute {
+            target_id,
+            request_id: reply.expect("a read nobody answers is refused at its decode"),
+            cut,
+        };
         match what {
             SalRequest::Shutdown => unsafe { libc::_exit(0) },
             // A drive writes views, so a read of one would see the tick half-run:
@@ -112,37 +115,32 @@ impl<'c> WorkerProcess<'c> {
                     && self
                         .catalog
                         .registry
-                        .relation(route.target_id)
+                        .relation(target_id)
                         .is_some_and(|r| r.kind().is_view()) =>
             {
-                self.replies.push_back(Owed::Parked(route, read))
+                self.replies.push_back(Owed::Parked(route(), read))
             }
             // A drive writes no other store, so every other read is answered here,
             // at its place in the SAL — a push behind it must not reach it.
             SalRequest::Read(read) => {
+                let route = route();
                 let answer = answer(self.catalog, &read);
                 self.reply(route, answer);
             }
             SalRequest::Apply(apply) => {
-                let (beside_drive, drives) = match apply {
-                    // The master holds the SAL writer until every worker ACKs a
-                    // flush; deferred, a push's ACK would wait for the drive.
-                    Apply::Flush | Apply::Push { .. } => (true, false),
-                    Apply::Tick { .. } | Apply::Backfill { .. } => (false, true),
-                    Apply::DdlSync { .. } | Apply::FlushEph { .. } => (false, false),
-                };
-                if in_drive && !beside_drive {
+                let role = drive_role(&apply);
+                if in_drive && role != DriveRole::BesideDrive {
                     gnitz_fatal_abort!("{apply:?} inside an exchange wait — diverged from the master");
                 }
                 if let Err(e) = self.apply(&apply, rows) {
                     gnitz_fatal_abort!("worker: {apply:?} failed: {e} — aborting for restart");
                 }
-                if route.request_id != NO_REPLY_REQUEST_ID {
-                    self.w2m_writer.send_ack(route.request_id);
+                if let Some(id) = reply {
+                    self.w2m_writer.send_ack(id);
                 }
                 // Before the next group: a parked read answers from the state its
                 // drive left.
-                if drives {
+                if role == DriveRole::Drives {
                     self.answer_parked();
                 }
             }
@@ -186,6 +184,28 @@ impl<'c> WorkerProcess<'c> {
     }
 }
 
+/// How a state change relates to a drive: the exchange waits of a `Tick` or
+/// `Backfill`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DriveRole {
+    /// Applied when it arrives, inside an exchange wait too.
+    BesideDrive,
+    /// Is a drive.
+    Drives,
+    /// Never arrives inside an exchange wait.
+    Outside,
+}
+
+fn drive_role(apply: &Apply<'_>) -> DriveRole {
+    match apply {
+        // The master holds the SAL writer until every worker ACKs a flush;
+        // deferred, a push's ACK would wait for the drive.
+        Apply::Flush | Apply::Push { .. } => DriveRole::BesideDrive,
+        Apply::Tick { .. } | Apply::Backfill { .. } => DriveRole::Drives,
+        Apply::DdlSync { .. } | Apply::FlushEph { .. } => DriveRole::Outside,
+    }
+}
+
 /// Answer `read`. A function of the catalog alone: it cannot reach the mesh, so
 /// answering a read never enters an exchange wait.
 fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
@@ -223,7 +243,7 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
         // A worker holds no system family a snapshot reads: the master answers
         // those from its own pin.
         Read::Pin { snapshot } => {
-            cat.registry.pin(snapshot, |k| k == RelationKind::BaseTable)?;
+            cat.registry.pin(snapshot, PinScope::BaseTables)?;
             Ok(no_rows())
         }
         Read::Unpin { snapshot } => {

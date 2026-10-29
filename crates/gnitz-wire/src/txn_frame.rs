@@ -3,7 +3,8 @@
 //!
 //! A frame is a prologue header naming the verb (`target_id = 0`), then items to
 //! the end of the frame, each a control frame of that verb. A `DELTA_POLL`'s
-//! prologue `arg0` is [`delta_poll_kept`]; every other prologue field is zero.
+//! prologue `arg0` is [`delta_poll_kept`]; every other prologue field is zero,
+//! which [`DecodedControl::client_verb`] checks.
 //!
 //! | Verb         | Item header                                              | Sections                  |
 //! |--------------|----------------------------------------------------------|---------------------------|
@@ -24,9 +25,10 @@
 
 use crate::region::Regions;
 use crate::{
-    append_frame, peek_control_block, ClientVerb, ControlHeader, DecodedControl, Reader, Target, WireFlags, WireStatus,
-    Writer,
+    append_frame, peek_control_block, ClientVerb, ControlHeader, DecodedControl, Reader, Target, WireConflictMode,
+    WireFlags, Writer,
 };
+use std::fmt;
 use std::num::NonZeroU64;
 
 /// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
@@ -38,10 +40,13 @@ const SCAN_MULTI_MAX_RELATIONS: usize = 16;
 /// no commit exceeds it.
 pub const BLIND: u64 = u64::MAX;
 
-/// One family of a `PUSH_TXN` or `DDL_TXN`: its header (the verb is the
-/// frame's), its schema record where the verb carries one, and its rows.
+/// One family of a `PUSH_TXN` or `DDL_TXN`: the relation it writes, a
+/// `PUSH_TXN` family's conflict mode and basis, its schema record where the
+/// verb carries one, and its rows.
 pub struct FrameItem<'a> {
-    pub hdr: ControlHeader,
+    pub target: Target,
+    pub conflict_mode: WireConflictMode,
+    pub basis: u64,
     pub schema: Option<&'a [u8]>,
     pub data: Regions<'a>,
 }
@@ -68,10 +73,8 @@ pub fn encode_items(verb: ClientVerb, items: &[FrameItem<'_>]) -> Vec<u8> {
     );
     let mut out = prologue(verb, 0);
     for it in items {
-        let hdr = ControlHeader {
-            flags: WireFlags { verb, ..it.hdr.flags },
-            ..it.hdr
-        };
+        let mut hdr = ControlHeader::naming(verb, it.target, it.basis);
+        hdr.flags.conflict_mode = it.conflict_mode;
         append_frame(&mut out, &hdr, &[], it.schema, Some(&it.data[..]));
     }
     out
@@ -109,9 +112,7 @@ pub fn decode_items(body: &[u8], verb: ClientVerb) -> Result<Vec<(&[u8], Decoded
     };
     let item = |rest: &[u8]| -> Result<DecodedControl, String> {
         let ctrl = peek_control_block(rest)?;
-        if ctrl.hdr.status != WireStatus::Ok {
-            return Err(format!("an item carries status {:?}", ctrl.hdr.status));
-        }
+        ctrl.hdr.check_client_authored(verb == ClientVerb::PushTxn)?;
         if ctrl.hdr.flags.verb != verb {
             return Err(format!("an item names verb {:?}", ctrl.hdr.flags.verb));
         }
@@ -158,7 +159,6 @@ pub struct ScanItem<'a> {
     /// The relation, and the token of the RESOLVE answer this read was built from.
     pub target: Target,
     pub reply_layout: u64,
-    /// The worker's decode is the trust boundary.
     pub spec: &'a [u8],
 }
 
@@ -239,15 +239,43 @@ pub struct DeltaPollItem<'a> {
     pub from: Option<DeltaCursor>,
     pub reply_layout: u64,
     /// An encoded `ReadSpec` forwarding rows with no cut; `ReadSpec::all_rows`
-    /// of no bound for the view's own rows. The worker's decode is the trust
-    /// boundary.
+    /// of no bound for the view's own rows.
     pub spec: &'a [u8],
 }
 
+/// A subscription's id: what a `DELTA_POLL` keeps a view under and a
+/// `SYNC_PUSHED` names. A prologue `arg0` of `0` keeps none, so no
+/// subscription is `0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SubId(NonZeroU64);
+
+impl SubId {
+    /// The first id a client hands out.
+    pub const FIRST: SubId = SubId(NonZeroU64::MIN);
+
+    /// The id `id` spells; `None` for `0`.
+    pub const fn new(id: u64) -> Option<SubId> {
+        match NonZeroU64::new(id) {
+            Some(id) => Some(SubId(id)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for SubId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Encode a `DELTA_POLL` frame, without the 4-byte frame length prefix. Item
-/// `i` is kept as the subscription `keep + i`.
-pub fn encode_delta_poll(views: &[DeltaPollItem<'_>], keep: Option<u64>) -> Vec<u8> {
-    let mut out = prologue(ClientVerb::DeltaPoll, keep.unwrap_or(0));
+/// `i` is kept as the subscription [`kept_as`]`(keep, i)`.
+pub fn encode_delta_poll(views: &[DeltaPollItem<'_>], keep: Option<SubId>) -> Vec<u8> {
+    let mut out = prologue(ClientVerb::DeltaPoll, keep.map_or(0, SubId::get));
     for v in views {
         let mut blob = Writer::new();
         DeltaCursor::write_opt(&mut blob, v.from);
@@ -259,26 +287,38 @@ pub fn encode_delta_poll(views: &[DeltaPollItem<'_>], keep: Option<u64>) -> Vec<
 }
 
 /// The subscription id item `item` of a `DELTA_POLL` keeping from `first` is
-/// kept as.
-pub fn kept_as(first: u64, item: usize) -> u64 {
-    first.wrapping_add(item as u64)
+/// kept as. Panics past `u64::MAX`, where [`delta_poll_kept`] refuses a poll.
+pub fn kept_as(first: SubId, item: usize) -> SubId {
+    let id = first.0.checked_add(item as u64);
+    SubId(id.expect("a subscription id past u64::MAX"))
 }
 
-/// The subscription id each item of the `DELTA_POLL` under `prologue` is kept
-/// as, in item order; `None` for a poll that keeps none.
-pub fn delta_poll_kept(prologue: &ControlHeader) -> Option<impl Iterator<Item = u64>> {
-    let first = prologue.arg0;
-    (first != 0).then(|| (0..).map(move |item| kept_as(first, item)))
+/// The subscription id each of the `items` items of the `DELTA_POLL` under
+/// `prologue` is kept as, in item order; `None` for a poll that keeps none.
+/// A poll whose ids would run past `u64::MAX` is refused.
+pub fn delta_poll_kept(prologue: &ControlHeader, items: usize) -> Result<Option<impl Iterator<Item = SubId>>, String> {
+    let Some(first) = SubId::new(prologue.arg0) else {
+        return Ok(None);
+    };
+    if first.get().checked_add(items.saturating_sub(1) as u64).is_none() {
+        return Err(format!(
+            "DeltaPoll: {items} subscriptions from {first} run past u64::MAX"
+        ));
+    }
+    Ok(Some((0..items).map(move |item| kept_as(first, item))))
 }
 
 /// A `SYNC_PUSHED` blob: the subscription ids its connection still holds.
-pub fn encode_held(ids: impl IntoIterator<Item = u64>) -> Vec<u8> {
-    ids.into_iter().flat_map(u64::to_le_bytes).collect()
+pub fn encode_held(ids: impl IntoIterator<Item = SubId>) -> Vec<u8> {
+    ids.into_iter().flat_map(|id| id.get().to_le_bytes()).collect()
 }
 
-/// The ids an [`encode_held`] blob names.
-pub fn decode_held(blob: &[u8]) -> Result<Vec<u64>, String> {
-    crate::le_scalars(blob).map_err(|e| format!("SyncPushed: held ids: {e}"))
+/// The ids an [`encode_held`] blob names; one naming `0` is refused.
+pub fn decode_held(blob: &[u8]) -> Result<Vec<SubId>, String> {
+    let ids: Vec<u64> = crate::le_scalars(blob).map_err(|e| format!("SyncPushed: held ids: {e}"))?;
+    ids.into_iter()
+        .map(|id| SubId::new(id).ok_or_else(|| "SyncPushed: held ids: 0 names no subscription".to_string()))
+        .collect()
 }
 
 /// Decode the items of a `DELTA_POLL` frame. View id `0` is refused: it is the

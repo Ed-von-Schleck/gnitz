@@ -244,8 +244,9 @@ fn whole_nodes(circuit: &Circuit, whole_scan: impl Fn(u64) -> bool) -> Result<Ve
         let behind_ground = inputs.iter().any(|&p| grounded[p]);
         if let OpNode::ExchangeShard = op {
             // The ground row is minted in an epoch of its own on one worker,
-            // entered behind the reduce: a round behind it would wait on workers
-            // that never run it.
+            // entered behind the reduce, which no other worker runs: a round
+            // behind it would be skipped, and a share would keep only the
+            // minting worker's part.
             if behind_ground {
                 return Err("an exchange behind a global aggregate".into());
             }

@@ -3,8 +3,8 @@ use crate::hir::{ColIdGen, KeyPair};
 use crate::test_support::{col, schema};
 use gnitz_wire::RangeRel;
 use std::sync::Arc;
-use JoinShape::{Band, Cross, Equi, PureRange};
 use JoinType::{Anti, Full, Inner, Left, Mark, Right, Semi};
+use Shape::{Band, Cross, Equi, PureRange};
 
 /// Four `U64` columns keyed on the slots `pk`, their ids minted from `ids`.
 fn frame(ids: &ColIdGen, names: [&str; 4], pk: &[u32]) -> Frame {
@@ -12,6 +12,15 @@ fn frame(ids: &ColIdGen, names: [&str; 4], pk: &[u32]) -> Frame {
         layout: names.map(|_| Some(ids.next())).to_vec(),
         schema: Arc::new(schema(names.map(|n| col(n, TypeCode::U64)).to_vec(), pk)),
     }
+}
+
+/// Which keys a `join_keep_rules` case joins on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    Equi,
+    Band,
+    PureRange,
+    Cross,
 }
 
 /// Every `join_keep` rule over left `(v, id, k, x)` keyed on `id` and right
@@ -37,12 +46,7 @@ fn join_keep_rules() {
     };
     /// The shape, the kind, the demand's reads, and each side's keep list and
     /// pinned PK arity.
-    type Case = (
-        JoinShape,
-        JoinType,
-        &'static [(usize, usize)],
-        [(&'static [u32], usize); 2],
-    );
+    type Case = (Shape, JoinType, &'static [(usize, usize)], [(&'static [u32], usize); 2]);
     #[rustfmt::skip]
     let cases: &[Case] = &[
         // Rule 4: a pair-PK side keeps its PK, in PK-list order; an INNER keeps no key
@@ -77,13 +81,20 @@ fn join_keep_rules() {
             eq: matches!(shape, Equi | Band).then_some(eq).into_iter().collect(),
             range: matches!(shape, Band | PureRange).then_some((range, RangeRel::Le)),
         };
-        assert_eq!(class.shape(), shape);
+        let plan = class.plan(kind).unwrap();
+        let planned = match plan {
+            JoinPlan::Equi => Equi,
+            JoinPlan::Band(_) => Band,
+            JoinPlan::PureRange(..) => PureRange,
+            JoinPlan::Cross => Cross,
+        };
+        assert_eq!(planned, shape);
         let refs: HashSet<ColId> = reads
             .iter()
             .map(|&(side, slot)| col(side, slot))
             .chain(matches!(kind, Mark(_)).then_some(mark))
             .collect();
-        let got = join_keep(&refs, &class, kind, &frames).unwrap();
+        let got = join_keep(&refs, &class, kind, plan, &frames).unwrap();
         let got = got.each_ref().map(|(keep, pa)| (keep.as_slice(), *pa));
         assert_eq!(got, want, "{shape:?} {kind:?} reads={reads:?}");
     }

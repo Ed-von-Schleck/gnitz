@@ -4,9 +4,7 @@
 //!
 //! An entry is the key's whole image, never a fingerprint: a collision would
 //! admit a reference to a row that does not exist. It holds only while the key
-//! is committed — a write to the referenced table evicts what it retracts before
-//! its table lock is released, and a write that references the table holds that
-//! lock.
+//! is committed; see `Checks::committed`.
 
 use std::cell::Ref;
 

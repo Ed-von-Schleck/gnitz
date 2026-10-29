@@ -329,6 +329,18 @@ pub(crate) enum OrderedOp {
     },
 }
 
+impl OrderedOp {
+    /// The columns it adds behind its input's: `rank`, `dense_rank`, then each
+    /// aggregate's.
+    pub(crate) fn added_cols(&self) -> impl Iterator<Item = &HirCol> {
+        let (aggs, rank, dense_rank): (&[AggCol], _, _) = match self {
+            OrderedOp::Window { aggs, rank, dense_rank } => (aggs, rank.as_ref(), dense_rank.as_ref()),
+            OrderedOp::TopN { .. } => (&[], None, None),
+        };
+        rank.into_iter().chain(dense_rank).chain(aggs.iter().map(|c| &c.col))
+    }
+}
+
 /// One ORDER BY key of a [`RelExpr::Ordered`]: a column of its input, its
 /// direction, and where NULLs go.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -498,8 +510,8 @@ impl JoinType {
     }
 
     /// Widen the two sides of one join step for its null semantics — a preserved
-    /// side forces the *other* side's columns nullable. The one home for that
-    /// cross, and it moves only `is_nullable`, so a resolved reference survives.
+    /// side forces the *other* side's columns nullable. It moves only
+    /// `is_nullable`, so a resolved reference survives.
     pub(crate) fn widen_sides<'a>(
         self,
         left: impl Iterator<Item = &'a mut ColumnDef>,
@@ -513,11 +525,21 @@ impl JoinType {
         }
     }
 
-    /// The three decorrelation-only kinds an EXISTS/IN subquery lowers to, never
-    /// produced by a FROM-clause JOIN: they preserve neither side and carry only
-    /// the left (outer) columns.
+    /// The decorrelation-only kind an EXISTS/IN subquery lowers to, never produced
+    /// by a FROM-clause JOIN: it preserves neither side and carries only the left
+    /// (outer) columns. `None` for a FROM-clause kind.
+    pub(crate) fn exists(self) -> Option<ExistsKind> {
+        match self {
+            JoinType::Semi => Some(ExistsKind::Semi),
+            JoinType::Anti => Some(ExistsKind::Anti),
+            JoinType::Mark(id) => Some(ExistsKind::Mark(id)),
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => None,
+        }
+    }
+
+    /// Whether this is an [`Self::exists`] kind.
     pub(crate) fn is_decorrelated(self) -> bool {
-        matches!(self, JoinType::Semi | JoinType::Anti | JoinType::Mark(_))
+        self.exists().is_some()
     }
 
     /// Whether this side gets a **ν** — the unmatched set `w_P · [S = 0]`, its
@@ -533,6 +555,14 @@ impl JoinType {
     pub(crate) fn emits_unmatched(self, side: usize) -> bool {
         self.preserves(side) || (side == 0 && matches!(self, JoinType::Anti | JoinType::Mark(_)))
     }
+}
+
+/// A [`JoinType`] an EXISTS/IN subquery lowers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExistsKind {
+    Semi,
+    Anti,
+    Mark(ColId),
 }
 
 /// A join-key column pair — `cols[0]` the left side's, `cols[1]` the right's —
@@ -551,16 +581,26 @@ pub(crate) struct JoinClass {
     pub range: Option<(KeyPair, RangeRel)>,
 }
 
-/// Which physical join a join's keys call for. A pure range join has an empty
-/// `eq`, as a keyless one does.
+/// Which physical join a step's keys and kind call for; [`JoinClass::plan`]
+/// refuses every other pair. A pure range join has an empty `eq`, as a keyless
+/// one does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JoinShape {
+pub(crate) enum JoinPlan {
     Equi,
     /// A range conjunct behind an equality prefix.
-    Band,
+    Band(RangeRel),
     /// A range conjunct with no equality prefix.
-    PureRange,
+    PureRange(RangeRel, PureRangeKind),
+    /// No key: INNER only.
     Cross,
+}
+
+/// The kinds a pure-range join exists in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PureRangeKind {
+    Inner,
+    Left,
+    Exists(ExistsKind),
 }
 
 impl JoinClass {
@@ -592,13 +632,41 @@ impl JoinClass {
         self.keys().map(|p| p.ty)
     }
 
-    pub(crate) fn shape(&self) -> JoinShape {
-        match (self.range.is_some(), self.eq.is_empty()) {
-            (true, true) => JoinShape::PureRange,
-            (true, false) => JoinShape::Band,
-            (false, true) => JoinShape::Cross,
-            (false, false) => JoinShape::Equi,
-        }
+    /// The physical join a step of `kind` over these keys is, or the refusal of a
+    /// pair no emitter builds. Both refusals are ordinary SQL with a buildable
+    /// lowering; neither emitter was written.
+    pub(crate) fn plan(&self, kind: JoinType) -> Result<JoinPlan, GnitzSqlError> {
+        let rel = self.range.map(|(_, rel)| rel);
+        Ok(match (rel, self.eq.is_empty()) {
+            (None, false) => JoinPlan::Equi,
+            (Some(rel), false) => JoinPlan::Band(rel),
+            (None, true) if kind == JoinType::Inner => JoinPlan::Cross,
+            (None, true) => {
+                return Err(GnitzSqlError::Rejected(
+                    "a LEFT/RIGHT/FULL JOIN or an EXISTS/IN correlation needs at least one equijoin \
+                     or range predicate between its two sides; only an INNER step (CROSS JOIN, a \
+                     comma-separated FROM, or JOIN … ON with no cross-table comparison) may be keyless."
+                        .into(),
+                ))
+            }
+            (Some(rel), true) => {
+                let kind = match (kind, kind.exists()) {
+                    (_, Some(e)) => PureRangeKind::Exists(e),
+                    (JoinType::Inner, None) => PureRangeKind::Inner,
+                    (JoinType::Left, None) => PureRangeKind::Left,
+                    (_, None) => {
+                        return Err(GnitzSqlError::Rejected(
+                            "pure-range RIGHT/FULL JOIN (a sole inequality range conjunct with no \
+                             equality prefix) is not supported; its mirror null-fill has no inner-join \
+                             witness on the preserved side. Use INNER/LEFT JOIN, or add an equality \
+                             conjunct to make it a band join."
+                                .into(),
+                        ))
+                    }
+                };
+                JoinPlan::PureRange(rel, kind)
+            }
+        })
     }
 }
 
@@ -804,7 +872,6 @@ impl RelExpr {
             RelExpr::Filter { input, .. } => input.cols(),
             RelExpr::Project { items, .. } => items.iter().map(|e| e.out.clone()).collect(),
             RelExpr::Join { left, right, kind, .. } => match kind {
-                // `join_frame`'s widening, over the logical columns.
                 JoinType::Semi | JoinType::Anti => left.cols(),
                 JoinType::Mark(id) => {
                     let mut cols = left.cols();
@@ -816,6 +883,7 @@ impl RelExpr {
                     ));
                     cols
                 }
+                // Null-widened per `JoinType::widen_sides`, as `join_frame` does.
                 _ => {
                     let mut cols = left.cols();
                     let mut rcols = right.cols();
@@ -836,10 +904,7 @@ impl RelExpr {
             RelExpr::Distinct { input } => input.cols(),
             RelExpr::Ordered { input, op, .. } => {
                 let mut cols = input.cols();
-                if let OrderedOp::Window { aggs, rank, dense_rank } = op {
-                    cols.extend(rank.iter().chain(dense_rank).cloned());
-                    cols.extend(aggs.iter().map(|c| c.col.clone()));
-                }
+                cols.extend(op.added_cols().cloned());
                 cols
             }
             RelExpr::Alias { cols, .. } => cols.clone(),

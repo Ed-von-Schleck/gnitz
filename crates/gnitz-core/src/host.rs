@@ -4,7 +4,7 @@
 //! [`Promise`] — every wait ends on.
 
 use std::future::{poll_fn, Future};
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{ready, Context, Poll, Waker};
@@ -22,9 +22,8 @@ pub type Job = Box<dyn FnOnce() + Send>;
 
 /// How a client waits: for its socket, and for work that blocks.
 pub trait Host: Send {
-    /// The client's socket is `fd` from here on, until the next `attach` or
-    /// this host's drop — either of which comes before the socket closes.
-    fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()>;
+    /// The client's socket is `fd` from here on, until the next `attach`.
+    fn attach(&mut self, fd: OwnedFd) -> std::io::Result<()>;
 
     /// Once the socket is ready for any of `want`, step the client on what is
     /// ready by calling `io`. It answers whether bytes are still waiting to be
@@ -46,7 +45,7 @@ pub trait Host: Send {
 /// [`block_on`] drives one to completion.
 #[derive(Default)]
 pub struct BlockingHost {
-    fd: Option<RawFd>,
+    fd: Option<OwnedFd>,
     hook: Option<ParkHook>,
 }
 
@@ -58,8 +57,8 @@ impl BlockingHost {
 }
 
 impl Host for BlockingHost {
-    fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()> {
-        self.fd = Some(fd.as_raw_fd());
+    fn attach(&mut self, fd: OwnedFd) -> std::io::Result<()> {
+        self.fd = Some(fd);
         Ok(())
     }
 
@@ -69,10 +68,11 @@ impl Host for BlockingHost {
         _cx: &mut Context<'_>,
         io: &mut dyn FnMut(Interest) -> bool,
     ) -> Poll<Result<(), ClientError>> {
-        let fd = self.fd.expect("a client attaches its host before it waits");
-        // SAFETY: `attach`'s contract: the socket stays open until the next
-        // `attach` or this host's drop.
-        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let fd = self
+            .fd
+            .as_ref()
+            .expect("a client attaches its host before it waits")
+            .as_fd();
         loop {
             match poll_fd(fd, want, None) {
                 Ok(ready) => {
@@ -210,13 +210,27 @@ enum Awaited<T> {
     Routed(Box<dyn FnOnce(Result<T, ClientError>) + Send>),
     /// Awaited by a task its arrival wakes.
     Watched(Waker),
+    /// Its [`Sent`] was dropped.
+    Abandoned,
 }
 
-struct Cell<T>(Mutex<Awaited<T>>);
+/// Where a reply goes when its [`Sent`] is dropped before it is read.
+type Back<T> = Box<dyn FnOnce(T) + Send>;
+
+struct Slot<T> {
+    awaited: Awaited<T>,
+    back: Option<Back<T>>,
+}
+
+struct Cell<T>(Mutex<Slot<T>>);
 
 impl<T> Cell<T> {
+    fn new(awaited: Awaited<T>, back: Option<Back<T>>) -> Arc<Self> {
+        Arc::new(Cell(Mutex::new(Slot { awaited, back })))
+    }
+
     /// A panic under this lock leaves what it guards whole.
-    fn lock(&self) -> MutexGuard<'_, Awaited<T>> {
+    fn lock(&self) -> MutexGuard<'_, Slot<T>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -231,7 +245,14 @@ pub struct Promise<T>(Option<Arc<Cell<T>>>);
 
 /// A reply yet to arrive, and its writer.
 pub fn promise<T>() -> (Promise<T>, Sent<T>) {
-    let cell = Arc::new(Cell(Mutex::new(Awaited::Outstanding)));
+    let cell = Cell::new(Awaited::Outstanding, None);
+    (Promise(Some(Arc::clone(&cell))), Sent(cell))
+}
+
+/// [`promise`], where a successful reply nobody read — its [`Sent`] dropped
+/// before taking or routing it — goes to `back`.
+pub(crate) fn promise_returning<T>(back: impl FnOnce(T) + Send + 'static) -> (Promise<T>, Sent<T>) {
+    let cell = Cell::new(Awaited::Outstanding, Some(Box::new(back)));
     (Promise(Some(Arc::clone(&cell))), Sent(cell))
 }
 
@@ -241,40 +262,27 @@ impl<T> Promise<T> {
         let Some(cell) = self.0.take() else {
             return;
         };
-        let mut state = cell.lock();
-        match std::mem::take(&mut *state) {
+        let mut slot = cell.lock();
+        match std::mem::take(&mut slot.awaited) {
             Awaited::Routed(route) => {
-                drop(state);
+                drop(slot);
                 route(reply)
             }
             Awaited::Watched(waiter) => {
-                *state = Awaited::Arrived(reply);
-                drop(state);
+                slot.awaited = Awaited::Arrived(reply);
+                drop(slot);
                 waiter.wake()
             }
-            Awaited::Outstanding => *state = Awaited::Arrived(reply),
+            Awaited::Outstanding => slot.awaited = Awaited::Arrived(reply),
+            Awaited::Abandoned => {
+                let back = slot.back.take();
+                drop(slot);
+                if let (Some(back), Ok(value)) = (back, reply) {
+                    back(value)
+                }
+            }
             Awaited::Arrived(_) => unreachable!("a cell has one writer, which fulfils once"),
         }
-    }
-
-    /// [`Self::fulfil`], handing `reply` back when its [`Sent`] was dropped
-    /// before routing it, so nobody could take it.
-    pub fn offer(&mut self, reply: Result<T, ClientError>) -> Option<Result<T, ClientError>> {
-        let cell = self.0.as_ref()?;
-        // Only a `Sent` shares the cell, and nothing clones a `Sent`, so a
-        // count of one is a reader gone for good. Read under the lock, so a
-        // `Sent` that routed the reply before it dropped is seen to have. A
-        // `Sent` dropped after this check drops the reply with it.
-        let unread = {
-            let state = cell.lock();
-            Arc::strong_count(cell) == 1 && !matches!(*state, Awaited::Routed(_))
-        };
-        if unread {
-            self.0 = None;
-            return Some(reply);
-        }
-        self.fulfil(reply);
-        None
     }
 }
 
@@ -284,19 +292,39 @@ impl<T> Drop for Promise<T> {
     }
 }
 
+/// A reply still to arrive is abandoned, and one that arrived unread goes
+/// back as [`promise_returning`] says.
+impl<T> Drop for Sent<T> {
+    fn drop(&mut self) {
+        let mut slot = self.0.lock();
+        let unread = match std::mem::replace(&mut slot.awaited, Awaited::Abandoned) {
+            Awaited::Arrived(Ok(value)) => slot.back.take().map(|back| (back, value)),
+            routed @ Awaited::Routed(_) => {
+                slot.awaited = routed;
+                None
+            }
+            _ => None,
+        };
+        drop(slot);
+        if let Some((back, value)) = unread {
+            back(value)
+        }
+    }
+}
+
 impl<T> Sent<T> {
     /// A reply that needed no request.
     pub fn ready(value: Result<T, ClientError>) -> Self {
-        Sent(Arc::new(Cell(Mutex::new(Awaited::Arrived(value)))))
+        Sent(Cell::new(Awaited::Arrived(value), None))
     }
 
     /// The reply, if it has arrived. It is handed out once.
     pub fn try_take(&mut self) -> Option<Result<T, ClientError>> {
-        let mut state = self.0.lock();
-        match std::mem::take(&mut *state) {
+        let mut slot = self.0.lock();
+        match std::mem::take(&mut slot.awaited) {
             Awaited::Arrived(reply) => Some(reply),
             other => {
-                *state = other;
+                slot.awaited = other;
                 None
             }
         }
@@ -305,13 +333,13 @@ impl<T> Sent<T> {
     /// Hand the reply to `route` — now if it has arrived, else from wherever
     /// it does: for a request's, inside the step that reads it.
     pub fn then(self, route: impl FnOnce(Result<T, ClientError>) + Send + 'static) {
-        let mut state = self.0.lock();
-        match std::mem::take(&mut *state) {
+        let mut slot = self.0.lock();
+        match std::mem::take(&mut slot.awaited) {
             Awaited::Arrived(reply) => {
-                drop(state);
+                drop(slot);
                 route(reply)
             }
-            _ => *state = Awaited::Routed(Box::new(route)),
+            _ => slot.awaited = Awaited::Routed(Box::new(route)),
         }
     }
 
@@ -330,11 +358,11 @@ impl<T> Future for Sent<T> {
     type Output = Result<T, ClientError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.0.lock();
-        match std::mem::take(&mut *state) {
+        let mut slot = self.0.lock();
+        match std::mem::take(&mut slot.awaited) {
             Awaited::Arrived(reply) => Poll::Ready(reply),
             _ => {
-                *state = Awaited::Watched(cx.waker().clone());
+                slot.awaited = Awaited::Watched(cx.waker().clone());
                 Poll::Pending
             }
         }

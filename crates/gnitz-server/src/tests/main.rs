@@ -101,22 +101,18 @@ fn the_worker_count_defaults_to_one_and_reaches_max_workers_or_auto() {
 #[test]
 fn the_tls_flags_are_collected_wherever_they_stand() {
     assert!(
-        parse("/data /sock", None).unwrap().server.tls.is_none(),
+        parse("/data /sock", None).unwrap().tls.is_none(),
         "no --tls-listen, no listener"
     );
 
-    let tls = parse("--tls-listen=[::1]:7 /data /sock", None)
-        .unwrap()
-        .server
-        .tls
-        .unwrap();
+    let tls = parse("--tls-listen=[::1]:7 /data /sock", None).unwrap().tls.unwrap();
     assert_eq!(tls.listen, "[::1]:7".parse().unwrap());
     assert!(tls.cert == CertSource::Minted(Vec::new()) && !tls.allow_unauthenticated);
     assert!(tls.client_ca.is_none() && tls.auth_tokens.is_none());
 
     let line = "--tls-name=db.internal,10.0.0.5 /data --tls-listen=127.0.0.1:0 --tls-name=db2 --auth-tokens=tok \
                 /sock";
-    let tls = parse(line, None).unwrap().server.tls.unwrap();
+    let tls = parse(line, None).unwrap().tls.unwrap();
     let names = ["db.internal", "10.0.0.5", "db2"].map(|n| ServerName::try_from(n).unwrap());
     assert_eq!(tls.cert, CertSource::Minted(names.to_vec()));
     assert_eq!(tls.auth_tokens.as_deref(), Some("tok"));
@@ -128,7 +124,7 @@ fn the_tls_flags_are_collected_wherever_they_stand() {
         (args.server.data_dir.as_str(), args.server.socket_path.as_str()),
         ("/data", "/sock")
     );
-    let tls = args.server.tls.unwrap();
+    let tls = args.tls.unwrap();
     let operator = CertSource::Operator {
         cert: "c.pem".to_string(),
         key: "k.pem".to_string(),
@@ -195,11 +191,7 @@ fn every_tls_resolution_refusal_names_what_it_refuses() {
         ),
         (format!("{lo} --auth-tokens={tokens}"), &tokens),
     ] {
-        let tls = parse(&format!("{flags} /data /sock"), None)
-            .unwrap()
-            .server
-            .tls
-            .unwrap();
+        let tls = parse(&format!("{flags} /data /sock"), None).unwrap().tls.unwrap();
         let e = tls.resolve().err().unwrap_or_else(|| panic!("{flags:?} is refused"));
         assert!(e.contains(names), "{flags:?}: {e}");
     }

@@ -42,10 +42,11 @@ fn a_codebook_is_kept_until_a_batch_drifts_from_it() {
     assert_ne!(drifted.digest(), book.digest());
 }
 
-/// A table read off disk in an order no trained encoder keeps is refused, never
-/// handed to the rebuild that asserts that order.
+/// A table under a body that fails its checksum is refused, never handed to
+/// the rebuild: two equal three-byte symbols are a table no trained encoder
+/// writes, and one the rebuild asserts against.
 #[test]
-fn a_table_out_of_trained_order_is_refused() {
+fn a_table_under_a_corrupt_body_is_refused() {
     use super::super::encoding::{SYMBOLS_AT, SYMBOLS_COUNT_AT};
     use super::super::layout::spans_of;
     let dir = tempfile::tempdir().unwrap();
@@ -56,11 +57,14 @@ fn a_table_out_of_trained_order_is_refused() {
     let mut image = std::fs::read(&path).unwrap();
     let heap = spans_of(&image)[gnitz_wire::REG_PAYLOAD_START + batch.schema().num_payload_cols()].off;
     let n = gnitz_wire::read_u64_le(&image, heap + SYMBOLS_COUNT_AT) as usize;
-    let lens = &mut image[heap + SYMBOLS_AT + n * MAX_SYMBOL_LEN..][..n];
-    assert!(lens[0] > 1 && lens[n - 1] == 1, "premise: multi-byte symbols lead");
-    lens.swap(0, n - 1);
+    let (symbols, lens) = image[heap + SYMBOLS_AT..].split_at_mut(n * MAX_SYMBOL_LEN);
+    let i = lens[..n].iter().position(|&len| len >= 3).unwrap();
+    assert!(lens[i + 1] >= 3, "premise: two symbols of three bytes or more");
+    lens[i..i + 2].fill(3);
+    let three = [symbols[i * MAX_SYMBOL_LEN..][..3].to_vec(), vec![0; MAX_SYMBOL_LEN - 3]].concat();
+    symbols[i * MAX_SYMBOL_LEN..][..2 * MAX_SYMBOL_LEN].copy_from_slice(&three.repeat(2));
     std::fs::write(&path, &image).unwrap();
     let forged = MappedShard::open(path.to_str().unwrap(), batch.schema()).unwrap();
-    assert!(forged.coded_heap().is_some(), "the lengths still parse");
+    assert!(forged.coded_heap().is_some(), "the table still parses");
     assert!(Codebook::of_shard(&forged).is_none());
 }

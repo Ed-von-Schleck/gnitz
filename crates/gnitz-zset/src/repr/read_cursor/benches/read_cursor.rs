@@ -61,7 +61,7 @@ fn cursor_drain_bench() {
         ("interleaved packed", packed, &interleaved),
     ] {
         let rows = (shards.len() * shards[0].row_count()) as f64;
-        let drain = || black_box(create_read_cursor(&[], shards, schema).materialize()).count;
+        let drain = || black_box(create_read_cursor(&[], shards, schema).materialize()).len();
         // The first drain faults the shards in.
         drain();
         let (instr, cyc) = (instructions.measure(drain).1, cycles.measure(drain).1);

@@ -14,7 +14,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
 use pyo3::IntoPyObjectExt;
 
-use gnitz_core::{BoxFut, ClientError, DeltaCursor, GnitzClient, RelName, Sent, TableDef, ZSetBatch};
+use gnitz_core::{BoxFut, ClientError, DeltaCursor, GnitzClient, RelName, Sent, SubId, TableDef, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::GnitzSqlError;
 use gnitz_wire::{KeyRange, PkColList, PkListRole, ReadBound, ReadSpec, WireConflictMode};
@@ -464,7 +464,7 @@ impl PyClient {
         Self::run(
             slf,
             whole!(|c| c.subscribe(view_id, cursor, &schema.rust, &spec).await?),
-            |py, (id, rows, cursor)| (id, scan_result(py, rows)?, cursor.pair()).into_py_any(py),
+            |py, (id, rows, cursor)| (id.get(), scan_result(py, rows)?, cursor.pair()).into_py_any(py),
         )
     }
 
@@ -473,7 +473,8 @@ impl PyClient {
     /// End a subscription: no `sync` reports it again, and the next one tells
     /// the server. An id this client does not hold is ignored.
     fn unsubscribe(slf: &Bound<'_, Self>, sub: u64) -> PyResult<Py<PyAny>> {
-        Self::run(slf, whole!(|c| c.unsubscribe(sub)), none)
+        let sub = SubId::new(sub);
+        Self::run(slf, whole!(|c| sub.map_or((), |id| c.unsubscribe(id))), none)
     }
 
     /// sync(wait=0.0) -> Synced

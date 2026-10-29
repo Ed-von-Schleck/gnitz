@@ -97,6 +97,7 @@ impl Table {
     /// Fold memtable and RAM tier into one shard and stage the manifest naming
     /// it, unless it is the one in place; `None` when that one is also synced.
     pub(super) fn flush_prepare(&mut self, checkpoint_mark: u64) -> Result<Option<FlushWork>, StorageError> {
+        debug_assert!(!self.held_in_ram, "a barrier over a store held in RAM only");
         // The memtable drains into the RAM tier, which spills as one shard.
         self.rejudge_live_floor();
         self.memtable.drain_into(&mut self.ram_tier, &self.shard_index.schema);

@@ -25,6 +25,56 @@ fn append_row_from_source_carries_the_callers_weight() {
     assert_eq!(payload0_i64(&dst, 0), 0x4242);
 }
 
+/// A `MemBatch`'s per-row accessors read the same bytes as its region
+/// accessors, at every row and payload column of a compound-PK batch whose arena
+/// has room past its rows.
+#[test]
+fn mem_batch_row_accessors_match_its_regions() {
+    use gnitz_expr::BatchView;
+    use gnitz_wire::RowSource;
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::U8, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::String, true),
+        ],
+        &[2, 0],
+    );
+    let mut b = BatchBuilder::new(&schema);
+    for i in 0..3u128 {
+        b.begin_row_natives(&[1000 + i, (i as i32 - 1) as u128], 1 + i as i64);
+        b.put_int(i + 7);
+        b.put_opt_int((i != 1).then_some((-(i as i64) * 100) as u128));
+        match i {
+            0 => b.put_null(),
+            _ => b.put_string(&"a long string the heap holds".repeat(i as usize)),
+        }
+        b.end_row();
+    }
+    let batch = b.finish();
+    let mb = batch.as_mem_batch();
+    assert!(mb.cap > mb.count, "the arena has room past the rows");
+    let (pk, stride) = BatchView::pk_region(&mb);
+    assert_eq!(stride, schema.pk_stride());
+    for row in 0..mb.count {
+        assert_eq!(RowSource::get_pk_bytes(&mb, row), &pk[row * stride..(row + 1) * stride]);
+        assert_eq!(
+            RowSource::get_null_word(&mb, row),
+            gnitz_wire::read_u64_le(BatchView::null_bmp(&mb), row * 8)
+        );
+        for (pi, col) in schema.payload_columns() {
+            let sz = col.size();
+            assert_eq!(
+                RowSource::get_col_ptr(&mb, row, pi, sz),
+                &BatchView::col_data(&mb, pi, sz)[row * sz..(row + 1) * sz],
+                "row {row}, payload column {pi}"
+            );
+        }
+    }
+}
+
 // Raising the claim verifies it: an adjacent-equal (PK, payload) duplicate
 // trips the verifier.
 #[cfg(debug_assertions)]

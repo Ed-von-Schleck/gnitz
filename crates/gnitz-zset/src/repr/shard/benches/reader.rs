@@ -34,7 +34,7 @@ fn slice_blob_relocate_bench() {
         let carried = (!relocate).then(|| shard.heap().plain().expect("a plain heap").len());
         let slice = || drop(black_box(shard.slice_to_owned_batch_with(0, rc, carried)));
         // The first slice faults in the cold mmap pages.
-        assert_eq!(shard.slice_to_owned_batch_with(0, rc, carried).count, rc);
+        assert_eq!(shard.slice_to_owned_batch_with(0, rc, carried).len(), rc);
         cycles.measure(|| (0..ITERS).for_each(|_| slice())).1 as f64 / ITERS as f64
     };
 

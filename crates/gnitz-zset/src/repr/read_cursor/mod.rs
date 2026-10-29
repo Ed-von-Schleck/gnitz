@@ -136,15 +136,11 @@ impl ReadCursor {
     }
 
     /// One payload dispatch for the tournament re-play and the advance after it.
-    /// A leaf is keyed under the cursor's `order` and ties go to
-    /// [`merge::merge_less`], the pair the advance and forward-seek paths step
-    /// the tree through, so a tree maintained in place cannot order rows
-    /// differently from how it was played.
+    /// Ties go to [`merge::merge_less`], as in the advance and forward seek that
+    /// step the tree afterwards.
     #[inline]
     fn rebuild_and_advance_merge_with<P: PayloadOrder>(&mut self, payload: P) {
         {
-            // Destructured so the tournament's `&mut tree` and the comparator's
-            // `&sources` / `&states` are disjoint field borrows.
             let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
             tree.rebuild(
                 |i| order.head(sources, i, &states[i]),
@@ -226,7 +222,6 @@ impl ReadCursor {
 
     #[inline]
     fn seek_forward_merge_with<P: PayloadOrder>(&mut self, key: &[u8], payload: P) {
-        // Scoping the field borrows to `seek_phase` frees `self` for the advance.
         let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
         let less = merge::merge_less(schema, sources, *order, payload);
         Self::seek_phase(
@@ -299,12 +294,14 @@ impl ReadCursor {
     /// The current row's net weight: its group's weights summed across sources.
     #[inline]
     pub fn current_weight(&self) -> i64 {
+        debug_assert!(self.valid, "current_weight on an invalid cursor");
         self.current_weight
     }
 
     /// PK region of the current row as raw bytes, without copying. The single PK
     /// accessor for any width — correct for compound/wide PKs.
     pub fn current_pk_bytes(&self) -> &[u8] {
+        debug_assert!(self.valid, "current_pk_bytes on an invalid cursor");
         let (src, row) = self.row_at(self.current);
         src.get_pk_bytes(row)
     }
@@ -574,9 +571,8 @@ impl ReadCursor {
         }
     }
 
-    /// The five-field destructure both merge-mode walks need before handing the
-    /// tournament to [`merge::drive`]: `advance_merge_with` takes one group,
-    /// `drain_sorted_into` a whole chunk.
+    /// [`merge::drive`] over the cursor's tournament: `advance_merge_with` takes
+    /// one group, `drain_sorted_into` a whole chunk.
     #[inline(always)]
     fn drive<P: PayloadOrder>(&mut self, payload: P, emit: impl FnMut(usize, usize, i64) -> ControlFlow<()>) {
         let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
@@ -588,9 +584,6 @@ impl ReadCursor {
     /// group, so ghosts are passed over rather than surfaced.
     #[inline(always)]
     fn advance_merge_with<P: PayloadOrder>(&mut self, payload: P) {
-        // The emitted group comes back as a tuple rather than being written to
-        // `self.current_*` in place: the drive already holds `&mut self`, so the
-        // closure cannot.
         let mut emitted: Option<(usize, usize, i64)> = None;
         self.drive(payload, |gs, gr, nw| {
             emitted = Some((gs, gr, nw));

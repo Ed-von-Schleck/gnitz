@@ -57,10 +57,13 @@ fn each_op_answers_its_calendar_anchor() {
         (C::Epoch, i64::MAX, false, -86_400),
         (C::Year, i64::MAX, false, 1969),
     ] {
-        assert_eq!(eval(op, v, micros), want, "{op:?}({v}, micros={micros})");
+        assert_eq!(eval(op, v, micros), (want, false), "{op:?}({v}, micros={micros})");
     }
-    assert_eq!(days_to_micros(d), (d * MICROS_PER_DAY, false));
-    assert!(days_to_micros(i64::MAX / 2).1, "a day count past i64 micros is NULL");
+    assert_eq!(eval(C::ToMicros, d, false), (d * MICROS_PER_DAY, false));
+    assert!(
+        eval(C::ToMicros, i64::MAX / 2, false).1,
+        "a day count past i64 micros is NULL"
+    );
 }
 
 /// The laws tying the ops together, over days of both eras and times of day at
@@ -68,6 +71,12 @@ fn each_op_answers_its_calendar_anchor() {
 #[test]
 fn every_op_obeys_the_calendar_laws() {
     use CalendarOp as C;
+    // No op these laws reach can NULL.
+    let ev = |op: C, v: i64, micros: bool| {
+        let (x, null) = eval(op, v, micros);
+        assert!(!null, "{op:?}({v}, micros={micros}) is NULL");
+        x
+    };
     let date_fields = [
         C::Year,
         C::Quarter,
@@ -81,26 +90,26 @@ fn every_op_obeys_the_calendar_laws() {
     for d in (-1_000_000..1_000_000).step_by(7_919) {
         for tod in [0, 1, MICROS_PER_DAY / 2 + 7, MICROS_PER_DAY - 1] {
             let ts = d * MICROS_PER_DAY + tod;
-            assert_eq!(eval(C::ToDays, ts, true), d);
+            assert_eq!(ev(C::ToDays, ts, true), d);
             for op in date_fields {
-                assert_eq!(eval(op, ts, true), eval(op, d, false), "{op:?} on day {d}");
+                assert_eq!(ev(op, ts, true), ev(op, d, false), "{op:?} on day {d}");
             }
-            assert_eq!(eval(C::Dow, d, false), eval(C::Isodow, d, false) % 7);
+            assert_eq!(ev(C::Dow, d, false), ev(C::Isodow, d, false) % 7);
             for (v, micros) in [(d, false), (ts, true)] {
                 for field in C::ALL.iter().copied() {
                     let Some(trunc) = field.trunc_of() else { continue };
-                    let t = eval(trunc, v, micros);
+                    let t = ev(trunc, v, micros);
                     assert!(t <= v, "{trunc:?}({v}) = {t}");
-                    assert_eq!(eval(trunc, t, micros), t, "{trunc:?} is idempotent at {v}");
+                    assert_eq!(ev(trunc, t, micros), t, "{trunc:?} is idempotent at {v}");
                     assert_eq!(
-                        eval(field, t, micros),
-                        eval(field, v, micros),
+                        ev(field, t, micros),
+                        ev(field, v, micros),
                         "{trunc:?} keeps {field:?} at {v}"
                     );
                 }
-                assert_eq!(eval(C::Isodow, eval(C::TruncWeek, v, micros), micros), 1);
-                assert_eq!(eval(C::Doy, eval(C::TruncYear, v, micros), micros), 1);
-                assert_eq!(eval(C::Day, eval(C::TruncMonth, v, micros), micros), 1);
+                assert_eq!(ev(C::Isodow, ev(C::TruncWeek, v, micros), micros), 1);
+                assert_eq!(ev(C::Doy, ev(C::TruncYear, v, micros), micros), 1);
+                assert_eq!(ev(C::Day, ev(C::TruncMonth, v, micros), micros), 1);
             }
         }
     }

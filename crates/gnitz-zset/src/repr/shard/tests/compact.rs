@@ -12,22 +12,19 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-/// Every `(guard_key, skeleton, batch)` [`merge_guard`] answers over `guards`
-/// in order.
+/// Every `(guard_key, skeleton, batch)` a [`GuardMerge`] answers over
+/// `guards` in order.
 fn route(
     shards: &[Rc<MappedShard>],
     guards: &[PkBuf],
     dehydrate: bool,
     schema: &SchemaDescriptor,
 ) -> Vec<(PkBuf, bool, Batch)> {
-    for s in shards {
-        s.verify_body().unwrap();
-    }
-    let mut starts = vec![0usize; shards.len()];
+    let mut merge = GuardMerge::begin(shards.to_vec()).unwrap();
     (0..guards.len())
         .filter_map(|g| {
             let until = guards.get(g + 1).map(PkBuf::pk_bytes);
-            let run = merge_guard(shards, &mut starts, until, dehydrate, schema, None)?;
+            let run = merge.next(until, dehydrate, schema, None)?;
             Some((
                 guards[g],
                 run.skeleton,
@@ -62,6 +59,39 @@ fn guard_slot_saturates_at_both_ends() {
     }
 }
 
+/// A merge begins only over inputs whose bodies match their checksums.
+#[test]
+fn a_merge_refuses_a_corrupt_input() {
+    let (dir, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let schema = make_schema_u64_i64();
+    let rows: Vec<(u64, i64, i64)> = (1..=100).map(|i| (i, 1, i as i64)).collect();
+    let intact = map_shard(&dir.path().join("s.db"), &make_batch(&schema, &rows));
+    let mut image = std::fs::read(dir.path().join("s.db")).unwrap();
+    *image.last_mut().unwrap() ^= 1;
+    // The same basename, which the prefix digest is seeded with.
+    let path = other.path().join("s.db");
+    std::fs::write(&path, &image).unwrap();
+    let corrupt = Rc::new(MappedShard::open(path.to_str().unwrap(), &schema).unwrap());
+    assert!(GuardMerge::begin(vec![Rc::clone(&intact)]).is_ok());
+    assert_eq!(
+        GuardMerge::begin(vec![intact, corrupt]).err(),
+        Some(StorageError::Corrupt("body checksum"))
+    );
+}
+
+/// A guard key below the last one would merge rows a second time.
+#[test]
+#[should_panic(expected = "guard keys ascend")]
+fn a_descending_guard_key_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let rows: Vec<(u64, i64, i64)> = (1..=100).map(|i| (i, 1, i as i64)).collect();
+    let shard = map_shard(&dir.path().join("s.db"), &make_batch(&schema, &rows));
+    let mut merge = GuardMerge::begin(vec![shard]).unwrap();
+    assert!(merge.next(Some(&60u64.to_be_bytes()), false, &schema, None).is_some());
+    merge.next(Some(&30u64.to_be_bytes()), false, &schema, None);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -77,7 +107,7 @@ proptest! {
         let runs: Vec<Batch> = rows
             .chunks(7)
             .map(|c| fold_batch(&s, c).into_consolidated())
-            .filter(|b| b.count > 0)
+            .filter(|b| !b.is_empty())
             .collect();
         let dir = tempfile::tempdir().unwrap();
         let shards: Vec<Rc<MappedShard>> = runs
@@ -116,7 +146,7 @@ proptest! {
             let what = format!("guard {g} (skeleton {skeleton})");
             let want_skeleton: Vec<(Vec<u8>, i64)> = per_pk(g).into_iter().filter(|&(_, w)| w != 0).collect();
             let hydrated_want = fold_batch(&s, &share(g));
-            let expect_any = if skeleton { !want_skeleton.is_empty() } else { hydrated_want.clone().into_consolidated().count > 0 };
+            let expect_any = if skeleton { !want_skeleton.is_empty() } else { !hydrated_want.clone().into_consolidated().is_empty() };
             let got = emitted.next_if(|(k, ..)| *k == key);
             prop_assert_eq!(got.is_some(), expect_any, "{}: emitted", what);
             let Some((_, got_skeleton, batch)) = got else { continue };
@@ -124,7 +154,7 @@ proptest! {
             if skeleton {
                 prop_assert_eq!(*batch.schema(), s.pk_only());
                 let rows: Vec<(Vec<u8>, i64)> =
-                    (0..batch.count).map(|r| (batch.get_pk_bytes(r).to_vec(), batch.get_weight(r))).collect();
+                    (0..batch.len()).map(|r| (batch.get_pk_bytes(r).to_vec(), batch.get_weight(r))).collect();
                 prop_assert_eq!(rows, want_skeleton, "{}", what);
             } else {
                 assert_folds(&[hydrated_want], &batch, &what);
@@ -173,7 +203,7 @@ fn a_skeleton_input_makes_every_output_a_skeleton() {
         .iter()
         .map(|(_, skel, b)| {
             assert_eq!(*b.schema(), schema.pk_only());
-            let rows = (0..b.count)
+            let rows = (0..b.len())
                 .map(|r| (gnitz_wire::widen_pk_be(b.get_pk_bytes(r)) as u64, b.get_weight(r)))
                 .collect();
             (*skel, rows)
@@ -231,8 +261,9 @@ fn a_coded_merge_keeps_the_codes_of_its_own_table() {
         map_shard(&dir.path().join("retracted.db"), &retracted),
     ];
 
-    let plain = merge_guard(&shards, &mut [0; 4], None, false, &schema, None).unwrap();
-    let coded = merge_guard(&shards, &mut [0; 4], None, false, &schema, Some(&book)).unwrap();
+    let merge = || GuardMerge::begin(shards.to_vec()).unwrap();
+    let plain = merge().next(None, false, &schema, None).unwrap();
+    let coded = merge().next(None, false, &schema, Some(&book)).unwrap();
     let plain = plain.plain().unwrap();
     let want = string_rows(plain, |r| plain.get_weight(r));
     assert_eq!(want.len(), 250 + 280 + 300);

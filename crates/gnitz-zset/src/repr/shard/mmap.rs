@@ -10,10 +10,14 @@ pub(super) struct Mmap {
 }
 
 impl Mmap {
-    /// Map the first `len` bytes of `file` read-only; `len` must be its length,
-    /// and nonzero. The mapping holds its own reference to the inode, so the
-    /// caller may close `file` at once.
-    pub(super) fn from_file(file: &File, len: usize) -> io::Result<Self> {
+    /// Map the whole of `file` read-only; `None` for an empty file. The mapping
+    /// holds its own reference to the inode, so the caller may close `file` at
+    /// once.
+    pub(super) fn of_file(file: &File) -> io::Result<Option<Self>> {
+        let len = file.metadata()?.len() as usize;
+        if len == 0 {
+            return Ok(None);
+        }
         // SAFETY: a fresh mapping at an address the kernel picks.
         let raw = unsafe {
             libc::mmap(
@@ -28,7 +32,7 @@ impl Mmap {
         if raw == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(Mmap { ptr: raw.cast(), len })
+        Ok(Some(Mmap { ptr: raw.cast(), len }))
     }
 
     /// `advice` over the mapping; best-effort.
@@ -46,7 +50,7 @@ impl Mmap {
 
 impl Drop for Mmap {
     fn drop(&mut self) {
-        // SAFETY: the mapping `from_file` made, unmapped once.
+        // SAFETY: the mapping `of_file` made, unmapped once.
         unsafe { libc::munmap(self.ptr.cast_mut().cast(), self.len) };
     }
 }

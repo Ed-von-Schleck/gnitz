@@ -21,15 +21,8 @@ const PATTERNS: &[u128] = &[
     u128::MAX,
 ];
 
-/// The OPK codec at every PK-eligible width. Unsigned byte comparison over an
-/// encoded key IS the typed order of the value it encodes (`cmp_col_window` is
-/// the crate's own definition of that order over native LE bytes, tested
-/// independently), so a wrong sign flip fails here rather than as silently
-/// mis-summed weights downstream. `decode_pk_cell` inverts the encode — the
-/// bijection byte-equal ⟺ key-equal rests on — `key_image` is the key read as
-/// a big-endian integer and its own inverse, `decode_opk_u128` reads the native
-/// value back, `push_opk` appends what `store_opk` stores, and `decode_opk_i64`
-/// fuses the decode with `FixedInt`'s widening.
+/// The OPK codec round-trips and orders like the typed value (`cmp_col_window`)
+/// at every PK-eligible width.
 #[test]
 fn opk_codec_over_every_pk_type() {
     for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {

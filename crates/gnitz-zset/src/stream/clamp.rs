@@ -5,20 +5,22 @@ use std::borrow::Cow;
 use gnitz_wire::ClampKind;
 
 use crate::repr::{materialize_carrying, Batch, Pick};
-use crate::stream::OpenAt;
+use crate::stream::History;
 
 /// Per consolidated (PK, payload) of `delta`, emits `clamp(w_old + Δw, 0, cap) −
-/// clamp(w_old, 0, cap)` against its weight `w_old` in the history `hist` opens —
-/// the lift of a per-element weight clamp to its delta. `hist_holds_delta`: what
-/// `hist` opens has absorbed `delta` already, so it holds `w_old + Δw`. When
-/// every row emits its own weight, the input is the output, moved when it is
-/// owned.
-pub fn op_weight_clamp(delta: Cow<'_, Batch>, hist: OpenAt<'_>, hist_holds_delta: bool, kind: ClampKind) -> Batch {
+/// clamp(w_old, 0, cap)` against its weight `w_old` in `hist` — the lift of a
+/// per-element weight clamp to its delta. When every row emits its own weight,
+/// the input is the output, moved when it is owned.
+pub fn op_weight_clamp(delta: Cow<'_, Batch>, hist: History<'_>, kind: ClampKind) -> Batch {
     debug_assert!(delta.is_consolidated());
     if delta.is_empty() {
         return Batch::empty_with_schema(delta.schema());
     }
-    let cursor = &mut hist(delta.get_pk_bytes(0), delta.get_pk_bytes(delta.len() - 1));
+    let (open, hist_holds_delta) = match hist {
+        History::Before(open) => (open, false),
+        History::Through(open) => (open, true),
+    };
+    let cursor = &mut open(delta.get_pk_bytes(0), delta.get_pk_bytes(delta.len() - 1));
     // The clamp's upper bound; every clamp's floor is 0.
     let cap = match kind {
         ClampKind::Distinct => 1,

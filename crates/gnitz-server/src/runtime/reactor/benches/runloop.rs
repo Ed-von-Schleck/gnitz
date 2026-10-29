@@ -7,7 +7,8 @@ use super::super::test_support::*;
 use super::*;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
-use crate::runtime::w2m::BOOT_READY_REQUEST_ID;
+use crate::runtime::w2m::fixtures::id;
+use crate::runtime::w2m::RequestId;
 
 const PASSES: u64 = 100_000;
 
@@ -81,21 +82,24 @@ fn reactor_pass_bench() {
 
     for nw in [1, 4, 16] {
         let (r, mut writers) = reactor_with_rings(nw);
+        // The wire value of the live lease's id, 0 before the first.
         let id = Rc::new(Cell::new(0));
         let (r2, leased) = (r.clone(), Rc::clone(&id));
         let acks = async move || {
             let lease = r2.lease_acks(WorkerSet::ALL);
-            leased.set(lease.targets().request_id);
+            leased.set(lease.id().get());
             lease.acks().await;
         };
         arm(&format!("acks nw={nw}"), r, acks, || {
-            writers.iter_mut().for_each(|w| w.send_ack(id.get()));
+            if let Some(id) = RequestId::from_wire(id.get()) {
+                writers.iter_mut().for_each(|w| w.send_ack(id));
+            }
         });
     }
 
     let (r, mut writers) = reactor_with_rings(1);
     let lease = r.lease_train(WorkerSet::ALL, "ScanSpec");
-    let id = lease.targets().request_id;
+    let id = lease.id();
     let schema = crate::test_support::make_schema_u64_i64();
     let rows = crate::test_support::make_batch(&schema, &[(1, 1, 0)]);
     let frame = WireMsg::train_frame(0, false, rows.wire_whole());
@@ -116,19 +120,18 @@ fn reactor_flood_bench() {
 
     let counter = Counter::instructions();
     for nw in [1, 4, 16] {
-        let (r, writers) = reactor_with_rings(nw);
-        let lease = r.lease_ready();
+        let (r, ready, writers) = booting_reactor(nw);
         let wakes_before = r.w2m.wakes();
         let (instructions, sleeps) = std::thread::scope(|s| {
             for mut writer in writers {
                 s.spawn(move || {
-                    for id in (BOOT_READY_REQUEST_ID + 1..=N).chain([BOOT_READY_REQUEST_ID]) {
-                        writer.send_ack(id);
+                    for n in (2..=N).chain([1]) {
+                        writer.send_ack(id(n));
                     }
                 });
             }
             let before = voluntary_ctx_switches();
-            let ((), instructions) = counter.measure(|| r.block_on(lease.acks()));
+            let (_, instructions) = counter.measure(|| r.block_on(ready.all_acked()));
             (instructions, voluntary_ctx_switches() - before)
         });
         let wakes = r.w2m.wakes() - wakes_before;
@@ -173,8 +176,8 @@ fn reactor_round_bench() {
                     while !stop.load(Ordering::Acquire) {
                         std::thread::sleep(std::time::Duration::from_micros(100));
                         let id = round.load(Ordering::Acquire);
-                        if id != last {
-                            writer.send_ack(id);
+                        if let Some(req) = RequestId::from_wire(id).filter(|_| id != last) {
+                            writer.send_ack(req);
                             last = id;
                         }
                     }
@@ -183,7 +186,7 @@ fn reactor_round_bench() {
             let before = voluntary_ctx_switches();
             for _ in 0..ROUNDS {
                 let lease = r.lease_acks(WorkerSet::ALL);
-                round.store(lease.targets().request_id, Ordering::Release);
+                round.store(lease.id().get(), Ordering::Release);
                 r.block_on(lease.acks());
             }
             let sleeps = voluntary_ctx_switches() - before;

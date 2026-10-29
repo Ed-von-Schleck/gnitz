@@ -16,14 +16,12 @@
 //! so a build whose formats moved on restores it; a view comes back from its
 //! recorded SQL, planned anew, under the names its sources carry now.
 //!
-//! A restore runs `schema.sql`, pushes each table's rows — a table that
-//! references itself and takes more than one push in an order where every
-//! row's parents come no later than it — puts each SERIAL sequence where the
-//! dump left it, and runs `post-data.sql`, so a view fills once from its loaded
-//! sources and is planned with every index its sources have. It refuses a
-//! database holding any schema, relation or index name the dump creates. Streams hold no rows, view contents are derived,
-//! and a delta feed's retained rounds and a client's mirrors are no state of
-//! the database, so none of them is dumped.
+//! A restore runs `schema.sql`, pushes each table's rows, puts each SERIAL
+//! sequence where the dump left it, and runs `post-data.sql`, so a view fills
+//! once from its loaded sources and is planned with every index its sources
+//! have. Streams hold no rows, view contents are derived, and a delta feed's
+//! retained rounds and a client's mirrors are no state of the database, so none
+//! of them is dumped.
 
 mod columns;
 mod manifest;
@@ -236,12 +234,11 @@ async fn dump_rows(
 
 /// Restore the dump in `dir` into the database `client` is connected to.
 ///
-/// A table that references itself and takes more than one push arrives in an
-/// order where every row's parents come no later than it, a reference cycle's
-/// rows in one push. Refused before anything is written when the database holds
-/// a schema, relation or index name the dump creates. Past that, each statement and each push commits on its own, so a
-/// restore that fails part way leaves what it created: restore into a fresh
-/// database again.
+/// Refused before anything is written when the database holds a schema,
+/// relation or index name the dump creates. Past that, each statement and each
+/// push commits on its own, so a restore that fails part way leaves what it
+/// created: restore into a fresh database again. A self-referencing table too
+/// large for one push goes in `order::order`'s order.
 pub async fn restore(client: &mut GnitzClient, dir: &Path) -> Result<Summary, DumpError> {
     let read = |file: &str| fs::read_to_string(dir.join(file)).map_err(|e| DumpError(format!("{file}: {e}")));
     let manifest = Manifest::from_json(&read("manifest.json")?)?;
@@ -339,9 +336,8 @@ fn push_bytes(schema: &Schema, batch: &ZSetBatch) -> usize {
     batch.blob.len() + batch.len() * schema.layout().row_width()
 }
 
-/// Push `batch` into `desc`: whole when it fits one push, else in pushes of at
-/// most `PUSH_BYTES`, each row after the rows it references through `refs`, and
-/// a reference cycle's rows in one push.
+/// Push `batch` into `desc`: whole when it fits one push, else in `order::order`'s
+/// order, cut where a push reaches `PUSH_BYTES`, the rows it puts last in one push.
 async fn push_rows(
     client: &mut GnitzClient,
     desc: &RelDescriptor,

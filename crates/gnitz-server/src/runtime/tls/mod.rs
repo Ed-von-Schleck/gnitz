@@ -1,11 +1,11 @@
 //! TLS 1.3 server transport. The recv filter ([`TlsIngress`]) decrypts into the
-//! connection's `RecvQueue` and never sends; ciphertext leaves only through
+//! connection's `FrameSink` and never sends; ciphertext leaves only through
 //! [`TlsShared::flush_records`], so records reach the socket in emission order.
 
 mod config;
 mod tokens;
 
-pub(crate) use config::{CertSource, Served, TlsArgs, TlsListener};
+pub(crate) use config::{CertSource, ResolvedTls, Served, TlsArgs, TlsListener};
 pub(crate) use tokens::mint as mint_token;
 
 use std::cell::RefCell;
@@ -16,8 +16,11 @@ use std::sync::Arc;
 
 use gnitz_zset::repr::PooledBuf;
 
-use crate::runtime::reactor::{Accepted, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody};
+use crate::runtime::reactor::{
+    Accepted, Charge, ClientConn, FrameSink, PeerGone, Reactor, RecvEnd, RecvFilter, SendBody,
+};
 use crate::runtime::sync::{chan, AsyncRwLock, WriteGuard};
+use gnitz_wire::Deframer;
 
 /// Size of the ciphertext window each recv lands in.
 const CIPHER_WINDOW_BYTES: usize = 64 * 1024;
@@ -28,10 +31,15 @@ const TLS_MAX_FRAGMENT: usize = 16 * 1024;
 /// AEAD tag.
 const TLS_RECORD_OVERHEAD: usize = 5 + 1 + 16;
 
-/// Feed one socket chunk of ciphertext through rustls, enqueueing the plaintext
-/// frames it yields on `q`. A peer's close_notify ends the recv side once the
-/// plaintext ahead of it is queued.
-fn ingest_cipher(sess: &mut rustls::ServerConnection, mut cipher: &[u8], q: &mut RecvQueue) -> Result<(), RecvEnd> {
+/// Feed one socket chunk of ciphertext through rustls, deframing the plaintext
+/// it yields through `deframer` into `sink`. A peer's close_notify ends the recv
+/// side once the plaintext ahead of it is queued.
+fn ingest_cipher(
+    sess: &mut rustls::ServerConnection,
+    mut cipher: &[u8],
+    deframer: &mut Deframer<Charge>,
+    sink: &mut FrameSink,
+) -> Result<(), RecvEnd> {
     while !cipher.is_empty() {
         // An `Err` is rustls's buffer being full, not a failure: the drain below
         // frees it and the loop retries the rest.
@@ -42,7 +50,7 @@ fn ingest_cipher(sess: &mut rustls::ServerConnection, mut cipher: &[u8], q: &mut
             let n = match reader.fill_buf() {
                 Ok([]) => return Err(RecvEnd::PeerClosed),
                 Ok(chunk) => {
-                    q.feed(chunk)?;
+                    sink.feed(deframer, chunk)?;
                     chunk.len()
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -63,8 +71,11 @@ pub(crate) struct TlsShared {
     state: RefCell<rustls::ServerConnection>,
     /// Held across every ciphertext extraction and send. `ClientConn::retire` and
     /// `fail` never take it, so an eviction never waits on a stalled send.
-    send_lock: AsyncRwLock,
+    send_lock: AsyncRwLock<TlsSendLock>,
 }
+
+/// The tag of a TLS connection's send lock.
+enum TlsSendLock {}
 
 impl TlsShared {
     /// Build the connection over `accepted`, arm its recv filter and spawn its
@@ -88,6 +99,7 @@ impl TlsShared {
         let ingress = TlsIngress {
             tls: Rc::clone(&tls),
             cipher: Box::new_uninit_slice(CIPHER_WINDOW_BYTES),
+            deframer: Deframer::default(),
         };
         tls.reactor.register_conn(&tls.conn, Box::new(ingress));
         tls.reactor.spawn(flusher(Rc::clone(&tls), flush_rx));
@@ -99,10 +111,11 @@ impl TlsShared {
         &self.conn
     }
 
-    /// Send everything rustls has queued. Callers hold `send_lock`, which is
-    /// what keeps records in emission order. `plaintext`, the bytes handed to
-    /// rustls since the last flush, sizes the buffer.
-    async fn flush_records(&self, _: &WriteGuard, plaintext: usize) -> Result<(), PeerGone> {
+    /// Send everything rustls has queued, under `send`, which keeps records in
+    /// emission order. `plaintext`, the bytes handed to rustls since the last
+    /// flush, sizes the buffer.
+    async fn flush_records(&self, send: &WriteGuard<TlsSendLock>, plaintext: usize) -> Result<(), PeerGone> {
+        debug_assert!(send.is_of(&self.send_lock), "the guard of this connection's send lock");
         let records = plaintext.div_ceil(TLS_MAX_FRAGMENT);
         let mut out = PooledBuf::with_capacity(plaintext + records * TLS_RECORD_OVERHEAD);
         {
@@ -147,18 +160,20 @@ impl TlsShared {
 struct TlsIngress {
     tls: Rc<TlsShared>,
     cipher: Box<[MaybeUninit<u8>]>,
+    /// Deframes the plaintext.
+    deframer: Deframer<Charge>,
 }
 
 impl RecvFilter for TlsIngress {
-    fn window<'a>(&'a mut self, _q: &'a mut RecvQueue) -> &'a mut [MaybeUninit<u8>] {
+    fn window(&mut self) -> &mut [MaybeUninit<u8>] {
         &mut self.cipher
     }
 
-    fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd> {
+    fn ingest(&mut self, n: usize, sink: &mut FrameSink) -> Result<(), RecvEnd> {
         let mut sess = self.tls.state.borrow_mut();
         // SAFETY: `n` counts bytes the completed recv wrote into the window.
         let cipher = unsafe { self.cipher[..n].assume_init_ref() };
-        let result = ingest_cipher(&mut sess, cipher, q);
+        let result = ingest_cipher(&mut sess, cipher, &mut self.deframer, sink);
         if sess.wants_write() {
             self.tls.conn.wake_egress();
         }

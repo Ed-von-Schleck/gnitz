@@ -3,7 +3,7 @@
 //! [`connect`] is a `gnitz-core` client that waits on this runtime, for the task
 //! that owns it; [`share`] hands one to a driver, and tasks share the handle.
 
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::OwnedFd;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -15,12 +15,12 @@ use tokio::sync::mpsc;
 #[derive(Default)]
 struct TokioHost {
     /// The client's socket, registered until the next `attach` or this drop.
-    fd: Option<AsyncFd<RawFd>>,
+    fd: Option<AsyncFd<OwnedFd>>,
 }
 
 fn fired(
-    polled: Poll<std::io::Result<AsyncFdReadyGuard<'_, RawFd>>>,
-) -> std::io::Result<Option<AsyncFdReadyGuard<'_, RawFd>>> {
+    polled: Poll<std::io::Result<AsyncFdReadyGuard<'_, OwnedFd>>>,
+) -> std::io::Result<Option<AsyncFdReadyGuard<'_, OwnedFd>>> {
     match polled {
         Poll::Ready(r) => r.map(Some),
         Poll::Pending => Ok(None),
@@ -28,13 +28,12 @@ fn fired(
 }
 
 impl Host for TokioHost {
-    fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    fn attach(&mut self, fd: OwnedFd) -> std::io::Result<()> {
         // Registered before the old registration drops, so a socket the
-        // reactor refuses leaves this host on the old one. That one is still
-        // open here, so the two are different fds.
-        // SAFETY: the socket stays open until the next `attach` or this host's
-        // drop, which each drop this registration first.
-        self.fd = Some(unsafe { AsyncFd::register(fd.as_raw_fd()) }?);
+        // reactor refuses leaves this host on the old one.
+        // SAFETY: the registration owns `fd`, which is open and stays the
+        // same descriptor until the registration drops.
+        self.fd = Some(unsafe { AsyncFd::register(fd) }?);
         Ok(())
     }
 
@@ -157,21 +156,16 @@ impl AsyncClient {
     /// while the server holds the reply.
     ///
     /// Cancel-safe: a sync dropped before it has its answer leaves what it
-    /// would have taken for the next sync, and one dropped while the client
-    /// finishes it hands its delivery to [`GnitzClient::unclaimed`].
+    /// would have taken for the next sync, and one dropped later hands its
+    /// delivery back through [`GnitzClient::sync_reply`].
     pub async fn sync(&self, wait: Duration) -> Result<Synced, ClientError> {
-        let sent = self
-            .run(move |c| Box::pin(std::future::ready(c.begin_sync(wait))))
+        let (sent, (mut to, synced)) = self
+            .run(move |c| Box::pin(std::future::ready((c.begin_sync(wait), c.sync_reply()))))
             .await?;
         let reply = sent.await;
-        let (mut to, synced) = promise();
         // A driver that is gone drops the op, and with it `to`.
         let _ = self.tx.send(Box::new(move |client| {
-            Box::pin(async move {
-                if let Some(Ok(unreceived)) = to.offer(client.finish_sync(reply).await) {
-                    client.unclaimed(unreceived);
-                }
-            })
+            Box::pin(async move { to.fulfil(client.finish_sync(reply).await) })
         }));
         synced.await
     }

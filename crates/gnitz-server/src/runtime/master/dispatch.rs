@@ -111,9 +111,8 @@ impl MasterDispatcher {
         let mut scope = excl.begin("ddl");
         let zone_lsn = scope.lsn();
         // Each DDL batch is logged inside the zone, under its one LSN, so recovery
-        // groups a DDL's groups atomically. The sink reads no catalog, so it runs
-        // while `write` holds the catalog mutably.
-        let written = write(self.cat_mut(), &mut |family, batch| {
+        // groups a DDL's groups atomically.
+        let written = write(&mut self.cat_mut(), &mut |family, batch| {
             scope.write(&SalGroup::ddl_sync(family, batch), true)?;
             gnitz_debug!("ddl group tid={} rows={}", family.id(), batch.len());
             Ok(())
@@ -180,37 +179,16 @@ impl MasterDispatcher {
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    /// Resolves with the first worker found dead, probing every `WORKER_WATCH`.
+    /// [`worker_death`] of this dispatcher's workers.
     pub(crate) async fn worker_death(&self) -> usize {
-        loop {
-            self.reactor.sleep(WORKER_WATCH).await;
-            if let Some(w) = self.check_workers() {
-                return w;
-            }
-        }
-    }
-
-    /// The first dead worker, reported on every probe: a reaped pid answers
-    /// ECHILD.
-    fn check_workers(&self) -> Option<usize> {
-        self.worker_pids.iter().position(|&pid| {
-            let mut status: i32 = 0;
-            pid > 0
-                && match retry_eintr(|| unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }) {
-                    Ok(0) => false, // still running
-                    Ok(_) => true,  // its zombie was ours to reap
-                    // ECHILD: reaped elsewhere, so equally dead. Any other errno is
-                    // unexpected and read as alive rather than as a crash.
-                    Err(e) => e.raw_os_error() == Some(libc::ECHILD),
-                }
-        })
+        worker_death(&self.reactor, &self.worker_pids).await
     }
 
     /// `SIGKILL` every worker, then reap each: a survivor parked for W2M ring
     /// space would never read a `Shutdown`.
     pub(crate) fn kill_workers(&self) {
-        for pid in self.live_pids() {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+        for pid in &self.worker_pids {
+            unsafe { libc::kill(pid.get(), libc::SIGKILL) };
         }
         self.reap_workers();
     }
@@ -226,38 +204,33 @@ impl MasterDispatcher {
         self.reap_workers();
     }
 
-    fn live_pids(&self) -> impl Iterator<Item = i32> + '_ {
-        self.worker_pids.iter().copied().filter(|&pid| pid > 0)
-    }
-
     /// Block until every worker has exited.
     fn reap_workers(&self) {
-        for pid in self.live_pids() {
+        for pid in &self.worker_pids {
             let mut status: i32 = 0;
-            let _ = retry_eintr(|| unsafe { libc::waitpid(pid, &mut status, 0) });
+            let _ = retry_eintr(|| unsafe { libc::waitpid(pid.get(), &mut status, 0) });
         }
     }
 
     /// Lay one push batch out as a SAL group inside `scope`, written to the
-    /// workers that own its rows, and answer the lease those workers ACK on.
-    /// A base table's rows go inside the zone; a stream's, which no restart
-    /// recovers, ride outside.
+    /// workers that own its rows, and answer the lease those workers ACK on and
+    /// whether the group rides inside the zone. A base table's rows do; a
+    /// stream's, which no restart recovers, ride outside.
     pub(crate) fn write_commit_group(
         &self,
         scope: &mut SalScope,
         target_id: u64,
         batch: &Batch,
-    ) -> Result<AckLease, WireFault> {
+    ) -> Result<(AckLease, bool), WireFault> {
         let cat = self.cat();
         let (rel, record) = cat
             .wire_target(target_id)
             .expect("a push target is registered under the catalog lock");
         let recoverable = rel.kind().is_base_table();
         with_routed(batch, rel.placement(), self.num_workers(), |data| {
-            // Leased before the group is laid out, so no ACK arrives unrouted.
             let lease = self.reactor.lease_acks(data.holders());
             scope.write(&SalGroup::push(target_id, record, data, lease.targets()), recoverable)?;
-            Ok(lease)
+            Ok((lease, recoverable))
         })
     }
 
@@ -276,7 +249,7 @@ impl MasterDispatcher {
     /// durable copy, so resetting on a swallowed failure destroys it. The caller
     /// leaves the SAL intact and aborts or fails the boot.
     fn checkpoint_post_ack(&self, excl: &mut SalExcl<'_>) -> Result<(), WireFault> {
-        let cat = self.cat_mut();
+        let mut cat = self.cat_mut();
         cat.flush_all_system_tables()?;
         // Every worker ACKed the FLUSH, so each has applied every DdlSync written
         // before it; the flush above made every applied DROP durable.
@@ -305,10 +278,39 @@ impl MasterDispatcher {
     /// that replayed a push advanced pre-fork. The workers published their base
     /// stores during recovery, and no push is admitted yet.
     pub(crate) async fn boot_checkpoint(&self) -> Result<(), WireFault> {
-        let cat = self.cat_mut();
-        cat.record_topology(cat.registry.slot().of)?;
+        {
+            let mut cat = self.cat_mut();
+            let width = cat.registry.slot().of;
+            cat.record_topology(width)?;
+        }
         self.checkpoint_ephemeral().await
     }
+}
+
+/// Resolves with the first worker of `pids` found dead, probing every
+/// `WORKER_WATCH`.
+pub(crate) async fn worker_death(reactor: &Reactor, pids: &[NonZero<libc::pid_t>]) -> usize {
+    loop {
+        reactor.sleep(WORKER_WATCH).await;
+        if let Some(w) = check_workers(pids) {
+            return w;
+        }
+    }
+}
+
+/// The first dead worker of `pids`, reported on every probe: a reaped pid
+/// answers ECHILD.
+fn check_workers(pids: &[NonZero<libc::pid_t>]) -> Option<usize> {
+    pids.iter().position(|pid| {
+        let mut status: i32 = 0;
+        match retry_eintr(|| unsafe { libc::waitpid(pid.get(), &mut status, libc::WNOHANG) }) {
+            Ok(0) => false, // still running
+            Ok(_) => true,  // its zombie was ours to reap
+            // ECHILD: reaped elsewhere, so equally dead. Any other errno is
+            // unexpected and read as alive rather than as a crash.
+            Err(e) => e.raw_os_error() == Some(libc::ECHILD),
+        }
+    })
 }
 
 #[cfg(test)]

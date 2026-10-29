@@ -106,9 +106,11 @@ impl<'a> WireMsg<'a> {
         let base = out.len();
         let total = base + PFX + sz;
         out.reserve(PFX + sz);
-        // SAFETY: `encode` writes every byte of the payload (it asserts so) — a
-        // block's header and regions pack end to end — and the length prefix is
-        // written immediately below.
+        // SAFETY: `encode` writes every payload byte. The control header's fields
+        // tile it, the blob and schema record follow it end to end, and a data
+        // block is its header, then its regions and heap end to end, each row of
+        // which its writer fills whole (gnitz-zset's `DirectWriter`). The length
+        // prefix is written immediately below.
         #[allow(clippy::uninit_vec)]
         unsafe {
             out.set_len(total);

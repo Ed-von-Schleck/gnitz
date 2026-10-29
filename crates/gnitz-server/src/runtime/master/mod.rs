@@ -14,7 +14,8 @@ mod dispatch;
 #[path = "tests/fixtures.rs"]
 pub(crate) mod fixtures;
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::num::NonZero;
 
 use rustc_hash::FxHashMap;
 
@@ -25,19 +26,19 @@ use crate::runtime::sal::{GroupData, Read, SalExcl, SalGroup, SalWriter};
 use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;
 
-pub(crate) use dispatch::WORKER_WATCH;
+pub(crate) use dispatch::{worker_death, WORKER_WATCH};
 
 // ---------------------------------------------------------------------------
 // MasterDispatcher
 // ---------------------------------------------------------------------------
 
 pub struct MasterDispatcher {
-    worker_pids: Vec<i32>,
+    /// One per worker, or none for a dispatcher with no processes behind it.
+    worker_pids: Vec<NonZero<libc::pid_t>>,
     sal: SalWriter,
     /// The master's one event loop, which reads every worker's replies.
     reactor: Reactor,
-    /// Dereferenced by [`MasterDispatcher::cat`] and [`MasterDispatcher::cat_mut`] alone.
-    catalog: *mut CatalogEngine,
+    catalog: RefCell<CatalogEngine>,
     /// The tick rounds the dispatcher's tick groups allocated.
     rounds: TickRounds,
 }
@@ -55,17 +56,21 @@ struct TickRounds {
 }
 
 impl MasterDispatcher {
-    pub(crate) fn new(worker_pids: Vec<i32>, catalog: *mut CatalogEngine, sal: SalWriter, reactor: Reactor) -> Self {
-        debug_assert_eq!(
-            sal.num_workers(),
-            worker_pids.len(),
+    pub(crate) fn new(
+        worker_pids: Vec<NonZero<libc::pid_t>>,
+        catalog: CatalogEngine,
+        sal: SalWriter,
+        reactor: Reactor,
+    ) -> Self {
+        assert!(
+            worker_pids.is_empty() || worker_pids.len() == sal.num_workers(),
             "the SAL is written at the worker count"
         );
         MasterDispatcher {
             worker_pids,
             sal,
             reactor,
-            catalog,
+            catalog: RefCell::new(catalog),
             rounds: TickRounds {
                 round: Cell::new(1),
                 last_delta_round: RefCell::new(FxHashMap::default()),
@@ -73,16 +78,14 @@ impl MasterDispatcher {
         }
     }
 
-    /// The catalog, which outlives the dispatcher.
-    pub(crate) fn cat(&self) -> &CatalogEngine {
-        unsafe { &*self.catalog }
+    /// The catalog.
+    pub(crate) fn cat(&self) -> Ref<'_, CatalogEngine> {
+        self.catalog.borrow()
     }
 
-    /// The catalog, exclusively: no reference from this or [`Self::cat`] may be
-    /// alive across a call.
-    #[allow(clippy::mut_from_ref)]
-    pub(crate) fn cat_mut(&self) -> &mut CatalogEngine {
-        unsafe { &mut *self.catalog }
+    /// The catalog, exclusively.
+    pub(crate) fn cat_mut(&self) -> RefMut<'_, CatalogEngine> {
+        self.catalog.borrow_mut()
     }
 
     /// The SAL writer: its queries, and the [`SalExcl`] every write goes through.
@@ -99,14 +102,13 @@ impl MasterDispatcher {
         self.sal.num_workers()
     }
 
-    /// Drop a dropped relation's last delta round. Ids are never reused, so
-    /// nothing else would ever reclaim it.
+    /// Drop a dropped relation's last delta round.
     pub(crate) fn forget_relation(&self, id: u64) {
         self.rounds.last_delta_round.borrow_mut().remove(&id);
     }
 
-    /// The scan-shaped requests `build` writes under one SAL hold, one lease
-    /// each; each worker replies in request order.
+    /// The scan-shaped requests `build` writes as one
+    /// [`Cut`](crate::runtime::sal::Cut), one lease each.
     pub(crate) async fn scan_cut(
         &self,
         build: impl FnOnce(&mut ScanCut<'_>) -> Result<(), WireFault>,
@@ -133,8 +135,8 @@ impl MasterDispatcher {
     }
 }
 
-/// Scan-shaped requests written under one SAL hold: one cut, whose replies each
-/// worker sends in request order.
+/// Scan-shaped requests written under one SAL hold: one
+/// [`Cut`](crate::runtime::sal::Cut).
 pub(crate) struct ScanCut<'d> {
     disp: &'d MasterDispatcher,
     excl: SalExcl<'d>,
@@ -142,6 +144,11 @@ pub(crate) struct ScanCut<'d> {
 }
 
 impl<'d> ScanCut<'d> {
+    /// The SAL hold the cut's groups are written under.
+    pub(crate) fn sal(&self) -> &SalExcl<'d> {
+        &self.excl
+    }
+
     /// `read` written to the workers its target and bound reach, each sent its
     /// own key set when the bound splits one, under a reply id leased for them.
     pub(crate) fn read(&mut self, read: Read<'_>) -> Result<(), WireFault> {

@@ -287,20 +287,22 @@ pub(crate) trait Groups: Copy {
     }
 }
 
-/// The rows of a fold's `i`-th range in one group: group `i` under
-/// [`Self::EACH`], group 0 under [`Self::FIRST`].
+/// The rows of a fold's `i`-th range in one group.
 #[derive(Clone, Copy)]
-pub(crate) struct RangeGroups(usize);
-
-impl RangeGroups {
-    pub(crate) const EACH: Self = RangeGroups(usize::MAX);
-    pub(crate) const FIRST: Self = RangeGroups(0);
+pub(crate) enum RangeGroups {
+    /// Group `i`.
+    Each,
+    /// Group 0.
+    First,
 }
 
 impl Groups for RangeGroups {
     #[inline(always)]
     fn of(self, range: usize, _: usize) -> usize {
-        range & self.0
+        match self {
+            RangeGroups::Each => range,
+            RangeGroups::First => 0,
+        }
     }
 }
 

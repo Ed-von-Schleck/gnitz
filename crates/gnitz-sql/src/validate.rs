@@ -61,21 +61,13 @@ impl HonoredClauses {
     }
 }
 
-/// Reject any `Select` clause the surface behind it does not consume. Each reads a
-/// hand-picked subset of the parsed `Select`; without this guard every unread
-/// clause (PREWHERE, TOP, QUALIFY, …) is silently dropped, turning the query the
-/// caller wrote into a different one that runs and returns rows — a silent wrong
-/// result. `honored` names the clauses *this* shape consumes; `context` names the
-/// surface for the message.
+/// Reject any `Select` clause the surface behind it does not consume. `honored`
+/// names the clauses *this* shape consumes; `context` names the surface for the
+/// message.
 ///
 /// `DISTINCT` is gated by [`HonoredClauses::distinct`]: `DISTINCT ON` is always
 /// rejected (non-deterministic without an ORDER BY views forbid), while plain
 /// `DISTINCT` is rejected unless the caller honors it.
-///
-/// The match is an exhaustive destructure with no `..`: when a future
-/// `sqlparser` bump adds a `Select` field, this stops compiling until the new
-/// field is classified honored-or-rejected — converting a silent-drop-on-upgrade
-/// into a build break.
 pub(crate) fn reject_unhonored_select_clauses(
     select: &sqlparser::ast::Select,
     honored: HonoredClauses,
@@ -83,10 +75,9 @@ pub(crate) fn reject_unhonored_select_clauses(
 ) -> Result<(), GnitzSqlError> {
     use sqlparser::ast::Distinct;
     let sqlparser::ast::Select {
-        // Read by every view builder.
+        // Read by every surface; a top-level WHERE always binds.
         from: _,
         projection: _,
-        // Read by every surface — a top-level WHERE always binds.
         selection: _,
         // Conditionally honored (see `HonoredClauses`); `distinct` handled below.
         distinct,
@@ -163,15 +154,9 @@ pub(crate) enum QueryEnvelope {
     WithAndTail,
 }
 
-/// Reject every `Query`-envelope clause a narrowing site does not consume. `GenericDialect`
-/// parses a tail of envelope clauses (FETCH, FOR UPDATE/XML, SETTINGS, FORMAT, …) the planner has
-/// no operator for; without this guard each is silently dropped — `WITH` and `FETCH` are wrong
-/// results, the rest must not be silently accepted. `honored` names what *this* site consumes;
+/// Reject every `Query`-envelope clause a narrowing site does not consume. Every
+/// narrowing site funnels through it. `honored` names what *this* site consumes;
 /// `context` names the surface for the message.
-///
-/// This is the crate's single exhaustive `Query` destructure (no `..`): a future `sqlparser`
-/// field stops the build here until it is classified, converting a silent-drop-on-upgrade into a
-/// compile error. Every narrowing site funnels through it.
 pub(crate) fn reject_unhonored_query_clauses(
     query: &sqlparser::ast::Query,
     honored: QueryEnvelope,

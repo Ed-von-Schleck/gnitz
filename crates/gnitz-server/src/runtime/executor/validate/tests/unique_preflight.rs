@@ -11,7 +11,7 @@ fn merge(partitions: &[&[u64]]) -> Option<UniqueFilter> {
     let frame_schema = pk_only_schema(&[TypeCode::U64]);
     let (reactor, mut writers) = reactor_with_rings(partitions.len());
     let lease = reactor.lease_train(WorkerSet::ALL, "KeySpans");
-    let req = lease.targets().request_id;
+    let req = lease.id();
     for (writer, keys) in writers.iter_mut().zip(partitions) {
         let mut spans = Batch::empty_with_schema(&frame_schema);
         for pair in keys.chunks(2) {

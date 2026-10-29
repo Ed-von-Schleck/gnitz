@@ -89,9 +89,8 @@ impl CalendarOp {
 }
 
 /// `DATE → TIMESTAMP`: a day count as microseconds, `(0, true)` when the
-/// product leaves `i64`. The one calendar op that can NULL, so the one the VM
-/// runs through the fail-mask kernel rather than through [`eval`].
-pub(crate) fn days_to_micros(days: i64) -> (i64, bool) {
+/// product leaves `i64`.
+fn days_to_micros(days: i64) -> (i64, bool) {
     match days.checked_mul(MICROS_PER_DAY) {
         Some(v) => (v, false),
         None => (0, true),
@@ -99,12 +98,11 @@ pub(crate) fn days_to_micros(days: i64) -> (i64, bool) {
 }
 
 /// Apply `op` to `v`: microseconds when `micros`, otherwise a DATE's day count
-/// read at its 32-bit storage width. Total: a truncation whose unit starts
-/// before `i64::MIN` saturates there. `ToMicros`'s arm returns
-/// [`days_to_micros`]'s value without its overflow flag; the VM runs that op
-/// through the fail-mask kernel instead.
+/// read at its 32-bit storage width. The flag is set when the result is NULL,
+/// which only an op whose [`CalendarOp::may_null`] holds can raise; a
+/// truncation whose unit starts before `i64::MIN` saturates there.
 #[inline(always)]
-pub(crate) fn eval(op: CalendarOp, v: i64, micros: bool) -> i64 {
+pub(crate) fn eval(op: CalendarOp, v: i64, micros: bool) -> (i64, bool) {
     use CalendarOp as C;
     let (days, tod) = if micros {
         (v.div_euclid(MICROS_PER_DAY), v.rem_euclid(MICROS_PER_DAY))
@@ -113,7 +111,7 @@ pub(crate) fn eval(op: CalendarOp, v: i64, micros: bool) -> i64 {
     };
     let in_days = |d: i64| if micros { d.saturating_mul(MICROS_PER_DAY) } else { d };
     let ymd = || civil_from_days(days);
-    match op {
+    let val = match op {
         C::Year => ymd().0,
         C::Quarter => (ymd().1 as i64 - 1) / 3 + 1,
         C::Month => ymd().1 as i64,
@@ -151,9 +149,10 @@ pub(crate) fn eval(op: CalendarOp, v: i64, micros: bool) -> i64 {
         C::TruncHour => v.saturating_sub(tod % MICROS_PER_HOUR),
         C::TruncMinute => v.saturating_sub(tod % MICROS_PER_MIN),
         C::TruncSecond => v.saturating_sub(tod % MICROS_PER_SEC),
-        C::ToMicros => days_to_micros(v).0,
+        C::ToMicros => return days_to_micros(v),
         C::ToDays => days,
-    }
+    };
+    (val, false)
 }
 
 #[cfg(test)]

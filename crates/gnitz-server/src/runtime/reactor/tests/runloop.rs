@@ -9,7 +9,8 @@ use super::super::uring::SQ_ENTRIES;
 use super::*;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
-use crate::runtime::w2m::BOOT_READY_REQUEST_ID;
+use crate::runtime::w2m::fixtures::id;
+use crate::runtime::w2m::RequestId;
 
 /// A panic during poll must propagate rather than be swallowed: it unwinds
 /// through the pass and, in real use, up to `block_on`'s caller.
@@ -229,7 +230,7 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
         let (r, mut writers) = reactor_with_rings(1);
         let mut writer = writers.pop().expect("one ring");
         let lease = r.lease_acks(WorkerSet::ALL);
-        let id = lease.targets().request_id;
+        let id = lease.id();
         let done = Rc::new(Cell::new(false));
         let d = Rc::clone(&done);
         r.spawn(async move {
@@ -263,7 +264,7 @@ fn a_publish_wakes_the_sleep_and_takes_the_arm() {
             while !writer.master_parked() {
                 std::thread::yield_now();
             }
-            writer.send_ack(BOOT_READY_REQUEST_ID); // no lease holds it
+            writer.send_ack(RequestId::BOOT_READY); // no lease holds it
             writer
         });
         r.tick(true);
@@ -284,22 +285,21 @@ fn w2m_publishes_from_another_process_wake_the_parked_reactor() {
     const N_MESSAGES: u32 = 500;
     const TIMEOUT: Duration = Duration::from_secs(30);
 
-    let (r, mut writers) = reactor_with_rings(2);
+    let (r, ready, mut writers) = booting_reactor(2);
     let child = || {
         let deadline = Instant::now() + TIMEOUT;
         while !writers[1].master_parked() {
             assert!(Instant::now() < deadline, "the reactor never parked");
             std::thread::yield_now();
         }
-        writers[1].send_ack(BOOT_READY_REQUEST_ID);
-        for req_id in (BOOT_READY_REQUEST_ID + 1..=N_MESSAGES).chain([BOOT_READY_REQUEST_ID]) {
-            writers[0].send_ack(req_id);
+        writers[1].send_ack(RequestId::BOOT_READY);
+        for n in (2..=N_MESSAGES).chain([1]) {
+            writers[0].send_ack(id(n));
         }
     };
     let pid = unsafe { fork_child(child) };
 
-    let lease = r.lease_ready();
-    if let Either::B(()) = r.block_on(select2(lease.acks(), r.sleep(TIMEOUT))) {
+    if let Either::B(()) = r.block_on(select2(ready.all_acked(), r.sleep(TIMEOUT))) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!("reactor stalled after {TIMEOUT:?}: a lost wake");
     }

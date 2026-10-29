@@ -25,13 +25,22 @@ fn oneshot_send_to_dropped_receiver_is_a_noop() {
     assert!(dropped.get(), "the undeliverable value must be dropped, not leaked");
 }
 
+/// A write guard is of the lock it was taken on, and of no other lock of its tag.
+#[test]
+fn a_write_guard_is_of_its_own_lock() {
+    let (lock, other): (AsyncRwLock, AsyncRwLock) = Default::default();
+    let guard = try_poll_once(lock.write()).expect("uncontended");
+    assert!(guard.is_of(&lock) && guard.is_of(&lock.clone()));
+    assert!(!guard.is_of(&other));
+}
+
 /// Every reader admitted while no writer holds or waits enters at once.
 #[test]
 fn async_rwlock_multiple_readers() {
     let r = make_reactor();
     let active = Rc::new(Cell::new(0u32));
     let max = Rc::new(Cell::new(0u32));
-    let lock = AsyncRwLock::default();
+    let lock: AsyncRwLock = AsyncRwLock::default();
     for _ in 0..4 {
         let l = lock.clone();
         let a = Rc::clone(&active);
@@ -53,7 +62,7 @@ fn async_rwlock_multiple_readers() {
 #[test]
 fn async_rwlock_new_readers_blocked_by_waiting_writer() {
     let r = make_reactor();
-    let lock = AsyncRwLock::default();
+    let lock: AsyncRwLock = AsyncRwLock::default();
     let order: Rc<RefCell<Vec<&'static str>>> = Rc::default();
 
     // Task A: holds read lock, yields once.
@@ -92,7 +101,7 @@ fn async_rwlock_new_readers_blocked_by_waiting_writer() {
 #[test]
 fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
     let r = make_reactor();
-    let lock = AsyncRwLock::default();
+    let lock: AsyncRwLock = AsyncRwLock::default();
     let done = Rc::new(Cell::new(false));
     let (release_tx, release_rx) = oneshot::channel::<()>();
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -147,7 +156,7 @@ fn async_rwlock_every_task_mix_excludes_finishes_and_leaves_the_lock_idle() {
 
     for len in 2..=MAX_TASKS {
         for mix in 0..SHAPES.pow(len) {
-            let lock = AsyncRwLock::default();
+            let lock: AsyncRwLock = AsyncRwLock::default();
             let done = Rc::new(Cell::new(0usize));
             // (readers, writers) inside the lock.
             let held = Rc::new(Cell::new((0u32, 0u32)));
@@ -213,7 +222,7 @@ fn async_rwlock_every_task_mix_excludes_finishes_and_leaves_the_lock_idle() {
 fn async_rwlock_write_release_admits_one_writer() {
     const N: usize = 16;
     let r = make_reactor();
-    let lock = AsyncRwLock::default();
+    let lock: AsyncRwLock = AsyncRwLock::default();
     let polls = Rc::new(Cell::new(0usize));
 
     for _ in 0..N {
@@ -239,7 +248,7 @@ fn async_rwlock_write_release_admits_one_writer() {
 /// between the release and that writer's poll queues behind it.
 #[test]
 fn async_rwlock_a_fresh_writer_queues_behind_a_woken_one() {
-    let lock = AsyncRwLock::default();
+    let lock: AsyncRwLock = AsyncRwLock::default();
     let held = try_poll_once(lock.write()).expect("a free lock admits a writer");
     let mut queued = Box::pin(lock.write());
     assert!(try_poll_once(&mut queued).is_none(), "a held lock parks the writer");

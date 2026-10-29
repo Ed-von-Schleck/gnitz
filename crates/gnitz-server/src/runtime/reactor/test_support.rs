@@ -9,7 +9,7 @@ pub(super) use crate::runtime::sync::{oneshot, select2, Either};
 pub(super) use crate::runtime::test_support::{read_nonblocking, spawn_drain, try_poll_once, within};
 pub(super) use crate::runtime::w2m::fixtures::ring_slot;
 use crate::runtime::w2m::fixtures::test_rings;
-use crate::runtime::w2m::W2mWriter;
+use crate::runtime::w2m::{RequestId, W2mWriter};
 
 impl Limits {
     /// Every send carries `client_send_timeout`, so it is generous here: a drain
@@ -30,7 +30,7 @@ pub(crate) fn make_reactor() -> Reactor {
 
 /// [`make_reactor`] built with `limits`.
 pub(super) fn make_reactor_with(limits: Limits) -> Reactor {
-    Reactor::new(limits, test_rings(1, 64 * 1024).1).expect("reactor")
+    Reactor::new(limits, test_rings(1, 64 * 1024).1).expect("reactor").0
 }
 
 /// The drivers every reactor suite runs on. An inherent impl here rather than in
@@ -52,10 +52,31 @@ impl Reactor {
     }
 }
 
+impl AckLease {
+    /// The request id its workers ACK on.
+    pub(crate) fn id(&self) -> RequestId {
+        self.targets().reply.expect("a lease's group is answered")
+    }
+}
+
+impl TrainLease {
+    /// The request id its workers reply on.
+    pub(crate) fn id(&self) -> RequestId {
+        self.targets().reply.expect("a lease's group is answered")
+    }
+}
+
 /// A reactor over `n` fresh W2M rings, with the writer of each.
 pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
+    let (reactor, _ready, writers) = booting_reactor(n);
+    (reactor, writers)
+}
+
+/// [`reactor_with_rings`], with the lease the workers' ready ACKs answer.
+pub(crate) fn booting_reactor(n: usize) -> (Reactor, ReadyLease, Vec<W2mWriter>) {
     let (writers, receiver) = test_rings(n, 64 * 1024);
-    (Reactor::new(Limits::TEST, receiver).expect("reactor"), writers)
+    let (reactor, ready) = Reactor::new(Limits::TEST, receiver).expect("reactor");
+    (reactor, ready, writers)
 }
 
 /// A one-shot op the kernel completes at its submit.
@@ -104,9 +125,9 @@ pub(super) fn admitted(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
     (conn, partner)
 }
 
-/// An inbound queue with an unbounded budget of its own, past the handshake.
-pub(crate) fn admitted_recv_queue() -> RecvQueue {
-    let mut q = RecvQueue::new(conn::Budget::new(usize::MAX));
+/// A frame sink with an unbounded budget of its own, past the handshake.
+pub(crate) fn admitted_frame_sink() -> FrameSink {
+    let mut q = FrameSink::new(conn::Budget::new(usize::MAX));
     q.admit_full_frames();
     q
 }

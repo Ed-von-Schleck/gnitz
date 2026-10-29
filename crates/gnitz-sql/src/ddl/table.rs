@@ -2,21 +2,19 @@
 //! and CREATE INDEX.
 
 use super::guard::{
-    fk_on_delete, reject_index_type_and_options, reject_unhonored_column_options, reject_unhonored_pk_fields,
-    reject_unhonored_unique_fields, ColumnOptionSite,
+    fk_on_delete, read_column, reject_index_type_and_options, reject_unhonored_pk_fields,
+    reject_unhonored_unique_fields, ColumnConstraint, ColumnDecl, ColumnOptionSite,
 };
 use super::options::parse_table_options;
 use crate::catalog::Catalog;
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use crate::names::{extract_index_name, extract_object_name};
 use crate::rules::{canonical_user_name, reject_duplicate_names, require_class, require_column, ClassWant};
-use crate::types::column_def;
 use gnitz_core::{FkTarget, GnitzClient, InlineUniqueIndex, RelName, Schema, TableDef};
 use gnitz_wire::{ColType, ColumnDef, FkAction, FkRef, PkColList, PkListRole};
-use sqlparser::ast::{
-    ColumnOption, Expr, ForeignKeyConstraint, IndexColumn, ObjectType, TableConstraint, WrappedCollection,
-};
-use std::collections::HashSet;
+use sqlparser::ast::{Expr, ForeignKeyConstraint, IndexColumn, ObjectType, TableConstraint, WrappedCollection};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashSet};
 
 /// The canonical catalog name of an unnamed index:
 /// `{schema}__{table}__idx_{col1}_{col2}…`.
@@ -197,7 +195,7 @@ fn resolve_fk_target(
 
     // Legal target iff the referenced column is the parent's lone PK or carries a
     // UNIQUE index of its own. A composite unique `(a, b)` does not make `a`
-    // unique, so the column list is matched exactly, as the engine's gate does.
+    // unique, so the column list is matched exactly.
     if pk_single != Some(ref_col_idx) {
         let unique = ref_rel
             .indexes
@@ -242,8 +240,7 @@ fn simple_ident_expr<'a>(e: &'a Expr, context: &str) -> Result<&'a str, GnitzSql
 /// column or a CREATE INDEX column), which gnitz requires to be a simple
 /// identifier. Any expression, operator class, or ordering qualifier is rejected
 /// — gnitz indexes are ordered ascending by key bytes and carry no per-column
-/// ordering. Shared by the CREATE INDEX loop and the table-level PK/UNIQUE loops,
-/// all of which see `Vec<IndexColumn>` since sqlparser 0.60.
+/// ordering. Shared by the CREATE INDEX loop and the table-level PK/UNIQUE loops.
 fn index_column_ident<'a>(c: &'a IndexColumn, context: &str) -> Result<&'a str, GnitzSqlError> {
     reject_if(
         c.operator_class.is_some(),
@@ -308,27 +305,23 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
 
     // The column defs and every site a column option declares.
     for (i, col) in create.columns.iter().enumerate() {
-        let (def, is_serial) = column_def(col)?;
+        let ColumnDecl { def, serial: is_serial, constraints } = read_column(col, ColumnOptionSite::CreateTable)?;
         cols.push(def);
         if is_serial {
             serial.push(i as u32);
         }
-        for opt in &col.options {
-            match &opt.option {
-                ColumnOption::PrimaryKey(_) => inline_pk.push(i as u32),
-                ColumnOption::ForeignKey(fk) => fk_sites.push(FkSite {
+        for constraint in constraints {
+            match constraint {
+                ColumnConstraint::PrimaryKey => inline_pk.push(i as u32),
+                ColumnConstraint::ForeignKey { fk, on_delete } => fk_sites.push(FkSite {
                     col_idx: i,
                     foreign_table: &fk.foreign_table,
                     referred_columns: &fk.referred_columns,
-                    on_delete: fk_on_delete(fk, "column definition")?,
+                    on_delete,
                 }),
-                ColumnOption::Unique(_) => push_unique(
-                    &mut unique,
-                    vec![i as u32],
-                    &[col.name.value.as_str()],
-                    opt.name.as_ref(),
-                )?,
-                _ => {}
+                ColumnConstraint::Unique(name) => {
+                    push_unique(&mut unique, vec![i as u32], &[col.name.value.as_str()], name)?
+                }
             }
         }
     }
@@ -534,12 +527,11 @@ pub(crate) async fn create_planned_table(client: &mut GnitzClient, plan: Planned
     Ok(())
 }
 
-/// Reject every `CREATE TABLE` clause the planner does not consume. Exhaustive
-/// destructure (no `..`): a future `sqlparser` field stops the build.
+/// Reject every `CREATE TABLE` clause the planner does not consume.
 fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<(), GnitzSqlError> {
     const CTX: &str = "CREATE TABLE";
     let sqlparser::ast::CreateTable {
-        // Consumed (column/constraint contents further guarded by the column-option guard and `collect_declarations`).
+        // Consumed; the columns and constraints are read by `collect_declarations`.
         name: _,
         columns: _,
         constraints: _,
@@ -617,10 +609,11 @@ fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::CreateTable) -
     Ok(())
 }
 
-/// `Err` unless `cluster` is exactly `pk`'s leading prefix, in PK order: the
-/// distribution key is a leading PK prefix so write-side routing is a byte-slice
-/// of the OPK region. `cols` names a column the PK does not hold.
-fn validate_dist_prefix(cols: &[ColumnDef], pk: &[u32], cluster: &[u32]) -> Result<(), GnitzSqlError> {
+/// The distribution prefix length `cluster` declares, or `Err` unless it is
+/// exactly `pk`'s leading prefix, in PK order: the distribution key is a leading
+/// PK prefix so write-side routing is a byte-slice of the OPK region. `cols`
+/// names a column the PK does not hold.
+fn dist_prefix_len(cols: &[ColumnDef], pk: &[u32], cluster: &[u32]) -> Result<u8, GnitzSqlError> {
     if cluster.is_empty() || cluster.len() > pk.len() {
         return Err(GnitzSqlError::Rejected(format!(
             "CLUSTER BY expects 1..={} leading PRIMARY KEY columns, got {}",
@@ -641,7 +634,7 @@ fn validate_dist_prefix(cols: &[ColumnDef], pk: &[u32], cluster: &[u32]) -> Resu
                 .into(),
         ));
     }
-    Ok(())
+    Ok(u8::try_from(cluster.len()).expect("a PRIMARY KEY prefix fits a u8"))
 }
 
 /// Plan a `CREATE TABLE` into the bundle its commit writes, its UNIQUE auto-names
@@ -671,11 +664,6 @@ pub(crate) fn plan_create_table(
     // Before any column list is resolved: a repeat would otherwise surface as an
     // ambiguous *reference*, when it is the definition that is wrong.
     reject_duplicate_names(create.columns.iter().map(|c| c.name.value.as_str()), "table definition")?;
-    // Before the column defs are built, so an unsupported column option errors as
-    // itself rather than as a downstream PK admission failure.
-    for col in &create.columns {
-        reject_unhonored_column_options(col, ColumnOptionSite::CreateTable)?;
-    }
 
     let declared = collect_declarations(create)?;
     if props.stream {
@@ -703,14 +691,14 @@ pub(crate) fn plan_create_table(
         })
         .collect::<Result<_, GnitzSqlError>>()?;
     sites.sort_by_key(|(ref_table, _)| *ref_table == table_name);
-    let mut fks: Vec<Option<FkTarget>> = vec![None; cols.len()];
+    let mut fks = BTreeMap::new();
     for (ref_table, site) in sites {
-        if fks[site.col_idx].is_some() {
+        let Entry::Vacant(slot) = fks.entry(site.col_idx) else {
             return Err(GnitzSqlError::Rejected(format!(
                 "column '{}' carries more than one FOREIGN KEY",
                 cols[site.col_idx].name
             )));
-        }
+        };
         // A self-reference resolves against the in-flight column list: the table
         // being created is not in the catalog yet.
         let (fk, parent_pk_type) = if ref_table == table_name {
@@ -718,7 +706,7 @@ pub(crate) fn plan_create_table(
         } else {
             resolve_fk_target(cat, site, &ref_table, cols[site.col_idx].ty)?
         };
-        fks[site.col_idx] = Some(fk);
+        slot.insert(fk);
         cols[site.col_idx].ty = parent_pk_type;
     }
 
@@ -756,7 +744,7 @@ pub(crate) fn plan_create_table(
 
     let unique = name_unique_indexes(unique, cols, pk_indices.len(), &table_name)?;
     // Every FK column carries an index of its own.
-    for (i, _) in fks.iter().enumerate().filter(|(_, fk)| fk.is_some()) {
+    for &i in fks.keys() {
         index_key(cols, &[i as u32], pk_indices.len(), "FOREIGN KEY")?;
     }
 
@@ -772,10 +760,7 @@ pub(crate) fn plan_create_table(
             let idx = require_column(cols, col_name).map_err(|e| e.in_clause("CLUSTER BY"))?;
             cluster_indices.push(idx as u32);
         }
-        validate_dist_prefix(cols, pk_indices, &cluster_indices)?;
-        // `validate_dist_prefix` bounded the prefix by the PK arity, so the `u8`
-        // is lossless.
-        let prefix_len = cluster_indices.len() as u8;
+        let prefix_len = dist_prefix_len(cols, pk_indices, &cluster_indices)?;
         props.distribution = props
             .distribution
             .cluster_by(prefix_len)
@@ -844,9 +829,7 @@ pub(super) enum IndexSite {
 }
 
 impl IndexSite {
-    /// How the site names itself in a rejection. Derived rather than passed
-    /// beside it: the two are 1:1, and a second parameter is a hole a caller can
-    /// spell the wrong way round.
+    /// How the site names itself in a rejection.
     fn context(self) -> &'static str {
         match self {
             IndexSite::CreateIndex { .. } => "CREATE INDEX",

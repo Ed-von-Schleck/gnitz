@@ -1,14 +1,15 @@
 use super::fixtures::{group_at, test_log};
 use super::{
     decode_sal_frame, epoch_word, group_header_size, prefix_atomic, stamp_digest, Apply, EpochGate, GroupData,
-    GroupHead, GroupTargets, Read, SalGroup, SalLog, SalMessageKind, SalReader, SalRequest, SalStep, SalWriter,
-    WorkerSet, ANCHOR_BYTES, CHECKPOINT_RESERVE, FLAG_IN_REQUEST_ORDER, FLAG_SHARED, FLAG_ZONE_END, HDR_PREFIX,
+    GroupHead, GroupTargets, Inbound, Read, SalGroup, SalLog, SalMessageKind, SalReader, SalRequest, SalStep,
+    SalWriter, WorkerSet, ANCHOR_BYTES, CHECKPOINT_RESERVE, FLAG_JOINS_CUT, FLAG_SHARED, FLAG_ZONE_END, HDR_PREFIX,
     KNOWN_FLAGS, MAX_WORKERS, OFF_FLAGS, OFF_KIND, OFF_LSN, OFF_TARGETS, OFF_WIDTH, PREFIX_BYTES, PRESENT,
 };
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
-use crate::runtime::w2m::fixtures::test_rings;
+use crate::runtime::w2m::fixtures::{id, test_rings};
+use crate::runtime::w2m::RequestId;
 use crate::test_support::{
     make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, sweep_bit_flips, weighted_rows,
 };
@@ -61,6 +62,7 @@ fn a_per_worker_group_gives_each_addressed_worker_its_own_bytes() {
                 width.div_ceil(2),
                 "width {width}: one per addressed worker"
             );
+            assert_eq!(g.shared_payload(), None, "width {width}: no shared payload");
             for (w, buf) in bufs.iter().enumerate() {
                 let written = (!buf.is_empty()).then_some(buf.as_slice());
                 assert_eq!(g.slot(w as u32), written, "width {width}: worker {w}");
@@ -100,6 +102,7 @@ fn a_shared_group_gives_every_addressed_worker_the_same_bytes() {
         let msg = group_at(log.log(), base);
         let payloads: Vec<_> = msg.payloads().collect();
         assert_eq!(payloads.len(), 1, "one directory entry");
+        assert_eq!(msg.shared_payload(), Some(payloads[0]));
         assert_eq!(msg.head.width(), 4);
         for (w, addressed) in addressed.into_iter().enumerate() {
             assert_eq!(msg.slot(w as u32), addressed.then_some(payloads[0]), "worker {w}");
@@ -293,7 +296,6 @@ fn a_committed_zoned_push_marks_the_writer_as_holding_pushes() {
 fn zone_lsns_rise_with_the_log_and_the_watermark_follows_the_commits() {
     let log = test_log(1 << 20, 1, 1);
     let mut excl = log.excl();
-    excl.boot_rewind(1);
     let boot = log.watermark();
 
     let empty = excl.begin("test");
@@ -376,7 +378,7 @@ fn sal_cross_process_checkpoint() {
                 panic!()
             };
             writer.send_msg(
-                0,
+                id(1),
                 &WireMsg {
                     arg0: control.hdr.arg0,
                     ..Default::default()
@@ -422,7 +424,7 @@ fn a_group_is_read_by_the_workers_it_addresses_on_one_id() {
     let group = SalGroup {
         targets: GroupTargets {
             set: WorkerSet::one(1).with(3),
-            request_id: 40,
+            reply: Some(id(40)),
         },
         ..SalGroup::new(scan(0, &[]))
     };
@@ -434,7 +436,7 @@ fn a_group_is_read_by_the_workers_it_addresses_on_one_id() {
         let mut read = std::iter::from_fn(|| {
             reader
                 .next()
-                .map(|(m, _)| (m.head.request_id, m.head.in_request_order()))
+                .map(|(m, _)| (RequestId::to_wire(m.head.reply), m.head.joins_cut()))
         });
         if w == 1 || w == 3 {
             assert_eq!(
@@ -453,8 +455,8 @@ fn a_group_is_read_by_the_workers_it_addresses_on_one_id() {
 #[test]
 fn every_worker_numbers_a_cut_alike() {
     let log = test_log(1 << 20, 2, 1);
-    let member = |set, request_id| SalGroup {
-        targets: GroupTargets { set, request_id },
+    let member = |set, n| SalGroup {
+        targets: GroupTargets { set, reply: Some(id(n)) },
         ..SalGroup::new(scan(0, &[]))
     };
     // One cut whose first member addresses worker 0 alone, then a cut of one.
@@ -467,7 +469,12 @@ fn every_worker_numbers_a_cut_alike() {
 
     let cuts = |w| {
         let mut reader = SalReader::new(log.log(), w, 1);
-        std::iter::from_fn(|| reader.next().map(|(m, _)| (m.head.request_id, reader.cut))).collect::<Vec<_>>()
+        std::iter::from_fn(|| {
+            reader
+                .next()
+                .map(|(m, _)| (RequestId::to_wire(m.head.reply), reader.cut.0))
+        })
+        .collect::<Vec<_>>()
     };
     assert_eq!(cuts(0), [(1, 1), (2, 1), (3, 1), (4, 2)]);
     assert_eq!(cuts(1), [(2, 1), (3, 1), (4, 2)]);
@@ -480,7 +487,7 @@ fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
     let log = test_log(1 << 20, 4, 1);
     let seqs = || (0..4).map(|w| log.parks().park(w).value()).collect::<Vec<_>>();
     let leased = |set| SalGroup {
-        targets: GroupTargets { set, request_id: 1 },
+        targets: GroupTargets { set, reply: Some(id(1)) },
         ..SalGroup::new(scan(0, &[]))
     };
 
@@ -638,24 +645,24 @@ fn every_header_field_round_trips() {
     let log = test_log(1 << 20, 5, u32::MAX);
     let first = log.write(1, 0, SalMessageKind::ScanSpec, &[&[0u8; 8]]);
     let targets = WorkerSet::one(0).with(2).with(4);
-    let head = |flags, request_id| GroupHead {
+    let head = |flags, reply| GroupHead {
         lsn: 0x0102_0304_0506_0708,
         kind: SalMessageKind::Backfill,
         flags,
         width: 5,
-        request_id,
+        reply,
         target_id: 0xABCD_1234,
         targets,
     };
     let per_worker = log
         .write_slots(
-            head(FLAG_ZONE_END | FLAG_IN_REQUEST_ORDER, 0x0A0B_0C0D),
+            head(FLAG_ZONE_END | FLAG_JOINS_CUT, Some(id(0x0A0B_0C0D))),
             &[8, 0, 24],
             |b| b.fill(0),
         )
         .expect("group fits");
     let shared = log
-        .write_slots(head(FLAG_SHARED, 0), &[40], |b| b.fill(0))
+        .write_slots(head(FLAG_SHARED, None), &[40], |b| b.fill(0))
         .expect("group fits");
     log.publish_range(per_worker, log.cursor());
     assert!(first < per_worker && per_worker < shared);
@@ -663,8 +670,8 @@ fn every_header_field_round_trips() {
     let msg = group_at(log.log(), per_worker);
     assert_eq!(msg.head.lsn, 0x0102_0304_0506_0708);
     assert_eq!(msg.head.kind, SalMessageKind::Backfill);
-    assert!(msg.head.zone_end() && msg.head.in_request_order() && !msg.head.shared());
-    assert_eq!(msg.head.request_id, 0x0A0B_0C0D);
+    assert!(msg.head.zone_end() && msg.head.joins_cut() && !msg.head.shared());
+    assert_eq!(msg.head.reply, Some(id(0x0A0B_0C0D)));
     assert_eq!(msg.head.target_id, 0xABCD_1234);
     assert_eq!((msg.base, msg.end), (per_worker, shared));
     assert_eq!((msg.head.width(), msg.head.targets), (5, targets));
@@ -683,11 +690,8 @@ fn every_header_field_round_trips() {
     );
 
     let msg = group_at(log.log(), shared);
-    assert!(msg.head.shared() && !msg.head.zone_end() && !msg.head.in_request_order());
-    assert_eq!(
-        (msg.head.width(), msg.head.targets, msg.head.request_id),
-        (5, targets, 0)
-    );
+    assert!(msg.head.shared() && !msg.head.zone_end() && !msg.head.joins_cut());
+    assert_eq!((msg.head.width(), msg.head.targets, msg.head.reply), (5, targets, None));
     assert_eq!(msg.payloads().map(<[u8]>::len).collect::<Vec<_>>(), vec![40]);
     assert!(
         matches!(log.log().read_at(shared, EpochGate::Live(u32::MAX)), SalStep::Group(_)),
@@ -723,7 +727,7 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
 
     restamp_header(&mut log, |hdr| {
         hdr[OFF_KIND] = SalMessageKind::ScanSpec.as_wire();
-        hdr[OFF_FLAGS] = FLAG_ZONE_END | FLAG_IN_REQUEST_ORDER;
+        hdr[OFF_FLAGS] = FLAG_ZONE_END | FLAG_JOINS_CUT;
     });
     assert!(group_at(view, 0).head.zone_end(), "both known flags verify");
 
@@ -819,6 +823,49 @@ fn the_live_path_aborts_on_a_damaged_header_internal() {
     let mut reader = SalReader::new(log.log(), 0, 1);
     let _ = reader.next();
     unreachable!("a damaged header on the live path must fail-stop, not park");
+}
+
+/// A read nobody would answer is refused at decode: the worker fail-stops
+/// rather than replying on no id.
+#[test]
+fn a_read_group_without_a_request_id_aborts() {
+    let name = "a_read_group_without_a_request_id_aborts_internal";
+    let out = crate::test_support::run_test_in_child(module_path!(), name, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(134),
+        "{name} must fail-stop (exit 134)\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("a read group carries no request id"),
+        "{name} aborted for the wrong reason\nstderr:\n{stderr}"
+    );
+}
+
+/// Runs only in the re-exec'd abort child.
+#[test]
+fn a_read_group_without_a_request_id_aborts_internal() {
+    if !crate::test_support::in_child_test() {
+        return;
+    }
+    let log = test_log(1 << 20, 1, 1);
+    let answered = SalGroup {
+        targets: GroupTargets { set: WorkerSet::ALL, reply: Some(id(1)) },
+        ..SalGroup::new(scan(0, &[]))
+    };
+    log.excl().write(&answered).expect("group fits");
+    log.excl().write(&SalGroup::new(scan(0, &[]))).expect("group fits");
+    let mut reader = SalReader::new(log.log(), 0, 1);
+    assert!(
+        matches!(
+            reader.next_request(|_, _| None),
+            Some(Inbound { what: SalRequest::Read(_), .. })
+        ),
+        "an answered read decodes"
+    );
+    let _ = reader.next_request(|_, _| None);
+    unreachable!("a read nobody answers must fail-stop");
 }
 
 // ---------------------------------------------------------------------------

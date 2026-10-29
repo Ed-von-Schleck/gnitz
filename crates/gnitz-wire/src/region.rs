@@ -158,6 +158,10 @@ pub fn null_word_at(word: u64, at: usize) -> u64 {
 ///
 /// All lifetimes are tied to `&self`, NOT decoupled — a client adapter owns the
 /// buffers it materializes and can only lend them for `&self`.
+///
+/// Every implementor marks every method `#[inline(always)]`: the per-row
+/// callers are generic code instantiated in gnitz-zset, which builds at
+/// opt-level 0 in dev, where a plain `#[inline]` stays a call.
 pub trait RowSource {
     /// The row's packed PK-region bytes (`pk_stride` wide), **order-preserving
     /// at-rest (OPK)** at every source, a client `ZSetBatch` included. That is
@@ -178,8 +182,7 @@ pub trait RowSource {
     /// Rows in this source. The bound every whole-source walk reads — the
     /// evaluator's `RowFilter::ranges`, the engine's N-way merge
     /// — so that a caller can never drive a view past its own end with a count it
-    /// carried alongside. `#[inline(always)]` on every implementor: the per-row
-    /// and per-morsel callers live in gnitz-zset, at opt-level 0.
+    /// carried alongside.
     fn row_count(&self) -> usize;
 }
 

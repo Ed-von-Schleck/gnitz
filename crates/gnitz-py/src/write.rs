@@ -57,10 +57,7 @@ pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyR
     Ok(pk_col)
 }
 
-/// Stores batch data in Rust Vecs with a cached Schema. `append` / `extend`
-/// handle all type extraction, null tracking, and PK handling in Rust, so
-/// `push()` reuses the cached schema and batch without any Python→Rust
-/// re-extraction.
+/// Rows being built for a push; `append`/`extend` encode each row as it is added.
 #[pyclass(name = "ZSetBatch", module = "gnitz")]
 pub struct PyZSetBatch {
     /// Shared with a push still on its way, which sends the rows as they were
@@ -84,8 +81,7 @@ impl PyZSetBatch {
     /// Run `body` against this batch's rows, unshared; on error, truncate every
     /// per-row vector back to the pre-call row count, so a half-written row
     /// never leaves the batch with mismatched column lengths. Wrap once per
-    /// surface — `append` its one row, `extend` its whole loop — and never
-    /// nested.
+    /// surface — `append` its one row, `extend` its whole loop.
     fn with_rollback<F>(&mut self, body: F) -> PyResult<()>
     where
         F: FnOnce(&mut ZSetBatch, &mut RowWriter) -> PyResult<()>,
@@ -285,9 +281,7 @@ impl RowWriter {
     ///
     /// The key is appended once every PK column has extracted, then each payload
     /// cell into its column, and the weight and null word close the row. Rolls
-    /// nothing back on error: each surface wraps its own call in
-    /// [`PyZSetBatch::with_rollback`], which cuts a half-written row off every
-    /// stream.
+    /// nothing back on error; its caller's [`PyZSetBatch::with_rollback`] does.
     fn write_row<'a, 'py>(
         &mut self,
         py: Python<'py>,

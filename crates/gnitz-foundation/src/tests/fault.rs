@@ -35,9 +35,15 @@ fn at_matches_only_the_exact_stage() {
 }
 
 #[test]
-fn count_reads_a_positive_number_or_nothing() {
+fn count_reads_a_positive_number_or_nothing_while_disarmed() {
     assert_eq!(seam(Some("50")).count(), Some(50));
-    for setting in [None, Some("0"), Some("x")] {
+    for setting in [None, Some("0"), Some("")] {
         assert_eq!(seam(setting).count(), None, "{setting:?}");
     }
+}
+
+#[test]
+#[should_panic(expected = "\"5ms\" is not a positive integer")]
+fn count_refuses_an_armed_setting_that_is_no_number() {
+    seam(Some("5ms")).count();
 }

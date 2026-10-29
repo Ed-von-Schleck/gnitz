@@ -173,7 +173,18 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
         ClientVerb::SnapshotPage => drop(attempt(root, anatomy, || {
             gnitz_wire::snapshot::PageRequest::decode(blob)
         })),
-        _ => {}
+        // Their blob is untyped bytes or empty.
+        ClientVerb::Push
+        | ClientVerb::PushTxn
+        | ClientVerb::DdlTxn
+        | ClientVerb::Resolve
+        | ClientVerb::AllocSerialRange
+        | ClientVerb::AllocIds
+        | ClientVerb::SnapshotOpen
+        | ClientVerb::SnapshotClose
+        | ClientVerb::Backup
+        | ClientVerb::DeltaPoll
+        | ClientVerb::ScanMulti => {}
     }
     let schema = match &ctrl.schema {
         Some(s) => attempt(root, anatomy, || Schema::from_block(&frame[s.clone()])).map(Arc::new),
@@ -190,8 +201,8 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
     if body.is_empty() {
         return;
     }
-    // A scan's and a poll's items carry a read spec in their blob; the other
-    // verbs' items are frames of their own.
+    // ScanMulti and DeltaPoll items nest a ReadSpec; every other multi-item
+    // verb's items are frames, as `txn_frame::item_shape` decides.
     match verb {
         ClientVerb::ScanMulti => {
             for s in attempt(root, anatomy, || txn_frame::decode_scan_multi(body)).unwrap_or_default() {

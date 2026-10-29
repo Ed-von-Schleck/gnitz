@@ -214,8 +214,10 @@ pub(in crate::query) fn mint_ground_rows(vm: &mut Vm, stores: &mut Stores<'_>) -
 }
 
 /// Run `seed`, taken, from `reg` and instruction `pc` to the program's end,
-/// integrating iff `tick`. No round stands past `pc`: `replay_entry` refuses a
-/// seed that reaches one, and the compiler puts none behind a global aggregate.
+/// integrating iff `tick`. A replay entry passes no round: `replay_entry` refuses
+/// a seed that reaches a stateful op, a round included. A ground-row mint enters
+/// at a reduce's output, which no round's seeds name, so a round behind it would
+/// be skipped; routing refuses any exchange behind a global aggregate.
 fn run_through(
     vm: &mut Vm,
     stores: &mut Stores<'_>,
@@ -335,8 +337,7 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
             // Never taken: the integrate of `hist` reads the register after the clamp.
             Op::WeightClamp { hist: ClampHistory::Own(hist), kind } => stream::op_weight_clamp(
                 Cow::Borrowed(&batches[in_reg.at()]),
-                &mut stores.open(Trace::Child(*hist)),
-                false,
+                stream::History::Before(&mut stores.open(Trace::Child(*hist))),
                 *kind,
             ),
 
@@ -345,7 +346,7 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
                 let schema = regs[in_reg.at()].schema;
                 let delta = operand(&mut batches[in_reg.at()], takes(in_reg));
                 let mut open = |_: &[u8], _: &[u8]| from_runs(runs.iter().cloned(), schema, runs.len());
-                stream::op_weight_clamp(delta, &mut open, true, *kind)
+                stream::op_weight_clamp(delta, stream::History::Through(&mut open), *kind)
             }
 
             Op::JoinDT { trace, plan } => {

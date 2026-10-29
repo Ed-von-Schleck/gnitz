@@ -1,13 +1,12 @@
 //! Server bootstrap: single entry point for server startup.
 //!
 //! `server_main()` opens the catalog, allocates shared IPC resources, forks workers,
-//! runs SAL recovery, and enters the executor event loop. It returns the
-//! master's exit code: 0 after a shutdown signal, 2 when a worker died while
-//! serving; a failed boot is an `Err`, which `main` exits 1 on.
+//! runs SAL recovery, and enters the executor event loop.
 //!
 //! **Recovery order is a crash guard**: every step is placed so a crash at any
 //! point rebuilds a view rather than silently resuming a stale one.
 
+use std::num::NonZero;
 use std::os::fd::AsRawFd;
 
 use crate::catalog::{CatalogEngine, SysFamily, UnreplayedCatalog};
@@ -16,16 +15,17 @@ use gnitz_foundation::fault::Seam;
 use crate::runtime::affinity;
 use crate::runtime::executor;
 use crate::runtime::listen;
-use crate::runtime::master::MasterDispatcher;
+use crate::runtime::master::{worker_death, MasterDispatcher};
 use crate::runtime::mesh::{self, Mesh};
 use crate::runtime::park::WorkerParks;
-use crate::runtime::reactor::{check_host, AckLease, Limits, Reactor};
+use crate::runtime::reactor::{check_host, Limits, Reactor};
 use crate::runtime::sal::{CommittedTail, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
 use crate::runtime::signals;
 use crate::runtime::sync::{select2, Either};
-use crate::runtime::tls::{TlsArgs, TlsListener};
-use crate::runtime::w2m::{self, W2mWriter, BOOT_READY_REQUEST_ID};
+use crate::runtime::tls::{ResolvedTls, TlsListener};
+use crate::runtime::w2m::{self, RequestId, W2mWriter};
 use crate::runtime::worker::WorkerProcess;
+use crate::runtime::ServerExit;
 use gnitz_store::relation::{Residency, StoreConfig};
 use gnitz_zset::algebra::Slot;
 
@@ -50,10 +50,9 @@ fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Re
 
     let mut replayed: u32 = 0;
     for (msg, family) in tail.groups().filter_map(mine) {
-        // A system family's group holds its batch as one payload.
-        let Some(data) = msg.payloads().next() else {
+        let Some(data) = msg.shared_payload() else {
             return Err(format!(
-                "SAL replay: DdlSync group at offset={} (lsn={}) carries no payload",
+                "SAL replay: DdlSync group at offset={} (lsn={}) carries no shared payload",
                 msg.base, msg.head.lsn
             ));
         };
@@ -159,8 +158,7 @@ fn recover_from_sal(tail: CommittedTail, slot: Slot, catalog: &mut CatalogEngine
 }
 
 /// Worker-boot catalog recovery. On `Err` the worker exits without its ready
-/// ACK, which fails the boot before the master rewinds the SAL — otherwise the
-/// rewind destroys the replayed rows' only durable copy.
+/// ACK, which fails the boot.
 fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: CommittedTail, slot: Slot) -> Result<(), String> {
     // Before any other catalog work, and before the replay below, which
     // projects the tail into each index exactly once.
@@ -195,8 +193,6 @@ pub(crate) struct ServerArgs {
     pub(crate) socket_path: String,
     /// The worker count, or `None` (`--workers=auto`) to size it from the host.
     pub(crate) workers: Option<u32>,
-    /// `None` when no TLS listener was asked for.
-    pub(crate) tls: Option<TlsArgs>,
     /// The directory BACKUP writes into; `None` refuses BACKUP.
     pub(crate) backup_dir: Option<String>,
 }
@@ -254,8 +250,7 @@ fn run_worker_child(
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
     let sal_reader = SalReader::new(tail.log(), slot.rank, tail.live_epoch());
-    // The id the master leases before it collects.
-    ipc.w2m_writer.send_ack(BOOT_READY_REQUEST_ID);
+    ipc.w2m_writer.send_ack(RequestId::BOOT_READY);
     WorkerProcess::new(catalog, sal_reader, ipc.w2m_writer, ipc.mesh).run()
 }
 
@@ -289,10 +284,10 @@ fn fork_workers(
     tail: CommittedTail,
     workers: Vec<WorkerIpc>,
     pinning: Option<&affinity::Pinning>,
-) -> Result<Vec<i32>, String> {
+) -> Result<Vec<NonZero<libc::pid_t>>, String> {
     let master_pid = unsafe { libc::getpid() };
     let num_workers = workers.len() as u32;
-    let mut worker_pids: Vec<i32> = Vec::with_capacity(workers.len());
+    let mut worker_pids = Vec::with_capacity(workers.len());
     for (w, ipc) in workers.into_iter().enumerate() {
         match unsafe { libc::fork() } {
             -1 => return Err("fork failed".to_string()),
@@ -305,24 +300,15 @@ fn fork_workers(
                 ipc,
                 pinning,
             ),
-            pid => worker_pids.push(pid),
+            pid => worker_pids.push(NonZero::new(pid).expect("fork answers the parent a child's pid")),
         }
     }
     Ok(worker_pids)
 }
 
-/// The master's half of recovery once the workers are alive, ending in the
-/// checkpoint a clean restart resumes from. `ready` is the lease the workers'
-/// ready ACKs answer.
-async fn master_post_fork_recovery(disp: &MasterDispatcher, ready: AckLease, live_epoch: u32) -> Result<(), String> {
-    // Wait for all workers to complete recovery and signal readiness.
-    ready.acks().await;
-    drop(ready);
-
-    disp.sal().lock().await.boot_rewind(live_epoch);
-
-    inject_recovery_panic("reset");
-
+/// The master's half of recovery once the workers have recovered and the SAL is
+/// rewound, ending in the checkpoint a clean restart resumes from.
+async fn master_post_fork_recovery(disp: &MasterDispatcher) -> Result<(), String> {
     // Every scanned base, tail or none: the tick also opens each kept view's
     // operator state, and the boot checkpoint publishes no trace of an unopened one.
     let scanned = {
@@ -376,16 +362,13 @@ fn raise_fd_limit(target: u64) {
 
 /// Single entry point for the entire server bootstrap: opens the catalog,
 /// allocates the shared IPC regions, forks the workers, runs recovery, and
-/// enters the executor event loop.
-///
-/// Returns the process's exit code: 0 after a shutdown signal, 2 when a worker
-/// died while serving; `Err` when the boot failed.
-pub(crate) fn server_main(args: ServerArgs) -> Result<i32, String> {
+/// enters the executor event loop, with a TLS listener when `tls` names one.
+/// Answers how serving ended; `Err` when the boot failed.
+pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<ServerExit, String> {
     let ServerArgs {
         data_dir,
         socket_path,
         workers,
-        tls,
         backup_dir,
     } = args;
     let data_dir = data_dir.as_str();
@@ -432,39 +415,37 @@ pub(crate) fn server_main(args: ServerArgs) -> Result<i32, String> {
         .map(|(w2m_writer, mesh)| WorkerIpc { w2m_writer, mesh })
         .collect();
 
-    // Leaked: the dispatcher and reactor borrow it for the life of the process.
-    let catalog: &'static mut CatalogEngine = Box::leak(Box::new(master_pre_fork_recovery(opened, tail)?));
+    let mut catalog = master_pre_fork_recovery(opened, tail)?;
 
-    let worker_pids = fork_workers(catalog, data_dir, tail, workers, pinning.as_ref())?;
+    let worker_pids = fork_workers(&mut catalog, data_dir, tail, workers, pinning.as_ref())?;
 
     // --- Parent process ---
-    let reactor = Reactor::new(limits, receiver).map_err(|e| format!("io_uring init failed: {e}"))?;
-    let dispatcher = MasterDispatcher::new(worker_pids, catalog, SalWriter::new(tail.log(), parks), reactor);
+    let (reactor, ready) = Reactor::new(limits, receiver).map_err(|e| format!("io_uring init failed: {e}"))?;
+    // Both waits race a worker's death, which would leave them waiting forever.
+    let died = |w: usize| format!("worker {w} exited during recovery (log: {})", worker_log(data_dir, w));
+    let acked = reactor.block_on(async {
+        match select2(ready.all_acked(), worker_death(&reactor, &worker_pids)).await {
+            Either::A(acked) => Ok(acked),
+            Either::B(w) => Err(died(w)),
+        }
+    })?;
+    let sal = SalWriter::boot(tail, parks, acked);
+    inject_recovery_panic("reset");
 
-    // The workers' ready ACKs. Leased before the loop first runs, which drops
-    // every W2M frame no lease routes.
-    let ready = dispatcher.reactor().lease_ready();
-    let live_epoch = tail.live_epoch();
-    // Raced against a worker's death, which would leave recovery waiting forever.
+    let dispatcher = MasterDispatcher::new(worker_pids, catalog, sal, reactor);
     dispatcher.reactor().block_on(async {
-        let recovery = master_post_fork_recovery(&dispatcher, ready, live_epoch);
-        match select2(recovery, dispatcher.worker_death()).await {
+        match select2(master_post_fork_recovery(&dispatcher), dispatcher.worker_death()).await {
             Either::A(r) => r,
-            Either::B(w) => Err(format!(
-                "worker {w} exited during recovery (log: {})",
-                worker_log(data_dir, w)
-            )),
+            Either::B(w) => Err(died(w)),
         }
     })?;
 
     let listeners = listen::bind_listeners(data_dir, &socket_path, tls)?;
-    // `2` separates a dead worker from a failed boot's `1` and from
-    // `gnitz_fatal_abort!`'s `134`.
     match executor::run(dispatcher, backup_dir, listeners) {
-        None => Ok(0),
+        None => Ok(ServerExit::Clean),
         Some(w) => {
             gnitz_error!("Worker {w} crashed (log: {}); workers stopped", worker_log(data_dir, w));
-            Ok(2)
+            Ok(ServerExit::WorkerDied)
         }
     }
 }

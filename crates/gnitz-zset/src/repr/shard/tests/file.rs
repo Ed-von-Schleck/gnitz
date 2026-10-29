@@ -119,7 +119,7 @@ fn a_shard_drops_its_runs_dead_heap() {
             &[run.as_mem_batch(), retract.as_mem_batch()],
             &make_schema_pk_u64_payload_string(),
         );
-        assert!(run.dead_heap > 0, "premise: the fold left dead bytes");
+        assert!(run.dead_heap() > 0, "premise: the fold left dead bytes");
         assert_eq!(written_strings(&run), (y.len(), Encoding::Constant), "{copies} copies");
     }
 }

@@ -47,10 +47,6 @@ enum PkSource {
     HashRow(FoldCols),
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 /// Rebase the string columns [`copy_window`] wrote for `copies`, their cells
 /// read from `src_blob`, onto the heap [`Batch::carry_heap`] left at `heap_at`.
 fn rebase_copied_strings(copies: &[ColCopy], output: &mut DirectWriter<'_>, src_blob: &[u8], heap_at: Option<usize>) {
@@ -351,16 +347,23 @@ impl MapPlan {
         };
         // Sized exactly: a first reservation would round a small delta's rows up.
         let mut output = Batch::with_capacity(&self.output_schema, crate::repr::range_rows(ranges));
-        self.append_map_ranges(in_batch, &mut output, ranges);
+        self.map_ranges(in_batch, &mut output, ranges);
         output
     }
 
     /// Map every `[start, end)` range of `src`, in order, onto the tail of `out`,
-    /// which is in this plan's output schema. Ranges too short to feed the
-    /// per-window kernel are gathered into one first. The ranges are mapped as
-    /// given: a [`gnitz_wire::NullKeys::Drop`] reindex's NULL-keyed rows are
-    /// dropped only by [`Self::evaluate_map_batch`].
+    /// which is in this plan's output schema.
     pub(crate) fn append_map_ranges(&mut self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)]) {
+        debug_assert!(
+            !matches!(self.pk_source, PkSource::Pack { drop_nulls, .. } if drop_nulls != 0),
+            "a NULL-dropping reindex maps through evaluate_map_batch"
+        );
+        self.map_ranges(src, out, ranges);
+    }
+
+    /// [`Self::append_map_ranges`], every row of `ranges` mapped. Ranges too
+    /// short to feed the per-window kernel are gathered into one first.
+    fn map_ranges(&mut self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)]) {
         let total = crate::repr::range_rows(ranges);
         if total == 0 {
             return;
@@ -415,10 +418,6 @@ impl MapPlan {
         });
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[path = "tests/map.rs"]

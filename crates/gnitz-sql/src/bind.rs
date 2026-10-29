@@ -17,7 +17,7 @@ use gnitz_expr::{CalendarOp, LikePattern};
 use gnitz_wire::{ColType, ColumnDef};
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CeilFloorKind, DataType, DateTimeField, Expr, Function, TrimWhereField, TypedString,
-    UnaryOperator, Value, ValueWithSpan,
+    UnaryOperator, Value, ValueWithSpan, WindowType,
 };
 
 /// A WHERE / ON clause as its bound conjunct list — the one home of that shape,
@@ -27,19 +27,6 @@ use sqlparser::ast::{
 pub(crate) fn bind_conjuncts<R: Clone>(expr: &Expr, leaf: &dyn LeafBinder<R>) -> Result<Vec<BExpr<R>>, GnitzSqlError> {
     Ok(bind_structural(expr, leaf)?.conjuncts())
 }
-
-// ---------------------------------------------------------------------------
-// Shared structural expression binding
-// ---------------------------------------------------------------------------
-//
-// One `Expr → BExpr` recursion, parametrized by a leaf. The only things that
-// differ across GnitzDB's binding contexts (WHERE/projection, HAVING, JOIN
-// residual) are the schema-aware positions — a column reference, an aggregate
-// or window call, a subquery, a reference's declaration, and a whole expression
-// the context names. Everything structural (literals, the full operator map,
-// unary ops, the BETWEEN desugar, Nested unwrap) lives here once, so a new
-// operator or fold lands on every context at the same time and cannot silently
-// drift between hand-copied walks.
 
 /// The schema-aware leaves of `bind_structural`, generic over the leaf reference
 /// type `R` (the `ColRef` payload). [`LeafTyping`] is how a reference it handed
@@ -61,7 +48,7 @@ pub(crate) trait LeafBinder<R>: LeafTyping<R> {
     }
     /// A windowed call (`f(…) OVER (…)`). Only a view body's SELECT list, QUALIFY
     /// and ORDER BY admit one; every other context keeps this rejection.
-    fn bind_window(&self, _f: &Function) -> Result<BExpr<R>, GnitzSqlError> {
+    fn bind_window(&self, _f: &Function, _over: &WindowType) -> Result<BExpr<R>, GnitzSqlError> {
         Err(GnitzSqlError::Rejected(
             "window functions (OVER) are only supported in the SELECT list, QUALIFY and ORDER BY of a \
              CREATE VIEW body, and cannot be nested in another window function's operands"
@@ -204,7 +191,7 @@ pub(crate) fn bind_structural<R: Clone>(expr: &Expr, leaf: &dyn LeafBinder<R>) -
         }
         // The names of [`SCALAR_CALLS`] bind here, above the leaf, so no leaf
         // carries them. Any other name is an aggregate's or no function's.
-        Expr::Function(f) if f.over.is_some() => leaf.bind_window(f),
+        Expr::Function(f @ Function { over: Some(over), .. }) => leaf.bind_window(f, over),
         Expr::Function(f) => match scalar_call(f) {
             Some((name, call)) => bind_scalar_call(name, call, f, leaf),
             None => match single_part_ident(&f.name) {
@@ -861,9 +848,7 @@ enum Nullness {
     Unknown,
 }
 
-/// A bound value's [`Nullness`], each reference as `leaf` declares it. The
-/// verdict alone, for a caller that only needs to know which shape to emit and
-/// would otherwise clone the value to ask.
+/// A bound value's [`Nullness`], each reference as `leaf` declares it.
 fn nullness<R>(value: &BExpr<R>, leaf: &dyn LeafBinder<R>) -> Nullness {
     match value {
         BExpr::LitNull => Nullness::Always,

@@ -99,7 +99,7 @@ impl PkSetGather {
         let mut picks: Vec<Pick> = Vec::with_capacity(self.remaining_keys().min(max_rows));
         let visited = self.for_each_live_row(max_rows, |c| {
             if split && c.current_is_skeleton() {
-                skeletons.push(c.current_pk_bytes(), c.current_weight);
+                skeletons.push(c.current_pk_bytes(), c.current_weight());
             } else {
                 picks.push(c.current_pick());
             }

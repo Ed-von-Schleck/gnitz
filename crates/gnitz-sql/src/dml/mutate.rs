@@ -32,33 +32,28 @@ pub(crate) struct MutationPlan {
 }
 
 pub(crate) fn plan_update(update: &Update, cat: &dyn Catalog) -> Result<MutationPlan, GnitzSqlError> {
-    reject_unhonored_update_clauses(update)?;
-    plan_mutation(
-        std::slice::from_ref(&update.table),
-        update.selection.as_ref(),
-        Some(&update.assignments),
-        cat,
-    )
+    let (table, selection, assignments) = reject_unhonored_update_clauses(update)?;
+    plan_mutation(std::slice::from_ref(table), selection, Some(assignments), cat)
 }
 
 pub(crate) fn plan_delete(del: &Delete, cat: &dyn Catalog) -> Result<MutationPlan, GnitzSqlError> {
-    reject_unhonored_delete_clauses(del)?;
-    let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = &del.from;
-    plan_mutation(from, del.selection.as_ref(), None, cat)
+    let (from, selection) = reject_unhonored_delete_clauses(del)?;
+    plan_mutation(from, selection, None, cat)
 }
 
-/// Reject every `UPDATE` clause `plan_mutation` does not consume. It reads `table`, `assignments`,
-/// `selection`; `from` (UPDATE … FROM join-update), `returning`, and `or` (SQLite conflict) all parse
-/// under `GenericDialect` and were dropped — the join-update silently binds SET/WHERE against the
-/// wrong relation set.
-fn reject_unhonored_update_clauses(update: &sqlparser::ast::Update) -> Result<(), GnitzSqlError> {
+/// Reject every `UPDATE` clause `plan_mutation` does not consume, and hand back
+/// the table, WHERE and SET list it does. Each rejected clause would otherwise be
+/// dropped: a dropped `FROM` binds SET/WHERE against the wrong relations.
+fn reject_unhonored_update_clauses(
+    update: &Update,
+) -> Result<(&TableWithJoins, Option<&Expr>, &[Assignment]), GnitzSqlError> {
     const CTX: &str = "UPDATE";
-    let sqlparser::ast::Update {
-        // Consumed by `plan_mutation` — `table` whole: it classifies the FROM
-        // shape, so a join written there is rejected rather than dropped.
-        table: _,
-        assignments: _,
-        selection: _,
+    let Update {
+        // `table` whole: `plan_mutation` classifies its FROM shape, so a join
+        // written there is rejected.
+        table,
+        assignments,
+        selection,
         // Inert: the `UPDATE` token and advisory-only comment hints.
         update_token: _,
         optimizer_hints: _,
@@ -76,18 +71,18 @@ fn reject_unhonored_update_clauses(update: &sqlparser::ast::Update) -> Result<()
     reject_if(or.is_some(), CTX, "OR (conflict clause)")?;
     reject_if(!order_by.is_empty(), CTX, "ORDER BY")?;
     reject_if(limit.is_some(), CTX, "LIMIT")?;
-    Ok(())
+    Ok((table, selection.as_ref(), assignments))
 }
 
-/// Reject every `DELETE` clause `plan_mutation` does not consume. It reads `from` and `selection`;
-/// `tables` (multi-table), `using` (join-delete), `returning`, `order_by`, and `limit` all parse
-/// under `GenericDialect` and were dropped — a dropped `LIMIT` deletes every matched row (data loss),
-/// a dropped `USING` binds WHERE against the wrong relation set.
-fn reject_unhonored_delete_clauses(del: &sqlparser::ast::Delete) -> Result<(), GnitzSqlError> {
+/// Reject every `DELETE` clause `plan_mutation` does not consume, and hand back
+/// the FROM list and WHERE it does. Each rejected clause would otherwise be
+/// dropped: a dropped `LIMIT` deletes every matched row, a dropped `USING` binds
+/// WHERE against the wrong relations.
+fn reject_unhonored_delete_clauses(del: &Delete) -> Result<(&[TableWithJoins], Option<&Expr>), GnitzSqlError> {
     const CTX: &str = "DELETE";
-    let sqlparser::ast::Delete {
-        from: _,
-        selection: _,
+    let Delete {
+        from,
+        selection,
         // Inert: the `DELETE` token and advisory-only comment hints.
         delete_token: _,
         optimizer_hints: _,
@@ -104,7 +99,8 @@ fn reject_unhonored_delete_clauses(del: &sqlparser::ast::Delete) -> Result<(), G
     reject_if(output.is_some(), CTX, "OUTPUT")?;
     reject_if(!order_by.is_empty(), CTX, "ORDER BY")?;
     reject_if(limit.is_some(), CTX, "LIMIT")?;
-    Ok(())
+    let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = from;
+    Ok((from, selection.as_ref()))
 }
 
 fn plan_mutation(

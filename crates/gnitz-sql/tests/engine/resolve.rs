@@ -5,7 +5,7 @@
 use super::*;
 use gnitz_core::{block_on, BlockingHost, Host, Interest, Job};
 use gnitz_wire::{RelClass, WireStatus::NotFound};
-use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
@@ -288,7 +288,7 @@ struct Interruptible {
 }
 
 impl Host for Interruptible {
-    fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    fn attach(&mut self, fd: OwnedFd) -> std::io::Result<()> {
         self.host.attach(fd)
     }
 

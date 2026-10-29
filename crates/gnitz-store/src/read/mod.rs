@@ -7,15 +7,9 @@
 //! kernels a circuit's linear operators dispatch to — so a read here and a view
 //! there compute a row the same way.
 //!
-//! Nothing here reaches a `CatalogEngine` or a `DagEngine`: those are in
-//! `gnitz-server`, which depends on this crate, so the direction is the crate
-//! graph's. Recomputing a capacity-bounded view's skeleton row does need the
-//! view's compiled program, and that one edge is injected as
-//! [`SkeletonHydrator`] rather than reached — a host that maintains no circuit
-//! passes `None`.
-//!
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover.
+//! Recomputing a capacity-bounded view's skeleton row needs the view's compiled
+//! program; that edge is injected as [`SkeletonHydrator`], and a host that
+//! maintains no circuit passes `None`.
 
 mod delta_read;
 mod key_spans;

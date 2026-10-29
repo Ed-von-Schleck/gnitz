@@ -8,8 +8,8 @@ use crate::DumpError;
 const FORMAT: &str = "gnitz-dump";
 
 /// Bumped by hand for any change to what a dump's files hold or how they are
-/// laid out. A restore reads every version up to this one, so a bump keeps a
-/// reader for the one it replaces; it refuses a later one.
+/// laid out; each version this build restores has its own arm in
+/// [`Manifest::from_json`].
 pub(crate) const VERSION: u64 = 1;
 
 /// One base table or stream of a dump.
@@ -80,13 +80,10 @@ impl Manifest {
         if header.format != FORMAT {
             return Err(bad("not a gnitz dump"));
         }
-        if !(1..=VERSION).contains(&header.version) {
-            return Err(bad(&format!(
-                "format version {}, this build restores 1 to {VERSION}",
-                header.version
-            )));
+        match header.version {
+            VERSION => serde_json::from_str(text).map_err(|e| bad(&e.to_string())),
+            v => Err(bad(&format!("format version {v}, this build restores {VERSION}"))),
         }
-        serde_json::from_str(text).map_err(|e| bad(&e.to_string()))
     }
 }
 

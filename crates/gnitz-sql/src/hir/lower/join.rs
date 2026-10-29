@@ -2,7 +2,7 @@
 //! key chosen by [`out_key`]; the output-key PK columns it mints; the re-keys onto
 //! join keys and source PKs; and the equi, range/band and cross emitters over them.
 
-use super::super::{ColId, HirExpr, JoinClass, JoinShape, JoinType, ProjEntry, RelExpr};
+use super::super::{ColId, ExistsKind, HirExpr, JoinClass, JoinPlan, JoinType, ProjEntry, PureRangeKind, RelExpr};
 use super::spine::{self, SourceOrigin, Spine, Top};
 use super::{materialize, Demand, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
@@ -49,13 +49,13 @@ impl OutKey {
     }
 }
 
-/// The key a step of `kind` over `class`'s keys emits its rows under.
-fn out_key(class: &JoinClass, kind: JoinType) -> OutKey {
-    match (class.shape(), kind.is_decorrelated()) {
-        (JoinShape::Equi, _) => OutKey::JoinKey,
-        (JoinShape::Band, true) => OutKey::OuterPk { owned: false },
-        (JoinShape::PureRange, true) => OutKey::OuterPk { owned: true },
-        (JoinShape::Band | JoinShape::PureRange | JoinShape::Cross, _) => OutKey::PairPk,
+/// The key a step of `kind` planned as `plan` emits its rows under.
+fn out_key(plan: JoinPlan, kind: JoinType) -> OutKey {
+    match plan {
+        JoinPlan::Equi => OutKey::JoinKey,
+        JoinPlan::Band(_) if kind.is_decorrelated() => OutKey::OuterPk { owned: false },
+        JoinPlan::PureRange(_, PureRangeKind::Exists(_)) => OutKey::OuterPk { owned: true },
+        JoinPlan::Band(_) | JoinPlan::PureRange(..) | JoinPlan::Cross => OutKey::PairPk,
     }
 }
 
@@ -73,14 +73,15 @@ pub(super) fn lower_join_view(
     above.refs(&mut refs);
 
     let mut cb = Circuit::default();
-    let out_key = out_key(class, kind);
-    let sides = emit_join_inputs(chain, &mut cb, &refs, [left, right], kind, class)?;
+    let plan = class.plan(kind)?;
+    let out_key = out_key(plan, kind);
+    let sides = emit_join_inputs(chain, &mut cb, &refs, [left, right], kind, class, plan)?;
 
     let out_pk = match out_key {
         OutKey::JoinKey => join_pk_coldefs(class),
         OutKey::PairPk => {
-            let surface = match class.shape() {
-                JoinShape::Cross => "CROSS JOIN output PK",
+            let surface = match plan {
+                JoinPlan::Cross => "CROSS JOIN output PK",
                 _ => "range JOIN output PK",
             };
             reject_arity(
@@ -93,7 +94,7 @@ pub(super) fn lower_join_view(
         OutKey::OuterPk { .. } => src_pk_coldefs(&sides[0].frame.schema),
     };
 
-    if matches!(class.shape(), JoinShape::Band | JoinShape::PureRange) {
+    if matches!(plan, JoinPlan::Band(_) | JoinPlan::PureRange(..)) {
         // No frame covers the range terms `[key region, A, B]`: the join frame's
         // key may be narrower than theirs.
         reject_arity(
@@ -102,12 +103,11 @@ pub(super) fn lower_join_view(
             gnitz_wire::MAX_COLUMNS,
         )?;
     }
-    let branches = match class.shape() {
-        JoinShape::Equi => emit_equi(&mut cb, class, kind, &sides)?,
-        JoinShape::Band => emit_band(&mut cb, class, kind, &sides)?,
-        JoinShape::PureRange => emit_pure_range(&mut cb, class, kind, &sides)?,
-        JoinShape::Cross if kind == JoinType::Inner => emit_cross(&mut cb, &sides)?,
-        JoinShape::Cross => unreachable!("reject_join_shape refuses a keyless non-INNER join"),
+    let branches = match plan {
+        JoinPlan::Equi => emit_equi(&mut cb, class, kind, &sides)?,
+        JoinPlan::Band(rel) => emit_band(&mut cb, class, rel, kind, &sides)?,
+        JoinPlan::PureRange(rel, kind) => emit_pure_range(&mut cb, class, rel, kind, &sides)?,
+        JoinPlan::Cross => emit_cross(&mut cb, &sides)?,
     };
 
     // The frame every branch filters and projects against.
@@ -155,6 +155,7 @@ fn emit_join_inputs(
     rels: [&Rc<RelExpr>; 2],
     kind: JoinType,
     class: &JoinClass,
+    plan: JoinPlan,
 ) -> Result<[JoinSide; 2], GnitzSqlError> {
     let live = [0, 1].map(|i| -> HashSet<ColId> { refs.iter().copied().chain(class.key_cols(i)).collect() });
     let mut spines = [
@@ -190,7 +191,7 @@ fn emit_join_inputs(
         false => [l.emit(cb, Top::Slots)?, r.emit(cb, Top::Slots)?],
     };
     let frames = [frame_l, frame_r];
-    let [kept_l, kept_r] = join_keep(refs, class, kind, &frames)?;
+    let [kept_l, kept_r] = join_keep(refs, class, kind, plan, &frames)?;
     let ([frame_l, frame_r], [origin_l, origin_r]) = (frames, origins);
     let side = |i: usize, input, frame: Frame, origin, (keep, pk_arity)| -> Result<JoinSide, GnitzSqlError> {
         let slots = frame.slots(class.key_cols(i))?;
@@ -271,12 +272,12 @@ impl JoinSide {
 /// into the join's traces, and so onto disk — and its pinned source PK's arity.
 /// A keep list is the pinned PK, then every other kept column in source order: it
 /// need not ascend, and the PK at the front is what makes every pair-PK slot list
-/// a range. A wildcard projection is already expanded into `ProjEntry` column
-/// refs by bind, so Rule 1 covers `SELECT *`.
+/// a range.
 fn join_keep(
     refs: &HashSet<ColId>,
     class: &JoinClass,
     kind: JoinType,
+    plan: JoinPlan,
     frames: &[Frame; 2],
 ) -> Result<[(Vec<u32>, usize); 2], GnitzSqlError> {
     let mut keep = frames.each_ref().map(|f| vec![false; f.layout.len()]);
@@ -286,8 +287,8 @@ fn join_keep(
         let side = usize::from(!frames[0].layout.contains(&Some(id)));
         keep[side][frames[side].slot(id)?] = true;
     }
-    let pins = out_key(class, kind).pins();
-    let banded = matches!(class.shape(), JoinShape::Band | JoinShape::PureRange);
+    let pins = out_key(plan, kind).pins();
+    let banded = matches!(plan, JoinPlan::Band(_) | JoinPlan::PureRange(..));
     for side in 0..2 {
         // Rule 3: a band or pure-range side with a ν keeps its key columns. A band
         // ν is keyed by the source PK, which a bag-valued side repeats; a pure
@@ -338,19 +339,17 @@ enum Split {
     Unmatched(NodeId),
 }
 
-/// A decorrelated `kind`'s branches, from one half of `all`; the other half is
-/// `all − known`.
-fn exists_branches(cb: &mut Circuit, kind: JoinType, split: Split, all: NodeId) -> Vec<Branch> {
+/// `kind`'s branches, from one half of `all`; the other half is `all − known`.
+fn exists_branches(cb: &mut Circuit, kind: ExistsKind, split: Split, all: NodeId) -> Vec<Branch> {
     let (Split::Matched(known) | Split::Unmatched(known)) = split;
     let complement = |cb: &mut Circuit| cb.difference(all, known);
     match (kind, split) {
-        (JoinType::Semi, Split::Matched(half)) | (JoinType::Anti, Split::Unmatched(half)) => vec![(half, None)],
-        (JoinType::Semi | JoinType::Anti, _) => vec![(complement(cb), None)],
-        (JoinType::Mark(_), Split::Matched(matched)) => vec![(matched, Some(true)), (complement(cb), Some(false))],
-        (JoinType::Mark(_), Split::Unmatched(unmatched)) => {
+        (ExistsKind::Semi, Split::Matched(half)) | (ExistsKind::Anti, Split::Unmatched(half)) => vec![(half, None)],
+        (ExistsKind::Semi | ExistsKind::Anti, _) => vec![(complement(cb), None)],
+        (ExistsKind::Mark(_), Split::Matched(matched)) => vec![(matched, Some(true)), (complement(cb), Some(false))],
+        (ExistsKind::Mark(_), Split::Unmatched(unmatched)) => {
             vec![(complement(cb), Some(true)), (unmatched, Some(false))]
         }
-        _ => unreachable!("exists_branches receives a decorrelated kind"),
     }
 }
 
@@ -515,8 +514,8 @@ fn emit_equi(
     // side's delta probes; the symmetric 2-term join over `[_join_pk, kept-A, kept-B]`.
     let reindex = [reindex_a, b_delta];
     let inner = cb.join(reindex, reindex, JoinKind::Equi);
-    if kind.is_decorrelated() {
-        return Ok(exists_branches(cb, kind, Split::Matched(inner), all[0]));
+    if let Some(e) = kind.exists() {
+        return Ok(exists_branches(cb, e, Split::Matched(inner), all[0]));
     }
     // Each `[_join_pk, A, B]`, the other side's half all-NULL.
     let nus: Vec<NodeId> = (0..2)
@@ -559,11 +558,11 @@ fn emit_equi(
 fn emit_band(
     cb: &mut Circuit,
     class: &JoinClass,
+    op: RangeRel,
     kind: JoinType,
     sides: &[JoinSide; 2],
 ) -> Result<Vec<Branch>, GnitzSqlError> {
     let k = class.arity();
-    let (_, op) = class.range.expect("a band class carries a range term");
     let reindex = [range_keyed(cb, class, &sides[0])?, range_keyed(cb, class, &sides[1])?];
     // The two range terms over `[key region, A, B]`, each carrying the ON clause's
     // left-to-right range relation verbatim.
@@ -582,10 +581,10 @@ fn emit_band(
         };
         Ok((all, nu))
     };
-    if kind.is_decorrelated() {
+    if let Some(e) = kind.exists() {
         // ν over A, keyed on A's source PK behind the output exchange.
         let (all, nu_a) = nu(cb, 0)?;
-        return Ok(exists_branches(cb, kind, Split::Unmatched(nu_a), all));
+        return Ok(exists_branches(cb, e, Split::Unmatched(nu_a), all));
     }
     // The pairs re-keyed onto `_pair_pk`, dropping the key region: every branch
     // lands on `[pair-PK, kept-A, kept-B]`.
@@ -605,25 +604,25 @@ fn emit_band(
 fn emit_pure_range(
     cb: &mut Circuit,
     class: &JoinClass,
-    kind: JoinType,
+    op: RangeRel,
+    kind: PureRangeKind,
     sides: &[JoinSide; 2],
 ) -> Result<Vec<Branch>, GnitzSqlError> {
-    let (_, op) = class.range.expect("a pure-range class carries a range term");
     let rel = JoinKind::Range { rel: op };
     Ok(match kind {
         // The threshold decides existence over A's owned slice, already on the
         // worker owning its output key.
-        JoinType::Semi | JoinType::Anti | JoinType::Mark(_) => {
+        PureRangeKind::Exists(e) => {
             let (owned, int_a) = own_a(cb, &sides[0], true)?;
             let reindex_b = range_keyed(cb, class, &sides[1])?;
             let matched = threshold(cb, &sides[0], reindex_b, int_a, op);
-            exists_branches(cb, kind, Split::Matched(matched), owned)
+            exists_branches(cb, e, Split::Matched(matched), owned)
         }
         // Each branch below lands on `[pair-PK, kept-A, kept-B]`; a LEFT join's
         // pair terms integrate A's owned slice, which its ν subtracts from.
-        JoinType::Inner | JoinType::Left => {
+        PureRangeKind::Inner | PureRangeKind::Left => {
             let reindex_a = range_keyed(cb, class, &sides[0])?;
-            let owned = (kind == JoinType::Left)
+            let owned = (kind == PureRangeKind::Left)
                 .then(|| own_a(cb, &sides[0], false))
                 .transpose()?;
             let int_a = match owned {
@@ -642,7 +641,6 @@ fn emit_pure_range(
             let branch = emit_range_null_fill_tail(cb, sides, nu_a, 0);
             vec![(cb.union(branch, pairs), None)]
         }
-        JoinType::Right | JoinType::Full => unreachable!("reject_join_shape refuses a pure-range RIGHT/FULL join"),
     })
 }
 

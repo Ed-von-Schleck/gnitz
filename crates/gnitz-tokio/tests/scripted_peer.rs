@@ -450,6 +450,19 @@ fn drive<F: Future>(rt: &Runtime, conn: &mut Connection, f: F) -> F::Output {
 /// reports the rows it took in front of its own, weights and all.
 #[test]
 fn a_sync_cancelled_after_its_answer_hands_its_rows_to_the_next() {
+    cancel_after_the_answer(false);
+}
+
+/// So does one dropped once the client finished it, its delivery arrived and
+/// never read.
+#[test]
+fn a_sync_cancelled_after_its_delivery_hands_its_rows_to_the_next() {
+    cancel_after_the_answer(true);
+}
+
+/// Drop a sync once its answer is in — and, if `delivered`, once the client
+/// finished it — then check the next sync reports its rows.
+fn cancel_after_the_answer(delivered: bool) {
     let rt = Runtime::new().unwrap();
     let (client, mut conn, mut peer) = connect_to_peer(&rt);
 
@@ -496,6 +509,10 @@ fn a_sync_cancelled_after_its_answer_hands_its_rows_to_the_next() {
     // Its answer in, the sync queues the client's half and awaits it.
     let polled = rt.block_on(std::future::poll_fn(|cx| Poll::Ready(sync.as_mut().poll(cx))));
     assert!(polled.is_pending());
+    if delivered {
+        // Calls run in order, so the client's half has run once this has.
+        drive(&rt, &mut conn, client.run(|_| Box::pin(std::future::ready(())))).unwrap();
+    }
     drop(sync);
 
     rt.spawn(conn);

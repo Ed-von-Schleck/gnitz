@@ -1,7 +1,7 @@
 //! Catalog DDL as a client writes it: every create, drop and alter is one
 //! bundle of system-family rows, committed as one DDL zone.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use gnitz_wire::{
@@ -38,8 +38,8 @@ pub struct InlineUniqueIndex {
 pub struct TableDef {
     pub name: RelName,
     pub schema: Schema,
-    /// `fks[i]` is column `i`'s target; an empty `fks` gives no column one.
-    pub fks: Vec<Option<FkTarget>>,
+    /// Each FOREIGN KEY column's target, by column index.
+    pub fks: BTreeMap<usize, FkTarget>,
     pub props: TableProps,
     /// Each inline UNIQUE constraint's columns and the catalog name its index
     /// takes.
@@ -52,7 +52,7 @@ impl TableDef {
         TableDef {
             name,
             schema,
-            fks: Vec::new(),
+            fks: BTreeMap::new(),
             props: TableProps::default(),
             unique_indexes: Vec::new(),
         }
@@ -203,7 +203,7 @@ impl ViewBundle {
             };
 
             // A foreign key constrains a base table, not a view.
-            append_col_rows(b, vid, pv.schema.columns(), &[]);
+            append_col_rows(b, vid, pv.schema.columns(), &BTreeMap::new());
             let circuit = circuit.encode();
             b.put(
                 &CircuitRow {
@@ -392,10 +392,9 @@ impl GnitzClient {
             .map(|spec| gnitz_wire::canonical_identifier(&spec.name))
             .collect::<Result<Vec<_>, String>>()?;
         let pk = PkColList::from_slice(schema.pk_cols());
-        if !fks.is_empty() && fks.len() != schema.columns().len() {
+        if let Some(&col) = fks.keys().find(|&&col| col >= schema.columns().len()) {
             return Err(ClientError::from(format!(
-                "create_table: {} foreign-key slots for {} columns",
-                fks.len(),
+                "create_table: a foreign key on column {col}, past the table's {} columns",
                 schema.columns().len()
             )));
         }
@@ -684,11 +683,11 @@ impl GnitzClient {
     }
 }
 
-/// Append one `COL_TAB` row per column of `owner_id`, at `+1`. `fks[i]` is
-/// column `i`'s target; a column past its end has none.
-fn append_col_rows(b: &mut DdlBundle, owner_id: u64, columns: &[ColumnDef], fks: &[Option<FkTarget>]) {
+/// Append one `COL_TAB` row per column of `owner_id`, at `+1`, each carrying
+/// its target in `fks`.
+fn append_col_rows(b: &mut DdlBundle, owner_id: u64, columns: &[ColumnDef], fks: &BTreeMap<usize, FkTarget>) {
     for (i, cd) in columns.iter().enumerate() {
-        let fk = fks.get(i).copied().flatten().map(|t| match t {
+        let fk = fks.get(&i).map(|&t| match t {
             FkTarget::Table(fk) => fk,
             FkTarget::SelfTable { col, on_delete } => FkRef { table_id: owner_id, col, on_delete },
         });

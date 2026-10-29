@@ -212,7 +212,7 @@ fn three_and_chain_matches_the_three_valued_reference() {
             LogicalInstr::BoolBinary { is_or: false, a: Reg(5), b: Reg(7) }, // r8 = r5 AND r7
         ];
         assert_eq!(
-            filter_prog(&schema, instrs.clone(), vec![]).prog().null_regs == 0,
+            filter_prog(&schema, instrs.clone(), vec![]).prog().null_regs() == 0,
             !nullable,
             "{label}: wrong arm"
         );
@@ -348,7 +348,7 @@ fn is_null_shapes_select_the_reference_rows() {
     ];
     for (name, instrs, reference) in shapes {
         let mut ev = filter_prog(&schema, instrs, vec![]);
-        assert_eq!(ev.prog().null_regs, 0, "{name}: must resolve no nullable register");
+        assert_eq!(ev.prog().null_regs(), 0, "{name}: must resolve no nullable register");
         for (arrangement, null_pred) in NULL_ARRANGEMENTS {
             let n = 70;
             let mb = make_n_col_view(&schema, n, |row, col| ((row + col) % 5) as i64, null_pred);
@@ -376,7 +376,7 @@ fn is_null_into_a_register_sink_reads_back_per_row() {
             vec![Sink::Reg(Reg(0))],
             vec![],
         );
-        assert_eq!(ev.prog().null_regs, 0);
+        assert_eq!(ev.prog().null_regs(), 0);
         for (arrangement, null_pred) in NULL_ARRANGEMENTS {
             let mb = make_n_col_view(&in_schema, n, |row, _| row as i64, null_pred);
             let want: Vec<(u64, Vec<Vec<u8>>)> = (0..n)
@@ -449,7 +449,7 @@ fn nullable_and_not_null_columns_side_by_side() {
         LogicalInstr::StrColCol { op: CmpOp::Lt, col_a: 4, col_b: 4 },
     ];
     let mut ev = scalar_prog(&schema, instrs, vec![b"m".to_vec()]);
-    assert_ne!(ev.prog().null_regs, 0);
+    assert_ne!(ev.prog().null_regs(), 0);
 
     // The rows each register must report NULL on.
     let want_null = |reg: usize, row: usize| match reg {

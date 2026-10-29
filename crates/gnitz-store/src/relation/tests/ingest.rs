@@ -4,7 +4,7 @@ use crate::test_support::{
     assert_index_holds, id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, zset_of,
     TID,
 };
-use gnitz_wire::PkColList;
+use gnitz_wire::{PkColList, ViewBudget};
 
 /// The append path sizes by the store's region count, so a batch of another
 /// payload arity is refused before anything is written.
@@ -57,6 +57,18 @@ fn only_the_ephemeral_round_publishes_an_index() {
     assert!(read_intact(&dir).unwrap().is_none(), "the base round skips it");
     registry.checkpoint_ephemeral([], 3, |_| true).unwrap();
     assert!(read_at(&dir, 3).unwrap().is_some());
+}
+
+/// A view's rows land only at the cut, so pending rows are refused for one.
+#[test]
+fn ingest_pending_refuses_a_view() {
+    let schema = make_schema_u64_i64();
+    let mut registry = relation_fixture(RelationKind::View(ViewBudget::Plain), schema, &[], []);
+    let err = registry
+        .ingest_pending(TID, make_batch_raw(&schema, &[(1, 1, 10)]))
+        .unwrap_err();
+    assert!(err.contains("is a view"), "{err}");
+    assert!(registry.seal(TID).unwrap().is_none());
 }
 
 /// Rows ingested above a base table's cut meet the PK rule against the stored

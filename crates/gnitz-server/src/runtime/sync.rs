@@ -11,6 +11,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -176,6 +177,11 @@ pub(crate) mod chan {
         pub(crate) fn send(&self, v: T) {
             self.inner.borrow_mut().push(v);
         }
+
+        /// Whether no value waits for the receiver.
+        pub(crate) fn is_empty(&self) -> bool {
+            !self.inner.borrow().is_ready()
+        }
     }
 
     impl<T> Receiver<T> {
@@ -200,9 +206,10 @@ pub(crate) mod chan {
 // ---------------------------------------------------------------------------
 //
 // Payload-free: both guards are drop tokens admitting entry to a critical
-// section, and what they protect lives outside. Writer-preference blocks new
-// readers as soon as a writer parks, so a writer cannot starve behind a stream
-// of readers.
+// section, and what they protect lives outside. A lock's zero-sized tag names
+// what it protects, so a guard of one tag cannot stand in for another's.
+// Writer-preference blocks new readers as soon as a writer parks, so a writer
+// cannot starve behind a stream of readers.
 
 /// A parked writer's waker, shared by its `WriteFuture` and its queue entry.
 type WakerSlot = RefCell<Option<Waker>>;
@@ -249,23 +256,29 @@ impl RwLockInner {
     }
 }
 
-/// A handle on one lock; clones share it. Every future and guard holds a clone,
-/// so none borrows the handle it came from.
-#[derive(Clone, Default)]
-pub(crate) struct AsyncRwLock(Rc<RefCell<RwLockInner>>);
+/// A handle on one lock tagged `K`; clones share it. Every future and guard
+/// holds a clone, so none borrows the handle it came from.
+pub(crate) struct AsyncRwLock<K = ()>(Rc<RefCell<RwLockInner>>, PhantomData<fn() -> K>);
 
-impl AsyncRwLock {
-    pub(crate) fn read(&self) -> ReadFuture {
+impl<K> Clone for AsyncRwLock<K> {
+    fn clone(&self) -> Self {
+        AsyncRwLock(Rc::clone(&self.0), PhantomData)
+    }
+}
+
+impl<K> Default for AsyncRwLock<K> {
+    fn default() -> Self {
+        AsyncRwLock(Rc::default(), PhantomData)
+    }
+}
+
+impl<K> AsyncRwLock<K> {
+    pub(crate) fn read(&self) -> ReadFuture<K> {
         ReadFuture { lock: self.clone() }
     }
 
-    pub(crate) fn write(&self) -> WriteFuture {
+    pub(crate) fn write(&self) -> WriteFuture<K> {
         WriteFuture { lock: self.clone(), waiter: None }
-    }
-
-    /// A writer holds the lock.
-    pub(crate) fn is_write_held(&self) -> bool {
-        self.0.borrow().has_writer
     }
 
     /// Admit whoever the state now allows: the first parked writer, or every
@@ -298,13 +311,13 @@ impl AsyncRwLock {
     }
 }
 
-pub(crate) struct ReadFuture {
-    lock: AsyncRwLock,
+pub(crate) struct ReadFuture<K = ()> {
+    lock: AsyncRwLock<K>,
 }
 
-impl Future for ReadFuture {
-    type Output = ReadGuard;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ReadGuard> {
+impl<K> Future for ReadFuture<K> {
+    type Output = ReadGuard<K>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ReadGuard<K>> {
         let mut s = self.lock.0.borrow_mut();
         if s.read_ok() {
             s.readers += 1;
@@ -315,25 +328,25 @@ impl Future for ReadFuture {
     }
 }
 
-pub(crate) struct ReadGuard {
-    lock: AsyncRwLock,
+pub(crate) struct ReadGuard<K = ()> {
+    lock: AsyncRwLock<K>,
 }
 
-impl Drop for ReadGuard {
+impl<K> Drop for ReadGuard<K> {
     fn drop(&mut self) {
         self.lock.release_read();
     }
 }
 
-pub(crate) struct WriteFuture {
-    lock: AsyncRwLock,
+pub(crate) struct WriteFuture<K = ()> {
+    lock: AsyncRwLock<K>,
     /// This future's entry in `write_waiters`: `Some` iff it is queued.
     waiter: Option<Rc<WakerSlot>>,
 }
 
-impl Future for WriteFuture {
-    type Output = WriteGuard;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WriteGuard> {
+impl<K> Future for WriteFuture<K> {
+    type Output = WriteGuard<K>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WriteGuard<K>> {
         let Self { lock, waiter } = self.get_mut();
         let mut s = lock.0.borrow_mut();
         if s.write_ok(waiter.as_ref()) {
@@ -357,7 +370,7 @@ impl Future for WriteFuture {
     }
 }
 
-impl Drop for WriteFuture {
+impl<K> Drop for WriteFuture<K> {
     fn drop(&mut self) {
         let Some(waiter) = self.waiter.take() else { return };
         self.lock.0.borrow_mut().unqueue(&waiter);
@@ -366,11 +379,18 @@ impl Drop for WriteFuture {
     }
 }
 
-pub(crate) struct WriteGuard {
-    lock: AsyncRwLock,
+pub(crate) struct WriteGuard<K = ()> {
+    lock: AsyncRwLock<K>,
 }
 
-impl Drop for WriteGuard {
+impl<K> WriteGuard<K> {
+    /// Whether this guard holds `lock`, among the locks of its tag.
+    pub(crate) fn is_of(&self, lock: &AsyncRwLock<K>) -> bool {
+        Rc::ptr_eq(&self.lock.0, &lock.0)
+    }
+}
+
+impl<K> Drop for WriteGuard<K> {
     fn drop(&mut self) {
         self.lock.release_write();
     }

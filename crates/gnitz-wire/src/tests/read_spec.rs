@@ -83,8 +83,8 @@ fn roundtrips_every_bound_against_every_sink() {
     }
 }
 
-/// The request blob's bytes, one spec per sink kind: a layout an old client and a
-/// new worker disagree on has no version word to refuse it.
+/// The request blob's bytes, one spec per sink kind. A change to them moves
+/// `WIRE_EPOCH`.
 #[test]
 fn the_encoded_bytes_are_pinned() {
     let rows = ReadSpec {

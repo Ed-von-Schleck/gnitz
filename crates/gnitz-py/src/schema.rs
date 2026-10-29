@@ -112,8 +112,6 @@ pub struct PySchema {
 
 #[pymethods]
 impl PySchema {
-    /// `Schema::from_parts` applies the shared rule set — the MAX_COLUMNS cap,
-    /// the structural PK rules, and per-PK-column nullability/eligibility.
     #[new]
     pub fn new(py: Python<'_>, columns: Vec<PyRef<'_, PyColumnDef>>, pk_indices: Vec<u32>) -> PyResult<Self> {
         let cols = columns.iter().map(|c| c.to_rust(py)).collect::<PyResult<_>>()?;

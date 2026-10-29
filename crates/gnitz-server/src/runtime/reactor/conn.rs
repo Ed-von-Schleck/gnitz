@@ -168,13 +168,10 @@ impl From<FrameLenError> for RecvEnd {
     }
 }
 
-/// The inbound half of one client connection: the deframer, the frames it has
-/// completed, and the single task awaiting them.
-pub(crate) struct RecvQueue {
-    /// Each payload in progress is charged to `budget` from its header on.
-    /// Touched only through a `RecvFilter`'s `window`/`ingest` and [`Self::feed`]:
-    /// a window it lent may be under a recv in flight.
-    deframer: Deframer<Charge>,
+/// The inbound half of one client connection its tasks reach: the frames its
+/// recv filter has completed, the single task awaiting them, and what admits the
+/// next.
+pub(crate) struct FrameSink {
     /// Complete messages awaiting pickup by `recv().await`, and the one task
     /// awaiting them. A queue, not a slot: with one slot a pipelined client
     /// deadlocks once the kernel socket buffer fills.
@@ -185,21 +182,21 @@ pub(crate) struct RecvQueue {
     max_frame: usize,
 }
 
-impl RecvQueue {
+impl FrameSink {
     pub(super) fn new(budget: Rc<Budget>) -> Self {
-        RecvQueue {
-            deframer: Deframer::default(),
+        FrameSink {
             frames: WakeQueue::default(),
             budget,
             max_frame: HANDSHAKE_FRAME_MAX,
         }
     }
 
-    /// Deframe `src`, queueing every frame it completes. Called only from a
-    /// `RecvFilter::ingest`; see `deframer`.
-    pub(crate) fn feed(&mut self, mut src: &[u8]) -> Result<(), RecvEnd> {
+    /// Deframe `src` through `deframer`, a recv filter's own, queueing every
+    /// frame it completes. Each payload in progress is charged to the budget
+    /// from its header on.
+    pub(crate) fn feed(&mut self, deframer: &mut Deframer<Charge>, mut src: &[u8]) -> Result<(), RecvEnd> {
         let (budget, max_frame) = (&self.budget, self.max_frame);
-        while let Some((buf, charge)) = self.deframer.feed(&mut src, |len| {
+        while let Some((buf, charge)) = deframer.feed(&mut src, |len| {
             if len > max_frame {
                 return Err(RecvEnd::Oversize);
             }
@@ -242,7 +239,7 @@ pub(crate) struct ClientConn {
     /// This connection's place under the connection cap, held exactly as long
     /// as the fd.
     _slot: Charge,
-    q: RefCell<RecvQueue>,
+    q: RefCell<FrameSink>,
     gone: Cell<bool>,
     /// Wakes the task that sends on this socket outside requests, which then
     /// owns the shutdown.
@@ -254,7 +251,7 @@ impl ClientConn {
         self.fd.as_raw_fd()
     }
 
-    /// See [`RecvQueue::admit_full_frames`].
+    /// See [`FrameSink::admit_full_frames`].
     pub(crate) fn admit_full_frames(&self) {
         self.q.borrow_mut().admit_full_frames();
     }
@@ -336,37 +333,45 @@ impl ClientConn {
     }
 }
 
-/// What stands between a socket and its `RecvQueue`.
+/// What stands between a socket and its [`FrameSink`]. A recv writes only into
+/// memory its filter owns.
 pub(crate) trait RecvFilter {
     /// Where the next socket bytes land. The reactor keeps the address until the
     /// recv completes, and calls nothing on the filter in between.
-    fn window<'a>(&'a mut self, q: &'a mut RecvQueue) -> &'a mut [MaybeUninit<u8>];
+    fn window(&mut self) -> &mut [MaybeUninit<u8>];
     /// `n` bytes landed in the window: queue the frames they complete.
-    fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd>;
+    fn ingest(&mut self, n: usize, sink: &mut FrameSink) -> Result<(), RecvEnd>;
 }
 
 /// Size of [`Plain`]'s carry.
 const CARRY_BYTES: usize = 32 * 1024;
 
 /// A socket whose bytes are the frames themselves, read through the deframer's
-/// window over this carry.
-pub(crate) struct Plain(Box<[MaybeUninit<u8>]>);
+/// window over the carry.
+pub(crate) struct Plain {
+    carry: Box<[MaybeUninit<u8>]>,
+    deframer: Deframer<Charge>,
+}
 
 impl Plain {
     pub(crate) fn new() -> Plain {
-        Plain(Box::new_uninit_slice(CARRY_BYTES))
+        Plain {
+            carry: Box::new_uninit_slice(CARRY_BYTES),
+            deframer: Deframer::default(),
+        }
     }
 }
 
 impl RecvFilter for Plain {
-    fn window<'a>(&'a mut self, q: &'a mut RecvQueue) -> &'a mut [MaybeUninit<u8>] {
-        q.deframer.window(&mut self.0)
+    fn window(&mut self) -> &mut [MaybeUninit<u8>] {
+        self.deframer.window(&mut self.carry)
     }
 
-    fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd> {
+    fn ingest(&mut self, n: usize, sink: &mut FrameSink) -> Result<(), RecvEnd> {
+        let Plain { carry, deframer } = self;
         // SAFETY: the completed recv wrote `n` bytes at the head of the window.
-        let src = unsafe { q.deframer.landed(&self.0, n) };
-        q.feed(src)
+        let src = unsafe { deframer.landed(carry, n) };
+        sink.feed(deframer, src)
     }
 }
 
@@ -436,15 +441,11 @@ impl Armed {
     /// module header).
     fn arm(&mut self, ring: &mut IoUringRing) {
         let fd = self.conn.fd();
-        let mut q = self.conn.q.borrow_mut();
-        let w = self.filter.window(&mut q);
+        let w = self.filter.window();
         let sqe = opcode::Recv::new(types::Fd(fd), w.as_mut_ptr().cast(), w.len() as u32).build();
-        // SAFETY: the window is the filter's own buffer or, for `Plain`, the payload
-        // in progress in `conn.q`'s deframer. Only the filter's `window`/`ingest` and
-        // `RecvQueue::feed`, which only an ingest calls, touch the deframer; the task
-        // side's borrows of `q` reach only the frame queue and `max_frame`. Only this
-        // recv's CQE removes or refills the entry, which holds the connection (so `fd`
-        // and `q`) and the filter; `ring` drops first.
+        // SAFETY: the window is memory the filter owns. Only this recv's CQE
+        // removes or refills the entry, which holds the filter and the connection
+        // (so `fd`); `ring` drops first.
         unsafe { ring.push(sqe, udata(KIND_RECV, fd as u32 as u64)) };
     }
 }
@@ -499,7 +500,7 @@ impl Reactor {
         Rc::new(ClientConn {
             fd: accepted.fd,
             _slot: accepted.slot,
-            q: RefCell::new(RecvQueue::new(Rc::clone(&self.conns.inbound))),
+            q: RefCell::new(FrameSink::new(Rc::clone(&self.conns.inbound))),
             gone: Cell::new(false),
             egress_owner,
         })

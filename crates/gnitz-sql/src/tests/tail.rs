@@ -69,16 +69,17 @@ fn an_order_by_past_the_key_cap_is_rejected() {
     );
 }
 
-/// Each clause form's count and skip; an absent one is no limit and no skip.
+/// Each clause form's count and skip, `None` where absent.
 #[test]
 fn limit_and_offset_read_every_clause_form() {
     for (sql, limit, offset) in [
-        ("SELECT * FROM t", None, 0),
-        ("SELECT * FROM t LIMIT 3", Some(3), 0),
-        ("SELECT * FROM t OFFSET 2", None, 2),
-        ("SELECT * FROM t LIMIT 3 OFFSET 2", Some(3), 2),
+        ("SELECT * FROM t", None, None),
+        ("SELECT * FROM t LIMIT 3", Some(3), None),
+        ("SELECT * FROM t OFFSET 2", None, Some(2)),
+        ("SELECT * FROM t OFFSET 0", None, Some(0)),
+        ("SELECT * FROM t LIMIT 3 OFFSET 2", Some(3), Some(2)),
         // MySQL `LIMIT off, lim`.
-        ("SELECT * FROM t LIMIT 2, 3", Some(3), 2),
+        ("SELECT * FROM t LIMIT 2, 3", Some(3), Some(2)),
     ] {
         let q = parse_query(sql);
         assert_eq!(extract_limit_offset(&q).unwrap(), (limit, offset), "{sql}");

@@ -10,7 +10,7 @@ struct Over<'a>(&'a [(usize, usize)]);
 
 impl IdentityLoop for Over<'_> {
     type Out = Vec<u128>;
-    fn run(self, identity: impl Fn(usize) -> u128) -> Vec<u128> {
+    fn run(self, identity: impl Fn(usize) -> u128, _: bool) -> Vec<u128> {
         self.0.iter().flat_map(|&(s, e)| s..e).map(identity).collect()
     }
 }

@@ -3,11 +3,10 @@
 //! lives in `ddl::view` (it recompiles a query). Every rule that reads
 //! the catalog is the engine precheck's.
 
-use super::guard::{reject_unhonored_column_options, reject_unhonored_unique_fields, ColumnOptionSite};
+use super::guard::{read_column, reject_unhonored_unique_fields, ColumnOptionSite};
 use crate::error::{missing_relation, reject_if, unsupported_clause, GnitzSqlError};
 use crate::names::extract_object_name;
 use crate::rules::{canonical_user_name, find_unique_column, require_class, require_column, ClassWant};
-use crate::types::column_def;
 use gnitz_core::{ColumnChange, GnitzClient, RelName};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, IndexColumn, RenameTableNameKind,
@@ -44,8 +43,7 @@ enum Action<'a> {
 /// Reject every `ALTER TABLE` envelope clause gnitz does not honor: `ONLY`
 /// (silently scopes out partition children), a Hive `SET LOCATION`, `ON CLUSTER`,
 /// and a non-`None` `table_type` (Iceberg/Dynamic — a different storage engine).
-/// The operation itself is [`parse`]'s. Exhaustive destructure (no `..`):
-/// a future sqlparser field stops the build until it is classified.
+/// The operation itself is [`parse`]'s.
 fn reject_unhonored_alter_table_clauses(alter: &sqlparser::ast::AlterTable) -> Result<(), GnitzSqlError> {
     const CTX: &str = "ALTER TABLE";
     let sqlparser::ast::AlterTable {
@@ -171,10 +169,15 @@ fn parse<'a>(
                 CTX,
                 "FIRST/AFTER (a column is always appended last)",
             )?;
-            reject_unhonored_column_options(col, ColumnOptionSite::AddColumn)?;
-            let (def, serial) = column_def(col)?;
-            reject_if(serial, CTX, "SERIAL")?;
-            Ok((CTX, Action::AddColumn { def, if_not_exists: *if_not_exists }))
+            let decl = read_column(col, ColumnOptionSite::AddColumn)?;
+            reject_if(decl.serial, CTX, "SERIAL")?;
+            Ok((
+                CTX,
+                Action::AddColumn {
+                    def: decl.def,
+                    if_not_exists: *if_not_exists,
+                },
+            ))
         }
         AlterTableOperation::DropColumn {
             // Inert: `DROP c` and `DROP COLUMN c` mean the same thing.

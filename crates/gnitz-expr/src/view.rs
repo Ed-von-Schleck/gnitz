@@ -10,15 +10,14 @@ use gnitz_wire::RowSource;
 /// Region accessors return the WHOLE column/region, never a morsel slice: the
 /// kernels index them absolutely.
 ///
-/// CONTRACT binding the two shapes:
-///   `get_col_ptr(row, pi, sz) == &col_data(pi, sz)[row*sz .. row*sz + sz]`
-///   `get_null_word(row)       == gnitz_wire::read_u64_le(null_bmp(), row*8)`
-///   `get_pk_bytes(row)        == &pk_region().0[row*s .. row*s + s]`, `s = .1`
+/// The two shapes must address the same bytes; `debug_assert_coherent`
+/// states the equations and checks them in debug builds.
 ///
 /// [`RowSource`]'s per-row half deliberately has **no default bodies** off these:
 /// a default would make direct cell addressing opt-in, so deleting an override
-/// would still compile and still pass, silently costing a second multiply and
-/// range check per read in the debug build the E2E suite runs.
+/// would still compile and still pass, silently costing a row-count load, a
+/// second multiply and a second range check per read in the debug build the
+/// E2E suite runs.
 pub trait BatchView: RowSource {
     /// Payload column `payload_col` in full (`rows * col_size` bytes, native LE).
     fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8];
@@ -28,6 +27,33 @@ pub trait BatchView: RowSource {
     fn pk_region(&self) -> (&[u8], usize);
     /// The heap in full: a batch holds its long values verbatim.
     fn blob(&self) -> &[u8];
+}
+
+/// Assert that `row` of `mb` reads the same through both shapes, for the
+/// `(payload_col, col_size)` slots in `payload_reads`:
+///   `get_col_ptr(row, pi, sz) == &col_data(pi, sz)[row*sz .. row*sz + sz]`
+///   `get_null_word(row)       == gnitz_wire::read_u64_le(null_bmp(), row*8)`
+///   `get_pk_bytes(row)        == &pk_region().0[row*s .. row*s + s]`, `s = .1`
+#[cfg(debug_assertions)]
+pub(crate) fn debug_assert_coherent(
+    mb: &dyn BatchView,
+    row: usize,
+    payload_reads: impl IntoIterator<Item = (usize, usize)>,
+) {
+    assert_eq!(
+        mb.get_null_word(row),
+        gnitz_wire::read_u64_le(mb.null_bmp(), row * 8),
+        "row {row}: null word"
+    );
+    let (pk, s) = mb.pk_region();
+    assert_eq!(mb.get_pk_bytes(row), &pk[row * s..row * s + s], "row {row}: PK bytes");
+    for (pi, sz) in payload_reads {
+        assert_eq!(
+            mb.get_col_ptr(row, pi, sz),
+            &mb.col_data(pi, sz)[row * sz..row * sz + sz],
+            "row {row}: payload column {pi}"
+        );
+    }
 }
 
 /// The batch a map writes its computed columns into.

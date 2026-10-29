@@ -147,6 +147,66 @@ fn client_verb_refuses_sections_the_verb_does_not_carry() {
     }
 }
 
+/// A client frame carries no status and no reply flag, and sets a conflict mode
+/// on a PUSH alone; a multi-item prologue sets no argument but a `DELTA_POLL`'s
+/// `arg0`.
+#[test]
+fn client_verb_refuses_a_header_word_the_verb_does_not_carry() {
+    let verdict = |hdr: ControlHeader| {
+        let tail: &[u8] = if crate::txn_frame::item_shape(hdr.flags.verb).is_some() {
+            b"items"
+        } else {
+            b""
+        };
+        let mut buf = frame(
+            &hdr,
+            if hdr.status == WireStatus::Ok { b"" } else { b"why" },
+            None,
+            false,
+        );
+        buf.extend_from_slice(tail);
+        peek_control_block(&buf).unwrap().client_verb()
+    };
+    for &verb in ClientVerb::ALL {
+        let multi = crate::txn_frame::item_shape(verb).is_some();
+        let hdr = ControlHeader {
+            flags: WireFlags { verb, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(verdict(hdr), Ok(verb), "{verb:?}");
+        let flagged = [
+            WireFlags { continuation: true, ..hdr.flags },
+            WireFlags { scan_last: true, ..hdr.flags },
+            WireFlags { lane: WireLane::SyncAnswer, ..hdr.flags },
+        ];
+        for flags in flagged {
+            let err = verdict(ControlHeader { flags, ..hdr }).unwrap_err();
+            assert!(err.contains("flag"), "{verb:?} {flags:?}: {err}");
+        }
+        let err = verdict(ControlHeader { status: WireStatus::Error, ..hdr }).unwrap_err();
+        assert!(err.contains("status"), "{verb:?}: {err}");
+        let flags = WireFlags {
+            conflict_mode: WireConflictMode::Error,
+            ..hdr.flags
+        };
+        assert_eq!(
+            verdict(ControlHeader { flags, ..hdr }).is_ok(),
+            verb == ClientVerb::Push,
+            "{verb:?} conflict mode"
+        );
+        assert_eq!(
+            verdict(ControlHeader { arg1: 1, ..hdr }).is_ok(),
+            !multi,
+            "{verb:?} arg1"
+        );
+        assert_eq!(
+            verdict(ControlHeader { arg0: 1, ..hdr }).is_ok(),
+            !multi || verb == ClientVerb::DeltaPoll,
+            "{verb:?} arg0"
+        );
+    }
+}
+
 /// A header word the codec cannot read is refused, never read past or coerced.
 #[test]
 fn peek_rejects_an_unreadable_header_word() {

@@ -28,7 +28,7 @@ use crate::test_support::{
 use gnitz_fuzz::input::Input;
 use gnitz_fuzz::seed::{Frame, Seed, Seeds, SEEDS_ENV};
 use gnitz_store::read::Probe;
-use gnitz_store::relation::RelationKind;
+use gnitz_store::relation::{PinScope, RelationKind};
 use gnitz_wire::txn_frame::{decode_scan_multi, encode_items, FrameItem, ScanItem};
 use gnitz_wire::{append_frame, ControlHeader, PkKeys, ReadSpec};
 use gnitz_zset::repr::BatchBuilder;
@@ -99,28 +99,34 @@ impl Session {
         match verb {
             ClientVerb::DdlTxn => self.ddl(body),
             ClientVerb::Push => {
-                let (target, mode) = (ctrl.hdr.target(), ctrl.hdr.flags.conflict_mode);
-                let Ok((batch, _)) = decode_push_frame(&self.cat, frame, ctrl) else {
+                let (tid, mode) = (ctrl.hdr.target_id, ctrl.hdr.flags.conflict_mode);
+                let Ok(push) = decode_push_frame(&self.cat, frame, ctrl) else {
                     return;
                 };
-                let admitted = match target_kind(&self.cat, target, Access::Write) {
-                    Ok(RelationKind::Stream) => check_stream_push(target.tid, batch.as_ref(), mode).is_ok(),
-                    Ok(_) => batch.as_ref().is_some_and(|b| self.inserts(target.tid, b)),
-                    Err(_) => false,
+                let Ok((kind, Some(batch))) = push.admit(&self.cat, Access::Write) else {
+                    return;
                 };
-                if let (true, Some(batch)) = (admitted, batch) {
-                    self.ingest(vec![TxnFamily { tid: target.tid, mode, batch }]);
+                let admitted = match kind {
+                    RelationKind::Stream => check_stream_push(tid, Some(&batch), mode).is_ok(),
+                    _ => self.inserts(tid, &batch),
+                };
+                if admitted {
+                    self.ingest(vec![TxnFamily { tid, mode, batch }]);
                 }
             }
             ClientVerb::PushTxn => {
                 let Ok(items) = decode_push_txn_frame(&self.cat, body) else {
                     return;
                 };
-                let admitted = items.iter().all(|(h, f)| {
-                    target_kind(&self.cat, h.target, Access::TxnWrite).is_ok() && self.inserts(f.tid, &f.batch)
-                });
-                if admitted {
-                    self.ingest(items.into_iter().map(|(_, f)| f).collect());
+                let Ok(families) = items
+                    .into_iter()
+                    .map(|item| item.admit(&self.cat).map(|(_, f)| f))
+                    .collect::<Result<Vec<_>, _>>()
+                else {
+                    return;
+                };
+                if families.iter().all(|f| self.inserts(f.tid, &f.batch)) {
+                    self.ingest(families);
                 }
             }
             ClientVerb::ScanSpec => self.scan(ScanItem::of(frame, &ctrl)),
@@ -133,10 +139,9 @@ impl Session {
             // One process is both the master and its worker, so it pins both.
             ClientVerb::SnapshotOpen => {
                 self.snapshots += 1;
-                let keep = |k| matches!(k, RelationKind::BaseTable | RelationKind::SystemCatalog);
                 self.cat
                     .registry
-                    .pin(self.snapshots, keep)
+                    .pin(self.snapshots, PinScope::Durable)
                     .expect("a fresh snapshot id pins");
             }
             ClientVerb::SnapshotPage => {
@@ -308,10 +313,9 @@ fn ddl_frame(blocks: impl IntoIterator<Item = (SysFamily, Batch)>) -> Vec<u8> {
     let items: Vec<FrameItem> = blocks
         .iter()
         .map(|(family, batch)| FrameItem {
-            hdr: ControlHeader {
-                target_id: family.id(),
-                ..Default::default()
-            },
+            target: family.id().into(),
+            conflict_mode: Default::default(),
+            basis: 0,
             schema: None,
             data: batch.wire_regions(),
         })

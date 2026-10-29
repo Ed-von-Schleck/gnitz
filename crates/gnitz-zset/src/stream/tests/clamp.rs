@@ -35,7 +35,9 @@ proptest! {
             if absorbed {
                 hist.ingest(delta.clone());
             }
-            outs.push(op_weight_clamp(Cow::Borrowed(&delta), &mut |f, l| hist.cursor_within(f, l), absorbed, kind));
+            let open = &mut |f: &[u8], l: &[u8]| hist.cursor_within(f, l);
+            let at = if absorbed { History::Through(open) } else { History::Before(open) };
+            outs.push(op_weight_clamp(Cow::Borrowed(&delta), at, kind));
             if !absorbed {
                 hist.ingest(delta.clone());
             }
@@ -57,8 +59,7 @@ fn weight_clamp_of_an_empty_delta_opens_nothing() {
     for kind in [Distinct, PositivePart] {
         let out = op_weight_clamp(
             Cow::Borrowed(&Batch::empty_with_schema(&schema)),
-            &mut |_, _| panic!("an empty delta opened its history"),
-            false,
+            History::Before(&mut |_, _| panic!("an empty delta opened its history")),
             kind,
         );
         assert!(out.is_empty());

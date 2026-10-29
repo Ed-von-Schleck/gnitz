@@ -38,8 +38,8 @@ impl RelationRegistry {
         match probe {
             Probe::Pk => {
                 keyed_as(relation.schema().pk_stride())?;
+                let table = relation.table_or_err()?;
                 let mut echo = Batch::empty_with_schema(&relation.probe_reply_schema(probe)?);
-                let table = relation.table();
                 keys.iter()
                     .filter(|k| table.has_pk_bytes(k))
                     .for_each(|key| echo.push_key_row(key, 1));
@@ -47,7 +47,7 @@ impl RelationRegistry {
             }
             Probe::PkColumn(col) => {
                 keyed_as(relation.schema().pk_stride())?;
-                let table = relation.table();
+                let table = relation.table_or_err()?;
                 let mut live = keys;
                 live.retain(|k| table.has_pk_bytes(k));
                 relation.gather(live, Cut::Now).project_live(&[col])

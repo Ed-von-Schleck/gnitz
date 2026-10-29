@@ -7,7 +7,7 @@
 //! the loop future the call resolves.
 
 use std::collections::VecDeque;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::task::{Context, Poll, Wake, Waker};
@@ -49,7 +49,8 @@ struct State {
     /// No further call is taken, and the client closes once nothing is owed.
     closing: bool,
 
-    fd: RawFd,
+    /// The client's socket, from its host's `attach` to that host's drop.
+    fd: Option<OwnedFd>,
     /// What the loop reported the socket ready for, and no step has used up.
     ready: Interest,
     /// What the loop is watching the socket for.
@@ -76,13 +77,17 @@ impl Shared {
     fn watch(&self, py: Python<'_>, to: impl FnOnce(&State) -> Interest) {
         let (fd, was, now, callbacks) = {
             let mut st = self.state();
+            // With no socket attached, nothing is watched.
+            let Some(fd) = st.fd.as_ref().map(AsRawFd::as_raw_fd) else {
+                return;
+            };
             let now = to(&st);
             let was = std::mem::replace(&mut st.watched, now);
             let callbacks = st
                 .callbacks
                 .as_ref()
                 .map(|cb| (cb.readable.clone_ref(py), cb.writable.clone_ref(py)));
-            (st.fd, was, now, callbacks)
+            (fd, was, now, callbacks)
         };
         let (on_read, on_write) = callbacks.unzip();
         let event_loop = self.event_loop.bind(py);
@@ -203,10 +208,10 @@ struct LoopHost {
 }
 
 impl Host for LoopHost {
-    fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    fn attach(&mut self, fd: OwnedFd) -> std::io::Result<()> {
         Python::attach(|py| self.shared.watch(py, |_| Interest::NONE));
         let mut st = self.shared.state();
-        st.fd = fd.as_raw_fd();
+        st.fd = Some(fd);
         st.ready = Interest::NONE;
         Ok(())
     }
@@ -256,9 +261,11 @@ impl Host for LoopHost {
     }
 }
 
+/// Lets go of the socket, which the callbacks' share of the state outlives.
 impl Drop for LoopHost {
     fn drop(&mut self) {
         Python::attach(|py| self.shared.watch(py, |_| Interest::NONE));
+        self.shared.state().fd = None;
     }
 }
 

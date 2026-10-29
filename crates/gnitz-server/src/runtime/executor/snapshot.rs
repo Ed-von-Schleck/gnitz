@@ -15,7 +15,7 @@ use super::{send_ack, send_msg, Shared};
 use crate::runtime::frame::WireMsg;
 use crate::runtime::reactor::SendBody;
 use crate::runtime::sal::Read;
-use gnitz_store::relation::RelationKind;
+use gnitz_store::relation::PinScope;
 use gnitz_wire::snapshot::PageRequest;
 use gnitz_wire::{ControlHeader, WireFault};
 use gnitz_zset::algebra::Slot;
@@ -42,7 +42,7 @@ pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u6
             shared
                 .cat_mut()
                 .registry
-                .pin(id, |k| k == RelationKind::SystemCatalog)
+                .pin(id, PinScope::SystemCatalog)
                 .map_err(WireFault::from)?;
             cut.read(Read::Pin { snapshot: id })
         })

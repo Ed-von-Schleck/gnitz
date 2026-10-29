@@ -10,12 +10,12 @@ use rustc_hash::FxHashMap;
 use gnitz_foundation::fault::Seam;
 
 use super::validate::{Checks, TxnFamily};
-use super::{not_found, park_until, target_kind, Access, Shared};
+use super::{not_found, park_until, target_kind, Access, CatalogLock, Shared};
 use crate::catalog::CatalogEngine;
 use crate::runtime::reactor::RecvBuf;
 use crate::runtime::sync::{AsyncRwLock, ReadGuard, WriteGuard};
 use gnitz_store::relation::RelationKind;
-use gnitz_wire::{ClientVerb, DecodedControl, Target, WireFault, WireStatus};
+use gnitz_wire::{ClientVerb, DecodedControl, Target, WireConflictMode, WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 
 /// `GNITZ_INJECT_PUSH_HOLD_FOR_DDL`: see `hold_push_for_ddl`.
@@ -25,14 +25,14 @@ static PUSH_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_PUSH_HOLD_FOR_DDL");
 const PUSH_HOLD_MAX_POLLS: u32 = 2_000;
 
 /// Hold one decoded push, before its catalog read lock, until a DDL has replaced
-/// the schema record `seen` its decode matched — the window a queued `ALTER TABLE`
+/// the schema record its decode matched — the window a queued `ALTER TABLE`
 /// writer opens between that match and the gate.
-async fn hold_push_for_ddl(shared: &Shared, target_id: u64, seen: &Rc<[u8]>) {
+async fn hold_push_for_ddl(shared: &Shared, push: &DecodedPush) {
     park_until(shared, PUSH_HOLD_MAX_POLLS, "push hold", || {
         shared
             .cat()
-            .wire_target(target_id)
-            .is_none_or(|(_, now)| !Rc::ptr_eq(seen, now))
+            .wire_target(push.target.tid)
+            .is_none_or(|(_, now)| !Rc::ptr_eq(&push.seen, now))
     })
     .await
 }
@@ -47,15 +47,12 @@ pub(super) struct Writes {
     table_locks: RefCell<FxHashMap<u64, AsyncRwLock>>,
     /// OCC per-table commit-LSN map: `tid → the zone LSN its last accepted write
     /// this boot rode`. A missing entry reads as `boot_seed`.
-    /// Single-threaded reactor — a plain `RefCell`, and no borrow is ever held across an
-    /// `.await`.
     table_commit_lsn: RefCell<FxHashMap<u64, u64>>,
     /// The SAL watermark when the executor started: every read watermark this
     /// boot is at or above it, and every commit's zone above it.
     boot_seed: u64,
-    /// The caches write validation probes less through. A cache entry stays
-    /// true of committed rows because a write that changes them holds the
-    /// table's write guard in `table_locks`.
+    /// The caches write validation probes less through; see
+    /// [`Checks::committed`].
     pub(super) checks: Checks,
 }
 
@@ -93,8 +90,8 @@ impl Writes {
         self.table_locks.borrow_mut().entry(tid).or_default().clone()
     }
 
-    /// The read guard on `tid`.
-    async fn lock_table_shared(&self, tid: u64) -> HeldTables {
+    /// The read guard on `tid`, taken under the catalog read guard.
+    async fn lock_table_shared(&self, _catalog: &ReadGuard<CatalogLock>, tid: u64) -> HeldTables {
         let guard = self.table_lock(tid).read().await;
         HeldTables::Shared { tid, _guard: guard }
     }
@@ -104,7 +101,7 @@ impl Writes {
     /// once, since re-guarding a lock this task holds would hang forever.
     ///
     /// Owned, because the set is read out of the catalog and this loop awaits.
-    async fn lock_tables_exclusive(&self, mut tids: Vec<u64>) -> HeldTables {
+    async fn lock_tables_exclusive(&self, _catalog: &ReadGuard<CatalogLock>, mut tids: Vec<u64>) -> HeldTables {
         tids.sort_unstable();
         tids.dedup();
         let mut guards = Vec::with_capacity(tids.len());
@@ -140,7 +137,7 @@ impl Shared {
     /// LSN to the write's.
     async fn commit(
         &self,
-        _catalog: &ReadGuard,
+        _catalog: &ReadGuard<CatalogLock>,
         held: &HeldTables,
         mut families: Vec<TxnFamily>,
     ) -> Result<u64, WireFault> {
@@ -169,24 +166,44 @@ impl Shared {
     }
 }
 
-/// Decode a push frame against the catalog: its token must still name its target,
-/// its record must lay out its target's columns, and the target's record is
-/// answered for [`CatalogEngine::recheck_record`]. The token comes first, as in
-/// [`target_kind`], which checks it again under the guard.
-/// Runs before the catalog read guard, and off it: `AsyncRwLock` is
-/// writer-preferring, so a bulk load's multi-megabyte decode under the guard
-/// would stall every DDL writer behind it.
+/// A push frame decoded off the catalog guard by [`decode_push_frame`]. Its batch
+/// is handed out only by [`DecodedPush::admit`], which re-judges it under the
+/// guard.
+pub(super) struct DecodedPush {
+    target: Target,
+    batch: Option<Batch>,
+    /// The target's schema record the frame's record matched.
+    seen: Rc<[u8]>,
+}
+
+impl DecodedPush {
+    /// Re-judge the push under the catalog guard, as `access`: its token still
+    /// names a target that serves it, and its record still lays out the
+    /// target's columns. Answers the target's kind and the batch.
+    pub(super) fn admit(self, cat: &CatalogEngine, access: Access) -> Result<(RelationKind, Option<Batch>), WireFault> {
+        let kind = target_kind(cat, self.target, access)?;
+        if self.batch.is_some() {
+            cat.recheck_record(self.target.tid, &self.seen)?;
+        }
+        Ok((kind, self.batch))
+    }
+}
+
+/// Decode a push frame against the catalog: its token must still name its
+/// target, and its record must lay out its target's columns. Runs off the
+/// catalog guard, since the lock is writer-preferring and a bulk load's decode is
+/// long; [`DecodedPush::admit`] re-judges it under the guard.
 pub(super) fn decode_push_frame(
     cat: &CatalogEngine,
     data: &[u8],
     ctrl: DecodedControl,
-) -> Result<(Option<Batch>, Rc<[u8]>), WireFault> {
-    let tid = ctrl.hdr.target_id;
-    cat.check_token(ctrl.hdr.target())?;
-    let (rel, target) = cat.wire_target(tid).ok_or_else(|| not_found(tid))?;
+) -> Result<DecodedPush, WireFault> {
+    let target = ctrl.hdr.target();
+    cat.check_token(target)?;
+    let (rel, record) = cat.wire_target(target.tid).ok_or_else(|| not_found(target.tid))?;
     let schema = rel.schema();
     match &ctrl.schema {
-        Some(r) => gnitz_wire::schema_block::check_same_types(&data[r.clone()], target)
+        Some(r) => gnitz_wire::schema_block::check_same_types(&data[r.clone()], record)
             .map_err(|e| format!("decode error: {e}"))?,
         None if ctrl.data.is_some() => return Err("decode error: a data block without a schema block".into()),
         None => {}
@@ -196,7 +213,7 @@ pub(super) fn decode_push_frame(
         .map(|r| Batch::decode_foreign_wal_block(&data[r], &schema))
         .transpose()
         .map_err(|e| format!("decode error: {e}"))?;
-    Ok((batch, target.clone()))
+    Ok(DecodedPush { target, batch, seen: record.clone() })
 }
 
 /// Handle a client push: decode the frame, then commit it under the catalog read
@@ -209,45 +226,34 @@ pub(super) fn decode_push_frame(
 /// pk list) fails the way a non-empty one would instead of being masked by a
 /// no-op ACK.
 pub(super) async fn handle_push(shared: &Rc<Shared>, buf: RecvBuf, ctrl: DecodedControl) -> Result<u64, WireFault> {
-    let target = ctrl.hdr.target();
-    let target_id = target.tid;
+    let target_id = ctrl.hdr.target_id;
     let mode = ctrl.hdr.flags.conflict_mode;
 
-    let (decoded, _charge) = buf.decode(|data| decode_push_frame(shared.cat(), data, ctrl));
-    let (batch, seen) = decoded?;
+    let (decoded, _charge) = buf.decode(|data| decode_push_frame(&shared.cat(), data, ctrl));
+    let push = decoded?;
     if PUSH_HOLD_FOR_DDL.take_once() {
-        hold_push_for_ddl(shared, target_id, &seen).await;
+        hold_push_for_ddl(shared, &push).await;
     }
     let catalog = shared.catalog_rwlock.read().await;
-    // Under the catalog guard, not at decode: a dropped id can be re-created as
-    // a stream between the two, and the stream rules below read the kind.
-    let is_stream = target_kind(shared.cat(), target, Access::Write)? == RelationKind::Stream;
-    if is_stream {
+    let (kind, batch) = push.admit(&shared.cat(), Access::Write)?;
+    if kind == RelationKind::Stream {
         check_stream_push(target_id, batch.as_ref(), mode)?;
     }
-
     let Some(batch) = batch else {
         return Ok(0);
     };
-
-    shared.cat().recheck_record(target_id, &seen)?;
 
     // See `Writes::table_locks`. The exclusive set covers the tables this
     // push's deletes cascade to.
     let held = if shared.cat().push_reads_committed_state(target_id, mode) {
         let deletes = !batch.all_weights_positive();
         let locks = shared.cat().write_lock_set(target_id, deletes);
-        shared.writes.lock_tables_exclusive(locks).await
+        shared.writes.lock_tables_exclusive(&catalog, locks).await
     } else {
-        shared.writes.lock_table_shared(target_id).await
+        shared.writes.lock_table_shared(&catalog, target_id).await
     };
     let families = vec![TxnFamily { tid: target_id, mode, batch }];
-    let zone_lsn = shared.commit(&catalog, &held, families).await?;
-    // A stream replies `0`: its push is not durable, and an ACK reports an LSN
-    // only for a write a restart must recover. Keyed on the target rather than on
-    // whether this batch happened to open a zone, so a stream push the committer
-    // coalesced with a base-table push still answers `0`.
-    Ok(if is_stream { 0 } else { zone_lsn })
+    shared.commit(&catalog, &held, families).await
 }
 
 /// PUSH_TXN: validate the bundle under the catalog read lock and its tables'
@@ -255,64 +261,75 @@ pub(super) async fn handle_push(shared: &Rc<Shared>, buf: RecvBuf, ctrl: Decoded
 /// zone. Every rejection is pre-SAL, so a fault or a conflict commits nothing.
 pub(super) async fn handle_push_txn(shared: &Rc<Shared>, buf: RecvBuf, ctrl: DecodedControl) -> Result<u64, WireFault> {
     // 1. Decode.
-    let (decoded, _charge) = buf.decode(|data| decode_push_txn_frame(shared.cat(), &data[ctrl.body]));
+    let (decoded, _charge) = buf.decode(|data| decode_push_txn_frame(&shared.cat(), &data[ctrl.body]));
     let items = decoded?;
 
-    // 2. Catalog read lock (excludes a concurrent DROP/DDL), then the
-    //    catalog-dependent rules per family.
+    // 2. Catalog read lock (excludes a concurrent DROP/DDL), then each family
+    //    admitted under it.
     let catalog = shared.catalog_rwlock.read().await;
-    for (head, _) in &items {
-        target_kind(shared.cat(), head.target, Access::TxnWrite)?;
-        shared.cat().recheck_record(head.target.tid, &head.seen)?;
+    let mut bases = Vec::with_capacity(items.len());
+    let mut families = Vec::with_capacity(items.len());
+    for item in items {
+        let (basis, family) = item.admit(&shared.cat())?;
+        bases.push(basis);
+        families.push(family);
     }
 
     // 3. Acquire the per-table lock union ⋃ write_lock_set(tid) exclusively.
-    let union = items
+    let union = families
         .iter()
-        .flat_map(|(_, f)| shared.cat().write_lock_set(f.tid, !f.batch.all_weights_positive()))
+        .flat_map(|f| shared.cat().write_lock_set(f.tid, !f.batch.all_weights_positive()))
         .collect();
-    let held = shared.writes.lock_tables_exclusive(union).await;
+    let held = shared.writes.lock_tables_exclusive(&catalog, union).await;
 
     // 3b. OCC. A blind family's `BLIND` basis no commit exceeds.
-    if let Some((head, _)) = items
-        .iter()
-        .find(|(h, _)| shared.writes.written_since(&held, h.target.tid, h.basis))
+    if let Some(f) = (families.iter().zip(&bases))
+        .find_map(|(f, &basis)| shared.writes.written_since(&held, f.tid, basis).then_some(f))
     {
         return Err(WireFault {
             status: WireStatus::TxnConflict,
             text: format!(
                 "transaction conflict on '{}': it was written after the read this write was built from; retry",
-                shared.cat().qualified_name(head.target.tid)
+                shared.cat().qualified_name(f.tid)
             ),
         });
     }
 
     // 4. Distributed bundle validation, and the commit.
-    let families = items.into_iter().map(|(_, f)| f).collect();
     shared.commit(&catalog, &held, families).await
 }
 
-/// What the gate and the OCC check read of one `PUSH_TXN` family.
-pub(super) struct TxnHead {
-    pub(super) target: Target,
-    pub(super) basis: u64,
-    pub(super) seen: Rc<[u8]>,
+/// One `PUSH_TXN` family as decoded: the push, its conflict mode, and the read
+/// basis its OCC check compares against.
+pub(super) struct TxnItem {
+    push: DecodedPush,
+    mode: WireConflictMode,
+    basis: u64,
 }
 
-/// Decode a `PUSH_TXN` frame body into its families, in frame order, each with
-/// its head, applying every rule that needs no catalog lock.
-pub(super) fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<Vec<(TxnHead, TxnFamily)>, WireFault> {
+impl TxnItem {
+    /// [`DecodedPush::admit`] as a transaction write: the family's basis and
+    /// the family.
+    pub(super) fn admit(self, cat: &CatalogEngine) -> Result<(u64, TxnFamily), WireFault> {
+        let tid = self.push.target.tid;
+        let (_, batch) = self.push.admit(cat, Access::TxnWrite)?;
+        let batch = batch.expect("a PUSH_TXN item carries a data block");
+        Ok((self.basis, TxnFamily { tid, mode: self.mode, batch }))
+    }
+}
+
+/// Decode a `PUSH_TXN` frame body into its families, in frame order, applying
+/// every rule that needs no catalog lock.
+pub(super) fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<Vec<TxnItem>, WireFault> {
     let items =
         gnitz_wire::txn_frame::decode_items(body, ClientVerb::PushTxn).map_err(|e| format!("decode error: {e}"))?;
     items
         .into_iter()
         .map(|(frame, ctrl)| {
-            let (target, mode, basis) = (ctrl.hdr.target(), ctrl.hdr.flags.conflict_mode, ctrl.hdr.arg0);
-            let tid = target.tid;
-            let (batch, seen) =
+            let (mode, basis, tid) = (ctrl.hdr.flags.conflict_mode, ctrl.hdr.arg0, ctrl.hdr.target_id);
+            let push =
                 decode_push_frame(cat, frame, ctrl).map_err(|e| e.in_context(format_args!("TXN family {tid}")))?;
-            let batch = batch.expect("a PUSH_TXN item carries a data block");
-            Ok((TxnHead { target, basis, seen }, TxnFamily { tid, mode, batch }))
+            Ok(TxnItem { push, mode, basis })
         })
         .collect()
 }
@@ -322,12 +339,8 @@ pub(super) fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<
 /// retraction at all — and rejecting `Error` mode is what keeps
 /// `push_reads_committed_state` false, and with it the shared table lock and a
 /// validator that would probe a stream's absent store.
-pub(super) fn check_stream_push(
-    target_id: u64,
-    batch: Option<&Batch>,
-    mode: gnitz_wire::WireConflictMode,
-) -> Result<(), String> {
-    if mode == gnitz_wire::WireConflictMode::Error {
+pub(super) fn check_stream_push(target_id: u64, batch: Option<&Batch>, mode: WireConflictMode) -> Result<(), String> {
+    if mode == WireConflictMode::Error {
         return Err(format!(
             "table {target_id} is a stream: conflict mode 'error' asserts a primary-key \
              uniqueness a stream does not have"

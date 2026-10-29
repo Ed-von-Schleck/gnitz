@@ -12,9 +12,7 @@
 //!
 //! Validating a write also completes it: the rows its
 //! deletes reach through `ON DELETE CASCADE` edges join the bundle as families
-//! of their own, under the same rules. The DDL-time pre-flight for CREATE UNIQUE INDEX is
-//! `unique_preflight.rs`, which shares nothing with this file but the
-//! `UniqueFilter` it seeds.
+//! of their own, under the same rules.
 
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
@@ -383,8 +381,10 @@ impl Checks {
         // No family whose write reads committed state ⇒ no table would be folded
         // and no rule would probe, so a plain push returns without building the
         // bundle.
-        let cat = disp.cat();
-        let reads_committed = families.iter().any(|f| cat.push_reads_committed_state(f.tid, f.mode));
+        let reads_committed = {
+            let cat = disp.cat();
+            families.iter().any(|f| cat.push_reads_committed_state(f.tid, f.mode))
+        };
         if !reads_committed {
             return Ok(());
         }
@@ -411,7 +411,7 @@ impl Checks {
         families: &[TxnFamily],
         cascade: &mut Cascade,
     ) -> Result<Vec<TxnFamily>, WireFault> {
-        let mut b = TxnBundle::new(disp.cat(), families)?;
+        let mut b = TxnBundle::new(&disp.cat(), families)?;
 
         for t in &b.tables {
             if !t.cons.uniques.is_empty() && b.surviving(t.tid).next().is_some() {
@@ -441,7 +441,7 @@ impl Checks {
                     return Ok(false);
                 };
                 if e.needs_probe {
-                    return Err(pk_violation_err(disp.cat(), t.tid, &t.schema, pk, Clash::Committed));
+                    return Err(pk_violation_err(&disp.cat(), t.tid, &t.schema, pk, Clash::Committed));
                 }
                 e.committed = true;
                 Ok(true)
@@ -469,7 +469,7 @@ impl Checks {
                 Rule::Unique { cols, spec } => {
                     let fold = &b.table(*tid).fold;
                     if unique_violation.is_none() && answered.any(|(_, e)| !fold.contains_key(spec.split_entry(e).1)) {
-                        let err = unique_violation_err(disp.cat(), *tid, cols.as_slice(), Clash::Committed);
+                        let err = unique_violation_err(&disp.cat(), *tid, cols.as_slice(), Clash::Committed);
                         unique_violation = Some(err);
                     }
                 }
@@ -517,7 +517,8 @@ fn plan_pk_checks<'a>(
     checks: &mut Vec<Check<Rule<'a>>>,
 ) -> Result<(), WireFault> {
     for t in &b.tables {
-        let rel = disp.cat().registry.relation_or_err(t.tid)?;
+        let cat = disp.cat();
+        let rel = cat.registry.relation_or_err(t.tid)?;
         let stride = t.schema.pk_stride();
         let parent_cols = || t.cons.fks_as_parent.iter().map(|e| e.parent_col);
         let mut payload_refs: Vec<usize> = parent_cols().filter(|&c| !t.schema.is_pk_col(c)).collect();
@@ -578,7 +579,7 @@ fn plan_unique_checks<'a>(
             // two rows of the bundle claiming it.
             if keys.len() * key_size != spans.len() {
                 violation.get_or_insert_with(|| {
-                    unique_violation_err(disp.cat(), tid, col_indices.as_slice(), Clash::InBatch)
+                    unique_violation_err(&disp.cat(), tid, col_indices.as_slice(), Clash::InBatch)
                 });
                 continue;
             }
@@ -588,7 +589,8 @@ fn plan_unique_checks<'a>(
             if keys.is_empty() {
                 continue;
             }
-            let rel = disp.cat().registry.relation_or_err(tid)?;
+            let cat = disp.cat();
+            let rel = cat.registry.relation_or_err(tid)?;
             let plan = Rule::Unique { cols: col_indices, spec: spec.clone() };
             checks.push(Check::new(rel, Probe::Index(col_indices, NonZeroU64::MAX), keys, plan)?);
         }
@@ -630,7 +632,8 @@ fn plan_fk_existence<'a>(
 
         // The parent's own PK store where the referenced column is its lone PK
         // column, its UNIQUE index on the column otherwise.
-        let parent = disp.cat().registry.relation_or_err(parent_tid)?;
+        let cat = disp.cat();
+        let parent = cat.registry.relation_or_err(parent_tid)?;
         let parent_schema = parent.schema();
         // An FK column has its parent column's type, so its image is the key's.
         let (span, probe) = if parent_schema.lone_pk_col() == Some(parent_col) {
@@ -856,7 +859,8 @@ async fn removed_references(
         let mut checks: Vec<Check<ReferencePlan>> = Vec::new();
         for (edge, cascades, values) in seeds.drain(..) {
             let FkEdge { child_tid, fk_col, .. } = edge;
-            let child = disp.cat().registry.relation_or_err(child_tid)?;
+            let cat = disp.cat();
+            let child = cat.registry.relation_or_err(child_tid)?;
             let cols = edge.child_index_cols();
             let index = child
                 .index_on(cols.as_slice())
@@ -927,8 +931,8 @@ async fn removed_references(
             if new.is_empty() {
                 continue;
             }
-            let cascading = disp
-                .cat()
+            let cat = disp.cat();
+            let cascading = cat
                 .fks_as_parent(tid)
                 .iter()
                 .filter(|e| e.on_delete == FkAction::Cascade);

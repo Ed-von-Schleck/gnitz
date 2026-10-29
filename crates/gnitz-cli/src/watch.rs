@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use gnitz_core::{block_on, ClientError, ScanReply, Subscription};
+use gnitz_core::{block_on, ClientError, ScanReply, SubId, Subscription};
 use gnitz_sql::GnitzSqlError;
 use gnitz_wire::WireStatus;
 use nu_ansi_term::{Color, Style};
@@ -44,7 +44,7 @@ impl Shell {
     }
 
     /// Subscribe to `plan` from scratch: its id, and the view whole.
-    fn subscribe(&mut self, plan: &Subscription) -> Result<(u64, ScanReply), ClientError> {
+    fn subscribe(&mut self, plan: &Subscription) -> Result<(SubId, ScanReply), ClientError> {
         let (id, rows, _cursor) = block_on(self.client.subscribe(&*plan.upstream, None, &plan.schema, &plan.spec))?;
         Ok((id, rows))
     }

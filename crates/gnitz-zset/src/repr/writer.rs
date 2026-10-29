@@ -9,15 +9,11 @@ use std::ops::Range;
 
 /// Writes rows `[at, at + rows)` of a pre-allocated arena, each region handed
 /// out as a slice of exactly those rows: a batch's tail, or a wire block's fixed
-/// bytes. A batch counts the rows only once its writer is done with them (see
-/// `Batch::write_rows`), so no reader reaches a row before its regions are
-/// written.
+/// bytes.
 ///
-/// **Whoever fills a writer writes every byte of every one of its rows** — the
-/// batch invariant (see `Batch::with_capacity`): the arena skips its memset, so
-/// a skipped cell leaks the recycled buffer's previous contents rather than
-/// reading back a zero. Hence the `repr::scatter` kernels take exactly `rows`
-/// rows and write every payload cell unconditionally, a null cell included.
+/// **Whoever fills a writer writes every byte of every row it hands out, a NULL
+/// cell's included**: the arena is uninitialised, and a batch counts the rows
+/// only once the writer is done.
 pub(crate) struct DirectWriter<'a> {
     /// An arena of `cap` rows under `schema`.
     data: &'a mut [u8],
@@ -29,8 +25,6 @@ pub(crate) struct DirectWriter<'a> {
     /// `None` relocates every cell on its own: two cells naming one source span
     /// each get a copy.
     blob_cache: Option<&'a mut BlobCache>,
-    /// Borrowed, not owned: the scatter reads it per column, and copying it in
-    /// would put a `memcpy` on every writer open.
     pub schema: &'a SchemaDescriptor,
 }
 
@@ -142,6 +136,21 @@ impl<'a> DirectWriter<'a> {
             &mut region[at * stride..(at + rows) * stride]
         });
         (regions, &mut *self.blob, self.blob_cache.as_deref_mut())
+    }
+
+    /// The PK region and payload columns `cols`' regions, each bounded to this
+    /// writer's rows, with the heap a string cell's bytes are appended to.
+    #[inline(always)]
+    pub(crate) fn pk_and_payload_mut(
+        &mut self,
+        cols: Range<usize>,
+    ) -> (&mut [u8], impl Iterator<Item = &mut [u8]>, &mut Vec<u8>) {
+        let (mut regions, blob, _) = self.split_mut();
+        let pk = regions.nth(REG_PK).expect("a batch has a PK region");
+        let cols = regions
+            .skip(REG_PAYLOAD_START + cols.start - REG_PK - 1)
+            .take(cols.len());
+        (pk, cols, blob)
     }
 
     /// Payload column `pi`'s region, bounded to this writer's rows.

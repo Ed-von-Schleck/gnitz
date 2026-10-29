@@ -237,7 +237,7 @@ fn source(
     frame: &Frame,
     leading: Vec<Vec<BoundExpr>>,
 ) -> Result<NodeId, GnitzSqlError> {
-    // This path compiles no residual.
+    // The bound only narrows the scan; every leading conjunct is still filtered below.
     let bound = match src {
         SegSource::Segment { .. } => ReadBound::None,
         SegSource::Catalog(d) => {

@@ -1,14 +1,7 @@
 //! Server executor: the serving loop (accept, the signal loop, the race against
 //! a worker's death), the `Shared` state, the request router, the scan and
-//! resolve handlers, and the reply-frame vocabulary. Tick scheduling, the
-//! pending-tick ledger and read freshness are the child `tick`; PUSH and
-//! PUSH_TXN, with the table locks and the OCC check, the child `write`, which
-//! checks each write through the child `validate`: the PK / FK / unique-index
-//! rules and the caches that let them probe less. The catalog-zone write path
-//! is the child `ddl`; the delta feed's readers are the child `delta`; a
-//! connection's snapshots are the child `snapshot`, and BACKUP the child
-//! `backup`. The durable-commit batcher is the child `committer`; a client
-//! connection's handle and cork is the child `peer`.
+//! resolve handlers, and the reply-frame vocabulary. Each child module states
+//! its own scope.
 //!
 //! The master owns one `Reactor`: [`run`] spawns its tasks on it
 //! and races the signal loop against a worker's death.
@@ -32,7 +25,7 @@ mod tick;
 mod validate;
 mod write;
 
-use std::cell::Cell;
+use std::cell::{Cell, Ref, RefMut};
 use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
 use std::time::Duration;
@@ -64,9 +57,6 @@ use gnitz_zset::repr::Batch;
 /// instead of wedging the node. It logs when it parks and which way it released,
 /// so a test waits for the park and asserts the release rather than passing on a
 /// hold that never engaged.
-///
-/// Polling rather than a handle keeps each seam self-contained: nothing outside
-/// one needs to know it exists.
 async fn park_until(shared: &Shared, polls: u32, what: &str, ready: impl Fn() -> bool) {
     gnitz_note!("{}: parked", what);
     for _ in 0..polls {
@@ -79,14 +69,17 @@ async fn park_until(shared: &Shared, polls: u32, what: &str, ready: impl Fn() ->
     gnitz_warn!("{}: seam armed but the event never arrived; releasing", what);
 }
 
+/// The tag of the catalog lock: a guard of it orders a task against DDL.
+pub(crate) enum CatalogLock {}
+
 /// Shared executor state held by every task.
 ///
-/// Lock order: the catalog, then a table lock or the tick gate, then the SAL
-/// writer.
+/// Lock order: the catalog, then a table lock or the committer's pause and the
+/// tick gate, then the SAL writer.
 pub struct Shared {
     dispatcher: MasterDispatcher,
     committer: Committer,
-    catalog_rwlock: AsyncRwLock,
+    catalog_rwlock: AsyncRwLock<CatalogLock>,
     ticks: Ticks,
     writes: Writes,
     feeds: Feeds,
@@ -102,23 +95,19 @@ pub struct Shared {
 }
 
 impl Shared {
-    fn cat(&self) -> &CatalogEngine {
+    fn cat(&self) -> Ref<'_, CatalogEngine> {
         self.dispatcher.cat()
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn cat_mut(&self) -> &mut CatalogEngine {
+    fn cat_mut(&self) -> RefMut<'_, CatalogEngine> {
         self.dispatcher.cat_mut()
     }
 
-    /// Drop the per-relation state of a relation whose DROP is durable. Takes the
-    /// catalog write guard because every `table_lock` acquisition is enclosed by a
-    /// catalog *read* guard, so holding the write guard is what proves no task
-    /// holds or awaits the lock being removed.
-    ///
-    /// Every per-relation state a drop must reclaim is cleared here: ids are
-    /// never reused, so nothing else would ever reclaim it.
-    fn forget_relation(&self, _catalog_write: &WriteGuard, id: u64) {
+    /// Drop the per-relation state of a relation whose DROP is durable: every
+    /// per-relation state a drop reclaims is cleared here. Every table lock is
+    /// taken under a catalog read guard, so the write guard proves no task holds
+    /// or awaits the lock being removed.
+    fn forget_relation(&self, _catalog_write: &WriteGuard<CatalogLock>, id: u64) {
         self.feeds.wake(id);
         self.writes.forget(id);
         self.ticks.forget(id);
@@ -297,8 +286,8 @@ fn reload_tls(tls: Option<&TlsListener>) {
 
 /// Until SIGTERM/SIGINT: poke the committer whenever the SAL wants a checkpoint.
 /// Then, with [`Committer::write`] and [`Committer::backup`] refusing since the
-/// signal, run one final
-/// checkpoint behind every write it admitted, and stop the workers.
+/// signal, run one final checkpoint behind every write it admitted, and stop the
+/// workers.
 async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>) {
     loop {
         shared.dispatcher.reactor().sleep(WORKER_WATCH).await;
@@ -336,8 +325,7 @@ async fn handle_message(
     buf: RecvBuf,
     shared: &Rc<Shared>,
 ) {
-    // ONE control-header parse for the whole request: routing, the schema-hint
-    // decision and the push decode all read this same parse.
+    // One control-header parse for the whole request.
     let ctrl = match gnitz_wire::peek_control_block(buf.as_slice()) {
         Ok(c) => c,
         Err(e) => {
@@ -385,9 +373,7 @@ async fn dispatch_request(
             .await
             .map(Some),
 
-        // An id allocation names no relation, so `target_id` is only echoed —
-        // and a frame that sets one is still allocated, rather than falling
-        // through to a scan of that id.
+        // An id allocation names no relation, so `target_id` is only echoed.
         ClientVerb::AllocIds => shared
             .cat_mut()
             .allocate_ids(ctrl.hdr.arg0)
@@ -543,13 +529,17 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -
     .await?;
     let mut scanned: Vec<Scanned> = Vec::with_capacity(scans.len());
     for scan in scans {
-        let kind = target_kind(shared.cat(), scan.target, Access::Read)?;
+        let kind = target_kind(&shared.cat(), scan.target, Access::Read)?;
         let (local, lsn) = match kind {
             RelationKind::SystemCatalog => {
                 let spec = ReadSpec::decode(scan.spec).map_err(|e| format!("decode error: {e}"))?;
-                let registry = &shared.cat().registry;
-                let rows = registry.scan_spec(scan.target.tid, spec, scan.reply_layout, None)?;
-                (Some(rows), read_watermark(shared, kind))
+                let rows = shared
+                    .cat()
+                    .registry
+                    .scan_spec(scan.target.tid, spec, scan.reply_layout, None)?;
+                // Read off the master's own copy, under no SAL hold: answered
+                // with the last tick's watermark.
+                (Some(rows), shared.ticks.last_lsn())
             }
             _ => (None, 0),
         };
@@ -561,7 +551,7 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -
         let fanned = scans.iter().zip(&mut scanned).filter(|(_, s)| s.local.is_none());
         let cut = shared.dispatcher.scan_cut(|cut| {
             for (scan, s) in fanned {
-                s.lsn = read_watermark(shared, s.kind);
+                s.lsn = read_watermark(shared, s.kind, cut.sal());
                 cut.read(Read::ScanSpec {
                     tid: scan.target.tid,
                     reply_layout: scan.reply_layout,

@@ -97,7 +97,7 @@ impl LogicalProgram {
     pub(crate) fn is_identity_map(&self, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> bool {
         in_schema.same_layout(out_schema)
             && self.instrs().is_empty()
-            && self.sinks.iter().copied().eq(in_schema
+            && self.sinks().iter().copied().eq(in_schema
                 .payload_columns()
                 .map(|(pi, _)| Sink::Col(in_schema.payload_col_idx(pi) as u32)))
     }
@@ -113,14 +113,14 @@ impl LogicalProgram {
     ) -> Result<(ColMoves, Vec<Emit>), ExprValidateErr> {
         use ExprValidateErr as E;
         let out_slots = out_schema.payload_locators();
-        if self.sinks.len() != out_slots.len() {
+        if self.sinks().len() != out_slots.len() {
             return Err(E::OutputSlotCountMismatch {
-                sinks: self.sinks.len(),
+                sinks: self.sinks().len(),
                 num_payload_cols: out_slots.len(),
             });
         }
         let (mut copies, mut emits) = (Vec::new(), Vec::new());
-        for (slot, (sink, out_loc)) in self.sinks.iter().zip(out_slots).enumerate() {
+        for (slot, (sink, out_loc)) in self.sinks().iter().zip(out_slots).enumerate() {
             let (out, type_code) = (slot as u32, out_loc.type_code());
             match *sink {
                 Sink::Col(col) => {

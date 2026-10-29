@@ -37,14 +37,12 @@ pub struct ServerHandle {
     paths: BootPaths,
     tmpdir: Option<TempDir>,
     workers: usize,
-    /// The boot's TLS argv and server-side environment, replayed by
+    /// The boot's flags and server-side environment, replayed by
     /// [`Self::restart`].
-    args: Vec<String>,
+    flags: Flags,
     env: Vec<(String, String)>,
-    /// mTLS client cert/key PEM paths (minted by `start_mtls`), for
-    /// [`Self::mtls_target`]. `None` for non-mTLS servers.
-    mtls_client: Option<(PathBuf, PathBuf)>,
-    /// The token that file held at boot, until `start_tls_with_token` hands it out.
+    /// The token the token file held at boot, until `start_tls_with_token`
+    /// hands it out.
     first_token: Option<String>,
 }
 
@@ -87,8 +85,10 @@ impl ServerHandle {
 
     /// The `--backup-dir` of a [`Self::start_with_backups`] server.
     pub fn backups(&self) -> PathBuf {
-        let dir = self.args.iter().find_map(|a| a.strip_prefix("--backup-dir="));
-        PathBuf::from(dir.expect("backups requires a start_with_backups server"))
+        self.flags
+            .backup_dir
+            .clone()
+            .expect("backups requires a start_with_backups server")
     }
 
     /// Start with a TLS listener on an ephemeral loopback port, reached through
@@ -130,11 +130,10 @@ impl ServerHandle {
 
     /// The token file a [`Self::start_tls_with_token`] server reads.
     pub fn token_file(&self) -> &Path {
-        self.args
-            .iter()
-            .find_map(|a| a.strip_prefix("--auth-tokens="))
-            .map(Path::new)
-            .expect("token_file requires a start_tls_with_token server")
+        match self.client_auth() {
+            Some(ClientAuth::Token { file }) => file,
+            _ => panic!("token_file requires a start_tls_with_token server"),
+        }
     }
 
     /// Send the master SIGHUP, which reloads the TLS listener, and wait until
@@ -195,33 +194,31 @@ impl ServerHandle {
         };
         let env: Vec<(String, String)> = extra_env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
-        // Build the TLS argv, minting what the client authentication needs.
-        let mut args: Vec<String> = Vec::new();
-        if let Boot::WithBackups = how {
+        let backup_dir = matches!(how, Boot::WithBackups).then(|| {
             let backups = tmpdir.path().join("backups");
             fs::create_dir(&backups).expect("create the backup directory");
-            args.push(format!("--backup-dir={}", backups.display()));
-        }
-        let mut mtls_client: Option<(PathBuf, PathBuf)> = None;
+            backups
+        });
+        // Mint what the client authentication needs.
         let mut first_token = None;
-        if let Some(addr) = tls_listen {
-            args.push(format!("--tls-listen={addr}"));
-            match auth {
-                Auth::None => {}
+        let tls = tls_listen.map(|listen| Tls {
+            listen: listen.to_string(),
+            auth: match auth {
+                Auth::None => ClientAuth::None,
                 Auth::ClientCa => {
                     let (ca, leaf_cert, leaf_key) = mint_client_ca_and_leaf(tmpdir.path());
-                    args.push(format!("--tls-client-ca={}", ca.display()));
-                    mtls_client = Some((leaf_cert, leaf_key));
+                    ClientAuth::ClientCa { ca, leaf_cert, leaf_key }
                 }
                 Auth::Token => {
                     let file = tmpdir.path().join("tokens");
                     first_token = Some(mint_token(&paths.bin, &file, "first"));
-                    args.push(format!("--auth-tokens={}", file.display()));
+                    ClientAuth::Token { file }
                 }
-            }
-        }
+            },
+        });
+        let flags = Flags { backup_dir, tls };
 
-        let process = match spawn_and_wait_ready(&paths, workers, &env, &args) {
+        let process = match spawn_and_wait_ready(&paths, workers, &env, &flags.argv()) {
             Ok(p) => p,
             Err(msg) => {
                 let kept = tmpdir.keep();
@@ -235,15 +232,28 @@ impl ServerHandle {
             paths,
             tmpdir: Some(tmpdir),
             workers,
-            args,
+            flags,
             env,
-            mtls_client,
             first_token,
         }
     }
 
     fn is_tls(&self) -> bool {
-        self.args.iter().any(|a| a.starts_with("--tls-listen="))
+        self.flags.tls.is_some()
+    }
+
+    /// How the TLS listener authenticates its clients; `None` without one.
+    fn client_auth(&self) -> Option<&ClientAuth> {
+        self.flags.tls.as_ref().map(|t| &t.auth)
+    }
+
+    /// The minted client leaf `(cert_pem, key_pem)` of a [`Self::start_mtls`]
+    /// server; `caller` names the accessor that requires one.
+    fn mtls_leaf(&self, caller: &str) -> (&Path, &Path) {
+        match self.client_auth() {
+            Some(ClientAuth::ClientCa { leaf_cert, leaf_key, .. }) => (leaf_cert, leaf_key),
+            _ => panic!("{caller} requires a start_mtls server"),
+        }
     }
 
     /// The bound TLS endpoint (`IP:PORT`), read from `<data_dir>/tls_endpoint`,
@@ -272,18 +282,14 @@ impl ServerHandle {
     /// [`Self::start_mtls`] server — for building a cross-server "untrusted
     /// client cert" target (one server's leaf against another's CA).
     pub fn mtls_client_cert_key(&self) -> (PathBuf, PathBuf) {
-        self.mtls_client
-            .clone()
-            .expect("mtls_client_cert_key requires a start_mtls server")
+        let (cert, key) = self.mtls_leaf("mtls_client_cert_key");
+        (cert.to_path_buf(), key.to_path_buf())
     }
 
     /// [`Self::tls_target`] presenting the CA-signed client leaf. Requires a
     /// [`Self::start_mtls`] server.
     pub fn mtls_target(&self) -> String {
-        let (cert, key) = self
-            .mtls_client
-            .as_ref()
-            .expect("mtls_target requires a start_mtls server");
+        let (cert, key) = self.mtls_leaf("mtls_target");
         format!("{}&cert={}&key={}", self.tls_target(), cert.display(), key.display())
     }
 
@@ -304,15 +310,13 @@ impl ServerHandle {
     /// rebinds the port it had. `Err` carries the stderr tail of a boot that
     /// did not come up; the handle then holds no running server.
     pub fn restart(&mut self) -> Result<(), String> {
-        if self.is_tls() {
-            let listen = format!("--tls-listen={}", self.tls_endpoint());
-            for a in self.args.iter_mut().filter(|a| a.starts_with("--tls-listen=")) {
-                *a = listen.clone();
-            }
+        let bound = self.is_tls().then(|| self.tls_endpoint());
+        if let (Some(tls), Some(bound)) = (&mut self.flags.tls, bound) {
+            tls.listen = bound;
         }
         self.process.kill().ok();
         self.process.wait().ok();
-        self.process = spawn_and_wait_ready(&self.paths, self.workers, &self.env, &self.args)
+        self.process = spawn_and_wait_ready(&self.paths, self.workers, &self.env, &self.flags.argv())
             .map_err(|msg| format!("restart failed: {msg}"))?;
         self.workers_alive = worker_pidfds(&self.process);
         Ok(())
@@ -351,10 +355,58 @@ enum Boot {
 #[derive(Clone, Copy)]
 enum Auth {
     None,
-    /// `--tls-client-ca`: a client certificate a minted CA signed.
+    /// A client certificate a minted CA signed.
     ClientCa,
-    /// `--auth-tokens`: an access token.
+    /// An access token.
     Token,
+}
+
+/// The server flags a boot passes beyond the data directory, socket and worker
+/// count.
+struct Flags {
+    /// `--backup-dir`.
+    backup_dir: Option<PathBuf>,
+    tls: Option<Tls>,
+}
+
+/// A TLS listener's flags.
+struct Tls {
+    /// `--tls-listen`.
+    listen: String,
+    auth: ClientAuth,
+}
+
+/// An [`Auth`] with what its boot minted for it.
+enum ClientAuth {
+    None,
+    /// `--tls-client-ca=ca`, and the leaf PEMs it signed.
+    ClientCa {
+        ca: PathBuf,
+        leaf_cert: PathBuf,
+        leaf_key: PathBuf,
+    },
+    /// `--auth-tokens=file`.
+    Token {
+        file: PathBuf,
+    },
+}
+
+impl Flags {
+    fn argv(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(dir) = &self.backup_dir {
+            args.push(format!("--backup-dir={}", dir.display()));
+        }
+        if let Some(tls) = &self.tls {
+            args.push(format!("--tls-listen={}", tls.listen));
+            match &tls.auth {
+                ClientAuth::None => {}
+                ClientAuth::ClientCa { ca, .. } => args.push(format!("--tls-client-ca={}", ca.display())),
+                ClientAuth::Token { file } => args.push(format!("--auth-tokens={}", file.display())),
+            }
+        }
+        args
+    }
 }
 
 /// A pidfd of every worker the ready server `master` forked. The master forks
@@ -395,8 +447,8 @@ fn mint_token(bin: &Path, file: &Path, name: &str) -> String {
 /// all three PEMs (CA public cert, leaf cert, leaf private key) into `dir`.
 /// Returns `(ca_cert, leaf_cert, leaf_key)` paths. The CA has cA=TRUE and no
 /// key-usage extension (so webpki imposes no CA key-usage constraint); the
-/// leaf has no EKU (still authenticates — the documented residual). Default
-/// rcgen validity (1975–4096) never expires.
+/// leaf has no EKU, which webpki accepts. Default rcgen validity (1975–4096)
+/// never expires.
 fn mint_client_ca_and_leaf(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let ca_key = rcgen::KeyPair::generate().expect("mint: ca key");
     let mut ca_params = rcgen::CertificateParams::new(vec!["gnitz-client-ca".to_string()]).expect("mint: ca params");

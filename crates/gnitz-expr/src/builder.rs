@@ -48,10 +48,12 @@ impl ExprBuilder {
                 a,
                 micros: false,
             } => match self.instrs.get(a.0 as usize) {
-                Some(&LogicalInstr::LoadConst { val, unsigned: false }) => match crate::calendar::days_to_micros(val) {
-                    (val, false) => LogicalInstr::LoadConst { val, unsigned: false },
-                    (_, true) => instr,
-                },
+                Some(&LogicalInstr::LoadConst { val, unsigned: false }) => {
+                    match crate::calendar::eval(CalendarOp::ToMicros, val, false) {
+                        (val, false) => LogicalInstr::LoadConst { val, unsigned: false },
+                        (_, true) => instr,
+                    }
+                }
                 _ => instr,
             },
             // A range check of a value already range-checked into the same type is

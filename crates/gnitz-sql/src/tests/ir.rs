@@ -158,6 +158,8 @@ fn unify_blend_type_rule() {
         (t(Bool), t(Bool), t(Bool)),
         (t(Date), t(Date), t(Date)),
         (t(Date), t(Timestamp), t(Timestamp)),
+        (t(Bool), t(Date), t(Bool)),
+        (t(Bool), t(Timestamp), t(Bool)),
     ] {
         assert_eq!(unify_blend_type(a, b), want, "{a} with {b}");
         assert_eq!(unify_blend_type(b, a), want, "{b} with {a}");

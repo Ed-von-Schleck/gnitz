@@ -3,17 +3,16 @@ use crate::test_support::{assert_rejects, parse_stmt};
 use sqlparser::ast::Statement;
 use sqlparser::parser::Parser;
 
-/// `CREATE TABLE t (c <decl>)`'s one column, through `column_def`.
-fn declared(decl: &str) -> Result<(ColumnDef, bool), GnitzSqlError> {
+/// `CREATE TABLE t (c <decl>)`'s one column type, through `declared_type`.
+fn declared(decl: &str) -> Result<(ColType, bool), GnitzSqlError> {
     let Statement::CreateTable(create) = parse_stmt(&format!("CREATE TABLE t (c {decl})")) else {
         panic!("{decl}: not a CREATE TABLE");
     };
-    column_def(&create.columns[0])
+    declared_type(&create.columns[0].data_type)
 }
 
 /// Every alias and modifier, as the type it declares — each type's own spelling
-/// is [`sql_type_name_round_trips`]'s. A column is nullable unless it says
-/// otherwise, and a SERIAL spelling is its signed integer, NOT NULL.
+/// is [`sql_type_name_round_trips`]'s. A SERIAL spelling is its signed integer.
 #[test]
 fn each_accepted_spelling_declares_its_type() {
     use TypeCode::*;
@@ -46,12 +45,8 @@ fn each_accepted_spelling_declares_its_type() {
     ];
     for &(decl, ty) in plain {
         let got = declared(decl).unwrap_or_else(|e| panic!("{decl}: {e}"));
-        assert_eq!(got, (ColumnDef::new("c", ty, true), false), "{decl}");
+        assert_eq!(got, (ty, false), "{decl}");
     }
-    assert_eq!(
-        declared("BIGINT NOT NULL").unwrap(),
-        (ColumnDef::new("c", I64, false), false)
-    );
     for (decl, tc) in [
         ("SMALLSERIAL", I16),
         ("SERIAL2", I16),
@@ -62,11 +57,7 @@ fn each_accepted_spelling_declares_its_type() {
         ("SERIAL8", I64),
         ("BigSerial", I64),
     ] {
-        assert_eq!(
-            declared(decl).unwrap(),
-            (ColumnDef::new("c", tc, false), true),
-            "{decl}"
-        );
+        assert_eq!(declared(decl).unwrap(), (t(tc), true), "{decl}");
     }
     assert_eq!(serial_type_name(U64), None);
 }
@@ -116,8 +107,8 @@ fn sql_type_name_round_trips() {
         ]);
     for ty in types {
         let spelled = sql_type_name(ty);
-        let (def, _) = declared(&spelled).unwrap_or_else(|e| panic!("{spelled}: {e}"));
-        assert_eq!(def.ty, ty, "{spelled}");
+        let (got, _) = declared(&spelled).unwrap_or_else(|e| panic!("{spelled}: {e}"));
+        assert_eq!(got, ty, "{spelled}");
     }
 }
 

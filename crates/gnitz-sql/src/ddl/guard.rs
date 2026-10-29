@@ -3,7 +3,8 @@
 //! ALTER TABLE each meet. They keep the guard contract `crate::validate` states.
 
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
-use gnitz_wire::FkAction;
+use crate::types::declared_type;
+use gnitz_wire::{ColumnDef, FkAction};
 
 /// A FOREIGN KEY's `ON DELETE` action, rejecting every field gnitz does not
 /// implement. Column-level and table-level FKs both read through here.
@@ -56,8 +57,6 @@ fn reject_constraint_characteristics(
 /// Reject every PRIMARY KEY constraint field beyond the column list and the
 /// inert names. `index_type` follows CREATE INDEX's rule: the BTree default is
 /// accepted (it names gnitz's real ordered index), anything else is rejected.
-/// Shared by the column-level and table-level guards (both wrap
-/// `PrimaryKeyConstraint` since sqlparser 0.60; exhaustive destructure, no `..`).
 pub(super) fn reject_unhonored_pk_fields(
     pk: &sqlparser::ast::PrimaryKeyConstraint,
     context: &str,
@@ -79,8 +78,7 @@ pub(super) fn reject_unhonored_pk_fields(
 /// Reject every UNIQUE constraint field beyond the column list and the
 /// constraint name (which names the created index). `NULLS [NOT] DISTINCT`
 /// is rejected like CREATE INDEX rejects it — gnitz defines no NULL-conflict
-/// semantics to honor. Shared by the column-level and table-level guards
-/// (exhaustive destructure, no `..`).
+/// semantics to honor.
 pub(super) fn reject_unhonored_unique_fields(
     u: &sqlparser::ast::UniqueConstraint,
     context: &str,
@@ -116,8 +114,7 @@ pub(super) fn reject_unhonored_unique_fields(
 
 /// The index-shape tail every index-creating surface shares: accept only the
 /// BTree default `USING` (it names gnitz's real ordered index), and no index
-/// options. CREATE INDEX, PRIMARY KEY and UNIQUE all spell the same two
-/// rejections, so they read from one place and cannot drift apart.
+/// options. CREATE INDEX, PRIMARY KEY and UNIQUE all read it.
 pub(super) fn reject_index_type_and_options(
     index_type: &Option<sqlparser::ast::IndexType>,
     index_options: &[sqlparser::ast::IndexOption],
@@ -145,10 +142,9 @@ fn reject_index_constraint_extras(
     reject_constraint_characteristics(characteristics, context)
 }
 
-/// Which site is walking a column definition, and so which constraint-bearing
-/// options are actually acted on. CREATE TABLE consumes NOT NULL / PRIMARY KEY /
-/// UNIQUE / REFERENCES; ADD COLUMN consumes none of them, so it must reject them
-/// rather than silently drop them.
+/// Which site is reading a column definition, and so which constraint-bearing
+/// options are acted on: CREATE TABLE consumes NOT NULL / PRIMARY KEY / UNIQUE /
+/// REFERENCES, ADD COLUMN none of them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ColumnOptionSite {
     CreateTable,
@@ -156,9 +152,7 @@ pub(super) enum ColumnOptionSite {
 }
 
 impl ColumnOptionSite {
-    /// How the site names itself in a rejection. Derived rather than passed
-    /// beside it: the two are 1:1, and a second parameter is a hole a caller can
-    /// spell the wrong way round.
+    /// How the site names itself in a rejection.
     fn context(self) -> &'static str {
         match self {
             ColumnOptionSite::CreateTable => "column definition",
@@ -167,53 +161,79 @@ impl ColumnOptionSite {
     }
 }
 
-/// Reject every column option `site` does not honor. Honored by CREATE TABLE: NULL/NOT NULL
-/// (nullability), PRIMARY KEY, UNIQUE, FOREIGN KEY target — the honored constraint variants are
-/// descended into (`reject_unhonored_{pk,unique}_fields`, `fk_on_delete`) so an unimplemented field inside them
-/// (an `ON UPDATE` action, DEFERRABLE, NULLS NOT DISTINCT, …) is rejected too. Every
-/// constraint/semantic option gnitz lacks (DEFAULT, CHECK, GENERATED, IDENTITY, ON UPDATE, COLLATE,
-/// SRID, INVISIBLE, …) is rejected; pure metadata (COMMENT/OPTIONS/POLICY/TAGS) is accepted. Exhaustive
-/// over the `ColumnDef` / `ColumnOptionDef` fields (no `..`) and over all 23 `ColumnOption` variants
-/// (no `_`): a new field or variant stops the build.
-pub(super) fn reject_unhonored_column_options(
+/// A constraint one column option declares on its own column.
+pub(super) enum ColumnConstraint<'a> {
+    PrimaryKey,
+    /// The option's `CONSTRAINT <name>`, which names the created index.
+    Unique(Option<&'a sqlparser::ast::Ident>),
+    ForeignKey {
+        fk: &'a sqlparser::ast::ForeignKeyConstraint,
+        on_delete: FkAction,
+    },
+}
+
+/// One column definition, read: the column, whether it was spelled SERIAL, and
+/// the constraints its options declare, in the order written. Only
+/// [`ColumnOptionSite::CreateTable`] yields a constraint.
+pub(super) struct ColumnDecl<'a> {
+    pub(super) def: ColumnDef,
+    pub(super) serial: bool,
+    pub(super) constraints: Vec<ColumnConstraint<'a>>,
+}
+
+/// Read `col`, rejecting every column option `site` does not honor; pure
+/// metadata (COMMENT/OPTIONS/POLICY/TAGS) is accepted. A constraint option is
+/// descended into, so a field gnitz does not implement (an `ON UPDATE` action,
+/// DEFERRABLE, NULLS NOT DISTINCT, …) is rejected with it. A SERIAL column is its
+/// signed integer, NOT NULL.
+pub(super) fn read_column(
     col: &sqlparser::ast::ColumnDef,
     site: ColumnOptionSite,
-) -> Result<(), GnitzSqlError> {
+) -> Result<ColumnDecl<'_>, GnitzSqlError> {
     use sqlparser::ast::ColumnOption as O;
     let context = site.context();
-    // Consumed at CREATE TABLE, unhonored at ADD COLUMN.
     let honored = |clause: &str| reject_if(site == ColumnOptionSite::AddColumn, context, clause);
-    let sqlparser::ast::ColumnDef {
-        // The name and type are the column; this guard is about its options.
-        name: _,
-        data_type: _,
-        options,
-    } = col;
+    let sqlparser::ast::ColumnDef { name, data_type, options } = col;
+    // `Some(true)` once NOT NULL is written, `Some(false)` once NULL is.
+    let mut not_null: Option<bool> = None;
+    let conflicting = || {
+        GnitzSqlError::Rejected(format!(
+            "{context}: conflicting NULL/NOT NULL declarations for column '{}'",
+            name.value
+        ))
+    };
+    let mut constraints = Vec::new();
     for opt in options {
-        // `name` is consumed for UNIQUE (it becomes the index name, as on the
-        // table-level spelling) and inert elsewhere — gnitz names no other
-        // constraint.
-        let sqlparser::ast::ColumnOptionDef { name: _, option } = opt;
+        // `name` is read for UNIQUE and inert elsewhere: gnitz names no other
+        // column constraint.
+        let sqlparser::ast::ColumnOptionDef { name: constraint_name, option } = opt;
         match option {
             // A new column over existing rows is nullable either way, so bare
-            // NULL is consumed at both sites.
-            O::Null => {}
-            O::NotNull => honored("NOT NULL (a new column over existing rows is nullable)")?,
-            // Consumed, but only the column list / constraint name — descend into
-            // the wrapped constraint so an unimplemented field is rejected, not
-            // silently dropped.
+            // NULL is honored at both sites.
+            O::Null | O::NotNull => {
+                let written = matches!(option, O::NotNull);
+                if written {
+                    honored("NOT NULL (a new column over existing rows is nullable)")?;
+                }
+                if not_null.is_some_and(|prev| prev != written) {
+                    return Err(conflicting());
+                }
+                not_null = Some(written);
+            }
             O::Unique(u) => {
                 honored("UNIQUE (add the column, then CREATE UNIQUE INDEX)")?;
-                reject_unhonored_unique_fields(u, context)?
+                reject_unhonored_unique_fields(u, context)?;
+                constraints.push(ColumnConstraint::Unique(constraint_name.as_ref()));
             }
             O::PrimaryKey(pk) => {
                 honored("PRIMARY KEY (a new column cannot join the primary key)")?;
-                reject_unhonored_pk_fields(pk, context)?
+                reject_unhonored_pk_fields(pk, context)?;
+                constraints.push(ColumnConstraint::PrimaryKey);
             }
-            // Target consumed; the rest rejected.
             O::ForeignKey(fk) => {
                 honored("REFERENCES (a foreign key is declared only at CREATE TABLE)")?;
-                fk_on_delete(fk, context).map(drop)?
+                let on_delete = fk_on_delete(fk, context)?;
+                constraints.push(ColumnConstraint::ForeignKey { fk, on_delete });
             }
             O::Comment(_) | O::Options(_) | O::Policy(_) | O::Tags(_) => {} // inert metadata
             O::Default(_) => return Err(unsupported_clause(context, "DEFAULT")),
@@ -232,5 +252,14 @@ pub(super) fn reject_unhonored_column_options(
             O::DialectSpecific(_) => return Err(unsupported_clause(context, "dialect-specific column option")),
         }
     }
-    Ok(())
+    let (ty, serial) = declared_type(data_type)?;
+    if serial && not_null == Some(false) {
+        return Err(conflicting());
+    }
+    let nullable = !serial && not_null != Some(true);
+    Ok(ColumnDecl {
+        def: ColumnDef::new(name.value.clone(), ty, nullable),
+        serial,
+        constraints,
+    })
 }

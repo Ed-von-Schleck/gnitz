@@ -67,13 +67,13 @@ fn a_dist_prefix_is_a_leading_pk_prefix_in_pk_order() {
         .iter()
         .map(|&n| ColumnDef::new(n, TypeCode::U64, false))
         .collect();
-    let check = |pk: &[u32], cluster: &[u32]| validate_dist_prefix(&cols, pk, cluster);
-    assert!(check(&[0, 1], &[0]).is_ok());
-    assert!(check(&[0, 1], &[0, 1]).is_ok());
+    let check = |pk: &[u32], cluster: &[u32]| dist_prefix_len(&cols, pk, cluster);
+    assert_eq!(check(&[0, 1], &[0]).unwrap(), 1);
+    assert_eq!(check(&[0, 1], &[0, 1]).unwrap(), 2);
     // A single-column PK: only the whole PK is a valid prefix.
-    assert!(check(&[3], &[3]).is_ok());
+    assert_eq!(check(&[3], &[3]).unwrap(), 1);
     // A reordered PK whose distribution column leads.
-    assert!(check(&[2, 1], &[2]).is_ok());
+    assert_eq!(check(&[2, 1], &[2]).unwrap(), 1);
 
     assert!(check(&[0, 1], &[1]).is_err(), "non-leading PK column");
     assert!(check(&[0, 1, 2], &[0, 2]).is_err(), "skips col 1");

@@ -42,9 +42,8 @@ fn group_by_exprs(select: &Select) -> Result<&[Expr], GnitzSqlError> {
 /// away so `SUM((a * b))` and `SUM(a * b)` reach one aggregate.
 struct PreMap<'a> {
     ids: &'a ColIdGen,
-    /// The reduce input's columns: the source env, then one per materialized
-    /// expression — so `env[..env.len() - extra.len()]` is the source env, which
-    /// [`Self::source_cols`] hands back. Every `ColId` this mints resolves here.
+    /// The reduce input's columns: the source's, then one per materialized
+    /// expression.
     env: Vec<HirCol>,
     /// The materialized columns and the expressions computing them — also the
     /// memo, since `extra[i].expr` is what `extra[i].out.id` holds.
@@ -74,20 +73,13 @@ impl<'a> PreMap<'a> {
         Ok(id)
     }
 
-    /// The scope this pre-map was built over — the body's *resolved* columns, so
-    /// a derived table's `AS d(col…)` aliases are the names, where `input.cols()`
-    /// would give the subtree's own.
-    fn source_cols(&self) -> &[HirCol] {
-        &self.env[..self.env.len() - self.extra.len()]
-    }
-
     /// The projection computing exactly `ids`: a materialized column by its
     /// expression, a source column passed through.
     fn items_for(&self, ids: &[ColId]) -> Vec<ProjEntry> {
         ids.iter()
             .map(|id| match self.extra.iter().find(|x| x.out.id == *id) {
                 Some(e) => e.clone(),
-                None => ProjEntry::passthrough(hircol_of(self.source_cols(), *id).clone()),
+                None => ProjEntry::passthrough(hircol_of(&self.env, *id).clone()),
             })
             .collect()
     }

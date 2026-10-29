@@ -48,12 +48,12 @@ pub use read_cursor::{
 };
 pub use run::{first_live_payload_group, Run, StoredRow};
 pub use shard::{
-    guard_slot, merge_guard, Codebook, GuardRun, MappedShard, ShardDirectory, ShardWriteOpts, StorageError,
+    guard_slot, Codebook, GuardMerge, GuardRun, MappedShard, ShardDirectory, ShardWriteOpts, StorageError,
 };
 
 pub(crate) use batch::{range_rows, runs_where, write_to_batch, RowMark};
 pub(crate) use read_cursor::CursorRow;
-pub(crate) use scatter::{copy_runs, materialize_carrying, width_dispatch, Pick};
+pub(crate) use scatter::{cell_width_dispatch, copy_runs, materialize_carrying, stride_dispatch, Pick};
 pub(crate) use seek::pk_group_end;
 pub(crate) use string_heap::{relocated_cell, should_relocate_blob};
 pub(crate) use writer::DirectWriter;

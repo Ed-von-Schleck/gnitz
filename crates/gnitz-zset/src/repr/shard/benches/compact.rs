@@ -35,16 +35,13 @@ fn for_compaction_bench() {
         let guard_keys: Vec<PkBuf> = (0..guards)
             .map(|g| PkBuf::from_bytes(&((g * per / guards) as u64).to_be_bytes()))
             .collect();
-        for s in &inputs {
-            s.verify_body().unwrap();
-        }
+        let mut merge = GuardMerge::begin(inputs).unwrap();
         let ((rows, i), c) = cycles.measure(|| {
             instructions.measure(|| {
-                let mut starts = vec![0usize; inputs.len()];
                 (0..guard_keys.len())
                     .filter_map(|g| {
                         let until = guard_keys.get(g + 1).map(PkBuf::pk_bytes);
-                        merge_guard(&inputs, &mut starts, until, skeleton, &schema, None)
+                        merge.next(until, skeleton, &schema, None)
                     })
                     .map(|run| black_box(run).row_count())
                     .sum::<usize>()
@@ -107,17 +104,14 @@ fn distinct_compaction_bench() {
                 .zip(builders)
                 .map(|(s, b)| map_shard(&dir.path().join(format!("{pk}_{deal}_{s}.db")), &b.finish()))
                 .collect();
-            for s in &inputs {
-                s.verify_body().unwrap();
-            }
-            let mut starts = vec![0usize; inputs.len()];
+            let mut merge = GuardMerge::begin(inputs.clone()).unwrap();
             let ((), whole) = instructions.measure(|| {
-                let run = merge_guard(&inputs, &mut starts, None, false, &schema, None).unwrap();
+                let run = merge.next(None, false, &schema, None).unwrap();
                 let batch = run.plain().unwrap();
                 assert_eq!(batch.len() as u64, TOTAL);
                 black_box(batch);
             });
-            // Over the decoded windows `merge_guard` merges, so that the difference
+            // Over the decoded windows `GuardMerge::next` merges, so that the difference
             // is the output batch.
             let (rows, merge) = instructions.measure(|| {
                 let windows: Vec<_> = inputs.iter().map(|s| s.window(0..s.row_count())).collect();

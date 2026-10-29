@@ -53,7 +53,7 @@ use crate::rules::{find_unique_column, reject_float_key};
 use crate::tail::parse_order_key;
 use gnitz_wire::{ColType, ColumnDef, TypeCode};
 use sqlparser::ast::{
-    Expr, Function, Ident, NamedWindowDefinition, NamedWindowExpr, Select, WindowFrame, WindowFrameBound,
+    Expr, Function, Ident, NamedWindowDefinition, NamedWindowExpr, OrderByExpr, Select, WindowFrame, WindowFrameBound,
     WindowFrameUnits, WindowSpec, WindowType,
 };
 use std::cell::RefCell;
@@ -173,6 +173,9 @@ fn def_of(w: &[ProjEntry], id: ColId) -> &ColumnDef {
         .def
 }
 
+/// A window specification's partition, order and frame.
+type SpecParts<'f> = (&'f [Expr], &'f [OrderByExpr], Option<&'f WindowFrame>);
+
 /// The leaf a view body's SELECT list, ORDER BY keys and QUALIFY bind through:
 /// every window call becomes a placeholder column, everything else goes to the
 /// body's own leaf.
@@ -197,16 +200,25 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
             .map(|c| (c.out.def.ty, c.out.def.is_nullable))
     }
 
-    /// The window specification a call names: written inline, or defined in
-    /// the WINDOW clause (which may itself name another definition).
-    fn resolve_spec<'f>(&'f self, over: &'f WindowType) -> Result<&'f WindowSpec, GnitzSqlError> {
+    /// The window specification a call names — written inline, or defined in
+    /// the WINDOW clause (which may itself name another definition) — as its
+    /// partition, order and frame.
+    fn resolve_spec<'f>(&'f self, over: &'f WindowType) -> Result<SpecParts<'f>, GnitzSqlError> {
         let inline = |s: &'f WindowSpec| {
-            if s.window_name.is_some() {
+            // Exhaustive (no `..`): a future frame or exclusion field stops the
+            // build rather than being dropped into a maintained view.
+            let WindowSpec {
+                window_name,
+                partition_by,
+                order_by,
+                window_frame,
+            } = s;
+            if window_name.is_some() {
                 return Err(GnitzSqlError::Rejected(
                     "a window specification extending a named window (OVER (w …)) is not supported".into(),
                 ));
             }
-            Ok(s)
+            Ok((partition_by.as_slice(), order_by.as_slice(), window_frame.as_ref()))
         };
         let mut name: &Ident = match over {
             WindowType::WindowSpec(s) => return inline(s),
@@ -236,24 +248,14 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
     /// Bind one `f(…) OVER (…)` call and hand back the placeholder column its
     /// value stands in for until the desugar computes it. Two calls equal in
     /// function, argument and specification share one.
-    fn bind_window_call(&self, f: &Function) -> Result<HirCol, GnitzSqlError> {
-        let over = f.over.as_ref().expect("bind_window_call receives a windowed call");
+    fn bind_window_call(&self, f: &Function, over: &WindowType) -> Result<HirCol, GnitzSqlError> {
         let (func, arg_expr) = classify_window_call(f)?;
-        let spec = self.resolve_spec(over)?;
+        let (partition_by, order_by, window_frame) = self.resolve_spec(over)?;
         // Operands bind through the body's leaf, so an aggregate argument in a
         // grouped body resolves to its finalize and a nested OVER is refused
         // there.
         let bind = |e: &Expr| bind_structural(e, self.inner);
         let mut arg = arg_expr.map(bind).transpose()?;
-        // `window_name` is rejected by `resolve_spec`, which is what hands `spec`
-        // over. Exhaustive (no `..`): a future frame or exclusion field stops the
-        // build rather than being dropped into a maintained view.
-        let WindowSpec {
-            window_name: _,
-            partition_by,
-            order_by,
-            window_frame,
-        } = spec;
         let partition = partition_by.iter().map(bind).collect::<Result<Vec<_>, _>>()?;
         let mut order = Vec::with_capacity(order_by.len());
         for o in order_by {
@@ -262,7 +264,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
         }
         // A ranking function ignores its frame; an aggregate over the whole
         // partition reads no order.
-        if matches!(func, WinFunc::Agg(_)) && frame_is_whole(window_frame.as_ref())? {
+        if matches!(func, WinFunc::Agg(_)) && frame_is_whole(window_frame)? {
             order.clear();
         }
         if matches!(func, WinFunc::Rank | WinFunc::DenseRank) && order.is_empty() {
@@ -367,8 +369,8 @@ impl<L: ItemLeaf> LeafBinder<ColId> for WindowLeaf<'_, L> {
     }
     /// The one context that admits a window call: it binds to the placeholder
     /// column its value stands in for until the desugar computes it.
-    fn bind_window(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
-        Ok(BExpr::ColRef(self.bind_window_call(f)?.id))
+    fn bind_window(&self, f: &Function, over: &WindowType) -> Result<HirExpr, GnitzSqlError> {
+        Ok(BExpr::ColRef(self.bind_window_call(f, over)?.id))
     }
     fn bind_subquery(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         self.inner.bind_subquery(e)
@@ -572,8 +574,6 @@ fn desugar<L: ItemLeaf>(
             let def = def_of(&win.w, p);
             // A partition is a reduce group key: GROUP BY's rule.
             reject_float_key(def.ty.tc, None, "window PARTITION BY")?;
-            // Stated with the clause named, rather than surfacing later as a
-            // rejection of a join the user never wrote.
             if call.order.is_empty() && def.is_nullable {
                 return Err(GnitzSqlError::Rejected(
                     "window PARTITION BY: the key must be provably NOT NULL (a NOT NULL column, or an \

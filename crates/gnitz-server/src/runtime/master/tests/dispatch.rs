@@ -1,6 +1,10 @@
+use std::num::NonZero;
+
 use super::super::fixtures::test_dispatcher;
+use super::{check_workers, worker_death};
 use crate::catalog::CatalogEngine;
 use crate::runtime::park::WorkerSet;
+use crate::runtime::reactor::test_support::make_reactor;
 use crate::runtime::sal::{Apply, GroupData, GroupTargets, SalGroup};
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, within};
 use gnitz_foundation::posix_io::retry_eintr;
@@ -9,19 +13,40 @@ use gnitz_wire::{ColTabRow, WireFault, WireStatus};
 /// Fork a child that exits immediately, and wait until it is a zombie *without*
 /// reaping it, so the probe's own `waitpid(WNOHANG)` finds it on the first call.
 /// `waitpid` rejects `WNOWAIT`, hence `waitid`.
-fn spawn_zombie() -> i32 {
+fn spawn_zombie() -> NonZero<libc::pid_t> {
     let pid = unsafe { fork_child(|| {}) };
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     retry_eintr(|| unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) })
         .expect("waitid pre-sync");
-    pid
+    NonZero::new(pid).unwrap()
 }
 
 /// The pid of a child already reaped, which every `waitpid` answers ECHILD.
-fn spawn_and_reap_dead() -> i32 {
+fn spawn_and_reap_dead() -> NonZero<libc::pid_t> {
     let pid = unsafe { fork_child(|| {}) };
     unsafe { assert_child_exited_ok(pid) };
-    pid
+    NonZero::new(pid).unwrap()
+}
+
+/// A child that lives until it is killed, or until this thread exits.
+fn spawn_live() -> NonZero<libc::pid_t> {
+    // `PR_SET_PDEATHSIG` on the forking thread: a panicking test unwinds off
+    // this thread and takes the paused child with it, rather than orphaning it.
+    let pid = unsafe {
+        fork_child(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+            libc::pause();
+        })
+    };
+    NonZero::new(pid).unwrap()
+}
+
+/// Kill and reap `pid`.
+fn kill(pid: NonZero<libc::pid_t>) {
+    unsafe {
+        libc::kill(pid.get(), libc::SIGKILL);
+        libc::waitpid(pid.get(), &mut 0, 0);
+    }
 }
 
 /// `check_workers` reports the first dead worker on every probe. Both dead arms
@@ -29,33 +54,33 @@ fn spawn_and_reap_dead() -> i32 {
 /// and answers ECHILD on every probe after.
 #[test]
 fn check_workers_keeps_reporting_a_dead_worker() {
-    // `PR_SET_PDEATHSIG` on the forking thread: a panicking test unwinds off
-    // this thread and takes the paused child with it, rather than orphaning it.
-    let live = unsafe {
-        fork_child(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
-            libc::pause();
-        })
-    };
-    let (disp, _) = test_dispatcher(vec![live, spawn_zombie()], std::ptr::null_mut());
+    let live = spawn_live();
+    let pids = [live, spawn_zombie()];
 
-    assert_eq!(disp.check_workers(), Some(1), "the unreaped zombie is detected dead");
-    assert_eq!(disp.check_workers(), Some(1), "and still reported once reaped");
+    assert_eq!(check_workers(&pids), Some(1), "the unreaped zombie is detected dead");
+    assert_eq!(check_workers(&pids), Some(1), "and still reported once reaped");
 
-    unsafe {
-        libc::kill(live, libc::SIGKILL);
-        libc::waitpid(live, &mut 0, 0);
-    }
+    kill(live);
 }
 
 /// `worker_death` resolves with the dead worker's rank, here a pid every probe
 /// answers ECHILD for.
 #[test]
 fn worker_death_names_the_dead_worker() {
-    within(|| {
-        let (disp, _) = test_dispatcher(vec![0, spawn_and_reap_dead()], std::ptr::null_mut());
-        assert_eq!(disp.reactor().block_on(disp.worker_death()), 1);
+    let live = spawn_live();
+    within(move || {
+        let reactor = make_reactor();
+        let pids = [live, spawn_and_reap_dead()];
+        assert_eq!(reactor.block_on(worker_death(&reactor, &pids)), 1);
     });
+    kill(live);
+}
+
+/// An empty catalog, and the directory it lives in.
+fn empty_catalog() -> (tempfile::TempDir, CatalogEngine) {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
+    (tmp, engine)
 }
 
 /// A group written on an ACK lease ends on every worker's ACK; one the SAL has
@@ -64,7 +89,8 @@ fn worker_death_names_the_dead_worker() {
 fn an_acked_group_ends_on_its_acks_or_is_refused() {
     within(|| {
         for refused in [false, true] {
-            let (disp, mut writers) = test_dispatcher(vec![0, 0], std::ptr::null_mut());
+            let (_tmp, engine) = empty_catalog();
+            let (disp, mut writers) = test_dispatcher(2, engine);
             let got = disp.reactor().block_on(async {
                 // Wider than the fixture's whole SAL.
                 let tick = Apply::Tick {
@@ -72,7 +98,7 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
                     tids: vec![0; if refused { 2 << 17 } else { 1 }].into(),
                 };
                 let lease = disp.write_acked(&mut disp.sal().lock().await, SalGroup::new(tick))?;
-                writers.iter_mut().for_each(|w| w.send_ack(lease.targets().request_id));
+                writers.iter_mut().for_each(|w| w.send_ack(lease.id()));
                 lease.acks().await;
                 Ok::<(), WireFault>(())
             });
@@ -123,7 +149,7 @@ fn a_zone_the_log_refuses_reaches_no_store_and_applies_after_a_checkpoint() {
     };
     let before = held(&mut engine);
 
-    let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
+    let (disp, _) = test_dispatcher(0, engine);
     let mut excl = disp.sal().excl();
     fill_log(&mut excl);
     let watermark = disp.sal().watermark();
@@ -133,10 +159,10 @@ fn a_zone_the_log_refuses_reaches_no_store_and_applies_after_a_checkpoint() {
         .expect_err("no room for the zone");
     assert_eq!(refused.status, WireStatus::SalFull, "{refused}");
     assert!(
-        engine.registry.relation(tid).is_none(),
+        disp.cat().registry.relation(tid).is_none(),
         "the refused table is not registered"
     );
-    assert_eq!(held(&mut engine), before);
+    assert_eq!(held(&mut disp.cat_mut()), before);
     assert_eq!(
         disp.sal().watermark(),
         watermark,
@@ -146,11 +172,10 @@ fn a_zone_the_log_refuses_reaches_no_store_and_applies_after_a_checkpoint() {
     disp.checkpoint_post_ack(&mut excl).unwrap();
     disp.emit_zone(&mut excl, |cat, sink| cat.apply_bundle(create(), sink))
         .expect("the reset log takes the zone");
-    assert!(engine.registry.relation(tid).is_some());
+    assert!(disp.cat().registry.relation(tid).is_some());
 
     drop(excl);
-    drop(disp);
-    engine.close();
+    disp.into_catalog().close();
 }
 
 /// An ADD COLUMN the log refuses leaves the table's schema and column records
@@ -177,7 +202,7 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
     let record = engine.wire_target(tid).unwrap().1.clone();
     let col_rows = scan_all(&mut engine, SysFamily::Column.id()).len();
 
-    let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
+    let (disp, _) = test_dispatcher(0, engine);
     let mut excl = disp.sal().excl();
     fill_log(&mut excl);
 
@@ -185,19 +210,21 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
         .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(add(), sink).map(drop))
         .expect_err("no room for the zone");
     assert_eq!(refused.status, WireStatus::SalFull, "{refused}");
-    assert_eq!(width(&engine), 2, "the refused ADD COLUMN leaves the schema");
-    assert_eq!(engine.wire_target(tid).unwrap().1, &record);
-    assert_eq!(scan_all(&mut engine, SysFamily::Column.id()).len(), col_rows);
+    assert_eq!(width(&disp.cat()), 2, "the refused ADD COLUMN leaves the schema");
+    assert_eq!(disp.cat().wire_target(tid).unwrap().1, &record);
+    assert_eq!(scan_all(&mut disp.cat_mut(), SysFamily::Column.id()).len(), col_rows);
 
     disp.checkpoint_post_ack(&mut excl).unwrap();
     disp.emit_zone(&mut excl, |cat, sink| cat.apply_bundle(add(), sink))
         .expect("the reset log takes the zone");
-    assert_eq!(width(&engine), 3, "the retry widens the schema");
-    assert_eq!(scan_all(&mut engine, SysFamily::Column.id()).len(), col_rows + 1);
+    assert_eq!(width(&disp.cat()), 3, "the retry widens the schema");
+    assert_eq!(
+        scan_all(&mut disp.cat_mut(), SysFamily::Column.id()).len(),
+        col_rows + 1
+    );
 
     drop(excl);
-    drop(disp);
-    engine.close();
+    disp.into_catalog().close();
 }
 
 /// The checkpoint finalizer flushes system tables before resetting the SAL. A
@@ -216,13 +243,12 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
         // lands ONLY in the sys_sequences MemTable.
         engine.reserve_user_sequence(user_seq, 64, &mut |_, _| Ok(())).unwrap();
 
-        let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
+        let (disp, _) = test_dispatcher(0, engine);
         disp.checkpoint_post_ack(&mut disp.sal().excl()).unwrap();
-        drop(disp);
 
         // Crash semantics: no `engine.close()`, and no Drop impl — only what the
         // finalizer flushed survives.
-        drop(engine);
+        drop(disp);
     }
 
     let engine = CatalogEngine::open(dir, 1).unwrap();
@@ -243,8 +269,8 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
 #[test]
 fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
-    let (disp, _) = test_dispatcher(Vec::new(), &mut engine);
+    let engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
+    let (disp, _) = test_dispatcher(0, engine);
     let gen = disp.cat().durable_generation();
     let checkpoint = |disp: &super::super::MasterDispatcher| {
         disp.reactor()
@@ -278,6 +304,5 @@ fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
     assert_eq!(checkpoint(&disp), gen + 1);
     assert_eq!(checkpoint(&disp), gen + 1, "the base round took the push with it");
 
-    drop(disp);
-    engine.close();
+    disp.into_catalog().close();
 }

@@ -17,7 +17,6 @@ impl Reactor {
     /// Spawn a task that runs detached.
     pub(crate) fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
         let slot = self.tasks.borrow_mut().insert(Some(Box::pin(fut)));
-        // Schedule immediate first poll.
         RUN_QUEUE.with(|q| q.borrow_mut().push(slot + 1));
     }
 

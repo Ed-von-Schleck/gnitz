@@ -15,8 +15,7 @@ use gnitz_wire::{ViewBudget, ViewProps};
 use sqlparser::ast::{CreateView, Ident, ObjectName, Query};
 use sqlparser::tokenizer::Location;
 
-/// Reject every `CREATE VIEW` clause the planner does not consume. Exhaustive
-/// destructure (no `..`): a future `sqlparser` field stops the build.
+/// Reject every `CREATE VIEW` clause the planner does not consume.
 fn reject_unhonored_create_view_clauses(cv: &sqlparser::ast::CreateView) -> Result<(), GnitzSqlError> {
     const CTX: &str = "CREATE VIEW";
     let sqlparser::ast::CreateView {

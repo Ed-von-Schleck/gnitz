@@ -337,8 +337,7 @@ impl TableReader {
     /// nullability.
     pub(crate) fn open(path: &Path, schema: &Arc<Schema>) -> Result<TableReader, DumpError> {
         let reader = SerializedFileReader::new(File::open(path)?)?;
-        // A file's columns are the dumped table's visible ones, and a restored
-        // table has no other, so a file column stands at its schema index.
+        // A restored table has no hidden column, so file column i is schema column i.
         if schema.columns().iter().any(|c| c.is_hidden) {
             return Err(DumpError::from("restored into a table with hidden columns"));
         }
@@ -371,7 +370,6 @@ impl TableReader {
         batch.weights = vec![1; n];
         batch.nulls = vec![0; n];
         let ZSetBatch { payload, nulls, blob, .. } = &mut batch;
-        // A file column stands at its schema index: the table has no hidden column (see `open`).
         let mut read = |ci: usize, cells: &mut Vec<u8>| -> Result<(), DumpError> {
             let def = &schema.columns()[ci];
             let null_words = def

@@ -22,7 +22,7 @@ mod support;
 mod bench;
 
 use gnitz_core::block_on;
-use gnitz_core::{ClientError, GnitzClient, MirrorError, PollOutcome, PollResult, RelName, Schema, TableDef};
+use gnitz_core::{ClientError, GnitzClient, MirrorError, PollOutcome, PollResult, RelName, Schema, SubId, TableDef};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::GnitzSqlError;
 use gnitz_test_harness::ServerHandle;
@@ -1008,7 +1008,13 @@ fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
         let hdr = ControlHeader::naming(gnitz_wire::ClientVerb::SyncPushed, 0.into(), wait.as_millis() as u64);
         let mut frame = Vec::new();
         // Naming the subscription below: a sync that names none holds none.
-        append_frame(&mut frame, &hdr, &gnitz_wire::txn_frame::encode_held([1]), None, None);
+        append_frame(
+            &mut frame,
+            &hdr,
+            &gnitz_wire::txn_frame::encode_held([SubId::FIRST]),
+            None,
+            None,
+        );
         frame
     };
 
@@ -1039,7 +1045,7 @@ fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
         recv(&mut raw),
         gnitz_wire::server_hello(gnitz_wire::AuthStatus::Accepted)
     );
-    send(&mut raw, &encode_delta_poll(&[item], Some(1)));
+    send(&mut raw, &encode_delta_poll(&[item], Some(SubId::FIRST)));
     assert!(!next_is_sync(&mut raw, "the subscribing read"));
 
     let t0 = std::time::Instant::now();
@@ -1117,7 +1123,7 @@ impl Reader {
 
     /// Stay subscribed from the cursor: the read that does it is applied, as
     /// a delta read from there would be.
-    fn subscribe(&mut self, client: &mut GnitzClient) -> u64 {
+    fn subscribe(&mut self, client: &mut GnitzClient) -> SubId {
         let from = Some(self.cursor);
         let (sub, rows, cursor) =
             block_on(client.subscribe(&*self.desc, from, &self.desc.schema, &self.whole)).expect("subscribe");
@@ -1137,7 +1143,7 @@ impl Reader {
     }
 
     /// One sync of `client`, whose one subscription is `sub`, applied.
-    fn sync(&mut self, client: &mut GnitzClient, sub: u64, wait: Duration) -> usize {
+    fn sync(&mut self, client: &mut GnitzClient, sub: SubId, wait: Duration) -> usize {
         let mut pushed = block_on(client.sync(wait)).expect("sync").pushed;
         assert_eq!(pushed.len(), 1, "one entry per subscription");
         let pushed = pushed.pop().unwrap();
@@ -1208,7 +1214,7 @@ fn a_subscription_a_sync_does_not_name_is_ended_at_the_server() {
             .collect();
         sql(client, "s", &format!("INSERT INTO t VALUES {}", rows.join(",")));
     };
-    let pushed = |client: &mut GnitzClient| -> Vec<(u64, Result<usize, String>)> {
+    let pushed = |client: &mut GnitzClient| -> Vec<(SubId, Result<usize, String>)> {
         let synced = block_on(client.sync(Duration::ZERO)).expect("sync");
         let entry = |p: gnitz_core::Pushed| {
             (
@@ -2903,7 +2909,7 @@ mod cut_short {
     use super::*;
     use gnitz_core::{BlockingHost, Host, Interest, Job};
     use std::future::Future;
-    use std::os::fd::BorrowedFd;
+    use std::os::fd::OwnedFd;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
@@ -2922,7 +2928,7 @@ mod cut_short {
     }
 
     impl Host for ScriptHost {
-        fn attach(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()> {
+        fn attach(&mut self, fd: OwnedFd) -> std::io::Result<()> {
             self.inner.attach(fd)
         }
         fn poll_io(

@@ -1,5 +1,5 @@
 use super::*;
-use crate::relation::RelationKind;
+use crate::relation::{PinScope, RelationKind};
 use crate::test_support::{
     make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, relation_fixture_with, spilling, TID,
 };
@@ -32,7 +32,7 @@ fn pinned() -> crate::test_support::RelationFixture {
     let cancelled: Vec<_> = (0..100).step_by(3).map(|k| (k, -1, 0)).collect();
     let rounds = [make_batch_raw(&schema, &all), make_batch_raw(&schema, &cancelled)];
     let mut r = relation_fixture_with(spilling(), RelationKind::BaseTable, schema, &[], rounds);
-    r.pin(1, |k| k == RelationKind::BaseTable).unwrap();
+    r.pin(1, PinScope::BaseTables).unwrap();
     r
 }
 

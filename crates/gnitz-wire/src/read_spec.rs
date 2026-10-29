@@ -140,7 +140,7 @@ impl ReadSpec {
         w.into_vec()
     }
 
-    /// Decode at the trust boundary. A malformed frame is an `Err`.
+    /// A malformed frame is an `Err`.
     pub fn decode(buf: &[u8]) -> Result<ReadSpec, String> {
         decode_all(buf, "read_spec", |r| {
             let bound = r.get()?;
@@ -212,7 +212,7 @@ impl PkKeys {
         w.into_vec()
     }
 
-    /// [`Self::encode_probe`]'s inverse, at the trust boundary.
+    /// [`Self::encode_probe`]'s inverse.
     pub fn decode_probe(buf: &[u8]) -> Result<PkKeys, String> {
         decode_all(buf, "pk_probe", |r| match r.get()? {
             ReadBound::PkSet(keys) => Ok(keys),
@@ -237,7 +237,7 @@ impl Wire for ReadBound {
         }
     }
 
-    /// At the trust boundary: a malformed bound is an `Err`.
+    /// A malformed bound is an `Err`.
     fn read(r: &mut Reader) -> Result<Self, String> {
         Ok(match r.get()? {
             BoundTag::None => ReadBound::None,
@@ -253,7 +253,7 @@ impl Wire for PkKeys {
         write_pk_set(w, self.stride(), self.as_bytes());
     }
 
-    /// At the trust boundary: keys out of order are an `Err`.
+    /// Keys out of order are an `Err`.
     fn read(r: &mut Reader) -> Result<Self, String> {
         let (stride, bytes) = read_pk_set(r)?;
         PkKeys::checked(stride, bytes.to_vec()).map_err(|e| format!("PkSet {e}"))
@@ -261,7 +261,7 @@ impl Wire for PkKeys {
 }
 
 /// The bound of an encoded request that routing reads, without decoding the
-/// rest. [`ReadSpec::decode`] on the worker stays the trust boundary.
+/// rest.
 pub enum BoundPeek<'a> {
     Range(KeyRange),
     PkSet(PkSetPeek<'a>),

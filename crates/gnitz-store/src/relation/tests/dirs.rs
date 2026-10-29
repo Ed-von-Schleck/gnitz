@@ -2,10 +2,10 @@ use super::*;
 use crate::relation::{IndexClaim, StateLayout, StoreConfig};
 use crate::storage::flush_barrier;
 use crate::test_support::{
-    flip_last_byte_in_place, make_batch_raw, make_schema_u64_i64, relation_fixture_with, scratch_table, solo, spec,
-    spilling, zset_of, TID,
+    flip_last_byte_in_place, make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture_with, scratch_table,
+    solo, spec, spilling, zset_of, TID,
 };
-use gnitz_wire::ViewBudget;
+use gnitz_wire::{TypeCode, ViewBudget};
 
 #[test]
 fn parse_inverts_name_for_every_grammar() {
@@ -73,15 +73,24 @@ fn children_at_generation_reads_the_rows_and_the_declared_scratch() {
     let dir = tmp.path().to_str().unwrap().to_string();
     let mut traces = StateLayout::default();
     traces.declare("agg".to_string(), make_schema_u64_i64());
+    let agg = traces.names().next().unwrap().to_string();
     assert!(
         !children_at_generation(&dir, 2, G, &traces),
         "an absent rank is a mismatch"
     );
 
-    for name in ["w0of2", "w1of2", "scratch_agg_w0of2", "scratch_agg_w1of2"] {
+    let (agg0, agg1) = (format!("scratch_{agg}_w0of2"), format!("scratch_{agg}_w1of2"));
+    for name in ["w0of2", "w1of2", &agg0, &agg1] {
         stamp(&format!("{dir}/{name}"), G);
     }
     assert!(children_at_generation(&dir, 2, G, &traces));
+
+    let mut reshaped = StateLayout::default();
+    reshaped.declare("agg".to_string(), pk_only_schema(&[TypeCode::U64]));
+    assert!(
+        !children_at_generation(&dir, 2, G, &reshaped),
+        "a trace published under another schema is a mismatch"
+    );
 
     for name in ["idx_7_w0of2", "w0of4", "scratch_old_w0of2", "not_a_child"] {
         std::fs::create_dir_all(format!("{dir}/{name}")).unwrap();
@@ -91,13 +100,13 @@ fn children_at_generation_reads_the_rows_and_the_declared_scratch() {
         "undeclared children are not read"
     );
 
-    stamp(&format!("{dir}/scratch_agg_w1of2"), G - 1);
+    stamp(&format!("{dir}/{agg1}"), G - 1);
     assert!(
         !children_at_generation(&dir, 2, G, &traces),
         "a stale scratch child is a mismatch"
     );
 
-    std::fs::remove_dir_all(format!("{dir}/scratch_agg_w1of2")).unwrap();
+    std::fs::remove_dir_all(format!("{dir}/{agg1}")).unwrap();
     assert!(
         !children_at_generation(&dir, 2, G, &traces),
         "a declared scratch child with no directory is a mismatch"
@@ -198,6 +207,7 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
     .unwrap();
     let mut traces = StateLayout::default();
     traces.declare("agg".to_string(), schema);
+    let agg = traces.names().next().unwrap().to_string();
     r.ingest(TID, make_batch_raw(&schema, &[(1, 1, 7)])).unwrap();
     r.checkpoint_base().unwrap();
 
@@ -207,15 +217,16 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
         relation_dir(base, TID + 50),
         format!("{rel}/w0of2"),
         format!("{rel}/w1of2"),
-        format!("{rel}/scratch_agg_w1of2"),
+        format!("{rel}/scratch_{agg}_w1of2"),
         format!("{rel}/idx_7_w0of2"),
         format!("{rel}/idx_0-1_w0of3"),
         format!("{rel}/scratch_old_w0of3"),
+        format!("{rel}/scratch_agg_w0of3"),
     ];
     let kept = [
         format!("{rel}/w0of3"),
         format!("{rel}/idx_1_w0of3"),
-        format!("{rel}/scratch_agg_w2of3"),
+        format!("{rel}/scratch_{agg}_w2of3"),
         format!("{rel}/data_keep"),
     ];
     for dir in unowned.iter().chain(&kept) {
@@ -235,4 +246,14 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
         zset_of(&r.relation(TID).unwrap().full_scan(), &schema),
         zset_of(&make_batch_raw(&schema, &[(1, 1, 7)]), &schema)
     );
+}
+
+/// A data directory whose ancestors are missing is created whole.
+#[test]
+fn lock_data_dir_creates_missing_ancestors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("a/b/data");
+    let base = base.to_str().unwrap();
+    let _lock = lock_data_dir(base).unwrap();
+    assert!(Path::new(&relations_dir(base)).is_dir());
 }

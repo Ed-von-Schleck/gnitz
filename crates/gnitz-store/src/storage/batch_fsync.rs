@@ -65,7 +65,10 @@ impl Syncer {
                 .map(File::open)
                 .collect::<Result<_, _>>()?;
             let ring = if files.len() > 1 { self.ring()? } else { None };
-            batch_sync_with(ring, &files, flags, |r, want| r.submit_and_wait(want))?;
+            // A failed batch can leave entries in the ring's queues, so the
+            // next batch starts on a fresh ring.
+            batch_sync_with(ring, &files, flags, |r, want| r.submit_and_wait(want))
+                .inspect_err(|_| self.ring = None)?;
         }
         Ok(())
     }
@@ -94,7 +97,8 @@ fn batch_sync_with(
     };
     for f in files {
         let sqe = opcode::Fsync::new(types::Fd(f.as_raw_fd())).flags(flags).build();
-        // SAFETY: `f` outlives every wait below.
+        // SAFETY: an Fsync SQE points at no user memory; the kernel takes its
+        // own reference to the file when it submits.
         unsafe { ring.submission().push(&sqe) }
             .expect("the SQ holds FD_CHUNK_THRESHOLD entries and starts each batch empty");
     }

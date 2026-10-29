@@ -25,9 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::{WorkerParks, WorkerSet};
-use crate::runtime::reactor::Reactor;
+use crate::runtime::reactor::{Reactor, ReadyAcked};
 use crate::runtime::sync::{AsyncRwLock, WriteGuard};
-use crate::runtime::w2m::NO_REPLY_REQUEST_ID;
+use crate::runtime::w2m::RequestId;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
 use gnitz_wire::{
@@ -61,14 +61,14 @@ const OFF_KIND: usize = 8;
 const OFF_FLAGS: usize = 9;
 /// On a zone's last member: the zone is closed.
 const FLAG_ZONE_END: u8 = 1;
-/// Each reply must reach the ring in request order.
-const FLAG_IN_REQUEST_ORDER: u8 = 2;
+/// The group is a later member of its [`Cut`].
+const FLAG_JOINS_CUT: u8 = 2;
 /// The group holds one payload, which every addressed worker reads.
 const FLAG_SHARED: u8 = 4;
-const KNOWN_FLAGS: u8 = FLAG_ZONE_END | FLAG_IN_REQUEST_ORDER | FLAG_SHARED;
+const KNOWN_FLAGS: u8 = FLAG_ZONE_END | FLAG_JOINS_CUT | FLAG_SHARED;
 /// The worker count the group was written at, one byte.
 const OFF_WIDTH: usize = 10;
-/// [`NO_REPLY_REQUEST_ID`](crate::runtime::w2m::NO_REPLY_REQUEST_ID): nothing answers.
+/// The group's [`RequestId`], 0 for none.
 const OFF_REQUEST_ID: usize = 12;
 /// The group's own byte offset in the ring.
 const OFF_BASE: usize = 16;
@@ -191,16 +191,12 @@ impl<'a> GroupData<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct GroupTargets {
     pub(crate) set: WorkerSet,
-    /// [`NO_REPLY_REQUEST_ID`]: nothing answers.
-    pub(crate) request_id: u32,
+    pub(crate) reply: Option<RequestId>,
 }
 
 impl GroupTargets {
     /// Every worker, nothing answers.
-    pub(crate) const SILENT: Self = GroupTargets {
-        set: WorkerSet::ALL,
-        request_id: NO_REPLY_REQUEST_ID,
-    };
+    pub(crate) const SILENT: Self = GroupTargets { set: WorkerSet::ALL, reply: None };
 }
 
 /// One SAL group as [`SalExcl::lay_out`] encodes it: the request every payload
@@ -439,8 +435,7 @@ pub(crate) struct GroupHead {
     flags: u8,
     /// The worker count the group was written at.
     width: u8,
-    /// [`NO_REPLY_REQUEST_ID`](crate::runtime::w2m::NO_REPLY_REQUEST_ID): nothing answers.
-    pub(crate) request_id: u32,
+    pub(crate) reply: Option<RequestId>,
     pub(crate) target_id: u64,
     /// The workers the group addresses, within `width`.
     pub(crate) targets: WorkerSet,
@@ -452,9 +447,9 @@ impl GroupHead {
         self.flags & FLAG_ZONE_END != 0
     }
 
-    /// Whether the group is a later member of its cut.
-    fn in_request_order(&self) -> bool {
-        self.flags & FLAG_IN_REQUEST_ORDER != 0
+    /// Whether the group is a later member of its [`Cut`].
+    fn joins_cut(&self) -> bool {
+        self.flags & FLAG_JOINS_CUT != 0
     }
 
     /// Whether the group holds one payload for every addressed worker.
@@ -470,7 +465,7 @@ impl GroupHead {
     /// Every scalar field into `hdr`, with the base and epoch it is published at.
     fn encode(&self, hdr: &mut [u8], base: u64, epoch: u32) {
         hdr[OFF_KIND..OFF_KIND + 4].copy_from_slice(&[self.kind.as_wire(), self.flags, self.width, 0]);
-        write_u32_le(hdr, OFF_REQUEST_ID, self.request_id);
+        write_u32_le(hdr, OFF_REQUEST_ID, RequestId::to_wire(self.reply));
         write_u32_le(hdr, OFF_BASE, base as u32);
         write_u32_le(hdr, OFF_EPOCH, epoch);
         write_u64_le(hdr, OFF_LSN, self.lsn);
@@ -486,7 +481,7 @@ impl GroupHead {
             kind: SalMessageKind::from_wire(fixed[OFF_KIND])?,
             flags: fixed[OFF_FLAGS],
             width: fixed[OFF_WIDTH],
-            request_id: read_u32_le(fixed, OFF_REQUEST_ID),
+            reply: RequestId::from_wire(read_u32_le(fixed, OFF_REQUEST_ID)),
             target_id: read_u64_le(fixed, OFF_TARGET_ID),
             targets: WorkerSet(read_u64_le(fixed, OFF_TARGETS)),
         };
@@ -526,6 +521,15 @@ impl SalMessage {
     pub(crate) fn payloads(&self) -> impl Iterator<Item = &'static [u8]> + '_ {
         let payload = self.payload;
         payload_spans(dir_sizes(self.dir)).map(move |(off, sz)| &payload[off..off + sz])
+    }
+
+    /// The one payload of a shared group, `None` on a group with one per worker.
+    pub(crate) fn shared_payload(&self) -> Option<&'static [u8]> {
+        if self.head.shared() {
+            self.payloads().next()
+        } else {
+            None
+        }
     }
 
     /// Worker `w`'s bytes, `None` when the group does not address it.
@@ -789,6 +793,9 @@ impl SalLog {
 // SalWriter
 // ---------------------------------------------------------------------------
 
+/// The tag of a [`SalWriter`]'s lock.
+enum SalLock {}
+
 pub(crate) struct SalWriter {
     log: SalLog,
     write_cursor: Cell<u64>,
@@ -805,32 +812,39 @@ pub(crate) struct SalWriter {
     /// [`Self::rewind`].
     holds_pushes: Cell<bool>,
     /// Taken by every [`SalExcl`].
-    excl: AsyncRwLock,
+    excl: AsyncRwLock<SalLock>,
     /// Every worker's park; its length is the worker count groups are written at.
     parks: WorkerParks,
 }
 
 impl SalWriter {
-    /// Starts at epoch 0, which [`Self::write_slots`] refuses: nothing can be
-    /// written before the boot [`SalExcl::boot_rewind`] sets the live epoch.
-    pub(crate) fn new(log: SalLog, parks: WorkerParks) -> Self {
+    /// The writer of the boot that recovered `tail`, rewound to its live epoch.
+    pub(crate) fn boot(tail: CommittedTail, parks: WorkerParks, _: ReadyAcked) -> Self {
+        Self::rewound(tail.log(), parks, tail.live_epoch())
+    }
+
+    /// A writer over `log` rewound to cursor 0 of `epoch`, its watermark below
+    /// every LSN of `epoch` and above every earlier epoch's.
+    fn rewound(log: SalLog, parks: WorkerParks, epoch: u32) -> Self {
         assert!(
             log.ring_len > PREFIX_BYTES + CHECKPOINT_RESERVE,
             "the ring must hold the checkpoint band"
         );
         let checkpoint_threshold =
             gnitz_foundation::env::env_num("GNITZ_CHECKPOINT_BYTES", (log.ring_len as u64 * 3) >> 2);
-        SalWriter {
+        let writer = SalWriter {
             log,
             write_cursor: Cell::new(0),
-            epoch: Cell::new(0),
-            watermark: Cell::new(0),
+            epoch: Cell::new(epoch),
+            watermark: Cell::new(epoch_word(epoch, 0) - 1),
             checkpoint_threshold,
             refused_transient: Cell::new(false),
             holds_pushes: Cell::new(false),
             excl: AsyncRwLock::default(),
             parks,
-        }
+        };
+        writer.rewind(epoch);
+        writer
     }
 
     /// Sole write access, once no other task holds it.
@@ -1013,17 +1027,17 @@ impl SalWriter {
 /// round's ACKs.
 pub(crate) struct SalExcl<'a> {
     writer: &'a SalWriter,
-    /// A group was written under this hold, so each later one joins its cut.
+    /// A group was written under this hold, so each later one joins its [`Cut`].
     wrote: bool,
     /// The workers groups laid out since the last [`Self::wake`] reached.
     reached: WorkerSet,
-    _guard: WriteGuard,
+    _guard: WriteGuard<SalLock>,
 }
 
 impl<'a> SalExcl<'a> {
     /// Lay `g` out at the write cursor, unpublished, stamped with `lsn` and,
-    /// when `in_request_order`, as a later member of its cut. The one encode path.
-    fn lay_out(&mut self, g: &SalGroup, lsn: u64, in_request_order: bool) -> Result<u64, WireFault> {
+    /// when `joins_cut`, as a later member of its [`Cut`]. The one encode path.
+    fn lay_out(&mut self, g: &SalGroup, lsn: u64, joins_cut: bool) -> Result<u64, WireFault> {
         let nw = self.writer.parks.len();
         let per_worker = match g.data {
             GroupData::Same(_) => nw,
@@ -1053,9 +1067,9 @@ impl<'a> SalExcl<'a> {
         let head = GroupHead {
             lsn,
             kind,
-            flags: if shared { FLAG_SHARED } else { 0 } | if in_request_order { FLAG_IN_REQUEST_ORDER } else { 0 },
+            flags: if shared { FLAG_SHARED } else { 0 } | if joins_cut { FLAG_JOINS_CUT } else { 0 },
             width: nw as u8,
-            request_id: g.targets.request_id,
+            reply: g.targets.reply,
             target_id: template.target_id,
             targets: set,
         };
@@ -1069,7 +1083,7 @@ impl<'a> SalExcl<'a> {
     }
 
     /// Write and publish one group, outside every zone. The groups written
-    /// under one hold are one cut.
+    /// under one hold are one [`Cut`].
     pub(crate) fn write(&mut self, g: &SalGroup) -> Result<(), WireFault> {
         let base = self.lay_out(g, 0, self.wrote)?;
         self.wrote = true;
@@ -1112,14 +1126,6 @@ impl<'a> SalExcl<'a> {
         let epoch = next_epoch(self.writer.epoch.get());
         self.writer.rewind(epoch);
         epoch
-    }
-
-    /// The boot rewind, to the live epoch the recovered tail names. Seeds the
-    /// watermark below every LSN this boot, above every earlier boot's.
-    pub(crate) fn boot_rewind(&mut self, live_epoch: u32) {
-        let w = self.writer;
-        w.rewind(live_epoch);
-        w.watermark.set(epoch_word(live_epoch, 0) - 1);
     }
 
     /// Wake every worker a group written since the last wake reached.
@@ -1209,9 +1215,7 @@ impl SalScope<'_, '_> {
         w.mark_zone_end(last);
         w.publish_range(self.from, last);
         if ZONE_PANIC.at(self.tag) {
-            // SAFETY: `libc::abort` is the whole reason this block is unsafe; it
-            // takes no argument and cannot violate an invariant.
-            unsafe { libc::abort() };
+            std::process::abort();
         }
         w.publish_range(last, end);
         true
@@ -1232,22 +1236,39 @@ impl Drop for SalScope<'_, '_> {
 // SalReader — one worker's live drain over a SalLog
 // ---------------------------------------------------------------------------
 
-/// Where the reply to a group goes.
+/// The groups written under one SAL hold. A cut's groups are consecutive in the
+/// log, and only its first lacks [`FLAG_JOINS_CUT`]. A worker sends a cut's
+/// replies in request order: the master drains a cut's leases in that order,
+/// and a W2M ring frees only a released prefix. Replies of different cuts go to
+/// different leases, and may pass each other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Cut(u64);
+
+#[cfg(test)]
+impl Cut {
+    /// The `n`th cut a drain passes.
+    pub(crate) fn nth(n: u64) -> Cut {
+        Cut(n)
+    }
+}
+
+/// Where the reply to a read goes.
 #[derive(Clone, Copy)]
 pub(crate) struct ReplyRoute {
     pub(crate) target_id: u64,
-    /// [`NO_REPLY_REQUEST_ID`](crate::runtime::w2m::NO_REPLY_REQUEST_ID): nothing answers.
-    pub(crate) request_id: u32,
-    /// The cut the group was written in: how many groups not flagged in request
-    /// order the drain had passed. A cut's groups are consecutive and only its
-    /// first is unflagged, so every member reads one count and no two cuts share one.
-    pub(crate) cut: u64,
+    pub(crate) request_id: RequestId,
+    /// The cut the read was written in.
+    pub(crate) cut: Cut,
 }
 
 /// One group addressed to a worker, decoded and owned: a parked read outlives the
 /// SAL bytes it came in, which an inline `Flush` lets the master rewrite.
 pub(crate) struct Inbound {
-    pub(crate) route: ReplyRoute,
+    pub(crate) target_id: u64,
+    /// The id the group is answered on; `None` when nothing waits for an
+    /// answer, which [`SalReader::next_request`] refuses for a read.
+    pub(crate) reply: Option<RequestId>,
+    pub(crate) cut: Cut,
     pub(crate) what: SalRequest<'static>,
     /// Boxed, so a request moves from its decode to where it is served or parked
     /// as a few words: held inline, the batch would be copied whole at each of
@@ -1263,8 +1284,9 @@ pub(crate) struct SalReader {
     /// arithmetic.
     read_cursor: u64,
     expected_epoch: u32,
-    /// The cut of the group [`Self::next`] last returned.
-    cut: u64,
+    /// The cut of the group [`Self::next`] last returned: how many groups
+    /// opening a cut the drain has passed.
+    cut: Cut,
 }
 
 impl SalReader {
@@ -1275,7 +1297,7 @@ impl SalReader {
             worker_id,
             read_cursor: 0,
             expected_epoch: live_epoch,
-            cut: 0,
+            cut: Cut(0),
         }
     }
 
@@ -1300,8 +1322,8 @@ impl SalReader {
                     }
                     // Counted whether or not the group addresses this worker, so
                     // every worker numbers a cut alike.
-                    if !msg.head.in_request_order() {
-                        self.cut += 1;
+                    if !msg.head.joins_cut() {
+                        self.cut.0 += 1;
                     }
                     if let Some(slot) = msg.slot(self.worker_id) {
                         return Some((msg, slot));
@@ -1347,12 +1369,13 @@ impl SalReader {
             Ok(what) => what,
             Err(e) => undecodable(e),
         };
+        if msg.head.reply.is_none() && matches!(what, SalRequest::Read(_)) {
+            undecodable("a read group carries no request id".into());
+        }
         Some(Inbound {
-            route: ReplyRoute {
-                target_id: control.hdr.target_id,
-                request_id: msg.head.request_id,
-                cut: self.cut,
-            },
+            target_id: control.hdr.target_id,
+            reply: msg.head.reply,
+            cut: self.cut,
             what,
             rows: rows.take().map(Box::new),
         })

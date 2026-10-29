@@ -6,9 +6,10 @@ use crate::{TypeCode, MAX_COLUMNS};
 /// Which rule a candidate primary key broke, worded by [`PkRule::named`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkRule {
-    /// The word carries no [`PK_LIST_PACKED_FLAG`]. The one rule about the
-    /// *word*; every other presupposes a decoded list.
+    /// The word carries no [`PK_LIST_PACKED_FLAG`].
     NotPacked,
+    /// The word sets a bit outside its flag, its count and its columns.
+    NonCanonical,
     /// No PK columns at all. Every base table has an enforced primary key.
     Empty,
     /// Arity past the cap the caller passed, which rides along so the message
@@ -54,6 +55,7 @@ impl PkRule {
         };
         match *self {
             PkRule::NotPacked => format!("{what} word carries no packed-list flag"),
+            PkRule::NonCanonical => format!("{what} word carries bits outside its columns"),
             PkRule::Empty => format!("{what} must name at least one column"),
             PkRule::TooManyColumns { count, max } => {
                 format!("{what} column count {count} out of range 1..={max}")
@@ -145,11 +147,12 @@ pub const MAX_PK_COLUMNS: usize = PK_LIST_MAX_COLS + 1;
 // IDX_TAB `source_col_idx`, and the column lists of a KeyRange, a RelIndex and
 // a mirror record.
 //
-// A word without the tag is malformed. Layout:
+// Layout:
 //        bit 63        : PK_LIST_PACKED_FLAG
-//        bit 62        : reserved
 //        bits [0..4)   : decoded count (1..=PK_LIST_MAX_COLS valid)
 //        bits [4+7i..) : i-th column index, 7 bits each
+// Every other bit is zero: the decode refuses a word that does not re-pack to
+// itself.
 // ---------------------------------------------------------------------------
 
 /// Capacity of the persisted PK-list codec ([`PkColList`]): the most columns a
@@ -175,17 +178,15 @@ const _: () = assert!(
     "PK_LIST_MAX_COLS overflows the packed count field"
 );
 const _: () = assert!(
-    PK_LIST_COUNT_BITS as usize + PK_LIST_COL_BITS as usize * PK_LIST_MAX_COLS <= 62,
-    "PK_LIST_MAX_COLS overflows the packed u64 column region" // bits 62/63 are flags
+    PK_LIST_COUNT_BITS as usize + PK_LIST_COL_BITS as usize * PK_LIST_MAX_COLS <= 63,
+    "PK_LIST_MAX_COLS overflows the packed u64 column region" // bit 63 is the flag
 );
 const _: () = assert!(
     MAX_COLUMNS <= 1 << PK_LIST_COL_BITS,
     "a schema column index no longer fits the packed 7-bit field"
 );
 
-/// Bit 63: the tag whose absence the decode refuses. An `arg1` means different
-/// things per message kind, so the decode insists on a tag rather than reading a
-/// shape.
+/// Bit 63: set on every packed list, so a zero word is never one.
 pub const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
 
 /// A column list — a PK's or an index's: `1..=PK_LIST_MAX_COLS` distinct columns,
@@ -235,7 +236,8 @@ impl PkColList {
         w
     }
 
-    /// Decode the persisted `u64` form.
+    /// Decode the persisted `u64` form: the one word [`Self::pack`] writes for
+    /// the list it names.
     fn unpack(word: u64) -> Result<Self, PkRule> {
         if word & PK_LIST_PACKED_FLAG == 0 {
             return Err(PkRule::NotPacked);
@@ -248,7 +250,11 @@ impl PkColList {
         for (i, slot) in cols[..n].iter_mut().enumerate() {
             *slot = ((word >> (PK_LIST_COUNT_BITS + PK_LIST_COL_BITS * i as u32)) & PK_LIST_COL_MAX as u64) as u32;
         }
-        Self::checked(&cols[..n], MAX_COLUMNS)
+        let list = Self::checked(&cols[..n], MAX_COLUMNS)?;
+        if list.pack() != word {
+            return Err(PkRule::NonCanonical);
+        }
+        Ok(list)
     }
 
     /// Decode the persisted `u64` form, its refusal rendered for `role`.

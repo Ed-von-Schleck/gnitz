@@ -95,7 +95,7 @@ fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
 // ---------------------------------------------------------------------------
 
 /// N-way (PK, payload) merge + consolidation over any sorted columnar sources —
-/// the kernel of shard compaction (`shard::merge_guard`) and of
+/// the kernel of shard compaction (`shard::GuardMerge`) and of
 /// [`merge_consolidated`]'s N-way arm.
 ///
 /// Rows with the same (PK, payload) have their weights summed; zero-weight
@@ -303,8 +303,7 @@ impl MergeOrder {
 ///
 /// Every N-way merge runs through this — [`run_merge`] and the read cursor's
 /// advance and drain — and it builds its order and group boundary itself, from
-/// the one [`tie_less`], so no caller can pair a heap order with a mismatched
-/// group boundary. `order` is [`merge_less`]'s and means the same here.
+/// the one [`tie_less`].
 ///
 /// `#[inline(always)]`: each caller's `emit` returns a constant `ControlFlow`, so
 /// forced inlining folds the branch and drops the unused arm per monomorphisation.
@@ -321,8 +320,6 @@ pub(crate) fn drive<S, P>(
     S: ColumnarSource,
     P: PayloadOrder,
 {
-    // `less` reads `(source_idx, row)` out of the heap node and never touches
-    // `cursors`, so it coexists with the `&mut cursors` `step!` holds.
     let less = merge_less(schema, sources, order, payload);
     let wide = order.has_tail(schema.pk_stride());
     macro_rules! step {
@@ -608,10 +605,8 @@ where
                                     sink.push(1, jb, jb + 1);
                                     jb += 1;
                                 }
-                                // One element carried by both sides: `+` sums its
-                                // two weights into one row, and a zero sum drops it
-                                // (§2), which is why this merge can emit fewer rows
-                                // than it read.
+                                // One element on both sides: its weights sum into
+                                // one row, dropped at zero.
                                 Ordering::Equal => {
                                     sink.push_folded(ia, jb, a.get_weight(ia) + b.get_weight(jb));
                                     ia += 1;
@@ -656,7 +651,7 @@ pub(crate) fn consolidate_groups(batch: &MemBatch, out: &mut Vec<Pick>) {
 /// them: strictly (PK, payload)-ascending, with no ghost. One forward pass, which
 /// the first pair out of order ends.
 pub(crate) fn in_consolidated_order(batch: &Batch) -> bool {
-    if batch.count == 0 {
+    if batch.is_empty() {
         return true;
     }
     with_payload_cmp!(batch.schema(), |p| ascending_with(batch, p)) && !batch.has_ghost()

@@ -521,16 +521,24 @@ fn float_minmax2_uses_total_cmp_order() {
 /// microseconds; `ToMicros` NULLs a day count past `i64` microseconds.
 #[test]
 fn calendar_ops_read_their_columns_representation() {
-    use crate::calendar::{days_to_micros, eval};
+    use crate::calendar::eval;
     use gnitz_wire::MICROS_PER_DAY;
-    let days = [-719_528i64, -1, 0, 19_782, 2_932_896];
-    let micros: Vec<i64> = days.iter().map(|d| d * MICROS_PER_DAY + 49_507_000_005).collect();
-    for op in CalendarOp::ALL.iter().copied().filter(|&op| op != CalendarOp::ToMicros) {
+    let days = [
+        -719_528i64,
+        -1,
+        0,
+        19_782,
+        2_932_896,
+        i64::MAX / MICROS_PER_DAY + 1,
+        i64::MIN / MICROS_PER_DAY - 1,
+    ];
+    let micros: Vec<i64> = days[..5].iter().map(|d| d * MICROS_PER_DAY + 49_507_000_005).collect();
+    for op in CalendarOp::ALL.iter().copied() {
         for (tc, vals, is_micros) in [
             (TypeCode::Date, &days[..], false),
             (TypeCode::Timestamp, &micros[..], true),
         ] {
-            if op == CalendarOp::ToDays && !is_micros {
+            if (op == CalendarOp::ToDays && !is_micros) || (op == CalendarOp::ToMicros && is_micros) {
                 continue;
             }
             let got = ints(&[int(tc, vals.iter().map(|&v| Some(v)).chain([None]))], |r| {
@@ -538,30 +546,12 @@ fn calendar_ops_read_their_columns_representation() {
             });
             let want: Vec<Option<i64>> = vals
                 .iter()
-                .map(|&v| Some(eval(op, v, is_micros)))
+                .map(|&v| Some(eval(op, v, is_micros)).filter(|r| !r.1).map(|r| r.0))
                 .chain([None])
                 .collect();
             assert_eq!(got, want, "{op:?} over {tc}");
         }
     }
-    let far = [
-        0i64,
-        19_782,
-        i64::MAX / MICROS_PER_DAY + 1,
-        i64::MIN / MICROS_PER_DAY - 1,
-    ];
-    let got = ints(&[int(TypeCode::Date, far)], |r| {
-        vec![LogicalInstr::Calendar {
-            op: CalendarOp::ToMicros,
-            a: r[0],
-            micros: false,
-        }]
-    });
-    let want: Vec<Option<i64>> = far
-        .iter()
-        .map(|&d| Some(days_to_micros(d)).filter(|r| !r.1).map(|r| r.0))
-        .collect();
-    assert_eq!(got, want);
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,5 +1336,61 @@ fn string_producers_answer_their_reference_rows() {
     for (label, cols, consts, mk, want) in rows {
         let (mut ev, view) = prog(&cols, consts, mk);
         assert_eq!(text_rows(&mut ev, &view), texts(&want), "{label}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The two shapes of a view
+// ---------------------------------------------------------------------------
+
+#[cfg(debug_assertions)]
+mod shapes {
+    use super::*;
+
+    /// A view whose per-row cells are the next row's, so its two shapes disagree.
+    struct SkewedCells(TestView);
+
+    impl gnitz_wire::RowSource for SkewedCells {
+        fn get_pk_bytes(&self, row: usize) -> &[u8] {
+            self.0.get_pk_bytes(row)
+        }
+        fn get_null_word(&self, row: usize) -> u64 {
+            self.0.get_null_word(row)
+        }
+        fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+            self.0
+                .get_col_ptr((row + 1) % self.0.row_count(), payload_col, col_size)
+        }
+        fn heap(&self) -> Heap<'_> {
+            self.0.heap()
+        }
+        fn row_count(&self) -> usize {
+            self.0.row_count()
+        }
+    }
+
+    impl crate::BatchView for SkewedCells {
+        fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8] {
+            self.0.col_data(payload_col, col_size)
+        }
+        fn null_bmp(&self) -> &[u8] {
+            self.0.null_bmp()
+        }
+        fn pk_region(&self) -> (&[u8], usize) {
+            self.0.pk_region()
+        }
+        fn blob(&self) -> &[u8] {
+            self.0.blob()
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "payload column 0")]
+    fn an_evaluation_refuses_a_view_whose_shapes_disagree() {
+        let (schema, instrs, view) = build(&[i64s([1, 2])], |r| {
+            vec![LogicalInstr::Cmp { op: CmpOp::Eq, a: r[0], b: r[0] }]
+        });
+        let mut f = filter_prog(&schema, instrs, vec![]);
+        crate::test_support::filter_verdicts(&mut f, &SkewedCells(view));
     }
 }

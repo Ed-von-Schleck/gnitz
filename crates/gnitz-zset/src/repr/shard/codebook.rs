@@ -1,10 +1,10 @@
 //! The symbol table a store codes its shard heaps under (FSST), as an encoder
 //! and a decoder of one table.
 //!
-//! A value coded under one table is the same codes whoever codes it — the
-//! encoder a shard's table is rebuilt into codes every value as the one trained
-//! did — so a shard written under a store's codebook copies the codes of every
-//! value it reads from a shard of the same table, and codes only the rest.
+//! A shard written under a store's codebook copies the codes of every value
+//! already coded under the same table, and codes only the rest. The encoder a
+//! shard's table is rebuilt into codes every value as the one trained did, so a
+//! value has the same codes in every shard of one table.
 
 use std::rc::Rc;
 
@@ -40,21 +40,16 @@ pub struct Codebook {
 }
 
 impl Codebook {
-    /// The codebook of `shard`'s table; `None` for a plain heap, or a table no
-    /// trained encoder could have written.
+    /// The codebook of `shard`'s table; `None` for a plain heap or a body that
+    /// fails its checksum.
     pub fn of_shard(shard: &MappedShard) -> Option<Self> {
         let image = shard.coded_heap()?;
-        let table = &image.table;
-        let (symbols, lens): (Vec<fsst::Symbol>, Vec<u8>) = table
+        shard.verify_body().ok()?;
+        let (symbols, lens): (Vec<fsst::Symbol>, Vec<u8>) = image
+            .table
             .symbols()
             .map(|(sym, len)| (fsst::Symbol::from_slice(sym), len))
             .unzip();
-        // The order a trained table keeps, which the rebuild asserts: the longer
-        // symbols ascending by length, then the one-byte ones.
-        let multi = lens.iter().take_while(|&&n| n > 1).count();
-        if !lens[..multi].is_sorted() || lens[multi..].iter().any(|&n| n != 1) {
-            return None;
-        }
         Some(Self::of_encoder(
             fsst::Compressor::rebuild_from(symbols, lens),
             image.trained_sixteenths,

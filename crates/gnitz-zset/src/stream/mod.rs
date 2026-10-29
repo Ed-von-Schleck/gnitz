@@ -27,6 +27,15 @@ use crate::repr::ReadCursor;
 /// touches, and not at all for a history it turns out not to read.
 pub type OpenAt<'a> = &'a mut dyn FnMut(&[u8], &[u8]) -> ReadCursor;
 
+/// A history of an operator's input, tagged with whether it holds this epoch's
+/// delta.
+pub enum History<'a> {
+    /// `z⁻¹(I(X))`: the integral before this epoch's delta.
+    Before(OpenAt<'a>),
+    /// `I(X)`: the integral with this epoch's delta absorbed.
+    Through(OpenAt<'a>),
+}
+
 pub use clamp::op_weight_clamp;
 pub use join::{op_join_delta_trace, JoinPlan};
 pub use ordered::{OrderedEpoch, OrderedPlan};

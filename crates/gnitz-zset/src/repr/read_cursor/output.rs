@@ -70,7 +70,7 @@ impl ReadCursor {
     /// Every remaining row in merge order, consolidated.
     pub fn materialize(mut self) -> Rc<Batch> {
         if let [Run::Mem(rc)] = &self.sources[..] {
-            let whole = self.valid && self.current.row == 0 && self.states[0].end == rc.count;
+            let whole = self.valid && self.current.row == 0 && self.states[0].end == rc.len();
             if whole {
                 return Rc::clone(rc);
             }

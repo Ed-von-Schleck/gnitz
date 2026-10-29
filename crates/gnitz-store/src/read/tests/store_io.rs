@@ -459,3 +459,13 @@ fn a_read_of_what_the_relation_has_not_got_is_refused() {
         assert!(err.contains(why), "refusal {i}: {err}");
     }
 }
+
+/// A stream holds no rows, so a PK or column probe of one is refused.
+#[test]
+fn a_pk_probe_of_a_stream_is_refused() {
+    let r = relation_fixture(RelationKind::Stream, make_schema_u64_i64(), &[], []);
+    for probe in [Probe::Pk, Probe::PkColumn(1)] {
+        let err = r.probe(TID, probe, PkKeys::from_images(8, [2])).map(drop).unwrap_err();
+        assert!(err.contains("is a stream"), "{probe:?}: {err}");
+    }
+}

@@ -8,7 +8,6 @@
 use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::test_support::try_poll_once;
-use crate::runtime::w2m::NO_REPLY_REQUEST_ID;
 
 /// A writer over a fresh `size`-byte ring written at `workers` workers, rewound
 /// to cursor 0 of `epoch` as a boot leaves it.
@@ -17,9 +16,7 @@ pub(crate) fn test_log(size: usize, workers: usize, epoch: u32) -> SalWriter {
     // Leaked: open and mapped for the rest of the process.
     let file: &'static File = Box::leak(Box::new(gnitz_foundation::posix_io::memfd(c"test_sal").expect("memfd")));
     let parks = WorkerParks::create(workers).expect("map the parks");
-    let writer = SalWriter::new(SalLog::map(file, len).expect("map the test SAL"), parks);
-    writer.excl().boot_rewind(epoch);
-    writer
+    SalWriter::rewound(SalLog::map(file, len).expect("map the test SAL"), parks, epoch)
 }
 
 impl SalWriter {
@@ -77,7 +74,7 @@ impl SalWriter {
             kind,
             flags: 0,
             width: self.parks.len() as u8,
-            request_id: NO_REPLY_REQUEST_ID,
+            reply: None,
             target_id: target,
             targets: written().map(|(w, _)| w).collect(),
         };

@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::tls::{TlsArgs, TlsListener};
+use crate::runtime::tls::{ResolvedTls, TlsArgs, TlsListener};
 
 /// The AF_UNIX bind replaces only a stale socket: a regular file at the path
 /// and a socket a live server answers on each refuse the boot, untouched.
@@ -31,7 +31,7 @@ fn bind_listeners_publishes_the_endpoint_and_accepted_sockets_inherit_the_option
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_str().unwrap();
     let sock = dir.path().join("s.sock");
-    let tls = TlsListener::open(TlsArgs::on("127.0.0.1:0"), data_dir).unwrap();
+    let tls = TlsListener::open(ResolvedTls::unchecked(TlsArgs::on("127.0.0.1:0")), data_dir).unwrap();
     let mut listeners = bind_listeners(data_dir, sock.to_str().unwrap(), Some(tls)).expect("bind");
 
     let endpoint = std::fs::read_to_string(dir.path().join(TLS_ENDPOINT_FILE)).unwrap();
@@ -71,7 +71,7 @@ fn a_failed_tcp_bind_exposes_nothing() {
     let data_dir = dir.path().to_str().unwrap();
     let sock = dir.path().join("s.sock");
     // TEST-NET-1: no host holds it, so the bind fails at once, without the grace.
-    let tls = TlsListener::open(TlsArgs::on("192.0.2.1:9"), data_dir).unwrap();
+    let tls = TlsListener::open(ResolvedTls::unchecked(TlsArgs::on("192.0.2.1:9")), data_dir).unwrap();
     let e = bind_listeners(data_dir, sock.to_str().unwrap(), Some(tls))
         .err()
         .expect("an address off the host refuses");
@@ -92,7 +92,7 @@ fn an_address_freed_within_the_grace_is_bound() {
     let held_unix = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let held_tcp = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = held_tcp.local_addr().unwrap();
-    let tls = TlsListener::open(TlsArgs::on(&addr.to_string()), data_dir).unwrap();
+    let tls = TlsListener::open(ResolvedTls::unchecked(TlsArgs::on(&addr.to_string())), data_dir).unwrap();
     let release = std::thread::spawn(move || {
         for held in [Box::new(held_tcp) as Box<dyn Send>, Box::new(held_unix)] {
             std::thread::sleep(Duration::from_millis(50));

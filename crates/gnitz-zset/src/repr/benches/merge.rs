@@ -123,8 +123,8 @@ fn striped_sum_bench() {
                 .collect();
             let mem: Vec<MemBatch<'_>> = stripes.iter().map(|b| b.as_mem_batch()).collect();
             let rows = per * k;
-            assert_eq!(merge_consolidated(&mem, &schema).count, rows, "the merge dropped rows");
-            assert_eq!(Batch::concat(&schema, mem.iter().copied()).count, rows);
+            assert_eq!(merge_consolidated(&mem, &schema).len(), rows, "the merge dropped rows");
+            assert_eq!(Batch::concat(&schema, mem.iter().copied()).len(), rows);
             let ((), merged) = instructions.measure(|| {
                 for _ in 0..iters {
                     black_box(merge_consolidated(&mem, &schema));
@@ -192,7 +192,7 @@ fn two_way_bench() {
         let mem = [a.as_mem_batch(), b.as_mem_batch()];
         black_box(merge_consolidated(&mem, &schema));
         let ((out, instr), cyc) = cycles.measure(|| instructions.measure(|| merge_consolidated(&mem, &schema)));
-        assert_eq!(out.count, survivors, "{label}");
+        assert_eq!(out.len(), survivors, "{label}");
         println!(
             "two_way_bench {label:<20} {:5.1} instr/row, {:5.1} cycles/row",
             instr as f64 / rows,
@@ -309,7 +309,7 @@ fn two_way_shapes_bench() {
                     _ => (0..s as u128).map(|i| ((1 << bits) + i, 1, 2 * i as u64)).collect(),
                 };
                 let (a, b) = (seeded_batch(&schema, &a_rows), seeded_batch(&schema, &b_rows));
-                let rows = a.count + b.count;
+                let rows = a.len() + b.len();
                 let calls = (400_000 / rows).max(1);
                 let mem = [a.as_mem_batch(), b.as_mem_batch()];
                 type Kernel<'k> = (&'k str, &'k dyn Fn() -> Batch);
@@ -369,7 +369,7 @@ fn two_way_tiny_bench() {
             };
             let mem = [a.as_mem_batch(), b.as_mem_batch()];
             let per_call = |kernel: &dyn Fn() -> Batch| {
-                assert_eq!(kernel().count, (d + s) as usize);
+                assert_eq!(kernel().len(), (d + s) as usize);
                 let ((), instr) = instructions.measure(|| (0..CALLS).for_each(|_| drop(black_box(kernel()))));
                 instr / CALLS
             };

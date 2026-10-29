@@ -76,7 +76,7 @@ proptest! {
         let runs: Vec<Run> = batches
             .iter()
             .enumerate()
-            .map(|(i, b)| match as_shard >> (i % 16) & 1 == 1 && b.count > 0 {
+            .map(|(i, b)| match as_shard >> (i % 16) & 1 == 1 && !b.is_empty() {
                 true => Run::Shard(map_shard(
                     &dir.path().join(format!("{i}.db")),
                     b)),
@@ -90,7 +90,7 @@ proptest! {
         let want = weighted_rows(&mat);
         let pk = |r: usize| mat.get_pk_bytes(r);
         let rows_where = |f: &dyn Fn(&[u8], i64) -> bool| -> Vec<(RowKey, i64)> {
-            (0..mat.count).filter(|&r| f(pk(r), mat.get_weight(r))).map(|r| want[r].clone()).collect()
+            (0..mat.len()).filter(|&r| f(pk(r), mat.get_weight(r))).map(|r| want[r].clone()).collect()
         };
 
         // The walk, with its size estimate bounding what is left of it.
@@ -108,7 +108,7 @@ proptest! {
         let mut c = open();
         let mut drained = Vec::new();
         while let Some(b) = c.drain_chunk(chunk) {
-            prop_assert!(0 < b.count && b.count <= chunk && b.is_consolidated());
+            prop_assert!(!b.is_empty() && b.len() <= chunk && b.is_consolidated());
             drained.extend(weighted_rows(&b));
         }
         prop_assert_eq!(&drained, &want);
@@ -120,7 +120,7 @@ proptest! {
             let mut got = Vec::new();
             open().for_each_mem_row_weight(&b.as_mem_batch(), |i, w| got.push((i, w)));
             let want_w: Vec<(usize, i64)> =
-                (0..b.count).map(|i| (i, sum.get(&row_key(b, &s, i)).copied().unwrap_or(0))).collect();
+                (0..b.len()).map(|i| (i, sum.get(&row_key(b, &s, i)).copied().unwrap_or(0))).collect();
             prop_assert_eq!(got, want_w);
         }
 
@@ -135,7 +135,7 @@ proptest! {
         // the cursor — forward, equal or backward.
         let mut adv = open();
         for k in &keys {
-            let lower = (0..mat.count).find(|&r| pk(r) >= &k[..]);
+            let lower = (0..mat.len()).find(|&r| pk(r) >= &k[..]);
             // `fresh` lands by absolute binary search, independent of where the last probe left `adv`.
             let mut fresh = open();
             fresh.seek_range_bytes(k, None);
@@ -172,7 +172,7 @@ proptest! {
             c.seek_range_bytes(lo, Some(hi));
             let estimate = c.estimated_length();
             let got = weighted_rows(&c.materialize());
-            let raw: usize = batches.iter().map(|b| (0..b.count).filter(|&r| in_range(b.get_pk_bytes(r))).count()).sum();
+            let raw: usize = batches.iter().map(|b| (0..b.len()).filter(|&r| in_range(b.get_pk_bytes(r))).count()).sum();
             prop_assert!(got.len() <= estimate && estimate <= raw);
             prop_assert_eq!(got, rows_where(&|p, _| in_range(p)));
         }
@@ -210,7 +210,7 @@ proptest! {
         let mut gather = PkSetGather::over(open(), PkKeys::from_sorted(stride, keys.concat()));
         let mut gathered = Vec::new();
         while let Some(b) = gather.drain_chunk(chunk) {
-            prop_assert!(b.count > 0);
+            prop_assert!(!b.is_empty());
             gathered.extend(weighted_rows(&b));
         }
         prop_assert_eq!(gathered, rows_where(&|p, _| keys.iter().any(|k| &k[..] == p)));
@@ -288,16 +288,16 @@ fn materialize_reserves_for_the_survivors() {
     // Same keys and payloads at opposite weights, but for key 0.
     let inserts = Rc::new(string_run(0..4096, 512, 1));
     let retracts = Rc::new(string_run(1..4096, 512, -1));
-    let heap = inserts.blob.len() + retracts.blob.len();
+    let heap = inserts.blob().len() + retracts.blob().len();
     assert!(heap > MAX_POOLED_BYTES, "must exceed MAX_POOLED_BYTES: {heap}");
 
     let batch = create_read_cursor(&[inserts, retracts], &[], make_schema_pk_u64_payload_string()).materialize();
-    assert_eq!(batch.count, 1, "all but the first key cancels");
-    assert_eq!(batch.blob.len(), 512, "one surviving string");
+    assert_eq!(batch.len(), 1, "all but the first key cancels");
+    assert_eq!(batch.blob().len(), 512, "one surviving string");
     assert!(
-        batch.blob.capacity() <= MAX_POOLED_BYTES,
+        batch.blob_capacity() <= MAX_POOLED_BYTES,
         "the reservation must not cover the cancelled rows (MAX_POOLED_BYTES): {}",
-        batch.blob.capacity(),
+        batch.blob_capacity(),
     );
 }
 
@@ -308,18 +308,18 @@ fn drain_chunk_blob_reservation_stays_o_chunk() {
     // merge rather than the single-source bulk copy.
     let even = Rc::new(string_run((0..4096).map(|i| 2 * i), 512, 1));
     let odd = Rc::new(string_run((0..4096).map(|i| 2 * i + 1), 512, 1));
-    let total_blob = even.blob.len() + odd.blob.len();
+    let total_blob = even.blob().len() + odd.blob().len();
     assert!(total_blob > MAX_POOLED_BYTES, "{total_blob}");
 
     let mut cursor = create_read_cursor(&[even, odd], &[], make_schema_pk_u64_payload_string());
     assert!(cursor.mode.is_none(), "both sources must stay live");
     let mut rows = 0usize;
     while let Some(chunk) = cursor.drain_chunk(512) {
-        rows += chunk.count;
+        rows += chunk.len();
         assert!(
-            chunk.blob.capacity() <= MAX_POOLED_BYTES,
+            chunk.blob_capacity() <= MAX_POOLED_BYTES,
             "chunk reserved {} blob bytes of a {total_blob}-byte relation (MAX_POOLED_BYTES)",
-            chunk.blob.capacity(),
+            chunk.blob_capacity(),
         );
     }
     assert_eq!(rows, 2 * 4096);
@@ -342,8 +342,8 @@ fn bounded_string_read_carries_only_its_own_rows() {
     c.seek_range_bytes(&10_001u64.to_be_bytes(), Some(&10_004u64.to_be_bytes()));
     assert_eq!(c.mode, Some(1));
     let batch = c.drain_chunk(usize::MAX).expect("shard 1 window");
-    assert_eq!(batch.blob.len(), 3 * 40, "only the drained rows' strings");
-    let strings: Vec<Vec<u8>> = (0..batch.count)
+    assert_eq!(batch.blob().len(), 3 * 40, "only the drained rows' strings");
+    let strings: Vec<Vec<u8>> = (0..batch.len())
         .map(|i| gnitz_wire::payload_bytes(&batch, i, 0).to_vec())
         .collect();
     let want: Vec<Vec<u8>> = (10_001..10_004u64)
@@ -410,7 +410,7 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
             .unwrap();
         assert_eq!(skeletons.keys, 1u64.to_be_bytes(), "{name}");
         assert_eq!(
-            (live.count, live.get_pk_bytes(0), live.get_weight(0)),
+            (live.len(), live.get_pk_bytes(0), live.get_weight(0)),
             (1, &2u64.to_be_bytes()[..], 4),
             "{name}"
         );

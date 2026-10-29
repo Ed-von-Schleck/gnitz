@@ -89,8 +89,7 @@ fn weight_clamp_bench() {
             counter.measure(|| {
                 op_weight_clamp(
                     Cow::Borrowed(&delta),
-                    &mut |first, last| trace.cursor_within(first, last),
-                    false,
+                    History::Before(&mut |first, last| trace.cursor_within(first, last)),
                     Distinct,
                 )
             })

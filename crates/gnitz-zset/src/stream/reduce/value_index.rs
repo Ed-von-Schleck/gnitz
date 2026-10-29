@@ -151,12 +151,10 @@ impl ValueIndex {
                 self.key_packer.pack_rows(w.pk_mut(), width, &mb, &runs);
                 copy_runs::<8>(delta.weight(), w.weight_mut(), runs.iter().copied(), 8);
                 w.null_bmp_mut().fill(0);
-                let (mut regions, blob, _) = w.split_mut();
-                let keys = regions.next().expect("the PK region");
-                // Past the weights and the null words: the image cells, where
-                // the index has them. They hold the whole image of a string
-                // ordinal, and nothing for any other.
-                let mut cells = regions.nth(2).filter(|_| has_payload);
+                let (keys, mut cells, blob) = w.pk_and_payload_mut(IMAGE_SLOT..IMAGE_SLOT + has_payload as usize);
+                // The image cells, where the index has them, hold the whole
+                // image of a string ordinal, and nothing for any other.
+                let mut cells = cells.next();
                 if a.image.fits_slot() {
                     cells.take().into_iter().for_each(|cells| cells.fill(0));
                 }

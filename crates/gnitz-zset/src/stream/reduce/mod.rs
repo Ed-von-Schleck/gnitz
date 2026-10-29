@@ -181,7 +181,7 @@ pub fn op_reduce(delta: &Batch, out_trace: OpenAt<'_>, index: Option<OpenAt<'_>>
             let mut vals = AggValues::new(aggs, ranges.len());
             for (k, agg) in aggs.iter().enumerate() {
                 let folded = if agg.is_linear() { &ranges[..] } else { stepped };
-                vals.fold(k, &mb, folded, RangeGroups::EACH);
+                vals.fold(k, &mb, folded, RangeGroups::Each);
             }
             let order = ranges.iter().enumerate().map(|(g, &(first, _))| (first, g));
             return emit_groups(plan, &mb, out_trace, index, vals, &probes, order);

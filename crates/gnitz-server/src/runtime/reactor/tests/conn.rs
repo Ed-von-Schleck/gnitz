@@ -24,13 +24,14 @@ pub(super) type Deframed = (Vec<Vec<u8>>, Option<RecvEnd>);
 /// The frames `stream` deframes to under a `cap`-byte budget, fed `step` bytes a
 /// read, and why the feed ended, if it did.
 pub(super) fn deframe(stream: &[u8], step: usize, admitted: bool, cap: usize) -> Deframed {
-    let mut q = RecvQueue::new(Budget::new(cap));
+    let mut q = FrameSink::new(Budget::new(cap));
     if admitted {
         q.admit_full_frames();
     }
+    let mut deframer = Deframer::default();
     let mut frames = Vec::new();
     for read in stream.chunks(step) {
-        let fed = q.feed(read);
+        let fed = q.feed(&mut deframer, read);
         while let Some(f) = q.try_recv() {
             frames.push(f.as_slice().to_vec());
         }

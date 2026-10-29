@@ -36,33 +36,61 @@ use write::{install_append_method, PyZSetBatch};
 
 // Created under `gnitz`, which re-exports every one of them: an exception is
 // pickled by its module and name, and `_native` is no module an unpickler can
-// import.
-pyo3::create_exception!(gnitz, GnitzError, pyo3::exceptions::PyException);
-
-// Every class below subclasses GnitzError, so `except GnitzError` catches them
-// all while a caller that branches on one can name it instead of matching prose.
-
-// The request was understood and declined: `ClientError::Refused` at any
-// status, and a statement the SQL planner rejects. The connection is intact.
-pyo3::create_exception!(gnitz, GnitzRefusedError, GnitzError);
-// The connection is unusable: it failed, was lost, or was closed.
-pyo3::create_exception!(gnitz, GnitzConnectionError, GnitzError);
-// MirrorError::Poisoned. Recovery is `close_mirror()`, and nothing else.
-pyo3::create_exception!(gnitz, GnitzMirrorPoisonedError, GnitzError);
-
-// A refusal whose status a caller branches on.
-
-// WireStatus::TxnConflict, and WireStatus::StaleCatalog: nothing was written,
-// and the caller's recovery is to run it again.
-pyo3::create_exception!(gnitz, GnitzConflictError, GnitzRefusedError);
-// WireStatus::DeltaExpired.
-pyo3::create_exception!(gnitz, GnitzDeltaExpiredError, GnitzRefusedError);
-// WireStatus::SalFull.
-pyo3::create_exception!(gnitz, GnitzSalFullError, GnitzRefusedError);
-// WireStatus::NotFound.
-pyo3::create_exception!(gnitz, GnitzNotFoundError, GnitzRefusedError);
-// WireStatus::IntegrityViolation.
-pyo3::create_exception!(gnitz, GnitzIntegrityError, GnitzRefusedError);
+// import. `client_err` decides which class a failure raises.
+pyo3::create_exception!(
+    gnitz,
+    GnitzError,
+    pyo3::exceptions::PyException,
+    "The base of every exception gnitz raises."
+);
+pyo3::create_exception!(
+    gnitz,
+    GnitzRefusedError,
+    GnitzError,
+    "The request was understood and declined; the connection is intact."
+);
+pyo3::create_exception!(
+    gnitz,
+    GnitzConnectionError,
+    GnitzError,
+    "The connection is unusable: it failed, was lost, or was closed."
+);
+pyo3::create_exception!(
+    gnitz,
+    GnitzMirrorPoisonedError,
+    GnitzError,
+    "The mirror store may be torn; recovery is close_mirror() and nothing else."
+);
+pyo3::create_exception!(
+    gnitz,
+    GnitzConflictError,
+    GnitzRefusedError,
+    "Nothing was written; run it again."
+);
+pyo3::create_exception!(
+    gnitz,
+    GnitzDeltaExpiredError,
+    GnitzRefusedError,
+    "The feed does not continue this delta cursor; discard the copy and bootstrap again."
+);
+pyo3::create_exception!(
+    gnitz,
+    GnitzSalFullError,
+    GnitzRefusedError,
+    "The server's log had no room for the request; run it again."
+);
+pyo3::create_exception!(
+    gnitz,
+    GnitzNotFoundError,
+    GnitzRefusedError,
+    "The named relation or schema does not exist."
+);
+pyo3::create_exception!(
+    gnitz,
+    GnitzIntegrityError,
+    GnitzRefusedError,
+    "The write would break a primary key, unique index or foreign key; nothing was written."
+);
 
 /// Wrap any `Display` error as a plain `GnitzError`.
 pub(crate) fn gnitz_err(e: impl std::fmt::Display) -> PyErr {

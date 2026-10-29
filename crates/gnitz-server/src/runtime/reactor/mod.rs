@@ -40,9 +40,9 @@ mod timer;
 mod uring;
 
 pub(crate) use conn::{
-    Accepted, ClientConn, Limits, PeerGone, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue, SendBody,
+    Accepted, Charge, ClientConn, FrameSink, Limits, PeerGone, Plain, RecvBuf, RecvEnd, RecvFilter, SendBody,
 };
-pub(crate) use lease::{AckLease, TrainFrame, TrainLease};
+pub(crate) use lease::{AckLease, ReadyAcked, ReadyLease, TrainFrame, TrainLease};
 pub(crate) use uring::check_host;
 
 // ---------------------------------------------------------------------------
@@ -105,12 +105,13 @@ impl std::ops::Deref for Reactor {
 }
 
 impl Reactor {
-    pub(crate) fn new(limits: Limits, w2m: W2mReceiver) -> std::io::Result<Self> {
+    /// The reactor, and the lease every worker's ready ACK answers.
+    pub(crate) fn new(limits: Limits, w2m: W2mReceiver) -> std::io::Result<(Self, ReadyLease)> {
         let ring = IoUringRing::new()?;
         // Before the shared state exists: a refused claim then drops none of it,
         // and so does not end the live reactor's claim.
         runloop::claim_thread();
-        Ok(Reactor(Rc::new(ReactorShared {
+        let reactor = Reactor(Rc::new(ReactorShared {
             ring: RefCell::new(ring),
             tasks: RefCell::new(Slab::new()),
             ops: RefCell::new(Slab::new()),
@@ -119,7 +120,9 @@ impl Reactor {
             routes: lease::Routes::new(),
             conns: conn::Conns::new(limits),
             w2m,
-        })))
+        }));
+        let ready = reactor.ready_lease();
+        Ok((reactor, ready))
     }
 
     /// Queue `sqe` as a one-shot op holding `carry` until its CQE, whose `res` the

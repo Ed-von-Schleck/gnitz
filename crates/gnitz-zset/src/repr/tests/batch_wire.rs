@@ -135,7 +135,7 @@ fn shared_span() -> Batch {
     let mut shared = Batch::with_capacity(one.schema(), 20);
     let src = one.as_mem_batch();
     shared.write_rows(20, |w| crate::repr::scatter::copy_ranges(&src, None, &[(0, 1); 20], w));
-    assert_eq!(shared.blob.len(), 200, "precondition: one span for every row");
+    assert_eq!(shared.blob().len(), 200, "precondition: one span for every row");
     shared
 }
 
@@ -240,7 +240,7 @@ fn a_listed_pick_sizes_and_encodes_its_rows_in_list_order() {
             let all = weighted_rows(&b);
             let want: Vec<_> = list.iter().map(|&r| all[r as usize].clone()).collect();
             assert_eq!(weighted_rows(&decoded), want, "{list:?}");
-            assert_eq!(decoded.dead_heap, 0, "{list:?}: every heap byte is referenced");
+            assert_eq!(decoded.dead_heap(), 0, "{list:?}: every heap byte is referenced");
         }
         assert!(b.wire_listed(&[]).is_none());
     }
@@ -292,7 +292,7 @@ fn dead_heap_round_trips_an_engine_block() {
     let b = make_batch_bytes(&schema, &[(1, 1, &[b'a'; 20]), (2, 1, &[b'b'; 30])]).padded(7);
     let block = encode_to_wire_vec(&b);
     let decoded = Batch::decode_from_wal_block(&block, &schema).unwrap();
-    assert_eq!((decoded.dead_heap, decoded.blob.len()), (7, b.blob.len()));
+    assert_eq!((decoded.dead_heap(), decoded.blob().len()), (7, b.blob().len()));
 }
 
 /// A foreign block's header is not trusted: the decode measures the heap,
@@ -319,9 +319,9 @@ fn a_foreign_decode_measures_the_dead_heap_exactly() {
         let mut block = Vec::new();
         wal::append_block(&regions, claimed, &mut block);
         let decoded = Batch::decode_foreign_wal_block(&block, &schema).unwrap();
-        assert_eq!(decoded.dead_heap, 70, "header claimed {claimed}");
+        assert_eq!(decoded.dead_heap(), 70, "header claimed {claimed}");
         assert_eq!(
-            Batch::decode_from_wal_block(&block, &schema).unwrap().dead_heap,
+            Batch::decode_from_wal_block(&block, &schema).unwrap().dead_heap(),
             claimed
         );
     }

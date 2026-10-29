@@ -2,11 +2,10 @@
 //! `create_index` … entry points the catalog tests drive the applier with.
 //! `create_table`, which tests across the crate use, is `test_support`'s.
 //!
-//! **Not** a production code path. Every real DDL statement (SQL planner,
-//! C-API, `gnitz-py`) is built client-side and pushed over the wire as a
-//! `DDL_TXN` bundle of system-table deltas, which the executor applies
-//! through `apply_bundle`. These wrappers build such a bundle and apply it the
-//! same way, without a server.
+//! **Not** a production code path. Every real DDL statement is built
+//! client-side by `gnitz-core` and pushed over the wire as a `DDL_TXN` bundle of
+//! system-table deltas, which the executor applies through `apply_bundle`. These
+//! wrappers build such a bundle and apply it the same way, without a server.
 
 use super::super::*;
 use crate::test_support::{apply_ddl, idx_tab_batch, parse_qualified_name, schema_tab_batch, table_blocks};

@@ -12,6 +12,7 @@ use proptest::prelude::*;
 
 use gnitz_wire::MAX_PK_COLUMNS;
 
+use crate::storage::shard_index::L0_COMPACT_THRESHOLD;
 use crate::storage::{flush_barrier, RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
 use crate::test_support::{self, arb_schema, row_key, zset_of, zset_sum};
 
@@ -83,13 +84,12 @@ fn arb_string(rng: &mut crate::test_support::Rng) -> Vec<u8> {
     (0..len).map(|_| rng.next_u64() as u8).collect()
 }
 
+/// Ingests, each flushed: enough to owe an L0 compaction.
+const WAVES: usize = L0_COMPACT_THRESHOLD + 1;
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-/// Ingests, each flushed: one more than the L0 shards a store holds before it
-/// owes a compaction.
-const WAVES: usize = 5;
 
 proptest! {
     /// Ingested in waves, each flushed (durable) or folded into the RAM tier

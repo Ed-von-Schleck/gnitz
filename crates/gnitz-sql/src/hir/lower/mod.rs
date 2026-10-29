@@ -258,7 +258,9 @@ fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, Gn
             return join::lower_join_view(chain, above, [left, right], *kind, on);
         }
         (Some(_), RelExpr::Reduce { input, group_cols, aggs }) => reduce::lower_reduce(chain, input, group_cols, aggs)?,
-        (_, RelExpr::Ordered { .. }) => ordered::lower_ordered(chain, core)?,
+        (_, RelExpr::Ordered { input, partition, order, op }) => {
+            ordered::lower_ordered(chain, input, partition, order, op)?
+        }
         (_, RelExpr::Distinct { .. } | RelExpr::SetOp { .. }) => setop::lower_setop(chain, core)?,
         (Some(above), _) => return spine::lower_linear(chain, rel, above.items),
         (None, _) => return Err(no_arm()),
@@ -325,6 +327,10 @@ fn materialize(chain: &mut ViewChain, rel: &Rc<RelExpr>, live: &HashSet<ColId>) 
 fn cut_segment(chain: &mut ViewChain, subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Result<SegInput, GnitzSqlError> {
     let key = Rc::as_ptr(subtree);
     if let Some(cached) = chain.cuts.get(&key) {
+        debug_assert!(
+            live.iter().all(|id| cached.frame.layout.contains(&Some(*id))),
+            "a shared subtree's segment holds every column a later reader needs"
+        );
         return Ok(cached.clone());
     }
     let seg = materialize(chain, subtree, live)?;

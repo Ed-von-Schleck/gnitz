@@ -3,8 +3,9 @@ use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::test_log;
-use crate::runtime::sal::{GroupData, GroupTargets, SalGroup, SalWriter};
-use crate::runtime::w2m::{self, W2mReceiver};
+use crate::runtime::sal::{Cut, GroupData, GroupTargets, SalGroup, SalRequest, SalWriter};
+use crate::runtime::w2m::fixtures::id;
+use crate::runtime::w2m::{self, RequestId, W2mReceiver};
 use crate::test_support::{
     make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema,
     register_identity_view, scan_all, table_engine, u64_i64_cols, weighted_rows,
@@ -46,13 +47,20 @@ pub(super) fn worker_over(
 
 /// The route of request `request_id`, written in cut `cut`.
 fn route(target_id: u64, request_id: u32, cut: u64) -> ReplyRoute {
-    ReplyRoute { target_id, request_id, cut }
+    ReplyRoute {
+        target_id,
+        request_id: id(request_id),
+        cut: Cut::nth(cut),
+    }
 }
 
-/// `request` answered on `request_id`.
+/// `request` answered on `request_id`, 0 for none.
 pub(super) fn addressed<'a>(request: impl Into<SalRequest<'a>>, request_id: u32) -> SalGroup<'a> {
     SalGroup {
-        targets: GroupTargets { request_id, ..GroupTargets::SILENT },
+        targets: GroupTargets {
+            reply: RequestId::from_wire(request_id),
+            ..GroupTargets::SILENT
+        },
         ..SalGroup::new(request)
     }
 }
@@ -81,7 +89,10 @@ pub(super) fn probe(tid: u64, keys: &[u8], request_id: u32) -> SalGroup<'_> {
 /// A push of `rows` into `tid`, whose schema record is `record`, ACKed on
 /// `request_id`.
 pub(super) fn push<'a>(tid: u64, record: &'a [u8], rows: &'a Batch, request_id: u32) -> SalGroup<'a> {
-    let targets = GroupTargets { request_id, ..GroupTargets::SILENT };
+    let targets = GroupTargets {
+        reply: RequestId::from_wire(request_id),
+        ..GroupTargets::SILENT
+    };
     SalGroup::push(tid, record, GroupData::Same(rows.wire_whole()), targets)
 }
 
@@ -129,9 +140,9 @@ fn owed(wp: &WorkerProcess) -> Vec<(&'static str, u32)> {
     wp.replies
         .iter()
         .map(|owed| match owed {
-            Owed::Parked(route, ..) => ("parked", route.request_id),
-            Owed::Fault(route, _) => ("fault", route.request_id),
-            Owed::Train(train) => ("train", train.route.request_id),
+            Owed::Parked(route, ..) => ("parked", route.request_id.get()),
+            Owed::Fault(route, _) => ("fault", route.request_id.get()),
+            Owed::Train(train) => ("train", train.route.request_id.get()),
         })
         .collect()
 }
@@ -392,7 +403,7 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
     assert_eq!(weighted_rows(&got), weighted_rows(&part));
     assert_eq!(reqs(&frames(&rx)), [1]);
     let next = wp.next_request().expect("the second read is still on the SAL");
-    assert_eq!(next.route.request_id, 2);
+    assert_eq!(next.reply, Some(id(2)));
 }
 
 /// A round is opened with the drive's own claim, and its close answers every
@@ -643,7 +654,7 @@ fn a_full_ring_owes_instead_of_blocking() {
     let dir = crate::test_support::scratch_dir("worker", "full_ring");
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
     let (mut wp, _sal, rx) = worker_over(&mut engine, 4096, 1 << 20);
-    while wp.w2m_writer.try_send_msg(1, &WireMsg::default()) {}
+    while wp.w2m_writer.try_send_msg(id(1), &WireMsg::default()) {}
 
     wp.reply(route(1, 5, 1), Ok(Rows::Own(one.clone())));
     wp.reply(route(1, 6, 2), Err("boom".into()));

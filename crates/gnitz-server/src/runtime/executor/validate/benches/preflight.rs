@@ -32,7 +32,7 @@ fn preflight_probe_bench() {
         }
         let inserted: Vec<_> = ids.iter().map(|&i| (i, 1, i as i64)).collect();
         // Its own: no worker drains the SAL the validations write to.
-        let (disp, _) = test_dispatcher(vec![0; 4], &mut engine);
+        let (disp, _) = test_dispatcher(4, engine);
         let checks = Checks::new();
         let mut families = vec![TxnFamily {
             tid,
@@ -47,6 +47,7 @@ fn preflight_probe_bench() {
             "preflight_probe_bench {rows:>5} rows {order:<9} {:>7.1} instr/row",
             instructions as f64 / rows as f64
         );
+        engine = disp.into_catalog();
     }
 
     let dir = engine.registry.base_dir().to_owned();

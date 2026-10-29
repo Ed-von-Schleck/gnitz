@@ -4,9 +4,8 @@
 //! separately installed one for the session.
 //!
 //! The library is the shell the binary and the integration suite drive; its
-//! parts are private. Unit tests live in `tests/<module>.rs`, attached with
-//! `#[path]` to the module they cover; the crate-root `tests/` is the
-//! integration suite, gated on the `integration` feature.
+//! parts are private. The crate-root `tests/` is the integration suite, gated
+//! on the `integration` feature.
 
 mod complete;
 mod editor;

@@ -60,7 +60,9 @@ impl Checks {
     }
 
     /// Bring every cache derived from `tid`'s committed rows up to a `batch` of
-    /// it that is now durable.
+    /// it. Called once the batch is committed and before its writer is
+    /// answered: the writer's table lock is what keeps a cache true of
+    /// committed rows.
     pub(super) fn committed(&self, cat: &CatalogEngine, tid: u64, batch: &Batch) {
         if let Some(cache) = self.fk_presence.borrow_mut().get_mut(&tid) {
             cache.apply(batch);

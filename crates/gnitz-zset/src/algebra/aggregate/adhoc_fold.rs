@@ -71,7 +71,7 @@ impl AdhocFold {
         );
         if self.shape.key.is_global() {
             for k in 0..self.shape.aggs.len() {
-                self.vals.fold(k, &mb, ranges, RangeGroups::FIRST);
+                self.vals.fold(k, &mb, ranges, RangeGroups::First);
             }
             return Ok(());
         }
@@ -122,7 +122,7 @@ struct AssignGroups<'a> {
 impl IdentityLoop for AssignGroups<'_> {
     type Out = Result<(), String>;
 
-    fn run(self, identity: impl Fn(usize) -> u128) -> Self::Out {
+    fn run(self, identity: impl Fn(usize) -> u128, _: bool) -> Self::Out {
         for row in self.ranges.iter().flat_map(|&(s, e)| s..e) {
             let g = self.numbers.ordinal(identity(row), || {
                 let g = self.groups.len();

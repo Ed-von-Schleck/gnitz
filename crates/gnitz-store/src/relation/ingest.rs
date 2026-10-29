@@ -2,7 +2,7 @@
 //! delta capture, the seal, and the checkpoint rounds.
 
 use super::store::Rows;
-use super::{CircuitState, Cut, Relation, RelationKind, RelationRegistry, SecondaryIndex};
+use super::{CircuitState, Cut, Relation, RelationKind, RelationRegistry, Residency, SecondaryIndex};
 use crate::storage::Table;
 use gnitz_zset::repr::{Batch, StorageError};
 use std::rc::Rc;
@@ -184,15 +184,20 @@ impl RelationRegistry {
 
     /// [`Self::ingest`] above `id`'s cut: every reader sees the rows but one at
     /// [`Cut::Sealed`](super::Cut::Sealed), until [`Self::seal`] answers them.
+    /// A view is refused.
     #[inline]
     pub fn ingest_pending(&mut self, id: u64, batch: Batch) -> Result<(), String> {
-        self.relation_mut_or_err(id)?.apply(batch, Landing::Pending).map(drop)
+        let relation = self.relation_mut_or_err(id)?;
+        if relation.kind().is_view() {
+            return Err(format!("relation {id} is a view: its rows land only at the cut"));
+        }
+        relation.apply(batch, Landing::Pending).map(drop)
     }
 
-    /// [`Self::ingest`], without its seal of pending rows (a view holds none), of
-    /// one round of view `id`'s output, captured as round `round` by the delta
-    /// feed this process serves for it; the batch as applied comes back iff
-    /// `echo` and it holds a row.
+    /// [`Self::ingest`], without its seal of pending rows (a view holds none:
+    /// [`Self::ingest_pending`] refuses one), of one round of view `id`'s
+    /// output, captured as round `round` by the delta feed this process serves
+    /// for it; the batch as applied comes back iff `echo` and it holds a row.
     #[inline]
     pub fn ingest_round(&mut self, id: u64, batch: Batch, round: u64, echo: bool) -> Result<Option<Batch>, String> {
         let landing = Landing::Cut { round: Some(round), echo };
@@ -265,6 +270,11 @@ impl RelationRegistry {
 
     /// The system round: every system family's store, in one barrier.
     pub fn checkpoint_system(&mut self, replay_floor: u64) -> Result<(), String> {
+        assert_ne!(
+            self.residency,
+            Residency::Worker,
+            "a worker holds the system families in RAM only; the master writes their shards"
+        );
         crate::storage::flush_barrier(self.held_rows(|k| k == RelationKind::SystemCatalog), replay_floor)
             .map_err(|e| format!("system catalog flush: {e}"))
     }

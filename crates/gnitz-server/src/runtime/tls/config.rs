@@ -53,10 +53,21 @@ pub(crate) struct Served {
     pub(super) fingerprint: String,
 }
 
+/// [`TlsArgs`] the bind policy admits, every file of which loaded once.
+pub(crate) struct ResolvedTls(TlsArgs);
+
+#[cfg(test)]
+impl ResolvedTls {
+    /// `args`, past no bind policy and no load.
+    pub(crate) fn unchecked(args: TlsArgs) -> Self {
+        ResolvedTls(args)
+    }
+}
+
 impl TlsArgs {
     /// Apply the bind policy, and load every file the flags name so an unusable
     /// one is refused as argv.
-    pub(crate) fn resolve(self) -> Result<TlsArgs, String> {
+    pub(crate) fn resolve(self) -> Result<ResolvedTls, String> {
         let listen = self.listen;
         let authenticated = self.client_ca.is_some() || self.auth_tokens.is_some();
         if !listen.ip().is_loopback() && !authenticated {
@@ -96,7 +107,7 @@ impl TlsArgs {
                 self.auth_tokens.as_deref().map(Tokens::load).transpose()?;
             }
         }
-        Ok(self)
+        Ok(ResolvedTls(self))
     }
 
     /// Read every file the flags name, and the identity minted in `data_dir`
@@ -141,8 +152,8 @@ pub(crate) struct TlsListener {
 }
 
 impl TlsListener {
-    /// The first load of `args`, which [`TlsArgs::resolve`] admitted.
-    pub(crate) fn open(args: TlsArgs, data_dir: &str) -> Result<TlsListener, String> {
+    /// The first load of `args`.
+    pub(crate) fn open(ResolvedTls(args): ResolvedTls, data_dir: &str) -> Result<TlsListener, String> {
         let served = args.load(data_dir)?;
         Ok(TlsListener {
             args,

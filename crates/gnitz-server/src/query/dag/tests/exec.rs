@@ -172,6 +172,25 @@ fn a_backfill_runs_only_the_named_view() {
     }
 }
 
+/// A view is not filled while a source of its own still awaits its fill: its
+/// ticks would then run over a producer the tick schedule skips.
+#[test]
+fn a_backfill_refuses_a_view_ahead_of_its_source() {
+    let (mut engine, base, views) = engine_with_views("backfill_order");
+    let rows = [(1, 1, 10)];
+    engine.registry.ingest(base, base_rows(&rows)).unwrap();
+    engine.dag.rebuild = [views.twice, views.deep].into_iter().collect();
+
+    assert!(backfill(&mut engine, views.deep).is_err());
+    assert!(
+        engine.dag.awaits_rebuild(views.deep),
+        "a refused view still awaits its fill"
+    );
+    backfill(&mut engine, views.twice).unwrap();
+    backfill(&mut engine, views.deep).unwrap();
+    assert_eq!(held(&mut engine, views.deep), times(&rows, 2));
+}
+
 /// A backfill feeds a join its sources one after the other, each joined against
 /// the ones fed before it, one row a chunk: the view holds every match once.
 /// Keyed on a non-PK column the join reads its own traces; keyed on the PK it

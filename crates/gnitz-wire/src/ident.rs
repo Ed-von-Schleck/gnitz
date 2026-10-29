@@ -2,9 +2,9 @@
 //! user-name rule and its canonical fold, the qualified key, and the two reserved
 //! schema names.
 
-/// The character set every stored catalog name is drawn from. Public because the
-/// engine applies the same charset at its own trust boundary without taking the
-/// rest of [`validate_user_identifier`]'s client-side policy.
+/// The character set every stored catalog name is drawn from; the engine checks a
+/// chain segment's name against it, and the planner builds generated index names
+/// from it.
 pub fn is_valid_ident_char(ch: u8) -> bool {
     ch.is_ascii_alphanumeric() || ch == b'_'
 }

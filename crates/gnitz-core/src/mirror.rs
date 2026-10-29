@@ -41,7 +41,7 @@ use crate::connection::{DeltaCursor, Polled, RawBlock, RelDescriptor, Session, T
 use crate::error::ClientError;
 use crate::host::{offload, BoxFut, Host};
 use crate::{RelName, Schema, ZSetBatch};
-use gnitz_wire::txn_frame::{kept_as, DeltaPollItem};
+use gnitz_wire::txn_frame::{kept_as, DeltaPollItem, SubId};
 use gnitz_wire::{payload_str, RelClass, WireStatus, RELTAB_PAY_NAME, VIEW_TAB};
 
 // ---------------------------------------------------------------------------
@@ -83,9 +83,13 @@ pub trait MirrorStore: Send {
     fn fill(&mut self, tid: u64, blocks: &[&[u8]], sealed_at: Option<DeltaCursor>) -> Result<(), MirrorError>;
 
     /// Apply `blocks`, the view's deltas after the copy's cursor, and advance it to
-    /// `next`. Refused for a copy holding no cursor. With no block it moves the
-    /// cursor alone and touches no disk: the client makes that call in place.
+    /// `next`. Refused for a copy holding no cursor. May touch the disk.
     fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError>;
+
+    /// Move the copy's cursor to `next`, the view having no delta after the
+    /// cursor it holds. Refused for a copy holding no cursor. Touches no disk:
+    /// the client calls it on its own thread.
+    fn move_cursor(&mut self, tid: u64, next: DeltaCursor) -> Result<(), MirrorError>;
 
     /// Run `spec` against `tid`'s copy, replying under `reply_schema`.
     fn scan_spec(
@@ -218,7 +222,7 @@ enum Link {
     /// By the trains pushed for this connection's subscription, by the id it
     /// was asked for under; no delta read may. A sync names it to the server
     /// from here, so leaving this state is what ends the subscription.
-    Subscribed(u64),
+    Subscribed(SubId),
 }
 
 /// A view read under a spec, as a planner compiled it — what
@@ -255,7 +259,7 @@ impl MirroredView {
 
     /// A delta read brought this copy up to date and left it subscribed as
     /// `id`: from here it answers reads.
-    fn subscribed(&mut self, id: u64) {
+    fn subscribed(&mut self, id: SubId) {
         self.link = Link::Subscribed(id);
         self.confirmed = true;
     }
@@ -288,8 +292,8 @@ impl Store {
         }
     }
 
-    /// The store, for a call that touches a copy: a cursor-only advance or a
-    /// local read in place, so a mirrored read costs no dispatch, and work that
+    /// The store, for a call that touches a copy: a cursor move or a local
+    /// read in place, so a mirrored read costs no dispatch, and work that
     /// writes the disk through [`Self::run`]. Refused as [`Self::refusal`] is.
     fn touch(&self) -> Result<MutexGuard<'_, dyn MirrorStore + 'static>, MirrorError> {
         self.0.lock().map_err(|_| MirrorError::Poisoned)
@@ -311,20 +315,22 @@ impl Store {
         host: &mut dyn Host,
         trains: Vec<(u64, Vec<RawBlock>, DeltaCursor)>,
     ) -> Result<Vec<(u64, Result<(), ClientError>)>, ClientError> {
-        let idle = trains.iter().all(|(_, blocks, _)| blocks.is_empty());
-        let apply = move |store: &Store| {
+        if trains.iter().all(|(_, blocks, _)| blocks.is_empty()) {
+            let moved = trains.into_iter().map(|(tid, _, next)| {
+                let moved = self.touch().and_then(|mut s| s.move_cursor(tid, next));
+                (tid, moved.map_err(ClientError::from))
+            });
+            return Ok(moved.collect());
+        }
+        offload(host, move || {
             let advance = |(tid, blocks, next): (u64, Vec<RawBlock>, DeltaCursor)| {
                 let blocks: Vec<&[u8]> = blocks.iter().map(RawBlock::block).collect();
-                let advanced = store.touch().and_then(|mut s| s.advance(tid, &blocks, next));
+                let advanced = self.touch().and_then(|mut s| s.advance(tid, &blocks, next));
                 (tid, advanced.map_err(ClientError::from))
             };
-            trains.into_iter().map(advance).collect::<Vec<_>>()
-        };
-        Ok(match idle {
-            // Only cursors move, so there is nothing to block on.
-            true => apply(&self),
-            false => offload(host, move || apply(&self)).await?,
+            trains.into_iter().map(advance).collect()
         })
+        .await
     }
 }
 
@@ -396,16 +402,13 @@ impl MirrorState {
     }
 
     /// Owe each view `outcomes` reports reseeded, and still registered, its
-    /// [`PollResult::Reseeded`] again: whether any is.
-    pub(crate) fn owe_reseeds(&mut self, outcomes: &[PollOutcome]) -> bool {
-        let mut owed = false;
+    /// [`PollResult::Reseeded`] again.
+    pub(crate) fn owe_reseeds(&mut self, outcomes: &[PollOutcome]) {
         for o in outcomes.iter().filter(|o| matches!(o.result, PollResult::Reseeded)) {
             if let Some(view) = self.views.get_mut(&o.view_id) {
                 view.owed_reseed = true;
-                owed = true;
             }
         }
-        owed
     }
 
     /// One entry for each view of `done` still registered, for a caller that is
@@ -647,7 +650,7 @@ impl GnitzClient {
                 }
             };
             let items: Vec<DeltaPollItem> = tids.iter().zip(&froms).map(item).collect();
-            *next_sub += items.len() as u64;
+            *next_sub = kept_as(first, items.len());
             DeltaPoll::start(session, first, &items)
         };
         let mut done = Vec::with_capacity(tids.len());
@@ -913,13 +916,14 @@ impl GnitzClient {
     }
 
     /// The wait a sync may be held for — none while a copy is due a delta
-    /// read — and the copies' subscriptions it names. A poisoned store names
-    /// none and leaves `wait` as asked: a sync advances none of its copies, so
-    /// their subscriptions end, and a reader's are synced as on any client.
-    pub(crate) fn mirror_hold(&self, wait: Duration) -> (Duration, impl Iterator<Item = u64> + '_) {
+    /// read or owed a reseed — and the copies' subscriptions it names. A
+    /// poisoned store names none and leaves `wait` as asked: a sync advances
+    /// none of its copies, so their subscriptions end, and a reader's are
+    /// synced as on any client.
+    pub(crate) fn mirror_hold(&self, wait: Duration) -> (Duration, impl Iterator<Item = SubId> + '_) {
         let live = self.mirror.as_deref().filter(|m| m.store.refusal().is_ok());
         let views = live.into_iter().flat_map(|m| m.views.values());
-        let due = views.clone().any(|v| v.link == Link::Due);
+        let due = views.clone().any(|v| v.link == Link::Due || v.owed_reseed);
         let held = views.filter_map(|v| match v.link {
             Link::Subscribed(id) => Some(id),
             Link::Due | Link::Failed => None,
@@ -1030,7 +1034,7 @@ impl Drop for DeltaPoll<'_> {
 
 impl<'s> DeltaPoll<'s> {
     /// Poll `items`, item `i` kept as the subscription `kept_as(first, i)`.
-    fn start(session: &'s mut Session, first: u64, items: &[DeltaPollItem]) -> Self {
+    fn start(session: &'s mut Session, first: SubId, items: &[DeltaPollItem]) -> Self {
         session.submit_delta_poll(first, items);
         DeltaPoll { session, answered: 0, items: items.len() }
     }

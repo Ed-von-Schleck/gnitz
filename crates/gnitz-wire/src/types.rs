@@ -40,7 +40,7 @@ crate::wire_enum! {
 
 impl TypeCode {
     /// The type's name in the wire vocabulary, which is what the client bindings
-    /// expose. Exhaustive on purpose: a new variant fails to compile until named.
+    /// expose.
     pub const fn wire_name(self) -> &'static str {
         match self {
             TypeCode::U8 => "U8",
@@ -106,10 +106,7 @@ impl TypeCode {
     /// and falls in with the rest.
     ///
     /// A temporal, decimal or boolean type also maps to itself: the register
-    /// holds the 8-byte integer while the declared column keeps its name. A
-    /// `DATE` slot is narrower than that register, so a sink into one is
-    /// admitted only behind a cast that range-checks the value into that width;
-    /// a `BOOLEAN` slot stores whether the register is non-zero.
+    /// holds the 8-byte integer while the declared column keeps its type.
     #[inline]
     pub const fn register_image(self) -> TypeCode {
         match self {

@@ -1,28 +1,7 @@
-//! Group commit task.
-//!
-//! Owns the `write_commit_group` → `SalScope::commit` → `fdatasync` → per-worker push
-//! ACK sequence for every user-table INSERT/UPSERT. Receives commit requests via
-//! `chan` and batches whatever is already queued behind the first — see
-//! **Batching** below; there is no debounce timer.
-//!
-//! Design notes:
-//!
-//! - **One committer per master process.**  Single-threaded: everything
-//!   lives on the reactor, sharing the `MasterDispatcher` by reference with
-//!   the executor.
-//! - **Batching.**  Pipelined clients batch naturally: after `rx.recv()`
-//!   returns the first request, `try_recv` drains anything already
-//!   queued (capped at `MAX_PENDING_ROWS`). There is no debounce timer —
-//!   a timer would add tail latency to every commit to help only serial
-//!   single-request workloads. See `drain_ready_batch`.
-//! - **Checkpoint.**  The committer runs the full sequence
-//!   (`run_checkpoint_sequence`: base round → drain → tick gate → ephemeral
-//!   round) ahead of a batch's groups when the SAL needs the room, and after
-//!   them when the batch ends in a `BatchEnd::Checkpoint` (graceful shutdown)
-//!   or a `BatchEnd::Backup` (BACKUP, with its copy).
-//! - **Barrier.**  A `BatchEnd::Barrier` signals via a oneshot once the batch
-//!   ahead of it has committed — used by DDL to drain the committer before
-//!   catalog mutation.
+//! The group-commit task: every user write's SAL groups, its fdatasync and its
+//! worker ACKs, batched from whatever is queued behind the first request (see
+//! [`drain_ready_batch`]). Checkpoints, backups, DDL barriers and DDL pauses
+//! end a batch. Once serving, it is the one task that runs a checkpoint.
 
 use super::validate::TxnFamily;
 use super::Shared;
@@ -33,7 +12,6 @@ use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Row ceiling on one committer batch. Tested before the receive, so a batch is
 /// capped at this plus one whole request — and one request is itself bounded
@@ -64,6 +42,23 @@ enum BatchEnd {
         dir: String,
         done: oneshot::Sender<Result<(), WireFault>>,
     },
+    /// Signal `parked`, then run nothing until `resume`.
+    Pause {
+        parked: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    },
+}
+
+/// The committer paused: it runs no batch, and so no checkpoint, until this is
+/// dropped.
+pub(super) struct Paused(Option<oneshot::Sender<()>>);
+
+impl Drop for Paused {
+    fn drop(&mut self) {
+        if let Some(resume) = self.0.take() {
+            resume.send(());
+        }
+    }
 }
 
 /// One write awaiting commit, all-or-nothing: each family is one `Push` group,
@@ -75,8 +70,8 @@ struct PendingWrite {
 }
 
 /// The way to the committer task. A write and a backup are refused once a
-/// graceful shutdown has been requested; the barrier, the reclaim poke and the
-/// final checkpoint itself are always queued.
+/// graceful shutdown has been requested; the barrier, the pause, the reclaim
+/// poke and the final checkpoint itself are always queued.
 ///
 /// Everything a refusing request admits is queued ahead of the final
 /// checkpoint: the check and the send share no await, and the signal loop
@@ -113,6 +108,22 @@ impl Committer {
         self.queue(|done| CommitRequest::End(BatchEnd::Barrier(done)))
     }
 
+    /// Resolves once the batch queued ahead has committed and the committer has
+    /// parked. A checkpoint the SAL needs runs ahead of the park.
+    pub(super) async fn pause(&self) -> Paused {
+        let (resume, on_resume) = oneshot::channel();
+        // Built before the await, so a dropped caller still resumes the committer.
+        let paused = Paused(Some(resume));
+        let parked = self.queue(|parked| CommitRequest::End(BatchEnd::Pause { parked, resume: on_resume }));
+        parked.await;
+        paused
+    }
+
+    /// Whether a request waits for the committer to take it.
+    pub(super) fn has_queued(&self) -> bool {
+        !self.tx.is_empty()
+    }
+
     /// Resolves once every write queued ahead has committed and a checkpoint
     /// sequence has run over them.
     pub(super) fn final_checkpoint(&self) -> oneshot::Receiver<()> {
@@ -146,9 +157,6 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
     loop {
         let first = rx.recv().await;
 
-        // Drain any additional requests already queued — no timer wait.
-        // Pipelined clients still get batched; serial clients don't pay
-        // a latency tax.
         let PendingBatch { writes, end } = drain_ready_batch(&mut rx, first);
 
         // Before this batch's groups: the checkpoint makes room for them.
@@ -171,6 +179,10 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
                 run_checkpoint_sequence(&shared).await;
                 done.send(shared.dispatcher.backup_round(&dir).await);
             }
+            Some(BatchEnd::Pause { parked, resume }) => {
+                parked.send(());
+                resume.await;
+            }
         }
     }
 }
@@ -185,7 +197,9 @@ struct PendingBatch {
 
 /// Sort `first` into the batch, then keep draining requests already queued
 /// behind it — without ever waiting — until the row cap is reached, an `End`
-/// request arrives, or the channel runs dry.
+/// request arrives, or the channel runs dry. There is no debounce timer: one
+/// would add tail latency to every commit to help only serial single-request
+/// workloads, while pipelined clients batch without one.
 ///
 /// An `End` request ends the batch wherever it lands, `first` included: what is
 /// queued behind it is younger than whatever issued it, so folding that in would
@@ -214,37 +228,18 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
     b
 }
 
-/// Checkpoint sequences that waited for a DDL to release the tick gate. Its one
-/// reader is the `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT` seam.
-pub(super) static CHECKPOINTS_BEHIND_DDL: AtomicU64 = AtomicU64::new(0);
-
-/// The full steady-state checkpoint sequence: base round → drain → tick gate →
-/// ephemeral round. The base round advances the generation when it has pushes
-/// to flush. Requests arriving meanwhile wait in the channel. Its callers are
-/// the pass that makes room ahead of a batch's groups, which the sequence runs
-/// ahead of, and a `BatchEnd::Checkpoint` or `Backup`, which runs after its batch has
-/// committed and so ahead of nothing in it.
-///
-/// Each flush round holds the SAL lock across the whole round (write, ACK wait,
-/// reset); the drain step runs with it released, so the tick loop can take it
-/// per tick.
-///
-/// A failed round aborts: the workers are re-epoched against an un-reset SAL,
-/// which only a restart's replay repairs.
+/// The checkpoint sequence: base round, drain, ephemeral round. A failed round
+/// aborts: the workers are re-epoched against an un-reset SAL, which only a
+/// restart's replay repairs.
 async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
-    // A checkpoint sequence starts after a DDL that holds the tick gate.
-    if shared.ticks.gate.is_write_held() {
-        CHECKPOINTS_BEHIND_DDL.fetch_add(1, Ordering::Relaxed);
-        drop(shared.ticks.gate.read().await);
-    }
     shared
         .dispatcher
         .checkpoint_base()
         .await
         .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
 
-    // Step 2 — DRAIN (lock released). One Drain suffices: pushes are held, so the
-    // pending-tick counts cannot grow.
+    // One drain suffices: no write is committed meanwhile, so the pending-tick
+    // counts cannot grow.
     // Stamping after a failed drain would make the views' missing deltas
     // generation-valid. Unstamped, they stay behind the generation the base
     // round that flushed those deltas' rows advanced to, and are rebuilt at the
@@ -254,7 +249,7 @@ async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
         return;
     }
 
-    // Step 3 — EPHEMERAL ROUND, with no tick running.
+    // The ephemeral round runs with no tick in flight.
     let _park = shared.ticks.gate.write().await;
     shared
         .dispatcher
@@ -266,20 +261,37 @@ async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
 /// One client-visible commit unit, all-or-nothing: the SAL groups it emits and
 /// the clients waiting on their shared verdict.
 struct CommitUnit {
-    /// One group each, in frame order. A run of one-family writes to one table
-    /// is one unit of one family, their batches merged. Empty once the unit
-    /// failed: what remains is what the SAL admitted, and past Phase C what
-    /// every worker also took.
-    families: Vec<TxnFamily>,
+    outcome: Outcome,
     /// The coalesced clients of a merged run, or a write's one client.
     dones: Vec<oneshot::Sender<Result<u64, WireFault>>>,
+}
+
+/// Where a [`CommitUnit`] stands.
+enum Outcome {
+    /// One group each, in frame order. A run of one-family writes to one table
+    /// is one unit of one family, their batches merged. `in_zone` once laid out:
+    /// whether one of its groups rode inside the zone, which a restart recovers.
+    Laid { families: Vec<TxnFamily>, in_zone: bool },
     /// Why none of the unit's writes committed.
-    failed: Option<WireFault>,
+    Failed(WireFault),
 }
 
 impl CommitUnit {
+    /// The families the unit laid out; none once it failed.
+    fn laid(&self) -> &[TxnFamily] {
+        match &self.outcome {
+            Outcome::Laid { families, .. } => families,
+            Outcome::Failed(_) => &[],
+        }
+    }
+
+    /// Answer every client: the zone LSN for a unit a restart recovers, `0` for
+    /// one it does not.
     fn resolve(self, zone_lsn: u64) {
-        let result = self.failed.map_or(Ok(zone_lsn), Err);
+        let result = match self.outcome {
+            Outcome::Laid { in_zone, .. } => Ok(if in_zone { zone_lsn } else { 0 }),
+            Outcome::Failed(e) => Err(e),
+        };
         for done in self.dones {
             done.send(result.clone());
         }
@@ -290,17 +302,17 @@ impl CommitUnit {
 fn write_disjoint_tables(units: &[CommitUnit]) -> bool {
     let mut seen = FxHashSet::default();
     units.iter().all(|unit| {
-        let mut tids: Vec<u64> = unit.families.iter().map(|f| f.tid).collect();
+        let mut tids: Vec<u64> = unit.laid().iter().map(|f| f.tid).collect();
         tids.sort_unstable();
         tids.dedup();
         tids.into_iter().all(|tid| seen.insert(tid))
     })
 }
 
-/// Commit one batch of writes. Emits every group's SAL writes, queues their tids
-/// for the tick and submits the fsync SQE under one SAL hold, THEN awaits worker
-/// ACKs (Phase C) and the fsync CQE (Phase D). `done.send` and the update of the
-/// validation caches of committed rows happen after fsync.
+/// Commit one batch of writes. Lays out every group, queues their tids for the
+/// tick and submits the fsync SQE under one SAL hold, then awaits the worker
+/// ACKs and, when the batch opened a zone, the fsync. Only then are the
+/// validation caches updated and the writers answered.
 async fn commit_writes(shared: &Rc<Shared>, mut writes: Vec<PendingWrite>) {
     // One-family writes in tid runs. Stable: arrival order within a run is what
     // makes intra-batch last-insert-wins mean last *inserted*.
@@ -329,7 +341,10 @@ async fn commit_writes(shared: &Rc<Shared>, mut writes: Vec<PendingWrite>) {
                 );
             }
         }
-        units.push(CommitUnit { families, dones, failed: None });
+        units.push(CommitUnit {
+            outcome: Outcome::Laid { families, in_zone: false },
+            dones,
+        });
     }
     debug_assert!(
         write_disjoint_tables(&units),
@@ -357,16 +372,18 @@ async fn commit_writes(shared: &Rc<Shared>, mut writes: Vec<PendingWrite>) {
         // unit's earlier families, which were never published.
         for unit in &mut units {
             let written = scope.all_or_nothing(|scope| {
-                (unit.families.iter())
+                (unit.laid().iter())
                     .map(|f| disp.write_commit_group(scope, f.tid, &f.batch))
                     .collect::<Result<Vec<_>, _>>()
             });
             match written {
-                Ok(unit_leases) => leases.extend(unit_leases),
-                Err(e) => {
-                    unit.failed = Some(e);
-                    unit.families.clear();
+                Ok(groups) => {
+                    if let Outcome::Laid { in_zone, .. } = &mut unit.outcome {
+                        *in_zone = groups.iter().any(|&(_, in_zone)| in_zone);
+                    }
+                    leases.extend(groups.into_iter().map(|(lease, _)| lease));
                 }
+                Err(e) => unit.outcome = Outcome::Failed(e),
             }
         }
 
@@ -374,7 +391,7 @@ async fn commit_writes(shared: &Rc<Shared>, mut writes: Vec<PendingWrite>) {
         // The auto-tick this may fire overlaps the ACKs and the fsync.
         shared.note_commit_rows(
             &excl,
-            units.iter().flat_map(|u| &u.families).map(|f| (f.tid, f.batch.len())),
+            units.iter().flat_map(CommitUnit::laid).map(|f| (f.tid, f.batch.len())),
         );
         (zone_lsn, synced, leases)
     };
@@ -382,30 +399,23 @@ async fn commit_writes(shared: &Rc<Shared>, mut writes: Vec<PendingWrite>) {
     // ------------------------------------------------------------------
     // Phase C (no lock): await push ACKs, per group in unit order. Replies for
     // later groups wait in their routes meanwhile.
-    // The validation caches of committed rows are NOT updated here: they hold
-    // only what is durable, so that runs after Phase D's fsync.
     // ------------------------------------------------------------------
     for lease in &leases {
         lease.acks().await;
     }
 
     // ------------------------------------------------------------------
-    // Phase D (no lock): await fsync CQE. Client response is held until after
-    // fsync so the client sees only durable data. A batch of nothing but stream
-    // groups opened no zone, so has no fsync to await. Writes batched together
-    // share one zone LSN.
+    // Phase D (no lock): await the fsync. A batch of nothing but stream groups
+    // opened no zone, so has none. Writes batched together share one zone LSN.
     // ------------------------------------------------------------------
     if let Some(synced) = synced {
         synced.await;
     }
 
-    // The validation caches of committed rows follow, now that fsync confirms
-    // durability and before any writer is answered.
-    for f in units.iter().flat_map(|u| &u.families) {
-        shared.writes.checks.committed(shared.cat(), f.tid, &f.batch);
+    // The caches, then the answers.
+    for f in units.iter().flat_map(CommitUnit::laid) {
+        shared.writes.checks.committed(&shared.cat(), f.tid, &f.batch);
     }
-
-    // Send responses: every client of a unit gets the unit's verdict.
     for unit in units {
         unit.resolve(zone_lsn);
     }

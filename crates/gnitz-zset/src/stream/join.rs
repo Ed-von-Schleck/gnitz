@@ -10,8 +10,8 @@
 use std::cmp::Ordering;
 
 use crate::repr::{
-    copy_runs, pk_group_end, relocated_cell, runs_where, should_relocate_blob, width_dispatch, Batch, CursorRow,
-    ReadCursor,
+    cell_width_dispatch, copy_runs, pk_group_end, relocated_cell, runs_where, should_relocate_blob, stride_dispatch,
+    Batch, CursorRow, ReadCursor,
 };
 use crate::schema::key::{band, compare_pk_ordering, group_floor, key_above};
 use crate::schema::{DerivedSchema, SchemaDescriptor};
@@ -383,7 +383,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
                 }
             }
             // A keyed plan's output key is the delta's PK region verbatim.
-            _ => width_dispatch!(d_schema.pk_stride(), copy_runs, delta.pk(), pk, delta_runs(pairs)),
+            _ => stride_dispatch!(d_schema.pk_stride(), copy_runs, delta.pk(), pk, delta_runs(pairs)),
         }
         {
             let src = delta.weight().as_chunks::<8>().0;
@@ -411,7 +411,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
 
         for (pi, col) in d_schema.payload_columns() {
             let slot = d_first + pi;
-            width_dispatch!(
+            stride_dispatch!(
                 col.size(),
                 copy_runs,
                 delta.col_data(pi),
@@ -442,9 +442,9 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
                     }
                 }
                 ColumnLocator::Payload { slot: pi, size, .. } => {
-                    width_dispatch!(size as usize, repeat_cells, cursor, pi as usize, w.col_mut(slot), pairs)
+                    cell_width_dispatch!(size as usize, repeat_cells, cursor, pi as usize, w.col_mut(slot), pairs)
                 }
-                ColumnLocator::Pk { byte_off, size, type_code } => width_dispatch!(
+                ColumnLocator::Pk { byte_off, size, type_code } => cell_width_dispatch!(
                     size as usize,
                     repeat_pk_cells,
                     cursor,
@@ -475,8 +475,7 @@ fn delta_runs(pairs: &[Pairing]) -> impl Iterator<Item = (usize, usize)> + '_ {
 /// Each pairing's trace cell of payload column `pi`, written once per row of its
 /// delta run.
 #[inline(always)]
-fn repeat_cells<const N: usize>(cursor: &ReadCursor, pi: usize, dst: &mut [u8], pairs: &[Pairing], width: usize) {
-    assert!(N != 0, "a payload column is 1, 2, 4, 8 or 16 bytes, not {width}");
+fn repeat_cells<const N: usize>(cursor: &ReadCursor, pi: usize, dst: &mut [u8], pairs: &[Pairing]) {
     let mut cells = dst.as_chunks_mut::<N>().0.iter_mut();
     for p in pairs {
         let (src, row) = cursor.row_at(p.at);
@@ -488,15 +487,7 @@ fn repeat_cells<const N: usize>(cursor: &ReadCursor, pi: usize, dst: &mut [u8], 
 /// [`repeat_cells`] for the PK column at byte `off` of the walked row's key,
 /// decoded to its native bytes.
 #[inline(always)]
-fn repeat_pk_cells<const N: usize>(
-    cursor: &ReadCursor,
-    off: usize,
-    signed: bool,
-    dst: &mut [u8],
-    pairs: &[Pairing],
-    width: usize,
-) {
-    assert!(N != 0, "a PK column is 1, 2, 4, 8 or 16 bytes, not {width}");
+fn repeat_pk_cells<const N: usize>(cursor: &ReadCursor, off: usize, signed: bool, dst: &mut [u8], pairs: &[Pairing]) {
     let mut cells = dst.as_chunks_mut::<N>().0.iter_mut();
     for p in pairs {
         let (src, row) = cursor.row_at(p.at);

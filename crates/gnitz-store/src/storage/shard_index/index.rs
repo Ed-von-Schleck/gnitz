@@ -20,7 +20,7 @@ use gnitz_wire::RowSource;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::ShardWriteOpts;
 use gnitz_zset::repr::StorageError;
-use gnitz_zset::repr::{merge_guard, Codebook, MappedShard};
+use gnitz_zset::repr::{Codebook, GuardMerge, MappedShard};
 
 /// One fold the tree owes: the shards it merges and where the merge goes.
 struct Fold {
@@ -37,12 +37,11 @@ struct Fold {
 /// the two are exchanged.
 pub(super) struct Running {
     fold: Fold,
-    shards: Vec<Rc<MappedShard>>,
+    merge: GuardMerge,
     /// Every output inherits the newest stamp over the inputs.
     newest: u64,
-    /// The destination to merge next, and where its rows start in each input.
+    /// The destination to merge next.
     next: usize,
-    starts: Vec<usize>,
     opened: Vec<(PkBuf, ShardEntry)>,
 }
 
@@ -361,14 +360,10 @@ impl ShardIndex {
                     .expect("a fold names registered shards")
             })
             .collect();
-        for e in &shards {
-            e.shard.verify_body()?;
-        }
         let newest = shards.iter().map(|e| e.newest).max().unwrap_or(0);
-        let shards: Vec<Rc<MappedShard>> = shards.iter().map(|e| Rc::clone(&e.shard)).collect();
+        let merge = GuardMerge::begin(shards.iter().map(|e| Rc::clone(&e.shard)).collect())?;
         self.running = Some(Running {
-            starts: vec![0; shards.len()],
-            shards,
+            merge,
             newest,
             next: 0,
             opened: Vec::with_capacity(fold.keys.len()),
@@ -384,12 +379,10 @@ impl ShardIndex {
     /// Answers the input bytes it merged.
     fn step(&mut self) -> Result<u64, StorageError> {
         let mut run = self.running.take().expect("a fold is under way");
-        let before: usize = run.starts.iter().sum();
+        let before = run.merge.rows_merged();
         let dehydrate = run.fold.kind == CompactionKind::Dehydrate;
         let codebook = self.codebook.clone();
-        let merged = merge_guard(
-            &run.shards,
-            &mut run.starts,
+        let merged = run.merge.next(
             run.fold.keys.get(run.next + 1).map(PkBuf::pk_bytes),
             dehydrate,
             &self.schema,
@@ -397,10 +390,11 @@ impl ShardIndex {
         );
         // Row share stands in for byte share.
         let (rows, bytes): (usize, u64) = run
-            .shards
+            .merge
+            .shards()
             .iter()
             .fold((0, 0), |(r, b), s| (r + s.row_count(), b + s.file_len()));
-        let merged_rows = (run.starts.iter().sum::<usize>() - before) as u128;
+        let merged_rows = (run.merge.rows_merged() - before) as u128;
         let read = (u128::from(bytes) * merged_rows / rows.max(1) as u128) as u64 + 1;
         if let Some(merged) = merged {
             // A store that has coded no heap yet codes the run under one of its own.
@@ -429,7 +423,8 @@ impl ShardIndex {
     /// Retire the inputs of a finished fold and register its outputs under
     /// their guards.
     fn install(&mut self, run: Running) {
-        let Running { fold, shards, opened, .. } = run;
+        let Running { fold, merge, opened, .. } = run;
+        let shards = merge.shards();
         if fold.kind == CompactionKind::L0Fold {
             // A run that lands in one guard is one shard whose encodings span
             // the whole run, and can outweigh the spills it was written from.
@@ -720,7 +715,7 @@ impl ShardIndex {
     /// The runs are the maximal runs of two or more adjacent guards whose
     /// combined bytes fit half the target. A run also breaks at a change of
     /// representation, because folding a hydrated guard together with a
-    /// dehydrated one would evict it (see [`merge_guard`]).
+    /// dehydrated one would evict it (see [`GuardMerge::next`]).
     ///
     /// Half the target is the hysteresis: a merged run no larger than its inputs
     /// is under the split trigger.

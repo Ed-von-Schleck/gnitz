@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use super::ddl::{hold_tick_for_ddl, TICK_HOLD_FOR_DDL};
-use super::Shared;
+use super::{CatalogLock, Shared};
 use crate::runtime::reactor::AckLease;
 use crate::runtime::sal::SalExcl;
 use crate::runtime::sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard};
@@ -38,8 +38,6 @@ enum TickTrigger {
 /// hold its commit groups are written under; a dropped relation's entry is
 /// removed under the catalog write guard.
 pub(super) struct Ticks {
-    /// Tick trigger sender. Private to this module, so [`Ticks::drain`] and
-    /// [`Shared::note_commit_rows`] are the only code that sends a trigger.
     tx: chan::Sender<TickTrigger>,
     /// Held shared by every tick, so a writer runs with no tick in flight.
     pub(super) gate: AsyncRwLock,
@@ -88,10 +86,14 @@ impl Ticks {
         sources.iter().all(|s| !pending.contains_key(s))
     }
 
-    /// Drop a dropped relation's pending entry. Ids are never reused, so
-    /// nothing else would ever reclaim it.
+    /// Drop a dropped relation's pending entry.
     pub(super) fn forget(&self, id: u64) {
         self.pending.borrow_mut().remove(&id);
+    }
+
+    /// The SAL watermark the last emitted tick snapshotted.
+    pub(super) fn last_lsn(&self) -> u64 {
+        self.last_lsn.get()
     }
 
     /// Send the tick loop a [`TickTrigger::Drain`] due `by`; the receiver is its
@@ -210,7 +212,7 @@ pub(super) async fn fresh_read_lock(
     shared: &Rc<Shared>,
     targets: impl IntoIterator<Item = u64>,
     drain_by: Instant,
-) -> Result<ReadGuard, WireFault> {
+) -> Result<ReadGuard<CatalogLock>, WireFault> {
     let g = shared.catalog_rwlock.read().await;
     if shared.ticks.all_ticked(&shared.cat().dag.source_closure(targets)) {
         return Ok(g);
@@ -220,13 +222,16 @@ pub(super) async fn fresh_read_lock(
     Ok(shared.catalog_rwlock.read().await)
 }
 
-/// The LSN at or below which every commit is reflected in a read of a `kind`
-/// relation. Called under the read's own SAL hold, so every zone at or below
-/// the SAL watermark precedes the read's group in the log. A view reflects its
-/// last tick.
-pub(super) fn read_watermark(shared: &Shared, kind: RelationKind) -> u64 {
+/// The LSN at or below which every commit is reflected in a worker read of a
+/// `kind` relation whose group is written under `_cut`: every zone at or below
+/// the SAL watermark precedes that group in the log. A view reflects its last
+/// tick.
+pub(super) fn read_watermark(shared: &Shared, kind: RelationKind, _cut: &SalExcl<'_>) -> u64 {
     match kind {
         RelationKind::BaseTable => shared.dispatcher.sal().watermark(),
-        _ => shared.ticks.last_lsn.get(),
+        RelationKind::View(_) => shared.ticks.last_lsn(),
+        RelationKind::SystemCatalog | RelationKind::Stream => {
+            unreachable!("a system family is read off the master, and a stream is never read")
+        }
     }
 }

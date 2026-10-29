@@ -176,7 +176,7 @@ fn no_register_tracks_nulls_exactly_when_nothing_can_produce_one() {
     ];
     for (label, schema, instrs, want) in cases {
         let prog = scalar_prog(&schema, instrs, vec![b"m".to_vec()]);
-        assert_eq!(prog.prog().null_regs == 0, want, "{label}");
+        assert_eq!(prog.prog().null_regs() == 0, want, "{label}");
     }
 }
 
@@ -204,7 +204,7 @@ fn null_regs_holds_exactly_the_registers_that_can_be_null() {
     ];
     for (label, instrs, want) in cases {
         let prog = scalar_prog(&ints, instrs, vec![]);
-        assert_eq!(prog.prog().null_regs, want, "{label}");
+        assert_eq!(prog.prog().null_regs(), want, "{label}");
     }
 }
 

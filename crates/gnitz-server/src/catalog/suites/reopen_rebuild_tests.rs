@@ -249,10 +249,9 @@ fn index_rebuild_forced_by_topology_change() {
 
 // ── The view twin: one policy for a view's output store and its traces ───
 //
-// A view's operator traces must look for the same manifest generation its output
-// store was opened under. The two are decided at different moments — the store at
-// registration, the traces at compile — so a checkpoint landing between them is
-// what these two tests put there.
+// A view's operator traces resume from the generation its output store loaded:
+// CircuitState::open reads the output's loaded mark, whenever the traces first
+// open.
 
 /// A push of row `(id, val)` into [`seed_base`]'s table `tid`, and its tick.
 fn tick(engine: &mut CatalogEngine, tid: u64, id: u64, val: u64) {
@@ -279,7 +278,7 @@ fn checkpointed_traced_view(dir: &str) -> (u64, u64) {
 }
 
 // ── view_traces_resume_with_their_output_store ──────────────────────────
-// A compile opens the traces against the generation the output store resumed
+// The first tick opens the traces at the generation the output store resumed
 // from.
 #[test]
 fn view_traces_resume_with_their_output_store() {

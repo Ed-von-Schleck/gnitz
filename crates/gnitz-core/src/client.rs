@@ -6,14 +6,14 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::os::fd::AsFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
 use gnitz_wire::txn_frame::BLIND;
 use gnitz_wire::{ReadSpec, WireConflictMode};
 
-use crate::connection::{DeltaCursor, RelDescriptor, Request, ScanReply, Session, Target};
+use crate::connection::{DeltaCursor, RelDescriptor, Request, ScanReply, Session, SubId, Target};
 use crate::error::{not_found, ClientError};
 use crate::host::{offload, serve, BlockingHost, Host, Pending, Sent};
 use crate::txn::TxnBuffer;
@@ -24,7 +24,6 @@ use crate::{RelName, Schema, ZSetBatch};
 const SERIAL_RANGE_SIZE: u64 = 64;
 
 pub struct GnitzClient {
-    /// Before the session, so it lets go of the socket before that closes.
     pub(crate) host: Box<dyn Host>,
     pub(crate) session: Session,
     /// Per table, the SERIAL ids a reservation drew and no INSERT has taken. A
@@ -40,7 +39,7 @@ pub struct GnitzClient {
     /// A reader's subscriptions, each with the layout its trains decode
     /// under, in the order they were made. A mirror keeps its own with the
     /// views they feed.
-    pub(crate) readers: std::collections::BTreeMap<u64, Arc<Schema>>,
+    pub(crate) readers: std::collections::BTreeMap<SubId, Arc<Schema>>,
     /// Qualified name → the descriptor its last RESOLVE answered, for
     /// [`Self::kept_desc`]. This client's own DDL drops the relations it wrote.
     pub(crate) kept: HashMap<RelName, Arc<RelDescriptor>>,
@@ -48,12 +47,14 @@ pub struct GnitzClient {
     /// subscription for the client's whole life: a reader still holding an id
     /// of a connection since replaced is told that one ended, never handed
     /// another's trains.
-    pub(crate) next_sub: u64,
+    pub(crate) next_sub: SubId,
     /// What a sync took for a reader's subscriptions and nobody received,
     /// handed back by [`Self::unclaimed`]: the next sync reports it in front
-    /// of its own, and is not held. `Some` with no entry when the delivery
-    /// handed back only reseeds, which the mirror owes again.
-    pub(crate) unclaimed: Option<Vec<crate::Pushed>>,
+    /// of its own, and is not held.
+    pub(crate) unclaimed: Vec<crate::Pushed>,
+    /// Deliveries a [`Self::sync_reply`] cell handed back, for
+    /// [`Self::unclaimed`] at the next sync.
+    pub(crate) returned: Arc<Mutex<Vec<crate::Synced>>>,
 }
 
 // `gnitz-py` runs these with the GIL released and `gnitz-tokio` spawns them,
@@ -102,7 +103,7 @@ impl GnitzClient {
 
     /// A client over an already-connected session.
     pub(crate) fn over(session: Session, mut host: Box<dyn Host>) -> Result<GnitzClient, ClientError> {
-        host.attach(session.as_fd())?;
+        host.attach(session.as_fd().try_clone_to_owned()?)?;
         Ok(GnitzClient {
             host,
             session,
@@ -111,8 +112,9 @@ impl GnitzClient {
             mirror: None,
             readers: Default::default(),
             kept: HashMap::new(),
-            next_sub: 1,
-            unclaimed: None,
+            next_sub: SubId::FIRST,
+            unclaimed: Vec::new(),
+            returned: Default::default(),
         })
     }
 
@@ -144,8 +146,9 @@ impl GnitzClient {
             kept,
             next_sub: _,
             unclaimed: _,
+            returned: _,
         } = self;
-        host.attach(fresh.as_fd())?;
+        host.attach(fresh.as_fd().try_clone_to_owned()?)?;
         *session = fresh;
         serial_cache.clear();
         kept.clear();
@@ -235,8 +238,7 @@ impl GnitzClient {
 
     // ── Requests ───────────────────────────────────────────────────────────
 
-    /// Push `batch` into `target` under `mode`. SQL `INSERT` uses `Error` to get
-    /// SQL-standard rejection semantics; every other caller passes `Update`.
+    /// Push `batch` into `target` under `mode`.
     ///
     /// Inside an open transaction the batch is buffered instead of sent, and the
     /// returned LSN is `0` — nothing is durable until `txn_commit`, which returns

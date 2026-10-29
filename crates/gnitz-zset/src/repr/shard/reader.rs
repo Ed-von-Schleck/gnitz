@@ -210,7 +210,7 @@ pub struct MappedShard {
     /// The null bits of `schema`'s payload columns past the file's own, OR'd
     /// into every null word read: a column the file predates reads NULL.
     null_pad_mask: u64,
-    heap: ShardHeap,
+    heap: ShardHeap<'static>,
     /// The validated PK filter, or `None` when the file carries none.
     pk_filter: Option<BinaryFuse8Ref<'static>>,
     /// The words `null_bmp` points into when the file is wider than `schema`:
@@ -220,9 +220,9 @@ pub struct MappedShard {
 
 /// The heap region: the verbatim heap, or the parsed image of one coded under
 /// a symbol table.
-enum ShardHeap {
-    Plain(&'static [u8]),
-    Coded(SymbolsImage<'static>),
+enum ShardHeap<'a> {
+    Plain(&'a [u8]),
+    Coded(SymbolsImage<'a>),
 }
 
 /// A shard's header and directory, read under no schema.
@@ -238,11 +238,12 @@ pub struct ShardDirectory {
 
 impl ShardDirectory {
     /// The header and directory of the shard at `path`, refused wherever
-    /// [`MappedShard::open`] would refuse it under every schema; no region is
-    /// checked against one.
+    /// [`MappedShard::open`] would refuse its header, directory, heap or PK
+    /// filter; no other region is checked.
     pub fn read(path: &str) -> Result<Self, StorageError> {
         let (mmap, header) = MappedShard::map(path)?;
         let spans = region_spans(mmap.as_slice(), header.file_npc)?;
+        frame(mmap.as_slice(), &spans)?;
         let regions = spans
             .iter()
             .enumerate()
@@ -265,6 +266,27 @@ impl ShardDirectory {
             regions,
         })
     }
+}
+
+/// The heap and the PK filter of the shard `data`, whose regions `spans`
+/// places: the regions no schema binds.
+fn frame<'a>(data: &'a [u8], spans: &[Span]) -> Result<(ShardHeap<'a>, Option<BinaryFuse8Ref<'a>>), StorageError> {
+    let [.., blob, filter] = spans else {
+        unreachable!("region_spans yields every region plus the filter")
+    };
+    let heap = match blob.encoding {
+        Encoding::Raw => ShardHeap::Plain(blob.bytes(data)),
+        Encoding::Symbols => ShardHeap::Coded(SymbolsImage::parse(blob.bytes(data)).ok_or(Corrupt("region size"))?),
+        _ => return Err(Corrupt("encoding")),
+    };
+    if filter.encoding != Encoding::Raw {
+        return Err(Corrupt("encoding"));
+    }
+    let pk_filter = match filter.size {
+        0 => None,
+        _ => Some(pk_filter::parse(filter.bytes(data)).ok_or(Corrupt("filter descriptor"))?),
+    };
+    Ok((heap, pk_filter))
 }
 
 /// A Raw (`count` elements) or Constant (one element, stride 0) region of
@@ -312,11 +334,7 @@ impl MappedShard {
     /// matches the digest stamped over it.
     fn map(path: &str) -> Result<(Mmap, ShardHeader), StorageError> {
         let file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len() as usize;
-        if len == 0 {
-            return Err(Corrupt("empty file"));
-        }
-        let mmap = Mmap::from_file(&file, len)?;
+        let mmap = Mmap::of_file(&file)?.ok_or(Corrupt("empty file"))?;
         let header = ShardHeader::read_prefix(path, mmap.as_slice())?;
         Ok((mmap, header))
     }
@@ -391,21 +409,7 @@ impl MappedShard {
             .collect::<Result<Vec<_>, StorageError>>()?;
         let null_pad_mask = gnitz_wire::low_bits_mask(schema.num_payload_cols()) & !gnitz_wire::low_bits_mask(file_npc);
 
-        let [.., blob, filter] = spans.as_slice() else {
-            unreachable!("region_spans yields every region plus the filter")
-        };
-        let heap = match blob.encoding {
-            Encoding::Raw => ShardHeap::Plain(blob.bytes(data)),
-            Encoding::Symbols => ShardHeap::Coded(SymbolsImage::parse(blob.bytes(data)).ok_or(Corrupt("region size"))?),
-            _ => return Err(Corrupt("encoding")),
-        };
-        if filter.encoding != Encoding::Raw {
-            return Err(Corrupt("encoding"));
-        }
-        let pk_filter = match filter.size {
-            0 => None,
-            _ => Some(pk_filter::parse(filter.bytes(data)).ok_or(Corrupt("filter descriptor"))?),
-        };
+        let (heap, pk_filter) = frame(data, &spans)?;
 
         Ok(MappedShard {
             header,
@@ -423,14 +427,17 @@ impl MappedShard {
     }
 
     /// Whether the body still hashes to the checksum the writer recorded.
-    /// Leaves the mapping, which every handle rebound from this one shares,
-    /// advised MADV_SEQUENTIAL.
     pub fn verify_body(&self) -> Result<(), StorageError> {
-        self.mmap.advise(libc::MADV_SEQUENTIAL);
         let body = &self.mmap.as_slice()[desc_len(self.header.file_npc)..];
         (gnitz_wire::checksum(body) == self.header.body_checksum)
             .then_some(())
             .ok_or(Corrupt("body checksum"))
+    }
+
+    /// Advise the mapping, which every handle rebound from this one shares,
+    /// MADV_SEQUENTIAL.
+    pub(super) fn advise_sequential(&self) {
+        self.mmap.advise(libc::MADV_SEQUENTIAL);
     }
 
     /// The schema this handle reads under.
@@ -462,15 +469,12 @@ impl MappedShard {
         match &p.image {
             PackedImage::For(frame) => frame.decode(first, p.width, out),
             PackedImage::Seq(seq) => seq.decode(self.heap(), first, out),
-            PackedImage::Sparse(sparse) => {
-                // From the block's first row on: the decode counts the values before `first`.
-                let from = first - first % DECODE_BLOCK_ROWS;
-                let rows = first - from + out.len() / p.width;
+            PackedImage::Sparse(sparse) => sparse.decode(first, p.width, out, pi, |rows| {
                 // SAFETY: the decode writes every word of `nulls`.
-                let mut nulls = unsafe { PooledBuf::uninit(rows * FIXED_REGION_BYTES) };
-                self.null_bmp.decode(from, &mut nulls);
-                sparse.decode(first, p.width, out, &nulls, pi)
-            }
+                let mut nulls = unsafe { PooledBuf::uninit(rows.len() * FIXED_REGION_BYTES) };
+                self.null_bmp.decode(rows.start, &mut nulls);
+                nulls
+            }),
         }
     }
 

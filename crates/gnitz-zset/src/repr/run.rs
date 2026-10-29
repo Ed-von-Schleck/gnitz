@@ -123,7 +123,7 @@ impl RowSource for Run {
     #[inline(always)]
     fn row_count(&self) -> usize {
         match self {
-            Run::Mem(b) => b.count,
+            Run::Mem(b) => b.len(),
             Run::Shard(s) => s.row_count(),
         }
     }

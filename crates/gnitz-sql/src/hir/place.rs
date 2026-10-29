@@ -2,7 +2,7 @@
 //! place each conjunct as low as it is exact — in an input, in the join's keys, or
 //! in a `Filter` above the join.
 
-use super::{cross_comparison, side, HirCol, HirExpr, JoinClass, JoinShape, JoinType, KeyPair, RelExpr, Side};
+use super::{cross_comparison, side, HirCol, HirExpr, JoinClass, JoinType, KeyPair, RelExpr, Side};
 use crate::error::GnitzSqlError;
 use crate::ir::BinOp;
 use crate::rules::{reject_arity, reject_float_keys};
@@ -27,7 +27,7 @@ impl RelExpr {
         let on = on.into_iter().flat_map(HirExpr::conjuncts).collect();
         let placed = place(&left, &right, kind, JoinClass::default(), on, Origin::On)?;
         reject_arity("join key list", placed.class.arity(), gnitz_wire::PK_LIST_MAX_COLS)?;
-        reject_join_shape(kind, placed.class.shape())?;
+        placed.class.plan(kind)?;
         reject_outer_with_residual(kind, &placed.above)?;
         placed.build(&left, &right, kind)
     }
@@ -59,7 +59,9 @@ struct Placed {
 }
 
 impl Placed {
+    /// The join node, refused where its keys and `kind` plan no join.
     fn build(self, left: &Rc<RelExpr>, right: &Rc<RelExpr>, kind: JoinType) -> Result<Rc<RelExpr>, GnitzSqlError> {
+        self.class.plan(kind)?;
         let [l, r] = self.below;
         let join = Rc::new(RelExpr::Join {
             left: RelExpr::filter(Rc::clone(left), l)?,
@@ -182,27 +184,6 @@ fn reject_outer_with_residual(kind: JoinType, residual: &[HirExpr]) -> Result<()
              match-existence decision. Filter inside the subquery or a wrapping view."
                 .into(),
         )),
-    }
-}
-
-/// Which (shape, kind) combinations a join step exists in. Both refusals are
-/// ordinary SQL with a buildable lowering; neither emitter was written.
-fn reject_join_shape(kind: JoinType, shape: JoinShape) -> Result<(), GnitzSqlError> {
-    match (shape, kind) {
-        (JoinShape::Cross, k) if k != JoinType::Inner => Err(GnitzSqlError::Rejected(
-            "a LEFT/RIGHT/FULL JOIN or an EXISTS/IN correlation needs at least one equijoin \
-             or range predicate between its two sides; only an INNER step (CROSS JOIN, a \
-             comma-separated FROM, or JOIN … ON with no cross-table comparison) may be keyless."
-                .into(),
-        )),
-        (JoinShape::PureRange, k) if k.preserves(1) => Err(GnitzSqlError::Rejected(
-            "pure-range RIGHT/FULL JOIN (a sole inequality range conjunct with no \
-             equality prefix) is not supported; its mirror null-fill has no inner-join \
-             witness on the preserved side. Use INNER/LEFT JOIN, or add an equality \
-             conjunct to make it a band join."
-                .into(),
-        )),
-        _ => Ok(()),
     }
 }
 

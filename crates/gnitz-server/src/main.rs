@@ -34,6 +34,7 @@ mod query;
 mod runtime;
 
 use gnitz_foundation::log::Level;
+use runtime::ServerExit;
 use rustls::pki_types::ServerName;
 use std::env;
 use std::process;
@@ -144,10 +145,6 @@ Exit codes:
   134  fail-stop abort (128 + SIGABRT)
 ";
 
-/// `sysexits.h`'s `EX_USAGE`: argv was refused, before anything was created. A
-/// boot failure exits 1, so a supervisor can tell the two apart.
-const EX_USAGE: i32 = 64;
-
 fn parse_level(s: &str) -> Result<Level, String> {
     match s {
         "quiet" => Ok(Level::Quiet),
@@ -174,6 +171,8 @@ fn parse_workers(val: &str) -> Result<Option<u32>, String> {
 /// other.
 struct Args {
     level: Level,
+    /// `None` when no TLS listener was asked for.
+    tls: Option<runtime::TlsArgs>,
     server: runtime::ServerArgs,
 }
 
@@ -257,11 +256,11 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
     };
     Ok(Args {
         level,
+        tls,
         server: runtime::ServerArgs {
             data_dir: data_dir.clone(),
             socket_path: socket_path.clone(),
             workers,
-            tls,
             backup_dir,
         },
     })
@@ -322,23 +321,22 @@ fn main() {
     let refuse = |e: String| -> ! {
         eprintln!("Error: {e}");
         eprintln!("Try 'gnitz-server --help' for usage information");
-        process::exit(EX_USAGE);
+        process::exit(ServerExit::Usage.code());
     };
-    let mut args = parse_args(&args, env_level.as_deref()).unwrap_or_else(|e| refuse(e));
+    let args = parse_args(&args, env_level.as_deref()).unwrap_or_else(|e| refuse(e));
     gnitz_foundation::log::init(args.level, gnitz_foundation::log::Tag::Master);
-    // Here and not in the boot: a bind the policy refuses and a PEM file that
-    // does not load are refusals of argv.
-    args.server.tls = args
-        .server
+    // Before the boot: a bind the policy refuses and a PEM file that does not
+    // load are refusals of argv.
+    let tls = args
         .tls
-        .take()
         .map(runtime::TlsArgs::resolve)
         .transpose()
         .unwrap_or_else(|e| refuse(e));
-    process::exit(runtime::server_main(args.server).unwrap_or_else(|e| {
+    let exit = runtime::server_main(args.server, tls).unwrap_or_else(|e| {
         gnitz_error!("{e}");
-        1
-    }));
+        ServerExit::BootFailed
+    });
+    process::exit(exit.code());
 }
 
 #[cfg(test)]

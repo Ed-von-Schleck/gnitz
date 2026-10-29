@@ -176,15 +176,9 @@ fn cell_ok_accepts_canonical_and_rejects_compare_visible_corruption() {
     assert!(!german_string_cell_ok(&skewed, &blob));
 }
 
-/// `compare_german_strings` is plain `[u8]` lexicographic order. The inline
-/// and heap cells reach that verdict through different bytes — the prefix u32
-/// fast path, then a content compare that resolves out of the cell or out of
-/// its blob — so the classes must agree pairwise. The merge heap and the
-/// cursor-vs-exemplar compare always hold **two** blob arenas, one per run, so
-/// each side's payload must resolve out of its own heap: the arenas here start
-/// at different lengths, so equal payloads land at different offsets, and a
-/// comparator reading both sides from one arena, or at offset 0, reports the
-/// wrong order.
+/// `compare_german_strings` is `[u8]` lexicographic order across inline and
+/// heap cells, each side resolved out of its own blob arena; the arenas start
+/// at different lengths, so equal payloads sit at different offsets.
 #[test]
 fn compare_matches_byte_order_across_classes_and_arenas() {
     let data: &[&[u8]] = &[

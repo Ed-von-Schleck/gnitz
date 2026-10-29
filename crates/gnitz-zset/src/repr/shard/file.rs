@@ -194,10 +194,10 @@ fn pack_string_column<'a>(cells: &'a [[u8; 16]], src: Heap<'a>, heap: &mut HeapW
 /// Per-call policy for writing a shard.
 #[derive(Clone, Copy, Default)]
 pub struct ShardWriteOpts<'a> {
-    /// Write no PK filter — named for what it turns off, so `Default` builds one.
+    /// Write no PK filter.
     pub skip_pk_filter: bool,
-    /// Code the heap under this codebook, unless that leaves it more than three
-    /// quarters of its bytes.
+    /// Code the heap under this codebook where that pays (see
+    /// `HeapWriter::coding_lost`).
     pub codebook: Option<&'a Codebook>,
 }
 
@@ -218,7 +218,7 @@ impl Batch {
         skeleton: bool,
     ) -> Result<(), StorageError> {
         let schema = self.schema();
-        let n = self.count;
+        let n = self.len();
         assert!(n > 0, "every writer skips an empty output");
         let src = rows.heap();
         if src.plain().is_some() {

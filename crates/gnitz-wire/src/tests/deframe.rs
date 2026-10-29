@@ -131,18 +131,19 @@ impl Feeder {
 }
 
 /// A run of frames fed as whole reads costs the reads named, yields every frame
-/// in order, and leaves nothing buffered: a pipelined run fits one read; a frame
-/// larger than the carry takes the reads behind its first straight into its own
-/// buffer, and the stream parses from the carry again afterwards; and a frame
-/// straddling the end of a carry read — its cut in the prefix, at the payload's
-/// start or in the payload — completes on the next read with what follows it.
+/// in order, and leaves nothing buffered.
 #[test]
 fn a_run_of_frames_costs_the_reads_it_needs() {
     const P: usize = FRAME_LEN_PREFIX_BYTES;
     let mut cases: Vec<(Vec<Vec<u8>>, usize)> = vec![
+        // A pipelined run fits one read.
         ((0..16u8).map(|i| vec![i; 700]).collect(), 1),
+        // A frame larger than the carry reads straight into its own buffer,
+        // and the frame after it parses from the carry again.
         (vec![vec![0xC3; 2 * CARRY_BYTES + 500], vec![0x11; 300]], 3),
     ];
+    // A frame whose carry read ends in its prefix, at its payload's start or in
+    // its payload completes on the next read.
     cases.extend((1..=P + 1).map(|cut| (vec![vec![0xA1; CARRY_BYTES - P - cut], vec![0xC3; 64]], 2)));
     for (payloads, reads) in cases {
         let at = payloads.iter().map(Vec::len).collect::<Vec<_>>();

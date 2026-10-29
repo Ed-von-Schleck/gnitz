@@ -18,7 +18,7 @@ fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
     let cols = [col_def("cid", TypeCode::U64), fk_def("fk", TypeCode::U64, parent, 0)];
     engine.create_table("public.child", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(parent).unwrap().schema();
-    let (disp, _) = test_dispatcher(vec![0], &mut engine);
+    let (disp, _) = test_dispatcher(1, engine);
     let checks = Checks::new();
 
     let write = |rows: &[(u64, i64, i64)]| {
@@ -36,14 +36,11 @@ fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
     let mut retraction = write(&[(1, -1, 10)]);
     assert!(try_poll_once(checks.validate_txn(&disp, &mut retraction)).is_none());
 
-    drop(disp);
-    engine.close();
+    disp.into_catalog().close();
 }
 
-/// `format_pk_bytes` decodes each column out of the OPK image at its own
-/// offset and width. The signed arms are what a native-LE read would get
-/// wrong (OPK flips the sign bit), and a compound PK wider than 16 bytes is
-/// what a `u128` key form could not carry at all.
+/// Each PK column decodes at its own offset and width, signed and
+/// wider-than-16-byte keys included.
 #[test]
 fn format_pk_bytes_renders_every_pk_column_from_its_opk_image() {
     for (tc, v, want) in [

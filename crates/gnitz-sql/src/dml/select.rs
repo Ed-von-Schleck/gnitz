@@ -166,7 +166,7 @@ pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, Gn
     // ORDER BY / LIMIT / OFFSET are the client finish's; any other query clause is refused.
     reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, "direct SELECT")?;
     let (limit, offset) = extract_limit_offset(query)?;
-    let slice = Slice { limit, offset };
+    let slice = Slice { limit, offset: offset.unwrap_or(0) };
     let keys = parse_order_by(query.order_by.as_ref())?;
     let (desc, name, conjuncts, shape) = match bind_adhoc_read(cat, query, &order_exprs(&keys))? {
         AdhocRead::Relation { desc, name, conjuncts, shape } => (desc, name, conjuncts, shape),

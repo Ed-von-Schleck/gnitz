@@ -109,6 +109,45 @@ fn a_column_row_refuses_forged_words() {
     }
 }
 
+/// Every row `column` accepts is the row `of` writes for what it read.
+#[test]
+fn a_column_row_column_accepts_is_the_row_of_writes() {
+    let col = crate::ColumnDef::new("c", crate::TypeCode::I64, false);
+    let base = ColTabRow {
+        is_nullable: true,
+        is_hidden: true,
+        ..ColTabRow::of(16, 2, &col, None)
+    };
+    let fks = [
+        (0, 0, 0),
+        (0, 0, 1),
+        (0, 3, 0),
+        (17, 0, 0),
+        (17, 3, 1),
+        (17, 3, 2),
+        (17, 1 << 32, 0),
+    ];
+    let mut accepted = 0;
+    for type_code in 0..=256 {
+        for scale in [0, 1, 2, 18, 38, 39, 255, 256] {
+            for (fk_table_id, fk_col_idx, fk_on_delete) in fks {
+                let row = ColTabRow {
+                    type_code,
+                    scale,
+                    fk_table_id,
+                    fk_col_idx,
+                    fk_on_delete,
+                    ..base.clone()
+                };
+                let Ok(c) = row.column() else { continue };
+                assert_eq!(ColTabRow::of(row.owner_id, row.col_idx, &c.def, c.fk), row);
+                accepted += 1;
+            }
+        }
+    }
+    assert!(accepted > 0);
+}
+
 /// A relation row's properties read back what its writer packed, and refuse a
 /// word no writer emits.
 #[test]

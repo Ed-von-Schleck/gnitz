@@ -36,6 +36,14 @@ pub const MAX_IN_FLIGHT: usize = 4096;
 /// without flushing.
 pub const MAX_QUEUED_BYTES: usize = 64 << 20;
 
+/// A cap on a connection's outstanding requests.
+enum Cap {
+    /// [`MAX_IN_FLIGHT`] requests unanswered.
+    InFlight,
+    /// [`MAX_QUEUED_BYTES`] bytes queued and unwritten.
+    QueuedBytes,
+}
+
 /// One relation's read result.
 #[derive(Debug)]
 pub struct ScanReply {
@@ -97,7 +105,7 @@ impl RawBlock {
     }
 }
 
-pub use gnitz_wire::txn_frame::DeltaCursor;
+pub use gnitz_wire::txn_frame::{DeltaCursor, SubId};
 
 // ── The request vocabulary ───────────────────────────────────────────────────
 
@@ -214,14 +222,12 @@ pub(crate) fn encode_push_txn(families: &[PushFamily]) -> Vec<u8> {
     let items: Vec<FrameItem> = families
         .iter()
         .zip(&schemas)
-        .map(|(f, schema)| {
-            let mut hdr = ControlHeader::naming(ClientVerb::PushTxn, f.target, f.basis);
-            hdr.flags.conflict_mode = f.mode;
-            FrameItem {
-                hdr,
-                schema: Some(schema),
-                data: f.batch.wire_regions(),
-            }
+        .map(|(f, schema)| FrameItem {
+            target: f.target,
+            conflict_mode: f.mode,
+            basis: f.basis,
+            schema: Some(schema),
+            data: f.batch.wire_regions(),
         })
         .collect();
     encode_items(ClientVerb::PushTxn, &items)
@@ -235,7 +241,9 @@ pub fn encode_ddl_txn(families: &[(u64, ZSetBatch)]) -> Vec<u8> {
     let items: Vec<FrameItem> = families
         .iter()
         .map(|(tid, b)| FrameItem {
-            hdr: ControlHeader { target_id: *tid, ..Default::default() },
+            target: Target::from(*tid),
+            conflict_mode: WireConflictMode::default(),
+            basis: 0,
             schema: None,
             data: b.wire_regions(),
         })
@@ -267,7 +275,7 @@ enum Slot {
         reply_schema: Arc<Schema>,
         data: Option<ZSetBatch>,
         /// The subscription id the view is kept as from that cursor.
-        keep: Option<u64>,
+        keep: Option<SubId>,
         to: Promise<(ScanReply, DeltaCursor)>,
     },
     /// SNAPSHOT_PAGE: a scan's trains, with where each worker's ends.
@@ -295,11 +303,15 @@ enum Slot {
         /// The poll this request is, see [`Polls::live`].
         poll: u64,
         /// The subscription id `views[0]` is kept as, the rest counting up.
-        first: u64,
+        first: SubId,
     },
     /// A train the server pushed for subscription `sub`, its blocks kept for
     /// whoever holds it.
-    Pushed { tid: u64, sub: u64, blocks: Vec<RawBlock> },
+    Pushed {
+        tid: u64,
+        sub: SubId,
+        blocks: Vec<RawBlock>,
+    },
 }
 
 /// How one view's train ends: the cursor its terminal carries, or the fault
@@ -324,7 +336,7 @@ struct Polls {
     queue: VecDeque<Polled>,
     /// What was pushed for each subscription the session holds, by its id,
     /// kept until its owner takes it. An id with no entry is one nobody holds.
-    subs: HashMap<u64, Parked>,
+    subs: HashMap<SubId, Parked>,
     /// The server may hold a subscription of this connection: a read it was
     /// asked to keep was answered with a cursor since the last sync, or that
     /// sync named one.
@@ -338,13 +350,13 @@ type Parked = Result<(Vec<RawBlock>, DeltaCursor), ClientError>;
 impl Polls {
     /// Hold subscription `id` at `cursor` before the reader takes the reply:
     /// a train pushed for the id may be right behind it.
-    fn hold(&mut self, id: u64, cursor: DeltaCursor) {
+    fn hold(&mut self, id: SubId, cursor: DeltaCursor) {
         self.server_holds = true;
         self.subs.insert(id, Ok((Vec::new(), cursor)));
     }
 
     /// One view of the request poll `poll`, kept as `kept`, ended with `end`.
-    fn reader_end(&mut self, poll: u64, kept: u64, end: PollEnd) {
+    fn reader_end(&mut self, poll: u64, kept: SubId, end: PollEnd) {
         // A cursor is what the server keeps a subscription from, live reader or not.
         self.server_holds |= end.is_ok();
         if poll != self.live {
@@ -357,7 +369,7 @@ impl Polls {
     }
 
     /// A train pushed for `sub` ended with `end`, after `train`.
-    fn holder_end(&mut self, sub: u64, train: Vec<RawBlock>, end: PollEnd) {
+    fn holder_end(&mut self, sub: SubId, train: Vec<RawBlock>, end: PollEnd) {
         self.server_holds |= end.is_ok();
         match (self.subs.get_mut(&sub), end) {
             (Some(Ok((held, at))), Ok(cursor)) => {
@@ -413,9 +425,14 @@ impl Inbox {
                         "a pushed train opens with a bare head".into(),
                     ));
                 }
+                let Some(sub) = SubId::new(h.arg0) else {
+                    return Err(ProtocolError::DecodeError(
+                        "a pushed train names no subscription".into(),
+                    ));
+                };
                 self.pushed = Some(Slot::Pushed {
-                    tid: ctrl.hdr.target_id,
-                    sub: ctrl.hdr.arg0,
+                    tid: h.target_id,
+                    sub,
                     blocks: Vec::new(),
                 });
                 return Ok(());
@@ -628,7 +645,7 @@ impl Session {
         from: Option<DeltaCursor>,
         reply_schema: &Arc<Schema>,
         spec: &[u8],
-        keep: Option<u64>,
+        keep: Option<SubId>,
     ) -> Sent<(ScanReply, DeltaCursor)> {
         let (to, sent) = promise();
         let slot = Slot::Delta {
@@ -651,7 +668,7 @@ impl Session {
     /// SYNC_PUSHED: bring the subscriptions `held` names up to date, held up
     /// to `wait` while none has anything new, and end every other one of this
     /// connection.
-    pub(crate) fn submit_sync(&mut self, held: &[u64], wait: Duration) -> Sent<()> {
+    pub(crate) fn submit_sync(&mut self, held: &[SubId], wait: Duration) -> Sent<()> {
         let polls = &mut self.inbox.polls;
         polls.subs.retain(|id, _| held.contains(id));
         if !polls.server_holds {
@@ -682,7 +699,7 @@ impl Session {
     ///
     /// `Err` is the end of the subscription, which the session then holds no
     /// more: the server ended it, or this connection never held it.
-    pub(crate) fn take_pushed(&mut self, id: u64) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
+    pub(crate) fn take_pushed(&mut self, id: SubId) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
         let Entry::Occupied(mut parked) = self.inbox.polls.subs.entry(id) else {
             return Err(ClientError::from(format!(
                 "subscription {id} is not held on this connection; read from its cursor and subscribe again"
@@ -696,7 +713,7 @@ impl Session {
 
     /// Stop holding subscription `id`: what is pushed for it from now on is
     /// dropped unparked. The next sync still tells the server.
-    pub(crate) fn release(&mut self, id: u64) {
+    pub(crate) fn release(&mut self, id: SubId) {
         self.inbox.polls.subs.remove(&id);
     }
 
@@ -704,7 +721,7 @@ impl Session {
     /// queues for [`Self::next_polled`], in order, and a request the session
     /// refuses ends each with the refusal. A view answered with a cursor stays
     /// subscribed from it, item `i` as [`kept_as`]`(first, i)`.
-    pub(crate) fn submit_delta_poll(&mut self, first: u64, views: &[txn_frame::DeltaPollItem]) {
+    pub(crate) fn submit_delta_poll(&mut self, first: SubId, views: &[txn_frame::DeltaPollItem]) {
         if views.is_empty() {
             return;
         }
@@ -739,16 +756,13 @@ impl Session {
         } else if let Some(why) = &self.ended {
             Some(why.clone())
         } else {
-            // The predicate a driver reads for back-pressure, so the two can
-            // never disagree; only the message re-derives which cap was hit.
-            self.at_capacity().then(|| {
-                ClientError::from(if self.inbox.in_flight() >= MAX_IN_FLIGHT {
-                    format!("connection has {MAX_IN_FLIGHT} requests in flight")
-                } else {
-                    format!(
+            self.cap_hit().map(|cap| {
+                ClientError::from(match cap {
+                    Cap::InFlight => format!("connection has {MAX_IN_FLIGHT} requests in flight"),
+                    Cap::QueuedBytes => format!(
                         "connection has {} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap",
                         self.transport.queued_bytes()
-                    )
+                    ),
                 })
             })
         };
@@ -856,12 +870,23 @@ impl Session {
         self.inbox.polls.queue.clear();
     }
 
-    /// Either of the caps [`Self::submit`] refuses on — in-flight slots or
-    /// queued bytes — reached. A driver that can wait leaves the request where
-    /// it is, which is what turns a cap into back-pressure rather than an error.
-    /// Each cap implies its own interest bit, so gating on it loses no wakeup.
+    /// Whether a cap [`Self::submit`] refuses on is reached. A driver that can
+    /// wait leaves the request where it is, which is what turns a cap into
+    /// back-pressure rather than an error. Each cap implies its own interest
+    /// bit, so gating on it loses no wakeup.
     pub(crate) fn at_capacity(&self) -> bool {
-        self.inbox.in_flight() >= MAX_IN_FLIGHT || self.transport.queued_bytes() >= MAX_QUEUED_BYTES
+        self.cap_hit().is_some()
+    }
+
+    /// The cap [`Self::submit`] refuses on that is reached, if any.
+    fn cap_hit(&self) -> Option<Cap> {
+        if self.inbox.in_flight() >= MAX_IN_FLIGHT {
+            Some(Cap::InFlight)
+        } else if self.transport.queued_bytes() >= MAX_QUEUED_BYTES {
+            Some(Cap::QueuedBytes)
+        } else {
+            None
+        }
     }
 
     /// `READ` while any request is unanswered; `WRITE` while bytes remain queued

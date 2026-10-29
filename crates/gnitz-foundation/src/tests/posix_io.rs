@@ -41,6 +41,7 @@ fn fsync_dir_syncs_a_directory_and_refuses_a_missing_one() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn rename_noreplace_moves_a_directory_and_refuses_to_replace_one() {
     let root = tempfile::tempdir().unwrap();

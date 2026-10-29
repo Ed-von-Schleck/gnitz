@@ -40,7 +40,7 @@ impl WireRows<'_> {
     /// Rows the block holds; never zero.
     pub fn rows(&self) -> usize {
         match self.selection {
-            Selection::Whole => self.batch.count,
+            Selection::Whole => self.batch.len(),
             Selection::Range { rows, .. } => rows,
             Selection::Listed { rows, .. } => rows.len(),
         }
@@ -57,12 +57,12 @@ impl WireRows<'_> {
         match self.selection {
             Selection::Whole => {
                 b.debug_verify_dead_heap();
-                wal::write_block(&b.wire_regions(), b.dead_heap, out)
+                wal::write_block(&b.wire_regions(), b.dead_heap(), out)
             }
             Selection::Range { start, rows } => b
                 .encode_relocating(rows, self.heap, out, true, |writer| {
                     // An empty heap is carried: its cells name no byte of it.
-                    let heap_at = b.blob.is_empty().then_some(0);
+                    let heap_at = b.blob().is_empty().then_some(0);
                     copy_ranges(&b.as_mem_batch(), heap_at, &[(start, start + rows)], writer);
                 })
                 .expect("a sized range fits the bytes its size reserved"),
@@ -84,24 +84,24 @@ impl Batch {
     /// one row, however wide, and `None` once no row remains. The whole batch,
     /// when it fits, goes over its heap as it stands.
     pub fn wire_rows_within(&self, start: usize, budget: usize) -> Option<WireRows<'_>> {
-        if start == self.count {
+        if start == self.len() {
             return None;
         }
         let whole = WireRows {
             batch: self,
             selection: Selection::Whole,
-            heap: self.blob.len(),
+            heap: self.blob().len(),
         };
         if start == 0 && whole.byte_size() <= budget {
             return Some(whole);
         }
         let (rows, heap) = match self.heap_referencing_slots() {
             0 => (
-                (self.count - start)
+                (self.len() - start)
                     .min((budget.saturating_sub(wal::WAL_HEADER_SIZE) / self.schema().row_width()).max(1)),
                 0,
             ),
-            slots => self.rows_with_heap(start..self.count, slots, budget),
+            slots => self.rows_with_heap(start..self.len(), slots, budget),
         };
         let out = WireRows {
             batch: self,
@@ -124,7 +124,7 @@ impl Batch {
         if indices.is_empty() {
             return None;
         }
-        if indices.len() == self.count && indices.iter().zip(0..).all(|(&row, at)| row == at) {
+        if indices.len() == self.len() && indices.iter().zip(0..).all(|(&row, at)| row == at) {
             return self.wire_whole();
         }
         let slots = self.heap_referencing_slots();
@@ -133,7 +133,7 @@ impl Batch {
             .flat_map(|row| self.long_spans(row, slots))
             .map(|span| span.len())
             .sum();
-        let dedup = copied > self.blob.len();
+        let dedup = copied > self.blob().len();
         let heap = match dedup {
             true => self.rows_with_heap(rows(), slots, usize::MAX).1,
             false => copied,
@@ -147,7 +147,7 @@ impl Batch {
 
     /// Payload slots whose cells can reference this batch's heap.
     fn heap_referencing_slots(&self) -> u64 {
-        if self.blob.is_empty() {
+        if self.blob().is_empty() {
             0
         } else {
             self.schema().string_payload_slots()
@@ -158,7 +158,7 @@ impl Batch {
     /// `slots`: the spans a relocation of the row copies.
     fn long_spans(&self, row: usize, slots: u64) -> impl Iterator<Item = Range<usize>> + '_ {
         gnitz_wire::BitIter(slots)
-            .filter_map(move |pi| gnitz_wire::german_string_heap(self.german_cell(row, pi), self.blob.len()))
+            .filter_map(move |pi| gnitz_wire::german_string_heap(self.german_cell(row, pi), self.blob().len()))
     }
 
     /// How many of `rows`, from the front, fit `budget` once the heap bytes they
@@ -186,7 +186,7 @@ impl Batch {
     fn row_heap_cost(&self, row: usize, slots: u64, seen: &mut BlobCache) -> usize {
         let mut cost = 0;
         for span in self.long_spans(row, slots) {
-            let content = &self.blob[span];
+            let content = &self.blob()[span];
             if seen.map().insert(blob_span_key(content), 0).is_none() {
                 cost += content.len();
             }
@@ -200,7 +200,7 @@ impl Batch {
         for r in 0..self.schema().num_fixed_regions() {
             out.push(self.region(r));
         }
-        out.push(&self.blob);
+        out.push(self.blob());
         out
     }
 
@@ -263,16 +263,16 @@ impl Batch {
             return None;
         }
         // Every row, ascending, is the batch itself: framed whole, heap as it is.
-        if indices.len() == self.count {
+        if indices.len() == self.len() {
             if let Some(whole) = self.wire_whole().filter(|w| w.byte_size() <= out.len()) {
-                return Some((self.count, whole.encode(out)));
+                return Some((self.len(), whole.encode(out)));
             }
         }
         let slots = self.heap_referencing_slots();
         // A heap-free block fits by width alone, and the sizing pass is skipped
         // when the source's whole heap fits too.
-        if slots == 0 || wal::WAL_HEADER_SIZE + rows.len() * width + self.blob.len() <= out.len() {
-            let heap = prorated_blob_cap(self.blob.len(), self.count, rows.len());
+        if slots == 0 || wal::WAL_HEADER_SIZE + rows.len() * width + self.blob().len() <= out.len() {
+            let heap = prorated_blob_cap(self.blob().len(), self.len(), rows.len());
             if let Some(len) = self.encode_listed(rows, heap, out, true) {
                 return Some((rows.len(), len));
             }

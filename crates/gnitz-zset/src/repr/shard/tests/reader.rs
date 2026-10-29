@@ -119,7 +119,7 @@ fn rows_of(src: &impl ColumnarSource, schema: &SchemaDescriptor) -> Vec<RowImage
 /// heap than the shard's.
 fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
     let schema = want.schema();
-    let n = want.count;
+    let n = want.len();
     assert_eq!(shard.row_count(), n, "{label}: row count");
     let want_rows = rows_of(&want.as_mem_batch(), schema);
     assert_eq!(rows_of(shard, schema), want_rows, "{label}: per-row");
@@ -138,7 +138,7 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
             let carried = shard.heap().plain().filter(|_| !relocate).map(<[u8]>::len);
             let b = shard.slice_to_owned_batch_with(w.start, w.len(), carried);
             if let Some(heap) = shard.heap().plain().filter(|_| relocate && w.len() == n) {
-                assert!(b.blob.len() <= heap.len(), "{label}: a relocated span copied twice");
+                assert!(b.blob().len() <= heap.len(), "{label}: a relocated span copied twice");
             }
             assert_eq!(
                 rows_of(&b.as_mem_batch(), schema),
@@ -739,7 +739,7 @@ fn the_directory_reads_without_a_schema() {
     for (s, path) in written_shapes(dir.path()) {
         let image = std::fs::read(&path).unwrap();
         let d = ShardDirectory::read(&path).unwrap();
-        assert_eq!(d.rows, s.written.count, "{}", s.label);
+        assert_eq!(d.rows, s.written.len(), "{}", s.label);
         assert!(!d.skeleton, "{}", s.label);
         let npc = s.written.schema().num_payload_cols();
         assert_eq!(d.regions.len(), num_regions(npc) + 1, "{}", s.label);
@@ -771,6 +771,35 @@ fn the_directory_reads_without_a_schema() {
         ShardDirectory::read(&path).err(),
         Some(StorageError::Corrupt("shorter than its directory"))
     );
+}
+
+/// The schema-free directory read refuses a heap or a PK filter the open
+/// refuses, with the same verdict.
+#[test]
+fn the_directory_refuses_the_heap_and_filter_the_open_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let path = small_shard(dir.path(), 10, 100);
+    let base = std::fs::read(&path).unwrap();
+    let filter = num_regions(schema.num_payload_cols());
+    let blob = filter - 1;
+    let xoff = spans_of(&base)[filter].off;
+
+    type Forge = Box<dyn Fn(&mut Vec<u8>)>;
+    let encoding = |region: usize, enc: Encoding| -> Forge {
+        Box::new(move |d| patch_entry(d, region, |e| e.encoding = enc as u8))
+    };
+    let cases: [(Forge, &str); 4] = [
+        (Box::new(move |d| d[xoff + 12] ^= 0x01), "filter descriptor"),
+        (encoding(blob, Encoding::Symbols), "region size"),
+        (encoding(blob, Encoding::For), "encoding"),
+        (encoding(filter, Encoding::Constant), "encoding"),
+    ];
+    for (forge, verdict) in cases {
+        let opened = open_patched_restamped(&path, &schema, &base, |d| forge(d));
+        assert_eq!(opened.err(), Some(StorageError::Corrupt(verdict)));
+        assert_eq!(ShardDirectory::read(&path).err(), Some(StorageError::Corrupt(verdict)));
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -922,23 +951,19 @@ fn slice_relocates_only_its_own_strings() {
     assert_eq!(shard.heap().plain().map(<[u8]>::len), Some(N * W));
 
     let one = shard.slice_to_owned_batch(37, 1);
-    assert_eq!(one.blob.len(), W, "a one-row slice carries one string");
+    assert_eq!(one.blob().len(), W, "a one-row slice carries one string");
 
     let under = shard.slice_to_owned_batch(0, CUT - 1);
-    assert_eq!((under.blob.len(), under.dead_heap), ((CUT - 1) * W, 0), "relocates");
+    assert_eq!((under.blob().len(), under.dead_heap()), ((CUT - 1) * W, 0), "relocates");
 
     let at = shard.slice_to_owned_batch(0, CUT);
     assert_eq!(
-        (at.blob.len(), at.dead_heap),
+        (at.blob().len(), at.dead_heap()),
         (N * W, (N - CUT) * W),
         "at the cut the whole region is copied, the rows left out charged dead"
     );
     let full = shard.slice_to_owned_batch(0, N);
-    assert_eq!(
-        Some(full.blob.as_slice()),
-        shard.heap().plain(),
-        "whole shard: verbatim"
-    );
+    assert_eq!(Some(full.blob()), shard.heap().plain(), "whole shard: verbatim");
 }
 
 // -----------------------------------------------------------------------

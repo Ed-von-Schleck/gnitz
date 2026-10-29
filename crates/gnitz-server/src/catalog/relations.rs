@@ -10,6 +10,7 @@
 
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
+use std::num::NonZeroU64;
 use std::rc::Rc;
 
 use gnitz_store::relation::Relation;
@@ -34,14 +35,22 @@ pub(in crate::catalog) struct RelationEntry {
     pub(in crate::catalog) fks: Vec<FkEdge>,
     /// [`gnitz_wire::TableProps::serial`].
     pub(in crate::catalog) serial: bool,
-    /// The token of [`CatalogEngine::resolve_answer`], computed on first use; `0` until then.
-    /// Reset by every hook of a family that can change a RESOLVE answer.
-    pub(in crate::catalog) token: Cell<u64>,
+    /// The token of [`CatalogEngine::resolve_answer`], once computed. Reset by
+    /// every hook of a family that can change a RESOLVE answer.
+    pub(in crate::catalog) token: Cell<Option<NonZeroU64>>,
+    /// See [`CatalogEngine::registration`]; set by [`CatalogCacheSet::enter`].
+    registration: u64,
 }
 
 impl RelationEntry {
     pub(in crate::catalog) fn new(record: Rc<[u8]>, fks: Vec<FkEdge>, serial: bool) -> Self {
-        RelationEntry { record, fks, serial, token: Cell::new(0) }
+        RelationEntry {
+            record,
+            fks,
+            serial,
+            token: Cell::new(None),
+            registration: 0,
+        }
     }
 }
 
@@ -56,6 +65,13 @@ impl CatalogEngine {
             .relations
             .get(&tid)
             .expect("every registered relation has an entry")
+    }
+
+    /// This process's serial number of the registration that entered `tid`:
+    /// distinct for every registration, so a relation dropped and created again
+    /// under its id has a new one. `None` for an unregistered id.
+    pub(crate) fn registration(&self, tid: u64) -> Option<u64> {
+        self.caches.relations.get(&tid).map(|e| e.registration)
     }
 
     /// `tid`'s relation and its named record; `None` for an unregistered id.
@@ -79,8 +95,7 @@ impl CatalogEngine {
     /// and its descriptor token. `None` for an unregistered id.
     ///
     /// The token digests the relation's qualified name and the other two, so it
-    /// changes exactly when a RESOLVE of that name would answer differently. It is
-    /// never `0`.
+    /// changes exactly when a RESOLVE of that name would answer differently.
     pub(crate) fn resolve_answer(&self, tid: u64) -> Option<(Vec<u8>, Rc<[u8]>, u64)> {
         let rel = self.registry.relation(tid)?;
         let entry = self.relation_entry(tid);
@@ -98,14 +113,17 @@ impl CatalogEngine {
                 .collect(),
         };
         let desc = desc.encode();
-        if entry.token.get() == 0 {
+        let token = entry.token.get().unwrap_or_else(|| {
             let mut h = gnitz_wire::ChecksumStream::default();
             h.update(self.qualified_name(tid).as_bytes());
             h.update(&desc);
             h.update(&entry.record);
-            entry.token.set(h.digest() | 1);
-        }
-        Some((desc, entry.record.clone(), entry.token.get()))
+            // The wire reserves `0` for a request built from no RESOLVE.
+            let token = NonZeroU64::MIN | h.digest();
+            entry.token.set(Some(token));
+            token
+        });
+        Some((desc, entry.record.clone(), token.get()))
     }
 
     /// Refuse a request built under `token` once `tid` answers a RESOLVE
@@ -115,8 +133,9 @@ impl CatalogEngine {
             return Ok(());
         }
         let current = match self.caches.relations.get(&tid).map(|e| e.token.get()) {
-            Some(0) => self.resolve_answer(tid).map(|(_, _, t)| t),
-            t => t,
+            Some(Some(t)) => Some(t.get()),
+            Some(None) => self.resolve_answer(tid).map(|(_, _, t)| t),
+            None => None,
         };
         if current == Some(token) {
             return Ok(());
@@ -136,11 +155,16 @@ pub(in crate::catalog) struct CatalogCacheSet {
     pub(in crate::catalog) relations: FxHashMap<u64, RelationEntry>,
     /// Every [`RelationEntry::fks`] edge, keyed by its parent.
     fk_by_parent: FxHashMap<u64, Vec<FkEdge>>,
+    /// The registrations entered so far.
+    registrations: u64,
 }
 
 impl CatalogCacheSet {
-    /// Enter registered relation `id`'s entry, and index its FK edges by parent.
-    pub(in crate::catalog) fn enter(&mut self, id: u64, entry: RelationEntry) {
+    /// Enter registered relation `id`'s entry under the next registration
+    /// serial, and index its FK edges by parent.
+    pub(in crate::catalog) fn enter(&mut self, id: u64, mut entry: RelationEntry) {
+        self.registrations += 1;
+        entry.registration = self.registrations;
         for e in &entry.fks {
             self.fk_by_parent.entry(e.parent_tid).or_default().push(*e);
         }

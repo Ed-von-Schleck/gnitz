@@ -1,8 +1,9 @@
-//! How one committer batch is drained off the request channel. The SAL layout and
-//! the checkpoint sequence need a live dispatcher and worker ACKs, so they are
-//! covered end to end.
+//! How one committer batch is drained off the request channel, and how a pause
+//! is released. The SAL layout and the checkpoint sequence need a live
+//! dispatcher and worker ACKs, so they are covered end to end.
 
 use super::*;
+use crate::runtime::test_support::try_poll_once;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64};
 use gnitz_wire::WireConflictMode;
 
@@ -46,11 +47,18 @@ fn backup() -> CommitRequest {
     CommitRequest::End(BatchEnd::Backup { dir: "dir".to_string(), done })
 }
 
+fn pause() -> CommitRequest {
+    let (parked, _rx) = oneshot::channel();
+    let (_tx, resume) = oneshot::channel();
+    CommitRequest::End(BatchEnd::Pause { parked, resume })
+}
+
 fn end_label(end: &Option<BatchEnd>) -> Option<&'static str> {
     end.as_ref().map(|end| match end {
         BatchEnd::Barrier(_) => "barrier",
         BatchEnd::Checkpoint(_) => "checkpoint",
         BatchEnd::Backup { .. } => "backup",
+        BatchEnd::Pause { .. } => "pause",
     })
 }
 
@@ -75,6 +83,7 @@ fn a_batch_ends_at_the_row_cap_or_an_end_request() {
             vec![push_of(1), push_of(1), backup(), push_of(1)],
             (2, Some("backup"), 1),
         ),
+        (vec![push_of(1), pause(), push_of(1)], (1, Some("pause"), 1)),
     ];
     for (i, (queued, want)) in cases.into_iter().enumerate() {
         let (tx, mut rx) = chan::unbounded();
@@ -87,4 +96,31 @@ fn a_batch_ends_at_the_row_cap_or_an_end_request() {
         let got = (b.writes.len(), end_label(&b.end), left);
         assert_eq!(got, want, "case {i}");
     }
+}
+
+/// A pause holds the committer until its token drops, or until its caller is
+/// dropped before the committer parked.
+#[test]
+fn a_pause_resumes_the_committer_when_released() {
+    let (committer, CommitRequests(mut rx)) = Committer::new();
+    let mut take_pause = || match rx.try_recv() {
+        Some(CommitRequest::End(BatchEnd::Pause { parked, resume })) => (parked, resume),
+        _ => panic!("a pause request is queued"),
+    };
+
+    assert!(try_poll_once(committer.pause()).is_none());
+    let (_parked, resume) = take_pause();
+    assert!(
+        try_poll_once(resume).is_some(),
+        "a caller dropped before the park resumes"
+    );
+
+    let mut pausing = std::pin::pin!(committer.pause());
+    assert!(try_poll_once(pausing.as_mut()).is_none());
+    let (parked, mut resume) = take_pause();
+    parked.send(());
+    let paused = try_poll_once(pausing.as_mut()).expect("parked");
+    assert!(try_poll_once(&mut resume).is_none(), "held while the token lives");
+    drop(paused);
+    assert!(try_poll_once(&mut resume).is_some());
 }

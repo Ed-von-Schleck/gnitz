@@ -190,10 +190,7 @@ fn primary_key_precedence() {
     assert_eq!(c.schema.pk_cols(), vec![1]);
     assert_eq!(
         c.fks,
-        vec![
-            Some(FkTarget::SelfTable { col: 1, on_delete: FkAction::Restrict }),
-            None
-        ]
+        [(0, FkTarget::SelfTable { col: 1, on_delete: FkAction::Restrict })].into()
     );
 }
 
@@ -458,6 +455,26 @@ fn a_serial_column_must_be_the_single_column_pk() {
     }
 }
 
+/// A column is nullable unless it says NOT NULL; writing both NULL and NOT NULL,
+/// or NULL on a SERIAL column, is refused.
+#[test]
+fn a_column_declares_its_nullability_once() {
+    let cat = catalog(vec![]);
+    let c = created(
+        &cat,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT NOT NULL, c BIGINT NULL, d BIGINT NOT NULL NOT NULL)",
+    );
+    let nullable: Vec<bool> = c.schema.columns().iter().map(|d| d.is_nullable).collect();
+    assert_eq!(nullable, [false, true, false, true, false]);
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT NULL NOT NULL)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT NOT NULL NULL)",
+        "CREATE TABLE t (id SERIAL NULL PRIMARY KEY)",
+    ] {
+        assert_rejects(sql, plan_table(&cat, sql), "conflicting NULL/NOT NULL declarations");
+    }
+}
+
 /// SERIAL is the table's property, not a column's: the plan carries it on its
 /// props and the column is a plain NOT NULL signed integer.
 #[test]
@@ -486,17 +503,12 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
         TypeCode::I64,
         "widened to the parent's type"
     );
-    assert_eq!(
-        c.fks,
-        vec![
-            None,
-            Some(FkTarget::Table(FkRef {
-                table_id: 41,
-                col: 0,
-                on_delete: FkAction::Restrict
-            }))
-        ]
-    );
+    let want = FkTarget::Table(FkRef {
+        table_id: 41,
+        col: 0,
+        on_delete: FkAction::Restrict,
+    });
+    assert_eq!(c.fks, [(1, want)].into());
     assert_eq!(c.unique_indexes, vec![unique(&[1], &format!("{SN}__c__idx_r"))]);
 
     // A non-PK parent column is a legal target only with a single-column UNIQUE
@@ -521,8 +533,8 @@ fn an_fk_carries_its_on_delete_action() {
         (" ON DELETE RESTRICT", FkAction::Restrict),
         (" ON DELETE CASCADE", FkAction::Cascade),
     ] {
-        let to_p = Some(FkTarget::Table(FkRef { table_id: 41, col: 0, on_delete }));
-        let to_self = Some(FkTarget::SelfTable { col: 0, on_delete });
+        let to_p = FkTarget::Table(FkRef { table_id: 41, col: 0, on_delete });
+        let to_self = FkTarget::SelfTable { col: 0, on_delete };
         for (sql, want) in [
             (
                 format!("CREATE TABLE c (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id){clause})"),
@@ -541,7 +553,7 @@ fn an_fk_carries_its_on_delete_action() {
                 to_self,
             ),
         ] {
-            assert_eq!(created(&cat, &sql).fks, vec![None, want], "{sql}");
+            assert_eq!(created(&cat, &sql).fks, [(1, want)].into(), "{sql}");
         }
     }
 }
@@ -561,9 +573,8 @@ fn a_self_fk_targets_the_lone_pk_and_adopts_its_type() {
         ("CREATE TABLE tree (id BIGINT PRIMARY KEY REFERENCES tree(id))", 0),
     ] {
         let c = created(&cat, sql);
-        let mut fks = vec![None; c.schema.columns().len()];
-        fks[col_idx] = Some(FkTarget::SelfTable { col: 0, on_delete: FkAction::Restrict });
-        assert_eq!(c.fks, fks, "{sql}");
+        let want = FkTarget::SelfTable { col: 0, on_delete: FkAction::Restrict };
+        assert_eq!(c.fks, [(col_idx, want)].into(), "{sql}");
         assert_eq!(c.schema.columns()[col_idx].ty.tc, TypeCode::I64, "{sql}");
     }
     for (sql, needle) in [
@@ -771,7 +782,7 @@ fn a_schema_qualifier_names_the_schema_rather_than_being_dropped() {
             }),
         ),
     ] {
-        assert_eq!(created(&cat, sql).fks[1], Some(want), "`{sql}`");
+        assert_eq!(created(&cat, sql).fks.get(&1), Some(&want), "`{sql}`");
     }
     for (sql, needle) in [
         // An unqualified parent is the session's, whatever schema the child is in.

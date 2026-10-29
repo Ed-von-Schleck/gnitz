@@ -78,7 +78,7 @@ fn a_two_way_sum_charges_exactly_the_dropped_rows() {
         assert_folds(&[a.clone(), b.clone()], &out, "merge");
         out.debug_verify_dead_heap();
         assert_eq!(
-            (out.dead_heap, out.blob().len()),
+            (out.dead_heap(), out.blob().len()),
             (dead, a.blob().len() + b.blob().len()),
             "{b_rows:?}"
         );

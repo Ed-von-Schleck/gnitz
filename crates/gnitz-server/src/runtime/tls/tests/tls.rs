@@ -1,6 +1,6 @@
 //! Unit tests for what is specific to TLS: what a listener serves, the minted
 //! identity kept in the data directory, the reload, and driving the
-//! connection's `RecvQueue` from rustls's `fill_buf` across record boundaries
+//! connection's `FrameSink` from rustls's `fill_buf` across record boundaries
 //! and awkward socket-chunk splits. The policy the queue owns — the per-frame
 //! ceiling, the inbound charge, the zero-length prefix — is covered once, on
 //! the fd path, in `reactor::tests`; what `TlsArgs::resolve` refuses is
@@ -18,7 +18,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 
 use super::config::{TLS_CERT_FILE, TLS_KEY_FILE};
 use super::*;
-use crate::runtime::reactor::test_support::{accepted_pair, admitted_recv_queue, make_reactor, poll_until};
+use crate::runtime::reactor::test_support::{accepted_pair, admitted_frame_sink, make_reactor, poll_until};
 use crate::runtime::test_support::read_nonblocking;
 use gnitz_wire::framed;
 
@@ -231,11 +231,12 @@ fn frames_deframe_in_order_under_any_split_until_close_notify() {
             client.writer().write_all(&framed(f)).unwrap();
         }
         client.send_close_notify();
-        let mut q = admitted_recv_queue();
+        let mut q = admitted_frame_sink();
+        let mut deframer = Deframer::default();
 
         let ends: Vec<_> = ciphertext(&mut client)
             .chunks(chunk)
-            .map(|c| ingest_cipher(&mut server, c, &mut q))
+            .map(|c| ingest_cipher(&mut server, c, &mut deframer, &mut q))
             .collect();
         let (last, rest) = ends.split_last().unwrap();
         assert!(

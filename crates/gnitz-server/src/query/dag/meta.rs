@@ -114,8 +114,9 @@ impl DepMap {
 impl DagEngine {
     /// One [`Step`] per dependency edge out of `source_id`'s forward closure, in
     /// execution order, skipping non-resumable views: their backfill fills them.
-    /// The skipped set is closed under dependents, so no step reads a skipped
-    /// producer. Worker-identical, which keeps the workers in lockstep.
+    /// The skipped set is closed under dependents (`rebuilt_with` closes it,
+    /// `backfill` keeps it so), so no step reads a skipped producer.
+    /// Worker-identical, which keeps the workers in lockstep.
     pub(super) fn tick_schedule(&mut self, source_id: u64) -> Rc<[Step]> {
         let steps = self.dep.tick_steps(source_id);
         match self.rebuild.is_empty() {

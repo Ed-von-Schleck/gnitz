@@ -272,11 +272,8 @@ fn test_edge_cases() {
 }
 
 // ── test_nonempty_schema_drop_rejected ───────────────────────────────────
-// The engine-side guard in precheck_family rejects a raw SCHEMA_TAB -1 on a
-// non-empty schema BEFORE any WAL write, so a member is never orphaned. Every
-// DROP SCHEMA empties the schema first — the client's cascade in production, the
-// fixture's member loop here — so this bare guard is reachable only by a direct
-// retraction, driven here to prove the rejection is loud and orphans nothing.
+// precheck_family refuses a bare SCHEMA_TAB -1 on a non-empty schema before
+// anything is written; a DROP SCHEMA cascade never sends one.
 
 #[test]
 fn test_nonempty_schema_drop_rejected() {
@@ -667,14 +664,10 @@ fn dropped_name_resolves_to_its_recreation() {
 }
 
 // ── replicated_bit_is_transitive_and_survives_replay ─────────────────
-// A view is replicated iff every source it scans is, so the property
-// climbs a view chain: base → producer → consumer. Registration reads its
-// sources' already-registered state, so `hook_relation_register` must process a batch
-// in dependency order — which neither order it sees is. Both are reproduced here:
-// the live batch carries the consumer before the producer, and replay walks
-// VIEW_TAB in PK order, in which the consumer's id is the LOWER one (a chain's
-// user-named view is minted before its body is bound). Get it wrong and the
-// consumer stamps `false`, flipping its store to Hashed across a restart.
+// A view is replicated iff every source it scans is, so the property climbs a
+// view chain: base → producer → consumer. The live batch carries the consumer's
+// row before the producer's; the register hook registers in id order, which
+// ascends along scan edges. Replay must reproduce the same placements.
 #[test]
 fn replicated_bit_is_transitive_and_survives_replay() {
     let dir = temp_dir("replicated_bit_transitive");
@@ -698,7 +691,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     // A partitioned base table, for the negative direction.
     let pt = engine.create_table("public.pt", &cols, &[0]).unwrap();
 
-    // Ids ascend along scan edges, as the DDL precheck requires.
+    // Ids ascend along scan edges, as view registration requires.
     let r_producer = engine.allocate_ids(1).unwrap();
     let r_consumer = engine.allocate_ids(1).unwrap();
     let p_producer = engine.allocate_ids(1).unwrap();
@@ -760,17 +753,8 @@ fn replicated_bit_is_transitive_and_survives_replay() {
 // Delta feeds (`WITH (delta = …)`)
 // ---------------------------------------------------------------------------
 
-/// `capacity` and `delta` are refused **together**, here as well as at the SQL
-/// layer. This is the trust boundary: driven from a registration the SQL planner
-/// cannot produce, so a test that only went through SQL would pass with the rule
-/// absent.
-///
-/// The reason is not cost and not effort. A bounded view's read hydrates its
-/// missing keys from the *source relation's live store*, which a push
-/// advances outside any tick — so a `Delta(0)` over a partly-dehydrated view
-/// reports round `T` while already carrying an un-ticked push, and the next poll
-/// delivers that same push again as round `T+1`, at double weight, with no error
-/// and no row-set difference.
+/// A registration naming both `capacity` and `delta` is refused by the engine,
+/// below the SQL layer (`ViewBudget::from_row`).
 #[test]
 fn a_view_declaring_both_capacity_and_delta_is_rejected() {
     let mut engine = fresh("capacity_and_delta_together");

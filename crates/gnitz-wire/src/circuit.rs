@@ -181,7 +181,8 @@ pub enum OpNode {
     WeightClamp(ClampKind),
     /// Over no group columns, behind an `ExchangeShard` it aggregates the whole
     /// relation and owes one row over an empty input; with no exchange it
-    /// aggregates each worker's slice and owes none. Carries a `Count`.
+    /// aggregates each worker's slice and owes none. Carries a `Count`; a
+    /// reduce without one is refused.
     Reduce(GroupAggs),
     /// The bilinear join of SQL sides A and B over slots `[ΔA, ΔB, iA, iB]`:
     /// `ΔA ⋈ z⁻¹(I(iB)) + ΔB ⋈ z⁻¹(I(iA))`, written `[key, A payload…, B
@@ -281,6 +282,10 @@ impl OpNode {
             // An empty list hashes no bytes, collapsing every row onto one PK.
             OpNode::Map(MapKind::HashRow { cols }) if cols.is_empty() => {
                 return Err("a hash-row map names no columns".into());
+            }
+            // The engine reads whether a group exists from its count.
+            OpNode::Reduce(g) if !g.aggs.iter().any(|d| d.agg_op == crate::AggFunc::Count) => {
+                return Err("a reduce carries no COUNT(*)".into());
             }
             _ => {}
         }

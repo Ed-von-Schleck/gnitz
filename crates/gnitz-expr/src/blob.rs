@@ -424,7 +424,7 @@ impl LogicalProgram {
     pub fn to_blob_bytes(&self) -> Vec<u8> {
         encode_expr_blob(
             self.instrs().iter().copied().map(LogicalInstr::to_wire),
-            self.sinks.iter().copied().map(Sink::to_wire),
+            self.sinks().iter().copied().map(Sink::to_wire),
             self.const_strings(),
         )
     }

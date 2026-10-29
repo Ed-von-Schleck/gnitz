@@ -58,13 +58,13 @@ fn a_program_round_trips_through_its_blob() {
     let back = LogicalProgram::from_blob(&prog.to_blob_bytes()).expect("its own blob decodes");
     assert_eq!(back.instrs(), instrs.as_slice());
     assert_eq!(back.const_strings(), pool.as_slice());
-    assert_eq!(back.sinks, vec![Sink::Reg(Reg(1))]);
+    assert_eq!(back.sinks(), [Sink::Reg(Reg(1))]);
 
     // The degenerate program is a valid one, not an absence.
     let empty = LogicalProgram::new(Vec::new(), Vec::new(), Vec::new()).unwrap();
     let back = LogicalProgram::from_blob(&empty.to_blob_bytes()).expect("a valid empty program decodes");
     assert!(back.instrs().is_empty() && back.const_strings().is_empty());
-    assert!(back.sinks.is_empty());
+    assert!(back.sinks().is_empty());
 }
 
 /// The blob layout and the opcode vocabulary, pinned to the version word.

@@ -27,8 +27,8 @@ use gnitz_core::{ClientError, GnitzClient, PkColumn, ProtocolError, RelDescripto
 use gnitz_wire::{FixedInt, ReadBound, RelClass, WireConflictMode};
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
-    ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query, SetExpr,
-    TableObject, Values,
+    ConflictTarget, DoUpdate, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query,
+    SelectItem, SetExpr, TableObject, Values,
 };
 
 /// What an INSERT does about a key already held. The conflict target is
@@ -127,31 +127,32 @@ fn serial_col(target: &RelDescriptor) -> Option<usize> {
     target.schema.layout().lone_pk_col().filter(|_| target.serial)
 }
 
-/// Reject every `Insert`-statement clause the INSERT planner does not consume. It reads only
-/// `table`, `source`, `columns`, `on` (ON CONFLICT) and `returning`; every other field is a
-/// conflict / overwrite / partition clause parsed under `GenericDialect` and
-/// silently reinterpreted as a plain append. The `source` is a full `Query` whose envelope (LIMIT,
-/// ORDER BY, FETCH, a `WITH`, …) an INSERT equally cannot honor, so it is routed through
-/// `reject_unhonored_query_clauses` here too.
-///
-/// Exhaustive destructure (no `..`): a future `sqlparser` `Insert` field stops the build here.
-fn reject_unhonored_insert_clauses(insert: &sqlparser::ast::Insert) -> Result<(), GnitzSqlError> {
+/// The `Insert` fields [`plan_insert`] reads.
+struct InsertClauses<'a> {
+    table: &'a TableObject,
+    source: Option<&'a Query>,
+    columns: &'a [ObjectName],
+    on: Option<&'a OnInsert>,
+    returning: Option<&'a [SelectItem]>,
+}
+
+/// Reject every `Insert` clause the INSERT planner does not consume, and hand
+/// back the ones it does. Each rejected one would otherwise be read as a plain
+/// append. The `source` is a full `Query`, whose envelope an INSERT honors none of.
+fn reject_unhonored_insert_clauses(insert: &Insert) -> Result<InsertClauses<'_>, GnitzSqlError> {
     const CTX: &str = "INSERT";
-    let sqlparser::ast::Insert {
-        // Consumed by `plan_insert`; `source`'s `Query` envelope is additionally checked below.
-        table: _,
+    let Insert {
+        table,
         source,
-        columns: _,
-        on: _,
+        columns,
+        on,
+        returning,
         // Inert keyword markers (`INTO` / `TABLE`, the `INSERT` token) and
         // advisory-only comment hints: positional flags, no droppable semantics.
         into: _,
         has_table_keyword: _,
         insert_token: _,
         optimizer_hints: _,
-        // Consumed by `plan_insert`: INSERT ... RETURNING is supported (projected
-        // client-side from the just-built batch).
-        returning: _,
         // Rejected: each is a clause the engine does not implement.
         or,
         ignore,
@@ -193,41 +194,34 @@ fn reject_unhonored_insert_clauses(insert: &sqlparser::ast::Insert) -> Result<()
         CTX,
         "multi-table INSERT (ALL/FIRST)",
     )?;
-    // The `source` is a full `Query`; an INSERT honors no envelope clause on it (LIMIT/OFFSET,
-    // ORDER BY, FETCH, FOR UPDATE/SHARE, SETTINGS, FORMAT, a `WITH`). Route it through the shared
-    // `Query` guard so a dropped envelope clause is a clean error, not a silent full-table insert.
     if let Some(src) = source {
         reject_unhonored_query_clauses(src, QueryEnvelope::Bare, CTX)?;
     }
-    Ok(())
+    Ok(InsertClauses {
+        table,
+        source: source.as_deref(),
+        columns,
+        on: on.as_ref(),
+        returning: returning.as_deref(),
+    })
 }
 
 pub(crate) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<InsertPlan, GnitzSqlError> {
-    reject_unhonored_insert_clauses(insert)?;
-    let table_name = match &insert.table {
+    let InsertClauses { table, source, columns, on, returning } = reject_unhonored_insert_clauses(insert)?;
+    let table_name = match table {
         TableObject::TableName(obj_name) => extract_object_name(obj_name, cat.schema_name(), "INSERT")?,
         _ => return Err(unsupported_clause("INSERT", "a table function target")),
     };
-    let source = insert
-        .source
-        .as_ref()
-        .ok_or_else(|| GnitzSqlError::Rejected("INSERT without VALUES not supported".to_string()))?;
+    let source = source.ok_or_else(|| GnitzSqlError::Rejected("INSERT without VALUES not supported".to_string()))?;
     let values = extract_values_rows(source)?;
 
     let target = cat.probe_relation(&table_name)?;
     require_class(&target, &table_name, ClassWant::BaseTableOrStream, "INSERT")?;
     let schema = &target.schema;
 
-    // RETURNING is supported on the plain-INSERT path only; capturing the
-    // effective row under ON CONFLICT (which may UPDATE or skip a row) is out of
-    // scope.
-    reject_if(
-        insert.returning.is_some() && insert.on.is_some(),
-        "INSERT … ON CONFLICT",
-        "RETURNING",
-    )?;
+    reject_if(returning.is_some() && on.is_some(), "INSERT … ON CONFLICT", "RETURNING")?;
 
-    let conflict = match insert.on.as_ref() {
+    let conflict = match on {
         None => ConflictPlan::Error,
         Some(OnInsert::DuplicateKeyUpdate(_)) => {
             return Err(GnitzSqlError::Rejected(
@@ -244,14 +238,9 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<InsertPl
 
             match action {
                 OnConflictAction::DoNothing => ConflictPlan::Resolve { set: None },
-                OnConflictAction::DoUpdate(do_update) => {
-                    reject_if(do_update.selection.is_some(), "INSERT … ON CONFLICT DO UPDATE", "WHERE")?;
-                    let set = bind_set_list(
-                        &do_update.assignments,
-                        schema,
-                        table_name.spelled_name(),
-                        SetClause::DoUpdate,
-                    )?;
+                OnConflictAction::DoUpdate(DoUpdate { assignments, selection }) => {
+                    reject_if(selection.is_some(), "INSERT … ON CONFLICT DO UPDATE", "WHERE")?;
+                    let set = bind_set_list(assignments, schema, table_name.spelled_name(), SetClause::DoUpdate)?;
                     ConflictPlan::Resolve { set: Some(set) }
                 }
             }
@@ -262,7 +251,7 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<InsertPl
     };
 
     let serial_ci = serial_col(&target);
-    let slot_of = value_slots(&insert.columns, schema, serial_ci)?;
+    let slot_of = value_slots(columns, schema, serial_ci)?;
     let expected = slot_of.iter().flatten().count();
     // Per PK column in PK-list order, the VALUES slot it reads; a SERIAL key
     // reads none.
@@ -350,9 +339,7 @@ pub(crate) fn plan_insert(insert: &Insert, cat: &dyn Catalog) -> Result<InsertPl
     if let (ConflictPlan::Resolve { set }, None) = (&conflict, serial_ci) {
         rows = first_per_key(rows, set.is_some())?;
     }
-    let returning = insert
-        .returning
-        .as_deref()
+    let returning = returning
         .map(|items| {
             let RowsReply { schema: out_schema, program, .. } =
                 crate::hir::bind_returning(items, &target, table_name.spelled_name())?.reply(&[], true)?;

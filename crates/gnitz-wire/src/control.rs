@@ -78,6 +78,28 @@ impl ControlHeader {
     pub fn target(&self) -> Target {
         Target { tid: self.target_id, token: self.arg1 }
     }
+
+    /// Refuses a header no client writes: a status other than `Ok`, a flag
+    /// only the engine sets, or a conflict mode where `pushes` is false.
+    pub(crate) fn check_client_authored(&self, pushes: bool) -> Result<(), &'static str> {
+        let WireFlags {
+            conflict_mode,
+            continuation,
+            scan_last,
+            lane,
+            ..
+        } = self.flags;
+        if self.status != WireStatus::Ok {
+            return Err("a request carries a status");
+        }
+        if continuation || scan_last || lane != WireLane::Reply {
+            return Err("a request sets a flag only a reply carries");
+        }
+        if !pushes && conflict_mode != WireConflictMode::default() {
+            return Err("a conflict mode on a request that pushes nothing");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -95,16 +117,22 @@ pub struct DecodedControl {
 }
 
 impl DecodedControl {
-    /// The verb a client frame names, refusing a section that verb does not
-    /// carry.
+    /// The verb a client frame names, refusing a header no client writes and
+    /// a section or prologue word that verb does not carry. A multi-item
+    /// frame's items are checked as they are decoded.
     pub fn client_verb(&self) -> Result<ClientVerb, &'static str> {
-        let verb = self.hdr.flags.verb;
+        let hdr = &self.hdr;
+        let verb = hdr.flags.verb;
+        hdr.check_client_authored(verb == ClientVerb::Push)?;
         if self.data.is_some() && verb != ClientVerb::Push {
             return Err("frame carries a data block on a verb other than PUSH");
         }
         let items = crate::txn_frame::item_shape(verb).is_some();
-        if items && (!self.blob.is_empty() || self.schema.is_some() || self.hdr.target_id != 0) {
+        if items && (!self.blob.is_empty() || self.schema.is_some() || hdr.target_id != 0) {
             return Err("a multi-item frame carries nothing but its items");
+        }
+        if items && (hdr.arg1 != 0 || hdr.arg0 != 0 && verb != ClientVerb::DeltaPoll) {
+            return Err("a multi-item prologue sets an argument its verb does not read");
         }
         if !items && !self.body.is_empty() {
             return Err("frame carries bytes past its last section");
@@ -311,6 +339,9 @@ wire_enum! {
 ///
 /// Bits 32/33 say which sections follow the blob; the frame codec sets and reads
 /// them, so `pack` leaves them clear and `unpack` ignores them.
+///
+/// A request sets `verb` and, on a push, `conflict_mode`; the other fields are
+/// a reply's, and [`DecodedControl::client_verb`] refuses a request setting one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WireFlags {
     /// Bits 0-7.
@@ -320,7 +351,6 @@ pub struct WireFlags {
     /// Bit 34: more frames of this reply follow. Set on every per-worker reply
     /// frame, absent on the master's terminal frame.
     pub continuation: bool,
-    // Engine-authored.
     /// Bit 35: a worker's last frame of a train.
     pub scan_last: bool,
     /// Bits 38-39.
@@ -390,9 +420,7 @@ wire_enum! {
     /// Conflict-resolution mode a PUSH carries in [`WireFlags::conflict_mode`].
     #[derive(Default)]
     pub enum WireConflictMode: u8 {
-        /// Retract-and-insert on PK conflict. Used for SQL `UPDATE`,
-        /// `INSERT ... ON CONFLICT ... DO UPDATE` (after client-side
-        /// merging), and explicit Python `push(mode="update")`.
+        /// Retract-and-insert on PK conflict.
         #[default]
         Update = 0,
         /// Reject the batch on any PK conflict. The master runs both an

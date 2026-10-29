@@ -4,7 +4,7 @@
 use super::*;
 use crate::test_support::{
     decode_wal_block, delta_frame, delta_terminal, kv_rows, kv_schema, pushed_marker, pushed_train, reply_ctrl,
-    reply_rows, reply_status, session_pair as pair, step_until_idle, sync_answer, sync_header, sync_held, Peer,
+    reply_rows, reply_status, session_pair as pair, step_until_idle, sub_id, sync_answer, sync_header, sync_held, Peer,
 };
 use crate::transport::poll_fd;
 use crate::{BatchAppender, PkColumn};
@@ -450,7 +450,7 @@ fn delta_item(view: u64) -> txn_frame::DeltaPollItem<'static> {
 fn a_poll_that_fails_whole_ends_each_unanswered_view() {
     for refused in [true, false] {
         let (mut s, peer) = pair();
-        s.submit_delta_poll(1, &[delta_item(7), delta_item(8), delta_item(9)]);
+        s.submit_delta_poll(sub_id(1), &[delta_item(7), delta_item(8), delta_item(9)]);
         s.step(Interest::WRITE);
         peer.recv();
         // View 7 is answered; the failure finds 8 and 9 open.
@@ -490,9 +490,9 @@ fn a_poll_that_fails_whole_ends_each_unanswered_view() {
 #[test]
 fn an_abandoned_poll_queues_nothing() {
     let (mut s, peer) = pair();
-    s.submit_delta_poll(1, &[delta_item(7)]);
+    s.submit_delta_poll(sub_id(1), &[delta_item(7)]);
     s.abandon_poll();
-    s.submit_delta_poll(2, &[delta_item(8)]);
+    s.submit_delta_poll(sub_id(2), &[delta_item(8)]);
     s.step(Interest::WRITE);
     let mut wire = Vec::new();
     for tid in [7, 8] {
@@ -628,22 +628,22 @@ fn cursor(tick: u64) -> DeltaCursor {
 }
 
 /// A read of view 40 that keeps it as subscription `id`.
-fn submit_kept_read(s: &mut Session, id: u64) -> Sent<(ScanReply, DeltaCursor)> {
+fn submit_kept_read(s: &mut Session, id: SubId) -> Sent<(ScanReply, DeltaCursor)> {
     s.submit_delta_read(40.into(), None, &schema_a(), &[], Some(id))
 }
 
 /// Subscribe to view 40 as subscription `id`: a kept read, answered here with
 /// no row and round 3.
-fn subscribe_as(s: &mut Session, peer: &Peer, id: u64) {
+fn subscribe_as(s: &mut Session, peer: &Peer, id: SubId) {
     let sent = submit_kept_read(s, id);
     peer.send(&delta_terminal(40, 1, 3));
     assert_eq!(await_reply(s, sent).unwrap().1, cursor(3));
 }
 
 /// [`subscribe_as`] subscription 5; that id.
-fn subscribe(s: &mut Session, peer: &Peer) -> u64 {
-    subscribe_as(s, peer, 5);
-    5
+fn subscribe(s: &mut Session, peer: &Peer) -> SubId {
+    subscribe_as(s, peer, sub_id(5));
+    sub_id(5)
 }
 
 /// A pushed train between two replies is set aside whole for the subscription
@@ -657,7 +657,7 @@ fn a_pushed_train_between_replies_is_set_aside() {
     let second = s.submit(COMMIT);
     let mut bytes = framed(&reply_ctrl(0, 1));
     bytes.extend(pushed_train(40, sub, &batch_a(&[1, 2]), Ok((1, 9))));
-    bytes.extend(pushed_train(40, sub + 1, &batch_a(&[3]), Ok((1, 9))));
+    bytes.extend(pushed_train(40, kept_as(sub, 1), &batch_a(&[3]), Ok((1, 9))));
     bytes.extend(pushed_train(40, sub, &batch_a(&[4]), Ok((1, 11))));
     bytes.extend(framed(&reply_ctrl(0, 2)));
     peer.send_bytes(&bytes);
@@ -667,7 +667,7 @@ fn a_pushed_train_between_replies_is_set_aside() {
     assert_eq!((blocks.len(), next), (2, cursor(11)), "its trains as one, in order");
     let (blocks, next) = s.take_pushed(sub).unwrap();
     assert_eq!((blocks.len(), next), (0, cursor(11)), "handed out once");
-    assert!(s.take_pushed(sub + 1).is_err(), "nobody holds it");
+    assert!(s.take_pushed(kept_as(sub, 1)).is_err(), "nobody holds it");
 }
 
 /// A released subscription parks nothing pushed for it afterwards, so the next
@@ -698,19 +698,19 @@ fn a_released_subscription_parks_no_pushed_train() {
 #[test]
 fn a_kept_reads_terminal_parks_its_cursor() {
     let (mut s, peer) = pair();
-    let sent = submit_kept_read(&mut s, 5);
-    assert!(s.take_pushed(5).is_err(), "unanswered, nothing is held");
+    let sent = submit_kept_read(&mut s, sub_id(5));
+    assert!(s.take_pushed(sub_id(5)).is_err(), "unanswered, nothing is held");
     let mut bytes = framed(&delta_frame(40, Some(&batch_a(&[1, 2])), None));
     bytes.extend(framed(&delta_terminal(40, 1, 9)));
-    bytes.extend(pushed_train(40, 5, &batch_a(&[3]), Ok((1, 11))));
+    bytes.extend(pushed_train(40, sub_id(5), &batch_a(&[3]), Ok((1, 11))));
     peer.send_bytes(&bytes);
     let (reply, at) = await_reply(&mut s, sent).unwrap();
     assert_eq!((reply.batch, at), (batch_a(&[1, 2]), cursor(9)));
-    let synced = s.submit_sync(&[5], Duration::ZERO);
+    let synced = s.submit_sync(&[sub_id(5)], Duration::ZERO);
     assert_eq!(s.requests_sent(), 2, "the server holds one, so the sync is a request");
     peer.send(&sync_answer(None));
     await_reply(&mut s, synced).unwrap();
-    let (blocks, next) = s.take_pushed(5).unwrap();
+    let (blocks, next) = s.take_pushed(sub_id(5)).unwrap();
     assert_eq!(
         (blocks.len(), next),
         (1, cursor(11)),
@@ -724,7 +724,7 @@ fn a_kept_reads_terminal_parks_its_cursor() {
 #[test]
 fn an_abandoned_kept_poll_is_ended_by_the_next_sync() {
     let (mut s, peer) = pair();
-    let first = 3;
+    let first = sub_id(3);
     s.submit_delta_poll(first, &[delta_item(7), delta_item(8)]);
     s.step(Interest::WRITE);
     peer.recv();
@@ -733,17 +733,17 @@ fn an_abandoned_kept_poll_is_ended_by_the_next_sync() {
     s.abandon_poll();
     assert_eq!(s.requests_sent(), 1, "the poll alone");
     let mut bytes = framed(&delta_terminal(8, 1, 9));
-    bytes.extend(pushed_train(8, first + 1, &batch_a(&[1]), Ok((1, 11))));
+    bytes.extend(pushed_train(8, kept_as(first, 1), &batch_a(&[1]), Ok((1, 11))));
     peer.send_bytes(&bytes);
     step_until_idle(&mut s);
     assert!(!s.is_closed());
     assert!(s.take_pushed(first).is_ok(), "answered before its reader went");
-    let gone = s.take_pushed(first + 1).expect_err("answered to nobody");
+    let gone = s.take_pushed(kept_as(first, 1)).expect_err("answered to nobody");
     assert!(gone.to_string().contains("not held"), "{gone:?}");
 
     let synced = s.submit_sync(&[], Duration::from_secs(60));
     s.step(Interest::WRITE);
-    assert_eq!(sync_held(&peer.recv()), [0u64; 0], "no owner named either");
+    assert_eq!(sync_held(&peer.recv()), [], "no owner named either");
     peer.send(&sync_answer(None));
     await_reply(&mut s, synced).unwrap();
     let gone = s.take_pushed(first).expect_err("nobody named it");
@@ -766,10 +766,12 @@ fn a_sync_of_no_subscription_is_no_request() {
 fn a_sync_names_what_is_held_and_ends_the_rest() {
     let (mut s, peer) = pair();
     for id in [5, 6] {
-        subscribe_as(&mut s, &peer, id);
+        subscribe_as(&mut s, &peer, sub_id(id));
     }
     for (held, named) in [(&[5, 6][..], &[5, 6][..]), (&[6, 9], &[6]), (&[], &[])] {
-        let synced = s.submit_sync(held, Duration::ZERO);
+        let held: Vec<SubId> = held.iter().copied().map(sub_id).collect();
+        let named: Vec<SubId> = named.iter().copied().map(sub_id).collect();
+        let synced = s.submit_sync(&held, Duration::ZERO);
         s.step(Interest::WRITE);
         let request = loop {
             let request = peer.recv();
@@ -781,7 +783,7 @@ fn a_sync_names_what_is_held_and_ends_the_rest() {
         peer.send(&sync_answer(None));
         await_reply(&mut s, synced).unwrap();
     }
-    assert!(s.take_pushed(5).is_err() && s.take_pushed(6).is_err());
+    assert!(s.take_pushed(sub_id(5)).is_err() && s.take_pushed(sub_id(6)).is_err());
     let sent = s.requests_sent();
     let synced = s.submit_sync(&[], Duration::ZERO);
     await_reply(&mut s, synced).unwrap();
@@ -903,16 +905,16 @@ fn a_pushed_fault_ends_its_subscription_and_no_request() {
 fn a_refused_kept_read_parks_nothing() {
     for named in [0, 40] {
         let (mut s, peer) = pair();
-        let sent = submit_kept_read(&mut s, 5);
+        let sent = submit_kept_read(&mut s, sub_id(5));
         peer.send(&reply_status(named, WireStatus::DeltaExpired, "refused"));
         let refused = await_reply(&mut s, sent);
         assert!(
             matches!(&refused, Err(e) if e.status() == Some(WireStatus::DeltaExpired)),
             "naming {named}: {refused:?}"
         );
-        let gone = s.take_pushed(5).expect_err("nothing is held");
+        let gone = s.take_pushed(sub_id(5)).expect_err("nothing is held");
         assert!(gone.to_string().contains("not held"), "naming {named}: {gone:?}");
-        let synced = s.submit_sync(&[5], Duration::ZERO);
+        let synced = s.submit_sync(&[sub_id(5)], Duration::ZERO);
         await_reply(&mut s, synced).unwrap();
         assert_eq!(s.requests_sent(), 1, "naming {named}: the read alone");
     }
@@ -924,7 +926,7 @@ fn a_refused_kept_read_parks_nothing() {
 fn a_pushed_train_naming_another_view_ends_the_session() {
     let (mut s, peer) = pair();
     let sent = s.submit(COMMIT);
-    let mut bytes = framed(&pushed_marker(40, 5));
+    let mut bytes = framed(&pushed_marker(40, sub_id(5)));
     bytes.extend(framed(&delta_terminal(41, 1, 9)));
     peer.send_bytes(&bytes);
     assert!(matches!(await_reply(&mut s, sent), Err(ClientError::ConnectionLost(_))));
@@ -932,7 +934,7 @@ fn a_pushed_train_naming_another_view_ends_the_session() {
 }
 
 /// A pushed train opens with a bare head naming its subscription: an opener
-/// carrying anything else ends the session.
+/// carrying anything else, or naming none, ends the session.
 #[test]
 fn a_pushed_train_opener_that_is_not_bare_ends_the_session() {
     let marker = |flags: gnitz_wire::WireFlags, status| ControlHeader {
@@ -959,6 +961,10 @@ fn a_pushed_train_opener_that_is_not_bare_ends_the_session() {
         (
             "a fault",
             encode_frame(marker(bare, WireStatus::Error), b"lagged", None, None),
+        ),
+        (
+            "no subscription",
+            encode_frame(ControlHeader { arg0: 0, ..marker(bare, ok) }, &[], None, None),
         ),
     ] {
         let (mut s, peer) = pair();

@@ -4,6 +4,7 @@
 use super::*;
 
 use crate::runtime::frame::WireMsg;
+use crate::runtime::sal::Cut;
 use gnitz_store::read::KeySpans;
 
 /// One reply this worker owes.
@@ -18,7 +19,7 @@ pub(super) enum Owed {
 
 impl Owed {
     /// The cut of the request it answers.
-    pub(super) fn cut(&self) -> u64 {
+    pub(super) fn cut(&self) -> Cut {
         match self {
             Owed::Parked(route, ..) | Owed::Fault(route, _) | Owed::Train(Train { route, .. }) => route.cut,
         }

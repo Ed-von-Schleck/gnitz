@@ -10,6 +10,7 @@ use std::ops::Range;
 
 use super::codebook::Codebook;
 use crate::repr::seek::{gallop_by, lower_bound_by};
+use crate::repr::PooledBuf;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{
     read_u32_le, read_u64_le, write_u32_le, write_u64_le, CodedHeap, FixedInt, Heap, HeapValue, ScalarKind,
@@ -1217,12 +1218,23 @@ impl<'a> SparseImage<'a> {
     }
 
     /// Decode rows `first_row..` to their `width`-byte cells, `out.len() /
-    /// width` rows: a NULL row's is zero. `nulls` is the null words from the
-    /// first row of `first_row`'s block on, of which bit `pi` is this column's.
-    /// A row they place past the last value reads zero too.
-    pub(crate) fn decode(&self, first_row: usize, width: usize, out: &mut [u8], nulls: &[u8], pi: usize) {
+    /// width` rows: a NULL row's is zero. `null_words(rows)` answers the null
+    /// words of `rows`, of which bit `pi` is this column's. A row they place
+    /// past the last value reads zero too.
+    pub(crate) fn decode(
+        &self,
+        first_row: usize,
+        width: usize,
+        out: &mut [u8],
+        pi: usize,
+        null_words: impl FnOnce(Range<usize>) -> PooledBuf,
+    ) {
+        // From the block's first row on: its rank counts the values before it.
+        let from = first_row - first_row % DECODE_BLOCK_ROWS;
+        let nulls = null_words(from..first_row + out.len() / width);
+        debug_assert_eq!(nulls.len(), (first_row + out.len() / width - from) * size_of::<u64>());
         gnitz_wire::by_cell_width!(width, |T| self
-            .decode_cells::<{ size_of::<T>() }>(first_row, out, nulls, pi))
+            .decode_cells::<{ size_of::<T>() }>(first_row, out, &nulls, pi))
     }
 
     fn decode_cells<const W: usize>(&self, first_row: usize, out: &mut [u8], nulls: &[u8], pi: usize) {

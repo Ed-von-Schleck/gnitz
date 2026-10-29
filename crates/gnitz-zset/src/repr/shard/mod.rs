@@ -16,7 +16,7 @@ mod pk_filter;
 mod reader;
 
 pub use codebook::Codebook;
-pub use compact::{guard_slot, merge_guard, GuardRun};
+pub use compact::{guard_slot, GuardMerge, GuardRun};
 pub use error::StorageError;
 pub use file::ShardWriteOpts;
 pub use reader::{MappedShard, ShardDirectory};

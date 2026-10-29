@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{IoSlice, Write};
 use std::mem::MaybeUninit;
+use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
@@ -310,11 +311,12 @@ impl ClientTransport {
     }
 
     /// Shut the socket down so the peer sees EOF, and drop every queued frame.
-    /// The fd stays open until the transport drops, since a reactor may still
-    /// have it registered.
+    /// The fd stays open until the transport drops.
     pub(crate) fn close(&mut self) {
-        // SAFETY: this transport's own open socket.
-        let _ = unsafe { libc::shutdown(self.as_fd().as_raw_fd(), libc::SHUT_RDWR) };
+        let _ = match &self.inner {
+            Inner::Unix(s) => s.shutdown(Shutdown::Both),
+            Inner::Tls(t) => t.sock.shutdown(Shutdown::Both),
+        };
         self.queue = OutQueue::default();
     }
 

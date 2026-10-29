@@ -64,6 +64,26 @@ pub(crate) struct RowMark {
     dead_heap: usize,
 }
 
+/// Which row of a batch before [`Batch::consolidate_recording`] each row after
+/// it was.
+pub(crate) enum RowOrigins {
+    /// The rows stood where they were.
+    Unmoved,
+    /// The pick [`merge::consolidate_groups`] found per output row.
+    Moved(Vec<Pick>),
+}
+
+impl RowOrigins {
+    /// The row that output row `out_row` was.
+    #[inline]
+    pub(crate) fn source_row(&self, out_row: usize) -> usize {
+        match self {
+            RowOrigins::Unmoved => out_row,
+            RowOrigins::Moved(survivors) => survivors[out_row].1 as usize,
+        }
+    }
+}
+
 /// Owned columnar batch.  All fixed-stride column data lives in a single
 /// contiguous `data` buffer.  Blob data is separate (variable-length).
 ///
@@ -75,22 +95,16 @@ pub(crate) struct RowMark {
 /// **2 heap allocations**: `data` and `blob`.
 pub struct Batch {
     data: PooledBuf,
-    pub(in crate::repr) blob: PooledBuf,
+    blob: PooledBuf,
     /// An upper bound on the bytes of `blob` no string cell references.
-    pub(in crate::repr) dead_heap: usize,
+    dead_heap: usize,
     /// Rows the arena has room for: region `r` starts at
     /// `schema.region_start(r, capacity)`.
     capacity: usize,
-    /// Live row count; read through [`Batch::len`] outside `repr`. Not wider: a
-    /// counted row whose regions were not all written reads uninitialised arena
-    /// bytes.
-    pub(in crate::repr) count: usize,
-    /// The rows are strictly (PK, payload)-increasing and ghost-free. Cleared by
-    /// every row swap and every append, and kept by
-    /// [`Self::map_weights`]; raised by [`Self::certify_consolidated`], by
-    /// copying a source's claim, and by [`Self::append_above`], which checks the
-    /// order it extends. A debug build verifies the rows wherever the claim is
-    /// raised or kept, so a reader takes it as it stands.
+    /// Live row count.
+    count: usize,
+    /// When set, the rows are strictly (PK, payload)-increasing and ghost-free;
+    /// a debug build verifies it wherever it is raised.
     consolidated: bool,
     /// The schema this batch's rows were laid out under, and the one every
     /// operation on this batch alone runs under. Replaced by
@@ -122,7 +136,7 @@ impl Batch {
     }
 
     /// An empty batch with room for `rows` rows. The arena is uninitialized
-    /// (poisoned in debug builds): every counted row must have every region written.
+    /// (poisoned in debug builds), and filled as `DirectWriter` says.
     pub fn with_capacity(schema: &SchemaDescriptor, rows: usize) -> Self {
         let mut b = Self::empty_with_schema(schema);
         b.capacity = schema.arena_rows(rows);
@@ -210,6 +224,12 @@ impl Batch {
     #[inline(always)]
     pub fn blob(&self) -> &[u8] {
         &self.blob
+    }
+
+    /// The bytes the string heap has room for.
+    #[cfg(test)]
+    pub(in crate::repr) fn blob_capacity(&self) -> usize {
+        self.blob.capacity()
     }
 
     /// An upper bound on the bytes of the heap no string cell references.
@@ -558,8 +578,6 @@ impl Batch {
 
     /// Create a borrowed `MemBatch` view over this batch's data.
     ///
-    /// Zero-allocation and near-free: every field is a pointer or a scalar.
-    ///
     /// `#[inline]`: derived per range and per chunk on paths whose whole body is
     /// a few reads through it.
     #[inline]
@@ -873,13 +891,7 @@ impl Batch {
     /// Copy every `[start, end)` range of `src`, ascending and disjoint, onto
     /// this batch's tail, one append setup serving the whole list.
     pub fn append_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
-        let rows = range_rows(ranges);
-        // Before the dedup cache, which would be set up to copy nothing. An
-        // all-DELETE push emits one empty range per row.
-        if rows == 0 {
-            return;
-        }
-        let mut cache = self.blob_cache(rows);
+        let mut cache = self.blob_cache(range_rows(ranges));
         self.push_ranges(src, ranges, &mut cache);
     }
 
@@ -1112,22 +1124,20 @@ impl Batch {
     /// [`Self::consolidate_in_place`] of a batch without the claim.
     #[inline(never)]
     fn consolidate_unclaimed(&mut self) {
-        self.consolidate_recording(&mut Vec::new());
+        self.consolidate_recording();
     }
 
     /// Consolidate this batch: rows that stand in consolidated order are
     /// certified where they are, and any others are sorted and weight-folded
-    /// into a fresh batch, `survivors` then holding what
-    /// [`merge::consolidate_groups`] found — per output row, the row it
-    /// was. Left empty when the rows stood.
-    pub(crate) fn consolidate_recording(&mut self, survivors: &mut Vec<Pick>) {
-        match self.stands_consolidated() {
-            true => self.certify_consolidated(),
-            false => {
-                survivors.reserve_exact(self.count);
-                *self = Self::consolidated_from(self, survivors);
-            }
+    /// into a fresh batch. Returns which row each output row was.
+    pub(crate) fn consolidate_recording(&mut self) -> RowOrigins {
+        if self.stands_consolidated() {
+            self.certify_consolidated();
+            return RowOrigins::Unmoved;
         }
+        let mut survivors = Vec::with_capacity(self.count);
+        *self = Self::consolidated_from(self, &mut survivors);
+        RowOrigins::Moved(survivors)
     }
 
     /// An owned consolidated copy: folds if needed, else clones. The borrowed
@@ -1239,8 +1249,6 @@ impl Clone for Batch {
     /// Clone all buffers into a new independent Batch (2 allocations).
     fn clone(&self) -> Self {
         // Rebuilt rather than copied through two pooled arenas holding zero bytes.
-        // The empty batch drops the consolidated claim, which is not observable on
-        // one holding no rows and no heap.
         if self.holds_nothing() {
             return Self::empty_with_schema(&self.schema);
         }
@@ -1411,9 +1419,7 @@ impl<'a> RowSource for MemBatch<'a> {
     }
 }
 
-/// The region half. The per-row accessors above are **not** derived from these
-/// (see [`BatchView`]): the derived form costs a row-count load, a second
-/// multiply and a second range check per read, which `-O0` cannot hoist.
+/// The region half, forwarded to the inherent accessors as the per-row half is.
 impl<'a> BatchView for MemBatch<'a> {
     #[inline(always)]
     fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8] {

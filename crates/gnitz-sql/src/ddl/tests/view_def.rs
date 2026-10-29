@@ -72,3 +72,29 @@ fn a_reference_past_the_query_is_refused() {
     def.refs[1].name.end = def.query.len() as u32 + 1;
     assert!(ViewDefinition::decode(&def.encode()).is_err());
 }
+
+/// The bytes version 1 writes. A change to them is a new layout, and moves
+/// `ENCODING_VERSION` with them.
+#[test]
+fn version_1_encodes_these_bytes() {
+    let query = b"SELECT x.a, b FROM s.t AS x JOIN \"\xc3\xbc\" ON x.a = \"\xc3\xbc\".a";
+    let mut golden: Vec<u8> = vec![1];
+    golden.extend_from_slice(&(query.len() as u32).to_le_bytes());
+    golden.extend_from_slice(query);
+    golden.extend_from_slice(&[
+        2, 0, // body_columns
+        1, 0, 0, 0, b'a', //
+        1, 0, 0, 0, b'b', //
+        2, 0, // refs
+        17, 0, 0, 0, 0, 0, 0, 0, 19, 0, 0, 0, 22, 0, 0, 0, // tid, name
+        1, 27, 0, 0, 0, // alias_end
+        1, 0, 0, 0, b'x', // alias
+        1, 2, 0, 1, 0, 0, 0, b'a', 1, 0, 0, 0, b'c', // columns
+        18, 0, 0, 0, 0, 0, 0, 0, 33, 0, 0, 0, 37, 0, 0, 0, // tid, name
+        0, // alias_end
+        2, 0, 0, 0, 0xc3, 0xbc, // alias
+        0,    // columns
+    ]);
+    assert_eq!(ENCODING_VERSION, 1);
+    assert_eq!(sample().encode(), golden);
+}

@@ -3,6 +3,8 @@ use std::io::Read;
 use super::*;
 use crate::runtime::reactor::test_support::make_reactor;
 use crate::runtime::test_support::try_poll_once;
+use crate::test_support::{apply_ddl, col_def, scratch_dir, table_blocks};
+use gnitz_wire::TypeCode;
 
 /// Trains queued for a connection reach the wire whole and in queue order
 /// behind the reply already corked, and are counted until the connection's
@@ -13,9 +15,10 @@ fn queued_trains_are_shipped_whole_behind_the_reply() {
     let r = make_reactor();
     let (peer, receiver) = Peer::over_socketpair(&r);
     let subs = Subscriptions::default();
-    subs.out.send(7, 1, Rc::new(vec![0x11; 100]));
-    subs.out.send(7, 2, Rc::new(vec![0x21; LARGE]));
-    subs.out.send(9, 3, Rc::new(vec![0x31; 100]));
+    let id = |id| SubId::new(id).unwrap();
+    subs.out.send(7, id(1), Rc::new(vec![0x11; 100]));
+    subs.out.send(7, id(2), Rc::new(vec![0x21; LARGE]));
+    subs.out.send(9, id(3), Rc::new(vec![0x31; 100]));
     let queued = 3 * MARKER_BYTES + 200 + LARGE;
     assert_eq!(subs.out.unsynced(), queued);
 
@@ -36,11 +39,11 @@ fn queued_trains_are_shipped_whole_behind_the_reply() {
 
     let want = [
         &b"reply"[..],
-        &framed(pushed_marker(7, 1)),
+        &framed(pushed_marker(7, id(1))),
         &[0x11; 100],
-        &framed(pushed_marker(7, 2)),
+        &framed(pushed_marker(7, id(2))),
         &vec![0x21; LARGE],
-        &framed(pushed_marker(9, 3)),
+        &framed(pushed_marker(9, id(3))),
         &[0x31; 100],
     ]
     .concat();
@@ -69,4 +72,25 @@ fn a_parked_sync_is_woken_by_what_it_watches_and_leaves_with_its_guard() {
         waiters.parked.borrow().is_empty(),
         "a sync that timed out is not left parked"
     );
+}
+
+/// A view's cursor tag is of one registration: a relation dropped and created
+/// again under its id answers a cursor of the first as foreign.
+#[test]
+fn a_cursor_tag_names_one_registration() {
+    let (feeds, _asks) = Feeds::new();
+    let cols = [col_def("id", TypeCode::U64)];
+    let mut engine = CatalogEngine::open(&scratch_dir("executor", "cursor_tag_registration"), 1).unwrap();
+    let sid = engine.schema_id("public").unwrap();
+    let tid = engine.allocate_ids(1).unwrap();
+    let create = || table_blocks(tid, sid, "t", &cols, &[0], Default::default());
+    apply_ddl(&mut engine, create()).unwrap();
+    let tag = feeds.cursor_tag(&engine, tid, b"spec");
+    assert_eq!(feeds.cursor_tag(&engine, tid, b"spec"), tag);
+
+    let [_, (family, row)] = create();
+    apply_ddl(&mut engine, [(family, row.negated())]).unwrap();
+    apply_ddl(&mut engine, create()).unwrap();
+    assert_ne!(feeds.cursor_tag(&engine, tid, b"spec"), tag);
+    engine.close();
 }

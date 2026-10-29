@@ -68,3 +68,124 @@ fn a_refusing_hello_names_its_release_to_a_client_of_another_version() {
         Err(HelloError::Version { peer, release: None })
     );
 }
+
+/// One sample of every layout client and engine both decode, past the bytes
+/// that carry [`WIRE_VERSION`] itself. A data block's layout is pinned by the
+/// block's own test.
+fn wire_layout_samples() -> Vec<u8> {
+    use crate::txn_frame::{self, DeltaCursor, DeltaPollItem, ScanItem, SubId};
+    use crate::*;
+
+    let mut out = Vec::new();
+    // A header with every field set, a blob and a schema record.
+    let hdr = ControlHeader {
+        status: WireStatus::StaleCatalog,
+        target_id: 0x1111_2222_3333_4444,
+        flags: WireFlags {
+            verb: ClientVerb::SnapshotPage,
+            conflict_mode: WireConflictMode::Error,
+            continuation: true,
+            scan_last: true,
+            lane: WireLane::SyncAnswer,
+        },
+        arg0: 0x5555_6666_7777_8888,
+        arg1: 0x9999_AAAA_BBBB_CCCC,
+    };
+    append_frame(&mut out, &hdr, b"blob", Some(b"schema"), None);
+
+    let target = Target { tid: 7, token: 9 };
+    out.extend(txn_frame::encode_scan_multi(&[ScanItem {
+        target,
+        reply_layout: 3,
+        spec: b"spec",
+    }]));
+    let poll = DeltaPollItem {
+        view: target,
+        from: DeltaCursor::from_pair(5, 6),
+        reply_layout: 3,
+        spec: b"spec",
+    };
+    out.extend(txn_frame::encode_delta_poll(
+        &[poll, DeltaPollItem { from: None, ..poll }],
+        SubId::new(4),
+    ));
+    out.extend(txn_frame::encode_held(
+        [SubId::new(4), SubId::new(u64::MAX)].map(Option::unwrap),
+    ));
+
+    let cols = PkColList::from_slice(&[2, 0]);
+    let rows = ReadSpec {
+        bound: ReadBound::Range(KeyRange::new(cols, &[1], 2, 3)),
+        predicate: vec![1, 2],
+        sink: ReadSink {
+            map: None,
+            kind: SinkKind::Rows {
+                cut: Some(RowsCut {
+                    k: std::num::NonZeroU64::new(5).unwrap(),
+                    order: vec![OrderKey { col: 3, desc: true, nulls_first: true }],
+                }),
+            },
+        },
+    };
+    let fold = ReadSpec {
+        bound: ReadBound::PkSet(PkKeys::from_sorted(1, vec![4, 9])),
+        predicate: vec![],
+        sink: ReadSink {
+            map: Some(ComputeMap {
+                program: vec![7],
+                out_cols: vec![(TypeCode::I64, true)],
+            }),
+            kind: SinkKind::Fold(GroupAggs {
+                group_cols: vec![2],
+                aggs: vec![AggDescriptor { agg_op: AggFunc::Min, col_idx: 4 }],
+            }),
+        },
+    };
+    out.extend(rows.encode());
+    out.extend(fold.encode());
+
+    let schema = [
+        schema_block::SchemaBlockCol {
+            ty: TypeCode::U64.into(),
+            nullable: false,
+            hidden: false,
+            name: b"k",
+        },
+        schema_block::SchemaBlockCol {
+            ty: ColType::decimal(9),
+            nullable: true,
+            hidden: true,
+            name: b"v",
+        },
+    ];
+    out.extend(schema_block::encode(schema.iter().copied(), &[0]));
+    let desc = RelDescriptorBlob {
+        class: RelClass::FedView,
+        pk_repeats: true,
+        serial: true,
+        indexes: vec![RelIndex { cols, is_unique: true }],
+    };
+    out.extend(desc.encode());
+    let page = snapshot::PageRequest {
+        layout: 3,
+        limit: 10,
+        after: vec![None, Some(PkBuf::from_bytes(&[1, 2]))],
+    };
+    out.extend(page.encode());
+
+    out.extend(&client_hello(b"token")[HELLO.len()..]);
+    for &status in AuthStatus::ALL {
+        out.extend(&server_hello(status)[HELLO.len()..]);
+    }
+    out
+}
+
+/// Every layout of [`wire_layout_samples`] moves with [`WIRE_EPOCH`].
+#[test]
+fn the_wire_layouts_are_pinned_to_the_epoch() {
+    assert_eq!(
+        (WIRE_EPOCH, crate::checksum(&wire_layout_samples())),
+        (36, 0xf724_9517_346b_fbe4),
+        "a client↔engine layout moved: bump WIRE_EPOCH and this digest together"
+    );
+}

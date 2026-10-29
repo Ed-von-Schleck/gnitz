@@ -68,6 +68,7 @@ pub fn map_shared(fd: Option<BorrowedFd<'_>>, len: usize) -> io::Result<*mut u8>
 }
 
 /// A close-on-exec memfd named `name`.
+#[cfg(target_os = "linux")]
 pub fn memfd(name: &std::ffi::CStr) -> io::Result<File> {
     use std::os::fd::FromRawFd;
     // SAFETY: `name` is NUL-terminated.
@@ -80,12 +81,13 @@ pub fn memfd(name: &std::ffi::CStr) -> io::Result<File> {
 }
 
 /// Make the entries of directory `dir` durable.
-pub fn fsync_dir(dir: &str) -> io::Result<()> {
+pub fn fsync_dir(dir: impl AsRef<std::path::Path>) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
 /// Rename `from` to `to`, refused with `AlreadyExists` where `to` exists:
 /// `std::fs::rename` replaces a file, or an empty directory, in its place.
+#[cfg(target_os = "linux")]
 pub fn rename_noreplace(from: &str, to: &str) -> io::Result<()> {
     let (from, to) = (std::ffi::CString::new(from)?, std::ffi::CString::new(to)?);
     // SAFETY: both paths are NUL-terminated and outlive the call.

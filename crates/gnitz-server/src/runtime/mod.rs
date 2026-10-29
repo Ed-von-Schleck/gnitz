@@ -19,10 +19,6 @@
 // item here publishes nothing outside the binary; the visibility that carries
 // meaning is `pub(in crate::catalog)` / `pub(in crate::query)` on the two rungs
 // below, which is what keeps a rung's internals out of the rung above it.
-//
-// The submodules are private `mod`, so cross-submodule refs resolve through
-// `crate::runtime::X::…` / `super::X::…` — descendants can name a private
-// sibling module.
 
 // First: `#[macro_use]` reaches only the submodules declared after it.
 #[macro_use]
@@ -45,6 +41,7 @@ mod w2m;
 mod worker;
 
 pub(crate) use bootstrap::{server_main, ServerArgs};
+pub(crate) use fatal::ServerExit;
 pub(crate) use tls::{mint_token, CertSource, TlsArgs};
 
 #[cfg(test)]

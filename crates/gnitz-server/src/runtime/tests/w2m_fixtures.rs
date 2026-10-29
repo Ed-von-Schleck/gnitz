@@ -15,6 +15,11 @@ pub(super) fn ring_capacity(msg_sz: usize, n_msgs: usize, slack: u64) -> usize {
     (W2M_HEADER_SIZE as u64 + n_msgs as u64 * slot_stride(msg_sz) + slack) as usize
 }
 
+/// The request id `n`, which is not 0.
+pub(crate) fn id(n: u32) -> RequestId {
+    RequestId::from_wire(n).expect("a request id is not 0")
+}
+
 /// One ring of [`ring_capacity`]: its writer and its reader.
 pub(super) fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> (W2mWriter, W2mReceiver) {
     let (mut writers, receiver) = test_rings(1, ring_capacity(msg_sz, n_msgs, slack));
@@ -56,7 +61,7 @@ pub(crate) fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
     let (mut writers, receiver) = test_rings(1, 256 * 1024);
     let text = vec![0x42u8; pad];
     let msg = crate::runtime::frame::WireMsg { blob: &text, ..Default::default() };
-    writers[0].send_msg(1, &msg);
+    writers[0].send_msg(id(1), &msg);
     let slot = receiver.try_read_slot(0).expect("a frame");
     (receiver, slot)
 }

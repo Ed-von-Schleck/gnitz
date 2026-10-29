@@ -30,6 +30,7 @@ pub use circuit_state::{CircuitState, StateIdx, StateLayout};
 pub use dirs::{lock_data_dir, relation_dir, ChildAddr, ChildKind, DirLock};
 pub use disk_usage::{disk_usage, DiskUsage};
 use feed::Feed;
+pub use snapshot::PinScope;
 use store::{Rows, Store};
 
 // ---------------------------------------------------------------------------
@@ -67,8 +68,6 @@ pub struct SecondaryIndex {
 }
 
 impl SecondaryIndex {
-    /// By value, not as a slice: `PkColList` is `Copy`, so the list can be keyed
-    /// on or held past the borrow of the registry that produced it.
     pub fn cols(&self) -> PkColList {
         self.cols
     }
@@ -264,9 +263,8 @@ impl Relation {
         self.rows.feed()
     }
 
-    /// By value, for the reason [`SecondaryIndex::cols`] is: the `relations` borrow
-    /// ends with the call, so the descriptor survives a later `&mut` on the
-    /// registry.
+    /// By value: the borrow of `relations` ends with the call, so the descriptor
+    /// survives a later `&mut` on the registry.
     pub fn schema(&self) -> SchemaDescriptor {
         *self.rows.schema()
     }
@@ -352,6 +350,17 @@ impl Relation {
     pub(crate) fn table(&self) -> &Table {
         self.rows.held()
     }
+
+    /// [`Self::table`], `Err` when this process holds no store of the relation.
+    pub(crate) fn table_or_err(&self) -> Result<&Table, String> {
+        self.rows.table().ok_or_else(|| match self.kind() {
+            RelationKind::Stream => format!(
+                "relation {} is a stream: a stream holds no rows and cannot be read",
+                self.id()
+            ),
+            _ => format!("relation {} holds no store in this process", self.id()),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,9 +427,6 @@ impl StoreConfig {
 
 /// Which relations this process holds, the stores behind them, and what this
 /// process is to those stores.
-///
-/// Nothing here compiles a circuit or runs an epoch — those are
-/// `gnitz-server`'s, and the crate graph is what says so.
 ///
 /// **Thread contract.** `!Send + !Sync` by auto-trait: every store holds its
 /// runs behind `Rc`. Nothing beneath a registry is thread-affine, so a host may

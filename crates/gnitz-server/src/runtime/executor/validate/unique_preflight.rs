@@ -1,10 +1,6 @@
 //! The DDL-time pre-flight for `CREATE UNIQUE INDEX`: the fan-out
 //! (`validate_unique_index_create`), the per-worker sorted-span streams
 //! (`PreflightKeyStream`) and their k-way merge (`merge_index_scan`).
-//!
-//! Nothing here is on the write path — `preflight.rs` holds that — and the only
-//! state shared with it is the `UniqueFilter` this pre-flight seeds. It reads
-//! no cache.
 
 use super::*;
 
@@ -96,10 +92,10 @@ async fn merge_index_scan(
 /// adjacent equal pair, within or across partitions — which no worker's own
 /// slice can show. Master memory is `O(num_workers)` plus the (≤ cap) filter seed.
 ///
-/// MUST run inside the DDL critical section (committer barrier drained,
-/// catalog write lock held) and BEFORE the IDX_TAB +1 is appended, so the
-/// index each worker filled is the one its catalog claim adopts. The caller
-/// releases the pre-flight's claims, committed or not.
+/// Runs under the DDL's catalog write, before the zone is laid out, so the index
+/// each worker filled is the one its catalog claim adopts; the caller releases
+/// every claim it leaves. The DDL's pause of the committer keeps a checkpoint's
+/// sweep off the claimed directory meanwhile.
 ///
 /// `Some(filter)` seeds the index's unique filter; `None` when the
 /// index covers the owner's PK and so can never collide.

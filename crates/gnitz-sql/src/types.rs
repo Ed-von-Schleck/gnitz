@@ -1,6 +1,6 @@
 use crate::error::GnitzSqlError;
-use gnitz_wire::{ColType, ColumnDef, TypeCode, MAX_DECIMAL_SCALE};
-use sqlparser::ast::{ColumnOption, DataType, ExactNumberInfo, TimezoneInfo};
+use gnitz_wire::{ColType, TypeCode, MAX_DECIMAL_SCALE};
+use sqlparser::ast::{DataType, ExactNumberInfo, TimezoneInfo};
 
 pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
     let tc = match dt {
@@ -104,15 +104,13 @@ fn decimal_type(info: &ExactNumberInfo) -> Result<ColType, GnitzSqlError> {
     Ok(ColType::decimal(s as u8))
 }
 
-/// A declared column, and whether it was spelled SERIAL: a SERIAL column is its
-/// signed integer, NOT NULL.
-pub(crate) fn column_def(col: &sqlparser::ast::ColumnDef) -> Result<(ColumnDef, bool), GnitzSqlError> {
-    let name = col.name.value.clone();
-    if let Some(tc) = serial_type(&col.data_type) {
-        return Ok((ColumnDef::new(name, tc, false), true));
+/// A column's declared type, and whether it was spelled SERIAL: a SERIAL
+/// spelling declares its signed integer.
+pub(crate) fn declared_type(dt: &DataType) -> Result<(ColType, bool), GnitzSqlError> {
+    match serial_type(dt) {
+        Some(tc) => Ok((ColType::of(tc), true)),
+        None => Ok((sql_col_type(dt)?, false)),
     }
-    let nullable = !col.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull));
-    Ok((ColumnDef::new(name, sql_col_type(&col.data_type)?, nullable), false))
 }
 
 /// The SERIAL family's signed integer; a modifier (`SERIAL(5)`) or a qualifier

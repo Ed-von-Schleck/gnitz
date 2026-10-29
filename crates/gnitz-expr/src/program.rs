@@ -291,9 +291,9 @@ impl TrimMode {
 // LogicalInstr — the wire-mirroring form (logical column indices)
 // ---------------------------------------------------------------------------
 
-/// A register, named by the index of the instruction that writes it. Single
-/// assignment and read-before-write already forced the two numbers to be equal,
-/// so only one of them is stored and a forged register file is unrepresentable.
+/// A register, named by the index of the one instruction that writes it;
+/// instructions therefore carry no destination, and a forged register file is
+/// unrepresentable.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Reg(pub u16);
 
@@ -888,7 +888,7 @@ pub struct LogicalProgram {
     instrs: Vec<LogicalInstr>,
     /// The output: one `Sink::Reg` for a filter or scalar, one sink per output
     /// payload slot for a map.
-    pub(crate) sinks: Vec<Sink>,
+    sinks: Vec<Sink>,
     const_strings: Vec<Vec<u8>>,
     /// Bit `r` set iff register `r` holds a string rather than a scalar, as
     /// [`Self::new`] finished it.
@@ -896,15 +896,15 @@ pub struct LogicalProgram {
     /// **Position-independent**, which is what lets every later pass read the
     /// finished mask instead of rebuilding one in step: a register's one writer
     /// is the instruction at its own index, ahead of every reader.
-    pub(crate) str_class: u64,
+    str_class: u64,
 }
 
 impl LogicalProgram {
     /// Assemble from typed instructions, holding every one to the rules a schema
-    /// is not needed for. Every constructor routes through here and the type is
-    /// immutable, so the walk below establishes, for every `LogicalProgram`,
-    /// that each operand register precedes its reader, which `split_regs`
-    /// relies on, and the `str_class` mask.
+    /// is not needed for. Every constructor routes through here and no field is
+    /// reachable to mutate after it, so the walk below establishes, for every
+    /// `LogicalProgram`, that each operand register precedes its reader, which
+    /// `split_regs` relies on, and the `str_class` mask.
     pub fn new(
         instrs: Vec<LogicalInstr>,
         sinks: Vec<Sink>,
@@ -965,6 +965,11 @@ impl LogicalProgram {
         &self.instrs
     }
 
+    /// The output sinks.
+    pub(crate) fn sinks(&self) -> &[Sink] {
+        &self.sinks
+    }
+
     /// The const pool the instructions index into.
     pub fn const_strings(&self) -> &[Vec<u8>] {
         &self.const_strings
@@ -980,7 +985,7 @@ impl LogicalProgram {
         use Instr as I;
         use LogicalInstr as L;
 
-        let ProgramFacts { bit_only, bool_pack, null_regs, reg_u64 } = self.analyze(schema, sink_read)?;
+        let facts = self.analyze(schema, sink_read)?;
         let str_class = self.str_class;
 
         // A string column, read as its 16-byte German-string cells.
@@ -1007,7 +1012,7 @@ impl LogicalProgram {
         let mut const_nulls: u64 = 0;
         // Answered once per register by `analyze`, off each opcode's `U64Rule`,
         // so no arm below restates the rule.
-        let is_u64 = |r: u16| (reg_u64 >> r) & 1 != 0;
+        let is_u64 = |r: u16| (facts.reg_u64 >> r) & 1 != 0;
         let int_reg = |r: Reg| IntReg { reg: r.0, signed: !is_u64(r.0) };
         let nullable_slots = schema.nullable_payload_slots();
         // By payload slot, the cell width an instruction reads it at; 0 if none.
@@ -1176,14 +1181,12 @@ impl LogicalProgram {
             instrs.push((dst, resolved));
         }
         Ok(ResolvedProgram {
-            null_regs,
+            facts,
             nullable_slots,
             payload_reads: (read_width.iter().enumerate())
                 .filter(|&(_, &w)| w != 0)
                 .map(|(slot, &w)| (slot as u8, w))
                 .collect(),
-            bit_only_mask: bit_only,
-            bool_pack_mask: bool_pack,
             instrs,
             const_regs,
             const_str_regs,
@@ -1196,7 +1199,6 @@ impl LogicalProgram {
             // A register file is exactly one entry per instruction.
             num_regs: self.instrs.len() as u32,
             str_lanes: MAX_REGS as u32 - str_class.leading_zeros(),
-            reg_u64,
         })
     }
 
@@ -1446,11 +1448,7 @@ fn operands(li: &LogicalInstr) -> Operands {
         // own.
         L::IntArith { op, a, b } => {
             let ops = writes(WVal(FromOperands)).reading(a, RVal).reading(b, RVal);
-            // Spelled out rather than left to a `_` arm: a new operator that
-            // *can* produce NULL would otherwise default to `makes_null: false`,
-            // `analyze` would leave its register out of `null_regs`, and the
-            // evaluator would skip its null words — a wrong answer in release
-            // with no compile error.
+            // No `_` arm: a new operator must say whether it makes NULL.
             match op {
                 IntArithOp::Div | IntArithOp::Mod => ops.may_null(),
                 IntArithOp::Add | IntArithOp::Sub | IntArithOp::Mul => ops,
@@ -1463,9 +1461,7 @@ fn operands(li: &LogicalInstr) -> Operands {
                 FloatArithOp::Add | FloatArithOp::Sub | FloatArithOp::Mul | FloatArithOp::Pow => ops,
             }
         }
-        // Null-*skipping*, unlike the arithmetic above: a NULL operand yields
-        // the other operand rather than propagating. That is why neither shares
-        // an arm with it, however alike the operand shapes look.
+        // Null-skipping: a NULL operand yields the other.
         L::IntMinMax2 { a, b, is_max: _ } => writes(WVal(FromOperands)).reading(a, RVal).reading(b, RVal),
         L::FloatMinMax2 { a, b, is_max: _ } => writes(WVal(Fixed(false))).reading(a, RVal).reading(b, RVal),
         L::Cmp { op: _, a, b } | L::FCmp { op: _, a, b } => writes(WBool).reading(a, RVal).reading(b, RVal),
@@ -1527,7 +1523,7 @@ fn operands(li: &LogicalInstr) -> Operands {
         L::LoadConstStr { const_idx } => writes(WStr).with_pool(const_idx, PoolEntry::Text),
         // A NULL on every row.
         L::LoadNullStr => writes(WStr).may_null(),
-        L::IntToStr { a } | L::FloatToStr { a, .. } => writes(WStr).reading(a, RVal),
+        L::IntToStr { a } | L::FloatToStr { a, f32: _ } => writes(WStr).reading(a, RVal),
         L::StrLen { a, chars: _ } => writes(WVal(Fixed(false))).reading(a, RStr),
         // Both text→number parses yield NULL on an unparsable or out-of-range
         // value.
@@ -1660,37 +1656,21 @@ pub(crate) struct ResolvedProgram {
     num_regs: u32,
     /// One past the highest string register; 0 for a program with none.
     pub(crate) str_lanes: u32,
-    /// Bit `r` set iff register `r` may hold a NULL against the schema this
-    /// program was resolved against: its kernel can make one, it decodes a
-    /// nullable column, or it reads such a register other than by a null test.
-    /// A kernel writes no null word for a register outside it, whose operands
-    /// are all outside it too. Only meaningful for that one schema, since the
-    /// payload indices in `instrs` were assigned from it.
-    pub(crate) null_regs: u64,
+    /// The per-register masks derived against the schema this program was
+    /// resolved against.
+    pub(crate) facts: ProgramFacts,
     /// Bit `N` set iff payload slot `N`'s column admits NULL in the schema this
     /// program was resolved against. A column read from a slot outside this mask
     /// contributes no null bit, so its destination register's null words are
     /// left zero instead of gathered per row.
     ///
-    /// Carries the same schema caveat as [`Self::null_regs`], and rests on the
-    /// same assumption it does: a `NOT NULL` column's declared flag is believed
-    /// over the bit the batch carries for it.
+    /// Carries the same schema caveat as [`ProgramFacts`], and rests on the
+    /// same assumption as [`ProgramFacts::null_regs`]: a `NOT NULL` column's
+    /// declared flag is believed over the bit the batch carries for it.
     pub(crate) nullable_slots: u64,
     /// Each payload slot an instruction reads, once, as `(slot, cell width)`:
     /// the regions an evaluation call fetches before its first morsel.
     pub(crate) payload_reads: Box<[(u8, u8)]>,
-    /// Bit `r` set iff register `r` is only consumed by boolean ops, so nothing
-    /// reads its lanes. A permission, not an obligation: the compares, the IN
-    /// scan, the string equalities, `BoolBinary`, `BoolNot` and the null tests
-    /// skip the lanes and write the packed truth bits natively.
-    bit_only_mask: u64,
-    /// Bit `r` set iff `r`'s producer must write its packed truth bits: some
-    /// downstream consumer reads it as a truth bit. A filter's result register
-    /// is covered because `analyze` forces it into that set, whatever opcode
-    /// writes it.
-    bool_pack_mask: u64,
-    /// Bit `r` set iff register `r`'s i64 image is to be read as a `u64`.
-    pub(crate) reg_u64: u64,
 }
 
 impl ResolvedProgram {
@@ -1700,37 +1680,56 @@ impl ResolvedProgram {
 
     /// Per instruction per morsel: whether `reg`'s kernel tracks null words.
     pub(crate) fn may_null(&self, reg: u16) -> bool {
-        (self.null_regs >> reg) & 1 != 0
+        (self.facts.null_regs >> reg) & 1 != 0
+    }
+
+    /// [`ProgramFacts::null_regs`].
+    #[cfg(test)]
+    pub(crate) fn null_regs(&self) -> u64 {
+        self.facts.null_regs
     }
 
     /// Per instruction per morsel, from the BOOL arms of `eval_batch`.
     pub(crate) fn is_bit_only(&self, reg: u16) -> bool {
-        (self.bit_only_mask >> reg) & 1 != 0
+        (self.facts.bit_only >> reg) & 1 != 0
     }
 
     /// True iff `reg`'s producer must write its packed truth bits. Per
     /// instruction per morsel, from `maybe_pack_bool_bits`.
     pub(crate) fn needs_bool_pack(&self, reg: u16) -> bool {
-        (self.bool_pack_mask >> reg) & 1 != 0
+        (self.facts.bool_pack >> reg) & 1 != 0
+    }
+
+    /// Whether `reg`'s i64 image is to be read as a `u64`.
+    pub(crate) fn is_u64(&self, reg: u16) -> bool {
+        (self.facts.reg_u64 >> reg) & 1 != 0
     }
 }
 
 /// What [`LogicalProgram::analyze`] derives in its one pass over the
-/// instruction stream.
-struct ProgramFacts {
-    /// Bit `r` set iff `r` is only consumed by boolean ops, so nothing reads
-    /// its lanes. [`ResolvedProgram::bit_only_mask`] states what it permits.
-    bit_only: u64,
+/// instruction stream. Each mask is only meaningful for the schema it was
+/// derived against, since the payload indices in the resolved instructions
+/// were assigned from it.
+pub(crate) struct ProgramFacts {
+    /// Bit `r` set iff register `r` is only consumed by boolean ops, so nothing
+    /// reads its lanes. A permission, not an obligation: the compares, the IN
+    /// scan, the string equalities, `BoolBinary`, `BoolNot` and the null tests
+    /// skip the lanes and write the packed truth bits natively.
+    pub(crate) bit_only: u64,
     /// Bit `r` set iff `r`'s producer must write its packed truth bits: some
-    /// downstream consumer reads it as a truth bit, a filter's result register
-    /// included.
-    bool_pack: u64,
-    /// [`ResolvedProgram::null_regs`].
-    null_regs: u64,
+    /// downstream consumer reads it as a truth bit. A filter's result register
+    /// is covered because `analyze` forces it into that set, whatever opcode
+    /// writes it.
+    pub(crate) bool_pack: u64,
+    /// Bit `r` set iff register `r` may hold a NULL: its kernel can make one, it
+    /// decodes a nullable column, or it reads such a register other than by a
+    /// null test. A kernel writes no null word for a register outside it, whose
+    /// operands are all outside it too.
+    pub(crate) null_regs: u64,
     /// Bit `r` set iff register `r`'s i64 image is to be read as a `u64`, per
     /// each opcode's [`U64Rule`]. Final rather than running, and safe to read at
     /// any point for the reason [`LogicalProgram::str_class`] gives.
-    reg_u64: u64,
+    pub(crate) reg_u64: u64,
 }
 
 /// Whether one opcode's `Value` destination holds a `u64`, per its [`U64Rule`].

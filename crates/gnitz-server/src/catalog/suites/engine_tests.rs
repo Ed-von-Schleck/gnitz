@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::table_blocks;
 use gnitz_wire::Target;
 
 // ── test_orphaned_metadata_recovery ─────────────────────────────────
@@ -175,6 +176,29 @@ fn a_dropped_relations_id_is_not_handed_out_again() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(engine.registry.relation(tid).is_none());
     assert!(engine.allocate_ids(1).unwrap() > tid);
+    finish(engine);
+}
+
+/// A DDL may name an id a dropped relation held; the relation it registers
+/// there has a registration of its own.
+#[test]
+fn a_relation_created_again_under_its_id_is_a_new_registration() {
+    let dir = temp_dir("recreated_registration");
+    let cols = vec![col_def("id", TypeCode::U64)];
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let sid = engine.schema_id("public").unwrap();
+    let tid = engine.create_table("public.again", &cols, &[0]).unwrap();
+    let first = engine.registration(tid).expect("registered");
+    engine.submit_retraction(SysFamily::Table, tid).unwrap();
+    assert_eq!(engine.registration(tid), None);
+
+    apply_ddl(
+        &mut engine,
+        table_blocks(tid, sid, "again", &cols, &[0], Default::default()),
+    )
+    .unwrap();
+    let again = engine.registration(tid).expect("registered again");
+    assert_ne!(again, first);
     finish(engine);
 }
 

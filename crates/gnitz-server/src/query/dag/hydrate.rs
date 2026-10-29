@@ -10,7 +10,7 @@ impl SkeletonHydrator for DagEngine {
         let (code, mut stores) = opened(&mut self.views, registry, view_id, &[])?;
         let hydration = code
             .hydration
-            .expect("a store holding skeleton rows is a bounded view's, compiled with its hydration");
+            .ok_or_else(|| format!("view {view_id} holds skeleton rows but was compiled unbounded"))?;
 
         let vm = &mut code.vm;
         let mut gather = stores.gather(hydration.seed, keys)?;

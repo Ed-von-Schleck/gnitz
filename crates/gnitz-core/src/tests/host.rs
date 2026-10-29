@@ -4,7 +4,7 @@ use crate::test_support::{client_pair, interrupt_self_until, kv_schema, reply_ct
 use crate::ProtocolError;
 use gnitz_wire::{ReadBound, ReadSpec, TypeCode};
 use std::collections::VecDeque;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -75,7 +75,7 @@ struct PendingHost {
 }
 
 impl Host for PendingHost {
-    fn attach(&mut self, _: BorrowedFd<'_>) -> std::io::Result<()> {
+    fn attach(&mut self, _: OwnedFd) -> std::io::Result<()> {
         Ok(())
     }
 
@@ -104,7 +104,7 @@ impl Host for PendingHost {
 struct FailingHost;
 
 impl Host for FailingHost {
-    fn attach(&mut self, _: BorrowedFd<'_>) -> std::io::Result<()> {
+    fn attach(&mut self, _: OwnedFd) -> std::io::Result<()> {
         Ok(())
     }
 
@@ -306,4 +306,43 @@ fn serve_ends_the_session_as_the_hosts_failure() {
         matches!(&failed, Some(Err(ClientError::ConnectionLost(ProtocolError::IoError(e)))) if e.to_string() == "no reactor"),
         "{failed:?}"
     );
+}
+
+// ── Reply cells ─────────────────────────────────────────────────────────────
+
+/// A successful reply its `Sent` never read goes back, whether the `Sent` was
+/// dropped before it arrived or after; one taken, routed or failed does not.
+#[test]
+fn an_unread_reply_goes_back() {
+    let back = Arc::new(Mutex::new(Vec::new()));
+    let cell = || {
+        let back = Arc::clone(&back);
+        promise_returning(move |v: u32| back.lock().unwrap().push(v))
+    };
+    let (mut to, sent) = cell();
+    drop(sent);
+    to.fulfil(Ok(1));
+
+    let (mut to, sent) = cell();
+    to.fulfil(Ok(2));
+    drop(sent);
+
+    let (mut to, mut sent) = cell();
+    to.fulfil(Ok(3));
+    assert!(matches!(sent.try_take(), Some(Ok(3))));
+    drop(sent);
+
+    let (mut to, sent) = cell();
+    sent.then(|_| {});
+    to.fulfil(Ok(4));
+
+    let (mut to, sent) = cell();
+    to.fulfil(Err(ClientError::Closed));
+    drop(sent);
+
+    let (to, sent) = cell();
+    drop(sent);
+    drop(to);
+
+    assert_eq!(*back.lock().unwrap(), [1, 2]);
 }

@@ -22,6 +22,7 @@
 
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::park::Park;
@@ -63,11 +64,12 @@ const fn slot_stride(sz: usize) -> u64 {
 /// `request_id` in the low, so that on LE the 4 bytes in front of the
 /// payload are the client's frame length prefix.
 #[inline]
-fn pack_prefix(sz: usize, request_id: u32) -> u64 {
-    (request_id as u64) | ((sz as u64) << 32)
+fn pack_prefix(sz: usize, request_id: RequestId) -> u64 {
+    (request_id.get() as u64) | ((sz as u64) << 32)
 }
 
-/// The `(sz, request_id)` [`pack_prefix`] stored.
+/// The `(sz, request_id)` [`pack_prefix`] stored, the id as [`RequestId::get`]
+/// gave it.
 #[inline]
 fn unpack_prefix(prefix: u64) -> (usize, u32) {
     ((prefix >> 32) as usize, prefix as u32)
@@ -86,12 +88,43 @@ const _: () = assert!(
 // Request ids
 // ---------------------------------------------------------------------------
 
-/// The request id of a group no worker answers.
-pub(crate) const NO_REPLY_REQUEST_ID: u32 = 0;
+/// The id a reply is routed by. A group with none is answered by nobody, which
+/// the wire spells as 0.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct RequestId(NonZeroU32);
 
-/// The request id every worker's boot ACK carries; the master leases it before
-/// its loop first runs.
-pub(crate) const BOOT_READY_REQUEST_ID: u32 = 1;
+impl RequestId {
+    /// The id every worker's boot ACK carries.
+    pub(crate) const BOOT_READY: RequestId = RequestId(NonZeroU32::MIN);
+
+    pub(crate) const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The id the wire value `raw` spells, `None` for 0.
+    pub(crate) const fn from_wire(raw: u32) -> Option<RequestId> {
+        match NonZeroU32::new(raw) {
+            Some(n) => Some(RequestId(n)),
+            None => None,
+        }
+    }
+
+    /// The wire value of `id`: 0 for `None`.
+    pub(crate) const fn to_wire(id: Option<RequestId>) -> u32 {
+        match id {
+            Some(id) => id.get(),
+            None => 0,
+        }
+    }
+
+    /// The id after this one, wrapping past `u32::MAX` to 1.
+    pub(crate) const fn next(self) -> RequestId {
+        match self.0.checked_add(1) {
+            Some(n) => RequestId(n),
+            None => RequestId(NonZeroU32::MIN),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Header layout (128 bytes, one cache line per writer)
@@ -297,7 +330,7 @@ impl W2mWriter {
 
     /// Publish one `sz`-byte message tagged `request_id`, written by `encode`.
     /// False, writing nothing, when the ring has no room for it now.
-    fn try_publish(&mut self, request_id: u32, sz: usize, encode: impl FnOnce(&mut [u8])) -> bool {
+    fn try_publish(&mut self, request_id: RequestId, sz: usize, encode: impl FnOnce(&mut [u8])) -> bool {
         let total = slot_stride(sz);
         assert!(sz > 0, "w2m: an empty message is a slot `take_next` aborts on");
         assert!(
@@ -338,12 +371,12 @@ impl W2mWriter {
     /// Encode `msg` into one ring slot, unless the ring has no room for the
     /// frame now. `request_id` goes in the slot's prefix, which is what the
     /// master routes the reply by.
-    pub fn try_send_msg(&mut self, request_id: u32, msg: &WireMsg<'_>) -> bool {
+    pub fn try_send_msg(&mut self, request_id: RequestId, msg: &WireMsg<'_>) -> bool {
         self.try_publish(request_id, msg.size(), |slot| msg.encode(slot))
     }
 
     /// [`Self::try_send_msg`], parking on `release_cursor` while the ring is full.
-    pub fn send_msg(&mut self, request_id: u32, msg: &WireMsg<'_>) {
+    pub fn send_msg(&mut self, request_id: RequestId, msg: &WireMsg<'_>) {
         while !self.try_send_msg(request_id, msg) {
             self.wait_for_room(msg.size());
         }
@@ -359,7 +392,7 @@ impl W2mWriter {
     }
 
     /// ACK `request_id`: the bare `Ok` control frame.
-    pub fn send_ack(&mut self, request_id: u32) {
+    pub fn send_ack(&mut self, request_id: RequestId) {
         self.send_msg(request_id, &WireMsg::default());
     }
 }
@@ -424,8 +457,8 @@ pub struct W2mSlot {
     /// client send unchanged, and [`Self::bytes`] is its tail.
     frame: &'static [u8],
     push_idx: u64,
-    /// The request id the worker's publish tagged the slot with: what the master
-    /// routes it by without decoding the frame.
+    /// The [`RequestId::get`] the worker's publish tagged the slot with: what the
+    /// master routes it by without decoding the frame.
     pub(crate) request_id: u32,
     /// The worker whose ring this slot was read from.
     pub(crate) worker: u32,

@@ -22,8 +22,7 @@
 //! positions, and the durability around them.
 //!
 //! It drives `gnitz-store` — the relation registry and its `ReadSpec` executor —
-//! directly, and links no DBSP layer: that is `gnitz-server`'s, which nothing
-//! links.
+//! directly.
 //!
 //! The store is `Send` and `!Sync`, and a [`gnitz_core::GnitzClient`] holds it
 //! behind a lock; the argument is beside the `unsafe impl` in `handle.rs`.

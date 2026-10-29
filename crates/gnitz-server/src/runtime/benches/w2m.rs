@@ -1,4 +1,4 @@
-use super::fixtures::make_ring;
+use super::fixtures::{id, make_ring};
 use super::*;
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::CTRL_HEADER_SIZE;
@@ -20,10 +20,11 @@ fn w2m_ring_bench() {
         let laps = FRAMES / lap as u64;
         let (mut writer, receiver) = make_ring(CTRL_HEADER_SIZE, RING_FRAMES as usize, 8);
         let (mut publish, mut drain) = (0, 0);
+        let reqs: Vec<RequestId> = (1..=lap).map(id).collect();
         for _ in 0..laps {
             publish += counter
                 .measure(|| {
-                    for req in 1..=lap {
+                    for &req in &reqs {
                         assert!(writer.try_send_msg(req, &WireMsg::default()), "the ring holds a lap");
                     }
                 })

@@ -24,19 +24,38 @@ pub(crate) struct PinnedStore {
 /// The stores one pin holds, by relation id.
 pub(super) type Pinned = FxHashMap<u64, PinnedStore>;
 
+/// The relations a pin takes: kinds whose stores hold no skeleton rows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinScope {
+    BaseTables,
+    SystemCatalog,
+    /// The base tables and the system catalog.
+    Durable,
+}
+
+impl PinScope {
+    fn takes(self, kind: RelationKind) -> bool {
+        match self {
+            PinScope::BaseTables => kind == RelationKind::BaseTable,
+            PinScope::SystemCatalog => kind == RelationKind::SystemCatalog,
+            PinScope::Durable => matches!(kind, RelationKind::BaseTable | RelationKind::SystemCatalog),
+        }
+    }
+}
+
 impl RelationRegistry {
-    /// Pin, as `snapshot`, the store of every relation whose kind `keep` accepts
-    /// and whose store this process holds. A replicated relation's rows are
+    /// Pin, as `snapshot`, the store of every relation `scope` takes whose
+    /// store this process holds. A replicated relation's rows are
     /// pinned at its owner alone, every other copy pinned empty, so a page read
     /// from every worker reads each row once. Refused for an id already pinned.
-    pub fn pin(&mut self, snapshot: u64, keep: impl Fn(RelationKind) -> bool) -> Result<(), String> {
+    pub fn pin(&mut self, snapshot: u64, scope: PinScope) -> Result<(), String> {
         if self.snapshots.contains_key(&snapshot) {
             return Err(format!("snapshot {snapshot} is already pinned"));
         }
         let pinned = self
             .relations
             .iter()
-            .filter(|(_, rel)| keep(rel.kind()))
+            .filter(|(_, rel)| scope.takes(rel.kind()))
             .filter_map(|(&id, rel)| {
                 let table = rel.rows.table()?;
                 let runs = match rel.placement().counts_on(self.slot.rank) {

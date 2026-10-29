@@ -2,21 +2,23 @@
 //! order. Their input opens through the spine, so a projection over a relation
 //! read in place is not stored a second time beside the operator's index.
 
-use super::super::{AggCol, ColId, HirCol, OrderedOp, RelExpr};
+use super::super::{AggCol, ColId, HirCol, OrderCol, OrderedOp, RelExpr};
 use super::spine::{open, Top};
 use super::{keyed_frame, resolve_reduce_specs, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
 use gnitz_wire::{Circuit, OrderKey};
 use std::collections::HashSet;
+use std::rc::Rc;
 
-/// Lower an `Ordered` node to circuit pieces.
-pub(super) fn lower_ordered(chain: &mut ViewChain, rel: &RelExpr) -> Result<EmitPieces, GnitzSqlError> {
-    let RelExpr::Ordered { input, partition, order, op } = rel else {
-        unreachable!("lower_ordered receives an Ordered");
-    };
-
-    let in_cols = input.cols();
-    let live: HashSet<ColId> = in_cols.iter().map(|c| c.id).collect();
+/// Lower an `Ordered` node over `input` to circuit pieces.
+pub(super) fn lower_ordered(
+    chain: &mut ViewChain,
+    input: &Rc<RelExpr>,
+    partition: &[ColId],
+    order: &[OrderCol],
+    op: &OrderedOp,
+) -> Result<EmitPieces, GnitzSqlError> {
+    let live: HashSet<ColId> = input.cols().iter().map(|c| c.id).collect();
     let spine = open(chain, input, &live)?;
     let mut cb = Circuit::default();
     let (node, frame) = spine.emit(&mut cb, Top::Output)?;
@@ -48,7 +50,7 @@ pub(super) fn lower_ordered(chain: &mut ViewChain, rel: &RelExpr) -> Result<Emit
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
 
     // The columns the operator adds behind its input's.
-    let tail = rel.cols()[in_cols.len()..].iter().map(HirCol::slot).collect();
+    let tail = op.added_cols().map(HirCol::slot).collect();
     let out = keyed_frame(&frame, &group.group_cols, 0..frame.schema.columns().len() as u32, tail)?;
     // The operator, and whether a partition — the key — holds more than one row.
     let pk_repeats = match op {

@@ -18,8 +18,8 @@ use std::collections::hash_map::Entry;
 pub(crate) enum GroupKey {
     /// The `n` PK bytes at `at`: consecutive PK columns' own images.
     PkRange { at: usize, n: usize },
-    /// One payload column's OPK image, at that column's width.
-    Image(ColumnLocator),
+    /// The OPK image of the payload column in `slot`, at that column's width.
+    Image { slot: u8, size: u8, type_code: TypeCode },
     /// The group's packed key, NULLs marked: at most 16 bytes, held by the
     /// `_group_pk` — also a join key packed off the PK region, at any width.
     Packed(KeyPacker),
@@ -60,24 +60,27 @@ impl GroupKey {
     fn in_place(locs: &[ColumnLocator]) -> Option<Self> {
         match (pk_run(locs), locs) {
             (Some((at, n)), _) => Some(GroupKey::PkRange { at, n }),
-            (None, &[loc @ ColumnLocator::Payload { .. }]) => Some(GroupKey::Image(loc)),
+            (None, &[ColumnLocator::Payload { slot, size, type_code }]) => {
+                Some(GroupKey::Image { slot, size, type_code })
+            }
             _ => None,
         }
     }
 
-    /// This key as one cell per row of `mb`, where it is 1 to 16 bytes of one region.
-    pub(crate) fn cells<'a>(&self, mb: &MemBatch<'a>) -> Option<KeyCells<'a>> {
-        let pk = |off: usize, width: usize| KeyCells {
-            region: mb.pk(),
-            stride: mb.pk_stride(),
-            off,
-            width,
-            opk: true,
-            signed: false,
-        };
+    /// This key resolved against the rows of `mb`.
+    #[inline(always)]
+    pub(crate) fn form<'k, 'a>(&'k self, mb: &MemBatch<'a>) -> KeyForm<'k, 'a> {
         match *self {
-            GroupKey::PkRange { at, n } if (1..=NARROW_PK_MAX_BYTES).contains(&n) => Some(pk(at, n)),
-            GroupKey::Image(ColumnLocator::Payload { slot, size, type_code }) => Some(KeyCells {
+            GroupKey::PkRange { at, n } if n <= NARROW_PK_MAX_BYTES => KeyForm::Cells(KeyCells {
+                region: mb.pk(),
+                stride: mb.pk_stride(),
+                off: at,
+                width: n,
+                opk: true,
+                signed: false,
+            }),
+            GroupKey::PkRange { at, n } => KeyForm::WidePk { at, n },
+            GroupKey::Image { slot, size, type_code } => KeyForm::Cells(KeyCells {
                 region: mb.col_data(slot as usize),
                 stride: size as usize,
                 off: 0,
@@ -85,10 +88,23 @@ impl GroupKey {
                 opk: false,
                 signed: type_code.is_signed_int(),
             }),
-            GroupKey::Image(ColumnLocator::Pk { .. }) => unreachable!("a PK column keys as a PK range"),
-            GroupKey::PkRange { .. } | GroupKey::Packed(_) | GroupKey::Fold(_) => None,
+            GroupKey::Packed(ref p) => KeyForm::Packed(p),
+            GroupKey::Fold(ref f) => KeyForm::Fold(f),
         }
     }
+}
+
+/// A [`GroupKey`] as one batch's rows hold it.
+pub(crate) enum KeyForm<'k, 'a> {
+    /// One cell of 1 to 16 bytes per row.
+    Cells(KeyCells<'a>),
+    /// A PK range wider than a cell.
+    WidePk {
+        at: usize,
+        n: usize,
+    },
+    Packed(&'k KeyPacker),
+    Fold(&'k FoldCols),
 }
 
 /// A group key of at most 16 bytes, as the cell it is in every row of `region`.
@@ -188,7 +204,9 @@ impl OutPk<'_> {
 /// A row loop keyed by group identity; see [`GroupOutKey::with_identity`].
 pub(crate) trait IdentityLoop {
     type Out;
-    fn run(self, identity: impl Fn(usize) -> u128) -> Self::Out;
+    /// `is_out_pk`: each identity is its row's output PK read as a big-endian
+    /// integer; else it is a digest of it.
+    fn run(self, identity: impl Fn(usize) -> u128, is_out_pk: bool) -> Self::Out;
 }
 
 /// V₀, the output PK of the empty group set's one group.
@@ -247,7 +265,10 @@ impl GroupOutKey {
                 group_pk(gnitz_wire::widen_pk_be(mb.get_pk_range(row, at, n)))
             }
             &GroupKey::PkRange { at, n } => OutPk::Borrowed(mb.get_pk_range(row, at, n)),
-            &GroupKey::Image(loc) => OutPk::inline(loc.opk_image(mb, row), loc.size()),
+            &GroupKey::Image { slot, size, type_code } => OutPk::inline(
+                ColumnLocator::Payload { slot, size, type_code }.opk_image(mb, row),
+                size as usize,
+            ),
             GroupKey::Packed(p) => group_pk(p.narrow_image(mb, row)),
             GroupKey::Fold(f) => group_pk(f.key_row(mb, row)),
         }
@@ -258,15 +279,14 @@ impl GroupOutKey {
     /// matched once per call.
     #[inline]
     pub(crate) fn with_identity<L: IdentityLoop>(&self, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
-        if let Some(cells) = self.key.cells(mb) {
-            return for_key_cells!(cells, |W, OPK| body
-                .run(|r| cell_image::<W, OPK>(cells.cell::<W>(r), cells.signed)));
-        }
-        match &self.key {
-            GroupKey::Fold(f) => body.run(|r| f.key_row(mb, r)),
-            GroupKey::Packed(p) => packed_identity(p, mb, rows, body),
-            &GroupKey::PkRange { at, n } => body.run(|r| gnitz_wire::checksum_128(mb.get_pk_range(r, at, n))),
-            GroupKey::Image(_) => unreachable!("an image key is one cell"),
+        match self.key.form(mb) {
+            KeyForm::Cells(cells) => {
+                for_key_cells!(cells, |W, OPK| body
+                    .run(|r| cell_image::<W, OPK>(cells.cell::<W>(r), cells.signed), true))
+            }
+            KeyForm::Fold(f) => body.run(|r| f.key_row(mb, r), true),
+            KeyForm::Packed(p) => packed_identity(p, mb, rows, body),
+            KeyForm::WidePk { at, n } => body.run(|r| gnitz_wire::checksum_128(mb.get_pk_range(r, at, n)), false),
         }
     }
 
@@ -298,11 +318,8 @@ impl GroupOutKey {
     pub(crate) fn numbered(&self, batch: &Batch) -> GroupOrdinals {
         let mb = &batch.as_mem_batch();
         let n = mb.len();
-        // A wide key's identity is a digest, and a sort compares the bytes.
-        // Nor do too few rows pay for a hash table.
-        let hashes =
-            n >= HASH_MIN_ROWS && !matches!(self.key, GroupKey::PkRange { n: w, .. } if w > NARROW_PK_MAX_BYTES);
-        if let Some(groups) = hashes
+        // Too few rows do not pay for a hash table.
+        if let Some(groups) = (n >= HASH_MIN_ROWS)
             .then(|| self.with_identity(mb, &[(0, n)], Hashed { n }))
             .flatten()
         {
@@ -314,8 +331,13 @@ impl GroupOutKey {
                     mb.get_pk_range(i, at, w)
                 )))
             }
-            &GroupKey::Image(loc) if loc.size() <= 8 => GroupOrdinals::sorted(n, |i| loc.opk_image(mb, i) as u64),
-            &GroupKey::Image(loc) => GroupOrdinals::sorted(n, |i| loc.opk_image(mb, i)),
+            &GroupKey::Image { slot, size, type_code } => {
+                let loc = ColumnLocator::Payload { slot, size, type_code };
+                match size <= 8 {
+                    true => GroupOrdinals::sorted(n, |i| loc.opk_image(mb, i) as u64),
+                    false => GroupOrdinals::sorted(n, |i| loc.opk_image(mb, i)),
+                }
+            }
             GroupKey::Packed(p) => {
                 let (keys, w) = (p.keys(mb), p.out_stride);
                 GroupOrdinals::sorted(n, |i| gnitz_wire::widen_pk_be(&keys[i * w..(i + 1) * w]))
@@ -337,9 +359,9 @@ fn packed_identity<L: IdentityLoop>(p: &KeyPacker, mb: &MemBatch, rows: &[(usize
     let every = rows == [(0, mb.len())];
     if every || p.packs_by_column() && !(few(rows.len()) && few(crate::repr::range_rows(rows))) {
         let (keys, w) = (p.keys(mb), p.out_stride);
-        return body.run(|r| gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w]));
+        return body.run(|r| gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w]), true);
     }
-    body.run(|r| p.narrow_image(mb, r))
+    body.run(|r| p.narrow_image(mb, r), true)
 }
 
 /// Fewest rows per row read at which [`packed_identity`] packs a column-packed
@@ -385,7 +407,6 @@ pub(crate) struct GroupOrdinals {
 }
 
 impl GroupOrdinals {
-    /// The group count.
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.first.len()
@@ -458,10 +479,14 @@ struct Hashed {
 
 impl IdentityLoop for Hashed {
     /// `None` once the batch holds more groups than
-    /// [`HASH_MIN_ROWS_PER_GROUP`] admits for its rows.
+    /// [`HASH_MIN_ROWS_PER_GROUP`] admits for its rows, or where an identity
+    /// does not sort as its output PK.
     type Out = Option<GroupOrdinals>;
 
-    fn run(self, identity: impl Fn(usize) -> u128) -> Self::Out {
+    fn run(self, identity: impl Fn(usize) -> u128, is_out_pk: bool) -> Self::Out {
+        if !is_out_pk {
+            return None;
+        }
         let limit = self.n / HASH_MIN_ROWS_PER_GROUP;
         let mut numbers = GroupNumbers::default();
         let mut ord: Vec<u32> = Vec::with_capacity(self.n);
@@ -474,7 +499,6 @@ impl IdentityLoop for Hashed {
             };
             ord.push(numbers.ordinal(identity(row), new).ok()?);
         }
-        // Every hashed identity is its output PK read as an integer.
         // Taken in discovery order, which is often PK order already.
         let mut by_pk: Vec<(u128, u32)> = first
             .iter()

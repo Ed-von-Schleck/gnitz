@@ -19,7 +19,7 @@ use gnitz_wire::{framed, peek_control_block, ColumnDef, ControlHeader, TypeCode,
 
 use crate::{
     poll_fd, BatchAppender, BlockingHost, ClientTransport, GnitzClient, Interest, ProtocolError, RelName, Schema,
-    Session, ZSetBatch,
+    Session, SubId, ZSetBatch,
 };
 
 /// `schema.name`.
@@ -285,10 +285,10 @@ pub(crate) fn delta_terminal(view: u64, tag: u64, tick: u64) -> Vec<u8> {
 }
 
 /// The frame that opens a pushed train of subscription `sub` to `view`.
-pub(crate) fn pushed_marker(view: u64, sub: u64) -> Vec<u8> {
+pub(crate) fn pushed_marker(view: u64, sub: SubId) -> Vec<u8> {
     let hdr = ControlHeader {
         target_id: view,
-        arg0: sub,
+        arg0: sub.get(),
         flags: WireFlags {
             lane: WireLane::PushedTrain,
             ..Default::default()
@@ -301,7 +301,7 @@ pub(crate) fn pushed_marker(view: u64, sub: u64) -> Vec<u8> {
 /// One pushed train of subscription `sub` to `view`, framed: its opening frame,
 /// `rows` unless there are none, and the terminal at the cursor `end` — or, with
 /// `end` an error, a fault carrying that text.
-pub(crate) fn pushed_train(view: u64, sub: u64, rows: &ZSetBatch, end: Result<(u64, u64), &str>) -> Vec<u8> {
+pub(crate) fn pushed_train(view: u64, sub: SubId, rows: &ZSetBatch, end: Result<(u64, u64), &str>) -> Vec<u8> {
     let mut out = framed(&pushed_marker(view, sub));
     let end = match end {
         Ok(cursor) => cursor,
@@ -317,6 +317,11 @@ pub(crate) fn pushed_train(view: u64, sub: u64, rows: &ZSetBatch, end: Result<(u
     out
 }
 
+/// The subscription id `id` spells.
+pub(crate) fn sub_id(id: u64) -> SubId {
+    SubId::new(id).expect("a subscription id is not 0")
+}
+
 /// The control header of `request`, which must be a SYNC_PUSHED.
 pub(crate) fn sync_header(request: &[u8]) -> ControlHeader {
     let hdr = peek_control_block(request).expect("a control header").hdr;
@@ -325,7 +330,7 @@ pub(crate) fn sync_header(request: &[u8]) -> ControlHeader {
 }
 
 /// The subscription ids `request`, a SYNC_PUSHED, names as held, ascending.
-pub(crate) fn sync_held(request: &[u8]) -> Vec<u64> {
+pub(crate) fn sync_held(request: &[u8]) -> Vec<SubId> {
     let ctrl = peek_control_block(request).expect("a control header");
     assert_eq!(ctrl.hdr.flags.verb, gnitz_wire::ClientVerb::SyncPushed);
     let mut held = gnitz_wire::txn_frame::decode_held(&request[ctrl.blob]).expect("held ids");

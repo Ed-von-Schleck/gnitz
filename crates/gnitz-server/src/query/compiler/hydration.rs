@@ -16,6 +16,9 @@ pub(in crate::query) struct Hydration {
 const UNSUPPORTED: &str =
     "capacity-bounded view: only a filter/projection over one relation or over an inner equi-join is supported";
 
+const READS_OWN_STORE: &str =
+    "capacity-bounded view: a reduce as its output would read the view's skeleton rows back as its trace";
+
 /// Resolve the seed against the plan the emitter produced for it. The seed is
 /// gathered by the view's own keys: the output's PK region is the seeded node's,
 /// which a row-local walk and an equi join's delta both keep.
@@ -26,6 +29,9 @@ pub(super) fn derive_hydration(
     regs: &[DeltaReg],
     integrals: &[Option<(Integral, DeltaReg)>],
 ) -> Result<Hydration, String> {
+    if vm.reads_view_store() {
+        return Err(READS_OWN_STORE.into());
+    }
     // A replay runs on one worker, and so no exchange round.
     if circuit.ops().any(|(_, op)| matches!(op, OpNode::ExchangeShard)) {
         return Err(UNSUPPORTED.into());

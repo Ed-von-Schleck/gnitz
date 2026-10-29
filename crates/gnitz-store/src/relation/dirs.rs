@@ -5,6 +5,7 @@
 //! names storage owns.
 
 use std::fs::{self, TryLockError};
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -182,6 +183,17 @@ pub struct DirLock {
 /// Create and lock `base_dir`, retrying a held lock for [`DIR_LOCK_RETRY_FOR`],
 /// then create its [`relations_dir`].
 pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, String> {
+    // The directories whose entries this call makes durable: `base_dir` on
+    // every boot, since a boot killed before the fsync below left its entry
+    // created and unsynced, and every ancestor `ensure_dir` creates.
+    let base = Path::new(base_dir);
+    let owed: Vec<&Path> = std::iter::once(base)
+        .chain(
+            base.ancestors()
+                .skip(1)
+                .take_while(|d| !d.as_os_str().is_empty() && !d.is_dir()),
+        )
+        .collect();
     ensure_dir(base_dir)?;
     let path = format!("{base_dir}/{DIR_LOCK_FILENAME}");
     let file = fs::OpenOptions::new()
@@ -202,9 +214,18 @@ pub fn lock_data_dir(base_dir: &str) -> Result<DirLock, String> {
     }
     let root = relations_dir(base_dir);
     ensure_dir(&root)?;
-    // `LOCK` and `_relations` are entries of `base_dir`. Every boot, since a
-    // boot killed before this fsync left them created and unsynced.
-    fsync_dir(base_dir).map_err(|e| format!("fsync '{base_dir}': {e}"))?;
+    // `LOCK` and `_relations` are entries of `base_dir`, synced every boot for
+    // the same reason.
+    let parents = owed
+        .iter()
+        .filter_map(|d| d.parent())
+        .map(|p| match p.as_os_str().is_empty() {
+            true => Path::new("."),
+            false => p,
+        });
+    for dir in std::iter::once(base).chain(parents) {
+        fsync_dir(dir).map_err(|e| format!("fsync '{}': {e}", dir.display()))?;
+    }
     Ok(DirLock { _file: file })
 }
 

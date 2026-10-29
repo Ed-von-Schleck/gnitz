@@ -21,7 +21,7 @@
 use std::cmp::Ordering;
 
 use crate::algebra::{GroupOutKey, KeyPacker};
-use crate::repr::{pk_group_end, Batch, CursorRow, MemBatch, Pick, ReadCursor};
+use crate::repr::{pk_group_end, Batch, CursorRow, MemBatch, ReadCursor};
 use crate::schema::key::compare_pk_ordering;
 use crate::schema::payload_order::{Generic, PayloadOrder};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
@@ -159,10 +159,7 @@ impl OrderedPlan {
         let index = &self.index;
         let mut folded = index.entries(delta);
         debug_assert_eq!(folded.len(), delta.len());
-        // Entry `i` is delta row `i`'s, unless a fold moved the entries: then
-        // `moved` records every entry's.
-        let mut moved: Vec<Pick> = Vec::new();
-        folded.consolidate_recording(&mut moved);
+        let origins = folded.consolidate_recording();
         let entries = &folded.as_mem_batch();
         let n = entries.len();
         if n == 0 {
@@ -189,7 +186,7 @@ impl OrderedPlan {
         while walk.end < n {
             walk.next = walk.end;
             walk.end = pk_group_end(entries, walk.next, width);
-            let delta_row = moved.get(walk.next).map_or(walk.next, |&(_, row, _)| row as usize);
+            let delta_row = origins.source_row(walk.next);
             let out_pk = index.key.out_pk(&mb, delta_row);
             walk.group = prefix(walk.next);
             walk.history.seek_pk_group_ascending(walk.group);
@@ -475,10 +472,8 @@ impl OrderIndex {
         let mut image = Vec::new();
         out.write_rows(n, |w| {
             self.key_packer.pack_rows(w.pk_mut(), stride, &mb, &[(0, n)]);
-            let (mut regions, blob, _) = w.split_mut();
-            let keys = regions.next().expect("the PK region");
-            // Past the weights and the null words: the image columns' cells.
-            let mut cells: Vec<_> = regions.skip(2).take(self.images.len()).collect();
+            let (keys, cells, blob) = w.pk_and_payload_mut(0..self.images.len());
+            let mut cells: Vec<_> = cells.collect();
             for (row, key) in keys.chunks_exact_mut(stride).enumerate() {
                 let mut cells = cells.iter_mut().map(|col| &mut col[row * 16..][..16]);
                 let mut put = |image: &[u8]| {

@@ -37,8 +37,8 @@ pub(super) fn join_keys_and_type(join: &sqlparser::ast::Join) -> Result<(&JoinCo
 
 /// Fold one join step onto the accumulated left input: resolve the right
 /// relation, derive the step's ON conjuncts from its constraint, merge away the
-/// duplicate copy of each `USING` / `NATURAL` column, and widen the scope by the
-/// step's null semantics.
+/// duplicate copy of each `USING` / `NATURAL` column, and take the join's output
+/// nullability into the scope.
 pub(super) fn fold_join_step(
     cx: &BindCx<'_>,
     scope: &mut JoinScope,
@@ -106,9 +106,8 @@ pub(super) fn fold_join_step(
     }
 
     let out = RelExpr::join(left, right_src, kind, on)?;
-    // Reflect this step's null-widening back into the scope so a later ON /
-    // the WHERE / the projection resolve against the widened nullability.
-    scope.widen_step(kind);
+    // A later ON, the WHERE and the projection resolve against the widened columns.
+    scope.adopt_nullability(&out.cols());
     Ok(out)
 }
 

@@ -17,13 +17,14 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::peer::Peer;
 use super::tick::fresh_read_lock;
-use super::{forward_scan, send_fault, send_msg, target_kind, Access, Shared};
+use super::{forward_scan, send_fault, send_msg, target_kind, Access, CatalogLock, Shared};
+use crate::catalog::CatalogEngine;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{PeerGone, SendBody, TrainLease};
 use crate::runtime::sal::Read;
 use crate::runtime::sync::{chan, oneshot, select2, ReadGuard};
-use gnitz_wire::txn_frame::{decode_delta_items, delta_poll_kept, DeltaPollItem};
+use gnitz_wire::txn_frame::{decode_delta_items, delta_poll_kept, DeltaPollItem, SubId};
 use gnitz_wire::{ControlHeader, Target, WireFault, WireStatus};
 
 /// Delta reads at one SAL cut: the ceiling on the leases and trains a
@@ -81,9 +82,9 @@ enum PollPosition {
 }
 
 /// Where a poll of `item` stands.
-fn poll_position(shared: &Shared, _catalog: &ReadGuard, item: DeltaPollItem) -> PollPosition {
+fn poll_position(shared: &Shared, _catalog: &ReadGuard<CatalogLock>, item: DeltaPollItem) -> PollPosition {
     let tid = item.view.tid;
-    let kind = match target_kind(shared.cat(), item.view, Access::Read) {
+    let kind = match target_kind(&shared.cat(), item.view, Access::Read) {
         Ok(kind) => kind,
         Err(fault) => return PollPosition::Fault(fault),
     };
@@ -93,15 +94,12 @@ fn poll_position(shared: &Shared, _catalog: &ReadGuard, item: DeltaPollItem) -> 
              create the view WITH (delta = '<size>') to subscribe to it"
         )));
     }
-    let tag = shared.feeds.cursor_tag(tid, item.spec);
+    let tag = shared.feeds.cursor_tag(&shared.cat(), tid, item.spec);
     let Some(cursor) = item.from else {
         return PollPosition::Moved { tag };
     };
     if cursor.tag != tag {
-        return PollPosition::Fault(WireFault {
-            status: WireStatus::DeltaExpired,
-            text: format!("delta cursor of relation {tid} names another boot, relation or spec; re-read at 0"),
-        });
+        return PollPosition::Fault(foreign_cursor(tid));
     }
     let last = shared.dispatcher.last_delta_round(tid);
     if cursor.tick.get() >= last {
@@ -109,6 +107,26 @@ fn poll_position(shared: &Shared, _catalog: &ReadGuard, item: DeltaPollItem) -> 
     } else {
         PollPosition::Moved { tag }
     }
+}
+
+/// The refusal of a cursor whose tag is not the view's.
+fn foreign_cursor(view: u64) -> WireFault {
+    WireFault {
+        status: WireStatus::DeltaExpired,
+        text: format!("delta cursor of relation {view} names another boot, relation or spec; re-read at 0"),
+    }
+}
+
+/// Whether `feed` still reads the view it was keyed under: the view exists, and
+/// is the registration its tag was taken of.
+fn feed_readable(shared: &Shared, feed: &Feed) -> Result<(), WireFault> {
+    let cat = shared.cat();
+    let view = feed.key.view;
+    target_kind(&cat, view, Access::Read)?;
+    if shared.feeds.cursor_tag(&cat, view.tid, &feed.key.spec) != feed.tag {
+        return Err(foreign_cursor(view.tid));
+    }
+    Ok(())
 }
 
 /// DELTA_POLL: read N views in one request, each from its own cursor to the
@@ -126,7 +144,7 @@ pub(super) async fn handle_delta_poll(
 ) -> Result<(), WireFault> {
     let views = decode_delta_items(body).map_err(|e| format!("decode error: {e}"))?;
     let disp = &shared.dispatcher;
-    let mut kept = delta_poll_kept(prologue);
+    let mut kept = delta_poll_kept(prologue, views.len()).map_err(|e| format!("decode error: {e}"))?;
     // The poll drained once, for this lock; a later slice takes the lock alone.
     let mut first_lock = Some(
         fresh_read_lock(
@@ -219,7 +237,7 @@ async fn hold_lock(
     ids: &[u64],
     until: Instant,
     quiet: impl FnOnce() -> bool,
-) -> Result<ReadGuard, WireFault> {
+) -> Result<ReadGuard<CatalogLock>, WireFault> {
     let ids = || ids.iter().copied();
     let waiting = until > shared.dispatcher.reactor().now();
     let g = fresh_read_lock(shared, ids(), until).await?;
@@ -256,7 +274,7 @@ struct FeedKey {
 
 struct Subscriber {
     /// The id its connection asked for it under.
-    id: u64,
+    id: SubId,
     /// The round this subscriber has been queued every row through; `None`
     /// once its feed ended it.
     after_tick: Cell<Option<u64>>,
@@ -287,7 +305,7 @@ struct Outbox {
 /// connection sent the same ones shares.
 struct Train {
     view: u64,
-    id: u64,
+    id: SubId,
     body: Rc<Vec<u8>>,
 }
 
@@ -310,7 +328,7 @@ impl Outbox {
 
     /// Queue one train of subscription `id` to `view`: its opening marker
     /// and the frames after it.
-    fn send(&self, view: u64, id: u64, body: Rc<Vec<u8>>) {
+    fn send(&self, view: u64, id: SubId, body: Rc<Vec<u8>>) {
         self.unsynced.set(self.unsynced.get() + MARKER_BYTES + body.len());
         self.trains.borrow_mut().push(Train { view, id, body });
     }
@@ -421,14 +439,18 @@ impl Feeds {
         self.waiters.wake(relation);
     }
 
-    /// The cursor tag a delta reply carries: distinct for every (boot, view) and,
-    /// with fair odds, every spec the view is read under — so a cursor from
-    /// another boot, from a dropped view, or polled under another spec is
-    /// recognizably foreign. `spec` is the request's encoded bytes.
-    pub(super) fn cursor_tag(&self, view_id: u64, spec: &[u8]) -> u64 {
+    /// The cursor tag a delta reply of `view` carries: distinct for every (boot,
+    /// registration) and, with fair odds, every spec the view is read under — so
+    /// a cursor from another boot, from another view or a dropped one, or polled
+    /// under another spec is recognizably foreign. A registration is
+    /// [`CatalogEngine::registration`]; `spec` is the request's encoded bytes.
+    pub(super) fn cursor_tag(&self, cat: &CatalogEngine, view: u64, spec: &[u8]) -> u64 {
+        let registration = cat
+            .registration(view)
+            .expect("a cursor tag is taken of a registered view");
         // splitmix64's finalizer, a bijection on u64: under one spec, two
-        // views of one boot never share a tag.
-        let mut z = view_id.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        // registrations of one boot never share a tag.
+        let mut z = registration.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         self.boot_nonce ^ (z ^ (z >> 31)) ^ gnitz_wire::checksum(spec)
@@ -484,7 +506,7 @@ impl Subscriptions {
 
     /// Keep `item` as the subscription `id`, queued through `round`; `tag` is
     /// the cursor tag of its reads.
-    fn join(&mut self, feeds: &Feeds, id: u64, item: &DeltaPollItem, round: u64, tag: u64) {
+    fn join(&mut self, feeds: &Feeds, id: SubId, item: &DeltaPollItem, round: u64, tag: u64) {
         let joined = Rc::new(Subscriber {
             id,
             after_tick: Cell::new(Some(round)),
@@ -496,6 +518,11 @@ impl Subscriptions {
             layout: item.reply_layout,
             spec: item.spec.to_vec(),
         };
+        // A feed of the view's earlier registration ends here.
+        let stale = feeds.live.borrow().get(&key).filter(|f| f.tag != tag).cloned();
+        if let Some(stale) = stale {
+            feeds.end(&stale, &foreign_cursor(item.view.tid));
+        }
         let feed = Rc::clone(feeds.live.borrow_mut().entry(key.clone()).or_insert_with(|| {
             Rc::new(Feed {
                 key,
@@ -526,7 +553,7 @@ impl Subscriptions {
     }
 
     /// Leave the feed of every subscription whose id `gone` names.
-    pub(super) fn leave(&mut self, feeds: &Feeds, gone: impl Fn(u64) -> bool) {
+    pub(super) fn leave(&mut self, feeds: &Feeds, gone: impl Fn(SubId) -> bool) {
         for (sub, feed) in self.asked_mut().held.extract_if(.., |(sub, _)| gone(sub.id)) {
             feed.members.borrow_mut().retain(|m| !Rc::ptr_eq(m, &sub));
             feeds.retire(&feed);
@@ -536,7 +563,7 @@ impl Subscriptions {
     /// SYNC_PUSHED: end every subscription `held` does not name, and owe the
     /// connection a sync held up to `wait_ms`. An undecodable `held` is what
     /// that sync is refused with.
-    pub(super) fn ask_sync(&mut self, shared: &Shared, held: Result<Vec<u64>, WireFault>, wait_ms: u64) {
+    pub(super) fn ask_sync(&mut self, shared: &Shared, held: Result<Vec<SubId>, WireFault>, wait_ms: u64) {
         if let Ok(held) = &held {
             self.leave(&shared.feeds, |id| !held.contains(&id));
         }
@@ -606,10 +633,10 @@ impl Subscriptions {
 const MARKER_BYTES: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES + gnitz_wire::frame_head_size(0, None);
 
 /// The frame that opens a pushed train of subscription `id`.
-fn pushed_marker(view: u64, id: u64) -> WireMsg<'static> {
+fn pushed_marker(view: u64, id: SubId) -> WireMsg<'static> {
     let marker = WireMsg {
         target_id: view,
-        arg0: id,
+        arg0: id.get(),
         flags: gnitz_wire::WireFlags {
             lane: gnitz_wire::WireLane::PushedTrain,
             ..Default::default()
@@ -654,9 +681,7 @@ async fn sync_wait(
     // Whether a subscription has been queued every round its view was reached
     // by. Asked under the catalog lock.
     let caught_up = |(sub, feed): &(Rc<Subscriber>, Rc<Feed>)| {
-        let view = feed.key.view;
-        target_kind(shared.cat(), view, Access::Read).is_ok()
-            && sub.caught_up(shared.dispatcher.last_delta_round(view.tid))
+        feed_readable(shared, feed).is_ok() && sub.caught_up(shared.dispatcher.last_delta_round(feed.key.view.tid))
     };
     loop {
         held.retain(|(sub, _)| sub.after_tick.get().is_some());
@@ -713,7 +738,7 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
         let mut first_lock = Some(shared.catalog_rwlock.read().await);
         let mut behind: Vec<(&Rc<Feed>, u64)> = Vec::new();
         for feed in &asked {
-            if let Err(fault) = target_kind(shared.cat(), feed.key.view, Access::Read) {
+            if let Err(fault) = feed_readable(&shared, feed) {
                 feeds.end(feed, &fault);
                 continue;
             }
@@ -733,7 +758,7 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
             };
             let mut reads = Vec::with_capacity(slice.len());
             for &(feed, cursor) in slice {
-                match target_kind(shared.cat(), feed.key.view, Access::Read) {
+                match feed_readable(&shared, feed) {
                     Ok(_) => reads.push((feed, cursor)),
                     Err(fault) => feeds.end(feed, &fault),
                 }

@@ -147,20 +147,23 @@ def test_reads_alone_are_reclaimed(own_server, target):
         assert bag(scanned(client, "t"), "pk", "val") == want | {(4, 40): 1}
 
 
-def test_a_checkpoint_waits_out_a_ddl_holding_the_tick_gate(own_server):
-    """A checkpoint sequence the watchdog starts while a DDL holds the tick gate
-    must wait for it to end: its drain would wait on a tick the DDL keeps out.
+def test_no_checkpoint_runs_inside_a_ddl(own_server):
+    """A checkpoint asked for while a DDL holds its locks runs only after the DDL.
 
     `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT` holds the first DDL, its zone written
-    and its locks held, until a checkpoint sequence waits on its gate. At a
-    one-byte threshold the zone alone crosses it, so the watchdog's wake is what
-    starts the sequence, and the hold's logged release proves it started inside
-    the DDL."""
+    and its locks held, until a request queues behind its pause of the
+    committer. At a one-byte threshold the zone alone crosses it, so that
+    request is the watchdog's reclaim wake. No checkpoint may finish between the
+    hold's park and its release, and that wake runs one once the DDL ends."""
     own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "1", "GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT": "1"})
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
             "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
             "INSERT INTO t VALUES (1, 10), (2, 20); "
             "CREATE VIEW v AS SELECT pk, val FROM t WHERE val > 10")
-        assert "ddl hold: released by its event" in own_server.log_text()
+        log = own_server.log_text()
+        parked = log.index("ddl hold: parked")
+        released = log.index("ddl hold: released by its event", parked)
+        assert "SAL checkpoint epoch=" not in log[parked:released]
+        assert "SAL checkpoint epoch=" in log[released:]
         assert bag(scanned(conn, "v"), "pk", "val") == {(2, 20): 1}

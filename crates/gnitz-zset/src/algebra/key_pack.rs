@@ -276,6 +276,7 @@ impl KeyPacker {
     /// `row`'s packed key of at most 16 bytes, widened as `widen_pk_be` does.
     #[inline]
     pub(crate) fn narrow_image<R: RowSource>(&self, batch: &R, row: usize) -> u128 {
+        debug_assert!(self.out_stride <= 16, "a narrow key is at most 16 bytes");
         let mut be = [0u8; 16];
         self.pack_into(&mut be[16 - self.out_stride..], batch, row);
         u128::from_be_bytes(be)

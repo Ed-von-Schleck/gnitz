@@ -99,7 +99,7 @@ pub(crate) struct OrderKey<'a> {
 /// placement (default NULLS LAST ascending, FIRST descending). `clause` names the
 /// ORDER BY in the refusal.
 pub(crate) fn parse_order_key<'a>(obe: &'a OrderByExpr, clause: &str) -> Result<(&'a Expr, bool, bool), GnitzSqlError> {
-    // Exhaustive (no `..`): a dropped modifier is a wrong result.
+    // A dropped modifier is a wrong result.
     let OrderByExpr { expr, options, with_fill } = obe;
     reject_if(with_fill.is_some(), clause, "WITH FILL")?;
     let OrderByOptions { asc, nulls_first } = options;
@@ -125,8 +125,7 @@ pub(crate) fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<OrderKey<
     let Some(ob) = order_by else {
         return Ok(Vec::new());
     };
-    // Exhaustive (no `..`) here and in `parse_order_key`: a dropped ORDER BY
-    // modifier is a wrong result, so a future `sqlparser` field stops the build.
+    // A dropped modifier is a wrong result, here and in `parse_order_key`.
     let OrderBy { kind, interpolate } = ob;
     reject_if(interpolate.is_some(), "ORDER BY", "INTERPOLATE")?;
     let exprs = match kind {
@@ -204,14 +203,14 @@ pub(crate) fn wire_keys<'c>(
         .collect())
 }
 
-/// The `LIMIT n` count (`None` when absent) and the `OFFSET m` skip (`0` when
-/// absent), in both the `LIMIT … OFFSET m` and the MySQL `LIMIT m, n` forms. A
-/// non-integer-literal value (`LIMIT 1+1`, `OFFSET 'x'`) is a clean error:
-/// degrading it would return every row or skip nothing, violating the
-/// unhonored-clause contract. So is the ClickHouse `LIMIT … BY` sub-form, which
-/// no surface has an operator for.
-pub(crate) fn extract_limit_offset(query: &sqlparser::ast::Query) -> Result<(Option<usize>, usize), GnitzSqlError> {
-    // Exhaustive (no `..`): a future `sqlparser` field stops the build.
+/// The `LIMIT n` count and the `OFFSET m` skip, each `None` when absent, in both
+/// the `LIMIT … OFFSET m` and the MySQL `LIMIT m, n` forms. A non-integer-literal
+/// value (`LIMIT 1+1`, `OFFSET 'x'`) is a clean error: degrading it would return
+/// every row or skip nothing, violating the unhonored-clause contract. So is the
+/// ClickHouse `LIMIT … BY` sub-form, which no surface has an operator for.
+pub(crate) fn extract_limit_offset(
+    query: &sqlparser::ast::Query,
+) -> Result<(Option<usize>, Option<usize>), GnitzSqlError> {
     let (limit, offset) = match &query.limit_clause {
         Some(LimitClause::LimitOffset { limit, offset, limit_by }) => {
             reject_if(!limit_by.is_empty(), "LIMIT", "BY")?;
@@ -221,7 +220,7 @@ pub(crate) fn extract_limit_offset(query: &sqlparser::ast::Query) -> Result<(Opt
         None => (None, None),
     };
     let limit = limit.map(|e| expr_usize_literal(e, "LIMIT")).transpose()?;
-    let offset = offset.map_or(Ok(0), |e| expr_usize_literal(e, "OFFSET"))?;
+    let offset = offset.map(|e| expr_usize_literal(e, "OFFSET")).transpose()?;
     Ok((limit, offset))
 }
 

@@ -69,9 +69,14 @@ pub(crate) fn tick(host: &mut impl DriveHost, source: u64, round: u64) -> Result
     run_tick(host, source, round, delta)
 }
 
-/// Fill `view`, and it alone, from each relation it scans, in scan order.
+/// Fill `view`, and it alone, from each relation it scans, in scan order. Views
+/// fill in id order: one whose source still awaits its own fill is refused, which
+/// keeps the rebuild set closed under dependents.
 pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), String> {
     let (dag, registry) = host.parts();
+    if let Some(source) = dag.sources_of(view).iter().find(|&&s| dag.awaits_rebuild(s)) {
+        return Err(format!("view {view} filled before its source {source}"));
+    }
     // Its ticks run from here on.
     dag.rebuild.remove(&view);
     let sources = dag.sources_of(view).to_vec();

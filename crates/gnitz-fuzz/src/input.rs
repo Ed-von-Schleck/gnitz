@@ -16,7 +16,8 @@ pub struct Boot {
     /// Kill the server once the traffic is played and boot it again on the
     /// same data directory.
     pub crash: bool,
-    /// Checkpoint every few kilobytes of log rather than at a quarter-full SAL.
+    /// Checkpoint every few kilobytes of log rather than at the server's default
+    /// threshold.
     pub checkpoints: bool,
 }
 

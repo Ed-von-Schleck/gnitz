@@ -54,7 +54,7 @@ fn sal_group_bench() {
             let (read, walked) = counter.measure(|| {
                 let mut read = 0;
                 while let Some((msg, slot)) = reader.next() {
-                    black_box((msg.head.request_id, slot.len()));
+                    black_box((msg.head.reply, slot.len()));
                     read += 1;
                 }
                 read
@@ -95,7 +95,7 @@ fn sal_park_cycle_bench() {
                         break;
                     }
                     let Some((msg, slot)) = reader.next() else { break };
-                    black_box((msg.head.request_id, slot.len()));
+                    black_box((msg.head.reply, slot.len()));
                     read += 1;
                 }
                 read

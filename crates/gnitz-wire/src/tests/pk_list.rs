@@ -18,10 +18,9 @@ fn a_pk_col_list_roundtrips_through_its_packed_word() {
     assert_eq!(PkColList::from_slice(&[3, 9]).pack(), 1 << 63 | 9 << 11 | 3 << 4 | 2);
 }
 
-/// A flag-clear word names no column list, whatever its other bits say — `0` is
-/// the one an `arg1` carries when it means the relation's own PK store — and a
-/// crafted count of zero or past the cap, a repeated column and a column no
-/// schema has are refused.
+/// A flag-clear word names no column list, whatever its other bits say; a
+/// crafted count of zero or past the cap, a repeated column, a column no schema
+/// has and a bit outside the list's fields are refused.
 #[test]
 fn unpack_refuses_an_untagged_word_and_a_crafted_list() {
     use PkRule::*;
@@ -43,6 +42,9 @@ fn unpack_refuses_an_untagged_word_and_a_crafted_list() {
             PK_LIST_PACKED_FLAG | 1 | (MAX_COLUMNS as u64) << 4,
             IndexOutOfRange { col: MAX_COLUMNS as u32 },
         ),
+        (PK_LIST_PACKED_FLAG | 1 << 62 | 1 | 3 << 4, NonCanonical),
+        (PK_LIST_PACKED_FLAG | 1 | 3 << 4 | 1 << 11, NonCanonical),
+        (PK_LIST_PACKED_FLAG | 1 | 3 << 4 | 1 << 32, NonCanonical),
     ] {
         assert_eq!(PkColList::unpack(w), Err(want), "{w:#x}");
     }

@@ -193,7 +193,7 @@ sys_row! {
         /// [`ViewBudget::row_words`]: `WITH (delta = …)` in bytes, `0` absent.
         delta_bytes: U64,
         /// The user view this row is an internal chain segment of; `0` is a user
-        /// view. A column, so the precheck can validate it against a forger.
+        /// view.
         owner_view_id: U64,
         /// Two of the view's rows may carry the same PK, or one may stand at
         /// weight above 1, so its PK region identifies no single row. The
@@ -397,8 +397,8 @@ impl<'a> ColTabRow<'a> {
 
     /// The column this row describes and the column it references:
     /// [`Self::of`]'s inverse. Every word must fit the width it is stored at and
-    /// decode to a value `of` could emit: an overflowing one would leave a stored
-    /// row no client can reproduce, and so no later `-1` can retract.
+    /// decode to a value `of` emits, so `of` over the result reproduces this
+    /// row.
     pub fn column(&self) -> Result<CatalogColumn, String> {
         let word = |field: &str, w: u64, max: u64| {
             if w > max {

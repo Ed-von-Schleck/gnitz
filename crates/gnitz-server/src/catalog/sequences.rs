@@ -15,9 +15,10 @@ const SEQ_ID_CHECKPOINT_GEN: u64 = 2;
 /// Cluster topology: [`topology_word`].
 const SEQ_ID_TOPOLOGY: u64 = 3;
 
-/// Operator-state format version. Bump on any change to an operator-state
-/// schema; a mismatch marks every Rederive view invalid at boot. Shard and
-/// manifest layout carry their own version words.
+/// Operator-state format version: bump when what a trace holds changes in a way
+/// its schema does not show. A mismatch marks every Rederive view invalid at
+/// boot. A trace's schema needs no bump, since its store's name carries the
+/// schema's digest; shard and manifest layout carry their own version words.
 const STATE_FORMAT: u32 = 16;
 
 /// The durable topology word recorded in `sequences` ([`SEQ_ID_TOPOLOGY`]):

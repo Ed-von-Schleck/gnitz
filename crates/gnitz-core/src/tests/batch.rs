@@ -763,6 +763,10 @@ fn a_string_cell_pointing_past_the_blob_is_refused() {
         Err(ProtocolError::DecodeError(m)) => assert!(m.contains("not in canonical form"), "{m}"),
         other => panic!("expected a decode error, got {other:?}"),
     }
+
+    let mut sink = batch.clone();
+    assert!(decode_wal_block_into(&mut sink, &encode_wal_block(&forged), &schema).is_err());
+    assert_eq!(sink, batch, "a refused block leaves the sink as it was");
 }
 
 /// A process's own regions are appended behind the rows a batch already holds,
@@ -836,9 +840,14 @@ fn a_null_bit_under_a_not_null_column_is_a_decode_error() {
         a.add_row(1, 1).i64_val(7);
         a.add_row(2, 1).i64_val(8);
     }
+    let mut sink = b.clone();
     b.nulls[1] = 1;
     match decode_wal_block(&encode_wal_block(&b), &schema) {
         Err(ProtocolError::DecodeError(m)) => assert!(m.contains("NOT NULL column 'v'"), "{m}"),
         other => panic!("expected a NOT NULL decode error, got {other:?}"),
     }
+
+    let before = sink.clone();
+    assert!(decode_wal_block_into(&mut sink, &encode_wal_block(&b), &schema).is_err());
+    assert_eq!(sink, before, "a refused block leaves the sink as it was");
 }
