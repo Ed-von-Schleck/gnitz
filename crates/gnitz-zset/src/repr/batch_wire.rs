@@ -309,7 +309,7 @@ impl Batch {
 /// would key a row and its retraction apart.
 pub(super) fn null_breach(mb: &MemBatch<'_>) -> Option<(&'static str, (usize, usize))> {
     let schema = mb.schema;
-    if let Some(at) = gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), mb.null_bmp()) {
+    if let Some(at) = gnitz_wire::first_not_null_violation(schema.nullable_payload_slots(), mb.null_bmp()) {
         return Some(("a null bit on a NOT NULL column", at));
     }
     let col = |pi| {

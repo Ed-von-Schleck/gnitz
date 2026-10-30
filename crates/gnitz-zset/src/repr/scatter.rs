@@ -96,7 +96,7 @@ pub(crate) fn copy_ranges(
 ) {
     let schema = writer.schema;
     debug_assert!(
-        schema.same_regions(src.schema),
+        schema.same_region_types(src.schema),
         "copy_ranges: a source of another layout"
     );
     match *ranges {

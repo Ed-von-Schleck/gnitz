@@ -91,10 +91,11 @@ fn key_spans_encode_the_typed_order_of_their_columns() {
         let mut bb = BatchBuilder::new(&s);
         for _ in 0..8 {
             let mut row: Vec<Option<u128>> = (0..s.num_columns()).map(|_| None).collect();
-            for (c, _) in s.pk_columns() {
+            for &c in s.pk_cols() {
+                let c = c as usize;
                 row[c] = Some(edge_native(&mut rng, tc(c)));
             }
-            let pk: Vec<u128> = s.pk_columns().map(|(c, _)| row[c].unwrap()).collect();
+            let pk: Vec<u128> = s.pk_cols().iter().map(|&c| row[c as usize].unwrap()).collect();
             bb.begin_row_natives(&pk, 1);
             // Payload slots run in schema order.
             for c in (0..s.num_columns()).filter(|&c| !s.is_pk_col(c)) {
@@ -131,7 +132,7 @@ fn key_spans_encode_the_typed_order_of_their_columns() {
         let span_schema = spec.span_schema();
         assert_eq!(span_schema, pk_only_schema(&types), "{s:?} {cols:?}");
         let span_cols: Vec<u32> = (0..cols.len() as u32).collect();
-        let src_pk = s.pk_columns().map(|(c, _)| tc(c));
+        let src_pk = s.pk_columns().map(|c| c.type_code);
         let index = spec.index_schema(&s);
         assert_eq!(index, pk_only_schema(&[types.clone(), src_pk.collect()].concat()));
         assert_eq!(index.pk_stride(), spec.key_size() + s.pk_stride(), "{s:?} {cols:?}");

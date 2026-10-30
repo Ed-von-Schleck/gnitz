@@ -34,7 +34,7 @@ fn fixture(val_of: impl Fn(u64) -> i64) -> RelationFixture {
 
 /// The probe keys `vals`, ascending, over `schema`'s one key column.
 fn keys(schema: &SchemaDescriptor, vals: impl Iterator<Item = u64>) -> PkKeys {
-    let tc = schema.pk_columns().next().expect("one key column").1.type_code;
+    let tc = schema.pk_columns().next().expect("one key column").type_code;
     let images = vals.map(|v| gnitz_wire::key_image(tc, v as u128));
     PkKeys::from_images(schema.pk_stride(), images)
 }

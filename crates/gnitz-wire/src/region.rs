@@ -84,8 +84,10 @@ pub fn null_word_set(word: &mut u64, pi: usize, is_null: bool) {
 }
 
 /// The first `(row, payload slot)` whose little-endian `u64` null word in
-/// `null_bmp` sets a bit in `not_null`.
-pub fn first_not_null_violation(not_null: u64, null_bmp: &[u8]) -> Option<(usize, usize)> {
+/// `null_bmp` sets a bit outside the `nullable` slots, past the last payload
+/// slot included.
+pub fn first_not_null_violation(nullable: u64, null_bmp: &[u8]) -> Option<(usize, usize)> {
+    let not_null = !nullable;
     let words = null_bmp.as_chunks::<8>().0;
     // A conforming batch takes only this branch-free pass.
     if not_null == 0 || words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & not_null == 0 {

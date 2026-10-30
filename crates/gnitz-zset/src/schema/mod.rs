@@ -42,7 +42,7 @@ impl DerivedSchema {
 
     /// Append `schema`'s PK columns in PK-list order.
     pub(crate) fn push_pk_of(&mut self, schema: &SchemaDescriptor) {
-        schema.pk_columns().for_each(|(_, c)| self.push_pk(*c));
+        schema.pk_columns().for_each(|c| self.push_pk(*c));
     }
 
     /// Append `schema`'s payload columns in schema order.

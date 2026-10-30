@@ -103,7 +103,7 @@ fn format_pk_bytes(schema: &SchemaDescriptor, pk_bytes: &[u8]) -> String {
     let mut off = 0usize;
     schema
         .pk_columns()
-        .map(|(_, col)| {
+        .map(|col| {
             let cell = &pk_bytes[off..off + col.size()];
             off += cell.len();
             let tc = col.type_code;

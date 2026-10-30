@@ -32,11 +32,11 @@ fn null_word_get_set_roundtrip() {
 fn first_not_null_violation_names_the_first_row_and_its_lowest_offending_slot() {
     let words: [u64; 4] = [0b0001, 0b0000, 0b1100, 0b0100];
     let bmp = crate::as_le_bytes(&words);
-    assert_eq!(first_not_null_violation(0, bmp), None);
-    assert_eq!(first_not_null_violation(0b0010, bmp), None);
-    assert_eq!(first_not_null_violation(0b0110, bmp), Some((2, 2)));
-    assert_eq!(first_not_null_violation(0b1001, bmp), Some((0, 0)));
-    assert_eq!(first_not_null_violation(!0, &[]), None);
+    assert_eq!(first_not_null_violation(!0, bmp), None);
+    assert_eq!(first_not_null_violation(!0b0010, bmp), None);
+    assert_eq!(first_not_null_violation(!0b0110, bmp), Some((2, 2)));
+    assert_eq!(first_not_null_violation(!0b1001, bmp), Some((0, 0)));
+    assert_eq!(first_not_null_violation(0, &[]), None);
 }
 
 #[test]

@@ -268,8 +268,11 @@ pub(super) fn build_schema_from_col_defs(
             return Err(format!("has duplicate column name '{name}'"));
         }
     }
-    Ok(SchemaDescriptor::try_collect(
-        col_defs.iter().map(|c| SchemaColumn::of_def(&c.def)),
+    Ok(SchemaDescriptor::try_new(
+        &col_defs
+            .iter()
+            .map(|c| SchemaColumn::of_def(&c.def))
+            .collect::<Vec<_>>(),
         pk_cols,
     )?)
 }

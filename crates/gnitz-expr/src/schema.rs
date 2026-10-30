@@ -121,33 +121,15 @@ impl From<SchemaRefusal> for String {
 }
 
 impl SchemaDescriptor {
-    /// The schema of `cols` keyed by `pk_indices`. `Err` for a list over the
-    /// column limit and for a PK list that breaks the PK admission rules.
+    /// The schema of the columns `cols` yields, keyed by `pk_indices`. `Err`
+    /// for a list over the column limit and for a PK list that breaks the PK
+    /// admission rules.
     pub fn try_new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Result<Self, SchemaRefusal> {
-        Self::try_collect(cols.iter().copied(), pk_indices)
-    }
-
-    /// [`Self::try_new`] over the columns `cols` yields.
-    pub fn try_collect(
-        cols: impl IntoIterator<Item = SchemaColumn>,
-        pk_indices: &[u32],
-    ) -> Result<Self, SchemaRefusal> {
-        let mut columns = [SchemaColumn::EMPTY; MAX_COLUMNS];
-        let mut cols = cols.into_iter();
-        let mut n = 0;
-        for c in cols.by_ref() {
-            if n == MAX_COLUMNS {
-                return Err(SchemaRefusal::TooManyColumns(n + 1 + cols.count()));
-            }
-            columns[n] = c;
-            n += 1;
+        if cols.len() > MAX_COLUMNS {
+            return Err(SchemaRefusal::TooManyColumns(cols.len()));
         }
-        Self::from_columns(columns, n, pk_indices)
-    }
-
-    /// [`Self::try_new`] over the first `n` of `columns`, the rest empty.
-    fn from_columns(columns: [SchemaColumn; MAX_COLUMNS], n: usize, pk_indices: &[u32]) -> Result<Self, SchemaRefusal> {
-        let cols = &columns[..n];
+        let mut columns = [SchemaColumn::EMPTY; MAX_COLUMNS];
+        columns[..cols.len()].copy_from_slice(cols);
         gnitz_wire::validate_pk_tuple(pk_indices, cols.len(), MAX_PK_COLUMNS, |c| {
             let col = &cols[c as usize];
             (col.type_code, col.nullable)
@@ -225,12 +207,10 @@ impl SchemaDescriptor {
                 .all(|(a, b)| a.type_code == b.type_code)
     }
 
-    /// The PK columns in PK-list order, as `(col_idx, &SchemaColumn)`.
+    /// The PK columns in PK-list order.
     #[inline]
-    pub fn pk_columns(&self) -> impl Iterator<Item = (usize, &SchemaColumn)> {
-        self.pk_cols()
-            .iter()
-            .map(move |&ci| (ci as usize, &self.columns[ci as usize]))
+    pub fn pk_columns(&self) -> impl Iterator<Item = &SchemaColumn> + Clone {
+        self.pk_cols().iter().map(move |&ci| &self.columns[ci as usize])
     }
 
     /// Total bytes per row of the PK region.
@@ -274,13 +254,6 @@ impl SchemaDescriptor {
         self.nullable_slots
     }
 
-    /// The null bits a conforming batch never sets: every bit but the nullable
-    /// slots', those past the last payload slot included.
-    #[inline]
-    pub fn not_null_payload_slots(&self) -> u64 {
-        !self.nullable_slots
-    }
-
     /// Fixed regions of a batch: PK, weight, null words, one per payload column.
     #[inline(always)]
     pub const fn num_fixed_regions(&self) -> usize {
@@ -304,11 +277,6 @@ impl SchemaDescriptor {
     #[inline(always)]
     pub const fn region_stride(&self, r: usize) -> usize {
         (self.region_off[r + 1] - self.region_off[r]) as usize
-    }
-
-    /// Whether `other` lays a batch's regions out as this schema does.
-    pub fn same_regions(&self, other: &SchemaDescriptor) -> bool {
-        self.region_off[..=self.num_fixed_regions()] == other.region_off[..=other.num_fixed_regions()]
     }
 
     /// The capacity an arena for `rows` rows is allocated at: `rows` itself below
@@ -347,7 +315,7 @@ impl SchemaDescriptor {
 
     /// This schema's PK columns alone, in PK-list order.
     pub fn pk_only(&self) -> SchemaDescriptor {
-        let cols: Vec<SchemaColumn> = self.pk_columns().map(|(_, c)| *c).collect();
+        let cols: Vec<SchemaColumn> = self.pk_columns().copied().collect();
         let pk: Vec<u32> = (0..cols.len() as u32).collect();
         SchemaDescriptor::new(&cols, &pk)
     }
@@ -447,7 +415,7 @@ impl SchemaDescriptor {
     /// The types of a batch's regions: the PK columns in PK-list order, then the
     /// payload columns in slot order.
     fn region_types(&self) -> impl Iterator<Item = TypeCode> + '_ {
-        let pk = self.pk_columns().map(|(_, c)| c.type_code);
+        let pk = self.pk_columns().map(|c| c.type_code);
         pk.chain(self.payload_columns().map(|(_, c)| c.type_code))
     }
 
@@ -519,7 +487,7 @@ impl SchemaDescriptor {
             "opk_key_cols: one native value per PK column",
         );
         let mut key = gnitz_wire::PkBuf::zeroed(0);
-        for ((_, col), &v) in self.pk_columns().zip(natives) {
+        for (col, &v) in self.pk_columns().zip(natives) {
             let (tc, w) = (col.type_code, col.size());
             debug_assert!(
                 {
@@ -575,7 +543,7 @@ pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
         n += 1;
         Ok(())
     })?;
-    Ok(SchemaDescriptor::from_columns(cols, n, pk.as_slice())?)
+    Ok(SchemaDescriptor::try_new(&cols[..n], pk.as_slice())?)
 }
 
 /// Encode `schema`'s physical column shape — the inverse of
@@ -611,10 +579,10 @@ pub enum ReduceOutKey {
 pub enum ReduceOutSlot {
     /// The synthetic `U128` fold key: slot 0 of the fold arm, and its whole PK.
     SyntheticKey,
-    /// Source column `col`, in the output's PK region.
+    /// The source column it names, in the output's PK region.
     Key(u32),
-    /// Source column `col`, carried into the payload — a column of the output's
-    /// row the key region does not spell.
+    /// The source column it names, carried into the payload — a column of the
+    /// output's row the key region does not spell.
     Carried(u32),
 }
 

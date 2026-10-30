@@ -173,7 +173,7 @@ enum Walked<'a> {
 /// layouts must be identical down to the OPK encoding each column type implies.
 fn same_pk_types(delta: &SchemaDescriptor, trace: &SchemaDescriptor) -> Result<(), String> {
     fn types(s: &SchemaDescriptor) -> impl Iterator<Item = TypeCode> + '_ {
-        s.pk_columns().map(|(_, c)| c.type_code)
+        s.pk_columns().map(|c| c.type_code)
     }
     if types(delta).eq(types(trace)) {
         return Ok(());

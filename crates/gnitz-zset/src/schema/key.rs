@@ -181,7 +181,7 @@ pub fn probe_key(opk: &[u8]) -> u64 {
 ///
 /// `None` = provably empty.
 pub fn range_band(schema: &SchemaDescriptor, range: &KeyRange) -> Option<(PkBuf, Option<PkBuf>)> {
-    let mut widths = schema.pk_columns().map(|(_, c)| c.size());
+    let mut widths = schema.pk_columns().map(|c| c.size());
     let mut first = PkBuf::zeroed(0);
     for (&image, w) in range.eq_vals().iter().zip(&mut widths) {
         first.push(w, image, false);

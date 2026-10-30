@@ -554,7 +554,7 @@ impl Batch {
     /// every relocation landed in this batch's heap.
     fn push_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)], cache: &mut BlobCache) {
         debug_assert!(
-            self.schema.same_regions(src.schema),
+            self.schema.same_region_types(src.schema),
             "push_ranges: a source of another layout"
         );
         let total: usize = ranges

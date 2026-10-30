@@ -116,7 +116,7 @@ fn layout_facts_match_the_column_table() {
         }
 
         // Expected payload slots: non-PK columns numbered left to right.
-        let (mut want_nullable, mut want_not_null) = (0u64, 0u64);
+        let mut want_nullable = 0u64;
         let mut next_slot = 0usize;
         for (ci, &(want_tc, nullable)) in cols.iter().enumerate() {
             let want_pk = pk.contains(&(ci as u32));
@@ -136,11 +136,7 @@ fn layout_facts_match_the_column_table() {
                     assert_eq!(slot as usize, next_slot, "{ctx}: locate({ci}) payload slot");
                     assert_eq!(s.payload_slot(ci), Some(next_slot), "{ctx}: payload_slot({ci})");
                     assert_eq!(s.payload_col_idx(next_slot), ci, "{ctx}: payload_col_idx({next_slot})");
-                    *if nullable {
-                        &mut want_nullable
-                    } else {
-                        &mut want_not_null
-                    } |= 1u64 << next_slot;
+                    want_nullable |= u64::from(nullable) << next_slot;
                     next_slot += 1;
                 }
             }
@@ -158,12 +154,6 @@ fn layout_facts_match_the_column_table() {
             s.nullable_payload_slots(),
             want_nullable,
             "{ctx}: nullable_payload_slots()"
-        );
-        assert_eq!(
-            s.not_null_payload_slots(),
-            // Every bit past the last payload slot is one no batch may set.
-            want_not_null | !gnitz_wire::low_bits_mask(next_slot),
-            "{ctx}: not_null_payload_slots()"
         );
         let want_strings = cols
             .iter()
@@ -234,15 +224,16 @@ fn covers_pk_accepts_any_superset_of_the_pk_columns() {
     }
 }
 
-/// `try_new` refuses a column count past `MAX_COLUMNS` and forwards the PK rule
-/// with each column's own nullability; the decode of a schema record carrying
-/// either shape refuses it too. The PK rule's own cases are `gnitz-wire`'s.
+/// `try_new` refuses a column count past `MAX_COLUMNS`, counted over the whole
+/// list, and forwards the PK rule with each column's own nullability; the decode
+/// of a schema record carrying either shape refuses it too. The PK rule's own
+/// cases are `gnitz-wire`'s.
 #[test]
 fn admission_refuses_what_the_constructor_aborts_on() {
     let k = col(TypeCode::U64);
     let cases = [
         ("nullable PK column", vec![SchemaColumn::new(TypeCode::U64, true)]),
-        ("column count past MAX_COLUMNS", vec![k; MAX_COLUMNS + 1]),
+        ("column count past MAX_COLUMNS", vec![k; MAX_COLUMNS + 2]),
     ];
     for (what, cols) in &cases {
         assert!(SchemaDescriptor::try_new(cols, &[0]).is_err(), "try_new: {what}");
@@ -257,17 +248,11 @@ fn admission_refuses_what_the_constructor_aborts_on() {
         );
         assert!(decode_schema_block(&record).is_err(), "decode: {what}");
     }
-    assert!(SchemaDescriptor::try_new(&[k, k], &[1, 0]).is_ok());
-}
-
-/// `try_new` refuses a list past `MAX_COLUMNS` by its whole length.
-#[test]
-fn try_new_refuses_a_list_past_max_columns_by_its_length() {
-    let cols = vec![SchemaColumn::new(TypeCode::U64, false); MAX_COLUMNS + 2];
     assert_eq!(
-        SchemaDescriptor::try_new(&cols, &[0]),
+        SchemaDescriptor::try_new(&[k; MAX_COLUMNS + 2], &[0]),
         Err(SchemaRefusal::TooManyColumns(MAX_COLUMNS + 2))
     );
+    assert!(SchemaDescriptor::try_new(&[k, k], &[1, 0]).is_ok());
 }
 
 /// A schema record's arity prefix carries no redundancy of its own, so every

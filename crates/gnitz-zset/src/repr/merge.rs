@@ -439,7 +439,7 @@ impl<'w> MergeSink<'w> {
         let (schema, room) = (writer.schema, writer.rows());
         let last = schema.num_fixed_regions() - 1;
         for src in srcs {
-            debug_assert!(src.schema.same_regions(schema), "a merge side of another layout");
+            debug_assert!(src.schema.same_region_types(schema), "a merge side of another layout");
             assert!(
                 src.count <= src.cap
                     && src.region_start(last) + src.count * schema.region_stride(last) <= src.data.len()

@@ -530,7 +530,7 @@ impl KeyLayout {
             n: 0,
             raw_stride: 0,
         };
-        for (_, col) in schema.pk_columns() {
+        for col in schema.pk_columns() {
             let halves: &[usize] = if col.size() == 16 { &[8, 8] } else { &[col.size()] };
             for &width in halves {
                 assert!(matches!(width, 1 | 2 | 4 | 8), "a PK column is 1, 2, 4, 8 or 16 bytes");

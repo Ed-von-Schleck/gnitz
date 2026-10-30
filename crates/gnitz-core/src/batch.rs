@@ -29,7 +29,7 @@ impl PkColumn {
     pub fn empty_for_schema(schema: &Schema) -> Self {
         let layout = schema.layout();
         let mut types = [TypeCode::U8; MAX_PK_COLUMNS];
-        for (t, (_, c)) in types.iter_mut().zip(layout.pk_columns()) {
+        for (t, c) in types.iter_mut().zip(layout.pk_columns()) {
             *t = c.type_code;
         }
         PkColumn {
@@ -425,7 +425,7 @@ impl ZSetBatch {
     /// The batch's layout is `schema`'s: key column types, payload slot count,
     /// and each slot's type.
     pub(crate) fn layout_matches(&self, schema: &Schema) -> Result<(), String> {
-        let want = schema.pk_cols().iter().map(|&c| schema.columns()[c as usize].ty.tc);
+        let want = schema.layout().pk_columns().map(|c| c.type_code);
         let got = self.pks.key_types();
         if !got.iter().copied().eq(want.clone()) {
             let want: Vec<TypeCode> = want.collect();
@@ -560,7 +560,7 @@ fn gather_cells(src: &[u8], stride: usize, rows: &[u32]) -> Vec<u8> {
 /// column, whose declaration every reader past the decoder trusts, or one past
 /// the last payload column.
 pub(crate) fn check_not_null(null_bmp: &[u8], schema: &Schema) -> Result<(), String> {
-    match gnitz_wire::first_not_null_violation(schema.layout().not_null_payload_slots(), null_bmp) {
+    match gnitz_wire::first_not_null_violation(schema.layout().nullable_payload_slots(), null_bmp) {
         None => Ok(()),
         Some((row, slot)) if slot >= schema.layout().num_payload_cols() => {
             Err(format!("row {row} sets null bit {slot}, past the last payload column"))

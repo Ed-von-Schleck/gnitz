@@ -27,12 +27,7 @@ impl ClientMap {
         src: &Schema,
         out_schema: Arc<Schema>,
     ) -> Result<Self, GnitzSqlError> {
-        let key = |s: &Schema| {
-            s.pk_cols()
-                .iter()
-                .map(|&c| s.columns()[c as usize].ty.tc)
-                .collect::<Vec<_>>()
-        };
+        let key = |s: &Schema| s.layout().pk_columns().map(|c| c.type_code).collect::<Vec<_>>();
         debug_assert_eq!(key(src), key(&out_schema), "a client map keeps its source's key");
         let ev = program
             .map(|p| p.resolve_map(src.layout(), out_schema.layout()))
