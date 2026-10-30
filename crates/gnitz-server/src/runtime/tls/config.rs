@@ -2,13 +2,11 @@
 //! again on every reload.
 
 use std::cell::RefCell;
-use std::io::Write as _;
 use std::net::SocketAddr;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gnitz_foundation::posix_io::fsync_parent;
+use gnitz_foundation::posix_io::write_file_durable;
 use gnitz_wire::ALPN_GNITZ;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -261,18 +259,7 @@ fn minted_identity(data_dir: &str, names: &[ServerName<'static>]) -> Result<Iden
     Ok(identity)
 }
 
-/// Replace `path` with `bytes`, permission bits `mode`, whole or not at all, and
-/// durably once it returns.
+/// [`write_file_durable`], its error in words.
 pub(super) fn write_file(path: &str, bytes: &[u8], mode: u32) -> Result<(), String> {
-    let tmp = format!("{path}.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&tmp)
-        .and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .and_then(|()| fsync_parent(path))
-        .map_err(|e| format!("failed to write {path}: {e}"))
+    write_file_durable(path, bytes, mode).map_err(|e| format!("failed to write {path}: {e}"))
 }

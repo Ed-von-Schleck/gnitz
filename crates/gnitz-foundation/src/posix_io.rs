@@ -108,6 +108,27 @@ pub fn create_dir_all_durable(dir: impl AsRef<std::path::Path>) -> io::Result<()
     std::iter::once(dir).chain(missing).try_for_each(fsync_parent)
 }
 
+/// Replace `path` with `bytes`, permission bits `mode`, whole or not at all, and
+/// durably once this returns. The bytes go to a fresh `<path>.tmp` first, so a
+/// stale one left by a crash never lends the file its own bits.
+pub fn write_file_durable(path: impl AsRef<std::path::Path>, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = path.as_ref();
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    fsync_parent(path)
+}
+
 /// Rename `from` to `to`, refused with `AlreadyExists` where `to` exists:
 /// `std::fs::rename` replaces a file, or an empty directory, in its place.
 #[cfg(target_os = "linux")]

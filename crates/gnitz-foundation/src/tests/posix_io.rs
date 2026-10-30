@@ -54,3 +54,18 @@ fn rename_noreplace_moves_a_directory_and_refuses_to_replace_one() {
     assert!(!std::path::Path::new(&path("from")).exists());
     assert!(std::path::Path::new(&path("to")).is_dir());
 }
+
+#[test]
+fn write_file_durable_replaces_the_file_with_its_own_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("key");
+    // A stale, world-readable tmp file a crash left behind.
+    std::fs::write(root.path().join("key.tmp"), b"stale").unwrap();
+    std::fs::set_permissions(root.path().join("key.tmp"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&path, b"old").unwrap();
+    write_file_durable(&path, b"new", 0o600).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!root.path().join("key.tmp").exists());
+}
