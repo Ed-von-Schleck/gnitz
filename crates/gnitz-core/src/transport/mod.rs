@@ -159,6 +159,16 @@ impl Interest {
 /// waits untimed. Expiry surfaces as `TimedOut`; `EINTR` is returned, and since
 /// `until` is absolute a caller may simply call again.
 pub fn poll_fd(fd: BorrowedFd<'_>, want: Interest, until: Option<Instant>) -> std::io::Result<Interest> {
+    poll_fd_or_cancel(fd, want, None, until).map(|ready| ready.expect("only a cancel fd cancels"))
+}
+
+/// [`poll_fd`], also polling `cancel` for any event: `None` once it has one.
+pub(crate) fn poll_fd_or_cancel(
+    fd: BorrowedFd<'_>,
+    want: Interest,
+    cancel: Option<BorrowedFd<'_>>,
+    until: Option<Instant>,
+) -> std::io::Result<Option<Interest>> {
     let timeout_ms: libc::c_int = match until {
         None => -1,
         Some(t) => {
@@ -171,16 +181,25 @@ pub fn poll_fd(fd: BorrowedFd<'_>, want: Interest, until: Option<Instant>) -> st
             left.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int
         }
     };
-    let mut pfd = libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: want.poll_events(),
-        revents: 0,
-    };
-    // SAFETY: one valid pollfd, count 1.
-    match unsafe { libc::poll(&mut pfd, 1, timeout_ms) } {
+    let mut pfds = [
+        libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: want.poll_events(),
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: cancel.map_or(-1, |c| c.as_raw_fd()),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let nfds = 1 + libc::nfds_t::from(cancel.is_some());
+    // SAFETY: `nfds` valid pollfds.
+    match unsafe { libc::poll(pfds.as_mut_ptr(), nfds, timeout_ms) } {
         rc if rc < 0 => Err(std::io::Error::last_os_error()),
         0 => Err(timed_out()),
-        _ => Ok(Interest::from_revents(pfd.revents)),
+        _ if pfds[1].revents != 0 => Ok(None),
+        _ => Ok(Some(Interest::from_revents(pfds[0].revents))),
     }
 }
 

@@ -78,6 +78,16 @@ const _: fn() = || {
     assert_send_sync::<Schema>();
 };
 
+/// The server `GNITZ_TARGET` names: `None` when it is unset or empty, and a
+/// refusal when it is not UTF-8.
+pub fn env_target() -> Result<Option<String>, String> {
+    match std::env::var("GNITZ_TARGET") {
+        Ok(target) => Ok((!target.is_empty()).then_some(target)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err("GNITZ_TARGET is not UTF-8".to_string()),
+    }
+}
+
 impl GnitzClient {
     /// A blocking client: its verbs' futures complete under [`block_on`](crate::block_on).
     pub fn connect(target: &str) -> Result<Self, ClientError> {

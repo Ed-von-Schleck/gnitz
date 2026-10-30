@@ -4,14 +4,16 @@
 //! [`Promise`] — every wait ends on.
 
 use std::future::{poll_fn, Future};
+use std::io::Read;
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{ready, Context, Poll, Waker};
 
 use crate::client::GnitzClient;
 use crate::error::ClientError;
-use crate::transport::{poll_fd, Interest};
+use crate::transport::{poll_fd_or_cancel, Interest};
 
 /// Run when a signal interrupts a [`BlockingHost`]'s wait; an `Err` aborts the
 /// call with [`ClientError::Interrupted`] and leaves the session as it stood.
@@ -47,6 +49,7 @@ pub trait Host: Send {
 pub struct BlockingHost {
     fd: Option<OwnedFd>,
     hook: Option<ParkHook>,
+    cancel: Option<UnixStream>,
 }
 
 impl BlockingHost {
@@ -54,6 +57,24 @@ impl BlockingHost {
     pub fn with_hook(hook: ParkHook) -> Self {
         BlockingHost { hook: Some(hook), ..Default::default() }
     }
+
+    /// A host whose wait gives up once `cancel` has bytes to read, and reads
+    /// them all: its `poll(2)` waits on `cancel` too, so a byte written at any
+    /// moment of the wait ends it. Whatever writes there must keep its end
+    /// open, as a closed one would cancel every wait.
+    pub fn cancelled_by(cancel: UnixStream) -> std::io::Result<Self> {
+        cancel.set_nonblocking(true)?;
+        Ok(BlockingHost {
+            cancel: Some(cancel),
+            ..Default::default()
+        })
+    }
+}
+
+/// Read what `cancel` holds, so it cancels no later wait.
+pub fn drain_cancel(mut cancel: &UnixStream) {
+    let mut buf = [0u8; 64];
+    while matches!(cancel.read(&mut buf), Ok(n) if n > 0) {}
 }
 
 impl Host for BlockingHost {
@@ -73,11 +94,17 @@ impl Host for BlockingHost {
             .as_ref()
             .expect("a client attaches its host before it waits")
             .as_fd();
+        let cancel = self.cancel.as_ref();
         loop {
-            match poll_fd(fd, want, None) {
-                Ok(ready) => {
+            match poll_fd_or_cancel(fd, want, cancel.map(AsFd::as_fd), None) {
+                Ok(Some(ready)) => {
                     io(ready);
                     return Poll::Ready(Ok(()));
+                }
+                Ok(None) => {
+                    drain_cancel(cancel.expect("only a cancel socket cancels"));
+                    let why: Box<dyn std::error::Error + Send + Sync> = "cancelled".into();
+                    return Poll::Ready(Err(ClientError::Interrupted(why.into())));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                     if let Some(hook) = self.hook.as_mut() {

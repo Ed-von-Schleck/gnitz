@@ -27,14 +27,16 @@ mod txn;
 
 pub use batch::{append_own_regions, push_zero_cell, BatchAppender, BatchMark, PayloadColumn, PkColumn, ZSetBatch};
 pub use catalog::{Catalog, CatalogRelation, IndexRow, RelProps};
-pub use client::GnitzClient;
+pub use client::{env_target, GnitzClient};
 pub use connection::{
     encode_ddl_txn, DeltaCursor, RelDescriptor, Request, ScanReply, Session, SnapshotPage, SubId, Target,
     MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
 pub use ddl::{segment_id, ColumnChange, FkTarget, InlineUniqueIndex, PlannedView, TableDef, ViewBundle};
 pub use error::{not_found, ClientError, ProtocolError};
-pub use host::{block_on, promise, serve, BlockingHost, BoxFut, Host, Job, Op, ParkHook, Pending, Promise, Sent};
+pub use host::{
+    block_on, drain_cancel, promise, serve, BlockingHost, BoxFut, Host, Job, Op, ParkHook, Pending, Promise, Sent,
+};
 pub use mirror::{MirrorError, MirrorStore, Planner, PollOutcome, PollResult, Subscription};
 pub use pushed::{Pushed, Synced};
 pub use rel_name::RelName;

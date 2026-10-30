@@ -1,7 +1,7 @@
 use super::*;
 use crate::connection::Request;
 use crate::test_support::{client_pair, interrupt_self_until, kv_schema, reply_ctrl, session_pair};
-use crate::ProtocolError;
+use crate::{poll_fd, ProtocolError};
 use gnitz_wire::{ReadBound, ReadSpec, TypeCode};
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -45,6 +45,29 @@ fn an_aborted_park_leaves_its_slot_pending_and_the_next_call_drains_it_first() {
     assert_eq!(block_on(c.scan_spec(1, &spec, &sa)).unwrap().lsn, Some(200));
     let _peer = h.join().unwrap();
     assert_eq!(c.session.interest(), Interest::NONE);
+}
+
+/// Bytes on the cancel socket end the wait, which reads them all, so the next
+/// call runs.
+#[test]
+fn a_cancellable_wait_gives_up_on_a_readable_cancel_socket_and_drains_it() {
+    let (s, peer) = session_pair();
+    let (cancel, mut canceller) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut c = GnitzClient::over(s, Box::new(BlockingHost::cancelled_by(cancel).unwrap())).unwrap();
+    let (sa, spec) = (Arc::new(kv_schema(TypeCode::I64)), ReadSpec::all_rows(ReadBound::None));
+    std::io::Write::write_all(&mut canceller, b"xx").unwrap();
+    let r = block_on(c.scan_spec(1, &spec, &sa));
+    assert!(matches!(r, Err(ClientError::Interrupted(_))));
+
+    peer.recv();
+    peer.send(&reply_ctrl(1, 100));
+    let h = std::thread::spawn(move || {
+        peer.recv();
+        peer.send(&reply_ctrl(1, 200));
+        peer
+    });
+    assert_eq!(block_on(c.scan_spec(1, &spec, &sa)).unwrap().lsn, Some(200));
+    let _peer = h.join().unwrap();
 }
 
 // ── Waiting ─────────────────────────────────────────────────────────────────
