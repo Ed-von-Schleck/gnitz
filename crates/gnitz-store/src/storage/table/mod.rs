@@ -84,6 +84,9 @@ pub(crate) struct Table {
     /// moves them into `memtable` as one run.
     pending: RunSet,
     /// Ingest runs, folded into `ram_tier` once they pass [`MEMTABLE_BYTES`].
+    /// [Cancelling](RunSet::cancelling): a reduce output's tick retracts the
+    /// rows the tick before it wrote, and merged at once the pair leaves no
+    /// cancelled row for a seek of that group to step over.
     memtable: RunSet,
     /// Folded memtable runs, spilled to a shard past the RAM-tier ceiling.
     ram_tier: RunSet,
@@ -171,7 +174,7 @@ impl Table {
         Ok(Table {
             // Never full: the budget only sizes its PK filter, to a tick's worth of rows.
             pending: RunSet::new(MEMTABLE_BYTES),
-            memtable: RunSet::new(MEMTABLE_BYTES),
+            memtable: RunSet::cancelling(MEMTABLE_BYTES),
             ram_tier: RunSet::cancelling(ram_tier_bytes),
             shard_index,
             loaded_mark: loaded.as_ref().map(|m| m.checkpoint_mark),
