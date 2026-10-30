@@ -169,19 +169,6 @@ impl DagEngine {
     pub(crate) fn is_ticked(&self, id: u64) -> bool {
         self.dependents_of(id).iter().any(|v| !self.rebuild.contains(v))
     }
-
-    /// The base tables — not streams — a view scans, sorted.
-    pub(crate) fn scanned_base_tables(&self, registry: &RelationRegistry) -> Vec<u64> {
-        let mut bases: Vec<u64> = self
-            .dep
-            .forward
-            .keys()
-            .copied()
-            .filter(|&s| registry.relation(s).is_some_and(|r| r.kind().is_base_table()))
-            .collect();
-        bases.sort_unstable();
-        bases
-    }
 }
 
 // ---------------------------------------------------------------------------

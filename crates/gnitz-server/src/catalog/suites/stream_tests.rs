@@ -72,23 +72,6 @@ fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
     discard(engine);
 }
 
-/// Boot's recovery sweep ticks no stream: it reads this one function, which is
-/// what is under test.
-#[test]
-fn the_drive_set_excludes_a_stream() {
-    let mut engine = fresh("stream_excluded_from_sweep");
-    let cols = u64_i64_cols();
-    let sid = create_stream(&mut engine, "public.s", &cols);
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    register_identity_view(&mut engine, sid, "v_s", &cols);
-    register_identity_view(&mut engine, tid, "v_t", &cols);
-
-    let driven = engine.dag.scanned_base_tables(&engine.registry);
-    assert_eq!(driven, [tid], "the base table a view scans, and not the stream");
-
-    discard(engine);
-}
-
 /// A view reaching a stream awaits a rebuild at reopen, and so does one over it.
 #[test]
 fn stream_fed_views_are_invalid_at_boot() {

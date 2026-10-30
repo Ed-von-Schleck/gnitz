@@ -6,6 +6,7 @@
 //! **Recovery order is a crash guard**: every step is placed so a crash at any
 //! point rebuilds a view rather than silently resuming a stale one.
 
+use std::collections::BTreeSet;
 use std::num::NonZero;
 use std::os::fd::AsRawFd;
 
@@ -99,14 +100,13 @@ fn recover_from_sal(tail: CommittedTail, slot: Slot, catalog: &mut CatalogEngine
     // previously-used epoch, so every group a walk sees carries the same width.
     let mut replayed: u32 = 0;
     let mut resliced_from: Option<u32> = None;
-    for msg in tail.groups().filter(|m| m.head.kind == SalMessageKind::Push) {
+    for msg in tail.pushes() {
         let tid = msg.head.target_id;
         // A table dropped later in the tail has no relation, and nothing to
         // recover into.
         let Some(relation) = catalog.registry.relation(tid) else {
             continue;
         };
-        // A stream's push is written at LSN 0, which no tail group carries.
         debug_assert!(relation.kind().is_base_table());
         let (schema, placement) = (relation.schema(), relation.placement());
         // Written for another width, so no payload is this rank's share: every one
@@ -299,21 +299,24 @@ fn fork_workers(
 
 /// The master's half of recovery once the workers have recovered and the SAL is
 /// rewound, ending in the checkpoint a clean restart resumes from.
-async fn master_post_fork_recovery(disp: &MasterDispatcher) -> Result<(), String> {
-    // Every scanned base, tail or none: the tick also opens each kept view's
-    // operator state, and the boot checkpoint publishes no trace of an unopened one.
-    let scanned = {
+/// `pushed` holds the base tables the tail pushed to.
+async fn master_post_fork_recovery(disp: &MasterDispatcher, pushed: BTreeSet<u64>) -> Result<(), String> {
+    // The scanned ones: only a replayed push lands rows above a base store's cut,
+    // and the backfill below reads at the cut. A view's operator state needs no
+    // tick: the boot checkpoint opens every resumed view's.
+    let ticked: Vec<u64> = {
         let cat = disp.cat();
-        cat.dag.scanned_base_tables(&cat.registry)
+        pushed.into_iter().filter(|&t| cat.dag.is_scanned(t)).collect()
     };
-    disp.drain_tick(&scanned)
+    disp.drain_tick(&ticked)
         .await
         .map_err(|e| format!("recovery tick sweep failed: {e}"))?;
 
     inject_recovery_panic("sweep");
 
     // Rebuild the views the boot verdict rejected, through the driver a live
-    // CREATE VIEW uses; they opened empty and the sweep above skipped them.
+    // CREATE VIEW uses; they opened empty, and no tick reaches them until their
+    // backfill.
     let invalid: Vec<u64> = disp.cat_mut().dag.take_rebuild().into_iter().collect();
     // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
     // E2E): 0 ⇒ every view resumed from its checkpoint.
@@ -412,12 +415,19 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
             Either::B(w) => Err(died(w)),
         }
     })?;
+    // Read before the writer's rewind empties the ring the tail walks.
+    let pushed = tail.pushed();
     let sal = SalWriter::boot(tail, parks, acked);
     inject_recovery_panic("reset");
 
     let dispatcher = MasterDispatcher::new(worker_pids, catalog, sal, reactor);
     dispatcher.reactor().block_on(async {
-        match select2(master_post_fork_recovery(&dispatcher), dispatcher.worker_death()).await {
+        match select2(
+            master_post_fork_recovery(&dispatcher, pushed),
+            dispatcher.worker_death(),
+        )
+        .await
+        {
             Either::A(r) => r,
             Either::B(w) => Err(died(w)),
         }

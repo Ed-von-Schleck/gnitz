@@ -1,6 +1,8 @@
 //! Which zones a boot replays: every zone closed before the recovery walk's
 //! first defect.
 
+use std::collections::BTreeSet;
+
 use super::{next_epoch, SalLog, SalMessage, SalMessageKind};
 
 /// The committed part of the un-checkpointed tail.
@@ -33,7 +35,18 @@ impl CommittedTail {
     /// Whether a push committed since the last base round: this boot's replay
     /// moves a base store.
     pub(crate) fn holds_pushes(self) -> bool {
-        self.groups().any(|m| m.head.kind == SalMessageKind::Push)
+        self.pushes().next().is_some()
+    }
+
+    /// The tail's Push groups, in log order. A stream's push is written at LSN 0,
+    /// which no tail group carries, so each targets a base table.
+    pub(crate) fn pushes(self) -> impl Iterator<Item = SalMessage> {
+        self.groups().filter(|m| m.head.kind == SalMessageKind::Push)
+    }
+
+    /// The relations [`Self::pushes`] target, each once, ascending.
+    pub(crate) fn pushed(self) -> BTreeSet<u64> {
+        self.pushes().map(|m| m.head.target_id).collect()
     }
 
     /// The log the tail was read from.
