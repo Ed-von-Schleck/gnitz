@@ -211,13 +211,118 @@ fn creating_a_child_of_a_parent_the_same_delta_drops_is_refused() {
 #[test]
 fn test_fk_invalid_targets() {
     let mut engine = fresh("fk_invalid");
+    let u = TypeCode::U64;
 
     let parent_tid = engine.create_table("public.p", &u64_i64_cols(), &[0]).unwrap();
+    let view_tid = register_identity_view(&mut engine, parent_tid, "pv", &u64_i64_cols());
+    let stream_tid = create_stream(&mut engine, "public.ps", &[col_def("id", u)]);
+    let cp_cols = [col_def("a", u), col_def("b", u), col_def("c", u)];
+    let cp_tid = engine.create_table("public.cp", &cp_cols, &[0, 1]).unwrap();
+    engine.create_index("public.cp", &["c"], true).unwrap();
+    engine.create_index("public.cp", &["b", "c"], true).unwrap();
+    let uq_tid = engine
+        .create_table("public.uq", &[col_def("id", u), col_def("v", u)], &[0])
+        .unwrap();
+    engine.create_index("public.uq", &["v"], true).unwrap();
+    let sys_tid = SysFamily::Table.id();
 
-    // FK targeting non-PK column (col_idx=1) should fail
-    let bad_cols = vec![col_def("pk", TypeCode::U64), fk_def("fk", TypeCode::I64, parent_tid, 1)];
-    assert!(engine.create_table("public.c_bad", &bad_cols, &[0]).is_err());
+    let cases: [(u64, u32, TypeCode, &str); 8] = [
+        (
+            parent_tid,
+            1,
+            TypeCode::I64,
+            "'fk' references public.p.v, which is neither its lone primary key nor \
+             covered by a single-column UNIQUE index",
+        ),
+        (
+            view_tid,
+            0,
+            u,
+            "'fk' references public.pv, which is a view; a FOREIGN KEY must reference a base table",
+        ),
+        (stream_tid, 0, u, "'fk' references public.ps, which is a stream"),
+        (sys_tid, 0, u, "which is a system table"),
+        // A compound PK has no lone column; only a single-column UNIQUE index
+        // makes a member a target.
+        (cp_tid, 0, u, "references public.cp.a, which is neither"),
+        // A unique `(b, c)` does not make `b` alone unique.
+        (cp_tid, 1, u, "references public.cp.b, which is neither"),
+        (cp_tid, 9, u, "references column 9 of public.cp, which has 3 columns"),
+        (cp_tid, 2, u, ""),
+    ];
+    for (n, (tid, col, ty, want)) in cases.into_iter().enumerate() {
+        let cols = vec![col_def("pk", u), fk_def("fk", ty, tid, col)];
+        let got = engine.create_table(&format!("public.c{n}"), &cols, &[0]);
+        match want {
+            "" => assert!(got.is_ok(), "{tid}.{col}: {got:?}"),
+            want => {
+                let err = got.expect_err(want);
+                assert!(err.contains(want), "{tid}.{col}: want {want:?}, got {err:?}");
+            }
+        }
+    }
+    let cols = vec![col_def("pk", u), fk_def("fk", u, uq_tid, 1)];
+    engine.create_table("public.c_uq", &cols, &[0]).unwrap();
 
+    finish(engine);
+}
+
+/// The self-referencing target is the lone PK: the table holds no index yet, so
+/// even a UNIQUE its own CREATE declares cannot count.
+#[test]
+fn a_self_fk_must_target_the_lone_pk() {
+    let mut engine = fresh("fk_self_target");
+    let u = TypeCode::U64;
+    for (cols, pk, want) in [
+        (
+            vec![col_def("id", u), col_def("tag", u), fk_def("p", u, 0, 1)],
+            &[0][..],
+            "FK column 'p' references 'tag' of its own table; a self-referencing FK \
+             must reference the table's lone primary key column",
+        ),
+        (
+            vec![col_def("a", u), col_def("b", u), fk_def("p", u, 0, 0)],
+            &[0, 1],
+            "references 'a' of its own table",
+        ),
+        (
+            vec![col_def("id", u), fk_def("p", u, 0, 7)],
+            &[0],
+            "FK column 'p' references column 7 of its own table, which has 2 columns",
+        ),
+        (vec![col_def("id", u), fk_def("p", u, 0, 0)], &[0], ""),
+    ] {
+        // The id the create takes.
+        let tid = engine.next_id;
+        let mut cols = cols;
+        cols.iter_mut()
+            .filter_map(|c| c.fk.as_mut())
+            .for_each(|fk| fk.table_id = tid);
+        let got = engine.create_table(&format!("public.t{tid}"), &cols, pk);
+        match want {
+            "" => assert!(got.is_ok(), "{got:?}"),
+            want => {
+                let err = got.expect_err(want);
+                assert!(err.contains(want), "want {want:?}, got {err:?}");
+            }
+        }
+    }
+    finish(engine);
+}
+
+/// A stream holds no rows for a referential action to check, so none of its
+/// columns carries an FK; the refusal names the stream and the column.
+#[test]
+fn a_stream_carries_no_foreign_key() {
+    let mut engine = fresh("fk_stream_child");
+    let parent_tid = engine.create_table("public.p", &u64_i64_cols(), &[0]).unwrap();
+    let cols = [col_def("id", TypeCode::U64), fk_def("r", TypeCode::U64, parent_tid, 0)];
+    let stream = gnitz_wire::TableProps { stream: true, ..Default::default() };
+    let err = engine.create_table_with("public.s", &cols, &[0], stream).unwrap_err();
+    assert!(
+        err.contains("stream 's'") && err.contains("column 'r' may not carry a FOREIGN KEY"),
+        "{err}"
+    );
     finish(engine);
 }
 

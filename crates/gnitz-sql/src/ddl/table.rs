@@ -140,88 +140,41 @@ fn resolve_referred_column(
     }
 }
 
-/// Resolve a self-referencing FK against the in-flight column list (the table
-/// is not yet registered in the catalog). The referenced column must be the
-/// table's lone PK column.
-fn resolve_fk_target_inline(
-    current_cols: &[ColumnDef],
-    current_pk_cols: &[u32],
-    ref_table: &RelName,
-    site: &FkSite<'_>,
-) -> Result<(FkTarget, ColType), GnitzSqlError> {
-    let pk_single = (current_pk_cols.len() == 1).then(|| current_pk_cols[0] as usize);
-    let ref_col_idx = resolve_referred_column(site.referred_columns, ref_table, current_cols, pk_single)?;
-
-    if pk_single != Some(ref_col_idx) {
-        return Err(GnitzSqlError::Rejected(format!(
-            "self-referencing FK must reference the primary key of '{}'; \
-             column '{}' is not the lone PK",
-            ref_table, current_cols[ref_col_idx].name,
-        )));
-    }
-
-    check_fk_type_compat(current_cols[site.col_idx].ty, current_cols[ref_col_idx].ty)?;
-    Ok((
-        FkTarget::SelfTable {
-            col: ref_col_idx as u32,
-            on_delete: site.on_delete,
-        },
-        current_cols[ref_col_idx].ty,
-    ))
-}
-
-/// Resolve a REFERENCES clause naming `ref_table`, another, already-registered
-/// table, to its target and the parent column's type. The referenced column is a
-/// legal target iff it is the parent's lone PK column or it carries its own
-/// single-column UNIQUE index. Validates that the child's type `child_ty` is
-/// compatible with the referenced column's and returns that type so the caller
-/// can widen the child column.
+/// Resolve the REFERENCES clause of `site` to its target and the parent column's
+/// type, which the child column adopts once checked compatible. A
+/// self-reference (`ref_table` is the table being created) resolves against the
+/// in-flight `cols` and `pk`, the table not being in the catalog yet; any other
+/// against the registered relation. The engine holds the target to a base
+/// table's lone PK or a column with a single-column UNIQUE index.
 fn resolve_fk_target(
     cat: &dyn Catalog,
     site: &FkSite<'_>,
     ref_table: &RelName,
-    child_ty: ColType,
+    self_ref: bool,
+    cols: &[ColumnDef],
+    pk: &[u32],
 ) -> Result<(FkTarget, ColType), GnitzSqlError> {
-    let ref_rel = cat.probe_relation(ref_table)?;
-    let ref_schema = &ref_rel.schema;
-    // The PK/UNIQUE tests below read only the schema, and both a view's and a
-    // stream's PK look exactly like a base table's without being the unique, stored
-    // key the parent probe reads.
-    require_class(&ref_rel, ref_table, ClassWant::BaseTable, "a FOREIGN KEY target")?;
-    let ref_tid = ref_rel.tid;
-
-    let pk_single = ref_schema.layout().lone_pk_col();
-    let ref_col_idx = resolve_referred_column(site.referred_columns, ref_table, ref_schema.columns(), pk_single)?;
-
-    // Legal target iff the referenced column is the parent's lone PK or carries a
-    // UNIQUE index of its own. A composite unique `(a, b)` does not make `a`
-    // unique, so the column list is matched exactly.
-    if pk_single != Some(ref_col_idx) {
-        let unique = ref_rel
-            .indexes
-            .iter()
-            .any(|m| m.cols.as_slice() == [ref_col_idx as u32] && m.is_unique);
-        if !unique {
-            return Err(GnitzSqlError::Rejected(format!(
-                "FK against table '{}' must reference the primary key or a column \
-                 with a UNIQUE index; column '{}' has neither",
-                ref_table,
-                ref_schema.columns()[ref_col_idx].name,
-            )));
+    let probed;
+    let (parent_cols, pk_single, parent) = match self_ref {
+        true => (cols, (pk.len() == 1).then(|| pk[0] as usize), None),
+        false => {
+            probed = cat.probe_relation(ref_table)?;
+            (
+                probed.schema.columns(),
+                probed.schema.layout().lone_pk_col(),
+                Some(probed.tid),
+            )
         }
-    }
-
-    // Child column widens to the referenced parent column's type.
-    check_fk_type_compat(child_ty, ref_schema.columns()[ref_col_idx].ty)?;
-
-    Ok((
-        FkTarget::Table(FkRef {
-            table_id: ref_tid,
-            col: ref_col_idx as u32,
-            on_delete: site.on_delete,
-        }),
-        ref_schema.columns()[ref_col_idx].ty,
-    ))
+    };
+    let col = resolve_referred_column(site.referred_columns, ref_table, parent_cols, pk_single)?;
+    let parent_ty = parent_cols[col].ty;
+    check_fk_type_compat(cols[site.col_idx].ty, parent_ty)?;
+    let (col, on_delete) = (col as u32, site.on_delete);
+    let target = match parent {
+        None => FkTarget::SelfTable { col, on_delete },
+        Some(table_id) => FkTarget::Table(FkRef { table_id, col, on_delete }),
+    };
+    Ok((target, parent_ty))
 }
 
 /// A strictly simple identifier expression's name, or the shared
@@ -392,19 +345,6 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
         fk_sites,
         unique,
     })
-}
-
-/// A stream holds no rows: nothing for a referential action to check against.
-/// The engine refuses an FK naming the relation by id; this names the column.
-/// Runs before FK resolution, which would otherwise probe the parent first.
-fn reject_stream_foreign_key(d: &Declared<'_>) -> Result<(), GnitzSqlError> {
-    if let Some(site) = d.fk_sites.first() {
-        return Err(GnitzSqlError::Rejected(format!(
-            "a stream cannot carry a FOREIGN KEY (column '{}'): it holds no rows to check against",
-            d.cols[site.col_idx].name
-        )));
-    }
-    Ok(())
 }
 
 /// Drop a UNIQUE the PK already covers: a second index on a lone single-column PK
@@ -665,17 +605,13 @@ pub(crate) fn plan_create_table(
     // ambiguous *reference*, when it is the definition that is wrong.
     reject_duplicate_names(create.columns.iter().map(|c| c.name.value.as_str()), "table definition")?;
 
-    let declared = collect_declarations(create)?;
-    if props.stream {
-        reject_stream_foreign_key(&declared)?;
-    }
     let Declared {
         mut cols,
         pk: pk_indices,
         serial,
         fk_sites,
         mut unique,
-    } = declared;
+    } = collect_declarations(create)?;
 
     // A self-FK resolves against the whole PK, and each resolve REWRITES its child
     // column's type to the parent's — so this runs after collection, not inside it.
@@ -699,13 +635,8 @@ pub(crate) fn plan_create_table(
                 cols[site.col_idx].name
             )));
         };
-        // A self-reference resolves against the in-flight column list: the table
-        // being created is not in the catalog yet.
-        let (fk, parent_pk_type) = if ref_table == table_name {
-            resolve_fk_target_inline(&cols, &pk_indices, &ref_table, site)?
-        } else {
-            resolve_fk_target(cat, site, &ref_table, cols[site.col_idx].ty)?
-        };
+        let self_ref = ref_table == table_name;
+        let (fk, parent_pk_type) = resolve_fk_target(cat, site, &ref_table, self_ref, &cols, &pk_indices)?;
         slot.insert(fk);
         cols[site.col_idx].ty = parent_pk_type;
     }

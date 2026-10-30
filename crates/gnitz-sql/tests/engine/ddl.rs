@@ -653,8 +653,8 @@ fn a_qualified_name_reaches_another_schema() {
         (
             "CREATE TABLE fk_sys (id BIGINT PRIMARY KEY, \
              t BIGINT UNSIGNED NOT NULL REFERENCES _system.tables(table_id))",
-            Rejected,
-            "is a system table",
+            Refused(Error),
+            "which is a system table; a FOREIGN KEY must reference a base table",
         ),
         (
             "INSERT INTO _system.schemas VALUES (99, 'forged')",

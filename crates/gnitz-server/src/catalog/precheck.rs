@@ -190,45 +190,69 @@ impl CatalogEngine {
         self_schema: &SchemaDescriptor,
         dropped: &IdSet,
     ) -> Result<(), String> {
+        let child = &col.def.name;
         let target_type = if fk.table_id == self_table_id {
-            // Self-referential FK: the table has no UNIQUE index yet, so the
-            // target must be its lone PK column. The downstream probe reads the
-            // referenced value out of the packed PK region, which is the whole
-            // key only when the PK is a single column.
+            let Some(target) = self_cols.get(fk.col as usize) else {
+                return Err(format!(
+                    "FK column '{child}' references column {} of its own table, which has {} columns",
+                    fk.col,
+                    self_cols.len()
+                ));
+            };
+            // Self-referential FK: the table has no UNIQUE index yet — not even
+            // one its own CREATE declares — so the target must be its lone PK
+            // column. The downstream probe reads the referenced value out of the
+            // packed PK region, which is the whole key only when the PK is a
+            // single column.
             if self_schema.lone_pk_col() != Some(fk.col as usize) {
-                return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
+                return Err(format!(
+                    "FK column '{child}' references '{}' of its own table; a self-referencing FK \
+                     must reference the table's lone primary key column",
+                    target.def.name
+                ));
             }
-            self_cols[fk.col as usize].def.ty
+            target.def.ty
         } else {
             if dropped.contains(fk.table_id) {
                 return Err(format!(
-                    "FK references table {}, which this transaction drops",
-                    fk.table_id
+                    "FK column '{child}' references {}, which this transaction drops",
+                    self.qualified_name(fk.table_id)
                 ));
             }
             let entry = self
                 .registry
                 .relation(fk.table_id)
-                .ok_or_else(|| format!("FK references unknown table_id {}", fk.table_id))?;
+                .ok_or_else(|| format!("FK column '{child}' references unknown table_id {}", fk.table_id))?;
+            let parent = self.qualified_name(fk.table_id);
             // Not covered by the PK/UNIQUE tests below, which read the parent's
             // key and index claims but not its kind: a stream's or a view's PK
             // looks like a base table's without being the unique, stored key the
             // parent probe reads.
             if !entry.kind().is_base_table() {
                 return Err(format!(
-                    "FK references relation {}, which is a {}; a FOREIGN KEY must reference a base table",
-                    fk.table_id,
+                    "FK column '{child}' references {parent}, which is a {}; \
+                     a FOREIGN KEY must reference a base table",
                     entry.kind().noun()
                 ));
             }
+            let defs = self.read_column_defs(fk.table_id)?;
+            let Some(target) = defs.get(fk.col as usize) else {
+                return Err(format!(
+                    "FK column '{child}' references column {} of {parent}, which has {} columns",
+                    fk.col,
+                    defs.len()
+                ));
+            };
             // No index counts as dropping here: `dropped` holds this delta's
             // relation ids, and an index drop arrives in the index family's delta.
             if !holds_fk_target(entry, fk.col, &IdSet::default()) {
-                return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
+                return Err(format!(
+                    "FK column '{child}' references {parent}.{}, which is neither its lone \
+                     primary key nor covered by a single-column UNIQUE index",
+                    target.def.name
+                ));
             }
-            // In range: the checks above admit only the parent's lone PK column
-            // or a column a unique index names.
-            self.read_column_defs(fk.table_id)?[fk.col as usize].def.ty
+            target.def.ty
         };
 
         // The preflight compares child and parent values as the referenced

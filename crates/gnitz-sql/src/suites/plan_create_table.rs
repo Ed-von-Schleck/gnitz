@@ -280,10 +280,9 @@ fn or_replace_is_rejected() {
     assert_rejects(sql, plan_table(&cat, sql), "OR REPLACE");
 }
 
-/// A stream holds no rows, so it backs no index, enforces no referential action
-/// and seeds no SERIAL generator.
+/// A stream holds no rows, so it backs no index and seeds no SERIAL generator.
 #[test]
-fn a_stream_refuses_serial_a_foreign_key_and_a_unique() {
+fn a_stream_refuses_serial_and_a_unique() {
     let cat = fk_catalog();
     for (sql, needle) in [
         (
@@ -291,10 +290,6 @@ fn a_stream_refuses_serial_a_foreign_key_and_a_unique() {
             "UNIQUE",
         ),
         ("CREATE TABLE s (id SERIAL PRIMARY KEY) WITH (stream = true)", "SERIAL"),
-        (
-            "CREATE TABLE s (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id)) WITH (stream = true)",
-            "FOREIGN KEY",
-        ),
         // Written table-level, the UNIQUE arrives through the constraints pass.
         (
             "CREATE TABLE s (id BIGINT PRIMARY KEY, a BIGINT, UNIQUE(a)) WITH (stream = true)",
@@ -328,7 +323,7 @@ fn a_stream_refuses_serial_a_foreign_key_and_a_unique() {
 
 /// A clause `CREATE TABLE` does not honour is named rather than dropped — a
 /// dropped CHECK or DEFAULT is a constraint never enforced — and a FOREIGN KEY
-/// target must be one stored, individually unique column.
+/// references one column of the parent's type.
 #[test]
 fn an_unhonoured_clause_or_fk_target_is_named() {
     let known = fk_catalog();
@@ -339,10 +334,6 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
         vec![0, 1],
     );
     known.insert(&in_sn("cp"), cp);
-    let st = rel(43, RelClass::Stream, vec![col("id", TypeCode::I64)], vec![0], vec![]);
-    known.insert(&in_sn("st"), st);
-    let sys = rel(44, RelClass::Catalog, vec![col("id", TypeCode::I64)], vec![0], vec![]);
-    known.insert(&in_sn("sys"), sys);
     for (sql, needle) in [
         ("CREATE TABLE t (id BIGINT PRIMARY KEY) AS SELECT id FROM p", "CTAS"),
         ("CREATE TEMPORARY TABLE t (id BIGINT PRIMARY KEY)", "TEMPORARY"),
@@ -380,20 +371,6 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT UNSIGNED REFERENCES p(id))",
             "FK type mismatch",
-        ),
-        (
-            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES st(id))",
-            "is a stream",
-        ),
-        (
-            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES sys(id))",
-            "'sys' is a system table; a FOREIGN KEY target requires a base table",
-        ),
-        // A compound PK has no lone column, so a member qualifies only through a
-        // UNIQUE index of its own.
-        (
-            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT UNSIGNED REFERENCES cp(a))",
-            "UNIQUE index",
         ),
         (
             "CREATE TABLE t (x BIGINT UNSIGNED, y BIGINT UNSIGNED, id BIGINT PRIMARY KEY, \
@@ -511,14 +488,18 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
     assert_eq!(c.fks, [(1, want)].into());
     assert_eq!(c.unique_indexes, vec![unique(&[1], &format!("{SN}__c__idx_r"))]);
 
-    // A non-PK parent column is a legal target only with a single-column UNIQUE
-    // index on it.
-    created(
+    // A non-PK parent column resolves by name; the engine holds it to a
+    // single-column UNIQUE index.
+    let c = created(
         &cat,
         "CREATE TABLE c2 (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(u))",
     );
-    let sql = "CREATE TABLE c3 (id BIGINT PRIMARY KEY, r BIGINT REFERENCES q(u))";
-    assert_rejects(sql, plan_table(&cat, sql), "UNIQUE index");
+    let want = FkTarget::Table(FkRef {
+        table_id: 41,
+        col: 1,
+        on_delete: FkAction::Restrict,
+    });
+    assert_eq!(c.fks, [(1, want)].into());
 }
 
 /// `ON DELETE` plans to its action in each spelling of a reference: a column
@@ -578,16 +559,8 @@ fn a_self_fk_targets_the_lone_pk_and_adopts_its_type() {
         assert_eq!(c.schema.columns()[col_idx].ty.tc, TypeCode::I64, "{sql}");
     }
     for (sql, needle) in [
-        (
-            "CREATE TABLE tree (id BIGINT PRIMARY KEY, tag BIGINT, p BIGINT REFERENCES tree(tag))",
-            "column 'tag' is not the lone PK",
-        ),
-        // A compound PK has no lone column: named, a member is not it; omitted,
-        // there is no default.
-        (
-            "CREATE TABLE tree (a BIGINT, b BIGINT, p BIGINT REFERENCES tree(a), PRIMARY KEY (a, b))",
-            "column 'a' is not the lone PK",
-        ),
+        // A compound PK has no lone column, so an omitted column list has no
+        // default.
         (
             "CREATE TABLE tree (a BIGINT, b BIGINT, p BIGINT REFERENCES tree, PRIMARY KEY (a, b))",
             "must name the referenced column",
