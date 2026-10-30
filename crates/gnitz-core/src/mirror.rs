@@ -83,13 +83,10 @@ pub trait MirrorStore: Send {
     fn fill(&mut self, tid: u64, blocks: &[&[u8]], sealed_at: Option<DeltaCursor>) -> Result<(), MirrorError>;
 
     /// Apply `blocks`, the view's deltas after the copy's cursor, and advance it to
-    /// `next`. Refused for a copy holding no cursor. May touch the disk.
+    /// `next`. Refused for a copy holding no cursor. May touch the disk when
+    /// `blocks` is non-empty; with no blocks it touches no disk, since the
+    /// client calls it on its own thread.
     fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError>;
-
-    /// Move the copy's cursor to `next`, the view having no delta after the
-    /// cursor it holds. Refused for a copy holding no cursor. Touches no disk:
-    /// the client calls it on its own thread.
-    fn move_cursor(&mut self, tid: u64, next: DeltaCursor) -> Result<(), MirrorError>;
 
     /// Run `spec` against `tid`'s copy, replying under `reply_schema`.
     fn scan_spec(
@@ -315,22 +312,20 @@ impl Store {
         host: &mut dyn Host,
         trains: Vec<(u64, Vec<RawBlock>, DeltaCursor)>,
     ) -> Result<Vec<(u64, Result<(), ClientError>)>, ClientError> {
-        if trains.iter().all(|(_, blocks, _)| blocks.is_empty()) {
-            let moved = trains.into_iter().map(|(tid, _, next)| {
-                let moved = self.touch().and_then(|mut s| s.move_cursor(tid, next));
-                (tid, moved.map_err(ClientError::from))
-            });
-            return Ok(moved.collect());
-        }
-        offload(host, move || {
+        // A cursor move touches no disk, so it runs on the client's thread.
+        let quiet = trains.iter().all(|(_, blocks, _)| blocks.is_empty());
+        let apply = move || {
             let advance = |(tid, blocks, next): (u64, Vec<RawBlock>, DeltaCursor)| {
                 let blocks: Vec<&[u8]> = blocks.iter().map(RawBlock::block).collect();
                 let advanced = self.touch().and_then(|mut s| s.advance(tid, &blocks, next));
                 (tid, advanced.map_err(ClientError::from))
             };
             trains.into_iter().map(advance).collect()
-        })
-        .await
+        };
+        if quiet {
+            return Ok(apply());
+        }
+        offload(host, apply).await
     }
 }
 

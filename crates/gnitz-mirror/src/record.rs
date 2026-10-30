@@ -1,9 +1,9 @@
 //! A copy's registration and feed position, published in the manifest beside
 //! the copy's rows.
 
-use gnitz_core::{DeltaCursor, MirrorError, RelDescriptor, RelName};
+use gnitz_core::{DeltaCursor, RelDescriptor, RelName};
 use gnitz_wire::{decode_all, PkColList, Writer, MAX_LIST_LEN};
-use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::{decode_schema_block, SchemaDescriptor};
 
 /// What one copy's registration fixed, and where its feed got to.
 #[derive(Debug, PartialEq, Eq)]
@@ -70,7 +70,7 @@ impl MirrorRecord {
             Ok(MirrorRecord { feed, name, block, pk_repeats, indexes })
         })
         .ok()?;
-        let schema = descriptor_of_block(&rec.block).ok()?;
+        let schema = decode_schema_block(&rec.block).ok()?;
         Some((rec, schema))
     }
 }
@@ -81,11 +81,6 @@ pub(crate) fn index_lists(desc: &RelDescriptor) -> Vec<PkColList> {
     lists.sort_unstable();
     lists.dedup();
     lists
-}
-
-/// The engine descriptor a wire schema record denotes.
-pub(crate) fn descriptor_of_block(block: &[u8]) -> Result<SchemaDescriptor, MirrorError> {
-    gnitz_zset::schema::decode_schema_block(block).map_err(|e| MirrorError::Engine(format!("schema record: {e}")))
 }
 
 #[cfg(test)]

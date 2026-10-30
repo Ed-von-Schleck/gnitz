@@ -126,10 +126,6 @@ impl MirrorStore for StubStore {
         Ok(())
     }
 
-    fn move_cursor(&mut self, tid: u64, next: DeltaCursor) -> Result<(), MirrorError> {
-        self.advance(tid, &[], next)
-    }
-
     fn scan_spec(
         &mut self,
         _tid: u64,

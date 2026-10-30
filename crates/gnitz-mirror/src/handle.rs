@@ -15,7 +15,7 @@ use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 
-use crate::record::{descriptor_of_block, index_lists, Feed, MirrorRecord};
+use crate::record::{index_lists, Feed, MirrorRecord};
 
 /// What a store is sized by. `Default` is the production value of every field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -302,8 +302,8 @@ impl MirrorStore for Mirror {
                     feed: Feed::Empty,
                     block,
                 };
-                let schema = descriptor_of_block(&rec.block)?;
-                self.enter(tid, rec, schema, None).map_err(MirrorError::Engine)?;
+                self.enter(tid, rec, *desc.schema.layout(), None)
+                    .map_err(MirrorError::Engine)?;
             }
         }
         Ok(())
@@ -352,13 +352,10 @@ impl MirrorStore for Mirror {
             self.ingest(tid, block)?;
         }
         self.settle(tid, next);
-        self.checkpoint_if_due();
-        Ok(())
-    }
-
-    fn move_cursor(&mut self, tid: u64, next: DeltaCursor) -> Result<(), MirrorError> {
-        self.continuing(tid)?;
-        self.settle(tid, next);
+        // A cursor move applies nothing and runs on the client's thread.
+        if !blocks.is_empty() {
+            self.checkpoint_if_due();
+        }
         Ok(())
     }
 
