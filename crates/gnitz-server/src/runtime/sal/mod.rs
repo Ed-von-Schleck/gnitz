@@ -424,6 +424,7 @@ pub(crate) struct GroupHead {
     /// The worker count the group was written at.
     width: u8,
     pub(crate) reply: Option<RequestId>,
+    /// The relation the group's request names, or 0; its payloads carry none.
     pub(crate) target_id: u64,
     /// The workers the group addresses, within `width`.
     pub(crate) targets: WorkerSet,
@@ -542,12 +543,15 @@ impl SalMessage {
         payload: &[u8],
         known: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
     ) -> Result<Option<Batch>, String> {
-        decode_sal_frame(payload, known).map(|(_, batch)| batch).map_err(|e| {
-            format!(
-                "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
-                self.base, self.head.lsn, self.head.target_id
-            )
-        })
+        let tid = self.head.target_id;
+        decode_sal_frame(payload, |record| known(tid, record))
+            .map(|(_, batch)| batch)
+            .map_err(|e| {
+                format!(
+                    "SAL replay: corrupt block at offset={} lsn={} target={tid}: {e}",
+                    self.base, self.head.lsn
+                )
+            })
     }
 }
 
@@ -556,14 +560,14 @@ impl SalMessage {
 /// caller already knows.
 fn decode_sal_frame(
     bytes: &[u8],
-    known: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
+    known: impl FnOnce(&[u8]) -> Option<SchemaDescriptor>,
 ) -> Result<(DecodedControl, Option<Batch>), String> {
     let control = peek_control_block(bytes)?;
     let Some(r) = control.data.clone() else {
         return Ok((control, None));
     };
     let record = &bytes[control.schema.clone().ok_or("a data block without a schema block")?];
-    let schema = match known(control.hdr.target_id, record) {
+    let schema = match known(record) {
         Some(s) => s,
         None => decode_schema_block(record)?,
     };
@@ -1037,7 +1041,7 @@ impl<'a> SalExcl<'a> {
 
         let set = g.targets.set.within(nw);
         let shared = matches!(g.data, GroupData::Same(_));
-        let (kind, template) = g.request.encode();
+        let (kind, target_id, template) = g.request.encode();
         debug_assert!(
             shared || g.data.holders().union(set) == set,
             "a group addresses every worker it has rows for"
@@ -1055,7 +1059,7 @@ impl<'a> SalExcl<'a> {
             flags: if shared { FLAG_SHARED } else { 0 } | if joins_cut { FLAG_JOINS_CUT } else { 0 },
             width: nw as u8,
             reply: g.targets.reply,
-            target_id: template.target_id,
+            target_id,
             targets: set,
         };
         let mut workers = payloads.iter();
@@ -1351,7 +1355,7 @@ impl SalReader {
             )
         };
         // Read in place: the rows move once, out of the decoded frame.
-        let mut decoded = decode_sal_frame(wire, catalog_schema);
+        let mut decoded = decode_sal_frame(wire, |record| catalog_schema(msg.head.target_id, record));
         let (control, rows) = match &mut decoded {
             Ok(frame) => frame,
             Err(e) => undecodable(std::mem::take(e)),
@@ -1361,7 +1365,12 @@ impl SalReader {
         if rows.is_some() && !matches!(msg.head.kind, SalMessageKind::Push | SalMessageKind::DdlSync) {
             undecodable(format!("a {:?} group carries no rows", msg.head.kind));
         }
-        let what = match SalRequest::decode(msg.head.kind, &control.hdr, &wire[control.blob.clone()]) {
+        let what = match SalRequest::decode(
+            msg.head.kind,
+            msg.head.target_id,
+            &control.hdr,
+            &wire[control.blob.clone()],
+        ) {
             Ok(what) => what,
             Err(e) => undecodable(e),
         };
@@ -1371,7 +1380,7 @@ impl SalReader {
                     undecodable("a read group carries no request id".into())
                 };
                 let route = ReplyRoute {
-                    target_id: control.hdr.target_id,
+                    target_id: msg.head.target_id,
                     request_id,
                     cut: self.cut,
                 };

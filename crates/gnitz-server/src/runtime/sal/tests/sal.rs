@@ -864,19 +864,15 @@ fn a_read_group_without_a_request_id_aborts_internal() {
 // The frame decode
 // ---------------------------------------------------------------------------
 
-/// `rest` addressed to relation `tid`, carrying its schema `record`, with the
-/// caller's own header fields kept.
-fn frame<'a>(tid: u64, record: &'a [u8], rest: WireMsg<'a>) -> WireMsg<'a> {
-    WireMsg {
-        target_id: tid,
-        schema_block: Some(record),
-        ..rest
-    }
+/// `rest` carrying the schema `record`, with the caller's own header fields
+/// kept.
+fn frame<'a>(record: &'a [u8], rest: WireMsg<'a>) -> WireMsg<'a> {
+    WireMsg { schema_block: Some(record), ..rest }
 }
 
 /// A SAL slot's rows, its record decoded.
 fn sal_rows(wire: &[u8]) -> Result<Option<Batch>, String> {
-    decode_sal_frame(wire, |_, _| None).map(|(_, rows)| rows)
+    decode_sal_frame(wire, |_| None).map(|(_, rows)| rows)
 }
 
 /// Eight rows of unequal region strides: a 4-byte PK, then stride-4 and
@@ -919,9 +915,9 @@ fn every_frame_shape_round_trips_and_no_prefix_decodes() {
     assert_eq!(range.rows(), 3, "a budget of three rows frames three");
     let whole = |b: &Batch| (0..b.len()).collect::<Vec<_>>();
 
-    let fixed_rel = (5, encode_schema_block(&fixed));
-    let string_rel = (6, encode_schema_block(strings.schema()));
-    let padded_rel = (7, encode_schema_block(padded.schema()));
+    let fixed_rel = encode_schema_block(&fixed);
+    let string_rel = encode_schema_block(strings.schema());
+    let padded_rel = encode_schema_block(padded.schema());
     // Each message beside the source batch and the rows of it the message sends,
     // in the order it sends them.
     let shapes = [
@@ -995,7 +991,7 @@ fn every_frame_shape_round_trips_and_no_prefix_decodes() {
     ];
 
     for (shape, (rel, msg, sent)) in shapes.into_iter().enumerate() {
-        let msg = rel.map_or(msg, |(tid, record)| frame(*tid, record, msg));
+        let msg = rel.map_or(msg, |record| frame(record, msg));
         let wire = msg.encode_to_vec();
         let control = peek_control_block(&wire).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
         let rows = sal_rows(&wire).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
@@ -1033,14 +1029,13 @@ fn a_sal_slot_lays_its_rows_out_under_the_known_schema_or_its_record() {
     let batch = make_batch(&sd, &[(1, 1, 10), (2, 3, 20)]);
     let junk = [0xFFu8; 12];
     let wire = WireMsg {
-        target_id: 77,
         schema_block: Some(&junk),
         data: batch.wire_whole(),
         ..Default::default()
     }
     .encode_to_vec();
-    let got = decode_sal_frame(&wire, |tid, record| {
-        assert_eq!((tid, record), (77, junk.as_slice()));
+    let got = decode_sal_frame(&wire, |record| {
+        assert_eq!(record, junk.as_slice());
         Some(sd)
     })
     .expect("the known schema lays the rows out")
@@ -1051,7 +1046,6 @@ fn a_sal_slot_lays_its_rows_out_under_the_known_schema_or_its_record() {
 
     let record = encode_schema_block(&sd);
     let framed = frame(
-        77,
         &record,
         WireMsg {
             data: batch.wire_whole(),
@@ -1063,7 +1057,6 @@ fn a_sal_slot_lays_its_rows_out_under_the_known_schema_or_its_record() {
     assert_eq!(weighted_rows(&got), weighted_rows(&batch));
 
     let bare = WireMsg {
-        target_id: 77,
         data: batch.wire_whole(),
         ..Default::default()
     }

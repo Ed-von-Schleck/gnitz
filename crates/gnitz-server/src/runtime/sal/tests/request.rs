@@ -98,11 +98,17 @@ fn every_request_decodes_from_its_written_group() {
             .next()
             .expect("the group addresses the worker");
         let control = peek_control_block(slot).expect("a control block");
-        let decoded = SalRequest::decode(msg.head.kind, &control.hdr, &slot[control.blob.clone()]);
+        let decoded = SalRequest::decode(
+            msg.head.kind,
+            msg.head.target_id,
+            &control.hdr,
+            &slot[control.blob.clone()],
+        );
         assert_eq!(decoded.as_ref(), Ok(&group.request));
-        let (kind, template) = group.request.encode();
+        let (kind, target, _) = group.request.encode();
         assert_eq!(msg.head.kind, kind);
-        assert_eq!(msg.head.target_id, template.target_id);
+        assert_eq!(msg.head.target_id, target);
+        assert_eq!(control.hdr.target_id, 0, "a payload carries no target");
         assert_eq!(control.data.is_some(), group.schema.is_some(), "{:?}", group.request);
     }
 }
@@ -110,7 +116,7 @@ fn every_request_decodes_from_its_written_group() {
 #[test]
 fn a_blob_of_the_wrong_width_is_refused() {
     let hdr = ControlHeader::default();
-    assert!(SalRequest::decode(SalMessageKind::Tick, &hdr, &[0u8; 12]).is_err());
+    assert!(SalRequest::decode(SalMessageKind::Tick, 0, &hdr, &[0u8; 12]).is_err());
 }
 
 /// A `HasPk` group's arguments must be the ones its probe kind writes.
@@ -128,7 +134,7 @@ fn a_probe_no_kind_writes_is_refused() {
     ] {
         let hdr = ControlHeader { arg0, arg1, ..Default::default() };
         assert!(
-            SalRequest::decode(kind, &hdr, &[]).is_err(),
+            SalRequest::decode(kind, 0, &hdr, &[]).is_err(),
             "{kind:?} {arg0} {arg1:#x}"
         );
     }
