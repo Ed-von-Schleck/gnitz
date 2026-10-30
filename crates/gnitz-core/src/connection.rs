@@ -261,39 +261,22 @@ enum Slot {
     /// RESOLVE: the descriptor, or `None` when no such relation exists.
     /// Uncorrelated on the wire, because the request names no id.
     Resolve { to: Promise<Option<Arc<RelDescriptor>>> },
-    Scan {
-        tid: u64,
-        reply_schema: Arc<Schema>,
-        /// The train's rows so far.
-        data: Option<ZSetBatch>,
-        to: Promise<ScanReply>,
-    },
+    /// SCAN_SPEC or SCAN_MULTI: one train per relation, in request order.
+    Scan(Scan),
     /// One view's delta read: a scan's train, whose terminal carries the cursor
     /// to read from next.
     Delta {
-        tid: u64,
-        reply_schema: Arc<Schema>,
-        data: Option<ZSetBatch>,
+        train: Train,
         /// The subscription id the view is kept as from that cursor.
         keep: Option<SubId>,
         to: Promise<(ScanReply, DeltaCursor)>,
     },
     /// SNAPSHOT_PAGE: a scan's trains, with where each worker's ends.
     Page {
-        tid: u64,
-        reply_schema: Arc<Schema>,
-        data: Option<ZSetBatch>,
+        train: Train,
         /// The row count at the end of each worker's train so far.
         worker_ends: Vec<usize>,
         to: Promise<SnapshotPage>,
-    },
-    /// One train per relation, each decoded under the schema paired with it.
-    /// The train in progress is `rels[replies.len()]`.
-    Multi {
-        rels: Vec<(u64, Arc<Schema>)>,
-        replies: Vec<ScanReply>,
-        data: Option<ZSetBatch>,
-        to: Promise<Vec<ScanReply>>,
     },
     /// One train per view, its blocks kept raw; the train in progress is
     /// `views[at]`, handed to the poll's reader while it is live.
@@ -311,6 +294,62 @@ enum Slot {
         tid: u64,
         sub: SubId,
         blocks: Vec<RawBlock>,
+    },
+}
+
+/// One relation's train: its rows so far, decoded under the schema its request
+/// named.
+struct Train {
+    tid: u64,
+    schema: Arc<Schema>,
+    data: Option<ZSetBatch>,
+}
+
+impl Train {
+    fn new(tid: u64, schema: &Arc<Schema>) -> Self {
+        Train {
+            tid,
+            schema: Arc::clone(schema),
+            data: None,
+        }
+    }
+
+    /// Rows are decoded straight into the train: it carries one data frame
+    /// per worker, and a per-frame batch would be copied in and dropped.
+    fn decode(&mut self, block: &[u8]) -> Result<(), ProtocolError> {
+        let schema = &self.schema;
+        decode_wal_block_into(self.data.get_or_insert_with(|| ZSetBatch::new(schema)), block, schema)
+    }
+
+    fn len(&self) -> usize {
+        self.data.as_ref().map_or(0, ZSetBatch::len)
+    }
+
+    fn take_batch(&mut self) -> ZSetBatch {
+        self.data.take().unwrap_or_else(|| ZSetBatch::new(&self.schema))
+    }
+
+    fn reply(&mut self, lsn: Option<u64>) -> ScanReply {
+        ScanReply {
+            batch: self.take_batch(),
+            schema: Arc::clone(&self.schema),
+            lsn,
+        }
+    }
+}
+
+/// A scan's trains and where their replies go: SCAN_SPEC answers with its one
+/// reply, SCAN_MULTI with every relation's, gathered as each train terminates.
+enum Scan {
+    One {
+        train: Train,
+        to: Promise<ScanReply>,
+    },
+    /// The train in progress is `trains[replies.len()]`.
+    All {
+        trains: Vec<Train>,
+        replies: Vec<ScanReply>,
+        to: Promise<Vec<ScanReply>>,
     },
 }
 
@@ -565,12 +604,10 @@ impl Session {
     ) -> Sent<ScanReply> {
         let hdr = ControlHeader::naming(ClientVerb::ScanSpec, target, reply_schema.layout().layout_digest());
         let (to, sent) = promise();
-        let slot = Slot::Scan {
-            tid: target.tid,
-            reply_schema: Arc::clone(reply_schema),
-            data: None,
+        let slot = Slot::Scan(Scan::One {
+            train: Train::new(target.tid, reply_schema),
             to,
-        };
+        });
         self.enqueue(encode_frame(hdr, &spec.encode(), None, None), slot);
         sent
     }
@@ -594,9 +631,7 @@ impl Session {
         };
         let (to, sent) = promise();
         let slot = Slot::Page {
-            tid,
-            reply_schema: Arc::clone(reply_schema),
-            data: None,
+            train: Train::new(tid, reply_schema),
             worker_ends: Vec::new(),
             to,
         };
@@ -623,15 +658,14 @@ impl Session {
             })
             .collect();
         let (to, sent) = promise();
-        let slot = Slot::Multi {
-            replies: Vec::with_capacity(scans.len()),
-            rels: scans
+        let slot = Slot::Scan(Scan::All {
+            trains: scans
                 .iter()
-                .map(|&(target, _, schema)| (target.tid, Arc::clone(schema)))
+                .map(|&(target, _, schema)| Train::new(target.tid, schema))
                 .collect(),
-            data: None,
+            replies: Vec::with_capacity(scans.len()),
             to,
-        };
+        });
         self.enqueue(txn_frame::encode_scan_multi(&items), slot);
         sent
     }
@@ -649,9 +683,7 @@ impl Session {
     ) -> Sent<(ScanReply, DeltaCursor)> {
         let (to, sent) = promise();
         let slot = Slot::Delta {
-            tid: view.tid,
-            reply_schema: Arc::clone(reply_schema),
-            data: None,
+            train: Train::new(view.tid, reply_schema),
             keep,
             to,
         };
@@ -927,15 +959,11 @@ impl Slot {
         // The relation this frame must name. Replies arrive in request order,
         // so a frame naming another would decode under the wrong schema
         // silently; make it loud.
-        let want = match &*self {
-            Slot::Ack { tid, .. }
-            | Slot::Scan { tid, .. }
-            | Slot::Delta { tid, .. }
-            | Slot::Page { tid, .. }
-            | Slot::Pushed { tid, .. } => Some(*tid),
-            Slot::Multi { rels, replies, .. } => Some(rels[replies.len()].0),
+        let want = match self {
+            Slot::Ack { tid, .. } | Slot::Pushed { tid, .. } => Some(*tid),
             Slot::DeltaPoll { views, at, .. } => Some(views[*at]),
             Slot::Resolve { .. } => None,
+            _ => self.train().map(|t| t.tid),
         };
         if let Some(fault) = ctrl.fault(&buf) {
             let refused = ClientError::Refused(fault);
@@ -968,11 +996,6 @@ impl Slot {
             ));
         }
 
-        // Rows are decoded straight into the slot: a train carries one data
-        // frame per worker, and a per-frame batch would be copied in and dropped.
-        let decode = |data: &mut Option<ZSetBatch>, schema: &Arc<Schema>, block: &[u8]| {
-            decode_wal_block_into(data.get_or_insert_with(|| ZSetBatch::new(schema)), block, schema)
-        };
         match (&mut *self, ctrl.data.clone()) {
             (_, None) => {}
             (Slot::DeltaPoll { poll, .. }, Some(block)) => {
@@ -987,23 +1010,19 @@ impl Slot {
                     blocks.push(RawBlock { frame, block });
                 }
             }
-            (
-                Slot::Scan { reply_schema, data, .. }
-                | Slot::Delta { reply_schema, data, .. }
-                | Slot::Page { reply_schema, data, .. },
-                Some(r),
-            ) => decode(data, reply_schema, &buf[r])?,
-            (Slot::Multi { rels, replies, data, .. }, Some(r)) => decode(data, &rels[replies.len()].1, &buf[r])?,
-            (Slot::Ack { .. } | Slot::Resolve { .. }, Some(_)) => {
-                return Err(ProtocolError::DecodeError(
-                    "a data block on a reply that carries no rows".into(),
-                ))
-            }
+            (slot, Some(r)) => match slot.train() {
+                Some(train) => train.decode(&buf[r])?,
+                None => {
+                    return Err(ProtocolError::DecodeError(
+                        "a data block on a reply that carries no rows".into(),
+                    ))
+                }
+            },
         }
 
-        if let Slot::Page { data, worker_ends, .. } = &mut *self {
+        if let Slot::Page { train, worker_ends, .. } = &mut *self {
             if ctrl.hdr.flags.scan_last {
-                worker_ends.push(data.as_ref().map_or(0, ZSetBatch::len));
+                worker_ends.push(train.len());
             }
         }
         if ctrl.hdr.flags.continuation {
@@ -1011,11 +1030,6 @@ impl Slot {
         }
 
         // The train terminated.
-        let scan_reply = |schema: &Arc<Schema>, data: &mut Option<ZSetBatch>| ScanReply {
-            batch: data.take().unwrap_or_else(|| ZSetBatch::new(schema)),
-            schema: Arc::clone(schema),
-            lsn: Some(ctrl.hdr.arg0),
-        };
         let cursor = || {
             DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0)
                 .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))
@@ -1023,35 +1037,31 @@ impl Slot {
         match self {
             Slot::Ack { to, .. } => to.fulfil(Ok(ctrl.hdr.arg0)),
             Slot::Resolve { to } => to.fulfil(Ok(resolve_descriptor(&ctrl, &buf)?)),
-            Slot::Scan { reply_schema, data, to, .. } => to.fulfil(Ok(scan_reply(reply_schema, data))),
-            Slot::Page { reply_schema, data, worker_ends, to, .. } => {
+            Slot::Scan(Scan::One { train, to }) => to.fulfil(Ok(train.reply(Some(ctrl.hdr.arg0)))),
+            Slot::Scan(Scan::All { trains, replies, to }) => {
+                let reply = trains[replies.len()].reply(Some(ctrl.hdr.arg0));
+                replies.push(reply);
+                if replies.len() < trains.len() {
+                    return Ok(false);
+                }
+                to.fulfil(Ok(std::mem::take(replies)))
+            }
+            Slot::Page { train, worker_ends, to } => {
                 // The next page's rows are shared over the stores this one
                 // names, so a page naming none is no reply to a page request.
                 if worker_ends.is_empty() {
                     return Err(ProtocolError::DecodeError("a snapshot page naming no worker".into()));
                 }
-                let batch = data.take().unwrap_or_else(|| ZSetBatch::new(reply_schema));
+                let batch = train.take_batch();
                 let worker_ends = std::mem::take(worker_ends);
                 to.fulfil(Ok(SnapshotPage { batch, worker_ends }))
             }
-            Slot::Delta { reply_schema, data, keep, to, .. } => {
+            Slot::Delta { train, keep, to } => {
                 let cursor = cursor()?;
                 if let Some(id) = *keep {
                     polls.hold(id, cursor);
                 }
-                let reply = ScanReply {
-                    lsn: None,
-                    ..scan_reply(reply_schema, data)
-                };
-                to.fulfil(Ok((reply, cursor)))
-            }
-            Slot::Multi { rels, replies, data, to } => {
-                let reply = scan_reply(&rels[replies.len()].1, data);
-                replies.push(reply);
-                if replies.len() < rels.len() {
-                    return Ok(false);
-                }
-                to.fulfil(Ok(std::mem::take(replies)))
+                to.fulfil(Ok((train.reply(None), cursor)))
             }
             Slot::DeltaPoll { views, at, poll, first } => {
                 polls.reader_end(*poll, kept_as(*first, *at), Ok(cursor()?));
@@ -1065,16 +1075,26 @@ impl Slot {
         Ok(true)
     }
 
+    /// The train in progress of a slot that reads rows; `None` for one that
+    /// carries none, or keeps its blocks raw.
+    fn train(&mut self) -> Option<&mut Train> {
+        match self {
+            Slot::Scan(Scan::One { train, .. }) | Slot::Delta { train, .. } | Slot::Page { train, .. } => Some(train),
+            Slot::Scan(Scan::All { trains, replies, .. }) => trains.get_mut(replies.len()),
+            _ => None,
+        }
+    }
+
     /// The request ended unanswered: `why` is its reply, and the end of each
     /// view a delta poll had yet to answer.
     fn fail(&mut self, why: ClientError, polls: &mut Polls) {
         match self {
             Slot::Ack { to, .. } => to.fulfil(Err(why)),
             Slot::Resolve { to } => to.fulfil(Err(why)),
-            Slot::Scan { to, .. } => to.fulfil(Err(why)),
+            Slot::Scan(Scan::One { to, .. }) => to.fulfil(Err(why)),
+            Slot::Scan(Scan::All { to, .. }) => to.fulfil(Err(why)),
             Slot::Page { to, .. } => to.fulfil(Err(why)),
             Slot::Delta { to, .. } => to.fulfil(Err(why)),
-            Slot::Multi { to, .. } => to.fulfil(Err(why)),
             Slot::DeltaPoll { views, at, poll, first } => {
                 for at in *at..views.len() {
                     polls.reader_end(*poll, kept_as(*first, at), Err(why.clone()));
