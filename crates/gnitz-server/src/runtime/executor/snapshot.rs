@@ -15,10 +15,8 @@ use super::{send_ack, send_msg, Shared};
 use crate::runtime::frame::WireMsg;
 use crate::runtime::reactor::SendBody;
 use crate::runtime::sal::Read;
-use gnitz_store::relation::PinScope;
 use gnitz_wire::snapshot::PageRequest;
 use gnitz_wire::{ControlHeader, WireFault};
-use gnitz_zset::algebra::Slot;
 
 /// The snapshots one connection may hold at a time.
 const MAX_SNAPSHOTS_PER_CONNECTION: usize = 4;
@@ -39,11 +37,7 @@ pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u6
     let leases = shared
         .dispatcher
         .scan_cut(|cut| {
-            shared
-                .cat_mut()
-                .registry
-                .pin(id, PinScope::SystemCatalog)
-                .map_err(WireFault::from)?;
+            shared.cat_mut().registry.pin(id).map_err(WireFault::from)?;
             cut.read(Read::Pin { snapshot: id })
         })
         .await;
@@ -79,7 +73,7 @@ pub(super) async fn page(
     }
     let request = PageRequest::decode(blob).map_err(|e| format!("decode error: {e}"))?;
     if shared.cat().registry.pins(id, tid) {
-        let rows = shared.cat().registry.pinned_page(id, tid, &request, Slot::SOLO)?;
+        let rows = shared.cat().registry.pinned_page(id, tid, &request)?;
         send_msg(peer, WireMsg::train_frame(tid, true, rows.wire_whole()));
     } else {
         let read = Read::SnapshotPage { snapshot: id, tid, page: blob.into() };

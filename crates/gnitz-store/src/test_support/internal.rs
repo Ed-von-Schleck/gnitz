@@ -128,19 +128,20 @@ pub(crate) fn relation_fixture(
     indexed: &[&[u32]],
     rounds: impl IntoIterator<Item = Batch>,
 ) -> RelationFixture {
-    relation_fixture_with(StoreConfig::default(), kind, schema, indexed, rounds)
+    relation_fixture_with(StoreConfig::default(), Slot::SOLO, kind, schema, indexed, rounds)
 }
 
-/// [`relation_fixture`] under `config`.
+/// [`relation_fixture`] under `config`, at `slot`.
 pub(crate) fn relation_fixture_with(
     config: StoreConfig,
+    slot: Slot,
     kind: RelationKind,
     schema: SchemaDescriptor,
     indexed: &[&[u32]],
     rounds: impl IntoIterator<Item = Batch>,
 ) -> RelationFixture {
     let dir = tempfile::tempdir().unwrap();
-    let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, config);
+    let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), slot, config);
     let indexes: Vec<_> = (TID + 1..)
         .zip(indexed)
         .map(|(id, &cols)| (IndexClaim::Index { id, unique: false }, PkColList::from_slice(cols)))
@@ -207,10 +208,12 @@ pub(crate) fn id_rows(
 
 /// Assert `ix` holds exactly the entries `rows` project to, weights included.
 pub(crate) fn assert_index_holds(ix: &SecondaryIndex, rows: &Batch, what: impl std::fmt::Display) {
-    let want = gnitz_zset::algebra::index_entries(rows, ix.key_spec(), &ix.schema());
+    let got = ix.cursor().materialize();
+    let schema = *got.schema();
+    let want = gnitz_zset::algebra::index_entries(rows, ix.key_spec(), &schema);
     assert_eq!(
-        gnitz_zset_testkit::zset_of(&ix.cursor().materialize(), &ix.schema()),
-        gnitz_zset_testkit::zset_of(&want, &ix.schema()),
+        gnitz_zset_testkit::zset_of(&got, &schema),
+        gnitz_zset_testkit::zset_of(&want, &schema),
         "{what}"
     );
 }

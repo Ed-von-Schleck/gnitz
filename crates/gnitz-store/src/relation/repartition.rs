@@ -9,10 +9,9 @@ use std::collections::BTreeSet;
 use std::fs;
 
 use super::dirs::{cluster_children, subdir_names};
-use super::{ChildAddr, ChildKind};
+use super::{ChildAddr, ChildKind, StoreConfig};
 use crate::storage::{flush_barrier, link_stores, retire_stores, Cut, RecoverySource, Table};
-use gnitz_zset::algebra::ScatterPlan;
-use gnitz_zset::algebra::{Placement, Slot};
+use gnitz_zset::algebra::{Placement, ScatterPlan, Slot};
 use gnitz_zset::repr::{from_runs, Batch, StorageError};
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -57,15 +56,14 @@ fn relay_source(rel_dir: &str, launched: u32) -> Result<Option<u32>, String> {
     Ok(None)
 }
 
-/// Bring `rel_dir`'s children onto `launched` workers. `ram_tier_bytes` and
-/// `chunk_rows` are the registry's own store tuning.
+/// Bring `rel_dir`'s children onto `launched` workers, with stores tuned by
+/// `config`.
 pub(super) fn repartition_relation(
     rel_dir: &str,
     schema: &SchemaDescriptor,
     placement: Placement,
     launched: u32,
-    ram_tier_bytes: usize,
-    chunk_rows: usize,
+    config: &StoreConfig,
 ) -> Result<(), String> {
     let Some(source) = relay_source(rel_dir, launched)? else {
         return Ok(());
@@ -77,7 +75,7 @@ pub(super) fn repartition_relation(
         if placement.is_replicated() {
             link_targets(rel_dir, source, launched)?;
         } else {
-            rewrite_targets(rel_dir, schema, placement, source, launched, ram_tier_bytes, chunk_rows)?;
+            rewrite_targets(rel_dir, schema, placement, source, launched, config)?;
         }
         // Each target's first publish made its entry in `rel_dir` durable.
         remove_set(rel_dir, source)
@@ -112,8 +110,7 @@ fn rewrite_targets(
     placement: Placement,
     source: u32,
     launched: u32,
-    ram_tier_bytes: usize,
-    chunk_rows: usize,
+    config: &StoreConfig,
 ) -> Result<(), StorageError> {
     // The relay writes its copy's heaps plain: a compressed relation's store
     // codes them as its compactions rewrite them.
@@ -124,7 +121,7 @@ fn rewrite_targets(
                     &c.dir(rel_dir),
                     *schema,
                     RecoverySource::SalReplay,
-                    ram_tier_bytes,
+                    config.ram_tier_bytes,
                     None,
                     false,
                 )
@@ -140,7 +137,7 @@ fn rewrite_targets(
     let mut buffers: Vec<Batch> = targets.iter().map(|_| Batch::empty_with_schema(schema)).collect();
     let plan = ScatterPlan::native(placement);
     let mut rows: Vec<Vec<u32>> = Vec::new();
-    while let Some(chunk) = cursor.drain_chunk(chunk_rows) {
+    while let Some(chunk) = cursor.drain_chunk(config.scan_chunk_rows) {
         let slots = plan.route(&chunk, &mut rows, launched as usize);
         for ((target, buffer), idx) in targets.iter_mut().zip(&mut buffers).zip(slots.iter()) {
             if idx.is_empty() {
@@ -148,7 +145,7 @@ fn rewrite_targets(
             }
             // Ascending subsets of one consolidated cursor, in cursor order.
             buffer.append_above(chunk.ascending_subset(idx));
-            if buffer.total_bytes() >= ram_tier_bytes {
+            if buffer.total_bytes() >= config.ram_tier_bytes {
                 target.append_terminal_run(&buffer.take())?;
             }
         }

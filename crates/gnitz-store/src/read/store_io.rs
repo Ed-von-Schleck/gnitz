@@ -49,14 +49,17 @@ impl RelationRegistry {
                 keyed_as(relation.schema().pk_stride())?;
                 let table = relation.table_or_err()?;
                 let mut live = keys;
+                // A filtered point lookup drops each key no live row carries before
+                // the gather opens a merge cursor; it narrows the band the cursor
+                // seeks, or skips the cursor when no key survives.
                 live.retain(|k| table.has_pk_bytes(k));
-                relation.gather(live, Cut::Now).project_live(&[col])
+                table.gather(live, Cut::Now).project_live(&[col])
             }
             Probe::Index(cols, cap) => {
                 let index = relation.index_or_err(cols.as_slice())?;
                 // The keys are the probed spans themselves.
                 keyed_as(index.key_spec().key_size())?;
-                let mut entries = Batch::empty_with_schema(&relation.probe_reply_schema(probe)?);
+                let mut entries = Batch::empty_with_schema(&index.key_spec().index_schema(&relation.schema()));
                 let cap = usize::try_from(cap.get()).unwrap_or(usize::MAX);
                 index
                     .gather(keys)
@@ -74,7 +77,7 @@ impl Relation {
         match probe {
             Probe::Pk => Ok(schema.pk_only()),
             Probe::PkColumn(col) => project_schema(&schema, &[col]),
-            Probe::Index(cols, _) => Ok(self.index_or_err(cols.as_slice())?.schema()),
+            Probe::Index(cols, _) => Ok(self.index_or_err(cols.as_slice())?.key_spec().index_schema(&schema)),
         }
     }
 

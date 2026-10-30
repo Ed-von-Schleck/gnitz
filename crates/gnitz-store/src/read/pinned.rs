@@ -12,17 +12,18 @@ use crate::relation::RelationRegistry;
 
 impl RelationRegistry {
     /// The first live rows of relation `id` as `snapshot` pinned it whose key
-    /// sorts strictly above the cursor `page` names for `store` — every row with
-    /// none — in key order, in the layout `page.layout` names: `store`'s share of
-    /// `page.limit`, exactly, unless the pinned store holds fewer, so a page
-    /// shorter than the share is the store's last.
-    pub fn pinned_page(&self, snapshot: u64, id: u64, page: &PageRequest, store: Slot) -> Result<Batch, String> {
-        let after = page.after_at(store.rank as usize, store.of as usize)?;
-        let share = PageRequest::rows_per_store(page.limit, store.of as usize);
+    /// sorts strictly above the cursor `page` names for the pinned store's
+    /// share — every row with none — in key order, in the layout `page.layout`
+    /// names: that share of `page.limit`, exactly, unless the pinned store holds
+    /// fewer, so a page shorter than the share is the store's last.
+    pub fn pinned_page(&self, snapshot: u64, id: u64, page: &PageRequest) -> Result<Batch, String> {
         let store = self.pinned_store(snapshot, id)?;
+        let Slot { rank, of } = store.share;
+        let after = page.after_at(rank as usize, of as usize)?;
+        let rows = PageRequest::rows_per_store(page.limit, of as usize);
         let schema = store.schema;
         check_layout(page.layout, &schema)?;
-        let limit = usize::try_from(share).unwrap_or(usize::MAX);
+        let limit = usize::try_from(rows).unwrap_or(usize::MAX);
         let (runs, cap) = (store.runs.iter().cloned(), store.runs.len());
         let mut cursor = match after {
             None => from_runs(runs, schema, cap),

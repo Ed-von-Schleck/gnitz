@@ -103,8 +103,6 @@ fn any_published(rel: &str, of: u32) -> bool {
     (0..of).any(|k| Path::new(&child(k, of).manifest(rel)).exists())
 }
 
-/// A relayout cuts each target into filtered terminal runs and moves every row
-/// once, onto its owner, payload intact.
 /// A fresh data directory, and [`ID`]'s relation directory under it.
 fn scratch_relation() -> (tempfile::TempDir, String, String) {
     let dir = tempfile::tempdir().unwrap();
@@ -113,18 +111,28 @@ fn scratch_relation() -> (tempfile::TempDir, String, String) {
     (dir, base, rel)
 }
 
+/// A relay config whose 4 KiB RAM tier each target passes only after several
+/// 64-row chunks.
+fn relay_config() -> StoreConfig {
+    StoreConfig {
+        ram_tier_bytes: 4096,
+        scan_chunk_rows: 64,
+        ..StoreConfig::default()
+    }
+}
+
+/// A relayout cuts each target into filtered terminal runs and moves every row
+/// once, onto its owner, payload intact.
 #[test]
 fn a_relayout_writes_filtered_terminal_runs() {
-    let dir = tempfile::tempdir().unwrap();
-    let rel = dir.path().join("rel");
-    let rel = rel.to_str().unwrap();
+    let (_dir, _, rel) = scratch_relation();
+    let rel = rel.as_str();
     let schema = make_schema_u64_i64();
     let placement = Placement::full_pk(&schema);
 
     let rows = ids(400);
     seed_set(rel, schema, placement, &rows, 1);
-    // Each target passes the 4 KiB RAM tier only after several 64-row chunks.
-    repartition_relation(rel, &schema, placement, 2, 4096, 64).unwrap();
+    repartition_relation(rel, &schema, placement, 2, &relay_config()).unwrap();
 
     for k in 0..2 {
         let t = open_child(rel, schema, k, 2);
@@ -142,9 +150,8 @@ fn a_relayout_writes_filtered_terminal_runs() {
 
 #[test]
 fn a_corrupt_source_body_fails_the_relayout_and_keeps_the_source_set() {
-    let dir = tempfile::tempdir().unwrap();
-    let rel = dir.path().join("rel");
-    let rel = rel.to_str().unwrap();
+    let (_dir, _, rel) = scratch_relation();
+    let rel = rel.as_str();
     let schema = make_schema_u64_i64();
     let placement = Placement::full_pk(&schema);
     seed_set(rel, schema, placement, &ids(100), 1);
@@ -157,7 +164,7 @@ fn a_corrupt_source_body_fails_the_relayout_and_keeps_the_source_set() {
     flip_last_byte_in_place(shard);
 
     assert!(matches!(
-        repartition_relation(rel, &schema, placement, 2, 4096, 64),
+        repartition_relation(rel, &schema, placement, 2, &relay_config()),
         Err(e) if e.contains("corrupt: body checksum")
     ));
     assert!(Path::new(shard).exists(), "the source shard survives");

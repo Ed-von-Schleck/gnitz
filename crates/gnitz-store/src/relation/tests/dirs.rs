@@ -124,6 +124,7 @@ fn a_published_store_put_elsewhere_opens_with_the_checkpointed_rows() {
     // Spilling, so the store put is several shards.
     let mut r = relation_fixture_with(
         spilling(),
+        Slot::SOLO,
         RelationKind::BaseTable,
         schema,
         &[&[1]],

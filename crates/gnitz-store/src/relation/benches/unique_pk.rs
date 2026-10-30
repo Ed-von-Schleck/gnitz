@@ -11,6 +11,7 @@ use crate::storage::DEFAULT_RAM_TIER_BYTES;
 use crate::test_support::{
     make_schema_pk_u64_payload_string, make_schema_u64_i64, relation_fixture_with, table_shards, TID,
 };
+use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -105,7 +106,7 @@ fn unique_pk_bench() {
                     ..StoreConfig::default()
                 };
                 let held = pushes(&schema, 1000, |s| (s, 1, 0));
-                let mut r = relation_fixture_with(config, RelationKind::BaseTable, schema, &[], held);
+                let mut r = relation_fixture_with(config, Slot::SOLO, RelationKind::BaseTable, schema, &[], held);
                 let spilled = tier == SPILL_TIER;
                 let in_shards = |r: &crate::test_support::RelationFixture| {
                     !table_shards(r.relation(TID).unwrap().table()).is_empty()

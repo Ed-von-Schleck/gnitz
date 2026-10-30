@@ -368,8 +368,9 @@ fn an_i128_column_is_an_fk_target() {
         fk_def("pid", TypeCode::I128, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.c", &child, &[0]).unwrap();
-    let index = engine.registry.relation(child_tid).unwrap().index_on(&[1]).unwrap();
-    assert_eq!(index.schema().pk_stride(), 16 + 8);
+    let child = engine.registry.relation(child_tid).unwrap();
+    let index = child.index_on(&[1]).unwrap();
+    assert_eq!(index.key_spec().index_schema(&child.schema()).pk_stride(), 16 + 8);
 
     finish(engine);
 }

@@ -267,8 +267,7 @@ impl RelationRegistry {
                 &entry.schema(),
                 entry.placement(),
                 self.slot.of,
-                self.config.ram_tier_bytes,
-                self.config.scan_chunk_rows,
+                &self.config,
             )?;
         }
         self.reclaim_orphan_relation_dirs(layout_of)
@@ -296,6 +295,10 @@ impl RelationRegistry {
         &self,
         layout_of: impl Fn(u64) -> Option<&'l StateLayout>,
     ) -> Result<(), String> {
+        assert!(
+            matches!(self.residency, Residency::Master | Residency::Origin),
+            "reclaim_orphan_relation_dirs removes other ranks' children"
+        );
         let root = relations_dir(&self.base_dir);
         let mut dead = Vec::new();
         for name in subdir_names(&root)? {
@@ -324,25 +327,21 @@ impl RelationRegistry {
         retire_stores(&dead).map_err(|e| format!("reclaim the children no relation owns under '{root}': {e}"))
     }
 
-    /// Put every store this process published into the data directory `dest`, at
+    /// Put every store this process publishes into the data directory `dest`, at
     /// the path it holds under this one: hard-linked where `dest` shares this
-    /// directory's filesystem, copied where it does not. A worker puts the
-    /// children of its own slot; the master, the system families' stores it
-    /// holds; an origin, both. A store's manifest is what was published, so a
-    /// store with none is left for the boot over `dest` to rebuild.
+    /// directory's filesystem, copied where it does not. A system family's store
+    /// is its relation directory; any other relation's are the children of this
+    /// process's slot. A store's manifest is what was published, so a store with
+    /// none is left for the boot over `dest` to rebuild.
     pub fn link_published_into(&self, dest: &str) -> Result<(), String> {
         let mut pairs = Vec::new();
         for (&id, entry) in &self.relations {
-            let (src_rel, dst_rel) = (relation_dir(&self.base_dir, id), relation_dir(dest, id));
-            if entry.kind() == RelationKind::SystemCatalog {
-                // Its one store is the relation directory itself, which a worker
-                // holds in memory only.
-                if self.residency != Residency::Worker {
-                    pairs.push((src_rel, dst_rel));
-                }
+            if !self.residency.publishes(entry.kind()) {
                 continue;
             }
-            if !self.residency.owns_stores() {
+            let (src_rel, dst_rel) = (relation_dir(&self.base_dir, id), relation_dir(dest, id));
+            if entry.kind() == RelationKind::SystemCatalog {
+                pairs.push((src_rel, dst_rel));
                 continue;
             }
             let names = subdir_names(&src_rel)?;

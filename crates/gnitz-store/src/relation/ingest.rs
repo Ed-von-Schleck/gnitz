@@ -1,8 +1,8 @@
 //! The write path: unique-PK enforcement, store + secondary-index application,
 //! delta capture, the seal, and the checkpoint rounds.
 
-use super::store::Rows;
-use super::{CircuitState, Cut, Relation, RelationKind, RelationRegistry, Residency, SecondaryIndex};
+use super::store::{not_held, Rows};
+use super::{CircuitState, Relation, RelationKind, RelationRegistry};
 use crate::storage::Table;
 use gnitz_zset::repr::{Batch, StorageError};
 use std::rc::Rc;
@@ -22,36 +22,6 @@ fn inject_ingest_apply_error(which: &str, kind: RelationKind, r: Result<(), Stor
     r
 }
 
-/// Fill each of `targets`, all empty, from one chunked scan of `owner`,
-/// `owner_id`'s store.
-pub(super) fn fill_indexes(
-    owner: &Table,
-    chunk_rows: usize,
-    owner_id: u64,
-    targets: &mut [&mut SecondaryIndex],
-) -> Result<(), String> {
-    for ix in targets.iter() {
-        assert_eq!(
-            ix.store.held().estimated_rows(),
-            0,
-            "index on columns {:?} of relation {owner_id} is already populated",
-            ix.cols.as_slice()
-        );
-    }
-    let mut source = owner.open_cursor(Cut::Now);
-    while let Some(chunk) = source.drain_chunk(chunk_rows) {
-        for ix in targets.iter_mut() {
-            ix.project_and_ingest(&chunk).map_err(|e| {
-                format!(
-                    "fill index on columns {:?} of relation {owner_id}: {e}",
-                    ix.cols.as_slice()
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
 /// Where a write lands in its relation's store.
 #[derive(Clone, Copy)]
 enum Landing {
@@ -66,7 +36,8 @@ impl Relation {
     /// Whether rows sit above this relation's cut.
     fn has_pending(&self) -> bool {
         match &self.rows {
-            Rows::Stored { store, .. } => store.table().is_some_and(Table::has_pending),
+            Rows::Held { table, .. } => table.has_pending(),
+            Rows::Absent(_) => false,
             Rows::Stream { unsealed, .. } => unsealed.is_some(),
         }
     }
@@ -76,10 +47,8 @@ impl Relation {
     fn seal(&mut self) -> Result<Option<Batch>, String> {
         let id = self.spec.id;
         match &mut self.rows {
-            Rows::Stored { store, .. } => match store.table_mut() {
-                Some(table) => table.seal().map_err(|e| format!("seal relation {id}: {e}")),
-                None => Ok(None),
-            },
+            Rows::Held { table, .. } => table.seal().map_err(|e| format!("seal relation {id}: {e}")),
+            Rows::Absent(_) => Ok(None),
             Rows::Stream { unsealed, .. } => Ok(unsealed.take().filter(|delta| !delta.is_empty())),
         }
     }
@@ -110,7 +79,8 @@ impl Relation {
                 }
                 return Ok(None);
             }
-            Rows::Stored { store, feed } => (store.held_mut(), feed),
+            Rows::Held { table, feed } => (&mut **table, feed),
+            Rows::Absent(_) => not_held(),
         };
         let kind = spec.kind;
         let mut effective = match kind.is_base_table() {
@@ -222,7 +192,7 @@ impl RelationRegistry {
         entry
             .indexes
             .iter_mut()
-            .filter_map(|ix| ix.store.table_mut())
+            .filter_map(|ix| ix.table.as_deref_mut())
             .for_each(Table::clear);
         Ok(())
     }
@@ -254,9 +224,7 @@ impl RelationRegistry {
     /// The bytes `id`'s next published manifest carries beside its rows.
     pub fn set_caller_record(&mut self, id: u64, record: Vec<u8>) -> Result<(), String> {
         self.relation_mut_or_err(id)?
-            .rows
-            .table_mut()
-            .ok_or_else(|| format!("relation {id} holds no store in this process"))?
+            .table_mut_or_err()?
             .set_caller_record(record);
         Ok(())
     }
@@ -270,9 +238,8 @@ impl RelationRegistry {
 
     /// The system round: every system family's store, in one barrier.
     pub fn checkpoint_system(&mut self, replay_floor: u64) -> Result<(), String> {
-        assert_ne!(
-            self.residency,
-            Residency::Worker,
+        assert!(
+            self.residency.publishes(RelationKind::SystemCatalog),
             "a worker holds the system families in RAM only; the master writes their shards"
         );
         crate::storage::flush_barrier(self.held_rows(|k| k == RelationKind::SystemCatalog), replay_floor)
@@ -290,15 +257,12 @@ impl RelationRegistry {
         resumes: impl Fn(u64) -> bool,
     ) -> Result<(), String> {
         let mut tables: Vec<&mut Table> = state.into_iter().flat_map(CircuitState::tables_mut).collect();
-        let picked = self
-            .relations
-            .values_mut()
-            .filter(|e| e.kind() != RelationKind::SystemCatalog && resumes(e.id()));
+        let picked = self.relations.values_mut().filter(|e| resumes(e.id()));
         for e in picked {
             if e.kind().is_view() {
                 tables.extend(e.rows.table_mut());
             }
-            tables.extend(e.indexes.iter_mut().filter_map(|ix| ix.store.table_mut()));
+            tables.extend(e.indexes.iter_mut().filter_map(|ix| ix.table.as_deref_mut()));
         }
         crate::storage::flush_barrier(tables, generation).map_err(|e| format!("ephemeral flush: {e}"))
     }

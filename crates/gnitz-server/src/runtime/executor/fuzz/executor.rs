@@ -28,7 +28,7 @@ use crate::test_support::{
 use gnitz_fuzz::input::Input;
 use gnitz_fuzz::seed::{Frame, Seed, Seeds, SEEDS_ENV};
 use gnitz_store::read::Probe;
-use gnitz_store::relation::{PinScope, RelationKind};
+use gnitz_store::relation::RelationKind;
 use gnitz_wire::txn_frame::{decode_scan_multi, encode_items, FrameItem, ScanItem};
 use gnitz_wire::{append_frame, ControlHeader, PkKeys, ReadSpec};
 use gnitz_zset::repr::BatchBuilder;
@@ -139,19 +139,11 @@ impl Session {
             // One process is both the master and its worker, so it pins both.
             ClientVerb::SnapshotOpen => {
                 self.snapshots += 1;
-                self.cat
-                    .registry
-                    .pin(self.snapshots, PinScope::Durable)
-                    .expect("a fresh snapshot id pins");
+                self.cat.registry.pin(self.snapshots).expect("a fresh snapshot id pins");
             }
             ClientVerb::SnapshotPage => {
                 if let Ok(page) = gnitz_wire::snapshot::PageRequest::decode(&frame[ctrl.blob.clone()]) {
-                    drop(self.cat.registry.pinned_page(
-                        ctrl.hdr.arg0,
-                        ctrl.hdr.target_id,
-                        &page,
-                        self.cat.registry.slot(),
-                    ));
+                    drop(self.cat.registry.pinned_page(ctrl.hdr.arg0, ctrl.hdr.target_id, &page));
                 }
             }
             ClientVerb::SnapshotClose => self.cat.registry.unpin(ctrl.hdr.arg0),

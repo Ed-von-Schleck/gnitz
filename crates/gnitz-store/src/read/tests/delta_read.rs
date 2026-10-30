@@ -9,6 +9,7 @@ use crate::test_support::{
 };
 use gnitz_expr::{CmpOp, LogicalProgram};
 use gnitz_wire::{PkKeys, ReadSink, TypeCode, ViewBudget};
+use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_zset_testkit::{zset_of, RowKey};
@@ -246,7 +247,7 @@ fn reads_past_any_cursor_match_a_model() {
             ram_tier_bytes: [1 << 11, StoreConfig::default().ram_tier_bytes][(seed % 2) as usize],
             ..StoreConfig::default()
         };
-        let mut r = relation_fixture_with(config, fed_view(budget), view_schema(), &[], []);
+        let mut r = relation_fixture_with(config, Slot::SOLO, fed_view(budget), view_schema(), &[], []);
         r.set_scan_chunk_rows([1, 3, 200, 8192][(seed % 4) as usize]);
         let cases = cases();
         let mut subs: Vec<Subscriber> = (0..cases.len())

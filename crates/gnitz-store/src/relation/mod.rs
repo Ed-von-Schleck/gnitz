@@ -30,8 +30,7 @@ pub use circuit_state::{CircuitState, StateIdx, StateLayout};
 pub use dirs::{lock_data_dir, relation_dir, ChildAddr, ChildKind, DirLock};
 pub use disk_usage::{disk_usage, DiskUsage};
 use feed::Feed;
-pub use snapshot::PinScope;
-use store::{Rows, Store};
+use store::{not_held, Rows};
 
 // ---------------------------------------------------------------------------
 // Secondary index
@@ -52,7 +51,8 @@ pub enum IndexClaim {
 /// A secondary index on a column list of one relation. Owns this process's store
 /// for it — dropping the index drops the store.
 pub struct SecondaryIndex {
-    store: Store,
+    /// This process's store of the index; `None` on the master.
+    table: Option<Box<Table>>,
     /// The index's declared column list, in order, which drives leading-prefix
     /// seeks. A relation holds at most one index per list.
     cols: PkColList,
@@ -72,10 +72,6 @@ impl SecondaryIndex {
         self.cols
     }
 
-    pub fn schema(&self) -> SchemaDescriptor {
-        *self.store.schema()
-    }
-
     pub fn key_spec(&self) -> &KeySpec {
         &self.key_spec
     }
@@ -91,26 +87,37 @@ impl SecondaryIndex {
         &self.claims
     }
 
+    /// This process's store of the index; panics when it holds none.
+    #[track_caller]
+    fn held(&self) -> &Table {
+        match self.table.as_deref() {
+            Some(t) => t,
+            None => not_held(),
+        }
+    }
+
     /// Non-compacting cursor over this index's store, in the index schema.
     pub fn cursor(&self) -> ReadCursor {
-        self.store.held().open_cursor(Cut::Now)
+        self.held().open_cursor(Cut::Now)
     }
 
     /// Every stored entry of `spans`, each this index's leading key bytes.
     pub(crate) fn gather(&self, spans: PkKeys) -> PkSetGather {
-        self.store.held().gather(spans, Cut::Now)
+        self.held().gather(spans, Cut::Now)
     }
 
     /// A cursor positioned on the key band `r` walks over this index's store.
     pub(crate) fn cursor_over(&self, r: &gnitz_wire::KeyRange) -> ReadCursor {
-        self.store.held().range_cursor(r, Cut::Now)
+        self.held().range_cursor(r, Cut::Now)
     }
 
     /// Project `source` into this index's layout and ingest the result. A
     /// zero-weight row, or one NULL in an indexed column, has no entry, so a
     /// non-empty `source` can project to nothing.
     fn project_and_ingest(&mut self, source: &Batch) -> Result<(), StorageError> {
-        let table = self.store.held_mut();
+        let Some(table) = self.table.as_deref_mut() else {
+            not_held()
+        };
         let projected = index_entries(source, &self.key_spec, table.schema());
         if projected.is_empty() {
             return Ok(());
@@ -121,7 +128,7 @@ impl SecondaryIndex {
     /// Whether this process's store of the index came back from a checkpoint
     /// manifest at its open.
     pub fn resumed(&self) -> bool {
-        self.store.held().loaded_mark().is_some()
+        self.held().loaded_mark().is_some()
     }
 }
 
@@ -233,12 +240,18 @@ pub enum Residency {
 }
 
 impl Residency {
-    /// True iff this process opens a store of every user relation and index it
-    /// registers. A stream has none wherever it is registered, and the master
-    /// still holds the system families'.
+    /// Whether this process writes, and answers for, the stores of a `kind`
+    /// relation: the master the system families', a worker every user
+    /// relation's and index's (it holds its copies of the system families in
+    /// RAM only), an origin all of them. A stream has no store anywhere, so the
+    /// answer for one opens nothing.
     #[inline]
-    fn owns_stores(self) -> bool {
-        !matches!(self, Residency::Master)
+    fn publishes(self, kind: RelationKind) -> bool {
+        match self {
+            Residency::Master => kind == RelationKind::SystemCatalog,
+            Residency::Worker => kind != RelationKind::SystemCatalog,
+            Residency::Origin => true,
+        }
     }
 }
 
@@ -353,13 +366,23 @@ impl Relation {
 
     /// [`Self::table`], `Err` when this process holds no store of the relation.
     pub(crate) fn table_or_err(&self) -> Result<&Table, String> {
-        self.rows.table().ok_or_else(|| match self.kind() {
-            RelationKind::Stream => format!(
-                "relation {} is a stream: a stream holds no rows and cannot be read",
-                self.id()
-            ),
-            _ => format!("relation {} holds no store in this process", self.id()),
-        })
+        self.rows.table().ok_or_else(|| no_store(self.kind(), self.id()))
+    }
+
+    /// [`Self::table_or_err`] as `&mut`.
+    pub(crate) fn table_mut_or_err(&mut self) -> Result<&mut Table, String> {
+        let (kind, id) = (self.kind(), self.id());
+        self.rows.table_mut().ok_or_else(|| no_store(kind, id))
+    }
+}
+
+/// Why this process holds no store of relation `id`.
+fn no_store(kind: RelationKind, id: u64) -> String {
+    match kind {
+        RelationKind::Stream => {
+            format!("relation {id} is a stream: a stream holds no rows and cannot be read")
+        }
+        _ => format!("relation {id} holds no store in this process"),
     }
 }
 
@@ -435,7 +458,6 @@ impl StoreConfig {
 /// are non-atomic.
 pub struct RelationRegistry {
     relations: FxHashMap<u64, Relation>,
-    /// The data directory every relation's [`relation_dir`] sits under.
     base_dir: String,
     /// Which worker this process is, of how many: names the `w{k}of{n}` child
     /// its stores open under.
@@ -491,12 +513,15 @@ impl RelationRegistry {
         self.relations.values_mut().for_each(|entry| entry.release(claim));
     }
 
-    /// Publish a new column schema for relation `id` in place (any column
+    /// Publish a new column schema for base table `id` in place (any column
     /// ALTER) into its store, where a held `Table` rebinds its shards to it if
-    /// it changed. Refuses a descriptor that is not a trailing append of the
-    /// stored one.
+    /// it changed. Refuses any other kind of relation, and a descriptor that is
+    /// not a trailing append of the stored one.
     pub fn swap_schema(&mut self, id: u64, schema: SchemaDescriptor) -> Result<(), String> {
         let entry = self.relation_mut_or_err(id)?;
+        if !entry.kind().is_base_table() {
+            return Err(format!("ALTER on relation {id}: not a base table"));
+        }
         // Checked, not asserted: what a stale `key_spec` produces is a silently
         // wrong index projection, which release codegen would not guard at all.
         if !schema.is_trailing_append_of(entry.rows.schema()) {

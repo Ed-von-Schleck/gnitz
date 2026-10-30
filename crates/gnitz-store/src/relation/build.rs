@@ -78,21 +78,20 @@ impl RelationRegistry {
             let owner_schema = entry.schema();
             let fail = |e: String| format!("index on columns {:?} of relation {owner}: {e}", cols.as_slice());
             let key_spec = KeySpec::new(cols.as_slice(), &owner_schema).map_err(fail)?;
-            let index_schema = key_spec.index_schema(&owner_schema);
             // One that does not resume opens empty, for the fill below.
-            let store = if self.residency.owns_stores() {
+            let table = if self.residency.publishes(entry.kind()) {
                 let dir = self.child_dir(owner, ChildKind::Index(cols));
                 let recovery = RecoverySource::Rederive { resume_at };
                 let table = self
-                    .open_store(&dir, index_schema, recovery, None, false)
+                    .open_store(&dir, key_spec.index_schema(&owner_schema), recovery, None, false)
                     .map_err(fail)?;
-                Store::Held(Box::new(table))
+                Some(Box::new(table))
             } else {
-                Store::Absent(Box::new(index_schema))
+                None
             };
             opened.push(SecondaryIndex {
                 cols,
-                store,
+                table,
                 key_spec,
                 claims: vec![claim],
                 covers_pk: owner_schema.covers_pk(cols.as_slice()),
@@ -102,11 +101,22 @@ impl RelationRegistry {
         let entry = self.relations.get_mut(&owner).expect("resolved above");
         let mut targets: Vec<&mut SecondaryIndex> = opened
             .iter_mut()
-            .filter(|ix| matches!(ix.store, Store::Held(_)) && !ix.resumed())
+            .filter(|ix| ix.table.is_some() && !ix.resumed())
             .collect();
         let filled = targets.len();
         if filled > 0 {
-            ingest::fill_indexes(entry.rows.held(), chunk_rows, owner, &mut targets)?;
+            // One chunked scan of the owner fills every target.
+            let mut source = entry.rows.held().open_cursor(Cut::Now);
+            while let Some(chunk) = source.drain_chunk(chunk_rows) {
+                for ix in targets.iter_mut() {
+                    ix.project_and_ingest(&chunk).map_err(|e| {
+                        format!(
+                            "fill index on columns {:?} of relation {owner}: {e}",
+                            ix.cols.as_slice()
+                        )
+                    })?;
+                }
+            }
         }
         for (at, claim) in claimed {
             entry.indexes[at].claims.push(claim);
@@ -129,7 +139,7 @@ impl RelationRegistry {
             Residency::Master,
             "open_stores runs once, on a master registry"
         );
-        assert!(residency.owns_stores());
+        assert_ne!(residency, Residency::Master);
         self.slot = Slot::new(rank, self.slot.of);
         self.residency = residency;
         let ids: Vec<u64> = self
@@ -149,10 +159,7 @@ impl RelationRegistry {
         }
         // A worker applies the same catalog deltas as the master, but only the
         // master writes the system tables' shards.
-        if residency == Residency::Worker {
-            self.held_rows(|k| k == RelationKind::SystemCatalog)
-                .for_each(Table::hold_in_ram);
-        }
+        self.held_rows(|k| !residency.publishes(k)).for_each(Table::hold_in_ram);
         Ok(filled)
     }
 
@@ -177,19 +184,13 @@ impl RelationRegistry {
             RelationKind::SystemCatalog => {
                 let dir = relation_dir(&self.base_dir, id);
                 let table = self.open_store(&dir, schema, RecoverySource::SalReplay, None, false)?;
-                return Ok(Rows::Stored {
-                    store: Store::Held(Box::new(table)),
-                    feed: None,
-                });
+                return Ok(Rows::Held { table: Box::new(table), feed: None });
             }
             // The master opens no user store, but it still creates the relation's
             // directory, so the directory exists by the time the DDL is acknowledged.
-            _ if !self.residency.owns_stores() => {
+            _ if !self.residency.publishes(kind) => {
                 ensure_dir(&relation_dir(&self.base_dir, id))?;
-                return Ok(Rows::Stored {
-                    store: Store::Absent(Box::new(schema)),
-                    feed: None,
-                });
+                return Ok(Rows::Absent(Box::new(schema)));
             }
             RelationKind::BaseTable => {
                 if let Some(ms) = TABLE_CREATE_DELAY.count() {
@@ -206,10 +207,7 @@ impl RelationRegistry {
         let table = self.open_child(id, ChildKind::Rows, schema, recovery, capacity, compress)?;
         // Empty at every open: no delta expresses what a boot does to a view, so every cursor restarts.
         let feed = feed.filter(|_| placement.counts_on(self.slot.rank)).map(Feed::new);
-        Ok(Rows::Stored {
-            store: Store::Held(Box::new(table)),
-            feed,
-        })
+        Ok(Rows::Held { table: Box::new(table), feed })
     }
 
     /// This process's `kind` child store of relation `id`; `Err` for one told to

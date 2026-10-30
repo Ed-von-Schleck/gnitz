@@ -2,6 +2,7 @@ use super::*;
 use crate::relation::{RelationKind, StoreConfig};
 use crate::test_support::{id_rows, pk_only_schema, relation_fixture_with, u64_pk_schema, RelationFixture, TID};
 use gnitz_wire::TypeCode;
+use gnitz_zset::algebra::Slot;
 use gnitz_zset::schema::SchemaColumn;
 
 const ROWS: u64 = 50;
@@ -27,7 +28,7 @@ fn fixture(indexed: bool, chunk_rows: usize) -> RelationFixture {
     };
     let indexed: &[&[u32]] = if indexed { &[&[1]] } else { &[] };
     let rounds = [rows(1, &mut (0..ROWS)), rows(-1, &mut (0..ROWS).step_by(3))];
-    relation_fixture_with(config, RelationKind::BaseTable, schema, indexed, rounds)
+    relation_fixture_with(config, Slot::SOLO, RelationKind::BaseTable, schema, indexed, rounds)
 }
 
 /// Every span of `spans` in order, and the row count of each chunk.
