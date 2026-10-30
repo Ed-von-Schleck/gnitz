@@ -9,7 +9,7 @@ use gnitz_expr::{ColCopy, ColumnLocator, LogicalProgram, MapEval};
 
 use super::key_pack::{locate_key_col, pk_run, FoldCols, KeyPacker};
 use crate::repr::{copy_runs, Batch, DirectWriter};
-use crate::schema::{project_schema, DerivedSchema, SchemaColumn, SchemaDescriptor};
+use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::{int_cell, zip_cells, FixedInt, TypeCode};
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
@@ -251,11 +251,6 @@ impl MapPlan {
                 let proj: Vec<u32> = cols.iter().map(|&(c, _)| c).collect();
                 let fold = FoldCols::new(out_schema.payload_locators());
                 (out_schema, LogicalProgram::copy_cols(&proj), PkSource::HashRow(fold))
-            }
-
-            gnitz_wire::MapKind::Projection(cols) => {
-                let out_schema = project_schema(in_schema, cols).map_err(|e| format!("projection map: {e}"))?;
-                (out_schema, LogicalProgram::copy_cols(cols), PkSource::Inherit)
             }
         };
         Self::from_map(prog, in_schema, out_schema, pk_source)

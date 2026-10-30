@@ -1,7 +1,7 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::query::vm::Vm;
-use crate::test_support::{make_schema_u64_i64, reindexed_on_col1, scan_keyed, self_typed_slots};
+use crate::test_support::{make_schema_u64_i64, map_copy, reindexed_on_col1, scan_keyed, self_typed_slots};
 use gnitz_store::relation::RelationKind::{self, BaseTable, Stream};
 use gnitz_wire::{Circuit, JoinKind, ReindexSlot, TypeCode};
 use gnitz_zset::algebra::{Placement, Slot};
@@ -431,24 +431,21 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         (
             "a copy list carries the PK region to its leading slot",
             pk_last,
-            |c, n| c.map(n, &[0, 1]),
+            |c, n| map_copy(c, n, &[(0, TypeCode::I64), (1, TypeCode::I64)]),
             &[0],
             true,
         ),
         (
             "a payload slot behind a map",
             pk_last,
-            |c, n| c.map(n, &[0, 1]),
+            |c, n| map_copy(c, n, &[(0, TypeCode::I64), (1, TypeCode::I64)]),
             &[1],
             false,
         ),
         (
-            "an expression map carries the PK region",
+            "a keys-only map carries the PK region",
             pk_last,
-            |c, n| {
-                let program = gnitz_expr::LogicalProgram::copy_cols(&[]).to_blob_bytes();
-                c.map_expr(n, gnitz_wire::ComputeMap { program, out_cols: vec![] })
-            },
+            |c, n| map_copy(c, n, &[]),
             &[0],
             true,
         ),
@@ -457,7 +454,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
             pk_last,
             |c, n| {
                 let f = c.filter(n, predicate(0));
-                let m = c.map(f, &[0, 1]);
+                let m = map_copy(c, f, &[(0, TypeCode::I64), (1, TypeCode::I64)]);
                 c.filter(m, predicate(1))
             },
             &[0],
@@ -556,7 +553,7 @@ fn a_clamp_reads_its_sources_where_they_hold_its_history() {
             |c| {
                 let a = scan(c, 10);
                 let a = c.filter(a, predicate(2));
-                let a = c.map(a, &[2]);
+                let a = map_copy(c, a, &[(2, TypeCode::U64)]);
                 let b = scan(c, 11);
                 c.positive_diff(a, b);
             },

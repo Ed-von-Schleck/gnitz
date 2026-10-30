@@ -141,10 +141,11 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         "a forward reference commits nothing"
     );
 
-    // A node list past the column cap encodes, and the engine refuses it at load.
+    // A map slot list past the column cap encodes, and the engine refuses it at load.
     let mut wide = Circuit::default();
     let scan = wide.input_delta(base_tid, ReadBound::None);
-    wide.map(scan, &vec![0; gnitz_wire::MAX_COLUMNS + 1]);
+    let slots = vec![(gnitz_wire::TypeCode::I64, false); gnitz_wire::MAX_COLUMNS + 1];
+    wide.map_expr(scan, gnitz_wire::ComputeMap { program: Vec::new(), out_cols: slots });
     let planned = PlannedView {
         circuit: wide,
         ..segment(base_tid, &schema)

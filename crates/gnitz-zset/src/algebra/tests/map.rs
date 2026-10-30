@@ -22,16 +22,20 @@ pub(super) fn make_schema(col_types: &[TypeCode]) -> SchemaDescriptor {
 
 /// A computed map of `program` over `in_schema` into the payload slots `out_cols`.
 pub(super) fn compute(in_schema: &SchemaDescriptor, program: LogicalProgram, out_cols: &[(TypeCode, bool)]) -> MapPlan {
-    let map = gnitz_wire::ComputeMap {
-        program: program.to_blob_bytes(),
-        out_cols: out_cols.to_vec(),
-    };
-    MapPlan::from_compute_map(in_schema, &map).unwrap()
+    MapPlan::from_compute_map(in_schema, &program.to_map(out_cols.to_vec())).unwrap()
 }
 
-/// A projection of `in_schema` onto its payload columns `cols`.
+/// A copy of `in_schema`'s columns `cols`, each slot at its source column's
+/// type and nullability.
 pub(super) fn project(in_schema: &SchemaDescriptor, cols: &[u32]) -> MapPlan {
-    MapPlan::from_wire(in_schema, &MapKind::Projection(cols.to_vec())).unwrap()
+    let slots: Vec<(TypeCode, bool)> = cols
+        .iter()
+        .map(|&c| {
+            let col = in_schema.columns()[c as usize];
+            (col.type_code, col.nullable)
+        })
+        .collect();
+    compute(in_schema, LogicalProgram::copy_cols(cols), &slots)
 }
 
 /// Every row keeps its PK and weight, NULLs included, while copied and
@@ -449,21 +453,8 @@ fn a_malformed_map_is_refused_by_name() {
     for (schema, mk, why) in [
         (
             s,
-            MapKind::Projection(vec![200]),
-            "projection map: column 200 is not a payload column of a 2-column schema".to_string(),
-        ),
-        (
-            s,
-            MapKind::Projection(vec![0]),
-            "projection map: column 0 is not a payload column of a 2-column schema".to_string(),
-        ),
-        (
-            s,
-            MapKind::Projection(vec![1; MAX_COLUMNS]),
-            format!(
-                "projection map: column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})",
-                MAX_COLUMNS + 1
-            ),
+            MapKind::Compute(LogicalProgram::copy_cols(&[200]).to_map(vec![(TypeCode::I64, false)])),
+            "map: program/schema mismatch: ColOutOfRange { col: 200".to_string(),
         ),
         (
             s,

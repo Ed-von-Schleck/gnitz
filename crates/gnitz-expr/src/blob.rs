@@ -429,6 +429,12 @@ impl LogicalProgram {
         )
     }
 
+    /// The program as a wire map writing payload slots `out_cols`, each the type
+    /// and nullability declared for that slot.
+    pub fn to_map(&self, out_cols: Vec<(TypeCode, bool)>) -> gnitz_wire::ComputeMap {
+        gnitz_wire::ComputeMap { program: self.to_blob_bytes(), out_cols }
+    }
+
     /// A program blob: the header walked, then the regions lowered into the
     /// typed logical form — the inverse of [`Self::to_blob_bytes`].
     ///

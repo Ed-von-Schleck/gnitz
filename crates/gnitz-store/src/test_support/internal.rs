@@ -220,12 +220,12 @@ pub(crate) fn assert_index_holds(ix: &SecondaryIndex, rows: &Batch, what: impl s
 
 /// `program` as a sink map declaring `reply`'s payload columns.
 pub(crate) fn map_of(program: LogicalProgram, reply: &SchemaDescriptor) -> Option<ComputeMap> {
-    let out_cols = reply
-        .payload_columns()
-        .map(|(_, c)| (c.type_code, c.nullable))
-        .collect();
-    Some(ComputeMap {
-        program: program.to_blob_bytes(),
-        out_cols,
-    })
+    Some(
+        program.to_map(
+            reply
+                .payload_columns()
+                .map(|(_, c)| (c.type_code, c.nullable))
+                .collect(),
+        ),
+    )
 }

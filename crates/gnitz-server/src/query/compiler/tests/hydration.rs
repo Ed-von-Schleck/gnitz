@@ -2,7 +2,7 @@ use super::*;
 use crate::query::compiler::fixtures::{
     compile, count_by, predicate, rejection, scan, sources, tables_at, Build, Source,
 };
-use crate::test_support::{make_schema_u64_i64, reindexed_on_col1};
+use crate::test_support::{make_schema_u64_i64, map_copy, reindexed_on_col1};
 use gnitz_wire::{Circuit, JoinKind, TypeCode};
 use gnitz_zset::algebra::Slot;
 
@@ -75,7 +75,7 @@ fn a_bounded_view_seeds_from_the_store_holding_its_rows() {
     let linear: Build = |c| {
         let a = scan(c, 10);
         let filtered = c.filter(a, predicate(1));
-        c.map(filtered, &[1]);
+        map_copy(c, filtered, &[(1, TypeCode::I64)]);
     };
     let seed = |kind, build: Build| {
         let (registry, _dir) = tables_at(Slot::SOLO, [(10, kind, table), (11, BaseTable, table)]);

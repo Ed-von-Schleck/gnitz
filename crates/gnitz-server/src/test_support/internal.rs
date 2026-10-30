@@ -211,6 +211,18 @@ pub fn negate_chain(source: u64, n: usize) -> Circuit {
     circuit
 }
 
+/// A copy of `cols`, each a source column and its type, into non-null payload
+/// slots under `input`'s PK.
+pub fn map_copy(
+    circuit: &mut Circuit,
+    input: gnitz_wire::NodeId,
+    cols: &[gnitz_wire::ReindexSlot],
+) -> gnitz_wire::NodeId {
+    let sources: Vec<u32> = cols.iter().map(|&(c, _)| c).collect();
+    let slots = cols.iter().map(|&(_, tc)| (tc, false)).collect();
+    circuit.map_expr(input, gnitz_expr::LogicalProgram::copy_cols(&sources).to_map(slots))
+}
+
 /// `source` scanned and reindexed on `key`, keeping its column 0, with the
 /// leading `routed` slots of `key` stated as its scatter key — what a spine that
 /// moves no column produces.
@@ -281,7 +293,7 @@ pub fn left_join_circuit(a: u64, b: u64, key: u32) -> (Circuit, gnitz_wire::Node
         false => ra,
     };
     let inner = c.join([ra, rb], [ra, rb], JoinKind::Equi);
-    let keys = c.map(rb, &[]);
+    let keys = map_copy(&mut c, rb, &[]);
     let set = c.distinct(keys);
     let matched = c.join([ra, set], [ra, set], JoinKind::Equi);
     let nu = c.difference(all, matched);

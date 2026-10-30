@@ -8,9 +8,9 @@
 use super::{ColId, HirCol, HirExpr, ProjEntry};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
-use crate::project::leading_schema;
+use crate::project::{compute_map, leading_schema, payload_program};
 use gnitz_core::{RelDescriptor, Schema};
-use gnitz_wire::ColumnDef;
+use gnitz_wire::{ColumnDef, ComputeMap};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -198,8 +198,22 @@ pub(crate) fn physicalize_projection(
     Ok((proj, Frame::new(cols, input.schema.pk_cols().len())?))
 }
 
-/// Pin the source PK to slots `0..k` in PK-list order, as the engine's
-/// `project_schema` does: each PK column's first pass-through moves there, and
+/// [`physicalize_projection`] as the map producing it: `None` when the
+/// projection is `input` itself. The engine carries the key region verbatim.
+pub(crate) fn projection_map(items: &[ProjEntry], input: &Frame) -> Result<(Option<ComputeMap>, Frame), GnitzSqlError> {
+    let (items, out) = physicalize_projection(items, input)?;
+    let input = &input.schema;
+    let identity =
+        items.len() == input.columns().len() && items.iter().enumerate().all(|(i, it)| it.as_col() == Some(i));
+    let map = match identity {
+        true => None,
+        false => Some(compute_map(payload_program(&items, &out.schema, input)?, &out.schema)),
+    };
+    Ok((map, out))
+}
+
+/// Pin the source PK to slots `0..k` in PK-list order: each PK column's first
+/// pass-through moves there, and
 /// one nothing passes through is prepended hidden. A hidden key slot carries the
 /// source's definition of its column.
 fn place_pk_front(slots: &mut Vec<(BoundExpr, Option<ColId>, ColumnDef)>, source: &Schema) {

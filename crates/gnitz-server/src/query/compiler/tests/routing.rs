@@ -1,7 +1,7 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::{
-    make_schema_u64_i64, mix, pk_payload_schema, scan_keyed, scan_routed, self_typed_slots, u64_pk_schema,
+    make_schema_u64_i64, map_copy, mix, pk_payload_schema, scan_keyed, scan_routed, self_typed_slots, u64_pk_schema,
 };
 use gnitz_wire::{Circuit, JoinKind, NullKeys, RangeRel, ReindexRole, TypeCode};
 use gnitz_zset::algebra::{Placement, Slot};
@@ -353,7 +353,7 @@ fn a_source_routes_by_the_one_key_it_states() {
 fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
     let mut c = Circuit::default();
     let source = scan(&mut c, 7);
-    let moved = c.map(source, &[5]);
+    let moved = map_copy(&mut c, source, &[(5, TypeCode::I64)]);
     let role = ReindexRole::ScatterKey { source_cols: vec![5] };
     let delta = c.map_reindex(moved, &[(2, TypeCode::I64)], &[0], role, NullKeys::Keep);
     join_with_own_trace(&mut c, delta, JoinKind::Equi);
@@ -445,7 +445,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
             |c| {
                 let a = scan(c, 7);
                 let f = c.filter(a, predicate(3));
-                c.map(f, &[3]);
+                map_copy(c, f, &[(3, I64)]);
             },
             [clustered; 2],
             inherited,

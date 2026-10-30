@@ -35,10 +35,7 @@ use routing::ViewMeta;
 /// True iff `op` carries every row through on its own worker with the PK region
 /// intact.
 fn keeps_rows_and_pk_region(op: &OpNode) -> bool {
-    matches!(
-        op,
-        OpNode::Filter(_) | OpNode::Map(MapKind::Projection(_) | MapKind::Compute(_))
-    )
+    matches!(op, OpNode::Filter(_) | OpNode::Map(MapKind::Compute(_)))
 }
 
 /// Walk back from `from` through nodes that keep rows and the PK region, to the

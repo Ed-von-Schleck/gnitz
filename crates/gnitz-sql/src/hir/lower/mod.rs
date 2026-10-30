@@ -26,7 +26,6 @@ use super::{col_by_id, split_filter, AggCol, ColId, HirCol, HirExpr, ProjEntry, 
 use crate::agg::group_pk_def;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use crate::project::{compute_map, payload_program};
 use chain::{EmitPieces, ViewChain};
 use gnitz_core::{PlannedView, RelDescriptor, Schema};
 use gnitz_expr::ReduceOutSlot;
@@ -176,32 +175,16 @@ fn collect_live_cols<'a>(exprs: impl IntoIterator<Item = &'a HirExpr>, live: &mu
 }
 
 /// `items` over `input` with `input`'s PK pinned to the front, the linear
-/// projection, as the cheapest node producing them: the input itself, a copy
-/// list, or the payload expression map. The engine carries the key region
-/// verbatim through each.
+/// projection, as the cheapest node producing them: the input itself or the
+/// payload map.
 fn project_front(
     cb: &mut gnitz_wire::Circuit,
     node: gnitz_wire::NodeId,
     items: &[ProjEntry],
     input: &Frame,
 ) -> Result<(gnitz_wire::NodeId, Frame), GnitzSqlError> {
-    let (items, out) = physical::physicalize_projection(items, input)?;
-    let input = &input.schema;
-    let k = input.pk_cols().len();
-    // A payload slot naming a key column is a second copy of a value the key
-    // region already carries; only the expression map can write one.
-    let payload: Option<Vec<u32>> = items[k..]
-        .iter()
-        .map(|i| i.as_col().filter(|&c| !input.layout().is_pk_col(c)).map(|c| c as u32))
-        .collect();
-    let Some(payload) = payload else {
-        let map = compute_map(payload_program(&items, &out.schema, input)?, &out.schema);
-        return Ok((cb.map_expr(node, map), out));
-    };
-    let identity =
-        items.len() == input.columns().len() && items.iter().enumerate().all(|(i, it)| it.as_col() == Some(i));
-    let node = if identity { node } else { cb.map(node, &payload) };
-    Ok((node, out))
+    let (map, out) = physical::projection_map(items, input)?;
+    Ok((map.map_or(node, |map| cb.map_expr(node, map)), out))
 }
 
 /// Lower a bound view body to its segments and the user-named view. The view lists its visible columns in

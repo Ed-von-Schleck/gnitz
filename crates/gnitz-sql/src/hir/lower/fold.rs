@@ -9,7 +9,6 @@ use super::super::{AggCol, ColId, HirExpr, ProjEntry};
 use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
-use crate::project::{compute_map, payload_program};
 use gnitz_core::Schema;
 use gnitz_wire::ColumnDef;
 use gnitz_wire::{ComputeMap, GroupAggs};
@@ -75,13 +74,9 @@ pub(super) fn fold(
 ) -> Result<FoldPieces, GnitzSqlError> {
     // The pre-map, physicalized over the source — the same projection `lower_reduce`
     // fuses, so the reduce input's column order is identical on both paths.
-    let (reduce_in, map) = match pre {
-        None => (src, None),
-        Some(items) => {
-            let (items, out) = physical::physicalize_projection(items, &src)?;
-            let map = compute_map(payload_program(&items, &out.schema, &src.schema)?, &out.schema);
-            (out, Some(map))
-        }
+    let (map, reduce_in) = match pre {
+        None => (None, src),
+        Some(items) => physical::projection_map(items, &src)?,
     };
     let ReduceSpecs { agg, cols } = resolve_reduce_specs(group_cols, aggs, &reduce_in)?;
     let partial = keyed_frame(&reduce_in, &agg.group_cols, agg.group_cols.iter().copied(), cols)?;

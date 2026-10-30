@@ -16,8 +16,6 @@ wire_enum! {
     enum Opcode: u8 {
         ScanDelta = 1,
         Filter = 2,
-        /// MAP sub-variant: pure projection (column reorder/drop).
-        MapProj = 3,
         /// MAP sub-variant: expression program (compute), inheriting the input PK.
         MapExpr = 4,
         /// MAP sub-variant: keep the listed columns as payload, set PK = hash of
@@ -51,7 +49,7 @@ wire_enum! {
 
 /// The layout of a `CIRCUIT_TAB` cell ([`Circuit::encode`]), folded into
 /// [`crate::SYS_SCHEMA_DIGEST`].
-pub(crate) const CIRCUIT_VERSION: u8 = 14;
+pub(crate) const CIRCUIT_VERSION: u8 = 15;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation
@@ -144,9 +142,8 @@ pub type ReindexSlot = (u32, TypeCode);
 /// MAP sub-variant discriminant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MapKind {
-    /// Pure projection/column-reorder. Carries payload column indices to keep.
-    Projection(Vec<u32>),
-    /// Computed projection (`SELECT a + b`).
+    /// Projection by an expression program (`SELECT a + b`); a pure column copy
+    /// is the instruction-free program.
     Compute(ComputeMap),
     /// Re-key onto a synthetic PK: `key` is the source columns in key order, each
     /// with the type its key slot packs at, and `keep` the columns surviving as
@@ -297,7 +294,6 @@ impl OpNode {
         match self {
             OpNode::ScanDelta { source, bound } => w.put(&Opcode::ScanDelta).u64(*source).put(bound),
             OpNode::Filter(program) => w.put(&Opcode::Filter).bytes32(program),
-            OpNode::Map(MapKind::Projection(cols)) => w.put(&Opcode::MapProj).list(cols),
             OpNode::Map(MapKind::Compute(map)) => w.put(&Opcode::MapExpr).put(map),
             OpNode::Map(MapKind::Reindex { keep, key, role, nulls }) => {
                 w.put(&Opcode::MapReindex).put(nulls).list(key).list(keep);
@@ -345,7 +341,6 @@ impl OpNode {
         Ok(match r.get::<Opcode>()? {
             Opcode::ScanDelta => OpNode::ScanDelta { source: r.u64()?, bound: r.get()? },
             Opcode::Filter => OpNode::Filter(r.bytes32()?.to_vec()),
-            Opcode::MapProj => OpNode::Map(MapKind::Projection(col_list(r)?)),
             Opcode::MapExpr => OpNode::Map(MapKind::Compute(r.get()?)),
             Opcode::MapReindex => {
                 let nulls = r.get()?;
@@ -568,11 +563,6 @@ impl Circuit {
     pub fn map_hash_row(&mut self, input: NodeId, cols: &[ReindexSlot]) -> NodeId {
         let map = self.add(OpNode::Map(MapKind::HashRow { cols: cols.to_vec() }), &[input]);
         self.shard(map)
-    }
-
-    /// [`MapKind::Projection`].
-    pub fn map(&mut self, input: NodeId, projection: &[u32]) -> NodeId {
-        self.add(OpNode::Map(MapKind::Projection(projection.to_vec())), &[input])
     }
 
     pub fn negate(&mut self, input: NodeId) -> NodeId {

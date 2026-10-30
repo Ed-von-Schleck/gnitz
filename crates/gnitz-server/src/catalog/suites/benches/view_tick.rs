@@ -69,7 +69,7 @@ fn projection_view_tick_bench() {
     let (mut engine, t) = ingest_fixture("projection_view_tick_bench", &cols, ROWS, cells);
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(t, ReadBound::None);
-    circuit.map(scan, &[2]);
+    crate::test_support::map_copy(&mut circuit, scan, &[(2, TypeCode::U64)]);
     let view_cols = [col_def("id", TypeCode::U64), col_def("b", TypeCode::U64)];
     let v = try_register_view(&mut engine, circuit, "p", &view_cols, 0, 0).unwrap();
 

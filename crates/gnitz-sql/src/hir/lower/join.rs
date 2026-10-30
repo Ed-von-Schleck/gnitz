@@ -11,6 +11,7 @@ use crate::ir::BExpr;
 use crate::rules::reject_arity;
 
 use gnitz_core::Schema;
+use gnitz_expr::LogicalProgram;
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, GroupAggs, JoinKind};
 use gnitz_wire::{Circuit, ColumnDef, NodeId, NullKeys, RangeRel, ReindexRole, ReindexSlot, TypeCode};
 use std::borrow::Cow;
@@ -529,9 +530,12 @@ fn emit_equi(
             // matches each P row at most once, so π_P(inner) = [_join_pk, P] is
             // that; otherwise P's reindex is joined against O's key set.
             let matched = match sides[o].unique {
-                true => cb.map(inner, &proj),
+                true => {
+                    let slots = sides[p].kept_defs().map(|c| (c.ty.tc, c.is_nullable)).collect();
+                    cb.map_expr(inner, LogicalProgram::copy_cols(&proj).to_map(slots))
+                }
                 false => {
-                    let keys = cb.map(reindex[o], &[]);
+                    let keys = cb.map_expr(reindex[o], LogicalProgram::copy_cols(&[]).to_map(Vec::new()));
                     let mut deltas = reindex;
                     deltas[o] = cb.distinct(keys);
                     cb.join(deltas, deltas, JoinKind::Equi)
@@ -658,7 +662,7 @@ fn threshold(cb: &mut Circuit, side_a: &JoinSide, reindex_b: NodeId, int_a: Node
         false => WireAggFunc::Max,
     };
     // B's range keys alone: rows sharing one consolidate before the MIN/MAX reads it.
-    let keys = cb.map(reindex_b, &[]);
+    let keys = cb.map_expr(reindex_b, LogicalProgram::copy_cols(&[]).to_map(Vec::new()));
     // Local over the broadcast B, so every worker holds the same extremum. No
     // ground row: a `m = NULL` seed would break `A − 0 = A` over an empty B.
     // The COUNT is the cardinality gate every reduce carries; the reindex

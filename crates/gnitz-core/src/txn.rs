@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use gnitz_expr::{LogicalProgram, RowFilter};
 use gnitz_wire::txn_frame::BLIND;
-use gnitz_wire::{ComputeMap, PkBuf, PkKeys, ReadBound, ReadSink, ReadSpec, WireConflictMode, WireFault, WireStatus};
+use gnitz_wire::{PkBuf, PkKeys, ReadBound, ReadSink, ReadSpec, WireConflictMode, WireFault, WireStatus};
 
 use crate::client::GnitzClient;
 use crate::connection::PushFamily;
@@ -25,8 +25,7 @@ pub fn key_reply(schema: &Schema) -> (Arc<Schema>, ReadSink) {
     let pk: Vec<u32> = (0..schema.pk_cols().len() as u32).collect();
     let reply = Schema::from_parts(schema.hidden_key_columns().collect(), &pk)
         .expect("a schema's own PK columns are an admissible schema");
-    let program = LogicalProgram::copy_cols(&[]).to_blob_bytes();
-    let map = ComputeMap { program, out_cols: Vec::new() };
+    let map = LogicalProgram::copy_cols(&[]).to_map(Vec::new());
     (Arc::new(reply), ReadSink { map: Some(map), ..ReadSink::all_rows() })
 }
 

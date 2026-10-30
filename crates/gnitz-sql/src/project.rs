@@ -39,13 +39,11 @@ pub(crate) fn payload_program(
 /// A compiled payload program paired with the `(type_code, nullable)` declaration of `out`'s
 /// payload slots, which it writes.
 pub(crate) fn compute_map(program: LogicalProgram, out: &Schema) -> ComputeMap {
-    ComputeMap {
-        program: program.to_blob_bytes(),
-        out_cols: out
-            .payload_columns()
+    program.to_map(
+        out.payload_columns()
             .map(|(_, _, c)| (c.ty.tc, c.is_nullable))
             .collect(),
-    }
+    )
 }
 
 /// Compile the *payload* slice of a projection (`items` must exclude the

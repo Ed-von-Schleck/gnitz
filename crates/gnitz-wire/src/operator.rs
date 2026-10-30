@@ -119,9 +119,10 @@ impl Wire for GroupAggs {
 
 /// A compiled expression program and the payload slots it writes, as
 /// `(type_code, nullable)` in output order; the PK region is inherited verbatim.
-/// The declarations travel because a computed projection has no copy list the
-/// engine could derive a schema from. One type on both wire paths — a circuit's
-/// `Map` and a `ReadSpec` fold's pre-map are the same device.
+/// The declarations travel because a computed slot has no source column the
+/// engine could derive its type from; a pure column copy declares its slots too.
+/// One type on both wire paths — a circuit's `Map` and a `ReadSpec` fold's
+/// pre-map are the same device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComputeMap {
     pub program: Vec<u8>,

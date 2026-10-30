@@ -40,7 +40,6 @@ fn sample(op: Opcode) -> OpNode {
             type_codes: vec![TypeCode::I64, TypeCode::String],
             nulls_first: true,
         },
-        Opcode::MapProj => OpNode::Map(MapKind::Projection(vec![4, 0, 9])),
         Opcode::MapExpr => OpNode::Map(MapKind::Compute(ComputeMap {
             program: vec![7],
             out_cols: vec![(TypeCode::I64, false), (TypeCode::String, true)],
@@ -132,7 +131,6 @@ fn every_op_node_variant_roundtrips() {
                 [&7u64.to_be_bytes()[..], &2u64.to_be_bytes()[..]],
             )),
         },
-        OpNode::Map(MapKind::Projection(vec![])),
         OpNode::Map(MapKind::Compute(ComputeMap { program: vec![9, 9], out_cols: vec![] })),
         // A hash-row target's domain is the copy kernel's, not this decode's.
         OpNode::Map(MapKind::HashRow { cols: vec![(3, TypeCode::U128)] }),
@@ -213,7 +211,7 @@ fn each_opcode_cell_refuses_every_perturbation() {
 #[test]
 fn the_cell_layout_is_pinned_to_its_version() {
     let cells: Vec<u8> = Opcode::ALL.iter().flat_map(|&op| wired(sample(op)).encode()).collect();
-    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (14, 0xbc8b_cf4e_e566_97e1));
+    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (15, 0x230c_3eef_fd93_1ff5));
 }
 
 /// Every framing guard, against the forgery that trips it.
@@ -260,9 +258,10 @@ fn each_decode_guard_rejects_its_own_forgery() {
         // The encoder is infallible; the decode refuses by the count before
         // reading the body.
         (
-            wired(OpNode::Map(MapKind::Projection(
-                (0..=crate::MAX_COLUMNS as u32).collect(),
-            )))
+            wired(OpNode::Map(MapKind::Compute(ComputeMap {
+                program: vec![],
+                out_cols: vec![(TypeCode::I64, false); crate::MAX_COLUMNS + 1],
+            })))
             .encode(),
             "exceeds cap",
         ),
