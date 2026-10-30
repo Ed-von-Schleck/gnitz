@@ -607,11 +607,12 @@ impl PyClient {
 /// The server a connection dials: `target`, or `GNITZ_TARGET` where it is not
 /// given.
 pub(crate) fn resolve_target(target: Option<String>) -> PyResult<String> {
-    target
-        .or_else(|| std::env::var("GNITZ_TARGET").ok().filter(|t| !t.is_empty()))
-        .ok_or_else(|| {
+    match target {
+        Some(target) => Ok(target),
+        None => gnitz_core::env_target().map_err(PyValueError::new_err)?.ok_or_else(|| {
             PyValueError::new_err("no target: pass the server's socket path or tls:// target, or set GNITZ_TARGET")
-        })
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
