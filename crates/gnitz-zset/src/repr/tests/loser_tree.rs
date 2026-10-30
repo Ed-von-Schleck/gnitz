@@ -42,9 +42,11 @@ fn random_kway_merges_drain_in_key_then_source_order() {
             let mut rng = Rng::new(seed.wrapping_mul(1_000_003) + k as u64 * 7);
 
             // `u128::MAX` is a real key here — only `source_idx` discriminates
-            // the sentinel. Small values force ties, on the value and on its key.
+            // the sentinel. Small values force ties, on the value and on its key;
+            // a band of its own per source gives a champion stretches it wins
+            // outright.
             let runs: Vec<Vec<u128>> = (0..k)
-                .map(|_| {
+                .map(|src| {
                     // Empty runs leave adjacent sentinel losers for a drop to walk past.
                     let len = match rng.gen_range(3) {
                         0 => 0,
@@ -55,6 +57,7 @@ fn random_kway_merges_drain_in_key_then_source_order() {
                             0 => u128::MAX,
                             1 => rng.gen_range(5) as u128,
                             2 => rng.gen_range(20) as u128,
+                            3 | 4 => (src as u128 + 1) << 64 | rng.gen_range(4) as u128,
                             _ => rng.gen_u128(),
                         })
                         .collect();

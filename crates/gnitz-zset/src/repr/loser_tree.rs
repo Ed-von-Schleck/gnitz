@@ -61,6 +61,10 @@ pub(crate) struct LoserTree {
     winners: Vec<HeapNode>,
     /// Sources the tournament was built for.
     n: usize,
+    /// A leading key word no player but the champion holds a lower one than —
+    /// keys only rise — so a champion stepped below it keeps winning without a
+    /// replay.
+    bound: u64,
 }
 
 impl LoserTree {
@@ -73,6 +77,7 @@ impl LoserTree {
             tree: vec![SENTINEL_NODE; n_pad],
             winners: vec![SENTINEL_NODE; 2 * n_pad],
             n,
+            bound: 0,
         }
     }
 
@@ -99,6 +104,7 @@ impl LoserTree {
             self.tree[idx] = loser;
         }
         self.tree[0] = self.winners[1];
+        self.bound = 0;
     }
 
     /// The current champion, or `None` once every source is exhausted.
@@ -116,11 +122,19 @@ impl LoserTree {
     }
 
     /// Step the champion to `next_row`, or drop it when its source is exhausted.
+    ///
+    /// A champion that stays one keeps its path's losers, whose least key is
+    /// then the bound under which its next steps skip the replay: a run that does
+    /// not interleave with the others is walked at one compare per row.
     #[inline(always)]
     pub(crate) fn step_top(&mut self, next_row: Option<(u32, u128)>, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
         let source_idx = self.tree[0].source_idx;
         debug_assert_ne!(source_idx, SENTINEL, "step_top on a drained tree");
         let mut cur = match next_row {
+            Some((row, key)) if ((key >> 64) as u64) < self.bound => {
+                self.tree[0] = HeapNode::new(key, source_idx, row);
+                return;
+            }
             Some((row, key)) => HeapNode::new(key, source_idx, row),
             None => SENTINEL_NODE,
         };
@@ -134,6 +148,23 @@ impl LoserTree {
             idx >>= 1;
         }
         self.tree[0] = cur;
+        // A player swapped into the tree never leaves it on this replay, so the
+        // champion is still `source_idx` exactly when it beat every loser. Its
+        // path's losers are then the champions of every other subtree.
+        if cur.source_idx == source_idx {
+            self.bound = self.path_least(source_idx);
+        }
+    }
+
+    /// The least leading key word a loser on `source_idx`'s path holds.
+    #[inline(never)]
+    fn path_least(&self, source_idx: u32) -> u64 {
+        let (mut least, mut idx) = (u64::MAX, self.leaf_parent(source_idx));
+        while idx > 0 {
+            least = least.min(self.tree[idx].key[0]);
+            idx >>= 1;
+        }
+        least
     }
 }
 
