@@ -38,7 +38,10 @@ pub use ddl::render::{
 };
 pub use error::GnitzSqlError;
 pub use literal::{parse_bool, place_scaled, Placed};
-pub use names::{column_text, parse_relation_name, parse_schema_name, relation_name, relation_text, table_factor_name};
+pub use names::{
+    column_text, parse_identifier, parse_relation_name, parse_schema_name, relation_name, relation_text,
+    table_factor_name,
+};
 pub use source::Offsets;
 pub use sqlparser;
 pub use types::{sql_type_name, type_names};

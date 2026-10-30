@@ -44,6 +44,13 @@ fn a_relation_name_reads_as_sql_reads_it() {
 }
 
 #[test]
+fn an_identifier_reads_unquoted_and_otherwise_as_written() {
+    assert_eq!(parse_identifier("\"My T\"").as_deref(), Some("My T"));
+    assert_eq!(parse_identifier("Ab").as_deref(), Some("Ab"));
+    assert!(parse_identifier("a.b").is_none());
+}
+
+#[test]
 fn a_schema_name_reads_as_the_schema_of_a_qualified_name() {
     assert_eq!(parse_schema_name("App").as_deref(), Some("app"));
     assert_eq!(parse_schema_name("\"app\"").as_deref(), Some("app"));
