@@ -111,11 +111,10 @@ impl TlsShared {
         &self.conn
     }
 
-    /// Send everything rustls has queued, under `send`, which keeps records in
-    /// emission order. `plaintext`, the bytes handed to rustls since the last
-    /// flush, sizes the buffer.
-    async fn flush_records(&self, send: &WriteGuard<TlsSendLock>, plaintext: usize) -> Result<(), PeerGone> {
-        debug_assert!(send.is_of(&self.send_lock), "the guard of this connection's send lock");
+    /// Send everything rustls has queued, under `_send`, a hold of `send_lock`
+    /// that keeps records in emission order. `plaintext`, the bytes handed to
+    /// rustls since the last flush, sizes the buffer.
+    async fn flush_records(&self, _send: &WriteGuard<TlsSendLock>, plaintext: usize) -> Result<(), PeerGone> {
         let records = plaintext.div_ceil(TLS_MAX_FRAGMENT);
         let mut out = PooledBuf::with_capacity(plaintext + records * TLS_RECORD_OVERHEAD);
         {

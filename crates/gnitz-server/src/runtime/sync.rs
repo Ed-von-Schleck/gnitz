@@ -229,10 +229,6 @@ struct RwLockInner {
 }
 
 impl RwLockInner {
-    fn unqueue(&mut self, waiter: &Rc<WakerSlot>) {
-        self.write_waiters.retain(|w| !Rc::ptr_eq(w, waiter));
-    }
-
     /// A reader may enter: no writer holds the lock and none is waiting, so a
     /// stream of readers cannot starve a writer.
     fn read_ok(&self) -> bool {
@@ -373,7 +369,11 @@ impl<K> Future for WriteFuture<K> {
 impl<K> Drop for WriteFuture<K> {
     fn drop(&mut self) {
         let Some(waiter) = self.waiter.take() else { return };
-        self.lock.0.borrow_mut().unqueue(&waiter);
+        self.lock
+            .0
+            .borrow_mut()
+            .write_waiters
+            .retain(|w| !Rc::ptr_eq(w, &waiter));
         // This future may have been the last writer blocking the parked readers.
         self.lock.wake_next();
     }
@@ -381,13 +381,6 @@ impl<K> Drop for WriteFuture<K> {
 
 pub(crate) struct WriteGuard<K = ()> {
     lock: AsyncRwLock<K>,
-}
-
-impl<K> WriteGuard<K> {
-    /// Whether this guard holds `lock`, among the locks of its tag.
-    pub(crate) fn is_of(&self, lock: &AsyncRwLock<K>) -> bool {
-        Rc::ptr_eq(&self.lock.0, &lock.0)
-    }
 }
 
 impl<K> Drop for WriteGuard<K> {

@@ -188,9 +188,7 @@ struct PendingBatch {
 
 /// Sort `first` into the batch, then keep draining requests already queued
 /// behind it — without ever waiting — until the row cap is reached, an `End`
-/// request arrives, or the channel runs dry. There is no debounce timer: one
-/// would add tail latency to every commit to help only serial single-request
-/// workloads, while pipelined clients batch without one.
+/// request arrives, or the channel runs dry.
 ///
 /// An `End` request ends the batch wherever it lands, `first` included: what is
 /// queued behind it is younger than whatever issued it, so folding that in would
@@ -222,7 +220,7 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
 /// The checkpoint sequence: base round, drain, ephemeral round. A failed round
 /// aborts: the workers are re-epoched against an un-reset SAL, which only a
 /// restart's replay repairs.
-async fn run_checkpoint_sequence(shared: &Rc<Shared>) {
+async fn run_checkpoint_sequence(shared: &Shared) {
     shared
         .dispatcher
         .checkpoint_base()
@@ -304,7 +302,7 @@ fn write_disjoint_tables(units: &[CommitUnit]) -> bool {
 /// tick and submits the fsync SQE under one SAL hold, then awaits the worker
 /// ACKs and, when the batch opened a zone, the fsync. Only then are the
 /// validation caches updated and the writers answered.
-async fn commit_writes(shared: &Rc<Shared>, mut writes: Vec<PendingWrite>) {
+async fn commit_writes(shared: &Shared, mut writes: Vec<PendingWrite>) {
     // One-family writes in tid runs. Stable: arrival order within a run is what
     // makes intra-batch last-insert-wins mean last *inserted*.
     writes.sort_by_key(|w| (w.families.len() != 1, w.families[0].tid));

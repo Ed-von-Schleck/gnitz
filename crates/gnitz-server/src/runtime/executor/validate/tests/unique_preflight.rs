@@ -1,7 +1,5 @@
 use super::*;
-use crate::runtime::frame::WireMsg;
-use crate::runtime::park::WorkerSet;
-use crate::runtime::reactor::test_support::reactor_with_rings;
+use crate::runtime::reactor::test_support::train_lease;
 use crate::test_support::pk_only_schema;
 use gnitz_wire::TypeCode;
 
@@ -9,8 +7,7 @@ use gnitz_wire::TypeCode;
 /// a row-less terminal frame.
 fn merge(partitions: &[&[u64]]) -> Option<UniqueFilter> {
     let frame_schema = pk_only_schema(&[TypeCode::U64]);
-    let (reactor, mut writers) = reactor_with_rings(partitions.len());
-    let lease = reactor.lease_train(WorkerSet::ALL, "KeySpans");
+    let (reactor, lease, mut writers) = train_lease(partitions.len(), "KeySpans");
     let req = lease.id();
     for (writer, keys) in writers.iter_mut().zip(partitions) {
         let mut spans = Batch::empty_with_schema(&frame_schema);
@@ -19,9 +16,9 @@ fn merge(partitions: &[&[u64]]) -> Option<UniqueFilter> {
             for key in pair {
                 spans.push_key_row(&key.to_be_bytes(), 1);
             }
-            writer.send_msg(req, &WireMsg::train_frame(1, false, spans.wire_whole()));
+            writer.send_train_frame(req, false, Some(&spans));
         }
-        writer.send_msg(req, &WireMsg::train_frame(1, true, None));
+        writer.send_train_frame(req, true, None);
     }
     reactor
         .block_on(merge_index_scan(&lease, &frame_schema))

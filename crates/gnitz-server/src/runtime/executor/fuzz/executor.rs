@@ -19,12 +19,10 @@
 use std::collections::HashSet;
 
 use super::validate::TxnFamily;
-use super::write::{check_stream_push, decode_push_frame, decode_push_txn_frame};
+use super::write::{decode_push_frame, decode_push_txn_frame};
 use super::*;
-use crate::catalog::{SysFamily, ZoneError};
-use crate::test_support::{
-    col_def, col_tab_batch, left_join_circuit, nullable_def, sys_batch, table_tab_batch, view_blocks, view_tab_row,
-};
+use crate::catalog::{SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
+use crate::test_support::{left_join_circuit, left_join_cols, sys_batch, table_blocks, view_blocks, view_tab_row};
 use gnitz_fuzz::input::Input;
 use gnitz_fuzz::seed::{Frame, Seed, Seeds, SEEDS_ENV};
 use gnitz_store::read::Probe;
@@ -99,19 +97,19 @@ impl Session {
         match verb {
             ClientVerb::DdlTxn => self.ddl(body),
             ClientVerb::Push => {
-                let (tid, mode) = (ctrl.hdr.target_id, ctrl.hdr.flags.conflict_mode);
                 let Ok(push) = decode_push_frame(&self.cat, frame, ctrl) else {
                     return;
                 };
-                let Ok((kind, Some(batch))) = push.admit(&self.cat, Access::Write) else {
+                let Ok(Some(family)) = push.admit(&self.cat, Access::Write) else {
                     return;
                 };
-                let admitted = match kind {
-                    RelationKind::Stream => check_stream_push(tid, Some(&batch), mode).is_ok(),
-                    _ => self.inserts(tid, &batch),
-                };
-                if admitted {
-                    self.ingest(vec![TxnFamily { tid, mode, batch }]);
+                let stream = self
+                    .cat
+                    .registry
+                    .relation(family.tid)
+                    .is_some_and(|r| r.kind() == RelationKind::Stream);
+                if stream || self.inserts(family.tid, &family.batch) {
+                    self.ingest(vec![family]);
                 }
             }
             ClientVerb::PushTxn => {
@@ -232,7 +230,6 @@ impl Session {
 /// frames are built under the schemas the DDL frames create, read off a
 /// scratch catalog they are played into.
 fn builtin() -> Seed {
-    use gnitz_wire::TypeCode::U64;
     let scratch = tempfile::tempdir().unwrap();
     let mut session = Session::open(scratch.path().to_str().unwrap());
     let ids = 3;
@@ -240,10 +237,14 @@ fn builtin() -> Seed {
     let base = gnitz_wire::FIRST_USER_TABLE_ID;
     let (a, b, view) = (base, base + 1, base + 2);
     let table = |tid: u64, name: &str, cols: &[gnitz_wire::CatalogColumn]| {
-        ddl_frame([
-            (SysFamily::Column, col_tab_batch(tid, cols, 1)),
-            (SysFamily::Table, table_tab_batch(&[(tid, name, 1)])),
-        ])
+        ddl_frame(table_blocks(
+            tid,
+            PUBLIC_SCHEMA_ID,
+            name,
+            cols,
+            &[0],
+            Default::default(),
+        ))
     };
     let mut alloc = Vec::new();
     append_frame(
@@ -253,22 +254,12 @@ fn builtin() -> Seed {
         None,
         None,
     );
-    let view_cols = [
-        col_def("key", U64),
-        col_def("id", U64),
-        col_def("nn", U64),
-        nullable_def("nullable", U64),
-        nullable_def("w", U64),
-    ];
+    let (a_cols, b_cols, view_cols) = left_join_cols();
     let (circuit, _) = left_join_circuit(a, b, 1);
     let ddl = [
         alloc,
-        table(
-            a,
-            "a",
-            &[col_def("id", U64), col_def("nn", U64), nullable_def("nullable", U64)],
-        ),
-        table(b, "b", &[col_def("id", U64), col_def("k", U64), col_def("w", U64)]),
+        table(a, "a", &a_cols),
+        table(b, "b", &b_cols),
         ddl_frame(view_blocks(
             [(view, &circuit, &view_cols[..])],
             sys_batch([(view_tab_row(view, "v"), 1)]),
@@ -326,10 +317,6 @@ fn the_builtin_seed_plays_through() {
     let mut session = Session::open(dir.path().to_str().unwrap());
     seed.sent.iter().for_each(|f| session.request(&f.bytes));
     assert_eq!(session.filled.len(), 2, "both pushes were admitted");
-    let view = session
-        .cat
-        .registry
-        .relation_or_err(session.filled.iter().max().unwrap() + 1)
-        .unwrap();
-    assert_eq!(crate::test_support::sum_weights(view.cursor()), 22);
+    let view = session.filled.iter().max().unwrap() + 1;
+    assert_eq!(crate::test_support::net_weight(&session.cat, view), 22);
 }

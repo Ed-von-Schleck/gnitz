@@ -42,7 +42,7 @@ mod uring;
 pub(crate) use conn::{
     Accepted, Charge, ClientConn, FrameSink, Limits, PeerGone, Plain, RecvBuf, RecvEnd, RecvFilter, SendBody,
 };
-pub(crate) use lease::{AckLease, ReadyAcked, ReadyLease, TrainFrame, TrainLease};
+pub(crate) use lease::{AckLease, GroupTargets, ReadyAcked, ReadyLease, TrainFrame, TrainLease};
 pub(crate) use uring::check_host;
 
 // ---------------------------------------------------------------------------

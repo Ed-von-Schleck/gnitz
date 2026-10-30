@@ -59,8 +59,7 @@ fn a_bulk_write_evicts_and_records_nothing() {
 /// invalidated, and a durable batch reaches that table's cache alone.
 #[test]
 fn a_table_has_a_cache_from_its_first_found_key() {
-    let tmp = tempfile::tempdir().unwrap();
-    let engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
+    let (_tmp, engine) = crate::runtime::test_support::empty_catalog();
     let checks = Checks::new();
     let held = |keys: [u64; 3]| checks.fk_presence_of(9).map(|cache| held(&cache, keys));
     assert_eq!(held([5, 6, 7]), None);

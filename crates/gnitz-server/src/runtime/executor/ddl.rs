@@ -8,12 +8,11 @@
 //! none of that: a `sys_sequences` advance has no DAG evaluation, and the row
 //! it logs is one no worker reads.
 
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::committer::Paused;
 use super::validate::{self, UniqueFilter};
-use super::{park_until, CatalogLock, Shared};
+use super::{decode_fault, park_until, CatalogLock, Shared};
 use crate::catalog::{AppliedDdl, DdlBundle, SysFamily};
 use crate::runtime::sal::Read;
 use crate::runtime::sync::WriteGuard;
@@ -104,8 +103,7 @@ fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, B
 /// [`decode_sys_family`]. One slot per family: every list derived from a bundle
 /// reads one block of each.
 pub(super) fn decode_bundle(body: &[u8]) -> Result<DdlBundle, WireFault> {
-    let items =
-        gnitz_wire::txn_frame::decode_items(body, ClientVerb::DdlTxn).map_err(|e| format!("decode error: {e}"))?;
+    let items = gnitz_wire::txn_frame::decode_items(body, ClientVerb::DdlTxn).map_err(decode_fault)?;
     let mut families = DdlBundle::default();
     for (frame, ctrl) in items {
         decode_sys_family(frame, ctrl)
@@ -122,7 +120,7 @@ pub(super) fn decode_bundle(body: &[u8]) -> Result<DdlBundle, WireFault> {
 /// The bundle is applied and its zone laid out under one hold of the SAL lock,
 /// with no await between: a bundle the catalog or the log refuses is negated in
 /// master memory there, so no system flush sees a row no zone carries.
-pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, body: &[u8]) -> Result<u64, WireFault> {
+pub(super) async fn handle_ddl_txn(shared: &Shared, body: &[u8]) -> Result<u64, WireFault> {
     // Decoded up front, before any lock.
     let families = decode_bundle(body)?;
     let unique_creates = families.unique_index_creates();
@@ -184,7 +182,7 @@ struct Committed {
 /// Pre-flight every unique index of the bundle, then apply it and make its zone
 /// durable. Every `Err` leaves the catalog as it was.
 async fn commit_bundle(
-    shared: &Rc<Shared>,
+    shared: &Shared,
     families: DdlBundle,
     unique_creates: &[(u64, PkColList)],
 ) -> Result<Committed, WireFault> {
@@ -237,7 +235,7 @@ async fn release_preflight(shared: &Shared) {
 /// through a later zone's fdatasync of the same log or through a checkpoint, and
 /// either makes this zone durable first. An advance a crash loses was used by no
 /// durable row, and a client drops its reserved ids with its connection.
-pub(super) async fn reserve_serial_range(shared: &Rc<Shared>, seq: Target, count: u64) -> Result<u64, WireFault> {
+pub(super) async fn reserve_serial_range(shared: &Shared, seq: Target, count: u64) -> Result<u64, WireFault> {
     // A read guard holds the token and the sequence's table against a DDL; the
     // SAL lock orders reservations among themselves, and everything under it is
     // synchronous.

@@ -26,7 +26,6 @@ pub(crate) fn with_routed<R>(
     num_workers: usize,
     f: impl FnOnce(GroupData<'_>) -> R,
 ) -> R {
-    let plan = ScatterPlan::native(placement);
     // One payload for every worker is the batch itself unless it holds a
     // ghost, and then no row needs routing.
     let shared = num_workers == 1 || matches!(placement, Placement::Replicated);
@@ -43,7 +42,7 @@ pub(crate) fn with_routed<R>(
     }
     SCATTER_INDICES.with(|pool| {
         let mut pool = pool.borrow_mut();
-        match plan.route(batch, &mut pool, num_workers) {
+        match ScatterPlan::native(placement).route(batch, &mut pool, num_workers) {
             [live] => f(GroupData::Same(batch.wire_listed(live))),
             lists => {
                 let mut each = [None; MAX_WORKERS];

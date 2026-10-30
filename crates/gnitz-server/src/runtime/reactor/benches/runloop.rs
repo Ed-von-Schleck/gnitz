@@ -5,7 +5,6 @@ use gnitz_foundation::perf::{voluntary_ctx_switches, Counter};
 
 use super::super::test_support::*;
 use super::*;
-use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::w2m::fixtures::id;
 use crate::runtime::w2m::RequestId;
@@ -97,14 +96,14 @@ fn reactor_pass_bench() {
         });
     }
 
-    let (r, mut writers) = reactor_with_rings(1);
-    let lease = r.lease_train(WorkerSet::ALL, "ScanSpec");
+    let (r, lease, mut writers) = train_lease(1, "ScanSpec");
     let id = lease.id();
     let schema = crate::test_support::make_schema_u64_i64();
     let rows = crate::test_support::make_batch(&schema, &[(1, 1, 0)]);
-    let frame = WireMsg::train_frame(0, false, rows.wire_whole());
     let next = async move || assert!(matches!(black_box(lease.next().await), Ok(Some(_))));
-    arm("train", r, next, || writers[0].send_msg(id, &frame));
+    arm("train", r, next, || {
+        drop(writers[0].send_train_frame(id, false, Some(&rows)))
+    });
 }
 
 /// What a flood of worker frames costs the master through its park, and what

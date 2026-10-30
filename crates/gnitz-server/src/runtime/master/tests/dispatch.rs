@@ -1,12 +1,14 @@
 use std::num::NonZero;
 
 use super::super::fixtures::test_dispatcher;
+use super::super::MasterDispatcher;
 use super::{check_workers, worker_death};
-use crate::catalog::CatalogEngine;
+use crate::catalog::{CatalogEngine, DdlBundle};
 use crate::runtime::park::WorkerSet;
 use crate::runtime::reactor::test_support::make_reactor;
-use crate::runtime::sal::{Apply, GroupData, GroupTargets, SalGroup};
-use crate::runtime::test_support::{assert_child_exited_ok, fork_child, within};
+use crate::runtime::reactor::GroupTargets;
+use crate::runtime::sal::{Apply, GroupData, SalGroup};
+use crate::runtime::test_support::{assert_child_exited_ok, empty_catalog, fork_child, within};
 use gnitz_foundation::posix_io::retry_eintr;
 use gnitz_wire::{ColTabRow, WireFault, WireStatus};
 
@@ -76,13 +78,6 @@ fn worker_death_names_the_dead_worker() {
     kill(live);
 }
 
-/// An empty catalog, and the directory it lives in.
-fn empty_catalog() -> (tempfile::TempDir, CatalogEngine) {
-    let tmp = tempfile::tempdir().unwrap();
-    let engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
-    (tmp, engine)
-}
-
 /// A group written on an ACK lease ends on every worker's ACK; one the SAL has
 /// no room for is refused with the SAL's own status.
 #[test]
@@ -111,8 +106,18 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
     });
 }
 
-/// Fill the log until it refuses a group far smaller than any DDL zone.
-fn fill_log(excl: &mut crate::runtime::sal::SalExcl<'_>) {
+/// Fill the log until it refuses a group far smaller than any DDL zone, and
+/// require `make()`'s zone to be refused with the SAL's own status and its scope
+/// discarded; run `refused`, then require the same zone to apply once a
+/// checkpoint has reset the log, and run `applied`.
+fn refused_then_applied(
+    engine: CatalogEngine,
+    make: impl Fn() -> DdlBundle,
+    refused: impl FnOnce(&MasterDispatcher),
+    applied: impl FnOnce(&MasterDispatcher),
+) {
+    let (disp, _) = test_dispatcher(0, engine);
+    let mut excl = disp.sal().excl();
     for tids in [1 << 12, 1 << 4, 1] {
         let tick = || Apply::Tick {
             first_round: 2,
@@ -120,6 +125,26 @@ fn fill_log(excl: &mut crate::runtime::sal::SalExcl<'_>) {
         };
         while excl.write(&SalGroup::new(tick())).is_ok() {}
     }
+    let watermark = disp.sal().watermark();
+
+    let e = disp
+        .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(make(), sink).map(drop))
+        .expect_err("no room for the zone");
+    assert_eq!(e.status, WireStatus::SalFull, "{e}");
+    assert_eq!(
+        disp.sal().watermark(),
+        watermark,
+        "the refused zone's scope is discarded"
+    );
+    refused(&disp);
+
+    disp.checkpoint_post_ack(&mut excl).unwrap();
+    disp.emit_zone(&mut excl, |cat, sink| cat.apply_bundle(make(), sink))
+        .expect("the reset log takes the zone");
+    applied(&disp);
+
+    drop(excl);
+    disp.into_catalog().close();
 }
 
 /// A zone the log has no room for is refused with the SAL's own status and
@@ -130,8 +155,7 @@ fn a_zone_the_log_refuses_reaches_no_store_and_applies_after_a_checkpoint() {
     use crate::catalog::SysFamily;
     use crate::test_support::{bundle, col_def, col_tab_batch, net_weight, scan_all, table_tab_batch};
 
-    let tmp = tempfile::tempdir().unwrap();
-    let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
+    let (_tmp, mut engine) = empty_catalog();
     let tid = engine.allocate_ids(1).unwrap();
     let cols: Vec<_> = (0..32)
         .map(|i| col_def(&format!("a_column_with_a_long_name_{i}"), gnitz_wire::TypeCode::U64))
@@ -149,33 +173,18 @@ fn a_zone_the_log_refuses_reaches_no_store_and_applies_after_a_checkpoint() {
     };
     let before = held(&mut engine);
 
-    let (disp, _) = test_dispatcher(0, engine);
-    let mut excl = disp.sal().excl();
-    fill_log(&mut excl);
-    let watermark = disp.sal().watermark();
-
-    let refused = disp
-        .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(create(), sink).map(drop))
-        .expect_err("no room for the zone");
-    assert_eq!(refused.status, WireStatus::SalFull, "{refused}");
-    assert!(
-        disp.cat().registry.relation(tid).is_none(),
-        "the refused table is not registered"
+    refused_then_applied(
+        engine,
+        create,
+        |disp| {
+            assert!(
+                disp.cat().registry.relation(tid).is_none(),
+                "the refused table is not registered"
+            );
+            assert_eq!(held(&mut disp.cat_mut()), before);
+        },
+        |disp| assert!(disp.cat().registry.relation(tid).is_some()),
     );
-    assert_eq!(held(&mut disp.cat_mut()), before);
-    assert_eq!(
-        disp.sal().watermark(),
-        watermark,
-        "the refused zone's scope is discarded"
-    );
-
-    disp.checkpoint_post_ack(&mut excl).unwrap();
-    disp.emit_zone(&mut excl, |cat, sink| cat.apply_bundle(create(), sink))
-        .expect("the reset log takes the zone");
-    assert!(disp.cat().registry.relation(tid).is_some());
-
-    drop(excl);
-    disp.into_catalog().close();
 }
 
 /// An ADD COLUMN the log refuses leaves the table's schema and column records
@@ -186,8 +195,7 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
     use crate::catalog::SysFamily;
     use crate::test_support::{bundle, col_def, nullable_def, scan_all};
 
-    let tmp = tempfile::tempdir().unwrap();
-    let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
+    let (_tmp, mut engine) = empty_catalog();
     let cols = [
         col_def("id", gnitz_wire::TypeCode::U64),
         col_def("v", gnitz_wire::TypeCode::U64),
@@ -202,29 +210,22 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
     let record = engine.wire_target(tid).unwrap().1.clone();
     let col_rows = scan_all(&mut engine, SysFamily::Column.id()).len();
 
-    let (disp, _) = test_dispatcher(0, engine);
-    let mut excl = disp.sal().excl();
-    fill_log(&mut excl);
-
-    let refused = disp
-        .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(add(), sink).map(drop))
-        .expect_err("no room for the zone");
-    assert_eq!(refused.status, WireStatus::SalFull, "{refused}");
-    assert_eq!(width(&disp.cat()), 2, "the refused ADD COLUMN leaves the schema");
-    assert_eq!(disp.cat().wire_target(tid).unwrap().1, &record);
-    assert_eq!(scan_all(&mut disp.cat_mut(), SysFamily::Column.id()).len(), col_rows);
-
-    disp.checkpoint_post_ack(&mut excl).unwrap();
-    disp.emit_zone(&mut excl, |cat, sink| cat.apply_bundle(add(), sink))
-        .expect("the reset log takes the zone");
-    assert_eq!(width(&disp.cat()), 3, "the retry widens the schema");
-    assert_eq!(
-        scan_all(&mut disp.cat_mut(), SysFamily::Column.id()).len(),
-        col_rows + 1
+    refused_then_applied(
+        engine,
+        add,
+        |disp| {
+            assert_eq!(width(&disp.cat()), 2, "the refused ADD COLUMN leaves the schema");
+            assert_eq!(disp.cat().wire_target(tid).unwrap().1, &record);
+            assert_eq!(scan_all(&mut disp.cat_mut(), SysFamily::Column.id()).len(), col_rows);
+        },
+        |disp| {
+            assert_eq!(width(&disp.cat()), 3, "the retry widens the schema");
+            assert_eq!(
+                scan_all(&mut disp.cat_mut(), SysFamily::Column.id()).len(),
+                col_rows + 1
+            );
+        },
     );
-
-    drop(excl);
-    disp.into_catalog().close();
 }
 
 /// The checkpoint finalizer flushes system tables before resetting the SAL. A
@@ -268,11 +269,10 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
 /// restamp bumps.
 #[test]
 fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
-    let tmp = tempfile::tempdir().unwrap();
-    let engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
+    let (_tmp, engine) = empty_catalog();
     let (disp, _) = test_dispatcher(0, engine);
     let gen = disp.cat().durable_generation();
-    let checkpoint = |disp: &super::super::MasterDispatcher| {
+    let checkpoint = |disp: &MasterDispatcher| {
         disp.reactor()
             .block_on(async {
                 disp.checkpoint_base().await?;

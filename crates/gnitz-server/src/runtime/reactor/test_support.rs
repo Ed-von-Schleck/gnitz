@@ -5,6 +5,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 use super::*;
+use crate::runtime::park::WorkerSet;
 pub(super) use crate::runtime::sync::{oneshot, select2, Either};
 pub(super) use crate::runtime::test_support::{read_nonblocking, spawn_drain, try_poll_once, within};
 pub(super) use crate::runtime::w2m::fixtures::ring_slot;
@@ -70,6 +71,13 @@ impl TrainLease {
 pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
     let (reactor, _ready, writers) = booting_reactor(n);
     (reactor, writers)
+}
+
+/// A train lease of `kind` over every one of `n` fresh rings, with each ring's writer.
+pub(crate) fn train_lease(n: usize, kind: &'static str) -> (Reactor, TrainLease, Vec<W2mWriter>) {
+    let (reactor, writers) = reactor_with_rings(n);
+    let lease = reactor.lease_train(WorkerSet::ALL, kind);
+    (reactor, lease, writers)
 }
 
 /// [`reactor_with_rings`], with the lease the workers' ready ACKs answer.

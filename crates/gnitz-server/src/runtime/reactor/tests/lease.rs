@@ -57,8 +57,7 @@ fn an_ack_lease_resolves_on_its_own_sets_acks() {
 /// abandoned request's late reply is.
 #[test]
 fn a_frame_no_lease_holds_is_released() {
-    let (r, mut writers) = reactor_with_rings(1);
-    let lease = r.lease_train(WorkerSet::ALL, "ScanSpec");
+    let (r, lease, mut writers) = train_lease(1, "ScanSpec");
     let id = lease.id();
     for _ in 0..3 {
         writers[0].send_msg(id, &Default::default());
@@ -79,16 +78,12 @@ fn a_frame_no_lease_holds_is_released() {
 /// released at its ring.
 #[test]
 fn next_yields_the_row_frames_and_releases_the_rest() {
-    let (r, mut writers) = reactor_with_rings(2);
-    let lease = r.lease_train(WorkerSet::ALL, "ScanSpec");
+    let (r, lease, mut writers) = train_lease(2, "ScanSpec");
     let id = lease.id();
     let schema = crate::test_support::make_schema_u64_i64();
     let mut send = |w: usize, last, pk: Option<u64>| {
         let rows = pk.map(|pk| crate::test_support::make_batch(&schema, &[(pk, 1, 0)]));
-        writers[w].send_msg(
-            id,
-            &WireMsg::train_frame(0, last, rows.as_ref().and_then(|b| b.wire_whole())),
-        );
+        writers[w].send_train_frame(id, last, rows.as_ref());
     };
     send(0, false, None);
     for pk in 1..=3 {
@@ -120,15 +115,14 @@ fn next_yields_the_row_frames_and_releases_the_rest() {
 /// terminal is read.
 #[test]
 fn frame_of_hands_out_a_row_less_terminal() {
-    let (r, mut writers) = reactor_with_rings(2);
-    let lease = r.lease_train(WorkerSet::ALL, "SnapshotPage");
+    let (r, lease, mut writers) = train_lease(2, "SnapshotPage");
     let id = lease.id();
     let schema = crate::test_support::make_schema_u64_i64();
     let rows = crate::test_support::make_batch(&schema, &[(7, 1, 0)]);
-    writers[0].send_msg(id, &WireMsg::train_frame(0, false, None));
-    writers[0].send_msg(id, &WireMsg::train_frame(0, false, rows.wire_whole()));
-    writers[0].send_msg(id, &WireMsg::train_frame(0, true, None));
-    writers[1].send_msg(id, &WireMsg::train_frame(0, true, None));
+    writers[0].send_train_frame(id, false, None);
+    writers[0].send_train_frame(id, false, Some(&rows));
+    writers[0].send_train_frame(id, true, None);
+    writers[1].send_train_frame(id, true, None);
     r.drain_all_w2m();
 
     let frame_of = |w: usize| try_poll_once(lease.frame_of(w)).expect("routed").expect("no fault");
@@ -148,10 +142,9 @@ fn frame_of_hands_out_a_row_less_terminal() {
 /// worker that sent it and the request it answered.
 #[test]
 fn a_fault_frame_names_its_worker() {
-    let (r, mut writers) = reactor_with_rings(2);
-    let lease = r.lease_train(WorkerSet::ALL, "ScanSpec");
+    let (r, lease, mut writers) = train_lease(2, "ScanSpec");
     let id = lease.id();
-    writers[0].send_msg(id, &WireMsg::train_frame(0, true, None));
+    writers[0].send_train_frame(id, true, None);
     let fault = WireFault::from("boom");
     writers[1].send_msg(id, &WireMsg::fault(&fault));
     r.drain_all_w2m();

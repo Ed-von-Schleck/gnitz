@@ -11,7 +11,7 @@
 //! SNAPSHOT_CLOSE or when the connection ends.
 
 use super::peer::Peer;
-use super::{send_ack, send_msg, Shared};
+use super::{decode_fault, send_ack, send_msg, Shared};
 use crate::runtime::frame::WireMsg;
 use crate::runtime::reactor::SendBody;
 use crate::runtime::sal::Read;
@@ -71,7 +71,7 @@ pub(super) async fn page(
     if !held.0.contains(&id) {
         return Err(format!("snapshot {id} is not this connection's").into());
     }
-    let request = PageRequest::decode(blob).map_err(|e| format!("decode error: {e}"))?;
+    let request = PageRequest::decode(blob).map_err(decode_fault)?;
     if shared.cat().registry.pins(id, tid) {
         let rows = shared.cat().registry.pinned_page(id, tid, &request)?;
         send_msg(peer, WireMsg::train_frame(tid, true, rows.wire_whole()));

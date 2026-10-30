@@ -17,7 +17,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::peer::Peer;
 use super::tick::fresh_read_lock;
-use super::{forward_scan, send_fault, send_msg, target_kind, Access, CatalogLock, Shared};
+use super::{decode_fault, forward_scan, send_fault, send_msg, target_kind, Access, CatalogLock, Shared};
 use crate::catalog::CatalogEngine;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::master::MasterDispatcher;
@@ -136,15 +136,15 @@ fn feed_readable(shared: &Shared, feed: &Feed) -> Result<(), WireFault> {
 /// `Err` rejects the frame; a view's own failure is its fault frame, and the
 /// rest of the poll continues.
 pub(super) async fn handle_delta_poll(
-    shared: &Rc<Shared>,
+    shared: &Shared,
     peer: &Peer,
     subs: &mut Subscriptions,
     prologue: &ControlHeader,
     body: &[u8],
 ) -> Result<(), WireFault> {
-    let views = decode_delta_items(body).map_err(|e| format!("decode error: {e}"))?;
+    let views = decode_delta_items(body).map_err(decode_fault)?;
     let disp = &shared.dispatcher;
-    let mut kept = delta_poll_kept(prologue, views.len()).map_err(|e| format!("decode error: {e}"))?;
+    let mut kept = delta_poll_kept(prologue, views.len()).map_err(decode_fault)?;
     // The poll drained once, for this lock; a later slice takes the lock alone.
     let mut first_lock = Some(
         fresh_read_lock(
@@ -233,7 +233,7 @@ fn terminal(view: u64, round: u64, tag: u64) -> WireMsg<'static> {
 /// commit reaching one of them ticked. A `quiet` sync is first held until a
 /// relation one of them reads changes or `until` comes.
 async fn hold_lock(
-    shared: &Rc<Shared>,
+    shared: &Shared,
     ids: &[u64],
     until: Instant,
     quiet: impl FnOnce() -> bool,
@@ -672,7 +672,7 @@ fn lagged(view: u64) -> WireFault {
 /// every round acknowledged before it, and one was queued something since the
 /// last sync or `deadline` has passed.
 async fn sync_wait(
-    shared: &Rc<Shared>,
+    shared: &Shared,
     out: &Outbox,
     deadline: Instant,
     mut held: Vec<(Rc<Subscriber>, Rc<Feed>)>,

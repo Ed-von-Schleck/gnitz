@@ -8,15 +8,15 @@ use gnitz_wire::TypeCode;
 #[test]
 fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
     use crate::runtime::master::fixtures::test_dispatcher;
+    use crate::runtime::test_support::empty_catalog;
     use crate::runtime::test_support::try_poll_once;
-    use crate::test_support::{col_def, fk_def, make_batch_raw};
+    use crate::test_support::{fk_child_cols, make_batch_raw};
 
-    let tmp = tempfile::tempdir().unwrap();
-    let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
-    let cols = u64_i64_cols();
-    let parent = engine.create_table("public.parent", &cols, &[0]).unwrap();
-    let cols = [col_def("cid", TypeCode::U64), fk_def("fk", TypeCode::U64, parent, 0)];
-    engine.create_table("public.child", &cols, &[0]).unwrap();
+    let (_tmp, mut engine) = empty_catalog();
+    let parent = engine.create_table("public.parent", &u64_i64_cols(), &[0]).unwrap();
+    engine
+        .create_table("public.child", &fk_child_cols(parent), &[0])
+        .unwrap();
     let schema = engine.registry.relation(parent).unwrap().schema();
     let (disp, _) = test_dispatcher(1, engine);
     let checks = Checks::new();

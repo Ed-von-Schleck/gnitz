@@ -5,12 +5,14 @@
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
 use crate::catalog::{CatalogEngine, DdlBundle, SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
-use gnitz_store::relation::StoreConfig;
+use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_wire::{
     CatalogColumn, Circuit, CircuitRow, ColTabRow, ColumnDef, FkAction, FkRef, IdxTabRow, PkColList, SchemaTabRow,
     SysRow, TableProps, TableTabRow, TypeCode, ViewTabRow,
 };
+use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
+use gnitz_zset::schema::SchemaDescriptor;
 
 /// A scratch directory for a test that needs a real on-disk tree, wiped at the
 /// start of the run so the previous same-user run self-cleans. `scope` names the
@@ -31,7 +33,24 @@ pub fn scratch_dir(scope: &str, name: &str) -> String {
     path
 }
 
+/// Register relation `id`, a `kind` over `schema` placed by its full PK.
+pub fn register_full_pk(registry: &mut RelationRegistry, id: u64, kind: RelationKind, schema: SchemaDescriptor) {
+    let spec = RelationSpec {
+        id,
+        kind,
+        placement: Placement::full_pk(&schema),
+        pk_repeats: false,
+        compress: false,
+    };
+    registry.register(spec, schema).unwrap();
+}
+
 // ── Catalog column fixtures ─────────────────────────────────────────────────
+
+/// A child's columns `(cid U64, fk U64)`, `fk` referencing `parent`'s column 0.
+pub fn fk_child_cols(parent: u64) -> [CatalogColumn; 2] {
+    [col_def("cid", TypeCode::U64), fk_def("fk", TypeCode::U64, parent, 0)]
+}
 
 /// A plain non-nullable, non-FK, non-hidden column of the given type.
 pub fn col_def(name: &str, type_code: TypeCode) -> CatalogColumn {
@@ -122,7 +141,7 @@ pub fn net_weight(engine: &CatalogEngine, id: u64) -> i64 {
 }
 
 /// Column records for a view whose output is `schema`.
-pub fn cols_of(schema: &gnitz_zset::schema::SchemaDescriptor) -> Vec<CatalogColumn> {
+pub fn cols_of(schema: &SchemaDescriptor) -> Vec<CatalogColumn> {
     schema
         .columns()
         .iter()
@@ -264,23 +283,30 @@ pub fn left_join_circuit(a: u64, b: u64, key: u32) -> (Circuit, gnitz_wire::Node
     (c, ra)
 }
 
-/// Tables `a (id | nn, nullable)` and `b (id | k, w)`, every column a U64, in a
-/// fresh catalog at `dir`, under the view of [`left_join_circuit`] on `a`'s
-/// column `key`: `[key | id, nn, nullable, w]`.
-pub fn left_join_engine(dir: &str, key: u32) -> (CatalogEngine, [u64; 2], u64) {
+/// The columns of `a (id | nn, nullable)`, `b (id | k, w)` and the view of
+/// [`left_join_circuit`] `[key | id, nn, nullable, w]`, every one a U64.
+pub fn left_join_cols() -> ([CatalogColumn; 3], [CatalogColumn; 3], [CatalogColumn; 5]) {
     use TypeCode::U64;
+    (
+        [col_def("id", U64), col_def("nn", U64), nullable_def("nullable", U64)],
+        [col_def("id", U64), col_def("k", U64), col_def("w", U64)],
+        [
+            col_def("key", U64),
+            col_def("id", U64),
+            col_def("nn", U64),
+            nullable_def("nullable", U64),
+            nullable_def("w", U64),
+        ],
+    )
+}
+
+/// Tables `a` and `b` of [`left_join_cols`] in a fresh catalog at `dir`, under
+/// the view of [`left_join_circuit`] on `a`'s column `key`.
+pub fn left_join_engine(dir: &str, key: u32) -> (CatalogEngine, [u64; 2], u64) {
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
-    let a_cols = [col_def("id", U64), col_def("nn", U64), nullable_def("nullable", U64)];
+    let (a_cols, b_cols, view_cols) = left_join_cols();
     let a = engine.create_table("public.a", &a_cols, &[0]).unwrap();
-    let b_cols = [col_def("id", U64), col_def("k", U64), col_def("w", U64)];
     let b = engine.create_table("public.b", &b_cols, &[0]).unwrap();
-    let view_cols = [
-        col_def("key", U64),
-        col_def("id", U64),
-        col_def("nn", U64),
-        nullable_def("nullable", U64),
-        nullable_def("w", U64),
-    ];
     let (circuit, _) = left_join_circuit(a, b, key);
     let view = try_register_view(&mut engine, circuit, "v", &view_cols, 0, 0).unwrap();
     (engine, [a, b], view)

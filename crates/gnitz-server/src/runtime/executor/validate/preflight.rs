@@ -164,9 +164,14 @@ enum RetireVerb {
     Update,
 }
 
-/// The `(retired, added)` referenced-value sets of one bundled FK parent
-/// column, each retired value under the verb of the write that retired it.
-type ParentDelta = (FxHashMap<u128, RetireVerb>, FxHashSet<u128>);
+/// The referenced-value sets of one bundled FK parent column.
+#[derive(Default)]
+struct ParentDelta {
+    /// Values the bundle removed, each under the verb of the write that retired it.
+    retired: FxHashMap<u128, RetireVerb>,
+    /// The surviving rows' non-NULL values.
+    added: FxHashSet<u128>,
+}
 
 /// `(parent tid, referenced col)` → its delta. Resolved once per key and shared
 /// by rules F1 and F2, which both turn on it.
@@ -679,12 +684,12 @@ fn fk_existence_verdict(
     deltas: &ParentDeltas,
 ) -> Result<(), WireFault> {
     // A non-bundled parent has no delta (the degenerate plain-push case).
-    let no_delta: ParentDelta = (FxHashMap::default(), FxHashSet::default());
+    let no_delta = ParentDelta::default();
     for check in checks {
         let Rule::FkExists { edge, values, .. } = &check.plan else {
             continue;
         };
-        let (retired, added) = deltas.get(&delta_key(edge)).unwrap_or(&no_delta);
+        let ParentDelta { retired, added } = deltas.get(&delta_key(edge)).unwrap_or(&no_delta);
         for (v, &in_committed) in values {
             if (in_committed && !retired.contains_key(v)) || added.contains(v) {
                 continue;
@@ -700,7 +705,7 @@ fn fk_existence_verdict(
     Ok(())
 }
 
-/// The `(retired, added)` referenced-column value sets rules F1 and F2 turn on,
+/// The [`ParentDelta`] of each referenced column rules F1 and F2 turn on,
 /// one per `(parent tid, referenced col)` of `children`.
 fn resolve_parent_deltas(b: &TxnBundle<'_>, checks: &[Check<Rule<'_>>], children: &[FkEdge]) -> ParentDeltas {
     let mut needed: Vec<(u64, usize)> = children.iter().map(delta_key).collect();
@@ -734,7 +739,7 @@ fn resolve_parent_deltas(b: &TxnBundle<'_>, checks: &[Check<Rule<'_>>], children
     deltas
 }
 
-/// One parent column's `(retired, added)` sets: `added` are the surviving rows'
+/// One parent column's [`ParentDelta`]: `added` are the surviving rows'
 /// non-NULL values; `retired` are the before-image values `old_of` yields that
 /// the PK's surviving state no longer holds.
 fn parent_retired_added(
@@ -769,7 +774,7 @@ fn parent_retired_added(
             }
         }
     }
-    (retired, added)
+    ParentDelta { retired, added }
 }
 
 /// What one write's cascade may still delete, and what it has asked, across
@@ -830,7 +835,7 @@ async fn removed_references(
     // `(edge, cascades, values)`: one probe each.
     let mut seeds: Vec<(FkEdge, bool, Vec<u128>)> = Vec::new();
     for &edge in children {
-        let (retired, added) = &deltas[&delta_key(&edge)];
+        let ParentDelta { retired, added } = &deltas[&delta_key(&edge)];
         let (mut deleted, mut restricted) = (Vec::new(), Vec::new());
         for (&v, verb) in retired.iter().filter(|(v, _)| !added.contains(v)) {
             let cascades = edge.on_delete == FkAction::Cascade && matches!(verb, RetireVerb::Delete);
@@ -845,8 +850,8 @@ async fn removed_references(
         for (edge, cascades, values) in &mut seeds {
             if *cascades {
                 // A value a surviving row of the bundle holds has not left.
-                if let Some((_, added)) = deltas.get(&delta_key(edge)) {
-                    values.retain(|v| !added.contains(v));
+                if let Some(d) = deltas.get(&delta_key(edge)) {
+                    values.retain(|v| !d.added.contains(v));
                 }
                 values.retain(|&v| cascade.probed.insert((edge.child_tid, edge.fk_col, v)));
             }
@@ -906,7 +911,7 @@ async fn removed_references(
                     }
                 } else if violation.is_none() {
                     // Anything but a surviving row holding a new value reads as a delete.
-                    let verb = match deltas[&delta_key(edge)].0.get(&gnitz_wire::widen_pk_be(span)) {
+                    let verb = match deltas[&delta_key(edge)].retired.get(&gnitz_wire::widen_pk_be(span)) {
                         Some(RetireVerb::Update) => "update",
                         _ => "delete from",
                     };

@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::sal::fixtures::{group_at, holders_of, test_log};
+use crate::runtime::sal::fixtures::{group_at, holders_of, scan, test_log};
 use crate::runtime::sal::{SalGroup, SalWriter};
 use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
@@ -272,20 +272,15 @@ fn a_read_reaches_the_owners_its_bound_names() {
             WorkerSet::ALL,
         ),
     ];
-    let scan = |spec: Vec<u8>| Read::ScanSpec {
-        tid: 16,
-        reply_layout: 0,
-        spec: spec.into(),
-    };
     for (case, schema, placement, blob, want) in cases {
         let registry = registry(schema, placement);
-        let r = route_read(&scan(blob.unwrap_or_default()), &registry, NW);
+        let r = route_read(&scan(16, &blob.unwrap_or_default()), &registry, NW);
         assert_eq!(r.set, want, "{case}");
         assert!(r.per_worker.is_none(), "{case}: every worker is sent the whole bound");
     }
 
     let registry = registry(schema, keyed);
-    let spread = route_read(&scan(set(&[0, b])), &registry, NW);
+    let spread = route_read(&scan(16, &set(&[0, b])), &registry, NW);
     assert_eq!(spread.set, WorkerSet::one(owner(0)).with(owner(b)));
     let own_keys = (0..NW)
         .map(|w| match w {
@@ -317,12 +312,11 @@ fn a_probe_routes_by_the_store_it_reads() {
         assert_eq!(r.set, WorkerSet::one(owner(0)).with(owner(b)), "{own:?}");
         assert!(r.per_worker.is_some(), "{own:?}: each worker is sent its own keys");
     }
-    let scan = Read::ScanSpec {
-        tid: 16,
-        reply_layout: 0,
-        spec: ReadSpec::all_rows(pk_set(8, &[0, b])).encode().into(),
-    };
-    let r = route_read(&scan, &replicated, NW);
+    let r = route_read(
+        &scan(16, &ReadSpec::all_rows(pk_set(8, &[0, b])).encode()),
+        &replicated,
+        NW,
+    );
     assert_eq!(r.set, WorkerSet::one(Placement::REPLICA_OWNER as usize));
 
     let keyed = registry(schema, full);

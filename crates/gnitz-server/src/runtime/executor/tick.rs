@@ -197,8 +197,9 @@ pub(super) async fn tick_loop(shared: Rc<Shared>, TickTriggers(mut rx): TickTrig
 }
 
 /// The catalog read lock for a read of `targets`, behind a drain when an
-/// un-ticked commit reaches one of them. The one read-lock entry of every read
-/// verb.
+/// un-ticked commit reaches one of them: the lock of a read that may reach a
+/// view's rows (SCAN, DELTA_POLL, a held sync). A read of catalog shape or of
+/// pinned base rows takes the plain guard.
 ///
 /// Only a view has sources, so any other target — an absent one included — is
 /// fresh. The guard is dropped across the drain, so a DDL queued on the lock
@@ -209,7 +210,7 @@ pub(super) async fn tick_loop(shared: Rc<Shared>, TickTriggers(mut rx): TickTrig
 /// them under `WireStatus::Ok` is a silent stale read. The tick loop is serial,
 /// so the drain also puts the read behind a tick already running.
 pub(super) async fn fresh_read_lock(
-    shared: &Rc<Shared>,
+    shared: &Shared,
     targets: impl IntoIterator<Item = u64>,
     drain_by: Instant,
 ) -> Result<ReadGuard<CatalogLock>, WireFault> {

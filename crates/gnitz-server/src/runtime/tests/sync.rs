@@ -25,15 +25,6 @@ fn oneshot_send_to_dropped_receiver_is_a_noop() {
     assert!(dropped.get(), "the undeliverable value must be dropped, not leaked");
 }
 
-/// A write guard is of the lock it was taken on, and of no other lock of its tag.
-#[test]
-fn a_write_guard_is_of_its_own_lock() {
-    let (lock, other): (AsyncRwLock, AsyncRwLock) = Default::default();
-    let guard = try_poll_once(lock.write()).expect("uncontended");
-    assert!(guard.is_of(&lock) && guard.is_of(&lock.clone()));
-    assert!(!guard.is_of(&other));
-}
-
 /// Every reader admitted while no writer holds or waits enters at once.
 #[test]
 fn async_rwlock_multiple_readers() {

@@ -10,7 +10,6 @@ use rustc_hash::FxHashMap;
 
 use super::*;
 use crate::runtime::park::WorkerSet;
-use crate::runtime::sal::GroupTargets;
 use crate::runtime::sync::WakeQueue;
 use crate::runtime::w2m::{RequestId, W2mSlot};
 
@@ -153,6 +152,18 @@ impl Reactor {
 // Lease
 // ---------------------------------------------------------------------------
 
+/// The workers a group is addressed to and the request id they answer on.
+#[derive(Clone, Copy)]
+pub(crate) struct GroupTargets {
+    pub(crate) set: WorkerSet,
+    pub(crate) reply: Option<RequestId>,
+}
+
+impl GroupTargets {
+    /// Every worker, nothing answers.
+    pub(crate) const SILENT: Self = GroupTargets { set: WorkerSet::ALL, reply: None };
+}
+
 /// A live route. Dropping it removes the route, and with it whatever the route
 /// still holds.
 struct Lease {
@@ -287,8 +298,7 @@ impl TrainLease {
         if ctrl.hdr.flags.scan_last {
             self.left.set(self.left.get().without(w));
         }
-        let data = ctrl.data;
-        Ok(Some((slot, data)))
+        Ok(Some((slot, ctrl.data)))
     }
 
     /// Worker `w`'s next frame that carries rows, `None` once its train has ended;

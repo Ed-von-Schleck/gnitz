@@ -1,9 +1,9 @@
-use super::fixtures::{group_at, test_log};
+use super::fixtures::{group_at, scan, test_log};
 use super::{
     decode_sal_frame, epoch_word, group_header_size, prefix_atomic, stamp_digest, Apply, EpochGate, GroupData,
-    GroupHead, GroupTargets, Inbound, Read, SalGroup, SalLog, SalMessageKind, SalReader, SalRequest, SalStep,
-    SalWriter, WorkerSet, ANCHOR_BYTES, CHECKPOINT_RESERVE, FLAG_JOINS_CUT, FLAG_SHARED, FLAG_ZONE_END, HDR_PREFIX,
-    KNOWN_FLAGS, MAX_WORKERS, OFF_FLAGS, OFF_KIND, OFF_LSN, OFF_TARGETS, OFF_WIDTH, PREFIX_BYTES, PRESENT,
+    GroupHead, GroupTargets, Inbound, SalGroup, SalLog, SalMessageKind, SalReader, SalRequest, SalStep, SalWriter,
+    WorkerSet, ANCHOR_BYTES, CHECKPOINT_RESERVE, FLAG_JOINS_CUT, FLAG_SHARED, FLAG_ZONE_END, HDR_PREFIX, KNOWN_FLAGS,
+    MAX_WORKERS, OFF_FLAGS, OFF_KIND, OFF_LSN, OFF_TARGETS, OFF_WIDTH, PREFIX_BYTES, PRESENT,
 };
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
@@ -24,11 +24,6 @@ use std::sync::atomic::Ordering;
 /// A control-only group addressed to `tid`: a push that carries no rows.
 fn to(tid: u64) -> SalGroup<'static> {
     SalGroup::new(Apply::Push { tid })
-}
-
-/// A read of `tid` under the blob `spec`.
-pub(super) fn scan(tid: u64, spec: &[u8]) -> Read<'_> {
-    Read::ScanSpec { tid, reply_layout: 0, spec: spec.into() }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,8 +458,8 @@ fn every_worker_numbers_a_cut_alike() {
     // One cut whose first member addresses worker 0 alone, then a cut of one.
     let mut excl = log.excl();
     excl.write(&member(WorkerSet::one(0), 1)).expect("group fits");
-    excl.write(&member(WorkerSet::ALL, 2)).expect("group fits");
-    excl.write(&member(WorkerSet::ALL, 3)).expect("group fits");
+    excl.join(&member(WorkerSet::ALL, 2)).expect("group fits");
+    excl.join(&member(WorkerSet::ALL, 3)).expect("group fits");
     drop(excl);
     log.excl().write(&member(WorkerSet::ALL, 4)).expect("group fits");
 
@@ -788,23 +783,30 @@ fn the_live_gate_reads_a_raised_prefix_epoch_over_an_older_header_as_corrupt() {
     assert!(matches!(log.log().read_at(0, EpochGate::Live(2)), SalStep::Corrupt));
 }
 
-/// A digest mismatch under a passing epoch gate can only be corruption, and the
-/// live drain fail-stops rather than reading it as end-of-log.
-#[test]
-fn the_live_path_aborts_on_a_damaged_header() {
-    let name = "the_live_path_aborts_on_a_damaged_header_internal";
-    let out = crate::test_support::run_test_in_child(module_path!(), name, &[]);
+/// Run `internal` in a re-exec'd child and require it to fail-stop with `reason` on stderr.
+fn assert_fail_stops(internal: &str, reason: &str) {
+    let out = crate::test_support::run_test_in_child(module_path!(), internal, &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
         Some(ServerExit::FailStop.code()),
-        "{name} must fail-stop (exit 134)\nstdout:\n{}\nstderr:\n{stderr}",
+        "{internal} must fail-stop (exit 134)\nstdout:\n{}\nstderr:\n{stderr}",
         String::from_utf8_lossy(&out.stdout)
     );
     // The code alone would be satisfied by any other fatal abort reached first.
     assert!(
-        stderr.contains("is corrupt — the log is damaged"),
-        "{name} aborted for the wrong reason\nstderr:\n{stderr}"
+        stderr.contains(reason),
+        "{internal} aborted for the wrong reason\nstderr:\n{stderr}"
+    );
+}
+
+/// A digest mismatch under a passing epoch gate can only be corruption, and the
+/// live drain fail-stops rather than reading it as end-of-log.
+#[test]
+fn the_live_path_aborts_on_a_damaged_header() {
+    assert_fail_stops(
+        "the_live_path_aborts_on_a_damaged_header_internal",
+        "is corrupt — the log is damaged",
     );
 }
 
@@ -830,17 +832,9 @@ fn the_live_path_aborts_on_a_damaged_header_internal() {
 /// rather than replying on no id.
 #[test]
 fn a_read_group_without_a_request_id_aborts() {
-    let name = "a_read_group_without_a_request_id_aborts_internal";
-    let out = crate::test_support::run_test_in_child(module_path!(), name, &[]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(
-        out.status.code(),
-        Some(ServerExit::FailStop.code()),
-        "{name} must fail-stop (exit 134)\nstderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("a read group carries no request id"),
-        "{name} aborted for the wrong reason\nstderr:\n{stderr}"
+    assert_fail_stops(
+        "a_read_group_without_a_request_id_aborts_internal",
+        "a read group carries no request id",
     );
 }
 

@@ -13,7 +13,7 @@ use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io::retry_eintr;
 
 /// How often a worker's death is probed for.
-pub(crate) const WORKER_WATCH: Duration = Duration::from_millis(100);
+const WORKER_WATCH: Duration = Duration::from_millis(100);
 
 /// `GNITZ_INJECT_BACKUP_ABORT`: abort the master between the workers' copies and
 /// its own, as a crash part-way through a backup would.

@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::{WorkerParks, WorkerSet};
-use crate::runtime::reactor::{Reactor, ReadyAcked};
+use crate::runtime::reactor::{GroupTargets, Reactor, ReadyAcked};
 use crate::runtime::sync::{AsyncRwLock, WriteGuard};
 use crate::runtime::w2m::RequestId;
 use gnitz_foundation::fault::Seam;
@@ -185,18 +185,6 @@ impl<'a> GroupData<'a> {
                 .collect(),
         }
     }
-}
-
-/// The workers a group is written to and the request id they answer on.
-#[derive(Clone, Copy)]
-pub(crate) struct GroupTargets {
-    pub(crate) set: WorkerSet,
-    pub(crate) reply: Option<RequestId>,
-}
-
-impl GroupTargets {
-    /// Every worker, nothing answers.
-    pub(crate) const SILENT: Self = GroupTargets { set: WorkerSet::ALL, reply: None };
 }
 
 /// One SAL group as [`SalExcl::lay_out`] encodes it: the request every payload
@@ -851,7 +839,6 @@ impl SalWriter {
     pub(crate) async fn lock(&self) -> SalExcl<'_> {
         SalExcl {
             writer: self,
-            wrote: false,
             reached: WorkerSet::EMPTY,
             _guard: self.excl.write().await,
         }
@@ -1027,8 +1014,6 @@ impl SalWriter {
 /// round's ACKs.
 pub(crate) struct SalExcl<'a> {
     writer: &'a SalWriter,
-    /// A group was written under this hold, so each later one joins its [`Cut`].
-    wrote: bool,
     /// The workers groups laid out since the last [`Self::wake`] reached.
     reached: WorkerSet,
     _guard: WriteGuard<SalLock>,
@@ -1082,11 +1067,18 @@ impl<'a> SalExcl<'a> {
         Ok(base)
     }
 
-    /// Write and publish one group, outside every zone. The groups written
-    /// under one hold are one [`Cut`].
+    /// Write and publish one group, outside every zone, starting a [`Cut`].
     pub(crate) fn write(&mut self, g: &SalGroup) -> Result<(), WireFault> {
-        let base = self.lay_out(g, 0, self.wrote)?;
-        self.wrote = true;
+        self.write_group(g, false)
+    }
+
+    /// [`Self::write`], joining the [`Cut`] of the group laid out before it.
+    pub(crate) fn join(&mut self, g: &SalGroup) -> Result<(), WireFault> {
+        self.write_group(g, true)
+    }
+
+    fn write_group(&mut self, g: &SalGroup, joins_cut: bool) -> Result<(), WireFault> {
+        let base = self.lay_out(g, 0, joins_cut)?;
         self.writer.publish(base);
         Ok(())
     }
@@ -1236,11 +1228,11 @@ impl Drop for SalScope<'_, '_> {
 // SalReader — one worker's live drain over a SalLog
 // ---------------------------------------------------------------------------
 
-/// The groups written under one SAL hold. A cut's groups are consecutive in the
-/// log, and only its first lacks [`FLAG_JOINS_CUT`]. A worker sends a cut's
-/// replies in request order: the master drains a cut's leases in that order,
-/// and a W2M ring frees only a released prefix. Replies of different cuts go to
-/// different leases, and may pass each other.
+/// A run of consecutive groups in the log: one that starts it, then each that
+/// [`SalExcl::join`] writes behind it, carrying [`FLAG_JOINS_CUT`]. A worker
+/// sends a cut's replies in request order: the master drains a cut's leases in
+/// that order, and a W2M ring frees only a released prefix. Replies of different
+/// cuts go to different leases, and may pass each other.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Cut(u64);
 

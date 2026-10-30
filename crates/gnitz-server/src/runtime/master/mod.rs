@@ -1,8 +1,8 @@
-//! Master-side dispatcher: the master's handle on its workers. It fans out
-//! push/scan operations to worker processes via the shared append-only log
-//! (SAL) and collects responses via per-worker W2M regions. The child `route`
-//! decides which workers a read or push reaches; `dispatch` holds its writes,
-//! the tick rounds they allocate and worker reaping.
+//! Master-side dispatcher: the master's handle on its workers. It writes every
+//! master→worker request to the shared append-only log (SAL) as a group under a
+//! reply lease from the reactor, which routes the workers' W2M replies to that
+//! lease. The child `route` decides which workers a read or push reaches;
+//! `dispatch` holds its writes, the tick rounds they allocate and worker reaping.
 
 pub(crate) mod route;
 
@@ -26,7 +26,7 @@ use crate::runtime::sal::{GroupData, Read, SalExcl, SalGroup, SalWriter};
 use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;
 
-pub(crate) use dispatch::{worker_death, WORKER_WATCH};
+pub(crate) use dispatch::worker_death;
 
 // ---------------------------------------------------------------------------
 // MasterDispatcher
@@ -160,7 +160,12 @@ impl<'d> ScanCut<'d> {
             .reactor
             .lease_train(route.set, group.request.encode().0.variant_name());
         debug_assert!(lease.targets().set.len() > 0, "every read owes at least one reply");
-        self.excl.write(&SalGroup { data, targets: lease.targets(), ..group })?;
+        let group = SalGroup { data, targets: lease.targets(), ..group };
+        if self.scans.is_empty() {
+            self.excl.write(&group)?;
+        } else {
+            self.excl.join(&group)?;
+        }
         self.scans.push(lease);
         Ok(())
     }

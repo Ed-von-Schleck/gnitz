@@ -40,7 +40,7 @@ use self::write::{handle_push, handle_push_txn, Writes};
 use crate::catalog::CatalogEngine;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::listen::ClientListener;
-use crate::runtime::master::{MasterDispatcher, WORKER_WATCH};
+use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{RecvBuf, SendBody, TrainLease};
 use crate::runtime::sal::Read;
 use crate::runtime::signals;
@@ -284,13 +284,17 @@ fn reload_tls(tls: Option<&TlsListener>) {
     }
 }
 
+/// How often the signal loop checks for a signal and for a SAL that wants a
+/// checkpoint.
+const SIGNAL_POLL: Duration = Duration::from_millis(100);
+
 /// Until SIGTERM/SIGINT: poke the committer whenever the SAL wants a checkpoint.
 /// Then, with [`Committer::write`] and [`Committer::backup`] refusing since the
 /// signal, run one final checkpoint behind every write it admitted, and stop the
 /// workers.
 async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>) {
     loop {
-        shared.dispatcher.reactor().sleep(WORKER_WATCH).await;
+        shared.dispatcher.reactor().sleep(SIGNAL_POLL).await;
 
         if signals::take_reload() {
             reload_tls(tls);
@@ -323,13 +327,13 @@ async fn handle_message(
     subs: &mut Subscriptions,
     snapshots: &mut HeldSnapshots,
     buf: RecvBuf,
-    shared: &Rc<Shared>,
+    shared: &Shared,
 ) {
     // One control-header parse for the whole request.
     let ctrl = match gnitz_wire::peek_control_block(buf.as_slice()) {
         Ok(c) => c,
         Err(e) => {
-            send_fault(peer, 0, &format!("decode error: {e}").into());
+            send_fault(peer, 0, &decode_fault(e));
             return;
         }
     };
@@ -351,7 +355,7 @@ async fn dispatch_request(
     snapshots: &mut HeldSnapshots,
     buf: RecvBuf,
     ctrl: gnitz_wire::DecodedControl,
-    shared: &Rc<Shared>,
+    shared: &Shared,
 ) -> Result<Option<u64>, WireFault> {
     let data = buf.as_slice();
     match ctrl.client_verb()? {
@@ -360,8 +364,7 @@ async fn dispatch_request(
         ClientVerb::DdlTxn => handle_ddl_txn(shared, &data[ctrl.body]).await.map(Some),
         ClientVerb::PushTxn => handle_push_txn(shared, buf, ctrl).await.map(Some),
         ClientVerb::ScanMulti => {
-            let scans =
-                gnitz_wire::txn_frame::decode_scan_multi(&data[ctrl.body]).map_err(|e| format!("decode error: {e}"))?;
+            let scans = gnitz_wire::txn_frame::decode_scan_multi(&data[ctrl.body]).map_err(decode_fault)?;
             handle_scan(shared, peer, &scans).await.map(|()| None)
         }
         ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, subs, &ctrl.hdr, &data[ctrl.body])
@@ -396,8 +399,7 @@ async fn dispatch_request(
 
         ClientVerb::SyncPushed => {
             // Refused or not, it is answered as a sync is: out of the order of replies.
-            let held = gnitz_wire::txn_frame::decode_held(&data[ctrl.blob.clone()])
-                .map_err(|e| WireFault::from(format!("decode error: {e}")));
+            let held = gnitz_wire::txn_frame::decode_held(&data[ctrl.blob.clone()]).map_err(decode_fault);
             subs.ask_sync(shared, held, ctrl.hdr.arg0);
             Ok(None)
         }
@@ -413,6 +415,11 @@ async fn dispatch_request(
             .map(|()| Some(0)),
         ClientVerb::Backup => backup::backup(shared, &data[ctrl.blob.clone()]).await.map(|()| Some(0)),
     }
+}
+
+/// The fault a request whose frame does not decode is refused with.
+pub(super) fn decode_fault(e: impl std::fmt::Display) -> WireFault {
+    format!("decode error: {e}").into()
 }
 
 fn not_found(tid: u64) -> WireFault {
@@ -468,38 +475,33 @@ fn target_kind(cat: &CatalogEngine, target: Target, access: Access) -> Result<Re
     }
 }
 
-/// The relation id a RESOLVE names; `None` when its qualified name names none.
-/// `Err` when the name's schema does not exist.
-fn resolve_request_target(shared: &Rc<Shared>, name_blob: &[u8]) -> Result<Option<u64>, WireFault> {
+/// Answer a RESOLVE with the relation's schema block, descriptor and token.
+fn build_resolve_reply(shared: &Shared, peer: &Peer, name_blob: &[u8]) -> Result<(), WireFault> {
     let qname = std::str::from_utf8(name_blob).map_err(|_| "RESOLVE: name is not valid UTF-8".to_string())?;
     let (schema_name, name) = qname
         .split_once('.')
         .ok_or_else(|| format!("RESOLVE: '{qname}' is not a qualified relation name"))?;
-    let cat = shared.cat();
-    let sid = cat.schema_id(schema_name).ok_or_else(|| WireFault {
-        status: WireStatus::NotFound,
-        text: format!("schema '{schema_name}' not found"),
-    })?;
-    Ok(cat.relation_id(sid, name))
-}
-
-/// Answer a RESOLVE with the relation's schema block, descriptor and token.
-fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, name_blob: &[u8]) -> Result<(), WireFault> {
-    let answer =
-        resolve_request_target(shared, name_blob)?.and_then(|tid| shared.cat().resolve_answer(tid).map(|a| (tid, a)));
-    let Some((tid, (desc, schema_block, token))) = answer else {
-        // No such relation: a successful reply naming none.
-        send_msg(peer, WireMsg::default());
-        return Ok(());
+    let answer = {
+        let cat = shared.cat();
+        let sid = cat.schema_id(schema_name).ok_or_else(|| WireFault {
+            status: WireStatus::NotFound,
+            text: format!("schema '{schema_name}' not found"),
+        })?;
+        cat.relation_id(sid, name)
+            .and_then(|tid| cat.resolve_answer(tid).map(|a| (tid, a)))
     };
     send_msg(
         peer,
-        WireMsg {
-            target_id: tid,
-            arg0: token,
-            schema_block: Some(&schema_block),
-            blob: &desc,
-            ..Default::default()
+        match &answer {
+            // No such relation: a successful reply naming none.
+            None => WireMsg::default(),
+            Some((tid, (desc, schema_block, token))) => WireMsg {
+                target_id: *tid,
+                arg0: *token,
+                schema_block: Some(schema_block),
+                blob: desc,
+                ..Default::default()
+            },
         },
     );
     Ok(())
@@ -518,7 +520,7 @@ struct Scanned {
 /// SCAN_SPEC and SCAN_MULTI: one reply per scan, in request order. The scans
 /// its workers answer share one SAL cut, so an atomic commit is in all of
 /// their replies or in none.
-async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -> Result<(), WireFault> {
+async fn handle_scan(shared: &Shared, peer: &Peer, scans: &[ScanItem<'_>]) -> Result<(), WireFault> {
     // Every target's kind is resolved under this guard, so a DDL during the
     // drain is caught there and an unknown tid is rejected there.
     let catalog = fresh_read_lock(
@@ -532,7 +534,7 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, scans: &[ScanItem<'_>]) -
         let kind = target_kind(&shared.cat(), scan.target, Access::Read)?;
         let (local, lsn) = match kind {
             RelationKind::SystemCatalog => {
-                let spec = ReadSpec::decode(scan.spec).map_err(|e| format!("decode error: {e}"))?;
+                let spec = ReadSpec::decode(scan.spec).map_err(decode_fault)?;
                 let rows = shared
                     .cat()
                     .registry

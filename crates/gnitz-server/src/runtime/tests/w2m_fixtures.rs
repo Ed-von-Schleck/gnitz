@@ -1,6 +1,7 @@
 //! Live W2M rings for the tests that need one.
 
 use super::*;
+use gnitz_zset::repr::Batch;
 
 /// `nw` rings of `capacity` bytes each, mapped shared and never unmapped, so a
 /// thread or forked child may use its end for the rest of the process: every
@@ -30,6 +31,14 @@ impl W2mWriter {
     /// The master has armed its park, and no publish has taken it.
     pub(crate) fn master_parked(&self) -> bool {
         self.master.armed()
+    }
+
+    /// Publish one frame of a train answering `id`, `last` ending it, carrying
+    /// `rows` if any; the bytes a client forward of it carries.
+    pub(crate) fn send_train_frame(&mut self, id: RequestId, last: bool, rows: Option<&Batch>) -> Vec<u8> {
+        let msg = WireMsg::train_frame(0, last, rows.and_then(Batch::wire_whole));
+        self.send_msg(id, &msg);
+        gnitz_wire::framed(&msg.encode_to_vec())
     }
 }
 

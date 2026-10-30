@@ -50,12 +50,12 @@ fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Re
 
     let mut replayed: u32 = 0;
     for (msg, family) in tail.groups().filter_map(mine) {
-        let Some(data) = msg.shared_payload() else {
-            return Err(format!(
+        let data = msg.shared_payload().ok_or_else(|| {
+            format!(
                 "SAL replay: DdlSync group at offset={} (lsn={}) carries no shared payload",
                 msg.base, msg.head.lsn
-            ));
-        };
+            )
+        })?;
         let Some(batch) = msg.rows(data, |_, _| None)? else {
             continue;
         };
@@ -137,12 +137,9 @@ fn recover_from_sal(tail: CommittedTail, slot: Slot, catalog: &mut CatalogEngine
             if owned.schema().num_payload_cols() < schema.num_payload_cols() {
                 owned = owned.widened_with_nulls(&schema, false);
             }
-            catalog.ingest_unticked(tid, owned).map_err(|e| {
-                format!(
-                    "SAL replay apply failed (table_id={}, lsn={}): {e}",
-                    msg.head.target_id, msg.head.lsn
-                )
-            })?;
+            catalog
+                .ingest_unticked(tid, owned)
+                .map_err(|e| format!("SAL replay apply failed (table_id={}, lsn={}): {e}", tid, msg.head.lsn))?;
             applied = true;
         }
         replayed += u32::from(applied);
@@ -197,12 +194,6 @@ pub(crate) struct ServerArgs {
     pub(crate) backup_dir: Option<String>,
 }
 
-/// One worker's own ends of the IPC regions.
-struct WorkerIpc {
-    w2m_writer: W2mWriter,
-    mesh: Mesh,
-}
-
 /// Worker `w`'s log file, which its stdout and stderr are redirected to. The
 /// name is also read by the test harnesses, which find a worker's log by it.
 fn worker_log(data_dir: &str, w: usize) -> String {
@@ -218,7 +209,7 @@ fn run_worker_child(
     master_pid: i32,
     catalog: &mut CatalogEngine,
     tail: CommittedTail,
-    mut ipc: WorkerIpc,
+    (mut w2m_writer, mesh): (W2mWriter, Mesh),
     pinning: Option<&affinity::Pinning>,
 ) -> ! {
     let w = slot.rank as usize;
@@ -250,8 +241,8 @@ fn run_worker_child(
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
     let sal_reader = SalReader::new(tail.log(), slot.rank, tail.live_epoch());
-    ipc.w2m_writer.send_ack(RequestId::BOOT_READY);
-    WorkerProcess::new(catalog, sal_reader, ipc.w2m_writer, ipc.mesh).run()
+    w2m_writer.send_ack(RequestId::BOOT_READY);
+    WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh).run()
 }
 
 /// The master's half of recovery before any worker exists: the catalog staged
@@ -282,7 +273,7 @@ fn fork_workers(
     catalog: &mut CatalogEngine,
     data_dir: &str,
     tail: CommittedTail,
-    workers: Vec<WorkerIpc>,
+    workers: Vec<(W2mWriter, Mesh)>,
     pinning: Option<&affinity::Pinning>,
 ) -> Result<Vec<NonZero<libc::pid_t>>, String> {
     let master_pid = unsafe { libc::getpid() };
@@ -365,13 +356,7 @@ fn raise_fd_limit(target: u64) {
 /// enters the executor event loop, with a TLS listener when `tls` names one.
 /// Answers how serving ended; `Err` when the boot failed.
 pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<ServerExit, String> {
-    let ServerArgs {
-        data_dir,
-        socket_path,
-        workers,
-        backup_dir,
-    } = args;
-    let data_dir = data_dir.as_str();
+    let data_dir = args.data_dir.as_str();
     // Ahead of anything a refusal would have to undo: the reactor cannot run
     // without io_uring, and nothing else tells a container why.
     check_host()?;
@@ -382,7 +367,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     raise_fd_limit((limits.max_conns as u64).saturating_add(FD_RESERVE));
 
     // Before any io_uring worker thread exists: each keeps the mask it starts with.
-    let (num_workers, pinning) = affinity::pin_master(workers)?;
+    let (num_workers, pinning) = affinity::pin_master(args.workers)?;
     let nw = num_workers as usize;
 
     gnitz_info!("Opening database at {}", data_dir);
@@ -411,9 +396,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     let (writers, receiver) = w2m::create(nw).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
     let meshes =
         mesh::create(mesh::outbox_bytes(), parks).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
-    let workers: Vec<WorkerIpc> = (writers.into_iter().zip(meshes))
-        .map(|(w2m_writer, mesh)| WorkerIpc { w2m_writer, mesh })
-        .collect();
+    let workers: Vec<(W2mWriter, Mesh)> = writers.into_iter().zip(meshes).collect();
 
     let mut catalog = master_pre_fork_recovery(opened, tail)?;
 
@@ -440,8 +423,8 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
         }
     })?;
 
-    let listeners = listen::bind_listeners(data_dir, &socket_path, tls)?;
-    match executor::run(dispatcher, backup_dir, listeners) {
+    let listeners = listen::bind_listeners(data_dir, &args.socket_path, tls)?;
+    match executor::run(dispatcher, args.backup_dir, listeners) {
         None => Ok(ServerExit::Clean),
         Some(w) => {
             gnitz_error!("Worker {w} crashed (log: {}); workers stopped", worker_log(data_dir, w));

@@ -15,7 +15,7 @@ pub(crate) enum ServerExit {
     WorkerDied = 2,
     /// `sysexits.h`'s `EX_USAGE`: argv was refused, before anything was created.
     Usage = 64,
-    /// [`gnitz_fatal_abort!`]: 128 + SIGABRT.
+    /// `gnitz_fatal_abort!`: 128 + SIGABRT.
     FailStop = 134,
 }
 

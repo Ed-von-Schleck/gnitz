@@ -2,13 +2,14 @@ use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
+use crate::runtime::reactor::GroupTargets;
 use crate::runtime::sal::fixtures::test_log;
-use crate::runtime::sal::{Cut, GroupData, GroupTargets, SalGroup, SalRequest, SalWriter};
+use crate::runtime::sal::{Cut, GroupData, SalGroup, SalRequest, SalWriter};
 use crate::runtime::w2m::fixtures::id;
 use crate::runtime::w2m::{self, RequestId, W2mReceiver};
 use crate::test_support::{
     make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema,
-    register_identity_view, scan_all, table_engine, u64_i64_cols, weighted_rows,
+    register_full_pk, register_identity_view, scan_all, table_engine, u64_i64_cols, weighted_rows,
 };
 use gnitz_store::read::Probe;
 use gnitz_wire::{peek_control_block, DecodedControl, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode, WireStatus};
@@ -69,6 +70,16 @@ pub(super) fn addressed<'a>(request: impl Into<SalRequest<'a>>, request_id: u32)
 fn scan(tid: u64, schema: &SchemaDescriptor) -> Read<'static> {
     Read::ScanSpec {
         tid,
+        reply_layout: schema.layout_digest(),
+        spec: ReadSpec::all_rows(ReadBound::None).encode().into(),
+    }
+}
+
+/// An unbounded delta read of every round of `view` after tick 0, whose rows lay out as `schema`.
+fn delta(view: u64, schema: &SchemaDescriptor) -> Read<'static> {
+    Read::Delta {
+        view,
+        after_tick: 0,
         reply_layout: schema.layout_digest(),
         spec: ReadSpec::all_rows(ReadBound::None).encode().into(),
     }
@@ -201,14 +212,6 @@ fn in_wait_dispositions() {
     let schema = make_schema_u64_i64();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
-    let delta = Read::Delta {
-        view: vid,
-        after_tick: 0,
-        reply_layout: schema.layout_digest(),
-        spec: gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None)
-            .encode()
-            .into(),
-    };
     let spans = Read::KeySpans { tid, cols, claim: false };
     let ddl = SalGroup {
         targets: GroupTargets {
@@ -221,17 +224,10 @@ fn in_wait_dispositions() {
     // store. `Flush` goes last: the reader leaves the epoch on stepping past it.
     let groups = [
         addressed(scan(vid, &schema), 1),
-        addressed(delta, 2),
+        addressed(delta(vid, &schema), 2),
         addressed(scan(tid, &schema), 3),
         addressed(spans, 4),
-        addressed(
-            Read::HasPk {
-                tid,
-                probe: Probe::Pk,
-                keys: Cow::Borrowed(&[]),
-            },
-            5,
-        ),
+        probe(tid, &[], 5),
         addressed(Apply::Push { tid }, 6),
         ddl,
         addressed(Apply::Flush, 7),
@@ -263,19 +259,12 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
     let schema = make_schema_u64_i64();
     for tid in [500, 501] {
-        engine
-            .registry
-            .register(
-                gnitz_store::relation::RelationSpec {
-                    id: tid,
-                    kind: gnitz_store::relation::RelationKind::BaseTable,
-                    placement: gnitz_zset::algebra::Placement::full_pk(&schema),
-                    pk_repeats: false,
-                    compress: false,
-                },
-                schema,
-            )
-            .unwrap();
+        register_full_pk(
+            &mut engine.registry,
+            tid,
+            gnitz_store::relation::RelationKind::BaseTable,
+            schema,
+        );
         engine
             .registry
             .ingest_pending(tid, make_batch_raw(&schema, &[(tid, 1, 10)]))
@@ -335,7 +324,7 @@ fn a_parked_view_read_answers_ahead_of_the_cut_member_behind_it() {
     {
         let mut excl = sal.excl();
         excl.write(&addressed(scan(vid, &schema), 1)).expect("group fits");
-        excl.write(&addressed(scan(tid, &schema), 2)).expect("group fits");
+        excl.join(&addressed(scan(tid, &schema), 2)).expect("group fits");
     }
     drain_in_wait(&mut wp);
     assert_eq!(owed(&wp), [("parked", 1), ("train", 2)]);
@@ -359,20 +348,14 @@ fn a_burst_passes_what_another_cut_owes() {
     let schema = make_schema_u64_i64();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
-    let delta = Read::Delta {
-        view: vid,
-        after_tick: 0,
-        reply_layout: schema.layout_digest(),
-        spec: gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None)
-            .encode()
-            .into(),
-    };
     let keys = pk_keys(&[1]);
-    sal.excl().write(&addressed(delta, 1)).expect("group fits");
+    sal.excl()
+        .write(&addressed(delta(vid, &schema), 1))
+        .expect("group fits");
     {
         let mut excl = sal.excl();
         excl.write(&probe(tid, &keys, 2)).expect("group fits");
-        excl.write(&probe(tid, &keys, 3)).expect("group fits");
+        excl.join(&probe(tid, &keys, 3)).expect("group fits");
     }
     drain_in_wait(&mut wp);
 

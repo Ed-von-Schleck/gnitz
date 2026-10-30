@@ -141,3 +141,8 @@ pub(crate) fn holders_of(data: &GroupData) -> GroupTargets {
         ..GroupTargets::SILENT
     }
 }
+
+/// A read of `tid` under the blob `spec`.
+pub(crate) fn scan(tid: u64, spec: &[u8]) -> Read<'_> {
+    Read::ScanSpec { tid, reply_layout: 0, spec: spec.into() }
+}
