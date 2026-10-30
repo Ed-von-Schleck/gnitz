@@ -31,6 +31,12 @@ fn type_predicates_partition_the_type_table() {
         (Bool, true, false, false, false, false, false, true, false, Bool),
     ];
     assert_eq!(table.len(), TypeCode::ALL.len(), "a TypeCode variant is unclassified");
+    let exact: Vec<FixedInt> = TypeCode::ALL.iter().filter_map(|&t| FixedInt::exact(t)).collect();
+    assert_eq!(
+        exact,
+        FixedInt::ALL,
+        "FixedInt::ALL is every exact fixed int, in TypeCode order"
+    );
 
     for &(tc, fixed, signed, int, float, german, wide, pk, serial, reindex) in table {
         assert_eq!(tc.is_fixed_int(), fixed, "is_fixed_int({tc:?})");
@@ -195,7 +201,7 @@ fn fixed_int_packs_unpacks_and_decodes_its_own_width() {
     assert_eq!(FixedInt::U64.decode_le_i64(&u64::MAX.to_le_bytes()), -1i64);
     assert_eq!(FixedInt::I64.decode_le_i64(&i64::MIN.to_le_bytes()), i64::MIN);
 
-    for fi in TypeCode::ALL.iter().filter_map(|&t| FixedInt::exact(t)) {
+    for fi in FixedInt::ALL {
         let (lo, hi) = fi.range();
         for v in [lo, 0, hi] {
             let packed = fi.pack(v);
@@ -226,7 +232,7 @@ fn narrow_f32_refuses_only_a_finite_overflow() {
 /// the inverse recovers the value.
 #[test]
 fn an_integers_order_image_is_its_opk_key_promoted() {
-    for fi in TypeCode::ALL.iter().filter_map(|&t| FixedInt::exact(t)) {
+    for fi in FixedInt::ALL {
         let w = fi.width();
         let mask = u64::MAX >> (64 - 8 * w);
         // Exhaustive where the width allows, else the edges plus a sweep.

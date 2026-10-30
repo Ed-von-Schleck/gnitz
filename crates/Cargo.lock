@@ -735,6 +735,7 @@ dependencies = [
  "gnitz-test-harness",
  "gnitz-wire",
  "gnitz-zset",
+ "gnitz-zset-testkit",
  "libc",
  "rcgen",
  "rustls",

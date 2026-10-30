@@ -660,17 +660,9 @@ fn filter_over_the_region_path() {
 
     // ci2 > 0: row 0 passes (1000), row 1 is NULL (dropped by
     // `bool_bits & !null_bits`), row 2 fails (-3000).
-    let mut ev = LogicalProgram::new(
-        vec![
-            LogicalInstr::LoadCol { col: 2 },
-            LogicalInstr::LoadConst { val: 0, unsigned: false },
-            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
-        ],
-        vec![Sink::Reg(Reg(2))],
-        vec![],
-    )
-    .and_then(|p| p.resolve_filter(schema.layout()))
-    .expect("predicate resolves against the client schema");
+    let mut ev = gnitz_zset_testkit::cmp_all(&[(CmpOp::Gt, 2, 0)])
+        .resolve_filter(schema.layout())
+        .expect("predicate resolves against the client schema");
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     ev.ranges(&batch, &mut ranges);

@@ -419,6 +419,18 @@ pub enum FixedInt {
 }
 
 impl FixedInt {
+    /// Every fixed int, in `TypeCode` order.
+    pub const ALL: [Self; 8] = [
+        Self::U8,
+        Self::I8,
+        Self::U16,
+        Self::I16,
+        Self::U32,
+        Self::I32,
+        Self::U64,
+        Self::I64,
+    ];
+
     /// Exhaustive over `TypeCode` (no `_` arm): a new `TypeCode` variant is a
     /// compile error here until someone decides whether it is a narrow integer.
     #[inline(always)]

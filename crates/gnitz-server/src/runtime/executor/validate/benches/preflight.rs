@@ -21,14 +21,7 @@ fn preflight_probe_bench() {
     {
         let mut ids: Vec<u64> = (0..rows).collect();
         if order == "scrambled" {
-            // A fixed Fisher-Yates shuffle under xorshift64.
-            let mut x = 0x9E37_79B9_7F4A_7C15u64;
-            for i in (1..ids.len()).rev() {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                ids.swap(i, (x % (i as u64 + 1)) as usize);
-            }
+            gnitz_zset_testkit::Rng::new(0x9E37_79B9_7F4A_7C15).shuffle(&mut ids);
         }
         let inserted: Vec<_> = ids.iter().map(|&i| (i, 1, i as i64)).collect();
         // Its own: no worker drains the SAL the validations write to.

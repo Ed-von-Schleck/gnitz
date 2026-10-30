@@ -44,17 +44,9 @@ fn pk_column_push_bench() {
 fn gather_bench() {
     const ROWS: usize = 262_144;
     let counter = gnitz_foundation::perf::Counter::instructions();
-    let mut st = 0x9E3779B97F4A7C15u64;
-    let mut rng = move || {
-        st ^= st << 13;
-        st ^= st >> 7;
-        st ^= st << 17;
-        st
-    };
+    let mut rng = gnitz_zset_testkit::Rng::new(0x9E3779B97F4A7C15);
     let mut perm: Vec<u32> = (0..ROWS as u32).collect();
-    for i in (1..ROWS).rev() {
-        perm.swap(i, (rng() % (i as u64 + 1)) as usize);
-    }
+    rng.shuffle(&mut perm);
     for (name, ints, string) in [
         ("1 col", 1usize, false),
         ("4 cols", 4, false),
@@ -68,7 +60,7 @@ fn gather_bench() {
         let mut b = ZSetBatch::new(&schema);
         let mut app = BatchAppender::new(&mut b);
         for i in 0..ROWS {
-            let r = rng();
+            let r = rng.next_u64();
             app.add_row(i as u128, 1);
             for _ in 0..ints {
                 app.i64_val(r as i64);

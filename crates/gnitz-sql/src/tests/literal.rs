@@ -20,8 +20,8 @@ const DAY: u128 = MICROS_PER_DAY as u128;
 /// either end outside it, on that end's side, rather than wrapping it.
 #[test]
 fn an_integer_type_holds_its_range_and_places_one_past_it_outside() {
-    for &tc in TypeCode::ALL {
-        let Some(fi) = FixedInt::exact(tc) else { continue };
+    for fi in FixedInt::ALL {
+        let tc = fi.type_code();
         let (lo, hi) = fi.range();
         for (v, want) in [
             (lo - 1, BELOW),

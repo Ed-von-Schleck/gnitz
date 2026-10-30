@@ -10,19 +10,8 @@
 
 use super::*;
 use gnitz_core::key_reply;
-use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr as L, Sink};
-
-/// `col > threshold` as a compiled predicate blob, over the SOURCE schema's
-/// column indices.
-fn gt_predicate(col: usize, threshold: i64) -> Vec<u8> {
-    let mut b = ExprBuilder::new();
-    let c = b.emit(L::LoadCol { col: col as u32 });
-    let k = b.emit(L::LoadConst { val: threshold, unsigned: false });
-    let cond = b.emit(L::Cmp { op: CmpOp::Gt, a: c, b: k });
-    b.build(vec![Sink::Reg(cond)])
-        .expect("a well-formed program")
-        .to_blob_bytes()
-}
+use gnitz_expr::CmpOp;
+use gnitz_zset_testkit::cmp_all;
 
 /// The key reply of `schema`'s rows matching `predicate`, checked to carry no
 /// payload slot and no blob heap, every row at weight 1.
@@ -65,7 +54,12 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
     }
     block_on(client.push(tid, &schema, &batch, WireConflictMode::Update)).unwrap();
 
-    let (_, reply) = read_keys(&mut client, tid, &schema, gt_predicate(1, 150));
+    let (_, reply) = read_keys(
+        &mut client,
+        tid,
+        &schema,
+        cmp_all(&[(CmpOp::Gt, 1, 150)]).to_blob_bytes(),
+    );
     let mut got: Vec<u64> = (0..reply.len()).map(|i| reply.pks.get(i) as u64).collect();
     got.sort_unstable();
     assert_eq!(got, (151u64..=200).collect::<Vec<_>>());
@@ -101,7 +95,12 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     block_on(client.push(tid, &schema, &batch, WireConflictMode::Update)).unwrap();
 
     // c2 > 15 → every row but the first
-    let (_, reply) = read_keys(&mut client, tid, &schema, gt_predicate(2, 15));
+    let (_, reply) = read_keys(
+        &mut client,
+        tid,
+        &schema,
+        cmp_all(&[(CmpOp::Gt, 2, 15)]).to_blob_bytes(),
+    );
     let mut got: Vec<Vec<u8>> = (0..reply.len()).map(|i| reply.pks.get_bytes(i).to_vec()).collect();
     // The OPK image, spelled by hand: a signed I64 is big-endian with the sign
     // bit flipped, an unsigned U32 is plain big-endian.

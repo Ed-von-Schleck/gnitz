@@ -100,13 +100,11 @@ fn for_packs_at_the_width_the_span_needs() {
 /// type's whole range, pack exactly when and as tightly as [`expected_bw`] says.
 #[test]
 fn random_regions_pack_at_the_expected_width() {
-    use FixedInt::*;
     let mut rng = Rng::new(0x9E3779B97F4A7C15);
     let (mut packed, mut declined) = (0, 0);
-    for fi in [U8, I8, U16, I16, U32, I32, U64, I64] {
+    for fi in FixedInt::ALL {
         let bits = 8 * fi.width() as u32;
-        let signed = matches!(fi, I8 | I16 | I32 | I64);
-        let (lo, size) = (if signed { -(1i128 << (bits - 1)) } else { 0 }, 1u128 << bits);
+        let (lo, size) = (fi.range().0, 1u128 << bits);
         for &n in &[1usize, 2, 10, 1023, 1024, 5000] {
             for _ in 0..8 {
                 let span = 1u128 << rng.gen_range(bits as u64 + 1);

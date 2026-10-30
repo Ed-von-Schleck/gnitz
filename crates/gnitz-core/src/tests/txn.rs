@@ -107,11 +107,7 @@ fn the_overlay_adds_a_buffered_row_at_weight_one() {
 #[test]
 fn the_overlay_replaces_committed_rows_with_the_last_buffered_op() {
     // `v > 15`, over the source schema's column indices.
-    let mut b = gnitz_expr::ExprBuilder::new();
-    let c = b.emit(gnitz_expr::LogicalInstr::LoadCol { col: 1 });
-    let k = b.emit(gnitz_expr::LogicalInstr::LoadConst { val: 15, unsigned: false });
-    let cond = b.emit(gnitz_expr::LogicalInstr::Cmp { op: gnitz_expr::CmpOp::Gt, a: c, b: k });
-    let over_15 = b.build(vec![gnitz_expr::Sink::Reg(cond)]).unwrap().to_blob_bytes();
+    let over_15 = gnitz_zset_testkit::cmp_all(&[(gnitz_expr::CmpOp::Gt, 1, 15)]).to_blob_bytes();
     let s = Arc::new(kv_schema(TypeCode::I64));
     let committed = [(1, 10, 1), (2, 20, 1), (5, 50, 1)];
 
