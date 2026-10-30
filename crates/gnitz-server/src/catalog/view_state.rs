@@ -13,8 +13,13 @@ use super::CatalogEngine;
 impl CatalogEngine {
     /// [`RelationRegistry::scan_spec`], hydrating.
     pub(crate) fn scan_spec(&mut self, target_id: u64, spec: ReadSpec, reply_layout: u64) -> Result<Rc<Batch>, String> {
-        self.registry
-            .scan_spec(target_id, spec, reply_layout, Some(&mut self.dag))
+        let (registry, dag) = (&self.registry, &mut self.dag);
+        registry.scan_spec(
+            target_id,
+            spec,
+            reply_layout,
+            Some(&mut |k| dag.hydrate_keys(registry, target_id, k)),
+        )
     }
 
     /// Open this process's stores: a relation's rederived state resumes at

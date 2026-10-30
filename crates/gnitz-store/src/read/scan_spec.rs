@@ -1,11 +1,11 @@
 //! The worker half of an ad-hoc `ReadSpec` read, over this worker's slice: open
 //! the bound, filter, map, then forward rows or fold them. A capacity-bounded
 //! view's rows hydrate chunk by chunk as the sink drains them.
-use gnitz_wire::ReadSpec;
+use gnitz_wire::{PkKeys, ReadSpec};
 
 use std::rc::Rc;
 
-use super::{check_layout, SkeletonHydrator};
+use super::check_layout;
 use crate::relation::{Cut, RelationRegistry};
 use gnitz_expr::RowFilter;
 use gnitz_zset::algebra::SinkPlan;
@@ -15,12 +15,18 @@ impl RelationRegistry {
     /// Execute `spec` on this worker's slice, replying in the layout whose
     /// [`SchemaDescriptor::layout_digest`](gnitz_zset::schema::SchemaDescriptor::layout_digest)
     /// is `reply_layout`.
+    ///
+    /// `hydrate` recomputes a capacity-bounded view's rows at its skeleton keys,
+    /// from the view's own maintained state: every row of the view at `keys` — at
+    /// the view's `pk_stride`, each held by the view's store as a skeleton row —
+    /// consolidated, each key's weights summing to its skeleton row's weight. A
+    /// host that maintains no circuit passes `None`.
     pub fn scan_spec(
         &self,
         target_id: u64,
         spec: ReadSpec,
         reply_layout: u64,
-        mut hydrator: Option<&mut dyn SkeletonHydrator>,
+        mut hydrate: Option<&mut dyn FnMut(PkKeys) -> Result<Batch, String>>,
     ) -> Result<Rc<Batch>, String> {
         let entry = self.relation_or_err(target_id)?;
         let table = entry.table_or_err()?;
@@ -41,16 +47,14 @@ impl RelationRegistry {
         let mut filter =
             RowFilter::for_read(&predicate, walk.as_ref(), &src_schema).map_err(|e| format!("scan_spec: {e}"))?;
         let chunk_rows = self.config.scan_chunk_rows;
-        let mut hydrate = |keys| match hydrator.as_deref_mut() {
-            Some(h) => h
-                .hydrate_keys(self, target_id, keys)
-                .map_err(|e| format!("hydrate: view {target_id}: {e}")),
+        let mut hydrate_chunk = |keys| match hydrate.as_deref_mut() {
+            Some(h) => h(keys).map_err(|e| format!("hydrate: view {target_id}: {e}")),
             None => Err(format!(
                 "relation {target_id} holds skeleton rows but this process maintains no circuit"
             )),
         };
         for drain_rows in drain_ramp(sink.first_drain(), chunk_rows) {
-            let Some(chunk) = source.drain_hydrated(drain_rows, &mut hydrate)? else {
+            let Some(chunk) = source.drain_hydrated(drain_rows, &mut hydrate_chunk)? else {
                 break;
             };
             if sink.push(&chunk, &mut filter)? {

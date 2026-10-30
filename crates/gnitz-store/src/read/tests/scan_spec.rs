@@ -502,8 +502,8 @@ impl Default for Recompute {
     }
 }
 
-impl SkeletonHydrator for Recompute {
-    fn hydrate_keys(&mut self, _: &RelationRegistry, _: u64, keys: PkKeys) -> Result<Batch, String> {
+impl Recompute {
+    fn call(&mut self, keys: PkKeys) -> Result<Batch, String> {
         let ks: Vec<u64> = keys.iter().map(|k| gnitz_wire::widen_pk_be(k) as u64).collect();
         let mut rows: Vec<_> = ks.iter().map(|&k| (k, 1, k as i64)).collect();
         if ks.contains(&2) {
@@ -535,13 +535,13 @@ fn every_read_over_a_skeleton_store_answers_the_ingested_rows() {
         (pk_set(&[1, 4, 102]), vec![1, 4, 102]),
     ];
     for (bound, ids) in reads {
-        let got = r.scan_spec(TID, ReadSpec::all_rows(bound.clone()), layout, Some(&mut h));
+        let got = r.scan_spec(TID, ReadSpec::all_rows(bound.clone()), layout, Some(&mut |k| h.call(k)));
         assert_eq!(batch_rows(&got.unwrap()), ingested(ids), "{bound:?}");
     }
 
     h.calls.clear();
     let range = ReadSpec::all_rows(pk_range(0, 104));
-    let got = r.scan_spec(TID, range, layout, Some(&mut h)).unwrap();
+    let got = r.scan_spec(TID, range, layout, Some(&mut |k| h.call(k))).unwrap();
     assert_eq!(batch_rows(&got), ingested(0..105));
     assert_eq!(h.calls, [vec![0, 1], vec![2, 3], vec![4]], "one hydration per chunk");
 
@@ -556,7 +556,7 @@ fn every_read_over_a_skeleton_store_answers_the_ingested_rows() {
         bound: pk_set(&[2]),
         ..rows_spec(None, cut(1, vec![]))
     };
-    let got = r.scan_spec(TID, first, layout, Some(&mut h)).unwrap();
+    let got = r.scan_spec(TID, first, layout, Some(&mut |k| h.call(k))).unwrap();
     assert_eq!(batch_rows(&got), [(2, 1, 2)]);
 }
 
@@ -590,7 +590,7 @@ fn a_hydration_off_the_skeleton_rows_panics() {
     ];
     for (i, (keys, edit)) in faults.into_iter().enumerate() {
         let mut h = Recompute { edit, ..Recompute::default() };
-        let read = || drop(r.scan_spec(TID, ReadSpec::all_rows(pk_set(keys)), layout, Some(&mut h)));
+        let read = || drop(r.scan_spec(TID, ReadSpec::all_rows(pk_set(keys)), layout, Some(&mut |k| h.call(k))));
         let panic =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).expect_err("a broken hydration panics");
         let msg = panic

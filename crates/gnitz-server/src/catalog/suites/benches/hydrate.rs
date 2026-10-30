@@ -10,10 +10,8 @@ use std::hint::black_box;
 use std::rc::Rc;
 
 use super::*;
-use crate::query::DagEngine;
 use gnitz_foundation::perf;
-use gnitz_store::read::SkeletonHydrator;
-use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec};
+use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound, ReadSpec};
 
 /// Base rows, and so view rows.
 const ROWS: u64 = 1_000_000;
@@ -62,43 +60,33 @@ fn point(engine: &CatalogEngine, view: u64, key: u64) -> ReadSpec {
     ReadSpec::all_rows(ReadBound::Range(KeyRange::point(pk, &[key as u128])))
 }
 
-/// The engine's own hydrator, counting the rows it recomputes.
-struct Counting<'a> {
-    dag: &'a mut DagEngine,
-    hydrated: usize,
-}
-
-impl SkeletonHydrator for Counting<'_> {
-    fn hydrate_keys(
-        &mut self,
-        registry: &RelationRegistry,
-        view_id: u64,
-        keys: gnitz_wire::PkKeys,
-    ) -> Result<Batch, String> {
-        let out = self.dag.hydrate_keys(registry, view_id, keys)?;
-        self.hydrated += out.len();
-        Ok(out)
-    }
-}
-
 /// One measured read of `view` under `spec`, after an unmeasured one of the same
 /// that leaves the shards it touches resident. Returns its rows and how many it
 /// hydrated.
 fn cell(label: &str, engine: &mut CatalogEngine, view: u64, spec: &ReadSpec) -> (Rc<Batch>, usize) {
     let counter = perf::Counter::instructions();
-    let registry = &engine.registry;
+    let (registry, dag) = (&engine.registry, &mut engine.dag);
     let digest = registry.relation(view).map(Relation::schema).unwrap().layout_digest();
-    let read = |hydrator: &mut Counting| registry.scan_spec(view, spec.clone(), digest, Some(hydrator)).unwrap();
-    black_box(read(&mut Counting { dag: &mut engine.dag, hydrated: 0 }));
+    // The engine's own hydration, counting the rows it recomputes.
+    let mut hydrated = 0;
+    let mut read = |count: &mut usize| {
+        let mut hydrate = |k: PkKeys| {
+            let out = dag.hydrate_keys(registry, view, k)?;
+            *count += out.len();
+            Ok(out)
+        };
+        registry
+            .scan_spec(view, spec.clone(), digest, Some(&mut hydrate))
+            .unwrap()
+    };
+    black_box(read(&mut 0));
 
-    let mut hydrator = Counting { dag: &mut engine.dag, hydrated: 0 };
     let resident = perf::Resident::baseline();
-    let (rows, instructions) = counter.measure(|| read(&mut hydrator));
+    let (rows, instructions) = counter.measure(|| read(&mut hydrated));
     let peak = match resident {
         Some(r) => format!("+{:>7.1} MiB", r.peak_added() as f64 / (1 << 20) as f64),
         None => format!("n/a without {}", perf::PIN_MMAP_THRESHOLD),
     };
-    let hydrated = hydrator.hydrated;
     assert!(
         hydrated > 0,
         "{label}: the read hydrated nothing, so it measured no hydration"

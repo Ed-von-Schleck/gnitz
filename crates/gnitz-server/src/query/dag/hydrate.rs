@@ -2,11 +2,17 @@
 //! output rows by replaying the view's own program over a key-restricted seed.
 
 use super::*;
-use gnitz_store::read::SkeletonHydrator;
 use gnitz_wire::PkKeys;
 
-impl SkeletonHydrator for DagEngine {
-    fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: u64, keys: PkKeys) -> Result<Batch, String> {
+impl DagEngine {
+    /// Every row of `view_id` at `keys`, each held by the view's store as a
+    /// skeleton row: the hydrate closure of [`RelationRegistry::scan_spec`].
+    pub(crate) fn hydrate_keys(
+        &mut self,
+        registry: &RelationRegistry,
+        view_id: u64,
+        keys: PkKeys,
+    ) -> Result<Batch, String> {
         let (code, mut stores) = opened(&mut self.views, registry, view_id, &[])?;
         let hydration = code
             .hydration

@@ -8,8 +8,8 @@
 //! there compute a row the same way.
 //!
 //! Recomputing a capacity-bounded view's skeleton row needs the view's compiled
-//! program; that edge is injected as [`SkeletonHydrator`], and a host that
-//! maintains no circuit passes `None`.
+//! program; that edge is injected as `scan_spec`'s hydrate closure, and a host
+//! that maintains no circuit passes `None`.
 
 mod delta_read;
 mod key_spans;
@@ -20,9 +20,7 @@ mod store_io;
 pub use key_spans::KeySpans;
 pub use store_io::Probe;
 
-use crate::relation::RelationRegistry;
 use gnitz_wire::PkKeys;
-use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// Refuses a reply in `produced` unless its layout digest is the client's
@@ -45,13 +43,4 @@ fn check_stride(verb: &str, id: u64, keys: &PkKeys, stride: usize) -> Result<(),
             keys.stride()
         )),
     }
-}
-
-/// Recomputes a capacity-bounded view's rows at its skeleton keys, from the view's
-/// own maintained state. A host that maintains no circuit has none.
-pub trait SkeletonHydrator {
-    /// Every row of `view_id` at `keys` — at the view's `pk_stride`, each held by
-    /// the view's store as a skeleton row — consolidated, each key's weights summing
-    /// to its skeleton row's weight.
-    fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: u64, keys: PkKeys) -> Result<Batch, String>;
 }
