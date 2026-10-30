@@ -4,7 +4,7 @@
 
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
-use gnitz_wire::Circuit;
+use gnitz_wire::{AggDescriptor, Circuit, GroupAggs};
 use gnitz_zset::algebra::{Placement, Slot};
 
 /// `circuit`'s routing. A view's schema decides only which key its placement
@@ -39,6 +39,14 @@ pub(super) fn scan(circuit: &mut Circuit, source: u64) -> NodeId {
 /// A filter program comparing column `col` with a constant.
 pub(super) fn predicate(col: u32) -> Vec<u8> {
     crate::test_support::cmp_all(&[(gnitz_expr::CmpOp::Lt, col, 100)]).to_blob_bytes()
+}
+
+/// COUNT(*) grouped by `group_cols`.
+pub(super) fn count_by(group_cols: &[u32]) -> GroupAggs {
+    GroupAggs {
+        group_cols: group_cols.to_vec(),
+        aggs: vec![AggDescriptor::COUNT_STAR],
+    }
 }
 
 /// The guard that rejected a build. Naming it is what makes a guard test

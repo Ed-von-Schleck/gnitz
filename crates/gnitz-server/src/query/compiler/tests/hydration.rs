@@ -1,7 +1,9 @@
 use super::*;
-use crate::query::compiler::fixtures::{compile, predicate, rejection, scan, sources, tables_at, Build, Source};
+use crate::query::compiler::fixtures::{
+    compile, count_by, predicate, rejection, scan, sources, tables_at, Build, Source,
+};
 use crate::test_support::{make_schema_u64_i64, reindexed_on_col1};
-use gnitz_wire::{AggDescriptor, Circuit, GroupAggs, JoinKind, TypeCode};
+use gnitz_wire::{Circuit, JoinKind, TypeCode};
 use gnitz_zset::algebra::Slot;
 
 /// Every broken clause of the two-term form, and every other shape, is refused.
@@ -44,13 +46,7 @@ fn a_reduce_as_the_output_is_refused() {
     let registry = sources([(1, make_schema_u64_i64())]);
     let mut c = Circuit::default();
     let a = scan(&mut c, 1);
-    c.reduce_local(
-        a,
-        GroupAggs {
-            group_cols: vec![0],
-            aggs: vec![AggDescriptor::COUNT_STAR],
-        },
-    );
+    c.reduce_local(a, count_by(&[0]));
     assert_eq!(rejection(compile(&c, &registry, true)), READS_OWN_STORE);
 }
 

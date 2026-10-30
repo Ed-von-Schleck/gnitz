@@ -47,6 +47,13 @@ pub fn register_full_pk(registry: &mut RelationRegistry, id: u64, kind: Relation
 
 // ── Catalog column fixtures ─────────────────────────────────────────────────
 
+/// Create `public.parent(pid U64)` on PK [0]; its id.
+pub fn fk_parent(engine: &mut CatalogEngine) -> u64 {
+    engine
+        .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
+        .unwrap()
+}
+
 /// A child's columns `(cid U64, fk U64)`, `fk` referencing `parent`'s column 0.
 pub fn fk_child_cols(parent: u64) -> [CatalogColumn; 2] {
     [col_def("cid", TypeCode::U64), fk_def("fk", TypeCode::U64, parent, 0)]

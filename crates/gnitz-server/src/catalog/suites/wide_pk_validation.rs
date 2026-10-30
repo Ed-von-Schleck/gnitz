@@ -6,7 +6,7 @@
 //! enforcement over a wide PK runs distributed and is covered end-to-end.
 
 use super::*;
-use gnitz_store::relation::{Relation, RelationKind};
+use gnitz_store::relation::RelationKind;
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -31,19 +31,7 @@ fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> B
 /// so it does not exercise the enforcement path.
 fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24], u64, i64)]) {
     let schema = wide_unique_schema();
-    engine
-        .registry
-        .register(
-            RelationSpec {
-                id: tid,
-                kind: RelationKind::BaseTable,
-                placement: Placement::full_pk(&schema),
-                pk_repeats: false,
-                compress: false,
-            },
-            schema,
-        )
-        .unwrap();
+    register_full_pk(&mut engine.registry, tid, RelationKind::BaseTable, schema);
     engine
         .registry
         .add_indexes(
@@ -103,24 +91,8 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
     // only test that resolves a genuinely wide (24-byte) PK via the byte-keyed
     // `seek` and reads back a committed non-PK column value.
     let parent_tid = engine.next_id;
-    let parent_schema = wide_unique_schema(); // [u64;4], pk [0,1,2], col 3 = email
     let parent_pk = pk24(100, 200, 300);
-    let pb = wide_val_batch(&parent_schema, &[(parent_pk, 555, 1)]);
-    engine
-        .registry
-        .register(
-            RelationSpec {
-                id: parent_tid,
-                kind: RelationKind::BaseTable,
-                placement: Placement::full_pk(&parent_schema),
-                pk_repeats: false,
-                compress: false,
-            },
-            parent_schema,
-        )
-        .unwrap();
-    engine.registry.ingest(parent_tid, pb).unwrap();
-    engine.registry.checkpoint_base().unwrap();
+    setup_wide_unique(&mut engine, parent_tid, &[(parent_pk, 555, 1)]);
 
     // A point read resolves the committed parent row by full PK bytes.
     let seen = pk_group(&mut engine, parent_tid, &parent_pk);
@@ -144,23 +116,18 @@ fn native_and_byte_point_reads_agree_narrow() {
     // Plain narrow U64-PK table created through the normal path.
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
-    let mut bb = BatchBuilder::new(&schema);
-    for i in 1..=3u64 {
-        bb.begin_row(i as u128, 1);
-        bb.put_u64(i * 10);
-        bb.end_row();
-    }
-    engine.registry.ingest(tid, bb.finish()).unwrap();
+    engine
+        .registry
+        .ingest(tid, rows(&engine, tid, 1, 1..=3, |i| [i * 10]))
+        .unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Retract key 2 so it is present-but-dead.
-    let mut del = BatchBuilder::new(&schema);
-    del.begin_row(2u128, -1);
-    del.put_u64(20);
-    del.end_row();
-    engine.registry.ingest(tid, del.finish()).unwrap();
+    engine
+        .registry
+        .ingest(tid, rows(&engine, tid, -1, [2], |_| [20]))
+        .unwrap();
     engine.registry.checkpoint_base().unwrap();
 
     // Present (1, 3), retracted (2), and absent (99) must agree across forms.

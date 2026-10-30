@@ -330,25 +330,25 @@ fn minmax_view_tick_bench() {
     });
 }
 
+/// The view of the `limit` rows of each `group` of `t` least in `v`.
+fn top_n_view(engine: &mut CatalogEngine, t: u64, group: &[u32], limit: u64) -> u64 {
+    let order = [gnitz_wire::OrderKey { col: 2, desc: false, nulls_first: false }];
+    let mut circuit = Circuit::default();
+    let scan = circuit.input_delta(t, ReadBound::None);
+    circuit.top_n(scan, group, &order, limit, 0);
+    let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
+    let out = *gnitz_zset::stream::OrderedPlan::top_n(&schema, group, &order, limit, 0)
+        .unwrap()
+        .output_schema();
+    try_register_view(engine, circuit, "v", &cols_of(&out), 0, 0).unwrap()
+}
+
 /// The three rows of each `k` least in `v`: an insert enters its group's window
 /// and pushes a row out, and the delete of it lets that row back in.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn topn_view_tick_bench() {
-    one_row_ticks("top-3", |engine, t| {
-        let (group, order) = (
-            [1u32],
-            [gnitz_wire::OrderKey { col: 2, desc: false, nulls_first: false }],
-        );
-        let mut circuit = Circuit::default();
-        let scan = circuit.input_delta(t, ReadBound::None);
-        circuit.top_n(scan, &group, &order, 3, 0);
-        let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
-        let out = *gnitz_zset::stream::OrderedPlan::top_n(&schema, &group, &order, 3, 0)
-            .unwrap()
-            .output_schema();
-        try_register_view(engine, circuit, "v", &cols_of(&out), 0, 0).unwrap()
-    });
+    one_row_ticks("top-3", |engine, t| top_n_view(engine, t, &[1], 3));
 }
 
 /// Top-N views under bulk deltas: the backfill of `ROWS` rows and the wide
@@ -367,15 +367,7 @@ fn topn_bulk_view_tick_bench() {
         let cells = move |id: u64| [scramble(id) % groups, 2 * ROWS - id];
         let name = format!("topn_bulk_{}", label.replace(' ', "_"));
         let (mut engine, t) = ingest_fixture(&name, &group_cols(), ROWS, cells);
-        let order = [gnitz_wire::OrderKey { col: 2, desc: false, nulls_first: false }];
-        let mut circuit = Circuit::default();
-        let scan = circuit.input_delta(t, ReadBound::None);
-        circuit.top_n(scan, &group, &order, limit, 0);
-        let schema = engine.registry.relation(t).map(Relation::schema).unwrap();
-        let out = *gnitz_zset::stream::OrderedPlan::top_n(&schema, &group, &order, limit, 0)
-            .unwrap()
-            .output_schema();
-        let v = try_register_view(&mut engine, circuit, "v", &cols_of(&out), 0, 0).unwrap();
+        let v = top_n_view(&mut engine, t, &group, limit);
         let ((), fill) = counter.measure(|| backfill(&mut engine, v));
         let held = net_weight(&engine, v);
         let ticks = wide_ticks(&mut engine, &counter, t, ROWS, false, cells);

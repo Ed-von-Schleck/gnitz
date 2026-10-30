@@ -3,9 +3,10 @@
 
 use super::*;
 use crate::test_support::{
-    cmp_all, join_reference, make_batch_u128, make_batch_u128_raw, make_schema_u128_i64, weighted_rows, zset_of,
+    cmp_all, join_reference, make_batch_u128, make_batch_u128_raw, make_schema_u128_i64, register_full_pk,
+    weighted_rows, zset_of,
 };
-use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
+use gnitz_store::relation::{RelationKind, StoreConfig};
 use gnitz_wire::{AggDescriptor, AggFunc, JoinKind, TypeCode, ViewBudget};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::schema::SchemaColumn;
@@ -22,18 +23,6 @@ impl Vm {
 
 /// The view a test program's children are opened under.
 const VIEW_ID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
-
-/// A relation of `make_schema_u128_i64`'s shape, placed by its whole PK.
-fn spec(id: u64, kind: RelationKind) -> RelationSpec {
-    let schema = make_schema_u128_i64();
-    RelationSpec {
-        id,
-        kind,
-        placement: Placement::full_pk(&schema),
-        pk_repeats: false,
-        compress: false,
-    }
-}
 
 /// `make_schema_u128_i64` with a nullable payload: a label wider than the
 /// batches a test feeds under it.
@@ -92,12 +81,12 @@ impl TestVm {
     fn open(p: ProgramBuilder, out: DeltaReg) -> TestVm {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, StoreConfig::default());
-        registry
-            .register(
-                spec(VIEW_ID, RelationKind::View(ViewBudget::Plain)),
-                make_schema_u128_i64(),
-            )
-            .unwrap();
+        register_full_pk(
+            &mut registry,
+            VIEW_ID,
+            RelationKind::View(ViewBudget::Plain),
+            make_schema_u128_i64(),
+        );
         let vm = p.finish(out);
         TestVm {
             state: CircuitState::open(&registry, VIEW_ID, vm.layout()).unwrap(),
@@ -362,9 +351,7 @@ fn a_join_over_its_source_reads_it_up_to_its_cut() {
         },
     );
     let mut vm = TestVm::open(p, out);
-    vm.registry
-        .register(spec(TABLE, RelationKind::BaseTable), make_schema_u128_i64())
-        .unwrap();
+    register_full_pk(&mut vm.registry, TABLE, RelationKind::BaseTable, make_schema_u128_i64());
     let sealed = make_batch_u128(&schema, &[(1, 1, 100), (2, 1, 200)]);
     vm.registry.ingest(TABLE, sealed.clone()).unwrap();
     let pending = make_batch_u128(&schema, &[(2, -1, 200), (3, 1, 300)]);

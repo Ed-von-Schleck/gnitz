@@ -342,9 +342,7 @@ fn undoing_a_drop_keeps_the_restored_relation_directory() {
 #[test]
 fn refused_create_table_leaves_no_trace() {
     let mut engine = fresh("refused_create_table");
-    let parent = engine
-        .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
-        .unwrap();
+    let parent = fk_parent(&mut engine);
     let tid = engine.allocate_ids(1).unwrap();
     let idx_id = engine.allocate_ids(1).unwrap();
     let before = sys_row_counts(&engine);

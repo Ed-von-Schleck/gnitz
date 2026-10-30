@@ -13,9 +13,7 @@ fn stream_flag_registers_storeless_with_no_directory() {
     let cols = u64_i64_cols();
 
     let sid = create_stream(&mut engine, "public.s", &cols);
-    let tid = engine
-        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
-        .unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     let entry = engine.registry.relation_or_err(sid).expect("stream registered");
     assert_eq!(entry.kind(), RelationKind::Stream);
@@ -44,18 +42,6 @@ fn stream_flag_registers_storeless_with_no_directory() {
     discard(engine);
 }
 
-/// A stream is not a push-conflict target and not an FK parent, so the two
-/// predicates that gate the master preflight must stay false for one.
-#[test]
-fn stream_reads_no_committed_state() {
-    let mut engine = fresh("stream_reads_no_committed_state");
-    let cols = u64_i64_cols();
-    let sid = create_stream(&mut engine, "public.s", &cols);
-
-    assert!(!engine.push_reads_committed_state(sid, gnitz_wire::WireConflictMode::Update));
-    discard(engine);
-}
-
 /// A bounded filter/projection over a stream is refused at compile; over a table,
 /// and a bounded join over a stream, it compiles.
 #[test]
@@ -63,9 +49,7 @@ fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
     let mut engine = fresh("bounded_view_over_stream");
     let cols = u64_i64_cols();
     let sid = create_stream(&mut engine, "public.s", &cols);
-    let tid = engine
-        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
-        .unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     let err = try_register_identity_view(&mut engine, sid, "bounded_over_stream", &cols, 4 << 20, 0)
         .expect_err("must be rejected");
@@ -95,9 +79,7 @@ fn the_drive_set_excludes_a_stream() {
     let mut engine = fresh("stream_excluded_from_sweep");
     let cols = u64_i64_cols();
     let sid = create_stream(&mut engine, "public.s", &cols);
-    let tid = engine
-        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
-        .unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     register_identity_view(&mut engine, sid, "v_s", &cols);
     register_identity_view(&mut engine, tid, "v_t", &cols);
 

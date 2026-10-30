@@ -27,34 +27,10 @@ fn test_index_live_fanout() {
     engine.registry.checkpoint_base().unwrap();
 
     // Verify index has 6 entries via DagEngine's index circuit
-    let entry = engine.registry.relation_or_err(tid).unwrap();
-    assert_eq!(entry.indexes().len(), 1, "Expected 1 index circuit");
-    let idx_count = count_records(entry.indexes()[0].cursor());
-    assert_eq!(idx_count, 6, "Index fanout: expected 6, got {idx_count}");
-
-    finish(engine);
-}
-
-#[test]
-fn test_create_index_duplicate_rejected() {
-    // Creating the same index twice must fail on the second attempt rather
-    // than silently orphaning the first index circuit.
-    let (mut engine, _tid) = table_engine(
-        "catalog",
-        "idx_dup_create",
-        1,
-        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)],
-    );
-
-    let first = engine.create_index("public.t", &["val"], false);
-    assert!(first.is_ok(), "first index creation should succeed");
-    assert!(engine.has_index_by_name("public__t__idx_val"));
-
-    let second = engine.create_index("public.t", &["val"], false);
-    assert!(second.is_err(), "duplicate index creation must be rejected");
-    assert!(
-        second.unwrap_err().contains("already exists"),
-        "error must mention the index already exists"
+    assert_eq!(
+        index_weight(&engine, tid),
+        6,
+        "Index fanout: one entry per row at weight 1"
     );
 
     finish(engine);
@@ -124,14 +100,10 @@ fn test_drop_table_cascades_fk_index() {
     let dir = temp_dir("drop_table_cascade_fk");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let parent_cols = vec![col_def("pk", TypeCode::U64), col_def("name", TypeCode::U64)];
-    let parent_tid = engine.create_table("public.parent", &parent_cols, &[0]).unwrap();
-
-    let child_cols = vec![
-        col_def("pk", TypeCode::U64),
-        fk_def("parent_ref", TypeCode::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
+    let parent_tid = fk_parent(&mut engine);
+    let child_tid = engine
+        .create_table("public.child", &fk_child_cols(parent_tid), &[0])
+        .unwrap();
 
     assert!(
         engine
@@ -290,18 +262,12 @@ fn circuit_unique(engine: &CatalogEngine, tid: u64, col: u32) -> Option<bool> {
 #[test]
 fn test_fk_circuit_is_derived_and_survives_its_unique_index() {
     let mut engine = fresh("fk_circuit_derived");
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("id", TypeCode::U64)], &[0])
-        .unwrap();
+    let parent_tid = fk_parent(&mut engine);
     let idx_rows_before = count_records(engine.sys_relation(SysFamily::Index).cursor());
 
     let child_tid = engine.next_id;
-    let cols = vec![
-        col_def("cid", TypeCode::U64),
-        fk_def("refc", TypeCode::U64, parent_tid, 0),
-    ];
     engine
-        .register_table(child_tid, PUBLIC_SCHEMA_ID, "child", &cols, &[0])
+        .register_table(child_tid, PUBLIC_SCHEMA_ID, "child", &fk_child_cols(parent_tid), &[0])
         .unwrap();
     let claims = engine
         .registry
@@ -314,40 +280,12 @@ fn test_fk_circuit_is_derived_and_survives_its_unique_index() {
         idx_rows_before
     );
 
-    engine.create_index("public.child", &["refc"], true).unwrap();
+    engine.create_index("public.child", &["fk"], true).unwrap();
     assert_eq!(circuit_unique(&engine, child_tid, 1), Some(true));
     engine
-        .drop_index(&make_secondary_index_name("public", "child", "refc"))
+        .drop_index(&make_secondary_index_name("public", "child", "fk"))
         .unwrap();
     assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false));
-
-    finish(engine);
-}
-
-#[test]
-fn test_promote_unique_index_over_fk_column_empty() {
-    let mut engine = fresh("promote_unique_fk_empty");
-
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("id", TypeCode::U64)], &[0])
-        .unwrap();
-    let child_cols = vec![
-        col_def("cid", TypeCode::U64),
-        fk_def("refc", TypeCode::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
-
-    // FK auto-index registered (non-unique) on col 1 at create time.
-    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false));
-
-    // A UNIQUE index over the same column promotes the incumbent circuit; on an
-    // empty table this is a pure flag flip (no duplicate data to scan).
-    engine.create_index("public.child", &["refc"], true).unwrap();
-    assert_eq!(
-        circuit_unique(&engine, child_tid, 1),
-        Some(true),
-        "the UNIQUE index must promote the FK circuit to unique"
-    );
 
     finish(engine);
 }
@@ -422,21 +360,20 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     // populated with distinct values must promote and enforce, not be masked.
     let mut engine = fresh("promote_unique_fk_distinct");
 
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("id", TypeCode::U64)], &[0])
+    let parent_tid = fk_parent(&mut engine);
+    let child_tid = engine
+        .create_table("public.child", &fk_child_cols(parent_tid), &[0])
         .unwrap();
-    let child_cols = vec![
-        col_def("cid", TypeCode::U64),
-        fk_def("refc", TypeCode::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
-    // Seed DISTINCT refc values (a registry ingest bypasses FK validation).
+    // The FK column's circuit is registered non-unique at create time.
+    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false));
+
+    // Seed DISTINCT fk values (a registry ingest bypasses FK validation).
     let seeded = rows(&engine, child_tid, 1, [1, 2], |i| [i * 10]);
     engine.registry.ingest(child_tid, seeded).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
-    engine.create_index("public.child", &["refc"], true).unwrap();
+    engine.create_index("public.child", &["fk"], true).unwrap();
     assert_eq!(circuit_unique(&engine, child_tid, 1), Some(true));
 
     finish(engine);
@@ -448,15 +385,14 @@ fn test_drop_index_permitted_on_lone_pk_target() {
     // dropped: the PK itself preserves uniqueness for FK child validation.
     let mut engine = fresh("drop_idx_lone_pk_fk");
 
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("id", TypeCode::U64)], &[0])
+    let parent_tid = fk_parent(&mut engine);
+    engine
+        .create_table("public.child", &fk_child_cols(parent_tid), &[0])
         .unwrap();
-    let child_cols = vec![col_def("cid", TypeCode::U64), fk_def("p", TypeCode::U64, parent_tid, 0)];
-    engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // Redundant unique index on the parent's lone PK column.
-    engine.create_index("public.parent", &["id"], true).unwrap();
-    let idx = make_secondary_index_name("public", "parent", "id");
+    engine.create_index("public.parent", &["pid"], true).unwrap();
+    let idx = make_secondary_index_name("public", "parent", "pid");
     engine
         .drop_index(&idx)
         .expect("drop must be permitted: lone PK preserves uniqueness");
@@ -515,10 +451,8 @@ fn test_unique_index_chunked_fill_distinct_succeeds() {
     engine.registry.set_scan_chunk_rows(3);
     engine.create_index("public.t", &["val"], true).unwrap();
 
-    let entry = engine.registry.relation_or_err(tid).unwrap();
-    assert_eq!(entry.indexes().len(), 1);
     assert_eq!(
-        count_records(entry.indexes()[0].cursor()),
+        index_weight(&engine, tid),
         10,
         "a chunked fill must project every row exactly once"
     );

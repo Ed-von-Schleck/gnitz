@@ -14,29 +14,6 @@ fn test_uuid_pk_create_and_drop() {
     finish(engine);
 }
 
-// ── test_uuid_non_pk_column ──────────────────────────────────────────
-
-#[test]
-fn test_uuid_non_pk_column() {
-    let mut engine = fresh("uuid_non_pk");
-
-    let cols = vec![col_def("id", TypeCode::U64), uuid_def("uid")];
-    let tid = engine.create_table("public.uuid_payload", &cols, &[0]).unwrap();
-    let s = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    assert_eq!(s.columns()[1].type_code, TypeCode::UUID);
-
-    // Ingest a row with a UUID payload column
-    let mut bb = BatchBuilder::new(&s);
-    bb.begin_row(1u128, 1);
-    bb.put_int(UUID_A);
-    bb.end_row();
-    engine.registry.ingest(tid, bb.finish()).unwrap();
-    engine.registry.checkpoint_base().unwrap();
-
-    engine.drop_table("public.uuid_payload").unwrap();
-    finish(engine);
-}
-
 // ── test_uuid_secondary_index ────────────────────────────────────────
 
 #[test]
@@ -46,6 +23,7 @@ fn test_uuid_secondary_index() {
     let cols = vec![col_def("id", TypeCode::U64), uuid_def("uid")];
     let tid = engine.create_table("public.uuid_idxtab", &cols, &[0]).unwrap();
     let s = engine.registry.relation(tid).map(Relation::schema).unwrap();
+    assert_eq!(s.columns()[1].type_code, TypeCode::UUID);
 
     let mut bb = BatchBuilder::new(&s);
     bb.begin_row(1u128, 1);

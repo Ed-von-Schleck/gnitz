@@ -5,56 +5,60 @@
 
 use super::*;
 use crate::test_support::u64_i64_cols;
-use gnitz_wire::TableTabRow;
 use std::path::Path;
-
-/// A rename of `tid` to `new_name` as its two TABLE_TAB rows, `[-1, +1]`: the
-/// `-1` copies the live row, the `+1` differs from it only in `name`.
-fn table_rename_rows(engine: &CatalogEngine, tid: u64, new_name: &str) -> [Batch; 2] {
-    let minus = engine.retract_under(SysFamily::Table, &[tid]);
-    let row = TableTabRow {
-        name: new_name.into(),
-        ..TableTabRow::read(&minus, 0).unwrap()
-    };
-    let plus = crate::test_support::sys_batch([(row, 1)]);
-    [minus, plus]
-}
-
-fn table_rename_pair(engine: &CatalogEngine, tid: u64, new_name: &str) -> Batch {
-    let [mut pair, plus] = table_rename_rows(engine, tid, new_name);
-    pair.append_batch(&plus);
-    pair
-}
 
 // ── Reconciling hooks: a rename fires no teardown ───────────────────────────
 
+/// A rename pair renames the table in place in either row order: a raw
+/// `DDL_TXN` block or an undo can hand the hooks the `+1` first. The names are
+/// longer than 12 bytes, so they live in the blob heap and the `-1` carries heap
+/// offsets of its own; the CAS compares string content, not region bytes.
 #[test]
-fn rename_fires_no_cascade_and_leaves_dir_untouched() {
-    let mut engine = fresh("alter_no_cascade");
-    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
-    let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
-    let table_path = relation_dir(engine.registry.base_dir(), tid);
-    assert!(Path::new(&table_path).exists());
+fn a_rename_pair_in_either_order_renames_in_place() {
+    let (old, new) = ("original_long_name", "renamed_to_a_long_name");
+    for insert_first in [false, true] {
+        let mut engine = fresh(&format!("alter_rename_pair_{insert_first}"));
+        let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
+        let tid = engine.create_table(&format!("public.{old}"), &cols, &[0]).unwrap();
+        let table_path = relation_dir(engine.registry.base_dir(), tid);
+        assert!(Path::new(&table_path).exists());
 
-    let pair = table_rename_pair(&engine, tid, "renamed");
-    apply_ddl(&mut engine, [(SysFamily::Table, pair.clone())]).unwrap();
+        let mut pair = [(tid, old, -1), (tid, new, 1)];
+        if insert_first {
+            pair.reverse();
+        }
+        apply_ddl(&mut engine, [(SysFamily::Table, table_tab_batch(&pair))]).unwrap();
 
-    // The registration survives, so its directory is live.
-    assert!(
-        engine.registry.relation(tid).is_some(),
-        "rename must not unregister the table"
-    );
-    assert!(Path::new(&table_path).exists(), "rename must not delete the table dir");
-    // Caches reflect the new name; no persistent ghost row.
-    assert!(engine.get_by_name("public", "renamed").is_some());
-    assert!(engine.get_by_name("public", "orig").is_none());
-    assert_eq!(
-        rows_under(&engine, SysFamily::Table, tid),
-        1,
-        "a rename must leave exactly one live row"
-    );
+        assert!(
+            engine.registry.relation(tid).is_some(),
+            "insert_first={insert_first}: unregistered"
+        );
+        assert!(
+            Path::new(&table_path).exists(),
+            "insert_first={insert_first}: dir deleted"
+        );
+        assert_eq!(
+            engine.get_by_name("public", new),
+            Some(tid),
+            "insert_first={insert_first}"
+        );
+        assert!(
+            engine.get_by_name("public", old).is_none(),
+            "insert_first={insert_first}"
+        );
+        assert_eq!(
+            engine.qualified_name_or_unknown(tid).1,
+            new,
+            "insert_first={insert_first}"
+        );
+        assert_eq!(
+            rows_under(&engine, SysFamily::Table, tid),
+            1,
+            "insert_first={insert_first}: a rename leaves exactly one live row"
+        );
 
-    finish(engine);
+        finish(engine);
+    }
 }
 
 // ── Id-only dirs resume after a rename + reopen ─────────────────────────────
@@ -68,16 +72,14 @@ fn rename_then_reopen_resolves_flushed_data() {
         let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
         tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
         // Flush a row so only the on-disk (id-only) path can serve it after reopen.
-        let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-        let mut bb = BatchBuilder::new(&schema);
-        bb.begin_row(7u128, 1);
-        bb.put_u64(70);
-        bb.end_row();
-        engine.registry.ingest(tid, bb.finish()).unwrap();
+        engine
+            .registry
+            .ingest(tid, rows(&engine, tid, 1, [7], |_| [70]))
+            .unwrap();
         engine.registry.checkpoint_base().unwrap();
 
-        let pair = table_rename_pair(&engine, tid, "renamed");
-        apply_ddl(&mut engine, [(SysFamily::Table, pair.clone())]).unwrap();
+        let pair = table_tab_batch(&[(tid, "orig", -1), (tid, "renamed", 1)]);
+        apply_ddl(&mut engine, [(SysFamily::Table, pair)]).unwrap();
         engine.close();
     }
 
@@ -94,20 +96,6 @@ fn rename_then_reopen_resolves_flushed_data() {
         "flushed row must resolve after rename + reopen (id-only dir was untouched)"
     );
 
-    finish(engine);
-}
-
-#[test]
-fn valid_long_name_rename_accepted() {
-    // Regression against a naive region `memcmp`: a name > 12 bytes lives in the
-    // blob heap, so the `-1` and live rows carry independent heap offsets. The CAS
-    // compares German-string content, so a valid rename to a long name is accepted.
-    let mut engine = fresh("alter_long_ok");
-    let cols = vec![col_def("id", TypeCode::U64)];
-    let tid = engine.create_table("public.original_long_name", &cols, &[0]).unwrap();
-    let pair = table_rename_pair(&engine, tid, "renamed_to_a_long_name");
-    apply_ddl(&mut engine, [(SysFamily::Table, pair.clone())]).unwrap();
-    assert!(engine.get_by_name("public", "renamed_to_a_long_name").is_some());
     finish(engine);
 }
 
@@ -294,45 +282,6 @@ fn a_dropped_column_cannot_be_renamed_or_indexed() {
     let idx = idx_tab_batch(engine.allocate_ids(1).unwrap(), tid, &[1], "public__t__idx_a", false, 1);
     let err = engine.precheck_family(SysFamily::Index, &idx).unwrap_err();
     assert!(err.contains("dropped"), "index: {err}");
-
-    finish(engine);
-}
-
-// ── The hook canonicalizer repairs a `+1`-first rewrite pair ────────────────
-// A raw `DDL_TXN` block or an undo can hand the hooks one.
-
-#[test]
-fn insert_first_rename_pair_lands_the_new_name() {
-    let mut engine = fresh("alter_insert_first_pair");
-    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
-    let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
-
-    let [minus, mut pair] = table_rename_rows(&engine, tid, "renamed");
-    pair.append_batch(&minus);
-    apply_ddl(&mut engine, [(SysFamily::Table, pair.clone())]).unwrap();
-
-    assert!(
-        engine.get_by_name("public", "renamed").is_some(),
-        "the new name must resolve"
-    );
-    assert!(
-        engine.get_by_name("public", "orig").is_none(),
-        "the outgoing name must be unmapped"
-    );
-    assert_eq!(
-        engine.qualified_name_or_unknown(tid).1,
-        "renamed",
-        "the catalog must name the table by its new name"
-    );
-    assert!(
-        engine.registry.relation(tid).is_some(),
-        "a rename must not unregister the table, whatever the row order"
-    );
-    assert_eq!(
-        rows_under(&engine, SysFamily::Table, tid),
-        1,
-        "a rename leaves exactly one live row"
-    );
 
     finish(engine);
 }

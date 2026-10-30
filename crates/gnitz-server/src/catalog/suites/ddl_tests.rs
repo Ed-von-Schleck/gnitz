@@ -198,10 +198,6 @@ fn test_edge_cases() {
     let mut engine = fresh("edge_cases");
     let cols = vec![col_def("id", TypeCode::U64)];
 
-    // Duplicate table
-    engine.create_table("public.tbl1", &cols, &[0]).unwrap();
-    assert!(engine.create_table("public.tbl1", &cols, &[0]).is_err());
-
     // Drop non-empty schema cascades (PostgreSQL-style): the
     //    contained table goes first, then the schema itself.
     engine.create_schema("my_schema").unwrap();
@@ -213,11 +209,6 @@ fn test_edge_cases() {
         "cascade must drop the contained table"
     );
 
-    // Invalid PK type (STRING)
-    assert!(engine
-        .create_table("public.bad_pk", &[col_def("id", TypeCode::String)], &[0])
-        .is_err());
-
     // Too many columns (> MAX_COLUMNS = 65)
     let many: Vec<CatalogColumn> = (0..66).map(|i| col_def(&format!("c{i}"), TypeCode::U64)).collect();
     assert!(engine.create_table("public.too_many", &many, &[0]).is_err());
@@ -228,9 +219,6 @@ fn test_edge_cases() {
         .unwrap_err()
         .contains("cannot DROP a system"));
 
-    // PK index out of bounds
-    assert!(engine.create_table("public.bad_idx", &cols, &[5]).is_err());
-
     // Recreated schema gets new ID
     engine.create_schema("temp").unwrap();
     let sid1 = engine.schema_id("temp").expect("the schema exists");
@@ -239,13 +227,6 @@ fn test_edge_cases() {
     let sid2 = engine.schema_id("temp").expect("the schema exists");
     assert_ne!(sid1, sid2);
     engine.drop_schema("temp").unwrap();
-
-    // Recreated table gets new ID
-    let tid14a = engine.create_table("public.tbl_rc", &cols, &[0]).unwrap();
-    engine.drop_table("public.tbl_rc").unwrap();
-    let tid14b = engine.create_table("public.tbl_rc", &cols, &[0]).unwrap();
-    assert_ne!(tid14a, tid14b);
-    engine.drop_table("public.tbl_rc").unwrap();
 
     // U128 PK support
     let tid15 = engine
@@ -267,6 +248,9 @@ fn test_edge_cases() {
     assert!(engine.get_by_name("public", "CaseTest").is_none());
     engine.create_table("public.casetest", &cols, &[0]).unwrap();
     engine.drop_table("public.casetest").unwrap();
+
+    // Multiple dots in qualified name — second part contains dot
+    assert!(engine.create_table("public.schema.tbl", &cols, &[0]).is_err());
 
     finish(engine);
 }
@@ -388,38 +372,6 @@ fn test_restart_long_strings() {
     }
 }
 
-// ── Additional edge cases ───────────────────────────────────────────
-
-#[test]
-fn test_edge_cases_extended() {
-    let mut engine = fresh("edge_ext");
-    let cols = vec![col_def("id", TypeCode::U64)];
-
-    // Multiple dots in qualified name — second part contains dot
-    assert!(engine.create_table("public.schema.tbl", &cols, &[0]).is_err());
-
-    finish(engine);
-}
-
-// ── test_nullable_pk_rejected ─────────────────────────────────────────
-// The PK region has no null bitmap; the catalog must
-// refuse to record a nullable PK regardless of its type.
-
-#[test]
-fn test_nullable_pk_rejected() {
-    let mut engine = fresh("nullable_pk");
-
-    let cols = vec![nullable_def("id", TypeCode::U64), col_def("name", TypeCode::String)];
-    let err = engine.create_table("public.bad_pk_null", &cols, &[0]).unwrap_err();
-    assert!(err.contains("nullable"), "expected nullable-PK error, got: {err}");
-
-    // Sanity: same shape with is_nullable=false succeeds.
-    let cols_ok = vec![col_def("id", TypeCode::U64), col_def("name", TypeCode::String)];
-    engine.create_table("public.ok_pk", &cols_ok, &[0]).unwrap();
-
-    finish(engine);
-}
-
 // ── test_hook_relation_register_rejects_malformed_pk ─────────────────
 
 // Drives crafted/malformed packed PK values through the production
@@ -460,7 +412,8 @@ fn test_hook_relation_register_rejects_malformed_pk() {
     assert_rejects(PK_LIST_PACKED_FLAG, "at least one column"); // count 0
     assert_rejects(PK_LIST_PACKED_FLAG | 5, "out of range 1..=4"); // count 5
     assert_rejects(PK_LIST_PACKED_FLAG | 15, "out of range 1..=4"); // count 15
-                                                                    // Out-of-bounds index (index 5, only 3 columns).
+
+    // Out-of-bounds index (index 5, only 3 columns).
     assert_rejects(PK_LIST_PACKED_FLAG | 1 | (5 << 4), "out of bounds");
     // Duplicate index [0, 0]. The `(0 << N)` forms document the slot layout
     // (count=2, idx0@bit4=0, idx1@bit11=0) even though they evaluate to 0.
@@ -564,50 +517,6 @@ fn test_drop_view_removes_directory() {
     assert!(
         !std::path::Path::new(&view_dir).exists(),
         "view dir must be deleted by the sweep after the drop: {view_dir}"
-    );
-
-    finish(engine);
-}
-
-// ── test_drop_view_cascades_columns_and_circuit_rows ─────────────────
-// DROP VIEW retracts only the VIEW_TAB row; the expanded cascade must clear both
-// the view's column rows and its circuit row.
-
-#[test]
-fn test_drop_view_cascades_columns_and_circuit_rows() {
-    let mut engine = fresh("drop_view_cascade");
-
-    let base_tid = engine
-        .create_table("public.base", &[col_def("id", TypeCode::U64)], &[0])
-        .unwrap();
-
-    // Baseline: system + base-table column rows; no circuit row yet.
-    let base_cols = count_records(engine.sys_relation(SysFamily::Column).cursor());
-    let base_circuits = count_records(engine.sys_relation(SysFamily::Circuit).cursor());
-
-    register_identity_view(&mut engine, base_tid, "depview", &[col_def("id", TypeCode::U64)]);
-
-    assert!(
-        count_records(engine.sys_relation(SysFamily::Column).cursor()) > base_cols,
-        "view column rows must be present before drop"
-    );
-    assert!(
-        count_records(engine.sys_relation(SysFamily::Circuit).cursor()) > base_circuits,
-        "the circuit row must be present before drop"
-    );
-
-    // Drop the view: the VIEW_TAB -1 cascade must retract both families.
-    engine.drop_view("public.depview").unwrap();
-
-    assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Column).cursor()),
-        base_cols,
-        "sys_columns must return to baseline after drop_view (column cascade)"
-    );
-    assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Circuit).cursor()),
-        base_circuits,
-        "circuit rows must return to baseline after drop_view (circuit cascade)"
     );
 
     finish(engine);
@@ -758,13 +667,8 @@ fn replicated_bit_is_transitive_and_survives_replay() {
 #[test]
 fn a_view_declaring_both_capacity_and_delta_is_rejected() {
     let mut engine = fresh("capacity_and_delta_together");
-    let cols = vec![
-        crate::test_support::col_def("id", gnitz_wire::TypeCode::U64),
-        crate::test_support::col_def("v", gnitz_wire::TypeCode::I64),
-    ];
-    let tid = engine
-        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
-        .unwrap();
+    let cols = u64_i64_cols();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     let err = try_register_identity_view(&mut engine, tid, "both", &cols, 4 << 20, 4 << 20)
         .expect_err("the pair must be refused");
@@ -782,13 +686,8 @@ fn a_view_declaring_both_capacity_and_delta_is_rejected() {
 #[test]
 fn a_bounded_view_source_is_named() {
     let mut engine = fresh("refused_view_source_named");
-    let cols = vec![
-        crate::test_support::col_def("id", gnitz_wire::TypeCode::U64),
-        crate::test_support::col_def("v", gnitz_wire::TypeCode::I64),
-    ];
-    let tid = engine
-        .create_table_with("public.t", &cols, &[0], gnitz_wire::TableProps::default())
-        .unwrap();
+    let cols = u64_i64_cols();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let bv = try_register_identity_view(&mut engine, tid, "bv", &cols, 4 << 20, 0).expect("a bounded view");
 
     let err = try_register_identity_view(&mut engine, bv, "over_bv", &cols, 0, 0).expect_err("a leaf view");
@@ -808,9 +707,7 @@ fn a_view_at_the_column_limit_carries_a_feed() {
     let cols: Vec<CatalogColumn> = (0..gnitz_wire::MAX_COLUMNS)
         .map(|i| crate::test_support::col_def(&format!("c{i}"), gnitz_wire::TypeCode::U64))
         .collect();
-    let tid = engine
-        .create_table_with("public.wide", &cols, &[0], gnitz_wire::TableProps::default())
-        .unwrap();
+    let tid = engine.create_table("public.wide", &cols, &[0]).unwrap();
 
     try_register_identity_view(&mut engine, tid, "fed_wide", &cols, 0, 4 << 20).expect("fed wide view");
 

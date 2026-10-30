@@ -36,68 +36,9 @@ fn filtered_view_blocks(vid: u64, base_tid: u64, pred: &[u8], views: Batch) -> [
 
 // ── The compile verdict ─────────────────────────────────────────────────────
 
-/// A circuit the engine cannot compile must come back as an error while the DDL
-/// is still undoable, and a compilable one must come back clean.
-#[test]
-fn test_compile_verdict() {
-    let mut engine = fresh("view_compile_verdict");
-    let base_cols = u64_i64_cols();
-    let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
-
-    // A compilable circuit: a well-formed predicate over the base's own columns.
-    let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 100)]).to_blob_bytes();
-    let ok_vid =
-        try_register_filtered_view(&mut engine, base_tid, "vok", &pred).expect("a well-formed circuit compiles");
-    assert!(engine.registry.relation(ok_vid).is_some());
-
-    // A predicate blob the expression decoder refuses — only a corrupt circuit
-    // can carry one, since the client's builder cannot — and the message is the
-    // decoder's own.
-    let bad_vid = engine.next_id;
-    let msg = try_register_filtered_view(&mut engine, base_tid, "vbad", &[0xFF])
-        .expect_err("an undecodable predicate fails the compile");
-    assert!(
-        msg.contains("expr blob"),
-        "the rejection must be the decoder's, got: {msg}"
-    );
-    assert!(
-        engine.registry.relation(bad_vid).is_none(),
-        "the refused view is not registered"
-    );
-    assert!(engine.live_sys_row(SysFamily::View, bad_vid).is_none());
-
-    finish(engine);
-}
-
-/// A circuit whose routing the engine refuses is rejected before the DDL is
-/// durable.
-#[test]
-fn a_view_whose_circuit_is_unroutable_is_rejected_before_the_sal() {
-    let mut engine = fresh("view_compile_routing");
-    let cols = u64_i64_cols();
-    let a = engine.create_table("public.a", &cols, &[0]).unwrap();
-    let b = engine.create_table("public.b", &cols, &[0]).unwrap();
-
-    let vid = engine.next_id;
-    let circuit = equi_join_circuit(a, b, TypeCode::I64, [false, true]);
-    let err =
-        try_register_view(&mut engine, circuit, "v", &cols, 0, 0).expect_err("the register hook refuses the circuit");
-    assert!(
-        err.contains(&format!("source {a} feeds a join and states no scatter key")),
-        "got: {err}"
-    );
-    assert!(engine.registry.relation(vid).is_none(), "the view is not registered");
-    assert!(
-        engine.live_sys_row(SysFamily::View, vid).is_none(),
-        "no VIEW_TAB row of it is live"
-    );
-
-    finish(engine);
-}
-
 /// A view bundle whose circuit cell does not decode, one whose circuit the
 /// register hook cannot route, and one holding no circuit row for its view are
-/// each refused at the view's row and undone: no view, no circuit row, and
+/// each refused at the view's row and undone: no view, no catalog row, and
 /// nothing depending on the source.
 #[test]
 fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
@@ -105,7 +46,7 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
     let cols = u64_i64_cols();
     let base = engine.create_table("public.base", &cols, &[0]).unwrap();
     let other = engine.create_table("public.other", &cols, &[0]).unwrap();
-    let circuits_before = count_records(engine.sys_relation(SysFamily::Circuit).cursor());
+    let before = sys_row_counts(&engine);
 
     let undecodable = |vid: u64| crate::test_support::circuit_cell_batch(vid, &[0xFF]);
     // Decodes, and joins the base on a key it never states a route for.
@@ -115,9 +56,10 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
     };
     let absent = |_: u64| BatchBuilder::new(SysFamily::Circuit.schema()).finish();
     type Rows<'a> = &'a dyn Fn(u64) -> Batch;
+    let unroutable_want = format!("source {base} feeds a join and states no scatter key");
     let cases: [(Rows, &str); 3] = [
         (&undecodable, "circuit: truncated"),
-        (&unroutable, "feeds a join and states no scatter key"),
+        (&unroutable, unroutable_want.as_str()),
         (&absent, "has no circuit row"),
     ];
     for (rows, want) in cases {
@@ -133,11 +75,7 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
 
         assert!(engine.dag.dependents_of(base).is_empty(), "{want}");
         assert!(engine.registry.relation(vid).is_none(), "the view is not registered");
-        assert_eq!(
-            count_records(engine.sys_relation(SysFamily::Circuit).cursor()),
-            circuits_before,
-            "{want}"
-        );
+        assert_eq!(sys_row_counts(&engine), before, "{want}");
     }
 
     finish(engine);

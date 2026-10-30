@@ -24,14 +24,11 @@ mod wide_pk_validation;
 
 use std::fs;
 
-use gnitz_store::relation::{
-    relation_dir, ChildKind, IndexClaim, Relation, RelationKind, RelationSpec, SecondaryIndex, StoreConfig,
-};
+use gnitz_store::relation::{relation_dir, ChildKind, IndexClaim, Relation, RelationKind, SecondaryIndex, StoreConfig};
 use gnitz_wire::{
     payload_u64, CatalogColumn, Circuit, ColTabRow, NullKeys, PkColList, ReindexRole, SysRow, TableTabRow, TypeCode,
     ViewTabRow, PK_LIST_PACKED_FLAG,
 };
-use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
 
 use super::sys_tables::*;
@@ -55,10 +52,11 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::
 
 use crate::test_support::{
     apply_ddl, bundle, circuit_batch, cmp_all, col_def, col_tab_batch, cols_of, distinct_circuit, equi_join_circuit,
-    fk_def, fk_def_on_delete, idx_tab_batch, left_join_engine, negate_chain, net_weight, nullable_def, opk_pk,
-    pk_payload_schema, push_and_tick, push_sys_row, read_rows, refusal, register_identity_view, scan_all,
-    schema_tab_batch, scratch_dir, sum_weights, sys_batch, table_engine, table_tab_batch, table_tab_row,
-    try_register_identity_view, try_register_view, two_term_join_circuit, uuid_def, view_blocks, view_tab_row, weights,
+    fk_child_cols, fk_def, fk_def_on_delete, fk_parent, idx_tab_batch, left_join_engine, negate_chain, net_weight,
+    nullable_def, opk_pk, pk_payload_schema, push_and_tick, push_sys_row, read_rows, refusal, register_full_pk,
+    register_identity_view, scan_all, schema_tab_batch, scratch_dir, sum_weights, sys_batch, table_engine,
+    table_tab_batch, table_tab_row, try_register_identity_view, try_register_view, two_term_join_circuit, uuid_def,
+    view_blocks, view_tab_row, weights,
 };
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
@@ -284,6 +282,13 @@ fn assert_round_publishes_nothing_reaching(mut engine: CatalogEngine, source: u6
 fn held(engine: &CatalogEngine, id: u64) -> (usize, i64) {
     let rel = engine.registry.relation(id).expect("a registered relation");
     (count_records(rel.cursor()), sum_weights(rel.cursor()))
+}
+
+/// Net weight of `tid`'s single index circuit.
+fn index_weight(engine: &CatalogEngine, tid: u64) -> i64 {
+    let entry = engine.registry.relation_or_err(tid).unwrap();
+    assert_eq!(entry.indexes().len(), 1, "one index circuit");
+    sum_weights(entry.indexes()[0].cursor())
 }
 
 /// Seal `source` and tick what the seal answers, as a worker's `Tick` does.

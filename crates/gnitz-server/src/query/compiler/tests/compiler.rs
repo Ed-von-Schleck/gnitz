@@ -51,28 +51,16 @@ fn an_output_schema_unequal_to_the_view_schema_is_rejected() {
 
 const BY_COL1: [OrderKey; 1] = [OrderKey { col: 1, desc: false, nulls_first: false }];
 
-fn aggs(op: AggFunc) -> Vec<AggDescriptor> {
-    vec![AggDescriptor { agg_op: op, col_idx: 1 }, AggDescriptor::COUNT_STAR]
+/// `op` of column 1 over the whole input, with the COUNT(*) every reduce carries.
+fn global(op: AggFunc) -> GroupAggs {
+    GroupAggs {
+        group_cols: vec![],
+        aggs: vec![AggDescriptor { agg_op: op, col_idx: 1 }, AggDescriptor::COUNT_STAR],
+    }
 }
 
-const SUM: Stage = |c, a| {
-    c.reduce(
-        a,
-        GroupAggs {
-            group_cols: vec![],
-            aggs: aggs(AggFunc::Sum),
-        },
-    )
-};
-const MIN: Stage = |c, a| {
-    c.reduce(
-        a,
-        GroupAggs {
-            group_cols: vec![],
-            aggs: aggs(AggFunc::Min),
-        },
-    )
-};
+const SUM: Stage = |c, a| c.reduce(a, global(AggFunc::Sum));
+const MIN: Stage = |c, a| c.reduce(a, global(AggFunc::Min));
 const TOP_N: Stage = |c, a| c.top_n(a, &[], &BY_COL1, 10, 5);
 const WINDOW: Stage = |c, a| {
     c.window(
@@ -83,15 +71,7 @@ const WINDOW: Stage = |c, a| {
     )
 };
 /// A reduce of each worker's slice: no exchange in front of it.
-const LOCAL_SUM: Stage = |c, a| {
-    c.reduce_local(
-        a,
-        GroupAggs {
-            group_cols: vec![],
-            aggs: aggs(AggFunc::Sum),
-        },
-    )
-};
+const LOCAL_SUM: Stage = |c, a| c.reduce_local(a, global(AggFunc::Sum));
 
 /// `build` over a scan of 10, compiled as worker `slot` into the view its
 /// unsplit, one-worker plan outputs: a split plan must write that layout too.

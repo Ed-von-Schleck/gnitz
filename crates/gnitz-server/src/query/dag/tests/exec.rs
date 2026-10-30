@@ -58,14 +58,26 @@ pub(super) fn base_rows(rows: &[(u64, i64, i64)]) -> Batch {
     make_batch(&make_schema_u64_i64(), rows)
 }
 
-/// A global `COUNT(*)` over `source`, a relation of the base's columns,
-/// registered as `name`; and its plan.
-pub(super) fn register_count(engine: &mut CatalogEngine, source: u64, name: &str) -> (u64, ReducePlan) {
+/// `COUNT(*)` over `source`, a relation of the base's columns, grouped by
+/// `group_cols`, registered as `name`; and its plan.
+pub(super) fn register_count(
+    engine: &mut CatalogEngine,
+    source: u64,
+    group_cols: &[u32],
+    name: &str,
+) -> (u64, ReducePlan) {
     let aggs = [AggDescriptor::COUNT_STAR];
-    let plan = ReducePlan::from_wire(&make_schema_u64_i64(), &[], &aggs, true).unwrap();
+    // Only a global reduce owes a ground row; `ReducePlan` refuses one on a grouped reduce.
+    let plan = ReducePlan::from_wire(&make_schema_u64_i64(), group_cols, &aggs, group_cols.is_empty()).unwrap();
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(source, ReadBound::None);
-    circuit.reduce(scan, GroupAggs { group_cols: vec![], aggs: aggs.to_vec() });
+    circuit.reduce(
+        scan,
+        GroupAggs {
+            group_cols: group_cols.to_vec(),
+            aggs: aggs.to_vec(),
+        },
+    );
     let view = try_register_view(engine, circuit, name, &cols_of(plan.output_schema()), 0, 0).unwrap();
     (view, plan)
 }
@@ -119,7 +131,7 @@ fn an_empty_tick_runs_every_round() {
     let (mut engine, base) = table_engine("dag_exec", "empty_rounds", 4, &u64_i64_cols());
     let once = register_identity_view(&mut engine, base, "once", &u64_i64_cols());
     for (source, name) in [(base, "count"), (once, "count_once")] {
-        register_count(&mut engine, source, name);
+        register_count(&mut engine, source, &[], name);
     }
     let mut host = EchoDrive::new(&mut engine);
     tick(&mut host, base, 1).unwrap();
@@ -133,7 +145,7 @@ fn an_empty_tick_runs_every_round() {
 fn an_empty_tick_lands_only_an_owed_ground_row() {
     let (mut engine, base) = table_engine("dag_exec", "empty_tick", 1, &u64_i64_cols());
     let once = register_identity_view(&mut engine, base, "once", &u64_i64_cols());
-    let (count, plan) = register_count(&mut engine, base, "count");
+    let (count, plan) = register_count(&mut engine, base, &[], "count");
     let ground = plan.ground_row().unwrap();
     let ground = zset_of(ground, ground.schema());
 
@@ -148,7 +160,7 @@ fn an_empty_tick_lands_only_an_owed_ground_row() {
 
     push_and_tick(&mut engine, base, base_rows(&[(1, 1, 10)]));
     assert_eq!(held(&mut engine, once), times(&[(1, 1, 10)], 1));
-    let (oracle, _) = register_count(&mut engine, base, "oracle");
+    let (oracle, _) = register_count(&mut engine, base, &[], "oracle");
     backfill(&mut engine, oracle).unwrap();
     assert_eq!(held(&mut engine, count), held(&mut engine, oracle));
     assert_ne!(held(&mut engine, count), ground);
