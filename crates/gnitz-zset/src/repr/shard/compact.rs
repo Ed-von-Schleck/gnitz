@@ -1,11 +1,5 @@
-//! Shard compaction: N-way merge of sorted shard files, by (PK, payload) or, for
-//! a skeleton merge, by PK alone, routed to per-guard output shards.
-//!
-//! [`GuardMerge::next`] merges the rows one guard owns → column-first scatter →
-//! one output batch, handed to the caller to write, one guard of a fold per
-//! call.
-//! The merge kernel itself is the shared [`run_merge`], which owns the merge
-//! order; this module only drives it and materializes survivors.
+//! Shard compaction: the N-way [`run_merge`] of sorted shard files, by (PK,
+//! payload) or, for a skeleton merge, by PK alone, one output guard at a time.
 
 use super::codebook::Codebook;
 use super::file::ShardWriteOpts;
@@ -90,18 +84,33 @@ pub struct GuardMerge {
     shards: Vec<Rc<MappedShard>>,
     /// Where the next window starts in each shard.
     starts: Vec<usize>,
+    /// Whether every run is a skeleton one.
+    skeleton: bool,
+    /// The schema every run is merged under.
+    out_schema: SchemaDescriptor,
 }
 
 impl GuardMerge {
     /// A merge over `shards` from their first rows, once each body matches its
-    /// checksum. Advises each mapping MADV_SEQUENTIAL.
-    pub fn begin(shards: Vec<Rc<MappedShard>>) -> Result<Self, StorageError> {
+    /// checksum. Every run is a skeleton one when `dehydrate` is set or any input
+    /// is a skeleton shard, whose rows carry no payload to write back.
+    pub fn begin(shards: Vec<Rc<MappedShard>>, dehydrate: bool) -> Result<Self, StorageError> {
+        let schema = *shards.first().expect("a guard merge has an input shard").schema();
+        debug_assert!(
+            shards.iter().all(|s| *s.schema() == schema),
+            "a guard merge's shards share one schema"
+        );
         for shard in &shards {
             shard.advise_sequential();
             shard.verify_body()?;
         }
-        let starts = vec![0; shards.len()];
-        Ok(GuardMerge { shards, starts })
+        let skeleton = dehydrate || shards.iter().any(|s| s.is_skeleton());
+        Ok(GuardMerge {
+            starts: vec![0; shards.len()],
+            shards,
+            skeleton,
+            out_schema: if skeleton { schema.pk_only() } else { schema },
+        })
     }
 
     /// The input shards.
@@ -114,31 +123,15 @@ impl GuardMerge {
         self.starts.iter().sum()
     }
 
-    /// Merge the next guard's window of each shard, its rows up to the first
-    /// `≥ until` (to its end when `None`), into one run, which knows whether it
-    /// is a skeleton run — one PK-only `(PK, Σweight)` row per key. `None` when
-    /// every row cancelled. Every run is a skeleton one when `dehydrate` is set
-    /// or any input is a skeleton shard: a skeleton row carries no payload to
-    /// write back full width. A skeleton merge runs under the PK-only schema,
-    /// where a key's rows are one element; every other merge is by (PK,
-    /// payload).
+    /// Merge the rows below `until` (all, when `None`) that earlier calls left
+    /// into one run; `None` when every row cancelled. Long values are coded under
+    /// `codebook` where given; those of a shard of the same table keep their codes.
     ///
-    /// The run's long values are coded under `codebook` where one is given: a
-    /// value of a shard of the same table keeps its codes, every other is coded.
-    ///
-    /// Panics where `until` would move a window back over rows an earlier call
-    /// merged. Out of line, so the merge is compiled once, here: inlined into a
-    /// caller, the payload comparator drops out of the merge loop.
+    /// Out of line: inlined into a caller, the payload comparator drops out of
+    /// the merge loop.
     #[inline(never)]
-    pub fn next<'a>(
-        &mut self,
-        until: Option<&[u8]>,
-        dehydrate: bool,
-        schema: &SchemaDescriptor,
-        codebook: Option<&'a Codebook>,
-    ) -> Option<GuardRun<'a>> {
-        let skeleton = dehydrate || self.shards.iter().any(|s| s.is_skeleton());
-        let out_schema = if skeleton { schema.pk_only() } else { *schema };
+    pub fn next<'a>(&mut self, until: Option<&[u8]>, codebook: Option<&'a Codebook>) -> Option<GuardRun<'a>> {
+        let (skeleton, out_schema) = (self.skeleton, &self.out_schema);
         let windows: Vec<Range<usize>> = self
             .shards
             .iter()
@@ -159,11 +152,11 @@ impl GuardMerge {
             .zip(&windows)
             .map(|(s, w)| s.window(w.clone()))
             .collect();
-        let survivors = run_merge(&shards, &out_schema, windows.iter().cloned());
+        let survivors = run_merge(&shards, out_schema, windows.iter().cloned());
         if survivors.is_empty() {
             return None;
         }
-        let set = UnifiedSet::of(&shards, &out_schema, windows);
+        let set = UnifiedSet::of(&shards, out_schema, windows);
         // A skeleton run holds no string.
         let codebook = codebook.filter(|_| !skeleton);
         let batch = set.materialize(&survivors, codebook);

@@ -434,7 +434,10 @@ impl ShardIndex {
             in_rows += e.shard.row_count();
             in_bytes += e.shard.file_len();
         }
-        let merge = GuardMerge::begin(shards.iter().map(|e| Rc::clone(&e.shard)).collect())?;
+        let merge = GuardMerge::begin(
+            shards.iter().map(|e| Rc::clone(&e.shard)).collect(),
+            fold.kind == CompactionKind::Dehydrate,
+        )?;
         self.running = Some(Running {
             merge,
             newest,
@@ -455,12 +458,9 @@ impl ShardIndex {
     fn step(&mut self) -> Result<u64, StorageError> {
         let mut run = self.running.take().expect("a fold is under way");
         let before = run.merge.rows_merged();
-        let dehydrate = run.fold.kind == CompactionKind::Dehydrate;
         let codebook = self.codebook.clone();
         let merged = run.merge.next(
             run.fold.keys.get(run.next + 1).map(PkBuf::pk_bytes),
-            dehydrate,
-            &self.schema,
             codebook.as_deref(),
         );
         // Row share stands in for byte share.
@@ -583,7 +583,7 @@ impl ShardIndex {
                 return split;
             }
             if self.levels[L0].entries().count() > L0_COMPACT_THRESHOLD || self.l0_cancels() {
-                return Some(self.plan_l0_fold());
+                return self.plan_l0_fold();
             }
             let merge = [L1, TERMINAL].into_iter().find_map(|level| self.plan_merge(level));
             if merge.is_some() {
@@ -612,11 +612,10 @@ impl ShardIndex {
                         return Some(fold);
                     }
                 }
-                None if !self.levels[L0].guards.is_empty() => return Some(self.plan_l0_fold()),
-                // Everything is at the terminal level and dehydrated: the
-                // skeleton floor, below which a sweep cannot go, however far
-                // over its capacity the store is.
-                None => return None,
+                // With L0 empty too, everything is at the terminal level and
+                // dehydrated: the skeleton floor, below which a sweep cannot go,
+                // however far over its capacity the store is.
+                None => return self.plan_l0_fold(),
             }
         }
     }
@@ -626,16 +625,19 @@ impl ShardIndex {
         guards.into_iter().flat_map(|g| &g.entries).map(|e| e.seq).collect()
     }
 
-    /// All of L0 into L1's guards. Observing `R` first is what makes the targets
-    /// reflect the fold this plans.
-    fn plan_l0_fold(&mut self) -> Fold {
+    /// All of L0 into L1's guards; `None` while L0 is empty. Observing `R` first
+    /// is what makes the targets reflect the fold this plans.
+    fn plan_l0_fold(&mut self) -> Option<Fold> {
+        if self.levels[L0].guards.is_empty() {
+            return None;
+        }
         self.l0_run_bytes = self.l0_run_bytes.max(self.levels[L0].bytes());
-        Fold {
+        Some(Fold {
             kind: CompactionKind::L0Fold,
             sources: Self::seqs(&self.levels[L0].guards),
             dest: L1,
             keys: self.l1_guard_keys(),
-        }
+        })
     }
 
     /// The largest a guard of `level_idx` is allowed to get: `R`, so no

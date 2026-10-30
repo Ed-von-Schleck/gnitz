@@ -35,13 +35,13 @@ fn for_compaction_bench() {
         let guard_keys: Vec<PkBuf> = (0..guards)
             .map(|g| PkBuf::from_bytes(&((g * per / guards) as u64).to_be_bytes()))
             .collect();
-        let mut merge = GuardMerge::begin(inputs).unwrap();
+        let mut merge = GuardMerge::begin(inputs, skeleton).unwrap();
         let ((rows, i), c) = cycles.measure(|| {
             instructions.measure(|| {
                 (0..guard_keys.len())
                     .filter_map(|g| {
                         let until = guard_keys.get(g + 1).map(PkBuf::pk_bytes);
-                        merge.next(until, skeleton, &schema, None)
+                        merge.next(until, None)
                     })
                     .map(|run| black_box(run).row_count())
                     .sum::<usize>()
@@ -104,9 +104,9 @@ fn distinct_compaction_bench() {
                 .zip(builders)
                 .map(|(s, b)| map_shard(&dir.path().join(format!("{pk}_{deal}_{s}.db")), &b.finish()))
                 .collect();
-            let mut merge = GuardMerge::begin(inputs.clone()).unwrap();
+            let mut merge = GuardMerge::begin(inputs.clone(), false).unwrap();
             let ((), whole) = instructions.measure(|| {
-                let run = merge.next(None, false, &schema, None).unwrap();
+                let run = merge.next(None, None).unwrap();
                 let batch = run.plain().unwrap();
                 assert_eq!(batch.len() as u64, TOTAL);
                 black_box(batch);

@@ -14,17 +14,12 @@ use std::rc::Rc;
 
 /// Every `(guard_key, skeleton, batch)` a [`GuardMerge`] answers over
 /// `guards` in order.
-fn route(
-    shards: &[Rc<MappedShard>],
-    guards: &[PkBuf],
-    dehydrate: bool,
-    schema: &SchemaDescriptor,
-) -> Vec<(PkBuf, bool, Batch)> {
-    let mut merge = GuardMerge::begin(shards.to_vec()).unwrap();
+fn route(shards: &[Rc<MappedShard>], guards: &[PkBuf], dehydrate: bool) -> Vec<(PkBuf, bool, Batch)> {
+    let mut merge = GuardMerge::begin(shards.to_vec(), dehydrate).unwrap();
     (0..guards.len())
         .filter_map(|g| {
             let until = guards.get(g + 1).map(PkBuf::pk_bytes);
-            let run = merge.next(until, dehydrate, schema, None)?;
+            let run = merge.next(until, None)?;
             Some((
                 guards[g],
                 run.skeleton,
@@ -72,9 +67,9 @@ fn a_merge_refuses_a_corrupt_input() {
     let path = other.path().join("s.db");
     std::fs::write(&path, &image).unwrap();
     let corrupt = Rc::new(MappedShard::open(path.to_str().unwrap(), &schema).unwrap());
-    assert!(GuardMerge::begin(vec![Rc::clone(&intact)]).is_ok());
+    assert!(GuardMerge::begin(vec![Rc::clone(&intact)], false).is_ok());
     assert_eq!(
-        GuardMerge::begin(vec![intact, corrupt]).err(),
+        GuardMerge::begin(vec![intact, corrupt], false).err(),
         Some(StorageError::Corrupt("body checksum"))
     );
 }
@@ -87,9 +82,9 @@ fn a_descending_guard_key_panics() {
     let schema = make_schema_u64_i64();
     let rows: Vec<(u64, i64, i64)> = (1..=100).map(|i| (i, 1, i as i64)).collect();
     let shard = map_shard(&dir.path().join("s.db"), &make_batch(&schema, &rows));
-    let mut merge = GuardMerge::begin(vec![shard]).unwrap();
-    assert!(merge.next(Some(&60u64.to_be_bytes()), false, &schema, None).is_some());
-    merge.next(Some(&30u64.to_be_bytes()), false, &schema, None);
+    let mut merge = GuardMerge::begin(vec![shard], false).unwrap();
+    assert!(merge.next(Some(&60u64.to_be_bytes()), None).is_some());
+    merge.next(Some(&30u64.to_be_bytes()), None);
 }
 
 proptest! {
@@ -115,6 +110,7 @@ proptest! {
             .enumerate()
             .map(|(i, b)| map_shard(&dir.path().join(format!("{i}.db")), b))
             .collect();
+        prop_assume!(!shards.is_empty());
 
         // Guard keys drawn from the rows' own keys, so boundaries land on live
         // PK groups; `below_all` adds one under every key, leaving guard 0 empty.
@@ -141,7 +137,7 @@ proptest! {
         // positive integral guarantees; these rows carry no such guarantee.
         let skeleton = dehydrate && (0..keys.len()).all(|g| per_pk(g).values().all(|&w| w >= 0));
 
-        let mut emitted = route(&shards, &keys, skeleton, &s).into_iter().peekable();
+        let mut emitted = route(&shards, &keys, skeleton).into_iter().peekable();
         for (g, &key) in keys.iter().enumerate() {
             let what = format!("guard {g} (skeleton {skeleton})");
             let want_skeleton: Vec<(Vec<u8>, i64)> = per_pk(g).into_iter().filter(|&(_, w)| w != 0).collect();
@@ -177,7 +173,6 @@ fn a_skeleton_input_makes_every_output_a_skeleton() {
         &[map_shard(&dir.path().join("a.db"), &hydrated)],
         &[PkBuf::zeroed(8)],
         true,
-        &schema,
     )[..] else {
         panic!("one skeleton output");
     };
@@ -198,7 +193,7 @@ fn a_skeleton_input_makes_every_output_a_skeleton() {
     );
 
     let guards = [PkBuf::zeroed(8), PkBuf::from_bytes(&5u64.to_be_bytes())];
-    let out = route(&[skeleton, fresh], &guards, false, &schema);
+    let out = route(&[skeleton, fresh], &guards, false);
     let rows: Vec<(bool, Vec<(u64, i64)>)> = out
         .iter()
         .map(|(_, skel, b)| {
@@ -261,9 +256,9 @@ fn a_coded_merge_keeps_the_codes_of_its_own_table() {
         map_shard(&dir.path().join("retracted.db"), &retracted),
     ];
 
-    let merge = || GuardMerge::begin(shards.to_vec()).unwrap();
-    let plain = merge().next(None, false, &schema, None).unwrap();
-    let coded = merge().next(None, false, &schema, Some(&book)).unwrap();
+    let merge = || GuardMerge::begin(shards.to_vec(), false).unwrap();
+    let plain = merge().next(None, None).unwrap();
+    let coded = merge().next(None, Some(&book)).unwrap();
     let plain = plain.plain().unwrap();
     let want = string_rows(plain, |r| plain.get_weight(r));
     assert_eq!(want.len(), 250 + 280 + 300);

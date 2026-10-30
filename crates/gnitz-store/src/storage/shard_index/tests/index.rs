@@ -3,7 +3,7 @@ use super::super::*;
 use super::Fold;
 use crate::storage::Cut;
 use crate::test_support::{
-    make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_payload_schema,
+    make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, mix, pk_payload_schema,
 };
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -66,8 +66,9 @@ impl ShardIndex {
 
     /// The L0 fold, whether or not L0 is over its threshold, then [`Self::drain`].
     fn run_compact(&mut self) -> Result<(), StorageError> {
-        let fold = self.plan_l0_fold();
-        self.run(fold)?;
+        if let Some(fold) = self.plan_l0_fold() {
+            self.run(fold)?;
+        }
         self.drain()
     }
 
@@ -119,7 +120,7 @@ fn test_batch(pks: &[u64], values: &[i64]) -> Batch {
 /// A payload for row `i` that spans the whole I64 range across a batch, so the
 /// writer cannot pack the column and a fixture's bytes follow from its rows.
 pub(super) fn spread(i: u64) -> i64 {
-    i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as i64
+    mix(i) as i64
 }
 
 /// [`spread`]'s ascending twin, for the rows of one key: payloads sort a batch.
@@ -1238,7 +1239,7 @@ fn a_jump_in_r_is_merged_within_each_calls_budget() {
     for i in 0..5u64 {
         append_stable(&mut idx, 1_000_000 + i * 10_000);
     }
-    let fold = idx.plan_l0_fold();
+    let fold = idx.plan_l0_fold().expect("L0 holds the spills");
     idx.run(fold).unwrap();
     let r = idx.l0_run_bytes;
     assert!(r > 2 * MIN_GUARD_BYTES, "premise: R jumped past the seeded guards");
