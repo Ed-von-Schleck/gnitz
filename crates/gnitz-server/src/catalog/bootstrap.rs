@@ -3,6 +3,7 @@ use std::rc::Rc;
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder};
+use rustc_hash::FxHashSet;
 
 use super::relations::{CatalogCacheSet, RelationEntry};
 use super::sys_tables::SysFamily;
@@ -35,6 +36,7 @@ impl UnreplayedCatalog {
         let mut engine = self.0;
         engine.load_sequence_scalars();
         engine.replay_catalog()?;
+        engine.id_floor = engine.next_id;
         // Relay each base table onto the launched worker count and drop the children
         // no relation owns any more before the verdict reads every launched rank's
         // manifests — here, where no worker exists yet.
@@ -63,6 +65,8 @@ impl CatalogEngine {
             dag: DagEngine::default(),
             caches: CatalogCacheSet::default(),
             next_id: gnitz_wire::FIRST_USER_TABLE_ID,
+            id_floor: gnitz_wire::FIRST_USER_TABLE_ID,
+            used_ids: FxHashSet::default(),
             system_zone: 0,
             resume_at: None,
         };

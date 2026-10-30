@@ -179,26 +179,60 @@ fn a_dropped_relations_id_is_not_handed_out_again() {
     finish(engine);
 }
 
-/// A DDL may name an id a dropped relation held; the relation it registers
-/// there has a registration of its own.
+/// A dropped relation's id is spent: a create under it is refused rather than
+/// registered over the dropped relation's store.
 #[test]
-fn a_relation_created_again_under_its_id_is_a_new_registration() {
-    let dir = temp_dir("recreated_registration");
+fn a_dropped_relations_id_is_not_created_again() {
+    let dir = temp_dir("dropped_id_not_recreated");
     let cols = vec![col_def("id", TypeCode::U64)];
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let sid = engine.schema_id("public").unwrap();
     let tid = engine.create_table("public.again", &cols, &[0]).unwrap();
-    let first = engine.registration(tid).expect("registered");
     engine.submit_retraction(SysFamily::Table, tid).unwrap();
-    assert_eq!(engine.registration(tid), None);
 
-    apply_ddl(
+    let err = apply_ddl(
         &mut engine,
         table_blocks(tid, sid, "again", &cols, &[0], Default::default()),
     )
+    .unwrap_err();
+    assert!(err.contains("single-use"), "{err}");
+    assert!(engine.registry.relation(tid).is_none());
+    finish(engine);
+}
+
+/// An id handed out before this boot creates nothing; one a refused create
+/// named stays unspent, so its client may retry under it.
+#[test]
+fn an_id_allocated_before_this_boot_creates_nothing() {
+    let dir = temp_dir("id_before_boot");
+    let cols = vec![col_def("id", TypeCode::U64)];
+    let (sid, stale);
+    {
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+        sid = engine.schema_id("public").unwrap();
+        stale = engine.allocate_ids(1).unwrap();
+        engine.flush_all_system_tables().unwrap();
+        engine.close();
+    }
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let err = apply_ddl(
+        &mut engine,
+        table_blocks(stale, sid, "stale", &cols, &[0], Default::default()),
+    )
+    .unwrap_err();
+    assert!(err.contains("single-use"), "{err}");
+    assert!(engine.registry.relation(stale).is_none());
+
+    // A create refused past the id check leaves its id unspent.
+    let tid = engine.allocate_ids(1).unwrap();
+    let bad_pk = table_blocks(tid, sid, "fresh", &cols, &[5], Default::default());
+    apply_ddl(&mut engine, bad_pk).unwrap_err();
+    apply_ddl(
+        &mut engine,
+        table_blocks(tid, sid, "fresh", &cols, &[0], Default::default()),
+    )
     .unwrap();
-    let again = engine.registration(tid).expect("registered again");
-    assert_ne!(again, first);
+    assert!(engine.registry.relation(tid).is_some());
     finish(engine);
 }
 

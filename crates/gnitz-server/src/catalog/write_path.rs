@@ -142,16 +142,21 @@ impl CatalogEngine {
     }
 
     /// Apply one `DDL_TXN` bundle, laying each group out through `sink` before it
-    /// is applied, and answer what it did. A bundle that fails is undone here:
-    /// `Refused` leaves the catalog as it was.
+    /// is applied, and answer what it did; the ids it created are spent. A bundle
+    /// that fails is undone here: `Refused` leaves the catalog as it was, its ids
+    /// unspent.
     pub(crate) fn apply_bundle(
         &mut self,
         families: DdlBundle,
         sink: &mut ZoneSink<'_>,
     ) -> Result<AppliedDdl, ZoneError> {
         let mut zone = Vec::new();
-        let Err(cause) = self.apply_families(families, &mut zone, sink) else {
-            return Ok(AppliedDdl::of(&zone));
+        let cause = match self.apply_families(families, &mut zone, sink) {
+            Ok(created) => {
+                self.used_ids.extend(created);
+                return Ok(AppliedDdl::of(&zone));
+            }
+            Err(cause) => cause,
         };
         // Newest first: a group's hook reads what the groups before it registered.
         let undone = zone
@@ -167,14 +172,15 @@ impl CatalogEngine {
     /// The cross-family guards, then each family through [`Self::submit`]. A bundle
     /// that creates is applied in [`SysFamily::ALL`] order, so every register hook
     /// finds the families it reads applied; one that only drops in the reverse, so
-    /// a dependent is retired first. On `Err`, `zone` holds what was applied.
+    /// a dependent is retired first. Answers the ids the bundle created; on `Err`,
+    /// `zone` holds what was applied.
     fn apply_families(
         &mut self,
         families: DdlBundle,
         zone: &mut Vec<ZoneGroup>,
         sink: &mut ZoneSink<'_>,
-    ) -> Result<(), WireFault> {
-        self.precheck_bundle(&families)?;
+    ) -> Result<Vec<u64>, WireFault> {
+        let created = self.precheck_bundle(&families)?;
         let mut ordered: Vec<(SysFamily, Batch)> = families.into_blocks().collect();
         if ordered.iter().all(|(_, b)| (0..b.len()).all(|i| b.get_weight(i) < 0)) {
             ordered.reverse();
@@ -182,7 +188,7 @@ impl CatalogEngine {
         for (family, batch) in ordered {
             self.submit(family, batch, zone, sink)?;
         }
-        Ok(())
+        Ok(created)
     }
 
     /// Ingest one delta, under its family's schema, into its family's store —

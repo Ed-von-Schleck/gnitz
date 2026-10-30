@@ -38,8 +38,6 @@ pub(in crate::catalog) struct RelationEntry {
     /// The token of [`CatalogEngine::resolve_answer`], once computed. Reset by
     /// every hook of a family that can change a RESOLVE answer.
     pub(in crate::catalog) token: Cell<Option<NonZeroU64>>,
-    /// See [`CatalogEngine::registration`]; set by [`CatalogCacheSet::enter`].
-    registration: u64,
 }
 
 impl RelationEntry {
@@ -49,7 +47,6 @@ impl RelationEntry {
             fks,
             serial,
             token: Cell::new(None),
-            registration: 0,
         }
     }
 }
@@ -65,13 +62,6 @@ impl CatalogEngine {
             .relations
             .get(&tid)
             .expect("every registered relation has an entry")
-    }
-
-    /// This process's serial number of the registration that entered `tid`:
-    /// distinct for every registration, so a relation dropped and created again
-    /// under its id has a new one. `None` for an unregistered id.
-    pub(crate) fn registration(&self, tid: u64) -> Option<u64> {
-        self.caches.relations.get(&tid).map(|e| e.registration)
     }
 
     /// `tid`'s relation and its named record; `None` for an unregistered id.
@@ -155,16 +145,11 @@ pub(in crate::catalog) struct CatalogCacheSet {
     pub(in crate::catalog) relations: FxHashMap<u64, RelationEntry>,
     /// Every [`RelationEntry::fks`] edge, keyed by its parent.
     fk_by_parent: FxHashMap<u64, Vec<FkEdge>>,
-    /// The registrations entered so far.
-    registrations: u64,
 }
 
 impl CatalogCacheSet {
-    /// Enter registered relation `id`'s entry under the next registration
-    /// serial, and index its FK edges by parent.
-    pub(in crate::catalog) fn enter(&mut self, id: u64, mut entry: RelationEntry) {
-        self.registrations += 1;
-        entry.registration = self.registrations;
+    /// Enter registered relation `id`'s entry, and index its FK edges by parent.
+    pub(in crate::catalog) fn enter(&mut self, id: u64, entry: RelationEntry) {
         for e in &entry.fks {
             self.fk_by_parent.entry(e.parent_tid).or_default().push(*e);
         }

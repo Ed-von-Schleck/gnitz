@@ -917,7 +917,7 @@ fn a_view_create_at_a_registered_table_id_is_refused() {
         [(SysFamily::View, sys_batch([(view_tab_row(tid, "v"), 1)]))],
     )
     .expect_err("a view create at a table's id must be refused");
-    assert!(err.contains(&format!("relation id {tid} already exists")), "{err}");
+    assert!(err.contains(&format!("{tid}")) && err.contains("single-use"), "{err}");
     assert!(engine.registry.relation(tid).is_some_and(|r| r.kind().is_base_table()));
 
     // In the same bundle as the TABLE_TAB create.
@@ -928,7 +928,7 @@ fn a_view_create_at_a_registered_table_id_is_refused() {
         (SysFamily::View, sys_batch([(view_tab_row(both, "both_v"), 1)])),
     ];
     let err = apply_ddl(&mut engine, blocks).expect_err("one bundle may not create one id as a table and a view");
-    assert!(err.contains(&format!("relation id {both} already exists")), "{err}");
+    assert!(err.contains(&format!("{both}")) && err.contains("single-use"), "{err}");
     assert!(engine.registry.relation(both).is_none());
     assert_eq!(
         engine.qualified_name_or_unknown(both),

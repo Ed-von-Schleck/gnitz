@@ -35,6 +35,7 @@ mod write_path;
 mod suites;
 
 use gnitz_store::relation::RelationRegistry;
+use rustc_hash::FxHashSet;
 
 use crate::query::DagEngine;
 use relations::CatalogCacheSet;
@@ -68,6 +69,13 @@ pub(crate) struct CatalogEngine {
     /// hands out. Boot raises it past every stored id; the precheck admits no id
     /// at or above it.
     pub(in crate::catalog) next_id: u64,
+    /// `next_id` as this boot's catalog replay left it: every id below it was
+    /// handed out by an earlier boot, whose connections are gone.
+    pub(in crate::catalog) id_floor: u64,
+    /// The ids a bundle this process committed created. With `id_floor` they
+    /// make a catalog object id single-use: the precheck admits a create under
+    /// neither.
+    pub(in crate::catalog) used_ids: FxHashSet<u64>,
     /// The newest SAL zone applied to the system families; every system flush
     /// records it as its replay floor.
     pub(in crate::catalog) system_zone: u64,

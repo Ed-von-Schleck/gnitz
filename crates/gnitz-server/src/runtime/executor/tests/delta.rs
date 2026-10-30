@@ -3,8 +3,6 @@ use std::io::Read;
 use super::*;
 use crate::runtime::reactor::test_support::make_reactor;
 use crate::runtime::test_support::try_poll_once;
-use crate::test_support::{apply_ddl, col_def, scratch_dir, table_blocks};
-use gnitz_wire::TypeCode;
 
 /// Trains queued for a connection reach the wire whole and in queue order
 /// behind the reply already corked, and are counted until the connection's
@@ -74,23 +72,13 @@ fn a_parked_sync_is_woken_by_what_it_watches_and_leaves_with_its_guard() {
     );
 }
 
-/// A view's cursor tag is of one registration: a relation dropped and created
-/// again under its id answers a cursor of the first as foreign.
+/// A view's cursor tag is of one (boot, view, spec): the same view under the
+/// same spec answers one tag, another view or spec another.
 #[test]
-fn a_cursor_tag_names_one_registration() {
+fn a_cursor_tag_names_one_view_and_spec() {
     let (feeds, _asks) = Feeds::new();
-    let cols = [col_def("id", TypeCode::U64)];
-    let mut engine = CatalogEngine::open(&scratch_dir("executor", "cursor_tag_registration"), 1).unwrap();
-    let sid = engine.schema_id("public").unwrap();
-    let tid = engine.allocate_ids(1).unwrap();
-    let create = || table_blocks(tid, sid, "t", &cols, &[0], Default::default());
-    apply_ddl(&mut engine, create()).unwrap();
-    let tag = feeds.cursor_tag(&engine, tid, b"spec");
-    assert_eq!(feeds.cursor_tag(&engine, tid, b"spec"), tag);
-
-    let [_, (family, row)] = create();
-    apply_ddl(&mut engine, [(family, row.negated())]).unwrap();
-    apply_ddl(&mut engine, create()).unwrap();
-    assert_ne!(feeds.cursor_tag(&engine, tid, b"spec"), tag);
-    engine.close();
+    let tag = feeds.cursor_tag(7, b"spec");
+    assert_eq!(feeds.cursor_tag(7, b"spec"), tag);
+    assert_ne!(feeds.cursor_tag(8, b"spec"), tag);
+    assert_ne!(feeds.cursor_tag(7, b"other"), tag);
 }

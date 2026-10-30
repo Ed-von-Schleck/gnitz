@@ -64,11 +64,11 @@ fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), Str
     Ok(())
 }
 
-/// Bootstrap-owned ids sit below the floor, and one at or above `next_id`, the
-/// id counter, was never allocated. Both are properties of the id space rather
-/// than of the mutation's shape, so they cover every sign: a `-1` drops a
-/// bootstrap row, a bare `+1` aliases a bootstrap id into the name indexes, and
-/// a pair renames one.
+/// Bootstrap-owned ids sit below [`gnitz_wire::FIRST_USER_TABLE_ID`], and one at
+/// or above `next_id`, the id counter, was never allocated. Both are properties
+/// of the id space rather than of the mutation's shape, so they cover every sign:
+/// a `-1` drops a bootstrap row, a bare `+1` aliases a bootstrap id into the name
+/// indexes, and a pair renames one.
 fn check_id_range(family: SysFamily, sig: &PkSignature, next_id: u64) -> Result<(), String> {
     let id = sig.leading;
     if id < gnitz_wire::FIRST_USER_TABLE_ID {
@@ -502,26 +502,45 @@ impl CatalogEngine {
     /// The cross-family rules of one `DDL_TXN` bundle: what no family's own arm
     /// can see, because each is prechecked against a catalog the bundle's other
     /// families have not reached yet. Run before the first family is applied, so
-    /// a rejection has written nothing.
-    pub(in crate::catalog) fn precheck_bundle(&self, families: &DdlBundle) -> Result<(), String> {
-        let creates = |f: SysFamily| {
-            families
-                .get(f)
-                .map(pk_signatures)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|s| s.shape() == PkShape::Create)
-                .map(|s| s.leading)
-        };
-        let created_views = IdSet::new(creates(SysFamily::View));
+    /// a rejection has written nothing. Answers the ids the bundle creates.
+    pub(in crate::catalog) fn precheck_bundle(&self, families: &DdlBundle) -> Result<Vec<u64>, String> {
+        let created = self.check_single_use(families)?;
+        let created_views = IdSet::new(families.creates(SysFamily::View));
         if let Some(cols) = families.get(SysFamily::Column) {
-            let created = IdSet::new(creates(SysFamily::Table).chain(created_views.ids().iter().copied()));
+            let created = IdSet::new(
+                families
+                    .creates(SysFamily::Table)
+                    .chain(created_views.ids().iter().copied()),
+            );
             self.check_column_owners(cols, &created, families.family_count() == 1)?;
         }
         if let Some(b) = families.get(SysFamily::Circuit) {
             check_circuit_rows(b, &created_views)?;
         }
-        Ok(())
+        Ok(created)
+    }
+
+    /// A create takes its id once, across every family that allocates ids from
+    /// the one counter: an id an earlier boot handed out, one a committed bundle
+    /// of this process created, or one the bundle creates twice is refused. So an
+    /// id never names two objects, and a create never reopens a dropped
+    /// relation's store. Answers the bundle's created ids.
+    fn check_single_use(&self, families: &DdlBundle) -> Result<Vec<u64>, String> {
+        let mut created: Vec<u64> = Vec::new();
+        for family in SysFamily::ALL.into_iter().filter(|f| f.allocates_ids()) {
+            for id in families.creates(family) {
+                // An id below the bootstrap floor is the shape check's refusal.
+                let earlier_boot = (gnitz_wire::FIRST_USER_TABLE_ID..self.id_floor).contains(&id);
+                if earlier_boot || self.used_ids.contains(&id) || created.contains(&id) {
+                    return Err(format!(
+                        "{} {id} was allocated before this boot or already used; ids are single-use",
+                        family.row_noun()
+                    ));
+                }
+                created.push(id);
+            }
+        }
+        Ok(created)
     }
 
     /// Every column record must name an owner this bundle creates (`created`) or
@@ -636,7 +655,7 @@ impl CatalogEngine {
     }
 
     /// TABLE_TAB / VIEW_TAB: on every live row the name rule and qualified-name
-    /// uniqueness; on a create also a free relation id and the rules of
+    /// uniqueness; on a create also the rules of
     /// [`Self::precheck_relation_create`]; and the DROP guards (FK children, view
     /// dependents). A rename pair's `+1` differs from the live row only in `name`
     /// (the pair mask plus the CAS), so it is not re-derived. The drop guards key
@@ -653,9 +672,6 @@ impl CatalogEngine {
         // The retired ids a relation of the same name takes over: an ALTER VIEW.
         let mut replaced: Vec<u64> = Vec::new();
         let creates = IdSet::new(sigs.iter().filter(|s| s.shape() == PkShape::Create).map(|s| s.leading));
-        if let Some(id) = creates.ids().iter().find(|&&id| self.registry.relation(id).is_some()) {
-            return Err(format!("relation id {id} already exists"));
-        }
         let rels: Vec<RelRow<'_>> = batch
             .live_rows()
             .map(|i| read_rel_row(family, batch, i))

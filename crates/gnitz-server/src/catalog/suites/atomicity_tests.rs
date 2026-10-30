@@ -131,44 +131,29 @@ fn a_recovered_row_raises_the_id_counter_past_its_id() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── DROP SCHEMA must not probe the table-keyed dep map ───────────────────────
+// ── A schema takes no relation's id ─────────────────────────────────────────
 
 #[test]
-fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
-    // A client chooses the id its SCHEMA_TAB row carries, so a schema id can equal
-    // a table id; dropping that schema must not read the table's dependents.
+fn a_schema_create_at_a_table_id_is_refused() {
+    // Schemas and relations draw from one id counter, so a schema row under a
+    // live table's id reuses a spent id; the table and its view stay as they are.
     let mut engine = fresh("atomicity_schema_id_collision");
 
-    // Table T (in schema `owner`) with a dependent view V → dep_map[T] = [V].
     engine.create_schema("owner").unwrap();
     let tid = engine
         .create_table("owner.t", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
     let vid = register_identity_view(&mut engine, tid, "v", &[col_def("id", TypeCode::U64)]);
-    assert_eq!(
-        engine.dag.dependents_of(tid),
-        &[vid][..],
-        "precondition: dependency edge T -> V must be present"
-    );
 
-    apply_ddl(
+    let err = apply_ddl(
         &mut engine,
         [(SysFamily::Schema, schema_tab_batch(&[(tid, "victim", 1)]))],
     )
-    .unwrap();
-    assert_eq!(
-        engine.schema_id("victim").expect("the schema exists"),
-        tid,
-        "test setup: victim schema id must collide with tid"
-    );
-
-    // The victim schema is empty and unrelated to T/V. Dropping it must
-    // succeed despite its id colliding with a table that has a dependent view.
-    engine.drop_schema("victim").unwrap();
-    assert!(
-        engine.schema_id("victim").is_none(),
-        "victim schema must be gone after a successful DROP SCHEMA"
-    );
+    .unwrap_err();
+    assert!(err.contains("single-use"), "{err}");
+    assert!(engine.schema_id("victim").is_none());
+    assert!(engine.registry.relation(tid).is_some_and(|r| r.kind().is_base_table()));
+    assert_eq!(engine.dag.dependents_of(tid), &[vid][..]);
 
     discard(engine);
 }

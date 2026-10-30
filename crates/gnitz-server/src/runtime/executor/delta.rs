@@ -18,7 +18,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::peer::Peer;
 use super::tick::fresh_read_lock;
 use super::{decode_fault, forward_scan, send_fault, send_msg, target_kind, Access, CatalogLock, Shared};
-use crate::catalog::CatalogEngine;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{PeerGone, SendBody, TrainLease};
@@ -94,7 +93,7 @@ fn poll_position(shared: &Shared, _catalog: &ReadGuard<CatalogLock>, item: Delta
              create the view WITH (delta = '<size>') to subscribe to it"
         )));
     }
-    let tag = shared.feeds.cursor_tag(&shared.cat(), tid, item.spec);
+    let tag = shared.feeds.cursor_tag(tid, item.spec);
     let Some(cursor) = item.from else {
         return PollPosition::Moved { tag };
     };
@@ -117,16 +116,11 @@ fn foreign_cursor(view: u64) -> WireFault {
     }
 }
 
-/// Whether `feed` still reads the view it was keyed under: the view exists, and
-/// is the registration its tag was taken of.
+/// Whether `feed` still reads the view it was keyed under: the view exists and
+/// resolves as it did. A view id is never created under twice, so that is the
+/// view its tag was taken of.
 fn feed_readable(shared: &Shared, feed: &Feed) -> Result<(), WireFault> {
-    let cat = shared.cat();
-    let view = feed.key.view;
-    target_kind(&cat, view, Access::Read)?;
-    if shared.feeds.cursor_tag(&cat, view.tid, &feed.key.spec) != feed.tag {
-        return Err(foreign_cursor(view.tid));
-    }
-    Ok(())
+    target_kind(&shared.cat(), feed.key.view, Access::Read).map(drop)
 }
 
 /// DELTA_POLL: read N views in one request, each from its own cursor to the
@@ -440,17 +434,15 @@ impl Feeds {
     }
 
     /// The cursor tag a delta reply of `view` carries: distinct for every (boot,
-    /// registration) and, with fair odds, every spec the view is read under — so
-    /// a cursor from another boot, from another view or a dropped one, or polled
-    /// under another spec is recognizably foreign. A registration is
-    /// [`CatalogEngine::registration`]; `spec` is the request's encoded bytes.
-    pub(super) fn cursor_tag(&self, cat: &CatalogEngine, view: u64, spec: &[u8]) -> u64 {
-        let registration = cat
-            .registration(view)
-            .expect("a cursor tag is taken of a registered view");
-        // splitmix64's finalizer, a bijection on u64: under one spec, two
-        // registrations of one boot never share a tag.
-        let mut z = registration.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    /// view) and, with fair odds, every spec the view is read under — so a cursor
+    /// from another boot or another view, or polled under another spec, is
+    /// recognizably foreign. A view id is never created under twice, so a dropped
+    /// view's cursor is refused as one of an unregistered relation. `spec` is the
+    /// request's encoded bytes.
+    pub(super) fn cursor_tag(&self, view: u64, spec: &[u8]) -> u64 {
+        // splitmix64's finalizer, a bijection on u64: under one spec, two views
+        // of one boot never share a tag.
+        let mut z = view.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         self.boot_nonce ^ (z ^ (z >> 31)) ^ gnitz_wire::checksum(spec)
@@ -518,11 +510,6 @@ impl Subscriptions {
             layout: item.reply_layout,
             spec: item.spec.to_vec(),
         };
-        // A feed of the view's earlier registration ends here.
-        let stale = feeds.live.borrow().get(&key).filter(|f| f.tag != tag).cloned();
-        if let Some(stale) = stale {
-            feeds.end(&stale, &foreign_cursor(item.view.tid));
-        }
         let feed = Rc::clone(feeds.live.borrow_mut().entry(key.clone()).or_insert_with(|| {
             Rc::new(Feed {
                 key,

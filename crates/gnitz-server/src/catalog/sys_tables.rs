@@ -199,6 +199,14 @@ impl DdlBundle {
         self.0.iter().flatten().count()
     }
 
+    /// The ids of the rows the bundle's `family` block creates.
+    pub(crate) fn creates(&self, family: SysFamily) -> impl Iterator<Item = u64> {
+        let sigs = self.get(family).map(pk_signatures).unwrap_or_default();
+        sigs.into_iter()
+            .filter(|s| s.shape() == PkShape::Create)
+            .map(|s| s.leading)
+    }
+
     /// The distinct `(owner, cols)` of every unique index the bundle's IDX_TAB
     /// block creates: the DDL driver's pre-flight input, read before the
     /// precheck. A row that does not decode is skipped; the precheck refuses the
