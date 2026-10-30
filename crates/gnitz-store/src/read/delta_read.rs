@@ -14,7 +14,7 @@ use gnitz_zset::repr::Batch;
 impl RelationRegistry {
     /// `spec` applied to every delta `id`'s feed recorded in the rounds after
     /// `after_tick`; `after_tick = 0` reads the view's own output store
-    /// instead. A cursor below the retained floor is refused as
+    /// instead. A cursor below the floor `Feed::rounds` applies is refused as
     /// [`WireStatus::DeltaExpired`]; every other refusal is `Error`.
     pub fn delta_read(
         &self,
@@ -50,23 +50,20 @@ impl RelationRegistry {
         // Before the floor: a layout no cursor could have been handed is a bad
         // request, not an expired one.
         check_layout(reply_layout, plan.output_schema())?;
-        let dropped_through = feed.dropped_through();
-        // A cursor at the floor has lost nothing.
-        if after_tick < dropped_through {
+        let Some(mut rounds) = feed.rounds(after_tick) else {
             return Err(WireFault {
                 status: WireStatus::DeltaExpired,
                 text: format!(
                     "delta cursor {after_tick} of relation {id} is below the \
-                     retained floor {dropped_through}; re-read at 0"
+                     retained floor {}; re-read at 0",
+                    feed.dropped_through()
                 ),
             });
-        }
-        let rounds = feed.rounds(after_tick);
+        };
         if whole {
-            let mut held = rounds.clone();
-            return Ok(match (held.next(), held.next()) {
+            return Ok(match rounds.len() {
                 // One round is the reply as it was captured.
-                (Some(only), None) => Rc::clone(only),
+                1 => Rc::clone(rounds.next().unwrap()),
                 _ => Rc::new(Batch::concat(&view, rounds.map(|round| round.as_mem_batch()))),
             });
         }

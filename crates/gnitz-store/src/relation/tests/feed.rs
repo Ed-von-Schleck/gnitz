@@ -7,8 +7,8 @@ fn round_of(rows: u64) -> Rc<Batch> {
     Rc::new(make_batch_raw(&schema, &rows).into_consolidated())
 }
 
-fn lens(feed: &Feed, after: u64) -> Vec<usize> {
-    feed.rounds(after).map(|b| b.len()).collect()
+fn lens(feed: &Feed, after: u64) -> Option<Vec<usize>> {
+    feed.rounds(after).map(|rounds| rounds.map(|b| b.len()).collect())
 }
 
 /// Against the whole history: a feed holds the longest run of the newest whole
@@ -51,7 +51,13 @@ fn a_feed_holds_its_newest_whole_rounds_within_budget() {
             assert_eq!(feed.bytes, held_now.iter().map(|m| m.2).sum::<usize>());
             let after = rng.gen_range(round + 2);
             let want: Vec<usize> = held_now.iter().filter(|m| after < m.0).map(|m| m.1).collect();
-            assert_eq!(lens(&feed, after), want, "seed {seed} after {after}");
+            match lens(&feed, after) {
+                None => assert!(after < floor, "seed {seed} after {after}: refused at the floor"),
+                Some(got) => {
+                    assert!(after >= floor, "seed {seed} after {after}: answered below the floor");
+                    assert_eq!(got, want, "seed {seed} after {after}");
+                }
+            }
         }
     }
 }

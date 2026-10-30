@@ -62,10 +62,15 @@ impl Feed {
         self.dropped_through
     }
 
-    /// The deltas of the rounds after `after`, oldest first.
-    pub(crate) fn rounds(&self, after: u64) -> impl Iterator<Item = &Rc<Batch>> + Clone {
+    /// The deltas of the rounds after `after`, oldest first; `None` when `after`
+    /// is below [`dropped_through`](Self::dropped_through), whose rounds are lost.
+    pub(crate) fn rounds(&self, after: u64) -> Option<impl ExactSizeIterator<Item = &Rc<Batch>> + Clone> {
+        // A cursor at the floor has lost nothing.
+        if after < self.dropped_through {
+            return None;
+        }
         let first = self.rounds.partition_point(|&(r, _)| r <= after);
-        self.rounds.range(first..).map(|(_, delta)| delta)
+        Some(self.rounds.range(first..).map(|(_, delta)| delta))
     }
 }
 
