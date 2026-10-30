@@ -47,7 +47,7 @@ macro_rules! lane_pred {
 
 /// The lanes as the `u64` they hold.
 #[inline(always)]
-fn unsigned<S: Simd>(_: S, v: i64x8<S>) -> u64x8<S> {
+fn unsigned<S: Simd>(v: i64x8<S>) -> u64x8<S> {
     v.bitcast()
 }
 
@@ -65,7 +65,7 @@ pub(crate) fn encode_f64(f: f64) -> i64 {
 
 /// The lanes as the `f64` image they hold.
 #[inline(always)]
-fn float<S: Simd>(_: S, v: i64x8<S>) -> f64x8<S> {
+fn float<S: Simd>(v: i64x8<S>) -> f64x8<S> {
     v.bitcast()
 }
 
@@ -76,10 +76,8 @@ fn non_negative<S: Simd>(simd: S, v: i64x8<S>) -> mask64x8<S> {
 
 lane_pred!(Eq, |x, y| x == y, |_simd, a, b| a.simd_eq(b));
 lane_pred!(GtSigned, |x, y| x > y, |_simd, a, b| a.simd_gt(b));
-lane_pred!(GtUnsigned, |x, y| (x as u64) > (y as u64), |simd, a, b| unsigned(
-    simd, a
-)
-.simd_gt(unsigned(simd, b)));
+lane_pred!(GtUnsigned, |x, y| (x as u64) > (y as u64), |_simd, a, b| unsigned(a)
+    .simd_gt(unsigned(b)));
 lane_pred!(
     /// An unsigned `x` against a signed `y`, as the three below: a negative `y`
     /// is below every `x`.
@@ -90,33 +88,29 @@ lane_pred!(
 lane_pred!(
     LtUnsignedSigned,
     |x, y| y >= 0 && (x as u64) < (y as u64),
-    |simd, a, b| non_negative(simd, b) & unsigned(simd, a).simd_lt(unsigned(simd, b))
+    |simd, a, b| non_negative(simd, b) & unsigned(a).simd_lt(unsigned(b))
 );
 lane_pred!(
     LeUnsignedSigned,
     |x, y| y >= 0 && (x as u64) <= (y as u64),
-    |simd, a, b| non_negative(simd, b) & unsigned(simd, a).simd_le(unsigned(simd, b))
+    |simd, a, b| non_negative(simd, b) & unsigned(a).simd_le(unsigned(b))
 );
 lane_pred!(
     /// IEEE comparison, as the two below: a NaN on either side is unordered,
     /// and `-0.0 == 0.0`.
     EqFloat,
     |x, y| decode_f64(x) == decode_f64(y),
-    |simd, a, b| float(simd, a).simd_eq(float(simd, b))
+    |_simd, a, b| float(a).simd_eq(float(b))
 );
-lane_pred!(GtFloat, |x, y| decode_f64(x) > decode_f64(y), |simd, a, b| float(
-    simd, a
-)
-.simd_gt(float(simd, b)));
-lane_pred!(GeFloat, |x, y| decode_f64(x) >= decode_f64(y), |simd, a, b| float(
-    simd, a
-)
-.simd_ge(float(simd, b)));
+lane_pred!(GtFloat, |x, y| decode_f64(x) > decode_f64(y), |_simd, a, b| float(a)
+    .simd_gt(float(b)));
+lane_pred!(GeFloat, |x, y| decode_f64(x) >= decode_f64(y), |_simd, a, b| float(a)
+    .simd_ge(float(b)));
 
 /// The lanes as keys whose signed order is `f64::total_cmp`'s over the `f64`
 /// images: a negative image's magnitude bits flipped.
 #[inline(always)]
-fn total_key<S: Simd>(_: S, v: i64x8<S>) -> i64x8<S> {
+fn total_key<S: Simd>(v: i64x8<S>) -> i64x8<S> {
     let sign: u64x8<S> = (v >> 63).bitcast();
     v ^ (sign >> 1).bitcast::<i64x8<S>>()
 }
@@ -125,7 +119,7 @@ lane_pred!(
     /// `f64::total_cmp` order, which tells `-0.0` from `0.0` and places a NaN.
     GtTotal,
     |x, y| decode_f64(x).total_cmp(&decode_f64(y)).is_gt(),
-    |simd, a, b| total_key(simd, a).simd_gt(total_key(simd, b))
+    |_simd, a, b| total_key(a).simd_gt(total_key(b))
 );
 
 /// The complement of `P`: one flip of each packed word, the vectors' masks
@@ -157,7 +151,7 @@ fn lanes<S: Simd>(simd: S, word: &[i64; 64], at: usize) -> i64x8<S> {
 /// each mask in at its own shift would be a reduction LLVM rebuilds in vector
 /// registers.
 #[inline(always)]
-fn mask_word<S: Simd>(_: S, mut mask: impl FnMut(usize) -> mask64x8<S>) -> u64 {
+fn mask_word<S: Simd>(mut mask: impl FnMut(usize) -> mask64x8<S>) -> u64 {
     let mut bits = 0u64;
     macro_rules! step {
         ($($at:literal)*) => {
@@ -185,7 +179,7 @@ pub(crate) fn pred_bits<P: LanePred>(level: Level, a: &[i64], b: &[i64], out: &m
 #[inline(always)]
 fn pred_bits_at<S: Simd, P: LanePred>(simd: S, a: &[i64], b: &[i64], out: &mut [u64]) {
     for ((w, a), b) in out.iter_mut().zip(a.as_chunks::<64>().0).zip(b.as_chunks::<64>().0) {
-        *w = P::FLIP ^ mask_word(simd, |at| P::vector(simd, lanes(simd, a, at), lanes(simd, b, at)));
+        *w = P::FLIP ^ mask_word(|at| P::vector(simd, lanes(simd, a, at), lanes(simd, b, at)));
     }
 }
 
@@ -199,7 +193,7 @@ pub(crate) fn truthy_bits(level: Level, src: &[i64], out: &mut [u64]) {
 fn truthy_bits_at<S: Simd>(simd: S, src: &[i64], out: &mut [u64]) {
     let zero = i64x8::splat(simd, 0);
     for (w, src) in out.iter_mut().zip(src.as_chunks::<64>().0) {
-        *w = !mask_word(simd, |at| lanes(simd, src, at).simd_eq(zero));
+        *w = !mask_word(|at| lanes(simd, src, at).simd_eq(zero));
     }
 }
 
@@ -230,7 +224,7 @@ pub(crate) fn in_set_bits(level: Level, a: &[i64], set: &[i64], out: &mut [u64])
 fn or_member_bits<S: Simd, const N: usize>(simd: S, a: &[i64], set: &[i64; N], out: &mut [u64]) {
     let set = set.map(|v| i64x8::splat(simd, v));
     for (w, a) in out.iter_mut().zip(a.as_chunks::<64>().0) {
-        *w |= mask_word(simd, |at| {
+        *w |= mask_word(|at| {
             let x = lanes(simd, a, at);
             set[1..].iter().fold(x.simd_eq(set[0]), |hit, &v| hit | x.simd_eq(v))
         });
@@ -258,7 +252,7 @@ pub(crate) fn null_bits(level: Level, rows: &[u8], cols: u64, out: &mut [u64]) {
 fn null_bits_at<S: Simd>(simd: S, blocks: &[[u8; 64 * 8]], cols: u64, out: &mut [u64]) {
     let (cols, zero) = (u64x8::splat(simd, cols), u64x8::splat(simd, 0));
     for (w, block) in out.iter_mut().zip(blocks) {
-        *w = !mask_word(simd, |at| {
+        *w = !mask_word(|at| {
             // `gnitz-wire` builds for little-endian hosts alone, so a row's
             // eight bytes are its word.
             let rows: u64x8<S> = u8x64::from_slice(simd, &block[at * 8..at * 8 + 64]).bitcast();

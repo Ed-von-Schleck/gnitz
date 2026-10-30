@@ -6,7 +6,7 @@ use crate::eval::Resolved;
 use crate::program::{FloatUnaryOp, IntUnaryOp};
 use crate::test_support::{
     f64s, filter_prog, i64s, int, make_string_view, pairs, passing_rows, row_strs, row_values, scalar_prog,
-    schema_pk_strings, text, verdicts, view, Col, TestView,
+    schema_pk_strings, text, verdicts, view, Col, TestView, PATTERNS,
 };
 use crate::{CalendarOp, CmpOp, LogicalInstr, ScalarEval};
 use crate::{SchemaColumn, SchemaDescriptor};
@@ -149,19 +149,7 @@ fn a_boolean_feeding_arithmetic_lands_in_regs() {
 /// on either side of a compound key, and from that key's second column.
 #[test]
 fn every_int_load_reads_its_value_from_either_region() {
-    const PATTERNS: [u64; 10] = [
-        0,
-        1,
-        0x7F,
-        0x80,
-        0xFF,
-        0x8000,
-        0x8000_0000,
-        1 << 63,
-        u64::MAX,
-        0x0123_4567_89AB_CDEF,
-    ];
-    for fi in fixed_ints() {
+    for fi in FixedInt::ALL {
         let tc = fi.type_code();
         let schema = SchemaDescriptor::new(
             &[
@@ -173,19 +161,19 @@ fn every_int_load_reads_its_value_from_either_region() {
             &[1, 2],
         );
         // Each column's value on the row holding `p`, distinct per slot.
-        let value = |col: u32, p: u64| if col == 3 { p.rotate_left(8) } else { p };
+        let value = |col: u32, p: u128| match col {
+            3 => u128::from((p as u64).rotate_left(8)),
+            _ => p,
+        };
         let mut view = TestView::for_schema(&schema, PATTERNS.len());
         for (row, &p) in PATTERNS.iter().enumerate() {
             for col in [0, 2, 3] {
-                view.set_native(&schema, row, col, value(col as u32, p).into());
+                view.set_native(&schema, row, col, value(col as u32, p));
             }
         }
         for col in [0, 2, 3] {
             let mut ev = scalar_prog(&schema, vec![LogicalInstr::LoadCol { col }], vec![]);
-            let want: Vec<Option<i64>> = PATTERNS
-                .iter()
-                .map(|&p| Some(fi.unpack(u128::from(value(col, p)))))
-                .collect();
+            let want: Vec<Option<i64>> = PATTERNS.iter().map(|&p| Some(fi.unpack(value(col, p)))).collect();
             assert_eq!(int_rows(&mut ev, &view), want, "{tc} column {col}");
         }
     }
@@ -329,11 +317,6 @@ fn float_unary_ops_match_ieee() {
     );
 }
 
-/// Every fixed-width integer type.
-fn fixed_ints() -> impl Iterator<Item = FixedInt> {
-    TypeCode::ALL.iter().filter_map(|&t| FixedInt::exact(t))
-}
-
 /// `CAST` to every integer type from either source signedness: the value
 /// survives iff the source reads it inside the target's range, and then keeps
 /// its register image. The corpus sits on both sides of every width's bounds.
@@ -353,7 +336,7 @@ fn int_cast_keeps_exactly_the_values_in_the_target_range() {
             TypeCode::U64 => i128::from(bits as u64),
             _ => i128::from(bits),
         };
-        for fi in fixed_ints() {
+        for fi in FixedInt::ALL {
             let (lo, hi) = fi.range();
             let got = ints(&[int(source, corpus.iter().copied())], |r| {
                 vec![LogicalInstr::IntCast { a: r[0], fi }]
@@ -401,7 +384,7 @@ fn float_to_int_truncates_then_range_checks() {
         f64::NEG_INFINITY,
         f64::NAN,
     ];
-    for fi in fixed_ints() {
+    for fi in FixedInt::ALL {
         let (lo, hi) = fi.range();
         let got = ints(&[f64s(corpus)], |r| vec![LogicalInstr::FloatToInt { a: r[0], fi }]);
         let want: Vec<Option<i64>> = corpus
@@ -632,7 +615,7 @@ fn payload_reads_name_each_slot_at_its_cell_width() {
         LogicalInstr::IsNull { col: 4, invert: false },
     ];
     let ev = scalar_prog(&schema, instrs, vec![]);
-    let prog = ev.ev().expect("an evaluated program").prog();
+    let prog = ev.prog();
     assert_eq!(*prog.payload_reads, [(0, 2), (1, 4), (2, 16)]);
 }
 
@@ -1378,9 +1361,6 @@ mod shapes {
         }
         fn pk_region(&self) -> (&[u8], usize) {
             self.0.pk_region()
-        }
-        fn blob(&self) -> &[u8] {
-            self.0.blob()
         }
     }
 

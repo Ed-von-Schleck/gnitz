@@ -82,24 +82,24 @@ impl LogicalProgram {
     ) -> Result<MapEval, ExprValidateErr> {
         let prog = self.resolve_program(in_schema, ReadAs::Value)?;
         let (moves, emits) = self.map_sinks(in_schema, out_schema)?;
-        let is_identity = self.is_identity_map(in_schema, out_schema);
+        // The map reproduces its input, with the input PK carried through: one
+        // layout on both sides, which fixes equal payload counts and types, and
+        // every slot copied from its own input slot. With no emits copy `i`
+        // writes slot `i`, and the program is never run, so instructions no
+        // sink reads do not count against it.
+        let is_identity = emits.is_empty()
+            && in_schema.same_layout(out_schema)
+            && moves
+                .copies()
+                .iter()
+                .enumerate()
+                .all(|(i, c)| c.src.payload_slot() == Some(i));
         Ok(MapEval {
             ev: Evaluator::new(prog),
             moves,
             emits,
             is_identity,
         })
-    }
-
-    /// Whether this program, run as a map from `in_schema` to `out_schema` with the input PK carried
-    /// through, reproduces its input: one layout on both sides, and the program copies each payload
-    /// column into its own slot and computes nothing.
-    pub(crate) fn is_identity_map(&self, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> bool {
-        in_schema.same_layout(out_schema)
-            && self.instrs().is_empty()
-            && self.sinks().iter().copied().eq(in_schema
-                .payload_columns()
-                .map(|(pi, _)| Sink::Col(in_schema.payload_col_idx(pi) as u32)))
     }
 
     /// Hold this map's sinks to its two schemas and say where each output slot

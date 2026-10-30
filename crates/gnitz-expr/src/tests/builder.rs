@@ -84,7 +84,7 @@ fn a_to_micros_over_a_constant_folds_unless_it_overflows() {
         to_micros(2)[..],
         [_, L::LoadConst { val: 172_800_000_000, unsigned: false }]
     ));
-    assert!(matches!(to_micros(i64::MAX)[..], [_, L::Calendar { .. }]));
+    assert!(matches!(to_micros(i64::from(i32::MAX))[..], [_, L::Calendar { .. }]));
 }
 
 /// Every integer-stored slot type takes the sink `slot_sink` builds, whatever the
@@ -99,8 +99,7 @@ fn a_slot_sink_resolves_into_its_slot_from_any_integer_source() {
         let Some(fi) = FixedInt::from_type_code(tc) else {
             continue;
         };
-        use FixedInt as F;
-        let same_width = [F::U8, F::I8, F::U16, F::I16, F::U32, F::I32, F::U64, F::I64]
+        let same_width = FixedInt::ALL
             .into_iter()
             .find(|other| other.width() == fi.width() && *other != fi)
             .expect("each width has a signed and an unsigned type");

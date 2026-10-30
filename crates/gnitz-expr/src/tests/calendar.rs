@@ -61,7 +61,7 @@ fn each_op_answers_its_calendar_anchor() {
     }
     assert_eq!(eval(C::ToMicros, d, false), (d * MICROS_PER_DAY, false));
     assert!(
-        eval(C::ToMicros, i64::MAX / 2, false).1,
+        eval(C::ToMicros, i64::from(i32::MAX), false).1,
         "a day count past i64 micros is NULL"
     );
 }

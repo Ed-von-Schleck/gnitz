@@ -7,8 +7,6 @@
 use gnitz_wire::KeyRange;
 
 use crate::batch::Evaluator;
-#[cfg(test)]
-use crate::batch::MorselOut;
 use crate::program::ReadAs;
 use crate::range::RangeMembership;
 #[cfg(test)]
@@ -210,19 +208,13 @@ pub(crate) trait Resolved {
     }
 
     fn null_regs(&self) -> u64 {
-        self.ev().map_or(0, |ev| ev.prog().null_regs())
+        self.ev().map_or(0, |ev| ev.prog().null_regs)
     }
 
     fn set_arm(&mut self, null_regs: u64, level: Level) {
         if let Some(ev) = self.ev_mut() {
             ev.set_arm(null_regs, level)
         }
-    }
-
-    fn eval_morsels(&mut self, mb: &dyn BatchView, start: usize, n: usize, f: impl FnMut(usize, &MorselOut<'_>)) {
-        self.ev_mut()
-            .expect("an evaluated program")
-            .eval_morsels(mb, start, n, f)
     }
 }
 

@@ -9,8 +9,8 @@ use crate::batch::MORSEL;
 use crate::eval::Resolved;
 use crate::simd::encode_f64;
 use crate::test_support::{
-    filter_prog, i64s, is_not_null_op, is_null_op, make_n_col_view, map_prog, map_rows, passing_rows, row_values,
-    scalar_prog, schema_pk, schema_pk_ints, verdicts, view, Cell, Col, TestView,
+    filter_prog, i64s, is_not_null_op, is_null_op, make_n_col_view, map_prog, map_rows, passing_rows, result_prog,
+    row_values, scalar_prog, schema_pk, schema_pk_ints, strings, verdicts, view, TestView,
 };
 use crate::SchemaDescriptor;
 use crate::{CmpOp, IntArithOp, LogicalInstr};
@@ -27,12 +27,7 @@ fn a_map_writes_its_computed_slots_and_moves_the_copied_null_bits() {
     let text_null = |row: usize| row.is_multiple_of(7);
     let (in_schema, mb) = view(&[
         i64s((0..n).map(|row| (!int_null(row)).then(|| int(row)))),
-        Col {
-            tc: TypeCode::String,
-            cells: (0..n)
-                .map(|row| (!text_null(row)).then(|| Cell::Str(text(row).into_bytes())))
-                .collect(),
-        },
+        strings((0..n).map(|row| (!text_null(row)).then(|| text(row).into_bytes()))),
     ]);
     let out_schema = schema_pk(
         &[
@@ -212,7 +207,7 @@ fn three_and_chain_matches_the_three_valued_reference() {
             LogicalInstr::BoolBinary { is_or: false, a: Reg(5), b: Reg(7) }, // r8 = r5 AND r7
         ];
         assert_eq!(
-            filter_prog(&schema, instrs.clone(), vec![]).prog().null_regs() == 0,
+            filter_prog(&schema, instrs.clone(), vec![]).null_regs() == 0,
             !nullable,
             "{label}: wrong arm"
         );
@@ -348,7 +343,7 @@ fn is_null_shapes_select_the_reference_rows() {
     ];
     for (name, instrs, reference) in shapes {
         let mut ev = filter_prog(&schema, instrs, vec![]);
-        assert_eq!(ev.prog().null_regs(), 0, "{name}: must resolve no nullable register");
+        assert_eq!(ev.null_regs(), 0, "{name}: must resolve no nullable register");
         for (arrangement, null_pred) in NULL_ARRANGEMENTS {
             let n = 70;
             let mb = make_n_col_view(&schema, n, |row, col| ((row + col) % 5) as i64, null_pred);
@@ -376,7 +371,7 @@ fn is_null_into_a_register_sink_reads_back_per_row() {
             vec![Sink::Reg(Reg(0))],
             vec![],
         );
-        assert_eq!(ev.prog().null_regs(), 0);
+        assert_eq!(ev.null_regs(), 0);
         for (arrangement, null_pred) in NULL_ARRANGEMENTS {
             let mb = make_n_col_view(&in_schema, n, |row, _| row as i64, null_pred);
             let want: Vec<(u64, Vec<Vec<u8>>)> = (0..n)
@@ -429,8 +424,8 @@ fn nullable_and_not_null_columns_side_by_side() {
         v.set_int(row, 1, row as i64);
         v.set_string(row, 2, if row % 3 == 0 { b"alpha" } else { b"zeta" });
         v.set_string(row, 3, if row % 2 == 0 { b"beta" } else { b"omega" });
-        v.set_payload(row, 4, &(row as f32).to_bits().to_le_bytes());
-        v.set_payload(row, 5, &(row as f32).to_bits().to_le_bytes());
+        v.set_int(row, 4, (row as f32).to_bits() as i64);
+        v.set_int(row, 5, (row as f32).to_bits() as i64);
     }
 
     let instrs = vec![
@@ -449,7 +444,7 @@ fn nullable_and_not_null_columns_side_by_side() {
         LogicalInstr::StrColCol { op: CmpOp::Lt, col_a: 4, col_b: 4 },
     ];
     let mut ev = scalar_prog(&schema, instrs, vec![b"m".to_vec()]);
-    assert_ne!(ev.prog().null_regs(), 0);
+    assert_ne!(ev.null_regs(), 0);
 
     // The rows each register must report NULL on.
     let want_null = |reg: usize, row: usize| match reg {
@@ -459,7 +454,7 @@ fn nullable_and_not_null_columns_side_by_side() {
         _ => false,
     };
     let mut seen = vec![vec![false; n]; 9];
-    ev.eval_morsels(&v, 0, n, |rel_start, out| {
+    ev.ev_mut().unwrap().eval_morsels(&v, 0, n, |rel_start, out| {
         for (reg, rows) in seen.iter_mut().enumerate() {
             out.for_each_null_row(reg, |i| rows[rel_start + i] = true);
         }
@@ -560,16 +555,14 @@ fn int_results_widen_by_the_result_registers_signedness() {
 fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
     use gnitz_wire::{key_image, KeyRange, PkColList};
     let schema = schema_pk_ints(1, true);
-    let v_gt_3 = crate::LogicalProgram::new(
+    let v_gt_3 = result_prog(
         vec![
             LogicalInstr::LoadCol { col: 1 },
             LogicalInstr::LoadConst { val: 3, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
-        vec![Sink::Reg(Reg(2))],
         vec![],
     )
-    .unwrap()
     .to_blob_bytes();
     let null = |row: usize| row.is_multiple_of(5);
     let walk = |col: u32, first, last| Some(KeyRange::new(PkColList::from_slice(&[col]), &[], first, last));

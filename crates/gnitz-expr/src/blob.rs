@@ -482,7 +482,7 @@ impl LogicalProgram {
 
 #[cfg(test)]
 #[path = "tests/blob.rs"]
-pub(crate) mod tests;
+mod tests;
 
 #[cfg(test)]
 #[path = "benches/blob.rs"]

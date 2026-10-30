@@ -69,58 +69,30 @@ impl RangeMembership {
                 }
             }
         }
+        // Clear the bit of every row whose image falls outside `lo ..= lo + span`,
+        // both bounds images of the column's own type.
         for &(loc, lo, span) in &self.bounds {
-            gnitz_wire::by_cell_width!(loc.size(), |T| and_column::<T, { size_of::<T>() }>(
-                words, mb, loc, lo, span
-            ))
-        }
-    }
-}
-
-/// An unsigned integer the width of a key column.
-trait KeyCell<const W: usize>: Copy + PartialOrd {
-    fn from_le(b: [u8; W]) -> Self;
-    fn from_be(b: [u8; W]) -> Self;
-    fn low(v: u128) -> Self;
-    fn sub(self, o: Self) -> Self;
-}
-
-macro_rules! key_cell {
-    ($($t:ty),*) => {$(
-        impl KeyCell<{ size_of::<$t>() }> for $t {
-            fn from_le(b: [u8; size_of::<$t>()]) -> Self { <$t>::from_le_bytes(b) }
-            fn from_be(b: [u8; size_of::<$t>()]) -> Self { <$t>::from_be_bytes(b) }
-            fn low(v: u128) -> Self { v as $t }
-            fn sub(self, o: Self) -> Self { self.wrapping_sub(o) }
-        }
-    )*};
-}
-key_cell!(u8, u16, u32, u64, u128);
-
-/// Clear the bit of every row whose image in column `loc` falls outside `lo ..= lo + span`,
-/// both images of the column's own type.
-fn and_column<C: KeyCell<W>, const W: usize>(
-    words: &mut [u64],
-    mb: &dyn BatchView,
-    loc: ColumnLocator,
-    lo: u128,
-    span: u128,
-) {
-    let span = C::low(span);
-    match loc {
-        // A PK column is stored as its image.
-        ColumnLocator::Pk { byte_off, .. } => {
-            let (region, stride) = mb.pk_region();
-            let lo = C::low(lo);
-            and_cells(words, region, stride, byte_off as usize, |c| {
-                C::from_be(c).sub(lo) <= span
-            });
-        }
-        // A payload column's image is its native value plus the sign bias.
-        ColumnLocator::Payload { slot, type_code, .. } => {
-            let col = mb.col_data(slot as usize, W);
-            let lo = C::low(lo.wrapping_sub(gnitz_wire::opk_bias(type_code)));
-            and_cells(words, col, W, 0, |c| C::from_le(c).sub(lo) <= span);
+            gnitz_wire::by_cell_width!(loc.size(), |T| {
+                const W: usize = size_of::<T>();
+                let span = span as T;
+                match loc {
+                    // A PK column is stored as its image.
+                    ColumnLocator::Pk { byte_off, .. } => {
+                        let (region, stride) = mb.pk_region();
+                        let lo = lo as T;
+                        and_cells::<W>(words, region, stride, byte_off as usize, |c| {
+                            T::from_be_bytes(c).wrapping_sub(lo) <= span
+                        })
+                    }
+                    // A payload column's image is its native value plus the sign bias.
+                    ColumnLocator::Payload { slot, type_code, .. } => {
+                        let lo = lo.wrapping_sub(gnitz_wire::opk_bias(type_code)) as T;
+                        and_cells::<W>(words, mb.col_data(slot as usize, W), W, 0, |c| {
+                            T::from_le_bytes(c).wrapping_sub(lo) <= span
+                        })
+                    }
+                }
+            })
         }
     }
 }

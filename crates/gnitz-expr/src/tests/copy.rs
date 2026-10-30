@@ -1,17 +1,19 @@
 use super::*;
 use gnitz_wire::TypeCode;
 
+/// A `U64` PK column at the start of the key.
+const PK: ColumnLocator = ColumnLocator::Pk {
+    byte_off: 0,
+    size: 8,
+    type_code: TypeCode::U64,
+};
+
 /// [`ColMoves`]' null words against a bit-by-bit move over a window spanning several
 /// blocks: a source that cannot carry a bit — a PK column or a NOT NULL slot —
 /// clears its slot.
 #[test]
 fn col_moves_carry_each_copied_null_bit_into_its_slot() {
     let payload = |slot: u8| ColumnLocator::Payload { slot, size: 8, type_code: TypeCode::I64 };
-    let pk = ColumnLocator::Pk {
-        byte_off: 0,
-        size: 8,
-        type_code: TypeCode::U64,
-    };
     let copies = |srcs: &[ColumnLocator]| -> Vec<ColCopy> {
         srcs.iter()
             .enumerate()
@@ -22,9 +24,9 @@ fn col_moves_carry_each_copied_null_bit_into_its_slot() {
     let nullable = 0b1101;
     let (src_start, dst_base) = (3, 5);
     for (srcs, shape) in [
-        (vec![pk, payload(1)], "Zero"),
+        (vec![PK, payload(1)], "Zero"),
         (vec![payload(0), payload(1), payload(2)], "Mask"),
-        (vec![payload(2), payload(0), pk, payload(3), payload(1)], "Permute"),
+        (vec![payload(2), payload(0), PK, payload(3), payload(1)], "Permute"),
     ] {
         let moves = ColMoves::new(copies(&srcs), nullable);
         for n in [0, 1, 255, 256, 257, 600] {
@@ -57,14 +59,9 @@ fn col_moves_carry_each_copied_null_bit_into_its_slot() {
 #[test]
 fn col_moves_name_the_string_slots_they_copy() {
     let payload = |slot: u8, type_code| ColumnLocator::Payload { slot, size: 16, type_code };
-    let pk = ColumnLocator::Pk {
-        byte_off: 0,
-        size: 8,
-        type_code: TypeCode::U64,
-    };
     let srcs = [
         payload(3, TypeCode::String),
-        pk,
+        PK,
         payload(0, TypeCode::U128),
         payload(5, TypeCode::Blob),
     ];

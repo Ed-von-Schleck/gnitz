@@ -9,7 +9,7 @@ use crate::simd::encode_f64;
 use crate::simd::Level;
 use crate::test_support::{
     bench_rows, filter_prog, filter_verdicts, in_set, int, make_n_col_view, make_string_view, map_prog, map_rows,
-    passing_rows, schema_pk, schema_pk_ints, schema_pk_strings, view, Cell, Col, Meter, TestView,
+    passing_rows, result_prog, schema_pk, schema_pk_ints, schema_pk_strings, strings, view, Meter, TestView,
 };
 use crate::{
     CalendarOp, CmpOp, ConstIdx, FloatArithOp, IntArithOp, LikePattern, LogicalInstr as L, LogicalInstr,
@@ -365,9 +365,7 @@ fn either_side_of_inline(row: usize, pi: usize) -> String {
 type Shape = (String, LogicalProgram, SchemaDescriptor);
 
 fn slot(name: impl Into<String>, instrs: Vec<LogicalInstr>, consts: Vec<Vec<u8>>, tc: TypeCode) -> Shape {
-    let result = Reg(instrs.len() as u16 - 1);
-    let prog = LogicalProgram::new(instrs, vec![Sink::Reg(result)], consts).unwrap();
-    (name.into(), prog, schema_pk(&[tc], true))
+    (name.into(), result_prog(instrs, consts), schema_pk(&[tc], true))
 }
 
 /// The kernels behind a computed column, each written through
@@ -656,11 +654,8 @@ fn expr_kernel_bench() {
     // learns, and a NULL in the first branch so the blend runs on the nullable
     // arm.
     let shuffled = |row: usize| (((row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) % 1000) as i64;
-    let string = |pi: usize, null: fn(usize) -> bool| Col {
-        tc: T::String,
-        cells: (0..n)
-            .map(|row| (!null(row)).then(|| Cell::Str(either_side_of_inline(row, pi).into_bytes())))
-            .collect(),
+    let string = |pi: usize, null: fn(usize) -> bool| {
+        strings((0..n).map(|row| (!null(row)).then(|| either_side_of_inline(row, pi).into_bytes())))
     };
     let (sel, sel_view) = view(&[
         int(T::I64, (0..n).map(shuffled)),

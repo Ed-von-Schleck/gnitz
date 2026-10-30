@@ -20,16 +20,28 @@ impl LikePattern {
     /// `sql` under `escape` (`None` = escaping disabled); `None` when `sql`
     /// ends in a live escape.
     pub fn encode(sql: &str, escape: Option<char>) -> Option<Self> {
-        let mut out = Vec::with_capacity(sql.len());
-        let mut chars = sql.chars();
+        Self::with_wildcards(sql, '%', '_', escape)
+    }
+
+    /// A shell glob: `*` matches any characters and `?` one; every other
+    /// character is itself.
+    pub fn glob(text: &str) -> Self {
+        Self::with_wildcards(text, '*', '?', None).expect("no escape character, so none dangles")
+    }
+
+    /// `text` with `many` as `ANY_MANY` and `one` as `ANY_ONE`, under `escape`, which is
+    /// tested before the wildcards; `None` when `text` ends in a live escape.
+    fn with_wildcards(text: &str, many: char, one: char, escape: Option<char>) -> Option<Self> {
+        let mut out = Vec::with_capacity(text.len());
+        let mut chars = text.chars();
         while let Some(c) = chars.next() {
             let lit = match c {
                 _ if Some(c) == escape => chars.next()?,
-                '%' => {
+                _ if c == many => {
                     out.push(ANY_MANY);
                     continue;
                 }
-                '_' => {
+                _ if c == one => {
                     out.push(ANY_ONE);
                     continue;
                 }
@@ -38,20 +50,6 @@ impl LikePattern {
             out.extend_from_slice(lit.encode_utf8(&mut [0; 4]).as_bytes());
         }
         Some(LikePattern(out))
-    }
-
-    /// A shell glob: `*` matches any characters and `?` one; every other
-    /// character is itself.
-    pub fn glob(text: &str) -> Self {
-        let mut out = Vec::with_capacity(text.len());
-        for c in text.chars() {
-            match c {
-                '*' => out.push(ANY_MANY),
-                '?' => out.push(ANY_ONE),
-                _ => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
-            }
-        }
-        LikePattern(out)
     }
 
     pub fn as_bytes(&self) -> &[u8] {

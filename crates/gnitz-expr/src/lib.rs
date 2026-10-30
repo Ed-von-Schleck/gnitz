@@ -40,7 +40,7 @@
 //! Client and engine compute these alike because they call the same code:
 //!
 //! - the ORDER BY ranking and the LIMIT/OFFSET weight-slot cut ([`RowRanking`],
-//!   [`WeightSlots`], [`cmp_order_keys`]);
+//!   [`WeightSlots`], [`order_locators`]);
 //! - a column copy and the null bits it moves ([`ColCopy`], [`ColMoves`]), and
 //!   a copy-only map ([`LogicalProgram::copy_cols`]);
 //! - a reduce's output key and layout ([`SchemaDescriptor::reduce_out_key`],

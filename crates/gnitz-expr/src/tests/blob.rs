@@ -282,9 +282,8 @@ fn from_regions_refuses_each_word_outside_its_region() {
 fn a_forged_selector_is_refused_at_decode() {
     use TypeCode as T;
     let code_of = |tcs: &[TypeCode]| tcs.iter().map(|&t| t.as_wire() as u32).collect::<Vec<_>>();
-    let int_targets: Vec<u32> = T::ALL
-        .iter()
-        .filter_map(|&t| FixedInt::exact(t))
+    let int_targets: Vec<u32> = FixedInt::ALL
+        .into_iter()
         .map(|fi| fi.type_code().as_wire() as u32)
         .collect();
     let i64_code = T::I64.as_wire() as u32;
@@ -323,7 +322,7 @@ fn a_forged_selector_is_refused_at_decode() {
 /// The number of [`LogicalInstr`] variants. A new variant stops the match below
 /// compiling until it is listed and counted.
 impl LogicalInstr {
-    pub(crate) const VARIANT_COUNT: usize = 45;
+    const VARIANT_COUNT: usize = 45;
 
     /// Exhaustive by construction — the compile error on a new variant is the
     /// whole point, so this must never gain a `_` arm.
@@ -383,7 +382,7 @@ impl LogicalInstr {
 /// Every instruction the decoder accepts over each opcode's selector word and a
 /// few operand shapes. Operands are distinct so a swapped pair cannot
 /// round-trip; 0/1 reach a flag word, `u32::MAX` SUBSTR's absent length.
-pub(crate) fn decodable_words() -> Vec<([u32; INSTR_WORDS], LogicalInstr)> {
+fn decodable_words() -> Vec<([u32; INSTR_WORDS], LogicalInstr)> {
     let shapes = [[11, 12, 13], [11, 0, 13], [11, 1, 13], [11, 12, u32::MAX]];
     ExprOp::ALL
         .iter()
@@ -415,6 +414,36 @@ fn every_decodable_instruction_round_trips_through_the_wire_form() {
         words.iter().all(|(w, _)| w[1] < 64),
         "a selector family reaches the sweep's last selector: widen the sweep"
     );
+}
+
+/// Every decodable instruction placed first reads only registers not yet
+/// written, so it is refused unless it reads none.
+#[test]
+fn every_register_operand_is_checked_read_before_write() {
+    use LogicalInstr as L;
+    for (_, x) in decodable_words() {
+        let reads_none = matches!(
+            x,
+            L::LoadCol { .. }
+                | L::LoadConst { .. }
+                | L::LoadNull
+                | L::IsNull { .. }
+                | L::StrColConst { .. }
+                | L::StrColCol { .. }
+                | L::LoadColStr { .. }
+                | L::LoadConstStr { .. }
+                | L::LoadNullStr
+        );
+        // Eight zero bytes are a well-formed entry of every pool kind.
+        let got = LogicalProgram::new(vec![x], vec![], vec![vec![0u8; 8]; 14]).err();
+        match reads_none {
+            true => assert_eq!(got, None, "{x:?}"),
+            false => assert!(
+                matches!(got, Some(ExprValidateErr::RegReadBeforeWrite { .. })),
+                "{x:?}: {got:?}"
+            ),
+        }
+    }
 }
 
 /// `LoadConst`'s `i64` is the one operand spanning two words: the split and the

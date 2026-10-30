@@ -1434,10 +1434,6 @@ impl<'a> BatchView for MemBatch<'a> {
     fn pk_region(&self) -> (&[u8], usize) {
         (MemBatch::pk(self), self.pk_stride())
     }
-    #[inline(always)]
-    fn blob(&self) -> &[u8] {
-        self.blob
-    }
 }
 
 /// A batch of `rows` rows, every one written in place by `write_fn` through a

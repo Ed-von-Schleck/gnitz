@@ -800,11 +800,6 @@ impl gnitz_expr::BatchView for ZSetBatch {
     fn pk_region(&self) -> (&[u8], usize) {
         (&self.pks.buf, self.pks.stride as usize)
     }
-
-    #[inline(always)]
-    fn blob(&self) -> &[u8] {
-        &self.blob
-    }
 }
 
 impl gnitz_expr::MapTarget for ZSetBatch {

@@ -3,8 +3,8 @@ use gnitz_wire::{FixedInt, TypeCode};
 use super::{ColKind, FloatUnaryOp, IntUnaryOp, ReadAs};
 use crate::eval::Resolved;
 use crate::test_support::{
-    is_not_null_op, is_null_op, make_n_col_view, make_string_view, row_values, scalar_prog, schema_pk, schema_pk_ints,
-    schema_pk_strings, verdicts,
+    in_set, is_not_null_op, is_null_op, make_n_col_view, make_string_view, result_prog, row_values, scalar_prog,
+    schema_pk, schema_pk_ints, schema_pk_strings, verdicts,
 };
 use crate::SchemaDescriptor;
 use crate::{
@@ -176,7 +176,7 @@ fn no_register_tracks_nulls_exactly_when_nothing_can_produce_one() {
     ];
     for (label, schema, instrs, want) in cases {
         let prog = scalar_prog(&schema, instrs, vec![b"m".to_vec()]);
-        assert_eq!(prog.prog().null_regs() == 0, want, "{label}");
+        assert_eq!(prog.null_regs() == 0, want, "{label}");
     }
 }
 
@@ -204,7 +204,7 @@ fn null_regs_holds_exactly_the_registers_that_can_be_null() {
     ];
     for (label, instrs, want) in cases {
         let prog = scalar_prog(&ints, instrs, vec![]);
-        assert_eq!(prog.prog().null_regs(), want, "{label}");
+        assert_eq!(prog.null_regs(), want, "{label}");
     }
 }
 
@@ -213,8 +213,7 @@ fn null_regs_holds_exactly_the_registers_that_can_be_null() {
 // ---------------------------------------------------------------------------
 
 /// Each refusal a client sees names what it refused: the count and the limit,
-/// the column and the type it holds against the kind the operator needs, or the
-/// PK column an operator cannot read.
+/// or the column and the type it holds against the kind the operator needs.
 #[test]
 fn a_validate_error_names_its_operands() {
     let regs = ExprValidateErr::TooManyRegs(66).to_string();
@@ -222,19 +221,17 @@ fn a_validate_error_names_its_operands() {
         regs.contains("66") && regs.contains(&crate::MAX_REGS.to_string()),
         "{regs}"
     );
-    for want in [ColKind::ScalarCol, ColKind::StringPayload] {
+    for want in [ColKind::ScalarCol, ColKind::StringCol] {
         let msg = ExprValidateErr::ColKindMismatch { col: 2, type_code: TypeCode::U128, want }.to_string();
         assert!(
             msg.contains("column 2") && msg.contains("U128") && msg.contains(&want.to_string()),
             "{msg}"
         );
     }
-    let msg = ExprValidateErr::ColNotPayload { col: 0 }.to_string();
-    assert!(msg.contains("column 0") && msg.contains("primary key"), "{msg}");
 }
 
-/// Each column-reading opcode's type rule over every type code, whether it
-/// reads a key column, and its refusal of a column past the schema.
+/// Each column-reading opcode's type rule over every type code, its verdict
+/// over the integer PK column, and its refusal of a column past the schema.
 #[test]
 fn each_column_opcode_admits_exactly_its_column_kinds() {
     use LogicalInstr as L;
@@ -265,7 +262,6 @@ fn each_column_opcode_admits_exactly_its_column_kinds() {
         over: fn(u32) -> LogicalInstr,
         mismatch: ColKind,
         accepts: &'static [TypeCode],
-        reads_pk: bool,
     }
     let rules = [
         Rule {
@@ -273,14 +269,12 @@ fn each_column_opcode_admits_exactly_its_column_kinds() {
             over: |col| L::LoadCol { col },
             mismatch: ColKind::ScalarCol,
             accepts: SCALARS,
-            reads_pk: true,
         },
         Rule {
             name: "LoadColStr",
             over: |col| L::LoadColStr { col },
-            mismatch: ColKind::StringPayload,
+            mismatch: ColKind::StringCol,
             accepts: STRS,
-            reads_pk: false,
         },
         Rule {
             name: "StrColConst",
@@ -289,9 +283,8 @@ fn each_column_opcode_admits_exactly_its_column_kinds() {
                 col,
                 const_idx: ConstIdx(0),
             },
-            mismatch: ColKind::StringPayload,
+            mismatch: ColKind::StringCol,
             accepts: STRS,
-            reads_pk: false,
         },
         Rule {
             name: "StrColCol a",
@@ -300,9 +293,8 @@ fn each_column_opcode_admits_exactly_its_column_kinds() {
                 col_a,
                 col_b: OTHER_STRING,
             },
-            mismatch: ColKind::StringPayload,
+            mismatch: ColKind::StringCol,
             accepts: STRS,
-            reads_pk: false,
         },
         Rule {
             name: "StrColCol b",
@@ -311,16 +303,14 @@ fn each_column_opcode_admits_exactly_its_column_kinds() {
                 col_a: OTHER_STRING,
                 col_b,
             },
-            mismatch: ColKind::StringPayload,
+            mismatch: ColKind::StringCol,
             accepts: STRS,
-            reads_pk: false,
         },
         Rule {
             name: "IsNull",
             over: |col| L::IsNull { col, invert: false },
             mismatch: ColKind::AnyCol,
             accepts: T::ALL,
-            reads_pk: true,
         },
     ];
     let validate = |tc: TypeCode, instr: LogicalInstr| {
@@ -343,9 +333,14 @@ fn each_column_opcode_admits_exactly_its_column_kinds() {
             };
             assert_eq!(validate(tc, (rule.over)(SUBJECT)), want, "{name} over {tc}");
         }
-        let want = match rule.reads_pk {
+        // `schema_pk`'s key column is a U64.
+        let want = match rule.accepts.contains(&T::U64) {
             true => Ok(()),
-            false => Err(ExprValidateErr::ColNotPayload { col: PK }),
+            false => Err(ExprValidateErr::ColKindMismatch {
+                col: PK,
+                type_code: T::U64,
+                want: rule.mismatch,
+            }),
         };
         assert_eq!(validate(T::I64, (rule.over)(PK)), want, "{name} over the PK");
         assert_eq!(
@@ -392,12 +387,7 @@ fn int_in_set_membership_over_every_pool_shape() {
         ),
     ] {
         let schema = schema_pk(&[col_tc], true);
-        let instrs = vec![
-            LogicalInstr::LoadCol { col: 1 },
-            LogicalInstr::IntInSet { value_reg: Reg(0), set_idx: ConstIdx(0) },
-        ];
-        let pool: Vec<i64> = pool;
-        let consts = vec![gnitz_wire::as_le_bytes(&pool).to_vec()];
+        let (instrs, consts) = in_set(pool.iter().copied());
         // One row per probe, then a NULL operand.
         let n = probes.len() + 1;
         let mb = make_n_col_view(
@@ -476,36 +466,6 @@ fn a_pool_entry_is_held_to_its_kind() {
     }
 }
 
-/// Every decodable instruction placed first reads only registers not yet
-/// written, so it is refused unless it reads none.
-#[test]
-fn every_register_operand_is_checked_read_before_write() {
-    use LogicalInstr as L;
-    for (_, x) in crate::blob::tests::decodable_words() {
-        let reads_none = matches!(
-            x,
-            L::LoadCol { .. }
-                | L::LoadConst { .. }
-                | L::LoadNull
-                | L::IsNull { .. }
-                | L::StrColConst { .. }
-                | L::StrColCol { .. }
-                | L::LoadColStr { .. }
-                | L::LoadConstStr { .. }
-                | L::LoadNullStr
-        );
-        // Eight zero bytes are a well-formed entry of every pool kind.
-        let got = LogicalProgram::new(vec![x], vec![], vec![vec![0u8; 8]; 14]).err();
-        match reads_none {
-            true => assert_eq!(got, None, "{x:?}"),
-            false => assert!(
-                matches!(got, Some(ExprValidateErr::RegReadBeforeWrite { .. })),
-                "{x:?}: {got:?}"
-            ),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Register classes
 // ---------------------------------------------------------------------------
@@ -543,12 +503,7 @@ fn operand_class_is_enforced_in_both_directions() {
 #[test]
 fn a_string_result_register_resolves_as_a_scalar_but_not_as_a_filter() {
     let schema = schema_pk_strings(1, true);
-    let prog = LogicalProgram::new(
-        vec![LogicalInstr::LoadColStr { col: 1 }],
-        vec![Sink::Reg(Reg(0))],
-        vec![],
-    )
-    .unwrap();
+    let prog = result_prog(vec![LogicalInstr::LoadColStr { col: 1 }], vec![]);
     assert_eq!(
         prog.resolve_filter(&schema).err(),
         Some(ExprValidateErr::RegClassMismatch { reg: 0 })

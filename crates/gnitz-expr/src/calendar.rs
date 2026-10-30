@@ -88,15 +88,6 @@ impl CalendarOp {
     }
 }
 
-/// `DATE → TIMESTAMP`: a day count as microseconds, `(0, true)` when the
-/// product leaves `i64`.
-fn days_to_micros(days: i64) -> (i64, bool) {
-    match days.checked_mul(MICROS_PER_DAY) {
-        Some(v) => (v, false),
-        None => (0, true),
-    }
-}
-
 /// Apply `op` to `v`: microseconds when `micros`, otherwise a DATE's day count
 /// read at its 32-bit storage width. The flag is set when the result is NULL,
 /// which only an op whose [`CalendarOp::may_null`] holds can raise; a
@@ -149,7 +140,7 @@ pub(crate) fn eval(op: CalendarOp, v: i64, micros: bool) -> (i64, bool) {
         C::TruncHour => v.saturating_sub(tod % MICROS_PER_HOUR),
         C::TruncMinute => v.saturating_sub(tod % MICROS_PER_MIN),
         C::TruncSecond => v.saturating_sub(tod % MICROS_PER_SEC),
-        C::ToMicros => return days_to_micros(v),
+        C::ToMicros => return days.checked_mul(MICROS_PER_DAY).map_or((0, true), |v| (v, false)),
         C::ToDays => days,
     };
     (val, false)

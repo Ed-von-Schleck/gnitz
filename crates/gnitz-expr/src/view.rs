@@ -13,11 +13,8 @@ use gnitz_wire::RowSource;
 /// The two shapes must address the same bytes; `debug_assert_coherent`
 /// states the equations and checks them in debug builds.
 ///
-/// [`RowSource`]'s per-row half deliberately has **no default bodies** off these:
-/// a default would make direct cell addressing opt-in, so deleting an override
-/// would still compile and still pass, silently costing a row-count load, a
-/// second multiply and a second range check per read in the debug build the
-/// E2E suite runs.
+/// A batch view's [`heap`](RowSource::heap) is [`Heap::Plain`](gnitz_wire::Heap::Plain):
+/// a batch holds its long values verbatim.
 pub trait BatchView: RowSource {
     /// Payload column `payload_col` in full (`rows * col_size` bytes, native LE).
     fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8];
@@ -25,8 +22,6 @@ pub trait BatchView: RowSource {
     fn null_bmp(&self) -> &[u8];
     /// The OPK PK region in full (`rows * stride` bytes) and its per-row stride.
     fn pk_region(&self) -> (&[u8], usize);
-    /// The heap in full: a batch holds its long values verbatim.
-    fn blob(&self) -> &[u8];
 }
 
 /// Assert that `row` of `mb` reads the same through both shapes, for the

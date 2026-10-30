@@ -67,7 +67,7 @@ impl TestView {
     }
 
     /// Write `native` into the low bytes of `row`'s cell in payload slot `pi`.
-    pub fn set_payload(&mut self, row: usize, pi: usize, native: &[u8]) {
+    fn set_payload(&mut self, row: usize, pi: usize, native: &[u8]) {
         let base = row * self.stride(pi);
         self.cols[pi][base..base + native.len()].copy_from_slice(native);
     }
@@ -104,7 +104,7 @@ impl TestView {
 
     /// A view whose row `i` is this one's row `source[i]`. A string cell keeps
     /// its heap offset, so the blob is shared verbatim.
-    pub fn tiled(&self, source: &[usize]) -> TestView {
+    fn tiled(&self, source: &[usize]) -> TestView {
         let copy = |src: &[u8], w: usize| -> Vec<u8> {
             source.iter().flat_map(|&r| &src[r * w..(r + 1) * w]).copied().collect()
         };
@@ -156,9 +156,6 @@ impl BatchView for TestView {
     fn pk_region(&self) -> (&[u8], usize) {
         (&self.pk, self.pk_stride)
     }
-    fn blob(&self) -> &[u8] {
-        &self.blob
-    }
 }
 
 impl MapTarget for TestView {
@@ -174,13 +171,13 @@ impl MapTarget for TestView {
 /// NULL.
 #[derive(Clone)]
 pub struct Col {
-    pub tc: TypeCode,
-    pub cells: Vec<Option<Cell>>,
+    tc: TypeCode,
+    cells: Vec<Option<Cell>>,
 }
 
 /// An integer, a float's bit pattern, or a string.
 #[derive(Clone)]
-pub enum Cell {
+enum Cell {
     Num(i64),
     Str(Vec<u8>),
 }
@@ -223,10 +220,12 @@ pub fn f64s<T: Into<Option<f64>>>(vals: impl IntoIterator<Item = T>) -> Col {
 }
 
 pub fn text<'a, T: Into<Option<&'a str>>>(vals: impl IntoIterator<Item = T>) -> Col {
-    let cells = vals
-        .into_iter()
-        .map(|v| v.into().map(|s| Cell::Str(s.as_bytes().to_vec())))
-        .collect();
+    strings(vals.into_iter().map(|v| v.into().map(|s| s.as_bytes().to_vec())))
+}
+
+/// A `STRING` column of each row's bytes, `None` for NULL.
+pub fn strings(cells: impl IntoIterator<Item = Option<Vec<u8>>>) -> Col {
+    let cells = cells.into_iter().map(|c| c.map(Cell::Str)).collect();
     Col { tc: TypeCode::String, cells }
 }
 
@@ -317,7 +316,7 @@ pub fn schema_pk_strings(n: usize, nullable: bool) -> SchemaDescriptor {
 }
 
 /// `instrs` as a program whose one register sink is its last instruction.
-fn result_prog(instrs: Vec<LogicalInstr>, const_strings: Vec<Vec<u8>>) -> LogicalProgram {
+pub(crate) fn result_prog(instrs: Vec<LogicalInstr>, const_strings: Vec<Vec<u8>>) -> LogicalProgram {
     let result = Reg(instrs.len() as u16 - 1);
     LogicalProgram::new(instrs, vec![Sink::Reg(result)], const_strings).expect("test program must validate")
 }
@@ -500,8 +499,7 @@ pub fn is_not_null_op(col: u32) -> LogicalInstr {
 /// Every instruction set [`crate::simd`]'s kernels can run at on this CPU: the
 /// one it reports, and below it the one the build targets when the two differ —
 /// the level a CPU without the wider set runs.
-pub(crate) fn simd_levels() -> Vec<(&'static str, crate::simd::Level)> {
-    use crate::simd::Level;
+pub(crate) fn simd_levels() -> Vec<(&'static str, Level)> {
     #[allow(unused_mut)]
     let mut levels = vec![("native", Level::new())];
     // A build that itself targets the wider set compiles no narrower kernel.
@@ -535,7 +533,7 @@ pub fn pairs<T: Copy>(corpus: &[T]) -> (Vec<T>, Vec<T>) {
 }
 
 /// One step of a xorshift generator over `state`: the deterministic stream the randomized
-/// tests and the benches draw from.
+/// tests draw from.
 pub(crate) fn xorshift(state: &mut u64) -> u64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
@@ -543,8 +541,8 @@ pub(crate) fn xorshift(state: &mut u64) -> u64 {
     *state
 }
 
-/// Key values that tie, that differ only in the low half of 16 bytes, and that
-/// cross each width's sign bit.
+/// Key values that tie, that differ only in the low half of 16 bytes, that cross
+/// each width's sign bit, and one whose every byte differs.
 pub(crate) const PATTERNS: &[u128] = &[
     0,
     1,
@@ -557,6 +555,7 @@ pub(crate) const PATTERNS: &[u128] = &[
     i64::MAX as u128,
     1 << 63,
     u64::MAX as u128,
+    0x0123_4567_89AB_CDEF,
     1 << 64,
     (1 << 64) + 1,
     i128::MAX as u128,
