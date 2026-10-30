@@ -49,7 +49,6 @@ def test_help_goes_to_stdout(flag):
     ("GNITZ_SCAN_CHUNK_ROWS", "3.0"),
     ("GNITZ_ADHOC_GROUP_CAP", "none"),
     ("GNITZ_CPU_AFFINITY", "off"),
-    ("GNITZ_DISABLE_IO_URING", "flase"),
     ("GNITZ_LOG_LEVEL", "verbos"),
     ("GNITZ_CASCADE_BYTES", "1MB"),
     ("GNITZ_FK_PRESENCE_KEYS", "-1"),

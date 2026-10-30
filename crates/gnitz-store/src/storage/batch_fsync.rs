@@ -5,7 +5,6 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::LazyLock;
 
 use io_uring::types::FsyncFlags;
 use io_uring::{opcode, types, IoUring};
@@ -15,13 +14,11 @@ use gnitz_zset::repr::StorageError;
 /// The fds one sync batch opens, and the ring's SQ size.
 const FD_CHUNK_THRESHOLD: usize = 256;
 
-/// Blocking fsync instead of io_uring: `GNITZ_DISABLE_IO_URING`, read once per
-/// process, or a host that denied `io_uring_setup`.
-static BLOCKING: LazyLock<AtomicBool> =
-    LazyLock::new(|| AtomicBool::new(gnitz_foundation::env::env_flag("GNITZ_DISABLE_IO_URING", false)));
+/// Blocking fsync instead of io_uring, set once this host denied
+/// `io_uring_setup`.
+static BLOCKING: AtomicBool = AtomicBool::new(false);
 
-/// The ring, or `None` for blocking fsync: where this host denies io_uring, or
-/// `GNITZ_DISABLE_IO_URING` is set.
+/// The ring, or `None` for blocking fsync where this host denies io_uring.
 fn new_ring() -> Result<Option<IoUring>, StorageError> {
     if BLOCKING.load(Relaxed) {
         return Ok(None);
