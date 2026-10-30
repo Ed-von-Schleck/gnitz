@@ -1,6 +1,7 @@
 use super::*;
 use gnitz_core::BatchAppender;
 use parquet::column::writer::ColumnWriter;
+use parquet::data_type::FixedLenByteArray;
 
 /// One column of every type, every other one nullable and NULL in odd rows,
 /// under a compound key of a signed and an unsigned column.

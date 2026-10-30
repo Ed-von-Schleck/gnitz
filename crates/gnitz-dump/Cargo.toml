@@ -16,6 +16,7 @@ integration = []
 [dependencies]
 bytes = "1"
 gnitz-core.workspace = true
+gnitz-foundation.workspace = true
 gnitz-expr.workspace = true
 gnitz-wire.workspace = true
 gnitz-sql.workspace = true
@@ -25,7 +26,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-gnitz-foundation.workspace = true
 gnitz-test-harness = { path = "../gnitz-test-harness" }
 tempfile.workspace = true
 

@@ -28,11 +28,6 @@ fn sample() -> Manifest {
 }
 
 #[test]
-fn a_manifest_reads_back_as_written() {
-    assert_eq!(Manifest::from_json(&sample().to_json()).unwrap(), sample());
-}
-
-#[test]
 fn another_format_or_version_is_refused() {
     let text = sample().to_json();
     for version in [0, VERSION + 1] {
@@ -44,7 +39,7 @@ fn another_format_or_version_is_refused() {
 }
 
 /// A version 1 manifest as a release wrote it, which every build restoring
-/// version 1 reads as [`sample`].
+/// version 1 reads as [`sample`], and which this build writes for it.
 const V1: &str = r#"{
   "format": "gnitz-dump",
   "version": 1,
@@ -80,6 +75,8 @@ const V1: &str = r#"{
 }"#;
 
 #[test]
-fn a_version_1_manifest_reads() {
+fn a_manifest_is_written_and_read_as_version_1() {
+    let written = V1.replace("\"0.1.0\"", &format!("\"{}\"", gnitz_wire::RELEASE));
+    assert_eq!(sample().to_json(), written);
     assert_eq!(Manifest::from_json(V1).unwrap(), sample());
 }

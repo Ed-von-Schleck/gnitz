@@ -1,6 +1,5 @@
 use super::*;
 use gnitz_core::BatchAppender;
-use gnitz_wire::ColType;
 
 /// Rows a bench table holds.
 const ROWS: usize = 1 << 20;
@@ -12,7 +11,7 @@ const GROUP: usize = gnitz_core::DEFAULT_PAGE_ROWS as usize;
 fn table(ty: ColType, nullable: bool) -> Arc<Schema> {
     let cols = vec![
         ColumnDef::new("id", TypeCode::I64, false),
-        ColumnDef::new("v".to_string(), ty, nullable),
+        ColumnDef::new("v", ty, nullable),
     ];
     Arc::new(Schema::from_parts(cols, &[0]).unwrap())
 }

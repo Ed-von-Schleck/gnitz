@@ -10,10 +10,10 @@ const FORMAT: &str = "gnitz-dump";
 /// Bumped by hand for any change to what a dump's files hold or how they are
 /// laid out; each version this build restores has its own arm in
 /// [`Manifest::from_json`].
-pub(crate) const VERSION: u64 = 1;
+const VERSION: u64 = 1;
 
 /// One base table or stream of a dump.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableEntry {
     pub(crate) schema: String,
     pub(crate) name: String,
@@ -26,14 +26,14 @@ pub(crate) struct TableEntry {
 }
 
 /// One view of a dump.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ViewEntry {
     pub(crate) schema: String,
     pub(crate) name: String,
 }
 
 /// Everything a dump holds, by name.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Manifest {
     /// The schemas `schema.sql` creates.
     pub(crate) schemas: Vec<String>,

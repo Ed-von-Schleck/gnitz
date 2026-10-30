@@ -35,8 +35,7 @@ use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
 use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as Physical, ZstdLevel};
 use parquet::column::reader::{get_typed_column_reader, ColumnReader};
 use parquet::data_type::{
-    BoolType, ByteArray, ByteArrayType, DataType, DoubleType, FixedLenByteArray, FixedLenByteArrayType, FloatType,
-    Int32Type, Int64Type,
+    BoolType, ByteArray, ByteArrayType, DataType, DoubleType, FixedLenByteArrayType, FloatType, Int32Type, Int64Type,
 };
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
@@ -49,7 +48,7 @@ use crate::DumpError;
 /// The file metadata key naming each column's gnitz type, in column order. Its
 /// values are `gnitz_sql::sql_type_name`'s spelling, so a change to that
 /// spelling is a change to the format.
-pub(crate) const COLUMNS_KEY: &str = "gnitz.columns";
+const COLUMNS_KEY: &str = "gnitz.columns";
 
 /// The zstd level a dump's pages are compressed at.
 const ZSTD_LEVEL: i32 = 3;
@@ -210,9 +209,11 @@ impl TableWriter {
         Ok(())
     }
 
-    /// Close the file; the rows it holds.
-    pub(crate) fn finish(self) -> Result<u64, DumpError> {
-        Ok(self.writer.close()?.file_metadata().num_rows() as u64)
+    /// Close the file, durable once this returns; the rows it holds.
+    pub(crate) fn finish(mut self) -> Result<u64, DumpError> {
+        let meta = self.writer.finish()?;
+        self.writer.inner().sync_all()?;
+        Ok(meta.file_metadata().num_rows() as u64)
     }
 }
 
@@ -250,7 +251,6 @@ fn write_column(
         .filter(|&(_, &w)| w & bit == 0)
         .map(|(c, _)| c);
     let le = |c: &[u8]| -> [u8; 8] { c.try_into().expect("an 8-byte cell") };
-    // An unsigned integer past the signed range is kept as its bits.
     match codec {
         Codec::Int32(fi) => put::<Int32Type>(writer, present.map(|c| fi.decode_le_i64(c) as i32).collect(), levels),
         Codec::Int64 => put::<Int64Type>(writer, present.map(|c| i64::from_le_bytes(le(c))).collect(), levels),
@@ -265,19 +265,19 @@ fn write_column(
         Codec::Double => put::<DoubleType>(writer, present.map(|c| f64::from_le_bytes(le(c))).collect(), levels),
         Codec::Wide => put::<FixedLenByteArrayType>(
             writer,
-            flba(byte_values(present, |c, all| {
+            byte_values(present, |c, all| {
                 let cell: [u8; 16] = c.try_into().expect("a 16-byte cell");
                 all.extend_from_slice(&u128::from_le_bytes(cell).to_be_bytes());
-            })),
+            }),
             levels,
         ),
         Codec::Decimal => put::<FixedLenByteArrayType>(
             writer,
-            flba(byte_values(present, |c, all| {
+            byte_values(present, |c, all| {
                 let v = i64::from_le_bytes(le(c));
                 all.push((v >> 63) as u8);
                 all.extend_from_slice(&v.to_be_bytes());
-            })),
+            }),
             levels,
         ),
         Codec::Bytes { .. } => put::<ByteArrayType>(
@@ -300,13 +300,12 @@ fn put<T: DataType>(
     Ok(())
 }
 
-fn flba(v: Vec<ByteArray>) -> Vec<FixedLenByteArray> {
-    v.into_iter().map(FixedLenByteArray::from).collect()
-}
-
 /// Each of `cells`, which `cell` appends to one buffer, as values over that
 /// buffer.
-fn byte_values<'c>(cells: impl Iterator<Item = &'c [u8]>, mut cell: impl FnMut(&[u8], &mut Vec<u8>)) -> Vec<ByteArray> {
+fn byte_values<'c, V: From<ByteArray>>(
+    cells: impl Iterator<Item = &'c [u8]>,
+    mut cell: impl FnMut(&[u8], &mut Vec<u8>),
+) -> Vec<V> {
     let mut all = Vec::new();
     let mut ends = Vec::with_capacity(cells.size_hint().1.unwrap_or(0));
     for c in cells {
@@ -317,7 +316,7 @@ fn byte_values<'c>(cells: impl Iterator<Item = &'c [u8]>, mut cell: impl FnMut(&
     let mut start = 0;
     ends.into_iter()
         .map(|end| {
-            let v = ByteArray::from(all.slice(start..end));
+            let v = V::from(ByteArray::from(all.slice(start..end)));
             start = end;
             v
         })
@@ -476,7 +475,7 @@ fn read_int32<const W: usize>(
     })
 }
 
-/// The `n` values of a column chunk, appended to `cells` as `put` writes each one; a zero
+/// The `n` values of a column chunk, appended to `cells` as `decode` turns each into a cell; a zero
 /// cell of `tc` for each NULL row, whose word in `nulls` gets the column's bit. `nulls` is
 /// `Some` exactly when the column may be NULL. `open` checked the file's schema against
 /// `file_layout`, so `reader` is of type `T`.
@@ -486,7 +485,7 @@ fn read_cells<T: DataType>(
     tc: TypeCode,
     cells: &mut Vec<u8>,
     mut nulls: Option<(&mut [u64], u64)>,
-    mut put: impl FnMut(T::T, &mut Vec<u8>) -> Result<(), String>,
+    mut decode: impl FnMut(T::T, &mut Vec<u8>) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut r = get_typed_column_reader::<T>(reader);
     let mut levels = nulls.is_some().then(|| Vec::with_capacity(n));
@@ -511,7 +510,7 @@ fn read_cells<T: DataType>(
                 continue;
             }
         }
-        put(values.next().ok_or("fewer values than rows")?, cells)?;
+        decode(values.next().ok_or("fewer values than rows")?, cells)?;
     }
     Ok(())
 }

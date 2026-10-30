@@ -285,11 +285,16 @@ type Parent = fn(i64) -> Option<i64>;
 /// Tables of `(id, parent, body)` rows that together take more than one restore
 /// push each, a row's `parent` the given function of its id: one whose rows
 /// reference larger ids, so key order puts children before their parents; one
-/// cycle through every row, which only one push can carry; and one referencing
-/// nothing.
-const TABLES: [(&str, &str, Parent); 3] = [
+/// cycle through every row, which only one push can carry; one cycle of two
+/// rows with a chain of every other row below it; rows in pairs, each pair a
+/// cycle of its own; and one referencing nothing.
+const TABLES: [(&str, &str, Parent); 5] = [
     ("chain", "REFERENCES chain (id)", |id| (id + 1 < ROWS).then_some(id + 1)),
     ("ring", "REFERENCES ring (id)", |id| Some((id + 1) % ROWS)),
+    ("lasso", "REFERENCES lasso (id)", |id| {
+        Some(if id < 2 { 1 - id } else { id - 1 })
+    }),
+    ("couples", "REFERENCES couples (id)", |id| Some(id ^ 1)),
     ("plain", "", Some),
 ];
 
@@ -297,8 +302,9 @@ const TABLES: [(&str, &str, Parent); 3] = [
 const ROWS: i64 = 20_000;
 
 /// A table that references itself and takes more than one push is restored in
-/// an order where every row's parents come first, and the rows of a reference
-/// cycle in one push; one that references nothing in pushes of whole pages.
+/// an order where every row's parents come first, and the rows of each
+/// reference cycle in one push; one that references nothing in pushes cut at
+/// the push size.
 #[test]
 fn tables_larger_than_a_push_restore() {
     let src = ServerHandle::start_n(4);

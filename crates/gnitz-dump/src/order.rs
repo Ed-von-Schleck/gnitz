@@ -1,55 +1,90 @@
-//! The order a table's rows are restored in when the table references itself
-//! and takes more than one push: a push is checked against what is committed
-//! and what it carries itself, so every row's parents go in an earlier push
-//! than it — or in the same one.
+//! The order the rows of a row group too large for one push are restored in —
+//! for a table that references itself, the whole table: a push is checked
+//! against what is committed and what it carries itself, so every row's parents
+//! go in an earlier push than it — or in the same one.
 
 use std::collections::HashMap;
 
 use gnitz_core::{Schema, ZSetBatch};
 
 /// Rows of `batch`, each after every row it references through one of `refs` —
-/// columns of `schema` that reference its lone key column — and the position
-/// from which the rest wait on a reference cycle: those rows, and every row that
-/// waits on one, come last.
-pub(crate) fn order(batch: &ZSetBatch, schema: &Schema, refs: &[usize]) -> (Vec<u32>, usize) {
+/// columns of `schema` that reference its lone key column — except where rows
+/// reference one another round a cycle: those come together and go in one
+/// push. Each row comes with whether a push may end after it, which is false
+/// inside such a set. With no `refs`, the rows in their own order.
+pub(crate) fn order(batch: &ZSetBatch, schema: &Schema, refs: &[usize]) -> Vec<(u32, bool)> {
     let n = batch.len();
-    if refs.is_empty() {
-        return ((0..n as u32).collect(), n);
-    }
     let layout = schema.layout();
     let ref_locs: Vec<_> = refs.iter().map(|&c| layout.locate(c)).collect();
-    let key = layout.locate(schema.pk_cols()[0] as usize);
-    let holder: HashMap<u128, u32> = (0..n).map(|r| (key.opk_image(batch, r), r as u32)).collect();
-    let mut waiting = vec![0usize; n];
-    let mut children: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for (row, waits) in waiting.iter_mut().enumerate() {
-        for loc in &ref_locs {
-            // The cell as the key the engine checks a reference by, which compares
-            // equal across a key and a payload column of one type.
-            let parent = (!loc.is_null(batch, row))
-                .then(|| loc.opk_image(batch, row))
-                .and_then(|k| holder.get(&k).copied());
-            // A row referencing itself, or no row of this table, waits on nothing here.
-            if let Some(p) = parent.filter(|&p| p as usize != row) {
-                *waits += 1;
-                children[p as usize].push(row as u32);
+    let k = ref_locs.len();
+    // Row r's parents are parents[r * k..(r + 1) * k]. A NULL cell, or one naming
+    // no row of this table, names r itself: a self-loop leaves its component as it is.
+    let parents: Vec<u32> = {
+        let key = layout.locate(schema.pk_cols()[0] as usize);
+        let holder: HashMap<u128, u32> = (0..n).map(|r| (key.opk_image(batch, r), r as u32)).collect();
+        let mut parents = Vec::with_capacity(n * k);
+        for row in 0..n {
+            for loc in &ref_locs {
+                // The cell as the key the engine checks a reference by, which compares
+                // equal across a key and a payload column of one type.
+                let parent = (!loc.is_null(batch, row))
+                    .then(|| loc.opk_image(batch, row))
+                    .and_then(|key| holder.get(&key).copied());
+                parents.push(parent.unwrap_or(row as u32));
+            }
+        }
+        parents
+    };
+
+    // Tarjan's strongly connected components over the edges row → parent, with
+    // an explicit stack, since a chain of references is as deep as the table.
+    // A component is complete only once every component it references is, so
+    // the order they complete in puts parents first.
+    const UNSEEN: u32 = u32::MAX;
+    let (mut index, mut low) = (vec![UNSEEN; n], vec![0u32; n]);
+    let mut on_stack = vec![false; n];
+    let (mut stack, mut dfs, mut out) = (Vec::new(), Vec::new(), Vec::with_capacity(n));
+    let mut seen = 0u32;
+    for root in 0..n {
+        if index[root] != UNSEEN {
+            continue;
+        }
+        // A frame is a row and its next edge.
+        dfs.push((root, root * k));
+        while let Some(&mut (v, ref mut edge)) = dfs.last_mut() {
+            if index[v] == UNSEEN {
+                (index[v], low[v]) = (seen, seen);
+                seen += 1;
+                stack.push(v as u32);
+                on_stack[v] = true;
+            }
+            if *edge < (v + 1) * k {
+                let p = parents[*edge] as usize;
+                *edge += 1;
+                if index[p] == UNSEEN {
+                    dfs.push((p, p * k));
+                } else if on_stack[p] {
+                    low[v] = low[v].min(index[p]);
+                }
+                continue;
+            }
+            dfs.pop();
+            if let Some(&(u, _)) = dfs.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                // v's component is the stack down to v; a push may end after its last row.
+                while let Some(r) = stack.pop() {
+                    on_stack[r as usize] = false;
+                    out.push((r, r as usize == v));
+                    if r as usize == v {
+                        break;
+                    }
+                }
             }
         }
     }
-    let mut out: Vec<u32> = (0..n as u32).filter(|&r| waiting[r as usize] == 0).collect();
-    let mut next = 0;
-    while let Some(&r) = out.get(next) {
-        next += 1;
-        for &c in &children[r as usize] {
-            waiting[c as usize] -= 1;
-            if waiting[c as usize] == 0 {
-                out.push(c);
-            }
-        }
-    }
-    let acyclic = out.len();
-    out.extend((0..n as u32).filter(|&r| waiting[r as usize] > 0));
-    (out, acyclic)
+    out
 }
 
 #[cfg(test)]
