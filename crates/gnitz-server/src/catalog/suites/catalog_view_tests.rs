@@ -139,7 +139,7 @@ fn no_view_scans_sequences() {
     assert!(err.contains("_system.sequences"), "{err}");
 
     assert!(!engine.dag.is_scanned(seq), "the refused view left no edge");
-    assert!(engine.dag.sources_of(vid).is_empty());
+    assert!(engine.dag.sources_of(vid).next().is_none());
     assert!(engine.registry.relation(vid).is_none());
     // allocate_ids moved `sequences` itself; every other family is as it was.
     let after = sys_row_counts(&engine);

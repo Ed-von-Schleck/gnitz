@@ -71,7 +71,7 @@ fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
     log.ddl_zone(&[(SysFamily::Circuit, &circuit)]);
     let engine = boot(dir, Slot::new(0, 1), &log);
 
-    assert_eq!(engine.dag.sources_of(v), &[r][..]);
+    assert_eq!(engine.dag.sources_of(v).collect::<Vec<_>>(), [r]);
     assert_eq!(engine.registry.relation(v).unwrap().placement(), Placement::Replicated);
     assert_eq!(net_weight(&engine, SysFamily::View.id()), 1);
 }

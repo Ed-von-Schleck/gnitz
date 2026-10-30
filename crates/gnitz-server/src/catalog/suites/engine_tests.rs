@@ -475,7 +475,7 @@ fn test_dep_map_view_on_view_chain() {
     let engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(engine.dag.dependents_of(tid), [v1]);
     assert_eq!(engine.dag.dependents_of(v1), [v2]);
-    assert_eq!(engine.dag.sources_of(v2), [v1]);
+    assert_eq!(engine.dag.sources_of(v2).collect::<Vec<_>>(), [v1]);
     finish(engine);
 }
 

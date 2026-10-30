@@ -194,7 +194,7 @@ fn a_source_scanned_once_keeps_its_backfill_bound() {
         let [a, b] = scans.clone().map(|(source, bound)| c.input_delta(source, bound));
         c.union(a, b);
         let out = compile(&c, &sources([(10, schema), (11, schema)]), false).expect("the fixture compiles");
-        scans.map(|(source, _)| out.sources[&source].bound.clone())
+        scans.map(|(source, _)| out.scan(source).bound.clone())
     };
     assert_eq!(
         bounds_of([(10, bound(1)), (11, ReadBound::None)]),

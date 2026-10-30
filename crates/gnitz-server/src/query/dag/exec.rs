@@ -25,8 +25,8 @@ fn run_view_epoch(
     let mut empty;
     let (dag, registry) = host.parts();
     let (mut code, mut stores) = opened(&mut dag.views, registry, view_id, unfed)?;
-    // The dep map names only sources the view's circuit scans.
-    let reg = code.sources[&src_id].seed;
+    // A tick reaches a view only from a source its circuit scans.
+    let reg = code.scan(src_id).seed;
     let input = match input.filter(|input| !input.is_empty()) {
         Some(input) => input,
         None if code.vm.idles_on_empty(reg) => return Ok(None),
@@ -74,12 +74,12 @@ pub(crate) fn tick(host: &mut impl DriveHost, source: u64, round: u64) -> Result
 /// keeps the rebuild set closed under dependents.
 pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), String> {
     let (dag, registry) = host.parts();
-    if let Some(source) = dag.sources_of(view).iter().find(|&&s| dag.awaits_rebuild(s)) {
+    let sources: Vec<u64> = dag.sources_of(view).collect();
+    if let Some(source) = sources.iter().find(|&&s| dag.awaits_rebuild(s)) {
         return Err(format!("view {view} filled before its source {source}"));
     }
     // Its ticks run from here on.
     dag.rebuild.remove(&view);
-    let sources = dag.sources_of(view).to_vec();
     let chunk_rows = registry.scan_chunk_rows();
     // No source has fed the view yet.
     let (code, mut stores) = opened(&mut dag.views, registry, view, &sources)?;
@@ -89,9 +89,8 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
     }
     for (at, &source) in sources.iter().enumerate() {
         let (dag, registry) = host.parts();
-        // `sources_of` names only registered views, and of each only the
-        // relations its circuit scans.
-        let bound = dag.views[&view].code.sources[&source].bound.clone();
+        // `sources` came from this view's own plan.
+        let bound = dag.views[&view].code.scan(source).bound.clone();
         let relation = registry.relation_or_err(source)?;
         let (mut cursor, _unapplied) = relation.open_bound(bound, Cut::Sealed)?;
         let unfed = &sources[at + 1..];

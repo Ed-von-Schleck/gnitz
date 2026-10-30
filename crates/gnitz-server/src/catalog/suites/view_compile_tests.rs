@@ -113,7 +113,7 @@ fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
 
     for id in [base, bounded, over] {
         assert!(engine.dag.dependents_of(id).is_empty(), "{id}");
-        assert!(engine.dag.sources_of(id).is_empty(), "{id}");
+        assert!(engine.dag.sources_of(id).next().is_none(), "{id}");
     }
     assert!(engine.registry.relation(bounded).is_none() && engine.registry.relation(over).is_none());
 

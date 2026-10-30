@@ -72,13 +72,28 @@ fn keyed_reader(circuit: &Circuit, shard: NodeId) -> Option<(NodeId, &[u32])> {
 /// program, exchanges included.
 pub(super) struct CompileOutput {
     pub(in crate::query) vm: Vm,
-    /// Every scanned source's scan, by source id.
-    pub(in crate::query) sources: FxHashMap<u64, Scan>,
+    /// Each scanned source's scan, once per source, in first-scan order.
+    sources: Box<[(u64, Scan)]>,
     /// `Some` iff the view is capacity-bounded.
     pub(in crate::query) hydration: Option<Hydration>,
     /// Each worker computes the view's whole result locally: it is replicated, or
     /// there is one worker.
     pub(in crate::query) self_contained: bool,
+}
+
+impl CompileOutput {
+    /// `source`'s scan. Panics unless the circuit scans `source`.
+    pub(in crate::query) fn scan(&self, source: u64) -> &Scan {
+        match self.sources.iter().find(|(s, _)| *s == source) {
+            Some((_, scan)) => scan,
+            None => panic!("the plan scans no relation {source}"),
+        }
+    }
+
+    /// The relations the circuit scans, each once, in first-scan order.
+    pub(in crate::query) fn source_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.sources.iter().map(|&(source, _)| source)
+    }
 }
 
 /// Compile view `view_id`'s circuit, and answer the placement its store registers
@@ -103,7 +118,7 @@ pub(super) fn compile_view(
         .transpose()?;
     let output = CompileOutput {
         vm,
-        sources,
+        sources: sources.into_boxed_slice(),
         hydration,
         self_contained: meta.self_contained,
     };

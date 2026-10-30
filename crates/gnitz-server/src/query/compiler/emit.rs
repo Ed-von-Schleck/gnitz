@@ -33,7 +33,8 @@ pub(super) struct EmitCtx<'a> {
     /// enter at: the node's own, or, for a base table's store, the scan's its
     /// re-key reads.
     pub(super) integrals: Vec<Option<(Integral, DeltaReg)>>,
-    pub(super) sources: FxHashMap<u64, Scan>,
+    /// Each scanned source's scan, once per source, in first-scan order.
+    pub(super) sources: Vec<(u64, Scan)>,
     /// The view, whose store is the integral of its output node's register.
     view: u64,
 }
@@ -70,7 +71,7 @@ impl<'a> EmitCtx<'a> {
             regs: Vec::with_capacity(nodes),
             partials: vec![false; nodes],
             integrals: vec![None; nodes],
-            sources: FxHashMap::default(),
+            sources: Vec::new(),
             view,
         };
         for (nid, op) in circuit.ops() {
@@ -108,7 +109,7 @@ impl<'a> EmitCtx<'a> {
         self.sources
             .iter()
             .find(|(_, scan)| scan.reg == reg)
-            .map(|(&source, _)| source)
+            .map(|&(source, _)| source)
     }
 
     /// `source`'s store where it holds, on this worker, the integral of the delta
@@ -218,7 +219,7 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<DeltaReg, St
             // registers every source before shipping the circuit.
             let relation = ctx.registry.relation_or_err(*tid)?;
             // One epoch seeds one delta, and one backfill cursor feeds every scan of it.
-            if let Some(scan) = ctx.sources.get_mut(tid) {
+            if let Some((_, scan)) = ctx.sources.iter_mut().find(|(s, _)| s == tid) {
                 scan.bound = ReadBound::None;
                 return Ok(scan.reg);
             }
@@ -229,7 +230,7 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<DeltaReg, St
                 None => seed,
             };
             let bound = bound.clone();
-            ctx.sources.insert(*tid, Scan { seed, reg, bound });
+            ctx.sources.push((*tid, Scan { seed, reg, bound }));
             Ok(reg)
         }
 

@@ -83,7 +83,7 @@ impl DagEngine {
             return Err(format!("scans relation {src}, which is not older than it"));
         }
         let (code, placement) = compiler::compile_view(circuit, registry, view_id, view, bounded)?;
-        self.dep.link(view_id, circuit.sources());
+        self.dep.link(view_id, code.source_ids());
         self.views.insert(view_id, RegisteredView { code, state: None, chain });
         Ok(placement)
     }
@@ -109,8 +109,9 @@ impl DagEngine {
 
     /// Drop everything this layer holds for relation `id`.
     pub(crate) fn forget(&mut self, id: u64) {
-        self.dep.unlink(id);
-        self.views.remove(&id);
+        if let Some(view) = self.views.remove(&id) {
+            self.dep.unlink(id, view.code.source_ids());
+        }
         self.rebuild.remove(&id);
     }
 
@@ -182,7 +183,7 @@ impl DagEngine {
         self.views
             .keys()
             .copied()
-            .filter(|&vid| self.sources_of(vid).iter().any(unreplayed))
+            .filter(|&vid| self.sources_of(vid).any(|s| unreplayed(&s)))
             .collect()
     }
 
