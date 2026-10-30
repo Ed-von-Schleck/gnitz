@@ -44,7 +44,7 @@ impl CatalogEngine {
     /// predicates; the caller names the relation.
     fn register_relation(&mut self, rel: &RelRow<'_>) -> Result<(), String> {
         let col_defs = self.read_column_defs(rel.id)?;
-        let schema = build_schema_from_col_defs(rel.kind(), &col_defs, rel.pk.as_slice())?;
+        let schema = build_schema_from_col_defs(&col_defs, rel.pk.as_slice())?;
         let (placement, pk_repeats, compress, serial) = match rel.detail {
             RelDetail::View(ViewParts { owner, pk_repeats, props }) => {
                 let circuit = self.read_circuit(rel.id)?;
@@ -176,16 +176,16 @@ impl CatalogEngine {
         for &owner in owners.ids() {
             // Only a base table's columns change; a system family's are compile-time
             // data, and at replay COL_TAB precedes every user relation's registration.
-            let Some((kind, cur)) = self
+            let Some(cur) = self
                 .registry
                 .relation(owner)
                 .filter(|e| e.kind().is_base_table())
-                .map(|e| (e.kind(), e.schema()))
+                .map(|e| e.schema())
             else {
                 continue;
             };
             let defs = self.read_column_defs(owner)?;
-            let rebuilt = build_schema_from_col_defs(kind, &defs, cur.pk_cols())
+            let rebuilt = build_schema_from_col_defs(&defs, cur.pk_cols())
                 .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
             if rebuilt != cur {
                 self.registry.swap_schema(owner, rebuilt)?;

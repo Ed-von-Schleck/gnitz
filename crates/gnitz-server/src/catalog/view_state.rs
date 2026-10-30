@@ -11,7 +11,7 @@ use gnitz_zset::repr::Batch;
 use super::CatalogEngine;
 
 impl CatalogEngine {
-    /// [`RelationRegistry::scan_spec`], hydrating.
+    /// [`gnitz_store::relation::RelationRegistry::scan_spec`], hydrating.
     pub(crate) fn scan_spec(&mut self, target_id: u64, spec: ReadSpec, reply_layout: u64) -> Result<Rc<Batch>, String> {
         let (registry, dag) = (&self.registry, &mut self.dag);
         registry.scan_spec(

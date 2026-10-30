@@ -2,7 +2,7 @@
 //! system-table deltas.
 use std::borrow::Cow;
 
-use gnitz_store::relation::{IndexClaim, Relation, RelationKind};
+use gnitz_store::relation::{IndexClaim, Relation};
 use gnitz_wire::{
     low_bits_mask, payload_bytes, validate_user_identifier, BitIter, CatalogColumn, ColTabRow, FixedInt, FkRef,
     IdxTabRow, IdxTabSlot, RowSource, SchemaTabRow, SchemaTabSlot, TableProps, ViewParts,
@@ -210,9 +210,10 @@ impl CatalogEngine {
                 .registry
                 .relation(fk.table_id)
                 .ok_or_else(|| format!("FK references unknown table_id {}", fk.table_id))?;
-            // Not covered by the PK/UNIQUE tests below, which read only the schema:
-            // a stream and a view both have a PK that looks exactly like a base
-            // table's without being the unique, stored key the parent probe reads.
+            // Not covered by the PK/UNIQUE tests below, which read the parent's
+            // key and index claims but not its kind: a stream's or a view's PK
+            // looks like a base table's without being the unique, stored key the
+            // parent probe reads.
             if !entry.kind().is_base_table() {
                 return Err(format!(
                     "FK references relation {}, which is a {}; a FOREIGN KEY must reference a base table",
@@ -363,16 +364,18 @@ impl CatalogEngine {
                     if old.def.is_hidden {
                         return Err(format!("cannot ALTER dropped column {col_idx} of table {owner_id}"));
                     }
-                    if new.def.is_nullable != old.def.is_nullable && !new.def.is_nullable {
+                    if old.def.is_nullable && !new.def.is_nullable {
                         return Err("a column-ALTER may only set is_nullable 0→1 (DROP NOT NULL)".into());
                     }
-                    let (hides, unnulls) = (new.def.is_hidden, new.def.is_nullable != old.def.is_nullable);
-                    let op = match (hides, unnulls) {
-                        (true, _) => Some("DROP COLUMN"),
-                        (false, true) => Some("DROP NOT NULL"),
+                    let hides = new.def.is_hidden;
+                    let op = if hides {
+                        Some("DROP COLUMN")
+                    } else if new.def.is_nullable != old.def.is_nullable {
+                        Some("DROP NOT NULL")
+                    } else {
                         // A rename: legal on a PK column and under dependent
                         // views, which bind columns by ordinal.
-                        (false, false) => None,
+                        None
                     };
                     let name = &old.def.name;
                     // Before the schema build, whose PK rules would refuse a PK
@@ -408,7 +411,8 @@ impl CatalogEngine {
                 Some(live) => *live = new,
                 None => defs.push(new),
             }
-            build_schema_from_col_defs(RelationKind::BaseTable, &defs, schema.pk_cols())
+            unique_visible_names(&defs)
+                .and_then(|()| build_schema_from_col_defs(&defs, schema.pk_cols()))
                 .map_err(|e| format!("cannot {} on table {owner_id}: {e}", op.unwrap_or("RENAME COLUMN")))?;
             // Last: a malformed ALTER is reported as malformed whatever depends
             // on the table.
@@ -544,9 +548,11 @@ impl CatalogEngine {
             }
         }
         for &sid in dropped.ids() {
-            let n = self.caches.relation_by_name.get(&sid).map_or(0, |names| names.len());
-            if n > 0 {
-                return Err(format!("Schema not empty: {n} relation(s) remain; drop them first"));
+            if let Some(names) = self.caches.relation_by_name.get(&sid) {
+                return Err(format!(
+                    "Schema not empty: {} relation(s) remain; drop them first",
+                    names.len()
+                ));
             }
         }
         Ok(())
@@ -561,8 +567,12 @@ impl CatalogEngine {
             return Err(format!("{rel}: the system schema takes no relation"));
         }
         let col_defs = self.read_column_defs(rel.id)?;
-        let schema =
-            build_schema_from_col_defs(rel.kind(), &col_defs, rel.pk.as_slice()).map_err(|e| format!("{rel} {e}"))?;
+        // A view segment legitimately carries two visible columns of one name
+        // (a join chain's output).
+        if rel.kind().is_ingestion_point() {
+            unique_visible_names(&col_defs).map_err(|e| format!("{rel} {e}"))?;
+        }
+        let schema = build_schema_from_col_defs(&col_defs, rel.pk.as_slice()).map_err(|e| format!("{rel} {e}"))?;
         // An FK probes its parent's store on every write of the child, which only
         // a base table's ingest runs; a stream push must stay a pure append.
         if !rel.kind().is_base_table() {
@@ -665,7 +675,10 @@ impl CatalogEngine {
                 let blocking = self.fks_as_parent(tid).iter().find(|r| !dropped.contains(r.child_tid));
                 if let Some(r) = blocking {
                     let child = self.qualified_name(r.child_tid);
-                    return Err(format!("Integrity violation: table referenced by '{child}'"));
+                    return Err(format!(
+                        "cannot DROP '{}': it is referenced by a foreign key of '{child}' — drop that first",
+                        self.qualified_name(tid)
+                    ));
                 }
             }
         }
@@ -739,11 +752,14 @@ impl CatalogEngine {
                 IdxTabRow::read(batch, i).map_err(|e| format!("Index: {e}"))?;
             // FK backing is single-column: a composite index is never an FK
             // target, so dropping one is never blocked by the FK-target guard.
-            if cols.as_slice().len() != 1 {
+            let &[src_col] = cols.as_slice() else {
                 continue;
-            }
-            let src_col = cols.as_slice()[0] as usize;
-            if !self.fks_as_parent(owner_id).iter().any(|r| r.parent_col == src_col) {
+            };
+            if !self
+                .fks_as_parent(owner_id)
+                .iter()
+                .any(|r| r.parent_col == src_col as usize)
+            {
                 continue;
             }
             // The FK target column must stay a legal target for FK child inserts
@@ -753,16 +769,26 @@ impl CatalogEngine {
             let remains = self
                 .registry
                 .relation(owner_id)
-                .is_some_and(|o| holds_fk_target(o, src_col as u32, dropped));
+                .is_some_and(|o| holds_fk_target(o, src_col, dropped));
             if !remains {
                 return Err(format!(
-                    "Integrity violation: index on '{}' is referenced by a \
-                     foreign key and no unique index would remain on the column",
+                    "cannot DROP the index on '{}': a foreign key references its \
+                     column and no unique index would remain on the column",
                     self.qualified_name(owner_id),
                 ));
             }
         }
         Ok(())
+    }
+}
+
+/// No two visible columns of `defs` share a name: the rule of a relation clients
+/// write to.
+fn unique_visible_names(defs: &[CatalogColumn]) -> Result<(), String> {
+    let visible = defs.iter().filter(|c| !c.def.is_hidden);
+    match gnitz_wire::first_duplicate(visible.map(|c| c.def.name.as_str())) {
+        Some(name) => Err(format!("has duplicate column name '{name}'")),
+        None => Ok(()),
     }
 }
 

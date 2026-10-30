@@ -238,8 +238,7 @@ impl DdlBundle {
 static SCHEMAS: LazyLock<[(SchemaDescriptor, Box<[u8]>); SysFamily::COUNT]> = LazyLock::new(|| {
     SysFamily::ALL.map(|family| {
         let (defs, pk) = (family.column_defs(), family.wire().pk_cols);
-        let schema = build_schema_from_col_defs(RelationKind::SystemCatalog, &defs, pk)
-            .expect("a system family is an admissible schema");
+        let schema = build_schema_from_col_defs(&defs, pk).expect("a system family is an admissible schema");
         (schema, encode_record(pk, &defs))
     })
 });
@@ -252,21 +251,12 @@ pub(in crate::catalog) fn encode_record(pk: &[u32], defs: &[CatalogColumn]) -> B
 
 /// The `SchemaDescriptor` COL_TAB records describe, or the first admissibility
 /// rule they break; messages are bare predicates, and callers add the context.
-/// The duplicate-name rule is ingestion points only — a view segment
-/// legitimately carries two visible columns of one name (a join chain's output).
 pub(super) fn build_schema_from_col_defs(
-    kind: RelationKind,
     col_defs: &[CatalogColumn],
     pk_cols: &[u32],
 ) -> Result<SchemaDescriptor, String> {
     if col_defs.is_empty() {
         return Err("has no column records".into());
-    }
-    if kind.is_ingestion_point() {
-        let visible = col_defs.iter().filter(|c| !c.def.is_hidden);
-        if let Some(name) = gnitz_wire::first_duplicate(visible.map(|c| c.def.name.as_str())) {
-            return Err(format!("has duplicate column name '{name}'"));
-        }
     }
     Ok(SchemaDescriptor::try_new(
         &col_defs

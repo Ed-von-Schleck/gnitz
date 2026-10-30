@@ -294,20 +294,16 @@ impl CatalogEngine {
         }
     }
 
-    /// Whether `tid` has a constraint whose validation reads committed state:
-    /// whether [`Self::row_constraints`] would list any.
-    fn has_row_constraints(&self, tid: u64) -> bool {
-        !self.fks_as_child(tid).is_empty()
+    /// Does validating a write of `mode` to `tid` read committed state: an Error-mode
+    /// write, or a table with any of [`Self::row_constraints`]? One that does not may
+    /// hold its table lock shared.
+    pub(crate) fn push_reads_committed_state(&self, tid: u64, mode: gnitz_wire::WireConflictMode) -> bool {
+        matches!(mode, gnitz_wire::WireConflictMode::Error)
+            || !self.fks_as_child(tid).is_empty()
             || !self.fks_as_parent(tid).is_empty()
             || self
                 .registry
                 .relation(tid)
                 .is_some_and(|r| r.unique_indexes_to_check().next().is_some())
-    }
-
-    /// Does validating a write of `mode` to `tid` read committed state? One that
-    /// does not may hold its table lock shared.
-    pub(crate) fn push_reads_committed_state(&self, tid: u64, mode: gnitz_wire::WireConflictMode) -> bool {
-        matches!(mode, gnitz_wire::WireConflictMode::Error) || self.has_row_constraints(tid)
     }
 }

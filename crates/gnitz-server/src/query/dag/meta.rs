@@ -41,9 +41,9 @@ fn schedule(mut edges: Vec<(u64, u64)>) -> Rc<[Step]> {
 /// and drop. A `forward` / `reverse` entry exists only while it holds an id.
 #[derive(Default)]
 pub(super) struct DepMap {
-    /// source_table_id → [view_ids]
+    /// source_table_id → view_ids
     forward: FxHashMap<u64, Vec<u64>>,
-    /// view_id → [source_table_ids]
+    /// view_id → source_table_ids
     reverse: FxHashMap<u64, Vec<u64>>,
     /// source id → [`Self::tick_steps`] of it, each kept until an edge moves.
     tick_steps: FxHashMap<u64, Rc<[Step]>>,

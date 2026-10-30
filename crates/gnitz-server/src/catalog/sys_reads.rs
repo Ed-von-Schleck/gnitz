@@ -63,20 +63,17 @@ impl CatalogEngine {
 
     /// Column definitions for `owner_id`, in key order.
     pub(in crate::catalog) fn read_column_defs(&self, owner_id: u64) -> Result<Vec<CatalogColumn>, String> {
-        let mut defs = Vec::new();
-        let mut err = None;
+        let mut defs = Ok(Vec::new());
         self.for_each_row_under(SysFamily::Column, owner_id, |c| {
-            if err.is_some() {
-                return;
-            }
+            let Ok(acc) = &mut defs else { return };
             let (src, row) = c.current_row_source();
-            let appended = ColTabRow::read(src, row)
-                .and_then(|r| r.append_to(&mut defs).map_err(|e| format!("column {}: {e}", r.col_idx)));
-            if let Err(e) = appended {
-                err = Some(format!("entity (owner_id={owner_id}): {e}"));
+            if let Err(e) = ColTabRow::read(src, row)
+                .and_then(|r| r.append_to(acc).map_err(|e| format!("column {}: {e}", r.col_idx)))
+            {
+                defs = Err(format!("entity (owner_id={owner_id}): {e}"));
             }
         });
-        err.map_or(Ok(defs), Err)
+        defs
     }
 
     // -- Names ---------------------------------------------------------------

@@ -117,8 +117,9 @@ pub(in crate::query) struct HistoryTerm {
     pub(in crate::query) negated: bool,
 }
 
-/// The integral of a delta, as its readers find it: a join's probe, and a
-/// bounded view's replay, which seeds from it.
+/// The integral of a delta, as its readers find it: a join's probe, a reduce's
+/// output trace (`Op::Reduce::out_trace`), and a bounded view's replay, which
+/// seeds from it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(in crate::query) enum Integral {
     /// A child store the circuit integrates a register into.

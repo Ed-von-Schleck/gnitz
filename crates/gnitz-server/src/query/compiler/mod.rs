@@ -25,10 +25,7 @@ mod routing;
 mod fixtures;
 
 use emit::*;
-use hydration::derive_hydration;
-// `pub(super)`: `dag` is the only module that names the compiler, so a
-// `pub(crate)` would publish it to the catalog and runtime rungs too.
-pub(super) use hydration::Hydration;
+use hydration::{derive_hydration, Hydration};
 use routing::ViewMeta;
 
 // ---------------------------------------------------------------------------

@@ -123,8 +123,9 @@ fn placement(
         .any(|(_, op)| matches!(op, OpNode::Join(_) | OpNode::ExchangeShard));
     match scanned_row_locally(circuit, circuit.out()) {
         // The view's PK region is this source's, byte for byte, and its rows sit on
-        // that source's owner only while nothing relays its delta: only a source
-        // stating a scatter key is relayed.
+        // that source's owner only while nothing relays its delta. Every source
+        // stating a scatter key counts as relayed here, even one whose scatter
+        // key routes to its native owner: Local is safe then.
         Some(tid) if uses[&tid].key.is_none() => sources[&tid].placement(),
         Some(_) => Placement::Local,
         // Behind a join or an exchange the rows sit on their own key's owner.

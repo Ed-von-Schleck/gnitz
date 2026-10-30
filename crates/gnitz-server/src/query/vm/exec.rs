@@ -281,9 +281,7 @@ fn operand(batch: &mut Batch, take: bool) -> Cow<'_, Batch> {
 /// Run the instruction stream from `epoch.pc`, to its end or to the round it
 /// next stands at.
 fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> Result<Option<usize>, String> {
-    let Vm { instructions, regs, batches, out_reg, .. } = vm;
-
-    gnitz_debug!("vm: dispatch out_reg={} instrs={}", out_reg.0, instructions.len());
+    let Vm { instructions, regs, batches, .. } = vm;
 
     for pc in epoch.pc..instructions.len() {
         let (before, rest) = instructions.split_at_mut(pc);
@@ -369,8 +367,6 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
                     res.map_err(|e| ingest_err("value index", idx, e))?;
                 }
 
-                gnitz_debug!("vm: REDUCE in_count={} value_index={}", delta.len(), index.is_some());
-
                 let mut open_out = stores.open(stores.trace(*out_trace)?);
                 let mut open_index = index.map(|idx| stores.open(Trace::Child(idx)));
                 let index_at = open_index.as_mut().map(|open| open as stream::OpenAt<'_>);
@@ -402,7 +398,6 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch<'_>) -> 
         fold_written(batches, regs, out_reg);
     }
 
-    gnitz_debug!("vm: dispatch done");
     Ok(None)
 }
 
