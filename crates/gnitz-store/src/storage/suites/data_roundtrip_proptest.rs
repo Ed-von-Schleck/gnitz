@@ -130,7 +130,7 @@ proptest! {
 
         let mut expected = zset_of(&original, &schema);
         if durable {
-            // One L0 shard per wave crosses `l0.len() > 4`, so the store owes
+            // One L0 shard per wave crosses `L0_COMPACT_THRESHOLD`, so the store owes
             // the fold into guards below L0.
             table.settle().unwrap();
             prop_assert!(table.level_shape().1.iter().sum::<usize>() > 0, "no L0->L1 compaction");

@@ -26,7 +26,7 @@ proptest! {
         for (n, action) in steps {
             let run = fold_batch(&s, &rows.by_ref().take(n).cloned().collect::<Vec<_>>()).into_consolidated();
             pushed.push(run.clone());
-            set.push(run, &s);
+            set.push_run(Rc::new(run.trimmed()), &s);
             match action {
                 0 => set.fold(&s),
                 1 => {
@@ -91,19 +91,19 @@ fn holds(set: &RunSet, schema: &SchemaDescriptor, k: u64) -> bool {
 fn a_cancelling_set_merges_only_a_run_that_cancels_the_one_before_it() {
     let schema = make_schema_u64_i64();
     let mut set = RunSet::cancelling(usize::MAX);
-    set.push(keyed_run(&schema, 0..100, 1, 0), &schema);
-    set.push(keyed_run(&schema, 100..200, 1, 0), &schema);
+    set.push_run(Rc::new(keyed_run(&schema, 0..100, 1, 0).trimmed()), &schema);
+    set.push_run(Rc::new(keyed_run(&schema, 100..200, 1, 0).trimmed()), &schema);
     assert_eq!(set.len(), 2, "an insert-only run stays apart");
 
     let update: Vec<_> = (100..160).flat_map(|k| [(k, -1, 0), (k, 1, 1)]).collect();
-    set.push(make_batch(&schema, &update), &schema);
+    set.push_run(Rc::new(make_batch(&schema, &update).trimmed()), &schema);
     assert_eq!(set.len(), 2, "the update cancelled into the run before it");
     assert_eq!(set.row_count(), 200, "its retractions and their rows are gone");
 
-    set.push(keyed_run(&schema, 150..160, -1, 1), &schema);
+    set.push_run(Rc::new(keyed_run(&schema, 150..160, -1, 1).trimmed()), &schema);
     assert_eq!(set.len(), 3, "a run much larger than its successor is not merged into");
 
-    set.push(keyed_run(&schema, 0..50, -1, 0), &schema);
+    set.push_run(Rc::new(keyed_run(&schema, 0..50, -1, 0).trimmed()), &schema);
     assert_eq!(set.len(), 4, "retractions of an older run's rows stay apart");
     set.fold(&schema);
     assert_eq!(set.row_count(), 140);
@@ -117,7 +117,9 @@ fn a_fold_drops_the_filter_once_most_of_its_keys_are_gone() {
     let schema = make_schema_u64_i64();
     // A zero budget sizes the filter to one block.
     let mut set = RunSet::new(0);
-    let push = |set: &mut RunSet, keys: std::ops::Range<u64>, w: i64| set.push(keyed_run(&schema, keys, w, 7), &schema);
+    let push = |set: &mut RunSet, keys: std::ops::Range<u64>, w: i64| {
+        set.push_run(Rc::new(keyed_run(&schema, keys, w, 7).trimmed()), &schema)
+    };
 
     push(&mut set, 0..10, 1);
     assert!(holds(&set, &schema, 3), "the first probe builds the filter");
@@ -149,8 +151,8 @@ fn widening_fills_nulls_and_keeps_the_filter() {
         &[0],
     );
     let mut set = RunSet::new(1 << 20);
-    set.push(keyed_run(&narrow, 0..10, 1, 7), &narrow);
-    set.push(keyed_run(&narrow, 10..20, 1, 7), &narrow);
+    set.push_run(Rc::new(keyed_run(&narrow, 0..10, 1, 7).trimmed()), &narrow);
+    set.push_run(Rc::new(keyed_run(&narrow, 10..20, 1, 7).trimmed()), &narrow);
     assert!(holds(&set, &narrow, 15), "the first probe builds the filter");
 
     set.widen_runs(&wide);
@@ -183,11 +185,14 @@ fn a_fold_merges_runs_of_different_nullability_under_its_own_schema() {
     };
 
     let mut set = RunSet::new(1 << 20);
-    set.push(
-        run(not_null, &[(1, Some(-3), 1), (2, Some(7), 1), (3, Some(8), 1)]),
+    set.push_run(
+        Rc::new(run(not_null, &[(1, Some(-3), 1), (2, Some(7), 1), (3, Some(8), 1)]).trimmed()),
         &not_null,
     );
-    set.push(run(nullable, &[(1, None, 1), (1, Some(-3), -1)]), &nullable);
+    set.push_run(
+        Rc::new(run(nullable, &[(1, None, 1), (1, Some(-3), -1)]).trimmed()),
+        &nullable,
+    );
     set.fold(&nullable);
 
     let folded = &set.runs[0];
@@ -212,7 +217,7 @@ fn a_fold_under_churn_keeps_every_run_trimmed() {
     let mut latest = vec![0u64; KEYS as usize];
     let push = |set: &mut RunSet, rows: &[(u64, i64, Vec<u8>)]| {
         let rows: Vec<(u64, i64, &[u8])> = rows.iter().map(|(k, w, v)| (*k, *w, &v[..])).collect();
-        set.push(make_batch_bytes(&schema, &rows), &schema);
+        set.push_run(Rc::new(make_batch_bytes(&schema, &rows).trimmed()), &schema);
     };
     push(
         &mut set,

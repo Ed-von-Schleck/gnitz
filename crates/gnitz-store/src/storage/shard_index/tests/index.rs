@@ -79,8 +79,7 @@ impl ShardIndex {
 
 fn open(dir: &Path, schema: SchemaDescriptor, budget: Option<u64>) -> ShardIndex {
     let dir = dir.to_str().unwrap();
-    let shards = manifest::read(dir).unwrap().map(|m| m.shards).unwrap_or_default();
-    ShardIndex::open(dir, schema, budget, false, false, &shards).unwrap()
+    ShardIndex::open(dir, schema, RecoverySource::SalReplay, budget, false).unwrap()
 }
 
 /// An unbounded store at `dir`, reloaded from its manifest if it has one.
@@ -211,17 +210,11 @@ fn assert_all_found(idx: &ShardIndex, keys: impl IntoIterator<Item = u64>) {
     assert_weighs(idx, 1, keys.into_iter().map(gk));
 }
 
-/// Publish the index's manifest as the barrier does, minus the fsyncs.
+/// Publish the index's manifest as the barrier does.
 fn publish_manifest(idx: &mut ShardIndex) {
-    let m = manifest::Manifest {
-        checkpoint_mark: 0,
-        caller_record: Vec::new(),
-        shards: idx.shard_set(),
-    };
-    manifest::stage(&idx.output_dir, &m).unwrap();
-    manifest::commit(&idx.output_dir).unwrap();
-    idx.mark_published();
-    idx.unlink_retired();
+    if let Some(w) = idx.stage(0).unwrap() {
+        ShardIndex::publish(vec![(idx, w)]).unwrap();
+    }
 }
 
 /// `idx` published and reopened under `budget`, which binds only at open.

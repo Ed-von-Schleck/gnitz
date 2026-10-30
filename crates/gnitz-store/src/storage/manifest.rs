@@ -28,7 +28,7 @@ pub(crate) struct ShardSet {
 
 /// One store's published shard set and the counters that must survive a
 /// restart.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Manifest {
     /// The owner's word for this publish, read back at the next open.
     pub checkpoint_mark: u64,
@@ -138,7 +138,7 @@ pub(super) fn shard_seqs(dir: &str) -> io::Result<Vec<u64>> {
 }
 
 /// The path of the shard drawn at `seq` in the store at `dir`.
-pub(crate) fn shard_path(dir: &str, seq: u64) -> String {
+pub(super) fn shard_path(dir: &str, seq: u64) -> String {
     format!("{dir}/{}", shard_name(seq))
 }
 
@@ -174,7 +174,7 @@ pub(crate) fn shard_files(dir: &str) -> Result<Vec<(String, Option<u64>)>, Stora
 
 /// Read and decode `dir`'s manifest. `Ok(None)` when it does not exist yet;
 /// `Err` on damage or a failed read.
-pub(crate) fn read(dir: &str) -> Result<Option<Manifest>, StorageError> {
+pub(super) fn read(dir: &str) -> Result<Option<Manifest>, StorageError> {
     match fs::read(manifest_path(dir)) {
         Ok(buf) => decode(&buf).map(Some),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -196,13 +196,13 @@ pub(crate) fn read_at(dir: &str, generation: u64) -> Result<Option<Manifest>, St
 }
 
 /// Write `m` to `dir`'s [`staging_path`], for [`commit`] to publish.
-pub(crate) fn stage(dir: &str, m: &Manifest) -> Result<(), StorageError> {
+pub(super) fn stage(dir: &str, m: &Manifest) -> Result<(), StorageError> {
     fs::write(staging_path(dir), encode(m))?;
     Ok(())
 }
 
 /// Rename the manifest staged at [`staging_path`] onto `dir`'s manifest path.
-pub(crate) fn commit(dir: &str) -> Result<(), StorageError> {
+pub(super) fn commit(dir: &str) -> Result<(), StorageError> {
     fs::rename(staging_path(dir), manifest_path(dir))?;
     Ok(())
 }
@@ -222,7 +222,7 @@ pub(super) fn owed_dirs(dir: &str, first: bool) -> impl Iterator<Item = PathBuf>
 
 /// Durably unlink the manifest of every store in `dirs`, in one sync batch; an
 /// absent manifest or directory is already unlinked.
-pub(crate) fn unlink<S: AsRef<str>>(dirs: &[S]) -> Result<(), StorageError> {
+pub(super) fn unlink<S: AsRef<str>>(dirs: &[S]) -> Result<(), StorageError> {
     let mut present = Vec::with_capacity(dirs.len());
     for dir in dirs.iter().map(AsRef::as_ref) {
         absent_ok(fs::remove_file(manifest_path(dir)))?;

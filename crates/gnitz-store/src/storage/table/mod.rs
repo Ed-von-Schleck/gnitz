@@ -15,14 +15,11 @@
 //! under it.
 
 use std::cell::Cell;
-use std::fs;
-use std::io;
 use std::ops::Range;
 use std::rc::Rc;
 
-use super::manifest::{Manifest, ShardSet};
 use super::run_set::RunSet;
-use super::shard_index::ShardIndex;
+use super::shard_index::{RecoverySource, ShardIndex};
 use super::Cut;
 use gnitz_wire::{KeyRange, PkBuf, PkKeys};
 use gnitz_zset::repr::Batch;
@@ -45,25 +42,6 @@ const SEAL_FOLD_RATIO: usize = 64;
 /// spill writes against RSS; shrinking it is how a test reaches the disk regime on
 /// small data.
 pub(crate) const DEFAULT_RAM_TIER_BYTES: usize = 32 << 20;
-
-// ---------------------------------------------------------------------------
-// RecoverySource
-// ---------------------------------------------------------------------------
-
-/// How a relation's tail is recovered across a restart.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum RecoverySource {
-    /// The tail is recovered by replaying the fsynced SAL over the shards loaded
-    /// from the manifest at open.
-    SalReplay,
-    /// Derived state, persisted under a generation-stamped manifest by each
-    /// ephemeral round that picks its relation.
-    Rederive {
-        /// The generation a manifest must carry for the open to resume from it
-        /// instead of erasing it; `None` erases it.
-        resume_at: Option<u64>,
-    },
-}
 
 // ---------------------------------------------------------------------------
 // Table
@@ -90,14 +68,9 @@ pub(crate) struct Table {
     memtable: RunSet,
     /// Folded memtable runs, spilled to a shard past the RAM-tier ceiling.
     ram_tier: RunSet,
-    /// The disk tier, and the one owner of this store's schema and directory.
+    /// The disk tier, and the one owner of this store's schema, directory and
+    /// manifest.
     shard_index: ShardIndex,
-
-    /// The checkpoint mark of the manifest this open loaded.
-    loaded_mark: Option<u64>,
-
-    /// What the next publish writes as the manifest's caller record.
-    caller_record: Vec<u8>,
 
     /// Set by [`Self::hold_in_ram`]: the RAM tier grows past its budget and never
     /// persists.
@@ -110,15 +83,6 @@ pub(crate) struct Table {
     cached_full_scan: Cell<Option<Rc<Batch>>>,
 
     live_floor: Cell<LiveFloor>,
-
-    /// The manifest in place: the one this open read, or the one this
-    /// process's last barrier renamed. `None` for a store that has none, and
-    /// from the staging of another until its barrier completes.
-    manifest_in_place: Option<Manifest>,
-    /// Whether a barrier of this process synced the directories behind
-    /// `manifest_in_place`. The rename of a manifest read at open may predate a
-    /// kill that came before them.
-    manifest_synced: bool,
 }
 
 mod flush;
@@ -137,54 +101,17 @@ impl Table {
         capacity: Option<u64>,
         compress: bool,
     ) -> Result<Self, StorageError> {
-        // First, so an unusable directory fails the open rather than the first
-        // flush. `created` is `mkdir`'s own verdict, never a `stat`'s: a store
-        // read as freshly created skips its manifest, and the shard index then
-        // unlinks every shard in the directory.
-        let created = match fs::create_dir(dir) {
-            Ok(()) => true,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir_all(dir)?;
-                true
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
-            Err(e) => return Err(e.into()),
-        };
-
-        let rederived = matches!(recovery_source, RecoverySource::Rederive { .. });
-        let loaded = match recovery_source {
-            _ if created => None,
-            // Erased at open, so it reads nothing: an I/O error on the file it is
-            // about to unlink must not abort it.
-            RecoverySource::Rederive { resume_at: None } => None,
-            // Rebuilt from its sources, so damage is erased rather than fatal.
-            RecoverySource::Rederive { resume_at: Some(want) } => super::manifest::read_at(dir, want)?,
-            // Its shards are its only copy, so damage stops the open.
-            RecoverySource::SalReplay => super::manifest::read(dir)?,
-        };
-        if loaded.is_none() && rederived && !created {
-            // So a later re-open cannot reload what this one rejected.
-            super::manifest::unlink(&[dir])?;
-        }
-        let none = ShardSet::default();
-        let shards = loaded.as_ref().map_or(&none, |m| &m.shards);
-        // A rederived store's shards carry no PK filter.
-        let skip_pk_filter = rederived;
-        let shard_index = ShardIndex::open(dir, schema, capacity, skip_pk_filter, compress, shards)?;
+        let shard_index = ShardIndex::open(dir, schema, recovery_source, capacity, compress)?;
         Ok(Table {
             // Never full: the budget only sizes its PK filter, to a tick's worth of rows.
             pending: RunSet::new(MEMTABLE_BYTES),
             memtable: RunSet::cancelling(MEMTABLE_BYTES),
             ram_tier: RunSet::cancelling(ram_tier_bytes),
             shard_index,
-            loaded_mark: loaded.as_ref().map(|m| m.checkpoint_mark),
-            caller_record: loaded.as_ref().map(|m| m.caller_record.clone()).unwrap_or_default(),
             held_in_ram: false,
             live_row_scratch: Cell::new(Vec::new()),
             cached_full_scan: Cell::new(None),
             live_floor: Default::default(),
-            manifest_in_place: loaded,
-            manifest_synced: false,
         })
     }
 
@@ -201,7 +128,7 @@ impl Table {
 
     /// The checkpoint mark of the manifest this open loaded; `None` without one.
     pub(crate) fn loaded_mark(&self) -> Option<u64> {
-        self.loaded_mark
+        self.shard_index.loaded_mark
     }
 
     /// See [`ShardIndex::append_terminal_run`].
@@ -278,7 +205,8 @@ impl Table {
             return;
         }
         self.admit(&batch);
-        self.pending.push(batch, &self.shard_index.schema);
+        self.pending
+            .push_run(Rc::new(batch.trimmed()), &self.shard_index.schema);
     }
 
     /// Whether any row sits above the cut.
@@ -343,7 +271,7 @@ impl Table {
 
     /// The bytes this store's next published manifest carries for its owner.
     pub(crate) fn set_caller_record(&mut self, record: Vec<u8>) {
-        self.caller_record = record;
+        self.shard_index.caller_record = record;
     }
 
     // ------------------------------------------------------------------

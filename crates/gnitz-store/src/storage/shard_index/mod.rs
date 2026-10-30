@@ -1,13 +1,15 @@
 //! FLSM Shard Index: the tree a store's shards form — levels of guards and the
 //! shard entries in them, the compaction policy's constants and its learned
-//! cancel yield — opened from and published as a manifest's shard set. The
-//! writer, probes and upkeep over the tree are [`index`]'s.
+//! cancel yield — and the manifest it is opened from and stages and publishes.
+//! The writer, probes and upkeep over the tree are [`index`]'s.
 
 use std::collections::HashSet;
+use std::fs;
+use std::io;
 use std::ops::Range;
 use std::rc::Rc;
 
-use super::manifest::{self, ManifestEntry, ShardSet};
+use super::manifest::{self, Manifest, ManifestEntry, ShardSet};
 use super::pk_ranges_overlap;
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
@@ -190,10 +192,17 @@ impl LevelGuard {
     /// the span's lower fence, so a fold out of this guard must route by this
     /// instead.
     fn key_extent(&self) -> (PkBuf, PkBuf) {
-        let lo = self.entries.iter().map(|e| e.pk_min).min();
-        let hi = self.entries.iter().map(|e| e.pk_max).max();
-        lo.zip(hi).expect("a guard holds at least one shard")
+        extent(self.entries.iter()).expect("a guard holds at least one shard")
     }
+}
+
+/// The key span `entries` cover: their least `pk_min` and greatest `pk_max`,
+/// or `None` for no entries.
+fn extent<'a>(entries: impl Iterator<Item = &'a ShardEntry>) -> Option<(PkBuf, PkBuf)> {
+    entries.fold(None, |span, e| match span {
+        None => Some((e.pk_min, e.pk_max)),
+        Some((lo, hi)) => Some((lo.min(e.pk_min), hi.max(e.pk_max))),
+    })
 }
 
 /// The destination keys a fold of `entries` into the guard at `key` routes into
@@ -215,9 +224,7 @@ fn fold_destinations<'a>(key: PkBuf, entries: impl Iterator<Item = &'a ShardEntr
     let mut keys = vec![key];
     let bytes: u64 = entries.clone().map(|e| e.shard.file_len()).sum();
     let parts = bytes.div_ceil(target).min(MAX_PARTS) as usize;
-    let lo = entries.clone().map(|e| e.pk_min).min();
-    let hi = entries.clone().map(|e| e.pk_max).max();
-    if parts >= 2 && lo < hi {
+    if parts >= 2 && extent(entries.clone()).is_some_and(|(lo, hi)| lo < hi) {
         // About `SPLIT_SAMPLES` row keys: each shard is sorted and its PK region
         // fixed-stride, so a key is one O(1) read.
         let rows: usize = entries.clone().map(|e| e.shard.row_count()).sum();
@@ -251,8 +258,8 @@ impl FLSMLevel {
         guard_slot(&self.guards, key, |g| g.guard_key.pk_bytes())
     }
 
-    /// The guards overlapping `[range_min, range_max]` — a contiguous run,
-    /// because guards partition the key line, so callers may `drain` it.
+    /// The guards overlapping `[range_min, range_max]`: a contiguous run,
+    /// because guards partition the key line.
     fn find_guards_for_range(&self, range_min: &[u8], range_max: &[u8]) -> std::ops::Range<usize> {
         self.slot(range_min)..(self.slot(range_max) + 1).min(self.guards.len())
     }
@@ -281,7 +288,7 @@ impl FLSMLevel {
 }
 
 pub(super) struct ShardIndex {
-    pub(super) output_dir: String,
+    output_dir: String,
     pub(super) schema: SchemaDescriptor,
 
     levels: [FLSMLevel; LEVELS],
@@ -298,6 +305,18 @@ pub(super) struct ShardIndex {
     /// Published shards the index has dropped, unlinked by
     /// [`Self::unlink_retired`].
     retired: Vec<u64>,
+    /// The manifest in place: the one this open read, or the one this
+    /// process's last barrier renamed. `None` for a store that has none, and
+    /// from the staging of another until its barrier completes.
+    manifest_in_place: Option<Manifest>,
+    /// Whether a barrier of this process synced the directories behind
+    /// `manifest_in_place`. The rename of a manifest read at open may predate a
+    /// kill that came before them.
+    manifest_synced: bool,
+    /// The checkpoint mark of the manifest this open loaded.
+    pub(super) loaded_mark: Option<u64>,
+    /// What the next publish writes as the manifest's caller record.
+    pub(super) caller_record: Vec<u8>,
     /// `R`, the unit every byte target is stated in: the running max of the
     /// registered L0 bytes one L0 fold consumed, of one shard it wrote and of
     /// one terminal run, floored at [`MIN_GUARD_BYTES`] and persisted in the
@@ -363,18 +382,74 @@ impl CancelYield {
     }
 }
 
+/// How a relation's tail is recovered across a restart.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RecoverySource {
+    /// The tail is recovered by replaying the fsynced SAL over the shards loaded
+    /// from the manifest at open.
+    SalReplay,
+    /// Derived state, persisted under a generation-stamped manifest by each
+    /// ephemeral round that picks its relation.
+    Rederive {
+        /// The generation a manifest must carry for the open to resume from it
+        /// instead of erasing it; `None` erases it.
+        resume_at: Option<u64>,
+    },
+}
+
+/// A publish [`ShardIndex::stage`] staged and [`ShardIndex::publish`] completes.
+pub(super) struct FlushWork {
+    /// The manifest staged for the rename. Without one the manifest in place
+    /// is already current, and only the directory syncs are owed.
+    staged: Option<Manifest>,
+    /// Whether no publish of this store is known durable, so the entries that
+    /// reach its directory are owed a sync beside the directory itself.
+    first_sync: bool,
+}
+
 impl ShardIndex {
-    /// Open the store at `output_dir` holding `shards`, unlinking the staging file
-    /// and every shard `shards` does not name. `skip_pk_filter`: nothing
-    /// probes this store by PK.
+    /// Open the store at `output_dir`, creating the directory if it is missing.
+    /// `recovery` decides which manifest, if any, the open loads; every shard
+    /// that manifest does not name, and the staging file, are unlinked.
     pub(super) fn open(
         output_dir: &str,
         schema: SchemaDescriptor,
+        recovery: RecoverySource,
         capacity: Option<u64>,
-        skip_pk_filter: bool,
         compress: bool,
-        shards: &ShardSet,
     ) -> Result<Self, StorageError> {
+        // First, so an unusable directory fails the open rather than the first
+        // flush. `created` is `mkdir`'s own verdict, never a `stat`'s: a store
+        // read as freshly created skips its manifest, and so unlinks every
+        // shard in the directory.
+        let created = match fs::create_dir(output_dir) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(output_dir)?;
+                true
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(e) => return Err(e.into()),
+        };
+        let rederived = matches!(recovery, RecoverySource::Rederive { .. });
+        let loaded = match recovery {
+            _ if created => None,
+            // Erased at open, so it reads nothing: an I/O error on the file it is
+            // about to unlink must not abort it.
+            RecoverySource::Rederive { resume_at: None } => None,
+            // Rebuilt from its sources, so damage is erased rather than fatal.
+            RecoverySource::Rederive { resume_at: Some(want) } => manifest::read_at(output_dir, want)?,
+            // Its shards are its only copy, so damage stops the open.
+            RecoverySource::SalReplay => manifest::read(output_dir)?,
+        };
+        if loaded.is_none() && rederived && !created {
+            // So a later re-open cannot reload what this one rejected.
+            manifest::unlink(&[output_dir])?;
+        }
+        // A rederived store's shards carry no PK filter: nothing probes it by PK.
+        let skip_pk_filter = rederived;
+        let none = ShardSet::default();
+        let shards = loaded.as_ref().map_or(&none, |m| &m.shards);
         let live: HashSet<u64> = shards.entries.iter().map(|e| e.seq).collect();
         let shard_seq = live.iter().copied().max().unwrap_or(0);
         let mut idx = ShardIndex {
@@ -385,6 +460,10 @@ impl ShardIndex {
             shard_seq,
             published_through: shard_seq,
             retired: Vec::new(),
+            manifest_in_place: None,
+            manifest_synced: false,
+            loaded_mark: loaded.as_ref().map(|m| m.checkpoint_mark),
+            caller_record: loaded.as_ref().map(|m| m.caller_record.clone()).unwrap_or_default(),
             l0_run_bytes: shards.run_bytes.max(MIN_GUARD_BYTES),
             capacity,
             skip_pk_filter,
@@ -413,6 +492,7 @@ impl ShardIndex {
             idx.codebook = newest_coded.and_then(|e| Codebook::of_shard(&e.shard)).map(Rc::new);
         }
         manifest::remove_stale_files(output_dir, |seq| live.contains(&seq))?;
+        idx.manifest_in_place = loaded;
         Ok(idx)
     }
 

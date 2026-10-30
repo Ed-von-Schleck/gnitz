@@ -504,7 +504,10 @@ fn a_barrier_publishes_exactly_when_the_manifest_changes() {
     drop(t);
 
     let t = new_table(dir.path(), schema, resume, 100);
-    assert_eq!(t.caller_record, b"first", "the record reloads with its manifest");
+    assert_eq!(
+        t.shard_index.caller_record, b"first",
+        "the record reloads with its manifest"
+    );
     assert_eq!(t.full_scan().len(), 0, "no retracted row comes back");
 }
 

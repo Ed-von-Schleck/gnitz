@@ -70,10 +70,16 @@ fn run_set_fold_bench() {
     for (label, has_dominant, small_runs, rows) in arms {
         let mut set = RunSet::new(usize::MAX);
         if has_dominant {
-            set.push(run(&schema, (0..DOMINANT).map(|i| (2 * i, 1))), &schema);
+            set.push_run(
+                Rc::new(run(&schema, (0..DOMINANT).map(|i| (2 * i, 1))).trimmed()),
+                &schema,
+            );
         }
         for k in 0..small_runs {
-            set.push(run(&schema, (0..PER_RUN).map(|i| rows(k, i))), &schema);
+            set.push_run(
+                Rc::new(run(&schema, (0..PER_RUN).map(|i| rows(k, i))).trimmed()),
+                &schema,
+            );
         }
         assert_eq!(
             set.len(),
@@ -97,7 +103,7 @@ fn run_set_fold_bench() {
     }
 }
 
-/// `RunSet::push` at a memtable's cadence: a set is pushed `tick`-row runs of
+/// `RunSet::push_run` at a memtable's cadence: a set is pushed `tick`-row runs of
 /// fresh keys until it is full, then cleared, as a drain leaves it. Instructions
 /// and cycles per pushed row with the set never probed, and instructions with
 /// its bloom live from each fill's first push on, beside the rows its folds
@@ -126,7 +132,7 @@ fn run_set_push_bench() {
                 for (cell, probed) in cells.iter_mut().zip([false, true]) {
                     (rows, folded) = (0, 0);
                     let mut instructions = 0;
-                    let mut set = RunSet::new(MEMTABLE_BYTES);
+                    let mut set = RunSet::cancelling(MEMTABLE_BYTES);
                     for _ in 0..FILLS {
                         // Enough ticks to fill the set, built ahead of the measurement.
                         let ticks: Vec<Batch> = (0..)
@@ -142,17 +148,17 @@ fn run_set_push_bench() {
                             })
                             .collect();
                         // What the set's own folds merge, off a set the same ticks fill.
-                        let mut shadow = RunSet::new(MEMTABLE_BYTES);
+                        let mut shadow = RunSet::cancelling(MEMTABLE_BYTES);
                         for b in &ticks {
                             let (before, rows) = (shadow.runs.clone(), shadow.row_count() + b.len());
-                            shadow.push(b.clone(), &schema);
+                            shadow.push_run(Rc::new(b.clone().trimmed()), &schema);
                             folded += rows_folded(&before, rows, &shadow) as u64;
                         }
                         let (runs, held) = (shadow.len(), shadow.row_count() as u64);
                         let (((), i), c) = cycles.measure(|| {
                             counter.measure(|| {
                                 for (at, b) in ticks.into_iter().enumerate() {
-                                    set.push(b, &schema);
+                                    set.push_run(Rc::new(b.trimmed()), &schema);
                                     if probed && at == 0 {
                                         std::hint::black_box(set.may_contain(0));
                                     }
@@ -212,10 +218,10 @@ fn run_set_probe_bench() {
     };
     for (label, runs, layout) in layouts {
         let per_run = ROWS / runs;
-        let mut set = RunSet::new(DEFAULT_RAM_TIER_BYTES);
+        let mut set = RunSet::cancelling(DEFAULT_RAM_TIER_BYTES);
         for r in 0..runs {
-            set.push(
-                run(&schema, (0..per_run).map(|i| (2 * layout(r, i, per_run), 1))),
+            set.push_run(
+                Rc::new(run(&schema, (0..per_run).map(|i| (2 * layout(r, i, per_run), 1))).trimmed()),
                 &schema,
             );
         }

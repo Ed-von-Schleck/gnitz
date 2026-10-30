@@ -243,16 +243,12 @@ fn compaction_amplification_bench() {
     let counter = Counter::instructions();
     for (label, rows, budget, fits, filters, runs, reaches) in arms {
         let dir = tmp.path().join(label);
-        std::fs::create_dir(&dir).unwrap();
-        let mut idx = ShardIndex::open(
-            dir.to_str().unwrap(),
-            schema,
-            budget,
-            !filters,
-            false,
-            &ShardSet::default(),
-        )
-        .unwrap();
+        // A rederived store's shards carry no PK filter.
+        let recovery = match filters {
+            true => RecoverySource::SalReplay,
+            false => RecoverySource::Rederive { resume_at: None },
+        };
+        let mut idx = ShardIndex::open(dir.to_str().unwrap(), schema, recovery, budget, false).unwrap();
         let mut rng = Rng::new(0x5EED_1234);
         let (mut spilled, mut spilled_rows) = (0, 0);
         let (mut spill, mut upkeep, mut costliest) = (0, 0, 0);

@@ -69,14 +69,10 @@ impl RunSet {
         }
     }
 
-    /// Append a consolidated run: a [cancelling](Self::cancelling) set first
+    /// Append a consolidated, [trimmed](Batch::trimmed) run, since the set
+    /// charges only its rows' bytes: a [cancelling](Self::cancelling) set first
     /// merges it into the runs before it, and the set folds once it holds
     /// [`FOLD_THRESHOLD`] runs. Empty runs are never stored.
-    pub(super) fn push(&mut self, run: Batch, schema: &SchemaDescriptor) {
-        self.push_run(Rc::new(run.trimmed()), schema);
-    }
-
-    /// [`Self::push`] for a consolidated run something else holds too.
     pub(super) fn push_run(&mut self, run: Rc<Batch>, schema: &SchemaDescriptor) {
         debug_assert!(run.is_consolidated(), "RunSet::push_run requires a consolidated run");
         if run.is_empty() {

@@ -10,7 +10,7 @@ const SALT: [u32; 8] = [
 ///
 /// A key is already a well-mixed 64-bit fingerprint (`probe_key`): its high
 /// half picks the block, its low half the bits.
-pub(crate) struct BloomFilter {
+pub(super) struct BloomFilter {
     words: Vec<u32>,
     /// The block count less one; the count is a power of two.
     block_mask: usize,
@@ -19,7 +19,7 @@ pub(crate) struct BloomFilter {
 }
 
 impl BloomFilter {
-    pub(crate) fn new(expected_n: usize) -> Self {
+    pub(super) fn new(expected_n: usize) -> Self {
         let blocks = (expected_n * BITS_PER_KEY).div_ceil(256).next_power_of_two();
         BloomFilter {
             words: vec![0; blocks * 8],
@@ -35,7 +35,7 @@ impl BloomFilter {
     }
 
     #[inline]
-    pub(crate) fn add(&mut self, key: u64) {
+    pub(super) fn add(&mut self, key: u64) {
         self.added += 1;
         let at = self.block(key);
         let h = key as u32;
@@ -46,12 +46,12 @@ impl BloomFilter {
 
     /// More keys went in than the bits are sized for, and no more than half of
     /// them are among the `live` rows the filter still answers for.
-    pub(crate) fn stale(&self, live: usize) -> bool {
+    pub(super) fn stale(&self, live: usize) -> bool {
         self.added * BITS_PER_KEY > self.words.len() * 32 && self.added >= 2 * live
     }
 
     #[inline]
-    pub(crate) fn may_contain(&self, key: u64) -> bool {
+    pub(super) fn may_contain(&self, key: u64) -> bool {
         let at = self.block(key);
         let h = key as u32;
         let mut missing = 0u32;

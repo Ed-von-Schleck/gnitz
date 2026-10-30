@@ -1,17 +1,22 @@
 //! What [`ShardIndex`] does with the tree its parent module declares: the one
 //! shard writer and the appends through it, the PK probes and shard listings a
-//! cursor opens over, publish tracking and retirement, and the upkeep
-//! (`maintain`) with the folds it plans and runs — the L0→L1 fold, the byte
-//! targets every level's guard partition is held at, and the vertical drain into
-//! the terminal level.
+//! cursor opens over, staging and publishing the manifest and retiring the
+//! shards it drops, and the upkeep (`maintain`) with the folds it plans and
+//! runs — the L0→L1 fold, the byte targets every level's guard partition is held
+//! at, and the vertical drain into the terminal level.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::ops::Range;
 use std::rc::Rc;
 
-use super::super::{manifest, Cut};
+use io_uring::types::FsyncFlags;
+
+use super::super::batch_fsync::Syncer;
+use super::super::manifest::{self, Manifest};
+use super::super::Cut;
 use super::{
-    fold_destinations, CompactionKind, FLSMLevel, LevelGuard, ShardEntry, ShardIndex, CANCEL_PERCENT,
+    fold_destinations, CompactionKind, FLSMLevel, FlushWork, LevelGuard, ShardEntry, ShardIndex, CANCEL_PERCENT,
     GUARD_FILE_THRESHOLD, L0, L0_COMPACT_THRESHOLD, L1, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL, UPKEEP_LEVY,
 };
 use crate::storage::pk_ranges_overlap;
@@ -40,6 +45,9 @@ pub(super) struct Running {
     merge: GuardMerge,
     /// Every output inherits the newest stamp over the inputs.
     newest: u64,
+    /// The inputs' rows and registered bytes.
+    in_rows: usize,
+    in_bytes: u64,
     /// The destination to merge next.
     next: usize,
     opened: Vec<(PkBuf, ShardEntry)>,
@@ -199,7 +207,7 @@ impl ShardIndex {
 
     /// Finish the fold under way, if any: a manifest names a tree, and a
     /// half-written fold's outputs are in none.
-    pub(crate) fn finish_fold(&mut self) -> Result<(), StorageError> {
+    fn finish_fold(&mut self) -> Result<(), StorageError> {
         while self.running.is_some() {
             self.step()?;
         }
@@ -261,16 +269,76 @@ impl ShardIndex {
     }
 
     /// Every live shard no published manifest names yet.
-    pub(crate) fn unsynced_paths(&self) -> impl Iterator<Item = String> + '_ {
+    fn unsynced_paths(&self) -> impl Iterator<Item = String> + '_ {
         self.all_entries()
             .filter(|e| !self.published(e))
             .map(|e| manifest::shard_path(&self.output_dir, e.seq))
     }
 
     /// The manifest built from the current shard set has been renamed into place.
-    pub(crate) fn mark_published(&mut self) {
+    fn mark_published(&mut self) {
         debug_assert!(self.running.is_none(), "a fold under way holds seqs no manifest names");
         self.published_through = self.shard_seq;
+    }
+
+    /// Stage the manifest of the current tree, carrying `checkpoint_mark`,
+    /// unless it is the one in place; `None` when that one is also synced.
+    pub(crate) fn stage(&mut self, checkpoint_mark: u64) -> Result<Option<FlushWork>, StorageError> {
+        self.finish_fold()?;
+        let m = Manifest {
+            checkpoint_mark,
+            caller_record: self.caller_record.clone(),
+            shards: self.shard_set(),
+        };
+        let staged = (self.manifest_in_place.as_ref() != Some(&m)).then_some(m);
+        debug_assert!(
+            staged.is_some() || self.unsynced_paths().next().is_none(),
+            "the manifest in place names an unsynced shard"
+        );
+        if staged.is_none() && self.manifest_synced {
+            return Ok(None);
+        }
+        // Until the barrier records otherwise: a failed publish may have renamed.
+        let first_sync = !std::mem::take(&mut self.manifest_synced);
+        if let Some(m) = &staged {
+            self.manifest_in_place = None;
+            manifest::stage(&self.output_dir, m)?;
+        }
+        Ok(Some(FlushWork { staged, first_sync }))
+    }
+
+    /// Durably publish every store in `work` as [`Self::stage`] staged it, then
+    /// unlink the shards its new manifest no longer names.
+    pub(crate) fn publish(mut work: Vec<(&mut ShardIndex, FlushWork)>) -> Result<(), StorageError> {
+        let mut sync = Syncer::default();
+        // Every unsynced shard and every staged manifest, before any rename.
+        sync.sync_paths(
+            work.iter().flat_map(|(idx, w)| {
+                idx.unsynced_paths()
+                    .chain(w.staged.is_some().then(|| manifest::staging_path(&idx.output_dir)))
+            }),
+            FsyncFlags::DATASYNC,
+        )?;
+        let mut dirs = BTreeSet::new();
+        for (idx, w) in &mut work {
+            if w.staged.is_some() {
+                // The rename publishes every shard the manifest names.
+                manifest::commit(&idx.output_dir)?;
+                idx.mark_published();
+            }
+            dirs.extend(manifest::owed_dirs(&idx.output_dir, w.first_sync));
+        }
+        // A rename is metadata: a full fsync, not fdatasync.
+        sync.sync_paths(&dirs, FsyncFlags::empty())?;
+        // No durable manifest names a superseded shard any more.
+        for (idx, w) in work {
+            if let Some(m) = w.staged {
+                idx.manifest_in_place = Some(m);
+            }
+            idx.manifest_synced = true;
+            idx.unlink_retired();
+        }
+        Ok(())
     }
 
     /// Every shard `cut` reads: the pending ones only at [`Cut::Now`].
@@ -360,11 +428,18 @@ impl ShardIndex {
                     .expect("a fold names registered shards")
             })
             .collect();
-        let newest = shards.iter().map(|e| e.newest).max().unwrap_or(0);
+        let (mut newest, mut in_rows, mut in_bytes) = (0, 0, 0);
+        for e in &shards {
+            newest = newest.max(e.newest);
+            in_rows += e.shard.row_count();
+            in_bytes += e.shard.file_len();
+        }
         let merge = GuardMerge::begin(shards.iter().map(|e| Rc::clone(&e.shard)).collect())?;
         self.running = Some(Running {
             merge,
             newest,
+            in_rows,
+            in_bytes,
             next: 0,
             opened: Vec::with_capacity(fold.keys.len()),
             fold,
@@ -389,13 +464,8 @@ impl ShardIndex {
             codebook.as_deref(),
         );
         // Row share stands in for byte share.
-        let (rows, bytes): (usize, u64) = run
-            .merge
-            .shards()
-            .iter()
-            .fold((0, 0), |(r, b), s| (r + s.row_count(), b + s.file_len()));
         let merged_rows = (run.merge.rows_merged() - before) as u128;
-        let read = (u128::from(bytes) * merged_rows / rows.max(1) as u128) as u64 + 1;
+        let read = (u128::from(run.in_bytes) * merged_rows / run.in_rows.max(1) as u128) as u64 + 1;
         if let Some(merged) = merged {
             // A store that has coded no heap yet codes the run under one of its own.
             let fresh = merged.plain().and_then(|b| self.codebook_for(b));
@@ -423,7 +493,7 @@ impl ShardIndex {
     /// Retire the inputs of a finished fold and register its outputs under
     /// their guards.
     fn install(&mut self, run: Running) {
-        let Running { fold, merge, opened, .. } = run;
+        let Running { fold, merge, opened, in_rows, .. } = run;
         let shards = merge.shards();
         if fold.kind == CompactionKind::L0Fold {
             // A run that lands in one guard is one shard whose encodings span
@@ -436,12 +506,11 @@ impl ShardIndex {
         if fold.kind == CompactionKind::GuardSplit {
             // The one fold that reads a guard's whole history at its level, and so
             // every row its retractions can cancel there.
-            let read: usize = shards.iter().map(|s| s.row_count()).sum();
             let wrote: usize = opened.iter().map(|(_, e)| e.shard.row_count()).sum();
             // Its inputs are the guard's shards in order, and the oldest has no
             // older one there to retract from.
             let retractions = shards.iter().skip(1).map(|s| s.retraction_rows()).sum();
-            self.cancel_yield.observe(retractions, read.saturating_sub(wrote));
+            self.cancel_yield.observe(retractions, in_rows.saturating_sub(wrote));
         }
         #[cfg(test)]
         super::cstats::record(
@@ -831,7 +900,7 @@ impl ShardIndex {
     }
 
     /// Unlink every retired shard.
-    pub(crate) fn unlink_retired(&mut self) {
+    fn unlink_retired(&mut self) {
         for seq in std::mem::take(&mut self.retired) {
             self.unlink_shard(seq);
         }
