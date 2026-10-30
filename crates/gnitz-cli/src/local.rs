@@ -47,7 +47,11 @@ impl Held {
         let held = Arc::clone(&server);
         std::thread::spawn(move || {
             if let Some(signal) = caught.forever().next() {
-                drop(held.lock().unwrap_or_else(|e| e.into_inner()).take());
+                // Held across the exit, so a main that ends meanwhile waits on
+                // it in `drop` and the signal's status is the one the process
+                // exits with.
+                let mut server = held.lock().unwrap_or_else(|e| e.into_inner());
+                drop(server.take());
                 std::process::exit(128 + signal);
             }
         });

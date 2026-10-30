@@ -10,12 +10,16 @@ use gnitz_wire::{format_date, format_decimal, format_timestamp, format_uuid, Col
 
 /// One cell. Each variant keeps what its renderings need: the text a terminal
 /// shows, and the JSON type a script reads back.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Value {
     Null,
     Bool(bool),
-    Int(i128),
-    UInt(u128),
+    Int(i64),
+    UInt(u64),
+    /// HUGEINT and UHUGEINT, which JSON carries as a string, as no JSON reader
+    /// is bound to hold a number that wide.
+    I128(i128),
+    U128(u128),
     F32(f32),
     F64(f64),
     /// A string, and DECIMAL, DATE, TIMESTAMP and UUID in their canonical text,
@@ -34,6 +38,8 @@ impl Value {
             Value::Bool(b) => b.to_string(),
             Value::Int(v) => v.to_string(),
             Value::UInt(v) => v.to_string(),
+            Value::I128(v) => v.to_string(),
+            Value::U128(v) => v.to_string(),
             Value::F32(v) => FloatText(*v).to_string(),
             Value::F64(v) => FloatText(*v).to_string(),
             Value::Bytes(b) => {
@@ -47,40 +53,37 @@ impl Value {
         }))
     }
 
-    /// Append the cell as JSON to `out`: a number where JSON holds it exactly,
-    /// else its text as a string, so no precision is lost.
+    /// Append the cell as JSON to `out`: integers up to 64 bits and booleans
+    /// as JSON's own, a float as a number where it is finite; anything else as
+    /// its text in a string, so no precision is lost.
     pub fn write_json(&self, out: &mut String) {
-        let _ = match self {
-            Value::Null => write!(out, "null"),
-            Value::Bool(b) => write!(out, "{b}"),
-            Value::Int(v) if i64::try_from(*v).is_ok() => write!(out, "{v}"),
-            Value::UInt(v) if u64::try_from(*v).is_ok() => write!(out, "{v}"),
+        match self {
+            Value::Null => out.push_str("null"),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Value::Int(v) => {
+                let _ = write!(out, "{v}");
+            }
+            Value::UInt(v) => {
+                let _ = write!(out, "{v}");
+            }
             // The shortest text that reads back as the float itself, of its
             // own width; a non-finite float has no JSON number.
-            Value::F32(v) if v.is_finite() => write!(out, "{}", serde_json::to_string(v).expect(SERIALIZES)),
-            Value::F64(v) if v.is_finite() => write!(out, "{}", serde_json::to_string(v).expect(SERIALIZES)),
-            _ => write_json_string(out, &self.text().unwrap_or_default()),
-        };
+            Value::F32(v) if v.is_finite() => out.push_str(&serde_json::to_string(v).expect(SERIALIZES)),
+            Value::F64(v) if v.is_finite() => out.push_str(&serde_json::to_string(v).expect(SERIALIZES)),
+            _ => out.push_str(&json_string(&self.text().unwrap_or_default())),
+        }
     }
 }
 
 const SERIALIZES: &str = "a finite float or a string serializes";
 
-/// Append `s` to `out` as a JSON string.
-pub fn write_json_string(out: &mut String, s: &str) -> std::fmt::Result {
-    write!(out, "{}", serde_json::to_string(s).expect(SERIALIZES))
-}
-
-/// Whether a column of `tc` reads right-aligned.
-pub fn is_numeric(tc: TypeCode) -> bool {
-    !matches!(
-        tc,
-        TypeCode::String | TypeCode::Blob | TypeCode::UUID | TypeCode::Date | TypeCode::Timestamp | TypeCode::Bool
-    )
+/// `s` as a JSON string.
+pub fn json_string(s: &str) -> String {
+    serde_json::to_string(s).expect(SERIALIZES)
 }
 
 /// The cell at `loc` in `row` of `batch`.
-pub fn cell(batch: &ZSetBatch, loc: ColumnLocator, ty: ColType, row: usize) -> Value {
+fn cell(batch: &ZSetBatch, loc: ColumnLocator, ty: ColType, row: usize) -> Value {
     if loc.is_null(batch, row) {
         return Value::Null;
     }
@@ -95,13 +98,13 @@ pub fn cell(batch: &ZSetBatch, loc: ColumnLocator, ty: ColType, row: usize) -> V
         )
     };
     match ty.tc {
-        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => Value::UInt((int() as u64).into()),
-        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => Value::Int(int().into()),
+        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => Value::UInt(int() as u64),
+        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => Value::Int(int()),
         TypeCode::Bool => Value::Bool(b[0] != 0),
         TypeCode::F32 => Value::F32(f32::from_le_bytes(b.try_into().expect("an F32 cell is 4 bytes"))),
         TypeCode::F64 => Value::F64(f64::from_le_bytes(b.try_into().expect("an F64 cell is 8 bytes"))),
-        TypeCode::U128 => Value::UInt(u128::from_le_bytes(wide(b))),
-        TypeCode::I128 => Value::Int(i128::from_le_bytes(wide(b))),
+        TypeCode::U128 => Value::U128(u128::from_le_bytes(wide(b))),
+        TypeCode::I128 => Value::I128(i128::from_le_bytes(wide(b))),
         TypeCode::UUID => Value::Text(format_uuid(u128::from_le_bytes(wide(b)))),
         TypeCode::Date => Value::Text(format_date(int())),
         TypeCode::Timestamp => Value::Text(format_timestamp(int())),
@@ -112,14 +115,12 @@ pub fn cell(batch: &ZSetBatch, loc: ColumnLocator, ty: ColType, row: usize) -> V
 }
 
 /// One column of a decoded reply.
-#[derive(Clone, Debug)]
 pub struct Column {
     pub name: String,
-    pub ty: ColType,
+    pub tc: TypeCode,
 }
 
 /// A reply's visible columns and its rows, each at its weight.
-#[derive(Clone, Debug, Default)]
 pub struct Rows {
     pub columns: Vec<Column>,
     pub rows: Vec<(Vec<Value>, i64)>,
@@ -131,10 +132,7 @@ impl Rows {
         Rows {
             columns: columns
                 .iter()
-                .map(|&(name, tc)| Column {
-                    name: name.to_string(),
-                    ty: ColType::of(tc),
-                })
+                .map(|&(name, tc)| Column { name: name.to_string(), tc })
                 .collect(),
             rows: rows.into_iter().map(|r| (r, 1)).collect(),
         }
@@ -142,14 +140,13 @@ impl Rows {
 
     pub fn decode(reply: &ScanReply) -> Rows {
         let schema = &reply.schema;
-        let shown: Vec<(ColumnLocator, ColType)> = schema
+        let (shown, columns): (Vec<(ColumnLocator, ColType)>, Vec<Column>) = schema
             .visible_columns()
-            .map(|(ci, c)| (schema.layout().locate(ci), c.ty))
-            .collect();
-        let columns = schema
-            .visible_columns()
-            .map(|(_, c)| Column { name: c.name.clone(), ty: c.ty })
-            .collect();
+            .map(|(ci, c)| {
+                let column = Column { name: c.name.clone(), tc: c.ty.tc };
+                ((schema.layout().locate(ci), c.ty), column)
+            })
+            .unzip();
         let batch = &reply.batch;
         let rows = (0..batch.len())
             .map(|row| {

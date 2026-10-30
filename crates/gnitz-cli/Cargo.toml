@@ -32,7 +32,6 @@ reedline = "0.52"
 nu-ansi-term = "0.50"
 comfy-table = { version = "8", features = ["custom_styling"] }
 clap = { version = "4", features = ["derive"] }
-csv = "1"
 serde_json = "1"
 dirs = "7"
 signal-hook = "0.3"

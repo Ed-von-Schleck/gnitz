@@ -55,8 +55,12 @@ fn ctx() -> Context {
     }
 }
 
+fn values_at(ctx: &Context, line: &str, pos: usize) -> Vec<String> {
+    suggest(ctx, line, pos).into_iter().map(|s| s.value).collect()
+}
+
 fn values(line: &str) -> Vec<String> {
-    suggest(&ctx(), line, line.len()).into_iter().map(|s| s.value).collect()
+    values_at(&ctx(), line, line.len())
 }
 
 #[test]
@@ -79,14 +83,14 @@ fn a_schema_qualifier_lists_its_relations() {
 #[test]
 fn an_alias_qualifier_lists_its_columns() {
     let line = "SELECT o. FROM orders AS o";
-    let v: Vec<String> = suggest(&ctx(), line, 9).into_iter().map(|s| s.value).collect();
+    let v = values_at(&ctx(), line, 9);
     assert_eq!(v, vec!["o.amount", "o.customer", "o.id"]);
 }
 
 #[test]
 fn columns_of_named_relations_rank_before_keywords() {
     let line = "SELECT n FROM customers";
-    let v: Vec<String> = suggest(&ctx(), line, 8).into_iter().map(|s| s.value).collect();
+    let v = values_at(&ctx(), line, 8);
     assert_eq!(v[0], "name");
 }
 
@@ -176,7 +180,7 @@ fn only_the_statement_under_the_cursor_names_relations() {
 #[test]
 fn a_derived_table_leaves_the_items_after_it() {
     let line = "SELECT o. FROM (SELECT * FROM customers) d, orders o";
-    let v: Vec<String> = suggest(&ctx(), line, 9).into_iter().map(|s| s.value).collect();
+    let v = values_at(&ctx(), line, 9);
     assert_eq!(v, vec!["o.amount", "o.customer", "o.id"]);
 }
 
@@ -250,18 +254,18 @@ fn a_name_is_written_as_sql_reads_it_back() {
         ..ctx()
     };
     let line = "SELECT  FROM t";
-    let v: Vec<String> = suggest(&ctx, line, 7).into_iter().map(|s| s.value).collect();
+    let v = values_at(&ctx, line, 7);
     for c in ["id", "name", "\"a b\"", "\"null\"", "\"from\""] {
         assert!(v.contains(&c.to_string()), "{c}: {v:?}");
     }
     let line = "SELECT * FROM 20";
-    let v: Vec<String> = suggest(&ctx, line, line.len()).into_iter().map(|s| s.value).collect();
+    let v = values_at(&ctx, line, line.len());
     assert!(v.is_empty(), "a number is no word: {v:?}");
     let line = "SELECT * FROM ";
-    let v: Vec<String> = suggest(&ctx, line, line.len()).into_iter().map(|s| s.value).collect();
+    let v = values_at(&ctx, line, line.len());
     assert!(v.contains(&"\"2024_sales\"".to_string()), "{v:?}");
     let line = "SELECT a FROM t";
-    let v: Vec<String> = suggest(&ctx, line, 8).into_iter().map(|s| s.value).collect();
+    let v = values_at(&ctx, line, 8);
     assert!(v.contains(&"\"a b\"".to_string()), "{v:?}");
 }
 
@@ -269,4 +273,21 @@ fn a_name_is_written_as_sql_reads_it_back() {
 fn quantifiers_are_offered() {
     assert!(values("SELECT * FROM orders WHERE id = AN").contains(&"ANY".to_string()));
     assert!(values("SELECT * FROM orders WHERE id = SOM").contains(&"SOME".to_string()));
+}
+
+#[test]
+fn a_quoted_qualifier_reads_as_sql_reads_it() {
+    let ctx = Context {
+        catalog: Catalog {
+            schemas: vec!["public".into(), "table".into()],
+            relations: vec![rel(1, "table", "t", &["x"]), rel(2, "public", "2024_sales", &["id"])],
+        },
+        ..ctx()
+    };
+    let line = "SELECT * FROM \"table\".";
+    assert_eq!(values_at(&ctx, line, line.len()), vec!["\"table\".t"]);
+    let line = "\\d \"table\".";
+    assert_eq!(values_at(&ctx, line, line.len()), vec!["\"table\".t"]);
+    let line = "SELECT * FROM \"2024_sales\" WHERE \"2024_sales\".";
+    assert_eq!(values_at(&ctx, line, line.len()), vec!["\"2024_sales\".id"]);
 }

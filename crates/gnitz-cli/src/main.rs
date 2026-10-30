@@ -1,8 +1,7 @@
 use std::io::IsTerminal;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gnitz_cli::{Expanded, Flow, Format, Options, Settings, Shell};
@@ -65,6 +64,13 @@ fn schema_name(text: &str) -> Result<String, String> {
     gnitz_sql::parse_schema_name(text).ok_or_else(|| format!("\"{text}\" is not a schema name"))
 }
 
+/// A socket each SIGINT writes a byte to, from then on.
+fn cancel_on_sigint() -> std::io::Result<UnixStream> {
+    let (cancel, signalled) = UnixStream::pair()?;
+    signal_hook::low_level::pipe::register(signal_hook::consts::SIGINT, signalled)?;
+    Ok(cancel)
+}
+
 /// One input of a script run, in command-line order.
 enum Input<'a> {
     Command(&'a str),
@@ -74,18 +80,10 @@ enum Input<'a> {
 fn main() -> ExitCode {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
-    let mut inputs: Vec<(usize, Input<'_>)> = matches
-        .indices_of("command")
-        .into_iter()
-        .flatten()
+    let at = |id| matches.indices_of(id).into_iter().flatten();
+    let mut inputs: Vec<(usize, Input<'_>)> = at("command")
         .zip(cli.command.iter().map(|c| Input::Command(c)))
-        .chain(
-            matches
-                .indices_of("file")
-                .into_iter()
-                .flatten()
-                .zip(cli.file.iter().map(|f| Input::File(f))),
-        )
+        .chain(at("file").zip(cli.file.iter().map(|f| Input::File(f))))
         .collect();
     inputs.sort_by_key(|&(at, _)| at);
     let scripted = !inputs.is_empty();
@@ -96,24 +94,26 @@ fn main() -> ExitCode {
         && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
 
     // In a session Ctrl-C cancels the wait in progress; a script dies by it.
-    let interrupt = interactive.then(|| {
-        let flag = Arc::new(AtomicBool::new(false));
-        if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&flag)) {
-            eprintln!("gnitz: cannot handle SIGINT: {e}");
-        }
-        flag
-    });
+    let interrupt = match interactive {
+        true => match cancel_on_sigint() {
+            Ok(cancel) => Some(cancel),
+            Err(e) => {
+                eprintln!("gnitz: cannot handle SIGINT: {e}");
+                None
+            }
+        },
+        false => None,
+    };
 
     // An empty GNITZ_TARGET is none, and --data asks for a server of the
     // session's own whatever the environment names.
     let given = match (cli.target.clone(), &cli.data) {
         (Some(target), _) => Some(target),
         (None, Some(_)) => None,
-        (None, None) => match std::env::var("GNITZ_TARGET") {
-            Ok(target) => (!target.is_empty()).then_some(target),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                eprintln!("gnitz: GNITZ_TARGET is not UTF-8");
+        (None, None) => match gnitz_core::env_target() {
+            Ok(target) => target,
+            Err(e) => {
+                eprintln!("gnitz: {e}");
                 return ExitCode::from(2);
             }
         },

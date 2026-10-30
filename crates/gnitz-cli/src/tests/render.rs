@@ -1,24 +1,17 @@
 use super::*;
-use crate::value::{Column, Value};
-use gnitz_wire::{ColType, TypeCode};
+use crate::value::Value;
 
+/// Two rows, the second at weight 2.
 fn rows() -> Rows {
-    Rows {
-        columns: vec![
-            Column {
-                name: "id".into(),
-                ty: ColType::of(TypeCode::I64),
-            },
-            Column {
-                name: "name".into(),
-                ty: ColType::of(TypeCode::String),
-            },
+    let mut r = Rows::of(
+        &[("id", TypeCode::I64), ("name", TypeCode::String)],
+        [
+            vec![Value::Int(1), Value::Text("a,b".into())],
+            vec![Value::Int(2), Value::Null],
         ],
-        rows: vec![
-            (vec![Value::Int(1), Value::Text("a,b".into())], 1),
-            (vec![Value::Int(2), Value::Null], 2),
-        ],
-    }
+    );
+    r.rows[1].1 = 2;
+    r
 }
 
 /// A file or a pipe.
@@ -60,30 +53,53 @@ fn csv_quotes_and_leaves_null_empty() {
 }
 
 #[test]
-fn json_keeps_types_and_spells_wide_integers_as_strings() {
-    let r = Rows {
-        columns: vec![
-            Column {
-                name: "big".into(),
-                ty: ColType::of(TypeCode::U128),
-            },
-            Column {
-                name: "f".into(),
-                ty: ColType::of(TypeCode::F64),
-            },
+fn json_keeps_types_and_spells_every_wide_integer_as_a_string() {
+    let r = Rows::of(
+        &[("big", TypeCode::U128), ("small", TypeCode::I128), ("f", TypeCode::F64)],
+        [
+            vec![Value::U128(u128::MAX), Value::I128(-5), Value::F64(1.5)],
+            vec![Value::U128(5), Value::I128(i128::MIN), Value::F64(f64::NAN)],
         ],
-        rows: vec![(vec![Value::UInt(u128::MAX), Value::F64(1.5)], 1)],
-    };
+    );
     let out = render(&r, Weights::Repeat, &plain(Format::Json), PLAIN);
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(parsed[0]["big"], serde_json::Value::String(u128::MAX.to_string()));
+    assert_eq!(parsed[0]["big"], serde_json::json!(u128::MAX.to_string()));
+    assert_eq!(parsed[0]["small"], serde_json::json!("-5"));
     assert_eq!(parsed[0]["f"], serde_json::json!(1.5));
+    assert_eq!(parsed[1]["big"], serde_json::json!("5"));
+    assert_eq!(parsed[1]["small"], serde_json::json!(i128::MIN.to_string()));
+    assert_eq!(parsed[1]["f"], serde_json::json!("NaN"));
+}
+
+#[test]
+fn json_repeats_a_bag_row_by_its_weight() {
+    let out = render(&rows(), Weights::Repeat, &plain(Format::Json), PLAIN);
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let parsed = parsed.as_array().unwrap();
+    assert_eq!(parsed.len(), 3);
+    assert_eq!(parsed[1], serde_json::json!({"id": 2, "name": null}));
+    assert_eq!(parsed[1], parsed[2]);
 }
 
 #[test]
 fn an_empty_result_is_an_empty_json_array() {
     let r = Rows { rows: vec![], ..rows() };
     assert_eq!(render(&r, Weights::Repeat, &plain(Format::Json), PLAIN), "[]\n");
+}
+
+#[test]
+fn a_csv_record_with_no_text_is_an_empty_quoted_field() {
+    let r = Rows::of(
+        &[("x", TypeCode::String)],
+        [vec![Value::Text(String::new())], vec![Value::Null]],
+    );
+    assert_eq!(
+        render(&r, Weights::Repeat, &plain(Format::Csv), PLAIN),
+        "x\n\"\"\n\"\"\n"
+    );
+    let mut out = String::new();
+    csv_record(&mut out, ["a\"b", "c\rd", "", "e"]);
+    assert_eq!(out, "\"a\"\"b\",\"c\rd\",,e\n");
 }
 
 #[test]
@@ -119,13 +135,10 @@ fn a_wide_character_cell_expands_auto_where_its_char_count_would_fit() {
         footer: false,
         ..Settings::default()
     };
-    let r = Rows {
-        columns: vec![Column {
-            name: "x".into(),
-            ty: ColType::of(TypeCode::String),
-        }],
-        rows: vec![(vec![Value::Text("数据库数据库数据库数".into())], 1)],
-    };
+    let r = Rows::of(
+        &[("x", TypeCode::String)],
+        [vec![Value::Text("数据库数据库数据库数".into())]],
+    );
     // Ten chars take 14 columns as a table, twenty wide ones 24.
     assert!(render(&r, Weights::Repeat, &settings, wide(20)).starts_with("-[ RECORD 1 ]"));
     assert!(render(&r, Weights::Repeat, &settings, wide(24)).contains('│'));

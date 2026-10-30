@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use gnitz_core::block_on;
 use nu_ansi_term::{Color, Style};
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
@@ -14,9 +15,10 @@ use reedline::{
     Validator, Vi,
 };
 
+use crate::complete::Context;
 use crate::highlight::SqlHighlighter;
 use crate::lex;
-use crate::shell::{Flow, Shell};
+use crate::shell::{command_from_env, Flow, Shell};
 
 const COMPLETION_MENU: &str = "completion_menu";
 const HISTORY_CAPACITY: usize = 10_000;
@@ -112,9 +114,7 @@ fn add_common_bindings(kb: &mut Keybindings) {
 
 /// `$VISUAL`, else `$EDITOR`, else `vi`.
 pub fn editor() -> String {
-    std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_string())
+    command_from_env(&["VISUAL", "EDITOR"], "vi")
 }
 
 /// The user's editor, run on `path` through the shell so `$EDITOR` may carry
@@ -179,6 +179,7 @@ fn build(vi: bool, color: bool, buffer: PathBuf) -> Reedline {
 /// The session: read a buffer at each prompt and run it, until `\q`, an exit
 /// word or Ctrl-D.
 pub fn run(shell: &mut Shell, vi: bool) -> ExitCode {
+    // Alt-E's buffer file lives here, removed when the session ends.
     let scratch = match tempfile::Builder::new().prefix("gnitz-").tempdir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -186,28 +187,32 @@ pub fn run(shell: &mut Shell, vi: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut line_editor = build(vi, shell.color, scratch.path().join("buffer.sql"));
-    shell.scratch = Some(scratch);
+    let mut line_editor = build(vi, shell.options.color, scratch.path().join("buffer.sql"));
     println!(
         "gnitz {} — connected to {}. Type \\? for help, \\q to quit.",
         gnitz_wire::RELEASE,
-        shell.target()
+        shell.options.target
     );
     loop {
         // Completion offers what the catalog holds now, whichever session
-        // changed it; a failed read keeps the previous completer.
-        if let Some(ctx) = shell.completion() {
-            line_editor = line_editor.with_completer(Box::new(ctx));
+        // changed it; a failed read keeps the previous completer. A Ctrl-C
+        // left over from the last command must not cancel the read.
+        shell.clear_interrupt();
+        if let Ok(catalog) = block_on(shell.client.catalog()) {
+            let schema = shell.options.schema.clone();
+            line_editor = line_editor.with_completer(Box::new(Context { catalog, schema }));
         }
         if let Some(text) = shell.prefill.take() {
             line_editor.run_edit_commands(&[EditCommand::InsertString(text)]);
         }
         let prompt = ShellPrompt {
-            schema: shell.schema.clone(),
+            schema: shell.options.schema.clone(),
             in_transaction: shell.client.txn_active(),
         };
         match line_editor.read_line(&prompt) {
             Ok(Signal::Success(buffer)) => {
+                // On disk before it runs, so a session a signal ends keeps it.
+                let _ = line_editor.sync_history();
                 if let Ok(Flow::Quit) = shell.run_script(&buffer) {
                     break;
                 }

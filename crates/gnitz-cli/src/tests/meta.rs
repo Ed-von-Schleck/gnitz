@@ -10,13 +10,6 @@ fn a_command_word_ending_in_plus_asks_for_the_verbose_form() {
 }
 
 #[test]
-fn lookup_knows_the_aliases() {
-    assert_eq!(lookup("\\quit").map(MetaCommand::name), Some("\\q"));
-    assert_eq!(lookup("\\help").map(MetaCommand::name), Some("\\?"));
-    assert!(lookup("\\nope").is_none());
-}
-
-#[test]
 fn every_command_name_is_unique_and_found() {
     for c in COMMANDS {
         for &name in c.names {
@@ -24,6 +17,7 @@ fn every_command_name_is_unique_and_found() {
             assert_eq!(lookup(name).map(MetaCommand::name), Some(c.name()));
         }
     }
+    assert!(lookup("\\nope").is_none());
 }
 
 #[test]

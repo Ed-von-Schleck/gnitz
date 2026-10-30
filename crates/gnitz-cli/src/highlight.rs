@@ -7,26 +7,26 @@ use reedline::{Highlighter, StyledText};
 use crate::lex::{is_keyword, lex_prefix, Lexeme};
 use crate::meta::{ArgKind, MetaLine};
 
-/// The style of each token class.
-pub struct Palette {
-    pub keyword: Style,
-    pub function: Style,
-    pub identifier: Style,
-    pub quoted: Style,
-    pub string: Style,
-    pub number: Style,
-    pub comment: Style,
-    pub operator: Style,
-    pub meta: Style,
+/// The highlighter: the style of each token class.
+pub struct SqlHighlighter {
+    keyword: Style,
+    function: Style,
+    identifier: Style,
+    quoted: Style,
+    string: Style,
+    number: Style,
+    comment: Style,
+    operator: Style,
+    meta: Style,
     /// Input the tokenizer stopped at: an unterminated string or comment.
-    pub open: Style,
+    open: Style,
     /// The bracket under the cursor and its partner.
-    pub bracket: Style,
+    bracket: Style,
 }
 
-impl Default for Palette {
+impl Default for SqlHighlighter {
     fn default() -> Self {
-        Palette {
+        SqlHighlighter {
             keyword: Style::new().fg(Color::LightBlue).bold(),
             function: Style::new().fg(Color::LightCyan),
             identifier: Style::new(),
@@ -42,11 +42,6 @@ impl Default for Palette {
     }
 }
 
-#[derive(Default)]
-pub struct SqlHighlighter {
-    palette: Palette,
-}
-
 impl SqlHighlighter {
     /// The style of each byte range of `src`, in order, covering it whole.
     pub fn spans(&self, src: &str, cursor: usize) -> Vec<(Style, std::ops::Range<usize>)> {
@@ -54,7 +49,7 @@ impl SqlHighlighter {
             return self.sql_spans(src, cursor);
         };
         let cmd_end = name.end;
-        let mut spans = vec![(Style::new(), 0..name.start), (self.palette.meta, name)];
+        let mut spans = vec![(Style::new(), 0..name.start), (self.meta, name)];
         // A command that takes SQL, `\watch`, has its argument read as SQL.
         if command.is_some_and(|c| matches!(c.arg, ArgKind::Sql(_))) {
             spans.extend(
@@ -69,7 +64,6 @@ impl SqlHighlighter {
     }
 
     fn sql_spans(&self, src: &str, cursor: usize) -> Vec<(Style, std::ops::Range<usize>)> {
-        let p = &self.palette;
         let (lexemes, lexed) = lex_prefix(src);
         let brackets = matching_brackets(&lexemes, cursor);
         let mut spans = Vec::with_capacity(lexemes.len() + 1);
@@ -79,7 +73,7 @@ impl SqlHighlighter {
                 spans.push((Style::new(), at..l.range.start));
             }
             let style = if brackets.is_some_and(|b| b.contains(&i)) {
-                p.bracket
+                self.bracket
             } else {
                 self.token_style(&lexemes, i)
             };
@@ -90,29 +84,28 @@ impl SqlHighlighter {
             spans.push((Style::new(), at..lexed));
         }
         if lexed < src.len() {
-            spans.push((p.open, lexed..src.len()));
+            spans.push((self.open, lexed..src.len()));
         }
         spans
     }
 
     fn token_style(&self, lexemes: &[Lexeme], i: usize) -> Style {
-        let p = &self.palette;
-        let solid = |l: &&Lexeme| !l.is_trivia();
-        let prev = lexemes[..i].iter().rev().find(solid).map(|l| &l.token);
-        let next = lexemes[i + 1..].iter().find(solid).map(|l| &l.token);
         match &lexemes[i].token {
-            Token::Word(w) if w.quote_style.is_some() => p.quoted,
+            Token::Word(w) if w.quote_style.is_some() => self.quoted,
             Token::Word(w) => {
+                let solid = |l: &&Lexeme| !l.is_trivia();
+                let prev = lexemes[..i].iter().rev().find(solid).map(|l| &l.token);
+                let next = lexemes[i + 1..].iter().find(solid).map(|l| &l.token);
                 let qualified = matches!(prev, Some(Token::Period)) || matches!(next, Some(Token::Period));
                 if matches!(next, Some(Token::LParen)) && !qualified && is_function(&w.value) {
-                    p.function
+                    self.function
                 } else if is_keyword(w) && !qualified {
-                    p.keyword
+                    self.keyword
                 } else {
-                    p.identifier
+                    self.identifier
                 }
             }
-            Token::Number(..) => p.number,
+            Token::Number(..) => self.number,
             Token::SingleQuotedString(_)
             | Token::DoubleQuotedString(_)
             | Token::TripleSingleQuotedString(_)
@@ -131,12 +124,12 @@ impl SqlHighlighter {
             | Token::NationalQuoteDelimitedStringLiteral(_)
             | Token::EscapedStringLiteral(_)
             | Token::UnicodeStringLiteral(_)
-            | Token::HexStringLiteral(_) => p.string,
-            Token::Whitespace(Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)) => p.comment,
+            | Token::HexStringLiteral(_) => self.string,
+            Token::Whitespace(Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)) => self.comment,
             Token::Whitespace(_) | Token::Comma | Token::SemiColon | Token::Period | Token::LParen | Token::RParen => {
                 Style::new()
             }
-            _ => p.operator,
+            _ => self.operator,
         }
     }
 }

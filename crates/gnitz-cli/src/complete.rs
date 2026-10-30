@@ -17,7 +17,7 @@ use crate::meta::{self, ArgKind, MetaLine};
 use crate::settings::{choose, variants, Setting};
 
 /// What completion reads: the catalog snapshot and the current schema. The
-/// shell builds one at each prompt.
+/// REPL builds one at each prompt.
 pub struct Context {
     pub catalog: Catalog,
     pub schema: String,
@@ -166,18 +166,19 @@ fn meta_candidates(ctx: &Context, line: &str, pos: usize, meta: MetaLine) -> (Ve
 /// `\watch`'s argument `sql`: a relation name or a `SELECT` as its first word,
 /// then SQL over the relations `keep` keeps.
 fn watch_candidates(ctx: &Context, sql: &str, pos: usize, keep: fn(RelClass) -> bool) -> (Vec<Candidate>, usize) {
-    let (out, start) = sql_candidates(ctx, sql, pos, keep);
-    if !sql[..start].trim().is_empty() {
-        return (out, start);
+    match word_at(&sql[..pos]) {
+        Some(start) if sql[..start].trim().is_empty() => {
+            let word = &sql[start..pos];
+            let mut out = relation_candidates(ctx, word, keep);
+            out.push(Candidate {
+                kind: Kind::Keyword,
+                value: cased("SELECT", word),
+                description: None,
+            });
+            (out, start)
+        }
+        _ => sql_candidates(ctx, sql, pos, keep),
     }
-    let word = &sql[start..pos];
-    let mut out = relation_candidates(ctx, word, keep);
-    out.push(Candidate {
-        kind: Kind::Keyword,
-        value: cased("SELECT", word),
-        description: None,
-    });
-    (out, start)
 }
 
 fn path_candidates(typed: &str) -> Vec<Candidate> {
@@ -189,23 +190,17 @@ fn path_candidates(typed: &str) -> Vec<Candidate> {
     let Ok(entries) = std::fs::read_dir(&*dir) else {
         return Vec::new();
     };
-    entries
-        .flatten()
-        .map(|e| {
-            let mut name = format!("{shown}{}", e.file_name().to_string_lossy());
-            if e.file_type().is_ok_and(|t| t.is_dir()) {
-                name.push('/');
-            }
-            Candidate {
-                kind: Kind::Value,
-                value: name,
-                description: None,
-            }
-        })
-        .collect()
+    let names = entries.flatten().map(|e| {
+        let mut name = format!("{shown}{}", e.file_name().to_string_lossy());
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            name.push('/');
+        }
+        name
+    });
+    value_candidates(names)
 }
 
-fn value_candidates(values: Vec<String>) -> Vec<Candidate> {
+fn value_candidates(values: impl IntoIterator<Item = String>) -> Vec<Candidate> {
     values
         .into_iter()
         .map(|value| Candidate {
@@ -257,8 +252,9 @@ fn relation_candidates(ctx: &Context, word: &str, keep: fn(RelClass) -> bool) ->
         description: Some(r.class().describe().to_string()),
     };
     if let Some((qual, _)) = word.rsplit_once('.') {
+        let schema = gnitz_sql::parse_schema_name(qual);
         return kept
-            .filter(|r| r.schema.eq_ignore_ascii_case(qual))
+            .filter(|r| schema.as_deref() == Some(&r.schema[..]))
             .map(|r| candidate(r, true))
             .collect();
     }
@@ -364,7 +360,9 @@ fn sql_candidates(ctx: &Context, sql: &str, pos: usize, keep: fn(RelClass) -> bo
         // naming none reads it as a relation of the catalog, by a one-part
         // name, as the binder reads a column reference.
         let rel = match refs.is_empty() {
-            false => refs.iter().find(|(n, _)| n.eq_ignore_ascii_case(qual)).map(|&(_, r)| r),
+            false => gnitz_sql::parse_identifier(qual)
+                .and_then(|q| refs.iter().find(|(n, _)| n.eq_ignore_ascii_case(&q)))
+                .map(|&(_, r)| r),
             true => gnitz_sql::parse_relation_name(qual, &ctx.schema)
                 .filter(|n| !n.is_qualified())
                 .and_then(|n| ctx.catalog.get(&n)),

@@ -1,22 +1,20 @@
 #![cfg(feature = "integration")]
 
-//! The shell against a real server: scripts, the catalog snapshot completion
-//! and `\d` read, and `\watch` following a view's delta feed.
+//! The shell against a real server: scripts, the meta-commands that read the
+//! catalog, and `\watch` following a view's delta feed.
 
+use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gnitz_cli::{Flow, Format, Options, Settings, Shell};
-use gnitz_core::{RelName, RelProps};
 use gnitz_test_harness::ServerHandle;
-use gnitz_wire::{RelClass, ViewBudget, ViewProps};
 
 const WORKERS: usize = 4;
 const PATIENCE: Duration = Duration::from_secs(30);
 
-fn shell(sock: &str, interrupt: Option<Arc<AtomicBool>>) -> Shell {
+fn shell(sock: &str, interrupt: Option<UnixStream>) -> Shell {
     Shell::connect(Options {
         target: sock.to_string(),
         schema: "public".to_string(),
@@ -32,11 +30,17 @@ fn shell(sock: &str, interrupt: Option<Arc<AtomicBool>>) -> Shell {
     .expect("connect")
 }
 
-/// Run `script`, its results written to `out`, and read them back.
+/// Send results to `out`; `\o` reads its path as one word.
+fn output_to(shell: &mut Shell, out: &Path) {
+    shell.run_script(&format!("\\o {}", out.display())).expect("\\o");
+}
+
+/// Run `script`, its results written to `out`, and read them back. Each is a
+/// script of its own, so SQL `script` leaves without a `;` runs at its end.
 fn results(shell: &mut Shell, out: &Path, script: &str) -> String {
-    shell.output_to_file(out.to_str().unwrap()).unwrap();
+    output_to(shell, out);
     shell.run_script(script).expect("script runs");
-    shell.output_to_stdout();
+    shell.run_script("\\o").expect("\\o");
     std::fs::read_to_string(out).unwrap()
 }
 
@@ -74,6 +78,33 @@ fn a_script_runs_statements_and_meta_commands_in_order() {
     );
 }
 
+/// Each type a SQL literal can write, in the text the shell prints, and
+/// `\\echo`'s text as typed past its first word.
+#[test]
+fn each_column_type_prints_its_canonical_text() {
+    let server = ServerHandle::start_n(WORKERS);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.csv");
+    let mut sh = shell(server.sock_path(), None);
+    let text = results(
+        &mut sh,
+        &out,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, ok BOOLEAN, u BIGINT UNSIGNED, h UHUGEINT, \
+         f DOUBLE, ts TIMESTAMP, g UUID);\n\
+         INSERT INTO t VALUES (1, true, 18446744073709551615, 340282366920938463463374607431768211455, \
+         1.5, '2024-01-02 03:04:05', '00112233-4455-6677-8899-aabbccddeeff');\n\
+         SELECT ok, u, h, f, ts, g FROM t;\n\
+         \\echo  done  here",
+    );
+    assert_eq!(
+        text,
+        "ok,u,h,f,ts,g\n\
+         true,18446744073709551615,340282366920938463463374607431768211455,1.5,2024-01-02 03:04:05,\
+         00112233-4455-6677-8899-aabbccddeeff\n\
+         done  here\n"
+    );
+}
+
 #[test]
 fn a_bag_result_repeats_each_row_by_its_weight() {
     let server = ServerHandle::start_n(WORKERS);
@@ -98,14 +129,18 @@ fn a_failed_statement_stops_the_script() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out.csv");
     let mut sh = shell(server.sock_path(), None);
-    sh.output_to_file(out.to_str().unwrap()).unwrap();
+    output_to(&mut sh, &out);
     assert!(sh.run_script("SELECT * FROM missing; SELECT 1 AS one;").is_err());
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "");
 }
 
+/// Each listing keeps its own command's classes, and `\d` shows a table's
+/// keys and a view's options.
 #[test]
-fn the_catalog_snapshot_sees_relations_columns_and_indexes() {
+fn listings_keep_their_command_s_classes() {
     let server = ServerHandle::start_n(WORKERS);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.csv");
     let mut sh = shell(server.sock_path(), None);
     sh.run_script(
         "CREATE TABLE t (id BIGINT PRIMARY KEY, kind BIGINT NOT NULL, note TEXT);\n\
@@ -114,59 +149,26 @@ fn the_catalog_snapshot_sees_relations_columns_and_indexes() {
          CREATE VIEW v WITH (delta = '1 MB') AS SELECT kind, COUNT(*) AS n FROM ev GROUP BY kind;",
     )
     .unwrap();
-    let c = sh.catalog().unwrap();
-    let t = c.get(&RelName::new("public", "t").unwrap()).expect("t");
-    assert_eq!(t.class(), RelClass::Table);
-    let cols: Vec<(&str, String, bool)> = t
-        .columns
-        .iter()
-        .map(|c| {
-            (
-                c.def.name.as_str(),
-                gnitz_sql::sql_type_name(c.def.ty),
-                c.def.is_nullable,
-            )
-        })
-        .collect();
+    const HEADER: &str = "Schema,Name,Type,Columns\n";
+    assert_eq!(results(&mut sh, &out, "\\dt"), format!("{HEADER}public,t,table,3\n"));
+    assert_eq!(results(&mut sh, &out, "\\ds"), format!("{HEADER}public,ev,stream,2\n"));
     assert_eq!(
-        cols,
-        [
-            ("id", "BIGINT".to_string(), false),
-            ("kind", "BIGINT".to_string(), false),
-            ("note", "TEXT".to_string(), true)
-        ]
+        results(&mut sh, &out, "\\dv"),
+        format!("{HEADER}public,v,view with a delta feed,2\n")
     );
-    assert_eq!(t.column_names(&t.pk), ["id"]);
-    let [ix] = &t.indexes[..] else {
-        panic!("{:?}", t.indexes)
-    };
-    assert_eq!((ix.name.as_str(), t.column_names(&ix.cols)), ("t_kind", vec!["kind"]));
-    let ev = c.get(&RelName::new("public", "ev").unwrap()).expect("ev");
-    assert_eq!(ev.class(), RelClass::Stream);
-    let v = c.get(&RelName::new("public", "v").unwrap()).expect("v");
-    assert_eq!(v.class(), RelClass::FedView);
-    assert_eq!(
-        v.props,
-        RelProps::View(ViewProps {
-            budget: ViewBudget::Fed {
-                delta_bytes: std::num::NonZeroU64::new(1 << 20).unwrap()
-            },
-            compress: false
-        })
-    );
-    assert_eq!(v.reads, [ev.id]);
-    assert_eq!(c.get(&RelName::new("PUBLIC", "V").unwrap()).map(|r| r.id), Some(v.id));
-    assert!(c.schemas.contains(&"_system".to_string()));
-    assert_eq!(
-        c.get(&RelName::new("_system", "tables").unwrap())
-            .expect("_system.tables")
-            .class(),
-        RelClass::Catalog
-    );
+    assert!(results(&mut sh, &out, "\\dS tables").contains("_system,tables,"));
+    assert!(!results(&mut sh, &out, "\\d").contains("_system"));
+    let schemas = results(&mut sh, &out, "\\dn");
+    assert!(schemas.contains("_system") && schemas.contains("public"), "{schemas}");
+    let t = results(&mut sh, &out, "\\d t");
+    assert!(t.contains("not null") && t.contains("PK"), "{t}");
+    let v = results(&mut sh, &out, "\\d v");
+    assert!(v.contains("With:\n    delta = '1 MB'\n"), "{v}");
 }
 
 /// `\d` reads the catalog as it stands, whichever session changed it: its
-/// foreign keys both ways, and what a view reads through its chain.
+/// foreign keys both ways, what a view reads through its chain, and the
+/// `WITH` options a view was created with.
 #[test]
 fn describe_shows_keys_and_what_reads_what() {
     let server = ServerHandle::start_n(WORKERS);
@@ -195,6 +197,15 @@ fn describe_shows_keys_and_what_reads_what() {
         joined.contains("Reads:\n    public.parent\n    public.child\n"),
         "{joined}"
     );
+    let bounded = results(
+        &mut sh,
+        &out,
+        "CREATE VIEW b WITH (capacity = '4 MB', compress = true) AS SELECT id FROM parent;\n\\d b",
+    );
+    assert!(
+        bounded.contains("With:\n    capacity = '4 MB'\n    compress = true\n"),
+        "{bounded}"
+    );
 }
 
 /// A name a meta-command takes is read as SQL reads one: quoted, qualified,
@@ -221,34 +232,15 @@ fn meta_command_names_read_as_sql_reads_them() {
         "Schema,Name,Table,Columns,Unique\npublic,t_kind,t,kind,false\n"
     );
     sh.run_script("CREATE SCHEMA \"table\";").unwrap();
-    sh.meta("\\use \"table\"").expect("a quoted schema name");
+    sh.run_script("\\use \"table\"").expect("a quoted schema name");
     sh.run_script("CREATE TABLE u (id BIGINT PRIMARY KEY);").unwrap();
     assert!(
-        sh.meta("\\d u").is_ok(),
+        sh.run_script("\\d u").is_ok(),
         "an unqualified name resolves in the schema used"
     );
-    sh.meta("\\use PUBLIC").expect("a schema name in any case");
-    assert!(sh.meta("\\d u").is_err(), "and in no other");
-    assert!(sh.meta("\\use nope").is_err());
-}
-
-#[test]
-fn describe_lists_the_with_options_a_view_was_created_with() {
-    let server = ServerHandle::start_n(WORKERS);
-    let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join("out.txt");
-    let mut sh = shell(server.sock_path(), None);
-    let text = results(
-        &mut sh,
-        &out,
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, kind BIGINT);\n\
-         CREATE VIEW b WITH (capacity = '4 MB', compress = true) AS SELECT id, kind FROM t WHERE kind > 0;\n\
-         \\d b",
-    );
-    assert!(
-        text.contains("With:\n    capacity = '4 MB'\n    compress = true\n"),
-        "{text}"
-    );
+    sh.run_script("\\use PUBLIC").expect("a schema name in any case");
+    assert!(sh.run_script("\\d u").is_err(), "and in no other");
+    assert!(sh.run_script("\\use nope").is_err());
 }
 
 #[test]
@@ -267,10 +259,16 @@ fn watch_prints_the_view_then_its_deltas_until_interrupted() {
         )
         .unwrap();
 
-    let flag = Arc::new(AtomicBool::new(false));
-    let mut watcher = shell(&sock, Some(Arc::clone(&flag)));
-    watcher.output_to_file(out.to_str().unwrap()).unwrap();
-    let watching = std::thread::spawn(move || watcher.meta("\\watch hot"));
+    let (cancel, mut interrupt) = UnixStream::pair().unwrap();
+    let mut watcher = shell(&sock, Some(cancel));
+    output_to(&mut watcher, &out);
+    let watch = |mut watcher: Shell| {
+        std::thread::spawn(move || {
+            let flow = watcher.run_script("\\watch hot");
+            (watcher, flow)
+        })
+    };
+    let watching = watch(watcher);
 
     let snapshot = wait_for(&out, "+1,2,7");
     assert!(
@@ -288,23 +286,32 @@ fn watch_prints_the_view_then_its_deltas_until_interrupted() {
         "an unchanged group emits nothing:\n{text}"
     );
 
-    flag.store(true, Ordering::SeqCst);
-    let flow = watching.join().expect("watch thread").expect("watch ends cleanly");
-    assert_eq!(flow, Flow::Continue);
+    interrupt.write_all(b"\x02").unwrap();
+    let (mut watcher, flow) = watching.join().expect("watch thread");
+    assert_eq!(flow.expect("watch ends cleanly"), Flow::Continue);
+
+    // An aligned watch prints each answer as a table with no row count.
+    watcher.run_script("\\pset format aligned").unwrap();
+    output_to(&mut watcher, &out);
+    let watching = watch(watcher);
+    let text = wait_for(&out, "107");
+    assert!(text.contains("snapshot") && !text.contains("rows)"), "{text}");
+    interrupt.write_all(b"\x02").unwrap();
+    let (_, flow) = watching.join().expect("watch thread");
+    assert_eq!(flow.expect("watch ends cleanly"), Flow::Continue);
 }
 
 #[test]
 fn watch_refuses_no_argument_and_a_view_without_a_delta_feed() {
     let server = ServerHandle::start_n(WORKERS);
     let mut sh = shell(server.sock_path(), None);
-    assert!(sh.meta("\\watch").is_err());
-    assert!(sh.meta("\\watch   ").is_err());
+    assert!(sh.run_script("\\watch").is_err());
     sh.run_script(
         "CREATE TABLE e (id BIGINT PRIMARY KEY, kind BIGINT);\n\
          CREATE VIEW plain AS SELECT kind FROM e;",
     )
     .unwrap();
-    assert!(sh.meta("\\watch plain").is_err());
+    assert!(sh.run_script("\\watch plain").is_err());
 }
 
 const APP: &str = "
@@ -361,13 +368,13 @@ fn backup_writes_an_entry_of_the_backup_directory() {
     sh.run_script("CREATE TABLE t (id BIGINT PRIMARY KEY); INSERT INTO t VALUES (1);\n\\backup nightly")
         .unwrap();
     assert!(server.backups().join("nightly").join("_relations").is_dir());
-    assert!(sh.meta("\\backup nightly").is_err());
-    assert!(sh.meta("\\backup").is_err());
+    assert!(sh.run_script("\\backup nightly").is_err());
+    assert!(sh.run_script("\\backup").is_err());
 }
 
-/// The shell binary with `args`, given no target: the server it starts is the
-/// suites' one, its scratch directories go under `tmp`, and its SAL is small
-/// even on a kept data directory, as the harness's servers' are.
+/// The shell binary with `args`. Where they name no server, the one it starts
+/// is the suites' one, its scratch directories go under `tmp`, and its SAL is
+/// small even on a kept data directory, as the harness's servers' are.
 fn gnitz(tmp: &Path, args: &[&str]) -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gnitz"));
     cmd.args(args)
@@ -388,13 +395,8 @@ fn stdout_of(mut cmd: std::process::Command) -> String {
 
 /// The run of the shell binary on the server at `sock` with `args`, CSV
 /// output and `stdin` as its input.
-fn run_at(sock: &str, args: &[&str], stdin: &str) -> std::process::Output {
-    use std::io::Write;
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_gnitz"))
-        .arg(sock)
-        .args(["-F", "csv"])
-        .args(args)
-        .env_remove("GNITZ_TARGET")
+fn run_at(tmp: &Path, sock: &str, args: &[&str], stdin: &str) -> std::process::Output {
+    let mut child = gnitz(tmp, &[&[sock, "-F", "csv"], args].concat())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -416,15 +418,20 @@ fn a_script_runs_its_inputs_in_order_and_its_exit_status_says_whether_one_failed
     let stdout = |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).into_owned();
 
     let failing = "SELECT * FROM missing; SELECT 1 AS one;";
-    let out = run_at(sock, &["-c", failing], "");
+    let out = run_at(dir.path(), sock, &["-c", failing], "");
     assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(1), ""));
     assert!(String::from_utf8_lossy(&out.stderr).contains("ERROR:"));
-    let out = run_at(sock, &["--continue-on-error", "-c", failing], "");
+    let out = run_at(dir.path(), sock, &["--continue-on-error", "-c", failing], "");
     assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(1), "one\n1\n"));
 
     let quit_after = dir.path().join("quit.sql");
     std::fs::write(&quit_after, "SELECT * FROM missing;\n\\q\nSELECT 2 AS two;\n").unwrap();
-    let out = run_at(sock, &["--continue-on-error", "-f", quit_after.to_str().unwrap()], "");
+    let out = run_at(
+        dir.path(),
+        sock,
+        &["--continue-on-error", "-f", quit_after.to_str().unwrap()],
+        "",
+    );
     assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(1), ""));
 
     let setup = dir.path().join("setup.sql");
@@ -433,11 +440,32 @@ fn a_script_runs_its_inputs_in_order_and_its_exit_status_says_whether_one_failed
         "CREATE TABLE t (id BIGINT PRIMARY KEY);\nINSERT INTO t VALUES (5);\n",
     )
     .unwrap();
-    let out = run_at(sock, &["-f", setup.to_str().unwrap(), "-c", "SELECT * FROM t"], "");
+    let out = run_at(
+        dir.path(),
+        sock,
+        &["-f", setup.to_str().unwrap(), "-c", "SELECT * FROM t"],
+        "",
+    );
     assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(0), "id\n5\n"));
 
-    let out = run_at(sock, &[], "SELECT 1 AS a;\n\\i -\nSELECT 2 AS b;\n");
+    let out = run_at(dir.path(), sock, &[], "SELECT 1 AS a;\n\\i -\nSELECT 2 AS b;\n");
     assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(0), "a\n1\nb\n2\n"));
+}
+
+/// A statement after the server restarts finds the connection closed; the
+/// shell dials again, so the next one runs.
+#[test]
+fn a_statement_after_the_server_restarts_runs_on_a_new_connection() {
+    let mut server = ServerHandle::start_n(WORKERS);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.csv");
+    let mut sh = shell(server.sock_path(), None);
+    sh.run_script("CREATE TABLE t (id BIGINT PRIMARY KEY); INSERT INTO t VALUES (1);")
+        .unwrap();
+    server.restart().unwrap();
+    assert!(sh.run_script("SELECT * FROM t;").is_err());
+    assert_eq!(results(&mut sh, &out, "SELECT * FROM t;"), "id\n1\n");
+    assert_eq!(results(&mut sh, &out, "\\c\nSELECT * FROM t;"), "id\n1\n");
 }
 
 fn is_empty_dir(dir: &Path) -> bool {

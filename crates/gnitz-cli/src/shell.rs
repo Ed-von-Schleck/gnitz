@@ -1,20 +1,17 @@
 //! The shell: one connection, the settings, and running what is typed or read
 //! — statements through the SQL front end, meta-commands through [`crate::meta`].
 
-use std::cell::Cell;
 use std::fmt::Display;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gnitz_core::{block_on, BlockingHost, Catalog, ClientError, GnitzClient};
 use gnitz_sql::{GnitzSqlError, SqlResult};
 use nu_ansi_term::{Color, Style};
 
-use crate::complete::Context;
 use crate::lex::{self, Piece, Splitter};
 use crate::render::{paint, render, Target, Weights};
 use crate::settings::{Format, Settings};
@@ -37,9 +34,12 @@ enum Sink {
     File(File),
 }
 
-/// How the shell was started.
+/// The session's options: where it is connected, how it reads names and
+/// prints results, and how it runs input. `\c`, `\use` and `\pset` change
+/// them as it goes.
 pub struct Options {
     pub target: String,
+    /// The schema unqualified names resolve in.
     pub schema: String,
     pub settings: Settings,
     /// Whether the session styles what it prints to the terminal.
@@ -47,111 +47,71 @@ pub struct Options {
     pub interactive: bool,
     /// Whether a failed statement ends a script.
     pub stop_on_error: bool,
-    /// Set by SIGINT; a blocking wait checks it and gives up.
-    pub interrupt: Option<Arc<AtomicBool>>,
+    /// Readable to cancel the wait in progress, which reads it empty; `None`
+    /// where nothing cancels one.
+    pub interrupt: Option<UnixStream>,
 }
 
 pub struct Shell {
     pub(crate) client: GnitzClient,
-    target: String,
-    /// The schema unqualified names resolve in.
-    pub(crate) schema: String,
-    pub(crate) settings: Settings,
-    pub(crate) color: bool,
-    pub(crate) interactive: bool,
-    stop_on_error: bool,
-    interrupt: Option<Arc<AtomicBool>>,
+    pub(crate) options: Options,
     sink: Sink,
     /// Whether a command has failed, for the exit status of a script.
-    failed: Cell<bool>,
+    failed: bool,
     /// The last statement run, which `\e` opens.
     pub(crate) last_statement: String,
     /// Text for the next prompt's buffer, from `\e`.
     pub(crate) prefill: Option<String>,
-    /// The REPL's directory for the editors' buffers, removed with the shell;
-    /// `None` outside one.
-    pub(crate) scratch: Option<tempfile::TempDir>,
 }
 
-/// A blocking host whose waits give up once `interrupt` is set.
-fn host(interrupt: Option<Arc<AtomicBool>>) -> BlockingHost {
-    match interrupt {
+/// A client of `target` whose waits give up once `interrupt` is readable.
+fn dial(target: &str, interrupt: Option<&UnixStream>) -> Result<GnitzClient, ClientError> {
+    let host = match interrupt {
+        Some(cancel) => BlockingHost::cancelled_by(cancel.try_clone()?)?,
         None => BlockingHost::default(),
-        Some(flag) => BlockingHost::with_hook(Box::new(move || match flag.swap(false, Ordering::SeqCst) {
-            true => Err("cancelled by Ctrl-C".into()),
-            false => Ok(()),
-        })),
-    }
-}
-
-fn connect(target: &str, interrupt: Option<Arc<AtomicBool>>) -> Result<GnitzClient, ClientError> {
-    GnitzClient::connect_on(target, Box::new(host(interrupt)))
+    };
+    GnitzClient::connect_on(target, Box::new(host))
 }
 
 impl Shell {
     pub fn connect(options: Options) -> Result<Shell, ClientError> {
-        let client = connect(&options.target, options.interrupt.clone())?;
         Ok(Shell {
-            client,
-            target: options.target,
-            schema: options.schema,
-            settings: options.settings,
-            color: options.color,
-            interactive: options.interactive,
-            stop_on_error: options.stop_on_error,
-            interrupt: options.interrupt,
+            client: dial(&options.target, options.interrupt.as_ref())?,
+            options,
             sink: Sink::Stdout,
-            failed: Cell::new(false),
+            failed: false,
             last_statement: String::new(),
             prefill: None,
-            scratch: None,
         })
-    }
-
-    pub(crate) fn target(&self) -> &str {
-        &self.target
     }
 
     /// Whether any command of the session has failed.
     pub fn failed(&self) -> bool {
-        self.failed.get()
+        self.failed
     }
 
     /// Clear an interrupt that arrived before the wait it would cancel.
     pub(crate) fn clear_interrupt(&self) {
-        if let Some(flag) = &self.interrupt {
-            flag.store(false, Ordering::SeqCst);
+        if let Some(cancel) = &self.options.interrupt {
+            gnitz_core::drain_cancel(cancel);
         }
     }
 
-    pub(crate) fn interrupted(&self) -> bool {
-        self.interrupt.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
-    }
-
     /// The catalog as it stands now, for a command that answers from it.
-    pub fn catalog(&mut self) -> Result<Catalog, Failed> {
+    pub(crate) fn catalog(&mut self) -> Result<Catalog, Failed> {
         block_on(self.client.catalog()).or_else(|e| self.fail(e))
-    }
-
-    /// What completion reads now: the catalog as it stands, and the schema.
-    /// `None` when the catalog cannot be read; completion is a convenience,
-    /// never a reason to stop.
-    pub(crate) fn completion(&mut self) -> Option<Context> {
-        block_on(self.client.catalog())
-            .ok()
-            .map(|catalog| Context { catalog, schema: self.schema.clone() })
     }
 
     /// Dial `target` in place of the current connection, whose open
     /// transaction, if any, is lost.
     pub(crate) fn reconnect(&mut self, target: &str) -> Result<(), Failed> {
-        let client = connect(target, self.interrupt.clone())
+        let client = dial(target, self.options.interrupt.as_ref())
             .or_else(|e| self.fail(format!("could not connect to {target}: {e}")))?;
         if self.client.txn_active() {
             self.note("the open transaction was lost");
         }
         self.client = client;
-        self.target = target.to_string();
+        self.options.target = target.to_string();
         Ok(())
     }
 
@@ -173,22 +133,18 @@ impl Shell {
     /// Run a whole script, each piece as soon as it is read: every statement
     /// and meta-command in it, and SQL left without a closing `;` at its end.
     /// `Err` when a failure stopped it.
-    fn run_input(&mut self, mut lines: impl Iterator<Item = io::Result<String>>) -> Result<Flow, Failed> {
+    fn run_input(&mut self, lines: impl Iterator<Item = io::Result<String>>) -> Result<Flow, Failed> {
         let mut splitter = Splitter::default();
-        let mut more = true;
-        while more {
-            let pieces = match lines.next() {
+        for line in lines.map(Some).chain([None]) {
+            let pieces = match line {
                 Some(Ok(line)) => splitter.push_line(&line),
                 Some(Err(e)) => return self.fail(format!("reading input: {e}")),
-                None => {
-                    more = false;
-                    splitter.finish()
-                }
+                None => splitter.finish(),
             };
             for piece in pieces {
                 match self.run_piece(piece) {
                     Ok(Flow::Quit) => return Ok(Flow::Quit),
-                    Err(Failed) if self.stop_on_error => return Err(Failed),
+                    Err(Failed) if self.options.stop_on_error => return Err(Failed),
                     Ok(Flow::Continue) | Err(Failed) => {}
                 }
             }
@@ -204,7 +160,7 @@ impl Shell {
             Piece::Sql(stmt) => self.run_statement(&stmt).map(|()| Flow::Continue),
         };
         if r.is_err() && self.client.is_closed() {
-            let target = self.target.clone();
+            let target = self.options.target.clone();
             if self.reconnect(&target).is_ok() {
                 self.note("reconnected");
             }
@@ -215,7 +171,7 @@ impl Shell {
     fn run_statement(&mut self, stmt: &str) -> Result<(), Failed> {
         self.last_statement = format!("{stmt};");
         let started = Instant::now();
-        let result = block_on(gnitz_sql::execute(&mut self.client, &self.schema, stmt));
+        let result = block_on(gnitz_sql::execute(&mut self.client, &self.options.schema, stmt));
         let elapsed = started.elapsed();
         let outcome = match result {
             Ok(results) => {
@@ -232,7 +188,7 @@ impl Shell {
                 r
             }
         };
-        if self.settings.timing {
+        if self.options.settings.timing {
             self.status(&format_elapsed(elapsed));
         }
         outcome
@@ -240,10 +196,7 @@ impl Shell {
 
     fn show(&mut self, result: SqlResult) {
         match result {
-            SqlResult::Rows(reply) => {
-                let rows = Rows::decode(&reply);
-                self.print_rows(&rows);
-            }
+            SqlResult::Rows(reply) => self.print_rows(&Rows::decode(&reply)),
             SqlResult::Ddl { tag } => self.status(tag),
             SqlResult::RowsAffected { tag, count } => self.status(&format!("{tag} {count}")),
             SqlResult::TransactionStarted => self.status("BEGIN"),
@@ -260,16 +213,17 @@ impl Shell {
             true => Weights::Repeat,
             false => Weights::Column,
         };
+        let settings = &self.options.settings;
         // The terminal an aligned result of a session may page on; elsewhere a
         // table wraps its cells to fit from the start.
-        let pager = self.interactive && self.settings.pager && self.settings.format == Format::Aligned;
+        let pager = self.options.interactive && settings.pager && settings.format == Format::Aligned;
         let paging = self.terminal_size().filter(|_| pager);
         let target = self.target_for(paging.is_none());
-        let text = render(rows, weights, &self.settings, target);
+        let text = render(rows, weights, settings, target);
         if fits(&text, paging) {
             self.write_result(&text);
         } else if !paged(&text) {
-            let wrapped = render(rows, weights, &self.settings, Target { wrap: true, ..target });
+            let wrapped = render(rows, weights, &self.options.settings, Target { wrap: true, ..target });
             self.write_result(&wrapped);
         }
     }
@@ -277,7 +231,7 @@ impl Shell {
     // ── Output ─────────────────────────────────────────────────────────────
 
     /// The terminal's columns and rows, where results go to one.
-    pub(crate) fn terminal_size(&self) -> Option<(u16, u16)> {
+    fn terminal_size(&self) -> Option<(u16, u16)> {
         match self.sink {
             Sink::Stdout => console::Term::stdout().size_checked().map(|(rows, cols)| (cols, rows)),
             Sink::File(_) => None,
@@ -292,7 +246,7 @@ impl Shell {
         Target {
             width,
             wrap,
-            color: self.color && width.is_some(),
+            color: self.options.color && width.is_some(),
             header: true,
         }
     }
@@ -309,18 +263,14 @@ impl Shell {
         };
     }
 
-    pub fn output_to_file(&mut self, path: &str) -> Result<(), Failed> {
-        match File::create(path) {
-            Ok(f) => {
-                self.sink = Sink::File(f);
-                Ok(())
-            }
-            Err(e) => self.fail(format!("{path}: {e}")),
-        }
-    }
-
-    pub fn output_to_stdout(&mut self) {
-        self.sink = Sink::Stdout;
+    /// Send results to the file at `path`, created afresh, or to stdout where
+    /// `path` is empty.
+    pub(crate) fn output_to(&mut self, path: &str) -> Result<(), Failed> {
+        self.sink = match path {
+            "" => Sink::Stdout,
+            path => Sink::File(File::create(path).or_else(|e| self.fail(format!("{path}: {e}")))?),
+        };
+        Ok(())
     }
 
     /// A command's status line: its tag, a timing, a setting changed. On the
@@ -331,28 +281,34 @@ impl Shell {
             return;
         }
         // A reader gone from stdout ends no session.
-        let _ = match self.interactive {
-            true => writeln!(io::stdout(), "{}", paint(self.color, Style::new().dimmed(), msg)),
+        let _ = match self.options.interactive {
+            true => writeln!(
+                io::stdout(),
+                "{}",
+                paint(self.options.color, Style::new().dimmed(), msg)
+            ),
             false => writeln!(io::stderr(), "{msg}"),
         };
     }
 
     /// A hint after an error.
     pub(crate) fn note(&self, msg: &str) {
-        eprintln!(
-            "{}",
-            paint(self.color, Style::new().fg(Color::Yellow), &format!("NOTE: {msg}"))
-        );
+        let style = Style::new().fg(Color::Yellow);
+        eprintln!("{}", paint(self.stderr_color(), style, &format!("NOTE: {msg}")));
     }
 
     /// Report an error; the command it ended has failed.
-    pub(crate) fn fail<T>(&self, msg: impl Display) -> Result<T, Failed> {
-        self.failed.set(true);
-        eprintln!(
-            "{} {msg}",
-            paint(self.color, Style::new().fg(Color::Red).bold(), "ERROR:")
-        );
+    pub(crate) fn fail<T>(&mut self, msg: impl Display) -> Result<T, Failed> {
+        self.failed = true;
+        let style = Style::new().fg(Color::Red).bold();
+        eprintln!("{} {msg}", paint(self.stderr_color(), style, "ERROR:"));
         Err(Failed)
+    }
+
+    /// Whether what goes to stderr is styled: in a styled session, where
+    /// stderr is a terminal too.
+    fn stderr_color(&self) -> bool {
+        self.options.color && io::stderr().is_terminal()
     }
 }
 
@@ -383,20 +339,23 @@ fn fits(text: &str, size: Option<(u16, u16)>) -> bool {
     let Some((w, h)) = size else {
         return true;
     };
-    let lines = text.lines().count();
-    let widest = text.lines().map(console::measure_text_width).max().unwrap_or(0);
-    lines < usize::from(h).saturating_sub(1) && widest <= usize::from(w)
+    text.lines().count() < usize::from(h).saturating_sub(1)
+        && text.lines().all(|l| console::measure_text_width(l) <= usize::from(w))
+}
+
+/// The command the first of `vars` set to more than whitespace names, else
+/// `default`.
+pub(crate) fn command_from_env(vars: &[&str], default: &str) -> String {
+    vars.iter()
+        .find_map(|v| std::env::var(v).ok().filter(|c| !c.trim().is_empty()))
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// Show `text` in `$PAGER`, else `less`; whether it started.
 fn paged(text: &str) -> bool {
-    let pager = std::env::var("PAGER")
-        .ok()
-        .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| "less -SRFX".to_string());
     let Ok(mut child) = Command::new("/bin/sh")
         .arg("-c")
-        .arg(&pager)
+        .arg(command_from_env(&["PAGER"], "less -SRFX"))
         .stdin(Stdio::piped())
         .spawn()
     else {
@@ -418,3 +377,7 @@ fn format_elapsed(d: Duration) -> String {
         false => format!("Time: {ms:.3} ms ({:.3} s)", d.as_secs_f64()),
     }
 }
+
+#[cfg(test)]
+#[path = "tests/shell.rs"]
+mod tests;

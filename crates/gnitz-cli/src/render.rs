@@ -7,8 +7,10 @@ use comfy_table::{presets, Cell, CellAlignment, ContentArrangement, Table};
 use console::measure_text_width;
 use nu_ansi_term::{Color, Style};
 
+use gnitz_wire::TypeCode;
+
 use crate::settings::{Expanded, Format, Settings};
-use crate::value::{is_numeric, write_json_string, Rows};
+use crate::value::{json_string, Rows, Value};
 
 /// What a render shows of each row's weight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +20,16 @@ pub enum Weights {
     Repeat,
     /// A leading signed weight column: the rows as the Z-set they are.
     Column,
+}
+
+impl Weights {
+    /// How many times a row at weight `w` is printed.
+    fn copies(self, w: i64) -> usize {
+        match self {
+            Weights::Repeat => usize::try_from(w).unwrap_or(0),
+            Weights::Column => 1,
+        }
+    }
 }
 
 /// Where a render goes.
@@ -34,13 +46,6 @@ pub struct Target {
     pub header: bool,
 }
 
-impl Target {
-    /// `text` in `style` where the output carries styles, else as it is.
-    pub fn paint<'a>(&self, style: Style, text: &'a str) -> Cow<'a, str> {
-        paint(self.color, style, text)
-    }
-}
-
 /// `text` in `style` when `color`, else as it is.
 pub fn paint(color: bool, style: Style, text: &str) -> Cow<'_, str> {
     match color {
@@ -52,11 +57,47 @@ pub fn paint(color: bool, style: Style, text: &str) -> Cow<'_, str> {
 /// The column a [`Weights::Column`] render adds.
 const WEIGHT_HEADER: &str = "weight";
 
-/// A cell's text; `None` for NULL.
+/// A printed line's cells: each one's text, `None` for NULL.
 type Line<'a> = Vec<Option<Cow<'a, str>>>;
 
-/// The rows a text format prints, each as its cells' text and the number of
-/// times it is printed, and the header.
+/// The header a render prints: the weight's where it shows one, then each
+/// column's name.
+fn header(rows: &Rows, weights: Weights) -> impl Iterator<Item = &str> {
+    (weights == Weights::Column)
+        .then_some(WEIGHT_HEADER)
+        .into_iter()
+        .chain(rows.columns.iter().map(|c| c.name.as_str()))
+}
+
+/// A row's fields as a text format prints them: its weight `w` where the
+/// render shows it, then each cell's text, `None` for NULL.
+fn fields(cells: &[Value], w: Option<i64>) -> impl Iterator<Item = Option<Cow<'_, str>>> {
+    w.map(|w| Some(Cow::Owned(format!("{w:+}"))))
+        .into_iter()
+        .chain(cells.iter().map(Value::text))
+}
+
+/// Append each printed line of a script format to `out`: `line` writes a
+/// row's once, given its weight where the render shows it, and the line is
+/// copied as many times as the row is printed.
+fn script_lines(
+    rows: &Rows,
+    weights: Weights,
+    out: &mut String,
+    mut line: impl FnMut(&mut String, &[Value], Option<i64>),
+) {
+    let mut buf = String::new();
+    for (cells, w) in &rows.rows {
+        buf.clear();
+        line(&mut buf, cells, (weights == Weights::Column).then_some(*w));
+        for _ in 0..weights.copies(*w) {
+            out.push_str(&buf);
+        }
+    }
+}
+
+/// The rows the aligned format prints, each as its cells' text and the number
+/// of times it is printed, and the header.
 struct Grid<'a> {
     header: Vec<&'a str>,
     numeric: Vec<bool>,
@@ -66,33 +107,21 @@ struct Grid<'a> {
 impl<'a> Grid<'a> {
     fn of(rows: &'a Rows, weights: Weights) -> Grid<'a> {
         let weight_col = weights == Weights::Column;
-        let header = weight_col
-            .then_some(WEIGHT_HEADER)
-            .into_iter()
-            .chain(rows.columns.iter().map(|c| c.name.as_str()))
-            .collect();
         let numeric = weight_col
             .then_some(true)
             .into_iter()
-            .chain(rows.columns.iter().map(|c| is_numeric(c.ty.tc)))
+            .chain(rows.columns.iter().map(|c| is_numeric(c.tc)))
             .collect();
-        let rows = rows
+        let lines = rows
             .rows
             .iter()
-            .map(|(cells, w)| {
-                let line = weight_col
-                    .then(|| Some(Cow::Owned(format!("{w:+}"))))
-                    .into_iter()
-                    .chain(cells.iter().map(|c| c.text()))
-                    .collect();
-                let copies = match weights {
-                    Weights::Repeat => usize::try_from(*w).unwrap_or(0),
-                    Weights::Column => 1,
-                };
-                (line, copies)
-            })
+            .map(|(cells, w)| (fields(cells, weight_col.then_some(*w)).collect(), weights.copies(*w)))
             .collect();
-        Grid { header, numeric, rows }
+        Grid {
+            header: header(rows, weights).collect(),
+            numeric,
+            rows: lines,
+        }
     }
 
     /// Every printed line: each row as many times as it is printed.
@@ -129,8 +158,8 @@ impl<'a> Grid<'a> {
 pub fn render(rows: &Rows, weights: Weights, settings: &Settings, target: Target) -> String {
     match settings.format {
         Format::Aligned => table(&Grid::of(rows, weights), settings, target),
-        Format::Unaligned => unaligned(&Grid::of(rows, weights), settings),
-        Format::Csv => csv(&Grid::of(rows, weights), target),
+        Format::Unaligned => unaligned(rows, weights, settings),
+        Format::Csv => csv(rows, weights, target),
         Format::Json => json(rows, weights),
     }
 }
@@ -138,7 +167,7 @@ pub fn render(rows: &Rows, weights: Weights, settings: &Settings, target: Target
 /// The aligned format: a table, or one record per printed line, and the
 /// footer.
 fn table(grid: &Grid<'_>, settings: &Settings, target: Target) -> String {
-    let null = target.paint(Style::new().dimmed(), &settings.null);
+    let null = paint(target.color, Style::new().dimmed(), &settings.null);
     let expand = match settings.expanded {
         Expanded::On => true,
         Expanded::Off => false,
@@ -163,7 +192,7 @@ fn build_table(grid: &Grid<'_>, null: &str, target: Target) -> Table {
     table.load_style(presets::UTF8_FULL_CONDENSED.with_rounded_corners());
     table.force_no_tty();
     let heading = Style::new().bold().fg(Color::Cyan);
-    table.set_header(grid.header.iter().map(|h| Cell::new(target.paint(heading, h))));
+    table.set_header(grid.header.iter().map(|h| Cell::new(paint(target.color, heading, h))));
     for line in grid.lines() {
         table.add_row(line.iter().map(|c| Cell::new(c.as_deref().unwrap_or(null))));
     }
@@ -201,7 +230,7 @@ fn expanded(grid: &Grid<'_>, null: &str, target: Target) -> String {
         .iter()
         .map(|h| {
             let pad = " ".repeat(label_width - measure_text_width(h));
-            target.paint(Style::new().bold(), &format!("{h}{pad}")).into_owned()
+            paint(target.color, Style::new().bold(), &format!("{h}{pad}")).into_owned()
         })
         .collect();
     let mut out = String::new();
@@ -216,7 +245,7 @@ fn expanded(grid: &Grid<'_>, null: &str, target: Target) -> String {
         let _ = writeln!(
             out,
             "{}",
-            target.paint(Style::new().fg(Color::Cyan), &format!("{banner}{rule}"))
+            paint(target.color, Style::new().fg(Color::Cyan), &format!("{banner}{rule}"))
         );
         for (label, cell) in labels.iter().zip(line) {
             let _ = writeln!(out, "{label} | {}", cell.as_deref().unwrap_or(null));
@@ -225,33 +254,56 @@ fn expanded(grid: &Grid<'_>, null: &str, target: Target) -> String {
     out
 }
 
-fn unaligned(grid: &Grid<'_>, settings: &Settings) -> String {
-    let mut out = grid.header.join("|");
+fn unaligned(rows: &Rows, weights: Weights, settings: &Settings) -> String {
+    let mut out = header(rows, weights).collect::<Vec<_>>().join("|");
     out.push('\n');
-    for line in grid.lines() {
-        for (i, cell) in line.iter().enumerate() {
+    script_lines(rows, weights, &mut out, |line, cells, w| {
+        for (i, field) in fields(cells, w).enumerate() {
             if i > 0 {
-                out.push('|');
+                line.push('|');
             }
-            out.push_str(cell.as_deref().unwrap_or(&settings.null));
+            line.push_str(field.as_deref().unwrap_or(&settings.null));
         }
-        out.push('\n');
-    }
+        line.push('\n');
+    });
     out
 }
 
-/// RFC 4180, NULL as an empty field.
-fn csv(grid: &Grid<'_>, target: Target) -> String {
-    let mut w = csv::Writer::from_writer(Vec::new());
-    let fail = "a CSV write to memory cannot fail";
+/// RFC 4180 quoting, each record ended by `\n`, NULL as an empty field.
+fn csv(rows: &Rows, weights: Weights, target: Target) -> String {
+    let mut out = String::new();
     if target.header {
-        w.write_record(&grid.header).expect(fail);
+        csv_record(&mut out, header(rows, weights));
     }
-    for line in grid.lines() {
-        w.write_record(line.iter().map(|c| c.as_deref().unwrap_or("")))
-            .expect(fail);
+    script_lines(rows, weights, &mut out, |line, cells, w| {
+        csv_record(line, fields(cells, w).map(Option::unwrap_or_default));
+    });
+    out
+}
+
+/// One CSV record: a field holding a `,`, `"`, CR or LF is quoted, its `"`
+/// doubled; a record with no text at all is `""`, so it does not read as a
+/// blank line.
+fn csv_record(out: &mut String, fields: impl IntoIterator<Item = impl AsRef<str>>) {
+    let start = out.len();
+    for (i, field) in fields.into_iter().enumerate() {
+        let field = field.as_ref();
+        if i > 0 {
+            out.push(',');
+        }
+        match field.contains([',', '"', '\r', '\n']) {
+            true => {
+                out.push('"');
+                out.push_str(&field.replace('"', "\"\""));
+                out.push('"');
+            }
+            false => out.push_str(field),
+        }
     }
-    String::from_utf8(w.into_inner().expect(fail)).expect("CSV of UTF-8 fields is UTF-8")
+    if out.len() == start {
+        out.push_str("\"\"");
+    }
+    out.push('\n');
 }
 
 /// A JSON array, one object per printed row on its own line, its keys in
@@ -259,27 +311,13 @@ fn csv(grid: &Grid<'_>, target: Target) -> String {
 /// `{"weight": w, "row": {...}}`, so no column's name can collide with the
 /// weight.
 fn json(rows: &Rows, weights: Weights) -> String {
-    let keys: Vec<String> = rows
-        .columns
-        .iter()
-        .map(|c| {
-            let mut key = String::new();
-            let _ = write_json_string(&mut key, &c.name);
-            key
-        })
-        .collect();
+    let keys: Vec<String> = rows.columns.iter().map(|c| json_string(&c.name)).collect();
     let mut out = String::from("[");
-    let mut line = String::new();
-    let mut first = true;
-    for (cells, w) in &rows.rows {
-        line.clear();
-        let copies = match weights {
-            Weights::Repeat => usize::try_from(*w).unwrap_or(0),
-            Weights::Column => {
-                let _ = write!(line, "{{\"weight\":{w},\"row\":");
-                1
-            }
-        };
+    script_lines(rows, weights, &mut out, |line, cells, w| {
+        line.push('\n');
+        if let Some(w) = w {
+            let _ = write!(line, "{{\"weight\":{w},\"row\":");
+        }
         line.push('{');
         for (i, (key, cell)) in keys.iter().zip(cells).enumerate() {
             if i > 0 {
@@ -287,20 +325,41 @@ fn json(rows: &Rows, weights: Weights) -> String {
             }
             line.push_str(key);
             line.push(':');
-            cell.write_json(&mut line);
+            cell.write_json(line);
         }
         line.push('}');
-        if weights == Weights::Column {
+        if w.is_some() {
             line.push('}');
         }
-        for _ in 0..copies {
-            out.push_str(if first { "\n" } else { ",\n" });
-            out.push_str(&line);
-            first = false;
+        line.push(',');
+    });
+    match out.pop() {
+        Some(',') => out.push_str("\n]\n"),
+        _ => out.push_str("[]\n"),
+    }
+    out
+}
+
+/// Whether a column of `tc` reads right-aligned: a number's.
+fn is_numeric(tc: TypeCode) -> bool {
+    match tc {
+        TypeCode::U8
+        | TypeCode::U16
+        | TypeCode::U32
+        | TypeCode::U64
+        | TypeCode::I8
+        | TypeCode::I16
+        | TypeCode::I32
+        | TypeCode::I64
+        | TypeCode::U128
+        | TypeCode::I128
+        | TypeCode::F32
+        | TypeCode::F64
+        | TypeCode::Decimal => true,
+        TypeCode::Bool | TypeCode::UUID | TypeCode::Date | TypeCode::Timestamp | TypeCode::String | TypeCode::Blob => {
+            false
         }
     }
-    out.push_str(if first { "]\n" } else { "\n]\n" });
-    out
 }
 
 #[cfg(test)]

@@ -5,6 +5,8 @@
 use clap::ValueEnum;
 use gnitz_sql::sqlparser::tokenizer::Token;
 
+use crate::lex::Lexeme;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Format {
     /// A bordered table, aligned per column.
@@ -162,10 +164,9 @@ fn on_off(b: bool) -> &'static str {
 /// The text of `v` when it lexes as one single-quoted string.
 fn single_quoted(v: &str) -> Option<String> {
     match crate::lex::lex(v)?.as_slice() {
-        [l] => match &l.token {
-            Token::SingleQuotedString(text) => Some(text.clone()),
-            _ => None,
-        },
+        [Lexeme {
+            token: Token::SingleQuotedString(text), ..
+        }] => Some(text.clone()),
         _ => None,
     }
 }

@@ -222,42 +222,39 @@ pub fn word_at(before: &str) -> Option<usize> {
     }
 }
 
-/// Whether `src` holds nothing but whitespace and comments.
-pub fn is_blank(src: &str) -> bool {
-    match lex(src) {
-        Some(lexemes) => lexemes.iter().all(Lexeme::is_trivia),
-        None => src.trim().is_empty(),
-    }
-}
-
-/// Whether an interactive buffer is ready to run: a meta-command, an exit word,
-/// or SQL whose last token is a `;`.
+/// Whether an interactive buffer is ready to run: read line by line as the
+/// shell runs it, it leaves nothing pending but whitespace, comments or an
+/// exit word.
 pub fn is_complete(src: &str) -> bool {
-    let trimmed = src.trim();
-    if trimmed.is_empty() || trimmed.starts_with('\\') || is_exit_word(trimmed) {
-        return true;
+    let mut splitter = Splitter::default();
+    for line in src.lines() {
+        splitter.push_line(line);
     }
-    let Some(lexemes) = lex(src) else {
-        return false;
-    };
-    lexemes
-        .iter()
-        .rev()
-        .find(|l| !l.is_trivia())
-        .is_some_and(|l| l.token == Token::SemiColon)
+    splitter.is_blank() || is_exit_word(&splitter.pending)
 }
 
 /// `exit` and `quit`, which a shell user types expecting to leave.
 pub fn is_exit_word(s: &str) -> bool {
-    let s = s.trim().trim_end_matches(';').trim();
+    let s = s.trim();
     s.eq_ignore_ascii_case("exit") || s.eq_ignore_ascii_case("quit")
 }
 
 /// Turns a stream of input lines into the pieces the shell runs: a
 /// meta-command line, or one statement.
+///
+/// Each line is tokenized once: a token other than an open string or comment
+/// never spans a newline, so a line read after whole ones tokenizes as it
+/// would within them. Only a string or comment left open is read again, with
+/// each line that continues it.
 #[derive(Default)]
 pub struct Splitter {
+    /// The input no `;` has ended yet.
     pending: String,
+    /// How much of `pending` has been tokenized: all of it, or up to an open
+    /// string or comment's line.
+    lexed: usize,
+    /// The span of `pending` the statement read so far covers.
+    stmt: Option<Range<usize>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -268,65 +265,63 @@ pub enum Piece {
 }
 
 impl Splitter {
-    /// Feed one line, without its newline: the pieces it completes. Only a
-    /// line that is a meta-command or holds a `;` can complete one, so only
-    /// such a line re-reads what is pending.
+    /// Feed one line, without its newline: the pieces it completes. A
+    /// statement ended before an open string or comment runs; the open one
+    /// stays pending.
     pub fn push_line(&mut self, line: &str) -> Vec<Piece> {
-        if line.trim_start().starts_with('\\') && is_blank(&self.pending) {
+        if line.trim_start().starts_with('\\') && self.is_blank() {
             self.pending.clear();
+            self.lexed = 0;
             return vec![Piece::Meta(line.trim().to_string())];
         }
         self.pending.push_str(line);
         self.pending.push('\n');
-        if !line.contains(';') {
-            return Vec::new();
-        }
-        let Some(lexemes) = lex(&self.pending) else {
-            return Vec::new();
-        };
+        let base = self.lexed;
+        let (lexemes, lexed) = lex_prefix(&self.pending[base..]);
         let mut out = Vec::new();
-        let done = split(&self.pending, &lexemes, false, &mut out);
-        self.pending.drain(..done);
+        let mut stmt = self.stmt.clone();
+        // The byte just past the last `;`.
+        let mut done = None;
+        for l in lexemes {
+            let range = base + l.range.start..base + l.range.end;
+            if l.token == Token::SemiColon {
+                if let Some(s) = stmt.take() {
+                    out.push(Piece::Sql(self.pending[s].to_string()));
+                }
+                done = Some(range.end);
+            } else if !l.is_trivia() {
+                stmt = Some(stmt.map_or(range.start, |s| s.start)..range.end);
+            }
+        }
+        if base + lexed == self.pending.len() {
+            (self.lexed, self.stmt) = (self.pending.len(), stmt);
+        } else if let Some(d) = done {
+            // What follows the `;` is read again from there with the next line.
+            (self.lexed, self.stmt) = (d, None);
+        }
+        if let Some(d) = done {
+            self.pending.drain(..d);
+            self.lexed -= d;
+            self.stmt = self.stmt.take().map(|s| s.start - d..s.end - d);
+        }
         out
     }
 
-    /// What is left at the end of the input: SQL with no closing `;` runs too.
+    /// What is left at the end of the input: SQL with no closing `;` runs too,
+    /// and what does not tokenize runs whole, for the planner to report.
     pub fn finish(&mut self) -> Vec<Piece> {
-        let rest = std::mem::take(&mut self.pending);
-        let mut out = Vec::new();
-        match lex(&rest) {
-            Some(lexemes) => {
-                split(&rest, &lexemes, true, &mut out);
-            }
-            // The planner reports what does not tokenize.
-            None => out.push(Piece::Sql(rest)),
+        let Splitter { pending, lexed, stmt } = std::mem::take(self);
+        match (lexed == pending.len(), stmt) {
+            (true, Some(s)) => vec![Piece::Sql(pending[s].to_string())],
+            (true, None) => Vec::new(),
+            (false, _) => vec![Piece::Sql(pending)],
         }
-        out
     }
-}
 
-/// Push each statement of `src` that a top-level `;` ends onto `out`, and
-/// with `tail` the one after the last `;` too; a statement of nothing but
-/// whitespace and comments is none. The byte just past the last `;`, or 0.
-fn split(src: &str, lexemes: &[Lexeme], tail: bool, out: &mut Vec<Piece>) -> usize {
-    let mut start: Option<usize> = None;
-    let mut end = 0;
-    let mut done = 0;
-    for l in lexemes {
-        if l.token == Token::SemiColon {
-            if let Some(s) = start.take() {
-                out.push(Piece::Sql(src[s..end].to_string()));
-            }
-            done = l.range.end;
-        } else if !l.is_trivia() {
-            start.get_or_insert(l.range.start);
-            end = l.range.end;
-        }
+    /// Whether nothing but whitespace and comments is pending.
+    fn is_blank(&self) -> bool {
+        self.lexed == self.pending.len() && self.stmt.is_none()
     }
-    if let Some(s) = start.filter(|_| tail) {
-        out.push(Piece::Sql(src[s..end].to_string()));
-    }
-    done
 }
 
 #[cfg(test)]

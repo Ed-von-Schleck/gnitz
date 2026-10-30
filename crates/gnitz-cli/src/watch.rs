@@ -10,15 +10,14 @@ use gnitz_sql::GnitzSqlError;
 use gnitz_wire::WireStatus;
 use nu_ansi_term::{Color, Style};
 
-use crate::render::{render, Target, Weights};
+use crate::render::{paint, render, Target, Weights};
 use crate::settings::{Expanded, Format, Settings};
 use crate::shell::{Failed, Shell};
 use crate::value::Rows;
 
-/// How long one sync is held at the server while the view does not change.
-/// A Ctrl-C that lands just before a sync starts does not wake it, so this
-/// bounds how long such a Ctrl-C takes to stop the watch.
-const HOLD: Duration = Duration::from_millis(500);
+/// How long one sync is held at the server while the view does not change. A
+/// Ctrl-C wakes the wait itself, so this bounds no response time.
+const HOLD: Duration = Duration::from_secs(60);
 
 /// The `SELECT` a `\watch` argument stands for: a relation name alone, as
 /// SQL reads one in `schema`, reads the view whole.
@@ -30,17 +29,13 @@ pub(crate) fn watch_query(arg: &str, schema: &str) -> String {
     }
 }
 
-/// A refusal a watch recovers from by reading the view whole again: the feed
-/// no longer continues the cursor, or (`StaleCatalog`) the view resolves
-/// differently and the `SELECT` is planned again.
-fn restart_status(e: &ClientError) -> Option<WireStatus> {
-    e.status()
-        .filter(|s| matches!(s, WireStatus::DeltaExpired | WireStatus::StaleCatalog))
-}
-
 impl Shell {
     fn plan_watch(&mut self, sql: &str) -> Result<Subscription, GnitzSqlError> {
-        block_on(gnitz_sql::plan_subscription(&mut self.client, &self.schema, sql))
+        block_on(gnitz_sql::plan_subscription(
+            &mut self.client,
+            &self.options.schema,
+            sql,
+        ))
     }
 
     /// Subscribe to `plan` from scratch: its id, and the view whole.
@@ -58,11 +53,11 @@ impl Shell {
             "── {} {label}  +{plus} −{minus}",
             chrono::Local::now().format("%H:%M:%S")
         );
-        if matches!(self.settings.format, Format::Csv | Format::Json) {
+        if matches!(self.options.settings.format, Format::Csv | Format::Json) {
             self.status(&line);
             return;
         }
-        let line = format!("{}\n", target.paint(Style::new().fg(Color::Cyan), &line));
+        let line = format!("{}\n", paint(target.color, Style::new().fg(Color::Cyan), &line));
         self.write_result(&line);
     }
 
@@ -75,11 +70,11 @@ impl Shell {
         self.watch_banner(label, &rows, target);
         let settings = Settings {
             footer: false,
-            expanded: match self.settings.expanded {
+            expanded: match self.options.settings.expanded {
                 Expanded::Auto => Expanded::Off,
                 e => e,
             },
-            ..self.settings.clone()
+            ..self.options.settings.clone()
         };
         let text = render(&rows, Weights::Column, &settings, target);
         self.write_result(&text);
@@ -100,57 +95,54 @@ impl Shell {
     /// Follow the delta feed of the view `arg` names, or of the `SELECT` over
     /// one it is, until interrupted.
     pub(crate) fn watch(&mut self, arg: &str) -> Result<(), Failed> {
-        let sql = watch_query(arg, &self.schema);
+        let sql = watch_query(arg, &self.options.schema);
         let mut plan = self.plan_watch(&sql).or_else(|e| self.fail(e))?;
         let (mut id, first) = self.subscribe(&plan).or_else(|e| self.fail(e))?;
         self.status("Watching; Ctrl-C stops.");
         self.watch_print("snapshot", &first, true);
         let outcome = loop {
-            if self.interrupted() {
-                break Ok(());
-            }
             let synced = match block_on(self.client.sync(HOLD)) {
                 Ok(s) => s,
                 Err(e) => break self.watch_ended(e),
             };
-            let mut restart = None;
-            let mut ended = None;
-            for pushed in synced.pushed.into_iter().filter(|p| p.sub == id) {
-                match pushed.result {
-                    Ok((reply, _cursor)) => {
-                        if !reply.batch.is_empty() {
-                            self.watch_print("delta", &reply, false);
-                        }
+            // A sync has one entry per subscription.
+            let Some(pushed) = synced.pushed.into_iter().find(|p| p.sub == id) else {
+                continue;
+            };
+            let cause = match pushed.result {
+                Ok((reply, _cursor)) => {
+                    if !reply.batch.is_empty() {
+                        self.watch_print("delta", &reply, false);
                     }
-                    Err(e) => match restart_status(&e) {
-                        Some(status) => restart = Some((status, e)),
-                        None => ended = Some(e),
-                    },
+                    continue;
                 }
+                Err(e) => e,
+            };
+            // The feed no longer continues the cursor, or the view resolves
+            // differently and the `SELECT` is planned again: either way the
+            // view is read whole again.
+            let replan = match cause.status() {
+                Some(WireStatus::StaleCatalog) => true,
+                Some(WireStatus::DeltaExpired) => false,
+                _ => break self.fail(cause),
+            };
+            self.client.unsubscribe(id);
+            self.note(&format!("{cause}; reading the view whole again"));
+            if replan {
+                plan = match self.plan_watch(&sql) {
+                    Ok(p) => p,
+                    Err(e) => break self.fail(e),
+                };
             }
-            if let Some(e) = ended {
-                break self.fail(e);
-            }
-            if let Some((status, cause)) = restart {
-                self.client.unsubscribe(id);
-                self.note(&format!("{cause}; reading the view whole again"));
-                if status == WireStatus::StaleCatalog {
-                    plan = match self.plan_watch(&sql) {
-                        Ok(p) => p,
-                        Err(e) => break self.fail(e),
-                    };
+            match self.subscribe(&plan) {
+                Ok((new_id, whole)) => {
+                    id = new_id;
+                    self.watch_print("reseeded", &whole, true);
                 }
-                match self.subscribe(&plan) {
-                    Ok((new_id, whole)) => {
-                        id = new_id;
-                        self.watch_print("reseeded", &whole, true);
-                    }
-                    Err(e) => break self.watch_ended(e),
-                }
+                Err(e) => break self.watch_ended(e),
             }
         };
         self.client.unsubscribe(id);
-        self.clear_interrupt();
         outcome
     }
 }

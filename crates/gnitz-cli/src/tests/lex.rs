@@ -21,18 +21,45 @@ fn statements_split_on_top_level_semicolons_only() {
 }
 
 #[test]
+fn a_statement_read_line_by_line_splits_as_its_whole_text_does() {
+    assert_eq!(
+        pieces(&[
+            "INSERT INTO t VALUES",
+            "(1, 'a;b'), -- c;",
+            "(2, 'c;d'); SELECT /* x;",
+            "y; */ 'p",
+            ";q' ;",
+            "\\dt",
+        ]),
+        [
+            Piece::Sql("INSERT INTO t VALUES\n(1, 'a;b'), -- c;\n(2, 'c;d')".into()),
+            Piece::Sql("SELECT /* x;\ny; */ 'p\n;q'".into()),
+            Piece::Meta("\\dt".into()),
+        ]
+    );
+}
+
+#[test]
 fn statements_skip_empty_ones_and_keep_a_trailing_one() {
     assert_eq!(pieces(&[";; SELECT 1; SELECT 2"]), sql(&["SELECT 1", "SELECT 2"]));
 }
 
 #[test]
-fn input_that_does_not_tokenize_runs_whole_for_the_planner_to_report() {
-    assert_eq!(pieces(&["SELECT 1; SELECT 'open"]), sql(&["SELECT 1; SELECT 'open\n"]));
+fn statements_before_an_open_string_run_and_it_goes_whole_to_the_planner() {
+    assert_eq!(
+        pieces(&["SELECT 1; SELECT 'open"]),
+        sql(&["SELECT 1", " SELECT 'open\n"])
+    );
 }
 
 #[test]
-fn a_buffer_is_complete_once_its_last_token_is_a_semicolon() {
+fn a_buffer_is_complete_once_running_it_leaves_nothing_pending() {
     assert!(is_complete("SELECT 1;"));
+    assert!(is_complete("SELECT 1;\n\\dt"));
+    assert!(is_complete("-- only a comment"));
+    assert!(is_complete("SELECT 1;\nexit"));
+    assert!(!is_complete("\\dt\nSELECT 1"));
+    assert!(!is_complete("SELECT 1; SELECT 'open"));
     assert!(is_complete("SELECT 1; -- trailing comment"));
     assert!(is_complete("\\dt"));
     assert!(is_complete("quit"));
@@ -100,7 +127,7 @@ fn lexeme_ranges_are_byte_ranges_past_multibyte_text() {
 
 #[test]
 fn exit_words_ignore_case_and_a_semicolon() {
-    assert!(is_exit_word("EXIT;"));
+    assert!(is_exit_word("EXIT"));
     assert!(is_exit_word(" quit "));
     assert!(!is_exit_word("exits"));
 }

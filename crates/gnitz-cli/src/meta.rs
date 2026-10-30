@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use clap::ValueEnum;
@@ -13,12 +13,13 @@ use gnitz_expr::{LikeMatcher, LikePattern};
 use gnitz_wire::{qualified_key, FkAction, RelClass, TypeCode};
 
 use crate::editor::{editor, editor_command, KEY_HELP};
-use crate::render::{render, Target, Weights};
+use crate::render::{render, Weights};
 use crate::settings::{choose, name_of, Expanded, Format, Setting, Settings};
-use crate::shell::{Failed, Flow, Shell};
+use crate::shell::{command_from_env, Failed, Flow, Shell};
 use crate::value::{Rows, Value};
 
-/// What a meta-command's argument is, for completion.
+/// What a meta-command's argument is: what completion offers for it, whether
+/// it is highlighted as SQL, and the classes a listing keeps.
 #[derive(Clone, Copy)]
 pub enum ArgKind {
     None,
@@ -81,7 +82,8 @@ pub(crate) fn expand_home(path: &str) -> Cow<'_, str> {
 pub struct MetaCommand {
     /// The command's name, then its aliases.
     pub names: &'static [&'static str],
-    /// The argument synopsis `\?` prints.
+    /// The argument synopsis `\?` prints; an argument it does not bracket is
+    /// one the command cannot run without.
     pub args: &'static str,
     pub help: &'static str,
     /// What its argument is.
@@ -210,7 +212,7 @@ pub const COMMANDS: &[MetaCommand] = &[
         help: "toggle between aligned and unaligned output",
         arg: ArgKind::None,
         run: |sh, _| {
-            let to = match sh.settings.format {
+            let to = match sh.options.settings.format {
                 Format::Aligned => "unaligned",
                 _ => "aligned",
             };
@@ -236,13 +238,7 @@ pub const COMMANDS: &[MetaCommand] = &[
         args: "[FILE]",
         help: "send results to FILE, or back to stdout",
         arg: ArgKind::Path,
-        run: |sh, c| {
-            match &*c.path() {
-                "" => sh.output_to_stdout(),
-                path => sh.output_to_file(path)?,
-            }
-            Ok(Flow::Continue)
-        },
+        run: |sh, c| sh.output_to(&c.path()).map(|()| Flow::Continue),
     },
     MetaCommand {
         names: &["\\i"],
@@ -349,12 +345,10 @@ fn glob(pattern: &str) -> impl FnMut(&str, &str) -> bool {
 }
 
 impl Shell {
-    /// Run one meta-command line.
-    pub fn meta(&mut self, line: &str) -> Result<Flow, Failed> {
-        let line = line.trim();
-        let Some(MetaLine { name, verbose, command }) = MetaLine::parse(line) else {
-            return self.fail(format!("{line} is not a meta-command"));
-        };
+    /// Run one meta-command line, as the splitter hands it over: trimmed,
+    /// starting with its backslash.
+    pub(crate) fn meta(&mut self, line: &str) -> Result<Flow, Failed> {
+        let MetaLine { name, verbose, command } = MetaLine::parse(line).expect("a meta piece starts with a backslash");
         let Some(cmd) = command else {
             return self.fail(format!("invalid command {}; try \\? for help", &line[name]));
         };
@@ -392,7 +386,7 @@ impl Shell {
     /// Reconnect, to `target` unless it is empty.
     fn connect_to(&mut self, target: &str) -> Result<Flow, Failed> {
         let target = match target {
-            "" => self.target().to_string(),
+            "" => self.options.target.clone(),
             t => t.to_string(),
         };
         self.reconnect(&target)?;
@@ -401,7 +395,10 @@ impl Shell {
     }
 
     fn conninfo(&mut self) -> Result<Flow, Failed> {
-        let msg = format!("connected to \"{}\", schema \"{}\"", self.target(), self.schema);
+        let msg = format!(
+            "connected to \"{}\", schema \"{}\"",
+            self.options.target, self.options.schema
+        );
         self.status(&msg);
         Ok(Flow::Continue)
     }
@@ -412,7 +409,7 @@ impl Shell {
         let Some(known) = key.filter(|k| catalog.schemas.contains(k)) else {
             return self.fail(format!("schema \"{schema}\" does not exist"));
         };
-        self.schema = known;
+        self.options.schema = known;
         Ok(Flow::Continue)
     }
 
@@ -420,9 +417,13 @@ impl Shell {
     /// report what it is.
     fn set_option(&mut self, setting: Setting, value: &str) -> Result<Flow, Failed> {
         setting
-            .set(&mut self.settings, (!value.is_empty()).then_some(value))
+            .set(&mut self.options.settings, (!value.is_empty()).then_some(value))
             .or_else(|e| self.fail(format!("{}: {e}", name_of(&setting))))?;
-        self.status(&format!("{} is {}.", setting.label(), setting.show(&self.settings)));
+        self.status(&format!(
+            "{} is {}.",
+            setting.label(),
+            setting.show(&self.options.settings)
+        ));
         Ok(Flow::Continue)
     }
 
@@ -432,7 +433,7 @@ impl Shell {
         let Some(option) = rest.split_whitespace().next() else {
             let rows = Setting::value_variants()
                 .iter()
-                .map(|s| vec![Value::Text(name_of(s)), Value::Text(s.show(&self.settings))]);
+                .map(|s| vec![Value::Text(name_of(s)), Value::Text(s.show(&self.options.settings))]);
             let rows = Rows::of(&[("Option", TypeCode::String), ("Value", TypeCode::String)], rows);
             self.print_rows(&rows);
             return Ok(Flow::Continue);
@@ -453,7 +454,7 @@ impl Shell {
                     Value::Text(r.schema.clone()),
                     Value::Text(r.name.clone()),
                     Value::Text(r.class().describe().to_string()),
-                    Value::Int(r.visible_columns().count() as i128),
+                    Value::Int(r.visible_columns().count() as i64),
                 ]
             })
             .collect();
@@ -509,15 +510,18 @@ impl Shell {
     }
 
     fn list_schemas(&mut self) -> Result<Flow, Failed> {
-        let catalog = self.catalog()?;
-        let rows = catalog.schemas.into_iter().map(|s| vec![Value::Text(s)]);
-        self.print_rows(&Rows::of(&[("Name", TypeCode::String)], rows));
-        Ok(Flow::Continue)
+        let rows = self
+            .catalog()?
+            .schemas
+            .into_iter()
+            .map(|s| vec![Value::Text(s)])
+            .collect();
+        self.print_listing("schemas", &[("Name", TypeCode::String)], rows)
     }
 
     fn describe(&mut self, name: &str, verbose: bool) -> Result<Flow, Failed> {
         let catalog = self.catalog()?;
-        let found = gnitz_sql::parse_relation_name(name, &self.schema).and_then(|n| catalog.get(&n));
+        let found = gnitz_sql::parse_relation_name(name, &self.options.schema).and_then(|n| catalog.get(&n));
         let Some(rel) = found else {
             return self.fail(format!("Did not find any relation named \"{name}\"."));
         };
@@ -570,14 +574,14 @@ impl Shell {
             format: Format::Aligned,
             expanded: Expanded::Off,
             footer: false,
-            ..self.settings.clone()
+            ..self.options.settings.clone()
         };
-        let target = Target {
-            width: None,
-            wrap: false,
-            ..self.target_for(false)
-        };
-        out.push_str(&render(&Rows::of(&columns, rows), Weights::Repeat, &settings, target));
+        out.push_str(&render(
+            &Rows::of(&columns, rows),
+            Weights::Repeat,
+            &settings,
+            self.target_for(false),
+        ));
 
         let mut section = |title: &str, lines: Vec<String>| {
             if lines.is_empty() {
@@ -648,25 +652,31 @@ impl Shell {
     /// `\e`: `file`, else the last statement, in the editor, then in the
     /// next prompt's buffer.
     fn edit(&mut self, file: &str) -> Result<Flow, Failed> {
-        let Some(scratch) = &self.scratch else {
+        if !self.options.interactive {
             return self.fail("\\e needs an interactive session");
-        };
+        }
+        // The last statement's file, removed once its text is read back.
+        let last;
         let path = match file {
             "" => {
-                let path = scratch.path().join("edit.sql");
-                std::fs::write(&path, &self.last_statement)
-                    .or_else(|e| self.fail(format!("{}: {e}", path.display())))?;
-                path
+                last = tempfile::Builder::new()
+                    .prefix("gnitz-")
+                    .suffix(".sql")
+                    .tempfile()
+                    .or_else(|e| self.fail(format!("\\e: {e}")))?;
+                std::fs::write(last.path(), &self.last_statement)
+                    .or_else(|e| self.fail(format!("{}: {e}", last.path().display())))?;
+                last.path()
             }
-            f => PathBuf::from(f),
+            f => Path::new(f),
         };
-        match editor_command(&path).status() {
+        match editor_command(path).status() {
             Ok(s) if s.success() => {}
             Ok(s) => return self.fail(format!("editor exited with {s}")),
             Err(e) => return self.fail(format!("{}: {e}", editor())),
         }
         // Read back by path: an editor may save by renaming a new file over it.
-        let text = std::fs::read_to_string(&path).or_else(|e| self.fail(format!("{}: {e}", path.display())))?;
+        let text = std::fs::read_to_string(path).or_else(|e| self.fail(format!("{}: {e}", path.display())))?;
         self.prefill = Some(text.trim_end().to_string());
         Ok(Flow::Continue)
     }
@@ -674,10 +684,7 @@ impl Shell {
     /// `\!`: `command` through `/bin/sh`, or an interactive `$SHELL`.
     fn shell_command(&mut self, command: &str) -> Result<Flow, Failed> {
         let status = match command.is_empty() {
-            true => {
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-                Command::new(&shell).status()
-            }
+            true => Command::new(command_from_env(&["SHELL"], "/bin/sh")).status(),
             false => Command::new("/bin/sh").arg("-c").arg(command).status(),
         };
         if let Err(e) = status {
