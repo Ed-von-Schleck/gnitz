@@ -416,7 +416,7 @@ fn a_delta_read_refuses_what_it_cannot_answer() {
     let cases = [
         (&fed, 0, whole(), own ^ 1, "reply schema does not match"),
         (&fed, 3, whole(), own ^ 1, "reply schema does not match"),
-        (&plain, 0, whole(), own, "carries no delta feed"),
+        (&plain, 0, whole(), own, "holds no delta feed"),
         (&fed, 0, first(), own, "uncut"),
         (&fed, 1, first(), own, "uncut"),
         (&fed, 1, short, own, "stride"),

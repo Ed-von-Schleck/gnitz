@@ -24,13 +24,9 @@ impl RelationRegistry {
         reply_layout: u64,
     ) -> Result<Rc<Batch>, WireFault> {
         let entry = self.relation_or_err(id)?;
-        if !entry.kind().has_delta_feed() {
-            return Err(format!(
-                "delta_read: relation {id} carries no delta feed; \
-                 create the view WITH (delta = '<size>') to subscribe to it"
-            )
-            .into());
-        }
+        let feed = entry
+            .feed()
+            .ok_or_else(|| format!("delta_read: this process holds no delta feed for relation {id}"))?;
         if !matches!(spec.sink.kind, SinkKind::Rows { cut: None }) {
             return Err("delta_read: a delta read forwards rows, uncut and unfolded"
                 .to_string()
@@ -40,9 +36,6 @@ impl RelationRegistry {
             return Ok(self.scan_spec(id, spec, reply_layout, None)?);
         }
         let view = entry.schema();
-        let feed = entry
-            .feed()
-            .ok_or_else(|| format!("delta_read: this process holds no delta feed for relation {id}"))?;
         let whole = spec.is_whole();
         let ReadSpec { bound, predicate, sink } = spec;
         let mut plan =
