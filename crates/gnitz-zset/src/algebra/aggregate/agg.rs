@@ -42,17 +42,19 @@ enum StepKind {
 }
 
 impl StepKind {
-    /// `None` iff `op` sums and `tc` has no scalar register image.
-    fn of(op: AggFunc, tc: TypeCode) -> Option<Self> {
-        Some(match op {
+    fn of(op: AggFunc, tc: TypeCode) -> Self {
+        match op {
             AggFunc::Count => StepKind::Count,
             AggFunc::CountNonNull => StepKind::CountNonNull,
-            AggFunc::Sum => StepKind::Sum(ScalarKind::from_type_code(tc)?),
+            AggFunc::Sum => StepKind::Sum(
+                ScalarKind::from_type_code(tc)
+                    .expect("AggFunc::output_type admits a sum only over a scalar register image"),
+            ),
             AggFunc::Min | AggFunc::Max => StepKind::Extreme {
                 max: op == AggFunc::Max,
                 kind: ImageKind::of(tc),
             },
-        })
+        }
     }
 }
 
@@ -333,15 +335,11 @@ impl Groups for &[u32] {
 impl Agg {
     /// `op` over input column `src`, emitting into output column `out`.
     pub(crate) fn new(op: AggFunc, src: ColumnLocator, out: ColumnLocator) -> Self {
-        let step = |op: AggFunc, loc: ColumnLocator| {
-            StepKind::of(op, loc.type_code())
-                .expect("AggFunc::output_type admits a sum only over a scalar register image")
-        };
         Agg {
             src,
             out,
-            kind: step(op, src),
-            merge: step(op.merge_op(), out),
+            kind: StepKind::of(op, src.type_code()),
+            merge: StepKind::of(op.merge_op(), out.type_code()),
         }
     }
 

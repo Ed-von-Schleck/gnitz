@@ -2,8 +2,7 @@ use std::cmp::Ordering;
 
 use super::*;
 use crate::repr::BatchBuilder;
-use crate::schema::key::range_band;
-use crate::schema::SchemaColumn;
+use crate::schema::{range_band, SchemaColumn};
 use crate::test_support::{edge_native, pk_only_schema, random_schema, Rng};
 use gnitz_wire::{cmp_col_window, key_image, KeyRange, PkColList, TypeCode, MAX_PK_COLUMNS};
 

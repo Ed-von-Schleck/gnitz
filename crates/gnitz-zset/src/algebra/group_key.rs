@@ -6,8 +6,7 @@
 
 use super::key_pack::{locate_key_col, pk_run, FoldCols, KeyPacker};
 use crate::repr::{Batch, MemBatch};
-use crate::schema::key::{pk_width_dispatch, PkSortKey};
-use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
+use crate::schema::{pk_width_dispatch, DerivedSchema, PkSortKey, SchemaColumn, SchemaDescriptor};
 use gnitz_expr::{ColumnLocator, ReduceOutKey, ReduceOutSlot};
 use gnitz_wire::{TypeCode, NARROW_PK_MAX_BYTES};
 use rustc_hash::FxHashMap;
@@ -138,27 +137,29 @@ pub(crate) fn cell_image<const W: usize, const OPK: bool>(cell: &[u8; W], signed
 }
 
 /// Run `$body` with `$w` the constant width of [`KeyCells`] `$cells` and `$opk`
-/// its constant `opk`.
+/// its constant `opk`: a PK cell at any width, a payload cell at a column's.
 macro_rules! for_key_cells {
     ($cells:ident, |$w:ident, $opk:ident| $body:expr) => {
-        $crate::algebra::group_key::for_key_cells!(@arms $cells, $w, $opk, $body, 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+        $crate::algebra::group_key::for_key_cells!(
+            @arms $cells, $w, $opk, $body, 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+        )
     };
     (@arms $cells:ident, $w:ident, $opk:ident, $body:expr, $($n:literal)*) => {
-        match $cells.width {
-            $($n => {
-                const $w: usize = $n;
-                match $cells.opk {
-                    true => {
-                        const $opk: bool = true;
-                        $body
-                    }
-                    false => {
-                        const $opk: bool = false;
-                        $body
-                    }
-                }
-            })*
-            _ => unreachable!("a key cell is 1..=16 bytes"),
+        if $cells.opk {
+            const $opk: bool = true;
+            match $cells.width {
+                $($n => {
+                    const $w: usize = $n;
+                    $body
+                })*
+                _ => unreachable!("a PK key cell is 1..=16 bytes"),
+            }
+        } else {
+            const $opk: bool = false;
+            gnitz_wire::by_cell_width!($cells.width, |T| {
+                const $w: usize = size_of::<T>();
+                $body
+            })
         }
     };
 }

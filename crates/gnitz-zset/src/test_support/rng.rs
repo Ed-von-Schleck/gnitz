@@ -1,5 +1,11 @@
-//! The test-only deterministic PRNG, compiled here and as part of
-//! `gnitz-zset-testkit`: xorshift64*, deterministic across hosts.
+//! The test-only deterministic PRNG (xorshift64*, deterministic across hosts)
+//! and the `u64` scrambler `mix`, compiled here and as part of
+//! `gnitz-zset-testkit`.
+
+/// A bijection of `u64` that scatters consecutive values.
+pub fn mix(i: u64) -> u64 {
+    i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
 
 pub struct Rng(u64);
 

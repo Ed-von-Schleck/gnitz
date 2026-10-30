@@ -1,5 +1,7 @@
 use super::{flush_barrier, Cut, RecoverySource, DEFAULT_RAM_TIER_BYTES};
-use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, new_table, scratch_table, table_shards};
+use crate::test_support::{
+    make_batch, make_batch_raw, make_schema_u64_i64, mix, new_table, scratch_table, table_shards,
+};
 use gnitz_foundation::perf::{self, Counter};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;
@@ -99,7 +101,7 @@ fn ram_tier_ceiling_bench() {
             .map(|t| {
                 let mut rows = Vec::new();
                 for u in t * PER_TICK..(t + 1) * PER_TICK {
-                    let key = (u.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) % hot;
+                    let key = (mix(u) >> 20) % hot;
                     let v = &mut version[key as usize];
                     rows.extend([(key, -1, *v), (key, 1, *v + 1)]);
                     *v += 1;
@@ -137,7 +139,7 @@ fn ingest_call_bench() {
     const PER_TICK: u64 = 100;
     const TIER: usize = 1 << 20;
     let ascending = |u: u64| u;
-    let scattered = |u: u64| u.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 1;
+    let scattered = |u: u64| mix(u) >> 1;
     type Case = (&'static str, fn(u64) -> u64);
     let cases: [Case; 2] = [("ascending", ascending), ("scattered", scattered)];
 
@@ -204,7 +206,7 @@ fn sealed_read_bench() {
             t.ingest(make_batch(&schema, &rows)).unwrap();
         }
         for from in (0..pending).step_by(per as usize) {
-            let row = |s: u64| ((s.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24) % held, 1, -1 - s as i64);
+            let row = |s: u64| ((mix(s) >> 24) % held, 1, -1 - s as i64);
             let rows: Vec<_> = (from..from + per).map(row).collect();
             t.ingest_pending(make_batch_raw(&schema, &rows));
         }

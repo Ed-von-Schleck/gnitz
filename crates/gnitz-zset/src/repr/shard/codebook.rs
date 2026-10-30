@@ -122,13 +122,10 @@ impl Codebook {
     /// `DRIFT_SIXTEENTHS` of how it coded its own training values, else one
     /// trained on them; `None` while they are too few to pay for a table.
     pub fn for_batch(current: Option<&Rc<Codebook>>, batch: &Batch) -> Option<Rc<Codebook>> {
-        let schema = batch.schema();
         let blob = batch.blob();
         // Each long value once per cell naming it.
-        let values: Vec<&[u8]> = schema
-            .payload_columns()
-            .filter(|(_, col)| col.type_code.is_german_string())
-            .flat_map(|(pi, _)| batch.col_data(pi).as_chunks::<16>().0)
+        let values: Vec<&[u8]> = gnitz_wire::BitIter(batch.schema().string_payload_slots())
+            .flat_map(|pi| batch.col_data(pi).as_chunks::<16>().0)
             .filter_map(|cell| gnitz_wire::german_string_heap(cell, blob.len()).map(|r| &blob[r]))
             .collect();
         if values.iter().map(|v| v.len()).sum::<usize>() < MIN_CODED_HEAP {

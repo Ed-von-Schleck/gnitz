@@ -5,21 +5,15 @@
 //! its behalf.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
-use std::fmt::Debug;
 use std::path::Path;
 use std::rc::Rc;
 
 use crate::repr::{
     from_runs, from_runs_in_band, Batch, BatchBuilder, Codebook, MappedShard, MemBatch, ReadCursor, Run, ShardWriteOpts,
 };
-use crate::schema::key::group_band;
-use crate::schema::payload_order::{Generic, PayloadOrder};
-use crate::schema::{SchemaColumn, SchemaDescriptor};
+use crate::schema::{group_band, Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::{PkBuf, TypeCode};
-
-use proptest::strategy::Strategy;
 
 use super::rng::Rng;
 use super::shared::{make_schema_pk_u64_payload_string, self_typed_slots, u64_pk_schema, zset_of, zset_sum};
@@ -269,34 +263,6 @@ pub(crate) const STRS: [&str; 10] = [
 /// Floats `total_cmp` tells apart though `==` does not, and the ones it places
 /// past every finite value.
 pub(crate) const FLOATS: [f64; 6] = [-0.0, 0.0, -1.5, 2.5, f64::INFINITY, f64::NAN];
-
-/// Ticks of `(row, target multiplicity)`: each moves some rows of a small pool
-/// to a new multiplicity in `0..=3`, so a row recurs across ticks and most
-/// ticks retract.
-pub(crate) fn arb_ticks<R: Copy + Debug + 'static>(
-    row: impl Strategy<Value = R>,
-) -> impl Strategy<Value = Vec<Vec<(R, i64)>>> {
-    use proptest::collection::vec;
-    vec(row, 1..6).prop_flat_map(|pool| vec(vec((proptest::sample::select(pool), 0i64..=3), 0..6), 1..6))
-}
-
-/// The retractions and insertions moving `model` to each `target` — so a delta
-/// carries cancelling pairs and weight-0 rows, and the integrated input stays
-/// a relation.
-pub(crate) fn delta_to<R: Ord + Copy>(model: &mut BTreeMap<R, i64>, targets: &[(R, i64)]) -> Vec<(R, i64)> {
-    let mut delta = Vec::new();
-    for &(row, target) in targets {
-        let cur = model.insert(row, target).unwrap_or(0);
-        delta.extend([(row, -cur), (row, target)]);
-    }
-    model.retain(|_, w| *w != 0);
-    delta
-}
-
-/// A bijection of `u64` that scatters consecutive values.
-pub(crate) fn mix(i: u64) -> u64 {
-    i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-}
 
 /// `(pk, weight, payload cells)` rows against `schema`, `None` a NULL cell.
 pub(crate) fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &[Option<i64>])]) -> Batch {

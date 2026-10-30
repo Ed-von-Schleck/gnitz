@@ -1,36 +1,17 @@
-//! Single-worker catalog checks for primary keys wider than 16 bytes
-//! (`pk_stride > 16`). A wide PK is always compound (e.g. three U64 columns =
-//! 24 bytes). These tests seed the DAG tables and index circuits directly so a
-//! wide PK can be written with byte-level control, and drive
-//! `Relation::index_on` / the byte-keyed `seek` on the wide path. Unique-index
-//! enforcement over a wide PK runs distributed and is covered end-to-end.
+//! Single-worker catalog checks for primary keys wider than 16 bytes, which
+//! only a compound PK reaches.
 
 use super::*;
+use crate::test_support::make_batch_opk;
 use gnitz_store::relation::RelationKind;
-use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::SchemaDescriptor;
-
-/// `pk_stride` = 24 (wide): three U64 PK columns + one U64 payload `val`.
-fn wide_unique_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(&[u64c(), u64c(), u64c(), u64c()], &[0, 1, 2])
-}
-
-/// Build a batch for `wide_unique_schema`: rows of (pk, val, weight).
-fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> Batch {
-    let mut b = BatchBuilder::new(schema);
-    for &(pk, val, w) in rows {
-        b.begin_row_bytes(&pk, w);
-        b.put_int(val as u128);
-        b.end_row();
-    }
-    b.finish()
-}
+use gnitz_wire::payload_u64;
 
 /// Register a wide-PK table owning a UNIQUE secondary index on col 3, seeded
-/// with `base_rows`. Bypasses `create_table`'s stride gate and the push path,
-/// so it does not exercise the enforcement path.
-fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24], u64, i64)]) {
-    let schema = wide_unique_schema();
+/// with `base_rows` of `(pk, weight, val)`. Bypasses `create_table`'s stride
+/// gate and the push path, so it does not exercise the enforcement path.
+fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24], i64, i64)]) {
+    // `pk_stride` = 24 (wide): three U64 PK columns + one payload `val`.
+    let schema = pk_payload_schema(&[TypeCode::U64; 3]);
     register_full_pk(&mut engine.registry, tid, RelationKind::BaseTable, schema);
     engine
         .registry
@@ -42,9 +23,7 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24
             )],
         )
         .unwrap();
-    // The registry projects the index itself, from the same `key_spec` and index
-    // schema a hand-written projection would use.
-    engine.registry.ingest(tid, wide_val_batch(&schema, base_rows)).unwrap();
+    engine.registry.ingest(tid, make_batch_opk(&schema, base_rows)).unwrap();
     engine.registry.checkpoint_base().unwrap();
 }
 
@@ -56,7 +35,7 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
     let tid = engine.next_id;
 
     // setup_wide_unique installs a UNIQUE secondary index on source col 3.
-    setup_wide_unique(&mut engine, tid, &[(pk24(1, 1, 1), 42, 1)]);
+    setup_wide_unique(&mut engine, tid, &[(pk24(1, 1, 1), 1, 42)]);
 
     // The indexed column resolves to its circuit, carrying the uniqueness flag.
     let ic = engine
@@ -87,24 +66,16 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
 fn wide_pk_seek_family_resolves_non_pk_col() {
     let mut engine = fresh("wide_fk_nonpk");
 
-    // Parent: wide PK (cols 0..3) + non-PK column `email` (col 3). This is the
-    // only test that resolves a genuinely wide (24-byte) PK via the byte-keyed
-    // `seek` and reads back a committed non-PK column value.
     let parent_tid = engine.next_id;
     let parent_pk = pk24(100, 200, 300);
-    setup_wide_unique(&mut engine, parent_tid, &[(parent_pk, 555, 1)]);
+    setup_wide_unique(&mut engine, parent_tid, &[(parent_pk, 1, 555)]);
 
     // A point read resolves the committed parent row by full PK bytes.
     let seen = pk_group(&mut engine, parent_tid, &parent_pk);
     assert_eq!(seen.len(), 1, "the live wide-PK parent row");
-    assert_eq!(read_u64_col(&seen, 0), 555, "resolved the referenced email value");
+    assert_eq!(payload_u64(&*seen, 0, 0), 555, "the row's payload");
 
     finish(engine);
-}
-
-fn read_u64_col(batch: &Batch, payload_idx: usize) -> u64 {
-    let d = batch.col_data(payload_idx);
-    u64::from_le_bytes(d[0..8].try_into().unwrap())
 }
 
 // ── native-key and byte-key point reads agree (narrow PK) ───────
@@ -138,8 +109,8 @@ fn native_and_byte_point_reads_agree_narrow() {
         assert_eq!(via_u128.len(), via_bytes.len(), "presence diverged for key {key}");
         if !via_u128.is_empty() {
             assert_eq!(
-                read_u64_col(&via_u128, 0),
-                read_u64_col(&via_bytes, 0),
+                payload_u64(&*via_u128, 0, 0),
+                payload_u64(&*via_bytes, 0, 0),
                 "payload diverged for key {key}"
             );
         }

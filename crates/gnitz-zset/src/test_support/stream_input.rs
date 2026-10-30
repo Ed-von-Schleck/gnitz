@@ -3,6 +3,8 @@
 //! over it, and each aggregate of one group's rows by its SQL definition.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::fmt::Debug;
 
 use proptest::prelude::*;
 
@@ -173,4 +175,27 @@ pub(crate) fn agg_of(agg: AggDescriptor, rows: &[(Cells, i64)]) -> Option<Vec<u8
             extreme.map(|c| c.to_vec())
         }
     }
+}
+
+/// Ticks of `(row, target multiplicity)`: each moves some rows of a small pool
+/// to a new multiplicity in `0..=3`, so a row recurs across ticks and most
+/// ticks retract.
+pub(crate) fn arb_ticks<R: Copy + Debug + 'static>(
+    row: impl Strategy<Value = R>,
+) -> impl Strategy<Value = Vec<Vec<(R, i64)>>> {
+    use proptest::collection::vec;
+    vec(row, 1..6).prop_flat_map(|pool| vec(vec((proptest::sample::select(pool), 0i64..=3), 0..6), 1..6))
+}
+
+/// The retractions and insertions moving `model` to each `target` — so a delta
+/// carries cancelling pairs and weight-0 rows, and the integrated input stays
+/// a relation.
+pub(crate) fn delta_to<R: Ord + Copy>(model: &mut BTreeMap<R, i64>, targets: &[(R, i64)]) -> Vec<(R, i64)> {
+    let mut delta = Vec::new();
+    for &(row, target) in targets {
+        let cur = model.insert(row, target).unwrap_or(0);
+        delta.extend([(row, -cur), (row, target)]);
+    }
+    model.retain(|_, w| *w != 0);
+    delta
 }

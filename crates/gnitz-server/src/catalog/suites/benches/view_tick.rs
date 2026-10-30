@@ -65,7 +65,7 @@ fn projection_view_tick_bench() {
         col_def("a", TypeCode::U64),
         col_def("b", TypeCode::U64),
     ];
-    let cells = |id: u64| [scramble(id), scramble(id ^ 0x55)];
+    let cells = |id: u64| [mix(id), mix(id ^ 0x55)];
     let (mut engine, t) = ingest_fixture("projection_view_tick_bench", &cols, ROWS, cells);
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(t, ReadBound::None);
@@ -96,7 +96,7 @@ fn projection_view_tick_bench() {
 fn echo_fold_view_tick_bench() {
     let counter = perf::Counter::instructions();
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
-    let cells = |id: u64| [scramble(id)];
+    let cells = |id: u64| [mix(id)];
     for readers in [0usize, 1, 2, 4] {
         let mut engine = fresh(&format!("echo_fold_{readers}"));
         let s = create_stream(&mut engine, "public.s", &cols);
@@ -149,13 +149,13 @@ fn left_join_view_tick_bench() {
         let dir = temp_dir(&format!("left_join_view_tick_bench_{key}_{matched}"));
         let (mut engine, [a, b], v) = left_join_engine(&dir, key);
         if matched {
-            let held = rows(&engine, b, 1, 0..total, |id| [scramble(id), id]);
+            let held = rows(&engine, b, 1, 0..total, |id| [mix(id), id]);
             tick(&mut engine, &counter, b, held);
         }
         // Compiles the plan outside the measurement.
         seal_and_tick(&mut engine, a);
 
-        let ticks = wide_ticks(&mut engine, &counter, a, 0, false, |id| [scramble(id); 2]);
+        let ticks = wide_ticks(&mut engine, &counter, a, 0, false, |id| [mix(id); 2]);
         let (_, null_filled) = left_join_rows(&mut engine, v);
         assert_eq!(
             (net_weight(&engine, v) as u64, null_filled),
@@ -180,11 +180,11 @@ fn left_join_backfill_bench() {
     for (label, matched) in [("every row matched", true), ("no row matched", false)] {
         let dir = temp_dir(&format!("left_join_backfill_bench_{matched}"));
         let (mut engine, [a, b], v) = left_join_engine(&dir, 1);
-        let held = rows(&engine, a, 1, 0..BACKFILL_ROWS, |id| [scramble(id); 2]);
+        let held = rows(&engine, a, 1, 0..BACKFILL_ROWS, |id| [mix(id); 2]);
         engine.registry.ingest(a, held).unwrap();
-        // A scramble is a bijection, so the keys past `a`'s ids match none of them.
+        // `mix` is a bijection, so the keys past `a`'s ids match none of them.
         let first = if matched { 0 } else { BACKFILL_ROWS };
-        let held = rows(&engine, b, 1, 0..BACKFILL_ROWS, |id| [scramble(first + id), id]);
+        let held = rows(&engine, b, 1, 0..BACKFILL_ROWS, |id| [mix(first + id), id]);
         engine.registry.ingest(b, held).unwrap();
 
         let ((), fill) = counter.measure(|| backfill(&mut engine, v));
@@ -220,7 +220,7 @@ fn group_cols() -> [CatalogColumn; 3] {
 /// Row `id`'s `(k, v)`: `v` falls as `id` grows, so a row newer than every other
 /// of its group is that group's least.
 fn group_cells(id: u64) -> [u64; 2] {
-    [scramble(id) % GROUPS, 2 * ROWS - id]
+    [mix(id) % GROUPS, 2 * ROWS - id]
 }
 
 /// The files under `dir`, at any depth: a store's shards and manifests.
@@ -364,7 +364,7 @@ fn topn_bulk_view_tick_bench() {
         ("top-100 of 16 groups", vec![1], 100, 16),
         ("top-3 of 100000 groups", vec![1], 3, 100_000),
     ] {
-        let cells = move |id: u64| [scramble(id) % groups, 2 * ROWS - id];
+        let cells = move |id: u64| [mix(id) % groups, 2 * ROWS - id];
         let name = format!("topn_bulk_{}", label.replace(' ', "_"));
         let (mut engine, t) = ingest_fixture(&name, &group_cols(), ROWS, cells);
         let v = top_n_view(&mut engine, t, &group, limit);
@@ -395,7 +395,7 @@ fn window_bulk_view_tick_bench() {
         ("16 a group, in front", ROWS / 16, true),
         ("256 a group, in front", ROWS / 256, true),
     ] {
-        let cells = move |id: u64| [scramble(id) % groups, if in_front { 2 * ROWS - id } else { id }];
+        let cells = move |id: u64| [mix(id) % groups, if in_front { 2 * ROWS - id } else { id }];
         let name = format!("window_bulk_{}", label.replace([' ', ','], "_"));
         let (mut engine, t) = ingest_fixture(&name, &group_cols(), ROWS, cells);
         let order = [gnitz_wire::OrderKey { col: 2, desc: false, nulls_first: false }];
@@ -478,7 +478,8 @@ fn segment_view_tick_bench() {
         col_def("t_id", TypeCode::U64),
         col_def("u_id", TypeCode::U64),
     ];
-    let joined_schema = gnitz_zset::schema::SchemaDescriptor::new(&[u64c(); 3], &[0]);
+    let joined_schema =
+        crate::test_support::u64_pk_schema(&[gnitz_zset::schema::SchemaColumn::new(TypeCode::U64, false); 2]);
     let aggs = [
         AggDescriptor { agg_op: AggFunc::Sum, col_idx: 1 },
         AggDescriptor::COUNT_STAR,
@@ -501,7 +502,7 @@ fn segment_view_tick_bench() {
     backfill(&mut engine, segment);
     backfill(&mut engine, view);
 
-    let ticks = wide_ticks(&mut engine, &counter, t, 0, false, |id| [scramble(id) % KEYS]);
+    let ticks = wide_ticks(&mut engine, &counter, t, 0, false, |id| [mix(id) % KEYS]);
     assert_eq!(net_weight(&engine, segment), 0, "the segment stored no tick");
     assert_eq!(net_weight(&engine, view) as u64, KEYS, "a group a key");
     println!("segment into a reduce: {WIDE_TICK_ROWS}-row ticks {ticks:>6.1} instr/row");

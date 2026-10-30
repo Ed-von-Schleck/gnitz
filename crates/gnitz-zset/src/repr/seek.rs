@@ -1,14 +1,8 @@
-//! The lower-bound search every sorted PK region seeks through, stateless and
-//! galloping, plus the equal-PK group bracket: [`lower_bound_by`],
-//! [`gallop_by`] and [`gallop_from`] under the `(count, width, ColPtr)` entry
-//! points here for an OPK region, under a packed key's image, under a seek by
-//! (PK, payload) and under the two-way merge's skip.
-//!
-//! A column is addressed as a [`ColPtr`]: a base and a row stride.
+//! Lower-bound search over a sorted row range, and the seeks over a PK column.
 
 use std::ops::Range;
 
-use crate::schema::key::{pk_width_dispatch, PkSortKey};
+use crate::schema::{pk_width_dispatch, PkSortKey};
 use gnitz_wire::RowSource;
 
 /// A column as `base + row * stride`. Stride 0 reads one shared element for
@@ -91,15 +85,8 @@ pub(crate) fn gallop_from(count: usize, mut lo: usize, lt: impl Fn(usize) -> boo
     lower_bound_by(lo + 1, hi, lt)
 }
 
-/// Lower bound over `[0, count)`, galloping from `hint` where there is one, else
-/// the plain binary search. Seeded at a hint it is `O(log gap)` forward when the
-/// boundary is after the hint, `O(1)` when the boundary IS the hint (consecutive
-/// keys in one inter-row gap, or a run past the source end with `hint == count`),
-/// and a bounded `[0, hint)` search when it is before. Correct for ANY hint, and
-/// since `[0, hint] ⊆ [0, count)` it is **never asymptotically worse** than
-/// `lower_bound_by(0, count, …)` — a backward or stale hint forfeits only the
-/// speedup, at the cost of at most two extra comparisons. `lt(i)` reports row
-/// `i < probe`, as in [`lower_bound_by`].
+/// Lower bound over `[0, count)`, galloping from `hint` where there is one, which
+/// may be any row. `lt(i)` reports row `i < probe`, as in [`lower_bound_by`].
 #[inline]
 pub(crate) fn gallop_by(count: usize, hint: Option<usize>, lt: impl Fn(usize) -> bool) -> usize {
     let Some(hint) = hint else {
@@ -107,19 +94,16 @@ pub(crate) fn gallop_by(count: usize, hint: Option<usize>, lt: impl Fn(usize) ->
     };
     let h = hint.min(count);
     if h < count && lt(h) {
-        // boundary strictly after the hint
         return gallop_from(count, h, lt);
     }
     if h == 0 || lt(h - 1) {
         return h;
-    } // boundary is exactly h (incl. h == count)
-    lower_bound_by(0, h, lt) // genuine overshoot: bounded [0, h)
+    }
+    lower_bound_by(0, h, lt)
 }
 
-/// First row of `pk` whose OPK bytes are `>= key`, galloping from `hint` where
-/// there is one ([`gallop_by`]). `width` is the key's byte width, which `key`
-/// must be; `pk`'s own stride is the step between rows, which a Constant region
-/// sets to zero.
+/// First row of `pk` whose `width`-byte OPK is `>= key`, galloping from `hint`
+/// where there is one.
 ///
 /// # Safety
 /// `pk` must address at least `count` rows of `width` bytes.
@@ -163,18 +147,15 @@ pub(crate) unsafe fn seek_pk_rows(
     })
 }
 
-/// First row index past the group beginning at `start` whose rows share row
-/// `start`'s leading `width` key bytes, in a PK-sorted source; `width` is the PK
-/// stride for the whole key. Requires `start < src.row_count()` and `width` no
-/// wider than the PK. A linear step, not a seek: every caller reaches it having
-/// just landed on the group's first row, and either the group is short or the
-/// caller walks all of it anyway.
+/// The first row past `start` of a PK-sorted source not sharing row `start`'s
+/// leading `width` key bytes.
 #[inline]
 pub(crate) fn pk_group_end<S: RowSource>(src: &S, start: usize, width: usize) -> usize {
-    let k = &src.get_pk_bytes(start)[..width];
     let count = src.row_count();
+    debug_assert!(start < count, "pk_group_end: row {start} out of {count}");
+    let k = &src.get_pk_bytes(start)[..width];
     let mut j = start + 1;
-    while j < count && crate::schema::key::compare_pk_ordering(&src.get_pk_bytes(j)[..width], k).is_eq() {
+    while j < count && crate::schema::compare_pk_ordering(&src.get_pk_bytes(j)[..width], k).is_eq() {
         j += 1;
     }
     j

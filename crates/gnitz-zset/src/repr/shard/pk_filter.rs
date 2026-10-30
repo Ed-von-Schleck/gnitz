@@ -1,5 +1,5 @@
 //! The per-shard PK membership filter: a [`BinaryFuse8`] over
-//! [`crate::schema::key::probe_key`] fingerprints, and the on-disk region it is
+//! [`crate::schema::probe_key`] fingerprints, and the on-disk region it is
 //! written to and read back from.
 //!
 //! The region is `[descriptor: DMA_LEN][fingerprints]` — the byte pair
@@ -36,7 +36,7 @@ pub(crate) fn build(pk_region: &[u8], stride: usize) -> Option<Vec<u8>> {
             continue;
         }
         prev = Some(chunk);
-        keys.push(crate::schema::key::probe_key(chunk));
+        keys.push(crate::schema::probe_key(chunk));
     }
     keys.sort_unstable();
     keys.dedup();

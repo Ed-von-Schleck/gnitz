@@ -50,8 +50,8 @@ macro_rules! stride_dispatch {
 }
 pub(crate) use stride_dispatch;
 
-/// The width a [`stride_dispatch!`] target runs at: `N`, or `width` in the
-/// runtime arm.
+/// The width a const-width copier runs at: `N`, or `width` in the runtime arm
+/// `N = 0`.
 #[inline(always)]
 pub(crate) const fn stride<const N: usize>(width: usize) -> usize {
     if N == 0 {

@@ -12,8 +12,7 @@ use super::scatter::{copy_ranges, Pick};
 use super::seek::ColPtr;
 use super::string_heap::{self, relocated_cell, BlobCache};
 use super::writer::DirectWriter;
-use crate::schema::payload_order::{Generic, PayloadOrder};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{Generic, PayloadOrder, SchemaDescriptor};
 use gnitz_expr::{BatchView, ColumnLocator};
 use gnitz_wire::{
     read_i64_le, read_u64_le, Heap, RowSource, TypeCode, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK,
@@ -571,10 +570,8 @@ impl Batch {
         let heap_at = self.carry_heap(src, self.schema.string_payload_slots(), ranges);
         self.write_at_most(total, cache, |w| (total, copy_ranges(src, heap_at, ranges, w)));
     }
-}
 
-impl Batch {
-    // ── Lifecycle ───────────────────────────────────────────────────────
+    // ── View, claim, row edits and sizes ────────────────────────────────
 
     /// Create a borrowed `MemBatch` view over this batch's data.
     ///
@@ -720,6 +717,8 @@ impl Batch {
         self.count * self.schema.row_width() + self.blob.len()
     }
 
+    // ── Copies ──────────────────────────────────────────────────────────
+
     /// The rows `indices` names, in that order, at their own weights; none may be
     /// weight 0.
     pub(crate) fn indexed_rows(&self, indices: &[u32]) -> Self {
@@ -831,6 +830,8 @@ impl Batch {
         output
     }
 
+    // ── Seeks ───────────────────────────────────────────────────────────
+
     /// The PK region as the [`ColPtr`] the OPK seeks read through. Its base
     /// aliases `self.data`, so it is read only while `self` is borrowed.
     #[inline]
@@ -887,6 +888,8 @@ impl Batch {
             }
         }
     }
+
+    // ── Appends, builds and resets ──────────────────────────────────────
 
     /// Copy every `[start, end)` range of `src`, ascending and disjoint, onto
     /// this batch's tail, one append setup serving the whole list.
@@ -1103,6 +1106,8 @@ impl Batch {
         }
     }
 
+    // ── Consolidation and trimming ──────────────────────────────────────
+
     /// Consume this batch, consolidating it if needed. An already-consolidated
     /// (or empty) `self` is returned by move, allocating nothing.
     ///
@@ -1221,11 +1226,13 @@ impl Batch {
     }
 
     /// A tight copy with every long string relocated, so its heap holds no
-    /// dead bytes.
+    /// dead bytes; a copy left with no rows or no long strings holds no heap
+    /// buffer at all.
     fn compacted(&self) -> Batch {
         let (n, mb) = (self.count, self.as_mem_batch());
-        let mut out = Batch::with_capacity_blob(&self.schema, n, self.blob.len());
-        out.write_rows(n, |w| copy_ranges(&mb, None, &[(0, n)], w));
+        let mut out = write_to_batch(&self.schema, n, self.blob.len(), |w| {
+            copy_ranges(&mb, None, &[(0, n)], w)
+        });
         out.inherit_consolidated(self);
         out
     }

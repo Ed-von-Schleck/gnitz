@@ -52,10 +52,11 @@ impl PkSetGather {
     /// can overshoot to `max_rows - 1 + |largest group|`. `0` means the list is exhausted.
     fn for_each_live_row(&mut self, max_rows: usize, mut f: impl FnMut(&ReadCursor)) -> usize {
         assert!(max_rows > 0, "for_each_live_row: max_rows must be positive");
-        let stride = self.keys.stride();
         let mut visited = 0;
-        while visited < max_rows && self.next * stride < self.keys.as_bytes().len() {
-            let key = &self.keys.as_bytes()[self.next * stride..(self.next + 1) * stride];
+        for key in self.keys.iter().skip(self.next) {
+            if visited >= max_rows {
+                break;
+            }
             self.next += 1;
             if self.cursor.seek_pk_group_ascending(key) {
                 self.cursor.for_each_pk_group_row(key, |c| {

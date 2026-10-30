@@ -10,7 +10,7 @@ use gnitz_core::{RelDescriptor, RelName, Schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{KeyRange, ReadBound, ReadSpec, RelClass, RelIndex, TypeCode};
 use gnitz_zset::schema::encode_schema_block;
-use gnitz_zset_testkit::{encode_to_wire_vec, make_batch, make_schema_u64_i64};
+use gnitz_zset_testkit::{encode_to_wire_vec, make_batch, make_schema_u64_i64, mix};
 
 use super::*;
 
@@ -26,7 +26,7 @@ const SELECTED: u64 = 16;
 
 /// 40 scattered bits.
 fn scatter(seq: u64) -> u64 {
-    seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24
+    mix(seq) >> 24
 }
 
 #[test]

@@ -7,8 +7,9 @@ use proptest::prelude::*;
 
 use crate::repr::Batch;
 use crate::stream::ordered::tests::{arb_keys, ordered_groups, Harness};
-use crate::test_support::stream_input::{arb_row, batch, cells, schema, shard, Cells, Row, GROUPS};
-use crate::test_support::{arb_ticks, delta_to};
+use crate::test_support::stream_input::{
+    arb_row, arb_ticks, batch, cells, delta_to, schema, shard, Cells, Row, GROUPS,
+};
 use gnitz_wire::OrderKey;
 
 use crate::stream::ordered::OrderedPlan;

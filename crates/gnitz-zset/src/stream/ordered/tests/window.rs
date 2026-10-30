@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 
 use crate::stream::ordered::tests::{arb_keys, ordered_groups, Harness};
-use crate::test_support::stream_input::{agg, agg_of, arb_row, batch, cells, schema, Cells, Row, GROUPS};
-use crate::test_support::{arb_ticks, delta_to};
+use crate::test_support::stream_input::{
+    agg, agg_of, arb_row, arb_ticks, batch, cells, delta_to, schema, Cells, Row, GROUPS,
+};
 use gnitz_expr::cmp_order_keys;
 use gnitz_wire::{AggDescriptor, AggFunc, OrderKey};
 

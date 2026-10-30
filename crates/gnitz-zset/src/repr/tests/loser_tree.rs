@@ -1,15 +1,15 @@
 use super::*;
 use crate::test_support::Rng;
 
-/// A value's node key: coarser than the value, so adjacent values tie on it,
+/// A value's player key: coarser than the value, so adjacent values tie on it,
 /// and `u128::MAX` for the highest, which is the sentinel's.
 fn key(value: u128) -> u128 {
     value | 1
 }
 
-/// The order of two nodes whose keys tie: the value at `(source_idx, row)`,
+/// The order of two players whose keys tie: the value at `(source_idx, row)`,
 /// then `source_idx` for a stable tiebreak.
-fn run_less(runs: &[Vec<u128>]) -> impl Fn(&HeapNode, &HeapNode) -> bool + '_ {
+fn run_less(runs: &[Vec<u128>]) -> impl Fn(&Player, &Player) -> bool + '_ {
     move |a, b| {
         let ka = (runs[a.source_idx as usize][a.row as usize], a.source_idx);
         let kb = (runs[b.source_idx as usize][b.row as usize], b.source_idx);

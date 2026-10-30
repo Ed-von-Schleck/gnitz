@@ -19,7 +19,7 @@ const ROWS: u64 = 1_000_000;
 /// Row `id`'s payload: incompressible columns, so a skeleton row is a fraction
 /// of a full one.
 fn payload(id: u64) -> [u64; 4] {
-    std::array::from_fn(|c| scramble(id ^ c as u64))
+    std::array::from_fn(|c| mix(id ^ c as u64))
 }
 
 /// An empty engine whose every store spills past a small RAM tier.
@@ -188,7 +188,7 @@ fn hydrate_join_seek_bench() {
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
     let bases = ["public.a", "public.b"].map(|name| {
         let t = engine.create_table(name, &cols, &[0]).unwrap();
-        let loaded = rows(&engine, t, 1, 0..ROWS, |id| [scramble(id)]);
+        let loaded = rows(&engine, t, 1, 0..ROWS, |id| [mix(id)]);
         engine.registry.ingest(t, loaded).unwrap();
         t
     });
@@ -207,7 +207,7 @@ fn hydrate_join_seek_bench() {
         gnitz_store::relation::disk_usage(engine.registry.base_dir()).unwrap()
     );
 
-    let spec = point(&engine, join, scramble(ROWS / 2));
+    let spec = point(&engine, join, mix(ROWS / 2));
     let (rows, _) = cell("join point seek", &mut engine, join, &spec);
     assert_eq!(rows.len(), 1, "one match at the sought key");
     discard(engine);

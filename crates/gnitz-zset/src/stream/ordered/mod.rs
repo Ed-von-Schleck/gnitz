@@ -22,9 +22,7 @@ use std::cmp::Ordering;
 
 use crate::algebra::{GroupOutKey, KeyPacker};
 use crate::repr::{pk_group_end, Batch, CursorRow, MemBatch, ReadCursor};
-use crate::schema::key::compare_pk_ordering;
-use crate::schema::payload_order::{Generic, PayloadOrder};
-use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
+use crate::schema::{compare_pk_ordering, DerivedSchema, Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
 use crate::stream::OpenAt;
 use gnitz_wire::RowSource;
 use gnitz_wire::{OrderKey, TypeCode};

@@ -9,7 +9,7 @@ use super::enforce_unique_pk;
 use crate::relation::{RelationKind, StoreConfig};
 use crate::storage::DEFAULT_RAM_TIER_BYTES;
 use crate::test_support::{
-    make_schema_pk_u64_payload_string, make_schema_u64_i64, relation_fixture_with, table_shards, TID,
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, mix, relation_fixture_with, table_shards, TID,
 };
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -29,7 +29,7 @@ type Row = fn(u64) -> (u64, i64, u64);
 
 /// 40 scattered bits.
 fn scatter(seq: u64) -> u64 {
-    seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24
+    mix(seq) >> 24
 }
 
 /// `per`-row pushes of `row(seq)` over `0..ROWS`; a string payload is spelled

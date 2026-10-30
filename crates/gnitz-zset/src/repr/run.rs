@@ -16,8 +16,7 @@ use crate::repr::batch::Batch;
 use crate::repr::scatter::{mem_batch_to_unified, ColumnarSource, DecodedColumns, UnifiedSource};
 use crate::repr::seek::ColPtr;
 use crate::repr::shard::MappedShard;
-use crate::schema::payload_order::{Generic, PayloadOrder};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{Generic, PayloadOrder, SchemaDescriptor};
 use gnitz_wire::{Heap, RowSource};
 
 #[derive(Clone)]

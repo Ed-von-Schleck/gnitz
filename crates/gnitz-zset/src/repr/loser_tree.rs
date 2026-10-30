@@ -5,21 +5,21 @@
 /// A player: an index into the caller's sources, its current row, and the key
 /// the caller gave that row.
 #[derive(Clone, Copy)]
-pub(crate) struct HeapNode {
+pub(crate) struct Player {
     /// A lower key wins its match outright; the caller's `less` settles a tie.
-    /// Two words, most significant first, so the node carries no padding.
+    /// Two words, most significant first, so the player carries no padding.
     key: [u64; 2],
     pub(crate) source_idx: u32,
     pub(crate) row: u32,
 }
 
-// `step_top` swaps whole nodes on every merge step.
-const _: () = assert!(std::mem::size_of::<HeapNode>() == 24);
+// `step_top` swaps whole players on every merge step.
+const _: () = assert!(std::mem::size_of::<Player>() == 24);
 
-impl HeapNode {
+impl Player {
     #[inline(always)]
     fn new(key: u128, source_idx: u32, row: u32) -> Self {
-        HeapNode {
+        Player {
             key: [(key >> 64) as u64, key as u64],
             source_idx,
             row,
@@ -35,7 +35,7 @@ impl HeapNode {
 /// Not a player: a padding leaf, or a source that has run out. `row` is unread.
 const SENTINEL: u32 = u32::MAX;
 
-const SENTINEL_NODE: HeapNode = HeapNode {
+const SENTINEL_PLAYER: Player = Player {
     key: [u64::MAX; 2],
     source_idx: SENTINEL,
     row: 0,
@@ -45,7 +45,7 @@ const SENTINEL_NODE: HeapNode = HeapNode {
 /// loses to every real player below that key and ties with one at it, where
 /// `source_idx` tells them apart: `less` never sees a sentinel.
 #[inline(always)]
-fn beats(a: &HeapNode, b: &HeapNode, less: &impl Fn(&HeapNode, &HeapNode) -> bool) -> bool {
+fn beats(a: &Player, b: &Player, less: &impl Fn(&Player, &Player) -> bool) -> bool {
     if a.key != b.key {
         return a.key < b.key;
     }
@@ -55,10 +55,10 @@ fn beats(a: &HeapNode, b: &HeapNode, less: &impl Fn(&HeapNode, &HeapNode) -> boo
 pub(crate) struct LoserTree {
     /// `tree[0]` is the champion; `tree[1..]` the loser of each internal node's
     /// last match. Its length is a power of two and never changes.
-    tree: Vec<HeapNode>,
+    tree: Vec<Player>,
     /// Champion of the subtree rooted at each index — [`rebuild`](Self::rebuild)'s
     /// scratch, reused across rebuilds.
-    winners: Vec<HeapNode>,
+    winners: Vec<Player>,
     /// Sources the tournament was built for.
     n: usize,
     /// A leading key word no player but the champion holds a lower one than —
@@ -74,8 +74,8 @@ impl LoserTree {
         debug_assert!(n < u32::MAX as usize, "source count must be < u32::MAX, the sentinel");
         let n_pad = n.next_power_of_two().max(1);
         Self {
-            tree: vec![SENTINEL_NODE; n_pad],
-            winners: vec![SENTINEL_NODE; 2 * n_pad],
+            tree: vec![SENTINEL_PLAYER; n_pad],
+            winners: vec![SENTINEL_PLAYER; 2 * n_pad],
             n,
             bound: 0,
         }
@@ -86,15 +86,15 @@ impl LoserTree {
     pub(crate) fn rebuild(
         &mut self,
         init_fn: impl Fn(usize) -> Option<(u32, u128)>,
-        less: impl Fn(&HeapNode, &HeapNode) -> bool,
+        less: impl Fn(&Player, &Player) -> bool,
     ) {
         let n_pad = self.tree.len();
         let leaf = |i: usize| n_pad + i;
 
-        self.winners[leaf(0)..].fill(SENTINEL_NODE);
+        self.winners[leaf(0)..].fill(SENTINEL_PLAYER);
         for i in 0..self.n {
             if let Some((row, key)) = init_fn(i) {
-                self.winners[leaf(i)] = HeapNode::new(key, i as u32, row);
+                self.winners[leaf(i)] = Player::new(key, i as u32, row);
             }
         }
         for idx in (1..n_pad).rev() {
@@ -109,7 +109,7 @@ impl LoserTree {
 
     /// The current champion, or `None` once every source is exhausted.
     #[inline]
-    pub(crate) fn peek(&self) -> Option<HeapNode> {
+    pub(crate) fn peek(&self) -> Option<Player> {
         let top = self.tree[0];
         (top.source_idx != SENTINEL).then_some(top)
     }
@@ -127,16 +127,16 @@ impl LoserTree {
     /// then the bound under which its next steps skip the replay: a run that does
     /// not interleave with the others is walked at one compare per row.
     #[inline(always)]
-    pub(crate) fn step_top(&mut self, next_row: Option<(u32, u128)>, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
+    pub(crate) fn step_top(&mut self, next_row: Option<(u32, u128)>, less: &impl Fn(&Player, &Player) -> bool) {
         let source_idx = self.tree[0].source_idx;
         debug_assert_ne!(source_idx, SENTINEL, "step_top on a drained tree");
         let mut cur = match next_row {
             Some((row, key)) if ((key >> 64) as u64) < self.bound => {
-                self.tree[0] = HeapNode::new(key, source_idx, row);
+                self.tree[0] = Player::new(key, source_idx, row);
                 return;
             }
-            Some((row, key)) => HeapNode::new(key, source_idx, row),
-            None => SENTINEL_NODE,
+            Some((row, key)) => Player::new(key, source_idx, row),
+            None => SENTINEL_PLAYER,
         };
         let mut idx = self.leaf_parent(source_idx);
         while idx > 0 {

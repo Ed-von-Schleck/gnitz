@@ -14,13 +14,11 @@ use std::marker::PhantomData;
 use std::ops::{ControlFlow, Range};
 
 use super::batch::{Batch, MemBatch};
-use super::loser_tree::{HeapNode, LoserTree};
+use super::loser_tree::{LoserTree, Player};
 use super::scatter::{ColumnarSource, Pick};
 use super::string_heap::{rebase_string_cells, row_long_bytes, BlobCache};
 use super::writer::DirectWriter;
-use crate::schema::key::{pack_pk_be, pk_width_dispatch, PkSortKey};
-use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{pack_pk_be, pk_width_dispatch, with_payload_cmp, PayloadOrder, PkSortKey, SchemaDescriptor};
 use gnitz_wire::{native_key_image, Heap, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT};
 
 // ---------------------------------------------------------------------------
@@ -94,21 +92,9 @@ fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
 // run_merge: the generic N-way (PK, payload) merge + consolidation
 // ---------------------------------------------------------------------------
 
-/// N-way (PK, payload) merge + consolidation over any sorted columnar sources —
-/// the kernel of shard compaction (`shard::GuardMerge`) and of
-/// [`merge_consolidated`]'s N-way arm.
-///
-/// Rows with the same (PK, payload) have their weights summed; zero-weight
-/// (PK, payload) groups are dropped. The payload-aware heap ordering puts equal
-/// (PK, payload) entries consecutively at the root, so the single pending-group
-/// drain in [`drive`] folds both intra-source duplicates (consecutive
-/// matching rows inside one sorted source) and cross-source duplicates in one
-/// pass.
-///
-/// The PK axis is settled by each row's key under a [`MergeOrder`], and past it
-/// by [`merge_less`]; source `i` is walked over the `i`-th of `windows`.
-/// Returns one [`Pick`] per surviving (net ≠ 0) group, at its net weight, in
-/// (PK, payload) order.
+/// The consolidated merge of sorted `sources`, source `i` walked over the `i`-th
+/// of `windows`: one [`Pick`] per (PK, payload) group whose weights do not sum to
+/// zero, at that sum, in (PK, payload) order.
 pub(crate) fn run_merge<S: ColumnarSource>(
     sources: &[S],
     schema: &SchemaDescriptor,
@@ -121,7 +107,7 @@ pub(crate) fn run_merge<S: ColumnarSource>(
     debug_assert_eq!(cursors.len(), sources.len(), "run_merge: one window per source");
     debug_assert!(
         cursors.iter().all(|c| c.end < u32::MAX as usize),
-        "merge source exceeds the heap node's u32 row"
+        "merge source exceeds the tournament's u32 row"
     );
     debug_assert!(
         schema.num_payload_cols() == 0 || !sources.iter().any(S::is_skeleton),
@@ -163,7 +149,7 @@ pub(crate) fn merge_less<'a, S, P>(
     sources: &'a [S],
     order: MergeOrder,
     payload: P,
-) -> impl Fn(&HeapNode, &HeapNode) -> bool + Copy + 'a
+) -> impl Fn(&Player, &Player) -> bool + Copy + 'a
 where
     S: ColumnarSource,
     P: PayloadOrder + 'a,
@@ -188,8 +174,8 @@ fn tie_less<const FOLD: bool, S: ColumnarSource, P: PayloadOrder>(
     order: MergeOrder,
     wide: bool,
     payload: P,
-    a: &HeapNode,
-    b: &HeapNode,
+    a: &Player,
+    b: &Player,
 ) -> bool {
     let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
     let (b_src, b_row) = (b.source_idx as usize, b.row as usize);

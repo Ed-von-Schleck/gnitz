@@ -9,14 +9,12 @@ use std::cmp::Ordering;
 use std::ops::{ControlFlow, Range};
 
 use crate::repr::batch::{Batch, MemBatch};
-use crate::repr::loser_tree::{HeapNode, LoserTree};
+use crate::repr::loser_tree::{LoserTree, Player};
 use crate::repr::merge::{self, MergeOrder};
 use crate::repr::scatter::{ColumnarSource, Pick};
 use crate::repr::seek::gallop_by;
 use crate::repr::shard::MappedShard;
-use crate::schema::key::{compare_pk_ordering, group_floor};
-use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{compare_pk_ordering, group_floor, with_payload_cmp, PayloadOrder, SchemaDescriptor};
 
 mod gather;
 mod output;
@@ -98,8 +96,8 @@ pub struct ReadCursor {
     /// skeleton shard. Keyed by the PK's leading bytes: finding a shared prefix
     /// would read every run's last row at each open.
     order: MergeOrder,
-    /// The drain's merge-order scratch, reused across chunks.
-    merge_order: Vec<Pick>,
+    /// The drain's picks, reused across chunks.
+    drain_picks: Vec<Pick>,
     /// The drain's per-source row windows, reused across chunks.
     drain_windows: Vec<Range<usize>>,
     /// Whether the cursor stands on a row. Written only by `commit_emitted`.
@@ -242,22 +240,22 @@ impl ReadCursor {
     /// leaves the tree positioned exactly as a from-scratch rebuild at the bound
     /// would.
     fn seek_phase(
-        heap: &mut LoserTree,
+        tree: &mut LoserTree,
         sources: &[Run],
         order: MergeOrder,
         states: &mut [Range<usize>],
         lags: impl Fn(&Run, usize) -> bool,
         gallop: impl Fn(&Run, usize) -> usize,
-        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
+        less: &impl Fn(&Player, &Player) -> bool,
     ) {
-        while let Some(HeapNode { source_idx: src, row, .. }) = heap.peek() {
+        while let Some(Player { source_idx: src, row, .. }) = tree.peek() {
             let (src, row) = (src as usize, row as usize);
             // The root is the global min, so once it no longer lags neither does any head.
             if !lags(&sources[src], row) {
                 break;
             }
             states[src].start = gallop(&sources[src], states[src].start);
-            heap.step_top(order.head(sources, src, &states[src]), less);
+            tree.step_top(order.head(sources, src, &states[src]), less);
         }
     }
 
@@ -547,7 +545,7 @@ impl ReadCursor {
         }
     }
 
-    /// Single-live-source bypass: no heap, no ghost filter. Every other source's
+    /// Single-live-source bypass: no tournament, no ghost filter. Every other source's
     /// window is empty, and a run arrives already folded, so the position is either
     /// emit-ready or past-end.
     #[inline]
@@ -655,7 +653,7 @@ fn build(
         if count > 0 {
             debug_assert!(
                 count < u32::MAX as usize,
-                "merge source exceeds the heap node's u32 row"
+                "merge source exceeds the tournament's u32 row"
             );
             sources.push(run);
             states.push(0..count);
@@ -668,7 +666,7 @@ fn build(
         sources,
         order,
         states,
-        merge_order: Vec::new(),
+        drain_picks: Vec::new(),
         drain_windows: Vec::new(),
         mode: None,
         schema,

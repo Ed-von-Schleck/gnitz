@@ -11,10 +11,9 @@ use std::cmp::Ordering;
 
 use crate::repr::{
     copy_runs, pk_group_end, relocated_cell, runs_where, should_relocate_blob, stride_dispatch, Batch, CursorRow,
-    ReadCursor,
+    ReadCursor, Run,
 };
-use crate::schema::key::{band, compare_pk_ordering, group_floor, key_above};
-use crate::schema::{DerivedSchema, SchemaDescriptor};
+use crate::schema::{band, compare_pk_ordering, group_floor, key_above, DerivedSchema, SchemaDescriptor};
 
 use crate::algebra::MapPlan;
 use crate::stream::OpenAt;
@@ -429,33 +428,36 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
                 ColumnLocator::Payload { slot: pi, type_code, .. } if type_code.is_german_string() => {
                     // One relocation per trace row, whatever its fan-out.
                     let (dst, dst_blob, mut cache) = w.string_col_mut(slot);
-                    let mut cells = dst.as_chunks_mut::<16>().0.iter_mut();
-                    for p in pairs {
-                        let (t_src, t_row) = trace_row(p);
-                        let cell = relocated_cell(
-                            t_src.german_cell(t_row, pi as usize),
-                            t_src.heap(),
+                    repeat_cells::<16>(cursor, dst, pairs, |src, row| {
+                        relocated_cell(
+                            src.german_cell(row, pi as usize),
+                            src.heap(),
                             dst_blob,
                             cache.as_deref_mut(),
-                        );
-                        cells.by_ref().take(p.len()).for_each(|c| *c = cell);
-                    }
+                        )
+                    });
                 }
                 ColumnLocator::Payload { slot: pi, size, .. } => {
+                    let pi = pi as usize;
                     gnitz_wire::by_cell_width!(size as usize, |T| repeat_cells::<{ size_of::<T>() }>(
                         cursor,
-                        pi as usize,
                         w.col_mut(slot),
-                        pairs
+                        pairs,
+                        |src, row| src.get_col_ptr(row, pi, size_of::<T>()).try_into().unwrap()
                     ))
                 }
                 ColumnLocator::Pk { byte_off, size, type_code } => {
-                    gnitz_wire::by_cell_width!(size as usize, |T| repeat_pk_cells::<{ size_of::<T>() }>(
+                    let (off, signed) = (byte_off as usize, type_code.is_signed_int());
+                    gnitz_wire::by_cell_width!(size as usize, |T| repeat_cells::<{ size_of::<T>() }>(
                         cursor,
-                        byte_off as usize,
-                        type_code.is_signed_int(),
                         w.col_mut(slot),
-                        pairs
+                        pairs,
+                        |src, row| {
+                            let mut cell = [0u8; size_of::<T>()];
+                            let pk = src.get_pk_bytes(row);
+                            gnitz_wire::decode_pk_cell(&pk[off..off + size_of::<T>()], signed, &mut cell);
+                            cell
+                        }
                     ))
                 }
             }
@@ -477,28 +479,19 @@ fn delta_runs(pairs: &[Pairing]) -> impl Iterator<Item = (usize, usize)> + '_ {
     pairs.iter().map(|p| (p.rs as usize, p.re as usize))
 }
 
-/// Each pairing's trace cell of payload column `pi`, written once per row of its
-/// delta run.
+/// Each pairing's trace cell, produced by `cell` from its walked row, written
+/// once per row of its delta run.
 #[inline(always)]
-fn repeat_cells<const N: usize>(cursor: &ReadCursor, pi: usize, dst: &mut [u8], pairs: &[Pairing]) {
+fn repeat_cells<const N: usize>(
+    cursor: &ReadCursor,
+    dst: &mut [u8],
+    pairs: &[Pairing],
+    mut cell: impl FnMut(&Run, usize) -> [u8; N],
+) {
     let mut cells = dst.as_chunks_mut::<N>().0.iter_mut();
     for p in pairs {
         let (src, row) = cursor.row_at(p.at);
-        let cell: [u8; N] = src.get_col_ptr(row, pi, N).try_into().unwrap();
-        cells.by_ref().take(p.len()).for_each(|c| *c = cell);
-    }
-}
-
-/// [`repeat_cells`] for the PK column at byte `off` of the walked row's key,
-/// decoded to its native bytes.
-#[inline(always)]
-fn repeat_pk_cells<const N: usize>(cursor: &ReadCursor, off: usize, signed: bool, dst: &mut [u8], pairs: &[Pairing]) {
-    let mut cells = dst.as_chunks_mut::<N>().0.iter_mut();
-    for p in pairs {
-        let (src, row) = cursor.row_at(p.at);
-        let pk = src.get_pk_bytes(row);
-        let mut cell = [0u8; N];
-        gnitz_wire::decode_pk_cell(&pk[off..off + N], signed, &mut cell);
+        let cell = cell(src, row);
         cells.by_ref().take(p.len()).for_each(|c| *c = cell);
     }
 }

@@ -5,7 +5,7 @@
 use gnitz_wire::{PkBuf, PkListRole, RowSource};
 
 use super::key_pack::KeyPacker;
-use crate::repr::{copy_runs, range_rows, runs_where, write_to_batch, Batch, MemBatch};
+use crate::repr::{copy_runs, range_rows, runs_where, stride, write_to_batch, Batch, MemBatch};
 use crate::schema::{DerivedSchema, SchemaDescriptor};
 
 /// A key span: columns at their own types, packed tightly in order.
@@ -113,7 +113,7 @@ pub fn index_entries(source: &Batch, spec: &KeySpec, idx_schema: &SchemaDescript
         src_stride: usize,
         runs: &[(usize, usize)],
     ) {
-        let w = if W == 0 { src_stride } else { W };
+        let w = stride::<W>(src_stride);
         let mut entries = entries.chunks_exact_mut(idx_stride);
         for &(s, e) in runs {
             // The PKs lead the zip: it stops on them without taking an entry it leaves unwritten.

@@ -1,6 +1,5 @@
 use super::*;
-use crate::schema::payload_order::{Generic, PayloadOrder};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{Generic, PayloadOrder, SchemaDescriptor};
 use crate::test_support::{
     arb_fold_case, assert_folds, fold_batch, make_schema_pk_u64_payload_string, make_string_batch, FoldRow,
 };

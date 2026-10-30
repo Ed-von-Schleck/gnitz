@@ -3,11 +3,11 @@
 //! own and may name crate-internals. All but [`stream_input`], whose names
 //! (`schema`, `batch`, `Row`) are read through its path, are re-exported here.
 
-pub mod internal;
-pub mod ladder;
-pub mod rng;
-pub mod shared;
-pub mod stream_input;
+mod internal;
+mod ladder;
+mod rng;
+mod shared;
+pub(crate) mod stream_input;
 
 pub(crate) use internal::*;
 pub use ladder::*;

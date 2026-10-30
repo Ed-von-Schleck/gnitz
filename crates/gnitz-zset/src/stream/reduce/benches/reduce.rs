@@ -163,7 +163,7 @@ fn op_reduce_bench() {
         for i in 0..N {
             bb.begin_row(mix(i + salt * N) as u128, 1);
             for (c, col) in group.iter().enumerate() {
-                let g = grp(i) & (u64::MAX >> (64 - 8 * col.size()));
+                let g = grp(i) & gnitz_wire::image_mask(col.size()) as u64;
                 bb.put_opt_int((!col.nullable || i % 16 != c as u64).then_some(g as u128));
             }
             bb.put_u64(mix(i ^ salt));

@@ -167,7 +167,7 @@ fn pk_range_and_confinement_follow_key_membership() {
 
     let key = |k: &PkBuf| u32::from(u16::from_be_bytes(k.pk_bytes().try_into().unwrap()));
     for r in &ranges {
-        let (lo, hi) = match crate::schema::key::range_band(&s, r) {
+        let (lo, hi) = match crate::schema::range_band(&s, r) {
             Some((start, end)) => (key(&start), end.as_ref().map_or(1 << 16, key)),
             None => (0, 0),
         };

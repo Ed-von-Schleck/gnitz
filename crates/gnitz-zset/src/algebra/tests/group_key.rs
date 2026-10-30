@@ -1,7 +1,10 @@
 use super::*;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::SchemaColumn;
-use crate::test_support::{arb_fold_case, cell, fold_batch, le_cell, mix, opk_pk, pk_only_schema};
+use crate::test_support::{
+    arb_fold_case, cell, fold_batch, le_cell, make_schema_pk_u64_payload_string, mix, opk_pk, pk_only_schema,
+    u64_pk_schema,
+};
 use gnitz_wire::TypeCode;
 use proptest::prelude::*;
 
@@ -203,12 +206,11 @@ fn groups_follow_out_pk_over_signed_wide_and_nullable_columns() {
 #[test]
 fn packed_identities_over_runs_are_their_whole_batch_identities() {
     const N: usize = 512;
-    let c = SchemaColumn::new;
-    let ints = SchemaDescriptor::new(
-        &[c(TypeCode::U64, false), c(TypeCode::I64, true), c(TypeCode::I32, false)],
-        &[0],
-    );
-    let strs = SchemaDescriptor::new(&[c(TypeCode::U64, false), c(TypeCode::String, false)], &[0]);
+    let ints = u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::I64, true),
+        SchemaColumn::new(TypeCode::I32, false),
+    ]);
+    let strs = make_schema_pk_u64_payload_string();
     for (schema, cols) in [(&ints, &[1u32, 2][..]), (&strs, &[1][..])] {
         let mut b = BatchBuilder::new(schema);
         for i in 0..N as u64 {

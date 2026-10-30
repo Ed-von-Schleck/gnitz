@@ -125,10 +125,10 @@ impl PayloadOrder for Generic {
 macro_rules! with_payload_cmp {
     ($schema:expr, |$p:ident| $body:expr $(,)?) => {
         if $schema.payload_is_fixed_int_nonnull() {
-            let $p = $crate::schema::payload_order::FixedIntNonnull;
+            let $p = $crate::schema::FixedIntNonnull;
             $body
         } else {
-            let $p = $crate::schema::payload_order::Generic;
+            let $p = $crate::schema::Generic;
             $body
         }
     };

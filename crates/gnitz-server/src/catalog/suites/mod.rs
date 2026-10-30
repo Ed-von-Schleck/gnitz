@@ -52,7 +52,7 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::
 
 use crate::test_support::{
     apply_ddl, bundle, circuit_batch, cmp_all, col_def, col_tab_batch, cols_of, distinct_circuit, equi_join_circuit,
-    fk_child_cols, fk_def, fk_def_on_delete, fk_parent, idx_tab_batch, left_join_engine, negate_chain, net_weight,
+    fk_child_cols, fk_def, fk_def_on_delete, fk_parent, idx_tab_batch, left_join_engine, mix, negate_chain, net_weight,
     nullable_def, opk_pk, pk_payload_schema, push_and_tick, push_sys_row, read_rows, refusal, register_full_pk,
     register_identity_view, scan_all, schema_tab_batch, scratch_dir, sum_weights, sys_batch, table_engine,
     table_tab_batch, table_tab_row, try_register_identity_view, try_register_view, two_term_join_circuit, uuid_def,
@@ -146,12 +146,6 @@ fn discard(engine: CatalogEngine) {
 // An arbitrary fixed 128-bit value for UUID columns; the bit pattern is
 // irrelevant, only that it round-trips through a U128/UUID column.
 const UUID_A: u128 = 0x0000_0000_0000_AAAA_0000_0000_0000_BBBB;
-
-/// A non-nullable U64 schema column — the building block of the compound-PK
-/// fixtures below.
-fn u64c() -> gnitz_zset::schema::SchemaColumn {
-    gnitz_zset::schema::SchemaColumn::new(TypeCode::U64, false)
-}
 
 /// The OPK image of a three-column U64 compound PK (`pk_stride` = 24, wide).
 /// Encoded through the production encoder, so a broken encoder fails the test
@@ -326,11 +320,6 @@ fn ingest_fixture<const N: usize>(
     let (mut engine, tid) = table_engine("catalog", name, 1, cols);
     engine.registry.ingest(tid, rows(&engine, tid, 1, 0..n, cells)).unwrap();
     (engine, tid)
-}
-
-/// A value spread over the whole `u64` range, a bijection of `id`.
-fn scramble(id: u64) -> u64 {
-    id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 /// A one-row `public` TABLE_TAB `+1` under an explicit packed `pk_col_idx`

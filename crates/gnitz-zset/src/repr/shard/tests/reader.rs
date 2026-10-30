@@ -162,7 +162,7 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
         assert_eq!(shard.pk_at(r).pk_bytes(), key, "{label}: key by value, row {r}");
         assert_eq!(shard.pk_rows(key), want.pk_rows(key), "{label}: rows of row {r}'s key");
         assert!(
-            shard.pk_filter_may_contain(crate::schema::key::probe_key(key)),
+            shard.pk_filter_may_contain(crate::schema::probe_key(key)),
             "{label}: PK filter false negative on row {r}"
         );
         let lb = (0..n).find(|&i| want.get_pk_bytes(i) == key).unwrap();
@@ -251,7 +251,7 @@ fn shapes() -> Vec<Shape> {
                 b.begin_row(i as u128 * 5, [1, -1, 2][i % 3]);
                 match i % 4 {
                     0 => b.put_null(),
-                    _ => b.put_int((i as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as i64) as u128),
+                    _ => b.put_int(mix(i as u64) as i64 as u128),
                 }
             }),
             reader: nullable_i64,
@@ -702,7 +702,7 @@ fn every_column_type_reads_back_whatever_its_values() {
     ] {
         for nullable in [false, true] {
             let schema = u64_pk_schema(&[SchemaColumn::new(tc, nullable)]);
-            let mask = u128::MAX >> (128 - 8 * schema.columns()[1].size());
+            let mask = gnitz_wire::image_mask(schema.columns()[1].size());
             for (what, value) in values {
                 for n in [1, 700, DECODE_BLOCK_ROWS + 3] {
                     let batch = build(schema, n, |b, i| {

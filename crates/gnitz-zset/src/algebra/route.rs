@@ -2,7 +2,7 @@
 
 use gnitz_wire::{widen_pk_be, KeyRange, NARROW_PK_MAX_BYTES};
 
-use crate::schema::{key, SchemaDescriptor};
+use crate::schema::{key_above, range_band, SchemaDescriptor};
 
 /// Map a 64-bit hash onto `0..num_workers` by multiply-shift.
 #[inline(always)]
@@ -90,7 +90,7 @@ impl Placement {
         if !range.walks_pk(schema.pk_cols()) {
             return None;
         }
-        let Some((start, end)) = key::range_band(schema, range) else {
+        let Some((start, end)) = range_band(schema, range) else {
             return Some(0);
         };
         let Placement::Keyed { dist_stride } = self else {
@@ -101,7 +101,7 @@ impl Placement {
         // OPK order is byte order: the band keeps `start`'s distribution prefix iff
         // it ends at or below the first key above that prefix group, and a group
         // with no key above it reaches the top of the key space.
-        let confined = key::key_above(prefix, start.len()).is_none_or(|above| end.is_some_and(|e| e <= above));
+        let confined = key_above(prefix, start.len()).is_none_or(|above| end.is_some_and(|e| e <= above));
         confined.then(|| worker_for_pk_bytes(prefix, num_workers))
     }
 

@@ -7,7 +7,7 @@ use super::super::run::Run;
 use super::{ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
 use crate::repr::scatter::{ColumnarSource, Pick, UnifiedSet};
-use crate::schema::payload_order::with_payload_cmp;
+use crate::schema::with_payload_cmp;
 use gnitz_wire::RowSource;
 
 impl ReadCursor {
@@ -43,14 +43,14 @@ impl ReadCursor {
         windows.clear();
         windows.extend(self.states.iter().map(|s| s.start..s.start));
         windows[self.current.src as usize].start = self.current.row as usize;
-        let mut order = std::mem::take(&mut self.merge_order);
-        self.drain_sorted_into(max_rows, &mut order);
+        let mut picks = std::mem::take(&mut self.drain_picks);
+        self.drain_sorted_into(max_rows, &mut picks);
         for (w, s) in windows.iter_mut().zip(&self.states) {
             w.end = s.start;
         }
         if self.order.coarsen {
             let sources = &self.sources;
-            order.retain(|&(e, r, w)| {
+            picks.retain(|&(e, r, w)| {
                 let src = &sources[e as usize];
                 let skeleton = src.is_skeleton();
                 if skeleton {
@@ -60,9 +60,9 @@ impl ReadCursor {
             });
         }
         let set = UnifiedSet::of(&self.sources, &self.schema, windows.iter().cloned());
-        let mut batch = set.materialize(&order, None);
+        let mut batch = set.materialize(&picks, None);
         batch.certify_consolidated();
-        self.merge_order = order;
+        self.drain_picks = picks;
         self.drain_windows = windows;
         Some(batch)
     }

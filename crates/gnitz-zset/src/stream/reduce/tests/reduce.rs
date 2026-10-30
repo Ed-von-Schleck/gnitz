@@ -8,8 +8,10 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 
 use crate::repr::Batch;
-use crate::test_support::stream_input::{agg, agg_of, arb_row, batch, cells, schema, shard, Cells, Row, GROUPS};
-use crate::test_support::{arb_ticks, assert_folds, cell, delta_to, TestTrace};
+use crate::test_support::stream_input::{
+    agg, agg_of, arb_row, arb_ticks, batch, cells, delta_to, schema, shard, Cells, Row, GROUPS,
+};
+use crate::test_support::{assert_folds, cell, TestTrace};
 use gnitz_expr::{CmpOp, ReduceOutKey, RowFilter};
 use gnitz_wire::{AggDescriptor, AggFunc, GroupAggs, ReadSink, SinkKind, TypeCode};
 

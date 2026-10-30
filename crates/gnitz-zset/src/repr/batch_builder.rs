@@ -4,6 +4,7 @@
 
 use super::batch::Batch;
 use crate::schema::SchemaDescriptor;
+use gnitz_wire::REG_PAYLOAD_START;
 
 /// Row-by-row builder of a `Batch`, whose schema lives on the batch itself.
 pub struct BatchBuilder {
@@ -19,7 +20,7 @@ impl gnitz_wire::SysRowSink for BatchBuilder {
         BatchBuilder::begin_row_natives(self, pk, weight);
     }
     fn put_u64(&mut self, v: u64) {
-        self.put_int(v.into());
+        BatchBuilder::put_u64(self, v);
     }
     fn put_string(&mut self, s: &str) {
         BatchBuilder::put_string(self, s);
@@ -35,9 +36,7 @@ impl gnitz_wire::SysRowSink for BatchBuilder {
 impl BatchBuilder {
     pub fn new(schema: &SchemaDescriptor) -> Self {
         BatchBuilder {
-            // Every row writes every column, as `DirectWriter` says: `put_null`
-            // zero-fills its cell.
-            batch: Batch::with_capacity(schema, 8),
+            batch: Batch::empty_with_schema(schema),
             curr_col: 0,
         }
     }
@@ -70,7 +69,7 @@ impl BatchBuilder {
     /// holds. That is the same native convention [`Self::begin_row_natives`] takes
     /// for PK columns.
     pub fn put_int(&mut self, val: u128) {
-        let col_size = self.schema().columns()[self.physical_col_idx()].size();
+        let col_size = self.schema().region_stride(REG_PAYLOAD_START + self.curr_col);
         debug_assert!(
             col_size == 16 || {
                 // The bytes about to be dropped must carry no information: all
@@ -112,7 +111,7 @@ impl BatchBuilder {
     /// width: an F32 column stores the `as f32` narrowing.
     #[cfg(test)]
     pub(crate) fn put_float(&mut self, val: f64) {
-        let col_size = self.schema().columns()[self.physical_col_idx()].size();
+        let col_size = self.schema().region_stride(REG_PAYLOAD_START + self.curr_col);
         match col_size {
             4 => self.batch.extend_col(self.curr_col, &(val as f32).to_le_bytes()),
             _ => self.batch.extend_col(self.curr_col, &val.to_le_bytes()),
@@ -149,9 +148,5 @@ impl BatchBuilder {
 
     fn schema(&self) -> &SchemaDescriptor {
         self.batch.schema()
-    }
-
-    fn physical_col_idx(&self) -> usize {
-        self.schema().payload_col_idx(self.curr_col)
     }
 }

@@ -191,12 +191,13 @@ pub type RowKey = (Vec<u8>, Vec<Option<Vec<u8>>>);
 /// the same logical string carry different struct bytes.
 pub fn row_key<S: RowSource>(src: &S, schema: &SchemaDescriptor, row: usize) -> RowKey {
     let nw = src.get_null_word(row);
-    let vals = (0..schema.num_payload_cols())
-        .map(|pi| {
+    let vals = schema
+        .payload_columns()
+        .map(|(pi, col)| {
             if gnitz_wire::null_word_get(nw, pi) {
                 return None;
             }
-            let tc = schema.columns()[schema.payload_col_idx(pi)].type_code;
+            let tc = col.type_code;
             let raw = src.get_col_ptr(row, pi, tc.wire_stride());
             Some(if tc.is_german_string() {
                 gnitz_wire::german_string_bytes(raw.first_chunk().unwrap(), src.heap()).into_owned()

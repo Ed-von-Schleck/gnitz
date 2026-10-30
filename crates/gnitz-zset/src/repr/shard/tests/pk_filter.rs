@@ -4,7 +4,7 @@ use xorf::Filter;
 
 /// A `u128` PK through the real key derivation, as its OPK bytes.
 fn key_u128(k: u128) -> u64 {
-    crate::schema::key::probe_key(&k.to_be_bytes())
+    crate::schema::probe_key(&k.to_be_bytes())
 }
 
 /// Through its region, no key set produces a false negative, and

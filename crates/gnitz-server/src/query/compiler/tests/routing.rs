@@ -1,7 +1,7 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::{
-    make_schema_u64_i64, pk_payload_schema, scan_keyed, scan_routed, self_typed_slots, u64_pk_schema,
+    make_schema_u64_i64, mix, pk_payload_schema, scan_keyed, scan_routed, self_typed_slots, u64_pk_schema,
 };
 use gnitz_wire::{Circuit, JoinKind, NullKeys, RangeRel, ReindexRole, TypeCode};
 use gnitz_zset::algebra::{Placement, Slot};
@@ -86,7 +86,7 @@ fn assert_routes_by(relay: Option<&Rc<ScatterPlan>>, schema: &SchemaDescriptor, 
     for i in 0..64u64 {
         bb.begin_row(i as u128, 1);
         for c in 0..schema.num_payload_cols() as u64 {
-            bb.put_u64((i << 8 | c).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            bb.put_u64(mix(i << 8 | c));
         }
         bb.end_row();
     }

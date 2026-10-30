@@ -16,8 +16,7 @@ use std::cmp::Ordering;
 
 use crate::algebra::{ground_pk, Agg, AggValues, GroupOrdinals, RangeGroups, ReduceShape};
 use crate::repr::{Batch, MemBatch, RowMark};
-use crate::schema::payload_order::{Generic, PayloadOrder};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{Generic, PayloadOrder, SchemaDescriptor};
 use crate::stream::OpenAt;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
