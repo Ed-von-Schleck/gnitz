@@ -91,7 +91,7 @@ pub(crate) fn booting_reactor(n: usize) -> (Reactor, ReadyLease, Vec<W2mWriter>)
 /// A one-shot op the kernel completes at its submit.
 pub(super) fn nop(r: &Reactor) -> oneshot::Receiver<i32> {
     // SAFETY: the SQE names no memory.
-    unsafe { r.push_op(opcode::Nop::new().build(), None) }
+    unsafe { r.push_op(opcode::Nop::new().build()) }
 }
 
 /// Future that returns Pending exactly once, waking itself, then Ready.

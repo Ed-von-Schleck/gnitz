@@ -158,3 +158,41 @@ fn a_dropped_wait_stops_counting_once_the_reader_parks_elsewhere() {
     r.drain_all_w2m();
     assert_eq!(r.w2m.release_cursor(0), r.w2m.write_cursor(0), "copied out");
 }
+
+/// A ring given back has every frame a lease holds queued copied out of it,
+/// releasing its space, and holds the lease's train on that worker until its
+/// reader asks for a frame past the copies; a dropped lease ends its holds.
+#[test]
+fn a_ring_given_back_copies_queued_frames_and_holds_their_train() {
+    let (r, lease, mut writers) = train_lease(1, "ScanSpec");
+    let id = lease.id();
+    let schema = crate::test_support::make_schema_u64_i64();
+    let rows = crate::test_support::make_batch(&schema, &[(7, 1, 0)]);
+    writers[0].send_train_frame(id, false, Some(&rows));
+    writers[0].send_train_frame(id, false, Some(&rows));
+    r.drain_all_w2m();
+    assert!(r.w2m.release_cursor(0) < r.w2m.write_cursor(0), "queued in place");
+
+    writers[0].name_shortage();
+    r.drain_all_w2m();
+    assert_eq!(r.w2m.release_cursor(0), r.w2m.write_cursor(0), "copied out");
+    assert!(writers[0].held(id));
+    for _ in 0..2 {
+        let f = try_poll_once(lease.next())
+            .expect("routed")
+            .expect("no fault")
+            .expect("a row frame");
+        assert!(!f.slot.in_ring());
+        assert_eq!(f.rows(&schema).get_pk_bytes(0), 7u64.to_be_bytes());
+    }
+    assert!(writers[0].held(id), "taking the copies keeps the hold");
+    assert!(try_poll_once(lease.next()).is_none());
+    assert!(!writers[0].held(id), "asking past them ends it");
+
+    writers[0].send_train_frame(id, false, Some(&rows));
+    writers[0].name_shortage();
+    r.drain_all_w2m();
+    assert!(writers[0].held(id));
+    drop(lease);
+    assert!(!writers[0].held(id), "a dropped lease holds nothing");
+}

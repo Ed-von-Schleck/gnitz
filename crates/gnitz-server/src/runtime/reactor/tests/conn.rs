@@ -529,3 +529,51 @@ fn peer_addr_names_a_tcp_peer_and_leaves_the_fd_open() {
     );
     assert_eq!(client_pair(&r).0.peer_addr(), None, "an AF_UNIX peer has no address");
 }
+
+/// A send of a ring slot to a client that has stopped reading holds the slot
+/// only until its ring is given back: then the send is cut short, the slot
+/// copied out and released, and the send goes on from the copy.
+#[test]
+fn a_stalled_send_gives_its_slot_back_with_its_ring() {
+    let (r, mut writers) = reactor_with_rings(1);
+    let (conn, mut receiver) = client_pair(&r);
+    shrink(&conn, &receiver, 4 * 1024);
+    let text: Vec<u8> = (0..24 * 1024).map(|i| (i % 251) as u8).collect();
+    let msg = crate::runtime::frame::WireMsg { blob: &text, ..Default::default() };
+    writers[0].send_msg(crate::runtime::w2m::fixtures::id(1), &msg);
+    let slot = r.w2m.try_read_slot(0).expect("the frame");
+    let wire = slot.frame_bytes().to_vec();
+    let held = r.w2m.release_cursor(0);
+
+    let done = Rc::new(Cell::new(None));
+    let (sender, out, c) = (r.clone(), Rc::clone(&done), Rc::clone(&conn));
+    r.spawn(async move { out.set(Some(sender.send_owned(&c, SendBody::Slot(slot)).await)) });
+    for _ in 0..100 {
+        r.tick(false);
+    }
+    assert_eq!(
+        (done.get(), r.w2m.release_cursor(0)),
+        (None, held),
+        "the send waits on the client, holding its slot"
+    );
+
+    writers[0].name_shortage();
+    assert!(
+        poll_until(&r, || r.w2m.release_cursor(0) > held),
+        "the give-back frees the slot"
+    );
+    assert_eq!(done.get(), None, "while the send goes on");
+
+    let reader = std::thread::spawn(move || {
+        let mut got = vec![0u8; wire.len()];
+        std::io::Read::read_exact(&mut receiver, &mut got).expect("the whole frame");
+        (got, wire)
+    });
+    assert!(
+        poll_until(&r, || done.get().is_some()),
+        "the send finishes from the copy"
+    );
+    assert_eq!(done.get(), Some(Ok(())));
+    let (got, wire) = reader.join().expect("reader");
+    assert!(got == wire, "the client reads the frame as it was published");
+}

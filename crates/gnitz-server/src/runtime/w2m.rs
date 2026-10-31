@@ -22,18 +22,34 @@
 //! waits on a reader's pace. ACKs need not come in SAL order — a group applied
 //! inside a drive is ACKed ahead of the drive's own — and each names its lease.
 //!
+//! ## Giving a ring back
+//!
+//! The master holds a slot until it is done with it, and a ring frees only a
+//! released front prefix, so a slot held at a client's pace holds up every
+//! slot behind it. A worker refused room by bytes another cut owns, while a
+//! reply of its own waits, names a shortage in its header and wakes the
+//! master. The master then gives the ring back: every slot of that ring a
+//! lease holds queued is copied out of the ring, and every holder awaiting
+//! with a slot is woken to copy its own ([`W2mSlot::poll_give_back`]). Each
+//! lease whose queued frames were copied is **held** on that worker: its
+//! worker sends it nothing more until its reader has taken the copies and asks
+//! for the next frame. So what the master copies is bounded by what the ring
+//! held, and while no worker is refused room by another cut, nothing is copied.
+//!
 //! ## The park rule
 //!
 //! A worker waits only on its own park, the one a SAL group or an exchange
-//! part wakes: short of room, it arms `release_cursor`'s [`Park`], and the
-//! master's release that takes that arm wakes the worker's park. So a worker
-//! short of room still sees the SAL. The master parks on one word of its own
-//! over all the rings, whose arm a publish on any ring takes.
+//! part wakes: short of room, or with every reply it owes held, it arms
+//! `release_cursor`'s [`Park`], and the master's release, or its end of a
+//! hold, that takes that arm wakes the worker's park. So a waiting worker
+//! still sees the SAL. The master parks on one word of its own over all the
+//! rings, whose arm a publish or a shortage on any ring takes.
 
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::task::{Context, Poll, Waker};
 
 use super::park::{Park, WorkerParks};
 use crate::runtime::frame::WireMsg;
@@ -159,6 +175,9 @@ struct W2mRingHeader {
     /// The virtual offset the data head stands for, stored ahead of the publish
     /// of the message there.
     origin: AtomicU64,
+    /// One past the `release_cursor` at which the worker last named a shortage
+    /// of room, zero before the first; the master answers each value once.
+    want_room: AtomicU64,
     /// `release_cursor`: the master publishes it, the worker reads it; its arm asks
     /// for a wake of the worker's park.
     release: Park,
@@ -197,6 +216,43 @@ impl AckRing {
         // SAFETY: a fresh page-aligned shared mapping of one ring, never
         // unmapped; zeroed is an empty one.
         Ok(unsafe { &*base.cast::<AckRing>() })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HoldTable
+// ---------------------------------------------------------------------------
+
+/// Leases one worker may have held at once. A lease past it is copied out
+/// unheld.
+const HOLD_SLOTS: usize = 1024;
+
+/// The leases a worker sends nothing more for (see the module header): the
+/// first `held` of `ids`, which only the master writes. A zeroed mapping holds
+/// none.
+#[repr(C)]
+struct HoldTable {
+    held: AtomicU32,
+    ids: [AtomicU32; HOLD_SLOTS],
+}
+
+impl HoldTable {
+    /// A fresh shared mapping holding no lease, never unmapped.
+    fn map() -> std::io::Result<&'static HoldTable> {
+        let base = posix_io::map_shared(None, size_of::<HoldTable>())?;
+        // SAFETY: a fresh page-aligned shared mapping of one table, never
+        // unmapped; zeroed holds nothing.
+        Ok(unsafe { &*base.cast::<HoldTable>() })
+    }
+
+    /// Whether `id` is held. A read racing the master's write may miss a hold
+    /// or see one just ended; a parker's re-test behind its arm sees neither.
+    #[inline]
+    fn holds(&self, id: RequestId) -> bool {
+        let n = self.held.load(Ordering::SeqCst) as usize;
+        self.ids[..n.min(HOLD_SLOTS)]
+            .iter()
+            .any(|x| x.load(Ordering::Relaxed) == id.get())
     }
 }
 
@@ -326,6 +382,7 @@ fn rings(parks: WorkerParks, capacity: usize) -> std::io::Result<(Vec<W2mWriter>
             cap: capacity as u64,
         };
         let acks = AckRing::map()?;
+        let holds = HoldTable::map()?;
         writers.push(W2mWriter {
             wc: start,
             master,
@@ -333,8 +390,11 @@ fn rings(parks: WorkerParks, capacity: usize) -> std::io::Result<(Vec<W2mWriter>
             acks,
             acks_head: 0,
             park,
+            holds,
         });
-        readers.push(WorkerRing(UnsafeCell::new(InFlightState::new(start, park, acks))));
+        readers.push(WorkerRing(UnsafeCell::new(InFlightState::new(
+            start, park, acks, holds,
+        ))));
     }
     // Leaked with the mappings: a slot releases through its ring for as long as
     // it lives.
@@ -370,6 +430,8 @@ pub struct W2mWriter {
     acks_head: u64,
     /// This worker's park, which a drain freeing ACK room wakes.
     park: &'static Park,
+    /// The leases this worker sends nothing more for.
+    holds: &'static HoldTable,
 }
 
 // SAFETY: the raw `base` inside the cursor and the master's park are
@@ -496,23 +558,65 @@ impl W2mWriter {
 
     /// The last publish found no room, and no release has come since.
     pub fn short_of_room(&self) -> bool {
-        self.full_at == Some(self.wc.header().release.value())
+        self.full_at == Some(self.release_cursor())
     }
 
-    /// Sleep on this worker's park, the one its SAL groups and exchange parts
-    /// wake, while `still_waiting` and the ring is [short of
-    /// room](Self::short_of_room). The release arm goes ahead of the park's own
-    /// arm and re-test: a release behind it wakes the park, and one ahead of it
+    /// Everything published lies below it.
+    pub fn write_cursor(&self) -> u64 {
+        self.wc.virt
+    }
+
+    /// Everything below it the master has released.
+    pub fn release_cursor(&self) -> u64 {
+        self.wc.header().release.value()
+    }
+
+    /// The master holds the lease `id` answers on: send it nothing more.
+    #[inline]
+    pub fn held(&self, id: RequestId) -> bool {
+        self.holds.holds(id)
+    }
+
+    /// Ask the master to give the ring back (see the module header): once per
+    /// `release_cursor`, so a refusal the master has answered names nothing
+    /// more until a release moves it. The load wake of [`Park`]: the master
+    /// arms, then re-tests `want_room`.
+    #[cold]
+    pub fn name_shortage(&mut self) {
+        let want = self.release_cursor() + 1;
+        let header = self.wc.header();
+        if header.want_room.load(Ordering::Relaxed) == want {
+            return;
+        }
+        header.want_room.store(want, Ordering::SeqCst);
+        self.master.take_arm();
+    }
+
+    /// Wait on this worker's park, the one its SAL groups and exchange parts
+    /// wake, while `still_waiting`: for the master's next release or end of a
+    /// hold. The release arm goes ahead of the park's own arm and re-test: a
+    /// release or end of a hold behind it wakes the park, and one ahead of it
     /// is what the re-test sees.
-    pub fn park_for_room(&self, still_waiting: impl FnOnce() -> bool) {
+    pub fn park_for_master(&self, still_waiting: impl FnOnce() -> bool) {
         self.wc.header().release.arm();
-        self.park.park(|| still_waiting() && self.short_of_room());
+        self.park.park(still_waiting);
     }
 }
 
 // ---------------------------------------------------------------------------
 // InFlightState — the master's read cursor and its outstanding slots
 // ---------------------------------------------------------------------------
+
+/// Where one in-flight slot stands.
+enum SlotState {
+    /// Held: by a lease's queue, or by whoever took it off one.
+    Held,
+    /// Held by a task awaiting something else, which this wakes to copy it out.
+    Waiting(Waker),
+    /// The ring was given back: its holder copies it out at its next turn.
+    GivenBack,
+    Released,
+}
 
 /// The master's per-ring state: its read cursor, which never leaves this
 /// process, and the slots it has handed out but not yet released.
@@ -524,17 +628,21 @@ struct InFlightState {
     /// A slot's `push_idx` minus `front_idx` is its position in `queue`.
     front_idx: u64,
     /// One entry per in-flight slot, front = oldest: the offset the slot ends
-    /// at, and whether it has been released.
-    queue: VecDeque<(u64, bool)>,
+    /// at, and where it stands.
+    queue: VecDeque<(u64, SlotState)>,
     /// The writer's park, which a release taking the writer's arm wakes.
     writer_park: &'static Park,
     /// The worker's ACK ring, and the ACKs read off it.
     acks: &'static AckRing,
     acks_tail: u64,
+    /// The leases the worker sends nothing more for, which only the master writes.
+    holds: &'static HoldTable,
+    /// The header's `want_room` the master last answered.
+    answered: u64,
 }
 
 impl InFlightState {
-    fn new(read: RingCursor, writer_park: &'static Park, acks: &'static AckRing) -> Self {
+    fn new(read: RingCursor, writer_park: &'static Park, acks: &'static AckRing, holds: &'static HoldTable) -> Self {
         InFlightState {
             read,
             front_idx: 0,
@@ -542,18 +650,24 @@ impl InFlightState {
             writer_park,
             acks,
             acks_tail: 0,
+            holds,
+            answered: 0,
         }
+    }
+
+    /// Where the in-flight slot `push_idx` stands.
+    fn state(&mut self, push_idx: u64) -> &mut SlotState {
+        &mut self.queue[(push_idx - self.front_idx) as usize].1
     }
 
     /// Mark the slot identified by `push_idx` as released. Advances
     /// `release_cursor` through the front-consecutive released prefix and, if it
     /// advanced and the writer asked, wakes the writer's park.
     fn release(&mut self, push_idx: u64) {
-        let pos = (push_idx - self.front_idx) as usize;
-        self.queue[pos].1 = true;
+        *self.state(push_idx) = SlotState::Released;
 
         let mut last_vrc = None;
-        while let Some(&(vrc, true)) = self.queue.front() {
+        while let Some(&(vrc, SlotState::Released)) = self.queue.front() {
             self.queue.pop_front();
             self.front_idx += 1;
             last_vrc = Some(vrc);
@@ -618,24 +732,40 @@ impl W2mSlot {
         unsafe { &*self.frame }
     }
 
-    /// The same message in pooled memory, its ring space released.
+    /// Copy the message into pooled memory and release its ring space; a no-op
+    /// on a copy.
     #[cold]
     #[inline(never)]
-    pub(crate) fn detach(mut self) -> W2mSlot {
-        let Some(ring) = self.ring.take() else { return self };
+    pub(crate) fn detach(&mut self) {
+        let Some(ring) = self.ring.take() else { return };
         let mut copy = std::mem::ManuallyDrop::new(PooledBuf::with_capacity(self.frame.len()));
         copy.extend_from_slice(self.frame_bytes());
         // SAFETY: as in `Drop`, for the slot the copy replaces.
         unsafe { (*ring.0.get()).release(self.index()) };
         self.frame = std::ptr::slice_from_raw_parts(copy.as_ptr(), copy.len());
         self.push_idx = copy.capacity() as u64 | self.push_idx & PASSED_BIT;
-        self
     }
 
     /// The bytes still pin their ring space.
-    #[cfg(test)]
     pub(crate) fn in_ring(&self) -> bool {
         self.ring.is_some()
+    }
+
+    /// Ready once the ring was given back while this slot was held: its holder,
+    /// a task awaiting something else with it, then copies it out
+    /// ([`Self::detach`]). Until then each poll leaves the caller's
+    /// waker for the give-back to wake. Never ready on a copy.
+    pub(crate) fn poll_give_back(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let Some(ring) = self.ring else { return Poll::Pending };
+        // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
+        let state = unsafe { (*ring.0.get()).state(self.index()) };
+        match state {
+            SlotState::GivenBack => Poll::Ready(()),
+            _ => {
+                *state = SlotState::Waiting(cx.waker().clone());
+                Poll::Pending
+            }
+        }
     }
 
     /// The slot's control header, aborting on failure: the ring is a trusted
@@ -681,14 +811,79 @@ fn drop_copy(frame: *const [u8], cap: u64) {
 struct WorkerRing(UnsafeCell<InFlightState>);
 
 impl WorkerRing {
-    /// The worker has published past the master's read cursor, or ACKed past
-    /// its ACK read count.
+    /// The worker has published past the master's read cursor, ACKed past its
+    /// ACK read count, or named a shortage the master has not answered.
     #[inline]
     fn has_unread(&self) -> bool {
         // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
         let st = unsafe { &*self.0.get() };
-        st.read.header().write.load(Ordering::SeqCst) != st.read.virt
+        let header = st.read.header();
+        header.write.load(Ordering::SeqCst) != st.read.virt
             || st.acks.head.load(Ordering::SeqCst) != st.acks_tail
+            || header.want_room.load(Ordering::SeqCst) != st.answered
+    }
+
+    /// The worker has named a shortage since the last call: answered now.
+    #[inline]
+    fn take_shortage(&self) -> bool {
+        // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
+        let st = unsafe { &mut *self.0.get() };
+        let want = st.read.header().want_room.load(Ordering::SeqCst);
+        if want == st.answered {
+            return false;
+        }
+        st.answered = want;
+        true
+    }
+
+    /// Wake every task awaiting with a slot of this ring, to copy it out.
+    #[cold]
+    fn wake_holders(&self) {
+        // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call;
+        // a wake only queues its task.
+        let st = unsafe { &mut *self.0.get() };
+        for (_, state) in st.queue.iter_mut() {
+            if let SlotState::Waiting(w) = state {
+                w.wake_by_ref();
+                *state = SlotState::GivenBack;
+            }
+        }
+    }
+
+    /// Hold `id`: its worker sends it nothing more. False, holding nothing,
+    /// when [`HOLD_SLOTS`] leases are held.
+    #[cold]
+    fn hold(&self, id: RequestId) -> bool {
+        // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
+        let holds = unsafe { (*self.0.get()).holds };
+        let n = holds.held.load(Ordering::Relaxed) as usize;
+        if n == HOLD_SLOTS {
+            return false;
+        }
+        holds.ids[n].store(id.get(), Ordering::Relaxed);
+        holds.held.store(n as u32 + 1, Ordering::SeqCst);
+        true
+    }
+
+    /// End `id`'s hold, waking the worker if it waits on the master. The
+    /// release is published again at its value: the RMW wake of [`Park`].
+    #[cold]
+    fn unhold(&self, id: RequestId) {
+        // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
+        let st = unsafe { &*self.0.get() };
+        let holds = st.holds;
+        let n = holds.held.load(Ordering::Relaxed) as usize;
+        let Some(at) = holds.ids[..n]
+            .iter()
+            .position(|x| x.load(Ordering::Relaxed) == id.get())
+        else {
+            debug_assert!(false, "an end of a hold that was never taken");
+            return;
+        };
+        holds.ids[at].store(holds.ids[n - 1].load(Ordering::Relaxed), Ordering::Relaxed);
+        holds.held.store(n as u32 - 1, Ordering::SeqCst);
+        let release = &st.read.header().release;
+        release.publish_waking(release.value(), st.writer_park);
     }
 
     /// Hand every unread ACK's id to `ack`, in the order the worker wrote them,
@@ -789,7 +984,7 @@ impl WorkerRing {
         st.read.advance(slot_stride(sz));
 
         let push_idx = st.front_idx + st.queue.len() as u64;
-        st.queue.push_back((st.read.virt, false));
+        st.queue.push_back((st.read.virt, SlotState::Held));
         Some(W2mSlot {
             frame,
             push_idx: push_idx | if passed { PASSED_BIT } else { 0 },
@@ -823,7 +1018,28 @@ impl W2mReceiver {
         self.rings[worker].drain_acks(ack)
     }
 
-    /// Arm the master's park unless a ring has unread data or ACKs: the futex word and
+    /// `worker` has named a shortage of room since the last call.
+    pub(crate) fn take_shortage(&self, worker: usize) -> bool {
+        self.rings[worker].take_shortage()
+    }
+
+    /// Wake every task awaiting with a slot of `worker`'s ring, to copy it out.
+    pub(crate) fn wake_holders(&self, worker: usize) {
+        self.rings[worker].wake_holders()
+    }
+
+    /// Hold the lease `id` on `worker`: it sends that lease nothing more until
+    /// [`Self::unhold`]. False when `worker` holds as many leases as it can.
+    pub(crate) fn hold(&self, worker: usize, id: RequestId) -> bool {
+        self.rings[worker].hold(id)
+    }
+
+    /// End the hold [`Self::hold`] took.
+    pub(crate) fn unhold(&self, worker: usize, id: RequestId) {
+        self.rings[worker].unhold(id)
+    }
+
+    /// Arm the master's park unless a ring has unread data, ACKs or a shortage: the futex word and
     /// the value a wait on it compares. `None` leaves it disarmed, and the caller
     /// drains and retries, never parks. The arm and the cursor loads behind it
     /// are SeqCst, the master's half of the pair [`Park`] describes. The arm

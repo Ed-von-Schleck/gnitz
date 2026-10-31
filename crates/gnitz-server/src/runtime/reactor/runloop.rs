@@ -166,10 +166,11 @@ impl Reactor {
                 self.parked.set(false);
             }
             KIND_OP => {
-                let op = self.ops.borrow_mut().try_remove(id as usize);
+                let op = self.ops.borrow_mut().try_remove((id & OP_SLOT_MASK) as usize);
                 op.expect("an op's entry lives until its CQE").done.send(res);
             }
             KIND_RECV => self.handle_recv_cqe(id as i32, res),
+            KIND_CANCEL => {}
             kind => unreachable!("CQE kind {kind} (user_data={user_data:#x}) was never issued"),
         }
     }

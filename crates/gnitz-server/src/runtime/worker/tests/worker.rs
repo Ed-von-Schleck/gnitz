@@ -784,3 +784,67 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
         assert_eq!(got, want, "{n} spans");
     }
 }
+
+/// A refusal asks the master for the ring back only when what holds the ring
+/// is another cut's than a reply that waits: a train held up by its own frames
+/// asks nothing, a reply of another cut behind those frames does.
+#[test]
+fn a_refusal_names_a_shortage_only_behind_another_cuts_bytes() {
+    let fixed = make_schema_u64_i64();
+    let rows = make_batch_raw(&fixed, &(0..1000).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+    let dir = crate::test_support::scratch_dir("worker", "shortage");
+    let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
+    let (mut wp, _sal, rx) = worker_over(&mut engine, 4096, 1 << 20);
+    wp.reply_frame_budget = frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 16]));
+
+    wp.reply(route(1, 11, 1), Ok(Rows::Own(rows)));
+    while !wp.w2m_writer.short_of_room() {
+        wp.emit_reply_frame();
+    }
+    assert!(!rx.take_shortage(0), "a train held up by its own frames asks nothing");
+
+    // As large as the train's frame the ring just refused.
+    let behind = make_batch_raw(&fixed, &(0..16).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+    wp.reply(route(2, 22, 2), Ok(Rows::Own(behind)));
+    assert_eq!(owed(&wp), [("train", 11), ("train", 22)]);
+    assert!(
+        rx.take_shortage(0),
+        "a reply of another cut behind them asks for the ring"
+    );
+    wp.w2m_writer.name_shortage();
+    assert!(!rx.take_shortage(0), "once per release");
+}
+
+/// A train the master holds sends nothing and holds up only its own cut: the
+/// first sendable reply behind it goes, and with every reply held the worker
+/// waits on the master, until the hold ends.
+#[test]
+fn a_held_train_steps_aside_until_its_hold_ends() {
+    let fixed = make_schema_u64_i64();
+    let rows = make_batch_raw(&fixed, &(0..100).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+    let dir = crate::test_support::scratch_dir("worker", "held_train");
+    let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
+    let (mut wp, _sal, rx) = test_worker(&mut engine);
+    wp.reply_frame_budget = frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 16]));
+
+    wp.reply(route(1, 11, 1), Ok(Rows::Own(rows.clone())));
+    wp.reply(route(1, 12, 1), Ok(Rows::Own(rows)));
+    wp.replies.push_back(Owed::Fault(route(2, 21, 2), "boom".into()));
+    assert!(rx.hold(0, id(11)));
+    wp.emit_reply_frame();
+    assert_eq!(
+        reqs(&frames(&rx)),
+        [21],
+        "the next cut's reply goes past the held train"
+    );
+    wp.emit_reply_frame();
+    assert!(frames(&rx).is_empty(), "nor does the train behind it in its cut");
+    assert!(wp.waits_on_master());
+
+    rx.unhold(0, id(11));
+    assert!(!wp.waits_on_master());
+    drain_replies(&mut wp);
+    let mut order = reqs(&frames(&rx));
+    order.dedup();
+    assert_eq!(order, [11, 12]);
+}

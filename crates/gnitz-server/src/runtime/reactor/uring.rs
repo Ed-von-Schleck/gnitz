@@ -28,12 +28,13 @@ fn entered(rc: std::io::Result<usize>) {
 }
 
 /// Every opcode the reactor issues, by its kernel name.
-const OPCODES: [(u8, &str); 5] = [
+const OPCODES: [(u8, &str); 6] = [
     (opcode::Accept::CODE, "ACCEPT"),
     (opcode::Recv::CODE, "RECV"),
     (opcode::Send::CODE, "SEND"),
     (opcode::Fsync::CODE, "FSYNC"),
     (opcode::FutexWait::CODE, "FUTEX_WAIT"),
+    (opcode::AsyncCancel::CODE, "ASYNC_CANCEL"),
 ];
 
 /// Whether this host gives the reactor what it runs on: a ring, and every

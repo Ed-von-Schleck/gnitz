@@ -32,7 +32,7 @@ impl W2mWriter {
     /// [`Self::try_send_msg`], retried while the ring is full.
     pub(crate) fn send_msg(&mut self, request_id: RequestId, msg: &WireMsg<'_>) {
         while !self.try_send_msg(request_id, false, msg) {
-            self.park_for_room(|| true);
+            self.park_for_master(|| self.short_of_room());
         }
     }
 

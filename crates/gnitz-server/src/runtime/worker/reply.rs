@@ -1,5 +1,6 @@
 //! The worker's reply queue: what it owes the master, the one rule that decides
-//! when a reply leaves, and the frame cutter every train is sent through.
+//! when a reply leaves, the frame cutter every train is sent through, and when
+//! a refusal of room asks the master for the ring back.
 
 use super::*;
 
@@ -48,9 +49,10 @@ pub(super) enum Rows {
 }
 
 impl Train {
-    /// Send the next frame, if the ring has room for it now; `Ok(true)` once the
-    /// last was sent. `Err` is a row too wide for any frame.
-    fn emit_next(&mut self, w2m: &mut W2mWriter, budget: usize) -> Result<bool, WireFault> {
+    /// Send the next frame, if the ring has room for it now: `Ok(Some(last))`,
+    /// `last` once it was the last; `Ok(None)` refused. `Err` is a row too wide
+    /// for any frame.
+    fn emit_next(&mut self, w2m: &mut W2mWriter, budget: usize) -> Result<Option<bool>, WireFault> {
         let (batch, whole) = match &mut self.rows {
             Rows::Own(batch) => (&*batch, true),
             Rows::Shared(batch) => (&**batch, true),
@@ -69,10 +71,10 @@ impl Train {
         let msg = WireMsg::train_frame(self.route.target_id, last, rows);
         msg.check_size()?;
         if !w2m.try_send_msg(self.route.request_id, false, &msg) {
-            return Ok(false);
+            return Ok(None);
         }
         self.next_row = next_row;
-        Ok(last)
+        Ok(Some(last))
     }
 }
 
@@ -85,17 +87,23 @@ impl WorkerProcess<'_> {
     fn send_or_owe(&mut self, at: usize, route: ReplyRoute, answer: Result<Rows, WireFault>) -> Option<Owed> {
         let passing = at > 0;
         let may_pass = at.checked_sub(1).is_none_or(|p| self.replies[p].cut() != route.cut);
-        let sent = may_pass
-            && match &answer {
-                Err(fault) => self
-                    .w2m_writer
+        let sent = match &answer {
+            _ if !may_pass => None,
+            Err(fault) => Some(
+                self.w2m_writer
                     .try_send_msg(route.request_id, passing, &WireMsg::fault(fault)),
-                Ok(Rows::Spans(_)) => false,
-                Ok(Rows::Own(batch)) => self.try_send_whole(route, passing, batch),
-                Ok(Rows::Shared(batch)) => self.try_send_whole(route, passing, batch),
-            };
-        if sent {
-            return None;
+            ),
+            Ok(Rows::Spans(_)) => None,
+            Ok(Rows::Own(batch)) => self.try_send_whole(route, passing, batch),
+            Ok(Rows::Shared(batch)) => self.try_send_whole(route, passing, batch),
+        };
+        match sent {
+            Some(true) => {
+                self.published(route.cut);
+                return None;
+            }
+            Some(false) => self.refused(route.cut),
+            None => {}
         }
         Some(match answer {
             Err(fault) => Owed::Fault(route, fault),
@@ -103,11 +111,59 @@ impl WorkerProcess<'_> {
         })
     }
 
-    /// `batch` as the one frame of its reply, when it fits the budget and the ring.
-    fn try_send_whole(&mut self, route: ReplyRoute, passing: bool, batch: &Batch) -> bool {
+    /// `batch` as the one frame of its reply, when it fits the budget: whether
+    /// the ring had room for it. `None` past the budget.
+    fn try_send_whole(&mut self, route: ReplyRoute, passing: bool, batch: &Batch) -> Option<bool> {
         let msg = WireMsg::train_frame(route.target_id, true, batch.wire_whole());
         (msg.data.is_none() || msg.size() <= self.reply_frame_budget)
-            && self.w2m_writer.try_send_msg(route.request_id, passing, &msg)
+            .then(|| self.w2m_writer.try_send_msg(route.request_id, passing, &msg))
+    }
+
+    /// Record a publish of `cut`'s that just fit: the ring bytes below the
+    /// write cursor are `cut`'s down to the last publish's end, which extends
+    /// the last run when that run is `cut`'s too.
+    fn published(&mut self, cut: Cut) {
+        self.forget_released();
+        let end = self.w2m_writer.write_cursor();
+        match self.unreleased.back_mut() {
+            Some((last, c)) if *c == cut => *last = end,
+            _ => self.unreleased.push_back((end, cut)),
+        }
+    }
+
+    /// Forget every run the master has released.
+    fn forget_released(&mut self) {
+        let release = self.w2m_writer.release_cursor();
+        while self.unreleased.front().is_some_and(|&(end, _)| end <= release) {
+            self.unreleased.pop_front();
+        }
+    }
+
+    /// A publish of `cut`'s found no room. Its own reader frees the room its
+    /// cut's bytes hold, at its own pace; bytes of another cut wait on another
+    /// reader, perhaps one that has stopped. So ask the master for the ring
+    /// back when the oldest unreleased publish is another cut's than a reply
+    /// that waits: `cut`'s, or that of another sendable entry.
+    fn refused(&mut self, cut: Cut) {
+        self.forget_released();
+        let blocker = self.unreleased.front().map(|&(_, c)| c);
+        if blocker != Some(cut) || self.sendable().any(|i| Some(self.replies[i].cut()) != blocker) {
+            self.w2m_writer.name_shortage();
+        }
+    }
+
+    /// The entries a frame may go for now, in queue order: the first of each
+    /// cut's run, unless it is a parked read or a train the master holds,
+    /// which hold up the rest of their run.
+    pub(super) fn sendable(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.replies.len()).filter(|&i| {
+            (i == 0 || self.replies[i - 1].cut() != self.replies[i].cut())
+                && match &self.replies[i] {
+                    Owed::Parked(..) => false,
+                    Owed::Fault(..) => true,
+                    Owed::Train(t) => !self.w2m_writer.held(t.route.request_id),
+                }
+        })
     }
 
     /// Answer `route`. Its cut's groups are consecutive in the SAL, so whatever the
@@ -140,27 +196,35 @@ impl WorkerProcess<'_> {
         }
     }
 
-    /// Send the front reply's next frame, if the ring has room for it now. A
-    /// reply that ends is popped; a train that faults is answered by the fault in
-    /// its place. Never blocks.
+    /// Send the next frame of the first [sendable](Self::sendable) reply, if
+    /// the ring has room for it now. A reply that ends is removed; a train that
+    /// faults is answered by the fault in its place. Never blocks.
     pub(super) fn emit_reply_frame(&mut self) {
+        let Some(i) = self.sendable().next() else { return };
         let w2m = &mut self.w2m_writer;
-        let done = match self.replies.front_mut() {
-            None => return,
-            Some(Owed::Parked(..)) => unreachable!("a parked read is answered when its drive ends"),
-            Some(Owed::Fault(route, fault)) => w2m.try_send_msg(route.request_id, false, &WireMsg::fault(fault)),
-            Some(Owed::Train(train)) => match train.emit_next(w2m, self.reply_frame_budget) {
-                Ok(done) => done,
-                Err(fault) => {
-                    // Answered by the fault, sent now or owed in the train's place.
-                    let route = train.route;
-                    self.replies[0] = Owed::Fault(route, fault);
-                    return self.emit_reply_frame();
-                }
-            },
+        let (route, sent) = match &mut self.replies[i] {
+            Owed::Parked(..) => unreachable!("a parked read is not sendable"),
+            Owed::Fault(route, fault) => (
+                *route,
+                Ok(w2m
+                    .try_send_msg(route.request_id, false, &WireMsg::fault(fault))
+                    .then_some(true)),
+            ),
+            Owed::Train(train) => (train.route, train.emit_next(w2m, self.reply_frame_budget)),
         };
-        if done {
-            self.replies.pop_front();
+        match sent {
+            Ok(Some(done)) => {
+                self.published(route.cut);
+                if done {
+                    self.replies.remove(i);
+                }
+            }
+            Ok(None) => self.refused(route.cut),
+            Err(fault) => {
+                // Answered by the fault, sent now or owed in the train's place.
+                self.replies[i] = Owed::Fault(route, fault);
+                self.emit_reply_frame();
+            }
         }
     }
 }

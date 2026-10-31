@@ -11,7 +11,7 @@ use std::rc::Rc;
 use crate::catalog::CatalogEngine;
 use crate::query::{DagEngine, DriveHost};
 use crate::runtime::mesh::Mesh;
-use crate::runtime::sal::{Apply, Inbound, Read, ReplyRoute, SalReader};
+use crate::runtime::sal::{Apply, Cut, Inbound, Read, ReplyRoute, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::{IndexClaim, RelationRegistry};
@@ -34,6 +34,9 @@ pub struct WorkerProcess<'c> {
     /// Replies this worker owes, in the order they reach the ring, which is
     /// request order within a [`Cut`](crate::runtime::sal::Cut).
     replies: VecDeque<Owed>,
+    /// The runs of one cut's publishes the master has not released, oldest
+    /// first: where each ends, and the cut whose bytes hold the ring there.
+    unreleased: VecDeque<(u64, Cut)>,
     /// Per-frame wire budget of every W2M train, never past what the ring holds.
     /// `GNITZ_REPLY_FRAME_BUDGET` lowers it, so tests reach multi-frame trains on
     /// small tables.
@@ -57,6 +60,7 @@ impl<'c> WorkerProcess<'c> {
             w2m_writer,
             mesh,
             replies: VecDeque::new(),
+            unreleased: VecDeque::new(),
             reply_frame_budget: gnitz_foundation::env::env_num(
                 "GNITZ_REPLY_FRAME_BUDGET",
                 gnitz_wire::MAX_FRAME_PAYLOAD,
@@ -72,15 +76,22 @@ impl<'c> WorkerProcess<'c> {
     pub fn run(&mut self) -> ! {
         loop {
             // An owed reply goes out without waiting on the SAL, unless the ring
-            // is short of room; then a release wakes the park too.
+            // is short of room or the master holds every reply owed; then the
+            // master's release or end of a hold wakes the park too.
             if self.replies.is_empty() {
                 self.mesh.park().park(|| self.sal_reader.is_empty());
-            } else if self.w2m_writer.short_of_room() {
-                self.w2m_writer.park_for_room(|| self.sal_reader.is_empty());
+            } else if self.waits_on_master() {
+                self.w2m_writer
+                    .park_for_master(|| self.sal_reader.is_empty() && self.waits_on_master());
             }
 
             self.drain_sal();
         }
+    }
+
+    /// No owed reply can leave before the master releases room or ends a hold.
+    fn waits_on_master(&self) -> bool {
+        self.w2m_writer.short_of_room() || self.sendable().next().is_none()
     }
 
     /// Process all pending SAL message groups. Shutdown `_exit`s inline.

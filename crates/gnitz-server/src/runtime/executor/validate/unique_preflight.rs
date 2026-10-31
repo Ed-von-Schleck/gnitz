@@ -11,8 +11,8 @@ use gnitz_store::relation::Relation;
 use gnitz_wire::PkBuf;
 use gnitz_zset::schema::SchemaDescriptor;
 
-/// One worker's sorted spans in `merge_index_scan`: the frame being read, which
-/// pins its ring bytes, and the byte range of its unread keys inside them.
+/// One worker's sorted spans in `merge_index_scan`: the frame being read, copied
+/// out of its ring, and the byte range of its unread keys inside it.
 struct PreflightKeyStream<'l> {
     lease: &'l TrainLease,
     w: usize,
@@ -34,9 +34,12 @@ impl PreflightKeyStream<'_> {
                 }
             }
             self.frame = None; // release the ring slot before waiting on the next
-            let Some(f) = self.lease.next_of(self.w).await? else {
+            let Some(mut f) = self.lease.next_of(self.w).await? else {
                 return Ok(None);
             };
+            // Held while the merge waits on the other workers' trains: a slot held
+            // there would wait on them, and no give-back reaches it.
+            f.slot.detach();
             let mb = f.rows(frame_schema);
             let start = mb.pk().as_ptr() as usize - f.slot.bytes().as_ptr() as usize;
             self.keys = start..start + mb.len() * stride;

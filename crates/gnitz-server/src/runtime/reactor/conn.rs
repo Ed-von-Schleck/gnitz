@@ -465,6 +465,39 @@ impl SendBody {
             SendBody::Shared(b) => b,
         }
     }
+
+    /// Ready once the W2M ring of a slot body was given back
+    /// ([`W2mSlot::poll_give_back`]); never for any other body.
+    fn poll_give_back(&self, cx: &mut Context<'_>) -> Poll<()> {
+        match self {
+            SendBody::Slot(s) => s.poll_give_back(cx),
+            _ => Poll::Pending,
+        }
+    }
+
+    /// Copy a slot body out of its ring; a no-op on any other body.
+    fn detach(&mut self) {
+        if let SendBody::Slot(s) = self {
+            s.detach();
+        }
+    }
+
+    /// `fut`'s output, awaited while holding this body: should the body's W2M
+    /// ring be given back meanwhile, its bytes are copied out of the ring, so
+    /// no slot waits on what `fut` waits on. `fut` must not read the body.
+    pub(crate) async fn holding<F: Future>(&mut self, fut: F) -> F::Output {
+        let mut fut = std::pin::pin!(fut);
+        std::future::poll_fn(|cx| {
+            if let Poll::Ready(out) = fut.as_mut().poll(cx) {
+                return Poll::Ready(out);
+            }
+            if self.poll_give_back(cx).is_ready() {
+                self.detach();
+            }
+            Poll::Pending
+        })
+        .await
+    }
 }
 
 /// This client's connection is finished.
@@ -503,7 +536,7 @@ impl Reactor {
             .build();
             // SAFETY: the SQE names no memory, and `listener` is open for the
             // process's life.
-            let res = unsafe { self.push_op(sqe, None) }.await;
+            let res = unsafe { self.push_op(sqe) }.await;
             if res < 0 {
                 self.sleep(self.conns.limits.accept_rearm_backoff).await;
                 continue;
@@ -637,21 +670,47 @@ impl Reactor {
     /// send has its own `Limits::client_send_timeout` deadline, past which the
     /// client is evicted. A failed or evicted send finishes the connection
     /// ([`ClientConn::fail`]). An empty body sends nothing.
+    ///
+    /// A W2M slot is sent from its ring until the ring is given back while a
+    /// send waits on the client: that send is cancelled, the slot copied out,
+    /// and the rest sent from the copy.
     pub(crate) async fn send_owned(&self, conn: &Rc<ClientConn>, body: SendBody) -> Result<(), PeerGone> {
         if body.bytes().is_empty() {
             return Ok(());
         }
-        let out = Rc::new(Outbound { _conn: Rc::clone(conn), body });
-        let bytes = out.body.bytes();
+        let mut out = Rc::new(Outbound { _conn: Rc::clone(conn), body });
         let mut sent = 0usize;
-        while sent < bytes.len() {
-            let rest = &bytes[sent..];
+        while sent < out.body.bytes().len() {
+            let rest = &out.body.bytes()[sent..];
             // A send longer than an SQE carries goes out over several.
             let len = u32::try_from(rest.len()).unwrap_or(u32::MAX);
             let sqe = opcode::Send::new(types::Fd(conn.fd()), rest.as_ptr(), len).build();
             // SAFETY: the op holds `out` until the CQE.
-            let op = unsafe { self.push_op(sqe, Some(Rc::clone(&out))) };
-            let rc = match select2(op, self.sleep(self.conns.limits.client_send_timeout)).await {
+            let (op, user_data) = unsafe { self.push_named_op(sqe, Some(Rc::clone(&out))) };
+            let mut op = std::pin::pin!(op);
+            let mut given_back = false;
+            let waited = select2(
+                std::future::poll_fn(|cx| {
+                    let polled = op.as_mut().poll(cx);
+                    if polled.is_pending() && !given_back && out.body.poll_give_back(cx).is_ready() {
+                        self.cancel_op(user_data);
+                        given_back = true;
+                    }
+                    polled
+                }),
+                self.sleep(self.conns.limits.client_send_timeout),
+            )
+            .await;
+            let rc = match waited {
+                Either::A(rc) if given_back => {
+                    // Its CQE dropped the op's hold on `out`.
+                    Rc::get_mut(&mut out).expect("no op holds the body").body.detach();
+                    // Cut short for the copy: no progress, and no failure.
+                    if rc == -libc::ECANCELED || rc == -libc::EINTR {
+                        continue;
+                    }
+                    rc
+                }
                 Either::A(rc) => rc,
                 // Evicted; a completion that raced the timer still counts as failed.
                 // The abandoned send completes only once the socket errors; its

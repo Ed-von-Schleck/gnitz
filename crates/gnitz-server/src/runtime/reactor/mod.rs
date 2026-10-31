@@ -53,6 +53,9 @@ pub(crate) use uring::check_host;
 const KIND_OP: u64 = 1;
 const KIND_PARK: u64 = 2;
 const KIND_RECV: u64 = 3;
+/// An `ASYNC_CANCEL`, whose CQE nothing awaits: the cancelled op's own says
+/// how that op ended.
+const KIND_CANCEL: u64 = 4;
 
 const KIND_SHIFT: u64 = 56;
 const ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
@@ -61,6 +64,11 @@ const ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 const fn udata(kind: u64, id: u64) -> u64 {
     (kind << KIND_SHIFT) | (id & ID_MASK)
 }
+
+/// The low bits of a one-shot op's id, its slot in `ops`; the bits above count
+/// the ops pushed, so no later op that reuses the slot has the same id, and a
+/// cancel names its op alone.
+const OP_SLOT_MASK: u64 = 0xFFFF_FFFF;
 
 // ---------------------------------------------------------------------------
 // Reactor
@@ -76,8 +84,10 @@ pub(crate) struct ReactorShared {
     /// Live tasks; a task's waker key is its slot plus one. A slot holds `None`
     /// while its task is polled, and is freed for reuse when it completes.
     tasks: RefCell<Slab<Option<Task>>>,
-    /// In-flight one-shot ops; an op's id is its slot, freed at its CQE.
+    /// In-flight one-shot ops, each in a slot freed at its CQE.
     ops: RefCell<Slab<PendingOp>>,
+    /// One-shot ops pushed: the high bits of each op's id.
+    ops_pushed: Cell<u64>,
     /// A `FUTEX_WAIT` SQE on the W2M park is outstanding. Cleared by its CQE.
     parked: Cell<bool>,
     timers: timer::Timers,
@@ -115,6 +125,7 @@ impl Reactor {
             ring: RefCell::new(ring),
             tasks: RefCell::new(Slab::new()),
             ops: RefCell::new(Slab::new()),
+            ops_pushed: Cell::new(0),
             parked: Cell::new(false),
             timers: timer::Timers::new(),
             routes: lease::Routes::new(),
@@ -125,23 +136,49 @@ impl Reactor {
         Ok((reactor, ready))
     }
 
-    /// Queue `sqe` as a one-shot op holding `carry` until its CQE, whose `res` the
-    /// receiver yields. Not submitted. The op's slot, and with it `carry`, is
-    /// freed at its one CQE and then reused, so `sqe` must be an opcode that
-    /// posts exactly one CQE.
+    /// [`Self::push_named_op`] of an op that holds nothing.
+    ///
+    /// # Safety
+    /// As [`IoUringRing::push`].
+    unsafe fn push_op(&self, sqe: io_uring::squeue::Entry) -> oneshot::Receiver<i32> {
+        // SAFETY: forwarded to the caller.
+        unsafe { self.push_named_op(sqe, None).0 }
+    }
+
+    /// Queue `sqe` as a one-shot op holding `carry` until its CQE, whose `res`
+    /// the receiver yields, and return it with the op's `user_data`, which
+    /// [`Self::cancel_op`] takes. Not submitted. The op's slot, and with it
+    /// `carry`, is freed at its one CQE and then reused, so `sqe` must be an
+    /// opcode that posts exactly one CQE.
     ///
     /// # Safety
     /// As [`IoUringRing::push`]; what `carry` holds counts as valid until the CQE.
-    unsafe fn push_op(
+    unsafe fn push_named_op(
         &self,
         sqe: io_uring::squeue::Entry,
         carry: Option<Rc<conn::Outbound>>,
-    ) -> oneshot::Receiver<i32> {
+    ) -> (oneshot::Receiver<i32>, u64) {
         let (done, rx) = oneshot::channel();
-        let id = self.ops.borrow_mut().insert(PendingOp { done, _carry: carry }) as u64;
+        let slot = self.ops.borrow_mut().insert(PendingOp { done, _carry: carry }) as u64;
+        debug_assert!(slot <= OP_SLOT_MASK, "{slot} ops in flight");
+        let pushed = self.ops_pushed.get() + 1;
+        self.ops_pushed.set(pushed);
+        let user_data = udata(KIND_OP, pushed << OP_SLOT_MASK.count_ones() | slot);
         // SAFETY: forwarded to the caller.
-        unsafe { self.ring.borrow_mut().push(sqe, udata(KIND_OP, id)) };
-        rx
+        unsafe { self.ring.borrow_mut().push(sqe, user_data) };
+        (rx, user_data)
+    }
+
+    /// Cancel the op [`Self::push_named_op`] pushed as `user_data`, which its
+    /// awaiter has not seen complete: the op's CQE comes early, `-ECANCELED`
+    /// unless it was completing anyway. Submitted now, so the cancel reaches
+    /// the kernel while the op's slot is still its own.
+    fn cancel_op(&self, user_data: u64) {
+        let sqe = opcode::AsyncCancel::new(user_data).build();
+        let mut ring = self.ring.borrow_mut();
+        // SAFETY: the SQE names no memory.
+        unsafe { ring.push(sqe, udata(KIND_CANCEL, 0)) };
+        ring.submit();
     }
 
     /// Queue an fdatasync of `fd` and submit it now, so it runs while the caller
@@ -151,7 +188,7 @@ impl Reactor {
             .flags(types::FsyncFlags::DATASYNC)
             .build();
         // SAFETY: `fd` is open for the process's life; the SQE names no memory.
-        let op = unsafe { self.push_op(sqe, None) };
+        let op = unsafe { self.push_op(sqe) };
         self.ring.borrow_mut().submit();
         op
     }

@@ -127,27 +127,29 @@ impl TlsShared {
     }
 
     /// Encrypt and send `body` under one `send_lock` hold; rustls sizes the chunks.
-    pub(crate) async fn send(&self, body: SendBody) -> Result<(), PeerGone> {
-        let send = self.send_lock.write().await;
-        let bytes = body.bytes();
+    /// Neither the wait for the lock nor a flush holds a W2M slot `body` is in
+    /// once its ring is given back ([`SendBody::holding`]).
+    pub(crate) async fn send(&self, mut body: SendBody) -> Result<(), PeerGone> {
+        let send = body.holding(self.send_lock.write()).await;
+        let len = body.bytes().len();
         let mut off = 0;
-        while off < bytes.len() {
+        while off < len {
             if self.conn.is_gone() {
                 return Err(PeerGone);
             }
             // rustls short-writes only on a full outgoing buffer, which the
             // previous turn's flush emptied: a zero here is a wedged session.
-            let Ok(n @ 1..) = self.state.borrow_mut().writer().write(&bytes[off..]) else {
+            let Ok(n @ 1..) = self.state.borrow_mut().writer().write(&body.bytes()[off..]) else {
                 self.conn.fail();
                 return Err(PeerGone);
             };
             off += n;
-            if off == bytes.len() {
+            if off == len {
                 // rustls holds every byte now: release the body — a W2M slot — before the send.
                 drop(body);
                 return self.flush_records(&send, n).await;
             }
-            self.flush_records(&send, n).await?;
+            body.holding(self.flush_records(&send, n)).await?;
         }
         Ok(())
     }

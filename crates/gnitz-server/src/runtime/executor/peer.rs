@@ -145,12 +145,12 @@ impl Peer {
     /// Send `body` behind whatever is corked: copied into the cork, or alone
     /// and uncopied when it is too large to join it. A corked body reports a
     /// gone peer at its flush, not here.
-    pub async fn send(&self, body: SendBody) -> Result<(), PeerGone> {
+    pub async fn send(&self, mut body: SendBody) -> Result<(), PeerGone> {
         self.live()?;
         let len = body.bytes().len();
         let corked = self.corked_len();
         if corked == 0 || corked + len > COALESCE_MAX_BYTES {
-            self.flush_egress().await?;
+            body.holding(self.flush_egress()).await?;
             if len > COALESCE_MAX_BYTES / 2 {
                 return self.send_raw(body).await;
             }
