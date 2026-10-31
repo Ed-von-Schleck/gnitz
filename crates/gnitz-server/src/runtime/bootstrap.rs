@@ -238,7 +238,7 @@ fn run_worker_child(
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
     let sal_reader = SalReader::new(tail.log(), slot.rank, tail.live_epoch());
-    w2m_writer.send_ack(RequestId::BOOT_READY);
+    w2m_writer.ack(RequestId::BOOT_READY);
     WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh).run()
 }
 
@@ -393,7 +393,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     // it is reclaimed on error: a failed boot exits the process, which returns
     // all of it to the kernel.
     let parks = WorkerParks::create(nw).map_err(|e| format!("failed to map the worker parks: {e}"))?;
-    let (writers, receiver) = w2m::create(nw).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
+    let (writers, receiver) = w2m::create(parks).map_err(|e| format!("failed to map the W2M rings: {e}"))?;
     let meshes =
         mesh::create(mesh::outbox_bytes(), parks).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
     let workers: Vec<(W2mWriter, Mesh)> = writers.into_iter().zip(meshes).collect();

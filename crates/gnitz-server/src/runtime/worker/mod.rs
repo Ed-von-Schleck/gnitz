@@ -34,8 +34,9 @@ pub struct WorkerProcess<'c> {
     /// Replies this worker owes, in the order they reach the ring, which is
     /// request order within a [`Cut`](crate::runtime::sal::Cut).
     replies: VecDeque<Owed>,
-    /// Per-frame wire budget of every W2M train. `GNITZ_REPLY_FRAME_BUDGET`
-    /// lowers it, so tests reach multi-frame trains on small tables.
+    /// Per-frame wire budget of every W2M train, never past what the ring holds.
+    /// `GNITZ_REPLY_FRAME_BUDGET` lowers it, so tests reach multi-frame trains on
+    /// small tables.
     reply_frame_budget: usize,
 }
 
@@ -49,6 +50,7 @@ static KEY_SPANS_ERROR: Seam = Seam::new("GNITZ_INJECT_KEY_SPANS_ERROR");
 
 impl<'c> WorkerProcess<'c> {
     pub fn new(catalog: &'c mut CatalogEngine, sal_reader: SalReader, w2m_writer: W2mWriter, mesh: Mesh) -> Self {
+        let max_message = w2m_writer.max_message_bytes();
         WorkerProcess {
             catalog,
             sal_reader,
@@ -59,7 +61,8 @@ impl<'c> WorkerProcess<'c> {
                 "GNITZ_REPLY_FRAME_BUDGET",
                 gnitz_wire::MAX_FRAME_PAYLOAD,
             )
-            .min(gnitz_wire::MAX_FRAME_PAYLOAD),
+            .min(gnitz_wire::MAX_FRAME_PAYLOAD)
+            .min(max_message),
         }
     }
 
@@ -68,9 +71,12 @@ impl<'c> WorkerProcess<'c> {
     /// Serve the SAL until a `Shutdown` exits the process.
     pub fn run(&mut self) -> ! {
         loop {
-            // An owed reply emits its next frame without waiting on the SAL.
+            // An owed reply goes out without waiting on the SAL, unless the ring
+            // is short of room; then a release wakes the park too.
             if self.replies.is_empty() {
                 self.mesh.park().park(|| self.sal_reader.is_empty());
+            } else if self.w2m_writer.short_of_room() {
+                self.w2m_writer.park_for_room(|| self.sal_reader.is_empty());
             }
 
             self.drain_sal();
@@ -129,7 +135,7 @@ impl<'c> WorkerProcess<'c> {
                     gnitz_fatal_abort!("worker: {apply:?} failed: {e} — aborting for restart");
                 }
                 if let Some(id) = ack {
-                    self.w2m_writer.send_ack(id);
+                    self.w2m_writer.ack(id);
                 }
                 // Before the next group: a parked read answers from the state its
                 // drive left.

@@ -93,7 +93,7 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
                     tids: vec![0; if refused { 2 << 17 } else { 1 }].into(),
                 };
                 let lease = disp.write_acked(&mut disp.sal().lock().await, SalGroup::new(tick))?;
-                writers.iter_mut().for_each(|w| w.send_ack(lease.id()));
+                writers.iter_mut().for_each(|w| w.ack(lease.id()));
                 lease.acks().await;
                 Ok::<(), WireFault>(())
             });

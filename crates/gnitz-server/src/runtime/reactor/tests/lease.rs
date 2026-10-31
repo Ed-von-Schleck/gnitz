@@ -14,11 +14,11 @@ fn lease_ids_wrap_past_zero_and_skip_live_ids() {
     let dropped = r.lease_acks(WorkerSet::ALL).id();
     assert_ne!(r.lease_acks(WorkerSet::ALL).id(), dropped);
 
-    r.routes.next_id.set(id(u32::MAX));
+    r.routes.next_id.set(RequestId::MAX);
     let top = r.lease_acks(WorkerSet::ALL);
-    assert_eq!(top.id(), id(u32::MAX));
+    assert_eq!(top.id(), RequestId::MAX);
     let wrapped = r.lease_acks(WorkerSet::ALL);
-    assert_eq!(wrapped.id(), id(1), "the id after u32::MAX is 1, not 0");
+    assert_eq!(wrapped.id(), id(1), "the id after the largest is 1, not 0");
 
     r.routes.next_id.set(id(1));
     let skipped = r.lease_train(WorkerSet::ALL, "ScanSpec");
@@ -37,7 +37,7 @@ fn an_ack_lease_resolves_on_its_own_sets_acks() {
 
     let lease = r.lease_acks(WorkerSet::one(1).with(3));
     let id = lease.id();
-    writers[3].send_ack(id);
+    writers[3].ack(id);
     r.tick(false); // drained before any awaiter
     let done = Rc::new(Cell::new(false));
     let d = Rc::clone(&done);
@@ -47,14 +47,14 @@ fn an_ack_lease_resolves_on_its_own_sets_acks() {
     });
     r.tick(false);
     assert!(!done.get(), "one of the two has answered");
-    writers[1].send_ack(id);
+    writers[1].ack(id);
     r.tick(false); // the drain wakes the awaiter, and the same pass polls it
     assert!(done.get());
 }
 
 /// A frame no lease routes is released at its ring undecoded: the frames a train
 /// lease holds when it drops, and a late answer on a dropped lease's id, as an
-/// abandoned request's late reply is.
+/// abandoned request's late reply is. A late ACK on it is read off and dropped.
 #[test]
 fn a_frame_no_lease_holds_is_released() {
     let (r, lease, mut writers) = train_lease(1, "ScanSpec");
@@ -67,90 +67,94 @@ fn a_frame_no_lease_holds_is_released() {
     drop(lease);
     assert_eq!(r.w2m.release_cursor(0), r.w2m.write_cursor(0));
 
-    writers[0].send_ack(id);
+    writers[0].send_msg(id, &Default::default());
+    writers[0].ack(id);
     r.drain_all_w2m();
     assert_eq!(r.w2m.release_cursor(0), r.w2m.write_cursor(0));
+    assert!(r.w2m.acks(0).is_empty(), "the drain read the ACK");
 }
 
-/// `next` yields exactly the frames that carry rows, workers in ascending order
-/// and each worker's in arrival order, and ends once every worker's terminal
-/// frame is read — a row-less one included. Every slot it passes over is
-/// released at its ring.
+/// ACKs resolve the lease each names whatever order they come in, as a group
+/// applied inside a drive is ACKed ahead of the drive's own; and they take no
+/// room a held reply frame pins.
 #[test]
-fn next_yields_the_row_frames_and_releases_the_rest() {
+fn acks_resolve_their_own_leases_in_any_order_past_a_held_frame() {
+    let (r, train, mut writers) = train_lease(1, "ScanSpec");
+    let tick = r.lease_acks(WorkerSet::ALL);
+    let push = r.lease_acks(WorkerSet::ALL);
+    writers[0].send_train_frame(train.id(), false, None);
+    r.drain_all_w2m();
+    assert!(
+        r.w2m.release_cursor(0) < r.w2m.write_cursor(0),
+        "the train frame is held"
+    );
+
+    writers[0].ack(push.id());
+    r.drain_all_w2m();
+    assert!(try_poll_once(push.acks()).is_some(), "the later group's ACK came first");
+    assert!(try_poll_once(tick.acks()).is_none(), "and resolved only its own lease");
+    writers[0].ack(tick.id());
+    r.drain_all_w2m();
+    assert!(try_poll_once(tick.acks()).is_some());
+}
+
+/// A passing frame is copied out of its ring as it is routed, releasing its
+/// space, unless its reader is parked on its worker; a frame sent in order
+/// stays in place either way.
+#[test]
+fn a_passing_frame_is_copied_out_unless_its_reader_waits_on_its_worker() {
     let (r, lease, mut writers) = train_lease(2, "ScanSpec");
     let id = lease.id();
-    let schema = crate::test_support::make_schema_u64_i64();
-    let mut send = |w: usize, last, pk: Option<u64>| {
-        let rows = pk.map(|pk| crate::test_support::make_batch(&schema, &[(pk, 1, 0)]));
-        writers[w].send_train_frame(id, last, rows.as_ref());
-    };
-    send(0, false, None);
-    for pk in 1..=3 {
-        send(0, false, Some(pk));
-    }
-    send(0, true, None);
-    send(1, true, Some(4));
-    r.drain_all_w2m();
+    let last = WireMsg::train_frame(0, true, None);
 
-    for (w, pk) in [(0u32, 1u64), (0, 2), (0, 3), (1, 4)] {
-        let f = try_poll_once(lease.next())
-            .expect("routed")
-            .expect("no fault")
-            .expect("a row frame");
-        assert_eq!(f.slot.worker, w);
-        assert_eq!(f.rows(&schema).get_pk_bytes(0), pk.to_be_bytes());
-    }
-    assert!(try_poll_once(lease.next())
+    writers[1].try_send_msg(id, true, &last);
+    r.drain_all_w2m();
+    assert_eq!(r.w2m.release_cursor(1), r.w2m.write_cursor(1), "no reader: copied out");
+
+    let other = r.lease_train(WorkerSet::ALL, "ScanSpec");
+    writers[1].send_msg(other.id(), &last);
+    r.drain_all_w2m();
+    assert!(
+        r.w2m.release_cursor(1) < r.w2m.write_cursor(1),
+        "an in-order frame stays in place"
+    );
+    drop(other);
+
+    // The reader parks on worker 0, then takes the passing frame from it.
+    let mut wait = Box::pin(lease.frame_of(0));
+    assert!(try_poll_once(wait.as_mut()).is_none(), "nothing from worker 0 yet");
+    writers[0].try_send_msg(id, true, &last);
+    r.drain_all_w2m();
+    assert!(
+        r.w2m.release_cursor(0) < r.w2m.write_cursor(0),
+        "its reader takes it in place"
+    );
+    let (slot, _) = try_poll_once(wait)
         .expect("routed")
         .expect("no fault")
-        .is_none());
-    for w in 0..2 {
-        assert_eq!(r.w2m.release_cursor(w), r.w2m.write_cursor(w), "worker {w}");
-    }
+        .expect("a frame");
+    assert!(slot.in_ring());
+    drop(slot);
+    let (slot, _) = try_poll_once(lease.frame_of(1))
+        .expect("routed")
+        .expect("no fault")
+        .expect("a frame");
+    assert!(!slot.in_ring(), "worker 1's frame was copied");
+    assert_eq!(slot.bytes(), last.encode_to_vec());
 }
 
-/// `frame_of` hands out every frame of a worker's train, a row-less one
-/// included, and its row-less terminal; it hands out nothing once that
-/// terminal is read.
+/// A wait dropped while parked on one worker no longer counts as the reader
+/// parked there once the reader parks on another.
 #[test]
-fn frame_of_hands_out_a_row_less_terminal() {
-    let (r, lease, mut writers) = train_lease(2, "SnapshotPage");
-    let id = lease.id();
-    let schema = crate::test_support::make_schema_u64_i64();
-    let rows = crate::test_support::make_batch(&schema, &[(7, 1, 0)]);
-    writers[0].send_train_frame(id, false, None);
-    writers[0].send_train_frame(id, false, Some(&rows));
-    writers[0].send_train_frame(id, true, None);
-    writers[1].send_train_frame(id, true, None);
-    r.drain_all_w2m();
-
-    let frame_of = |w: usize| try_poll_once(lease.frame_of(w)).expect("routed").expect("no fault");
-    for (w, carries_rows, last) in [(0, false, false), (0, true, false), (0, false, true), (1, false, true)] {
-        let (slot, data) = frame_of(w).expect("a frame");
-        assert_eq!(slot.worker as usize, w);
-        assert_eq!(data.is_some(), carries_rows);
-        assert_eq!(slot.control().hdr.flags.scan_last, last);
-    }
-    for w in 0..2 {
-        assert!(frame_of(w).is_none(), "worker {w}'s train has ended");
-        assert_eq!(r.w2m.release_cursor(w), r.w2m.write_cursor(w), "worker {w}");
-    }
-}
-
-/// A fault frame ends a train's read with the fault, its text naming the
-/// worker that sent it and the request it answered.
-#[test]
-fn a_fault_frame_names_its_worker() {
+fn a_dropped_wait_stops_counting_once_the_reader_parks_elsewhere() {
     let (r, lease, mut writers) = train_lease(2, "ScanSpec");
     let id = lease.id();
-    writers[0].send_train_frame(id, true, None);
-    let fault = WireFault::from("boom");
-    writers[1].send_msg(id, &WireMsg::fault(&fault));
+    let mut wait = Box::pin(lease.frame_of(0));
+    assert!(try_poll_once(wait.as_mut()).is_none());
+    drop(wait);
+    let mut elsewhere = Box::pin(lease.frame_of(1));
+    assert!(try_poll_once(elsewhere.as_mut()).is_none());
+    writers[0].try_send_msg(id, true, &WireMsg::train_frame(0, true, None));
     r.drain_all_w2m();
-
-    let err = try_poll_once(lease.finish()).expect("routed").expect_err("the fault");
-    assert!(err.text.contains("worker 1"), "{err}");
-    assert!(err.text.contains("ScanSpec"), "{err}");
-    assert!(err.text.contains("boom"), "{err}");
+    assert_eq!(r.w2m.release_cursor(0), r.w2m.write_cursor(0), "copied out");
 }

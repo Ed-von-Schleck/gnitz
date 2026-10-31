@@ -7,7 +7,8 @@ use gnitz_zset::repr::Batch;
 /// thread or forked child may use its end for the rest of the process: every
 /// ring's writer, and the reader over all of them.
 pub(crate) fn test_rings(nw: usize, capacity: usize) -> (Vec<W2mWriter>, W2mReceiver) {
-    rings(nw, capacity).expect("map the test rings")
+    let parks = WorkerParks::create(nw).expect("map the test parks");
+    rings(parks, capacity).expect("map the test rings")
 }
 
 /// The capacity of a ring holding `n_msgs` messages of `msg_sz` bytes plus
@@ -28,6 +29,13 @@ pub(super) fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> (W2mWriter,
 }
 
 impl W2mWriter {
+    /// [`Self::try_send_msg`], retried while the ring is full.
+    pub(crate) fn send_msg(&mut self, request_id: RequestId, msg: &WireMsg<'_>) {
+        while !self.try_send_msg(request_id, false, msg) {
+            self.park_for_room(|| true);
+        }
+    }
+
     /// The master has armed its park, and no publish has taken it.
     pub(crate) fn master_parked(&self) -> bool {
         self.master.armed()
@@ -56,6 +64,13 @@ impl W2mReceiver {
     /// The worker's published boundary: everything below it is readable.
     pub(crate) fn write_cursor(&self, worker: usize) -> u64 {
         self.header(worker).write.load(Ordering::Acquire)
+    }
+
+    /// The request ids `worker` has ACKed since the last drain, in ACK order.
+    pub(crate) fn acks(&self, worker: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.drain_acks(worker, |id| out.push(id.get()));
+        out
     }
 
     /// The publishes that took the master's arm, each one `FUTEX_WAKE`.

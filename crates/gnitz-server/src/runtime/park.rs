@@ -66,7 +66,7 @@ const ARMED: u64 = 1 << 63;
 /// sleeps on the value the arm returned; a peer wakes it by moving that value.
 /// The two kinds of wake order against the arm differently.
 ///
-/// - **An RMW wake** ([`Self::publish`], [`Self::bump`]): the arm and every
+/// - **An RMW wake** ([`Self::publish_waking`], [`Self::bump`]): the arm and every
 ///   advance are RMWs on the one atomic, so they are totally ordered: an advance
 ///   behind the arm sees it and wakes, and an arm behind the advance reads
 ///   everything the advance released, so the parker's re-test sees it.
@@ -124,15 +124,22 @@ impl Park {
         }
     }
 
-    /// The value's one writer stores `v`, waking the parker iff it armed first.
-    /// The swap takes the arm, so later publishes spend no syscall until a re-arm.
+    /// The value's one writer stores `v`, waking `parker` if this word was armed:
+    /// a word whose parker sleeps on a park of its own. The swap takes the arm,
+    /// so later publishes wake nobody until a re-arm.
     #[inline]
-    #[track_caller]
-    pub(super) fn publish(&self, v: u64) {
+    pub(super) fn publish_waking(&self, v: u64, parker: &Park) {
         debug_assert_eq!(v & ARMED, 0, "a value reached the armed bit");
-        if self.0.swap(v, Ordering::AcqRel) & ARMED != 0 {
-            futex_wake(self.futex_word());
+        if self.0.swap(v, Ordering::SeqCst) & ARMED != 0 {
+            parker.bump();
         }
+    }
+
+    /// Ask for a wake on the next publish without waiting here: the parker of a
+    /// [`Self::publish_waking`] word, ahead of its own park's arm and re-test.
+    #[inline]
+    pub(super) fn arm(&self) {
+        self.0.fetch_or(ARMED, Ordering::SeqCst);
     }
 
     /// One of any number of writers advances the value by one, waking an armed

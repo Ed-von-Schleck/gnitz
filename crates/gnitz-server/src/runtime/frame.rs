@@ -18,7 +18,7 @@ use gnitz_zset::repr::WireRows;
 ///
 /// ```ignore
 /// let msg = WireMsg { status: WireStatus::Error, blob: text, ..Default::default() };
-/// writer.send_msg(request_id, &msg);
+/// writer.try_send_msg(request_id, false, &msg);
 /// ```
 #[derive(Clone, Copy, Default)]
 pub struct WireMsg<'a> {

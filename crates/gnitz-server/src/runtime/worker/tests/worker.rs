@@ -111,6 +111,8 @@ pub(super) fn push<'a>(tid: u64, record: &'a [u8], rows: &'a Batch, request_id: 
 /// bytes.
 pub(super) struct Frame {
     req: u32,
+    /// Published as passing an owed reply.
+    passed: bool,
     pub(super) ctrl: DecodedControl,
     bytes: Vec<u8>,
 }
@@ -134,6 +136,7 @@ pub(super) fn frames(rx: &W2mReceiver) -> Vec<Frame> {
         let bytes = slot.bytes().to_vec();
         out.push(Frame {
             req: slot.request_id.get(),
+            passed: slot.passed(),
             ctrl: peek_control_block(&bytes).expect("a control block"),
             bytes,
         });
@@ -239,12 +242,13 @@ fn in_wait_dispositions() {
 
     assert_eq!(owed(&wp), [("parked", 1), ("parked", 2), ("train", 4)]);
     let out = frames(&rx);
-    assert_eq!(reqs(&out), [3, 5, 6, 7]);
+    assert_eq!(reqs(&out), [3, 5]);
+    assert_eq!(rx.acks(0), [6, 7], "Push and Flush ACK");
     let statuses: Vec<_> = out.iter().map(|f| f.ctrl.hdr.status).collect();
     assert_eq!(
         statuses,
-        [WireStatus::Ok, WireStatus::Error, WireStatus::Ok, WireStatus::Ok],
-        "the table's read, HasPk (a keyless probe faults), Push and Flush answer"
+        [WireStatus::Ok, WireStatus::Error],
+        "the table's read and HasPk (a keyless probe faults) answer"
     );
     assert!(out[0].ctrl.hdr.flags.scan_last);
     let fault = out[1].ctrl.fault(&out[1].bytes).expect("a fault frame");
@@ -282,9 +286,8 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
     for tid in [500, 501] {
         assert!(wp.catalog.registry.seal(tid).unwrap().is_none(), "tid {tid} was ticked");
     }
-    let out = frames(&rx);
-    assert_eq!(reqs(&out), [9], "the group ACKs once");
-    assert_eq!(out[0].ctrl.hdr.status, WireStatus::Ok);
+    assert_eq!(rx.acks(0), [9], "the group ACKs once");
+    assert!(frames(&rx).is_empty(), "an ACK takes no reply slot");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -303,7 +306,8 @@ fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
     drain_in_wait(&mut wp);
 
     let out = frames(&rx);
-    assert_eq!(reqs(&out), [1, 2], "the read answers, then the push ACKs");
+    assert_eq!(reqs(&out), [1], "the read answers");
+    assert_eq!(rx.acks(0), [2], "the push ACKs");
     assert!(out[0].ctrl.hdr.flags.scan_last);
     assert!(out[0].rows(&schema).is_empty(), "the read was written before the push");
     assert_eq!(weighted_rows(&scan_all(wp.catalog, tid)), weighted_rows(&row));
@@ -617,12 +621,15 @@ fn an_ordered_fault_stays_behind_its_cuts_queued_train() {
     wp.reply(route(1, 11, 1), Ok(Rows::Own(rows)));
     wp.reply(route(1, 12, 1), Err("of the train's cut".into()));
     wp.reply(route(1, 13, 2), Err("of another cut".into()));
-    assert_eq!(reqs(&frames(&rx)), [13], "another cut's fault leaves at once");
+    let passing = frames(&rx);
+    assert_eq!(reqs(&passing), [13], "another cut's fault leaves at once");
+    assert!(passing[0].passed, "published as passing the owed train");
     assert_eq!(owed(&wp), [("train", 11), ("fault", 12)]);
 
     drain_replies(&mut wp);
     let out = frames(&rx);
     assert_eq!(reqs(&out), [11, 11, 11, 12], "the fault follows the train's last frame");
+    assert!(out.iter().all(|f| !f.passed), "each was the front of the queue");
     assert!(out[2].ctrl.hdr.flags.scan_last);
     let fault = out[3].ctrl.fault(&out[3].bytes).expect("a fault frame");
     assert_eq!(fault.text, "of the train's cut");
@@ -637,7 +644,7 @@ fn a_full_ring_owes_instead_of_blocking() {
     let dir = crate::test_support::scratch_dir("worker", "full_ring");
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
     let (mut wp, _sal, rx) = worker_over(&mut engine, 4096, 1 << 20);
-    while wp.w2m_writer.try_send_msg(id(1), &WireMsg::default()) {}
+    while wp.w2m_writer.try_send_msg(id(1), false, &WireMsg::default()) {}
 
     wp.reply(route(1, 5, 1), Ok(Rows::Own(one.clone())));
     wp.reply(route(1, 6, 2), Err("boom".into()));

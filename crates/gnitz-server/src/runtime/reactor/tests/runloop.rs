@@ -235,7 +235,7 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
         let d = Rc::clone(&done);
         r.spawn(async move {
             // Published during the poll, after this tick's own drain.
-            writer.send_ack(id);
+            writer.ack(id);
             lease.acks().await;
             d.set(true);
         });
@@ -264,7 +264,7 @@ fn a_publish_wakes_the_sleep_and_takes_the_arm() {
             while !writer.master_parked() {
                 std::thread::yield_now();
             }
-            writer.send_ack(RequestId::BOOT_READY); // no lease holds it
+            writer.ack(RequestId::BOOT_READY); // no lease holds it
             writer
         });
         r.tick(true);
@@ -292,9 +292,9 @@ fn w2m_publishes_from_another_process_wake_the_parked_reactor() {
             assert!(Instant::now() < deadline, "the reactor never parked");
             std::thread::yield_now();
         }
-        writers[1].send_ack(RequestId::BOOT_READY);
+        writers[1].ack(RequestId::BOOT_READY);
         for n in (2..=N_MESSAGES).chain([1]) {
-            writers[0].send_ack(id(n));
+            writers[0].ack(id(n));
         }
     };
     let pid = unsafe { fork_child(child) };

@@ -91,7 +91,7 @@ fn reactor_pass_bench() {
         };
         arm(&format!("acks nw={nw}"), r, acks, || {
             if let Some(id) = RequestId::from_wire(id.get()) {
-                writers.iter_mut().for_each(|w| w.send_ack(id));
+                writers.iter_mut().for_each(|w| w.ack(id));
             }
         });
     }
@@ -124,9 +124,10 @@ fn reactor_flood_bench() {
         let (instructions, sleeps) = std::thread::scope(|s| {
             for mut writer in writers {
                 s.spawn(move || {
-                    for n in (2..=N).chain([1]) {
-                        writer.send_ack(id(n));
+                    for n in 2..=N {
+                        writer.send_msg(id(n), &Default::default());
                     }
+                    writer.ack(id(1));
                 });
             }
             let before = voluntary_ctx_switches();
@@ -176,7 +177,7 @@ fn reactor_round_bench() {
                         std::thread::sleep(std::time::Duration::from_micros(100));
                         let id = round.load(Ordering::Acquire);
                         if let Some(req) = RequestId::from_wire(id).filter(|_| id != last) {
-                            writer.send_ack(req);
+                            writer.ack(req);
                             last = id;
                         }
                     }

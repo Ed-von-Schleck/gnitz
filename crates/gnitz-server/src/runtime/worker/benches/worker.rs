@@ -8,8 +8,9 @@ use gnitz_foundation::perf::Counter;
 use gnitz_store::relation::IndexClaim;
 use gnitz_wire::{PkColList, PkKeys, ReadBound, ReadSpec, WireStatus};
 
-/// Requests an arm writes, unless it says otherwise.
-const REQUESTS: u32 = 10_000;
+/// Requests an arm writes, unless it says otherwise: no more ACKs than an ACK
+/// ring holds unread, since nothing drains it while the arm runs.
+const REQUESTS: u32 = crate::runtime::w2m::ACK_RING_ENTRIES as u32;
 
 /// Rows the table of a read arm holds.
 const HELD: u64 = 1024;
@@ -17,8 +18,8 @@ const HELD: u64 = 1024;
 /// One arm: a table `prepare` dresses and `held` rows are then ingested into,
 /// `requests` groups on the SAL, each written by `request` from the table's id, its schema
 /// record and the group's request id, and `drain_sal` until nothing is owed.
-/// The worker must answer in `frames` frames, none a fault, and leave the table
-/// at net weight `holds`.
+/// The worker must answer in `frames` frames or ACKs, no frame a fault, and
+/// leave the table at net weight `holds`.
 fn arm(
     label: &str,
     held: u64,
@@ -46,7 +47,7 @@ fn arm(
         }
     });
     let sent = frames(&rx);
-    assert_eq!(sent.len(), frames_owed, "{label}");
+    assert_eq!(sent.len() + rx.acks(0).len(), frames_owed, "{label}");
     assert!(sent.iter().all(|f| f.ctrl.hdr.status == WireStatus::Ok), "{label}");
     assert_eq!(net_weight(wp.catalog, tid), holds as i64, "{label}");
     println!(
