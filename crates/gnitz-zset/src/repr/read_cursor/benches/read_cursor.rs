@@ -196,64 +196,82 @@ fn advance_to_bench() {
 }
 
 /// Instructions per gathered row of a `pk IN (…)` drain, over one and four
-/// in-memory runs, fixed-width and string payloads, dense and sparse key lists.
+/// runs, fixed-width and string payloads, dense and sparse key lists. The runs
+/// are in-memory batches, or shards: `packed` stores the integer columns
+/// frame-of-reference coded, `raw` holds values no encoding shrinks, so they
+/// are stored as they stand.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn pk_set_gather_drain_bench() {
     const N: u64 = 1 << 20;
     let counter = Counter::instructions();
-    for (label, with_str) in [("3xI64", false), ("2xI64+string", true)] {
-        let schema = mixed_schema(if with_str { TypeCode::String } else { TypeCode::I64 });
-        for srcs in [1u64, 4] {
-            let runs: Vec<Run> = (0..srcs)
-                .map(|s| {
-                    let mut b = BatchBuilder::new(&schema);
-                    for i in (s..N).step_by(srcs as usize) {
-                        b.begin_row(i as u128, 1);
-                        b.put_int(i as u128);
-                        match i % 7 {
-                            0 => b.put_null(),
-                            _ => b.put_int((i * 3) as u128),
+    let dir = tempfile::tempdir().unwrap();
+    for backing in ["mem", "shard packed", "shard raw"] {
+        // The integer cells of row `i`, spread over the whole range in `raw`.
+        let val = |i: u64, m: u64| match backing {
+            "shard raw" => (i * m).wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128,
+            _ => (i * m) as u128,
+        };
+        for (label, with_str) in [("3xI64", false), ("2xI64+string", true)] {
+            let schema = mixed_schema(if with_str { TypeCode::String } else { TypeCode::I64 });
+            for srcs in [1u64, 4] {
+                let runs: Vec<Run> = (0..srcs)
+                    .map(|s| {
+                        let mut b = BatchBuilder::new(&schema);
+                        for i in (s..N).step_by(srcs as usize) {
+                            b.begin_row(i as u128, 1);
+                            b.put_int(val(i, 1));
+                            match i % 7 {
+                                0 => b.put_null(),
+                                _ => b.put_int(val(i, 3)),
+                            }
+                            match with_str {
+                                true => b.put_string(&format!("gather-bench-payload-{:05}", i % 64)),
+                                false => b.put_int(val(i, 5)),
+                            }
+                            b.end_row();
                         }
-                        match with_str {
-                            true => b.put_string(&format!("gather-bench-payload-{:05}", i % 64)),
-                            false => b.put_int((i * 5) as u128),
+                        let mut b = b.finish();
+                        b.certify_consolidated();
+                        match backing {
+                            "mem" => Run::Mem(Rc::new(b)),
+                            _ => {
+                                let path = dir.path().join(format!("{backing}_{label}_{srcs}_{s}.db"));
+                                Run::Shard(map_shard(&path, &b))
+                            }
                         }
-                        b.end_row();
-                    }
-                    let mut b = b.finish();
-                    b.certify_consolidated();
-                    Run::Mem(Rc::new(b))
-                })
-                .collect();
-            for every in [1u64, 16] {
-                let keys: Vec<u8> = (0..N).step_by(every as usize).flat_map(u64::to_be_bytes).collect();
-                let n_keys = (keys.len() / 8) as f64;
-                // The first pass takes the pool's first allocations.
-                let [_, instructions] = [(); 2].map(|()| {
-                    let keys = PkKeys::from_sorted(8, keys.clone());
-                    let cursor = from_runs_in_band(
-                        runs.iter().cloned(),
-                        schema,
-                        runs.len(),
-                        keys.iter().next().unwrap(),
-                        None,
-                    );
-                    let mut g = PkSetGather::over(cursor, keys);
-                    let (rows, instructions) = counter.measure(|| {
-                        let mut rows = 0;
-                        while let Some(c) = g.drain_chunk(65_536) {
-                            rows += c.len();
-                        }
-                        rows
+                    })
+                    .collect();
+                for every in [1u64, 16] {
+                    let keys: Vec<u8> = (0..N).step_by(every as usize).flat_map(u64::to_be_bytes).collect();
+                    let n_keys = (keys.len() / 8) as f64;
+                    // The first pass takes the pool's first allocations and
+                    // decodes the shards' blocks.
+                    let [_, instructions] = [(); 2].map(|()| {
+                        let keys = PkKeys::from_sorted(8, keys.clone());
+                        let cursor = from_runs_in_band(
+                            runs.iter().cloned(),
+                            schema,
+                            runs.len(),
+                            keys.iter().next().unwrap(),
+                            None,
+                        );
+                        let mut g = PkSetGather::over(cursor, keys);
+                        let (rows, instructions) = counter.measure(|| {
+                            let mut rows = 0;
+                            while let Some(c) = g.drain_chunk(65_536) {
+                                rows += c.len();
+                            }
+                            rows
+                        });
+                        assert_eq!(rows as f64, n_keys);
+                        instructions
                     });
-                    assert_eq!(rows as f64, n_keys);
-                    instructions
-                });
-                println!(
-                    "pk-set gather {label:<13} src={srcs} every={every:<2} {:>7.1} instr/row",
-                    instructions as f64 / n_keys
-                );
+                    println!(
+                        "pk-set gather {backing:<12} {label:<13} src={srcs} every={every:<2} {:>7.1} instr/row",
+                        instructions as f64 / n_keys
+                    );
+                }
             }
         }
     }

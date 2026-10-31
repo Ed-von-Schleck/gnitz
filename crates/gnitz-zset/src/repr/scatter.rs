@@ -7,7 +7,8 @@
 //! the caller's [`Pick`] instead: a `UnifiedSource` has no weight region, so the
 //! pick is the only channel for a merge fold's net weight — which is not any one
 //! source row's weight. [`gather_rows`] takes the same picks and reads each cell
-//! through its source, for picks sparse in their sources.
+//! through its source's row accessor, or in place where every source holds the
+//! region so, for picks sparse in their sources.
 //!
 //! A merge source is a [`ColumnarSource`]: a row source that also carries the
 //! Z-set weight, which every N-way merge and these kernels read sources through.
@@ -19,7 +20,7 @@ use super::batch_pool::PooledBuf;
 use super::seek::ColPtr;
 use super::shard::Codebook;
 use super::string_heap::{
-    carried_dead, prorated_blob_cap, rebase_string_cell, recode_string_cell, relocated_cell, row_long_bytes,
+    carried_dead, long_bytes, prorated_blob_cap, rebase_string_cell, recode_string_cell, relocated_cell, row_long_bytes,
 };
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
@@ -289,6 +290,18 @@ pub(crate) trait ColumnarSource: RowSource {
     /// Whether this source's rows are (PK, coarse weight) pairs with no payload —
     /// a capacity-bounded view's skeleton shard.
     fn is_skeleton(&self) -> bool;
+
+    /// Payload column `pi` as a [`ColPtr`] readable in place at every row, or
+    /// `None` where a row is read through a decode.
+    fn direct_col(&self, _pi: usize) -> Option<ColPtr> {
+        None
+    }
+
+    /// The PK and null-word regions as [`ColPtr`]s readable in place at every
+    /// row, each null word as the row accessor reads it; `None` otherwise.
+    fn direct_fixed(&self) -> Option<[ColPtr; 2]> {
+        None
+    }
 }
 
 impl<'a> ColumnarSource for MemBatch<'a> {
@@ -310,6 +323,23 @@ impl<'a> ColumnarSource for MemBatch<'a> {
     #[inline(always)]
     fn is_skeleton(&self) -> bool {
         false
+    }
+
+    fn direct_col(&self, pi: usize) -> Option<ColPtr> {
+        let stride = self.schema.region_stride(REG_PAYLOAD_START + pi);
+        Some(ColPtr { base: self.col_data(pi).as_ptr(), stride })
+    }
+
+    fn direct_fixed(&self) -> Option<[ColPtr; 2]> {
+        let pk = ColPtr {
+            base: self.pk().as_ptr(),
+            stride: self.pk_stride(),
+        };
+        let nulls = ColPtr {
+            base: self.null_bmp().as_ptr(),
+            stride: FIXED_REGION_BYTES,
+        };
+        Some([pk, nulls])
     }
 }
 
@@ -441,12 +471,16 @@ fn gather_unified_col<const N: usize>(
 /// Copy the rows `picks` names out of `sources`, in the order given, each at
 /// the weight its pick carries, into a fresh unconsolidated batch.
 ///
-/// Every cell is read through its source's row accessor, so a packed shard
-/// column decodes only the blocks the picks land in: the kernel for picks
+/// A region every source holds in place is read through one [`ColPtr`] per
+/// source; any other is read through each source's row accessor, so a packed
+/// shard column decodes only the blocks the picks land in: the kernel for picks
 /// sparse in their sources, where [`UnifiedSet`] would decode whole windows.
 pub(crate) fn gather_rows(sources: &[impl ColumnarSource], schema: &SchemaDescriptor, picks: &[Pick]) -> Batch {
+    let mut direct = Vec::new();
+    let hoist = picks.len() >= HOIST_PICKS_PER_SOURCE * (sources.len() + 1);
     write_to_batch(schema, picks.len(), 0, |w| {
-        stride_dispatch!(schema.pk_stride(), gather_pk_wt_nbm, sources, picks, w);
+        let fixed = all_direct(&mut direct, hoist, sources, |s| s.direct_fixed());
+        stride_dispatch!(schema.pk_stride(), gather_pk_wt_nbm, sources, picks, fixed, w);
         for (pi, col) in schema.payload_columns() {
             if col.type_code.is_german_string() {
                 let (cells, blob, _) = w.string_col_mut(pi);
@@ -455,19 +489,47 @@ pub(crate) fn gather_rows(sources: &[impl ColumnarSource], schema: &SchemaDescri
                     *cell = relocated_cell(s.german_cell(ri as usize, pi), s.heap(), blob, None);
                 }
             } else {
+                let cols = all_direct(&mut direct, hoist, sources, |s| s.direct_col(pi).map(|col| [col]));
                 let dst = w.col_mut(pi);
                 gnitz_wire::by_cell_width!(col.size(), |T| gather_cells::<{ size_of::<T>() }>(
-                    sources, picks, pi, dst
+                    sources, picks, pi, cols, dst
                 ));
             }
         }
     })
 }
 
+/// Picks per source, counting one source more for the table's allocation, from
+/// which [`gather_rows`] reads a region every source holds in place through one
+/// [`ColPtr`] per source: resolving a source's region costs about what reading a
+/// few of its cells through the row accessor does.
+const HOIST_PICKS_PER_SOURCE: usize = 4;
+
+/// The [`ColPtr`]s `region` gives for each of `sources`, in source order,
+/// filled into `direct`; `None` where a source reads its region through a
+/// decode, or unless `hoist`.
+fn all_direct<'d, S, const K: usize>(
+    direct: &'d mut Vec<ColPtr>,
+    hoist: bool,
+    sources: &[S],
+    region: impl Fn(&S) -> Option<[ColPtr; K]>,
+) -> Option<&'d [ColPtr]> {
+    if !hoist {
+        return None;
+    }
+    direct.clear();
+    direct.reserve(K * sources.len());
+    for s in sources {
+        direct.extend(region(s)?);
+    }
+    Some(direct)
+}
+
 #[inline(always)]
 fn gather_pk_wt_nbm<const PKS: usize>(
     sources: &[impl ColumnarSource],
     picks: &[Pick],
+    direct: Option<&[ColPtr]>,
     w: &mut DirectWriter<'_>,
     width: usize,
 ) {
@@ -476,8 +538,24 @@ fn gather_pk_wt_nbm<const PKS: usize>(
     let (pk, weight, null_bmp) = w.fixed_mut();
     let weights = weight.as_chunks_mut::<8>().0.iter_mut();
     let nulls = null_bmp.as_chunks_mut::<8>().0.iter_mut();
-    let pk = pk.chunks_exact_mut(pks);
-    for (((&(si, ri, weight), pk), wt), nb) in picks.iter().zip(pk).zip(weights).zip(nulls) {
+    let rows = picks.iter().zip(pk.chunks_exact_mut(pks)).zip(weights).zip(nulls);
+    if let Some(direct) = direct {
+        for (((&(si, ri, weight), pk), wt), nb) in rows {
+            debug_assert_ne!(weight, 0, "gather_rows: zero-weight row (filter before gather)");
+            debug_assert!((ri as usize) < sources[si as usize].row_count());
+            // SAFETY: `direct` holds two regions per source, and `ri` is a row
+            // of source `si`, whose regions these address.
+            unsafe {
+                let src_pk = *direct.get_unchecked(2 * si as usize);
+                let src_nulls = *direct.get_unchecked(2 * si as usize + 1);
+                pk.copy_from_slice(src_pk.row(ri as usize, pks));
+                *nb = ((src_nulls.row_ptr(ri as usize) as *const u64).read_unaligned() & keep).to_le_bytes();
+            }
+            *wt = weight.to_le_bytes();
+        }
+        return;
+    }
+    for (((&(si, ri, weight), pk), wt), nb) in rows {
         debug_assert_ne!(weight, 0, "gather_rows: zero-weight row (filter before gather)");
         let s = &sources[si as usize];
         pk.copy_from_slice(&s.get_pk_bytes(ri as usize)[..pks]);
@@ -487,8 +565,25 @@ fn gather_pk_wt_nbm<const PKS: usize>(
 }
 
 #[inline(always)]
-fn gather_cells<const N: usize>(sources: &[impl ColumnarSource], picks: &[Pick], pi: usize, dst: &mut [u8]) {
-    for (&(si, ri, _), cell) in picks.iter().zip(dst.as_chunks_mut::<N>().0) {
+fn gather_cells<const N: usize>(
+    sources: &[impl ColumnarSource],
+    picks: &[Pick],
+    pi: usize,
+    direct: Option<&[ColPtr]>,
+    dst: &mut [u8],
+) {
+    let cells = dst.as_chunks_mut::<N>().0;
+    if let Some(direct) = direct {
+        for (&(si, ri, _), cell) in picks.iter().zip(cells) {
+            debug_assert!((ri as usize) < sources[si as usize].row_count());
+            // SAFETY: `direct` holds one column per source, and `ri` is a row of
+            // source `si`, whose column `pi` it addresses.
+            *cell =
+                unsafe { (direct.get_unchecked(si as usize).row_ptr(ri as usize) as *const [u8; N]).read_unaligned() };
+        }
+        return;
+    }
+    for (&(si, ri, _), cell) in picks.iter().zip(cells) {
         *cell = sources[si as usize].get_col_ptr(ri as usize, pi, N).try_into().unwrap();
     }
 }
@@ -619,13 +714,19 @@ pub(crate) fn materialize_carrying(sources: &[MemBatch<'_>], schema: &SchemaDesc
     // A carried heap lands after the ones before it in a fresh, empty heap.
     let (mut heap_end, mut dead) = (0, 0);
     let (mut relocated_blob, mut relocated_rows, mut relocated_out) = (0, 0, 0);
+    // The long bytes the picks keep of each source, summed on the first source
+    // that leaves rows behind.
+    let mut kept_long: Option<Vec<usize>> = None;
     for (si, s) in sources.iter().enumerate() {
         let excluded = || {
-            let all: usize = (0..s.count).map(|row| row_long_bytes(s, mask, row)).sum();
-            let rows = rows.iter().filter(|&&(src, _, _)| src as usize == si);
-            all - rows
-                .map(|&(_, row, _)| row_long_bytes(s, mask, row as usize))
-                .sum::<usize>()
+            let kept_long = kept_long.get_or_insert_with(|| {
+                let mut v = vec![0usize; sources.len()];
+                for &(src, row, _) in rows {
+                    v[src as usize] += row_long_bytes(&sources[src as usize], mask, row as usize);
+                }
+                v
+            });
+            long_bytes(s, mask, 0..s.count) - kept_long[si]
         };
         match carried_dead(s.blob.len(), s.dead_heap, s.count, kept[si], excluded) {
             Some(d) => {

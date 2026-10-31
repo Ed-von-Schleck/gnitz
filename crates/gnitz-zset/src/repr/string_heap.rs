@@ -107,8 +107,23 @@ pub(super) fn carry_dead(src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, us
             }
         }
     }
-    let excluded = || long_bytes_outside(src, mask, kept);
+    let excluded = || {
+        let kept_long: usize = kept.iter().map(|&(s, e)| long_bytes(src, mask, s..e)).sum();
+        long_bytes(src, mask, 0..src.count) - kept_long
+    };
     carried_dead(heap, dead, src.count, range_rows(kept), excluded)
+}
+
+/// The heap bytes the long cells of rows `rows` of `src` name in the
+/// German-string slots `mask` name, a column at a time. A span two cells share
+/// counts twice.
+pub(super) fn long_bytes(src: &MemBatch<'_>, mask: u64, rows: std::ops::Range<usize>) -> usize {
+    gnitz_wire::BitIter(mask)
+        .map(|pi| {
+            let cells = &src.col_data(pi).as_chunks::<16>().0[rows.clone()];
+            cells.iter().map(gnitz_wire::german_string_long_len).sum::<usize>()
+        })
+        .sum()
 }
 
 /// [`row_long_bytes`] summed over every row of `src` outside the ascending,

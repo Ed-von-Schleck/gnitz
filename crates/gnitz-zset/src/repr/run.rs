@@ -156,4 +156,18 @@ impl ColumnarSource for Run {
             Run::Shard(s) => s.is_skeleton(),
         }
     }
+
+    fn direct_col(&self, pi: usize) -> Option<ColPtr> {
+        match self {
+            Run::Mem(b) => b.as_mem_batch().direct_col(pi),
+            Run::Shard(s) => s.direct_col(pi),
+        }
+    }
+
+    fn direct_fixed(&self) -> Option<[ColPtr; 2]> {
+        match self {
+            Run::Mem(b) => b.as_mem_batch().direct_fixed(),
+            Run::Shard(s) => s.direct_fixed(),
+        }
+    }
 }

@@ -693,14 +693,15 @@ impl MappedShard {
         debug_assert!(window.end <= self.header.row_count);
         let cols_off = cols.len();
         cols.extend(
-            self.col_regions[..schema.num_payload_cols()]
-                .iter()
-                .zip(self.schema.payload_columns())
-                .map(|(region, (pi, col))| match region {
-                    PayloadRegion::Mapped(cp) => *cp,
-                    _ => decoded.column(&window, col.size(), |column| {
-                        self.decode_payload(pi, col.size(), window.start, column)
-                    }),
+            self.schema
+                .payload_columns()
+                .take(schema.num_payload_cols())
+                .map(|(pi, col)| {
+                    self.direct_col(pi).unwrap_or_else(|| {
+                        decoded.column(&window, col.size(), |column| {
+                            self.decode_payload(pi, col.size(), window.start, column)
+                        })
+                    })
                 }),
         );
         let null_bmp = match &self.null_bmp {
@@ -739,6 +740,31 @@ impl ColumnarSource for MappedShard {
     #[inline(always)]
     fn is_skeleton(&self) -> bool {
         MappedShard::is_skeleton(self)
+    }
+
+    fn direct_col(&self, pi: usize) -> Option<ColPtr> {
+        match &self.col_regions[pi] {
+            PayloadRegion::Mapped(cp) => Some(*cp),
+            _ => None,
+        }
+    }
+
+    fn direct_fixed(&self) -> Option<[ColPtr; 2]> {
+        match &self.pk {
+            KeyRegion::Mapped(pk) => Some([*pk, self.direct_nulls()?]),
+            KeyRegion::Packed(_) => None,
+        }
+    }
+}
+
+impl MappedShard {
+    /// The null words as a [`ColPtr`] readable in place, where they are stored
+    /// as the row accessor reads them: unpacked, and no column padded NULL.
+    fn direct_nulls(&self) -> Option<ColPtr> {
+        match &self.null_bmp {
+            WordRegion::Mapped(cp) if self.null_pad_mask == 0 => Some(*cp),
+            _ => None,
+        }
     }
 }
 
@@ -802,6 +828,14 @@ impl ColumnarSource for ShardWindow<'_> {
     #[inline(always)]
     fn is_skeleton(&self) -> bool {
         self.shard.is_skeleton()
+    }
+
+    fn direct_col(&self, pi: usize) -> Option<ColPtr> {
+        self.shard.direct_col(pi)
+    }
+
+    fn direct_fixed(&self) -> Option<[ColPtr; 2]> {
+        Some([self.pk, self.shard.direct_nulls()?])
     }
 }
 
