@@ -26,14 +26,29 @@ pub(crate) fn range_rows(ranges: &[(usize, usize)]) -> usize {
     ranges.iter().map(|&(s, e)| e - s).sum()
 }
 
-/// The maximal `[start, end)` runs of `0..n` whose rows `keep` admits, ascending.
-pub(crate) fn runs_where(n: usize, keep: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
-    let kept: Vec<u64> = (0..n)
-        .step_by(64)
-        .map(|base| (base..n.min(base + 64)).fold(0, |bits, row| bits | u64::from(keep(row)) << (row - base)))
+/// The maximal `[start, end)` runs of `items`' positions whose item `keep`
+/// admits, ascending.
+pub(crate) fn runs_where<T>(items: &[T], keep: impl Fn(&T) -> bool) -> Vec<(usize, usize)> {
+    runs_where_zip(items, items, |x, _| keep(x))
+}
+
+/// [`runs_where`] over two equal-length slices read in lockstep: the runs of
+/// positions `i` where `keep(&a[i], &b[i])`. Each 64-position word is a fold
+/// over a zip of slice chunks, so no position is bounds-checked.
+pub(crate) fn runs_where_zip<A, B>(a: &[A], b: &[B], keep: impl Fn(&A, &B) -> bool) -> Vec<(usize, usize)> {
+    debug_assert_eq!(a.len(), b.len());
+    let kept: Vec<u64> = a
+        .chunks(64)
+        .zip(b.chunks(64))
+        .map(|(ca, cb)| {
+            ca.iter()
+                .zip(cb)
+                .enumerate()
+                .fold(0, |bits, (j, (x, y))| bits | u64::from(keep(x, y)) << j)
+        })
         .collect();
     let mut runs = Vec::new();
-    gnitz_wire::set_bit_runs(&kept, n, &mut runs);
+    gnitz_wire::set_bit_runs(&kept, a.len(), &mut runs);
     runs
 }
 
@@ -286,7 +301,7 @@ impl Batch {
         if words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & mask == 0 {
             return vec![(0, self.count)];
         }
-        runs_where(self.count, |row| u64::from_le_bytes(words[row]) & mask == 0)
+        runs_where(words, |w| u64::from_le_bytes(*w) & mask == 0)
     }
     #[inline]
     pub fn col_data(&self, pi: usize) -> &[u8] {
@@ -748,7 +763,7 @@ impl Batch {
     /// payload column landed at output slot `first_slot + pi` over this batch's
     /// heap. `rest` writes what remains — the PK region, the null words, and
     /// any output column no input column lands in.
-    fn copied_into(
+    pub(crate) fn copied_into(
         &self,
         out_schema: &SchemaDescriptor,
         first_slot: usize,

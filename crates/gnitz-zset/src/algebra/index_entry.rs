@@ -5,7 +5,7 @@
 use gnitz_wire::{PkBuf, PkListRole, RowSource};
 
 use super::key_pack::KeyPacker;
-use crate::repr::{copy_runs, range_rows, runs_where, stride, write_to_batch, Batch, MemBatch};
+use crate::repr::{copy_runs, range_rows, runs_where_zip, stride, write_to_batch, Batch, MemBatch};
 use crate::schema::{DerivedSchema, SchemaDescriptor};
 
 /// A key span: columns at their own types, packed tightly in order.
@@ -84,8 +84,8 @@ impl KeySpec {
 fn indexed_runs(mb: &MemBatch<'_>, spec: &KeySpec, keep: impl Fn(i64) -> bool) -> Vec<(usize, usize)> {
     let weights = mb.weight().as_chunks::<8>().0;
     let nulls = mb.null_bmp().as_chunks::<8>().0;
-    runs_where(weights.len(), |row| {
-        keep(i64::from_le_bytes(weights[row])) && u64::from_le_bytes(nulls[row]) & spec.null_mask == 0
+    runs_where_zip(weights, nulls, |w, nb| {
+        keep(i64::from_le_bytes(*w)) & (u64::from_le_bytes(*nb) & spec.null_mask == 0)
     })
 }
 

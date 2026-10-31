@@ -51,7 +51,7 @@ pub use shard::{
     guard_slot, Codebook, GuardMerge, GuardRun, MappedShard, ShardDirectory, ShardWriteOpts, StorageError,
 };
 
-pub(crate) use batch::{range_rows, runs_where, write_to_batch, RowMark};
+pub(crate) use batch::{range_rows, runs_where, runs_where_zip, write_to_batch, RowMark};
 pub(crate) use read_cursor::CursorRow;
 pub(crate) use scatter::{copy_runs, materialize_carrying, stride, stride_dispatch, Pick};
 pub(crate) use seek::pk_group_end;

@@ -129,9 +129,15 @@ impl Batch {
         }
         let slots = self.heap_referencing_slots();
         let rows = || indices.iter().map(|&row| row as usize);
-        let copied: usize = rows()
-            .flat_map(|row| self.long_spans(row, slots))
-            .map(|span| span.len())
+        let blob_len = self.blob().len();
+        let copied: usize = gnitz_wire::BitIter(slots)
+            .map(|pi| {
+                let cells = self.col_data(pi).as_chunks::<16>().0;
+                rows()
+                    .filter_map(|row| gnitz_wire::german_string_heap(&cells[row], blob_len))
+                    .map(|span| span.len())
+                    .sum::<usize>()
+            })
             .sum();
         let dedup = copied > self.blob().len();
         let heap = match dedup {

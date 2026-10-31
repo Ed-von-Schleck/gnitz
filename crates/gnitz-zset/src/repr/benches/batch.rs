@@ -67,36 +67,51 @@ fn consolidate_bench() {
 /// `into_consolidated` over the rows a window emits into a view keyed by its
 /// partition: PKs in order, each with a run of rows whose payload stands out
 /// of order — a retraction and an insertion per row, a few hundred rows a run.
-/// Two payload columns fit one 128-bit payload sort key; three span two.
+/// Two payload columns fit one 128-bit payload sort key; three span two. The
+/// columns are non-null I64, nullable I64 with every fourth value NULL, or F64.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn consolidate_runs_bench() {
     const N: u64 = 1 << 17;
     let counter = Counter::instructions();
-    for payload_cols in [2usize, 3] {
-        let schema = u64_pk_schema(&vec![SchemaColumn::new(TypeCode::I64, false); payload_cols]);
-        for per_pk in [32u64, 256] {
-            let [_, (out, instructions)] = [(); 2].map(|()| {
-                let mut b = BatchBuilder::new(&schema);
-                for i in 0..N / 2 {
-                    let (pk, id) = (i / (per_pk / 2), mix(i) >> 16);
-                    for (w, value) in [(-1, i % per_pk), (1, i % per_pk + 1)] {
-                        b.begin_row(pk as u128, w);
-                        b.put_int(id as u128);
-                        for _ in 1..payload_cols {
-                            b.put_int(value as u128);
+    let kinds = [
+        ("I64", TypeCode::I64, false),
+        ("nullable I64", TypeCode::I64, true),
+        ("F64", TypeCode::F64, false),
+    ];
+    for (kind, tc, nullable) in kinds {
+        for payload_cols in [2usize, 3] {
+            let schema = u64_pk_schema(&vec![SchemaColumn::new(tc, nullable); payload_cols]);
+            for per_pk in [32u64, 256] {
+                let [_, (out, instructions)] = [(); 2].map(|()| {
+                    let mut b = BatchBuilder::new(&schema);
+                    for i in 0..N / 2 {
+                        let (pk, id) = (i / (per_pk / 2), mix(i) >> 16);
+                        for (w, value) in [(-1, i % per_pk), (1, i % per_pk + 1)] {
+                            b.begin_row(pk as u128, w);
+                            let put = |b: &mut BatchBuilder, v: u64| match tc {
+                                TypeCode::F64 => b.put_float(v as f64),
+                                _ => b.put_int(v as u128),
+                            };
+                            put(&mut b, id);
+                            for _ in 1..payload_cols {
+                                match nullable && value % 4 == 0 {
+                                    true => b.put_null(),
+                                    false => put(&mut b, value),
+                                }
+                            }
+                            b.end_row();
                         }
-                        b.end_row();
                     }
-                }
-                let batch = b.finish();
-                counter.measure(|| black_box(batch).into_consolidated())
-            });
-            assert_eq!(out.count as u64, N);
-            println!(
-                "into_consolidated, {payload_cols} payload columns, {per_pk:>3} rows per PK {:>7.1} instr/row",
-                instructions as f64 / N as f64
-            );
+                    let batch = b.finish();
+                    counter.measure(|| black_box(batch).into_consolidated())
+                });
+                assert_eq!(out.count as u64, N);
+                println!(
+                    "into_consolidated, {payload_cols} {kind:<12} columns, {per_pk:>3} rows per PK {:>7.1} instr/row",
+                    instructions as f64 / N as f64
+                );
+            }
         }
     }
 }

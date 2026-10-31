@@ -344,7 +344,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
         true => {
             let mut emitted = vec![false; delta.len()];
             pairs.iter().for_each(|p| emitted[p.delta_rows()].fill(true));
-            let kept = runs_where(delta.len(), |row| emitted[row]);
+            let kept = runs_where(&emitted, |&e| e);
             out.carry_heap(&delta.as_mem_batch(), strings, &kept)
         }
         false => None,
@@ -467,7 +467,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
 
     if any_ghost {
         // A weight product that wrapped to zero is not a Z-set element.
-        let live = runs_where(rows, |row| out.get_weight(row) != 0);
+        let live = runs_where(out.weight().as_chunks::<8>().0, |w| i64::from_le_bytes(*w) != 0);
         return Batch::from_ranges(&out, &live, 0);
     }
     out
