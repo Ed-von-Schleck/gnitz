@@ -5,9 +5,10 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
+use crate::repr::MemBatch;
 use crate::schema::SchemaColumn;
 use gnitz_expr::{order_bits, ColumnLocator};
-use gnitz_wire::{cmp_col_window, ScalarKind};
+use gnitz_wire::{cmp_col_window, for_each_fixed_int, int_cell, ScalarKind};
 use gnitz_wire::{RowSource, TypeCode};
 
 /// The column types outside [`ScalarKind`]: the 16-byte integers and the
@@ -114,6 +115,64 @@ impl ImageCol {
                 slot[take..].fill(0);
             }
         }
+    }
+
+    /// [`Self::write_slot`] for every row of `runs`, all **known non-NULL**, a
+    /// column at a time: the `n`-th row's image into the `slot`-byte window at
+    /// `at` of the `n`-th `stride`-byte key of `keys`. `false`, writing nothing,
+    /// for a wide image, which takes [`Self::write_slot`] a row at a time.
+    pub(crate) fn write_slots(
+        &self,
+        mb: &MemBatch,
+        runs: &[(usize, usize)],
+        keys: &mut [u8],
+        stride: usize,
+        at: usize,
+        slot: usize,
+    ) -> bool {
+        let ImageKind::Scalar(kind) = self.kind else {
+            return false;
+        };
+        let flip = if self.invert { u64::MAX } else { 0 };
+        // Each row's cell, `cs` bytes apart, holds the value at `off`.
+        let (cells, cs, off) = match self.loc {
+            ColumnLocator::Pk { byte_off, .. } => (mb.pk(), mb.pk_stride(), byte_off as usize),
+            ColumnLocator::Payload { slot, size, .. } => (mb.col_data(slot as usize), size as usize, 0),
+        };
+        // Zero-padded where the slot is 16 bytes wide, as `write_slot` pads it.
+        let pad = slot == 16;
+        macro_rules! fill {
+            ($w:expr, |$c:ident| $image:expr) => {{
+                let mut keys = keys.chunks_exact_mut(stride);
+                for &(s, e) in runs {
+                    for (cell, key) in cells[s * cs..e * cs].chunks_exact(cs).zip(&mut keys) {
+                        let $c = &cell[off..off + $w];
+                        key[at..at + 8].copy_from_slice(&(($image) ^ flip).to_be_bytes());
+                        if pad {
+                            key[at + 8..at + 16].fill(0);
+                        }
+                    }
+                }
+            }};
+        }
+        match (kind, self.loc) {
+            (ScalarKind::Int(fi), ColumnLocator::Pk { .. }) => for_each_fixed_int!(fi, |FI| {
+                fill!(FI.width(), |c| ScalarKind::Int(FI)
+                    .order_image(int_cell::<true>(FI, c) as u64))
+            }),
+            (ScalarKind::Int(fi), ColumnLocator::Payload { .. }) => for_each_fixed_int!(fi, |FI| {
+                fill!(FI.width(), |c| ScalarKind::Int(FI)
+                    .order_image(int_cell::<false>(FI, c) as u64))
+            }),
+            // A float is never a PK column.
+            (ScalarKind::F32, _) => {
+                fill!(4, |c| ScalarKind::F32
+                    .order_image(u32::from_le_bytes(c.try_into().unwrap()) as u64))
+            }
+            (ScalarKind::F64, _) => fill!(8, |c| ScalarKind::F64
+                .order_image(u64::from_le_bytes(c.try_into().unwrap()))),
+        }
+        true
     }
 }
 

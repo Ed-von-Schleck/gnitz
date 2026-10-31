@@ -273,9 +273,22 @@ impl GroupOutKey {
         }
     }
 
+    /// [`Self::out_pk`], built from `id` — the group's [`Self::with_identity`]
+    /// identity — where one is given and the key's output PK is that identity;
+    /// a PK range is borrowed or widened from `row` whatever `id` holds.
+    #[inline]
+    pub(crate) fn out_pk_with<'a>(&self, mb: &'a MemBatch, row: usize, id: Option<u128>) -> OutPk<'a> {
+        match (&self.key, id) {
+            (GroupKey::Packed(_) | GroupKey::Fold(_), Some(id)) => OutPk::inline(id, GROUP_PK_BYTES),
+            (&GroupKey::Image { size, .. }, Some(id)) => OutPk::inline(id, size as usize),
+            _ => self.out_pk(mb, row),
+        }
+    }
+
     /// `body` over `mb`, handed the identity of each row of `rows`: the output PK
-    /// up to 16 bytes, widened, else its XXH3-128. The key's form and width are
-    /// matched once per call.
+    /// up to 16 bytes, widened, else its XXH3-128 — so for every key but a PK
+    /// range wider than 16 bytes, [`Self::out_pk_with`] rebuilds the output PK
+    /// from it. The key's form and width are matched once per call.
     #[inline]
     pub(crate) fn with_identity<L: IdentityLoop>(&self, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
         match self.key.form(mb) {
@@ -328,29 +341,33 @@ impl GroupOutKey {
         }
         match &self.key {
             &GroupKey::PkRange { at, n: w } => {
-                pk_width_dispatch!(w, |K| GroupOrdinals::sorted(n, |i| K::from_opk(
-                    mb.get_pk_range(i, at, w)
-                )))
+                pk_width_dispatch!(w, |K| GroupOrdinals::sorted(
+                    n,
+                    |i| K::from_opk(mb.get_pk_range(i, at, w)),
+                    |_| None
+                ))
             }
             &GroupKey::Image { slot, size, type_code } => {
+                // No identities kept: reading an image again per group costs a
+                // batch too small to hash less than allocating them does.
                 let loc = ColumnLocator::Payload { slot, size, type_code };
                 match size <= 8 {
-                    true => GroupOrdinals::sorted(n, |i| loc.opk_image(mb, i) as u64),
-                    false => GroupOrdinals::sorted(n, |i| loc.opk_image(mb, i)),
+                    true => GroupOrdinals::sorted(n, |i| loc.opk_image(mb, i) as u64, |_| None),
+                    false => GroupOrdinals::sorted(n, |i| loc.opk_image(mb, i), |_| None),
                 }
             }
             GroupKey::Packed(p) => {
                 let (keys, w) = (p.keys(mb), p.out_stride);
-                GroupOrdinals::sorted(n, |i| gnitz_wire::widen_pk_be(&keys[i * w..(i + 1) * w]))
+                GroupOrdinals::sorted(n, |i| gnitz_wire::widen_pk_be(&keys[i * w..(i + 1) * w]), Some)
             }
-            GroupKey::Fold(f) => GroupOrdinals::sorted(n, |i| f.key_row(mb, i)),
+            GroupKey::Fold(f) => GroupOrdinals::sorted(n, |i| f.key_row(mb, i), Some),
         }
     }
 }
 
 /// [`GroupOutKey::with_identity`] over a packed `_group_pk`: every row packed once
-/// for the whole loop where `rows` are all of them, or where the key packs a
-/// column at a time and `rows` hold more than one row in
+/// for the whole loop where `rows` are all of them, or where no slot of the key
+/// is hashed and `rows` hold more than one row in
 /// `PACK_ROWS_MIN_SPARSITY`; else each of `rows` packs its own key as it is read.
 /// Out of line, so the loops that read their key in place compile as they do
 /// without it.
@@ -358,15 +375,15 @@ impl GroupOutKey {
 fn packed_identity<L: IdentityLoop>(p: &KeyPacker, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
     let few = |k: usize| k * PACK_ROWS_MIN_SPARSITY <= mb.len();
     let every = rows == [(0, mb.len())];
-    if every || p.packs_by_column() && !(few(rows.len()) && few(crate::repr::range_rows(rows))) {
+    if every || p.packs_without_hashing() && !(few(rows.len()) && few(crate::repr::range_rows(rows))) {
         let (keys, w) = (p.keys(mb), p.out_stride);
         return body.run(|r| gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w]));
     }
     body.run(|r| p.narrow_image(mb, r))
 }
 
-/// Fewest rows per row read at which [`packed_identity`] packs a column-packed
-/// key a row at a time, rather than every row.
+/// Fewest rows per row read at which [`packed_identity`] packs a key that hashes
+/// no slot a row at a time, rather than every row.
 const PACK_ROWS_MIN_SPARSITY: usize = 16;
 
 /// The runs of equal adjacent keys over rows `0..n`, each as `[start, end)`.
@@ -405,6 +422,9 @@ pub(crate) struct GroupOrdinals {
     pub(crate) first: Vec<u32>,
     /// The group ordinals in ascending output-PK order.
     pub(crate) by_pk: Vec<u32>,
+    /// Group ordinal → its [`GroupOutKey::with_identity`] identity, where the
+    /// numbering computed one; else empty.
+    pub(crate) ids: Vec<u128>,
 }
 
 impl GroupOrdinals {
@@ -425,19 +445,24 @@ impl GroupOrdinals {
             ord,
             by_pk: (0..first.len() as u32).collect(),
             first,
+            ids: Vec::new(),
         }
     }
 
-    /// Groups numbered in ascending `key` order, found by sorting the rows.
-    fn sorted<K: Ord>(n: usize, key: impl Fn(usize) -> K) -> Self {
+    /// Groups numbered in ascending `key` order, found by sorting the rows; `id`
+    /// maps a group's key to the identity kept for it, `None` for every key
+    /// where none is kept.
+    fn sorted<K: Ord + Copy>(n: usize, key: impl Fn(usize) -> K, id: impl Fn(K) -> Option<u128>) -> Self {
         // The row index breaks ties, so a group's first row is its first in the batch.
         let mut pairs: Vec<(K, u32)> = (0..n).map(|i| (key(i), i as u32)).collect();
         pairs.sort_unstable();
         let mut ord = vec![0u32; n];
         let mut first: Vec<u32> = Vec::new();
+        let mut ids: Vec<u128> = Vec::new();
         for (p, (k, row)) in pairs.iter().enumerate() {
             if p == 0 || *k != pairs[p - 1].0 {
                 first.push(*row);
+                ids.extend(id(*k));
             }
             ord[*row as usize] = (first.len() - 1) as u32;
         }
@@ -445,6 +470,7 @@ impl GroupOrdinals {
             ord,
             by_pk: (0..first.len() as u32).collect(),
             first,
+            ids,
         }
     }
 }
@@ -488,25 +514,25 @@ impl IdentityLoop for Hashed {
         let mut numbers = GroupNumbers::default();
         let mut ord: Vec<u32> = Vec::with_capacity(self.n);
         let mut first: Vec<u32> = Vec::new();
+        let mut ids: Vec<u128> = Vec::new();
         for row in 0..self.n {
+            let id = identity(row);
             let new = || {
                 let g = first.len();
                 first.push(row as u32);
+                ids.push(id);
                 (g < limit).then_some(g as u32).ok_or(())
             };
-            ord.push(numbers.ordinal(identity(row), new).ok()?);
+            ord.push(numbers.ordinal(id, new).ok()?);
         }
         // Taken in discovery order, which is often PK order already.
-        let mut by_pk: Vec<(u128, u32)> = first
-            .iter()
-            .zip(0..)
-            .map(|(&row, g)| (identity(row as usize), g))
-            .collect();
+        let mut by_pk: Vec<(u128, u32)> = ids.iter().copied().zip(0..).collect();
         by_pk.sort_unstable();
         Some(GroupOrdinals {
             ord,
             first,
             by_pk: by_pk.into_iter().map(|(_, g)| g).collect(),
+            ids,
         })
     }
 }

@@ -158,9 +158,12 @@ impl ValueIndex {
                 if a.image.fits_slot() {
                     cells.take().into_iter().for_each(|cells| cells.fill(0));
                 }
+                keys.chunks_exact_mut(width).for_each(|k| k[stride] = j as u8);
+                if a.image.write_slots(&mb, &runs, keys, width, value.start, value.len()) {
+                    return;
+                }
                 let live = runs.iter().flat_map(|&(s, e)| s..e);
                 for (i, (row, key)) in live.zip(keys.chunks_exact_mut(width)).enumerate() {
-                    key[stride] = j as u8;
                     a.image.write_slot(&mb, row, &mut key[value.clone()], &mut image);
                     if let Some(cells) = cells.as_deref_mut() {
                         cells[i * 16..][..16].copy_from_slice(&gnitz_wire::encode_german_string(&image, blob));

@@ -79,7 +79,8 @@ fn single_natural_col_keys_by_its_opk_from_either_side() {
 /// group columns' values, and iff they share an identity. `runs`, where it
 /// answers, cuts the rows at exactly the ordinals' boundaries, and it answers
 /// for a consolidated batch grouped by leading PK columns whose bytes are its
-/// output PK.
+/// output PK. A row's identity rebuilds its `out_pk` under every key form but
+/// a PK range, and the numbering's kept identities are its groups'.
 fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
     let schema = *raw.schema();
     let consolidated = Batch::clone(raw).into_consolidated();
@@ -137,6 +138,20 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
             let group =
                 |r: usize| -> Vec<_> { cols.iter().map(|&c| cell(&mb, schema.locate(c as usize), r)).collect() };
             let ids = identities(&key, &mb);
+            // The output PK rebuilt from a row's identity is its own: handed
+            // row 0, every key but a PK range reads the identity alone.
+            let pk_range = matches!(key.key, GroupKey::PkRange { .. });
+            for (row, &id) in ids.iter().enumerate() {
+                let pk = key.out_pk_with(&mb, if pk_range { row } else { 0 }, Some(id));
+                prop_assert_eq!(pk.bytes(), &out_pk(row)[..], "{:?}: row {}", cols, row);
+            }
+            // The numbering's identities, where it keeps them, are its groups' first rows'.
+            if !groups.ids.is_empty() {
+                prop_assert_eq!(groups.ids.len(), groups.len(), "{:?}", cols);
+                for (g, &first) in groups.first.iter().enumerate() {
+                    prop_assert_eq!(groups.ids[g], ids[first as usize], "{:?}: group {}", cols, g);
+                }
+            }
             for a in 0..batch.len() {
                 for b in a + 1..batch.len() {
                     let same_out_pk = out_pk(a) == out_pk(b);

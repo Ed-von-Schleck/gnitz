@@ -171,6 +171,65 @@ fn a_content_key_packs_its_content_hash() {
     }
 }
 
+/// A key holding content-hashed slots — nullable and not, beside integer slots
+/// and with columns past the budget folded — packs by `pack_rows` over windows
+/// and dirty padded slots exactly as `pack_into` packs each row.
+#[test]
+fn pack_rows_hashes_content_slots_as_a_row_at_a_time() {
+    use TypeCode::*;
+    let schema = u64_pk_schema(&[
+        SchemaColumn::new(I64, true),
+        SchemaColumn::new(String, true),
+        SchemaColumn::new(U32, false),
+        SchemaColumn::new(String, false),
+        SchemaColumn::new(Blob, true),
+    ]);
+    let rows = 300;
+    let mut b = BatchBuilder::new(&schema);
+    for r in 0..rows {
+        b.begin_row(r as u128, 1);
+        b.put_opt_int((r % 3 != 0).then_some((r as i64 - 150) as u64 as u128));
+        match r % 4 {
+            0 => b.put_null(),
+            k => b.put_string(STRS[(r + k) % STRS.len()]),
+        }
+        b.put_int(r as u128 * 7);
+        b.put_string(STRS[r % STRS.len()]);
+        match r % 5 {
+            0 => b.put_null(),
+            _ => b.put_blob(STRS[(r * 3) % STRS.len()].as_bytes()),
+        }
+        b.end_row();
+    }
+    let b = b.finish();
+    let mb = b.as_mem_batch();
+    let windows: [&[(usize, usize)]; 3] = [&[(0, rows)], &[(17, 18), (40, 299)], &[(5, 5), (250, rows)]];
+    for group in [
+        &[2][..],
+        &[4],
+        &[4, 3],
+        &[2, 1],
+        &[1, 2, 3],
+        &[2, 4, 5],
+        &[1, 2, 3, 4, 5],
+    ] {
+        let (packer, _) = KeyPacker::new_group_key(&schema, group, &[]).unwrap();
+        for runs in windows {
+            let want: Vec<usize> = runs.iter().flat_map(|&(s, e)| s..e).collect();
+            for pad in [0, 3] {
+                let stride = packer.out_stride + pad;
+                let mut got = vec![0xA5u8; want.len() * stride];
+                packer.pack_rows(&mut got, stride, &mb, runs);
+                for (key, &row) in got.chunks_exact(stride).zip(&want) {
+                    let mut one = vec![0u8; packer.out_stride];
+                    packer.pack_into(&mut one, &mb, row);
+                    assert_eq!(&key[..packer.out_stride], &one[..], "{group:?} row {row} pad {pad}");
+                }
+            }
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // KeyPacker::pack_into — property test over every PK-eligible type
 // -----------------------------------------------------------------------

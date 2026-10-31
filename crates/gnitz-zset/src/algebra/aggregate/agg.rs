@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::repr::{Batch, MemBatch};
+use crate::repr::{Batch, DirectWriter, MemBatch};
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::{for_each_fixed_int, int_cell, AggFunc, FixedInt, ScalarKind};
 use gnitz_wire::{RowSource, TypeCode};
@@ -642,6 +642,68 @@ impl AggValues {
             }
         }
     }
+
+    /// [`Self::emit`] a column at a time: group `g`'s value of every aggregate
+    /// into row `g` of `w`, for every row it writes. An extreme with no value
+    /// renders NULL, its bit ORed into the null words `w` already holds.
+    pub(crate) fn emit_columns(&self, w: &mut DirectWriter<'_>) {
+        let n = w.rows();
+        debug_assert!(n <= self.groups);
+        for (k, agg) in self.aggs.iter().enumerate() {
+            let ColumnLocator::Payload { slot, size, .. } = agg.out else {
+                unreachable!("an aggregate is a payload column")
+            };
+            let (pi, size) = (slot as usize, size as usize);
+            let values = k * self.cap..k * self.cap + n;
+            let acc = &self.acc[values.clone()];
+            let StepKind::Extreme { kind, max } = agg.kind else {
+                put_cells(w.col_mut(pi), size, acc.iter().map(|&v| v as u64));
+                continue;
+            };
+            let has = &self.has[values.clone()];
+            match kind {
+                ImageKind::Scalar(kind) => {
+                    let native = |(&v, &has): (&i64, &bool)| match has {
+                        true => scalar_native_of_image(kind, max, v as u64),
+                        false => 0,
+                    };
+                    put_cells(w.col_mut(pi), size, acc.iter().zip(has).map(native));
+                }
+                ImageKind::Wide(WideKind::Fixed(_)) => {
+                    for ((cell, at), &has) in w.col_mut(pi).chunks_exact_mut(size).zip(values.clone()).zip(has) {
+                        match has {
+                            true => cell.copy_from_slice(self.wide(at)),
+                            false => cell.fill(0),
+                        }
+                    }
+                }
+                ImageKind::Wide(WideKind::Bytes) => {
+                    let (cells, heap, _) = w.string_col_mut(pi);
+                    for ((cell, at), &has) in cells.chunks_exact_mut(16).zip(values.clone()).zip(has) {
+                        match has {
+                            true => cell.copy_from_slice(&gnitz_wire::encode_german_string(self.wide(at), heap)),
+                            false => cell.fill(0),
+                        }
+                    }
+                }
+            }
+            for (word, _) in w.null_bmp_mut().chunks_exact_mut(8).zip(has).filter(|(_, &has)| !has) {
+                word[pi / 8] |= 1 << (pi % 8);
+            }
+        }
+    }
+}
+
+/// `values` into `col`'s cells of `size` bytes each, each value's low `size`
+/// bytes, little-endian.
+#[inline(always)]
+fn put_cells(col: &mut [u8], size: usize, values: impl Iterator<Item = u64>) {
+    gnitz_wire::by_cell_width!(size, |T| {
+        let cells = col.as_chunks_mut::<{ size_of::<T>() }>().0;
+        for (cell, v) in cells.iter_mut().zip(values) {
+            *cell = (v as T).to_le_bytes();
+        }
+    })
 }
 
 /// Rows `ranges` of source column `src`, in row order, each stepping

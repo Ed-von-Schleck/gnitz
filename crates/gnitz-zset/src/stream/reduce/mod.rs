@@ -182,7 +182,7 @@ pub fn op_reduce(delta: &Batch, out_trace: OpenAt<'_>, index: Option<OpenAt<'_>>
                 let folded = if agg.is_linear() { &ranges[..] } else { stepped };
                 vals.fold(k, &mb, folded, RangeGroups::Each);
             }
-            let order = ranges.iter().enumerate().map(|(g, &(first, _))| (first, g));
+            let order = ranges.iter().enumerate().map(|(g, &(first, _))| (first, g, None));
             return emit_groups(plan, &mb, out_trace, index, vals, &probes, order);
         }
         Some(runs) => GroupOrdinals::of_runs(&runs),
@@ -201,17 +201,21 @@ pub fn op_reduce(delta: &Batch, out_trace: OpenAt<'_>, index: Option<OpenAt<'_>>
             probes[g as usize] |= retracts(w);
         }
     }
-    let order = groups
-        .by_pk
-        .iter()
-        .map(|&g| (groups.first[g as usize] as usize, g as usize));
+    let order = groups.by_pk.iter().map(|&g| {
+        (
+            groups.first[g as usize] as usize,
+            g as usize,
+            groups.ids.get(g as usize).copied(),
+        )
+    });
     emit_groups(plan, &mb, out_trace, index, vals, &probes, order)
 }
 
 /// Emit each group of `order` merged with its history, as a retraction and a
-/// new row. `order` yields a delta row of each group and the group's index in
-/// `vals`, in ascending output-PK order. A group `g` with `probes[g]` reads its
-/// extremes off the value index, whatever `vals` holds for them.
+/// new row. `order` yields a delta row of each group, the group's index in
+/// `vals` and the identity its numbering kept for it, if any, in ascending
+/// output-PK order. A group `g` with `probes[g]` reads its extremes off the
+/// value index, whatever `vals` holds for them.
 fn emit_groups(
     plan: &ReducePlan,
     delta: &MemBatch<'_>,
@@ -219,15 +223,15 @@ fn emit_groups(
     index: Option<OpenAt<'_>>,
     mut vals: AggValues,
     probes: &[bool],
-    order: impl DoubleEndedIterator<Item = (usize, usize)> + ExactSizeIterator + Clone,
+    order: impl DoubleEndedIterator<Item = (usize, usize, Option<u128>)> + ExactSizeIterator + Clone,
 ) -> Batch {
     let shape = &plan.shape;
     let key = &shape.key;
-    let row = |end: Option<(usize, usize)>| end.expect("a delta with a row has a group").0;
+    let row = |end: Option<(usize, usize, Option<u128>)>| end.expect("a delta with a row has a group").0;
     let (lo, hi) = (row(order.clone().next()), row(order.clone().next_back()));
     let mut out_trace = out_trace(key.out_pk(delta, lo).bytes(), key.out_pk(delta, hi).bytes());
     let mut value_index = plan.value_index.as_ref().and_then(|value_index| {
-        let probed = order.clone().filter(|&(_, g)| probes[g]).map(|(row, _)| row);
+        let probed = order.clone().filter(|&(_, g, _)| probes[g]).map(|(row, _, _)| row);
         let (lo, hi) = value_index.group_span(delta, probed)?;
         let open = index.expect("a value-indexed reduce is handed its index");
         Some((value_index, open(lo.pk_bytes(), hi.pk_bytes())))
@@ -236,8 +240,8 @@ fn emit_groups(
     // A group emits at most its retraction and its new row.
     let mut out = Batch::with_capacity(&shape.output_schema, 2 * groups);
 
-    for (first, g) in order {
-        let out_pk = key.out_pk(delta, first);
+    for (first, g, id) in order {
+        let out_pk = key.out_pk_with(delta, first, id);
         let out_pk_bytes: &[u8] = out_pk.bytes();
         let probed = value_index.as_mut().filter(|_| probes[g]);
 

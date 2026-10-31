@@ -395,8 +395,9 @@ impl KeyPacker {
         }
     }
 
-    /// Whether [`Self::pack_rows`] packs a column at a time.
-    pub(crate) fn packs_by_column(&self) -> bool {
+    /// Whether every slot packs without hashing, so packing all of a batch's rows costs
+    /// about what packing the rows read costs.
+    pub(crate) fn packs_without_hashing(&self) -> bool {
         self.fold.is_empty() && self.cols().iter().all(|c| !c.loc.type_code().is_german_string())
     }
 
@@ -404,16 +405,6 @@ impl KeyPacker {
     /// into the fronts of `dst`'s slots `stride` apart.
     pub(crate) fn pack_rows<B: BatchView>(&self, dst: &mut [u8], stride: usize, batch: &B, runs: &[(usize, usize)]) {
         let dst = &mut dst[..range_rows(runs) * stride];
-        if !self.packs_by_column() {
-            let mut keys = dst.chunks_exact_mut(stride);
-            for &(s, e) in runs {
-                // The rows lead the zip: it stops on them without taking a key it leaves unwritten.
-                for (row, key) in (s..e).zip(keys.by_ref()) {
-                    self.pack_into(&mut key[..self.out_stride], batch, row);
-                }
-            }
-            return;
-        }
         let mut off = usize::from(self.has_bitmap) * BITMAP_BYTES;
         if self.has_bitmap {
             dst.chunks_exact_mut(stride).for_each(|key| key[0] = 0);
@@ -429,6 +420,19 @@ impl KeyPacker {
             };
             let signed = loc.type_code().is_signed_int();
             match loc {
+                ColumnLocator::Payload { slot, type_code, .. } if type_code.is_german_string() => {
+                    // A content slot packs its content hash, a NULL a zeroed slot under its bitmap bit.
+                    let nulls = batch.null_bmp().as_chunks::<8>().0;
+                    for_rows(dst, stride, runs, |key, row| {
+                        if self.has_bitmap && gnitz_wire::null_word_get(u64::from_le_bytes(nulls[row]), slot as usize) {
+                            key[0] |= 1 << i;
+                            key[off..off + dw].fill(0);
+                        } else {
+                            let h = gnitz_wire::checksum_128(&gnitz_wire::payload_bytes(batch, row, slot as usize));
+                            key[off..off + dw].copy_from_slice(&h.to_be_bytes());
+                        }
+                    });
+                }
                 ColumnLocator::Pk { byte_off, .. } => {
                     let (pk, pk_stride) = batch.pk_region();
                     col.dispatch::<true>(sw, dw, signed, pk, pk_stride, byte_off as usize);
@@ -438,21 +442,34 @@ impl KeyPacker {
                     if self.has_bitmap {
                         // A NULL packs as a zeroed slot under its bitmap bit.
                         let nulls = batch.null_bmp().as_chunks::<8>().0;
-                        let mut rest = &mut *dst;
-                        for &(s, e) in runs {
-                            let (keys, tail) = rest.split_at_mut((e - s) * stride);
-                            rest = tail;
-                            for (key, word) in keys.chunks_exact_mut(stride).zip(&nulls[s..e]) {
-                                if gnitz_wire::null_word_get(u64::from_le_bytes(*word), slot as usize) {
-                                    key[0] |= 1 << i;
-                                    key[off..off + dw].fill(0);
-                                }
+                        for_rows(dst, stride, runs, |key, row| {
+                            if gnitz_wire::null_word_get(u64::from_le_bytes(nulls[row]), slot as usize) {
+                                key[0] |= 1 << i;
+                                key[off..off + dw].fill(0);
                             }
-                        }
+                        });
                     }
                 }
             }
             off += dw;
+        }
+        if !self.fold.is_empty() {
+            for_rows(dst, stride, runs, |key, row| {
+                key[off..off + FOLD_BYTES].copy_from_slice(&self.fold.key_row(batch, row).to_be_bytes());
+            });
+        }
+    }
+}
+
+/// Call `f` on each row of `runs` — ascending `[start, end)` — in order, with that row's
+/// slot of `dst`, the slots `stride` apart.
+#[inline(always)]
+fn for_rows(dst: &mut [u8], stride: usize, runs: &[(usize, usize)], mut f: impl FnMut(&mut [u8], usize)) {
+    let mut keys = dst.chunks_exact_mut(stride);
+    for &(s, e) in runs {
+        // The rows lead the zip: it stops on them without taking a key it leaves unwritten.
+        for (row, key) in (s..e).zip(keys.by_ref()) {
+            f(key, row);
         }
     }
 }

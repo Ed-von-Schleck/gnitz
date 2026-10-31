@@ -293,3 +293,79 @@ fn adhoc_fold_sparse_bench() {
         }
     }
 }
+
+/// Instructions per group of the finish alone — the fold before it untimed — at
+/// nearly the group cap, over
+/// `[U64 pk | I64 grp | STRING sgrp | I64 a | I32 b NULL | STRING s NULL]`,
+/// grouped by an integer column and by a string one.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn adhoc_fold_finish_bench() {
+    let c = SchemaColumn::new;
+    let schema = u64_pk_schema(&[
+        c(TypeCode::I64, false),
+        c(TypeCode::String, false),
+        c(TypeCode::I64, false),
+        c(TypeCode::I32, true),
+        c(TypeCode::String, true),
+    ]);
+    const GROUPS: u64 = 60_000;
+    let chunks: Vec<Batch> = (0..N / CHUNK)
+        .map(|ch| {
+            let mut b = BatchBuilder::new(&schema);
+            for i in ch * CHUNK..(ch + 1) * CHUNK {
+                let g = (mix(i) >> 20) % GROUPS;
+                b.begin_row(i as u128, 1);
+                b.put_int(g as u128);
+                b.put_string(&format!("group-key-string-{g:08}"));
+                b.put_int(mix(i ^ 7) as i64 as u128);
+                b.put_opt_int((i % 5 != 0).then(|| mix(i ^ 9) as u32 as u128));
+                match i % 7 {
+                    0 => b.put_null(),
+                    _ => b.put_string(&format!("value-string-{:016x}", mix(i ^ 11))),
+                }
+                b.end_row();
+            }
+            b.finish()
+        })
+        .collect();
+    let agg = |col_idx: u32, agg_op: AggFunc| AggDescriptor { col_idx, agg_op };
+    let agg_sets: [(&str, Vec<AggDescriptor>); 3] = [
+        ("count", vec![AggDescriptor::COUNT_STAR]),
+        (
+            "count+sum+min+max",
+            vec![
+                AggDescriptor::COUNT_STAR,
+                agg(3, AggFunc::Sum),
+                agg(3, AggFunc::Min),
+                agg(4, AggFunc::Max),
+            ],
+        ),
+        ("min+max string", vec![agg(5, AggFunc::Min), agg(5, AggFunc::Max)]),
+    ];
+    let counter = Counter::instructions();
+    for (key, group_col) in [("grp i64", 1u32), ("grp string", 2)] {
+        for (name, aggs) in &agg_sets {
+            let spec = GroupAggs {
+                group_cols: vec![group_col],
+                aggs: aggs.clone(),
+            };
+            let folded = || {
+                let mut fold = AdhocFold::new(&schema, &spec, GROUP_CAP).unwrap();
+                for c in &chunks {
+                    fold.fold_ranges(c, &[(0, CHUNK as usize)]).unwrap();
+                }
+                fold
+            };
+            std::hint::black_box(folded().finish());
+            let fold = folded();
+            let (out, instructions) = counter.measure(|| fold.finish());
+            let groups = out.len();
+            std::hint::black_box(out);
+            println!(
+                "adhoc_fold_finish_bench {key:<10} {name:<18} {:>6.1} instr/group ({groups} groups)",
+                instructions as f64 / groups as f64
+            );
+        }
+    }
+}

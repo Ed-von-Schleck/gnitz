@@ -6,7 +6,7 @@ use super::key_pack::{FoldCols, KeyPacker};
 use super::route::{ground_owner, worker_for_key, worker_for_pk_bytes, worker_for_wide_pk, Placement, Slot};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::zip_cells;
+use gnitz_wire::{zip_cells, NARROW_PK_MAX_BYTES};
 
 /// A scatter key resolved against one schema: each row goes to the owner of the
 /// PK its consumer gives it. Without a key every worker is sent every
@@ -82,7 +82,7 @@ impl ScatterPlan {
         match self.0 {
             Some(ref key) if nw > 1 => match key.form(mb) {
                 KeyForm::Cells(cells) => {
-                    for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(&cells, mb.weight(), sink, nw))
+                    for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(&cells, mb.weight(), 0, sink, nw))
                 }
                 KeyForm::WidePk { at, n } => route_rows(mb, sink, PkRangeW { at, n, nw }),
                 KeyForm::Packed(packer) => route_rows_packed(mb, sink, packer, nw),
@@ -179,13 +179,19 @@ fn route_rows<W: RowWorker>(mb: &MemBatch, sink: &mut impl RowSink, w: W) {
 }
 
 /// [`route_rows`] for a key that is one `W`-byte cell per row: each nonzero-weight row to the
-/// owner of its cell's image.
+/// owner of its cell's image, the rows numbered from `first_row`.
 #[inline(never)]
-fn route_cells<const W: usize, const OPK: bool>(cells: &KeyCells, weights: &[u8], sink: &mut impl RowSink, nw: usize) {
-    let rows = weights.as_chunks::<8>().0.iter().enumerate();
-    zip_cells::<W, _>(cells.region, cells.stride, cells.off, rows, |cell, (row, weight)| {
+fn route_cells<const W: usize, const OPK: bool>(
+    cells: &KeyCells,
+    weights: &[u8],
+    first_row: u32,
+    sink: &mut impl RowSink,
+    nw: usize,
+) {
+    let rows = weights.as_chunks::<8>().0.iter().zip(first_row..);
+    zip_cells::<W, _>(cells.region, cells.stride, cells.off, rows, |cell, (weight, row)| {
         if *weight != [0; 8] {
-            sink.put(worker_for_key(cell_image::<W, OPK>(cell, cells.signed), nw), row as u32);
+            sink.put(worker_for_key(cell_image::<W, OPK>(cell, cells.signed), nw), row);
         }
     });
 }
@@ -201,9 +207,29 @@ fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker,
     for start in (0..rows).step_by(KEY_CHUNK) {
         let n = (rows - start).min(KEY_CHUNK);
         packer.pack_rows(&mut keys, width, mb, &[(start, start + n)]);
-        for (row, key) in (start..).zip(keys.chunks_exact(width).take(n)) {
-            if mb.get_weight(row) != 0 {
-                sink.put(worker_for_pk_bytes(key, nw), row as u32);
+        if width <= NARROW_PK_MAX_BYTES {
+            // A packed key is an OPK image of `width` bytes per row.
+            let weights = &mb.weight()[start * 8..(start + n) * 8];
+            let cells = KeyCells {
+                region: &keys[..n * width],
+                stride: width,
+                off: 0,
+                width,
+                opk: true,
+                signed: false,
+            };
+            for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(
+                &cells,
+                weights,
+                start as u32,
+                sink,
+                nw
+            ));
+        } else {
+            for (row, key) in (start..).zip(keys.chunks_exact(width).take(n)) {
+                if mb.get_weight(row) != 0 {
+                    sink.put(worker_for_pk_bytes(key, nw), row as u32);
+                }
             }
         }
     }

@@ -93,3 +93,68 @@ fn an_image_orders_round_trips_and_slots_as_its_value() {
         }
     }
 }
+
+/// `write_slots` writes, into each key's slot window, the bytes `write_slot`
+/// writes for the same row, over a run list with gaps, for a scalar PK column
+/// between two others, scalar payload columns of every kind and both slot
+/// widths, and leaves every other key byte as it found it. A wide kind writes
+/// nothing.
+#[test]
+fn write_slots_matches_write_slot_per_row() {
+    use TypeCode::{String, F32, F64, I16, I32, I64, U128, U64, U8};
+    let c = |tc| SchemaColumn::new(tc, false);
+    let schema = SchemaDescriptor::new(
+        &[
+            c(U64),
+            c(I32),
+            c(I16),
+            c(U8),
+            c(I64),
+            c(F64),
+            c(F32),
+            c(U128),
+            c(String),
+            c(U8),
+        ],
+        &[0, 1, 9],
+    );
+    let rows = 40;
+    let mut b = BatchBuilder::new(&schema);
+    for r in 0..rows {
+        let v = (r as i64 - 20) * 977;
+        b.begin_row_natives(&[r as u128, v as u128, r as u128], 1);
+        b.put_int(v as u128);
+        b.put_int((r as u128 * 7) % 256);
+        b.put_int((v * 1_000_003) as u128);
+        b.put_int(u128::from((v as f64 * -0.25).to_bits()));
+        b.put_int(u128::from((v as f32 * 1.5).to_bits()));
+        b.put_int(v as u128);
+        b.put_string(STRS[r % STRS.len()]);
+        b.end_row();
+    }
+    let b = b.finish();
+    let mb = b.as_mem_batch();
+    let runs = [(0, 3), (5, 6), (9, 30), (33, 40)];
+    let live: Vec<usize> = runs.iter().flat_map(|&(s, e)| s..e).collect();
+    for ci in 1..schema.num_columns() {
+        for invert in [false, true] {
+            let col = ImageCol::new(schema.locate(ci), invert);
+            for slot in [8, 16] {
+                let (at, stride) = (3, 3 + slot + 2);
+                let mut keys = vec![0xAAu8; live.len() * stride];
+                let wrote = col.write_slots(&mb, &runs, &mut keys, stride, at, slot);
+                let what = format!("column {ci} invert={invert} slot {slot}");
+                assert_eq!(wrote, !col.is_wide(), "{what}");
+                if !wrote {
+                    assert!(keys.iter().all(|&b| b == 0xAA), "{what}");
+                    continue;
+                }
+                for (key, &r) in keys.chunks_exact(stride).zip(&live) {
+                    let mut want = vec![0xAAu8; stride];
+                    col.write_slot(&mb, r, &mut want[at..at + slot], &mut Vec::new());
+                    assert_eq!(key, &want[..], "{what} row {r}");
+                }
+            }
+        }
+    }
+}

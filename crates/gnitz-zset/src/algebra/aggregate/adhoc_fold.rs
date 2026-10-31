@@ -4,8 +4,10 @@
 //! surviving scan chunk folds into per-group aggregate values in bounded RAM, then
 //! one partial reduce-output batch is emitted.
 //!
-//! It runs the same `GroupOutKey`, aggregates and `AggValues::emit_row` as a
-//! view's reduce, so its output is that reduce's output over the same group set.
+//! It runs the same `GroupOutKey` and aggregates as a view's reduce, and emits
+//! their values through `AggValues::emit_columns`, the column form of the
+//! reduce's `AggValues::emit`, so its output is that reduce's output over the
+//! same group set.
 //!
 //! The scan cursor delivers consolidated, positive-weight rows, so there is no
 //! retraction arithmetic and every present group has a positive cardinality:
@@ -94,16 +96,16 @@ impl AdhocFold {
         Ok(())
     }
 
-    /// One partial row per present group (weight +1), in group-discovery order.
+    /// One partial row per present group (weight +1), in group-discovery order:
+    /// `groups` is the output's leading columns, copied whole, then each
+    /// aggregate's column.
     pub(crate) fn finish(self) -> Batch {
-        let carried = self.groups.schema().payload_locators();
-        let mut output = Batch::with_capacity(&self.shape.output_schema, self.groups.len());
-        let groups_mb = self.groups.as_mem_batch();
-        for g in 0..self.groups.len() {
-            let group = Some((&groups_mb, g, &carried[..]));
-            self.vals.emit_row(&mut output, group, groups_mb.get_pk_bytes(g), g);
-        }
-        output
+        self.groups.copied_into(&self.shape.output_schema, 0, |w| {
+            let (pk, _, nulls) = w.fixed_mut();
+            pk.copy_from_slice(self.groups.pk());
+            nulls.copy_from_slice(self.groups.null_bmp());
+            self.vals.emit_columns(w);
+        })
     }
 }
 
@@ -124,7 +126,8 @@ impl IdentityLoop for AssignGroups<'_> {
 
     fn run(self, identity: impl Fn(usize) -> u128) -> Self::Out {
         for row in self.ranges.iter().flat_map(|&(s, e)| s..e) {
-            let g = self.numbers.ordinal(identity(row), || {
+            let id = identity(row);
+            let g = self.numbers.ordinal(id, || {
                 let g = self.groups.len();
                 if g >= self.group_cap {
                     return Err(format!(
@@ -133,7 +136,8 @@ impl IdentityLoop for AssignGroups<'_> {
                         self.group_cap
                     ));
                 }
-                self.groups.begin_row(self.key.out_pk(self.mb, row).bytes(), 1);
+                self.groups
+                    .begin_row(self.key.out_pk_with(self.mb, row, Some(id)).bytes(), 1);
                 self.groups.append_cells_from(self.key.carried(), self.mb, row);
                 self.groups.commit_row();
                 Ok(g as u32)
@@ -143,6 +147,10 @@ impl IdentityLoop for AssignGroups<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "tests/adhoc_fold.rs"]
+mod tests;
 
 #[cfg(test)]
 #[path = "benches/adhoc_fold.rs"]
