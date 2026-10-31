@@ -1,7 +1,7 @@
-//! Client connections: the frame queue's ceilings and the global inbound-memory
-//! budget every `RecvBuf` is charged against, the accept op, the send loop and
-//! its eviction deadline, and how a connection's recv side ends and its socket
-//! closes.
+//! Client connections: the frame queue's ceilings, the global inbound-memory
+//! budget every `RecvBuf` is charged against and a connection's share of it,
+//! the accept op, the send loop and its eviction deadline, and how a
+//! connection's recv side ends and its socket closes.
 
 use std::io::Write;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -161,6 +161,118 @@ fn inbound_cap_accounting_balances_on_consume() {
         });
     }
     assert_eq!(r.conns.inbound.held(), 0, "every frame consumed");
+}
+
+/// A connection past its share of the inbound budget is received from no
+/// further until its task takes frames back under the share, so what it has
+/// queued never refuses another connection's frame; and every frame it sent
+/// arrives once its task drains them.
+#[test]
+fn a_connection_past_its_share_holds_off_and_refuses_no_other() {
+    // Past the carry, so one recv completes at most one frame and starts at most
+    // one more.
+    const FRAME: usize = 40_000;
+    const FRAMES: usize = 9;
+    const SHARE: usize = 200_000;
+    // All nine fit under the cap, but leave no room beside them for the other
+    // connection's frame.
+    let r = make_reactor_with(Limits {
+        inbound_cap: 400_000,
+        conn_inbound_share: SHARE,
+        ..Limits::TEST
+    });
+    let (hog, hog_partner) = admitted(&r);
+    let (other, other_partner) = admitted(&r);
+    hog_partner.set_nonblocking(true).expect("nonblocking");
+    let wire = framed(&[0x33; FRAME]).repeat(FRAMES);
+    let mut written = 0;
+    // What of the hog's bytes the socket takes now.
+    let mut write_some = || match (&hog_partner).write(&wire[written..]) {
+        Ok(n) => written += n,
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
+    };
+
+    assert!(
+        poll_until(&r, || {
+            write_some();
+            r.conns.paused.borrow().contains(&hog.fd())
+        }),
+        "the hog's recv is never held off"
+    );
+    // One recv past the share starts at most one frame.
+    let held = r.conns.inbound.held();
+    assert!(held <= SHARE + FRAME, "the hog holds {held} B");
+
+    let payload = [0x44; 50_000];
+    (&other_partner).write_all(&framed(&payload)).expect("write");
+    let got = r.block_on(other.recv()).expect("the other connection's frame");
+    assert_eq!(got.as_slice(), payload);
+    drop(got);
+
+    let drained = Rc::new(Cell::new(0));
+    let (n, conn) = (Rc::clone(&drained), Rc::clone(&hog));
+    r.spawn(async move {
+        while let Some(frame) = conn.recv().await {
+            assert_eq!(frame.as_slice().len(), FRAME);
+            n.set(n.get() + 1);
+        }
+    });
+    assert!(
+        poll_until(&r, || {
+            write_some();
+            drained.get() == FRAMES
+        }),
+        "the hog's frames are delivered once its task takes them"
+    );
+    assert!(!hog.is_gone() && !other.is_gone());
+    assert_eq!(r.conns.inbound.held(), 0);
+    hog.retire(); // ends the draining task
+    r.block_until_idle();
+}
+
+/// A frame past the share is received whole: with nothing queued, no take of
+/// the task's could bring the connection under it.
+#[test]
+fn a_frame_past_the_share_is_received_whole() {
+    let r = make_reactor_with(Limits {
+        conn_inbound_share: 1_000,
+        ..Limits::TEST
+    });
+    let (conn, partner) = admitted(&r);
+    partner.set_nonblocking(true).expect("nonblocking");
+    let payload = [0x55; 100_000];
+    let wire = framed(&payload);
+    let (mut written, mut got) = (0, None);
+    assert!(
+        poll_until(&r, || {
+            match (&partner).write(&wire[written..]) {
+                Ok(n) => written += n,
+                Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
+            }
+            got = conn.try_recv();
+            got.is_some()
+        }),
+        "the frame never completes"
+    );
+    assert_eq!(got.expect("the frame").as_slice(), payload);
+}
+
+/// A connection retired while its recv is held off has no recv to complete:
+/// the reactor lets go of it at its next submit, refunding its queue.
+#[test]
+fn a_held_off_connection_retired_is_let_go_of() {
+    let r = make_reactor_with(Limits { conn_inbound_share: 0, ..Limits::TEST });
+    let (conn, partner) = admitted(&r);
+    (&partner).write_all(&framed(b"queued")).expect("write");
+    assert!(
+        poll_until(&r, || r.conns.paused.borrow().contains(&conn.fd())),
+        "one queued frame is past a zero share"
+    );
+    conn.retire();
+    r.tick(false);
+    assert!(r.conns.paused.borrow().is_empty());
+    assert_eq!(Rc::strong_count(&conn), 1, "the reactor let go of the connection");
+    assert_eq!(r.conns.inbound.held(), 0);
 }
 
 /// `readable` resolves on a queued frame and on the end of the recv side, and

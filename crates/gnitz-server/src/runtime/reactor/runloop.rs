@@ -65,12 +65,14 @@ impl Reactor {
         root
     }
 
-    /// Submit queued SQEs. When `block` and nothing is runnable, arm the W2M park
-    /// and sleep until the next CQE, W2M publish or earliest deadline instead —
-    /// unless a deadline has passed or the drain run before arming woke a task.
-    /// The park is armed only on a pass that sleeps: the publish that takes an
-    /// arm spends a cross-process `FUTEX_WAKE`.
+    /// Re-arm the recvs this pass's tasks resumed, then submit queued SQEs.
+    /// When `block` and nothing is runnable, arm the W2M park and sleep until
+    /// the next CQE, W2M publish or earliest deadline instead — unless a
+    /// deadline has passed or the drain run before arming woke a task. The park
+    /// is armed only on a pass that sleeps: the publish that takes an arm spends
+    /// a cross-process `FUTEX_WAKE`.
     pub(super) fn submit_or_sleep(&self, block: bool) {
+        self.resume_recvs();
         let until = self.timers.earliest();
         let sleep = block
             && run_queue_is_empty()

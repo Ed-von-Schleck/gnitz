@@ -18,6 +18,7 @@ impl Limits {
     /// test. A test that waits a deadline out sets its own.
     pub(super) const TEST: Limits = Limits {
         inbound_cap: usize::MAX,
+        conn_inbound_share: usize::MAX,
         client_send_timeout: Duration::from_secs(30),
         accept_rearm_backoff: Duration::from_millis(2),
         max_conns: usize::MAX,

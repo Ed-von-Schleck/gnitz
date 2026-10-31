@@ -24,6 +24,11 @@ pub(crate) struct Limits {
     /// Ceiling on in-flight inbound frame payload bytes, across every
     /// connection.
     pub inbound_cap: usize,
+    /// One connection's share of `inbound_cap`: once the frames it has queued
+    /// for its task, and the one it is receiving, weigh more than this, its
+    /// recv is not re-armed until the task takes them back under it or takes
+    /// every queued one.
+    pub conn_inbound_share: usize,
     /// One kernel send making no progress for this long evicts the client, whose
     /// stalled sends would otherwise pin W2M ring space and block a worker
     /// (`GNITZ_CLIENT_SEND_TIMEOUT_MS`).
@@ -40,14 +45,19 @@ pub(crate) struct Limits {
 impl Limits {
     /// The server's, resolved from the environment.
     pub(crate) fn from_env() -> Limits {
+        let inbound_cap = resolve_inbound_cap();
+        let max_conns = gnitz_foundation::env::env_num("GNITZ_MAX_CONNS", 256);
         Limits {
-            inbound_cap: resolve_inbound_cap(),
+            inbound_cap,
+            // Every connection at its share together stays under the cap, so
+            // what one has queued never refuses another's frame.
+            conn_inbound_share: inbound_cap / max_conns.max(1),
             client_send_timeout: Duration::from_millis(gnitz_foundation::env::env_num(
                 "GNITZ_CLIENT_SEND_TIMEOUT_MS",
                 30_000,
             )),
             accept_rearm_backoff: Duration::from_millis(50),
-            max_conns: gnitz_foundation::env::env_num("GNITZ_MAX_CONNS", 256),
+            max_conns,
         }
     }
 }
@@ -177,6 +187,9 @@ pub(crate) struct FrameSink {
     /// deadlocks once the kernel socket buffer fills.
     frames: WakeQueue<RecvBuf>,
     budget: Rc<Budget>,
+    /// What this connection holds of `budget` outside its task: the frames
+    /// queued in `frames` and the payload in progress, charged from its header.
+    held: usize,
     /// The largest payload admitted: [`HANDSHAKE_FRAME_MAX`] until the
     /// handshake admits the client, then [`MAX_FRAME_PAYLOAD`].
     max_frame: usize,
@@ -187,6 +200,7 @@ impl FrameSink {
         FrameSink {
             frames: WakeQueue::default(),
             budget,
+            held: 0,
             max_frame: HANDSHAKE_FRAME_MAX,
         }
     }
@@ -195,7 +209,7 @@ impl FrameSink {
     /// frame it completes. Each payload in progress is charged to the budget
     /// from its header on.
     pub(crate) fn feed(&mut self, deframer: &mut Deframer<Charge>, mut src: &[u8]) -> Result<(), RecvEnd> {
-        let (budget, max_frame) = (&self.budget, self.max_frame);
+        let (budget, max_frame, held) = (&self.budget, self.max_frame, &mut self.held);
         while let Some((buf, charge)) = deframer.feed(&mut src, |len| {
             if len > max_frame {
                 return Err(RecvEnd::Oversize);
@@ -203,7 +217,9 @@ impl FrameSink {
             // A 64-byte floor per frame, so a flood of tiny frames is bounded
             // by frame count as well as bytes.
             let want = len.max(64);
-            budget.charge(want).ok_or(RecvEnd::CapBreach { want })
+            let charge = budget.charge(want).ok_or(RecvEnd::CapBreach { want })?;
+            *held += want;
+            Ok(charge)
         })? {
             self.frames.push(RecvBuf {
                 buf: buf.into_owned().into_boxed_slice(),
@@ -221,7 +237,20 @@ impl FrameSink {
 
     /// Take a completed frame without parking.
     pub(crate) fn try_recv(&mut self) -> Option<RecvBuf> {
-        self.frames.pop()
+        self.frames.pop().inspect(|f| self.held -= f.charge.weight)
+    }
+
+    /// [`WakeQueue::poll`], counting the frame taken out of [`Self::held`].
+    fn poll(&mut self, cx: &Context<'_>) -> Poll<Option<RecvBuf>> {
+        self.frames.poll_ready(cx).map(|()| self.try_recv())
+    }
+
+    /// Whether the connection holds more than `share` of the budget outside its
+    /// task with a frame queued for it. A payload in progress past the share
+    /// with nothing queued is still received: no take of the task's could bring
+    /// it under.
+    fn over(&self, share: usize) -> bool {
+        self.held > share && self.frames.is_ready()
     }
 }
 
@@ -291,6 +320,7 @@ impl ClientConn {
             let mut q = self.q.borrow_mut();
             q.frames.clear();
             q.frames.close();
+            q.held = 0;
         }
         match &self.egress_owner {
             Some(owner) => owner.send(()),
@@ -312,7 +342,7 @@ impl ClientConn {
 
     /// Next frame, or `None` once the recv side has ended and is drained.
     pub(crate) async fn recv(&self) -> Option<RecvBuf> {
-        std::future::poll_fn(|cx| self.q.borrow_mut().frames.poll(cx)).await
+        std::future::poll_fn(|cx| self.q.borrow_mut().poll(cx)).await
     }
 
     /// Resolves once [`Self::recv`] would: a frame is queued, or the recv side
@@ -378,8 +408,12 @@ impl RecvFilter for Plain {
 /// The reactor's connection state: every armed recv, the budgets connections
 /// are charged to, and their limits.
 pub(super) struct Conns {
-    /// Every connection with a recv armed on it, by fd.
+    /// Every connection the reactor receives on, by fd: those with a recv armed,
+    /// and those in `paused`.
     armed: RefCell<FxHashMap<i32, Armed>>,
+    /// The connections over their `Limits::conn_inbound_share`, whose recv is
+    /// re-armed once their task takes them back under it.
+    paused: RefCell<Vec<i32>>,
     /// The OOM guard shared by every connection, charged per inbound frame.
     inbound: Rc<Budget>,
     /// Open client connections under `Limits::max_conns`; each [`ClientConn`]
@@ -392,6 +426,7 @@ impl Conns {
     pub(super) fn new(limits: Limits) -> Self {
         Conns {
             armed: RefCell::new(FxHashMap::default()),
+            paused: RefCell::new(Vec::new()),
             inbound: Budget::new(limits.inbound_cap),
             slots: Budget::new(limits.max_conns),
             limits,
@@ -399,8 +434,9 @@ impl Conns {
     }
 }
 
-/// A connection with a recv armed on it — the reactor's whole per-connection
-/// state. The entry exists exactly while the recv SQE is outstanding.
+/// A connection the reactor receives on — its whole per-connection state. The
+/// entry exists while the recv SQE is outstanding, or while the connection is
+/// paused with none.
 struct Armed {
     conn: Rc<ClientConn>,
     filter: Box<dyn RecvFilter>,
@@ -535,8 +571,14 @@ impl Reactor {
             ..0 => RecvEnd::Socket,
             0 => RecvEnd::PeerClosed,
             n => {
-                let ingested = armed.filter.ingest(n as usize, &mut armed.conn.q.borrow_mut());
+                let mut q = armed.conn.q.borrow_mut();
+                let ingested = armed.filter.ingest(n as usize, &mut q);
+                let over = q.over(self.conns.limits.conn_inbound_share);
+                drop(q);
                 match ingested {
+                    // Not re-armed: the socket's bytes stay in the kernel, whose
+                    // flow control holds the client off.
+                    Ok(()) if over => return self.conns.paused.borrow_mut().push(fd),
                     Ok(()) => return armed.arm(&mut self.ring.borrow_mut()),
                     Err(end) => end,
                 }
@@ -560,6 +602,36 @@ impl Reactor {
             _ => armed.conn.fail(),
         }
     } // `armed` drops: the reactor's hold on the connection ends
+
+    /// Re-arm the recv of every paused connection its task has taken back under
+    /// its share, and let go of every paused one that is gone, whose bytes no
+    /// recv will read. Run ahead of every submit, so a pass that took frames
+    /// re-arms before the loop sleeps.
+    pub(super) fn resume_recvs(&self) {
+        if self.conns.paused.borrow().is_empty() {
+            return;
+        }
+        let mut paused = self.conns.paused.borrow_mut();
+        let share = self.conns.limits.conn_inbound_share;
+        let mut armed = self.conns.armed.borrow_mut();
+        let mut gone = Vec::new();
+        paused.retain(|&fd| {
+            let Entry::Occupied(mut entry) = armed.entry(fd) else {
+                unreachable!("paused fd={fd} with no entry")
+            };
+            if entry.get().conn.is_gone() {
+                gone.push(entry.remove());
+                return false;
+            }
+            if entry.get().conn.q.borrow().over(share) {
+                return true;
+            }
+            entry.get_mut().arm(&mut self.ring.borrow_mut());
+            false
+        });
+        drop((paused, armed));
+        drop(gone); // the reactor's hold on those connections ends
+    }
 
     /// Send `body`'s whole byte range on `conn`. Loops on short sends; each kernel
     /// send has its own `Limits::client_send_timeout` deadline, past which the
