@@ -147,6 +147,13 @@ fn two_value_roundtrips_from_any_row() {
     }
     assert!(two_value_encode(&words(9, &|_| a)).is_none(), "one word");
     assert!(two_value_encode(&words(9, &|i| i as u64 % 3)).is_none(), "three words");
+    let third_last = words(131, &|i| if i == 130 { 7 } else { i as u64 % 2 });
+    assert!(two_value_encode(&third_last).is_none(), "a third word in the last row");
+    // Rows 128.. are the last byte's bits 0..=2: row 130 alone holds `value_b`.
+    let image = two_value_encode(&words(131, &|i| if i == 130 { b } else { a })).unwrap();
+    let mut bits = [0u8; 17];
+    bits[16] = 0b100;
+    assert_eq!(image[TWO_VALUE_BITS_AT..], bits, "no bit past the last row");
 }
 
 /// `n` distinct cells, cell `i` holding `i` in its low bytes.

@@ -12,6 +12,7 @@ use super::codebook::Codebook;
 use crate::repr::seek::{gallop_by, lower_bound_by};
 use crate::repr::PooledBuf;
 use crate::schema::SchemaDescriptor;
+use gnitz_expr::{null_bits, Level};
 use gnitz_wire::{
     read_u32_le, read_u64_le, write_u32_le, write_u64_le, CodedHeap, FixedInt, Heap, HeapValue, ScalarKind,
     SymbolTable, GERMAN_INLINE_OFF, MAX_PK_COLUMNS, MAX_SYMBOLS, MAX_SYMBOL_LEN, SHORT_STRING_THRESHOLD,
@@ -67,27 +68,27 @@ const TWO_VALUE_BITS_AT: usize = 16;
 /// A word region's TwoValue image, bit *i* set ⇔ row *i* holds `value_b`; or
 /// `None` unless the region holds exactly two distinct words.
 pub(crate) fn two_value_encode(src: &[u8]) -> Option<Vec<u8>> {
-    let n = src.len() / 8;
-    let first = read_u64_le(src, 0);
-    // Rows before the first second value hold `first`: their bits start 0.
-    let mut second: Option<(u64, Vec<u8>)> = None;
-    for i in 1..n {
-        let v = read_u64_le(src, i * 8);
-        if v == first {
-            continue;
+    let words = src.as_chunks::<8>().0;
+    let a = words[0];
+    let b = *words.iter().find(|w| **w != a)?;
+    let (a, b) = (u64::from_le_bytes(a), u64::from_le_bytes(b));
+    let mut image = vec![0u8; TWO_VALUE_BITS_AT + words.len().div_ceil(8)];
+    write_u64_le(&mut image, TWO_VALUE_A_AT, a);
+    write_u64_le(&mut image, TWO_VALUE_B_AT, b);
+    // A word of bits per 64 rows, beside one of the rows holding neither word.
+    for (rows, bits) in words.chunks(64).zip(image[TWO_VALUE_BITS_AT..].chunks_mut(8)) {
+        let (mut is_b, mut other) = (0u64, 0u64);
+        for (j, w) in rows.iter().enumerate() {
+            let v = u64::from_le_bytes(*w);
+            is_b |= ((v == b) as u64) << j;
+            other |= ((v != a && v != b) as u64) << j;
         }
-        let (b, image) = second.get_or_insert_with(|| {
-            let mut image = vec![0u8; TWO_VALUE_BITS_AT + n.div_ceil(8)];
-            write_u64_le(&mut image, TWO_VALUE_A_AT, first);
-            write_u64_le(&mut image, TWO_VALUE_B_AT, v);
-            (v, image)
-        });
-        if v != *b {
+        if other != 0 {
             return None;
         }
-        image[TWO_VALUE_BITS_AT + i / 8] |= 1 << (i % 8);
+        bits.copy_from_slice(&is_b.to_le_bytes()[..bits.len()]);
     }
-    second.map(|(_, image)| image)
+    Some(image)
 }
 
 /// A TwoValue image taken apart.
@@ -1242,35 +1243,74 @@ impl<'a> SparseImage<'a> {
         if out.is_empty() {
             return;
         }
-        let (before, nulls) = nulls.as_chunks::<8>().0.split_at(first_row % DECODE_BLOCK_ROWS);
-        let held = |word: &[u8; 8]| (u64::from_le_bytes(*word) >> pi & 1 == 0) as usize;
+        // A NULL row's cell, and one past the last value.
+        out.fill(0);
+        let level = Level::new();
+        let (before, nulls) = nulls.split_at(first_row % DECODE_BLOCK_ROWS * size_of::<u64>());
+        let mut bits = [0u64; HELD_CHUNK_ROWS / 64];
         let at = u32::from_le_bytes(self.ranks[first_row / DECODE_BLOCK_ROWS]) as usize;
-        let at = at + before.iter().map(held).sum::<usize>();
-        let cells = out.as_chunks_mut::<W>().0.iter_mut().zip(nulls.iter().map(held));
+        let at = at
+            + held_bits(level, before, pi, &mut bits)
+                .iter()
+                .map(|w| w.count_ones() as usize)
+                .sum::<usize>();
+        let cells = out.as_chunks_mut::<W>().0;
         match self.values {
             // `parse` admits a frame only under cells a u64 holds.
-            SparseValues::Framed(frame) => {
-                self.fill(cells, at, |at| *frame.at(at).to_le_bytes().first_chunk().unwrap())
-            }
-            SparseValues::Cells(values) => self.fill(cells, at, |at| *values[at * W..].first_chunk().unwrap()),
+            SparseValues::Framed(frame) => self.scatter(level, nulls, pi, cells, at, |at| {
+                *frame.at(at).to_le_bytes().first_chunk().unwrap()
+            }),
+            SparseValues::Cells(values) => self.scatter(level, nulls, pi, cells, at, |at| {
+                *values[at * W..].first_chunk().unwrap()
+            }),
         }
     }
 
-    /// Write each of `cells` — a cell, and whether its row holds a value — from
-    /// value `at` on. A cell past the last value is zero whatever its row holds.
+    /// Write value `at` on into each of `cells` whose row, by its word of
+    /// `nulls`, holds one, until the values run out.
     #[inline(always)]
-    fn fill<'c, const W: usize>(
+    fn scatter<const W: usize>(
         &self,
-        cells: impl Iterator<Item = (&'c mut [u8; W], usize)>,
+        level: Level,
+        nulls: &[u8],
+        pi: usize,
+        cells: &mut [[u8; W]],
         mut at: usize,
         value: impl Fn(usize) -> [u8; W],
     ) {
-        for (cell, held) in cells {
-            let held = held & (at < self.held) as usize;
-            *cell = if held != 0 { value(at) } else { [0; W] };
-            at += held;
+        let mut bits = [0u64; HELD_CHUNK_ROWS / 64];
+        let chunks = nulls
+            .chunks(HELD_CHUNK_ROWS * size_of::<u64>())
+            .zip(cells.chunks_mut(HELD_CHUNK_ROWS));
+        for (rows, cells) in chunks {
+            for (w, &word) in held_bits(level, rows, pi, &mut bits).iter().enumerate() {
+                for j in gnitz_wire::BitIter(word) {
+                    if at >= self.held {
+                        return;
+                    }
+                    cells[w * 64 + j] = value(at);
+                    at += 1;
+                }
+            }
         }
     }
+}
+
+/// Rows a Sparse decode gathers the null bits of at once.
+const HELD_CHUNK_ROWS: usize = 64 * 64;
+const _: () = assert!(DECODE_BLOCK_ROWS <= HELD_CHUNK_ROWS);
+
+/// One bit per row of `rows` (8-byte null words), set where bit `pi` of the
+/// row's word is clear, written to the leading words of `bits` and returned.
+fn held_bits<'b>(level: Level, rows: &[u8], pi: usize, bits: &'b mut [u64]) -> &'b [u64] {
+    let n = rows.len() / size_of::<u64>();
+    let bits = &mut bits[..n.div_ceil(64)];
+    null_bits(level, rows, 1 << pi, bits);
+    bits.iter_mut().for_each(|w| *w = !*w);
+    if let (Some(last), tail @ 1..) = (bits.last_mut(), n % 64) {
+        *last &= gnitz_wire::low_bits_mask(tail);
+    }
+    bits
 }
 
 #[cfg(test)]

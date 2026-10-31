@@ -106,6 +106,7 @@ pub use map::MapEval;
 pub use order::*;
 pub use program::*;
 pub use schema::*;
+pub use simd::{null_bits, Level};
 pub use view::*;
 
 #[cfg(test)]

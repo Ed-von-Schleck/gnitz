@@ -15,7 +15,7 @@
 
 use fearless_simd::{dispatch, f64x8, i64x8, mask64x8, prelude::*, u64x8, u8x64};
 
-pub(crate) use fearless_simd::Level;
+pub use fearless_simd::Level;
 
 /// A predicate over two register lanes, spelled once per row and once per
 /// vector. The two agree on every pair of bit patterns, the vector's mask read
@@ -235,7 +235,7 @@ fn or_member_bits<S: Simd, const N: usize>(simd: S, a: &[i64], set: &[i64; N], o
 /// bit `j` of word `w` is set iff row `w * 64 + j` is null in any column of
 /// `cols`. Whole words, so the bits past the last row are 0. A column *mask*,
 /// so a two-operand read gathers both columns in one pass.
-pub(crate) fn null_bits(level: Level, rows: &[u8], cols: u64, out: &mut [u64]) {
+pub fn null_bits(level: Level, rows: &[u8], cols: u64, out: &mut [u64]) {
     debug_assert_eq!(out.len(), (rows.len() / 8).div_ceil(64), "one bit per row");
     let (blocks, tail) = rows.as_chunks::<{ 64 * 8 }>();
     dispatch!(level, simd => null_bits_at(simd, blocks, cols, out));

@@ -95,6 +95,8 @@ fn shard_read_bench() {
     let i64_col = make_schema_u64_i64();
     let nullable_i64 = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, true)]);
     let one_in_ten = |i: usize| i.is_multiple_of(10).then_some(3_000_000_000 + i as u128);
+    // A full-range i64, which no frame shrinks.
+    let scattered = |i: usize| (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128;
 
     let tenants: Vec<String> = (0..50).map(|i| format!("tenant-{i:03}")).collect();
     let urls: Vec<String> = (0..2_000)
@@ -154,6 +156,16 @@ fn shard_read_bench() {
             }),
         ),
         (
+            "one nullable column, distinct 60-byte values, NULL in all but one row in a thousand",
+            build(nullable_string, N, |b, i| {
+                b.begin_row(i as u128 + 1, 1);
+                match i % 1000 {
+                    7 => b.put_string(&wide_string(i, 60)),
+                    _ => b.put_null(),
+                }
+            }),
+        ),
+        (
             "one nullable column, all NULL",
             build(nullable_string, N, |b, i| {
                 b.begin_row(i as u128 + 1, 1);
@@ -200,6 +212,20 @@ fn shard_read_bench() {
             build(nullable_i64, N, |b, i| {
                 b.begin_row(i as u128, 1);
                 b.put_opt_int(one_in_ten(i));
+            }),
+        ),
+        (
+            "a nullable i64, a full-range value in one row of ten and NULL in the rest",
+            build(nullable_i64, N, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_opt_int(i.is_multiple_of(10).then(|| scattered(i)));
+            }),
+        ),
+        (
+            "a nullable i64, a full-range value in 49 rows of 100 and NULL in the rest",
+            build(nullable_i64, N, |b, i| {
+                b.begin_row(i as u128, 1);
+                b.put_opt_int((i % 100 < 49).then(|| scattered(i)));
             }),
         ),
         (

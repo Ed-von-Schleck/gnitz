@@ -248,3 +248,43 @@ fn the_sample_sees_spread_and_adjacent_repeats() {
     assert!(column(&|i| i % 1000), "a thousand values, spread");
     assert!(column(&|i| i / 2), "each value in two adjacent rows");
 }
+
+/// An empty cell, as a NULL string reads, counts as a repeat only where empty
+/// cells are most of the sample.
+#[test]
+fn empty_cells_repeat_only_as_most_of_the_sample() {
+    let n = 4 * SAMPLE_RUN * SAMPLE_RUNS;
+    let column = |empty: &dyn Fn(usize) -> bool| {
+        let mut heap = Vec::new();
+        let cells: Vec<[u8; 16]> = (0..n)
+            .map(|i| {
+                let value = if empty(i) {
+                    String::new()
+                } else {
+                    format!("value-{i:012}")
+                };
+                gnitz_wire::encode_german_string(value.as_bytes(), &mut heap)
+            })
+            .collect();
+        sample_repeats(n, |row| gnitz_wire::german_string_content(&cells[row], &heap))
+    };
+    assert!(!column(&|i| i % 20 == 7), "one in twenty empty");
+    assert!(column(&|i| i % 10 != 7), "nine in ten empty");
+}
+
+/// A column of distinct long values NULL in all but a few rows is a dictionary
+/// of those few, which the sample sees none of twice.
+#[test]
+fn a_mostly_null_column_of_distinct_values_is_a_dictionary() {
+    let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::String, true)]);
+    let mut b = BatchBuilder::new(&schema);
+    for i in 0..8000usize {
+        b.begin_row(i as u128 + 1, 1);
+        match i % 1000 {
+            7 => b.put_string(&format!("{i:060}")),
+            _ => b.put_null(),
+        }
+        b.end_row();
+    }
+    assert_eq!(written_strings(&b.finish()), (8 * 60, Encoding::Dict));
+}

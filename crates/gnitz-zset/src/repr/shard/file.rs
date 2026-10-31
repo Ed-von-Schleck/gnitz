@@ -95,15 +95,23 @@ const SAMPLE_RUNS: usize = 64;
 /// Whether a sample of a column's `n` rows holds one content twice. The sample
 /// is runs of adjacent rows spread evenly over the column, so it sees a value
 /// repeated across the column and one repeated only in a run of neighbours. A
-/// NULL cell reads as zeroes or the empty string, so a column of mostly NULLs
-/// repeats.
+/// NULL string cell reads as the empty string, which counts as a repeat only
+/// where such cells are most of the sample; a NULL fixed cell reads as zeroes.
+/// Either way a column of mostly NULLs repeats.
 fn sample_repeats<'a>(n: usize, content: impl Fn(usize) -> &'a [u8]) -> bool {
     let stride = (n / SAMPLE_RUNS).max(SAMPLE_RUN);
     let mut seen = FxHashSet::default();
+    let (mut sampled, mut empty) = (0usize, 0usize);
     (0..n)
         .step_by(stride)
         .flat_map(|run| run..(run + SAMPLE_RUN).min(n))
-        .any(|row| !seen.insert(Content(content(row))))
+        .any(|row| {
+            sampled += 1;
+            let c = content(row);
+            empty += c.is_empty() as usize;
+            !c.is_empty() && !seen.insert(Content(c))
+        })
+        || empty * 2 > sampled
 }
 
 /// The Dict image of a column of `width`-byte cells, or `None` unless it is
