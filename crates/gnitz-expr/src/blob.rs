@@ -91,6 +91,7 @@ gnitz_wire::wire_enum! {
         StrPad = 43,
         StrSplitPart = 44,
         Calendar = 45,
+        StrColPrefix = 46,
     }
 }
 
@@ -170,6 +171,7 @@ impl LogicalInstr {
                 [ExprOp::StrColConst.as_wire(), op.as_wire(), c, const_idx.0, 0]
             }
             L::StrColCol { op, col_a, col_b } => [ExprOp::StrColCol.as_wire(), op.as_wire(), col_a, col_b, 0],
+            L::StrColPrefix { col: c, const_idx } => [ExprOp::StrColPrefix.as_wire(), 0, c, const_idx.0, 0],
             L::IntInSet { value_reg, set_idx } => [ExprOp::IntInSet.as_wire(), 0, value_reg.0 as u32, set_idx.0, 0],
             L::LoadColStr { col: c } => col(ExprOp::LoadColStr, 0, c),
             L::LoadConstStr { const_idx } => col(ExprOp::LoadConstStr, 0, const_idx.0),
@@ -285,6 +287,7 @@ impl LogicalInstr {
                 const_idx: ConstIdx(w3),
             },
             ExprOp::StrColCol => L::StrColCol { op: cmp_op()?, col_a: w2, col_b: w3 },
+            ExprOp::StrColPrefix => no_sel(L::StrColPrefix { col: w2, const_idx: ConstIdx(w3) })?,
             ExprOp::IntInSet => no_sel(L::IntInSet { value_reg: a, set_idx: ConstIdx(w3) })?,
             ExprOp::LoadColStr => no_sel(L::LoadColStr { col: w2 })?,
             ExprOp::LoadConstStr => no_sel(L::LoadConstStr { const_idx: ConstIdx(w2) })?,

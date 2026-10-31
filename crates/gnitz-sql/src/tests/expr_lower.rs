@@ -3,7 +3,7 @@ use crate::test_support::Cell::{self, Int, Null, Str, F64};
 use crate::test_support::{
     assert_rejects, batch_of, bind_sql, holds, holds_exact, two_col, typed_schema, CMP, EXACT_CASES,
 };
-use gnitz_expr::{ExprResults, FloatArithOp, IntUnaryOp, RowFilter};
+use gnitz_expr::{ConstIdx, ExprResults, FloatArithOp, IntUnaryOp, RowFilter};
 use gnitz_wire::as_le_bytes;
 use gnitz_wire::TypeCode as T;
 
@@ -171,6 +171,14 @@ fn the_string_forms_compute_their_values() {
             ("c1 NOT LIKE 'a%'", &[Str("ab")], Int(0)),
             ("UPPER(c1) LIKE 'A%'", &[Str("ab")], Int(1)),
             ("c1 LIKE 'a%'", &[Null], Null),
+            ("c1 LIKE 'a%'", &[Str("ab")], Int(1)),
+            ("c1 LIKE 'abc%'", &[Str("ab")], Int(0)),
+            ("c1 LIKE '%'", &[Str("")], Int(1)),
+            ("c1 LIKE 'ab'", &[Str("ab")], Int(1)),
+            ("c1 LIKE 'ab'", &[Str("abc")], Int(0)),
+            ("c1 NOT LIKE 'ab'", &[Str("abc")], Int(1)),
+            ("c1 LIKE 'ab'", &[Null], Null),
+            ("UPPER(c1) LIKE 'AB'", &[Str("ab")], Int(1)),
             ("c1 = 'ab'", &[Str("ab")], Int(1)),
             ("c1 IN ('a', 'b')", &[Str("b")], Int(1)),
             ("c1 || NULL", &[Str("a")], Null),
@@ -683,6 +691,36 @@ fn string_comparisons_fuse_over_columns_and_fall_back_to_registers() {
             ],
             "{op}"
         );
+    }
+}
+
+/// LIKE without wildcards lowers as `=`, and `'lit%'` over a string column as
+/// one prefix opcode over the cells; ILIKE and every other pattern or operand
+/// run the matcher.
+#[test]
+fn like_lowers_to_a_byte_compare_where_its_pattern_allows() {
+    let strings = [T::String, T::String];
+    assert_eq!(instrs("c1 LIKE 'abc'", &strings), instrs("c1 = 'abc'", &strings));
+    assert_eq!(
+        instrs("c1 NOT LIKE 'abc'", &strings),
+        instrs("NOT c1 = 'abc'", &strings)
+    );
+    assert_eq!(
+        instrs("UPPER(c1) LIKE 'ABC'", &strings),
+        instrs("UPPER(c1) = 'ABC'", &strings)
+    );
+    let prefix = lowered("c1 LIKE 'ab%'", &strings);
+    assert_eq!(prefix.instrs(), [L::StrColPrefix { col: 1, const_idx: ConstIdx(0) }]);
+    assert_eq!(prefix.const_strings(), [b"ab".to_vec()]);
+    let matched = |sql: &str| matches!(instrs(sql, &strings).last(), Some(L::StrLike { .. }));
+    for sql in [
+        "c1 ILIKE 'abc'",
+        "c1 ILIKE 'ab%'",
+        "c1 LIKE '%ab'",
+        "c1 LIKE 'a_b%'",
+        "UPPER(c1) LIKE 'AB%'",
+    ] {
+        assert!(matched(sql), "{sql}");
     }
 }
 

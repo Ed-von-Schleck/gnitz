@@ -459,6 +459,12 @@ pub enum LogicalInstr {
         col_a: u32,
         col_b: u32,
     },
+    /// `col LIKE 'lit%'`: whether German-string column `col` starts with the
+    /// text at `const_idx`.
+    StrColPrefix {
+        col: u32,
+        const_idx: ConstIdx,
+    },
     /// Integer set membership: `value_reg ∈ set[set_idx]`, over the strictly
     /// ascending pool of packed `N × 8-byte LE` values at const index `set_idx`,
     /// decoded once at `resolve_program`. NULL input propagates to NULL.
@@ -738,6 +744,13 @@ pub(crate) enum Instr {
         pi_a: u8,
         pi_b: u8,
     },
+    /// A German-string column against the prefix spanning `len` bytes at `off`
+    /// of `ResolvedProgram::const_arena`.
+    StrColPrefix {
+        pi: u8,
+        off: u32,
+        len: u32,
+    },
     /// Integer set membership: `value_reg ∈ ResolvedProgram::int_sets[set_idx]`.
     IntInSet {
         value_reg: u16,
@@ -994,6 +1007,15 @@ impl LogicalProgram {
         let nullable_slots = schema.nullable_payload_slots();
         // By payload slot, the cell width an instruction reads it at; 0 if none.
         let mut read_width = [0u8; PAYLOAD_SLOTS];
+        // Pool entry `ci`'s span of `const_arena`, copied in on first reference.
+        fn const_span(spans: &mut [Option<(u32, u32)>], arena: &mut Vec<u8>, pool: &[Vec<u8>], ci: u32) -> (u32, u32) {
+            *spans[ci as usize].get_or_insert_with(|| {
+                let bytes = &pool[ci as usize];
+                let span = (arena.len() as u32, bytes.len() as u32);
+                arena.extend_from_slice(bytes);
+                span
+            })
+        }
         // A string column's payload slot; the operand pass admitted it as one.
         let str_slot = |col: u32| {
             schema
@@ -1123,6 +1145,10 @@ impl LogicalProgram {
                     pi_a: str_slot(col_a),
                     pi_b: str_slot(col_b),
                 },
+                L::StrColPrefix { col, const_idx: ConstIdx(const_idx) } => {
+                    let (off, len) = const_span(&mut const_spans, &mut const_arena, &self.const_strings, const_idx);
+                    I::StrColPrefix { pi: str_slot(col), off, len }
+                }
                 L::IntInSet {
                     value_reg: Reg(value_reg),
                     set_idx: ConstIdx(set_idx),
@@ -1133,13 +1159,7 @@ impl LogicalProgram {
                 }
                 L::LoadColStr { col } => I::LoadColStr { pi: str_slot(col) },
                 L::LoadConstStr { const_idx: ConstIdx(const_idx) } => {
-                    let ci = const_idx as usize;
-                    let (off, len) = *const_spans[ci].get_or_insert_with(|| {
-                        let bytes = &self.const_strings[ci];
-                        let span = (const_arena.len() as u32, bytes.len() as u32);
-                        const_arena.extend_from_slice(bytes);
-                        span
-                    });
+                    let (off, len) = const_span(&mut const_spans, &mut const_arena, &self.const_strings, const_idx);
                     const_str_regs.push((dst, off, len));
                     continue;
                 }
@@ -1476,6 +1496,9 @@ fn operands(li: &LogicalInstr) -> Operands {
         L::StrColCol { op: _, col_a, col_b } => writes(WBool)
             .on_col(col_a, ColKind::StringCol)
             .on_col(col_b, ColKind::StringCol),
+        L::StrColPrefix { col, const_idx } => writes(WBool)
+            .on_col(col, ColKind::StringCol)
+            .with_pool(const_idx, PoolEntry::Text),
         // The string-register column load reads the same 16-byte cells the
         // `LogicalInstr::StrCol*` compares do, so it carries the same requirement.
         L::LoadColStr { col } => writes(WStr).on_col(col, ColKind::StringCol),
@@ -1598,7 +1621,7 @@ pub(crate) struct ResolvedProgram {
     /// in, so two instructions over one pattern get one each.
     pub(crate) like_matchers: Vec<LikeMatcher>,
     /// Every constant byte the program needs at run time: the spans a
-    /// `LoadConstStr` bakes in, and the heap half of each long `const_cells`
+    /// `LoadConstStr` bakes in and a `StrColPrefix` compares, and the heap half of each long `const_cells`
     /// entry. Holds only the constants some opcode names, so an unreferenced
     /// pool entry is not carried for the plan's life. Also the string arena's
     /// non-cleared prefix: the per-morsel reset truncates back to

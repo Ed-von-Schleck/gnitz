@@ -56,6 +56,20 @@ impl LikePattern {
         &self.0
     }
 
+    /// The text a pattern without wildcards matches exactly. A wildcard byte is
+    /// never UTF-8, so the text is the pattern exactly when it decodes.
+    pub fn literal(&self) -> Option<&str> {
+        std::str::from_utf8(&self.0).ok()
+    }
+
+    /// The text a `'lit%'` pattern matches as a prefix: a trailing run of `%`
+    /// and no other wildcard.
+    pub fn prefix(&self) -> Option<&str> {
+        let lit = self.0.strip_suffix(&[ANY_MANY])?;
+        let lit = &lit[..lit.iter().rposition(|&b| b != ANY_MANY).map_or(0, |i| i + 1)];
+        std::str::from_utf8(lit).ok()
+    }
+
     /// Whether `bytes` is a pattern [`Self::encode`] could produce: UTF-8 text
     /// between the wildcard bytes.
     pub(crate) fn is_encoding(bytes: &[u8]) -> bool {

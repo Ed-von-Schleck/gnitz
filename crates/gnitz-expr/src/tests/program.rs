@@ -287,6 +287,12 @@ fn each_column_opcode_admits_exactly_its_column_kinds() {
             accepts: STRS,
         },
         Rule {
+            name: "StrColPrefix",
+            over: |col| L::StrColPrefix { col, const_idx: ConstIdx(0) },
+            mismatch: ColKind::StringCol,
+            accepts: STRS,
+        },
+        Rule {
             name: "StrColCol a",
             over: |col_a| L::StrColCol {
                 op: CmpOp::Eq,

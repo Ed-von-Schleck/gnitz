@@ -826,6 +826,47 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
     }
 }
 
+/// `StrColPrefix` agrees with the LIKE matcher on `'lit%'` for every literal
+/// length up to two past the inline limit, against every string length up to
+/// twenty: strings that carry the literal, and ones that leave it in the 4-byte
+/// prefix or past it, inline and on the heap, with NULL rows, over more than one
+/// morsel.
+#[test]
+fn the_fused_prefix_agrees_with_the_like_matcher() {
+    let text: &[u8] = b"abcdefghijklmnopqrst";
+    let mut corpus: Vec<Vec<u8>> = Vec::new();
+    for n in 0..=text.len() {
+        corpus.push(text[..n].to_vec());
+        for at in [0, 3, 5, 11, 13] {
+            if at < n {
+                let mut s = text[..n].to_vec();
+                s[at] = b'Z';
+                corpus.push(s);
+            }
+        }
+    }
+    let rows = MORSEL + corpus.len() * 3;
+    for nullable in [false, true] {
+        let null = |row: usize| nullable && row.is_multiple_of(5);
+        let schema = schema_pk_strings(1, nullable);
+        let view = make_string_view(&schema, rows, |row, _| &corpus[row % corpus.len()], |row, _| null(row));
+        for l in 0..=gnitz_wire::SHORT_STRING_THRESHOLD + 2 {
+            let lit = &text[..l];
+            let pattern = crate::LikePattern::encode(&format!("{}%", std::str::from_utf8(lit).unwrap()), None).unwrap();
+            let matcher = crate::LikeMatcher::compile(pattern.as_bytes(), false);
+            let want: Vec<Option<i128>> = (0..rows)
+                .map(|row| (!null(row)).then(|| matcher.matches(&corpus[row % corpus.len()], &mut Vec::new()) as i128))
+                .collect();
+            let fused = vec![LogicalInstr::StrColPrefix { col: 1, const_idx: ConstIdx(0) }];
+            assert_eq!(
+                verdicts(&schema, fused, vec![lit.to_vec()], &view),
+                want,
+                "nullable={nullable} prefix length {l}"
+            );
+        }
+    }
+}
+
 /// The fused compares name pool entries 2 then 1 behind an IN set at 0; both
 /// constants live on the program's heap.
 #[test]

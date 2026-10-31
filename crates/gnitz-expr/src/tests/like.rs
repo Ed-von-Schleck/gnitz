@@ -150,6 +150,28 @@ fn each_pattern_specializes_to_its_shape() {
     }
 }
 
+/// The text a pattern matches exactly, and the text it matches as a prefix.
+#[test]
+fn a_pattern_names_its_literal_and_its_prefix() {
+    for (pattern, literal, prefix) in [
+        ("", Some(""), None),
+        ("abc", Some("abc"), None),
+        (r"a\%b", Some("a%b"), None),
+        ("lit%", None, Some("lit")),
+        ("lit%%", None, Some("lit")),
+        ("%", None, Some("")),
+        (r"a\%%", None, Some("a%")),
+        ("é%", None, Some("é")),
+        ("%lit", None, None),
+        ("a%b%", None, None),
+        ("a_%", None, None),
+        ("_", None, None),
+    ] {
+        let p = LikePattern::encode(pattern, Some('\\')).unwrap();
+        assert_eq!((p.literal(), p.prefix()), (literal, prefix), "{pattern:?}");
+    }
+}
+
 /// ILIKE folds the haystack only for the scanning shapes; an anchored one reads
 /// just the literal's length of it in place.
 #[test]

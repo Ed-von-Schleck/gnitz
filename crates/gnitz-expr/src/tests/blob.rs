@@ -110,7 +110,7 @@ fn the_blob_layout_is_pinned_to_its_version_word() {
             gnitz_wire::checksum(&vocabulary),
             gnitz_wire::EXPR_BLOB_VERSION
         ),
-        (want, 3025886851799597962, 8),
+        (want, 17023075754260568460, 8),
         "the expr-blob layout or opcode vocabulary changed: bump EXPR_BLOB_VERSION if a number moved, \
          then paste what is reported here"
     );
@@ -322,7 +322,7 @@ fn a_forged_selector_is_refused_at_decode() {
 /// The number of [`LogicalInstr`] variants. A new variant stops the match below
 /// compiling until it is listed and counted.
 impl LogicalInstr {
-    const VARIANT_COUNT: usize = 45;
+    const VARIANT_COUNT: usize = 46;
 
     /// Exhaustive by construction — the compile error on a new variant is the
     /// whole point, so this must never gain a `_` arm.
@@ -353,6 +353,7 @@ impl LogicalInstr {
             | L::IsNullReg { .. }
             | L::StrColConst { .. }
             | L::StrColCol { .. }
+            | L::StrColPrefix { .. }
             | L::IntInSet { .. }
             | L::LoadColStr { .. }
             | L::LoadConstStr { .. }
@@ -430,6 +431,7 @@ fn every_register_operand_is_checked_read_before_write() {
                 | L::IsNull { .. }
                 | L::StrColConst { .. }
                 | L::StrColCol { .. }
+                | L::StrColPrefix { .. }
                 | L::LoadColStr { .. }
                 | L::LoadConstStr { .. }
                 | L::LoadNullStr

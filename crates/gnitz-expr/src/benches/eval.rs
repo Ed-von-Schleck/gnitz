@@ -30,17 +30,21 @@ fn k(val: i64) -> LogicalInstr {
 /// `abcd-shared-prefix` differ only in whether the prefix the fused compare
 /// short-circuits on collides; `long` and `long-distinct` only in whether the
 /// heap strings share theirs.
+///
+/// `col LIKE 'prefix%'` runs the same domains through the fused `StrColPrefix`
+/// and through the matcher over a string register, and `col LIKE 'const'`
+/// through the matcher, which the planner lowers to the fused `eq` instead.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn str_const_filter_bench() {
     let meter = Meter::new();
     let schema = schema_pk_strings(1, false);
     let n = 1_000_000usize;
-    // (domain, constant, value per row). In `mixed` ~1/16 rows match and every
-    // 7th row is a long (heap-backed) string.
-    type Domain = (&'static str, &'static str, fn(usize) -> String);
+    // (domain, constant, LIKE prefix, value per row). In `mixed` ~1/16 rows
+    // match and every 7th row is a long (heap-backed) string.
+    type Domain = (&'static str, &'static str, &'static str, fn(usize) -> String);
     let domains: [Domain; 5] = [
-        ("mixed", "match_target", |row| {
+        ("mixed", "match_target", "match", |row| {
             if row % 16 == 0 {
                 "match_target".to_string()
             } else if row % 7 == 0 {
@@ -49,19 +53,24 @@ fn str_const_filter_bench() {
                 format!("k{}", row % 97)
             }
         }),
-        ("long", "long_string_variant_number_42", |row| {
-            format!("long_string_variant_number_{}", row % 97)
-        }),
+        (
+            "long",
+            "long_string_variant_number_42",
+            "long_string_variant_number_4",
+            |row| format!("long_string_variant_number_{}", row % 97),
+        ),
         // The controlled pair: `{i}abcd` and `abcd{i}` hold the same bytes at the
         // same lengths, so the prefix is the only thing that differs.
-        ("long-distinct", "42_long_string_variant_number", |row| {
+        ("long-distinct", "42_long_string_variant_number", "42_long", |row| {
             format!("{}_long_string_variant_number", row % 97)
         }),
-        ("digits-first", "42abcd", |row| format!("{}abcd", row % 97)),
-        ("abcd-shared-prefix", "abcd42", |row| format!("abcd{}", row % 97)),
+        ("digits-first", "42abcd", "42", |row| format!("{}abcd", row % 97)),
+        ("abcd-shared-prefix", "abcd42", "abcd4", |row| {
+            format!("abcd{}", row % 97)
+        }),
     ];
 
-    for (domain, constant, value) in domains {
+    for (domain, constant, prefix, value) in domains {
         let mb = make_string_view(&schema, n, |row, _| value(row), |_, _| false);
         for (name, op) in [("eq", CmpOp::Eq), ("ne", CmpOp::Ne), ("lt", CmpOp::Lt)] {
             let consts = vec![constant.as_bytes().to_vec()];
@@ -87,6 +96,40 @@ fn str_const_filter_bench() {
             for (chan, ev) in [("fused", &mut fused), ("registers", &mut regs)] {
                 meter.filter("str_const_filter_bench", &format!("{domain}/{name}/{chan}"), ev, &mb);
             }
+        }
+        let matcher = |pattern: String| {
+            let pattern = LikePattern::encode(&pattern, None).unwrap().as_bytes().to_vec();
+            filter_prog(
+                &schema,
+                vec![
+                    L::LoadColStr { col: 1 },
+                    L::StrLike {
+                        src: Reg(0),
+                        pat_idx: ConstIdx(0),
+                        ci: false,
+                    },
+                ],
+                vec![pattern],
+            )
+        };
+        let mut fused = filter_prog(
+            &schema,
+            vec![L::StrColPrefix { col: 1, const_idx: ConstIdx(0) }],
+            vec![prefix.as_bytes().to_vec()],
+        );
+        let mut regs = matcher(format!("{prefix}%"));
+        assert_eq!(
+            passing_rows(&mut fused, &mb),
+            passing_rows(&mut regs, &mb),
+            "{domain}/like-prefix: the channels disagree"
+        );
+        let mut exact = matcher(constant.to_string());
+        for (chan, ev) in [
+            ("like-prefix/fused", &mut fused),
+            ("like-prefix/registers", &mut regs),
+            ("like-exact/registers", &mut exact),
+        ] {
+            meter.filter("str_const_filter_bench", &format!("{domain}/{chan}"), ev, &mb);
         }
     }
 }

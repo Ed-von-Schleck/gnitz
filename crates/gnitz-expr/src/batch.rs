@@ -17,7 +17,7 @@ use std::fmt;
 use crate::chars::{char_count, char_offset, char_offset_back, reverse_chars};
 use crate::map::{Emit, EmitStore};
 use crate::program::{FloatUnaryOp, IntArithOp, IntOrder, IntReg, IntUnaryOp};
-use crate::search::{fields, find};
+use crate::search::{fields, find, lit_eq};
 use crate::simd::{self, decode_f64, encode_f64, LanePred, Level};
 use crate::{calendar, BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram};
 use gnitz_wire::{
@@ -846,15 +846,33 @@ fn str_to_scalar<const S: usize>(
     let mut bad = [0u8; MORSEL];
     {
         let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
-        // Every window cut to the morsel: relating them is what lets LLVM drop
-        // the sources' per-row bounds checks.
-        let srcs = strs.map(|r| str_lane(str_views, r as usize, mo.m));
         let rd = &mut regs[dst as usize].lanes[..mo.m];
-        for (i, r) in rd.iter_mut().enumerate() {
-            *r = f(srcs.map(|v| view_bytes(v[i], str_arena, mo.bufs))).unwrap_or_else(|| {
-                bad[i] = 1;
-                0
-            });
+        if const { S == 1 } {
+            // Every window cut to the morsel: relating them is what lets LLVM
+            // drop the sources' per-row bounds checks.
+            let srcs = strs.map(|r| str_lane(str_views, r as usize, mo.m));
+            for (i, r) in rd.iter_mut().enumerate() {
+                *r = f(srcs.map(|v| view_bytes(v[i], str_arena, mo.bufs))).unwrap_or_else(|| {
+                    bad[i] = 1;
+                    0
+                });
+            }
+        } else {
+            // Each operand resolved to bytes a column at a time: resolving them
+            // per row through a nested array map is an out-of-line call per
+            // operand per row.
+            let mut cols: [[&[u8]; MORSEL]; S] = [[&[]; MORSEL]; S];
+            for (c, &reg) in cols.iter_mut().zip(&strs) {
+                for (d, &v) in c[..mo.m].iter_mut().zip(str_lane(str_views, reg as usize, mo.m)) {
+                    *d = view_bytes(v, str_arena, mo.bufs);
+                }
+            }
+            for (i, r) in rd.iter_mut().enumerate() {
+                *r = f(std::array::from_fn(|k| cols[k][i])).unwrap_or_else(|| {
+                    bad[i] = 1;
+                    0
+                });
+            }
         }
     }
     null_or_all(scratch, mo, dst, strs.into_iter());
@@ -1140,27 +1158,78 @@ fn eval_str_eq<A: Cells, B: Cells>(
         *eq = ((a0 == b0) & (a1 == b1) & !long) as u8;
         *long_match = ((a0 == b0) & long) as u8;
     }
+    settle_long(scratch, mo, dst, &eq, &long_match, ne, |i| {
+        german_string_content(a.cells.cell(i), a.blob) == german_string_content(b.cells.cell(i), b.blob)
+    });
+}
+
+/// A string compare's verdicts into `dst`, negated when `negate`: true at each
+/// row of `hit`, which the cell pass settled, and at each row of `long` that
+/// `resolve` — the heap read — holds.
+#[inline(always)]
+fn settle_long(
+    scratch: &mut EvalScratch,
+    mo: &Morsel<'_>,
+    dst: u16,
+    hit: &[u8; MORSEL],
+    long: &[u8; MORSEL],
+    negate: bool,
+    resolve: impl Fn(usize) -> bool,
+) {
     let words = mo.m.div_ceil(64);
-    let mut eq_bits = [0u64; NULL_WORDS_PER_REG];
-    pack_bytes(&eq, &mut eq_bits);
+    let mut bits = [0u64; NULL_WORDS_PER_REG];
+    pack_bytes(hit, &mut bits);
     // A fold rather than `any`: with no early exit it vectorizes.
-    if long_match.iter().fold(0u8, |acc, &c| acc | c) != 0 {
+    if long.iter().fold(0u8, |acc, &c| acc | c) != 0 {
         let mut pending = [0u64; NULL_WORDS_PER_REG];
-        pack_bytes(&long_match, &mut pending);
+        pack_bytes(long, &mut pending);
         for (w, &word) in pending.iter().enumerate().take(words) {
             for j in gnitz_wire::BitIter(word) {
-                let (ca, cb) = (a.cells.cell(w * 64 + j), b.cells.cell(w * 64 + j));
-                let same = german_string_content(ca, a.blob) == german_string_content(cb, b.blob);
-                eq_bits[w] |= (same as u64) << j;
+                bits[w] |= (resolve(w * 64 + j) as u64) << j;
             }
         }
     }
-    let flip = if ne { u64::MAX } else { 0 };
-    for (w, &bits) in eq_bits.iter().enumerate().take(words) {
+    let flip = if negate { u64::MAX } else { 0 };
+    for (w, &bits) in bits.iter().enumerate().take(words) {
         // Whole words; a verdict's reader masks past the last row.
         scratch.regs[dst as usize].bools[w] = bits ^ flip;
     }
     maybe_unpack_bool_to_regs(scratch, mo, dst);
+}
+
+/// `LIKE 'lit%'` over a German-string column: one branch-free pass over the
+/// cells settles every short row, and every row when the literal fits the
+/// 4-byte prefix; only a long row whose length and prefix admit the literal
+/// reads the heap.
+#[inline(never)]
+fn eval_str_prefix<A: Cells>(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: StrOperand<'_, A>, lit: &[u8]) {
+    fill_null_bits_mask(scratch, dst, mo, a.null_bit);
+    let l = lit.len();
+    let in_cell = l.min(gnitz_wire::SHORT_STRING_THRESHOLD);
+    let mut want = [0u8; 16];
+    want[gnitz_wire::GERMAN_INLINE_OFF..][..in_cell].copy_from_slice(&lit[..in_cell]);
+    // The literal's bytes in each cell word: the prefix half of the first, the
+    // inline tail of the second. A short cell's own bytes past the literal are
+    // masked off, so its zero padding is never read.
+    let m0 = low_bits_mask(8 * in_cell.min(4)) << 32;
+    let m1 = low_bits_mask(8 * in_cell.saturating_sub(4));
+    let (w0, w1) = cell_words(&want);
+    let (l0, l1) = (w0 & m0, w1 & m1);
+    let short_lit = l <= 4;
+    let (mut hit, mut long_match) = ([0u8; MORSEL], [0u8; MORSEL]);
+    let cells = a.cells.iter().take(mo.m);
+    for ((hit, long_match), c) in hit.iter_mut().zip(&mut long_match).zip(cells) {
+        let (c0, c1) = cell_words(c);
+        let len = c0 as u32 as usize;
+        let long = len > gnitz_wire::SHORT_STRING_THRESHOLD;
+        let head = (len >= l) & ((c0 & m0) == l0);
+        *hit = (head & ((c1 & m1) == l1) & (!long | short_lit)) as u8;
+        *long_match = (head & long & !short_lit) as u8;
+    }
+    settle_long(scratch, mo, dst, &hit, &long_match, false, |i| {
+        let head = german_string_content(a.cells.cell(i), a.blob).get(..l);
+        head.is_some_and(|h| lit_eq(h, lit))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1647,6 +1716,13 @@ fn eval_batch(morsel: &Morsel<'_>, scratch: &mut EvalScratch) {
                 dst,
                 StrOperand::column(pi_a, mo),
                 StrOperand::column(pi_b, mo),
+            ),
+            Instr::StrColPrefix { pi, off, len } => eval_str_prefix(
+                scratch,
+                mo,
+                dst,
+                StrOperand::column(pi, mo),
+                &prog.const_arena[off as usize..][..len as usize],
             ),
 
             // ----------------------------------------------------------------
