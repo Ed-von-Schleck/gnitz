@@ -1,5 +1,5 @@
-//! How one committer batch is drained off the request channel, and how a pause
-//! is released. The SAL layout and the checkpoint sequence need a live
+//! How one committer batch is drained off the request channel, how a merged
+//! run is taken back as its writes, and how a pause is released. The SAL layout and the checkpoint sequence need a live
 //! dispatcher and worker ACKs, so they are covered end to end.
 
 use super::*;
@@ -116,4 +116,50 @@ fn a_pause_resumes_the_committer_when_released() {
     assert!(try_poll_once(&mut resume).is_none(), "held while the token lives");
     drop(paused);
     assert!(try_poll_once(&mut resume).is_some());
+}
+
+/// A merged run taken back is its clients' writes again: each client's rows,
+/// in its own write, answered on its own channel.
+#[test]
+fn a_merged_run_splits_back_into_its_writes() {
+    let schema = make_schema_u64_i64();
+    let parts: Vec<Batch> = [0u64..2, 2..2, 2..5]
+        .into_iter()
+        .map(|pks| make_batch_raw(&schema, &pks.map(|pk| (pk, pk as i64 + 1, 0)).collect::<Vec<_>>()))
+        .collect();
+    let (dones, mut rxs): (Vec<_>, Vec<_>) = parts
+        .iter()
+        .map(|part| {
+            let (done, rx) = oneshot::channel();
+            ((done, part.len()), rx)
+        })
+        .unzip();
+    let unit = CommitUnit {
+        outcome: Outcome::Laid {
+            families: vec![TxnFamily {
+                tid: 7,
+                mode: WireConflictMode::Update,
+                batch: Batch::concat(&schema, parts.iter().map(Batch::as_mem_batch)),
+            }],
+            in_zone: false,
+        },
+        dones,
+    };
+    let writes = unit.into_writes();
+    assert_eq!(writes.len(), parts.len());
+    let rows = |b: &Batch| {
+        (0..b.len())
+            .map(|r| (b.get_pk_bytes(r).to_vec(), b.get_weight(r)))
+            .collect::<Vec<_>>()
+    };
+    for (i, (w, part)) in writes.into_iter().zip(&parts).enumerate() {
+        let [f] = &w.families[..] else {
+            panic!("write {i} is one family")
+        };
+        assert_eq!((f.tid, rows(&f.batch)), (7, rows(part)), "write {i}");
+        w.done.send(Ok(i as u64));
+    }
+    for (i, rx) in rxs.iter_mut().enumerate() {
+        assert_eq!(try_poll_once(rx), Some(Ok(i as u64)), "client {i}");
+    }
 }

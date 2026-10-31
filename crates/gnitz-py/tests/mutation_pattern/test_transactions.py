@@ -8,6 +8,7 @@ per-frame conflict modes only the binding exposes.
 """
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import gnitz
@@ -146,3 +147,33 @@ def test_a_bundle_the_sal_cannot_hold_rolls_back_whole(own_server):
 
         client.push(a, gnitz.ZSetBatch(schema).extend([{"pk": 1, "pad": "y"}]))
         assert bag(scanned(client, "a")) == {(1, "y"): 1}
+
+
+@pytest.mark.parametrize("concurrent", [False, True], ids=["one after another", "concurrent"])
+def test_pushes_that_each_fit_the_sal_all_commit(own_server, concurrent):
+    """Eight ~2.7 MB pushes to one table on a 16 MiB SAL whose checkpoint
+    threshold is the whole log, so only a refusal makes room: each fits an empty
+    log, the eight together do not. Whether they arrive one after another or
+    are coalesced into one committer batch, every push commits."""
+    schema = gnitz.Schema([gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+                           gnitz.ColumnDef("pad", gnitz.TypeCode.STRING)], [0])
+    pad, pushes, per_push = "x" * 8_000, 8, 340
+    target = own_server.start(extra_env={
+        "GNITZ_SAL_BYTES": str(16 * 1024 * 1024),
+        "GNITZ_CHECKPOINT_BYTES": str(16 * 1024 * 1024)}).target
+    with gnitz.connect(target) as client:
+        tid = client.create_table("t", schema)
+
+    def push(n):
+        with gnitz.connect(target) as c:
+            c.push(tid, gnitz.ZSetBatch(schema).extend(
+                [{"pk": i, "pad": pad} for i in range(n * per_push, (n + 1) * per_push)]))
+
+    if concurrent:
+        with ThreadPoolExecutor(pushes) as pool:
+            list(pool.map(push, range(pushes)))
+    else:
+        for n in range(pushes):
+            push(n)
+    with gnitz.connect(target) as client:
+        assert bag(scanned(client, "t")) == {(i, pad): 1 for i in range(pushes * per_push)}

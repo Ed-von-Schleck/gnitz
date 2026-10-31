@@ -7,7 +7,7 @@ use super::Shared;
 use crate::runtime::reactor::AckLease;
 use crate::runtime::signals;
 use crate::runtime::sync::{chan, oneshot};
-use gnitz_wire::WireFault;
+use gnitz_wire::{WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
@@ -156,8 +156,16 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
             run_checkpoint_sequence(&shared).await;
         }
 
-        if !writes.is_empty() {
-            commit_writes(&shared, writes).await;
+        // A write the SAL refused for want of room goes again behind a
+        // checkpoint, merged with none, until each has committed or been refused
+        // on an empty log.
+        let (mut writes, mut merge) = (writes, true);
+        while !writes.is_empty() {
+            writes = commit_writes(&shared, writes, merge).await;
+            if !writes.is_empty() {
+                run_checkpoint_sequence(&shared).await;
+                merge = false;
+            }
         }
 
         match end {
@@ -251,8 +259,9 @@ async fn run_checkpoint_sequence(shared: &Shared) {
 /// the clients waiting on their shared verdict.
 struct CommitUnit {
     outcome: Outcome,
-    /// The coalesced clients of a merged run, or a write's one client.
-    dones: Vec<oneshot::Sender<Result<u64, WireFault>>>,
+    /// The coalesced clients of a merged run, or a write's one client, each
+    /// with the rows it wrote.
+    dones: Vec<(oneshot::Sender<Result<u64, WireFault>>, usize)>,
 }
 
 /// Where a [`CommitUnit`] stands.
@@ -274,6 +283,37 @@ impl CommitUnit {
         }
     }
 
+    /// A run of several clients' writes merged into one.
+    fn is_merged(&self) -> bool {
+        self.dones.len() > 1
+    }
+
+    /// The unit as the writes it was built from: a merged run split back into
+    /// its clients' pushes, by the rows each wrote.
+    fn into_writes(self) -> Vec<PendingWrite> {
+        let merged = self.is_merged();
+        let Outcome::Laid { mut families, .. } = self.outcome else {
+            unreachable!("only a unit not yet laid out is taken back")
+        };
+        if !merged {
+            let (done, _) = self.dones.into_iter().next().expect("a unit answers one client");
+            return vec![PendingWrite { families, done }];
+        }
+        let TxnFamily { tid, mode, batch } = families.pop().expect("a merged run is one family");
+        let mut start = 0;
+        (self.dones.into_iter())
+            .map(|(done, rows)| {
+                let range = (start, start + rows);
+                start += rows;
+                let batch = Batch::from_ranges(&batch, &[range], 0);
+                PendingWrite {
+                    families: vec![TxnFamily { tid, mode, batch }],
+                    done,
+                }
+            })
+            .collect()
+    }
+
     /// Answer every client: the zone LSN for a unit a restart recovers, `0` for
     /// one it does not.
     fn resolve(self, zone_lsn: u64) {
@@ -281,7 +321,7 @@ impl CommitUnit {
             Outcome::Laid { in_zone, .. } => Ok(if in_zone { zone_lsn } else { 0 }),
             Outcome::Failed(e) => Err(e),
         };
-        for done in self.dones {
+        for (done, _) in self.dones {
             done.send(result.clone());
         }
     }
@@ -302,7 +342,12 @@ fn write_disjoint_tables(units: &[CommitUnit]) -> bool {
 /// tick and submits the fsync SQE under one SAL hold, then awaits the worker
 /// ACKs and, when the batch opened a zone, the fsync. Only then are the
 /// validation caches updated and the writers answered.
-async fn commit_writes(shared: &Shared, mut writes: Vec<PendingWrite>) {
+///
+/// Returns the writes to commit again behind a checkpoint: the first unit the
+/// SAL had no room for, and every unit after it. A unit of one write refused on
+/// an empty log never fits and fails instead. A merged run comes back as the
+/// writes it merged, which a batch that does not `merge` commits one by one.
+async fn commit_writes(shared: &Shared, mut writes: Vec<PendingWrite>, merge: bool) -> Vec<PendingWrite> {
     // One-family writes in tid runs. Stable: arrival order within a run is what
     // makes intra-batch last-insert-wins mean last *inserted*.
     writes.sort_by_key(|w| (w.families.len() != 1, w.families[0].tid));
@@ -314,14 +359,15 @@ async fn commit_writes(shared: &Shared, mut writes: Vec<PendingWrite>) {
     let mut units: Vec<CommitUnit> = Vec::with_capacity(writes.len());
     let mut remaining = writes.into_iter().peekable();
     while let Some(PendingWrite { mut families, done }) = remaining.next() {
-        let mut dones = vec![done];
-        if let [head] = &mut families[..] {
+        let rows = |families: &[TxnFamily]| families.iter().map(|f| f.batch.len()).sum::<usize>();
+        let mut dones = vec![(done, rows(&families))];
+        if let ([head], true) = (&mut families[..], merge) {
             // The run's batches behind its first. A single push ships the
             // client's batch as it stands, so the dominant case builds no `Vec`.
             let mut tail: Vec<Batch> = Vec::new();
             while let Some(next) = remaining.next_if(|w| matches!(&w.families[..], [f] if f.tid == head.tid)) {
+                dones.push((next.done, rows(&next.families)));
                 tail.extend(next.families.into_iter().map(|f| f.batch));
-                dones.push(next.done);
             }
             if !tail.is_empty() {
                 head.batch = Batch::concat(
@@ -336,7 +382,7 @@ async fn commit_writes(shared: &Shared, mut writes: Vec<PendingWrite>) {
         });
     }
     debug_assert!(
-        write_disjoint_tables(&units),
+        !merge || write_disjoint_tables(&units),
         "two units of one batch write one table, so the sort reordered them"
     );
 
@@ -344,7 +390,7 @@ async fn commit_writes(shared: &Shared, mut writes: Vec<PendingWrite>) {
     // Phase B (under the SAL writer): emit SAL groups, queue their tids for the
     // tick, submit fsync SQE. The batch's recoverable groups form one zone.
     // ------------------------------------------------------------------
-    let (zone_lsn, synced, leases) = {
+    let (zone_lsn, synced, leases, again) = {
         let disp = &shared.dispatcher;
         let mut excl = disp.sal().lock().await;
 
@@ -359,7 +405,9 @@ async fn commit_writes(shared: &Shared, mut writes: Vec<PendingWrite>) {
         let mut leases: Vec<AckLease> = Vec::with_capacity(units.len());
         // A unit is all-or-nothing: a family that does not fit takes back the
         // unit's earlier families, which were never published.
-        for unit in &mut units {
+        let mut refused_at = None;
+        for (at, unit) in units.iter_mut().enumerate() {
+            let fits_nowhere = scope.log_is_empty() && !unit.is_merged();
             let written = scope.all_or_nothing(|scope| {
                 (unit.laid().iter())
                     .map(|f| disp.write_commit_group(scope, f.tid, &f.batch))
@@ -372,9 +420,14 @@ async fn commit_writes(shared: &Shared, mut writes: Vec<PendingWrite>) {
                     }
                     leases.extend(groups.into_iter().map(|(lease, _)| lease));
                 }
+                Err(e) if e.status == WireStatus::SalFull && !fits_nowhere => {
+                    refused_at = Some(at);
+                    break;
+                }
                 Err(e) => unit.outcome = Outcome::Failed(e),
             }
         }
+        let again = refused_at.map_or_else(Vec::new, |at| units.split_off(at));
 
         let synced = scope.commit().then(|| excl.sync(disp.reactor()));
         // The auto-tick this may fire overlaps the ACKs and the fsync.
@@ -382,7 +435,7 @@ async fn commit_writes(shared: &Shared, mut writes: Vec<PendingWrite>) {
             &excl,
             units.iter().flat_map(CommitUnit::laid).map(|f| (f.tid, f.batch.len())),
         );
-        (zone_lsn, synced, leases)
+        (zone_lsn, synced, leases, again)
     };
 
     // ------------------------------------------------------------------
@@ -408,6 +461,7 @@ async fn commit_writes(shared: &Shared, mut writes: Vec<PendingWrite>) {
     for unit in units {
         unit.resolve(zone_lsn);
     }
+    again.into_iter().flat_map(CommitUnit::into_writes).collect()
 }
 
 #[cfg(test)]

@@ -1174,6 +1174,12 @@ impl SalScope<'_, '_> {
         Ok(())
     }
 
+    /// Nothing is laid out in the epoch, this scope included: a group refused
+    /// here does not fit an empty log.
+    pub(crate) fn log_is_empty(&self) -> bool {
+        self.excl.writer.write_cursor.get() == 0
+    }
+
     /// Run `f`, and take back every group it laid out when it fails: nothing in
     /// a scope is published, so restoring the cursor, the zone's last member and
     /// whether it pushes is the whole undo.
