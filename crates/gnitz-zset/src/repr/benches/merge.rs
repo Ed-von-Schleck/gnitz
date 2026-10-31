@@ -381,3 +381,67 @@ fn two_way_tiny_bench() {
         }
     }
 }
+
+/// Instructions per input row of the N-way fold over string sources that each
+/// lose rows to cancellation in another, so every carried heap is charged the
+/// long bytes its dropped rows leave behind. `k` sources hold interleaved keys;
+/// every 20th key is retracted, at the same payload, by the next source. `k = 1`
+/// is a consolidation of one batch holding both halves of each cancelling pair.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn n_way_string_cancel_bench() {
+    use crate::test_support::make_schema_pk_u64_payload_string;
+    const KEYS: usize = 1 << 18;
+    let instructions = Counter::instructions();
+    let schema = make_schema_pk_u64_payload_string();
+    for k in [16usize, 2, 1] {
+        let mut rows: Vec<Vec<(u128, i64, u64)>> = vec![Vec::new(); k];
+        for key in 0..KEYS {
+            rows[key % k].push((key as u128, 1, key as u64));
+            if key % 20 == 0 {
+                rows[(key + 1) % k].push((key as u128, -1, key as u64));
+            }
+        }
+        let rows_in: usize = rows.iter().map(Vec::len).sum();
+        let (label, kernel): (&str, Box<dyn Fn() -> Batch>) = match k {
+            1 => {
+                // The pairs stand adjacent and unsummed: consolidation folds them.
+                let mut b = BatchBuilder::new(&schema);
+                for &(pk, w, seed) in &rows[0] {
+                    b.begin_row(pk, w);
+                    b.put_string(&format!("{seed:028}"));
+                    b.end_row();
+                }
+                let b = b.finish();
+                ("consolidate", Box::new(move || b.to_consolidated()))
+            }
+            _ => {
+                let batches: Vec<Batch> = rows
+                    .iter_mut()
+                    .map(|r| {
+                        r.sort_unstable();
+                        seeded_batch(&schema, r)
+                    })
+                    .collect();
+                (
+                    "merge_rows",
+                    Box::new(move || {
+                        let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
+                        merge_rows(&mem, &schema)
+                    }),
+                )
+            }
+        };
+        let out = kernel();
+        assert_eq!(out.len(), KEYS - KEYS.div_ceil(20), "k={k}: every pair cancels");
+        assert!(out.dead_heap() > 0, "k={k}: a carried heap is charged its dropped rows");
+        let mut least = u64::MAX;
+        for _ in 0..5 {
+            least = least.min(instructions.measure(|| drop(black_box(kernel()))).1);
+        }
+        println!(
+            "n_way_string_cancel_bench {label:<11} k={k:<2} {:6.1} instr/input row",
+            least as f64 / rows_in as f64
+        );
+    }
+}

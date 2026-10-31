@@ -160,6 +160,73 @@ proptest! {
     }
 }
 
+/// `(pk, weight, value)` of each row of a `make_schema_u64_i64` batch.
+fn u64_i64_rows(b: &Batch) -> Vec<(u64, i64, i64)> {
+    (0..b.len())
+        .map(|r| {
+            let pk = u64::from_be_bytes(b.get_pk_bytes(r).try_into().unwrap());
+            let v = i64::from_le_bytes(b.get_col_ptr(r, 0, 8).try_into().unwrap());
+            (pk, b.get_weight(r), v)
+        })
+        .collect()
+}
+
+/// Inputs that ascend without overlap, an empty window between them, fold to
+/// what the merge of them is; a key one input ends at and the next begins at
+/// still sums the weights of an element both hold; and a dehydrating fold
+/// still folds a hydrated input's rows that share a PK.
+#[test]
+fn ascending_inputs_fold_as_their_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let low = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (2, 2, 21), (3, 1, 30)]);
+    let high = make_batch(&schema, &[(7, 1, 70), (8, 3, 80)]);
+    let meeting = make_batch(&schema, &[(3, 1, 30), (3, 1, 31), (4, 1, 40)]);
+    let shard = |name: &str, b: &Batch| map_shard(&dir.path().join(name), b);
+    let (low_s, high_s, meeting_s) = (
+        shard("low.db", &low),
+        shard("high.db", &high),
+        shard("meeting.db", &meeting),
+    );
+    let guards = [PkBuf::zeroed(8), PkBuf::from_bytes(&5u64.to_be_bytes())];
+    let merged = |batches: &[&Batch]| {
+        let mems: Vec<_> = batches.iter().map(|b| b.as_mem_batch()).collect();
+        u64_i64_rows(&merge_consolidated(&mems, &schema))
+    };
+    let folded = |shards: &[Rc<MappedShard>]| -> Vec<(u64, i64, i64)> {
+        route(shards, &guards, false)
+            .iter()
+            .flat_map(|(.., b)| u64_i64_rows(b))
+            .collect()
+    };
+
+    // Below 5 only `low` holds rows; from 5 `top` precedes `high` but lies above it.
+    let top = make_batch(&schema, &[(9, 1, 90)]);
+    assert_eq!(
+        folded(&[Rc::clone(&low_s), shard("top.db", &top), Rc::clone(&high_s)]),
+        merged(&[&low, &top, &high])
+    );
+    let want = merged(&[&low, &meeting]);
+    assert!(want.contains(&(3, 2, 30)), "premise: one element in both");
+    assert_eq!(folded(&[Rc::clone(&low_s), meeting_s]), want);
+
+    let coarse: Vec<Vec<(u64, i64)>> = route(&[low_s, high_s], &guards, true)
+        .iter()
+        .map(|(_, skel, b)| {
+            assert!(*skel);
+            (0..b.len())
+                .map(|r| {
+                    (
+                        u64::from_be_bytes(b.get_pk_bytes(r).try_into().unwrap()),
+                        b.get_weight(r),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    assert_eq!(coarse, [vec![(1, 1), (2, 3), (3, 1)], vec![(7, 1), (8, 3)]]);
+}
+
 /// A skeleton output declares itself on disk — zero payload arity, the skeleton
 /// flag, and a null region collapsed to one `Constant` element for the whole
 /// file — and a skeleton input makes every output a skeleton, asked or not: its

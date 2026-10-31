@@ -1,7 +1,9 @@
 use super::*;
-use crate::schema::{Generic, PayloadOrder, SchemaDescriptor};
+use crate::repr::BatchBuilder;
+use crate::schema::{Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    arb_fold_case, assert_folds, fold_batch, make_schema_pk_u64_payload_string, make_string_batch, FoldRow,
+    arb_fold_case, assert_folds, fold_batch, make_schema_pk_u64_payload_string, make_string_batch, u64_pk_schema,
+    FoldRow,
 };
 
 // ── The Z-set fold, over every path that runs it ────────────────────────
@@ -54,6 +56,79 @@ proptest::proptest! {
             assert_folds(&runs, &got, path);
             got.debug_verify_dead_heap();
         }
+    }
+}
+
+/// Narrow integer and float payload columns, nullable and not, that the packed
+/// payload key spans two levels of: one schema per order of the columns.
+fn packed_payload_schemas() -> Vec<SchemaDescriptor> {
+    use gnitz_wire::TypeCode::*;
+    let col = SchemaColumn::new;
+    let cols = [
+        col(I64, true),
+        col(F64, false),
+        col(F32, true),
+        col(I8, true),
+        col(U16, false),
+        col(F64, true),
+    ];
+    vec![
+        u64_pk_schema(&cols),
+        u64_pk_schema(&cols.iter().rev().copied().collect::<Vec<_>>()),
+    ]
+}
+
+/// A cell of `tc` from a small domain of values — every one of a float's
+/// non-numbers with its own bits, both zeroes, both infinities — as the raw
+/// image `put_int` stores.
+fn packed_cell(tc: gnitz_wire::TypeCode, i: u8) -> u128 {
+    use gnitz_wire::TypeCode::*;
+    let f64s = [f64::NEG_INFINITY, -1.5, -0.0, 0.0, 1.5, f64::INFINITY]
+        .map(f64::to_bits)
+        .into_iter()
+        .chain([0x7ff8_0000_0000_0000, 0x7ff8_0000_0000_0001, 0xfff8_0000_0000_0000]);
+    let f32s = [f32::NEG_INFINITY, -1.5, -0.0, 0.0, 1.5, f32::INFINITY]
+        .map(f32::to_bits)
+        .into_iter()
+        .chain([0x7fc0_0000, 0x7fc0_0001, 0xffc0_0000]);
+    let ints: [i64; 9] = [i64::MIN, -128, -2, -1, 0, 1, 2, 127, i64::MAX];
+    let i = i as usize % 9;
+    match tc {
+        F64 => f64s.clone().nth(i).unwrap() as u128,
+        F32 => f32s.clone().nth(i).unwrap() as u128,
+        I8 => ints[i].clamp(-128, 127) as i128 as u128,
+        U16 => ints[i].unsigned_abs().min(u16::MAX as u64) as u128,
+        _ => ints[i] as i128 as u128,
+    }
+}
+
+proptest::proptest! {
+    /// Runs of three or more rows under one PK, over narrow integer and float
+    /// payloads with NULLs, fold to their Z-set sum in (PK, payload) order:
+    /// NULL apart from zero, -0.0 apart from +0.0, every non-number apart.
+    #[test]
+    fn a_packed_payload_run_folds_to_the_zset(
+        which in 0usize..2,
+        rows in proptest::collection::vec(
+            (0u64..2, -2i64..=2, proptest::collection::vec(proptest::option::of(0u8..9), 6)),
+            0..60,
+        ),
+    ) {
+        let schema = &packed_payload_schemas()[which];
+        let mut b = BatchBuilder::new(schema);
+        for (pk, w, cells) in &rows {
+            b.begin_row(*pk as u128, *w);
+            for ((_, col), cell) in schema.payload_columns().zip(cells) {
+                match cell {
+                    Some(i) => b.put_int(packed_cell(col.type_code, *i)),
+                    None if col.nullable => b.put_null(),
+                    None => b.put_int(packed_cell(col.type_code, 4)),
+                }
+            }
+            b.end_row();
+        }
+        let input = b.finish();
+        assert_folds(std::slice::from_ref(&input), &input.clone().into_consolidated(), "consolidate");
     }
 }
 

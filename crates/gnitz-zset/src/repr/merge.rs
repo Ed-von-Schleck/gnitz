@@ -18,8 +18,10 @@ use super::loser_tree::{LoserTree, Player};
 use super::scatter::{ColumnarSource, Pick};
 use super::string_heap::{rebase_string_cells, row_long_bytes, BlobCache};
 use super::writer::DirectWriter;
-use crate::schema::{pack_pk_be, pk_width_dispatch, with_payload_cmp, PayloadOrder, PkSortKey, SchemaDescriptor};
-use gnitz_wire::{native_key_image, Heap, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT};
+use crate::schema::{
+    pack_pk_be, pk_width_dispatch, with_payload_cmp, PayloadOrder, PkSortKey, SchemaColumn, SchemaDescriptor,
+};
+use gnitz_wire::{native_key_image, Heap, RowSource, ScalarKind, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT};
 
 // ---------------------------------------------------------------------------
 // Z-Set `+` over consolidated batches
@@ -33,17 +35,24 @@ use gnitz_wire::{native_key_image, Heap, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START,
 /// a dominant one — usually a previous fold's output — against the sum of the
 /// rest, so its stretches are bulk-copied; any other mix takes the N-way fold.
 pub fn merge_consolidated(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
-    let held = sources.iter().filter(|s| s.count > 0);
-    let ascending = held
-        .clone()
-        .zip(held.skip(1))
-        .all(|(a, b)| a.get_pk_bytes(a.count - 1) < b.get_pk_bytes(0));
-    let mut out = match ascending {
+    let mut out = match windows_ascend(sources.iter().map(|s| (s, 0..s.count))) {
         true => Batch::concat(schema, sources.iter().copied()),
         false => merge_interleaved(sources, schema),
     };
     out.certify_consolidated();
     out
+}
+
+/// Whether each non-empty one of `windows`, rows of its source, ends below the
+/// PK the next begins at: windows of consolidated sources that do share no
+/// element, and are their sum in order.
+pub(crate) fn windows_ascend<'s, S: RowSource + 's>(
+    windows: impl Iterator<Item = (&'s S, Range<usize>)> + Clone,
+) -> bool {
+    let held = windows.filter(|(_, rows)| !rows.is_empty());
+    held.clone()
+        .zip(held.skip(1))
+        .all(|((a, ra), (b, rb))| a.get_pk_bytes(ra.end - 1) < b.get_pk_bytes(rb.start))
 }
 
 /// [`merge_consolidated`] of sources that interleave, so at least two hold rows.
@@ -764,6 +773,11 @@ fn fold_runs<E: ArgEntry, P: PayloadOrder>(
     out: &mut Vec<Pick>,
 ) {
     let weights = batch.weight().as_chunks::<8>().0;
+    // Whether every payload column packs into [`fold_keyed`]'s key: none is a
+    // string, none is 16 bytes wide.
+    let packable = schema
+        .payload_columns()
+        .all(|(_, c)| !c.type_code.is_german_string() && c.size() <= 8);
     // The run in hand's payload keys and rows, in a buffer every run reuses.
     let mut keyed = Vec::new();
     for run in entries.chunk_by_mut(|a, b| a.same_pk(*b)) {
@@ -774,19 +788,23 @@ fn fold_runs<E: ArgEntry, P: PayloadOrder>(
                     out.push((0, one.idx() as u32, weight));
                 }
             }
-            run => fold_run(run, batch, schema, payload, weights, &mut keyed, out),
+            run => fold_run(run, batch, schema, payload, packable, weights, &mut keyed, out),
         }
     }
 }
 
-/// Sort `run`, the rows of one PK, by its payload and fold it. Out of line, so
-/// the loop over a batch of distinct PKs stays tight.
+/// Sort `run`, the rows of one PK, by its payload and fold it: two rows by one
+/// compare, more by [`fold_keyed`]'s packed keys when the payload is
+/// `packable`, else by the payload order's comparator. Out of line, so the loop
+/// over a batch of distinct PKs stays tight.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn fold_run<E: ArgEntry, P: PayloadOrder>(
     run: &mut [E],
     batch: &MemBatch,
     schema: &SchemaDescriptor,
     payload: P,
+    packable: bool,
     weights: &[[u8; 8]],
     keyed: &mut Vec<(u128, u32)>,
     out: &mut Vec<Pick>,
@@ -807,7 +825,7 @@ fn fold_run<E: ArgEntry, P: PayloadOrder>(
         }
         return;
     }
-    if P::FIXED_INT {
+    if packable {
         keyed.clear();
         keyed.extend(run.iter().map(|e| (0, e.idx() as u32)));
         fold_keyed(batch, schema, 0, keyed, weights, out);
@@ -817,11 +835,18 @@ fn fold_run<E: ArgEntry, P: PayloadOrder>(
     }
 }
 
-/// Sort `keyed`, rows that tie on every fixed-int, non-null payload column
-/// before `from`, by the rest of the payload, and fold them. The columns from
-/// `from` that fit 128 bits are packed into each row's key from the high bits
-/// down, each order-preserving, and the rows sorted by it; rows still tied on it
-/// are sorted the same way by the columns after.
+/// Sort `keyed`, rows that tie on every payload column before `from`, by the
+/// rest of the payload, and fold them. Every payload column is at most 8 bytes
+/// and no string. The columns from `from` that fit 128 bits are packed into
+/// each row's key from the high bits down, each order-preserving as
+/// [`crate::schema::Generic`] orders it, and the rows sorted by it; rows still
+/// tied on it are sorted the same way by the columns after.
+///
+/// A column's image is its value's bits mapped so that unsigned order is the
+/// column's order: a signed integer's sign bit flipped, a float's bits mapped
+/// onto `total_cmp`'s order. A nullable column puts one more bit above the
+/// image, set when the cell is present, and a NULL cell's image is all zero:
+/// NULL sorts below every value and ties with NULL.
 fn fold_keyed(
     batch: &MemBatch,
     schema: &SchemaDescriptor,
@@ -832,26 +857,61 @@ fn fold_keyed(
 ) {
     /// Shift each key left past the column and put the column's bits in.
     #[inline(always)]
-    fn put<const W: usize>(keyed: &mut [(u128, u32)], cells: &[u8], signed: bool) {
+    fn put<const W: usize, const NULLABLE: bool>(
+        keyed: &mut [(u128, u32)],
+        cells: &[u8],
+        nulls: &[[u8; 8]],
+        slot: usize,
+        image: impl Fn(&[u8; W]) -> u128,
+    ) {
         let cells = cells.as_chunks::<W>().0;
         for (key, row) in keyed.iter_mut() {
-            *key = (*key << (W * 8)) | native_key_image(&cells[*row as usize], signed);
+            let r = *row as usize;
+            let mut img = image(&cells[r]);
+            if NULLABLE {
+                let present = (u64::from_le_bytes(nulls[r]) >> slot) & 1 == 0;
+                img = (img | 1 << (W * 8)) & (present as u128).wrapping_neg();
+            }
+            *key = (*key << (W * 8 + NULLABLE as usize)) | img;
         }
     }
+    /// `put` for a column of `W`-byte cells: an integer's or a float's image.
+    #[inline(always)]
+    fn put_col<const W: usize>(
+        keyed: &mut [(u128, u32)],
+        cells: &[u8],
+        nulls: &[[u8; 8]],
+        slot: usize,
+        col: &SchemaColumn,
+    ) {
+        let signed = col.is_signed();
+        let int = |c: &[u8; W]| native_key_image(c, signed);
+        let kind = if W == 4 { ScalarKind::F32 } else { ScalarKind::F64 };
+        let float = |c: &[u8; W]| kind.order_image(native_key_image(c, false) as u64) as u128;
+        match (col.type_code.is_float(), col.nullable) {
+            (false, false) => put::<W, false>(keyed, cells, nulls, slot, int),
+            (false, true) => put::<W, true>(keyed, cells, nulls, slot, int),
+            (true, false) => put::<W, false>(keyed, cells, nulls, slot, float),
+            (true, true) => put::<W, true>(keyed, cells, nulls, slot, float),
+        }
+    }
+    let nulls = batch.null_bmp().as_chunks::<8>().0;
     // The rows tie on the key the columns before `from` made, so whatever of it
     // these columns do not shift out is a prefix every row shares.
     let (mut room, mut next) = (u128::BITS as usize, from);
     for (pc, col) in schema.payload_columns().skip(from) {
         let cs = col.size();
-        let Some(left) = room.checked_sub(cs * 8) else { break };
+        let Some(left) = room.checked_sub(cs * 8 + col.nullable as usize) else {
+            break;
+        };
         (room, next) = (left, next + 1);
-        let (cells, signed) = (batch.col_data(pc), col.is_signed());
+        let cells = batch.col_data(pc);
         match cs {
-            1 => put::<1>(keyed, cells, signed),
-            2 => put::<2>(keyed, cells, signed),
-            4 => put::<4>(keyed, cells, signed),
-            8 => put::<8>(keyed, cells, signed),
-            w => unreachable!("a fixed-int column of {w} bytes"),
+            1 => put_col::<1>(keyed, cells, nulls, pc, col),
+            2 => put_col::<2>(keyed, cells, nulls, pc, col),
+            4 => put_col::<4>(keyed, cells, nulls, pc, col),
+            8 => put_col::<8>(keyed, cells, nulls, pc, col),
+            w => unreachable!("a packable column of {w} bytes"),
         }
     }
     keyed.sort_unstable_by_key(|e| e.0);

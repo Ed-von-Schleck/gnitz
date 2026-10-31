@@ -12,10 +12,6 @@ use gnitz_wire::{cmp_col_window, compare_german_strings, native_key_image, null_
 /// compares rows of two source types, as the read cursor does a run's row
 /// against a batch's.
 pub(crate) trait PayloadOrder: Copy {
-    /// Whether the order is [`FixedIntNonnull`]'s: each column's cells read as
-    /// an order-preserving integer.
-    const FIXED_INT: bool;
-
     fn compare<A: RowSource, B: RowSource>(
         self,
         schema: &SchemaDescriptor,
@@ -47,8 +43,6 @@ pub(crate) struct FixedIntNonnull;
 pub(crate) struct Generic;
 
 impl PayloadOrder for FixedIntNonnull {
-    const FIXED_INT: bool = true;
-
     /// Each column by its cells' key images: the same order as [`Generic`],
     /// with no null-bitmap read and no per-type dispatch, one width dispatch
     /// serving both cells.
@@ -84,8 +78,6 @@ impl PayloadOrder for FixedIntNonnull {
 }
 
 impl PayloadOrder for Generic {
-    const FIXED_INT: bool = false;
-
     /// Null words are read once per row outside the column loop. Each cell's
     /// dispatch is written out here rather than taken from
     /// `ColumnLocator::cmp_non_null`, which retires more instructions per row on

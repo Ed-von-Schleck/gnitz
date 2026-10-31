@@ -1,12 +1,13 @@
 //! Shard compaction: the N-way [`run_merge`] of sorted shard files, by (PK,
-//! payload) or, for a skeleton merge, by PK alone, one output guard at a time.
+//! payload) or, for a skeleton merge, by PK alone, one output guard at a time;
+//! windows that ascend without overlap are taken in order unmerged.
 
 use super::codebook::Codebook;
 use super::file::ShardWriteOpts;
-use super::reader::MappedShard;
-use crate::repr::merge::run_merge;
-use crate::repr::scatter::UnifiedSet;
-use crate::repr::string_heap::row_long_bytes;
+use super::reader::{MappedShard, ShardWindow};
+use crate::repr::merge::{run_merge, windows_ascend};
+use crate::repr::scatter::{Pick, UnifiedSet};
+use crate::repr::string_heap::long_bytes;
 use crate::repr::{Batch, StorageError};
 use crate::schema::{compare_pk_ordering, SchemaDescriptor};
 use gnitz_wire::RowSource;
@@ -152,7 +153,10 @@ impl GuardMerge {
             .zip(&windows)
             .map(|(s, w)| s.window(w.clone()))
             .collect();
-        let survivors = run_merge(&shards, out_schema, windows.iter().cloned());
+        let survivors = match self.in_order(&shards, &windows) {
+            Some(picks) => picks,
+            None => run_merge(&shards, out_schema, windows.iter().cloned()),
+        };
         if survivors.is_empty() {
             return None;
         }
@@ -162,12 +166,29 @@ impl GuardMerge {
         let batch = set.materialize(&survivors, codebook);
         let coded = codebook.map(|book| {
             let mask = out_schema.string_payload_slots();
-            (
-                book,
-                (0..batch.len()).map(|row| row_long_bytes(&batch, mask, row)).sum(),
-            )
+            (book, long_bytes(&batch.as_mem_batch(), mask, 0..batch.len()))
         });
         Some(GuardRun { batch, coded, skeleton })
+    }
+
+    /// Every row of `windows` at its own weight, in order, when they need no
+    /// merge: consolidated windows that each end below the key the next begins
+    /// at share no element. A hydrated window under a skeleton merge still folds
+    /// its PK groups, so it always merges.
+    ///
+    /// Out of line: inlined into `next`, it costs that merge loop instructions.
+    #[inline(never)]
+    fn in_order(&self, shards: &[ShardWindow<'_>], windows: &[Range<usize>]) -> Option<Vec<Pick>> {
+        if self.skeleton && !self.shards.iter().all(|s| s.is_skeleton()) {
+            return None;
+        }
+        let ascending = windows_ascend(shards.iter().zip(windows.iter().cloned()));
+        ascending.then(|| {
+            (windows.iter().enumerate())
+                .flat_map(|(i, w)| w.clone().map(move |r| (i, r)))
+                .map(|(i, r)| (i as u32, r as u32, self.shards[i].get_weight(r)))
+                .collect()
+        })
     }
 }
 

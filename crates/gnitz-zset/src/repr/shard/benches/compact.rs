@@ -1,7 +1,10 @@
 use super::*;
 use crate::repr::merge::run_merge;
 use crate::repr::BatchBuilder;
-use crate::test_support::{map_shard, mix, pk_payload_schema, pk_u64_two_i64_schema};
+use crate::schema::SchemaColumn;
+use crate::test_support::{
+    map_coded_shard, map_shard, mix, pk_payload_schema, pk_u64_two_i64_schema, prose, u64_pk_schema,
+};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{PkBuf, TypeCode};
 use std::hint::black_box;
@@ -61,7 +64,8 @@ fn for_compaction_bench() {
 /// Compaction over inputs that share no key, the shape a fold of scattered
 /// spills has: every match is settled on the PK. By what the PK is — 8 bytes,
 /// then 24 that differ in their leading or only in their trailing column — and
-/// by how the rows are dealt to the sources. The merge alone is the run walk
+/// by how the rows are dealt to the sources: scattered, or in ascending blocks
+/// as the spills of an ascending key are. The merge alone is the run walk
 /// without the output batch.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
@@ -75,18 +79,20 @@ fn distinct_compaction_bench() {
         ("24-byte PK, leading column", 3, 0),
         ("24-byte PK, trailing column", 3, 2),
     ];
-    // Label, source count, the source a row lands in.
+    // Label, source count, the source key `k` lands in.
     type Deal = (&'static str, u64, fn(u64) -> u64);
-    let deals: [Deal; 3] = [
-        ("2 equal sources", 2, |h| h % 2),
-        ("5 equal sources", 5, |h| h % 5),
-        ("1 large and 4 small sources", 5, |h| {
+    let deals: [Deal; 4] = [
+        ("2 equal sources", 2, |k| (mix(k) >> 20) % 2),
+        ("5 equal sources", 5, |k| (mix(k) >> 20) % 5),
+        ("1 large and 4 small sources", 5, |k| {
+            let h = mix(k) >> 20;
             if h % 16 < 12 {
                 0
             } else {
                 1 + h % 4
             }
         }),
+        ("5 ascending blocks", 5, |k| k * 5 / TOTAL),
     ];
     for (pk, (pk_label, pk_cols, key_col)) in pks.into_iter().enumerate() {
         let schema = pk_payload_schema(&vec![TypeCode::U64; pk_cols]);
@@ -95,7 +101,7 @@ fn distinct_compaction_bench() {
             for k in 0..TOTAL {
                 let mut key = vec![0u8; pk_cols * 8];
                 key[key_col * 8..][..8].copy_from_slice(&k.to_be_bytes());
-                let b = &mut builders[source_of(mix(k) >> 20) as usize];
+                let b = &mut builders[source_of(k) as usize];
                 b.begin_row_bytes(&key, 1);
                 b.put_int(mix(k) as u128);
                 b.end_row();
@@ -126,4 +132,42 @@ fn distinct_compaction_bench() {
             );
         }
     }
+}
+
+/// Coded compaction of rows with three long STRING payload values each, over
+/// sources coded under the merge's own codebook, so their codes are kept.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn coded_compaction_bench() {
+    const TOTAL: usize = 1 << 18;
+    const SOURCES: usize = 4;
+    let string = SchemaColumn::new(TypeCode::String, false);
+    let schema = u64_pk_schema(&[string, string, string]);
+    let dir = tempfile::tempdir().unwrap();
+    let instructions = Counter::instructions();
+    let batches: Vec<Batch> = (0..SOURCES)
+        .map(|s| {
+            let mut b = BatchBuilder::new(&schema);
+            for k in (s..TOTAL).step_by(SOURCES) {
+                b.begin_row(k as u128, 1);
+                for c in 0..3 {
+                    b.put_string(&prose(k * 3 + c));
+                }
+                b.end_row();
+            }
+            b.finish()
+        })
+        .collect();
+    let book = Codebook::for_batch(None, &batches[0]).unwrap();
+    let inputs: Vec<Rc<MappedShard>> = (0..)
+        .zip(&batches)
+        .map(|(s, b)| map_coded_shard(&dir.path().join(format!("{s}.db")), b, &book))
+        .collect();
+    let mut merge = GuardMerge::begin(inputs, false).unwrap();
+    let (rows, i) = instructions.measure(|| black_box(merge.next(None, Some(&book)).unwrap()).row_count());
+    assert_eq!(rows, TOTAL);
+    println!(
+        "{SOURCES} coded sources, 3 long strings: {:.1} instr/row",
+        i as f64 / TOTAL as f64
+    );
 }
