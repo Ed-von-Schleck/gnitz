@@ -418,12 +418,12 @@ unsafe fn write_end_prefix(sal_ptr: *mut u8, offset: usize) {
 pub(crate) struct GroupHead {
     /// The zone LSN of a zone member, `0` outside every zone.
     pub(crate) lsn: u64,
-    pub(crate) kind: SalMessageKind,
+    kind: SalMessageKind,
     /// `FLAG_*` bits.
     flags: u8,
     /// The worker count the group was written at.
     width: u8,
-    pub(crate) reply: Option<RequestId>,
+    reply: Option<RequestId>,
     /// The relation the group's request names, or 0; its payloads carry none.
     pub(crate) target_id: u64,
     /// The workers the group addresses, within `width`.

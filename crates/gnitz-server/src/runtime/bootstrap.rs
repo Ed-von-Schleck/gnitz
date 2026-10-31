@@ -20,7 +20,7 @@ use crate::runtime::master::{worker_death, MasterDispatcher};
 use crate::runtime::mesh::{self, Mesh};
 use crate::runtime::park::WorkerParks;
 use crate::runtime::reactor::{check_host, Limits, Reactor};
-use crate::runtime::sal::{CommittedTail, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
+use crate::runtime::sal::{CommittedTail, SalLog, SalMessage, SalReader, SalWriter};
 use crate::runtime::signals;
 use crate::runtime::sync::{select2, Either};
 use crate::runtime::tls::{ResolvedTls, TlsListener};
@@ -41,16 +41,13 @@ use gnitz_zset::algebra::Slot;
 fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Result<(), String> {
     let floors = catalog.system_replay_floors();
     let mine = |msg: SalMessage| {
-        if msg.head.kind != SalMessageKind::DdlSync {
-            return None;
-        }
         let family = SysFamily::from_id(msg.head.target_id)?;
         let floor = *floors.get(&family.id())?;
         (msg.head.lsn > floor).then_some((msg, family))
     };
 
     let mut replayed: u32 = 0;
-    for (msg, family) in tail.groups().filter_map(mine) {
+    for (msg, family) in tail.ddl_syncs().filter_map(mine) {
         let data = msg.shared_payload().ok_or_else(|| {
             format!(
                 "SAL replay: DdlSync group at offset={} (lsn={}) carries no shared payload",

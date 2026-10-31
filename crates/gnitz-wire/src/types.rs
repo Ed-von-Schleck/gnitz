@@ -466,6 +466,7 @@ impl FixedInt {
 
     /// The type code this fixed int is stored as. It inverts
     /// [`Self::from_type_code`] only where [`Self::exact`] is `Some`.
+    #[inline(always)]
     pub const fn type_code(self) -> TypeCode {
         match self {
             Self::U8 => TypeCode::U8,
@@ -482,12 +483,7 @@ impl FixedInt {
     /// Byte width (1/2/4/8).
     #[inline(always)]
     pub const fn width(self) -> usize {
-        match self {
-            Self::U8 | Self::I8 => 1,
-            Self::U16 | Self::I16 => 2,
-            Self::U32 | Self::I32 => 4,
-            Self::U64 | Self::I64 => 8,
-        }
+        self.type_code().wire_stride()
     }
 
     /// The representable `(min, max)` of this integer type, widened to `i128`
@@ -533,7 +529,7 @@ impl FixedInt {
     /// Whether this integer type is signed.
     #[inline(always)]
     pub const fn is_signed(self) -> bool {
-        matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64)
+        self.type_code().is_signed_int()
     }
 
     /// Decode the leading `width()` little-endian bytes of `b` as this integer,
@@ -659,8 +655,8 @@ impl ScalarKind {
 }
 
 // A new `TypeCode` is classified by `FixedInt::from_type_code`'s exhaustive
-// match; these hold the scalar/wide split and `FixedInt`'s width and sign
-// tables to the type's own.
+// match; these hold the scalar/wide split, and `FixedInt::type_code` to an
+// inverse of `from_type_code`.
 const _: () = {
     let mut i = 0;
     while i < TypeCode::ALL.len() {
@@ -681,14 +677,6 @@ const _: () = {
             assert!(
                 fi.type_code().as_wire() == tc.storage_type().as_wire(),
                 "FixedInt::type_code must invert from_type_code up to the storage type"
-            );
-            assert!(
-                fi.is_signed() == tc.is_signed_int(),
-                "FixedInt::is_signed must match the type's sign"
-            );
-            assert!(
-                fi.width() == tc.wire_stride(),
-                "FixedInt::width must be the type's wire stride"
             );
         }
         i += 1;

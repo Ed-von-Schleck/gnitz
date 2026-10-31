@@ -64,11 +64,11 @@ impl RowType {
             key.extend_from_slice(name.as_bytes());
             key.push(hidden as u8);
         }
-        if let Some(ty) = CACHE.lock().unwrap().get(&key) {
+        if let Some(ty) = crate::lock(&CACHE).get(&key) {
             return Ok(RowType(ty.clone_ref(py)));
         }
         let built = Self::build(py, names)?;
-        Ok(RowType(CACHE.lock().unwrap().entry(key).or_insert(built).clone_ref(py)))
+        Ok(RowType(crate::lock(&CACHE).entry(key).or_insert(built).clone_ref(py)))
     }
 
     fn build(py: Python<'_>, names: &[(&str, bool)]) -> PyResult<Py<PyType>> {

@@ -44,6 +44,11 @@ impl CommittedTail {
         self.groups().filter(|m| m.head.kind == SalMessageKind::Push)
     }
 
+    /// The tail's DdlSync groups, in log order.
+    pub(crate) fn ddl_syncs(self) -> impl Iterator<Item = SalMessage> {
+        self.groups().filter(|m| m.head.kind == SalMessageKind::DdlSync)
+    }
+
     /// The relations [`Self::pushes`] target, each once, ascending.
     pub(crate) fn pushed(self) -> BTreeSet<u64> {
         self.pushes().map(|m| m.head.target_id).collect()
