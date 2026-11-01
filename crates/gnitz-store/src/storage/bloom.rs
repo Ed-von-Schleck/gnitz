@@ -20,12 +20,27 @@ pub(super) struct BloomFilter {
 
 impl BloomFilter {
     pub(super) fn new(expected_n: usize) -> Self {
-        let blocks = (expected_n * BITS_PER_KEY).div_ceil(256).next_power_of_two();
+        let blocks = Self::blocks_for(expected_n);
         BloomFilter {
             words: vec![0; blocks * 8],
             block_mask: blocks - 1,
             added: 0,
         }
+    }
+
+    /// Blocks for `n` keys at [`BITS_PER_KEY`], rounded up to a power of two.
+    fn blocks_for(n: usize) -> usize {
+        (n * BITS_PER_KEY).div_ceil(256).next_power_of_two()
+    }
+
+    /// `keys` more fit the bits the filter is sized for.
+    pub(super) fn has_room(&self, keys: usize) -> bool {
+        (self.added + keys) * BITS_PER_KEY <= self.words.len() * 32
+    }
+
+    /// A filter sized for `n` keys has more blocks than this one.
+    pub(super) fn grows_at(&self, n: usize) -> bool {
+        Self::blocks_for(n) > self.block_mask + 1
     }
 
     /// The first word of `key`'s block.
@@ -47,7 +62,7 @@ impl BloomFilter {
     /// More keys went in than the bits are sized for, and no more than half of
     /// them are among the `live` rows the filter still answers for.
     pub(super) fn stale(&self, live: usize) -> bool {
-        self.added * BITS_PER_KEY > self.words.len() * 32 && self.added >= 2 * live
+        !self.has_room(0) && self.added >= 2 * live
     }
 
     #[inline]

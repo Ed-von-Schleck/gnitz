@@ -26,6 +26,9 @@ const CANCEL_SAMPLE: usize = 16;
 /// [crowded](RunSet::is_crowded): one part in this many.
 const ROOM_SHARE: usize = 16;
 
+/// The fewest keys a set's PK bloom is sized for.
+const MIN_BLOOM_KEYS: usize = 256;
+
 fn pk_min(run: &Batch) -> &[u8] {
     run.get_pk_bytes(0)
 }
@@ -40,9 +43,9 @@ pub(super) struct RunSet {
     /// PK bloom over every key pushed since it was built — a superset of the
     /// live runs' keys — built on the first probe.
     bloom: OnceCell<BloomFilter>,
-    /// Heap budget: [`is_full`](Self::is_full) reports crossing it, and the
-    /// bloom's key capacity is derived from it. What crossing it *means* — fold
-    /// into the next tier, or spill to a shard — is `Table`'s policy.
+    /// Heap budget: [`is_full`](Self::is_full) reports crossing it, and it caps
+    /// the bloom, which is sized to the live rows. What crossing it *means* —
+    /// fold into the next tier, or spill to a shard — is `Table`'s policy.
     budget: usize,
     bytes: usize,
     /// See [`Self::cancelling`].
@@ -78,7 +81,16 @@ impl RunSet {
         if run.is_empty() {
             return;
         }
-        if let Some(bloom) = self.bloom.get_mut() {
+        // An overfull filter is dropped, for the next probe to rebuild, only
+        // when the rebuilt one would be larger; otherwise it stays until a merge
+        // finds it stale.
+        let grow = self.bloom.get().is_some_and(|b| {
+            !b.has_room(run.len())
+                && b.grows_at(self.bloom_keys(self.row_count() + run.len(), run.schema().row_width()))
+        });
+        if grow {
+            self.bloom.take();
+        } else if let Some(bloom) = self.bloom.get_mut() {
             bloom_add_batch(bloom, &run);
         }
         self.bytes += run.total_bytes();
@@ -223,11 +235,19 @@ impl RunSet {
         run
     }
 
+    /// Keys to size a bloom for over `live` rows of `row_width` bytes: room for
+    /// the set to grow to four times them, capped at the rows the budget holds,
+    /// but never under twice them nor under [`MIN_BLOOM_KEYS`].
+    fn bloom_keys(&self, live: usize, row_width: usize) -> usize {
+        let ceiling = (self.budget / row_width).max(2 * live);
+        (4 * live).min(ceiling).max(MIN_BLOOM_KEYS)
+    }
+
     /// Bloom probe for a PK by its [`probe_key`]. The first probe builds the
     /// filter from all live runs.
     #[inline]
     fn may_contain(&self, probe_key: u64) -> bool {
-        // Answered without building a budget-sized filter.
+        // Answered without building a filter.
         if self.runs.is_empty() {
             return false;
         }
@@ -243,10 +263,9 @@ impl RunSet {
     #[inline(never)]
     fn build_bloom(&self) -> &BloomFilter {
         self.bloom.get_or_init(|| {
-            // Sized to the rows the budget holds, not the current ones: later
-            // pushes add to it.
+            // Sized with room for later pushes, which add to it.
             let row_width = self.runs[0].schema().row_width();
-            let mut bloom = BloomFilter::new(self.budget / row_width);
+            let mut bloom = BloomFilter::new(self.bloom_keys(self.row_count(), row_width));
             for run in &self.runs {
                 bloom_add_batch(&mut bloom, run);
             }

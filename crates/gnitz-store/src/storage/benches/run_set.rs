@@ -106,9 +106,9 @@ fn run_set_fold_bench() {
 /// `RunSet::push_run` at a memtable's cadence: a set is pushed `tick`-row runs of
 /// fresh keys until it is full, then cleared, as a drain leaves it. Instructions
 /// and cycles per pushed row with the set never probed, and instructions with
-/// its bloom live from each fill's first push on, beside the rows its folds
-/// merged per row pushed. The cycles price the bulk copies of a fold, which
-/// retire next to no instructions.
+/// it probed after every push, beside the rows its folds merged per row pushed.
+/// The cycles price the bulk copies of a fold, which retire next to no
+/// instructions.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn run_set_push_bench() {
@@ -157,9 +157,9 @@ fn run_set_push_bench() {
                         let (runs, held) = (shadow.len(), shadow.row_count() as u64);
                         let (((), i), c) = cycles.measure(|| {
                             counter.measure(|| {
-                                for (at, b) in ticks.into_iter().enumerate() {
+                                for b in ticks {
                                     set.push_run(Rc::new(b.trimmed()), &schema);
-                                    if probed && at == 0 {
+                                    if probed {
                                         std::hint::black_box(set.may_contain(0));
                                     }
                                 }

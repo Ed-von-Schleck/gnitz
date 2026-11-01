@@ -109,14 +109,15 @@ fn a_cancelling_set_merges_only_a_run_that_cancels_the_one_before_it() {
     assert_eq!(set.row_count(), 140);
 }
 
-/// A probed set keeps its filter through a fold that cancels a few rows and
-/// through one that leaves it overfull but mostly live, drops it at one that
-/// cancels most of what went in, and answers its probes alike.
+/// A probed set's filter is sized to its rows: a fold that cancels a few rows
+/// keeps it, an overfull push drops it for the next probe to rebuild larger
+/// until the budget caps it, an overfull filter at the cap stays until a fold
+/// cancels most of what went in, and probes answer alike throughout.
 #[test]
-fn a_fold_drops_the_filter_once_most_of_its_keys_are_gone() {
+fn a_filter_grows_with_its_rows_and_is_dropped_once_most_of_its_keys_are_gone() {
     let schema = make_schema_u64_i64();
-    // A zero budget sizes the filter to one block.
-    let mut set = RunSet::new(0);
+    // Caps the filter at 64 blocks: room for 1638 keys.
+    let mut set = RunSet::new(1638 * schema.row_width());
     let push = |set: &mut RunSet, keys: std::ops::Range<u64>, w: i64| {
         set.push_run(Rc::new(keyed_run(&schema, keys, w, 7).trimmed()), &schema)
     };
@@ -128,13 +129,32 @@ fn a_fold_drops_the_filter_once_most_of_its_keys_are_gone() {
     assert!(set.bloom.get().is_some());
     assert!(holds(&set, &schema, 7) && !holds(&set, &schema, 3));
 
-    push(&mut set, 100..1100, 1);
+    push(&mut set, 100..600, 1);
+    assert!(
+        set.bloom.get().is_none(),
+        "an overfull push drops the floor-sized filter"
+    );
+    assert!(holds(&set, &schema, 105), "the next probe rebuilds it");
+    push(&mut set, 100..600, -1);
     set.fold(&schema);
-    assert!(set.bloom.get().is_some(), "overfull, but most of its keys live");
-    push(&mut set, 100..1100, -1);
+    assert!(set.bloom.get().is_some());
+
+    push(&mut set, 1000..1400, 1);
+    push(&mut set, 1000..1400, -1);
+    assert!(set.bloom.get().is_some(), "overfull, but at the budget's cap");
     set.fold(&schema);
     assert!(set.bloom.get().is_none());
-    assert!(holds(&set, &schema, 7) && !holds(&set, &schema, 3) && !holds(&set, &schema, 105));
+    assert!(holds(&set, &schema, 7) && !holds(&set, &schema, 3));
+    assert!(!holds(&set, &schema, 105) && !holds(&set, &schema, 1005));
+}
+
+/// A set whose budget holds fewer rows than the filter's floor still probes.
+#[test]
+fn a_set_with_a_tiny_budget_probes() {
+    let schema = make_schema_u64_i64();
+    let mut set = RunSet::new(0);
+    set.push_run(Rc::new(keyed_run(&schema, 0..10, 1, 7).trimmed()), &schema);
+    assert!(holds(&set, &schema, 3) && !holds(&set, &schema, 10));
 }
 
 /// Widening fills the new column with NULL, recounts the set's bytes, and

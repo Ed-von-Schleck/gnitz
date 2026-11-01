@@ -103,7 +103,7 @@ impl Table {
     ) -> Result<Self, StorageError> {
         let shard_index = ShardIndex::open(dir, schema, recovery_source, capacity, compress)?;
         Ok(Table {
-            // Never full: the budget only sizes its PK filter, to a tick's worth of rows.
+            // Never full: the budget only caps its PK filter.
             pending: RunSet::new(MEMTABLE_BYTES),
             memtable: RunSet::cancelling(MEMTABLE_BYTES),
             ram_tier: RunSet::cancelling(ram_tier_bytes),
