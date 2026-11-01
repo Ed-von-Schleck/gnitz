@@ -122,9 +122,11 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
 #[inline(always)]
 fn run_tick(host: &mut impl DriveHost, source: u64, round: u64, delta: Option<Batch>) -> Result<(), String> {
     let schedule = host.parts().0.tick_schedule(source);
-    // Sized for the schedule: growing it rehashes it once per doubling. A
-    // producer with no entry produced nothing.
-    let mut outputs: FxHashMap<u64, Batch> = FxHashMap::with_capacity_and_hasher(schedule.len(), Default::default());
+    // The engine's map, empty between ticks, with room for the schedule:
+    // growing it rehashes it once per doubling. A producer with no entry
+    // produced nothing.
+    let mut outputs = std::mem::take(&mut host.parts().0.tick_outputs);
+    outputs.reserve(schedule.len());
     outputs.extend(delta.map(|delta| (source, delta)));
     for &Step { view, producer, last, needed } in schedule.iter() {
         // Lent to every reader, the last of which may take it.
@@ -152,6 +154,8 @@ fn run_tick(host: &mut impl DriveHost, source: u64, round: u64, delta: Option<Ba
             }
         }
     }
+    outputs.clear();
+    host.parts().0.tick_outputs = outputs;
     Ok(())
 }
 

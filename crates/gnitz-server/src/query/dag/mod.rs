@@ -65,6 +65,9 @@ pub(crate) struct DagEngine {
     /// Views the boot verdict ([`Self::decide_rebuild`]) rejected, closed under
     /// dependents and chains, each until its rebuild backfill starts.
     rebuild: FxHashSet<u64>,
+    /// The batch each producer of the running tick has emitted, keyed by
+    /// producer; empty between ticks, kept for its capacity.
+    tick_outputs: FxHashMap<u64, Batch>,
 }
 
 impl DagEngine {
