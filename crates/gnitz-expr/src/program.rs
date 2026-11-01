@@ -1226,10 +1226,10 @@ impl LogicalProgram {
             null_regs,
             reg_u64,
             nullable_slots,
-            payload_reads: (read_width.iter().enumerate())
+            read_mask: (read_width.iter().enumerate())
                 .filter(|&(_, &w)| w != 0)
-                .map(|(slot, &w)| (slot as u8, w))
-                .collect(),
+                .fold(0, |m, (slot, _)| m | 1 << slot),
+            read_widths: read_width,
             instrs,
             const_regs,
             const_str_regs,
@@ -1663,9 +1663,12 @@ pub(crate) struct ResolvedProgram {
     /// same assumption as [`Self::null_regs`]: a `NOT NULL` column's
     /// declared flag is believed over the bit the batch carries for it.
     pub(crate) nullable_slots: u64,
-    /// Each payload slot an instruction reads, once, as `(slot, cell width)`:
-    /// the regions an evaluation call fetches before its first morsel.
-    pub(crate) payload_reads: Box<[(u8, u8)]>,
+    /// Bit `N` set iff an instruction reads payload slot `N`: the regions an
+    /// evaluation call fetches, once each, before its first morsel.
+    pub(crate) read_mask: u64,
+    /// The cell width each slot in [`Self::read_mask`] is read at; zero for
+    /// every slot outside it.
+    pub(crate) read_widths: [u8; PAYLOAD_SLOTS],
 }
 
 impl ResolvedProgram {

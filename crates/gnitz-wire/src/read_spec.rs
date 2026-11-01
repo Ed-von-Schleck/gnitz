@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use crate::codec::{decode_all, Reader, Wire, Writer};
 use crate::operator::{order_keys, ComputeMap, GroupAggs, OrderKey};
-use crate::pk::{strictly_ascending, PkKeys};
+use crate::pk::PkKeys;
 use crate::range::KeyRange;
 use crate::MAX_PK_BYTES;
 
@@ -171,7 +171,13 @@ impl ReadSpec {
 
 /// The one `PkSet` layout: stride, key count, then the keys.
 fn write_pk_set(w: &mut Writer, stride: usize, keys: &[u8]) {
-    w.u8(stride as u8).u32((keys.len() / stride) as u32).raw(keys);
+    write_pk_set_head(w, stride, keys.len() / stride);
+    w.raw(keys);
+}
+
+/// [`write_pk_set`]'s stride and key count, which the keys follow.
+fn write_pk_set_head(w: &mut Writer, stride: usize, count: usize) {
+    w.u8(stride as u8).u32(count as u32);
 }
 
 /// [`write_pk_set`]'s inverse: the stride and the keys, not checked for order.
@@ -207,7 +213,8 @@ impl PkKeys {
     /// A `HasPk` probe's blob: the keys as a `PkSet` bound, the layout
     /// [`peek_bound`] routes.
     pub fn encode_probe(&self) -> Vec<u8> {
-        let mut w = Writer::new();
+        // The tag, the stride byte, the `u32` count, then the keys.
+        let mut w = Writer::with_capacity(1 + 1 + 4 + self.as_bytes().len());
         w.put(&BoundTag::PkSet).put(self);
         w.into_vec()
     }
@@ -256,7 +263,7 @@ impl Wire for PkKeys {
     /// Keys out of order are an `Err`.
     fn read(r: &mut Reader) -> Result<Self, String> {
         let (stride, bytes) = read_pk_set(r)?;
-        PkKeys::checked(stride, bytes.to_vec()).map_err(|e| format!("PkSet {e}"))
+        PkKeys::checked(stride, bytes).map_err(|e| format!("PkSet {e}"))
     }
 }
 
@@ -277,19 +284,40 @@ pub struct PkSetPeek<'a> {
 }
 
 impl PkSetPeek<'_> {
-    /// The blob with its key list replaced by `keys`, a subsequence of
-    /// [`Self::keys`] — so still strictly ascending — and every other byte
-    /// copied verbatim: it decodes to the same spec over those keys.
-    pub fn with_keys(&self, keys: &[u8]) -> Vec<u8> {
+    /// The blob once per worker: worker `w`'s copy carries the `counts[w]` keys
+    /// `owner` maps to it — a subsequence of [`Self::keys`], so still strictly
+    /// ascending — and every other byte verbatim, so it decodes to the same spec
+    /// over those keys. A worker whose count is 0 gets an empty `Vec`. `counts`
+    /// must be the number of keys `owner` maps to each worker.
+    pub fn split(&self, counts: &[u32], owner: impl Fn(&[u8]) -> usize) -> Vec<Vec<u8>> {
+        let (head, tail) = (&self.blob[..self.span.start], &self.blob[self.span.end..]);
+        // Every byte but the keys: head, stride, count and tail.
+        let fixed = self.blob.len() - self.keys.len();
+        let mut out: Vec<Vec<u8>> = counts
+            .iter()
+            .map(|&n| {
+                if n == 0 {
+                    return Vec::new();
+                }
+                let mut w = Writer::with_capacity(fixed + n as usize * self.stride);
+                w.raw(head);
+                write_pk_set_head(&mut w, self.stride, n as usize);
+                w.into_vec()
+            })
+            .collect();
+        for k in self.keys.chunks_exact(self.stride) {
+            out[owner(k)].extend_from_slice(k);
+        }
+        for v in out.iter_mut().filter(|v| !v.is_empty()) {
+            v.extend_from_slice(tail);
+        }
+        // `Vec::with_capacity` is exact, so a count off from what `owner` maps
+        // leaves a blob short of or past its capacity.
         debug_assert!(
-            strictly_ascending(keys, self.stride),
-            "a subsequence of the peeked keys"
+            out.iter().all(|v| v.len() == v.capacity()),
+            "each blob sized by its count"
         );
-        let mut w = Writer::with_capacity(self.blob.len() - self.keys.len() + keys.len());
-        w.raw(&self.blob[..self.span.start]);
-        write_pk_set(&mut w, self.stride, keys);
-        w.raw(&self.blob[self.span.end..]);
-        w.into_vec()
+        out
     }
 }
 

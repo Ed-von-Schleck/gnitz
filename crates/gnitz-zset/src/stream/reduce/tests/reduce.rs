@@ -11,7 +11,7 @@ use crate::repr::Batch;
 use crate::test_support::stream_input::{
     agg, agg_of, arb_row, arb_ticks, batch, cells, delta_to, schema, shard, Cells, Row, GROUPS,
 };
-use crate::test_support::{assert_folds, cell, TestTrace};
+use crate::test_support::{assert_folds, cell, weighted_rows, TestTrace};
 use gnitz_expr::{CmpOp, ReduceOutKey, RowFilter};
 use gnitz_wire::{AggDescriptor, AggFunc, GroupAggs, ReadSink, SinkKind, TypeCode};
 
@@ -49,13 +49,13 @@ impl Harness {
 
     /// `op_reduce` over `delta` against the two traces, each opened at exactly
     /// the keys the operator asks for.
-    pub(super) fn reduce(&self, delta: &Batch) -> Batch {
+    pub(super) fn reduce(&mut self, delta: &Batch) -> Batch {
         let mut open_out = |first: &[u8], last: &[u8]| self.out_trace.cursor_within(first, last);
         let mut index = |first: &[u8], last: &[u8]| {
             let index = self.index.as_ref().expect("a plan with a value index");
             index.cursor_within(first, last)
         };
-        op_reduce(delta, &mut open_out, Some(&mut index), &self.plan)
+        op_reduce(delta, &mut open_out, Some(&mut index), &mut self.plan)
     }
 
     /// `delta` as the VM hands it to the reduce: folded unless every aggregate
@@ -526,5 +526,103 @@ fn a_float_sum_is_carried_in_f64() {
         let mut all = RowFilter::for_read(&[], None, &schema()).unwrap();
         fold.push(&batch(&rows), &mut all).unwrap();
         assert_eq!(read(&fold.finish()), (want_f, want_x), "ad hoc, group {group_cols:?}");
+    }
+}
+
+/// One plan run epoch after epoch, its buffers kept across them, emits what a
+/// plan built afresh for each epoch emits over the same traces, PKs and weights
+/// included. Each case's epochs alternate the hashed numbering, its fallback to
+/// a sort, row runs and a hashed epoch whose first group was the previous
+/// hashed epoch's last.
+#[test]
+fn a_plan_reused_across_epochs_emits_what_a_fresh_plan_emits() {
+    let row = |id: u64, val: i64, w: u128| Row {
+        id,
+        grp: id as i64 % 7,
+        val: Some(val),
+        s: Some(["a", "q", "z"][id as usize % 3]),
+        w,
+        n: Some(1),
+        ..Row::default()
+    };
+    let ins = |rows: Vec<Row>| -> Vec<(Row, i64)> { rows.into_iter().map(|r| (r, 1)).collect() };
+    let extremes = vec![
+        AggDescriptor::COUNT_STAR,
+        agg(AggFunc::Min, 3),
+        agg(AggFunc::Max, 2),
+        agg(AggFunc::Sum, 0),
+    ];
+    let linear = vec![AggDescriptor::COUNT_STAR, agg(AggFunc::Sum, 3)];
+
+    // A packed key over two nullable payload columns, with a value index.
+    let packed: Vec<Vec<(Row, i64)>> = vec![
+        // 24 rows in 3 groups: hashed.
+        ins((0..24).map(|id| row(id, id as i64 % 3, 0)).collect()),
+        // 40 rows in 40 groups: the hash gives up, the rows are sorted.
+        ins((100..140).map(|id| row(id, id as i64, 0)).collect()),
+        // One row: one run.
+        ins(vec![row(200, 1, 0)]),
+        // Retractions and inserts in 3 groups, the last row's group numbered 1.
+        (0..12)
+            .map(|id| (row(id, id as i64 % 3, 0), 0))
+            .chain((300..311).map(|id| (row(id, (id as i64 - 300) % 3, 0), 1)))
+            .collect(),
+        // The first row in the group the previous epoch numbered 1, which this
+        // epoch numbers 0.
+        ins((400..420).map(|id| row(id, (id as i64 - 399) % 3, 0)).collect()),
+    ];
+    // A 16-byte payload image: the hash keeps identities, the sort none.
+    let image: Vec<Vec<(Row, i64)>> = vec![
+        ins((0..24).map(|id| row(id, id as i64, id as u128 % 3)).collect()),
+        ins((100..140).map(|id| row(id, -(id as i64), id as u128)).collect()),
+        ins((200..220).map(|id| row(id, id as i64, 1 + id as u128 % 2)).collect()),
+        (0..12).map(|id| (row(id, id as i64, id as u128 % 3), 0)).collect(),
+        ins(vec![row(500, 5, 7)]),
+    ];
+    // The leading PK column under exact-linear aggregates: raw deltas are
+    // numbered, consolidated ones taken as runs.
+    let leading: Vec<Vec<(Row, i64)>> = vec![
+        ins((0..20)
+            .map(|i| Row { grp: i, ..row((i as u64 * 3) % 4, 1, 0) })
+            .collect()),
+        ins((0..40).map(|i| row(1000 - i, 2, 0)).collect()),
+        ins((0..20)
+            .map(|i| Row { grp: 100 + i, ..row(i as u64 / 5, 3, 0) })
+            .collect()),
+        ins((0..6).map(|i| row(2000 + i, 4, 0)).collect()),
+        ins((0..20)
+            .map(|i| Row {
+                grp: 200 + i,
+                ..row(3 - (i as u64 * 3) % 4, 5, 0)
+            })
+            .collect()),
+    ];
+    let consolidate_leading = [false, false, true, true, false];
+
+    type Ticks = [Vec<(Row, i64)>];
+    let cases: [(&[u32], &[AggDescriptor], &Ticks); 3] = [
+        (&[0, 7], &extremes, &packed),
+        (&[6], &extremes, &image),
+        (&[1], &linear, &leading),
+    ];
+    for (group_cols, aggs, ticks) in cases {
+        let plan = || ReducePlan::from_wire(&schema(), group_cols, aggs, false).unwrap();
+        let (mut reused, mut fresh) = (Harness::new(plan()), Harness::new(plan()));
+        let mut model = BTreeMap::new();
+        for (t, targets) in ticks.iter().enumerate() {
+            let delta = batch(&delta_to(&mut model, targets));
+            let delta = match group_cols == [1] && consolidate_leading[t] {
+                true => delta.into_consolidated(),
+                false => delta,
+            };
+            fresh.plan = plan();
+            let (a, b) = (reused.tick(delta.clone()), fresh.tick(delta));
+            assert_eq!(weighted_rows(&a), weighted_rows(&b), "{group_cols:?}: epoch {t}");
+            assert_eq!(
+                reused.state(group_cols),
+                aggregates(&model, group_cols, aggs, false),
+                "{group_cols:?}: epoch {t}"
+            );
+        }
     }
 }

@@ -84,10 +84,11 @@ fn a_body_declares_its_output_columns() {
             &[("a", I64, false), ("_sum1", F64, true)],
         ),
     ] {
-        let cols = bound(sql).cols();
+        let rel = bound(sql);
+        let cols = rel.cols();
         let got: Vec<_> = cols
             .iter()
-            .map(|c| (c.def.name.as_str(), c.def.ty.tc, c.def.is_nullable))
+            .map(|c| (&*c.def.name, c.def.ty.tc, c.def.is_nullable))
             .collect();
         assert_eq!(got, want, "{sql}");
     }
@@ -158,7 +159,7 @@ fn a_reduce_reads_one_distinct_set_and_shares_its_columns() {
                         if e.out.def.is_hidden {
                             "<computed>"
                         } else {
-                            e.out.def.name.as_str()
+                            &*e.out.def.name
                         }
                     })
                     .collect();
@@ -197,7 +198,7 @@ fn positional_aliases_rename_the_visible_columns_in_order() {
             col("b", TypeCode::U64),
         ];
         apply_positional_aliases(aliases.iter(), &mut defs, "CTE 'd'")
-            .map(|()| defs.into_iter().map(|c| c.name).collect::<Vec<_>>())
+            .map(|()| defs.into_iter().map(|c| c.name.to_string()).collect::<Vec<_>>())
     };
     assert_eq!(rename(&["x", "y"]).unwrap(), ["_k", "x", "y"]);
     assert_eq!(rename(&[]).unwrap(), ["_k", "a", "b"]);
@@ -206,4 +207,27 @@ fn positional_aliases_rename_the_visible_columns_in_order() {
         "CTE 'd' defines 1 column aliases but body returns 2 columns"
     );
     assert!(rejected(rename(&["x", "X"])).contains("duplicate column name 'X'"));
+}
+
+/// A view body records each catalog reference's visible column names, except
+/// where a column alias list renames them.
+#[test]
+fn a_view_body_records_its_references_column_names() {
+    let (cat, ids) = (catalog(), ColIdGen::new());
+    let mut cx = BindCx::new(
+        &cat,
+        &ids,
+        Surface::View(ViewBody { stmt: "CREATE VIEW", replacing: None }),
+    );
+    let sql = "SELECT t.id FROM t JOIN u AS x(p, q) ON t.a = x.q";
+    bind_query(&mut cx, &parse_query(sql)).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    let got: Vec<_> = cx.refs.into_inner().into_iter().map(|r| (r.name, r.columns)).collect();
+    let names = |ns: &[&str]| Some(ns.iter().map(|n| n.to_string()).collect());
+    assert_eq!(
+        got,
+        vec![
+            ("t".to_string(), names(&["id", "a", "b", "f"])),
+            ("u".to_string(), None)
+        ]
+    );
 }

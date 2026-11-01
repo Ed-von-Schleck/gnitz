@@ -2,7 +2,9 @@
 //! schema: an operator's output or an index's layout. The descriptor itself is
 //! `gnitz-expr`'s.
 
-use gnitz_expr::SchemaRefusal;
+use gnitz_expr::{leading_pk, SchemaRefusal};
+use gnitz_wire::MAX_COLUMNS;
+use smallvec::SmallVec;
 
 mod key;
 mod payload_order;
@@ -16,14 +18,15 @@ pub(crate) use key::{band, compare_pk_ordering, group_floor, pack_pk_be, pk_widt
 pub(crate) use payload_order::{with_payload_cmp, FixedIntNonnull, Generic, PayloadOrder};
 
 /// Builder for a derived schema: its PK columns, then its payload columns.
+/// Inline up to `MAX_COLUMNS`; a longer list spills and `finish` refuses it.
 pub(crate) struct DerivedSchema {
-    cols: Vec<SchemaColumn>,
+    cols: SmallVec<[SchemaColumn; MAX_COLUMNS]>,
     pk_len: usize,
 }
 
 impl DerivedSchema {
     pub(crate) fn new() -> Self {
-        DerivedSchema { cols: Vec::new(), pk_len: 0 }
+        DerivedSchema { cols: SmallVec::new(), pk_len: 0 }
     }
 
     /// Append one payload column.
@@ -39,7 +42,7 @@ impl DerivedSchema {
             self.cols.len(),
             "DerivedSchema: key column pushed behind a payload column"
         );
-        self.cols.push(col);
+        self.push(col);
         self.pk_len += 1;
     }
 
@@ -60,8 +63,7 @@ impl DerivedSchema {
 
     /// The schema pushed so far, as [`SchemaDescriptor::try_new`] admits it.
     pub(crate) fn finish(&self) -> Result<SchemaDescriptor, SchemaRefusal> {
-        let pk: Vec<u32> = (0..self.pk_len as u32).collect();
-        SchemaDescriptor::try_new(&self.cols, &pk)
+        SchemaDescriptor::try_new(&self.cols, leading_pk(self.pk_len))
     }
 }
 

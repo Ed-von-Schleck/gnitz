@@ -15,8 +15,6 @@ pub struct SinkPlan {
     /// The map every survivor goes through first, if any.
     map: Option<MapPlan>,
     kind: Kind,
-    /// The surviving row ranges of the chunk being pushed; reused across chunks.
-    ranges: Vec<(usize, usize)>,
 }
 
 enum Kind {
@@ -85,7 +83,7 @@ impl SinkPlan {
                 }
             }
         };
-        Ok(SinkPlan { map, kind, ranges: Vec::new() })
+        Ok(SinkPlan { map, kind })
     }
 
     /// The layout [`Self::finish`] emits.
@@ -109,8 +107,8 @@ impl SinkPlan {
     /// window ends in. `Ok(true)` once the sink needs no more rows; `Err` past a
     /// fold's group cap.
     pub fn push(&mut self, chunk: &Batch, filter: &mut RowFilter) -> Result<bool, String> {
-        let SinkPlan { map, kind, ranges } = self;
-        filter.ranges(&chunk.as_mem_batch(), ranges);
+        let SinkPlan { map, kind } = self;
+        let ranges = filter.ranges(&chunk.as_mem_batch());
         let map = map.as_mut();
         match kind {
             Kind::Rows(keeper) => {

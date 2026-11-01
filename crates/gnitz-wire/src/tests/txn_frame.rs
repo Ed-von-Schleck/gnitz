@@ -142,6 +142,88 @@ fn delta_poll_roundtrips_every_view_in_order() {
     assert_eq!(peeked(&frame, decode_delta_items).unwrap(), views);
 }
 
+/// A multi-item frame is its prologue followed by each item framed on its own:
+/// the bytes item-by-item `append_frame` calls into a fresh buffer produce.
+#[test]
+fn multi_item_frames_are_their_items_framed_one_by_one() {
+    fn framed(verb: ClientVerb, arg0: u64, items: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let hdr = ControlHeader {
+            arg0,
+            ..ControlHeader::naming(verb, 0.into(), 0)
+        };
+        append_frame(&mut out, &hdr, &[], None, None);
+        for item in items {
+            out.extend_from_slice(&item);
+        }
+        out
+    }
+    fn one(hdr: ControlHeader, blob: &[u8], schema: Option<&[u8]>, data: Option<&[&[u8]]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        append_frame(&mut out, &hdr, blob, schema, data);
+        out
+    }
+
+    let (s0, s1) = (b"schema 0".to_vec(), b"schema one".to_vec());
+    let items = [
+        family(16, WireConflictMode::Error, BLIND, &s0),
+        family(WIDE_TID, WireConflictMode::Update, 9, &s1),
+    ];
+    let want = framed(
+        ClientVerb::PushTxn,
+        0,
+        items.iter().map(|it| {
+            let mut hdr = ControlHeader::naming(ClientVerb::PushTxn, it.target, it.basis);
+            hdr.flags.conflict_mode = it.conflict_mode;
+            one(hdr, &[], it.schema, Some(&it.data[..]))
+        }),
+    );
+    assert_eq!(encode_items(ClientVerb::PushTxn, &items), want);
+
+    let rels = [rel(7, 0), rel(8, 3), rel(9, u64::MAX)];
+    let want = framed(
+        ClientVerb::ScanMulti,
+        0,
+        rels.iter().map(|s| {
+            one(
+                ControlHeader::naming(ClientVerb::ScanMulti, s.target, s.reply_layout),
+                s.spec,
+                None,
+                None,
+            )
+        }),
+    );
+    assert_eq!(encode_scan_multi(&rels), want);
+
+    // A long spec ahead of a short one and a cursorless item: each item's blob
+    // holds only its own cursor and spec.
+    let views = [
+        DeltaPollItem {
+            spec: b"a much longer spec",
+            ..item(1, 5, 1)
+        },
+        item(2, 42, u64::MAX),
+        DeltaPollItem { spec: b"", ..item(3, 0, 7) },
+    ];
+    let want = framed(
+        ClientVerb::DeltaPoll,
+        1_500,
+        views.iter().map(|v| {
+            let (tag, tick) = v.from.map_or((0, 0), DeltaCursor::pair);
+            let mut blob = tag.to_le_bytes().to_vec();
+            blob.extend_from_slice(&tick.to_le_bytes());
+            blob.extend_from_slice(v.spec);
+            one(
+                ControlHeader::naming(ClientVerb::DeltaPoll, v.view, v.reply_layout),
+                &blob,
+                None,
+                None,
+            )
+        }),
+    );
+    assert_eq!(encode_delta_poll(&views, Some(sub(1_500))), want);
+}
+
 /// The first id rides the prologue's `arg0` and nothing else of it moves.
 #[test]
 fn a_kept_delta_poll_carries_its_first_id_in_the_prologue() {

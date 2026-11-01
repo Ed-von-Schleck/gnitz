@@ -62,7 +62,7 @@ fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) ->
                 return Err(GnitzSqlError::Rejected(format!(
                     "ON CONFLICT target must name exactly the primary key ({})",
                     pk.iter()
-                        .map(|&ci| schema.columns()[ci as usize].name.as_str())
+                        .map(|&ci| &*schema.columns()[ci as usize].name)
                         .collect::<Vec<_>>()
                         .join(", "),
                 )));

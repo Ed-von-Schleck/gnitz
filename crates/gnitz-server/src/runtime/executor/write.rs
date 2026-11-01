@@ -46,7 +46,8 @@ pub(super) struct Writes {
     /// same-table pushes reach the committer concurrently and share one fsync.
     table_locks: RefCell<FxHashMap<u64, AsyncRwLock>>,
     /// OCC per-table commit-LSN map: `tid → the zone LSN its last accepted write
-    /// this boot rode`. A missing entry reads as `boot_seed`.
+    /// this boot rode`, raised by [`Writes::committed`]. A missing entry reads
+    /// as `boot_seed`.
     table_commit_lsn: RefCell<FxHashMap<u64, u64>>,
     /// The SAL watermark when the executor started: every read watermark this
     /// boot is at or above it, and every commit's zone above it.
@@ -121,6 +122,17 @@ impl Writes {
         committed.unwrap_or(self.boot_seed) > basis
     }
 
+    /// Record a committed write of `batch` to `tid` at commit LSN `lsn`: the
+    /// validation caches, then `tid`'s commit LSN, raised to `lsn`. The
+    /// committer calls it before it answers the writer, which still holds its
+    /// table locks, so an OCC check of a later write to `tid` sees the raise.
+    pub(super) fn committed(&self, cat: &CatalogEngine, tid: u64, batch: &Batch, lsn: u64) {
+        self.checks.committed(cat, tid, batch);
+        let mut map = self.table_commit_lsn.borrow_mut();
+        let e = map.entry(tid).or_default();
+        *e = (*e).max(lsn);
+    }
+
     /// Drop relation `id`'s table lock, commit LSN and validation caches. The
     /// caller proves no task holds or awaits the lock; see
     /// [`Shared::forget_relation`].
@@ -132,9 +144,9 @@ impl Writes {
 }
 
 impl Shared {
-    /// Validate `families` as one bundle, commit it with the families its
-    /// deletes cascade to as one write, and raise each written table's commit
-    /// LSN to the write's.
+    /// Validate `families` as one bundle, and commit it with the families its
+    /// deletes cascade to as one write. The committer raises each written
+    /// table's commit LSN to the write's.
     async fn commit(
         &self,
         _catalog: &ReadGuard<CatalogLock>,
@@ -148,21 +160,11 @@ impl Shared {
             "a write whose validation reads committed state holds its table exclusively"
         );
         self.writes.checks.validate_txn(&self.dispatcher, &mut families).await?;
-        let tids: Vec<u64> = families.iter().map(|f| f.tid).collect();
         assert!(
-            tids.iter().all(|&t| held.holds(t)),
+            families.iter().all(|f| held.holds(f.tid)),
             "a commit bumps only tables whose lock it holds"
         );
-        let lsn = self.committer.write(families).await?;
-        let mut map = self.writes.table_commit_lsn.borrow_mut();
-        for tid in tids {
-            // Pushes sharing a read guard resume from the await in any order.
-            let e = map.entry(tid).or_default();
-            *e = (*e).max(lsn);
-            // After the raise, which is what a woken poll reads as staleness.
-            self.feeds.wake(tid);
-        }
-        Ok(lsn)
+        self.committer.write(families).await
     }
 }
 
@@ -253,7 +255,8 @@ pub(super) async fn handle_push(shared: &Shared, buf: RecvBuf, ctrl: DecodedCont
     // push's deletes cascade to.
     let held = if shared.cat().push_reads_committed_state(family.tid, family.mode) {
         let deletes = !family.batch.all_weights_positive();
-        let locks = shared.cat().write_lock_set(family.tid, deletes);
+        let mut locks = Vec::with_capacity(4);
+        shared.cat().write_lock_set_into(&mut locks, family.tid, deletes);
         shared.writes.lock_tables_exclusive(&catalog, locks).await
     } else {
         shared.writes.lock_table_shared(&catalog, family.tid).await
@@ -280,11 +283,13 @@ pub(super) async fn handle_push_txn(shared: &Shared, buf: RecvBuf, ctrl: Decoded
         families.push(family);
     }
 
-    // 3. Acquire the per-table lock union ⋃ write_lock_set(tid) exclusively.
-    let union = families
-        .iter()
-        .flat_map(|f| shared.cat().write_lock_set(f.tid, !f.batch.all_weights_positive()))
-        .collect();
+    // 3. Acquire the per-table lock union ⋃ write_lock_set_into(tid) exclusively.
+    let mut union = Vec::with_capacity(4 * families.len());
+    for f in &families {
+        shared
+            .cat()
+            .write_lock_set_into(&mut union, f.tid, !f.batch.all_weights_positive());
+    }
     let held = shared.writes.lock_tables_exclusive(&catalog, union).await;
 
     // 3b. OCC. A blind family's `BLIND` basis no commit exceeds.

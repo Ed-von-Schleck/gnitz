@@ -90,6 +90,38 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
     assert_eq!(overlaid(&mut buf, 17), [(1, 12, 1)], "tids are independent");
 }
 
+/// A shared batch opens its family without a copy, and the transaction holds
+/// each push's rows as they were at the call: the pusher appending to its own
+/// batch between pushes, through `Arc::make_mut` as the Python batch does,
+/// changes nothing buffered, and extending the family copies the batch the
+/// pusher still holds rather than writing it. The read between the pushes
+/// indexes the family before its copy; the index stays valid after it.
+#[test]
+fn a_shared_batch_is_buffered_as_it_was_at_each_push() {
+    let s = Arc::new(kv_schema(TypeCode::I64));
+    let mut buf = TxnBuffer::default();
+    let mut rows = Arc::new(kv_rows(&[(1, 11, 1)]));
+    buf.push(7, &s, Arc::clone(&rows), Update, BLIND).unwrap();
+    assert!(
+        Arc::ptr_eq(&buf.families[0].batch, &rows),
+        "a new family shares the batch"
+    );
+    assert_eq!(overlaid(&mut buf, 7), [(1, 11, 1)]);
+
+    Arc::make_mut(&mut rows).extend_from(&kv_rows(&[(2, 21, 1)]));
+    assert_eq!(contents(&buf.families[0].batch), [(1, 11, 1)]);
+
+    buf.push(7, &s, Arc::clone(&rows), Update, BLIND).unwrap();
+    assert_eq!(buf.families.len(), 1);
+    assert_eq!(contents(&buf.families[0].batch), [(1, 11, 1), (1, 11, 1), (2, 21, 1)]);
+    assert_eq!(
+        contents(&rows),
+        [(1, 11, 1), (2, 21, 1)],
+        "the pusher's batch is not written"
+    );
+    assert_eq!(overlaid(&mut buf, 7), [(1, 11, 1), (2, 21, 1)]);
+}
+
 /// A buffered row joins the read at weight 1, as the committed rows beside it
 /// stand, whatever weight it was pushed at.
 #[test]
@@ -185,7 +217,7 @@ fn overlay_is_the_committed_read_without_a_live_op() {
 #[test]
 fn the_read_index_is_built_on_read() {
     let s = Arc::new(kv_schema(TypeCode::I64));
-    let indexed = |buf: &TxnBuffer| buf.indexed.iter().sum::<usize>();
+    let indexed = |buf: &TxnBuffer| buf.tids.values().map(|t| t.last_op.len()).sum::<usize>();
     let mut buf = TxnBuffer::default();
     buf.push(17, &s, kv_rows(&[(9, 90, 1)]), Error, BLIND).unwrap();
     for pk in 1..=4 {

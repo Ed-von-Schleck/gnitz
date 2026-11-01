@@ -3,6 +3,7 @@
 //! server against a hand-built catalog.
 
 use gnitz_wire::{ColType, ColumnDef, RelClass, TypeCode, PK_LIST_MAX_COLS};
+use std::sync::Arc;
 
 use super::*;
 
@@ -336,18 +337,20 @@ fn a_cte_body_reads_in_place_only_when_it_renames() {
 }
 
 /// A view's column list names the SELECT list in order, the key's column
-/// included.
+/// included, and leaves the source relation's own names alone.
 #[test]
 fn view_column_aliases_name_the_select_list() {
     let i = TypeCode::I64;
+    let tn = table(32, vec![col("id", i), ncol("name", TypeCode::String)], vec![0]);
     let cat = catalog(vec![
-        (
-            "tn",
-            table(32, vec![col("id", i), ncol("name", TypeCode::String)], vec![0]),
-        ),
+        ("tn", Arc::clone(&tn)),
         ("t", table(33, vec![col("id", i), col("g", i), col("v", i)], vec![0])),
     ]);
     let rows: &[(&str, Shape)] = &[
+        (
+            "CREATE VIEW v (x, y) AS SELECT id, name FROM tn",
+            sh(&[("x", false, false), ("y", false, true)]),
+        ),
         (
             "CREATE VIEW v (x, y) AS SELECT name, id FROM tn",
             sh(&[("x", false, true), ("y", false, false)]),
@@ -365,6 +368,8 @@ fn view_column_aliases_name_the_select_list() {
         let chain = plan(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
         assert_eq!(&output_shape(&chain), shape, "{sql}");
     }
+    let names: Vec<&str> = tn.schema.columns().iter().map(|c| &*c.name).collect();
+    assert_eq!(names, ["id", "name"]);
 }
 
 /// A CTE that passes a view through whole keeps the view's hidden row key, so a
@@ -769,7 +774,7 @@ fn an_item_is_declared_by_whether_it_is_copied_or_computed() {
         let cols = &final_view(&chain).schema.columns();
         let c = cols
             .iter()
-            .find(|c| c.name == name)
+            .find(|c| &*c.name == name)
             .unwrap_or_else(|| panic!("`{body}`: no column '{name}'"));
         assert_eq!((c.ty.tc, c.is_nullable), (tc, nullable), "{body}");
     }
@@ -796,7 +801,7 @@ fn a_synthetic_key_over_a_decimal_keeps_its_scale() {
         let cols = final_view(&chain).schema.columns();
         let c = cols
             .iter()
-            .find(|c| c.name == key)
+            .find(|c| &*c.name == key)
             .unwrap_or_else(|| panic!("{body}: no {key}"));
         assert_eq!(c.ty, ColType::decimal(2), "{body}");
     }
@@ -996,12 +1001,7 @@ fn a_chain_segment_keeps_only_its_live_columns() {
         "SELECT ja.id AS aid, jc.cv AS ccv FROM ja JOIN jb ON ja.k = jb.id JOIN jc ON ja.v = jc.id",
     );
     assert_eq!(view_count(&chain), 2);
-    let seg: Vec<&str> = chain.segments[0]
-        .schema
-        .columns()
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect();
+    let seg: Vec<&str> = chain.segments[0].schema.columns().iter().map(|c| &*c.name).collect();
     assert_eq!(seg, ["_join_pk", "id", "v"]);
     assert_eq!(
         output_shape(&chain),
@@ -1038,12 +1038,7 @@ fn a_collision_segment_keeps_only_its_live_columns() {
         "SELECT e.nm AS emp, m.nm AS boss FROM emp e JOIN emp m ON e.mgr = m.id",
     );
     assert_eq!(view_count(&chain), 2);
-    let wrapper: Vec<&str> = chain.segments[0]
-        .schema
-        .columns()
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect();
+    let wrapper: Vec<&str> = chain.segments[0].schema.columns().iter().map(|c| &*c.name).collect();
     assert_eq!(wrapper, ["id", "nm"]);
 
     // `t EXCEPT t` cuts nothing: a set operation reads one source on both sides.

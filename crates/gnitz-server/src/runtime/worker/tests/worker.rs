@@ -12,10 +12,12 @@ use crate::test_support::{
     register_full_pk, register_identity_view, scan_all, table_engine, u64_i64_cols, weighted_rows,
 };
 use gnitz_store::read::Probe;
+use gnitz_store::read::ReadRows;
 use gnitz_wire::{peek_control_block, DecodedControl, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode, WireStatus};
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::schema::SchemaDescriptor;
 use std::borrow::Cow;
+use std::rc::Rc;
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -241,6 +243,19 @@ fn in_wait_dispositions() {
     drain_in_wait(&mut wp);
 
     assert_eq!(owed(&wp), [("parked", 1), ("parked", 2), ("train", 4)]);
+    // A parked read is answered after the drive reads past a `Flush`, which
+    // lets the master rewrite the SAL bytes it was decoded from.
+    for owed in &wp.replies {
+        if let Owed::Parked(_, read) = owed {
+            assert!(
+                matches!(
+                    **read,
+                    Read::ScanSpec { spec: Cow::Owned(_), .. } | Read::Delta { spec: Cow::Owned(_), .. }
+                ),
+                "a parked read owns its bytes: {read:?}"
+            );
+        }
+    }
     let out = frames(&rx);
     assert_eq!(reqs(&out), [3, 5]);
     assert_eq!(rx.acks(0), [6, 7], "Push and Flush ACK");
@@ -451,15 +466,15 @@ fn reply_trains_drain_in_order_and_reassemble_exactly() {
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
     let (mut wp, _sal, rx) = test_worker(&mut engine);
     wp.reply_frame_budget = budget;
-    wp.reply(route(1, 11, 1), Ok(Rows::Own(a.clone())));
-    wp.reply(route(2, 22, 2), Ok(Rows::Own(b.clone())));
+    wp.reply(route(1, 11, 1), Ok(Rows::from(a.clone())));
+    wp.reply(route(2, 22, 2), Ok(Rows::from(b.clone())));
     // Cut 3: a train, then two members that fit and stay behind it.
-    wp.reply(route(3, 33, 3), Ok(Rows::Own(c.clone())));
-    wp.reply(route(5, 55, 3), Ok(Rows::Own(one.clone())));
-    wp.reply(route(6, 66, 3), Ok(Rows::Own(empty.clone())));
+    wp.reply(route(3, 33, 3), Ok(Rows::from(c.clone())));
+    wp.reply(route(5, 55, 3), Ok(Rows::from(one.clone())));
+    wp.reply(route(6, 66, 3), Ok(Rows::from(empty.clone())));
     // Cut 4 owes nothing: both members pass the queue.
-    wp.reply(route(4, 44, 4), Ok(Rows::Own(one.clone())));
-    wp.reply(route(4, 45, 4), Ok(Rows::Own(one.clone())));
+    wp.reply(route(4, 44, 4), Ok(Rows::from(one.clone())));
+    wp.reply(route(4, 45, 4), Ok(Rows::from(one.clone())));
 
     let inline = frames(&rx);
     assert_eq!(
@@ -556,11 +571,11 @@ fn a_fitting_reply_is_the_source_batch_verbatim() {
     let dir = crate::test_support::scratch_dir("worker", "verbatim_reply");
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
     let (mut wp, _sal, rx) = test_worker(&mut engine);
-    wp.reply(route(1, 5, 1), Ok(Rows::Shared(Rc::clone(&batch))));
+    wp.reply(route(1, 5, 1), Ok(Rows::from(ReadRows::Shared(Rc::clone(&batch)))));
     assert!(wp.replies.is_empty(), "the first member of its cut leaves at once");
     // Behind a fault its own cut owes, the same reply waits in the queue.
     wp.replies.push_back(Owed::Fault(route(1, 6, 2), "boom".into()));
-    wp.reply(route(1, 7, 2), Ok(Rows::Shared(Rc::clone(&batch))));
+    wp.reply(route(1, 7, 2), Ok(Rows::from(ReadRows::Shared(Rc::clone(&batch)))));
     drain_replies(&mut wp);
 
     let out = frames(&rx);
@@ -590,8 +605,8 @@ fn a_row_wider_than_the_frame_cap_faults_its_train_alone() {
     let dir = crate::test_support::scratch_dir("worker", "oversized_row");
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
     let (mut wp, _sal, rx) = test_worker(&mut engine);
-    wp.reply(route(1, 5, 1), Ok(Rows::Own(batch)));
-    wp.reply(route(2, 6, 1), Ok(Rows::Own(next)));
+    wp.reply(route(1, 5, 1), Ok(Rows::from(batch)));
+    wp.reply(route(2, 6, 1), Ok(Rows::from(next)));
     assert_eq!(owed(&wp), [("train", 5), ("train", 6)]);
     drain_replies(&mut wp);
 
@@ -618,7 +633,7 @@ fn an_ordered_fault_stays_behind_its_cuts_queued_train() {
     let (mut wp, _sal, rx) = test_worker(&mut engine);
     wp.reply_frame_budget = frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 4]));
 
-    wp.reply(route(1, 11, 1), Ok(Rows::Own(rows)));
+    wp.reply(route(1, 11, 1), Ok(Rows::from(rows)));
     wp.reply(route(1, 12, 1), Err("of the train's cut".into()));
     wp.reply(route(1, 13, 2), Err("of another cut".into()));
     let passing = frames(&rx);
@@ -646,7 +661,7 @@ fn a_full_ring_owes_instead_of_blocking() {
     let (mut wp, _sal, rx) = worker_over(&mut engine, 4096, 1 << 20);
     while wp.w2m_writer.try_send_msg(id(1), false, &WireMsg::default()) {}
 
-    wp.reply(route(1, 5, 1), Ok(Rows::Own(one.clone())));
+    wp.reply(route(1, 5, 1), Ok(Rows::from(one.clone())));
     wp.reply(route(1, 6, 2), Err("boom".into()));
     assert_eq!(owed(&wp), [("train", 5), ("fault", 6)]);
 
@@ -670,7 +685,7 @@ fn a_train_advances_with_every_request() {
     let (mut engine, tid) = table_engine("worker", "train_advances", 1, &u64_i64_cols());
     let (mut wp, sal, rx) = test_worker(&mut engine);
     wp.reply_frame_budget = frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 4]));
-    wp.reply(route(1, 11, 1), Ok(Rows::Own(rows)));
+    wp.reply(route(1, 11, 1), Ok(Rows::from(rows)));
 
     for _ in 0..GROUPS {
         // Control-only and unanswered: nothing of its own reaches the ring.
@@ -797,7 +812,7 @@ fn a_refusal_names_a_shortage_only_behind_another_cuts_bytes() {
     let (mut wp, _sal, rx) = worker_over(&mut engine, 4096, 1 << 20);
     wp.reply_frame_budget = frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 16]));
 
-    wp.reply(route(1, 11, 1), Ok(Rows::Own(rows)));
+    wp.reply(route(1, 11, 1), Ok(Rows::from(rows)));
     while !wp.w2m_writer.short_of_room() {
         wp.emit_reply_frame();
     }
@@ -805,7 +820,7 @@ fn a_refusal_names_a_shortage_only_behind_another_cuts_bytes() {
 
     // As large as the train's frame the ring just refused.
     let behind = make_batch_raw(&fixed, &(0..16).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
-    wp.reply(route(2, 22, 2), Ok(Rows::Own(behind)));
+    wp.reply(route(2, 22, 2), Ok(Rows::from(behind)));
     assert_eq!(owed(&wp), [("train", 11), ("train", 22)]);
     assert!(
         rx.take_shortage(0),
@@ -827,8 +842,8 @@ fn a_held_train_steps_aside_until_its_hold_ends() {
     let (mut wp, _sal, rx) = test_worker(&mut engine);
     wp.reply_frame_budget = frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 16]));
 
-    wp.reply(route(1, 11, 1), Ok(Rows::Own(rows.clone())));
-    wp.reply(route(1, 12, 1), Ok(Rows::Own(rows)));
+    wp.reply(route(1, 11, 1), Ok(Rows::from(rows.clone())));
+    wp.reply(route(1, 12, 1), Ok(Rows::from(rows)));
     wp.replies.push_back(Owed::Fault(route(2, 21, 2), "boom".into()));
     assert!(rx.hold(0, id(11)));
     wp.emit_reply_frame();

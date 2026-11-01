@@ -45,22 +45,20 @@ async fn delta_cut<'s>(
     if reads.peek().is_none() {
         return Ok(Vec::new());
     }
-    let mut reached = Vec::with_capacity(reads.size_hint().0);
-    let leases = disp
-        .scan_cut(|cut| {
-            for (view, after_tick, spec, reply_layout) in reads {
-                cut.read(Read::Delta {
-                    view,
-                    after_tick,
-                    reply_layout,
-                    spec: spec.into(),
-                })?;
-                reached.push(disp.last_delta_round(view));
-            }
-            Ok(())
-        })
-        .await?;
-    Ok(leases.into_iter().zip(reached).collect())
+    disp.scan_cut(|cut| {
+        let mut leases = Vec::with_capacity(reads.size_hint().0);
+        for (view, after_tick, spec, reply_layout) in reads {
+            let lease = cut.read(Read::Delta {
+                view,
+                after_tick,
+                reply_layout,
+                spec: spec.into(),
+            })?;
+            leases.push((lease, disp.last_delta_round(view)));
+        }
+        Ok(leases)
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -215,13 +213,18 @@ pub(super) async fn handle_delta_poll(
 
 /// The frame that ends a delta train: the cursor to read `view` from next.
 fn terminal(view: u64, round: u64, tag: u64) -> WireMsg<'static> {
-    WireMsg {
+    let msg = WireMsg {
         target_id: view,
         arg0: round,
         arg1: tag,
         ..Default::default()
-    }
+    };
+    debug_assert_eq!(gnitz_wire::FRAME_LEN_PREFIX_BYTES + msg.size(), TERMINAL_BYTES);
+    msg
 }
+
+/// The framed size of every [`terminal`]: a head with no blob, schema or data.
+const TERMINAL_BYTES: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES + gnitz_wire::frame_head_size(0, None);
 
 /// The catalog read lock a sync of the views `ids` is answered under, every
 /// commit reaching one of them ticked. A `quiet` sync is first held until a
@@ -240,12 +243,15 @@ async fn hold_lock(
     }
     // No await from the test to the park, so no commit is acknowledged between
     // them. The drain above was one: a commit it did not take is un-ticked here.
-    let mut watched = shared.cat().dag.source_closure(ids());
-    if !(shared.ticks.all_ticked(&watched) && quiet()) {
+    let ticked = shared.ticks.all_ticked(&shared.cat().dag, ids());
+    if !(ticked && quiet()) {
         return Ok(g);
     }
     // A commit or a drop reaches a view through the view or anything it reads.
-    watched.extend(ids());
+    let watched: FxHashSet<u64> = {
+        let cat = shared.cat();
+        ids().flat_map(|v| cat.dag.self_and_sources(v)).collect()
+    };
     let mut parked = shared.feeds.waiters.park(watched);
     drop(g);
     select2(&mut parked.woken, shared.dispatcher.reactor().sleep_until(until)).await;
@@ -602,12 +608,15 @@ impl Subscriptions {
 
     /// Ship every queued train behind what is corked.
     pub(super) async fn ship(&self, peer: &Peer) -> Result<(), PeerGone> {
+        // Each pass swaps the drained Vec back in for the trains queued since,
+        // so the Outbox keeps one allocation across ships.
+        let mut batch = Vec::new();
         loop {
-            let trains = self.out.trains.take();
-            if trains.is_empty() {
+            std::mem::swap(&mut batch, &mut *self.out.trains.borrow_mut());
+            if batch.is_empty() {
                 return Ok(());
             }
-            for Train { view, id, body } in trains {
+            for Train { view, id, body } in batch.drain(..) {
                 peer.cork_with(|out| pushed_marker(view, id).encode_framed(out));
                 peer.send(SendBody::Shared(body)).await?;
             }
@@ -710,23 +719,24 @@ async fn sync_wait(
 pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::Sender<()>>) {
     let feeds = &shared.feeds;
     let disp = &shared.dispatcher;
+    // Scratch kept across passes; each pass leaves every one empty.
+    let mut waiting: Vec<oneshot::Sender<()>> = Vec::new();
+    let mut asked: Vec<Rc<Feed>> = Vec::new();
+    let mut behind: Vec<(Rc<Feed>, u64)> = Vec::new();
+    let mut reads: Vec<(Rc<Feed>, u64)> = Vec::new();
     loop {
         // Taken together, so a pass reads every feed its requests asked for
         // and positions each after they asked.
-        let mut waiting = vec![asks.recv().await];
+        waiting.push(asks.recv().await);
         while let Some(done) = asks.try_recv() {
             waiting.push(done);
         }
-        let asked: Vec<Rc<Feed>> = {
-            let live = feeds.live.borrow();
-            live.values().filter(|feed| feed.asked.take()).cloned().collect()
-        };
+        asked.extend(feeds.live.borrow().values().filter(|feed| feed.asked.take()).cloned());
         // Each distinct cursor that is behind, of the feeds still readable.
         let mut first_lock = Some(shared.catalog_rwlock.read().await);
-        let mut behind: Vec<(&Rc<Feed>, u64)> = Vec::new();
-        for feed in &asked {
-            if let Err(fault) = feed_readable(&shared, feed) {
-                feeds.end(feed, &fault);
+        for feed in asked.drain(..) {
+            if let Err(fault) = feed_readable(&shared, &feed) {
+                feeds.end(&feed, &fault);
                 continue;
             }
             let first = behind.len();
@@ -734,7 +744,7 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
             for m in feed.members.borrow().iter().filter(|m| !m.caught_up(last)) {
                 let cursor = m.after_tick.get().expect("a member is one its feed has not ended");
                 if behind[first..].iter().all(|&(_, read)| read != cursor) {
-                    behind.push((feed, cursor));
+                    behind.push((Rc::clone(&feed), cursor));
                 }
             }
         }
@@ -743,10 +753,9 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
                 Some(g) => g,
                 None => shared.catalog_rwlock.read().await,
             };
-            let mut reads = Vec::with_capacity(slice.len());
-            for &(feed, cursor) in slice {
+            for (feed, cursor) in slice {
                 match feed_readable(&shared, feed) {
-                    Ok(_) => reads.push((feed, cursor)),
+                    Ok(_) => reads.push((Rc::clone(feed), *cursor)),
                     Err(fault) => feeds.end(feed, &fault),
                 }
             }
@@ -754,21 +763,22 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
                 disp,
                 reads
                     .iter()
-                    .map(|&(feed, cursor)| (feed.key.view.tid, cursor, &*feed.key.spec, feed.key.layout)),
+                    .map(|(feed, cursor)| (feed.key.view.tid, *cursor, &*feed.key.spec, feed.key.layout)),
             )
             .await;
             drop(catalog);
             match cut {
                 Ok(cut) => {
-                    for ((feed, cursor), (lease, round)) in reads.into_iter().zip(cut) {
-                        queue_train(&shared, feed, cursor, round, lease).await;
+                    for ((feed, cursor), (lease, round)) in reads.drain(..).zip(cut) {
+                        queue_train(&shared, &feed, cursor, round, lease).await;
                     }
                 }
-                Err(fault) => reads.iter().for_each(|(feed, _)| feeds.end(feed, &fault)),
+                Err(fault) => reads.drain(..).for_each(|(feed, _)| feeds.end(&feed, &fault)),
             }
         }
+        behind.clear();
         drop(first_lock);
-        for done in waiting {
+        for done in waiting.drain(..) {
             done.send(());
         }
     }
@@ -785,7 +795,16 @@ async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, round: u64, 
     let read = loop {
         match lease.next().await {
             Ok(Some(_)) if body.len() > cap => break Err(lagged(tid)),
-            Ok(Some(frame)) => body.extend_from_slice(frame.slot.frame_bytes()),
+            Ok(Some(frame)) => {
+                let bytes = frame.slot.frame_bytes();
+                if body.is_empty() {
+                    // Room for one frame this size from each worker and the
+                    // terminal, capped near where the lagged check stops reading.
+                    let workers = lease.targets().set.len();
+                    body.reserve((bytes.len() * workers).min(cap) + TERMINAL_BYTES);
+                }
+                body.extend_from_slice(bytes);
+            }
             Ok(None) => break Ok(()),
             Err(fault) => break Err(fault),
         }
@@ -797,21 +816,28 @@ async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, round: u64, 
     let reading = members.iter().filter(|m| m.after_tick.get() == Some(cursor));
     match read {
         Err(fault) => fail_subscribers(tid, reading, &fault),
+        // Rounds that left the subscription no row are sent as no train.
+        Ok(()) if body.is_empty() => {
+            for m in reading {
+                m.after_tick.set(Some(round));
+            }
+        }
         Ok(()) => {
-            // Rounds that left the subscription no row are sent as no train.
-            let rows = !body.is_empty();
             terminal(tid, round, feed.tag).encode_framed(&mut body);
+            // Rows from fewer workers than reserved for: the rest goes back,
+            // so a queued train holds at most twice its length.
+            if body.capacity() > 2 * body.len() {
+                body.shrink_to_fit();
+            }
             let body = Rc::new(body);
             for m in reading {
-                if rows && m.out.unsynced() + body.len() > cap {
+                if m.out.unsynced() + body.len() > cap {
                     fail_subscribers(tid, [m], &lagged(tid));
                     continue;
                 }
                 m.after_tick.set(Some(round));
-                if rows {
-                    m.told.set(round);
-                    m.out.send(tid, m.id, Rc::clone(&body));
-                }
+                m.told.set(round);
+                m.out.send(tid, m.id, Rc::clone(&body));
             }
         }
     }

@@ -135,30 +135,25 @@ impl MasterDispatcher {
     pub(crate) fn emit_tick(&self, excl: &mut SalExcl<'_>, tids: &[u64]) -> Result<AckLease, WireFault> {
         let first = self.rounds.round.get() + 1;
         self.rounds.round.set(first + tids.len() as u64 - 1);
-        for (i, &tid) in tids.iter().enumerate() {
-            self.record_delta_round(tid, first + i as u64);
-        }
+        self.record_delta_rounds(tids, first);
         let tick = Apply::Tick { first_round: first, tids: tids.into() };
         self.write_acked(excl, SalGroup::new(tick))
     }
 
-    /// Raise the last-reached round of every fed view in `tid`'s **forward**
-    /// closure — which views this source reaches. Skipped outright when no view
-    /// carries a feed, which is every server that does not use the feature.
+    /// Raise each fed view's last-reached round to the last of `tids`' rounds
+    /// (`first` onward) whose tid is in the view's source closure. Costs nothing
+    /// past one registry pass on a server where no view carries a feed.
     ///
     /// At **emit** time, not at ACK time: a round emitted but not yet ACKed has
     /// already reached the view's workers, and an ACK-time update would let the
     /// gate answer "nothing changed" over a round whose rows are already in flight.
-    fn record_delta_round(&self, tid: u64, round: u64) {
+    fn record_delta_rounds(&self, tids: &[u64], first: u64) {
         let cat = self.cat();
-        if !cat.registry.any_delta_feed() {
-            return;
-        }
-        let reached = cat.dag.dependent_closure([tid]);
         let mut map = self.rounds.last_delta_round.borrow_mut();
-        for vid in reached {
-            if cat.registry.relation(vid).is_some_and(|r| r.kind().has_delta_feed()) {
-                map.insert(vid, round);
+        for vid in cat.registry.delta_fed() {
+            let sources = cat.dag.source_closure_of(vid);
+            if let Some(i) = tids.iter().rposition(|t| sources.binary_search(t).is_ok()) {
+                map.insert(vid, first + i as u64);
             }
         }
     }

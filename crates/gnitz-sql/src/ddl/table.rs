@@ -60,9 +60,7 @@ fn is_auto_name(name: &str, base: &str) -> bool {
 /// The column list of an index over `key`, or why no index can be built on it.
 fn index_key(cols: &[ColumnDef], key: &[u32], src_pk_count: usize, role: &str) -> Result<PkColList, GnitzSqlError> {
     let rejected = |rule: gnitz_wire::PkRule| {
-        let named = rule.named(PkListRole::ColumnList, |c| {
-            cols.get(c as usize).map(|d| d.name.as_str())
-        });
+        let named = rule.named(PkListRole::ColumnList, |c| cols.get(c as usize).map(|d| &*d.name));
         GnitzSqlError::Rejected(format!("{role}: {named}"))
     };
     gnitz_wire::validate_index_key(key, cols.len(), src_pk_count, |c| cols[c as usize].ty.tc).map_err(rejected)
@@ -404,7 +402,7 @@ fn name_unique_indexes(
             let name = match u.name {
                 Some(name) => IndexName::Written(name),
                 None => {
-                    let col_names: Vec<&str> = u.cols.iter().map(|&c| cols[c as usize].name.as_str()).collect();
+                    let col_names: Vec<&str> = u.cols.iter().map(|&c| &*cols[c as usize].name).collect();
                     IndexName::Auto(default_index_name(table, &col_names))
                 }
             };
@@ -665,7 +663,7 @@ pub(crate) fn plan_create_table(
     // so it is no more refused here than it is on a table.
     if props.stream {
         if let Some(u) = unique.first() {
-            let names: Vec<&str> = u.cols.iter().map(|&c| cols[c as usize].name.as_str()).collect();
+            let names: Vec<&str> = u.cols.iter().map(|&c| &*cols[c as usize].name).collect();
             return Err(GnitzSqlError::Rejected(format!(
                 "a stream cannot carry a UNIQUE constraint (column(s) {}): it holds no rows to index",
                 names.join(", ")

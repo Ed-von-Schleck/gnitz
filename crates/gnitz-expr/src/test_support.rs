@@ -436,18 +436,20 @@ pub fn passing_rows(ev: &mut RowFilter, mb: &TestView) -> Vec<bool> {
 /// to be exactly the maximal runs of those verdicts: ordered, non-empty, apart
 /// and inside the batch.
 pub fn filter_verdicts(ev: &mut RowFilter, mb: &dyn BatchView) -> Vec<bool> {
-    // A stale entry, which `ranges` must clear.
-    let mut ranges = vec![(usize::MAX, usize::MAX)];
-    ev.ranges(mb, &mut ranges);
+    let ranges = ev.ranges(mb);
     let mut passed = vec![false; mb.row_count()];
-    for &(s, e) in &ranges {
+    for &(s, e) in &*ranges {
         assert!(
             s < e && e <= passed.len(),
             "run ({s}, {e}) is not a non-empty run of the batch"
         );
         passed[s..e].fill(true);
     }
-    assert_eq!(ranges, runs(&passed), "the runs are not the maximal runs of their rows");
+    assert_eq!(
+        *ranges,
+        runs(&passed),
+        "the runs are not the maximal runs of their rows"
+    );
     passed
 }
 
@@ -620,11 +622,7 @@ impl Meter {
 
     /// [`Self::levels`] of a filter's `ranges` over `view`.
     pub(crate) fn filter(&self, bench: &str, case: &str, f: &mut RowFilter, view: &TestView) {
-        let mut ranges = Vec::new();
-        self.levels(bench, case, view.row_count(), f, |f| {
-            f.ranges(view, &mut ranges);
-            ranges.len()
-        });
+        self.levels(bench, case, view.row_count(), f, |f| f.ranges(view).len());
     }
 }
 

@@ -7,7 +7,8 @@ use gnitz_wire::{FkAction, FkRef};
 /// The lock set of a write to `tid` that `deletes` or does not, as
 /// `lock_tables_exclusive` acquires it: sorted and deduped.
 fn lock_set_of(engine: &CatalogEngine, tid: u64, deletes: bool) -> Vec<u64> {
-    let mut set = engine.write_lock_set(tid, deletes);
+    let mut set = Vec::new();
+    engine.write_lock_set_into(&mut set, tid, deletes);
     set.sort_unstable();
     set.dedup();
     set
@@ -98,6 +99,13 @@ fn a_write_locks_what_its_cascade_can_delete_from() {
     assert_eq!(lock_set(&engine, held), [root, held, under]);
     assert_eq!(lock_set_of(&engine, root, false), [root, mid, held]);
     assert_eq!(lock_set_of(&engine, mid, false), [root, mid, leaf]);
+    // Appends to what the set already holds, as a transaction's union of its
+    // families' sets is built.
+    let mut union = vec![other];
+    engine.write_lock_set_into(&mut union, held, false);
+    union.sort_unstable();
+    union.dedup();
+    assert_eq!(union, [root, other, held, under]);
     let _ = (beyond, under);
 
     let actions = |tid| -> Vec<FkAction> { engine.fks_as_child(tid).iter().map(|e| e.on_delete).collect() };

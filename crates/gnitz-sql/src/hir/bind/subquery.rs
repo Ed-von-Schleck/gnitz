@@ -89,7 +89,6 @@ fn resolve_inner<'e>(cx: SubCtx<'_>, subquery: &'e Query) -> Result<InnerResolve
         ));
     };
     let tref = extract_table_ref(factor, cx.cx.cat.schema_name(), "subquery")?;
-    let inner_alias = tref.alias.clone();
     let (inner_get, inner_cols) = resolve_table_ref(cx.cx, &tref)?;
 
     let mut local_preds: Vec<HirExpr> = Vec::new();
@@ -98,7 +97,7 @@ fn resolve_inner<'e>(cx: SubCtx<'_>, subquery: &'e Query) -> Result<InnerResolve
         // The (outer, inner) scope the split resolves against — built here, and
         // read nowhere else: a subquery with no WHERE has nothing to split.
         let mut scope = cx.outer.clone();
-        scope.push(&inner_alias, inner_cols.clone())?;
+        scope.push(&tref.alias, inner_cols.clone())?;
         let leaf = ScopeLeaf {
             scope: &scope,
             sub: SubPolicy::Reject(|_| {
@@ -124,7 +123,7 @@ fn resolve_inner<'e>(cx: SubCtx<'_>, subquery: &'e Query) -> Result<InnerResolve
     let rel = RelExpr::filter(inner_get, local_preds)?;
     Ok(InnerResolved {
         rel,
-        inner: JoinScope::single(&inner_alias, inner_cols),
+        inner: JoinScope::single(tref.alias, inner_cols),
         inner_select,
         correlation,
     })

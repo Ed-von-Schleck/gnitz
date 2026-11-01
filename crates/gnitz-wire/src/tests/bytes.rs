@@ -33,9 +33,10 @@ fn bit_iter_yields_set_bits_lowest_first() {
     assert_eq!(BitIter(low_bits_mask(64)).count(), 64);
 }
 
-/// `set_bit_runs` against a bit-by-bit run collector: every maximal run of set
-/// bits below `n`, over single bits at both ends of a word, whole words set and
-/// clear, and runs crossing and ending on word boundaries.
+/// `set_bit_runs` and `set_bit_runs_iter` against a bit-by-bit run collector:
+/// every maximal run of set bits below `n`, over single bits at both ends of a
+/// word, whole words set and clear, runs crossing and ending on word
+/// boundaries, and set bits of the last word at or past `n`.
 #[test]
 fn set_bit_runs_reports_every_maximal_run() {
     let naive = |bits: &[u64], n: usize| {
@@ -60,13 +61,28 @@ fn set_bit_runs_reports_every_maximal_run() {
     for a in words {
         for b in words {
             for c in words {
-                for n in [1usize, 63, 64, 65, 127, 128, 150, 191, 192] {
-                    let bits = [a, b, c];
-                    let mut got = Vec::new();
-                    set_bit_runs(&bits[..n.div_ceil(64)], n, &mut got);
-                    assert_eq!(got, naive(&bits, n), "{bits:x?} n={n}");
+                for d in words {
+                    for n in [0usize, 1, 63, 64, 65, 127, 128, 150, 191, 192, 200, 255, 256] {
+                        let bits = [a, b, c, d];
+                        let bits = &bits[..n.div_ceil(64)];
+                        let want = naive(bits, n);
+                        let mut got = Vec::new();
+                        set_bit_runs(bits, n, &mut got);
+                        assert_eq!(got, want, "{bits:x?} n={n}");
+                        got.clear();
+                        set_bit_runs_iter(bits.iter().copied(), n, &mut got);
+                        assert_eq!(got, want, "iter {bits:x?} n={n}");
+                    }
                 }
             }
         }
     }
+}
+
+/// Runs are appended after what `out` already holds.
+#[test]
+fn set_bit_runs_iter_appends() {
+    let mut out = vec![(0, 1)];
+    set_bit_runs_iter([0b110u64], 3, &mut out);
+    assert_eq!(out, [(0, 1), (1, 3)]);
 }

@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use crate::repr::batch::Batch;
-use crate::repr::scatter::{mem_batch_to_unified, ColumnarSource, DecodedColumns, UnifiedSource};
+use crate::repr::scatter::{mem_batch_to_unified, ColTable, ColumnarSource, DecodedColumns, UnifiedSource};
 use crate::repr::seek::ColPtr;
 use crate::repr::shard::MappedShard;
 use crate::schema::{Generic, PayloadOrder, SchemaDescriptor};
@@ -132,7 +132,7 @@ impl ColumnarSource for Run {
     fn to_unified(
         &self,
         schema: &SchemaDescriptor,
-        cols: &mut Vec<ColPtr>,
+        cols: &mut ColTable,
         window: Range<usize>,
         decoded: &mut DecodedColumns,
     ) -> UnifiedSource<'_> {

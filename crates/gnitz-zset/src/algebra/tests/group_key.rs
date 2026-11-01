@@ -96,10 +96,14 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
         for batch in [raw, &consolidated] {
             let mb = batch.as_mem_batch();
             let out_pk = |row: usize| key.out_pk(&mb, row).bytes().to_vec();
-            let runs = key.runs(batch);
-            let groups = runs
-                .as_deref()
-                .map_or_else(|| key.numbered(batch), GroupOrdinals::of_runs);
+            let mut runs = Vec::new();
+            let mut scratch = GroupScratch::default();
+            let in_runs = key.runs_into(batch, &mut runs);
+            match in_runs {
+                true => scratch.groups.fill_runs(&runs),
+                false => key.numbered_into(batch, &mut scratch),
+            }
+            let groups = &scratch.groups;
             prop_assert_eq!(groups.ord.len(), batch.len(), "{:?}", cols);
             for (row, &g) in groups.ord.iter().enumerate() {
                 let first = groups.first[g as usize] as usize;
@@ -116,7 +120,7 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
                 .collect();
             prop_assert!(pks.windows(2).all(|w| w[0] < w[1]), "{:?}: groups out of order", cols);
 
-            if let Some(runs) = &runs {
+            if in_runs {
                 prop_assert_eq!(runs.len(), groups.len(), "{:?}", cols);
                 for (g, run) in runs.iter().map(|&(s, e)| s..e).enumerate() {
                     prop_assert!(
@@ -132,7 +136,7 @@ fn assert_groups_follow_out_pk(raw: &Batch) -> Result<(), TestCaseError> {
             let bytes: usize = cols.iter().map(|&c| schema.columns()[c as usize].size()).sum();
             let in_place = *cols == pk || bytes <= GROUP_PK_BYTES;
             if std::ptr::eq(batch, &consolidated) && !cols.is_empty() && pk.starts_with(cols) && in_place {
-                prop_assert!(runs.is_some(), "{:?}: a PK prefix of a consolidated batch", cols);
+                prop_assert!(in_runs, "{:?}: a PK prefix of a consolidated batch", cols);
             }
 
             let group =

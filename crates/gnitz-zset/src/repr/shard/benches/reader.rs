@@ -315,8 +315,9 @@ fn shard_read_bench() {
         });
         let rows: Vec<Pick> = (0..N).map(|r| (0, r as u32, batch.get_weight(r))).collect();
         let (merged, merge_i) = instructions.measure(|| {
-            let set = UnifiedSet::whole(std::slice::from_ref(&shard), &schema);
-            black_box(set.materialize(&rows, None))
+            black_box(UnifiedSet::with_whole(std::slice::from_ref(&shard), &schema, |set| {
+                set.materialize(&rows, None)
+            }))
         });
         assert_eq!(weighted_rows(&merged), want, "{label}: materialize");
         let per_row = |i: u64| i as f64 / N as f64;

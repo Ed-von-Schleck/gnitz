@@ -20,8 +20,33 @@ mod store_io;
 pub use key_spans::KeySpans;
 pub use store_io::Probe;
 
+use std::ops::Deref;
+use std::rc::Rc;
+
 use gnitz_wire::PkKeys;
+use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
+
+/// The rows a read answers with: a batch the store holds too, or one built for
+/// this read alone.
+// One per read; boxing the owned batch would cost every read an allocation.
+#[allow(clippy::large_enum_variant)]
+pub enum ReadRows {
+    /// The store's cached snapshot, or a feed round as it was captured.
+    Shared(Rc<Batch>),
+    Own(Batch),
+}
+
+impl Deref for ReadRows {
+    type Target = Batch;
+
+    fn deref(&self) -> &Batch {
+        match self {
+            ReadRows::Shared(rows) => rows,
+            ReadRows::Own(rows) => rows,
+        }
+    }
+}
 
 /// Refuses a reply in `produced` unless its layout digest is the client's
 /// `reply_layout`: a reply in any other layout would ship its regions under the

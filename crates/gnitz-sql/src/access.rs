@@ -159,7 +159,8 @@ struct ListBound {
 /// the next column's interval. `None` when nothing bounds it, or when an uncovered
 /// trailing column is nullable.
 fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option<ListBound> {
-    let mut eq = Vec::new();
+    let mut eq = [0u128; PK_LIST_MAX_COLS];
+    let mut pinned = 0;
     let mut consumed = Vec::new();
     let mut next = None;
     for &col in cols.as_slice() {
@@ -168,7 +169,8 @@ fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option
         };
         match f.point() {
             Some(v) => {
-                eq.push(v);
+                eq[pinned] = v;
+                pinned += 1;
                 consumed.extend(f.consumed);
             }
             None => {
@@ -177,19 +179,19 @@ fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option
             }
         }
     }
-    let pinned = eq.len();
+    let eq = &eq[..pinned];
     let (range, bounded_sides) = match next {
         Some(f) => {
             consumed.extend(f.consumed);
             let (&first, &last) = (f.admits.start(), f.admits.end());
             let sides = (first != 0) as u32 + (last != f.max) as u32;
-            (KeyRange::new(cols, &eq, first, last), sides)
+            (KeyRange::new(cols, eq, first, last), sides)
         }
         None => {
-            if eq.is_empty() {
+            if pinned == 0 {
                 return None;
             }
-            (KeyRange::point(cols, &eq), 0)
+            (KeyRange::point(cols, eq), 0)
         }
     };
     range
@@ -205,9 +207,17 @@ fn bound_column_list(cols: PkColList, terms: &[Term], schema: &Schema) -> Option
 /// product of lists grows multiplicatively past anything the statement spelled out.
 const MAX_CROSS_PRODUCT_KEYS: usize = 65_536;
 
+/// The PK keys the WHERE names, and the conjuncts they consume.
+struct PkKeySet {
+    keys: PkKeys,
+    consumed: Vec<usize>,
+    /// Every PK column is a point: the set is one key.
+    all_points: bool,
+}
+
 /// The PK keys the WHERE names: each PK column's point, else its first IN list,
 /// crossed into OPK keys.
-fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
+fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<PkKeySet> {
     let pk_count = schema.pk_cols().len();
     let mut points = [0u128; PK_LIST_MAX_COLS];
     let mut lists: [Option<&[u128]>; PK_LIST_MAX_COLS] = [None; PK_LIST_MAX_COLS];
@@ -228,11 +238,10 @@ fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
         lists[k] = Some(keys);
         consumed.push(conjunct);
     }
-    let slices: Vec<&[u128]> = lists[..pk_count]
-        .iter()
-        .zip(&points)
-        .map(|(l, p)| l.unwrap_or(std::slice::from_ref(p)))
-        .collect();
+    let all_points = lists[..pk_count].iter().all(Option::is_none);
+    let slices: [&[u128]; PK_LIST_MAX_COLS] =
+        std::array::from_fn(|k| lists[k].unwrap_or(std::slice::from_ref(&points[k])));
+    let slices = &slices[..pk_count];
     let n = slices.iter().try_fold(1usize, |n, s| n.checked_mul(s.len()))?;
     let longest = slices.iter().map(|s| s.len()).max().unwrap_or(1);
     // Only a cross product is capped: a lone list is keys the statement spelled out.
@@ -261,7 +270,11 @@ fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
             at[k] = 0;
         }
     }
-    Some((PkKeys::from_sorted(stride, bytes), consumed))
+    Some(PkKeySet {
+        keys: PkKeys::from_sorted(stride, bytes),
+        consumed,
+        all_points,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -339,16 +352,26 @@ fn ranked(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec
         .collect();
     let mut out: Vec<(Tier, IndexRank, Candidate)> = Vec::new();
 
-    if let Some((keys, consumed)) = pk_key_set(&terms, schema) {
+    let mut pk_all_points = false;
+    if let Some(set) = pk_key_set(&terms, schema) {
+        pk_all_points = set.all_points;
         out.push((
             Tier::PkKeys,
             IndexRank::default(),
-            Candidate { bound: ReadBound::PkSet(keys), consumed },
+            Candidate {
+                bound: ReadBound::PkSet(set.keys),
+                consumed: set.consumed,
+            },
         ));
     }
-    // A range pinning every PK column is the key set's one key.
-    let pk_range = bound_column_list(PkColList::from_slice(schema.pk_cols()), &terms, schema)
-        .filter(|b| b.pinned < schema.pk_cols().len());
+    // A range pinning every PK column is the key set's one key. A key set of points
+    // alone is that key, so the range is not built.
+    let pk_range = if pk_all_points {
+        None
+    } else {
+        bound_column_list(PkColList::from_slice(schema.pk_cols()), &terms, schema)
+    }
+    .filter(|b| b.pinned < schema.pk_cols().len());
     if let Some(b) = pk_range {
         let tier = if b.pinned > 0 {
             Tier::PinnedPkRange

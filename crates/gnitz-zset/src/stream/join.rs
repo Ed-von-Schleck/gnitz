@@ -7,11 +7,12 @@
 //! delta run with the cursor's current trace row — and all write
 //! `[key, left payload…, right payload…]` over the SQL sides, keyed by the delta
 //! PK, or by `[left PK…, right PK…]` under `Cross`.
+use std::cell::Cell;
 use std::cmp::Ordering;
 
 use crate::repr::{
-    copy_runs, pk_group_end, relocated_cell, runs_where, should_relocate_blob, stride_dispatch, Batch, CursorRow,
-    ReadCursor, Run,
+    copy_runs, pk_group_end, prorated_blob_cap, relocated_cell, row_long_bytes, runs_where, should_relocate_blob,
+    stride_dispatch, with_scratch, Batch, CursorRow, ReadCursor, Run,
 };
 use crate::schema::{band, compare_pk_ordering, group_floor, key_above, DerivedSchema, SchemaDescriptor};
 
@@ -295,35 +296,46 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
         Walk::Cross => 0,
     };
     let cursor = &mut trace(&delta.get_pk_bytes(0)[..prefix], &delta.get_pk_bytes(n - 1)[..prefix]);
-    // Grown, not pre-sized: a walk can match nothing.
-    let mut pairs: Vec<Pairing> = Vec::new();
-    let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
-        debug_assert!(rs < re, "every walk emits a non-empty delta run");
-        pairs.push(Pairing {
-            rs: rs as u32,
-            re: re as u32,
-            at: c.current_position(),
-            w_trace: c.current_weight(),
-        });
-    };
-    match plan.walk {
-        Walk::Equi { .. } => equi_merge_walk(delta, cursor, emit),
-        Walk::Range(range) => range_merge_walk(delta, cursor, range, emit),
-        Walk::Cross => cursor.for_each_row_while(|_| true, |c| emit(0, n, c)),
-    }
-    let ordered = match plan.walk {
-        // A delta run that meets several trace rows keeps the output order only
-        // when they arrive in it and lead the payload or the run is one row.
-        Walk::Equi { trace_ordered } => pairs
-            .windows(2)
-            .all(|w| w[0].rs != w[1].rs || (trace_ordered && (plan.trace_leads || w[0].len() == 1))),
-        Walk::Range(_) | Walk::Cross => false,
-    };
-    let mut out = write_pairings(delta, cursor, plan, &pairs);
-    if ordered {
-        out.certify_consolidated();
-    }
-    out
+    // The thread's buffer, reused across calls; still grown rather than
+    // pre-sized, since a walk can match nothing.
+    with_scratch(&PAIRS, |pairs| {
+        let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
+            debug_assert!(rs < re, "every walk emits a non-empty delta run");
+            pairs.push(Pairing {
+                rs: rs as u32,
+                re: re as u32,
+                at: c.current_position(),
+                w_trace: c.current_weight(),
+            });
+        };
+        match plan.walk {
+            Walk::Equi { .. } => equi_merge_walk(delta, cursor, emit),
+            Walk::Range(range) => range_merge_walk(delta, cursor, range, emit),
+            Walk::Cross => cursor.for_each_row_while(|_| true, |c| emit(0, n, c)),
+        }
+        debug_assert!(
+            pairs.windows(2).all(|w| w[0].rs <= w[1].rs),
+            "every walk emits delta runs by ascending start"
+        );
+        let ordered = match plan.walk {
+            // A delta run that meets several trace rows keeps the output order only
+            // when they arrive in it and lead the payload or the run is one row.
+            Walk::Equi { trace_ordered } => pairs
+                .windows(2)
+                .all(|w| w[0].rs != w[1].rs || (trace_ordered && (plan.trace_leads || w[0].len() == 1))),
+            Walk::Range(_) | Walk::Cross => false,
+        };
+        let mut out = write_pairings(delta, cursor, plan, pairs);
+        if ordered {
+            out.certify_consolidated();
+        }
+        out
+    })
+}
+
+thread_local! {
+    /// The pairings buffer of [`op_join_delta_trace`], reused across calls.
+    static PAIRS: Cell<Vec<Pairing>> = const { Cell::new(Vec::new()) };
 }
 
 /// The output rows `pairs` names, in list order, one region at a time, less any
@@ -337,17 +349,38 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
     let d_schema = delta.schema();
     let mut out = Batch::with_capacity(output_schema, rows);
 
+    // The heap is reserved once, with room for the long trace cells the
+    // pairings relocate. They are summed only over a short list: there the
+    // heap's regrowth costs more than the pass, while over a long list
+    // regrowth is amortised and the pass is the larger cost.
+    let trace_long = match pairs.len() <= MAX_RESERVE_SCAN_PAIRS {
+        true => trace_long_bytes(cursor, plan, pairs),
+        false => 0,
+    };
     // The delta's heap rides whole unless relocating the emitted cells is
     // cheaper; the rows no pairing names are what it then holds dead.
     let strings = d_schema.string_payload_slots();
     let heap_at = match strings != 0 && !should_relocate_blob(delta.blob().len(), delta.len(), rows) {
         true => {
-            let mut emitted = vec![false; delta.len()];
-            pairs.iter().for_each(|p| emitted[p.delta_rows()].fill(true));
-            let kept = runs_where(&emitted, |&e| e);
-            out.carry_heap(&delta.as_mem_batch(), strings, &kept)
+            // The union of the pairings' delta runs, as maximal sorted disjoint runs.
+            let mut kept: Vec<(usize, usize)> = Vec::new();
+            for (s, e) in delta_runs(pairs) {
+                match kept.last_mut() {
+                    Some(k) if s <= k.1 => k.1 = k.1.max(e),
+                    _ => kept.push((s, e)),
+                }
+            }
+            out.carry_heap_with_room(&delta.as_mem_batch(), strings, &kept, trace_long)
         }
-        false => None,
+        false => {
+            // The delta's long cells are relocated as well, each output row
+            // taking its share of the delta's heap.
+            let room = trace_long + prorated_blob_cap(delta.blob().len(), delta.len(), rows);
+            if room != 0 {
+                out.reserve_blob(room);
+            }
+            None
+        }
     };
 
     // The delta's payload follows the trace's where the trace is the left side,
@@ -473,7 +506,30 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
     out
 }
 
-/// Each pairing's delta run, as [`copy_runs`] takes it.
+/// The longest pairings list [`write_pairings`] measures its trace strings over
+/// before writing.
+const MAX_RESERVE_SCAN_PAIRS: usize = 256;
+
+/// The heap bytes of the long cells in the trace's string columns that `pairs`
+/// names, one row per pairing: an upper bound on what the relocation appends,
+/// as the blob cache stores a span two cells share once.
+fn trace_long_bytes(cursor: &ReadCursor, plan: &JoinPlan, pairs: &[Pairing]) -> usize {
+    let mask = plan.t_moves.string_slots();
+    if mask == 0 {
+        return 0;
+    }
+    pairs
+        .iter()
+        .map(|p| {
+            let (src, row) = cursor.row_at(p.at);
+            row_long_bytes(src, mask, row)
+        })
+        .sum()
+}
+
+/// Each pairing's delta run, as [`copy_runs`] takes it. Runs ascend by start:
+/// every walk meets the delta's groups in ascending order, and `Cross` emits
+/// the whole delta each time.
 #[inline(always)]
 fn delta_runs(pairs: &[Pairing]) -> impl Iterator<Item = (usize, usize)> + '_ {
     pairs.iter().map(|p| (p.rs as usize, p.re as usize))

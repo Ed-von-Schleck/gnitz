@@ -109,7 +109,7 @@ pub fn fk_def_on_delete(
 }
 
 /// Every row of `tid` under `bound`, in the relation's own layout.
-pub fn read_rows(engine: &mut CatalogEngine, tid: u64, bound: gnitz_wire::ReadBound) -> std::rc::Rc<Batch> {
+pub fn read_rows(engine: &mut CatalogEngine, tid: u64, bound: gnitz_wire::ReadBound) -> gnitz_store::read::ReadRows {
     let schema = engine
         .registry
         .relation(tid)
@@ -121,7 +121,7 @@ pub fn read_rows(engine: &mut CatalogEngine, tid: u64, bound: gnitz_wire::ReadBo
 }
 
 /// Every row of `tid`.
-pub fn scan_all(engine: &mut CatalogEngine, tid: u64) -> std::rc::Rc<Batch> {
+pub fn scan_all(engine: &mut CatalogEngine, tid: u64) -> gnitz_store::read::ReadRows {
     read_rows(engine, tid, gnitz_wire::ReadBound::None)
 }
 

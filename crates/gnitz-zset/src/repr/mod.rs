@@ -41,6 +41,7 @@ mod writer;
 pub use batch::{Batch, MemBatch};
 pub use batch_builder::BatchBuilder;
 pub use batch_pool::PooledBuf;
+pub(crate) use batch_pool::{vec_bytes, with_scratch};
 pub use batch_wire::WireRows;
 pub use merge::merge_consolidated;
 pub use read_cursor::{
@@ -53,7 +54,7 @@ pub use shard::{
 
 pub(crate) use batch::{range_rows, runs_where, runs_where_zip, write_to_batch, RowMark};
 pub(crate) use read_cursor::CursorRow;
-pub(crate) use scatter::{copy_runs, materialize_carrying, stride, stride_dispatch, Pick};
+pub(crate) use scatter::{copy_runs, materialize_carrying, stride, stride_dispatch, with_picks};
 pub(crate) use seek::pk_group_end;
-pub(crate) use string_heap::{relocated_cell, should_relocate_blob};
+pub(crate) use string_heap::{prorated_blob_cap, relocated_cell, row_long_bytes, should_relocate_blob};
 pub(crate) use writer::DirectWriter;

@@ -1,5 +1,6 @@
-//! How one committer batch is drained off the request channel, how a merged
-//! run is taken back as its writes, and how a pause is released. The SAL layout and the checkpoint sequence need a live
+//! How one committer batch is drained off the request channel, how a commit
+//! unit answers its clients, how a merged run is taken back as its writes, and
+//! how a pause is released. The SAL layout and the checkpoint sequence need a live
 //! dispatcher and worker ACKs, so they are covered end to end.
 
 use super::*;
@@ -84,9 +85,10 @@ fn a_batch_ends_at_the_row_cap_or_an_end_request() {
             tx.send(r);
         }
         let first = rx.try_recv().expect("queued");
-        let b = drain_ready_batch(&mut rx, first);
+        let mut writes = Vec::new();
+        let end = drain_ready_batch(&mut rx, first, &mut writes);
         let left = std::iter::from_fn(|| rx.try_recv()).count();
-        let got = (b.writes.len(), end_label(&b.end), left);
+        let got = (writes.len(), end_label(&end), left);
         assert_eq!(got, want, "case {i}");
     }
 }
@@ -143,7 +145,7 @@ fn a_merged_run_splits_back_into_its_writes() {
             }],
             in_zone: false,
         },
-        dones,
+        dones: dones.into(),
     };
     let writes = unit.into_writes();
     assert_eq!(writes.len(), parts.len());
@@ -161,5 +163,36 @@ fn a_merged_run_splits_back_into_its_writes() {
     }
     for (i, rx) in rxs.iter_mut().enumerate() {
         assert_eq!(try_poll_once(rx), Some(Ok(i as u64)), "client {i}");
+    }
+}
+
+/// A unit answers every client it holds, a merged run's included: the zone
+/// LSN when it rode inside the zone, `0` when it did not, the error when it
+/// failed.
+#[test]
+fn a_unit_answers_every_client() {
+    let unit_of = |outcome: Outcome| {
+        let (rxs, dones): (Vec<_>, Vec<_>) = (0..3)
+            .map(|_| {
+                let (done, rx) = oneshot::channel();
+                (rx, (done, 1))
+            })
+            .unzip();
+        let unit = CommitUnit { outcome, dones: dones.into() };
+        (unit, rxs)
+    };
+    let laid = |in_zone| Outcome::Laid { families: Vec::new(), in_zone };
+    let cases = [
+        (laid(true), Ok(9)),
+        (laid(false), Ok(0)),
+        (Outcome::Failed("refused".to_string().into()), Err(())),
+    ];
+    for (i, (outcome, want)) in cases.into_iter().enumerate() {
+        let (unit, mut rxs) = unit_of(outcome);
+        unit.resolve(9);
+        for (c, rx) in rxs.iter_mut().enumerate() {
+            let got = try_poll_once(rx).expect("answered").map_err(|_| ());
+            assert_eq!(got, want, "case {i}, client {c}");
+        }
     }
 }

@@ -232,19 +232,19 @@ fn int16_image(loc: &ColumnLocator, invert: bool, src: &impl RowSource, row: usi
     (if invert { !image } else { image }).to_be_bytes()
 }
 
-/// [`append_bytes_image`]'s and [`int16_image`]'s inverse: the native bytes back
-/// out of an index image.
-pub(super) fn wide_native_of_image(kind: WideKind, invert: bool, image: &[u8]) -> Vec<u8> {
-    let mut v = image.to_vec();
+/// [`append_bytes_image`]'s and [`int16_image`]'s inverse, in place: decodes
+/// the index image in `v` into the native bytes at its front and returns their
+/// length.
+pub(super) fn wide_native_of_image(kind: WideKind, invert: bool, v: &mut [u8]) -> usize {
     if invert {
         v.iter_mut().for_each(|b| *b = !*b);
     }
     match kind {
         WideKind::Fixed(tc) => {
             let (n, mut native) = (v.len(), [0u8; 16]);
-            gnitz_wire::decode_pk_cell(&v, tc.is_signed_int(), &mut native[..n]);
+            gnitz_wire::decode_pk_cell(v, tc.is_signed_int(), &mut native[..n]);
             v.copy_from_slice(&native[..n]);
-            v
+            n
         }
         WideKind::Bytes => {
             debug_assert!(v.ends_with(&[0, 0]), "a byte-string image ends in its terminator");
@@ -256,8 +256,7 @@ pub(super) fn wide_native_of_image(kind: WideKind, invert: bool, image: &[u8]) -
                 w += 1;
                 r += if b == 0 { 2 } else { 1 };
             }
-            v.truncate(w);
-            v
+            w
         }
     }
 }

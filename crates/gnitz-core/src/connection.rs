@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use std::time::{Duration, Instant};
 
-use crate::batch::decode_wal_block_into;
+use crate::batch::{decode_wal_blocks_into, parse_wal_block};
 use crate::error::ClientError;
 use crate::host::{promise, Host, Promise, Sent};
 use crate::transport::Interest;
@@ -206,7 +206,9 @@ pub struct PushFamily {
     /// batches built from a descriptor; `0` while none was.
     pub target: Target,
     pub schema: Arc<Schema>,
-    pub batch: ZSetBatch,
+    /// May still be shared with the caller that pushed it, so it is never
+    /// written in place.
+    pub batch: Arc<ZSetBatch>,
     pub mode: WireConflictMode,
     /// The commit fails if `target` was written after `basis`, the oldest
     /// watermark among the reads this family's writes were built from; `BLIND`
@@ -297,11 +299,17 @@ enum Slot {
     },
 }
 
-/// One relation's train: its rows so far, decoded under the schema its request
-/// named.
+/// One relation's train, decoded under the schema its request named when it
+/// terminates.
 struct Train {
     tid: u64,
     schema: Arc<Schema>,
+    /// The continuation frames' blocks, undecoded until the train terminates
+    /// so its batch is sized once for every worker's rows.
+    held: Vec<RawBlock>,
+    /// The rows of the blocks taken so far, held or decoded.
+    rows: usize,
+    /// Every block's rows, in arrival order, once the train has terminated.
     data: Option<ZSetBatch>,
 }
 
@@ -310,31 +318,61 @@ impl Train {
         Train {
             tid,
             schema: Arc::clone(schema),
+            held: Vec::new(),
+            rows: 0,
             data: None,
         }
     }
 
-    /// Rows are decoded straight into the train: it carries one data frame
-    /// per worker, and a per-frame batch would be copied in and dropped.
-    fn decode(&mut self, block: &[u8]) -> Result<(), ProtocolError> {
+    /// Take the data block at `block` of `frame`. A continuation frame's block
+    /// is kept, its header checked at once and the frame owned, since a
+    /// borrowed one lives in the transport window; the terminal frame's block
+    /// is decoded in place behind the held ones.
+    fn take(
+        &mut self,
+        frame: &mut Cow<'_, [u8]>,
+        block: std::ops::Range<usize>,
+        more: bool,
+    ) -> Result<(), ProtocolError> {
+        if more {
+            self.rows += parse_wal_block(&frame[block.clone()], &self.schema)?.rows;
+            let frame = std::mem::take(frame).into_owned();
+            self.held.push(RawBlock { frame, block });
+            Ok(())
+        } else {
+            self.settle(Some(&frame[block]))
+        }
+    }
+
+    /// Decode the held blocks, then `last`, into the train's batch.
+    fn settle(&mut self, last: Option<&[u8]>) -> Result<(), ProtocolError> {
+        if self.held.is_empty() && last.is_none() {
+            return Ok(());
+        }
         let schema = &self.schema;
-        decode_wal_block_into(self.data.get_or_insert_with(|| ZSetBatch::new(schema)), block, schema)
+        let sink = self.data.get_or_insert_with(|| ZSetBatch::new(schema));
+        let held = std::mem::take(&mut self.held);
+        decode_wal_blocks_into(sink, held.iter().map(RawBlock::block).chain(last), schema)?;
+        self.rows = sink.len();
+        Ok(())
     }
 
     fn len(&self) -> usize {
-        self.data.as_ref().map_or(0, ZSetBatch::len)
+        self.rows
     }
 
-    fn take_batch(&mut self) -> ZSetBatch {
-        self.data.take().unwrap_or_else(|| ZSetBatch::new(&self.schema))
+    fn take_batch(&mut self) -> Result<ZSetBatch, ProtocolError> {
+        self.settle(None)?;
+        self.rows = 0;
+        Ok(self.data.take().unwrap_or_else(|| ZSetBatch::new(&self.schema)))
     }
 
-    fn reply(&mut self, lsn: Option<u64>) -> ScanReply {
-        ScanReply {
-            batch: self.take_batch(),
+    fn reply(&mut self, lsn: Option<u64>) -> Result<ScanReply, ProtocolError> {
+        Ok(ScanReply {
+            batch: self.take_batch()?,
             schema: Arc::clone(&self.schema),
             lsn,
-        }
+        })
     }
 }
 
@@ -1011,7 +1049,7 @@ impl Slot {
                 }
             }
             (slot, Some(r)) => match slot.train() {
-                Some(train) => train.decode(&buf[r])?,
+                Some(train) => train.take(&mut buf, r, ctrl.hdr.flags.continuation)?,
                 None => {
                     return Err(ProtocolError::DecodeError(
                         "a data block on a reply that carries no rows".into(),
@@ -1037,9 +1075,9 @@ impl Slot {
         match self {
             Slot::Ack { to, .. } => to.fulfil(Ok(ctrl.hdr.arg0)),
             Slot::Resolve { to } => to.fulfil(Ok(resolve_descriptor(&ctrl, &buf)?)),
-            Slot::Scan(Scan::One { train, to }) => to.fulfil(Ok(train.reply(Some(ctrl.hdr.arg0)))),
+            Slot::Scan(Scan::One { train, to }) => to.fulfil(Ok(train.reply(Some(ctrl.hdr.arg0))?)),
             Slot::Scan(Scan::All { trains, replies, to }) => {
-                let reply = trains[replies.len()].reply(Some(ctrl.hdr.arg0));
+                let reply = trains[replies.len()].reply(Some(ctrl.hdr.arg0))?;
                 replies.push(reply);
                 if replies.len() < trains.len() {
                     return Ok(false);
@@ -1052,7 +1090,7 @@ impl Slot {
                 if worker_ends.is_empty() {
                     return Err(ProtocolError::DecodeError("a snapshot page naming no worker".into()));
                 }
-                let batch = train.take_batch();
+                let batch = train.take_batch()?;
                 let worker_ends = std::mem::take(worker_ends);
                 to.fulfil(Ok(SnapshotPage { batch, worker_ends }))
             }
@@ -1061,7 +1099,7 @@ impl Slot {
                 if let Some(id) = *keep {
                     polls.hold(id, cursor);
                 }
-                to.fulfil(Ok((train.reply(None), cursor)))
+                to.fulfil(Ok((train.reply(None)?, cursor)))
             }
             Slot::DeltaPoll { views, at, poll, first } => {
                 polls.reader_end(*poll, kept_as(*first, *at), Ok(cursor()?));

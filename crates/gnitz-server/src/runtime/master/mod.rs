@@ -108,24 +108,23 @@ impl MasterDispatcher {
     }
 
     /// The scan-shaped requests `build` writes as one
-    /// [`Cut`](crate::runtime::sal::Cut), one lease each.
-    pub(crate) async fn scan_cut(
+    /// [`Cut`](crate::runtime::sal::Cut); `build` keeps the lease each
+    /// [`ScanCut::read`] hands it.
+    pub(crate) async fn scan_cut<R>(
         &self,
-        build: impl FnOnce(&mut ScanCut<'_>) -> Result<(), WireFault>,
-    ) -> Result<Vec<TrainLease>, WireFault> {
+        build: impl FnOnce(&mut ScanCut<'_>) -> Result<R, WireFault>,
+    ) -> Result<R, WireFault> {
         let mut cut = ScanCut {
             disp: self,
             excl: self.sal.lock().await,
-            scans: Vec::new(),
+            written: false,
         };
-        build(&mut cut)?;
-        Ok(cut.scans)
+        build(&mut cut)
     }
 
     /// One scan-shaped read under its own SAL hold.
     pub(crate) async fn scan(&self, read: Read<'_>) -> Result<TrainLease, WireFault> {
-        let mut leases = self.scan_cut(|cut| cut.read(read)).await?;
-        Ok(leases.pop().expect("one read, one lease"))
+        self.scan_cut(|cut| cut.read(read)).await
     }
 
     /// `read`, answered with no rows by every worker it reaches, under its own
@@ -140,7 +139,8 @@ impl MasterDispatcher {
 pub(crate) struct ScanCut<'d> {
     disp: &'d MasterDispatcher,
     excl: SalExcl<'d>,
-    scans: Vec<TrainLease>,
+    /// Whether the cut's first group has been written; the rest join it.
+    written: bool,
 }
 
 impl<'d> ScanCut<'d> {
@@ -150,8 +150,9 @@ impl<'d> ScanCut<'d> {
     }
 
     /// `read` written to the workers its target and bound reach, each sent its
-    /// own key set when the bound splits one, under a reply id leased for them.
-    pub(crate) fn read(&mut self, read: Read<'_>) -> Result<(), WireFault> {
+    /// own key set when the bound splits one, under a reply id leased for them;
+    /// the lease its replies are read through.
+    pub(crate) fn read(&mut self, read: Read<'_>) -> Result<TrainLease, WireFault> {
         let route = route::route_read(&read, &self.disp.cat().registry, self.disp.num_workers());
         let group = SalGroup::new(read);
         let data = route.per_worker.as_deref().map_or(group.data, GroupData::Blobs);
@@ -161,12 +162,12 @@ impl<'d> ScanCut<'d> {
             .lease_train(route.set, group.request.encode().0.variant_name());
         debug_assert!(lease.targets().set.len() > 0, "every read owes at least one reply");
         let group = SalGroup { data, targets: lease.targets(), ..group };
-        if self.scans.is_empty() {
-            self.excl.write(&group)?;
-        } else {
+        if self.written {
             self.excl.join(&group)?;
+        } else {
+            self.excl.write(&group)?;
+            self.written = true;
         }
-        self.scans.push(lease);
-        Ok(())
+        Ok(lease)
     }
 }

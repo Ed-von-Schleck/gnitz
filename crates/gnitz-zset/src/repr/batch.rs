@@ -5,10 +5,10 @@
 
 use std::ops::Range;
 
-use super::batch_pool::{is_tight, PooledBuf};
+use super::batch_pool::{self, is_tight, PooledBuf};
 use super::merge;
 use super::run::StoredRow;
-use super::scatter::{copy_ranges, Pick};
+use super::scatter::{copy_ranges, with_picks, Pick};
 use super::seek::ColPtr;
 use super::string_heap::{self, relocated_cell, BlobCache};
 use super::writer::DirectWriter;
@@ -34,21 +34,25 @@ pub(crate) fn runs_where<T>(items: &[T], keep: impl Fn(&T) -> bool) -> Vec<(usiz
 
 /// [`runs_where`] over two equal-length slices read in lockstep: the runs of
 /// positions `i` where `keep(&a[i], &b[i])`. Each 64-position word is a fold
-/// over a zip of slice chunks, so no position is bounds-checked.
+/// over a zip of slice chunks, so no position is bounds-checked; every word but
+/// a partial last one folds a fixed-length chunk. The words go straight to the
+/// run scan, uncollected.
 pub(crate) fn runs_where_zip<A, B>(a: &[A], b: &[B], keep: impl Fn(&A, &B) -> bool) -> Vec<(usize, usize)> {
     debug_assert_eq!(a.len(), b.len());
-    let kept: Vec<u64> = a
-        .chunks(64)
-        .zip(b.chunks(64))
-        .map(|(ca, cb)| {
-            ca.iter()
-                .zip(cb)
-                .enumerate()
-                .fold(0, |bits, (j, (x, y))| bits | u64::from(keep(x, y)) << j)
-        })
-        .collect();
+    let fold = |ca: &[A], cb: &[B]| {
+        ca.iter()
+            .zip(cb)
+            .enumerate()
+            .fold(0, |bits, (j, (x, y))| bits | u64::from(keep(x, y)) << j)
+    };
+    let ((ah, at), (bh, bt)) = (a.as_chunks::<64>(), b.as_chunks::<64>());
+    let words = ah
+        .iter()
+        .zip(bh)
+        .map(|(ca, cb)| fold(ca, cb))
+        .chain((!at.is_empty()).then(|| fold(at, bt)));
     let mut runs = Vec::new();
-    gnitz_wire::set_bit_runs(&kept, a.len(), &mut runs);
+    gnitz_wire::set_bit_runs_iter(words, a.len(), &mut runs);
     runs
 }
 
@@ -169,18 +173,24 @@ impl Batch {
         b
     }
 
-    /// Room for `bytes` more blob heap bytes, taken from the buffer pool —
-    /// a bare [`Vec::reserve`] would take them from the global allocator. A heap
-    /// already holding bytes has to grow in place. A schema with no string
-    /// column has no heap to reserve.
-    fn reserve_blob(&mut self, bytes: usize) {
-        if !self.schema.has_german_string() {
+    /// Room for `bytes` more blob heap bytes. A heap that has to grow moves into
+    /// a buffer from the pool of at least twice its capacity, so repeated
+    /// reserves on one batch stay amortised, and the outgrown buffer returns to
+    /// the pool; the bytes move verbatim, so cell offsets and `dead_heap` still
+    /// hold. Past the pool's largest buffer it grows by [`Vec::reserve`]. A
+    /// schema with no string column has no heap to reserve.
+    pub(crate) fn reserve_blob(&mut self, bytes: usize) {
+        if !self.schema.has_german_string() || self.blob.capacity() - self.blob.len() >= bytes {
             return;
         }
-        match self.blob.capacity() {
-            0 => self.blob = PooledBuf::with_capacity(bytes),
-            _ => self.blob.reserve(bytes),
+        let need = (self.blob.len() + bytes).max(2 * self.blob.capacity());
+        if need > batch_pool::MAX_POOLED_BYTES {
+            self.blob.reserve(bytes);
+            return;
         }
+        let mut grown = PooledBuf::with_capacity(need);
+        grown.extend_from_slice(&self.blob);
+        self.blob = grown;
     }
 
     /// An owned copy of `mb`'s `count` rows and its whole heap, in an arena
@@ -919,6 +929,14 @@ impl Batch {
             return;
         }
         self.reserve_rows(rows.len());
+        let mask = self.schema.string_payload_slots();
+        if mask != 0 {
+            self.reserve_blob(
+                rows.iter()
+                    .map(|r| string_heap::row_long_bytes(&r.run, mask, r.row))
+                    .sum(),
+            );
+        }
         let mut cache = self.blob_cache(rows.len());
         for r in rows {
             self.append_row_from_source(weight, &r.run, r.row, Some(&mut cache));
@@ -1040,18 +1058,27 @@ impl Batch {
     /// relocated instead — that share, not the whole heap: a many-run merge
     /// appends into one output, and the whole heap per run ratchets capacity.
     pub(crate) fn carry_heap(&mut self, src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, usize)]) -> Option<usize> {
+        self.carry_heap_with_room(src, kept_slots, kept, 0)
+    }
+
+    /// [`Self::carry_heap`], reserving `room` more heap bytes with either
+    /// outcome, for long cells the caller relocates from another source.
+    pub(crate) fn carry_heap_with_room(
+        &mut self,
+        src: &MemBatch<'_>,
+        kept_slots: u64,
+        kept: &[(usize, usize)],
+        room: usize,
+    ) -> Option<usize> {
         let Some(dead) = string_heap::carry_dead(src, kept_slots, kept) else {
-            if !src.blob.is_empty() {
-                self.reserve_blob(string_heap::prorated_blob_cap(
-                    src.blob.len(),
-                    src.count,
-                    range_rows(kept),
-                ));
+            let share = string_heap::prorated_blob_cap(src.blob.len(), src.count, range_rows(kept));
+            if share + room != 0 {
+                self.reserve_blob(share + room);
             }
             return None;
         };
         let base = self.blob.len();
-        self.reserve_blob(src.blob.len());
+        self.reserve_blob(src.blob.len() + room);
         self.blob.extend_from_slice(src.blob);
         self.charge_dead(dead);
         Some(base)
@@ -1144,7 +1171,20 @@ impl Batch {
     /// [`Self::consolidate_in_place`] of a batch without the claim.
     #[inline(never)]
     fn consolidate_unclaimed(&mut self) {
-        self.consolidate_recording();
+        if self.stands_consolidated() {
+            self.certify_consolidated();
+            return;
+        }
+        *self = self.folded();
+    }
+
+    /// The rows sorted and weight-folded into a fresh batch, through the
+    /// thread's pooled picks.
+    fn folded(&self) -> Batch {
+        with_picks(|picks| {
+            picks.reserve(self.count);
+            Self::consolidated_from(self, picks)
+        })
     }
 
     /// Consolidate this batch: rows that stand in consolidated order are
@@ -1164,7 +1204,7 @@ impl Batch {
     /// counterpart of [`Self::into_consolidated`].
     pub fn to_consolidated(&self) -> Batch {
         if !self.stands_consolidated() {
-            return Self::consolidated_from(self, &mut Vec::with_capacity(self.count));
+            return self.folded();
         }
         let mut copy = self.clone();
         if !copy.consolidated {
@@ -1181,12 +1221,13 @@ impl Batch {
     }
 
     /// Sort and weight-fold `batch` into a fresh certified batch, handing back in
-    /// `survivors` what [`merge::consolidate_groups`] found: per output
-    /// row, the `batch` row it is.
+    /// `survivors`, which must be empty, what [`merge::consolidate_groups`]
+    /// found: per output row, the `batch` row it is.
     #[inline(always)]
     fn consolidated_from(batch: &Batch, survivors: &mut Vec<Pick>) -> Batch {
         let schema = &batch.schema;
         let mb = batch.as_mem_batch();
+        debug_assert!(survivors.is_empty());
         // Folded first, so the arena is sized to the survivors.
         merge::consolidate_groups(&mb, survivors);
         let mut result = super::scatter::materialize_carrying(std::slice::from_ref(&mb), schema, survivors);
@@ -1219,9 +1260,10 @@ impl Batch {
     }
 
     /// `self` in buffers of exactly what its rows take, with a wasteful heap
-    /// compacted first: each buffer that holds more is copied into one fresh off
-    /// the allocator, since a pooled buffer may hold twice what is asked of it,
-    /// and one shrunk in place keeps its tail resident.
+    /// compacted first: each buffer that holds more is copied into one of exactly
+    /// what it takes, a pooled one only when its capacity matches exactly, since
+    /// a tight pooled buffer may hold twice what is asked of it, and one shrunk
+    /// in place keeps its tail resident.
     pub fn shrunk(mut self) -> Batch {
         if self.heap_is_wasteful() {
             self = self.compacted();
@@ -1229,13 +1271,17 @@ impl Batch {
         let cap = self.schema.arena_rows(self.count);
         let need = cap * self.schema.row_width();
         if self.data.capacity() != need {
-            let mut data = vec![0; need];
+            // SAFETY: `copy_regions` writes the `count` rows a `Batch` reads.
+            let mut data = unsafe { PooledBuf::uninit_exact(need) };
             copy_regions(&self.schema, &self.data, self.capacity, &mut data, cap, self.count);
-            self.data = PooledBuf(data);
+            self.data = data;
             self.capacity = cap;
+            self.debug_poison_rows(self.count..cap);
         }
         if self.blob.capacity() != self.blob.len() {
-            self.blob = PooledBuf(self.blob.to_vec());
+            let mut blob = PooledBuf::exact(self.blob.len());
+            blob.extend_from_slice(&self.blob);
+            self.blob = blob;
         }
         self
     }

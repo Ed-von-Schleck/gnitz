@@ -40,6 +40,26 @@ pub(super) fn recycle<T>(pool: &'static LocalKey<Cell<VecDeque<T>>>, item: T, by
     });
 }
 
+/// The bytes `v` holds allocated.
+#[inline]
+pub(crate) fn vec_bytes<T>(v: &Vec<T>) -> usize {
+    v.capacity() * size_of::<T>()
+}
+
+/// Run `f` over the thread's scratch list in `slot`, emptied. A list grown past
+/// `MAX_POOLED_BYTES` goes back to the allocator. The list is taken out of its
+/// slot while `f` runs, so a nested call gets a fresh one.
+pub(crate) fn with_scratch<T, R>(slot: &'static LocalKey<Cell<Vec<T>>>, f: impl FnOnce(&mut Vec<T>) -> R) -> R {
+    let mut v = slot.try_with(Cell::take).unwrap_or_default();
+    v.clear();
+    let r = f(&mut v);
+    if vec_bytes(&v) <= MAX_POOLED_BYTES {
+        v.clear();
+        let _ = slot.try_with(|c| c.set(v));
+    }
+    r
+}
+
 thread_local! {
     static BUF_POOL: Cell<VecDeque<Vec<u8>>> = const { Cell::new(VecDeque::new()) };
 }
@@ -64,6 +84,25 @@ impl PooledBuf {
             take(&BUF_POOL, |b| b.capacity() >= size && is_tight(b.capacity(), size))
                 .unwrap_or_else(|| Vec::with_capacity(size)),
         )
+    }
+
+    /// Empty, with capacity exactly `size`: a pooled buffer of that capacity,
+    /// else a fresh one (`Vec::<u8>::with_capacity` allocates exactly `size`).
+    /// A zero `size` holds no buffer, since the pool keeps none of capacity 0.
+    pub(super) fn exact(size: usize) -> Self {
+        PooledBuf(take(&BUF_POOL, |b| b.capacity() == size).unwrap_or_else(|| Vec::with_capacity(size)))
+    }
+
+    /// [`Self::exact`] with `len == size`, the bytes uninitialized.
+    ///
+    /// # Safety
+    /// The caller writes each byte before reading it.
+    #[allow(clippy::uninit_vec)]
+    pub(super) unsafe fn uninit_exact(size: usize) -> Self {
+        let mut buf = Self::exact(size);
+        // SAFETY: `capacity == size`.
+        unsafe { buf.0.set_len(size) };
+        buf
     }
 
     /// [`Self::with_capacity`] with `len == size`, the bytes uninitialized.

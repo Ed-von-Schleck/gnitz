@@ -78,6 +78,16 @@ impl Writer {
     pub fn into_vec(self) -> Vec<u8> {
         self.0
     }
+
+    /// The bytes written so far.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Drop every byte written, keeping the buffer for the next encoding.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 /// A value with one layout, spliced into a larger blob.

@@ -207,13 +207,16 @@ proptest! {
         }
 
         // A key-set gather, drained across chunk boundaries.
-        let mut gather = PkSetGather::over(open(), PkKeys::from_sorted(stride, keys.concat()));
+        let list = PkKeys::from_sorted(stride, keys.concat());
+        let mut gather = PkSetGather::over(open(), list.clone());
         let mut gathered = Vec::new();
         while let Some(b) = gather.drain_chunk(chunk) {
             prop_assert!(!b.is_empty());
             gathered.extend(weighted_rows(&b));
         }
         prop_assert_eq!(gathered, rows_where(&|p, _| keys.iter().any(|k| &k[..] == p)));
+        // A drained gather still hands back every key, for the next gather to reuse.
+        prop_assert_eq!(gather.into_keys(), list);
     }
 }
 
@@ -414,5 +417,44 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
             (1, &2u64.to_be_bytes()[..], 4),
             "{name}"
         );
+    }
+}
+
+/// Cursors opened and dropped in turn on one thread, over run counts that rise
+/// and fall so each takes buffers a different one returned, drain the sum of
+/// their runs, weights included; a dropped cursor holds none of its runs.
+#[test]
+fn cursors_over_pooled_buffers_drain_their_own_runs() {
+    let mut rng = crate::test_support::Rng::new(11);
+    for (round, k) in [0usize, 5, 1, 9, 2, 0, 3, 17, 1, 4, 2, 6, 0, 8]
+        .into_iter()
+        .cycle()
+        .take(60)
+        .enumerate()
+    {
+        let mut expected = std::collections::BTreeMap::<(u128, i64), i64>::new();
+        let runs: Vec<Rc<Batch>> = (0..k)
+            .map(|_| {
+                let mut rows = std::collections::BTreeMap::<(u128, i64), i64>::new();
+                for _ in 0..rng.gen_range(10) {
+                    let (pk, val) = (rng.gen_range(12) as u128, rng.gen_range(3) as i64);
+                    let w = [-2i64, -1, 1, 2][rng.gen_range(4) as usize];
+                    *rows.entry((pk, val)).or_default() += w;
+                }
+                rows.retain(|_, w| *w != 0);
+                for (&id, &w) in &rows {
+                    *expected.entry(id).or_default() += w;
+                }
+                u128_run(&rows.into_iter().map(|((pk, val), w)| (pk, w, val)).collect::<Vec<_>>())
+            })
+            .collect();
+        expected.retain(|_, w| *w != 0);
+        let expected: Vec<(u128, i64, i64)> = expected.into_iter().map(|((pk, val), w)| (pk, w, val)).collect();
+        let mut c = create_read_cursor(&runs, &[], make_schema_u128_i64());
+        assert_eq!(walk(&mut c), expected, "round {round}, k={k}");
+        drop(c);
+        for run in &runs {
+            assert_eq!(Rc::strong_count(run), 1, "round {round}: a dropped cursor holds a run");
+        }
     }
 }

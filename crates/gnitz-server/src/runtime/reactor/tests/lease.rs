@@ -196,3 +196,52 @@ fn a_ring_given_back_copies_queued_frames_and_holds_their_train() {
     drop(lease);
     assert!(!writers[0].held(id), "a dropped lease holds nothing");
 }
+
+/// A dropped train lease's queue box is emptied and taken by the next train
+/// lease: a lease read to its end, then one dropped with frames still queued,
+/// leave the lease after them only its own frames, and the dropped frames'
+/// ring space released.
+#[test]
+fn a_reused_queue_box_holds_only_its_own_leases_frames() {
+    let (r, mut writers) = reactor_with_rings(3);
+    let schema = crate::test_support::make_schema_u64_i64();
+    let rows = |pk| crate::test_support::make_batch(&schema, &[(pk, 1, 0)]);
+    let read_all = |lease: &TrainLease| {
+        let mut pks = Vec::new();
+        while let Some(f) = try_poll_once(lease.next()).expect("routed").expect("no fault") {
+            pks.push(u64::from_be_bytes(f.rows(&schema).get_pk_bytes(0).try_into().unwrap()));
+        }
+        pks
+    };
+
+    let read = r.lease_train(WorkerSet::one(1), "ScanSpec");
+    writers[1].send_train_frame(read.id(), true, Some(&rows(1)));
+    r.drain_all_w2m();
+    assert_eq!(read_all(&read), [1]);
+    drop(read);
+    assert_eq!(r.routes.spare.borrow().len(), 1, "the box is kept");
+
+    let unread = r.lease_train(WorkerSet::one(0).with(2), "ScanSpec");
+    assert!(r.routes.spare.borrow().is_empty(), "the kept box is taken");
+    for w in [0, 2] {
+        writers[w].send_train_frame(unread.id(), false, Some(&rows(2)));
+    }
+    r.drain_all_w2m();
+    assert!(r.w2m.release_cursor(0) < r.w2m.write_cursor(0), "queued in place");
+    drop(unread);
+    for w in [0, 2] {
+        assert_eq!(
+            r.w2m.release_cursor(w),
+            r.w2m.write_cursor(w),
+            "worker {w}'s frames released"
+        );
+    }
+
+    let next = r.lease_train(WorkerSet::ALL, "ScanSpec");
+    assert!(r.routes.spare.borrow().is_empty(), "the kept box is taken");
+    for (w, writer) in writers.iter_mut().enumerate() {
+        writer.send_train_frame(next.id(), true, (w == 2).then(|| rows(3)).as_ref());
+    }
+    r.drain_all_w2m();
+    assert_eq!(read_all(&next), [3], "only its own frames");
+}

@@ -6,7 +6,8 @@ use super::key_pack::{FoldCols, KeyPacker};
 use super::route::{ground_owner, worker_for_key, worker_for_pk_bytes, worker_for_wide_pk, Placement, Slot};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::{zip_cells, NARROW_PK_MAX_BYTES};
+use gnitz_wire::{zip_cells, MAX_PK_BYTES, NARROW_PK_MAX_BYTES};
+use std::mem::MaybeUninit;
 
 /// A scatter key resolved against one schema: each row goes to the owner of the
 /// PK its consumer gives it. Without a key every worker is sent every
@@ -199,14 +200,21 @@ fn route_cells<const W: usize, const OPK: bool>(
 /// Rows [`route_rows_packed`] packs per [`KeyPacker::pack_rows`] call.
 const KEY_CHUNK: usize = 256;
 
-/// [`route_rows`] for a packed key, packed a chunk of rows at a time.
+/// [`route_rows`] for a packed key, packed a chunk of rows at a time into a stack buffer.
+/// The buffer is zeroed only as far as the first chunk's keys reach, since no later chunk
+/// is longer; [`KeyPacker::pack_rows`] writes every byte of each key it packs, so a chunk
+/// reads no key left by the one before.
 #[inline(never)]
 fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker, nw: usize) {
     let (rows, width) = (mb.len(), packer.out_stride);
-    let mut keys = vec![0u8; rows.min(KEY_CHUNK) * width];
+    let mut buf = [MaybeUninit::<u8>::uninit(); KEY_CHUNK * MAX_PK_BYTES];
+    let keys = &mut buf[..rows.min(KEY_CHUNK) * width];
+    keys.fill(MaybeUninit::new(0));
+    // SAFETY: the fill initialized every byte of `keys`.
+    let keys = unsafe { keys.assume_init_mut() };
     for start in (0..rows).step_by(KEY_CHUNK) {
         let n = (rows - start).min(KEY_CHUNK);
-        packer.pack_rows(&mut keys, width, mb, &[(start, start + n)]);
+        packer.pack_rows(keys, width, mb, &[(start, start + n)]);
         if width <= NARROW_PK_MAX_BYTES {
             // A packed key is an OPK image of `width` bytes per row.
             let weights = &mb.weight()[start * 8..(start + n) * 8];

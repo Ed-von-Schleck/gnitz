@@ -16,8 +16,8 @@ use gnitz_wire::{ColumnDef, ComputeMap};
 /// `columns` behind a leading key region of `npk`, admitted as a schema the engine
 /// can hold.
 pub(crate) fn leading_schema(columns: Vec<ColumnDef>, npk: usize) -> Result<Schema, GnitzSqlError> {
-    let pk: Vec<u32> = (0..npk as u32).collect();
-    Schema::from_parts(columns, &pk).map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))
+    Schema::from_parts(columns, gnitz_expr::leading_pk(npk))
+        .map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))
 }
 
 /// The payload program of a physicalized projection, whose first `k` items copy

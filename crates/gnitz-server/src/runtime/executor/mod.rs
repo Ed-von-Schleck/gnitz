@@ -46,10 +46,10 @@ use crate::runtime::sal::Read;
 use crate::runtime::signals;
 use crate::runtime::sync::{select2, AsyncRwLock, Either, WriteGuard};
 use crate::runtime::tls::{Served, TlsListener};
+use gnitz_store::read::ReadRows;
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_wire::txn_frame::ScanItem;
 use gnitz_wire::{ClientVerb, ReadSpec, Target, WireFault, WireStatus};
-use gnitz_zset::repr::Batch;
 
 /// Park in 1 ms reactor ticks until `ready`, or until `polls` elapse. The shape
 /// every hold-seam needs: it holds no lock while it waits, so the event it waits
@@ -512,9 +512,11 @@ struct Scanned {
     kind: RelationKind,
     /// A system catalog family's rows, read off the master's own copy; `None`
     /// for a scan that takes the next lease of the cut.
-    local: Option<Rc<Batch>>,
+    local: Option<ReadRows>,
     /// The read's watermark; a fanned scan's is sampled inside the cut.
     lsn: u64,
+    /// A fanned scan's lease, written in the cut.
+    lease: Option<TrainLease>,
 }
 
 /// SCAN_SPEC and SCAN_MULTI: one reply per scan, in request order. The scans
@@ -545,30 +547,27 @@ async fn handle_scan(shared: &Shared, peer: &Peer, scans: &[ScanItem<'_>]) -> Re
             }
             _ => (None, 0),
         };
-        scanned.push(Scanned { kind, local, lsn });
+        scanned.push(Scanned { kind, local, lsn, lease: None });
     }
-    let leases = if scanned.iter().all(|s| s.local.is_some()) {
-        Vec::new()
-    } else {
+    if scanned.iter().any(|s| s.local.is_none()) {
         let fanned = scans.iter().zip(&mut scanned).filter(|(_, s)| s.local.is_none());
         let cut = shared.dispatcher.scan_cut(|cut| {
             for (scan, s) in fanned {
                 s.lsn = read_watermark(shared, s.kind, cut.sal());
-                cut.read(Read::ScanSpec {
+                s.lease = Some(cut.read(Read::ScanSpec {
                     tid: scan.target.tid,
                     reply_layout: scan.reply_layout,
                     spec: scan.spec.into(),
-                })?;
+                })?);
             }
             Ok(())
         });
-        cut.await?
-    };
+        cut.await?;
+    }
     // The replies read no catalog state, and a slow client's egress must not
     // hold the catalog read lock.
     drop(catalog);
 
-    let mut leases = leases.iter();
     for (scan, s) in scans.iter().zip(&scanned) {
         let target_id = scan.target.tid;
         match &s.local {
@@ -584,7 +583,7 @@ async fn handle_scan(shared: &Shared, peer: &Peer, scans: &[ScanItem<'_>]) -> Re
             None => {
                 // This relation's train, all workers, before the next: within a
                 // cut each worker's ring order is request order.
-                forward_scan(peer, leases.next().expect("one lease per fanned scan")).await?;
+                forward_scan(peer, s.lease.as_ref().expect("a fanned scan has a lease")).await?;
                 send_ack(peer, target_id, s.lsn);
             }
         }

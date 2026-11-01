@@ -1,7 +1,7 @@
 //! Single-threaded io_uring reactor: the master process's one event loop, driven
 //! by [`Reactor::block_on`] alone. A task's waker is its key (see `waker_wake`);
-//! one-CQE awaiters hold a [`oneshot`], next-of-many awaiters park in a
-//! [`WakeQueue`](crate::runtime::sync::WakeQueue), an ACK round parks on its
+//! a one-CQE awaiter polls its op's slot in `ops`, next-of-many awaiters park in
+//! a [`WakeQueue`](crate::runtime::sync::WakeQueue), an ACK round parks on its
 //! lease's route until every worker of its set has answered, and every deadline
 //! sits in one deadline map.
 //!
@@ -28,7 +28,6 @@ use slab::Slab;
 
 use self::uring::IoUringRing;
 
-use crate::runtime::sync::oneshot;
 use crate::runtime::w2m::W2mReceiver;
 
 mod conn;
@@ -84,7 +83,8 @@ pub(crate) struct ReactorShared {
     /// Live tasks; a task's waker key is its slot plus one. A slot holds `None`
     /// while its task is polled, and is freed for reuse when it completes.
     tasks: RefCell<Slab<Option<Task>>>,
-    /// In-flight one-shot ops, each in a slot freed at its CQE.
+    /// One-shot ops, each in a slot freed by the later of its CQE and its
+    /// future's end (taking the result, or being dropped).
     ops: RefCell<Slab<PendingOp>>,
     /// One-shot ops pushed: the high bits of each op's id.
     ops_pushed: Cell<u64>,
@@ -96,11 +96,116 @@ pub(crate) struct ReactorShared {
     w2m: W2mReceiver,
 }
 
-/// A submitted op awaiting its CQE `res`.
+/// A submitted op: where its CQE `res` meets its awaiter.
 struct PendingOp {
-    done: oneshot::Sender<i32>,
-    /// What the SQE names, held until the CQE.
-    _carry: Option<Rc<conn::Outbound>>,
+    state: OpState,
+    /// What the SQE names, held until the CQE, and handed to the awaiter with
+    /// the result.
+    carry: Option<conn::Outbound>,
+}
+
+enum OpState {
+    /// No CQE yet; the waker of the awaiter's last poll.
+    Waiting(Option<Waker>),
+    /// The CQE's `res`, not yet taken by the awaiter.
+    Done(i32),
+    /// The awaiter was dropped before the CQE, which frees the slot.
+    Abandoned,
+}
+
+/// The awaiter of a one-shot op: yields its CQE `res` and the op's carry.
+/// Dropped before the CQE, it leaves the slot, carry included, to the CQE.
+struct NamedOp {
+    reactor: Reactor,
+    user_data: u64,
+    /// The result was taken, and the slot freed.
+    finished: bool,
+}
+
+impl NamedOp {
+    /// The op's `user_data`, which [`Reactor::cancel_op`] takes.
+    fn user_data(&self) -> u64 {
+        self.user_data
+    }
+
+    fn slot(&self) -> usize {
+        (self.user_data & OP_SLOT_MASK) as usize
+    }
+
+    /// `f` over the carry while the op is in flight. `f` runs under a shared
+    /// borrow of `ops`, so it must not reach the reactor.
+    fn with_carry<R>(&self, f: impl FnOnce(&conn::Outbound) -> R) -> R {
+        debug_assert!(!self.finished, "the carry left with the result");
+        let ops = self.reactor.ops.borrow();
+        f(ops[self.slot()].carry.as_ref().expect("an op that carries"))
+    }
+}
+
+impl Future for NamedOp {
+    type Output = (i32, Option<conn::Outbound>);
+
+    // Inlined into each caller: outlined, the result moves through extra
+    // stack copies.
+    #[inline(always)]
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        assert!(!self.finished, "an op polled after its result");
+        let slot = self.slot();
+        let mut ops = self.reactor.ops.borrow_mut();
+        let entry = &mut ops[slot];
+        let res = match &mut entry.state {
+            OpState::Done(res) => *res,
+            OpState::Waiting(waker) => {
+                match waker {
+                    Some(w) if w.will_wake(cx.waker()) => {}
+                    _ => *waker = Some(cx.waker().clone()),
+                }
+                return Poll::Pending;
+            }
+            OpState::Abandoned => unreachable!("a live op's slot marked abandoned"),
+        };
+        let PendingOp { state, carry } = ops.remove(slot);
+        drop(ops);
+        drop(state);
+        self.finished = true;
+        Poll::Ready((res, carry))
+    }
+}
+
+impl Drop for NamedOp {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let slot = self.slot();
+        let mut ops = self.reactor.ops.borrow_mut();
+        let entry = &mut ops[slot];
+        if let OpState::Done(_) = entry.state {
+            drop(ops);
+            self.reactor.free_op(slot);
+        } else {
+            entry.state = OpState::Abandoned;
+        }
+    }
+}
+
+impl ReactorShared {
+    /// Free op `slot`, dropping its carry outside the `ops` borrow: the carry
+    /// may hold the last handle on a connection.
+    fn free_op(&self, slot: usize) {
+        let op = self.ops.borrow_mut().remove(slot);
+        drop(op);
+    }
+}
+
+/// The awaiter of a one-shot op that carries nothing: yields its CQE `res`.
+struct OpFuture(NamedOp);
+
+impl Future for OpFuture {
+    type Output = i32;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
+        Pin::new(&mut self.0).poll(cx).map(|(res, _)| res)
+    }
 }
 
 /// A handle on the master's one event loop; clones share it.
@@ -140,33 +245,35 @@ impl Reactor {
     ///
     /// # Safety
     /// As [`IoUringRing::push`].
-    unsafe fn push_op(&self, sqe: io_uring::squeue::Entry) -> oneshot::Receiver<i32> {
+    unsafe fn push_op(&self, sqe: io_uring::squeue::Entry) -> OpFuture {
         // SAFETY: forwarded to the caller.
-        unsafe { self.push_named_op(sqe, None).0 }
+        OpFuture(unsafe { self.push_named_op(sqe, None) })
     }
 
-    /// Queue `sqe` as a one-shot op holding `carry` until its CQE, whose `res`
-    /// the receiver yields, and return it with the op's `user_data`, which
-    /// [`Self::cancel_op`] takes. Not submitted. The op's slot, and with it
-    /// `carry`, is freed at its one CQE and then reused, so `sqe` must be an
-    /// opcode that posts exactly one CQE.
+    /// Queue `sqe` as a one-shot op holding `carry` until its CQE, and return
+    /// its awaiter, which yields the CQE `res` with `carry` and names the op's
+    /// `user_data` for [`Self::cancel_op`]. Not submitted. The op's slot is
+    /// freed by the later of its one CQE and its awaiter's end, and then
+    /// reused, so `sqe` must be an opcode that posts exactly one CQE.
     ///
     /// # Safety
     /// As [`IoUringRing::push`]; what `carry` holds counts as valid until the CQE.
-    unsafe fn push_named_op(
-        &self,
-        sqe: io_uring::squeue::Entry,
-        carry: Option<Rc<conn::Outbound>>,
-    ) -> (oneshot::Receiver<i32>, u64) {
-        let (done, rx) = oneshot::channel();
-        let slot = self.ops.borrow_mut().insert(PendingOp { done, _carry: carry }) as u64;
+    unsafe fn push_named_op(&self, sqe: io_uring::squeue::Entry, carry: Option<conn::Outbound>) -> NamedOp {
+        let slot = self
+            .ops
+            .borrow_mut()
+            .insert(PendingOp { state: OpState::Waiting(None), carry }) as u64;
         debug_assert!(slot <= OP_SLOT_MASK, "{slot} ops in flight");
         let pushed = self.ops_pushed.get() + 1;
         self.ops_pushed.set(pushed);
         let user_data = udata(KIND_OP, pushed << OP_SLOT_MASK.count_ones() | slot);
         // SAFETY: forwarded to the caller.
         unsafe { self.ring.borrow_mut().push(sqe, user_data) };
-        (rx, user_data)
+        NamedOp {
+            reactor: self.clone(),
+            user_data,
+            finished: false,
+        }
     }
 
     /// Cancel the op [`Self::push_named_op`] pushed as `user_data`, which its

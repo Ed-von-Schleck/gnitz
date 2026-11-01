@@ -22,13 +22,23 @@ pub(super) struct Routes {
     map: RefCell<FxHashMap<RequestId, Route>>,
     /// The next request id a lease starts from.
     next_id: Cell<RequestId>,
+    /// Emptied queue boxes of dropped train leases, taken by the next ones.
+    spare: RefCell<Vec<Box<[VecDeque<W2mSlot>]>>>,
 }
+
+/// The most queue boxes [`Routes`] keeps for reuse.
+const SPARE_QUEUES: usize = 64;
+
+/// The largest capacity a queue keeps when its box goes back for reuse; a
+/// queue grown past it under a slow reader is freed.
+const SPARE_QUEUE_CAP: usize = 16;
 
 impl Routes {
     pub(super) fn new() -> Self {
         Routes {
             map: RefCell::new(FxHashMap::default()),
             next_id: Cell::new(RequestId::BOOT_READY.next()),
+            spare: RefCell::new(Vec::new()),
         }
     }
 }
@@ -50,11 +60,12 @@ struct TrainRoute {
     /// out when their ring was given back, and they send it nothing more until
     /// its reader asks for a frame none of them has sent.
     held: WorkerSet,
-    /// One queue per worker of `set`, ascending.
+    /// One queue per launched worker, indexed by worker id; only the queues of
+    /// `set` take slots.
     queues: Box<[VecDeque<W2mSlot>]>,
-    /// The lease's one reader while it waits: the position of the queue it
-    /// waits on, and its waker. Each wait replaces the last, so a dropped wait
-    /// stops counting once the reader waits again.
+    /// The lease's one reader while it waits: the worker it waits on, and its
+    /// waker. Each wait replaces the last, so a dropped wait stops counting
+    /// once the reader waits again.
     reader: Option<(usize, Waker)>,
 }
 
@@ -91,8 +102,10 @@ impl Reactor {
         self.w2m.wake_holders(w);
         for (&id, route) in self.routes.map.borrow_mut().iter_mut() {
             let Route::Train(t) = route else { continue };
-            let Some(at) = t.set.position(w) else { continue };
-            let queue = &mut t.queues[at];
+            if !t.set.contains(w) {
+                continue;
+            }
+            let queue = &mut t.queues[w];
             if !queue.iter().any(W2mSlot::in_ring) {
                 continue;
             }
@@ -140,20 +153,21 @@ impl Reactor {
     fn route(&self, mut slot: W2mSlot) {
         let w = slot.worker as usize;
         match self.routes.map.borrow_mut().get_mut(&slot.request_id) {
-            Some(Route::Train(t)) => match t.set.position(w) {
-                Some(at) => {
-                    let reader = t.reader.take_if(|(r, _)| *r == at);
+            Some(Route::Train(t)) => {
+                if t.set.contains(w) {
+                    let reader = t.reader.take_if(|(r, _)| *r == w);
                     if slot.passed() && reader.is_none() {
                         slot.detach();
                     }
-                    t.queues[at].push_back(slot);
+                    t.queues[w].push_back(slot);
                     if let Some((_, waker)) = reader {
                         waker.wake();
                     }
+                } else {
+                    // Dropped here, releasing its ring space.
+                    debug_assert!(false, "worker {w} answered a read it was not sent");
                 }
-                // Dropped here, releasing its ring space.
-                None => debug_assert!(false, "worker {w} answered a read it was not sent"),
-            },
+            }
             Some(Route::Acks(_)) => debug_assert!(false, "worker {w} answered an ACKed request with a frame"),
             // No lease takes it: it drops here undecoded, releasing its ring space.
             None => {}
@@ -199,8 +213,10 @@ impl Reactor {
     /// `what` names the request in every fault the lease reports. See
     /// [`TrainLease`].
     pub(crate) fn lease_train(&self, set: WorkerSet, what: &'static str) -> TrainLease {
+        // Taken before `lease` borrows the route map.
+        let spare = self.routes.spare.borrow_mut().pop();
+        let queues = spare.unwrap_or_else(|| (0..self.w2m.num_workers()).map(|_| VecDeque::new()).collect());
         let lease = self.lease(self.alloc_request_id(), set, |set| {
-            let queues = (0..set.len()).map(|_| VecDeque::new()).collect();
             Route::Train(TrainRoute {
                 set,
                 held: WorkerSet::EMPTY,
@@ -251,9 +267,22 @@ impl Drop for Lease {
         // than through the route's drop glue.
         match route {
             Some(Route::Acks(acks)) => drop(acks),
-            Some(Route::Train(train)) => {
+            Some(Route::Train(mut train)) => {
                 for w in train.held.iter() {
                     self.reactor.w2m.unhold(w, self.id);
+                }
+                // Every slot is dropped before the box is kept: one left queued
+                // would hold up its ring's released prefix and reach the next
+                // lease to take the box.
+                for q in train.queues.iter_mut() {
+                    q.clear();
+                    if q.capacity() > SPARE_QUEUE_CAP {
+                        *q = VecDeque::new();
+                    }
+                }
+                let mut spare = self.reactor.routes.spare.borrow_mut();
+                if spare.len() < SPARE_QUEUES {
+                    spare.push(train.queues);
                 }
             }
             None => {}
@@ -406,8 +435,8 @@ impl TrainLease {
             let Some(Route::Train(route)) = routes.get_mut(&self.lease.id) else {
                 unreachable!("a train lease's id routes to its train")
             };
-            let at = route.set.position(w).expect("the train was written to `w`");
-            match route.queues[at].pop_front() {
+            assert!(route.set.contains(w), "the train was written to `w`");
+            match route.queues[w].pop_front() {
                 Some(slot) => Poll::Ready(slot),
                 None => {
                     // Every copied frame is taken: `w` sends the train on.
@@ -415,7 +444,7 @@ impl TrainLease {
                         route.held = route.held.without(w);
                         self.lease.reactor.w2m.unhold(w, self.lease.id);
                     }
-                    route.reader = Some((at, cx.waker().clone()));
+                    route.reader = Some((w, cx.waker().clone()));
                     Poll::Pending
                 }
             }

@@ -87,7 +87,7 @@ fn unique_key_is_the_flag_carried_through_set_preserving_nodes() {
         let rel = bound(sql);
         let cols = rel.cols();
         let key = rel.unique_key().map(|k| {
-            let names: Vec<&str> = k.iter().map(|&id| hircol_of(&cols, id).def.name.as_str()).collect();
+            let names: Vec<&str> = k.iter().map(|&id| &*hircol_of(&cols, id).def.name).collect();
             names.join(" ")
         });
         assert_eq!(key.as_deref(), want, "{sql}");

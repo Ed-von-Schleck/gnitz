@@ -3,9 +3,7 @@
 //! view's rows hydrate chunk by chunk as the sink drains them.
 use gnitz_wire::{PkKeys, ReadSpec};
 
-use std::rc::Rc;
-
-use super::check_layout;
+use super::{check_layout, ReadRows};
 use crate::relation::{Cut, RelationRegistry};
 use gnitz_expr::RowFilter;
 use gnitz_zset::algebra::SinkPlan;
@@ -27,7 +25,7 @@ impl RelationRegistry {
         spec: ReadSpec,
         reply_layout: u64,
         mut hydrate: Option<&mut dyn FnMut(PkKeys) -> Result<Batch, String>>,
-    ) -> Result<Rc<Batch>, String> {
+    ) -> Result<ReadRows, String> {
         let entry = self.relation_or_err(target_id)?;
         let table = entry.table_or_err()?;
         let src_schema = entry.schema();
@@ -41,7 +39,7 @@ impl RelationRegistry {
         // Nothing to hydrate either: the relation whole, off the store's cached
         // snapshot.
         if whole && !table.has_skeleton_rows() {
-            return Ok(entry.full_scan());
+            return Ok(ReadRows::Shared(entry.full_scan()));
         }
         let (mut source, walk) = entry.open_bound(bound, Cut::Now)?;
         let mut filter =
@@ -61,7 +59,7 @@ impl RelationRegistry {
                 break;
             }
         }
-        Ok(Rc::new(sink.finish()))
+        Ok(ReadRows::Own(sink.finish()))
     }
 }
 

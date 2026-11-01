@@ -558,7 +558,7 @@ impl Shell {
                     key.push(hidden.to_string());
                 }
                 vec![
-                    Value::Text(c.name.clone()),
+                    Value::Text(c.name.to_string()),
                     Value::Text(gnitz_sql::sql_type_name(c.ty)),
                     Value::Text(if c.is_nullable { "" } else { "not null" }.to_string()),
                     Value::Text(key.join(", ")),

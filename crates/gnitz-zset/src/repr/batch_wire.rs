@@ -7,7 +7,7 @@ use super::batch::Batch;
 use super::batch::MemBatch;
 use super::batch_pool::PooledBuf;
 use super::scatter::{copy_ranges, scatter_copy};
-use super::string_heap::{blob_span_key, prorated_blob_cap, walk_heap_spans, BlobCache};
+use super::string_heap::{blob_span_key, walk_heap_spans, BlobCache};
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::ColumnLocator;
@@ -278,7 +278,9 @@ impl Batch {
         // A heap-free block fits by width alone, and the sizing pass is skipped
         // when the source's whole heap fits too.
         if slots == 0 || wal::WAL_HEADER_SIZE + rows.len() * width + self.blob().len() <= out.len() {
-            let heap = prorated_blob_cap(self.blob().len(), self.len(), rows.len());
+            // Under dedup each source span is copied at most once, so the whole
+            // source heap bounds the block's.
+            let heap = if slots == 0 { 0 } else { self.blob().len() };
             if let Some(len) = self.encode_listed(rows, heap, out, true) {
                 return Some((rows.len(), len));
             }

@@ -25,7 +25,9 @@ mod test_support;
 mod transport;
 mod txn;
 
-pub use batch::{append_own_regions, push_zero_cell, BatchAppender, BatchMark, PayloadColumn, PkColumn, ZSetBatch};
+pub use batch::{
+    append_own_regions, push_zero_cell, BatchAppender, BatchMark, PayloadColumn, PkColumn, PushBatch, ZSetBatch,
+};
 pub use catalog::{Catalog, CatalogRelation, IndexRow, RelProps};
 pub use client::{env_target, GnitzClient};
 pub use connection::{

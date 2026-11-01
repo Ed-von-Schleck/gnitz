@@ -166,8 +166,22 @@ impl Reactor {
                 self.parked.set(false);
             }
             KIND_OP => {
-                let op = self.ops.borrow_mut().try_remove((id & OP_SLOT_MASK) as usize);
-                op.expect("an op's entry lives until its CQE").done.send(res);
+                let slot = (id & OP_SLOT_MASK) as usize;
+                let mut ops = self.ops.borrow_mut();
+                let entry = ops.get_mut(slot).expect("an op's entry lives until its CQE");
+                match std::mem::replace(&mut entry.state, OpState::Done(res)) {
+                    OpState::Waiting(waker) => {
+                        drop(ops);
+                        if let Some(w) = waker {
+                            w.wake();
+                        }
+                    }
+                    OpState::Abandoned => {
+                        drop(ops);
+                        self.free_op(slot);
+                    }
+                    OpState::Done(_) => unreachable!("a second CQE for op {user_data:#x}"),
+                }
             }
             KIND_RECV => self.handle_recv_cqe(id as i32, res),
             KIND_CANCEL => {}

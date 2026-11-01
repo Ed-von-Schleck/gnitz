@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::ops::Range;
 use std::rc::Rc;
 
+use crate::algebra::{vec_bytes, zeroed};
 use crate::repr::{Batch, DirectWriter, MemBatch};
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::{for_each_fixed_int, int_cell, AggFunc, FixedInt, ScalarKind};
@@ -92,16 +93,38 @@ fn wides(aggs: &[Agg]) -> bool {
 impl AggValues {
     /// `groups` empty groups of `aggs`.
     pub(crate) fn new(aggs: &Rc<[Agg]>, groups: usize) -> Self {
-        let n = aggs.len() * groups;
-        AggValues {
-            acc: vec![0; n],
-            has: vec![false; if extremes(aggs) { n } else { 0 }],
-            wide: vec![(0, 0, 0); if wides(aggs) { n } else { 0 }],
+        let mut values = AggValues {
+            acc: Vec::new(),
+            has: Vec::new(),
+            wide: Vec::new(),
             heap: Vec::new(),
             aggs: Rc::clone(aggs),
-            groups,
-            cap: groups,
+            groups: 0,
+            cap: 0,
+        };
+        values.reset(groups);
+        values
+    }
+
+    /// `groups` empty groups, in the buffers this already holds.
+    pub(crate) fn reset(&mut self, groups: usize) {
+        // Laid out again at `cap = groups`: every value sits at `k * cap + g`.
+        let n = self.aggs.len() * groups;
+        zeroed(&mut self.acc, n);
+        if extremes(&self.aggs) {
+            zeroed(&mut self.has, n);
         }
+        if wides(&self.aggs) {
+            zeroed(&mut self.wide, n);
+        }
+        self.heap.clear();
+        self.groups = groups;
+        self.cap = groups;
+    }
+
+    /// The bytes this holds allocated.
+    pub(crate) fn held_bytes(&self) -> usize {
+        vec_bytes(&self.acc) + vec_bytes(&self.has) + vec_bytes(&self.wide) + vec_bytes(&self.heap)
     }
 
     /// Grow to `groups` groups, each new one empty.
@@ -162,6 +185,31 @@ impl AggValues {
         &self.heap[start..start + len as usize]
     }
 
+    /// Give group `at` room for `len` bytes and return where they start, for the
+    /// caller to write. A group whose room is too small moves to the end of
+    /// `heap`, into room for the larger of `len` and twice its old room. Sets its
+    /// length to `len` and marks it holding a value.
+    #[inline(always)]
+    fn reserve_wide(&mut self, at: usize, len: usize) -> usize {
+        let (start, _, room) = self.wide[at];
+        let len32 = len as u32;
+        let start = if len32 <= room {
+            start
+        } else {
+            let room = len32.max(room.saturating_mul(2));
+            let start = self.heap.len();
+            self.heap.resize(start + room as usize, 0);
+            self.wide[at].0 = start;
+            self.wide[at].2 = room;
+            start
+        };
+        self.wide[at].1 = len32;
+        self.has[at] = true;
+        start
+    }
+
+    /// Store `v` as group `at`'s value, growing as [`Self::reserve_wide`] does.
+    /// A move appends `v` itself, so only the room past it is zeroed.
     #[inline(always)]
     fn store_wide(&mut self, at: usize, v: &[u8]) {
         let (start, _, room) = self.wide[at];
@@ -402,7 +450,13 @@ impl AggValues {
                 self.acc[at] = u64::from_be_bytes(image[..8].try_into().unwrap()) as i64;
                 self.has[at] = true;
             }
-            ImageKind::Wide(kind) => self.store_wide(at, &wide_native_of_image(kind, max, image)),
+            ImageKind::Wide(kind) => {
+                let start = self.reserve_wide(at, image.len());
+                let room = &mut self.heap[start..start + image.len()];
+                room.copy_from_slice(image);
+                // The native bytes are never longer than their image.
+                self.wide[at].1 = wide_native_of_image(kind, max, room) as u32;
+            }
         }
     }
 
@@ -560,8 +614,9 @@ impl AggValues {
             if let StepKind::Extreme { kind, .. } = self.aggs[k].kind {
                 self.has[to] = self.has[from];
                 if matches!(kind, ImageKind::Wide(_)) && self.has[from] {
-                    let value = self.wide(from).to_vec();
-                    self.store_wide(to, &value);
+                    let (src, len, _) = self.wide[from];
+                    let dst = self.reserve_wide(to, len as usize);
+                    self.heap.copy_within(src..src + len as usize, dst);
                 }
             }
         }

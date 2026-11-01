@@ -982,7 +982,7 @@ fn an_order_by_key_binds_where_the_select_list_does() {
     // An aggregate named only in ORDER BY is collected into the reduce: the
     // partial reply carries its accumulator behind the group column, its key.
     let plan = read(&cat, "SELECT g FROM t GROUP BY g ORDER BY COUNT(*)").unwrap();
-    let names: Vec<&str> = plan.reply_schema().columns().iter().map(|c| c.name.as_str()).collect();
+    let names: Vec<&str> = plan.reply_schema().columns().iter().map(|c| &*c.name).collect();
     assert_eq!(names, ["g", "_agg"]);
     // A hidden ordering column is tied to its key by the key's position in the
     // whole ORDER BY, so a positional key ahead of an expression one does not

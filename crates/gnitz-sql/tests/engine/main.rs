@@ -173,7 +173,7 @@ impl Db {
                     .cols
                     .as_slice()
                     .iter()
-                    .map(|&c| rel.schema.columns()[c as usize].name.clone())
+                    .map(|&c| rel.schema.columns()[c as usize].name.to_string())
                     .collect();
                 (cols, ix.is_unique)
             })

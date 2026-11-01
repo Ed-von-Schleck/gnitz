@@ -177,7 +177,7 @@ impl TableWriter {
         // A lone key column's values are distinct within the file, so a
         // dictionary would hold every one and add an index per row.
         if let Some(key) = schema.layout().lone_pk_col() {
-            let name = schema.columns()[key].name.as_str();
+            let name = &*schema.columns()[key].name;
             props = props.set_column_dictionary_enabled(ColumnPath::from(name), false);
         }
         let file = File::create(path)?;

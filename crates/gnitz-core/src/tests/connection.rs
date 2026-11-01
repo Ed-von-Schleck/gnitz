@@ -620,6 +620,88 @@ fn a_snapshot_page_naming_no_worker_ends_the_session() {
     assert!(s.is_closed());
 }
 
+/// A page's rows arrive as several workers' trains of continuation frames; the
+/// batch holds them in arrival order with their weights and strings, and each
+/// worker's end is where its rows stop in that batch.
+#[test]
+fn a_multi_frame_page_decodes_in_arrival_order() {
+    let schema = schema_b();
+    let rows = |rows: &[(u64, i64)]| {
+        let mut b = ZSetBatch::new(&schema);
+        let mut app = BatchAppender::new(&mut b);
+        for &(pk, w) in rows {
+            app.add_row(pk as u128, w)
+                .str_val(&format!("a string longer than inline {pk}"))
+                .f64_val(pk as f64);
+        }
+        b
+    };
+    let frame = |batch: &ZSetBatch, continuation, scan_last| {
+        let hdr = ControlHeader {
+            target_id: 7,
+            flags: gnitz_wire::WireFlags {
+                continuation,
+                scan_last,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        encode_frame(hdr, &[], None, Some(batch))
+    };
+    let (mut s, peer) = pair();
+    let mut sent = s.submit_snapshot_page(1, 7, &[], 10, &schema);
+    s.step(Interest::WRITE);
+    peer.recv();
+    for f in [
+        frame(&rows(&[(1, 1), (2, 3)]), true, true),
+        frame(&rows(&[(3, -1)]), true, false),
+        frame(&rows(&[(4, 2), (5, 1)]), true, true),
+        frame(&rows(&[(6, 7)]), false, true),
+    ] {
+        assert!(sent.try_take().is_none());
+        peer.send(&f);
+        s.step(Interest::READ);
+    }
+    let page = sent.try_take().unwrap().unwrap();
+    assert_eq!(page.batch, rows(&[(1, 1), (2, 3), (3, -1), (4, 2), (5, 1), (6, 7)]));
+    assert_eq!(page.worker_ends, [2, 5, 6]);
+
+    // A terminal that carries no rows decodes the held frames.
+    let mut sent = submit_scan(&mut s, 7, &schema);
+    s.step(Interest::WRITE);
+    peer.recv();
+    peer.send(&frame(&rows(&[(1, 2)]), true, false));
+    peer.send(&frame(&rows(&[(2, 1)]), true, false));
+    s.step(Interest::READ);
+    assert!(sent.try_take().is_none());
+    peer.send(&reply_ctrl(7, 0));
+    assert_eq!(await_reply(&mut s, sent).unwrap().batch, rows(&[(1, 2), (2, 1)]));
+}
+
+/// A continuation frame whose data block header does not parse ends the
+/// session on that frame, before the train's terminal.
+#[test]
+fn a_malformed_block_mid_train_ends_the_session_at_once() {
+    let (mut s, peer) = pair();
+    let schema = schema_a();
+    let sent = submit_scan(&mut s, 7, &schema);
+    s.step(Interest::WRITE);
+    peer.recv();
+    let mut bad = reply_rows(7, &batch_a(&[2]), 0, true);
+    let data = peek_control_block(&bad).unwrap().data.unwrap();
+    // The header's second word, the block version.
+    bad[data.start + 4] ^= 0xff;
+    peer.send(&reply_rows(7, &batch_a(&[1]), 0, true));
+    peer.send(&bad);
+    s.step(Interest::READ);
+    assert!(s.is_closed());
+    let e = await_reply(&mut s, sent).expect_err("a malformed block");
+    assert!(
+        matches!(&e, ClientError::ConnectionLost(ProtocolError::DecodeError(m)) if m.contains("version")),
+        "{e:?}"
+    );
+}
+
 // ── Pushed trains ────────────────────────────────────────────────────────────
 
 /// The cursor `(tag 1, tick)`.
@@ -1009,7 +1091,7 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     let family = |tid: u64, batch, mode, basis| PushFamily {
         target: tid.into(),
         schema: Arc::clone(&schema),
-        batch,
+        batch: Arc::new(batch),
         mode,
         basis,
     };
@@ -1029,7 +1111,7 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
         assert_eq!(got, (want.target.tid, want.mode, want.basis));
         let block_schema = frame_schema(frame, fam).unwrap();
         assert_eq!(block_schema, *schema);
-        assert_eq!(frame_data(frame, fam, &block_schema).as_ref(), Some(&want.batch));
+        assert_eq!(frame_data(frame, fam, &block_schema).as_ref(), Some(&*want.batch));
     }
 }
 

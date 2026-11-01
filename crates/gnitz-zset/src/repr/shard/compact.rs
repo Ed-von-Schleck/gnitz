@@ -160,10 +160,11 @@ impl GuardMerge {
         if survivors.is_empty() {
             return None;
         }
-        let set = UnifiedSet::of(&shards, out_schema, windows);
         // A skeleton run holds no string.
         let codebook = codebook.filter(|_| !skeleton);
-        let batch = set.materialize(&survivors, codebook);
+        let batch = UnifiedSet::with(&shards, out_schema, windows, |set| {
+            set.materialize(&survivors, codebook)
+        });
         let coded = codebook.map(|book| {
             let mask = out_schema.string_payload_slots();
             (book, long_bytes(&batch.as_mem_batch(), mask, 0..batch.len()))

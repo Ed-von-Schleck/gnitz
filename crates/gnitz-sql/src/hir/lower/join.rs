@@ -17,6 +17,7 @@ use gnitz_wire::{Circuit, ColumnDef, NodeId, NullKeys, RangeRel, ReindexRole, Re
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// One branch an emitter hands the shell: its node over the join frame, and a mark
 /// branch's BOOLEAN constant.
@@ -377,10 +378,10 @@ fn join_pk_coldefs(class: &JoinClass) -> Vec<ColumnDef> {
         .key_types()
         .enumerate()
         .map(|(i, ty)| {
-            let name = if k == 1 {
-                "_join_pk".to_string()
+            let name: Arc<str> = if k == 1 {
+                "_join_pk".into()
             } else {
-                format!("_join_pk_{i}")
+                format!("_join_pk_{i}").into()
             };
             ColumnDef::new(name, ty, false).hidden()
         })
@@ -392,7 +393,7 @@ fn join_pk_coldefs(class: &JoinClass) -> Vec<ColumnDef> {
 /// hidden. The two producers below differ only in `name`.
 fn rekey_pk_coldefs<'a>(
     cols: impl IntoIterator<Item = (&'a Schema, u32)>,
-    name: impl Fn(usize, &ColumnDef) -> String,
+    name: impl Fn(usize, &ColumnDef) -> Arc<str>,
 ) -> Vec<ColumnDef> {
     cols.into_iter()
         .enumerate()
@@ -413,7 +414,7 @@ fn pair_pk_coldefs(left_schema: &Schema, right_schema: &Schema) -> Vec<ColumnDef
             .iter()
             .map(|&c| (left_schema, c))
             .chain(right_schema.pk_cols().iter().map(|&c| (right_schema, c))),
-        |slot, _| format!("_pair_pk_{slot}"),
+        |slot, _| format!("_pair_pk_{slot}").into(),
     )
 }
 

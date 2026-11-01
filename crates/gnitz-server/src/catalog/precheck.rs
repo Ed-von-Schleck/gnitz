@@ -826,7 +826,7 @@ impl CatalogEngine {
 /// write to.
 fn unique_visible_names(defs: &[CatalogColumn]) -> Result<(), String> {
     let visible = defs.iter().filter(|c| !c.def.is_hidden);
-    match gnitz_wire::first_duplicate(visible.map(|c| c.def.name.as_str())) {
+    match gnitz_wire::first_duplicate(visible.map(|c| &*c.def.name)) {
         Some(name) => Err(format!("has duplicate column name '{name}'")),
         None => Ok(()),
     }

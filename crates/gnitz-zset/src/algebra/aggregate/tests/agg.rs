@@ -2,7 +2,7 @@ use super::*;
 use crate::algebra::aggregate::ReduceShape;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{le_cell, pk_payload_schema, Rng};
+use crate::test_support::{le_cell, pk_payload_schema, Rng, STRS};
 use gnitz_wire::{AggDescriptor, TypeCode};
 
 const N: usize = 97;
@@ -127,6 +127,61 @@ fn the_column_kernels_read_a_pk_column() {
                 b.end_row();
             }
             assert_kernels_match(&b.finish(), ci);
+        }
+    }
+}
+
+/// A wide MIN/MAX seeded from a row's value-index image holds the value a step
+/// of that row reaches, and `copy` hands it on: over strings holding `0x00`
+/// and 16-byte integers, into a group seeded or copied into again with a
+/// longer or a shorter value each time.
+#[test]
+fn a_wide_extreme_seeds_from_its_image_and_copies() {
+    use TypeCode::{String, I128, U64};
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(U64, false),
+            SchemaColumn::new(String, false),
+            SchemaColumn::new(I128, false),
+        ],
+        &[0],
+    );
+    let rows = STRS.len();
+    let mut b = BatchBuilder::new(&schema);
+    for (r, s) in STRS.iter().enumerate() {
+        b.begin_row(r as u128, 1);
+        b.put_string(s);
+        b.put_int((r as i128 - 4).wrapping_mul(i128::MAX / 7) as u128);
+        b.end_row();
+    }
+    let b = b.finish();
+    let mb = b.as_mem_batch();
+    for agg_op in [AggFunc::Min, AggFunc::Max] {
+        for ci in [1, 2] {
+            let aggs = [AggDescriptor { col_idx: ci, agg_op }];
+            let aggs = ReduceShape::new(&schema, &[0], &aggs).unwrap().0.aggs;
+            let image_col = aggs[0].index_image().unwrap();
+            // Per row: a stepped group, a seeded one; then one reseeded and one
+            // copied into for every row.
+            let (reseeded, copied) = (2 * rows, 2 * rows + 1);
+            let mut vals = AggValues::new(&aggs, 2 * rows + 2);
+            for r in (0..rows).chain((0..rows).rev()) {
+                let what = format!("{agg_op:?} over column {ci}, row {r}");
+                let (stepped, seeded) = (2 * r, 2 * r + 1);
+                let mut image = Vec::new();
+                image_col.append(&mb, r, &mut image);
+                vals.clear_extreme(0, stepped);
+                vals.step(stepped, &mb, r, 1);
+                vals.seed_from_index(0, seeded, &image);
+                vals.seed_from_index(0, reseeded, &image);
+                vals.copy(stepped, copied);
+                assert!(vals.same(stepped, seeded), "{what}: seeded");
+                assert!(vals.same(stepped, reseeded), "{what}: reseeded");
+                assert!(vals.same(stepped, copied), "{what}: copied");
+                if ci == 1 {
+                    assert_eq!(vals.wide(vals.at(0, seeded)), STRS[r].as_bytes(), "{what}");
+                }
+            }
         }
     }
 }

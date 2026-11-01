@@ -151,10 +151,16 @@ impl DagEngine {
         self.views.get(&view_id).into_iter().flat_map(|v| v.code.source_ids())
     }
 
-    /// Every relation one or more `view → sources` edges from some seed —
-    /// through view sources, down to the bases.
-    pub(crate) fn source_closure(&self, seeds: impl IntoIterator<Item = u64>) -> FxHashSet<u64> {
-        closure(|id| self.sources_of(id), seeds)
+    /// Every relation one or more `view → sources` edges from `view` — through
+    /// view sources, down to the bases — sorted, without `view` itself. Empty for
+    /// an id that is no registered view.
+    pub(crate) fn source_closure_of(&self, view: u64) -> &[u64] {
+        self.views.get(&view).map_or(&[], |v| &v.sources)
+    }
+
+    /// `id`, then [`Self::source_closure_of`] it.
+    pub(crate) fn self_and_sources(&self, id: u64) -> impl Iterator<Item = u64> + '_ {
+        std::iter::once(id).chain(self.source_closure_of(id).iter().copied())
     }
 
     /// The other direction over the same edges: every view one or more

@@ -108,7 +108,7 @@ fn cell(batch: &ZSetBatch, loc: ColumnLocator, ty: ColType, row: usize) -> Value
         TypeCode::UUID => Value::Text(format_uuid(u128::from_le_bytes(wide(b)))),
         TypeCode::Date => Value::Text(format_date(int())),
         TypeCode::Timestamp => Value::Text(format_timestamp(int())),
-        TypeCode::Decimal => Value::Text(format_decimal(int().into(), ty.scale)),
+        TypeCode::Decimal => Value::Text(format_decimal(int(), ty.scale)),
         TypeCode::String => Value::Text(String::from_utf8_lossy(&loc.content(batch, row)).into_owned()),
         TypeCode::Blob => Value::Bytes(loc.content(batch, row).into_owned()),
     }
@@ -143,7 +143,7 @@ impl Rows {
         let (shown, columns): (Vec<(ColumnLocator, ColType)>, Vec<Column>) = schema
             .visible_columns()
             .map(|(ci, c)| {
-                let column = Column { name: c.name.clone(), tc: c.ty.tc };
+                let column = Column { name: c.name.to_string(), tc: c.ty.tc };
                 ((schema.layout().locate(ci), c.ty), column)
             })
             .unzip();

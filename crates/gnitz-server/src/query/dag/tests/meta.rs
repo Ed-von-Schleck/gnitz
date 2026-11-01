@@ -30,33 +30,68 @@ fn engine_with_tables<const N: usize>(name: &str, more: [&str; N]) -> (CatalogEn
     (engine, t, ids)
 }
 
-/// Both closures walk transitively over a chain, a diamond and a disconnected
-/// pair. A seed is reported only when another seed reaches it.
+/// Both closures walk transitively over a three-view chain, a diamond and a
+/// disconnected pair; the cached source closures answer the dependent closure of
+/// one id.
 #[test]
 fn the_closures_walk_both_directions_transitively() {
-    // chain a → c1 → c2, diamond d → {d1, d2} → d3, disconnected pair p → p1.
+    // chain a → c1 → c2 → c3, diamond d → {d1, d2} → d3, disconnected pair p → p1.
     let (mut engine, a, [d, p]) = engine_with_tables("closures", ["d", "p"]);
     let cols = u64_i64_cols();
     let c1 = register_identity_view(&mut engine, a, "c1", &cols);
     let c2 = register_identity_view(&mut engine, c1, "c2", &cols);
+    let c3 = register_identity_view(&mut engine, c2, "c3", &cols);
     let d1 = register_identity_view(&mut engine, d, "d1", &cols);
     let d2 = register_identity_view(&mut engine, d, "d2", &cols);
     let d3 = union_view(&mut engine, &[d1, d2], "d3");
     let p1 = register_identity_view(&mut engine, p, "p1", &cols);
     let dag = &engine.dag;
 
-    assert!(dag.source_closure([]).is_empty());
-    assert_eq!(dag.source_closure([c2]), set(&[a, c1]));
-    assert_eq!(dag.source_closure([d3]), set(&[d, d1, d2]));
-    assert_eq!(dag.source_closure([p1]), set(&[p]));
-    assert!(dag.source_closure([a]).is_empty());
-    assert!(dag.source_closure([u64::MAX]).is_empty());
-    assert_eq!(dag.source_closure([c2, c1]), set(&[a, c1]));
+    assert_eq!(dag.source_closure_of(c1), [a]);
+    assert_eq!(dag.source_closure_of(c2), [a, c1]);
+    assert_eq!(dag.source_closure_of(c3), [a, c1, c2]);
+    assert_eq!(dag.source_closure_of(d3), [d, d1, d2]);
+    assert_eq!(dag.source_closure_of(p1), [p]);
+    assert!(dag.source_closure_of(a).is_empty());
+    assert!(dag.source_closure_of(u64::MAX).is_empty());
     // The other direction, so a walk that read the wrong half of the graph
     // cannot pass both.
-    assert_eq!(dag.dependent_closure([a]), set(&[c1, c2]));
+    assert_eq!(dag.dependent_closure([a]), set(&[c1, c2, c3]));
     assert_eq!(dag.dependent_closure([d]), set(&[d1, d2, d3]));
     assert!(dag.dependent_closure([p1]).is_empty());
+
+    let views = [c1, c2, c3, d1, d2, d3, p1];
+    let reading = |id| {
+        let reads = |v: &u64| dag.source_closure_of(*v).binary_search(&id).is_ok();
+        views.into_iter().filter(reads).collect::<FxHashSet<u64>>()
+    };
+    for id in [a, c1, c2, c3, d, d1, d2, d3, p, p1, u64::MAX] {
+        assert_eq!(reading(id), dag.dependent_closure([id]), "views reading {id}");
+    }
+    assert_eq!(reading(c1), set(&[c2, c3]));
+    assert_eq!(reading(d1), set(&[d3]));
+}
+
+/// A view registered again under a dropped id takes the closure of its new plan.
+#[test]
+fn a_source_closure_is_dropped_and_recomputed_with_its_view() {
+    let (mut engine, t1, [t2]) = engine_with_tables("reregister", ["t2"]);
+    let cols = u64_i64_cols();
+    let v1 = register_identity_view(&mut engine, t1, "v1", &cols);
+    let v2 = register_identity_view(&mut engine, v1, "v2", &cols);
+    assert_eq!(engine.dag.source_closure_of(v2), [t1, v1]);
+    engine.dag.forget(v2);
+    assert!(engine.dag.source_closure_of(v2).is_empty());
+    assert_eq!(engine.dag.source_closure_of(v1), [t1]);
+
+    let circuit = crate::test_support::identity_circuit(t2, ReadBound::None);
+    let registry = &engine.registry;
+    let schema = crate::test_support::make_schema_u64_i64();
+    engine
+        .dag
+        .register_view(registry, v2, &schema, false, v2, &circuit)
+        .unwrap();
+    assert_eq!(engine.dag.source_closure_of(v2), [t2]);
 }
 
 /// A view links to each source once however many scans name it, in first-scan

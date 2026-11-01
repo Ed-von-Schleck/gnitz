@@ -5,15 +5,16 @@
 use super::*;
 
 use crate::runtime::frame::WireMsg;
-use crate::runtime::sal::Cut;
-use gnitz_store::read::KeySpans;
+use crate::runtime::sal::{Cut, OwnedRead};
+use gnitz_store::read::{KeySpans, ReadRows};
 
 /// One reply this worker owes.
 // One per queued reply, which is not the path a one-frame reply takes.
 #[allow(clippy::large_enum_variant)]
 pub(super) enum Owed {
-    /// A read of a view, received while a drive was writing views.
-    Parked(ReplyRoute, Read<'static>),
+    /// A read of a view, received while a drive was writing views. It owns its
+    /// bytes: it is answered after the drive, which may read past a `Flush`.
+    Parked(ReplyRoute, OwnedRead),
     Fault(ReplyRoute, WireFault),
     Train(Train),
 }
@@ -41,11 +42,21 @@ pub(super) struct Train {
 #[allow(clippy::large_enum_variant)]
 pub(super) enum Rows {
     /// One batch, cut into frames.
-    Own(Batch),
-    /// One batch its store holds too.
-    Shared(Rc<Batch>),
+    Batch(ReadRows),
     /// Sorted key spans, a chunk at a time; the first empty chunk ends them.
     Spans(Box<KeySpans>),
+}
+
+impl From<ReadRows> for Rows {
+    fn from(rows: ReadRows) -> Self {
+        Rows::Batch(rows)
+    }
+}
+
+impl From<Batch> for Rows {
+    fn from(rows: Batch) -> Self {
+        Rows::Batch(ReadRows::Own(rows))
+    }
 }
 
 impl Train {
@@ -54,8 +65,7 @@ impl Train {
     /// for any frame.
     fn emit_next(&mut self, w2m: &mut W2mWriter, budget: usize) -> Result<Option<bool>, WireFault> {
         let (batch, whole) = match &mut self.rows {
-            Rows::Own(batch) => (&*batch, true),
-            Rows::Shared(batch) => (&**batch, true),
+            Rows::Batch(batch) => (&**batch, true),
             Rows::Spans(spans) => {
                 if self.next_row == spans.chunk().len() {
                     spans.advance();
@@ -94,8 +104,7 @@ impl WorkerProcess<'_> {
                     .try_send_msg(route.request_id, passing, &WireMsg::fault(fault)),
             ),
             Ok(Rows::Spans(_)) => None,
-            Ok(Rows::Own(batch)) => self.try_send_whole(route, passing, batch),
-            Ok(Rows::Shared(batch)) => self.try_send_whole(route, passing, batch),
+            Ok(Rows::Batch(batch)) => self.try_send_whole(route, passing, batch),
         };
         match sent {
             Some(true) => {

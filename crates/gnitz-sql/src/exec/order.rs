@@ -41,7 +41,7 @@ pub(crate) fn order_and_slice(
         "client cut: non-positive weight violates the bag invariant"
     );
     let end = slice.end().unwrap_or(usize::MAX);
-    let rows: Vec<u32> = if order.is_empty() {
+    let mut rows: Vec<u32> = if order.is_empty() {
         // Every entry holds at least one logical row, so the first `end` entries cover the slice.
         (0..batch.len().min(end) as u32).collect()
     } else {
@@ -60,18 +60,24 @@ pub(crate) fn order_and_slice(
         skip: slice.offset as u64,
         keep: slice.limit.map_or(u64::MAX, |l| l as u64),
     };
-    let (mut kept, mut takes) = (Vec::new(), Vec::new());
-    for &r in &rows {
+    // Kept rows compact to the front of `rows`: the write slot never passes the read.
+    // Every kept row takes at least one of the `keep` slots.
+    let mut takes = Vec::with_capacity(rows.len().min(slice.limit.unwrap_or(usize::MAX)));
+    let mut n = 0;
+    for i in 0..rows.len() {
+        let r = rows[i];
         let take = slots.take(batch.weights[r as usize]);
         if take > 0 {
-            kept.push(r);
+            rows[n] = r;
+            n += 1;
             takes.push(take);
         }
         if slots.keep == 0 {
             break;
         }
     }
-    let mut out = batch.gather(&kept);
+    rows.truncate(n);
+    let mut out = batch.gather(&rows);
     out.weights = takes;
     out
 }

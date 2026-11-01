@@ -221,14 +221,16 @@ pub(super) fn apply_set(
             SetRhs::Const { cell, spill, null } => {
                 let ZSetBatch { payload, blob, .. } = &mut new;
                 // One spill for every row's cell.
-                let cell = if tc.is_german_string() {
-                    relocate_german_string(cell.first_chunk().expect("a German cell is 16 bytes"), spill, blob).to_vec()
+                let reloc;
+                let cell: &[u8] = if tc.is_german_string() {
+                    reloc = relocate_german_string(cell.first_chunk().expect("a German cell is 16 bytes"), spill, blob);
+                    &reloc
                 } else {
-                    cell.clone()
+                    cell
                 };
                 for w in &mut nulls {
                     set_null(w, pi, *null, def)?;
-                    payload[pi].bytes.extend_from_slice(&cell);
+                    payload[pi].bytes.extend_from_slice(cell);
                 }
             }
             SetRhs::Copy { scope, src } => {

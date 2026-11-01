@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 
 use gnitz_core::{serve, BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Sent};
 
-use crate::client::{resolve_target, verb, whole, Mode, PyClient, Unconverted, Verb};
+use crate::client::{resolve_target, whole, Convert, Mode, PyClient, VerbOp};
 use crate::reply::{none, synced};
 use crate::{client_err, lock, sql_err};
 
@@ -161,13 +161,19 @@ struct Owed {
 }
 
 impl Owed {
-    /// The call that runs `verb` and resolves this with what it yields.
-    fn call(self, verb: Verb) -> Op {
+    /// The call that runs `op` and resolves this with what `convert` makes of
+    /// its answer.
+    fn call<T, O, C>(self, op: O, convert: C) -> Op
+    where
+        T: Send + 'static,
+        O: VerbOp<T>,
+        C: Convert<T>,
+    {
         Box::new(move |client| {
             Box::pin(async move {
-                match verb(client).await {
-                    Ok(sent) => sent.then(move |reply| self.land(reply.map_err(client_err))),
-                    Err(fail) => self.land(Err(sql_err(fail))),
+                match op(client).await {
+                    Ok(sent) => sent.then(move |reply| self.land(reply.map_err(client_err), convert)),
+                    Err(fail) => self.land(Err(sql_err(fail)), convert),
                 }
             })
         })
@@ -183,9 +189,9 @@ impl Owed {
         })
     }
 
-    fn land(mut self, reply: PyResult<Unconverted>) {
+    fn land<T>(mut self, reply: PyResult<T>, convert: impl FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>>) {
         let future = self.future.take().expect("landed once");
-        Python::attach(move |py| settle(py, &future, reply.and_then(|convert| convert(py))));
+        Python::attach(move |py| settle(py, &future, reply.and_then(|t| convert(py, t))));
     }
 }
 
@@ -341,9 +347,15 @@ impl LoopCore {
         Ok(LoopHandle(core.unbind()))
     }
 
-    /// Queue `verb` and hand back the loop future its result resolves.
-    pub(crate) fn submit(&self, py: Python<'_>, verb: Verb) -> PyResult<Py<PyAny>> {
-        self.queue(py, |owed| owed.call(verb))
+    /// Queue the verb that runs `op` and converts its answer with `convert`,
+    /// and hand back the loop future its result resolves.
+    pub(crate) fn submit<T, O, C>(&self, py: Python<'_>, op: O, convert: C) -> PyResult<Py<PyAny>>
+    where
+        T: Send + 'static,
+        O: VerbOp<T>,
+        C: Convert<T>,
+    {
+        self.queue(py, |owed| owed.call(op, convert))
     }
 
     /// Queue a sync, which leaves the client free while the server holds it:
@@ -367,10 +379,7 @@ impl LoopCore {
                             Box::pin(async move {
                                 match client.finish_sync(reply).await {
                                     Ok(unreceived) if owed.abandoned() => client.unclaimed(unreceived),
-                                    done => owed.land(
-                                        done.map_err(client_err)
-                                            .map(|s| Box::new(move |py: Python<'_>| synced(py, s)) as Unconverted),
-                                    ),
+                                    done => owed.land(done.map_err(client_err), synced),
                                 }
                             })
                         });
@@ -387,7 +396,7 @@ impl LoopCore {
         if self.closing() {
             return self.settled(py, py.None());
         }
-        let closed = self.submit(py, verb(whole!(|c| c.close_mirror().await?), none))?;
+        let closed = self.submit(py, whole!(|c| c.close_mirror().await?), none)?;
         self.release(py);
         Ok(closed)
     }

@@ -1,6 +1,7 @@
 //! What a SAL group asks of a worker, typed: the master builds a [`SalRequest`]
-//! borrowed, a worker decodes one owned, and [`SalRequest::encode`] and
-//! [`SalRequest::decode`] are the one mapping between its fields and a frame head.
+//! over its bytes, a worker decodes one that borrows the SAL's, and
+//! [`SalRequest::encode`] and [`SalRequest::decode`] are the one mapping between
+//! its fields and a frame head.
 
 use std::borrow::Cow;
 use std::num::NonZeroU64;
@@ -13,6 +14,9 @@ use gnitz_wire::{ControlHeader, PkColList, PkListRole};
 
 /// A request answered with a reply train; its failure is a fault frame to the
 /// asker, so it may change only state the asker can retry or release.
+///
+/// A decoded read borrows its byte fields from the SAL group it came in; whoever
+/// keeps one past that group's dispatch takes [`Read::into_owned`] first.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Read<'a> {
     /// `probe` at `keys`, encoded by [`gnitz_wire::PkKeys::encode_probe`].
@@ -153,10 +157,16 @@ impl SalRequest<'_> {
     }
 }
 
-impl SalRequest<'static> {
-    /// The inverse of [`Self::encode`], owning what it read
-    /// of `blob`: a worker holds its request past the SAL bytes it came in.
-    pub(super) fn decode(kind: SalMessageKind, tid: u64, hdr: &ControlHeader, blob: &[u8]) -> Result<Self, String> {
+impl<'a> SalRequest<'a> {
+    /// The inverse of [`Self::encode`]. A read borrows what it reads of `blob`;
+    /// the tid lists of `Backfill` and `Tick` are owned, since a drive iterates
+    /// them while it reads later groups, a `Flush` among them.
+    pub(super) fn decode(
+        kind: SalMessageKind,
+        tid: u64,
+        hdr: &ControlHeader,
+        blob: &'a [u8],
+    ) -> Result<SalRequest<'a>, String> {
         Ok(match kind {
             SalMessageKind::Shutdown => SalRequest::Shutdown,
             SalMessageKind::Flush => Apply::Flush.into(),
@@ -188,7 +198,7 @@ impl SalRequest<'static> {
                     }
                     _ => return Err(refused()),
                 };
-                Read::HasPk { tid, probe, keys: blob.to_vec().into() }.into()
+                Read::HasPk { tid, probe, keys: Cow::Borrowed(blob) }.into()
             }
             SalMessageKind::KeySpans => Read::KeySpans {
                 tid,
@@ -200,14 +210,14 @@ impl SalRequest<'static> {
             SalMessageKind::ScanSpec => Read::ScanSpec {
                 tid,
                 reply_layout: hdr.arg0,
-                spec: blob.to_vec().into(),
+                spec: Cow::Borrowed(blob),
             }
             .into(),
             SalMessageKind::Delta => Read::Delta {
                 view: tid,
                 after_tick: hdr.arg1,
                 reply_layout: hdr.arg0,
-                spec: blob.to_vec().into(),
+                spec: Cow::Borrowed(blob),
             }
             .into(),
             SalMessageKind::Pin => Read::Pin { snapshot: hdr.arg0 }.into(),
@@ -215,10 +225,48 @@ impl SalRequest<'static> {
             SalMessageKind::SnapshotPage => Read::SnapshotPage {
                 snapshot: hdr.arg0,
                 tid,
-                page: blob.to_vec().into(),
+                page: Cow::Borrowed(blob),
             }
             .into(),
-            SalMessageKind::Backup => Read::Backup { dir: blob.to_vec().into() }.into(),
+            SalMessageKind::Backup => Read::Backup { dir: Cow::Borrowed(blob) }.into(),
+        })
+    }
+}
+
+/// A read that owns its bytes, so it may outlive the SAL group it was decoded
+/// from. Only [`Read::into_owned`] builds one: a SAL read is handed out as
+/// `Read<'static>` while it borrows the group, so the lifetime alone cannot
+/// say that it owns them.
+#[derive(Debug)]
+pub(crate) struct OwnedRead(Read<'static>);
+
+impl std::ops::Deref for OwnedRead {
+    type Target = Read<'static>;
+
+    fn deref(&self) -> &Read<'static> {
+        &self.0
+    }
+}
+
+impl Read<'_> {
+    /// The same read, owning its bytes.
+    pub(crate) fn into_owned(self) -> OwnedRead {
+        let own = |c: Cow<'_, [u8]>| Cow::Owned(c.into_owned());
+        OwnedRead(match self {
+            Read::HasPk { tid, probe, keys } => Read::HasPk { tid, probe, keys: own(keys) },
+            Read::KeySpans { tid, cols, claim } => Read::KeySpans { tid, cols, claim },
+            Read::ReleasePreflight => Read::ReleasePreflight,
+            Read::ScanSpec { tid, reply_layout, spec } => Read::ScanSpec { tid, reply_layout, spec: own(spec) },
+            Read::Delta { view, after_tick, reply_layout, spec } => Read::Delta {
+                view,
+                after_tick,
+                reply_layout,
+                spec: own(spec),
+            },
+            Read::Pin { snapshot } => Read::Pin { snapshot },
+            Read::Unpin { snapshot } => Read::Unpin { snapshot },
+            Read::SnapshotPage { snapshot, tid, page } => Read::SnapshotPage { snapshot, tid, page: own(page) },
+            Read::Backup { dir } => Read::Backup { dir: own(dir) },
         })
     }
 }

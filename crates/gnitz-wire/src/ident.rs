@@ -46,8 +46,9 @@ pub fn validate_user_identifier(name: &str) -> Result<(), String> {
 /// `[A-Za-z0-9_]` it is injective on the classes SQL already considers equal,
 /// which it is not over arbitrary bytes.
 ///
-/// The single definition of catalog-name case-insensitivity: every user-supplied
-/// relation, schema or index name crosses it on the way to a catalog row.
+/// The definition of catalog-name case-insensitivity. A client's relation name
+/// applies the same ASCII fold to its whole `schema.name` once both parts pass
+/// [`validate_user_identifier`].
 pub fn canonical_identifier(name: &str) -> Result<String, String> {
     validate_user_identifier(name)?;
     Ok(name.to_ascii_lowercase())

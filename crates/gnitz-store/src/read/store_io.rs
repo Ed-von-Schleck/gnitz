@@ -88,14 +88,14 @@ impl Relation {
         // epoch: that keeps every worker's exchange rounds in step.
         if self.kind() == RelationKind::Stream {
             let empty = empty_cursor(self.schema());
-            return Ok((SourceCursor::Full(Box::new(empty)), None));
+            return Ok((SourceCursor::Full(empty), None));
         }
         let cursor = match bound {
-            ReadBound::None => SourceCursor::Full(Box::new(self.table().open_cursor(cut))),
+            ReadBound::None => SourceCursor::Full(self.table().open_cursor(cut)),
             ReadBound::PkSet(keys) => {
                 check_stride("open_bound", self.id(), &keys, self.schema().pk_stride())?;
                 // A key this worker holds no row for copies nothing.
-                SourceCursor::PkSet(Box::new(self.gather(keys, cut)))
+                SourceCursor::PkSet(self.gather(keys, cut))
             }
             ReadBound::Range(r) => return open_range(self, r, cut),
         };
@@ -109,7 +109,7 @@ fn open_range(entry: &Relation, r: KeyRange, cut: Cut) -> Result<(SourceCursor, 
     let table = entry.table();
     if r.walks_pk(schema.pk_cols()) {
         let cursor = table.range_cursor(&r, cut);
-        return Ok((SourceCursor::Full(Box::new(cursor)), None));
+        return Ok((SourceCursor::Full(cursor), None));
     }
     // An index holds a pending row's entry from its ingest on, so it is walked
     // only where the store's two cuts read the same rows.
@@ -123,7 +123,7 @@ fn open_range(entry: &Relation, r: KeyRange, cut: Cut) -> Result<(SourceCursor, 
             return Ok((SourceCursor::Bounded(Box::new(walk)), None));
         }
     }
-    Ok((SourceCursor::Full(Box::new(table.open_cursor(cut))), Some(r)))
+    Ok((SourceCursor::Full(table.open_cursor(cut)), Some(r)))
 }
 
 #[cfg(test)]

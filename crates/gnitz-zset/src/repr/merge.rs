@@ -66,19 +66,20 @@ fn merge_interleaved(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Bat
     if dominant.count * 2 < rows {
         return merge_rows(sources, schema);
     }
-    // The rest keep their order, which is what lets an ascending load's runs
-    // sum by concatenation.
-    let rest: Vec<MemBatch> = sources
-        .iter()
-        .enumerate()
-        .filter(|&(i, s)| i != big && s.count > 0)
-        .map(|(_, s)| *s)
-        .collect();
+    let rest = || {
+        sources
+            .iter()
+            .enumerate()
+            .filter(move |&(i, s)| i != big && s.count > 0)
+            .map(|(_, s)| *s)
+    };
     let summed;
-    let other = match &rest[..] {
-        [one] => *one,
-        rest => {
-            summed = merge_consolidated(rest, schema);
+    let other = match rest().nth(1) {
+        None => rest().next().expect("interleaved sources: another holds rows"),
+        Some(_) => {
+            // The rest keep their order, which is what lets an ascending load's
+            // runs sum by concatenation.
+            summed = merge_consolidated(&rest().collect::<Vec<_>>(), schema);
             summed.as_mem_batch()
         }
     };
@@ -104,6 +105,10 @@ fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
 /// The consolidated merge of sorted `sources`, source `i` walked over the `i`-th
 /// of `windows`: one [`Pick`] per (PK, payload) group whose weights do not sum to
 /// zero, at that sum, in (PK, payload) order.
+///
+/// Out of line, so the merge loop's register allocation does not depend on the
+/// caller it would be inlined into.
+#[inline(never)]
 pub(crate) fn run_merge<S: ColumnarSource>(
     sources: &[S],
     schema: &SchemaDescriptor,
@@ -164,6 +169,7 @@ where
     P: PayloadOrder + 'a,
 {
     let wide = order.has_tail(schema.pk_stride());
+    #[inline(always)]
     move |a, b| tie_less::<false, S, P>(schema, sources, order, wide, payload, a, b)
 }
 

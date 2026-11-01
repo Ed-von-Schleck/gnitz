@@ -49,6 +49,7 @@ impl LogicalProgram {
             pred: Some(pred),
             walk: None,
             words: Vec::new(),
+            runs: Vec::new(),
         })
     }
 
@@ -87,7 +88,13 @@ pub struct RowFilter {
     walk: Option<RangeMembership>,
     /// One bit per row of the batch being filtered.
     words: Vec<u64>,
+    /// The runs [`Self::ranges`] returns.
+    runs: Vec<(usize, usize)>,
 }
+
+/// The run capacity a filter keeps between calls: a buffer grown past it is
+/// dropped at the next call rather than held for the filter's lifetime.
+const RETAIN_RUNS: usize = 4096;
 
 impl RowFilter {
     /// A read's filter: its wire predicate (empty for none), and the walk its
@@ -102,6 +109,7 @@ impl RowFilter {
                 pred: None,
                 walk: None,
                 words: Vec::new(),
+                runs: Vec::new(),
             },
             false => LogicalProgram::from_blob(predicate)?.resolve_filter(schema)?,
         };
@@ -109,34 +117,34 @@ impl RowFilter {
         Ok(f)
     }
 
-    /// The surviving rows of `mb` as maximal runs into `out` (cleared first).
-    pub fn ranges(&mut self, mb: &dyn BatchView, out: &mut Vec<(usize, usize)>) {
-        out.clear();
+    /// The surviving rows of `mb` as maximal runs, held by the filter until its
+    /// next call; a caller may rewrite them in place.
+    pub fn ranges(&mut self, mb: &dyn BatchView) -> &mut [(usize, usize)] {
         let n = mb.row_count();
-        if self.pred.is_none() && self.walk.is_none() {
-            if n > 0 {
-                out.push((0, n));
-            }
-        } else {
-            self.filter_bits(mb, n, out);
+        let RowFilter { pred, walk, words, runs } = self;
+        if runs.capacity() > RETAIN_RUNS {
+            *runs = Vec::new();
         }
-    }
-
-    /// [`Self::ranges`] of the predicate and the walk, at least one of them present.
-    fn filter_bits(&mut self, mb: &dyn BatchView, n: usize, out: &mut Vec<(usize, usize)>) {
-        self.words.resize(n.div_ceil(64), 0);
-        let words = &mut self.words[..];
-        match &mut self.pred {
+        runs.clear();
+        if pred.is_none() && walk.is_none() {
+            if n > 0 {
+                runs.push((0, n));
+            }
+            return runs;
+        }
+        words.resize(n.div_ceil(64), 0);
+        match pred {
             Some(FilterEval { ev, result_reg }) => ev.eval_morsels(mb, 0, n, |rel_start, mo| {
                 let first = rel_start / 64;
                 mo.filter_words(*result_reg, &mut words[first..first + mo.rows().div_ceil(64)]);
             }),
             None => words.fill(u64::MAX),
         }
-        if let Some(w) = &self.walk {
+        if let Some(w) = walk {
             w.and_into(mb, words);
         }
-        gnitz_wire::set_bit_runs(words, n, out);
+        gnitz_wire::set_bit_runs(words, n, runs);
+        runs
     }
 }
 

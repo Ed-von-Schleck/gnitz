@@ -150,6 +150,43 @@ fn check(schema: &Schema, rows: Vec<(Vec<RelIndex>, &str, Vec<Ranked>)>) {
     }
 }
 
+/// A key set of points alone is the PK range's one key, so no range joins it; a key
+/// set that crosses a list leaves the PK range as the next candidate.
+#[test]
+fn a_pk_range_beside_a_key_set_only_when_a_list_feeds_it() {
+    let s = pk_schema(TypeCode::U64);
+    check(
+        &s,
+        vec![
+            (vec![], "id = 5", vec![(T::PkKeys, keys(&s, &[&[5]]), vec![])]),
+            (
+                vec![],
+                "id IN (1, 5) AND id >= 3",
+                vec![
+                    (T::PkKeys, keys(&s, &[&[1], &[5]]), vec![1]),
+                    (T::PkRange, rng(&[0], &[], 3, U64_MAX), vec![0]),
+                ],
+            ),
+            (
+                vec![],
+                "id IN (5, 5) AND id >= 3",
+                vec![
+                    (T::PkKeys, keys(&s, &[&[5]]), vec![1]),
+                    (T::PkRange, rng(&[0], &[], 3, U64_MAX), vec![0]),
+                ],
+            ),
+            (
+                vec![],
+                "id IN (1, 2) AND id >= 0",
+                vec![
+                    (T::PkKeys, keys(&s, &[&[1], &[2]]), vec![1]),
+                    (T::UnboundedPkRange, rng(&[0], &[], 0, U64_MAX), vec![0]),
+                ],
+            ),
+        ],
+    );
+}
+
 /// A WHERE that names whole keys gathers them, however the point or the list is
 /// spelled; whatever does not bind the PK stays residual.
 #[test]

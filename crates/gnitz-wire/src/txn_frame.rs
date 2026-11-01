@@ -23,10 +23,11 @@
 //! The module also holds the [`DeltaCursor`] a `DELTA_POLL` item and terminal
 //! carry, and the held-ids blob of a `SYNC_PUSHED` reply ([`encode_held`]).
 
+use crate::control::frame_size;
 use crate::region::Regions;
 use crate::{
-    append_frame, peek_control_block, ClientVerb, ControlHeader, DecodedControl, Reader, Target, WireConflictMode,
-    WireFlags, Writer,
+    append_frame, frame_head_size, peek_control_block, ClientVerb, ControlHeader, DecodedControl, Reader, Target,
+    WireConflictMode, WireFlags, Writer, CTRL_HEADER_SIZE,
 };
 use std::fmt;
 use std::num::NonZeroU64;
@@ -51,16 +52,20 @@ pub struct FrameItem<'a> {
     pub data: Regions<'a>,
 }
 
-/// A `verb` frame's prologue: `arg0` as given, every other field zero. Each
-/// item's `append_frame` reserves its own bytes.
-fn prologue(verb: ClientVerb, arg0: u64) -> Vec<u8> {
-    let mut out = Vec::new();
+/// A multi-item `verb` frame: a prologue of `arg0` as given and every other
+/// field zero, then the items `items` appends, which are `body` bytes exactly,
+/// so appending them never reallocates.
+fn multi_frame(verb: ClientVerb, arg0: u64, body: usize, items: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CTRL_HEADER_SIZE + body);
     let hdr = ControlHeader {
         flags: WireFlags { verb, ..Default::default() },
         arg0,
         ..Default::default()
     };
     append_frame(&mut out, &hdr, &[], None, None);
+    let cap = out.capacity();
+    items(&mut out);
+    debug_assert_eq!(out.capacity(), cap, "{verb:?} frame outgrew its size");
     out
 }
 
@@ -71,13 +76,17 @@ pub fn encode_items(verb: ClientVerb, items: &[FrameItem<'_>]) -> Vec<u8> {
         item_shape(verb).is_some_and(|s| s.data),
         "{verb:?} items carry no data block"
     );
-    let mut out = prologue(verb, 0);
-    for it in items {
-        let mut hdr = ControlHeader::naming(verb, it.target, it.basis);
-        hdr.flags.conflict_mode = it.conflict_mode;
-        append_frame(&mut out, &hdr, &[], it.schema, Some(&it.data[..]));
-    }
-    out
+    let body = items
+        .iter()
+        .map(|it| frame_size(&[], it.schema, Some(&it.data[..])))
+        .sum();
+    multi_frame(verb, 0, body, |out| {
+        for it in items {
+            let mut hdr = ControlHeader::naming(verb, it.target, it.basis);
+            hdr.flags.conflict_mode = it.conflict_mode;
+            append_frame(out, &hdr, &[], it.schema, Some(&it.data[..]));
+        }
+    })
 }
 
 /// The sections an item of a multi-item verb carries, and how many items one
@@ -177,12 +186,13 @@ impl<'a> ScanItem<'a> {
 
 /// Encode a `SCAN_MULTI` frame, without the 4-byte frame length prefix.
 pub fn encode_scan_multi(scans: &[ScanItem<'_>]) -> Vec<u8> {
-    let mut out = prologue(ClientVerb::ScanMulti, 0);
-    for s in scans {
-        let hdr = ControlHeader::naming(ClientVerb::ScanMulti, s.target, s.reply_layout);
-        append_frame(&mut out, &hdr, s.spec, None, None);
-    }
-    out
+    let body = scans.iter().map(|s| frame_head_size(s.spec.len(), None)).sum();
+    multi_frame(ClientVerb::ScanMulti, 0, body, |out| {
+        for s in scans {
+            let hdr = ControlHeader::naming(ClientVerb::ScanMulti, s.target, s.reply_layout);
+            append_frame(out, &hdr, s.spec, None, None);
+        }
+    })
 }
 
 /// Decode a `SCAN_MULTI` frame body into its items, in request order.
@@ -192,6 +202,9 @@ pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<ScanItem<'_>>, String> {
         .map(|(item, c)| ScanItem::of(item, &c))
         .collect())
 }
+
+/// Bytes [`DeltaCursor::write_opt`] writes: two words.
+const DELTA_CURSOR_BYTES: usize = 16;
 
 /// A delta-feed position, held by the client alone: the boot, relation and
 /// spec its rounds belong to (`tag`), and the last round of the view it covers
@@ -275,15 +288,21 @@ impl fmt::Display for SubId {
 /// Encode a `DELTA_POLL` frame, without the 4-byte frame length prefix. Item
 /// `i` is kept as the subscription [`kept_as`]`(keep, i)`.
 pub fn encode_delta_poll(views: &[DeltaPollItem<'_>], keep: Option<SubId>) -> Vec<u8> {
-    let mut out = prologue(ClientVerb::DeltaPoll, keep.map_or(0, SubId::get));
-    for v in views {
-        let mut blob = Writer::new();
-        DeltaCursor::write_opt(&mut blob, v.from);
-        blob.raw(v.spec);
-        let hdr = ControlHeader::naming(ClientVerb::DeltaPoll, v.view, v.reply_layout);
-        append_frame(&mut out, &hdr, &blob.into_vec(), None, None);
-    }
-    out
+    let body = views
+        .iter()
+        .map(|v| frame_head_size(DELTA_CURSOR_BYTES + v.spec.len(), None))
+        .sum();
+    let widest = views.iter().map(|v| v.spec.len()).max().unwrap_or(0);
+    let mut blob = Writer::with_capacity(DELTA_CURSOR_BYTES + widest);
+    multi_frame(ClientVerb::DeltaPoll, keep.map_or(0, SubId::get), body, |out| {
+        for v in views {
+            blob.clear();
+            DeltaCursor::write_opt(&mut blob, v.from);
+            blob.raw(v.spec);
+            let hdr = ControlHeader::naming(ClientVerb::DeltaPoll, v.view, v.reply_layout);
+            append_frame(out, &hdr, blob.as_slice(), None, None);
+        }
+    })
 }
 
 /// The subscription id item `item` of a `DELTA_POLL` keeping from `first` is

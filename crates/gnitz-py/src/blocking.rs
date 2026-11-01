@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use gnitz_core::{block_on, BlockingHost, ClientError, GnitzClient, Sent};
 use gnitz_sql::GnitzSqlError;
 
-use crate::client::{resolve_target, Mode, PyClient, Unconverted, Verb};
+use crate::client::{resolve_target, Convert, Mode, PyClient, VerbOp};
 use crate::{client_err, gnitz_err, lock, sql_err};
 
 /// A client driven on the calling thread.
@@ -43,21 +43,29 @@ impl Blocking {
     /// Run one verb: wait for its reply and convert it, or inside a pipeline,
     /// send its request and hand back the `Pending` its reply lands in. The
     /// verb's own failure raises here either way.
-    pub(crate) fn run(&mut self, slf: &Bound<'_, PyClient>, verb: Verb) -> PyResult<Py<PyAny>> {
+    pub(crate) fn run<T, O, C>(&mut self, slf: &Bound<'_, PyClient>, op: O, convert: C) -> PyResult<Py<PyAny>>
+    where
+        T: Send + 'static,
+        O: VerbOp<T>,
+        C: Convert<T>,
+    {
         let py = slf.py();
         let Some(pipeline) = &mut self.pipeline else {
             let reply = self.call(py, async move |c| {
-                let sent = verb(c).await?;
+                let sent = op(c).await?;
                 Ok::<_, GnitzSqlError>(c.wait(sent).await?)
             })?;
-            return reply(py);
+            return convert(py, reply);
         };
         let client = &mut self.client;
         let sent = py
             .detach(|| {
                 block_on(async move {
                     client.make_room().await?;
-                    verb(client).await
+                    let sent = op(client).await?;
+                    Ok::<_, GnitzSqlError>(
+                        sent.map(move |t| Box::new(move |py: Python<'_>| convert(py, t)) as Unconverted),
+                    )
                 })
             })
             .map_err(sql_err)?;
@@ -126,6 +134,9 @@ impl PyGnitzClient {
 // ---------------------------------------------------------------------------
 // Pipelining
 // ---------------------------------------------------------------------------
+
+/// A pipelined verb's answer, waiting to become its Python value under the GIL.
+type Unconverted = Box<dyn FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + Send>;
 
 /// A pipelined verb's reply. Shared by its `Pending` and the pipeline that
 /// waits for it, so the client holds no reference back to its `Pending`s.

@@ -48,6 +48,42 @@ fn queued_trains_are_shipped_whole_behind_the_reply() {
     assert!(wire.join().unwrap() == want, "every train whole, in queue order");
 }
 
+/// A ship sends only what was queued since the last one, so the trains a ship
+/// drained are never sent again.
+#[test]
+fn a_second_ship_sends_only_the_trains_queued_since() {
+    let r = make_reactor();
+    let (peer, receiver) = Peer::over_socketpair(&r);
+    let subs = Subscriptions::default();
+    let id = |id| SubId::new(id).unwrap();
+    subs.out.send(7, id(1), Rc::new(vec![0x11; 10]));
+    subs.out.send(7, id(2), Rc::new(vec![0x21; 20]));
+    r.block_on(async { subs.ship(&peer).await.expect("an open peer") });
+    assert!(subs.out.is_empty());
+    subs.out.send(9, id(3), Rc::new(vec![0x31; 30]));
+    let len = 3 * MARKER_BYTES + 60;
+    let wire = std::thread::spawn(move || {
+        let mut wire = vec![0u8; len];
+        (&receiver).read_exact(&mut wire).expect("every train");
+        wire
+    });
+    r.block_on(async {
+        subs.ship(&peer).await.expect("an open peer");
+        peer.flush_egress().await.expect("an open peer");
+    });
+    assert!(subs.out.is_empty());
+    let want = [
+        &framed(pushed_marker(7, id(1)))[..],
+        &[0x11; 10],
+        &framed(pushed_marker(7, id(2))),
+        &[0x21; 20],
+        &framed(pushed_marker(9, id(3))),
+        &[0x31; 30],
+    ]
+    .concat();
+    assert!(wire.join().unwrap() == want, "each train once, in queue order");
+}
+
 /// A parked sync is woken by a relation it watches and by no other, once; and
 /// one that stops waiting for a reason of its own leaves no entry behind.
 #[test]

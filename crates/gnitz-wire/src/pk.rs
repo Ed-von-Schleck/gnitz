@@ -14,6 +14,7 @@
 
 use crate::codec::{Reader, Wire, Writer};
 use crate::{zip_cells, TypeCode};
+use smallvec::SmallVec;
 
 /// `$body` once per fixed cell width — 1/2/4/8/16 bytes, the widths of a PK
 /// column and of every non-string payload cell — with `$t` the unsigned integer
@@ -192,8 +193,11 @@ pub fn widen_pk_be(pk_bytes: &[u8]) -> u128 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PkKeys {
     stride: u8,
-    bytes: Vec<u8>,
+    /// Inline for a list of at most `MAX_PK_BYTES`, such as one key.
+    bytes: PkBytes,
 }
+
+type PkBytes = SmallVec<[u8; MAX_PK_BYTES]>;
 
 impl PkKeys {
     /// Sort and dedup `keys`, each exactly `stride` bytes.
@@ -208,65 +212,97 @@ impl PkKeys {
         if stride <= 2 * NARROW_PK_MAX_BYTES {
             // Two words, the second right-aligned: equal-width keys order as
             // the pair does, and the sort moves no pointer into the keys.
-            let mut ks: Vec<[u128; 2]> = keys
-                .map(|k| {
-                    let (hi, lo) = k.split_at(NARROW_PK_MAX_BYTES);
-                    [widen_pk_be(hi), widen_pk_be(lo)]
-                })
-                .collect();
-            ks.sort_unstable();
-            ks.dedup();
-            let mut bytes = Vec::with_capacity(ks.len() * stride);
-            for [hi, lo] in ks {
+            let words = |k: &[u8]| {
+                let (hi, lo) = k.split_at(NARROW_PK_MAX_BYTES);
+                [widen_pk_be(hi), widen_pk_be(lo)]
+            };
+            return Self::sorted(stride, keys.map(words), |bytes, [hi, lo]| {
                 bytes.extend_from_slice(&hi.to_be_bytes());
                 bytes.extend_from_slice(&lo.to_be_bytes()[2 * NARROW_PK_MAX_BYTES - stride..]);
-            }
-            return PkKeys { stride: stride as u8, bytes };
+            });
         }
-        let mut ks: Vec<&[u8]> = keys.collect();
-        ks.sort_unstable();
-        ks.dedup();
-        PkKeys { stride: stride as u8, bytes: ks.concat() }
+        Self::sorted(stride, keys, |bytes, k| bytes.extend_from_slice(k))
     }
 
     /// Sort and dedup key images, each stored as its low `stride` bytes
-    /// big-endian. An image orders as those bytes do; the `u64` arm is the
+    /// big-endian. An image orders as those bytes do. The `u64` arm is the
     /// narrower sort for keys of at most 8 bytes.
     pub fn from_images(stride: usize, images: impl IntoIterator<Item = u128>) -> Self {
         assert!((1..=NARROW_PK_MAX_BYTES).contains(&stride), "PkKeys: stride {stride}");
-        let mut bytes = Vec::new();
-        if stride <= 8 {
-            let mut imgs: Vec<u64> = images.into_iter().map(|v| v as u64).collect();
-            imgs.sort_unstable();
-            imgs.dedup();
-            bytes.reserve(imgs.len() * stride);
-            imgs.iter()
-                .for_each(|v| bytes.extend_from_slice(&v.to_be_bytes()[8 - stride..]));
-        } else {
-            let mut imgs: Vec<u128> = images.into_iter().collect();
-            imgs.sort_unstable();
-            imgs.dedup();
-            bytes.reserve(imgs.len() * stride);
-            imgs.iter()
-                .for_each(|v| bytes.extend_from_slice(&v.to_be_bytes()[16 - stride..]));
+        let images = images.into_iter();
+        match stride <= 8 {
+            true => Self::sorted(stride, images.map(|v| v as u64), |bytes, v| {
+                bytes.extend_from_slice(&v.to_be_bytes()[8 - stride..])
+            }),
+            false => Self::sorted(stride, images, |bytes, v| {
+                bytes.extend_from_slice(&v.to_be_bytes()[16 - stride..])
+            }),
         }
-        PkKeys { stride: stride as u8, bytes }
+    }
+
+    /// `items` sorted and deduped, each written by `write`; a list of at most
+    /// two items, and its bytes up to `MAX_PK_BYTES`, never touch the heap.
+    fn sorted<T: Ord>(stride: usize, items: impl Iterator<Item = T>, write: impl Fn(&mut PkBytes, T)) -> Self {
+        let mut items: SmallVec<[T; 2]> = items.collect();
+        items.sort_unstable();
+        items.dedup();
+        let mut bytes = PkBytes::with_capacity(items.len() * stride);
+        for item in items {
+            write(&mut bytes, item);
+        }
+        Self::new(stride, bytes)
     }
 
     /// Keys of `stride` already concatenated in strictly ascending order.
+    /// A list past the inline capacity keeps `bytes` as its storage.
     pub fn from_sorted(stride: usize, bytes: Vec<u8>) -> Self {
         assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
         assert_eq!(bytes.len() % stride, 0, "PkKeys: key width");
-        Self::checked(stride, bytes).expect("PkKeys")
+        assert!(
+            strictly_ascending(&bytes, stride),
+            "PkKeys: keys are not strictly ascending"
+        );
+        Self::heap(stride, bytes)
+    }
+
+    /// Keys of `stride` concatenated in any order, duplicates allowed: kept as
+    /// [`Self::from_sorted`] keeps them when they already ascend, adjacent
+    /// duplicates dropped in place, else sorted and deduped into a new list.
+    pub fn from_vec(stride: usize, mut bytes: Vec<u8>) -> Self {
+        assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
+        assert_eq!(bytes.len() % stride, 0, "PkKeys: key width");
+        if !bytes.chunks_exact(stride).is_sorted() {
+            return Self::from_keys(stride, bytes.chunks_exact(stride));
+        }
+        let mut kept = 0;
+        for at in (0..bytes.len()).step_by(stride) {
+            if kept == 0 || bytes[kept - stride..kept] != bytes[at..at + stride] {
+                bytes.copy_within(at..at + stride, kept);
+                kept += stride;
+            }
+        }
+        bytes.truncate(kept);
+        Self::heap(stride, bytes)
     }
 
     /// [`Self::from_sorted`] for keys off the wire: `Err` where they do not
-    /// strictly ascend.
-    pub(crate) fn checked(stride: usize, bytes: Vec<u8>) -> Result<Self, String> {
-        match strictly_ascending(&bytes, stride) {
-            true => Ok(PkKeys { stride: stride as u8, bytes }),
-            false => Err("keys are not strictly ascending".to_string()),
+    /// strictly ascend. `stride` is in range and `bytes` a whole number of keys.
+    pub(crate) fn checked(stride: usize, bytes: &[u8]) -> Result<Self, String> {
+        debug_assert_eq!(bytes.len() % stride, 0, "PkKeys: key width");
+        if !strictly_ascending(bytes, stride) {
+            return Err("keys are not strictly ascending".to_string());
         }
+        Ok(Self::new(stride, SmallVec::from_slice(bytes)))
+    }
+
+    fn new(stride: usize, bytes: PkBytes) -> Self {
+        PkKeys { stride: stride as u8, bytes }
+    }
+
+    /// `bytes` as the list's storage: a list within the inline capacity is
+    /// copied inline, a longer one keeps its buffer.
+    fn heap(stride: usize, bytes: Vec<u8>) -> Self {
+        Self::new(stride, SmallVec::from_vec(bytes))
     }
 
     pub fn stride(&self) -> usize {
@@ -293,14 +329,15 @@ impl PkKeys {
     /// ascends, so nothing is re-checked.
     pub fn retain(&mut self, mut keep: impl FnMut(&[u8]) -> bool) {
         let stride = self.stride();
+        let bytes = &mut self.bytes;
         let mut kept = 0;
-        for at in (0..self.bytes.len()).step_by(stride) {
-            if keep(&self.bytes[at..at + stride]) {
-                self.bytes.copy_within(at..at + stride, kept);
+        for at in (0..bytes.len()).step_by(stride) {
+            if keep(&bytes[at..at + stride]) {
+                bytes.copy_within(at..at + stride, kept);
                 kept += stride;
             }
         }
-        self.bytes.truncate(kept);
+        bytes.truncate(kept);
     }
 
     /// The first and last key, or `None` for an empty list.

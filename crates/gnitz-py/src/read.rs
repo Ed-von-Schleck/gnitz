@@ -16,7 +16,7 @@ use pyo3::IntoPyObjectExt;
 
 use gnitz_core::{ScanReply, Schema, ZSetBatch};
 use gnitz_expr::ColumnLocator;
-use gnitz_wire::{format_decimal, format_uuid, ColType, TypeCode};
+use gnitz_wire::{write_decimal, write_uuid, ColType, ColumnDef, TypeCode, DECIMAL_TEXT_MAX};
 
 use crate::schema::PySchema;
 
@@ -54,21 +54,37 @@ impl ColumnDescriptor {
 struct RowType(Py<PyType>);
 
 impl RowType {
-    /// One per distinct `names`, for the life of the process.
-    fn of(py: Python<'_>, names: &[(&str, bool)]) -> PyResult<RowType> {
-        static CACHE: LazyLock<Mutex<HashMap<Vec<u8>, Py<PyType>>>> = LazyLock::new(Default::default);
-        // Length-prefixed, so no two column lists share a key.
-        let mut key = Vec::with_capacity(names.iter().map(|(n, _)| n.len() + 5).sum());
-        for &(name, hidden) in names {
-            key.extend_from_slice(&(name.len() as u32).to_le_bytes());
-            key.extend_from_slice(name.as_bytes());
-            key.push(hidden as u8);
+    /// One per distinct list of `columns`, for the life of the process.
+    fn of<'a>(py: Python<'_>, columns: impl Iterator<Item = &'a ColumnDef> + Clone) -> PyResult<RowType> {
+        #[derive(Default)]
+        struct Cache {
+            types: HashMap<Vec<u8>, Py<PyType>>,
+            /// The lookup key, cleared and refilled by every lookup.
+            key: Vec<u8>,
         }
-        if let Some(ty) = crate::lock(&CACHE).get(&key) {
-            return Ok(RowType(ty.clone_ref(py)));
-        }
-        let built = Self::build(py, names)?;
-        Ok(RowType(crate::lock(&CACHE).entry(key).or_insert(built).clone_ref(py)))
+        static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
+        let key = {
+            let mut guard = crate::lock(&CACHE);
+            let Cache { types, key } = &mut *guard;
+            key.clear();
+            // Length-prefixed, so no two column lists share a key.
+            for c in columns.clone() {
+                key.extend_from_slice(&(c.name.len() as u32).to_le_bytes());
+                key.extend_from_slice(c.name.as_bytes());
+                key.push(c.is_hidden as u8);
+            }
+            if let Some(ty) = types.get(key.as_slice()) {
+                return Ok(RowType(ty.clone_ref(py)));
+            }
+            key.clone()
+        };
+        // Built with the lock released: `build` calls into Python, which may
+        // hand the GIL to a thread that then waits on `CACHE`.
+        let names: Vec<(&str, bool)> = columns.map(|c| (&*c.name, c.is_hidden)).collect();
+        let built = Self::build(py, &names)?;
+        Ok(RowType(
+            crate::lock(&CACHE).types.entry(key).or_insert(built).clone_ref(py),
+        ))
     }
 
     fn build(py: Python<'_>, names: &[(&str, bool)]) -> PyResult<Py<PyType>> {
@@ -277,7 +293,9 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
         TypeCode::F64 => f64::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
         TypeCode::U128 => u128::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
         TypeCode::I128 => i128::from_le_bytes(b.try_into().unwrap()).into_py_any(py)?,
-        TypeCode::UUID => format_uuid(u128::from_le_bytes(b.try_into().unwrap())).into_py_any(py)?,
+        TypeCode::UUID => PyString::new(py, write_uuid(u128::from_le_bytes(b.try_into().unwrap()), &mut [0; 36]))
+            .into_any()
+            .unbind(),
         TypeCode::Date => {
             let days = int();
             let (y, m, d) = gnitz_wire::civil_from_days(days);
@@ -300,7 +318,7 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
             }
         }
         TypeCode::Decimal => py_decimal(py)?
-            .call1((format_decimal(int().into(), ty.scale),))?
+            .call1((write_decimal(int(), ty.scale, &mut [0; DECIMAL_TEXT_MAX]),))?
             .unbind(),
         // CPython validates the UTF-8 and raises `UnicodeDecodeError`.
         TypeCode::String => PyString::from_bytes(py, &loc.content(batch, row))?.into_any().unbind(),
@@ -321,16 +339,12 @@ pub(crate) fn present(
     include_hidden: bool,
     lsn: Option<u64>,
 ) -> PyResult<PyScanResult> {
+    // One filter for both, so the row type names exactly the columns `cols` reads.
+    let shown = || (schema.columns().iter().enumerate()).filter(move |(_, c)| include_hidden || !c.is_hidden);
+    // Sized up front: a filtered iterator's size hint has no lower bound.
     let mut cols = Vec::with_capacity(schema.columns().len());
-    let mut names = Vec::with_capacity(schema.columns().len());
-    for (ci, c) in schema.columns().iter().enumerate() {
-        if c.is_hidden && !include_hidden {
-            continue;
-        }
-        cols.push((schema.layout().locate(ci), c.ty));
-        names.push((c.name.as_str(), c.is_hidden));
-    }
-    let row_type = RowType::of(py, &names)?;
+    cols.extend(shown().map(|(ci, c)| (schema.layout().locate(ci), c.ty)));
+    let row_type = RowType::of(py, shown().map(|(_, c)| c))?;
     Ok(PyScanResult { schema, batch, cols, row_type, lsn })
 }
 

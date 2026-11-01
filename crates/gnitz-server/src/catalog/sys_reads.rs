@@ -123,7 +123,7 @@ impl CatalogEngine {
         let defs = self.read_column_defs(table_id).unwrap_or_default();
         col_indices
             .iter()
-            .map(|&ci| defs.get(ci as usize).map_or("?", |d| d.def.name.as_str()))
+            .map(|&ci| defs.get(ci as usize).map_or("?", |d| &*d.def.name))
             .collect::<Vec<_>>()
             .join(", ")
     }

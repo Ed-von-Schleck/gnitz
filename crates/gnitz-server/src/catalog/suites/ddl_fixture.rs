@@ -128,7 +128,7 @@ impl CatalogEngine {
             .map(|name| {
                 col_defs
                     .iter()
-                    .position(|cd| cd.def.name == *name)
+                    .position(|cd| &*cd.def.name == *name)
                     .map(|p| p as u32)
                     .ok_or_else(|| format!("Column not found in owner: {name}"))
             })

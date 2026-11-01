@@ -306,7 +306,32 @@ fn returning_a_relations_columns_replies_the_rows_written() {
         let mut map = plan.returning.unwrap();
         assert_eq!(map.apply(plan.rows.clone()), plan.rows, "RETURNING {list}");
         let schema = map.out_schema();
-        let got: Vec<&str> = schema.columns().iter().map(|c| c.name.as_str()).collect();
+        let got: Vec<&str> = schema.columns().iter().map(|c| &*c.name).collect();
+        assert_eq!(
+            (got, schema.pk_cols()),
+            (names.to_vec(), &[key][..]),
+            "RETURNING {list}"
+        );
+    }
+}
+
+/// RETURNING over a key-first relation numbers the reply by the list, under the
+/// names it gives.
+#[test]
+fn returning_names_the_reply_by_the_list() {
+    let i = TypeCode::I64;
+    let cat = catalog(vec![("k", table(1, vec![col("id", i), col("v", i)], vec![0]))]);
+    for (list, names, key) in [
+        ("*", ["id", "v"], 0u32),
+        ("id, v", ["id", "v"], 0),
+        ("id AS a, v", ["a", "v"], 0),
+        ("v, id", ["v", "id"], 1),
+    ] {
+        let plan = insert(&cat, &format!("INSERT INTO k VALUES (1, 10) RETURNING {list}")).unwrap();
+        let mut map = plan.returning.unwrap();
+        assert_eq!(map.apply(plan.rows.clone()), plan.rows, "RETURNING {list}");
+        let schema = map.out_schema();
+        let got: Vec<&str> = schema.columns().iter().map(|c| &*c.name).collect();
         assert_eq!(
             (got, schema.pk_cols()),
             (names.to_vec(), &[key][..]),

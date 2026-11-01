@@ -139,9 +139,9 @@ pub(super) struct ShardEntry {
 }
 
 impl ShardEntry {
-    /// Open the shard drawn at `seq` in the store at `dir`.
-    fn open(dir: &str, seq: u64, schema: &SchemaDescriptor, newest: u64) -> Result<Self, StorageError> {
-        let shard = Rc::new(MappedShard::open(&manifest::shard_path(dir, seq), schema)?);
+    /// Open the shard drawn at `seq`, at `path`.
+    fn open(path: &str, seq: u64, schema: &SchemaDescriptor, newest: u64) -> Result<Self, StorageError> {
+        let shard = Rc::new(MappedShard::open(path, schema)?);
         let (pk_min, pk_max) = (shard.pk_at(0), shard.pk_at(shard.row_count() - 1));
         Ok(ShardEntry { shard, seq, newest, pk_min, pk_max })
     }
@@ -477,7 +477,7 @@ impl ShardIndex {
             bands: Vec::new(),
         };
         for e in &shards.entries {
-            let entry = ShardEntry::open(output_dir, e.seq, &idx.schema, e.newest)?;
+            let entry = ShardEntry::open(&manifest::shard_path(output_dir, e.seq), e.seq, &idx.schema, e.newest)?;
             let level = idx
                 .levels
                 .get_mut(e.level as usize)

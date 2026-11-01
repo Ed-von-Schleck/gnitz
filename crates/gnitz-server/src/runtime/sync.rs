@@ -211,9 +211,6 @@ pub(crate) mod chan {
 // Writer-preference blocks new readers as soon as a writer parks, so a writer
 // cannot starve behind a stream of readers.
 
-/// A parked writer's waker, shared by its `WriteFuture` and its queue entry.
-type WakerSlot = RefCell<Option<Waker>>;
-
 #[derive(Default)]
 struct RwLockInner {
     readers: usize,
@@ -222,10 +219,13 @@ struct RwLockInner {
     /// here to choose between. One entry per pending poll; a cancelled reader's
     /// waker stays behind, harmlessly.
     read_waiters: VecDeque<Waker>,
-    /// Parked `WriteFuture`s, admitted one at a time in queue order. A woken
-    /// entry keeps its place, its slot emptied, until its future acquires or
-    /// drops.
-    write_waiters: VecDeque<Rc<WakerSlot>>,
+    /// Parked `WriteFuture`s by id, admitted one at a time in queue order. A
+    /// woken entry keeps its place, its waker taken, until its future acquires
+    /// or drops.
+    write_waiters: VecDeque<(u64, Option<Waker>)>,
+    /// The id the next parked writer takes. Ids come from this counter alone, so
+    /// they are unique among this lock's queued writers.
+    next_waiter: u64,
 }
 
 impl RwLockInner {
@@ -243,12 +243,8 @@ impl RwLockInner {
     /// The writer queued as `me` (`None`: not queued) may enter: the lock is free
     /// and no writer is queued ahead of it, so a fresh writer cannot take the lock
     /// from a woken one that has yet to poll.
-    fn write_ok(&self, me: Option<&Rc<WakerSlot>>) -> bool {
-        self.free()
-            && self
-                .write_waiters
-                .front()
-                .is_none_or(|first| me.is_some_and(|me| Rc::ptr_eq(first, me)))
+    fn write_ok(&self, me: Option<u64>) -> bool {
+        self.free() && self.write_waiters.front().is_none_or(|(first, _)| me == Some(*first))
     }
 }
 
@@ -282,8 +278,8 @@ impl<K> AsyncRwLock<K> {
     fn wake_next(&self) {
         let mut s = self.0.borrow_mut();
         if s.free() {
-            if let Some(slot) = s.write_waiters.front() {
-                if let Some(w) = slot.borrow_mut().take() {
+            if let Some((_, slot)) = s.write_waiters.front_mut() {
+                if let Some(w) = slot.take() {
                     w.wake();
                 }
                 return;
@@ -336,8 +332,8 @@ impl<K> Drop for ReadGuard<K> {
 
 pub(crate) struct WriteFuture<K = ()> {
     lock: AsyncRwLock<K>,
-    /// This future's entry in `write_waiters`: `Some` iff it is queued.
-    waiter: Option<Rc<WakerSlot>>,
+    /// The id of this future's entry in `write_waiters`: `Some` iff it is queued.
+    waiter: Option<u64>,
 }
 
 impl<K> Future for WriteFuture<K> {
@@ -345,21 +341,29 @@ impl<K> Future for WriteFuture<K> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WriteGuard<K>> {
         let Self { lock, waiter } = self.get_mut();
         let mut s = lock.0.borrow_mut();
-        if s.write_ok(waiter.as_ref()) {
+        if s.write_ok(*waiter) {
             s.has_writer = true;
             // `write_ok` admits a queued writer only at the front.
-            if let Some(w) = waiter.take() {
+            if let Some(id) = waiter.take() {
                 let first = s.write_waiters.pop_front();
-                debug_assert!(first.is_some_and(|f| Rc::ptr_eq(&f, &w)));
+                debug_assert!(first.is_some_and(|(f, _)| f == id));
             }
             return Poll::Ready(WriteGuard { lock: lock.clone() });
         }
-        match waiter {
-            Some(w) => *w.borrow_mut() = Some(cx.waker().clone()),
+        match *waiter {
+            Some(id) => {
+                let (_, slot) = s
+                    .write_waiters
+                    .iter_mut()
+                    .find(|(i, _)| *i == id)
+                    .expect("a queued writer has an entry");
+                *slot = Some(cx.waker().clone());
+            }
             None => {
-                let w = Rc::new(RefCell::new(Some(cx.waker().clone())));
-                s.write_waiters.push_back(Rc::clone(&w));
-                *waiter = Some(w);
+                let id = s.next_waiter;
+                s.next_waiter += 1;
+                s.write_waiters.push_back((id, Some(cx.waker().clone())));
+                *waiter = Some(id);
             }
         }
         Poll::Pending
@@ -368,12 +372,8 @@ impl<K> Future for WriteFuture<K> {
 
 impl<K> Drop for WriteFuture<K> {
     fn drop(&mut self) {
-        let Some(waiter) = self.waiter.take() else { return };
-        self.lock
-            .0
-            .borrow_mut()
-            .write_waiters
-            .retain(|w| !Rc::ptr_eq(w, &waiter));
+        let Some(id) = self.waiter.take() else { return };
+        self.lock.0.borrow_mut().write_waiters.retain(|(i, _)| *i != id);
         // This future may have been the last writer blocking the parked readers.
         self.lock.wake_next();
     }

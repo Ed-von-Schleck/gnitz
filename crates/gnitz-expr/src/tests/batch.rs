@@ -3,7 +3,7 @@ use gnitz_wire::{FixedInt, Heap, TypeCode};
 
 use super::{decode_f64, encode_f64, MORSEL};
 use crate::eval::Resolved;
-use crate::program::{FloatUnaryOp, IntUnaryOp};
+use crate::program::{FloatUnaryOp, IntUnaryOp, ResolvedProgram};
 use crate::test_support::{
     f64s, filter_prog, i64s, int, make_string_view, pairs, passing_rows, row_strs, row_values, scalar_prog,
     schema_pk_strings, text, verdicts, view, Col, TestView, PATTERNS,
@@ -571,7 +571,7 @@ fn every_string_column_addresses_its_own_region_in_place() {
     let evaluator = ev.ev_mut().expect("an evaluated program");
 
     assert_eq!(
-        evaluator.prog().payload_reads.to_vec(),
+        payload_reads(evaluator.prog()),
         (0..N).map(|c| (c as u8, 16)).collect::<Vec<_>>(),
         "every string column the program loads is read at its own slot",
     );
@@ -597,6 +597,13 @@ fn every_string_column_addresses_its_own_region_in_place() {
     assert_eq!(text_rows(&mut ev, &view), [Some(vals.concat())]);
 }
 
+/// `(slot, cell width)` for each slot in the program's read mask, lowest first.
+fn payload_reads(prog: &ResolvedProgram) -> Vec<(u8, u8)> {
+    gnitz_wire::BitIter(prog.read_mask)
+        .map(|pi| (pi as u8, prog.read_widths[pi]))
+        .collect()
+}
+
 /// Each payload slot an instruction reads comes once, with the width its kernel
 /// reads it at, and a slot only a null test reads does not come.
 #[test]
@@ -616,7 +623,7 @@ fn payload_reads_name_each_slot_at_its_cell_width() {
     ];
     let ev = scalar_prog(&schema, instrs, vec![]);
     let prog = ev.prog();
-    assert_eq!(*prog.payload_reads, [(0, 2), (1, 4), (2, 16)]);
+    assert_eq!(payload_reads(prog), [(0, 2), (1, 4), (2, 16)]);
 }
 
 /// UPPER and LOWER fold ASCII only: the neighbours of `a-z`/`A-Z` pass through,

@@ -101,11 +101,12 @@ impl Frame {
     /// `root`'s columns in `root` order, each unnamed payload slot staying where
     /// the payload order puts it. The regions are this frame's own, so the engine
     /// relabels a batch rather than moving a column. Refused for a `root` that
-    /// would move a payload column.
+    /// would move a payload column. A `root` that keeps every slot in place returns
+    /// this frame's own schema.
     pub(crate) fn schema_in_order(
         &self,
         root: impl IntoIterator<Item = ColId>,
-    ) -> Result<(Schema, Vec<u32>), GnitzSqlError> {
+    ) -> Result<(Arc<Schema>, Vec<u32>), GnitzSqlError> {
         let internal = |m: &str| GnitzSqlError::Internal(format!("output order: {m}"));
         let is_pk = |s: usize| self.schema.layout().is_pk_col(s);
         let mut rooted = vec![false; self.layout.len()];
@@ -131,6 +132,9 @@ impl Frame {
         if !order.iter().filter(|&&s| !is_pk(s)).is_sorted() {
             return Err(internal("the root would move a payload column"));
         }
+        if order.iter().copied().eq(0..order.len()) {
+            return Ok((Arc::clone(&self.schema), (0..order.len() as u32).collect()));
+        }
         let mut moved_to = vec![0u32; order.len()];
         for (to, &from) in order.iter().enumerate() {
             moved_to[from] = to as u32;
@@ -138,7 +142,7 @@ impl Frame {
         let pk: Vec<u32> = self.schema.pk_cols().iter().map(|&s| moved_to[s as usize]).collect();
         let schema = Schema::from_parts(order.iter().map(|&s| self.schema.columns()[s].clone()).collect(), &pk)
             .map_err(|e| GnitzSqlError::Rejected(format!("output schema: {e}")))?;
-        Ok((schema, moved_to))
+        Ok((Arc::new(schema), moved_to))
     }
 
     /// This frame under `rename`'s identities. A slot it does not name loses its
@@ -194,6 +198,19 @@ pub(crate) fn physicalize_projection(
         })
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
     place_pk_front(&mut slots, &input.schema);
+    // Each input column copied in place under its own definition: the output schema
+    // is the input's.
+    let columns = input.schema.columns();
+    let identity = slots.len() == columns.len()
+        && slots
+            .iter()
+            .enumerate()
+            .all(|(i, (item, _, def))| item.as_col() == Some(i) && *def == columns[i]);
+    if identity {
+        let (proj, layout) = slots.into_iter().map(|(item, id, _)| (item, id)).unzip();
+        let schema = Arc::clone(&input.schema);
+        return Ok((proj, Frame { layout, schema }));
+    }
     let (proj, cols): (Vec<BoundExpr>, Vec<Slot>) = slots.into_iter().map(|(item, id, def)| (item, (id, def))).unzip();
     Ok((proj, Frame::new(cols, input.schema.pk_cols().len())?))
 }

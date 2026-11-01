@@ -41,19 +41,28 @@ impl RelName {
     /// The catalog spelling of the schema `text` names: a reserved schema
     /// matched in any case, else the identifier folded as SQL folds it.
     pub fn schema_key(text: &str) -> Result<String, String> {
-        let reserved = RESERVED_SCHEMAS.into_iter().find(|r| text.eq_ignore_ascii_case(r));
-        match reserved {
-            Some(r) => Ok(r.to_string()),
-            None => gnitz_wire::canonical_identifier(text),
+        Self::validate_schema(text)?;
+        Ok(text.to_ascii_lowercase())
+    }
+
+    /// Refuses a schema that is neither reserved nor a name a user may give.
+    /// Either way the catalog fold of a passing schema is its ASCII lowercase:
+    /// the reserved schemas are lowercase literals, and a user name folds as
+    /// [`gnitz_wire::canonical_identifier`] folds it.
+    fn validate_schema(text: &str) -> Result<(), String> {
+        if RESERVED_SCHEMAS.iter().any(|r| text.eq_ignore_ascii_case(r)) {
+            return Ok(());
         }
+        gnitz_wire::validate_user_identifier(text)
     }
 
     fn build(schema: &str, name: &str, qualified: bool) -> Result<Self, String> {
-        let schema_key = Self::schema_key(schema)?;
-        let key = gnitz_wire::qualified_key(&schema_key, &gnitz_wire::canonical_identifier(name)?);
+        Self::validate_schema(schema)?;
+        gnitz_wire::validate_user_identifier(name)?;
+        let spelled = gnitz_wire::qualified_key(schema, name);
         Ok(RelName {
-            key,
-            spelled: gnitz_wire::qualified_key(schema, name),
+            key: spelled.to_ascii_lowercase(),
+            spelled,
             dot: schema.len(),
             qualified,
         })

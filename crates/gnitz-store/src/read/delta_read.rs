@@ -6,7 +6,7 @@ use gnitz_wire::{ReadBound, ReadSpec, SinkKind, WireFault, WireStatus};
 
 use std::rc::Rc;
 
-use super::{check_layout, check_stride};
+use super::{check_layout, check_stride, ReadRows};
 use crate::relation::RelationRegistry;
 use gnitz_zset::algebra::SinkPlan;
 use gnitz_zset::repr::Batch;
@@ -22,7 +22,7 @@ impl RelationRegistry {
         after_tick: u64,
         spec: ReadSpec,
         reply_layout: u64,
-    ) -> Result<Rc<Batch>, WireFault> {
+    ) -> Result<ReadRows, WireFault> {
         let entry = self.relation_or_err(id)?;
         let feed = entry
             .feed()
@@ -56,8 +56,8 @@ impl RelationRegistry {
         if whole {
             return Ok(match rounds.len() {
                 // One round is the reply as it was captured.
-                1 => Rc::clone(rounds.next().unwrap()),
-                _ => Rc::new(Batch::concat(&view, rounds.map(|round| round.as_mem_batch()))),
+                1 => ReadRows::Shared(Rc::clone(rounds.next().unwrap())),
+                _ => ReadRows::Own(Batch::concat(&view, rounds.map(|round| round.as_mem_batch()))),
             });
         }
         let mut filter =
@@ -102,7 +102,7 @@ impl RelationRegistry {
         let rows = plan.finish();
         // A map can send two rows to one, and a retraction and an insert that
         // differ only in a column it drops to nothing.
-        Ok(Rc::new(match sink.map {
+        Ok(ReadRows::Own(match sink.map {
             Some(_) => rows.into_consolidated(),
             None => rows,
         }))

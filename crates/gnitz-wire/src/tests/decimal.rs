@@ -25,11 +25,11 @@ fn format_and_parse_are_inverse_at_every_scale() {
         (0, 3, "0.000"),
         (-1234, 1, "-123.4"),
     ] {
-        assert_eq!(format_decimal(v.into(), scale), want);
+        assert_eq!(format_decimal(v, scale), want);
     }
     for scale in 0..=MAX_DECIMAL_SCALE {
         for v in [0, 1, -1, 5, -5, 999, -999, i64::MAX, i64::MIN] {
-            let text = format_decimal(v.into(), scale);
+            let text = format_decimal(v, scale);
             assert_eq!(
                 parse_decimal_text(&text),
                 Some((v.into(), scale)),
@@ -41,4 +41,52 @@ fn format_and_parse_are_inverse_at_every_scale() {
             assert_eq!(text.starts_with('-'), v < 0, "{text:?}");
         }
     }
+}
+
+/// `write_decimal` agrees with a reference built from the digit string: sign,
+/// at least `scale + 1` zero-padded digits, the point `scale` from the end.
+#[test]
+fn write_decimal_matches_the_padded_digit_string() {
+    fn reference(v: i64, scale: u8) -> String {
+        let scale = scale as usize;
+        let digits = v.unsigned_abs().to_string();
+        let mut out = String::new();
+        if v < 0 {
+            out.push('-');
+        }
+        for _ in digits.len()..=scale {
+            out.push('0');
+        }
+        out.push_str(&digits);
+        if scale > 0 {
+            out.insert(out.len() - scale, '.');
+        }
+        out
+    }
+    for scale in 0..=MAX_DECIMAL_SCALE {
+        for v in [0, 1, -1, 10, -10, 123_456, i64::MAX, i64::MIN, i64::MIN + 1] {
+            let mut buf = [0; DECIMAL_TEXT_MAX];
+            assert_eq!(
+                write_decimal(v, scale, &mut buf),
+                reference(v, scale),
+                "{v} at scale {scale}"
+            );
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "DECIMAL scale 19")]
+fn write_decimal_refuses_a_scale_past_the_maximum() {
+    write_decimal(1, MAX_DECIMAL_SCALE + 1, &mut [0; DECIMAL_TEXT_MAX]);
+}
+
+/// `write_scaled` holds a whole `u64`, at scale 0 and at the largest scale.
+#[test]
+fn write_scaled_holds_every_u64() {
+    let mut buf = [0; DECIMAL_TEXT_MAX];
+    assert_eq!(write_scaled(u64::MAX, true, 0, &mut buf), format!("-{}", u64::MAX));
+    let text = write_scaled(u64::MAX, true, MAX_DECIMAL_SCALE, &mut buf).to_owned();
+    assert_eq!(text.len(), DECIMAL_TEXT_MAX);
+    assert_eq!(text.replace('.', ""), format!("-{}", u64::MAX));
 }

@@ -18,12 +18,11 @@ use gnitz_wire::TypeCode;
 /// owned. An index-bounded backfill takes that path on every chunk: the access
 /// path already satisfies the predicate the circuit still carries.
 pub fn op_filter(batch: Cow<'_, Batch>, pred: &mut RowFilter) -> Batch {
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    pred.ranges(&batch.as_mem_batch(), &mut ranges);
-    if ranges == [(0, batch.len())] {
+    let ranges = pred.ranges(&batch.as_mem_batch());
+    if *ranges == [(0, batch.len())] {
         return batch.into_owned();
     }
-    Batch::from_ranges(&batch, &ranges, 0)
+    Batch::from_ranges(&batch, ranges, 0)
 }
 
 /// `a`'s schema with each column's nullability OR-ed with `b`'s: a NULL and a

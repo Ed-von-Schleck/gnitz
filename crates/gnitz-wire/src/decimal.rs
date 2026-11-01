@@ -30,25 +30,52 @@ pub fn parse_decimal_text(s: &str) -> Option<(i128, u8)> {
     Some((if neg { -v } else { v }, frac.len() as u8))
 }
 
+/// The longest text [`write_scaled`] produces: a sign, 20 digits (all of a
+/// `u64`, or the `scale + 1` padded digits of a scale up to
+/// [`MAX_DECIMAL_SCALE`]) and a point.
+pub const DECIMAL_TEXT_MAX: usize = 22;
+
 /// The text a value at scale `scale` prints as — exactly `scale` fractional
 /// digits, so a column's values line up and read back through
 /// [`parse_decimal_text`] at that scale.
-pub fn format_decimal(v: i128, scale: u8) -> String {
+pub fn format_decimal(v: i64, scale: u8) -> String {
+    write_decimal(v, scale, &mut [0; DECIMAL_TEXT_MAX]).to_owned()
+}
+
+/// [`format_decimal`]'s text, written into the tail of `buf` and borrowed from
+/// it. Panics on a `scale` past [`MAX_DECIMAL_SCALE`], which no admissible
+/// column type has.
+pub fn write_decimal(v: i64, scale: u8, buf: &mut [u8; DECIMAL_TEXT_MAX]) -> &str {
+    write_scaled(v.unsigned_abs(), v < 0, scale, buf)
+}
+
+/// The text of `magnitude`, negated where `neg`, at scale `scale` — an integer's
+/// at scale 0 — written into the tail of `buf` and borrowed from it. Several
+/// times cheaper than `core::fmt` (`int_to_str` of `expr_kernel_bench`).
+/// Panics on a `scale` past [`MAX_DECIMAL_SCALE`].
+pub fn write_scaled(magnitude: u64, neg: bool, scale: u8, buf: &mut [u8; DECIMAL_TEXT_MAX]) -> &str {
+    assert!(
+        scale <= MAX_DECIMAL_SCALE,
+        "DECIMAL scale {scale} past {MAX_DECIMAL_SCALE}"
+    );
     let scale = scale as usize;
-    let digits = v.unsigned_abs().to_string();
-    let mut out = String::with_capacity(digits.len().max(scale + 1) + 2);
-    if v < 0 {
-        out.push('-');
+    let (mut m, mut i, mut n) = (magnitude, buf.len(), 0);
+    // At least `scale + 1` digits, so the point always has a digit in front of it.
+    while m != 0 || n <= scale {
+        if n == scale && scale > 0 {
+            i -= 1;
+            buf[i] = b'.';
+        }
+        i -= 1;
+        buf[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        n += 1;
     }
-    // Padded to `scale + 1` digits, so the point always has a digit in front of it.
-    for _ in digits.len()..=scale {
-        out.push('0');
+    if neg {
+        i -= 1;
+        buf[i] = b'-';
     }
-    out.push_str(&digits);
-    if scale > 0 {
-        out.insert(out.len() - scale, '.');
-    }
-    out
+    std::str::from_utf8(&buf[i..]).expect("digits, point and sign")
 }
 
 #[cfg(test)]

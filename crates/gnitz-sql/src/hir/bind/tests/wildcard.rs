@@ -38,7 +38,7 @@ fn a_wildcard_expands_through_its_modifiers() {
         let got: Vec<(usize, String)> = expand_wildcard_item(&wildcard_item(sql), &cols, "SELECT")
             .unwrap()
             .into_iter()
-            .map(|(i, c)| (i, c.name))
+            .map(|(i, c)| (i, c.name.to_string()))
             .collect();
         let want: Vec<(usize, String)> = want.iter().map(|&(i, n)| (i, n.to_string())).collect();
         assert_eq!(got, want, "{sql}");

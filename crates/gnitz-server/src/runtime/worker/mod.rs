@@ -6,7 +6,6 @@
 //! the mesh.
 
 use std::collections::VecDeque;
-use std::rc::Rc;
 
 use crate::catalog::CatalogEngine;
 use crate::query::{DagEngine, DriveHost};
@@ -106,7 +105,7 @@ impl<'c> WorkerProcess<'c> {
 
     /// The next SAL group this worker acts on: the single decode point of both
     /// drain loops.
-    fn next_request(&mut self) -> Option<Inbound> {
+    fn next_request(&mut self) -> Option<Inbound<'static>> {
         let cat = &*self.catalog;
         self.sal_reader
             .next_request(|tid, record| cat.known_decode(tid, record))
@@ -116,11 +115,12 @@ impl<'c> WorkerProcess<'c> {
     /// is a fault frame to its asker, a state change's a fail-stop. `in_drive`:
     /// the request arrived inside an exchange wait of a `Tick` or `Backfill`.
     /// Total, so a new request cannot compile without a decision.
-    pub(super) fn dispatch(&mut self, req: Inbound, in_drive: bool) {
+    pub(super) fn dispatch(&mut self, req: Inbound<'_>, in_drive: bool) {
         match req {
             Inbound::Shutdown => unsafe { libc::_exit(0) },
             // A drive writes views, so a read of one would see the tick half-run:
-            // it parks.
+            // it parks, owning its bytes, since the drive may read past a `Flush`
+            // before it is answered.
             Inbound::Read { route, read }
                 if in_drive
                     && self
@@ -129,10 +129,11 @@ impl<'c> WorkerProcess<'c> {
                         .relation(route.target_id)
                         .is_some_and(|r| r.kind().is_view()) =>
             {
-                self.replies.push_back(Owed::Parked(route, read))
+                self.replies.push_back(Owed::Parked(route, read.into_owned()))
             }
             // A drive writes no other store, so every other read is answered here,
-            // at its place in the SAL — a push behind it must not reach it.
+            // at its place in the SAL — a push behind it must not reach it — and
+            // before the next group is read, while its borrowed bytes are intact.
             Inbound::Read { route, read } => {
                 let answer = answer(self.catalog, &read);
                 self.reply(route, answer);
@@ -224,14 +225,14 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
     match *read {
         Read::HasPk { tid, probe, ref keys } => {
             let keys = PkKeys::decode_probe(keys)?;
-            Ok(Rows::Own(cat.registry.probe(tid, probe, keys)?))
+            Ok(Rows::from(cat.registry.probe(tid, probe, keys)?))
         }
-        Read::ScanSpec { tid, reply_layout, ref spec } => Ok(Rows::Shared(cat.scan_spec(
+        Read::ScanSpec { tid, reply_layout, ref spec } => Ok(Rows::from(cat.scan_spec(
             tid,
             gnitz_wire::ReadSpec::decode(spec)?,
             reply_layout,
         )?)),
-        Read::Delta { view, after_tick, reply_layout, ref spec } => Ok(Rows::Shared(cat.registry.delta_read(
+        Read::Delta { view, after_tick, reply_layout, ref spec } => Ok(Rows::from(cat.registry.delta_read(
             view,
             after_tick,
             gnitz_wire::ReadSpec::decode(spec)?,
@@ -262,7 +263,7 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
         }
         Read::SnapshotPage { snapshot, tid, ref page } => {
             let page = gnitz_wire::snapshot::PageRequest::decode(page)?;
-            Ok(Rows::Own(cat.registry.pinned_page(snapshot, tid, &page)?))
+            Ok(Rows::from(cat.registry.pinned_page(snapshot, tid, &page)?))
         }
         Read::Backup { ref dir } => {
             let dir = std::str::from_utf8(dir).map_err(|_| "a backup directory that is not UTF-8".to_string())?;
@@ -275,7 +276,7 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
 /// The reply of a read that answers with no rows: one empty frame.
 fn no_rows() -> Rows {
     let schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
-    Rows::Own(Batch::empty_with_schema(&schema))
+    Rows::from(Batch::empty_with_schema(&schema))
 }
 
 #[cfg(test)]

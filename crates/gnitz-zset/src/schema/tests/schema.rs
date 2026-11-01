@@ -13,3 +13,21 @@ fn project_schema_places_the_pk_then_the_named_payload() {
         SchemaDescriptor::new(&[col(U32), col(U64), opt, col(I32), opt], &[0, 1]),
     );
 }
+
+/// The builder admits `MAX_COLUMNS` columns; `finish` refuses one more, never
+/// truncating it.
+#[test]
+fn derived_schema_refuses_past_max_columns() {
+    let k = SchemaColumn::new(gnitz_wire::TypeCode::U64, false);
+    let mut b = DerivedSchema::new();
+    b.push_pk(k);
+    for _ in 1..MAX_COLUMNS {
+        b.push(k);
+    }
+    assert_eq!(b.finish().unwrap(), SchemaDescriptor::new(&[k; MAX_COLUMNS], &[0]));
+    b.push(k);
+    assert_eq!(b.finish(), Err(SchemaRefusal::TooManyColumns(MAX_COLUMNS + 1)));
+    assert_eq!(b.payload().len(), MAX_COLUMNS);
+    b.push(k);
+    assert_eq!(b.finish(), Err(SchemaRefusal::TooManyColumns(MAX_COLUMNS + 2)));
+}

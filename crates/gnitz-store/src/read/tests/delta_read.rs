@@ -429,3 +429,36 @@ fn a_delta_read_refuses_what_it_cannot_answer() {
         assert!(err.text.contains(why), "{err:?}");
     }
 }
+
+/// Rounds of alternating small and large sizes, read past a cursor under a
+/// filter at a chunk size a run of small rounds fills exactly: every round's rows
+/// arrive once, at their own weights.
+#[test]
+fn a_delta_read_reads_each_round_once_however_rounds_are_chunked() {
+    let schema = make_schema_u64_i64();
+    let mut r = relation_fixture(fed_view(1 << 30), schema, &[], []);
+    r.set_scan_chunk_rows(10);
+    // 4 + 4 + 2 fills a chunk of 10; 1 + 7 leaves no room for the 8 after it.
+    let sizes = [3, 5, 200, 4, 4, 2, 130, 1, 7, 8, 129, 10, 1];
+    let mut want = Vec::new();
+    let mut id = 0u64;
+    for (at, &n) in sizes.iter().enumerate() {
+        let weight = at as i64 + 1;
+        let rows: Vec<_> = (0..n)
+            .map(|_| {
+                id += 1;
+                (id, weight, (id % 7) as i64)
+            })
+            .collect();
+        want.extend(rows.iter().copied().filter(|&(_, _, val)| val < 5));
+        r.ingest_round(TID, make_batch_raw(&schema, &rows), at as u64 + 2, false)
+            .unwrap();
+    }
+    want.sort_unstable();
+    let spec = ReadSpec {
+        predicate: between(1, 0, 5),
+        ..rows_spec(None, None)
+    };
+    let got = r.delta_read(TID, 1, spec, schema.layout_digest()).unwrap();
+    assert_eq!(batch_rows(&got), want);
+}

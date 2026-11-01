@@ -677,7 +677,7 @@ impl GnitzClient {
     ) -> Result<(ZSetBatch, usize), ClientError> {
         let mut keys = PkColumn::empty_for_schema(sys_schema(family));
         keys.push_natives(key);
-        let batch = self.sys_rows(family, ReadBound::PkSet(keys.keys())).await?;
+        let batch = self.sys_rows(family, ReadBound::PkSet(keys.into_keys())).await?;
         let i = batch.live_rows().next().ok_or_else(missing)?;
         Ok((batch, i))
     }

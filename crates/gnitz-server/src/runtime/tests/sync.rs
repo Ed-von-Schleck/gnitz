@@ -252,6 +252,35 @@ fn async_rwlock_a_fresh_writer_queues_behind_a_woken_one() {
     assert!(try_poll_once(&mut queued).is_some(), "the woken writer acquires");
 }
 
+/// Dropping a writer queued between two others removes only its own entry: the
+/// first and the last still acquire in queue order.
+#[test]
+fn async_rwlock_a_dropped_middle_writer_keeps_the_others_in_order() {
+    let lock: AsyncRwLock = AsyncRwLock::default();
+    let held = try_poll_once(lock.write()).expect("a free lock admits a writer");
+    let mut first = Box::pin(lock.write());
+    let mut middle = Box::pin(lock.write());
+    let mut last = Box::pin(lock.write());
+    assert!(try_poll_once(&mut first).is_none(), "a held lock parks the writer");
+    assert!(try_poll_once(&mut middle).is_none(), "a held lock parks the writer");
+    assert!(try_poll_once(&mut last).is_none(), "a held lock parks the writer");
+
+    drop(middle);
+    drop(held);
+    assert!(
+        try_poll_once(&mut last).is_none(),
+        "the last writer must wait for the first"
+    );
+    let g = try_poll_once(&mut first).expect("the first queued writer acquires");
+    assert!(
+        try_poll_once(&mut last).is_none(),
+        "the lock is held by the first writer"
+    );
+    drop(g);
+    let _g = try_poll_once(&mut last).expect("the last writer acquires next");
+    assert!(try_poll_once(lock.read()).is_none(), "the last writer holds the lock");
+}
+
 // ─────────────────────────────────────────────────────────────────
 // select2
 // ─────────────────────────────────────────────────────────────────

@@ -142,7 +142,7 @@ fn a_table_carries_its_columns_key_fks_and_indexes() {
 
     let child = catalog.get(&rel("app", "child")).unwrap();
     assert_eq!(child.props, RelProps::Table(props));
-    let cols: Vec<_> = child.columns.iter().map(|c| (c.def.name.as_str(), c.fk)).collect();
+    let cols: Vec<_> = child.columns.iter().map(|c| (&*c.def.name, c.fk)).collect();
     assert_eq!(cols, [("id", None), ("parent_id", Some(fk)), ("note", None)]);
     assert_eq!(child.column_names(&child.pk), ["id"]);
     let [ix] = &child.indexes[..] else {

@@ -481,7 +481,7 @@ impl PyZSetBatch {
     #[new]
     pub fn new(schema: PySchema) -> Self {
         let schema = schema.rust;
-        let weight_is_column = schema.visible_columns().any(|(_, c)| c.name == WEIGHT_KW);
+        let weight_is_column = schema.visible_columns().any(|(_, c)| &*c.name == WEIGHT_KW);
         PyZSetBatch {
             batch: Arc::new(ZSetBatch::new(&schema)),
             writer: RowWriter { schema, weight_is_column, plan: None },

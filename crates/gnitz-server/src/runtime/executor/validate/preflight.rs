@@ -231,6 +231,9 @@ impl<'a> TxnBundle<'a> {
                 let error = matches!(fam.mode, WireConflictMode::Error);
                 let batch = &fam.batch;
                 t.fold.reserve(batch.len());
+                if error {
+                    t.probe_keys.reserve(batch.len());
+                }
                 for row in 0..batch.len() {
                     let w = batch.get_weight(row);
                     if w == 0 {
@@ -352,14 +355,15 @@ async fn execute_probe_burst<P>(
     }
     let leases = disp
         .scan_cut(|cut| {
+            let mut leases = Vec::with_capacity(checks.len());
             for check in checks.iter() {
-                cut.read(Read::HasPk {
+                leases.push(cut.read(Read::HasPk {
                     tid: check.tid,
                     probe: check.probe,
                     keys: (&check.keys[..]).into(),
-                })?;
+                })?);
             }
-            Ok(())
+            Ok(leases)
         })
         .await?;
 

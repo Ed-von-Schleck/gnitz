@@ -27,29 +27,6 @@ use crate::schema::PySchema;
 use crate::write::{py_key_image, py_pks_to_column, PyZSetBatch};
 use crate::{client_err, lock};
 
-/// A verb's answer, waiting to become its Python value under the GIL.
-pub(crate) type Unconverted = Box<dyn FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + Send>;
-
-/// A verb as both drivers run it: what it does with the client, and the
-/// answer that yields, still to be converted.
-pub(crate) type Verb =
-    Box<dyn for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<Unconverted>, GnitzSqlError>> + Send>;
-
-/// The verb that runs `op` and converts its answer with `convert`.
-pub(crate) fn verb<T, O, C>(op: O, convert: C) -> Verb
-where
-    T: Send + 'static,
-    O: for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>> + Send + 'static,
-    C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
-{
-    Box::new(move |c| {
-        Box::pin(async move {
-            let sent = op(c).await?;
-            Ok(sent.map(move |t| Box::new(move |py: Python<'_>| convert(py, t)) as Unconverted))
-        })
-    })
-}
-
 /// How a client waits, which is the whole difference between its two classes.
 pub(crate) enum Mode {
     /// `None` once closed. Held by the verb running on it: one that finds it
@@ -67,7 +44,7 @@ pub struct PyClient {
     mode: Mode,
     /// The schema of a relation named without one, in SQL and in every verb
     /// that takes a name.
-    schema: Mutex<String>,
+    schema: Mutex<Arc<str>>,
 }
 
 /// A verb the client finishes itself: `body` runs with the client `c` to
@@ -92,7 +69,7 @@ impl PyClient {
     pub(crate) fn init(mode: Mode, schema: &str) -> PyClassInitializer<Self> {
         PyClassInitializer::from(PyClient {
             mode,
-            schema: Mutex::new(schema.to_owned()),
+            schema: Mutex::new(Arc::from(schema)),
         })
     }
 
@@ -141,10 +118,9 @@ impl PyClient {
         O: for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>> + Send + 'static,
         C: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static,
     {
-        let verb = verb(op, convert);
         match &slf.get().mode {
-            Mode::Blocking(_) => slf.get().blocking(|blocking| blocking.run(slf, verb)),
-            Mode::Loop(handle) => handle.get().submit(slf.py(), verb),
+            Mode::Blocking(_) => slf.get().blocking(|blocking| blocking.run(slf, op, convert)),
+            Mode::Loop(handle) => handle.get().submit(slf.py(), op, convert),
         }
     }
 
@@ -164,8 +140,8 @@ impl PyClient {
         }
     }
 
-    fn schema_name(slf: &Bound<'_, Self>) -> String {
-        lock(&slf.get().schema).clone()
+    fn schema_name(slf: &Bound<'_, Self>) -> Arc<str> {
+        Arc::clone(&lock(&slf.get().schema))
     }
 
     /// The relation a verb's `name` or `schema.name` argument names, split at
@@ -215,12 +191,12 @@ fn sync_wait(seconds: f64) -> PyResult<Duration> {
 impl PyClient {
     #[getter]
     fn schema(slf: &Bound<'_, Self>) -> String {
-        Self::schema_name(slf)
+        lock(&slf.get().schema).to_string()
     }
 
     #[setter]
     fn set_schema(&self, schema: String) {
-        *lock(&self.schema) = schema;
+        *lock(&self.schema) = schema.into();
     }
 
     /// Request frames this connection has written — what a test asserts a
@@ -275,7 +251,11 @@ impl PyClient {
         let mode: WireConflictMode = mode.parse().map_err(|e: String| PyValueError::new_err(e))?;
         let (schema, rows) = (Arc::clone(batch.schema()), Arc::clone(&batch.batch));
         drop(batch);
-        Self::run(slf, single!(|c| c.push(target_id, &schema, &*rows, mode)), value)
+        Self::run(
+            slf,
+            single!(|c| c.push(target_id, &schema, Arc::clone(&rows), mode)),
+            value,
+        )
     }
 
     /// delete(target_id, schema, pks) — `pks` is a sequence where each element
@@ -353,7 +333,7 @@ impl PyClient {
     /// The rows keyed `pk` — a single-column key's value, or a compound key's
     /// tuple of column values in PK order — read where `scan` reads.
     fn seek(slf: &Bound<'_, Self>, table_id: u64, schema: PySchema, pk: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let keys = py_pks_to_column(&schema.rust, std::slice::from_ref(&pk))?.keys();
+        let keys = py_pks_to_column(&schema.rust, std::slice::from_ref(&pk))?.into_keys();
         Self::read(slf, table_id, schema, ReadSpec::all_rows(ReadBound::PkSet(keys)))
     }
 
@@ -653,8 +633,10 @@ impl PyTxn {
 
     fn __aenter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let entered = self.client.clone_ref(py);
-        let begin = verb(whole!(|c| c.txn_begin()?), move |_, ()| Ok(entered.into_any()));
-        self.client.get().on_loop()?.submit(py, begin)
+        self.client
+            .get()
+            .on_loop()?
+            .submit(py, whole!(|c| c.txn_begin()?), move |_, ()| Ok(entered.into_any()))
     }
 
     /// As `__exit__`, awaited.
@@ -672,10 +654,7 @@ impl PyTxn {
         if !clean && core.closing() {
             return core.settled(py, false.into_py_any(py)?);
         }
-        core.submit(
-            py,
-            verb(whole!(|c| end_txn(c, clean).await?), |py, ()| value(py, false)),
-        )
+        core.submit(py, whole!(|c| end_txn(c, clean).await?), |py, ()| value(py, false))
     }
 }
 
@@ -689,3 +668,20 @@ async fn end_txn(c: &mut GnitzClient, clean: bool) -> Result<(), ClientError> {
     }
     Ok(())
 }
+
+/// A verb's request: runs on the client and yields the verb's answer. Spelled
+/// out on [`PyClient::run`] itself, where a closure's signature is inferred.
+pub(crate) trait VerbOp<T>:
+    for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>> + Send + 'static
+{
+}
+
+impl<T, F> VerbOp<T> for F where
+    F: for<'a> FnOnce(&'a mut GnitzClient) -> BoxFut<'a, Result<Sent<T>, GnitzSqlError>> + Send + 'static
+{
+}
+
+/// What turns a verb's answer into its Python value.
+pub(crate) trait Convert<T>: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static {}
+
+impl<T, F> Convert<T> for F where F: FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>> + Send + 'static {}

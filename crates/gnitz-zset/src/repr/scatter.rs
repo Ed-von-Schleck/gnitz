@@ -13,10 +13,11 @@
 //! A merge source is a [`ColumnarSource`]: a row source that also carries the
 //! Z-set weight, which every N-way merge and these kernels read sources through.
 
+use std::cell::Cell;
 use std::ops::Range;
 
 use super::batch::{range_rows, write_to_batch, Batch, MemBatch};
-use super::batch_pool::PooledBuf;
+use super::batch_pool::{with_scratch, PooledBuf};
 use super::seek::ColPtr;
 use super::shard::Codebook;
 use super::string_heap::{
@@ -25,12 +26,23 @@ use super::string_heap::{
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{Heap, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START};
+use smallvec::{smallvec, SmallVec};
 
 /// One output row of a pick-driven copy: `(source, row, weight)` — the index of
 /// the source the row is read from, its row there, and the weight it is copied
 /// out at, which overrides that row's own weight. A merge emits one per surviving
 /// (PK, payload) group, at the group's net weight.
 pub(crate) type Pick = (u32, u32, i64);
+
+thread_local! {
+    /// Pick lists of materializes whose caller keeps none, reused across calls.
+    static PICKS: Cell<Vec<Pick>> = const { Cell::new(Vec::new()) };
+}
+
+/// Run `f` over the thread's pick scratch, emptied, as [`with_scratch`] runs it.
+pub(crate) fn with_picks<R>(f: impl FnOnce(&mut Vec<Pick>) -> R) -> R {
+    with_scratch(&PICKS, f)
+}
 
 /// Instantiate `$f` at the const width matching the region stride `$w`, which
 /// is also passed on. The literal width keeps the per-row copy a load/store
@@ -247,7 +259,7 @@ pub(crate) struct UnifiedSource<'a> {
 pub(crate) fn mem_batch_to_unified<'a>(
     mb: &MemBatch<'a>,
     schema: &SchemaDescriptor,
-    cols: &mut Vec<ColPtr>,
+    cols: &mut ColTable,
 ) -> UnifiedSource<'a> {
     let data_ptr = mb.data.as_ptr();
     let cols_off = cols.len();
@@ -282,7 +294,7 @@ pub(crate) trait ColumnarSource: RowSource {
     fn to_unified(
         &self,
         schema: &SchemaDescriptor,
-        cols: &mut Vec<ColPtr>,
+        cols: &mut ColTable,
         window: Range<usize>,
         decoded: &mut DecodedColumns,
     ) -> UnifiedSource<'_>;
@@ -313,7 +325,7 @@ impl<'a> ColumnarSource for MemBatch<'a> {
     fn to_unified(
         &self,
         schema: &SchemaDescriptor,
-        cols: &mut Vec<ColPtr>,
+        cols: &mut ColTable,
         _window: Range<usize>,
         _decoded: &mut DecodedColumns,
     ) -> UnifiedSource<'_> {
@@ -349,6 +361,10 @@ impl<'a> ColumnarSource for MemBatch<'a> {
 ///
 /// `cols` is the flat payload-`ColPtr` table the sources were built against;
 /// source `si`'s column `pi` is `cols[sources[si].cols_off + pi]`.
+///
+/// Out of line: inlined into [`UnifiedSet::write`], its per-row loops lose
+/// registers to the write's own state.
+#[inline(never)]
 fn scatter_unified_sources(
     sources: &[UnifiedSource<'_>],
     cols: &[ColPtr],
@@ -476,7 +492,7 @@ fn gather_unified_col<const N: usize>(
 /// shard column decodes only the blocks the picks land in: the kernel for picks
 /// sparse in their sources, where [`UnifiedSet`] would decode whole windows.
 pub(crate) fn gather_rows(sources: &[impl ColumnarSource], schema: &SchemaDescriptor, picks: &[Pick]) -> Batch {
-    let mut direct = Vec::new();
+    let mut direct = DirectCols::new();
     let hoist = picks.len() >= HOIST_PICKS_PER_SOURCE * (sources.len() + 1);
     write_to_batch(schema, picks.len(), 0, |w| {
         let fixed = all_direct(&mut direct, hoist, sources, |s| s.direct_fixed());
@@ -509,7 +525,7 @@ const HOIST_PICKS_PER_SOURCE: usize = 4;
 /// filled into `direct`; `None` where a source reads its region through a
 /// decode, or unless `hoist`.
 fn all_direct<'d, S, const K: usize>(
-    direct: &'d mut Vec<ColPtr>,
+    direct: &'d mut DirectCols,
     hoist: bool,
     sources: &[S],
     region: impl Fn(&S) -> Option<[ColPtr; K]>,
@@ -607,12 +623,23 @@ impl DecodedColumns {
     }
 }
 
+/// The flat payload-[`ColPtr`] table a [`UnifiedSet`] builds, inline up to 32
+/// columns across all sources. Nothing keeps a pointer into it: the scatter
+/// slices it at write time.
+pub(crate) type ColTable = SmallVec<[ColPtr; 32]>;
+
+/// A [`UnifiedSet`]'s per-source views, inline up to 4 sources.
+type SourceViews<'a> = SmallVec<[UnifiedSource<'a>; 4]>;
+
+/// [`gather_rows`]' hoisted per-source regions, inline up to 8.
+type DirectCols = SmallVec<[ColPtr; 8]>;
+
 /// [`scatter_unified_sources`]'s source side: the per-source [`UnifiedSource`]
 /// views, the flat payload-`ColPtr` table they index into, and the columns they
 /// decoded.
 pub(crate) struct UnifiedSet<'a> {
-    sources: Vec<UnifiedSource<'a>>,
-    cols: Vec<ColPtr>,
+    sources: SourceViews<'a>,
+    cols: ColTable,
     schema: SchemaDescriptor,
     /// Heap bytes and rows of the whole sources, windows notwithstanding.
     src_blob: usize,
@@ -623,43 +650,48 @@ pub(crate) struct UnifiedSet<'a> {
 }
 
 impl<'a> UnifiedSet<'a> {
-    /// Views over `sources` under `schema`, source `si` readable at rows in the
-    /// `si`-th window.
-    pub(crate) fn of<S: ColumnarSource>(
+    /// `f` applied to views over `sources` under `schema`, source `si` readable
+    /// at rows in the `si`-th window. The set is built in this frame and lent to
+    /// `f`, so its inline tables are never copied out by a return.
+    pub(crate) fn with<S: ColumnarSource, R>(
         sources: &'a [S],
         schema: &SchemaDescriptor,
         windows: impl IntoIterator<Item = Range<usize>>,
-    ) -> Self {
-        let mut cols = Vec::with_capacity(sources.len() * schema.num_payload_cols());
-        let mut decoded = DecodedColumns::default();
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         #[cfg(debug_assertions)]
         let (windows, each) = {
             let windows: Vec<Range<usize>> = windows.into_iter().collect();
-            assert_eq!(windows.len(), sources.len(), "UnifiedSet::of: one window per source");
+            assert_eq!(windows.len(), sources.len(), "UnifiedSet::with: one window per source");
             (windows.clone(), windows)
         };
         #[cfg(not(debug_assertions))]
         let each = windows;
-        let views = sources
-            .iter()
-            .zip(each)
-            .map(|(s, w)| s.to_unified(schema, &mut cols, w, &mut decoded))
-            .collect();
-        UnifiedSet {
-            sources: views,
-            cols,
+        let mut set = UnifiedSet {
+            sources: SourceViews::new(),
+            cols: ColTable::new(),
             schema: *schema,
             src_blob: sources.iter().map(|s| s.heap().plain_len()).sum(),
             src_rows: sources.iter().map(|s| s.row_count()).sum(),
-            _decoded: decoded,
+            _decoded: DecodedColumns::default(),
             #[cfg(debug_assertions)]
             windows,
+        };
+        set.cols.reserve(sources.len() * schema.num_payload_cols());
+        for (s, w) in sources.iter().zip(each) {
+            let view = s.to_unified(schema, &mut set.cols, w, &mut set._decoded);
+            set.sources.push(view);
         }
+        f(&mut set)
     }
 
-    /// [`of`](Self::of) with every source readable at every row.
-    pub(crate) fn whole<S: ColumnarSource>(sources: &'a [S], schema: &SchemaDescriptor) -> Self {
-        Self::of(sources, schema, sources.iter().map(|s| 0..s.row_count()))
+    /// [`with`](Self::with) with every source readable at every row.
+    pub(crate) fn with_whole<S: ColumnarSource, R>(
+        sources: &'a [S],
+        schema: &SchemaDescriptor,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        Self::with(sources, schema, sources.iter().map(|s| 0..s.row_count()), f)
     }
 
     /// Copy the rows `rows` names, in the order given, each at the weight its
@@ -702,25 +734,36 @@ impl<'a> UnifiedSet<'a> {
 /// [`UnifiedSet::materialize`] over whole `sources`, each heap carried whole
 /// when [`carried_dead`] prefers it for the rows `rows` keeps of that source.
 pub(crate) fn materialize_carrying(sources: &[MemBatch<'_>], schema: &SchemaDescriptor, rows: &[Pick]) -> Batch {
-    let mut set = UnifiedSet::whole(sources, schema);
+    UnifiedSet::with_whole(sources, schema, |set| carry_and_write(set, sources, schema, rows))
+}
+
+/// [`materialize_carrying`]'s body over the set built for it.
+fn carry_and_write(
+    set: &mut UnifiedSet<'_>,
+    sources: &[MemBatch<'_>],
+    schema: &SchemaDescriptor,
+    rows: &[Pick],
+) -> Batch {
     let mask = schema.string_payload_slots();
     if mask == 0 {
         return set.materialize(rows, None);
     }
-    let mut kept = vec![0usize; sources.len()];
+    let mut kept: SmallVec<[usize; 4]> = smallvec![0; sources.len()];
+    // Counted through one slice, so the loop does not re-resolve inline storage per row.
+    let counts = &mut kept[..];
     for &(si, _, _) in rows {
-        kept[si as usize] += 1;
+        counts[si as usize] += 1;
     }
     // A carried heap lands after the ones before it in a fresh, empty heap.
     let (mut heap_end, mut dead) = (0, 0);
     let (mut relocated_blob, mut relocated_rows, mut relocated_out) = (0, 0, 0);
     // The long bytes the picks keep of each source, summed on the first source
     // that leaves rows behind.
-    let mut kept_long: Option<Vec<usize>> = None;
+    let mut kept_long: Option<SmallVec<[usize; 4]>> = None;
     for (si, s) in sources.iter().enumerate() {
         let excluded = || {
             let kept_long = kept_long.get_or_insert_with(|| {
-                let mut v = vec![0usize; sources.len()];
+                let mut v: SmallVec<[usize; 4]> = smallvec![0; sources.len()];
                 for &(src, row, _) in rows {
                     v[src as usize] += row_long_bytes(&sources[src as usize], mask, row as usize);
                 }

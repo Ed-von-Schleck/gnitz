@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::ops::Range;
+use std::path::Path;
 use std::rc::Rc;
 
 use io_uring::types::FsyncFlags;
@@ -106,8 +107,10 @@ impl ShardIndex {
             ..Default::default()
         };
         write(&path, opts)
-            .and_then(|()| ShardEntry::open(&self.output_dir, seq, &self.schema, newest.unwrap_or(seq)))
-            .inspect_err(|_| self.unlink_shard(seq))
+            .and_then(|()| ShardEntry::open(&path, seq, &self.schema, newest.unwrap_or(seq)))
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&path);
+            })
     }
 
     /// The codebook `run` is coded under, adopted as the store's own: none in a
@@ -319,16 +322,18 @@ impl ShardIndex {
             }),
             FsyncFlags::DATASYNC,
         )?;
-        let mut dirs = BTreeSet::new();
         for (idx, w) in &mut work {
             if w.staged.is_some() {
                 // The rename publishes every shard the manifest names.
                 manifest::commit(&idx.output_dir)?;
                 idx.mark_published();
             }
-            dirs.extend(manifest::owed_dirs(&idx.output_dir, w.first_sync));
         }
-        // A rename is metadata: a full fsync, not fdatasync.
+        // After every rename. A rename is metadata: a full fsync, not fdatasync.
+        let dirs: BTreeSet<&Path> = work
+            .iter()
+            .flat_map(|(idx, w)| manifest::owed_dirs(&idx.output_dir, w.first_sync))
+            .collect();
         sync.sync_paths(&dirs, FsyncFlags::empty())?;
         // No durable manifest names a superseded shard any more.
         for (idx, w) in work {

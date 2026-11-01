@@ -596,3 +596,45 @@ fn row_filter_keeps_the_intersection_of_its_predicate_and_its_bound() {
         }
     }
 }
+
+/// `ranges` rewrites the runs it returned last time, whatever their count and
+/// whatever a caller did to them: each call on one long-lived filter answers
+/// as a fresh filter does, with and without a predicate.
+#[test]
+fn ranges_on_a_reused_filter_match_a_fresh_filters() {
+    let schema = schema_pk_ints(1, false);
+    type Pass = fn(usize) -> bool;
+    let inputs: [(usize, Pass); 8] = [
+        (MORSEL + 8, |_| true),
+        (MORSEL + 8, |_| false),
+        (MORSEL + 8, |row| row % 2 == 0),
+        // More runs than the filter keeps capacity for, then fewer.
+        (20_000, |row| row % 2 == 0),
+        (20_000, |row| row % 4 == 0),
+        (5, |_| true),
+        (0, |_| true),
+        (300, |row| row % 3 != 1),
+    ];
+    let fresh: [fn() -> crate::RowFilter; 2] = [
+        || {
+            let gt_0 = vec![
+                LogicalInstr::LoadCol { col: 1 },
+                LogicalInstr::LoadConst { val: 0, unsigned: false },
+                LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+            ];
+            filter_prog(&schema_pk_ints(1, false), gt_0, vec![])
+        },
+        || crate::RowFilter::for_read(&[], None, &schema_pk_ints(1, false)).unwrap(),
+    ];
+    for make in fresh {
+        let mut reused = make();
+        for &(n, pass) in &inputs {
+            let mb = make_n_col_view(&schema, n, |row, _| i64::from(pass(row)), |_, _| false);
+            let want = make().ranges(&mb).to_vec();
+            let got = reused.ranges(&mb);
+            assert_eq!(*got, want, "n = {n}");
+            // A caller may cut the runs in place; the next call must not see it.
+            got.iter_mut().for_each(|(s, e)| *e = *s);
+        }
+    }
+}

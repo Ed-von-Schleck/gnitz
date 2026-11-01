@@ -98,6 +98,24 @@ const _: () = {
     assert!(MAX_PK_COLUMNS * 16 <= MAX_PK_BYTES && MAX_PK_BYTES <= u8::MAX as usize);
 };
 
+const LEADING_PK: [u32; MAX_COLUMNS] = {
+    let mut a = [0u32; MAX_COLUMNS];
+    let mut i = 0;
+    while i < MAX_COLUMNS {
+        a[i] = i as u32;
+        i += 1;
+    }
+    a
+};
+
+/// `0, 1, …, n-1`: the PK list of a schema keyed by its first `n` columns.
+/// Past `MAX_COLUMNS` it is the first `MAX_COLUMNS`: a schema that long has more
+/// columns than [`SchemaDescriptor::try_new`] admits, so it is refused either
+/// way, and a PK past the PK limit still reaches `validate_pk_tuple`'s refusal.
+pub fn leading_pk(n: usize) -> &'static [u32] {
+    &LEADING_PK[..n.min(MAX_COLUMNS)]
+}
+
 /// Why a column list is no schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaRefusal {
@@ -315,9 +333,12 @@ impl SchemaDescriptor {
 
     /// This schema's PK columns alone, in PK-list order.
     pub fn pk_only(&self) -> SchemaDescriptor {
-        let cols: Vec<SchemaColumn> = self.pk_columns().copied().collect();
-        let pk: Vec<u32> = (0..cols.len() as u32).collect();
-        SchemaDescriptor::new(&cols, &pk)
+        let mut cols = [SchemaColumn::EMPTY; MAX_PK_COLUMNS];
+        let n = self.pk_count as usize;
+        for (d, s) in cols.iter_mut().zip(self.pk_columns()) {
+            *d = *s;
+        }
+        Self::try_new(&cols[..n], leading_pk(n)).expect("a valid schema's PK is a valid PK-only schema")
     }
 
     /// The column index of payload slot `pi`, which must be below `num_payload_cols()`.
@@ -395,13 +416,16 @@ impl SchemaDescriptor {
 
     /// Every payload column's locator, in slot order.
     pub fn payload_locators(&self) -> Vec<ColumnLocator> {
-        self.payload_columns()
-            .map(|(pi, c)| ColumnLocator::Payload {
-                slot: pi as u8,
-                size: c.size,
-                type_code: c.type_code,
-            })
-            .collect()
+        self.payload_locator_iter().collect()
+    }
+
+    /// [`Self::payload_locators`], uncollected.
+    pub(crate) fn payload_locator_iter(&self) -> impl Iterator<Item = ColumnLocator> + '_ {
+        self.payload_columns().map(|(pi, c)| ColumnLocator::Payload {
+            slot: pi as u8,
+            size: c.size,
+            type_code: c.type_code,
+        })
     }
 
     /// The PK column when the PK is exactly one column.

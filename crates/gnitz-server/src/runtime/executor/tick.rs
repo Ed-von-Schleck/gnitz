@@ -8,13 +8,14 @@ use std::time::{Duration, Instant};
 
 use super::ddl::{hold_tick_for_ddl, TICK_HOLD_FOR_DDL};
 use super::{CatalogLock, Shared};
+use crate::query::DagEngine;
 use crate::runtime::reactor::AckLease;
 use crate::runtime::sal::SalExcl;
 use crate::runtime::sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::WireFault;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 /// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next tick emit, once, as a full SAL
 /// would.
@@ -48,6 +49,8 @@ pub(super) struct Ticks {
     /// Tables with a pending delta, each with the row count feeding the
     /// coalesce threshold.
     pending: RefCell<FxHashMap<u64, usize>>,
+    /// Scratch for the tids a tick is emitted for, kept across ticks.
+    tids: RefCell<Vec<u64>>,
     /// The pending rows of one table that fire an auto-tick.
     /// `GNITZ_TICK_COALESCE_ROWS` lowers it, so tests reach it on small tables.
     coalesce_rows: usize,
@@ -71,19 +74,23 @@ impl Ticks {
             gate: AsyncRwLock::default(),
             patient_gap: Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_PATIENT_TICK_GAP_MS", 10)),
             pending: RefCell::new(FxHashMap::default()),
+            tids: RefCell::new(Vec::new()),
             coalesce_rows: gnitz_foundation::env::env_num("GNITZ_TICK_COALESCE_ROWS", 10_000),
             last_lsn: Cell::new(boot_seed),
         };
         (ticks, TickTriggers(rx))
     }
 
-    /// True when no relation of `sources` has a commit no emitted tick has
-    /// taken, so a read of a view whose source closure they are misses nothing.
+    /// True when no relation in the source closure of any of `targets` has a
+    /// commit no emitted tick has taken, so a read of them misses nothing.
     /// A commit is pending from its layout on, ahead of its ACK, so this errs
     /// towards false, which costs one extra drain.
-    pub(super) fn all_ticked(&self, sources: &FxHashSet<u64>) -> bool {
+    pub(super) fn all_ticked(&self, dag: &DagEngine, targets: impl IntoIterator<Item = u64>) -> bool {
         let pending = self.pending.borrow();
-        sources.iter().all(|s| !pending.contains_key(s))
+        pending.is_empty()
+            || targets
+                .into_iter()
+                .all(|t| dag.source_closure_of(t).iter().all(|s| !pending.contains_key(s)))
     }
 
     /// Drop a dropped relation's pending entry.
@@ -139,8 +146,12 @@ impl Shared {
         if TICK_EMIT_ERROR.take_once() {
             return Err("injected tick emit error".to_string().into());
         }
-        let tids: Vec<u64> = ticks.pending.borrow().keys().copied().collect();
-        let lease = self.dispatcher.emit_tick(&mut excl, &tids)?;
+        let lease = {
+            let mut tids = ticks.tids.borrow_mut();
+            tids.clear();
+            tids.extend(ticks.pending.borrow().keys().copied());
+            self.dispatcher.emit_tick(&mut excl, &tids)?
+        };
         ticks.pending.borrow_mut().clear();
         ticks.last_lsn.set(sal.watermark());
         Ok(Some(lease))
@@ -215,7 +226,7 @@ pub(super) async fn fresh_read_lock(
     drain_by: Instant,
 ) -> Result<ReadGuard<CatalogLock>, WireFault> {
     let g = shared.catalog_rwlock.read().await;
-    if shared.ticks.all_ticked(&shared.cat().dag.source_closure(targets)) {
+    if shared.ticks.all_ticked(&shared.cat().dag, targets) {
         return Ok(g);
     }
     drop(g);
@@ -236,3 +247,7 @@ pub(super) fn read_watermark(shared: &Shared, kind: RelationKind, _cut: &SalExcl
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/tick.rs"]
+mod tests;

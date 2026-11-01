@@ -1,7 +1,7 @@
 //! The client batch: a Z-set in the canonical region order, its builders, and
 //! its WAL-block encode and decode.
 
-use std::borrow::Cow;
+use std::sync::Arc;
 
 use gnitz_wire::{as_le_bytes, PkKeys, Regions, TypeCode};
 use gnitz_wire::{FIXED_REGION_BYTES, MAX_PK_COLUMNS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
@@ -102,6 +102,12 @@ impl PkColumn {
     /// These keys as a read's key set.
     pub fn keys(&self) -> PkKeys {
         PkKeys::from_keys(self.stride(), self.buf.chunks_exact(self.stride()))
+    }
+
+    /// [`Self::keys`], reusing the region as the list's storage when its keys
+    /// already strictly ascend.
+    pub fn into_keys(self) -> PkKeys {
+        PkKeys::from_vec(self.stride(), self.buf)
     }
 
     pub fn len(&self) -> usize {
@@ -208,15 +214,51 @@ pub struct ZSetBatch {
     pub blob: Vec<u8>,
 }
 
-impl From<ZSetBatch> for Cow<'_, ZSetBatch> {
+/// A batch handed to [`crate::GnitzClient::push`]: borrowed, or shared with
+/// its caller (a batch moved in is shared with no one). A transaction buffers a
+/// shared one without copying it and copies it only when the family it opened
+/// is extended while the caller still holds it.
+pub enum PushBatch<'a> {
+    Borrowed(&'a ZSetBatch),
+    Shared(Arc<ZSetBatch>),
+}
+
+impl From<ZSetBatch> for PushBatch<'_> {
     fn from(batch: ZSetBatch) -> Self {
-        Cow::Owned(batch)
+        PushBatch::Shared(Arc::new(batch))
     }
 }
 
-impl<'a> From<&'a ZSetBatch> for Cow<'a, ZSetBatch> {
+impl<'a> From<&'a ZSetBatch> for PushBatch<'a> {
     fn from(batch: &'a ZSetBatch) -> Self {
-        Cow::Borrowed(batch)
+        PushBatch::Borrowed(batch)
+    }
+}
+
+impl From<Arc<ZSetBatch>> for PushBatch<'_> {
+    fn from(batch: Arc<ZSetBatch>) -> Self {
+        PushBatch::Shared(batch)
+    }
+}
+
+impl std::ops::Deref for PushBatch<'_> {
+    type Target = ZSetBatch;
+
+    fn deref(&self) -> &ZSetBatch {
+        match self {
+            PushBatch::Borrowed(b) => b,
+            PushBatch::Shared(b) => b,
+        }
+    }
+}
+
+impl PushBatch<'_> {
+    /// The batch as a shareable handle: a borrowed one is copied here.
+    pub(crate) fn into_arc(self) -> Arc<ZSetBatch> {
+        match self {
+            PushBatch::Borrowed(b) => Arc::new(b.clone()),
+            PushBatch::Shared(b) => b,
+        }
     }
 }
 
@@ -835,18 +877,48 @@ impl ZSetBatch {
     }
 }
 
+/// The header and regions of the WAL block `data` under `schema`; its rows'
+/// contents are not checked.
+pub(crate) fn parse_wal_block<'a>(
+    data: &'a [u8],
+    schema: &Schema,
+) -> Result<gnitz_wire::wal::ParsedBlock<'a>, ProtocolError> {
+    gnitz_wire::wal::parse_block(data, schema.layout().row_width())
+        .map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))
+}
+
 /// Decode a WAL block under `schema`, appending its rows to `sink`. On error
 /// `sink` is as it was.
 pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
     let layout = schema.layout();
-    let gnitz_wire::wal::ParsedBlock { rows, fixed, heap, .. } = gnitz_wire::wal::parse_block(data, layout.row_width())
-        .map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?;
+    let gnitz_wire::wal::ParsedBlock { rows, fixed, heap, .. } = parse_wal_block(data, schema)?;
     let mut regions = Regions::new();
     for r in 0..layout.num_fixed_regions() {
         regions.push(&fixed[layout.region_start(r, rows)..][..rows * layout.region_stride(r)]);
     }
     regions.push(heap);
     append_regions(sink, &regions, schema, true)
+}
+
+/// Decode the WAL blocks `blocks` under `schema`, appending their rows to
+/// `sink` in iteration order. Every block's header is parsed and `sink` sized
+/// for all of them before any rows are copied, so a reply split over several
+/// blocks grows each region once. On a header error `sink` is as it was; on a
+/// payload error the blocks before the failing one stay appended.
+pub(crate) fn decode_wal_blocks_into<'a>(
+    sink: &mut ZSetBatch,
+    mut blocks: impl Iterator<Item = &'a [u8]> + Clone,
+    schema: &Schema,
+) -> Result<(), ProtocolError> {
+    let (mut rows, mut heap) = (0usize, 0usize);
+    for block in blocks.clone() {
+        let parsed = parse_wal_block(block, schema)?;
+        rows += parsed.rows;
+        heap += parsed.heap.len();
+    }
+    sink.reserve(rows);
+    sink.blob.reserve(heap);
+    blocks.try_for_each(|block| decode_wal_block_into(sink, block, schema))
 }
 
 /// Append to `sink`, a batch of `schema`, the rows of a canonical region list

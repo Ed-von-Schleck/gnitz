@@ -20,7 +20,7 @@ fn view(rows: &[(u64, i64, i64)]) -> RelationFixture {
 }
 
 /// `spec` over `TID`, replying in the layout its sink produces.
-fn run(r: &RelationRegistry, spec: ReadSpec) -> Result<Rc<Batch>, String> {
+fn run(r: &RelationRegistry, spec: ReadSpec) -> Result<ReadRows, String> {
     let layout = layout_of(&r.relation(TID).unwrap().schema(), &spec.sink);
     r.scan_spec(TID, spec, layout, None)
 }
@@ -231,8 +231,10 @@ fn keyed_reads_return_each_named_keys_whole_group() {
         let got = run(&r, ReadSpec::all_rows(bound.clone())).unwrap();
         assert_eq!(batch_rows(&got), want, "{bound:?}");
     }
-    let whole = run(&r, rows_spec(None, None)).unwrap();
-    assert!(Rc::ptr_eq(&whole, &r.relation(TID).unwrap().full_scan()));
+    let ReadRows::Shared(whole) = run(&r, rows_spec(None, None)).unwrap() else {
+        panic!("a whole read shares the cached snapshot");
+    };
+    assert!(std::rc::Rc::ptr_eq(&whole, &r.relation(TID).unwrap().full_scan()));
 }
 
 // ── Index walks ──────────────────────────────────────────────────────

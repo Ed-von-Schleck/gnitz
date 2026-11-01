@@ -245,25 +245,32 @@ impl CatalogEngine {
         self.caches.fk_by_parent.get(&parent_id).map_or(&[], Vec::as_slice)
     }
 
-    /// The tables a write to `table_id` locks exclusively: itself; its FK parents,
-    /// against a parent DELETE; and its FK children, against a child INSERT. One
-    /// that `deletes` rows takes the children of every table its deletes cascade
-    /// to as well.
-    pub(crate) fn write_lock_set(&self, table_id: u64, deletes: bool) -> Vec<u64> {
-        let mut set: Vec<u64> = self.fks_as_child(table_id).iter().map(|e| e.parent_tid).collect();
-        let mut deleted_from = vec![table_id];
-        let mut at = 0;
-        while let Some(&tid) = deleted_from.get(at) {
-            at += 1;
+    /// Append to `set` the tables a write to `table_id` locks exclusively:
+    /// itself; its FK parents, against a parent DELETE; and its FK children,
+    /// against a child INSERT. One that `deletes` rows takes the children of
+    /// every table its deletes cascade to as well. Appends without clearing,
+    /// in no particular order and with repeats.
+    pub(crate) fn write_lock_set_into(&self, set: &mut Vec<u64>, table_id: u64, deletes: bool) {
+        set.push(table_id);
+        set.extend(self.fks_as_child(table_id).iter().map(|e| e.parent_tid));
+        // The tables the deletes cascade to, beyond `table_id`, each once.
+        let mut cascaded: Vec<u64> = Vec::new();
+        let (mut tid, mut at) = (table_id, 0);
+        loop {
             for e in self.fks_as_parent(tid) {
                 set.push(e.child_tid);
-                if deletes && e.on_delete == FkAction::Cascade && !deleted_from.contains(&e.child_tid) {
-                    deleted_from.push(e.child_tid);
+                if deletes
+                    && e.on_delete == FkAction::Cascade
+                    && e.child_tid != table_id
+                    && !cascaded.contains(&e.child_tid)
+                {
+                    cascaded.push(e.child_tid);
                 }
             }
+            let Some(&next) = cascaded.get(at) else { break };
+            at += 1;
+            tid = next;
         }
-        set.push(table_id);
-        set
     }
 
     /// Every constraint on `tid` whose validation reads committed state.

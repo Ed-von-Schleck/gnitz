@@ -29,7 +29,7 @@ use gnitz_store::read::Probe;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::txn_frame::{decode_scan_multi, encode_items, FrameItem, ScanItem};
 use gnitz_wire::{append_frame, ControlHeader, PkKeys, ReadSpec};
-use gnitz_zset::repr::BatchBuilder;
+use gnitz_zset::repr::{Batch, BatchBuilder};
 use gnitz_zset::schema::encode_schema_block;
 
 #[test]

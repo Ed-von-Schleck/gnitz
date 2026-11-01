@@ -133,7 +133,7 @@ fn output_shape(chain: &ViewBundle) -> Vec<(String, bool, bool)> {
         .schema
         .columns()
         .iter()
-        .map(|c| (c.name.clone(), c.is_hidden, c.is_nullable))
+        .map(|c| (c.name.to_string(), c.is_hidden, c.is_nullable))
         .collect()
 }
 

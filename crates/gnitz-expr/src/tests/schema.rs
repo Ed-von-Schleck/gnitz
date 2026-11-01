@@ -1,7 +1,7 @@
 //! The descriptor's layout facts, checked against absolute answers.
 
 use crate::{
-    decode_schema_block, encode_schema_block, ColumnLocator, ReduceOutKey, ReduceOutSlot, SchemaColumn,
+    decode_schema_block, encode_schema_block, leading_pk, ColumnLocator, ReduceOutKey, ReduceOutSlot, SchemaColumn,
     SchemaDescriptor, SchemaRefusal,
 };
 use gnitz_wire::schema_block::SchemaBlockCol;
@@ -222,6 +222,39 @@ fn covers_pk_accepts_any_superset_of_the_pk_columns() {
     ] {
         assert_eq!(compound.covers_pk(cols), want, "{cols:?}");
     }
+}
+
+/// `pk_only` keeps the PK columns in PK-list order, renumbered `0..n`.
+#[test]
+fn pk_only_is_the_pk_columns_in_pk_list_order() {
+    let opt = SchemaColumn::new(TypeCode::I64, true);
+    let schema = SchemaDescriptor::new(
+        &[col(TypeCode::I32), opt, col(TypeCode::U16), col(TypeCode::U64)],
+        &[3, 0, 2],
+    );
+    assert_eq!(
+        schema.pk_only(),
+        SchemaDescriptor::new(
+            &[col(TypeCode::U64), col(TypeCode::I32), col(TypeCode::U16)],
+            &[0, 1, 2]
+        ),
+    );
+}
+
+/// `leading_pk` lists the leading columns, and a schema keyed by it is refused
+/// as any other, a PK longer than the PK limit included.
+#[test]
+fn leading_pk_keys_by_the_leading_columns() {
+    let k = col(TypeCode::U64);
+    assert_eq!(leading_pk(3), &[0, 1, 2]);
+    assert_eq!(leading_pk(MAX_COLUMNS + 1).len(), MAX_COLUMNS);
+    let wide = vec![k; MAX_COLUMNS + 1];
+    assert_eq!(
+        SchemaDescriptor::try_new(&wide, leading_pk(wide.len())),
+        Err(SchemaRefusal::TooManyColumns(MAX_COLUMNS + 1))
+    );
+    let n = gnitz_wire::MAX_PK_COLUMNS + 1;
+    assert!(SchemaDescriptor::try_new(&vec![k; n], leading_pk(n)).is_err());
 }
 
 /// `try_new` refuses a column count past `MAX_COLUMNS`, counted over the whole

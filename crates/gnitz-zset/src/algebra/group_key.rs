@@ -5,11 +5,13 @@
 //! the window) by it — a group is its output PK.
 
 use super::key_pack::{locate_key_col, pk_run, FoldCols, KeyPacker};
+use super::{vec_bytes, zeroed};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::{pk_width_dispatch, DerivedSchema, PkSortKey, SchemaColumn, SchemaDescriptor};
 use gnitz_expr::{ColumnLocator, ReduceOutKey, ReduceOutSlot};
 use gnitz_wire::{TypeCode, NARROW_PK_MAX_BYTES};
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
 
 /// A row's key as the PK bytes its consumer gives it: a group as the output PK a
@@ -308,40 +310,48 @@ impl GroupOutKey {
         &self.carried
     }
 
-    /// `batch`'s groups as row runs, where its rows already stand in ascending
-    /// output-PK order; `None` where they need not.
-    pub(crate) fn runs(&self, batch: &Batch) -> Option<Vec<(usize, usize)>> {
+    /// `batch`'s groups as row runs into `out`, where its rows already stand in
+    /// ascending output-PK order; false, `out` unspecified, where they need not.
+    pub(crate) fn runs_into(&self, batch: &Batch, out: &mut Vec<(usize, usize)>) -> bool {
         let mb = &batch.as_mem_batch();
         let n = mb.len();
         match &self.key {
             // One run, with no key to compute.
-            _ if n <= 1 || self.is_global() => Some(equal_runs(n, |_| ())),
+            _ if n <= 1 || self.is_global() => equal_runs(n, |_| (), out),
             // A consolidated batch is in PK order, so already grouped by any PK prefix.
-            &GroupKey::PkRange { at: 0, n: w } if batch.is_consolidated() => Some(pk_width_dispatch!(w, |K| {
-                equal_runs(n, |i| K::from_opk(mb.get_pk_range(i, 0, w)))
-            })),
-            _ => None,
+            &GroupKey::PkRange { at: 0, n: w } if batch.is_consolidated() => {
+                pk_width_dispatch!(w, |K| equal_runs(n, |i| K::from_opk(mb.get_pk_range(i, 0, w)), out))
+            }
+            _ => return false,
         }
+        true
     }
 
-    /// The groups of a batch [`Self::runs`] does not answer for, as one ordinal
-    /// per row: its rows hashed into groups while those are few for the rows,
-    /// else sorted.
-    pub(crate) fn numbered(&self, batch: &Batch) -> GroupOrdinals {
+    /// The groups of a batch [`Self::runs_into`] does not answer for, as one
+    /// ordinal per row, into `s.groups`, whatever `s` held: its rows hashed into
+    /// groups while those are few for the rows, else sorted.
+    pub(crate) fn numbered_into(&self, batch: &Batch, s: &mut GroupScratch) {
         let mb = &batch.as_mem_batch();
         let n = mb.len();
         // Too few rows do not pay for a hash table. A wide PK's identity is a
         // digest, which does not sort as the PK.
         let hashable = n >= HASH_MIN_ROWS && !matches!(self.key.form(mb), KeyForm::WidePk { .. });
-        if let Some(groups) = hashable
-            .then(|| self.with_identity(mb, &[(0, n)], Hashed { n }))
-            .flatten()
-        {
-            return groups;
+        let GroupScratch { groups, numbers, keys } = s;
+        if let GroupKey::Packed(p) = &self.key {
+            // Every row packed once, for the hash and for the sort it may fall back to.
+            p.keys_into(mb, keys);
+            let key = |i: usize| packed_key(keys, p.out_stride, i);
+            if !(hashable && Hashed { n, groups: &mut *groups, numbers }.run(key)) {
+                groups.fill_sorted(n, key, Some);
+            }
+            return;
+        }
+        if hashable && self.with_identity(mb, &[(0, n)], Hashed { n, groups: &mut *groups, numbers }) {
+            return;
         }
         match &self.key {
             &GroupKey::PkRange { at, n: w } => {
-                pk_width_dispatch!(w, |K| GroupOrdinals::sorted(
+                pk_width_dispatch!(w, |K| groups.fill_sorted(
                     n,
                     |i| K::from_opk(mb.get_pk_range(i, at, w)),
                     |_| None
@@ -352,16 +362,33 @@ impl GroupOutKey {
                 // batch too small to hash less than allocating them does.
                 let loc = ColumnLocator::Payload { slot, size, type_code };
                 match size <= 8 {
-                    true => GroupOrdinals::sorted(n, |i| loc.opk_image(mb, i) as u64, |_| None),
-                    false => GroupOrdinals::sorted(n, |i| loc.opk_image(mb, i), |_| None),
+                    true => groups.fill_sorted(n, |i| loc.opk_image(mb, i) as u64, |_| None),
+                    false => groups.fill_sorted(n, |i| loc.opk_image(mb, i), |_| None),
                 }
             }
-            GroupKey::Packed(p) => {
-                let (keys, w) = (p.keys(mb), p.out_stride);
-                GroupOrdinals::sorted(n, |i| gnitz_wire::widen_pk_be(&keys[i * w..(i + 1) * w]), Some)
-            }
-            GroupKey::Fold(f) => GroupOrdinals::sorted(n, |i| f.key_row(mb, i), Some),
+            GroupKey::Fold(f) => groups.fill_sorted(n, |i| f.key_row(mb, i), Some),
+            GroupKey::Packed(_) => unreachable!("a packed key is numbered above"),
         }
+    }
+}
+
+/// The buffers [`GroupOutKey::numbered_into`] numbers a batch's groups with,
+/// kept by a caller that numbers batch after batch.
+#[derive(Default)]
+pub(crate) struct GroupScratch {
+    /// The last numbering.
+    pub(crate) groups: GroupOrdinals,
+    numbers: GroupNumbers,
+    /// Every row's packed key, for a packed group key.
+    keys: Vec<u8>,
+}
+
+impl GroupScratch {
+    /// The bytes this holds allocated.
+    pub(crate) fn held_bytes(&self) -> usize {
+        let GroupOrdinals { ord, first, by_pk, ids } = &self.groups;
+        let map = self.numbers.by_identity.capacity() * size_of::<(u128, u32)>();
+        vec_bytes(ord) + vec_bytes(first) + vec_bytes(by_pk) + vec_bytes(ids) + vec_bytes(&self.keys) + map
     }
 }
 
@@ -376,21 +403,28 @@ fn packed_identity<L: IdentityLoop>(p: &KeyPacker, mb: &MemBatch, rows: &[(usize
     let few = |k: usize| k * PACK_ROWS_MIN_SPARSITY <= mb.len();
     let every = rows == [(0, mb.len())];
     if every || p.packs_without_hashing() && !(few(rows.len()) && few(crate::repr::range_rows(rows))) {
-        let (keys, w) = (p.keys(mb), p.out_stride);
-        return body.run(|r| gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w]));
+        let keys = p.keys(mb);
+        return body.run(|r| packed_key(&keys, p.out_stride, r));
     }
     body.run(|r| p.narrow_image(mb, r))
+}
+
+/// Row `r`'s identity among `keys`, every row's packed key of width `w`.
+#[inline(always)]
+fn packed_key(keys: &[u8], w: usize, r: usize) -> u128 {
+    gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w])
 }
 
 /// Fewest rows per row read at which [`packed_identity`] packs a key that hashes
 /// no slot a row at a time, rather than every row.
 const PACK_ROWS_MIN_SPARSITY: usize = 16;
 
-/// The runs of equal adjacent keys over rows `0..n`, each as `[start, end)`.
-fn equal_runs<K: PartialEq>(n: usize, key: impl Fn(usize) -> K) -> Vec<(usize, usize)> {
-    let mut runs = Vec::new();
+/// The runs of equal adjacent keys over rows `0..n`, each as `[start, end)`,
+/// into `runs`.
+fn equal_runs<K: PartialEq>(n: usize, key: impl Fn(usize) -> K, runs: &mut Vec<(usize, usize)>) {
+    runs.clear();
     if n == 0 {
-        return runs;
+        return;
     }
     let (mut start, mut prev) = (0, key(0));
     for i in 1..n {
@@ -402,7 +436,6 @@ fn equal_runs<K: PartialEq>(n: usize, key: impl Fn(usize) -> K) -> Vec<(usize, u
         prev = k;
     }
     runs.push((start, n));
-    runs
 }
 
 /// Fewest rows per group at which hashing a batch's rows into groups costs
@@ -415,6 +448,7 @@ const HASH_MIN_ROWS: usize = 16;
 
 /// A batch's groups as one ordinal per row: no row moves, and a fold over the
 /// groups is one pass per column.
+#[derive(Default)]
 pub(crate) struct GroupOrdinals {
     /// Row → group ordinal.
     pub(crate) ord: Vec<u32>,
@@ -433,32 +467,41 @@ impl GroupOrdinals {
         self.first.len()
     }
 
+    /// The buffers, emptied, taken out of `self`. A fill destructures them into
+    /// locals rather than writing `self`'s fields: with the four in one struct,
+    /// a call handed one of them makes the loop reload the others' lengths.
+    fn take_cleared(&mut self) -> Self {
+        let mut taken = std::mem::take(self);
+        taken.ord.clear();
+        taken.first.clear();
+        taken.by_pk.clear();
+        taken.ids.clear();
+        taken
+    }
+
     /// Run `g` is group `g`.
-    pub(crate) fn of_runs(runs: &[(usize, usize)]) -> Self {
-        let mut ord = Vec::with_capacity(runs.last().map_or(0, |&(_, end)| end));
-        let mut first = Vec::with_capacity(runs.len());
+    pub(crate) fn fill_runs(&mut self, runs: &[(usize, usize)]) {
+        let GroupOrdinals { mut ord, mut first, mut by_pk, ids } = self.take_cleared();
+        ord.reserve(runs.last().map_or(0, |&(_, end)| end));
+        first.reserve(runs.len());
         for (g, &(start, end)) in runs.iter().enumerate() {
             first.push(start as u32);
             ord.extend(std::iter::repeat_n(g as u32, end - start));
         }
-        GroupOrdinals {
-            ord,
-            by_pk: (0..first.len() as u32).collect(),
-            first,
-            ids: Vec::new(),
-        }
+        by_pk.extend(0..runs.len() as u32);
+        *self = GroupOrdinals { ord, first, by_pk, ids };
     }
 
     /// Groups numbered in ascending `key` order, found by sorting the rows; `id`
     /// maps a group's key to the identity kept for it, `None` for every key
     /// where none is kept.
-    fn sorted<K: Ord + Copy>(n: usize, key: impl Fn(usize) -> K, id: impl Fn(K) -> Option<u128>) -> Self {
+    fn fill_sorted<K: Ord + Copy>(&mut self, n: usize, key: impl Fn(usize) -> K, id: impl Fn(K) -> Option<u128>) {
+        let GroupOrdinals { mut ord, mut first, mut by_pk, mut ids } = self.take_cleared();
         // The row index breaks ties, so a group's first row is its first in the batch.
-        let mut pairs: Vec<(K, u32)> = (0..n).map(|i| (key(i), i as u32)).collect();
+        // A batch too small to hash sorts on the stack.
+        let mut pairs: SmallVec<[(K, u32); HASH_MIN_ROWS]> = (0..n).map(|i| (key(i), i as u32)).collect();
         pairs.sort_unstable();
-        let mut ord = vec![0u32; n];
-        let mut first: Vec<u32> = Vec::new();
-        let mut ids: Vec<u128> = Vec::new();
+        zeroed(&mut ord, n);
         for (p, (k, row)) in pairs.iter().enumerate() {
             if p == 0 || *k != pairs[p - 1].0 {
                 first.push(*row);
@@ -466,12 +509,8 @@ impl GroupOrdinals {
             }
             ord[*row as usize] = (first.len() - 1) as u32;
         }
-        GroupOrdinals {
-            ord,
-            by_pk: (0..first.len() as u32).collect(),
-            first,
-            ids,
-        }
+        by_pk.extend(0..first.len() as u32);
+        *self = GroupOrdinals { ord, first, by_pk, ids };
     }
 }
 
@@ -497,25 +536,40 @@ impl GroupNumbers {
         self.last = Some((identity, g));
         Ok(g)
     }
+
+    /// Forget every identity, the previous row's included.
+    fn clear(&mut self) {
+        self.by_identity.clear();
+        self.last = None;
+    }
 }
 
-/// Groups numbered in discovery order, found by hashing each row's identity.
-struct Hashed {
+/// Groups numbered in discovery order, found by hashing each row's identity,
+/// into `groups`.
+struct Hashed<'s> {
     n: usize,
+    groups: &'s mut GroupOrdinals,
+    numbers: &'s mut GroupNumbers,
 }
 
-impl IdentityLoop for Hashed {
-    /// `None` once the batch holds more groups than
+impl IdentityLoop for Hashed<'_> {
+    /// False, `groups` unspecified, once the batch holds more groups than
     /// [`HASH_MIN_ROWS_PER_GROUP`] admits for its rows.
-    type Out = Option<GroupOrdinals>;
+    type Out = bool;
 
     fn run(self, identity: impl Fn(usize) -> u128) -> Self::Out {
-        let limit = self.n / HASH_MIN_ROWS_PER_GROUP;
-        let mut numbers = GroupNumbers::default();
-        let mut ord: Vec<u32> = Vec::with_capacity(self.n);
-        let mut first: Vec<u32> = Vec::new();
-        let mut ids: Vec<u128> = Vec::new();
-        for row in 0..self.n {
+        let Hashed { n, groups: out, numbers: kept } = self;
+        let limit = n / HASH_MIN_ROWS_PER_GROUP;
+        let GroupOrdinals { mut ord, mut first, mut by_pk, mut ids } = out.take_cleared();
+        let mut numbers = std::mem::take(kept);
+        numbers.clear();
+        // Room for every group the hash admits, and the one it gives up at.
+        ord.reserve(n);
+        first.reserve(limit + 1);
+        ids.reserve(limit + 1);
+        numbers.by_identity.reserve(limit + 1);
+        let mut fits = true;
+        for row in 0..n {
             let id = identity(row);
             let new = || {
                 let g = first.len();
@@ -523,17 +577,22 @@ impl IdentityLoop for Hashed {
                 ids.push(id);
                 (g < limit).then_some(g as u32).ok_or(())
             };
-            ord.push(numbers.ordinal(id, new).ok()?);
+            match numbers.ordinal(id, new) {
+                Ok(g) => ord.push(g),
+                Err(()) => {
+                    fits = false;
+                    break;
+                }
+            }
         }
-        // Taken in discovery order, which is often PK order already.
-        let mut by_pk: Vec<(u128, u32)> = ids.iter().copied().zip(0..).collect();
-        by_pk.sort_unstable();
-        Some(GroupOrdinals {
-            ord,
-            first,
-            by_pk: by_pk.into_iter().map(|(_, g)| g).collect(),
-            ids,
-        })
+        if fits {
+            // The identities are distinct and sort as the output PK. Taken in
+            // discovery order, which is often PK order already.
+            by_pk.extend(0..first.len() as u32);
+            by_pk.sort_unstable_by_key(|&g| ids[g as usize]);
+        }
+        (*out, *kept) = (GroupOrdinals { ord, first, by_pk, ids }, numbers);
+        fits
     }
 }
 

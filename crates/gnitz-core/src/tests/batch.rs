@@ -664,9 +664,7 @@ fn filter_over_the_region_path() {
         .resolve_filter(schema.layout())
         .expect("predicate resolves against the client schema");
 
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    ev.ranges(&batch, &mut ranges);
-    assert_eq!(ranges, vec![(0, 1)]);
+    assert_eq!(ev.ranges(&batch), [(0, 1)]);
 }
 
 #[test]

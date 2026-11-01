@@ -5,9 +5,9 @@
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
-use crate::batch::decode_wal_block_into;
+use crate::batch::decode_wal_blocks_into;
 use crate::client::GnitzClient;
-use crate::connection::{DeltaCursor, ScanReply, SubId, Target};
+use crate::connection::{DeltaCursor, RawBlock, ScanReply, SubId, Target};
 use crate::error::ClientError;
 use crate::host::{promise_returning, Promise, Sent};
 use crate::mirror::PollOutcome;
@@ -152,9 +152,7 @@ impl GnitzClient {
             let taken = synced.clone().and_then(|()| session.take_pushed(sub));
             let result = taken.and_then(|(blocks, cursor)| {
                 let mut batch = ZSetBatch::new(schema);
-                for block in blocks {
-                    decode_wal_block_into(&mut batch, block.block(), schema)?;
-                }
+                decode_wal_blocks_into(&mut batch, blocks.iter().map(RawBlock::block), schema)?;
                 let schema = Arc::clone(schema);
                 Ok((ScanReply { schema, batch, lsn: None }, cursor))
             });

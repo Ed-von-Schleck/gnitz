@@ -112,13 +112,14 @@ impl LogicalProgram {
         out_schema: &SchemaDescriptor,
     ) -> Result<(ColMoves, Vec<Emit>), ExprValidateErr> {
         use ExprValidateErr as E;
-        let out_slots = out_schema.payload_locators();
-        if self.sinks().len() != out_slots.len() {
+        let num_payload_cols = out_schema.num_payload_cols();
+        if self.sinks().len() != num_payload_cols {
             return Err(E::OutputSlotCountMismatch {
                 sinks: self.sinks().len(),
-                num_payload_cols: out_slots.len(),
+                num_payload_cols,
             });
         }
+        let out_slots = out_schema.payload_locator_iter();
         let (mut copies, mut emits) = (Vec::new(), Vec::new());
         for (slot, (sink, out_loc)) in self.sinks().iter().zip(out_slots).enumerate() {
             let (out, type_code) = (slot as u32, out_loc.type_code());

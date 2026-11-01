@@ -59,6 +59,7 @@ use sqlparser::ast::{
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// A view body's SELECT list over the relation `rel` builds, with the item each
 /// ORDER BY key sorts on. Window calls in the list, in the ORDER BY keys and in
@@ -144,7 +145,7 @@ impl Windows {
         let name = e
             .as_col()
             .and_then(|id| leaf.source_name(id))
-            .unwrap_or_else(|| format!("_w{}", self.w.len()));
+            .unwrap_or_else(|| format!("_w{}", self.w.len()).into());
         let out = HirCol::new(ids.next(), ColumnDef::new(name, ty, nullable));
         let id = out.id;
         self.w.push(ProjEntry { expr: e.clone(), out });
@@ -378,7 +379,7 @@ impl<L: ItemLeaf> LeafBinder<ColId> for WindowLeaf<'_, L> {
 }
 
 impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
-    fn source_name(&self, id: ColId) -> Option<String> {
+    fn source_name(&self, id: ColId) -> Option<Arc<str>> {
         self.inner.source_name(id)
     }
     fn project(&self, source: Rc<RelExpr>, items: Vec<ProjEntry>) -> Result<Rc<RelExpr>, GnitzSqlError> {
@@ -538,7 +539,7 @@ impl Read {
     fn of(ids: &ColIdGen, input: &Rc<RelExpr>) -> Read {
         let in_cols = input.cols();
         let rel = RelExpr::alias(ids, Rc::clone(input), in_cols.iter().map(|c| c.def.clone()));
-        let cols = rel.cols();
+        let cols = rel.cols().into_owned();
         let at = in_cols.iter().map(|c| c.id).zip(cols.iter().map(|c| c.id)).collect();
         Read { rel, cols, at }
     }

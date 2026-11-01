@@ -45,7 +45,7 @@ pub(crate) fn reject_float_keys<'a>(
     role: &str,
 ) -> Result<(), GnitzSqlError> {
     cols.into_iter()
-        .try_for_each(|c| reject_float_key(c.ty.tc, (!c.is_hidden).then_some(c.name.as_str()), role))
+        .try_for_each(|c| reject_float_key(c.ty.tc, (!c.is_hidden).then_some(&*c.name), role))
 }
 
 /// What a surface requires of the relation a name resolved to, and how a

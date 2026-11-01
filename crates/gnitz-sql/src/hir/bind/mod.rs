@@ -50,10 +50,12 @@ use sqlparser::ast::{
     SetQuantifier, TableAliasColumnDef, TableFactor,
 };
 use sqlparser::tokenizer::Span;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 use subquery::{SubqueryKind, SubqueryRef};
 
 /// Bind a query's CTEs ahead of its body. Each binds to one subtree registered
@@ -136,12 +138,9 @@ pub(super) fn apply_positional_aliases<'a, 'b>(
         )));
     }
     for (col, alias) in visible.iter_mut().zip(aliases) {
-        col.name = alias.value.clone();
+        col.name = Arc::from(alias.value.as_str());
     }
-    reject_duplicate_names(
-        visible.iter().map(|c| c.name.as_str()),
-        &format!("{ctx} column aliases"),
-    )
+    reject_duplicate_names(visible.iter().map(|c| &*c.name), &format!("{ctx} column aliases"))
 }
 
 /// The output column `e` names, if it names one. Only an unqualified name can:
@@ -189,7 +188,7 @@ fn collapse_identity(rel: Rc<RelExpr>) -> (Rc<RelExpr>, Vec<ColumnDef>) {
             return (Rc::clone(input), defs);
         }
     }
-    let defs = rel.cols().into_iter().map(|c| c.def).collect();
+    let defs = rel.cols().iter().map(|c| c.def.clone()).collect();
     (rel, defs)
 }
 
@@ -242,6 +241,7 @@ pub(crate) struct BoundRef {
     pub(crate) alias: String,
     /// The relation's visible column names, which the body reads it by; `None`
     /// where the reference renames them with a column alias list of its own.
+    /// Also `None` on the ad-hoc surface, which reads only `tid` and `name`.
     pub(crate) columns: Option<Vec<String>>,
 }
 
@@ -250,12 +250,14 @@ pub(crate) struct BoundRef {
 /// names in FROM resolves here.
 fn resolve_table_ref(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<(Rc<RelExpr>, Vec<HirCol>), GnitzSqlError> {
     let rel = resolve_relation(cx, tref)?;
-    let mut cols = rel.cols();
-    apply_alias_columns(
-        tref.columns,
-        cols.iter_mut().map(|c| &mut c.def),
-        &format!("table '{}'", tref.alias),
-    )?;
+    let mut cols = rel.cols().into_owned();
+    if !tref.columns.is_empty() {
+        apply_alias_columns(
+            tref.columns,
+            cols.iter_mut().map(|c| &mut c.def),
+            &format!("table '{}'", tref.alias),
+        )?;
+    }
     Ok((rel, cols))
 }
 
@@ -279,10 +281,8 @@ fn resolve_relation(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<Rc<RelExpr>,
         Surface::View(v) => (ClassWant::ViewSource, v.stmt),
     };
     require_class(&rel, name, want, op)?;
-    let columns = tref
-        .columns
-        .is_empty()
-        .then(|| rel.schema.visible_columns().map(|(_, c)| c.name.clone()).collect());
+    let columns = (cx.surface.is_view() && tref.columns.is_empty())
+        .then(|| rel.schema.visible_columns().map(|(_, c)| c.name.to_string()).collect());
     cx.refs.borrow_mut().push(BoundRef {
         tid: rel.tid,
         name: name.to_string(),
@@ -423,7 +423,7 @@ fn resolve_table_factor(
         reject_if(sample.is_some(), &ctx, "TABLESAMPLE")?;
         let body = reject_query_envelope_body(subquery, &ctx)?;
         let subtree = bind_body(cx, body)?;
-        let mut cols = subtree.cols();
+        let mut cols = subtree.cols().into_owned();
         apply_alias_columns(&alias.columns, cols.iter_mut().map(|c| &mut c.def), &ctx)?;
         return Ok((subtree, alias.name.value.clone(), cols));
     }
@@ -462,7 +462,7 @@ pub(super) fn bind_select(
     let (mut left, mut scope) = match (select.from.first(), surface) {
         (Some(first), _) => {
             let (rel, alias, cols) = resolve_table_factor(cx, &first.relation)?;
-            (rel, JoinScope::single(&alias, cols))
+            (rel, JoinScope::single(alias, cols))
         }
         // No relation is in scope, so every written name is unresolvable.
         (None, Surface::Adhoc) => (Rc::new(RelExpr::Unit), JoinScope::default()),
@@ -512,7 +512,10 @@ pub(super) fn bind_select(
     // outranks a grouped shape, and either sits above a join, which lowering
     // cuts. The projection is bound in SELECT order (`place_pk_front` is
     // physical, applied at lowering).
-    let ctx = &format!("{stmt} projection");
+    let ctx: &str = &match surface {
+        Surface::Adhoc => Cow::Borrowed("SELECT projection"),
+        Surface::View(v) => Cow::Owned(format!("{} projection", v.stmt)),
+    };
     if let Some(where_expr) = &select.selection {
         let preds = bind_conjuncts(where_expr, &leaf).map_err(|e| e.in_clause("WHERE"))?;
         left = RelExpr::filter(left, preds)?;
@@ -573,7 +576,7 @@ fn reject_unselected_distinct_keys(projected: &RelExpr, placed: &[usize], ctx: &
 /// binding.
 trait ItemLeaf: LeafBinder<ColId> {
     /// The name a copied column is selected under: its visible source column's.
-    fn source_name(&self, id: ColId) -> Option<String>;
+    fn source_name(&self, id: ColId) -> Option<Arc<str>>;
     /// The projection of `items` over `source`. The subquery-binding leaf joins in
     /// the subqueries its items and `source`'s filter read.
     fn project(&self, source: Rc<RelExpr>, items: Vec<ProjEntry>) -> Result<Rc<RelExpr>, GnitzSqlError> {
@@ -621,7 +624,7 @@ fn bind_projection<L: ItemLeaf>(
     // A projection naming nothing of its own (`*`, `* EXCEPT/EXCLUDE`) is exempt: a
     // duplicate among the source's own names rides through positionally.
     if !wildcard::is_name_preserving_wildcard_projection(projection) {
-        reject_duplicate_names(items.iter().map(|e| e.out.def.name.as_str()), ctx)?;
+        reject_duplicate_names(items.iter().map(|e| &*e.out.def.name), ctx)?;
     }
     Ok(items)
 }
@@ -666,8 +669,9 @@ fn bind_scalar_item<L: ItemLeaf>(
     };
     let (ty, nullable) = bound.declared(leaf);
     let name = alias
+        .map(Arc::from)
         .or(src_name)
-        .unwrap_or_else(|| format!("_{}{idx}", stem.as_deref().unwrap_or("expr")));
+        .unwrap_or_else(|| format!("_{}{idx}", stem.as_deref().unwrap_or("expr")).into());
     let def = ColumnDef::new(name, ty, nullable);
     Ok(ProjEntry {
         expr: bound,
@@ -714,7 +718,7 @@ impl<'a> ScopeLeaf<'a> {
 }
 
 impl ItemLeaf for ScopeLeaf<'_> {
-    fn source_name(&self, id: ColId) -> Option<String> {
+    fn source_name(&self, id: ColId) -> Option<Arc<str>> {
         col_by_id(&self.scope.combined, id)
             .filter(|c| !c.def.is_hidden)
             .map(|c| c.def.name.clone())
@@ -771,11 +775,14 @@ struct JoinScope {
 }
 
 impl JoinScope {
-    /// The scope of one relation — an empty scope plus one `push`.
-    fn single(alias: &str, cols: Vec<HirCol>) -> Self {
-        let mut scope = JoinScope::default();
-        scope.push(alias, cols).expect("an empty scope takes any alias");
-        scope
+    /// The scope of one relation.
+    fn single(alias: String, cols: Vec<HirCol>) -> Self {
+        let n = cols.len();
+        JoinScope {
+            combined: cols,
+            merged: Vec::new(),
+            relations: vec![(alias, 0..n)],
+        }
     }
 
     /// The columns still answering an unqualified name and appearing in `*`.
@@ -795,7 +802,7 @@ impl JoinScope {
             if has_visible_column(rcols.iter().map(|r| &r.def), &c.def.name)
                 && !names.iter().any(|n| n.eq_ignore_ascii_case(&c.def.name))
             {
-                names.push(c.def.name.clone());
+                names.push(c.def.name.to_string());
             }
         }
         names
@@ -887,7 +894,7 @@ pub(super) fn bind_returning(
     schema: &Schema,
     alias: &str,
 ) -> Result<(Vec<HirCol>, Vec<ProjEntry>), GnitzSqlError> {
-    let scope = JoinScope::single(alias, schema_cols(ids, schema));
+    let scope = JoinScope::single(alias.to_string(), schema_cols(ids, schema));
     let leaf = ScopeLeaf::plain(&scope);
     let items = bind_projection(projection, &leaf, ids, "SELECT")?;
     Ok((scope.combined, items))

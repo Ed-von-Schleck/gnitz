@@ -10,7 +10,7 @@ use std::cell::Cell;
 use gnitz_expr::{BatchView, ColumnLocator};
 use gnitz_wire::{zip_cells, RowSource, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS};
 
-use crate::repr::range_rows;
+use crate::repr::{range_rows, with_scratch};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 
 /// Filler for a fixed locator array's unused slots; nothing reads it.
@@ -140,15 +140,11 @@ impl FoldCols {
     /// stack arm stays small enough to inline into its callers.
     #[inline(never)]
     fn key_row_scratch<R: RowSource>(&self, src: &R, row: usize, null_word: u64) -> u128 {
-        FOLD_SCRATCH.with(|cell| {
-            let mut buf = cell.take();
-            buf.clear();
+        with_scratch(&FOLD_SCRATCH, |buf| {
             for &loc in &self.locs {
-                push_col_key(&mut buf, src, row, null_word, loc);
+                push_col_key(buf, src, row, null_word, loc);
             }
-            let key = gnitz_wire::checksum_128(&buf);
-            cell.set(buf);
-            key
+            gnitz_wire::checksum_128(buf)
         })
     }
 }
@@ -284,10 +280,18 @@ impl KeyPacker {
 
     /// Every row's packed key, `out_stride` bytes each.
     pub(crate) fn keys<B: BatchView>(&self, batch: &B) -> Vec<u8> {
-        let n = batch.row_count();
-        let mut keys = vec![0u8; n * self.out_stride];
-        self.pack_rows(&mut keys, self.out_stride, batch, &[(0, n)]);
+        let mut keys = Vec::new();
+        self.keys_into(batch, &mut keys);
         keys
+    }
+
+    /// [`Self::keys`] into `out`, whatever it held. Only growth is zeroed:
+    /// [`Self::pack_rows`] writes every byte of each key.
+    pub(crate) fn keys_into<B: BatchView>(&self, batch: &B, out: &mut Vec<u8>) {
+        let n = batch.row_count();
+        out.truncate(n * self.out_stride);
+        out.resize(n * self.out_stride, 0);
+        self.pack_rows(out, self.out_stride, batch, &[(0, n)]);
     }
 
     /// The reindex Map's output schema: [`Self::key_columns`], then

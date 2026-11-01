@@ -5,6 +5,7 @@ use crate::error::{unsupported_clause, GnitzSqlError};
 use crate::rules::has_visible_column;
 use gnitz_wire::ColumnDef;
 use sqlparser::ast::{ExcludeSelectItem, ObjectName, RenameSelectItem, SelectItem, WildcardAdditionalOptions};
+use std::sync::Arc;
 
 /// One wildcard's modifiers, classified. The **only** place a
 /// `WildcardAdditionalOptions` is read, so a field a future sqlparser adds
@@ -124,7 +125,7 @@ where
         .map(|(i, c)| {
             let mut out = c.clone();
             if let Some(new) = output_name(&out.name) {
-                out.name = new.to_string();
+                out.name = Arc::from(new);
             }
             (i, out)
         })

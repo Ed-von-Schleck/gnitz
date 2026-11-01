@@ -199,12 +199,13 @@ pub(crate) fn lower(
     // A top-N carries its input's columns key first: the SELECT list is a
     // projection over it. A window body always ends in a projection.
     let rel = match rel.as_ref() {
-        RelExpr::Ordered { .. } => RelExpr::project(Rc::clone(&rel), ProjEntry::passthroughs(rel.cols())),
+        RelExpr::Ordered { .. } => RelExpr::project(Rc::clone(&rel), ProjEntry::passthroughs(rel.cols().into_owned())),
         _ => rel,
     };
     let top = lower_body(&mut chain, &rel)?;
     let visible = names.iter().filter(|c| !c.def.is_hidden).map(|c| c.id);
-    let (mut schema, moved_to) = top.out.schema_in_order(visible)?;
+    let (schema, moved_to) = top.out.schema_in_order(visible)?;
+    let mut schema = Arc::unwrap_or_clone(schema);
     for (slot, id) in top.out.layout.iter().enumerate() {
         if let Some(c) = id.and_then(|id| col_by_id(names, id)) {
             schema.rename_column(moved_to[slot] as usize, c.def.name.clone());
@@ -338,7 +339,7 @@ fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
         RelExpr::Distinct { .. } | RelExpr::SetOp { .. } | RelExpr::Ordered { .. } => Rc::clone(subtree),
         // The HIR spelling of `SELECT <live cols> FROM <subtree>`.
         _ => {
-            let items = ProjEntry::passthroughs(subtree.cols().into_iter().filter(|c| live.contains(&c.id)));
+            let items = ProjEntry::passthroughs(subtree.cols().iter().filter(|c| live.contains(&c.id)).cloned());
             RelExpr::project(Rc::clone(subtree), items)
         }
     }

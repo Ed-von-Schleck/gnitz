@@ -5,10 +5,13 @@
 //! skeleton row comes out as that one coarse row: a split drain sets its key
 //! aside for hydration, and a raw drain refuses it.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::ops::{ControlFlow, Range};
 
 use crate::repr::batch::{Batch, MemBatch};
+use crate::repr::batch_pool::{recycle, take, vec_bytes};
 use crate::repr::loser_tree::{LoserTree, Player};
 use crate::repr::merge::{self, MergeOrder};
 use crate::repr::scatter::{ColumnarSource, Pick};
@@ -84,8 +87,8 @@ pub struct ReadCursor {
     /// count or a range seek's clamp for the cursor's life. A reposition may
     /// leave `start` past `end`, which leaves the walk empty.
     states: Vec<Range<usize>>,
-    /// The N-way merge tournament, sized once from `sources.len()` — which never
-    /// changes — and re-played in place by each reposition. Idle while `mode` is
+    /// The N-way merge tournament over `sources.len()` leaves — which never
+    /// changes — re-played in place by each reposition. Idle while `mode` is
     /// `Some`.
     tree: LoserTree,
     /// The one source live at the last absolute reposition, walked without `tree`.
@@ -96,8 +99,6 @@ pub struct ReadCursor {
     /// skeleton shard. Keyed by the PK's leading bytes: finding a shared prefix
     /// would read every run's last row at each open.
     order: MergeOrder,
-    /// The drain's picks, reused across chunks.
-    drain_picks: Vec<Pick>,
     /// The drain's per-source row windows, reused across chunks.
     drain_windows: Vec<Range<usize>>,
     /// Whether the cursor stands on a row. Written only by `commit_emitted`.
@@ -141,6 +142,7 @@ impl ReadCursor {
         {
             let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
             tree.rebuild(
+                #[inline(always)]
                 |i| order.head(sources, i, &states[i]),
                 merge::merge_less(schema, sources, *order, payload),
             );
@@ -640,8 +642,9 @@ fn build(
     cap: usize,
     position: impl FnOnce(&mut ReadCursor),
 ) -> ReadCursor {
-    let mut sources = Vec::with_capacity(cap);
-    let mut states = Vec::with_capacity(cap);
+    let CursorBufs { mut sources, mut states, losers, windows } = take(&CURSOR_BUFS, |_| true).unwrap_or_default();
+    sources.reserve(cap);
+    states.reserve(cap);
     // `for_each`, not `for`: the stores hand in nested adaptors, which fold
     // far cheaper than they step.
     runs.into_iter().for_each(|run| {
@@ -662,12 +665,11 @@ fn build(
     let order = MergeOrder::leading(schema.pk_stride(), sources.iter().any(ColumnarSource::is_skeleton));
     let mut cursor = ReadCursor {
         // Sized for the source count; `rebuild_and_advance` plays it.
-        tree: LoserTree::empty(sources.len()),
+        tree: LoserTree::with_buffer(sources.len(), losers),
         sources,
         order,
         states,
-        drain_picks: Vec::new(),
-        drain_windows: Vec::new(),
+        drain_windows: windows,
         mode: None,
         schema,
         valid: false,
@@ -676,6 +678,48 @@ fn build(
     };
     position(&mut cursor);
     cursor
+}
+
+/// A dropped cursor's vectors, emptied, for the thread's next [`build`].
+#[derive(Default)]
+struct CursorBufs {
+    sources: Vec<Run>,
+    states: Vec<Range<usize>>,
+    losers: Vec<Player>,
+    windows: Vec<Range<usize>>,
+}
+
+/// Elements a pooled vector keeps room for; a larger one is freed, so a cursor
+/// over many runs does not park its buffer for a point read to take.
+const MAX_POOLED_ELEMS: usize = 4096;
+
+/// `v` emptied, or a fresh vector in place of one above [`MAX_POOLED_ELEMS`];
+/// and the heap bytes it keeps.
+fn emptied<T>(mut v: Vec<T>) -> (Vec<T>, usize) {
+    if v.capacity() > MAX_POOLED_ELEMS {
+        return (Vec::new(), 0);
+    }
+    v.clear();
+    let bytes = vec_bytes(&v);
+    (v, bytes)
+}
+
+thread_local! {
+    /// Each thread's own: a `Run` holds an `Rc`, so the buffers never cross threads.
+    static CURSOR_BUFS: Cell<VecDeque<CursorBufs>> = const { Cell::new(VecDeque::new()) };
+}
+
+impl Drop for ReadCursor {
+    /// Return the cursor's vectors to the thread's pool. Emptying `sources`
+    /// drops its runs, so a pooled buffer holds no batch or shard alive.
+    fn drop(&mut self) {
+        let (sources, a) = emptied(std::mem::take(&mut self.sources));
+        let (states, b) = emptied(std::mem::take(&mut self.states));
+        let (losers, c) = emptied(self.tree.take_buffer());
+        let (windows, d) = emptied(std::mem::take(&mut self.drain_windows));
+        let bufs = CursorBufs { sources, states, losers, windows };
+        recycle(&CURSOR_BUFS, bufs, a + b + c + d);
+    }
 }
 
 /// A cursor over nothing, in `schema`'s shape.

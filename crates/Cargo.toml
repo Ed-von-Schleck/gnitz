@@ -47,6 +47,8 @@ io-uring = "0.7"
 libc = "0.2"
 proptest = "1"
 rustc-hash = "2"
+# `const_generics`: inline storage of any length, such as one `MAX_PK_BYTES` key.
+smallvec = { version = "1", features = ["const_generics"] }
 tempfile = "3"
 # `default-features = false` pins the ring backend: the default is aws-lc-rs,
 # which needs a C/cmake toolchain and would break the "no C++ toolchain"

@@ -13,7 +13,7 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// The one constructor. `Err` for a column list over `MAX_COLUMNS`, an
+    /// The constructor every other one goes through. `Err` for a column list over `MAX_COLUMNS`, an
     /// inadmissible column type, or a PK list that breaks the PK rules at
     /// `PK_LIST_MAX_COLS`, the capacity of a persisted PK list.
     pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: &[u32]) -> Result<Schema, String> {
@@ -23,11 +23,8 @@ impl Schema {
                 cd.name, cd.ty.tc, cd.ty.scale
             ));
         }
-        let pk_refusal = |rule: PkRule| {
-            rule.named(PkListRole::PrimaryKey, |c| {
-                columns.get(c as usize).map(|cd| cd.name.as_str())
-            })
-        };
+        let pk_refusal =
+            |rule: PkRule| rule.named(PkListRole::PrimaryKey, |c| columns.get(c as usize).map(|cd| &*cd.name));
         if pk_cols.len() > PK_LIST_MAX_COLS {
             return Err(pk_refusal(PkRule::TooManyColumns {
                 count: pk_cols.len(),
@@ -57,7 +54,7 @@ impl Schema {
     }
 
     /// A name carries no layout.
-    pub fn rename_column(&mut self, ci: usize, name: String) {
+    pub fn rename_column(&mut self, ci: usize, name: Arc<str>) {
         self.columns[ci].name = name;
     }
 
@@ -98,7 +95,7 @@ impl Schema {
         let pk = gnitz_wire::schema_block::decode(block, |c| {
             let name = std::str::from_utf8(c.name).map_err(|e| format!("utf8 in column name: {e}"))?;
             columns.push(ColumnDef {
-                name: name.to_owned(),
+                name: Arc::from(name),
                 ty: c.ty,
                 is_nullable: c.nullable,
                 is_hidden: c.hidden,

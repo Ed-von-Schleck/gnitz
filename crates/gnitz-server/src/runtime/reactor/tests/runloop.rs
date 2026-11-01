@@ -255,19 +255,30 @@ fn a_pass_that_does_not_sleep_does_not_arm() {
 }
 
 /// A sleep arms the park, and the publish that ends it takes the arm.
+///
+/// A publish that lands between the arm and the re-test behind it is drained by
+/// the arm loop, which then arms again and sleeps for the next publish. So the
+/// publisher answers every arm it sees until the tick returns.
 #[test]
 fn a_publish_wakes_the_sleep_and_takes_the_arm() {
     within(|| {
         let (r, mut writers) = reactor_with_rings(1);
         let mut writer = writers.pop().expect("one ring");
-        let publisher = std::thread::spawn(move || {
-            while !writer.master_parked() {
-                std::thread::yield_now();
+        let woke = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let publisher = std::thread::spawn({
+            let woke = woke.clone();
+            move || {
+                while !woke.load(std::sync::atomic::Ordering::SeqCst) {
+                    if writer.master_parked() {
+                        writer.ack(RequestId::BOOT_READY); // no lease holds it
+                    }
+                    std::thread::yield_now();
+                }
+                writer
             }
-            writer.ack(RequestId::BOOT_READY); // no lease holds it
-            writer
         });
         r.tick(true);
+        woke.store(true, std::sync::atomic::Ordering::SeqCst);
         let writer = publisher.join().expect("the publisher");
         assert!(!writer.master_parked(), "the publish took the arm");
     });

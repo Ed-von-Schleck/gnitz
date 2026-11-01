@@ -678,21 +678,23 @@ impl Reactor {
         if body.bytes().is_empty() {
             return Ok(());
         }
-        let mut out = Rc::new(Outbound { _conn: Rc::clone(conn), body });
+        let mut out = Outbound { _conn: Rc::clone(conn), body };
         let mut sent = 0usize;
         while sent < out.body.bytes().len() {
             let rest = &out.body.bytes()[sent..];
             // A send longer than an SQE carries goes out over several.
             let len = u32::try_from(rest.len()).unwrap_or(u32::MAX);
             let sqe = opcode::Send::new(types::Fd(conn.fd()), rest.as_ptr(), len).build();
-            // SAFETY: the op holds `out` until the CQE.
-            let (op, user_data) = unsafe { self.push_named_op(sqe, Some(Rc::clone(&out))) };
+            // SAFETY: the op holds `out` until the CQE, and its bytes stay in
+            // place as it moves.
+            let op = unsafe { self.push_named_op(sqe, Some(out)) };
+            let user_data = op.user_data();
             let mut op = std::pin::pin!(op);
             let mut given_back = false;
             let waited = select2(
                 std::future::poll_fn(|cx| {
                     let polled = op.as_mut().poll(cx);
-                    if polled.is_pending() && !given_back && out.body.poll_give_back(cx).is_ready() {
+                    if polled.is_pending() && !given_back && op.with_carry(|o| o.body.poll_give_back(cx)).is_ready() {
                         self.cancel_op(user_data);
                         given_back = true;
                     }
@@ -702,16 +704,18 @@ impl Reactor {
             )
             .await;
             let rc = match waited {
-                Either::A(rc) if given_back => {
-                    // Its CQE dropped the op's hold on `out`.
-                    Rc::get_mut(&mut out).expect("no op holds the body").body.detach();
-                    // Cut short for the copy: no progress, and no failure.
-                    if rc == -libc::ECANCELED || rc == -libc::EINTR {
-                        continue;
+                Either::A((rc, carry)) => {
+                    out = carry.expect("a send carries its body");
+                    if given_back {
+                        // The CQE has come, so no SQE reads the body.
+                        out.body.detach();
+                        // Cut short for the copy: no progress, and no failure.
+                        if rc == -libc::ECANCELED || rc == -libc::EINTR {
+                            continue;
+                        }
                     }
                     rc
                 }
-                Either::A(rc) => rc,
                 // Evicted; a completion that raced the timer still counts as failed.
                 // The abandoned send completes only once the socket errors; its
                 // `ops` entry holds the connection and body until then.
@@ -721,7 +725,8 @@ impl Reactor {
                         conn.fd(),
                         self.conns.limits.client_send_timeout
                     );
-                    0
+                    conn.fail();
+                    return Err(PeerGone);
                 }
             };
             // A zero is the kernel accepting nothing, which is not progress either.

@@ -16,6 +16,8 @@ field-map = []
 
 [dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# A key list short enough to need no heap.
+smallvec.workspace = true
 
 [dev-dependencies]
 # The benches' instruction and cycle counters.

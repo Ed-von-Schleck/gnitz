@@ -152,7 +152,11 @@ fn linear(rel: &Rc<RelExpr>) -> Result<Linear<'_>, GnitzSqlError> {
 
 /// Lower a bound ad-hoc body; `placed` is the item each ORDER BY expression key
 /// sorts on, and `refs` the catalog relations the bind read.
-pub(crate) fn lower_read(rel: &Rc<RelExpr>, placed: Vec<usize>, refs: &[BoundRef]) -> Result<AdhocRead, GnitzSqlError> {
+pub(crate) fn lower_read(
+    rel: &Rc<RelExpr>,
+    placed: Vec<usize>,
+    refs: Vec<BoundRef>,
+) -> Result<AdhocRead, GnitzSqlError> {
     let internal = || GnitzSqlError::Internal("an ad-hoc read body is not a projection".into());
     let (lin, shape) = match rel.as_ref() {
         RelExpr::Distinct { input } => {
@@ -196,9 +200,9 @@ pub(crate) fn lower_read(rel: &Rc<RelExpr>, placed: Vec<usize>, refs: &[BoundRef
     let (desc, source) = lin.source()?;
     let conjuncts = Frame::scan(desc, source).resolve_preds(&lin.preds)?;
     let name = refs
-        .iter()
+        .into_iter()
         .find(|r| r.tid == desc.tid)
-        .map(|r| r.name.clone())
+        .map(|r| r.name)
         .ok_or_else(|| GnitzSqlError::Internal("an ad-hoc read's relation is not among the bound references".into()))?;
     Ok(AdhocRead::Relation {
         desc: Arc::clone(desc),
@@ -388,7 +392,7 @@ impl AdhocRows {
                 .map(|&(slot, key)| OrderKey { col: col(slot) as u16, ..key })
                 .collect()
         };
-        let mut copied: Vec<(u32, u32)> = Vec::new();
+        let mut copied: Vec<(u32, u32)> = Vec::with_capacity(proj.len());
         for (slot, item) in proj.iter().enumerate() {
             let src = item.as_col().map(|s| s as u32);
             if let Some(src) = src.filter(|s| copied.iter().all(|(c, _)| c != s)) {
@@ -411,7 +415,7 @@ impl AdhocRows {
             },
             copied,
             program,
-            schema: Arc::new(schema),
+            schema,
         })
     }
 }

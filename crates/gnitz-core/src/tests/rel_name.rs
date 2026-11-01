@@ -52,3 +52,18 @@ fn the_system_schema_is_spelled_in_any_case() {
     assert_eq!(shouted, t);
     assert_eq!(shouted.to_string(), "_SYSTEM.Tables");
 }
+
+#[test]
+fn a_mixed_case_name_folds_to_its_canonical_parts() {
+    for (schema, name, key) in [
+        ("MySchema", "MyTable_1", "myschema.mytable_1"),
+        ("_Local", "Alias", "_local.alias"),
+        ("_sYsTeM", "Views", "_system.views"),
+    ] {
+        let t = RelName::new(schema, name).unwrap();
+        assert_eq!(t.key(), key);
+        assert_eq!(t.schema(), RelName::schema_key(schema).unwrap());
+        assert_eq!(t.name(), gnitz_wire::canonical_identifier(name).unwrap());
+        assert_eq!(t.to_string(), format!("{schema}.{name}"));
+    }
+}

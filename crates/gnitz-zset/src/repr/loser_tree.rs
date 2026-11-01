@@ -1,6 +1,11 @@
 //! N-way min-merge tournament: a loser tree. Each internal node holds the loser
-//! of the last match between its two subtrees' champions, so `tree[0]` is the
-//! overall champion and replacing it costs one compare per level.
+//! of the last match between its two subtrees' champions; the overall champion
+//! is held apart, and replacing it costs one compare per level.
+
+use std::cell::Cell;
+use std::mem::MaybeUninit;
+
+use super::batch_pool::with_scratch;
 
 /// A player: an index into the caller's sources, its current row, and the key
 /// the caller gave that row.
@@ -32,6 +37,15 @@ impl Player {
     }
 }
 
+/// The leaf count up to which [`LoserTree::rebuild`] keeps its scratch on the
+/// stack; past it, in the thread's reused [`WINNERS`].
+const STACK_LEAVES: usize = 64;
+
+thread_local! {
+    /// [`LoserTree::rebuild`]'s scratch past [`STACK_LEAVES`] leaves.
+    static WINNERS: Cell<Vec<MaybeUninit<Player>>> = const { Cell::new(Vec::new()) };
+}
+
 /// Not a player: a padding leaf, or a source that has run out. `row` is unread.
 const SENTINEL: u32 = u32::MAX;
 
@@ -53,12 +67,13 @@ fn beats(a: &Player, b: &Player, less: &impl Fn(&Player, &Player) -> bool) -> bo
 }
 
 pub(crate) struct LoserTree {
-    /// `tree[0]` is the champion; `tree[1..]` the loser of each internal node's
-    /// last match. Its length is a power of two and never changes.
-    tree: Vec<Player>,
-    /// Champion of the subtree rooted at each index — [`rebuild`](Self::rebuild)'s
-    /// scratch, reused across rebuilds.
-    winners: Vec<Player>,
+    /// The champion: the overall min, or a sentinel once every source is out.
+    top: Player,
+    /// For each internal node `1..n_pad`, the loser of its last match; `[0]` is
+    /// unused. Empty when `n_pad == 1`: one leaf has no internal node.
+    losers: Vec<Player>,
+    /// Leaf count: `n` rounded up to a power of two, at least 1.
+    n_pad: usize,
     /// Sources the tournament was built for.
     n: usize,
     /// A leading key word no player but the champion holds a lower one than —
@@ -68,57 +83,99 @@ pub(crate) struct LoserTree {
 }
 
 impl LoserTree {
-    /// Buffers for a tournament over `n` sources, every leaf a sentinel — empty
-    /// until [`rebuild`](Self::rebuild) plays it.
+    /// A tournament over `n` sources, every leaf a sentinel — empty until
+    /// [`rebuild`](Self::rebuild) plays it. Allocates the losers only for
+    /// `n >= 2`.
     pub(crate) fn empty(n: usize) -> Self {
+        Self::with_buffer(n, Vec::new())
+    }
+
+    /// [`Self::empty`] over `losers`' allocation, whatever it held before.
+    pub(crate) fn with_buffer(n: usize, mut losers: Vec<Player>) -> Self {
         debug_assert!(n < u32::MAX as usize, "source count must be < u32::MAX, the sentinel");
         let n_pad = n.next_power_of_two().max(1);
+        losers.clear();
+        if n_pad > 1 {
+            losers.resize(n_pad, SENTINEL_PLAYER);
+        }
         Self {
-            tree: vec![SENTINEL_PLAYER; n_pad],
-            winners: vec![SENTINEL_PLAYER; 2 * n_pad],
+            top: SENTINEL_PLAYER,
+            losers,
+            n_pad,
             n,
             bound: 0,
         }
     }
 
+    /// The losers' allocation, for a later [`Self::with_buffer`]; leaves the
+    /// tree without one.
+    pub(crate) fn take_buffer(&mut self) -> Vec<Player> {
+        std::mem::take(&mut self.losers)
+    }
+
     /// Re-play the tournament over the same `n` sources at their current rows.
-    /// O(n) compares, no allocation.
+    /// O(n) compares, no allocation once the thread's scratch has grown.
     pub(crate) fn rebuild(
         &mut self,
         init_fn: impl Fn(usize) -> Option<(u32, u128)>,
         less: impl Fn(&Player, &Player) -> bool,
     ) {
-        let n_pad = self.tree.len();
-        let leaf = |i: usize| n_pad + i;
+        let slots = 2 * self.n_pad;
+        if self.n_pad <= STACK_LEAVES {
+            let mut stack = [MaybeUninit::<Player>::uninit(); 2 * STACK_LEAVES];
+            self.replay(&mut stack[..slots], &init_fn, &less);
+        } else {
+            with_scratch(&WINNERS, |winners| {
+                winners.resize(slots, MaybeUninit::uninit());
+                self.replay(winners, &init_fn, &less);
+            });
+        }
+    }
 
-        self.winners[leaf(0)..].fill(SENTINEL_PLAYER);
-        for i in 0..self.n {
-            if let Some((row, key)) = init_fn(i) {
-                self.winners[leaf(i)] = Player::new(key, i as u32, row);
-            }
+    /// Play every match bottom-up. `winners` holds `2 * n_pad` slots: the
+    /// champion of the subtree at each index, leaves at `n_pad..`, `[0]` unused.
+    #[inline(always)]
+    fn replay(
+        &mut self,
+        winners: &mut [MaybeUninit<Player>],
+        init_fn: &impl Fn(usize) -> Option<(u32, u128)>,
+        less: &impl Fn(&Player, &Player) -> bool,
+    ) {
+        let n_pad = self.n_pad;
+        let (real, padding) = winners[n_pad..].split_at_mut(self.n);
+        for (i, leaf) in real.iter_mut().enumerate() {
+            leaf.write(match init_fn(i) {
+                Some((row, key)) => Player::new(key, i as u32, row),
+                None => SENTINEL_PLAYER,
+            });
         }
+        // A padding leaf never reaches `init_fn`.
+        padding.fill(MaybeUninit::new(SENTINEL_PLAYER));
         for idx in (1..n_pad).rev() {
-            let (a, b) = (self.winners[2 * idx], self.winners[2 * idx + 1]);
-            let (winner, loser) = if beats(&a, &b, &less) { (a, b) } else { (b, a) };
-            self.winners[idx] = winner;
-            self.tree[idx] = loser;
+            // SAFETY: both children lie above `idx`: leaves, written above, or
+            // internal nodes, written by an earlier iteration.
+            let (a, b) = unsafe { (winners[2 * idx].assume_init(), winners[2 * idx + 1].assume_init()) };
+            let (winner, loser) = if beats(&a, &b, less) { (a, b) } else { (b, a) };
+            winners[idx].write(winner);
+            self.losers[idx] = loser;
         }
-        self.tree[0] = self.winners[1];
+        // SAFETY: index 1 is the root, written by the loop when `n_pad > 1`,
+        // else the one leaf.
+        self.top = unsafe { winners[1].assume_init() };
         self.bound = 0;
     }
 
     /// The current champion, or `None` once every source is exhausted.
     #[inline]
     pub(crate) fn peek(&self) -> Option<Player> {
-        let top = self.tree[0];
+        let top = self.top;
         (top.source_idx != SENTINEL).then_some(top)
     }
 
     /// The internal node above leaf `source_idx`.
     #[inline(always)]
     fn leaf_parent(&self, source_idx: u32) -> usize {
-        let n_pad = self.tree.len();
-        (n_pad + (source_idx as usize & (n_pad - 1))) >> 1
+        (self.n_pad + (source_idx as usize & (self.n_pad - 1))) >> 1
     }
 
     /// Step the champion to `next_row`, or drop it when its source is exhausted.
@@ -128,11 +185,11 @@ impl LoserTree {
     /// not interleave with the others is walked at one compare per row.
     #[inline(always)]
     pub(crate) fn step_top(&mut self, next_row: Option<(u32, u128)>, less: &impl Fn(&Player, &Player) -> bool) {
-        let source_idx = self.tree[0].source_idx;
+        let source_idx = self.top.source_idx;
         debug_assert_ne!(source_idx, SENTINEL, "step_top on a drained tree");
         let mut cur = match next_row {
             Some((row, key)) if ((key >> 64) as u64) < self.bound => {
-                self.tree[0] = Player::new(key, source_idx, row);
+                self.top = Player::new(key, source_idx, row);
                 return;
             }
             Some((row, key)) => Player::new(key, source_idx, row),
@@ -140,14 +197,16 @@ impl LoserTree {
         };
         let mut idx = self.leaf_parent(source_idx);
         while idx > 0 {
-            // SAFETY: `leaf_parent` masks into `0..tree.len()`; `idx >>= 1` only decreases it.
-            let loser = unsafe { self.tree.get_unchecked_mut(idx) };
+            // SAFETY: `leaf_parent` masks into `0..n_pad` and `idx >>= 1` only
+            // decreases it; an `idx > 0` exists only when `n_pad > 1`, and then
+            // `losers.len() == n_pad`.
+            let loser = unsafe { self.losers.get_unchecked_mut(idx) };
             if beats(loser, &cur, less) {
                 std::mem::swap(&mut cur, loser);
             }
             idx >>= 1;
         }
-        self.tree[0] = cur;
+        self.top = cur;
         // A player swapped into the tree never leaves it on this replay, so the
         // champion is still `source_idx` exactly when it beat every loser. Its
         // path's losers are then the champions of every other subtree.
@@ -161,7 +220,7 @@ impl LoserTree {
     fn path_least(&self, source_idx: u32) -> u64 {
         let (mut least, mut idx) = (u64::MAX, self.leaf_parent(source_idx));
         while idx > 0 {
-            least = least.min(self.tree[idx].key[0]);
+            least = least.min(self.losers[idx].key[0]);
             idx >>= 1;
         }
         least

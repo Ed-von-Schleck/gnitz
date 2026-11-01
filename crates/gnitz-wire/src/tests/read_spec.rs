@@ -296,13 +296,13 @@ fn peek_bound_reads_only_the_routing_bounds() {
     assert!(peek_bound(&[]).is_none());
 }
 
-/// Re-keying a blob keeps every other section byte-for-byte: it decodes to the
-/// same spec over the subsequence.
+/// Splitting a blob by key owner keeps every other section byte-for-byte: each
+/// worker's blob decodes to the same spec over the keys it owns, in ascending
+/// order, a worker owning none gets nothing, and together they carry every key.
 #[test]
-fn a_pk_set_with_fewer_keys_decodes_to_the_same_spec() {
+fn a_pk_set_split_by_owner_decodes_to_the_same_spec_per_worker() {
     for stride in [8usize, 24] {
         let set = keys(stride);
-        let all: Vec<&[u8]> = set.iter().collect();
         let spec = ReadSpec {
             bound: ReadBound::PkSet(set.clone()),
             predicate: vec![1, 2, 3],
@@ -318,12 +318,36 @@ fn a_pk_set_with_fewer_keys_decodes_to_the_same_spec() {
         let Some(BoundPeek::PkSet(peek)) = peek_bound(&blob) else {
             panic!("a PkSet peeks as its keys");
         };
-        for sub in [vec![all[0]], vec![all[0], all[2]], all.clone()] {
-            let want = ReadSpec {
-                bound: ReadBound::PkSet(PkKeys::from_keys(stride, sub.iter().copied())),
-                ..spec.clone()
+        // The keys ascend as 3, 9, 200; each table names the owner of each in turn.
+        for owners in [[0usize, 0, 0], [0, 2, 0], [2, 1, 0], [1, 1, 2]] {
+            let owner = |k: &[u8]| match k[0] {
+                3 => owners[0],
+                9 => owners[1],
+                _ => owners[2],
             };
-            assert_eq!(ReadSpec::decode(&peek.with_keys(&sub.concat())), Ok(want), "{sub:?}");
+            let mut counts = [0u32; 3];
+            for k in set.iter() {
+                counts[owner(k)] += 1;
+            }
+            let blobs = peek.split(&counts, owner);
+            assert_eq!(blobs.len(), 3);
+            let mut union: Vec<&[u8]> = Vec::new();
+            for (w, got) in blobs.iter().enumerate() {
+                let mine: Vec<&[u8]> = set.iter().filter(|k| owner(k) == w).collect();
+                if mine.is_empty() {
+                    assert!(got.is_empty(), "{owners:?} worker {w}");
+                    continue;
+                }
+                let want = ReadSpec {
+                    bound: ReadBound::PkSet(PkKeys::from_keys(stride, mine.iter().copied())),
+                    ..spec.clone()
+                };
+                // Decoding a PkSet refuses keys out of order.
+                assert_eq!(ReadSpec::decode(got), Ok(want), "{owners:?} worker {w}");
+                union.extend(mine);
+            }
+            union.sort();
+            assert_eq!(union, set.iter().collect::<Vec<_>>(), "{owners:?}");
         }
     }
 }

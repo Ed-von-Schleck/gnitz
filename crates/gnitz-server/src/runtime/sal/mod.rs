@@ -11,7 +11,7 @@
 mod request;
 mod zone;
 
-pub(crate) use request::{Apply, Read, SalRequest};
+pub(crate) use request::{Apply, OwnedRead, Read, SalRequest};
 pub(crate) use zone::CommittedTail;
 
 use std::cell::Cell;
@@ -1263,12 +1263,16 @@ pub(crate) struct ReplyRoute {
     pub(crate) cut: Cut,
 }
 
-/// One group addressed to a worker, decoded and owned: a parked read outlives the
-/// SAL bytes it came in, which an inline `Flush` lets the master rewrite.
-pub(crate) enum Inbound {
+/// One group addressed to a worker, decoded. A read borrows its group's SAL
+/// bytes, which stay intact only until this worker reads past the next `Flush`:
+/// the master may then rewrite them. [`SalReader::next_request`] hands it out
+/// as `'static`, a convention the compiler does not check; a read kept beyond
+/// its group is an [`OwnedRead`], which only [`Read::into_owned`] builds. An
+/// apply owns what it carries.
+pub(crate) enum Inbound<'a> {
     Read {
         route: ReplyRoute,
-        read: Read<'static>,
+        read: Read<'a>,
     },
     Apply {
         /// The id the change is acknowledged on; `None` when nothing waits for it.
@@ -1350,7 +1354,7 @@ impl SalReader {
     pub(crate) fn next_request(
         &mut self,
         catalog_schema: impl FnOnce(u64, &[u8]) -> Option<SchemaDescriptor>,
-    ) -> Option<Inbound> {
+    ) -> Option<Inbound<'static>> {
         let (msg, wire) = self.next()?;
         // Fail-stop: a dropped group diverges this worker from the master.
         let undecodable = |e: String| -> ! {

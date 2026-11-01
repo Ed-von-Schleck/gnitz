@@ -208,3 +208,95 @@ fn pk_keys_from_images_is_the_byte_sort() {
 fn pk_keys_from_sorted_refuses_a_repeat() {
     PkKeys::from_sorted(2, vec![0, 1, 0, 1]);
 }
+
+fn u64_keys(vals: impl IntoIterator<Item = u64>) -> Vec<u8> {
+    vals.into_iter().flat_map(u64::to_be_bytes).collect()
+}
+
+/// A list off the wire round-trips through `encode_probe` whether it decodes
+/// inline (up to `MAX_PK_BYTES`) or onto the heap, and a decoded list equals the
+/// same keys built by `from_sorted`.
+#[test]
+fn pk_keys_decode_inline_and_heap() {
+    for n in [1u64, 2, 10, 11, 64] {
+        let bytes = u64_keys(0..n);
+        let k = PkKeys::checked(8, &bytes).unwrap();
+        assert_eq!(!k.bytes.spilled(), bytes.len() <= MAX_PK_BYTES, "n {n}");
+        assert_eq!(k.as_bytes(), bytes, "n {n}");
+        assert_eq!(k.len(), n as usize, "n {n}");
+        assert_eq!(k, PkKeys::from_sorted(8, bytes.clone()), "n {n}");
+        assert_eq!(PkKeys::decode_probe(&k.encode_probe()), Ok(k), "n {n}");
+    }
+    assert!(PkKeys::checked(8, &u64_keys([2, 1])).is_err());
+    assert!(PkKeys::checked(8, &u64_keys([1, 1])).is_err());
+}
+
+/// An inline list shrinks in place, down to empty.
+#[test]
+fn pk_keys_retain_inline_to_empty() {
+    let mut k = PkKeys::checked(8, &u64_keys([1, 2, 3, 4])).unwrap();
+    k.retain(|key| key[7] % 2 == 0);
+    assert_eq!(k, PkKeys::from_sorted(8, u64_keys([2, 4])));
+    assert_eq!(k.bounds(), Some((&u64_keys([2])[..], &u64_keys([4])[..])));
+    k.retain(|_| false);
+    assert!(k.is_empty());
+    assert_eq!(k.len(), 0);
+    assert_eq!(k.bounds(), None);
+    assert_eq!(k, PkKeys::from_sorted(8, Vec::new()));
+}
+
+/// A single key, by bytes or by image, builds the same list as the multi-key
+/// sort would; so do two and three keys around it.
+#[test]
+fn pk_keys_single_key_matches_the_sort() {
+    for stride in [1usize, 3, 8, 9, 16, 24, 40] {
+        let key: Vec<u8> = (0..stride as u8).map(|b| b.wrapping_mul(37) | 1).collect();
+        let one = PkKeys::from_keys(stride, [&key[..]]);
+        assert_eq!(one.as_bytes(), key, "stride {stride}");
+        assert_eq!(one.len(), 1, "stride {stride}");
+        assert_eq!(PkKeys::from_keys(stride, [&key[..], &key[..]]), one, "stride {stride}");
+        let zero = vec![0u8; stride];
+        let two = PkKeys::from_keys(stride, [&key[..], &zero[..], &key[..]]);
+        assert_eq!(two.as_bytes(), [&zero[..], &key[..]].concat(), "stride {stride}");
+        if stride <= NARROW_PK_MAX_BYTES {
+            let image = crate::widen_pk_be(&key);
+            assert_eq!(PkKeys::from_images(stride, [image]), one, "stride {stride}");
+            assert_eq!(PkKeys::from_images(stride, [image, 0, image]), two, "stride {stride}");
+        }
+    }
+    assert!(PkKeys::from_keys(8, std::iter::empty()).is_empty());
+    assert!(PkKeys::from_images(8, std::iter::empty()).is_empty());
+}
+
+#[test]
+#[should_panic(expected = "key width")]
+fn pk_keys_single_key_checks_its_width() {
+    PkKeys::from_keys(8, [&[0u8; 4][..]]);
+}
+
+/// `from_vec` keeps ascending input in place — a list past the inline capacity
+/// in its own buffer, adjacent duplicates dropped — and sorts and dedups
+/// anything else.
+#[test]
+fn pk_keys_from_vec_sorts_only_when_needed() {
+    let long = u64_keys(0..11);
+    assert!(long.len() > MAX_PK_BYTES);
+    let ptr = long.as_ptr();
+    assert_eq!(PkKeys::from_vec(8, long).as_bytes().as_ptr(), ptr);
+
+    let repeats = u64_keys((0..40).map(|k| k / 2));
+    let ptr = repeats.as_ptr();
+    let k = PkKeys::from_vec(8, repeats);
+    assert_eq!(k.as_bytes().as_ptr(), ptr);
+    assert_eq!(k.as_bytes(), u64_keys(0..20));
+
+    let k = PkKeys::from_vec(8, u64_keys([1, 5, 9]));
+    assert_eq!(k.as_bytes(), u64_keys([1, 5, 9]));
+    assert_eq!(PkKeys::from_vec(8, u64_keys([9, 1, 5])), k);
+    assert_eq!(PkKeys::from_vec(8, u64_keys([5, 9, 1, 9, 5])), k);
+    assert_eq!(
+        PkKeys::from_vec(8, u64_keys([7, 7])),
+        PkKeys::from_keys(8, [&u64_keys([7])[..]])
+    );
+    assert!(PkKeys::from_vec(8, Vec::new()).is_empty());
+}

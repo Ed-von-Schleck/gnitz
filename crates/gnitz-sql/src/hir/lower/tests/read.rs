@@ -65,6 +65,8 @@ fn a_rows_reply_numbers_the_select_list_over_the_relations_regions() {
     let cases: &[Case] = &[
         (&t,   "SELECT * FROM t ORDER BY w",                 false, "id v w",    &[0], "w", false),
         (&mid, "SELECT * FROM t ORDER BY id",                false, "v id w",    &[1], "id", true),
+        (&t,   "SELECT id, v, w FROM t ORDER BY v",          false, "id v w",    &[0], "v", false),
+        (&t,   "SELECT id AS k, v, w FROM t ORDER BY k",     false, "k v w",     &[0], "k", true),
         (&t,   "SELECT v, id, w FROM t ORDER BY w",          false, "v id w",    &[1], "w", false),
         (&t,   "SELECT v, w, id AS k FROM t ORDER BY k",     false, "v w k",     &[2], "k", true),
         (&mid, "SELECT id, v AS a, w FROM t ORDER BY a",     false, "id a w",    &[0], "a", false),
@@ -89,7 +91,7 @@ fn a_rows_reply_numbers_the_select_list_over_the_relations_regions() {
             let c = &r.schema.columns()[c];
             match c.is_hidden {
                 true => format!("[{}]", c.name),
-                false => c.name.clone(),
+                false => c.name.to_string(),
             }
         };
         let shown: Vec<String> = (0..r.schema.columns().len()).map(name).collect();
@@ -123,5 +125,24 @@ fn a_rows_reply_numbers_the_select_list_over_the_relations_regions() {
         }
         let walked = rows_reply_of(sql, desc, true);
         assert_eq!(walked.sink_order.is_empty(), pk_ordered, "`{sql}`");
+    }
+}
+
+/// A SELECT list naming each of a key-first relation's columns in place under its
+/// own name replies under the relation's own schema; a renamed, reordered or dropped
+/// column, or a computed ORDER BY key, gets a schema of its own.
+#[test]
+fn an_identity_select_list_replies_under_the_relations_schema() {
+    let t = u64_table(&["id", "v", "w"], &[0]);
+    for (sql, shared) in [
+        ("SELECT * FROM t", true),
+        ("SELECT id, v, w FROM t ORDER BY w", true),
+        ("SELECT id AS k, v, w FROM t", false),
+        ("SELECT v, id, w FROM t", false),
+        ("SELECT v, w FROM t", false),
+        ("SELECT * FROM t ORDER BY v + 1", false),
+    ] {
+        let r = rows_reply_of(sql, &t, false);
+        assert_eq!(Arc::ptr_eq(&r.schema, &t.schema), shared, "`{sql}`");
     }
 }

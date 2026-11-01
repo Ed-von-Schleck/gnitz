@@ -1,6 +1,7 @@
 //! Incremental reduce: δ_out = Agg(history + δ_in) − Agg(history). `ReducePlan`
 //! holds what `op_reduce` needs at emit time: the `ReduceShape` the ad-hoc fold
-//! shares, and the value index its MIN/MAX read their history from.
+//! shares, the value index its MIN/MAX read their history from, and the buffers
+//! one epoch folds its delta in, kept for the next.
 
 mod value_index;
 
@@ -14,7 +15,7 @@ mod tests;
 
 use std::cmp::Ordering;
 
-use crate::algebra::{ground_pk, Agg, AggValues, GroupOrdinals, RangeGroups, ReduceShape};
+use crate::algebra::{ground_pk, vec_bytes, Agg, AggValues, GroupScratch, RangeGroups, ReduceShape};
 use crate::repr::{Batch, MemBatch, RowMark};
 use crate::schema::{Generic, PayloadOrder, SchemaDescriptor};
 use crate::stream::OpenAt;
@@ -32,7 +33,36 @@ pub struct ReducePlan {
     count_star: usize,
     /// The value index the non-linear aggregates read their history from.
     value_index: Option<ValueIndex>,
+    scratch: ReduceScratch,
 }
+
+/// The buffers an epoch of [`op_reduce`] fills, kept across epochs so a small
+/// delta allocates none of them again. Every epoch overwrites each one it reads.
+#[derive(Default)]
+struct ReduceScratch {
+    grouping: GroupScratch,
+    /// `None` until the first epoch that folds a group.
+    vals: Option<AggValues>,
+    /// Per group, whether its extremes come off the value index; empty for a
+    /// reduce without one.
+    probes: Vec<bool>,
+    /// The delta's groups as row runs, where it stands in group order.
+    runs: Vec<(usize, usize)>,
+    /// `runs` with each probed run emptied.
+    unprobed: Vec<(usize, usize)>,
+}
+
+impl ReduceScratch {
+    /// The bytes this holds allocated.
+    fn held_bytes(&self) -> usize {
+        let vals = self.vals.as_ref().map_or(0, AggValues::held_bytes);
+        self.grouping.held_bytes() + vals + vec_bytes(&self.probes) + vec_bytes(&self.runs) + vec_bytes(&self.unprobed)
+    }
+}
+
+/// The most bytes of [`ReduceScratch`] a plan keeps after an epoch; an epoch
+/// that grew it past this, such as a backfill, drops it.
+const SCRATCH_KEEP_BYTES: usize = 1 << 16;
 
 impl ReducePlan {
     /// `Err` for a shape `ReduceShape` refuses and a reduce without a COUNT(*).
@@ -87,7 +117,13 @@ impl ReducePlan {
             values.emit_row(&mut v0, None, &ground_pk(), 0);
             v0
         });
-        Ok(ReducePlan { shape, ground, count_star, value_index })
+        Ok(ReducePlan {
+            shape,
+            ground,
+            count_star,
+            value_index,
+            scratch: ReduceScratch::default(),
+        })
     }
 
     /// The row a global aggregate publishes over an empty input; `None` for a
@@ -143,62 +179,86 @@ const RUN_STEP_CAP: usize = 128;
 /// `index` opens the value index `plan.value_index` describes, this epoch's
 /// entries included, at the groups whose extremes are read off it; a delta with
 /// none leaves it unopened.
-pub fn op_reduce(delta: &Batch, out_trace: OpenAt<'_>, index: Option<OpenAt<'_>>, plan: &ReducePlan) -> Batch {
-    let shape = &plan.shape;
-
+pub fn op_reduce(delta: &Batch, out_trace: OpenAt<'_>, index: Option<OpenAt<'_>>, plan: &mut ReducePlan) -> Batch {
     debug_assert!(plan.is_exact_linear() || delta.is_consolidated());
 
     if delta.is_empty() {
-        return Batch::empty_with_schema(&shape.output_schema);
+        return Batch::empty_with_schema(&plan.shape.output_schema);
     }
 
+    // Taken out for the epoch, so the plan stays shared while the buffers fill.
+    let mut scratch = std::mem::take(&mut plan.scratch);
+    let out = reduce_epoch(delta, out_trace, index, plan, &mut scratch);
+    if scratch.held_bytes() <= SCRATCH_KEEP_BYTES {
+        plan.scratch = scratch;
+    }
+    out
+}
+
+/// [`op_reduce`] over a non-empty `delta`, folding it in `s`.
+fn reduce_epoch(
+    delta: &Batch,
+    out_trace: OpenAt<'_>,
+    index: Option<OpenAt<'_>>,
+    plan: &ReducePlan,
+    s: &mut ReduceScratch,
+) -> Batch {
+    let shape = &plan.shape;
     let mb = delta.as_mem_batch();
     let weights = mb.weight().as_chunks::<8>().0;
     let retracts = |w: &[u8; 8]| i64::from_le_bytes(*w) <= 0;
     let indexed = plan.value_index.is_some();
     let aggs = &shape.aggs;
+    let ReduceScratch { grouping, vals, probes, runs, unprobed } = s;
+    let vals = vals.get_or_insert_with(|| AggValues::new(aggs, 0));
 
-    let groups = match shape.key.runs(delta) {
-        Some(ranges) if ranges.len() == 1 || 2 * ranges.len() <= delta.len() => {
-            // An extreme recedes only on a retraction, so an all-insert group's
-            // extremes are its rows' and its stored row's: no probe.
-            let probes: Vec<bool> = ranges
-                .iter()
-                .map(|&(s, e)| indexed && (e - s > RUN_STEP_CAP || weights[s..e].iter().any(retracts)))
-                .collect();
-            // A probed run's extremes come off the index: an extreme folds the
-            // runs with each of those emptied, so it steps none of its rows.
-            let unprobed: Vec<(usize, usize)>;
-            let stepped: &[(usize, usize)] = match probes.contains(&true) {
-                true => {
-                    let keep = |(&(s, e), &probe): (&(usize, usize), &bool)| (s, if probe { s } else { e });
-                    unprobed = ranges.iter().zip(&probes).map(keep).collect();
-                    &unprobed
-                }
-                false => &ranges,
-            };
-            let mut vals = AggValues::new(aggs, ranges.len());
-            for (k, agg) in aggs.iter().enumerate() {
-                let folded = if agg.is_linear() { &ranges[..] } else { stepped };
-                vals.fold(k, &mb, folded, RangeGroups::Each);
-            }
-            let order = ranges.iter().enumerate().map(|(g, &(first, _))| (first, g, None));
-            return emit_groups(plan, &mb, out_trace, index, vals, &probes, order);
+    let in_runs = shape.key.runs_into(delta, runs);
+    if in_runs && (runs.len() == 1 || 2 * runs.len() <= delta.len()) {
+        let ranges = &runs[..];
+        // An extreme recedes only on a retraction, so an all-insert group's
+        // extremes are its rows' and its stored row's: no probe.
+        probes.clear();
+        if indexed {
+            let probed = |&(s, e): &(usize, usize)| e - s > RUN_STEP_CAP || weights[s..e].iter().any(retracts);
+            probes.extend(ranges.iter().map(probed));
         }
-        Some(runs) => GroupOrdinals::of_runs(&runs),
-        None => shape.key.numbered(delta),
-    };
+        // A probed run's extremes come off the index: an extreme folds the
+        // runs with each of those emptied, so it steps none of its rows.
+        let stepped: &[(usize, usize)] = match probes.contains(&true) {
+            true => {
+                let keep = |(&(s, e), &probe): (&(usize, usize), &bool)| (s, if probe { s } else { e });
+                unprobed.clear();
+                unprobed.extend(ranges.iter().zip(probes.iter()).map(keep));
+                &unprobed[..]
+            }
+            false => ranges,
+        };
+        vals.reset(ranges.len());
+        for (k, agg) in aggs.iter().enumerate() {
+            let folded = if agg.is_linear() { ranges } else { stepped };
+            vals.fold(k, &mb, folded, RangeGroups::Each);
+        }
+        let order = ranges.iter().enumerate().map(|(g, &(first, _))| (first, g, None));
+        return emit_groups(plan, &mb, out_trace, index, vals, probes, order);
+    }
+    match in_runs {
+        true => grouping.groups.fill_runs(runs),
+        false => shape.key.numbered_into(delta, grouping),
+    }
+    let groups = &grouping.groups;
 
-    let mut vals = AggValues::new(aggs, groups.len());
+    vals.reset(groups.len());
     for k in 0..aggs.len() {
         vals.fold(k, &mb, &[(0, delta.len())], &groups.ord[..]);
     }
     // Per group, whether its extremes come off the index. Every row is stepped
     // whatever its group then reads, so only a retraction sends one there.
-    let mut probes = vec![false; groups.len()];
+    probes.clear();
     if indexed {
+        probes.resize(groups.len(), false);
+        let probed = &mut probes[..];
         for (&g, w) in groups.ord.iter().zip(weights) {
-            probes[g as usize] |= retracts(w);
+            probed[g as usize] |= retracts(w);
         }
     }
     let order = groups.by_pk.iter().map(|&g| {
@@ -208,20 +268,21 @@ pub fn op_reduce(delta: &Batch, out_trace: OpenAt<'_>, index: Option<OpenAt<'_>>
             groups.ids.get(g as usize).copied(),
         )
     });
-    emit_groups(plan, &mb, out_trace, index, vals, &probes, order)
+    emit_groups(plan, &mb, out_trace, index, vals, probes, order)
 }
 
 /// Emit each group of `order` merged with its history, as a retraction and a
 /// new row. `order` yields a delta row of each group, the group's index in
 /// `vals` and the identity its numbering kept for it, if any, in ascending
 /// output-PK order. A group `g` with `probes[g]` reads its extremes off the
-/// value index, whatever `vals` holds for them.
+/// value index, whatever `vals` holds for them; `probes` is empty for a reduce
+/// without a value index.
 fn emit_groups(
     plan: &ReducePlan,
     delta: &MemBatch<'_>,
     out_trace: OpenAt<'_>,
     index: Option<OpenAt<'_>>,
-    mut vals: AggValues,
+    vals: &mut AggValues,
     probes: &[bool],
     order: impl DoubleEndedIterator<Item = (usize, usize, Option<u128>)> + ExactSizeIterator + Clone,
 ) -> Batch {
@@ -253,7 +314,7 @@ fn emit_groups(
             vals.fold_stored(g, stored_row, stored_idx, probed.is_none());
         }
         if let Some((value_index, cursor)) = probed {
-            value_index.seed_extremes(cursor, delta, first, &mut vals, g);
+            value_index.seed_extremes(cursor, delta, first, vals, g);
         }
 
         let cardinality = vals.count_value(plan.count_star, g);

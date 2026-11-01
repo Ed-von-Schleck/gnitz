@@ -365,7 +365,7 @@ fn test_restart_long_strings() {
         let col_defs = engine.read_column_defs(tid).unwrap();
         assert_eq!(col_defs.len(), 2);
         assert_eq!(
-            col_defs[1].def.name, long_name,
+            &*col_defs[1].def.name, long_name,
             "Long column name corrupted after restart"
         );
         finish(engine);

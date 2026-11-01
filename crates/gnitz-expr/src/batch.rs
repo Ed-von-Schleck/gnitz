@@ -139,13 +139,13 @@ impl Evaluator {
         let Evaluator { prog, scratch } = self;
         #[cfg(debug_assertions)]
         if n > 0 {
-            let reads = prog.payload_reads.iter().map(|&(pi, w)| (pi as usize, w as usize));
+            let reads = gnitz_wire::BitIter(prog.read_mask).map(|pi| (pi, prog.read_widths[pi] as usize));
             crate::view::debug_assert_coherent(mb, start, reads);
         }
         // Hoisted: LLVM cannot fold repeated `&dyn` calls.
         let mut cols: [&[u8]; PAYLOAD_SLOTS] = [&[]; PAYLOAD_SLOTS];
-        for &(pi, width) in &prog.payload_reads {
-            cols[pi as usize] = mb.col_data(pi as usize, width as usize);
+        for pi in gnitz_wire::BitIter(prog.read_mask) {
+            cols[pi] = mb.col_data(pi, prog.read_widths[pi] as usize);
         }
         let blob = mb.heap().plain().expect("a batch view holds its long values verbatim");
         let bufs = Regions { blob, cols: &cols };
@@ -743,27 +743,11 @@ fn parse_decimal_i128(s: &[u8]) -> Option<i128> {
     Some(if neg { -(v as i128) } else { v as i128 })
 }
 
-/// An integer's decimal text, written into the arena: several times cheaper
-/// than `core::fmt` (`int_to_str` of `expr_kernel_bench`).
+/// An integer's decimal text, written into the arena.
 fn arena_push_int(arena: &mut Vec<u8>, magnitude: u64, neg: bool) -> StrView {
     let off = arena.len();
-    // Least-significant digit first, from the end: 20 digits and a sign.
-    let mut text = [0u8; 21];
-    let mut at = text.len();
-    let mut x = magnitude;
-    loop {
-        at -= 1;
-        text[at] = b'0' + (x % 10) as u8;
-        x /= 10;
-        if x == 0 {
-            break;
-        }
-    }
-    if neg {
-        at -= 1;
-        text[at] = b'-';
-    }
-    arena.extend_from_slice(&text[at..]);
+    let mut buf = [0; gnitz_wire::DECIMAL_TEXT_MAX];
+    arena.extend_from_slice(gnitz_wire::write_scaled(magnitude, neg, 0, &mut buf).as_bytes());
     StrView::at(SRC_ARENA, off, arena.len() - off)
 }
 

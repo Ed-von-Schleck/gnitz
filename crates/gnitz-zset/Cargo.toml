@@ -21,6 +21,8 @@ libc.workspace = true
 # The UTF-8 check on a pushed block's STRING cells.
 simdutf8 = "0.1"
 fsst-rs = "0.6"
+# Inline storage for the per-materialize index tables of `repr::scatter`.
+smallvec.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

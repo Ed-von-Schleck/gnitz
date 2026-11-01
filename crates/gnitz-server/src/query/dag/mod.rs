@@ -51,6 +51,10 @@ struct RegisteredView {
     state: Option<CircuitState>,
     /// The user view whose chain holds this view: its owner, or itself.
     chain: u64,
+    /// Every relation one or more `view → sources` edges from this view, sorted and
+    /// each once: source views and bases, never the view itself. Fixed from
+    /// registration to drop, since a source registers before and drops after it.
+    sources: Box<[u64]>,
 }
 
 #[derive(Default)]
@@ -83,8 +87,17 @@ impl DagEngine {
             return Err(format!("scans relation {src}, which is not older than it"));
         }
         let (code, placement) = compiler::compile_view(circuit, registry, view_id, view, bounded)?;
+        // The closure below is exact only if every source view is registered here.
+        debug_assert!(code
+            .source_ids()
+            .all(|s| self.views.contains_key(&s) || !registry.relation(s).is_some_and(|r| r.kind().is_view())));
+        let mut sources: Vec<u64> = code.source_ids().flat_map(|s| self.self_and_sources(s)).collect();
+        sources.sort_unstable();
+        sources.dedup();
         self.dep.link(view_id, code.source_ids());
-        self.views.insert(view_id, RegisteredView { code, state: None, chain });
+        let sources = sources.into_boxed_slice();
+        self.views
+            .insert(view_id, RegisteredView { code, state: None, chain, sources });
         Ok(placement)
     }
 

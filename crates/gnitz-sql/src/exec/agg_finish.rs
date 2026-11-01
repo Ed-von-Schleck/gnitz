@@ -84,9 +84,8 @@ impl FoldFinish {
     pub(crate) fn finish(&mut self, partial: ZSetBatch) -> ZSetBatch {
         let mut groups = self.combine(partial);
         if let Some(ev) = &mut self.having {
-            let mut ranges = Vec::new();
-            ev.ranges(&groups, &mut ranges);
-            groups.retain_ranges(&ranges);
+            let ranges = ev.ranges(&groups);
+            groups.retain_ranges(ranges);
         }
         self.finalize.apply(groups)
     }

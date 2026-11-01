@@ -6,8 +6,8 @@
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 
+use gnitz_store::read::ReadRows;
 use std::hint::black_box;
-use std::rc::Rc;
 
 use super::*;
 use gnitz_foundation::perf;
@@ -63,7 +63,7 @@ fn point(engine: &CatalogEngine, view: u64, key: u64) -> ReadSpec {
 /// One measured read of `view` under `spec`, after an unmeasured one of the same
 /// that leaves the shards it touches resident. Returns its rows and how many it
 /// hydrated.
-fn cell(label: &str, engine: &mut CatalogEngine, view: u64, spec: &ReadSpec) -> (Rc<Batch>, usize) {
+fn cell(label: &str, engine: &mut CatalogEngine, view: u64, spec: &ReadSpec) -> (ReadRows, usize) {
     let counter = perf::Counter::instructions();
     let (registry, dag) = (&engine.registry, &mut engine.dag);
     let digest = registry.relation(view).map(Relation::schema).unwrap().layout_digest();

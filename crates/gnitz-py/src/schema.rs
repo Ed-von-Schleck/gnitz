@@ -91,10 +91,10 @@ impl PyColumnDef {
     }
 
     fn to_rust(&self, py: Python<'_>) -> PyResult<ColumnDef> {
-        let name = self.name.bind(py).to_cow()?.into_owned();
+        let name = self.name.bind(py).to_cow()?;
         Ok(ColumnDef {
             is_hidden: self.is_hidden,
-            ..ColumnDef::new(name, self.ty, self.is_nullable)
+            ..ColumnDef::new(&*name, self.ty, self.is_nullable)
         })
     }
 }

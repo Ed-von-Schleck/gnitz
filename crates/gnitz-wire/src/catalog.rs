@@ -4,6 +4,8 @@
 //! list — the stored-shape digest and [`EXPR_BLOB_VERSION`], the system and user
 //! id ranges, and [`bool_word`].
 
+use std::sync::Arc;
+
 use crate::{ColType, ColumnDef, PkColList, PkListRole, RowSource, TableProps, TypeCode, ViewBudget, ViewProps};
 
 /// Where a row writer emits a row. Both sides already build batches this way —
@@ -369,7 +371,7 @@ impl<'a> ColTabRow<'a> {
         ColTabRow {
             owner_id,
             col_idx,
-            name: col.name.as_str().into(),
+            name: (&*col.name).into(),
             type_code: col.ty.tc.as_wire() as u64,
             is_nullable: col.is_nullable,
             fk_table_id,
@@ -423,7 +425,7 @@ impl<'a> ColTabRow<'a> {
             (table_id, col) => Some(FkRef { table_id, col, on_delete }),
         };
         let def = ColumnDef {
-            name: self.name.to_string(),
+            name: Arc::from(&*self.name),
             ty,
             is_nullable: self.is_nullable,
             is_hidden: self.is_hidden,

@@ -71,7 +71,9 @@ fn an_image_orders_round_trips_and_slots_as_its_value() {
                     ImageKind::Wide(kind) => {
                         let [sa, sb] = &mut scratch;
                         let native = wide_native(&loc, kind, &mb, r, sa);
-                        assert_eq!(wide_native_of_image(kind, invert, image), *native, "{what} row {r}");
+                        let mut v = image.clone();
+                        let n = wide_native_of_image(kind, invert, &mut v);
+                        assert_eq!(&v[..n], &*native, "{what} row {r}");
                         if !invert {
                             for (o, other) in images.iter().enumerate() {
                                 let want = kind.cmp_native(&native, &wide_native(&loc, kind, &mb, o, sb));

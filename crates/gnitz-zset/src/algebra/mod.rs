@@ -40,7 +40,21 @@ pub use route::{ground_owner, Placement, Slot};
 pub use sink::SinkPlan;
 
 pub(crate) use aggregate::{resolve_aggs, Agg, AggValues, RangeGroups, ReduceShape};
-pub(crate) use group_key::{ground_pk, GroupOrdinals, GroupOutKey};
+pub(crate) use group_key::{ground_pk, GroupOutKey, GroupScratch};
 pub(crate) use key_pack::KeyPacker;
 pub(crate) use map::copy_columns;
 pub(crate) use order_image::{image_slot_col, ImageCol, IMAGE_COL};
+
+pub(crate) use crate::repr::vec_bytes;
+
+/// `v` as `n` zeros: freshly allocated zeroed where it lacks the room, else
+/// overwritten in place.
+pub(crate) fn zeroed<T: Copy + Default>(v: &mut Vec<T>, n: usize) {
+    match v.capacity() < n {
+        true => *v = vec![T::default(); n],
+        false => {
+            v.clear();
+            v.resize(n, T::default());
+        }
+    }
+}

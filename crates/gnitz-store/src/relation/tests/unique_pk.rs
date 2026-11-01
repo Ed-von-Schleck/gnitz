@@ -158,3 +158,52 @@ fn enforce_unique_pk_keeps_heap_strings_intact() {
     );
     assert_eq!(eff.len(), 3);
 }
+
+/// A batch in PK order takes the run walk and any other batch the map; both
+/// must give the same effective batch, weights included. Random batches with
+/// repeated keys, mixed weights and differing payloads are enforced as given
+/// and stably sorted by PK, which keeps each key's rows in push order, against
+/// one store that the effective batch then advances.
+#[test]
+fn enforce_unique_pk_ordered_walk_matches_map() {
+    let schema = pk_payload_schema(&[TypeCode::I64]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut pt = scratch_table(dir.path(), schema);
+    let k: Vec<Vec<u8>> = (0..12i64).map(|i| opk_pk(&schema, &[(i - 6) as u64 as u128])).collect();
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+
+    let mut unordered_pushes = 0;
+    for round in 0..300 {
+        let len = 1 + next(24) as usize;
+        let rows: Vec<(usize, i64, i64)> = (0..len)
+            .map(|_| (next(k.len() as u64) as usize, next(5) as i64 - 2, next(3) as i64))
+            .collect();
+        let mut sorted = rows.clone();
+        sorted.sort_by(|a, b| k[a.0].cmp(&k[b.0]));
+        let batch = |rows: &[(usize, i64, i64)]| {
+            let rows: Vec<(&[u8], i64, i64)> = rows.iter().map(|&(i, w, v)| (&k[i][..], w, v)).collect();
+            make_batch_opk(&schema, &rows)
+        };
+        unordered_pushes += usize::from(rows != sorted);
+
+        let from_map = enforce_unique_pk(&pt, batch(&rows));
+        let from_walk = enforce_unique_pk(&pt, batch(&sorted));
+        assert_eq!(
+            zset_of(&from_map, &schema),
+            zset_of(&from_walk, &schema),
+            "round {round}: {rows:?}"
+        );
+        assert_eq!(from_map.len(), from_walk.len(), "round {round}: effective row count");
+        pt.ingest(from_walk).unwrap();
+        if round % 50 == 49 {
+            flush_barrier([&mut pt], 0).unwrap();
+        }
+    }
+    assert!(unordered_pushes > 200, "{unordered_pushes} pushes took the map");
+}

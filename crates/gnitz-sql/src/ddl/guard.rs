@@ -258,7 +258,7 @@ pub(super) fn read_column(
     }
     let nullable = !serial && not_null != Some(true);
     Ok(ColumnDecl {
-        def: ColumnDef::new(name.value.clone(), ty, nullable),
+        def: ColumnDef::new(name.value.as_str(), ty, nullable),
         serial,
         constraints,
     })

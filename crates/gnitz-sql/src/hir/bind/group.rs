@@ -13,6 +13,7 @@ use gnitz_wire::{ColType, ColumnDef};
 use sqlparser::ast::{Expr, GroupByExpr, Select};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// The GROUP BY clause's expression list. Only the plain list form is supported —
 /// `GROUPING SETS` / `CUBE` / `ROLLUP` / `ALL`, written in the list or as a trailing
@@ -245,7 +246,7 @@ impl GroupedLeaf<'_> {
 
 impl ItemLeaf for GroupedLeaf<'_> {
     /// `None` for a pre-map or aggregate column, which the body's scope does not hold.
-    fn source_name(&self, id: ColId) -> Option<String> {
+    fn source_name(&self, id: ColId) -> Option<Arc<str>> {
         self.leaf.source_name(id)
     }
     fn wildcard_cols(&self, _: Option<&str>) -> Result<Option<Vec<&HirCol>>, GnitzSqlError> {

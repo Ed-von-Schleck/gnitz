@@ -27,6 +27,7 @@ use gnitz_wire::MAX_WORKERS;
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch};
 use gnitz_zset::schema::SchemaDescriptor;
+use smallvec::SmallVec;
 
 /// The default and largest virtual size of one outbox.
 const OUTBOX_BYTES: usize = 1 << 30;
@@ -331,13 +332,13 @@ impl Mesh {
         if !self.complete() {
             return None;
         }
-        let view = round.view;
+        let (view, rank, nw) = (round.view, self.rank, self.nw());
         let (mut drained, mut more) = (true, false);
-        let mut blocks = Vec::with_capacity(self.nw());
-        for peer in 0..self.nw() {
-            // SAFETY: the peer wrote its head before the arrival `complete`
-            // observed, and rewrites it only after this worker's next arrival.
-            let head = unsafe { &*self.outbox(peer).cast::<Head>() };
+        // The non-empty blocks peers sent this worker; they stay as read until
+        // this worker's next arrival.
+        let mut blocks: SmallVec<[&[u8]; MAX_WORKERS]> = SmallVec::new();
+        for peer in 0..nw {
+            let head = self.head(peer);
             if head.view != view {
                 gnitz_fatal_abort!(
                     "exchange of view {view}: worker {peer} published view {} — workers diverged",
@@ -346,7 +347,7 @@ impl Mesh {
             }
             drained &= head.drained != 0;
             more |= head.more != 0;
-            let block = self.block(peer, head.blocks[self.rank]);
+            let block = self.block(peer, head.blocks[rank]);
             if !block.is_empty() {
                 round.merge &= head.consolidated != 0;
                 blocks.push(block);
@@ -359,7 +360,7 @@ impl Mesh {
             return None;
         }
         let schema = &round.schema;
-        let slices: Vec<MemBatch> = round
+        let slices: SmallVec<[MemBatch; MAX_WORKERS]> = round
             .saved
             .iter()
             .map(Vec::as_slice)
@@ -375,9 +376,17 @@ impl Mesh {
             true => merge_consolidated(&slices, schema),
             false => Batch::concat(schema, slices.iter().copied()),
         };
+        drop(slices);
         self.part += 1;
         self.in_round = false;
         Some((rows, drained))
+    }
+
+    /// `peer`'s head for the current part.
+    fn head(&self, peer: usize) -> &Head {
+        // SAFETY: the peer wrote its head before the arrival `complete`
+        // observed, and rewrites it only after this worker's next arrival.
+        unsafe { &*self.outbox(peer).cast::<Head>() }
     }
 
     /// The block `span` names in `peer`'s outbox for the current part.

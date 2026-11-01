@@ -39,7 +39,7 @@ pub(super) fn lower_setop(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<Em
     // The leaves, in the order `combine` reads them, which is scan order.
     let mut leaves: Vec<Leaf> = Vec::new();
     combine(&mut Circuit::default(), rel, false, &mut |dry, side| {
-        let cols = side.cols();
+        let cols = side.cols().into_owned();
         let spine = open(chain, side, &cols.iter().map(|c| c.id).collect())?;
         let (node, frame) = spine.emit(&mut cb, Top::Slots)?;
         leaves.push(Leaf { cols, node, frame });
@@ -75,7 +75,7 @@ pub(super) fn lower_setop(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<Em
             .frame
             .slots(leaf.cols.iter().map(|c| c.id))?
             .into_iter()
-            .zip(&out)
+            .zip(out.iter())
             .map(|(s, o)| (s as u32, o.def.ty.tc))
             .collect();
         Ok(match key {

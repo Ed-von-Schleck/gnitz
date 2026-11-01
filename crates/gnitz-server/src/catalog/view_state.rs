@@ -2,17 +2,15 @@
 //! the boot's resume point, the ephemeral checkpoint round, the orphan-directory
 //! sweep, and the hydrating read.
 
-use std::rc::Rc;
-
+use gnitz_store::read::ReadRows;
 use gnitz_store::relation::Residency;
 use gnitz_wire::ReadSpec;
-use gnitz_zset::repr::Batch;
 
 use super::CatalogEngine;
 
 impl CatalogEngine {
     /// [`gnitz_store::relation::RelationRegistry::scan_spec`], hydrating.
-    pub(crate) fn scan_spec(&mut self, target_id: u64, spec: ReadSpec, reply_layout: u64) -> Result<Rc<Batch>, String> {
+    pub(crate) fn scan_spec(&mut self, target_id: u64, spec: ReadSpec, reply_layout: u64) -> Result<ReadRows, String> {
         let (registry, dag) = (&self.registry, &mut self.dag);
         registry.scan_spec(
             target_id,

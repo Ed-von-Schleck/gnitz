@@ -458,6 +458,27 @@ fn carry_heap_charges_exactly_the_excluded_rows() {
     );
 }
 
+/// The room a carry is asked for is reserved past the carried heap, and past
+/// the kept rows' share of it when the carry is refused.
+#[test]
+fn carry_heap_with_room_reserves_past_either_outcome() {
+    let rows: Vec<(u64, i64, &[u8])> = (1..=8).map(|pk| (pk, 1, &[b'x'; 40][..])).collect();
+    let src = make_string_batch(&rows);
+    let mask = src.schema().string_payload_slots();
+    let mb = src.as_mem_batch();
+    let heap = src.blob().len();
+
+    let mut carried = Batch::with_capacity(src.schema(), 8);
+    assert_eq!(carried.carry_heap_with_room(&mb, mask, &[(0, 8)], 1000), Some(0));
+    assert_eq!(carried.blob.len(), heap);
+    assert!(carried.blob.capacity() >= heap + 1000);
+
+    let mut refused = Batch::with_capacity(src.schema(), 8);
+    assert_eq!(refused.carry_heap_with_room(&mb, mask, &[(0, 2)], 1000), None);
+    assert_eq!(refused.blob.len(), 0);
+    assert!(refused.blob.capacity() >= heap / 4 + 1000);
+}
+
 /// A copy that drops a string slot is charged that slot's long bytes of every
 /// row it keeps, and refused once they leave the heap wasteful.
 #[test]
@@ -594,8 +615,46 @@ fn a_shrunk_batch_holds_its_rows_in_no_more_than_they_take() {
             schema.arena_rows(rows) * schema.row_width() + out.blob.len(),
             "{rows} rows, built with {roomy} bytes"
         );
+        assert_eq!(out.data.capacity(), out.data.len(), "{rows} rows");
+        assert_eq!(out.blob.capacity(), out.blob.len(), "{rows} rows");
         assert_eq!(weighted_rows(&out), weighted_rows(&before), "{rows} rows");
     }
+}
+
+/// A batch is shrunk into the pooled buffers of exactly its size when the pool
+/// holds them, and reads back the same rows.
+#[test]
+fn a_shrunk_batch_takes_pooled_buffers_of_its_exact_size() {
+    let schema = make_schema_pk_u64_payload_string();
+    let rows = 100usize;
+    let mut b = BatchBuilder::new(&schema);
+    for i in 0..rows {
+        b.begin_row_natives(&[i as u128], 1);
+        b.put_blob(format!("a-fairly-long-string-value-{i}").as_bytes());
+        b.end_row();
+    }
+    let b = b.finish();
+    let before = weighted_rows(&b);
+    let need = schema.arena_rows(rows) * schema.row_width();
+    let heap = b.blob.len();
+    assert_ne!(b.data.capacity(), need, "the built batch has room to shrink");
+    assert_ne!(b.blob.capacity(), heap, "the built heap has room to shrink");
+    assert_ne!(need, heap);
+
+    drain_pool();
+    let (data, blob) = (vec![0xEEu8; need], vec![0xEEu8; heap]);
+    let ptrs = (data.as_ptr(), blob.as_ptr());
+    drop(PooledBuf(data));
+    drop(PooledBuf(blob));
+    let out = b.shrunk();
+    assert_eq!(
+        (out.data.as_ptr(), out.blob.as_ptr()),
+        ptrs,
+        "both buffers come from the pool"
+    );
+    assert_eq!((out.data.capacity(), out.data.len()), (need, need));
+    assert_eq!((out.blob.capacity(), out.blob.len()), (heap, heap));
+    assert_eq!(weighted_rows(&out), before);
 }
 
 /// A key set names the rows keyed by one of its keys: every row of a key
@@ -702,4 +761,57 @@ fn runs_where_zip_matches_a_per_position_scan_across_word_boundaries() {
         assert_eq!(runs_where(&a, |x| *x != 0), naive_runs(n, |i| a[i] != 0), "n = {n}");
         assert_eq!(runs_where(&a, |_| true), naive_runs(n, |_| true), "n = {n}");
     }
+}
+
+/// One row at a time through `append_stored`, each reserving its long strings:
+/// every string reads back as its source, and the heap's capacity doubles
+/// rather than growing by each reserve.
+#[test]
+fn append_stored_one_row_at_a_time_grows_the_heap_geometrically() {
+    use crate::repr::{Run, StoredRow};
+    use crate::test_support::string_batch;
+    const N: usize = 1000;
+    let src = std::rc::Rc::new(string_batch(
+        &(0..N as u64)
+            .map(|i| (i, format!("long string number {i:>8}")))
+            .collect::<Vec<_>>(),
+    ));
+    let run = Run::Mem(src.clone());
+    let mut dst = Batch::empty_with_schema(src.schema());
+    let mut caps = std::collections::BTreeSet::new();
+    for row in 0..N {
+        dst.append_stored(&[StoredRow::new(run.clone(), row)], 1);
+        caps.insert(dst.blob.capacity());
+    }
+    assert_eq!(read_strings(&dst), read_strings(&src));
+    assert!(
+        caps.len() <= 2 * N.ilog2() as usize,
+        "{} distinct capacities",
+        caps.len()
+    );
+}
+
+/// A heap that outgrows its buffer moves into a pooled one of at least twice
+/// its capacity, holding exactly its old bytes, and the outgrown buffer goes
+/// back to the pool; a reserve the capacity covers moves nothing.
+#[test]
+fn reserve_blob_grows_into_a_pooled_buffer() {
+    let mut b = Batch::empty_with_schema(&make_schema_pk_u64_payload_string());
+    drain_pool();
+    b.reserve_blob(100);
+    b.blob.extend_from_slice(&[7; 100]);
+    assert_eq!(b.blob.capacity(), 100, "precondition: the heap is full");
+
+    // A pooled buffer that held other bytes.
+    let pooled = vec![0xEE; 300];
+    let at = pooled.as_ptr();
+    drop(PooledBuf(pooled));
+
+    b.reserve_blob(1);
+    assert_eq!(b.blob.as_ptr(), at, "the growth takes the pooled buffer");
+    assert_eq!(b.blob.as_slice(), &[7; 100]);
+    b.reserve_blob(200);
+    assert_eq!(b.blob.as_ptr(), at, "a covered reserve moves nothing");
+    let caps: Vec<usize> = drain_pool().iter().map(Vec::capacity).collect();
+    assert_eq!(caps, [100], "the outgrown buffer is pooled");
 }

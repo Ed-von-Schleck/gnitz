@@ -107,7 +107,7 @@ impl CatalogRelation {
         cols.as_slice()
             .iter()
             .filter_map(|&ci| self.columns.get(ci as usize))
-            .map(|c| c.def.name.as_str())
+            .map(|c| &*c.def.name)
             .collect()
     }
 }

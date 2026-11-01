@@ -27,7 +27,7 @@ proptest! {
     fn an_admitted_record_decodes_as_itself(schema in arb_schema(MAX_PK_COLUMNS), hidden in any::<bool>()) {
         let mut defs: Vec<ColumnDef> = cols_of(&schema).into_iter().map(|c| c.def).collect();
         for c in &mut defs {
-            c.name = format!("renamed_{}", c.name);
+            c.name = format!("renamed_{}", c.name).into();
             c.is_hidden = hidden;
         }
         let frame = gnitz_wire::schema_block::encode(defs.iter().map(ColumnDef::block_col), schema.pk_cols());

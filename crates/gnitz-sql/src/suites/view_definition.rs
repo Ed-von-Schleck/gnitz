@@ -39,7 +39,7 @@ fn renamed_desc(d: &RelDescriptor) -> Arc<RelDescriptor> {
         .columns()
         .iter()
         .map(|c| ColumnDef {
-            name: format!("{}_r", c.name),
+            name: format!("{}_r", c.name).into(),
             ..c.clone()
         })
         .collect();
@@ -90,7 +90,7 @@ fn shape(chain: &ViewBundle) -> (Vec<Member>, Vec<String>) {
     let names = final_view(chain)
         .schema
         .visible_columns()
-        .map(|(_, c)| c.name.clone())
+        .map(|(_, c)| c.name.to_string())
         .collect();
     (members, names)
 }

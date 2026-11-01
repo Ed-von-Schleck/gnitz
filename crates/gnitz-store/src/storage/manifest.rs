@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use io_uring::types::FsyncFlags;
 
@@ -116,9 +116,18 @@ pub(super) fn staging_path(dir: &str) -> String {
     format!("{dir}/manifest.bin.tmp")
 }
 
-/// The basename of the shard drawn at `seq`: `shard_{seq}.db`.
+/// The basename of the shard drawn at its seq: `shard_{seq}.db`.
+struct ShardName(u64);
+
+impl std::fmt::Display for ShardName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shard_{}.db", self.0)
+    }
+}
+
+/// The basename of the shard drawn at `seq`.
 pub(super) fn shard_name(seq: u64) -> String {
-    format!("shard_{seq}.db")
+    ShardName(seq).to_string()
 }
 
 /// The seq `name` denotes, or `None` unless [`shard_name`] gives that seq
@@ -139,7 +148,7 @@ pub(super) fn shard_seqs(dir: &str) -> io::Result<Vec<u64>> {
 
 /// The path of the shard drawn at `seq` in the store at `dir`.
 pub(super) fn shard_path(dir: &str, seq: u64) -> String {
-    format!("{dir}/{}", shard_name(seq))
+    format!("{dir}/{}", ShardName(seq))
 }
 
 /// `r`, with `NotFound` read as success.
@@ -212,12 +221,11 @@ pub(super) fn commit(dir: &str) -> Result<(), StorageError> {
 /// too, for the entries that reach it. A store directory sits at most two below
 /// the data directory's `_relations` (`relation_dir[/child]`), whose own entry
 /// `lock_data_dir` syncs.
-pub(super) fn owed_dirs(dir: &str, first: bool) -> impl Iterator<Item = PathBuf> + '_ {
+pub(super) fn owed_dirs(dir: &str, first: bool) -> impl Iterator<Item = &Path> + '_ {
     Path::new(dir)
         .ancestors()
         .take(if first { 3 } else { 1 })
         .filter(|d| !d.as_os_str().is_empty())
-        .map(Path::to_path_buf)
 }
 
 /// Durably unlink the manifest of every store in `dirs`, in one sync batch; an

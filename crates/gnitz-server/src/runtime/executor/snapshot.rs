@@ -34,7 +34,7 @@ pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u6
     shared.last_snapshot.set(id);
     // No DDL moves the catalog between the master's pin and the workers'.
     let catalog = shared.catalog_rwlock.read().await;
-    let leases = shared
+    let lease = shared
         .dispatcher
         .scan_cut(|cut| {
             shared.cat_mut().registry.pin(id).map_err(WireFault::from)?;
@@ -42,8 +42,8 @@ pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u6
         })
         .await;
     drop(catalog);
-    let pinned = match leases {
-        Ok(mut leases) => leases.pop().expect("one read, one lease").finish().await,
+    let pinned = match lease {
+        Ok(lease) => lease.finish().await,
         Err(e) => Err(e),
     };
     if let Err(e) = pinned {

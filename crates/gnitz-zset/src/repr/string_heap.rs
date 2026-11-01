@@ -141,7 +141,7 @@ pub(super) fn long_bytes_outside<S: RowSource>(src: &S, mask: u64, kept: &[(usiz
 /// The heap bytes `row`'s long cells in the German-string slots `mask` name.
 /// A span two cells share counts twice.
 #[inline]
-pub(super) fn row_long_bytes<S: RowSource>(src: &S, mask: u64, row: usize) -> usize {
+pub(crate) fn row_long_bytes<S: RowSource>(src: &S, mask: u64, row: usize) -> usize {
     gnitz_wire::BitIter(mask)
         .map(|pi| gnitz_wire::german_string_long_len(src.german_cell(row, pi)))
         .sum()

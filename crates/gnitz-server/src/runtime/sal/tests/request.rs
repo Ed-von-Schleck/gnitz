@@ -139,3 +139,34 @@ fn a_probe_no_kind_writes_is_refused() {
         );
     }
 }
+
+/// A decoded read borrows the bytes it came in; `into_owned` copies them, and the
+/// copy outlives those bytes.
+#[test]
+fn a_read_borrows_its_blob_until_owned() {
+    let hdr = ControlHeader { arg0: 7, ..Default::default() };
+    let owned = {
+        let blob = vec![1u8, 2, 3];
+        let SalRequest::Read(read) = SalRequest::decode(SalMessageKind::ScanSpec, 5, &hdr, &blob).unwrap() else {
+            panic!("a scan is a read")
+        };
+        let Read::ScanSpec { spec: Cow::Borrowed(spec), .. } = &read else {
+            panic!("a decoded spec borrows its blob")
+        };
+        assert_eq!(spec.as_ptr(), blob.as_ptr());
+        read.into_owned()
+    };
+    assert!(matches!(
+        *owned,
+        Read::ScanSpec { tid: 5, reply_layout: 7, spec: Cow::Owned(ref s) } if s == &[1, 2, 3]
+    ));
+}
+
+#[test]
+fn into_owned_keeps_every_read() {
+    for request in every_request() {
+        let SalRequest::Read(read) = request else { continue };
+        let expected = format!("{read:?}");
+        assert_eq!(format!("{:?}", *read.into_owned()), expected);
+    }
+}

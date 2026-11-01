@@ -24,6 +24,7 @@ use crate::ir::{BExpr, BinOp, LeafTyping};
 use gnitz_core::{PlannedView, RelDescriptor, Schema};
 use gnitz_wire::AggFunc as WireAggFunc;
 use gnitz_wire::{ColType, ColumnDef, RangeRel, TypeCode};
+use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -52,11 +53,11 @@ pub(crate) fn bind_and_lower<'a>(
     let stmt = view.stmt;
     let mut cx = bind::BindCx::new(cat, &ids, bind::Surface::View(view));
     let rel = bind::bind_query(&mut cx, query)?;
-    let mut names = rel.cols();
+    let mut names = rel.cols().into_owned();
     let body_columns = names
         .iter()
         .filter(|c| !c.def.is_hidden)
-        .map(|c| c.def.name.clone())
+        .map(|c| c.def.name.to_string())
         .collect();
     bind::apply_positional_aliases(aliases, names.iter_mut().map(|c| &mut c.def), stmt)?;
     let (segments, view) = lower::lower(rel, bounded, &names)?;
@@ -98,7 +99,7 @@ pub(crate) fn bind_adhoc_read(
     let mut cx = bind::BindCx::new(cat, &ids, bind::Surface::Adhoc);
     bind::bind_ctes(&mut cx, query)?;
     let (rel, placed) = bind::bind_select(&cx, select, order_exprs)?;
-    lower::read::lower_read(&rel, placed, &cx.refs.into_inner())
+    lower::read::lower_read(&rel, placed, cx.refs.into_inner())
 }
 
 /// An `INSERT … RETURNING` list as the reply items of a read of `desc`.
@@ -831,7 +832,7 @@ impl RelExpr {
             )));
         }
         let mut out = Vec::with_capacity(lcols.len());
-        for (i, (l, r)) in lcols.iter().zip(&rcols).enumerate() {
+        for (i, (l, r)) in lcols.iter().zip(rcols.iter()).enumerate() {
             let ty = set_op_common_type(l.def.ty, r.def.ty).ok_or_else(|| {
                 GnitzSqlError::Rejected(format!(
                     "set operation: column {} type mismatch ({} vs {})",
@@ -867,50 +868,48 @@ impl RelExpr {
     }
 
     /// The node's output columns.
-    pub(crate) fn cols(&self) -> Vec<HirCol> {
+    pub(crate) fn cols(&self) -> Cow<'_, [HirCol]> {
         match self {
-            RelExpr::Unit => Vec::new(),
-            RelExpr::Get { cols, .. } => cols.clone(),
-            RelExpr::Filter { input, .. } => input.cols(),
-            RelExpr::Project { items, .. } => items.iter().map(|e| e.out.clone()).collect(),
+            RelExpr::Unit => Cow::Borrowed(&[]),
+            RelExpr::Get { cols, .. } | RelExpr::Alias { cols, .. } => Cow::Borrowed(cols),
+            RelExpr::Filter { input, .. } | RelExpr::Distinct { input } => input.cols(),
+            RelExpr::Project { items, .. } => Cow::Owned(items.iter().map(|e| e.out.clone()).collect()),
             RelExpr::Join { left, right, kind, .. } => match kind {
                 JoinType::Semi | JoinType::Anti => left.cols(),
                 JoinType::Mark(id) => {
-                    let mut cols = left.cols();
+                    let mut cols = left.cols().into_owned();
                     // Hidden: nothing but the expressions reading the subquery
                     // reach it, and it is addressed by id, never by name.
                     cols.push(HirCol::new(
                         *id,
                         ColumnDef::new("_mark", TypeCode::Bool, false).hidden(),
                     ));
-                    cols
+                    Cow::Owned(cols)
                 }
                 // Null-widened per `JoinType::widen_sides`, as `join_frame` does.
                 _ => {
-                    let mut cols = left.cols();
-                    let mut rcols = right.cols();
+                    let mut cols = left.cols().into_owned();
+                    let mut rcols = right.cols().into_owned();
                     kind.widen_sides(
                         cols.iter_mut().map(|c| &mut c.def),
                         rcols.iter_mut().map(|c| &mut c.def),
                     );
                     cols.extend(rcols);
-                    cols
+                    Cow::Owned(cols)
                 }
             },
             RelExpr::Reduce { input, group_cols, aggs } => {
                 let in_cols = input.cols();
                 let mut cols: Vec<HirCol> = group_cols.iter().map(|id| hircol_of(&in_cols, *id).clone()).collect();
                 cols.extend(aggs.iter().map(|c| c.col.clone()));
-                cols
+                Cow::Owned(cols)
             }
-            RelExpr::Distinct { input } => input.cols(),
             RelExpr::Ordered { input, op, .. } => {
-                let mut cols = input.cols();
+                let mut cols = input.cols().into_owned();
                 cols.extend(op.added_cols().cloned());
-                cols
+                Cow::Owned(cols)
             }
-            RelExpr::Alias { cols, .. } => cols.clone(),
-            RelExpr::SetOp { out, .. } => out.clone(),
+            RelExpr::SetOp { out, .. } => Cow::Borrowed(out),
         }
     }
 }

@@ -5,11 +5,10 @@
 //! raised here; the SQL dispatch arms and the Python context manager only
 //! translate them.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gnitz_expr::{LogicalProgram, RowFilter};
+use gnitz_expr::{leading_pk, LogicalProgram, RowFilter};
 use gnitz_wire::txn_frame::BLIND;
 use gnitz_wire::{PkBuf, PkKeys, ReadBound, ReadSink, ReadSpec, WireConflictMode, WireFault, WireStatus};
 
@@ -17,14 +16,16 @@ use crate::client::GnitzClient;
 use crate::connection::PushFamily;
 use crate::connection::{RelDescriptor, Request, ScanReply, Target};
 use crate::error::ClientError;
-use crate::{Schema, ZSetBatch};
+use crate::{PushBatch, Schema, ZSetBatch};
 
 /// The keys-only read of `schema`: a reply of its PK columns alone, and a rows sink
 /// whose zero-instruction map fills no payload slot.
 pub fn key_reply(schema: &Schema) -> (Arc<Schema>, ReadSink) {
-    let pk: Vec<u32> = (0..schema.pk_cols().len() as u32).collect();
-    let reply = Schema::from_parts(schema.hidden_key_columns().collect(), &pk)
-        .expect("a schema's own PK columns are an admissible schema");
+    let reply = Schema::from_parts(
+        schema.hidden_key_columns().collect(),
+        leading_pk(schema.pk_cols().len()),
+    )
+    .expect("a schema's own PK columns are an admissible schema");
     let map = LogicalProgram::copy_cols(&[]).to_map(Vec::new());
     (Arc::new(reply), ReadSink { map: Some(map), ..ReadSink::all_rows() })
 }
@@ -70,7 +71,7 @@ impl GnitzClient {
         let buf = self.txn.take().ok_or_else(no_transaction)?;
         self.push_txn(&buf).await.map_err(|e| match e {
             ClientError::Refused(WireFault { status: WireStatus::StaleCatalog, text }) => {
-                self.kept.retain(|_, rel| !buf.families_of.contains_key(&rel.tid));
+                self.kept.retain(|_, rel| !buf.tids.contains_key(&rel.tid));
                 ClientError::Refused(WireFault {
                     status: WireStatus::TxnConflict,
                     text: format!("transaction conflict: {text}; retry"),
@@ -139,11 +140,11 @@ impl GnitzClient {
             let batch = build(txn.overlay(tid, schema, &spec, keys, batch)?)?;
             let count = batch.len();
             txn.push(target, schema, batch, WireConflictMode::Update, basis)?;
-            let pushed = match self.txn {
-                Some(_) => Ok(0),
-                None => self.push_txn(&own).await,
-            };
-            match pushed {
+            if self.txn.is_some() {
+                return Ok(count);
+            }
+            // Autocommit: the statement is a transaction of its own.
+            match self.push_txn(&own).await {
                 Err(e) if e.status() == Some(WireStatus::TxnConflict) && attempt < RMW_MAX_ATTEMPTS => {}
                 r => {
                     r?;
@@ -165,21 +166,51 @@ fn no_transaction() -> ClientError {
 #[derive(Default)]
 pub(crate) struct TxnBuffer {
     /// Creation order; per tid, maximal same-mode runs of the caller's op
-    /// sequence.
+    /// sequence. Only a tid's last family can still grow (a matching-mode
+    /// append extends it), which is what makes indexing a tid's families in
+    /// creation order the same as indexing in append order.
     families: Vec<PushFamily>,
-    /// Per family, how many of its batch's rows are already folded into
-    /// `last_op_of`. A batch only ever extends, so this is a watermark.
-    indexed: Vec<usize>,
+    /// Every tid with a family.
+    tids: HashMap<u64, TidWrites>,
+}
 
-    /// tid → its family indices in creation order. Only the last one can still
-    /// grow (a matching-mode append extends it), which is what makes indexing a
-    /// tid's families in this order the same as indexing in append order.
-    families_of: HashMap<u64, Vec<usize>>,
-    /// tid → PK → `(family index, row index)` of the LAST op buffered on that
-    /// PK. Row indices are stable: `push` only ever extends a family batch or
-    /// pushes a new one. Weight-0 rows are not indexed — they are inert, exactly
-    /// as the engine's fold treats them.
-    last_op_of: HashMap<u64, HashMap<PkBuf, (usize, usize)>>,
+/// One tid's families and the read index over them.
+#[derive(Default)]
+struct TidWrites {
+    /// Its families' indices in `families`, in creation order.
+    fams: Vec<usize>,
+    /// Rows already folded into `last_op`: those of every family before
+    /// `fams[at]`, and the first `rows` of `fams[at]`. Only the last family
+    /// grows, so this is a watermark.
+    at: usize,
+    rows: usize,
+    /// PK → `(family index, row index)` of the LAST op buffered on that PK.
+    /// Row indices are stable: `push` only ever extends a family batch or
+    /// pushes a new one. Weight-0 rows are not indexed — they are inert,
+    /// exactly as the engine's fold treats them.
+    last_op: HashMap<PkBuf, (usize, usize)>,
+}
+
+impl TidWrites {
+    /// The read index, once every row buffered since the last catch-up is
+    /// folded into it. Each row is folded at most once, so the whole index
+    /// costs O(rows buffered) across the transaction however often it is read —
+    /// and nothing at all for a transaction that never reads.
+    fn index(&mut self, families: &[PushFamily]) -> &HashMap<PkBuf, (usize, usize)> {
+        let TidWrites { fams, at, rows, last_op } = self;
+        let from = *at;
+        for (p, &fam) in fams.iter().enumerate().skip(from) {
+            let batch = &families[fam].batch;
+            let start = if p == from { *rows } else { 0 };
+            for row in start..batch.len() {
+                if batch.weights[row] != 0 {
+                    last_op.insert(PkBuf::from_bytes(batch.pks.get_bytes(row)), (fam, row));
+                }
+            }
+            (*at, *rows) = (p, batch.len());
+        }
+        last_op
+    }
 }
 
 impl TxnBuffer {
@@ -200,7 +231,7 @@ impl TxnBuffer {
         &mut self,
         target: impl Into<Target>,
         schema: &Arc<Schema>,
-        batch: impl Into<Cow<'b, ZSetBatch>>,
+        batch: impl Into<PushBatch<'b>>,
         mode: WireConflictMode,
         basis: u64,
     ) -> Result<(), ClientError> {
@@ -217,27 +248,27 @@ impl TxnBuffer {
             true => Ok(()),
             false => batch.layout_matches(&held.schema),
         })?;
-        // Copied out, so no borrow of `families_of` spans the `families` read.
-        let last = self.families_of.get(&tid).and_then(|v| v.last().copied());
+        let last = self.tids.get(&tid).and_then(|t| t.fams.last().copied());
         match last.filter(|&i| self.families[i].mode == mode) {
             Some(i) => {
                 let f = &mut self.families[i];
-                f.batch.extend_from(&batch);
+                // Copies the batch first while its pusher still shares it, so a
+                // shared batch is never written; row indices are kept either way.
+                Arc::make_mut(&mut f.batch).extend_from(&batch);
                 f.basis = f.basis.min(basis);
                 if f.target.token == 0 {
                     f.target = target;
                 }
             }
             None => {
-                self.families_of.entry(tid).or_default().push(self.families.len());
+                self.tids.entry(tid).or_default().fams.push(self.families.len());
                 self.families.push(PushFamily {
                     target,
                     schema: Arc::clone(schema),
-                    batch: batch.into_owned(),
+                    batch: batch.into_arc(),
                     mode,
                     basis,
                 });
-                self.indexed.push(0);
             }
         }
         Ok(())
@@ -249,37 +280,17 @@ impl TxnBuffer {
         tid: u64,
         matches: impl FnOnce(&PushFamily) -> Result<(), String>,
     ) -> Result<(), ClientError> {
-        let Some(&first) = self.families_of.get(&tid).and_then(|v| v.first()) else {
+        let Some(t) = self.tids.get(&tid) else {
             return Ok(());
         };
-        matches(&self.families[first])
+        matches(&self.families[t.fams[0]])
             .map_err(|e| ClientError::from(format!("relation {tid} changed layout during this transaction: {e}")))
-    }
-
-    /// Fold every row `tid` has buffered since the last catch-up into
-    /// `last_op_of`. Each row is folded at most once, so the whole index costs
-    /// O(rows buffered) across the transaction however often it is read — and
-    /// nothing at all for a transaction that never reads.
-    fn index_tid(&mut self, tid: u64) {
-        let Some(own) = self.families_of.get(&tid) else {
-            return;
-        };
-        let index = self.last_op_of.entry(tid).or_default();
-        for &fam in own {
-            let batch = &self.families[fam].batch;
-            for row in std::mem::replace(&mut self.indexed[fam], batch.len())..batch.len() {
-                if batch.weights[row] != 0 {
-                    index.insert(PkBuf::from_bytes(batch.pks.get_bytes(row)), (fam, row));
-                }
-            }
-        }
     }
 
     /// The keys of `set` this transaction has not written — what a read of
     /// `set` still has to ask the server. `None` when it wrote none of them.
     fn unwritten(&mut self, tid: u64, set: &PkKeys) -> Option<PkKeys> {
-        self.index_tid(tid);
-        let index = self.last_op_of.get(&tid)?;
+        let index = self.tids.get_mut(&tid)?.index(&self.families);
         if !set.iter().any(|k| index.contains_key(k)) {
             return None;
         }
@@ -301,8 +312,8 @@ impl TxnBuffer {
         committed: ZSetBatch,
     ) -> Result<ZSetBatch, ClientError> {
         self.check_layout(tid, |held| held.batch.layout_matches(schema))?;
-        self.index_tid(tid);
-        let Some(index) = self.last_op_of.get(&tid) else {
+        let families = &self.families;
+        let Some(index) = self.tids.get_mut(&tid).map(|t| t.index(families)) else {
             return Ok(committed);
         };
         let keep: Vec<u32> = (0..committed.len())
@@ -313,7 +324,6 @@ impl TxnBuffer {
         let mut out = committed.gather(&keep);
 
         let mut live = ZSetBatch::new(schema);
-        let families = &self.families;
         let take = |&(fam, row): &(usize, usize)| {
             let b = &families[fam].batch;
             if b.weights[row] > 0 {
@@ -327,15 +337,14 @@ impl TxnBuffer {
         if live.is_empty() {
             return Ok(out);
         }
-        let mut ranges = Vec::new();
-        RowFilter::for_read(&spec.predicate, spec.bound.range(), schema.layout())
-            .map_err(|e| ClientError::from(e.to_string()))?
-            .ranges(&live, &mut ranges);
+        let mut filter = RowFilter::for_read(&spec.predicate, spec.bound.range(), schema.layout())
+            .map_err(|e| ClientError::from(e.to_string()))?;
+        let ranges = filter.ranges(&live);
         if keys {
             // The predicate has read the payload; the key reply carries none.
             live.payload.clear();
             live.blob.clear();
-            live.retain_ranges(&ranges);
+            live.retain_ranges(ranges);
             live.nulls.fill(0);
         } else {
             let kept: Vec<u32> = ranges.iter().flat_map(|&(s, e)| s as u32..e as u32).collect();

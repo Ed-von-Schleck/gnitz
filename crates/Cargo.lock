@@ -841,6 +841,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "slab",
+ "smallvec",
  "tempfile",
 ]
 
@@ -902,6 +903,7 @@ name = "gnitz-wire"
 version = "0.1.8"
 dependencies = [
  "gnitz-foundation",
+ "smallvec",
  "xxhash-rust",
 ]
 
@@ -917,6 +919,7 @@ dependencies = [
  "proptest",
  "rustc-hash",
  "simdutf8",
+ "smallvec",
  "tempfile",
  "xorf",
 ]

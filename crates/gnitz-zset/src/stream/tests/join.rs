@@ -265,6 +265,54 @@ fn assert_matches_reference(
     }
 }
 
+/// A plan reused over several epochs, through the thread's reused pairings
+/// buffer, writes per epoch exactly what a fresh plan writes: rows, order and
+/// weights. The epochs differ in size and in what they match, one matching
+/// nothing, so a pairing left over from an earlier epoch would show.
+#[test]
+fn a_reused_plan_writes_what_a_fresh_one_writes() {
+    let schema = side_schema(&[TypeCode::U64], TypeCode::I64, true);
+    let row = |slot: u8, w: i64, val: i64| (vec![Some(slot)], w, val);
+    let trace = side_batch(
+        &schema,
+        &[row(0, 1, 2), row(1, 2, 3), row(1, 1, 7), row(3, -1, 6), row(3, 1, 2)],
+    );
+    let trace = TestTrace::dealt(&trace, 2);
+    let epochs = [
+        vec![row(0, 1, 3), row(1, 1, 2), row(1, -1, 6), row(3, 2, 7)],
+        vec![row(2, 1, 2)],
+        vec![row(1, 1, 3)],
+        vec![row(0, 1, 2), row(1, 3, 7), row(2, 1, 6), row(3, -2, 3)],
+    ];
+    let kinds = [
+        JoinKind::Equi,
+        JoinKind::Range { rel: RangeRel::Lt },
+        JoinKind::Range { rel: RangeRel::Ge },
+        JoinKind::Cross,
+    ];
+    for kind in kinds {
+        for delta_is_right in [false, true] {
+            let reused = plan(kind, delta_is_right, &schema, &schema);
+            for (e, rows) in epochs.iter().enumerate() {
+                let delta = side_batch(&schema, rows).into_consolidated();
+                let fresh = plan(kind, delta_is_right, &schema, &schema);
+                let mut open = |f: &[u8], l: &[u8]| trace.cursor_within(f, l);
+                let got = op_join_delta_trace(&delta, &mut open, &reused);
+                let want = op_join_delta_trace(&delta, &mut open, &fresh);
+                let at = format!("kind={kind:?} delta_is_right={delta_is_right} epoch {e}");
+                assert_eq!(got.len(), want.len(), "{at}: row count");
+                assert_eq!(got.pk(), want.pk(), "{at}: keys");
+                assert_eq!(got.weight(), want.weight(), "{at}: weights");
+                assert_eq!(
+                    zset_of(&got, &reused.output_schema),
+                    zset_of(&want, &fresh.output_schema),
+                    "{at}"
+                );
+            }
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // RangeProbe::cut_points, over 1-byte slots so the keys are exact-comparable
 // -----------------------------------------------------------------------

@@ -161,7 +161,7 @@ fn access_line(bound: &ReadBound, schema: &Schema) -> String {
                 .cols()
                 .as_slice()
                 .iter()
-                .map(|&c| schema.columns()[c as usize].name.as_str())
+                .map(|&c| &*schema.columns()[c as usize].name)
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("index range on ({cols})")
@@ -199,7 +199,7 @@ fn fold_line(agg: &GroupAggs, reduce_schema: &Schema, has_having: bool, is_disti
     let cols = agg
         .group_cols
         .iter()
-        .map(|&c| reduce_schema.columns()[c as usize].name.as_str())
+        .map(|&c| &*reduce_schema.columns()[c as usize].name)
         .collect::<Vec<_>>()
         .join(", ");
     let ops = agg

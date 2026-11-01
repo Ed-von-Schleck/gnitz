@@ -607,9 +607,12 @@ impl RelationRegistry {
         format!("relation {id} is not registered")
     }
 
-    /// True iff at least one registered relation carries a delta feed.
-    pub fn any_delta_feed(&self) -> bool {
-        self.relations.values().any(|r| r.kind().has_delta_feed())
+    /// The ids of the registered relations that carry a delta feed.
+    pub fn delta_fed(&self) -> impl Iterator<Item = u64> + '_ {
+        self.relations
+            .iter()
+            .filter(|(_, r)| r.kind().has_delta_feed())
+            .map(|(&id, _)| id)
     }
 }
 

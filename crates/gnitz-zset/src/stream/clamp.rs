@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use gnitz_wire::ClampKind;
 
-use crate::repr::{materialize_carrying, Batch, Pick};
+use crate::repr::{materialize_carrying, with_picks, Batch};
 use crate::stream::History;
 
 /// Per consolidated (PK, payload) of `delta`, emits `clamp(w_old + Δw, 0, cap) −
@@ -27,28 +27,29 @@ pub fn op_weight_clamp(delta: Cow<'_, Batch>, hist: History<'_>, kind: ClampKind
         ClampKind::PositivePart => i64::MAX,
     };
     let mb = delta.as_mem_batch();
-    let mut rows: Vec<Pick> = Vec::new();
-    let mut identity = true;
-    cursor.for_each_mem_row_weight(&mb, |i, w_hist| {
-        let dw = mb.get_weight(i);
-        let w_old = if hist_holds_delta {
-            w_hist.wrapping_sub(dw)
-        } else {
-            w_hist
-        };
-        let out_w = w_old.wrapping_add(dw).clamp(0, cap) - w_old.clamp(0, cap);
-        identity &= out_w == dw;
-        if out_w != 0 {
-            rows.push((0, i as u32, out_w));
-        }
+    let clamped = with_picks(|rows| {
+        let mut identity = true;
+        cursor.for_each_mem_row_weight(&mb, |i, w_hist| {
+            let dw = mb.get_weight(i);
+            let w_old = if hist_holds_delta {
+                w_hist.wrapping_sub(dw)
+            } else {
+                w_hist
+            };
+            let out_w = w_old.wrapping_add(dw).clamp(0, cap) - w_old.clamp(0, cap);
+            identity &= out_w == dw;
+            if out_w != 0 {
+                rows.push((0, i as u32, out_w));
+            }
+        });
+        (!identity).then(|| {
+            let mut out = materialize_carrying(std::slice::from_ref(&mb), delta.schema(), rows);
+            // One row per transitioning element, in delta order: (PK, payload)-sorted, no ghosts.
+            out.certify_consolidated();
+            out
+        })
     });
-    if identity {
-        return delta.into_owned();
-    }
-    let mut out = materialize_carrying(std::slice::from_ref(&mb), delta.schema(), &rows);
-    // One row per transitioning element, in delta order: (PK, payload)-sorted, no ghosts.
-    out.certify_consolidated();
-    out
+    clamped.unwrap_or_else(|| delta.into_owned())
 }
 
 #[cfg(test)]

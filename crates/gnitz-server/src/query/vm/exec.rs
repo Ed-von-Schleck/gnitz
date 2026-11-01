@@ -60,12 +60,13 @@ impl Stores<'_> {
         terms: &[HistoryTerm],
         instructions: &mut [Instr],
     ) -> Result<Vec<Run>, String> {
-        let stride = delta.schema().pk_stride();
-        let keys = PkKeys::from_keys(stride, (0..delta.len()).map(|row| delta.get_pk_bytes(row)));
+        let mut keys = PkKeys::from_vec(delta.schema().pk_stride(), delta.pk().to_vec());
         let mut runs = Vec::with_capacity(terms.len());
         for term in terms {
-            let mut gather = self.gather(Integral::Relation(term.relation), keys.clone())?;
-            let Some(mut rows) = gather.drain_chunk(usize::MAX) else {
+            let mut gather = self.gather(Integral::Relation(term.relation), keys)?;
+            let chunk = gather.drain_chunk(usize::MAX);
+            keys = gather.into_keys();
+            let Some(mut rows) = chunk else {
                 continue;
             };
             for &pc in term.steps.iter() {

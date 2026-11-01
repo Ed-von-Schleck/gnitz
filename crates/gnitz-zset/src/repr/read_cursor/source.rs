@@ -9,11 +9,14 @@ use crate::repr::batch::Batch;
 use crate::repr::merge::merge_consolidated;
 
 /// A chunked source of `Batch`es: a whole cursor, an index range, or a key list.
+// One per read, held on the reader's stack; boxing `Full` or `PkSet` would cost
+// every read an allocation. `Bounded` holds a cursor and a gather, so it stays boxed.
+#[allow(clippy::large_enum_variant)]
 pub enum SourceCursor {
-    Full(Box<ReadCursor>),
+    Full(ReadCursor),
     Bounded(Box<BoundedIndexCursor>),
     /// `pk IN (…)` gather over a listed key set.
-    PkSet(Box<PkSetGather>),
+    PkSet(PkSetGather),
 }
 
 impl SourceCursor {

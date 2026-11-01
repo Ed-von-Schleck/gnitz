@@ -14,7 +14,7 @@ use super::layout::*;
 use super::mmap::Mmap;
 use super::pk_filter;
 use crate::repr::batch::{write_to_batch, Batch};
-use crate::repr::scatter::{ColumnarSource, DecodedColumns, UnifiedSource};
+use crate::repr::scatter::{ColTable, ColumnarSource, DecodedColumns, UnifiedSource};
 use crate::repr::seek::{seek_lower_bound, seek_pk_rows, ColPtr};
 use crate::repr::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
 use crate::repr::PooledBuf;
@@ -686,7 +686,7 @@ impl MappedShard {
         &self,
         pk: ColPtr,
         schema: &SchemaDescriptor,
-        cols: &mut Vec<ColPtr>,
+        cols: &mut ColTable,
         window: Range<usize>,
         decoded: &mut DecodedColumns,
     ) -> UnifiedSource<'_> {
@@ -723,7 +723,7 @@ impl ColumnarSource for MappedShard {
     fn to_unified(
         &self,
         schema: &SchemaDescriptor,
-        cols: &mut Vec<ColPtr>,
+        cols: &mut ColTable,
         window: Range<usize>,
         decoded: &mut DecodedColumns,
     ) -> UnifiedSource<'_> {
@@ -812,7 +812,7 @@ impl ColumnarSource for ShardWindow<'_> {
     fn to_unified(
         &self,
         schema: &SchemaDescriptor,
-        cols: &mut Vec<ColPtr>,
+        cols: &mut ColTable,
         window: Range<usize>,
         decoded: &mut DecodedColumns,
     ) -> UnifiedSource<'_> {

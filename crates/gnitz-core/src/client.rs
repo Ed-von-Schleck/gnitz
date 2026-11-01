@@ -2,7 +2,6 @@
 //! every other `impl GnitzClient` file builds on — waiting, ids, requests and
 //! relation resolution.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::os::fd::AsFd;
@@ -17,7 +16,7 @@ use crate::connection::{DeltaCursor, RelDescriptor, Request, ScanReply, Session,
 use crate::error::{not_found, ClientError};
 use crate::host::{offload, serve, BlockingHost, Host, Pending, Sent};
 use crate::txn::TxnBuffer;
-use crate::{RelName, Schema, ZSetBatch};
+use crate::{PushBatch, RelName, Schema, ZSetBatch};
 
 /// The ids one SERIAL reservation takes when the statement asks for fewer. Each
 /// reservation is a round trip to the master.
@@ -253,12 +252,14 @@ impl GnitzClient {
     /// Inside an open transaction the batch is buffered instead of sent, and the
     /// returned LSN is `0` — nothing is durable until `txn_commit`, which returns
     /// the one zone LSN covering the whole bundle. A batch passed by value moves
-    /// into the buffer; a borrowed one is copied into it once.
+    /// into the buffer; a shared one is held as it is until a later push to the
+    /// same family extends it, which copies it if the caller still holds it; a
+    /// borrowed one is copied into the buffer once.
     pub fn push<'a>(
         &mut self,
         target: impl Into<Target>,
         schema: &Arc<Schema>,
-        batch: impl Into<Cow<'a, ZSetBatch>>,
+        batch: impl Into<PushBatch<'a>>,
         mode: WireConflictMode,
     ) -> Pending<'_, u64> {
         let (target, batch) = (target.into(), batch.into());

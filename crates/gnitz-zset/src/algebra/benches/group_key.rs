@@ -4,7 +4,7 @@ use crate::schema::SchemaColumn;
 use crate::test_support::{mix, pk_payload_schema, u64_pk_schema};
 use gnitz_wire::TypeCode;
 
-/// Instructions per [`GroupOutKey::numbered`] call and per row, per key form,
+/// Instructions per [`GroupOutKey::numbered_into`] call and per row, per key form,
 /// over unconsolidated rows: a two-row delta of two groups — an UPDATE's
 /// retraction and insert — then 262 144 rows in 1000 groups, where a key that
 /// hashes is hashed into them, and with every row a group of its own, where the
@@ -54,12 +54,18 @@ fn group_ordinals_bench() {
                 bb.end_row();
             }
             let batch = bb.finish();
-            assert!(key.runs(&batch).is_none(), "{label}: unconsolidated rows are numbered");
-            let ordinals = key.numbered(&batch);
-            assert_eq!(ordinals.len() as u64, groups, "{label}");
+            assert!(
+                !key.runs_into(&batch, &mut Vec::new()),
+                "{label}: unconsolidated rows are numbered"
+            );
+            // Numbered once ahead of the measured calls, as a reduce keeps its buffers across epochs.
+            let mut scratch = GroupScratch::default();
+            key.numbered_into(&batch, &mut scratch);
+            assert_eq!(scratch.groups.len() as u64, groups, "{label}");
             let ((), instructions) = counter.measure(|| {
                 for _ in 0..iters {
-                    std::hint::black_box(key.numbered(&batch));
+                    key.numbered_into(&batch, &mut scratch);
+                    std::hint::black_box(&scratch.groups);
                 }
             });
             println!(

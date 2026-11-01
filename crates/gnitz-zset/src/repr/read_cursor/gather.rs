@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 
 use super::{ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
-use crate::repr::scatter::{gather_rows, Pick};
+use crate::repr::scatter::{gather_rows, with_picks};
 use crate::schema::{project_schema, SchemaDescriptor};
 use gnitz_expr::ColumnLocator;
 
@@ -27,6 +27,11 @@ impl PkSetGather {
     pub fn over(cursor: ReadCursor, keys: PkKeys) -> Self {
         debug_assert!(keys.stride() <= cursor.schema.pk_stride());
         PkSetGather { cursor, keys, next: 0 }
+    }
+
+    /// The whole key list, the keys already gathered included.
+    pub fn into_keys(self) -> PkKeys {
+        self.keys
     }
 
     /// Start over on `keys` against the same snapshot.
@@ -97,20 +102,21 @@ impl PkSetGather {
             return None;
         }
         let split = self.cursor.order.coarsen;
-        let mut picks: Vec<Pick> = Vec::with_capacity(self.remaining_keys().min(max_rows));
-        let visited = self.for_each_live_row(max_rows, |c| {
-            if split && c.current_is_skeleton() {
-                skeletons.push(c.current_pk_bytes(), c.current_weight());
-            } else {
-                picks.push(c.current_pick());
-            }
-        });
-        if visited == 0 {
-            return None;
-        }
-        let mut out = gather_rows(&self.cursor.sources, &self.cursor.schema, &picks);
-        out.certify_consolidated();
-        Some(out)
+        with_picks(|picks| {
+            picks.reserve(self.remaining_keys().min(max_rows));
+            let visited = self.for_each_live_row(max_rows, |c| {
+                if split && c.current_is_skeleton() {
+                    skeletons.push(c.current_pk_bytes(), c.current_weight());
+                } else {
+                    picks.push(c.current_pick());
+                }
+            });
+            (visited != 0).then(|| {
+                let mut out = gather_rows(&self.cursor.sources, &self.cursor.schema, picks);
+                out.certify_consolidated();
+                out
+            })
+        })
     }
 
     /// Every remaining live row at weight 1, in the [`project_schema`] layout of

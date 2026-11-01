@@ -45,7 +45,7 @@ fn visible(chain: &ViewBundle) -> Vec<(String, TypeCode, bool)> {
     let cols = &final_view(chain).schema.columns();
     cols.iter()
         .filter(|c| !c.is_hidden)
-        .map(|c| (c.name.clone(), c.ty.tc, c.is_nullable))
+        .map(|c| (c.name.to_string(), c.ty.tc, c.is_nullable))
         .collect()
 }
 

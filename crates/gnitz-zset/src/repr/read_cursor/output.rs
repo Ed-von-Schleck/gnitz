@@ -6,7 +6,7 @@ use std::rc::Rc;
 use super::super::run::Run;
 use super::{ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
-use crate::repr::scatter::{ColumnarSource, Pick, UnifiedSet};
+use crate::repr::scatter::{with_picks, ColumnarSource, Pick, UnifiedSet};
 use crate::schema::with_payload_cmp;
 use gnitz_wire::RowSource;
 
@@ -43,26 +43,27 @@ impl ReadCursor {
         windows.clear();
         windows.extend(self.states.iter().map(|s| s.start..s.start));
         windows[self.current.src as usize].start = self.current.row as usize;
-        let mut picks = std::mem::take(&mut self.drain_picks);
-        self.drain_sorted_into(max_rows, &mut picks);
-        for (w, s) in windows.iter_mut().zip(&self.states) {
-            w.end = s.start;
-        }
-        if self.order.coarsen {
-            let sources = &self.sources;
-            picks.retain(|&(e, r, w)| {
-                let src = &sources[e as usize];
-                let skeleton = src.is_skeleton();
-                if skeleton {
-                    skeletons.push(src.get_pk_bytes(r as usize), w);
-                }
-                !skeleton
-            });
-        }
-        let set = UnifiedSet::of(&self.sources, &self.schema, windows.iter().cloned());
-        let mut batch = set.materialize(&picks, None);
+        let mut batch = with_picks(|picks| {
+            self.drain_sorted_into(max_rows, picks);
+            for (w, s) in windows.iter_mut().zip(&self.states) {
+                w.end = s.start;
+            }
+            if self.order.coarsen {
+                let sources = &self.sources;
+                picks.retain(|&(e, r, w)| {
+                    let src = &sources[e as usize];
+                    let skeleton = src.is_skeleton();
+                    if skeleton {
+                        skeletons.push(src.get_pk_bytes(r as usize), w);
+                    }
+                    !skeleton
+                });
+            }
+            UnifiedSet::with(&self.sources, &self.schema, windows.iter().cloned(), |set| {
+                set.materialize(picks, None)
+            })
+        });
         batch.certify_consolidated();
-        self.drain_picks = picks;
         self.drain_windows = windows;
         Some(batch)
     }

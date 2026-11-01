@@ -35,13 +35,13 @@ use super::sys_tables::*;
 use super::*;
 
 /// Every live row of `opk`'s PK group, read as a one-key `PkSet`.
-fn pk_group(engine: &mut CatalogEngine, tid: u64, opk: &[u8]) -> std::rc::Rc<gnitz_zset::repr::Batch> {
+fn pk_group(engine: &mut CatalogEngine, tid: u64, opk: &[u8]) -> gnitz_store::read::ReadRows {
     let keys = gnitz_wire::PkKeys::from_keys(opk.len(), [opk]);
     read_rows(engine, tid, gnitz_wire::ReadBound::PkSet(keys))
 }
 
 /// [`pk_group`] by a narrow native key.
-fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> std::rc::Rc<gnitz_zset::repr::Batch> {
+fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> gnitz_store::read::ReadRows {
     let schema = engine
         .registry
         .relation(tid)
