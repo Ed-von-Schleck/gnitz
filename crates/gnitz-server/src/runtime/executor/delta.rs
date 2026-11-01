@@ -850,7 +850,7 @@ async fn copy_train(lease: TrainLease, tid: u64, cap: usize) -> Result<Vec<u8>, 
         if body.is_empty() {
             // Room for one frame this size from each worker and the terminal,
             // capped near where the lagged check stops reading.
-            let workers = lease.targets().set.len();
+            let workers = lease.workers().len();
             body.reserve((bytes.len() * workers).min(cap) + HEAD_FRAME_BYTES);
         }
         body.extend_from_slice(bytes);

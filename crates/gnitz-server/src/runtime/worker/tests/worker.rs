@@ -2,8 +2,8 @@ use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
-use crate::runtime::reactor::GroupTargets;
 use crate::runtime::sal::fixtures::test_log;
+use crate::runtime::sal::GroupTargets;
 use crate::runtime::sal::{Cut, GroupData, SalGroup, SalRequest, SalWriter};
 use crate::runtime::w2m::fixtures::id;
 use crate::runtime::w2m::{self, RequestId, W2mReceiver};
@@ -816,18 +816,18 @@ fn a_refusal_names_a_shortage_only_behind_another_cuts_bytes() {
     while !wp.w2m_writer.short_of_room() {
         wp.emit_reply_frame();
     }
-    assert!(!rx.take_shortage(0), "a train held up by its own frames asks nothing");
+    assert!(!rx.answer_shortage(0), "a train held up by its own frames asks nothing");
 
     // As large as the train's frame the ring just refused.
     let behind = make_batch_raw(&fixed, &(0..16).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
     wp.reply(route(2, 22, 2), Ok(Rows::from(behind)));
     assert_eq!(owed(&wp), [("train", 11), ("train", 22)]);
     assert!(
-        rx.take_shortage(0),
+        rx.answer_shortage(0),
         "a reply of another cut behind them asks for the ring"
     );
     wp.w2m_writer.name_shortage();
-    assert!(!rx.take_shortage(0), "once per release");
+    assert!(!rx.answer_shortage(0), "once per release");
 }
 
 /// A train the master holds sends nothing and holds up only its own cut: the

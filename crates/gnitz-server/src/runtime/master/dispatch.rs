@@ -7,8 +7,8 @@ use std::time::Duration;
 use super::route::with_routed;
 use super::*;
 use crate::catalog::{ZoneError, ZoneSink};
-use crate::runtime::reactor::{AckLease, GroupTargets};
-use crate::runtime::sal::{Apply, SalMessageKind, SalRequest, SalScope};
+use crate::runtime::reactor::AckLease;
+use crate::runtime::sal::{Apply, GroupTargets, SalMessageKind, SalRequest, SalScope};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io::retry_eintr;
 
@@ -24,7 +24,11 @@ impl MasterDispatcher {
     /// caller may await the ACKs under this hold.
     fn write_acked(&self, excl: &mut SalExcl<'_>, group: SalGroup<'_>) -> Result<AckLease, WireFault> {
         let lease = self.reactor.lease_acks(WorkerSet::ALL);
-        excl.write(&SalGroup { targets: lease.targets(), ..group })?;
+        let targets = GroupTargets {
+            set: lease.workers(),
+            reply: Some(lease.id()),
+        };
+        excl.write(&SalGroup { targets, ..group })?;
         excl.wake();
         Ok(lease)
     }
@@ -233,7 +237,11 @@ impl MasterDispatcher {
     ) -> Result<(AckLease, bool), WireFault> {
         self.with_commit_group(target_id, batch, |g, recoverable| {
             let lease = self.reactor.lease_acks(g.targets.set);
-            scope.write(&SalGroup { targets: lease.targets(), ..g }, recoverable)?;
+            let targets = GroupTargets {
+                set: lease.workers(),
+                reply: Some(lease.id()),
+            };
+            scope.write(&SalGroup { targets, ..g }, recoverable)?;
             Ok((lease, recoverable))
         })
     }

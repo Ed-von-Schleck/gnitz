@@ -43,8 +43,7 @@ impl Peer {
     pub(super) fn new(reactor: &Reactor, accepted: Accepted, tls: Option<&Arc<rustls::ServerConfig>>) -> Peer {
         let (conn, transport) = match tls {
             None => {
-                let conn = reactor.client_conn(accepted, None);
-                reactor.register_conn(&conn, Box::new(Plain::new()));
+                let conn = reactor.connect(accepted, None, |_| Plain::new());
                 (conn, Transport::Plain(reactor.clone()))
             }
             Some(cfg) => {

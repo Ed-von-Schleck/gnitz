@@ -51,7 +51,7 @@ impl Reactor {
     /// its reused key queued, when it runs later in this one. True when [`ROOT`]
     /// was among those queued.
     pub(super) fn run_ready(&self) -> bool {
-        self.drain_cqes_into_wakers();
+        self.dispatch_cqes();
         self.drain_all_w2m();
         self.timers.fire();
 
@@ -132,7 +132,7 @@ impl Reactor {
     }
 
     /// Drain all CQEs pending in the ring and route each through `dispatch_cqe`.
-    fn drain_cqes_into_wakers(&self) {
+    fn dispatch_cqes(&self) {
         let mut buf = [const { MaybeUninit::<cqueue::Entry>::uninit() }; 64];
         loop {
             // `fill`'s slice borrows `buf`, not the ring, so dispatch can re-borrow it.
@@ -169,21 +169,24 @@ impl Reactor {
                 let slot = (id & OP_SLOT_MASK) as usize;
                 let mut ops = self.ops.borrow_mut();
                 let entry = ops.get_mut(slot).expect("an op's entry lives until its CQE");
-                match std::mem::replace(&mut entry.state, OpState::Done(res)) {
-                    OpState::Waiting(waker) => {
+                match std::mem::replace(entry, OpSlot::Done(res)) {
+                    OpSlot::Waiting(waker) => {
                         drop(ops);
                         if let Some(w) = waker {
                             w.wake();
                         }
                     }
-                    OpState::Abandoned => {
+                    OpSlot::Abandoned(carry) => {
+                        ops.remove(slot);
                         drop(ops);
-                        self.free_op(slot);
+                        // Outside the borrow: the carry may hold the last handle
+                        // on a connection.
+                        drop(carry);
                     }
-                    OpState::Done(_) => unreachable!("a second CQE for op {user_data:#x}"),
+                    OpSlot::Done(_) => unreachable!("a second CQE for op {user_data:#x}"),
                 }
             }
-            KIND_RECV => self.handle_recv_cqe(id as i32, res),
+            KIND_RECV => self.handle_recv_cqe(id as usize, res),
             KIND_CANCEL => {}
             kind => unreachable!("CQE kind {kind} (user_data={user_data:#x}) was never issued"),
         }

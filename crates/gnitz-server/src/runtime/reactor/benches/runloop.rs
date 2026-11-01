@@ -23,7 +23,7 @@ fn arm(label: &str, r: Reactor, park: impl AsyncFn() + 'static, mut publish: imp
             p.set(p.get() + 1);
         }
     });
-    r.tick(false); // the first poll parks the task
+    r.tick(); // the first poll parks the task
 
     // One counter at a time: two open at once would count each other's ioctls.
     let [user, all] = [Counter::instructions as fn() -> Counter, Counter::instructions_all].map(|open| {
@@ -31,7 +31,7 @@ fn arm(label: &str, r: Reactor, park: impl AsyncFn() + 'static, mut publish: imp
         let mut instructions = 0;
         for _ in 0..PASSES {
             publish();
-            instructions += counter.measure(|| r.tick(false)).1;
+            instructions += counter.measure(|| r.tick()).1;
         }
         let empty = (0..PASSES).map(|_| counter.measure(|| ()).1).sum::<u64>();
         (instructions - empty) as f64 / PASSES as f64
@@ -127,7 +127,7 @@ fn reactor_flood_bench() {
                     for n in 2..=N {
                         writer.send_msg(id(n), &Default::default());
                     }
-                    writer.ack(id(1));
+                    writer.ack(RequestId::BOOT_READY);
                 });
             }
             let before = voluntary_ctx_switches();

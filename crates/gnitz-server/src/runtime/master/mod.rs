@@ -22,7 +22,7 @@ use rustc_hash::FxHashMap;
 use crate::catalog::CatalogEngine;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::reactor::{Reactor, TrainLease};
-use crate::runtime::sal::{GroupData, Read, SalExcl, SalGroup, SalWriter};
+use crate::runtime::sal::{GroupData, GroupTargets, Read, SalExcl, SalGroup, SalWriter};
 use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;
 
@@ -160,8 +160,12 @@ impl<'d> ScanCut<'d> {
             .disp
             .reactor
             .lease_train(route.set, group.request.encode().0.variant_name());
-        debug_assert!(lease.targets().set.len() > 0, "every read owes at least one reply");
-        let group = SalGroup { data, targets: lease.targets(), ..group };
+        debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
+        let targets = GroupTargets {
+            set: lease.workers(),
+            reply: Some(lease.id()),
+        };
+        let group = SalGroup { data, targets, ..group };
         if self.written {
             self.excl.join(&group)?;
         } else {

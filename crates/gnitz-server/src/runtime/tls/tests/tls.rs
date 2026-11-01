@@ -18,7 +18,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 
 use super::config::{TLS_CERT_FILE, TLS_KEY_FILE};
 use super::*;
-use crate::runtime::reactor::test_support::{accepted_pair, admitted_frame_sink, make_reactor, poll_until};
+use crate::runtime::reactor::test_support::{accepted_pair, frame_sink, make_reactor, poll_until};
 use crate::runtime::test_support::read_nonblocking;
 use gnitz_wire::framed;
 
@@ -231,7 +231,7 @@ fn frames_deframe_in_order_under_any_split_until_close_notify() {
             client.writer().write_all(&framed(f)).unwrap();
         }
         client.send_close_notify();
-        let mut q = admitted_frame_sink();
+        let mut q = frame_sink(usize::MAX, true);
         let mut deframer = Deframer::default();
 
         let ends: Vec<_> = ciphertext(&mut client)

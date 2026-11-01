@@ -5,8 +5,9 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use super::*;
-use crate::runtime::reactor::test_support::{make_reactor, poll_until, yield_once};
+use crate::runtime::reactor::test_support::{make_reactor, poll_until};
 use crate::runtime::test_support::try_poll_once;
+use crate::runtime::test_support::yield_once;
 
 /// Sending to a cancelled receiver is not an error and never was to any caller:
 /// the value is parked where nothing will read it and dropped with the channel.
@@ -119,7 +120,7 @@ fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
         d.set(true);
     });
 
-    r.tick(false); // A acquires, B and C park
+    r.tick(); // A acquires, B and C park
     assert!(!done.get(), "C must be blocked while write waiter B is alive");
 
     cancel_tx.send(());

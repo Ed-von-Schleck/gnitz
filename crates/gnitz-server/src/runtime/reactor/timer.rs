@@ -9,7 +9,7 @@ use super::*;
 /// Every pending deadline, and the clock they are measured against.
 pub(super) struct Timers {
     /// Keyed by `(deadline, timer id)` and valued by the waker to fire.
-    pub(super) deadlines: RefCell<BTreeMap<(Instant, u64), Waker>>,
+    deadlines: RefCell<BTreeMap<(Instant, u64), Waker>>,
     /// The next timer id, which orders deadlines sharing an instant; the 64-bit
     /// counter does not wrap within a process's life.
     next_id: Cell<u64>,

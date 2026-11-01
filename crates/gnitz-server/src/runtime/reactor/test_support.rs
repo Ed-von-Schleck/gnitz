@@ -7,10 +7,10 @@ use std::os::unix::net::UnixStream;
 use super::*;
 use crate::runtime::park::WorkerSet;
 pub(super) use crate::runtime::sync::{oneshot, select2, Either};
-pub(super) use crate::runtime::test_support::{read_nonblocking, spawn_drain, try_poll_once, within};
+pub(super) use crate::runtime::test_support::{read_nonblocking, spawn_drain, try_poll_once, within, yield_once};
 pub(super) use crate::runtime::w2m::fixtures::ring_slot;
 use crate::runtime::w2m::fixtures::test_rings;
-use crate::runtime::w2m::{RequestId, W2mWriter};
+use crate::runtime::w2m::W2mWriter;
 
 impl Limits {
     /// Every send carries `client_send_timeout`, so it is generous here: a drain
@@ -46,25 +46,10 @@ impl Reactor {
         assert!(idle, "reactor never reached idle: lost wake or deadlock");
     }
 
-    /// One pass of the loop `block_on` runs; with `block`, it sleeps whenever
-    /// nothing is runnable.
-    pub(crate) fn tick(&self, block: bool) {
+    /// One pass of the loop `block_on` runs, never sleeping.
+    pub(crate) fn tick(&self) {
         self.run_ready();
-        self.submit_or_sleep(block);
-    }
-}
-
-impl AckLease {
-    /// The request id its workers ACK on.
-    pub(crate) fn id(&self) -> RequestId {
-        self.targets().reply.expect("a lease's group is answered")
-    }
-}
-
-impl TrainLease {
-    /// The request id its workers reply on.
-    pub(crate) fn id(&self) -> RequestId {
-        self.targets().reply.expect("a lease's group is answered")
+        self.submit_or_sleep(false);
     }
 }
 
@@ -82,28 +67,16 @@ pub(crate) fn train_lease(n: usize, kind: &'static str) -> (Reactor, TrainLease,
 }
 
 /// [`reactor_with_rings`], with the lease the workers' ready ACKs answer.
-pub(crate) fn booting_reactor(n: usize) -> (Reactor, ReadyLease, Vec<W2mWriter>) {
+pub(super) fn booting_reactor(n: usize) -> (Reactor, ReadyLease, Vec<W2mWriter>) {
     let (writers, receiver) = test_rings(n, 64 * 1024);
     let (reactor, ready) = Reactor::new(Limits::TEST, receiver).expect("reactor");
     (reactor, ready, writers)
 }
 
 /// A one-shot op the kernel completes at its submit.
-pub(super) fn nop(r: &Reactor) -> OpFuture {
+pub(super) fn nop(r: &Reactor) -> Op<()> {
     // SAFETY: the SQE names no memory.
-    unsafe { r.push_op(opcode::Nop::new().build()) }
-}
-
-/// Future that returns Pending exactly once, waking itself, then Ready.
-pub(crate) fn yield_once() -> impl Future<Output = ()> {
-    let mut yielded = false;
-    std::future::poll_fn(move |cx| {
-        if std::mem::replace(&mut yielded, true) {
-            return Poll::Ready(());
-        }
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    })
+    unsafe { r.push_op(opcode::Nop::new().build(), ()) }
 }
 
 /// One end of a fresh socketpair admitted under the connection cap, and the
@@ -113,18 +86,11 @@ pub(crate) fn accepted_pair(r: &Reactor) -> (Accepted, UnixStream) {
     (r.admit(OwnedFd::from(local)).expect("under the cap"), partner)
 }
 
-/// A connection over an [`accepted_pair`], nothing armed on it and no egress
-/// owner, and the other end.
-pub(super) fn client_pair(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
-    let (accepted, partner) = accepted_pair(r);
-    (r.client_conn(accepted, None), partner)
-}
-
-/// [`client_pair`] with a recv armed on the connection.
+/// A connection over an [`accepted_pair`], its recv armed and no egress owner,
+/// and the other end.
 pub(super) fn registered(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
-    let (conn, partner) = client_pair(r);
-    r.register_conn(&conn, Box::new(Plain::new()));
-    (conn, partner)
+    let (accepted, partner) = accepted_pair(r);
+    (r.connect(accepted, None, |_| Plain::new()), partner)
 }
 
 /// [`registered`], past its handshake: admitting frames up to the payload ceiling.
@@ -134,10 +100,13 @@ pub(super) fn admitted(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
     (conn, partner)
 }
 
-/// A frame sink with an unbounded budget of its own, past the handshake.
-pub(crate) fn admitted_frame_sink() -> FrameSink {
-    let mut q = FrameSink::new(conn::Budget::new(usize::MAX));
-    q.admit_full_frames();
+/// A frame sink with a `cap`-byte budget of its own, past the handshake when
+/// `admitted`.
+pub(crate) fn frame_sink(cap: usize, admitted: bool) -> FrameSink {
+    let mut q = FrameSink::new(conn::Budget::new(cap));
+    if admitted {
+        q.admit_full_frames();
+    }
     q
 }
 
@@ -146,7 +115,7 @@ pub(crate) fn admitted_frame_sink() -> FrameSink {
 pub(crate) fn poll_until(r: &Reactor, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + std::time::Duration::from_secs(10);
     while Instant::now() < deadline {
-        r.tick(false);
+        r.tick();
         if cond() {
             return true;
         }

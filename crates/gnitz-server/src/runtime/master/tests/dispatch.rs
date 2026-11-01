@@ -6,7 +6,7 @@ use super::{check_workers, worker_death};
 use crate::catalog::{CatalogEngine, DdlBundle};
 use crate::runtime::park::WorkerSet;
 use crate::runtime::reactor::test_support::make_reactor;
-use crate::runtime::reactor::GroupTargets;
+use crate::runtime::sal::GroupTargets;
 use crate::runtime::sal::{Apply, GroupData, SalGroup};
 use crate::runtime::test_support::{assert_child_exited_ok, empty_catalog, fork_child, within};
 use gnitz_foundation::posix_io::retry_eintr;

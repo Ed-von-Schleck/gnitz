@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::{WorkerParks, WorkerSet};
-use crate::runtime::reactor::{GroupTargets, Reactor, ReadyAcked};
+use crate::runtime::reactor::{Reactor, ReadyAcked};
 use crate::runtime::sync::{AsyncRwLock, WriteGuard};
 use crate::runtime::w2m::RequestId;
 use gnitz_foundation::fault::Seam;
@@ -187,6 +187,18 @@ impl<'a> GroupData<'a> {
     }
 }
 
+/// The workers a group is addressed to and the request id they answer on.
+#[derive(Clone, Copy)]
+pub(crate) struct GroupTargets {
+    pub(crate) set: WorkerSet,
+    pub(crate) reply: Option<RequestId>,
+}
+
+impl GroupTargets {
+    /// Every worker, nothing answers.
+    pub(crate) const SILENT: Self = GroupTargets { set: WorkerSet::ALL, reply: None };
+}
+
 /// One SAL group as [`SalExcl::lay_out`] encodes it: the request every payload
 /// carries, plus what varies by worker.
 pub(crate) struct SalGroup<'a> {
@@ -227,13 +239,13 @@ impl<'a> SalGroup<'a> {
         SalGroup {
             schema: Some(family.record()),
             data: GroupData::Same(batch.wire_whole()),
-            targets: if family.master_only() {
-                GroupTargets {
-                    set: WorkerSet::EMPTY,
-                    ..GroupTargets::SILENT
-                }
-            } else {
-                GroupTargets::SILENT
+            targets: GroupTargets {
+                set: if family.master_only() {
+                    WorkerSet::EMPTY
+                } else {
+                    WorkerSet::ALL
+                },
+                reply: None,
             },
             ..Self::new(Apply::DdlSync { family })
         }

@@ -120,3 +120,15 @@ pub(crate) fn empty_catalog() -> (tempfile::TempDir, crate::catalog::CatalogEngi
     let engine = crate::catalog::CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
     (tmp, engine)
 }
+
+/// Future that returns Pending exactly once, waking itself, then Ready.
+pub(crate) fn yield_once() -> impl std::future::Future<Output = ()> {
+    let mut yielded = false;
+    std::future::poll_fn(move |cx| {
+        if std::mem::replace(&mut yielded, true) {
+            return std::task::Poll::Ready(());
+        }
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    })
+}

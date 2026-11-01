@@ -32,23 +32,23 @@ fn lease_ids_wrap_past_zero_and_skip_live_ids() {
 #[test]
 fn an_ack_lease_resolves_on_its_own_sets_acks() {
     let (r, mut writers) = reactor_with_rings(4);
-    assert_eq!(r.lease_acks(WorkerSet::ALL).targets().set.len(), 4);
+    assert_eq!(r.lease_acks(WorkerSet::ALL).workers().len(), 4);
     assert!(try_poll_once(r.lease_acks(WorkerSet::EMPTY).acks()).is_some());
 
     let lease = r.lease_acks(WorkerSet::one(1).with(3));
     let id = lease.id();
     writers[3].ack(id);
-    r.tick(false); // drained before any awaiter
+    r.tick(); // drained before any awaiter
     let done = Rc::new(Cell::new(false));
     let d = Rc::clone(&done);
     r.spawn(async move {
         lease.acks().await;
         d.set(true);
     });
-    r.tick(false);
+    r.tick();
     assert!(!done.get(), "one of the two has answered");
     writers[1].ack(id);
-    r.tick(false); // the drain wakes the awaiter, and the same pass polls it
+    r.tick(); // the drain wakes the awaiter, and the same pass polls it
     assert!(done.get());
 }
 
@@ -195,6 +195,39 @@ fn a_ring_given_back_copies_queued_frames_and_holds_their_train() {
     assert!(writers[0].held(id));
     drop(lease);
     assert!(!writers[0].held(id), "a dropped lease holds nothing");
+}
+
+/// A ring given back while its worker holds as many leases as it can still has
+/// a lease's queued frames copied out, without a hold: the worker sends that
+/// lease on, and the next shortage its frames cause copies them again, holding
+/// the train once the table has room.
+#[test]
+fn a_give_back_past_the_hold_table_copies_without_a_hold() {
+    let (r, lease, mut writers) = train_lease(1, "ScanSpec");
+    let train = lease.id();
+    let fillers: Vec<RequestId> = (0..)
+        .map(|n| id(10_000 + n))
+        .take_while(|&filler| r.w2m.hold(0, filler))
+        .collect();
+    assert!(!fillers.is_empty(), "the table takes holds until it is full");
+    let schema = crate::test_support::make_schema_u64_i64();
+    let rows = crate::test_support::make_batch(&schema, &[(7, 1, 0)]);
+
+    writers[0].send_train_frame(train, false, Some(&rows));
+    writers[0].name_shortage();
+    r.drain_all_w2m();
+    assert_eq!(r.w2m.release_cursor(0), r.w2m.write_cursor(0), "copied out");
+    assert!(!writers[0].held(train), "with the table full, nothing holds the lease");
+
+    r.w2m.unhold(0, fillers[0]);
+    writers[0].send_train_frame(train, false, Some(&rows));
+    writers[0].name_shortage();
+    r.drain_all_w2m();
+    assert_eq!(r.w2m.release_cursor(0), r.w2m.write_cursor(0), "copied out again");
+    assert!(writers[0].held(train), "a freed entry takes the hold");
+    for filler in &fillers[1..] {
+        r.w2m.unhold(0, *filler);
+    }
 }
 
 /// A dropped train lease's queue box is emptied and taken by the next train

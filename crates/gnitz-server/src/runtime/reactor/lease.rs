@@ -1,6 +1,7 @@
 //! W2M ingest: every ring drained into the routes of [`AckLease`] and
 //! [`TrainLease`].
 
+use std::collections::hash_map::Entry;
 use std::collections::VecDeque;
 use std::ops::Range;
 
@@ -37,7 +38,7 @@ impl Routes {
     pub(super) fn new() -> Self {
         Routes {
             map: RefCell::new(FxHashMap::default()),
-            next_id: Cell::new(RequestId::BOOT_READY.next()),
+            next_id: Cell::new(RequestId::BOOT_READY),
             spare: RefCell::new(Vec::new()),
         }
     }
@@ -80,9 +81,9 @@ impl Reactor {
     /// each ring whose worker named a shortage of room.
     pub(super) fn drain_all_w2m(&self) {
         for w in 0..self.w2m.num_workers() {
-            // Taken ahead of the reads: a worker names a shortage behind its
+            // Answered ahead of the reads: a worker names a shortage behind its
             // last publish, so the reads route every slot the give-back must reach.
-            let short = self.w2m.take_shortage(w);
+            let short = self.w2m.answer_shortage(w);
             self.w2m.drain_acks(w, |id| self.route_ack(w, id));
             while let Some(slot) = self.w2m.try_read_slot(w) {
                 self.route(slot);
@@ -95,11 +96,9 @@ impl Reactor {
 
     /// Give worker `w`'s ring back (see `w2m`'s module header): copy every
     /// frame of it a lease holds queued out of the ring, holding each such
-    /// lease's train on `w`, and wake every task awaiting with a slot of it to
-    /// copy its own.
+    /// lease's train on `w`.
     #[cold]
     fn give_back(&self, w: usize) {
-        self.w2m.wake_holders(w);
         for (&id, route) in self.routes.map.borrow_mut().iter_mut() {
             let Route::Train(t) = route else { continue };
             if !t.set.contains(w) {
@@ -174,49 +173,50 @@ impl Reactor {
         }
     }
 
-    /// A request id no live lease holds.
-    fn alloc_request_id(&self) -> RequestId {
-        let routes = self.routes.map.borrow();
-        let mut id = self.routes.next_id.get();
-        while routes.contains_key(&id) {
-            id = id.next();
-        }
-        self.routes.next_id.set(id.next());
-        id
-    }
-
-    /// `id`, routed to what `route` builds over `set` clipped to the launched
-    /// workers.
-    fn lease(&self, id: RequestId, set: WorkerSet, route: impl FnOnce(WorkerSet) -> Route) -> Lease {
+    /// A request id no live lease holds, routed to what `route` builds over
+    /// `set` clipped to the launched workers.
+    fn lease(&self, set: WorkerSet, route: impl FnOnce(WorkerSet) -> Route) -> Lease {
         let workers = set.within(self.w2m.num_workers());
-        self.routes.map.borrow_mut().insert(id, route(workers));
+        let mut map = self.routes.map.borrow_mut();
+        let mut id = self.routes.next_id.get();
+        loop {
+            match map.entry(id) {
+                Entry::Vacant(free) => {
+                    free.insert(route(workers));
+                    break;
+                }
+                Entry::Occupied(_) => id = id.next(),
+            }
+        }
+        drop(map);
+        self.routes.next_id.set(id.next());
         Lease { reactor: self.clone(), id, set: workers }
-    }
-
-    /// `id`, answered by one ACK from every worker in `set`.
-    fn lease_acks_on(&self, id: RequestId, set: WorkerSet) -> AckLease {
-        AckLease(self.lease(id, set, |left| Route::Acks(AckRoute { left, waker: None })))
     }
 
     /// One request id, answered by one ACK from every worker in `set`. See
     /// [`AckLease`].
     pub(crate) fn lease_acks(&self, set: WorkerSet) -> AckLease {
-        self.lease_acks_on(self.alloc_request_id(), set)
+        AckLease(self.lease(set, |left| Route::Acks(AckRoute { left, waker: None })))
     }
 
     /// The lease every worker's ready ACK answers; [`Reactor::new`] takes it.
     pub(super) fn ready_lease(&self) -> ReadyLease {
-        ReadyLease(self.lease_acks_on(RequestId::BOOT_READY, WorkerSet::ALL))
+        let acks = self.lease_acks(WorkerSet::ALL);
+        assert_eq!(
+            acks.id(),
+            RequestId::BOOT_READY,
+            "the ready lease is the reactor's first"
+        );
+        ReadyLease(acks)
     }
 
     /// One request id, answered by a train of frames from every worker in `set`.
     /// `what` names the request in every fault the lease reports. See
     /// [`TrainLease`].
     pub(crate) fn lease_train(&self, set: WorkerSet, what: &'static str) -> TrainLease {
-        // Taken before `lease` borrows the route map.
         let spare = self.routes.spare.borrow_mut().pop();
         let queues = spare.unwrap_or_else(|| (0..self.w2m.num_workers()).map(|_| VecDeque::new()).collect());
-        let lease = self.lease(self.alloc_request_id(), set, |set| {
+        let lease = self.lease(set, |set| {
             Route::Train(TrainRoute {
                 set,
                 held: WorkerSet::EMPTY,
@@ -233,18 +233,6 @@ impl Reactor {
 // Lease
 // ---------------------------------------------------------------------------
 
-/// The workers a group is addressed to and the request id they answer on.
-#[derive(Clone, Copy)]
-pub(crate) struct GroupTargets {
-    pub(crate) set: WorkerSet,
-    pub(crate) reply: Option<RequestId>,
-}
-
-impl GroupTargets {
-    /// Every worker, nothing answers.
-    pub(crate) const SILENT: Self = GroupTargets { set: WorkerSet::ALL, reply: None };
-}
-
 /// A live route. Dropping it removes the route, and with it whatever the route
 /// still holds.
 struct Lease {
@@ -252,12 +240,6 @@ struct Lease {
     id: RequestId,
     /// The set the route was built over.
     set: WorkerSet,
-}
-
-impl Lease {
-    fn targets(&self) -> GroupTargets {
-        GroupTargets { set: self.set, reply: Some(self.id) }
-    }
 }
 
 impl Drop for Lease {
@@ -299,9 +281,15 @@ impl Drop for Lease {
 pub(crate) struct AckLease(Lease);
 
 impl AckLease {
-    /// The targets of the group this lease's workers answer.
-    pub(crate) fn targets(&self) -> GroupTargets {
-        self.0.targets()
+    /// The request id its workers ACK on.
+    pub(crate) fn id(&self) -> RequestId {
+        self.0.id
+    }
+
+    /// The workers that ACK it: the set it was leased over, clipped to the
+    /// launched workers.
+    pub(crate) fn workers(&self) -> WorkerSet {
+        self.0.set
     }
 
     /// Resolves once every worker of the set has ACKed. A worker that cannot
@@ -372,9 +360,15 @@ impl TrainFrame {
 }
 
 impl TrainLease {
-    /// The targets of the group this lease's workers answer.
-    pub(crate) fn targets(&self) -> GroupTargets {
-        self.lease.targets()
+    /// The request id its workers reply on.
+    pub(crate) fn id(&self) -> RequestId {
+        self.lease.id
+    }
+
+    /// The workers that reply: the set it was leased over, clipped to the
+    /// launched workers.
+    pub(crate) fn workers(&self) -> WorkerSet {
+        self.lease.set
     }
 
     /// Worker `w`'s next frame, row-less ones included, with the range of its
@@ -435,7 +429,7 @@ impl TrainLease {
             let Some(Route::Train(route)) = routes.get_mut(&self.lease.id) else {
                 unreachable!("a train lease's id routes to its train")
             };
-            assert!(route.set.contains(w), "the train was written to `w`");
+            debug_assert!(route.set.contains(w), "the train was written to `w`");
             match route.queues[w].pop_front() {
                 Some(slot) => Poll::Ready(slot),
                 None => {

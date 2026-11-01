@@ -76,7 +76,7 @@ pub(super) async fn page(
     } else {
         let read = Read::SnapshotPage { snapshot: id, tid, page: blob.into() };
         let lease = shared.dispatcher.scan(read).await?;
-        'forward: for w in lease.targets().set.iter() {
+        'forward: for w in lease.workers().iter() {
             while let Some((slot, _)) = lease.frame_of(w).await? {
                 if peer.send(SendBody::Slot(slot)).await.is_err() {
                     break 'forward;

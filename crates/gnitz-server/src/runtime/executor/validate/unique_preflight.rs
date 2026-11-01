@@ -60,8 +60,7 @@ async fn merge_index_scan(
     use std::collections::BinaryHeap;
 
     let mut streams: Vec<PreflightKeyStream> = scan
-        .targets()
-        .set
+        .workers()
         .iter()
         .map(|w| PreflightKeyStream { lease: scan, w, frame: None, keys: 0..0 })
         .collect();

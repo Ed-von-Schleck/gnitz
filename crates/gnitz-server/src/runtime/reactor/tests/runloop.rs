@@ -21,7 +21,7 @@ fn panic_in_spawned_task_propagates_not_swallowed() {
     r.spawn(async {
         panic!("boom");
     });
-    r.tick(false);
+    r.tick();
 }
 
 /// A task may spawn during its own poll, and what it spawns runs.
@@ -53,14 +53,14 @@ fn repeated_wakes_for_one_key_collapse_to_a_single_poll() {
         k.borrow_mut().get_or_insert_with(|| cx.waker().clone());
         Poll::<()>::Pending
     }));
-    r.tick(false); // the spawn's own first poll
+    r.tick(); // the spawn's own first poll
     assert_eq!(polls.get(), 1);
 
     let waker = kept.borrow().clone().expect("the first poll kept its waker");
     for _ in 0..16 {
         waker.wake_by_ref();
     }
-    r.tick(false);
+    r.tick();
     assert_eq!(
         polls.get(),
         2,
@@ -70,8 +70,8 @@ fn repeated_wakes_for_one_key_collapse_to_a_single_poll() {
 
 /// A waker that outlived its task wakes whichever task took its key since, or
 /// none; either costs at most one spurious poll. `send_owned`'s eviction leaves
-/// such a waker behind: the abandoned send's op keeps its receiver's waker, which
-/// the late CQE fires.
+/// such a waker behind: the abandoned send's slot body keeps its task's waker
+/// until the op's CQE, and a give-back of its ring fires it.
 #[test]
 fn a_stale_wake_costs_at_most_a_spurious_poll() {
     let r = make_reactor();
@@ -81,10 +81,10 @@ fn a_stale_wake_costs_at_most_a_spurious_poll() {
         *k.borrow_mut() = Some(cx.waker().clone());
         Poll::Ready(())
     }));
-    r.tick(false);
+    r.tick();
     let stale = kept.take().expect("the task kept its waker");
     stale.wake_by_ref();
-    r.tick(false); // its key is vacant: nothing to poll
+    r.tick(); // its key is vacant: nothing to poll
 
     let polls = Rc::new(Cell::new(0u32));
     let p = Rc::clone(&polls);
@@ -92,11 +92,11 @@ fn a_stale_wake_costs_at_most_a_spurious_poll() {
         p.set(p.get() + 1);
         Poll::<()>::Pending
     }));
-    r.tick(false); // the spawn takes the freed key
+    r.tick(); // the spawn takes the freed key
     assert_eq!(polls.get(), 1);
     stale.wake();
-    r.tick(false);
-    r.tick(false);
+    r.tick();
+    r.tick();
     assert_eq!(polls.get(), 2, "the stale wake costs one spurious poll, and no more");
 }
 
@@ -157,7 +157,10 @@ fn a_sleeping_tick_wakes_at_the_earliest_deadline() {
         }
         assert!(start.elapsed() >= Duration::from_millis(20), "woke before the deadline");
         assert!(ticks <= 16, "{ticks} ticks: the reactor spun instead of sleeping");
-        assert_eq!(r.timers.deadlines.borrow().len(), 1, "only the later deadline is left");
+        assert!(
+            r.timers.earliest() > Some(start + Duration::from_secs(60)),
+            "only the hour-long deadline is left"
+        );
         r.tasks.borrow_mut().clear(); // the pending timer holds the reactor
     });
 }
@@ -184,7 +187,7 @@ fn a_self_waking_task_does_not_starve_the_pass() {
 fn block_on_submits_the_pass_that_completed_it() {
     let r = make_reactor();
     let mut op = r.block_on(std::future::poll_fn(|_| Poll::Ready(nop(&r))));
-    r.drain_cqes_into_wakers();
+    r.dispatch_cqes();
     assert_eq!(
         try_poll_once(&mut op),
         Some(0),
@@ -217,7 +220,7 @@ fn a_pass_past_the_sq_and_the_drain_batch_loses_no_completion() {
     let r = make_reactor();
     let n = SQ_ENTRIES + SQ_ENTRIES / 2;
     let ops: Vec<_> = (0..n).map(|_| nop(&r)).collect();
-    r.tick(false);
+    r.tick();
     r.run_ready();
     assert!(ops.into_iter().all(|op| try_poll_once(op) == Some(0)));
 }
@@ -239,8 +242,9 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
             lease.acks().await;
             d.set(true);
         });
-        r.tick(true);
-        r.tick(false);
+        r.run_ready();
+        r.submit_or_sleep(true);
+        r.tick();
         assert!(done.get());
     });
 }
@@ -250,7 +254,7 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
 #[test]
 fn a_pass_that_does_not_sleep_does_not_arm() {
     let (r, writers) = reactor_with_rings(1);
-    r.tick(false);
+    r.tick();
     assert!(!writers[0].master_parked());
 }
 
@@ -277,7 +281,8 @@ fn a_publish_wakes_the_sleep_and_takes_the_arm() {
                 writer
             }
         });
-        r.tick(true);
+        r.run_ready();
+        r.submit_or_sleep(true);
         woke.store(true, std::sync::atomic::Ordering::SeqCst);
         let writer = publisher.join().expect("the publisher");
         assert!(!writer.master_parked(), "the publish took the arm");
@@ -304,9 +309,10 @@ fn w2m_publishes_from_another_process_wake_the_parked_reactor() {
             std::thread::yield_now();
         }
         writers[1].ack(RequestId::BOOT_READY);
-        for n in (2..=N_MESSAGES).chain([1]) {
+        for n in 2..=N_MESSAGES {
             writers[0].ack(id(n));
         }
+        writers[0].ack(RequestId::BOOT_READY);
     };
     let pid = unsafe { fork_child(child) };
 

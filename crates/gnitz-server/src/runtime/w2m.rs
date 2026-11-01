@@ -823,16 +823,19 @@ impl WorkerRing {
             || header.want_room.load(Ordering::SeqCst) != st.answered
     }
 
-    /// The worker has named a shortage since the last call: answered now.
+    /// The worker has named a shortage since the last call: answered now, by
+    /// waking every task awaiting with a slot of this ring.
     #[inline]
-    fn take_shortage(&self) -> bool {
-        // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends with the call.
+    fn answer_shortage(&self) -> bool {
+        // SAFETY: a `WorkerRing` is `!Sync`, and this borrow ends before
+        // `wake_holders` takes its own.
         let st = unsafe { &mut *self.0.get() };
         let want = st.read.header().want_room.load(Ordering::SeqCst);
         if want == st.answered {
             return false;
         }
         st.answered = want;
+        self.wake_holders();
         true
     }
 
@@ -1018,14 +1021,11 @@ impl W2mReceiver {
         self.rings[worker].drain_acks(ack)
     }
 
-    /// `worker` has named a shortage of room since the last call.
-    pub(crate) fn take_shortage(&self, worker: usize) -> bool {
-        self.rings[worker].take_shortage()
-    }
-
-    /// Wake every task awaiting with a slot of `worker`'s ring, to copy it out.
-    pub(crate) fn wake_holders(&self, worker: usize) {
-        self.rings[worker].wake_holders()
+    /// Answer a shortage of room `worker` has named since the last call, by
+    /// waking every task awaiting with a slot of its ring to copy it out;
+    /// whether there was one.
+    pub(crate) fn answer_shortage(&self, worker: usize) -> bool {
+        self.rings[worker].answer_shortage()
     }
 
     /// Hold the lease `id` on `worker`: it sends that lease nothing more until

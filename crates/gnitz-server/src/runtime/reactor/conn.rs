@@ -1,15 +1,13 @@
 //! Client connections: their limits, the inbound budget and deframed frame
 //! queue, the armed recv, the send loop and its eviction, and how a connection
-//! ends. Nothing here flushes: an SQE ships with the loop's own submit, before the
-//! task awaiting it can run.
+//! ends. Nothing here flushes but a send's give-back cancel: every other SQE
+//! ships with the loop's own submit, before the task awaiting it can run.
 
-use std::collections::hash_map::Entry;
 use std::mem::MaybeUninit;
 use std::os::fd::{FromRawFd, OwnedFd};
 
 use gnitz_wire::{Deframer, FrameLenError, HANDSHAKE_FRAME_MAX, MAX_FRAME_PAYLOAD};
 use gnitz_zset::repr::PooledBuf;
-use rustc_hash::FxHashMap;
 
 use super::*;
 use crate::runtime::sync::{chan, select2, Either, WakeQueue};
@@ -80,26 +78,26 @@ fn resolve_inbound_cap() -> usize {
 }
 
 /// A capped running total. Each [`Charge`] counts toward it until dropped.
-pub(crate) struct Budget {
+pub(super) struct Budget {
     held: Cell<usize>,
     cap: usize,
 }
 
 impl Budget {
-    pub(crate) fn new(cap: usize) -> Rc<Budget> {
+    pub(super) fn new(cap: usize) -> Rc<Budget> {
         Rc::new(Budget { held: Cell::new(0), cap })
     }
 
-    pub(crate) fn held(&self) -> usize {
+    fn held(&self) -> usize {
         self.held.get()
     }
 
-    pub(crate) fn cap(&self) -> usize {
+    fn cap(&self) -> usize {
         self.cap
     }
 
     /// Count `weight` toward the total, or `None` if that would pass the cap.
-    pub(crate) fn charge(self: &Rc<Self>, weight: usize) -> Option<Charge> {
+    fn charge(self: &Rc<Self>, weight: usize) -> Option<Charge> {
         let held = self.held.get().checked_add(weight).filter(|&h| h <= self.cap)?;
         self.held.set(held);
         Some(Charge { budget: Rc::clone(self), weight })
@@ -120,13 +118,13 @@ impl Drop for Charge {
 
 /// One complete inbound frame payload, charged to the inbound [`Budget`] for as
 /// long as it lives.
-pub struct RecvBuf {
+pub(crate) struct RecvBuf {
     buf: Box<[u8]>,
     charge: Charge,
 }
 
 impl RecvBuf {
-    pub fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         &self.buf
     }
 
@@ -320,7 +318,6 @@ impl ClientConn {
             let mut q = self.q.borrow_mut();
             q.frames.clear();
             q.frames.close();
-            q.held = 0;
         }
         match &self.egress_owner {
             Some(owner) => owner.send(()),
@@ -408,12 +405,12 @@ impl RecvFilter for Plain {
 /// The reactor's connection state: every armed recv, the budgets connections
 /// are charged to, and their limits.
 pub(super) struct Conns {
-    /// Every connection the reactor receives on, by fd: those with a recv armed,
-    /// and those in `paused`.
-    armed: RefCell<FxHashMap<i32, Armed>>,
-    /// The connections over their `Limits::conn_inbound_share`, whose recv is
-    /// re-armed once their task takes them back under it.
-    paused: RefCell<Vec<i32>>,
+    /// Every connection the reactor receives on, by the key its recv's
+    /// user_data carries: those with a recv armed, and those in `paused`.
+    recvs: RefCell<Slab<Armed>>,
+    /// The keys of the connections over their `Limits::conn_inbound_share`,
+    /// whose recv is re-armed once their task takes them back under it.
+    paused: RefCell<Vec<usize>>,
     /// The OOM guard shared by every connection, charged per inbound frame.
     inbound: Rc<Budget>,
     /// Open client connections under `Limits::max_conns`; each [`ClientConn`]
@@ -425,7 +422,7 @@ pub(super) struct Conns {
 impl Conns {
     pub(super) fn new(limits: Limits) -> Self {
         Conns {
-            armed: RefCell::new(FxHashMap::default()),
+            recvs: RefCell::new(Slab::new()),
             paused: RefCell::new(Vec::new()),
             inbound: Budget::new(limits.inbound_cap),
             slots: Budget::new(limits.max_conns),
@@ -505,17 +502,18 @@ impl SendBody {
 pub(crate) struct PeerGone;
 
 impl Armed {
-    /// Arm (or re-arm) the recv into the filter's window. The fd rides the udata
-    /// id, so the completion routes back to this entry. Not flushed (see the
-    /// module header).
-    fn arm(&mut self, ring: &mut IoUringRing) {
+    /// Arm (or re-arm) the recv into the filter's window. The entry's `key`
+    /// rides the udata id, so the completion routes back to it. Not flushed
+    /// (see the module header).
+    fn arm(&mut self, key: usize, ring: &mut IoUringRing) {
         let fd = self.conn.fd();
         let w = self.filter.window();
         let sqe = opcode::Recv::new(types::Fd(fd), w.as_mut_ptr().cast(), w.len() as u32).build();
         // SAFETY: the window is memory the filter owns. Only this recv's CQE
-        // removes or refills the entry, which holds the filter and the connection
-        // (so `fd`); `ring` drops first.
-        unsafe { ring.push(sqe, udata(KIND_RECV, fd as u32 as u64)) };
+        // removes or refills entry `key`, which holds the filter and the
+        // connection (so `fd`); nothing cancels a recv by its user_data, so the
+        // key needs no generation. `ring` drops first.
+        unsafe { ring.push(sqe, udata(KIND_RECV, key as u64)) };
     }
 }
 
@@ -536,7 +534,7 @@ impl Reactor {
             .build();
             // SAFETY: the SQE names no memory, and `listener` is open for the
             // process's life.
-            let res = unsafe { self.push_op(sqe) }.await;
+            let res = unsafe { self.push_op(sqe, ()) }.await;
             if res < 0 {
                 self.sleep(self.conns.limits.accept_rearm_backoff).await;
                 continue;
@@ -562,63 +560,64 @@ impl Reactor {
         Some(Accepted { fd, slot })
     }
 
-    /// A connection over `accepted`, charging frames to the inbound budget.
-    /// `egress_owner` wakes the task that sends on the socket outside requests,
-    /// if one does. Nothing is armed on it yet.
-    pub(crate) fn client_conn(&self, accepted: Accepted, egress_owner: Option<chan::Sender<()>>) -> Rc<ClientConn> {
-        Rc::new(ClientConn {
+    /// A connection over `accepted`, charging frames to the inbound budget, its
+    /// first recv armed into the filter `filter` builds over it; the reactor
+    /// holds it until the recv side ends. `egress_owner` wakes the task that
+    /// sends on the socket outside requests, if one does.
+    pub(crate) fn connect<F: RecvFilter + 'static>(
+        &self,
+        accepted: Accepted,
+        egress_owner: Option<chan::Sender<()>>,
+        filter: impl FnOnce(&Rc<ClientConn>) -> F,
+    ) -> Rc<ClientConn> {
+        let conn = Rc::new(ClientConn {
             fd: accepted.fd,
             _slot: accepted.slot,
             q: RefCell::new(FrameSink::new(Rc::clone(&self.conns.inbound))),
             gone: Cell::new(false),
             egress_owner,
-        })
+        });
+        let filter: Box<dyn RecvFilter> = Box::new(filter(&conn));
+        let mut recvs = self.conns.recvs.borrow_mut();
+        let entry = recvs.vacant_entry();
+        let key = entry.key();
+        entry
+            .insert(Armed { conn: Rc::clone(&conn), filter })
+            .arm(key, &mut self.ring.borrow_mut());
+        conn
     }
 
-    /// Arm `conn`'s first recv into `filter`'s window, and hold the connection
-    /// until the recv side ends.
-    pub(crate) fn register_conn(&self, conn: &Rc<ClientConn>, filter: Box<dyn RecvFilter>) {
-        let fd = conn.fd();
-        let mut conns = self.conns.armed.borrow_mut();
-        let Entry::Vacant(slot) = conns.entry(fd) else {
-            // An entry holds its connection, so its fd is open and cannot be
-            // reissued.
-            unreachable!("fd={fd} registered while an entry still holds it")
-        };
-        slot.insert(Armed { conn: Rc::clone(conn), filter })
-            .arm(&mut self.ring.borrow_mut());
-    }
-
-    pub(super) fn handle_recv_cqe(&self, fd: i32, res: i32) {
-        let mut conns = self.conns.armed.borrow_mut();
-        let Entry::Occupied(mut entry) = conns.entry(fd) else {
-            unreachable!("recv CQE for fd={fd} with no armed entry")
-        };
-        let armed = entry.get_mut();
-        if armed.conn.is_gone() {
+    pub(super) fn handle_recv_cqe(&self, key: usize, res: i32) {
+        let mut recvs = self.conns.recvs.borrow_mut();
+        let armed = recvs.get_mut(key).expect("a recv's entry lives until its CQE");
+        let end = if armed.conn.is_gone() {
             // Retired while this recv was in flight: its bytes are discarded.
-            entry.remove();
-            return;
-        }
-        let end = match res {
-            ..0 => RecvEnd::Socket,
-            0 => RecvEnd::PeerClosed,
-            n => {
-                let mut q = armed.conn.q.borrow_mut();
-                let ingested = armed.filter.ingest(n as usize, &mut q);
-                let over = q.over(self.conns.limits.conn_inbound_share);
-                drop(q);
-                match ingested {
-                    // Not re-armed: the socket's bytes stay in the kernel, whose
-                    // flow control holds the client off.
-                    Ok(()) if over => return self.conns.paused.borrow_mut().push(fd),
-                    Ok(()) => return armed.arm(&mut self.ring.borrow_mut()),
-                    Err(end) => end,
+            None
+        } else {
+            match res {
+                ..0 => Some(RecvEnd::Socket),
+                0 => Some(RecvEnd::PeerClosed),
+                n => {
+                    let mut q = armed.conn.q.borrow_mut();
+                    let ingested = armed.filter.ingest(n as usize, &mut q);
+                    let over = q.over(self.conns.limits.conn_inbound_share);
+                    drop(q);
+                    match ingested {
+                        // Not re-armed: the socket's bytes stay in the kernel, whose
+                        // flow control holds the client off.
+                        Ok(()) if over => return self.conns.paused.borrow_mut().push(key),
+                        Ok(()) => return armed.arm(key, &mut self.ring.borrow_mut()),
+                        Err(end) => Some(end),
+                    }
                 }
             }
         };
-        let armed = entry.remove();
-        drop(conns);
+        // Dropped outside the borrow: the entry may hold the last handle on the
+        // connection.
+        let armed = recvs.remove(key);
+        drop(recvs);
+        let Some(end) = end else { return };
+        let fd = armed.conn.fd();
         if let RecvEnd::PeerClosed = end {
             gnitz_debug!("reactor: fd={fd} recv side ended: {end}");
             return armed.conn.end_recv();
@@ -646,23 +645,21 @@ impl Reactor {
         }
         let mut paused = self.conns.paused.borrow_mut();
         let share = self.conns.limits.conn_inbound_share;
-        let mut armed = self.conns.armed.borrow_mut();
+        let mut recvs = self.conns.recvs.borrow_mut();
         let mut gone = Vec::new();
-        paused.retain(|&fd| {
-            let Entry::Occupied(mut entry) = armed.entry(fd) else {
-                unreachable!("paused fd={fd} with no entry")
-            };
-            if entry.get().conn.is_gone() {
-                gone.push(entry.remove());
+        paused.retain(|&key| {
+            let armed = &mut recvs[key];
+            if armed.conn.is_gone() {
+                gone.push(recvs.remove(key));
                 return false;
             }
-            if entry.get().conn.q.borrow().over(share) {
+            if armed.conn.q.borrow().over(share) {
                 return true;
             }
-            entry.get_mut().arm(&mut self.ring.borrow_mut());
+            armed.arm(key, &mut self.ring.borrow_mut());
             false
         });
-        drop((paused, armed));
+        drop((paused, recvs));
         drop(gone); // the reactor's hold on those connections ends
     }
 
@@ -687,15 +684,13 @@ impl Reactor {
             let sqe = opcode::Send::new(types::Fd(conn.fd()), rest.as_ptr(), len).build();
             // SAFETY: the op holds `out` until the CQE, and its bytes stay in
             // place as it moves.
-            let op = unsafe { self.push_named_op(sqe, Some(out)) };
-            let user_data = op.user_data();
-            let mut op = std::pin::pin!(op);
+            let mut op = unsafe { self.push_op(sqe, out) };
             let mut given_back = false;
             let waited = select2(
                 std::future::poll_fn(|cx| {
-                    let polled = op.as_mut().poll(cx);
-                    if polled.is_pending() && !given_back && op.with_carry(|o| o.body.poll_give_back(cx)).is_ready() {
-                        self.cancel_op(user_data);
+                    let polled = Pin::new(&mut op).poll(cx);
+                    if polled.is_pending() && !given_back && op.carry().body.poll_give_back(cx).is_ready() {
+                        op.cancel();
                         given_back = true;
                     }
                     polled
@@ -704,8 +699,8 @@ impl Reactor {
             )
             .await;
             let rc = match waited {
-                Either::A((rc, carry)) => {
-                    out = carry.expect("a send carries its body");
+                Either::A(rc) => {
+                    out = op.into_carry();
                     if given_back {
                         // The CQE has come, so no SQE reads the body.
                         out.body.detach();
