@@ -5,7 +5,7 @@
 //! one partial reduce-output batch is emitted.
 //!
 //! It runs the same `GroupOutKey` and aggregates as a view's reduce, and emits
-//! their values through `AggValues::emit_columns`, the column form of the
+//! their values through `AggValues::emit_at`, the column form of the
 //! reduce's `AggValues::emit`, so its output is that reduce's output over the
 //! same group set.
 //!
@@ -104,7 +104,7 @@ impl AdhocFold {
             let (pk, _, nulls) = w.fixed_mut();
             pk.copy_from_slice(self.groups.pk());
             nulls.copy_from_slice(self.groups.null_bmp());
-            self.vals.emit_columns(w);
+            self.vals.emit_at(w, (0..w.rows()).map(|g| (g, g)));
         })
     }
 }
