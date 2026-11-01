@@ -106,19 +106,20 @@ impl Ranked {
     }
 }
 
+/// The rows [`rank_rows`] gives images: the first `n` of a source, appended to a vector, or
+/// a run's, ranked in place.
+enum Rows<'a> {
+    First(u32, &'a mut Vec<Ranked>),
+    Run(&'a mut [Ranked]),
+}
+
 /// `rows` of `src`, each with its image under `key`: an integer whose order never contradicts
 /// the key's.
-fn rank_rows<S: RowSource>(key: &OrderLocator, src: &S, rows: impl Iterator<Item = u32>, out: &mut Vec<Ranked>) {
+fn rank_rows<S: RowSource>(key: &OrderLocator, src: &S, rows: Rows<'_>) {
     #[inline(always)]
-    fn fill<S: RowSource>(
-        key: &OrderLocator,
-        src: &S,
-        rows: impl Iterator<Item = u32>,
-        out: &mut Vec<Ranked>,
-        image: impl Fn(usize) -> u64,
-    ) {
+    fn fill<S: RowSource>(key: &OrderLocator, src: &S, rows: Rows<'_>, image: impl Fn(usize) -> u64) {
         let (loc, desc, nulls_first) = (key.loc, key.desc, key.nulls_first);
-        out.extend(rows.map(|row| {
+        let rank = |row: u32| {
             let r = row as usize;
             if loc.is_null_word(src.get_null_word(r)) {
                 return Ranked { image: 0, row, rank: !nulls_first as u8 };
@@ -129,20 +130,24 @@ fn rank_rows<S: RowSource>(key: &OrderLocator, src: &S, rows: impl Iterator<Item
                 row,
                 rank: nulls_first as u8,
             }
-        }));
+        };
+        match rows {
+            Rows::First(n, out) => out.extend((0..n).map(rank)),
+            Rows::Run(run) => run.iter_mut().for_each(|r| *r = rank(r.row)),
+        }
     }
     let loc = key.loc;
     let tc = loc.type_code();
     match ScalarKind::from_type_code(tc) {
         Some(ScalarKind::Int(fi)) => gnitz_wire::for_each_fixed_int!(fi, |FI| {
-            fill(key, src, rows, out, |r| order_bits(&loc, src, r, ScalarKind::Int(FI)))
+            fill(key, src, rows, |r| order_bits(&loc, src, r, ScalarKind::Int(FI)))
         }),
-        Some(kind) => fill(key, src, rows, out, |r| order_bits(&loc, src, r, kind)),
-        None if tc.is_german_string() => fill(key, src, rows, out, |r| {
+        Some(kind) => fill(key, src, rows, |r| order_bits(&loc, src, r, kind)),
+        None if tc.is_german_string() => fill(key, src, rows, |r| {
             gnitz_wire::german_string_lead(loc.german_cell(src, r), src.heap())
         }),
         // A 16-byte integer's high half.
-        None => fill(key, src, rows, out, |r| (loc.opk_image(src, r) >> 64) as u64),
+        None => fill(key, src, rows, |r| (loc.opk_image(src, r) >> 64) as u64),
     }
 }
 
@@ -154,13 +159,10 @@ fn sort_run<S: RowSource>(keys: &[OrderLocator], src: &S, run: &mut [Ranked]) {
     if whole && keys.len() == 1 {
         return;
     }
-    let mut scratch = Vec::new();
     for tie in run.chunk_by_mut(|a, b| a.lead() == b.lead()).filter(|t| t.len() > 1) {
         match whole {
             true => {
-                scratch.clear();
-                rank_rows(&keys[1], src, tie.iter().map(|r| r.row), &mut scratch);
-                tie.copy_from_slice(&scratch);
+                rank_rows(&keys[1], src, Rows::Run(tie));
                 sort_run(&keys[1..], src, tie);
             }
             false => tie.sort_by(|a, b| cmp_order_keys(keys, src, a.row as usize, b.row as usize)),
@@ -183,7 +185,7 @@ impl<'a, S: RowSource> RowRanking<'a, S> {
         let n = src.row_count();
         assert!(n <= u32::MAX as usize, "row count exceeds u32");
         let mut rows = Vec::with_capacity(n);
-        rank_rows(&keys[0], src, 0..n as u32, &mut rows);
+        rank_rows(&keys[0], src, Rows::First(n as u32, &mut rows));
         RowRanking { keys, src, rows }
     }
 
