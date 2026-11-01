@@ -1,10 +1,21 @@
 use super::*;
 
 /// An executable at `dir/name` running `body` under `sh`.
+///
+/// A child process writes it: a write descriptor held here would be inherited by
+/// a child another test thread forks meanwhile, and the kernel refuses to exec a
+/// file still open for writing (ETXTBSY).
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
-    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    let src = dir.join(format!("{name}.src"));
+    fs::write(&src, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let status = std::process::Command::new("install")
+        .arg("-m755")
+        .arg(&src)
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "install {}", path.display());
     path
 }
 
