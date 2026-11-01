@@ -369,6 +369,15 @@ fn sparse_region(rows: usize, width: usize, is_null: impl Fn(usize) -> bool, val
         .collect()
 }
 
+/// One bit per row of `rows`, set where `is_null` says the row holds a value.
+fn held_rows(rows: usize, is_null: impl Fn(usize) -> bool) -> Vec<u64> {
+    let mut held = vec![0u64; rows.div_ceil(64)];
+    (0..rows)
+        .filter(|&row| !is_null(row))
+        .for_each(|row| held[row / 64] |= 1 << (row % 64));
+    held
+}
+
 /// Decode rows `first_row..` of `sparse` under null words whose bit 3 is `is_null`'s.
 fn sparse_decode(
     sparse: &SparseImage,
@@ -407,7 +416,7 @@ fn sparse_roundtrips_framed_and_unframed() {
         for rows in [1, 40, DECODE_BLOCK_ROWS, 3 * DECODE_BLOCK_ROWS + 5] {
             let src = sparse_region(rows, width, is_null, value);
             let held: Vec<u128> = (0..rows).filter(|&row| !is_null(row)).map(value).collect();
-            let image = sparse_encode(&src, width, fi, is_null);
+            let image = sparse_encode(&src, width, fi, &held_rows(rows, is_null));
             let values = image.len() - SPARSE_RANKS_AT - rows.div_ceil(DECODE_BLOCK_ROWS) * SPARSE_RANK_ENTRY;
             let framed_at = fi.and_then(|fi| expected_bw(&held.iter().map(|&v| v as i128).collect::<Vec<_>>(), fi));
             assert_eq!(
@@ -439,6 +448,57 @@ fn sparse_roundtrips_framed_and_unframed() {
     }
 }
 
+/// The image from the held bits of a null region is the one a row-by-row walk
+/// of its null words writes: a rank per block, then the non-NULL cells.
+#[test]
+fn sparse_encode_from_null_words_matches_a_row_walk() {
+    let walk = |src: &[u8], width: usize, fi: Option<FixedInt>, is_null: &dyn Fn(usize) -> bool| {
+        let n = src.len() / width;
+        let mut image = vec![0u8; SPARSE_RANKS_AT + n.div_ceil(DECODE_BLOCK_ROWS) * SPARSE_RANK_ENTRY];
+        let mut values = Vec::new();
+        for (row, cell) in src.chunks_exact(width).enumerate() {
+            if row % DECODE_BLOCK_ROWS == 0 {
+                let entry = SPARSE_RANKS_AT + row / DECODE_BLOCK_ROWS * SPARSE_RANK_ENTRY;
+                write_u32_le(&mut image, entry, (values.len() / width) as u32);
+            }
+            if !is_null(row) {
+                values.extend_from_slice(cell);
+            }
+        }
+        write_u64_le(&mut image, 0, (values.len() / width) as u64);
+        let framed = fi.and_then(|fi| for_encode(&values, fi));
+        image.extend_from_slice(framed.as_ref().unwrap_or(&values));
+        image
+    };
+    let shapes: [fn(usize) -> bool; 4] = [|_| false, |_| true, |row| row % 7 != 2, |row| (row / 300) % 2 == 0];
+    for (width, fi) in [
+        (1, Some(FixedInt::I8)),
+        (2, Some(FixedInt::U16)),
+        (4, Some(FixedInt::I32)),
+        (8, Some(FixedInt::I64)),
+        (8, None),
+        (16, None),
+    ] {
+        for rows in [0, 1, 63, 64, 65, DECODE_BLOCK_ROWS, 5 * DECODE_BLOCK_ROWS + 77] {
+            for is_null in shapes {
+                let src = sparse_region(rows, width, is_null, |row| row as u128 * 0x0101_0101 + 5);
+                // Payload column 5 of null words whose other bits are set.
+                let words: Vec<u8> = (0..rows)
+                    .flat_map(|row| ((is_null(row) as u64) << 5 | 0xFFFF_0000_0000_001F).to_le_bytes())
+                    .collect();
+                let mut held = vec![0u64; rows.div_ceil(64)];
+                held_bits(gnitz_expr::Level::new(), &words, 5, &mut held);
+                assert_eq!(held, held_rows(rows, is_null), "{width}: {rows} rows");
+                assert_eq!(
+                    sparse_encode(&src, width, fi, &held),
+                    walk(&src, width, fi, &is_null),
+                    "{width}: {rows} rows"
+                );
+            }
+        }
+    }
+}
+
 /// A frame the size of the cells it would replace is not taken, so that a
 /// parse tells the two apart by size alone.
 #[test]
@@ -457,7 +517,7 @@ fn sparse_keeps_cells_a_frame_would_not_shrink() {
         let is_null = |row: usize| row % 3 != 1;
         let top = (1u128 << (8 * bw)) - 1;
         let src = sparse_region(rows, width, is_null, |row| if row == 1 { top } else { row as u128 });
-        let image = sparse_encode(&src, width, Some(fi), is_null);
+        let image = sparse_encode(&src, width, Some(fi), &held_rows(rows, is_null));
         let values = image.len() - SPARSE_RANKS_AT - SPARSE_RANK_ENTRY;
         let framed = for_image_len(held, bw) < held * width;
         assert_eq!(
@@ -477,7 +537,7 @@ fn sparse_parse_refuses_a_size_its_header_does_not_give() {
     let is_null = |row: usize| !row.is_multiple_of(5);
     let src = sparse_region(DECODE_BLOCK_ROWS + 3, 8, is_null, |row| 1000 + row as u128);
     let rows = src.len() / 8;
-    let image = sparse_encode(&src, 8, Some(FixedInt::I64), is_null);
+    let image = sparse_encode(&src, 8, Some(FixedInt::I64), &held_rows(src.len() / 8, is_null));
     assert!(SparseImage::parse(&image, rows, 8).is_some());
     assert!(
         SparseImage::parse(&image, DECODE_BLOCK_ROWS, 8).is_none(),
@@ -502,7 +562,7 @@ fn a_sparse_row_past_the_last_value_reads_zero() {
     let is_null = |row: usize| row % 2 == 1;
     let src = sparse_region(600, 8, is_null, |row| 1000 + row as u128);
     for fi in [Some(FixedInt::I64), None] {
-        let image = sparse_encode(&src, 8, fi, is_null);
+        let image = sparse_encode(&src, 8, fi, &held_rows(600, is_null));
         let sparse = SparseImage::parse(&image, 600, 8).unwrap();
         let mut out = vec![0xAAu8; src.len()];
         // Null words that name twice the values the image holds.

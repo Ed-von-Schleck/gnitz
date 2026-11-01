@@ -172,3 +172,44 @@ fn key_bench() {
         );
     }
 }
+
+/// Instructions per row to pack a nullable i64 column, payload column 2 of its
+/// null words, at each share of NULL rows: the Sparse image past half.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn sparse_encode_bench() {
+    use super::super::file::pack_fixed_column;
+    use crate::schema::SchemaColumn;
+    use gnitz_foundation::perf::Counter;
+    use std::hint::black_box;
+    const N: usize = 1_000_000;
+    let col = SchemaColumn::new(TypeCode::I64, true);
+    let instructions = Counter::instructions();
+    for percent in [0u64, 60, 95] {
+        let mut rng = Rng::new(0x0053_5041);
+        let null: Vec<bool> = (0..N).map(|_| rng.gen_range(100) < percent).collect();
+        let nulls: Vec<u8> = null
+            .iter()
+            .flat_map(|&n| ((n as u64) << 2 | 0b1001).to_le_bytes())
+            .collect();
+        let src: Vec<u8> = null
+            .iter()
+            .enumerate()
+            .flat_map(|(row, &n)| {
+                if n {
+                    0i64
+                } else {
+                    (row as i64).wrapping_mul(0x9E37_79B9)
+                }
+                .to_le_bytes()
+            })
+            .collect();
+        let (packed, i) = instructions.measure(|| pack_fixed_column(&col, 2, black_box(&src), black_box(&nulls)));
+        let (encoding, image) = packed.expect("the column packs");
+        println!(
+            "sparse_encode_bench {percent:>2}% NULL: {:6.2} instructions per row, {encoding:?}, {} bytes",
+            i as f64 / N as f64,
+            image.len()
+        );
+    }
+}

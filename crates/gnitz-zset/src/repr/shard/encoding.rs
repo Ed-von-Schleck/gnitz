@@ -1157,31 +1157,37 @@ impl<'a> SymbolsImage<'a> {
 const SPARSE_RANKS_AT: usize = 8;
 const SPARSE_RANK_ENTRY: usize = size_of::<u32>();
 
-/// The Sparse image of a region of `width`-byte cells whose row `r` is NULL
-/// iff `is_null(r)`, its values framed where `fi` admits a frame smaller than
-/// they are.
-pub(crate) fn sparse_encode(
-    src: &[u8],
-    width: usize,
-    fi: Option<FixedInt>,
-    is_null: impl Fn(usize) -> bool,
-) -> Vec<u8> {
+/// The Sparse image of a region of `width`-byte cells whose row `r` holds a
+/// value iff bit `r` of `held` is set, as [`held_bits`] gives them, its values
+/// framed where `fi` admits a frame smaller than they are.
+pub(crate) fn sparse_encode(src: &[u8], width: usize, fi: Option<FixedInt>, held: &[u64]) -> Vec<u8> {
     let n = src.len() / width;
+    debug_assert_eq!(held.len(), n.div_ceil(64), "one bit per row");
     let mut image = vec![0u8; SPARSE_RANKS_AT + n.div_ceil(DECODE_BLOCK_ROWS) * SPARSE_RANK_ENTRY];
-    let mut values = Vec::new();
-    for (row, cell) in src.chunks_exact(width).enumerate() {
-        if row % DECODE_BLOCK_ROWS == 0 {
-            let entry = SPARSE_RANKS_AT + row / DECODE_BLOCK_ROWS * SPARSE_RANK_ENTRY;
-            write_u32_le(&mut image, entry, (values.len() / width) as u32);
-        }
-        if !is_null(row) {
-            values.extend_from_slice(cell);
-        }
+    let mut count = 0usize;
+    for (block, words) in held.chunks(DECODE_BLOCK_ROWS / 64).enumerate() {
+        write_u32_le(&mut image, SPARSE_RANKS_AT + block * SPARSE_RANK_ENTRY, count as u32);
+        count += words.iter().map(|w| w.count_ones() as usize).sum::<usize>();
     }
-    write_u64_le(&mut image, 0, (values.len() / width) as u64);
+    write_u64_le(&mut image, 0, count as u64);
+    let mut values = vec![0u8; count * width];
+    gnitz_wire::by_cell_width!(width, |T| gather_held::<{ size_of::<T>() }>(src, held, &mut values));
     let framed = fi.and_then(|fi| for_encode(&values, fi));
     image.extend_from_slice(framed.as_ref().unwrap_or(&values));
     image
+}
+
+/// Copy the cells of `src` whose bit of `held` is set into `values`, in row order.
+fn gather_held<const W: usize>(src: &[u8], held: &[u64], values: &mut [u8]) {
+    let cells = src.as_chunks::<W>().0;
+    let out = values.as_chunks_mut::<W>().0;
+    let mut at = 0;
+    for (w, &word) in held.iter().enumerate() {
+        for j in gnitz_wire::BitIter(word) {
+            out[at] = cells[w * 64 + j];
+            at += 1;
+        }
+    }
 }
 
 /// A Sparse image taken apart.
@@ -1302,7 +1308,7 @@ const _: () = assert!(DECODE_BLOCK_ROWS <= HELD_CHUNK_ROWS);
 
 /// One bit per row of `rows` (8-byte null words), set where bit `pi` of the
 /// row's word is clear, written to the leading words of `bits` and returned.
-fn held_bits<'b>(level: Level, rows: &[u8], pi: usize, bits: &'b mut [u64]) -> &'b [u64] {
+pub(super) fn held_bits<'b>(level: Level, rows: &[u8], pi: usize, bits: &'b mut [u64]) -> &'b [u64] {
     let n = rows.len() / size_of::<u64>();
     let bits = &mut bits[..n.div_ceil(64)];
     null_bits(level, rows, 1 << pi, bits);

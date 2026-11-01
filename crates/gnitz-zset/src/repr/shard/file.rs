@@ -12,9 +12,8 @@ use super::layout::*;
 use super::pk_filter;
 use crate::repr::Batch;
 use crate::schema::SchemaColumn;
-use gnitz_wire::{
-    read_u64_le, FixedInt, Heap, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
-};
+use gnitz_expr::Level;
+use gnitz_wire::{FixedInt, Heap, RowSource, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Whether every `width`-byte element of `region` is the same. Every element
@@ -53,7 +52,12 @@ fn pack_words(src: &[u8], word: FixedInt) -> Option<(Encoding, Vec<u8>)> {
 /// batch's null region `nulls`: its frame, unless its non-NULL cells alone or a
 /// dictionary — the smaller of the two — take no more than half of what the
 /// region would else, since both cost a decode a frame does not.
-fn pack_fixed_column(col: &SchemaColumn, pi: usize, src: &[u8], nulls: &[u8]) -> Option<(Encoding, Vec<u8>)> {
+pub(super) fn pack_fixed_column(
+    col: &SchemaColumn,
+    pi: usize,
+    src: &[u8],
+    nulls: &[u8],
+) -> Option<(Encoding, Vec<u8>)> {
     let n = nulls.len() / FIXED_REGION_BYTES;
     let width = col.size();
     let fi = FixedInt::from_type_code(col.type_code);
@@ -61,10 +65,16 @@ fn pack_fixed_column(col: &SchemaColumn, pi: usize, src: &[u8], nulls: &[u8]) ->
         .and_then(|fi| for_encode(src, fi))
         .filter(|image| aligned(image.len()) < aligned(src.len()));
     let limit = framed.as_ref().map_or(src.len(), Vec::len) / 2;
-    let is_null = |row: usize| gnitz_wire::null_word_get(read_u64_le(nulls, row * FIXED_REGION_BYTES), pi);
+    let held = col.nullable.then(|| {
+        let mut held = vec![0u64; n.div_ceil(64)];
+        held_bits(Level::new(), nulls, pi, &mut held);
+        held
+    });
+    let present = |held: &[u64]| held.iter().map(|w| w.count_ones() as usize).sum::<usize>();
     // A column under half NULL has more cells than half the region holds.
-    let sparse = (col.nullable && (0..n).filter(|&r| is_null(r)).count() > n / 2)
-        .then(|| sparse_encode(src, width, fi, is_null))
+    let sparse = held
+        .filter(|held| n - present(held) > n / 2)
+        .map(|held| sparse_encode(src, width, fi, &held))
         .filter(|image| aligned(image.len()) < aligned(limit));
     let limit = sparse.as_ref().map_or(limit, Vec::len);
     let dict = (dict_image_len(n, 2) < limit && sample_repeats(n, |row| &src[row * width..][..width]))
