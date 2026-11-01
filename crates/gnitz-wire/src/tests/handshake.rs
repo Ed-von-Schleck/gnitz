@@ -94,21 +94,14 @@ fn wire_layout_samples() -> Vec<u8> {
     append_frame(&mut out, &hdr, b"blob", Some(b"schema"), None);
 
     let target = Target { tid: 7, token: 9 };
-    out.extend(txn_frame::encode_scan_multi(&[ScanItem {
-        target,
-        reply_layout: 3,
-        spec: b"spec",
-    }]));
+    txn_frame::encode_scan_multi(&mut out, &[ScanItem { target, reply_layout: 3, spec: b"spec" }]);
     let poll = DeltaPollItem {
         view: target,
         from: DeltaCursor::from_pair(5, 6),
         reply_layout: 3,
         spec: b"spec",
     };
-    out.extend(txn_frame::encode_delta_poll(
-        &[poll, DeltaPollItem { from: None, ..poll }],
-        SubId::new(4),
-    ));
+    txn_frame::encode_delta_poll(&mut out, &[poll, DeltaPollItem { from: None, ..poll }], SubId::new(4));
     out.extend(txn_frame::encode_held(
         [SubId::new(4), SubId::new(u64::MAX)].map(Option::unwrap),
     ));

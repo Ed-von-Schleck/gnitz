@@ -2,7 +2,7 @@
 //! Not `rustls::StreamOwned`: its `Read` would be a plaintext path around the
 //! deframer.
 
-use std::io::{self, BufRead, IoSlice, Write};
+use std::io::{self, BufRead, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -232,11 +232,11 @@ impl TlsInner {
         Ok(())
     }
 
-    /// The TLS write core: rustls takes a prefix of `slices`, held as plaintext
+    /// The TLS write core: rustls takes a prefix of `bytes`, held as plaintext
     /// until the handshake completes.
-    pub(super) fn write_slices(&mut self, slices: &[IoSlice<'_>]) -> Result<Option<usize>, ProtocolError> {
+    pub(super) fn write_bytes(&mut self, bytes: &[u8]) -> Result<Option<usize>, ProtocolError> {
         debug_assert!(!self.conn.wants_write());
-        write_nonblocking(|| self.conn.writer().write_vectored(slices))
+        write_nonblocking(|| self.conn.writer().write(bytes))
     }
 
     /// Decrypt one read's ciphertext, handing `plain` every chunk it yields.

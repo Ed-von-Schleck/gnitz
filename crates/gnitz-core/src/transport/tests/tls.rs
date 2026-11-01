@@ -84,7 +84,7 @@ fn flush_can_empty_the_queue_with_ciphertext_still_pending() {
     let frame: Vec<u8> = (0u8..=255).collect::<Vec<_>>().repeat(240);
     let (mut t, mut end) = tls_pair(Some(8 * 1024));
     set_sockopt_int(t.as_fd().as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 8 * 1024).unwrap();
-    t.enqueue(frame.clone());
+    t.enqueue(&frame).unwrap();
     t.flush().unwrap();
     assert_eq!(t.queued_bytes(), 0, "rustls took the whole frame");
     assert!(t.wants_write(), "the queue alone is not the predicate");
@@ -102,14 +102,14 @@ fn a_frame_larger_than_the_send_buffer_leaves_its_tail_queued() {
         .repeat((SEND_BUFFER_BYTES + 256 * 1024) / 256);
     let (mut t, mut end) = tls_pair(None);
     set_sockopt_int(t.as_fd().as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 16 * 1024).unwrap();
-    t.enqueue(big.clone());
+    t.enqueue(&big).unwrap();
     t.flush().unwrap();
     assert!(t.queued_bytes() > 0, "the tail is queue state, not rustls's");
     let reader = std::thread::spawn(move || {
         assert_eq!(read_frame(&mut end), big);
         assert_eq!(read_frame(&mut end), b"after");
     });
-    t.enqueue(b"after".to_vec());
+    t.enqueue(b"after").unwrap();
     flush_all(&mut t);
     reader.join().unwrap();
 }

@@ -3,10 +3,9 @@
 
 use super::*;
 use crate::block_on;
-use crate::connection::encode_frame;
 use crate::test_support::{
-    client_pair, delta_frame, delta_terminal, interrupt_self_until, kv_rows, kv_schema, pushed_train, rel, reply_ctrl,
-    reply_status, sync_answer, sync_header, sync_held, Peer,
+    client_pair, delta_frame, delta_terminal, encode_frame, interrupt_self_until, kv_rows, kv_schema, pushed_train,
+    rel, reply_ctrl, reply_status, sync_answer, sync_header, sync_held, Peer,
 };
 use crate::transport::{poll_fd, Interest};
 use crate::BlockingHost;

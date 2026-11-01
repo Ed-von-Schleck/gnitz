@@ -104,9 +104,13 @@ fn play(srv: &mut ServerHandle, target: &str, sent: &[Frame], deadline: Instant,
         if trace {
             eprintln!("> conn {} frame {i}: {}", frame.conn, describe(&frame.bytes));
         }
-        conn.transport.enqueue(frame.bytes.clone());
+        // An edit can grow a frame past the ceiling, which the transport
+        // refuses to queue; such a frame is not sent.
+        if conn.transport.enqueue(&frame.bytes).is_err() {
+            continue;
+        }
         let id = BARRIER_BASE + i as u64;
-        conn.transport.enqueue(barrier(id));
+        conn.transport.enqueue(&barrier(id)).expect("a barrier is one header");
         conn.barrier = Some(id);
         pump(&mut conns, frame.conn, deadline, trace).map_err(|e| match e {
             None => format!("frame {i} was not answered within {SESSION_BUDGET:?}"),

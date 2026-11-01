@@ -52,26 +52,25 @@ pub struct FrameItem<'a> {
     pub data: Regions<'a>,
 }
 
-/// A multi-item `verb` frame: a prologue of `arg0` as given and every other
-/// field zero, then the items `items` appends, which are `body` bytes exactly,
-/// so appending them never reallocates.
-fn multi_frame(verb: ClientVerb, arg0: u64, body: usize, items: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
-    let mut out = Vec::with_capacity(CTRL_HEADER_SIZE + body);
+/// Append a multi-item `verb` frame to `out`: a prologue of `arg0` as given and
+/// every other field zero, then the items `items` appends, which are `body`
+/// bytes exactly, so appending them never reallocates.
+fn multi_frame(out: &mut Vec<u8>, verb: ClientVerb, arg0: u64, body: usize, items: impl FnOnce(&mut Vec<u8>)) {
+    let at = out.len();
+    out.reserve(CTRL_HEADER_SIZE + body);
     let hdr = ControlHeader {
         flags: WireFlags { verb, ..Default::default() },
         arg0,
         ..Default::default()
     };
-    append_frame(&mut out, &hdr, &[], None, None);
-    let cap = out.capacity();
-    items(&mut out);
-    debug_assert_eq!(out.capacity(), cap, "{verb:?} frame outgrew its size");
-    out
+    append_frame(out, &hdr, &[], None, None);
+    items(out);
+    debug_assert_eq!(out.len() - at, CTRL_HEADER_SIZE + body, "{verb:?} frame missized");
 }
 
-/// Encode a `PUSH_TXN` or `DDL_TXN` frame, without the 4-byte frame length
-/// prefix.
-pub fn encode_items(verb: ClientVerb, items: &[FrameItem<'_>]) -> Vec<u8> {
+/// Append a `PUSH_TXN` or `DDL_TXN` frame to `out`, without the 4-byte frame
+/// length prefix.
+pub fn encode_items(out: &mut Vec<u8>, verb: ClientVerb, items: &[FrameItem<'_>]) {
     debug_assert!(
         item_shape(verb).is_some_and(|s| s.data),
         "{verb:?} items carry no data block"
@@ -80,7 +79,7 @@ pub fn encode_items(verb: ClientVerb, items: &[FrameItem<'_>]) -> Vec<u8> {
         .iter()
         .map(|it| frame_size(&[], it.schema, Some(&it.data[..])))
         .sum();
-    multi_frame(verb, 0, body, |out| {
+    multi_frame(out, verb, 0, body, |out| {
         for it in items {
             let mut hdr = ControlHeader::naming(verb, it.target, it.basis);
             hdr.flags.conflict_mode = it.conflict_mode;
@@ -184,10 +183,11 @@ impl<'a> ScanItem<'a> {
     }
 }
 
-/// Encode a `SCAN_MULTI` frame, without the 4-byte frame length prefix.
-pub fn encode_scan_multi(scans: &[ScanItem<'_>]) -> Vec<u8> {
+/// Append a `SCAN_MULTI` frame to `out`, without the 4-byte frame length
+/// prefix.
+pub fn encode_scan_multi(out: &mut Vec<u8>, scans: &[ScanItem<'_>]) {
     let body = scans.iter().map(|s| frame_head_size(s.spec.len(), None)).sum();
-    multi_frame(ClientVerb::ScanMulti, 0, body, |out| {
+    multi_frame(out, ClientVerb::ScanMulti, 0, body, |out| {
         for s in scans {
             let hdr = ControlHeader::naming(ClientVerb::ScanMulti, s.target, s.reply_layout);
             append_frame(out, &hdr, s.spec, None, None);
@@ -285,16 +285,16 @@ impl fmt::Display for SubId {
     }
 }
 
-/// Encode a `DELTA_POLL` frame, without the 4-byte frame length prefix. Item
-/// `i` is kept as the subscription [`kept_as`]`(keep, i)`.
-pub fn encode_delta_poll(views: &[DeltaPollItem<'_>], keep: Option<SubId>) -> Vec<u8> {
+/// Append a `DELTA_POLL` frame to `out`, without the 4-byte frame length
+/// prefix. Item `i` is kept as the subscription [`kept_as`]`(keep, i)`.
+pub fn encode_delta_poll(out: &mut Vec<u8>, views: &[DeltaPollItem<'_>], keep: Option<SubId>) {
     let body = views
         .iter()
         .map(|v| frame_head_size(DELTA_CURSOR_BYTES + v.spec.len(), None))
         .sum();
     let widest = views.iter().map(|v| v.spec.len()).max().unwrap_or(0);
     let mut blob = Writer::with_capacity(DELTA_CURSOR_BYTES + widest);
-    multi_frame(ClientVerb::DeltaPoll, keep.map_or(0, SubId::get), body, |out| {
+    multi_frame(out, ClientVerb::DeltaPoll, keep.map_or(0, SubId::get), body, |out| {
         for v in views {
             blob.clear();
             DeltaCursor::write_opt(&mut blob, v.from);

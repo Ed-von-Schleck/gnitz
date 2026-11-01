@@ -1017,6 +1017,11 @@ fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
         );
         frame
     };
+    let poll = |keep: Option<SubId>| {
+        let mut frame = Vec::new();
+        encode_delta_poll(&mut frame, &[item], keep);
+        frame
+    };
 
     let mut raw = std::os::unix::net::UnixStream::connect(fx.server.sock_path()).unwrap();
     let send = |raw: &mut std::os::unix::net::UnixStream, payload: &[u8]| {
@@ -1045,12 +1050,12 @@ fn a_waiting_sync_holds_up_no_request_and_the_next_sync_ends_it() {
         recv(&mut raw),
         gnitz_wire::server_hello(gnitz_wire::AuthStatus::Accepted)
     );
-    send(&mut raw, &encode_delta_poll(&[item], Some(SubId::FIRST)));
+    send(&mut raw, &poll(Some(SubId::FIRST)));
     assert!(!next_is_sync(&mut raw, "the subscribing read"));
 
     let t0 = std::time::Instant::now();
     send(&mut raw, &sync(HELD));
-    send(&mut raw, &encode_delta_poll(&[item], None));
+    send(&mut raw, &poll(None));
     assert!(
         !next_is_sync(&mut raw, "the read behind the sync"),
         "the sync is still held"

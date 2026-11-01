@@ -3,9 +3,9 @@
 
 use super::*;
 use crate::test_support::{
-    await_reply, decode_wal_block, delta_frame, delta_terminal, kv_rows, kv_schema, pushed_marker, pushed_train,
-    reply_ctrl, reply_rows, reply_status, session_pair as pair, step_until_idle, sub_id, sync_answer, sync_header,
-    sync_held, Peer,
+    await_reply, decode_wal_block, delta_frame, delta_terminal, encode_frame, kv_rows, kv_schema, pushed_marker,
+    pushed_train, reply_ctrl, reply_rows, reply_status, session_pair as pair, step_until_idle, sub_id, sync_answer,
+    sync_header, sync_held, Peer,
 };
 use crate::transport::poll_fd;
 use crate::{BatchAppender, PkColumn};
@@ -1090,7 +1090,8 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
         family(17, b1, WireConflictMode::Error, blind),
         family(16, b2, WireConflictMode::Update, blind),
     ];
-    let payload = encode_push_txn(&families);
+    let mut payload = Vec::new();
+    append_push_txn(&mut payload, &families);
 
     let ctrl = peek_control_block(&payload).unwrap();
     let decoded = gnitz_wire::txn_frame::decode_items(&payload[ctrl.body], ClientVerb::PushTxn).unwrap();

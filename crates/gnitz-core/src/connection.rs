@@ -130,15 +130,10 @@ pub(crate) enum Request<'a> {
 }
 
 impl Request<'_> {
-    /// Validate and encode: the frame, and the relation its ACK names.
-    fn encode(self) -> Result<(Vec<u8>, u64), ClientError> {
-        // A control-only request: its verb, the relation its ACK names, `arg0`, and its blob.
-        let (verb, target, arg0, blob): (ClientVerb, Target, u64, &[u8]) = match self {
-            Request::AllocIds(n) => (ClientVerb::AllocIds, Target::from(0), n, &[]),
-            Request::AllocSerial { table, count } => (ClientVerb::AllocSerialRange, table, count, &[]),
-            Request::SnapshotOpen => (ClientVerb::SnapshotOpen, Target::from(0), 0, &[]),
-            Request::SnapshotClose(id) => (ClientVerb::SnapshotClose, Target::from(0), id, &[]),
-            Request::Backup(name) => (ClientVerb::Backup, Target::from(0), 0, name.as_bytes()),
+    /// Validate: the relation its ACK names.
+    fn validate(&self) -> Result<u64, ClientError> {
+        match *self {
+            Request::AllocSerial { table, .. } => Ok(table.tid),
             Request::DdlTxn(families) => {
                 for (tid, batch) in families {
                     if gnitz_wire::sys_family_index(*tid).is_none() {
@@ -146,49 +141,62 @@ impl Request<'_> {
                     }
                     batch.validate(sys_schema(*tid))?;
                 }
-                return Ok((encode_ddl_txn(families), 0));
+                Ok(0)
             }
             Request::PushTxn(families) => {
                 for f in families {
                     f.batch.validate(&f.schema)?;
                 }
-                return Ok((encode_push_txn(families), 0));
+                Ok(0)
             }
-            Request::Push { target, schema, batch, mode } => {
+            Request::Push { target, schema, batch, .. } => {
                 // In-process, so a convenience and never a trust boundary; the
                 // server checks the same things. Here so no driver has to
                 // remember to.
                 batch.validate(schema)?;
+                Ok(target.tid)
+            }
+            Request::AllocIds(_) | Request::SnapshotOpen | Request::SnapshotClose(_) | Request::Backup(_) => Ok(0),
+        }
+    }
+
+    /// Append the frame payload to `out`.
+    fn append(self, out: &mut Vec<u8>) {
+        // A control-only request: its verb, the relation it names, `arg0`, and its blob.
+        let (verb, target, arg0, blob): (ClientVerb, Target, u64, &[u8]) = match self {
+            Request::AllocIds(n) => (ClientVerb::AllocIds, Target::from(0), n, &[]),
+            Request::AllocSerial { table, count } => (ClientVerb::AllocSerialRange, table, count, &[]),
+            Request::SnapshotOpen => (ClientVerb::SnapshotOpen, Target::from(0), 0, &[]),
+            Request::SnapshotClose(id) => (ClientVerb::SnapshotClose, Target::from(0), id, &[]),
+            Request::Backup(name) => (ClientVerb::Backup, Target::from(0), 0, name.as_bytes()),
+            Request::DdlTxn(families) => return append_ddl_txn(out, families),
+            Request::PushTxn(families) => return append_push_txn(out, families),
+            Request::Push { target, schema, batch, mode } => {
                 let mut hdr = ControlHeader::naming(ClientVerb::Push, target, 0);
                 hdr.flags.conflict_mode = mode;
-                let frame = encode_frame(hdr, &[], Some(&schema.to_block()), Some(batch));
-                return Ok((frame, target.tid));
+                return append_payload(out, hdr, &[], Some(&schema.to_block()), Some(batch));
             }
         };
-        Ok((
-            encode_frame(ControlHeader::naming(verb, target, arg0), blob, None, None),
-            target.tid,
-        ))
+        append_payload(out, ControlHeader::naming(verb, target, arg0), blob, None, None)
     }
 }
 
-/// One frame payload, without the 4-byte length prefix. An empty batch ships no
-/// data block, and still ships the schema record.
-pub(crate) fn encode_frame(
+/// Append one frame payload, without the 4-byte length prefix, to `out`. An
+/// empty batch ships no data block, and still ships the schema record.
+pub(crate) fn append_payload(
+    out: &mut Vec<u8>,
     hdr: ControlHeader,
     blob: &[u8],
     schema: Option<&[u8]>,
     data: Option<&ZSetBatch>,
-) -> Vec<u8> {
-    let mut out = Vec::new();
+) {
     append_frame(
-        &mut out,
+        out,
         &hdr,
         blob,
         schema,
         data.filter(|b| !b.is_empty()).map(|b| b.wire_regions()).as_deref(),
     );
-    out
 }
 
 /// One family of a user-table push transaction: a maximal run of same-mode
@@ -208,10 +216,10 @@ pub struct PushFamily {
     pub basis: u64,
 }
 
-/// Encode an atomic user-table push transaction frame (`ClientVerb::PushTxn`) into
-/// wire bytes (without the 4-byte frame header). Every family carries its schema
+/// Append an atomic user-table push transaction frame (`ClientVerb::PushTxn`) to
+/// `out` (without the 4-byte frame header). Every family carries its schema
 /// record, which the master validates it against.
-pub(crate) fn encode_push_txn(families: &[PushFamily]) -> Vec<u8> {
+pub(crate) fn append_push_txn(out: &mut Vec<u8>, families: &[PushFamily]) {
     let schemas: Vec<Vec<u8>> = families.iter().map(|f| f.schema.to_block()).collect();
     let items: Vec<FrameItem> = families
         .iter()
@@ -224,7 +232,7 @@ pub(crate) fn encode_push_txn(families: &[PushFamily]) -> Vec<u8> {
             data: f.batch.wire_regions(),
         })
         .collect();
-    encode_items(ClientVerb::PushTxn, &items)
+    encode_items(out, ClientVerb::PushTxn, &items)
 }
 
 /// Encode an atomic DDL transaction frame (`ClientVerb::DdlTxn`) into wire bytes
@@ -232,6 +240,13 @@ pub(crate) fn encode_push_txn(families: &[PushFamily]) -> Vec<u8> {
 /// alone; its batch carries its own layout, which `Session::submit` validates
 /// against that id's system schema.
 pub fn encode_ddl_txn(families: &[(u64, ZSetBatch)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    append_ddl_txn(&mut out, families);
+    out
+}
+
+/// Append the frame [`encode_ddl_txn`] encodes to `out`.
+fn append_ddl_txn(out: &mut Vec<u8>, families: &[(u64, ZSetBatch)]) {
     let items: Vec<FrameItem> = families
         .iter()
         .map(|(tid, b)| FrameItem {
@@ -242,7 +257,7 @@ pub fn encode_ddl_txn(families: &[(u64, ZSetBatch)]) -> Vec<u8> {
             data: b.wire_regions(),
         })
         .collect();
-    encode_items(ClientVerb::DdlTxn, &items)
+    encode_items(out, ClientVerb::DdlTxn, &items)
 }
 
 /// One request in flight, or a pushed train: how its reply decodes, the reply
@@ -588,12 +603,12 @@ impl Session {
     /// does not validate, or at either cap — is answered with the refusal, as
     /// every submit's is.
     pub(crate) fn submit(&mut self, req: Request<'_>) -> Sent<u64> {
-        let (frame, tid) = match req.encode() {
-            Ok(encoded) => encoded,
+        let tid = match req.validate() {
+            Ok(tid) => tid,
             Err(why) => return Sent::ready(Err(why)),
         };
         let (to, sent) = promise();
-        self.enqueue(frame, Slot::Ack { tid, to });
+        self.enqueue(|out| req.append(out), Slot::Ack { tid, to });
         sent
     }
 
@@ -602,7 +617,10 @@ impl Session {
     pub(crate) fn submit_resolve(&mut self, qname: &str) -> Sent<Option<Arc<RelDescriptor>>> {
         let hdr = ControlHeader::naming(ClientVerb::Resolve, Target::from(0), 0);
         let (to, sent) = promise();
-        self.enqueue(encode_frame(hdr, qname.as_bytes(), None, None), Slot::Resolve { to });
+        self.enqueue(
+            |out| append_payload(out, hdr, qname.as_bytes(), None, None),
+            Slot::Resolve { to },
+        );
         sent
     }
 
@@ -619,7 +637,8 @@ impl Session {
             train: Train::new(target.tid, reply_schema),
             to,
         });
-        self.enqueue(encode_frame(hdr, &spec.encode(), None, None), slot);
+        let spec = spec.encode();
+        self.enqueue(|out| append_payload(out, hdr, &spec, None, None), slot);
         sent
     }
 
@@ -646,7 +665,8 @@ impl Session {
             worker_ends: Vec::new(),
             to,
         };
-        self.enqueue(encode_frame(hdr, &request.encode(), None, None), slot);
+        let request = request.encode();
+        self.enqueue(|out| append_payload(out, hdr, &request, None, None), slot);
         sent
     }
 
@@ -677,7 +697,7 @@ impl Session {
             replies: Vec::with_capacity(scans.len()),
             to,
         });
-        self.enqueue(txn_frame::encode_scan_multi(&items), slot);
+        self.enqueue(|out| txn_frame::encode_scan_multi(out, &items), slot);
         sent
     }
 
@@ -704,7 +724,7 @@ impl Session {
             reply_layout: reply_schema.layout().layout_digest(),
             spec,
         };
-        self.enqueue(txn_frame::encode_delta_poll(&[item], keep), slot);
+        self.enqueue(|out| txn_frame::encode_delta_poll(out, &[item], keep), slot);
         sent
     }
 
@@ -727,7 +747,7 @@ impl Session {
         let hdr = ControlHeader::naming(ClientVerb::SyncPushed, Target::from(0), wait_ms);
         let named = txn_frame::encode_held(polls.subs.keys().copied());
         let (mut to, sent) = promise();
-        match self.admit(encode_frame(hdr, &named, None, None)) {
+        match self.admit(|out| append_payload(out, hdr, &named, None, None)) {
             Ok(()) => {
                 self.inbox.syncing.push_back(to);
                 self.inbox.polls.server_holds = !self.inbox.polls.subs.is_empty();
@@ -774,36 +794,35 @@ impl Session {
             poll: self.inbox.polls.live,
             first,
         };
-        self.enqueue(txn_frame::encode_delta_poll(views, Some(first)), slot);
+        self.enqueue(|out| txn_frame::encode_delta_poll(out, views, Some(first)), slot);
     }
 
-    /// Queue `frame`, whose reply `slot` reads. A request this session refuses
-    /// is answered with the refusal.
-    fn enqueue(&mut self, frame: Vec<u8>, mut slot: Slot) {
-        match self.admit(frame) {
+    /// Queue the frame `encode` appends, whose reply `slot` reads. A request
+    /// this session refuses is answered with the refusal.
+    fn enqueue(&mut self, encode: impl FnOnce(&mut Vec<u8>), mut slot: Slot) {
+        match self.admit(encode) {
             Ok(()) => self.inbox.pending.push_back(slot),
             Err(why) => slot.fail(why, &mut self.inbox.polls),
         }
     }
 
-    /// Queue `frame` on the transport, or the refusal this session answers it with.
-    fn admit(&mut self, frame: Vec<u8>) -> Result<(), ClientError> {
-        let (total, limit) = (frame.len(), gnitz_wire::MAX_FRAME_PAYLOAD);
-        // A frame past the ceiling is refused here rather than by the server's
-        // ingress cap, which would drop the connection.
-        if total > limit {
-            return Err(ClientError::from(format!(
-                "request frame is {total} bytes, exceeding the {limit}-byte server ingress cap; \
-                 split the request"
-            )));
-        }
+    /// Queue the frame `encode` appends on the transport, or the refusal this
+    /// session answers it with.
+    fn admit(&mut self, encode: impl FnOnce(&mut Vec<u8>)) -> Result<(), ClientError> {
         if let Some(why) = &self.ended {
             return Err(why.clone());
         }
         if let Some(why) = self.cap_refusal() {
             return Err(why);
         }
-        self.transport.enqueue(frame);
+        // A frame past the ceiling is refused here rather than by the server's
+        // ingress cap, which would drop the connection.
+        self.transport.frame(encode).map_err(|total| {
+            ClientError::from(format!(
+                "request frame is {total} bytes, exceeding the {}-byte server ingress cap; split the request",
+                gnitz_wire::MAX_FRAME_PAYLOAD
+            ))
+        })?;
         self.submitted += 1;
         Ok(())
     }

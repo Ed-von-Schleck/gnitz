@@ -306,7 +306,9 @@ fn ddl_frame(blocks: impl IntoIterator<Item = (SysFamily, Batch)>) -> Vec<u8> {
             data: batch.wire_regions(),
         })
         .collect();
-    encode_items(ClientVerb::DdlTxn, &items)
+    let mut frame = Vec::new();
+    encode_items(&mut frame, ClientVerb::DdlTxn, &items);
+    frame
 }
 
 /// The built-in seed is a session the target plays through without a refusal:

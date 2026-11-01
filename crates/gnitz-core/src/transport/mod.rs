@@ -8,7 +8,6 @@
 //! send or receives after its HELLO.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::io::{IoSlice, Write};
 use std::mem::MaybeUninit;
 use std::net::Shutdown;
@@ -33,7 +32,7 @@ pub struct ClientTransport {
     window: Box<[MaybeUninit<u8>]>,
     /// A read ended with bytes of it unfed, so the stream has lost its framing.
     torn: bool,
-    queue: OutQueue,
+    queue: OutBuf,
     /// Where this connection records its frames, when its process records.
     tap: Option<Tap>,
 }
@@ -47,13 +46,14 @@ enum Inner {
 }
 
 impl Inner {
-    /// The non-blocking write core: hand `slices` to the sink and report how
-    /// many bytes it accepted. std's `write_vectored` clamps to `IOV_MAX`
-    /// itself, so a caller may pass any number of slices and gets a prefix.
-    fn write_slices(&mut self, slices: &[IoSlice<'_>]) -> Result<Option<usize>, ProtocolError> {
+    /// The non-blocking write core: hand `bytes` to the sink and report how
+    /// many of them it accepted. The Unix arm writes them as one `writev`
+    /// slice, so a syscall trace tells the transport's writes apart from a
+    /// `write` to stdout and a `sendto` to a self-pipe.
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<Option<usize>, ProtocolError> {
         match self {
-            Inner::Unix(s) => write_nonblocking(|| (&*s).write_vectored(slices)),
-            Inner::Tls(t) => t.write_slices(slices),
+            Inner::Unix(s) => write_nonblocking(|| (&*s).write_vectored(&[IoSlice::new(bytes)])),
+            Inner::Tls(t) => t.write_bytes(bytes),
         }
     }
 
@@ -217,7 +217,7 @@ impl ClientTransport {
             deframer: Deframer::default(),
             window: Box::new_uninit_slice(WINDOW_BYTES),
             torn: false,
-            queue: OutQueue::default(),
+            queue: OutBuf::default(),
             tap: None,
         }
     }
@@ -247,7 +247,13 @@ impl ClientTransport {
     /// this is also where the handshake completes and certificate failures
     /// surface.
     fn hello(&mut self, token: &[u8], until: Instant) -> Result<(), ClientError> {
-        self.enqueue(gnitz_wire::client_hello(token));
+        let hello = gnitz_wire::client_hello(token);
+        self.enqueue(&hello).map_err(|len| {
+            ClientError::from(format!(
+                "the HELLO is {len} bytes, past the {}-byte frame ceiling; use a shorter access token",
+                gnitz_wire::MAX_FRAME_PAYLOAD
+            ))
+        })?;
         loop {
             // Every round: a read queues the TLS handshake's next flight.
             self.flush()?;
@@ -292,14 +298,38 @@ impl ClientTransport {
         }
     }
 
-    /// Queue an owned frame behind everything already queued. Nothing is
-    /// written here; `flush` ships the queue. A recording connection records it
-    /// as sent here.
-    pub fn enqueue(&mut self, payload: Vec<u8>) {
-        if let Some(tap) = &self.tap {
-            tap.note(Direction::Sent, &payload);
+    /// Queue `payload` as one frame behind everything already queued, or
+    /// refuse one past [`gnitz_wire::MAX_FRAME_PAYLOAD`] with its length.
+    /// Nothing is written here; `flush` ships the queue.
+    pub fn enqueue(&mut self, payload: &[u8]) -> Result<(), usize> {
+        self.frame(|out| out.extend_from_slice(payload))
+    }
+
+    /// Queue the frame whose payload `encode` appends to the buffer it is
+    /// handed, behind everything already queued. A payload past
+    /// [`gnitz_wire::MAX_FRAME_PAYLOAD`] is taken back out and refused with
+    /// its length. Nothing is written here; `flush` ships the queue. A
+    /// recording connection records the frame as sent here.
+    pub(crate) fn frame(&mut self, encode: impl FnOnce(&mut Vec<u8>)) -> Result<(), usize> {
+        let q = &mut self.queue;
+        q.compact();
+        let at = q.buf.len();
+        let body = at + gnitz_wire::FRAME_LEN_PREFIX_BYTES;
+        q.buf.resize(body, 0);
+        encode(&mut q.buf);
+        let len = q.buf.len() - body;
+        if len > gnitz_wire::MAX_FRAME_PAYLOAD {
+            q.buf.truncate(at);
+            if q.is_empty() {
+                q.settle();
+            }
+            return Err(len);
         }
-        self.queue.push(payload);
+        q.buf[at..body].copy_from_slice(&gnitz_wire::frame_len_prefix(len));
+        if let Some(tap) = &self.tap {
+            tap.note(Direction::Sent, &q.buf[body..]);
+        }
+        Ok(())
     }
 
     /// Write what the fd accepts from the queue cursor. Never parks; what is
@@ -310,9 +340,7 @@ impl ClientTransport {
             if self.inner.has_pending_ciphertext() || self.queue.is_empty() {
                 return Ok(());
             }
-            let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOV_MAX_CHUNK.min(2 * self.queue.frames.len()));
-            self.queue.build_slices(&mut slices);
-            match self.inner.write_slices(&slices)? {
+            match self.inner.write_bytes(self.queue.pending())? {
                 Some(n) => self.queue.advance(n),
                 None => return Ok(()),
             }
@@ -321,7 +349,7 @@ impl ClientTransport {
 
     /// Frame bytes queued and not yet written.
     pub(crate) fn queued_bytes(&self) -> usize {
-        self.queue.bytes
+        self.queue.pending().len()
     }
 
     /// Bytes queued, or ciphertext pending: the `WRITE` half of a driver's
@@ -338,7 +366,7 @@ impl ClientTransport {
             Inner::Unix(s) => s.shutdown(Shutdown::Both),
             Inner::Tls(t) => t.sock.shutdown(Shutdown::Both),
         };
-        self.queue = OutQueue::default();
+        self.queue = OutBuf::default();
     }
 
     /// One read of the socket, handing `on_frame` every frame it completes.
@@ -395,69 +423,55 @@ impl ClientTransport {
 
 // ── Framing: the outbound queue ──────────────────────────────────────────────
 
-/// Slices per `flush` chunk, bounding the local slice array: Linux's `UIO_MAXIOV`.
-const IOV_MAX_CHUNK: usize = 1024;
+/// Capacity the outbound buffer keeps once everything in it is written; a
+/// larger allocation is released.
+const OUT_RETAIN_BYTES: usize = 1 << 20;
 
-/// One queue entry: a frame's payload and its own length prefix.
-struct QueuedFrame {
-    prefix: [u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES],
-    payload: Vec<u8>,
-}
-
-/// The owned outbound queue and its partial-write cursor: one byte offset into
-/// the front entry, so a write the socket cut short resumes where it stopped.
+/// The outbound queue: the queued frames back to back, each behind its length
+/// prefix, and the partial-write cursor, so a write the socket cut short
+/// resumes where it stopped.
 #[derive(Default)]
-struct OutQueue {
-    frames: VecDeque<QueuedFrame>,
-    /// Bytes of the front frame already written.
+struct OutBuf {
+    buf: Vec<u8>,
+    /// Bytes of `buf` already written.
     off: usize,
-    /// Bytes queued and not yet written, prefixes included.
-    bytes: usize,
 }
 
-impl OutQueue {
-    fn push(&mut self, payload: Vec<u8>) {
-        self.bytes += gnitz_wire::FRAME_LEN_PREFIX_BYTES + payload.len();
-        let prefix = gnitz_wire::frame_len_prefix(payload.len());
-        self.frames.push_back(QueuedFrame { prefix, payload });
-    }
-
+impl OutBuf {
     fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.off == self.buf.len()
     }
 
-    /// Slices from the cursor forward, at most `IOV_MAX_CHUNK` of them.
-    fn build_slices<'a>(&'a self, out: &mut Vec<IoSlice<'a>>) {
-        let mut skip = self.off;
-        for f in &self.frames {
-            for s in [&f.prefix[..], &f.payload[..]] {
-                if skip >= s.len() {
-                    skip -= s.len();
-                    continue;
-                }
-                out.push(IoSlice::new(&s[skip..]));
-                skip = 0;
-                if out.len() == IOV_MAX_CHUNK {
-                    return;
-                }
-            }
+    /// The bytes queued and not yet written.
+    fn pending(&self) -> &[u8] {
+        &self.buf[self.off..]
+    }
+
+    /// Advance the cursor by `n` written bytes.
+    fn advance(&mut self, n: usize) {
+        // Total by construction: `n` is what the sink took of `pending`.
+        debug_assert!(n <= self.buf.len() - self.off);
+        self.off += n;
+        if self.is_empty() {
+            self.settle();
         }
     }
 
-    /// Advance the cursor by `n` written bytes, popping fully-sent frames.
-    fn advance(&mut self, n: usize) {
-        // Total by construction: `n` is what the sink took from our own slices.
-        // Release checks no subtraction, and a wrap here tears the next frame.
-        debug_assert!(n <= self.bytes);
-        self.bytes -= n;
-        self.off += n;
-        while let Some(f) = self.frames.front() {
-            let total = gnitz_wire::FRAME_LEN_PREFIX_BYTES + f.payload.len();
-            if self.off < total {
-                break;
-            }
-            self.off -= total;
-            self.frames.pop_front();
+    /// Drop the written bytes once they are at least as many as the unwritten
+    /// ones, so the unwritten bytes it moves are never more than were written.
+    fn compact(&mut self) {
+        if self.off > 0 && self.off >= self.buf.len() - self.off {
+            self.buf.drain(..self.off);
+            self.off = 0;
+        }
+    }
+
+    /// Empty the buffer, releasing an allocation past `OUT_RETAIN_BYTES`.
+    fn settle(&mut self) {
+        self.buf.clear();
+        self.off = 0;
+        if self.buf.capacity() > OUT_RETAIN_BYTES {
+            self.buf = Vec::new();
         }
     }
 }

@@ -1,6 +1,13 @@
 use super::*;
 use crate::{WireConflictMode, WireLane, WireStatus, CTRL_HEADER_SIZE};
 
+/// The frame `encode` appends to an empty buffer.
+fn encoded(encode: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode(&mut out);
+    out
+}
+
 fn rel(tid: u64, reply_layout: u64) -> ScanItem<'static> {
     ScanItem {
         target: Target { tid, token: tid ^ 0x5A5A },
@@ -98,7 +105,7 @@ fn txn_frames_roundtrip_every_item_in_order() {
             ],
         ),
     ] {
-        let frame = encode_items(verb, &items);
+        let frame = encoded(|out| encode_items(out, verb, &items));
         let got = peeked(&frame, |b| decode_items(b, verb)).unwrap();
         assert_eq!(got.len(), items.len());
         for ((bytes, c), it) in got.iter().zip(&items) {
@@ -125,7 +132,10 @@ fn txn_frames_roundtrip_every_item_in_order() {
 fn scan_multi_roundtrips_order_and_layouts() {
     // A repeated id is two positions, answered separately.
     let rels = [rel(7, 0), rel(8, 3), rel(9, u64::MAX), rel(7, 0)];
-    assert_eq!(peeked(&encode_scan_multi(&rels), decode_scan_multi).unwrap(), rels);
+    assert_eq!(
+        peeked(&encoded(|out| encode_scan_multi(out, &rels)), decode_scan_multi).unwrap(),
+        rels
+    );
 }
 
 #[test]
@@ -138,7 +148,7 @@ fn delta_poll_roundtrips_every_view_in_order() {
         DeltaPollItem { spec: b"another spec", ..item(1, 0, 1) },
         item(1, 0, 1),
     ];
-    let frame = encode_delta_poll(&views, None);
+    let frame = encoded(|out| encode_delta_poll(out, &views, None));
     assert_eq!(peeked(&frame, decode_delta_items).unwrap(), views);
 }
 
@@ -178,7 +188,7 @@ fn multi_item_frames_are_their_items_framed_one_by_one() {
             one(hdr, &[], it.schema, Some(&it.data[..]))
         }),
     );
-    assert_eq!(encode_items(ClientVerb::PushTxn, &items), want);
+    assert_eq!(encoded(|out| encode_items(out, ClientVerb::PushTxn, &items)), want);
 
     let rels = [rel(7, 0), rel(8, 3), rel(9, u64::MAX)];
     let want = framed(
@@ -193,7 +203,7 @@ fn multi_item_frames_are_their_items_framed_one_by_one() {
             )
         }),
     );
-    assert_eq!(encode_scan_multi(&rels), want);
+    assert_eq!(encoded(|out| encode_scan_multi(out, &rels)), want);
 
     // A long spec ahead of a short one and a cursorless item: each item's blob
     // holds only its own cursor and spec.
@@ -221,14 +231,26 @@ fn multi_item_frames_are_their_items_framed_one_by_one() {
             )
         }),
     );
-    assert_eq!(encode_delta_poll(&views, Some(sub(1_500))), want);
+    assert_eq!(encoded(|out| encode_delta_poll(out, &views, Some(sub(1_500)))), want);
+}
+
+/// A frame appended behind other bytes leaves them as they were.
+#[test]
+fn a_multi_item_frame_appends_behind_what_its_buffer_holds() {
+    let rels = [rel(7, 0), rel(8, 3)];
+    let mut out = b"queued".to_vec();
+    encode_scan_multi(&mut out, &rels);
+    assert_eq!(
+        out,
+        [&b"queued"[..], &encoded(|out| encode_scan_multi(out, &rels))].concat()
+    );
 }
 
 /// The first id rides the prologue's `arg0` and nothing else of it moves.
 #[test]
 fn a_kept_delta_poll_carries_its_first_id_in_the_prologue() {
     let views = [item(1, 5, 1), item(2, 5, 1)];
-    let frame = encode_delta_poll(&views, Some(sub(1_500)));
+    let frame = encoded(|out| encode_delta_poll(out, &views, Some(sub(1_500))));
     let ctrl = peek_control_block(&frame).unwrap();
     assert_eq!(ctrl.client_verb(), Ok(ClientVerb::DeltaPoll));
     assert_eq!(ctrl.hdr, ControlHeader::naming(ClientVerb::DeltaPoll, 0.into(), 1_500));
@@ -236,7 +258,7 @@ fn a_kept_delta_poll_carries_its_first_id_in_the_prologue() {
     let kept = delta_poll_kept(&ctrl.hdr, views.len()).unwrap().expect("a kept poll");
     assert_eq!(kept.collect::<Vec<_>>(), [sub(1_500), sub(1_501)]);
 
-    let unkept = encode_delta_poll(&views, None);
+    let unkept = encoded(|out| encode_delta_poll(out, &views, None));
     let unkept = delta_poll_kept(&peek_control_block(&unkept).unwrap().hdr, views.len());
     assert!(unkept.unwrap().is_none());
 }
@@ -260,7 +282,7 @@ fn a_kept_delta_poll_refuses_ids_past_the_last() {
 #[test]
 fn a_delta_poll_refuses_view_id_zero() {
     let err = peeked(
-        &encode_delta_poll(&[item(1, 0, 9), item(0, 0, 9)], None),
+        &encoded(|out| encode_delta_poll(out, &[item(1, 0, 9), item(0, 0, 9)], None)),
         decode_delta_items,
     )
     .expect_err("view id 0");

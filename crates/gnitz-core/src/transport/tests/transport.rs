@@ -21,7 +21,7 @@ fn spawn_reader(peer: Peer, count: usize) -> std::thread::JoinHandle<Vec<Vec<u8>
 fn roundtrip_both_directions() {
     let (mut t, peer) = transport_pair();
     let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
-    t.enqueue(data.clone());
+    t.enqueue(&data).unwrap();
     t.flush().unwrap();
     assert!(!t.wants_write());
     assert_eq!(peer.recv(), data);
@@ -37,15 +37,15 @@ fn read_refuses_a_prefix_past_the_frame_ceiling() {
 }
 
 #[test]
-fn queue_survives_chunked_and_partial_writes() {
-    // Far more slices than one chunk, through a 4 KiB send buffer: every
-    // writev is clamped or cut short mid-frame, and the cursor resumes each time.
+fn queue_survives_partial_writes() {
+    // Thousands of frames through a 4 KiB send buffer: every write is cut
+    // short mid-frame, and the cursor resumes each time.
     let (mut t, peer) = transport_pair();
     set_sockopt_int(t.as_fd().as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096).unwrap();
     let n = 3000usize;
     let expected: Vec<Vec<u8>> = (0..n).map(|i| format!("f{i}").repeat(i % 7 + 1).into_bytes()).collect();
     for f in &expected {
-        t.enqueue(f.clone());
+        t.enqueue(f).unwrap();
     }
     t.flush().unwrap();
     assert!(t.wants_write(), "with nobody reading, flush stops at EAGAIN");
@@ -53,6 +53,35 @@ fn queue_survives_chunked_and_partial_writes() {
     flush_all(&mut t);
     drop(t);
     assert_eq!(reader.join().unwrap(), expected);
+}
+
+#[test]
+fn a_frame_queued_behind_a_partial_write_follows_its_unwritten_bytes() {
+    let (mut t, _peer) = transport_pair();
+    t.enqueue(b"first").unwrap();
+    // Two-thirds written: the next frame drops the written bytes first.
+    t.queue.advance(6);
+    t.enqueue(b"second").unwrap();
+    assert_eq!(t.queue.off, 0, "the written bytes are dropped");
+    assert_eq!(
+        t.queue.pending(),
+        [&framed(b"first")[6..], &framed(b"second")[..]].concat()
+    );
+}
+
+#[test]
+fn an_oversize_frame_is_refused_and_leaves_the_queue_as_it_was() {
+    let (mut t, _peer) = transport_pair();
+    let len = gnitz_wire::MAX_FRAME_PAYLOAD + 1;
+    let oversize = |out: &mut Vec<u8>| out.resize(out.len() + len, 0);
+    t.enqueue(b"queued").unwrap();
+    assert_eq!(t.frame(oversize), Err(len));
+    assert_eq!(t.queue.pending(), framed(b"queued"));
+    t.queue.advance(t.queued_bytes());
+    // Refused into an empty queue, it takes its allocation with it.
+    assert_eq!(t.frame(oversize), Err(len));
+    assert!(t.queue.is_empty());
+    assert_eq!(t.queue.buf.capacity(), 0);
 }
 
 /// A peer answering `reply` to the client's HELLO, which carries `token`.
