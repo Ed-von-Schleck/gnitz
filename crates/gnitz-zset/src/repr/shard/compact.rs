@@ -1,17 +1,19 @@
 //! Shard compaction: the N-way [`run_merge`] of sorted shard files, by (PK,
 //! payload) or, for a skeleton merge, by PK alone, one output guard at a time;
-//! windows that ascend without overlap are taken in order unmerged.
+//! windows that ascend without overlap are taken in key order unmerged, a
+//! plain run's decoded straight into it.
 
 use super::codebook::Codebook;
 use super::file::ShardWriteOpts;
-use super::reader::{MappedShard, ShardWindow};
-use crate::repr::merge::{run_merge, windows_ascend};
+use super::reader::MappedShard;
+use crate::repr::merge::{disjoint_order, run_merge};
 use crate::repr::scatter::{Pick, UnifiedSet};
-use crate::repr::string_heap::long_bytes;
+use crate::repr::string_heap::{long_bytes, prorated_blob_cap};
 use crate::repr::{Batch, StorageError};
 use crate::schema::{compare_pk_ordering, SchemaDescriptor};
 use gnitz_wire::RowSource;
 use gnitz_wire::{CodedHeap, Heap};
+use smallvec::SmallVec;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -146,6 +148,12 @@ impl GuardMerge {
                 std::mem::replace(start, end)..end
             })
             .collect();
+        // A skeleton run holds no string.
+        let codebook = codebook.filter(|_| !skeleton);
+        let order = self.in_order(&windows);
+        if let (Some(order), None, false) = (&order, codebook, skeleton) {
+            return self.concat(&windows, order);
+        }
         // The merge compares every key of a window and the scatter copies it.
         let shards: Vec<_> = self
             .shards
@@ -153,15 +161,13 @@ impl GuardMerge {
             .zip(&windows)
             .map(|(s, w)| s.window(w.clone()))
             .collect();
-        let survivors = match self.in_order(&shards, &windows) {
-            Some(picks) => picks,
+        let survivors = match order {
+            Some(order) => self.picks(&windows, &order),
             None => run_merge(&shards, out_schema, windows.iter().cloned()),
         };
         if survivors.is_empty() {
             return None;
         }
-        // A skeleton run holds no string.
-        let codebook = codebook.filter(|_| !skeleton);
         let batch = UnifiedSet::with(&shards, out_schema, windows, |set| {
             set.materialize(&survivors, codebook)
         });
@@ -172,24 +178,51 @@ impl GuardMerge {
         Some(GuardRun { batch, coded, skeleton })
     }
 
-    /// Every row of `windows` at its own weight, in order, when they need no
-    /// merge: consolidated windows that each end below the key the next begins
-    /// at share no element. A hydrated window under a skeleton merge still folds
-    /// its PK groups, so it always merges.
-    ///
-    /// Out of line: inlined into `next`, it costs that merge loop instructions.
-    #[inline(never)]
-    fn in_order(&self, shards: &[ShardWindow<'_>], windows: &[Range<usize>]) -> Option<Vec<Pick>> {
+    /// The shards holding rows in `windows`, in the [`disjoint_order`] of their
+    /// windows, when the windows need no merge. A hydrated window under a
+    /// skeleton merge still folds its PK groups, so it always merges.
+    fn in_order(&self, windows: &[Range<usize>]) -> Option<SmallVec<[usize; 8]>> {
         if self.skeleton && !self.shards.iter().all(|s| s.is_skeleton()) {
             return None;
         }
-        let ascending = windows_ascend(shards.iter().zip(windows.iter().cloned()));
-        ascending.then(|| {
-            (windows.iter().enumerate())
-                .flat_map(|(i, w)| w.clone().map(move |r| (i, r)))
-                .map(|(i, r)| (i as u32, r as u32, self.shards[i].get_weight(r)))
-                .collect()
-        })
+        disjoint_order(
+            (self.shards.iter().zip(windows).enumerate())
+                .filter(|(_, (_, w))| !w.is_empty())
+                .map(|(i, (s, w))| (s.pk_at(w.start), s.pk_at(w.end - 1), i)),
+        )
+    }
+
+    /// Every row of the windows of the shards in `order`, at its own weight.
+    ///
+    /// Out of line: inlined into `next`, it costs that merge loop instructions.
+    #[inline(never)]
+    fn picks(&self, windows: &[Range<usize>], order: &[usize]) -> Vec<Pick> {
+        (order.iter())
+            .flat_map(|&i| windows[i].clone().map(move |r| (i, r)))
+            .map(|(i, r)| (i as u32, r as u32, self.shards[i].get_weight(r)))
+            .collect()
+    }
+
+    /// The plain run of the windows of the shards [`Self::in_order`] put in
+    /// `order`: each window's rows decoded straight into it, one after the
+    /// other. `None` when every window is empty.
+    fn concat<'a>(&self, windows: &[Range<usize>], order: &[usize]) -> Option<GuardRun<'a>> {
+        let rows: usize = order.iter().map(|&i| windows[i].len()).sum();
+        if rows == 0 {
+            return None;
+        }
+        let mut batch = Batch::with_capacity(&self.out_schema, rows);
+        let shards = order.iter().map(|&i| (&*self.shards[i], windows[i].clone()));
+        batch.reserve_blob(
+            (shards.clone())
+                .map(|(s, w)| prorated_blob_cap(s.heap().plain_len(), s.row_count(), w.len()))
+                .sum(),
+        );
+        for (s, w) in shards {
+            batch.write_rows(w.len(), |dw| s.decode_rows_into(w, dw, false));
+        }
+        batch.certify_consolidated();
+        Some(GuardRun { batch, coded: None, skeleton: false })
     }
 }
 

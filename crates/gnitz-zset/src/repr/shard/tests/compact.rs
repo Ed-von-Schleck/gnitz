@@ -354,3 +354,47 @@ fn a_coded_merge_keeps_the_codes_of_its_own_table() {
         "premise: the other table codes it otherwise"
     );
 }
+
+/// Windows that share no key and ascend, in whatever order the shards come, are
+/// the run in key order, each guard its own share: the rows and long values the
+/// merge path writes, a coded shard's values decoded into the plain run.
+#[test]
+fn ascending_windows_are_the_merge_of_their_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let values: Vec<String> = (0..1000).map(prose).collect();
+    let rows = |pks: std::ops::RangeInclusive<u64>, w: i64| -> Batch {
+        let rows: Vec<(u64, i64, &[u8])> = pks.map(|pk| (pk, w, values[pk as usize].as_bytes())).collect();
+        make_string_batch(&rows)
+    };
+    let (low, mid, high) = (rows(1..=300, 1), rows(301..=600, 2), rows(601..=900, 1));
+    let book = Codebook::for_batch(None, &low).unwrap();
+    let shards = [
+        map_shard(&dir.path().join("high.db"), &high),
+        map_coded_shard(&dir.path().join("low.db"), &low, &book),
+        map_shard(&dir.path().join("mid.db"), &mid),
+    ];
+    let weight = |pk: u64| if (301..=600).contains(&pk) { 2 } else { 1 };
+    let want = |pks: std::ops::RangeInclusive<u64>| -> Vec<(u64, i64, Vec<u8>)> {
+        pks.map(|pk| (pk, weight(pk), values[pk as usize].as_bytes().to_vec()))
+            .collect()
+    };
+
+    let mut merge = GuardMerge::begin(shards.to_vec(), false).unwrap();
+    for (until, pks) in [(Some(450u64), 1..=449), (None, 450..=900)] {
+        let until = until.map(u64::to_be_bytes);
+        let run = merge.next(until.as_ref().map(|k| &k[..]), None).unwrap();
+        let batch = run.plain().unwrap();
+        assert!(batch.is_consolidated());
+        assert_eq!(
+            string_rows(batch, |r| batch.get_weight(r)),
+            want(pks.clone()),
+            "{pks:?}"
+        );
+    }
+    // The coded merge takes the merge path over the same windows.
+    let coded = GuardMerge::begin(shards.to_vec(), false)
+        .unwrap()
+        .next(None, Some(&book))
+        .unwrap();
+    assert_eq!(string_rows(&coded, |r| coded.batch.get_weight(r)), want(1..=900));
+}

@@ -17,6 +17,7 @@ use crate::repr::batch::{write_to_batch, Batch};
 use crate::repr::scatter::{ColTable, ColumnarSource, DecodedColumns, UnifiedSource};
 use crate::repr::seek::{seek_lower_bound, seek_pk_rows, ColPtr};
 use crate::repr::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap};
+use crate::repr::writer::DirectWriter;
 use crate::repr::PooledBuf;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{
@@ -602,29 +603,44 @@ impl MappedShard {
             heap.plain_len()
         };
         let mut batch = write_to_batch(schema, row_count, blob_cap, |w| {
-            let (pk, weight, null_bmp) = w.fixed_mut();
-            self.pk.decode(start, schema.pk_stride(), pk);
-            self.weight.decode(start, weight);
-            self.null_bmp.decode(start, null_bmp);
-            if self.null_pad_mask != 0 {
-                for word in null_bmp.as_chunks_mut::<8>().0 {
-                    *word = (u64::from_le_bytes(*word) | self.null_pad_mask).to_le_bytes();
-                }
-            }
             // A carried heap lands first in the fresh one, so its cells stand as
             // the shard holds them.
-            let heap_at = (!relocate).then(|| w.adopt_heap(heap.plain().expect("only a plain heap is carried")));
-            debug_assert!(heap_at.is_none_or(|base| base == 0), "a fresh writer's heap is empty");
-            for (pi, col) in schema.payload_columns() {
-                self.decode_payload(pi, col.size(), start, w.col_mut(pi));
-                if col.type_code.is_german_string() {
-                    w.rebase_string_col(pi, heap, heap_at);
-                }
-            }
+            self.decode_rows_into(start..start + row_count, w, !relocate);
         });
         batch.charge_dead(carried.unwrap_or(0));
         batch.certify_consolidated();
         batch
+    }
+
+    /// Decode `rows` into `w`, a writer of exactly that many rows under this
+    /// shard's schema. `carry` appends the shard's plain heap whole to the
+    /// writer's and shifts the copied cells onto it; otherwise each long value
+    /// is relocated, a coded one decoded.
+    pub(crate) fn decode_rows_into(&self, rows: Range<usize>, w: &mut DirectWriter<'_>, carry: bool) {
+        assert!(
+            !self.header.skeleton,
+            "a skeleton shard has no payload to decode; hydrate its keys"
+        );
+        assert!(rows.end <= self.header.row_count, "rows out of range");
+        debug_assert_eq!(rows.len(), w.rows(), "a writer of another row count");
+        debug_assert!(w.schema.same_region_types(&self.schema), "a writer of another layout");
+        let (schema, heap, start) = (&self.schema, self.heap(), rows.start);
+        let (pk, weight, null_bmp) = w.fixed_mut();
+        self.pk.decode(start, schema.pk_stride(), pk);
+        self.weight.decode(start, weight);
+        self.null_bmp.decode(start, null_bmp);
+        if self.null_pad_mask != 0 {
+            for word in null_bmp.as_chunks_mut::<8>().0 {
+                *word = (u64::from_le_bytes(*word) | self.null_pad_mask).to_le_bytes();
+            }
+        }
+        let heap_at = carry.then(|| w.adopt_heap(heap.plain().expect("only a plain heap is carried")));
+        for (pi, col) in schema.payload_columns() {
+            self.decode_payload(pi, col.size(), start, w.col_mut(pi));
+            if col.type_code.is_german_string() {
+                w.rebase_string_col(pi, heap, heap_at);
+            }
+        }
     }
 }
 

@@ -11,6 +11,8 @@
 
 use std::cmp::Ordering;
 use std::marker::PhantomData;
+
+use smallvec::SmallVec;
 use std::ops::{ControlFlow, Range};
 
 use super::batch::{Batch, MemBatch};
@@ -35,24 +37,27 @@ use gnitz_wire::{native_key_image, Heap, RowSource, ScalarKind, NARROW_PK_MAX_BY
 /// a dominant one — usually a previous fold's output — against the sum of the
 /// rest, so its stretches are bulk-copied; any other mix takes the N-way fold.
 pub fn merge_consolidated(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
-    let mut out = match windows_ascend(sources.iter().map(|s| (s, 0..s.count))) {
-        true => Batch::concat(schema, sources.iter().copied()),
-        false => merge_interleaved(sources, schema),
+    let held = (sources.iter().enumerate())
+        .filter(|(_, s)| s.count > 0)
+        .map(|(i, s)| (s.get_pk_bytes(0), s.get_pk_bytes(s.count - 1), i));
+    let mut out = match disjoint_order(held) {
+        Some(order) => Batch::concat(schema, order.iter().map(|&i| sources[i])),
+        None => merge_interleaved(sources, schema),
     };
     out.certify_consolidated();
     out
 }
 
-/// Whether each non-empty one of `windows`, rows of its source, ends below the
-/// PK the next begins at: windows of consolidated sources that do share no
-/// element, and are their sum in order.
-pub(crate) fn windows_ascend<'s, S: RowSource + 's>(
-    windows: impl Iterator<Item = (&'s S, Range<usize>)> + Clone,
-) -> bool {
-    let held = windows.filter(|(_, rows)| !rows.is_empty());
-    held.clone()
-        .zip(held.skip(1))
-        .all(|((a, ra), (b, rb))| a.get_pk_bytes(ra.end - 1) < b.get_pk_bytes(rb.start))
+/// The order in which `windows`, each the keys of its first and last row and
+/// its index, lie end to end with their keys ascending: the indexes in that
+/// order, or `None` where two of them overlap or share a key. Windows of
+/// consolidated sources so laid out share no element, and are their sum
+/// concatenated in that order.
+pub(crate) fn disjoint_order<K: Ord>(windows: impl Iterator<Item = (K, K, usize)>) -> Option<SmallVec<[usize; 8]>> {
+    let mut bounds: SmallVec<[(K, K, usize); 8]> = windows.collect();
+    bounds.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let disjoint = bounds.windows(2).all(|pair| pair[0].1 < pair[1].0);
+    disjoint.then(|| bounds.iter().map(|b| b.2).collect())
 }
 
 /// [`merge_consolidated`] of sources that interleave, so at least two hold rows.
