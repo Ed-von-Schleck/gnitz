@@ -355,17 +355,22 @@ impl TxnBuffer {
         // `gather` compacts the string arena the dropped rows carried.
         let mut out = committed.gather(&keep);
 
-        let mut live = ZSetBatch::new(schema);
+        // Each family's live rows, gathered family by family.
+        let mut rows: Vec<Vec<u32>> = vec![Vec::new(); families.len()];
         let take = |&(fam, row): &(usize, usize)| {
-            let b = &families[fam].batch;
-            if b.weights[row] > 0 {
-                live.copy_row_at(b, row, 1);
+            if families[fam].batch.weights[row] > 0 {
+                rows[fam].push(row as u32);
             }
         };
         match &spec.bound {
             ReadBound::PkSet(set) => set.iter().filter_map(|k| index.get(k)).for_each(take),
             _ => index.values().for_each(take),
         }
+        let mut live = ZSetBatch::new(schema);
+        for (fam, rows) in families.iter().zip(&rows).filter(|(_, rows)| !rows.is_empty()) {
+            live.append_rows(&fam.batch, rows, true);
+        }
+        live.weights.fill(1);
         if live.is_empty() {
             return Ok(out);
         }

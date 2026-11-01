@@ -235,10 +235,10 @@ pub(super) fn apply_set(
             }
             SetRhs::Copy { scope, src } => {
                 let b = scoped(*scope);
-                for (r, w) in nulls.iter_mut().enumerate() {
-                    set_null(w, pi, null_word_get(b.nulls[r], *src), def)?;
-                    new.push_cell_from(pi, b, *src, r);
+                for (w, &sw) in nulls.iter_mut().zip(&b.nulls) {
+                    set_null(w, pi, null_word_get(sw, *src), def)?;
                 }
+                new.append_column_from(pi, b, *src);
             }
             SetRhs::Expr { scope, ev } => {
                 let ZSetBatch { payload, blob, .. } = &mut new;
@@ -273,9 +273,7 @@ pub(super) fn apply_set(
     if rebuild {
         for (pi, ci, def) in schema.payload_columns() {
             if def.ty.tc.is_german_string() && !set.iter().any(|a| a.ci == ci) {
-                for r in 0..n {
-                    new.push_cell_from(pi, &rows, pi, r);
-                }
+                new.append_column_from(pi, &rows, pi);
             }
         }
         rows.blob = std::mem::take(&mut new.blob);
@@ -295,3 +293,7 @@ fn set_null(word: &mut u64, pi: usize, null: bool, def: &ColumnDef) -> Result<()
     null_word_set(word, pi, null);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "benches/set.rs"]
+mod bench;

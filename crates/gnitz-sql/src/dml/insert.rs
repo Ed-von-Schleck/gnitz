@@ -427,20 +427,14 @@ fn resolve_conflicts(
     let mut is_held = vec![false; rows.len()];
     let collided = (0..held.len())
         .map(|r| match at.get(held.pks.get_bytes(r)) {
-            Some(&i) if !std::mem::replace(&mut is_held[i], true) => Ok(i),
+            Some(&i) if !std::mem::replace(&mut is_held[i], true) => Ok(i as u32),
             Some(_) => Err(malformed_reply("a key held twice")),
             None => Err(malformed_reply("a key that was not read")),
         })
-        .collect::<Result<Vec<usize>, _>>()?;
+        .collect::<Result<Vec<u32>, _>>()?;
     // `held` is the `Existing` scope, so `SET x = x + 1` reads the row a
     // transaction buffered; `excluded` is the VALUES row each one collided with.
-    let excluded = set.is_some().then(|| {
-        let mut ex = ZSetBatch::with_capacity(schema, collided.len());
-        for &i in &collided {
-            ex.copy_row_at(&rows, i, 1);
-        }
-        ex
-    });
+    let excluded = set.is_some().then(|| rows.gathered(&collided));
     let kept: Vec<u32> = (0..rows.len() as u32).filter(|&i| !is_held[i as usize]).collect();
     let mut out = rows.gather(&kept);
     if let (Some(set), Some(excluded)) = (set, excluded) {

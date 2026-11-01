@@ -85,6 +85,51 @@ fn gather_bench() {
             );
         }
     }
+    // A copy of two rows in three, ascending, out of a batch that stays, row by row and
+    // borrowing gather: over 2, 8 and 32 I64 payload columns, and over 8 with a STRING column.
+    let picks: Vec<u32> = (0..ROWS as u32).filter(|r| r % 3 != 0).collect();
+    for (name, ints, string) in [
+        ("2 cols", 2usize, false),
+        ("8 cols", 8, false),
+        ("32 cols", 32, false),
+        ("8 cols + string", 8, true),
+    ] {
+        let mut columns = vec![ColumnDef::new("id", TypeCode::U64, false)];
+        columns.extend((0..ints).map(|_| ColumnDef::new("v", TypeCode::I64, false)));
+        columns.extend(string.then(|| ColumnDef::new("s", TypeCode::String, false)));
+        let schema = Schema::from_parts(columns, &[0]).unwrap();
+        let mut b = ZSetBatch::new(&schema);
+        let mut app = BatchAppender::new(&mut b);
+        for i in 0..ROWS {
+            let r = rng.next_u64();
+            app.add_row(i as u128, 1);
+            for _ in 0..ints {
+                app.int_val(r as i64);
+            }
+            if string {
+                app.str_val(if r & 1 == 0 {
+                    "short"
+                } else {
+                    "a string long enough to spill out of line"
+                });
+            }
+        }
+        let (rows, copy_row_at) = counter.measure(|| {
+            let mut out = ZSetBatch::new(&schema);
+            for &r in &picks {
+                out.copy_row_at(&b, r as usize, 1);
+            }
+            out
+        });
+        black_box(rows);
+        let (rows, gathered) = counter.measure(|| b.gathered(&picks));
+        black_box(rows);
+        println!(
+            "gather_bench {name:<16} copy_row_at {:7.1}  gathered {:7.1} instr/row",
+            copy_row_at as f64 / picks.len() as f64,
+            gathered as f64 / picks.len() as f64
+        );
+    }
 }
 
 /// Instructions per row to append two payload columns' rows to an empty batch, as a

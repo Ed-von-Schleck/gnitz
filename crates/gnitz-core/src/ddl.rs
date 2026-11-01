@@ -128,21 +128,17 @@ impl DdlBundle {
     fn same_rows(&self, other: &DdlBundle) -> bool {
         // A German cell's offset is relative to the arena of the batch it sits
         // in, so each side is copied onto an arena laid out in key order.
-        fn in_key_order(family: u64, rows: &ZSetBatch) -> ZSetBatch {
-            let mut live: Vec<usize> = rows.live_rows().collect();
-            live.sort_unstable_by_key(|&i| rows.pks.get_bytes(i));
-            let mut out = ZSetBatch::new(sys_schema(family));
-            for i in live {
-                out.copy_row_at(rows, i, rows.weights[i]);
-            }
-            out
+        fn in_key_order(rows: &ZSetBatch) -> ZSetBatch {
+            let mut live: Vec<u32> = rows.live_rows().map(|i| i as u32).collect();
+            live.sort_unstable_by_key(|&i| rows.pks.get_bytes(i as usize));
+            rows.gathered(&live)
         }
         self.0.len() == other.0.len()
             && self.0.iter().all(|(family, rows)| {
                 other
                     .0
                     .iter()
-                    .any(|(f, theirs)| f == family && in_key_order(*family, rows) == in_key_order(*family, theirs))
+                    .any(|(f, theirs)| f == family && in_key_order(rows) == in_key_order(theirs))
             })
     }
 }

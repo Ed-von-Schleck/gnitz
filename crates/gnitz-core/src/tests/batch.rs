@@ -548,6 +548,124 @@ fn a_whole_gather_moves_the_arena() {
     got.validate(&schema).unwrap();
 }
 
+/// A batch over a compound key with payload cells of every stride, NULLs among the
+/// nullable ones, and `strings` STRING columns holding short and spilled values.
+fn mixed_batch(strings: usize) -> (Schema, ZSetBatch) {
+    let mut columns = vec![
+        ColumnDef::new("a", TypeCode::U32, false),
+        ColumnDef::new("u8c", TypeCode::U8, true),
+        ColumnDef::new("b", TypeCode::I64, false),
+        ColumnDef::new("i16c", TypeCode::I16, false),
+        ColumnDef::new("i32c", TypeCode::I32, true),
+        ColumnDef::new("u128c", TypeCode::U128, false),
+    ];
+    columns.extend((0..strings).map(|_| ColumnDef::new("s", TypeCode::String, true)));
+    let schema = Schema::from_parts(columns, &[2, 0]).unwrap();
+    let mut b = ZSetBatch::new(&schema);
+    let mut app = BatchAppender::new(&mut b);
+    for r in 0..40u128 {
+        let row = app.add_row_natives(&[r * 7 % 5, r], if r % 4 == 0 { -2 } else { 1 + r as i64 % 3 });
+        if r % 3 == 0 {
+            row.null();
+        } else {
+            row.int_val(r as i64 % 200);
+        }
+        row.int_val(-(r as i64));
+        if r % 5 == 0 {
+            row.null();
+        } else {
+            row.int_val(r as i64 * 1000);
+        }
+        row.u128_val(r << 100 | r);
+        for s in 0..strings as u128 {
+            match (r + s) % 3 {
+                0 => row.null(),
+                1 => row.str_val("short"),
+                _ => row.str_val(GATHER_VALS[(r + s) as usize % GATHER_VALS.len()]),
+            };
+        }
+    }
+    b.validate(&schema).unwrap();
+    (schema, b)
+}
+
+/// A row's key, weight, null word and payload cells, a German cell by its content.
+type RowCells = (Vec<u8>, i64, u64, Vec<Vec<u8>>);
+
+/// Every row of `b` as [`RowCells`].
+fn cells_of(b: &ZSetBatch) -> Vec<RowCells> {
+    (0..b.len())
+        .map(|r| {
+            let cells = b
+                .payload
+                .iter()
+                .map(|c| {
+                    if c.tc.is_german_string() {
+                        gnitz_wire::german_string_content(&c.bytes.as_chunks::<16>().0[r], &b.blob).to_vec()
+                    } else {
+                        c.bytes[r * c.stride()..][..c.stride()].to_vec()
+                    }
+                })
+                .collect();
+            (b.pks.get_bytes(r).to_vec(), b.weights[r], b.nulls[r], cells)
+        })
+        .collect()
+}
+
+/// A borrowing gather is a row-by-row copy at the source weights: byte for byte with one
+/// STRING column, and row for row, on an arena of the same size, with two — whose spills it
+/// lays out column by column where the row copy interleaves them. The consuming gather holds
+/// the same rows.
+#[test]
+fn a_borrowing_gather_matches_a_row_by_row_copy() {
+    for strings in [0, 1, 2] {
+        let (schema, b) = mixed_batch(strings);
+        for picks in [
+            (0..b.len() as u32).collect::<Vec<u32>>(),
+            (0..b.len() as u32).filter(|r| r % 3 != 0).collect(),
+            vec![17, 3, 39, 0, 22],
+            vec![],
+        ] {
+            let mut want = ZSetBatch::new(&schema);
+            for &r in &picks {
+                want.copy_row_at(&b, r as usize, b.weights[r as usize]);
+            }
+            let got = b.gathered(&picks);
+            got.validate(&schema).unwrap();
+            if strings < 2 {
+                assert_eq!(got, want, "{strings} strings, {picks:?}");
+            } else {
+                assert_eq!(cells_of(&got), cells_of(&want), "{picks:?}");
+                assert_eq!(got.blob.len(), want.blob.len(), "{picks:?}");
+            }
+            assert_eq!(
+                cells_of(&b.clone().gather(&picks)),
+                cells_of(&want),
+                "{strings} strings, {picks:?}"
+            );
+        }
+    }
+}
+
+/// Appending every column whole, in slot order, onto an empty batch builds what a borrowing
+/// gather of every row builds, byte for byte.
+#[test]
+fn appending_columns_whole_matches_a_full_gather() {
+    for strings in [0, 1, 2] {
+        let (schema, b) = mixed_batch(strings);
+        let mut got = ZSetBatch::new(&schema);
+        got.pks.buf = b.pks.buf.clone();
+        got.weights = b.weights.clone();
+        got.nulls = b.nulls.clone();
+        for pi in 0..b.payload.len() {
+            got.append_column_from(pi, &b, pi);
+        }
+        let all: Vec<u32> = (0..b.len() as u32).collect();
+        assert_eq!(got, b.gathered(&all), "{strings} strings");
+        got.validate(&schema).unwrap();
+    }
+}
+
 // ── The client batch as a `BatchView` ───────────────────────────────────
 
 /// Every row's integer result of a scalar program.

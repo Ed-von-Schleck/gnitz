@@ -221,35 +221,28 @@ impl ZSetBatch {
             .collect()
     }
 
-    /// Append the cell at row `i` of `src.payload[src_pi]` onto
-    /// `self.payload[dst_pi]`. A German cell is relocated onto this batch's
-    /// arena — its heap offset is relative to `src`'s and means nothing here.
-    pub fn push_cell_from(&mut self, dst_pi: usize, src: &ZSetBatch, src_pi: usize, i: usize) {
-        let col = &src.payload[src_pi];
-        let tc = col.tc();
-        debug_assert_eq!(self.payload[dst_pi].tc(), tc, "push_cell_from: slot type mismatch");
-        if tc.is_german_string() {
-            let cell = &col.bytes.as_chunks::<16>().0[i];
-            let moved = gnitz_wire::relocate_german_string(cell, &src.blob, &mut self.blob);
-            self.payload[dst_pi].bytes.extend_from_slice(&moved);
-        } else {
-            let w = tc.wire_stride();
-            self.payload[dst_pi]
-                .bytes
-                .extend_from_slice(&col.bytes[i * w..(i + 1) * w]);
-        }
-    }
-
     /// Append row `i` of `src` to `self` at `weight`, verbatim — so a `-1`
     /// reproduces the stored row rather than relying on a decoder and an encoder
-    /// agreeing. `src` and `self` must share a layout.
+    /// agreeing. `src` and `self` must share a layout. A German cell is relocated
+    /// onto this batch's arena: its heap offset is relative to `src`'s.
     pub fn copy_row_at(&mut self, src: &ZSetBatch, i: usize, weight: i64) {
-        debug_assert!(self.same_layout(src), "copy_row_at: layout mismatch");
-        self.pks.buf.extend_from_slice(src.pks.get_bytes(i));
-        self.weights.push(weight);
-        self.nulls.push(src.nulls[i]);
-        for pi in 0..self.payload.len() {
-            self.push_cell_from(pi, src, pi, i);
+        self.append_rows(src, &[i as u32], true);
+        *self.weights.last_mut().expect("a row appended") = weight;
+    }
+
+    /// Append every cell of `src.payload[src_pi]` onto `self.payload[dst_pi]`,
+    /// in row order. A German cell is relocated onto this batch's arena.
+    pub fn append_column_from(&mut self, dst_pi: usize, src: &ZSetBatch, src_pi: usize) {
+        let col = &src.payload[src_pi];
+        debug_assert_eq!(
+            self.payload[dst_pi].tc, col.tc,
+            "append_column_from: slot type mismatch"
+        );
+        let dst = &mut self.payload[dst_pi].bytes;
+        if col.tc.is_german_string() {
+            relocate_cells(col.bytes.as_chunks::<16>().0.iter(), &src.blob, &mut self.blob, dst);
+        } else {
+            dst.extend_from_slice(&col.bytes);
         }
     }
 
@@ -444,73 +437,104 @@ impl ZSetBatch {
         if rows.len() == self.len() && rows.iter().enumerate().all(|(i, &r)| r as usize == i) {
             return self;
         }
+        if rows.len() < self.len() {
+            return self.gathered(rows);
+        }
+        let mut out = self.gather_into(rows, false);
+        out.blob = self.blob;
+        out
+    }
+
+    /// The rows `rows` names, in order, each at most once, onto a fresh arena holding only
+    /// their strings; `self` is left as it was.
+    pub fn gathered(&self, rows: &[u32]) -> ZSetBatch {
+        self.gather_into(rows, true)
+    }
+
+    /// The rows `rows` names. With `relocate`, German cells are moved onto the returned
+    /// batch's arena; without, they are copied as they are and the returned arena is empty,
+    /// for the caller to supply `self`'s.
+    fn gather_into(&self, rows: &[u32], relocate: bool) -> ZSetBatch {
+        let mut out = ZSetBatch {
+            pks: PkColumn { buf: Vec::new(), ..self.pks },
+            weights: Vec::with_capacity(rows.len()),
+            nulls: Vec::with_capacity(rows.len()),
+            payload: (self.payload.iter())
+                .map(|c| PayloadColumn { tc: c.tc, bytes: Vec::new() })
+                .collect(),
+            blob: Vec::new(),
+        };
+        out.append_rows(self, rows, relocate);
+        out
+    }
+
+    /// Append the rows of `src` that `rows` names, in order, each at most once, at their
+    /// weights. With `relocate`, German cells are moved onto this batch's arena; without,
+    /// they are copied as they are, for an arena the caller supplies. `src` and `self` must
+    /// share a layout.
+    pub(crate) fn append_rows(&mut self, src: &ZSetBatch, rows: &[u32], relocate: bool) {
+        debug_assert!(self.same_layout(src), "append_rows: layout mismatch");
         debug_assert!(
-            {
-                let mut seen = vec![false; self.len()];
+            rows.len() < 2 || {
+                let mut seen = vec![false; src.len()];
                 rows.iter().all(|&r| !std::mem::replace(&mut seen[r as usize], true))
             },
             "gather: a row named twice"
         );
-        let whole = rows.len() == self.len();
-        let mut blob = Vec::new();
-        let pks = PkColumn {
-            buf: gather_cells(&self.pks.buf, self.pks.stride(), rows),
-            ..self.pks
-        };
-        let payload = self
-            .payload
-            .iter()
-            .map(|src| {
-                let bytes = if !whole && src.tc.is_german_string() {
-                    let cells = src.bytes.as_chunks::<16>().0;
-                    let mut bytes = Vec::with_capacity(rows.len() * 16);
-                    for &r in rows {
-                        bytes.extend_from_slice(&gnitz_wire::relocate_german_string(
-                            &cells[r as usize],
-                            &self.blob,
-                            &mut blob,
-                        ));
-                    }
-                    bytes
-                } else {
-                    gather_cells(&src.bytes, src.stride(), rows)
-                };
-                PayloadColumn { tc: src.tc, bytes }
-            })
-            .collect();
-        ZSetBatch {
-            pks,
-            weights: rows.iter().map(|&r| self.weights[r as usize]).collect(),
-            nulls: rows.iter().map(|&r| self.nulls[r as usize]).collect(),
-            payload,
-            blob: if whole { self.blob } else { blob },
+        gather_cells_into(&src.pks.buf, src.pks.stride(), rows, &mut self.pks.buf);
+        self.weights.extend(rows.iter().map(|&r| src.weights[r as usize]));
+        self.nulls.extend(rows.iter().map(|&r| src.nulls[r as usize]));
+        for (dst, col) in self.payload.iter_mut().zip(&src.payload) {
+            if relocate && col.tc.is_german_string() {
+                let cells = col.bytes.as_chunks::<16>().0;
+                let picked = rows.iter().map(|&r| &cells[r as usize]);
+                relocate_cells(picked, &src.blob, &mut self.blob, &mut dst.bytes);
+            } else {
+                gather_cells_into(&col.bytes, col.stride(), rows, &mut dst.bytes);
+            }
         }
     }
 }
 
-/// The `stride`-wide cells of `src` that `rows` names, in order.
-fn gather_cells(src: &[u8], stride: usize, rows: &[u32]) -> Vec<u8> {
-    fn fixed<const N: usize>(src: &[u8], rows: &[u32]) -> Vec<u8> {
+/// Append each German cell of `cells`, whose heap is `src_blob`, onto `out`, its
+/// spill (if any) moved onto `dst_blob`.
+fn relocate_cells<'a>(
+    cells: impl Iterator<Item = &'a [u8; 16]>,
+    src_blob: &[u8],
+    dst_blob: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) {
+    for cell in cells {
+        out.extend_from_slice(&gnitz_wire::relocate_german_string(cell, src_blob, dst_blob));
+    }
+}
+
+/// Append the `stride`-wide cells of `src` that `rows` names, in order, onto `out`.
+fn gather_cells_into(src: &[u8], stride: usize, rows: &[u32], out: &mut Vec<u8>) {
+    fn fixed<const N: usize>(src: &[u8], rows: &[u32], out: &mut Vec<u8>) {
         let cells = src.as_chunks::<N>().0;
-        let mut out = vec![0u8; rows.len() * N];
-        for (dst, &r) in out.as_chunks_mut::<N>().0.iter_mut().zip(rows) {
-            *dst = cells[r as usize];
+        let at = out.len();
+        out.reserve(rows.len() * N);
+        let dst = out.spare_capacity_mut().as_mut_ptr().cast::<[u8; N]>();
+        for (i, &r) in rows.iter().enumerate() {
+            // SAFETY: the reserve leaves room for `rows.len()` cells past `at`.
+            unsafe { dst.add(i).write(cells[r as usize]) };
         }
-        out
+        // SAFETY: the loop wrote each of those cells.
+        unsafe { out.set_len(at + rows.len() * N) };
     }
     match stride {
-        1 => fixed::<1>(src, rows),
-        2 => fixed::<2>(src, rows),
-        4 => fixed::<4>(src, rows),
-        8 => fixed::<8>(src, rows),
-        16 => fixed::<16>(src, rows),
+        1 => fixed::<1>(src, rows, out),
+        2 => fixed::<2>(src, rows, out),
+        4 => fixed::<4>(src, rows, out),
+        8 => fixed::<8>(src, rows, out),
+        16 => fixed::<16>(src, rows, out),
         // A compound key's stride.
         _ => {
-            let mut out = Vec::with_capacity(rows.len() * stride);
+            out.reserve(rows.len() * stride);
             for &r in rows {
                 out.extend_from_slice(&src[r as usize * stride..][..stride]);
             }
-            out
         }
     }
 }
