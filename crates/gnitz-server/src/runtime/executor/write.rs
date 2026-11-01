@@ -143,31 +143,6 @@ impl Writes {
     }
 }
 
-impl Shared {
-    /// Validate `families` as one bundle, and commit it with the families its
-    /// deletes cascade to as one write. The committer raises each written
-    /// table's commit LSN to the write's.
-    async fn commit(
-        &self,
-        _catalog: &ReadGuard<CatalogLock>,
-        held: &HeldTables,
-        mut families: Vec<TxnFamily>,
-    ) -> Result<u64, WireFault> {
-        debug_assert!(
-            families
-                .iter()
-                .all(|f| held.holds_exclusive(f.tid) || !self.cat().push_reads_committed_state(f.tid, f.mode)),
-            "a write whose validation reads committed state holds its table exclusively"
-        );
-        self.writes.checks.validate_txn(&self.dispatcher, &mut families).await?;
-        assert!(
-            families.iter().all(|f| held.holds(f.tid)),
-            "a commit bumps only tables whose lock it holds"
-        );
-        self.committer.write(families).await
-    }
-}
-
 /// A push frame decoded off the catalog guard by [`decode_push_frame`]. Its batch
 /// is handed out only by [`DecodedPush::admit`], which re-judges it under the
 /// guard.
@@ -231,8 +206,8 @@ pub(super) fn decode_push_frame(
     })
 }
 
-/// Handle a client push: decode the frame, then commit it under the catalog read
-/// lock and the target's table lock(s).
+/// Handle a client push: decode the frame, then admit it under the catalog read
+/// lock and [`commit`] it.
 ///
 /// One handler for both batch shapes. An empty delta — a frame with no data
 /// block — is ACKed with the "nothing written" LSN `0`, but only after the same
@@ -250,52 +225,62 @@ pub(super) async fn handle_push(shared: &Shared, buf: RecvBuf, ctrl: DecodedCont
     let Some(family) = push.admit(&shared.cat(), Access::Write)? else {
         return Ok(0);
     };
-
-    // See `Writes::table_locks`. The exclusive set covers the tables this
-    // push's deletes cascade to.
-    let held = if shared.cat().push_reads_committed_state(family.tid, family.mode) {
-        let deletes = !family.batch.all_weights_positive();
-        let mut locks = Vec::with_capacity(4);
-        shared.cat().write_lock_set_into(&mut locks, family.tid, deletes);
-        shared.writes.lock_tables_exclusive(&catalog, locks).await
-    } else {
-        shared.writes.lock_table_shared(&catalog, family.tid).await
-    };
-    shared.commit(&catalog, &held, vec![family]).await
+    commit(shared, &catalog, vec![family], None).await
 }
 
-/// PUSH_TXN: validate the bundle under the catalog read lock and its tables'
-/// lock union — the plain-push arm's order — check OCC, and commit it as one
-/// zone. Every rejection is pre-SAL, so a fault or a conflict commits nothing.
+/// PUSH_TXN: decode the bundle, then admit every family under the catalog read
+/// lock and [`commit`] them as one zone.
 pub(super) async fn handle_push_txn(shared: &Shared, buf: RecvBuf, ctrl: DecodedControl) -> Result<u64, WireFault> {
-    // 1. Decode.
     let (decoded, _charge) = buf.decode(|data| decode_push_txn_frame(&shared.cat(), &data[ctrl.body]));
     let items = decoded?;
-
-    // 2. Catalog read lock (excludes a concurrent DROP/DDL), then each family
-    //    admitted under it.
     let catalog = shared.catalog_rwlock.read().await;
     let mut bases = Vec::with_capacity(items.len());
     let mut families = Vec::with_capacity(items.len());
-    for item in items {
-        let (basis, family) = item.admit(&shared.cat())?;
+    for (basis, push) in items {
+        let family = push.admit(&shared.cat(), Access::TxnWrite)?;
+        families.push(family.expect("a PUSH_TXN item carries a data block"));
         bases.push(basis);
-        families.push(family);
     }
+    commit(shared, &catalog, families, Some(&bases)).await
+}
 
-    // 3. Acquire the per-table lock union ⋃ write_lock_set_into(tid) exclusively.
-    let mut union = Vec::with_capacity(4 * families.len());
-    for f in &families {
-        shared
+/// Commit `families` as one write: the table locks, OCC, the bundle's
+/// validation, and the commit, whose families its deletes cascade to ride
+/// along. Every rejection is pre-SAL, so a fault or a conflict commits nothing.
+/// The committer raises each written table's commit LSN to the write's.
+///
+/// `bases` makes it a transaction: each family's read basis, which its OCC
+/// check compares against. A transaction, or a push whose validation reads
+/// committed state, locks the tables it writes and those its deletes cascade to
+/// exclusively; any other push shares its table's lock (see
+/// [`Writes::table_locks`]).
+async fn commit(
+    shared: &Shared,
+    catalog: &ReadGuard<CatalogLock>,
+    mut families: Vec<TxnFamily>,
+    bases: Option<&[u64]>,
+) -> Result<u64, WireFault> {
+    let exclusive = bases.is_some()
+        || shared
             .cat()
-            .write_lock_set_into(&mut union, f.tid, !f.batch.all_weights_positive());
-    }
-    let held = shared.writes.lock_tables_exclusive(&catalog, union).await;
+            .push_reads_committed_state(families[0].tid, families[0].mode);
+    let held = if exclusive {
+        let mut locks = Vec::with_capacity(4 * families.len());
+        for f in &families {
+            shared
+                .cat()
+                .write_lock_set_into(&mut locks, f.tid, !f.batch.all_weights_positive());
+        }
+        shared.writes.lock_tables_exclusive(catalog, locks).await
+    } else {
+        shared.writes.lock_table_shared(catalog, families[0].tid).await
+    };
 
-    // 3b. OCC. A blind family's `BLIND` basis no commit exceeds.
-    if let Some(f) = (families.iter().zip(&bases))
-        .find_map(|(f, &basis)| shared.writes.written_since(&held, f.tid, basis).then_some(f))
-    {
+    // OCC. A blind family's basis is one no commit exceeds.
+    let conflict = bases.and_then(|bases| {
+        (families.iter().zip(bases)).find(|&(f, &basis)| shared.writes.written_since(&held, f.tid, basis))
+    });
+    if let Some((f, _)) = conflict {
         return Err(WireFault {
             status: WireStatus::TxnConflict,
             text: format!(
@@ -305,29 +290,21 @@ pub(super) async fn handle_push_txn(shared: &Shared, buf: RecvBuf, ctrl: Decoded
         });
     }
 
-    // 4. Distributed bundle validation, and the commit.
-    shared.commit(&catalog, &held, families).await
+    shared
+        .writes
+        .checks
+        .validate_txn(&shared.dispatcher, &mut families)
+        .await?;
+    assert!(
+        families.iter().all(|f| held.holds(f.tid)),
+        "a commit bumps only tables whose lock it holds"
+    );
+    shared.committer.write(families).await
 }
 
-/// One `PUSH_TXN` family as decoded: the push and the read basis its OCC check
-/// compares against.
-pub(super) struct TxnItem {
-    push: DecodedPush,
-    basis: u64,
-}
-
-impl TxnItem {
-    /// [`DecodedPush::admit`] as a transaction write: the family's basis and
-    /// the family.
-    pub(super) fn admit(self, cat: &CatalogEngine) -> Result<(u64, TxnFamily), WireFault> {
-        let family = self.push.admit(cat, Access::TxnWrite)?;
-        Ok((self.basis, family.expect("a PUSH_TXN item carries a data block")))
-    }
-}
-
-/// Decode a `PUSH_TXN` frame body into its families, in frame order, applying
-/// every rule that needs no catalog lock.
-pub(super) fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<Vec<TxnItem>, WireFault> {
+/// Decode a `PUSH_TXN` frame body into its families, in frame order, each with
+/// its read basis, applying every rule that needs no catalog lock.
+pub(super) fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<Vec<(u64, DecodedPush)>, WireFault> {
     let items = gnitz_wire::txn_frame::decode_items(body, ClientVerb::PushTxn).map_err(decode_fault)?;
     items
         .into_iter()
@@ -335,7 +312,7 @@ pub(super) fn decode_push_txn_frame(cat: &CatalogEngine, body: &[u8]) -> Result<
             let (basis, tid) = (ctrl.hdr.arg0, ctrl.hdr.target_id);
             let push =
                 decode_push_frame(cat, frame, ctrl).map_err(|e| e.in_context(format_args!("TXN family {tid}")))?;
-            Ok(TxnItem { push, basis })
+            Ok((basis, push))
         })
         .collect()
 }

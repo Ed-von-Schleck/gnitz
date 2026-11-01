@@ -34,10 +34,10 @@ use gnitz_zset::schema::SchemaDescriptor;
 /// conflict `mode`, and the decoded batch. The executor decodes into these, the
 /// validator borrows them and extends them with the families a delete cascades
 /// to, and the committer takes them by value.
-pub(crate) struct TxnFamily {
-    pub tid: u64,
-    pub mode: WireConflictMode,
-    pub batch: Batch,
+pub(in crate::runtime::executor) struct TxnFamily {
+    pub(in crate::runtime::executor) tid: u64,
+    pub(in crate::runtime::executor) mode: WireConflictMode,
+    pub(in crate::runtime::executor) batch: Batch,
 }
 
 /// One probe of relation `tid` at `keys`, queued for a burst, with the state
@@ -207,11 +207,12 @@ struct TxnBundle<'a> {
 impl<'a> TxnBundle<'a> {
     fn new(cat: &CatalogEngine, families: &'a [TxnFamily]) -> Result<Self, WireFault> {
         let mut tables: Vec<TxnTable<'a>> = Vec::new();
-        for fam in families {
-            if tables.iter().any(|t| t.tid == fam.tid) {
+        // Each table judged once, at its first family.
+        for (i, fam) in families.iter().enumerate() {
+            if families[..i].iter().any(|f| f.tid == fam.tid) {
                 continue;
             }
-            let reads_committed = families
+            let reads_committed = families[i..]
                 .iter()
                 .any(|f| f.tid == fam.tid && cat.push_reads_committed_state(f.tid, f.mode));
             if !reads_committed {

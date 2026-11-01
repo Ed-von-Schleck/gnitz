@@ -118,7 +118,10 @@ impl Session {
                 };
                 let Ok(families) = items
                     .into_iter()
-                    .map(|item| item.admit(&self.cat).map(|(_, f)| f))
+                    .map(|(_, push)| {
+                        let family = push.admit(&self.cat, Access::TxnWrite);
+                        family.map(|f| f.expect("a PUSH_TXN item carries a data block"))
+                    })
                     .collect::<Result<Vec<_>, _>>()
                 else {
                     return;
