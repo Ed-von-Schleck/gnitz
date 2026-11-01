@@ -1,7 +1,7 @@
 //! The morsel evaluator: `Evaluator` runs a resolved program over a batch one
 //! morsel (up to `MORSEL` rows) at a time.
 //!
-//! `eval_batch` applies each instruction as a columnar loop over register
+//! `eval_morsel` applies each instruction as a columnar loop over register
 //! buffers, reading the batch's regions from a table `Evaluator::eval_morsels`
 //! fetches once per call. Base pointers are hoisted outside the inner loop,
 //! which is what lets LLVM auto-vectorize the arithmetic opcodes. The loops that
@@ -16,7 +16,7 @@ use std::fmt;
 
 use crate::chars::{char_count, char_offset, char_offset_back, reverse_chars};
 use crate::map::{Emit, EmitStore};
-use crate::program::{FloatUnaryOp, IntArithOp, IntOrder, IntReg, IntUnaryOp};
+use crate::program::{FloatUnaryOp, IntArithOp, IntOrder, IntReg, IntUnaryOp, PAYLOAD_SLOTS};
 use crate::search::{fields, find, lit_eq};
 use crate::simd::{self, decode_f64, encode_f64, LanePred, Level};
 use crate::{calendar, BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram};
@@ -60,8 +60,7 @@ fn tail_mask(m: usize) -> u64 {
 /// One register: a lane per row, and a null bit and a truth bit per row.
 ///
 /// On a cache-line boundary: lanes that start off a 32-byte one split the
-/// loaders' stores and the kernels' loads across lines, which the filter
-/// benches count as `ls_misal_loads`.
+/// loaders' stores and the kernels' loads across lines.
 #[derive(Clone)]
 #[repr(align(64))]
 struct RegBuf {
@@ -93,8 +92,8 @@ struct EvalScratch {
     level: Level,
 }
 
-/// String register `reg`'s first `m` views, cut from the flattened file: an
-/// instruction a row cheaper than slicing its own array (`expr_kernel_bench`).
+/// String register `reg`'s first `m` views, cut from the flattened file, which
+/// is cheaper than slicing its own array (`expr_kernel_bench`).
 #[inline(always)]
 fn str_lane(views: &[[StrView; MORSEL]], reg: usize, m: usize) -> &[StrView] {
     &views.as_flattened()[reg * MORSEL..][..m]
@@ -161,7 +160,7 @@ impl Evaluator {
             let m = MORSEL.min(n - rel_start);
             morsel.start = start + rel_start;
             morsel.m = m;
-            eval_batch(&morsel, scratch);
+            eval_morsel(&morsel, scratch);
             debug_assert!(
                 (scratch.regs.iter().enumerate())
                     .all(|(r, reg)| prog.may_null(r as u16) || reg.nulls == [0; NULL_WORDS_PER_REG]),
@@ -360,9 +359,6 @@ impl MorselOut<'_> {
 // ---------------------------------------------------------------------------
 // Morsel context
 // ---------------------------------------------------------------------------
-
-/// One region-table entry per payload slot, the cap the null bitmap imposes.
-pub(crate) const PAYLOAD_SLOTS: usize = u64::BITS as usize;
 
 /// The batch regions a payload load or a string view reads, fetched once per
 /// [`Evaluator::eval_morsels`] call: the blob, and the region of each payload
@@ -620,6 +616,12 @@ impl<'a> Regions<'a> {
     #[inline]
     fn col(&self, pi: u32) -> &'a [u8] {
         self.cols[pi as usize]
+    }
+
+    /// Payload slot `pi`'s cells, `W` bytes each, for the `m` rows from `start`.
+    #[inline(always)]
+    fn cells<const W: usize>(&self, pi: u8, start: usize, m: usize) -> &'a [[u8; W]] {
+        self.col(pi as u32)[start * W..(start + m) * W].as_chunks::<W>().0
     }
 }
 
@@ -1073,9 +1075,8 @@ struct StrOperand<'a, C> {
 
 impl<'a> StrOperand<'a, ColumnCells<'a>> {
     fn column(pi: u8, mo: &Morsel<'a>) -> Self {
-        let rows = &mo.bufs.col(pi as u32)[mo.start * 16..][..mo.m * 16];
         StrOperand {
-            cells: ColumnCells(rows.as_chunks::<16>().0),
+            cells: ColumnCells(mo.bufs.cells::<16>(pi, mo.start, mo.m)),
             blob: mo.bufs.blob,
             null_bit: 1u64 << pi,
         }
@@ -1283,7 +1284,8 @@ fn un_op(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, f: impl Fn(
 }
 
 /// The largest IN set scanned a value at a time, by a morsel of at least as
-/// many rows, rather than searched per row (the `in*` shapes of both benches).
+/// many rows, rather than searched per row (the `in*` shapes of
+/// `filter_kernel_bench` and `expr_kernel_bench`).
 const IN_SET_BITS_MAX: usize = 64;
 
 /// `a IN set` by scanning the set: the packed bits straight off the operand.
@@ -1408,7 +1410,7 @@ fn str_cmp<A: Cells, B: Cells>(
 }
 
 // ---------------------------------------------------------------------------
-// eval_batch — single morsel
+// eval_morsel — single morsel
 // ---------------------------------------------------------------------------
 
 /// Decode PK column `fi` at byte `off` of each of the morsel's rows into register
@@ -1428,7 +1430,7 @@ fn load_pk(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, off: usize, fi:
 /// Evaluate the program over one morsel's rows. Results land in
 /// `scratch.regs`: a register's values in its lanes, its null bits beside them.
 /// [`Evaluator::eval_morsels`] calls it once per morsel.
-fn eval_batch(morsel: &Morsel<'_>, scratch: &mut EvalScratch) {
+fn eval_morsel(morsel: &Morsel<'_>, scratch: &mut EvalScratch) {
     let (prog, bufs) = (morsel.prog, morsel.bufs);
     // Back to the constant prefix: the previous morsel's views die here.
     scratch.str_arena.truncate(prog.const_arena.len());
@@ -1443,12 +1445,10 @@ fn eval_batch(morsel: &Morsel<'_>, scratch: &mut EvalScratch) {
             // Load operations
             // ----------------------------------------------------------------
             Instr::LoadPayloadInt { pi, fi } => {
-                let col_data = bufs.col(pi as u32);
                 let dst_reg = scratch.reg_mut(dst, m);
                 gnitz_wire::for_each_fixed_int!(fi, |FI| {
                     const W: usize = FI.width();
-                    let b = &col_data[morsel_start * W..(morsel_start + m) * W];
-                    for (r, c) in dst_reg.iter_mut().zip(b.as_chunks::<W>().0) {
+                    for (r, c) in dst_reg.iter_mut().zip(bufs.cells::<W>(pi, morsel_start, m)) {
                         *r = FI.decode_le_i64(c);
                     }
                 });
@@ -1459,10 +1459,8 @@ fn eval_batch(morsel: &Morsel<'_>, scratch: &mut EvalScratch) {
             // Every float register holds an f64 image, so an F32 column widens
             // on load.
             Instr::LoadPayloadF32 { pi } => {
-                let col_data = bufs.col(pi as u32);
                 let dst_reg = scratch.reg_mut(dst, m);
-                let b = &col_data[morsel_start * 4..(morsel_start + m) * 4];
-                for (r, c) in dst_reg.iter_mut().zip(b.as_chunks::<4>().0) {
+                for (r, c) in dst_reg.iter_mut().zip(bufs.cells::<4>(pi, morsel_start, m)) {
                     *r = encode_f64(f32::from_le_bytes(*c) as f64);
                 }
                 fill_null_bits_mask(scratch, dst, mo, 1u64 << pi);
@@ -1722,9 +1720,7 @@ fn eval_batch(morsel: &Morsel<'_>, scratch: &mut EvalScratch) {
             Instr::LoadColStr { pi } => {
                 let blob_len = bufs.blob.len();
                 let buf = SRC_COL_BASE + pi as u32;
-                let rows = bufs.col(pi as u32)[morsel_start * 16..(morsel_start + m) * 16]
-                    .as_chunks::<16>()
-                    .0;
+                let rows = bufs.cells::<16>(pi, morsel_start, m);
                 let lane = str_lane_mut(&mut scratch.str_views, dst as usize, m);
                 for (i, (v, cell)) in lane.iter_mut().zip(rows).enumerate() {
                     *v = cell_to_view(cell, (morsel_start + i) * 16, buf, blob_len);
@@ -1966,5 +1962,5 @@ fn eval_batch(morsel: &Morsel<'_>, scratch: &mut EvalScratch) {
 }
 
 #[cfg(test)]
-#[path = "tests/batch.rs"]
+#[path = "tests/morsel.rs"]
 mod tests;

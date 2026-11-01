@@ -1,5 +1,5 @@
 use super::*;
-use crate::repr::batch_pool::MAX_POOLED_BYTES;
+use crate::repr::pool::MAX_POOLED_BYTES;
 use crate::repr::ShardWriteOpts;
 use crate::repr::{Batch, BatchBuilder, MappedShard};
 use crate::schema::SchemaColumn;

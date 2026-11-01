@@ -130,7 +130,8 @@ fn region_append_bench() {
                     if wal {
                         decode_wal_block_into(&mut sink, black_box(&block), &schema).unwrap();
                     } else {
-                        sink.check_laid_out(black_box(&regions), &schema).unwrap();
+                        sink.check_region_lengths(black_box(&regions)).unwrap();
+                        check_not_null(regions[REG_NULL_BMP], &schema).unwrap();
                         sink.append_region_list(&regions);
                     }
                     black_box(&sink);

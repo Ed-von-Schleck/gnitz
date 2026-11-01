@@ -1,4 +1,4 @@
-# The columnar kernels (`eval_batch`'s morsel loops, `repr::scatter`,
+# The columnar kernels (`eval_morsel`'s morsel loops, `repr::scatter`,
 # `repr::merge`) carry no explicit SIMD — their vector width is whatever LLVM
 # auto-vectorises to, and rustc's default `x86-64` baseline caps that at SSE2's
 # 128 bits. `x86-64-v3` (AVX2) doubles it, and adds TZCNT/LZCNT for the null-word

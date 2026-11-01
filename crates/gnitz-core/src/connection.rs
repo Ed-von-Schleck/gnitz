@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use std::time::{Duration, Instant};
 
-use crate::batch::{decode_wal_blocks_into, parse_wal_block};
+use crate::batch::{decode_wal_blocks, parse_wal_block};
 use crate::error::ClientError;
 use crate::host::{promise, Host, Promise, Sent};
 use crate::transport::Interest;
@@ -349,10 +349,8 @@ impl Train {
     /// The train's rows: the held blocks, then the terminal frame's block
     /// `last`, decoded in place.
     fn finish(&mut self, last: Option<&[u8]>) -> Result<ZSetBatch, ProtocolError> {
-        let mut batch = ZSetBatch::new(&self.schema);
         let held = std::mem::take(&mut self.held);
-        decode_wal_blocks_into(&mut batch, held.iter().map(RawBlock::block).chain(last), &self.schema)?;
-        Ok(batch)
+        decode_wal_blocks(held.iter().map(RawBlock::block).chain(last), &self.schema)
     }
 
     fn reply(&mut self, last: Option<&[u8]>, lsn: Option<u64>) -> Result<ScanReply, ProtocolError> {

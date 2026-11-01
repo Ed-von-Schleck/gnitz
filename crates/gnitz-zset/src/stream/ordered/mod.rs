@@ -464,7 +464,7 @@ impl OrderIndex {
         // No carried string reads the delta's heap.
         let heap_at = match self.moves.string_slots() {
             0 => None,
-            strings => out.carry_heap(&mb, strings, &[(0, n)]),
+            strings => out.carry_heap(&mb, strings, &[(0, n)], 0),
         };
         let (stride, group) = (self.schema.pk_stride(), self.key_packer.out_stride);
         let mut image = Vec::new();

@@ -1,6 +1,6 @@
 //! Instruction benchmarks for the mask kernels.
 
-use crate::batch::MORSEL;
+use crate::morsel::MORSEL;
 use crate::simd::{self, encode_f64};
 use crate::test_support::{simd_levels, Meter};
 

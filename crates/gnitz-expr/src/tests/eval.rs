@@ -5,8 +5,8 @@ use crate::SchemaColumn;
 use crate::{ConstIdx, Reg, Sink};
 use gnitz_wire::{FixedInt, TypeCode};
 
-use crate::batch::MORSEL;
 use crate::eval::Resolved;
+use crate::morsel::MORSEL;
 use crate::simd::encode_f64;
 use crate::test_support::{
     filter_prog, i64s, is_not_null_op, is_null_op, make_n_col_view, map_prog, map_rows, passing_rows, result_prog,

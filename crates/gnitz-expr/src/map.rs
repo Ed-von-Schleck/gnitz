@@ -3,7 +3,7 @@
 
 use gnitz_wire::{FixedInt, TypeCode};
 
-use crate::batch::Evaluator;
+use crate::morsel::Evaluator;
 use crate::program::{locate_col, ReadAs};
 use crate::{
     BatchView, ColCopy, ColKind, ColMoves, ExprValidateErr, LogicalInstr, LogicalProgram, MapTarget, SchemaDescriptor,

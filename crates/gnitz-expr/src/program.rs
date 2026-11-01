@@ -9,7 +9,6 @@
 //! operators and `TrimMode`, are declared here; `CalendarOp` is declared in
 //! `calendar.rs`, beside the arithmetic it selects.
 
-use crate::batch::PAYLOAD_SLOTS;
 use crate::calendar::CalendarOp;
 use crate::like::{LikeMatcher, LikePattern};
 use crate::{ColumnLocator, SchemaDescriptor};
@@ -20,6 +19,10 @@ use std::fmt;
 /// null-bit propagation, and every register-indexed mask address registers by
 /// bit in a `u64`.
 pub(crate) const MAX_REGS: usize = u64::BITS as usize;
+
+/// Payload slots are capped at 64 by the null bitmap's one `u64` word per row:
+/// the length of `ResolvedProgram::read_widths` and of the evaluator's region table.
+pub(crate) const PAYLOAD_SLOTS: usize = u64::BITS as usize;
 
 /// Why a client-supplied expression program, or the range walk a read carries
 /// beside it, was rejected. A variant's payload is there for its `Display` to
@@ -1637,9 +1640,10 @@ pub(crate) struct ResolvedProgram {
     // program was resolved against, since the payload indices in `instrs` were
     // assigned from it.
     /// Bit `r` set iff register `r` is only consumed by boolean ops, so nothing
-    /// reads its lanes. A permission, not an obligation: the compares, the IN
-    /// scan, the string compares (`StrCmp`), `BoolBinary`, `BoolNot` and the
-    /// null tests skip the lanes and write the packed truth bits natively.
+    /// reads its lanes. A permission, not an obligation: the integer and float
+    /// compares, the IN scan over a small set, the column string compares
+    /// (`StrColConst`, `StrColCol`, `StrColPrefix`), `BoolBinary`, `BoolNot` and
+    /// the null tests skip the lanes and write the packed truth bits natively.
     bit_only: u64,
     /// Bit `r` set iff `r`'s producer must write its packed truth bits: some
     /// downstream consumer reads it as a truth bit. A filter's result register
@@ -1681,7 +1685,7 @@ impl ResolvedProgram {
         (self.null_regs >> reg) & 1 != 0
     }
 
-    /// Per instruction per morsel, from the BOOL arms of `eval_batch`.
+    /// Per instruction per morsel, from the BOOL arms of `eval_morsel`.
     pub(crate) fn is_bit_only(&self, reg: u16) -> bool {
         (self.bit_only >> reg) & 1 != 0
     }

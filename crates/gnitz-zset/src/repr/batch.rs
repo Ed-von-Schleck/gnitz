@@ -5,8 +5,8 @@
 
 use std::ops::Range;
 
-use super::batch_pool::{self, is_tight, PooledBuf};
 use super::merge;
+use super::pool::{is_tight, PooledBuf};
 use super::run::StoredRow;
 use super::scatter::{copy_ranges, with_picks, Pick};
 use super::seek::ColPtr;
@@ -154,7 +154,8 @@ impl Batch {
     }
 
     /// An empty batch with room for `rows` rows. The arena is uninitialized
-    /// (poisoned in debug builds), and filled as `DirectWriter` says.
+    /// (poisoned in debug builds), and filled as `DirectWriter` says; the blob
+    /// heap starts empty, for [`Self::reserve_blob`] to size.
     pub fn with_capacity(schema: &SchemaDescriptor, rows: usize) -> Self {
         let mut b = Self::empty_with_schema(schema);
         b.capacity = schema.arena_rows(rows);
@@ -164,51 +165,13 @@ impl Batch {
         b
     }
 
-    /// [`Self::with_capacity`] with the blob heap pre-sized. For the callers that
-    /// know the byte count up front; `with_capacity` leaves it empty because most
-    /// writers do not.
-    fn with_capacity_blob(schema: &SchemaDescriptor, rows: usize, blob_bytes: usize) -> Self {
-        let mut b = Self::with_capacity(schema, rows);
-        b.reserve_blob(blob_bytes);
-        b
-    }
-
-    /// Room for `bytes` more blob heap bytes. A heap that has to grow moves into
-    /// a buffer from the pool of at least twice its capacity, so repeated
-    /// reserves on one batch stay amortised, and the outgrown buffer returns to
-    /// the pool; the bytes move verbatim, so cell offsets and `dead_heap` still
-    /// hold. Past the pool's largest buffer it grows by [`Vec::reserve`]. A
-    /// schema with no string column has no heap to reserve.
+    /// Room for `bytes` more blob heap bytes, grown as [`PooledBuf::reserve_pooled`]
+    /// grows a buffer: the bytes move verbatim, so cell offsets and `dead_heap`
+    /// still hold. A schema with no string column has no heap to reserve.
     pub(crate) fn reserve_blob(&mut self, bytes: usize) {
-        if !self.schema.has_german_string() || self.blob.capacity() - self.blob.len() >= bytes {
-            return;
+        if self.schema.has_german_string() {
+            self.blob.reserve_pooled(bytes);
         }
-        let need = (self.blob.len() + bytes).max(2 * self.blob.capacity());
-        if need > batch_pool::MAX_POOLED_BYTES {
-            self.blob.reserve(bytes);
-            return;
-        }
-        let mut grown = PooledBuf::with_capacity(need);
-        grown.extend_from_slice(&self.blob);
-        self.blob = grown;
-    }
-
-    /// An owned copy of `mb`'s `count` rows and its whole heap, in an arena
-    /// sized for them: unconsolidated, `mb`'s dead-byte bound.
-    pub(in crate::repr) fn from_mem_batch(mb: &MemBatch) -> Self {
-        let schema = mb.schema;
-        let mut b = Self::empty_with_schema(schema);
-        let cap = schema.arena_rows(mb.count);
-        // SAFETY: `copy_regions` writes the `count` rows a `Batch` reads.
-        b.data = unsafe { PooledBuf::uninit(cap * schema.row_width()) };
-        copy_regions(schema, mb.data, mb.cap, &mut b.data, cap, mb.count);
-        b.blob = PooledBuf::with_capacity(mb.blob.len());
-        b.blob.extend_from_slice(mb.blob);
-        b.dead_heap = mb.dead_heap;
-        b.capacity = cap;
-        b.count = mb.count;
-        b.debug_poison_rows(mb.count..cap);
-        b
     }
 
     // ── Schema installation ─────────────────────────────────────────────
@@ -270,17 +233,16 @@ impl Batch {
 
     /// These rows over their heap padded with `pad` unreferenced bytes, charged dead.
     #[cfg(test)]
-    pub(crate) fn padded(mut self, pad: usize) -> Batch {
+    pub(in crate::repr) fn padded(mut self, pad: usize) -> Batch {
         self.blob.extend(std::iter::repeat_n(0u8, pad));
         self.dead_heap += pad;
         self
     }
 
-    /// The live `count * stride` bytes of region `r` — the one range computation
-    /// every fixed-region accessor below shares, and the slice the wire and shard
-    /// framers build their region lists from.
+    /// The live `count * stride` bytes of region `r`, the range every
+    /// whole-region accessor below reads.
     #[inline(always)]
-    pub(super) fn region(&self, r: usize) -> &[u8] {
+    fn region(&self, r: usize) -> &[u8] {
         let off = self.region_start(r);
         &self.data[off..off + self.count * self.schema.region_stride(r)]
     }
@@ -563,7 +525,7 @@ impl Batch {
         if total == 0 {
             return;
         }
-        let heap_at = self.carry_heap(src, self.schema.string_payload_slots(), ranges);
+        let heap_at = self.carry_heap(src, self.schema.string_payload_slots(), ranges, 0);
         self.write_at_most(total, cache, |w| (total, copy_ranges(src, heap_at, ranges, w)));
     }
 
@@ -757,7 +719,7 @@ impl Batch {
         );
         let n = self.count;
         let mut out = Self::with_capacity(out_schema, n);
-        let heap_at = out.carry_heap(&self.as_mem_batch(), in_schema.string_payload_slots(), &[(0, n)]);
+        let heap_at = out.carry_heap(&self.as_mem_batch(), in_schema.string_payload_slots(), &[(0, n)], 0);
         out.write_rows(n, |w| {
             w.weight_mut().copy_from_slice(self.weight());
             for (pi, col) in in_schema.payload_columns() {
@@ -978,7 +940,8 @@ impl Batch {
             rows += src.count;
             blob += src.blob.len();
         }
-        let mut out = Batch::with_capacity_blob(schema, rows, blob);
+        let mut out = Batch::with_capacity(schema, rows);
+        out.reserve_blob(blob);
         // One dedup cache serves every source, so a fold of one-row runs pays its
         // setup once.
         let mut cache = BlobCache::for_rows(&out.schema, rows);
@@ -988,9 +951,8 @@ impl Batch {
         out
     }
 
-    /// No rows and no string heap — so this batch already *is* its own cleared
-    /// and its own copied form, and `clear`/`clone` can hand back what
-    /// they were given.
+    /// No rows and no string heap, so `clear` has nothing to do and `clone`
+    /// builds an empty batch.
     #[inline]
     fn holds_nothing(&self) -> bool {
         self.count == 0 && self.blob.is_empty()
@@ -1028,13 +990,9 @@ impl Batch {
     /// dead. Declined, it reserves the rows' share of `src`'s heap for the cells
     /// relocated instead — that share, not the whole heap: a many-run merge
     /// appends into one output, and the whole heap per run ratchets capacity.
-    pub(crate) fn carry_heap(&mut self, src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, usize)]) -> Option<usize> {
-        self.carry_heap_with_room(src, kept_slots, kept, 0)
-    }
-
-    /// [`Self::carry_heap`], reserving `room` more heap bytes with either
-    /// outcome, for long cells the caller relocates from another source.
-    pub(crate) fn carry_heap_with_room(
+    /// Either outcome also reserves `room` more heap bytes, for long cells the
+    /// caller relocates from another source.
+    pub(crate) fn carry_heap(
         &mut self,
         src: &MemBatch<'_>,
         kept_slots: u64,
@@ -1276,14 +1234,14 @@ impl Batch {
 }
 
 impl Clone for Batch {
-    /// Clone all buffers into a new independent Batch (2 allocations).
+    /// An independent copy of the rows and heap, in an arena sized for the
+    /// rows, keeping the consolidated claim.
     fn clone(&self) -> Self {
         // Rebuilt rather than copied through two pooled arenas holding zero bytes.
         if self.holds_nothing() {
             return Self::empty_with_schema(&self.schema);
         }
-        // Only the used portion of data (count-based, not capacity-based).
-        let mut b = Self::from_mem_batch(&self.as_mem_batch());
+        let mut b = self.as_mem_batch().to_batch();
         b.consolidated = self.consolidated;
         b
     }
@@ -1351,16 +1309,22 @@ impl<'a> MemBatch<'a> {
         self.blob
     }
 
-    /// An upper bound on the bytes of the heap no string cell references.
-    #[inline]
-    pub fn dead_heap(&self) -> usize {
-        self.dead_heap
-    }
-
-    /// An owned copy of these rows and their whole heap: unconsolidated, under
-    /// this view's dead-byte bound.
+    /// An owned copy of these `count` rows and their whole heap, in an arena
+    /// sized for them: unconsolidated, under this view's dead-byte bound.
     pub fn to_batch(&self) -> Batch {
-        Batch::from_mem_batch(self)
+        let schema = self.schema;
+        let mut b = Batch::empty_with_schema(schema);
+        let cap = schema.arena_rows(self.count);
+        // SAFETY: `copy_regions` writes the `count` rows a `Batch` reads.
+        b.data = unsafe { PooledBuf::uninit(cap * schema.row_width()) };
+        copy_regions(schema, self.data, self.cap, &mut b.data, cap, self.count);
+        b.blob = PooledBuf::with_capacity(self.blob.len());
+        b.blob.extend_from_slice(self.blob);
+        b.dead_heap = self.dead_heap;
+        b.capacity = cap;
+        b.count = self.count;
+        b.debug_poison_rows(self.count..cap);
+        b
     }
 
     /// True iff every row's weight is `> 0` — vacuously true for an empty batch.
@@ -1539,7 +1503,8 @@ pub(crate) fn write_to_batch(
     if rows == 0 {
         return Batch::empty_with_schema(schema);
     }
-    let mut b = Batch::with_capacity_blob(schema, rows, max_blob);
+    let mut b = Batch::with_capacity(schema, rows);
+    b.reserve_blob(max_blob);
     b.write_rows(rows, write_fn);
     if b.blob.is_empty() {
         b.blob = PooledBuf::default();

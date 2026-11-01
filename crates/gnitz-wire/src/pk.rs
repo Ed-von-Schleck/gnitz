@@ -75,6 +75,17 @@ pub const fn image_mask(width: usize) -> u128 {
     u128::MAX >> (128 - 8 * width)
 }
 
+/// Whether a native value — passed `v as u128`, sign-extended if it is signed —
+/// fits a `width`-byte column: the bits outside its image are all clear (an
+/// unsigned value) or all set (a sign-extended negative), so dropping them
+/// loses nothing.
+#[inline(always)]
+pub const fn native_fits(v: u128, width: usize) -> bool {
+    let outside = !image_mask(width);
+    let dropped = v & outside;
+    dropped == 0 || dropped == outside
+}
+
 /// A native value's image in its column's key order: masked to the type's width, sign bit
 /// flipped for a signed type — the OPK bytes read as a big-endian integer. Its own
 /// inverse on a masked value, which is how [`decode_opk_u128`] reads a cell back.

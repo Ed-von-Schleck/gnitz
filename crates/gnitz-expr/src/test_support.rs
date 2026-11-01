@@ -8,8 +8,8 @@ use std::fmt::Debug;
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::TypeCode;
 
-use crate::batch::MORSEL;
 use crate::eval::Resolved;
+use crate::morsel::MORSEL;
 use crate::simd::encode_f64;
 use crate::simd::Level;
 use crate::{

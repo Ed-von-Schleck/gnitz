@@ -514,11 +514,8 @@ impl SchemaDescriptor {
         for (col, &v) in self.pk_columns().zip(natives) {
             let (tc, w) = (col.type_code, col.size());
             debug_assert!(
-                {
-                    let dropped = v.checked_shr(w as u32 * 8).unwrap_or(0);
-                    dropped == 0 || dropped == u128::MAX >> (w * 8)
-                },
-                "opk_key_cols: {v:#x} does not fit a {tc:?} column",
+                gnitz_wire::native_fits(v, w),
+                "opk_key_cols: {v:#x} does not fit a {tc:?} column"
             );
             key.push(w, v, tc.is_signed_int());
         }

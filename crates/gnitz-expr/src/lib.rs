@@ -20,7 +20,7 @@
 //! [`ExprBuilder`] assembles a [`LogicalProgram`], the wire form, which encodes
 //! to a blob and decodes back from one. Resolved against a schema, it becomes a
 //! [`RowFilter`], a [`ScalarEval`] or a [`MapEval`], each running the morsel
-//! kernels of `batch.rs` and `simd.rs`. The wire ids, both instruction tables
+//! kernels of `morsel.rs` and `simd.rs`. The wire ids, both instruction tables
 //! and the blob framing live in `blob.rs`, and `tests/blob.rs` binds them to each
 //! other and to `EXPR_BLOB_VERSION`. The selector families are declared in
 //! `program.rs`, except `CalendarOp`, which `calendar.rs` declares beside the
@@ -77,7 +77,6 @@
 //! benches print — never on wall-clock: timings on the development machines
 //! swing far wider than the effects being measured.
 
-mod batch;
 mod blob;
 mod builder;
 mod calendar;
@@ -87,6 +86,7 @@ mod eval;
 mod like;
 mod locator;
 mod map;
+mod morsel;
 mod order;
 mod program;
 mod range;
@@ -95,7 +95,6 @@ mod search;
 mod simd;
 mod view;
 
-pub use batch::FloatText;
 pub use builder::*;
 pub use calendar::CalendarOp;
 pub use copy::{ColCopy, ColMoves};
@@ -103,6 +102,7 @@ pub use eval::*;
 pub use like::*;
 pub use locator::*;
 pub use map::MapEval;
+pub use morsel::FloatText;
 pub use order::*;
 pub use program::*;
 pub use schema::*;

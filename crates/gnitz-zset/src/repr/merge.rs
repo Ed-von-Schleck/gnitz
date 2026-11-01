@@ -570,8 +570,8 @@ where
     let mut out = Batch::with_capacity(schema, n_a + n_b);
     let slots = schema.string_payload_slots();
     let heap_at = [
-        out.carry_heap(a, slots, &[(0, n_a)]),
-        out.carry_heap(b, slots, &[(0, n_b)]),
+        out.carry_heap(a, slots, &[(0, n_a)], 0),
+        out.carry_heap(b, slots, &[(0, n_b)], 0),
     ];
     let mut cache = BlobCache::for_rows(out.schema(), n_a + n_b);
     let dead = out.write_at_most(n_a + n_b, &mut cache, |writer| {

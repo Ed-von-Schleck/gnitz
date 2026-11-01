@@ -370,7 +370,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
                     _ => kept.push((s, e)),
                 }
             }
-            out.carry_heap_with_room(&delta.as_mem_batch(), strings, &kept, trace_long)
+            out.carry_heap(&delta.as_mem_batch(), strings, &kept, trace_long)
         }
         false => {
             // The delta's long cells are relocated as well, each output row

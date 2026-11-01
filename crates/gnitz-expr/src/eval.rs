@@ -6,7 +6,7 @@
 
 use gnitz_wire::KeyRange;
 
-use crate::batch::{Evaluator, MorselOut};
+use crate::morsel::{Evaluator, MorselOut};
 use crate::program::ReadAs;
 use crate::range::RangeMembership;
 #[cfg(test)]
@@ -40,12 +40,7 @@ impl LogicalProgram {
             ev: Evaluator::new(prog),
             result_reg: r.0 as usize,
         };
-        Ok(RowFilter {
-            pred: Some(pred),
-            walk: None,
-            words: Vec::new(),
-            runs: Vec::new(),
-        })
+        Ok(RowFilter { pred: Some(pred), ..Default::default() })
     }
 
     /// A scalar expression, one value per row.
@@ -78,6 +73,7 @@ struct FilterEval {
 }
 
 /// Which rows of a batch survive a predicate and a range walk, either optional.
+#[derive(Default)]
 pub struct RowFilter {
     pred: Option<FilterEval>,
     walk: Option<RangeMembership>,
@@ -100,12 +96,7 @@ impl RowFilter {
         schema: &SchemaDescriptor,
     ) -> Result<Self, ExprValidateErr> {
         let mut f = match predicate.is_empty() {
-            true => RowFilter {
-                pred: None,
-                walk: None,
-                words: Vec::new(),
-                runs: Vec::new(),
-            },
+            true => RowFilter::default(),
             false => LogicalProgram::from_blob(predicate)?.resolve_filter(schema)?,
         };
         f.walk = walk.map(|r| RangeMembership::new(r, schema)).transpose()?;

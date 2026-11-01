@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 
 use super::batch::{range_rows, MemBatch};
-use super::batch_pool::{self, is_tight};
+use super::pool::{self, is_tight};
 use super::shard::Codebook;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::TypeCode;
@@ -322,7 +322,7 @@ pub(crate) struct BlobCache {
 }
 
 impl BlobCache {
-    pub(crate) fn new(cells: usize) -> Self {
+    fn new(cells: usize) -> Self {
         BlobCache { map: None, cells }
     }
 
@@ -341,7 +341,7 @@ impl BlobCache {
             // than its reserve, which would grow it.
             let reserve = cells.min(BLOB_CACHE_RESERVE_CAP);
             let fits = |m: &SpanMap| m.capacity() >= reserve && is_tight(m.capacity(), cells.max(4));
-            let mut map = batch_pool::take(&BLOB_CACHE_POOL, fits).unwrap_or_default();
+            let mut map = pool::take(&BLOB_CACHE_POOL, fits).unwrap_or_default();
             map.reserve(reserve);
             map
         })
@@ -353,7 +353,7 @@ impl Drop for BlobCache {
         if let Some(mut map) = self.map.take() {
             let bytes = map.capacity() * std::mem::size_of::<(SpanKey, usize)>();
             map.clear();
-            batch_pool::recycle(&BLOB_CACHE_POOL, map, bytes);
+            pool::recycle(&BLOB_CACHE_POOL, map, bytes);
         }
     }
 }

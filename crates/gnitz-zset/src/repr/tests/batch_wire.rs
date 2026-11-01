@@ -271,7 +271,7 @@ fn a_viewed_wal_block_reads_as_its_batch() {
         assert_eq!((mb.len(), mb.cap), (rows, rows));
         let want = weighted_rows(&src);
 
-        assert_eq!(weighted_rows(&Batch::from_mem_batch(&mb)), want, "{rows} rows: copy");
+        assert_eq!(weighted_rows(&mb.to_batch()), want, "{rows} rows: copy");
 
         let mut one = Batch::empty_with_schema(&schema);
         one.append_ranges(&mb, &[(0, rows)]);

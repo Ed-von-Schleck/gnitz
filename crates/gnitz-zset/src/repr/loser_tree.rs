@@ -5,7 +5,7 @@
 use std::cell::Cell;
 use std::mem::MaybeUninit;
 
-use super::batch_pool::with_scratch;
+use super::pool::with_scratch;
 
 /// A player: an index into the caller's sources, its current row, and the key
 /// the caller gave that row.

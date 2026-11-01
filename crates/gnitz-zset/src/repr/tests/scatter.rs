@@ -1,5 +1,5 @@
 use super::*;
-use crate::repr::batch_pool::MAX_POOLED_BYTES;
+use crate::repr::pool::MAX_POOLED_BYTES;
 
 /// Carrying two whole heaps charges each source's rows the output leaves out —
 /// survivors interleaved across both — and every kept string reads back.

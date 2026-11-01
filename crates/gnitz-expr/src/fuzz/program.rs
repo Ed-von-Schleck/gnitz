@@ -5,7 +5,7 @@
 //! morsel boundary.
 
 use super::*;
-use crate::batch::MORSEL;
+use crate::morsel::MORSEL;
 use crate::test_support::{filter_verdicts, TestView};
 use crate::{SchemaColumn, SchemaDescriptor};
 use gnitz_wire::{FixedInt, TypeCode};

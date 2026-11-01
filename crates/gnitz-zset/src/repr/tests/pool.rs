@@ -36,7 +36,7 @@ fn full_pool_evicts_its_oldest() {
 }
 
 #[test]
-fn acquire_takes_only_a_buffer_within_twice_the_request() {
+fn with_capacity_takes_only_a_buffer_within_twice_the_request() {
     drain_pool();
     drop(PooledBuf(Vec::with_capacity(4096)));
 

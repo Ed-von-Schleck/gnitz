@@ -5,13 +5,13 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use crate::batch::decode_wal_blocks_into;
+use crate::batch::decode_wal_blocks;
 use crate::client::GnitzClient;
 use crate::connection::{DeltaCursor, RawBlock, ScanReply, SubId, Target};
 use crate::error::ClientError;
 use crate::host::Sent;
 use crate::mirror::PollOutcome;
-use crate::{Schema, ZSetBatch};
+use crate::Schema;
 use gnitz_wire::txn_frame::kept_as;
 
 /// What a sync hands a reader for one of its subscriptions.
@@ -169,8 +169,7 @@ impl GnitzClient {
         readers.retain(|&sub, schema| {
             let taken = synced.clone().and_then(|()| session.take_pushed(sub));
             let result = taken.and_then(|(blocks, cursor)| {
-                let mut batch = ZSetBatch::new(schema);
-                decode_wal_blocks_into(&mut batch, blocks.iter().map(RawBlock::block), schema)?;
+                let batch = decode_wal_blocks(blocks.iter().map(RawBlock::block), schema)?;
                 let schema = Arc::clone(schema);
                 Ok((ScanReply { schema, batch, lsn: None }, cursor))
             });

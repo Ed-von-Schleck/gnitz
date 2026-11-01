@@ -477,7 +477,7 @@ fn retain_ranges_keeps_the_named_runs_in_order() {
 
 /// A rollback drops every row since the mark: a whole row with its spilled string, and a key-only partial row.
 #[test]
-fn rollback_to_drops_the_rows_and_spills_since_the_mark() {
+fn truncate_to_drops_the_rows_and_heap_since_the_mark() {
     let (_, want) = string_batch();
     let mut b = want.clone();
     let m = b.mark();
@@ -486,7 +486,7 @@ fn rollback_to_drops_the_rows_and_spills_since_the_mark() {
         .str_val(GATHER_VALS[0])
         .int_val(0);
     b.pks.push_natives(&[10]);
-    b.rollback_to(m);
+    b.truncate_to(m);
     assert_eq!(b, want);
 }
 

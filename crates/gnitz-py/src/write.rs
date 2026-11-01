@@ -89,7 +89,7 @@ impl PyZSetBatch {
         let PyZSetBatch { batch, writer } = self;
         let batch = Arc::make_mut(batch);
         let mark = batch.mark();
-        body(batch, writer).inspect_err(|_| batch.rollback_to(mark))
+        body(batch, writer).inspect_err(|_| batch.truncate_to(mark))
     }
 
     /// The schema the rows are written in.

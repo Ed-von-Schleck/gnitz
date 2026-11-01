@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::thread::LocalKey;
 
 /// Items retained per pool.
-pub(super) const MAX_POOLED: usize = 64;
+const MAX_POOLED: usize = 64;
 /// The largest item a pool retains, in bytes.
 pub(super) const MAX_POOLED_BYTES: usize = 2 * 1024 * 1024;
 
@@ -116,6 +116,24 @@ impl PooledBuf {
         unsafe { buf.0.set_len(size) };
         buf
     }
+
+    /// Room for `additional` more bytes. A buffer that has to grow moves, bytes
+    /// verbatim, into a pooled one of at least twice its capacity, so repeated
+    /// reserves stay amortised, and the outgrown buffer returns to the pool. Past
+    /// `MAX_POOLED_BYTES` it grows by [`Vec::reserve`].
+    pub(super) fn reserve_pooled(&mut self, additional: usize) {
+        if self.0.capacity() - self.0.len() >= additional {
+            return;
+        }
+        let need = (self.0.len() + additional).max(2 * self.0.capacity());
+        if need > MAX_POOLED_BYTES {
+            self.0.reserve(additional);
+            return;
+        }
+        let mut grown = PooledBuf::with_capacity(need);
+        grown.extend_from_slice(&self.0);
+        *self = grown;
+    }
 }
 
 impl std::ops::Deref for PooledBuf {
@@ -146,9 +164,9 @@ pub(super) fn drain_pool() -> VecDeque<Vec<u8>> {
 }
 
 #[cfg(test)]
-#[path = "tests/batch_pool.rs"]
+#[path = "tests/pool.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "benches/batch_pool.rs"]
+#[path = "benches/pool.rs"]
 mod bench;

@@ -111,7 +111,7 @@ impl Relation {
         };
         // An echo hands back the caller's batch: its copy, tight, is the run.
         let (run, applied) = match echo {
-            true => (effective.to_consolidated(), Some(effective)),
+            true => (effective.clone(), Some(effective)),
             false => (effective, None),
         };
         let capture = feed.as_mut().zip(round);

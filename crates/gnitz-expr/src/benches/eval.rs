@@ -2,8 +2,8 @@
 
 use gnitz_wire::{FixedInt, TypeCode};
 
-use crate::batch::MORSEL;
 use crate::eval::Resolved;
+use crate::morsel::MORSEL;
 use crate::program::{FloatUnaryOp, IntUnaryOp};
 use crate::simd::encode_f64;
 use crate::simd::Level;

@@ -17,7 +17,7 @@ use std::cell::Cell;
 use std::ops::Range;
 
 use super::batch::{range_rows, write_to_batch, Batch, MemBatch};
-use super::batch_pool::{with_scratch, PooledBuf};
+use super::pool::{with_scratch, PooledBuf};
 use super::seek::ColPtr;
 use super::shard::Codebook;
 use super::string_heap::{

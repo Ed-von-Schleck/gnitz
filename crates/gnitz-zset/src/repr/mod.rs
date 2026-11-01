@@ -3,9 +3,9 @@
 //!
 //! - The batch: its region layout (`batch`), the row-at-a-time system-table
 //!   writer over one (`batch_builder`), the direct row writer (`writer`), wire
-//!   serialization (`batch_wire`), the German-string heap (`string_heap`), and
-//!   the thread-local buffer pool batch arenas and send buffers recycle through
-//!   (`batch_pool`).
+//!   serialization (`batch_wire`), and the German-string heap (`string_heap`).
+//! - The thread-local object pools that batch arenas, send buffers, cursor
+//!   vectors and kernel scratch recycle through (`pool`).
 //! - The kernels over batches: the OPK lower-bound search and the column
 //!   pointer it reads through (`seek`), the column-first row copy (`scatter`),
 //!   the run merges and single-batch consolidation (`merge`), and the N-way
@@ -26,10 +26,10 @@
 
 mod batch;
 mod batch_builder;
-mod batch_pool;
 mod batch_wire;
 mod loser_tree;
 mod merge;
+mod pool;
 mod read_cursor;
 mod run;
 mod scatter;
@@ -40,10 +40,9 @@ mod writer;
 
 pub use batch::{Batch, MemBatch};
 pub use batch_builder::BatchBuilder;
-pub use batch_pool::PooledBuf;
-pub(crate) use batch_pool::{vec_bytes, with_scratch};
 pub use batch_wire::WireRows;
 pub use merge::merge_consolidated;
+pub use pool::PooledBuf;
 pub use read_cursor::{
     empty_cursor, from_runs, from_runs_at, from_runs_in_band, BoundedIndexCursor, PkSetGather, ReadCursor, SourceCursor,
 };
@@ -53,6 +52,7 @@ pub use shard::{
 };
 
 pub(crate) use batch::{range_rows, runs_where, runs_where_zip, write_to_batch, RowMark};
+pub(crate) use pool::{vec_bytes, with_scratch};
 pub(crate) use read_cursor::CursorRow;
 pub(crate) use scatter::{copy_runs, materialize_carrying, stride, stride_dispatch, with_picks};
 pub(crate) use seek::pk_group_end;

@@ -380,7 +380,7 @@ impl MapPlan {
         };
         let mb = src.as_mem_batch();
         // Declined, the carry reserves for relocated copies and string emits alike.
-        let heap_at = out.carry_heap(&mb, self.ev.moves().string_slots(), ranges);
+        let heap_at = out.carry_heap(&mb, self.ev.moves().string_slots(), ranges, 0);
         // The reserved rows are uninitialized: `resolve_map` gives every output
         // payload slot one sink, and the writes below cover the PK, weight and
         // null regions.

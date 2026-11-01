@@ -1,4 +1,4 @@
-use super::super::batch_pool::drain_pool;
+use super::super::pool::drain_pool;
 use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
@@ -433,26 +433,26 @@ fn carry_heap_charges_exactly_the_excluded_rows() {
     let mb = src.as_mem_batch();
 
     let mut out = Batch::with_capacity(src.schema(), 8);
-    assert_eq!(out.carry_heap(&mb, mask, &[(0, 2), (3, 8)]), Some(0));
+    assert_eq!(out.carry_heap(&mb, mask, &[(0, 2), (3, 8)], 0), Some(0));
     assert_eq!(out.dead_heap, 5 + 30, "row 2's span and the source's own padding");
 
     let mut short = Batch::with_capacity(src.schema(), 8);
-    assert_eq!(short.carry_heap(&mb, mask, &[(0, 3), (4, 8)]), Some(0));
+    assert_eq!(short.carry_heap(&mb, mask, &[(0, 3), (4, 8)], 0), Some(0));
     assert_eq!(short.dead_heap, 5, "a short row leaves no span behind");
 
     let mut all = Batch::with_capacity(src.schema(), 8);
-    assert_eq!(all.carry_heap(&mb, mask, &[(0, 8)]), Some(0));
+    assert_eq!(all.carry_heap(&mb, mask, &[(0, 8)], 0), Some(0));
     assert_eq!(all.dead_heap, 5, "keeping every row charges only the padding");
 
     for kept in [&[][..], &[(0, 2)][..]] {
         let mut refused = Batch::with_capacity(src.schema(), 8);
-        assert_eq!(refused.carry_heap(&mb, mask, kept), None, "{kept:?}");
+        assert_eq!(refused.carry_heap(&mb, mask, kept, 0), None, "{kept:?}");
         assert_eq!((refused.blob.len(), refused.dead_heap), (0, 0));
     }
 
     let mut no_string = Batch::with_capacity(src.schema(), 8);
     assert_eq!(
-        no_string.carry_heap(&mb, 0, &[(0, 8)]),
+        no_string.carry_heap(&mb, 0, &[(0, 8)], 0),
         None,
         "a copy keeping no string slot"
     );
@@ -461,7 +461,7 @@ fn carry_heap_charges_exactly_the_excluded_rows() {
 /// The room a carry is asked for is reserved past the carried heap, and past
 /// the kept rows' share of it when the carry is refused.
 #[test]
-fn carry_heap_with_room_reserves_past_either_outcome() {
+fn carry_heap_reserves_room_past_either_outcome() {
     let rows: Vec<(u64, i64, &[u8])> = (1..=8).map(|pk| (pk, 1, &[b'x'; 40][..])).collect();
     let src = make_string_batch(&rows);
     let mask = src.schema().string_payload_slots();
@@ -469,12 +469,12 @@ fn carry_heap_with_room_reserves_past_either_outcome() {
     let heap = src.blob().len();
 
     let mut carried = Batch::with_capacity(src.schema(), 8);
-    assert_eq!(carried.carry_heap_with_room(&mb, mask, &[(0, 8)], 1000), Some(0));
+    assert_eq!(carried.carry_heap(&mb, mask, &[(0, 8)], 1000), Some(0));
     assert_eq!(carried.blob.len(), heap);
     assert!(carried.blob.capacity() >= heap + 1000);
 
     let mut refused = Batch::with_capacity(src.schema(), 8);
-    assert_eq!(refused.carry_heap_with_room(&mb, mask, &[(0, 2)], 1000), None);
+    assert_eq!(refused.carry_heap(&mb, mask, &[(0, 2)], 1000), None);
     assert_eq!(refused.blob.len(), 0);
     assert!(refused.blob.capacity() >= heap / 4 + 1000);
 }
@@ -498,11 +498,15 @@ fn carry_heap_charges_the_dropped_slots() {
     let mb = src.as_mem_batch();
 
     let mut keeps_a = Batch::with_capacity(&schema, 4);
-    assert_eq!(keeps_a.carry_heap(&mb, 0b01, &[(0, 4)]), Some(0));
+    assert_eq!(keeps_a.carry_heap(&mb, 0b01, &[(0, 4)], 0), Some(0));
     assert_eq!(keeps_a.dead_heap, 4 * 20, "slot 1's span on every kept row");
 
     let mut keeps_b = Batch::with_capacity(&schema, 4);
-    assert_eq!(keeps_b.carry_heap(&mb, 0b10, &[(0, 4)]), None, "400 of 480 bytes dead");
+    assert_eq!(
+        keeps_b.carry_heap(&mb, 0b10, &[(0, 4)], 0),
+        None,
+        "400 of 480 bytes dead"
+    );
 }
 
 /// Truncation drops the heap appended since the mark along with its rows.
