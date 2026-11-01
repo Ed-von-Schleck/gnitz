@@ -12,6 +12,7 @@ mod ast_util;
 mod bind;
 mod catalog;
 mod ddl;
+mod dialect;
 mod dispatch;
 mod dml;
 mod error;
@@ -36,6 +37,7 @@ pub use ddl::options::{with_option_names, with_options};
 pub use ddl::render::{
     create_index_statements, create_schema_statement, create_table_statement, create_view_statement, qualified_name,
 };
+pub use dialect::GnitzDialect;
 pub use error::GnitzSqlError;
 pub use literal::{parse_bool, place_scaled, Placed};
 pub use names::{
@@ -48,12 +50,11 @@ pub use types::{sql_type_name, type_names};
 
 use gnitz_core::{ClientError, GnitzClient, Planner, PollOutcome, ScanReply, Subscription};
 use sqlparser::ast::Statement;
-use sqlparser::dialect::GenericDialect;
 use std::sync::Arc;
 
 /// The dialect every statement is parsed under. A client that tokenizes text it
 /// will submit uses this one, so it splits statements where the parser does.
-pub const DIALECT: GenericDialect = GenericDialect {};
+pub const DIALECT: GnitzDialect = GnitzDialect;
 
 /// Result of executing a single SQL statement.
 #[derive(Debug)]
