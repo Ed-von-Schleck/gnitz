@@ -171,3 +171,73 @@ fn coded_compaction_bench() {
         i as f64 / TOTAL as f64
     );
 }
+
+/// Compaction of disjoint ascending key blocks, the shape the spills of an
+/// ascending key have, each window taken whole: rows of two i64 payload values
+/// and three long STRING ones, one of them a value repeated across the blocks,
+/// over sources coded under the merge's own codebook; then the same keys as
+/// skeleton shards. With the bytes of the run's heap.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn disjoint_coded_compaction_bench() {
+    const TOTAL: usize = 1 << 18;
+    const SOURCES: usize = 4;
+    let (int, string) = (
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::String, false),
+    );
+    let schema = u64_pk_schema(&[int, string, string, int, string]);
+    let dir = tempfile::tempdir().unwrap();
+    let instructions = Counter::instructions();
+    let per = TOTAL / SOURCES;
+    let batches: Vec<Batch> = (0..SOURCES)
+        .map(|s| {
+            let mut b = BatchBuilder::new(&schema);
+            for k in s * per..(s + 1) * per {
+                b.begin_row(k as u128, 1);
+                b.put_int(mix(k as u64) as u128 >> 40);
+                b.put_string(&prose(k * 3));
+                b.put_string(&prose(k * 3 + 1));
+                b.put_int(k as u128 * 7);
+                b.put_string(&prose(k % 64));
+                b.end_row();
+            }
+            b.finish()
+        })
+        .collect();
+    let book = Codebook::for_batch(None, &batches[0]).unwrap();
+    let inputs: Vec<Rc<MappedShard>> = (0..)
+        .zip(&batches)
+        .map(|(s, b)| map_coded_shard(&dir.path().join(format!("{s}.db")), b, &book))
+        .collect();
+    let mut merge = GuardMerge::begin(inputs.clone(), false).unwrap();
+    let (heap, i) = instructions.measure(|| {
+        let run = black_box(merge.next(None, Some(&book)).unwrap());
+        assert_eq!(run.row_count(), TOTAL);
+        run.batch.blob().len()
+    });
+    println!(
+        "{SOURCES} disjoint coded sources, 2 i64 and 3 long strings: {:.1} instr/row, {heap} heap bytes",
+        i as f64 / TOTAL as f64
+    );
+
+    let skeletons: Vec<Rc<MappedShard>> = (0..)
+        .zip(inputs)
+        .map(|(s, input)| {
+            let run = GuardMerge::begin(vec![input], true).unwrap().next(None, None).unwrap();
+            let path = dir.path().join(format!("skeleton_{s}.db"));
+            let path = path.to_str().unwrap();
+            (run.batch
+                .write_shard_over(&run.batch, path, ShardWriteOpts::default(), true))
+            .unwrap();
+            Rc::new(MappedShard::open(path, &schema).unwrap())
+        })
+        .collect();
+    let mut merge = GuardMerge::begin(skeletons, false).unwrap();
+    let (rows, i) = instructions.measure(|| black_box(merge.next(None, Some(&book)).unwrap()).row_count());
+    assert_eq!(rows, TOTAL);
+    println!(
+        "{SOURCES} disjoint skeleton sources: {:.1} instr/row",
+        i as f64 / TOTAL as f64
+    );
+}

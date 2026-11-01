@@ -148,24 +148,44 @@ pub(crate) fn row_long_bytes<S: RowSource>(src: &S, mask: u64, row: usize) -> us
         .sum()
 }
 
+/// Where a long value of a German-string cell copied verbatim from a source
+/// lands in the destination heap.
+#[derive(Clone, Copy)]
+pub(crate) enum StringDest<'b> {
+    /// The source heap was carried whole onto the destination's at this base:
+    /// each cell's offset is shifted by it.
+    Carried(usize),
+    /// Each value is placed on its own: decoded into a plain heap, or coded
+    /// under the codebook where one is given (see [`Codebook::append`]).
+    Placed(Option<&'b Codebook>),
+}
+
+impl From<Option<usize>> for StringDest<'_> {
+    /// A carried plain heap's base, else each value relocated as it is.
+    fn from(heap_at: Option<usize>) -> Self {
+        heap_at.map_or(StringDest::Placed(None), StringDest::Carried)
+    }
+}
+
 /// Rebase `cells`, whole German-string cells copied verbatim from a source
-/// whose heap is `src`, onto the destination heap: shifted in bulk onto `src`
-/// carried there at `heap_at`, or each relocated into `dst_blob`, under `cache`
-/// when there is one. Only a plain heap is carried.
+/// whose heap is `src`, onto the destination heap `dst_blob` as `dest` says,
+/// under `cache` when there is one.
 #[inline]
 pub(super) fn rebase_string_cells(
     cells: &mut [u8],
     src: Heap<'_>,
     dst_blob: &mut Vec<u8>,
-    heap_at: Option<usize>,
-    cache: Option<&mut BlobCache>,
+    dest: StringDest<'_>,
+    mut cache: Option<&mut BlobCache>,
 ) {
-    match heap_at {
-        Some(base) => {
-            debug_assert!(src.plain().is_some(), "only a plain heap is carried");
-            gnitz_wire::shift_german_string_heaps(cells, base)
+    match dest {
+        StringDest::Carried(base) => gnitz_wire::shift_german_string_heaps(cells, base),
+        StringDest::Placed(None) => relocate_cells(cells.as_chunks_mut::<16>().0, src, dst_blob, cache),
+        StringDest::Placed(book) => {
+            for cell in cells.as_chunks_mut::<16>().0 {
+                rebase_string_cell(cell, src, dst_blob, StringDest::Placed(book), cache.as_deref_mut());
+            }
         }
-        None => relocate_cells(cells.as_chunks_mut::<16>().0, src, dst_blob, cache),
     }
 }
 
@@ -176,26 +196,16 @@ pub(super) fn rebase_string_cell(
     cell: &mut [u8; 16],
     src: Heap<'_>,
     dst_blob: &mut Vec<u8>,
-    heap_at: Option<usize>,
+    dest: StringDest<'_>,
     cache: Option<&mut BlobCache>,
 ) {
-    match heap_at {
-        Some(base) => gnitz_wire::shift_german_string_heaps(cell, base),
-        None => *cell = relocated_cell(cell, src, dst_blob, cache),
+    match dest {
+        StringDest::Carried(base) => gnitz_wire::shift_german_string_heaps(cell, base),
+        StringDest::Placed(None) => *cell = relocated_cell(cell, src, dst_blob, cache),
+        StringDest::Placed(book) => {
+            *cell = gnitz_wire::relocate_german_value_with(cell, src, |value| place_value(value, dst_blob, book, cache))
+        }
     }
-}
-
-/// [`rebase_string_cell`] onto `dst_blob`, a heap coded under `book`; see
-/// [`Codebook::append`].
-#[inline]
-pub(super) fn recode_string_cell(
-    cell: &mut [u8; 16],
-    src: Heap<'_>,
-    dst_blob: &mut Vec<u8>,
-    book: &Codebook,
-    cache: Option<&mut BlobCache>,
-) {
-    *cell = gnitz_wire::relocate_german_value_with(cell, src, |value| place_value(value, dst_blob, Some(book), cache));
 }
 
 /// Relocate each of `cells`. Out of line: a caller's loop over fixed-width

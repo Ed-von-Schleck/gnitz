@@ -502,7 +502,13 @@ impl<'w> MergeSink<'w> {
         for pi in gnitz_wire::BitIter(self.string_slots) {
             let cells = &mut self.regions[REG_PAYLOAD_START + pi].dst[at * 16..(at + n) * 16];
             let (blob, heap_at) = (self.srcs[side].blob, self.heap_at[side]);
-            rebase_string_cells(cells, Heap::Plain(blob), self.blob, heap_at, self.cache.as_deref_mut());
+            rebase_string_cells(
+                cells,
+                Heap::Plain(blob),
+                self.blob,
+                heap_at.into(),
+                self.cache.as_deref_mut(),
+            );
         }
         self.rows += n;
     }

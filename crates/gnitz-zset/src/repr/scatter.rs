@@ -21,7 +21,7 @@ use super::pool::{with_scratch, PooledBuf};
 use super::seek::ColPtr;
 use super::shard::Codebook;
 use super::string_heap::{
-    carried_dead, long_bytes, prorated_blob_cap, rebase_string_cell, recode_string_cell, relocated_cell, row_long_bytes,
+    carried_dead, long_bytes, prorated_blob_cap, rebase_string_cell, relocated_cell, row_long_bytes, StringDest,
 };
 use super::writer::DirectWriter;
 use crate::schema::SchemaDescriptor;
@@ -142,7 +142,7 @@ pub(crate) fn copy_ranges(
         }
     }
     for pi in gnitz_wire::BitIter(schema.string_payload_slots()) {
-        writer.rebase_string_col(pi, Heap::Plain(src.blob), heap_at);
+        writer.rebase_string_col(pi, Heap::Plain(src.blob), heap_at.into());
     }
 }
 
@@ -409,11 +409,17 @@ fn scatter_unified_sources(
             // Matched once, so the per-cell loop tests for no codebook.
             match codebook {
                 None => picked.for_each(|(cell, src)| {
-                    rebase_string_cell(cell, src.heap, blob, src.heap_at, cache.as_deref_mut())
+                    rebase_string_cell(cell, src.heap, blob, src.heap_at.into(), cache.as_deref_mut())
                 }),
-                Some(book) => {
-                    picked.for_each(|(cell, src)| recode_string_cell(cell, src.heap, blob, book, cache.as_deref_mut()))
-                }
+                Some(book) => picked.for_each(|(cell, src)| {
+                    rebase_string_cell(
+                        cell,
+                        src.heap,
+                        blob,
+                        StringDest::Placed(Some(book)),
+                        cache.as_deref_mut(),
+                    )
+                }),
             }
         } else {
             gnitz_wire::by_cell_width!(cs, |T| gather_unified_col::<{ size_of::<T>() }>(

@@ -725,7 +725,7 @@ impl Batch {
             for (pi, col) in in_schema.payload_columns() {
                 w.col_mut(first_slot + pi).copy_from_slice(self.col_data(pi));
                 if col.type_code.is_german_string() {
-                    w.rebase_string_col(first_slot + pi, Heap::Plain(&self.blob), heap_at);
+                    w.rebase_string_col(first_slot + pi, Heap::Plain(&self.blob), heap_at.into());
                 }
             }
             rest(w);

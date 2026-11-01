@@ -451,7 +451,7 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
                 delta_runs(pairs)
             );
             if col.type_code.is_german_string() {
-                w.rebase_string_col(slot, Heap::Plain(delta.blob()), heap_at);
+                w.rebase_string_col(slot, Heap::Plain(delta.blob()), heap_at.into());
             }
         }
 

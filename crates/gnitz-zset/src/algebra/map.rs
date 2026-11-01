@@ -52,7 +52,7 @@ enum PkSource {
 fn rebase_copied_strings(copies: &[ColCopy], output: &mut DirectWriter<'_>, src_blob: &[u8], heap_at: Option<usize>) {
     for c in copies {
         if matches!(c.src, ColumnLocator::Payload { type_code, .. } if type_code.is_german_string()) {
-            output.rebase_string_col(c.slot, gnitz_wire::Heap::Plain(src_blob), heap_at);
+            output.rebase_string_col(c.slot, gnitz_wire::Heap::Plain(src_blob), heap_at.into());
         }
     }
 }

@@ -1,14 +1,14 @@
 //! Shard compaction: the N-way [`run_merge`] of sorted shard files, by (PK,
 //! payload) or, for a skeleton merge, by PK alone, one output guard at a time;
-//! windows that ascend without overlap are taken in key order unmerged, a
-//! plain run's decoded straight into it.
+//! windows that ascend without overlap are taken in key order unmerged, each
+//! decoded straight into the run.
 
 use super::codebook::Codebook;
 use super::file::ShardWriteOpts;
 use super::reader::MappedShard;
 use crate::repr::merge::{disjoint_order, run_merge};
-use crate::repr::scatter::{Pick, UnifiedSet};
-use crate::repr::string_heap::{long_bytes, prorated_blob_cap};
+use crate::repr::scatter::UnifiedSet;
+use crate::repr::string_heap::{long_bytes, prorated_blob_cap, BlobCache, StringDest};
 use crate::repr::{Batch, StorageError};
 use crate::schema::{compare_pk_ordering, SchemaDescriptor};
 use gnitz_wire::RowSource;
@@ -36,6 +36,16 @@ pub struct GuardRun<'a> {
 }
 
 impl<'a> GuardRun<'a> {
+    /// The run of `batch`, whose rows are `schema`'s, its long values coded under
+    /// `codebook` where given.
+    pub(super) fn new(batch: Batch, schema: &SchemaDescriptor, codebook: Option<&'a Codebook>, skeleton: bool) -> Self {
+        let coded = codebook.map(|book| {
+            let mask = schema.string_payload_slots();
+            (book, long_bytes(&batch.as_mem_batch(), mask, 0..batch.len()))
+        });
+        GuardRun { batch, coded, skeleton }
+    }
+
     /// The run's rows, where its heap holds its values verbatim.
     pub fn plain(&self) -> Option<&Batch> {
         self.coded.is_none().then_some(&self.batch)
@@ -150,32 +160,27 @@ impl GuardMerge {
             .collect();
         // A skeleton run holds no string.
         let codebook = codebook.filter(|_| !skeleton);
-        let order = self.in_order(&windows);
-        if let (Some(order), None, false) = (&order, codebook, skeleton) {
-            return self.concat(&windows, order);
-        }
-        // The merge compares every key of a window and the scatter copies it.
-        let shards: Vec<_> = self
-            .shards
-            .iter()
-            .zip(&windows)
+        let batch = match self.in_order(&windows) {
+            Some(order) => self.concat(&windows, &order, codebook)?,
+            None => self.merged(windows, codebook)?,
+        };
+        Some(GuardRun::new(batch, out_schema, codebook, skeleton))
+    }
+
+    /// The run of `windows`, one per shard, merged: every key compared and
+    /// each survivor copied, its long values coded under `codebook` where
+    /// given. `None` when nothing survives.
+    fn merged(&self, windows: Vec<Range<usize>>, codebook: Option<&Codebook>) -> Option<Batch> {
+        let shards: Vec<_> = (self.shards.iter().zip(&windows))
             .map(|(s, w)| s.window(w.clone()))
             .collect();
-        let survivors = match order {
-            Some(order) => self.picks(&windows, &order),
-            None => run_merge(&shards, out_schema, windows.iter().cloned()),
-        };
+        let survivors = run_merge(&shards, &self.out_schema, windows.iter().cloned());
         if survivors.is_empty() {
             return None;
         }
-        let batch = UnifiedSet::with(&shards, out_schema, windows, |set| {
+        Some(UnifiedSet::with(&shards, &self.out_schema, windows, |set| {
             set.materialize(&survivors, codebook)
-        });
-        let coded = codebook.map(|book| {
-            let mask = out_schema.string_payload_slots();
-            (book, long_bytes(&batch.as_mem_batch(), mask, 0..batch.len()))
-        });
-        Some(GuardRun { batch, coded, skeleton })
+        }))
     }
 
     /// The shards holding rows in `windows`, in the [`disjoint_order`] of their
@@ -192,37 +197,46 @@ impl GuardMerge {
         )
     }
 
-    /// Every row of the windows of the shards in `order`, at its own weight.
-    ///
-    /// Out of line: inlined into `next`, it costs that merge loop instructions.
-    #[inline(never)]
-    fn picks(&self, windows: &[Range<usize>], order: &[usize]) -> Vec<Pick> {
-        (order.iter())
-            .flat_map(|&i| windows[i].clone().map(move |r| (i, r)))
-            .map(|(i, r)| (i as u32, r as u32, self.shards[i].get_weight(r)))
-            .collect()
-    }
-
-    /// The plain run of the windows of the shards [`Self::in_order`] put in
-    /// `order`: each window's rows decoded straight into it, one after the
-    /// other. `None` when every window is empty.
-    fn concat<'a>(&self, windows: &[Range<usize>], order: &[usize]) -> Option<GuardRun<'a>> {
+    /// The run of the windows of the shards [`Self::in_order`] put in `order`:
+    /// each window's rows decoded straight into it, one after the other, its
+    /// long values coded under `codebook` where given, under one dedup cache.
+    /// `None` when every window is empty.
+    fn concat(&self, windows: &[Range<usize>], order: &[usize], codebook: Option<&Codebook>) -> Option<Batch> {
         let rows: usize = order.iter().map(|&i| windows[i].len()).sum();
         if rows == 0 {
             return None;
         }
-        let mut batch = Batch::with_capacity(&self.out_schema, rows);
+        let out_schema = &self.out_schema;
+        let mut batch = Batch::with_capacity(out_schema, rows);
         let shards = order.iter().map(|&i| (&*self.shards[i], windows[i].clone()));
-        batch.reserve_blob(
-            (shards.clone())
-                .map(|(s, w)| prorated_blob_cap(s.heap().plain_len(), s.row_count(), w.len()))
-                .sum(),
-        );
-        for (s, w) in shards {
-            batch.write_rows(w.len(), |dw| s.decode_rows_into(w, dw, false));
+        if out_schema.has_german_string() {
+            batch.reserve_blob(
+                (shards.clone())
+                    .map(|(s, w)| prorated_blob_cap(s.heap().plain_len(), s.row_count(), w.len()))
+                    .sum(),
+            );
         }
-        batch.certify_consolidated();
-        Some(GuardRun { batch, coded: None, skeleton: false })
+        let mut cache = BlobCache::for_rows(out_schema, rows);
+        for (s, w) in shards {
+            batch.write_at_most(w.len(), &mut cache, |dw| {
+                // A whole shard coded under the run's own table is carried: its
+                // codes are already the run's.
+                let dest = match (s.heap(), codebook) {
+                    (Heap::Coded(c), Some(book)) if w.len() == s.row_count() && c.table.digest() == book.digest() => {
+                        StringDest::Carried(dw.adopt_heap(c.codes))
+                    }
+                    _ => StringDest::Placed(codebook),
+                };
+                s.decode_rows_into(w.clone(), dw, dest);
+                (w.len(), ())
+            });
+        }
+        // A coded run's heap holds codes, which compare as content only through
+        // the codebook, so it is left unflagged, as the merge path leaves its run.
+        if codebook.is_none() {
+            batch.certify_consolidated();
+        }
+        Some(batch)
     }
 }
 
