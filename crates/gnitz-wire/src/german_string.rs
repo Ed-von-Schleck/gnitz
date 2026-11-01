@@ -53,17 +53,18 @@ pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
 /// Shift every **long** cell's heap offset in `cells`, a run of whole 16-byte
 /// cells, by `delta` — what a concatenating appender owes each cell once the
 /// source arena has been appended onto the destination's at `delta`. A short
-/// cell carries no offset and is left alone.
+/// cell carries no offset: its bytes 8..16 are rewritten with `+ 0`, so the
+/// loop chooses the addend per cell instead of branching on it.
 #[inline]
 pub fn shift_german_string_heaps(cells: &mut [u8], delta: usize) {
     if delta == 0 {
         return;
     }
     for cell in cells.as_chunks_mut::<16>().0 {
-        if german_string_inline(cell).is_none() {
-            let off = read_u64_le(cell, 8) + delta as u64;
-            write_u64_le(cell, 8, off);
-        }
+        let long = read_u32_le(cell, 0) as usize > SHORT_STRING_THRESHOLD;
+        let add = std::hint::select_unpredictable(long, delta as u64, 0);
+        let off = read_u64_le(cell, 8).wrapping_add(add);
+        write_u64_le(cell, 8, off);
     }
 }
 
@@ -304,3 +305,7 @@ fn compare_decoded(a: &[u8; 16], heap_a: Heap<'_>, b: &[u8; 16], heap_b: Heap<'_
 #[cfg(test)]
 #[path = "tests/german_string.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/german_string.rs"]
+mod bench;

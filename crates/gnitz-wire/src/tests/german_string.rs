@@ -55,6 +55,28 @@ fn roundtrip_across_length_boundaries() {
     }
 }
 
+/// A shift adds `delta` to a long cell's offset and leaves every byte of a
+/// short cell as it was, its pad bytes included, at every length around the
+/// threshold.
+#[test]
+fn shift_touches_only_long_offsets() {
+    let mut cells = Vec::new();
+    for len in 0..=SHORT_STRING_THRESHOLD as u32 + 3 {
+        let mut cell = [0xA5u8; 16];
+        write_u32_le(&mut cell, 0, len);
+        cells.extend_from_slice(&cell);
+    }
+    let before = cells.clone();
+    shift_german_string_heaps(&mut cells, 3);
+    for (a, b) in before.as_chunks::<16>().0.iter().zip(cells.as_chunks::<16>().0) {
+        let mut want = *a;
+        if read_u32_le(a, 0) as usize > SHORT_STRING_THRESHOLD {
+            write_u64_le(&mut want, 8, read_u64_le(a, 8) + 3);
+        }
+        assert_eq!(*b, want, "length {}", read_u32_le(a, 0));
+    }
+}
+
 /// A relocated cell is rebuilt in canonical form: a long cell overrunning its
 /// heap becomes the empty string, its prefix zeroed with its length, and a
 /// skewed short-cell pad does not survive — either left as it was would order
