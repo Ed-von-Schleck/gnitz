@@ -244,6 +244,12 @@ pub(crate) trait Reg: Copy {
     /// The value after `x`; `None` where `x` leaves it as it is.
     fn absorb(self, x: Self::In) -> Option<Self>;
 
+    /// The value after each of `xs` in turn, a `None` leaving it as it is.
+    #[inline(always)]
+    fn fold_run(self, xs: impl Iterator<Item = Option<Self::In>>) -> Self {
+        xs.fold(self, |r, x| x.and_then(|x| r.absorb(x)).unwrap_or(r))
+    }
+
     /// Group `g` after `x`.
     #[inline(always)]
     fn step(vals: &mut Slots, g: usize, x: Self::In) {
@@ -311,6 +317,22 @@ impl Reg for Least {
     fn absorb(self, image: u64) -> Option<Self> {
         (!self.1 || image < self.0).then_some(Least(image, true))
     }
+
+    /// The least of the run with no branch per row, so it vectorizes; `any`
+    /// keeps a real image of `u64::MAX` apart from no image at all.
+    #[inline(always)]
+    fn fold_run(self, xs: impl Iterator<Item = Option<u64>>) -> Self {
+        let (mut least, mut any) = (u64::MAX, false);
+        for x in xs {
+            any |= x.is_some();
+            least = least.min(x.unwrap_or(u64::MAX));
+        }
+        match (any, self.1) {
+            (false, _) => self,
+            (true, false) => Least(least, true),
+            (true, true) => Least(self.0.min(least), true),
+        }
+    }
 }
 
 /// Which group each row of a fold belongs to.
@@ -330,10 +352,7 @@ pub(crate) trait Groups: Copy {
         contribution: impl Fn(V) -> Option<R::In>,
     ) {
         let g = self.of(range, at.start);
-        rows.fold(R::load(vals, g), |r, v| {
-            contribution(v).and_then(|x| r.absorb(x)).unwrap_or(r)
-        })
-        .store(vals, g);
+        R::load(vals, g).fold_run(rows.map(contribution)).store(vals, g);
     }
 }
 

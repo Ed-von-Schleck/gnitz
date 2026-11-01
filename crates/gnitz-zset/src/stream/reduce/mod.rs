@@ -17,7 +17,7 @@ use std::cmp::Ordering;
 
 use crate::algebra::{ground_pk, vec_bytes, Agg, AggValues, GroupScratch, RangeGroups, ReduceShape};
 use crate::repr::{Batch, MemBatch, RowMark};
-use crate::schema::{Generic, PayloadOrder, SchemaDescriptor};
+use crate::schema::{with_payload_cmp, PayloadOrder, SchemaDescriptor};
 use crate::stream::OpenAt;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
@@ -301,7 +301,8 @@ fn emit_groups(
     // A group emits at most its retraction and its new row.
     let mut out = Batch::with_capacity(&shape.output_schema, 2 * groups);
 
-    for (first, g, id) in order {
+    // One copy of the loop per payload order, so no group dispatches on it.
+    with_payload_cmp!(shape.output_schema, |cmp| for (first, g, id) in order {
         let out_pk = key.out_pk_with(delta, first, id);
         let out_pk_bytes: &[u8] = out_pk.bytes();
         let probed = value_index.as_mut().filter(|_| probes[g]);
@@ -329,8 +330,8 @@ fn emit_groups(
             // An emptied global aggregate still publishes one row.
             out.append_batch(v0);
         }
-        consolidate_group(&mut out, mark);
-    }
+        consolidate_group(&mut out, mark, cmp);
+    });
 
     out.certify_consolidated();
     out
@@ -338,13 +339,14 @@ fn emit_groups(
 
 /// Consolidate the rows one group wrote since `mark`: at most a retraction and
 /// a new row, under one PK.
-fn consolidate_group(out: &mut Batch, mark: RowMark) {
+#[inline(always)]
+fn consolidate_group(out: &mut Batch, mark: RowMark, cmp: impl PayloadOrder) {
     if out.rows_since(mark) != 2 {
         return;
     }
     let row0 = out.len() - 2;
     let omb = out.as_mem_batch();
-    match Generic.compare(out.schema(), &omb, row0, &omb, row0 + 1) {
+    match cmp.compare(out.schema(), &omb, row0, &omb, row0 + 1) {
         Ordering::Equal => out.truncate_to(mark),
         Ordering::Greater => out.swap_rows(row0, row0 + 1),
         Ordering::Less => {}
