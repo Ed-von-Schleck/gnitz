@@ -3,6 +3,7 @@
 //! operator is driven epoch by epoch through the production populate and
 //! integrate paths.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
@@ -218,7 +219,7 @@ proptest! {
         let mut keep = crate::test_support::cmp_all(&[(CmpOp::Ge, 3, lo)]).resolve_filter(&schema()).unwrap();
         let scan: Vec<(Row, i64)> = scan.into_iter().collect();
         for rows in scan.chunks(chunk) {
-            fold.push(&batch(rows), &mut keep).unwrap();
+            fold.push(Cow::Owned(batch(rows)), &mut keep).unwrap();
         }
         let folded: BTreeMap<Row, i64> = scan.iter().filter(|(r, _)| r.grp >= lo).copied().collect();
         prop_assert_eq!(
@@ -270,8 +271,8 @@ fn the_adhoc_fold_refuses_a_group_past_its_cap() {
         )
     };
     let mut all = RowFilter::for_read(&[], None, &schema()).unwrap();
-    fold.push(&rows(&[7, 8, 7]), &mut all).unwrap();
-    let err = fold.push(&rows(&[8, 9]), &mut all).unwrap_err();
+    fold.push(Cow::Owned(rows(&[7, 8, 7])), &mut all).unwrap();
+    let err = fold.push(Cow::Owned(rows(&[8, 9])), &mut all).unwrap_err();
     assert!(err.contains("exceeds 2 distinct groups"), "{err}");
 }
 
@@ -415,7 +416,7 @@ fn a_float_sum_weighs_each_value() {
 
         let mut fold = fold_sink(group_cols, aggs.to_vec(), usize::MAX).unwrap();
         let mut all = RowFilter::for_read(&[], None, &schema()).unwrap();
-        fold.push(&batch(&rows), &mut all).unwrap();
+        fold.push(Cow::Owned(batch(&rows)), &mut all).unwrap();
         assert_eq!(
             output_rows(&fold.finish(), group_cols),
             want,
@@ -524,7 +525,7 @@ fn a_float_sum_is_carried_in_f64() {
         );
         let mut fold = fold_sink(group_cols, aggs.to_vec(), usize::MAX).unwrap();
         let mut all = RowFilter::for_read(&[], None, &schema()).unwrap();
-        fold.push(&batch(&rows), &mut all).unwrap();
+        fold.push(Cow::Owned(batch(&rows)), &mut all).unwrap();
         assert_eq!(read(&fold.finish()), (want_f, want_x), "ad hoc, group {group_cols:?}");
     }
 }

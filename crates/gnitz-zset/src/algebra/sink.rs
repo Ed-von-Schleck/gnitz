@@ -1,6 +1,8 @@
 //! [`SinkPlan`]: the sink of an ad-hoc read over one worker's surviving rows —
 //! the map, then a forward, a prefix cut, a top-k or a fold.
 
+use std::borrow::Cow;
+
 use gnitz_expr::{order_locators, Lead, OrderLocator, RowFilter, RowRanking};
 
 use gnitz_wire::{ReadSink, RowsCut, SinkKind};
@@ -106,7 +108,7 @@ impl SinkPlan {
     /// Take the rows of one source chunk `filter` keeps, cutting at the row a
     /// window ends in. `Ok(true)` once the sink needs no more rows; `Err` past a
     /// fold's group cap.
-    pub fn push(&mut self, chunk: &Batch, filter: &mut RowFilter) -> Result<bool, String> {
+    pub fn push(&mut self, chunk: Cow<'_, Batch>, filter: &mut RowFilter) -> Result<bool, String> {
         let SinkPlan { map, kind } = self;
         let ranges = filter.ranges(&chunk.as_mem_batch());
         let map = map.as_mut();
@@ -126,11 +128,12 @@ impl SinkPlan {
                         *left -= range_sum;
                         continue;
                     }
-                    let mut end = *s;
-                    while *left > 0 && end < *e {
-                        *left -= mb.get_weight(end);
+                    let (mut end, mut l) = (*s, *left);
+                    while l > 0 && end < *e {
+                        l -= mb.get_weight(end);
                         end += 1;
                     }
+                    *left = l;
                     *e = end;
                     taken = i + 1;
                     break;
@@ -156,12 +159,12 @@ impl SinkPlan {
                 match map {
                     Some(plan) => {
                         mapped.clear();
-                        plan.append_map_ranges(chunk, mapped, ranges);
+                        plan.append_map_ranges(&chunk, mapped, ranges);
                         // The map already dropped the non-survivors, so every
                         // row of `mapped` folds.
                         fold.fold_ranges(mapped, &[(0, mapped.len())])?;
                     }
-                    None => fold.fold_ranges(chunk, ranges)?,
+                    None => fold.fold_ranges(&chunk, ranges)?,
                 }
                 Ok(false)
             }
@@ -220,10 +223,16 @@ impl TopK {
 }
 
 /// Append one chunk's survivor ranges onto the keeper, through the map when there
-/// is one.
-fn append_survivors(map: Option<&mut MapPlan>, chunk: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
+/// is one. An unmapped chunk whose every row survives into an empty keeper
+/// becomes the keeper, moved when it is owned.
+fn append_survivors(map: Option<&mut MapPlan>, chunk: Cow<'_, Batch>, keeper: &mut Batch, ranges: &[(usize, usize)]) {
     match map {
+        None if keeper.is_empty() && *ranges == [(0, chunk.len())] => {
+            let mut whole = chunk.into_owned();
+            whole.set_schema(keeper.schema());
+            *keeper = whole;
+        }
         None => keeper.append_ranges(&chunk.as_mem_batch(), ranges),
-        Some(p) => p.append_map_ranges(chunk, keeper, ranges),
+        Some(p) => p.append_map_ranges(&chunk, keeper, ranges),
     }
 }

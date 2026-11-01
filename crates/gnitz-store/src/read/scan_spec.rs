@@ -3,6 +3,8 @@
 //! view's rows hydrate chunk by chunk as the sink drains them.
 use gnitz_wire::{PkKeys, ReadSpec};
 
+use std::borrow::Cow;
+
 use super::{check_layout, ReadRows};
 use crate::relation::{Cut, RelationRegistry};
 use gnitz_expr::RowFilter;
@@ -55,7 +57,7 @@ impl RelationRegistry {
             let Some(chunk) = source.drain_hydrated(drain_rows, &mut hydrate_chunk)? else {
                 break;
             };
-            if sink.push(&chunk, &mut filter)? {
+            if sink.push(Cow::Owned(chunk), &mut filter)? {
                 break;
             }
         }

@@ -147,6 +147,19 @@ fn scan_spec_bench() {
     let key_desc = rows_spec(None, cut(100, order_by(0, true)));
     cell("ORDER BY id DESC LIMIT 100", &r, key_desc, 100, ROWS);
 
+    // Unfiltered key ranges: every drained row survives.
+    for width in [1, 64, 4096, 65_536] {
+        let id = |v: u64| gnitz_wire::key_image(TypeCode::U64, v as u128);
+        let bound = col_range(0, id(0), id(width - 1));
+        cell(
+            &format!("key range, {width} rows"),
+            &r,
+            ReadSpec::all_rows(bound),
+            width,
+            width,
+        );
+    }
+
     // The widest range of `c2` the index is walked for, and one row wider,
     // which scans the table under the range.
     for (label, width, walks) in [

@@ -4,6 +4,7 @@
 use gnitz_expr::RowFilter;
 use gnitz_wire::{ReadBound, ReadSpec, SinkKind, WireFault, WireStatus};
 
+use std::borrow::Cow;
 use std::rc::Rc;
 
 use super::{check_layout, check_stride, ReadRows};
@@ -63,7 +64,7 @@ impl RelationRegistry {
         let mut filter =
             RowFilter::for_read(&predicate, bound.range(), &view).map_err(|e| format!("delta_read: {e}"))?;
         let chunk_rows = self.config.scan_chunk_rows;
-        let mut read = |rows: &Batch| plan.push(rows, &mut filter).map(drop);
+        let mut read = |rows: Cow<'_, Batch>| plan.push(rows, &mut filter).map(drop);
         if let ReadBound::PkSet(keys) = &bound {
             check_stride("delta_read", id, keys, view.pk_stride())?;
             // The keyed rows of every round, read a chunk at a time.
@@ -73,12 +74,12 @@ impl RelationRegistry {
                 round.key_ranges(keys.iter(), &mut keyed);
                 chunk.append_ranges(&round.as_mem_batch(), &keyed);
                 if chunk.len() >= chunk_rows {
-                    read(&chunk)?;
+                    read(Cow::Borrowed(&chunk))?;
                     chunk.clear();
                 }
             }
             if !chunk.is_empty() {
-                read(&chunk)?;
+                read(Cow::Owned(chunk))?;
             }
         } else {
             // The spec runs on each round where it lies; a run of small rounds
@@ -93,8 +94,11 @@ impl RelationRegistry {
                     j += 1;
                 }
                 match &rounds[i..j] {
-                    [round] => read(round)?,
-                    chunk => read(&Batch::concat(&view, chunk.iter().map(|round| round.as_mem_batch())))?,
+                    [round] => read(Cow::Borrowed(round))?,
+                    chunk => read(Cow::Owned(Batch::concat(
+                        &view,
+                        chunk.iter().map(|round| round.as_mem_batch()),
+                    )))?,
                 }
                 i = j;
             }
