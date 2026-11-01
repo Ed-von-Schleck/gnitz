@@ -17,6 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use gnitz_foundation::log::READY_LINE;
+use gnitz_foundation::process::{await_log, default_env, die_with_parent, log_tail};
 use tempfile::TempDir;
 
 /// The server's binary name.
@@ -35,7 +36,7 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 /// process group is SIGKILLed.
 const STOP_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// How often a boot or a stop is checked on.
+/// How often a stop is checked on.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// The lines of a server's log an error quotes.
@@ -48,6 +49,8 @@ pub struct LocalServer {
     scratch: Option<TempDir>,
     socket: PathBuf,
     data_dir: PathBuf,
+    /// The server's stderr, in the scratch directory.
+    log: PathBuf,
 }
 
 impl LocalServer {
@@ -82,7 +85,8 @@ impl LocalServer {
         // A group of its own: a terminal's Ctrl-C reaches this process alone,
         // which decides whether it stops the server.
         cmd.process_group(0);
-        stop_with_parent(&mut cmd);
+        // SIGTERMed when the thread that started it ends without stopping it.
+        die_with_parent(&mut cmd, libc::SIGTERM);
         let child = cmd.spawn().map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
 
         let mut server = LocalServer {
@@ -90,6 +94,7 @@ impl LocalServer {
             scratch: Some(scratch),
             socket,
             data_dir,
+            log: log_path,
         };
         server.await_ready()?;
         Ok(server)
@@ -120,7 +125,7 @@ impl LocalServer {
         let report = match self.child.try_wait() {
             Ok(Some(status)) => Err(format!(
                 "{SERVER} exited ({status}) while it served:\n{}",
-                self.log_tail()
+                log_tail(&self.log, LOG_TAIL_LINES)
             )),
             _ => {
                 self.terminate();
@@ -150,41 +155,14 @@ impl LocalServer {
         }
     }
 
-    fn log(&self) -> String {
-        let dir = self
-            .scratch
-            .as_ref()
-            .expect("the log is read before the stop removes it");
-        fs::read_to_string(dir.path().join("server.log")).unwrap_or_default()
-    }
-
-    fn log_tail(&self) -> String {
-        let log = self.log();
-        let lines: Vec<&str> = log.lines().collect();
-        lines[lines.len().saturating_sub(LOG_TAIL_LINES)..].join("\n")
-    }
-
     fn await_ready(&mut self) -> Result<(), String> {
-        let deadline = Instant::now() + BOOT_TIMEOUT;
-        loop {
-            // The status before the log: a server that has exited has written
-            // all of its log, so one that served before exiting is read as served.
-            let status = self.child.try_wait();
-            if self.log().contains(READY_LINE) {
-                return Ok(());
-            }
-            let why = match status {
-                Ok(Some(status)) => format!("exited ({status}) before it served"),
-                _ if Instant::now() >= deadline => format!("did not serve within {BOOT_TIMEOUT:?}"),
-                _ => {
-                    std::thread::sleep(POLL_INTERVAL);
-                    continue;
-                }
-            };
-            let err = format!("{SERVER} {why}:\n{}", self.log_tail());
-            let _ = self.stop();
-            return Err(err);
-        }
+        let Err(why) = await_log(&mut self.child, &self.log, 0, BOOT_TIMEOUT, LOG_TAIL_LINES, |log| {
+            log.contains(READY_LINE).then_some(())
+        }) else {
+            return Ok(());
+        };
+        let _ = self.stop();
+        Err(format!("{SERVER} failed before it served: {why}"))
     }
 }
 
@@ -195,37 +173,6 @@ impl Drop for LocalServer {
         }
     }
 }
-
-/// Set `key` for the server unless this process's environment sets it.
-fn default_env(cmd: &mut Command, key: &str, value: &str) {
-    if env::var_os(key).is_none() {
-        cmd.env(key, value);
-    }
-}
-
-/// Have the server SIGTERMed when the thread that started it ends without
-/// stopping it.
-#[cfg(target_os = "linux")]
-fn stop_with_parent(cmd: &mut Command) {
-    let parent = std::process::id() as libc::pid_t;
-    // SAFETY: `prctl` and `getppid` are async-signal-safe, and the closure
-    // allocates nothing.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // The parent died between the fork and the prctl: no signal comes.
-            match libc::getppid() == parent {
-                true => Ok(()),
-                false => Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
-            }
-        });
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stop_with_parent(_: &mut Command) {}
 
 /// The `gnitz-server` to run: the one `GNITZ_SERVER_BIN` names where it is set,
 /// else the one in `installed`, else the first on `PATH`.

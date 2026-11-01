@@ -9,16 +9,15 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
-use std::{env, fs, thread};
+use std::time::Duration;
+use std::{env, fs};
 
 use gnitz_foundation::log::READY_LINE;
+use gnitz_foundation::process::{await_log, default_env, die_with_parent, log_tail};
 use tempfile::TempDir;
 
 /// Wall-clock budget for the server to log its readiness marker.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-/// How often the boot is checked for readiness or an early exit.
-const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Server binary plus the tmpdir's data/socket/stderr paths: what a boot and a
 /// restart both spawn from.
@@ -147,10 +146,16 @@ impl ServerHandle {
             .status()
             .expect("kill -HUP");
         assert!(status.success(), "kill -HUP failed");
-        await_log(&mut self.process, &self.paths.stderr_path, offset, |log| {
-            log.lines().find(|l| l.contains("SIGHUP:")).map(str::to_string)
-        })
-        .unwrap_or_else(|e| panic!("the server never reported the reload: {e}"))
+        let path = &self.paths.stderr_path;
+        await_log(
+            &mut self.process,
+            path,
+            offset,
+            STARTUP_TIMEOUT,
+            MAX_TAIL_LINES,
+            |log| log.lines().find(|l| l.contains("SIGHUP:")).map(str::to_string),
+        )
+        .unwrap_or_else(|why| panic!("the server never reported the reload: {why}"))
     }
 
     /// Whether the master and every worker it forked are running. A worker's
@@ -325,10 +330,11 @@ impl ServerHandle {
     /// Print the tail of the master's stderr and of every worker's log.
     pub fn print_logs(&self) {
         eprintln!("\n──── server stderr (last {MAX_TAIL_LINES} lines) ────");
-        eprintln!("{}", read_tail(&self.paths.stderr_path));
+        eprintln!("{}", log_tail(&self.paths.stderr_path, MAX_TAIL_LINES));
         for w in 0..self.workers {
             eprintln!("──── worker {w} (last {MAX_TAIL_LINES} lines) ────");
-            eprintln!("{}", read_tail(&self.paths.data_dir.join(format!("worker_{w}.log"))));
+            let log = self.paths.data_dir.join(format!("worker_{w}.log"));
+            eprintln!("{}", log_tail(&log, MAX_TAIL_LINES));
         }
         eprintln!("──── end server logs ────");
     }
@@ -487,14 +493,7 @@ fn spawn_and_wait_ready(
     let offset = stderr_file.metadata().expect("stderr log metadata").len();
 
     let mut cmd = Command::new(&paths.bin);
-    // SAFETY: `prctl` is async-signal-safe, and the closure allocates nothing.
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| match libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) {
-            0 => Ok(()),
-            _ => Err(std::io::Error::last_os_error()),
-        });
-    }
+    die_with_parent(&mut cmd, libc::SIGKILL);
     cmd.arg(&paths.data_dir)
         .arg(&paths.sock_path)
         .stdout(Stdio::null())
@@ -502,61 +501,29 @@ fn spawn_and_wait_ready(
 
     // Each server fallocates its whole SAL, and a parallel `cargo test` runs one
     // server per test; these tests write little.
-    if env::var_os("GNITZ_SAL_BYTES").is_none() {
-        cmd.env("GNITZ_SAL_BYTES", "134217728"); // 128 MiB
-    }
+    default_env(&mut cmd, "GNITZ_SAL_BYTES", "134217728"); // 128 MiB
 
     // Servers pinning independently would pile onto the same cores.
-    if env::var_os("GNITZ_CPU_AFFINITY").is_none() {
-        cmd.env("GNITZ_CPU_AFFINITY", "0");
-    }
+    default_env(&mut cmd, "GNITZ_CPU_AFFINITY", "0");
     cmd.envs(extra_env.iter().map(|(k, v)| (k, v)));
     cmd.arg(format!("--workers={workers}"));
     cmd.args(args);
     let mut proc = cmd.spawn().expect("failed to spawn server");
 
-    await_log(&mut proc, &paths.stderr_path, offset, |log| {
-        log.contains(READY_LINE).then_some(())
-    })
-    .map_err(|e| {
+    await_log(
+        &mut proc,
+        &paths.stderr_path,
+        offset,
+        STARTUP_TIMEOUT,
+        MAX_TAIL_LINES,
+        |log| log.contains(READY_LINE).then_some(()),
+    )
+    .map_err(|why| {
         proc.kill().ok();
         proc.wait().ok();
-        format!("server did not log {READY_LINE:?}: {e}")
+        format!("server did not log {READY_LINE:?}: {why}")
     })?;
     Ok(proc)
-}
-
-/// Poll the log at `path` past `offset` until `found` finds what it looks for
-/// there; `Err` carries the stderr tail of `proc` exiting or of a timeout.
-fn await_log<T>(
-    proc: &mut Child,
-    path: &Path,
-    offset: u64,
-    mut found: impl FnMut(&str) -> Option<T>,
-) -> Result<T, String> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut file = fs::File::open(path).expect("open server stderr log");
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let mut logged = Vec::new();
-    loop {
-        if let Ok(Some(status)) = proc.try_wait() {
-            return Err(format!("server exited ({status})\nstderr tail:\n{}", read_tail(path)));
-        }
-        logged.clear();
-        file.seek(SeekFrom::Start(offset)).expect("seek stderr log");
-        file.read_to_end(&mut logged).expect("read stderr log");
-        if let Some(t) = found(&String::from_utf8_lossy(&logged)) {
-            return Ok(t);
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "nothing within {STARTUP_TIMEOUT:?}\nstderr tail:\n{}",
-                read_tail(path)
-            ));
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
 }
 
 impl Drop for ServerHandle {
@@ -583,33 +550,8 @@ impl Drop for ServerHandle {
     }
 }
 
-/// The most lines of a log [`read_tail`] keeps.
+/// The most lines of a log a report quotes.
 const MAX_TAIL_LINES: usize = 100;
-
-/// The last [`MAX_TAIL_LINES`] lines of `path`, bounded to the final 128 KiB.
-/// Lossy UTF-8 so a binary-garbage tail from a hard crash still prints.
-/// Returns an empty string if the file is missing or unreadable.
-fn read_tail(path: &Path) -> String {
-    use std::io::{Read, Seek, SeekFrom};
-    const MAX_TAIL_BYTES: u64 = 128 * 1024;
-
-    let Ok(mut f) = fs::File::open(path) else {
-        return String::new();
-    };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let offset = len.saturating_sub(MAX_TAIL_BYTES);
-    if offset > 0 {
-        let _ = f.seek(SeekFrom::Start(offset));
-    }
-    let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() {
-        return String::new();
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(MAX_TAIL_LINES);
-    lines[start..].join("\n")
-}
 
 /// The server binary the suites run: `GNITZ_SERVER_BIN`, or the one `make
 /// server` builds at the repository root. A missing binary panics rather than

@@ -8,6 +8,7 @@
 //!   - `posix_io`   — the syscall idioms `std` lacks
 //!   - `perf`       — cost probes: instructions retired, context switches and
 //!     resident-set bytes, for benchmarks and cost-claim tests. Linux only
+//!   - `process`    — a child process: tied to the thread that spawns it, awaited on its log
 //!
 //! The server is Linux-only; a client is not. What a client links of this crate
 //! builds on any Unix: `perf` and the server-only `posix_io` idioms are gated to
@@ -24,3 +25,4 @@ pub mod log;
 #[cfg(target_os = "linux")]
 pub mod perf;
 pub mod posix_io;
+pub mod process;
