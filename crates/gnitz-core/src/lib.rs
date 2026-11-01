@@ -25,9 +25,7 @@ mod test_support;
 mod transport;
 mod txn;
 
-pub use batch::{
-    append_own_regions, push_zero_cell, BatchAppender, BatchMark, PayloadColumn, PkColumn, PushBatch, ZSetBatch,
-};
+pub use batch::{BatchAppender, BatchMark, PayloadColumn, PkColumn, ZSetBatch};
 pub use catalog::{Catalog, CatalogRelation, IndexRow, RelProps};
 pub use client::{env_target, GnitzClient};
 pub use connection::{
@@ -45,4 +43,4 @@ pub use rel_name::RelName;
 pub use schema::{sys_schema, Schema};
 pub use snapshot::DEFAULT_PAGE_ROWS;
 pub use transport::{poll_fd, ClientTransport, Interest};
-pub use txn::{key_reply, RMW_MAX_ATTEMPTS};
+pub use txn::{key_reply, PushBatch, RMW_MAX_ATTEMPTS};

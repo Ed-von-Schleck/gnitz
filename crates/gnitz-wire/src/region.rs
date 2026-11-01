@@ -7,6 +7,8 @@
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 
+use crate::TypeCode;
+
 /// Fixed regions, in order. Payload column `pi` is at `REG_PAYLOAD_START + pi`,
 /// and the blob heap is last.
 pub const REG_PK: usize = 0;
@@ -97,6 +99,15 @@ pub fn first_not_null_violation(nullable: u64, null_bmp: &[u8]) -> Option<(usize
         let bad = u64::from_le_bytes(*w) & not_null;
         (bad != 0).then(|| (row, bad.trailing_zeros() as usize))
     })
+}
+
+/// Append one zero-filled cell of wire type `tc` to a payload region — the NULL
+/// encoding and the non-null filler alike. The null bitmap is the NULL truth,
+/// and a zeroed German cell *is* the empty value, which is what
+/// `encode_german_string(&[], _)` writes.
+#[inline]
+pub fn push_zero_cell(col: &mut Vec<u8>, tc: TypeCode) {
+    col.extend(std::iter::repeat_n(0u8, tc.wire_stride()));
 }
 
 /// The first `(row, payload slot)` whose null bit in `null_bmp`, among the

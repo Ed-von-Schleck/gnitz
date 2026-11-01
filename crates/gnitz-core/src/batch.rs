@@ -1,8 +1,6 @@
 //! The client batch: a Z-set in the canonical region order, its builders, and
 //! its WAL-block encode and decode.
 
-use std::sync::Arc;
-
 use gnitz_wire::{as_le_bytes, PkKeys, Regions, TypeCode};
 use gnitz_wire::{FIXED_REGION_BYTES, MAX_PK_COLUMNS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
@@ -104,12 +102,6 @@ impl PkColumn {
         PkKeys::from_keys(self.stride(), self.buf.chunks_exact(self.stride()))
     }
 
-    /// [`Self::keys`], reusing the region as the list's storage when its keys
-    /// already strictly ascend.
-    pub fn into_keys(self) -> PkKeys {
-        PkKeys::from_vec(self.stride(), self.buf)
-    }
-
     pub fn len(&self) -> usize {
         self.buf.len() / self.stride()
     }
@@ -150,26 +142,6 @@ impl PkColumn {
             gnitz_wire::push_opk(&mut self.buf, tc.wire_stride(), v, tc.is_signed_int());
         }
     }
-
-    /// Append whole OPK rows verbatim — `opk` is a multiple of `stride` bytes
-    /// already in region form.
-    pub(crate) fn push_region_bytes(&mut self, opk: &[u8]) {
-        debug_assert!(
-            opk.len().is_multiple_of(self.stride()),
-            "push_region_bytes: {} bytes is not a whole number of {}-byte rows",
-            opk.len(),
-            self.stride(),
-        );
-        self.buf.extend_from_slice(opk);
-    }
-}
-
-/// Append one zero-filled cell of wire type `tc` to a payload region — the NULL
-/// encoding and the non-null filler alike. The null bitmap is the NULL truth,
-/// and a zeroed German cell *is* the empty value, which is what
-/// `encode_german_string(&[], _)` writes.
-pub fn push_zero_cell(col: &mut Vec<u8>, tc: TypeCode) {
-    col.extend(std::iter::repeat_n(0u8, tc.wire_stride()));
 }
 
 /// One payload region: its wire type and its cells, `tc.wire_stride()` bytes
@@ -194,7 +166,7 @@ impl PayloadColumn {
 
     /// Append one zero cell: a NULL's filler, or a DROP COLUMN tombstone's value.
     pub fn push_zero(&mut self) {
-        push_zero_cell(&mut self.bytes, self.tc)
+        gnitz_wire::push_zero_cell(&mut self.bytes, self.tc)
     }
 }
 
@@ -212,54 +184,6 @@ pub struct ZSetBatch {
     pub payload: Vec<PayloadColumn>,
     /// The arena the German cells in `payload` point into.
     pub blob: Vec<u8>,
-}
-
-/// A batch handed to [`crate::GnitzClient::push`]: borrowed, or shared with
-/// its caller (a batch moved in is shared with no one). A transaction buffers a
-/// shared one without copying it and copies it only when the family it opened
-/// is extended while the caller still holds it.
-pub enum PushBatch<'a> {
-    Borrowed(&'a ZSetBatch),
-    Shared(Arc<ZSetBatch>),
-}
-
-impl From<ZSetBatch> for PushBatch<'_> {
-    fn from(batch: ZSetBatch) -> Self {
-        PushBatch::Shared(Arc::new(batch))
-    }
-}
-
-impl<'a> From<&'a ZSetBatch> for PushBatch<'a> {
-    fn from(batch: &'a ZSetBatch) -> Self {
-        PushBatch::Borrowed(batch)
-    }
-}
-
-impl From<Arc<ZSetBatch>> for PushBatch<'_> {
-    fn from(batch: Arc<ZSetBatch>) -> Self {
-        PushBatch::Shared(batch)
-    }
-}
-
-impl std::ops::Deref for PushBatch<'_> {
-    type Target = ZSetBatch;
-
-    fn deref(&self) -> &ZSetBatch {
-        match self {
-            PushBatch::Borrowed(b) => b,
-            PushBatch::Shared(b) => b,
-        }
-    }
-}
-
-impl PushBatch<'_> {
-    /// The batch as a shareable handle: a borrowed one is copied here.
-    pub(crate) fn into_arc(self) -> Arc<ZSetBatch> {
-        match self {
-            PushBatch::Borrowed(b) => Arc::new(b.clone()),
-            PushBatch::Shared(b) => b,
-        }
-    }
 }
 
 impl ZSetBatch {
@@ -382,33 +306,27 @@ impl ZSetBatch {
         (0..self.len()).filter(move |&i| self.weights[i] > 0)
     }
 
-    /// Append all rows of `other`: each region concatenates, and `other`'s arena
-    /// lands on this one's tail, so every German cell it carries has its heap
-    /// offset shifted by that much.
+    /// Append all rows of `other`, its German cells rebased onto this arena.
     pub(crate) fn extend_from(&mut self, other: &ZSetBatch) {
         assert!(self.same_layout(other), "extend_from: layout mismatch");
-        self.pks.buf.extend_from_slice(&other.pks.buf);
-        self.weights.extend_from_slice(&other.weights);
-        self.nulls.extend_from_slice(&other.nulls);
-        let delta = self.blob.len();
-        self.blob.extend_from_slice(&other.blob);
-        for (dst, src) in self.payload.iter_mut().zip(&other.payload) {
-            let at = dst.bytes.len();
-            dst.bytes.extend_from_slice(&src.bytes);
-            if dst.tc().is_german_string() {
-                gnitz_wire::shift_german_string_heaps(&mut dst.bytes[at..], delta);
-            }
-        }
+        let payload = other.payload.iter().map(|c| c.bytes.as_slice());
+        self.append_laid_out(
+            &other.pks.buf,
+            as_le_bytes(&other.weights),
+            as_le_bytes(&other.nulls),
+            payload,
+            &other.blob,
+        );
     }
 
     /// `extend_from`, taking `other` whole when `self` is empty.
     pub fn extend_from_owned(&mut self, other: ZSetBatch) {
-        assert!(self.same_layout(&other), "extend_from_owned: layout mismatch");
         if self.is_empty() {
+            assert!(self.same_layout(&other), "extend_from_owned: layout mismatch");
             *self = other;
-            return;
+        } else {
+            self.extend_from(&other);
         }
-        self.extend_from(&other);
     }
 
     /// The batch's current extent, for [`Self::rollback_to`].
@@ -419,8 +337,8 @@ impl ZSetBatch {
         }
     }
 
-    /// Drop everything appended since `mark` — used to undo a half-written row,
-    /// its blob spill included.
+    /// Drop every row and arena byte appended since `mark`. Valid while no cell of a row
+    /// before the mark points into the arena past it.
     pub fn rollback_to(&mut self, mark: BatchMark) {
         self.pks.buf.truncate(mark.rows * self.pks.stride());
         self.weights.truncate(mark.rows);
@@ -452,9 +370,16 @@ impl ZSetBatch {
         self.rollback_to(BatchMark { rows: dst, blob: self.blob.len() });
     }
 
-    /// Every payload region is the length its type and the row count imply.
-    pub(crate) fn check_columns(&self) -> Result<(), String> {
+    /// Every fixed region is the length the row count (the weights) implies.
+    fn check_lengths(&self) -> Result<(), String> {
         let n = self.len();
+        let (pk, want) = (self.pks.region().len(), n * self.pks.stride());
+        if pk != want {
+            return Err(format!("pk region length {pk} != expected {want}"));
+        }
+        if self.nulls.len() != n {
+            return Err(format!("nulls length {} != row count {n}", self.nulls.len()));
+        }
         for (pi, col) in self.payload.iter().enumerate() {
             let (got, want) = (col.bytes.len(), n * col.stride());
             if got != want {
@@ -497,14 +422,7 @@ impl ZSetBatch {
     /// that every NULL is a zeroed cell of a nullable column.
     pub fn validate(&self, schema: &Schema) -> Result<(), String> {
         self.layout_matches(schema)?;
-        let n = self.pks.len();
-        if self.weights.len() != n {
-            return Err(format!("weights length {} != row count {}", self.weights.len(), n));
-        }
-        if self.nulls.len() != n {
-            return Err(format!("nulls length {} != row count {}", self.nulls.len(), n));
-        }
-        self.check_columns()?;
+        self.check_lengths()?;
         check_not_null(gnitz_wire::as_le_bytes(&self.nulls), schema)?;
         let col = |pi: usize| (self.payload[pi].bytes.as_slice(), self.payload[pi].stride());
         match gnitz_wire::first_valued_null(
@@ -601,7 +519,7 @@ fn gather_cells(src: &[u8], stride: usize, rows: &[u32]) -> Vec<u8> {
 /// No row sets a null bit `schema` does not admit: one on a NOT NULL payload
 /// column, whose declaration every reader past the decoder trusts, or one past
 /// the last payload column.
-pub(crate) fn check_not_null(null_bmp: &[u8], schema: &Schema) -> Result<(), String> {
+fn check_not_null(null_bmp: &[u8], schema: &Schema) -> Result<(), String> {
     match gnitz_wire::first_not_null_violation(schema.layout().nullable_payload_slots(), null_bmp) {
         None => Ok(()),
         Some((row, slot)) if slot >= schema.layout().num_payload_cols() => {
@@ -621,11 +539,14 @@ pub struct BatchMark {
     blob: usize,
 }
 
-/// Appends rows to a [`ZSetBatch`] one payload slot at a time, each value
-/// checked against its slot's column type.
+/// Appends rows to a [`ZSetBatch`] one payload slot at a time. A fixed-width value is
+/// checked against its slot's width and refused by a STRING/BLOB slot, `int_val` also
+/// against the integer type's range, and `str_val`/`bytes_val` against the exact type.
 ///
 /// Columns are appended in payload-slot order, so callers supply only payload
-/// values; the cursor is the payload slot.
+/// values; the cursor is the payload slot, and equals the payload count while no row
+/// is open. In debug builds a row given fewer values than payload columns is caught
+/// when the next row starts or the row is closed.
 pub struct BatchAppender<'a> {
     batch: &'a mut ZSetBatch,
     cursor: usize,
@@ -646,9 +567,20 @@ impl gnitz_wire::SysRowSink for BatchAppender<'_> {
     fn put_bytes(&mut self, b: &[u8]) {
         self.bytes_val(b);
     }
+    fn end_row(&mut self) {
+        self.debug_check_row_full();
+    }
+}
+
+impl<'a> BatchAppender<'a> {
+    pub fn new(batch: &'a mut ZSetBatch) -> Self {
+        let cursor = batch.payload.len();
+        BatchAppender { batch, cursor }
+    }
+
     /// A row takes exactly one push per payload column; names the row `validate` would reject
     /// later as a bare region-length error.
-    fn end_row(&mut self) {
+    fn debug_check_row_full(&self) {
         debug_assert_eq!(
             self.cursor,
             self.batch.payload.len(),
@@ -656,12 +588,6 @@ impl gnitz_wire::SysRowSink for BatchAppender<'_> {
             self.cursor,
             self.batch.payload.len(),
         );
-    }
-}
-
-impl<'a> BatchAppender<'a> {
-    pub fn new(batch: &'a mut ZSetBatch) -> Self {
-        BatchAppender { batch, cursor: 0 }
     }
 
     /// Start a new row with the given single-column primary key and weight.
@@ -672,10 +598,11 @@ impl<'a> BatchAppender<'a> {
     /// [`Self::add_row`] for a **compound** PK: `natives` are the PK columns'
     /// native values in PK-list order.
     pub fn add_row_natives(&mut self, natives: &[u128], weight: i64) -> &mut Self {
+        self.debug_check_row_full();
+        self.batch.pks.push_natives(natives);
         self.batch.weights.push(weight);
         self.batch.nulls.push(0);
         self.cursor = 0;
-        self.batch.pks.push_natives(natives);
         self
     }
 
@@ -766,11 +693,8 @@ impl<'a> BatchAppender<'a> {
     pub fn null(&mut self) -> &mut Self {
         let pi = self.col_index();
         self.batch.payload[pi].push_zero();
-        let word = self
-            .batch
-            .nulls
-            .last_mut()
-            .expect("BatchAppender: null called before add_row");
+        // `col_index` admits a value only while a row is open, so a null word exists.
+        let word = self.batch.nulls.last_mut().unwrap();
         gnitz_wire::null_word_set(word, pi, true);
         self.cursor += 1;
         self
@@ -782,7 +706,7 @@ impl<'a> BatchAppender<'a> {
         // here instead of an OOB index panicking at the `payload[pi]` call site.
         assert!(
             self.cursor < self.batch.payload.len(),
-            "BatchAppender: payload cursor {} exceeds {} payload columns",
+            "BatchAppender: no payload slot open (cursor {} of {} columns): a value before add_row or past the row's last column",
             self.cursor,
             self.batch.payload.len(),
         );
@@ -875,6 +799,79 @@ impl ZSetBatch {
         out.push(&self.blob);
         out
     }
+
+    /// A batch of `schema` holding the rows of a canonical region list this process's own
+    /// store produced. Its German cells are not checked, the store having checked them when
+    /// it ingested them; the layout and NOT NULL are checked as for a WAL block.
+    pub fn from_own_regions(schema: &Schema, regions: &[&[u8]]) -> Result<Self, ProtocolError> {
+        let mut b = Self::new(schema);
+        b.check_laid_out(regions, schema)?;
+        b.append_region_list(regions);
+        Ok(b)
+    }
+
+    /// `regions` lays out this batch's layout, each region as long as the weight region's row
+    /// count implies, and sets no null bit `schema` does not admit. The region lengths guard a
+    /// region list handed in whole; a decoded WAL block's regions are sliced at exactly those
+    /// lengths from a size-checked block, so on that path only NOT NULL can fail.
+    fn check_laid_out(&self, regions: &[&[u8]], schema: &Schema) -> Result<(), ProtocolError> {
+        debug_assert!(self.layout_matches(schema).is_ok() && self.check_lengths().is_ok());
+        let count = regions.get(REG_WEIGHT).map_or(0, |w| w.len() / FIXED_REGION_BYTES);
+        if regions.len() != gnitz_wire::num_regions(self.payload.len())
+            || regions[REG_WEIGHT].len() != count * FIXED_REGION_BYTES
+            || regions[REG_PK].len() != count * self.pks.stride()
+            || regions[REG_NULL_BMP].len() != count * FIXED_REGION_BYTES
+            || !self
+                .payload
+                .iter()
+                .zip(&regions[REG_PAYLOAD_START..])
+                .all(|(c, r)| r.len() == count * c.stride())
+        {
+            return Err(ProtocolError::DecodeError(
+                "a region list that does not lay out its schema".into(),
+            ));
+        }
+        check_not_null(regions[REG_NULL_BMP], schema).map_err(ProtocolError::DecodeError)
+    }
+
+    /// [`Self::append_laid_out`] over `r`, a canonical region list in this batch's layout.
+    fn append_region_list(&mut self, r: &[&[u8]]) {
+        let p = self.payload.len();
+        let payload = r[REG_PAYLOAD_START..][..p].iter().copied();
+        self.append_laid_out(
+            r[REG_PK],
+            r[REG_WEIGHT],
+            r[REG_NULL_BMP],
+            payload,
+            r[REG_PAYLOAD_START + p],
+        );
+    }
+
+    /// Append rows given as their regions in this batch's layout, verbatim: each region
+    /// concatenates and `blob` lands on this arena's tail, so every German cell `payload`
+    /// carries has its heap offset shifted by that much. The regions are passed apart rather
+    /// than as a list so [`Self::extend_from`] appends a batch without building one.
+    fn append_laid_out<'r>(
+        &mut self,
+        pks: &[u8],
+        weights: &[u8],
+        nulls: &[u8],
+        payload: impl Iterator<Item = &'r [u8]>,
+        blob: &[u8],
+    ) {
+        self.pks.buf.extend_from_slice(pks);
+        gnitz_wire::extend_from_le_bytes(&mut self.weights, weights);
+        gnitz_wire::extend_from_le_bytes(&mut self.nulls, nulls);
+        let base = self.blob.len();
+        self.blob.extend_from_slice(blob);
+        for (col, region) in self.payload.iter_mut().zip(payload) {
+            let at = col.bytes.len();
+            col.bytes.extend_from_slice(region);
+            if col.tc.is_german_string() {
+                gnitz_wire::shift_german_string_heaps(&mut col.bytes[at..], base);
+            }
+        }
+    }
 }
 
 /// The header and regions of the WAL block `data` under `schema`; its rows'
@@ -889,7 +886,7 @@ pub(crate) fn parse_wal_block<'a>(
 
 /// Decode a WAL block under `schema`, appending its rows to `sink`. On error
 /// `sink` is as it was.
-pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
+fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
     let layout = schema.layout();
     let gnitz_wire::wal::ParsedBlock { rows, fixed, heap, .. } = parse_wal_block(data, schema)?;
     let mut regions = Regions::new();
@@ -897,7 +894,22 @@ pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &
         regions.push(&fixed[layout.region_start(r, rows)..][..rows * layout.region_stride(r)]);
     }
     regions.push(heap);
-    append_regions(sink, &regions, schema, true)
+    sink.check_laid_out(&regions, schema)?;
+    // The block crossed a trust boundary: each German cell must be canonical against the
+    // block's own heap.
+    let bad = sink
+        .payload
+        .iter()
+        .zip(&regions[REG_PAYLOAD_START..])
+        .position(|(c, r)| c.tc.is_german_string() && !gnitz_wire::german_string_region_ok(r, heap));
+    if let Some(pi) = bad {
+        return Err(ProtocolError::DecodeError(format!(
+            "column {}: German string cell is not in canonical form",
+            layout.payload_col_idx(pi)
+        )));
+    }
+    sink.append_region_list(&regions);
+    Ok(())
 }
 
 /// Decode the WAL blocks `blocks` under `schema`, appending their rows to
@@ -919,74 +931,6 @@ pub(crate) fn decode_wal_blocks_into<'a>(
     sink.reserve(rows);
     sink.blob.reserve(heap);
     blocks.try_for_each(|block| decode_wal_block_into(sink, block, schema))
-}
-
-/// Append to `sink`, a batch of `schema`, the rows of a canonical region list
-/// this process's own store produced. Its German cells are rebased and not
-/// checked, the store having checked them when it ingested them; the layout
-/// and NOT NULL are checked as for a block. On error `sink` is as it was.
-pub fn append_own_regions(sink: &mut ZSetBatch, regions: &[&[u8]], schema: &Schema) -> Result<(), ProtocolError> {
-    append_regions(sink, regions, schema, false)
-}
-
-/// Append the rows laid out as the canonical region list `regions` under
-/// `schema` to `sink`, a batch of `schema`. `foreign` regions crossed a trust
-/// boundary, so each German cell is checked for canonical form as it is copied.
-/// On error `sink` is as it was.
-fn append_regions(
-    sink: &mut ZSetBatch,
-    regions: &[&[u8]],
-    schema: &Schema,
-    foreign: bool,
-) -> Result<(), ProtocolError> {
-    debug_assert!(sink.layout_matches(schema).is_ok() && sink.check_columns().is_ok());
-    let count = regions.get(REG_WEIGHT).map_or(0, |w| w.len() / FIXED_REGION_BYTES);
-    if regions.len() != gnitz_wire::num_regions(sink.payload.len())
-        || regions[REG_WEIGHT].len() != count * FIXED_REGION_BYTES
-        || regions[REG_PK].len() != count * sink.pks.stride()
-        || regions[REG_NULL_BMP].len() != count * FIXED_REGION_BYTES
-        || !sink
-            .payload
-            .iter()
-            .zip(&regions[REG_PAYLOAD_START..])
-            .all(|(c, r)| r.len() == count * c.stride())
-    {
-        return Err(ProtocolError::DecodeError(
-            "a region list that does not lay out its schema".into(),
-        ));
-    }
-    check_not_null(regions[REG_NULL_BMP], schema).map_err(ProtocolError::DecodeError)?;
-    // A German cell's heap offset is relative to its own block's heap.
-    let block_blob = regions[REG_PAYLOAD_START + sink.payload.len()];
-    if foreign {
-        let bad = sink.payload.iter().enumerate().find(|&(pi, col)| {
-            col.tc().is_german_string()
-                && !gnitz_wire::german_string_region_ok(regions[REG_PAYLOAD_START + pi], block_blob)
-        });
-        if let Some((pi, _)) = bad {
-            return Err(ProtocolError::DecodeError(format!(
-                "column {}: German string cell is not in canonical form",
-                schema.layout().payload_col_idx(pi)
-            )));
-        }
-    }
-
-    sink.reserve(count);
-    sink.pks.push_region_bytes(regions[REG_PK]);
-    gnitz_wire::extend_from_le_bytes(&mut sink.weights, regions[REG_WEIGHT]);
-    gnitz_wire::extend_from_le_bytes(&mut sink.nulls, regions[REG_NULL_BMP]);
-    let blob_base = sink.blob.len();
-    sink.blob.extend_from_slice(block_blob);
-    for (pi, col) in sink.payload.iter_mut().enumerate() {
-        let german = col.tc().is_german_string();
-        let dst = &mut col.bytes;
-        let at = dst.len();
-        dst.extend_from_slice(regions[REG_PAYLOAD_START + pi]);
-        if german {
-            gnitz_wire::shift_german_string_heaps(&mut dst[at..], blob_base);
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -868,7 +868,7 @@ impl GnitzClient {
         let Some((_, b)) = families.iter().find(|(family, _)| *family == VIEW_TAB) else {
             return;
         };
-        let vid = |i| b.pks.get(i) as u64;
+        let vid = |i| gnitz_wire::sys_leading_id(b.pks.get_bytes(i));
         let mut dropped: Vec<u64> = Vec::new();
         let mut renamed = Vec::new();
         for v in (0..b.len()).filter(|&i| b.weights[i] < 0).map(vid) {

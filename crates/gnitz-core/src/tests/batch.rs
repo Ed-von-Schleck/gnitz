@@ -51,8 +51,9 @@ fn validate_refuses_each_malformed_batch() {
         .expect("a NULL over a zeroed nullable cell validates");
 
     type Mutation = fn(&mut ZSetBatch);
-    let cases: [(Mutation, &str); 6] = [
-        (|b| _ = b.weights.pop(), "weights length"),
+    let cases: [(Mutation, &str); 8] = [
+        (|b| _ = b.weights.pop(), "pk region length"),
+        (|b| b.pks.push_natives(&[3]), "pk region length"),
         (|b| _ = b.nulls.pop(), "nulls length"),
         (
             |b| b.payload[0].bytes.clear(),
@@ -64,6 +65,7 @@ fn validate_refuses_each_malformed_batch() {
         ),
         (|b| b.nulls[0] |= 1, "NOT NULL column 'v'"),
         (|b| b.nulls[0] |= 2, "holds a value under NULL"),
+        (|b| b.nulls[0] |= 1 << 2, "past the last payload column"),
     ];
     for (mutate, want) in cases {
         let mut b = base.clone();
@@ -105,19 +107,19 @@ fn validate_refuses_each_malformed_batch() {
     }
 }
 
+/// Batches that differ in one layout clause each are refused: the payload slot count, a
+/// slot's type (whose cells would be read at another width), and a key column's sign.
 #[test]
-#[should_panic(expected = "extend_from_owned: layout mismatch")]
-fn extend_from_owned_refuses_a_different_payload_count() {
-    let pk_only = Schema::from_parts(vec![ColumnDef::new("pk", TypeCode::U64, false)], &[0]).unwrap();
-    ZSetBatch::new(&pk_only).extend_from_owned(ZSetBatch::new(&kv_schema(TypeCode::U64)));
-}
-
-/// Equal slot counts are not enough: a batch whose slot holds another type would
-/// have its cells read at that type's width.
-#[test]
-#[should_panic(expected = "extend_from_owned: layout mismatch")]
-fn extend_from_owned_refuses_a_different_payload_type() {
-    ZSetBatch::new(&kv_schema(TypeCode::I64)).extend_from_owned(ZSetBatch::new(&kv_schema(TypeCode::F64)));
+fn same_layout_refuses_each_differing_clause() {
+    let key_only = |tc| Schema::from_parts(vec![ColumnDef::new("pk", tc, false)], &[0]).unwrap();
+    for (a, b) in [
+        (key_only(TypeCode::U64), kv_schema(TypeCode::U64)),
+        (kv_schema(TypeCode::I64), kv_schema(TypeCode::F64)),
+        (key_only(TypeCode::I64), key_only(TypeCode::U64)),
+    ] {
+        let e = std::panic::catch_unwind(|| ZSetBatch::new(&a).extend_from_owned(ZSetBatch::new(&b))).unwrap_err();
+        assert_eq!(e.downcast_ref::<&str>(), Some(&"extend_from_owned: layout mismatch"));
+    }
 }
 
 /// A key column's sign is part of the layout: a `U64` key and an `I64` key share
@@ -130,8 +132,6 @@ fn a_key_of_another_sign_is_another_layout() {
         ZSetBatch::new(&unsigned).layout_matches(&signed).unwrap_err(),
         "mismatched key column types: expected [I64], got [U64]"
     );
-    let extend = std::panic::catch_unwind(|| ZSetBatch::new(&signed).extend_from_owned(ZSetBatch::new(&unsigned)));
-    assert!(extend.is_err(), "extend_from_owned across key types must panic");
 }
 
 /// The scalar key verbs are a single-column key's; a compound key is written one
@@ -140,9 +140,15 @@ fn a_key_of_another_sign_is_another_layout() {
 fn a_compound_key_has_no_scalar_form() {
     let schema = fixture_a_schema();
     let panics = |f: &(dyn Fn() + std::panic::RefUnwindSafe)| std::panic::catch_unwind(f).is_err();
-    assert!(panics(&|| {
-        BatchAppender::new(&mut ZSetBatch::new(&schema)).add_row(1, 1);
-    }));
+    let mut b = ZSetBatch::new(&schema);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BatchAppender::new(&mut b).add_row(1, 1);
+    }))
+    .is_err());
+    assert!(
+        b.weights.is_empty() && b.nulls.is_empty() && b.pks.is_empty(),
+        "a refused key leaves no partial row"
+    );
     assert!(panics(&|| _ = fixture_a_batch().pks.get(0)));
     assert!(panics(&|| _ = PkColumn::from_natives(&schema, [1])));
     for arity in [&[1][..], &[1, 2, 3]] {
@@ -382,6 +388,25 @@ fn closing_an_under_pushed_row_trips_the_tripwire() {
     a.end_row();
 }
 
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "BatchAppender: row got 1 of 2")]
+fn starting_a_row_after_an_under_pushed_one_trips_the_tripwire() {
+    let schema = Schema::from_parts(
+        vec![
+            ColumnDef::new("pk", TypeCode::U64, false),
+            ColumnDef::new("v", TypeCode::I64, false),
+            ColumnDef::new("w", TypeCode::I64, false),
+        ],
+        &[0],
+    )
+    .unwrap();
+    let mut batch = ZSetBatch::new(&schema);
+    let mut a = BatchAppender::new(&mut batch);
+    a.add_row(1, 1).i64_val(1);
+    a.add_row(2, 1);
+}
+
 // ── Row selection: retain_ranges and gather ──────────────────────────────
 
 const GATHER_VALS: [&str; 4] = [
@@ -438,6 +463,7 @@ fn retain_ranges_keeps_the_named_runs_in_order() {
     for (ranges, keep) in [
         (&[(0, 1), (2, 4)][..], &[0, 2, 3][..]),
         (&[(0, 4)][..], &[0, 1, 2, 3][..]),
+        (&[(0, 2), (2, 4)][..], &[0, 1, 2, 3][..]),
         (&[][..], &[][..]),
     ] {
         let mut z = b.clone();
@@ -446,6 +472,21 @@ fn retain_ranges_keeps_the_named_runs_in_order() {
         let want: Vec<Row> = keep.iter().map(|&r| all[r].clone()).collect();
         assert_eq!(rows(&z), want, "{ranges:?}");
     }
+}
+
+/// A rollback drops every row since the mark: a whole row with its spilled string, and a key-only partial row.
+#[test]
+fn rollback_to_drops_the_rows_and_spills_since_the_mark() {
+    let (_, want) = string_batch();
+    let mut b = want.clone();
+    let m = b.mark();
+    BatchAppender::new(&mut b)
+        .add_row(9, 1)
+        .str_val(GATHER_VALS[0])
+        .i64_val(0);
+    b.pks.push_natives(&[10]);
+    b.rollback_to(m);
+    assert_eq!(b, want);
 }
 
 /// A cut gather is the named rows at their weights, and its arena holds exactly
@@ -760,8 +801,7 @@ fn a_string_cell_pointing_past_the_blob_is_refused() {
 }
 
 /// A process's own regions are appended behind the rows a batch already holds,
-/// each long cell reading its content at the heap's new place, and their layout
-/// is checked as a block's is.
+/// each long cell reading its content at the heap's new place.
 #[test]
 fn own_regions_are_appended_with_their_long_cells_rebased() {
     let schema = kv_schema(TypeCode::String);
@@ -774,7 +814,7 @@ fn own_regions_are_appended_with_their_long_cells_rebased() {
     let regions = batch.wire_regions();
 
     let mut sink = batch.clone();
-    append_own_regions(&mut sink, &regions, &schema).unwrap();
+    sink.extend_from(&ZSetBatch::from_own_regions(&schema, &regions).unwrap());
     assert_eq!(sink.len(), 4);
     assert_eq!(sink.weights, [1, -1, 1, -1]);
     let cells = sink.payload[0].bytes.as_chunks::<16>().0;
@@ -782,19 +822,6 @@ fn own_regions_are_appended_with_their_long_cells_rebased() {
     assert_eq!(content(1), content(3));
     assert_eq!(content(3), b"a value well past the inline cell");
     assert_eq!(content(2), b"ab");
-
-    let short = &regions[..regions.len() - 1];
-    assert!(append_own_regions(&mut ZSetBatch::new(&schema), short, &schema).is_err());
-}
-
-/// A block of zero rows is refused: an empty batch ships no block.
-#[test]
-fn a_zero_row_block_is_refused() {
-    let schema = kv_schema(TypeCode::I64);
-    match decode_wal_block(&encode_wal_block(&ZSetBatch::new(&schema)), &schema) {
-        Err(ProtocolError::DecodeError(m)) => assert!(m.contains("block holds no rows"), "{m}"),
-        other => panic!("expected a decode error, got {other:?}"),
-    }
 }
 
 /// A region list that does not lay out its schema — a region short, or one
@@ -805,7 +832,7 @@ fn a_region_list_that_does_not_lay_out_its_schema_is_refused() {
     let mut batch = ZSetBatch::new(&schema);
     BatchAppender::new(&mut batch).add_row(1, 1).i64_val(7);
     let regions = batch.wire_regions();
-    let decode = |regions: &[&[u8]]| append_regions(&mut ZSetBatch::new(&schema), regions, &schema, true);
+    let decode = |regions: &[&[u8]]| ZSetBatch::from_own_regions(&schema, regions);
     decode(&regions).expect("the batch's own regions decode");
 
     let short = &regions[..regions.len() - 1];

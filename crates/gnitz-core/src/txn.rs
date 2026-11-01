@@ -16,7 +16,7 @@ use crate::client::GnitzClient;
 use crate::connection::PushFamily;
 use crate::connection::{RelDescriptor, Request, ScanReply, Target};
 use crate::error::ClientError;
-use crate::{PushBatch, Schema, ZSetBatch};
+use crate::{Schema, ZSetBatch};
 
 /// The keys-only read of `schema`: a reply of its PK columns alone, and a rows sink
 /// whose zero-instruction map fills no payload slot.
@@ -157,6 +157,54 @@ impl GnitzClient {
 
 fn no_transaction() -> ClientError {
     ClientError::from("no transaction open".to_string())
+}
+
+/// A batch handed to [`crate::GnitzClient::push`]: borrowed, or shared with
+/// its caller (a batch moved in is shared with no one). A transaction buffers a
+/// shared one without copying it and copies it only when the family it opened
+/// is extended while the caller still holds it.
+pub enum PushBatch<'a> {
+    Borrowed(&'a ZSetBatch),
+    Shared(Arc<ZSetBatch>),
+}
+
+impl From<ZSetBatch> for PushBatch<'_> {
+    fn from(batch: ZSetBatch) -> Self {
+        PushBatch::Shared(Arc::new(batch))
+    }
+}
+
+impl<'a> From<&'a ZSetBatch> for PushBatch<'a> {
+    fn from(batch: &'a ZSetBatch) -> Self {
+        PushBatch::Borrowed(batch)
+    }
+}
+
+impl From<Arc<ZSetBatch>> for PushBatch<'_> {
+    fn from(batch: Arc<ZSetBatch>) -> Self {
+        PushBatch::Shared(batch)
+    }
+}
+
+impl std::ops::Deref for PushBatch<'_> {
+    type Target = ZSetBatch;
+
+    fn deref(&self) -> &ZSetBatch {
+        match self {
+            PushBatch::Borrowed(b) => b,
+            PushBatch::Shared(b) => b,
+        }
+    }
+}
+
+impl PushBatch<'_> {
+    /// The batch as a shareable handle: a borrowed one is copied here.
+    pub(crate) fn into_arc(self) -> Arc<ZSetBatch> {
+        match self {
+            PushBatch::Borrowed(b) => Arc::new(b.clone()),
+            PushBatch::Shared(b) => b,
+        }
+    }
 }
 
 /// A transaction's buffered writes, which [`GnitzClient::push_txn`] ships as one

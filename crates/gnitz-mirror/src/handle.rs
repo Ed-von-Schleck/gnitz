@@ -2,7 +2,6 @@
 //! it through.
 use std::collections::{HashMap, HashSet};
 
-use gnitz_core::append_own_regions;
 use gnitz_core::{DeltaCursor, MirrorError, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
@@ -370,12 +369,9 @@ impl MirrorStore for Mirror {
             .registry
             .scan_spec(tid, spec, reply_schema.layout().layout_digest(), None)
             .map_err(MirrorError::Engine)?;
-        let regions = batch.wire_regions();
-        let mut rows = ZSetBatch::new(reply_schema);
         // The client's own region append, so a local and a remote reply land in
         // one row layout; the cells are this copy's, checked when it ingested them.
-        append_own_regions(&mut rows, &regions, reply_schema).map_err(|e| MirrorError::Engine(e.to_string()))?;
-        Ok(rows)
+        ZSetBatch::from_own_regions(reply_schema, &batch.wire_regions()).map_err(|e| MirrorError::Engine(e.to_string()))
     }
 
     fn cursor_of(&self, tid: u64) -> Option<DeltaCursor> {

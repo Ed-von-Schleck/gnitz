@@ -87,13 +87,13 @@ fn gather_bench() {
     }
 }
 
-/// Instructions per row to append a region list of two payload columns to an
-/// empty batch, as a foreign list and as the process's own: what the German
-/// cell check costs, over all-short cells, all-long cells and integer columns,
-/// which carry no cell to check.
+/// Instructions per row to append two payload columns' rows to an empty batch, as a
+/// decoded WAL block and as the process's own region list: what a block's parse and
+/// German cell check cost over the own-regions append, over all-short cells, all-long
+/// cells and integer columns, which carry no cell to check.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn append_regions_bench() {
+fn region_append_bench() {
     const ROWS: usize = 10_000;
     const ITERS: usize = 200;
     let counter = gnitz_foundation::perf::Counter::instructions();
@@ -122,16 +122,22 @@ fn append_regions_bench() {
             };
         }
         let regions = batch.wire_regions();
-        for foreign in [true, false] {
+        let block = encode_wal_block(&batch);
+        for (arm, wal) in [("a WAL block", true), ("own regions", false)] {
             let ((), instr) = counter.measure(|| {
                 for _ in 0..ITERS {
                     let mut sink = ZSetBatch::with_capacity(&schema, ROWS);
-                    append_regions(&mut sink, black_box(&regions), &schema, black_box(foreign)).unwrap();
+                    if wal {
+                        decode_wal_block_into(&mut sink, black_box(&block), &schema).unwrap();
+                    } else {
+                        sink.check_laid_out(black_box(&regions), &schema).unwrap();
+                        sink.append_region_list(&regions);
+                    }
                     black_box(&sink);
                 }
             });
             println!(
-                "append_regions_bench {shape}, foreign={foreign}: {:.1} instr/row",
+                "region_append_bench {shape}, {arm}: {:.1} instr/row",
                 instr as f64 / (ITERS * ROWS) as f64
             );
         }

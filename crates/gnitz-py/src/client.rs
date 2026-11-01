@@ -333,7 +333,7 @@ impl PyClient {
     /// The rows keyed `pk` — a single-column key's value, or a compound key's
     /// tuple of column values in PK order — read where `scan` reads.
     fn seek(slf: &Bound<'_, Self>, table_id: u64, schema: PySchema, pk: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let keys = py_pks_to_column(&schema.rust, std::slice::from_ref(&pk))?.into_keys();
+        let keys = py_pks_to_column(&schema.rust, std::slice::from_ref(&pk))?.keys();
         Self::read(slf, table_id, schema, ReadSpec::all_rows(ReadBound::PkSet(keys)))
     }
 

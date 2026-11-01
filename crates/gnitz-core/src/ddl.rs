@@ -364,7 +364,7 @@ impl GnitzClient {
         let all = ReadSpec::all_rows(ReadBound::None);
         let [schemas, views, tables] = self.sys_cut([SCHEMA_TAB, VIEW_TAB, TABLE_TAB], &all).await?;
         let at = schema_row(&schemas, &name).ok_or_else(|| not_found("schema", &name))?;
-        let schema_id = schemas.pks.get(at) as u64;
+        let schema_id = gnitz_wire::sys_leading_id(schemas.pks.get_bytes(at));
 
         let mut b = DdlBundle::default();
         for (family, scanned) in [(VIEW_TAB, views), (TABLE_TAB, tables)] {
@@ -466,7 +466,7 @@ impl GnitzClient {
                 let views = &standing.0[0].1;
                 let i = views
                     .live_rows()
-                    .find(|&i| views.pks.get(i) as u64 == vid)
+                    .find(|&i| gnitz_wire::sys_leading_id(views.pks.get_bytes(i)) == vid)
                     .ok_or_else(|| not_found("view", view))?;
                 let row =
                     ViewTabRow::read(views, i).map_err(|e| ProtocolError::DecodeError(format!("view {vid}: {e}")))?;
@@ -638,7 +638,8 @@ impl GnitzClient {
             .submit_scan(SCHEMA_TAB.into(), &all, sys_schema(SCHEMA_TAB));
         let ids = self.session.submit(Request::AllocIds(n));
         let schemas = self.wait(schemas).await?.batch;
-        let schema_id = schema_row(&schemas, schema_name).map(|at| schemas.pks.get(at) as u64);
+        let schema_id =
+            schema_row(&schemas, schema_name).map(|at| gnitz_wire::sys_leading_id(schemas.pks.get_bytes(at)));
         Ok((schema_id, self.wait(ids).await?))
     }
 
@@ -677,7 +678,7 @@ impl GnitzClient {
     ) -> Result<(ZSetBatch, usize), ClientError> {
         let mut keys = PkColumn::empty_for_schema(sys_schema(family));
         keys.push_natives(key);
-        let batch = self.sys_rows(family, ReadBound::PkSet(keys.into_keys())).await?;
+        let batch = self.sys_rows(family, ReadBound::PkSet(keys.keys())).await?;
         let i = batch.live_rows().next().ok_or_else(missing)?;
         Ok((batch, i))
     }
