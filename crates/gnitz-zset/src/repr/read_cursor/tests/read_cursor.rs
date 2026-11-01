@@ -206,6 +206,27 @@ proptest! {
             }
         }
 
+        // A group probe lands on each ascending key's first live row, as an
+        // ascending group seek does, from a cursor opened at the whole store or
+        // at the first key.
+        if let Some(first) = keys.first() {
+            for mut cursor in [open(), from_runs_in_band(runs.iter().cloned(), s, runs.len(), first, None)] {
+                let mut seeking = open();
+                let mut probe = cursor.group_probe();
+                for key in &keys {
+                    let found = probe.find(key).map(|at| {
+                        let mut one = Batch::with_capacity(&s, 1);
+                        probe.copy_row_into(at, &mut one, 1);
+                        weighted_rows(&one).remove(0).0
+                    });
+                    let first_live = (0..mat.len()).find(|&r| pk(r) == &key[..]).map(|r| want[r].0.clone());
+                    prop_assert_eq!(&found, &first_live);
+                    let sought = seeking.seek_pk_group_ascending(key).then(|| current(&seeking).0);
+                    prop_assert_eq!(&found, &sought);
+                }
+            }
+        }
+
         // A key-set gather, drained across chunk boundaries.
         let list = PkKeys::from_sorted(stride, keys.concat());
         let mut gather = PkSetGather::over(open(), list.clone());

@@ -509,22 +509,6 @@ fn carry_heap_charges_the_dropped_slots() {
     );
 }
 
-/// Truncation drops the heap appended since the mark along with its rows.
-#[test]
-fn truncate_to_drops_the_heap_appended_since_the_mark() {
-    let src = make_string_batch(&[(1, 1, &[b'a'; 20]), (2, 1, &[b'b'; 30]), (3, 1, &[b'c'; 40])]);
-    let mut out = Batch::concat(src.schema(), std::iter::once(src.as_mem_batch()));
-    assert_eq!((out.blob.len(), out.dead_heap), (src.blob.len(), 0));
-    let shared = out.mark();
-
-    let fresh = make_string_batch(&[(4, 1, &[b'e'; 50])]);
-    out.append_batch(&fresh);
-    assert!(out.blob.len() > shared.blob_len);
-    out.truncate_to(shared);
-    assert_eq!((out.blob.len(), out.dead_heap), (src.blob.len(), 0));
-    assert_eq!(read_strings(&out), read_strings(&src));
-}
-
 /// Concatenation carries each heap whole: every string reads back, the output
 /// heap is the sum of its inputs', and so is its dead-byte bound.
 #[test]

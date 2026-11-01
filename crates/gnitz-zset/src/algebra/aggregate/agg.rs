@@ -533,6 +533,29 @@ impl AggValues {
     /// extreme.
     pub(crate) fn fold(&mut self, k: usize, mb: &MemBatch, ranges: &[(usize, usize)], groups: impl Groups) {
         let Agg { kind, src, .. } = self.aggs[k];
+        self.fold_column(k, (kind, src), mb, ranges, groups);
+    }
+
+    /// Fold into group `groups[i]` the values of output row `i` of `stored`,
+    /// every row of it: each aggregate over its own column, as a previously
+    /// emitted row's value merges.
+    pub(crate) fn fold_stored_rows(&mut self, stored: &MemBatch, groups: &[u32]) {
+        debug_assert_eq!(stored.len(), groups.len());
+        for k in 0..self.aggs.len() {
+            let Agg { merge, out, .. } = self.aggs[k];
+            self.fold_column(k, (merge, out), stored, &[(0, stored.len())], groups);
+        }
+    }
+
+    /// [`Self::fold`] of aggregate `k` stepping by `kind` over column `src`.
+    fn fold_column(
+        &mut self,
+        k: usize,
+        (kind, src): (StepKind, ColumnLocator),
+        mb: &MemBatch,
+        ranges: &[(usize, usize)],
+        groups: impl Groups,
+    ) {
         macro_rules! fold {
             ($n:expr, $opk:expr, $reg:ty, $contribution:expr) => {
                 fold_cells::<{ $n }, { $opk }, $reg>(&mut self.column(k), mb, src, ranges, groups, $contribution)
@@ -660,15 +683,30 @@ impl AggValues {
         })
     }
 
-    /// Fold into group `g` the values of a previously-emitted output row: every
-    /// aggregate's, or only the linear ones' unless `extremes`.
-    pub(crate) fn fold_stored(&mut self, g: usize, out_row: &impl RowSource, row: usize, extremes: bool) {
+    /// Fold into group `g` the values of a previously-emitted output row.
+    pub(crate) fn fold_stored(&mut self, g: usize, out_row: &impl RowSource, row: usize) {
+        let nulls = out_row.get_null_word(row);
         for k in 0..self.aggs.len() {
             let Agg { merge, out, .. } = self.aggs[k];
-            if extremes || self.aggs[k].is_linear() {
-                self.apply(k, g, (merge, out), out_row, row, 1);
+            match (merge, out) {
+                // An integer sum's merge over an 8-byte cell, read in place.
+                (StepKind::Sum(ScalarKind::Int(_)), ColumnLocator::Payload { slot, size: 8, .. })
+                    if !gnitz_wire::null_word_get(nulls, slot as usize) =>
+                {
+                    let cell = out_row.get_col_ptr(row, slot as usize, 8);
+                    let at = self.at(k, g);
+                    self.acc[at] = self.acc[at].wrapping_add(i64::from_le_bytes(cell.try_into().unwrap()));
+                }
+                _ => self.fold_stored_cell(k, g, out_row, row),
             }
         }
+    }
+
+    /// [`Self::fold_stored`] of aggregate `k` alone.
+    #[inline(never)]
+    fn fold_stored_cell(&mut self, k: usize, g: usize, out_row: &impl RowSource, row: usize) {
+        let Agg { merge, out, .. } = self.aggs[k];
+        self.apply(k, g, (merge, out), out_row, row, 1);
     }
 
     /// Emit one `[key…, group columns…, aggregates…]` row at weight +1, copying
@@ -766,6 +804,141 @@ impl AggValues {
             }
         }
     }
+
+    /// For each `(row, g)` of `rows`, group `g`'s value of every aggregate into
+    /// row `row` of `w`, over whatever cells it held. An extreme renders NULL
+    /// where it has no value and clears its null bit where it has one; a count
+    /// or a sum, never NULL, leaves its bit as it was.
+    pub(crate) fn emit_at(&self, w: &mut DirectWriter<'_>, rows: impl Iterator<Item = (usize, usize)> + Clone) {
+        for (k, agg) in self.aggs.iter().enumerate() {
+            let ColumnLocator::Payload { slot, size, .. } = agg.out else {
+                unreachable!("an aggregate is a payload column")
+            };
+            let (pi, size) = (slot as usize, size as usize);
+            let at = |g: usize| self.at(k, g);
+            let StepKind::Extreme { kind, max } = agg.kind else {
+                put_cells_at(
+                    w.col_mut(pi),
+                    size,
+                    rows.clone().map(|(row, g)| (row, self.acc[at(g)] as u64)),
+                );
+                continue;
+            };
+            match kind {
+                ImageKind::Scalar(kind) => {
+                    let native = |(row, g): (usize, usize)| match self.has[at(g)] {
+                        true => (row, scalar_native_of_image(kind, max, self.acc[at(g)] as u64)),
+                        false => (row, 0),
+                    };
+                    put_cells_at(w.col_mut(pi), size, rows.clone().map(native));
+                }
+                ImageKind::Wide(WideKind::Fixed(_)) => {
+                    let col = w.col_mut(pi);
+                    for (row, g) in rows.clone() {
+                        let cell = &mut col[row * size..(row + 1) * size];
+                        match self.has[at(g)] {
+                            true => cell.copy_from_slice(self.wide(at(g))),
+                            false => cell.fill(0),
+                        }
+                    }
+                }
+                ImageKind::Wide(WideKind::Bytes) => {
+                    let (cells, heap, _) = w.string_col_mut(pi);
+                    for (row, g) in rows.clone() {
+                        let cell = &mut cells[row * 16..(row + 1) * 16];
+                        match self.has[at(g)] {
+                            true => cell.copy_from_slice(&gnitz_wire::encode_german_string(self.wide(at(g)), heap)),
+                            false => cell.fill(0),
+                        }
+                    }
+                }
+            }
+            set_null_bits(
+                w.null_bmp_mut(),
+                pi,
+                rows.clone().map(|(row, g)| (row, !self.has[at(g)])),
+            );
+        }
+    }
+
+    /// Group `g`'s values against the aggregate columns of row `row` of
+    /// `stored`, an output row, each by its type's order, NULL below every
+    /// value: the payload order of two output rows whose other columns are equal,
+    /// as the aggregates are the trailing ones.
+    pub(crate) fn cmp_stored(&self, g: usize, stored: &impl RowSource, row: usize) -> Ordering {
+        let nulls = stored.get_null_word(row);
+        for (k, agg) in self.aggs.iter().enumerate() {
+            let at = self.at(k, g);
+            let ord = match (agg.kind, agg.out) {
+                // A count or an integer sum over an 8-byte cell, never NULL.
+                (
+                    StepKind::Count | StepKind::CountNonNull | StepKind::Sum(ScalarKind::Int(_)),
+                    ColumnLocator::Payload { slot, size: 8, type_code },
+                ) => {
+                    debug_assert!(!gnitz_wire::null_word_get(nulls, slot as usize));
+                    cmp_int8(
+                        self.acc[at] as u64,
+                        stored.get_col_ptr(row, slot as usize, 8),
+                        type_code,
+                    )
+                }
+                // An 8-byte integer extreme with a value, against a cell holding one.
+                (
+                    StepKind::Extreme {
+                        kind: ImageKind::Scalar(kind @ ScalarKind::Int(_)),
+                        max,
+                    },
+                    ColumnLocator::Payload { slot, size: 8, type_code },
+                ) if self.has[at] && !gnitz_wire::null_word_get(nulls, slot as usize) => {
+                    let native = scalar_native_of_image(kind, max, self.acc[at] as u64);
+                    cmp_int8(native, stored.get_col_ptr(row, slot as usize, 8), type_code)
+                }
+                _ => self.cmp_stored_cell(k, at, stored, row, nulls),
+            };
+            if ord.is_ne() {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// [`Self::cmp_stored`] of aggregate `k`'s value `at` alone.
+    #[inline(never)]
+    fn cmp_stored_cell(&self, k: usize, at: usize, stored: &impl RowSource, row: usize, nulls: u64) -> Ordering {
+        let agg = &self.aggs[k];
+        let ColumnLocator::Payload { slot, size, type_code } = agg.out else {
+            unreachable!("an aggregate is a payload column")
+        };
+        let (pi, size) = (slot as usize, size as usize);
+        let null = gnitz_wire::null_word_get(nulls, pi);
+        match agg.kind {
+            StepKind::Extreme { .. } if !self.has[at] => match null {
+                true => Ordering::Equal,
+                false => Ordering::Less,
+            },
+            _ if null => Ordering::Greater,
+            StepKind::Extreme {
+                kind: ImageKind::Wide(WideKind::Bytes), ..
+            } => self.wide(at).cmp(&agg.out.content(stored, row)),
+            StepKind::Extreme {
+                kind: ImageKind::Wide(WideKind::Fixed(_)),
+                ..
+            } => gnitz_wire::cmp_col_window(self.wide(at), stored.get_col_ptr(row, pi, size), type_code),
+            StepKind::Extreme { kind: ImageKind::Scalar(kind), max } => {
+                let bits = scalar_native_of_image(kind, max, self.acc[at] as u64);
+                gnitz_wire::cmp_col_window(
+                    &bits.to_le_bytes()[..size],
+                    stored.get_col_ptr(row, pi, size),
+                    type_code,
+                )
+            }
+            _ => gnitz_wire::cmp_col_window(
+                &(self.acc[at] as u64).to_le_bytes()[..size],
+                stored.get_col_ptr(row, pi, size),
+                type_code,
+            ),
+        }
+    }
 }
 
 /// `values` into `col`'s cells of `size` bytes each, each value's low `size`
@@ -778,6 +951,40 @@ fn put_cells(col: &mut [u8], size: usize, values: impl Iterator<Item = u64>) {
             *cell = (v as T).to_le_bytes();
         }
     })
+}
+
+/// The 8-byte integer `v` against `cell`'s, both of integer type `tc`.
+#[inline(always)]
+fn cmp_int8(v: u64, cell: &[u8], tc: gnitz_wire::TypeCode) -> Ordering {
+    let cell = u64::from_le_bytes(cell.try_into().unwrap());
+    match tc.is_signed_int() {
+        true => (v as i64).cmp(&(cell as i64)),
+        false => v.cmp(&cell),
+    }
+}
+
+/// Each `(row, v)` of `values` into row `row` of `col`'s cells of `size` bytes
+/// each: `v`'s low `size` bytes, little-endian.
+#[inline(always)]
+fn put_cells_at(col: &mut [u8], size: usize, values: impl Iterator<Item = (usize, u64)>) {
+    gnitz_wire::by_cell_width!(size, |T| {
+        let cells = col.as_chunks_mut::<{ size_of::<T>() }>().0;
+        for (row, v) in values {
+            cells[row] = (v as T).to_le_bytes();
+        }
+    })
+}
+
+/// Payload column `pi`'s bit in the null word of each `(row, null)` of `rows`,
+/// set where `null` and cleared elsewhere.
+#[inline(always)]
+fn set_null_bits(null_bmp: &mut [u8], pi: usize, rows: impl Iterator<Item = (usize, bool)>) {
+    let (byte, bit) = (pi / 8, 1u8 << (pi % 8));
+    let words = null_bmp.as_chunks_mut::<8>().0;
+    for (row, null) in rows {
+        let b = &mut words[row][byte];
+        *b = (*b & !bit) | if null { bit } else { 0 };
+    }
 }
 
 /// Rows `ranges` of source column `src`, in row order, each stepping

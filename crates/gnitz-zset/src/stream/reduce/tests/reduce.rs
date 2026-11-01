@@ -146,6 +146,28 @@ fn arb_aggs() -> impl Strategy<Value = Vec<AggDescriptor>> {
     })
 }
 
+/// After every epoch of `ticks` the maintained output is the aggregates of the
+/// integrated input, weights included.
+fn maintains(
+    group_cols: &[u32],
+    aggs: &[AggDescriptor],
+    seeds: bool,
+    folded: bool,
+    ticks: &[Vec<(Row, i64)>],
+) -> Result<(), TestCaseError> {
+    let ground = seeds && group_cols.is_empty();
+    let mut h = Harness::new(ReducePlan::from_wire(&schema(), group_cols, aggs, ground).unwrap());
+    let mut model = BTreeMap::new();
+    h.ground();
+    prop_assert_eq!(h.state(group_cols), aggregates(&model, group_cols, aggs, ground));
+    for targets in ticks {
+        let delta = batch(&delta_to(&mut model, targets));
+        h.tick(if folded { delta.into_consolidated() } else { delta });
+        prop_assert_eq!(h.state(group_cols), aggregates(&model, group_cols, aggs, ground));
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -161,16 +183,22 @@ proptest! {
         folded in any::<bool>(),
         ticks in arb_ticks(arb_row()),
     ) {
-        let ground = seeds && group_cols.is_empty();
-        let mut h = Harness::new(ReducePlan::from_wire(&schema(), group_cols, &aggs, ground).unwrap());
-        let mut model = BTreeMap::new();
-        h.ground();
-        prop_assert_eq!(h.state(group_cols), aggregates(&model, group_cols, &aggs, ground));
-        for targets in &ticks {
-            let delta = batch(&delta_to(&mut model, targets));
-            h.tick(if folded { delta.into_consolidated() } else { delta });
-            prop_assert_eq!(h.state(group_cols), aggregates(&model, group_cols, &aggs, ground));
-        }
+        maintains(group_cols, &aggs, seeds, folded, &ticks)?;
+    }
+
+    /// The same over epochs that touch more groups than one emits a row at a
+    /// time: those copy their stored rows out a column at a time.
+    #[test]
+    fn many_groups_maintain_the_aggregates_of_the_integral(
+        group_cols in prop::sample::select(&GROUPS[1..]),
+        aggs in arb_aggs(),
+        folded in any::<bool>(),
+        ticks in prop::collection::vec(arb_row(), 8..24).prop_flat_map(|pool| {
+            let target = (prop::sample::select(pool), 0i64..=3);
+            prop::collection::vec(prop::collection::vec(target, 0..24), 1..5)
+        }),
+    ) {
+        maintains(group_cols, &aggs, false, folded, &ticks)?;
     }
 
     /// Two workers' partials, relayed to one combine, maintain the global

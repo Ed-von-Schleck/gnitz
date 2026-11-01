@@ -73,15 +73,6 @@ fn copy_regions(schema: &SchemaDescriptor, src: &[u8], src_cap: usize, dst: &mut
     }
 }
 
-/// A batch's end at one moment: its row count, and its heap's length and
-/// dead-byte bound.
-#[derive(Clone, Copy)]
-pub(crate) struct RowMark {
-    count: usize,
-    blob_len: usize,
-    dead_heap: usize,
-}
-
 /// Which row of a batch before [`Batch::consolidate_recording`] each row after
 /// it was.
 pub(crate) enum RowOrigins {
@@ -579,51 +570,6 @@ impl Batch {
         self.consolidated = true;
     }
 
-    /// The batch's current end, to [`Self::truncate_to`] later.
-    #[inline]
-    pub(crate) fn mark(&self) -> RowMark {
-        RowMark {
-            count: self.count,
-            blob_len: self.blob.len(),
-            dead_heap: self.dead_heap,
-        }
-    }
-
-    /// The rows appended since `mark`.
-    #[inline]
-    pub(crate) fn rows_since(&self, mark: RowMark) -> usize {
-        self.count - mark.count
-    }
-
-    /// Drop every row, and every blob byte, appended since `mark`. The dropped
-    /// rows must reference only heap bytes appended since it, as relocated or
-    /// carried cells do, so the heap left behind is as dead as it was then.
-    #[inline]
-    pub(crate) fn truncate_to(&mut self, mark: RowMark) {
-        debug_assert!(mark.count <= self.count && mark.blob_len <= self.blob.len());
-        self.debug_poison_rows(mark.count..self.count);
-        self.count = mark.count;
-        self.blob.truncate(mark.blob_len);
-        self.dead_heap = mark.dead_heap;
-    }
-
-    /// Exchange rows `a` and `b`. Their strings index this batch's own blob, so
-    /// they move with the rows.
-    pub(crate) fn swap_rows(&mut self, a: usize, b: usize) {
-        debug_assert!(a < self.count && b < self.count);
-        if a == b {
-            return;
-        }
-        self.consolidated = false;
-        let (lo, hi) = (a.min(b), a.max(b));
-        for r in 0..self.schema.num_fixed_regions() {
-            let stride = self.schema.region_stride(r);
-            let start = self.region_start(r);
-            let (head, tail) = self.data[start..start + self.count * stride].split_at_mut(hi * stride);
-            head[lo * stride..(lo + 1) * stride].swap_with_slice(&mut tail[..stride]);
-        }
-    }
-
     /// Copy `src`'s claim: sound for a copy of `src` that keeps its
     /// (PK, payload) order, distinctness and weights, which a debug build
     /// verifies.
@@ -694,9 +640,16 @@ impl Batch {
     /// The rows `indices` names, in that order, at their own weights; none may be
     /// weight 0.
     pub(crate) fn indexed_rows(&self, indices: &[u32]) -> Self {
+        self.indexed_rows_then(indices, |_| {})
+    }
+
+    /// [`Self::indexed_rows`], then the writer of those rows handed to `then`,
+    /// to overwrite cells. A row named twice shares its strings' heap bytes.
+    pub(crate) fn indexed_rows_then(&self, indices: &[u32], then: impl FnOnce(&mut DirectWriter<'_>)) -> Self {
         let blob_cap = string_heap::prorated_blob_cap(self.blob.len(), self.count, indices.len());
         write_to_batch(&self.schema, indices.len(), blob_cap, |writer| {
             super::scatter::scatter_copy(&self.as_mem_batch(), indices, writer);
+            then(writer);
         })
     }
 
@@ -994,7 +947,10 @@ impl Batch {
             return;
         }
         // The data buffer stays allocated, at its capacity.
-        self.truncate_to(RowMark { count: 0, blob_len: 0, dead_heap: 0 });
+        self.debug_poison_rows(0..self.count);
+        self.count = 0;
+        self.blob.truncate(0);
+        self.dead_heap = 0;
         self.consolidated = false;
     }
 

@@ -21,11 +21,13 @@ use crate::schema::{compare_pk_ordering, group_floor, with_payload_cmp, PayloadO
 
 mod gather;
 mod output;
+mod probe;
 mod source;
 
 use super::run::Run;
 pub use gather::PkSetGather;
 use gnitz_wire::RowSource;
+pub(crate) use probe::GroupProbe;
 pub use source::{BoundedIndexCursor, SourceCursor};
 
 /// The skeleton rows a split drain set aside instead of copying: their OPK keys, flat
@@ -71,6 +73,14 @@ impl SkeletonKeys {
 pub(crate) struct CursorRow {
     src: u32,
     row: u32,
+}
+
+impl CursorRow {
+    /// This row as a [`Pick`] at `weight`.
+    #[inline]
+    fn pick(self, weight: i64) -> Pick {
+        (self.src, self.row, weight)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,7 +358,7 @@ impl ReadCursor {
     /// The current row as a [`Pick`] at its net weight.
     #[inline]
     fn current_pick(&self) -> Pick {
-        (self.current.src, self.current.row, self.current_weight)
+        self.current.pick(self.current_weight)
     }
 
     /// The source and row of a handle [`Self::current_position`] issued.

@@ -498,27 +498,35 @@ fn gather_unified_col<const N: usize>(
 /// shard column decodes only the blocks the picks land in: the kernel for picks
 /// sparse in their sources, where [`UnifiedSet`] would decode whole windows.
 pub(crate) fn gather_rows(sources: &[impl ColumnarSource], schema: &SchemaDescriptor, picks: &[Pick]) -> Batch {
+    write_to_batch(schema, picks.len(), 0, |w| gather_into(sources, schema, picks, w))
+}
+
+/// [`gather_rows`] into the rows `w` writes, one per pick.
+pub(crate) fn gather_into(
+    sources: &[impl ColumnarSource],
+    schema: &SchemaDescriptor,
+    picks: &[Pick],
+    w: &mut DirectWriter<'_>,
+) {
     let mut direct = DirectCols::new();
     let hoist = picks.len() >= HOIST_PICKS_PER_SOURCE * (sources.len() + 1);
-    write_to_batch(schema, picks.len(), 0, |w| {
-        let fixed = all_direct(&mut direct, hoist, sources, |s| s.direct_fixed());
-        stride_dispatch!(schema.pk_stride(), gather_pk_wt_nbm, sources, picks, fixed, w);
-        for (pi, col) in schema.payload_columns() {
-            if col.type_code.is_german_string() {
-                let (cells, blob, _) = w.string_col_mut(pi);
-                for (cell, &(si, ri, _)) in cells.as_chunks_mut::<16>().0.iter_mut().zip(picks) {
-                    let s = &sources[si as usize];
-                    *cell = relocated_cell(s.german_cell(ri as usize, pi), s.heap(), blob, None);
-                }
-            } else {
-                let cols = all_direct(&mut direct, hoist, sources, |s| s.direct_col(pi).map(|col| [col]));
-                let dst = w.col_mut(pi);
-                gnitz_wire::by_cell_width!(col.size(), |T| gather_cells::<{ size_of::<T>() }>(
-                    sources, picks, pi, cols, dst
-                ));
+    let fixed = all_direct(&mut direct, hoist, sources, |s| s.direct_fixed());
+    stride_dispatch!(schema.pk_stride(), gather_pk_wt_nbm, sources, picks, fixed, w);
+    for (pi, col) in schema.payload_columns() {
+        if col.type_code.is_german_string() {
+            let (cells, blob, _) = w.string_col_mut(pi);
+            for (cell, &(si, ri, _)) in cells.as_chunks_mut::<16>().0.iter_mut().zip(picks) {
+                let s = &sources[si as usize];
+                *cell = relocated_cell(s.german_cell(ri as usize, pi), s.heap(), blob, None);
             }
+        } else {
+            let cols = all_direct(&mut direct, hoist, sources, |s| s.direct_col(pi).map(|col| [col]));
+            let dst = w.col_mut(pi);
+            gnitz_wire::by_cell_width!(col.size(), |T| gather_cells::<{ size_of::<T>() }>(
+                sources, picks, pi, cols, dst
+            ));
         }
-    })
+    }
 }
 
 /// Picks per source, counting one source more for the table's allocation, from
