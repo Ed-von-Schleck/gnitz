@@ -405,7 +405,7 @@ pub(crate) async fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -
             let keys_only = set.is_none();
             let count = client
                 .read_modify_write(&target, bound, Vec::new(), keys_only, |held| {
-                    resolve_conflicts(&rows, held, set.as_deref_mut(), schema)
+                    resolve_conflicts(rows, held, set.as_deref_mut(), schema)
                 })
                 .await?;
             Ok(SqlResult::RowsAffected { tag: "INSERT", count })
@@ -418,7 +418,7 @@ pub(crate) async fn execute_insert(client: &mut GnitzClient, plan: InsertPlan) -
 /// held key is dropped (DO NOTHING) or merged with the SET list (DO UPDATE). A
 /// `held` holding a key outside `rows`, or one key twice, is a malformed reply.
 fn resolve_conflicts(
-    rows: &ZSetBatch,
+    rows: ZSetBatch,
     held: ZSetBatch,
     set: Option<&mut [SetCol]>,
     schema: &Schema,
@@ -432,17 +432,18 @@ fn resolve_conflicts(
             None => Err(malformed_reply("a key that was not read")),
         })
         .collect::<Result<Vec<usize>, _>>()?;
-    let mut out = ZSetBatch::with_capacity(schema, rows.len());
-    for i in (0..rows.len()).filter(|&i| !is_held[i]) {
-        out.copy_row_at(rows, i, 1);
-    }
-    if let Some(set) = set {
-        // `held` is the `Existing` scope, so `SET x = x + 1` reads the row a
-        // transaction buffered; `excluded` is the VALUES row each one collided with.
-        let mut excluded = ZSetBatch::with_capacity(schema, held.len());
+    // `held` is the `Existing` scope, so `SET x = x + 1` reads the row a
+    // transaction buffered; `excluded` is the VALUES row each one collided with.
+    let excluded = set.is_some().then(|| {
+        let mut ex = ZSetBatch::with_capacity(schema, collided.len());
         for &i in &collided {
-            excluded.copy_row_at(rows, i, 1);
+            ex.copy_row_at(&rows, i, 1);
         }
+        ex
+    });
+    let kept: Vec<u32> = (0..rows.len() as u32).filter(|&i| !is_held[i as usize]).collect();
+    let mut out = rows.gather(&kept);
+    if let (Some(set), Some(excluded)) = (set, excluded) {
         out.extend_from_owned(apply_set(set, held, Some(&excluded), schema)?);
     }
     Ok(out)
