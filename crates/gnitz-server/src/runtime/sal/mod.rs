@@ -239,6 +239,16 @@ impl<'a> SalGroup<'a> {
         }
     }
 
+    /// The workers a payload of the group is written for at width `nw`, in
+    /// directory order: a shared group carries one payload, which [`Self::msg`]
+    /// builds alike for every worker; any other carries one per addressed worker.
+    fn payloads(&self, nw: usize) -> WorkerSet {
+        match self.data {
+            GroupData::Same(_) => WorkerSet::one(0),
+            _ => self.targets.set.within(nw),
+        }
+    }
+
     /// Worker `w`'s message over `head`, the request's template. The one
     /// definition — sizing and encoding both go through it, so a payload's size
     /// and its bytes cannot disagree.
@@ -1046,9 +1056,7 @@ impl<'a> SalExcl<'a> {
             shared || g.data.holders().union(set) == set,
             "a group addresses every worker it has rows for"
         );
-        // A shared group carries one payload, which `msg` builds alike for every
-        // worker; any other carries one per addressed worker, in set order.
-        let payloads = if shared { WorkerSet::one(0) } else { set };
+        let payloads = g.payloads(nw);
         let mut sizes = [0usize; MAX_WORKERS];
         for (i, w) in payloads.iter().enumerate() {
             sizes[i] = g.msg(&template, w).size();
@@ -1174,10 +1182,21 @@ impl SalScope<'_, '_> {
         Ok(())
     }
 
-    /// Nothing is laid out in the epoch, this scope included: a group refused
-    /// here does not fit an empty log.
-    pub(crate) fn log_is_empty(&self) -> bool {
-        self.excl.writer.write_cursor.get() == 0
+    /// The log bytes `g` occupies, wherever it is laid out.
+    pub(crate) fn footprint(&self, g: &SalGroup) -> usize {
+        let (_, _, template) = g.request.encode();
+        let payloads = g.payloads(self.excl.writer.parks.len());
+        group_total_size(
+            group_header_size(payloads.len()),
+            payloads.iter().map(|w| g.msg(&template, w).size()),
+        )
+    }
+
+    /// Whether `bytes` of groups of `kind`, laid out back to back, fit a log
+    /// with nothing else in its epoch: whether a checkpoint can make room for
+    /// them.
+    pub(crate) fn fits_empty_log(&self, kind: SalMessageKind, bytes: usize) -> bool {
+        bytes <= group_limit(kind, self.excl.writer.log.ring_len)
     }
 
     /// Run `f`, and take back every group it laid out when it fails: nothing in

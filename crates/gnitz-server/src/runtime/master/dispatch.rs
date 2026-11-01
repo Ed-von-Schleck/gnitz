@@ -7,8 +7,8 @@ use std::time::Duration;
 use super::route::with_routed;
 use super::*;
 use crate::catalog::{ZoneError, ZoneSink};
-use crate::runtime::reactor::AckLease;
-use crate::runtime::sal::{Apply, SalRequest, SalScope};
+use crate::runtime::reactor::{AckLease, GroupTargets};
+use crate::runtime::sal::{Apply, SalMessageKind, SalRequest, SalScope};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io::retry_eintr;
 
@@ -207,26 +207,49 @@ impl MasterDispatcher {
         }
     }
 
-    /// Lay one push batch out as a SAL group inside `scope`, written to the
-    /// workers that own its rows, and answer the lease those workers ACK on and
-    /// whether the group rides inside the zone. A base table's rows do; a
-    /// stream's, which no restart recovers, ride outside.
-    pub(crate) fn write_commit_group(
-        &self,
-        scope: &mut SalScope,
-        target_id: u64,
-        batch: &Batch,
-    ) -> Result<(AckLease, bool), WireFault> {
+    /// The SAL group of one push of `batch` to `target_id`, addressed to the
+    /// workers that own its rows and to no reply, handed to `f` with whether it
+    /// rides inside the zone. A base table's rows do; a stream's, which no
+    /// restart recovers, ride outside.
+    fn with_commit_group<R>(&self, target_id: u64, batch: &Batch, f: impl FnOnce(SalGroup<'_>, bool) -> R) -> R {
         let cat = self.cat();
         let (rel, record) = cat
             .wire_target(target_id)
             .expect("a push target is registered under the catalog lock");
         let recoverable = rel.kind().is_base_table();
         with_routed(batch, rel.placement(), self.num_workers(), |data| {
-            let lease = self.reactor.lease_acks(data.holders());
-            scope.write(&SalGroup::push(target_id, record, data, lease.targets()), recoverable)?;
+            let targets = GroupTargets { set: data.holders(), reply: None };
+            f(SalGroup::push(target_id, record, data, targets), recoverable)
+        })
+    }
+
+    /// Lay one push batch out as a SAL group inside `scope`, and answer the
+    /// lease its workers ACK on and whether the group rides inside the zone.
+    pub(crate) fn write_commit_group(
+        &self,
+        scope: &mut SalScope,
+        target_id: u64,
+        batch: &Batch,
+    ) -> Result<(AckLease, bool), WireFault> {
+        self.with_commit_group(target_id, batch, |g, recoverable| {
+            let lease = self.reactor.lease_acks(g.targets.set);
+            scope.write(&SalGroup { targets: lease.targets(), ..g }, recoverable)?;
             Ok((lease, recoverable))
         })
+    }
+
+    /// Whether the commit groups of `families`, laid out back to back as
+    /// [`Self::write_commit_group`] lays each out, fit a log with nothing else
+    /// in its epoch: whether a checkpoint can make room for them.
+    pub(crate) fn commit_fits_empty_log<'b>(
+        &self,
+        scope: &SalScope,
+        families: impl IntoIterator<Item = (u64, &'b Batch)>,
+    ) -> bool {
+        let bytes = (families.into_iter())
+            .map(|(target_id, batch)| self.with_commit_group(target_id, batch, |g, _| scope.footprint(&g)))
+            .sum();
+        scope.fits_empty_log(SalMessageKind::Push, bytes)
     }
 
     /// Post-ACK checkpoint cleanup, run once a round's Flush ACKs are in: flush

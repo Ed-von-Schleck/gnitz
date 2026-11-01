@@ -1,9 +1,9 @@
 use super::fixtures::{group_at, scan, test_log};
 use super::{
-    decode_sal_frame, epoch_word, group_header_size, prefix_atomic, stamp_digest, Apply, EpochGate, GroupData,
-    GroupHead, GroupTargets, Inbound, SalGroup, SalLog, SalMessageKind, SalReader, SalRequest, SalStep, SalWriter,
-    WorkerSet, ANCHOR_BYTES, CHECKPOINT_RESERVE, FLAG_JOINS_CUT, FLAG_SHARED, FLAG_ZONE_END, HDR_PREFIX, KNOWN_FLAGS,
-    MAX_WORKERS, OFF_FLAGS, OFF_KIND, OFF_LSN, OFF_TARGETS, OFF_WIDTH, PREFIX_BYTES, PRESENT,
+    decode_sal_frame, epoch_word, group_header_size, group_limit, prefix_atomic, stamp_digest, Apply, EpochGate,
+    GroupData, GroupHead, GroupTargets, Inbound, SalGroup, SalLog, SalMessageKind, SalReader, SalRequest, SalStep,
+    SalWriter, WorkerSet, ANCHOR_BYTES, CHECKPOINT_RESERVE, FLAG_JOINS_CUT, FLAG_SHARED, FLAG_ZONE_END, HDR_PREFIX,
+    KNOWN_FLAGS, MAX_WORKERS, OFF_FLAGS, OFF_KIND, OFF_LSN, OFF_TARGETS, OFF_WIDTH, PREFIX_BYTES, PRESENT,
 };
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
@@ -237,6 +237,37 @@ fn a_failed_unit_is_taken_back_and_the_rest_commits() {
         log.log().read_at(taken_back, EpochGate::Live(1)),
         SalStep::Absent
     ));
+}
+
+/// A group's footprint is what laying it out advances the cursor by, a shared
+/// group's one payload and a per-worker group's several alike; groups fit an
+/// empty log up to the limit of their kind and no further.
+#[test]
+fn a_footprint_is_the_cursor_advance_and_an_empty_log_admits_up_to_the_limit() {
+    let log = test_log(1 << 20, 3, 1);
+    let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10), (2, 1, 20)]);
+    let record = encode_schema_block(batch.schema());
+    let each = [batch.wire_whole(), None, batch.wire_whole()];
+    let pushed = GroupTargets {
+        set: WorkerSet::one(0).union(WorkerSet::one(2)),
+        reply: None,
+    };
+    let spec = vec![7u8; 1000];
+    let groups = [
+        SalGroup::new(scan(4, &spec)),
+        SalGroup::push(16, &record, GroupData::Same(batch.wire_whole()), GroupTargets::SILENT),
+        SalGroup::push(16, &record, GroupData::Each(&each), pushed),
+    ];
+    let mut excl = log.excl();
+    let mut scope = excl.begin("test");
+    for (i, g) in groups.iter().enumerate() {
+        let (at, footprint) = (log.cursor(), scope.footprint(g));
+        scope.write(g, false).expect("group fits");
+        assert_eq!(log.cursor() - at, footprint as u64, "group {i}");
+    }
+    let limit = group_limit(SalMessageKind::Push, 1 << 20);
+    assert!(scope.fits_empty_log(SalMessageKind::Push, limit));
+    assert!(!scope.fits_empty_log(SalMessageKind::Push, limit + 1));
 }
 
 /// The writer holds pushes once a scope commits a zone with a push in it, and

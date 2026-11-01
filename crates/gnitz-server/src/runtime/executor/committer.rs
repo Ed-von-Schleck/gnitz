@@ -365,9 +365,9 @@ fn write_disjoint_tables(units: &[CommitUnit]) -> bool {
 ///
 /// Leaves in `s.writes` the writes to commit again behind a checkpoint: the
 /// first unit the SAL had no room for, and every unit after it. A unit of one
-/// write refused on an empty log never fits and fails instead. A merged run
-/// comes back as the writes it merged, which a batch that does not `merge`
-/// commits one by one. `s.units` and `s.leases` are empty again on return.
+/// write too large for a log with nothing else in its epoch fails instead. A
+/// merged run comes back as the writes it merged, which a batch that does not
+/// `merge` commits one by one. `s.units` and `s.leases` are empty again on return.
 async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
     // One-family writes in tid runs. Stable: arrival order within a run is what
     // makes intra-batch last-insert-wins mean last *inserted*.
@@ -429,7 +429,6 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
         // would wait in Phase C for an ACK that never comes.
         let mut refused_at = None;
         for (at, unit) in s.units.iter_mut().enumerate() {
-            let fits_nowhere = scope.log_is_empty() && !unit.is_merged();
             let mark = s.leases.len();
             let mut unit_in_zone = false;
             let written = scope.all_or_nothing(|scope| {
@@ -449,7 +448,13 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
                         *in_zone = unit_in_zone;
                     }
                 }
-                Err(e) if e.status == WireStatus::SalFull && !fits_nowhere => {
+                // A merged run goes again as the writes it merged; a unit of one
+                // write, if a checkpoint can make room for it.
+                Err(e)
+                    if e.status == WireStatus::SalFull
+                        && (unit.is_merged()
+                            || disp.commit_fits_empty_log(&scope, unit.laid().iter().map(|f| (f.tid, &f.batch)))) =>
+                {
                     refused_at = Some(at);
                     break;
                 }
