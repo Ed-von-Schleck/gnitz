@@ -58,7 +58,7 @@ fn rows(schema: &Schema, pks: Range<i64>) -> ZSetBatch {
     let mut batch = ZSetBatch::new(schema);
     let mut app = BatchAppender::new(&mut batch);
     for pk in pks {
-        app.add_row(pk as u128, 1).i64_val(pk * 3);
+        app.add_row(pk as u128, 1).int_val(pk * 3);
     }
     batch
 }
@@ -162,7 +162,7 @@ fn pipelined_verbs() {
             // Every kind of verb in flight together, behind a push that replaces
             // a row rather than adding to it.
             let mut replaced = ZSetBatch::new(&schema);
-            BatchAppender::new(&mut replaced).add_row(7, 1).i64_val(-1);
+            BatchAppender::new(&mut replaced).add_row(7, 1).int_val(-1);
             let key = PkColumn::from_natives(&schema, [7]);
             let (all, reply) = (ReadSpec::all_rows(ReadBound::None), Arc::clone(&schema));
             let resolve = |name: &'static str| {
@@ -236,6 +236,7 @@ fn one_writev_per_burst() {
     let srv = ServerHandle::start();
     let (mut blocking, tid, schema, _sn) = table(srv.sock_path());
     let Some(counts) = strace_test(
+        module_path!(),
         "syscall_count_child",
         &[
             ("GNITZ_TOKIO_TARGET", srv.sock_path()),

@@ -36,14 +36,6 @@ pub const MAX_IN_FLIGHT: usize = 4096;
 /// without flushing.
 pub const MAX_QUEUED_BYTES: usize = 64 << 20;
 
-/// A cap on a connection's outstanding requests.
-enum Cap {
-    /// [`MAX_IN_FLIGHT`] requests unanswered.
-    InFlight,
-    /// [`MAX_QUEUED_BYTES`] bytes queued and unwritten.
-    QueuedBytes,
-}
-
 /// One relation's read result.
 #[derive(Debug)]
 pub struct ScanReply {
@@ -58,11 +50,11 @@ pub struct ScanReply {
 
 /// One page of a snapshot read.
 #[derive(Debug)]
-pub struct SnapshotPage {
+pub(crate) struct SnapshotPage {
     /// Each train's rows in key order, one train after another.
-    pub batch: ZSetBatch,
+    pub(crate) batch: ZSetBatch,
     /// Where each train's rows end in `batch`.
-    pub worker_ends: Vec<usize>,
+    pub(crate) worker_ends: Vec<usize>,
 }
 
 /// One relation, as a RESOLVE describes it.
@@ -111,7 +103,7 @@ pub use gnitz_wire::txn_frame::{DeltaCursor, SubId};
 
 /// A request answered by one value — an LSN, or the base id of a run. It
 /// borrows its inputs; the borrow ends at [`Session::submit`].
-pub enum Request<'a> {
+pub(crate) enum Request<'a> {
     /// A run of this many catalog object ids.
     AllocIds(u64),
     /// A run of `count` ids from the SERIAL sequence of `table`.
@@ -121,7 +113,7 @@ pub enum Request<'a> {
     DdlTxn(&'a [(u64, ZSetBatch)]),
     /// An atomic user-table push transaction: the server refuses it if some
     /// family's relation was written after that family's `basis`.
-    PushTxn { families: &'a [PushFamily] },
+    PushTxn(&'a [PushFamily]),
     /// PUSH. The frame always carries `schema`'s record.
     Push {
         target: Target,
@@ -156,7 +148,7 @@ impl Request<'_> {
                 }
                 return Ok((encode_ddl_txn(families), 0));
             }
-            Request::PushTxn { families } => {
+            Request::PushTxn(families) => {
                 for f in families {
                     f.batch.validate(&f.schema)?;
                 }
@@ -307,10 +299,8 @@ struct Train {
     /// The continuation frames' blocks, undecoded until the train terminates
     /// so its batch is sized once for every worker's rows.
     held: Vec<RawBlock>,
-    /// The rows of the blocks taken so far, held or decoded.
+    /// The rows of every block taken so far, held or terminal.
     rows: usize,
-    /// Every block's rows, in arrival order, once the train has terminated.
-    data: Option<ZSetBatch>,
 }
 
 impl Train {
@@ -320,56 +310,39 @@ impl Train {
             schema: Arc::clone(schema),
             held: Vec::new(),
             rows: 0,
-            data: None,
         }
     }
 
-    /// Take the data block at `block` of `frame`. A continuation frame's block
-    /// is kept, its header checked at once and the frame owned, since a
-    /// borrowed one lives in the transport window; the terminal frame's block
-    /// is decoded in place behind the held ones.
+    /// Take the data block at `block` of `frame`, its header checked at once.
+    /// A continuation frame's is held, the frame owned, since a borrowed one
+    /// lives in the transport window; the terminal frame's is decoded in place
+    /// by [`Self::finish`], behind the held ones.
     fn take(
         &mut self,
         frame: &mut Cow<'_, [u8]>,
         block: std::ops::Range<usize>,
         more: bool,
     ) -> Result<(), ProtocolError> {
+        self.rows += parse_wal_block(&frame[block.clone()], &self.schema)?.rows;
         if more {
-            self.rows += parse_wal_block(&frame[block.clone()], &self.schema)?.rows;
             let frame = std::mem::take(frame).into_owned();
             self.held.push(RawBlock { frame, block });
-            Ok(())
-        } else {
-            self.settle(Some(&frame[block]))
         }
-    }
-
-    /// Decode the held blocks, then `last`, into the train's batch.
-    fn settle(&mut self, last: Option<&[u8]>) -> Result<(), ProtocolError> {
-        if self.held.is_empty() && last.is_none() {
-            return Ok(());
-        }
-        let schema = &self.schema;
-        let sink = self.data.get_or_insert_with(|| ZSetBatch::new(schema));
-        let held = std::mem::take(&mut self.held);
-        decode_wal_blocks_into(sink, held.iter().map(RawBlock::block).chain(last), schema)?;
-        self.rows = sink.len();
         Ok(())
     }
 
-    fn len(&self) -> usize {
-        self.rows
+    /// The train's rows: the held blocks, then the terminal frame's block
+    /// `last`, decoded in place.
+    fn finish(&mut self, last: Option<&[u8]>) -> Result<ZSetBatch, ProtocolError> {
+        let mut batch = ZSetBatch::new(&self.schema);
+        let held = std::mem::take(&mut self.held);
+        decode_wal_blocks_into(&mut batch, held.iter().map(RawBlock::block).chain(last), &self.schema)?;
+        Ok(batch)
     }
 
-    fn take_batch(&mut self) -> Result<ZSetBatch, ProtocolError> {
-        self.settle(None)?;
-        self.rows = 0;
-        Ok(self.data.take().unwrap_or_else(|| ZSetBatch::new(&self.schema)))
-    }
-
-    fn reply(&mut self, lsn: Option<u64>) -> Result<ScanReply, ProtocolError> {
+    fn reply(&mut self, last: Option<&[u8]>, lsn: Option<u64>) -> Result<ScanReply, ProtocolError> {
         Ok(ScanReply {
-            batch: self.take_batch()?,
+            batch: self.finish(last)?,
             schema: Arc::clone(&self.schema),
             lsn,
         })
@@ -560,7 +533,7 @@ impl Inbox {
 /// (reply, sync and pushed lanes, delta-poll/subscription routing). Exactly one
 /// owner of that state: a [`crate::GnitzClient`], whose host decides how it
 /// waits.
-pub struct Session {
+pub(crate) struct Session {
     transport: ClientTransport,
     inbox: Inbox,
     submitted: u64,
@@ -584,7 +557,7 @@ impl AsFd for Session {
 impl Session {
     /// `target` is an AF_UNIX socket path or a `tls://` target (see
     /// `ClientTransport::connect`).
-    pub fn connect(target: &str) -> Result<Self, ClientError> {
+    pub(crate) fn connect(target: &str) -> Result<Self, ClientError> {
         Ok(Self::over(ClientTransport::connect(
             target,
             Instant::now() + CONNECT_TIMEOUT,
@@ -605,7 +578,7 @@ impl Session {
 
     /// Requests submitted since this session connected — one per `submit`,
     /// however the bytes were batched. HELLO predates the session, uncounted.
-    pub fn requests_sent(&self) -> u64 {
+    pub(crate) fn requests_sent(&self) -> u64 {
         self.submitted
     }
 
@@ -614,7 +587,7 @@ impl Session {
     /// Encode and queue `req`. A request this session refuses — one that
     /// does not validate, or at either cap — is answered with the refusal, as
     /// every submit's is.
-    pub fn submit(&mut self, req: Request<'_>) -> Sent<u64> {
+    pub(crate) fn submit(&mut self, req: Request<'_>) -> Sent<u64> {
         let (frame, tid) = match req.encode() {
             Ok(encoded) => encoded,
             Err(why) => return Sent::ready(Err(why)),
@@ -634,7 +607,7 @@ impl Session {
     }
 
     /// SCAN_SPEC, replied in `reply_schema`'s layout.
-    pub fn submit_scan(
+    pub(crate) fn submit_scan(
         &mut self,
         target: Target,
         spec: &gnitz_wire::ReadSpec,
@@ -683,7 +656,7 @@ impl Session {
         scans: &[(Target, &gnitz_wire::ReadSpec, &Arc<Schema>)],
     ) -> Sent<Vec<ScanReply>> {
         if scans.is_empty() {
-            return Sent::ready(Err(ClientError::from("a multi-read names no relation".to_string())));
+            return Sent::ready(Err(ClientError::from("a multi-read names no relation")));
         }
         let specs: Vec<Vec<u8>> = scans.iter().map(|(_, spec, _)| spec.encode()).collect();
         let items: Vec<txn_frame::ScanItem> = scans
@@ -818,25 +791,16 @@ impl Session {
         let (total, limit) = (frame.len(), gnitz_wire::MAX_FRAME_PAYLOAD);
         // A frame past the ceiling is refused here rather than by the server's
         // ingress cap, which would drop the connection.
-        let refusal = if total > limit {
-            Some(ClientError::from(format!(
+        if total > limit {
+            return Err(ClientError::from(format!(
                 "request frame is {total} bytes, exceeding the {limit}-byte server ingress cap; \
                  split the request"
-            )))
-        } else if let Some(why) = &self.ended {
-            Some(why.clone())
-        } else {
-            self.cap_hit().map(|cap| {
-                ClientError::from(match cap {
-                    Cap::InFlight => format!("connection has {MAX_IN_FLIGHT} requests in flight"),
-                    Cap::QueuedBytes => format!(
-                        "connection has {} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap",
-                        self.transport.queued_bytes()
-                    ),
-                })
-            })
-        };
-        if let Some(why) = refusal {
+            )));
+        }
+        if let Some(why) = &self.ended {
+            return Err(why.clone());
+        }
+        if let Some(why) = self.cap_refusal() {
             return Err(why);
         }
         self.transport.enqueue(frame);
@@ -850,7 +814,7 @@ impl Session {
     ///
     /// A failure ends the session: every reply still owed arrives as
     /// [`ClientError::ConnectionLost`], after those that completed.
-    pub fn step(&mut self, ready: Interest) {
+    pub(crate) fn step(&mut self, ready: Interest) {
         if ready.read {
             self.read();
         }
@@ -945,23 +909,27 @@ impl Session {
     /// back-pressure rather than an error. Each cap implies its own interest
     /// bit, so gating on it loses no wakeup.
     pub(crate) fn at_capacity(&self) -> bool {
-        self.cap_hit().is_some()
+        self.inbox.in_flight() >= MAX_IN_FLIGHT || self.transport.queued_bytes() >= MAX_QUEUED_BYTES
     }
 
-    /// The cap [`Self::submit`] refuses on that is reached, if any.
-    fn cap_hit(&self) -> Option<Cap> {
-        if self.inbox.in_flight() >= MAX_IN_FLIGHT {
-            Some(Cap::InFlight)
-        } else if self.transport.queued_bytes() >= MAX_QUEUED_BYTES {
-            Some(Cap::QueuedBytes)
-        } else {
-            None
+    /// The refusal [`Self::submit`] answers at a reached cap, if one is.
+    fn cap_refusal(&self) -> Option<ClientError> {
+        if !self.at_capacity() {
+            return None;
         }
+        let why = match self.inbox.in_flight() >= MAX_IN_FLIGHT {
+            true => format!("connection has {MAX_IN_FLIGHT} requests in flight"),
+            false => format!(
+                "connection has {} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap",
+                self.transport.queued_bytes()
+            ),
+        };
+        Some(ClientError::from(why))
     }
 
     /// `READ` while any request is unanswered; `WRITE` while bytes remain queued
     /// or rustls has ciphertext to ship. Nothing once the session has ended.
-    pub fn interest(&self) -> Interest {
+    pub(crate) fn interest(&self) -> Interest {
         if self.ended.is_some() {
             return Interest::NONE;
         }
@@ -972,7 +940,7 @@ impl Session {
     }
 
     /// Whether this session has ended, and refuses work.
-    pub fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.ended.is_some()
     }
 
@@ -1060,14 +1028,15 @@ impl Slot {
 
         if let Slot::Page { train, worker_ends, .. } = &mut *self {
             if ctrl.hdr.flags.scan_last {
-                worker_ends.push(train.len());
+                worker_ends.push(train.rows);
             }
         }
         if ctrl.hdr.flags.continuation {
             return Ok(false);
         }
 
-        // The train terminated.
+        // The train terminated; a train slot's last block is still in `buf`.
+        let last = || ctrl.data.clone().map(|block| &buf[block]);
         let cursor = || {
             DeltaCursor::from_pair(ctrl.hdr.arg1, ctrl.hdr.arg0)
                 .ok_or_else(|| ProtocolError::DecodeError("a delta-poll terminal at round 0".into()))
@@ -1075,9 +1044,9 @@ impl Slot {
         match self {
             Slot::Ack { to, .. } => to.fulfil(Ok(ctrl.hdr.arg0)),
             Slot::Resolve { to } => to.fulfil(Ok(resolve_descriptor(&ctrl, &buf)?)),
-            Slot::Scan(Scan::One { train, to }) => to.fulfil(Ok(train.reply(Some(ctrl.hdr.arg0))?)),
+            Slot::Scan(Scan::One { train, to }) => to.fulfil(Ok(train.reply(last(), Some(ctrl.hdr.arg0))?)),
             Slot::Scan(Scan::All { trains, replies, to }) => {
-                let reply = trains[replies.len()].reply(Some(ctrl.hdr.arg0))?;
+                let reply = trains[replies.len()].reply(last(), Some(ctrl.hdr.arg0))?;
                 replies.push(reply);
                 if replies.len() < trains.len() {
                     return Ok(false);
@@ -1085,21 +1054,22 @@ impl Slot {
                 to.fulfil(Ok(std::mem::take(replies)))
             }
             Slot::Page { train, worker_ends, to } => {
+                let batch = train.finish(last())?;
                 // The next page's rows are shared over the stores this one
                 // names, so a page naming none is no reply to a page request.
                 if worker_ends.is_empty() {
                     return Err(ProtocolError::DecodeError("a snapshot page naming no worker".into()));
                 }
-                let batch = train.take_batch()?;
                 let worker_ends = std::mem::take(worker_ends);
                 to.fulfil(Ok(SnapshotPage { batch, worker_ends }))
             }
             Slot::Delta { train, keep, to } => {
                 let cursor = cursor()?;
+                let reply = train.reply(last(), None)?;
                 if let Some(id) = *keep {
                     polls.hold(id, cursor);
                 }
-                to.fulfil(Ok((train.reply(None)?, cursor)))
+                to.fulfil(Ok((reply, cursor)))
             }
             Slot::DeltaPoll { views, at, poll, first } => {
                 polls.reader_end(*poll, kept_as(*first, *at), Ok(cursor()?));

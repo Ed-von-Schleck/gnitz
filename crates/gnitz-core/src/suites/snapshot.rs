@@ -3,7 +3,7 @@
 //! checkpoint that a server boots on.
 
 use super::*;
-use gnitz_core::{BatchAppender, PkColumn, DEFAULT_PAGE_ROWS};
+use crate::{BatchAppender, PkColumn, DEFAULT_PAGE_ROWS};
 use gnitz_wire::TableDistribution;
 
 const WORKERS: usize = 4;
@@ -79,7 +79,7 @@ fn pages_of_a_compound_key_return_every_row_once() {
     for a in -40i32..40 {
         for b in [0u8, 1, 254, 255] {
             app.add_row_natives(&[a as i128 as u128, b as u128], 1)
-                .i64_val(a as i64 * 1000 + b as i64);
+                .int_val(a as i64 * 1000 + b as i64);
             want.push(a as i64 * 1000 + b as i64);
         }
     }

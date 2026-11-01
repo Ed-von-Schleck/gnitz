@@ -1,4 +1,4 @@
-//! [`gnitz_core::key_reply`]: a `ReadSpec` rows sink whose reply is **nothing but
+//! [`key_reply`](crate::txn::key_reply): a `ReadSpec` rows sink whose reply is **nothing but
 //! the primary key**, a PK-only reply schema plus a zero-instruction projection
 //! program.
 //!
@@ -9,7 +9,7 @@
 //! non-adjacent compound PK whose OPK sign flip must survive.
 
 use super::*;
-use gnitz_core::key_reply;
+use crate::txn::key_reply;
 use gnitz_expr::CmpOp;
 use gnitz_zset_testkit::cmp_all;
 
@@ -50,7 +50,7 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
     let mut batch = ZSetBatch::new(&schema);
     let mut app = BatchAppender::new(&mut batch);
     for i in 1u64..=200 {
-        app.add_row(i as u128, 1).i64_val(i as i64).str_val(&"x".repeat(300));
+        app.add_row(i as u128, 1).int_val(i as i64).str_val(&"x".repeat(300));
     }
     block_on(client.push(tid, &schema, &batch, WireConflictMode::Update)).unwrap();
 
@@ -90,7 +90,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     for &(c3, c0, c2) in &rows {
         app.add_row_natives(&[c3 as u128, c0 as u128], 1)
             .str_val("payload")
-            .i64_val(c2);
+            .int_val(c2);
     }
     block_on(client.push(tid, &schema, &batch, WireConflictMode::Update)).unwrap();
 

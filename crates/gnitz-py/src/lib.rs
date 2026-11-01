@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use pyo3::prelude::*;
 
-use gnitz_core::{ClientError, MirrorError};
+use gnitz_core::ClientError;
 use gnitz_wire::{TypeCode, WireStatus};
 
 mod aio;
@@ -118,8 +118,8 @@ pub(crate) fn client_err(e: ClientError) -> PyErr {
             Some(py_err) => Python::attach(|py| py_err.clone_ref(py)),
             None => gnitz_err(inner),
         },
-        ClientError::Mirror(MirrorError::Poisoned) => GnitzMirrorPoisonedError::new_err(e.to_string()),
-        e @ ClientError::Mirror(MirrorError::Engine(_)) => gnitz_err(e),
+        ClientError::MirrorPoisoned => GnitzMirrorPoisonedError::new_err(e.to_string()),
+        e @ ClientError::Mirror(_) => gnitz_err(e),
     }
 }
 

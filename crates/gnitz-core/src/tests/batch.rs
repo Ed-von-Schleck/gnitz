@@ -44,8 +44,8 @@ fn validate_refuses_each_malformed_batch() {
     let mut base = ZSetBatch::new(&schema);
     {
         let mut a = BatchAppender::new(&mut base);
-        a.add_row(1, 1).i64_val(10).str_val("x");
-        a.add_row(2, -1).i64_val(20).null();
+        a.add_row(1, 1).int_val(10).str_val("x");
+        a.add_row(2, -1).int_val(20).null();
     }
     base.validate(&schema)
         .expect("a NULL over a zeroed nullable cell validates");
@@ -258,17 +258,17 @@ fn the_appender_writes_each_value_into_its_slot() {
     let mut batch = ZSetBatch::new(&schema);
     BatchAppender::new(&mut batch)
         .add_row(7, 1)
-        .u64_val(100)
+        .int_val(100)
         .str_val(spilled)
-        .i64_val(-5)
+        .int_val(-5)
         .f64_val(1.5)
         .u128_val(wide)
         .bytes_val(b"xy");
     BatchAppender::new(&mut batch)
         .add_row(8, -1)
-        .u64_val(200)
+        .int_val(200)
         .str_val("short")
-        .i64_val(6)
+        .int_val(6)
         .f64_val(-2.5)
         .u128_val(1)
         .null();
@@ -338,14 +338,14 @@ fn int_val_refuses_a_value_its_column_cannot_hold() {
 }
 
 /// A fixed-width value written into a German-string column panics before the
-/// region can go out of shape — one message for `u64_val`/`i64_val`/`u128_val`,
+/// region can go out of shape — one message for `f64_val`/`f32_val`/`u128_val`,
 /// since they share one body.
 #[test]
 #[should_panic(expected = "a fixed-width value cannot be written to the String column")]
 fn a_fixed_value_in_a_string_column_panics() {
     let schema = kv_schema(TypeCode::String);
     let mut batch = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut batch).add_row(1, 1).u64_val(42);
+    BatchAppender::new(&mut batch).add_row(1, 1).u128_val(42);
 }
 
 #[test]
@@ -403,7 +403,7 @@ fn starting_a_row_after_an_under_pushed_one_trips_the_tripwire() {
     .unwrap();
     let mut batch = ZSetBatch::new(&schema);
     let mut a = BatchAppender::new(&mut batch);
-    a.add_row(1, 1).i64_val(1);
+    a.add_row(1, 1).int_val(1);
     a.add_row(2, 1);
 }
 
@@ -432,7 +432,7 @@ fn string_batch() -> (Schema, ZSetBatch) {
     {
         let mut a = BatchAppender::new(&mut b);
         for (i, v) in GATHER_VALS.iter().enumerate() {
-            a.add_row(i as u128, i as i64 + 1).str_val(v).i64_val(i as i64 * 10);
+            a.add_row(i as u128, i as i64 + 1).str_val(v).int_val(i as i64 * 10);
         }
     }
     (schema, b)
@@ -483,7 +483,7 @@ fn rollback_to_drops_the_rows_and_spills_since_the_mark() {
     BatchAppender::new(&mut b)
         .add_row(9, 1)
         .str_val(GATHER_VALS[0])
-        .i64_val(0);
+        .int_val(0);
     b.pks.push_natives(&[10]);
     b.rollback_to(m);
     assert_eq!(b, want);
@@ -630,7 +630,7 @@ fn fixture_b_batch() -> ZSetBatch {
     let mut b = ZSetBatch::new(&schema);
     let mut a = BatchAppender::new(&mut b);
     for (pk, v) in B_PK.into_iter().zip([7i64, -8, 9]) {
-        a.add_row(pk as u128, 1).i64_val(v);
+        a.add_row(pk as u128, 1).int_val(v);
     }
     b
 }
@@ -830,7 +830,7 @@ fn own_regions_are_appended_with_their_long_cells_rebased() {
 fn a_region_list_that_does_not_lay_out_its_schema_is_refused() {
     let schema = kv_schema(TypeCode::I64);
     let mut batch = ZSetBatch::new(&schema);
-    BatchAppender::new(&mut batch).add_row(1, 1).i64_val(7);
+    BatchAppender::new(&mut batch).add_row(1, 1).int_val(7);
     let regions = batch.wire_regions();
     let decode = |regions: &[&[u8]]| ZSetBatch::from_own_regions(&schema, regions);
     decode(&regions).expect("the batch's own regions decode");
@@ -854,8 +854,8 @@ fn a_null_bit_under_a_not_null_column_is_a_decode_error() {
     let mut b = ZSetBatch::new(&schema);
     {
         let mut a = BatchAppender::new(&mut b);
-        a.add_row(1, 1).i64_val(7);
-        a.add_row(2, 1).i64_val(8);
+        a.add_row(1, 1).int_val(7);
+        a.add_row(2, 1).int_val(8);
     }
     let mut sink = b.clone();
     b.nulls[1] = 1;

@@ -15,7 +15,7 @@ fn tree(rows: &[(u64, &[Option<u64>])]) -> (ZSetBatch, Schema) {
         let r = app.add_row(id as u128, 1);
         for parent in parents {
             match parent {
-                Some(p) => r.u64_val(*p),
+                Some(p) => r.int_val(*p),
                 None => r.null(),
             };
         }

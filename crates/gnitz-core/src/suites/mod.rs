@@ -1,5 +1,3 @@
-#![cfg(feature = "integration")]
-
 //! The client against a real `gnitz-server`, one module per surface.
 
 mod base_replay;
@@ -12,24 +10,19 @@ mod spine;
 mod transport;
 mod view_chain;
 
-use gnitz_core::block_on;
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use gnitz_core::{
-    poll_fd, BatchAppender, ClientError, GnitzClient, Interest, PlannedView, RelName, Request, Schema, Sent, Session,
-    TableDef, ViewBundle, ZSetBatch,
+use crate::connection::{Request, Session};
+use crate::test_support::{drive, park, rel};
+use crate::{
+    block_on, BatchAppender, ClientError, GnitzClient, Interest, PlannedView, RelName, Schema, Sent, TableDef,
+    ViewBundle, ZSetBatch,
 };
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{
     read_i64_le, Circuit, ColumnDef, ReadBound, ReadSpec, TableProps, TypeCode, ViewProps, WireConflictMode,
 };
-
-/// `schema.name`.
-fn rel(schema: &str, name: &str) -> RelName {
-    RelName::new(schema, name).unwrap()
-}
 
 /// Non-nullable `columns`, the first one the PK.
 fn schema_of(columns: &[(&str, TypeCode)]) -> Schema {
@@ -83,7 +76,7 @@ fn rows(schema: &Schema, pks: impl IntoIterator<Item = u64>) -> ZSetBatch {
     for pk in pks {
         let row = app.add_row(pk as u128, 1);
         for j in 0..schema.columns().len() - 1 {
-            row.i64_val(pk as i64 * 3 + j as i64);
+            row.int_val(pk as i64 * 3 + j as i64);
         }
     }
     batch
@@ -116,29 +109,6 @@ fn push_req<'a>(tid: u64, schema: &'a Schema, batch: &'a ZSetBatch) -> Request<'
         schema,
         batch,
         mode: WireConflictMode::Update,
-    }
-}
-
-/// Park until `s`'s fd is ready for `want` (at most 30 s) and say what is.
-fn park(s: &Session, want: Interest) -> Interest {
-    assert!(!want.is_empty(), "slots pending but nothing to wait for");
-    poll_fd(s.as_fd(), want, Some(Instant::now() + Duration::from_secs(30))).expect("poll")
-}
-
-/// The driver: step with what `poll` reported, parking on `interest()`, until
-/// `last` is answered. Also reports whether both interests were ever armed at
-/// once.
-fn drive<T>(s: &mut Session, mut last: Sent<T>) -> (Result<T, ClientError>, bool) {
-    let mut ready = Interest::WRITE;
-    let mut both_armed = false;
-    loop {
-        s.step(ready);
-        if let Some(reply) = last.try_take() {
-            return (reply, both_armed);
-        }
-        let interest = s.interest();
-        both_armed |= interest.read && interest.write;
-        ready = park(s, interest);
     }
 }
 

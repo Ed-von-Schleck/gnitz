@@ -139,7 +139,7 @@ fn a_text_table_past_one_frame_reads_back_whole() {
     let mut batch = ZSetBatch::new(&rel.schema);
     let mut app = gnitz_core::BatchAppender::new(&mut batch);
     for id in 0..ROWS {
-        app.add_row(id as u128, 1).u64_val(id % GROUPS).str_val(&text);
+        app.add_row(id as u128, 1).int_val(id % GROUPS).str_val(&text);
     }
     block_on(
         db.client

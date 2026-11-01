@@ -2,7 +2,7 @@
 //! it through.
 use std::collections::{HashMap, HashSet};
 
-use gnitz_core::{DeltaCursor, MirrorError, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
+use gnitz_core::{DeltaCursor, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
@@ -90,11 +90,11 @@ unsafe impl Send for Mirror {}
 impl Mirror {
     /// Open (or create) a store at `base_dir`. Fails if another store, in this
     /// process or another, holds it.
-    pub fn open(base_dir: &str, config: MirrorConfig) -> Result<Self, MirrorError> {
+    pub fn open(base_dir: &str, config: MirrorConfig) -> Result<Self, String> {
         let root = format!("{base_dir}/{ROOT}");
-        let dir_lock = lock_data_dir(&root).map_err(MirrorError::Engine)?;
+        let dir_lock = lock_data_dir(&root)?;
         let registry = RelationRegistry::new(&root, Slot::SOLO, config.store);
-        let persisted = registry.persisted_records().map_err(MirrorError::Engine)?;
+        let persisted = registry.persisted_records()?;
         let mut store = Mirror {
             registry,
             records: HashMap::new(),
@@ -167,7 +167,7 @@ impl Mirror {
     /// Bring `tid`'s copy's indexes to `listed`, the new ones filled from the
     /// rows the copy holds. If they cannot be added the copy is erased and the
     /// registration fails, so the next one retries them.
-    fn sync_indexes(&mut self, tid: u64, listed: Vec<PkColList>) -> Result<(), MirrorError> {
+    fn sync_indexes(&mut self, tid: u64, listed: Vec<PkColList>) -> Result<(), String> {
         let rec = self.records.get_mut(&tid).expect("checked by the caller");
         for &cols in rec.indexes.iter().filter(|c| !listed.contains(c)) {
             self.registry.release_index(tid, index_claim(cols));
@@ -181,7 +181,7 @@ impl Mirror {
             .collect();
         if let Err(e) = self.registry.add_indexes(tid, &missing) {
             self.erase(tid);
-            return Err(MirrorError::Engine(format!("indexing the copy of {tid}: {e}")));
+            return Err(format!("indexing the copy of {tid}: {e}"));
         }
         rec.indexes = listed;
         Ok(())
@@ -198,7 +198,7 @@ impl Mirror {
     }
 
     /// Apply one block to `tid`'s copy. A failed apply erases the copy.
-    fn ingest(&mut self, tid: u64, block: &[u8]) -> Result<(), MirrorError> {
+    fn ingest(&mut self, tid: u64, block: &[u8]) -> Result<(), String> {
         self.applied_bytes += block.len();
         self.unpublished.insert(tid);
         let schema = self
@@ -213,19 +213,14 @@ impl Mirror {
                     .ingest(tid, b)
                     .map_err(|e| format!("applying a block to {tid}: {e}"))
             });
-        applied.map_err(|why| {
-            self.erase(tid);
-            MirrorError::Engine(why)
-        })
+        applied.inspect_err(|_| self.erase(tid))
     }
 
     /// Refuse deltas for a copy of `tid` that holds no cursor to continue. Where
     /// [`INGEST_PANIC`] fires.
-    fn continuing(&self, tid: u64) -> Result<(), MirrorError> {
+    fn continuing(&self, tid: u64) -> Result<(), String> {
         if self.cursor_of(tid).is_none() {
-            return Err(MirrorError::Engine(format!(
-                "relation {tid}'s copy holds no cursor for deltas to continue"
-            )));
+            return Err(format!("relation {tid}'s copy holds no cursor for deltas to continue"));
         }
         if INGEST_PANIC.take_once() {
             panic!("injected mirror ingest panic");
@@ -265,7 +260,7 @@ impl MirrorStore for Mirror {
     /// Bring `desc.tid`'s copy to `desc`: kept in place, cursor and all, while
     /// it is the same relation, its indexes brought to the ones `desc` names;
     /// entered empty otherwise.
-    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError> {
+    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), String> {
         let tid = desc.tid;
         let block = desc.schema.to_block();
         let indexes = index_lists(desc);
@@ -301,8 +296,7 @@ impl MirrorStore for Mirror {
                     feed: Feed::Empty,
                     block,
                 };
-                self.enter(tid, rec, *desc.schema.layout(), None)
-                    .map_err(MirrorError::Engine)?;
+                self.enter(tid, rec, *desc.schema.layout(), None)?;
             }
         }
         Ok(())
@@ -311,28 +305,26 @@ impl MirrorStore for Mirror {
     /// Drop `tid`'s record, and erase its copy with its directory. On `Err` the
     /// copy is gone from this store; a reopen may find it at its last
     /// checkpoint.
-    fn forget(&mut self, tid: u64) -> Result<(), MirrorError> {
+    fn forget(&mut self, tid: u64) -> Result<(), String> {
         if self.records.remove(&tid).is_none() {
             return Ok(());
         }
         self.unpublished.remove(&tid);
         self.registry
             .unregister_and_erase(tid)
-            .map_err(|e| MirrorError::Engine(format!("erasing the copy of {tid} failed: {e}")))
+            .map_err(|e| format!("erasing the copy of {tid} failed: {e}"))
     }
 
-    fn refill(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError> {
+    fn refill(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), String> {
         self.register(name, desc)?;
         self.erase(desc.tid);
         self.record(desc.tid).feed = Feed::Filling;
         Ok(())
     }
 
-    fn fill(&mut self, tid: u64, blocks: &[&[u8]], sealed_at: Option<DeltaCursor>) -> Result<(), MirrorError> {
+    fn fill(&mut self, tid: u64, blocks: &[&[u8]], sealed_at: Option<DeltaCursor>) -> Result<(), String> {
         if self.feed_of(tid) != Feed::Filling {
-            return Err(MirrorError::Engine(format!(
-                "relation {tid}'s copy is not being refilled"
-            )));
+            return Err(format!("relation {tid}'s copy is not being refilled"));
         }
         // A block that fails erases the copy, which ends the refill.
         for &block in blocks {
@@ -345,7 +337,7 @@ impl MirrorStore for Mirror {
         Ok(())
     }
 
-    fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError> {
+    fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), String> {
         self.continuing(tid)?;
         for &block in blocks {
             self.ingest(tid, block)?;
@@ -358,20 +350,14 @@ impl MirrorStore for Mirror {
         Ok(())
     }
 
-    fn scan_spec(
-        &mut self,
-        tid: u64,
-        spec: gnitz_wire::ReadSpec,
-        reply_schema: &Schema,
-    ) -> Result<ZSetBatch, MirrorError> {
+    fn scan_spec(&mut self, tid: u64, spec: gnitz_wire::ReadSpec, reply_schema: &Schema) -> Result<ZSetBatch, String> {
         // No copy holds a skeleton row, so no hydrator is needed.
         let batch = self
             .registry
-            .scan_spec(tid, spec, reply_schema.layout().layout_digest(), None)
-            .map_err(MirrorError::Engine)?;
+            .scan_spec(tid, spec, reply_schema.layout().layout_digest(), None)?;
         // The client's own region append, so a local and a remote reply land in
         // one row layout; the cells are this copy's, checked when it ingested them.
-        ZSetBatch::from_own_regions(reply_schema, &batch.wire_regions()).map_err(|e| MirrorError::Engine(e.to_string()))
+        ZSetBatch::from_own_regions(reply_schema, &batch.wire_regions()).map_err(|e| e.to_string())
     }
 
     fn cursor_of(&self, tid: u64) -> Option<DeltaCursor> {
@@ -381,21 +367,18 @@ impl MirrorStore for Mirror {
     /// Publish every copy that moved since it was last published, with its
     /// record and its indexes, at one new generation; nothing when none moved.
     /// A failure leaves every store holding what it held.
-    fn checkpoint(&mut self) -> Result<(), MirrorError> {
+    fn checkpoint(&mut self) -> Result<(), String> {
         self.applied_bytes = 0;
         if self.unpublished.is_empty() {
             return Ok(());
         }
         for &tid in &self.unpublished {
-            self.registry
-                .set_caller_record(tid, self.records[&tid].encode())
-                .map_err(MirrorError::Engine)?;
+            self.registry.set_caller_record(tid, self.records[&tid].encode())?;
         }
         self.generation += 1;
         let moved = &self.unpublished;
         self.registry
-            .checkpoint_ephemeral([], self.generation, |tid| moved.contains(&tid))
-            .map_err(MirrorError::Engine)?;
+            .checkpoint_ephemeral([], self.generation, |tid| moved.contains(&tid))?;
         self.unpublished.clear();
         Ok(())
     }

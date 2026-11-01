@@ -323,7 +323,7 @@ impl GnitzClient {
     /// holds no row opens no zone.
     async fn commit_ddl(&mut self, bundle: DdlBundle) -> Result<(), ClientError> {
         if self.txn.is_some() {
-            return Err(ClientError::from("DDL is not allowed inside a transaction".to_string()));
+            return Err(ClientError::from("DDL is not allowed inside a transaction"));
         }
         if bundle.0.is_empty() {
             return Ok(());
@@ -445,8 +445,8 @@ impl GnitzClient {
     /// written.
     pub async fn create_view_chain(&mut self, bundle: ViewBundle) -> Result<u64, ClientError> {
         let view = &bundle.name;
-        let n_views = bundle.segments.len() + 1;
         let n_segments = bundle.segments.len() as u64;
+        let n_views = n_segments + 1;
 
         let mut b = DdlBundle::default();
         let (schema_id, base) = match bundle.replacing {
@@ -483,10 +483,10 @@ impl GnitzClient {
                 // Only the user-named view, ahead of the new chain's `+1`s: the
                 // engine cascades its segments.
                 b.retract(VIEW_TAB, views, i);
-                (schema_id, self.alloc_ids(n_views as u64).await?)
+                (schema_id, self.alloc_ids(n_views).await?)
             }
             None => {
-                let (schema_id, base) = self.schema_and_ids(view.schema(), n_views as u64).await?;
+                let (schema_id, base) = self.schema_and_ids(view.schema(), n_views).await?;
                 (schema_id.ok_or_else(|| not_found("schema", view.schema()))?, base)
             }
         };

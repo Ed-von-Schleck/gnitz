@@ -1,11 +1,11 @@
 //! Client transport: frames over an AF_UNIX stream socket or TLS 1.3 over TCP
-//! (`tls.rs`), the same wire bytes on both. Nothing here waits except the HELLO
-//! exchange inside [`ClientTransport::connect`].
+//! (`tls.rs`), the same wire bytes on both. Nothing here waits except
+//! [`ClientTransport::connect`].
 //!
-//! It is the frame layer under a [`Session`](crate::Session), which knows which
+//! It is the frame layer under a [`Session`](crate::connection::Session), which knows which
 //! request a frame answers; this layer knows only frames. A connection of a
-//! process that records ([`crate::recording`]) records every frame it sends or
-//! receives after its HELLO.
+//! process that records ([`crate::recording`]) records every frame it queues to
+//! send or receives after its HELLO.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -119,9 +119,8 @@ fn timed_out() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, "socket operation timed out")
 }
 
-/// What a driver should wait for before its next
-/// [`Session::step`](crate::Session::step), and what it hands back: two
-/// booleans on the connection.
+/// What the client waits for on its socket — what [`Host::poll_io`](crate::Host::poll_io)
+/// is asked to wait for, and what it hands back: two booleans on the connection.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Interest {
     pub read: bool,
@@ -158,7 +157,7 @@ impl Interest {
 /// One `poll(2)` on `fd` for `want` until `until`, and what is ready; `None`
 /// waits untimed. Expiry surfaces as `TimedOut`; `EINTR` is returned, and since
 /// `until` is absolute a caller may simply call again.
-pub fn poll_fd(fd: BorrowedFd<'_>, want: Interest, until: Option<Instant>) -> std::io::Result<Interest> {
+pub(crate) fn poll_fd(fd: BorrowedFd<'_>, want: Interest, until: Option<Instant>) -> std::io::Result<Interest> {
     poll_fd_or_cancel(fd, want, None, until).map(|ready| ready.expect("only a cancel fd cancels"))
 }
 
@@ -224,7 +223,9 @@ impl ClientTransport {
     }
 
     /// Connect to a `tls://` target, or else to an AF_UNIX socket path, and
-    /// exchange HELLOs, all no later than `until`.
+    /// exchange HELLOs. The TCP connect and the HELLO exchange end no later
+    /// than `until`; resolving the TLS host name and connecting the AF_UNIX
+    /// socket are blocking calls `until` does not bound.
     pub fn connect(target: &str, until: Instant) -> Result<Self, ClientError> {
         let (mut t, token) = match target.strip_prefix("tls://") {
             Some(rest) => tls::connect_tls(rest, until)?,
@@ -280,7 +281,7 @@ impl ClientTransport {
                 }
                 Ok(AuthStatus::Refused) => {
                     return Err(ClientError::from(
-                        "authentication failed: the server does not recognise the access token".to_string(),
+                        "authentication failed: the server does not recognise the access token",
                     ))
                 }
                 Err(e @ HelloError::Malformed) => return Err(ProtocolError::DecodeError(e.to_string()).into()),
@@ -292,7 +293,8 @@ impl ClientTransport {
     }
 
     /// Queue an owned frame behind everything already queued. Nothing is
-    /// written here; `flush` ships the queue.
+    /// written here; `flush` ships the queue. A recording connection records it
+    /// as sent here.
     pub fn enqueue(&mut self, payload: Vec<u8>) {
         if let Some(tap) = &self.tap {
             tap.note(Direction::Sent, &payload);

@@ -16,7 +16,7 @@ pub struct Frame {
 /// One recorded conversation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Seed {
-    /// What the connections sent, in the order they sent it.
+    /// What the connections queued to send, in the order they queued it.
     pub sent: Vec<Frame>,
     /// What they received, in the order they received it.
     pub received: Vec<Frame>,

@@ -23,7 +23,7 @@ pub(crate) struct Blocking {
 impl Blocking {
     /// A connection whose waits check for Ctrl-C.
     fn connect(py: Python<'_>, target: &str) -> PyResult<Self> {
-        let host = BlockingHost::with_hook(Box::new(|| Python::attach(|py| py.check_signals()).map_err(Into::into)));
+        let host = BlockingHost::with_hook(|| Python::attach(|py| py.check_signals()).map_err(Into::into));
         let client = py
             .detach(|| GnitzClient::connect_on(target, Box::new(host)))
             .map_err(client_err)?;

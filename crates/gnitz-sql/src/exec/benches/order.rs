@@ -33,7 +33,7 @@ fn order_slice_bench() {
     let top10 = Slice { offset: 0, limit: Some(10) };
     let ints = |card: u64| {
         keyed(ROWS, TypeCode::I64, move |app, r| {
-            app.i64_val(if card == 0 { r as i64 } else { (r % card) as i64 });
+            app.int_val(if card == 0 { r as i64 } else { (r % card) as i64 });
         })
     };
     let float = || {

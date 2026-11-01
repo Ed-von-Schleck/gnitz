@@ -30,7 +30,7 @@ fn client_map_bench() {
             let mut app = BatchAppender::new(&mut b);
             for i in 0..n as i64 {
                 app.add_row((i - n as i64 / 2) as u128, 1)
-                    .i64_val(i)
+                    .int_val(i)
                     .str_val(&format!("a string past the inline prefix {i}"));
             }
             let mut map = map_of(&src, &items);

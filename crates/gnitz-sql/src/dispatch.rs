@@ -111,16 +111,20 @@ async fn planned<T>(
     }
 }
 
-/// Times [`planned_kept`] plans a statement before its `StaleCatalog` refusal
-/// is the caller's to see.
-const STALE_MAX_ATTEMPTS: usize = 4;
+/// Times [`planned_kept`] plans a statement before a refusal that wrote
+/// nothing — `StaleCatalog` or `TxnConflict` — is the caller's to see. There is
+/// no backoff.
+const RUN_MAX_ATTEMPTS: usize = 4;
 
 /// Plan and `run` a statement from the descriptors the client holds, until one
 /// of them is in doubt and every later plan asks the server. A kept descriptor
 /// may be stale, and only a request carrying its token finds that out, so:
 ///
 /// - a `run` refused `StaleCatalog` wrote nothing, and the statement is planned
-///   and run again;
+///   and run again, every later plan asking the server;
+/// - a `run` refused `TxnConflict` — an autocommit read-modify-write whose
+///   table was written after its read — wrote nothing, and the statement is
+///   planned from the same descriptors and run again, reading afresh;
 /// - a plan that fails, or one `checked` denies sends such a request, stands
 ///   only when no kept descriptor went into it; otherwise the statement is
 ///   planned again.
@@ -144,11 +148,12 @@ async fn planned_kept<P>(
             }
         };
         match run(client, plan).await {
-            Err(GnitzSqlError::Client(e))
-                if e.status() == Some(WireStatus::StaleCatalog) && attempt < STALE_MAX_ATTEMPTS =>
-            {
-                descriptors.kept = false
-            }
+            Err(GnitzSqlError::Client(e)) if attempt < RUN_MAX_ATTEMPTS => match e.status() {
+                Some(WireStatus::StaleCatalog) => descriptors.kept = false,
+                // Only an autocommit statement's push is its own.
+                Some(WireStatus::TxnConflict) if !client.txn_active() => {}
+                _ => return Err(GnitzSqlError::Client(e)),
+            },
             done => return done,
         }
     }
@@ -387,3 +392,7 @@ pub(crate) async fn plan_subscription(
     .0?
     .into_subscription()
 }
+
+#[cfg(all(test, feature = "integration"))]
+#[path = "tests/dispatch.rs"]
+mod tests;

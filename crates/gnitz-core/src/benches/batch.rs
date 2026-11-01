@@ -63,7 +63,7 @@ fn gather_bench() {
             let r = rng.next_u64();
             app.add_row(i as u128, 1);
             for _ in 0..ints {
-                app.i64_val(r as i64);
+                app.int_val(r as i64);
             }
             if string {
                 app.str_val(if r & 1 == 0 {
@@ -118,7 +118,7 @@ fn region_append_bench() {
             rows.add_row(i as u128, 1);
             match cell {
                 Some(s) => rows.str_val(s).str_val(s),
-                None => rows.i64_val(i as i64).i64_val(7),
+                None => rows.int_val(i as i64).int_val(7),
             };
         }
         let regions = batch.wire_regions();

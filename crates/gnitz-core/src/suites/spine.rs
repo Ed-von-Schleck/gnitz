@@ -1,14 +1,12 @@
 //! A second driver over the connection spine: many operations in flight on
 //! one connection against a real server, on both transports. Carries no
 //! futures, no waker and no executor — submit N, then `step` / drain / park
-//! until every reply has arrived. It lives out of crate on purpose: it proves
-//! the spine's public surface is complete for a driver with nothing private in
-//! reach, and it exercises what the one-slot blocking client cannot — a deep
-//! outbound queue, the head accumulator handing off across slots, both
-//! interests armed at once, and the cap.
+//! until every reply has arrived. It exercises what the one-slot blocking
+//! client cannot — a deep outbound queue, the head accumulator handing off
+//! across slots, both interests armed at once, and the cap.
 
 use super::*;
-use gnitz_core::MAX_IN_FLIGHT;
+use crate::MAX_IN_FLIGHT;
 use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_test_harness::strace_test;
 
@@ -125,7 +123,8 @@ fn count_syscalls(target: &str) {
     let (_client, tid, _schema) = table(target);
     let n = 1000usize;
     let Some(counts) = strace_test(
-        "spine::syscall_count_child",
+        module_path!(),
+        "syscall_count_child",
         &[
             ("GNITZ_SYSCALL_TARGET", target),
             ("GNITZ_SYSCALL_TID", &tid.to_string()),

@@ -22,7 +22,7 @@ mod support;
 mod bench;
 
 use gnitz_core::block_on;
-use gnitz_core::{ClientError, GnitzClient, MirrorError, PollOutcome, PollResult, RelName, Schema, SubId, TableDef};
+use gnitz_core::{ClientError, GnitzClient, PollOutcome, PollResult, RelName, Schema, SubId, TableDef};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_sql::GnitzSqlError;
 use gnitz_test_harness::ServerHandle;
@@ -56,7 +56,7 @@ struct Fixture {
 }
 
 /// An opener of the store on `dir`, which must be free when it runs.
-fn opener(dir: &str, config: MirrorConfig) -> impl FnOnce() -> Result<Mirror, MirrorError> + Send + 'static {
+fn opener(dir: &str, config: MirrorConfig) -> impl FnOnce() -> Result<Mirror, String> + Send + 'static {
     let dir = dir.to_string();
     move || Mirror::open(&dir, config)
 }
@@ -596,7 +596,7 @@ fn storage_fault_child() {
     let err =
         block_on(mirror.mirror_view(&rel("s", "v_keyed"))).expect_err("the armed seam must fail the bootstrap ingest");
     assert!(
-        !matches!(err, ClientError::Mirror(MirrorError::Poisoned)),
+        !matches!(err, ClientError::MirrorPoisoned),
         "an ingest fault damages one copy, so it must not poison the store: {err}",
     );
     assert!(!mirror.mirror_poisoned(), "the handle stays usable");
@@ -739,7 +739,7 @@ fn a_failed_exit_checkpoint_is_reported_and_releases_the_store() {
 
     block_copy(&dir, keyed);
     let err = block_on(fx.mirror().close_mirror()).expect_err("a checkpoint into a blocked copy");
-    assert!(matches!(err, ClientError::Mirror(MirrorError::Engine(_))), "{err}");
+    assert!(matches!(err, ClientError::Mirror(_)), "{err}");
     unblock_copy(&dir, keyed);
     block_on(fx.mirror().attach_mirror(opener(&dir, MirrorConfig::default())))
         .expect("the failed close released the directory and the client's slot");
@@ -2325,16 +2325,13 @@ fn poisoned_read_child() {
     let err = block_on(gnitz_sql::execute(&mut mirror, "s", "SELECT * FROM v_keyed"))
         .expect_err("a poisoned copy must refuse the read it would answer");
     assert!(
-        matches!(err, GnitzSqlError::Client(ClientError::Mirror(MirrorError::Poisoned))),
+        matches!(err, GnitzSqlError::Client(ClientError::MirrorPoisoned)),
         "{err}"
     );
 
     // Mirroring another view is refused before a round trip finds out.
     let (refused, sent) = cost(&mut mirror, |m| block_on(m.mirror_view(&rel("s", "v_repl"))).err());
-    assert!(
-        matches!(refused, Some(ClientError::Mirror(MirrorError::Poisoned))),
-        "{refused:?}"
-    );
+    assert!(matches!(refused, Some(ClientError::MirrorPoisoned)), "{refused:?}");
     assert_eq!(sent, 0);
 
     // A sync goes on for the connection and reports each copy failed, without
@@ -2347,10 +2344,7 @@ fn poisoned_read_child() {
         assert!(!report.is_empty(), "sync {round}");
         for out in &report {
             assert!(
-                matches!(
-                    out.result,
-                    PollResult::Failed(ClientError::Mirror(MirrorError::Poisoned))
-                ),
+                matches!(out.result, PollResult::Failed(ClientError::MirrorPoisoned)),
                 "sync {round}: {report:?}"
             );
             assert_eq!(out.cursor, None, "sync {round}: {report:?}");

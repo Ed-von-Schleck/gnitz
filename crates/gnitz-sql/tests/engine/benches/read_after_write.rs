@@ -61,7 +61,7 @@ fn view_read_after_write_bench() {
             let mut batch = ZSetBatch::new(&t.schema);
             BatchAppender::new(&mut batch)
                 .add_row(i as u128, 1)
-                .i64_val((i % 8) as i64);
+                .int_val((i % 8) as i64);
             block_on(db.client.push(t.tid, &t.schema, batch, WireConflictMode::Update)).unwrap();
             let got = block_on(db.client.scan_spec(v.tid, &all, &v.schema)).unwrap().batch;
             let rows: i64 = got.weights.iter().sum();

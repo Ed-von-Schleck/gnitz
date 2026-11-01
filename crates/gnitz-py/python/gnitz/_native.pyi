@@ -1,6 +1,6 @@
 import asyncio
 import os
-from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
+from collections.abc import Callable, Coroutine, Generator, Iterable, Iterator, Sequence
 from pathlib import Path
 from types import GenericAlias
 from typing import Any, Literal, Self, final, type_check_only
@@ -183,7 +183,8 @@ class Synced:
 #
 # Every verb is one method of the private base `_Client` at runtime, and what it returns is how
 # its client waits: the result on a `GnitzClient`, a future of it on an
-# `AsyncGnitzClient`, a `Pending` of it inside `GnitzClient.pipeline()`. A type
+# `AsyncGnitzClient` (an awaitable, for `sync`), a `Pending` of it inside
+# `GnitzClient.pipeline()`. A type
 # cannot be abstracted over that, so each of the three spells the verbs out.
 # ---------------------------------------------------------------------------
 
@@ -273,7 +274,7 @@ class AsyncGnitzClient(_Client):
     def mirror_view(self, name: str) -> asyncio.Future[PollResult]: ...
     def mirror_subscription(self, alias: str, sql: str) -> asyncio.Future[PollResult]: ...
     def forget_view(self, view_id: int) -> asyncio.Future[None]: ...
-    def sync(self, wait: float = 0.0) -> asyncio.Future[Synced]: ...
+    def sync(self, wait: float = 0.0) -> Coroutine[Any, Any, Synced]: ...
     def checkpoint(self) -> asyncio.Future[None]: ...
     def close_mirror(self) -> asyncio.Future[None]: ...
     def mirrored_ids(self) -> asyncio.Future[list[int]]: ...

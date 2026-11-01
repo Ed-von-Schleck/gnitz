@@ -1,4 +1,3 @@
-use crate::mirror::MirrorError;
 use gnitz_wire::{FrameLenError, WireFault, WireStatus};
 use std::fmt;
 use std::sync::Arc;
@@ -15,11 +14,15 @@ pub enum ClientError {
     /// The connection failed: every request outstanding on it, and every later
     /// one, carries this one cause.
     ConnectionLost(ProtocolError),
-    /// A mirror store refused or failed. [`MirrorError::Poisoned`] is a class a
-    /// host catches: a poisoned copy is recovered by
-    /// [`GnitzClient::close_mirror`](crate::GnitzClient::close_mirror) and by
-    /// nothing else.
-    Mirror(MirrorError),
+    /// The local mirror store refused or failed: a storage fault, a
+    /// registration its registry rejected, a read the spec could not express.
+    /// Costs the one copy it hit.
+    Mirror(String),
+    /// The mirror store is poisoned: a store call panicked, so it may be torn,
+    /// and it refuses every further call that touches a copy.
+    /// [`GnitzClient::close_mirror`](crate::GnitzClient::close_mirror) is the
+    /// only recovery.
+    MirrorPoisoned,
     /// The park hook aborted a blocking call — for the Python binding, a signal
     /// handler raised. Carries the host's own error so the binding re-raises
     /// exactly what the handler produced.
@@ -52,12 +55,6 @@ impl From<ProtocolError> for ClientError {
     }
 }
 
-impl From<MirrorError> for ClientError {
-    fn from(e: MirrorError) -> Self {
-        ClientError::Mirror(e)
-    }
-}
-
 impl From<std::io::Error> for ClientError {
     fn from(e: std::io::Error) -> Self {
         ClientError::Protocol(e.into())
@@ -71,6 +68,12 @@ impl From<String> for ClientError {
     }
 }
 
+impl From<&str> for ClientError {
+    fn from(e: &str) -> Self {
+        ClientError::Refused(WireFault::from(e))
+    }
+}
+
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -78,7 +81,11 @@ impl fmt::Display for ClientError {
             ClientError::Refused(fault) => write!(f, "{fault}"),
             ClientError::Closed => write!(f, "connection closed"),
             ClientError::ConnectionLost(cause) => write!(f, "connection lost: {cause}"),
-            ClientError::Mirror(e) => write!(f, "{e}"),
+            ClientError::Mirror(m) => write!(f, "mirror store: {m}"),
+            ClientError::MirrorPoisoned => write!(
+                f,
+                "mirror store is poisoned: a store call panicked; the store may be torn"
+            ),
             ClientError::Interrupted(e) => write!(f, "interrupted: {e}"),
         }
     }

@@ -3,7 +3,7 @@
 //! autocommit while `b` writes around it.
 
 use super::*;
-use gnitz_core::{PkColumn, RelDescriptor, RMW_MAX_ATTEMPTS};
+use crate::{PkColumn, RelDescriptor};
 use gnitz_wire::{write_u64_le, WireStatus};
 
 struct Fixture {
@@ -28,32 +28,25 @@ fn boot() -> Fixture {
 fn commit(client: &mut GnitzClient, target: &RelDescriptor, pk: u128, val: i64) {
     let s = &target.schema;
     let mut batch = ZSetBatch::new(s);
-    BatchAppender::new(&mut batch).add_row(pk, 1).i64_val(val);
+    BatchAppender::new(&mut batch).add_row(pk, 1).int_val(val);
     block_on(client.push(target.tid, s, &batch, WireConflictMode::Update)).unwrap();
 }
 
-/// `a`'s read of pk 1 and its `val + 1` build, which calls `side` first on every
-/// attempt with its 0-based attempt number.
-fn run_increment(
-    f: &mut Fixture,
-    mut side: impl FnMut(&mut GnitzClient, &RelDescriptor, usize),
-) -> (Result<usize, ClientError>, usize) {
+/// `a`'s read of pk 1 and its `val + 1` build, which calls `side` first.
+fn run_increment(f: &mut Fixture, side: impl FnOnce(&mut GnitzClient, &RelDescriptor)) -> Result<usize, ClientError> {
     let s = Arc::clone(&f.target.schema);
     let keys = PkColumn::from_natives(&s, [1]).keys();
-    let mut attempts = 0;
     let Fixture { a, b, target, .. } = f;
-    let result = block_on(
+    block_on(
         a.read_modify_write(target, ReadBound::PkSet(keys), Vec::new(), false, |mut rows| {
-            side(&mut *b, target, attempts);
-            attempts += 1;
+            side(&mut *b, target);
             for r in 0..rows.len() {
                 let v = read_i64_le(&rows.payload[0].bytes, r * 8);
                 write_u64_le(&mut rows.payload[0].bytes, r * 8, (v + 1) as u64);
             }
             Ok::<_, ClientError>(rows)
         }),
-    );
-    (result, attempts)
+    )
 }
 
 /// Every row of `t` at pk 1, as `(val, weight)`.
@@ -66,45 +59,29 @@ fn row_1(client: &mut GnitzClient, target: &RelDescriptor) -> Vec<(i64, i64)> {
         .collect()
 }
 
-/// A write landing after every read exhausts the bound, the conflict names the
-/// table, and none of the attempts' increments landed.
+/// A write landing between the read and the push refuses the push, naming the
+/// table, after one read and one push; the increment does not land.
 #[test]
-fn sustained_contention_surfaces_a_conflict_naming_the_table() {
+fn a_write_after_the_read_is_refused_naming_the_table() {
     let mut f = boot();
-    let (result, attempts) = run_increment(&mut f, |b, t, i| commit(b, t, 2, i as i64));
-    let err = result.expect_err("every attempt conflicts");
+    let before = f.a.requests_sent();
+    let err = run_increment(&mut f, |b, t| commit(b, t, 2, 0)).expect_err("the push conflicts");
     assert_eq!(err.status(), Some(WireStatus::TxnConflict), "{err:?}");
     assert!(err.to_string().contains(&format!("'{}.t'", f.schema_name)), "{err}");
-    assert_eq!(attempts, RMW_MAX_ATTEMPTS);
+    assert_eq!(f.a.requests_sent() - before, 2, "SCAN_SPEC and PUSH_TXN");
     assert_eq!(row_1(&mut f.a, &f.target), [(0, 1)]);
 }
 
-/// A write landing after the first read forces one retry, which re-reads: the
-/// increment applies to the row that write left, so no update is lost.
-#[test]
-fn a_conflict_retries_over_a_fresh_read() {
-    let mut f = boot();
-    let (result, attempts) = run_increment(&mut f, |b, t, i| {
-        if i == 0 {
-            commit(b, t, 1, 100);
-        }
-    });
-    assert_eq!(result.unwrap(), 1);
-    assert_eq!(attempts, 2);
-    assert_eq!(row_1(&mut f.a, &f.target), [(101, 1)]);
-}
-
 /// A write committed before the statement's read is inside its watermark: the
-/// first attempt commits, in one read and one push.
+/// statement commits, in one read and one push.
 #[test]
 fn a_write_the_read_saw_is_no_conflict() {
     let mut f = boot();
     let target = Arc::clone(&f.target);
     commit(&mut f.b, &target, 1, 100);
     let before = f.a.requests_sent();
-    let (result, attempts) = run_increment(&mut f, |_, _, _| {});
+    let result = run_increment(&mut f, |_, _| {});
     assert_eq!(result.unwrap(), 1);
-    assert_eq!(attempts, 1);
     assert_eq!(f.a.requests_sent() - before, 2, "SCAN_SPEC and PUSH_TXN");
     assert_eq!(row_1(&mut f.a, &target), [(101, 1)]);
 }

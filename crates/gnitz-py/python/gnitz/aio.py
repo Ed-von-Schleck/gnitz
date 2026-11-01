@@ -21,14 +21,36 @@ round trip::
     lsns = await asyncio.gather(conn.push(table_id, batch1),
                                 conn.push(table_id, batch2))
 
+``sync`` submits when called too, and returns a coroutine: the awaiting task
+takes the sync's delivery when it resumes, so a task cancelled at any point
+loses nothing, and the next sync brings it.
+
 Socket I/O runs on the loop, and a mirror store's disk work on one thread of
 its own. ``connect`` blocks the calling thread. Abandoning a
 future is not cancellation: the request is still written and committed.
 """
 
-from gnitz._native import AsyncGnitzClient
+import asyncio
+from typing import Any
+
+from gnitz._native import AsyncGnitzClient, Synced
 
 __all__ = ["AsyncGnitzClient", "connect"]
+
+
+async def _claimed(delivery: "asyncio.Future[Any]") -> Synced:
+    """What `AsyncGnitzClient.sync` returns: its delivery is taken when the
+    awaiting task resumes. A task cancelled after the answer arrived resumes
+    with `CancelledError` instead, and hands the delivery back for the next
+    sync."""
+    try:
+        reply = await delivery
+    except asyncio.CancelledError:
+        if delivery.done() and not delivery.cancelled() and delivery.exception() is None:
+            delivery.result().hand_back()
+        raise
+    taken: Synced = reply.take()
+    return taken
 
 
 def connect(target: str | None = None, schema: str = "public") -> AsyncGnitzClient:

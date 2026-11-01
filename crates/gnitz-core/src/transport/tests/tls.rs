@@ -2,7 +2,8 @@ use super::*;
 use crate::test_support::{
     flush_all, handshake, io_kind, pass, read_frame, recv_frames, tls_pair, write_frame, Loopback,
 };
-use crate::{poll_fd, ClientError, Interest};
+use crate::transport::poll_fd;
+use crate::{ClientError, Interest};
 use gnitz_wire::{framed, CONNECT_TIMEOUT};
 use std::io::ErrorKind;
 use std::os::fd::AsFd;

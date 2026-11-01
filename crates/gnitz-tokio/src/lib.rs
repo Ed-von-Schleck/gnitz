@@ -157,17 +157,16 @@ impl AsyncClient {
     ///
     /// Cancel-safe: a sync dropped before it has its answer leaves what it
     /// would have taken for the next sync, and one dropped later hands its
-    /// delivery back through [`GnitzClient::sync_reply`].
+    /// [`Delivery`](gnitz_core::Delivery) back.
     pub async fn sync(&self, wait: Duration) -> Result<Synced, ClientError> {
-        let (sent, (mut to, synced)) = self
-            .run(move |c| Box::pin(std::future::ready((c.begin_sync(wait), c.sync_reply()))))
-            .await?;
-        let reply = sent.await;
-        // A driver that is gone drops the op, and with it `to`.
-        let _ = self.tx.send(Box::new(move |client| {
-            Box::pin(async move { to.fulfil(client.finish_sync(reply).await) })
-        }));
-        synced.await
+        let reply = self
+            .run(move |c| Box::pin(std::future::ready(c.begin_sync(wait))))
+            .await?
+            .await;
+        let delivery = self
+            .run(move |c| Box::pin(async move { c.finish_sync(reply).await.map(|s| c.delivery(s)) }))
+            .await??;
+        Ok(delivery.take())
     }
 }
 

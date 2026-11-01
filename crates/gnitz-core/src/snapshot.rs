@@ -12,8 +12,8 @@ use gnitz_wire::snapshot::PageRequest;
 use gnitz_wire::{PkBuf, SeqTabRow};
 
 use crate::catalog::CATALOG_FAMILIES;
-use crate::connection::SnapshotPage;
-use crate::{sys_schema, Catalog, ClientError, GnitzClient, Pending, Request, Schema, ZSetBatch};
+use crate::connection::{Request, SnapshotPage};
+use crate::{sys_schema, Catalog, ClientError, GnitzClient, Pending, Schema, ZSetBatch};
 
 /// The rows a page holds when a caller names no other size.
 pub const DEFAULT_PAGE_ROWS: u64 = 16_384;
@@ -38,7 +38,7 @@ impl GnitzClient {
     /// One page of relation `tid` as snapshot `id` holds it: up to `limit`
     /// rows, each worker's share of them after its key in `after` — from its
     /// first row with `after` empty — in `schema`'s layout.
-    pub fn snapshot_page(
+    pub(crate) fn snapshot_page(
         &mut self,
         id: u64,
         tid: u64,

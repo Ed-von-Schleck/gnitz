@@ -347,7 +347,7 @@ fn a_second_client_pushes_after_a_column_alter() {
     a.exec(T_ID_V);
     let rel = b.rel("t");
     let mut batch = ZSetBatch::new(&rel.schema);
-    BatchAppender::new(&mut batch).add_row(1, 1).i64_val(10);
+    BatchAppender::new(&mut batch).add_row(1, 1).int_val(10);
     block_on(b.client.push(rel.tid, &rel.schema, &batch, Update)).unwrap();
 
     a.exec("ALTER TABLE t ALTER COLUMN v DROP NOT NULL");

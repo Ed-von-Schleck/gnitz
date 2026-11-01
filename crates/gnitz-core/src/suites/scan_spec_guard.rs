@@ -3,7 +3,7 @@
 //! not the family's refused with the connection left usable.
 
 use super::*;
-use gnitz_core::sys_schema;
+use crate::sys_schema;
 use gnitz_wire::{WireStatus, TABLE_TAB};
 
 #[test]

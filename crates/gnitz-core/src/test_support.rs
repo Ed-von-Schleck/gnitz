@@ -12,14 +12,16 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_wire::{framed, peek_control_block, ColumnDef, ControlHeader, TypeCode, WireFlags, WireLane, WireStatus};
 
+use crate::connection::Session;
+use crate::transport::poll_fd;
 use crate::{
-    poll_fd, BatchAppender, BlockingHost, ClientTransport, GnitzClient, Interest, ProtocolError, RelName, Schema,
-    Session, SubId, ZSetBatch,
+    BatchAppender, BlockingHost, ClientError, ClientTransport, GnitzClient, Interest, ProtocolError, RelName, Schema,
+    Sent, SubId, ZSetBatch,
 };
 
 /// `schema.name`.
@@ -45,7 +47,7 @@ pub(crate) fn kv_rows(rows: &[(u64, i64, i64)]) -> ZSetBatch {
     let mut b = ZSetBatch::new(&schema);
     let mut app = BatchAppender::new(&mut b);
     for &(pk, v, w) in rows {
-        app.add_row(pk as u128, w).i64_val(v);
+        app.add_row(pk as u128, w).int_val(v);
     }
     b
 }
@@ -68,7 +70,7 @@ pub(crate) fn wide_rows(schema: &Schema, n: usize, null_every: usize) -> ZSetBat
             if null_every != 0 && (r + c) % null_every == 0 {
                 row.null();
             } else {
-                row.i64_val(7);
+                row.int_val(7);
             }
         }
     }
@@ -230,6 +232,34 @@ pub(crate) fn session_pair() -> (Session, Peer) {
 pub(crate) fn client_pair() -> (GnitzClient, Peer) {
     let (s, peer) = session_pair();
     (GnitzClient::over(s, Box::new(BlockingHost::default())).unwrap(), peer)
+}
+
+/// Park until `s`'s fd is ready for `want` (at most 30 s) and say what is.
+pub(crate) fn park(s: &Session, want: Interest) -> Interest {
+    assert!(!want.is_empty(), "slots pending but nothing to wait for");
+    poll_fd(s.as_fd(), want, Some(Instant::now() + Duration::from_secs(30))).expect("poll")
+}
+
+/// The driver: step with what `poll` reported, parking on `interest()`, until
+/// `last` is answered. Also reports whether both interests were ever armed at
+/// once.
+pub(crate) fn drive<T>(s: &mut Session, mut last: Sent<T>) -> (Result<T, ClientError>, bool) {
+    let mut ready = Interest::WRITE;
+    let mut both_armed = false;
+    loop {
+        s.step(ready);
+        if let Some(reply) = last.try_take() {
+            return (reply, both_armed);
+        }
+        let interest = s.interest();
+        both_armed |= interest.read && interest.write;
+        ready = park(s, interest);
+    }
+}
+
+/// Step and park until `sent` is answered.
+pub(crate) fn await_reply<T>(s: &mut Session, sent: Sent<T>) -> Result<T, ClientError> {
+    drive(s, sent).0
 }
 
 /// Step `s` on what its socket reports ready, parked between steps, until it owes nothing.

@@ -599,12 +599,18 @@ impl SyscallCounts {
     }
 }
 
-/// Re-run **this** test binary's `child_test` under `strace -f -c`, with `env`
-/// set, and total the syscalls it made. The child reads its work out of `env`
-/// and no-ops without it, so an ordinary run leaves it inert.
+/// Re-run **this** test binary's `child_test`, in the caller's `module` (its
+/// `module_path!()`), under `strace -f -c`, with `env` set, and total the
+/// syscalls it made. The child reads its work out of `env` and no-ops without
+/// it, so an ordinary run leaves it inert.
 ///
 /// `None` when `strace` is not installed — the caller skips.
-pub fn strace_test(child_test: &str, env: &[(&str, &str)]) -> Option<SyscallCounts> {
+pub fn strace_test(module: &str, child_test: &str, env: &[(&str, &str)]) -> Option<SyscallCounts> {
+    // libtest's filter path is the module path minus the crate segment.
+    let child_test = &match module.split_once("::") {
+        Some((_krate, path)) => format!("{path}::{child_test}"),
+        None => child_test.to_string(),
+    };
     let strace =
         env::var_os("PATH").and_then(|p| env::split_paths(&p).map(|d| d.join("strace")).find(|c| c.is_file()))?;
     let exe = env::current_exe().expect("current_exe");

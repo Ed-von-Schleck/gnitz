@@ -244,7 +244,7 @@ fn a_tid_refuses_a_second_layout() {
     let wide = Arc::new(Schema::from_parts(wide_cols, s.pk_cols()).unwrap());
     let wide_row = || {
         let mut b = ZSetBatch::new(&wide);
-        BatchAppender::new(&mut b).add_row(2, 1).i64_val(20).i64_val(30);
+        BatchAppender::new(&mut b).add_row(2, 1).int_val(20).int_val(30);
         b
     };
     let mut buf = TxnBuffer::default();

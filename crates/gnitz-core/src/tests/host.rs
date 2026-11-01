@@ -1,7 +1,8 @@
 use super::*;
 use crate::connection::Request;
 use crate::test_support::{client_pair, interrupt_self_until, kv_schema, reply_ctrl, session_pair};
-use crate::{poll_fd, ProtocolError};
+use crate::transport::poll_fd;
+use crate::ProtocolError;
 use gnitz_wire::{ReadBound, ReadSpec, TypeCode};
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -14,13 +15,13 @@ use std::sync::{Arc, Mutex};
 fn an_aborted_park_leaves_its_slot_pending_and_the_next_call_drains_it_first() {
     let (s, peer) = session_pair();
     let mut fired = false;
-    let hook = BlockingHost::with_hook(Box::new(move || {
+    let hook = BlockingHost::with_hook(move || {
         if std::mem::replace(&mut fired, true) {
             Ok(())
         } else {
             Err("interrupted".into())
         }
-    }));
+    });
     let mut c = GnitzClient::over(s, Box::new(hook)).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let sig = interrupt_self_until(Arc::clone(&stop));
@@ -329,43 +330,4 @@ fn serve_ends_the_session_as_the_hosts_failure() {
         matches!(&failed, Some(Err(ClientError::ConnectionLost(ProtocolError::IoError(e)))) if e.to_string() == "no reactor"),
         "{failed:?}"
     );
-}
-
-// ── Reply cells ─────────────────────────────────────────────────────────────
-
-/// A successful reply its `Sent` never read goes back, whether the `Sent` was
-/// dropped before it arrived or after; one taken, routed or failed does not.
-#[test]
-fn an_unread_reply_goes_back() {
-    let back = Arc::new(Mutex::new(Vec::new()));
-    let cell = || {
-        let back = Arc::clone(&back);
-        promise_returning(move |v: u32| back.lock().unwrap().push(v))
-    };
-    let (mut to, sent) = cell();
-    drop(sent);
-    to.fulfil(Ok(1));
-
-    let (mut to, sent) = cell();
-    to.fulfil(Ok(2));
-    drop(sent);
-
-    let (mut to, mut sent) = cell();
-    to.fulfil(Ok(3));
-    assert!(matches!(sent.try_take(), Some(Ok(3))));
-    drop(sent);
-
-    let (mut to, sent) = cell();
-    sent.then(|_| {});
-    to.fulfil(Ok(4));
-
-    let (mut to, sent) = cell();
-    to.fulfil(Err(ClientError::Closed));
-    drop(sent);
-
-    let (to, sent) = cell();
-    drop(sent);
-    drop(to);
-
-    assert_eq!(*back.lock().unwrap(), [1, 2]);
 }

@@ -25,14 +25,14 @@ fn base_rows(schema: &Schema) -> ZSetBatch {
 /// A three-view bundle: segment `h` reads base, segment `g` reads `h`, and `f`
 /// (the user-named view) reads `g`.
 fn chain(name: RelName, base_tid: u64, schema: &Arc<Schema>) -> ViewBundle {
-    let segments = vec![segment(base_tid, schema), segment(gnitz_core::segment_id(0), schema)];
-    bundle(name, segments, segment(gnitz_core::segment_id(1), schema))
+    let segments = vec![segment(base_tid, schema), segment(crate::segment_id(0), schema)];
+    bundle(name, segments, segment(crate::segment_id(1), schema))
 }
 
 /// `(vid, owner_view_id)` of every VIEW_TAB row, sorted; each row is held at
 /// weight 1.
 fn live_views(client: &mut GnitzClient) -> Vec<(u64, u64)> {
-    let view_tab = gnitz_core::sys_schema(VIEW_TAB);
+    let view_tab = crate::sys_schema(VIEW_TAB);
     let b = block_on(client.scan_spec(VIEW_TAB, &ReadSpec::all_rows(ReadBound::None), view_tab))
         .unwrap()
         .batch;
@@ -130,8 +130,8 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     // A segment naming a later segment scans a relation no older than itself.
     let forward = bundle(
         rel(&sn, "fwd"),
-        vec![segment(gnitz_core::segment_id(1), &schema), segment(base_tid, &schema)],
-        segment(gnitz_core::segment_id(0), &schema),
+        vec![segment(crate::segment_id(1), &schema), segment(base_tid, &schema)],
+        segment(crate::segment_id(0), &schema),
     );
     let err = block_on(client.create_view_chain(forward)).unwrap_err().to_string();
     assert!(err.contains("not older"), "got: {err}");
@@ -184,7 +184,7 @@ fn a_multi_scan_reads_a_system_family_between_fanned_relations() {
     let alone = bundle(rel(&sn, "f"), Vec::new(), segment(base_tid, &schema));
     let vid = block_on(client.create_view_chain(alone)).unwrap();
 
-    let view_tab = gnitz_core::sys_schema(VIEW_TAB);
+    let view_tab = crate::sys_schema(VIEW_TAB);
     let all = ReadSpec::all_rows(ReadBound::None);
     let scans = [
         (base_tid.into(), &all, &schema),

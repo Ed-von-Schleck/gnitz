@@ -1,5 +1,5 @@
 //! `AsyncGnitzClient`: a client on the running asyncio event loop, whose verbs
-//! return a future of their result.
+//! return a future of their result — `sync`, a coroutine over one.
 //!
 //! The client lives inside a `serve` loop, polled from the event loop's own
 //! callbacks: its reader and writer on the socket, and a flush the loop runs
@@ -15,8 +15,9 @@ use std::time::Duration;
 
 use pyo3::intern;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 
-use gnitz_core::{serve, BoxFut, ClientError, GnitzClient, Host, Interest, Job, Op, Sent};
+use gnitz_core::{serve, BoxFut, ClientError, Delivery, GnitzClient, Host, Interest, Job, Op, Sent};
 
 use crate::client::{resolve_target, whole, Convert, Mode, PyClient, VerbOp};
 use crate::reply::{none, synced};
@@ -179,16 +180,6 @@ impl Owed {
         })
     }
 
-    /// The caller cancelled the loop future: nobody takes what the call yields.
-    fn abandoned(&self) -> bool {
-        Python::attach(|py| {
-            self.future.as_ref().is_some_and(|future| {
-                let cancelled = future.bind(py).call_method0(intern!(py, "cancelled"));
-                cancelled.and_then(|c| c.extract()).unwrap_or(false)
-            })
-        })
-    }
-
     fn land<T>(mut self, reply: PyResult<T>, convert: impl FnOnce(Python<'_>, T) -> PyResult<Py<PyAny>>) {
         let future = self.future.take().expect("landed once");
         Python::attach(move |py| settle(py, &future, reply.and_then(|t| convert(py, t))));
@@ -203,6 +194,32 @@ impl Drop for Owed {
             Python::attach(move |py| settle(py, &future, Err(client_err(ClientError::Closed))));
         }
         self.shared.state().owed -= 1;
+    }
+}
+
+/// A sync's [`Delivery`], from the step that finished the sync to the task
+/// that awaits it. Dropped untaken, the delivery goes back to the client.
+#[pyclass(name = "_SyncDelivery", frozen, module = "gnitz._native")]
+struct SyncDelivery(Mutex<Option<Delivery>>);
+
+/// The loop future's value for a finished sync.
+fn delivered(py: Python<'_>, delivery: Delivery) -> PyResult<Py<PyAny>> {
+    Ok(Py::new(py, SyncDelivery(Mutex::new(Some(delivery))))?.into_any())
+}
+
+#[pymethods]
+impl SyncDelivery {
+    /// The sync's result, taken once.
+    fn take(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match lock(&self.0).take() {
+            Some(delivery) => synced(py, delivery.take()),
+            None => Err(client_err(ClientError::Closed)),
+        }
+    }
+
+    /// Hand the delivery back untaken: the next sync reports it.
+    fn hand_back(&self) {
+        drop(lock(&self.0).take());
     }
 }
 
@@ -359,35 +376,35 @@ impl LoopCore {
     }
 
     /// Queue a sync, which leaves the client free while the server holds it:
-    /// its answer has no place among the replies. A loop future cancelled
-    /// before the answer arrives never finishes the sync, so what it would
-    /// take from the client stays there for the next sync to bring; one
-    /// cancelled while the client finishes it hands its delivery to
-    /// `GnitzClient::unclaimed`, for the same.
+    /// its answer has no place among the replies. Every answered sync is
+    /// finished, and its `Delivery` goes to the loop future, held by a
+    /// `_SyncDelivery`. What this
+    /// returns is `gnitz.aio._claimed` over that future: the awaiting task takes
+    /// the delivery when it resumes. A delivery never taken (its future
+    /// cancelled, or its task cancelled after the answer arrived) goes back
+    /// to the client, and the next sync reports it.
     pub(crate) fn sync(&self, py: Python<'_>, wait: Duration) -> PyResult<Py<PyAny>> {
-        self.queue(py, |owed| {
+        let delivery = self.queue(py, |owed| {
             Box::new(move |client| {
                 Box::pin(async move {
                     // The step that reads the answer queues the rest, and
                     // the `serve` loop takes it up before it waits again.
                     client.begin_sync(wait).then(move |reply| {
-                        if owed.abandoned() {
-                            return;
-                        }
                         let shared = Arc::clone(&owed.shared);
                         let rest: Op = Box::new(move |client| {
                             Box::pin(async move {
-                                match client.finish_sync(reply).await {
-                                    Ok(unreceived) if owed.abandoned() => client.unclaimed(unreceived),
-                                    done => owed.land(done.map_err(client_err), synced),
-                                }
+                                let synced = client.finish_sync(reply).await.map(|s| client.delivery(s));
+                                owed.land(synced.map_err(client_err), delivered);
                             })
                         });
                         shared.state().queue.push_back(rest);
                     })
                 })
             })
-        })
+        })?;
+        static CLAIMED: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+        let claimed = CLAIMED.import(py, "gnitz.aio", "_claimed")?;
+        Ok(claimed.call1((delivery,))?.unbind())
     }
 
     /// Checkpoint and release the mirror store, then close: no call is taken

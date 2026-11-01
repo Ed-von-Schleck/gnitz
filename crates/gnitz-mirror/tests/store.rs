@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use gnitz_core::{DeltaCursor, MirrorError, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
+use gnitz_core::{DeltaCursor, MirrorStore, RelDescriptor, RelName, Schema, ZSetBatch};
 use gnitz_mirror::{Mirror, MirrorConfig};
 use gnitz_wire::{KeyRange, PkColList, ReadBound, ReadSpec, RelClass, RelIndex};
 use gnitz_zset::schema::{encode_schema_block, SchemaDescriptor};
@@ -86,7 +86,7 @@ fn seed(
     desc: &RelDescriptor,
     blocks: &[&[u8]],
     cursor: DeltaCursor,
-) -> Result<(), MirrorError> {
+) -> Result<(), String> {
     store.refill(&rel(name), desc)?;
     store.fill(desc.tid, blocks, Some(cursor))
 }
@@ -179,7 +179,7 @@ fn rows_of(batch: &ZSetBatch) -> BTreeMap<(u64, i64), i64> {
 }
 
 /// Every row of the copy.
-fn whole_copy(store: &mut Mirror, tid: u64) -> Result<ZSetBatch, MirrorError> {
+fn whole_copy(store: &mut Mirror, tid: u64) -> Result<ZSetBatch, String> {
     store.scan_spec(tid, ReadSpec::all_rows(ReadBound::None), &view_schema())
 }
 
@@ -239,14 +239,11 @@ fn a_forgotten_copy_is_gone() {
 
     assert_eq!(store.cursor_of(TID), None);
     assert!(
-        matches!(
-            store.advance(TID, &[&plain(&[(3, 1, 30)])], cursor(5)),
-            Err(MirrorError::Engine(_))
-        ),
+        store.advance(TID, &[&plain(&[(3, 1, 30)])], cursor(5)).is_err(),
         "no cursor, so no delta continues it",
     );
     let filled = store.fill(TID, &[&plain(&[(7, 1, 70)])], Some(cursor(4)));
-    assert!(matches!(filled, Err(MirrorError::Engine(_))), "no refill opened it");
+    assert!(filled.is_err(), "no refill opened it");
     assert!(whole_copy(&mut store, TID).is_err(), "and so is the copy");
     assert!(!has_copy(path(&dir), TID), "directory and all, checkpointed or not");
     // Dropped without another checkpoint: the retraction is durable on its own.
@@ -301,11 +298,11 @@ fn a_failed_block_ends_its_refill() {
     store.refill(&rel("v"), &desc(TID)).unwrap();
     store.fill(TID, &[&plain(&[(5, 1, 50)])], None).unwrap();
     let torn = store.fill(TID, &[&[0xFF; 64]], None);
-    assert!(matches!(torn, Err(MirrorError::Engine(_))), "{torn:?}");
+    assert!(torn.is_err(), "{torn:?}");
     let next = store.fill(TID, &[&plain(&[(6, 1, 60)])], None);
-    assert!(matches!(next, Err(MirrorError::Engine(_))), "{next:?}");
+    assert!(next.is_err(), "{next:?}");
     let sealed = store.fill(TID, &[], Some(cursor(5)));
-    assert!(matches!(sealed, Err(MirrorError::Engine(_))), "{sealed:?}");
+    assert!(sealed.is_err(), "{sealed:?}");
     assert_eq!(store.cursor_of(TID), None);
 
     seed(&mut store, "v", &desc(TID), &[&plain(&[(7, 1, 70)])], cursor(6)).unwrap();
@@ -380,10 +377,9 @@ fn a_checkpoint_keeps_a_copy_the_session_never_touched() {
 fn a_failed_apply_erases_that_copy_and_spares_the_rest() {
     let (mut store, _dir) = two_copies();
 
-    let err = store
+    store
         .advance(TID, &[&plain(&[(2, 1, 20)]), &[0xFF; 64]], cursor(5))
         .expect_err("an undecodable block must fail the advance");
-    assert!(matches!(err, MirrorError::Engine(_)), "{err}");
 
     assert_eq!(store.cursor_of(TID), None, "the erased copy keeps no cursor");
     assert!(held(&mut store, TID).is_empty(), "and holds no rows");
@@ -708,8 +704,7 @@ fn a_teardown_that_cannot_erase_costs_that_copy_alone() {
     store.checkpoint().unwrap();
 
     block_manifest(path(&dir), TID);
-    let err = store.forget(TID).expect_err("an erase of a blocked manifest must fail");
-    assert!(matches!(err, MirrorError::Engine(_)), "{err}");
+    store.forget(TID).expect_err("an erase of a blocked manifest must fail");
     assert_eq!(store.cursor_of(TID), None, "the copy is gone from the store");
 
     store.advance(OTHER_TID, &[&plain(&[(9, 1, 90)])], cursor(5)).unwrap();
@@ -733,7 +728,7 @@ fn a_refill_ends_with_its_copy() {
     store.refill(&rel("v"), &desc(TID)).unwrap();
     store.forget(TID).unwrap();
     let filled = store.fill(TID, &[&plain(&[(1, 1, 10)])], None);
-    assert!(matches!(filled, Err(MirrorError::Engine(_))), "{filled:?}");
+    assert!(filled.is_err(), "{filled:?}");
 }
 
 /// A refill ends with its registration: once the id is registered at another
@@ -746,7 +741,7 @@ fn a_refill_ends_with_its_registration() {
     let wide = schema_of(&make_schema_u128_i64());
     store.register(&rel("v"), &desc_of(TID, &wide, &[])).unwrap();
     let sealed = store.fill(TID, &[], Some(cursor(5)));
-    assert!(matches!(sealed, Err(MirrorError::Engine(_))), "{sealed:?}");
+    assert!(sealed.is_err(), "{sealed:?}");
     assert_eq!(store.cursor_of(TID), None);
 }
 
@@ -810,10 +805,9 @@ fn a_failed_checkpoint_leaves_the_store_usable_and_the_retry_sound() {
         .unwrap();
 
     block_copy(path(&dir), TID);
-    let err = store
+    store
         .checkpoint()
         .expect_err("a checkpoint into a blocked copy must fail");
-    assert!(matches!(err, MirrorError::Engine(_)), "{err}");
     let rows = BTreeMap::from([((1, 10), 2), ((2, 20), 1)]);
     assert_eq!(held(&mut store, TID), rows, "the copy is untouched");
 

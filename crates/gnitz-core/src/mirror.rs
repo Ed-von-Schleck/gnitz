@@ -32,14 +32,13 @@
 
 use std::collections::HashMap;
 use std::future::poll_fn;
-use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::client::GnitzClient;
-use crate::connection::{DeltaCursor, Polled, RawBlock, RelDescriptor, Session, Target};
+use crate::connection::{DeltaCursor, Polled, RawBlock, RelDescriptor, ScanReply, Session, Target};
 use crate::error::ClientError;
-use crate::host::{offload, BoxFut, Host};
+use crate::host::{offload, BoxFut, Host, Pending, Sent};
 use crate::{RelName, Schema, ZSetBatch};
 use gnitz_wire::txn_frame::{kept_as, DeltaPollItem, SubId};
 use gnitz_wire::{payload_str, RelClass, WireStatus, RELTAB_PAY_NAME, VIEW_TAB};
@@ -57,80 +56,50 @@ use gnitz_wire::{payload_str, RelClass, WireStatus, RELTAB_PAY_NAME, VIEW_TAB};
 ///
 /// `Send`, because the client runs its disk work where its host lets work
 /// block, which may be another thread. Not `Sync`: one call runs at a time.
+///
+/// Every `Err` is the local engine's refusal or failure: a storage fault, a
+/// registration the registry rejected, a read the spec could not express.
 pub trait MirrorStore: Send {
     /// Register `desc.tid` as `name`, with `desc`'s schema and indexes,
     /// retracting whatever the store held at that id as another relation, or
     /// under that name at another id. A registration that already stands as
     /// given is left as it is.
-    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError>;
+    fn register(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), String>;
 
     /// Retract `tid`: its cursor, its rows, its record and its directory.
     /// Idempotent, and a `tid` the store does not hold is `Ok(())`. On `Err` the
     /// store no longer holds it, and a later open may find it at its last
     /// checkpoint.
-    fn forget(&mut self, tid: u64) -> Result<(), MirrorError>;
+    fn forget(&mut self, tid: u64) -> Result<(), String>;
 
     /// Register `desc.tid` as `name`, as [`Self::register`] does, then erase its
     /// copy and open it for the view's whole value. Until a [`Self::fill`] seals
     /// it, it holds no cursor, so [`Self::cursor_of`] gates every read of it out.
-    fn refill(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError>;
+    fn refill(&mut self, name: &RelName, desc: &RelDescriptor) -> Result<(), String>;
 
     /// Add `blocks` of the value to the copy [`Self::refill`] opened. At
     /// `Some(cursor)` the blocks filled so far and these are `tid`'s whole value
     /// at that cursor, and the copy answers at it. A block that fails erases the
     /// copy and ends the refill: no further block or seal is taken until the
     /// next refill.
-    fn fill(&mut self, tid: u64, blocks: &[&[u8]], sealed_at: Option<DeltaCursor>) -> Result<(), MirrorError>;
+    fn fill(&mut self, tid: u64, blocks: &[&[u8]], sealed_at: Option<DeltaCursor>) -> Result<(), String>;
 
     /// Apply `blocks`, the view's deltas after the copy's cursor, and advance it to
     /// `next`. Refused for a copy holding no cursor. May touch the disk when
     /// `blocks` is non-empty; with no blocks it touches no disk, since the
     /// client calls it on its own thread.
-    fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError>;
+    fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), String>;
 
     /// Run `spec` against `tid`'s copy, replying under `reply_schema`.
-    fn scan_spec(
-        &mut self,
-        tid: u64,
-        spec: gnitz_wire::ReadSpec,
-        reply_schema: &Schema,
-    ) -> Result<ZSetBatch, MirrorError>;
+    fn scan_spec(&mut self, tid: u64, spec: gnitz_wire::ReadSpec, reply_schema: &Schema) -> Result<ZSetBatch, String>;
 
     /// The round `tid`'s copy answers at, and by its presence that the copy is
     /// valid at all — the store half of the readability gate.
     fn cursor_of(&self, tid: u64) -> Option<DeltaCursor>;
 
     /// Make every copy and its cursor durable.
-    fn checkpoint(&mut self) -> Result<(), MirrorError>;
+    fn checkpoint(&mut self) -> Result<(), String>;
 }
-
-/// Why a mirror operation did not happen.
-#[derive(Debug, Clone)]
-pub enum MirrorError {
-    /// The local engine refused or failed: a storage fault, a registration the
-    /// registry rejected, a read the spec could not express.
-    Engine(String),
-    /// The store is poisoned and refuses every further call that touches a copy:
-    /// a store call panicked, so the store may be torn. A failed apply or
-    /// teardown costs that copy alone.
-    ///
-    /// [`GnitzClient::close_mirror`] is the only recovery.
-    Poisoned,
-}
-
-impl std::fmt::Display for MirrorError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MirrorError::Engine(m) => write!(f, "engine: {m}"),
-            MirrorError::Poisoned => write!(
-                f,
-                "mirror store is poisoned: a store call panicked; the store may be torn"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for MirrorError {}
 
 // ---------------------------------------------------------------------------
 // What a poll reports
@@ -280,11 +249,11 @@ impl Store {
     }
 
     /// Refused once a call panicked under the lock — the store's poison, and so
-    /// the one source of [`MirrorError::Poisoned`]: a torn store answers no
-    /// read and publishes nothing.
-    fn refusal(&self) -> Result<(), MirrorError> {
+    /// the one source of [`ClientError::MirrorPoisoned`]: a torn store answers
+    /// no read and publishes nothing.
+    fn refusal(&self) -> Result<(), ClientError> {
         match self.0.is_poisoned() {
-            true => Err(MirrorError::Poisoned),
+            true => Err(ClientError::MirrorPoisoned),
             false => Ok(()),
         }
     }
@@ -292,33 +261,39 @@ impl Store {
     /// The store, for a call that touches a copy: a cursor move or a local
     /// read in place, so a mirrored read costs no dispatch, and work that
     /// writes the disk through [`Self::run`]. Refused as [`Self::refusal`] is.
-    fn touch(&self) -> Result<MutexGuard<'_, dyn MirrorStore + 'static>, MirrorError> {
-        self.0.lock().map_err(|_| MirrorError::Poisoned)
+    fn touch(&self) -> Result<MutexGuard<'_, dyn MirrorStore + 'static>, ClientError> {
+        self.0.lock().map_err(|_| ClientError::MirrorPoisoned)
     }
 
-    /// Run `work`, which may touch the disk, where `host` lets work block.
+    /// `work` on the store, in place, refused as [`Self::touch`] is; the
+    /// store's own failure is [`ClientError::Mirror`].
+    fn with<R>(&self, work: impl FnOnce(&mut dyn MirrorStore) -> Result<R, String>) -> Result<R, ClientError> {
+        work(&mut *self.touch()?).map_err(ClientError::Mirror)
+    }
+
+    /// [`Self::with`], run where `host` lets work block, since `work` may touch
+    /// the disk. The outer `Err` is the job's, the inner the store's.
     async fn run<R: Send + 'static>(
         self,
         host: &mut dyn Host,
-        work: impl FnOnce(&mut dyn MirrorStore) -> Result<R, MirrorError> + Send + 'static,
-    ) -> Result<Result<R, MirrorError>, ClientError> {
-        offload(host, move || work(&mut *self.touch()?)).await
+        work: impl FnOnce(&mut dyn MirrorStore) -> Result<R, String> + Send + 'static,
+    ) -> Result<Result<R, ClientError>, ClientError> {
+        offload(host, move || self.with(work)).await
     }
 
     /// Advance each copy of `trains` — its id, its blocks and the cursor past
-    /// them — and answer each with how its ingest went.
+    /// them — and answer each, in train order, with how its ingest went.
     async fn advance(
         self,
         host: &mut dyn Host,
         trains: Vec<(u64, Vec<RawBlock>, DeltaCursor)>,
-    ) -> Result<Vec<(u64, Result<(), ClientError>)>, ClientError> {
+    ) -> Result<Vec<Result<(), ClientError>>, ClientError> {
         // A cursor move touches no disk, so it runs on the client's thread.
         let quiet = trains.iter().all(|(_, blocks, _)| blocks.is_empty());
         let apply = move || {
             let advance = |(tid, blocks, next): (u64, Vec<RawBlock>, DeltaCursor)| {
                 let blocks: Vec<&[u8]> = blocks.iter().map(RawBlock::block).collect();
-                let advanced = self.touch().and_then(|mut s| s.advance(tid, &blocks, next));
-                (tid, advanced.map_err(ClientError::from))
+                self.with(|s| s.advance(tid, &blocks, next))
             };
             trains.into_iter().map(advance).collect()
         };
@@ -339,39 +314,6 @@ pub(crate) struct MirrorState {
 }
 
 impl MirrorState {
-    /// See [`GnitzClient::cursor_of`].
-    pub(crate) fn cursor_of(&self, tid: u64) -> Option<DeltaCursor> {
-        self.views.get(&tid)?.answers_at(&*self.store.get())
-    }
-
-    /// Run `spec` against `tid`'s copy when the copy answers reads, under one
-    /// guard for the gate and the scan, and break with its answer; a copy that
-    /// answers none continues with `spec`, for the read upstream. A poisoned
-    /// store answers with its refusal.
-    pub(crate) fn scan_local(
-        &self,
-        tid: u64,
-        spec: gnitz_wire::ReadSpec,
-        reply_schema: &Schema,
-    ) -> ControlFlow<Result<ZSetBatch, MirrorError>, gnitz_wire::ReadSpec> {
-        let mut store = self.store.get();
-        match self.views.get(&tid).and_then(|v| v.answers_at(&*store)) {
-            Some(_) => ControlFlow::Break(
-                self.store
-                    .refusal()
-                    .and_then(|()| store.scan_spec(tid, spec, reply_schema)),
-            ),
-            None => ControlFlow::Continue(spec),
-        }
-    }
-
-    /// The descriptor `name` is mirrored under, while its copy answers reads.
-    pub(crate) fn answering(&self, name: &RelName) -> Option<Arc<RelDescriptor>> {
-        let view = self.views.values().find(|v| v.name == *name)?;
-        view.answers_at(&*self.store.get())?;
-        Some(Arc::clone(&view.desc))
-    }
-
     /// The connection was replaced: no copy answers a read until it is synced
     /// on the new one.
     pub(crate) fn connection_replaced(&mut self) {
@@ -382,24 +324,20 @@ impl MirrorState {
     }
 
     /// One failed entry for each view, its copy answering at no round: the
-    /// store is poisoned, so a sync names none of its subscriptions, which
-    /// ends them.
-    fn poisoned(&mut self) -> Vec<PollOutcome> {
-        let failed = |(&view_id, view): (&u64, &mut MirroredView)| {
-            view.link = Link::Failed;
-            PollOutcome {
-                view_id,
-                cursor: None,
-                result: PollResult::Failed(ClientError::Mirror(MirrorError::Poisoned)),
-            }
+    /// store is poisoned.
+    fn poisoned(&self) -> Vec<PollOutcome> {
+        let failed = |&view_id: &u64| PollOutcome {
+            view_id,
+            cursor: None,
+            result: PollResult::Failed(ClientError::MirrorPoisoned),
         };
-        self.views.iter_mut().map(failed).collect()
+        self.views.keys().map(failed).collect()
     }
 
     /// Owe each view `outcomes` reports reseeded, and still registered, its
     /// [`PollResult::Reseeded`] again.
     pub(crate) fn owe_reseeds(&mut self, outcomes: &[PollOutcome]) {
-        for o in outcomes.iter().filter(|o| matches!(o.result, PollResult::Reseeded)) {
+        for o in outcomes.iter().filter(|o| o.result.reseeded()) {
             if let Some(view) = self.views.get_mut(&o.view_id) {
                 view.owed_reseed = true;
             }
@@ -456,7 +394,7 @@ fn refuse_unfed(what: &str, class: RelClass) -> Result<(), ClientError> {
 /// A mirror verb on a client that never attached a store. The message names no
 /// method — each binding spells the attach differently.
 fn no_mirror_store() -> ClientError {
-    ClientError::from("this client mirrors nothing; attach a store before mirroring a view".to_string())
+    ClientError::from("this client mirrors nothing; attach a store before mirroring a view")
 }
 
 impl GnitzClient {
@@ -699,7 +637,7 @@ impl GnitzClient {
                             let taken: Vec<&[u8]> = taken.iter().map(RawBlock::block).collect();
                             s.fill(tid, &taken, sealed_at)
                         };
-                        failed = store.clone().run(host, fill).await?.err().map(ClientError::from);
+                        failed = store.clone().run(host, fill).await?.err();
                     }
                     if let Some(end) = end {
                         blocks.clear();
@@ -726,7 +664,8 @@ impl GnitzClient {
             }
             if poll.drained() && !due.is_empty() {
                 let advanced = store.clone().advance(host, std::mem::take(&mut due)).await?;
-                for (i, (tid, advanced)) in ended.drain(..).zip(advanced) {
+                for (i, advanced) in ended.drain(..).zip(advanced) {
+                    let tid = tids[i];
                     if let (Ok(()), Some(view)) = (&advanced, views.get_mut(&tid)) {
                         view.subscribed(kept_as(first, i));
                     }
@@ -760,9 +699,10 @@ impl GnitzClient {
                     view.link = Link::Due;
                     continue;
                 };
-                done.push((tid, Ok(())));
                 if next != at || !blocks.is_empty() {
                     due.push((tid, blocks, next));
+                } else {
+                    done.push((tid, Ok(())));
                 }
             }
         }
@@ -780,15 +720,14 @@ impl GnitzClient {
                 return Err(lost);
             }
         };
-        for (tid, advanced) in advanced {
-            let Err(e) = advanced else { continue };
+        for (tid, advanced) in taken.into_iter().zip(advanced) {
             // A copy its store let go of is read whole by the next poll.
-            if let Some(view) = views.get_mut(&tid) {
-                view.link = Link::Due;
+            if advanced.is_err() {
+                if let Some(view) = views.get_mut(&tid) {
+                    view.link = Link::Due;
+                }
             }
-            if let Some(failed) = done.iter_mut().find(|(done, _)| *done == tid) {
-                failed.1 = Err(e);
-            }
+            done.push((tid, advanced));
         }
         Ok(done)
     }
@@ -816,14 +755,14 @@ impl GnitzClient {
     /// when the feed no longer covers them.
     pub async fn attach_mirror<S: MirrorStore + 'static>(
         &mut self,
-        open: impl FnOnce() -> Result<S, MirrorError> + Send + 'static,
+        open: impl FnOnce() -> Result<S, String> + Send + 'static,
     ) -> Result<(), ClientError> {
         if self.mirror.is_some() {
             return Err(ClientError::from(
-                "this client already mirrors; close_mirror before attaching another store".to_string(),
+                "this client already mirrors; close_mirror before attaching another store",
             ));
         }
-        let store = offload(&mut *self.host, open).await??;
+        let store = offload(&mut *self.host, open).await?.map_err(ClientError::Mirror)?;
         self.mirror = Some(Box::new(MirrorState {
             store: Store(Arc::new(Mutex::new(store))),
             views: HashMap::new(),
@@ -928,13 +867,13 @@ impl GnitzClient {
 
     /// Advance every mirrored view, a subscribed one by what the sync `synced`
     /// answers brought it and any other by a delta read. On a poisoned store
-    /// each view is reported failed with [`MirrorError::Poisoned`], and the
-    /// store is not touched. `Err` is an interrupt.
+    /// each view is reported failed with [`ClientError::MirrorPoisoned`], and
+    /// the store is not touched. `Err` is an interrupt.
     pub(crate) async fn advance_mirror(
         &mut self,
         synced: &Result<(), ClientError>,
     ) -> Result<Vec<PollOutcome>, ClientError> {
-        let Some(m) = self.mirror.as_deref_mut() else {
+        let Some(m) = self.mirror.as_deref() else {
             return Ok(Vec::new());
         };
         if m.store.refusal().is_err() {
@@ -970,7 +909,48 @@ impl GnitzClient {
     /// left is none until a sync on this connection succeeds. A discarded copy
     /// is told by [`PollResult::Reseeded`], never by its cursor.
     pub fn cursor_of(&self, table_id: u64) -> Option<DeltaCursor> {
-        self.mirror.as_deref()?.cursor_of(table_id)
+        let m = self.mirror.as_deref()?;
+        m.views.get(&table_id)?.answers_at(&*m.store.get())
+    }
+
+    /// The descriptor of the mirrored view `name`, while its copy answers
+    /// reads. As stale as the copy.
+    pub fn mirrored_desc(&self, name: &RelName) -> Option<Arc<RelDescriptor>> {
+        let m = self.mirror.as_deref()?;
+        let view = m.views.values().find(|v| v.name == *name)?;
+        view.answers_at(&*m.store.get())?;
+        Some(Arc::clone(&view.desc))
+    }
+
+    /// [`Self::scan_spec`], answered off the copy when it holds `target`, with
+    /// no served LSN: a copy's freshness is [`Self::cursor_of`]. The gate and
+    /// the scan run under one guard, and a poisoned store refuses a read its
+    /// copy would answer.
+    pub fn scan_spec_local_first(
+        &mut self,
+        target: impl Into<Target>,
+        spec: gnitz_wire::ReadSpec,
+        reply_schema: &Arc<Schema>,
+    ) -> Pending<'_, ScanReply> {
+        let target = target.into();
+        if let Some(m) = self.mirror.as_deref() {
+            let mut store = m.store.get();
+            if m.views.get(&target.tid).and_then(|v| v.answers_at(&*store)).is_some() {
+                let scanned = m.store.refusal().and_then(|()| {
+                    store
+                        .scan_spec(target.tid, spec, reply_schema)
+                        .map_err(ClientError::Mirror)
+                });
+                drop(store);
+                let reply = scanned.map(|batch| ScanReply {
+                    batch,
+                    schema: Arc::clone(reply_schema),
+                    lsn: None,
+                });
+                return self.wait(Sent::ready(reply));
+            }
+        }
+        self.scan_spec(target, &spec, reply_schema)
     }
 
     /// Make every copy and its cursor durable.
@@ -980,7 +960,7 @@ impl GnitzClient {
     /// usable and a retry is sound.
     pub async fn checkpoint_mirror(&mut self) -> Result<(), ClientError> {
         let store = self.mirror_state()?.store.clone();
-        Ok(store.run(&mut *self.host, |s| s.checkpoint()).await??)
+        store.run(&mut *self.host, |s| s.checkpoint()).await?
     }
 
     /// Checkpoint and release the store, returning the checkpoint's own result so
@@ -998,8 +978,8 @@ impl GnitzClient {
         // Dropping the store, in the job that holds its last handle, releases
         // the directory lock.
         match m.store.run(&mut *self.host, |s| s.checkpoint()).await? {
-            Err(MirrorError::Poisoned) => Ok(()),
-            other => other.map_err(ClientError::from),
+            Err(ClientError::MirrorPoisoned) => Ok(()),
+            other => other,
         }
     }
 

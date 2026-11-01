@@ -15,9 +15,8 @@ use crate::client::GnitzClient;
 use crate::error::ClientError;
 use crate::transport::{poll_fd_or_cancel, Interest};
 
-/// Run when a signal interrupts a [`BlockingHost`]'s wait; an `Err` aborts the
-/// call with [`ClientError::Interrupted`] and leaves the session as it stood.
-pub type ParkHook = Box<dyn FnMut() -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send>;
+/// What [`BlockingHost::with_hook`] runs.
+type ParkHook = Box<dyn FnMut() -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send>;
 
 /// Work a [`Host`] runs where blocking is allowed.
 pub type Job = Box<dyn FnOnce() + Send>;
@@ -53,9 +52,16 @@ pub struct BlockingHost {
 }
 
 impl BlockingHost {
-    /// A host that runs `hook` whenever a signal interrupts its wait.
-    pub fn with_hook(hook: ParkHook) -> Self {
-        BlockingHost { hook: Some(hook), ..Default::default() }
+    /// A host that runs `hook` whenever a signal interrupts its wait; an `Err`
+    /// aborts the call with [`ClientError::Interrupted`] and leaves the session
+    /// as it stood.
+    pub fn with_hook(
+        hook: impl FnMut() -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ) -> Self {
+        BlockingHost {
+            hook: Some(Box::new(hook)),
+            ..Default::default()
+        }
     }
 
     /// A host whose wait gives up once `cancel` has bytes to read, and reads
@@ -170,8 +176,7 @@ impl<T> Future for Pending<'_, T> {
             if let Some(reply) = this.sent.try_take() {
                 return Poll::Ready(reply);
             }
-            let GnitzClient { session, host, .. } = &mut *this.client;
-            ready!(session.turn(&mut **host, cx))?;
+            ready!(this.client.session.turn(&mut *this.client.host, cx))?;
         }
     }
 }
@@ -197,8 +202,7 @@ pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_
                     Poll::Pending => {}
                 }
             }
-            let GnitzClient { session, host, .. } = &mut client;
-            match session.turn(&mut **host, cx) {
+            match client.session.turn(&mut *client.host, cx) {
                 Poll::Ready(Ok(())) => {}
                 // Nothing outstanding and nothing buffered.
                 Poll::Ready(Err(ClientError::Closed)) => {
@@ -208,7 +212,7 @@ pub async fn serve(mut client: GnitzClient, mut next: impl FnMut(&mut Context<'_
                     }
                 }
                 // No call is waiting to hand an interrupt to.
-                Poll::Ready(Err(e)) => session.end(e),
+                Poll::Ready(Err(e)) => client.session.end(e),
                 Poll::Pending => return Poll::Pending,
             }
         })
@@ -237,27 +241,17 @@ enum Awaited<T> {
     Routed(Box<dyn FnOnce(Result<T, ClientError>) + Send>),
     /// Awaited by a task its arrival wakes.
     Watched(Waker),
-    /// Its [`Sent`] was dropped.
-    Abandoned,
 }
 
-/// Where a reply goes when its [`Sent`] is dropped before it is read.
-type Back<T> = Box<dyn FnOnce(T) + Send>;
-
-struct Slot<T> {
-    awaited: Awaited<T>,
-    back: Option<Back<T>>,
-}
-
-struct Cell<T>(Mutex<Slot<T>>);
+struct Cell<T>(Mutex<Awaited<T>>);
 
 impl<T> Cell<T> {
-    fn new(awaited: Awaited<T>, back: Option<Back<T>>) -> Arc<Self> {
-        Arc::new(Cell(Mutex::new(Slot { awaited, back })))
+    fn new(awaited: Awaited<T>) -> Arc<Self> {
+        Arc::new(Cell(Mutex::new(awaited)))
     }
 
     /// A panic under this lock leaves what it guards whole.
-    fn lock(&self) -> MutexGuard<'_, Slot<T>> {
+    fn lock(&self) -> MutexGuard<'_, Awaited<T>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -272,14 +266,7 @@ pub struct Promise<T>(Option<Arc<Cell<T>>>);
 
 /// A reply yet to arrive, and its writer.
 pub fn promise<T>() -> (Promise<T>, Sent<T>) {
-    let cell = Cell::new(Awaited::Outstanding, None);
-    (Promise(Some(Arc::clone(&cell))), Sent(cell))
-}
-
-/// [`promise`], where a successful reply nobody read — its [`Sent`] dropped
-/// before taking or routing it — goes to `back`.
-pub(crate) fn promise_returning<T>(back: impl FnOnce(T) + Send + 'static) -> (Promise<T>, Sent<T>) {
-    let cell = Cell::new(Awaited::Outstanding, Some(Box::new(back)));
+    let cell = Cell::new(Awaited::Outstanding);
     (Promise(Some(Arc::clone(&cell))), Sent(cell))
 }
 
@@ -290,24 +277,17 @@ impl<T> Promise<T> {
             return;
         };
         let mut slot = cell.lock();
-        match std::mem::take(&mut slot.awaited) {
+        match std::mem::take(&mut *slot) {
             Awaited::Routed(route) => {
                 drop(slot);
                 route(reply)
             }
             Awaited::Watched(waiter) => {
-                slot.awaited = Awaited::Arrived(reply);
+                *slot = Awaited::Arrived(reply);
                 drop(slot);
                 waiter.wake()
             }
-            Awaited::Outstanding => slot.awaited = Awaited::Arrived(reply),
-            Awaited::Abandoned => {
-                let back = slot.back.take();
-                drop(slot);
-                if let (Some(back), Ok(value)) = (back, reply) {
-                    back(value)
-                }
-            }
+            Awaited::Outstanding => *slot = Awaited::Arrived(reply),
             Awaited::Arrived(_) => unreachable!("a cell has one writer, which fulfils once"),
         }
     }
@@ -319,39 +299,19 @@ impl<T> Drop for Promise<T> {
     }
 }
 
-/// A reply still to arrive is abandoned, and one that arrived unread goes
-/// back as [`promise_returning`] says.
-impl<T> Drop for Sent<T> {
-    fn drop(&mut self) {
-        let mut slot = self.0.lock();
-        let unread = match std::mem::replace(&mut slot.awaited, Awaited::Abandoned) {
-            Awaited::Arrived(Ok(value)) => slot.back.take().map(|back| (back, value)),
-            routed @ Awaited::Routed(_) => {
-                slot.awaited = routed;
-                None
-            }
-            _ => None,
-        };
-        drop(slot);
-        if let Some((back, value)) = unread {
-            back(value)
-        }
-    }
-}
-
 impl<T> Sent<T> {
     /// A reply that needed no request.
     pub fn ready(value: Result<T, ClientError>) -> Self {
-        Sent(Cell::new(Awaited::Arrived(value), None))
+        Sent(Cell::new(Awaited::Arrived(value)))
     }
 
     /// The reply, if it has arrived. It is handed out once.
     pub fn try_take(&mut self) -> Option<Result<T, ClientError>> {
         let mut slot = self.0.lock();
-        match std::mem::take(&mut slot.awaited) {
+        match std::mem::take(&mut *slot) {
             Awaited::Arrived(reply) => Some(reply),
             other => {
-                slot.awaited = other;
+                *slot = other;
                 None
             }
         }
@@ -361,12 +321,12 @@ impl<T> Sent<T> {
     /// it does: for a request's, inside the step that reads it.
     pub fn then(self, route: impl FnOnce(Result<T, ClientError>) + Send + 'static) {
         let mut slot = self.0.lock();
-        match std::mem::take(&mut slot.awaited) {
+        match std::mem::take(&mut *slot) {
             Awaited::Arrived(reply) => {
                 drop(slot);
                 route(reply)
             }
-            _ => slot.awaited = Awaited::Routed(Box::new(route)),
+            _ => *slot = Awaited::Routed(Box::new(route)),
         }
     }
 
@@ -386,10 +346,10 @@ impl<T> Future for Sent<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut slot = self.0.lock();
-        match std::mem::take(&mut slot.awaited) {
+        match std::mem::take(&mut *slot) {
             Awaited::Arrived(reply) => Poll::Ready(reply),
             _ => {
-                slot.awaited = Awaited::Watched(cx.waker().clone());
+                *slot = Awaited::Watched(cx.waker().clone());
                 Poll::Pending
             }
         }

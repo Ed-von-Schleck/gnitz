@@ -3,8 +3,9 @@
 
 use super::*;
 use crate::test_support::{
-    decode_wal_block, delta_frame, delta_terminal, kv_rows, kv_schema, pushed_marker, pushed_train, reply_ctrl,
-    reply_rows, reply_status, session_pair as pair, step_until_idle, sub_id, sync_answer, sync_header, sync_held, Peer,
+    await_reply, decode_wal_block, delta_frame, delta_terminal, kv_rows, kv_schema, pushed_marker, pushed_train,
+    reply_ctrl, reply_rows, reply_status, session_pair as pair, step_until_idle, sub_id, sync_answer, sync_header,
+    sync_held, Peer,
 };
 use crate::transport::poll_fd;
 use crate::{BatchAppender, PkColumn};
@@ -15,20 +16,8 @@ fn submit_scan(s: &mut Session, tid: u64, schema: &Arc<Schema>) -> Sent<ScanRepl
     s.submit_scan(tid.into(), &ReadSpec::all_rows(ReadBound::None), schema)
 }
 
-/// Step and park until `sent` is answered.
-fn await_reply<T>(s: &mut Session, mut sent: Sent<T>) -> Result<T, ClientError> {
-    let mut ready = Interest::WRITE;
-    loop {
-        s.step(ready);
-        if let Some(reply) = sent.try_take() {
-            return reply;
-        }
-        ready = poll_fd(s.as_fd(), s.interest(), None).unwrap();
-    }
-}
-
 /// A request ACKed at target 0.
-const COMMIT: Request<'static> = Request::PushTxn { families: &[] };
+const COMMIT: Request<'static> = Request::PushTxn(&[]);
 
 fn schema_a() -> Arc<Schema> {
     Arc::new(kv_schema(TypeCode::I64))

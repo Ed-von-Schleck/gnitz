@@ -1,6 +1,8 @@
 //! A recording of the frames clients exchanged with one server: every frame a
-//! connection sent or received after its HELLO, in the order this process saw
-//! them, tagged with the connection.
+//! connection queued to send or received after its HELLO, in the order this
+//! process saw them, tagged with the connection. A frame is recorded as sent
+//! when it is queued, so one dropped unwritten by a connection that ended
+//! first is recorded too.
 //!
 //! A process whose `GNITZ_RECORD_FRAMES` names a directory records every
 //! connection it opens there. The connections of one process to one target
@@ -129,9 +131,9 @@ impl Tap {
         Tap { file: Arc::clone(&recording.file), conn }
     }
 
-    /// Record `frame`, which this connection sent or received, whole under the
-    /// file's lock: the connections sharing the file never interleave inside a
-    /// record.
+    /// Record `frame`, which this connection queued to send or received, whole
+    /// under the file's lock: the connections sharing the file never interleave
+    /// inside a record.
     pub(crate) fn note(&self, dir: Direction, frame: &[u8]) {
         let mut w = Writer::with_capacity(1 + 4 + 4 + frame.len());
         Recorded { conn: self.conn, dir, frame }.write(&mut w);

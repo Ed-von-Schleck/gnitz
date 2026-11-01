@@ -1,9 +1,8 @@
 //! Transactions as a client runs them. One transaction per client:
 //! [`GnitzClient::txn_begin`] opens the buffer every write path then routes
 //! into, [`GnitzClient::txn_commit`] ships it as one atomic frame, and
-//! [`GnitzClient::txn_rollback`] discards it. All state-machine errors are
-//! raised here; the SQL dispatch arms and the Python context manager only
-//! translate them.
+//! [`GnitzClient::txn_rollback`] discards it. Each refuses a call out of turn:
+//! a BEGIN inside a transaction, a COMMIT or ROLLBACK outside one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +19,7 @@ use crate::{Schema, ZSetBatch};
 
 /// The keys-only read of `schema`: a reply of its PK columns alone, and a rows sink
 /// whose zero-instruction map fills no payload slot.
-pub fn key_reply(schema: &Schema) -> (Arc<Schema>, ReadSink) {
+pub(crate) fn key_reply(schema: &Schema) -> (Arc<Schema>, ReadSink) {
     let reply = Schema::from_parts(
         schema.hidden_key_columns().collect(),
         leading_pk(schema.pk_cols().len()),
@@ -29,11 +28,6 @@ pub fn key_reply(schema: &Schema) -> (Arc<Schema>, ReadSink) {
     let map = LogicalProgram::copy_cols(&[]).to_map(Vec::new());
     (Arc::new(reply), ReadSink { map: Some(map), ..ReadSink::all_rows() })
 }
-
-/// Autocommit attempts [`GnitzClient::read_modify_write`] makes before surfacing
-/// the conflict for the caller's own retry. Each attempt re-reads; there is no
-/// backoff.
-pub const RMW_MAX_ATTEMPTS: usize = 4;
 
 impl GnitzClient {
     /// True while a transaction is open.
@@ -45,7 +39,7 @@ impl GnitzClient {
     /// carries the basis of the read it was built from, which COMMIT checks.
     pub fn txn_begin(&mut self) -> Result<(), ClientError> {
         if self.txn.is_some() {
-            return Err(ClientError::from("transaction already open".to_string()));
+            return Err(ClientError::from("transaction already open"));
         }
         self.txn = Some(TxnBuffer::default());
         Ok(())
@@ -87,7 +81,7 @@ impl GnitzClient {
         if buf.families.is_empty() {
             return Ok(0);
         }
-        self.ack(Request::PushTxn { families: &buf.families }).await
+        self.ack(Request::PushTxn(&buf.families)).await
     }
 
     /// Read `target`'s rows under `bound` and `predicate` — only their keys when
@@ -96,15 +90,15 @@ impl GnitzClient {
     /// read. Returns the written row count.
     ///
     /// Inside a transaction COMMIT checks the condition. In autocommit the statement
-    /// is a transaction of its own, and a conflict re-reads and rebuilds, up to
-    /// [`RMW_MAX_ATTEMPTS`] times.
+    /// is a transaction of its own, committed here; a conflict is refused
+    /// `TxnConflict` with nothing written, and is the caller's to run again.
     pub async fn read_modify_write<E: From<ClientError>>(
         &mut self,
         target: &RelDescriptor,
         bound: ReadBound,
         predicate: Vec<u8>,
         keys: bool,
-        mut build: impl FnMut(ZSetBatch) -> Result<ZSetBatch, E>,
+        build: impl FnOnce(ZSetBatch) -> Result<ZSetBatch, E>,
     ) -> Result<usize, E> {
         let (tid, schema) = (target.tid, &target.schema);
         let (reply, sink) = match keys {
@@ -112,51 +106,41 @@ impl GnitzClient {
             false => (Arc::clone(schema), ReadSink::all_rows()),
         };
         let spec = ReadSpec { bound, predicate, sink };
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let rest = match (self.txn.as_mut(), &spec.bound) {
-                (Some(txn), ReadBound::PkSet(set)) => txn.unwritten(tid, set),
-                _ => None,
-            };
-            let (batch, basis) = match rest {
-                // Every key is the transaction's own: nothing is read, so the write
-                // depends on no committed state.
-                Some(rest) if rest.is_empty() => (ZSetBatch::new(&reply), BLIND),
-                rest => {
-                    let narrowed = rest.map(|rest| ReadSpec {
-                        bound: ReadBound::PkSet(rest),
-                        predicate: spec.predicate.clone(),
-                        sink: spec.sink.clone(),
-                    });
-                    let ScanReply { batch, lsn, .. } = self
-                        .scan_spec(target, narrowed.as_ref().unwrap_or(&spec), &reply)
-                        .await?;
-                    (batch, lsn.expect("a server read carries its watermark"))
-                }
-            };
-            let mut own = TxnBuffer::default();
-            let txn = self.txn.as_mut().unwrap_or(&mut own);
-            let batch = build(txn.overlay(tid, schema, &spec, keys, batch)?)?;
-            let count = batch.len();
-            txn.push(target, schema, batch, WireConflictMode::Update, basis)?;
-            if self.txn.is_some() {
-                return Ok(count);
+        let rest = match (self.txn.as_mut(), &spec.bound) {
+            (Some(txn), ReadBound::PkSet(set)) => txn.unwritten(tid, set),
+            _ => None,
+        };
+        let (batch, basis) = match rest {
+            // Every key is the transaction's own: nothing is read, so the write
+            // depends on no committed state.
+            Some(rest) if rest.is_empty() => (ZSetBatch::new(&reply), BLIND),
+            rest => {
+                let narrowed = rest.map(|rest| ReadSpec {
+                    bound: ReadBound::PkSet(rest),
+                    predicate: spec.predicate.clone(),
+                    sink: spec.sink.clone(),
+                });
+                let ScanReply { batch, lsn, .. } = self
+                    .scan_spec(target, narrowed.as_ref().unwrap_or(&spec), &reply)
+                    .await?;
+                (batch, lsn.expect("a server read carries its watermark"))
             }
+        };
+        let mut own = TxnBuffer::default();
+        let txn = self.txn.as_mut().unwrap_or(&mut own);
+        let batch = build(txn.overlay(tid, schema, &spec, keys, batch)?)?;
+        let count = batch.len();
+        txn.push(target, schema, batch, WireConflictMode::Update, basis)?;
+        if self.txn.is_none() {
             // Autocommit: the statement is a transaction of its own.
-            match self.push_txn(&own).await {
-                Err(e) if e.status() == Some(WireStatus::TxnConflict) && attempt < RMW_MAX_ATTEMPTS => {}
-                r => {
-                    r?;
-                    return Ok(count);
-                }
-            }
+            self.push_txn(&own).await?;
         }
+        Ok(count)
     }
 }
 
 fn no_transaction() -> ClientError {
-    ClientError::from("no transaction open".to_string())
+    ClientError::from("no transaction open")
 }
 
 /// A batch handed to [`crate::GnitzClient::push`]: borrowed, or shared with

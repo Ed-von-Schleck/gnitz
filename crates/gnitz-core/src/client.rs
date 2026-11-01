@@ -3,7 +3,6 @@
 //! relation resolution.
 
 use std::collections::HashMap;
-use std::ops::ControlFlow;
 use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
@@ -48,11 +47,11 @@ pub struct GnitzClient {
     /// another's trains.
     pub(crate) next_sub: SubId,
     /// What a sync took for a reader's subscriptions and nobody received,
-    /// handed back by [`Self::unclaimed`]: the next sync reports it in front
-    /// of its own, and is not held.
+    /// taken up from [`Self::returned`]: the next sync reports it in front of
+    /// its own, and is not held.
     pub(crate) unclaimed: Vec<crate::Pushed>,
-    /// Deliveries a [`Self::sync_reply`] cell handed back, for
-    /// [`Self::unclaimed`] at the next sync.
+    /// Deliveries dropped untaken, taken up into
+    /// [`Self::unclaimed`] by the next sync or unsubscribe.
     pub(crate) returned: Arc<Mutex<Vec<crate::Synced>>>,
 }
 
@@ -139,7 +138,7 @@ impl GnitzClient {
     pub async fn reconnect(&mut self, target: &str) -> Result<(), ClientError> {
         if self.txn_active() {
             return Err(ClientError::from(
-                "reconnect inside a transaction; commit or roll back first".to_string(),
+                "reconnect inside a transaction; commit or roll back first",
             ));
         }
         let target = target.to_owned();
@@ -167,8 +166,9 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// Requests this connection has submitted. Exposed for the
-    /// round-trip-count assertions; see [`Session::requests_sent`].
+    /// Requests submitted on the current connection — one per request, however
+    /// its bytes were batched; HELLO is not counted. Exposed for round-trip-count
+    /// assertions.
     pub fn requests_sent(&self) -> u64 {
         self.session.requests_sent()
     }
@@ -194,8 +194,7 @@ impl GnitzClient {
 
     /// Wait for the socket and step once. `Closed` when nothing is outstanding.
     pub async fn turn(&mut self) -> Result<(), ClientError> {
-        let GnitzClient { session, host, .. } = self;
-        std::future::poll_fn(|cx| session.turn(&mut **host, cx)).await
+        std::future::poll_fn(|cx| self.session.turn(&mut *self.host, cx)).await
     }
 
     /// Step until the connection is under its in-flight caps, at which a
@@ -211,7 +210,7 @@ impl GnitzClient {
 
     /// Allocate `n` contiguous catalog object ids (schemas, relations or
     /// indexes) and return the first.
-    pub async fn alloc_ids(&mut self, n: u64) -> Result<u64, ClientError> {
+    pub(crate) async fn alloc_ids(&mut self, n: u64) -> Result<u64, ClientError> {
         self.ack(Request::AllocIds(n)).await
     }
 
@@ -325,10 +324,11 @@ impl GnitzClient {
     // ── Reads, by the freshness asked for ──────────────────────────────────
     //
     // `resolve` and `scan_spec` ask the server; `mirrored_desc` and
-    // `scan_spec_local_first` below consult the copy first, and `kept_desc`
-    // the last RESOLVE's answer. **The gate is what the copy holds, never
-    // whether a store is attached**, so a client with one reads exactly like
-    // a client without for every relation the copy does not hold.
+    // `scan_spec_local_first`, with the mirror's other verbs, consult the copy
+    // first, and `kept_desc` the last RESOLVE's answer. **The gate is what the
+    // copy holds, never whether a store is attached**, so a client with one
+    // reads exactly like a client without for every relation the copy does
+    // not hold.
 
     /// The descriptor for `name` as the server answers it now, or `None` when
     /// no such relation exists; `Err` is a missing schema or a decode error.
@@ -347,43 +347,11 @@ impl GnitzClient {
         self.resolve(name).await?.ok_or_else(|| not_found("relation", name))
     }
 
-    /// The descriptor of the mirrored view `name`, while its copy answers
-    /// reads. As stale as the copy.
-    pub fn mirrored_desc(&self, name: &RelName) -> Option<Arc<RelDescriptor>> {
-        self.mirror.as_deref()?.answering(name)
-    }
-
     /// What the last RESOLVE answered for `name`. Only a request
     /// carrying its token finds out whether it is stale; a planning error or an
     /// answer that needs no request is the caller's to repeat from
     /// [`Self::resolve`].
     pub fn kept_desc(&self, name: &RelName) -> Option<Arc<RelDescriptor>> {
         self.kept.get(name).cloned()
-    }
-
-    /// [`Self::scan_spec`], answered off the copy when it holds `target`, with
-    /// no served LSN: a copy's freshness is [`Self::cursor_of`].
-    pub fn scan_spec_local_first(
-        &mut self,
-        target: impl Into<Target>,
-        spec: ReadSpec,
-        reply_schema: &Arc<Schema>,
-    ) -> Pending<'_, ScanReply> {
-        let target = target.into();
-        let spec = match self.mirror.as_deref() {
-            Some(m) => match m.scan_local(target.tid, spec, reply_schema) {
-                ControlFlow::Break(scanned) => {
-                    let reply = scanned.map(|batch| ScanReply {
-                        batch,
-                        schema: Arc::clone(reply_schema),
-                        lsn: None,
-                    });
-                    return self.wait(Sent::ready(reply.map_err(ClientError::from)));
-                }
-                ControlFlow::Continue(spec) => spec,
-            },
-            None => spec,
-        };
-        self.scan_spec(target, &spec, reply_schema)
     }
 }

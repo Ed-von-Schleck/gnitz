@@ -8,8 +8,8 @@ use crate::test_support::{
     client_pair, delta_frame, delta_terminal, interrupt_self_until, kv_rows, kv_schema, pushed_train, rel, reply_ctrl,
     reply_status, sync_answer, sync_header, sync_held, Peer,
 };
+use crate::transport::{poll_fd, Interest};
 use crate::BlockingHost;
-use crate::{poll_fd, Interest};
 use gnitz_wire::{framed, peek_control_block, ControlHeader, RelDescriptorBlob, TypeCode};
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -81,31 +81,31 @@ struct StubStore {
 }
 
 impl MirrorStore for StubStore {
-    fn register(&mut self, _name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError> {
+    fn register(&mut self, _name: &RelName, desc: &RelDescriptor) -> Result<(), String> {
         self.log.push(Ev::Register(desc.tid));
         if let Some(old) = self.log.fail_register_retracting.lock().unwrap().take() {
             self.cursors.remove(&old);
-            return Err(MirrorError::Engine("stub: the copy could not be entered".into()));
+            return Err("stub: the copy could not be entered".into());
         }
         Ok(())
     }
 
-    fn forget(&mut self, tid: u64) -> Result<(), MirrorError> {
+    fn forget(&mut self, tid: u64) -> Result<(), String> {
         self.log.push(Ev::Forget(tid));
         self.cursors.remove(&tid);
         Ok(())
     }
 
-    fn refill(&mut self, _name: &RelName, desc: &RelDescriptor) -> Result<(), MirrorError> {
+    fn refill(&mut self, _name: &RelName, desc: &RelDescriptor) -> Result<(), String> {
         self.log.push(Ev::Refill(desc.tid));
         self.cursors.remove(&desc.tid);
         Ok(())
     }
 
-    fn fill(&mut self, tid: u64, blocks: &[&[u8]], sealed_at: Option<DeltaCursor>) -> Result<(), MirrorError> {
+    fn fill(&mut self, tid: u64, blocks: &[&[u8]], sealed_at: Option<DeltaCursor>) -> Result<(), String> {
         let failing = self.log.fail_fill_of.lock().unwrap().take_if(|failing| *failing == tid);
         if failing.is_some() {
-            return Err(MirrorError::Engine("stub: the block could not be applied".into()));
+            return Err("stub: the block could not be applied".into());
         }
         blocks.iter().for_each(|_| self.log.push(Ev::Fill(tid)));
         if let Some(cursor) = sealed_at {
@@ -115,11 +115,9 @@ impl MirrorStore for StubStore {
         Ok(())
     }
 
-    fn advance(&mut self, tid: u64, _b: &[&[u8]], next: DeltaCursor) -> Result<(), MirrorError> {
+    fn advance(&mut self, tid: u64, _b: &[&[u8]], next: DeltaCursor) -> Result<(), String> {
         if !self.cursors.contains_key(&tid) {
-            return Err(MirrorError::Engine(format!(
-                "stub: advance of {tid}, which holds no cursor"
-            )));
+            return Err(format!("stub: advance of {tid}, which holds no cursor"));
         }
         self.log.push(Ev::Advance(tid, next.tick.get()));
         self.cursors.insert(tid, next);
@@ -131,7 +129,7 @@ impl MirrorStore for StubStore {
         _tid: u64,
         _spec: gnitz_wire::ReadSpec,
         reply_schema: &Schema,
-    ) -> Result<ZSetBatch, MirrorError> {
+    ) -> Result<ZSetBatch, String> {
         Ok(ZSetBatch::new(reply_schema))
     }
 
@@ -139,7 +137,7 @@ impl MirrorStore for StubStore {
         self.cursors.get(&tid).copied()
     }
 
-    fn checkpoint(&mut self) -> Result<(), MirrorError> {
+    fn checkpoint(&mut self) -> Result<(), String> {
         Ok(())
     }
 }
@@ -757,13 +755,13 @@ fn an_interrupted_poll_reannounces_its_reseed() {
     let watched = log.clone();
     rehost(
         &mut client,
-        BlockingHost::with_hook(Box::new(move || {
+        BlockingHost::with_hook(move || {
             if watched.saw(|e| matches!(e, Ev::Seal(7, _))) {
                 Err("interrupted".into())
             } else {
                 Ok(())
             }
-        })),
+        }),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let sig = interrupt_self_until(Arc::clone(&stop));
@@ -1081,9 +1079,7 @@ fn a_sync_nobody_received_is_reported_by_the_next() {
     let synced = block_on(client.sync(Duration::ZERO)).expect("the sync");
     let peer = h.join().unwrap();
     // Its caller drops the reply unread.
-    let (mut to, sent) = client.sync_reply();
-    to.fulfil(Ok(synced));
-    drop(sent);
+    drop(client.delivery(synced));
 
     let h = std::thread::spawn(move || {
         let hdr = peer.expect_sync("the next sync");
@@ -1121,9 +1117,7 @@ fn an_unreceived_reseed_is_reported_by_the_next_sync() {
         "{:?}",
         synced.mirrored
     );
-    let (mut to, sent) = client.sync_reply();
-    drop(sent);
-    to.fulfil(Ok(synced));
+    drop(client.delivery(synced));
 
     let h = std::thread::spawn(move || {
         let hdr = peer.expect_sync("the next sync");
@@ -1152,7 +1146,7 @@ fn an_unreceived_end_is_reported_once() {
     let synced = block_on(client.sync(Duration::ZERO)).expect("the sync");
     let peer = h.join().unwrap();
     assert!(matches!(synced.pushed[..], [crate::Pushed { result: Err(_), .. }]));
-    client.unclaimed(synced);
+    drop(client.delivery(synced));
 
     let h = std::thread::spawn(move || {
         let held = peer.expect_sync_naming("the next sync");
@@ -1174,13 +1168,13 @@ fn an_interrupted_sync_keeps_a_readers_deltas() {
     let watched = Arc::clone(&reading);
     rehost(
         &mut client,
-        BlockingHost::with_hook(Box::new(move || {
+        BlockingHost::with_hook(move || {
             if watched.load(Ordering::Relaxed) {
                 Err("interrupted".into())
             } else {
                 Ok(())
             }
-        })),
+        }),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let sig = interrupt_self_until(Arc::clone(&stop));

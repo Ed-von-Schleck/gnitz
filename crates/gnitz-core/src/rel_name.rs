@@ -82,7 +82,7 @@ impl RelName {
     }
 
     /// `schema.name`, as the catalog and a RESOLVE spell it.
-    pub fn key(&self) -> &str {
+    pub(crate) fn key(&self) -> &str {
         &self.key
     }
 

@@ -559,7 +559,7 @@ impl gnitz_wire::SysRowSink for BatchAppender<'_> {
         self.add_row_natives(pk, weight);
     }
     fn put_u64(&mut self, v: u64) {
-        self.u64_val(v);
+        self.int_val(v);
     }
     fn put_string(&mut self, s: &str) {
         self.str_val(s);
@@ -628,24 +628,14 @@ impl<'a> BatchAppender<'a> {
 
     /// Append an integer to the next ≤8-byte integer column, at that column's
     /// own width and signedness; `v` must lie in the column type's range.
-    pub fn int_val(&mut self, v: i128) -> &mut Self {
+    pub fn int_val(&mut self, v: impl Into<i128>) -> &mut Self {
+        let v = v.into();
         let tc = self.batch.payload[self.col_index()].tc();
         let fi = gnitz_wire::FixedInt::from_type_code(tc)
             .unwrap_or_else(|| panic!("BatchAppender: {tc:?} is not an integer column"));
         let (lo, hi) = fi.range();
         assert!((lo..=hi).contains(&v), "BatchAppender: {v} is out of range for {tc:?}");
         self.fixed_val(&fi.pack(v).to_le_bytes()[..fi.width()])
-    }
-
-    /// Append a u64 value to the next column.
-    pub fn u64_val(&mut self, v: u64) -> &mut Self {
-        self.fixed_val(&v.to_le_bytes())
-    }
-
-    /// Append an i64 value to the next column. Same eight bytes as
-    /// [`Self::u64_val`].
-    pub fn i64_val(&mut self, v: i64) -> &mut Self {
-        self.fixed_val(&v.to_le_bytes())
     }
 
     /// Append an f64 value to the next column.
@@ -802,7 +792,7 @@ impl ZSetBatch {
 
     /// A batch of `schema` holding the rows of a canonical region list this process's own
     /// store produced. Its German cells are not checked, the store having checked them when
-    /// it ingested them; the layout and NOT NULL are checked as for a WAL block.
+    /// it ingested them; its region lengths and NOT NULL are checked.
     pub fn from_own_regions(schema: &Schema, regions: &[&[u8]]) -> Result<Self, ProtocolError> {
         let mut b = Self::new(schema);
         b.check_laid_out(regions, schema)?;
@@ -811,9 +801,7 @@ impl ZSetBatch {
     }
 
     /// `regions` lays out this batch's layout, each region as long as the weight region's row
-    /// count implies, and sets no null bit `schema` does not admit. The region lengths guard a
-    /// region list handed in whole; a decoded WAL block's regions are sliced at exactly those
-    /// lengths from a size-checked block, so on that path only NOT NULL can fail.
+    /// count implies, and sets no null bit `schema` does not admit.
     fn check_laid_out(&self, regions: &[&[u8]], schema: &Schema) -> Result<(), ProtocolError> {
         debug_assert!(self.layout_matches(schema).is_ok() && self.check_lengths().is_ok());
         let count = regions.get(REG_WEIGHT).map_or(0, |w| w.len() / FIXED_REGION_BYTES);
@@ -894,7 +882,9 @@ fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> 
         regions.push(&fixed[layout.region_start(r, rows)..][..rows * layout.region_stride(r)]);
     }
     regions.push(heap);
-    sink.check_laid_out(&regions, schema)?;
+    debug_assert!(sink.layout_matches(schema).is_ok() && sink.check_lengths().is_ok());
+    // The block's size was checked against its rows, so each region is as long as they are.
+    check_not_null(regions[REG_NULL_BMP], schema).map_err(ProtocolError::DecodeError)?;
     // The block crossed a trust boundary: each German cell must be canonical against the
     // block's own heap.
     let bad = sink

@@ -2,14 +2,14 @@
 //! subscribe, then sync, which answers with the view's deltas since and
 //! advances every mirrored view.
 
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::batch::decode_wal_blocks_into;
 use crate::client::GnitzClient;
 use crate::connection::{DeltaCursor, RawBlock, ScanReply, SubId, Target};
 use crate::error::ClientError;
-use crate::host::{promise_returning, Promise, Sent};
+use crate::host::Sent;
 use crate::mirror::PollOutcome;
 use crate::{Schema, ZSetBatch};
 use gnitz_wire::txn_frame::kept_as;
@@ -21,6 +21,33 @@ pub struct Pushed {
     /// The deltas pushed since the last sync and the cursor past them, or
     /// the end of the subscription.
     pub result: Result<(ScanReply, DeltaCursor), ClientError>,
+}
+
+/// A sync's [`Synced`], on its way to a caller who may be gone. Dropped
+/// untaken, it goes back to its client: the next sync reports it in front of
+/// what that one brings, and is not held. Each subscription's rows come before
+/// the next sync's, under that sync's cursor, and an end is reported once; a
+/// view reported [`PollResult::Reseeded`](crate::PollResult::Reseeded) is
+/// reported so again by the next sync that advances it. An
+/// [`GnitzClient::unsubscribe`] made after the hand-back drops what it holds
+/// for that id.
+pub struct Delivery {
+    synced: Option<Synced>,
+    back: Arc<Mutex<Vec<Synced>>>,
+}
+
+impl Delivery {
+    pub fn take(mut self) -> Synced {
+        self.synced.take().expect("a delivery is taken once")
+    }
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        if let Some(synced) = self.synced.take() {
+            self.back.lock().unwrap_or_else(PoisonError::into_inner).push(synced);
+        }
+    }
 }
 
 /// What one sync brought a client.
@@ -101,8 +128,8 @@ impl GnitzClient {
     /// request. A sync that failed is the end of every subscription.
     ///
     /// What it takes from the client is the caller's alone: a driver whose
-    /// caller is gone by the time it completes hands it to
-    /// [`Self::unclaimed`], or delivers it through a [`Self::sync_reply`] cell.
+    /// caller may be gone by the time it completes hands it over as a
+    /// [`Self::delivery`].
     pub async fn finish_sync(&mut self, synced: Result<(), ClientError>) -> Result<Synced, ClientError> {
         self.reclaim();
         let mirrored = self.advance_mirror(&synced).await?;
@@ -111,35 +138,26 @@ impl GnitzClient {
         Ok(Synced { pushed, mirrored })
     }
 
-    /// A cell for [`Self::finish_sync`]'s delivery whose [`Sent`], dropped
-    /// with the delivery unread, hands it back as [`Self::unclaimed`] does.
-    pub fn sync_reply(&self) -> (Promise<Synced>, Sent<Synced>) {
-        let returned = Arc::clone(&self.returned);
-        promise_returning(move |synced| returned.lock().unwrap_or_else(PoisonError::into_inner).push(synced))
-    }
-
-    /// Hand back a sync's delivery its caller never received: the next sync
-    /// reports it in front of what that one brings, and is not held. Each
-    /// subscription's rows come before the next sync's, under that sync's
-    /// cursor, and an end is reported once; a view reported
-    /// [`PollResult::Reseeded`](crate::PollResult::Reseeded) is reported so
-    /// again by the next sync that advances it.
-    pub fn unclaimed(&mut self, synced: Synced) {
-        let Synced { mut pushed, mirrored } = synced;
-        if let Some(m) = self.mirror.as_deref_mut() {
-            m.owe_reseeds(&mirrored);
+    /// `synced`, on its way to a caller who may be gone: see [`Delivery`].
+    pub fn delivery(&self, synced: Synced) -> Delivery {
+        Delivery {
+            synced: Some(synced),
+            back: Arc::clone(&self.returned),
         }
-        put_in_front(std::mem::take(&mut self.unclaimed), &mut pushed);
-        // Rows-free entries carry nothing the next sync's cursor does not.
-        pushed.retain(|p| p.result.as_ref().map_or(true, |(rows, _)| !rows.batch.is_empty()));
-        self.unclaimed = pushed;
     }
 
-    /// Take up what [`Self::sync_reply`] cells handed back.
+    /// Take up what dropped [`Delivery`]s handed back, in the order they were
+    /// dropped.
     fn reclaim(&mut self) {
         let returned = std::mem::take(&mut *self.returned.lock().unwrap_or_else(PoisonError::into_inner));
-        for synced in returned {
-            self.unclaimed(synced);
+        for Synced { mut pushed, mirrored } in returned {
+            if let Some(m) = self.mirror.as_deref_mut() {
+                m.owe_reseeds(&mirrored);
+            }
+            put_in_front(std::mem::take(&mut self.unclaimed), &mut pushed);
+            // Rows-free entries carry nothing the next sync's cursor does not.
+            pushed.retain(|p| p.result.as_ref().map_or(true, |(rows, _)| !rows.batch.is_empty()));
+            self.unclaimed = pushed;
         }
     }
 

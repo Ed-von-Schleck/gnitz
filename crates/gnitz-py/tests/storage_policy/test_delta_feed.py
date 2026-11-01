@@ -211,6 +211,33 @@ async def test_a_cancelled_held_sync_loses_nothing(client, aconn):
     assert (pushed.sub, pushed.error, bag(pushed.rows)) == (sub, None, {(i, 100, "w"): 1 for i in range(10)})
 
 
+async def test_a_sync_cancelled_after_its_answer_loses_nothing(client, aconn):
+    """A task cancelled once its sync's answer is in, before the task resumes,
+    never sees that answer: the next sync brings it, and is not held."""
+    fed_view(client)
+    vid, schema = client.resolve_table("f")
+    sub, _, _ = await aconn.subscribe(vid, schema)
+    insert(client, "t", [(i, 100, "w") for i in range(10)])
+
+    async def received():
+        return await aconn.sync(60)
+
+    task = asyncio.ensure_future(received())
+    await asyncio.sleep(0)
+    # The answer resolves the future the task awaits from a loop callback,
+    # which schedules the task's resumption behind this coroutine's.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 20
+    while not task._fut_waiter.done():
+        assert loop.time() < deadline, "the sync was never answered"
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    (pushed,) = (await asyncio.wait_for(aconn.sync(60), 20)).pushed
+    assert (pushed.sub, pushed.error, bag(pushed.rows)) == (sub, None, {(i, 100, "w"): 1 for i in range(10)})
+
+
 async def test_a_sync_waiting_for_a_tick_holds_up_no_request(own_server):
     """The writes behind a held sync are answered while it waits for a tick,
     which at the pace set here is ten minutes away; and a sync that finds a
