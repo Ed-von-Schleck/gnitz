@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 
 use crate::repr::{
     copy_runs, pk_group_end, prorated_blob_cap, relocated_cell, row_long_bytes, runs_where, should_relocate_blob,
-    stride_dispatch, with_scratch, Batch, CursorRow, ReadCursor, Run,
+    stride, stride_dispatch, with_scratch, Batch, CursorRow, ReadCursor, Run,
 };
 use crate::schema::{band, compare_pk_ordering, group_floor, key_above, DerivedSchema, SchemaDescriptor};
 
@@ -403,16 +403,18 @@ fn write_pairings(delta: &Batch, cursor: &ReadCursor, plan: &JoinPlan, pairs: &[
                     true => (pk_len - d_len..pk_len, 0..pk_len - d_len),
                     false => (0..d_len, d_len..pk_len),
                 };
-                let mut keys = pk.chunks_exact_mut(pk_len);
-                for p in pairs {
+                // One window of every key at a time: each pairing's delta PKs
+                // over its run, then its trace PK repeated over the same rows.
+                let d_pk = delta.pk();
+                let d_runs = pairs
+                    .iter()
+                    .map(|p| (&d_pk[p.rs as usize * d_len..p.re as usize * d_len], d_len, p.len()));
+                stride_dispatch!(d_len, put_key_windows, pk, pk_len, d_key.start, d_runs);
+                let t_runs = pairs.iter().map(|p| {
                     let (t_src, t_row) = trace_row(p);
-                    let t_pk = t_src.get_pk_bytes(t_row);
-                    for i in p.delta_rows() {
-                        let key = keys.next().expect("one key per output row");
-                        key[d_key.clone()].copy_from_slice(delta.get_pk_bytes(i));
-                        key[t_key.clone()].copy_from_slice(t_pk);
-                    }
-                }
+                    (t_src.get_pk_bytes(t_row), 0, p.len())
+                });
+                stride_dispatch!(pk_len - d_len, put_key_windows, pk, pk_len, t_key.start, t_runs);
             }
             // A keyed plan's output key is the delta's PK region verbatim.
             _ => stride_dispatch!(d_schema.pk_stride(), copy_runs, delta.pk(), pk, delta_runs(pairs)),
@@ -533,6 +535,26 @@ fn trace_long_bytes(cursor: &ReadCursor, plan: &JoinPlan, pairs: &[Pairing]) -> 
 #[inline(always)]
 fn delta_runs(pairs: &[Pairing]) -> impl Iterator<Item = (usize, usize)> + '_ {
     pairs.iter().map(|p| (p.rs as usize, p.re as usize))
+}
+
+/// For each `(cells, step, n)` of `runs`, `n` cells of `width` bytes read
+/// from `cells` `step` bytes apart (a step of 0 repeats one cell), each
+/// written at byte `off` of the next `key_len`-byte key of `keys`.
+#[inline(always)]
+fn put_key_windows<'a, const N: usize>(
+    keys: &mut [u8],
+    key_len: usize,
+    off: usize,
+    runs: impl Iterator<Item = (&'a [u8], usize, usize)>,
+    width: usize,
+) {
+    let w = stride::<N>(width);
+    let mut keys = keys.chunks_exact_mut(key_len);
+    for (cells, step, n) in runs {
+        for (j, key) in keys.by_ref().take(n).enumerate() {
+            key[off..off + w].copy_from_slice(&cells[j * step..j * step + w]);
+        }
+    }
 }
 
 /// Each pairing's trace cell, produced by `cell` from its walked row, written
