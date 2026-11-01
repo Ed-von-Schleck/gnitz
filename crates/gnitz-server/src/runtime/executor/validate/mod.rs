@@ -22,7 +22,7 @@ use crate::runtime::reactor::TrainLease;
 use crate::runtime::sal::Read;
 use gnitz_store::read::Probe;
 use gnitz_wire::{PkColList, WireFault};
-use gnitz_zset::algebra::spans;
+use gnitz_zset::algebra::{extend_spans, spans};
 use gnitz_zset::repr::MemBatch;
 
 use self::fk_presence::FkPresence;

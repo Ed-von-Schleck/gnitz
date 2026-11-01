@@ -33,7 +33,7 @@ mod route;
 mod sink;
 
 pub use exchange::ScatterPlan;
-pub use index_entry::{index_entries, spans, KeySpec};
+pub use index_entry::{extend_spans, index_entries, spans, KeySpec};
 pub use linear::{null_extend_output_schema, op_filter, op_union, union_nullability_merge};
 pub use map::MapPlan;
 pub use route::{ground_owner, Placement, Slot};

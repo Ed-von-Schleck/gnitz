@@ -91,11 +91,17 @@ fn indexed_runs(mb: &MemBatch<'_>, spec: &KeySpec, keep: impl Fn(i64) -> bool) -
 
 /// The `spec` span of each positive-weight row of `mb` that `spec` indexes, in row order.
 pub fn spans(mb: &MemBatch<'_>, spec: &KeySpec) -> Vec<u8> {
-    let runs = indexed_runs(mb, spec, |w| w > 0);
-    let key_size = spec.key_size();
-    let mut out = vec![0; range_rows(&runs) * key_size];
-    spec.packer.pack_rows(&mut out, key_size, mb, &runs);
+    let mut out = Vec::new();
+    extend_spans(&mut out, mb, spec);
     out
+}
+
+/// [`spans`] appended to `out`.
+pub fn extend_spans(out: &mut Vec<u8>, mb: &MemBatch<'_>, spec: &KeySpec) {
+    let runs = indexed_runs(mb, spec, |w| w > 0);
+    let (key_size, at) = (spec.key_size(), out.len());
+    out.resize(at + range_rows(&runs) * key_size, 0);
+    spec.packer.pack_rows(&mut out[at..], key_size, mb, &runs);
 }
 
 /// Each nonzero-weight row of `source` that `spec` indexes, as its index entry

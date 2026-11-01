@@ -249,6 +249,11 @@ struct TxnTable<'a> {
     /// The keys whose first op is an Error family's insert, in row order: a
     /// client's ascending keys reach the probe's sort ascending.
     probe_keys: Vec<&'a [u8]>,
+    /// The table's families, in bundle order.
+    fams: SmallVec<[u32; 1]>,
+    /// Whether some PK is touched by two nonzero-weight rows. Where none is, the
+    /// surviving rows are exactly the positive-weight ones.
+    repeats: bool,
 }
 
 /// A decoded transaction bundle plus everything its rules share. Built once;
@@ -282,6 +287,8 @@ impl<'a> TxnBundle<'a> {
                 cons: cat.row_constraints(fam.tid),
                 fold: Fold::default(),
                 probe_keys: Vec::new(),
+                fams: SmallVec::new(),
+                repeats: false,
             });
         }
         let mems: SmallVec<[MemBatch<'a>; 1]> = families.iter().map(|f| f.rows.view()).collect();
@@ -290,6 +297,7 @@ impl<'a> TxnBundle<'a> {
             for (fi, fam) in families.iter().enumerate().filter(|(_, f)| f.tid == tid) {
                 let error = matches!(fam.mode, WireConflictMode::Error);
                 let batch = mems[fi];
+                t.fams.push(fi as u32);
                 t.fold.reserve(batch.len());
                 if error {
                     t.probe_keys.reserve(batch.len());
@@ -309,6 +317,7 @@ impl<'a> TxnBundle<'a> {
                     let inserts = error && w > 0;
                     match t.fold.entry(pk) {
                         Entry::Occupied(o) => {
+                            t.repeats = true;
                             let e = o.into_mut();
                             if inserts {
                                 match e.last {
@@ -500,38 +509,11 @@ impl Checks {
 
         execute_probe_burst(disp, &mut checks, |check, rows| {
             let Check { tid, probe, reply, plan, .. } = check;
-            let mut answered = (0..rows.len())
-                .filter(|&j| rows.get_weight(j) == 1)
-                .map(|j| (j, rows.get_pk_bytes(j)));
-            // An Error family's first insert of a committed key, refused; any
-            // other committed key, marked.
-            let found = |t: &mut TxnTable<'_>, pk: &[u8]| -> Result<bool, WireFault> {
-                let Some(e) = t.fold.get_mut(pk) else {
-                    return Ok(false);
-                };
-                if e.needs_probe {
-                    return Err(pk_violation_err(&disp.cat(), t.tid, &t.schema, pk, Clash::Committed));
-                }
-                e.committed = true;
-                Ok(true)
-            };
+            let mut answered = answered(rows);
             match plan {
-                Rule::Pk => {
-                    let t = b.get_mut(*tid).expect("a bundled table");
-                    for (_, pk) in answered {
-                        found(t, pk)?;
-                    }
-                }
+                Rule::Pk => fold_pk_reply(disp, b.get_mut(*tid).expect("a bundled table"), rows, reply, None)?,
                 Rule::Gather { old, .. } => {
-                    let loc = reply.locate(reply.payload_col_idx(0));
-                    let t = b.get_mut(*tid).expect("a bundled table");
-                    for (j, pk) in answered {
-                        if found(t, pk)? && !loc.is_null(rows, j) {
-                            // Keyed by the fold's own key, which outlives the reply.
-                            let (&key, _) = t.fold.get_key_value(pk).expect("found above");
-                            old.insert(key, loc.opk_image(rows, j));
-                        }
-                    }
+                    fold_pk_reply(disp, b.get_mut(*tid).expect("a bundled table"), rows, reply, Some(old))?
                 }
                 // The in-bundle duplicate check left each span one claimant, so
                 // a holder that is a fold key is that claimant or gave the span up.
@@ -578,6 +560,44 @@ impl Checks {
     }
 }
 
+/// The `(row, key)` of each row of a burst-1 reply that answers a probed key.
+fn answered<'r>(rows: &'r MemBatch<'_>) -> impl Iterator<Item = (usize, &'r [u8])> + 'r {
+    (0..rows.len())
+        .filter(|&j| rows.get_weight(j) == 1)
+        .map(|j| (j, rows.get_pk_bytes(j)))
+}
+
+/// Rule U-PK, reply half, over one reply frame `rows` of `t`'s PK probe: an
+/// Error family's first insert of a committed key, refused; any other
+/// committed key of the fold, marked. With `old`, the probe read a referenced
+/// payload column, whose non-NULL before-image of each such key it records.
+fn fold_pk_reply<'a>(
+    disp: &MasterDispatcher,
+    t: &mut TxnTable<'a>,
+    rows: &MemBatch<'_>,
+    reply: &SchemaDescriptor,
+    old: Option<&mut FxHashMap<&'a [u8], u128>>,
+) -> Result<(), WireFault> {
+    let mut old = old.map(|old| (old, reply.locate(reply.payload_col_idx(0))));
+    for (j, pk) in answered(rows) {
+        let Some(e) = t.fold.get_mut(pk) else {
+            continue;
+        };
+        if e.needs_probe {
+            return Err(pk_violation_err(&disp.cat(), t.tid, &t.schema, pk, Clash::Committed));
+        }
+        e.committed = true;
+        if let Some((old, loc)) = &mut old {
+            if !loc.is_null(rows, j) {
+                // Keyed by the fold's own key, which outlives the reply.
+                let (&key, _) = t.fold.get_key_value(pk).expect("found above");
+                old.insert(key, loc.opk_image(rows, j));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Rule U-PK, planning half, and the before-images of referenced payload
 /// columns, whose replies answer U-PK as well.
 fn plan_pk_checks<'a>(
@@ -599,7 +619,9 @@ fn plan_pk_checks<'a>(
                 continue;
             }
             for col in payload_refs {
-                let plan = Rule::Gather { col, old: FxHashMap::default() };
+                // At most one before-image per key of the fold.
+                let old = FxHashMap::with_capacity_and_hasher(keys.len(), Default::default());
+                let plan = Rule::Gather { col, old };
                 checks.push(Check::new(rel, Probe::PkColumn(col as u32), keys.clone(), plan)?);
             }
             continue;
@@ -620,6 +642,11 @@ fn plan_pk_checks<'a>(
     Ok(())
 }
 
+/// Rows from which [`plan_unique_checks`] packs the spans of a table whose every
+/// PK one row touches a column at a time; fewer are packed one row at a time,
+/// since the column pass's setup costs more than a couple of rows' own spans.
+const COLUMNAR_SPANS_MIN_ROWS: usize = 3;
+
 /// Rule U-SEC, planning half: every (table, unique index)'s surviving spans,
 /// with one committed-holder probe appended to `checks` for those its filter
 /// cannot prove absent. Two surviving rows claiming one span fill an empty
@@ -636,15 +663,25 @@ fn plan_unique_checks<'a>(
         for &(col_indices, ref spec) in &t.cons.uniques {
             let key_size = spec.key_size();
 
-            let mut spans: Vec<u8> = Vec::with_capacity(t.fold.len() * key_size);
-            for (_pk, fam, row) in b.surviving(tid) {
-                // NULL in an indexed column ⇒ unindexed.
-                if let Some(span) = spec.span(b.mem(fam), row as usize) {
-                    spans.extend_from_slice(span.pk_bytes());
+            // NULL in an indexed column ⇒ unindexed. Where every PK is touched
+            // once, the surviving rows are the families' positive-weight rows.
+            let spans: Vec<u8> = if !t.repeats && t.fold.len() >= COLUMNAR_SPANS_MIN_ROWS {
+                let mut all = Vec::with_capacity(t.fold.len() * key_size);
+                for &f in &t.fams {
+                    extend_spans(&mut all, b.mem(f), spec);
                 }
-            }
+                all
+            } else {
+                let mut spans = Vec::with_capacity(t.fold.len() * key_size);
+                for (_pk, fam, row) in b.surviving(tid) {
+                    if let Some(span) = spec.span(b.mem(fam), row as usize) {
+                        spans.extend_from_slice(span.pk_bytes());
+                    }
+                }
+                spans
+            };
             let keys = PkKeys::from_keys(key_size, spans.chunks_exact(key_size));
-            // `surviving` yields each PK once, so a span the dedup collapsed is
+            // Each surviving PK gave one span, so a span the dedup collapsed is
             // two rows of the bundle claiming it.
             if keys.len() * key_size != spans.len() {
                 violation.get_or_insert_with(|| {
