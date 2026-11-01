@@ -43,31 +43,27 @@ pub(super) async fn backup(shared: &Shared, name: &[u8]) -> Result<(), WireFault
         }
         Err(e) => return Err(format!("create backup '{partial}': {e}").into()),
     }
-    let result = shared
-        .committer
-        .backup(partial.clone())
-        .await
-        .and_then(|()| publish(&partial, &dest, root));
+    let mut copy_at = partial.as_str();
+    let result = shared.committer.backup(partial.clone()).await.and_then(|()| {
+        let synced = |dir: &str| posix_io::fsync_dir(dir).map_err(|e| format!("fsync '{dir}': {e}"));
+        // The copy's own entries, durable before the name makes it a backup.
+        synced(&partial)?;
+        posix_io::rename_noreplace(&partial, &dest).map_err(|e| format!("name backup '{dest}': {e}"))?;
+        copy_at = &dest;
+        synced(root).map_err(WireFault::from)
+    });
     drop(catalog);
-    if result.is_err() {
-        // Only this request made the directory, and it is no backup.
-        if let Err(e) = fs::remove_dir_all(&partial) {
-            gnitz_warn!("backup: failed to remove the incomplete '{}': {}", partial, e);
+    match &result {
+        Ok(()) => gnitz_info!("backup '{}' complete", dest),
+        // Only this request made the copy, and it is no backup: a name that
+        // could not be made durable is taken back with it.
+        Err(_) => {
+            if let Err(e) = fs::remove_dir_all(copy_at) {
+                gnitz_warn!("backup: failed to remove the incomplete '{}': {}", copy_at, e);
+            }
         }
     }
     result
-}
-
-/// Give the complete copy at `partial` the entry `dest` of the backup directory
-/// `root`, durably.
-fn publish(partial: &str, dest: &str, root: &str) -> Result<(), WireFault> {
-    let synced = |dir: &str| posix_io::fsync_dir(dir).map_err(|e| format!("fsync '{dir}': {e}"));
-    // The copy's own entries, durable before the name makes it a backup.
-    synced(partial)?;
-    posix_io::rename_noreplace(partial, dest).map_err(|e| format!("name backup '{dest}': {e}"))?;
-    synced(root)?;
-    gnitz_info!("backup '{}' complete", dest);
-    Ok(())
 }
 
 /// `name` as an entry of the backup directory: one path component of the
