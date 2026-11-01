@@ -303,6 +303,13 @@ impl MorselOut<'_> {
         }
     }
 
+    /// Whether register `reg` is NULL in row `i` of this morsel.
+    #[inline(always)]
+    pub(crate) fn is_null(&self, reg: usize, i: usize) -> bool {
+        debug_assert!(i < self.m, "is_null row {i} is outside the morsel's {} rows", self.m);
+        gnitz_wire::null_word_get(self.scratch.regs[reg].nulls[i / 64], i % 64)
+    }
+
     /// String register `reg`'s bytes for row `i` of this morsel.
     #[inline(always)]
     pub(crate) fn str_bytes(&self, reg: usize, i: usize) -> &[u8] {

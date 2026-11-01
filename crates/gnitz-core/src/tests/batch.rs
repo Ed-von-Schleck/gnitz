@@ -1,8 +1,9 @@
 use super::*;
 use crate::test_support::{decode_wal_block, encode_wal_block, kv_schema};
 use crate::BatchAppender;
-use gnitz_expr::{BatchView, CmpOp, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarEval, Sink};
+use gnitz_expr::{BatchView, CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Reg, ScalarCell, ScalarEval, Sink};
 use gnitz_wire::{payload_str, payload_u64, ColumnDef};
+use std::convert::Infallible;
 
 /// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
 /// a NULL cell, which the region zero-fills.
@@ -551,10 +552,16 @@ fn a_whole_gather_moves_the_arena() {
 
 /// Every row's integer result of a scalar program.
 fn row_values(ev: &mut ScalarEval, mb: &dyn BatchView) -> Vec<Option<i128>> {
-    match ev.eval_all(mb) {
-        ExprResults::Int(vals) => vals,
-        ExprResults::Str { .. } => panic!("row_values over a string-valued program"),
-    }
+    let mut vals = Vec::new();
+    ev.for_each(mb, |_, cell| {
+        let ScalarCell::Int(v) = cell else {
+            panic!("row_values over a string-valued program")
+        };
+        vals.push(v);
+        Ok::<_, Infallible>(())
+    })
+    .unwrap();
+    vals
 }
 
 // ── Fixture A: a compound PK (ci3, ci0) listed out of column order ───────

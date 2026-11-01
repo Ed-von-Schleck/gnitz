@@ -10,7 +10,7 @@ use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::{BoundExpr, RegClass};
 use crate::rules::require_column;
 use gnitz_core::{Schema, ZSetBatch};
-use gnitz_expr::{ExprResults, ScalarEval};
+use gnitz_expr::{ScalarCell, ScalarEval};
 use gnitz_wire::{encode_german_string, null_word_get, null_word_set, relocate_german_string};
 use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
 use sqlparser::ast::{Assignment, AssignmentTarget, Expr};
@@ -242,35 +242,31 @@ pub(super) fn apply_set(
             }
             SetRhs::Expr { scope, ev } => {
                 let ZSetBatch { payload, blob, .. } = &mut new;
-                match ev.eval_all(scoped(*scope)) {
-                    ExprResults::Int(vals) => {
-                        let fi = FixedInt::from_type_code(tc)
-                            .expect("classify_set_rhs admits a scalar only into a FixedInt column");
-                        let (min, max) = fi.range();
-                        for (w, v) in nulls.iter_mut().zip(vals) {
-                            set_null(w, pi, v.is_none(), def)?;
+                // `classify_set_rhs` admits a scalar only into a FixedInt column.
+                let fi = FixedInt::from_type_code(tc);
+                ev.for_each(scoped(*scope), |r, cell| {
+                    let bytes = &mut payload[pi].bytes;
+                    match cell {
+                        ScalarCell::Str(s) => {
+                            set_null(&mut nulls[r], pi, s.is_none(), def)?;
+                            bytes.extend_from_slice(&encode_german_string(s.unwrap_or(&[]), blob));
+                        }
+                        ScalarCell::Int(v) => {
+                            set_null(&mut nulls[r], pi, v.is_none(), def)?;
+                            let fi = fi.expect("a scalar is set only into a FixedInt column");
                             let v = v.unwrap_or(0);
+                            let (min, max) = fi.range();
                             if !(min..=max).contains(&v) {
                                 return Err(GnitzSqlError::Rejected(format!(
                                     "column '{}': {} value out of range: {v}",
                                     def.name, def.ty
                                 )));
                             }
-                            payload[pi]
-                                .bytes
-                                .extend_from_slice(&fi.pack(v).to_le_bytes()[..fi.width()]);
+                            bytes.extend_from_slice(&fi.pack(v).to_le_bytes()[..fi.width()]);
                         }
                     }
-                    ExprResults::Str { bytes, spans } => {
-                        for (w, span) in nulls.iter_mut().zip(spans) {
-                            set_null(w, pi, span.is_none(), def)?;
-                            let content = span.map_or(&[][..], |(o, l)| &bytes[o..o + l]);
-                            payload[pi]
-                                .bytes
-                                .extend_from_slice(&encode_german_string(content, blob));
-                        }
-                    }
-                }
+                    Ok(())
+                })?;
             }
         }
     }

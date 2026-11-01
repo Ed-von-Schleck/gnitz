@@ -6,7 +6,7 @@
 
 use gnitz_wire::KeyRange;
 
-use crate::batch::Evaluator;
+use crate::batch::{Evaluator, MorselOut};
 use crate::program::ReadAs;
 use crate::range::RangeMembership;
 #[cfg(test)]
@@ -15,18 +15,13 @@ use crate::simd::Level;
 use crate::ResolvedProgram;
 use crate::{BatchView, ExprValidateErr, LogicalProgram, SchemaDescriptor, Sink};
 
-/// One program's result for every row of a batch, in the shape its result
-/// register's class fixes.
-pub enum ExprResults {
-    /// Every row's integer value, `None` for SQL NULL. A float result is its
-    /// `f64` bit pattern.
-    Int(Vec<Option<i128>>),
-    /// Every row's bytes concatenated, addressed by `(offset, length)`; `None`
-    /// for SQL NULL, which contributes no bytes.
-    Str {
-        bytes: Vec<u8>,
-        spans: Vec<Option<(usize, usize)>>,
-    },
+/// One row's result of a [`ScalarEval`], in the shape its result register's
+/// class fixes; `None` for SQL NULL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScalarCell<'a> {
+    /// An integer; a float result is its `f64` bit pattern.
+    Int(Option<i128>),
+    Str(Option<&'a [u8]>),
 }
 
 /// The only way to obtain an evaluator: each constructor resolves the program
@@ -168,38 +163,49 @@ pub struct ScalarEval {
 }
 
 impl ScalarEval {
-    pub fn eval_all(&mut self, mb: &dyn BatchView) -> ExprResults {
+    /// `f(row, value)` for every row of `mb` in order. Returns the first `Err`
+    /// of `f`, after which `f` is not called again.
+    pub fn for_each<E>(
+        &mut self,
+        mb: &dyn BatchView,
+        mut f: impl FnMut(usize, ScalarCell<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let r = self.result_reg;
         let unsigned = match self.class {
-            ResultClass::Str => return self.eval_all_str(mb),
+            ResultClass::Str => {
+                return self.try_rows(mb, |out, i, row| {
+                    f(row, ScalarCell::Str((!out.is_null(r, i)).then(|| out.str_bytes(r, i))))
+                })
+            }
             ResultClass::Signed => false,
             ResultClass::Unsigned => true,
         };
-        let r = self.result_reg;
-        let mut vals = Vec::with_capacity(mb.row_count());
-        self.ev.eval_morsels(mb, 0, mb.row_count(), |_, out| {
-            let first = vals.len();
-            vals.extend(out.reg_values(r).iter().map(|&x| match unsigned {
-                true => Some(i128::from(x as u64)),
-                false => Some(i128::from(x)),
-            }));
-            out.for_each_null_row(r, |i| vals[first + i] = None);
-        });
-        ExprResults::Int(vals)
+        self.try_rows(mb, |out, i, row| {
+            let v = (!out.is_null(r, i)).then(|| {
+                let x = out.reg_values(r)[i];
+                match unsigned {
+                    true => i128::from(x as u64),
+                    false => i128::from(x),
+                }
+            });
+            f(row, ScalarCell::Int(v))
+        })
     }
 
-    fn eval_all_str(&mut self, mb: &dyn BatchView) -> ExprResults {
-        let r = self.result_reg;
-        let (mut bytes, mut spans) = (Vec::new(), Vec::with_capacity(mb.row_count()));
-        self.ev.eval_morsels(mb, 0, mb.row_count(), |_, out| {
-            let first = spans.len();
-            for i in 0..out.rows() {
-                let b = out.str_bytes(r, i);
-                spans.push(Some((bytes.len(), b.len())));
-                bytes.extend_from_slice(b);
+    /// `f(morsel, i, row)` for row `i` of each morsel, `row` its index in `mb`, up
+    /// to the first `Err`.
+    fn try_rows<E>(
+        &mut self,
+        mb: &dyn BatchView,
+        mut f: impl FnMut(&MorselOut<'_>, usize, usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut res = Ok(());
+        self.ev.eval_morsels(mb, 0, mb.row_count(), |rel_start, out| {
+            if res.is_ok() {
+                res = (0..out.rows()).try_for_each(|i| f(out, i, rel_start + i));
             }
-            out.for_each_null_row(r, |i| spans[first + i] = None);
         });
-        ExprResults::Str { bytes, spans }
+        res
     }
 }
 

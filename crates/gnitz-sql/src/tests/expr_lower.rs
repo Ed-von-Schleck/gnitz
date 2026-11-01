@@ -3,9 +3,10 @@ use crate::test_support::Cell::{self, Int, Null, Str, F64};
 use crate::test_support::{
     assert_rejects, batch_of, bind_sql, holds, holds_exact, two_col, typed_schema, CMP, EXACT_CASES,
 };
-use gnitz_expr::{ConstIdx, ExprResults, FloatArithOp, IntUnaryOp, RowFilter};
+use gnitz_expr::{ConstIdx, FloatArithOp, IntUnaryOp, RowFilter, ScalarCell};
 use gnitz_wire::as_le_bytes;
 use gnitz_wire::TypeCode as T;
+use std::convert::Infallible;
 
 // Every expression here is SQL bound over `typed_schema`: `(pk, c1, c2, …)`, the
 // payload columns nullable and of the types the test lists.
@@ -38,29 +39,29 @@ fn assert_eval<Ty: Into<ColType> + Copy>(sql: &str, tys: &[Ty], rows: &[&[Cell]]
     let bound = bind_sql(sql, &s);
     let ty = bound.infer_ty(s.columns()).tc;
     let mut ev = compile_scalar_evaluator(&bound, &s).unwrap_or_else(|e| panic!("{sql}: {e}"));
-    let out = ev.eval_all(&batch_of(&s, rows));
-    let got: Vec<Cell> = match &out {
-        ExprResults::Int(vals) => {
-            assert_ne!(ty, T::String, "{sql}: typed a string, computed a scalar");
-            vals.iter()
-                .map(|v| match *v {
+    let b = batch_of(&s, rows);
+    // A program's results are all of one class; a string's text is owned
+    // here, since a `Cell` borrows it.
+    let (mut got, mut texts) = (Vec::new(), Vec::new());
+    ev.for_each(&b, |_, cell| {
+        match cell {
+            ScalarCell::Int(v) => {
+                assert_ne!(ty, T::String, "{sql}: typed a string, computed a scalar");
+                got.push(match v {
                     None => Null,
                     Some(v) if ty.is_float() => F64(f64::from_bits(v as u64)),
                     Some(v) => Int(v),
-                })
-                .collect()
+                });
+            }
+            ScalarCell::Str(v) => {
+                assert_eq!(ty, T::String, "{sql}: computed a string, typed {ty}");
+                texts.push(v.map(|v| String::from_utf8(v.to_vec()).unwrap()));
+            }
         }
-        ExprResults::Str { bytes, spans } => {
-            assert_eq!(ty, T::String, "{sql}: computed a string, typed {ty}");
-            spans
-                .iter()
-                .map(|span| match *span {
-                    None => Null,
-                    Some((at, len)) => Str(std::str::from_utf8(&bytes[at..at + len]).unwrap()),
-                })
-                .collect()
-        }
-    };
+        Ok::<_, Infallible>(())
+    })
+    .unwrap();
+    got.extend(texts.iter().map(|v| v.as_deref().map_or(Null, Str)));
     assert_eq!(got, want, "{sql} over {rows:?}");
 }
 

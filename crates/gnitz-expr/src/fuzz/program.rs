@@ -9,6 +9,7 @@ use crate::batch::MORSEL;
 use crate::test_support::{filter_verdicts, TestView};
 use crate::{SchemaColumn, SchemaDescriptor};
 use gnitz_wire::{FixedInt, TypeCode};
+use std::convert::Infallible;
 
 #[test]
 fn program_fuzz() {
@@ -22,7 +23,7 @@ fn program_fuzz() {
             filter_verdicts(&mut filter, &rows);
         }
         if let Ok(mut scalar) = program.resolve_scalar(&schema) {
-            scalar.eval_all(&rows);
+            let _ = scalar.for_each(&rows, |_, _| Ok::<_, Infallible>(()));
         }
         if let Ok(mut map) = program.resolve_map(&schema, &schema) {
             let mut out = TestView::for_schema(&schema, ROWS);

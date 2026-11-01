@@ -2,6 +2,7 @@
 //! physical batch. The real one lives in a crate that depends on this one, and a
 //! stand-in holds the kernels to the [`BatchView`] contract alone.
 
+use std::convert::Infallible;
 use std::fmt::Debug;
 
 use gnitz_foundation::perf::Counter;
@@ -12,7 +13,7 @@ use crate::eval::Resolved;
 use crate::simd::encode_f64;
 use crate::simd::Level;
 use crate::{
-    BatchView, ColumnLocator, ConstIdx, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg, RowFilter,
+    BatchView, ColumnLocator, ConstIdx, LogicalInstr, LogicalProgram, MapEval, MapTarget, Reg, RowFilter, ScalarCell,
     ScalarEval, SchemaColumn, SchemaDescriptor, Sink,
 };
 use gnitz_wire::{Heap, RowSource};
@@ -393,20 +394,33 @@ fn checked<E: Resolved, T: PartialEq + Debug>(
     want
 }
 
+/// `take` of every row's result of a scalar program — see [`checked`].
+fn row_cells<T: PartialEq + Debug>(ev: &mut ScalarEval, mb: &TestView, take: impl Fn(ScalarCell<'_>) -> T) -> Vec<T> {
+    checked(ev, mb, |ev, mb| {
+        let mut out = Vec::new();
+        ev.for_each(mb, |_, cell| {
+            out.push(take(cell));
+            Ok::<_, Infallible>(())
+        })
+        .unwrap();
+        out
+    })
+}
+
 /// Every row's integer result of a scalar program — see [`checked`].
 pub fn row_values(ev: &mut ScalarEval, mb: &TestView) -> Vec<Option<i128>> {
-    checked(ev, mb, |ev, mb| match ev.eval_all(mb) {
-        ExprResults::Int(vals) => vals,
-        ExprResults::Str { .. } => panic!("row_values over a string-valued program; use row_strs"),
+    row_cells(ev, mb, |cell| match cell {
+        ScalarCell::Int(v) => v,
+        ScalarCell::Str(_) => panic!("row_values over a string-valued program; use row_strs"),
     })
 }
 
 /// Every row's string result of a scalar program, `None` for NULL — see
 /// [`checked`].
 pub fn row_strs(ev: &mut ScalarEval, mb: &TestView) -> Vec<Option<Vec<u8>>> {
-    checked(ev, mb, |ev, mb| match ev.eval_all(mb) {
-        ExprResults::Str { bytes, spans } => spans.iter().map(|s| s.map(|(o, l)| bytes[o..o + l].to_vec())).collect(),
-        ExprResults::Int(_) => panic!("row_strs over a scalar program; use row_values"),
+    row_cells(ev, mb, |cell| match cell {
+        ScalarCell::Str(s) => s.map(<[u8]>::to_vec),
+        ScalarCell::Int(_) => panic!("row_strs over a scalar program; use row_values"),
     })
 }
 
