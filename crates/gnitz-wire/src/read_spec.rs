@@ -284,39 +284,48 @@ pub struct PkSetPeek<'a> {
 }
 
 impl PkSetPeek<'_> {
-    /// The blob once per worker: worker `w`'s copy carries the `counts[w]` keys
-    /// `owner` maps to it — a subsequence of [`Self::keys`], so still strictly
-    /// ascending — and every other byte verbatim, so it decodes to the same spec
-    /// over those keys. A worker whose count is 0 gets an empty `Vec`. `counts`
-    /// must be the number of keys `owner` maps to each worker.
-    pub fn split(&self, counts: &[u32], owner: impl Fn(&[u8]) -> usize) -> Vec<Vec<u8>> {
+    /// The blob once per worker of `nw`: `owners` names the worker of each key
+    /// of [`Self::keys`] in turn, and worker `w`'s copy carries the keys it
+    /// names `w` — a subsequence, so still strictly ascending — and every other
+    /// byte verbatim, so it decodes to the same spec over those keys. A worker
+    /// owning no key gets an empty `Vec`.
+    pub fn split(&self, owners: &[u8], nw: usize) -> Vec<Vec<u8>> {
+        assert_eq!(owners.len() * self.stride, self.keys.len(), "one owner per key");
+        let mut counts = [0usize; crate::MAX_WORKERS];
+        for &o in owners {
+            counts[o as usize] += 1;
+        }
         let (head, tail) = (&self.blob[..self.span.start], &self.blob[self.span.end..]);
         // Every byte but the keys: head, stride, count and tail.
         let fixed = self.blob.len() - self.keys.len();
-        let mut out: Vec<Vec<u8>> = counts
+        let mut out: Vec<Vec<u8>> = counts[..nw]
             .iter()
             .map(|&n| {
                 if n == 0 {
                     return Vec::new();
                 }
-                let mut w = Writer::with_capacity(fixed + n as usize * self.stride);
+                let mut w = Writer::with_capacity(fixed + n * self.stride);
                 w.raw(head);
-                write_pk_set_head(&mut w, self.stride, n as usize);
+                write_pk_set_head(&mut w, self.stride, n);
                 w.into_vec()
             })
             .collect();
-        for k in self.keys.chunks_exact(self.stride) {
-            out[owner(k)].extend_from_slice(k);
+        /// Each key, `N` bytes wide or `stride` where `N = 0`, onto its owner's spec.
+        fn scatter<const N: usize>(keys: &[u8], stride: usize, owners: &[u8], out: &mut [Vec<u8>]) {
+            let w = if N == 0 { stride } else { N };
+            for (k, &o) in keys.chunks_exact(w).zip(owners) {
+                out[o as usize].extend_from_slice(&k[..w]);
+            }
         }
+        let scatter = match self.stride {
+            8 => scatter::<8>,
+            16 => scatter::<16>,
+            _ => scatter::<0>,
+        };
+        scatter(self.keys, self.stride, owners, &mut out);
         for v in out.iter_mut().filter(|v| !v.is_empty()) {
             v.extend_from_slice(tail);
         }
-        // `Vec::with_capacity` is exact, so a count off from what `owner` maps
-        // leaves a blob short of or past its capacity.
-        debug_assert!(
-            out.iter().all(|v| v.len() == v.capacity()),
-            "each blob sized by its count"
-        );
         out
     }
 }

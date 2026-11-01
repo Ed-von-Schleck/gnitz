@@ -2,6 +2,7 @@
 
 use gnitz_wire::{widen_pk_be, KeyRange, NARROW_PK_MAX_BYTES};
 
+use crate::repr::{stride, stride_dispatch};
 use crate::schema::{key_above, range_band, SchemaDescriptor};
 
 /// Map a 64-bit hash onto `0..num_workers` by multiply-shift.
@@ -113,6 +114,22 @@ impl Placement {
             Placement::Keyed { dist_stride } => Some(worker_for_pk_bytes(&pk[..dist_stride as usize], num_workers)),
             _ => None,
         }
+    }
+
+    /// [`Self::owner`] of each `key_len`-byte key of `keys`, in order, as a `u8`;
+    /// `None` unless the placement is key-routed.
+    pub fn owners(self, keys: &[u8], key_len: usize, num_workers: usize) -> Option<Vec<u8>> {
+        #[inline(always)]
+        fn at<const N: usize>(keys: &[u8], key_len: usize, nw: usize, width: usize) -> Vec<u8> {
+            let w = stride::<N>(width);
+            (keys.chunks_exact(key_len))
+                .map(|k| worker_for_pk_bytes(&k[..w], nw) as u8)
+                .collect()
+        }
+        let Placement::Keyed { dist_stride } = self else {
+            return None;
+        };
+        Some(stride_dispatch!(dist_stride as usize, at, keys, key_len, num_workers))
     }
 }
 

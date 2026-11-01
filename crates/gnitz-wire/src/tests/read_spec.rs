@@ -325,11 +325,8 @@ fn a_pk_set_split_by_owner_decodes_to_the_same_spec_per_worker() {
                 9 => owners[1],
                 _ => owners[2],
             };
-            let mut counts = [0u32; 3];
-            for k in set.iter() {
-                counts[owner(k)] += 1;
-            }
-            let blobs = peek.split(&counts, owner);
+            let column: Vec<u8> = set.iter().map(|k| owner(k) as u8).collect();
+            let blobs = peek.split(&column, 3);
             assert_eq!(blobs.len(), 3);
             let mut union: Vec<&[u8]> = Vec::new();
             for (w, got) in blobs.iter().enumerate() {

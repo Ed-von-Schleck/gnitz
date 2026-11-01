@@ -1,8 +1,10 @@
 use super::*;
-use crate::runtime::sal::fixtures::{holders_of, test_log};
+use crate::runtime::sal::fixtures::{holders_of, scan, test_log};
 use crate::runtime::sal::SalGroup;
-use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64};
+use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema};
 use gnitz_foundation::perf::Counter;
+use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
+use gnitz_wire::{PkKeys, ReadBound, ReadSpec, TypeCode};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::encode_schema_block;
@@ -89,6 +91,38 @@ fn push_group_layout_bench() {
             format!("{cell:?}"),
             instructions as f64 / rows as f64,
             log.cursor(),
+        );
+    }
+}
+
+/// What the master pays to split one own-PK probe of ascending `u64` keys among
+/// the workers that own them, in instructions per key.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn route_read_pkset_bench() {
+    const KEYS: u64 = 100_000;
+    let schema = pk_only_schema(&[TypeCode::U64]);
+    let mut registry = RelationRegistry::new("", gnitz_zset::algebra::Slot::SOLO, StoreConfig::default());
+    let spec = RelationSpec {
+        id: 16,
+        kind: RelationKind::Stream,
+        placement: Placement::full_pk(&schema),
+        pk_repeats: false,
+        compress: false,
+    };
+    registry.register(spec, schema).unwrap();
+    let keys: Vec<[u8; 8]> = (0..KEYS).map(u64::to_be_bytes).collect();
+    let blob = ReadSpec::all_rows(ReadBound::PkSet(PkKeys::from_keys(8, keys.iter().map(|k| &k[..])))).encode();
+    let read = scan(16, &blob);
+    let counter = Counter::instructions();
+    for nw in [4usize, 16] {
+        std::hint::black_box(route_read(&read, &registry, nw));
+        let (route, instructions) = counter.measure(|| route_read(std::hint::black_box(&read), &registry, nw));
+        assert_eq!(route.set.len(), nw, "the keys spread over every worker");
+        std::hint::black_box(route);
+        println!(
+            "route_read_pkset_bench nw={nw:<2} {KEYS} keys {:>6.1} instr/key",
+            instructions as f64 / KEYS as f64
         );
     }
 }

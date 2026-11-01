@@ -90,7 +90,6 @@ pub(super) fn route_read(read: &Read<'_>, registry: &RelationRegistry, nw: usize
         Placement::Replicated if own_pk => Placement::full_pk(&schema),
         p => p,
     };
-    let owner = |k: &[u8]| placement.owner(k, nw).expect("a key-routed placement owns every key");
     match (placement, bound) {
         (Placement::Replicated, _) => whole(WorkerSet::one(Placement::REPLICA_OWNER as usize)),
         (_, Some(BoundPeek::Range(r))) => whole(
@@ -99,17 +98,14 @@ pub(super) fn route_read(read: &Read<'_>, registry: &RelationRegistry, nw: usize
                 .map_or(WorkerSet::ALL, WorkerSet::one),
         ),
         (_, Some(BoundPeek::PkSet(s))) if placement.is_key_routed() && s.stride == schema.pk_stride() => {
-            let mut counts = [0u32; gnitz_wire::MAX_WORKERS];
-            for k in s.keys.chunks_exact(s.stride) {
-                counts[owner(k)] += 1;
-            }
-            let set: WorkerSet = (0..nw).filter(|&w| counts[w] > 0).collect();
+            let owners = (placement.owners(s.keys, s.stride, nw)).expect("a key-routed placement owns every key");
+            let set: WorkerSet = owners.iter().map(|&o| o as usize).collect();
             match set.len() {
                 0 => whole(WorkerSet::one(0)),
                 1 => whole(set),
                 _ => ReadRoute {
                     set,
-                    per_worker: Some(s.split(&counts[..nw], owner)),
+                    per_worker: Some(s.split(&owners, nw)),
                 },
             }
         }
