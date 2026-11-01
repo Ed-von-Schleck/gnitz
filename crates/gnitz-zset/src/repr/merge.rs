@@ -652,18 +652,30 @@ pub(crate) fn consolidate_groups(batch: &MemBatch, out: &mut Vec<Pick>) {
 /// them: strictly (PK, payload)-ascending, with no ghost. One forward pass, which
 /// the first pair out of order ends.
 pub(crate) fn in_consolidated_order(batch: &Batch) -> bool {
-    if batch.is_empty() {
-        return true;
-    }
-    with_payload_cmp!(batch.schema(), |p| ascending_with(batch, p)) && !batch.as_mem_batch().has_ghost()
+    ascending(batch, batch.schema(), batch.pk()) && !batch.as_mem_batch().has_ghost()
 }
 
-/// Whether `batch`, of at least one row, is strictly (PK, payload)-ascending.
-fn ascending_with<P: PayloadOrder>(batch: &Batch, payload: P) -> bool {
-    let schema = batch.schema();
+/// [`in_consolidated_order`] of a view's rows. Separate, so a `Batch`'s pass
+/// reads its rows directly rather than through a view, which costs its payload
+/// comparisons more.
+pub(crate) fn view_in_consolidated_order(batch: &MemBatch<'_>) -> bool {
+    ascending(batch, batch.schema(), batch.pk()) && !batch.has_ghost()
+}
+
+/// Whether `batch`, laid out under `schema` with PK region `pk`, is strictly
+/// (PK, payload)-ascending.
+fn ascending<S: RowSource>(batch: &S, schema: &SchemaDescriptor, pk: &[u8]) -> bool {
+    if batch.row_count() == 0 {
+        return true;
+    }
+    with_payload_cmp!(schema, |p| ascending_with(batch, schema, pk, p))
+}
+
+/// [`ascending`] of a `batch` of at least one row.
+fn ascending_with<S: RowSource, P: PayloadOrder>(batch: &S, schema: &SchemaDescriptor, pk: &[u8], payload: P) -> bool {
     let stride = schema.pk_stride();
     pk_width_dispatch!(stride, |K| {
-        let mut keys = batch.pk().chunks_exact(stride).map(K::from_opk);
+        let mut keys = pk.chunks_exact(stride).map(K::from_opk);
         let mut prev = keys.next().expect("a batch of at least one row");
         keys.zip(1..).all(|(key, i)| {
             // The payload order is read only where two rows share a PK.

@@ -2,8 +2,8 @@ use super::*;
 use crate::repr::{merge_consolidated, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    encode_to_wire_vec, make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u64_i64,
-    ragged_batch, ragged_schema, string_batch, u64_pk_schema, weighted_rows,
+    encode_to_wire_vec, make_batch, make_batch_bytes, make_batch_raw, make_schema_pk_u64_payload_string,
+    make_schema_u64_i64, ragged_batch, ragged_schema, string_batch, u64_pk_schema, weighted_rows,
 };
 use gnitz_wire::{TypeCode, REG_NULL_BMP, REG_PAYLOAD_START};
 
@@ -286,6 +286,42 @@ fn a_viewed_wal_block_reads_as_its_batch() {
         let doubled: Vec<_> = want.iter().map(|(row, w)| (row.clone(), 2 * w)).collect();
         assert_eq!(weighted_rows(&merged), doubled, "{rows} rows: merge");
     }
+}
+
+/// Several foreign blocks decode to their sum: merged and consolidated when each
+/// stands consolidated, concatenated otherwise; and one invalid block refuses
+/// them all.
+#[test]
+fn foreign_blocks_decode_to_their_sum() {
+    let schema = make_schema_u64_i64();
+    let a = encode_to_wire_vec(&make_batch(&schema, &[(1, 1, 10), (3, 1, 30), (5, -1, 50)]));
+    let b = encode_to_wire_vec(&make_batch(&schema, &[(2, 1, 20), (5, 1, 50), (6, 2, 60)]));
+    let unsorted = encode_to_wire_vec(&make_batch_raw(&schema, &[(9, 1, 90), (7, 1, 70)]));
+    let ghost = encode_to_wire_vec(&make_batch_raw(&schema, &[(8, 0, 80)]));
+    let sum = |rows: &[(u64, i64, i64)]| weighted_rows(&make_batch(&schema, rows));
+
+    let merged = Batch::decode_foreign_wal_blocks(&[&a, &b], &schema).unwrap();
+    assert!(merged.is_consolidated());
+    assert_eq!(
+        weighted_rows(&merged),
+        sum(&[(1, 1, 10), (2, 1, 20), (3, 1, 30), (6, 2, 60)])
+    );
+
+    for odd in [&unsorted, &ghost] {
+        let mixed = Batch::decode_foreign_wal_blocks(&[&a, &b, odd], &schema).unwrap();
+        assert!(!mixed.is_consolidated());
+        assert_eq!(mixed.len(), 6 + MemBatch::of_wal_block(odd, &schema).unwrap().len());
+    }
+    let mixed = Batch::decode_foreign_wal_blocks(&[&a, &b, &unsorted], &schema).unwrap();
+    assert_eq!(
+        weighted_rows(&mixed.to_consolidated()),
+        sum(&[(1, 1, 10), (2, 1, 20), (3, 1, 30), (6, 2, 60), (7, 1, 70), (9, 1, 90)])
+    );
+
+    assert_eq!(Batch::decode_foreign_wal_blocks(&[], &schema).map(|b| b.len()), Ok(0));
+    let one = Batch::decode_foreign_wal_blocks(&[&a], &schema).unwrap();
+    assert_eq!(weighted_rows(&one), sum(&[(1, 1, 10), (3, 1, 30), (5, -1, 50)]));
+    assert!(Batch::decode_foreign_wal_blocks(&[&a, &b[..b.len() - 1]], &schema).is_err());
 }
 
 /// An engine block states its batch's dead-byte bound and the engine decode

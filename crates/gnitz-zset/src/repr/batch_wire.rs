@@ -7,6 +7,7 @@ use std::ops::Range;
 use super::batch::Batch;
 use super::batch::MemBatch;
 use super::batch_pool::PooledBuf;
+use super::merge;
 use super::scatter::{copy_ranges, scatter_copy};
 use super::string_heap::{blob_span_key, walk_heap_spans, BlobCache};
 use super::writer::DirectWriter;
@@ -320,6 +321,27 @@ impl Batch {
     /// [`MemBatch::validate_foreign`], copied into an owned unconsolidated batch.
     pub fn decode_foreign_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
         Ok(MemBatch::validate_foreign(data, schema)?.to_batch())
+    }
+
+    /// The sum of `blocks`, WAL blocks a peer wrote, as one batch, every block
+    /// validated as [`MemBatch::validate_foreign`] validates one before any is
+    /// read. Several blocks that each stand consolidated are merged into one
+    /// consolidated batch; a lone block is copied as it stands and any other
+    /// mix concatenated, both unconsolidated.
+    pub fn decode_foreign_wal_blocks(blocks: &[&[u8]], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
+        match blocks {
+            [] => Ok(Batch::empty_with_schema(schema)),
+            [one] => Batch::decode_foreign_wal_block(one, schema),
+            _ => {
+                let views = (blocks.iter())
+                    .map(|b| MemBatch::validate_foreign(b, schema))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(match views.iter().all(merge::view_in_consolidated_order) {
+                    true => merge::merge_consolidated(&views, schema),
+                    false => Batch::concat(schema, views.iter().copied()),
+                })
+            }
+        }
     }
 }
 

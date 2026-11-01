@@ -197,21 +197,25 @@ impl Mirror {
             .expect("a mirrored relation's copy is registered");
     }
 
-    /// Apply one block to `tid`'s copy. A failed apply erases the copy.
-    fn ingest(&mut self, tid: u64, block: &[u8]) -> Result<(), String> {
-        self.applied_bytes += block.len();
+    /// Apply a train's blocks to `tid`'s copy as one batch: every block is
+    /// validated before any is applied. A failed train erases the copy.
+    fn ingest(&mut self, tid: u64, blocks: &[&[u8]]) -> Result<(), String> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        self.applied_bytes += blocks.iter().map(|b| b.len()).sum::<usize>();
         self.unpublished.insert(tid);
         let schema = self
             .registry
             .relation(tid)
             .expect("a mirrored relation's copy is registered")
             .schema();
-        let applied = Batch::decode_foreign_wal_block(block, &schema)
+        let applied = Batch::decode_foreign_wal_blocks(blocks, &schema)
             .map_err(|e| format!("decoding a block for {tid}: {e}"))
             .and_then(|b| {
                 self.registry
                     .ingest(tid, b)
-                    .map_err(|e| format!("applying a block to {tid}: {e}"))
+                    .map_err(|e| format!("applying the blocks to {tid}: {e}"))
             });
         applied.inspect_err(|_| self.erase(tid))
     }
@@ -326,9 +330,11 @@ impl MirrorStore for Mirror {
         if self.feed_of(tid) != Feed::Filling {
             return Err(format!("relation {tid}'s copy is not being refilled"));
         }
-        // A block that fails erases the copy, which ends the refill.
-        for &block in blocks {
-            self.ingest(tid, block)?;
+        // Block by block: a refill's blocks are large and each arrives in
+        // order, so each is certified in place, where one batch would merge
+        // them. A failed block erases the copy, which ends the refill.
+        for block in blocks {
+            self.ingest(tid, std::slice::from_ref(block))?;
         }
         if let Some(cursor) = sealed_at {
             self.settle(tid, cursor);
@@ -339,9 +345,7 @@ impl MirrorStore for Mirror {
 
     fn advance(&mut self, tid: u64, blocks: &[&[u8]], next: DeltaCursor) -> Result<(), String> {
         self.continuing(tid)?;
-        for &block in blocks {
-            self.ingest(tid, block)?;
-        }
+        self.ingest(tid, blocks)?;
         self.settle(tid, next);
         // A cursor move applies nothing and runs on the client's thread.
         if !blocks.is_empty() {
