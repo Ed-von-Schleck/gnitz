@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 
 use gnitz_zset::algebra::ScatterPlan;
-use gnitz_zset::repr::Batch;
+use gnitz_zset::repr::MemBatch;
 
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::{GroupData, Read};
@@ -21,7 +21,7 @@ thread_local! {
 /// Route `batch`'s nonzero-weight rows to the workers `placement` names, and hand `f` the
 /// group data that carries them, framed straight from `batch`.
 pub(crate) fn with_routed<R>(
-    batch: &Batch,
+    batch: MemBatch<'_>,
     placement: Placement,
     num_workers: usize,
     f: impl FnOnce(GroupData<'_>) -> R,
@@ -42,7 +42,7 @@ pub(crate) fn with_routed<R>(
     }
     SCATTER_INDICES.with(|pool| {
         let mut pool = pool.borrow_mut();
-        match ScatterPlan::native(placement).route(batch, &mut pool, num_workers) {
+        match ScatterPlan::native(placement).route(&batch, &mut pool, num_workers) {
             [live] => f(GroupData::Same(batch.wire_listed(live))),
             lists => {
                 let mut each = [None; MAX_WORKERS];

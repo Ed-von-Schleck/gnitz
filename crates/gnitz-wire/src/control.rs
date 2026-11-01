@@ -117,6 +117,19 @@ pub struct DecodedControl {
 }
 
 impl DecodedControl {
+    /// The control of a frame peeked at `at` in a larger buffer, its ranges
+    /// moved onto that buffer.
+    pub(crate) fn placed_at(self, at: usize) -> Self {
+        let shift = |r: Range<usize>| r.start + at..r.end + at;
+        DecodedControl {
+            hdr: self.hdr,
+            blob: shift(self.blob),
+            body: shift(self.body),
+            schema: self.schema.map(shift),
+            data: self.data.map(shift),
+        }
+    }
+
     /// The verb a client frame names, refusing a header no client writes and
     /// a section or prologue word that verb does not carry. A multi-item
     /// frame's items are checked as they are decoded.

@@ -29,7 +29,7 @@ use gnitz_store::read::Probe;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::txn_frame::{decode_scan_multi, encode_items, FrameItem, ScanItem};
 use gnitz_wire::{append_frame, ControlHeader, PkKeys, ReadSpec};
-use gnitz_zset::repr::{Batch, BatchBuilder};
+use gnitz_zset::repr::{Batch, BatchBuilder, MemBatch};
 use gnitz_zset::schema::encode_schema_block;
 
 #[test]
@@ -94,13 +94,14 @@ impl Session {
         };
         let Ok(verb) = ctrl.client_verb() else { return };
         let body = &frame[ctrl.body.clone()];
+        let mut buf = RecvBuf::detached(frame);
         match verb {
             ClientVerb::DdlTxn => self.ddl(body),
             ClientVerb::Push => {
-                let Ok(push) = decode_push_frame(&self.cat, frame, ctrl) else {
+                let Ok(push) = decode_push_frame(&self.cat, buf.as_mut_slice(), ctrl) else {
                     return;
                 };
-                let Ok(Some(family)) = push.admit(&self.cat, Access::Write) else {
+                let Ok(Some(family)) = push.admit(&self.cat, Access::Write, &Rc::new(buf)) else {
                     return;
                 };
                 let stream = self
@@ -108,25 +109,26 @@ impl Session {
                     .registry
                     .relation(family.tid)
                     .is_some_and(|r| r.kind() == RelationKind::Stream);
-                if stream || self.inserts(family.tid, &family.batch) {
+                if stream || self.inserts(family.tid, &family.rows.view()) {
                     self.ingest(vec![family]);
                 }
             }
             ClientVerb::PushTxn => {
-                let Ok(items) = decode_push_txn_frame(&self.cat, body) else {
+                let Ok(items) = decode_push_txn_frame(&self.cat, buf.as_mut_slice(), ctrl.body.clone()) else {
                     return;
                 };
+                let buf = Rc::new(buf);
                 let Ok(families) = items
                     .into_iter()
                     .map(|(_, push)| {
-                        let family = push.admit(&self.cat, Access::TxnWrite);
+                        let family = push.admit(&self.cat, Access::TxnWrite, &buf);
                         family.map(|f| f.expect("a PUSH_TXN item carries a data block"))
                     })
                     .collect::<Result<Vec<_>, _>>()
                 else {
                     return;
                 };
-                if families.iter().all(|f| self.inserts(f.tid, &f.batch)) {
+                if families.iter().all(|f| self.inserts(f.tid, &f.rows.view())) {
                     self.ingest(families);
                 }
             }
@@ -188,7 +190,7 @@ impl Session {
     /// Ingest every one of `families`, which the master admitted, and tick each.
     fn ingest(&mut self, families: Vec<TxnFamily>) {
         for f in families {
-            if self.cat.ingest_unticked(f.tid, f.batch).is_ok() {
+            if self.cat.ingest_unticked(f.tid, f.rows.into_batch()).is_ok() {
                 self.filled.insert(f.tid);
                 self.tick(f.tid);
             }
@@ -197,7 +199,7 @@ impl Session {
 
     /// Whether `batch` is an INSERT into table `tid` as it stands: every weight
     /// one, every key once, and none held already.
-    fn inserts(&self, tid: u64, batch: &Batch) -> bool {
+    fn inserts(&self, tid: u64, batch: &MemBatch<'_>) -> bool {
         if (0..batch.len()).any(|i| batch.get_weight(i) != 1) {
             return false;
         }
@@ -270,14 +272,7 @@ fn builtin() -> Seed {
     ];
     ddl.iter().for_each(|f| session.request(f));
     let rows = |tid: u64| {
-        let schema = session.cat.registry.relation(tid).expect("the DDL created it").schema();
-        let mut rows = BatchBuilder::new(&schema);
-        for id in 0..8u64 {
-            rows.begin_row(id as u128, 1);
-            [id % 3, id].into_iter().for_each(|c| rows.put_u64(c));
-            rows.end_row();
-        }
-        let rows = rows.finish();
+        let rows = eight_rows(&session, tid);
         let mut frame = Vec::new();
         let hdr = ControlHeader::naming(ClientVerb::Push, Target::from(tid), 0);
         let schema_block = encode_schema_block(rows.schema());
@@ -291,6 +286,19 @@ fn builtin() -> Seed {
         .map(|bytes| Frame { conn: 0, bytes })
         .collect();
     Seed { sent, received: Vec::new() }
+}
+
+/// The rows the built-in seed pushes into table `tid`: ids 0..8, keyed on
+/// `id % 3`, each at weight one.
+fn eight_rows(session: &Session, tid: u64) -> Batch {
+    let schema = session.cat.registry.relation(tid).expect("the DDL created it").schema();
+    let mut rows = BatchBuilder::new(&schema);
+    for id in 0..8u64 {
+        rows.begin_row(id as u128, 1);
+        [id % 3, id].into_iter().for_each(|c| rows.put_u64(c));
+        rows.end_row();
+    }
+    rows.finish()
 }
 
 /// A `DDL_TXN` of `blocks`, one item per family.
@@ -324,4 +332,33 @@ fn the_builtin_seed_plays_through() {
     assert_eq!(session.filled.len(), 2, "both pushes were admitted");
     let view = session.filled.iter().max().unwrap() + 1;
     assert_eq!(crate::test_support::net_weight(&session.cat, view), 22);
+}
+
+/// The built-in seed's two pushes sent as one `PUSH_TXN` fill the view as the
+/// two pushes do: each family reads its rows where they lie in the one frame.
+#[test]
+fn a_push_txn_reads_each_family_where_it_lies() {
+    let seed = builtin();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::open(dir.path().to_str().unwrap());
+    let (ddl, _) = seed.sent.split_at(seed.sent.len() - 2);
+    ddl.iter().for_each(|f| session.request(&f.bytes));
+    let base = gnitz_wire::FIRST_USER_TABLE_ID;
+    let tables = [base, base + 1];
+    let batches = tables.map(|tid| eight_rows(&session, tid));
+    let records = batches.each_ref().map(|b| encode_schema_block(b.schema()));
+    let items: Vec<FrameItem> = (0..2)
+        .map(|i| FrameItem {
+            target: Target::from(tables[i]),
+            conflict_mode: Default::default(),
+            basis: 0,
+            schema: Some(&records[i]),
+            data: batches[i].wire_regions(),
+        })
+        .collect();
+    let mut frame = Vec::new();
+    encode_items(&mut frame, ClientVerb::PushTxn, &items);
+    session.request(&frame);
+    assert_eq!(session.filled.len(), 2, "both families were admitted");
+    assert_eq!(crate::test_support::net_weight(&session.cat, base + 2), 22);
 }

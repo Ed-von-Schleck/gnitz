@@ -357,7 +357,7 @@ impl Batch {
             *chunk = f(i64::from_le_bytes(*chunk)).to_le_bytes();
         }
         debug_assert!(
-            !(self.consolidated && self.has_ghost()),
+            !(self.consolidated && self.as_mem_batch().has_ghost()),
             "map_weights: a weight mapped to zero under the consolidated claim",
         );
     }
@@ -368,28 +368,6 @@ impl Batch {
         self.map_weights(i64::wrapping_neg);
         self
     }
-    /// True iff every row's weight is `> 0` — vacuously true for an empty batch.
-    /// Branch-free over the contiguous weight region, so
-    /// the conforming case is one pass with no early exit to serialize it.
-    #[inline]
-    pub fn all_weights_positive(&self) -> bool {
-        !self
-            .weight()
-            .as_chunks::<FIXED_REGION_BYTES>()
-            .0
-            .iter()
-            .fold(false, |bad, w| bad | (i64::from_le_bytes(*w) <= 0))
-    }
-    /// Whether any row is a ghost, at weight zero. Branch-free over the weight
-    /// region, like [`Self::all_weights_positive`].
-    #[inline]
-    pub fn has_ghost(&self) -> bool {
-        self.weight()
-            .as_chunks::<FIXED_REGION_BYTES>()
-            .0
-            .iter()
-            .fold(false, |any, w| any | (*w == [0; FIXED_REGION_BYTES]))
-    }
     #[inline(always)]
     pub fn get_null_word(&self, row: usize) -> u64 {
         read_u64_le(&self.data, self.region_start(REG_NULL_BMP) + row * FIXED_REGION_BYTES)
@@ -398,13 +376,6 @@ impl Batch {
     pub(crate) fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
         let off = self.region_start(REG_PAYLOAD_START + payload_col) + row * col_size;
         &self.data[off..off + col_size]
-    }
-
-    /// A span-dedup cache sized for `rows` rows of this batch's schema: the most
-    /// string cells they hold.
-    #[inline]
-    pub(super) fn blob_cache(&self, rows: usize) -> BlobCache {
-        BlobCache::new(rows * self.schema.string_payload_slots().count_ones() as usize)
     }
 
     // ── Extend methods (building batches row-by-row) ────────────────────
@@ -541,7 +512,7 @@ impl Batch {
     /// reaches a row before its regions are written.
     #[inline(always)]
     pub(crate) fn write_rows<R>(&mut self, rows: usize, fill: impl FnOnce(&mut DirectWriter<'_>) -> R) -> R {
-        let mut cache = self.blob_cache(rows);
+        let mut cache = BlobCache::for_rows(&self.schema, rows);
         self.write_at_most(rows, &mut cache, |w| (rows, fill(w)))
     }
 
@@ -919,7 +890,7 @@ impl Batch {
     /// Copy every `[start, end)` range of `src`, ascending and disjoint, onto
     /// this batch's tail, one append setup serving the whole list.
     pub fn append_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
-        let mut cache = self.blob_cache(range_rows(ranges));
+        let mut cache = BlobCache::for_rows(&self.schema, range_rows(ranges));
         self.push_ranges(src, ranges, &mut cache);
     }
 
@@ -937,7 +908,7 @@ impl Batch {
                     .sum(),
             );
         }
-        let mut cache = self.blob_cache(rows.len());
+        let mut cache = BlobCache::for_rows(&self.schema, rows.len());
         for r in rows {
             self.append_row_from_source(weight, &r.run, r.row, Some(&mut cache));
         }
@@ -1010,7 +981,7 @@ impl Batch {
         let mut out = Batch::with_capacity_blob(schema, rows, blob);
         // One dedup cache serves every source, so a fold of one-row runs pays its
         // setup once.
-        let mut cache = out.blob_cache(rows);
+        let mut cache = BlobCache::for_rows(&out.schema, rows);
         for src in sources {
             out.push_ranges(&src, &[(0, src.count)], &mut cache);
         }
@@ -1298,18 +1269,9 @@ impl Batch {
         out
     }
 
-    /// Debug-only: `dead_heap` bounds the heap's unreferenced bytes from above.
+    /// [`MemBatch::debug_verify_dead_heap`].
     pub(super) fn debug_verify_dead_heap(&self) {
-        if cfg!(debug_assertions) {
-            let measured = string_heap::measure_dead_heap(&self.as_mem_batch());
-            debug_assert!(
-                measured <= self.dead_heap,
-                "heap holds {measured} unreferenced bytes, past its bound of {} ({} bytes, {} rows)",
-                self.dead_heap,
-                self.blob.len(),
-                self.count,
-            );
-        }
+        self.as_mem_batch().debug_verify_dead_heap();
     }
 }
 
@@ -1375,6 +1337,68 @@ impl<'a> MemBatch<'a> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// The schema the rows are laid out under.
+    #[inline]
+    pub fn schema(&self) -> &'a SchemaDescriptor {
+        self.schema
+    }
+
+    /// The string heap the long German-string cells index into.
+    #[inline(always)]
+    pub fn blob(&self) -> &'a [u8] {
+        self.blob
+    }
+
+    /// An upper bound on the bytes of the heap no string cell references.
+    #[inline]
+    pub fn dead_heap(&self) -> usize {
+        self.dead_heap
+    }
+
+    /// An owned copy of these rows and their whole heap: unconsolidated, under
+    /// this view's dead-byte bound.
+    pub fn to_batch(&self) -> Batch {
+        Batch::from_mem_batch(self)
+    }
+
+    /// True iff every row's weight is `> 0` — vacuously true for an empty batch.
+    /// Branch-free over the contiguous weight region, so the conforming case is
+    /// one pass with no early exit to serialize it.
+    #[inline]
+    pub fn all_weights_positive(&self) -> bool {
+        !self
+            .weight()
+            .as_chunks::<FIXED_REGION_BYTES>()
+            .0
+            .iter()
+            .fold(false, |bad, w| bad | (i64::from_le_bytes(*w) <= 0))
+    }
+
+    /// Whether any row is a ghost, at weight zero. Branch-free over the weight
+    /// region, like [`Self::all_weights_positive`].
+    #[inline]
+    pub fn has_ghost(&self) -> bool {
+        self.weight()
+            .as_chunks::<FIXED_REGION_BYTES>()
+            .0
+            .iter()
+            .fold(false, |any, w| any | (*w == [0; FIXED_REGION_BYTES]))
+    }
+
+    /// Debug-only: `dead_heap` bounds the heap's unreferenced bytes from above.
+    pub(super) fn debug_verify_dead_heap(&self) {
+        if cfg!(debug_assertions) {
+            let measured = string_heap::measure_dead_heap(self);
+            debug_assert!(
+                measured <= self.dead_heap,
+                "heap holds {measured} unreferenced bytes, past its bound of {} ({} bytes, {} rows)",
+                self.dead_heap,
+                self.blob.len(),
+                self.count,
+            );
+        }
     }
 
     /// Byte width of the PK region per row.

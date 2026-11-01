@@ -25,7 +25,7 @@ fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
         vec![TxnFamily {
             tid: parent,
             mode: WireConflictMode::Update,
-            batch: make_batch_raw(&schema, rows),
+            rows: FamilyRows::Built(make_batch_raw(&schema, rows)),
         }]
     };
     let mut upsert = write(&[(1, 1, 10), (2, 1, 20)]);

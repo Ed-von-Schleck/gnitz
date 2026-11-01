@@ -55,7 +55,7 @@ impl ScatterPlan {
     /// Reset `out` to one ascending list per worker of the nonzero-weight rows of
     /// `batch` that worker owns — a weight-0 row is not a Z-set element. A
     /// broadcast is the one list every worker is sent.
-    pub fn route<'a>(&self, batch: &Batch, out: &'a mut Vec<Vec<u32>>, num_workers: usize) -> &'a [Vec<u32>] {
+    pub fn route<'a>(&self, batch: &MemBatch<'_>, out: &'a mut Vec<Vec<u32>>, num_workers: usize) -> &'a [Vec<u32>] {
         let lists = if self.is_broadcast() { 1 } else { num_workers };
         // Reset to `lists` empty lists, keeping their allocations.
         if out.len() < lists {
@@ -63,7 +63,7 @@ impl ScatterPlan {
         }
         let slots = &mut out[..lists];
         slots.iter_mut().for_each(Vec::clear);
-        self.route_into(&batch.as_mem_batch(), num_workers, &mut EveryWorker(slots));
+        self.route_into(batch, num_workers, &mut EveryWorker(slots));
         slots
     }
 

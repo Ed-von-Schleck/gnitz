@@ -1,6 +1,7 @@
 use super::*;
 use crate::test_support::{make_batch_raw, u64_pk_schema};
 use gnitz_wire::TypeCode;
+use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaColumn;
 
 fn batch(rows: impl IntoIterator<Item = (u64, i64)>) -> Batch {
@@ -34,7 +35,7 @@ fn a_small_write_leaves_each_key_as_its_last_row_does() {
     for k in [1, 2, 3] {
         cache.record(k);
     }
-    cache.apply(&batch([(1, -1), (2, -1), (2, 1), (4, 1), (4, -1), (5, 1), (3, 0)]));
+    cache.apply(&batch([(1, -1), (2, -1), (2, 1), (4, 1), (4, -1), (5, 1), (3, 0)]).as_mem_batch());
     assert_eq!(held(&cache, 1..=5), [2, 3, 5]);
 }
 
@@ -47,11 +48,11 @@ fn a_bulk_write_evicts_and_records_nothing() {
         cache.record(k);
     }
     let fresh = 100..100 + FILL_MAX_ROWS as u64 + 1;
-    cache.apply(&batch(fresh.clone().map(|k| (k, 1))));
+    cache.apply(&batch(fresh.clone().map(|k| (k, 1))).as_mem_batch());
     assert_eq!(held(&cache, fresh.clone()), [] as [u64; 0]);
     assert_eq!(held(&cache, 1..=2), [1, 2]);
 
-    cache.apply(&batch(fresh.map(|k| (k, 1)).chain([(1, -1)])));
+    cache.apply(&batch(fresh.map(|k| (k, 1)).chain([(1, -1)])).as_mem_batch());
     assert_eq!(held(&cache, 1..=2), [2]);
 }
 
@@ -68,8 +69,8 @@ fn a_table_has_a_cache_from_its_first_found_key() {
     checks.fk_presence_found(9, 7);
     assert_eq!(held([5, 6, 7]), Some(vec![5, 7]));
 
-    checks.committed(&engine, 8, &batch([(7, -1)]));
-    checks.committed(&engine, 9, &batch([(5, -1)]));
+    checks.committed(&engine, 8, batch([(7, -1)]).as_mem_batch());
+    checks.committed(&engine, 9, batch([(5, -1)]).as_mem_batch());
     checks.forget(8);
     assert_eq!(held([5, 6, 7]), Some(vec![7]));
     checks.forget(9);

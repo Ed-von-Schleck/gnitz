@@ -207,7 +207,7 @@ impl Mesh {
         assert!(!self.in_round, "exchange of view {view}: a round is already open");
         self.in_round = true;
         let nw = self.nw();
-        let lists = plan.route(&batch, &mut self.routed, nw).len();
+        let lists = plan.route(&batch.as_mem_batch(), &mut self.routed, nw).len();
         let mut round = Round {
             view,
             schema: *batch.schema(),
@@ -262,7 +262,7 @@ impl Mesh {
                 // SAFETY: `[end, outbox_bytes)` lies inside this worker's own
                 // outbox, which no peer reads until the arrival that follows.
                 let out = unsafe { std::slice::from_raw_parts_mut(outbox.add(end), self.outbox_bytes - end) };
-                let Some((n, len)) = batch.encode_scattered_prefix(rest, out) else {
+                let Some((n, len)) = batch.as_mem_batch().encode_scattered_prefix(rest, out) else {
                     return (end, true);
                 };
                 let span = Span { at: end as u32, len: len as u32 };

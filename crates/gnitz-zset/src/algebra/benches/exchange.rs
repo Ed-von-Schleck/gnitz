@@ -83,11 +83,15 @@ fn exchange_route_bench() {
         for (n, iters) in [(1, 10_000), (1_000_000, 20)] {
             let batch = bench_stripe(schema, n);
             let mut pool = Vec::new();
-            let routed: usize = plan.route(&batch, &mut pool, workers).iter().map(Vec::len).sum();
+            let routed: usize = plan
+                .route(&batch.as_mem_batch(), &mut pool, workers)
+                .iter()
+                .map(Vec::len)
+                .sum();
             assert_eq!(routed, n, "{name}: the route dropped rows");
             let ((), i) = instructions.measure(|| {
                 for _ in 0..iters {
-                    black_box(plan.route(&batch, &mut pool, workers));
+                    black_box(plan.route(&batch.as_mem_batch(), &mut pool, workers));
                 }
             });
             println!(

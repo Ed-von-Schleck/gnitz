@@ -23,11 +23,11 @@ use crate::runtime::sal::Read;
 use gnitz_store::read::Probe;
 use gnitz_wire::{PkColList, WireFault};
 use gnitz_zset::algebra::spans;
-use gnitz_zset::repr::Batch;
+use gnitz_zset::repr::MemBatch;
 
 use self::fk_presence::FkPresence;
 
-pub(super) use preflight::TxnFamily;
+pub(super) use preflight::{FamilyRows, PushedBlock, TxnFamily};
 pub(super) use unique_filter::UniqueFilter;
 pub(super) use unique_preflight::validate_unique_index_create;
 
@@ -63,21 +63,20 @@ impl Checks {
     /// it. Called once the batch is committed and before its writer is
     /// answered: the writer's table lock is what keeps a cache true of
     /// committed rows.
-    pub(super) fn committed(&self, cat: &CatalogEngine, tid: u64, batch: &Batch) {
+    pub(super) fn committed(&self, cat: &CatalogEngine, tid: u64, batch: MemBatch<'_>) {
         if let Some(cache) = self.fk_presence.borrow_mut().get_mut(&tid) {
-            cache.apply(batch);
+            cache.apply(&batch);
         }
         let Some(relation) = cat.registry.relation(tid) else {
             return;
         };
-        let mb = batch.as_mem_batch();
         let mut filters = self.unique_filters.borrow_mut();
         for ic in relation.unique_indexes_to_check() {
             if let Some(filter) = filters.get_mut(&(tid, ic.cols())) {
                 // A capped filter takes nothing, so its spans are not extracted.
                 if !filter.is_capped() {
                     let spec = ic.key_spec();
-                    filter.insert_all(spans(&mb, spec).chunks_exact(spec.key_size()));
+                    filter.insert_all(spans(&batch, spec).chunks_exact(spec.key_size()));
                 }
             }
         }

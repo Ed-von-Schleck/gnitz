@@ -2,6 +2,7 @@ use super::*;
 use crate::runtime::reactor::test_support::train_lease;
 use crate::test_support::pk_only_schema;
 use gnitz_wire::TypeCode;
+use gnitz_zset::repr::Batch;
 
 /// Merge the trains the workers send for `partitions[w]`, two spans a frame and
 /// a row-less terminal frame.

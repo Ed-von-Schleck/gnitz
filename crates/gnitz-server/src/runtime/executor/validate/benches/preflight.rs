@@ -30,7 +30,7 @@ fn preflight_probe_bench() {
         let mut families = vec![TxnFamily {
             tid,
             mode: WireConflictMode::Error,
-            batch: make_batch_raw(&schema, &inserted),
+            rows: FamilyRows::Built(make_batch_raw(&schema, &inserted)),
         }];
         let mut validate = || counter.measure(|| try_poll_once(checks.validate_txn(&disp, &mut families)));
         validate(); // the fold's and the scatter's first allocations

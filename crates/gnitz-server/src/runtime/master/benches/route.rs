@@ -65,7 +65,7 @@ fn push_group_layout_bench() {
             excl.checkpoint_reset();
             counter.measure(|| {
                 let mut scope = excl.begin("bench");
-                let own = with_routed(&batch, placement, nw, |data| {
+                let own = with_routed(batch.as_mem_batch(), placement, nw, |data| {
                     scope
                         .write(&SalGroup::push(16, &record, data, holders_of(&data)), zoned)
                         .expect("group fits");

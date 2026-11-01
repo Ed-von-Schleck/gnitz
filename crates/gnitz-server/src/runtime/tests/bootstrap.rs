@@ -37,7 +37,7 @@ fn boot(dir: &str, slot: Slot, log: &SalWriter) -> CatalogEngine {
 /// Write `rows` to `log` as the master's push of them to `tid`.
 fn push(log: &SalWriter, engine: &CatalogEngine, tid: u64, rows: &Batch) {
     let (rel, record) = engine.wire_target(tid).unwrap();
-    with_routed(rows, rel.placement(), log.num_workers(), |data| {
+    with_routed(rows.as_mem_batch(), rel.placement(), log.num_workers(), |data| {
         log.commit_zone(&[SalGroup::push(tid, record, data, holders_of(&data))]);
     });
 }

@@ -94,8 +94,8 @@ fn assert_routes_by(relay: Option<&Rc<ScatterPlan>>, schema: &SchemaDescriptor, 
     let want = ScatterPlan::join(schema, &self_typed_slots(schema, cols)).unwrap();
     let (mut got_lists, mut want_lists) = (Vec::new(), Vec::new());
     assert_eq!(
-        got.route(&probe, &mut got_lists, 4),
-        want.route(&probe, &mut want_lists, 4)
+        got.route(&probe.as_mem_batch(), &mut got_lists, 4),
+        want.route(&probe.as_mem_batch(), &mut want_lists, 4)
     );
 }
 

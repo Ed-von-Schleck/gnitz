@@ -17,27 +17,84 @@
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
+use std::ops::Range;
+use std::rc::Rc;
 
 use rustc_hash::FxHashSet;
+use smallvec::SmallVec;
 
 use super::*;
 
 use crate::catalog::{FkEdge, RowConstraints};
+use crate::runtime::reactor::RecvBuf;
 use gnitz_expr::ColumnLocator;
 use gnitz_store::relation::Relation;
 use gnitz_wire::{FkAction, PkBuf, PkKeys, WireConflictMode};
 use gnitz_zset::algebra::KeySpec;
-use gnitz_zset::repr::MemBatch;
+use gnitz_zset::repr::{Batch, MemBatch};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// One decoded, shape-validated transaction family: the target `tid`, its
-/// conflict `mode`, and the decoded batch. The executor decodes into these, the
+/// conflict `mode`, and its rows. The executor decodes into these, the
 /// validator borrows them and extends them with the families a delete cascades
 /// to, and the committer takes them by value.
 pub(in crate::runtime::executor) struct TxnFamily {
     pub(in crate::runtime::executor) tid: u64,
     pub(in crate::runtime::executor) mode: WireConflictMode,
-    pub(in crate::runtime::executor) batch: Batch,
+    pub(in crate::runtime::executor) rows: FamilyRows,
+}
+
+/// The rows of a [`TxnFamily`].
+pub(in crate::runtime::executor) enum FamilyRows {
+    /// A client's block, read where it lies in the request frame that carried
+    /// it. The frame, and its charge to the inbound budget, live as long as
+    /// the rows.
+    Frame(Rc<RecvBuf>, PushedBlock),
+    /// Rows the master built: a merged run of pushes, or a cascade's
+    /// retractions.
+    Built(Batch),
+}
+
+impl FamilyRows {
+    /// The rows, read where they lie.
+    pub(in crate::runtime::executor) fn view(&self) -> MemBatch<'_> {
+        match self {
+            FamilyRows::Frame(frame, block) => block.view(frame.as_slice()),
+            FamilyRows::Built(batch) => batch.as_mem_batch(),
+        }
+    }
+
+    /// The rows as an owned batch, copied out of a frame.
+    pub(in crate::runtime::executor) fn into_batch(self) -> Batch {
+        match self {
+            FamilyRows::Frame(..) => self.view().to_batch(),
+            FamilyRows::Built(batch) => batch,
+        }
+    }
+}
+
+/// A client's data block that [`MemBatch::certify_foreign`] accepted, at
+/// `range` of the bytes it certified, under the schema it was certified under.
+pub(in crate::runtime::executor) struct PushedBlock {
+    range: Range<usize>,
+    schema: SchemaDescriptor,
+}
+
+impl PushedBlock {
+    /// Certify the block at `range` of `data` under `schema`.
+    pub(in crate::runtime::executor) fn certify(
+        data: &mut [u8],
+        range: Range<usize>,
+        schema: SchemaDescriptor,
+    ) -> Result<Self, &'static str> {
+        MemBatch::certify_foreign(&mut data[range.clone()], &schema)?;
+        Ok(PushedBlock { range, schema })
+    }
+
+    /// The block's rows, read from `data`: the bytes it was certified in.
+    pub(in crate::runtime::executor) fn view<'a>(&'a self, data: &'a [u8]) -> MemBatch<'a> {
+        MemBatch::of_wal_block(&data[self.range.clone()], &self.schema).expect("a certified block parses")
+    }
 }
 
 /// One probe of relation `tid` at `keys`, queued for a burst, with the state
@@ -197,8 +254,9 @@ struct TxnTable<'a> {
 /// A decoded transaction bundle plus everything its rules share. Built once;
 /// every rule reads it instead of re-walking the families.
 struct TxnBundle<'a> {
-    /// The bundle's families, indexed by family number.
-    families: &'a [TxnFamily],
+    /// The rows of the bundle's families, indexed by family number. A push's
+    /// one family is held inline.
+    mems: SmallVec<[MemBatch<'a>; 1]>,
     /// The tables with an Error family or a constraint, in first-appearance
     /// order, found by linear scan over the write's own table count.
     tables: Vec<TxnTable<'a>>,
@@ -226,11 +284,12 @@ impl<'a> TxnBundle<'a> {
                 probe_keys: Vec::new(),
             });
         }
+        let mems: SmallVec<[MemBatch<'a>; 1]> = families.iter().map(|f| f.rows.view()).collect();
         for t in &mut tables {
             let (tid, schema) = (t.tid, t.schema);
             for (fi, fam) in families.iter().enumerate().filter(|(_, f)| f.tid == tid) {
                 let error = matches!(fam.mode, WireConflictMode::Error);
-                let batch = &fam.batch;
+                let batch = mems[fi];
                 t.fold.reserve(batch.len());
                 if error {
                     t.probe_keys.reserve(batch.len());
@@ -282,7 +341,7 @@ impl<'a> TxnBundle<'a> {
                 }
             }
         }
-        Ok(TxnBundle { families, tables })
+        Ok(TxnBundle { mems, tables })
     }
 
     fn get(&self, tid: u64) -> Option<&TxnTable<'a>> {
@@ -298,8 +357,8 @@ impl<'a> TxnBundle<'a> {
     }
 
     /// Family `fam`'s rows.
-    fn mem(&self, fam: u32) -> &'a Batch {
-        &self.families[fam as usize].batch
+    fn mem(&self, fam: u32) -> &MemBatch<'a> {
+        &self.mems[fam as usize]
     }
 
     /// The rows of `tid` that survive the whole bundle: `(pk, family, row)`.
@@ -964,7 +1023,7 @@ async fn removed_references(
         .map(|(tid, c)| TxnFamily {
             tid,
             mode: WireConflictMode::Update,
-            batch: Batch::key_retractions(&c.schema, &c.pks),
+            rows: FamilyRows::Built(Batch::key_retractions(&c.schema, &c.pks)),
         })
         .collect();
     Ok((further, violation))

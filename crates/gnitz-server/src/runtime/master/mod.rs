@@ -24,7 +24,6 @@ use crate::runtime::park::WorkerSet;
 use crate::runtime::reactor::{Reactor, TrainLease};
 use crate::runtime::sal::{GroupData, GroupTargets, Read, SalExcl, SalGroup, SalWriter};
 use gnitz_wire::WireFault;
-use gnitz_zset::repr::Batch;
 
 pub(crate) use dispatch::worker_death;
 

@@ -138,7 +138,7 @@ fn rewrite_targets(
     let plan = ScatterPlan::native(placement);
     let mut rows: Vec<Vec<u32>> = Vec::new();
     while let Some(chunk) = cursor.drain_chunk(config.scan_chunk_rows) {
-        let slots = plan.route(&chunk, &mut rows, launched as usize);
+        let slots = plan.route(&chunk.as_mem_batch(), &mut rows, launched as usize);
         for ((target, buffer), idx) in targets.iter_mut().zip(&mut buffers).zip(slots.iter()) {
             if idx.is_empty() {
                 continue;

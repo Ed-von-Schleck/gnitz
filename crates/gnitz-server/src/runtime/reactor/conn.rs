@@ -128,10 +128,18 @@ impl RecvBuf {
         &self.buf
     }
 
-    /// Decode the frame, then free its bytes. The returned charge keeps counting
-    /// them against the inbound budget, now on behalf of what `decode` built.
-    pub(crate) fn decode<T>(self, decode: impl FnOnce(&[u8]) -> T) -> (T, Charge) {
-        (decode(&self.buf), self.charge)
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
+    /// `bytes` as a frame charged to a budget of its own, which nothing else
+    /// draws on.
+    #[cfg(test)]
+    pub(crate) fn detached(bytes: &[u8]) -> RecvBuf {
+        let charge = Budget::new(bytes.len())
+            .charge(bytes.len())
+            .expect("the budget is the frame's size");
+        RecvBuf { buf: bytes.into(), charge }
     }
 }
 

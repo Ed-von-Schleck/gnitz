@@ -215,9 +215,11 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
             }
         }
         _ => {
-            if let Some(items) = attempt(root, anatomy, || txn_frame::decode_items(body, verb)) {
-                for (item, ctrl) in items {
-                    walk_frame(root, item, ctrl, anatomy);
+            if let Some(items) = attempt(root, anatomy, || {
+                txn_frame::decode_items(frame, ctrl.body.clone(), verb)
+            }) {
+                for item in items {
+                    walk_frame(root, frame, item, anatomy);
                 }
             }
         }

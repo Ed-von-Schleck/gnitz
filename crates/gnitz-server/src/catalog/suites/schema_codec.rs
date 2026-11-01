@@ -177,14 +177,14 @@ fn a_client_bundle_decodes_to_the_rows_it_wrote() {
     ];
     let payload = gnitz_core::encode_ddl_txn(&bundle);
     let ctrl = gnitz_wire::peek_control_block(&payload).expect("control header");
-    let items = decode_items(&payload[ctrl.body], gnitz_wire::ClientVerb::DdlTxn).expect("decode_items");
-    let ids: Vec<u64> = items.iter().map(|(_, item)| item.hdr.target_id).collect();
+    let items = decode_items(&payload, ctrl.body, gnitz_wire::ClientVerb::DdlTxn).expect("decode_items");
+    let ids: Vec<u64> = items.iter().map(|item| item.hdr.target_id).collect();
     assert_eq!(ids, bundle.iter().map(|(id, _)| *id).collect::<Vec<_>>());
     let b: Vec<Batch> = items
         .iter()
-        .map(|(frame, item)| {
+        .map(|item| {
             let schema = crate::catalog::SysFamily::from_id(item.hdr.target_id).unwrap().schema();
-            Batch::decode_from_wal_block(&frame[item.data.clone().unwrap()], schema).unwrap()
+            Batch::decode_from_wal_block(&payload[item.data.clone().unwrap()], schema).unwrap()
         })
         .collect();
 

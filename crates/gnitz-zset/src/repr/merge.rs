@@ -568,7 +568,7 @@ where
         out.carry_heap(a, slots, &[(0, n_a)]),
         out.carry_heap(b, slots, &[(0, n_b)]),
     ];
-    let mut cache = out.blob_cache(n_a + n_b);
+    let mut cache = BlobCache::for_rows(out.schema(), n_a + n_b);
     let dead = out.write_at_most(n_a + n_b, &mut cache, |writer| {
         let mut sink = MergeSink::new(srcs, heap_at, writer);
         let (mut ia, mut jb) = (0usize, 0usize);
@@ -655,7 +655,7 @@ pub(crate) fn in_consolidated_order(batch: &Batch) -> bool {
     if batch.is_empty() {
         return true;
     }
-    with_payload_cmp!(batch.schema(), |p| ascending_with(batch, p)) && !batch.has_ghost()
+    with_payload_cmp!(batch.schema(), |p| ascending_with(batch, p)) && !batch.as_mem_batch().has_ghost()
 }
 
 /// Whether `batch`, of at least one row, is strictly (PK, payload)-ascending.

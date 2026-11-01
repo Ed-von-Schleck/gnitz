@@ -1094,14 +1094,14 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     append_push_txn(&mut payload, &families);
 
     let ctrl = peek_control_block(&payload).unwrap();
-    let decoded = gnitz_wire::txn_frame::decode_items(&payload[ctrl.body], ClientVerb::PushTxn).unwrap();
+    let decoded = gnitz_wire::txn_frame::decode_items(&payload, ctrl.body, ClientVerb::PushTxn).unwrap();
     assert_eq!(decoded.len(), families.len());
-    for ((frame, fam), want) in decoded.iter().zip(&families) {
+    for (fam, want) in decoded.iter().zip(&families) {
         let got = (fam.hdr.target_id, fam.hdr.flags.conflict_mode, fam.hdr.arg0);
         assert_eq!(got, (want.target.tid, want.mode, want.basis));
-        let block_schema = frame_schema(frame, fam).unwrap();
+        let block_schema = frame_schema(&payload, fam).unwrap();
         assert_eq!(block_schema, *schema);
-        assert_eq!(frame_data(frame, fam, &block_schema).as_ref(), Some(&*want.batch));
+        assert_eq!(frame_data(&payload, fam, &block_schema).as_ref(), Some(&*want.batch));
     }
 }
 

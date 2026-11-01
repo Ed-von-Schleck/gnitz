@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use super::batch::{range_rows, MemBatch};
 use super::batch_pool::{self, is_tight};
 use super::shard::Codebook;
+use crate::schema::SchemaDescriptor;
 use gnitz_wire::TypeCode;
 use gnitz_wire::{Heap, HeapValue, RowSource};
 use rustc_hash::FxHashMap;
@@ -323,6 +324,12 @@ pub(crate) struct BlobCache {
 impl BlobCache {
     pub(crate) fn new(cells: usize) -> Self {
         BlobCache { map: None, cells }
+    }
+
+    /// A cache sized for `rows` rows of `schema`: the most string cells they
+    /// hold.
+    pub(crate) fn for_rows(schema: &SchemaDescriptor, rows: usize) -> Self {
+        BlobCache::new(rows * schema.string_payload_slots().count_ones() as usize)
     }
 
     #[inline]

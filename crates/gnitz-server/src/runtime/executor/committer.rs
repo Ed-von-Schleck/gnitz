@@ -2,7 +2,7 @@
 //! worker ACKs, batched from whatever is queued behind the first request (see
 //! [`drain_ready_batch`]). Checkpoints, backups and DDL pauses end a batch. Once serving, it is the one task that runs a checkpoint.
 
-use super::validate::TxnFamily;
+use super::validate::{FamilyRows, TxnFamily};
 use super::Shared;
 use crate::runtime::reactor::AckLease;
 use crate::runtime::signals;
@@ -222,7 +222,7 @@ fn drain_ready_batch(
             // A write is one indivisible entry: its whole family set rides this
             // batch, and counts every family's rows.
             CommitRequest::Write(w) => {
-                row_count += w.families.iter().map(|f| f.batch.len()).sum::<usize>();
+                row_count += w.families.iter().map(|f| f.rows.view().len()).sum::<usize>();
                 writes.push(w);
             }
             CommitRequest::End(end) => return Some(end),
@@ -318,15 +318,16 @@ impl CommitUnit {
             let (done, _) = self.dones.into_iter().next().expect("a unit answers one client");
             return vec![PendingWrite { families, done }];
         }
-        let TxnFamily { tid, mode, batch } = families.pop().expect("a merged run is one family");
+        let TxnFamily { tid, mode, rows } = families.pop().expect("a merged run is one family");
+        let batch = rows.into_batch();
         let mut start = 0;
         (self.dones.into_iter())
             .map(|(done, rows)| {
                 let range = (start, start + rows);
                 start += rows;
-                let batch = Batch::from_ranges(&batch, &[range], 0);
+                let rows = FamilyRows::Built(Batch::from_ranges(&batch, &[range], 0));
                 PendingWrite {
-                    families: vec![TxnFamily { tid, mode, batch }],
+                    families: vec![TxnFamily { tid, mode, rows }],
                     done,
                 }
             })
@@ -380,21 +381,23 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
     s.units.reserve(s.writes.len());
     let mut remaining = s.writes.drain(..).peekable();
     while let Some(PendingWrite { mut families, done }) = remaining.next() {
-        let rows = |families: &[TxnFamily]| families.iter().map(|f| f.batch.len()).sum::<usize>();
+        let rows = |families: &[TxnFamily]| families.iter().map(|f| f.rows.view().len()).sum::<usize>();
         let mut dones: SmallVec<[Done; 1]> = smallvec![(done, rows(&families))];
         if let ([head], true) = (&mut families[..], merge) {
             // The run's batches behind its first. A single push ships the
             // client's batch as it stands, so the dominant case builds no `Vec`.
-            let mut tail: Vec<Batch> = Vec::new();
+            let mut tail: Vec<FamilyRows> = Vec::new();
             while let Some(next) = remaining.next_if(|w| matches!(&w.families[..], [f] if f.tid == head.tid)) {
                 dones.push((next.done, rows(&next.families)));
-                tail.extend(next.families.into_iter().map(|f| f.batch));
+                tail.extend(next.families.into_iter().map(|f| f.rows));
             }
             if !tail.is_empty() {
-                head.batch = Batch::concat(
-                    head.batch.schema(),
-                    std::iter::once(&head.batch).chain(&tail).map(Batch::as_mem_batch),
+                let first = head.rows.view();
+                let merged = Batch::concat(
+                    first.schema(),
+                    std::iter::once(first).chain(tail.iter().map(FamilyRows::view)),
                 );
+                head.rows = FamilyRows::Built(merged);
             }
         }
         s.units.push(CommitUnit {
@@ -433,7 +436,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
             let mut unit_in_zone = false;
             let written = scope.all_or_nothing(|scope| {
                 for f in unit.laid() {
-                    let (lease, in_zone) = disp.write_commit_group(scope, f.tid, &f.batch)?;
+                    let (lease, in_zone) = disp.write_commit_group(scope, f.tid, f.rows.view())?;
                     s.leases.push(lease);
                     unit_in_zone |= in_zone;
                 }
@@ -453,7 +456,8 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
                 Err(e)
                     if e.status == WireStatus::SalFull
                         && (unit.is_merged()
-                            || disp.commit_fits_empty_log(&scope, unit.laid().iter().map(|f| (f.tid, &f.batch)))) =>
+                            || disp
+                                .commit_fits_empty_log(&scope, unit.laid().iter().map(|f| (f.tid, f.rows.view())))) =>
                 {
                     refused_at = Some(at);
                     break;
@@ -472,7 +476,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
             s.units
                 .iter()
                 .flat_map(CommitUnit::laid)
-                .map(|f| (f.tid, f.batch.len())),
+                .map(|f| (f.tid, f.rows.view().len())),
         );
         (zone_lsn, synced, again)
     };
@@ -499,7 +503,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
     for unit in &s.units {
         let lsn = unit.lsn(zone_lsn);
         for f in unit.laid() {
-            shared.writes.committed(&shared.cat(), f.tid, &f.batch, lsn);
+            shared.writes.committed(&shared.cat(), f.tid, f.rows.view(), lsn);
             // After the raise, which is what a woken poll reads as staleness.
             shared.feeds.wake(f.tid);
         }

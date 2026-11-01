@@ -1,6 +1,7 @@
 use super::*;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64};
 use gnitz_wire::WireConflictMode::{Error, Update};
+use gnitz_zset::repr::Batch;
 
 /// A stream is append-only and nothing clamps its weights, so every weight `>= 1`
 /// is admitted and the first `<= 0` one is named. `Error` mode is refused whatever
@@ -12,9 +13,13 @@ fn a_stream_push_admits_only_positive_weights_outside_error_mode() {
         make_batch_raw(&make_schema_u64_i64(), &rows)
     };
     assert_eq!(check_stream_push(7, None, Update), Ok(()));
-    assert_eq!(check_stream_push(7, Some(&weighted(&[1, 5, 1])), Update), Ok(()));
+    assert_eq!(
+        check_stream_push(7, Some(weighted(&[1, 5, 1]).as_mem_batch()), Update),
+        Ok(())
+    );
     for (weights, row) in [(&[0][..], 0), (&[-1], 0), (&[1, 1, -3], 2), (&[2, 0, -1], 1)] {
-        let e = check_stream_push(7, Some(&weighted(weights)), Update).expect_err("a non-positive weight");
+        let e =
+            check_stream_push(7, Some(weighted(weights).as_mem_batch()), Update).expect_err("a non-positive weight");
         let w = weights[row];
         assert!(
             e.contains("table 7") && e.contains(&format!("row {row} of this push carries weight {w}")),
@@ -22,7 +27,7 @@ fn a_stream_push_admits_only_positive_weights_outside_error_mode() {
         );
     }
     for batch in [None, Some(weighted(&[1]))] {
-        let e = check_stream_push(7, batch.as_ref(), Error).expect_err("Error mode");
+        let e = check_stream_push(7, batch.as_ref().map(Batch::as_mem_batch), Error).expect_err("Error mode");
         assert!(e.contains("conflict mode 'error'"), "{e}");
     }
 }

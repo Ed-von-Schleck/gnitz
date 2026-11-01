@@ -1,5 +1,6 @@
-//! Wire serialization for `Batch`: [`WireRows`], the row selection that sizes
-//! and encodes itself, and WAL-block decoding with the validation it runs.
+//! Wire serialization for `Batch` and `MemBatch`: [`WireRows`], the row
+//! selection that sizes and encodes itself, and WAL-block decoding with the
+//! validation it runs.
 
 use std::ops::Range;
 
@@ -19,7 +20,7 @@ use gnitz_wire::{Regions, RowSource, TypeCode};
 /// same value.
 #[derive(Clone, Copy)]
 pub struct WireRows<'a> {
-    batch: &'a Batch,
+    batch: MemBatch<'a>,
     selection: Selection<'a>,
     heap: usize,
 }
@@ -63,7 +64,7 @@ impl WireRows<'_> {
                 .encode_relocating(rows, self.heap, out, true, |writer| {
                     // An empty heap is carried: its cells name no byte of it.
                     let heap_at = b.blob().is_empty().then_some(0);
-                    copy_ranges(&b.as_mem_batch(), heap_at, &[(start, start + rows)], writer);
+                    copy_ranges(&b, heap_at, &[(start, start + rows)], writer);
                 })
                 .expect("a sized range fits the bytes its size reserved"),
             Selection::Listed { rows, dedup } => b
@@ -73,22 +74,22 @@ impl WireRows<'_> {
     }
 }
 
-impl Batch {
+impl<'a> MemBatch<'a> {
     /// Every row, over the heap as it stands and under its dead-byte bound;
     /// `None` for an empty batch.
-    pub fn wire_whole(&self) -> Option<WireRows<'_>> {
+    pub fn wire_whole(&self) -> Option<WireRows<'a>> {
         self.wire_rows_within(0, usize::MAX)
     }
 
     /// The longest run of rows from `start` whose block fits `budget`: at least
     /// one row, however wide, and `None` once no row remains. The whole batch,
     /// when it fits, goes over its heap as it stands.
-    pub fn wire_rows_within(&self, start: usize, budget: usize) -> Option<WireRows<'_>> {
+    pub fn wire_rows_within(&self, start: usize, budget: usize) -> Option<WireRows<'a>> {
         if start == self.len() {
             return None;
         }
         let whole = WireRows {
-            batch: self,
+            batch: *self,
             selection: Selection::Whole,
             heap: self.blob().len(),
         };
@@ -104,7 +105,7 @@ impl Batch {
             slots => self.rows_with_heap(start..self.len(), slots, budget),
         };
         let out = WireRows {
-            batch: self,
+            batch: *self,
             selection: Selection::Range { start, rows },
             heap,
         };
@@ -120,7 +121,10 @@ impl Batch {
     /// it stands. Any other sends each row with its own copy of its long
     /// strings, unless that would send more heap than the batch holds: listed
     /// cells then share spans, and the block keeps each span once.
-    pub fn wire_listed<'a>(&'a self, indices: &'a [u32]) -> Option<WireRows<'a>> {
+    pub fn wire_listed<'b>(&self, indices: &'b [u32]) -> Option<WireRows<'b>>
+    where
+        'a: 'b,
+    {
         if indices.is_empty() {
             return None;
         }
@@ -145,7 +149,7 @@ impl Batch {
             false => copied,
         };
         Some(WireRows {
-            batch: self,
+            batch: *self,
             selection: Selection::Listed { rows: indices, dedup },
             heap,
         })
@@ -162,9 +166,10 @@ impl Batch {
 
     /// The heap spans the long cells of row `row` name, over the string slots
     /// `slots`: the spans a relocation of the row copies.
-    fn long_spans(&self, row: usize, slots: u64) -> impl Iterator<Item = Range<usize>> + '_ {
+    fn long_spans(&self, row: usize, slots: u64) -> impl Iterator<Item = Range<usize>> + 'a {
+        let mb = *self;
         gnitz_wire::BitIter(slots)
-            .filter_map(move |pi| gnitz_wire::german_string_heap(self.german_cell(row, pi), self.blob().len()))
+            .filter_map(move |pi| gnitz_wire::german_string_heap(mb.german_cell(row, pi), mb.blob.len()))
     }
 
     /// How many of `rows`, from the front, fit `budget` once the heap bytes they
@@ -173,7 +178,7 @@ impl Batch {
     fn rows_with_heap(&self, rows: impl ExactSizeIterator<Item = usize>, slots: u64, budget: usize) -> (usize, usize) {
         let slope = self.schema().row_width();
         let base = wal::WAL_HEADER_SIZE;
-        let mut seen = self.blob_cache(rows.len());
+        let mut seen = BlobCache::for_rows(self.schema, rows.len());
         let mut heap = 0usize;
         let mut fit = 0usize;
         for row in rows {
@@ -201,7 +206,7 @@ impl Batch {
     }
 
     /// Every fixed region followed by the blob heap, in canonical order.
-    pub fn wire_regions(&self) -> Regions<'_> {
+    pub fn wire_regions(&self) -> Regions<'a> {
         let mut out = Regions::new();
         for r in 0..self.schema().num_fixed_regions() {
             out.push(self.region(r));
@@ -218,7 +223,7 @@ impl Batch {
     fn encode_listed(&self, indices: &[u32], heap_bytes: usize, out: &mut [u8], dedup: bool) -> Option<usize> {
         let count = indices.len();
         self.encode_relocating(count, heap_bytes, out, dedup, |writer| {
-            scatter_copy(&self.as_mem_batch(), indices, writer);
+            scatter_copy(self, indices, writer);
         })
     }
 
@@ -240,7 +245,7 @@ impl Batch {
             return None;
         }
         let mut heap = PooledBuf::with_capacity(heap_bytes);
-        let mut cache = self.blob_cache(count);
+        let mut cache = BlobCache::for_rows(self.schema, count);
         let block = &mut out[wal::WAL_HEADER_SIZE..heap_at];
         let cache = dedup.then_some(&mut cache);
         fill(&mut DirectWriter::over(
@@ -288,6 +293,23 @@ impl Batch {
         let (n, heap) = self.rows_with_heap(rows.iter().map(|&i| i as usize), slots, out.len());
         self.encode_listed(&rows[..n], heap, out, true).map(|len| (n, len))
     }
+}
+
+impl Batch {
+    /// [`MemBatch::wire_whole`].
+    pub fn wire_whole(&self) -> Option<WireRows<'_>> {
+        self.as_mem_batch().wire_whole()
+    }
+
+    /// [`MemBatch::wire_rows_within`].
+    pub fn wire_rows_within(&self, start: usize, budget: usize) -> Option<WireRows<'_>> {
+        self.as_mem_batch().wire_rows_within(start, budget)
+    }
+
+    /// [`MemBatch::wire_regions`].
+    pub fn wire_regions(&self) -> Regions<'_> {
+        self.as_mem_batch().wire_regions()
+    }
 
     /// Decode a WAL block the engine wrote into an owned unconsolidated batch. String
     /// cells are copied verbatim with their heap.
@@ -295,19 +317,9 @@ impl Batch {
         Ok(Batch::from_mem_batch(&MemBatch::of_wal_block(data, schema)?))
     }
 
-    /// [`Self::decode_from_wal_block`] for a block a peer wrote, validated
-    /// first: its string cells, null bits and BOOLEAN cells. The header's
-    /// dead-heap bound is not trusted: the heap is measured.
+    /// [`MemBatch::validate_foreign`], copied into an owned unconsolidated batch.
     pub fn decode_foreign_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
-        let mut mb = MemBatch::of_wal_block(data, schema)?;
-        mb.dead_heap = validate_string_cells(&mb)?;
-        if let Some((breach, _)) = null_breach(&mb) {
-            return Err(breach);
-        }
-        if !boolean_cells_ok(&mb) {
-            return Err("a BOOLEAN cell is neither 0 nor 1");
-        }
-        Ok(Batch::from_mem_batch(&mb))
+        Ok(MemBatch::validate_foreign(data, schema)?.to_batch())
     }
 }
 
@@ -376,8 +388,8 @@ impl<'a> MemBatch<'a> {
     /// arena of exactly its row count.
     ///
     /// Its string cells and dead-heap bound are taken as the engine wrote
-    /// them; a block a peer wrote goes through
-    /// [`Batch::decode_foreign_wal_block`].
+    /// them; a block a peer wrote goes through [`Self::validate_foreign`] or
+    /// [`Self::certify_foreign`] first.
     pub fn of_wal_block(data: &'a [u8], schema: &'a SchemaDescriptor) -> Result<Self, &'static str> {
         let block = wal::parse_block(data, schema.row_width())?;
         Ok(MemBatch {
@@ -388,6 +400,30 @@ impl<'a> MemBatch<'a> {
             count: block.rows,
             dead_heap: block.heap_dead,
         })
+    }
+
+    /// [`Self::of_wal_block`] for a block a peer wrote, validated first: its
+    /// string cells, null bits and BOOLEAN cells. The header's dead-heap bound
+    /// is not trusted: the heap is measured.
+    pub fn validate_foreign(data: &'a [u8], schema: &'a SchemaDescriptor) -> Result<Self, &'static str> {
+        let mut mb = MemBatch::of_wal_block(data, schema)?;
+        mb.dead_heap = validate_string_cells(&mb)?;
+        if let Some((breach, _)) = null_breach(&mb) {
+            return Err(breach);
+        }
+        if !boolean_cells_ok(&mb) {
+            return Err("a BOOLEAN cell is neither 0 nor 1");
+        }
+        Ok(mb)
+    }
+
+    /// [`Self::validate_foreign`], then the bound it measured written into the
+    /// block's header: from then on [`Self::of_wal_block`] reads `data` as a
+    /// block the engine wrote.
+    pub fn certify_foreign(data: &mut [u8], schema: &SchemaDescriptor) -> Result<(), &'static str> {
+        let dead = MemBatch::validate_foreign(data, schema)?.dead_heap;
+        gnitz_wire::wal::set_heap_dead(data, dead);
+        Ok(())
     }
 }
 

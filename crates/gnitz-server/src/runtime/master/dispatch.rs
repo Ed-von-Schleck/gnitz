@@ -11,6 +11,7 @@ use crate::runtime::reactor::AckLease;
 use crate::runtime::sal::{Apply, GroupTargets, SalMessageKind, SalRequest, SalScope};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io::retry_eintr;
+use gnitz_zset::repr::MemBatch;
 
 /// How often a worker's death is probed for.
 const WORKER_WATCH: Duration = Duration::from_millis(100);
@@ -215,7 +216,7 @@ impl MasterDispatcher {
     /// workers that own its rows and to no reply, handed to `f` with whether it
     /// rides inside the zone. A base table's rows do; a stream's, which no
     /// restart recovers, ride outside.
-    fn with_commit_group<R>(&self, target_id: u64, batch: &Batch, f: impl FnOnce(SalGroup<'_>, bool) -> R) -> R {
+    fn with_commit_group<R>(&self, target_id: u64, batch: MemBatch<'_>, f: impl FnOnce(SalGroup<'_>, bool) -> R) -> R {
         let cat = self.cat();
         let (rel, record) = cat
             .wire_target(target_id)
@@ -233,7 +234,7 @@ impl MasterDispatcher {
         &self,
         scope: &mut SalScope,
         target_id: u64,
-        batch: &Batch,
+        batch: MemBatch<'_>,
     ) -> Result<(AckLease, bool), WireFault> {
         self.with_commit_group(target_id, batch, |g, recoverable| {
             let lease = self.reactor.lease_acks(g.targets.set);
@@ -252,7 +253,7 @@ impl MasterDispatcher {
     pub(crate) fn commit_fits_empty_log<'b>(
         &self,
         scope: &SalScope,
-        families: impl IntoIterator<Item = (u64, &'b Batch)>,
+        families: impl IntoIterator<Item = (u64, MemBatch<'b>)>,
     ) -> bool {
         let bytes = (families.into_iter())
             .map(|(target_id, batch)| self.with_commit_group(target_id, batch, |g, _| scope.footprint(&g)))

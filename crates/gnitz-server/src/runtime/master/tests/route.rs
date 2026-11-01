@@ -7,6 +7,7 @@ use crate::test_support::{
 };
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_wire::{peek_control_block, KeyRange, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode};
+use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::encode_schema_block;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use std::num::NonZeroU64;
@@ -15,7 +16,7 @@ use std::num::NonZeroU64;
 /// `placement`, handing `inspect` the layout the scatter picked.
 fn push(log: &SalWriter, batch: &Batch, placement: Placement, inspect: impl FnOnce(&GroupData)) {
     let record = encode_schema_block(batch.schema());
-    with_routed(batch, placement, log.num_workers(), |data| {
+    with_routed(batch.as_mem_batch(), placement, log.num_workers(), |data| {
         inspect(&data);
         log.excl().write(&SalGroup::push(16, &record, data, holders_of(&data)))
     })

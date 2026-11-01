@@ -7,6 +7,7 @@ use super::*;
 use crate::runtime::test_support::try_poll_once;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64};
 use gnitz_wire::WireConflictMode;
+use gnitz_zset::repr::MemBatch;
 
 fn batch_of(rows: usize) -> Batch {
     make_batch_raw(&make_schema_u64_i64(), &vec![(0, 1, 0); rows])
@@ -26,7 +27,7 @@ fn write_of(family_rows: &[usize]) -> CommitRequest {
             .map(|(i, &rows)| TxnFamily {
                 tid: i as u64 + 1,
                 mode: WireConflictMode::Update,
-                batch: batch_of(rows),
+                rows: FamilyRows::Built(batch_of(rows)),
             })
             .collect(),
         done,
@@ -141,7 +142,7 @@ fn a_merged_run_splits_back_into_its_writes() {
             families: vec![TxnFamily {
                 tid: 7,
                 mode: WireConflictMode::Update,
-                batch: Batch::concat(&schema, parts.iter().map(Batch::as_mem_batch)),
+                rows: FamilyRows::Built(Batch::concat(&schema, parts.iter().map(Batch::as_mem_batch))),
             }],
             in_zone: false,
         },
@@ -149,7 +150,7 @@ fn a_merged_run_splits_back_into_its_writes() {
     };
     let writes = unit.into_writes();
     assert_eq!(writes.len(), parts.len());
-    let rows = |b: &Batch| {
+    let rows = |b: MemBatch<'_>| {
         (0..b.len())
             .map(|r| (b.get_pk_bytes(r).to_vec(), b.get_weight(r)))
             .collect::<Vec<_>>()
@@ -158,7 +159,11 @@ fn a_merged_run_splits_back_into_its_writes() {
         let [f] = &w.families[..] else {
             panic!("write {i} is one family")
         };
-        assert_eq!((f.tid, rows(&f.batch)), (7, rows(part)), "write {i}");
+        assert_eq!(
+            (f.tid, rows(f.rows.view())),
+            (7, rows(part.as_mem_batch())),
+            "write {i}"
+        );
         w.done.send(Ok(i as u64));
     }
     for (i, rx) in rxs.iter_mut().enumerate() {

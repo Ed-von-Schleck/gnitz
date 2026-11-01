@@ -60,7 +60,7 @@ async fn hold_ddl_for_checkpoint(shared: &Shared) {
     park_until(shared, DDL_HOLD_MAX_POLLS, "ddl hold", || shared.committer.has_queued()).await
 }
 
-/// Decode one `DDL_TXN` item's block under its family's own schema.
+/// Decode one `DDL_TXN` item's block, in `frame`, under its family's own schema.
 fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, Batch), String> {
     let tid = ctrl.hdr.target_id;
     let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
@@ -75,10 +75,10 @@ fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, B
 /// [`decode_sys_family`]. One slot per family: every list derived from a bundle
 /// reads one block of each.
 pub(super) fn decode_bundle(body: &[u8]) -> Result<DdlBundle, WireFault> {
-    let items = gnitz_wire::txn_frame::decode_items(body, ClientVerb::DdlTxn).map_err(decode_fault)?;
+    let items = gnitz_wire::txn_frame::decode_items(body, 0..body.len(), ClientVerb::DdlTxn).map_err(decode_fault)?;
     let mut families = DdlBundle::default();
-    for (frame, ctrl) in items {
-        decode_sys_family(frame, ctrl)
+    for ctrl in items {
+        decode_sys_family(body, ctrl)
             .and_then(|(family, batch)| families.insert(family, batch))
             .map_err(|e| format!("DDL_TXN: {e}"))?;
     }

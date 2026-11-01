@@ -31,6 +31,7 @@ use crate::{
 };
 use std::fmt;
 use std::num::NonZeroU64;
+use std::ops::Range;
 
 /// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
 /// one reply train of bookkeeping per relation; a handful of related tables
@@ -111,10 +112,10 @@ pub(crate) const fn item_shape(verb: ClientVerb) -> Option<ItemShape> {
     Some(ItemShape { blob, schema, data, cap })
 }
 
-/// Split a multi-item `verb` frame's body into its items, in send order: each
-/// item's own frame bytes and its peeked control. An item's `body` is the empty
-/// range at its end.
-pub fn decode_items(body: &[u8], verb: ClientVerb) -> Result<Vec<(&[u8], DecodedControl)>, String> {
+/// Split the item list at `body` of the multi-item `verb` frame `frame` into
+/// its items, in send order: each item's peeked control, its ranges indexing
+/// `frame`. An item's `body` is the empty range at its end.
+pub fn decode_items(frame: &[u8], body: Range<usize>, verb: ClientVerb) -> Result<Vec<DecodedControl>, String> {
     let Some(ItemShape { blob, schema, data, cap }) = item_shape(verb) else {
         return Err(format!("{verb:?} is not a multi-item verb"));
     };
@@ -144,17 +145,17 @@ pub fn decode_items(body: &[u8], verb: ClientVerb) -> Result<Vec<(&[u8], Decoded
     if body.is_empty() {
         return Err(format!("{verb:?}: empty item list"));
     }
-    let mut rest = body;
+    let mut at = body.start;
     let mut out = Vec::new();
-    while !rest.is_empty() {
+    while at < body.end {
         if out.len() == cap {
             return Err(format!("{verb:?}: too many items (max {cap})"));
         }
-        let mut ctrl = item(rest).map_err(|e| format!("{verb:?} item {}: {e}", out.len()))?;
-        let end = ctrl.body.start;
-        ctrl.body = end..end;
-        out.push((&rest[..end], ctrl));
-        rest = &rest[end..];
+        let mut ctrl =
+            (item(&frame[at..body.end]).map_err(|e| format!("{verb:?} item {}: {e}", out.len())))?.placed_at(at);
+        at = ctrl.body.start;
+        ctrl.body = at..at;
+        out.push(ctrl);
     }
     Ok(out)
 }
@@ -197,9 +198,9 @@ pub fn encode_scan_multi(out: &mut Vec<u8>, scans: &[ScanItem<'_>]) {
 
 /// Decode a `SCAN_MULTI` frame body into its items, in request order.
 pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<ScanItem<'_>>, String> {
-    Ok(decode_items(body, ClientVerb::ScanMulti)?
+    Ok(decode_items(body, 0..body.len(), ClientVerb::ScanMulti)?
         .into_iter()
-        .map(|(item, c)| ScanItem::of(item, &c))
+        .map(|c| ScanItem::of(body, &c))
         .collect())
 }
 
@@ -343,13 +344,13 @@ pub fn decode_held(blob: &[u8]) -> Result<Vec<SubId>, String> {
 /// Decode the items of a `DELTA_POLL` frame. View id `0` is refused: it is the
 /// id of a fault ending the request.
 pub fn decode_delta_items(body: &[u8]) -> Result<Vec<DeltaPollItem<'_>>, String> {
-    decode_items(body, ClientVerb::DeltaPoll)?
+    decode_items(body, 0..body.len(), ClientVerb::DeltaPoll)?
         .into_iter()
-        .map(|(item, c)| {
+        .map(|c| {
             if c.hdr.target_id == 0 {
                 return Err("DeltaPoll: view id 0 names no view".to_string());
             }
-            let blob = &item[c.blob];
+            let blob = &body[c.blob];
             let mut r = Reader::new(blob);
             let from = DeltaCursor::read_opt(&mut r)
                 .map_err(|_| format!("DeltaPoll: view {} carries no cursor", c.hdr.target_id))?;

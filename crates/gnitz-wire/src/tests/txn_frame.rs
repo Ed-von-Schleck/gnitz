@@ -1,6 +1,11 @@
 use super::*;
 use crate::{WireConflictMode, WireLane, WireStatus, CTRL_HEADER_SIZE};
 
+/// [`decode_items`] of a whole item list.
+fn items(body: &[u8], verb: ClientVerb) -> Result<Vec<DecodedControl>, String> {
+    decode_items(body, 0..body.len(), verb)
+}
+
 /// The frame `encode` appends to an empty buffer.
 fn encoded(encode: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     let mut out = Vec::new();
@@ -106,9 +111,11 @@ fn txn_frames_roundtrip_every_item_in_order() {
         ),
     ] {
         let frame = encoded(|out| encode_items(out, verb, &items));
-        let got = peeked(&frame, |b| decode_items(b, verb)).unwrap();
+        let ctrl = peek_control_block(&frame).unwrap();
+        let got = decode_items(&frame, ctrl.body.clone(), verb).unwrap();
         assert_eq!(got.len(), items.len());
-        for ((bytes, c), it) in got.iter().zip(&items) {
+        let mut at = ctrl.body.start;
+        for (c, it) in got.iter().zip(&items) {
             let flags = WireFlags {
                 verb,
                 conflict_mode: it.conflict_mode,
@@ -121,10 +128,13 @@ fn txn_frames_roundtrip_every_item_in_order() {
                     ..ControlHeader::naming(verb, it.target, it.basis)
                 }
             );
-            assert_eq!(c.schema.clone().map(|s| &bytes[s]), it.schema);
-            assert_eq!(&bytes[c.data.clone().unwrap()], &d[..]);
-            assert_eq!(c.body, bytes.len()..bytes.len());
+            assert_eq!(c.blob.start, at + CTRL_HEADER_SIZE, "each item follows the one before");
+            assert_eq!(c.schema.clone().map(|s| &frame[s]), it.schema);
+            assert_eq!(&frame[c.data.clone().unwrap()], &d[..]);
+            assert!(c.body.is_empty());
+            at = c.body.end;
         }
+        assert_eq!(at, frame.len());
     }
 }
 
@@ -344,13 +354,13 @@ fn decode_items_enforces_each_verbs_item_rules() {
         let ItemShape { blob, schema, data, cap } = item_shape(verb).unwrap();
         let hdr = ControlHeader::naming(verb, 7.into(), 0);
         let refused = |body: &[u8], want: &str| {
-            let err = decode_items(body, verb).expect_err(want);
+            let err = items(body, verb).expect_err(want);
             assert!(err.contains(want), "{verb:?}: {err:?} does not name {want:?}");
         };
         let one = one_item(hdr, b"", schema, data);
 
         let n = cap.min(3);
-        assert_eq!(decode_items(&one.repeat(n), verb).unwrap().len(), n, "{verb:?}");
+        assert_eq!(items(&one.repeat(n), verb).unwrap().len(), n, "{verb:?}");
         if cap != usize::MAX {
             refused(&one.repeat(cap + 1), "too many items");
         }
@@ -358,12 +368,12 @@ fn decode_items_enforces_each_verbs_item_rules() {
 
         let two = one.repeat(2);
         for cut in (1..two.len()).filter(|&c| c != one.len()) {
-            assert!(decode_items(&two[..cut], verb).is_err(), "{verb:?} cut at {cut}");
+            assert!(items(&two[..cut], verb).is_err(), "{verb:?} cut at {cut}");
         }
 
         for (s, d) in [(false, false), (true, false), (false, true), (true, true)] {
             if (s, d) != (schema, data) {
-                let err = decode_items(&one_item(hdr, b"", s, d), verb).unwrap_err();
+                let err = items(&one_item(hdr, b"", s, d), verb).unwrap_err();
                 assert!(
                     err.contains("schema record") || err.contains("data block"),
                     "{verb:?}: {err}"
@@ -396,18 +406,15 @@ fn decode_items_enforces_each_verbs_item_rules() {
             ..hdr
         };
         match verb {
-            ClientVerb::PushTxn => assert!(decode_items(&one_item(error_mode, b"", schema, data), verb).is_ok()),
+            ClientVerb::PushTxn => assert!(items(&one_item(error_mode, b"", schema, data), verb).is_ok()),
             _ => refused(&one_item(error_mode, b"", schema, data), "conflict mode"),
         }
         match blob {
-            true => assert_eq!(
-                decode_items(&one_item(hdr, b"blob", schema, data), verb).unwrap().len(),
-                1
-            ),
+            true => assert_eq!(items(&one_item(hdr, b"blob", schema, data), verb).unwrap().len(), 1),
             false => refused(&one_item(hdr, b"blob", schema, data), "blob"),
         }
     }
-    let err = decode_items(
+    let err = items(
         &one_item(ControlHeader::default(), b"", false, false),
         ClientVerb::ScanSpec,
     )

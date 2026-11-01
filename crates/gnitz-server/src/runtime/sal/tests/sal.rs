@@ -1004,7 +1004,7 @@ fn every_frame_shape_round_trips_and_no_prefix_decodes() {
         (
             Some(&padded_rel),
             WireMsg {
-                data: padded.wire_listed(&[6, 1, 3]),
+                data: padded.as_mem_batch().wire_listed(&[6, 1, 3]),
                 ..Default::default()
             },
             Some((&padded, vec![6, 1, 3])),

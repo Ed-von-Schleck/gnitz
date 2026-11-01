@@ -187,7 +187,11 @@ fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
     for b in wire_batches() {
         let whole = b.wire_whole().unwrap().byte_size();
         let mut buf = vec![0u8; 2 * whole];
-        let size = |rows: &[u32]| b.encode_listed(rows, 0, &mut vec![0; 2 * whole], true).unwrap();
+        let size = |rows: &[u32]| {
+            b.as_mem_batch()
+                .encode_listed(rows, 0, &mut vec![0; 2 * whole], true)
+                .unwrap()
+        };
         assert!(b.wire_rows_within(b.len(), usize::MAX).is_none());
         assert!(Batch::empty_with_schema(b.schema()).wire_whole().is_none());
         let read_back = |block: &[u8]| weighted_rows(&Batch::decode_foreign_wal_block(block, b.schema()).unwrap());
@@ -208,13 +212,13 @@ fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
             let all = run(rest);
             for cap in [size(&run(1)) - 1, size(&run(2.min(rest))), size(&run(2.min(rest))) + 1] {
                 let mut out = vec![0u8; cap];
-                let got = b.encode_scattered_prefix(&all, &mut out);
+                let got = b.as_mem_batch().encode_scattered_prefix(&all, &mut out);
                 let want = longest(cap).map(|k| (k, size(&run(k))));
                 assert_eq!(got, want, "start {start} cap {cap}");
                 if let Some((k, n)) = got {
                     assert_eq!(read_back(&out[..n]), weighted_rows(&b)[start..start + k]);
                     let mut short = vec![0u8; n - 1];
-                    assert!(b.encode_listed(&run(k), 0, &mut short, true).is_none());
+                    assert!(b.as_mem_batch().encode_listed(&run(k), 0, &mut short, true).is_none());
                 }
             }
         }
@@ -228,7 +232,7 @@ fn row_runs_and_scattered_prefixes_take_the_longest_run_that_fits() {
 fn a_listed_pick_sizes_and_encodes_its_rows_in_list_order() {
     for b in wire_batches().into_iter().filter(|b| b.len() >= 20) {
         for list in [&[0u32, 3, 7, 19][..], &[19, 3, 0], &[5]] {
-            let rows = b.wire_listed(list).unwrap();
+            let rows = b.as_mem_batch().wire_listed(list).unwrap();
             assert_eq!(rows.rows(), list.len());
             let mut buf = vec![0u8; rows.byte_size()];
             assert_eq!(
@@ -242,10 +246,10 @@ fn a_listed_pick_sizes_and_encodes_its_rows_in_list_order() {
             assert_eq!(weighted_rows(&decoded), want, "{list:?}");
             assert_eq!(decoded.dead_heap(), 0, "{list:?}: every heap byte is referenced");
         }
-        assert!(b.wire_listed(&[]).is_none());
+        assert!(b.as_mem_batch().wire_listed(&[]).is_none());
     }
     let shared = shared_span();
-    let three = shared.wire_listed(&[0, 1, 2]).unwrap();
+    let three = shared.as_mem_batch().wire_listed(&[0, 1, 2]).unwrap();
     assert_eq!(
         three.byte_size(),
         wal::WAL_HEADER_SIZE + 3 * shared.schema().row_width() + 200,

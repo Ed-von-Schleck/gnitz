@@ -58,7 +58,11 @@ fn assert_routes(plan: &ScatterPlan, b: &Batch, what: &str, owner: impl Fn(&MemB
         }
         // A pool left over from a wider round.
         let mut pool = vec![vec![7u32]; nw + 1];
-        assert_eq!(plan.route(b, &mut pool, nw), &want[..], "{what}, {nw} workers");
+        assert_eq!(
+            plan.route(&b.as_mem_batch(), &mut pool, nw),
+            &want[..],
+            "{what}, {nw} workers"
+        );
         for rank in 0..nw {
             assert_eq!(
                 weighted_rows(&plan.share(b, Slot::new(rank as u32, nw as u32))),

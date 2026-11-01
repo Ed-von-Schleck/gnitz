@@ -43,7 +43,7 @@ impl FkPresence {
     /// decides, as it does in the store. A retraction always evicts; only a
     /// small write's inserts are recorded, so a bulk load of the table costs
     /// nothing here.
-    pub(super) fn apply(&mut self, batch: &Batch) {
+    pub(super) fn apply(&mut self, batch: &MemBatch<'_>) {
         let records = batch.len() <= FILL_MAX_ROWS;
         if !records && batch.all_weights_positive() {
             return;
