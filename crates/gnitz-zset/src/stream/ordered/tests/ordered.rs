@@ -8,14 +8,15 @@ use std::ops::Range;
 
 use proptest::prelude::*;
 
-use super::{OrderedEpoch, OrderedPlan};
+use super::{OrderIndex, OrderedEpoch, OrderedPlan};
+use crate::algebra::copy_columns;
 use crate::repr::{Batch, BatchBuilder};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::stream_input::{batch, schema, Cells, Row};
-use crate::test_support::{cell, TestTrace};
+use crate::test_support::{cell, mix, TestTrace};
 use gnitz_expr::{cmp_order_keys, order_locators, OrderLocator, ReduceOutSlot};
 use gnitz_foundation::perf::Counter;
-use gnitz_wire::OrderKey;
+use gnitz_wire::{OrderKey, TypeCode};
 
 /// One to three order keys, over any column of [`schema`].
 pub(super) fn arb_keys() -> impl Strategy<Value = Vec<OrderKey>> {
@@ -174,4 +175,106 @@ fn a_shape_the_order_index_cannot_hold_is_refused() {
     assert!(err(OrderedPlan::top_n(&s, &[], &[], 1, 0)).contains("no order keys"));
     let oob = [OrderKey { col: 9, desc: false, nulls_first: false }];
     assert!(err(OrderedPlan::top_n(&s, &[], &oob, 1, 0)).contains("order column"));
+}
+
+/// [`OrderIndex::entries`] a row at a time: each row's lead and every other
+/// key's image built through the row accessors and string-encoded one by one.
+fn entries_by_row(index: &OrderIndex, delta: &Batch) -> Batch {
+    let mb = delta.as_mem_batch();
+    let n = delta.len();
+    let mut out = Batch::with_capacity(&index.schema, n);
+    let heap_at = match index.moves.string_slots() {
+        0 => None,
+        strings => out.carry_heap(&mb, strings, &[(0, n)], 0),
+    };
+    let (stride, group) = (index.schema.pk_stride(), index.key_packer.out_stride);
+    let mut image = Vec::new();
+    out.write_rows(n, |w| {
+        index.key_packer.pack_rows(w.pk_mut(), stride, &mb, &[(0, n)]);
+        let (keys, cells, blob) = w.pk_and_payload_mut(0..index.images.len());
+        let mut cells: Vec<_> = cells.collect();
+        for (row, key) in keys.chunks_exact_mut(stride).enumerate() {
+            let mut cells = cells.iter_mut().map(|col| &mut col[row * 16..][..16]);
+            let mut put = |image: &[u8]| {
+                let cell = cells.next().expect("a cell per image column");
+                cell.copy_from_slice(&gnitz_wire::encode_german_string(image, blob));
+            };
+            image.clear();
+            index.lead.write_lead(&mb, row, &mut key[group..], &mut image);
+            if !index.lead.image.fits_slot() {
+                put(&image);
+            }
+            for spec in &index.rest {
+                image.clear();
+                spec.append_image(&mb, row, &mut image);
+                put(&image);
+            }
+        }
+        w.weight_mut().copy_from_slice(delta.weight());
+        index.moves.write_null_rows(mb.null_bmp(), 0, w.null_bmp_mut(), 0, n);
+        copy_columns(delta, w, index.moves.copies(), n, heap_at);
+    });
+    out
+}
+
+/// The entries are byte for byte the row-at-a-time entries, every region and
+/// the heap, for a key of every image kind, nullable or not, ascending or
+/// descending, NULLs first or last, leading the index PK or behind another key,
+/// grouped or not.
+#[test]
+fn entries_are_the_row_at_a_time_entries() {
+    use gnitz_wire::TypeCode::*;
+    const TYPES: [TypeCode; 10] = [U8, I16, I32, I64, U32, U64, F32, F64, U128, String];
+    const STRINGS: [&str; 5] = ["", "a", "abcdefghijkl", "a\0b", "a string past the inline threshold"];
+    let mut cols = vec![SchemaColumn::new(U64, false)];
+    for tc in TYPES {
+        for nullable in [false, true] {
+            cols.push(SchemaColumn::new(tc, nullable));
+        }
+    }
+    let s = SchemaDescriptor::new(&cols, &[0]);
+    let mut b = BatchBuilder::new(&s);
+    for i in 0..300u64 {
+        b.begin_row_natives(&[mix(i) as u128], 1 + (i % 3) as i64);
+        for (c, col) in cols.iter().enumerate().skip(1) {
+            let v = mix(i * 31 + c as u64);
+            // Few distinct values, so keys tie and the later keys decide.
+            let v = if i % 4 == 0 { v % 3 } else { v };
+            if col.nullable && v % 3 == 0 {
+                b.put_null();
+            } else if col.type_code == String {
+                b.put_string(STRINGS[(v % STRINGS.len() as u64) as usize]);
+            } else {
+                let bits = (v as u128) << 64 | mix(v) as u128;
+                b.put_int(bits & (u128::MAX >> (128 - 8 * col.size())));
+            }
+        }
+        b.end_row();
+    }
+    let delta = b.finish();
+    let n = cols.len() as u16;
+    for c in 0..n {
+        for (desc, nulls_first) in [(false, false), (false, true), (true, false), (true, true)] {
+            let key = |col: u16| OrderKey { col, desc, nulls_first };
+            for keys in [
+                vec![key(c)],
+                vec![key((c + 1) % n), key(c)],
+                vec![key(c), key((c ^ 1) % n), key(n - 1)],
+            ] {
+                // No group, an I64 one, a nullable I64 one.
+                for group in [&[][..], &[7], &[8]] {
+                    let plan = OrderedPlan::top_n(&s, group, &keys, 1, 0).unwrap();
+                    let (got, want) = (plan.index.entries(&delta), entries_by_row(&plan.index, &delta));
+                    let at = format!("keys {keys:?}, group {group:?}");
+                    assert_eq!(got.pk(), want.pk(), "{at}: PK");
+                    assert_eq!(got.weight(), want.weight(), "{at}: weights");
+                    assert_eq!(got.null_bmp(), want.null_bmp(), "{at}: null words");
+                    for pi in 0..plan.index.schema.num_payload_cols() {
+                        assert_eq!(got.col_data(pi), want.col_data(pi), "{at}: payload {pi}");
+                    }
+                    assert_eq!(got.blob(), want.blob(), "{at}: heap");
+                }
+            }
+        }
+    }
 }

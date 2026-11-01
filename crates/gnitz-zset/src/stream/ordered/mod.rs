@@ -94,6 +94,54 @@ impl OrderSpec {
         }
     }
 
+    /// Over `keys`, whose `n`-th `stride`-byte key holds the `n`-th row's
+    /// scalar image at `at + 1` as if the row were non-NULL: each row's rank
+    /// byte at `at`, and a NULL row's image zeroed, as [`Self::write_lead`]
+    /// leaves it. `stamp` then gets each key and whether its row is NULL. A
+    /// key without a rank byte is left as it is.
+    #[inline]
+    fn stamp_ranks(
+        &self,
+        mb: &MemBatch<'_>,
+        keys: &mut [u8],
+        stride: usize,
+        at: usize,
+        mut stamp: impl FnMut(&mut [u8], bool),
+    ) {
+        if !self.nullable {
+            return;
+        }
+        let bit = self.image.loc.null_bit();
+        let words = mb.null_bmp().as_chunks::<8>().0;
+        for (key, word) in keys.chunks_exact_mut(stride).zip(words) {
+            let is_null = u64::from_le_bytes(*word) & bit != 0;
+            key[at] = self.rank(is_null);
+            if is_null {
+                key[at + 1..at + 9].fill(0);
+            }
+            stamp(key, is_null);
+        }
+    }
+
+    /// Every row's image of a scalar key into `cells`, one 16-byte inline
+    /// string cell per row, as `encode_german_string` writes the rank byte and
+    /// image [`Self::append_image`] appends: at most 9 bytes, so always inline.
+    fn write_inline_images(&self, mb: &MemBatch<'_>, cells: &mut [u8]) {
+        const OFF: usize = gnitz_wire::GERMAN_INLINE_OFF;
+        cells.fill(0);
+        let scalar = (self.image).write_slots(mb, &[(0, cells.len() / 16)], cells, 16, OFF + self.nullable as usize, 8);
+        debug_assert!(scalar, "a wide image is written a row at a time");
+        let len = (8 + self.nullable as u32).to_le_bytes();
+        cells
+            .chunks_exact_mut(16)
+            .for_each(|cell| cell[..4].copy_from_slice(&len));
+        self.stamp_ranks(mb, cells, 16, OFF, |cell, is_null| {
+            if is_null {
+                cell[..4].copy_from_slice(&1u32.to_le_bytes());
+            }
+        });
+    }
+
     /// The PK columns holding the image's lead: the rank byte of a nullable
     /// key, then the image slot.
     fn lead_cols(&self) -> impl Iterator<Item = SchemaColumn> {
@@ -472,21 +520,38 @@ impl OrderIndex {
             self.key_packer.pack_rows(w.pk_mut(), stride, &mb, &[(0, n)]);
             let (keys, cells, blob) = w.pk_and_payload_mut(0..self.images.len());
             let mut cells: Vec<_> = cells.collect();
-            for (row, key) in keys.chunks_exact_mut(stride).enumerate() {
-                let mut cells = cells.iter_mut().map(|col| &mut col[row * 16..][..16]);
-                let mut put = |image: &[u8]| {
-                    let cell = cells.next().expect("a cell per image column");
-                    cell.copy_from_slice(&gnitz_wire::encode_german_string(image, blob));
-                };
-                image.clear();
-                self.lead.write_lead(&mb, row, &mut key[group..], &mut image);
-                if !self.lead.image.fits_slot() {
-                    put(&image);
+            // The image columns: a string lead's whole image, then the rest's.
+            let (whole, rest) = cells.split_at_mut(usize::from(!self.lead.image.fits_slot()));
+            // A scalar image is written a column at a time; a wide one takes the
+            // row loop below, which appends any heap image in row order.
+            let lead = &self.lead;
+            let lead_wide = lead.image.is_wide();
+            if !lead_wide {
+                lead.image
+                    .write_slots(&mb, &[(0, n)], keys, stride, group + lead.nullable as usize, 8);
+                lead.stamp_ranks(&mb, keys, stride, group, |_, _| {});
+            }
+            for (spec, col) in self.rest.iter().zip(rest.iter_mut()) {
+                if !spec.image.is_wide() {
+                    spec.write_inline_images(&mb, col);
                 }
-                for spec in &self.rest {
-                    image.clear();
-                    spec.append_image(&mb, row, &mut image);
-                    put(&image);
+            }
+            if lead_wide || self.rest.iter().any(|spec| spec.image.is_wide()) {
+                for (row, key) in keys.chunks_exact_mut(stride).enumerate() {
+                    if lead_wide {
+                        image.clear();
+                        lead.write_lead(&mb, row, &mut key[group..], &mut image);
+                        if let Some(whole) = whole.first_mut() {
+                            whole[row * 16..][..16].copy_from_slice(&gnitz_wire::encode_german_string(&image, blob));
+                        }
+                    }
+                    for (spec, col) in self.rest.iter().zip(rest.iter_mut()) {
+                        if spec.image.is_wide() {
+                            image.clear();
+                            spec.append_image(&mb, row, &mut image);
+                            col[row * 16..][..16].copy_from_slice(&gnitz_wire::encode_german_string(&image, blob));
+                        }
+                    }
                 }
             }
             w.weight_mut().copy_from_slice(delta.weight());
