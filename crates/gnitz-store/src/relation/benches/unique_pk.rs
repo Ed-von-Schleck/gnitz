@@ -9,11 +9,13 @@ use super::enforce_unique_pk;
 use crate::relation::{RelationKind, StoreConfig};
 use crate::storage::DEFAULT_RAM_TIER_BYTES;
 use crate::test_support::{
-    make_schema_pk_u64_payload_string, make_schema_u64_i64, mix, relation_fixture_with, table_shards, TID,
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, mix, relation_fixture_with, table_shards, u64_pk_schema,
+    TID,
 };
+use gnitz_wire::TypeCode;
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 /// Rows each cell pushes, into a store holding keys `0..ROWS`.
 const ROWS: u64 = 200_000;
@@ -32,8 +34,16 @@ fn scatter(seq: u64) -> u64 {
     mix(seq) >> 24
 }
 
-/// `per`-row pushes of `row(seq)` over `0..ROWS`; a string payload is spelled
-/// out long enough to live on the heap.
+/// U64 pk + eight payload columns of mixed widths, one of them a STRING.
+fn wide_schema() -> SchemaDescriptor {
+    use TypeCode as T;
+    let cols = [T::I64, T::I32, T::I64, T::String, T::I64, T::I16, T::U64, T::I64].map(|t| SchemaColumn::new(t, false));
+    u64_pk_schema(&cols)
+}
+
+/// `per`-row pushes of `row(seq)` over `0..ROWS`, every payload column carrying
+/// the row's value; a string payload is spelled out long enough to live on the
+/// heap.
 fn pushes(schema: &SchemaDescriptor, per: u64, row: Row) -> Vec<Batch> {
     (0..ROWS)
         .step_by(per as usize)
@@ -41,9 +51,13 @@ fn pushes(schema: &SchemaDescriptor, per: u64, row: Row) -> Vec<Batch> {
             let mut bb = BatchBuilder::new(schema);
             for (pk, w, v) in (from..from + per).map(row) {
                 bb.begin_row(pk as u128, w);
-                match schema.string_payload_slots() {
-                    0 => bb.put_int(v as u128),
-                    _ => bb.put_string(&format!("a payload that lives on the heap #{v:>10}")),
+                for (_, col) in schema.payload_columns() {
+                    match col.type_code {
+                        TypeCode::String => bb.put_string(&format!("a payload that lives on the heap #{v:>10}")),
+                        TypeCode::I16 => bb.put_int((v & 0x7fff) as u128),
+                        TypeCode::I32 => bb.put_int((v & 0x7fff_ffff) as u128),
+                        _ => bb.put_int(v as u128),
+                    }
                 }
                 bb.end_row();
             }
@@ -60,9 +74,10 @@ fn unique_pk_bench() {
 
     let ints = make_schema_u64_i64();
     let strings = make_schema_pk_u64_payload_string();
+    let wide = wide_schema();
     const RAM: usize = DEFAULT_RAM_TIER_BYTES;
     // Label, schema, RAM tier, the row of a push, effective rows per row pushed alone.
-    let arms: [(&str, SchemaDescriptor, usize, Row, u64); 11] = [
+    let arms: [(&str, SchemaDescriptor, usize, Row, u64); 13] = [
         ("fresh, ascending", ints, RAM, |s| (FRESH + s, 1, s), 1),
         ("fresh, scattered", ints, RAM, |s| (FRESH + scatter(s), 1, s), 1),
         (
@@ -75,6 +90,14 @@ fn unique_pk_bench() {
         ("update", ints, RAM, |s| (scatter(s) % ROWS, 1, s + 1), 2),
         ("update, shards", ints, SPILL_TIER, |s| (scatter(s) % ROWS, 1, s + 1), 2),
         ("update, strings", strings, RAM, |s| (scatter(s) % ROWS, 1, s + 1), 2),
+        ("update, wide", wide, RAM, |s| (scatter(s) % ROWS, 1, s + 1), 2),
+        (
+            "update, wide, shards",
+            wide,
+            SPILL_TIER,
+            |s| (scatter(s) % ROWS, 1, s + 1),
+            2,
+        ),
         // The held keys in order: a memtable run covers one stretch of them.
         ("update, ascending", ints, RAM, |s| (s, 1, 1), 2),
         // 64 keys: the memtable never drains, and a 1000-row push repeats each.

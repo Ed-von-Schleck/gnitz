@@ -393,6 +393,20 @@ impl Batch {
         &mut self.data[off..off + stride]
     }
 
+    /// Write `src` into the open row's cell of region `r`. The common widths copy
+    /// at a constant width, a load and a store; any other is a runtime-length copy.
+    #[inline(always)]
+    fn put_row_cell(&mut self, r: usize, src: &[u8]) {
+        let dst = self.row_cell_mut(r, src.len());
+        if let (Ok(d), Ok(s)) = (<&mut [u8; 8]>::try_from(&mut *dst), <&[u8; 8]>::try_from(src)) {
+            *d = *s;
+        } else if let (Ok(d), Ok(s)) = (<&mut [u8; 16]>::try_from(&mut *dst), <&[u8; 16]>::try_from(src)) {
+            *d = *s;
+        } else {
+            dst.copy_from_slice(src);
+        }
+    }
+
     /// Write `d`, one cell, into payload column `pi` of the open row.
     #[inline(always)]
     pub(crate) fn extend_col(&mut self, pi: usize, d: &[u8]) {
@@ -402,7 +416,7 @@ impl Batch {
             self.schema.region_stride(r),
             "extend_col: a cell of another width"
         );
-        self.row_cell_mut(r, d.len()).copy_from_slice(d);
+        self.put_row_cell(r, d);
     }
 
     /// [`Self::extend_col`] for a STRING/BLOB column: `content` is encoded into
@@ -442,7 +456,7 @@ impl Batch {
         if self.count == self.capacity {
             self.reserve_rows(1);
         }
-        self.row_cell_mut(REG_PK, pk_bytes.len()).copy_from_slice(pk_bytes);
+        self.put_row_cell(REG_PK, pk_bytes);
         self.row_cell_mut(REG_WEIGHT, FIXED_REGION_BYTES)
             .copy_from_slice(&weight.to_le_bytes());
         self.row_cell_mut(REG_NULL_BMP, FIXED_REGION_BYTES)
