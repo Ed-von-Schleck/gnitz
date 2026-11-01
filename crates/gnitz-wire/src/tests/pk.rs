@@ -274,29 +274,20 @@ fn pk_keys_single_key_checks_its_width() {
     PkKeys::from_keys(8, [&[0u8; 4][..]]);
 }
 
-/// `from_vec` keeps ascending input in place — a list past the inline capacity
-/// in its own buffer, adjacent duplicates dropped — and sorts and dedups
-/// anything else.
+/// `from_ascending` drops a repeated key and keeps the rest as they come, past
+/// the inline capacity too.
 #[test]
-fn pk_keys_from_vec_sorts_only_when_needed() {
+fn pk_keys_from_ascending_drops_repeats() {
     let long = u64_keys(0..11);
     assert!(long.len() > MAX_PK_BYTES);
-    let ptr = long.as_ptr();
-    assert_eq!(PkKeys::from_vec(8, long).as_bytes().as_ptr(), ptr);
+    assert_eq!(PkKeys::from_ascending(8, &long).as_bytes(), long);
 
-    let repeats = u64_keys((0..40).map(|k| k / 2));
-    let ptr = repeats.as_ptr();
-    let k = PkKeys::from_vec(8, repeats);
-    assert_eq!(k.as_bytes().as_ptr(), ptr);
+    let k = PkKeys::from_ascending(8, &u64_keys((0..40).map(|k| k / 2)));
     assert_eq!(k.as_bytes(), u64_keys(0..20));
 
-    let k = PkKeys::from_vec(8, u64_keys([1, 5, 9]));
-    assert_eq!(k.as_bytes(), u64_keys([1, 5, 9]));
-    assert_eq!(PkKeys::from_vec(8, u64_keys([9, 1, 5])), k);
-    assert_eq!(PkKeys::from_vec(8, u64_keys([5, 9, 1, 9, 5])), k);
     assert_eq!(
-        PkKeys::from_vec(8, u64_keys([7, 7])),
+        PkKeys::from_ascending(8, &u64_keys([7, 7])),
         PkKeys::from_keys(8, [&u64_keys([7])[..]])
     );
-    assert!(PkKeys::from_vec(8, Vec::new()).is_empty());
+    assert!(PkKeys::from_ascending(8, &[]).is_empty());
 }

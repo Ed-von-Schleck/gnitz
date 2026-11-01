@@ -7,6 +7,7 @@ use gnitz_store::relation::{Cut, Relation, RelationRegistry};
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::{empty_cursor, from_runs, Batch, PkSetGather, ReadCursor, Run, StorageError};
 use gnitz_zset::{algebra, stream};
+use smallvec::SmallVec;
 
 /// The stores an epoch reads and writes: the view's own children, and the
 /// relations behind its plan's [`Integral::Relation`]s.
@@ -59,9 +60,11 @@ impl Stores<'_> {
         delta: &Batch,
         terms: &[HistoryTerm],
         instructions: &mut [Instr],
-    ) -> Result<Vec<Run>, String> {
-        let mut keys = PkKeys::from_vec(delta.schema().pk_stride(), delta.pk().to_vec());
-        let mut runs = Vec::with_capacity(terms.len());
+    ) -> Result<SmallVec<[Run; 2]>, String> {
+        // Consolidated, so its keys ascend, a key repeated only beside itself.
+        debug_assert!(delta.is_consolidated());
+        let mut keys = PkKeys::from_ascending(delta.schema().pk_stride(), delta.pk());
+        let mut runs = SmallVec::new();
         for term in terms {
             let mut gather = self.gather(Integral::Relation(term.relation), keys)?;
             let chunk = gather.drain_chunk(usize::MAX);

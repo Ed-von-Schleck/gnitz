@@ -265,24 +265,19 @@ impl PkKeys {
         Self::heap(stride, bytes)
     }
 
-    /// Keys of `stride` concatenated in any order, duplicates allowed: kept as
-    /// [`Self::from_sorted`] keeps them when they already ascend, adjacent
-    /// duplicates dropped in place, else sorted and deduped into a new list.
-    pub fn from_vec(stride: usize, mut bytes: Vec<u8>) -> Self {
+    /// Keys of `stride` concatenated in ascending order, adjacent repeats
+    /// dropped. A list of at most `MAX_PK_BYTES` never touches the heap.
+    pub fn from_ascending(stride: usize, bytes: &[u8]) -> Self {
         assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
         assert_eq!(bytes.len() % stride, 0, "PkKeys: key width");
-        if !bytes.chunks_exact(stride).is_sorted() {
-            return Self::from_keys(stride, bytes.chunks_exact(stride));
-        }
-        let mut kept = 0;
-        for at in (0..bytes.len()).step_by(stride) {
-            if kept == 0 || bytes[kept - stride..kept] != bytes[at..at + stride] {
-                bytes.copy_within(at..at + stride, kept);
-                kept += stride;
+        let mut out = PkBytes::with_capacity(bytes.len());
+        for key in bytes.chunks_exact(stride) {
+            if out.len() < stride || out[out.len() - stride..] != *key {
+                out.extend_from_slice(key);
             }
         }
-        bytes.truncate(kept);
-        Self::heap(stride, bytes)
+        debug_assert!(strictly_ascending(&out, stride), "PkKeys: keys do not ascend");
+        Self::new(stride, out)
     }
 
     /// [`Self::from_sorted`] for keys off the wire: `Err` where they do not
