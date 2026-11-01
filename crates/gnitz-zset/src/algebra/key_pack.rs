@@ -6,10 +6,12 @@
 //! scattered delta co-partition byte-for-byte.
 
 use std::cell::Cell;
+use std::mem::MaybeUninit;
 
 use gnitz_expr::{BatchView, ColumnLocator};
 use gnitz_wire::{zip_cells, RowSource, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS};
 
+use super::group_key::cell_image;
 use crate::repr::{range_rows, with_scratch};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 
@@ -85,28 +87,60 @@ fn push_col_key<R: RowSource>(buf: &mut Vec<u8>, src: &R, row: usize, null_word:
 }
 
 thread_local! {
-    /// `key_row`'s buffer for a fold its stack buffer cannot hold.
+    /// `key_row`'s buffer for a fold its stack buffer cannot hold, and
+    /// `keys_by_column`'s for a fold of the tagged layout.
     static FOLD_SCRATCH: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
 }
 
 /// Columns a fold assembles on the stack; a wider fold takes the scratch buffer.
 const FOLD_INLINE_COLS: usize = MAX_PK_COLUMNS;
 
-/// The columns one 128-bit row digest folds, and which of its two byte layouts
-/// the digest is taken over. Over no columns it is the digest of no bytes.
+/// The most key bytes one row of the inline layout assembles: the presence
+/// word, then a 16-byte image per column.
+const FOLD_INLINE_BYTES: usize = 8 + 16 * FOLD_INLINE_COLS;
+
+/// The most key bytes a fixed-width column adds to one row of the tagged
+/// layout: its presence byte, then its 16-byte image.
+const FOLD_TAGGED_COL_BYTES: usize = 1 + 16;
+
+/// The most rows one [`FoldCols::keys_chunk`] call digests.
+pub(crate) const FOLD_CHUNK: usize = 256;
+
+/// Fewest rows at which [`FoldCols::keys_chunk`] assembling them a column at a
+/// time costs less than digesting each with [`FoldCols::key_row`].
+pub(crate) const FOLD_CHUNK_MIN_ROWS: usize = 4;
+
+/// The byte layout a fold's digest is taken over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FoldLayout {
+    /// One to `FOLD_INLINE_COLS` fixed-width columns: a word of presence bits,
+    /// then each present column's 16-byte image.
+    Inline,
+    /// More fixed-width columns: per column a presence byte, then the image of a
+    /// present one.
+    Tagged,
+    /// A string column among them, or no column: the tagged layout with a
+    /// string's content behind its length; assembled a row at a time.
+    Rows,
+}
+
+/// The columns one 128-bit row digest folds, and which of its byte layouts the
+/// digest is taken over. Over no columns it is the digest of no bytes.
 #[derive(Clone)]
 pub(crate) struct FoldCols {
     locs: Vec<ColumnLocator>,
-    /// One to `FOLD_INLINE_COLS` columns, each fixed-width: the key bytes are
-    /// assembled on the stack.
-    inline: bool,
+    layout: FoldLayout,
 }
 
 impl FoldCols {
     pub(crate) fn new(locs: Vec<ColumnLocator>) -> Self {
-        let inline =
-            (1..=FOLD_INLINE_COLS).contains(&locs.len()) && !locs.iter().any(|l| l.type_code().is_german_string());
-        FoldCols { locs, inline }
+        let layout = match locs.len() {
+            _ if locs.iter().any(|l| l.type_code().is_german_string()) => FoldLayout::Rows,
+            0 => FoldLayout::Rows,
+            n if n <= FOLD_INLINE_COLS => FoldLayout::Inline,
+            _ => FoldLayout::Tagged,
+        };
+        FoldCols { locs, layout }
     }
 
     #[inline]
@@ -115,13 +149,13 @@ impl FoldCols {
     }
 
     /// The 128-bit XXH3 digest of these columns' key bytes over `row`.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn key_row<R: RowSource>(&self, src: &R, row: usize) -> u128 {
         let null_word = src.get_null_word(row);
-        if self.inline {
+        if self.layout == FoldLayout::Inline {
             // One word of presence bits, then each present column's image: every
             // 8-byte read XXH3 makes lies inside one store.
-            let mut buf = [0u8; 8 + 16 * FOLD_INLINE_COLS];
+            let mut buf = [0u8; FOLD_INLINE_BYTES];
             let (mut n, mut present) = (8usize, 0u64);
             for (i, &loc) in self.locs.iter().enumerate() {
                 if !loc.is_null_word(null_word) {
@@ -147,6 +181,163 @@ impl FoldCols {
             gnitz_wire::checksum_128(buf)
         })
     }
+
+    /// Call `f` with each chunk of the rows of `runs`, in order: its first row and
+    /// its rows' [`Self::key_row`], staged on the stack.
+    #[inline(always)]
+    pub(crate) fn for_each_chunk<B: BatchView>(
+        &self,
+        src: &B,
+        runs: &[(usize, usize)],
+        mut f: impl FnMut(usize, &[u128]),
+    ) {
+        let mut buf = [MaybeUninit::<u128>::uninit(); FOLD_CHUNK];
+        for &(s, e) in runs {
+            for start in (s..e).step_by(FOLD_CHUNK) {
+                let keys = filled(&mut buf[..(e - start).min(FOLD_CHUNK)], 0);
+                self.keys_chunk(src, start, keys);
+                f(start, keys);
+            }
+        }
+    }
+
+    /// [`Self::key_row`] of rows `start..start + out.len()` of `src` into `out`,
+    /// at most [`FOLD_CHUNK`] of them.
+    #[inline]
+    pub(crate) fn keys_chunk<B: BatchView>(&self, src: &B, start: usize, out: &mut [u128]) {
+        assert!(out.len() <= FOLD_CHUNK, "a fold chunk is at most {FOLD_CHUNK} rows");
+        if out.len() < FOLD_CHUNK_MIN_ROWS || self.layout == FoldLayout::Rows {
+            for (key, row) in out.iter_mut().zip(start..) {
+                *key = self.key_row(src, row);
+            }
+        } else {
+            self.keys_by_column(src, start, out);
+        }
+    }
+
+    /// [`Self::keys_chunk`] of a fixed-width fold: the rows' key bytes assembled
+    /// a column at a time, then each row digested. Out of line, so a chunk too
+    /// short for it keeps a small frame.
+    #[inline(never)]
+    fn keys_by_column<B: BatchView>(&self, src: &B, start: usize, out: &mut [u128]) {
+        let n = out.len();
+        match self.layout {
+            FoldLayout::Inline => {
+                let stride = 8 + 16 * self.locs.len();
+                let mut buf = [MaybeUninit::<u8>::uninit(); FOLD_CHUNK * FOLD_INLINE_BYTES];
+                let buf = filled(&mut buf[..n * stride], 0);
+                self.assemble::<B, false>(src, start, buf, stride, out);
+            }
+            FoldLayout::Tagged => with_scratch(&FOLD_SCRATCH, |buf| {
+                let stride = FOLD_TAGGED_COL_BYTES * self.locs.len();
+                buf.resize(n * stride, 0);
+                self.assemble::<B, true>(src, start, buf, stride, out);
+            }),
+            FoldLayout::Rows => unreachable!("a fold holding a string is digested a row at a time"),
+        }
+    }
+
+    /// [`Self::keys_by_column`]'s assembly: each row's key bytes into its
+    /// `stride` bytes of `buf`, in the inline layout or, where `TAGGED`, the tagged
+    /// one. Each column's image is stored whether or not it is present, and the
+    /// row's length advances past it only where it is, so a later column or the
+    /// digest's end overwrites or skips an absent one's.
+    #[inline(always)]
+    fn assemble<B: BatchView, const TAGGED: bool>(
+        &self,
+        src: &B,
+        start: usize,
+        buf: &mut [u8],
+        stride: usize,
+        out: &mut [u128],
+    ) {
+        let n = out.len();
+        let mut lens = [MaybeUninit::<u32>::uninit(); FOLD_CHUNK];
+        let lens = filled(&mut lens[..n], if TAGGED { 0 } else { 8 });
+        // The current column's presence in each row, and every column's as the
+        // inline layout's presence word.
+        let mut bits = [MaybeUninit::<u8>::uninit(); FOLD_CHUNK];
+        let bits = filled(&mut bits[..n], 1);
+        let mut present = [MaybeUninit::<u64>::uninit(); FOLD_CHUNK];
+        let present = filled(&mut present[..n], 0);
+        let nulls = &src.null_bmp().as_chunks::<8>().0[start..start + n];
+        let (pk, pk_stride) = src.pk_region();
+        for (i, &loc) in self.locs.iter().enumerate() {
+            let (region, cell_stride, off, signed, opk) = match loc {
+                ColumnLocator::Pk { byte_off, .. } => {
+                    bits.fill(1);
+                    (pk, pk_stride, byte_off as usize, false, true)
+                }
+                ColumnLocator::Payload { slot, size, type_code } => {
+                    for (bit, word) in bits.iter_mut().zip(nulls) {
+                        *bit = !gnitz_wire::null_word_get(u64::from_le_bytes(*word), slot as usize) as u8;
+                    }
+                    let size = size as usize;
+                    (
+                        src.col_data(slot as usize, size),
+                        size,
+                        0,
+                        type_code.is_signed_int(),
+                        false,
+                    )
+                }
+            };
+            if !TAGGED {
+                for (p, &bit) in present.iter_mut().zip(bits.iter()) {
+                    *p |= (bit as u64) << i;
+                }
+            }
+            let region = &region[start * cell_stride..(start + n) * cell_stride];
+            let rows = buf.chunks_exact_mut(stride).zip(lens.iter_mut().zip(bits.iter()));
+            gnitz_wire::by_cell_width!(loc.size(), |T| {
+                const W: usize = size_of::<T>();
+                match opk {
+                    true => put_images::<W, true, TAGGED>(region, cell_stride, off, signed, rows),
+                    false => put_images::<W, false, TAGGED>(region, cell_stride, off, signed, rows),
+                }
+            });
+        }
+        for ((key, out), (&len, &p)) in buf
+            .chunks_exact_mut(stride)
+            .zip(out)
+            .zip(lens.iter().zip(present.iter()))
+        {
+            if !TAGGED {
+                key[..8].copy_from_slice(&p.to_le_bytes());
+            }
+            *out = gnitz_wire::checksum_128(&key[..len as usize]);
+        }
+    }
+}
+
+/// One column's part of [`FoldCols::assemble`]: the `W`-byte cell at `off` of each
+/// `stride`-byte row of `region`, stored as its image at its row's length, behind
+/// a presence byte where `TAGGED`.
+#[inline(always)]
+fn put_images<'a, const W: usize, const OPK: bool, const TAGGED: bool>(
+    region: &[u8],
+    stride: usize,
+    off: usize,
+    signed: bool,
+    rows: impl Iterator<Item = (&'a mut [u8], (&'a mut u32, &'a u8))>,
+) {
+    zip_cells::<W, _>(region, stride, off, rows, |cell, (key, (len, &bit))| {
+        let at = *len as usize;
+        if TAGGED {
+            key[at] = bit;
+        }
+        let at = at + TAGGED as usize;
+        key[at..at + 16].copy_from_slice(&cell_image::<W, OPK>(cell, signed).to_le_bytes());
+        *len += TAGGED as u32 + 16 * bit as u32;
+    });
+}
+
+/// `s` with every element set to `v`.
+#[inline(always)]
+pub(super) fn filled<T: Copy>(s: &mut [MaybeUninit<T>], v: T) -> &mut [T] {
+    s.fill(MaybeUninit::new(v));
+    // SAFETY: the fill initialized every element of `s`.
+    unsafe { s.assume_init_mut() }
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +407,13 @@ impl KeyPacker {
         Ok(Self::finish(cols, false, FoldCols::new(Vec::new())))
     }
 
+    /// The packer of a group key whose own images do not fit 16 bytes: the
+    /// fold of `locs`, one or more columns, alone.
+    pub(crate) fn fold_only(locs: Vec<ColumnLocator>) -> Self {
+        debug_assert!(!locs.is_empty(), "a fold of no columns has no slot");
+        Self::finish([], false, FoldCols::new(locs))
+    }
+
     /// The packer of a span over `locs`, each column at its own type: no bitmap,
     /// no fold.
     pub(crate) fn of_span(locs: impl IntoIterator<Item = ColumnLocator>) -> Self {
@@ -278,20 +476,28 @@ impl KeyPacker {
         u128::from_be_bytes(be)
     }
 
-    /// Every row's packed key, `out_stride` bytes each.
-    pub(crate) fn keys<B: BatchView>(&self, batch: &B) -> Vec<u8> {
-        let mut keys = Vec::new();
-        self.keys_into(batch, &mut keys);
-        keys
-    }
-
-    /// [`Self::keys`] into `out`, whatever it held. Only growth is zeroed:
-    /// [`Self::pack_rows`] writes every byte of each key.
-    pub(crate) fn keys_into<B: BatchView>(&self, batch: &B, out: &mut Vec<u8>) {
-        let n = batch.row_count();
-        out.truncate(n * self.out_stride);
-        out.resize(n * self.out_stride, 0);
-        self.pack_rows(out, self.out_stride, batch, &[(0, n)]);
+    /// The packed key of each row of `runs` — ascending `[start, end)` — widened as
+    /// [`Self::narrow_image`] widens it, into `out[row]`; a row outside them keeps
+    /// what it held. A key of the fold alone is its digest, written as it is
+    /// taken.
+    pub(crate) fn identities_over<B: BatchView>(&self, batch: &B, runs: &[(usize, usize)], out: &mut [u128]) {
+        let w = self.out_stride;
+        debug_assert!((1..=16).contains(&w), "a narrow key is 1 to 16 bytes");
+        let fold_alone = self.n_cols == 0 && !self.has_bitmap;
+        let mut buf = [0u8; FOLD_CHUNK * 16];
+        for &(s, e) in runs {
+            for (start, ids) in (s..e).step_by(FOLD_CHUNK).zip(out[s..e].chunks_mut(FOLD_CHUNK)) {
+                if fold_alone {
+                    self.fold.keys_chunk(batch, start, ids);
+                    continue;
+                }
+                let keys = &mut buf[..ids.len() * w];
+                self.pack_rows(keys, w, batch, &[(start, start + ids.len())]);
+                for (id, key) in ids.iter_mut().zip(keys.chunks_exact(w)) {
+                    *id = gnitz_wire::widen_pk_be(key);
+                }
+            }
+        }
     }
 
     /// The reindex Map's output schema: [`Self::key_columns`], then
@@ -458,10 +664,28 @@ impl KeyPacker {
             off += dw;
         }
         if !self.fold.is_empty() {
-            for_rows(dst, stride, runs, |key, row| {
-                key[off..off + FOLD_BYTES].copy_from_slice(&self.fold.key_row(batch, row).to_be_bytes());
-            });
+            self.pack_fold_slots(dst, stride, off, batch, runs);
         }
+    }
+
+    /// [`Self::pack_rows`]' fold slot, at `off` of each key: the rows of `runs`
+    /// digested a chunk at a time. Out of line, so a packer without one compiles
+    /// as it does without it.
+    #[inline(never)]
+    fn pack_fold_slots<B: BatchView>(
+        &self,
+        dst: &mut [u8],
+        stride: usize,
+        off: usize,
+        batch: &B,
+        runs: &[(usize, usize)],
+    ) {
+        let mut keys = dst.chunks_exact_mut(stride);
+        self.fold.for_each_chunk(batch, runs, |_, digests| {
+            for (h, key) in digests.iter().zip(keys.by_ref()) {
+                key[off..off + FOLD_BYTES].copy_from_slice(&h.to_be_bytes());
+            }
+        });
     }
 }
 

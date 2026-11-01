@@ -2,7 +2,8 @@ use super::*;
 use crate::repr::{BatchBuilder, MemBatch};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    le_cell, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string, u64_pk_schema, STRS,
+    edge_native, le_cell, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string, random_schema,
+    u64_pk_schema, Rng, STRS,
 };
 use gnitz_wire::TypeCode;
 
@@ -75,11 +76,12 @@ fn a_fold_keys_a_row_by_its_columns() {
         &[1, 2, 3, 4, 1, 2],
     ] {
         let f = FoldCols::new(cols.iter().map(|&c| schema.locate(c)).collect());
-        assert_eq!(
-            f.inline,
-            cols.len() <= FOLD_INLINE_COLS && !cols.contains(&5),
-            "{cols:?}"
-        );
+        let layout = match () {
+            _ if cols.contains(&5) => FoldLayout::Rows,
+            _ if cols.len() <= FOLD_INLINE_COLS => FoldLayout::Inline,
+            _ => FoldLayout::Tagged,
+        };
+        assert_eq!(f.layout, layout, "{cols:?}");
         let keys: Vec<u128> = (0..rows.len()).map(|r| f.key_row(&mb, r)).collect();
         let vals = |r: usize| -> Vec<Option<u128>> { cols.iter().map(|&c| rows[r][c - 1]).collect() };
         for x in 0..rows.len() {
@@ -158,16 +160,10 @@ fn a_content_key_packs_its_content_hash() {
         }
         let b = b.finish();
         let packer = KeyPacker::new(&schema, &[(1, TypeCode::U128)]).unwrap();
-        let want: Vec<u8> = contents
-            .iter()
-            .flat_map(|c| gnitz_wire::checksum_128(c).to_be_bytes())
-            .collect();
-        assert_eq!(
-            packer.keys(&b.as_mem_batch()),
-            want,
-            "{}",
-            schema.columns()[1].type_code
-        );
+        let want: Vec<u128> = contents.iter().map(|c| gnitz_wire::checksum_128(c)).collect();
+        let mut got = vec![0; contents.len()];
+        packer.identities_over(&b.as_mem_batch(), &[(0, contents.len())], &mut got);
+        assert_eq!(got, want, "{}", schema.columns()[1].type_code);
     }
 }
 
@@ -395,4 +391,63 @@ mod pack_proptest {
             }
         }
     }
+}
+
+/// The chunk kernel digests each row exactly as `key_row` does — the digest is a
+/// persisted key — over random schemas: PK columns at any offset of a compound
+/// PK, payload columns of every integer width, signed and not, nullable or not,
+/// strings among them, and folds of one to eight columns (repeats allowed), so
+/// every layout is reached; over chunks that start anywhere and end short.
+#[test]
+fn keys_chunk_digests_each_row_as_key_row_does() {
+    use TypeCode::*;
+    let mut rng = Rng::new(0xf01d);
+    let payload = [U8, I8, U16, I16, U32, I32, U64, I64, U128, I128, String];
+    let mut layouts = std::collections::HashSet::new();
+    for _ in 0..200 {
+        let s = random_schema(&mut rng, &payload, true);
+        let n = 1 + rng.gen_range(600) as usize;
+        let mut bb = BatchBuilder::new(&s);
+        for _ in 0..n {
+            let pk: Vec<u128> = s
+                .pk_cols()
+                .iter()
+                .map(|&c| edge_native(&mut rng, s.columns()[c as usize].type_code))
+                .collect();
+            bb.begin_row_natives(&pk, 1);
+            for c in (0..s.num_columns()).filter(|&c| !s.is_pk_col(c)) {
+                let col = s.columns()[c];
+                if col.nullable && rng.gen_range(4) == 0 {
+                    bb.put_null();
+                } else if col.type_code.is_german_string() {
+                    bb.put_string(STRS[rng.gen_range(STRS.len() as u64) as usize]);
+                } else if rng.gen_range(2) == 0 {
+                    bb.put_int(edge_native(&mut rng, col.type_code));
+                } else {
+                    bb.put_int(rng.gen_u128() & gnitz_wire::image_mask(col.type_code.wire_stride()));
+                }
+            }
+            bb.end_row();
+        }
+        let b = bb.finish();
+        let mb = b.as_mem_batch();
+        let k = 1 + rng.gen_range(8) as usize;
+        let cols: Vec<usize> = (0..k).map(|_| rng.gen_range(s.num_columns() as u64) as usize).collect();
+        let f = FoldCols::new(cols.iter().map(|&c| s.locate(c)).collect());
+        layouts.insert(format!("{:?}", f.layout));
+        let want: Vec<u128> = (0..n).map(|r| f.key_row(&mb, r)).collect();
+        let mut all = Vec::new();
+        f.for_each_chunk(&mb, &[(0, n)], |start, keys| {
+            assert_eq!(start, all.len(), "chunks in row order");
+            all.extend_from_slice(keys);
+        });
+        let types: Vec<TypeCode> = s.columns().iter().map(|c| c.type_code).collect();
+        assert_eq!(all, want, "{cols:?} over {types:?}");
+        let start = rng.gen_range(n as u64) as usize;
+        let len = (rng.gen_range((n - start) as u64 + 1) as usize).min(FOLD_CHUNK);
+        let mut chunk = vec![0u128; len];
+        f.keys_chunk(&mb, start, &mut chunk);
+        assert_eq!(chunk, want[start..start + len], "{cols:?} from row {start}");
+    }
+    assert_eq!(layouts.len(), 3, "every layout reached: {layouts:?}");
 }

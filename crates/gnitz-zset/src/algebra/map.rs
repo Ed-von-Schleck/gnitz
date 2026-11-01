@@ -7,7 +7,7 @@
 
 use gnitz_expr::{ColCopy, ColumnLocator, LogicalProgram, MapEval};
 
-use super::key_pack::{locate_key_col, pk_run, FoldCols, KeyPacker};
+use super::key_pack::{locate_key_col, pk_run, FoldCols, KeyPacker, FOLD_CHUNK};
 use crate::repr::{copy_runs, Batch, DirectWriter};
 use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 use gnitz_wire::{int_cell, zip_cells, FixedInt, TypeCode};
@@ -185,22 +185,15 @@ fn stamp_hash_row_pks(output: &mut DirectWriter<'_>, fold: &FoldCols) {
     assert_eq!(output.schema.pk_stride(), KEY_BYTES, "a hash-row PK is one U128 column");
     // Hashing borrows `output` and the write-back mutates it, so keys are staged
     // per chunk.
-    const CHUNK: usize = 256;
-    let mut keys = [0u128; CHUNK];
-    let mut start = 0;
-    while start < n {
-        let end = (start + CHUNK).min(n);
-        {
-            let mb = output.written();
-            for (key, row) in keys.iter_mut().zip(first + start..first + end) {
-                *key = fold.key_row(&mb, row);
-            }
-        }
+    let mut keys = [0u128; FOLD_CHUNK];
+    for start in (0..n).step_by(FOLD_CHUNK) {
+        let end = (start + FOLD_CHUNK).min(n);
+        let keys = &mut keys[..end - start];
+        fold.keys_chunk(&output.written(), first + start, keys);
         let pk = &mut output.pk_mut()[start * KEY_BYTES..end * KEY_BYTES];
         for (key, dst) in keys.iter().zip(pk.as_chunks_mut::<KEY_BYTES>().0) {
             *dst = key.to_be_bytes();
         }
-        start = end;
     }
 }
 

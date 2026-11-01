@@ -8,9 +8,9 @@ use std::hint::black_box;
 
 const N: usize = 500_000;
 
-/// Instructions and cycles per row of [`FoldCols::key_row`] by column count,
-/// over `[U64 PK, I64, U32 NULL, I64, I64, I64]` — the cycles the least of
-/// several passes.
+/// Instructions and cycles per row of [`FoldCols::key_row`] and of
+/// [`FoldCols::for_each_chunk`] by column count, over `[U64 PK, I64, U32 NULL, I64,
+/// I64, I64]` — the cycles the least of several passes.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn fold_key_bench() {
@@ -36,20 +36,29 @@ fn fold_key_bench() {
     let mb = &b.as_mem_batch();
     for cols in 1..=5usize {
         let fold = FoldCols::new((1..=cols).map(|c| schema.locate(c)).collect());
-        let run = || {
+        let row = || {
             let mut acc = 0u128;
             for row in 0..N {
                 acc ^= fold.key_row(mb, row);
             }
             black_box(acc)
         };
-        run();
-        let (_, instr) = instructions.measure(run);
-        let cyc = (0..9).map(|_| cycles.measure(run).1).min().unwrap();
+        let chunked = || {
+            let mut acc = 0u128;
+            fold.for_each_chunk(mb, &[(0, N)], |_, keys| acc = keys.iter().fold(acc, |acc, &k| acc ^ k));
+            black_box(acc)
+        };
+        assert_eq!(row(), chunked(), "for_each_chunk digests as key_row does");
+        let (_, instr) = instructions.measure(row);
+        let cyc = (0..9).map(|_| cycles.measure(row).1).min().unwrap();
+        let (_, chunk_instr) = instructions.measure(chunked);
+        let chunk_cyc = (0..9).map(|_| cycles.measure(chunked).1).min().unwrap();
         println!(
-            "fold_key_bench {cols} columns {:6.1} instr/row {:6.1} cycles/row",
+            "fold_key_bench {cols} columns key_row {:6.1} instr/row {:6.1} cycles/row   chunked {:6.1} instr/row {:6.1} cycles/row",
             instr as f64 / N as f64,
-            cyc as f64 / N as f64
+            cyc as f64 / N as f64,
+            chunk_instr as f64 / N as f64,
+            chunk_cyc as f64 / N as f64
         );
     }
 }

@@ -2,7 +2,7 @@
 //! routing-key kernels.
 
 use super::group_key::{cell_image, for_key_cells, GroupKey, KeyCells, KeyForm};
-use super::key_pack::{FoldCols, KeyPacker};
+use super::key_pack::{filled, KeyPacker};
 use super::route::{ground_owner, worker_for_key, worker_for_pk_bytes, worker_for_wide_pk, Placement, Slot};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
@@ -88,8 +88,7 @@ impl ScatterPlan {
                 KeyForm::WidePk { at, n } => route_rows(mb, sink, PkRangeW { at, n, nw }),
                 KeyForm::Packed(packer) => route_rows_packed(mb, sink, packer, nw),
                 // The one group of no columns has one owner, and no key to hash.
-                KeyForm::Fold(fold) if fold.is_empty() => route_rows(mb, sink, Owner(ground_owner(nw))),
-                KeyForm::Fold(fold) => route_rows(mb, sink, FoldW { fold, nw }),
+                KeyForm::Global => route_rows(mb, sink, Owner(ground_owner(nw))),
             },
             // One worker owns every key, and a broadcast is the one list, so no
             // key is read or hashed.
@@ -158,18 +157,6 @@ impl RowWorker for Owner {
     }
 }
 
-struct FoldW<'a> {
-    fold: &'a FoldCols,
-    nw: usize,
-}
-
-impl RowWorker for FoldW<'_> {
-    #[inline(always)]
-    fn worker(&self, mb: &MemBatch, row: usize) -> usize {
-        worker_for_key(self.fold.key_row(mb, row), self.nw)
-    }
-}
-
 #[inline(never)]
 fn route_rows<W: RowWorker>(mb: &MemBatch, sink: &mut impl RowSink, w: W) {
     for (row, weight) in mb.weight().as_chunks::<8>().0.iter().enumerate() {
@@ -208,10 +195,7 @@ const KEY_CHUNK: usize = 256;
 fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker, nw: usize) {
     let (rows, width) = (mb.len(), packer.out_stride);
     let mut buf = [MaybeUninit::<u8>::uninit(); KEY_CHUNK * MAX_PK_BYTES];
-    let keys = &mut buf[..rows.min(KEY_CHUNK) * width];
-    keys.fill(MaybeUninit::new(0));
-    // SAFETY: the fill initialized every byte of `keys`.
-    let keys = unsafe { keys.assume_init_mut() };
+    let keys = filled(&mut buf[..rows.min(KEY_CHUNK) * width], 0);
     for start in (0..rows).step_by(KEY_CHUNK) {
         let n = (rows - start).min(KEY_CHUNK);
         packer.pack_rows(keys, width, mb, &[(start, start + n)]);
