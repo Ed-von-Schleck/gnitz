@@ -856,6 +856,7 @@ dependencies = [
  "gnitz-wire",
  "libc",
  "rustc-hash",
+ "serde_json",
  "sqlparser",
 ]
 

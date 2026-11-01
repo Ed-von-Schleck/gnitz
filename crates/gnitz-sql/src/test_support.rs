@@ -379,21 +379,21 @@ pub(crate) fn bind_conjunct(sql: &str, schema: &Schema) -> BoundExpr {
     conjuncts.pop().expect("one conjunct")
 }
 
-/// Parse a bare SQL expression (e.g. a WHERE predicate) via [`crate::DIALECT`].
+/// Parse a bare SQL expression (e.g. a WHERE predicate) via [`crate::GnitzDialect`].
 pub(crate) fn parse_expr_sql(src: &str) -> Expr {
     use sqlparser::parser::Parser;
-    Parser::new(&crate::DIALECT)
+    Parser::new(&crate::GnitzDialect)
         .try_with_sql(src)
         .unwrap()
         .parse_expr()
         .unwrap()
 }
 
-/// The first statement of `sql`, parsed via [`crate::DIALECT`] — the same dialect
+/// The first statement of `sql`, parsed via [`crate::GnitzDialect`] — the same dialect
 /// the planner parses with, so a test sees the AST shape the planner receives.
 pub(crate) fn parse_stmt(sql: &str) -> sqlparser::ast::Statement {
     use sqlparser::parser::Parser;
-    Parser::parse_sql(&crate::DIALECT, sql)
+    Parser::parse_sql(&crate::GnitzDialect, sql)
         .expect("parses")
         .into_iter()
         .next()

@@ -6,7 +6,9 @@ use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::Token;
 use std::any::TypeId;
 
-/// `GenericDialect`, plus a prefix hook for literal tokens.
+/// The dialect every statement is parsed under: `GenericDialect`, plus a
+/// prefix hook for literal tokens. A client that tokenizes text it will submit
+/// uses this one, so it splits statements where the parser does.
 ///
 /// Before every expression prefix sqlparser first tries to parse a data type
 /// (for `DATE '…'`-style typed strings), and that attempt builds and drops a
@@ -16,9 +18,8 @@ use std::any::TypeId;
 ///
 /// `dialect()` reports `GenericDialect`'s type id, so sqlparser's
 /// `dialect_of!` checks branch as for `GenericDialect`. Every other method
-/// forwards to `GenericDialect`; the forwarded list matches `GenericDialect`'s
-/// overrides in the sqlparser version pinned in this crate's manifest, and
-/// must be diffed against them again on a bump.
+/// that `GenericDialect` overrides forwards to it; a test checks that list
+/// against the source of the sqlparser this crate resolves.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GnitzDialect;
 
@@ -127,3 +128,7 @@ impl Dialect for GnitzDialect {
 #[cfg(test)]
 #[path = "tests/dialect.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/dialect.rs"]
+mod bench;

@@ -10,7 +10,7 @@ fn a_name_is_written_as_sql_reads_it_back() {
     let keywords = sqlparser::keywords::ALL_KEYWORDS.iter().map(|k| k.to_lowercase());
     for n in keywords.chain(specials.map(String::from)) {
         let sql = format!("SELECT {} FROM t", column_text(&n));
-        let read = match &Parser::parse_sql(&DIALECT, &sql).unwrap()[..] {
+        let read = match &Parser::parse_sql(&GnitzDialect, &sql).unwrap()[..] {
             [Statement::Query(q)] => match &*q.body {
                 SetExpr::Select(s) => match &s.projection[..] {
                     [SelectItem::UnnamedExpr(Expr::Identifier(i))] => Some(i.value.clone()),

@@ -1,6 +1,6 @@
 //! The input read as `sqlparser` tokenizes it: where statements end, whether a
 //! buffer is ready to run, and the spans the highlighter styles. The tokenizer
-//! runs under [`gnitz_sql::DIALECT`], the dialect the planner parses with.
+//! runs under [`gnitz_sql::GnitzDialect`], the dialect the planner parses with.
 
 use std::ops::Range;
 
@@ -25,7 +25,7 @@ impl Lexeme {
 /// comment begins.
 pub fn lex_prefix(src: &str) -> (Vec<Lexeme>, usize) {
     let mut tokens: Vec<TokenWithSpan> = Vec::new();
-    let whole = Tokenizer::new(&gnitz_sql::DIALECT, src)
+    let whole = Tokenizer::new(&gnitz_sql::GnitzDialect, src)
         .tokenize_with_location_into_buf(&mut tokens)
         .is_ok();
     let mut offsets = gnitz_sql::Offsets::new(src);

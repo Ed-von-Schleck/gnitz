@@ -3,7 +3,7 @@
 
 use crate::error::{reject_if, GnitzSqlError};
 use crate::rules::canonical_user_name;
-use crate::DIALECT;
+use crate::GnitzDialect;
 use gnitz_core::RelName;
 use sqlparser::ast::{Expr, Ident, ObjectName, SelectItem, Spanned, TableAliasColumnDef, TableFactor};
 use sqlparser::parser::Parser;
@@ -46,7 +46,7 @@ fn read_back<T>(
     text: &str,
     parse: impl FnOnce(&mut Parser<'_>) -> Result<T, sqlparser::parser::ParserError>,
 ) -> Option<T> {
-    let mut p = Parser::new(&DIALECT).try_with_sql(text).ok()?;
+    let mut p = Parser::new(&GnitzDialect).try_with_sql(text).ok()?;
     let out = parse(&mut p).ok()?;
     p.expect_token(&Token::EOF).ok()?;
     Some(out)

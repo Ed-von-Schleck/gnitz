@@ -125,8 +125,8 @@ fn type_names_are_the_spellings_the_planner_accepts() {
     }
     let words: Vec<&str> = type_names().flat_map(str::split_whitespace).collect();
     for &kw in sqlparser::keywords::ALL_KEYWORDS {
-        let accepted =
-            Parser::parse_sql(&crate::DIALECT, &format!("CREATE TABLE t (c {kw})")).is_ok_and(|_| declared(kw).is_ok());
+        let accepted = Parser::parse_sql(&crate::GnitzDialect, &format!("CREATE TABLE t (c {kw})"))
+            .is_ok_and(|_| declared(kw).is_ok());
         assert!(
             !accepted || words.contains(&kw),
             "{kw} declares but is not in type_names()"

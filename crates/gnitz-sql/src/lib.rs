@@ -52,10 +52,6 @@ use gnitz_core::{ClientError, GnitzClient, Planner, PollOutcome, ScanReply, Subs
 use sqlparser::ast::Statement;
 use std::sync::Arc;
 
-/// The dialect every statement is parsed under. A client that tokenizes text it
-/// will submit uses this one, so it splits statements where the parser does.
-pub const DIALECT: GnitzDialect = GnitzDialect;
-
 /// Result of executing a single SQL statement.
 #[derive(Debug)]
 pub enum SqlResult {

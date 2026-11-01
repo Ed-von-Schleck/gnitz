@@ -295,7 +295,7 @@ fn referenced<'a>(ctx: &'a Context, stmt: &[Lexeme]) -> Vec<(String, &'a Catalog
             continue;
         }
         let rest = stmt[i + 1..].iter().map(|l| l.token.clone()).collect();
-        let mut p = Parser::new(&gnitz_sql::DIALECT).with_tokens(rest);
+        let mut p = Parser::new(&gnitz_sql::GnitzDialect).with_tokens(rest);
         match w.keyword {
             // A table factor: the dialect's alias rule, derived tables, comma lists.
             Keyword::FROM | Keyword::JOIN | Keyword::UPDATE => {

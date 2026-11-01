@@ -8,7 +8,7 @@ use sqlparser::ast::Statement;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Location, Token, Tokenizer};
 
-use crate::DIALECT;
+use crate::GnitzDialect;
 
 /// One statement's place in the script it was parsed from. The parser's spans
 /// are relative to the whole script, so the script travels with the range.
@@ -37,7 +37,7 @@ impl<'a> StatementText<'a> {
     /// outside parentheses — a `CREATE VIEW`'s or an `ALTER VIEW`'s body.
     pub(crate) fn body_after_as(&self) -> Option<Range<usize>> {
         let text = self.text();
-        let tokens = Tokenizer::new(&DIALECT, text).tokenize_with_location().ok()?;
+        let tokens = Tokenizer::new(&GnitzDialect, text).tokenize_with_location().ok()?;
         let mut depth = 0usize;
         for t in &tokens {
             match &t.token {
@@ -60,7 +60,7 @@ impl<'a> StatementText<'a> {
 /// a statement is refused, where `Parser::parse_sql` stops there and drops the
 /// rest of the script.
 pub(crate) fn split_statements(script: &str) -> Result<Vec<(Statement, StatementText<'_>)>, ParserError> {
-    let mut parser = Parser::new(&DIALECT).try_with_sql(script)?;
+    let mut parser = Parser::new(&GnitzDialect).try_with_sql(script)?;
     let mut offsets = Offsets::new(script);
     let mut out = Vec::new();
     let mut expecting_delimiter = false;

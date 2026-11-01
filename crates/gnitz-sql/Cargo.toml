@@ -24,6 +24,7 @@ rustc-hash.workspace = true
 gnitz-foundation = { path = "../gnitz-foundation" }
 gnitz-test-harness = { path = "../gnitz-test-harness" }
 libc.workspace = true
+serde_json = "1"
 
 [lints]
 workspace = true
