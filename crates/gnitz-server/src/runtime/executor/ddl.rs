@@ -8,8 +8,6 @@
 //! none of that: a `sys_sequences` advance has no DAG evaluation, and the row
 //! it logs is one no worker reads.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use super::committer::Paused;
 use super::validate::{self, UniqueFilter};
 use super::{decode_fault, park_until, CatalogLock, Shared};
@@ -19,13 +17,6 @@ use crate::runtime::sync::WriteGuard;
 use gnitz_foundation::fault::Seam;
 use gnitz_wire::{ClientVerb, DecodedControl, PkColList, Target, WireFault};
 use gnitz_zset::repr::Batch;
-
-/// `GNITZ_INJECT_TICK_HOLD_FOR_DDL`: see `hold_tick_for_ddl`.
-pub(super) static TICK_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_TICK_HOLD_FOR_DDL");
-
-/// DDLs waiting for the tick gate, counted only while [`TICK_HOLD_FOR_DDL`] is
-/// armed: its one reader.
-static DDL_GATE_WAITERS: AtomicU64 = AtomicU64::new(0);
 
 /// What a DDL body runs under: the catalog write; the committer paused, so no
 /// checkpoint round runs inside the DDL; and the tick gate's write, so no tick
@@ -47,14 +38,7 @@ async fn enter_ddl(shared: &Shared) -> DdlLocks {
     drop(shared.committer.pause().await);
     let catalog = shared.catalog_rwlock.write().await;
     let committer = shared.committer.pause().await;
-    let counted = TICK_HOLD_FOR_DDL.armed();
-    if counted {
-        DDL_GATE_WAITERS.fetch_add(1, Ordering::Relaxed);
-    }
-    let ticks = shared.ticks.gate.write().await;
-    if counted {
-        DDL_GATE_WAITERS.fetch_sub(1, Ordering::Relaxed);
-    }
+    let ticks = shared.ticks.gate_for_ddl().await;
     DdlLocks {
         catalog,
         _committer: committer,
@@ -62,30 +46,18 @@ async fn enter_ddl(shared: &Shared) -> DdlLocks {
     }
 }
 
-/// Poll bound for [`TICK_HOLD_FOR_DDL`], in 1 ms ticks.
-const HOLD_TICK_MAX_POLLS: u32 = 10_000;
-
-/// Hold the first steady-state tick in flight until a DDL waits on the tick gate,
-/// so that DDL provably lands mid-tick. One-shot.
-pub(super) async fn hold_tick_for_ddl(shared: &Shared) {
-    park_until(shared, HOLD_TICK_MAX_POLLS, "tick hold", || {
-        DDL_GATE_WAITERS.load(Ordering::Relaxed) > 0
-    })
-    .await
-}
-
 /// `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT`: see `hold_ddl_for_checkpoint`.
 static DDL_HOLD_FOR_CHECKPOINT: Seam = Seam::new("GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT");
+
+/// Poll bound for [`DDL_HOLD_FOR_CHECKPOINT`], in 1 ms ticks.
+const DDL_HOLD_MAX_POLLS: u32 = 10_000;
 
 /// Hold the first DDL, its zone written and its locks still held, until a
 /// request is queued behind its pause of the committer. Below a checkpoint
 /// threshold of one zone, that request is the watchdog's reclaim wake, so a
 /// checkpoint is asked for inside the DDL. One-shot.
 async fn hold_ddl_for_checkpoint(shared: &Shared) {
-    park_until(shared, HOLD_TICK_MAX_POLLS, "ddl hold", || {
-        shared.committer.has_queued()
-    })
-    .await
+    park_until(shared, DDL_HOLD_MAX_POLLS, "ddl hold", || shared.committer.has_queued()).await
 }
 
 /// Decode one `DDL_TXN` item's block under its family's own schema.
@@ -160,9 +132,9 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, body: &[u8]) -> Result<u64, 
     if let Err(e) = shared.dispatcher.drain_tick(&applied.held_above).await {
         gnitz_fatal_abort!("catalog tick failed after the DDL was made durable: {e}");
     }
-    for &family in &applied.held_above {
-        shared.feeds.wake(family);
-    }
+    // Any DDL may change what a parked sync reads: a view dropped, a source's
+    // token reset, catalog rows a view scans.
+    shared.feeds.wake_all();
 
     if DDL_HOLD_FOR_CHECKPOINT.take_once() {
         hold_ddl_for_checkpoint(shared).await;

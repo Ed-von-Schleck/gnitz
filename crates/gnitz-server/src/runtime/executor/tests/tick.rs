@@ -11,7 +11,7 @@ fn all_ticked_reads_each_targets_source_closure() {
     let v1 = register_identity_view(&mut engine, t, "v1", &cols);
     let v2 = register_identity_view(&mut engine, v1, "v2", &cols);
     let w = register_identity_view(&mut engine, u, "w", &cols);
-    let (ticks, _triggers) = Ticks::new(0);
+    let (ticks, _requests) = Ticks::new(0);
     let dag = &engine.dag;
 
     assert!(ticks.all_ticked(dag, [v1, v2, w]));

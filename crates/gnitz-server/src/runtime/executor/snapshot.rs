@@ -11,8 +11,7 @@
 //! SNAPSHOT_CLOSE or when the connection ends.
 
 use super::peer::Peer;
-use super::{decode_fault, send_ack, send_msg, Shared};
-use crate::runtime::frame::WireMsg;
+use super::{cork_ack, cork_train, decode_fault, Shared};
 use crate::runtime::reactor::SendBody;
 use crate::runtime::sal::Read;
 use gnitz_wire::snapshot::PageRequest;
@@ -37,16 +36,15 @@ pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u6
     let lease = shared
         .dispatcher
         .scan_cut(|cut| {
-            shared.cat_mut().registry.pin(id).map_err(WireFault::from)?;
-            cut.read(Read::Pin { snapshot: id })
+            // The master pins only once the workers' Pin group is written, so
+            // a refused cut pinned nothing.
+            let lease = cut.read(Read::Pin { snapshot: id })?;
+            (shared.cat_mut().registry.pin(id)).expect("a snapshot id is fresh this boot");
+            Ok(lease)
         })
         .await;
     drop(catalog);
-    let pinned = match lease {
-        Ok(lease) => lease.finish().await,
-        Err(e) => Err(e),
-    };
-    if let Err(e) = pinned {
+    if let Err(e) = lease?.finish().await {
         release(shared, id).await;
         return Err(e);
     }
@@ -74,7 +72,7 @@ pub(super) async fn page(
     let request = PageRequest::decode(blob).map_err(decode_fault)?;
     if shared.cat().registry.pins(id, tid) {
         let rows = shared.cat().registry.pinned_page(id, tid, &request)?;
-        send_msg(peer, WireMsg::train_frame(tid, true, rows.wire_whole()));
+        cork_train(peer, tid, &rows)?;
     } else {
         let read = Read::SnapshotPage { snapshot: id, tid, page: blob.into() };
         let lease = shared.dispatcher.scan(read).await?;
@@ -86,7 +84,7 @@ pub(super) async fn page(
             }
         }
     }
-    send_ack(peer, tid, 0);
+    cork_ack(peer, tid, 0);
     Ok(())
 }
 

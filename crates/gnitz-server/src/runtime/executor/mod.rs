@@ -1,7 +1,6 @@
 //! Server executor: the serving loop (accept, the signal loop, the race against
-//! a worker's death), the `Shared` state, the request router, the scan and
-//! resolve handlers, and the reply-frame vocabulary. Each child module states
-//! its own scope.
+//! a worker's death), the `Shared` state, the request router, and the
+//! reply-frame vocabulary. Each child module states its own scope.
 //!
 //! The master owns one `Reactor`: [`run`] spawns its tasks on it
 //! and races the signal loop against a worker's death.
@@ -20,6 +19,7 @@ mod committer;
 mod ddl;
 mod delta;
 mod peer;
+mod read;
 mod snapshot;
 mod tick;
 mod validate;
@@ -35,21 +35,19 @@ use self::ddl::{handle_ddl_txn, reserve_serial_range};
 use self::delta::{handle_delta_poll, Feeds, Subscriptions};
 use self::peer::Peer;
 use self::snapshot::HeldSnapshots;
-use self::tick::{fresh_read_lock, read_watermark, Ticks};
+use self::tick::Ticks;
 use self::write::{handle_push, handle_push_txn, Writes};
 use crate::catalog::CatalogEngine;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::listen::ClientListener;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{RecvBuf, SendBody, TrainLease};
-use crate::runtime::sal::Read;
 use crate::runtime::signals;
 use crate::runtime::sync::{select2, AsyncRwLock, Either, WriteGuard};
 use crate::runtime::tls::{Served, TlsListener};
-use gnitz_store::read::ReadRows;
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_wire::txn_frame::ScanItem;
-use gnitz_wire::{ClientVerb, ReadSpec, Target, WireFault, WireStatus};
+use gnitz_wire::{ClientVerb, Target, WireFault, WireStatus};
 
 /// Park in 1 ms reactor ticks until `ready`, or until `polls` elapse. The shape
 /// every hold-seam needs: it holds no lock while it waits, so the event it waits
@@ -70,13 +68,13 @@ async fn park_until(shared: &Shared, polls: u32, what: &str, ready: impl Fn() ->
 }
 
 /// The tag of the catalog lock: a guard of it orders a task against DDL.
-pub(crate) enum CatalogLock {}
+enum CatalogLock {}
 
 /// Shared executor state held by every task.
 ///
 /// Lock order: the catalog, then a table lock or the committer's pause and the
 /// tick gate, then the SAL writer.
-pub struct Shared {
+struct Shared {
     dispatcher: MasterDispatcher,
     committer: Committer,
     catalog_rwlock: AsyncRwLock<CatalogLock>,
@@ -108,7 +106,6 @@ impl Shared {
     /// taken under a catalog read guard, so the write guard proves no task holds
     /// or awaits the lock being removed.
     fn forget_relation(&self, _catalog_write: &WriteGuard<CatalogLock>, id: u64) {
-        self.feeds.wake(id);
         self.writes.forget(id);
         self.ticks.forget(id);
         self.dispatcher.forget_relation(id);
@@ -121,7 +118,11 @@ impl Shared {
 
 /// Serve `listeners` until a shutdown signal (`None`) or a worker's death
 /// (`Some(rank)`), having killed and reaped the remaining workers.
-pub fn run(dispatcher: MasterDispatcher, backup_dir: Option<String>, listeners: Vec<ClientListener>) -> Option<usize> {
+pub(super) fn run(
+    dispatcher: MasterDispatcher,
+    backup_dir: Option<String>,
+    listeners: Vec<ClientListener>,
+) -> Option<usize> {
     let reactor = dispatcher.reactor().clone();
     let boot_seed = dispatcher.sal().watermark();
 
@@ -333,15 +334,15 @@ async fn handle_message(
     let ctrl = match gnitz_wire::peek_control_block(buf.as_slice()) {
         Ok(c) => c,
         Err(e) => {
-            send_fault(peer, 0, &decode_fault(e));
+            cork_fault(peer, 0, &decode_fault(e));
             return;
         }
     };
     let target_id = ctrl.hdr.target_id;
     match dispatch_request(peer, subs, snapshots, buf, ctrl, shared).await {
-        Ok(Some(value)) => send_ack(peer, target_id, value),
+        Ok(Some(value)) => cork_ack(peer, target_id, value),
         Ok(None) => {}
-        Err(f) => send_fault(peer, target_id, &f),
+        Err(f) => cork_fault(peer, target_id, &f),
     }
 }
 
@@ -365,7 +366,7 @@ async fn dispatch_request(
         ClientVerb::PushTxn => handle_push_txn(shared, buf, ctrl).await.map(Some),
         ClientVerb::ScanMulti => {
             let scans = gnitz_wire::txn_frame::decode_scan_multi(&data[ctrl.body]).map_err(decode_fault)?;
-            handle_scan(shared, peer, &scans).await.map(|()| None)
+            read::handle_scan(shared, peer, &scans).await.map(|()| None)
         }
         ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, subs, &ctrl.hdr, &data[ctrl.body])
             .await
@@ -383,17 +384,13 @@ async fn dispatch_request(
             .map(Some)
             .map_err(|e| format!("id allocation failed: {e}").into()),
 
-        ClientVerb::ScanSpec => handle_scan(shared, peer, &[ScanItem::of(data, &ctrl)])
+        ClientVerb::ScanSpec => read::handle_scan(shared, peer, &[ScanItem::of(data, &ctrl)])
             .await
             .map(|()| None),
 
-        // A plain read guard, not `fresh_read_lock`: a resolve answers catalog shape,
-        // and a view tick moves a view's rows, never its shape — so the tick
-        // drain that one waits for buys nothing here.
-        ClientVerb::Resolve => {
-            let _g = shared.catalog_rwlock.read().await;
-            build_resolve_reply(shared, peer, &data[ctrl.blob.clone()]).map(|()| None)
-        }
+        ClientVerb::Resolve => read::handle_resolve(shared, peer, &data[ctrl.blob.clone()])
+            .await
+            .map(|()| None),
 
         ClientVerb::Push => handle_push(shared, buf, ctrl).await.map(Some),
 
@@ -475,127 +472,6 @@ fn target_kind(cat: &CatalogEngine, target: Target, access: Access) -> Result<Re
     }
 }
 
-/// Answer a RESOLVE with the relation's schema block, descriptor and token.
-fn build_resolve_reply(shared: &Shared, peer: &Peer, name_blob: &[u8]) -> Result<(), WireFault> {
-    let qname = std::str::from_utf8(name_blob).map_err(|_| "RESOLVE: name is not valid UTF-8".to_string())?;
-    let (schema_name, name) = qname
-        .split_once('.')
-        .ok_or_else(|| format!("RESOLVE: '{qname}' is not a qualified relation name"))?;
-    let answer = {
-        let cat = shared.cat();
-        let sid = cat.schema_id(schema_name).ok_or_else(|| WireFault {
-            status: WireStatus::NotFound,
-            text: format!("schema '{schema_name}' not found"),
-        })?;
-        cat.relation_id(sid, name)
-            .and_then(|tid| cat.resolve_answer(tid).map(|a| (tid, a)))
-    };
-    send_msg(
-        peer,
-        match &answer {
-            // No such relation: a successful reply naming none.
-            None => WireMsg::default(),
-            Some((tid, (desc, schema_block, token))) => WireMsg {
-                target_id: *tid,
-                arg0: *token,
-                schema_block: Some(schema_block),
-                blob: desc,
-                ..Default::default()
-            },
-        },
-    );
-    Ok(())
-}
-
-/// One scan of [`handle_scan`], resolved under the catalog guard.
-struct Scanned {
-    kind: RelationKind,
-    /// A system catalog family's rows, read off the master's own copy; `None`
-    /// for a scan that takes the next lease of the cut.
-    local: Option<ReadRows>,
-    /// The read's watermark; a fanned scan's is sampled inside the cut.
-    lsn: u64,
-    /// A fanned scan's lease, written in the cut.
-    lease: Option<TrainLease>,
-}
-
-/// SCAN_SPEC and SCAN_MULTI: one reply per scan, in request order. The scans
-/// its workers answer share one SAL cut, so an atomic commit is in all of
-/// their replies or in none.
-async fn handle_scan(shared: &Shared, peer: &Peer, scans: &[ScanItem<'_>]) -> Result<(), WireFault> {
-    // Every target's kind is resolved under this guard, so a DDL during the
-    // drain is caught there and an unknown tid is rejected there.
-    let catalog = fresh_read_lock(
-        shared,
-        scans.iter().map(|s| s.target.tid),
-        shared.dispatcher.reactor().now(),
-    )
-    .await?;
-    let mut scanned: Vec<Scanned> = Vec::with_capacity(scans.len());
-    for scan in scans {
-        let kind = target_kind(&shared.cat(), scan.target, Access::Read)?;
-        let (local, lsn) = match kind {
-            RelationKind::SystemCatalog => {
-                let spec = ReadSpec::decode(scan.spec).map_err(decode_fault)?;
-                let rows = shared
-                    .cat()
-                    .registry
-                    .scan_spec(scan.target.tid, spec, scan.reply_layout, None)?;
-                // Read off the master's own copy, under no SAL hold: answered
-                // with the last tick's watermark.
-                (Some(rows), shared.ticks.last_lsn())
-            }
-            _ => (None, 0),
-        };
-        scanned.push(Scanned { kind, local, lsn, lease: None });
-    }
-    if scanned.iter().any(|s| s.local.is_none()) {
-        let fanned = scans.iter().zip(&mut scanned).filter(|(_, s)| s.local.is_none());
-        let cut = shared.dispatcher.scan_cut(|cut| {
-            for (scan, s) in fanned {
-                s.lsn = read_watermark(shared, s.kind, cut.sal());
-                s.lease = Some(cut.read(Read::ScanSpec {
-                    tid: scan.target.tid,
-                    reply_layout: scan.reply_layout,
-                    spec: scan.spec.into(),
-                })?);
-            }
-            Ok(())
-        });
-        cut.await?;
-    }
-    // The replies read no catalog state, and a slow client's egress must not
-    // hold the catalog read lock.
-    drop(catalog);
-
-    for (scan, s) in scans.iter().zip(&scanned) {
-        let target_id = scan.target.tid;
-        match &s.local {
-            Some(rows) => send_msg(
-                peer,
-                WireMsg {
-                    target_id,
-                    arg0: s.lsn,
-                    data: rows.wire_whole(),
-                    ..Default::default()
-                },
-            ),
-            None => {
-                // This relation's train, all workers, before the next: within a
-                // cut each worker's ring order is request order.
-                forward_scan(peer, s.lease.as_ref().expect("a fanned scan has a lease")).await?;
-                send_ack(peer, target_id, s.lsn);
-            }
-        }
-        // Carry no more than the budget into the next reply, and learn here
-        // rather than at the end if the client is gone.
-        if peer.flush_if_full().await.is_err() {
-            return Ok(());
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Wire-protocol response helpers
 // ---------------------------------------------------------------------------
@@ -612,20 +488,42 @@ async fn forward_scan(peer: &Peer, lease: &TrainLease) -> Result<(), WireFault> 
     Ok(())
 }
 
-/// Cork `msg` for the client, or a fault in its place past `MAX_FRAME_PAYLOAD`.
-/// The connection loop ships it.
-fn send_msg(peer: &Peer, msg: WireMsg<'_>) {
-    match msg.check_size() {
-        Ok(()) => peer.cork_with(|out| msg.encode_framed(out)),
-        Err(fault) => send_fault(peer, msg.target_id, &fault),
+/// Cork `msg` for the client; the connection loop ships it. Every frame the
+/// master mints is a head and a bounded text but a RESOLVE answer, sized before
+/// it is corked, and [`cork_train`]'s.
+fn cork_msg(peer: &Peer, msg: WireMsg<'_>) {
+    debug_assert!(
+        msg.check_size().is_ok(),
+        "an unchecked reply frame is over MAX_FRAME_PAYLOAD"
+    );
+    peer.cork_with(|out| msg.encode_framed(out))
+}
+
+/// Cork `rows` as a train of `target_id` read off the master's own copy: frames
+/// of at most `MAX_FRAME_PAYLOAD`, the last flagged `scan_last`, as a worker
+/// cuts its own. The terminal ACK is the caller's. `Err` is a row too wide for
+/// any frame, the frames before it corked.
+fn cork_train(peer: &Peer, target_id: u64, rows: &gnitz_zset::repr::Batch) -> Result<(), WireFault> {
+    let head = WireMsg::train_frame(target_id, false, None).size();
+    let mut next = 0;
+    loop {
+        let chunk = rows.wire_rows_within(next, gnitz_wire::MAX_FRAME_PAYLOAD - head);
+        next += chunk.map_or(0, |r| r.rows());
+        let last = next == rows.len();
+        let msg = WireMsg::train_frame(target_id, last, chunk);
+        msg.check_size()?;
+        cork_msg(peer, msg);
+        if last {
+            return Ok(());
+        }
     }
 }
 
 /// A control-only ACK: the request's own `target_id`, and its one value — a
 /// write's LSN, an allocation's base id, or the watermark of the read whose
 /// train it ends (see [`tick::read_watermark`]) — in `arg0`.
-fn send_ack(peer: &Peer, target_id: u64, value: u64) {
-    send_msg(
+fn cork_ack(peer: &Peer, target_id: u64, value: u64) {
+    cork_msg(
         peer,
         WireMsg {
             target_id,
@@ -637,8 +535,8 @@ fn send_ack(peer: &Peer, target_id: u64, value: u64) {
 
 /// A failure carrying its own status, master-minted or forwarded from a worker.
 /// A failure describes no rows, so it carries no schema block.
-fn send_fault(peer: &Peer, target_id: u64, fault: &WireFault) {
-    send_msg(peer, WireMsg { target_id, ..WireMsg::fault(fault) })
+fn cork_fault(peer: &Peer, target_id: u64, fault: &WireFault) {
+    cork_msg(peer, WireMsg { target_id, ..WireMsg::fault(fault) })
 }
 
 #[cfg(test)]

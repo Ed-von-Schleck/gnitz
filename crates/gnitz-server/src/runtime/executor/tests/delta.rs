@@ -17,7 +17,7 @@ fn queued_trains_are_shipped_whole_behind_the_reply() {
     subs.out.send(7, id(1), Rc::new(vec![0x11; 100]));
     subs.out.send(7, id(2), Rc::new(vec![0x21; LARGE]));
     subs.out.send(9, id(3), Rc::new(vec![0x31; 100]));
-    let queued = 3 * MARKER_BYTES + 200 + LARGE;
+    let queued = 3 * HEAD_FRAME_BYTES + 200 + LARGE;
     assert_eq!(subs.out.unsynced(), queued);
 
     peer.cork(b"reply");
@@ -61,7 +61,7 @@ fn a_second_ship_sends_only_the_trains_queued_since() {
     r.block_on(async { subs.ship(&peer).await.expect("an open peer") });
     assert!(subs.out.is_empty());
     subs.out.send(9, id(3), Rc::new(vec![0x31; 30]));
-    let len = 3 * MARKER_BYTES + 60;
+    let len = 3 * HEAD_FRAME_BYTES + 60;
     let wire = std::thread::spawn(move || {
         let mut wire = vec![0u8; len];
         (&receiver).read_exact(&mut wire).expect("every train");

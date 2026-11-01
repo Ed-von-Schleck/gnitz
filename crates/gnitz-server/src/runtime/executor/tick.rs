@@ -1,17 +1,17 @@
 //! Tick scheduling and read freshness: the pending-tick ledger, the one task
-//! that ticks the views, the triggers that wake it, and the read lock that
+//! that ticks the views, the requests that wake it, and the read lock that
 //! drains it when a read would otherwise miss a commit no tick has taken yet.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::ddl::{hold_tick_for_ddl, TICK_HOLD_FOR_DDL};
-use super::{CatalogLock, Shared};
+use super::{park_until, CatalogLock, Shared};
 use crate::query::DagEngine;
 use crate::runtime::reactor::AckLease;
 use crate::runtime::sal::SalExcl;
-use crate::runtime::sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard};
+use crate::runtime::sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, WriteGuard};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::WireFault;
@@ -21,17 +21,33 @@ use rustc_hash::FxHashMap;
 /// would.
 static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
 
-/// One tick request to [`tick_loop`], sent only through [`Ticks`]' sender.
-enum TickTrigger {
-    /// Fire-and-forget trigger from a commit when a tid crosses the row
-    /// coalesce threshold. Tids come from [`Ticks`]' pending ledger.
-    Auto,
-    /// Asked for by a read or by the checkpoint: tick whatever is pending —
-    /// even nothing — by `by`, and report the tick's verdict on `done`.
-    Drain {
-        done: oneshot::Sender<Result<(), WireFault>>,
-        by: Instant,
-    },
+/// `GNITZ_INJECT_TICK_HOLD_FOR_DDL`: see `hold_tick_for_ddl`.
+static TICK_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_TICK_HOLD_FOR_DDL");
+
+/// DDLs waiting for the tick gate, counted only while [`TICK_HOLD_FOR_DDL`] is
+/// armed: its one reader.
+static DDL_GATE_WAITERS: AtomicU64 = AtomicU64::new(0);
+
+/// Poll bound for [`TICK_HOLD_FOR_DDL`], in 1 ms ticks.
+const HOLD_TICK_MAX_POLLS: u32 = 10_000;
+
+/// Hold the first steady-state tick in flight until a DDL waits on the tick gate,
+/// so that DDL provably lands mid-tick. One-shot.
+async fn hold_tick_for_ddl(shared: &Shared) {
+    park_until(shared, HOLD_TICK_MAX_POLLS, "tick hold", || {
+        DDL_GATE_WAITERS.load(Ordering::Relaxed) > 0
+    })
+    .await
+}
+
+/// One tick request to [`tick_loop`], sent only through [`Ticks`]' sender: tick
+/// whatever is pending — even nothing — by `by`, and report the tick's verdict
+/// on `done` when it asks for one. A commit that brings a tid to the row
+/// coalesce threshold asks for a tick now and no verdict; a read or the
+/// checkpoint asks for a drain by its deadline, and its verdict.
+struct TickRequest {
+    by: Instant,
+    done: Option<oneshot::Sender<Result<(), WireFault>>>,
 }
 
 /// The tick loop's handle and pacing, and the pending-tick ledger: what the
@@ -39,10 +55,10 @@ enum TickTrigger {
 /// hold its commit groups are written under; a dropped relation's entry is
 /// removed under the catalog write guard.
 pub(super) struct Ticks {
-    tx: chan::Sender<TickTrigger>,
+    tx: chan::Sender<TickRequest>,
     /// Held shared by every tick, so a writer runs with no tick in flight.
     pub(super) gate: AsyncRwLock,
-    /// How long after a tick the next one waits for a trigger to fall due
+    /// How long after a tick the next one waits for a request to fall due
     /// (`GNITZ_PATIENT_TICK_GAP_MS`): a held sync is re-issued the moment it is
     /// answered, so unpaced it would tick per commit.
     patient_gap: Duration,
@@ -60,14 +76,14 @@ pub(super) struct Ticks {
     last_lsn: Cell<u64>,
 }
 
-/// The triggers [`tick_loop`] receives.
-pub(super) struct TickTriggers(chan::Receiver<TickTrigger>);
+/// The requests [`tick_loop`] receives.
+pub(super) struct TickRequests(chan::Receiver<TickRequest>);
 
 impl Ticks {
-    /// The ticks' handle, and the triggers [`tick_loop`] is to be spawned on.
+    /// The ticks' handle, and the requests [`tick_loop`] is to be spawned on.
     /// `boot_seed` is the SAL watermark after the recovery tick sweep: every
     /// commit recovered at boot is reflected in every view.
-    pub(super) fn new(boot_seed: u64) -> (Ticks, TickTriggers) {
+    pub(super) fn new(boot_seed: u64) -> (Ticks, TickRequests) {
         let (tx, rx) = chan::unbounded();
         let ticks = Ticks {
             tx,
@@ -78,7 +94,7 @@ impl Ticks {
             coalesce_rows: gnitz_foundation::env::env_num("GNITZ_TICK_COALESCE_ROWS", 10_000),
             last_lsn: Cell::new(boot_seed),
         };
-        (ticks, TickTriggers(rx))
+        (ticks, TickRequests(rx))
     }
 
     /// True when no relation in the source closure of any of `targets` has a
@@ -103,12 +119,25 @@ impl Ticks {
         self.last_lsn.get()
     }
 
-    /// Send the tick loop a [`TickTrigger::Drain`] due `by`; the receiver is its
-    /// verdict.
-    pub(super) fn drain(&self, by: Instant) -> oneshot::Receiver<Result<(), WireFault>> {
-        let (done, rx) = oneshot::channel();
-        self.tx.send(TickTrigger::Drain { done, by });
-        rx
+    /// Have the tick loop tick whatever is pending by `by`; its verdict.
+    pub(super) async fn drain(&self, by: Instant) -> Result<(), WireFault> {
+        let (done, verdict) = oneshot::channel();
+        self.tx.send(TickRequest { by, done: Some(done) });
+        verdict.await
+    }
+
+    /// The tick gate's write guard, a DDL's: no tick is in flight while it is
+    /// held.
+    pub(super) async fn gate_for_ddl(&self) -> WriteGuard {
+        let counted = TICK_HOLD_FOR_DDL.armed();
+        if counted {
+            DDL_GATE_WAITERS.fetch_add(1, Ordering::Relaxed);
+        }
+        let gate = self.gate.write().await;
+        if counted {
+            DDL_GATE_WAITERS.fetch_sub(1, Ordering::Relaxed);
+        }
+        gate
     }
 }
 
@@ -126,7 +155,10 @@ impl Shared {
             *pending.entry(tid).or_insert(0) += n;
         }
         if pending.values().any(|&rows| rows >= ticks.coalesce_rows) {
-            ticks.tx.send(TickTrigger::Auto);
+            ticks.tx.send(TickRequest {
+                by: self.dispatcher.reactor().now(),
+                done: None,
+            });
         }
     }
 
@@ -158,26 +190,21 @@ impl Shared {
     }
 }
 
-/// One tick of everything pending per batch of `TickTrigger`s. A batch is
-/// ticked once its first trigger is due, or [`Ticks::patient_gap`] after the
+/// One tick of everything pending per batch of [`TickRequest`]s. A batch is
+/// ticked once its first request is due, or [`Ticks::patient_gap`] after the
 /// last tick where that is sooner.
-pub(super) async fn tick_loop(shared: Rc<Shared>, TickTriggers(mut rx): TickTriggers) {
-    // The batch's `Drain` repliers.
+pub(super) async fn tick_loop(shared: Rc<Shared>, TickRequests(mut rx): TickRequests) {
+    // The batch's verdict repliers.
     let mut dones: Vec<oneshot::Sender<Result<(), WireFault>>> = Vec::new();
     let reactor = shared.dispatcher.reactor();
     let mut patient_from = reactor.now();
     loop {
         let mut due = patient_from;
-        let mut trigger = rx.recv().await;
+        let mut request = rx.recv().await;
         loop {
-            match trigger {
-                TickTrigger::Auto => due = reactor.now(),
-                TickTrigger::Drain { done, by } => {
-                    due = due.min(by);
-                    dones.push(done);
-                }
-            }
-            trigger = match rx.try_recv() {
+            due = due.min(request.by);
+            dones.extend(request.done);
+            request = match rx.try_recv() {
                 Some(t) => t,
                 None => match select2(rx.recv(), reactor.sleep_until(due)).await {
                     Either::A(t) => t,

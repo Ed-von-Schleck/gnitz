@@ -17,7 +17,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::peer::Peer;
 use super::tick::fresh_read_lock;
-use super::{decode_fault, forward_scan, send_fault, send_msg, target_kind, Access, CatalogLock, Shared};
+use super::{cork_fault, cork_msg, decode_fault, forward_scan, target_kind, Access, CatalogLock, Shared};
 use crate::runtime::frame::WireMsg;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{PeerGone, SendBody, TrainLease};
@@ -33,6 +33,20 @@ const DELTA_CUT_READS: usize = 64;
 /// The longest a SYNC_PUSHED is held, whatever wait it asks for.
 const SYNC_MAX_WAIT: Duration = Duration::from_secs(3600);
 
+/// The leases of one delta cut, one per read in the order given, or the one
+/// refusal that wrote none of them.
+struct CutReads(Result<std::vec::IntoIter<(TrainLease, u64)>, WireFault>);
+
+impl CutReads {
+    /// The next read's lease and the round it reaches, or the cut's refusal.
+    fn next(&mut self) -> Result<(TrainLease, u64), WireFault> {
+        match &mut self.0 {
+            Ok(leases) => Ok(leases.next().expect("one lease per read")),
+            Err(fault) => Err(fault.clone()),
+        }
+    }
+}
+
 /// One cut of delta reads, each given as `(view, after_tick, spec,
 /// reply_layout)`: a read of `view`'s deltas after `after_tick`. Each lease is
 /// paired with the round its read reaches, the view's last when the read was
@@ -40,12 +54,12 @@ const SYNC_MAX_WAIT: Duration = Duration::from_secs(3600);
 async fn delta_cut<'s>(
     disp: &MasterDispatcher,
     reads: impl IntoIterator<Item = (u64, u64, &'s [u8], u64)>,
-) -> Result<Vec<(TrainLease, u64)>, WireFault> {
+) -> CutReads {
     let mut reads = reads.into_iter().peekable();
     if reads.peek().is_none() {
-        return Ok(Vec::new());
+        return CutReads(Ok(Vec::new().into_iter()));
     }
-    disp.scan_cut(|cut| {
+    let leases = disp.scan_cut(|cut| {
         let mut leases = Vec::with_capacity(reads.size_hint().0);
         for (view, after_tick, spec, reply_layout) in reads {
             let lease = cut.read(Read::Delta {
@@ -57,8 +71,8 @@ async fn delta_cut<'s>(
             leases.push((lease, disp.last_delta_round(view)));
         }
         Ok(leases)
-    })
-    .await
+    });
+    CutReads(leases.await.map(Vec::into_iter))
 }
 
 // ---------------------------------------------------------------------------
@@ -125,8 +139,9 @@ fn feed_readable(shared: &Shared, feed: &Feed) -> Result<(), WireFault> {
 /// last round that reached it, and keep each one the request asks to as a
 /// subscription of `subs` from there.
 ///
-/// `Err` rejects the frame; a view's own failure is its fault frame, and the
-/// rest of the poll continues.
+/// `Err` rejects the frame, a decode error or a failed drain, ahead of anything
+/// corked; a view's own failure, its read refused included, is its fault frame,
+/// and the rest of the poll continues.
 pub(super) async fn handle_delta_poll(
     shared: &Shared,
     peer: &Peer,
@@ -169,8 +184,7 @@ pub(super) async fn handle_delta_poll(
             disp,
             moved().map(|i| (i.view.tid, i.from.map_or(0, |c| c.tick.get()), i.spec, i.reply_layout)),
         )
-        .await?
-        .into_iter();
+        .await;
         // Phase 2 reads no catalog state, and holding the lock across the
         // forward would block DDL.
         drop(catalog);
@@ -184,10 +198,10 @@ pub(super) async fn handle_delta_poll(
             let result = match position {
                 PollPosition::Fault(fault) => Err(fault),
                 PollPosition::UpToDate { round, tag } => Ok((round, tag)),
-                PollPosition::Moved { tag } => {
-                    let (lease, round) = dispatches.next().expect("one dispatch per moved view");
-                    forward_scan(peer, &lease).await.map(|()| (round, tag))
-                }
+                PollPosition::Moved { tag } => match dispatches.next() {
+                    Ok((lease, round)) => forward_scan(peer, &lease).await.map(|()| (round, tag)),
+                    Err(fault) => Err(fault),
+                },
             };
             let tid = item.view.tid;
             if let Some(id) = kept.as_mut().and_then(Iterator::next) {
@@ -197,9 +211,8 @@ pub(super) async fn handle_delta_poll(
                 }
             }
             match result {
-                // Corked, not sent: the terminal joins whatever the forward corked.
-                Ok((round, tag)) => send_msg(peer, terminal(tid, round, tag)),
-                Err(fault) => send_fault(peer, tid, &fault),
+                Ok((round, tag)) => cork_msg(peer, terminal(tid, round, tag)),
+                Err(fault) => cork_fault(peer, tid, &fault),
             }
             // Carry no more than the budget into the next view, and learn here
             // rather than at the end if the client is gone.
@@ -219,45 +232,13 @@ fn terminal(view: u64, round: u64, tag: u64) -> WireMsg<'static> {
         arg1: tag,
         ..Default::default()
     };
-    debug_assert_eq!(gnitz_wire::FRAME_LEN_PREFIX_BYTES + msg.size(), TERMINAL_BYTES);
+    debug_assert_eq!(gnitz_wire::FRAME_LEN_PREFIX_BYTES + msg.size(), HEAD_FRAME_BYTES);
     msg
 }
 
-/// The framed size of every [`terminal`]: a head with no blob, schema or data.
-const TERMINAL_BYTES: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES + gnitz_wire::frame_head_size(0, None);
-
-/// The catalog read lock a sync of the views `ids` is answered under, every
-/// commit reaching one of them ticked. A `quiet` sync is first held until a
-/// relation one of them reads changes or `until` comes.
-async fn hold_lock(
-    shared: &Shared,
-    ids: &[u64],
-    until: Instant,
-    quiet: impl FnOnce() -> bool,
-) -> Result<ReadGuard<CatalogLock>, WireFault> {
-    let ids = || ids.iter().copied();
-    let waiting = until > shared.dispatcher.reactor().now();
-    let g = fresh_read_lock(shared, ids(), until).await?;
-    if !waiting {
-        return Ok(g);
-    }
-    // No await from the test to the park, so no commit is acknowledged between
-    // them. The drain above was one: a commit it did not take is un-ticked here.
-    let ticked = shared.ticks.all_ticked(&shared.cat().dag, ids());
-    if !(ticked && quiet()) {
-        return Ok(g);
-    }
-    // A commit or a drop reaches a view through the view or anything it reads.
-    let watched: FxHashSet<u64> = {
-        let cat = shared.cat();
-        ids().flat_map(|v| cat.dag.self_and_sources(v)).collect()
-    };
-    let mut parked = shared.feeds.waiters.park(watched);
-    drop(g);
-    select2(&mut parked.woken, shared.dispatcher.reactor().sleep_until(until)).await;
-    drop(parked);
-    fresh_read_lock(shared, ids(), until).await
-}
+/// The framed size of every [`terminal`] and [`pushed_marker`]: a head with no
+/// blob, schema or data.
+const HEAD_FRAME_BYTES: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES + gnitz_wire::frame_head_size(0, None);
 
 // ---------------------------------------------------------------------------
 // Pushed feeds
@@ -329,7 +310,7 @@ impl Outbox {
     /// Queue one train of subscription `id` to `view`: its opening marker
     /// and the frames after it.
     fn send(&self, view: u64, id: SubId, body: Rc<Vec<u8>>) {
-        self.unsynced.set(self.unsynced.get() + MARKER_BYTES + body.len());
+        self.unsynced.set(self.unsynced.get() + HEAD_FRAME_BYTES + body.len());
         self.trains.borrow_mut().push(Train { view, id, body });
     }
 }
@@ -348,6 +329,12 @@ struct Feed {
 
 /// The SYNC_PUSHEDs held back with nothing to report, each with the relations
 /// whose change ends its wait.
+///
+/// A sync parks only while every subscription it covers is readable and caught
+/// up. A commit to a relation it watches, woken by relation once the commit's
+/// LSN is raised, and a DDL, which wakes every parked sync, are what can change
+/// that. A lag or a failed read ends only a subscriber behind, whose connection
+/// is not parked, and a feed ended as unreadable became so by a DDL.
 #[derive(Default)]
 struct SyncWaiters {
     next_id: Cell<u64>,
@@ -380,6 +367,13 @@ impl SyncWaiters {
     fn wake(&self, relation: u64) {
         let mut parked = self.parked.borrow_mut();
         for sync in parked.extract_if(.., |p| p.watched.contains(&relation)) {
+            sync.wake.send(());
+        }
+    }
+
+    /// Wake every parked sync.
+    fn wake_all(&self) {
+        for sync in self.parked.take() {
             sync.wake.send(());
         }
     }
@@ -434,9 +428,14 @@ impl Feeds {
         (feeds, asks)
     }
 
-    /// Wake every sync watching `relation`.
+    /// Wake every sync watching `relation`: it committed.
     pub(super) fn wake(&self, relation: u64) {
         self.waiters.wake(relation);
+    }
+
+    /// Wake every parked sync: a DDL may have changed what any of them reads.
+    pub(super) fn wake_all(&self) {
+        self.waiters.wake_all();
     }
 
     /// The cursor tag a delta reply of `view` carries: distinct for every (boot,
@@ -445,7 +444,7 @@ impl Feeds {
     /// recognizably foreign. A view id is never created under twice, so a dropped
     /// view's cursor is refused as one of an unregistered relation. `spec` is the
     /// request's encoded bytes.
-    pub(super) fn cursor_tag(&self, view: u64, spec: &[u8]) -> u64 {
+    fn cursor_tag(&self, view: u64, spec: &[u8]) -> u64 {
         // splitmix64's finalizer, a bijection on u64: under one spec, two views
         // of one boot never share a tag.
         let mut z = view.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -624,10 +623,6 @@ impl Subscriptions {
     }
 }
 
-/// The framed size of every [`pushed_marker`]: a head with no blob, schema
-/// or data.
-const MARKER_BYTES: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES + gnitz_wire::frame_head_size(0, None);
-
 /// The frame that opens a pushed train of subscription `id`.
 fn pushed_marker(view: u64, id: SubId) -> WireMsg<'static> {
     let marker = WireMsg {
@@ -639,7 +634,7 @@ fn pushed_marker(view: u64, id: SubId) -> WireMsg<'static> {
         },
         ..Default::default()
     };
-    debug_assert_eq!(gnitz_wire::FRAME_LEN_PREFIX_BYTES + marker.size(), MARKER_BYTES);
+    debug_assert_eq!(gnitz_wire::FRAME_LEN_PREFIX_BYTES + marker.size(), HEAD_FRAME_BYTES);
     marker
 }
 
@@ -681,15 +676,33 @@ async fn sync_wait(
     };
     loop {
         held.retain(|(sub, _)| sub.after_tick.get().is_some());
-        let ids: Vec<u64> = held.iter().map(|(_, feed)| feed.key.view.tid).collect();
+        let views = || held.iter().map(|(_, feed)| feed.key.view.tid);
         // With no subscription there is nothing to hold for.
-        let until = if ids.is_empty() {
+        let until = if held.is_empty() {
             shared.dispatcher.reactor().now()
         } else {
             deadline
         };
-        let quiet = || out.unsynced() == 0 && held.iter().all(caught_up);
-        let catalog = hold_lock(shared, &ids, until, quiet).await?;
+        let catalog = fresh_read_lock(shared, views(), until).await?;
+        // Nothing to report: held until a relation one of the views reads
+        // changes or `until` comes. No await from this test to the park, so no
+        // commit is acknowledged between them; a commit the drain above did not
+        // take is un-ticked here.
+        if until > shared.dispatcher.reactor().now()
+            && shared.ticks.all_ticked(&shared.cat().dag, views())
+            && out.unsynced() == 0
+            && held.iter().all(caught_up)
+        {
+            // A commit reaches a view through the view or anything it reads.
+            let watched: FxHashSet<u64> = {
+                let cat = shared.cat();
+                views().flat_map(|v| cat.dag.self_and_sources(v)).collect()
+            };
+            let mut parked = feeds.waiters.park(watched);
+            drop(catalog);
+            select2(&mut parked.woken, shared.dispatcher.reactor().sleep_until(until)).await;
+            continue;
+        }
         // Every commit acknowledged before the sync is ticked here, so only a
         // subscription behind asks for a pump.
         let mut asked = false;
@@ -759,7 +772,7 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
                     Err(fault) => feeds.end(feed, &fault),
                 }
             }
-            let cut = delta_cut(
+            let mut cut = delta_cut(
                 disp,
                 reads
                     .iter()
@@ -767,13 +780,8 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
             )
             .await;
             drop(catalog);
-            match cut {
-                Ok(cut) => {
-                    for ((feed, cursor), (lease, round)) in reads.drain(..).zip(cut) {
-                        queue_train(&shared, &feed, cursor, round, lease).await;
-                    }
-                }
-                Err(fault) => reads.drain(..).for_each(|(feed, _)| feeds.end(&feed, &fault)),
+            for (feed, cursor) in reads.drain(..) {
+                queue_train(&shared, &feed, cursor, cut.next()).await;
             }
         }
         behind.clear();
@@ -784,32 +792,16 @@ pub(super) async fn pump(shared: Rc<Shared>, mut asks: chan::Receiver<oneshot::S
     }
 }
 
-/// Queue the subscribers of `feed` standing at `cursor` the train `lease`
-/// reads: the feed's rounds after `cursor`, through `round`, the view's last.
-async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, round: u64, lease: TrainLease) {
+/// Queue the subscribers of `feed` standing at `cursor` the train `read`
+/// leases: the feed's rounds after `cursor`, through the round it reaches, the
+/// view's last. A refused read fails those subscribers alone.
+async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, read: Result<(TrainLease, u64), WireFault>) {
     let tid = feed.key.view.tid;
     let cap = shared.feeds.queue_bytes;
-    // Copied off the ring, so no subscriber's pace holds a ring slot. A train
-    // past the cap is not read to its end.
-    let mut body = Vec::new();
-    let read = loop {
-        match lease.next().await {
-            Ok(Some(_)) if body.len() > cap => break Err(lagged(tid)),
-            Ok(Some(frame)) => {
-                let bytes = frame.slot.frame_bytes();
-                if body.is_empty() {
-                    // Room for one frame this size from each worker and the
-                    // terminal, capped near where the lagged check stops reading.
-                    let workers = lease.targets().set.len();
-                    body.reserve((bytes.len() * workers).min(cap) + TERMINAL_BYTES);
-                }
-                body.extend_from_slice(bytes);
-            }
-            Ok(None) => break Ok(()),
-            Err(fault) => break Err(fault),
-        }
+    let read = match read {
+        Ok((lease, round)) => copy_train(lease, tid, cap).await.map(|body| (body, round)),
+        Err(fault) => Err(fault),
     };
-    drop(lease);
     // The subscribers this read is for: a round is past every cursor that was
     // behind it, so none is taken for a later read's.
     let mut members = feed.members.borrow_mut();
@@ -817,12 +809,12 @@ async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, round: u64, 
     match read {
         Err(fault) => fail_subscribers(tid, reading, &fault),
         // Rounds that left the subscription no row are sent as no train.
-        Ok(()) if body.is_empty() => {
+        Ok((body, round)) if body.is_empty() => {
             for m in reading {
                 m.after_tick.set(Some(round));
             }
         }
-        Ok(()) => {
+        Ok((mut body, round)) => {
             terminal(tid, round, feed.tag).encode_framed(&mut body);
             // Rows from fewer workers than reserved for: the rest goes back,
             // so a queued train holds at most twice its length.
@@ -844,6 +836,26 @@ async fn queue_train(shared: &Shared, feed: &Rc<Feed>, cursor: u64, round: u64, 
     members.retain(|m| m.after_tick.get().is_some());
     drop(members);
     shared.feeds.retire(feed);
+}
+
+/// The frames of `lease`'s train, copied off the ring so no subscriber's pace
+/// holds a ring slot. A train past `cap` is not read to its end.
+async fn copy_train(lease: TrainLease, tid: u64, cap: usize) -> Result<Vec<u8>, WireFault> {
+    let mut body = Vec::new();
+    while let Some(frame) = lease.next().await? {
+        if body.len() > cap {
+            return Err(lagged(tid));
+        }
+        let bytes = frame.slot.frame_bytes();
+        if body.is_empty() {
+            // Room for one frame this size from each worker and the terminal,
+            // capped near where the lagged check stops reading.
+            let workers = lease.targets().set.len();
+            body.reserve((bytes.len() * workers).min(cap) + HEAD_FRAME_BYTES);
+        }
+        body.extend_from_slice(bytes);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
