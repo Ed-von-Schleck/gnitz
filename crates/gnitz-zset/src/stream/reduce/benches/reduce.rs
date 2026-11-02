@@ -313,18 +313,20 @@ fn op_reduce_runs_bench() {
     use AggFunc::{Max, Min, Sum};
     const N: u64 = 1 << 16;
     let counter = Counter::instructions();
-    for run_len in [2u64, 16, 128, 1024] {
+    // 128 against 129 is the run step cap's boundary.
+    for run_len in [2u64, 16, 128, 129, 256, 1024] {
         for (label, value, put) in value_shapes() {
             for (aname, aggs) in [("min", &[Min][..]), ("min+max+sum", &[Min, Max, Sum][..])] {
                 if aggs.len() > 1 && label != "I64" {
                     continue;
                 }
                 let schema = compound_schema(value);
-                let make = |salt: u64| {
+                let make = |pk_salt: u64, value_salt: u64| {
                     let mut bb = BatchBuilder::new(&schema);
                     for i in 0..N {
-                        bb.begin_row_natives(&[(i / run_len) as u128, (i % run_len + salt * run_len) as u128], 1);
-                        put(&mut bb, i + salt * N);
+                        let b = i % run_len + pk_salt * run_len;
+                        bb.begin_row_natives(&[(i / run_len) as u128, b as u128], 1);
+                        put(&mut bb, i + value_salt * N);
                         bb.end_row();
                     }
                     let mut b = bb.finish();
@@ -332,10 +334,58 @@ fn op_reduce_runs_bench() {
                     b
                 };
                 let mut h = Harness::new(plan(&schema, &[0], aggs, false));
-                let [empty, populated, retract] = three_epochs(&counter, &mut h, make(1), make(2));
+                let [empty, populated, retract] = three_epochs(&counter, &mut h, make(1, 1), make(2, 2));
+                // Every row of the second delta moved to a new PK, its value
+                // kept: each group's aggregates are unchanged.
+                let mut rewrite = make(2, 2).negated();
+                rewrite.append_batch(&make(3, 2));
+                let rewrite = h.fold(rewrite);
+                let rewritten = epoch(&counter, &mut h, &rewrite);
                 println!(
                     "op_reduce_runs_bench len={run_len:<5} {label:<7} {aname:<12} empty {empty:7.1}, populated {populated:7.1}, \
-                     retraction {retract:7.1} instr/row"
+                     retraction {retract:7.1}, rewrite {rewritten:7.1} instr/row"
+                );
+            }
+        }
+    }
+}
+
+/// The run arm over updates: runs of `run_len` stored rows of the leading PK
+/// column, then an epoch replacing each run's first row with a fresh one.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn op_reduce_runs_update_bench() {
+    use AggFunc::{Max, Min, Sum};
+    const N: u64 = 1 << 16;
+    let counter = Counter::instructions();
+    for run_len in [2u64, 16, 128] {
+        for (label, value, put) in value_shapes() {
+            for (aname, aggs) in [("min", &[Min][..]), ("min+max+sum", &[Min, Max, Sum][..])] {
+                if !matches!(label, "I64" | "F64") || (aggs.len() > 1 && label != "I64") {
+                    continue;
+                }
+                let schema = compound_schema(value);
+                // Rows `(run, row)` of `rows`, each at weight `w`, valued off its seed.
+                let make = |rows: &mut dyn Iterator<Item = (u64, u64, u64)>, w: i64| {
+                    let mut bb = BatchBuilder::new(&schema);
+                    for (run, row, seed) in rows {
+                        bb.begin_row_natives(&[run as u128, row as u128], w);
+                        put(&mut bb, seed);
+                        bb.end_row();
+                    }
+                    bb.finish()
+                };
+                let mut h = Harness::new(plan(&schema, &[0], aggs, false));
+                let stored = h.fold(make(&mut (0..N).map(|i| (i / run_len, i % run_len, i)), 1));
+                epoch(&counter, &mut h, &stored);
+                // Each run loses its row 0 and gains a row `run_len`.
+                let runs = || 0..N / run_len;
+                let mut update = make(&mut runs().map(|g| (g, 0, g * run_len)), -1);
+                update.append_batch(&make(&mut runs().map(|g| (g, run_len, N + g)), 1));
+                let update = h.fold(update);
+                let instructions = epoch(&counter, &mut h, &update);
+                println!(
+                    "op_reduce_runs_update_bench len={run_len:<4} {label:<4} {aname:<12} update {instructions:7.1} instr/row"
                 );
             }
         }
@@ -408,13 +458,32 @@ fn op_reduce_tiny_bench() {
                 (100_000 + g * 16 + n, g, 9000 + n, 1)
             }
         };
-        let deltas: [(&str, Vec<Row>); 5] = [
-            ("1 insert", vec![fresh(7, 0)]),
-            ("2 inserts 1 group", vec![fresh(7, 0), fresh(7, 1)]),
-            ("2 inserts 2 groups", vec![fresh(7, 0), fresh(9, 0)]),
-            ("update in group", vec![old(57, -1), fresh(7, 0)]),
-            ("1 delete", vec![old(57, -1)]),
+        // Stored row i's group and value under a PK no other row holds.
+        let kept = |i: u64, w: i64| -> Row {
+            if compound {
+                (i / 8, 157, i, w)
+            } else {
+                (100_000 + i, i / 8, i, w)
+            }
+        };
+        let mut deltas: Vec<(String, Vec<Row>)> = vec![
+            ("1 insert".into(), vec![fresh(7, 0)]),
+            ("2 inserts 1 group".into(), vec![fresh(7, 0), fresh(7, 1)]),
+            ("2 inserts 2 groups".into(), vec![fresh(7, 0), fresh(9, 0)]),
+            ("update in group".into(), vec![old(57, -1), fresh(7, 0)]),
+            ("update kept values".into(), vec![old(57, -1), kept(57, 1)]),
+            ("1 delete".into(), vec![old(57, -1)]),
         ];
+        // Either side of the most groups an epoch emits a row at a time, each
+        // group stored.
+        if !group.is_empty() {
+            for k in [4u64, 5, 8, 32] {
+                deltas.push((
+                    format!("{k} inserts {k} groups"),
+                    (0..k).map(|g| fresh(7 * g, 0)).collect(),
+                ));
+            }
+        }
         for (dname, rows) in deltas {
             let mut h = Harness::new(plan(schema, group, aggs, false));
             let stored: Vec<Row> = (0..4096).map(|i| old(i, 1)).collect();
@@ -429,7 +498,7 @@ fn op_reduce_tiny_bench() {
                 }
             });
             println!(
-                "op_reduce_tiny_bench {label:<20} {dname:<19} {:>6} instr/call",
+                "op_reduce_tiny_bench {label:<20} {dname:<20} {:>6} instr/call",
                 instructions / ITERS
             );
         }
@@ -490,6 +559,48 @@ fn op_reduce_wide_bench() {
             let [empty, mixed] = [&d1, &d2].map(|d| epoch(&counter, &mut h, d));
             println!("op_reduce_wide_bench {label:<7} {aname:<12} empty {empty:7.1}, mixed-sign {mixed:7.1} instr/row");
         }
+    }
+}
+
+/// Instructions per delta row of `op_reduce` over medium deltas of fresh rows
+/// spread over a populated trace's groups, the same delta again and again: from
+/// sizes whose buffers the plan keeps to sizes whose buffers it drops after each
+/// epoch.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn op_reduce_medium_bench() {
+    const STORED: u64 = 1 << 16;
+    const ITERS: u64 = 50;
+    let counter = Counter::instructions();
+    let i64c = SchemaColumn::new(TypeCode::I64, false);
+    // [U64 pk | I64 grp | I64 value]
+    let schema = u64_pk_schema(&[i64c, i64c]);
+    let build = |ids: &mut dyn Iterator<Item = u64>| {
+        let mut bb = BatchBuilder::new(&schema);
+        for i in ids {
+            bb.begin_row(i as u128, 1);
+            bb.put_int((mix(i) % 4096) as u128);
+            bb.put_u64(mix(i ^ 1));
+            bb.end_row();
+        }
+        bb.finish()
+    };
+    for n in [256u64, 1024, 4096, 16384] {
+        let mut h = Harness::new(plan(&schema, &[1], &[AggFunc::Min], false));
+        let base = h.fold(build(&mut (0..STORED)));
+        epoch(&counter, &mut h, &base);
+        let delta = h.fold(build(&mut (STORED..STORED + n)));
+        h.index(&delta);
+        std::hint::black_box(h.reduce(&delta));
+        let ((), instructions) = counter.measure(|| {
+            for _ in 0..ITERS {
+                std::hint::black_box(h.reduce(&delta));
+            }
+        });
+        println!(
+            "op_reduce_medium_bench {n:>6} rows {:7.1} instr/row",
+            instructions as f64 / (ITERS * n) as f64
+        );
     }
 }
 

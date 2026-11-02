@@ -90,16 +90,19 @@ impl ValueIndex {
             })
     }
 
-    /// Seed group `g` of every value-indexed aggregate — the group of `row` —
+    /// Seed group `g` of each value-indexed aggregate `k` — the group of `row` —
     /// with its extreme out of the index, emptying one whose ordinal has no
-    /// positive entry.
+    /// positive entry; with `retracted`, the fold of the group's retractions,
+    /// only each one that [`AggValues::recedes`]. `cur` is opened by `open` at
+    /// its first seek.
     pub(super) fn seed_extremes<R: RowSource>(
         &self,
-        cur: &mut ReadCursor,
+        (cur, mut open): (&mut Option<ReadCursor>, impl FnMut() -> ReadCursor),
         src: &R,
         row: usize,
         vals: &mut AggValues,
         g: usize,
+        retracted: Option<&AggValues>,
     ) {
         let mut key = [0u8; MAX_PK_BYTES];
         let stride = self.key_packer.out_stride;
@@ -107,6 +110,10 @@ impl ValueIndex {
         self.key_packer.pack_prefix(&mut key, src, row);
         for (j, a) in self.aggs.iter().enumerate() {
             let k = a.agg_idx as usize;
+            if retracted.is_some_and(|r| !r.recedes(k, g, vals)) {
+                continue;
+            }
+            let cur = cur.get_or_insert_with(&mut open);
             key[stride] = j as u8;
             if !cur.seek_positive_with_prefix(&key[..prefix_len]) {
                 vals.clear_extreme(k, g);

@@ -208,7 +208,7 @@ pub(in crate::query) fn mint_ground_rows(vm: &mut Vm, stores: &mut Stores<'_>) -
     for pc in 0..vm.instructions.len() {
         let instr = &vm.instructions[pc];
         let Op::Reduce { plan, .. } = &instr.op else { continue };
-        let Some(mut row) = plan.ground_row().cloned() else {
+        let Some(mut row) = plan.ground_row() else {
             continue;
         };
         let reg = instr.out_reg;

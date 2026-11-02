@@ -429,7 +429,7 @@ impl Agg {
         !matches!(self.kind, StepKind::Extreme { .. })
     }
 
-    fn is_wide(&self) -> bool {
+    pub(crate) fn is_wide(&self) -> bool {
         matches!(self.kind, StepKind::Extreme { kind: ImageKind::Wide(_), .. })
     }
 
@@ -557,6 +557,80 @@ impl AggValues {
         self.fold_column(k, (kind, src), mb, ranges, groups);
     }
 
+    /// [`Self::fold`] of wide extreme `k`, stepping no row of a group `g` that
+    /// `skips(g)`: one whose wide extremes the caller reads elsewhere. A wide
+    /// extreme compares native bytes a row at a time, so skipping a row costs
+    /// less than stepping it.
+    pub(crate) fn fold_wide(
+        &mut self,
+        k: usize,
+        mb: &MemBatch,
+        ranges: &[(usize, usize)],
+        groups: impl Groups,
+        skips: impl Fn(usize) -> bool,
+    ) {
+        let Agg { kind, src, .. } = self.aggs[k];
+        debug_assert!(self.aggs[k].is_wide());
+        let mut i = 0;
+        for (range, &(s, e)) in ranges.iter().enumerate() {
+            for row in s..e {
+                let (w, g) = (mb.get_weight(row), groups.of(range, i));
+                if w > 0 && !skips(g) {
+                    self.apply(k, g, (kind, src), mb, row, w);
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// Fold into each scalar extreme of each group the least image its rows
+    /// `ranges` of `mb` retract, NULLs aside, where `inserted`, the fold of the
+    /// same rows' inserts, holds none at or below it. Every other value is
+    /// left empty; a list without a scalar extreme is left as it is.
+    pub(crate) fn fold_retracted(
+        &mut self,
+        mb: &MemBatch,
+        ranges: &[(usize, usize)],
+        groups: impl Groups,
+        inserted: &AggValues,
+    ) {
+        let scalar = |a: &Agg| !a.is_linear() && !a.is_wide();
+        if !self.aggs.iter().any(scalar) {
+            return;
+        }
+        self.reset(inserted.groups);
+        for k in 0..self.aggs.len() {
+            let Agg {
+                kind: StepKind::Extreme { max, kind: ImageKind::Scalar(scalar) },
+                src,
+                ..
+            } = self.aggs[k]
+            else {
+                continue;
+            };
+            fold_least((&mut self.column(k), mb, src, ranges, groups), scalar, max, |w| w < 0);
+            for g in 0..self.groups {
+                let (at, i) = (self.at(k, g), inserted.at(k, g));
+                self.has[at] &= !(inserted.has[i] && inserted.acc[i] as u64 <= self.acc[at] as u64);
+            }
+        }
+    }
+
+    /// Whether group `g`'s extreme `k` may have receded past what `vals`, its
+    /// delta and its stored row folded, holds; `self` is the fold of
+    /// [`Self::fold_retracted`]. A wide extreme folds no retraction, so it may
+    /// wherever its group retracts. A scalar one may where `self` holds an
+    /// image at or below `vals`' extreme: bag positivity puts that image at the
+    /// stored extreme, every instance of which may be gone.
+    #[inline(always)]
+    pub(crate) fn recedes(&self, k: usize, g: usize, vals: &AggValues) -> bool {
+        if self.aggs[k].is_wide() {
+            return true;
+        }
+        let (at, v) = (self.at(k, g), vals.at(k, g));
+        self.has[at] && (!vals.has[v] || self.acc[at] as u64 <= vals.acc[v] as u64)
+    }
+
     /// Fold into group `groups[i]` the values of output row `i` of `stored`,
     /// every row of it: each aggregate over its own column, as a previously
     /// emitted row's value merges.
@@ -582,22 +656,6 @@ impl AggValues {
                 fold_cells::<{ $n }, { $opk }, $reg>(&mut self.column(k), mb, src, ranges, groups, $contribution)
             };
         }
-        // `$contribution` over the source column's `$n`-byte cells: a payload
-        // column's native ones, or a PK column's OPK images under `$opk`.
-        macro_rules! fold_ints {
-            ($n:expr, $reg:ty, |$opk:ident| $contribution:expr) => {
-                match src {
-                    ColumnLocator::Payload { .. } => {
-                        const $opk: bool = false;
-                        fold!($n, $opk, $reg, $contribution)
-                    }
-                    ColumnLocator::Pk { .. } => {
-                        const $opk: bool = true;
-                        fold!($n, $opk, $reg, $contribution)
-                    }
-                }
-            };
-        }
         // `$contribution` over a float column of kind `$kind`, each cell
         // widened to `f64`. A float is never a PK column.
         macro_rules! fold_float {
@@ -620,13 +678,18 @@ impl AggValues {
             // A PK column is never NULL.
             StepKind::CountNonNull => fold!(0, false, IntSum, |_, w, null| Some(if null { 0 } else { w })),
             StepKind::Sum(ScalarKind::Int(fi)) => for_each_fixed_int!(fi, |FI| {
-                fold_ints!(FI.width(), IntSum, |OPK| |v, w, null| {
-                    Some(if null {
-                        0
-                    } else {
-                        int_cell::<OPK>(FI, &v).wrapping_mul(w)
-                    })
-                })
+                fold_int_cells!(
+                    (&mut self.column(k), mb, src, ranges, groups),
+                    FI.width(),
+                    IntSum,
+                    |OPK| |v, w, null| {
+                        Some(if null {
+                            0
+                        } else {
+                            int_cell::<OPK>(FI, &v).wrapping_mul(w)
+                        })
+                    }
+                )
             }),
             StepKind::CountInf { neg, kind } => fold_float!(kind, IntSum, |v, w, null| {
                 Some(w * (!null && counts_inf(v, neg)) as i64)
@@ -636,22 +699,7 @@ impl AggValues {
             }),
             StepKind::Sum(kind) => fold_float!(kind, FloatSum, |v, w, null| (!null).then_some(v * w as f64)),
             StepKind::Extreme { max, kind: ImageKind::Scalar(scalar) } => {
-                // A MAX keeps the smallest complement, as the value index does.
-                let flip = if max { u64::MAX } else { 0 };
-                match scalar {
-                    ScalarKind::Int(fi) => for_each_fixed_int!(fi, |FI| {
-                        fold_ints!(FI.width(), Least, |OPK| move |v, w, null| {
-                            (w > 0 && !null)
-                                .then(|| ScalarKind::Int(FI).order_image(int_cell::<OPK>(FI, &v) as u64) ^ flip)
-                        })
-                    }),
-                    ScalarKind::F32 => fold!(4, false, Least, move |v, w, null| {
-                        (w > 0 && !null).then(|| ScalarKind::F32.order_image(u32::from_le_bytes(v) as u64) ^ flip)
-                    }),
-                    ScalarKind::F64 => fold!(8, false, Least, move |v, w, null| {
-                        (w > 0 && !null).then(|| ScalarKind::F64.order_image(u64::from_le_bytes(v)) ^ flip)
-                    }),
-                }
+                fold_least((&mut self.column(k), mb, src, ranges, groups), scalar, max, |w| w > 0)
             }
             // A wide extreme compares native bytes, a row at a time.
             StepKind::Extreme { kind: ImageKind::Wide(_), .. } => {
@@ -980,6 +1028,53 @@ fn set_null_bits(null_bmp: &mut [u8], pi: usize, rows: impl Iterator<Item = (usi
     for (row, null) in rows {
         let b = &mut words[row][byte];
         *b = (*b & !bit) | if null { bit } else { 0 };
+    }
+}
+
+/// [`fold_cells`] over `($vals, $mb, $src, $ranges, $groups)`, the source
+/// column's cells `$n` bytes: a payload column's native ones, or a PK column's
+/// OPK images, `$contribution` reading them under `$opk`.
+macro_rules! fold_int_cells {
+    (($vals:expr, $mb:expr, $src:expr, $ranges:expr, $groups:expr), $n:expr, $reg:ty, |$opk:ident| $contribution:expr) => {
+        match $src {
+            ColumnLocator::Payload { .. } => {
+                const $opk: bool = false;
+                fold_cells::<{ $n }, $opk, $reg>($vals, $mb, $src, $ranges, $groups, $contribution)
+            }
+            ColumnLocator::Pk { .. } => {
+                const $opk: bool = true;
+                fold_cells::<{ $n }, $opk, $reg>($vals, $mb, $src, $ranges, $groups, $contribution)
+            }
+        }
+    };
+}
+use fold_int_cells;
+
+/// Into each group of `vals`, the least image of the scalar extreme over
+/// `src` among rows `ranges` whose weight `steps` and whose cell is not NULL;
+/// complemented for a MAX, as the value index holds it.
+#[inline(always)]
+fn fold_least(
+    (vals, mb, src, ranges, groups): (&mut Slots, &MemBatch, ColumnLocator, &[(usize, usize)], impl Groups),
+    scalar: ScalarKind,
+    max: bool,
+    steps: impl Fn(i64) -> bool + Copy,
+) {
+    let flip = if max { u64::MAX } else { 0 };
+    match scalar {
+        ScalarKind::Int(fi) => for_each_fixed_int!(fi, |FI| {
+            fold_int_cells!((vals, mb, src, ranges, groups), FI.width(), Least, |OPK| {
+                move |v, w, null| {
+                    (steps(w) && !null).then(|| ScalarKind::Int(FI).order_image(int_cell::<OPK>(FI, &v) as u64) ^ flip)
+                }
+            })
+        }),
+        ScalarKind::F32 => fold_cells::<4, false, Least>(vals, mb, src, ranges, groups, move |v, w, null| {
+            (steps(w) && !null).then(|| ScalarKind::F32.order_image(u32::from_le_bytes(v) as u64) ^ flip)
+        }),
+        ScalarKind::F64 => fold_cells::<8, false, Least>(vals, mb, src, ranges, groups, move |v, w, null| {
+            (steps(w) && !null).then(|| ScalarKind::F64.order_image(u64::from_le_bytes(v)) ^ flip)
+        }),
     }
 }
 

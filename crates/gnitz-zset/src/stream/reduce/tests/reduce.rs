@@ -31,13 +31,15 @@ pub(super) struct Harness {
     plan: ReducePlan,
     index: Option<TestTrace>,
     pub(super) out_trace: TestTrace,
+    /// How often the operator has opened the value index.
+    index_opens: usize,
 }
 
 impl Harness {
     pub(super) fn new(plan: ReducePlan) -> Self {
         let index = plan.index_schema().map(|schema| TestTrace::new(*schema));
         let out_trace = TestTrace::new(*plan.output_schema());
-        Harness { plan, index, out_trace }
+        Harness { plan, index, out_trace, index_opens: 0 }
     }
 
     /// Add `delta`'s entries to the value index, as the VM does ahead of
@@ -52,7 +54,9 @@ impl Harness {
     /// the keys the operator asks for.
     pub(super) fn reduce(&mut self, delta: &Batch) -> Batch {
         let mut open_out = |first: &[u8], last: &[u8]| self.out_trace.cursor_within(first, last);
+        let opens = &mut self.index_opens;
         let mut index = |first: &[u8], last: &[u8]| {
+            *opens += 1;
             let index = self.index.as_ref().expect("a plan with a value index");
             index.cursor_within(first, last)
         };
@@ -81,7 +85,7 @@ impl Harness {
     /// The epoch of its own a global aggregate's ground row is minted in: the
     /// row lands in the output's trace.
     fn ground(&mut self) {
-        if let Some(v0) = self.plan.ground_row().cloned() {
+        if let Some(v0) = self.plan.ground_row() {
             self.out_trace.ingest(v0);
         }
     }
@@ -153,6 +157,18 @@ fn arb_aggs() -> impl Strategy<Value = Vec<AggDescriptor>> {
     })
 }
 
+/// [`arb_row`] over four times its group keys: a spread `k` shifts its `id`,
+/// `grp` and `w`, so a group set reading one of those alone has more groups
+/// than an epoch emits a row at a time.
+fn arb_spread_row() -> impl Strategy<Value = Row> {
+    (arb_row(), 0u8..4).prop_map(|(r, k)| Row {
+        id: r.id.wrapping_add(k as u64),
+        grp: r.grp + 2 * k as i64,
+        w: r.w ^ ((k as u128) << 32),
+        ..r
+    })
+}
+
 /// After every epoch of `ticks` the maintained output is the aggregates of the
 /// integrated input, weights included.
 fn maintains(
@@ -200,7 +216,7 @@ proptest! {
         group_cols in prop::sample::select(&GROUPS[1..]),
         aggs in arb_aggs(),
         folded in any::<bool>(),
-        ticks in prop::collection::vec(arb_row(), 8..24).prop_flat_map(|pool| {
+        ticks in prop::collection::vec(arb_spread_row(), 8..24).prop_flat_map(|pool| {
             let target = (prop::sample::select(pool), 0i64..=3);
             prop::collection::vec(prop::collection::vec(target, 0..24), 1..5)
         }),
@@ -264,32 +280,207 @@ proptest! {
     }
 }
 
-/// A run of more delta rows than the run arm steps takes its extremes, the
-/// burst's own among them, from the index.
+/// Epochs over runs of more groups than one emits a row at a time, their
+/// extremes long strings: one whose groups are all fresh, and one with every
+/// outcome of a group's new row against its stored row, beside a run past the
+/// step cap that reads its extremes off the index.
 #[test]
-fn a_run_past_the_step_cap_reads_its_extremes_off_the_index() {
-    let aggs = [
-        AggDescriptor::COUNT_STAR,
-        agg(AggFunc::Min, 0),
-        agg(AggFunc::Max, 2),
-        agg(AggFunc::Sum, 0),
+fn a_gathered_epoch_over_runs_emits_every_outcome() {
+    const S: [&str; 6] = [
+        "a string extreme too long to be inlined 0",
+        "a string extreme too long to be inlined 1",
+        "a string extreme too long to be inlined 2",
+        "a string extreme too long to be inlined 3",
+        "a string extreme too long to be inlined 4",
+        "a string extreme too long to be inlined 5",
     ];
-    let row = |grp: i64, val: i64, s: &'static str| Row {
-        id: 7,
+    let aggs = [
+        agg(AggFunc::Min, 2),
+        agg(AggFunc::Max, 0),
+        agg(AggFunc::Sum, 7),
+        AggDescriptor::COUNT_STAR,
+    ];
+    let row = |id: u64, grp: i64, val: i64, s: usize| Row {
+        id,
         grp,
         val: Some(val),
-        s: Some(s),
+        s: Some(S[s]),
+        n: Some(1),
         ..Row::default()
     };
+    let pair = |id: u64| [(row(id, 0, 0, 3), 1), (row(id, 1, 1, 5), 1)];
+    let history: Vec<(Row, i64)> = (10..=18).chain([22]).flat_map(pair).collect();
+    // Fresh groups on both sides of the untouched group 22.
+    let fresh: Vec<(Row, i64)> = [20, 21, 23, 24, 25].into_iter().flat_map(pair).collect();
+    let mut outcomes = vec![
+        // A lower minimum, no retraction: stepped.
+        (row(10, 2, 0, 0), 1),
+        // A retraction lowering the maximum: probed.
+        (row(11, 1, 1, 5), 0),
+        // A swap keeping every aggregate.
+        (row(12, 1, 1, 5), 0),
+        (row(12, 2, 1, 5), 1),
+        // An emptied group.
+        (row(13, 0, 0, 3), 0),
+        (row(13, 1, 1, 5), 0),
+        // A higher maximum.
+        (row(14, 2, 9, 4), 1),
+    ];
+    // A run past the step cap.
+    outcomes.extend((100..240).map(|grp| (row(15, grp, grp % 7, (grp % 6) as usize), 1)));
+    outcomes.extend(pair(19));
+
     let mut h = Harness::new(ReducePlan::from_wire(&schema(), &[1], &aggs, false).unwrap());
     let mut model = BTreeMap::new();
-    let history = [(row(0, 0, "m"), 1)];
-    let burst: Vec<(Row, i64)> = (1..=200)
-        .map(|grp| (row(grp, grp - 100, ["a", "z"][grp as usize % 2]), 1))
-        .collect();
-    for targets in [&history[..], &burst[..]] {
-        h.tick(batch(&delta_to(&mut model, targets)));
+    for targets in [history, fresh, outcomes] {
+        h.tick(batch(&delta_to(&mut model, &targets)));
         assert_eq!(h.state(&[1]), aggregates(&model, &[1], &aggs, false));
+    }
+}
+
+/// Group 7's row `n`, of value `val` and string `s`.
+fn member(n: i64, val: Option<i64>, s: &'static str) -> Row {
+    Row {
+        id: 7,
+        grp: n,
+        val,
+        s: Some(s),
+        ..Row::default()
+    }
+}
+
+/// Whether an epoch setting `targets` in group 7 of a reduce grouped by `id`,
+/// after one setting `history`, opens the value index. With
+/// `bystander`, an insert into a fresh group joins the delta: two groups of a
+/// row or two each, which the ordinal arm folds; without, group 7 is one run.
+/// After each epoch the output is the aggregates of the integrated input.
+fn reads_index(aggs: &[AggDescriptor], history: &[(Row, i64)], targets: &[(Row, i64)], bystander: bool) -> bool {
+    let mut h = Harness::new(ReducePlan::from_wire(&schema(), &[1], aggs, false).unwrap());
+    let mut model = BTreeMap::new();
+    let fresh = (
+        Row {
+            id: 9,
+            val: Some(0),
+            s: Some("b"),
+            ..Row::default()
+        },
+        1,
+    );
+    let targets: Vec<(Row, i64)> = targets.iter().copied().chain(bystander.then_some(fresh)).collect();
+    let mut opens = 0;
+    for targets in [history, &targets[..]] {
+        opens = h.index_opens;
+        h.tick(batch(&delta_to(&mut model, targets)));
+        assert_eq!(h.state(&[1]), aggregates(&model, &[1], aggs, false));
+    }
+    h.index_opens > opens
+}
+
+/// MIN and MAX of the nullable `val`, and a SUM beside them.
+fn scalar_extremes() -> [AggDescriptor; 4] {
+    [
+        AggDescriptor::COUNT_STAR,
+        agg(AggFunc::Min, 0),
+        agg(AggFunc::Max, 0),
+        agg(AggFunc::Sum, 0),
+    ]
+}
+
+/// A group whose retractions leave its scalar extremes in place reads them
+/// off its delta and its stored row: a retraction strictly between its MIN
+/// and its MAX, or of a NULL, opens no index, in either arm.
+#[test]
+fn a_retraction_that_leaves_the_extremes_in_place_reads_no_index() {
+    let history = [
+        (member(0, Some(1), "m"), 1),
+        (member(1, Some(5), "m"), 1),
+        (member(2, None, "m"), 1),
+        (member(3, Some(9), "m"), 1),
+    ];
+    for bystander in [false, true] {
+        let inner = [(member(1, Some(5), "m"), 0)];
+        assert!(!reads_index(&scalar_extremes(), &history, &inner, bystander));
+        let null = [(member(2, None, "m"), 0)];
+        assert!(!reads_index(&scalar_extremes(), &history, &null, bystander));
+        // An insert beside it moves an extreme without the index.
+        let moved = [(member(1, Some(5), "m"), 0), (member(4, Some(0), "m"), 1)];
+        assert!(!reads_index(&scalar_extremes(), &history, &moved, bystander));
+    }
+}
+
+/// A retraction of a stored extreme reads the index unless the delta inserts
+/// a value at or past it, or empties the group: the extreme held twice keeps
+/// its value, and one held once recedes to the next.
+#[test]
+fn a_retraction_of_an_extreme_reads_the_index_unless_an_insert_reaches_it() {
+    let history = [
+        (member(0, Some(3), "m"), 1),
+        (member(1, Some(3), "m"), 1),
+        (member(2, Some(6), "m"), 1),
+        (member(3, Some(9), "m"), 1),
+    ];
+    for bystander in [false, true] {
+        let reads = |targets: &[(Row, i64)]| reads_index(&scalar_extremes(), &history, targets, bystander);
+        // MIN 3 held twice, and MAX 9 held once.
+        assert!(reads(&[(member(0, Some(3), "m"), 0)]));
+        assert!(reads(&[(member(3, Some(9), "m"), 0)]));
+        // An insert at the retracted extreme, or past it.
+        for v in [3, 2] {
+            assert!(!reads(&[(member(0, Some(3), "m"), 0), (member(4, Some(v), "m"), 1)]));
+        }
+        for v in [9, 10] {
+            assert!(!reads(&[(member(3, Some(9), "m"), 0), (member(4, Some(v), "m"), 1)]));
+        }
+        // An insert short of it: the extreme recedes to the history's next.
+        assert!(reads(&[(member(3, Some(9), "m"), 0), (member(4, Some(7), "m"), 1)]));
+        // Emptied, the group has no extreme to read.
+        let emptied: Vec<(Row, i64)> = history.iter().map(|&(r, _)| (r, 0)).collect();
+        assert!(!reads(&emptied));
+        assert!(reads(&[
+            (member(0, Some(3), "m"), 0),
+            (member(1, Some(3), "m"), 0),
+            (member(4, Some(4), "m"), 1),
+        ]));
+    }
+}
+
+/// A capped run steps none of its rows for its extremes, so it reads every
+/// one off the index, whatever it retracts.
+#[test]
+fn a_capped_run_reads_its_extremes_off_the_index() {
+    let history = [(member(0, Some(3), "m"), 1), (member(1, Some(9), "m"), 1)];
+    let burst = |extra: &[(Row, i64)]| -> Vec<(Row, i64)> {
+        let rows = (2..=200).map(|n| (member(n, Some(n % 50 + 4), "m"), 1));
+        extra.iter().copied().chain(rows).collect()
+    };
+    assert!(reads_index(&scalar_extremes(), &history, &burst(&[]), false));
+    assert!(reads_index(
+        &scalar_extremes(),
+        &history,
+        &burst(&[(member(1, Some(9), "m"), 0)]),
+        false
+    ));
+}
+
+/// A wide extreme folds no retraction, so any retraction of its group reads
+/// it off the index, in either arm; a scalar extreme beside it still reads
+/// its own off the delta.
+#[test]
+fn a_retraction_reads_a_wide_extreme_off_the_index() {
+    let aggs = [
+        AggDescriptor::COUNT_STAR,
+        agg(AggFunc::Min, 2),
+        agg(AggFunc::Max, 2),
+        agg(AggFunc::Min, 0),
+    ];
+    let history = [
+        (member(0, Some(1), "a"), 1),
+        (member(1, Some(5), "m"), 1),
+        (member(2, Some(9), "z"), 1),
+    ];
+    for bystander in [false, true] {
+        assert!(reads_index(&aggs, &history, &[(member(1, Some(5), "m"), 0)], bystander));
+        assert!(reads_index(&aggs, &history, &[(member(0, Some(1), "a"), 0)], bystander));
     }
 }
 
@@ -632,6 +823,28 @@ fn a_plan_reused_across_epochs_emits_what_a_fresh_plan_emits() {
             );
         }
     }
+}
+
+/// An epoch that grows the plan's buffers past what it keeps, such as a
+/// backfill, leaves the plan without them; the next small epoch builds them
+/// again and keeps them.
+#[test]
+fn a_plan_drops_scratch_a_large_epoch_grew() {
+    let aggs = [AggDescriptor::COUNT_STAR, agg(AggFunc::Min, 0)];
+    let mut h = Harness::new(ReducePlan::from_wire(&schema(), &[1], &aggs, false).unwrap());
+    let row = |id: u64| Row {
+        id,
+        val: Some(id as i64),
+        ..Row::default()
+    };
+    let mut model = BTreeMap::new();
+    let ins: Vec<(Row, i64)> = (0..5000).map(|id| (row(id), 1)).collect();
+    h.tick(batch(&delta_to(&mut model, &ins)));
+    assert!(h.plan.scratch.is_none());
+    let del: Vec<(Row, i64)> = (0..3).map(|id| (row(id), 0)).collect();
+    h.tick(batch(&delta_to(&mut model, &del)));
+    assert!(h.plan.scratch.is_some());
+    assert_eq!(h.state(&[1]), aggregates(&model, &[1], &aggs, false));
 }
 
 /// A float sum is of its rows' finite values, and the infinity counts carry

@@ -15,8 +15,10 @@ mod tests;
 
 use std::cmp::Ordering;
 
-use crate::algebra::{ground_pk, vec_bytes, Agg, AggValues, GroupScratch, RangeGroups, ReduceShape};
-use crate::repr::{Batch, CursorRow, GroupProbe, MemBatch, ReadCursor};
+use crate::algebra::{
+    ground_pk, vec_bytes, Agg, AggValues, GroupOrdinals, GroupScratch, OutPk, RangeGroups, ReduceShape,
+};
+use crate::repr::{Batch, CursorRow, DirectWriter, GroupProbe, MemBatch, ReadCursor};
 use crate::schema::SchemaDescriptor;
 use crate::stream::OpenAt;
 use gnitz_wire::AggDescriptor;
@@ -27,9 +29,8 @@ use value_index::ValueIndex;
 /// The baked per-instruction circuit reduce plan.
 pub struct ReducePlan {
     shape: ReduceShape,
-    /// The row a global aggregate publishes over an empty input; `None` for a
-    /// reduce that owes none.
-    ground: Option<Batch>,
+    /// Whether this global aggregate publishes a row over an empty input.
+    seeds_ground: bool,
     /// Position of the COUNT(*) holding a group's net row count.
     count_star: usize,
     /// The value index the non-linear aggregates read their history from.
@@ -45,24 +46,43 @@ struct ReduceScratch {
     grouping: GroupScratch,
     /// The delta's groups as row runs, where it stands in group order.
     runs: Vec<(usize, usize)>,
+    /// `runs` with each capped run emptied.
+    uncapped: Vec<(usize, usize)>,
     /// `runs` with each probed run emptied.
     unprobed: Vec<(usize, usize)>,
     /// What the fold leaves [`emit_groups`].
     emit: EmitScratch,
 }
 
+/// Which of a group's extremes come off the value index.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// None: an extreme recedes only on a retraction, so an all-insert group's
+    /// extremes are its rows' and its stored row's.
+    No,
+    /// Each one a retraction may have receded past: [`AggValues::recedes`].
+    Retracts,
+    /// Every one: its rows stepped none, or its retractions were not folded.
+    Every,
+}
+
 /// The buffers [`emit_groups`] reads and fills.
 struct EmitScratch {
     vals: AggValues,
-    /// Per group, whether its extremes come off the value index; empty for a
+    /// Per probed group, the least image each scalar extreme retracts that no
+    /// insert of the group reaches: [`AggValues::fold_retracted`].
+    retracted: AggValues,
+    /// Per group, which of its extremes come off the value index. Empty for a
     /// reduce without one.
-    probes: Vec<bool>,
+    probes: Vec<Probe>,
     /// The stored rows of the groups that have one, in output order.
     stored: Vec<CursorRow>,
     /// Per stored row, its group.
     stored_groups: Vec<u32>,
     /// The output rows, as rows of the stored and fresh rows they copy.
     out_rows: Vec<u32>,
+    /// The groups with a new row and no stored row, in output order.
+    fresh: Vec<u32>,
     /// Per new row copied off a stored row, its output row and its group.
     derived: Vec<(u32, u32)>,
 }
@@ -73,13 +93,16 @@ impl ReduceScratch {
         ReduceScratch {
             grouping: GroupScratch::default(),
             runs: Vec::new(),
+            uncapped: Vec::new(),
             unprobed: Vec::new(),
             emit: EmitScratch {
                 vals: AggValues::new(&shape.aggs, 0),
+                retracted: AggValues::new(&shape.aggs, 0),
                 probes: Vec::new(),
                 stored: Vec::new(),
                 stored_groups: Vec::new(),
                 out_rows: Vec::new(),
+                fresh: Vec::new(),
                 derived: Vec::new(),
             },
         }
@@ -90,12 +113,15 @@ impl ReduceScratch {
         let e = &self.emit;
         self.grouping.held_bytes()
             + vec_bytes(&self.runs)
+            + vec_bytes(&self.uncapped)
             + vec_bytes(&self.unprobed)
             + e.vals.held_bytes()
+            + e.retracted.held_bytes()
             + vec_bytes(&e.probes)
             + vec_bytes(&e.stored)
             + vec_bytes(&e.stored_groups)
             + vec_bytes(&e.out_rows)
+            + vec_bytes(&e.fresh)
             + vec_bytes(&e.derived)
     }
 }
@@ -151,15 +177,9 @@ impl ReducePlan {
         );
         let (shape, _) = ReduceShape::new(input, group_cols, aggs)?;
         let value_index = ValueIndex::new(input, group_cols, &shape.aggs)?;
-        let ground = seeds_ground.then(|| {
-            let mut v0 = Batch::with_capacity(&shape.output_schema, 1);
-            let values = AggValues::new(&shape.aggs, 1);
-            values.emit_row(&mut v0, None, &ground_pk(), 0);
-            v0
-        });
         Ok(ReducePlan {
             shape,
-            ground,
+            seeds_ground,
             count_star,
             value_index,
             scratch: None,
@@ -168,8 +188,12 @@ impl ReducePlan {
 
     /// The row a global aggregate publishes over an empty input; `None` for a
     /// reduce that owes none.
-    pub fn ground_row(&self) -> Option<&Batch> {
-        self.ground.as_ref()
+    pub fn ground_row(&self) -> Option<Batch> {
+        self.seeds_ground.then(|| {
+            let mut v0 = Batch::with_capacity(&self.shape.output_schema, 1);
+            AggValues::new(&self.shape.aggs, 1).emit_row(&mut v0, None, &ground_pk(), 0);
+            v0
+        })
     }
 
     /// The layout `op_reduce` emits under this plan.
@@ -208,6 +232,11 @@ fn count_star(aggs: &[AggDescriptor]) -> Result<usize, String> {
 /// extremes off the value index instead of stepping its rows: one seek in place
 /// of stepping every row.
 const RUN_STEP_CAP: usize = 128;
+
+/// In the ordinal arm, the most delta rows per probed group at which the
+/// retractions are folded to spare the seeks of extremes they leave in place:
+/// past it, the pass costs more than the seeks it would spare.
+const RETRACTED_FOLD_ROWS: usize = 64;
 
 /// One epoch of the reduce, its output consolidated.
 ///
@@ -252,74 +281,106 @@ fn reduce_epoch(
     let retracts = |w: &[u8; 8]| i64::from_le_bytes(*w) <= 0;
     let indexed = plan.value_index.is_some();
     let aggs = &shape.aggs;
-    let ReduceScratch { grouping, runs, unprobed, emit } = s;
-    let EmitScratch { vals, probes, .. } = emit;
+    let ReduceScratch { grouping, runs, uncapped, unprobed, emit } = s;
+    let EmitScratch { vals, retracted, probes, .. } = emit;
 
     let in_runs = shape.key.runs_into(delta, runs);
     if in_runs && (runs.len() == 1 || 2 * runs.len() <= delta.len()) {
         let ranges = &runs[..];
-        // An extreme recedes only on a retraction, so an all-insert group's
-        // extremes are its rows' and its stored row's: no probe.
         probes.clear();
         if indexed {
-            let probed = |&(s, e): &(usize, usize)| e - s > RUN_STEP_CAP || weights[s..e].iter().any(retracts);
-            probes.extend(ranges.iter().map(probed));
+            // Each run's weights scanned whole and branch-free: a run of
+            // inserts reads every one either way.
+            probes.extend(ranges.iter().map(|&(s, e)| {
+                if e - s > RUN_STEP_CAP {
+                    Probe::Every
+                } else if weights[s..e].iter().fold(false, |any, w| any | retracts(w)) {
+                    Probe::Retracts
+                } else {
+                    Probe::No
+                }
+            }));
         }
-        // A probed run's extremes come off the index: an extreme folds the
-        // runs with each of those emptied, so it steps none of its rows.
-        let stepped: &[(usize, usize)] = match probes.contains(&true) {
-            true => {
-                let keep = |(&(s, e), &probe): (&(usize, usize), &bool)| (s, if probe { s } else { e });
-                unprobed.clear();
-                unprobed.extend(ranges.iter().zip(probes.iter()).map(keep));
-                &unprobed[..]
-            }
-            false => ranges,
+        // A capped run steps none of its rows for its extremes, and a
+        // retracting one none for its wide ones, which fold no retraction.
+        let (uncapped, unprobed) = match probes.iter().any(|&p| p != Probe::No) {
+            true => (
+                emptied(ranges, uncapped, |g| probes[g] == Probe::Every),
+                emptied(ranges, unprobed, |g| probes[g] != Probe::No),
+            ),
+            false => (ranges, ranges),
         };
         vals.reset(ranges.len());
         for (k, agg) in aggs.iter().enumerate() {
-            let folded = if agg.is_linear() { ranges } else { stepped };
+            let folded = match agg.is_linear() {
+                true => ranges,
+                false if agg.is_wide() => unprobed,
+                false => uncapped,
+            };
             vals.fold(k, &mb, folded, RangeGroups::Each);
         }
-        let order = ranges.iter().enumerate().map(|(g, &(first, _))| (first, g, None));
-        return emit_groups(plan, &mb, out_trace, index, emit, order);
-    }
-    match in_runs {
-        true => grouping.groups.fill_runs(runs),
-        false => shape.key.numbered_into(delta, grouping),
-    }
-    let groups = &grouping.groups;
+        if probes.contains(&Probe::Retracts) {
+            retracted.fold_retracted(&mb, uncapped, RangeGroups::Each, vals);
+        }
+        grouping.groups.fill_heads(ranges);
+    } else {
+        match in_runs {
+            true => grouping.groups.fill_runs(runs),
+            false => shape.key.numbered_into(delta, grouping),
+        }
+        let groups = &grouping.groups;
 
-    vals.reset(groups.len());
-    for k in 0..aggs.len() {
-        vals.fold(k, &mb, &[(0, delta.len())], &groups.ord[..]);
-    }
-    // Per group, whether its extremes come off the index. Every row is stepped
-    // whatever its group then reads, so only a retraction sends one there.
-    probes.clear();
-    if indexed {
-        probes.resize(groups.len(), false);
-        let probed = &mut probes[..];
-        for (&g, w) in groups.ord.iter().zip(weights) {
-            probed[g as usize] |= retracts(w);
+        probes.clear();
+        if indexed {
+            probes.resize(groups.len(), Probe::No);
+            for (&g, w) in groups.ord.iter().zip(weights) {
+                if retracts(w) {
+                    probes[g as usize] = Probe::Retracts;
+                }
+            }
+        }
+        let retracting = probes.iter().filter(|&&p| p == Probe::Retracts).count();
+        // A retracting group's wide extremes come off the index, so its rows
+        // step none of them; a scalar one costs less to step than to skip.
+        let all = &[(0, delta.len())];
+        vals.reset(groups.len());
+        for (k, agg) in aggs.iter().enumerate() {
+            match retracting > 0 && agg.is_wide() {
+                true => vals.fold_wide(k, &mb, all, &groups.ord[..], |g| probes[g] != Probe::No),
+                false => vals.fold(k, &mb, all, &groups.ord[..]),
+            }
+        }
+        if retracting * RETRACTED_FOLD_ROWS >= delta.len() {
+            retracted.fold_retracted(&mb, all, &groups.ord[..], vals);
+        } else if retracting > 0 {
+            probes
+                .iter_mut()
+                .filter(|p| **p == Probe::Retracts)
+                .for_each(|p| *p = Probe::Every);
         }
     }
-    let order = groups.by_pk.iter().map(|&g| {
-        (
-            groups.first[g as usize] as usize,
-            g as usize,
-            groups.ids.get(g as usize).copied(),
-        )
-    });
-    emit_groups(plan, &mb, out_trace, index, emit, order)
+    emit_groups(plan, &mb, out_trace, index, emit, &grouping.groups)
 }
 
-/// Emit each group of `order` merged with its history, as a retraction and a
-/// new row. `order` yields a delta row of each group, the group's index in
-/// `s.vals` and the identity its numbering kept for it, if any, in ascending
-/// output-PK order. A group `g` with `s.probes[g]` reads its extremes off the
-/// value index, whatever `s.vals` holds for them; `s.probes` is empty for a
-/// reduce without a value index.
+/// `ranges` with each run `g` that `skip(g)` emptied, in `out`.
+fn emptied<'a>(
+    ranges: &[(usize, usize)],
+    out: &'a mut Vec<(usize, usize)>,
+    skip: impl Fn(usize) -> bool,
+) -> &'a [(usize, usize)] {
+    out.clear();
+    out.extend(
+        ranges
+            .iter()
+            .enumerate()
+            .map(|(g, &(s, e))| (s, if skip(g) { s } else { e })),
+    );
+    out
+}
+
+/// Emit each group of `groups` merged with its history, as a retraction and a
+/// new row, in ascending output-PK order. A group reads the extremes its
+/// `s.probes` names off the value index, whatever `s.vals` holds for them.
 ///
 /// The retraction is the group's stored row, and its new row equals it in
 /// every column but the aggregates, the trailing ones: the two order, and
@@ -330,45 +391,31 @@ fn emit_groups(
     out_trace: OpenAt<'_>,
     index: Option<OpenAt<'_>>,
     s: &mut EmitScratch,
-    order: impl DoubleEndedIterator<Item = Group> + ExactSizeIterator + Clone,
+    groups: &GroupOrdinals,
 ) -> Batch {
     debug_assert!(
-        plan.ground.is_none() || order.len() == 1,
+        !plan.seeds_ground || groups.len() == 1,
         "a global aggregate has one group"
     );
-    let key = &plan.shape.key;
-    let row = |end: Option<Group>| end.expect("a delta with a row has a group").0;
-    let (lo, hi) = (row(order.clone().next()), row(order.clone().next_back()));
-    let mut out_trace = out_trace(key.out_pk(delta, lo).bytes(), key.out_pk(delta, hi).bytes());
-    let EmitScratch {
-        vals,
-        probes,
-        stored,
-        stored_groups,
-        out_rows,
-        derived,
-    } = s;
-    let mut value_index = plan.value_index.as_ref().and_then(|value_index| {
-        let probed = order.clone().filter(|&(_, g, _)| probes[g]).map(|(row, _, _)| row);
-        let (lo, hi) = value_index.group_span(delta, probed)?;
-        let open = index.expect("a value-indexed reduce is handed its index");
-        Some((value_index, open(lo.pk_bytes(), hi.pk_bytes())))
-    });
+    let heads = GroupHeads { plan, delta, groups };
+    let end = |g: Option<&u32>| heads.out_pk(*g.expect("a delta with a row has a group"));
+    let mut out_trace = out_trace(end(groups.by_pk.first()).bytes(), end(groups.by_pk.last()).bytes());
+    let mut index_cursor = None;
 
     // A trace with no row at the delta's groups holds no group's history.
     let traced = out_trace.is_valid();
     let probe = out_trace.group_probe();
-    let mut groups = GroupEmit {
-        plan,
-        delta,
+    let mut emit = GroupEmit {
+        heads,
         probe,
-        value_index: &mut value_index,
-        vals,
-        probes,
+        index,
+        index_cursor: &mut index_cursor,
+        s,
     };
-    let mut out = match order.len() <= ROW_EPOCH_GROUPS || !traced {
-        true => groups.emit_by_row(order, traced),
-        false => groups.emit_gathered(order, stored, stored_groups, out_rows, derived),
+    let mut out = match (groups.len() <= ROW_EPOCH_GROUPS, traced) {
+        (true, _) => emit.emit_by_row(traced),
+        (false, false) => emit.emit_fresh_columns(),
+        (false, true) => emit.emit_gathered(),
     };
     out.certify_consolidated();
     out
@@ -391,154 +438,237 @@ fn new_row(
         "reduce input must be bag-positive: negative group cardinality"
     );
     if cardinality == 0 {
-        plan.ground.as_ref()?;
+        if !plan.seeds_ground {
+            return None;
+        }
         vals.clear();
     }
     Some(stored.map_or(Ordering::Less, |(rows, row)| vals.cmp_stored(g, rows, row)))
 }
 
-/// A group of the delta: a row of it, its index in the values and the identity
-/// its numbering kept for it, if any.
-type Group = (usize, usize, Option<u128>);
-
-/// The most groups an epoch emits a row at a time: up to this, a column
-/// kernel's fixed cost is more than its rows' copies cost one by one.
+/// The most groups an epoch emits a row at a time, and past which a column at a
+/// time: up to this, a column kernel's fixed cost is more than its rows' copies
+/// cost one by one.
 const ROW_EPOCH_GROUPS: usize = 4;
 
-/// What [`emit_groups`] reads each group's history through.
-struct GroupEmit<'a, 'b> {
+/// Where each group of an epoch's delta stands in it.
+#[derive(Clone, Copy)]
+struct GroupHeads<'a, 'b> {
     plan: &'a ReducePlan,
     delta: &'a MemBatch<'b>,
-    probe: GroupProbe<'a>,
-    value_index: &'a mut Option<(&'a ValueIndex, ReadCursor)>,
-    vals: &'a mut AggValues,
-    probes: &'a [bool],
+    groups: &'a GroupOrdinals,
 }
 
-impl GroupEmit<'_, '_> {
-    /// Group `g`, of delta row `first`, seeded from the value index if it reads
-    /// its extremes off it: after its stored row is folded, so they are the
-    /// index's alone.
-    fn seed(&mut self, first: usize, g: usize) {
-        if let Some((value_index, cursor)) = self.value_index.as_mut().filter(|_| self.probes[g]) {
-            value_index.seed_extremes(cursor, self.delta, first, self.vals, g);
+impl<'a> GroupHeads<'a, '_> {
+    /// Group `g`'s first delta row.
+    #[inline(always)]
+    fn first(&self, g: u32) -> usize {
+        self.groups.first[g as usize] as usize
+    }
+
+    /// Group `g`'s output PK.
+    #[inline(always)]
+    fn out_pk(&self, g: u32) -> OutPk<'a> {
+        let id = self.groups.ids.get(g as usize).copied();
+        self.plan.shape.key.out_pk_with(self.delta, self.first(g), id)
+    }
+
+    /// The new rows of groups `fresh`, none with a stored row, onto `w` a
+    /// column at a time: each at +1, its group columns gathered off its first
+    /// delta row, its aggregates off `vals`.
+    #[inline(always)]
+    fn write_fresh(&self, vals: &AggValues, w: &mut DirectWriter<'_>, fresh: &[u32]) {
+        let (keys, weights, nulls) = w.fixed_mut();
+        for (key, &g) in keys
+            .chunks_exact_mut(self.plan.shape.output_schema.pk_stride())
+            .zip(fresh)
+        {
+            key.copy_from_slice(self.out_pk(g).bytes());
+        }
+        weights.as_chunks_mut::<8>().0.fill(1i64.to_le_bytes());
+        nulls.fill(0);
+        let firsts = fresh.iter().map(|&g| self.first(g));
+        w.gather_cells_from(self.plan.shape.key.carried(), self.delta, firsts);
+        vals.emit_at(w, fresh.iter().enumerate().map(|(row, &g)| (row, g as usize)));
+    }
+}
+
+/// What [`emit_groups`] reads each group's history through.
+struct GroupEmit<'a, 'b, 'c> {
+    heads: GroupHeads<'a, 'b>,
+    probe: GroupProbe<'a>,
+    /// What opens the value index.
+    index: Option<OpenAt<'c>>,
+    /// The value index opened at the probed groups, once a group seeks in it.
+    /// Borrowed: a cursor is too large to move into this per epoch.
+    index_cursor: &'a mut Option<ReadCursor>,
+    s: &'a mut EmitScratch,
+}
+
+impl GroupEmit<'_, '_, '_> {
+    /// Group `g` seeded from the value index at the extremes its probe names:
+    /// after its stored row is folded, so the probe sees the stored extreme and
+    /// a seeded one is the index's alone. An emptied group has no extremes to
+    /// seed.
+    #[inline(always)]
+    fn seed(&mut self, g: u32) {
+        let probe = self.s.probes.get(g as usize).copied().unwrap_or(Probe::No);
+        if probe != Probe::No && self.s.vals.count_value(self.heads.plan.count_star, g as usize) > 0 {
+            self.seed_probed(g, probe);
         }
     }
 
+    /// [`Self::seed`] of a probed group, the index opened at the first that
+    /// seeks in it.
+    #[inline(never)]
+    fn seed_probed(&mut self, g: u32, probe: Probe) {
+        let GroupEmit { heads, index, index_cursor, s, .. } = self;
+        let EmitScratch { vals, retracted, probes, .. } = &mut **s;
+        let value_index = heads
+            .plan
+            .value_index
+            .as_ref()
+            .expect("a reduce that probes has a value index");
+        let open = index.as_mut().expect("a value-indexed reduce is handed its index");
+        let gi = g as usize;
+        let open = || {
+            let probed = heads.groups.by_pk.iter().filter(|&&g| probes[g as usize] != Probe::No);
+            let (lo, hi) = value_index
+                .group_span(heads.delta, probed.map(|&g| heads.first(g)))
+                .expect("a probed group spans its own key");
+            open(lo.pk_bytes(), hi.pk_bytes())
+        };
+        let retracted = (probe == Probe::Retracts).then_some(&*retracted);
+        value_index.seed_extremes((index_cursor, open), heads.delta, heads.first(g), vals, gi, retracted);
+    }
+
     /// Append the new row of group `g` under `out_pk`, its group columns read
-    /// off delta row `first`.
+    /// off its first delta row.
     #[inline(always)]
-    fn emit_fresh(&self, out: &mut Batch, out_pk: &[u8], first: usize, g: usize) {
-        let group = Some((self.delta, first, self.plan.shape.key.carried()));
-        self.vals.emit_row(out, group, out_pk, g);
+    fn emit_fresh(&self, out: &mut Batch, out_pk: &[u8], g: u32) {
+        let heads = &self.heads;
+        let group = Some((heads.delta, heads.first(g), heads.plan.shape.key.carried()));
+        self.s.vals.emit_row(out, group, out_pk, g as usize);
     }
 
     /// The groups one at a time: each group's stored row, found where
     /// `traced`, folded and copied off the trace, its new row written off its
     /// delta row.
-    fn emit_by_row(&mut self, order: impl ExactSizeIterator<Item = Group>, traced: bool) -> Batch {
-        // A group emits at most its retraction and its new row.
-        let mut out = Batch::with_capacity(&self.plan.shape.output_schema, 2 * order.len());
-        for (first, g, id) in order {
-            let out_pk = self.plan.shape.key.out_pk_with(self.delta, first, id);
+    fn emit_by_row(&mut self, traced: bool) -> Batch {
+        let heads = self.heads;
+        // A group emits at most its retraction and its new row; untraced, its
+        // new row alone.
+        let rows = heads.groups.len() << usize::from(traced);
+        let mut out = Batch::with_capacity(&heads.plan.shape.output_schema, rows);
+        for &g in &heads.groups.by_pk {
+            let out_pk = heads.out_pk(g);
             let at = traced.then(|| self.probe.find(out_pk.bytes())).flatten();
             if let Some(at) = at {
                 let (rows, row) = self.probe.row_at(at);
-                self.vals.fold_stored(g, rows, row);
+                self.s.vals.fold_stored(g as usize, rows, row);
             }
-            self.seed(first, g);
-            let new = new_row(self.plan, self.vals, g, at.map(|at| self.probe.row_at(at)));
+            self.seed(g);
+            let stored = at.map(|at| self.probe.row_at(at));
+            let new = new_row(heads.plan, &mut self.s.vals, g as usize, stored);
             if new == Some(Ordering::Equal) {
                 continue;
             }
             if new == Some(Ordering::Less) {
-                self.emit_fresh(&mut out, out_pk.bytes(), first, g);
+                self.emit_fresh(&mut out, out_pk.bytes(), g);
             }
             if let Some(at) = at {
                 self.probe.copy_row_into(at, &mut out, -1);
             }
             if new == Some(Ordering::Greater) {
-                self.emit_fresh(&mut out, out_pk.bytes(), first, g);
+                self.emit_fresh(&mut out, out_pk.bytes(), g);
             }
         }
+        out
+    }
+
+    /// The groups, none with a stored row, a column at a time: each group's new
+    /// row, its group columns gathered off its first delta row.
+    fn emit_fresh_columns(&mut self) -> Batch {
+        let heads = self.heads;
+        self.s.fresh.clear();
+        for &g in &heads.groups.by_pk {
+            self.seed(g);
+            if new_row(heads.plan, &mut self.s.vals, g as usize, None::<(&MemBatch, usize)>).is_some() {
+                self.s.fresh.push(g);
+            }
+        }
+        let EmitScratch { vals, fresh, .. } = &*self.s;
+        let mut out = Batch::with_capacity(&heads.plan.shape.output_schema, fresh.len());
+        out.write_rows(fresh.len(), |w| heads.write_fresh(vals, w, fresh));
         out
     }
 
     /// The groups a column at a time: the stored rows gathered off the trace
     /// in one pass and folded, then each copied out as the retraction and, its
     /// aggregates rewritten, as the new row.
-    fn emit_gathered(
-        &mut self,
-        order: impl ExactSizeIterator<Item = Group> + Clone,
-        stored: &mut Vec<CursorRow>,
-        stored_groups: &mut Vec<u32>,
-        out_rows: &mut Vec<u32>,
-        derived: &mut Vec<(u32, u32)>,
-    ) -> Batch {
-        let key = &self.plan.shape.key;
-        stored.clear();
-        stored_groups.clear();
-        for (first, g, id) in order.clone() {
-            if let Some(at) = self.probe.find(key.out_pk_with(self.delta, first, id).bytes()) {
-                stored.push(at);
-                stored_groups.push(g as u32);
+    fn emit_gathered(&mut self) -> Batch {
+        let heads = self.heads;
+        self.s.stored.clear();
+        self.s.stored_groups.clear();
+        for &g in &heads.groups.by_pk {
+            if let Some(at) = self.probe.find(heads.out_pk(g).bytes()) {
+                self.s.stored.push(at);
+                self.s.stored_groups.push(g);
             }
         }
-        if stored.is_empty() {
-            // Every group is fresh.
-            return self.emit_by_row(order, false);
+        if self.s.stored.is_empty() {
+            return self.emit_fresh_columns();
         }
 
         // The stored rows, then the new rows of the groups with none.
-        let mut rows = Batch::with_capacity(&self.plan.shape.output_schema, order.len());
-        self.probe.gather_into(stored, &mut rows);
-        self.vals.fold_stored_rows(&rows.as_mem_batch(), stored_groups);
+        let mut rows = Batch::with_capacity(&heads.plan.shape.output_schema, heads.groups.len());
+        self.probe.gather_into(&self.s.stored, &mut rows);
+        // Folded at +1, which a COUNT reads; from here each is its retraction.
+        self.s
+            .vals
+            .fold_stored_rows(&rows.as_mem_batch(), &self.s.stored_groups);
+        rows.map_weights(|_| -1);
 
-        out_rows.clear();
-        derived.clear();
+        self.s.out_rows.clear();
+        self.s.fresh.clear();
+        self.s.derived.clear();
         let mut next = 0;
-        for (first, g, id) in order {
+        for &g in &heads.groups.by_pk {
             // The stored row of the group, if it has one.
-            let h = (stored_groups.get(next) == Some(&(g as u32))).then(|| {
+            let h = (self.s.stored_groups.get(next) == Some(&g)).then(|| {
                 next += 1;
                 next as u32 - 1
             });
-            self.seed(first, g);
+            self.seed(g);
             let mb = rows.as_mem_batch();
-            let new = new_row(self.plan, self.vals, g, h.map(|h| (&mb, h as usize)));
+            let new = new_row(heads.plan, &mut self.s.vals, g as usize, h.map(|h| (&mb, h as usize)));
             let Some(h) = h else {
-                // A fresh group's new row is written whole behind the stored rows.
+                // A fresh group's new row is written behind the stored rows.
                 if new.is_some() {
-                    out_rows.push(rows.len() as u32);
-                    let out_pk = key.out_pk_with(self.delta, first, id);
-                    self.emit_fresh(&mut rows, out_pk.bytes(), first, g);
+                    self.s.out_rows.push((self.s.stored.len() + self.s.fresh.len()) as u32);
+                    self.s.fresh.push(g);
                 }
                 continue;
             };
             match new {
-                None => out_rows.push(h),
+                None => self.s.out_rows.push(h),
                 Some(Ordering::Equal) => {}
                 // The new row is a copy of the stored row, its aggregates
                 // rewritten, on its side of the retraction.
                 Some(ord) => {
-                    derived.push((out_rows.len() as u32 + u32::from(ord.is_gt()), g as u32));
-                    out_rows.extend([h, h]);
+                    let row = self.s.out_rows.len() as u32 + u32::from(ord.is_gt());
+                    self.s.derived.push((row, g));
+                    self.s.out_rows.extend([h, h]);
                 }
             }
         }
-
-        let retracted = stored.len() as u32;
-        let vals = &*self.vals;
+        let EmitScratch { vals, out_rows, fresh, derived, .. } = &*self.s;
+        rows.write_rows(fresh.len(), |w| heads.write_fresh(vals, w, fresh));
         rows.indexed_rows_then(out_rows, |w| {
-            // Every row copies one at +1: a stored row's copy is its
-            // retraction, but where it is a new row.
+            // Every row copies at its own weight: a stored row at −1, a fresh
+            // row at +1. A new row copied off a stored row is set to +1.
             let weights = w.weight_mut().as_chunks_mut::<8>().0;
-            for (cell, &h) in weights.iter_mut().zip(out_rows.iter()) {
-                if h < retracted {
-                    *cell = (-1i64).to_le_bytes();
-                }
-            }
-            for &(row, _) in derived.iter() {
+            for &(row, _) in derived {
                 weights[row as usize] = 1i64.to_le_bytes();
             }
             vals.emit_at(w, derived.iter().map(|&(row, g)| (row as usize, g as usize)));

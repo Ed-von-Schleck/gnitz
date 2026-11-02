@@ -147,7 +147,7 @@ fn an_empty_tick_lands_only_an_owed_ground_row() {
     let once = register_identity_view(&mut engine, base, "once", &u64_i64_cols());
     let (count, plan) = register_count(&mut engine, base, &[], "count");
     let ground = plan.ground_row().unwrap();
-    let ground = zset_of(ground, ground.schema());
+    let ground = zset_of(&ground, ground.schema());
 
     tick(&mut engine, base, 1).unwrap();
     assert!(held(&mut engine, count).is_empty(), "no tick mints the ground row");

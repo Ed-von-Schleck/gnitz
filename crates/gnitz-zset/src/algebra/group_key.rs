@@ -457,7 +457,7 @@ const HASH_MIN_ROWS: usize = 16;
 /// groups is one pass per column.
 #[derive(Default)]
 pub(crate) struct GroupOrdinals {
-    /// Row → group ordinal.
+    /// Row → group ordinal; empty after [`Self::fill_heads`].
     pub(crate) ord: Vec<u32>,
     /// Group ordinal → its first row.
     pub(crate) first: Vec<u32>,
@@ -486,17 +486,23 @@ impl GroupOrdinals {
         taken
     }
 
-    /// Run `g` is group `g`.
-    pub(crate) fn fill_runs(&mut self, runs: &[(usize, usize)]) {
-        let GroupOrdinals { mut ord, mut first, mut by_pk, ids } = self.take_cleared();
-        ord.reserve(runs.last().map_or(0, |&(_, end)| end));
-        first.reserve(runs.len());
-        for (g, &(start, end)) in runs.iter().enumerate() {
-            first.push(start as u32);
-            ord.extend(std::iter::repeat_n(g as u32, end - start));
-        }
+    /// Run `g` is group `g`, its rows not numbered: `ord` is left empty, for a
+    /// fold over the runs themselves.
+    pub(crate) fn fill_heads(&mut self, runs: &[(usize, usize)]) {
+        let GroupOrdinals { ord, mut first, mut by_pk, ids } = self.take_cleared();
+        first.extend(runs.iter().map(|&(start, _)| start as u32));
         by_pk.extend(0..runs.len() as u32);
         *self = GroupOrdinals { ord, first, by_pk, ids };
+    }
+
+    /// Run `g` is group `g`.
+    pub(crate) fn fill_runs(&mut self, runs: &[(usize, usize)]) {
+        self.fill_heads(runs);
+        let ord = &mut self.ord;
+        ord.reserve(runs.last().map_or(0, |&(_, end)| end));
+        for (g, &(start, end)) in runs.iter().enumerate() {
+            ord.extend(std::iter::repeat_n(g as u32, end - start));
+        }
     }
 
     /// Groups numbered in ascending `key` order, found by sorting the rows; `id`

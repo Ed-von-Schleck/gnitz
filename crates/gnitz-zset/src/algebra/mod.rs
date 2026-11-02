@@ -40,7 +40,7 @@ pub use route::{ground_owner, Placement, Slot};
 pub use sink::SinkPlan;
 
 pub(crate) use aggregate::{resolve_aggs, Agg, AggValues, RangeGroups, ReduceShape};
-pub(crate) use group_key::{ground_pk, GroupOutKey, GroupScratch};
+pub(crate) use group_key::{ground_pk, GroupOrdinals, GroupOutKey, GroupScratch, OutPk};
 pub(crate) use key_pack::KeyPacker;
 pub(crate) use map::copy_columns;
 pub(crate) use order_image::{image_slot_col, ImageCol, IMAGE_COL};
