@@ -383,6 +383,9 @@ pub(crate) struct HirAgg {
     pub arg: AggArg<ColId>,
     pub out: AggCol,
     pub companion: Option<AggCol>,
+    /// A [`WireAggFunc::FiniteSum`]'s counts of +inf and of -inf rows, NaN
+    /// under both.
+    pub infs: Option<[AggCol; 2]>,
 }
 
 impl HirAgg {
@@ -421,12 +424,16 @@ impl HirAgg {
             arg,
             out: col(value),
             companion: count.map(col),
+            infs: (value == WireAggFunc::FiniteSum)
+                .then(|| [col(WireAggFunc::CountPosInf), col(WireAggFunc::CountNegInf)]),
         })
     }
 
-    /// Its physical columns: the value, then the count.
+    /// Its physical columns: the value, the count, then the infinity counts.
     pub(crate) fn cols(&self) -> impl Iterator<Item = &AggCol> {
-        std::iter::once(&self.out).chain(&self.companion)
+        std::iter::once(&self.out)
+            .chain(&self.companion)
+            .chain(self.infs.iter().flatten())
     }
 
     /// The physical columns of `aggs`: each once, in first-use order.
@@ -443,8 +450,27 @@ impl HirAgg {
     /// The SELECT/HAVING value over this aggregate's raw reduce column(s): the
     /// raw value when it has no count companion ([`crate::agg::agg_ops`]), else
     /// NULL on a zero count — AVG as a float division by the count, every other
-    /// aggregate as a CASE on it.
+    /// aggregate as a CASE on it. A float SUM or AVG over a row of +inf is +inf,
+    /// over one of -inf is -inf, and over both, or over a NaN, is NaN.
     pub(crate) fn finalize(&self) -> HirExpr {
+        let value = self.finite_value();
+        let Some([pos, neg]) = &self.infs else {
+            return value;
+        };
+        let some = |c: &AggCol| BExpr::bin(BExpr::ColRef(c.col.id), BinOp::Ne, BExpr::LitInt(0));
+        let float = |v: f64| BExpr::LitFloat { v, dec: None };
+        BExpr::Case {
+            branches: vec![
+                (BExpr::bin(some(pos), BinOp::And, some(neg)), float(f64::NAN)),
+                (some(pos), float(f64::INFINITY)),
+                (some(neg), float(f64::NEG_INFINITY)),
+            ],
+            else_: Box::new(value),
+        }
+    }
+
+    /// [`Self::finalize`] over the finite values alone.
+    fn finite_value(&self) -> HirExpr {
         let value = BExpr::ColRef(self.out.col.id);
         let Some(count) = &self.companion else {
             return value;

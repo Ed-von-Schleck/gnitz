@@ -142,26 +142,39 @@ pub(crate) const fn agg(agg_op: AggFunc, col_idx: u32) -> AggDescriptor {
     AggDescriptor { agg_op, col_idx }
 }
 
-/// `agg` over one group's weighted rows of [`schema`], by its SQL definition: a
+/// `agg` over one group's weighted rows of [`schema`], by its definition: a
 /// float sum is each value widened to `f64` times its weight, added in row
-/// order.
+/// order, a finite sum the same over the finite values alone, and an infinity
+/// count counts NaN under both signs.
 pub(crate) fn agg_of(agg: AggDescriptor, rows: &[(Cells, i64)]) -> Option<Vec<u8>> {
     let col = agg.col_idx as usize;
     let tc = schema().columns()[col].type_code;
     let live = || rows.iter().filter_map(|(r, w)| r[col].as_deref().map(|c| (c, *w)));
     let i64_cell = |v: i64| Some(v.to_le_bytes().to_vec());
+    let widen = |c: &[u8]| match tc {
+        TypeCode::F32 => f32::from_le_bytes(c.try_into().unwrap()) as f64,
+        _ => f64::from_le_bytes(c.try_into().unwrap()),
+    };
     match agg.agg_op {
         AggFunc::Count => i64_cell(rows.iter().map(|(_, w)| w).sum()),
         AggFunc::CountNonNull => i64_cell(live().map(|(_, w)| w).sum()),
-        AggFunc::Sum if matches!(tc, TypeCode::F32 | TypeCode::F64) => {
-            let widen = |c: &[u8]| match tc {
-                TypeCode::F32 => f32::from_le_bytes(c.try_into().unwrap()) as f64,
-                _ => f64::from_le_bytes(c.try_into().unwrap()),
+        AggFunc::CountPosInf | AggFunc::CountNegInf => {
+            let inf = match agg.agg_op {
+                AggFunc::CountPosInf => f64::INFINITY,
+                _ => f64::NEG_INFINITY,
             };
-            let sum = live().fold(0f64, |a, (c, w)| a + widen(c) * w as f64);
+            let counted = |v: f64| v.is_nan() || v == inf;
+            i64_cell(live().filter(|&(c, _)| counted(widen(c))).map(|(_, w)| w).sum())
+        }
+        AggFunc::Sum | AggFunc::FiniteSum if tc.is_float() => {
+            let finite = |v: &f64| agg.agg_op == AggFunc::Sum || v.is_finite();
+            let sum = live()
+                .map(|(c, w)| (widen(c), w))
+                .filter(|(v, _)| finite(v))
+                .fold(0f64, |a, (v, w)| a + v * w as f64);
             Some(sum.to_le_bytes().to_vec())
         }
-        AggFunc::Sum => {
+        AggFunc::Sum | AggFunc::FiniteSum => {
             let int = FixedInt::from_type_code(tc).expect("an integer sum reads a narrow integer");
             i64_cell(live().fold(0, |a, (c, w)| a.wrapping_add(int.decode_le_i64(c).wrapping_mul(w))))
         }

@@ -32,8 +32,17 @@ pub(crate) struct Agg {
 enum StepKind {
     Count,
     CountNonNull,
-    /// A float sum holds `f64` bits whatever the source width.
+    /// A count of the rows whose float value is NaN or the infinity of `neg`'s
+    /// sign, over a source of float kind `kind`.
+    CountInf {
+        neg: bool,
+        kind: ScalarKind,
+    },
+    /// A sum; a float one holds `f64` bits whatever its source's width.
     Sum(ScalarKind),
+    /// [`AggFunc::FiniteSum`], over a source of float kind `kind`. A finite sum
+    /// that overflows is ±inf, and stays so until its group empties.
+    FiniteSum(ScalarKind),
     /// A scalar extreme is held as the value index holds it, complemented for
     /// MAX, so the smaller image always wins.
     Extreme {
@@ -43,14 +52,19 @@ enum StepKind {
 }
 
 impl StepKind {
+    /// `op` over a column of type `tc`.
     fn of(op: AggFunc, tc: TypeCode) -> Self {
+        let scalar =
+            || ScalarKind::from_type_code(tc).expect("AggFunc::output_type admits this aggregate only over a scalar");
         match op {
             AggFunc::Count => StepKind::Count,
             AggFunc::CountNonNull => StepKind::CountNonNull,
-            AggFunc::Sum => StepKind::Sum(
-                ScalarKind::from_type_code(tc)
-                    .expect("AggFunc::output_type admits a sum only over a scalar register image"),
-            ),
+            AggFunc::CountPosInf | AggFunc::CountNegInf => StepKind::CountInf {
+                neg: op == AggFunc::CountNegInf,
+                kind: scalar(),
+            },
+            AggFunc::Sum => StepKind::Sum(scalar()),
+            AggFunc::FiniteSum => StepKind::FiniteSum(scalar()),
             AggFunc::Min | AggFunc::Max => StepKind::Extreme {
                 max: op == AggFunc::Max,
                 kind: ImageKind::of(tc),
@@ -423,7 +437,7 @@ impl Agg {
     pub(crate) fn is_exact_linear(&self) -> bool {
         matches!(
             self.kind,
-            StepKind::Count | StepKind::CountNonNull | StepKind::Sum(ScalarKind::Int(_))
+            StepKind::Count | StepKind::CountNonNull | StepKind::CountInf { .. } | StepKind::Sum(ScalarKind::Int(_))
         )
     }
 
@@ -495,17 +509,24 @@ impl AggValues {
         }
         match kind {
             StepKind::Count | StepKind::CountNonNull => IntSum::step(&mut self.slot(k, g), 0, weight),
+            StepKind::CountInf { neg, kind } => {
+                if counts_inf(float_cell(kind, loc.bytes(rows, row)), neg) {
+                    IntSum::step(&mut self.slot(k, g), 0, weight)
+                }
+            }
+            StepKind::FiniteSum(kind) => {
+                let v = float_cell(kind, loc.bytes(rows, row));
+                if v.is_finite() {
+                    FloatSum::step(&mut self.slot(k, g), 0, v * weight as f64)
+                }
+            }
             StepKind::Sum(ScalarKind::Int(fi)) => IntSum::step(
                 &mut self.slot(k, g),
                 0,
                 loc.decode_i64(rows, row, fi).wrapping_mul(weight),
             ),
-            StepKind::Sum(ScalarKind::F32) => {
-                let v = f32::from_le_bytes(loc.bytes(rows, row).try_into().unwrap());
-                FloatSum::step(&mut self.slot(k, g), 0, v as f64 * weight as f64)
-            }
-            StepKind::Sum(ScalarKind::F64) => {
-                let v = f64::from_le_bytes(loc.bytes(rows, row).try_into().unwrap());
+            StepKind::Sum(kind) => {
+                let v = float_cell(kind, loc.bytes(rows, row));
                 FloatSum::step(&mut self.slot(k, g), 0, v * weight as f64)
             }
             StepKind::Extreme { max, kind } => {
@@ -577,6 +598,22 @@ impl AggValues {
                 }
             };
         }
+        // `$contribution` over a float column of kind `$kind`, each cell
+        // widened to `f64`. A float is never a PK column.
+        macro_rules! fold_float {
+            ($kind:expr, $reg:ty, |$v:ident, $w:ident, $null:ident| $contribution:expr) => {
+                match $kind {
+                    ScalarKind::F32 => fold!(4, false, $reg, move |c, $w, $null| {
+                        let $v = f32::from_le_bytes(c) as f64;
+                        $contribution
+                    }),
+                    _ => fold!(8, false, $reg, move |c, $w, $null| {
+                        let $v = f64::from_le_bytes(c);
+                        $contribution
+                    }),
+                }
+            };
+        }
         match kind {
             // Reads no column.
             StepKind::Count => fold!(0, false, IntSum, |_, w, _| Some(w)),
@@ -591,13 +628,13 @@ impl AggValues {
                     })
                 })
             }),
-            // A float is never a PK column.
-            StepKind::Sum(ScalarKind::F32) => fold!(4, false, FloatSum, |v, w, null| {
-                (!null).then(|| f32::from_le_bytes(v) as f64 * w as f64)
+            StepKind::CountInf { neg, kind } => fold_float!(kind, IntSum, |v, w, null| {
+                Some(w * (!null && counts_inf(v, neg)) as i64)
             }),
-            StepKind::Sum(ScalarKind::F64) => fold!(8, false, FloatSum, |v, w, null| {
-                (!null).then(|| f64::from_le_bytes(v) * w as f64)
+            StepKind::FiniteSum(kind) => fold_float!(kind, FloatSum, |v, w, null| {
+                (!null && v.is_finite()).then_some(v * w as f64)
             }),
+            StepKind::Sum(kind) => fold_float!(kind, FloatSum, |v, w, null| (!null).then_some(v * w as f64)),
             StepKind::Extreme { max, kind: ImageKind::Scalar(scalar) } => {
                 // A MAX keeps the smallest complement, as the value index does.
                 let flip = if max { u64::MAX } else { 0 };
@@ -822,7 +859,10 @@ impl AggValues {
             let ord = match (agg.kind, agg.out) {
                 // A count or an integer sum over an 8-byte cell, never NULL.
                 (
-                    StepKind::Count | StepKind::CountNonNull | StepKind::Sum(ScalarKind::Int(_)),
+                    StepKind::Count
+                    | StepKind::CountNonNull
+                    | StepKind::CountInf { .. }
+                    | StepKind::Sum(ScalarKind::Int(_)),
                     ColumnLocator::Payload { slot, size: 8, type_code },
                 ) => {
                     debug_assert!(!gnitz_wire::null_word_get(nulls, slot as usize));
@@ -889,6 +929,24 @@ impl AggValues {
             ),
         }
     }
+}
+
+/// A float cell of kind `kind`, widened to `f64`.
+#[inline(always)]
+fn float_cell(kind: ScalarKind, cell: &[u8]) -> f64 {
+    match kind {
+        ScalarKind::F32 => f32::from_le_bytes(cell.try_into().unwrap()) as f64,
+        _ => f64::from_le_bytes(cell.try_into().unwrap()),
+    }
+}
+
+/// Whether [`StepKind::CountInf`] counts `v`: NaN, or the infinity of `neg`'s
+/// sign. A NaN counts under both signs, as a sum holding one is NaN just as a
+/// sum holding both infinities is.
+#[inline(always)]
+fn counts_inf(v: f64, neg: bool) -> bool {
+    let toward = if neg { -v } else { v };
+    toward == f64::INFINITY || toward.is_nan()
 }
 
 /// The 8-byte integer `v` against `cell`'s, both of integer type `tc`.

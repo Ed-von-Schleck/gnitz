@@ -27,6 +27,19 @@ fn output_type_is_count_i64_min_max_identity_and_sum_widening() {
     ] {
         assert_eq!(AggFunc::Sum.output_type(src), want, "SUM over {src}");
     }
+    // A float's infinity counts are I64 and its finite sum F64; nothing else
+    // has an infinity.
+    for &tc in TypeCode::ALL {
+        let want = tc.is_float().then_some(I64);
+        for f in [AggFunc::CountPosInf, AggFunc::CountNegInf] {
+            assert_eq!(f.output_type(tc), want, "{f:?} over {tc}");
+        }
+        assert_eq!(
+            AggFunc::FiniteSum.output_type(tc),
+            tc.is_float().then_some(F64),
+            "FiniteSum over {tc}"
+        );
+    }
 }
 
 /// A partial's merge aggregate keeps the partial's type.
@@ -43,10 +56,17 @@ fn agg_merge_preserves_output_type() {
     }
 }
 
-/// COUNT and SUM never render NULL; MIN/MAX do over a nullable source or with no group.
+/// A count and a SUM never render NULL; MIN/MAX do over a nullable source or with no group.
 #[test]
 fn raw_output_nullable_matches_emit_semantics() {
-    for f in [AggFunc::Count, AggFunc::CountNonNull, AggFunc::Sum] {
+    for f in [
+        AggFunc::Count,
+        AggFunc::CountNonNull,
+        AggFunc::CountPosInf,
+        AggFunc::CountNegInf,
+        AggFunc::Sum,
+        AggFunc::FiniteSum,
+    ] {
         for src_nullable in [false, true] {
             for ungrouped in [false, true] {
                 assert!(!f.raw_output_nullable(src_nullable, ungrouped), "{f:?}");

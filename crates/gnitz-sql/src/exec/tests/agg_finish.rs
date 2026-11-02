@@ -86,11 +86,26 @@ fn partials_finish_to_one_row_per_group() {
     );
     let v0: &[u128] = &[global_group_key()];
     let global = "SELECT COUNT(*), SUM(x), SUM(f), MIN(sm), MAX(s), AVG(u) FROM t";
-    // COUNT(*), then SUM(x), SUM(f) and AVG(u)'s sum each with its non-null count, MIN, MAX.
-    let ground: &[Cell] = &[Int(0), Int(0), Int(0), F64(0.0), Int(0), Null, Null, Int(0), Int(0)];
+    // COUNT(*), then SUM(x) and SUM(f) each with its non-null count, SUM(f)'s
+    // +inf and -inf counts, MIN, MAX, then AVG(u)'s sum and count.
+    let ground: &[Cell] = &[
+        Int(0),
+        Int(0),
+        Int(0),
+        F64(0.0),
+        Int(0),
+        Int(0),
+        Int(0),
+        Null,
+        Null,
+        Int(0),
+        Int(0),
+    ];
+    // SUM(f) and AVG(f) share their sum, count and infinity counts.
+    let float = "SELECT SUM(f), AVG(f) FROM t";
     let neg = -1i32 as u128;
     let neg3 = -3i64 as u64 as u128;
-    let cases: [(&str, &Arc<RelDescriptor>, Rows, Rows); 11] = [
+    let cases: [(&str, &Arc<RelDescriptor>, Rows, Rows); 13] = [
         // A lone non-NULL group column is the partial's key, decoded back out by finalize.
         (
             "SELECT n, COUNT(*), SUM(x) FROM t GROUP BY n",
@@ -139,6 +154,8 @@ fn partials_finish_to_one_row_per_group() {
                         Int(3),
                         F64(1.5),
                         Int(3),
+                        Int(0),
+                        Int(0),
                         Int(-5),
                         Null,
                         Int(u64::MAX as i128),
@@ -154,6 +171,8 @@ fn partials_finish_to_one_row_per_group() {
                         Int(2),
                         F64(2.25),
                         Int(2),
+                        Int(0),
+                        Int(0),
                         Int(3),
                         Str(LONG_Z),
                         Int(0),
@@ -168,6 +187,8 @@ fn partials_finish_to_one_row_per_group() {
                         Int(1),
                         F64(0.0),
                         Int(1),
+                        Int(0),
+                        Int(0),
                         Int(-7),
                         Str(LONG_M),
                         Int(0),
@@ -193,6 +214,26 @@ fn partials_finish_to_one_row_per_group() {
             &t,
             &[(v0, ground), (v0, ground)],
             &[(v0, &[Int(0), Null, Null, Null, Null, Null])],
+        ),
+        // The finite sum is overridden once a worker's partial counted an
+        // infinity, and the counts of every worker's partials add.
+        (
+            float,
+            &t,
+            &[
+                (v0, &[F64(1.5), Int(1), Int(0), Int(0)]),
+                (v0, &[F64(0.0), Int(1), Int(0), Int(1)]),
+            ],
+            &[(v0, &[F64(f64::NEG_INFINITY), F64(f64::NEG_INFINITY)])],
+        ),
+        (
+            float,
+            &t,
+            &[
+                (v0, &[F64(1.5), Int(1), Int(0), Int(0)]),
+                (v0, &[F64(2.5), Int(3), Int(1), Int(0)]),
+            ],
+            &[(v0, &[F64(f64::INFINITY), F64(f64::INFINITY)])],
         ),
         // Group 0x2 passes HAVING only once its two partials merge.
         (

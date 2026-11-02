@@ -212,6 +212,9 @@ fn fold_line(agg: &GroupAggs, reduce_schema: &Schema, has_having: bool, is_disti
                 AggFunc::Min => "MIN",
                 AggFunc::Max => "MAX",
                 AggFunc::CountNonNull => "COUNT_NON_NULL",
+                AggFunc::CountPosInf => "COUNT_POS_INF",
+                AggFunc::CountNegInf => "COUNT_NEG_INF",
+                AggFunc::FiniteSum => "FINITE_SUM",
             };
             format!("{op}({})", reduce_schema.columns()[s.col_idx as usize].name)
         })

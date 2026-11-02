@@ -132,10 +132,17 @@ fn aggregates(
 }
 
 /// A COUNT(*) among up to three aggregates over any column that admits them.
-/// The summed float is `x` alone: its values sum exactly, where `f`'s do not.
+/// The plainly summed float is `x` alone, whose values are finite; both
+/// floats' finite values sum exactly.
 fn arb_aggs() -> impl Strategy<Value = Vec<AggDescriptor>> {
+    let float = prop_oneof![
+        Just(AggFunc::CountPosInf),
+        Just(AggFunc::CountNegInf),
+        Just(AggFunc::FiniteSum)
+    ];
     let one = prop_oneof![
         (0u32..8).prop_map(|c| agg(AggFunc::CountNonNull, c)),
+        (float, 4u32..6).prop_map(|(f, c)| agg(f, c)),
         prop::sample::select(&[0u32, 1, 3, 5, 7][..]).prop_map(|c| agg(AggFunc::Sum, c)),
         (0u32..8).prop_map(|c| agg(AggFunc::Min, c)),
         (0u32..8).prop_map(|c| agg(AggFunc::Max, c)),
@@ -206,8 +213,8 @@ proptest! {
     #[test]
     fn two_workers_partials_combine_to_the_global_aggregates(
         aggs in arb_aggs().prop_map(|mut aggs| {
-            // The float sum has no partial.
-            aggs.retain(|d| !(d.agg_op == AggFunc::Sum && d.col_idx == 5));
+            // A float sum has no partial.
+            aggs.retain(|d| !(matches!(d.agg_op, AggFunc::Sum | AggFunc::FiniteSum) && matches!(d.col_idx, 4 | 5)));
             aggs
         }),
         ticks in arb_ticks(arb_row()),
@@ -388,6 +395,9 @@ fn every_aggregate_but_a_float_sum_splits() {
         (agg(AggFunc::Sum, 7), true),
         (agg(AggFunc::Sum, 5), false),
         (agg(AggFunc::Sum, 4), false),
+        (agg(AggFunc::FiniteSum, 4), false),
+        (agg(AggFunc::CountPosInf, 4), true),
+        (agg(AggFunc::CountNegInf, 5), true),
         (agg(AggFunc::Min, 0), true),
         (agg(AggFunc::Max, 0), true),
     ] {
@@ -418,23 +428,33 @@ fn a_scalar_extreme_zero_pads_the_value_slot_a_wide_one_widens() {
     assert_eq!(&key[n - 8..], &[0u8; 8], "zero padding");
 }
 
-/// SUM over an F64 column is each non-NULL value times its weight, added in row
-/// order — through the run arm, the ordinal arm and the ad-hoc fold.
+/// SUM over a float column is each non-NULL value, an F32 one widened to f64,
+/// times its weight, added in row order: through the run arm, the ordinal arm
+/// and the ad-hoc fold.
 #[test]
-fn a_float_sum_weighs_each_value() {
-    let aggs = [AggDescriptor::COUNT_STAR, agg(AggFunc::Sum, 4)];
-    let row = |id: u64, grp: i64, f: f64| Row {
+fn a_float_sum_weighs_each_value_in_f64() {
+    let aggs = [AggDescriptor::COUNT_STAR, agg(AggFunc::Sum, 4), agg(AggFunc::Sum, 5)];
+    let row = |id: u64, grp: i64, f: f64, x: f32| Row {
         id,
         grp,
         f: f.to_bits(),
+        x: x.to_bits(),
         ..Row::default()
     };
     let rows = [
-        (row(1, 0, 1.5), 3),
-        (row(2, 0, 0.25), 2),
-        (row(3, -1, 8.0), 5),
-        (row(4, 0, -4.0), 1),
+        (row(1, 0, 0.1, 0.1), 3),
+        (row(2, 0, 1e-9, 16_777_217.0), 3),
+        (row(3, 0, 1.0, 0.3), 7),
+        (row(4, -1, -4.0, -2.5), 1),
     ];
+    // The model's sums of group 0, pinned: an F64 sum keeps the bits an f32
+    // cannot, and an F32 value is widened before it is weighed.
+    let want_f = 0.1f64 * 3.0 + 1e-9 * 3.0 + 1.0 * 7.0;
+    let want_x = 0.1f32 as f64 * 3.0 + 16_777_217.0f32 as f64 * 3.0 + 0.3f32 as f64 * 7.0;
+    let grp0: Vec<(Cells, i64)> = rows[..3].iter().map(|(r, w)| (cells(r), *w)).collect();
+    assert_eq!(agg_of(agg(AggFunc::Sum, 4), &grp0), Some(want_f.to_le_bytes().to_vec()));
+    assert_eq!(agg_of(agg(AggFunc::Sum, 5), &grp0), Some(want_x.to_le_bytes().to_vec()));
+
     let model: BTreeMap<Row, i64> = rows.iter().copied().collect();
     for group_cols in [&[][..], &[3], &[1], &[0]] {
         let want = aggregates(&model, group_cols, &aggs, false);
@@ -513,48 +533,6 @@ fn two_string_extremes_keep_their_own_index_images() {
     for targets in [&first[..], &second[..]] {
         h.tick(batch(&delta_to(&mut model, targets)));
         assert_eq!(h.state(&[3]), aggregates(&model, &[3], &aggs, false));
-    }
-}
-
-/// A float SUM adds in f64: an F32 value is widened before it is weighed, and
-/// an F64 sum keeps the bits an f32 cannot.
-#[test]
-fn a_float_sum_is_carried_in_f64() {
-    let row = |id: u64, f: f64, x: f32| Row {
-        id,
-        f: f.to_bits(),
-        x: x.to_bits(),
-        ..Row::default()
-    };
-    let rows = [
-        (row(1, 0.1, 0.1), 3),
-        (row(2, 1e-9, 16_777_217.0), 3),
-        (row(3, 1.0, 0.3), 7),
-    ];
-    let want_f = [0.1f64 * 3.0, 1e-9 * 3.0, 1.0 * 7.0].iter().fold(0f64, |a, v| a + v);
-    let want_x = [0.1f32 as f64 * 3.0, 16_777_217.0f32 as f64 * 3.0, 0.3f32 as f64 * 7.0]
-        .iter()
-        .fold(0f64, |a, v| a + v);
-    let aggs = [AggDescriptor::COUNT_STAR, agg(AggFunc::Sum, 4), agg(AggFunc::Sum, 5)];
-    let read = |b: &Batch| {
-        let mb = b.as_mem_batch();
-        let n = b.schema().num_columns();
-        let f = |c: usize| f64::from_le_bytes(cell(&mb, b.schema().locate(c), 0).unwrap().try_into().unwrap());
-        assert_eq!(b.len(), 1);
-        (f(n - 2), f(n - 1))
-    };
-    for group_cols in [&[][..], &[3]] {
-        let mut h = Harness::new(ReducePlan::from_wire(&schema(), group_cols, &aggs, false).unwrap());
-        h.tick(batch(&rows));
-        assert_eq!(
-            read(&h.out_trace.cursor().materialize()),
-            (want_f, want_x),
-            "reduce, group {group_cols:?}"
-        );
-        let mut fold = fold_sink(group_cols, aggs.to_vec(), usize::MAX).unwrap();
-        let mut all = RowFilter::for_read(&[], None, &schema()).unwrap();
-        fold.push(Cow::Owned(batch(&rows)), &mut all).unwrap();
-        assert_eq!(read(&fold.finish()), (want_f, want_x), "ad hoc, group {group_cols:?}");
     }
 }
 
@@ -653,5 +631,78 @@ fn a_plan_reused_across_epochs_emits_what_a_fresh_plan_emits() {
                 "{group_cols:?}: epoch {t}"
             );
         }
+    }
+}
+
+/// A float sum is of its rows' finite values, and the infinity counts carry
+/// the rest, so a sum that held +inf, -inf or NaN returns to the sum of its
+/// rows once they are retracted — maintained and ad hoc.
+#[test]
+fn a_float_sum_recovers_once_its_non_finite_rows_are_retracted() {
+    let row = |id: u64, f: f64, x: f32| Row {
+        id,
+        f: f.to_bits(),
+        x: x.to_bits(),
+        ..Row::default()
+    };
+    let (inf, nan) = (f64::INFINITY, f64::NAN);
+    let aggs = [
+        AggDescriptor::COUNT_STAR,
+        agg(AggFunc::FiniteSum, 4),
+        agg(AggFunc::FiniteSum, 5),
+        agg(AggFunc::CountPosInf, 4),
+        agg(AggFunc::CountNegInf, 4),
+        agg(AggFunc::CountPosInf, 5),
+        agg(AggFunc::CountNegInf, 5),
+    ];
+    let ticks: [&[(Row, i64)]; 4] = [
+        &[
+            (row(1, 1.0, 1.0), 1),
+            (row(2, inf, -inf as f32), 1),
+            (row(3, nan, 2.5), 2),
+        ],
+        &[(row(2, inf, -inf as f32), -1), (row(4, -inf, nan as f32), 1)],
+        &[(row(5, 0.5, inf as f32), 3), (row(4, -inf, nan as f32), -1)],
+        &[(row(3, nan, 2.5), -2), (row(5, 0.5, inf as f32), -3)],
+    ];
+    for group_cols in [&[][..], &[3]] {
+        let mut h = Harness::new(ReducePlan::from_wire(&schema(), group_cols, &aggs, false).unwrap());
+        let mut model = BTreeMap::new();
+        for t in ticks {
+            h.tick(batch(t));
+            for &(r, w) in t {
+                *model.entry(r).or_insert(0) += w;
+            }
+            model.retain(|_, w| *w != 0);
+            let want = aggregates(&model, group_cols, &aggs, false);
+            assert_eq!(h.state(group_cols), want, "group {group_cols:?}");
+
+            let mut fold = fold_sink(group_cols, aggs.to_vec(), usize::MAX).unwrap();
+            let mut all = RowFilter::for_read(&[], None, &schema()).unwrap();
+            fold.push(
+                Cow::Owned(batch(&model.iter().map(|(&r, &w)| (r, w)).collect::<Vec<_>>())),
+                &mut all,
+            )
+            .unwrap();
+            assert_eq!(
+                output_rows(&fold.finish(), group_cols),
+                want,
+                "ad hoc, group {group_cols:?}"
+            );
+        }
+        let out = h.out_trace.cursor().materialize();
+        let mb = out.as_mem_batch();
+        let n = out.schema().num_columns();
+        let cell_at = |c: usize| cell(&mb, out.schema().locate(c), 0).unwrap();
+        assert_eq!(
+            f64::from_le_bytes(cell_at(n - 6).try_into().unwrap()),
+            1.0,
+            "SUM(f), group {group_cols:?}"
+        );
+        assert_eq!(
+            f64::from_le_bytes(cell_at(n - 5).try_into().unwrap()),
+            1.0,
+            "SUM(x), group {group_cols:?}"
+        );
     }
 }

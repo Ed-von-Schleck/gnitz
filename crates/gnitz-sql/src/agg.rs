@@ -93,7 +93,8 @@ pub(crate) fn agg_func_name(f: AggFunc) -> &'static str {
 }
 
 /// An aggregate's physical value op, and the count op its null-ness is read off
-/// when it has one. The one type gate every aggregate call goes through.
+/// when it has one. The one type gate every aggregate call goes through. A
+/// [`WireAggFunc::FiniteSum`] value is read with its infinity counts.
 pub(crate) fn agg_ops(
     func: AggFunc,
     arg: Option<&ColumnDef>,
@@ -112,13 +113,18 @@ pub(crate) fn agg_ops(
     } else {
         WireAggFunc::Count
     };
+    // A float sum is of the finite values, its infinities counted beside it.
+    let sum = match arg.is_some_and(|c| c.ty.tc.is_float()) {
+        true => WireAggFunc::FiniteSum,
+        false => WireAggFunc::Sum,
+    };
     let ops = match func {
         AggFunc::Count => (count, None),
         AggFunc::Min => (WireAggFunc::Min, None),
         AggFunc::Max => (WireAggFunc::Max, None),
         // A raw SUM is 0 over no non-null row: its count says whether there was one.
-        AggFunc::Sum => (WireAggFunc::Sum, (nullable || ungrouped).then_some(count)),
-        AggFunc::Avg => (WireAggFunc::Sum, Some(count)),
+        AggFunc::Sum => (sum, (nullable || ungrouped).then_some(count)),
+        AggFunc::Avg => (sum, Some(count)),
     };
     if let Some(c) = arg {
         if ops.0.output_type(c.ty.tc).is_none() {

@@ -3,13 +3,15 @@ use crate::test_support::{col, ncol, rejected};
 use WireAggFunc as W;
 
 /// An aggregate's physical ops: a count over a NOT NULL argument counts rows, a
-/// count companion rides exactly where null-ness needs one, and only SUM and AVG
-/// are refused a type — MIN, MAX and COUNT select or count a row of any.
+/// count companion rides exactly where null-ness needs one, a float SUM or AVG
+/// sums the finite values, and only SUM and AVG are refused a type — MIN, MAX
+/// and COUNT select or count a row of any.
 #[test]
 fn agg_ops_picks_the_value_op_and_the_count_its_nullness_needs() {
     use AggFunc::*;
     let nullable = ncol("x", TypeCode::I64);
     let not_null = col("y", TypeCode::I64);
+    let float = col("f", TypeCode::F32);
     let (blob, uuid, string) = (
         ncol("b", TypeCode::Blob),
         col("u", TypeCode::UUID),
@@ -26,6 +28,9 @@ fn agg_ops_picks_the_value_op_and_the_count_its_nullness_needs() {
         (Sum, Some(&not_null), false, (W::Sum, None)),
         (Sum, Some(&not_null), true, (W::Sum, Some(W::Count))),
         (Sum, Some(&nullable), true, (W::Sum, Some(W::CountNonNull))),
+        (Sum, Some(&float), false, (W::FiniteSum, None)),
+        (Avg, Some(&float), false, (W::FiniteSum, Some(W::Count))),
+        (Min, Some(&float), false, (W::Min, None)),
         (Min, Some(&not_null), true, (W::Min, None)),
         (Min, Some(&string), false, (W::Min, None)),
         (Max, Some(&uuid), false, (W::Max, None)),

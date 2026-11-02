@@ -492,3 +492,58 @@ fn op_reduce_wide_bench() {
         }
     }
 }
+
+/// Instructions per delta row of `op_reduce` over a float SUM alone and as a
+/// view plans one, a finite sum with its +inf and -inf counts, over finite F64
+/// and F32 values: runs of 16 rows of the leading PK column, 8 scattered rows a
+/// group, and one global group; three epochs each, as [`op_reduce_bench`]'s.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn op_reduce_float_sum_bench() {
+    use AggFunc::{CountNegInf, CountPosInf, FiniteSum, Sum};
+    const N: u64 = 1 << 16;
+    let counter = Counter::instructions();
+    for tc in [TypeCode::F64, TypeCode::F32] {
+        let value = SchemaColumn::new(tc, false);
+        let runs = compound_schema(value);
+        let keyed = u64_pk_schema(&[SchemaColumn::new(TypeCode::I64, false), value]);
+        let make = |schema: &SchemaDescriptor, salt: u64| {
+            let mut bb = BatchBuilder::new(schema);
+            for i in 0..N {
+                match schema.pk_cols().len() {
+                    2 => bb.begin_row_natives(&[(i / 16) as u128, (i % 16 + salt * 16) as u128], 1),
+                    _ => {
+                        bb.begin_row(mix(i + salt * N) as u128, 1);
+                        bb.put_int((i % (N / 8)) as u128);
+                    }
+                }
+                bb.put_float((mix(i ^ salt) >> 11) as f64 / 3.0);
+                bb.end_row();
+            }
+            let mut b = bb.finish();
+            if schema.pk_cols().len() == 2 {
+                b.certify_consolidated();
+            }
+            b
+        };
+        let shapes = [
+            ("runs of 16", &runs, &[0][..]),
+            ("8 a group", &keyed, &[1]),
+            ("global", &keyed, &[]),
+        ];
+        for ((shape, schema, group), (aname, aggs)) in shapes.into_iter().flat_map(|s| {
+            [
+                ("sum", &[Sum][..]),
+                ("sum+infs", &[FiniteSum, CountPosInf, CountNegInf]),
+            ]
+            .map(|a| (s, a))
+        }) {
+            let mut h = Harness::new(plan(schema, group, aggs, false));
+            let [empty, populated, retract] = three_epochs(&counter, &mut h, make(schema, 1), make(schema, 2));
+            println!(
+                "op_reduce_float_sum_bench {tc:<4} {shape:<11} {aname:<9} empty {empty:7.1}, populated {populated:7.1}, \
+                 retraction {retract:7.1} instr/row"
+            );
+        }
+    }
+}

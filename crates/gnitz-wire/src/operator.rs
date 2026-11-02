@@ -16,6 +16,14 @@ wire_enum! {
         Min = 3,
         Max = 4,
         CountNonNull = 5,
+        /// COUNT of the rows whose float value is +inf or NaN.
+        CountPosInf = 6,
+        /// COUNT of the rows whose float value is -inf or NaN.
+        CountNegInf = 7,
+        /// SUM of the finite values of a float column: an infinity or a NaN,
+        /// once added, would outlast its retraction, so `CountPosInf` and
+        /// `CountNegInf` carry them instead.
+        FiniteSum = 8,
     }
 }
 
@@ -24,7 +32,12 @@ impl AggFunc {
     /// replay, and the value over no rows is `0`.
     pub const fn is_linear(self) -> bool {
         match self {
-            AggFunc::Count | AggFunc::CountNonNull | AggFunc::Sum => true,
+            AggFunc::Count
+            | AggFunc::CountNonNull
+            | AggFunc::CountPosInf
+            | AggFunc::CountNegInf
+            | AggFunc::Sum
+            | AggFunc::FiniteSum => true,
             AggFunc::Min | AggFunc::Max => false,
         }
     }
@@ -53,6 +66,9 @@ impl AggFunc {
     pub const fn output_type(self, src_tc: TypeCode) -> Option<TypeCode> {
         match self {
             AggFunc::Count | AggFunc::CountNonNull => Some(TypeCode::I64),
+            AggFunc::CountPosInf | AggFunc::CountNegInf if src_tc.is_float() => Some(TypeCode::I64),
+            AggFunc::FiniteSum if src_tc.is_float() => Some(TypeCode::F64),
+            AggFunc::CountPosInf | AggFunc::CountNegInf | AggFunc::FiniteSum => None,
             // Adding two calendar values, or two truth values, is meaningless.
             AggFunc::Sum => {
                 if ScalarKind::from_type_code(src_tc).is_some()

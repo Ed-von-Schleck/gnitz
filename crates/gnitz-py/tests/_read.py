@@ -31,6 +31,11 @@ def reply(results):
     return res["rows"]
 
 
+def canon(v):
+    """`v`, a NaN folded onto `math.nan` itself, as `bag` folds it."""
+    return math.nan if v != v else v
+
+
 def bag(rows, *cols):
     """`{(values of cols): summed weight}` over any row iterable — a SELECT
     result or a scan — with ghosts dropped.
@@ -39,15 +44,15 @@ def bag(rows, *cols):
     multiplicity is split across workers and entries, so the same expectation
     holds at every worker count.
 
-    A NaN is folded onto `math.nan` itself, so an expectation spelling
-    `math.nan` matches it: tuple equality tries identity before `==`, and by
+    A NaN is folded onto `math.nan` itself ([`canon`]), so an expectation
+    spelling `math.nan` matches it: tuple equality tries identity before `==`, and by
     `==` a NaN equals nothing — not even the NaN a retraction must cancel.
     """
     acc = {}
     for r in rows:
         d = r._asdict()
         k = tuple(d[c] for c in cols) if cols else tuple(r)
-        k = tuple(math.nan if v != v else v for v in k)
+        k = tuple(map(canon, k))
         acc[k] = acc.get(k, 0) + r._weight
     return {k: w for k, w in sorted(acc.items(), key=repr) if w != 0}
 

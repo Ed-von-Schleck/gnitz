@@ -12,9 +12,10 @@ Run with GNITZ_WORKERS=4: a GROUP BY shards each group whole onto one worker and
 a global aggregate funnels or combines per-worker partials, so both routing
 decisions are only real at W > 1.
 """
+import math
 from collections import Counter
 
-from _read import bag, scanned
+from _read import bag, canon, rows as select_rows, scanned
 from _shapes import agg, groups
 from _sql import churn, inserting, values
 
@@ -340,3 +341,65 @@ def test_a_compound_group_key_is_emitted_in_source_key_order(client):
     client.execute_sql("DELETE FROM t4 WHERE a = 1 AND b = 1 AND c = 1 AND d = 2")
     assert bag(scanned(client, "g4"), *cols) == {
         (*q[:4], 1, q[4], q[4]): 1 for q in quads if q[3] != 2}
+
+
+def _ln(x):
+    """SQL `LN`: -inf at 0 and NaN below it, where Python raises."""
+    return math.log(x) if x > 0 else (-math.inf if x == 0 else math.nan)
+
+
+def _sqrt(x):
+    """SQL `SQRT`: NaN below 0, where Python raises."""
+    return math.sqrt(x) if x >= 0 else math.nan
+
+
+def _ovf(x):
+    """`x * 1e308 * 10.0`: the infinity of `x`'s sign, 0 at 0."""
+    return x * 1e308 * 10.0
+
+
+def _ieee(kind, f, xs):
+    """The IEEE aggregate `kind` of `f` over `xs`, as `bag` reads it back."""
+    return canon(agg(kind, [f(x) for x in xs]))
+
+
+# (statement, table, {pk: (g, x)}). No group holds more than two irrational
+# finite terms of a sum, so the engine's summation order cannot move its bits.
+_NON_FINITE_CHURN = [
+    inserting("t", {1: (1, 1.0), 2: (1, 0.0), 3: (1, 4.0), 4: (2, -1.0), 5: (2, 16.0),
+                    6: (3, 4.0)}),
+    ("DELETE FROM t WHERE pk = 2", "t", {2: None}),
+    ("DELETE FROM t WHERE pk = 4", "t", {4: None}),
+    ("UPDATE t SET x = 0.0 WHERE pk = 5", "t", {5: (2, 0.0)}),
+    ("UPDATE t SET x = 16.0 WHERE pk = 5", "t", {5: (2, 16.0)}),
+    inserting("t", {7: (3, -1.0)}),
+    ("DELETE FROM t WHERE pk = 7", "t", {7: None}),
+    ("UPDATE t SET x = 0.0 WHERE pk = 6", "t", {6: (3, 0.0)}),
+]
+
+
+def test_a_float_sum_returns_to_finite_once_its_non_finite_rows_leave(client):
+    """A float SUM/AVG over values an IEEE domain error made +inf, -inf or NaN
+    is that IEEE value while such a row is present — NaN for both infinities —
+    and the sum of the rows left once it is retracted: a retraction never
+    leaves `inf - inf` behind. `x * 1e308 * 10.0` overflows to the infinity of
+    `x`'s sign. Held in a grouped view, a global view and an ad-hoc read."""
+    body = ("SELECT g, SUM(SQRT(x)) AS sq, SUM(LN(x)) AS l, AVG(LN(x)) AS al, "
+            "SUM(x * 1e308 * 10.0) AS o FROM t GROUP BY g")
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, x DOUBLE NOT NULL); "
+        f"CREATE VIEW grouped AS {body}; "
+        "CREATE VIEW global AS SELECT SUM(SQRT(x)) AS sq, AVG(x * 1e308 * 10.0) AS ao FROM t")
+
+    rows = {}
+    for sql in churn(client, {"t": rows}, _NON_FINITE_CHURN):
+        want = {}
+        for g, rs in groups(rows.values(), lambda r: r[0]).items():
+            xs = [x for _, x in rs]
+            want[(g, _ieee("SUM", _sqrt, xs), _ieee("SUM", _ln, xs), _ieee("AVG", _ln, xs),
+                  _ieee("SUM", _ovf, xs))] = 1
+        assert bag(scanned(client, "grouped"), "g", "sq", "l", "al", "o") == want, sql
+        assert bag(select_rows(client, body), "g", "sq", "l", "al", "o") == want, sql
+        xs = [x for _, x in rows.values()]
+        assert bag(scanned(client, "global"), "sq", "ao") == {
+            (_ieee("SUM", _sqrt, xs), _ieee("AVG", _ovf, xs)): 1}, sql

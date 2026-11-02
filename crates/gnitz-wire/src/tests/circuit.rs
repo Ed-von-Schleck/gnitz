@@ -211,7 +211,7 @@ fn each_opcode_cell_refuses_every_perturbation() {
 #[test]
 fn the_cell_layout_is_pinned_to_its_version() {
     let cells: Vec<u8> = Opcode::ALL.iter().flat_map(|&op| wired(sample(op)).encode()).collect();
-    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (15, 0x230c_3eef_fd93_1ff5));
+    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (16, 0x5a00_1a9f_b96b_b403));
 }
 
 /// Every framing guard, against the forgery that trips it.
