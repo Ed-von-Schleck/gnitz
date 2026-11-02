@@ -24,6 +24,7 @@ impl DriveHost for WorkerProcess<'_> {
     ) -> (Batch, bool) {
         let mut round = self.mesh.open(view_id, batch, plan, fold, drained);
         loop {
+            self.mesh.spin_for_part(|| !self.sal_reader.is_empty());
             self.mesh
                 .park()
                 .park(|| self.sal_reader.is_empty() && !self.mesh.complete());

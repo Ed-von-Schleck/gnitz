@@ -45,6 +45,11 @@ const HEADER_BYTES: usize = PAGE_BYTES;
 const BLOCKS_AT: usize = PAGE_BYTES;
 const _: () = assert!(size_of::<Head>() <= BLOCKS_AT, "an outbox's head fits its first page");
 
+/// How many `spin_loop` polls a worker on a core of its own spends waiting for a
+/// part before it parks. A peer's arrival in a small tick usually lands within tens of
+/// microseconds, sooner than a futex sleep and wake turn around.
+const SPINS_BEFORE_PARK: u32 = 1000;
+
 /// Resident bytes an outbox keeps past its latest part; a part that ends
 /// further below the outbox's high-water mark returns the pages beyond it.
 const RESIDENT_SLACK_BYTES: usize = 64 << 20;
@@ -83,6 +88,7 @@ pub(crate) fn create(outbox_bytes: usize, parks: WorkerParks) -> std::io::Result
             parks,
             routed: Vec::new(),
             resident: [0; 2],
+            spins: 0,
         })
         .collect())
 }
@@ -129,6 +135,9 @@ pub(crate) struct Mesh {
     routed: Vec<Vec<u32>>,
     /// How far into each of this worker's outboxes pages may be resident.
     resident: [usize; 2],
+    /// How many polls [`Self::spin_for_part`] spends; zero until
+    /// [`Self::spin_before_park`].
+    spins: u32,
 }
 
 /// One exchange round, from [`Mesh::open`] to the [`Mesh::step`] that closes it.
@@ -316,6 +325,23 @@ impl Mesh {
             self.resident[p] = end;
         }
         self.resident[p] = self.resident[p].max(end);
+    }
+
+    /// Poll for the current part before parking for it. Only for a worker on a
+    /// core of its own: on a shared one the spin holds off the peer it waits for.
+    pub(crate) fn spin_before_park(&mut self) {
+        self.spins = SPINS_BEFORE_PARK;
+    }
+
+    /// Poll until the current part completes or `woken` holds, for at most the
+    /// spin budget.
+    pub(crate) fn spin_for_part(&self, mut woken: impl FnMut() -> bool) {
+        for _ in 0..self.spins {
+            if self.complete() || woken() {
+                return;
+            }
+            std::hint::spin_loop();
+        }
     }
 
     /// Every worker has published the current part.

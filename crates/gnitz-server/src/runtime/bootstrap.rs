@@ -206,7 +206,7 @@ fn run_worker_child(
     master_pid: i32,
     catalog: &mut CatalogEngine,
     tail: CommittedTail,
-    (mut w2m_writer, mesh): (W2mWriter, Mesh),
+    (mut w2m_writer, mut mesh): (W2mWriter, Mesh),
     pinning: Option<&affinity::Pinning>,
 ) -> ! {
     let w = slot.rank as usize;
@@ -236,6 +236,10 @@ fn run_worker_child(
     }
 
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
+    // Pinned, this worker has a core of its own to spin on.
+    if pinning.is_some() {
+        mesh.spin_before_park();
+    }
 
     let sal_reader = SalReader::new(tail.log(), slot.rank, tail.live_epoch());
     w2m_writer.ack(RequestId::BOOT_READY);
