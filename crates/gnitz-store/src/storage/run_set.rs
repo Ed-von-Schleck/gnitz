@@ -1,6 +1,6 @@
 //! `RunSet` — a set of in-heap sorted runs with a PK bloom and a fold trigger.
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -29,6 +29,14 @@ const ROOM_SHARE: usize = 16;
 /// The fewest keys a set's PK bloom is sized for.
 const MIN_BLOOM_KEYS: usize = 256;
 
+/// The fewest rows a run must hold to build a PK filter of its own.
+const RUN_FILTER_MIN_ROWS: usize = 64;
+
+/// A run builds its own filter once searches for keys it does not hold reach
+/// one per this many of its rows: the build hashes every row, which the
+/// misses' share of a filter's savings repays.
+const RUN_FILTER_ROWS_PER_MISS: usize = 8;
+
 fn pk_min(run: &Batch) -> &[u8] {
     run.get_pk_bytes(0)
 }
@@ -38,8 +46,7 @@ fn pk_max(run: &Batch) -> &[u8] {
 }
 
 pub(super) struct RunSet {
-    /// Each [`Batch::trimmed`], since the set charges only its rows' bytes.
-    runs: Vec<Rc<Batch>>,
+    runs: Vec<HeldRun>,
     /// PK bloom over every key pushed since it was built — a superset of the
     /// live runs' keys — built on the first probe.
     bloom: OnceCell<BloomFilter>,
@@ -94,8 +101,8 @@ impl RunSet {
             bloom_add_batch(bloom, &run);
         }
         self.bytes += run.total_bytes();
-        self.runs.push(run);
-        while let [.., older, newer] = &self.runs[..] {
+        self.runs.push(HeldRun::new(run));
+        while let [.., HeldRun { batch: older, .. }, HeldRun { batch: newer, .. }] = &self.runs[..] {
             if !self.merges_cancelling
                 || older.len() > CANCEL_MERGE_RATIO * newer.len()
                 || !retractions_cancel(older, newer)
@@ -112,9 +119,13 @@ impl RunSet {
 
     /// The runs whose PK extent meets the inclusive `bound`; `None` takes them all.
     pub(super) fn runs_overlapping(&self, bound: Option<(PkBuf, PkBuf)>) -> impl Iterator<Item = &Rc<Batch>> {
-        self.runs.iter().filter(move |run| {
+        self.batches().filter(move |run| {
             bound.is_none_or(|(lo, hi)| pk_ranges_overlap(pk_min(run), pk_max(run), lo.pk_bytes(), hi.pk_bytes()))
         })
+    }
+
+    fn batches(&self) -> impl Iterator<Item = &Rc<Batch>> {
+        self.runs.iter().map(|run| &run.batch)
     }
 
     /// Visit each run holding `key`, newest first, with its rows of that key;
@@ -129,12 +140,8 @@ impl RunSet {
             return;
         }
         for run in self.runs.iter().rev() {
-            if !pk_ranges_overlap(pk_min(run), pk_max(run), key, key) {
-                continue;
-            }
-            let rows = run.pk_rows(key);
-            if !rows.is_empty() {
-                visitor(run, rows);
+            if let Some(rows) = run.probe(key, fingerprint) {
+                visitor(&run.batch, rows);
             }
         }
     }
@@ -155,7 +162,7 @@ impl RunSet {
     }
 
     pub(super) fn row_count(&self) -> usize {
-        self.runs.iter().map(|r| r.len()).sum()
+        self.batches().map(|r| r.len()).sum()
     }
 
     pub(super) fn clear(&mut self) {
@@ -169,7 +176,7 @@ impl RunSet {
     pub(super) fn widen_runs(&mut self, schema: &SchemaDescriptor) {
         let npc = schema.num_payload_cols();
         let mut bytes = 0;
-        for run in &mut self.runs {
+        for HeldRun { batch: run, .. } in &mut self.runs {
             if run.schema().num_payload_cols() < npc {
                 let widened = run.widened_with_nulls(schema, false);
                 debug_assert!(
@@ -181,7 +188,7 @@ impl RunSet {
             bytes += run.total_bytes();
         }
         self.bytes = bytes;
-        // The widen leaves PK bytes untouched, so the bloom stays valid.
+        // The widen leaves PK bytes untouched, so the filters stay valid.
     }
 
     /// Fold every run into one consolidated run, dropping net-zero
@@ -190,7 +197,7 @@ impl RunSet {
         if self.runs.len() <= 1 {
             return;
         }
-        let views: Vec<MemBatch> = self.runs.iter().map(|r| r.as_mem_batch()).collect();
+        let views: Vec<MemBatch> = self.batches().map(|r| r.as_mem_batch()).collect();
         let merged = merge_consolidated(&views, schema);
         self.replace_from(0, merged);
     }
@@ -199,9 +206,9 @@ impl RunSet {
     fn replace_from(&mut self, start: usize, merged: Batch) {
         self.runs.truncate(start);
         if !merged.is_empty() {
-            self.runs.push(Rc::new(merged.trimmed()));
+            self.runs.push(HeldRun::new(Rc::new(merged.trimmed())));
         }
-        self.bytes = self.runs.iter().map(|r| r.total_bytes()).sum();
+        self.bytes = self.batches().map(|r| r.total_bytes()).sum();
         // A cancelled row's key stays in the filter as a false positive.
         if self.bloom.get().is_some_and(|b| b.stale(self.row_count())) {
             self.bloom.take();
@@ -217,7 +224,7 @@ impl RunSet {
     ) -> Result<(), StorageError> {
         self.fold(schema);
         if let Some(run) = self.runs.first() {
-            write(run)?;
+            write(&run.batch)?;
             self.clear();
         }
         Ok(())
@@ -227,7 +234,7 @@ impl RunSet {
     /// empty. `None` when the set is empty or fully cancelled.
     pub(super) fn drain_into(&mut self, dst: &mut RunSet, schema: &SchemaDescriptor) -> Option<Rc<Batch>> {
         self.fold(schema);
-        let run = self.runs.pop();
+        let run = self.runs.pop().map(|run| run.batch);
         self.clear();
         if let Some(run) = &run {
             dst.push_run(Rc::clone(run), schema);
@@ -264,9 +271,9 @@ impl RunSet {
     fn build_bloom(&self) -> &BloomFilter {
         self.bloom.get_or_init(|| {
             // Sized with room for later pushes, which add to it.
-            let row_width = self.runs[0].schema().row_width();
+            let row_width = self.runs[0].batch.schema().row_width();
             let mut bloom = BloomFilter::new(self.bloom_keys(self.row_count(), row_width));
-            for run in &self.runs {
+            for run in self.batches() {
                 bloom_add_batch(&mut bloom, run);
             }
             bloom
@@ -292,6 +299,59 @@ fn retractions_cancel(older: &Batch, newer: &Batch) -> bool {
         }
     }
     2 * held >= sampled
+}
+
+/// A [trimmed](Batch::trimmed) run, since the set charges only its rows'
+/// bytes, and the PK filter of its own it builds once enough searches have
+/// missed it: a run that holds most keys it is searched for is never hashed
+/// whole.
+struct HeldRun {
+    batch: Rc<Batch>,
+    misses: Cell<usize>,
+    filter: OnceCell<BloomFilter>,
+}
+
+impl HeldRun {
+    fn new(batch: Rc<Batch>) -> Self {
+        HeldRun {
+            batch,
+            misses: Cell::new(0),
+            filter: OnceCell::new(),
+        }
+    }
+
+    /// The run's rows of `key`, whose [`probe_key`] is `fingerprint`, when it
+    /// holds any.
+    #[inline(always)]
+    fn probe(&self, key: &[u8], fingerprint: u64) -> Option<Range<usize>> {
+        let run = &*self.batch;
+        if !pk_ranges_overlap(pk_min(run), pk_max(run), key, key)
+            || self.filter.get().is_some_and(|f| !f.may_contain(fingerprint))
+        {
+            return None;
+        }
+        let rows = run.pk_rows(key);
+        if rows.is_empty() && self.filter.get().is_none() && run.len() >= RUN_FILTER_MIN_ROWS {
+            self.note_miss();
+        }
+        (!rows.is_empty()).then_some(rows)
+    }
+
+    /// Count a search that missed, and build the filter once the misses repay
+    /// it. Out of line: it runs at most once per [`RUN_FILTER_ROWS_PER_MISS`]
+    /// of the run's rows, and inlined it keeps the probe from inlining into
+    /// its caller.
+    #[cold]
+    #[inline(never)]
+    fn note_miss(&self) {
+        let misses = self.misses.get() + 1;
+        self.misses.set(misses);
+        if misses * RUN_FILTER_ROWS_PER_MISS >= self.batch.len() {
+            let mut filter = BloomFilter::new(self.batch.len());
+            bloom_add_batch(&mut filter, &self.batch);
+            let _ = self.filter.set(filter);
+        }
+    }
 }
 
 /// Insert every row's PK into `bloom`, keyed by [`probe_key`].

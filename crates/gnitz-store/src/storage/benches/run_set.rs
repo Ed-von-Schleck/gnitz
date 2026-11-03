@@ -25,8 +25,7 @@ fn run(schema: &SchemaDescriptor, rows: impl Iterator<Item = (u64, i64)>) -> Bat
 /// The rows a push made `set` fold.
 fn rows_folded(runs_before: &[Rc<Batch>], rows_with_pushed: usize, set: &RunSet) -> usize {
     let kept = set
-        .runs
-        .iter()
+        .batches()
         .zip(runs_before)
         .take_while(|(a, b)| Rc::ptr_eq(a, b))
         .count();
@@ -87,7 +86,7 @@ fn run_set_fold_bench() {
             "{label}: a push folded the set"
         );
         let rows_in = set.row_count();
-        let retracted = set.runs.iter().map(|r| r.retracted_rows().count());
+        let retracted = set.batches().map(|r| r.retracted_rows().count());
         let rows_out = rows_in - 2 * retracted.sum::<usize>();
         let resident = perf::Resident::baseline();
         let ((), instructions) = counter.measure(|| set.fold(&schema));
@@ -150,7 +149,8 @@ fn run_set_push_bench() {
                         // What the set's own folds merge, off a set the same ticks fill.
                         let mut shadow = RunSet::cancelling(MEMTABLE_BYTES);
                         for b in &ticks {
-                            let (before, rows) = (shadow.runs.clone(), shadow.row_count() + b.len());
+                            let before: Vec<_> = shadow.batches().cloned().collect();
+                            let rows = shadow.row_count() + b.len();
                             shadow.push_run(Rc::new(b.clone().trimmed()), &schema);
                             folded += rows_folded(&before, rows, &shadow) as u64;
                         }

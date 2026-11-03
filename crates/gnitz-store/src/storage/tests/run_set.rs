@@ -36,7 +36,7 @@ proptest! {
                 _ => {}
             }
             let want = zset_sum(&pushed, &s);
-            let held: Vec<Batch> = set.runs.iter().map(|r| (**r).clone()).collect();
+            let held: Vec<Batch> = set.batches().map(|r| (**r).clone()).collect();
             prop_assert_eq!(&zset_sum(&held, &s), &want);
             prop_assert!(set.len() < FOLD_THRESHOLD);
             prop_assert!(held.iter().all(Batch::is_consolidated));
@@ -178,8 +178,8 @@ fn widening_fills_nulls_and_keeps_the_filter() {
     set.widen_runs(&wide);
     assert!(set.bloom.get().is_some());
     assert!(holds(&set, &wide, 15));
-    assert_eq!(set.bytes, set.runs.iter().map(|r| r.total_bytes()).sum::<usize>());
-    for run in &set.runs {
+    assert_eq!(set.bytes, set.batches().map(|r| r.total_bytes()).sum::<usize>());
+    for run in set.batches() {
         assert!(weighted_rows(run)
             .iter()
             .all(|((_, v), _)| v.len() == 2 && v[1].is_none()));
@@ -215,7 +215,7 @@ fn a_fold_merges_runs_of_different_nullability_under_its_own_schema() {
     );
     set.fold(&nullable);
 
-    let folded = &set.runs[0];
+    let folded = &set.runs[0].batch;
     assert!(*folded.schema() == nullable);
     let want = run(nullable, &[(1, None, 1), (2, Some(7), 1), (3, Some(8), 1)]);
     assert_eq!(weighted_rows(folded), weighted_rows(&want));
@@ -255,7 +255,7 @@ fn a_fold_under_churn_keeps_every_run_trimmed() {
         }
         rows.sort_by(|a, b| (a.0, &a.2).cmp(&(b.0, &b.2)));
         push(&mut set, &rows);
-        for run in &set.runs {
+        for run in set.batches() {
             saw_dead |= run.dead_heap() > 0;
             let trimmed = (**run).clone().trimmed();
             assert_eq!(
