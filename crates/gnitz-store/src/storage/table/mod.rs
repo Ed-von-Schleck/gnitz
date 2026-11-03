@@ -177,6 +177,11 @@ impl Table {
         if run.is_empty() {
             return Ok(());
         }
+        debug_assert_eq!(
+            self.pending.len(),
+            0,
+            "an ingest below the cut lands above every pending run"
+        );
         self.admit(&run);
         let ingested = run.total_bytes();
         self.memtable.push_run(run, &self.shard_index.schema);
@@ -455,36 +460,79 @@ impl Table {
     #[inline]
     pub(crate) fn has_pk_bytes(&self, key: &[u8]) -> bool {
         let mut w: i64 = 0;
-        self.for_each_pk_candidate(key, |run, row| w += run.get_weight(row));
+        self.for_each_pk_candidate(key, probe_key(key), true, |run, row| w += run.get_weight(row));
         w > 0
     }
 
-    /// Visit every row whose PK equals `key`, the heap tiers' newest first: that
-    /// puts `live_row_at`'s live row ahead of the retracted history it would
-    /// otherwise scan past.
-    fn for_each_pk_candidate(&self, key: &[u8], mut f: impl FnMut(&Run, usize)) {
+    /// Visit every row whose PK equals `key`, whose [`probe_key`] is
+    /// `fingerprint`: the heap tiers' when `heap`, newest first, which puts
+    /// `live_row_at`'s live row ahead of the retracted history it would
+    /// otherwise scan past, then the shards'.
+    fn for_each_pk_candidate(&self, key: &[u8], fingerprint: u64, heap: bool, mut f: impl FnMut(&Run, usize)) {
         let mut visit = |run: Run, rows: Range<usize>| {
             for row in rows {
                 f(&run, row);
             }
         };
-        let fingerprint = probe_key(key);
-        for set in self.ram_tiers(Cut::Now) {
-            set.find_pk_bytes(key, fingerprint, |batch, rows| visit(Run::Mem(Rc::clone(batch)), rows));
+        if heap {
+            for set in self.ram_tiers(Cut::Now) {
+                set.find_pk_bytes(key, fingerprint, |batch, rows| visit(Run::Mem(Rc::clone(batch)), rows));
+            }
         }
         self.shard_index.find_pk_bytes(key, fingerprint, |shard, rows| {
             visit(Run::Shard(Rc::clone(shard)), rows)
         });
     }
 
+    /// [`Self::live_row_at`]'s row, for a store whose every key nets 0 or 1 —
+    /// a base table's, under its unique-PK rule.
+    ///
+    /// There every heap run is the consolidated sum of a contiguous stretch of
+    /// ingests, newer than every shard — a barrier empties every heap tier
+    /// into shards, and a spill the oldest — and the heap tiers are walked
+    /// newest first, the pending tier being newer than the memtable since an
+    /// ingest below the cut finds it empty. So the newest heap run holding `key` decides it: what
+    /// that stretch left is the key's state now, and its rows of the key are
+    /// that state less the one it started from — a positive row is the live
+    /// one, and a retraction alone means the stretch deleted the key. A key no
+    /// heap run holds is summed over the shards.
+    #[inline]
+    pub(crate) fn unique_live_row_at(&self, key: &[u8]) -> Option<StoredRow> {
+        let fingerprint = probe_key(key);
+        let newest = self
+            .ram_tiers(Cut::Now)
+            .find_map(|set| set.newest_holding(key, fingerprint));
+        let live = match newest {
+            Some((run, rows)) => {
+                let live = rows.into_iter().find(|&row| run.get_weight(row) > 0);
+                live.map(|row| StoredRow::new(Run::Mem(Rc::clone(run)), row))
+            }
+            None => self.live_row_in(key, fingerprint, false).1,
+        };
+        debug_assert!(
+            {
+                let (w, _) = self.live_row_at(key);
+                w == i64::from(live.is_some()) && (0..=1).contains(&w)
+            },
+            "unique_live_row_at: a key nets 0 or 1, and 1 exactly when it answers a row",
+        );
+        live
+    }
+
     /// The net weight at OPK `key` and, when it is positive, a live
     /// (PK, payload) row: one whose payload group across every tier nets
     /// positive.
     pub(crate) fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
+        self.live_row_in(key, probe_key(key), true)
+    }
+
+    /// [`Self::live_row_at`] over the shards, and the heap tiers too when `heap`;
+    /// `fingerprint` is `key`'s [`probe_key`].
+    fn live_row_in(&self, key: &[u8], fingerprint: u64, heap: bool) -> (i64, Option<StoredRow>) {
         let mut pool = self.live_row_scratch.take();
 
         let mut total_w: i64 = 0;
-        self.for_each_pk_candidate(key, |run, row| {
+        self.for_each_pk_candidate(key, fingerprint, heap, |run, row| {
             total_w += run.get_weight(row);
             pool.push(StoredRow::new(run.clone(), row));
         });

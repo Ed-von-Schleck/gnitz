@@ -146,6 +146,20 @@ impl RunSet {
         }
     }
 
+    /// [`Self::find_pk_bytes`]'s first run.
+    #[inline]
+    pub(super) fn newest_holding(&self, key: &[u8], fingerprint: u64) -> Option<(&Rc<Batch>, Range<usize>)> {
+        if !self.may_contain(fingerprint) {
+            return None;
+        }
+        for run in self.runs.iter().rev() {
+            if let Some(rows) = run.probe(key, fingerprint) {
+                return Some((&run.batch, rows));
+            }
+        }
+        None
+    }
+
     /// How many runs this set holds — one cursor source each.
     pub(super) fn len(&self) -> usize {
         self.runs.len()

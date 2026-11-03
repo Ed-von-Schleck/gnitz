@@ -25,7 +25,7 @@ pub(super) fn enforce_unique_pk(store: &Table, mut batch: Batch) -> Batch {
     let mut stored: Vec<StoredRow> = Vec::new();
     {
         let mut fetch = |pk: &[u8], row: usize| {
-            if let Some(s) = store.live_row_at(pk).1 {
+            if let Some(s) = store.unique_live_row_at(pk) {
                 push_reserving(&mut stored, s, n - row);
             }
         };

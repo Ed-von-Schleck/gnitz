@@ -787,3 +787,110 @@ fn a_compressing_store_codes_its_shards_under_one_table() {
     );
     assert_eq!(zset_of(&t.full_scan(), &schema), zset_sum(&pushed, &schema));
 }
+
+/// The keys a base table's history writes: enough for a write to make a run
+/// long enough to probe through a filter of its own.
+const UNIQUE_KEYS: u64 = 256;
+
+/// A step of a base table's history: upsert or delete distinct keys, below
+/// or above the cut, or move the tiers.
+#[derive(Clone, Debug)]
+enum UniqueOp {
+    Write {
+        keys: Vec<(u64, Option<i64>)>,
+        pending: bool,
+    },
+    Seal,
+    FoldToRam,
+    Flush,
+    Crash,
+}
+
+fn arb_unique_op() -> impl Strategy<Value = UniqueOp> {
+    let write = (
+        prop::collection::btree_map(0u64..UNIQUE_KEYS, prop::option::weighted(0.8, 0i64..4), 1..96),
+        any::<bool>(),
+    )
+        .prop_map(|(keys, pending)| UniqueOp::Write {
+            keys: keys.into_iter().collect(),
+            pending,
+        });
+    prop_oneof![
+        6 => write,
+        2 => Just(UniqueOp::Seal),
+        2 => Just(UniqueOp::FoldToRam),
+        1 => Just(UniqueOp::Flush),
+        1 => Just(UniqueOp::Crash),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Under any history a base table's unique-PK rule writes — each key's
+    /// stored row retracted as its new one lands — interleaved with seals,
+    /// folds, barriers and crashes, `unique_live_row_at` answers each key's
+    /// one live row.
+    #[test]
+    fn unique_live_row_at_answers_each_keys_live_row(
+        ops in prop::collection::vec(arb_unique_op(), 1..40),
+        salreplay in any::<bool>(),
+        spills in any::<bool>(),
+    ) {
+        let s = make_schema_u64_i64();
+        let rs = match salreplay {
+            true => RecoverySource::SalReplay,
+            false => RecoverySource::Rederive { resume_at: Some(0) },
+        };
+        let ram = if spills { 100 } else { DEFAULT_RAM_TIER_BYTES };
+        let dir = tempfile::tempdir().unwrap();
+        let open = || new_table(dir.path(), s, rs, ram);
+        let mut t = open();
+        let (mut live, mut durable) = (HashMap::<u64, i64>::new(), HashMap::new());
+        for op in ops {
+            match op {
+                UniqueOp::Write { keys, pending } => {
+                    let mut delta = Vec::new();
+                    for (k, new) in keys {
+                        if let Some(old) = live.remove(&k) {
+                            delta.push((k, -1, old));
+                        }
+                        if let Some(v) = new {
+                            delta.push((k, 1, v));
+                            live.insert(k, v);
+                        }
+                    }
+                    if delta.is_empty() {
+                        continue;
+                    }
+                    match pending {
+                        true => t.ingest_pending(rows(&delta)),
+                        false => {
+                            t.seal().unwrap();
+                            t.ingest(rows(&delta)).unwrap();
+                        }
+                    }
+                }
+                UniqueOp::Seal => drop(t.seal().unwrap()),
+                UniqueOp::FoldToRam => t.fold_to_ram().unwrap(),
+                UniqueOp::Flush => {
+                    flush_barrier([&mut t], 0).unwrap();
+                    durable = live.clone();
+                }
+                UniqueOp::Crash => {
+                    drop(t);
+                    t = open();
+                    live = durable.clone();
+                }
+            }
+            for k in 0..UNIQUE_KEYS {
+                let got = t.unique_live_row_at(&k.to_be_bytes()).map(|r| {
+                    let (src, i) = r.source();
+                    row_key(src, &s, i)
+                });
+                let want = live.get(&k).map(|&v| row_key(&rows(&[(k, 1, v)]), &s, 0));
+                prop_assert_eq!(got, want, "key {}", k);
+            }
+        }
+    }
+}
