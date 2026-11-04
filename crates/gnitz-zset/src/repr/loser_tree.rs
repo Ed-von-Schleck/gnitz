@@ -76,10 +76,10 @@ pub(crate) struct LoserTree {
     n_pad: usize,
     /// Sources the tournament was built for.
     n: usize,
-    /// A leading key word no player but the champion holds a lower one than —
-    /// keys only rise — so a champion stepped below it keeps winning without a
-    /// replay.
-    bound: u64,
+    /// A key no player but the champion holds a lower one than — keys only
+    /// rise — so a champion stepped below it keeps winning without a replay;
+    /// `0`, which no key is below, when none is known.
+    bound: u128,
 }
 
 impl LoserTree {
@@ -188,7 +188,7 @@ impl LoserTree {
         let source_idx = self.top.source_idx;
         debug_assert_ne!(source_idx, SENTINEL, "step_top on a drained tree");
         let mut cur = match next_row {
-            Some((row, key)) if ((key >> 64) as u64) < self.bound => {
+            Some((row, key)) if key < self.bound => {
                 self.top = Player::new(key, source_idx, row);
                 return;
             }
@@ -209,18 +209,22 @@ impl LoserTree {
         self.top = cur;
         // A player swapped into the tree never leaves it on this replay, so the
         // champion is still `source_idx` exactly when it beat every loser. Its
-        // path's losers are then the champions of every other subtree.
-        if cur.source_idx == source_idx {
+        // path's losers are then the champions of every other subtree. A
+        // champion that stays one at its bound swapped nothing, so its bound
+        // still holds; one above it would have lost to the loser holding it.
+        if cur.source_idx != source_idx {
+            self.bound = 0;
+        } else if cur.key() != self.bound {
             self.bound = self.path_least(source_idx);
         }
     }
 
-    /// The least leading key word a loser on `source_idx`'s path holds.
+    /// The least key a loser on `source_idx`'s path holds.
     #[inline(never)]
-    fn path_least(&self, source_idx: u32) -> u64 {
-        let (mut least, mut idx) = (u64::MAX, self.leaf_parent(source_idx));
+    fn path_least(&self, source_idx: u32) -> u128 {
+        let (mut least, mut idx) = (u128::MAX, self.leaf_parent(source_idx));
         while idx > 0 {
-            least = least.min(self.losers[idx].key[0]);
+            least = least.min(self.losers[idx].key());
             idx >>= 1;
         }
         least

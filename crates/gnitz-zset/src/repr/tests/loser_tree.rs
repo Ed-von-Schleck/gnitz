@@ -58,6 +58,9 @@ fn random_kway_merges_drain_in_key_then_source_order() {
                             1 => rng.gen_range(5) as u128,
                             2 => rng.gen_range(20) as u128,
                             3 | 4 => (src as u128 + 1) << 64 | rng.gen_range(4) as u128,
+                            // One leading word every source shares, so only the
+                            // second word orders them.
+                            5 => 1 << 64 | rng.gen_range(64) as u128,
                             _ => rng.gen_u128(),
                         })
                         .collect();

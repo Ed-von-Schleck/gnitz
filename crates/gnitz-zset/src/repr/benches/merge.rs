@@ -445,3 +445,52 @@ fn n_way_string_cancel_bench() {
         );
     }
 }
+
+/// Instructions per row of the N-way merge over K sources keyed on a compound
+/// PK `(group, seq)` whose groups each span every source: within a group each
+/// source holds a run of R consecutive `seq`, so the sources tie on the leading
+/// key word and only the second orders them. Many groups, so no prefix is
+/// shared across a whole window. R = 1 interleaves every row.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn shared_lead_merge_bench() {
+    const ROWS: usize = 400_000;
+    let instructions = Counter::instructions();
+    let col = SchemaColumn::new;
+    let schema = SchemaDescriptor::new(
+        &[
+            col(TypeCode::U64, false),
+            col(TypeCode::U64, false),
+            col(TypeCode::I64, false),
+        ],
+        &[0, 1],
+    );
+    for k in [2usize, 4, 16] {
+        for run in [1usize, 64, 4096] {
+            let groups = (ROWS / (k * run)).max(2);
+            let batches: Vec<Batch> = (0..k)
+                .map(|j| {
+                    let mut b = BatchBuilder::new(&schema);
+                    for g in 0..groups {
+                        for r in 0..run {
+                            b.begin_row_natives(&[g as u128, (j * run + r) as u128], 1);
+                            b.put_int(r as u128);
+                            b.end_row();
+                        }
+                    }
+                    b.finish()
+                })
+                .collect();
+            let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
+            let rows = groups * k * run;
+            let merge = || black_box(run_merge(black_box(&mem), &schema, mem.iter().map(|m| 0..m.count)).len());
+            assert_eq!(merge(), rows, "every row is distinct");
+            // The least of several runs: nothing but the kernel can lower a count.
+            let least = (0..5).map(|_| instructions.measure(merge).1).min().unwrap();
+            println!(
+                "shared_lead_merge_bench k={k:<2} run={run:<4} {:6.1} instr/row",
+                least as f64 / rows as f64
+            );
+        }
+    }
+}
