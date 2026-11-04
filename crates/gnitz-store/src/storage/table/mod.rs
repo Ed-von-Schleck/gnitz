@@ -275,8 +275,11 @@ impl Table {
             .skip(usize::from(cut == Cut::Sealed))
     }
 
-    /// The heap-resident runs whose PK extent meets the inclusive `bound`; `None`
-    /// takes them all.
+    /// The heap-resident runs whose PK extent meets the inclusive `bound`, newest
+    /// first; `None` takes them all. Each is newer than every shard: a barrier
+    /// empties the heap tiers into shards, and a spill the oldest, so a cursor
+    /// over them and the shards after them is
+    /// [marked](ReadCursor::mark_heap_newest_first).
     fn mem_runs(&self, bound: Option<(PkBuf, PkBuf)>, cut: Cut) -> impl Iterator<Item = Run> + '_ {
         self.ram_tiers(cut)
             .flat_map(move |set| set.runs_overlapping(bound))
@@ -319,10 +322,12 @@ impl Table {
     fn cursor_from(&self, floor: Option<PkBuf>, cut: Cut) -> ReadCursor {
         let schema = self.shard_index.schema;
         let cap = self.mem_run_count() + self.shard_index.shard_count();
-        match floor {
+        let mut cursor = match floor {
             Some(at) => from_runs_at(self.runs(cut), schema, cap, at.pk_bytes()),
             None => from_runs(self.runs(cut), schema, cap),
-        }
+        };
+        cursor.mark_heap_newest_first();
+        cursor
     }
 
     /// The least key a row above the cut holds.
@@ -402,7 +407,9 @@ impl Table {
             .chain(self.shard_index.shard_arcs_in_range(start, hi, cut).map(Run::Shard));
         let cap = self.mem_run_count() + self.shard_index.narrow_range_shards();
         let end = end.as_ref().map(PkBuf::pk_bytes);
-        from_runs_in_band(runs, schema, cap, start.pk_bytes(), end)
+        let mut cursor = from_runs_in_band(runs, schema, cap, start.pk_bytes(), end);
+        cursor.mark_heap_newest_first();
+        cursor
     }
 
     /// Every live row of `keys` — whole PKs, or the same leading columns of

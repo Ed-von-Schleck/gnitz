@@ -117,9 +117,10 @@ impl RunSet {
         }
     }
 
-    /// The runs whose PK extent meets the inclusive `bound`; `None` takes them all.
+    /// The runs whose PK extent meets the inclusive `bound`, newest first;
+    /// `None` takes them all.
     pub(super) fn runs_overlapping(&self, bound: Option<(PkBuf, PkBuf)>) -> impl Iterator<Item = &Rc<Batch>> {
-        self.batches().filter(move |run| {
+        self.runs.iter().rev().map(|run| &run.batch).filter(move |run| {
             bound.is_none_or(|(lo, hi)| pk_ranges_overlap(pk_min(run), pk_max(run), lo.pk_bytes(), hi.pk_bytes()))
         })
     }

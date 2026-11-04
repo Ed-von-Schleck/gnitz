@@ -117,6 +117,10 @@ pub struct ReadCursor {
     current_weight: i64,
     /// The row the cursor stands on, while `valid`.
     current: CursorRow,
+    /// How many leading sources are one store's heap runs newest first, each
+    /// newer than every source after them; set by
+    /// [`Self::mark_heap_newest_first`], 0 otherwise.
+    heap_newest_first: u32,
 }
 
 impl ReadCursor {
@@ -602,6 +606,15 @@ impl ReadCursor {
         self.commit_emitted(emitted);
     }
 
+    /// Declare the leading [`Run::Mem`] sources one store's heap runs in age
+    /// order, newest first, and every source after them older than each: a
+    /// [`GroupProbe`] over a store of one row per PK reads a PK off the first
+    /// of them holding it.
+    pub fn mark_heap_newest_first(&mut self) {
+        let heap = self.sources.iter().take_while(|run| matches!(run, Run::Mem(_))).count();
+        self.heap_newest_first = heap as u32;
+    }
+
     /// Upper bound on the rows a walk from HERE emits — the pre-size a batch that
     /// walk fills wants. The per-source windows (so a range seek's clamp is in
     /// it) PLUS the row the cursor sits on: a drive CONSUMES the group it emits,
@@ -685,6 +698,7 @@ fn build(
         valid: false,
         current_weight: 0,
         current: CursorRow { src: 0, row: 0 },
+        heap_newest_first: 0,
     };
     position(&mut cursor);
     cursor

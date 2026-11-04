@@ -212,7 +212,7 @@ proptest! {
         if let Some(first) = keys.first() {
             for mut cursor in [open(), from_runs_in_band(runs.iter().cloned(), s, runs.len(), first, None)] {
                 let mut seeking = open();
-                let mut probe = cursor.group_probe();
+                let mut probe = cursor.group_probe(false);
                 for key in &keys {
                     let found = probe.find(key).map(|at| {
                         let mut one = Batch::with_capacity(&s, 1);
@@ -476,6 +476,79 @@ fn cursors_over_pooled_buffers_drain_their_own_runs() {
         drop(c);
         for run in &runs {
             assert_eq!(Rc::strong_count(run), 1, "round {round}: a dropped cursor holds a run");
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Over a store of one row per PK — a reduce output's history, each tick
+    /// retracting a group's row and writing its new one — a probe that reads a
+    /// PK off the newest heap run holding it lands where folding every run
+    /// does: on the PK's one live row.
+    #[test]
+    fn newest_heap_run_decides_a_one_row_per_pk_probe(
+        ticks in prop::collection::vec(prop::collection::vec((0u128..10, prop::option::of(0i64..4)), 1..6), 1..24),
+        cuts in prop::collection::vec(any::<prop::sample::Index>(), 0..8),
+        shards in 0usize..4,
+    ) {
+        let s = make_schema_u128_i64();
+        // Each tick's consolidated delta, and the state after the last.
+        let mut state = std::collections::BTreeMap::<u128, i64>::new();
+        let deltas: Vec<std::collections::BTreeMap<(u128, i64), i64>> = ticks
+            .iter()
+            .map(|tick| {
+                let mut delta = std::collections::BTreeMap::new();
+                for &(pk, val) in tick {
+                    let old = match val {
+                        Some(v) => state.insert(pk, v),
+                        None => state.remove(&pk),
+                    };
+                    for (v, w) in old.map(|o| (o, -1)).into_iter().chain(val.map(|v| (v, 1))) {
+                        *delta.entry((pk, v)).or_default() += w;
+                    }
+                }
+                delta.retain(|_, w| *w != 0);
+                delta
+            })
+            .collect();
+        // Contiguous stretches of ticks, each one run, oldest first.
+        let mut bounds: Vec<usize> = cuts.iter().map(|i| i.index(deltas.len() + 1)).collect();
+        bounds.extend([0, deltas.len()]);
+        bounds.sort();
+        bounds.dedup();
+        let runs: Vec<Batch> = bounds
+            .windows(2)
+            .map(|w| {
+                let mut sum = std::collections::BTreeMap::<(u128, i64), i64>::new();
+                for (&id, &w) in deltas[w[0]..w[1]].iter().flatten() {
+                    *sum.entry(id).or_default() += w;
+                }
+                sum.retain(|_, w| *w != 0);
+                make_batch_u128(&s, &sum.into_iter().map(|((pk, v), w)| (pk, w, v)).collect::<Vec<_>>())
+            })
+            .collect();
+        // The oldest stretches as shards, the rest as heap runs newest first.
+        let dir = tempfile::tempdir().unwrap();
+        let shards = shards.min(runs.len());
+        let sources: Vec<Run> = runs[shards..]
+            .iter()
+            .rev()
+            .map(|b| Run::Mem(Rc::new(b.clone())))
+            .chain(runs[..shards].iter().enumerate().filter(|(_, b)| !b.is_empty()).map(|(i, b)| {
+                Run::Shard(map_shard(&dir.path().join(format!("{i}.db")), b))
+            }))
+            .collect();
+        let mut cursor = from_runs(sources.iter().cloned(), s, sources.len());
+        cursor.mark_heap_newest_first();
+        let mut probe = cursor.group_probe(true);
+        for pk in 0u128..11 {
+            let found = probe.find(&pk.to_be_bytes()).map(|at| {
+                let (src, row) = probe.row_at(at);
+                payload0_i64(src, row)
+            });
+            prop_assert_eq!(found, state.get(&pk).copied(), "pk {}", pk);
         }
     }
 }
