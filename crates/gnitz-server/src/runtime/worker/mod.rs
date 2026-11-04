@@ -209,8 +209,9 @@ enum DriveRole {
 
 fn drive_role(apply: &Apply<'_>) -> DriveRole {
     match apply {
-        // The master holds the SAL writer until every worker ACKs a flush;
-        // deferred, a push's ACK would wait for the drive.
+        // The master holds the SAL writer until every worker ACKs a flush, so
+        // deferred, a flush would wait for the drive. A read of a table behind
+        // a push is answered inside the drive, so the push is applied there too.
         Apply::Flush | Apply::Push { .. } => DriveRole::BesideDrive,
         Apply::Tick { .. } | Apply::Backfill { .. } => DriveRole::Drives,
         Apply::DdlSync { .. } | Apply::FlushEph { .. } => DriveRole::Outside,

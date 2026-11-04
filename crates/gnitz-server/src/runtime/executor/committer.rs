@@ -1,10 +1,9 @@
-//! The group-commit task: every user write's SAL groups, its fdatasync and its
-//! worker ACKs, batched from whatever is queued behind the first request (see
+//! The group-commit task: every user write's SAL groups and its fdatasync,
+//! batched from whatever is queued behind the first request (see
 //! [`drain_ready_batch`]). Checkpoints, backups and DDL pauses end a batch. Once serving, it is the one task that runs a checkpoint.
 
 use super::validate::{FamilyRows, TxnFamily};
 use super::Shared;
-use crate::runtime::reactor::AckLease;
 use crate::runtime::signals;
 use crate::runtime::sync::{chan, oneshot};
 use gnitz_wire::{WireFault, WireStatus};
@@ -158,9 +157,6 @@ struct CommitScratch {
     /// Per unit, the batches merged behind its one family's; empty between
     /// batches.
     tails: Vec<Vec<FamilyRows>>,
-    /// The ACKs of every group laid out and kept, in unit order; empty between
-    /// batches.
-    leases: Vec<AckLease>,
 }
 
 /// The committer task loop. Never returns.
@@ -401,14 +397,14 @@ fn build_units(s: &mut CommitScratch, merge: bool) {
 
 /// Commit the batch of writes in `s.writes`. Lays out every group, queues their
 /// tids for the tick and submits the fsync SQE under one SAL hold, then awaits
-/// the worker ACKs and, when the batch opened a zone, the fsync. Only then are
+/// the fsync when the batch opened a zone. Only then are
 /// the validation caches and commit LSNs updated and the writers answered.
 ///
 /// Leaves in `s.writes` the writes to commit again behind a checkpoint: the
 /// first unit the SAL had no room for, and every unit after it. A unit of one
 /// write too large for a log with nothing else in its epoch fails instead. A
 /// merged run comes back as the writes it merged, which a batch that does not
-/// `merge` commits one by one. `s.units` and `s.leases` are empty again on return.
+/// `merge` commits one by one. `s.units` is empty again on return.
 async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
     // ------------------------------------------------------------------
     // Phase A (no lock): the units.
@@ -431,24 +427,16 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
         let zone_lsn = scope.lsn();
 
         // A unit is all-or-nothing: a family that does not fit takes back the
-        // unit's earlier families, which were never published, and their
-        // leases with them. A rolled-back group's lease left in `s.leases`
-        // would wait in Phase C for an ACK that never comes.
+        // unit's earlier families, which were never published.
         let mut refused_at = None;
         for (at, unit) in s.units.iter_mut().enumerate() {
-            let mark = s.leases.len();
             let mut unit_in_zone = false;
             let written = scope.all_or_nothing(|scope| {
                 for f in unit.laid() {
-                    let (lease, in_zone) = disp.write_commit_group(scope, f.tid, f.rows.view())?;
-                    s.leases.push(lease);
-                    unit_in_zone |= in_zone;
+                    unit_in_zone |= disp.write_commit_group(scope, f.tid, f.rows.view())?;
                 }
                 Ok(())
             });
-            if written.is_err() {
-                s.leases.truncate(mark);
-            }
             match written {
                 Ok(()) => {
                     if let Outcome::Laid { in_zone, .. } = &mut unit.outcome {
@@ -474,7 +462,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
         let again = refused_at.map(|at| s.units.split_off(at));
 
         let synced = scope.commit().then(|| excl.sync(disp.reactor()));
-        // The auto-tick this may fire overlaps the ACKs and the fsync.
+        // The auto-tick this may fire overlaps the fsync.
         shared.note_commit_rows(
             &excl,
             s.units
@@ -486,15 +474,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
     };
 
     // ------------------------------------------------------------------
-    // Phase C (no lock): await push ACKs, per group in unit order. Replies for
-    // later groups wait in their routes meanwhile.
-    // ------------------------------------------------------------------
-    for lease in &s.leases {
-        lease.acks().await;
-    }
-
-    // ------------------------------------------------------------------
-    // Phase D (no lock): await the fsync. A batch of nothing but stream groups
+    // Phase C (no lock): await the fsync. A batch of nothing but stream groups
     // opened no zone, so has none. Writes batched together share one zone LSN.
     // ------------------------------------------------------------------
     if let Some(synced) = synced {
@@ -515,8 +495,6 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
     for unit in s.units.drain(..) {
         unit.resolve(zone_lsn);
     }
-    // Only now: a lease dropped before its ACKs arrived would lose them.
-    s.leases.clear();
     s.writes
         .extend(again.into_iter().flatten().flat_map(CommitUnit::into_writes));
 }

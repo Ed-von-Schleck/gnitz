@@ -228,22 +228,19 @@ impl MasterDispatcher {
         })
     }
 
-    /// Lay one push batch out as a SAL group inside `scope`, and answer the
-    /// lease its workers ACK on and whether the group rides inside the zone.
+    /// Lay one push batch out as a SAL group inside `scope`, and answer whether
+    /// the group rides inside the zone. No worker ACKs it: a read or tick behind
+    /// it in the SAL reaches its workers after their apply, and a worker that
+    /// cannot apply it exits.
     pub(crate) fn write_commit_group(
         &self,
         scope: &mut SalScope,
         target_id: u64,
         batch: MemBatch<'_>,
-    ) -> Result<(AckLease, bool), WireFault> {
+    ) -> Result<bool, WireFault> {
         self.with_commit_group(target_id, batch, |g, recoverable| {
-            let lease = self.reactor.lease_acks(g.targets.set);
-            let targets = GroupTargets {
-                set: lease.workers(),
-                reply: Some(lease.id()),
-            };
-            scope.write(&SalGroup { targets, ..g }, recoverable)?;
-            Ok((lease, recoverable))
+            scope.write(&g, recoverable)?;
+            Ok(recoverable)
         })
     }
 

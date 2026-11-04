@@ -428,12 +428,18 @@ fn a_stalled_scan_client_is_evicted_by_the_send_deadline() {
     }
 }
 
-/// With the inbound cap pinned to its 64 MiB floor, a client stalling its scan
-/// reply and then flooding pushes past the cap is closed, and none of the flood
-/// is applied. The default send deadline (30 s) stays out of the way.
+/// A client stalling its scan reply and then flooding pushes is held off at its
+/// share of the inbound budget, which the 64 MiB floor makes small, until the
+/// send deadline evicts it, and none of the flood is applied.
 #[test]
-fn inbound_cap_breach_closes_stalled_connection() {
-    let srv = ServerHandle::start_tls_with_env(4, &[("GNITZ_INBOUND_MEM_BYTES", "67108864")]);
+fn a_stalled_client_flooding_pushes_is_held_off_and_evicted() {
+    let srv = ServerHandle::start_tls_with_env(
+        4,
+        &[
+            ("GNITZ_INBOUND_MEM_BYTES", "67108864"),
+            ("GNITZ_CLIENT_SEND_TIMEOUT_MS", "1500"),
+        ],
+    );
     let target = srv.tls_target();
     with_watchdog(120, move || {
         let (mut setup, _, tid, schema) = client_with_table(&target);
@@ -451,8 +457,12 @@ fn inbound_cap_breach_closes_stalled_connection() {
             sent += 1;
         }
         assert!(
-            evicted_within(&mut s, 20_000),
-            "server must close the cap-breaching connection (sent {sent} frames)"
+            sent < 140,
+            "the server reads a stalled client's flood without holding it off"
+        );
+        assert!(
+            evicted_within(&mut s, 8_000),
+            "server must evict the stalled connection (sent {sent} frames)"
         );
         assert_eq!(
             scan_all(&mut setup, tid, &schema).len(),
