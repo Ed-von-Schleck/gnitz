@@ -405,7 +405,9 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
 
     // The committed tail every recovery replays, and the epoch the next writer
     // epoch starts above. Read once, before the fork.
-    let tail = CommittedTail::read(SalLog::open(data_dir)?)?;
+    let log = SalLog::open(data_dir)?;
+    let tail = CommittedTail::read(log)?;
+    log.advise_random();
     // The workers' parks, one W2M ring per worker, and the exchange mesh. None of
     // it is reclaimed on error: a failed boot exits the process, which returns
     // all of it to the kernel.

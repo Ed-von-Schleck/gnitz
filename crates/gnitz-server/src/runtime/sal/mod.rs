@@ -19,7 +19,7 @@ use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::catalog::SysFamily;
@@ -297,6 +297,10 @@ const SAL_MMAP_SIZE: usize = 1 << 30;
 /// The page holding the anchor, at the head of `wal.sal` so it does not move
 /// when `GNITZ_SAL_BYTES` does.
 const ANCHOR_BYTES: usize = 4096;
+
+/// The payload span from which a group's payloads are written with `pwrite`
+/// rather than stored through the mapping.
+const PAYLOAD_PWRITE_BYTES: usize = 4096;
 
 const _: () = assert!(
     SAL_MMAP_SIZE as u64 <= 1 << 32,
@@ -692,6 +696,18 @@ impl SalLog {
         })
     }
 
+    /// From here on, a fault on the mapping reads no pages ahead, so it caches
+    /// the one page it faulted on: a store to a page no write cached before
+    /// dirties, and the next `fdatasync` writes, that page alone. The advice is
+    /// the mapping's, so the workers' reads through it, after the `fork()`,
+    /// take it too. Given once recovery has read the committed tail, which a
+    /// cold page cache then reads ahead.
+    pub(crate) fn advise_random(&self) {
+        let (base, len) = (self.ring.wrapping_sub(ANCHOR_BYTES), self.ring_len + ANCHOR_BYTES);
+        // SAFETY: the whole mapping, anchor page included.
+        unsafe { libc::madvise(base.cast(), len, libc::MADV_RANDOM) };
+    }
+
     /// The header of the group laid out at `base`, sized by its own payload
     /// count.
     ///
@@ -822,6 +838,8 @@ pub(crate) struct SalWriter {
     /// so a checkpoint is warranted whatever the write cursor says. Cleared by
     /// [`Self::rewind`].
     refused_transient: Cell<bool>,
+    /// The encode buffer of a group whose payloads are written with `pwrite`.
+    scratch: Cell<Vec<u8>>,
     /// A zone member pushing rows was published in this epoch. Cleared by
     /// [`Self::rewind`].
     holds_pushes: Cell<bool>,
@@ -853,6 +871,7 @@ impl SalWriter {
             watermark: Cell::new(epoch_word(epoch, 0) - 1),
             checkpoint_threshold,
             refused_transient: Cell::new(false),
+            scratch: Cell::default(),
             holds_pushes: Cell::new(false),
             excl: AsyncRwLock::default(),
             parks,
@@ -935,26 +954,43 @@ impl SalWriter {
         // unwritten would read as whatever group last occupied this offset:
         // every one is written.
         head.encode(hdr, base, epoch);
+        // A payload span from `PAYLOAD_PWRITE_BYTES` up is laid out in `scratch`
+        // and written with `pwrite`, not stored through the mapping: no page
+        // fault per page, and the page cache sizes its pages to the write. Its
+        // padding is written as zeros. A mapped span's padding is left as it
+        // is: the checksum covers whatever bytes are there, and nothing rewrites
+        // a laid-out group's span before the cursor passes it again.
+        let span = total - PREFIX_BYTES - hdr_size;
+        let mut scratch = (span >= PAYLOAD_PWRITE_BYTES).then(|| {
+            let mut buf = self.scratch.take();
+            buf.clear();
+            buf.resize(span, 0);
+            buf
+        });
+        let payload: &mut [u8] = match &mut scratch {
+            Some(buf) => buf,
+            // SAFETY: the payload span past `hdr`, inside the group mapped above.
+            None => unsafe { std::slice::from_raw_parts_mut(self.log.ring.add(hdr_off + hdr_size), span) },
+        };
         for (i, (off, sz)) in payload_spans(sizes.iter().copied()).enumerate() {
             write_u64_le(hdr, OFF_DIRECTORY + i * DIR_ENTRY_BYTES, sz as u64);
-            // SAFETY: `off + sz <= total - PREFIX_BYTES - hdr_size`, inside the mapped
-            // span past `hdr`, and the spans are disjoint.
-            let slot = unsafe { std::slice::from_raw_parts_mut(self.log.ring.add(hdr_off + hdr_size + off), sz) };
-            fill(slot);
+            fill(&mut payload[off..off + sz]);
         }
-        // The span includes the padding behind each payload, which nothing
-        // writes: the checksum covers whatever bytes are there, and nothing
-        // rewrites a laid-out group's span before the cursor passes it again.
-        // SAFETY: the payload span of the group laid out above.
-        let payload = unsafe {
-            std::slice::from_raw_parts(self.log.ring.add(hdr_off + hdr_size), total - PREFIX_BYTES - hdr_size)
-        };
         let sum = if head.lsn != 0 {
             gnitz_wire::checksum(payload)
         } else {
             0
         };
         write_u64_le(hdr, OFF_PAYLOAD_SUM, sum);
+        if let Some(buf) = scratch {
+            // Once it returns, the bytes are in the page cache the mapping
+            // reads, ahead of the prefix store that publishes them.
+            let at = (ANCHOR_BYTES + hdr_off + hdr_size) as u64;
+            if let Err(e) = self.log.file.write_all_at(&buf, at) {
+                gnitz_fatal_abort!("SAL pwrite ({span} bytes at {at}) failed: {e}");
+            }
+            self.scratch.set(buf);
+        }
 
         let end = base + total as u64;
         // SAFETY: `end <= cap <= ring_len`, inside the mapping, and the word at
@@ -1014,6 +1050,19 @@ impl SalWriter {
         if let Err(e) = self.log.file.sync_data() {
             gnitz_fatal_abort!("SAL fdatasync (rewind to epoch {epoch}) failed: {e}");
         }
+        // Every page of the ring is clean once synced: drop the cached ones no
+        // process maps, so the new epoch's small groups do not land in the large
+        // pages earlier `pwrite`s left behind, each of which a store dirties
+        // and a sync writes whole.
+        // SAFETY: an advisory call on an open descriptor.
+        unsafe {
+            libc::posix_fadvise(
+                self.log.file.as_raw_fd(),
+                ANCHOR_BYTES as libc::off_t,
+                self.log.ring_len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
         unsafe { write_end_prefix(self.log.ring, 0) };
     }
 
