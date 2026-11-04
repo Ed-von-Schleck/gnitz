@@ -355,6 +355,18 @@ fn raise_fd_limit(target: u64) {
     }
 }
 
+/// Keeps freed memory in the heap for the next batch: with a fixed mmap
+/// threshold and a trim threshold above any phase's working set, glibc stops
+/// unmapping and trimming on free, which the next allocation would fault in
+/// again. Set before the fork, so every worker inherits it.
+fn keep_freed_memory_mapped() {
+    // SAFETY: mallopt only adjusts glibc's allocator parameters.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 32 << 20);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 1 << 30);
+    }
+}
+
 /// Single entry point for the entire server bootstrap: opens the catalog,
 /// allocates the shared IPC regions, forks the workers, runs recovery, and
 /// enters the executor event loop, with a TLS listener when `tls` names one.
@@ -364,6 +376,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     // Ahead of anything a refusal would have to undo: the reactor cannot run
     // without io_uring, and nothing else tells a container why.
     check_host()?;
+    keep_freed_memory_mapped();
     signals::catch_reload();
     let limits = Limits::from_env();
     // Client connections are the one descriptor demand that grows: a shard is
