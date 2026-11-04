@@ -32,11 +32,6 @@ use gnitz_zset::schema::{group_band, probe_key, range_band};
 /// Ingest runs fold into the RAM tier once they pass this.
 pub(super) const MEMTABLE_BYTES: usize = 192 << 10;
 
-/// Memtable rows per row of a seal's delta past which the seal leaves the
-/// memtable unfolded: beyond it a fold is mostly the copy of rows the delta
-/// does not touch.
-const SEAL_FOLD_RATIO: usize = 64;
-
 /// The RAM-tier ceiling a registry's stores open with unless its `StoreConfig`
 /// overrides it: it bounds that one tier, not the table's heap. The ceiling trades
 /// spill writes against RSS; shrinking it is how a test reaches the disk regime on
@@ -225,16 +220,6 @@ impl Table {
     pub(crate) fn seal(&mut self) -> Result<Option<Batch>, StorageError> {
         let schema = self.shard_index.schema;
         let run = self.pending.drain_into(&mut self.memtable, &schema);
-        // Left as a run of its own, a seal's delta lengthens every PK probe and
-        // keeps the rows it cancels held until the memtable next folds. A fold
-        // rewrites the whole memtable, though, so a delta under a
-        // `SEAL_FOLD_RATIO`th of it waits for the memtable's own trigger.
-        if run
-            .as_ref()
-            .is_some_and(|run| run.len() * SEAL_FOLD_RATIO >= self.memtable.row_count())
-        {
-            self.memtable.fold(&schema);
-        }
         let shards = self.shard_index.seal_pending();
         let delta = match shards.is_empty() {
             true => run,
