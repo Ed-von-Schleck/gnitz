@@ -9,7 +9,7 @@ use crate::runtime::signals;
 use crate::runtime::sync::{chan, oneshot};
 use gnitz_wire::{WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 use smallvec::{smallvec, SmallVec};
 use std::rc::Rc;
 
@@ -153,6 +153,11 @@ struct CommitScratch {
     writes: Vec<PendingWrite>,
     /// The batch's commit units; empty between batches.
     units: Vec<CommitUnit>,
+    /// Per table, the last of `units` that writes it; empty between batches.
+    last_unit: FxHashMap<u64, usize>,
+    /// Per unit, the batches merged behind its one family's; empty between
+    /// batches.
+    tails: Vec<Vec<FamilyRows>>,
     /// The ACKs of every group laid out and kept, in unit order; empty between
     /// batches.
     leases: Vec<AckLease>,
@@ -348,15 +353,50 @@ impl CommitUnit {
     }
 }
 
-/// Whether no table is written by two of `units`.
-fn write_disjoint_tables(units: &[CommitUnit]) -> bool {
-    let mut seen = FxHashSet::default();
-    units.iter().all(|unit| {
-        let mut tids: Vec<u64> = unit.laid().iter().map(|f| f.tid).collect();
-        tids.sort_unstable();
-        tids.dedup();
-        tids.into_iter().all(|tid| seen.insert(tid))
-    })
+/// Build `s.units` from `s.writes`, in arrival order: one unit per write, but
+/// under `merge` a one-family write joins the unit of the last write before it
+/// to its table when that is a one-family write too, so it moves past only
+/// writes to other tables. A unit's batches stay in arrival order, which is
+/// what makes intra-batch last-insert-wins mean last *inserted*.
+fn build_units(s: &mut CommitScratch, merge: bool) {
+    s.units.reserve(s.writes.len());
+    for PendingWrite { families, done } in s.writes.drain(..) {
+        let rows = families.iter().map(|f| f.rows.view().len()).sum();
+        if let ([f], true) = (&families[..], merge) {
+            if let Some(&at) = s.last_unit.get(&f.tid) {
+                if matches!(s.units[at].laid(), [g] if g.tid == f.tid) {
+                    s.units[at].dones.push((done, rows));
+                    s.tails[at].extend(families.into_iter().map(|f| f.rows));
+                    continue;
+                }
+            }
+        }
+        for f in &families {
+            s.last_unit.insert(f.tid, s.units.len());
+        }
+        s.units.push(CommitUnit {
+            outcome: Outcome::Laid { families, in_zone: false },
+            dones: smallvec![(done, rows)],
+        });
+        // A unit nothing merges into builds no `Vec`.
+        s.tails.push(Vec::new());
+    }
+    s.last_unit.clear();
+    for (unit, tail) in s.units.iter_mut().zip(s.tails.drain(..)) {
+        if tail.is_empty() {
+            continue;
+        }
+        let Outcome::Laid { families, .. } = &mut unit.outcome else {
+            unreachable!("no unit has been laid out yet")
+        };
+        let head = &mut families[0];
+        let first = head.rows.view();
+        let merged = Batch::concat(
+            first.schema(),
+            std::iter::once(first).chain(tail.iter().map(FamilyRows::view)),
+        );
+        head.rows = FamilyRows::Built(merged);
+    }
 }
 
 /// Commit the batch of writes in `s.writes`. Lays out every group, queues their
@@ -370,46 +410,10 @@ fn write_disjoint_tables(units: &[CommitUnit]) -> bool {
 /// merged run comes back as the writes it merged, which a batch that does not
 /// `merge` commits one by one. `s.units` and `s.leases` are empty again on return.
 async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
-    // One-family writes in tid runs. Stable: arrival order within a run is what
-    // makes intra-batch last-insert-wins mean last *inserted*.
-    s.writes.sort_by_key(|w| (w.families.len() != 1, w.families[0].tid));
-
     // ------------------------------------------------------------------
-    // Phase A (no lock): one unit per write, a run of one-family writes to one
-    // table merged into one.
+    // Phase A (no lock): the units.
     // ------------------------------------------------------------------
-    s.units.reserve(s.writes.len());
-    let mut remaining = s.writes.drain(..).peekable();
-    while let Some(PendingWrite { mut families, done }) = remaining.next() {
-        let rows = |families: &[TxnFamily]| families.iter().map(|f| f.rows.view().len()).sum::<usize>();
-        let mut dones: SmallVec<[Done; 1]> = smallvec![(done, rows(&families))];
-        if let ([head], true) = (&mut families[..], merge) {
-            // The run's batches behind its first. A single push ships the
-            // client's batch as it stands, so the dominant case builds no `Vec`.
-            let mut tail: Vec<FamilyRows> = Vec::new();
-            while let Some(next) = remaining.next_if(|w| matches!(&w.families[..], [f] if f.tid == head.tid)) {
-                dones.push((next.done, rows(&next.families)));
-                tail.extend(next.families.into_iter().map(|f| f.rows));
-            }
-            if !tail.is_empty() {
-                let first = head.rows.view();
-                let merged = Batch::concat(
-                    first.schema(),
-                    std::iter::once(first).chain(tail.iter().map(FamilyRows::view)),
-                );
-                head.rows = FamilyRows::Built(merged);
-            }
-        }
-        s.units.push(CommitUnit {
-            outcome: Outcome::Laid { families, in_zone: false },
-            dones,
-        });
-    }
-    drop(remaining);
-    debug_assert!(
-        !merge || write_disjoint_tables(&s.units),
-        "two units of one batch write one table, so the sort reordered them"
-    );
+    build_units(s, merge);
 
     // ------------------------------------------------------------------
     // Phase B (under the SAL writer): emit SAL groups, queue their tids for the

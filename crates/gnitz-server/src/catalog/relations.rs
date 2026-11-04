@@ -23,8 +23,13 @@ use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use super::CatalogEngine;
+
+/// A set of table ids to lock; a write to one table without FK edges, the
+/// common case, fits inline.
+pub(crate) type LockSet = SmallVec<[u64; 4]>;
 
 /// What one registered relation's lifetime owns: entered by its registration,
 /// removed by its unregistration.
@@ -250,7 +255,7 @@ impl CatalogEngine {
     /// against a child INSERT. One that `deletes` rows takes the children of
     /// every table its deletes cascade to as well. Appends without clearing,
     /// in no particular order and with repeats.
-    pub(crate) fn write_lock_set_into(&self, set: &mut Vec<u64>, table_id: u64, deletes: bool) {
+    pub(crate) fn write_lock_set_into(&self, set: &mut LockSet, table_id: u64, deletes: bool) {
         set.push(table_id);
         set.extend(self.fks_as_child(table_id).iter().map(|e| e.parent_tid));
         // The tables the deletes cascade to, beyond `table_id`, each once.

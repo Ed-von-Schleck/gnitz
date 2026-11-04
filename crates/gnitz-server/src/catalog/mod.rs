@@ -42,7 +42,7 @@ use relations::CatalogCacheSet;
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 pub(crate) use bootstrap::UnreplayedCatalog;
-pub(crate) use relations::{FkEdge, RowConstraints};
+pub(crate) use relations::{FkEdge, LockSet, RowConstraints};
 #[cfg(test)]
 pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
 pub(crate) use sys_tables::{DdlBundle, SysFamily};

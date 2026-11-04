@@ -5,13 +5,13 @@ use gnitz_wire::{FkAction, FkRef};
 // ── test_write_lock_set ─────────────────────────────────────────────────
 
 /// The lock set of a write to `tid` that `deletes` or does not, as
-/// `lock_tables_exclusive` acquires it: sorted and deduped.
+/// `lock_tables` acquires it: sorted and deduped.
 fn lock_set_of(engine: &CatalogEngine, tid: u64, deletes: bool) -> Vec<u64> {
-    let mut set = Vec::new();
+    let mut set = LockSet::new();
     engine.write_lock_set_into(&mut set, tid, deletes);
     set.sort_unstable();
     set.dedup();
-    set
+    set.to_vec()
 }
 
 /// A deleting write's lock set.
@@ -101,11 +101,11 @@ fn a_write_locks_what_its_cascade_can_delete_from() {
     assert_eq!(lock_set_of(&engine, mid, false), [root, mid, leaf]);
     // Appends to what the set already holds, as a transaction's union of its
     // families' sets is built.
-    let mut union = vec![other];
+    let mut union: LockSet = [other].into_iter().collect();
     engine.write_lock_set_into(&mut union, held, false);
     union.sort_unstable();
     union.dedup();
-    assert_eq!(union, [root, other, held, under]);
+    assert_eq!(union[..], [root, other, held, under]);
     let _ = (beyond, under);
 
     let actions = |tid| -> Vec<FkAction> { engine.fks_as_child(tid).iter().map(|e| e.on_delete).collect() };

@@ -7,15 +7,17 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use gnitz_foundation::fault::Seam;
 
 use super::validate::{Checks, FamilyRows, PushedBlock, TxnFamily};
 use super::{decode_fault, not_found, park_until, target_kind, Access, CatalogLock, Shared};
-use crate::catalog::CatalogEngine;
+use crate::catalog::{CatalogEngine, LockSet};
 use crate::runtime::reactor::RecvBuf;
 use crate::runtime::sync::{AsyncRwLock, ReadGuard, WriteGuard};
 use gnitz_store::relation::RelationKind;
+use gnitz_wire::txn_frame::BLIND;
 use gnitz_wire::{ClientVerb, DecodedControl, Target, WireConflictMode, WireFault, WireStatus};
 use gnitz_zset::repr::MemBatch;
 
@@ -41,10 +43,12 @@ async fn hold_push_for_ddl(shared: &Shared, push: &DecodedPush) {
 /// The per-table write state: the table locks, the OCC commit-LSN map, and the
 /// validation caches.
 pub(super) struct Writes {
-    /// Per-table write serialization. A push whose validation reads committed
-    /// state (`push_reads_committed_state`) and every transaction take the write
-    /// guard; a push that reads no committed state takes the read guard, so
-    /// same-table pushes reach the committer concurrently and share one fsync.
+    /// Per-table write serialization. A write with an OCC check, or whose
+    /// validation reads committed state (`push_reads_committed_state`), takes
+    /// the write guard of every table it writes and of those its deletes
+    /// cascade to; any other write — a push, or a transaction of blind pushes —
+    /// takes the read guard of every table it writes, so such writes reach the
+    /// committer concurrently and share one fsync.
     table_locks: RefCell<FxHashMap<u64, AsyncRwLock>>,
     /// OCC per-table commit-LSN map: `tid → the zone LSN its last accepted write
     /// this boot rode`, raised by [`Writes::committed`]. A missing entry reads
@@ -58,22 +62,27 @@ pub(super) struct Writes {
     pub(super) checks: Checks,
 }
 
-/// The table locks one task holds.
-enum HeldTables {
-    Shared { tid: u64, _guard: ReadGuard },
-    Exclusive { tids: Vec<u64>, _guards: Vec<WriteGuard> },
+/// The table locks one task holds: a guard on each of `tids`, the write guard
+/// when `exclusive`, else the read guard.
+struct HeldTables {
+    tids: LockSet,
+    exclusive: bool,
+    _guards: SmallVec<[TableGuard; 4]>,
+}
+
+/// One table lock's guard, held only to be dropped.
+enum TableGuard {
+    Read { _guard: ReadGuard },
+    Write { _guard: WriteGuard },
 }
 
 impl HeldTables {
     fn holds(&self, tid: u64) -> bool {
-        match self {
-            Self::Shared { tid: t, .. } => *t == tid,
-            Self::Exclusive { tids, .. } => tids.contains(&tid),
-        }
+        self.tids.contains(&tid)
     }
 
     fn holds_exclusive(&self, tid: u64) -> bool {
-        matches!(self, Self::Exclusive { tids, .. } if tids.contains(&tid))
+        self.exclusive && self.holds(tid)
     }
 }
 
@@ -92,25 +101,22 @@ impl Writes {
         self.table_locks.borrow_mut().entry(tid).or_default().clone()
     }
 
-    /// The read guard on `tid`, taken under the catalog read guard.
-    async fn lock_table_shared(&self, _catalog: &ReadGuard<CatalogLock>, tid: u64) -> HeldTables {
-        let guard = self.table_lock(tid).read().await;
-        HeldTables::Shared { tid, _guard: guard }
-    }
-
-    /// The write guard on every table in `tids`, taken in ascending order so a
-    /// child INSERT and a parent DELETE cannot deadlock on the same set, and each
-    /// once, since re-guarding a lock this task holds would hang forever.
-    ///
-    /// Owned, because the set is read out of the catalog and this loop awaits.
-    async fn lock_tables_exclusive(&self, _catalog: &ReadGuard<CatalogLock>, mut tids: Vec<u64>) -> HeldTables {
+    /// A guard on every table in `tids` — the write guard when `exclusive`, else
+    /// the read guard — taken under the catalog read guard in ascending order, so
+    /// no two sets deadlock (a child INSERT and a parent DELETE among them), and
+    /// each once, since re-guarding a lock this task holds would hang forever.
+    async fn lock_tables(&self, _catalog: &ReadGuard<CatalogLock>, mut tids: LockSet, exclusive: bool) -> HeldTables {
         tids.sort_unstable();
         tids.dedup();
-        let mut guards = Vec::with_capacity(tids.len());
+        let mut guards = SmallVec::with_capacity(tids.len());
         for &tid in &tids {
-            guards.push(self.table_lock(tid).write().await);
+            let lock = self.table_lock(tid);
+            guards.push(match exclusive {
+                true => TableGuard::Write { _guard: lock.write().await },
+                false => TableGuard::Read { _guard: lock.read().await },
+            });
         }
-        HeldTables::Exclusive { tids, _guards: guards }
+        HeldTables { tids, exclusive, _guards: guards }
     }
 
     /// OCC: whether `tid` committed a write after `basis`. `held`'s write guard on
@@ -234,7 +240,7 @@ pub(super) async fn handle_push(shared: &Shared, mut buf: RecvBuf, ctrl: Decoded
     let Some(family) = push.admit(&shared.cat(), Access::Write, &Rc::new(buf))? else {
         return Ok(0);
     };
-    commit(shared, &catalog, vec![family], None).await
+    commit(shared, &catalog, vec![family], &[]).await
 }
 
 /// PUSH_TXN: decode the bundle, then admit every family under the catalog read
@@ -244,14 +250,18 @@ pub(super) async fn handle_push_txn(shared: &Shared, mut buf: RecvBuf, ctrl: Dec
     let items = decode_push_txn_frame(&shared.cat(), buf.as_mut_slice(), ctrl.body)?;
     let catalog = shared.catalog_rwlock.read().await;
     let frame = Rc::new(buf);
-    let mut bases = Vec::with_capacity(items.len());
+    let mut occ = Vec::new();
     let mut families = Vec::with_capacity(items.len());
     for (basis, push) in items {
         let family = push.admit(&shared.cat(), Access::TxnWrite, &frame)?;
-        families.push(family.expect("a PUSH_TXN item carries a data block"));
-        bases.push(basis);
+        let family = family.expect("a PUSH_TXN item carries a data block");
+        // A blind family's basis is one no commit exceeds: there is nothing to check.
+        if basis != BLIND {
+            occ.push((family.tid, basis));
+        }
+        families.push(family);
     }
-    commit(shared, &catalog, families, Some(&bases)).await
+    commit(shared, &catalog, families, &occ).await
 }
 
 /// Commit `families` as one write: the table locks, OCC, the bundle's
@@ -259,43 +269,36 @@ pub(super) async fn handle_push_txn(shared: &Shared, mut buf: RecvBuf, ctrl: Dec
 /// along. Every rejection is pre-SAL, so a fault or a conflict commits nothing.
 /// The committer raises each written table's commit LSN to the write's.
 ///
-/// `bases` makes it a transaction: each family's read basis, which its OCC
-/// check compares against. A transaction, or a push whose validation reads
-/// committed state, locks the tables it writes and those its deletes cascade to
-/// exclusively; any other push shares its table's lock (see
-/// [`Writes::table_locks`]).
+/// `occ` is a transaction's OCC checks: each a table and the read basis its
+/// family was built from. The locks taken are [`Writes::table_locks`]'.
 async fn commit(
     shared: &Shared,
     catalog: &ReadGuard<CatalogLock>,
     mut families: Vec<TxnFamily>,
-    bases: Option<&[u64]>,
+    occ: &[(u64, u64)],
 ) -> Result<u64, WireFault> {
-    let exclusive = bases.is_some()
-        || shared
-            .cat()
-            .push_reads_committed_state(families[0].tid, families[0].mode);
-    let held = if exclusive {
-        let mut locks = Vec::with_capacity(4 * families.len());
+    let (tids, exclusive) = {
+        let cat = shared.cat();
+        let exclusive = !occ.is_empty() || families.iter().any(|f| cat.push_reads_committed_state(f.tid, f.mode));
+        let mut tids = LockSet::new();
         for f in &families {
-            shared
-                .cat()
-                .write_lock_set_into(&mut locks, f.tid, !f.rows.view().all_weights_positive());
+            // A shared write's table has no FK edge, so its set is the table alone.
+            let deletes = exclusive && !f.rows.view().all_weights_positive();
+            cat.write_lock_set_into(&mut tids, f.tid, deletes);
         }
-        shared.writes.lock_tables_exclusive(catalog, locks).await
-    } else {
-        shared.writes.lock_table_shared(catalog, families[0].tid).await
+        (tids, exclusive)
     };
+    let held = shared.writes.lock_tables(catalog, tids, exclusive).await;
 
-    // OCC. A blind family's basis is one no commit exceeds.
-    let conflict = bases.and_then(|bases| {
-        (families.iter().zip(bases)).find(|&(f, &basis)| shared.writes.written_since(&held, f.tid, basis))
-    });
-    if let Some((f, _)) = conflict {
+    let conflict = occ
+        .iter()
+        .find(|&&(tid, basis)| shared.writes.written_since(&held, tid, basis));
+    if let Some(&(tid, _)) = conflict {
         return Err(WireFault {
             status: WireStatus::TxnConflict,
             text: format!(
                 "transaction conflict on '{}': it was written after the read this write was built from; retry",
-                shared.cat().qualified_name(f.tid)
+                shared.cat().qualified_name(tid)
             ),
         });
     }

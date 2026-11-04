@@ -1,7 +1,8 @@
-//! How one committer batch is drained off the request channel, how a commit
-//! unit answers its clients, how a merged run is taken back as its writes, and
-//! how a pause is released. The SAL layout and the checkpoint sequence need a live
-//! dispatcher and worker ACKs, so they are covered end to end.
+//! How one committer batch is drained off the request channel, how its writes
+//! form commit units, how a commit unit answers its clients, how a merged run is
+//! taken back as its writes, and how a pause is released. The SAL layout and the
+//! checkpoint sequence need a live dispatcher and worker ACKs, so they are
+//! covered end to end.
 
 use super::*;
 use crate::runtime::test_support::try_poll_once;
@@ -17,21 +18,24 @@ fn push_of(rows: usize) -> CommitRequest {
     write_of(&[rows])
 }
 
-/// A write of one family per entry of `family_rows`.
-fn write_of(family_rows: &[usize]) -> CommitRequest {
+/// A write of one family per `(tid, rows)` of `families`.
+fn write(families: impl IntoIterator<Item = (u64, usize)>) -> PendingWrite {
     let (done, _rx) = oneshot::channel();
-    CommitRequest::Write(PendingWrite {
-        families: family_rows
-            .iter()
-            .enumerate()
-            .map(|(i, &rows)| TxnFamily {
-                tid: i as u64 + 1,
+    PendingWrite {
+        families: (families.into_iter())
+            .map(|(tid, rows)| TxnFamily {
+                tid,
                 mode: WireConflictMode::Update,
                 rows: FamilyRows::Built(batch_of(rows)),
             })
             .collect(),
         done,
-    })
+    }
+}
+
+/// A write of one family per entry of `family_rows`, to tables `1..`.
+fn write_of(family_rows: &[usize]) -> CommitRequest {
+    CommitRequest::Write(write((1..).zip(family_rows.iter().copied())))
 }
 
 fn checkpoint() -> CommitRequest {
@@ -200,4 +204,42 @@ fn a_unit_answers_every_client() {
             assert_eq!(got, want, "case {i}, client {c}");
         }
     }
+}
+
+/// Each write joins the unit of the last write before it to its table when
+/// both are one-family writes, so no write moves past another to one of its
+/// tables.
+#[test]
+fn a_push_merges_behind_the_last_write_to_its_table() {
+    // Arrival order, each write's rows its label: pushes to 7 on both sides of
+    // a transaction over 8 and 7, and pushes to 9 and 3 nothing else writes.
+    let mut s = CommitScratch {
+        writes: vec![
+            write([(7, 1)]),
+            write([(9, 2)]),
+            write([(8, 3), (7, 3)]),
+            write([(7, 4)]),
+            write([(3, 5)]),
+            write([(9, 6)]),
+            write([(7, 7)]),
+        ],
+        ..CommitScratch::default()
+    };
+    build_units(&mut s, true);
+    let units: Vec<(Vec<u64>, Vec<usize>, usize)> = (s.units.iter())
+        .map(|u| {
+            let tids = u.laid().iter().map(|f| f.tid).collect();
+            let dones = u.dones.iter().map(|&(_, rows)| rows).collect();
+            (tids, dones, u.laid()[0].rows.view().len())
+        })
+        .collect();
+    let want = vec![
+        (vec![7], vec![1], 1),
+        (vec![9], vec![2, 6], 8),
+        (vec![8, 7], vec![6], 3),
+        (vec![7], vec![4, 7], 11),
+        (vec![3], vec![5], 5),
+    ];
+    assert_eq!(units, want);
+    assert!(s.last_unit.is_empty() && s.tails.is_empty());
 }
