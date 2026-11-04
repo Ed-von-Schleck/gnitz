@@ -11,8 +11,8 @@ use std::rc::Rc;
 use gnitz_wire::{AggDescriptor, AggFunc, OrderKey, TypeCode};
 
 use super::{with_row, At, Element, OrderIndex, OrderedKind, OrderedPlan, Walk};
-use crate::algebra::{resolve_aggs, Agg, AggValues};
-use crate::repr::Batch;
+use crate::algebra::{resolve_aggs, Agg, AggValues, RangeGroups};
+use crate::repr::{Batch, Run};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 
 /// The values a window adds behind its input's columns: the rank, the dense
@@ -23,6 +23,10 @@ pub(super) struct Window {
     dense_rank: Option<usize>,
     /// The aggregates, each reading its column off an index row.
     aggs: Rc<[Agg]>,
+    /// Whether the rows before an entry fold as sums over the index's runs:
+    /// every value is a count or a wrapping integer sum, so no row order or
+    /// merge changes it, and no dense rank counts peer groups.
+    summed_prefix: bool,
 }
 
 impl OrderedPlan {
@@ -66,10 +70,11 @@ impl OrderedPlan {
             .collect();
         // A row's own frame holds the row, so no value is taken over no rows.
         let (output_schema, aggs) = resolve_aggs(&index.schema, out, &over_index, false)?;
+        let summed_prefix = dense_rank.is_none() && aggs.iter().all(Agg::is_exact_linear);
         Ok(OrderedPlan {
             index,
             output_schema,
-            kind: OrderedKind::Window(Window { rank, dense_rank, aggs }),
+            kind: OrderedKind::Window(Window { rank, dense_rank, aggs, summed_prefix }),
         })
     }
 }
@@ -129,6 +134,30 @@ impl<'a> Running<'a> {
     /// amount to the same on entry and hold the same such rows, so each is folded
     /// once, and none is emitted.
     fn fold_to_entry(&mut self, walk: &mut Walk<'_>) {
+        if self.window.summed_prefix {
+            // Each run's rows below the entry's PK, unmerged: a sum of `w · v`
+            // over them is the sum over the merged elements, a cancelled pair
+            // adding nothing. The index integrates a relation, so no element nets
+            // a negative weight the walk below would leave out.
+            let (aggs, rows, n) = (&mut self.aggs, &mut self.rows[NEW], self.window.aggs.len());
+            walk.skip_stored_below_entry_pk(|src, at, net| match (src, net) {
+                (Run::Mem(b), None) => {
+                    let mb = b.as_mem_batch();
+                    let ranges = [(at.start, at.end)];
+                    for k in 0..n {
+                        aggs.fold(k, &mb, &ranges, RangeGroups::One(NEW));
+                    }
+                    *rows = rows.wrapping_add(mb.sum_weights(at.start, at.end));
+                }
+                _ => {
+                    for row in at {
+                        let weight = net.unwrap_or_else(|| src.get_weight(row));
+                        aggs.step(NEW, src, row, weight);
+                        *rows = rows.wrapping_add(weight);
+                    }
+                }
+            });
+        }
         let mut last: Option<At> = None;
         while let Some((at, weight)) = walk.next_stored_before_entry() {
             // A row at a non-positive weight is not in the group.

@@ -73,7 +73,7 @@ impl AdhocFold {
         );
         if self.shape.key.is_global() {
             for k in 0..self.shape.aggs.len() {
-                self.vals.fold(k, &mb, ranges, RangeGroups::First);
+                self.vals.fold(k, &mb, ranges, RangeGroups::One(0));
             }
             return Ok(());
         }

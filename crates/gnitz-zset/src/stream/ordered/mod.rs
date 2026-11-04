@@ -19,9 +19,10 @@
 //! merge's row-by-row equal-PK arm; a string's does past its slot.
 
 use std::cmp::Ordering;
+use std::ops::Range;
 
 use crate::algebra::{GroupOutKey, KeyPacker};
-use crate::repr::{pk_group_end, Batch, CursorRow, MemBatch, ReadCursor};
+use crate::repr::{pk_group_end, Batch, CursorRow, MemBatch, ReadCursor, Run};
 use crate::schema::{compare_pk_ordering, DerivedSchema, Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
 use crate::stream::OpenAt;
 use gnitz_wire::RowSource;
@@ -382,6 +383,23 @@ impl Walk<'_> {
         let weight = self.history.current_weight();
         self.history.advance();
         Some((at, weight))
+    }
+
+    /// Pass over the stored rows whose PK is below the next entry's, handing
+    /// `fold` each run with rows of it, unmerged: a run's rows at their own
+    /// weights, and — as a one-row range at `Some` net weight — the row the
+    /// cursor stood on. They sort before the entry's peers, so they are the
+    /// group's. An entry is pending.
+    #[inline]
+    fn skip_stored_below_entry_pk(&mut self, mut fold: impl FnMut(&Run, Range<usize>, Option<i64>)) {
+        debug_assert!(self.pending());
+        let key = self.entries.get_pk_bytes(self.next);
+        if !self.history.is_valid() || compare_pk_ordering(self.history.current_pk_bytes(), key).is_ge() {
+            return;
+        }
+        let (src, row) = self.history.row_at(self.history.current_position());
+        fold(src, row..row + 1, Some(self.history.current_weight()));
+        self.history.skip_below(key, |src, rows| fold(src, rows, None));
     }
 
     /// Leave the group's remaining entries unread.

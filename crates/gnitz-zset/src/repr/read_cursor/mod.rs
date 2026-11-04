@@ -199,7 +199,7 @@ impl ReadCursor {
         // gallop — does not pay for one that cannot change what it does. `valid`
         // before both: `current_pk_cmp_bytes` reads the positioned row.
         if self.valid && self.mode.is_none() && self.current_pk_cmp_bytes(key) == Ordering::Less {
-            self.seek_forward_merge(key);
+            self.skip_below(key, |_, _| {});
         } else {
             self.reposition_to(key);
         }
@@ -211,7 +211,7 @@ impl ReadCursor {
     fn advance_to_forward(&mut self, key: &[u8]) {
         // Only the merge mode has a tournament an in-place gallop can maintain.
         if self.mode.is_none() {
-            self.seek_forward_merge(key);
+            self.skip_below(key, |_, _| {});
         } else {
             self.reposition_to(key);
         }
@@ -227,27 +227,49 @@ impl ReadCursor {
         self.rebuild_and_advance();
     }
 
-    /// Gallop the loser tree forward to the first head `>= key`, then advance to
-    /// the first live group. [`Self::advance_to_forward`]'s dispatch is what
-    /// establishes the mode and the strictly-forward key this needs.
-    fn seek_forward_merge(&mut self, key: &[u8]) {
-        with_payload_cmp!(self.schema, |p| self.seek_forward_merge_with(key, p));
+    /// Stand on the first live group whose PK is `>= key`, handing `skipped` each
+    /// source with the rows of its walk it passes over. Those rows are unmerged:
+    /// a row and a row of another source cancelling it are both handed over. The
+    /// row the cursor stands on is consumed already, so it is not. Only the
+    /// sources whose head lies below `key` are galloped, and the loser tree is
+    /// kept in place. `key` must be exactly `pk_stride` OPK bytes and above the
+    /// current row's PK.
+    pub(crate) fn skip_below(&mut self, key: &[u8], skipped: impl FnMut(&Run, Range<usize>)) {
+        with_payload_cmp!(self.schema, |p| self.skip_below_with(key, p, skipped));
     }
 
     #[inline]
-    fn seek_forward_merge_with<P: PayloadOrder>(&mut self, key: &[u8], payload: P) {
-        let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
-        let less = merge::merge_less(schema, sources, *order, payload);
-        Self::seek_phase(
+    fn skip_below_with<P: PayloadOrder>(
+        &mut self,
+        key: &[u8],
+        payload: P,
+        mut skipped: impl FnMut(&Run, Range<usize>),
+    ) {
+        let ReadCursor {
             tree,
             sources,
-            *order,
             states,
-            |s: &Run, r: usize| compare_pk_ordering(s.get_pk_bytes(r), key) == Ordering::Less,
-            |s: &Run, pos: usize| s.seek(key, Some(pos)),
-            &less,
-        );
-        self.advance_merge_with(payload);
+            schema,
+            order,
+            mode,
+            ..
+        } = &mut *self;
+        let sources = &*sources;
+        let lags = |s: &Run, r: usize| compare_pk_ordering(s.get_pk_bytes(r), key) == Ordering::Less;
+        let mut gallop = |s: &Run, at: &Range<usize>| {
+            let to = s.seek(key, Some(at.start));
+            skipped(s, at.start..to.min(at.end));
+            to
+        };
+        match *mode {
+            // The other sources' windows are empty, and a forward seek keeps them so.
+            Some(src) => states[src].start = gallop(&sources[src], &states[src]),
+            None => {
+                let less = merge::merge_less(schema, sources, *order, payload);
+                Self::seek_phase(tree, sources, *order, states, lags, gallop, &less);
+            }
+        }
+        self.advance_with(payload);
     }
 
     /// Advance every laggard head (`lags` its row) to its own lower bound via
@@ -261,7 +283,7 @@ impl ReadCursor {
         order: MergeOrder,
         states: &mut [Range<usize>],
         lags: impl Fn(&Run, usize) -> bool,
-        gallop: impl Fn(&Run, usize) -> usize,
+        mut gallop: impl FnMut(&Run, &Range<usize>) -> usize,
         less: &impl Fn(&Player, &Player) -> bool,
     ) {
         while let Some(Player { source_idx: src, row, .. }) = tree.peek() {
@@ -270,7 +292,7 @@ impl ReadCursor {
             if !lags(&sources[src], row) {
                 break;
             }
-            states[src].start = gallop(&sources[src], states[src].start);
+            states[src].start = gallop(&sources[src], &states[src]);
             tree.step_top(order.head(sources, src, &states[src]), less);
         }
     }
@@ -412,7 +434,7 @@ impl ReadCursor {
         // `advance_to_forward`, with the payload order already selected.
         if self.valid && self.current_pk_cmp_bytes(key) == Ordering::Less {
             match self.mode {
-                None => self.seek_forward_merge_with(key, payload),
+                None => self.skip_below_with(key, payload, |_, _| {}),
                 Some(_) => self.reposition_to(key),
             }
         }
@@ -457,10 +479,10 @@ impl ReadCursor {
         } = &mut *self;
         let (sources, schema) = (&*sources, &*schema);
         let lags = |s: &Run, r: usize| payload.compare_full(schema, s, r, mb, i).is_lt();
-        let gallop = |s: &Run, pos: usize| gallop_by(s.row_count(), Some(pos), |r| lags(s, r));
+        let gallop = |s: &Run, at: &Range<usize>| gallop_by(s.row_count(), Some(at.start), |r| lags(s, r));
         match *mode {
             // The other sources' windows are empty, and a forward seek keeps them so.
-            Some(src) => states[src].start = gallop(&sources[src], states[src].start),
+            Some(src) => states[src].start = gallop(&sources[src], &states[src]),
             None => {
                 let less = merge::merge_less(schema, sources, *order, payload);
                 Self::seek_phase(tree, sources, *order, states, lags, gallop, &less);

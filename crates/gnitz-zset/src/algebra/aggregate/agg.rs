@@ -375,8 +375,8 @@ pub(crate) trait Groups: Copy {
 pub(crate) enum RangeGroups {
     /// Group `i`.
     Each,
-    /// Group 0.
-    First,
+    /// This group.
+    One(usize),
 }
 
 impl Groups for RangeGroups {
@@ -384,7 +384,7 @@ impl Groups for RangeGroups {
     fn of(self, range: usize, _: usize) -> usize {
         match self {
             RangeGroups::Each => range,
-            RangeGroups::First => 0,
+            RangeGroups::One(g) => g,
         }
     }
 }

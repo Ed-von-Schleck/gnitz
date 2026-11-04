@@ -13,7 +13,7 @@ use crate::test_support::stream_input::{
 use gnitz_expr::cmp_order_keys;
 use gnitz_wire::{AggDescriptor, AggFunc, OrderKey};
 
-use crate::stream::ordered::OrderedPlan;
+use crate::stream::ordered::{OrderedKind, OrderedPlan};
 
 /// Every aggregate, over every column form one reads: none, a nullable
 /// integer, a string, a float, and a column the group may be keyed on.
@@ -29,27 +29,43 @@ fn aggs() -> Vec<AggDescriptor> {
     ]
 }
 
-/// Both ranks and [`aggs`] of every row of `model`, each over the rows of its
-/// group at or before its peers under `keys`.
-fn window(model: &BTreeMap<Row, i64>, group_cols: &[u32], keys: &[OrderKey]) -> BTreeMap<(Cells, Cells), i64> {
+/// The counts and integer sums: the aggregates whose prefix folds as sums over
+/// the index's runs.
+fn summed_aggs() -> Vec<AggDescriptor> {
+    vec![
+        agg(AggFunc::Sum, 0),
+        AggDescriptor::COUNT_STAR,
+        agg(AggFunc::CountNonNull, 2),
+    ]
+}
+
+/// The rank, the dense rank where `dense`, and `aggs` of every row of `model`,
+/// each over the rows of its group at or before its peers under `keys`.
+fn window(
+    model: &BTreeMap<Row, i64>,
+    group_cols: &[u32],
+    keys: &[OrderKey],
+    aggs: &[AggDescriptor],
+    dense: bool,
+) -> BTreeMap<(Cells, Cells), i64> {
     let rows: Vec<(Row, i64)> = model.iter().filter(|(_, &w)| w > 0).map(|(r, &w)| (*r, w)).collect();
     let (b, locs, groups) = ordered_groups(&rows, group_cols, keys);
     let mb = b.as_mem_batch();
     let int = |v: i64| Some(v.to_le_bytes().to_vec());
-    let aggs = aggs();
     let mut want = BTreeMap::new();
     for group in groups {
-        let (mut before, mut dense) = (0i64, 0i64);
+        let (mut before, mut groups) = (0i64, 0i64);
         let mut prefix: Vec<(Cells, i64)> = Vec::new();
         let mut at = 0;
         while at < group.len() {
             let end = (at..group.len())
                 .find(|&j| cmp_order_keys(&locs, &mb, group[at], group[j]) != Ordering::Equal)
                 .unwrap_or(group.len());
-            dense += 1;
+            groups += 1;
             prefix.extend(group[at..end].iter().map(|&i| (cells(&rows[i].0), rows[i].1)));
-            let values: Cells = [int(before + 1), int(dense)]
+            let values: Cells = [Some(int(before + 1)), dense.then(|| int(groups))]
                 .into_iter()
+                .flatten()
                 .chain(aggs.iter().map(|&a| agg_of(a, &prefix)))
                 .collect();
             for &i in &group[at..end] {
@@ -78,7 +94,28 @@ proptest! {
         let mut model = BTreeMap::new();
         for targets in &ticks {
             h.tick(&batch(&delta_to(&mut model, targets)));
-            prop_assert_eq!(h.state(group_cols), window(&model, group_cols, &keys));
+            prop_assert_eq!(h.state(group_cols), window(&model, group_cols, &keys, &aggs(), true));
+        }
+    }
+
+    /// The same of a window of counts and integer sums and a rank, whose rows
+    /// before an entry fold as sums over the index's runs: with many runs, each
+    /// epoch's own, and rows of a later run cancelling an earlier one's.
+    #[test]
+    fn summed_prefix_values_are_the_values_of_the_integral(
+        group_cols in prop::sample::select(&GROUPS[..]),
+        keys in arb_keys(),
+        ticks in prop::collection::vec(arb_row(), 8..32).prop_flat_map(|pool| {
+            prop::collection::vec(prop::collection::vec((prop::sample::select(pool), 0i64..=3), 0..12), 2..10)
+        }),
+    ) {
+        let plan = OrderedPlan::window(&schema(), group_cols, &keys, &summed_aggs(), true, false).unwrap();
+        prop_assert!(matches!(&plan.kind, OrderedKind::Window(w) if w.summed_prefix));
+        let mut h = Harness::new(plan);
+        let mut model = BTreeMap::new();
+        for targets in &ticks {
+            h.tick(&batch(&delta_to(&mut model, targets)));
+            prop_assert_eq!(h.state(group_cols), window(&model, group_cols, &keys, &summed_aggs(), false));
         }
     }
 }
