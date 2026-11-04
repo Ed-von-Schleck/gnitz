@@ -110,7 +110,7 @@ const SAMPLE_RUNS: usize = 64;
 /// Either way a column of mostly NULLs repeats.
 fn sample_repeats<'a>(n: usize, content: impl Fn(usize) -> &'a [u8]) -> bool {
     let stride = (n / SAMPLE_RUNS).max(SAMPLE_RUN);
-    let mut seen = FxHashSet::default();
+    let mut seen = FxHashSet::with_capacity_and_hasher(n.min(SAMPLE_RUNS * SAMPLE_RUN), Default::default());
     let (mut sampled, mut empty) = (0usize, 0usize);
     (0..n)
         .step_by(stride)
@@ -129,7 +129,8 @@ fn sample_repeats<'a>(n: usize, content: impl Fn(usize) -> &'a [u8]) -> bool {
 /// that seldom repeat costs the rows up to its first entry too many.
 fn dict_fixed_column(src: &[u8], width: usize, limit: usize) -> Option<Vec<u8>> {
     let n = src.len() / width;
-    let mut index: FxHashMap<Content<'_>, u32> = FxHashMap::default();
+    let mut index: FxHashMap<Content<'_>, u32> =
+        FxHashMap::with_capacity_and_hasher(n.min(DICT_MAX_ENTRIES + 1), Default::default());
     let mut entries: Vec<[u8; 16]> = Vec::new();
     let mut ids = Vec::with_capacity(n);
     for cell in src.chunks_exact(width) {
@@ -154,12 +155,13 @@ fn dict_fixed_column(src: &[u8], width: usize, limit: usize) -> Option<Vec<u8>> 
 /// smaller region and heap — a dictionary only while the values fit one — and
 /// one cell for a column of one value. A column whose sample repeats no value
 /// is priced without the pass that tells its values apart, and the pass stops
-/// at the first value past which the lengths are the smaller.
+/// at the first value past which the lengths are the smaller. The pass reaches
+/// the heap only once a dictionary or a cell per row has won it.
 fn pack_string_column<'a>(cells: &'a [[u8; 16]], src: Heap<'a>, heap: &mut HeapWriter<'_>) -> (Encoding, Vec<u8>) {
     if is_constant(cells.as_flattened(), 16) {
         return (Encoding::Constant, heap.place(&cells[0], src).to_vec());
     }
-    let (at, raw) = (heap.mark(), aligned(cells.len() * 16));
+    let raw = aligned(cells.len() * 16);
     let (mut span, mut short, mut long) = ((usize::MAX, 0), 0, 0);
     for len in cells.iter().map(|cell| stored_value(cell, src).0) {
         span = (span.0.min(len), span.1.max(len));
@@ -182,28 +184,37 @@ fn pack_string_column<'a>(cells: &'a [[u8; 16]], src: Heap<'a>, heap: &mut HeapW
         }
     };
     if raw + long <= seq || sample_repeats(cells.len(), |row| stored_value(&cells[row], src).1) {
-        let mut index: FxHashMap<(usize, Content<'_>), u32> = FxHashMap::default();
-        let mut entries: Vec<[u8; 16]> = Vec::new();
+        let mut index: FxHashMap<(usize, Content<'_>), u32> =
+            FxHashMap::with_capacity_and_hasher(cells.len().min(DICT_MAX_ENTRIES + 1), Default::default());
+        // Each distinct value's first cell, and the heap bytes their long values take.
+        let mut firsts: Vec<&[u8; 16]> = Vec::new();
+        let mut shared = 0;
         let mut ids: Vec<u32> = Vec::with_capacity(cells.len());
         for cell in cells {
-            let next = entries.len() as u32;
+            let next = firsts.len() as u32;
             let (len, bytes) = stored_value(cell, src);
             let id = *index.entry((len, Content(bytes))).or_insert(next);
             if id == next {
-                entries.push(heap.place(cell, src));
-                if next > 0 && sharing(entries.len(), heap.plain_len() - at.1).is_none() {
+                firsts.push(cell);
+                if len > gnitz_wire::SHORT_STRING_THRESHOLD {
+                    shared += len;
+                }
+                if next > 0 && sharing(firsts.len(), shared).is_none() {
                     break;
                 }
             }
             ids.push(id);
         }
-        if entries.len() == 1 {
-            return (Encoding::Constant, entries[0].to_vec());
-        }
-        match sharing(entries.len(), heap.plain_len() - at.1) {
-            Some(Encoding::Dict) => return (Encoding::Dict, dict_encode(&entries, &ids)),
-            Some(_) => return (Encoding::Raw, ids.iter().flat_map(|&id| entries[id as usize]).collect()),
-            None => heap.truncate(at),
+        let shares = sharing(firsts.len(), shared);
+        if firsts.len() == 1 || shares.is_some() {
+            let entries: Vec<[u8; 16]> = firsts.iter().map(|cell| heap.place(cell, src)).collect();
+            if entries.len() == 1 {
+                return (Encoding::Constant, entries[0].to_vec());
+            }
+            return match shares {
+                Some(Encoding::Dict) => (Encoding::Dict, dict_encode(&entries, &ids)),
+                _ => (Encoding::Raw, ids.iter().flat_map(|&id| entries[id as usize]).collect()),
+            };
         }
     }
     (Encoding::Seq, seq_encode(cells, span, src, heap))

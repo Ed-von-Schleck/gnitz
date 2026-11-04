@@ -1079,22 +1079,6 @@ impl<'a> HeapWriter<'a> {
         gnitz_wire::relocate_german_value_with(cell, src, |value| self.push(value))
     }
 
-    /// The bytes the values appended take decoded.
-    pub(crate) fn plain_len(&self) -> usize {
-        self.plain_len
-    }
-
-    /// The point [`truncate`](Self::truncate) returns the heap to.
-    pub(crate) fn mark(&self) -> (usize, usize) {
-        (self.bytes.len(), self.plain_len)
-    }
-
-    /// Drop every value appended since `mark`.
-    pub(crate) fn truncate(&mut self, (bytes, plain_len): (usize, usize)) {
-        self.bytes.truncate(bytes);
-        self.plain_len = plain_len;
-    }
-
     /// Whether the heap is coded and its image, table included, holds more than
     /// three quarters of the bytes its values take: a saving that small does
     /// not pay for decoding every value read.

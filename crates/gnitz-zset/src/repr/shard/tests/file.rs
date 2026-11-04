@@ -288,3 +288,63 @@ fn a_mostly_null_column_of_distinct_values_is_a_dictionary() {
     }
     assert_eq!(written_strings(&b.finish()), (8 * 60, Encoding::Dict));
 }
+
+/// The shard bytes of string columns that take each string image, over a plain
+/// heap and a coded one, are pinned: a column whose dictionary loses late in
+/// the pass among them.
+#[test]
+fn string_images_are_pinned() {
+    let shard = |batch: &Batch, coded: bool| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let codebook = coded.then(|| Codebook::for_batch(None, batch)).flatten();
+        let opts = ShardWriteOpts {
+            codebook: codebook.as_deref(),
+            ..Default::default()
+        };
+        batch.write_as_shard(path.to_str().unwrap(), opts).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let encodings: Vec<Encoding> = spans_of(&bytes)[REG_PAYLOAD_START..]
+            .iter()
+            .map(|s| s.encoding)
+            .collect();
+        write_u64_le(&mut bytes, OFF_VERSION, 0);
+        write_u64_le(&mut bytes, OFF_DESC_CHECKSUM, 0);
+        (encodings, gnitz_wire::checksum(&bytes))
+    };
+    let str = SchemaColumn::new(TypeCode::String, false);
+    let schema = u64_pk_schema(&[str, str, str, str]);
+    let mut b = BatchBuilder::new(&schema);
+    for i in 0..512u64 {
+        b.begin_row(i as u128 + 1, 1);
+        // One long value, at a heap offset of its own per row.
+        b.put_string("one value held by every row");
+        b.put_string(&"dict".repeat(1 + (i % 7) as usize));
+        // Distinct long values but for the first two rows'.
+        b.put_string(&format!(
+            "prose row {} {}",
+            i.max(1),
+            "of words a table codes ".repeat(4)
+        ));
+        b.put_string(&format!("{i:05}"));
+        b.end_row();
+    }
+    let rows = b.finish();
+    use Encoding::*;
+    assert_eq!(
+        shard(&rows, false),
+        (vec![Constant, Dict, Seq, Seq, Raw, Raw], 15936150502234314707),
+        "plain heap"
+    );
+    assert_eq!(
+        shard(&rows, true),
+        (vec![Constant, Dict, Seq, Seq, Symbols, Raw], 17156004011245352482),
+        "coded heap"
+    );
+    let two = string_batch(&[(1, "the first long value"), (2, "the second long value")]);
+    assert_eq!(
+        shard(&two, false),
+        (vec![Raw, Raw, Raw], 12857855154648196144),
+        "two distinct values"
+    );
+}
