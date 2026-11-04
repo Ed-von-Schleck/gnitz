@@ -1,6 +1,6 @@
 //! Draining the merge into owned batches.
 
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Range};
 use std::rc::Rc;
 
 use super::super::run::Run;
@@ -8,6 +8,7 @@ use super::{ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
 use crate::repr::scatter::{with_picks, ColumnarSource, Pick, UnifiedSet};
 use crate::schema::with_payload_cmp;
+use gnitz_expr::RowFilter;
 use gnitz_wire::RowSource;
 
 impl ReadCursor {
@@ -25,18 +26,25 @@ impl ReadCursor {
     /// Up to `max_rows` rows in merge order, consolidated, each a whole (PK, payload)
     /// group; `None` once the cursor is exhausted.
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
-        SkeletonKeys::raw(|s| self.drain_live_chunk(max_rows, s))
+        SkeletonKeys::raw(|s| self.drain_live_chunk(max_rows, s, &mut RowFilter::default()))
     }
 
     /// [`Self::drain_chunk`], with each skeleton row's key pushed to `skeletons` instead of
-    /// copied; a chunk of skeleton rows alone is `Some` and empty.
-    pub(super) fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
+    /// copied; a chunk of skeleton rows alone is `Some` and empty. The rows of
+    /// in-memory runs `filter` drops are left out of the chunk; a shard's rows are
+    /// copied whatever it says, so the caller filters the chunk again.
+    pub(super) fn drain_live_chunk(
+        &mut self,
+        max_rows: usize,
+        skeletons: &mut SkeletonKeys,
+        filter: &mut RowFilter,
+    ) -> Option<Batch> {
         assert!(max_rows > 0, "drain_live_chunk: max_rows must be positive");
         if !self.valid {
             return None;
         }
         if let Some(i) = self.mode {
-            return Some(self.drain_single(i, max_rows, skeletons));
+            return Some(self.drain_single(i, max_rows, skeletons, filter));
         }
         // Per source, the rows this drain can emit: its current row on to where the drive stops.
         let mut windows = std::mem::take(&mut self.drain_windows);
@@ -58,6 +66,9 @@ impl ReadCursor {
                     }
                     !skeleton
                 });
+            }
+            if !filter.keeps_all() {
+                retain_kept(&self.sources, &windows, picks, filter);
             }
             UnifiedSet::with(&self.sources, &self.schema, windows.iter().cloned(), |set| {
                 set.materialize(picks, None)
@@ -81,8 +92,15 @@ impl ReadCursor {
             .unwrap_or_else(|| Rc::new(Batch::empty_with_schema(&self.schema)))
     }
 
-    /// Up to `max_rows` rows of `i`, the one live source, as one slice copy.
-    fn drain_single(&mut self, i: usize, max_rows: usize, skeletons: &mut SkeletonKeys) -> Batch {
+    /// Up to `max_rows` rows of `i`, the one live source, as one slice copy; of an
+    /// in-memory run, only the rows `filter` keeps.
+    fn drain_single(
+        &mut self,
+        i: usize,
+        max_rows: usize,
+        skeletons: &mut SkeletonKeys,
+        filter: &mut RowFilter,
+    ) -> Batch {
         // `states[i].start` is already past the committed row, so the slice
         // starts at `current.row`.
         let start = self.current.row as usize;
@@ -100,7 +118,8 @@ impl ReadCursor {
                 shard.slice_to_owned_batch(start, row_count)
             }
             Run::Mem(b) => {
-                let mut slice = Batch::from_ranges(b, &[(start, start + row_count)], 0);
+                let ranges = filter.ranges_in(&b.as_mem_batch(), start..start + row_count);
+                let mut slice = Batch::from_ranges(b, ranges, 0);
                 slice.set_schema(&self.schema);
                 slice
             }
@@ -128,4 +147,31 @@ impl ReadCursor {
         }));
         self.commit_emitted(first_undrained);
     }
+}
+
+/// Drop from `picks` every row of an in-memory run that `filter` drops. A pick
+/// stands for its whole (PK, payload) group, which the predicate reads alone, so
+/// one row decides the group. A shard's picks stay: its regions may be encoded,
+/// and are read only through the scatter.
+fn retain_kept(sources: &[Run], windows: &[Range<usize>], picks: &mut Vec<Pick>, filter: &mut RowFilter) {
+    // Per source, its first word in `bits`, or `None` for a source kept whole.
+    let mut first_word = Vec::with_capacity(sources.len());
+    let mut bits = Vec::new();
+    for (src, w) in sources.iter().zip(windows) {
+        first_word.push(match src {
+            Run::Mem(b) if !w.is_empty() => {
+                let at = bits.len();
+                bits.extend_from_slice(filter.mark(&b.as_mem_batch(), w.clone()));
+                Some(at)
+            }
+            _ => None,
+        });
+    }
+    picks.retain(|&(s, r, _)| match first_word[s as usize] {
+        Some(at) => {
+            let i = r as usize - windows[s as usize].start;
+            bits[at + i / 64] >> (i % 64) & 1 == 1
+        }
+        None => true,
+    });
 }

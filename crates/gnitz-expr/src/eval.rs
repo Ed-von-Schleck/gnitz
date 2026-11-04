@@ -4,6 +4,8 @@
 //!
 //! Row ranges are half-open everywhere in this file: `end` is EXCLUSIVE.
 
+use std::ops::Range;
+
 use gnitz_wire::KeyRange;
 
 use crate::morsel::{Evaluator, MorselOut};
@@ -103,34 +105,56 @@ impl RowFilter {
         Ok(f)
     }
 
+    /// Whether every row survives: no predicate and no walk.
+    pub fn keeps_all(&self) -> bool {
+        self.pred.is_none() && self.walk.is_none()
+    }
+
     /// The surviving rows of `mb` as maximal runs, held by the filter until its
     /// next call; a caller may rewrite them in place.
     pub fn ranges(&mut self, mb: &dyn BatchView) -> &mut [(usize, usize)] {
-        let n = mb.row_count();
-        let RowFilter { pred, walk, words, runs } = self;
-        if runs.capacity() > RETAIN_RUNS {
-            *runs = Vec::new();
+        self.ranges_in(mb, 0..mb.row_count())
+    }
+
+    /// [`Self::ranges`] over the rows `rows` of `mb` alone, each run in `mb`'s
+    /// row numbers.
+    pub fn ranges_in(&mut self, mb: &dyn BatchView, rows: Range<usize>) -> &mut [(usize, usize)] {
+        if self.runs.capacity() > RETAIN_RUNS {
+            self.runs = Vec::new();
         }
-        runs.clear();
-        if pred.is_none() && walk.is_none() {
+        self.runs.clear();
+        let (start, n) = (rows.start, rows.len());
+        if self.keeps_all() {
             if n > 0 {
-                runs.push((0, n));
+                self.runs.push((start, rows.end));
             }
-            return runs;
+            return &mut self.runs;
         }
+        self.mark(mb, rows);
+        gnitz_wire::set_bit_runs(&self.words, n, &mut self.runs);
+        for run in &mut self.runs {
+            *run = (run.0 + start, run.1 + start);
+        }
+        &mut self.runs
+    }
+
+    /// One bit per row of `rows` of `mb`, bit `i` set when row `rows.start + i`
+    /// survives; the bits of the last word at or past `rows.len()` are unspecified.
+    pub fn mark(&mut self, mb: &dyn BatchView, rows: Range<usize>) -> &[u64] {
+        let RowFilter { pred, walk, words, .. } = self;
+        let n = rows.len();
         words.resize(n.div_ceil(64), 0);
         match pred {
-            Some(FilterEval { ev, result_reg }) => ev.eval_morsels(mb, 0, n, |rel_start, mo| {
+            Some(FilterEval { ev, result_reg }) => ev.eval_morsels(mb, rows.start, n, |rel_start, mo| {
                 let first = rel_start / 64;
                 mo.filter_words(*result_reg, &mut words[first..first + mo.rows().div_ceil(64)]);
             }),
             None => words.fill(u64::MAX),
         }
         if let Some(w) = walk {
-            w.and_into(mb, words);
+            w.and_into(mb, rows, words);
         }
-        gnitz_wire::set_bit_runs(words, n, runs);
-        runs
+        words
     }
 }
 

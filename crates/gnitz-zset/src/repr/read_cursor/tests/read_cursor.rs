@@ -430,7 +430,7 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
 
         let mut skeletons = SkeletonKeys::default();
         let live = create_read_cursor(&[mem], &[sk], schema)
-            .drain_live_chunk(usize::MAX, &mut skeletons)
+            .drain_live_chunk(usize::MAX, &mut skeletons, &mut gnitz_expr::RowFilter::default())
             .unwrap();
         assert_eq!(skeletons.keys, 1u64.to_be_bytes(), "{name}");
         assert_eq!(

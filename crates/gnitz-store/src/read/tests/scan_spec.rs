@@ -111,6 +111,59 @@ fn a_cut_keeps_the_first_rows_covering_its_window() {
     }
 }
 
+/// A filtered read over a store of several runs, in memory and spilled to shards,
+/// answers the predicate's survivors of the runs' consolidated sum: a row the
+/// predicate keeps at its net weight, one whose weights cancel across runs not at all.
+#[test]
+fn a_filtered_read_over_many_runs_keeps_the_survivors_net_weights() {
+    let schema = make_schema_u64_i64();
+    let mut rng = Rng::new(0xC0FFEE);
+    for round in 0..60 {
+        let rounds: Vec<Vec<(u64, i64, i64)>> = (0..1 + rng.gen_range(6))
+            .map(|_| {
+                let mut rows: Vec<_> = (0..rng.gen_range(80))
+                    .map(|_| {
+                        let w = [1, 1, 2, -1][rng.gen_range(4) as usize];
+                        (rng.gen_range(40), w, rng.gen_range(6) as i64)
+                    })
+                    .collect();
+                rows.sort_unstable_by_key(|&(id, _, val)| (id, val));
+                rows
+            })
+            .collect();
+        let mut net = std::collections::BTreeMap::new();
+        for &(id, w, val) in rounds.iter().flatten() {
+            *net.entry((id, val)).or_insert(0i64) += w;
+        }
+        let (lo, hi) = (rng.gen_range(4) as i64, 2 + rng.gen_range(5) as i64);
+        let mut want: Vec<_> = (net.into_iter())
+            .filter(|&((_, val), w)| w != 0 && (lo..hi).contains(&val))
+            .map(|((id, val), w)| (id, w, val))
+            .collect();
+        want.sort_unstable();
+        for config in [crate::relation::StoreConfig::default(), crate::test_support::spilling()] {
+            let batches = rounds
+                .iter()
+                .map(|rows| make_batch_raw(&schema, rows).into_consolidated());
+            let kind = RelationKind::View(ViewBudget::Plain);
+            let mut r = crate::test_support::relation_fixture_with(
+                config,
+                gnitz_zset::algebra::Slot::SOLO,
+                kind,
+                schema,
+                &[],
+                batches,
+            );
+            r.set_scan_chunk_rows(1 + rng.gen_range(24) as usize);
+            let spec = ReadSpec {
+                predicate: between(1, lo, hi),
+                ..rows_spec(None, None)
+            };
+            assert_eq!(batch_rows(&run(&r, spec).unwrap()), want, "round {round} {lo}..{hi}");
+        }
+    }
+}
+
 /// The fold sink folds exactly the predicate's survivors of every chunk, mapped or
 /// not: one partial per group, its count the survivors' summed weight.
 #[test]
@@ -540,6 +593,14 @@ fn every_read_over_a_skeleton_store_answers_the_ingested_rows() {
         let got = r.scan_spec(TID, ReadSpec::all_rows(bound.clone()), layout, Some(&mut |k| h.call(k)));
         assert_eq!(batch_rows(&got.unwrap()), ingested(ids), "{bound:?}");
     }
+
+    let filtered = ReadSpec {
+        predicate: between(1, 0, 5),
+        ..rows_spec(None, None)
+    };
+    let got = r.scan_spec(TID, filtered, layout, Some(&mut |k| h.call(k))).unwrap();
+    let want: Vec<_> = ingested(0..5).into_iter().filter(|&(_, _, val)| val < 5).collect();
+    assert_eq!(batch_rows(&got), want, "a predicate over hydrated and live rows");
 
     h.calls.clear();
     let range = ReadSpec::all_rows(pk_range(0, 104));

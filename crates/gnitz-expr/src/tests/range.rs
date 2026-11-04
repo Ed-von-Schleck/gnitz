@@ -1,6 +1,6 @@
 //! Range membership over key images, driven through [`TestView`].
 
-use crate::test_support::{filter_verdicts, schema_pk, TestView, PATTERNS};
+use crate::test_support::{assert_windows_match_whole, filter_verdicts, schema_pk, TestView, PATTERNS};
 use crate::SchemaColumn;
 use crate::SchemaDescriptor;
 use crate::{ExprValidateErr, RowFilter};
@@ -58,6 +58,7 @@ fn every_walk_admits_exactly_the_rows_within_its_bounds() {
                         want,
                         "{tc} {cols:?}: {first:#x} ..= {last:#x}"
                     );
+                    assert_windows_match_whole(&mut f, &v);
                 }
             }
         }

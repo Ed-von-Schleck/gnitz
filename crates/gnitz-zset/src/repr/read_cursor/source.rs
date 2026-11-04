@@ -2,6 +2,7 @@
 //! and [`BoundedIndexCursor`], the walk of a secondary-index range that gathers
 //! each entry's row.
 
+use gnitz_expr::RowFilter;
 use gnitz_wire::PkKeys;
 
 use super::{PkSetGather, ReadCursor, SkeletonKeys};
@@ -23,20 +24,23 @@ impl SourceCursor {
     /// The next non-empty source chunk, or `None` once the source is exhausted.
     /// `PkSet` exceeds `max_rows` rather than split a PK group.
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
-        SkeletonKeys::raw(|s| self.drain_live_chunk(max_rows, s))
+        SkeletonKeys::raw(|s| self.drain_live_chunk(max_rows, s, &mut RowFilter::default()))
     }
 
     /// [`Self::drain_chunk`] over a store that may hold skeleton rows: each one the
     /// chunk meets is replaced by its key's rows, which `hydrate` recomputes from
     /// the keys, ascending. A skeleton row counts once against `max_rows` however
-    /// many rows it hydrates to.
+    /// many rows it hydrates to. A whole cursor leaves out the rows of its
+    /// in-memory runs that `filter` drops; every other row stays, hydrated ones
+    /// included, for the caller to filter.
     pub fn drain_hydrated(
         &mut self,
         max_rows: usize,
+        filter: &mut RowFilter,
         hydrate: impl FnOnce(PkKeys) -> Result<Batch, String>,
     ) -> Result<Option<Batch>, String> {
         let mut skeletons = SkeletonKeys::default();
-        let Some(live) = self.drain_live_chunk(max_rows, &mut skeletons) else {
+        let Some(live) = self.drain_live_chunk(max_rows, &mut skeletons, filter) else {
             return Ok(None);
         };
         if skeletons.keys.is_empty() {
@@ -58,9 +62,14 @@ impl SourceCursor {
 
     /// [`Self::drain_chunk`] with skeleton rows split out; `Some` and empty means every
     /// row of the chunk was a skeleton.
-    fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
+    fn drain_live_chunk(
+        &mut self,
+        max_rows: usize,
+        skeletons: &mut SkeletonKeys,
+        filter: &mut RowFilter,
+    ) -> Option<Batch> {
         match self {
-            SourceCursor::Full(c) => c.drain_live_chunk(max_rows, skeletons),
+            SourceCursor::Full(c) => c.drain_live_chunk(max_rows, skeletons, filter),
             SourceCursor::Bounded(c) => c.drain_live_chunk(max_rows, skeletons),
             SourceCursor::PkSet(g) => g.drain_live_chunk(max_rows, skeletons),
         }

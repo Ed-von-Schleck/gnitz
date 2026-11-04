@@ -53,8 +53,12 @@ impl RelationRegistry {
                 "relation {target_id} holds skeleton rows but this process maintains no circuit"
             )),
         };
+        // The drain leaves out the rows `filter` drops that it can, but for a
+        // sink that folds them in place, which the copy would only slow.
+        let mut keep_all = RowFilter::default();
         for drain_rows in drain_ramp(sink.first_drain(), chunk_rows) {
-            let Some(chunk) = source.drain_hydrated(drain_rows, &mut hydrate_chunk)? else {
+            let drain_filter = if sink.folds() { &mut keep_all } else { &mut filter };
+            let Some(chunk) = source.drain_hydrated(drain_rows, drain_filter, &mut hydrate_chunk)? else {
                 break;
             };
             if sink.push(Cow::Owned(chunk), &mut filter)? {

@@ -635,6 +635,7 @@ fn ranges_on_a_reused_filter_match_a_fresh_filters() {
             assert_eq!(*got, want, "n = {n}");
             // A caller may cut the runs in place; the next call must not see it.
             got.iter_mut().for_each(|(s, e)| *e = *s);
+            crate::test_support::assert_windows_match_whole(&mut reused, &mb);
         }
     }
 }

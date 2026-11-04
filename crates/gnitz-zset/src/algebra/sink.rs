@@ -96,6 +96,13 @@ impl SinkPlan {
         }
     }
 
+    /// Whether this sink folds its survivors where they stand rather than
+    /// copying them: a source that filters its rows out ahead of it saves it no
+    /// copy.
+    pub fn folds(&self) -> bool {
+        matches!(self.kind, Kind::Fold { .. })
+    }
+
     /// How many source rows the first drain needs to visit: an unordered cut
     /// no more than its window, any other sink no fewer than every row.
     pub fn first_drain(&self) -> usize {

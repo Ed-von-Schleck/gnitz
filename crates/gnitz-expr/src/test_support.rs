@@ -655,3 +655,24 @@ pub(crate) fn in_set(set: impl IntoIterator<Item = i64>) -> (Vec<LogicalInstr>, 
     ];
     (instrs, vec![gnitz_wire::as_le_bytes(&set).to_vec()])
 }
+
+/// `ranges_in` over a window of `v` names the runs `ranges` names over the whole
+/// of `v`, cut to the window, whatever the window's alignment to a word.
+pub(crate) fn assert_windows_match_whole(f: &mut crate::RowFilter, v: &dyn BatchView) {
+    let n = v.row_count();
+    let whole = f.ranges(v).to_vec();
+    for (s, e) in [
+        (0, n),
+        (n.min(1), n),
+        (n.min(37), n.min(101)),
+        (n.min(64), n),
+        (n / 2, n / 2),
+    ] {
+        let want: Vec<(usize, usize)> = whole
+            .iter()
+            .map(|&(a, b)| (a.max(s), b.min(e)))
+            .filter(|&(a, b)| a < b)
+            .collect();
+        assert_eq!(f.ranges_in(v, s..e), want, "window {s}..{e}");
+    }
+}
