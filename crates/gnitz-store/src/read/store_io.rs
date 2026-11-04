@@ -6,8 +6,9 @@
 
 use super::check_stride;
 use crate::relation::{Cut, Relation, RelationKind, RelationRegistry};
+use crate::storage::Table;
 use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound};
-use gnitz_zset::repr::{empty_cursor, Batch, BoundedIndexCursor, SourceCursor};
+use gnitz_zset::repr::{empty_cursor, Batch, BoundedIndexCursor, KeyGather, SourceCursor, StoredRow, UniqueRows};
 use gnitz_zset::schema::{project_schema, SchemaDescriptor};
 use std::num::NonZeroU64;
 
@@ -82,8 +83,25 @@ impl Relation {
     }
 
     /// Open `bound`'s source over this relation, without walking it, and the part
-    /// of `bound` the source does not apply.
-    pub fn open_bound(&self, bound: ReadBound, cut: Cut) -> Result<(SourceCursor, Option<KeyRange>), String> {
+    /// of `bound` the source does not apply. The source borrows nothing.
+    pub fn open_bound(&self, bound: ReadBound, cut: Cut) -> Result<(SourceCursor<'static>, Option<KeyRange>), String> {
+        self.open_source(bound, cut, None)
+    }
+
+    /// [`Self::open_bound`] at `Cut::Now`, where a base table answers each
+    /// whole key it is asked for by its unique-PK probe instead of a cursor
+    /// seek.
+    pub fn open_read(&self, bound: ReadBound) -> Result<(SourceCursor<'_>, Option<KeyRange>), String> {
+        let unique = (self.kind() == RelationKind::BaseTable).then(|| self.table() as &dyn UniqueRows);
+        self.open_source(bound, Cut::Now, unique)
+    }
+
+    fn open_source<'a>(
+        &self,
+        bound: ReadBound,
+        cut: Cut,
+        unique: Option<&'a dyn UniqueRows>,
+    ) -> Result<(SourceCursor<'a>, Option<KeyRange>), String> {
         // A stream holds no rows, but a backfill over one still feeds an empty
         // epoch: that keeps every worker's exchange rounds in step.
         if self.kind() == RelationKind::Stream {
@@ -95,16 +113,25 @@ impl Relation {
             ReadBound::PkSet(keys) => {
                 check_stride("open_bound", self.id(), &keys, self.schema().pk_stride())?;
                 // A key this worker holds no row for copies nothing.
-                SourceCursor::PkSet(self.gather(keys, cut))
+                match unique.filter(|_| keys.stride() == self.schema().pk_stride()) {
+                    Some(store) => SourceCursor::PkSet(KeyGather::unique(store, self.schema(), keys)),
+                    None => SourceCursor::PkSet(KeyGather::Merge(self.gather(keys, cut))),
+                }
             }
-            ReadBound::Range(r) => return open_range(self, r, cut),
+            ReadBound::Range(r) => return open_range(self, r, cut, unique),
         };
         Ok((cursor, None))
     }
 }
 
 /// The walk `r` names over `entry`, and the part of it the cursor leaves unapplied.
-fn open_range(entry: &Relation, r: KeyRange, cut: Cut) -> Result<(SourceCursor, Option<KeyRange>), String> {
+/// `unique`, when given, is `entry`'s store, probed for an index entry's row.
+fn open_range<'a>(
+    entry: &Relation,
+    r: KeyRange,
+    cut: Cut,
+    unique: Option<&'a dyn UniqueRows>,
+) -> Result<(SourceCursor<'a>, Option<KeyRange>), String> {
     let schema = entry.schema();
     let table = entry.table();
     if r.walks_pk(schema.pk_cols()) {
@@ -118,12 +145,26 @@ fn open_range(entry: &Relation, r: KeyRange, cut: Cut) -> Result<(SourceCursor, 
         .filter(|_| cut == Cut::Now || !table.has_pending());
     if let Some(ic) = index {
         let idx = ic.cursor_over(&r);
+        // No entry in the range: no store cursor to open.
+        if !idx.is_valid() {
+            return Ok((SourceCursor::Full(empty_cursor(schema)), None));
+        }
         if idx.estimated_length() <= table.estimated_rows() / INDEX_SCAN_RATIO {
-            let walk = BoundedIndexCursor::new(idx, table.open_cursor(cut));
+            let walk = match unique {
+                Some(store) => BoundedIndexCursor::new_unique(idx, store, schema),
+                None => BoundedIndexCursor::new(idx, table.open_cursor(cut)),
+            };
             return Ok((SourceCursor::Bounded(Box::new(walk)), None));
         }
     }
     Ok((SourceCursor::Full(table.open_cursor(cut)), Some(r)))
+}
+
+/// The probe reads the rows `Cut::Now` reads.
+impl UniqueRows for Table {
+    fn unique_live_row_at(&self, key: &[u8]) -> Option<StoredRow> {
+        Table::unique_live_row_at(self, key)
+    }
 }
 
 #[cfg(test)]

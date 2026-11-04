@@ -6,7 +6,7 @@ use gnitz_wire::{PkKeys, ReadSpec};
 use std::borrow::Cow;
 
 use super::{check_layout, ReadRows};
-use crate::relation::{Cut, RelationRegistry};
+use crate::relation::RelationRegistry;
 use gnitz_expr::RowFilter;
 use gnitz_zset::algebra::SinkPlan;
 use gnitz_zset::repr::Batch;
@@ -43,7 +43,7 @@ impl RelationRegistry {
         if whole && !table.has_skeleton_rows() {
             return Ok(ReadRows::Shared(entry.full_scan()));
         }
-        let (mut source, walk) = entry.open_bound(bound, Cut::Now)?;
+        let (mut source, walk) = entry.open_read(bound)?;
         let mut filter =
             RowFilter::for_read(&predicate, walk.as_ref(), &src_schema).map_err(|e| format!("scan_spec: {e}"))?;
         let chunk_rows = self.config.scan_chunk_rows;

@@ -54,7 +54,8 @@ fn rows(ids: impl IntoIterator<Item = u64>) -> Vec<(u64, i64, i64)> {
 /// A range walks the index only while its entries are at most 1/16 of the base's rows
 /// — 12 of 200 do, 13 do not — and yields exactly its rows at every chunk size; past
 /// the gate, and with no index at all, the source is a full scan and the range comes
-/// back unapplied, for the caller's filter.
+/// back unapplied, for the caller's filter. A range holding no entry opens no walk.
+/// A read at now, which probes the base table for each entry's row, yields the same.
 #[test]
 fn a_range_walks_the_index_only_within_the_selectivity_gate() {
     // With `val` anti-correlated to the PK, a range at val's minimum makes the first
@@ -82,10 +83,16 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
         }
         let want: Vec<_> = ids.into_iter().map(|id| (id, 1, val_of(id))).collect();
         for chunk in [1, 3, 7, 64, usize::MAX] {
-            let (mut cur, unapplied) = r.relation(TID).unwrap().open_bound(bound.clone(), At::Now).unwrap();
-            assert_eq!(matches!(cur, SourceCursor::Bounded(_)), walks, "{bound:?}");
-            assert_eq!(unapplied.map(ReadBound::Range), (!walks).then(|| bound.clone()));
-            assert_eq!(drain_all(&mut cur, chunk), want, "{bound:?} chunk {chunk}");
+            let relation = r.relation(TID).unwrap();
+            for (mut cur, unapplied) in [
+                relation.open_bound(bound.clone(), At::Now).unwrap(),
+                relation.open_read(bound.clone()).unwrap(),
+            ] {
+                let bounded = walks && !want.is_empty();
+                assert_eq!(matches!(cur, SourceCursor::Bounded(_)), bounded, "{bound:?}");
+                assert_eq!(unapplied.map(ReadBound::Range), (!walks).then(|| bound.clone()));
+                assert_eq!(drain_all(&mut cur, chunk), want, "{bound:?} chunk {chunk}");
+            }
         }
     }
 }
