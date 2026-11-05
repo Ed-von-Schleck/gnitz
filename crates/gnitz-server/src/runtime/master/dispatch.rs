@@ -47,12 +47,22 @@ impl MasterDispatcher {
     /// invalid until the next ephemeral round restamps it. Otherwise the round
     /// moves no base store, the generation stands, and the ephemeral round
     /// republishes only the stores whose manifests changed.
+    ///
+    /// Once its ACKs are in, the round removes every directory no live entity
+    /// owns.
     pub(crate) async fn checkpoint_base(&self) -> Result<(), WireFault> {
         let mut excl = self.sal.lock().await;
         if self.sal.holds_pushes() {
             self.cat_mut().advance_durable_generation()?;
         }
-        self.flush_round(&mut excl, Apply::Flush).await
+        self.flush_round(&mut excl, Apply::Flush).await?;
+        // Every worker ACKed the Flush, so each has applied every DdlSync written
+        // before it, and the post-ACK system flush made every applied DROP
+        // durable. The checkpoint's one orphan sweep: a DDL pauses the committer,
+        // so none lands before the ephemeral round, and at boot
+        // `reconcile_child_dirs` has already swept.
+        self.cat().reclaim_orphan_dirs();
+        Ok(())
     }
 
     /// A checkpoint's second half: the round that flushes every resumable
@@ -286,11 +296,7 @@ impl MasterDispatcher {
     /// durable copy, so resetting on a swallowed failure destroys it. The caller
     /// leaves the SAL intact and aborts or fails the boot.
     fn checkpoint_post_ack(&self, excl: &mut SalExcl<'_>) -> Result<(), WireFault> {
-        let mut cat = self.cat_mut();
-        cat.flush_all_system_tables()?;
-        // Every worker ACKed the FLUSH, so each has applied every DdlSync written
-        // before it; the flush above made every applied DROP durable.
-        cat.reclaim_orphan_dirs();
+        self.cat_mut().flush_all_system_tables()?;
         let epoch = excl.checkpoint_reset();
         gnitz_note!("SAL checkpoint epoch={epoch}");
         Ok(())
