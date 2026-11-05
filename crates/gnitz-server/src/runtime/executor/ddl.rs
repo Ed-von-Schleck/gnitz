@@ -182,7 +182,7 @@ async fn commit_bundle(
             .dispatcher
             .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(families, sink))?
     };
-    shared.dispatcher.sal().sync(shared.dispatcher.reactor()).await;
+    shared.dispatcher.sal().durable_through(zone_lsn).await;
     Ok(Committed { applied, zone_lsn, filter_seeds })
 }
 

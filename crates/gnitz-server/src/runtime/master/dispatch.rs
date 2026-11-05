@@ -103,7 +103,8 @@ impl MasterDispatcher {
     }
 
     /// Run catalog write `write` with its groups laid out as one SAL zone, and mark
-    /// the zone applied: the write's value and the zone LSN. A write the catalog or
+    /// the zone applied: the write's value and the zone LSN, `0` when the write
+    /// published nothing and so opened no zone. A write the catalog or
     /// the log refuses leaves the catalog as it was and its scope unpublished. A
     /// diverged catalog is one no log describes, so the process ends on it.
     /// Submits no fdatasync. The divergence abort names the caller's location.
@@ -129,9 +130,10 @@ impl MasterDispatcher {
         };
         // Only a closed zone raises the replay floor: an LSN no member carries can
         // be the next scope's, whose zone boot replay would then skip.
-        if scope.commit() {
-            self.cat_mut().mark_zone_applied(zone_lsn);
+        if !scope.commit() {
+            return Ok((value, 0));
         }
+        self.cat_mut().mark_zone_applied(zone_lsn);
         Ok((value, zone_lsn))
     }
 

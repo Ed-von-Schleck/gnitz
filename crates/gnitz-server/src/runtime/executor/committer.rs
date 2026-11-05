@@ -1,10 +1,9 @@
 //! The group-commit task: every user write's SAL groups, batched from whatever
-//! is queued behind the first request (see [`drain_ready_batch`]), and the
-//! fdatasync task beside it, which keeps one fdatasync in flight over every
-//! batch laid out meanwhile (see [`sync_loop`]). A write's table locks are
-//! dropped once it is laid out, and its writer is answered at the fdatasync
-//! that covers it. Checkpoints, backups and DDL pauses end a batch.
-//! Once serving, it is the one task that runs a checkpoint.
+//! is queued behind the first request (see [`drain_ready_batch`]). A write's
+//! table locks are dropped once it is laid out, when its writer is answered;
+//! the writer then waits for the SAL's fdatasync to cover it. Checkpoints,
+//! backups and DDL pauses end a batch. Once serving, it is the one task that
+//! runs a checkpoint.
 
 use super::validate::{FamilyRows, TxnFamily};
 use super::write::HeldTables;
@@ -15,7 +14,6 @@ use gnitz_wire::{WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashMap;
 use smallvec::{smallvec, SmallVec};
-use std::cell::Cell;
 use std::rc::Rc;
 
 /// Row ceiling on one committer batch. Tested before the receive, so a batch is
@@ -71,20 +69,11 @@ struct PendingWrite {
     waiter: Waiter,
 }
 
-/// Where a write's commit LSN goes, or the error that rolled the whole write
-/// back.
-type Reply = oneshot::Sender<Result<u64, WireFault>>;
-
 /// The client of one write: the rows it wrote, and the table locks it holds
-/// until the write is laid out in the SAL. Its reply is sent at the fdatasync
-/// that covers the write, once every write laid out ahead of it is answered.
-///
-/// Workers apply a group once it is published, so between the layout and the
-/// reply a read, or a later write's validation, can see the write before a
-/// restart would recover it. Nothing laid out is taken back: a failed
-/// fdatasync aborts the process.
+/// until the write is laid out in the SAL, when `done` resolves to the write's
+/// commit LSN or to the error that rolled the whole write back.
 struct Waiter {
-    done: Reply,
+    done: oneshot::Sender<Result<u64, WireFault>>,
     rows: usize,
     held: HeldTables,
 }
@@ -111,8 +100,8 @@ impl Committer {
         (Committer { tx }, CommitRequests(rx))
     }
 
-    /// Commit `families` as one write, dropping `held` once it is laid out;
-    /// resolves to the write's commit LSN at the fdatasync that covers it.
+    /// Lay out `families` as one write, dropping `held` once it is; resolves
+    /// then to the write's commit LSN, which is not yet durable.
     pub(super) async fn write(&self, families: Vec<TxnFamily>, held: HeldTables) -> Result<u64, WireFault> {
         let rows = families.iter().map(|f| f.rows.view().len()).sum();
         self.admit(|done| {
@@ -129,8 +118,7 @@ impl Committer {
     }
 
     /// Resolves once the batch queued ahead is laid out and the committer has
-    /// parked. A checkpoint the SAL needs runs ahead of the park. The batch's
-    /// writers are answered at their fdatasync meanwhile.
+    /// parked. A checkpoint the SAL needs runs ahead of the park.
     pub(super) async fn pause(&self) -> Paused {
         let (resume, on_resume) = oneshot::channel();
         // Built before the await, so a dropped caller still resumes the committer.
@@ -188,105 +176,20 @@ struct CommitScratch {
     tails: Vec<Vec<FamilyRows>>,
 }
 
-/// One batch's replies, held for the fdatasync that covers it, or a barrier
-/// answered once every job sent ahead of it has been.
-enum SyncJob {
-    Batch {
-        /// Whether the batch opened a zone, which only an fdatasync makes
-        /// durable.
-        zoned: bool,
-        /// The batch's writers in batch order, each with its commit LSN: a
-        /// batch with no zone is answered behind the ones ahead of it.
-        replies: Vec<(Reply, u64)>,
-        /// The tables the batch wrote, woken for their feeds once it is durable.
-        woken: SmallVec<[u64; 4]>,
-    },
-    Barrier(oneshot::Sender<()>),
-}
-
-/// The way to [`sync_loop`]: jobs are answered in the order sent.
-struct Syncer {
-    tx: chan::Sender<SyncJob>,
-    /// Set while [`sync_loop`]'s fdatasync is in flight. Every job it took is
-    /// answered as soon as that resolves, so with this clear and no job queued,
-    /// every job sent is answered.
-    in_flight: Rc<Cell<bool>>,
-}
-
-impl Syncer {
-    fn send(&self, zoned: bool, replies: Vec<(Reply, u64)>, woken: SmallVec<[u64; 4]>) {
-        self.tx.send(SyncJob::Batch { zoned, replies, woken });
-    }
-
-    /// Whether the fdatasync in flight covers every batch sent.
-    fn covered(&self) -> bool {
-        self.in_flight.get() && self.tx.is_empty()
-    }
-
-    /// Resolves once every job sent ahead is answered.
-    async fn idle(&self) {
-        if !self.in_flight.get() && self.tx.is_empty() {
-            return;
-        }
-        let (done, rx) = oneshot::channel();
-        self.tx.send(SyncJob::Barrier(done));
-        rx.await
-    }
-}
-
-/// The fdatasync task. An fdatasync covers every batch laid out before it is
-/// submitted, so one in flight at a time serves them all: the batches laid out
-/// while one is in flight share the next. Never returns.
-async fn sync_loop(mut rx: chan::Receiver<SyncJob>, shared: Rc<Shared>, in_flight: Rc<Cell<bool>>) {
-    let mut jobs = Vec::new();
-    loop {
-        jobs.push(rx.recv().await);
-        while let Some(job) = rx.try_recv() {
-            jobs.push(job);
-        }
-        if jobs.iter().any(|j| matches!(j, SyncJob::Batch { zoned: true, .. })) {
-            // Submitted after every job's layout, so it covers all of them.
-            in_flight.set(true);
-            shared.dispatcher.sal().sync(shared.dispatcher.reactor()).await;
-            in_flight.set(false);
-        }
-        for job in jobs.drain(..) {
-            match job {
-                SyncJob::Batch { replies, woken, .. } => {
-                    for tid in woken {
-                        // After the raise, which is what a woken poll reads as staleness.
-                        shared.feeds.wake(tid);
-                    }
-                    for (done, lsn) in replies {
-                        done.send(Ok(lsn));
-                    }
-                }
-                SyncJob::Barrier(done) => done.send(()),
-            }
-        }
-    }
-}
-
 /// The committer task loop. Never returns.
 pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Shared>) {
     let mut s = CommitScratch::default();
-    let (tx, sync_rx) = chan::unbounded();
-    let in_flight = Rc::new(Cell::new(false));
-    shared
-        .dispatcher
-        .reactor()
-        .spawn(sync_loop(sync_rx, Rc::clone(&shared), Rc::clone(&in_flight)));
-    let syncer = Syncer { tx, in_flight };
     loop {
         let first = rx.recv().await;
 
         let mut end = drain_ready_batch(&mut rx, first, &mut s.writes);
-        // While the fdatasync in flight covers every batch sent, this one is
-        // answered at the next either way. Laid out now, it releases its table
-        // locks; unless a write is parked on one, it waits that fdatasync out
-        // and takes in what queued meanwhile.
-        if end.is_none() && syncer.covered() && !s.writes.iter().any(|w| w.waiter.held.contended()) {
-            syncer.idle().await;
+        // While the fdatasync in flight covers everything published, this
+        // batch is durable at the next either way. Laid out now, it releases
+        // its table locks; unless a write is parked on one, it waits that
+        // fdatasync out and takes in what queued meanwhile.
+        let sal = shared.dispatcher.sal();
+        if end.is_none() && sal.syncing_all() && !s.writes.iter().any(|w| w.waiter.held.contended()) {
+            sal.durable_through(sal.watermark()).await;
             if let Some(next) = rx.try_recv() {
                 end = drain_ready_batch(&mut rx, next, &mut s.writes);
             }
@@ -294,7 +197,7 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
 
         // Before this batch's groups: the checkpoint makes room for them.
         if shared.dispatcher.sal().needs_checkpoint() {
-            run_checkpoint_sequence(&shared, &syncer).await;
+            run_checkpoint_sequence(&shared).await;
         }
 
         // A write the SAL refused for want of room goes again behind a
@@ -302,9 +205,9 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
         // on an empty log.
         let mut merge = true;
         while !s.writes.is_empty() {
-            commit_writes(&shared, &mut s, merge, &syncer).await;
+            commit_writes(&shared, &mut s, merge).await;
             if !s.writes.is_empty() {
-                run_checkpoint_sequence(&shared, &syncer).await;
+                run_checkpoint_sequence(&shared).await;
                 merge = false;
             }
         }
@@ -312,11 +215,11 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
         match end {
             None => {}
             Some(BatchEnd::Checkpoint(done)) => {
-                run_checkpoint_sequence(&shared, &syncer).await;
+                run_checkpoint_sequence(&shared).await;
                 done.send(());
             }
             Some(BatchEnd::Backup { dir, done }) => {
-                run_checkpoint_sequence(&shared, &syncer).await;
+                run_checkpoint_sequence(&shared).await;
                 done.send(shared.dispatcher.backup_round(&dir).await);
             }
             Some(BatchEnd::Pause { parked, resume }) => {
@@ -359,11 +262,10 @@ fn drain_ready_batch(
     None
 }
 
-/// The checkpoint sequence, over nothing still awaiting its fdatasync: base
-/// round, drain, ephemeral round. A failed round aborts: the workers are
-/// re-epoched against an un-reset SAL, which only a restart's replay repairs.
-async fn run_checkpoint_sequence(shared: &Shared, syncer: &Syncer) {
-    syncer.idle().await;
+/// The checkpoint sequence: base round, drain, ephemeral round. A failed round
+/// aborts: the workers are re-epoched against an un-reset SAL, which only a
+/// restart's replay repairs.
+async fn run_checkpoint_sequence(shared: &Shared) {
     shared
         .dispatcher
         .checkpoint_base()
@@ -458,17 +360,16 @@ impl CommitUnit {
             .collect()
     }
 
-    /// Drop every client's table locks, then answer a failed unit's clients
-    /// with its error, and push a laid unit's onto `replies` with its
-    /// [`CommitUnit::lsn`], for the fdatasync that covers it.
-    fn resolve(self, zone_lsn: u64, replies: &mut Vec<(Reply, u64)>) {
-        let lsn = self.lsn(zone_lsn);
+    /// Drop every client's table locks and answer it: [`CommitUnit::lsn`] for
+    /// a laid unit, the error for a failed one.
+    fn resolve(self, zone_lsn: u64) {
+        let result = match self.outcome {
+            Outcome::Laid { .. } => Ok(self.lsn(zone_lsn)),
+            Outcome::Failed(e) => Err(e),
+        };
         for Waiter { done, held, .. } in self.waiters {
             drop(held);
-            match &self.outcome {
-                Outcome::Laid { .. } => replies.push((done, lsn)),
-                Outcome::Failed(e) => done.send(Err(e.clone())),
-            }
+            done.send(result.clone());
         }
     }
 }
@@ -520,15 +421,15 @@ fn build_units(s: &mut CommitScratch, merge: bool) {
 
 /// Commit the batch of writes in `s.writes`. Lays out every group and queues
 /// their tids for the tick under one SAL hold, then raises the validation
-/// caches and commit LSNs, drops the writers' table locks, and hands their
-/// replies to the syncer, which sends them once the batch is durable.
+/// caches and commit LSNs, and drops the writers' table locks as it answers
+/// them.
 ///
 /// Leaves in `s.writes` the writes to commit again behind a checkpoint: the
 /// first unit the SAL had no room for, and every unit after it. A unit of one
 /// write too large for a log with nothing else in its epoch fails instead. A
 /// merged run comes back as the writes it merged, which a batch that does not
 /// `merge` commits one by one. `s.units` is empty again on return.
-async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool, syncer: &Syncer) {
+async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
     // ------------------------------------------------------------------
     // Phase A (no lock): the units.
     // ------------------------------------------------------------------
@@ -538,7 +439,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool, sync
     // Phase B (under the SAL writer): emit SAL groups, queue their tids for the
     // tick. The batch's recoverable groups form one zone.
     // ------------------------------------------------------------------
-    let (zone_lsn, zoned, again) = {
+    let (zone_lsn, again) = {
         let disp = &shared.dispatcher;
         let mut excl = disp.sal().lock().await;
 
@@ -584,7 +485,10 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool, sync
         // committed or failed.
         let again = refused_at.map(|at| s.units.split_off(at));
 
-        let zoned = scope.commit();
+        // Started now rather than at the first writer's wait for it.
+        if scope.commit() {
+            disp.sal().want_durable(zone_lsn);
+        }
         // The auto-tick this may fire overlaps the fdatasync.
         shared.note_commit_rows(
             &excl,
@@ -593,34 +497,24 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool, sync
                 .flat_map(CommitUnit::laid)
                 .map(|f| (f.tid, f.rows.view().len())),
         );
-        (zone_lsn, zoned, again)
+        (zone_lsn, again)
     };
 
     // The caches and commit LSNs, then the table locks. No OCC check of a
     // later write to one of the tables runs before the raise. Such a write is
     // laid out behind this batch, so the fdatasync that covers it covers this
     // batch too.
-    let mut woken = SmallVec::new();
-    for unit in &s.units {
+    for unit in s.units.drain(..) {
         let lsn = unit.lsn(zone_lsn);
         for f in unit.laid() {
             shared.writes.committed(&shared.cat(), f.tid, f.rows.view(), lsn);
-            woken.push(f.tid);
+            // After the raise, which is what a woken poll reads as staleness.
+            shared.feeds.wake(f.tid);
         }
-    }
-    let mut replies = Vec::new();
-    for unit in s.units.drain(..) {
-        unit.resolve(zone_lsn, &mut replies);
+        unit.resolve(zone_lsn);
     }
     s.writes
         .extend(again.into_iter().flatten().flat_map(CommitUnit::into_writes));
-
-    // ------------------------------------------------------------------
-    // Phase C: the batch's fdatasync, on the syncer. A batch of nothing but
-    // stream groups opened no zone, so needs none, and is still answered in
-    // order behind the batches ahead of it.
-    // ------------------------------------------------------------------
-    syncer.send(zoned, replies, woken);
 }
 
 #[cfg(test)]

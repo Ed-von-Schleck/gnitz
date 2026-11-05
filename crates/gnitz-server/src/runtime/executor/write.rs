@@ -280,7 +280,7 @@ pub(super) async fn handle_push_txn(shared: &Shared, mut buf: RecvBuf, ctrl: Dec
 /// validation, and the commit, whose families its deletes cascade to ride
 /// along. Every rejection is pre-SAL, so a fault or a conflict commits nothing.
 /// The committer raises each written table's commit LSN to the write's and
-/// drops the table locks once the write is laid out; the answer comes at the
+/// drops the table locks once the write is laid out; the answer waits for the
 /// fdatasync that covers it.
 ///
 /// `occ` is a transaction's OCC checks: each a table and the read basis its
@@ -326,7 +326,12 @@ async fn commit(
         families.iter().all(|f| held.holds(f.tid)),
         "a commit bumps only tables whose lock it holds"
     );
-    shared.committer.write(families, held).await
+    let lsn = shared.committer.write(families, held).await?;
+    // Workers apply a group once it is published, so until here a read, or a
+    // later write's validation, can see the write before a restart would
+    // recover it. Nothing laid out is taken back: a failed fdatasync aborts.
+    shared.dispatcher.sal().durable_through(lsn).await;
+    Ok(lsn)
 }
 
 /// Decode the `PUSH_TXN` frame `frame`, whose item list is at `body`, into its

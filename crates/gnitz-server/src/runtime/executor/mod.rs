@@ -150,6 +150,8 @@ pub(super) fn run(
     gnitz_note!("{}", gnitz_foundation::log::READY_LINE);
 
     let tls = listeners.iter().find_map(|l| l.tls.clone());
+    let syncs = Rc::clone(&shared);
+    reactor.spawn(async move { syncs.dispatcher.sal().run_syncs(syncs.dispatcher.reactor()).await });
     reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
     for listener in listeners {
         reactor.spawn(accept_loop(Rc::clone(&shared), listener));

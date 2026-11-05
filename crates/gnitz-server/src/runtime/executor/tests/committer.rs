@@ -193,8 +193,7 @@ fn a_merged_run_splits_back_into_its_writes() {
 
 /// A unit answers every client it holds, a merged run's included: the zone
 /// LSN when it rode inside the zone, `0` when it did not, the error when it
-/// failed. A laid unit's replies wait for the fdatasync; a failed unit's error
-/// does not.
+/// failed.
 #[test]
 fn a_unit_answers_every_client() {
     let unit_of = |outcome: Outcome| {
@@ -210,21 +209,7 @@ fn a_unit_answers_every_client() {
     ];
     for (i, (outcome, want)) in cases.into_iter().enumerate() {
         let (unit, mut rxs) = unit_of(outcome);
-        let mut replies = Vec::new();
-        unit.resolve(9, &mut replies);
-        if let Ok(lsn) = want {
-            assert_eq!(replies.len(), rxs.len(), "case {i}: one reply per client");
-            for (c, rx) in rxs.iter_mut().enumerate() {
-                assert!(
-                    try_poll_once(rx).is_none(),
-                    "case {i}, client {c}: answered before the fdatasync"
-                );
-            }
-            for (done, got) in replies {
-                assert_eq!(got, lsn, "case {i}");
-                done.send(Ok(got));
-            }
-        }
+        unit.resolve(9);
         for (c, rx) in rxs.iter_mut().enumerate() {
             let got = try_poll_once(rx).expect("answered").map_err(|_| ());
             assert_eq!(got, want, "case {i}, client {c}");

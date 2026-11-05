@@ -14,13 +14,13 @@ mod zone;
 pub(crate) use request::{Apply, OwnedRead, Read, SalRequest};
 pub(crate) use zone::CommittedTail;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::{File, OpenOptions};
-use std::future::Future;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Poll, Waker};
 
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
@@ -847,6 +847,24 @@ pub(crate) struct SalWriter {
     excl: AsyncRwLock<SalLock>,
     /// Every worker's park; its length is the worker count groups are written at.
     parks: WorkerParks,
+    /// How far the log is durable; see [`Self::durable_through`].
+    durable: Durable,
+}
+
+/// How far a [`SalWriter`]'s log is durable, and who waits on it.
+#[derive(Default)]
+struct Durable {
+    /// Every group published at or below this LSN is durable.
+    through: Cell<u64>,
+    /// The highest LSN asked to be made durable.
+    wanted: Cell<u64>,
+    /// The LSN the fdatasync in flight makes durable; `0` while none is.
+    syncing: Cell<u64>,
+    /// Each parked waiter, with the LSN it waits for.
+    waiters: RefCell<Vec<(u64, Waker)>>,
+    /// [`SalWriter::run_syncs`], parked until a waiter wants more than is
+    /// durable.
+    driver: Cell<Option<Waker>>,
 }
 
 impl SalWriter {
@@ -875,6 +893,7 @@ impl SalWriter {
             holds_pushes: Cell::new(false),
             excl: AsyncRwLock::default(),
             parks,
+            durable: Durable::default(),
         };
         writer.rewind(epoch);
         writer
@@ -1050,6 +1069,7 @@ impl SalWriter {
         if let Err(e) = self.log.file.sync_data() {
             gnitz_fatal_abort!("SAL fdatasync (rewind to epoch {epoch}) failed: {e}");
         }
+        self.mark_durable(self.watermark());
         // Every page of the ring is clean once synced: drop the cached ones no
         // process maps, so the new epoch's small groups do not land in the large
         // pages earlier `pwrite`s left behind, each of which a store dirties
@@ -1083,19 +1103,80 @@ impl SalWriter {
         self.watermark.get()
     }
 
-    /// `fdatasync` the log, fatal on failure: every group published before the
-    /// call is durable once it resolves. Publishing needs the writer lock, this
-    /// does not. The abort names the caller's location.
-    #[track_caller]
-    pub(crate) fn sync(&self, reactor: &Reactor) -> impl Future<Output = ()> {
-        let at = std::panic::Location::caller();
-        let done = reactor.fsync(self.log.file.as_fd());
-        async move {
-            let rc = done.await;
-            if rc < 0 {
-                gnitz_fatal_abort!("{at}: SAL fdatasync failed rc={rc}");
+    /// Start making every group published at or below `lsn` durable, without
+    /// waiting for it. Needs [`Self::run_syncs`] running.
+    pub(crate) fn want_durable(&self, lsn: u64) {
+        debug_assert!(lsn <= self.watermark(), "LSN {lsn} is not published");
+        let d = &self.durable;
+        if lsn > d.wanted.get() {
+            d.wanted.set(lsn);
+            if let Some(driver) = d.driver.take() {
+                driver.wake();
             }
         }
+    }
+
+    /// Resolves once every group published at or below `lsn` is durable: at
+    /// once for `0`, which no zone carries. Needs [`Self::run_syncs`] running.
+    pub(crate) async fn durable_through(&self, lsn: u64) {
+        let d = &self.durable;
+        std::future::poll_fn(|cx| {
+            if d.through.get() >= lsn {
+                return Poll::Ready(());
+            }
+            self.want_durable(lsn);
+            d.waiters.borrow_mut().push((lsn, cx.waker().clone()));
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// Whether the fdatasync in flight makes every published group durable.
+    pub(crate) fn syncing_all(&self) -> bool {
+        self.durable.syncing.get() == self.watermark()
+    }
+
+    /// Run the fdatasyncs [`Self::durable_through`] waits for, one at a time and
+    /// fatal on failure. Each covers every group published before it is
+    /// submitted, so the waiters that arrive while one is in flight share the
+    /// next. Publishing needs the writer lock, this does not. Never returns.
+    pub(crate) async fn run_syncs(&self, reactor: &Reactor) {
+        let d = &self.durable;
+        loop {
+            std::future::poll_fn(|cx| {
+                if d.wanted.get() > d.through.get() {
+                    return Poll::Ready(());
+                }
+                d.driver.set(Some(cx.waker().clone()));
+                Poll::Pending
+            })
+            .await;
+            let target = self.watermark();
+            d.syncing.set(target);
+            let rc = reactor.fsync(self.log.file.as_fd()).await;
+            if rc < 0 {
+                gnitz_fatal_abort!("SAL fdatasync failed rc={rc}");
+            }
+            d.syncing.set(0);
+            self.mark_durable(target);
+        }
+    }
+
+    /// Every group published at or below `lsn` is durable: wake whoever waits
+    /// on no more.
+    fn mark_durable(&self, lsn: u64) {
+        let d = &self.durable;
+        if lsn <= d.through.get() {
+            return;
+        }
+        d.through.set(lsn);
+        d.waiters.borrow_mut().retain(|(waits_for, waker)| {
+            let done = *waits_for <= lsn;
+            if done {
+                waker.wake_by_ref();
+            }
+            !done
+        });
     }
 }
 

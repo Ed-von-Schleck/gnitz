@@ -7,7 +7,8 @@ use super::{
 };
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
-use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
+use crate::runtime::reactor::test_support::make_reactor;
+use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_once};
 use crate::runtime::w2m::fixtures::{id, test_rings};
 use crate::runtime::w2m::RequestId;
 use crate::runtime::ServerExit;
@@ -347,6 +348,44 @@ fn zone_lsns_rise_with_the_log_and_the_watermark_follows_the_commits() {
 
     excl.checkpoint_reset();
     assert!(excl.begin("test").lsn() > second, "a checkpoint keeps LSNs rising");
+}
+
+/// A waiter resolves once the fdatasync the driver runs covers its LSN, and at
+/// once for `0`, which no zone carries; a checkpoint's rewind makes every
+/// published group durable without one.
+#[test]
+fn durable_through_waits_for_an_fdatasync_or_a_rewind() {
+    let log: &'static SalWriter = Box::leak(Box::new(test_log(1 << 20, 1, 1)));
+    let mut excl = log.excl();
+    assert!(try_poll_once(log.durable_through(0)).is_some(), "LSN 0 needs no sync");
+
+    let mut zone = |g| {
+        let mut scope = excl.begin("test");
+        let lsn = scope.lsn();
+        scope.write(&to(g), true).expect("group fits");
+        assert!(scope.commit());
+        lsn
+    };
+    let first = zone(1);
+    let mut waiting = Box::pin(log.durable_through(first));
+    assert!(try_poll_once(&mut waiting).is_none(), "published, not yet durable");
+    let reactor = make_reactor();
+    let driver = reactor.clone();
+    reactor.spawn(async move { log.run_syncs(&driver).await });
+    reactor.block_on(waiting);
+    assert!(
+        !log.syncing_all(),
+        "no fdatasync is in flight once its waiter is answered"
+    );
+
+    let second = zone(2);
+    let mut waiting = Box::pin(log.durable_through(second));
+    assert!(
+        try_poll_once(&mut waiting).is_none(),
+        "the next zone waits for its own sync"
+    );
+    excl.checkpoint_reset();
+    assert!(try_poll_once(&mut waiting).is_some(), "the rewind's sync covers it");
 }
 
 // ---------------------------------------------------------------------------
