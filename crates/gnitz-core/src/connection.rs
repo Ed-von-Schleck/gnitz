@@ -139,21 +139,20 @@ impl Request<'_> {
                     if gnitz_wire::sys_family_index(*tid).is_none() {
                         return Err(ClientError::from(format!("DDL family {tid} is not a system table")));
                     }
-                    batch.validate(sys_schema(*tid))?;
+                    batch.check_shape(sys_schema(*tid))?;
                 }
                 Ok(0)
             }
             Request::PushTxn(families) => {
                 for f in families {
-                    f.batch.validate(&f.schema)?;
+                    f.batch.check_shape(&f.schema)?;
                 }
                 Ok(0)
             }
             Request::Push { target, schema, batch, .. } => {
-                // In-process, so a convenience and never a trust boundary; the
-                // server checks the same things. Here so no driver has to
-                // remember to.
-                batch.validate(schema)?;
+                // Shape only: the server certifies every row's NULL bits and
+                // cells against the relation's own schema.
+                batch.check_shape(schema)?;
                 Ok(target.tid)
             }
             Request::AllocIds(_) | Request::SnapshotOpen | Request::SnapshotClose(_) | Request::Backup(_) => Ok(0),

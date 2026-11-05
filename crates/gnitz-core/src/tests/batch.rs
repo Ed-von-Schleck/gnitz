@@ -30,6 +30,7 @@ fn payload_of(schema: &Schema, regions: Vec<Vec<u8>>) -> Vec<PayloadColumn> {
 
 /// Each way a batch can disagree with its schema or with itself is refused and
 /// named; a NULL over a zeroed cell of a nullable column is not one of them.
+/// `check_shape` refuses the layout and length cases and reads no cell.
 #[test]
 fn validate_refuses_each_malformed_batch() {
     // `(pk U64 | v I64 | s STRING nullable)`, two valid rows, the second NULL in `s`.
@@ -52,27 +53,34 @@ fn validate_refuses_each_malformed_batch() {
         .expect("a NULL over a zeroed nullable cell validates");
 
     type Mutation = fn(&mut ZSetBatch);
-    let cases: [(Mutation, &str); 8] = [
-        (|b| _ = b.weights.pop(), "pk region length"),
-        (|b| b.pks.push_natives(&[3]), "pk region length"),
-        (|b| _ = b.nulls.pop(), "nulls length"),
+    // (mutation, the refusal, whether it is a shape error)
+    let cases: [(Mutation, &str, bool); 8] = [
+        (|b| _ = b.weights.pop(), "pk region length", true),
+        (|b| b.pks.push_natives(&[3]), "pk region length", true),
+        (|b| _ = b.nulls.pop(), "nulls length", true),
         (
             |b| b.payload[0].bytes.clear(),
             "payload slot 0: length 0 != expected 16",
+            true,
         ),
         (
             |b| b.payload[1].bytes.clear(),
             "payload slot 1: length 0 != expected 32",
+            true,
         ),
-        (|b| b.nulls[0] |= 1, "NOT NULL column 'v'"),
-        (|b| b.nulls[0] |= 2, "holds a value under NULL"),
-        (|b| b.nulls[0] |= 1 << 2, "past the last payload column"),
+        (|b| b.nulls[0] |= 1, "NOT NULL column 'v'", false),
+        (|b| b.nulls[0] |= 2, "holds a value under NULL", false),
+        (|b| b.nulls[0] |= 1 << 2, "past the last payload column", false),
     ];
-    for (mutate, want) in cases {
+    for (mutate, want, shape) in cases {
         let mut b = base.clone();
         mutate(&mut b);
         let err = b.validate(&schema).unwrap_err();
         assert!(err.contains(want), "{err:?} does not mention {want:?}");
+        match b.check_shape(&schema) {
+            Err(err) => assert!(shape && err.contains(want), "{err:?} for {want:?}"),
+            Ok(()) => assert!(!shape, "check_shape accepted a {want:?} batch"),
+        }
     }
 
     // The same batch against a schema of another layout.
@@ -105,6 +113,7 @@ fn validate_refuses_each_malformed_batch() {
     ] {
         let err = base.validate(&other).unwrap_err();
         assert!(err.contains(want), "{err:?} does not mention {want:?}");
+        assert_eq!(base.check_shape(&other).unwrap_err(), err);
     }
 }
 

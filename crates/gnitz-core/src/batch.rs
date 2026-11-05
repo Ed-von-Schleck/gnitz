@@ -414,11 +414,18 @@ impl ZSetBatch {
         Ok(())
     }
 
-    /// Validate that all vectors are consistently sized for the given schema, and
-    /// that every NULL is a zeroed cell of a nullable column.
-    pub fn validate(&self, schema: &Schema) -> Result<(), String> {
+    /// The batch has `schema`'s layout and every vector is sized for its row
+    /// count. O(columns): no row is read.
+    pub fn check_shape(&self, schema: &Schema) -> Result<(), String> {
         self.layout_matches(schema)?;
-        self.check_region_lengths(&self.wire_regions())?;
+        self.check_region_lengths(&self.wire_regions())
+    }
+
+    /// [`Self::check_shape`], and every NULL is a zeroed cell of a nullable
+    /// column — what the server certifies of each row it is sent, here with
+    /// the row and column named.
+    pub fn validate(&self, schema: &Schema) -> Result<(), String> {
+        self.check_shape(schema)?;
         check_not_null(as_le_bytes(&self.nulls), schema)?;
         let col = |pi: usize| (self.payload[pi].bytes.as_slice(), self.payload[pi].stride());
         match gnitz_wire::first_valued_null(schema.layout().nullable_payload_slots(), as_le_bytes(&self.nulls), col) {

@@ -2,9 +2,9 @@ use super::*;
 use crate::test_support::{session_pair, wide_rows, wide_schema};
 use std::hint::black_box;
 
-/// Instructions to validate a push of four nullable columns and to encode it
-/// into a buffer the rounds reuse, at one row and at 100k, with no NULL and
-/// with one NULL per row.
+/// Instructions to validate a push request of four nullable columns and to
+/// encode it into a buffer the rounds reuse, at one row and at 100k, with no
+/// NULL and with one NULL per row.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn push_validate_bench() {
@@ -17,15 +17,13 @@ fn push_validate_bench() {
             let (mut v, mut e) = (0, 0);
             let mut out = Vec::new();
             for _ in 0..iters {
-                v += counter
-                    .measure(|| black_box(black_box(&batch).validate(&schema)).unwrap())
-                    .1;
                 let push = || Request::Push {
                     target,
                     schema: &schema,
                     batch: &batch,
                     mode: WireConflictMode::Update,
                 };
+                v += counter.measure(|| black_box(black_box(push()).validate()).unwrap()).1;
                 out.clear();
                 e += counter.measure(|| push().append(black_box(&mut out))).1;
             }
