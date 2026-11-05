@@ -3,7 +3,8 @@
 
 use std::borrow::Cow;
 use std::fs::OpenOptions;
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::io::IoSlice;
+use std::os::unix::fs::OpenOptionsExt;
 
 use super::codebook::Codebook;
 use super::encoding::*;
@@ -306,15 +307,24 @@ impl Batch {
         images.push((encoding, Cow::Owned(heap)));
         images.push((Encoding::Raw, Cow::Borrowed(filter.as_deref().unwrap_or(&[]))));
 
+        // The file is laid out whole in memory: the header, then each image
+        // behind the zero pad that aligns it. The body checksum covers the
+        // same pads and images in the same order, so the header is stamped
+        // before any byte is written and the file goes out in one vectored
+        // write.
         static PAD: [u8; ALIGNMENT] = [0; ALIGNMENT];
-        let file = OpenOptions::new().write(true).create_new(true).mode(0o644).open(path)?;
         let mut header = vec![0u8; desc_len(npc)];
         let mut body = gnitz_wire::ChecksumStream::default();
+        // The header's slot, filled once it is stamped.
+        let mut slices: Vec<IoSlice> = Vec::with_capacity(1 + 2 * images.len());
+        slices.push(IoSlice::new(&[]));
         let mut end = header.len();
         for (i, (encoding, image)) in images.iter().enumerate() {
             for bytes in [&PAD[..aligned(end) - end], &image[..]] {
                 body.update(bytes);
-                file.write_all_at(bytes, end as u64)?;
+                if !bytes.is_empty() {
+                    slices.push(IoSlice::new(bytes));
+                }
                 end += bytes.len();
             }
             DirEntry {
@@ -332,7 +342,10 @@ impl Batch {
             body_checksum: body.digest(),
         }
         .stamp(path, &mut header);
-        file.write_all_at(&header, 0)?;
+        slices[0] = IoSlice::new(&header);
+        // A fresh file's cursor is at offset 0.
+        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o644).open(path)?;
+        gnitz_foundation::posix_io::write_all_vectored(&mut file, &mut slices)?;
         Ok(())
     }
 }

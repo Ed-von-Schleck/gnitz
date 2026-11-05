@@ -129,6 +129,21 @@ pub fn write_file_durable(path: impl AsRef<std::path::Path>, bytes: &[u8], mode:
     fsync_parent(path)
 }
 
+/// Write every byte of `bufs`, in order, to `w` in as few vectored writes as
+/// it takes: a short write resumes past what was taken, and an interrupted one
+/// is retried.
+pub fn write_all_vectored(w: &mut impl io::Write, mut bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
+    while !bufs.is_empty() {
+        match w.write_vectored(bufs) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => io::IoSlice::advance_slices(&mut bufs, written),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Rename `from` to `to`, refused with `AlreadyExists` where `to` exists:
 /// `std::fs::rename` replaces a file, or an empty directory, in its place.
 #[cfg(target_os = "linux")]
