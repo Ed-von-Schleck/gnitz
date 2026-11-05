@@ -727,6 +727,55 @@ fn two_string_extremes_keep_their_own_index_images() {
     }
 }
 
+/// Under a group key that packs by hashing, each extreme of a reduce with
+/// several keys its entries as that extreme alone does: the same rows, group
+/// keys, images and weights, over a NULL pattern of its own.
+#[test]
+fn extremes_under_a_hashed_group_key_each_key_their_entries_as_one_alone() {
+    let (min, max) = (agg(AggFunc::Min, 0), agg(AggFunc::Max, 7));
+    let row = |id: u64, val: Option<i64>, s: Option<&'static str>, n: Option<i16>| Row {
+        id,
+        grp: id as i64 % 3 - 1,
+        val,
+        s,
+        n,
+        ..Row::default()
+    };
+    let delta = batch(&[
+        (row(1, Some(4), Some("aa"), None), 1),
+        (row(2, None, None, Some(-3)), 2),
+        (row(3, Some(-9), Some("zz"), Some(7)), 1),
+        (row(4, Some(0), Some("aa"), None), 3),
+        (row(5, None, Some("q"), Some(1)), 1),
+    ])
+    .into_consolidated();
+    let entries = |group: &[u32], aggs: &[AggDescriptor]| {
+        let plan = ReducePlan::from_wire(&schema(), group, aggs, false).unwrap();
+        let idx = plan.index_entries(&delta).unwrap();
+        let mb = idx.as_mem_batch();
+        // Each entry with its ordinal byte cleared: the key's 9th byte from the end.
+        (0..idx.len())
+            .map(|i| {
+                let mut key = mb.get_pk_bytes(i).to_vec();
+                let ordinal = key.len() - 9;
+                (std::mem::take(&mut key[ordinal]), key, idx.get_weight(i))
+            })
+            .collect::<Vec<_>>()
+    };
+    // A string and a column folded behind two packed ones.
+    for group in [&[3, 2][..], &[0, 1, 3]] {
+        let both = entries(group, &[AggDescriptor::COUNT_STAR, min, max]);
+        let alone = [min, max].map(|a| entries(group, &[AggDescriptor::COUNT_STAR, a]));
+        let want: Vec<_> = alone
+            .iter()
+            .enumerate()
+            .flat_map(|(j, e)| e.iter().map(move |(_, key, w)| (j as u8, key.clone(), *w)))
+            .collect();
+        assert_eq!(both, want, "group {group:?}");
+        assert_eq!(both.len(), 6, "three non-NULL values per extreme");
+    }
+}
+
 /// One plan run epoch after epoch, its buffers kept across them, emits what a
 /// plan built afresh for each epoch emits over the same traces, PKs and weights
 /// included. Each case's epochs alternate the hashed numbering, its fallback to

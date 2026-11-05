@@ -149,13 +149,28 @@ impl ValueIndex {
         let mut out = Batch::with_capacity(&self.schema, n * self.aggs.len());
         // A string ordinal's whole image of one row; empty between rows.
         let mut image = Vec::new();
+        // Every row's group key, packed once for all ordinals when packing one
+        // hashes; each ordinal otherwise packs its own rows' keys.
+        let shared = (self.aggs.len() > 1 && !self.key_packer.packs_without_hashing()).then(|| {
+            let mut keys = vec![0u8; n * stride];
+            self.key_packer.pack_rows(&mut keys, stride, &mb, &[(0, n)]);
+            keys
+        });
 
         for (j, a) in self.aggs.iter().enumerate() {
             // A NULL has no image: MIN/MAX skips it.
             let runs = delta.runs_without_nulls(a.image.loc.null_bit());
             let rows = range_rows(&runs);
             out.write_rows(rows, |w| {
-                self.key_packer.pack_rows(w.pk_mut(), width, &mb, &runs);
+                match &shared {
+                    Some(keys) => {
+                        let live = runs.iter().flat_map(|&(s, e)| s..e);
+                        for (row, key) in live.zip(w.pk_mut().chunks_exact_mut(width)) {
+                            key[..stride].copy_from_slice(&keys[row * stride..][..stride]);
+                        }
+                    }
+                    None => self.key_packer.pack_rows(w.pk_mut(), width, &mb, &runs),
+                }
                 copy_runs::<8>(delta.weight(), w.weight_mut(), runs.iter().copied(), 8);
                 w.null_bmp_mut().fill(0);
                 let (keys, mut cells, blob) = w.pk_and_payload_mut(IMAGE_SLOT..IMAGE_SLOT + has_payload as usize);

@@ -23,7 +23,7 @@ fn plan(schema: &SchemaDescriptor, group: &[u32], aggs: &[AggFunc], ground: bool
 /// derives from its delta, per image kind: a scalar, a fixed wide value, a
 /// column holding NULLs, two extremes at once, and strings of 8, 13, 40 and 400
 /// bytes, with no NUL, a trailing one, one in the middle, or one in every few
-/// bytes.
+/// bytes; then a scalar under hashing group keys, with one extreme and two.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn reduce_index_entries_bench() {
@@ -88,20 +88,33 @@ fn reduce_index_entries_bench() {
     ];
     let u32_group: &[SchemaColumn] = &[SchemaColumn::new(TypeCode::U32, false)];
     let nullable_pair: &[SchemaColumn] = &[SchemaColumn::new(TypeCode::I64, true); 2];
+    let string_group: &[SchemaColumn] = &[string];
     let grouped = cases
         .iter()
         .map(|&(label, value, aggs, put)| (label.to_string(), u32_group, value, aggs, put));
+    let nullable_triple: &[SchemaColumn] = &[SchemaColumn::new(TypeCode::I64, true); 3];
     // The first case again under a group set too wide for a packed key.
     let folded = cases[..1]
         .iter()
         .map(|&(label, value, aggs, put)| (format!("{label}, 2 groups"), nullable_pair, value, aggs, put));
-    for (label, group, value, aggs, put) in grouped.chain(folded) {
+    // The scalar cases, one extreme and two, again under group keys that pack
+    // by hashing: a group set whose last columns fold, and a string group.
+    let hashed = [(", 3 groups", nullable_triple), (", STRING group", string_group)];
+    let hashed = hashed.into_iter().flat_map(|(suffix, group)| {
+        [cases[0], cases[5]]
+            .into_iter()
+            .map(move |(label, value, aggs, put)| (format!("{label}{suffix}"), group, value, aggs, put))
+    });
+    for (label, group, value, aggs, put) in grouped.chain(folded).chain(hashed) {
         let schema = u64_pk_schema(&[group, &[value]].concat());
         let mut b = BatchBuilder::new(&schema);
         for i in 0..N {
             b.begin_row(i as u128, 1);
-            for _ in group {
-                b.put_int((i % 4096) as u128);
+            for col in group {
+                match col.type_code {
+                    TypeCode::String => b.put_string(&format!("group {:016}", i % 4096)),
+                    _ => b.put_int((i % 4096) as u128),
+                }
             }
             put(&mut b, i);
             b.end_row();
@@ -113,7 +126,7 @@ fn reduce_index_entries_bench() {
         // The first pass takes the pool's first allocations.
         let [_, (entries, instructions)] = [(); 2].map(|()| counter.measure(|| plan.index_entries(&delta).unwrap()));
         println!(
-            "reduce_index_entries_bench {label:<20} {:6.1} instr/row ({} entries)",
+            "reduce_index_entries_bench {label:<32} {:6.1} instr/row ({} entries)",
             instructions as f64 / N as f64,
             entries.len()
         );
@@ -498,7 +511,7 @@ fn op_reduce_tiny_bench() {
                 }
             });
             println!(
-                "op_reduce_tiny_bench {label:<20} {dname:<20} {:>6} instr/call",
+                "op_reduce_tiny_bench {label:<32} {dname:<20} {:>6} instr/call",
                 instructions / ITERS
             );
         }
@@ -516,7 +529,7 @@ fn op_reduce_tiny_bench() {
             }
         });
         println!(
-            "op_reduce_tiny_bench {label:<20} {:<19} {:>6} instr/call",
+            "op_reduce_tiny_bench {label:<32} {:<19} {:>6} instr/call",
             "delete last row",
             instructions / ITERS
         );
