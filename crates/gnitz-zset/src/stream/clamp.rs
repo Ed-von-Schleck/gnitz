@@ -21,11 +21,7 @@ pub fn op_weight_clamp(delta: Cow<'_, Batch>, hist: History<'_>, kind: ClampKind
         History::Through(open) => (open, true),
     };
     let cursor = &mut open(delta.get_pk_bytes(0), delta.get_pk_bytes(delta.len() - 1));
-    // The clamp's upper bound; every clamp's floor is 0.
-    let cap = match kind {
-        ClampKind::Distinct => 1,
-        ClampKind::PositivePart => i64::MAX,
-    };
+    let cap = clamp_cap(kind);
     let mb = delta.as_mem_batch();
     let clamped = with_picks(|rows| {
         let mut identity = true;
@@ -50,6 +46,14 @@ pub fn op_weight_clamp(delta: Cow<'_, Batch>, hist: History<'_>, kind: ClampKind
         })
     });
     clamped.unwrap_or_else(|| delta.into_owned())
+}
+
+/// `kind`'s upper bound; every clamp's floor is 0.
+pub(crate) fn clamp_cap(kind: ClampKind) -> i64 {
+    match kind {
+        ClampKind::Distinct => 1,
+        ClampKind::PositivePart => i64::MAX,
+    }
 }
 
 #[cfg(test)]

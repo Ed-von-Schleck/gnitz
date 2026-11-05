@@ -3,6 +3,8 @@
 
 use super::*;
 use gnitz_wire::PkKeys;
+use gnitz_zset::repr::empty_cursor;
+use gnitz_zset::stream;
 
 impl DagEngine {
     /// Every row of `view_id` at `keys`, each held by the view's store as a
@@ -21,7 +23,13 @@ impl DagEngine {
         let vm = &mut code.vm;
         let mut gather = stores.gather(hydration.seed, keys)?;
         let mut out = Batch::empty_with_schema(vm.out_schema());
-        while let Some(seed) = gather.drain_chunk(registry.scan_chunk_rows()) {
+        while let Some(mut seed) = gather.drain_chunk(registry.scan_chunk_rows()) {
+            if let Some(kind) = hydration.clamp {
+                // Clamped against no history: each gathered weight, clamped.
+                let schema = *seed.schema();
+                let history = stream::History::Before(&mut |_, _| empty_cursor(schema));
+                seed = stream::op_weight_clamp(Cow::Owned(seed), history, kind);
+            }
             let produced = vm::replay_chunk(vm, &mut stores, hydration.entry, seed)?;
             out.append_above(produced.into_consolidated());
         }

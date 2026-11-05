@@ -17,9 +17,10 @@ use crate::repr::{
 use crate::schema::{band, compare_pk_ordering, group_floor, key_above, DerivedSchema, SchemaDescriptor};
 
 use crate::algebra::MapPlan;
+use crate::stream::clamp::clamp_cap;
 use crate::stream::OpenAt;
 use gnitz_expr::{ColCopy, ColMoves, ColumnLocator};
-use gnitz_wire::{null_word_at, Heap, JoinKind, PkBuf, RangeRel, RowSource, TypeCode};
+use gnitz_wire::{null_word_at, ClampKind, Heap, JoinKind, PkBuf, RangeRel, RowSource, TypeCode};
 
 // ---------------------------------------------------------------------------
 // The plan
@@ -37,6 +38,10 @@ pub struct JoinPlan {
     t_moves: ColMoves,
     /// The trace's columns lead the output payload: the delta is the right side.
     trace_leads: bool,
+    /// The ceiling each trace row's weight is clamped to, from a floor of 0,
+    /// where the stored trace is a clamp's input history and the joined side is
+    /// that clamp's output; a row clamped to 0 meets nothing.
+    trace_cap: Option<i64>,
 }
 
 /// Which trace walk a probe drives.
@@ -156,7 +161,17 @@ impl JoinPlan {
             walk,
             t_moves,
             trace_leads: delta_is_right,
+            trace_cap: None,
         })
+    }
+
+    /// This plan over a trace holding `kind`'s input history in place of its
+    /// output's integral. The integral of a clamp's output is the clamp of its
+    /// input's integral, element by element, so each trace weight is clamped as
+    /// it is read.
+    pub fn clamped_trace(mut self, kind: ClampKind) -> JoinPlan {
+        self.trace_cap = Some(clamp_cap(kind));
+        self
     }
 }
 
@@ -301,11 +316,19 @@ pub fn op_join_delta_trace(delta: &Batch, trace: OpenAt<'_>, plan: &JoinPlan) ->
     with_scratch(&PAIRS, |pairs| {
         let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
             debug_assert!(rs < re, "every walk emits a non-empty delta run");
+            let w_trace = match plan.trace_cap {
+                Some(cap) => c.current_weight().clamp(0, cap),
+                None => c.current_weight(),
+            };
+            // Dropping a pairing keeps the rest in walk order.
+            if w_trace == 0 {
+                return;
+            }
             pairs.push(Pairing {
                 rs: rs as u32,
                 re: re as u32,
                 at: c.current_position(),
-                w_trace: c.current_weight(),
+                w_trace,
             });
         };
         match plan.walk {

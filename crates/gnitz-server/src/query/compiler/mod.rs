@@ -12,7 +12,7 @@ use std::rc::Rc;
 use crate::query::vm::{DeltaReg, Integral, Vm};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::relation::{Relation, RelationRegistry, StateIdx};
-use gnitz_wire::{AggDescriptor, Circuit, JoinKind, MapKind, NodeId, OpNode, ReadBound};
+use gnitz_wire::{AggDescriptor, Circuit, ClampKind, JoinKind, MapKind, NodeId, OpNode, ReadBound};
 use gnitz_zset::algebra::{MapPlan, Placement, ScatterPlan};
 use gnitz_zset::schema::SchemaDescriptor;
 

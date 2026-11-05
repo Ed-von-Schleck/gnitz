@@ -126,6 +126,62 @@ fn an_equi_join_claims_the_output_it_writes_in_order() {
     }
 }
 
+/// A plan over a clamp's input history joins what it would join over the clamp's
+/// output integral: each trace weight clamped, and a row clamped to 0 met by
+/// nothing — under both kinds, on both ports, and with the history in one run
+/// or summed across two.
+#[test]
+fn a_clamped_trace_joins_the_clamp_of_its_history() {
+    use gnitz_wire::ClampKind;
+    let schema = make_schema_u64_i64();
+    // Several delta rows per key, so a dropped pairing sits between kept ones.
+    let delta = make_batch(
+        &schema,
+        &[(1, 1, 10), (1, 2, 11), (2, 1, 20), (3, 3, 30), (3, 1, 31), (4, 1, 40)],
+    );
+    let summed = make_batch(
+        &schema,
+        &[(1, 2, 100), (1, -1, 101), (2, 1, 200), (3, 3, 300), (3, -2, 301)],
+    );
+    // Two runs summing to `summed`, the last row cancelling across them.
+    let older = make_batch(
+        &schema,
+        &[
+            (1, 1, 100),
+            (1, -1, 101),
+            (2, 1, 200),
+            (3, 1, 300),
+            (3, -2, 301),
+            (4, 1, 400),
+        ],
+    );
+    let newer = make_batch(&schema, &[(1, 1, 100), (3, 2, 300), (4, -1, 400)]);
+    let mut one_run = TestTrace::new(schema);
+    one_run.ingest(summed);
+    let mut two_runs = TestTrace::new(schema);
+    two_runs.ingest(older);
+    two_runs.ingest(newer);
+    for (kind, clamped) in [
+        (ClampKind::Distinct, [(1, 1, 100), (2, 1, 200), (3, 1, 300)]),
+        (ClampKind::PositivePart, [(1, 2, 100), (2, 1, 200), (3, 3, 300)]),
+    ] {
+        let clamped = make_batch(&schema, &clamped);
+        for delta_is_right in [false, true] {
+            let (want, _) = join_reference(JoinKind::Equi, delta_is_right, &schema, &schema, &delta, &clamped);
+            assert!(!want.is_empty(), "premise: the clamped trace matches something");
+            let capped = plan(JoinKind::Equi, delta_is_right, &schema, &schema).clamped_trace(kind);
+            for (runs, hist) in [(1, &one_run), (2, &two_runs)] {
+                let got = op_join_delta_trace(&delta, &mut |f, l| hist.cursor_within(f, l), &capped);
+                assert_eq!(
+                    zset_of(&got, capped.output_schema()),
+                    want,
+                    "{kind:?} delta_is_right={delta_is_right} runs={runs}"
+                );
+            }
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // Delta-trace versus a brute-force reference
 // -----------------------------------------------------------------------

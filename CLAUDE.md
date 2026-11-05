@@ -249,7 +249,8 @@ it.
 **A trace is not always a store of its own.** A join side that is a base table
 re-keyed onto leading columns of its own PK reads the table's store — **as the
 view last absorbed it** — instead of keeping a copy, and so does a clamp over
-base tables' rows under their own PK. A reduce whose output is
+base tables' rows under their own PK. A join side that is a clamp keeping its
+own history reads that history, clamped. A reduce whose output is
 the view's reads the view's own store.
 
 ## 4. The Region Convention

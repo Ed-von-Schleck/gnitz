@@ -1,11 +1,11 @@
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    col_def, make_batch, make_schema_u64_i64, push_and_tick, scan_all, scratch_dir, table_engine,
+    col_def, make_batch, make_schema_u64_i64, push_and_tick, reindexed_on_col1, scan_all, scratch_dir, table_engine,
     try_register_identity_view, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, RowKey,
 };
 use gnitz_store::relation::PkRule;
-use gnitz_wire::TypeCode;
+use gnitz_wire::{Circuit, JoinKind, TypeCode};
 use std::collections::HashMap;
 
 /// `view`'s rows recomputed for the U64 keys `ids`, as a Z-set.
@@ -66,4 +66,32 @@ fn a_trace_seed_recomputes_a_joins_rows() {
     assert_eq!(held.len(), 3, "k=10 twice, k=20 once, k=30 unmatched");
     assert!(held.values().all(|&w| w == 1), "each match once");
     assert_eq!(hydrate(&mut engine, view, &[10, 20, 30]), held);
+}
+
+/// A bounded join whose `a` side is a `DISTINCT` hydrates from the clamp's own
+/// history, read through the clamp: an `a` row the history holds twice joins
+/// once, as the view holds it.
+#[test]
+fn a_clamp_history_seed_is_read_through_the_clamp() {
+    let mut engine = CatalogEngine::open(&scratch_dir("dag_hydrate", "clamp_seed"), 1).unwrap();
+    let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
+    let a = engine.create_table("public.a", &cols, &[0]).unwrap();
+    let b = engine.create_table("public.b", &cols, &[0]).unwrap();
+    let mut circuit = Circuit::default();
+    let ra = reindexed_on_col1(&mut circuit, a, TypeCode::U64);
+    let twice = circuit.union(ra, ra);
+    let da = circuit.distinct(twice);
+    let db = reindexed_on_col1(&mut circuit, b, TypeCode::U64);
+    circuit.join([da, db], [da, db], JoinKind::Equi);
+    let join_cols = ["k", "a_id", "b_id"].map(|name| col_def(name, TypeCode::U64));
+    let view = try_register_view(&mut engine, circuit, "bounded_distinct_join", &join_cols, 1 << 20, 0).unwrap();
+    let schema = engine.registry.relation_or_err(a).unwrap().schema();
+    push_and_tick(&mut engine, a, make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]));
+    push_and_tick(&mut engine, b, make_batch(&schema, &[(7, 1, 10), (9, 1, 20)]));
+
+    let rows = scan_all(&mut engine, view);
+    let held = zset_of(&rows, rows.schema());
+    assert_eq!(held.len(), 2, "k=10 and k=20, once each");
+    assert!(held.values().all(|&w| w == 1), "each match once, through the clamp");
+    assert_eq!(hydrate(&mut engine, view, &[10, 20]), held);
 }

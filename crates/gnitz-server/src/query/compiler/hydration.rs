@@ -5,12 +5,14 @@ use super::*;
 use crate::query::vm::ReplayEntry;
 use gnitz_store::relation::RelationKind;
 
-/// Where a bounded view's per-key replay seeds: the register it enters at, and
-/// the integral the seed is gathered from.
+/// Where a bounded view's per-key replay seeds: the register it enters at, the
+/// integral the seed is gathered from, and the clamp the gathered weights are
+/// read through — a clamp's history holds its input, whose clamp is its output.
 #[derive(Clone, Copy)]
 pub(in crate::query) struct Hydration {
     pub(in crate::query) entry: ReplayEntry,
     pub(in crate::query) seed: Integral,
+    pub(in crate::query) clamp: Option<ClampKind>,
 }
 
 const UNSUPPORTED: &str =
@@ -27,7 +29,7 @@ pub(super) fn derive_hydration(
     registry: &RelationRegistry,
     vm: &Vm,
     regs: &[DeltaReg],
-    integrals: &[Option<(Integral, DeltaReg)>],
+    integrals: &[Option<(Integral, DeltaReg, Option<ClampKind>)>],
 ) -> Result<Hydration, String> {
     if vm.reads_view_store() {
         return Err(READS_OWN_STORE.into());
@@ -37,7 +39,7 @@ pub(super) fn derive_hydration(
         return Err(UNSUPPORTED.into());
     }
     let origin = row_local_origin(circuit, circuit.out());
-    let (in_reg, seed) = match circuit.op(origin) {
+    let (in_reg, seed, clamp) = match circuit.op(origin) {
         OpNode::ScanDelta { source, .. } => {
             if registry.relation_or_err(*source)?.kind() == RelationKind::Stream {
                 return Err(
@@ -45,7 +47,7 @@ pub(super) fn derive_hydration(
                         .into(),
                 );
             }
-            (regs[origin], Integral::Relation(*source))
+            (regs[origin], Integral::Relation(*source), None)
         }
         OpNode::Join(JoinKind::Equi) => {
             let &[da, db, ia, ib] = circuit.inputs(origin) else {
@@ -56,12 +58,16 @@ pub(super) fn derive_hydration(
             if (ia, ib) != (da, db) {
                 return Err(UNSUPPORTED.into());
             }
-            let (seed, entry) = integrals[da].expect("the join declared its integrand's integral");
-            (entry, seed)
+            let (seed, entry, clamp) = integrals[da].expect("the join declared its integrand's integral");
+            (entry, seed, clamp)
         }
         _ => return Err(UNSUPPORTED.into()),
     };
-    Ok(Hydration { entry: vm.replay_entry(in_reg)?, seed })
+    Ok(Hydration {
+        entry: vm.replay_entry(in_reg)?,
+        seed,
+        clamp,
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -29,10 +29,11 @@ pub(super) struct EmitCtx<'a> {
     /// Whether each `ExchangeShard` emitted so far hands on per-worker partials,
     /// which its reader combines.
     partials: Vec<bool>,
-    /// The integral of each node some join probes, and the register its rows
-    /// enter at: the node's own, or, for a base table's store, the scan's its
-    /// re-key reads.
-    pub(super) integrals: Vec<Option<(Integral, DeltaReg)>>,
+    /// The integral of each node some join probes, the register its rows enter
+    /// at, and the clamp its stored weights are read through: the node's own,
+    /// or, for a base table's store, the scan's its re-key reads. A clamp's
+    /// integral is its own history, read through the clamp.
+    pub(super) integrals: Vec<Option<(Integral, DeltaReg, Option<ClampKind>)>>,
     /// Each scanned source's scan, once per source, in first-scan order.
     pub(super) sources: Vec<(u64, Scan)>,
     /// The view, whose store is the integral of its output node's register.
@@ -202,7 +203,7 @@ impl<'a> EmitCtx<'a> {
     /// The child integrating `of`'s register, declared and scheduled the first time
     /// a join asks.
     fn own_integral(&mut self, of: NodeId) -> StateIdx {
-        if let Some((Integral::Own(trace), _)) = self.integrals[of] {
+        if let Some((Integral::Own(trace), ..)) = self.integrals[of] {
             return trace;
         }
         let reg = self.regs[of];
@@ -370,18 +371,32 @@ fn emit_join_term(
     let delta_reg = ctx.regs[delta];
     let delta_schema = ctx.prog.schema_of(delta_reg);
     // One constructor owns every kind's guards and its output layout.
-    let ((trace, entry), plan) = match ctx.source_rekey(integrand) {
+    let (trace, entry, clamp, plan) = match ctx.source_rekey(integrand) {
         Some((relation, entry, rekey)) => (
-            (Integral::Relation(relation.id()), entry),
+            Integral::Relation(relation.id()),
+            entry,
+            None,
             JoinPlan::over_source(delta_is_right, &delta_schema, &relation.schema(), rekey)?,
         ),
         None => {
             let reg = ctx.regs[integrand];
             let plan = JoinPlan::from_wire(kind, delta_is_right, &delta_schema, &ctx.prog.schema_of(reg))?;
-            ((Integral::Own(ctx.own_integral(integrand)), reg), plan)
+            match ctx.prog.writer(reg) {
+                // A clamp's output integral is its history clamped, both integrated
+                // in one pass, so the join reads the history through the clamp.
+                Some((
+                    _,
+                    &Op::WeightClamp {
+                        hist: ClampHistory::Own(hist),
+                        kind: clamp,
+                    },
+                    _,
+                )) => (Integral::Own(hist), reg, Some(clamp), plan.clamped_trace(clamp)),
+                _ => (Integral::Own(ctx.own_integral(integrand)), reg, None, plan),
+            }
         }
     };
-    ctx.integrals[integrand] = Some((trace, entry));
+    ctx.integrals[integrand] = Some((trace, entry, clamp));
     let out_schema = *plan.output_schema();
     let op = Op::JoinDT { trace, plan: Box::new(plan) };
     Ok(ctx.prog.push(delta_reg, out_schema, op))

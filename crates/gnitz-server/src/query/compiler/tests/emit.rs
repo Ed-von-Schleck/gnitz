@@ -214,7 +214,8 @@ fn an_integral_is_its_source_table_only_where_the_table_holds_what_it_would() {
 
 /// A join names the node whose integral it probes, so the two joins reading the
 /// preserved side's re-key — the inner term and the matched term — share one
-/// store.
+/// store; and the matched join reads B's key set out of the history of the
+/// clamp that makes it, so no store holds that key set twice.
 #[test]
 fn two_joins_probing_one_integrand_share_one_integral() {
     use TypeCode::U64;
@@ -223,17 +224,26 @@ fn two_joins_probing_one_integrand_share_one_integral() {
     let b = SchemaDescriptor::new(&[nn, nn, nn], &[0]);
     let (c, _) = crate::test_support::left_join_circuit(10, 11, 1);
     let vm = compile(&c, &sources([(10, a), (11, b)]), false).unwrap().vm;
-    let (mut probes, mut distinct) = (0, Vec::new());
+    let (mut probes, mut distinct, mut hists) = (0, Vec::new(), Vec::new());
     for op in vm.ops() {
-        if let Op::JoinDT { trace, .. } = op {
-            probes += 1;
-            if !distinct.contains(trace) {
-                distinct.push(*trace);
+        match op {
+            Op::JoinDT { trace, .. } => {
+                probes += 1;
+                if !distinct.contains(trace) {
+                    distinct.push(*trace);
+                }
             }
+            Op::WeightClamp { hist: ClampHistory::Own(hist), .. } => hists.push(Integral::Own(*hist)),
+            _ => {}
         }
     }
     assert_eq!(probes, 4, "the inner and the matched join's two terms each");
     assert_eq!(distinct.len(), 3, "A's re-key, B's, and B's key set: {distinct:?}");
+    assert_eq!(hists.len(), 1, "the clamp making B's key set keeps its history");
+    assert!(
+        distinct.contains(&hists[0]),
+        "the key set is read out of the clamp's history: {distinct:?}"
+    );
 }
 
 // ── A reduce whose output is the view's ───────────────────────────────────
