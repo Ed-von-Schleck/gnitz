@@ -975,25 +975,27 @@ impl SalWriter {
         head.encode(hdr, base, epoch);
         // A payload span from `PAYLOAD_PWRITE_BYTES` up is laid out in `scratch`
         // and written with `pwrite`, not stored through the mapping: no page
-        // fault per page, and the page cache sizes its pages to the write. Its
-        // padding is written as zeros. A mapped span's padding is left as it
-        // is: the checksum covers whatever bytes are there, and nothing rewrites
-        // a laid-out group's span before the cursor passes it again.
+        // fault per page, and the page cache sizes its pages to the write.
+        // `fill` writes every payload byte, and each payload's padding is
+        // written as zeros, so the span is a function of the group alone,
+        // whatever an earlier group left in `scratch` or at this offset.
         let span = total - PREFIX_BYTES - hdr_size;
         let mut scratch = (span >= PAYLOAD_PWRITE_BYTES).then(|| {
             let mut buf = self.scratch.take();
-            buf.clear();
-            buf.resize(span, 0);
+            if buf.len() < span {
+                buf.resize(span, 0);
+            }
             buf
         });
         let payload: &mut [u8] = match &mut scratch {
-            Some(buf) => buf,
+            Some(buf) => &mut buf[..span],
             // SAFETY: the payload span past `hdr`, inside the group mapped above.
             None => unsafe { std::slice::from_raw_parts_mut(self.log.ring.add(hdr_off + hdr_size), span) },
         };
         for (i, (off, sz)) in payload_spans(sizes.iter().copied()).enumerate() {
             write_u64_le(hdr, OFF_DIRECTORY + i * DIR_ENTRY_BYTES, sz as u64);
             fill(&mut payload[off..off + sz]);
+            payload[off + sz..(off + sz).next_multiple_of(8)].fill(0);
         }
         let sum = if head.lsn != 0 {
             gnitz_wire::checksum(payload)
@@ -1005,7 +1007,7 @@ impl SalWriter {
             // Once it returns, the bytes are in the page cache the mapping
             // reads, ahead of the prefix store that publishes them.
             let at = (ANCHOR_BYTES + hdr_off + hdr_size) as u64;
-            if let Err(e) = self.log.file.write_all_at(&buf, at) {
+            if let Err(e) = self.log.file.write_all_at(&buf[..span], at) {
                 gnitz_fatal_abort!("SAL pwrite ({span} bytes at {at}) failed: {e}");
             }
             self.scratch.set(buf);

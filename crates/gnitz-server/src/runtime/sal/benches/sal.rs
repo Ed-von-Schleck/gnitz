@@ -110,3 +110,36 @@ fn sal_park_cycle_bench() {
         );
     }
 }
+
+/// Instructions per payload byte of a group large enough to be laid out in the
+/// writer's scratch buffer and written with `pwrite`: one blob per worker.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn sal_large_group_bench() {
+    const NW: usize = 4;
+    const LARGE_GROUPS: usize = 16;
+    let counter = Counter::instructions();
+    for blob_len in [4 << 10, 64 << 10, 1 << 20] {
+        let blobs = vec![vec![7u8; blob_len]; NW];
+        let log = test_log(LARGE_GROUPS * NW * (blob_len + 4096) + (16 << 20), NW, 1);
+        let group = SalGroup {
+            data: GroupData::Blobs(&blobs),
+            ..SalGroup::new(scan(16, &[]))
+        };
+        let mut excl = log.excl();
+        // One group first, so the scratch buffer has grown before the count.
+        excl.write(&group).expect("group fits");
+        let ((), written) = counter.measure(|| {
+            for _ in 0..LARGE_GROUPS {
+                excl.write(&group).expect("group fits");
+            }
+        });
+        drop(excl);
+        let bytes = (LARGE_GROUPS * NW * blob_len) as f64;
+        println!(
+            "sal_large_group_bench nw={NW} blob={blob_len:>8} {:>10.0} instr/group, {:.4} instr/payload byte",
+            written as f64 / LARGE_GROUPS as f64,
+            written as f64 / bytes
+        );
+    }
+}

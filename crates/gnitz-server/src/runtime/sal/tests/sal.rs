@@ -621,6 +621,42 @@ fn a_group_with_per_worker_blobs_sends_each_worker_its_own_blob() {
     }
 }
 
+/// A group written through the reused `pwrite` scratch buffer zeroes its
+/// payloads' padding, whatever an earlier, larger group left in the buffer.
+#[test]
+fn a_pwritten_group_zeroes_its_padding_over_an_earlier_group() {
+    let log = test_log(1 << 20, 3, 1);
+    let dirty = vec![vec![0xFF; 8 << 10]; 3];
+    log.excl()
+        .write(&SalGroup {
+            data: GroupData::Blobs(&dirty),
+            ..SalGroup::new(scan(16, &[]))
+        })
+        .expect("group fits");
+    let base = log.cursor();
+    let blobs: Vec<Vec<u8>> = vec![vec![1; 5001], vec![2; 3], vec![3; 4003]];
+    log.excl()
+        .write(&SalGroup {
+            data: GroupData::Blobs(&blobs),
+            ..SalGroup::new(scan(16, &[]))
+        })
+        .expect("group fits");
+
+    let msg = group_at(log.log(), base);
+    let mut padded = 0;
+    for (w, blob) in blobs.iter().enumerate() {
+        let slot = msg.slot(w as u32).expect("every worker is written");
+        let control = peek_control_block(slot).expect("a payload decodes");
+        assert_eq!(slot[control.blob], **blob, "worker {w}");
+        let pad = slot.len().next_multiple_of(8) - slot.len();
+        // SAFETY: a slot's padding lies inside its group, inside the mapping.
+        let padding = unsafe { std::slice::from_raw_parts(slot.as_ptr().add(slot.len()), pad) };
+        assert!(padding.iter().all(|&b| b == 0), "worker {w}: padding {padding:?}");
+        padded += pad;
+    }
+    assert!(padded > 0, "some payload is padded");
+}
+
 // ---------------------------------------------------------------------------
 // The group header's own integrity: a digest over the header, which names the
 // group's byte offset. Every field swept below drives a routing or replay
