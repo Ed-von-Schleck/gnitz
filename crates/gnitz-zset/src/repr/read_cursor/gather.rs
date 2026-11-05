@@ -12,8 +12,7 @@ use std::ops::ControlFlow;
 use super::{ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
 use crate::repr::scatter::{gather_rows, with_picks};
-use crate::schema::{project_schema, SchemaDescriptor};
-use gnitz_expr::ColumnLocator;
+use crate::schema::SchemaDescriptor;
 
 pub struct PkSetGather {
     cursor: ReadCursor,
@@ -117,23 +116,6 @@ impl PkSetGather {
                 out
             })
         })
-    }
-
-    /// Every remaining live row at weight 1, in the [`project_schema`] layout of
-    /// `cols`: this source's PK, then the payload columns `cols` names.
-    /// `Err` where `project_schema` refuses `cols`.
-    pub fn project_live(&mut self, cols: &[u32]) -> Result<Batch, String> {
-        let schema = self.cursor.schema;
-        let out_schema = project_schema(&schema, cols)?;
-        let locs: Vec<ColumnLocator> = cols.iter().map(|&c| schema.locate(c as usize)).collect();
-        let mut out = Batch::with_capacity(&out_schema, self.remaining_keys());
-        self.for_each_live_row(usize::MAX, |c| {
-            let (src, row) = c.current_row_source();
-            out.begin_row(c.current_pk_bytes(), 1);
-            out.append_cells_from(&locs, src, row);
-            out.commit_row();
-        });
-        Ok(out)
     }
 
     /// The next non-empty chunk of source rows, or `None` once the key list is

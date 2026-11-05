@@ -9,7 +9,8 @@ use super::{PkSetGather, ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
 use crate::repr::merge::merge_consolidated;
 use crate::repr::run::StoredRow;
-use crate::schema::SchemaDescriptor;
+use crate::schema::{project_schema, SchemaDescriptor};
+use gnitz_expr::ColumnLocator;
 
 /// A chunked source of `Batch`es: a whole cursor, an index range, or a key list.
 // One per read, held on the reader's stack; boxing `Full` or `PkSet` would cost
@@ -216,6 +217,33 @@ impl<'a> KeyGather<'a> {
 pub trait UniqueRows {
     /// The live row at whole OPK `key`, `None` when the key nets 0.
     fn unique_live_row_at(&self, key: &[u8]) -> Option<StoredRow>;
+}
+
+/// Every live row of `keys`, a strictly ascending list of whole PKs of
+/// `schema`, probed from `store`, at weight 1 and in the [`project_schema`]
+/// layout of `cols`: the PK, then the payload columns `cols` names. `Err` where
+/// `project_schema` refuses `cols`.
+pub fn project_unique(
+    store: &dyn UniqueRows,
+    schema: &SchemaDescriptor,
+    keys: &PkKeys,
+    cols: &[u32],
+) -> Result<Batch, String> {
+    debug_assert_eq!(keys.stride(), schema.pk_stride());
+    let out_schema = project_schema(schema, cols)?;
+    let locs: Vec<ColumnLocator> = cols.iter().map(|&c| schema.locate(c as usize)).collect();
+    let mut out = Batch::with_capacity(&out_schema, keys.len());
+    for key in keys.iter() {
+        if let Some(row) = store.unique_live_row_at(key) {
+            let (src, i) = row.source();
+            out.begin_row(key, 1);
+            out.append_cells_from(&locs, src, i);
+            out.commit_row();
+        }
+    }
+    // One row per key, in ascending key order.
+    out.certify_consolidated();
+    Ok(out)
 }
 
 /// Every live row of a strictly ascending list of whole keys, one

@@ -405,6 +405,17 @@ fn a_pk_probe_answers_each_key_a_live_row_carries() {
     assert_eq!(batch_rows(&column), rows([2, 7]));
 }
 
+/// A column probe reads a store that holds one live row per key, so a view's is
+/// refused.
+#[test]
+fn a_column_probe_of_a_view_is_refused() {
+    let r = fixture(RelationKind::View(ViewBudget::Plain), x10);
+    let keys = || PkKeys::from_images(8, [2]);
+    assert_eq!(keyed(&r.probe(TID, Probe::Pk, keys()).unwrap()), [(2, 1)]);
+    let err = r.probe(TID, Probe::PkColumn(1), keys()).map(drop).unwrap_err();
+    assert!(err.contains("not a base table"), "{err}");
+}
+
 /// An index probe answers a held span with every stored entry, up to a cap counted
 /// across the keys, and a span no row holds with nothing. Its one cursor answers each
 /// key as a seek of its own does: a run of misses ahead of a hit, a hit ahead of its

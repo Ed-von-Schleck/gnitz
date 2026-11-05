@@ -28,7 +28,7 @@ use super::run::Run;
 pub use gather::PkSetGather;
 use gnitz_wire::RowSource;
 pub(crate) use probe::GroupProbe;
-pub use source::{BoundedIndexCursor, KeyGather, SourceCursor, UniqueRows};
+pub use source::{project_unique, BoundedIndexCursor, KeyGather, SourceCursor, UniqueRows};
 
 /// The skeleton rows a split drain set aside instead of copying: their OPK keys, flat
 /// and ascending, and — in debug builds — each one's coarse weight.

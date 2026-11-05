@@ -8,7 +8,9 @@ use super::check_stride;
 use crate::relation::{Cut, Relation, RelationKind, RelationRegistry};
 use crate::storage::Table;
 use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound};
-use gnitz_zset::repr::{empty_cursor, Batch, BoundedIndexCursor, KeyGather, SourceCursor, StoredRow, UniqueRows};
+use gnitz_zset::repr::{
+    empty_cursor, project_unique, Batch, BoundedIndexCursor, KeyGather, SourceCursor, StoredRow, UniqueRows,
+};
 use gnitz_zset::schema::{project_schema, SchemaDescriptor};
 use std::num::NonZeroU64;
 
@@ -18,7 +20,8 @@ use std::num::NonZeroU64;
 pub enum Probe {
     /// The relation's own PK store: each key a live row carries, echoed.
     Pk,
-    /// The own PK store: each key a live row carries, with that row's column.
+    /// A base table's own PK store: each key a live row carries, with that
+    /// row's column.
     PkColumn(u32),
     /// The secondary index on this exact column list: the stored entries
     /// under the keys' spans, `[span ‖ holder PK]`, in key order, up to `cap`
@@ -48,13 +51,11 @@ impl RelationRegistry {
             }
             Probe::PkColumn(col) => {
                 keyed_as(relation.schema().pk_stride())?;
-                let table = relation.table_or_err()?;
-                let mut live = keys;
-                // A filtered point lookup drops each key no live row carries before
-                // the gather opens a merge cursor; it narrows the band the cursor
-                // seeks, or skips the cursor when no key survives.
-                live.retain(|k| table.has_pk_bytes(k));
-                table.gather(live, Cut::Now).project_live(&[col])
+                relation.table_or_err()?;
+                let rows = relation
+                    .unique_rows()
+                    .ok_or_else(|| format!("probe: column probe of relation {id}, which is not a base table"))?;
+                project_unique(rows, &relation.schema(), &keys, &[col])
             }
             Probe::Index(cols, cap) => {
                 let index = relation.index_or_err(cols.as_slice())?;
@@ -90,8 +91,13 @@ impl Relation {
     /// whole key it is asked for by its unique-PK probe instead of a cursor
     /// seek.
     pub fn open_read(&self, bound: ReadBound) -> Result<(SourceCursor<'_>, Option<KeyRange>), String> {
-        let unique = (self.kind() == RelationKind::BaseTable).then(|| self.table() as &dyn UniqueRows);
-        self.open_source(bound, Cut::Now, unique)
+        self.open_source(bound, Cut::Now, self.unique_rows())
+    }
+
+    /// This process's store of the relation as one live row per key, which only
+    /// a base table's is; `None` for any other kind.
+    fn unique_rows(&self) -> Option<&dyn UniqueRows> {
+        (self.kind() == RelationKind::BaseTable).then(|| self.table() as &dyn UniqueRows)
     }
 
     fn open_source<'a>(
