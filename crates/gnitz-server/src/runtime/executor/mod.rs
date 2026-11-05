@@ -497,22 +497,18 @@ fn cork_msg(peer: &Peer, msg: WireMsg<'_>) {
 }
 
 /// Cork `rows` as a train of `target_id` read off the master's own copy: frames
-/// of at most `MAX_FRAME_PAYLOAD`, the last flagged `scan_last`, as a worker
-/// cuts its own. The terminal ACK is the caller's. `Err` is a row too wide for
-/// any frame, the frames before it corked.
+/// of at most `MAX_FRAME_PAYLOAD`, the last flagged `scan_last`, cut by
+/// [`WireMsg::next_train_frame`] as a worker's are. The terminal ACK is the
+/// caller's. `Err` is a row too wide for any frame, the frames before it corked.
 fn cork_train(peer: &Peer, target_id: u64, rows: &gnitz_zset::repr::Batch) -> Result<(), WireFault> {
-    let head = WireMsg::train_frame(target_id, false, None).size();
     let mut next = 0;
     loop {
-        let chunk = rows.wire_rows_within(next, gnitz_wire::MAX_FRAME_PAYLOAD - head);
-        next += chunk.map_or(0, |r| r.rows());
-        let last = next == rows.len();
-        let msg = WireMsg::train_frame(target_id, last, chunk);
-        msg.check_size()?;
+        let (msg, n) = WireMsg::next_train_frame(target_id, rows, next, gnitz_wire::MAX_FRAME_PAYLOAD, true)?;
         cork_msg(peer, msg);
-        if last {
+        if msg.flags.scan_last {
             return Ok(());
         }
+        next = n;
     }
 }
 

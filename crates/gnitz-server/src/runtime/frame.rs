@@ -2,7 +2,7 @@
 //! group's payload or a client reply.
 
 use gnitz_wire::{ControlHeader, WireFault, WireFlags, WireStatus};
-use gnitz_zset::repr::WireRows;
+use gnitz_zset::repr::{Batch, WireRows};
 
 // ---------------------------------------------------------------------------
 // WireMsg
@@ -53,6 +53,26 @@ impl<'a> WireMsg<'a> {
             data,
             ..Default::default()
         }
+    }
+
+    /// The next frame of `target_id`'s train over `batch`, its rows starting at
+    /// row `from` and the frame within `budget` bytes, and the row the one after
+    /// it starts at, which the caller commits once the frame is sent. The frame
+    /// reaching the end of `batch` is the train's last, flagged `scan_last`, iff
+    /// `ends`: no row follows `batch`. `Err` is a row too wide for any frame.
+    pub(crate) fn next_train_frame(
+        target_id: u64,
+        batch: &'a Batch,
+        from: usize,
+        budget: usize,
+        ends: bool,
+    ) -> Result<(Self, usize), WireFault> {
+        let head = Self::train_frame(target_id, false, None).size();
+        let rows = batch.wire_rows_within(from, budget.saturating_sub(head));
+        let next = from + rows.map_or(0, |r| r.rows());
+        let msg = Self::train_frame(target_id, ends && next == batch.len(), rows);
+        msg.check_size()?;
+        Ok((msg, next))
     }
 
     /// Total encoded size, without allocating.
@@ -119,3 +139,7 @@ impl<'a> WireMsg<'a> {
         self.encode(&mut out[base + PFX..total]);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/frame.rs"]
+mod tests;

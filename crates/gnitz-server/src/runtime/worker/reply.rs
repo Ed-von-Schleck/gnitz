@@ -1,5 +1,5 @@
 //! The worker's reply queue: what it owes the master, the one rule that decides
-//! when a reply leaves, the frame cutter every train is sent through, and when
+//! when a reply leaves, the sender every train's frames go through, and when
 //! a refusal of room asks the master for the ring back.
 
 use super::*;
@@ -64,27 +64,23 @@ impl Train {
     /// `last` once it was the last; `Ok(None)` refused. `Err` is a row too wide
     /// for any frame.
     fn emit_next(&mut self, w2m: &mut W2mWriter, budget: usize) -> Result<Option<bool>, WireFault> {
-        let (batch, whole) = match &mut self.rows {
+        let (batch, ends) = match &mut self.rows {
             Rows::Batch(batch) => (&**batch, true),
             Rows::Spans(spans) => {
                 if self.next_row == spans.chunk().len() {
                     spans.advance();
                     self.next_row = 0;
                 }
-                (spans.chunk(), false)
+                // An empty chunk: every span is sent.
+                (spans.chunk(), spans.chunk().is_empty())
             }
         };
-        let head = WireMsg::train_frame(self.route.target_id, false, None).size();
-        let rows = batch.wire_rows_within(self.next_row, budget.saturating_sub(head));
-        let next_row = self.next_row + rows.map_or(0, |r| r.rows());
-        let last = next_row == batch.len() && (whole || batch.is_empty());
-        let msg = WireMsg::train_frame(self.route.target_id, last, rows);
-        msg.check_size()?;
+        let (msg, next_row) = WireMsg::next_train_frame(self.route.target_id, batch, self.next_row, budget, ends)?;
         if !w2m.try_send_msg(self.route.request_id, false, &msg) {
             return Ok(None);
         }
         self.next_row = next_row;
-        Ok(Some(last))
+        Ok(Some(msg.flags.scan_last))
     }
 }
 
