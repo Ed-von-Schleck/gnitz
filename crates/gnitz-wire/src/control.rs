@@ -284,10 +284,6 @@ wire_enum! {
     /// The verb a client request frame names.
     #[derive(Default)]
     pub enum ClientVerb: u8 {
-        /// A parameterized bounded read (`ReadSpec`) of one relation, replied in
-        /// the layout whose digest is `arg0`, under the descriptor token `arg1`.
-        #[default]
-        ScanSpec = 0,
         /// A data push under the descriptor token `arg1`, ACKed with its LSN in
         /// `arg0`. An empty batch is still a push, ACKed at LSN 0.
         Push = 1,
@@ -313,7 +309,10 @@ wire_enum! {
         /// User-table batches committed as one SAL zone; each family carries
         /// its own OCC basis in `arg0` and its descriptor token in `arg1`.
         PushTxn = 7,
-        /// N relations read at one SAL cut.
+        /// N relations read at one SAL cut, one item each: a parameterized
+        /// bounded read (`ReadSpec`) in the blob, replied in the layout whose
+        /// digest is the item's `arg0`, under the descriptor token `arg1`.
+        #[default]
         ScanMulti = 8,
         /// `arg0` SERIAL ids of table `target_id`, under the descriptor token
         /// `arg1`; the reply's `arg0` is the run's base.
@@ -392,7 +391,7 @@ impl WireFlags {
     /// frame ends the client's reply; `scan_last` on the train's last frame.
     pub const fn train_frame(last: bool) -> Self {
         WireFlags {
-            verb: ClientVerb::ScanSpec,
+            verb: ClientVerb::ScanMulti,
             conflict_mode: WireConflictMode::Update,
             continuation: true,
             scan_last: last,

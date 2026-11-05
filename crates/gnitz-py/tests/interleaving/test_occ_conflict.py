@@ -82,7 +82,7 @@ def test_a_foreign_commit_costs_no_extra_round(ledger, peer, sql, want):
     b.execute_sql("UPDATE ledger SET val = val + 100 WHERE pk = 2")
     before = a.requests_sent
     a.execute_sql(sql)
-    assert a.requests_sent - before == 3, "RESOLVE, SCAN_SPEC and PUSH_TXN"
+    assert a.requests_sent - before == 3, "RESOLVE, SCAN_MULTI and PUSH_TXN"
     assert bag(scanned(a, "ledger"), "pk", "val") == want
 
 

@@ -124,7 +124,7 @@ impl ReadSpec {
             )
     }
 
-    /// The SCAN_SPEC request blob.
+    /// The blob of a SCAN_MULTI item.
     pub fn encode(&self) -> Vec<u8> {
         let map = self.sink.map.as_ref().map_or(0, |m| m.program.len());
         let mut w = Writer::with_capacity(64 + self.predicate.len() + self.bound.key_bytes() + map);
@@ -330,7 +330,7 @@ impl PkSetPeek<'_> {
     }
 }
 
-/// The routing bound of a SCAN_SPEC request blob. `None` for any other bound or
+/// The routing bound of a SCAN_MULTI item's blob. `None` for any other bound or
 /// a malformed prefix.
 pub fn peek_bound(blob: &[u8]) -> Option<BoundPeek<'_>> {
     let mut r = Reader::new(blob);

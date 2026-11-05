@@ -4,9 +4,10 @@ use std::num::NonZeroU64;
 
 use gnitz_core::{encode_ddl_txn, sys_schema, BatchAppender, ZSetBatch};
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr, Sink};
+use gnitz_wire::txn_frame::{encode_scan_multi, ScanItem};
 use gnitz_wire::{
-    append_frame, Circuit, CircuitRow, ClientVerb, ControlHeader, KeyRange, OrderKey, PkColList, ReadBound, ReadSink,
-    ReadSpec, RowsCut, SinkKind, SysRow, Target, CIRCUIT_TAB,
+    Circuit, CircuitRow, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, SysRow,
+    Target, CIRCUIT_TAB,
 };
 
 /// `col > 7`, as an expression program's blob.
@@ -39,11 +40,18 @@ pub(crate) fn ddl_frame(circuit: &[u8]) -> Vec<u8> {
     encode_ddl_txn(&[(CIRCUIT_TAB, batch)])
 }
 
-/// A `SCAN_SPEC` of relation 9 under `spec`.
+/// A `SCAN_MULTI` of relation 9 under `spec`.
 pub(crate) fn scan_frame(spec: &ReadSpec) -> Vec<u8> {
     let mut out = Vec::new();
-    let hdr = ControlHeader::naming(ClientVerb::ScanSpec, Target::from(9), 0);
-    append_frame(&mut out, &hdr, &spec.encode(), None, None);
+    let spec = spec.encode();
+    encode_scan_multi(
+        &mut out,
+        &[ScanItem {
+            target: Target::from(9),
+            reply_layout: 0,
+            spec: &spec,
+        }],
+    );
     out
 }
 

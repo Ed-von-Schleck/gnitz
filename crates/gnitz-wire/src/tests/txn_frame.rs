@@ -414,11 +414,7 @@ fn decode_items_enforces_each_verbs_item_rules() {
             false => refused(&one_item(hdr, b"blob", schema, data), "blob"),
         }
     }
-    let err = items(
-        &one_item(ControlHeader::default(), b"", false, false),
-        ClientVerb::ScanSpec,
-    )
-    .unwrap_err();
+    let err = items(&one_item(ControlHeader::default(), b"", false, false), ClientVerb::Push).unwrap_err();
     assert!(err.contains("not a multi-item verb"), "{err}");
 }
 

@@ -68,7 +68,7 @@ fn a_write_after_the_read_is_refused_naming_the_table() {
     let err = run_increment(&mut f, |b, t| commit(b, t, 2, 0)).expect_err("the push conflicts");
     assert_eq!(err.status(), Some(WireStatus::TxnConflict), "{err:?}");
     assert!(err.to_string().contains(&format!("'{}.t'", f.schema_name)), "{err}");
-    assert_eq!(f.a.requests_sent() - before, 2, "SCAN_SPEC and PUSH_TXN");
+    assert_eq!(f.a.requests_sent() - before, 2, "SCAN_MULTI and PUSH_TXN");
     assert_eq!(row_1(&mut f.a, &f.target), [(0, 1)]);
 }
 
@@ -82,6 +82,6 @@ fn a_write_the_read_saw_is_no_conflict() {
     let before = f.a.requests_sent();
     let result = run_increment(&mut f, |_, _| {});
     assert_eq!(result.unwrap(), 1);
-    assert_eq!(f.a.requests_sent() - before, 2, "SCAN_SPEC and PUSH_TXN");
+    assert_eq!(f.a.requests_sent() - before, 2, "SCAN_MULTI and PUSH_TXN");
     assert_eq!(row_1(&mut f.a, &target), [(101, 1)]);
 }

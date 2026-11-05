@@ -103,7 +103,7 @@ def test_bounded_view_matches_its_unbounded_twin(swept, swept_client, body, capa
     # A key the view does not hold.
     assert bag(c.seek(*bid, 10**9)) == {}
 
-    # The ScanSpec path: predicate, ORDER BY / LIMIT, and an aggregate fold.
+    # The scan_spec path: predicate, ORDER BY / LIMIT, and an aggregate fold.
     # A bag key is positional, so a column out of its declared order fails it.
     for tmpl in [
         "SELECT * FROM {v}",

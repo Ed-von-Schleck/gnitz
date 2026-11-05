@@ -132,7 +132,6 @@ impl Session {
                     self.ingest(families);
                 }
             }
-            ClientVerb::ScanSpec => self.scan(ScanItem::of(frame, &ctrl)),
             ClientVerb::ScanMulti => {
                 for s in decode_scan_multi(body).unwrap_or_default() {
                     self.scan(s);

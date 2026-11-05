@@ -178,7 +178,7 @@ fn wire_layout_samples() -> Vec<u8> {
 fn the_wire_layouts_are_pinned_to_the_epoch() {
     assert_eq!(
         (WIRE_EPOCH, crate::checksum(&wire_layout_samples())),
-        (36, 0xf724_9517_346b_fbe4),
+        (37, 0xf724_9517_346b_fbe4),
         "a client↔engine layout moved: bump WIRE_EPOCH and this digest together"
     );
 }

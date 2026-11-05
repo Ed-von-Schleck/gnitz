@@ -270,7 +270,7 @@ enum Slot {
     /// RESOLVE: the descriptor, or `None` when no such relation exists.
     /// Uncorrelated on the wire, because the request names no id.
     Resolve { to: Promise<Option<Arc<RelDescriptor>>> },
-    /// SCAN_SPEC or SCAN_MULTI: one train per relation, in request order.
+    /// SCAN_MULTI: one train per relation, in request order.
     Scan(Scan),
     /// One view's delta read: a scan's train, whose terminal carries the cursor
     /// to read from next.
@@ -362,8 +362,9 @@ impl Train {
     }
 }
 
-/// A scan's trains and where their replies go: SCAN_SPEC answers with its one
-/// reply, SCAN_MULTI with every relation's, gathered as each train terminates.
+/// A scan's trains and where their replies go: a one-item scan answers with
+/// its one reply, a multi-read with every relation's, gathered as each train
+/// terminates.
 enum Scan {
     One {
         train: Train,
@@ -622,21 +623,25 @@ impl Session {
         sent
     }
 
-    /// SCAN_SPEC, replied in `reply_schema`'s layout.
+    /// A one-item SCAN_MULTI, replied in `reply_schema`'s layout.
     pub(crate) fn submit_scan(
         &mut self,
         target: Target,
         spec: &gnitz_wire::ReadSpec,
         reply_schema: &Arc<Schema>,
     ) -> Sent<ScanReply> {
-        let hdr = ControlHeader::naming(ClientVerb::ScanSpec, target, reply_schema.layout().layout_digest());
         let (to, sent) = promise();
         let slot = Slot::Scan(Scan::One {
             train: Train::new(target.tid, reply_schema),
             to,
         });
         let spec = spec.encode();
-        self.enqueue(|out| append_payload(out, hdr, &spec, None, None), slot);
+        let item = txn_frame::ScanItem {
+            target,
+            reply_layout: reply_schema.layout().layout_digest(),
+            spec: &spec,
+        };
+        self.enqueue(|out| txn_frame::encode_scan_multi(out, &[item]), slot);
         sent
     }
 

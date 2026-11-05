@@ -168,7 +168,6 @@ fn walk_frame(root: &[u8], frame: &[u8], ctrl: DecodedControl, anatomy: &mut Ana
     let verb = ctrl.hdr.flags.verb;
     let blob = &frame[ctrl.blob.clone()];
     match verb {
-        ClientVerb::ScanSpec => drop(attempt(root, anatomy, || ReadSpec::decode(blob))),
         ClientVerb::SyncPushed => drop(attempt(root, anatomy, || txn_frame::decode_held(blob))),
         ClientVerb::SnapshotPage => drop(attempt(root, anatomy, || {
             gnitz_wire::snapshot::PageRequest::decode(blob)

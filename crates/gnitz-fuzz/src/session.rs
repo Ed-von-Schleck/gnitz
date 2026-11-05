@@ -7,8 +7,9 @@
 //! state no client can read back or that does not boot again on its own data —
 //! what any client on the network could otherwise do to every other.
 //!
-//! Every request is followed by a **barrier**: a scan of a relation id no
-//! catalog allocates. Replies come in request order, so the barrier's refusal
+//! Every request is followed by a **barrier**: a snapshot page with no page
+//! request, naming a relation id no catalog allocates. Replies come in request
+//! order, so the barrier's refusal
 //! arriving means the request before it was answered whole, however many
 //! frames that took — which only the client that built the request knows.
 
@@ -193,12 +194,13 @@ fn pump(conns: &mut BTreeMap<u32, Conn>, key: u32, deadline: Instant, trace: boo
     }
 }
 
-/// A request the server answers with a refusal naming `id`, and nothing else.
+/// A request the server answers with a refusal naming `id`, and nothing else:
+/// a SNAPSHOT_PAGE whose empty blob is no page request.
 fn barrier(id: u64) -> Vec<u8> {
     let mut out = Vec::new();
     append_frame(
         &mut out,
-        &ControlHeader::naming(ClientVerb::ScanSpec, Target::from(id), 0),
+        &ControlHeader::naming(ClientVerb::SnapshotPage, Target::from(id), 0),
         &[],
         None,
         None,

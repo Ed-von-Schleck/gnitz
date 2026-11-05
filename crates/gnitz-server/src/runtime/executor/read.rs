@@ -1,5 +1,4 @@
-//! The catalog-shape and row reads: RESOLVE, and SCAN_SPEC/SCAN_MULTI under one
-//! SAL cut.
+//! The catalog-shape and row reads: RESOLVE, and SCAN_MULTI under one SAL cut.
 
 use super::peer::Peer;
 use super::tick::{fresh_read_lock, read_watermark};
@@ -59,7 +58,7 @@ struct Scanned {
     lease: Option<TrainLease>,
 }
 
-/// SCAN_SPEC and SCAN_MULTI: one reply per scan, in request order. The scans
+/// SCAN_MULTI: one reply per scan, in request order. The scans
 /// its workers answer share one SAL cut, so an atomic commit is in all of
 /// their replies or in none.
 ///

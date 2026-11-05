@@ -6,7 +6,7 @@ fn probe_header() -> ControlHeader {
     ControlHeader {
         target_id: 0x1111_2222_3333_4444,
         flags: WireFlags {
-            verb: ClientVerb::ScanSpec,
+            verb: ClientVerb::ScanMulti,
             conflict_mode: WireConflictMode::Error,
             continuation: true,
             scan_last: true,
@@ -258,22 +258,29 @@ fn wire_flags_roundtrip_every_combination() {
 /// mode the server does not implement into a silent upsert on a client's push.
 #[test]
 fn wire_flags_reject_unknown() {
+    // Every word but the unknown verb's names a defined verb, so the field
+    // under test is the one refused.
+    let verb = WireFlags::default().pack();
     for bit in (16..32).chain(36..38).chain(40..64) {
-        assert!(WireFlags::unpack(1 << bit).is_err(), "bit {bit}");
+        assert_eq!(
+            WireFlags::unpack(verb | 1 << bit),
+            Err("flags: reserved bits set"),
+            "bit {bit}"
+        );
     }
     // Bits 32/33 are the frame codec's, so the flags word neither refuses nor
     // carries them.
-    assert_eq!(WireFlags::unpack(3 << 32), Ok(WireFlags::default()));
+    assert_eq!(WireFlags::unpack(3 << 32 | verb), Ok(WireFlags::default()));
     // The two-bit lane leaves one value unused.
     let lane = u64::from(crate::outside(WireLane::from_wire));
     assert!(lane < 4, "a two-bit field holds no unknown value");
     for (w, want) in [
         (u64::from(crate::outside(ClientVerb::from_wire)), "unknown request verb"),
         (
-            u64::from(crate::outside(WireConflictMode::from_wire)) << 8,
+            verb | u64::from(crate::outside(WireConflictMode::from_wire)) << 8,
             "unknown conflict mode",
         ),
-        (lane << 38, "unknown lane"),
+        (verb | lane << 38, "unknown lane"),
     ] {
         assert_eq!(WireFlags::unpack(w), Err(format!("flags: {want}").as_str()), "{w:#x}");
     }

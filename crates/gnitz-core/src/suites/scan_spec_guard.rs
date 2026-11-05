@@ -1,4 +1,4 @@
-//! `SCAN_SPEC` at a system catalog family is answered off the master's own copy,
+//! A `scan_spec` at a system catalog family is answered off the master's own copy,
 //! under the reply layout the client names: every row once, and a layout that is
 //! not the family's refused with the connection left usable.
 

@@ -131,12 +131,17 @@ fn await_unread(s: &UnixStream, len: usize) {
     }
 }
 
-/// The relation the next request on the wire names.
+/// The relation the next request on the wire names: a scan's in its one item.
 fn request(s: &mut UnixStream) -> u64 {
-    peek_control_block(&read_frame(s))
-        .expect("a control header")
-        .hdr
-        .target_id
+    let frame = read_frame(s);
+    let ctrl = peek_control_block(&frame).expect("a control header");
+    match ctrl.hdr.flags.verb {
+        ClientVerb::ScanMulti => match gnitz_wire::txn_frame::decode_scan_multi(&frame[ctrl.body]).as_deref() {
+            Ok([item]) => item.target.tid,
+            other => panic!("a scan names one relation: {other:?}"),
+        },
+        _ => ctrl.hdr.target_id,
+    }
 }
 
 /// Answer the oldest unanswered request, `tid`'s, with `lsn` and no rows.

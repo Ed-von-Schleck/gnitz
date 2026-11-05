@@ -46,7 +46,6 @@ use crate::runtime::signals;
 use crate::runtime::sync::{select2, AsyncRwLock, Either, WriteGuard};
 use crate::runtime::tls::{Served, TlsListener};
 use gnitz_store::relation::{Relation, RelationKind};
-use gnitz_wire::txn_frame::ScanItem;
 use gnitz_wire::{ClientVerb, Target, WireFault, WireStatus};
 
 /// Park in 1 ms reactor ticks until `ready`, or until `polls` elapse. The shape
@@ -385,10 +384,6 @@ async fn dispatch_request(
             .allocate_ids(ctrl.hdr.arg0)
             .map(Some)
             .map_err(|e| format!("id allocation failed: {e}").into()),
-
-        ClientVerb::ScanSpec => read::handle_scan(shared, peer, &[ScanItem::of(data, &ctrl)])
-            .await
-            .map(|()| None),
 
         ClientVerb::Resolve => read::handle_resolve(shared, peer, &data[ctrl.blob.clone()])
             .await

@@ -161,27 +161,13 @@ pub fn decode_items(frame: &[u8], body: Range<usize>, verb: ClientVerb) -> Resul
 }
 
 /// One scan: the encoded `ReadSpec` `spec` over `target`, replied in the layout
-/// whose digest is `reply_layout`. A `SCAN_MULTI` item, and what a `SCAN_SPEC`
-/// request's header and blob spell.
+/// whose digest is `reply_layout`: one `SCAN_MULTI` item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanItem<'a> {
     /// The relation, and the token of the RESOLVE answer this read was built from.
     pub target: Target,
     pub reply_layout: u64,
     pub spec: &'a [u8],
-}
-
-impl<'a> ScanItem<'a> {
-    /// The scan the frame `frame`, peeked as `ctrl`, spells: `target_id` and
-    /// the descriptor token in `arg1` name the relation, `arg0` is the reply
-    /// layout digest, and the blob is the spec.
-    pub fn of(frame: &'a [u8], ctrl: &DecodedControl) -> Self {
-        ScanItem {
-            target: ctrl.hdr.target(),
-            reply_layout: ctrl.hdr.arg0,
-            spec: &frame[ctrl.blob.clone()],
-        }
-    }
 }
 
 /// Append a `SCAN_MULTI` frame to `out`, without the 4-byte frame length
@@ -200,7 +186,11 @@ pub fn encode_scan_multi(out: &mut Vec<u8>, scans: &[ScanItem<'_>]) {
 pub fn decode_scan_multi(body: &[u8]) -> Result<Vec<ScanItem<'_>>, String> {
     Ok(decode_items(body, 0..body.len(), ClientVerb::ScanMulti)?
         .into_iter()
-        .map(|c| ScanItem::of(body, &c))
+        .map(|c| ScanItem {
+            target: c.hdr.target(),
+            reply_layout: c.hdr.arg0,
+            spec: &body[c.blob],
+        })
         .collect())
 }
 
