@@ -278,17 +278,26 @@ fn view_traces_resume_with_their_output_store() {
 // ── an_unrun_view_checkpoints_its_traces_and_resumes ────────────────────
 // The other half: a checkpoint stamps a resumed view's traces with its output
 // store even where nothing has run the view since the boot, so the next boot
-// finds both at one generation and resumes the view.
+// finds both at one generation and resumes the view. A round at the generation
+// the traces already carry — a clean boot's — leaves them closed.
 #[test]
 fn an_unrun_view_checkpoints_its_traces_and_resumes() {
     let dir = temp_dir("view_unrun_traces_resume");
     let (tid, vid) = checkpointed_traced_view(&dir);
 
-    // A checkpoint no tick precedes — what a boot checkpoint is for a view no
-    // tick sweep reaches.
+    // Checkpoints no tick precedes — what a boot checkpoint is for a view no
+    // tick sweep reaches: first at the generation the boot resumed, then at
+    // the next one.
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let g = engine.durable_generation();
+    engine.flush_ephemeral_round(g).unwrap();
+    assert!(
+        !engine.dag.state_opened(vid),
+        "traces already at the round's generation stay closed"
+    );
     let g2 = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g2).unwrap();
+    assert!(engine.dag.state_opened(vid), "a moved generation restamps the traces");
     engine.close();
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();

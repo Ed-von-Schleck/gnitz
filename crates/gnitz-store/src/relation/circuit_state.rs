@@ -54,7 +54,7 @@ impl CircuitState {
     pub fn open(reg: &RelationRegistry, view_id: u64, layout: &StateLayout) -> Result<Self, String> {
         let view = reg.relation_or_err(view_id)?;
         // The traces resume from the generation the output they feed resumed from.
-        let recovery = RecoverySource::Rederive { resume_at: view.table().loaded_mark() };
+        let recovery = RecoverySource::Rederive { resume_at: view.loaded_mark() };
         let tables = layout
             .children
             .iter()

@@ -397,6 +397,13 @@ impl Relation {
         self.table().live_row_at(key)
     }
 
+    /// The checkpoint mark this process's store of the relation resumed from;
+    /// `None` when its open loaded no manifest. A view's operator traces resume
+    /// at this mark. Panics when this process holds no store of the relation.
+    pub fn loaded_mark(&self) -> Option<u64> {
+        self.table().loaded_mark()
+    }
+
     /// Every secondary index on this relation, in registration order.
     pub fn indexes(&self) -> &[SecondaryIndex] {
         &self.indexes

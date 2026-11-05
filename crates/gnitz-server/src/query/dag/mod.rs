@@ -227,18 +227,37 @@ impl DagEngine {
 
     // ── Operator state ──────────────────────────────────────────────────
 
-    /// The operator state of every view `checkpointed` picks, each
-    /// opened on a miss: the round that stamps a view's output store stamps its
-    /// traces with it, run or not, so the next boot finds them at one generation.
+    /// The operator state a round at `generation` stamps, of every view
+    /// `checkpointed` picks: the round that stamps a view's output store stamps
+    /// its traces with it, run or not, so the next boot finds them at one
+    /// generation. A view whose state this process never opened has traces
+    /// untouched since they were published at the mark its output store resumed
+    /// from; when that mark is `generation` they are already stamped, so the
+    /// round leaves them closed, and otherwise opens them to restamp them.
     pub(crate) fn ephemeral_states<'a>(
         &'a mut self,
         registry: &RelationRegistry,
+        generation: u64,
         checkpointed: impl Fn(u64) -> bool,
     ) -> Result<Vec<&'a mut CircuitState>, String> {
-        let views = self.views.iter_mut().filter(|(&id, _)| checkpointed(id));
+        let stamped = |id: u64| {
+            registry
+                .relation(id)
+                .is_some_and(|r| r.loaded_mark() == Some(generation))
+        };
+        let views = self
+            .views
+            .iter_mut()
+            .filter(|(&id, v)| checkpointed(id) && (v.state.is_some() || !stamped(id)));
         views
             .map(|(&id, v)| open_state(&mut v.state, registry, id, v.code.vm.layout()))
             .collect()
+    }
+
+    /// Whether this process has opened view `view_id`'s operator state.
+    #[cfg(test)]
+    pub(crate) fn state_opened(&self, view_id: u64) -> bool {
+        self.views.get(&view_id).is_some_and(|v| v.state.is_some())
     }
 }
 

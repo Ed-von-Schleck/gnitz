@@ -34,7 +34,7 @@ impl CatalogEngine {
     pub(crate) fn flush_ephemeral_round(&mut self, generation: u64) -> Result<(), String> {
         let never = self.dag.never_resumed(&self.registry);
         let resumes = |id| !never.contains(&id);
-        let states = self.dag.ephemeral_states(&self.registry, resumes)?;
+        let states = self.dag.ephemeral_states(&self.registry, generation, resumes)?;
         self.registry.checkpoint_ephemeral(states, generation, resumes)
     }
 

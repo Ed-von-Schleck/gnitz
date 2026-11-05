@@ -177,7 +177,7 @@ impl RelationRegistry {
         self.relations
             .iter()
             .filter(|(_, entry)| entry.kind() == RelationKind::SystemCatalog)
-            .map(|(&id, entry)| (id, entry.table().loaded_mark().unwrap_or(0)))
+            .map(|(&id, entry)| (id, entry.loaded_mark().unwrap_or(0)))
             .collect()
     }
 
