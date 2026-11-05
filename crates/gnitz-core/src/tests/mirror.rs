@@ -219,7 +219,7 @@ impl Peer {
         self.send(&encode_frame(
             hdr,
             &blob.encode(),
-            Some(&schema.to_block()),
+            Some(schema.to_block()),
             Some(&ZSetBatch::new(&schema)),
         ));
     }

@@ -55,7 +55,29 @@ fn schema_survives_the_block_roundtrip() {
         &[4, 0],
     )
     .unwrap();
-    assert_eq!(Schema::from_block(&original.to_block()).unwrap(), original);
+    assert_eq!(Schema::from_block(original.to_block()).unwrap(), original);
+}
+
+/// The record is cached: a rename re-encodes it under the new name, and
+/// whether a schema's record is cached does not enter its equality.
+#[test]
+fn a_rename_re_encodes_the_cached_record() {
+    let mut schema = Schema::from_parts(
+        vec![
+            ColumnDef::new("id", TypeCode::U64, false),
+            ColumnDef::new("v", TypeCode::I64, true),
+        ],
+        &[0],
+    )
+    .unwrap();
+    let fresh = schema.clone();
+    let before = schema.to_block().to_vec();
+    assert_eq!(schema, fresh, "a cached record does not enter equality");
+    schema.rename_column(1, Arc::from("w"));
+    let renamed = Schema::from_block(schema.to_block()).unwrap();
+    assert_eq!(&*renamed.columns()[1].name, "w");
+    assert_ne!(schema.to_block(), &before[..]);
+    assert_eq!(Schema::from_block(fresh.to_block()).unwrap(), fresh);
 }
 
 /// The client's PK arity cap is `gnitz_wire::PK_LIST_MAX_COLS` — a key it accepts must

@@ -173,7 +173,7 @@ impl Request<'_> {
             Request::Push { target, schema, batch, mode } => {
                 let mut hdr = ControlHeader::naming(ClientVerb::Push, target, 0);
                 hdr.flags.conflict_mode = mode;
-                return append_payload(out, hdr, &[], Some(&schema.to_block()), Some(batch));
+                return append_payload(out, hdr, &[], Some(schema.to_block()), Some(batch));
             }
         };
         append_payload(out, ControlHeader::naming(verb, target, arg0), blob, None, None)
@@ -219,15 +219,13 @@ pub struct PushFamily {
 /// `out` (without the 4-byte frame header). Every family carries its schema
 /// record, which the master validates it against.
 pub(crate) fn append_push_txn(out: &mut Vec<u8>, families: &[PushFamily]) {
-    let schemas: Vec<Vec<u8>> = families.iter().map(|f| f.schema.to_block()).collect();
     let items: Vec<FrameItem> = families
         .iter()
-        .zip(&schemas)
-        .map(|(f, schema)| FrameItem {
+        .map(|f| FrameItem {
             target: f.target,
             conflict_mode: f.mode,
             basis: f.basis,
-            schema: Some(schema),
+            schema: Some(f.schema.to_block()),
             data: f.batch.wire_regions(),
         })
         .collect();

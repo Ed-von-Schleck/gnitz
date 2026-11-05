@@ -135,7 +135,7 @@ fn a_schema_block_on_a_read_reply_fails_the_slot_and_ends_the_session() {
     peer.send(&encode_frame(
         ControlHeader { target_id: 7, ..Default::default() },
         &[],
-        Some(&sa.to_block()),
+        Some(sa.to_block()),
         Some(&batch_a(&[5])),
     ));
     let e = await_reply(&mut s, sent).expect_err("a schema block on a read is a decode error");
@@ -556,7 +556,7 @@ fn a_delta_read_terminal_at_round_0_ends_the_session() {
 /// sections is the malformed one.
 #[test]
 fn a_resolve_reply_that_does_not_decode_ends_the_session() {
-    let schema = schema_a().to_block();
+    let schema = schema_a().to_block().to_vec();
     let named = ControlHeader { target_id: 7, ..Default::default() };
     for (what, frame) in [
         ("no schema block", encode_frame(named, &[], None, None)),
@@ -1025,7 +1025,7 @@ fn a_pushed_train_opener_that_is_not_bare_ends_the_session() {
         ),
         (
             "a schema block",
-            encode_frame(marker(bare, ok), &[], Some(&schema_a().to_block()), None),
+            encode_frame(marker(bare, ok), &[], Some(schema_a().to_block()), None),
         ),
         ("a blob", encode_frame(marker(bare, ok), b"why", None, None)),
         ("a continuation", encode_frame(marker(continued, ok), &[], None, None)),
@@ -1115,7 +1115,7 @@ fn a_frame_carries_its_schema_and_its_rows_unless_empty() {
         kv_rows(&[(1, 100, 1), (2, 200, 1), (3, 300, 1)]),
         ZSetBatch::new(&schema),
     ] {
-        let buf = encode_frame(hdr, &[], Some(&schema.to_block()), Some(&batch));
+        let buf = encode_frame(hdr, &[], Some(schema.to_block()), Some(&batch));
         let ctrl = peek_control_block(&buf).unwrap();
         assert_eq!(ctrl.hdr, hdr);
         assert_eq!(frame_schema(&buf, &ctrl).as_ref(), Some(&schema));

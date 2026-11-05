@@ -6,10 +6,32 @@ use std::sync::{Arc, OnceLock};
 
 use gnitz_wire::{ColumnDef, PkListRole, PkRule, PK_LIST_MAX_COLS};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Schema {
     columns: Vec<ColumnDef>,
     layout: SchemaDescriptor,
+    /// The meta-schema record of `columns` and the PK list, encoded on first
+    /// use. Every `&mut self` method that changes either resets it.
+    record: OnceLock<Arc<[u8]>>,
+}
+
+/// Equality is over the columns and the layout; whether the record is cached
+/// does not enter it.
+impl PartialEq for Schema {
+    fn eq(&self, o: &Schema) -> bool {
+        self.columns == o.columns && self.layout == o.layout
+    }
+}
+
+impl Eq for Schema {}
+
+impl std::fmt::Debug for Schema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Schema")
+            .field("columns", &self.columns)
+            .field("layout", &self.layout)
+            .finish()
+    }
 }
 
 impl Schema {
@@ -36,7 +58,7 @@ impl Schema {
                 SchemaRefusal::Pk(rule) => pk_refusal(rule),
                 other => other.to_string(),
             })?;
-        Ok(Schema { columns, layout })
+        Ok(Schema { columns, layout, record: OnceLock::new() })
     }
 
     pub fn columns(&self) -> &[ColumnDef] {
@@ -53,9 +75,10 @@ impl Schema {
         &self.layout
     }
 
-    /// A name carries no layout.
+    /// A name carries no layout, but the record carries it.
     pub fn rename_column(&mut self, ci: usize, name: Arc<str>) {
         self.columns[ci].name = name;
+        self.record = OnceLock::new();
     }
 
     /// The PK columns in PK-list order, hidden: the leading key of a reply that
@@ -84,9 +107,12 @@ impl Schema {
         self.columns.iter().enumerate().filter(|(_, c)| !c.is_hidden)
     }
 
-    /// This schema's meta-schema record — the bytes a schema-bearing push embeds.
-    pub fn to_block(&self) -> Vec<u8> {
-        gnitz_wire::schema_block::encode(self.columns.iter().map(ColumnDef::block_col), self.pk_cols())
+    /// This schema's meta-schema record — the bytes a schema-bearing push
+    /// embeds. Encoded once per schema; a clone shares it.
+    pub fn to_block(&self) -> &[u8] {
+        self.record.get_or_init(|| {
+            gnitz_wire::schema_block::encode(self.columns.iter().map(ColumnDef::block_col), self.pk_cols()).into()
+        })
     }
 
     /// The schema a meta-schema record describes.

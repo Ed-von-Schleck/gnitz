@@ -277,7 +277,7 @@ impl MirrorStore for Mirror {
         if let Some(old) = renamed {
             self.forget(old)?;
         }
-        let same = |r: &&mut MirrorRecord| r.block == block && r.pk_repeats == desc.pk_repeats;
+        let same = |r: &&mut MirrorRecord| *r.block == *block && r.pk_repeats == desc.pk_repeats;
         match self.records.get_mut(&tid).filter(same) {
             // A rename upstream keeps the id; a stale name here would match a
             // later view created under it.
@@ -298,7 +298,7 @@ impl MirrorStore for Mirror {
                     pk_repeats: desc.pk_repeats,
                     indexes,
                     feed: Feed::Empty,
-                    block,
+                    block: block.to_vec(),
                 };
                 self.enter(tid, rec, *desc.schema.layout(), None)?;
             }
