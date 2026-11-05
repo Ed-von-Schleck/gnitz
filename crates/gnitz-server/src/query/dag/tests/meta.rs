@@ -179,6 +179,41 @@ fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
     assert_eq!(steps(&mut dag), [(2, 1, false, false), (3, 1, true, false)]);
 }
 
+/// Steps relaying one producer by one scatter key share one round: the first
+/// runs it, the last is told no later step reads it, and it folds where any of
+/// them folds. Another key, or another
+/// producer, is a round of its own, and a step its view does not relay reads none.
+#[test]
+fn steps_relaying_one_producer_by_one_key_share_a_round() {
+    let by_v = [(1, gnitz_wire::TypeCode::I64)];
+    let by_id = [(0, gnitz_wire::TypeCode::U64)];
+    // `(view, producer)` → the key the view's scan of the producer relays by.
+    // View 3 folds what it gathers, so the round it shares gathers by merge.
+    let relay_key = |view: u64, producer: u64| -> RelayKey<'_> {
+        match (view, producer) {
+            (2 | 5, 1) => Some((&by_v, false)),
+            (3, 1) => Some((&by_v, true)),
+            (4, 1) => Some((&by_id, false)),
+            (5, 2) => Some((&by_v, false)),
+            _ => None,
+        }
+    };
+    let edges = vec![(2, 1), (3, 1), (4, 1), (5, 1), (5, 2), (6, 1)];
+    let relays: Vec<_> = schedule(edges, relay_key).iter().map(|s| s.relay).collect();
+    let slot = |at, last, fold| Some(RelaySlot { at, last, fold });
+    assert_eq!(
+        relays,
+        [
+            slot(0, false, true),
+            slot(0, false, true),
+            slot(1, true, false),
+            slot(0, true, true),
+            slot(2, true, false),
+            None
+        ]
+    );
+}
+
 /// A view scans only relations older than it: ticks and backfills take ascending
 /// id order as dependency order. The refusal links nothing.
 #[test]

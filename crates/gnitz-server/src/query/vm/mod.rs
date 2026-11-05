@@ -256,6 +256,12 @@ impl Vm {
             .any(|i| matches!(i.op, Op::Reduce { out_trace: Integral::Relation(..), .. }))
     }
 
+    /// Some instruction reads `reg` at net weights, so its batch is folded when
+    /// it stands.
+    pub(in crate::query) fn folds(&self, reg: DeltaReg) -> bool {
+        self.regs[reg.at()].fold
+    }
+
     /// An epoch seeding `reg` with an empty delta does nothing: it runs no
     /// exchange round.
     pub(in crate::query) fn idles_on_empty(&self, reg: DeltaReg) -> bool {

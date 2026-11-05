@@ -1,6 +1,7 @@
 //! The view-dependency graph and the closures over it.
 
 use super::*;
+use gnitz_wire::ReindexSlot;
 use std::collections::hash_map::Entry;
 
 /// One edge of a tick's schedule: `producer`'s output feeds `view`.
@@ -12,12 +13,37 @@ pub(super) struct Step {
     pub(super) last: bool,
     /// A later step reads `view`'s output.
     pub(super) needed: bool,
+    /// The tick's one round of `producer`'s delta that `view`'s relay reads,
+    /// where its scan of `producer` is relayed by a round.
+    pub(super) relay: Option<RelaySlot>,
 }
 
+/// One relay round of a tick, shared by every step relaying one producer's delta
+/// by one scatter key: the first of them runs it, and the rest read what it
+/// gathered. Fixed by the schedule and the plans alone, so every worker shares
+/// the same rounds.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) struct RelaySlot {
+    /// The round's index among the tick's relay rounds.
+    pub(super) at: usize,
+    /// No later step reads the round.
+    pub(super) last: bool,
+    /// Some step reading the round folds what it gathered, so it gathers by merge.
+    pub(super) fold: bool,
+}
+
+/// `(scatter key, folds)` of the round view `view` relays producer `producer`'s
+/// delta by: the key the round's plan is built from, and whether the view folds
+/// what it gathers. `None` where no round relays it.
+pub(super) type RelayKey<'k> = Option<(&'k [ReindexSlot], bool)>;
+
 /// `edges`, each `(view, producer)`, as one schedule. Sorting puts a view after every
-/// view it reads, because ids ascend along scan edges.
-fn schedule(mut edges: Vec<(u64, u64)>) -> Rc<[Step]> {
+/// view it reads, because ids ascend along scan edges. `relay_key`: each edge's
+/// relay round.
+fn schedule<'k>(mut edges: Vec<(u64, u64)>, relay_key: impl Fn(u64, u64) -> RelayKey<'k>) -> Rc<[Step]> {
     edges.sort_unstable();
+    // `(producer, key, folds)` of each round.
+    let mut rounds: Vec<(u64, &[ReindexSlot], bool)> = Vec::new();
     let mut steps: Vec<Step> = edges
         .into_iter()
         .map(|(view, producer)| Step {
@@ -25,11 +51,27 @@ fn schedule(mut edges: Vec<(u64, u64)>) -> Rc<[Step]> {
             producer,
             last: false,
             needed: false,
+            relay: relay_key(view, producer).map(|(key, fold)| {
+                let at = match rounds.iter().position(|&(p, k, _)| (p, k) == (producer, key)) {
+                    Some(at) => at,
+                    None => {
+                        rounds.push((producer, key, false));
+                        rounds.len() - 1
+                    }
+                };
+                rounds[at].2 |= fold;
+                RelaySlot { at, last: false, fold: false }
+            }),
         })
         .collect();
     let mut read: FxHashSet<u64> = FxHashSet::default();
+    let mut relayed: FxHashSet<usize> = FxHashSet::default();
     for step in steps.iter_mut().rev() {
         step.last = read.insert(step.producer);
+        if let Some(slot) = &mut step.relay {
+            slot.last = relayed.insert(slot.at);
+            slot.fold = rounds[slot.at].2;
+        }
     }
     for step in steps.iter_mut() {
         step.needed = read.contains(&step.view);
@@ -73,15 +115,24 @@ impl DepMap {
     /// One [`Step`] per dependency edge out of `source`'s forward closure, in
     /// execution order. A tick runs these every time, so they are derived once
     /// per shape of the graph.
-    fn tick_steps(&mut self, source: u64) -> Rc<[Step]> {
-        if let Some(steps) = self.tick_steps.get(&source) {
-            return Rc::clone(steps);
+    fn tick_steps<'k>(&mut self, source: u64, relay_key: impl Fn(u64, u64) -> RelayKey<'k>) -> Rc<[Step]> {
+        match self.tick_steps.get(&source) {
+            Some(steps) => Rc::clone(steps),
+            None => self.derive_tick_steps(source, relay_key),
         }
+    }
+
+    /// [`Self::tick_steps`] on a miss: derived and kept.
+    // Out of line: a tick reads the kept steps, and the derivation inlined into
+    // it costs every tick.
+    #[cold]
+    #[inline(never)]
+    fn derive_tick_steps<'k>(&mut self, source: u64, relay_key: impl Fn(u64, u64) -> RelayKey<'k>) -> Rc<[Step]> {
         let producers = std::iter::once(source).chain(closure(|id| self.forward_of(id).iter().copied(), [source]));
         let edges = producers
             .flat_map(|producer| self.forward_of(producer).iter().map(move |&view| (view, producer)))
             .collect();
-        let steps = schedule(edges);
+        let steps = schedule(edges, relay_key);
         self.tick_steps.insert(source, Rc::clone(&steps));
         steps
     }
@@ -120,7 +171,14 @@ impl DagEngine {
     /// `backfill` keeps it so), so no step reads a skipped producer.
     /// Worker-identical, which keeps the workers in lockstep.
     pub(super) fn tick_schedule(&mut self, source_id: u64) -> Rc<[Step]> {
-        let steps = self.dep.tick_steps(source_id);
+        let views = &self.views;
+        // A step's view scans its producer.
+        let relay_key = |view: u64, producer: u64| {
+            let code = &views.get(&view)?.code;
+            let scan = code.scan(producer);
+            Some((&*scan.relay.as_ref()?.key, code.vm.folds(scan.seed)))
+        };
+        let steps = self.dep.tick_steps(source_id, relay_key);
         match self.rebuild.is_empty() {
             true => steps,
             false => schedule(
@@ -129,6 +187,7 @@ impl DagEngine {
                     .filter(|s| !self.awaits_rebuild(s.view))
                     .map(|s| (s.view, s.producer))
                     .collect(),
+                relay_key,
             ),
         }
     }

@@ -38,7 +38,7 @@ fn route(plan: Option<&Rc<ScatterPlan>>) -> Route {
 
 /// The routes of sources 7 and 9.
 fn routes(meta: &ViewMeta) -> [Route; 2] {
-    [7, 9].map(|tid| route(meta.source_route(tid)))
+    [7, 9].map(|tid| route(meta.source_route(tid).map(|(plan, _)| plan)))
 }
 
 /// A range join: a pure range over a one-slot key, a band over a wider one.
@@ -290,7 +290,7 @@ fn a_source_routes_by_the_prefix_of_its_key_it_states() {
         (JoinKind::Equi, &[3, 4], &[3, 4]),
     ] {
         let meta = join_meta_in(kind, key, [false; 2], of_four([(7, wide_schema()), (9, wide_schema())]));
-        assert_routes_by(meta.source_route(7), &wide_schema(), routed);
+        assert_routes_by(meta.source_route(7).map(|(plan, _)| plan), &wide_schema(), routed);
     }
 }
 
@@ -311,7 +311,7 @@ fn an_owner_trimmed_source_routes_by_the_key_it_states() {
 
     let meta = trimmed(JoinKind::Equi, &[1], [base, replicated]);
     assert_eq!(routes(&meta), [Route::Keyed, Route::Stays]);
-    assert_routes_by(meta.source_route(7), &base.schema, &[1]);
+    assert_routes_by(meta.source_route(7).map(|(plan, _)| plan), &base.schema, &[1]);
 
     let meta = trimmed(RANGE, &[0], [base, base]);
     assert_eq!(
@@ -326,7 +326,7 @@ fn an_owner_trimmed_source_routes_by_the_key_it_states() {
         [Route::Keyed, Route::Broadcast],
         "a replicated copy is kept by key where it stands"
     );
-    assert_routes_by(meta.source_route(7), &replicated.schema, &[0]);
+    assert_routes_by(meta.source_route(7).map(|(plan, _)| plan), &replicated.schema, &[0]);
 }
 
 /// A source states one route however many reindexes name it, and none when it
@@ -342,8 +342,8 @@ fn a_source_routes_by_the_one_key_it_states() {
     let other = scan(&mut c, 20);
     c.union(joined, other);
     let meta = routing(&c, &of_four([(10, wide_schema()), (20, wide_schema())])).unwrap();
-    assert_routes_by(meta.source_route(10), &wide_schema(), &[2]);
-    assert_eq!(route(meta.source_route(20)), Route::Stays);
+    assert_routes_by(meta.source_route(10).map(|(plan, _)| plan), &wide_schema(), &[2]);
+    assert_eq!(route(meta.source_route(20).map(|(plan, _)| plan)), Route::Stays);
 }
 
 /// A `Map` between the scan and the reindex moves the key, so the route is read
@@ -358,7 +358,7 @@ fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
     let delta = c.map_reindex(moved, &[(2, TypeCode::I64)], &[0], role, NullKeys::Keep);
     join_with_own_trace(&mut c, delta, JoinKind::Equi);
     let meta = routing(&c, &of_four([(7, wide_schema())])).unwrap();
-    assert_routes_by(meta.source_route(7), &wide_schema(), &[5]);
+    assert_routes_by(meta.source_route(7).map(|(plan, _)| plan), &wide_schema(), &[5]);
 }
 
 /// A circuit is client-supplied, and workers route by its metadata mid-round,

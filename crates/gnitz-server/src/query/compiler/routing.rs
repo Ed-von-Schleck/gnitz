@@ -13,9 +13,10 @@ pub(super) struct ViewMeta {
     /// there is one worker.
     pub(super) self_contained: bool,
     /// source table id → the plan a worker relays the delta this source scatters
-    /// by: a share of it where the source is replicated, a round otherwise.
-    /// A source absent from it does not scatter; a self-contained view has none.
-    source_routes: FxHashMap<u64, Rc<ScatterPlan>>,
+    /// by — a share of it where the source is replicated, a round otherwise — and
+    /// the key it is built from, empty for a broadcast. A source absent from it
+    /// does not scatter; a self-contained view has none.
+    source_routes: FxHashMap<u64, (Rc<ScatterPlan>, ReindexKey)>,
     /// Per node, every worker computes the same rows into it: each relation
     /// behind it is replicated and reaches it whole, and nothing on the way trims
     /// or moves its rows.
@@ -50,7 +51,7 @@ impl ViewMeta {
         let has_replicated_partner =
             keyed().any(|(tid, ..)| replicated(tid)) && keyed().all(|(tid, u, _)| !replicated(tid) || !u.outside_join);
 
-        let mut source_routes: FxHashMap<u64, Rc<ScatterPlan>> = FxHashMap::default();
+        let mut source_routes: FxHashMap<u64, (Rc<ScatterPlan>, ReindexKey)> = FxHashMap::default();
         for (tid, use_, key) in keyed() {
             let source = sources[&tid];
             let partner_makes_every_match = has_replicated_partner
@@ -78,7 +79,7 @@ impl ViewMeta {
                     plan
                 }
             };
-            source_routes.insert(tid, Rc::new(plan));
+            source_routes.insert(tid, (Rc::new(plan), key.to_vec()));
         }
         // Kept only beside other workers; the loop above refuses a key no relay
         // could route by at any worker count.
@@ -95,11 +96,16 @@ impl ViewMeta {
         self.whole[nid]
     }
 
-    /// The plan a worker relays `source_id`'s delta into this view by, `None`
-    /// when that source does not scatter: its rows are already where the view
-    /// needs them, and a route would name a key they were never stored under.
-    pub(super) fn source_route(&self, source_id: u64) -> Option<&Rc<ScatterPlan>> {
-        self.source_routes.get(&source_id)
+    /// The plan a worker relays `source_id`'s delta into this view by, and the
+    /// key it is built from over the source's schema, empty for a broadcast —
+    /// two views relaying one source by equal keys relay it by equal plans.
+    /// `None` when that source does not scatter: its rows are already where the
+    /// view needs them, and a route would name a key they were never stored
+    /// under.
+    pub(super) fn source_route(&self, source_id: u64) -> Option<(&Rc<ScatterPlan>, &[gnitz_wire::ReindexSlot])> {
+        self.source_routes
+            .get(&source_id)
+            .map(|(plan, key)| (plan, key.as_slice()))
     }
 }
 

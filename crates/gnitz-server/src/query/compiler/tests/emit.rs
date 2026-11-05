@@ -267,13 +267,16 @@ fn a_view_store_stands_in_for_the_output_trace_of_the_output_node() {
 // ── A delta's relay ───────────────────────────────────────────────────────
 
 /// The relays of `build`'s plan over sources 7 and 9, as worker 0 of `of`:
-/// `(rounds, shares)`.
+/// `(rounds, shares)`, a source's relay round among the rounds.
 fn relays(of: u32, sources: [Source; 2], build: impl FnOnce(&mut Circuit)) -> (usize, usize) {
     let registry = sources_at(Slot::new(0, of), [(7, sources[0]), (9, sources[1])]);
-    let vm = plan(&registry, build).expect("the fixture compiles");
-    let rounds = vm.ops().filter(|op| matches!(op, Op::Round { .. })).count();
-    let shares = vm.ops().filter(|op| matches!(op, Op::Share(_))).count();
-    (rounds, shares)
+    let mut c = Circuit::default();
+    build(&mut c);
+    let out = compile(&c, &registry, false).expect("the fixture compiles");
+    let relayed = out.source_ids().filter(|&s| out.scan(s).relay.is_some()).count();
+    let rounds = out.vm.ops().filter(|op| matches!(op, Op::Round { .. })).count();
+    let shares = out.vm.ops().filter(|op| matches!(op, Op::Share(_))).count();
+    (relayed + rounds, shares)
 }
 
 /// A delta stays where its rows already are, is kept by share where every worker

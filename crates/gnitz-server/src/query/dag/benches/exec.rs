@@ -12,7 +12,8 @@ use super::tests::{base_rows, engine_with_views, register_count};
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    col_def, net_weight, register_identity_view, table_engine, try_register_view, u64_i64_cols, EchoDrive,
+    col_def, net_weight, push_and_tick, register_identity_view, table_engine, try_register_view, two_term_join_circuit,
+    u64_i64_cols, EchoDrive,
 };
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{Circuit, ReadBound, TypeCode};
@@ -103,6 +104,33 @@ fn drive_tick_bench() {
     assert_eq!(net_weight(&engine, counted), 1);
     for view in [grouped, distinct] {
         assert_eq!(net_weight(&engine, view), VALUES as i64, "view {view}");
+    }
+
+    // Four equi-joins of the source onto one other table, all on the source's
+    // `v`, beside three other workers: one round of the source a tick.
+    let (mut engine, base) = table_engine("dag_exec", "tick_bench_joins", 4, &u64_i64_cols());
+    let other = engine.create_table("public.u", &u64_i64_cols(), &[0]).unwrap();
+    let join_cols = [
+        col_def("k", TypeCode::I64),
+        col_def("t_id", TypeCode::U64),
+        col_def("u_id", TypeCode::U64),
+    ];
+    let joins: Vec<u64> = (0..4)
+        .map(|j| {
+            let circuit = two_term_join_circuit(base, other, TypeCode::I64);
+            try_register_view(&mut engine, circuit, &format!("j{j}"), &join_cols, 0, 0).unwrap()
+        })
+        .collect();
+    // One match per source row.
+    let keys: Vec<(u64, i64, i64)> = (0..VALUES).map(|id| (id, 1, id as i64)).collect();
+    push_and_tick(&mut engine, other, base_rows(&keys));
+    assert_eq!(
+        cells(&counter, "joined by 4", &mut engine, base),
+        1,
+        "one shared round a tick"
+    );
+    for view in joins {
+        assert_eq!(net_weight(&engine, view), all_rows, "view {view}");
     }
 
     // Wide ticks of a source one view reads and eight do, every reader but the

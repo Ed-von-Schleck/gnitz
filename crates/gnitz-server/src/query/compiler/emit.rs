@@ -40,11 +40,23 @@ pub(super) struct EmitCtx<'a> {
 }
 
 /// One scanned source: the register its delta seeds, the register its scans read — the
-/// seed's, or the relay's the source's route puts behind it — and its backfill bound.
+/// seed's, or the share the source's route puts behind it — and its backfill bound.
 pub(in crate::query) struct Scan {
     pub(in crate::query) seed: DeltaReg,
     reg: DeltaReg,
     pub(in crate::query) bound: ReadBound,
+    /// The exchange round the driver relays the source's delta by before it
+    /// seeds `seed`, where the route is one.
+    pub(in crate::query) relay: Option<Relay>,
+}
+
+/// A source's relay round: its plan, and the scatter key the plan is built from
+/// over the source's schema, empty for a broadcast. The round reads the
+/// source's delta alone, so equal keys over one source gather equal rows,
+/// whichever view relays them.
+pub(in crate::query) struct Relay {
+    pub(in crate::query) plan: Rc<ScatterPlan>,
+    pub(in crate::query) key: Box<[gnitz_wire::ReindexSlot]>,
 }
 
 impl<'a> EmitCtx<'a> {
@@ -224,13 +236,18 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<DeltaReg, St
                 return Ok(scan.reg);
             }
             let seed = ctx.prog.seed(relation.schema());
-            let reg = match ctx.meta.source_route(*tid) {
+            let route = ctx
+                .meta
+                .source_route(*tid)
+                .map(|(plan, key)| (Rc::clone(plan), key.into()));
+            let (reg, relay) = match route {
                 // Every worker already holds a replicated delta whole, and keeps its share.
-                Some(plan) => ctx.relay(seed, Rc::clone(plan), relation.placement().is_replicated()),
-                None => seed,
+                Some((plan, _)) if relation.placement().is_replicated() => (ctx.share(seed, plan), None),
+                Some((plan, key)) => (seed, Some(Relay { plan, key })),
+                None => (seed, None),
             };
             let bound = bound.clone();
-            ctx.sources.push((*tid, Scan { seed, reg, bound }));
+            ctx.sources.push((*tid, Scan { seed, reg, bound, relay }));
             Ok(reg)
         }
 

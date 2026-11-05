@@ -68,6 +68,10 @@ pub(crate) struct DagEngine {
     /// The batch each producer of the running tick has emitted, keyed by
     /// producer; empty between ticks, kept for its capacity.
     tick_outputs: FxHashMap<u64, Batch>,
+    /// What each relay round of the running tick gathered, indexed by
+    /// [`meta::RelaySlot`], from the round's run to its last reader; empty between
+    /// ticks, kept for its capacity.
+    tick_relays: Vec<Batch>,
 }
 
 impl DagEngine {

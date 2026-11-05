@@ -6,6 +6,7 @@ use crate::test_support::{
     col_def, cols_of, make_batch, make_schema_u64_i64, push_and_tick, register_identity_view, scan_all, scan_keyed,
     scratch_dir, table_engine, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, EchoDrive, RowKey,
 };
+use gnitz_store::relation::PkRule;
 use gnitz_wire::{AggDescriptor, Circuit, GroupAggs, ReadBound, TypeCode};
 use gnitz_zset::stream::ReducePlan;
 use std::collections::HashMap;
@@ -136,6 +137,78 @@ fn an_empty_tick_runs_every_round() {
     let mut host = EchoDrive::new(&mut engine);
     tick(&mut host, base, 1).unwrap();
     assert_eq!(host.rounds, 2, "one round per count, none for the identity");
+}
+
+/// `a ⋈ b` on their `v`, `a`'s side through a `DISTINCT` where `distinct`: a
+/// clamp folds the register `a`'s relay round writes, a plain re-key does not.
+fn join_on_v(a: u64, b: u64, distinct: bool) -> Circuit {
+    use gnitz_wire::{NullKeys, ReindexRole};
+    let mut circuit = Circuit::default();
+    let key = [(1, TypeCode::I64)];
+    let deltas = [(a, distinct), (b, false)].map(|(source, distinct)| {
+        let scan = circuit.input_delta(source, ReadBound::None);
+        let rows = match distinct {
+            true => circuit.distinct(scan),
+            false => scan,
+        };
+        let role = ReindexRole::ScatterKey { source_cols: vec![1] };
+        circuit.map_reindex(rows, &key, &[0], role, NullKeys::Keep)
+    });
+    circuit.join(deltas, deltas, gnitz_wire::JoinKind::Equi);
+    circuit
+}
+
+/// Tables `a` and `b`, `(id U64 PK, v I64)`, beside three other workers, and a
+/// [`join_on_v`] view per entry of `distinct`, in that order.
+fn joins_on_v(name: &str, distinct: &[bool]) -> (CatalogEngine, [u64; 2], Vec<u64>) {
+    let (mut engine, a) = table_engine("dag_exec", name, 4, &u64_i64_cols());
+    let b = engine.create_table("public.b", &u64_i64_cols(), &[0]).unwrap();
+    let cols = [
+        col_def("k", TypeCode::I64),
+        col_def("a_id", TypeCode::U64),
+        col_def("b_id", TypeCode::U64),
+    ];
+    let views = distinct
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| try_register_view(&mut engine, join_on_v(a, b, d), &format!("j{i}"), &cols, 0, 0).unwrap())
+        .collect();
+    (engine, [a, b], views)
+}
+
+/// Views relaying one source by one scatter key share one exchange round per
+/// tick, rows or none, and each holds what it holds when it runs its own round,
+/// weights included — the view that folds the round's rows among them, between
+/// two that do not.
+#[test]
+fn views_relaying_one_source_by_one_key_share_its_round() {
+    // `(source, rows)` of each tick.
+    let ticks: [(usize, &[_]); 5] = [
+        (1, &[(1, 1, 10), (2, 1, 20), (3, 1, 10)]),
+        (0, &[(1, 1, 10), (2, 1, 20), (4, 1, 30)]),
+        (0, &[(2, -1, 20)]),
+        (1, &[(3, -1, 10), (5, 1, 20)]),
+        (0, &[]),
+    ];
+    let shapes = [false, true, false];
+    let (mut engine, sources, views) = joins_on_v("shared_relay", &shapes);
+    for &(side, rows) in &ticks {
+        let mut host = EchoDrive::new(&mut engine);
+        host.cat
+            .ingest_unticked(sources[side], base_rows(rows), PkRule::Enforce)
+            .unwrap();
+        tick(&mut host, sources[side], 1).unwrap();
+        assert_eq!(host.rounds, 1, "one round of source {side} for every view");
+    }
+    for (i, (&view, &distinct)) in views.iter().zip(&shapes).enumerate() {
+        let (mut alone, sources, own) = joins_on_v(&format!("shared_relay_oracle_{i}"), &[distinct]);
+        for &(side, rows) in &ticks {
+            push_and_tick(&mut alone, sources[side], base_rows(rows));
+        }
+        let want = held(&mut alone, own[0]);
+        assert!(!want.is_empty(), "view {i} joins some row");
+        assert_eq!(held(&mut engine, view), want, "view {i}");
+    }
 }
 
 /// A view's backfill mints the ground row a global aggregate owes; a tick that
