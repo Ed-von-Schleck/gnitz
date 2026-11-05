@@ -253,6 +253,20 @@ fn async_rwlock_a_fresh_writer_queues_behind_a_woken_one() {
     assert!(try_poll_once(&mut queued).is_some(), "the woken writer acquires");
 }
 
+/// A guard is contended while a writer is parked behind it, and no longer once
+/// that writer drops.
+#[test]
+fn async_rwlock_a_guard_is_contended_while_a_writer_waits() {
+    let lock: AsyncRwLock = AsyncRwLock::default();
+    let read = try_poll_once(lock.read()).expect("a free lock admits a reader");
+    assert!(!read.contended(), "nothing waits on a lone reader");
+    let mut queued = Box::pin(lock.write());
+    assert!(try_poll_once(&mut queued).is_none(), "a held lock parks the writer");
+    assert!(read.contended(), "a parked writer waits on the reader");
+    drop(queued);
+    assert!(!read.contended(), "a dropped writer leaves the queue");
+}
+
 /// Dropping a writer queued between two others removes only its own entry: the
 /// first and the last still acquire in queue order.
 #[test]

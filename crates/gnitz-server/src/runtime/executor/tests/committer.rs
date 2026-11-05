@@ -20,17 +20,21 @@ fn push_of(rows: usize) -> CommitRequest {
 
 /// A write of one family per `(tid, rows)` of `families`.
 fn write(families: impl IntoIterator<Item = (u64, usize)>) -> PendingWrite {
-    let (done, _rx) = oneshot::channel();
-    PendingWrite {
-        families: (families.into_iter())
-            .map(|(tid, rows)| TxnFamily {
-                tid,
-                mode: WireConflictMode::Update,
-                rows: FamilyRows::Built(batch_of(rows)),
-            })
-            .collect(),
-        done,
-    }
+    let families: Vec<TxnFamily> = (families.into_iter())
+        .map(|(tid, rows)| TxnFamily {
+            tid,
+            mode: WireConflictMode::Update,
+            rows: FamilyRows::Built(batch_of(rows)),
+        })
+        .collect();
+    let rows = families.iter().map(|f| f.rows.view().len()).sum();
+    PendingWrite { families, waiter: waiter(rows).0 }
+}
+
+/// A client of a write of `rows` rows holding no table lock, and its reply.
+fn waiter(rows: usize) -> (Waiter, oneshot::Receiver<Result<u64, WireFault>>) {
+    let (done, rx) = oneshot::channel();
+    (Waiter { done, rows, held: HeldTables::default() }, rx)
 }
 
 /// A write of one family per entry of `family_rows`, to tables `1..`.
@@ -98,6 +102,24 @@ fn a_batch_ends_at_the_row_cap_or_an_end_request() {
     }
 }
 
+/// A drain that tops up a batch, as one behind an fdatasync in flight does,
+/// counts the rows the batch already holds towards the cap.
+#[test]
+fn a_top_up_drain_counts_the_rows_already_batched() {
+    let (tx, mut rx) = chan::unbounded();
+    for r in [push_of(1), push_of(1)] {
+        tx.send(r);
+    }
+    let CommitRequest::Write(held) = push_of(MAX_PENDING_ROWS) else {
+        unreachable!("a push is a write")
+    };
+    let mut writes = vec![held];
+    let first = rx.try_recv().expect("queued");
+    assert!(drain_ready_batch(&mut rx, first, &mut writes).is_none());
+    assert_eq!(writes.len(), 2, "the cap was reached before the first top-up");
+    assert_eq!(std::iter::from_fn(|| rx.try_recv()).count(), 1);
+}
+
 /// A pause holds the committer until its token drops, or until its caller is
 /// dropped before the committer parked.
 #[test]
@@ -134,13 +156,7 @@ fn a_merged_run_splits_back_into_its_writes() {
         .into_iter()
         .map(|pks| make_batch_raw(&schema, &pks.map(|pk| (pk, pk as i64 + 1, 0)).collect::<Vec<_>>()))
         .collect();
-    let (dones, mut rxs): (Vec<_>, Vec<_>) = parts
-        .iter()
-        .map(|part| {
-            let (done, rx) = oneshot::channel();
-            ((done, part.len()), rx)
-        })
-        .unzip();
+    let (waiters, mut rxs): (Vec<_>, Vec<_>) = parts.iter().map(|part| waiter(part.len())).unzip();
     let unit = CommitUnit {
         outcome: Outcome::Laid {
             families: vec![TxnFamily {
@@ -150,7 +166,7 @@ fn a_merged_run_splits_back_into_its_writes() {
             }],
             in_zone: false,
         },
-        dones: dones.into(),
+        waiters: waiters.into(),
     };
     let writes = unit.into_writes();
     assert_eq!(writes.len(), parts.len());
@@ -168,7 +184,7 @@ fn a_merged_run_splits_back_into_its_writes() {
             (7, rows(part.as_mem_batch())),
             "write {i}"
         );
-        w.done.send(Ok(i as u64));
+        w.waiter.done.send(Ok(i as u64));
     }
     for (i, rx) in rxs.iter_mut().enumerate() {
         assert_eq!(try_poll_once(rx), Some(Ok(i as u64)), "client {i}");
@@ -177,17 +193,13 @@ fn a_merged_run_splits_back_into_its_writes() {
 
 /// A unit answers every client it holds, a merged run's included: the zone
 /// LSN when it rode inside the zone, `0` when it did not, the error when it
-/// failed.
+/// failed. A laid unit's replies wait for the fdatasync; a failed unit's error
+/// does not.
 #[test]
 fn a_unit_answers_every_client() {
     let unit_of = |outcome: Outcome| {
-        let (rxs, dones): (Vec<_>, Vec<_>) = (0..3)
-            .map(|_| {
-                let (done, rx) = oneshot::channel();
-                (rx, (done, 1))
-            })
-            .unzip();
-        let unit = CommitUnit { outcome, dones: dones.into() };
+        let (waiters, rxs): (Vec<_>, Vec<_>) = (0..3).map(|_| waiter(1)).unzip();
+        let unit = CommitUnit { outcome, waiters: waiters.into() };
         (unit, rxs)
     };
     let laid = |in_zone| Outcome::Laid { families: Vec::new(), in_zone };
@@ -198,7 +210,21 @@ fn a_unit_answers_every_client() {
     ];
     for (i, (outcome, want)) in cases.into_iter().enumerate() {
         let (unit, mut rxs) = unit_of(outcome);
-        unit.resolve(9);
+        let mut replies = Vec::new();
+        unit.resolve(9, &mut replies);
+        if let Ok(lsn) = want {
+            assert_eq!(replies.len(), rxs.len(), "case {i}: one reply per client");
+            for (c, rx) in rxs.iter_mut().enumerate() {
+                assert!(
+                    try_poll_once(rx).is_none(),
+                    "case {i}, client {c}: answered before the fdatasync"
+                );
+            }
+            for (done, got) in replies {
+                assert_eq!(got, lsn, "case {i}");
+                done.send(Ok(got));
+            }
+        }
         for (c, rx) in rxs.iter_mut().enumerate() {
             let got = try_poll_once(rx).expect("answered").map_err(|_| ());
             assert_eq!(got, want, "case {i}, client {c}");
@@ -229,7 +255,7 @@ fn a_push_merges_behind_the_last_write_to_its_table() {
     let units: Vec<(Vec<u64>, Vec<usize>, usize)> = (s.units.iter())
         .map(|u| {
             let tids = u.laid().iter().map(|f| f.tid).collect();
-            let dones = u.dones.iter().map(|&(_, rows)| rows).collect();
+            let dones = u.waiters.iter().map(|w| w.rows).collect();
             (tids, dones, u.laid()[0].rows.view().len())
         })
         .collect();

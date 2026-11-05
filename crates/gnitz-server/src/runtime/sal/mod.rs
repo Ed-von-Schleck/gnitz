@@ -1082,6 +1082,21 @@ impl SalWriter {
     pub(crate) fn watermark(&self) -> u64 {
         self.watermark.get()
     }
+
+    /// `fdatasync` the log, fatal on failure: every group published before the
+    /// call is durable once it resolves. Publishing needs the writer lock, this
+    /// does not. The abort names the caller's location.
+    #[track_caller]
+    pub(crate) fn sync(&self, reactor: &Reactor) -> impl Future<Output = ()> {
+        let at = std::panic::Location::caller();
+        let done = reactor.fsync(self.log.file.as_fd());
+        async move {
+            let rc = done.await;
+            if rc < 0 {
+                gnitz_fatal_abort!("{at}: SAL fdatasync failed rc={rc}");
+            }
+        }
+    }
 }
 
 /// Sole write access. Dropping it wakes each worker a group written under it
@@ -1168,20 +1183,6 @@ impl<'a> SalExcl<'a> {
             last_member: None,
             zoned_push: false,
             committed: false,
-        }
-    }
-
-    /// `fdatasync` the log, fatal on failure: every group published before the
-    /// call is durable once it resolves. The abort names the caller's location.
-    #[track_caller]
-    pub(crate) fn sync(&self, reactor: &Reactor) -> impl Future<Output = ()> {
-        let at = std::panic::Location::caller();
-        let done = reactor.fsync(self.writer.log.file.as_fd());
-        async move {
-            let rc = done.await;
-            if rc < 0 {
-                gnitz_fatal_abort!("{at}: SAL fdatasync failed rc={rc}");
-            }
         }
     }
 

@@ -39,7 +39,7 @@ impl FkPresence {
         self.keys.insert(key);
     }
 
-    /// Apply a durable `batch` of the table: per key the batch's last row
+    /// Apply a committed `batch` of the table, laid out in the SAL: per key the batch's last row
     /// decides, as it does in the store. A retraction always evicts; only a
     /// small write's inserts are recorded, so a bulk load of the table costs
     /// nothing here.

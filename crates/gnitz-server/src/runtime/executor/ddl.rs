@@ -176,14 +176,13 @@ async fn commit_bundle(
             lease.acks().await;
         }
     }
-    let ((applied, zone_lsn), synced) = {
+    let (applied, zone_lsn) = {
         let mut excl = shared.dispatcher.sal().lock().await;
-        let written = shared
+        shared
             .dispatcher
-            .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(families, sink))?;
-        (written, excl.sync(shared.dispatcher.reactor()))
+            .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(families, sink))?
     };
-    synced.await;
+    shared.dispatcher.sal().sync(shared.dispatcher.reactor()).await;
     Ok(Committed { applied, zone_lsn, filter_seeds })
 }
 

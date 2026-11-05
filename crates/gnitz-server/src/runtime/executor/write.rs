@@ -62,18 +62,20 @@ pub(super) struct Writes {
     pub(super) checks: Checks,
 }
 
-/// The table locks one task holds: a guard on each of `tids`, the write guard
-/// when `exclusive`, else the read guard.
-struct HeldTables {
+/// The table locks one write holds: a guard on each of `tids`, the write guard
+/// when `exclusive`, else the read guard. The committer drops them once the
+/// write is laid out.
+#[derive(Default)]
+pub(super) struct HeldTables {
     tids: LockSet,
     exclusive: bool,
-    _guards: SmallVec<[TableGuard; 4]>,
+    guards: SmallVec<[TableGuard; 4]>,
 }
 
-/// One table lock's guard, held only to be dropped.
+/// One table lock's guard.
 enum TableGuard {
-    Read { _guard: ReadGuard },
-    Write { _guard: WriteGuard },
+    Read { guard: ReadGuard },
+    Write { guard: WriteGuard },
 }
 
 impl HeldTables {
@@ -83,6 +85,14 @@ impl HeldTables {
 
     fn holds_exclusive(&self, tid: u64) -> bool {
         self.exclusive && self.holds(tid)
+    }
+
+    /// Whether another write is parked on one of these locks.
+    pub(super) fn contended(&self) -> bool {
+        self.guards.iter().any(|g| match g {
+            TableGuard::Read { guard } => guard.contended(),
+            TableGuard::Write { guard } => guard.contended(),
+        })
     }
 }
 
@@ -112,11 +122,11 @@ impl Writes {
         for &tid in &tids {
             let lock = self.table_lock(tid);
             guards.push(match exclusive {
-                true => TableGuard::Write { _guard: lock.write().await },
-                false => TableGuard::Read { _guard: lock.read().await },
+                true => TableGuard::Write { guard: lock.write().await },
+                false => TableGuard::Read { guard: lock.read().await },
             });
         }
-        HeldTables { tids, exclusive, _guards: guards }
+        HeldTables { tids, exclusive, guards }
     }
 
     /// OCC: whether `tid` committed a write after `basis`. `held`'s write guard on
@@ -131,8 +141,8 @@ impl Writes {
 
     /// Record a committed write of `batch` to `tid` at commit LSN `lsn`: the
     /// validation caches, then `tid`'s commit LSN, raised to `lsn`. The
-    /// committer calls it before it answers the writer, which still holds its
-    /// table locks, so an OCC check of a later write to `tid` sees the raise.
+    /// committer calls it before it drops the writer's table locks, so an OCC
+    /// check of a later write to `tid` sees the raise.
     pub(super) fn committed(&self, cat: &CatalogEngine, tid: u64, batch: MemBatch<'_>, lsn: u64) {
         self.checks.committed(cat, tid, batch);
         let mut map = self.table_commit_lsn.borrow_mut();
@@ -261,13 +271,17 @@ pub(super) async fn handle_push_txn(shared: &Shared, mut buf: RecvBuf, ctrl: Dec
         }
         families.push(family);
     }
+    // The families hold the frame, so it is freed once they are laid out.
+    drop(frame);
     commit(shared, &catalog, families, &occ).await
 }
 
 /// Commit `families` as one write: the table locks, OCC, the bundle's
 /// validation, and the commit, whose families its deletes cascade to ride
 /// along. Every rejection is pre-SAL, so a fault or a conflict commits nothing.
-/// The committer raises each written table's commit LSN to the write's.
+/// The committer raises each written table's commit LSN to the write's and
+/// drops the table locks once the write is laid out; the answer comes at the
+/// fdatasync that covers it.
 ///
 /// `occ` is a transaction's OCC checks: each a table and the read basis its
 /// family was built from. The locks taken are [`Writes::table_locks`]'.
@@ -312,7 +326,7 @@ async fn commit(
         families.iter().all(|f| held.holds(f.tid)),
         "a commit bumps only tables whose lock it holds"
     );
-    shared.committer.write(families).await
+    shared.committer.write(families, held).await
 }
 
 /// Decode the `PUSH_TXN` frame `frame`, whose item list is at `body`, into its

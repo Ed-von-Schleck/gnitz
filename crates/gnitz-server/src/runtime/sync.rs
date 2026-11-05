@@ -235,6 +235,12 @@ impl RwLockInner {
         !self.has_writer && self.write_waiters.is_empty()
     }
 
+    /// A reader or a writer is parked on the lock. A cancelled reader's stale
+    /// waker counts too.
+    fn contended(&self) -> bool {
+        !self.read_waiters.is_empty() || !self.write_waiters.is_empty()
+    }
+
     /// Nobody holds the lock in either mode.
     fn free(&self) -> bool {
         !self.has_writer && self.readers == 0
@@ -324,6 +330,13 @@ pub(crate) struct ReadGuard<K = ()> {
     lock: AsyncRwLock<K>,
 }
 
+impl<K> ReadGuard<K> {
+    /// Whether a reader or a writer is parked behind this guard's lock.
+    pub(crate) fn contended(&self) -> bool {
+        self.lock.0.borrow().contended()
+    }
+}
+
 impl<K> Drop for ReadGuard<K> {
     fn drop(&mut self) {
         self.lock.release_read();
@@ -381,6 +394,13 @@ impl<K> Drop for WriteFuture<K> {
 
 pub(crate) struct WriteGuard<K = ()> {
     lock: AsyncRwLock<K>,
+}
+
+impl<K> WriteGuard<K> {
+    /// Whether a reader or a writer is parked behind this guard's lock.
+    pub(crate) fn contended(&self) -> bool {
+        self.lock.0.borrow().contended()
+    }
 }
 
 impl<K> Drop for WriteGuard<K> {
