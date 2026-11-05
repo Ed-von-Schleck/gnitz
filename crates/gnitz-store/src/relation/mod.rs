@@ -31,6 +31,7 @@ pub use dirs::{lock_data_dir, relation_dir, ChildAddr, ChildKind, DirLock};
 pub use disk_usage::{disk_usage, DiskUsage};
 use feed::Feed;
 use store::{not_held, Rows};
+pub use unique_pk::PkRule;
 
 // ---------------------------------------------------------------------------
 // Secondary index
@@ -205,8 +206,8 @@ pub enum RelationKind {
     /// upstream sources (it has none; recovery is LSN-gated SAL replay).
     SystemCatalog,
     /// User base table: durable, never rebuilt from upstream
-    /// sources; owns a DML-enforced PK, so `enforce_unique_pk` runs on every
-    /// ingest and its accumulated per-PK weight is always in {0, 1}.
+    /// sources; owns a DML-enforced PK, so every ingest is held to a
+    /// [`PkRule`] and its accumulated per-PK weight is always in {0, 1}.
     BaseTable,
     /// Materialised view, with its `WITH (…)` options: ephemeral, resumed from a
     /// generation-stamped manifest when the ephemeral checkpoint round left one.

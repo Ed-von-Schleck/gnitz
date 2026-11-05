@@ -4,6 +4,7 @@ use crate::runtime::sal::{
     epoch_word, Apply, GroupData, GroupTargets, SalGroup, SalMessageKind, SalWriter, PREFIX_BYTES,
 };
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
+use gnitz_store::relation::PkRule;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::encode_schema_block;
 
@@ -230,8 +231,8 @@ fn slot_damage_in_an_unzoned_group_does_not_stop_the_walk() {
     let record = encode_schema_block(batch.schema());
     let data = GroupData::Same(batch.wire_whole());
     let (member, stream) = (
-        SalGroup::push(TID, &record, data, GroupTargets::SILENT),
-        SalGroup::push(TID + 1, &record, data, GroupTargets::SILENT),
+        SalGroup::push(TID, PkRule::Enforce, &record, data, GroupTargets::SILENT),
+        SalGroup::push(TID + 1, PkRule::Enforce, &record, data, GroupTargets::SILENT),
     );
     let mut excl = log.excl();
     let mut scope = excl.begin("test");
@@ -265,7 +266,10 @@ impl SalWriter {
     /// A committed zone of one control-only `Push` group per target, carrying no
     /// rows: its LSN and every member's base.
     fn zone(&self, targets: &[u64]) -> (u64, Vec<u64>) {
-        let groups: Vec<SalGroup> = targets.iter().map(|&tid| SalGroup::new(Apply::Push { tid })).collect();
+        let groups: Vec<SalGroup> = targets
+            .iter()
+            .map(|&tid| SalGroup::new(Apply::Push { tid, rule: PkRule::Enforce }))
+            .collect();
         self.commit_zone(&groups)
     }
 
@@ -277,7 +281,15 @@ impl SalWriter {
         let record = encode_schema_block(batch.schema());
         let groups: Vec<SalGroup> = targets
             .iter()
-            .map(|&t| SalGroup::push(t, &record, GroupData::Each(&each), GroupTargets::SILENT))
+            .map(|&t| {
+                SalGroup::push(
+                    t,
+                    PkRule::Enforce,
+                    &record,
+                    GroupData::Each(&each),
+                    GroupTargets::SILENT,
+                )
+            })
             .collect();
         self.commit_zone(&groups)
     }

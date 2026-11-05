@@ -1,12 +1,13 @@
 //! The base-table write path, in instructions per pushed row: `enforce_unique_pk`
 //! against the store alone, and the registry's whole write of the push — as a
 //! table no view scans takes it, and as a scanned one does, above the cut and
-//! sealed after every push and after every [`TICK_ROWS`].
+//! sealed after every push and after every [`TICK_ROWS`]. A fresh arm's pushes
+//! are also written as a table no view scans takes them under [`PkRule::Fresh`].
 //!
 //! `cd crates && cargo test -p gnitz-store --release unique_pk_bench -- --ignored --nocapture --test-threads=1`
 
 use super::enforce_unique_pk;
-use crate::relation::{RelationKind, StoreConfig};
+use crate::relation::{PkRule, RelationKind, StoreConfig};
 use crate::storage::DEFAULT_RAM_TIER_BYTES;
 use crate::test_support::{
     make_schema_pk_u64_payload_string, make_schema_u64_i64, mix, relation_fixture_with, table_shards, u64_pk_schema,
@@ -76,7 +77,8 @@ fn unique_pk_bench() {
     let strings = make_schema_pk_u64_payload_string();
     let wide = wide_schema();
     const RAM: usize = DEFAULT_RAM_TIER_BYTES;
-    // Label, schema, RAM tier, the row of a push, effective rows per row pushed alone.
+    // Label, schema, RAM tier, the row of a push, effective rows per row pushed
+    // alone. An arm labelled "fresh" pushes each key once, never held.
     let arms: [(&str, SchemaDescriptor, usize, Row, u64); 13] = [
         ("fresh, ascending", ints, RAM, |s| (FRESH + s, 1, s), 1),
         ("fresh, scattered", ints, RAM, |s| (FRESH + scatter(s), 1, s), 1),
@@ -117,13 +119,22 @@ fn unique_pk_bench() {
 
     let counter = gnitz_foundation::perf::Counter::instructions();
     println!(
-        "{:<26} {:>5} | {:>9} {:>9} | {:>9} {:>9} | {:>9} {:>9}",
-        "instr/row", "push", "enforce", "write", "enforce", "seal/push", "enforce", "seal/tick"
+        "{:<26} {:>5} | {:>9} {:>9} | {:>9} {:>9} | {:>9} {:>9} | {:>11}",
+        "instr/row", "push", "enforce", "write", "enforce", "seal/push", "enforce", "seal/tick", "fresh write"
     );
     for (label, schema, tier, row, eff_per_row) in arms {
         for per in [1, 1000] {
-            // Rows between two seals; `None` is the table no view scans.
-            let cells = [None, Some(per), Some(TICK_ROWS)].map(|tick| {
+            let fresh = label.starts_with("fresh");
+            // Rows between two seals, `None` being the table no view scans, and
+            // the PK rule the write is held to.
+            let cells = [
+                Some((None, PkRule::Enforce)),
+                Some((Some(per), PkRule::Enforce)),
+                Some((Some(TICK_ROWS), PkRule::Enforce)),
+                fresh.then_some((None, PkRule::Fresh)),
+            ]
+            .map(|cell| {
+                let (tick, rule) = cell?;
                 let config = StoreConfig {
                     ram_tier_bytes: tier,
                     ..StoreConfig::default()
@@ -144,7 +155,7 @@ fn unique_pk_bench() {
                     eff_rows += eff.len() as u64;
                     drop(eff);
                     let ((), w) = counter.measure(|| match tick {
-                        None => r.ingest(TID, b).unwrap(),
+                        None => r.ingest_under(TID, b, rule).unwrap(),
                         Some(rows) => {
                             r.ingest_pending(TID, b).unwrap();
                             if push * per % rows == 0 {
@@ -160,10 +171,15 @@ fn unique_pk_bench() {
                     per > 1 || eff_rows == ROWS * eff_per_row,
                     "{label}: {eff_rows} effective rows"
                 );
-                [enforce, write].map(|instructions: u64| instructions as f64 / ROWS as f64)
+                Some([enforce, write].map(|instructions: u64| instructions as f64 / ROWS as f64))
             });
-            let [[e0, s0], [e1, s1], [e2, s2]] = cells;
-            println!("{label:<26} {per:>5} | {e0:>9.1} {s0:>9.1} | {e1:>9.1} {s1:>9.1} | {e2:>9.1} {s2:>9.1}");
+            let [Some([e0, s0]), Some([e1, s1]), Some([e2, s2]), fresh_write] = cells else {
+                unreachable!("every arm writes under the enforced rule")
+            };
+            let f = fresh_write.map_or("-".to_string(), |[_, w]| format!("{w:.1}"));
+            println!(
+                "{label:<26} {per:>5} | {e0:>9.1} {s0:>9.1} | {e1:>9.1} {s1:>9.1} | {e2:>9.1} {s2:>9.1} | {f:>11}"
+            );
         }
     }
 }

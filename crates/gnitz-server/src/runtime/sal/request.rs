@@ -10,6 +10,7 @@ use super::SalMessageKind;
 use crate::catalog::SysFamily;
 use crate::runtime::frame::WireMsg;
 use gnitz_store::read::Probe;
+use gnitz_store::relation::PkRule;
 use gnitz_wire::{ControlHeader, PkColList, PkListRole};
 
 /// A request answered with a reply train; its failure is a fault frame to the
@@ -73,8 +74,8 @@ pub(crate) enum Apply<'a> {
     DdlSync { family: SysFamily },
     /// The fill of each of `views`, in order, from the relations it scans.
     Backfill { views: Cow<'a, [u64]> },
-    /// The rows the group carries.
-    Push { tid: u64 },
+    /// The rows the group carries, a base table's held to `rule`.
+    Push { tid: u64, rule: PkRule },
     /// One tick per tid, at consecutive rounds from `first_round`.
     Tick { first_round: u64, tids: Cow<'a, [u64]> },
 }
@@ -98,7 +99,14 @@ impl SalRequest<'_> {
             SalRequest::Apply(Apply::Flush) => (K::Flush, 0, head),
             SalRequest::Apply(Apply::FlushEph { generation }) => (K::FlushEph, 0, WireMsg { arg0: generation, ..head }),
             SalRequest::Apply(Apply::DdlSync { family }) => (K::DdlSync, family.id(), head),
-            SalRequest::Apply(Apply::Push { tid }) => (K::Push, tid, head),
+            SalRequest::Apply(Apply::Push { tid, rule }) => (
+                K::Push,
+                tid,
+                WireMsg {
+                    arg0: u64::from(rule == PkRule::Fresh),
+                    ..head
+                },
+            ),
             SalRequest::Apply(Apply::Backfill { ref views }) => (
                 K::Backfill,
                 0,
@@ -179,7 +187,14 @@ impl<'a> SalRequest<'a> {
                 views: gnitz_wire::le_scalars(blob)?.into(),
             }
             .into(),
-            SalMessageKind::Push => Apply::Push { tid }.into(),
+            SalMessageKind::Push => Apply::Push {
+                tid,
+                rule: match gnitz_wire::bool_word(hdr.arg0)? {
+                    true => PkRule::Fresh,
+                    false => PkRule::Enforce,
+                },
+            }
+            .into(),
             SalMessageKind::Tick => Apply::Tick {
                 first_round: hdr.arg0,
                 tids: gnitz_wire::le_scalars(blob)?.into(),

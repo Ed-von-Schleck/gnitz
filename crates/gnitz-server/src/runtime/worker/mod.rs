@@ -172,10 +172,10 @@ impl<'c> WorkerProcess<'c> {
                 gnitz_debug!("ddl_sync tid={}", family.id());
                 Ok(())
             }
-            Apply::Push { tid } => {
+            Apply::Push { tid, rule } => {
                 let Some(rows) = rows else { return Ok(()) };
                 let row_count = rows.len();
-                self.catalog.ingest_unticked(tid, *rows)?;
+                self.catalog.ingest_unticked(tid, *rows, rule)?;
                 gnitz_debug!("push tid={} rows={}", tid, row_count);
                 Ok(())
             }

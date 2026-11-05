@@ -5,6 +5,7 @@ use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     pk_only_schema, pk_payload_schema, weighted_rows, zset_of,
 };
+use gnitz_store::relation::PkRule;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_wire::{peek_control_block, KeyRange, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode};
 use gnitz_zset::repr::Batch;
@@ -18,7 +19,8 @@ fn push(log: &SalWriter, batch: &Batch, placement: Placement, inspect: impl FnOn
     let record = encode_schema_block(batch.schema());
     with_routed(batch.as_mem_batch(), placement, log.num_workers(), |data| {
         inspect(&data);
-        log.excl().write(&SalGroup::push(16, &record, data, holders_of(&data)))
+        log.excl()
+            .write(&SalGroup::push(16, PkRule::Enforce, &record, data, holders_of(&data)))
     })
     .expect("group fits");
 }

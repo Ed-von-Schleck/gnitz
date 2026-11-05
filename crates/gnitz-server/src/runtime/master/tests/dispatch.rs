@@ -1,3 +1,4 @@
+use gnitz_store::relation::PkRule;
 use std::num::NonZero;
 
 use super::super::fixtures::test_dispatcher;
@@ -291,6 +292,7 @@ fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
         // no ACK is owed.
         let push = SalGroup::push(
             1,
+            PkRule::Enforce,
             &[],
             GroupData::Same(None),
             GroupTargets {

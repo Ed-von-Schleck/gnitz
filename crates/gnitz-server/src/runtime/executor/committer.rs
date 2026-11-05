@@ -10,6 +10,7 @@ use super::write::HeldTables;
 use super::Shared;
 use crate::runtime::signals;
 use crate::runtime::sync::{chan, oneshot};
+use gnitz_store::relation::PkRule;
 use gnitz_wire::{WireFault, WireStatus};
 use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashMap;
@@ -344,7 +345,7 @@ impl CommitUnit {
             let waiter = self.waiters.into_iter().next().expect("a unit answers one client");
             return vec![PendingWrite { families, waiter }];
         }
-        let TxnFamily { tid, mode, rows } = families.pop().expect("a merged run is one family");
+        let TxnFamily { tid, mode, rows, pk_rule } = families.pop().expect("a merged run is one family");
         let batch = rows.into_batch();
         let mut start = 0;
         (self.waiters.into_iter())
@@ -353,7 +354,7 @@ impl CommitUnit {
                 start += waiter.rows;
                 let rows = FamilyRows::Built(Batch::from_ranges(&batch, &[range], 0));
                 PendingWrite {
-                    families: vec![TxnFamily { tid, mode, rows }],
+                    families: vec![TxnFamily { tid, mode, rows, pk_rule }],
                     waiter,
                 }
             })
@@ -378,13 +379,17 @@ impl CommitUnit {
 /// under `merge` a one-family write joins the unit of the last write before it
 /// to its table when that is a one-family write too, so it moves past only
 /// writes to other tables. A unit's batches stay in arrival order, which is
-/// what makes intra-batch last-insert-wins mean last *inserted*.
+/// what makes intra-batch last-insert-wins mean last *inserted*. No unit a
+/// write merges into is held to [`PkRule::Fresh`]: such a write holds its
+/// table's exclusive lock until its unit resolves, after this, so no other
+/// write to the table is in the batch.
 fn build_units(s: &mut CommitScratch, merge: bool) {
     s.units.reserve(s.writes.len());
     for PendingWrite { families, waiter } in s.writes.drain(..) {
         if let ([f], true) = (&families[..], merge) {
             if let Some(&at) = s.last_unit.get(&f.tid) {
                 if matches!(s.units[at].laid(), [g] if g.tid == f.tid) {
+                    debug_assert!([f, &s.units[at].laid()[0]].iter().all(|g| g.pk_rule == PkRule::Enforce));
                     s.units[at].waiters.push(waiter);
                     s.tails[at].extend(families.into_iter().map(|f| f.rows));
                     continue;
@@ -457,7 +462,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
             let mut unit_in_zone = false;
             let written = scope.all_or_nothing(|scope| {
                 for f in unit.laid() {
-                    unit_in_zone |= disp.write_commit_group(scope, f.tid, f.rows.view())?;
+                    unit_in_zone |= disp.write_commit_group(scope, f.tid, f.pk_rule, f.rows.view())?;
                 }
                 Ok(())
             });

@@ -21,11 +21,7 @@ fn push_of(rows: usize) -> CommitRequest {
 /// A write of one family per `(tid, rows)` of `families`.
 fn write(families: impl IntoIterator<Item = (u64, usize)>) -> PendingWrite {
     let families: Vec<TxnFamily> = (families.into_iter())
-        .map(|(tid, rows)| TxnFamily {
-            tid,
-            mode: WireConflictMode::Update,
-            rows: FamilyRows::Built(batch_of(rows)),
-        })
+        .map(|(tid, rows)| TxnFamily::new(tid, WireConflictMode::Update, FamilyRows::Built(batch_of(rows))))
         .collect();
     let rows = families.iter().map(|f| f.rows.view().len()).sum();
     PendingWrite { families, waiter: waiter(rows).0 }
@@ -159,11 +155,11 @@ fn a_merged_run_splits_back_into_its_writes() {
     let (waiters, mut rxs): (Vec<_>, Vec<_>) = parts.iter().map(|part| waiter(part.len())).unzip();
     let unit = CommitUnit {
         outcome: Outcome::Laid {
-            families: vec![TxnFamily {
-                tid: 7,
-                mode: WireConflictMode::Update,
-                rows: FamilyRows::Built(Batch::concat(&schema, parts.iter().map(Batch::as_mem_batch))),
-            }],
+            families: vec![TxnFamily::new(
+                7,
+                WireConflictMode::Update,
+                FamilyRows::Built(Batch::concat(&schema, parts.iter().map(Batch::as_mem_batch))),
+            )],
             in_zone: false,
         },
         waiters: waiters.into(),

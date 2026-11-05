@@ -5,6 +5,7 @@
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
 use crate::catalog::{CatalogEngine, DdlBundle, SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
+use gnitz_store::relation::PkRule;
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_wire::{
     CatalogColumn, Circuit, CircuitRow, ColTabRow, ColumnDef, FkAction, FkRef, IdxTabRow, PkColList, SchemaTabRow,
@@ -357,7 +358,7 @@ impl crate::query::DriveHost for CatalogEngine {
 
 /// Push `rows` into `tid` and tick it, as a worker applies a push.
 pub fn push_and_tick(engine: &mut CatalogEngine, tid: u64, rows: Batch) {
-    engine.ingest_unticked(tid, rows).unwrap();
+    engine.ingest_unticked(tid, rows, PkRule::Enforce).unwrap();
     crate::query::tick(engine, tid, 1).unwrap();
 }
 

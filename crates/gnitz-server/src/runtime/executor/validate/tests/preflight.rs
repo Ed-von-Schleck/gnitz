@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{opk_pk, pk_only_schema, u64_i64_cols};
+use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk, pk_only_schema, u64_i64_cols};
 use gnitz_wire::TypeCode;
 
 /// A write to a parent referenced through its lone PK column probes nothing
@@ -10,7 +10,7 @@ fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
     use crate::runtime::master::fixtures::test_dispatcher;
     use crate::runtime::test_support::empty_catalog;
     use crate::runtime::test_support::try_poll_once;
-    use crate::test_support::{fk_child_cols, make_batch_raw};
+    use crate::test_support::fk_child_cols;
 
     let (_tmp, mut engine) = empty_catalog();
     let parent = engine.create_table("public.parent", &u64_i64_cols(), &[0]).unwrap();
@@ -22,11 +22,11 @@ fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
     let checks = Checks::new();
 
     let write = |rows: &[(u64, i64, i64)]| {
-        vec![TxnFamily {
-            tid: parent,
-            mode: WireConflictMode::Update,
-            rows: FamilyRows::Built(make_batch_raw(&schema, rows)),
-        }]
+        vec![TxnFamily::new(
+            parent,
+            WireConflictMode::Update,
+            FamilyRows::Built(make_batch_raw(&schema, rows)),
+        )]
     };
     let mut upsert = write(&[(1, 1, 10), (2, 1, 20)]);
     assert!(matches!(
@@ -113,11 +113,7 @@ fn a_unique_index_refuses_exactly_the_spans_two_surviving_rows_claim() {
             bb.put_opt_int(v.map(|v| v as u128));
             bb.end_row();
         }
-        TxnFamily {
-            tid,
-            mode: WireConflictMode::Update,
-            rows: FamilyRows::Built(bb.finish()),
-        }
+        TxnFamily::new(tid, WireConflictMode::Update, FamilyRows::Built(bb.finish()))
     };
     let refused = |fams: &[Rows<'_>]| {
         let mut families: Vec<TxnFamily> = fams.iter().map(|&r| family(r)).collect();
@@ -192,4 +188,31 @@ fn a_unique_index_refuses_exactly_the_spans_two_surviving_rows_claim() {
     }
 
     disp.into_catalog().close();
+}
+
+/// Only a lone Error family of positive weights is held fresh: an Update
+/// family, a retraction, and a second family to the same table each keep the
+/// enforced rule.
+#[test]
+fn only_a_lone_positive_error_family_is_fresh() {
+    let family = |tid, mode, weights: &[i64]| {
+        let rows: Vec<(u64, i64, i64)> = weights.iter().enumerate().map(|(i, &w)| (i as u64, w, 0)).collect();
+        TxnFamily::new(
+            tid,
+            mode,
+            FamilyRows::Built(make_batch_raw(&make_schema_u64_i64(), &rows)),
+        )
+    };
+    let mut families = vec![
+        family(1, WireConflictMode::Error, &[1, 1]),
+        family(2, WireConflictMode::Update, &[1]),
+        family(3, WireConflictMode::Error, &[1, -1]),
+        family(4, WireConflictMode::Error, &[1]),
+        family(4, WireConflictMode::Error, &[1]),
+        family(5, WireConflictMode::Error, &[]),
+    ];
+    mark_fresh(&mut families);
+    let rules: Vec<PkRule> = families.iter().map(|f| f.pk_rule).collect();
+    use PkRule::{Enforce, Fresh};
+    assert_eq!(rules, [Fresh, Enforce, Enforce, Enforce, Enforce, Fresh]);
 }

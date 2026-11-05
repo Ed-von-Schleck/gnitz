@@ -1,3 +1,4 @@
+use gnitz_store::relation::PkRule;
 use std::num::NonZeroU64;
 
 use super::*;
@@ -18,7 +19,8 @@ fn every_request() -> Vec<SalRequest<'static>> {
         Apply::FlushEph { generation: 11 }.into(),
         Apply::DdlSync { family: SysFamily::Sequence }.into(),
         Apply::Backfill { views: vec![13, 14].into() }.into(),
-        Apply::Push { tid: 15 }.into(),
+        Apply::Push { tid: 15, rule: PkRule::Enforce }.into(),
+        Apply::Push { tid: 50, rule: PkRule::Fresh }.into(),
         Apply::Tick {
             first_round: 16,
             tids: vec![17, 18].into(),
@@ -79,6 +81,7 @@ fn every_request_decodes_from_its_written_group() {
     let mut groups: Vec<SalGroup> = every_request().into_iter().map(SalGroup::new).collect();
     groups.push(SalGroup::push(
         15,
+        PkRule::Fresh,
         &record,
         GroupData::Same(batch.wire_whole()),
         GroupTargets::SILENT,
@@ -117,6 +120,13 @@ fn every_request_decodes_from_its_written_group() {
 fn a_blob_of_the_wrong_width_is_refused() {
     let hdr = ControlHeader::default();
     assert!(SalRequest::decode(SalMessageKind::Tick, 0, &hdr, &[0u8; 12]).is_err());
+}
+
+/// A `Push` group's rule word is 0 or 1.
+#[test]
+fn a_push_rule_no_group_writes_is_refused() {
+    let hdr = ControlHeader { arg0: 2, ..Default::default() };
+    assert!(SalRequest::decode(SalMessageKind::Push, 15, &hdr, &[]).is_err());
 }
 
 /// A `HasPk` group's arguments must be the ones its probe kind writes.

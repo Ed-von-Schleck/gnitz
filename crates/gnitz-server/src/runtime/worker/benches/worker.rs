@@ -6,6 +6,7 @@ use crate::test_support::{
 };
 use gnitz_foundation::perf::Counter;
 use gnitz_store::relation::IndexClaim;
+use gnitz_store::relation::PkRule;
 use gnitz_wire::{PkColList, PkKeys, ReadBound, ReadSpec, WireStatus};
 
 /// Requests an arm writes, unless it says otherwise: no more ACKs than an ACK
@@ -77,7 +78,8 @@ fn worker_request_bench() {
     let n = REQUESTS as usize;
     let bare = |_: &mut CatalogEngine, _: u64| ();
 
-    let ack = |excl: &mut SalExcl, tid, _: &[u8], id| excl.write(&addressed(Apply::Push { tid }, id));
+    let ack =
+        |excl: &mut SalExcl, tid, _: &[u8], id| excl.write(&addressed(Apply::Push { tid, rule: PkRule::Enforce }, id));
     arm("ack", 0, bare, REQUESTS, ack, n, 0);
 
     let one_row = |excl: &mut SalExcl, tid, record: &[u8], id: u32| {

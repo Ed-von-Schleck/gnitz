@@ -4,6 +4,7 @@ use crate::test_support::{
     col_def, make_batch, make_schema_u64_i64, push_and_tick, scan_all, scratch_dir, table_engine,
     try_register_identity_view, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, RowKey,
 };
+use gnitz_store::relation::PkRule;
 use gnitz_wire::TypeCode;
 use std::collections::HashMap;
 
@@ -28,7 +29,7 @@ fn a_relation_seed_reads_the_source_as_of_its_last_tick() {
 
     // Row 8 lies outside every gathered key below.
     let pushed = make_batch(&schema, &[(3, -1, 30), (5, -1, 50), (5, 1, 55), (8, -1, 80)]);
-    engine.ingest_unticked(tid, pushed).unwrap();
+    engine.ingest_unticked(tid, pushed, PkRule::Enforce).unwrap();
     let expect = |rows: &[(u64, i64, i64)]| zset_of(&make_batch(&schema, rows), &schema);
     assert_eq!(hydrate(&mut engine, view, &[3, 5]), expect(&[(3, 1, 30), (5, 1, 50)]));
     assert_eq!(hydrate(&mut engine, view, &[5]), expect(&[(5, 1, 50)]));

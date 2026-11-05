@@ -1,10 +1,12 @@
-use super::enforce_unique_pk;
+use super::{enforce_unique_pk, under_pk_rule, PkRule};
 use crate::storage::flush_barrier;
 use crate::test_support::{
     make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_string, opk_pk, payload0_i64, pk_payload_schema,
     scratch_table, table_shards, zset_of,
 };
 use gnitz_wire::TypeCode;
+use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::SchemaDescriptor;
 
 /// `(key index, weight, payload)`.
 type Row = (usize, i64, i64);
@@ -68,12 +70,7 @@ const SCRIPT: &[Step] = &[
         &[(5, 1, 1), (7, 1, 3)],
         &[(5, 1, Some(1)), (6, 0, None), (7, 1, Some(3))],
     ),
-    (
-        "identical upsert",
-        &[(7, 1, 3)],
-        &[(7, -1, 3), (7, 1, 3)],
-        &[(7, 1, Some(3))],
-    ),
+    ("identical upsert", &[(7, 1, 3)], &[], &[(7, 1, Some(3))]),
     (
         "fresh passthrough",
         &[(10, 1, 1), (8, 1, 2), (9, 1, 3)],
@@ -84,7 +81,8 @@ const SCRIPT: &[Step] = &[
 
 /// One script of pushes, run at every PK shape, its stored rows in RAM and in
 /// shards. Every key's net weight stays in `{0, 1}`, and the effective batch is
-/// exactly the script's, row for row.
+/// exactly the script's, row for row: an update that rewrites a row unchanged
+/// cancels to nothing.
 #[test]
 fn enforce_unique_pk_holds_at_every_pk_shape() {
     type Key = fn(usize) -> Vec<u128>;
@@ -199,11 +197,74 @@ fn enforce_unique_pk_ordered_walk_matches_map() {
             zset_of(&from_walk, &schema),
             "round {round}: {rows:?}"
         );
-        assert_eq!(from_map.len(), from_walk.len(), "round {round}: effective row count");
+        // The walk's batch is claimed consolidated, which a debug build verifies.
+        assert!(from_walk.is_consolidated(), "round {round}: walk output unconsolidated");
+        assert_eq!(
+            from_map.into_consolidated().len(),
+            from_walk.len(),
+            "round {round}: effective row count"
+        );
         pt.ingest(from_walk).unwrap();
         if round % 50 == 49 {
             flush_barrier([&mut pt], 0).unwrap();
         }
     }
     assert!(unordered_pushes > 200, "{unordered_pushes} pushes took the map");
+}
+
+/// A store holding keys `0..4`, and the OPK of keys `0..8`.
+fn fresh_fixture() -> (tempfile::TempDir, crate::storage::Table, SchemaDescriptor, Vec<Vec<u8>>) {
+    let schema = pk_payload_schema(&[TypeCode::U64]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut pt = scratch_table(dir.path(), schema);
+    let k: Vec<Vec<u8>> = (0..8u128).map(|i| opk_pk(&schema, &[i])).collect();
+    let held: Vec<(&[u8], i64, i64)> = (0..4).map(|i| (&k[i][..], 1, i as i64)).collect();
+    pt.ingest(make_batch_opk(&schema, &held)).unwrap();
+    (dir, pt, schema, k)
+}
+
+/// A batch of `rows`, `(key index, weight, payload)`, over keys `k`.
+fn rows_of(schema: &SchemaDescriptor, k: &[Vec<u8>], rows: &[Row]) -> Batch {
+    let rows: Vec<(&[u8], i64, i64)> = rows.iter().map(|&(i, w, v)| (&k[i][..], w, v)).collect();
+    make_batch_opk(schema, &rows)
+}
+
+/// On a batch whose keys are distinct, weighted 1 and not held — unsorted
+/// too — the fresh rule's effective batch is the enforced rule's.
+#[test]
+fn fresh_rule_matches_enforce_on_fresh_keys() {
+    let (_dir, pt, schema, k) = fresh_fixture();
+    for rows in [&[(6, 1, 60), (4, 1, 40), (7, 1, 70)][..], &[(5, 1, 50)], &[]] {
+        let fresh = under_pk_rule(&pt, rows_of(&schema, &k, rows), PkRule::Fresh);
+        let enforced = under_pk_rule(&pt, rows_of(&schema, &k, rows), PkRule::Enforce);
+        assert_eq!(zset_of(&fresh, &schema), zset_of(&enforced, &schema), "{rows:?}");
+        assert_eq!(fresh.len(), rows.len(), "{rows:?}");
+    }
+}
+
+/// A debug build refuses a batch admitted as fresh that meets a held key.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "admitted as fresh")]
+fn fresh_rule_refuses_a_held_key() {
+    let (_dir, pt, schema, k) = fresh_fixture();
+    under_pk_rule(&pt, rows_of(&schema, &k, &[(5, 1, 50), (2, 1, 20)]), PkRule::Fresh);
+}
+
+/// A debug build refuses a batch admitted as fresh that repeats a key.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "admitted as fresh")]
+fn fresh_rule_refuses_a_repeated_key() {
+    let (_dir, pt, schema, k) = fresh_fixture();
+    under_pk_rule(&pt, rows_of(&schema, &k, &[(5, 1, 50), (5, 1, 51)]), PkRule::Fresh);
+}
+
+/// A debug build refuses a batch admitted as fresh that weighs a row other than 1.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "admitted as fresh")]
+fn fresh_rule_refuses_a_weight_other_than_one() {
+    let (_dir, pt, schema, k) = fresh_fixture();
+    under_pk_rule(&pt, rows_of(&schema, &k, &[(5, 2, 50)]), PkRule::Fresh);
 }

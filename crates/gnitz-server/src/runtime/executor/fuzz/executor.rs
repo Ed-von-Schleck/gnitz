@@ -189,7 +189,7 @@ impl Session {
     /// Ingest every one of `families`, which the master admitted, and tick each.
     fn ingest(&mut self, families: Vec<TxnFamily>) {
         for f in families {
-            if self.cat.ingest_unticked(f.tid, f.rows.into_batch()).is_ok() {
+            if self.cat.ingest_unticked(f.tid, f.rows.into_batch(), f.pk_rule).is_ok() {
                 self.filled.insert(f.tid);
                 self.tick(f.tid);
             }

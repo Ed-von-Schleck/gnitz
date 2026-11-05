@@ -11,6 +11,7 @@
 
 use super::*;
 use gnitz_foundation::perf;
+use gnitz_store::relation::PkRule;
 use gnitz_wire::{AggDescriptor, AggFunc, Circuit, GroupAggs, ReadBound};
 
 /// Base rows a table-sourced fixture loads before its view is created.
@@ -19,7 +20,7 @@ const ROWS: u64 = 1_000_000;
 /// One tick of `source` over `rows`, pushed as a worker applies them; the
 /// instructions the tick took, its seal among them.
 fn tick(engine: &mut CatalogEngine, counter: &perf::Counter, source: u64, rows: Batch) -> u64 {
-    engine.ingest_unticked(source, rows).unwrap();
+    engine.ingest_unticked(source, rows, PkRule::Enforce).unwrap();
     let (res, instructions) = counter.measure(|| crate::query::tick(engine, source, 1));
     res.unwrap();
     instructions

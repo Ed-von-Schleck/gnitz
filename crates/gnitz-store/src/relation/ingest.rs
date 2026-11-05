@@ -2,6 +2,7 @@
 //! delta capture, the seal, and the checkpoint rounds.
 
 use super::store::{not_held, Rows};
+use super::unique_pk::{under_pk_rule, PkRule};
 use super::{CircuitState, Relation, RelationKind, RelationRegistry, SecondaryIndex};
 use crate::storage::Table;
 use gnitz_zset::repr::{Batch, StorageError};
@@ -54,9 +55,9 @@ impl Relation {
     }
 
     /// Apply `batch` to this relation's store and its index projections where
-    /// `landing` puts it; the batch as applied comes back iff it asks for an echo
-    /// and the batch holds a row.
-    fn apply(&mut self, batch: Batch, landing: Landing) -> Result<Option<Batch>, String> {
+    /// `landing` puts it, a base table's under `rule`; the batch as applied
+    /// comes back iff it asks for an echo and the batch holds a row.
+    fn apply(&mut self, batch: Batch, landing: Landing, rule: PkRule) -> Result<Option<Batch>, String> {
         let Relation { spec, rows, indexes } = self;
         let id = spec.id;
         // Checked, not asserted: the append path sizes by the destination's region
@@ -84,7 +85,7 @@ impl Relation {
         };
         let kind = spec.kind;
         let mut effective = match kind.is_base_table() {
-            true => super::unique_pk::enforce_unique_pk(table, batch),
+            true => under_pk_rule(table, batch, rule),
             false => batch,
         };
         // Folded once for every reader below — the indexes, the store, the delta
@@ -141,6 +142,12 @@ impl RelationRegistry {
     /// writes nothing, holding no rows.
     #[inline]
     pub fn ingest(&mut self, id: u64, batch: Batch) -> Result<(), String> {
+        self.ingest_under(id, batch, PkRule::Enforce)
+    }
+
+    /// [`Self::ingest`], a base table's under `rule`.
+    #[inline]
+    pub fn ingest_under(&mut self, id: u64, batch: Batch, rule: PkRule) -> Result<(), String> {
         let relation = self.relation_mut_or_err(id)?;
         // Rows left above the cut would stay there: nothing seals a relation no
         // view reads.
@@ -148,7 +155,7 @@ impl RelationRegistry {
             relation.seal()?;
         }
         relation
-            .apply(batch, Landing::Cut { round: None, echo: false })
+            .apply(batch, Landing::Cut { round: None, echo: false }, rule)
             .map(drop)
     }
 
@@ -157,11 +164,17 @@ impl RelationRegistry {
     /// A view is refused.
     #[inline]
     pub fn ingest_pending(&mut self, id: u64, batch: Batch) -> Result<(), String> {
+        self.ingest_pending_under(id, batch, PkRule::Enforce)
+    }
+
+    /// [`Self::ingest_pending`], a base table's under `rule`.
+    #[inline]
+    pub fn ingest_pending_under(&mut self, id: u64, batch: Batch, rule: PkRule) -> Result<(), String> {
         let relation = self.relation_mut_or_err(id)?;
         if relation.kind().is_view() {
             return Err(format!("relation {id} is a view: its rows land only at the cut"));
         }
-        relation.apply(batch, Landing::Pending).map(drop)
+        relation.apply(batch, Landing::Pending, rule).map(drop)
     }
 
     /// [`Self::ingest`], without its seal of pending rows (a view holds none:
@@ -171,7 +184,7 @@ impl RelationRegistry {
     #[inline]
     pub fn ingest_round(&mut self, id: u64, batch: Batch, round: u64, echo: bool) -> Result<Option<Batch>, String> {
         let landing = Landing::Cut { round: Some(round), echo };
-        self.relation_mut_or_err(id)?.apply(batch, landing)
+        self.relation_mut_or_err(id)?.apply(batch, landing, PkRule::Enforce)
     }
 
     /// Move `id`'s cut past every row ingested as pending since the last seal,

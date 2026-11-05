@@ -60,11 +60,11 @@ fn preflight_probe_bench() {
             if unique {
                 checks.unique_filter_seed(tid, PkColList::from_slice(&[1]), UniqueFilter::new());
             }
-            let mut families = vec![TxnFamily {
+            let mut families = vec![TxnFamily::new(
                 tid,
-                mode: WireConflictMode::Error,
-                rows: FamilyRows::Built(inserted),
-            }];
+                WireConflictMode::Error,
+                FamilyRows::Built(inserted),
+            )];
             let mut validate = || counter.measure(|| try_poll_once(checks.validate_txn(&disp, &mut families)));
             validate(); // the fold's and the scatter's first allocations
             let (verdict, instructions) = validate();
@@ -119,11 +119,11 @@ fn preflight_sink_bench() {
             gnitz_zset_testkit::Rng::new(0x9E37_79B9_7F4A_7C15).shuffle(&mut ids);
         }
         let upserts: Vec<_> = ids.iter().map(|&i| (i, 1, (i + 1_000_000) as i64)).collect();
-        let families = vec![TxnFamily {
-            tid: parent,
-            mode: WireConflictMode::Update,
-            rows: FamilyRows::Built(make_batch_raw(&schema, &upserts)),
-        }];
+        let families = vec![TxnFamily::new(
+            parent,
+            WireConflictMode::Update,
+            FamilyRows::Built(make_batch_raw(&schema, &upserts)),
+        )];
         let frames: Vec<Batch> = (0..4)
             .map(|w| {
                 let replies: Vec<_> = (0..rows).filter(|i| i % 4 == w).map(|i| (i, 1, i as i64)).collect();

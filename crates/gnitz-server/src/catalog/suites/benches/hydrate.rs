@@ -7,6 +7,7 @@
 //! ```
 
 use gnitz_store::read::ReadRows;
+use gnitz_store::relation::PkRule;
 use std::hint::black_box;
 
 use super::*;
@@ -144,7 +145,7 @@ fn hydrate_seek_bench() {
     // Each upsert takes effect as a retraction and an insert.
     let ids = key - UNTICKED_IDS / 2..key + UNTICKED_IDS / 2;
     let upserts = rows(&engine, base, 1, ids, |id| payload(id).map(|c| c.wrapping_add(1)));
-    engine.ingest_unticked(base, upserts).unwrap();
+    engine.ingest_unticked(base, upserts, PkRule::Enforce).unwrap();
     seek("single-key seek, unticked base", &mut engine);
     discard(engine);
 }

@@ -13,6 +13,7 @@ use crate::test_support::{
 };
 use gnitz_store::read::Probe;
 use gnitz_store::read::ReadRows;
+use gnitz_store::relation::PkRule;
 use gnitz_wire::{peek_control_block, DecodedControl, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode, WireStatus};
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::schema::SchemaDescriptor;
@@ -106,7 +107,13 @@ pub(super) fn push<'a>(tid: u64, record: &'a [u8], rows: &'a Batch, request_id: 
         reply: RequestId::from_wire(request_id),
         ..GroupTargets::SILENT
     };
-    SalGroup::push(tid, record, GroupData::Same(rows.wire_whole()), targets)
+    SalGroup::push(
+        tid,
+        PkRule::Enforce,
+        record,
+        GroupData::Same(rows.wire_whole()),
+        targets,
+    )
 }
 
 /// One published ring message: its ring-prefix request id, control block and
@@ -233,7 +240,7 @@ fn in_wait_dispositions() {
         addressed(scan(tid, &schema), 3),
         addressed(spans, 4),
         probe(tid, &[], 5),
-        addressed(Apply::Push { tid }, 6),
+        addressed(Apply::Push { tid, rule: PkRule::Enforce }, 6),
         ddl,
         addressed(Apply::Flush, 7),
     ];
@@ -690,7 +697,7 @@ fn a_train_advances_with_every_request() {
     for _ in 0..GROUPS {
         // Control-only and unanswered: nothing of its own reaches the ring.
         sal.excl()
-            .write(&SalGroup::new(Apply::Push { tid }))
+            .write(&SalGroup::new(Apply::Push { tid, rule: PkRule::Enforce }))
             .expect("group fits");
     }
     wp.drain_sal();

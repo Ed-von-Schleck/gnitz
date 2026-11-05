@@ -7,6 +7,7 @@ use crate::test_support::{
     batch_rows, circuit_batch, col_tab_batch, identity_circuit, make_batch, net_weight, register_identity_view,
     sys_batch, table_tab_batch, u64_i64_cols, view_tab_row,
 };
+use gnitz_store::relation::PkRule;
 use gnitz_wire::{TableDistribution, TableProps};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
@@ -38,7 +39,7 @@ fn boot(dir: &str, slot: Slot, log: &SalWriter) -> CatalogEngine {
 fn push(log: &SalWriter, engine: &CatalogEngine, tid: u64, rows: &Batch) {
     let (rel, record) = engine.wire_target(tid).unwrap();
     with_routed(rows.as_mem_batch(), rel.placement(), log.num_workers(), |data| {
-        log.commit_zone(&[SalGroup::push(tid, record, data, holders_of(&data))]);
+        log.commit_zone(&[SalGroup::push(tid, PkRule::Enforce, record, data, holders_of(&data))]);
     });
 }
 

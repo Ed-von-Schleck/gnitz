@@ -28,20 +28,36 @@ use super::*;
 use crate::catalog::{FkEdge, RowConstraints};
 use crate::runtime::reactor::RecvBuf;
 use gnitz_expr::ColumnLocator;
-use gnitz_store::relation::Relation;
+use gnitz_store::relation::{PkRule, Relation};
 use gnitz_wire::{FkAction, PkBuf, PkKeys, WireConflictMode};
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::{Batch, MemBatch};
 use gnitz_zset::schema::SchemaDescriptor;
 
 /// One decoded, shape-validated transaction family: the target `tid`, its
-/// conflict `mode`, and its rows. The executor decodes into these, the
-/// validator borrows them and extends them with the families a delete cascades
-/// to, and the committer takes them by value.
+/// conflict `mode`, its rows, and the PK rule its workers hold them to. The
+/// executor decodes into these, the validator borrows them and extends them
+/// with the families a delete cascades to, and the committer takes them by
+/// value.
 pub(in crate::runtime::executor) struct TxnFamily {
     pub(in crate::runtime::executor) tid: u64,
     pub(in crate::runtime::executor) mode: WireConflictMode,
     pub(in crate::runtime::executor) rows: FamilyRows,
+    /// [`PkRule::Enforce`] until the write's validation proves the family
+    /// fresh: see [`mark_fresh`].
+    pub(in crate::runtime::executor) pk_rule: PkRule,
+}
+
+impl TxnFamily {
+    /// A family held to [`PkRule::Enforce`].
+    pub(in crate::runtime::executor) fn new(tid: u64, mode: WireConflictMode, rows: FamilyRows) -> Self {
+        TxnFamily {
+            tid,
+            mode,
+            rows,
+            pk_rule: PkRule::Enforce,
+        }
+    }
 }
 
 /// The rows of a [`TxnFamily`].
@@ -475,6 +491,7 @@ impl Checks {
         loop {
             let further = self.validate_bundle(disp, families, &mut cascade).await?;
             if further.is_empty() {
+                mark_fresh(families);
                 return Ok(());
             }
             families.extend(further);
@@ -1057,13 +1074,29 @@ async fn removed_references(
     let further = cascaded
         .into_iter()
         .filter(|(_, c)| !c.pks.is_empty())
-        .map(|(tid, c)| TxnFamily {
-            tid,
-            mode: WireConflictMode::Update,
-            rows: FamilyRows::Built(Batch::key_retractions(&c.schema, &c.pks)),
+        .map(|(tid, c)| {
+            let rows = FamilyRows::Built(Batch::key_retractions(&c.schema, &c.pks));
+            TxnFamily::new(tid, WireConflictMode::Update, rows)
         })
         .collect();
     Ok((further, violation))
+}
+
+/// Hold to [`PkRule::Fresh`] each of `families`, a bundle [`Checks::validate_txn`]
+/// admitted, that is an Error family of positive weights and its table's one
+/// family. Validation refused a key such a family repeats, inserts at a weight
+/// above 1, or finds held; and an Error family reads committed state, so its
+/// write holds its tables' exclusive locks from that probe until the committer
+/// lays it out, which keeps every other write off the table in between. So each
+/// key is distinct, weighs 1, and is absent from the store the family lands on.
+fn mark_fresh(families: &mut [TxnFamily]) {
+    for i in 0..families.len() {
+        let f = &families[i];
+        let lone = families.iter().filter(|g| g.tid == f.tid).count() == 1;
+        if lone && matches!(f.mode, WireConflictMode::Error) && f.rows.view().all_weights_positive() {
+            families[i].pk_rule = PkRule::Fresh;
+        }
+    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ use crate::runtime::ServerExit;
 use crate::test_support::{
     make_batch, make_batch_raw, make_schema_u64_i64, make_string_batch, sweep_bit_flips, weighted_rows,
 };
+use gnitz_store::relation::PkRule;
 use gnitz_wire::wal::WAL_HEADER_SIZE;
 use gnitz_wire::{peek_control_block, ClientVerb, TypeCode, WireFlags, WireStatus, CTRL_HEADER_SIZE};
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -24,7 +25,7 @@ use std::sync::atomic::Ordering;
 
 /// A control-only group addressed to `tid`: a push that carries no rows.
 fn to(tid: u64) -> SalGroup<'static> {
-    SalGroup::new(Apply::Push { tid })
+    SalGroup::new(Apply::Push { tid, rule: PkRule::Enforce })
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +80,7 @@ fn a_shared_group_gives_every_addressed_worker_the_same_bytes() {
     let push = |set| {
         SalGroup::push(
             16,
+            PkRule::Enforce,
             &record,
             GroupData::Same(batch.wire_whole()),
             GroupTargets { set, ..GroupTargets::SILENT },
@@ -256,8 +258,14 @@ fn a_footprint_is_the_cursor_advance_and_an_empty_log_admits_up_to_the_limit() {
     let spec = vec![7u8; 1000];
     let groups = [
         SalGroup::new(scan(4, &spec)),
-        SalGroup::push(16, &record, GroupData::Same(batch.wire_whole()), GroupTargets::SILENT),
-        SalGroup::push(16, &record, GroupData::Each(&each), pushed),
+        SalGroup::push(
+            16,
+            PkRule::Enforce,
+            &record,
+            GroupData::Same(batch.wire_whole()),
+            GroupTargets::SILENT,
+        ),
+        SalGroup::push(16, PkRule::Enforce, &record, GroupData::Each(&each), pushed),
     ];
     let mut excl = log.excl();
     let mut scope = excl.begin("test");
@@ -279,7 +287,15 @@ fn a_committed_zoned_push_marks_the_writer_as_holding_pushes() {
     let log = test_log(1 << 20, 1, 1);
     let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
     let record = encode_schema_block(batch.schema());
-    let push = || SalGroup::push(16, &record, GroupData::Same(batch.wire_whole()), GroupTargets::SILENT);
+    let push = || {
+        SalGroup::push(
+            16,
+            PkRule::Enforce,
+            &record,
+            GroupData::Same(batch.wire_whole()),
+            GroupTargets::SILENT,
+        )
+    };
     let oversized = vec![0u8; 1 << 20];
 
     log.ddl_zone(&[(SysFamily::Table, &batch)]);

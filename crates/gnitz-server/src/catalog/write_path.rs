@@ -2,6 +2,7 @@
 //! layout through the caller's sink → ingest → `fire_hooks`), the undo of a
 //! refused write, what an applied bundle did, and the zone pin.
 
+use gnitz_store::relation::PkRule;
 use gnitz_wire::{payload_u64, IdxTabRow, IdxTabSlot, PkColList, ViewTabSlot, WireFault};
 use gnitz_zset::repr::Batch;
 
@@ -207,19 +208,19 @@ impl CatalogEngine {
         self.fire_hooks(family, batch)
     }
 
-    /// Apply a push to ingestion point `tid`'s store, and hold its effect for the
-    /// next tick of the views that scan `tid`. `Err` for a relation that is not
-    /// an ingestion point.
+    /// Apply a push to ingestion point `tid`'s store, a base table's under
+    /// `rule`, and hold its effect for the next tick of the views that scan
+    /// `tid`. `Err` for a relation that is not an ingestion point.
     // Inlined: `batch` is taken by value, and at a call it is copied whole.
     #[inline(always)]
-    pub(crate) fn ingest_unticked(&mut self, tid: u64, batch: Batch) -> Result<(), String> {
+    pub(crate) fn ingest_unticked(&mut self, tid: u64, batch: Batch, rule: PkRule) -> Result<(), String> {
         let kind = self.registry.relation_or_err(tid)?.kind();
         if !kind.is_ingestion_point() {
             return Err(format!("relation {tid} is a {}, not an ingestion point", kind.noun()));
         }
         match self.dag.is_ticked(tid) {
-            true => self.registry.ingest_pending(tid, batch),
-            false => self.registry.ingest(tid, batch),
+            true => self.registry.ingest_pending_under(tid, batch, rule),
+            false => self.registry.ingest_under(tid, batch, rule),
         }
     }
 

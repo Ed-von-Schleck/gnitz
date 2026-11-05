@@ -27,7 +27,7 @@ use crate::runtime::tls::{ResolvedTls, TlsListener};
 use crate::runtime::w2m::{self, RequestId, W2mWriter};
 use crate::runtime::worker::WorkerProcess;
 use crate::runtime::ServerExit;
-use gnitz_store::relation::{Residency, StoreConfig};
+use gnitz_store::relation::{PkRule, Residency, StoreConfig};
 use gnitz_zset::algebra::Slot;
 
 // ---------------------------------------------------------------------------
@@ -88,9 +88,11 @@ fn inject_recovery_panic(stage: &str) {
     }
 }
 
-/// Apply `slot`'s share of the tail's Push groups, each as a live push is. No LSN
-/// floor: `enforce_unique_pk` makes re-applying a group the shards already hold a
-/// no-op.
+/// Apply `slot`'s share of the tail's Push groups, each as a live push is but
+/// always under [`PkRule::Enforce`], whatever rule the group carries. No LSN
+/// floor: the enforced rule makes re-applying a group the shards already hold a
+/// no-op, where a group's [`PkRule::Fresh`] holds only of the store it was first
+/// applied to.
 fn recover_from_sal(tail: CommittedTail, slot: Slot, catalog: &mut CatalogEngine) -> Result<(), String> {
     // Groups that applied at least one payload, and the width a re-sliced tail was
     // written at — the boot record's re-slice marker. No boot writes at a
@@ -135,7 +137,7 @@ fn recover_from_sal(tail: CommittedTail, slot: Slot, catalog: &mut CatalogEngine
                 owned = owned.widened_with_nulls(&schema, false);
             }
             catalog
-                .ingest_unticked(tid, owned)
+                .ingest_unticked(tid, owned, PkRule::Enforce)
                 .map_err(|e| format!("SAL replay apply failed (table_id={}, lsn={}): {e}", tid, msg.head.lsn))?;
             applied = true;
         }

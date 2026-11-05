@@ -11,6 +11,7 @@ use crate::runtime::reactor::AckLease;
 use crate::runtime::sal::{Apply, GroupTargets, SalMessageKind, SalRequest, SalScope};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io::retry_eintr;
+use gnitz_store::relation::PkRule;
 use gnitz_zset::repr::MemBatch;
 
 /// How often a worker's death is probed for.
@@ -214,11 +215,17 @@ impl MasterDispatcher {
         }
     }
 
-    /// The SAL group of one push of `batch` to `target_id`, addressed to the
-    /// workers that own its rows and to no reply, handed to `f` with whether it
-    /// rides inside the zone. A base table's rows do; a stream's, which no
-    /// restart recovers, ride outside.
-    fn with_commit_group<R>(&self, target_id: u64, batch: MemBatch<'_>, f: impl FnOnce(SalGroup<'_>, bool) -> R) -> R {
+    /// The SAL group of one push of `batch` to `target_id`, held to `rule`,
+    /// addressed to the workers that own its rows and to no reply, handed to `f`
+    /// with whether it rides inside the zone. A base table's rows do; a
+    /// stream's, which no restart recovers, ride outside.
+    fn with_commit_group<R>(
+        &self,
+        target_id: u64,
+        rule: PkRule,
+        batch: MemBatch<'_>,
+        f: impl FnOnce(SalGroup<'_>, bool) -> R,
+    ) -> R {
         let cat = self.cat();
         let (rel, record) = cat
             .wire_target(target_id)
@@ -226,21 +233,22 @@ impl MasterDispatcher {
         let recoverable = rel.kind().is_base_table();
         with_routed(batch, rel.placement(), self.num_workers(), |data| {
             let targets = GroupTargets { set: data.holders(), reply: None };
-            f(SalGroup::push(target_id, record, data, targets), recoverable)
+            f(SalGroup::push(target_id, rule, record, data, targets), recoverable)
         })
     }
 
-    /// Lay one push batch out as a SAL group inside `scope`, and answer whether
-    /// the group rides inside the zone. No worker ACKs it: a read or tick behind
+    /// Lay one push batch out as a SAL group inside `scope`, held to `rule`, and
+    /// answer whether the group rides inside the zone. No worker ACKs it: a read or tick behind
     /// it in the SAL reaches its workers after their apply, and a worker that
     /// cannot apply it exits.
     pub(crate) fn write_commit_group(
         &self,
         scope: &mut SalScope,
         target_id: u64,
+        rule: PkRule,
         batch: MemBatch<'_>,
     ) -> Result<bool, WireFault> {
-        self.with_commit_group(target_id, batch, |g, recoverable| {
+        self.with_commit_group(target_id, rule, batch, |g, recoverable| {
             scope.write(&g, recoverable)?;
             Ok(recoverable)
         })
@@ -255,7 +263,10 @@ impl MasterDispatcher {
         families: impl IntoIterator<Item = (u64, MemBatch<'b>)>,
     ) -> bool {
         let bytes = (families.into_iter())
-            .map(|(target_id, batch)| self.with_commit_group(target_id, batch, |g, _| scope.footprint(&g)))
+            // The rule rides in the group head, so it sizes no group.
+            .map(|(target_id, batch)| {
+                self.with_commit_group(target_id, PkRule::Enforce, batch, |g, _| scope.footprint(&g))
+            })
             .sum();
         scope.fits_empty_log(SalMessageKind::Push, bytes)
     }

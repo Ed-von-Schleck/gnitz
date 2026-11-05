@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::test_support::u64_i64_cols;
+use gnitz_store::relation::PkRule;
 
 /// A `WITH (stream = true)` TABLE_TAB row must register as a stream with no store
 /// and no directory. Driven through `hook_relation_register` rather than a hand-built
@@ -28,7 +29,7 @@ fn stream_flag_registers_storeless_with_no_directory() {
     // A view's backfill over it reads nothing, whatever was pushed.
     let vid = register_identity_view(&mut engine, sid, "v_s", &cols);
     let pushed = rows(&engine, sid, 1, [1], |id| [id]);
-    engine.ingest_unticked(sid, pushed).unwrap();
+    engine.ingest_unticked(sid, pushed, PkRule::Enforce).unwrap();
     backfill(&mut engine, vid);
     assert_eq!(held(&engine, vid), (0, 0), "a stream's backfill reads nothing");
 

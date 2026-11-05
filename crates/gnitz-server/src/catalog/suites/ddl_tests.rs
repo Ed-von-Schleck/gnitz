@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::u64_i64_cols;
+use gnitz_store::relation::PkRule;
 use gnitz_wire::{ColTabRow, ColumnDef};
 use std::collections::HashMap;
 
@@ -945,12 +946,16 @@ fn only_a_scanned_table_holds_a_push_for_its_tick() {
     let (mut engine, tid) = table_engine("catalog", "unscanned_push", 1, &cols);
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
-    engine.ingest_unticked(tid, make_batch(&schema, &[(1, 1, 10)])).unwrap();
+    engine
+        .ingest_unticked(tid, make_batch(&schema, &[(1, 1, 10)]), PkRule::Enforce)
+        .unwrap();
     assert!(engine.registry.seal(tid).unwrap().is_none());
     assert_eq!(scan_all(&mut engine, tid).len(), 1);
 
     try_register_identity_view(&mut engine, tid, "v", &cols, 0, 0).unwrap();
-    engine.ingest_unticked(tid, make_batch(&schema, &[(2, 1, 20)])).unwrap();
+    engine
+        .ingest_unticked(tid, make_batch(&schema, &[(2, 1, 20)]), PkRule::Enforce)
+        .unwrap();
     assert_eq!(engine.registry.seal(tid).unwrap().map(|b| b.len()), Some(1));
 
     finish(engine);

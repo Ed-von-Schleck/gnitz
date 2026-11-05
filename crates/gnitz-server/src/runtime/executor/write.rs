@@ -194,7 +194,7 @@ impl DecodedPush {
         if kind == RelationKind::Stream {
             check_stream_push(tid, rows.as_ref().map(FamilyRows::view), self.mode)?;
         }
-        Ok(rows.map(|rows| TxnFamily { tid, mode: self.mode, rows }))
+        Ok(rows.map(|rows| TxnFamily::new(tid, self.mode, rows)))
     }
 }
 

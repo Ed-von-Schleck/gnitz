@@ -3,6 +3,7 @@ use crate::runtime::sal::fixtures::{holders_of, scan, test_log};
 use crate::runtime::sal::SalGroup;
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema};
 use gnitz_foundation::perf::Counter;
+use gnitz_store::relation::PkRule;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_wire::{PkKeys, ReadBound, ReadSpec, TypeCode};
 use gnitz_zset::algebra::Placement;
@@ -69,7 +70,10 @@ fn push_group_layout_bench() {
                 let mut scope = excl.begin("bench");
                 let own = with_routed(batch.as_mem_batch(), placement, nw, |data| {
                     scope
-                        .write(&SalGroup::push(16, &record, data, holders_of(&data)), zoned)
+                        .write(
+                            &SalGroup::push(16, PkRule::Enforce, &record, data, holders_of(&data)),
+                            zoned,
+                        )
                         .expect("group fits");
                     match data {
                         GroupData::Same(_) => None,

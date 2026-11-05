@@ -30,6 +30,7 @@ use crate::runtime::sync::{AsyncRwLock, WriteGuard};
 use crate::runtime::w2m::RequestId;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
+use gnitz_store::relation::PkRule;
 use gnitz_wire::{
     frame_head_size, peek_control_block, read_u32_le, read_u64_le, write_u32_le, write_u64_le, DecodedControl,
     WireFault, WireStatus, MAX_WORKERS,
@@ -222,14 +223,14 @@ impl<'a> SalGroup<'a> {
         }
     }
 
-    /// A push of `data` into `tid`, whose schema record is `record`, written to
-    /// `targets`.
-    pub(crate) fn push(tid: u64, record: &'a [u8], data: GroupData<'a>, targets: GroupTargets) -> Self {
+    /// A push of `data` into `tid`, held to `rule`, whose schema record is
+    /// `record`, written to `targets`.
+    pub(crate) fn push(tid: u64, rule: PkRule, record: &'a [u8], data: GroupData<'a>, targets: GroupTargets) -> Self {
         SalGroup {
             schema: Some(record),
             data,
             targets,
-            ..Self::new(Apply::Push { tid })
+            ..Self::new(Apply::Push { tid, rule })
         }
     }
 
