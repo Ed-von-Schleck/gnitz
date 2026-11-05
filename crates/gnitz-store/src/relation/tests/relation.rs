@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{
     assert_index_holds, id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, solo,
-    spec, TID,
+    spec, zset_of, TID,
 };
 
 fn index(id: u64, unique: bool) -> IndexClaim {
@@ -177,4 +177,95 @@ fn a_reopened_index_resumes_only_at_its_owners_generation() {
     }
     assert_eq!(reopen(5).1, 1, "of another generation, so filled from the owner");
     assert_eq!(reopen(5).1, 1, "the refused manifest is gone");
+}
+
+/// An index whose columns lead the owner's PK keeps no store: its probe and its
+/// spans read the owner's rows, entry for entry, across retractions and updates,
+/// and a directory left on such a column list is reclaimed as an orphan.
+#[test]
+fn an_index_leading_the_pk_reads_the_owners_rows() {
+    use crate::read::Probe;
+    use gnitz_wire::{PkKeys, TypeCode};
+    use gnitz_zset::repr::BatchBuilder;
+    use gnitz_zset::schema::SchemaColumn;
+    use std::num::NonZeroU64;
+    use std::path::Path;
+
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+        ],
+        &[0, 1],
+    );
+    let batch = |rows: &[(i64, u64, u64, i64)]| {
+        let mut bb = BatchBuilder::new(&schema);
+        for &(a, b, v, w) in rows {
+            bb.begin_row_natives(&[a as u64 as u128, b as u128], w);
+            bb.put_int(v as u128);
+            bb.end_row();
+        }
+        bb.finish()
+    };
+    let first: Vec<_> = (-2..3i64)
+        .flat_map(|a| (0..4u64).map(move |b| (a, b, b * 7, 1)))
+        .collect();
+    let second = [(0, 1, 7, -1), (1, 2, 14, -1), (1, 2, 99, 1), (2, 9, 5, 1)];
+    let leading: [&[u32]; 2] = [&[0], &[0, 1]];
+    let r = relation_fixture(
+        RelationKind::BaseTable,
+        schema,
+        &[leading[0], leading[1], &[2]],
+        [batch(&first), batch(&second)],
+    );
+    let rel = r.relation(TID).unwrap();
+    let dir = |cols: &[u32]| r.child_dir(TID, ChildKind::Index(PkColList::from_slice(cols)));
+    assert!(!rel.index_on(&[2]).unwrap().reads_owner_pk());
+    assert!(Path::new(&dir(&[2])).exists());
+
+    for cols in leading {
+        let ix = rel.index_on(cols).unwrap();
+        assert!(ix.reads_owner_pk(), "{cols:?}");
+        assert!(!Path::new(&dir(cols)).exists(), "{cols:?} keeps no store");
+        let ix_schema = ix.key_spec().index_schema(&schema);
+        let want = index_entries(&rel.full_scan(), ix.key_spec(), &ix_schema);
+        let k = ix.key_spec().key_size();
+        let entries: Vec<&[u8]> = (0..want.len()).map(|i| want.get_pk_bytes(i)).collect();
+
+        let mut spans: Vec<&[u8]> = entries.iter().map(|e| &e[..k]).collect();
+        spans.dedup();
+        let picked: Vec<&[u8]> = spans.iter().copied().step_by(2).collect();
+        let probe = |cap: u64| {
+            let probe = Probe::Index(PkColList::from_slice(cols), NonZeroU64::new(cap).unwrap());
+            r.probe(TID, probe, PkKeys::from_keys(k, picked.iter().copied()))
+                .unwrap()
+        };
+        let mut hit = Batch::empty_with_schema(&ix_schema);
+        entries
+            .iter()
+            .filter(|e| picked.contains(&&e[..k]))
+            .for_each(|e| hit.push_key_row(e, 1));
+        let got = probe(u64::MAX);
+        assert_eq!(zset_of(&got, &ix_schema), zset_of(&hit, &ix_schema), "{cols:?}");
+        assert_eq!(probe(1).len(), 1, "{cols:?}: the cap bounds the entries");
+
+        let mut drained = Vec::new();
+        let mut key_spans = r.key_spans(TID, cols).unwrap();
+        while !key_spans.chunk().is_empty() {
+            let chunk = key_spans.chunk();
+            drained.extend((0..chunk.len()).map(|i| (chunk.get_pk_bytes(i).to_vec(), chunk.get_weight(i))));
+            key_spans.advance();
+        }
+        let want_spans: Vec<_> = entries.iter().map(|e| (e[..k].to_vec(), 1)).collect();
+        assert_eq!(drained, want_spans, "{cols:?}");
+    }
+
+    std::fs::create_dir_all(dir(leading[0])).unwrap();
+    r.reclaim_orphan_relation_dirs(|_| None).unwrap();
+    assert!(
+        !Path::new(&dir(leading[0])).exists(),
+        "an index that reads the PK owns no directory"
+    );
+    assert!(Path::new(&dir(&[2])).exists());
 }

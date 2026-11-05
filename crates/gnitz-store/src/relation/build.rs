@@ -79,19 +79,27 @@ impl RelationRegistry {
             let fail = |e: String| format!("index on columns {:?} of relation {owner}: {e}", cols.as_slice());
             let key_spec = KeySpec::new(cols.as_slice(), &owner_schema).map_err(fail)?;
             // One that does not resume opens empty, for the fill below.
-            let table = if self.residency.publishes(entry.kind()) {
+            let store = if owner_schema.pk_cols().starts_with(cols.as_slice()) {
+                // The span of a PK column is its OPK bytes, so the entry's span is
+                // the owner PK's leading bytes.
+                debug_assert_eq!(
+                    key_spec.key_size(),
+                    owner_schema.pk_prefix_stride(cols.as_slice().len())
+                );
+                IndexStore::OwnerPk
+            } else if self.residency.publishes(entry.kind()) {
                 let dir = self.child_dir(owner, ChildKind::Index(cols));
                 let recovery = RecoverySource::Rederive { resume_at };
                 let table = self
                     .open_store(&dir, key_spec.index_schema(&owner_schema), recovery, None, false)
                     .map_err(fail)?;
-                Some(Box::new(table))
+                IndexStore::Own(Box::new(table))
             } else {
-                None
+                IndexStore::NotHeld
             };
             opened.push(SecondaryIndex {
                 cols,
-                table,
+                store,
                 key_spec,
                 claims: vec![claim],
                 covers_pk: owner_schema.covers_pk(cols.as_slice()),
@@ -101,7 +109,7 @@ impl RelationRegistry {
         let entry = self.relations.get_mut(&owner).expect("resolved above");
         let mut targets: Vec<&mut SecondaryIndex> = opened
             .iter_mut()
-            .filter(|ix| ix.table.is_some() && !ix.resumed())
+            .filter(|ix| matches!(ix.store, IndexStore::Own(_)) && !ix.resumed())
             .collect();
         let filled = targets.len();
         if filled > 0 {

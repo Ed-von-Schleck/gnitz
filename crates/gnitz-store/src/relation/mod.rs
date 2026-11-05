@@ -48,11 +48,22 @@ pub enum IndexClaim {
     Preflight,
 }
 
+/// What backs one process's entries of a secondary index.
+enum IndexStore {
+    /// A store of its own, which this process holds.
+    Own(Box<Table>),
+    /// The owner's rows: the index's columns lead the owner's PK, so an owner
+    /// row's entry `[span ‖ PK]` is its PK with the span's leading bytes
+    /// repeated, in the owner's PK order. No process keeps a store for it.
+    OwnerPk,
+    /// A store of its own, which another process holds: the master's state.
+    NotHeld,
+}
+
 /// A secondary index on a column list of one relation. Owns this process's store
-/// for it — dropping the index drops the store.
+/// for it, if it keeps one — dropping the index drops the store.
 pub struct SecondaryIndex {
-    /// This process's store of the index; `None` on the master.
-    table: Option<Box<Table>>,
+    store: IndexStore,
     /// The index's declared column list, in order, which drives leading-prefix
     /// seeks. A relation holds at most one index per list.
     cols: PkColList,
@@ -87,36 +98,82 @@ impl SecondaryIndex {
         &self.claims
     }
 
+    /// Whether the index's entries are read off its owner's rows, so no process
+    /// keeps a store for it.
+    pub fn reads_owner_pk(&self) -> bool {
+        matches!(self.store, IndexStore::OwnerPk)
+    }
+
     /// This process's store of the index; panics when it holds none.
     #[track_caller]
     fn held(&self) -> &Table {
-        match self.table.as_deref() {
-            Some(t) => t,
-            None => not_held(),
+        match &self.store {
+            IndexStore::Own(t) => t,
+            IndexStore::OwnerPk | IndexStore::NotHeld => not_held(),
         }
     }
 
-    /// Non-compacting cursor over this index's store, in the index schema.
+    /// Non-compacting cursor over this index's own store, in the index schema;
+    /// panics on an index that [reads its owner's PK](Self::reads_owner_pk).
     pub fn cursor(&self) -> ReadCursor {
         self.held().open_cursor(Cut::Now)
     }
 
-    /// Every stored entry of `spans`, each this index's leading key bytes.
-    pub(crate) fn gather(&self, spans: PkKeys) -> PkSetGather {
-        self.held().gather(spans, Cut::Now)
+    /// A non-compacting cursor whose rows each lead their key with one entry's
+    /// span, in span order: this index's store, or `owner`'s.
+    pub(crate) fn span_cursor(&self, owner: &Relation) -> ReadCursor {
+        match self.store {
+            IndexStore::OwnerPk => owner.cursor(),
+            _ => self.cursor(),
+        }
     }
 
-    /// A cursor positioned on the key band `r` walks over this index's store.
+    /// Call `f` on each live entry `[span ‖ owner PK]` of `spans`, each this
+    /// index's leading key bytes, in span order and at most `cap` of them.
+    pub(crate) fn for_each_entry(&self, owner: &Relation, spans: PkKeys, cap: usize, mut f: impl FnMut(&[u8])) {
+        match self.store {
+            IndexStore::OwnerPk => {
+                let key_size = self.key_spec.key_size();
+                let mut entry = Vec::with_capacity(key_size + owner.schema().pk_stride());
+                owner.gather(spans, Cut::Now).for_each_positive_capped(cap, |c| {
+                    let pk = c.current_pk_bytes();
+                    entry.clear();
+                    entry.extend_from_slice(&pk[..key_size]);
+                    entry.extend_from_slice(pk);
+                    f(&entry);
+                });
+            }
+            _ => self
+                .held()
+                .gather(spans, Cut::Now)
+                .for_each_positive_capped(cap, |c| f(c.current_pk_bytes())),
+        }
+    }
+
+    /// A cursor positioned on the key band `r` walks over this index's own
+    /// store. An index that reads its owner's PK has none: a range on its
+    /// columns walks the owner's PK.
     pub(crate) fn cursor_over(&self, r: &gnitz_wire::KeyRange) -> ReadCursor {
         self.held().range_cursor(r, Cut::Now)
     }
 
+    /// This process's own store of the index, if it holds one.
+    fn table_mut(&mut self) -> Option<&mut Table> {
+        match &mut self.store {
+            IndexStore::Own(t) => Some(t),
+            IndexStore::OwnerPk | IndexStore::NotHeld => None,
+        }
+    }
+
     /// Project `source` into this index's layout and ingest the result. A
     /// zero-weight row, or one NULL in an indexed column, has no entry, so a
-    /// non-empty `source` can project to nothing.
+    /// non-empty `source` can project to nothing. A no-op for an index that
+    /// reads its owner's PK.
     fn project_and_ingest(&mut self, source: &Batch) -> Result<(), StorageError> {
-        let Some(table) = self.table.as_deref_mut() else {
-            not_held()
+        let table = match &mut self.store {
+            IndexStore::Own(t) => t,
+            IndexStore::OwnerPk => return Ok(()),
+            IndexStore::NotHeld => not_held(),
         };
         let projected = index_entries(source, &self.key_spec, table.schema());
         if projected.is_empty() {
@@ -125,10 +182,15 @@ impl SecondaryIndex {
         table.ingest(projected)
     }
 
-    /// Whether this process's store of the index came back from a checkpoint
-    /// manifest at its open.
+    /// Whether this process's own store of the index came back from a
+    /// checkpoint manifest at its open; `false` for one that reads its owner's
+    /// PK.
     pub fn resumed(&self) -> bool {
-        self.held().loaded_mark().is_some()
+        match &self.store {
+            IndexStore::Own(t) => t.loaded_mark().is_some(),
+            IndexStore::OwnerPk => false,
+            IndexStore::NotHeld => not_held(),
+        }
     }
 }
 

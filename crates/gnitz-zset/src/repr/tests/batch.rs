@@ -151,7 +151,7 @@ fn every_producer_states_its_claim() {
         ("append", appended, RAW),
         ("clear", cleared, RAW),
         ("indexed_rows", src.indexed_rows(&[2, 0]), RAW),
-        ("keyed_by_prefix", src.keyed_by_prefix(&schema), RAW),
+        ("keyed_by_prefix", src.keyed_by_prefix(&schema.pk_only()), RAW),
     ] {
         assert_eq!(b.consolidated, want, "{what}");
     }
@@ -406,6 +406,21 @@ fn keyed_by_prefix_cuts_each_key_to_the_output_stride() {
         .collect();
     let want: Vec<_> = rows.iter().map(|&(a, _, w)| (a.to_be_bytes().to_vec(), w)).collect();
     assert_eq!(got, want);
+}
+
+/// A row's payload is dropped: only its key and weight carry over.
+#[test]
+fn keyed_by_prefix_drops_the_payload() {
+    let schema = make_schema_u64_i64();
+    let out = make_batch(&schema, &[(1, 1, 10), (2, 3, 20)]).keyed_by_prefix(&schema.pk_only());
+    assert_eq!(out.schema().num_payload_cols(), 0);
+    let got: Vec<_> = (0..out.count)
+        .map(|i| (out.get_pk_bytes(i).to_vec(), out.get_weight(i)))
+        .collect();
+    assert_eq!(
+        got,
+        [(1u64.to_be_bytes().to_vec(), 1), (2u64.to_be_bytes().to_vec(), 3)]
+    );
 }
 
 /// Negate is the Z-Set group inverse: every weight flips sign and nothing else

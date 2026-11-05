@@ -625,13 +625,21 @@ fn test_fk_auto_index_covers_pk_members() {
     let child_cols = vec![col_def("a", TypeCode::U64), fk_col("pid_fk"), fk_col("plain_fk")];
     let child_tid = engine.create_table("public.child", &child_cols, &[0, 1]).unwrap();
 
-    let child = engine.registry.relation(child_tid).unwrap();
-    for c in [1, 2] {
+    // PK = (pid_lead, line): the FK leads the PK, so its index reads the PK.
+    let lead_cols = vec![fk_col("pid_lead"), col_def("line", TypeCode::U64)];
+    let lead_tid = engine.create_table("public.lead", &lead_cols, &[0, 1]).unwrap();
+
+    for (tid, c, reads_pk) in [(child_tid, 1, false), (child_tid, 2, false), (lead_tid, 0, true)] {
+        let ix = engine.registry.relation(tid).and_then(|r| r.index_on(&[c]));
         assert_eq!(
-            child.index_on(&[c]).map(|ix| ix.claims().to_vec()),
-            Some(vec![IndexClaim::ForeignKey]),
-            "col {c}"
+            ix.map(|ix| (ix.claims().to_vec(), ix.reads_owner_pk())),
+            Some((vec![IndexClaim::ForeignKey], reads_pk)),
+            "table {tid} col {c}"
         );
+        let dir = engine
+            .registry
+            .child_dir(tid, ChildKind::Index(PkColList::from_slice(&[c])));
+        assert_eq!(std::path::Path::new(&dir).exists(), !reads_pk, "table {tid} col {c}");
     }
 
     finish(engine);

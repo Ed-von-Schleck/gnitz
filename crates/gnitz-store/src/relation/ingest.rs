@@ -2,7 +2,7 @@
 //! delta capture, the seal, and the checkpoint rounds.
 
 use super::store::{not_held, Rows};
-use super::{CircuitState, Relation, RelationKind, RelationRegistry};
+use super::{CircuitState, Relation, RelationKind, RelationRegistry, SecondaryIndex};
 use crate::storage::Table;
 use gnitz_zset::repr::{Batch, StorageError};
 use std::rc::Rc;
@@ -192,7 +192,7 @@ impl RelationRegistry {
         entry
             .indexes
             .iter_mut()
-            .filter_map(|ix| ix.table.as_deref_mut())
+            .filter_map(SecondaryIndex::table_mut)
             .for_each(Table::clear);
         Ok(())
     }
@@ -262,7 +262,7 @@ impl RelationRegistry {
             if e.kind().is_view() {
                 tables.extend(e.rows.table_mut());
             }
-            tables.extend(e.indexes.iter_mut().filter_map(|ix| ix.table.as_deref_mut()));
+            tables.extend(e.indexes.iter_mut().filter_map(SecondaryIndex::table_mut));
         }
         crate::storage::flush_barrier(tables, generation).map_err(|e| format!("ephemeral flush: {e}"))
     }

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use gnitz_foundation::posix_io::{create_dir_all_durable, fsync_dir};
 use gnitz_wire::PkColList;
 
-use super::{RelationKind, RelationRegistry, Residency, StateLayout};
+use super::{RelationKind, RelationRegistry, Residency, SecondaryIndex, StateLayout};
 use crate::storage::{link_stores, manifest_path, read_at, read_intact, retire_stores};
 use gnitz_zset::algebra::Slot;
 
@@ -287,9 +287,9 @@ impl RelationRegistry {
     }
 
     /// Remove every relation directory and child this registry does not own — a
-    /// child of another worker count, an index nothing declares, a trace that
-    /// `layout_of(id)`, view `id`'s compiled operator state, does not declare — the
-    /// children retired in one batch. Sound only once every process sharing
+    /// child of another worker count, an index nothing declares or one that
+    /// reads its owner's PK, a trace that `layout_of(id)`, view `id`'s compiled
+    /// operator state, does not declare — the children retired in one batch. Sound only once every process sharing
     /// `base_dir` has applied this catalog.
     pub fn reclaim_orphan_relation_dirs<'l>(
         &self,
@@ -315,7 +315,9 @@ impl RelationRegistry {
             dead.extend(children(&dir, |c| {
                 c.slot.of != of
                     || match c.kind {
-                        ChildKind::Index(cols) => entry.index_on(cols.as_slice()).is_none(),
+                        ChildKind::Index(cols) => entry
+                            .index_on(cols.as_slice())
+                            .is_none_or(SecondaryIndex::reads_owner_pk),
                         ChildKind::Scratch(name) => {
                             !layout_of(entry.id()).is_some_and(|l| l.names().any(|t| t == name))
                         }

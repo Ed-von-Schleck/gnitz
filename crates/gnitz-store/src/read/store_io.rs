@@ -62,9 +62,7 @@ impl RelationRegistry {
                 keyed_as(index.key_spec().key_size())?;
                 let mut entries = Batch::empty_with_schema(&index.key_spec().index_schema(&relation.schema()));
                 let cap = usize::try_from(cap.get()).unwrap_or(usize::MAX);
-                index
-                    .gather(keys)
-                    .for_each_positive_capped(cap, |c| entries.push_key_row(c.current_pk_bytes(), 1));
+                index.for_each_entry(relation, keys, cap, |entry| entries.push_key_row(entry, 1));
                 Ok(entries)
             }
         }

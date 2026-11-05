@@ -700,19 +700,22 @@ impl Batch {
         out
     }
 
-    /// Every row copied into `out_schema`, whose payload space is this batch's,
-    /// keyed by its leading key bytes — as many as `out_schema`'s stride. Left
-    /// unconsolidated: rows may now share a key.
+    /// Every row's leading key bytes — as many as `out_schema`'s stride — at its
+    /// weight, in `out_schema`, which has no payload column: a row's payload is
+    /// dropped. Left unconsolidated: rows may now share a key.
     pub fn keyed_by_prefix(&self, out_schema: &SchemaDescriptor) -> Batch {
-        debug_assert_eq!(out_schema.num_payload_cols(), self.schema.num_payload_cols());
-        self.copied_into(out_schema, 0, |w| {
-            let (pk, _, nulls) = w.fixed_mut();
-            nulls.copy_from_slice(self.null_bmp());
+        debug_assert_eq!(out_schema.num_payload_cols(), 0, "keyed_by_prefix keeps no payload");
+        let mut out = Self::with_capacity(out_schema, self.count);
+        out.write_rows(self.count, |w| {
+            let (pk, weights, nulls) = w.fixed_mut();
+            weights.copy_from_slice(self.weight());
+            nulls.fill(0);
             let keys = pk.chunks_exact_mut(out_schema.pk_stride());
             for (dst, src) in keys.zip(self.pk().chunks_exact(self.schema.pk_stride())) {
                 dst.copy_from_slice(&src[..dst.len()]);
             }
-        })
+        });
+        out
     }
 
     /// Copy every row into `out_schema`, which extends this batch's schema with

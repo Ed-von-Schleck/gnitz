@@ -104,12 +104,16 @@ _TWO_COLUMNS = (
     "CREATE TABLE c2 (cid BIGINT PRIMARY KEY, eref BIGINT UNSIGNED REFERENCES p(email))")
 _TWO_COLUMN_ROWS = {"p": [(1, 1001, 7001), (2, 1002, 7002), (3, 1003, 7003)],
                     "c1": [(1, 1001)], "c2": [(1, 7002)]}
-# An FK column inside the child's PK, alone or as a non-leading member.
+# An FK column inside the child's PK: alone, leading it, or as a non-leading member.
 _PK_CHILD = ("CREATE TABLE parent (id BIGINT UNSIGNED PRIMARY KEY); "
              "CREATE TABLE child (cid BIGINT UNSIGNED PRIMARY KEY REFERENCES parent(id))")
 _MEMBER_CHILD = ("CREATE TABLE parent (id BIGINT UNSIGNED PRIMARY KEY); "
                  "CREATE TABLE child (a BIGINT UNSIGNED REFERENCES parent(id), b BIGINT UNSIGNED,"
                  " PRIMARY KEY (b, a))")
+_LEAD_CHILD = ("CREATE TABLE parent (id BIGINT UNSIGNED PRIMARY KEY); "
+               "CREATE TABLE child (pid BIGINT UNSIGNED REFERENCES parent(id){}, line BIGINT UNSIGNED,"
+               " PRIMARY KEY (pid, line))")
+_LEAD_ROWS = {"parent": [(1,), (2,), (3,)], "child": [(1, 7), (1, 8), (2, 9)]}
 _LOOP = "CREATE TABLE loop (id BIGINT PRIMARY KEY REFERENCES loop(id))"
 
 # `(ddl, rows seeded per table, the write, every table's rows after — or None
@@ -203,6 +207,14 @@ _WRITES = {
     "a parent no PK member references": (
         _MEMBER_CHILD, {"parent": [(1,), (2,)], "child": [(1, 7)]}, "DELETE FROM parent WHERE id = 2",
         {"parent": [(1,)], "child": [(1, 7)]}),
+    "a parent a leading PK member references": (
+        _LEAD_CHILD.format(""), _LEAD_ROWS, "DELETE FROM parent WHERE id = 1", None),
+    "a parent no leading PK member references": (
+        _LEAD_CHILD.format(""), _LEAD_ROWS, "DELETE FROM parent WHERE id = 3",
+        {**_LEAD_ROWS, "parent": [(1,), (2,)]}),
+    "a cascade through a leading PK member": (
+        _LEAD_CHILD.format(" ON DELETE CASCADE"), _LEAD_ROWS, "DELETE FROM parent WHERE id = 1",
+        {"parent": [(2,), (3,)], "child": [(2, 9)]}),
     # A row referencing itself exempts itself.
     "a self-referencing PK row": (_LOOP, {"loop": [(1,)]}, "DELETE FROM loop", {"loop": []}),
     # `retract(1)` beside `insert(2, parent=1)`: probing committed state finds 1
