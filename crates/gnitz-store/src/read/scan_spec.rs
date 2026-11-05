@@ -46,7 +46,14 @@ impl RelationRegistry {
         let (mut source, walk) = entry.open_read(bound)?;
         let mut filter =
             RowFilter::for_read(&predicate, walk.as_ref(), &src_schema).map_err(|e| format!("scan_spec: {e}"))?;
-        let chunk_rows = self.config.scan_chunk_rows;
+        // Chunks bound a read's peak memory only where the sink drops, cuts or
+        // maps the rows, or where they hydrate; a read that keeps every row as it
+        // is drains its source once.
+        let chunk_rows = if sink.forwards_every_row() && filter.keeps_all() && !table.has_skeleton_rows() {
+            usize::MAX
+        } else {
+            self.config.scan_chunk_rows
+        };
         let mut hydrate_chunk = |keys| match hydrate.as_deref_mut() {
             Some(h) => h(keys).map_err(|e| format!("hydrate: view {target_id}: {e}")),
             None => Err(format!(
@@ -54,14 +61,17 @@ impl RelationRegistry {
             )),
         };
         // The drain leaves out the rows `filter` drops that it can, but for a
-        // sink that folds them in place, which the copy would only slow.
+        // sink that folds them in place, which the copy would only slow. A chunk
+        // whose every row the drain's `filter` decided reaches the sink unfiltered.
         let mut keep_all = RowFilter::default();
+        let folds = sink.folds();
         for drain_rows in drain_ramp(sink.first_drain(), chunk_rows) {
-            let drain_filter = if sink.folds() { &mut keep_all } else { &mut filter };
-            let Some(chunk) = source.drain_hydrated(drain_rows, drain_filter, &mut hydrate_chunk)? else {
+            let drain_filter = if folds { &mut keep_all } else { &mut filter };
+            let Some((chunk, decided)) = source.drain_hydrated(drain_rows, drain_filter, &mut hydrate_chunk)? else {
                 break;
             };
-            if sink.push(Cow::Owned(chunk), &mut filter)? {
+            let push_filter = if decided && !folds { &mut keep_all } else { &mut filter };
+            if sink.push(Cow::Owned(chunk), push_filter)? {
                 break;
             }
         }

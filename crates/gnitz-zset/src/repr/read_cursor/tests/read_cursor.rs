@@ -4,8 +4,9 @@ use crate::repr::ShardWriteOpts;
 use crate::repr::{Batch, BatchBuilder, MappedShard};
 use crate::schema::SchemaColumn;
 use crate::test_support::{
-    arb_fold_case, assert_folds, fold_batch, make_batch_u128, make_schema_pk_u64_payload_string, make_schema_u128_i64,
-    make_schema_u64_i64, map_shard, payload0_i64, row_key, u64_pk_schema, weighted_rows, zset_of, RowKey,
+    arb_fold_case, assert_folds, fold_batch, make_batch, make_batch_u128, make_schema_pk_u64_payload_string,
+    make_schema_u128_i64, make_schema_u64_i64, map_shard, payload0_i64, row_key, u64_pk_schema, weighted_rows, zset_of,
+    RowKey,
 };
 use gnitz_wire::{PkKeys, TypeCode};
 use proptest::prelude::*;
@@ -431,13 +432,59 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
         let mut skeletons = SkeletonKeys::default();
         let live = create_read_cursor(&[mem], &[sk], schema)
             .drain_live_chunk(usize::MAX, &mut skeletons, &mut gnitz_expr::RowFilter::default())
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(skeletons.keys, 1u64.to_be_bytes(), "{name}");
         assert_eq!(
             (live.len(), live.get_pk_bytes(0), live.get_weight(0)),
             (1, &2u64.to_be_bytes()[..], 4),
             "{name}"
         );
+    }
+}
+
+/// A drain reports its filter decided the chunk only when in-memory runs alone
+/// supplied it, every row then a survivor; a shard's rows stay whatever the
+/// filter says, and the chunk is reported undecided.
+#[test]
+fn a_drain_decides_only_a_chunk_of_in_memory_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let mut filter = crate::test_support::cmp_all(&[(gnitz_expr::CmpOp::Gt, 1, 2)])
+        .resolve_filter(&schema)
+        .unwrap();
+    let rows = |ids: &[u64]| -> Vec<(u64, i64, i64)> { ids.iter().map(|&id| (id, 1, id as i64 % 5)).collect() };
+    let even: Vec<u64> = (0..20).step_by(2).collect();
+    let odd: Vec<u64> = (1..20).step_by(2).collect();
+    let mem = |ids: &[u64]| Rc::new(make_batch(&schema, &rows(ids)));
+    let shard = |name: &str, ids: &[u64]| map_shard(&dir.path().join(name), &make_batch(&schema, &rows(ids)));
+    let survivors = |ids: &[u64]| -> Vec<u64> { ids.iter().copied().filter(|&id| id % 5 > 2).collect() };
+    let all: Vec<u64> = (0..20).collect();
+    let cases = [
+        ("one run", vec![mem(&all)], vec![], true, survivors(&all)),
+        ("two runs", vec![mem(&even), mem(&odd)], vec![], true, survivors(&all)),
+        (
+            "a run and a shard",
+            vec![mem(&even)],
+            vec![shard("a.db", &odd)],
+            false,
+            {
+                let mut ids = [survivors(&even), odd.clone()].concat();
+                ids.sort_unstable();
+                ids
+            },
+        ),
+        ("one shard", vec![], vec![shard("b.db", &all)], false, all.clone()),
+    ];
+    for (name, batches, shards, want_decided, want_ids) in cases {
+        let mut skeletons = SkeletonKeys::default();
+        let (chunk, decided) = create_read_cursor(&batches, &shards, schema)
+            .drain_live_chunk(usize::MAX, &mut skeletons, &mut filter)
+            .unwrap();
+        let ids: Vec<u64> = (0..chunk.len())
+            .map(|i| gnitz_wire::widen_pk_be(chunk.get_pk_bytes(i)) as u64)
+            .collect();
+        assert_eq!((decided, ids), (want_decided, want_ids), "{name}");
     }
 }
 

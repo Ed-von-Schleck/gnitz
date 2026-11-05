@@ -251,8 +251,9 @@ fn a_malformed_request_is_refused() {
 
 /// Every keyed read returns each named key's whole PK group at its folded weights —
 /// a view's PK is not unique, and a group larger than the chunk budget crosses it
-/// in one piece — and a key the store does not hold misses. A read of the whole
-/// relation is the store's cached snapshot itself.
+/// in one piece — and a key the store does not hold misses, whether it drains its
+/// source once, unfiltered, or in chunks under a predicate that keeps every row.
+/// A read of the whole relation is the store's cached snapshot itself.
 #[test]
 fn keyed_reads_return_each_named_keys_whole_group() {
     let schema = make_schema_u64_i64();
@@ -281,8 +282,14 @@ fn keyed_reads_return_each_named_keys_whole_group() {
             .filter(|&(id, _, val)| ids.contains(&id) && val != 70)
             .collect();
         want.sort_unstable();
-        let got = run(&r, ReadSpec::all_rows(bound.clone())).unwrap();
-        assert_eq!(batch_rows(&got), want, "{bound:?}");
+        for predicate in [vec![], between(1, i64::MIN, i64::MAX)] {
+            let spec = ReadSpec {
+                predicate,
+                ..ReadSpec::all_rows(bound.clone())
+            };
+            let got = run(&r, spec).unwrap();
+            assert_eq!(batch_rows(&got), want, "{bound:?}");
+        }
     }
     let ReadRows::Shared(whole) = run(&r, rows_spec(None, None)).unwrap() else {
         panic!("a whole read shares the cached snapshot");

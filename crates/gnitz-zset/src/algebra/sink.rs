@@ -103,6 +103,13 @@ impl SinkPlan {
         matches!(self.kind, Kind::Fold { .. })
     }
 
+    /// Whether this sink keeps every survivor as it is, unmapped and uncut: a
+    /// source drained for it in chunks bounds no memory, the sink holding every
+    /// chunk's rows anyway.
+    pub fn forwards_every_row(&self) -> bool {
+        self.map.is_none() && matches!(self.kind, Kind::Rows(_))
+    }
+
     /// How many source rows the first drain needs to visit: an unordered cut
     /// no more than its window, any other sink no fewer than every row.
     pub fn first_drain(&self) -> usize {

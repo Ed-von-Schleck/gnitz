@@ -3,7 +3,8 @@
 //! `cd crates && cargo test -p gnitz-store --release scan_spec_bench -- --ignored --nocapture --test-threads=1`
 //!
 //! A fixture is one run of the RAM tier, which the cursor drains in bulk, so a
-//! cell's figure is its filter and its sink.
+//! cell's figure is its filter and its sink; one cell instead merges a shard
+//! with a run of the RAM tier.
 
 use std::hint::black_box;
 
@@ -148,7 +149,7 @@ fn scan_spec_bench() {
     cell("ORDER BY id DESC LIMIT 100", &r, key_desc, 100, ROWS);
 
     // Unfiltered key ranges: every drained row survives.
-    for width in [1, 64, 4096, 65_536] {
+    for width in [1, 64, 4096, 65_536, ROWS / 2] {
         let id = |v: u64| gnitz_wire::key_image(TypeCode::U64, v as u128);
         let bound = col_range(0, id(0), id(width - 1));
         cell(
@@ -159,6 +160,16 @@ fn scan_spec_bench() {
             width,
         );
     }
+
+    // `id IN (…)` over every other id: more keys than one drain chunk.
+    let keys = gnitz_wire::PkKeys::from_images(8, (0..ROWS).step_by(2).map(u128::from));
+    cell(
+        "key set, every other id",
+        &r,
+        ReadSpec::all_rows(ReadBound::PkSet(keys)),
+        ROWS / 2,
+        ROWS / 2,
+    );
 
     // The widest range of `c2` the index is walked for, and one row wider,
     // which scans the table under the range.
@@ -171,6 +182,29 @@ fn scan_spec_bench() {
         assert_eq!(matches!(source, SourceCursor::Bounded(_)), walks, "{label}");
         cell(label, &r, ReadSpec::all_rows(bound), width, width);
     }
+
+    // The same rows, the even ids in a shard and the odd ones in the RAM tier, so
+    // every drain merges the two.
+    let half = |parity| {
+        let rows = (parity..ROWS).step_by(2).map(|id| (id, 1));
+        id_rows(&schema(&[I64; 4]), rows, |bb, id| {
+            bb.put_u64(id % 512);
+            bb.put_u64(id % 2);
+            bb.put_u64(id * 179_999 % ROWS);
+            bb.put_u64(id / 7);
+        })
+    };
+    let mut r = relation_fixture(RelationKind::BaseTable, schema(&[I64; 4]), &[], [half(0)]);
+    r.checkpoint_base().unwrap();
+    r.ingest(TID, half(1)).unwrap();
+    let table = r.relation(TID).unwrap().table();
+    assert_eq!((table_shards(table).len(), table.runs(At::Now).count()), (1, 2));
+    let spec = ReadSpec {
+        bound: ReadBound::None,
+        predicate: lt(1, 256),
+        sink: ReadSink::all_rows(),
+    };
+    cell("rows, 256-row ranges, shard and RAM tier", &r, spec, ROWS / 2, ROWS);
 
     // `id | s | c1 = id % 2`: of the rows `c1 < 1` keeps, every other `s` is
     // out of line.

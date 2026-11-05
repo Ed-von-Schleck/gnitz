@@ -26,36 +26,48 @@ impl ReadCursor {
     /// Up to `max_rows` rows in merge order, consolidated, each a whole (PK, payload)
     /// group; `None` once the cursor is exhausted.
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
-        SkeletonKeys::raw(|s| self.drain_live_chunk(max_rows, s, &mut RowFilter::default()))
+        SkeletonKeys::raw(|s| {
+            self.drain_live_chunk(max_rows, s, &mut RowFilter::default())
+                .map(|(b, _)| b)
+        })
     }
 
     /// [`Self::drain_chunk`], with each skeleton row's key pushed to `skeletons` instead of
     /// copied; a chunk of skeleton rows alone is `Some` and empty. The rows of
     /// in-memory runs `filter` drops are left out of the chunk; a shard's rows are
-    /// copied whatever it says, so the caller filters the chunk again.
+    /// copied whatever it says. The `bool` is whether `filter` decided every row
+    /// of the chunk: `false` once a shard contributed a row or a skeleton key, and
+    /// then the caller filters the chunk again.
     pub(super) fn drain_live_chunk(
         &mut self,
         max_rows: usize,
         skeletons: &mut SkeletonKeys,
         filter: &mut RowFilter,
-    ) -> Option<Batch> {
+    ) -> Option<(Batch, bool)> {
         assert!(max_rows > 0, "drain_live_chunk: max_rows must be positive");
         if !self.valid {
             return None;
         }
         if let Some(i) = self.mode {
-            return Some(self.drain_single(i, max_rows, skeletons, filter));
+            let decided = matches!(self.sources[i], Run::Mem(_));
+            return Some((self.drain_single(i, max_rows, skeletons, filter), decided));
         }
         // Per source, the rows this drain can emit: its current row on to where the drive stops.
         let mut windows = std::mem::take(&mut self.drain_windows);
         windows.clear();
         windows.extend(self.states.iter().map(|s| s.start..s.start));
         windows[self.current.src as usize].start = self.current.row as usize;
+        let mut decided = true;
         let mut batch = with_picks(|picks| {
             self.drain_sorted_into(max_rows, picks);
             for (w, s) in windows.iter_mut().zip(&self.states) {
                 w.end = s.start;
             }
+            decided = !self
+                .sources
+                .iter()
+                .zip(&windows)
+                .any(|(src, w)| matches!(src, Run::Shard(_)) && !w.is_empty());
             if self.order.coarsen {
                 let sources = &self.sources;
                 picks.retain(|&(e, r, w)| {
@@ -76,7 +88,7 @@ impl ReadCursor {
         });
         batch.certify_consolidated();
         self.drain_windows = windows;
-        Some(batch)
+        Some((batch, decided))
     }
 
     /// Every remaining row in merge order, consolidated.

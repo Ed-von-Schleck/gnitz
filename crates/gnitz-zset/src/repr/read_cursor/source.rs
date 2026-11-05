@@ -27,7 +27,10 @@ impl SourceCursor<'_> {
     /// The next non-empty source chunk, or `None` once the source is exhausted.
     /// `PkSet` exceeds `max_rows` rather than split a PK group.
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
-        SkeletonKeys::raw(|s| self.drain_live_chunk(max_rows, s, &mut RowFilter::default()))
+        SkeletonKeys::raw(|s| {
+            self.drain_live_chunk(max_rows, s, &mut RowFilter::default())
+                .map(|(b, _)| b)
+        })
     }
 
     /// [`Self::drain_chunk`] over a store that may hold skeleton rows: each one the
@@ -35,19 +38,22 @@ impl SourceCursor<'_> {
     /// the keys, ascending. A skeleton row counts once against `max_rows` however
     /// many rows it hydrates to. A whole cursor leaves out the rows of its
     /// in-memory runs that `filter` drops; every other row stays, hydrated ones
-    /// included, for the caller to filter.
+    /// included, for the caller to filter. The `bool` is whether `filter` already
+    /// decided every row of the chunk, so the caller need not filter it again:
+    /// only a whole cursor's chunk drawn from in-memory runs alone, with no
+    /// skeleton row hydrated.
     pub fn drain_hydrated(
         &mut self,
         max_rows: usize,
         filter: &mut RowFilter,
         hydrate: impl FnOnce(PkKeys) -> Result<Batch, String>,
-    ) -> Result<Option<Batch>, String> {
+    ) -> Result<Option<(Batch, bool)>, String> {
         let mut skeletons = SkeletonKeys::default();
-        let Some(live) = self.drain_live_chunk(max_rows, &mut skeletons, filter) else {
+        let Some((live, decided)) = self.drain_live_chunk(max_rows, &mut skeletons, filter) else {
             return Ok(None);
         };
         if skeletons.keys.is_empty() {
-            return Ok(Some(live));
+            return Ok(Some((live, decided)));
         }
         let keys = PkKeys::from_sorted(live.schema().pk_stride(), skeletons.keys);
         #[cfg(debug_assertions)]
@@ -56,25 +62,30 @@ impl SourceCursor<'_> {
         #[cfg(debug_assertions)]
         assert_hydration_matches(&hydrated, &asked, &skeletons.coarse);
         // Both consolidated and PK-disjoint.
-        Ok(Some(if live.is_empty() {
-            hydrated
-        } else {
-            merge_consolidated(&[hydrated.as_mem_batch(), live.as_mem_batch()], live.schema())
-        }))
+        Ok(Some((
+            if live.is_empty() {
+                hydrated
+            } else {
+                merge_consolidated(&[hydrated.as_mem_batch(), live.as_mem_batch()], live.schema())
+            },
+            false,
+        )))
     }
 
     /// [`Self::drain_chunk`] with skeleton rows split out; `Some` and empty means every
-    /// row of the chunk was a skeleton.
+    /// row of the chunk was a skeleton. The `bool` is whether `filter` decided every
+    /// row, as [`ReadCursor::drain_live_chunk`]; an index range or a key list never
+    /// reads `filter`.
     fn drain_live_chunk(
         &mut self,
         max_rows: usize,
         skeletons: &mut SkeletonKeys,
         filter: &mut RowFilter,
-    ) -> Option<Batch> {
+    ) -> Option<(Batch, bool)> {
         match self {
             SourceCursor::Full(c) => c.drain_live_chunk(max_rows, skeletons, filter),
-            SourceCursor::Bounded(c) => c.drain_live_chunk(max_rows, skeletons),
-            SourceCursor::PkSet(g) => g.drain_live_chunk(max_rows, skeletons),
+            SourceCursor::Bounded(c) => c.drain_live_chunk(max_rows, skeletons).map(|b| (b, false)),
+            SourceCursor::PkSet(g) => g.drain_live_chunk(max_rows, skeletons).map(|b| (b, false)),
         }
     }
 }
