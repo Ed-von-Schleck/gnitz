@@ -199,34 +199,6 @@ pub trait RowSource {
     fn row_count(&self) -> usize;
 }
 
-/// A borrowed source reads as the source it borrows.
-impl<T: RowSource + ?Sized> RowSource for &T {
-    #[inline(always)]
-    fn get_pk_bytes(&self, row: usize) -> &[u8] {
-        (**self).get_pk_bytes(row)
-    }
-    #[inline(always)]
-    fn get_null_word(&self, row: usize) -> u64 {
-        (**self).get_null_word(row)
-    }
-    #[inline(always)]
-    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
-        (**self).get_col_ptr(row, payload_col, col_size)
-    }
-    #[inline(always)]
-    fn german_cell(&self, row: usize, payload_col: usize) -> &[u8; 16] {
-        (**self).german_cell(row, payload_col)
-    }
-    #[inline(always)]
-    fn heap(&self) -> crate::Heap<'_> {
-        (**self).heap()
-    }
-    #[inline(always)]
-    fn row_count(&self) -> usize {
-        (**self).row_count()
-    }
-}
-
 /// One row's fixed 8-byte payload slot `pi`, little-endian.
 pub fn payload_u64<S: RowSource>(src: &S, row: usize, pi: usize) -> u64 {
     crate::read_u64_le(src.get_col_ptr(row, pi, 8), 0)
