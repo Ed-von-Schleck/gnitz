@@ -4,14 +4,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{park_until, CatalogLock, Shared};
 use crate::query::DagEngine;
 use crate::runtime::reactor::AckLease;
 use crate::runtime::sal::SalExcl;
-use crate::runtime::sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, WriteGuard};
+use crate::runtime::sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::WireFault;
@@ -21,24 +20,14 @@ use rustc_hash::FxHashMap;
 /// would.
 static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
 
-/// `GNITZ_INJECT_TICK_HOLD_FOR_DDL`: see `hold_tick_for_ddl`.
+/// `GNITZ_INJECT_TICK_HOLD_FOR_DDL`: hold the first tick that emitted a group in
+/// flight, its gate held and its ACKs outstanding, until a writer — a DDL, or a
+/// checkpoint's ephemeral round — parks on the tick gate. With no checkpoint
+/// asked for, a DDL then provably lands mid-tick. One-shot.
 static TICK_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_TICK_HOLD_FOR_DDL");
 
-/// DDLs waiting for the tick gate, counted only while [`TICK_HOLD_FOR_DDL`] is
-/// armed: its one reader.
-static DDL_GATE_WAITERS: AtomicU64 = AtomicU64::new(0);
-
 /// Poll bound for [`TICK_HOLD_FOR_DDL`], in 1 ms ticks.
-const HOLD_TICK_MAX_POLLS: u32 = 10_000;
-
-/// Hold the first steady-state tick in flight until a DDL waits on the tick gate,
-/// so that DDL provably lands mid-tick. One-shot.
-async fn hold_tick_for_ddl(shared: &Shared) {
-    park_until(shared, HOLD_TICK_MAX_POLLS, "tick hold", || {
-        DDL_GATE_WAITERS.load(Ordering::Relaxed) > 0
-    })
-    .await
-}
+const TICK_HOLD_MAX_POLLS: u32 = 10_000;
 
 /// One tick request to [`tick_loop`], sent only through [`Ticks`]' sender: tick
 /// whatever is pending — even nothing — by `by`, and report the tick's verdict
@@ -125,20 +114,6 @@ impl Ticks {
         self.tx.send(TickRequest { by, done: Some(done) });
         verdict.await
     }
-
-    /// The tick gate's write guard, a DDL's: no tick is in flight while it is
-    /// held.
-    pub(super) async fn gate_for_ddl(&self) -> WriteGuard {
-        let counted = TICK_HOLD_FOR_DDL.armed();
-        if counted {
-            DDL_GATE_WAITERS.fetch_add(1, Ordering::Relaxed);
-        }
-        let gate = self.gate.write().await;
-        if counted {
-            DDL_GATE_WAITERS.fetch_sub(1, Ordering::Relaxed);
-        }
-        gate
-    }
 }
 
 impl Shared {
@@ -213,7 +188,7 @@ pub(super) async fn tick_loop(shared: Rc<Shared>, TickRequests(mut rx): TickRequ
             };
         }
 
-        let _ticking = shared.ticks.gate.read().await;
+        let ticking = shared.ticks.gate.read().await;
         let emitted = shared.emit_pending_tick().await;
         if let Err(e) = &emitted {
             gnitz_warn!("tick error: {}", e);
@@ -226,7 +201,9 @@ pub(super) async fn tick_loop(shared: Rc<Shared>, TickRequests(mut rx): TickRequ
         }
         if let Ok(Some(lease)) = emitted {
             if TICK_HOLD_FOR_DDL.take_once() {
-                hold_tick_for_ddl(&shared).await;
+                // A held read guard is contended only by a queued writer: readers
+                // park only behind one.
+                park_until(&shared, TICK_HOLD_MAX_POLLS, "tick hold", || ticking.contended()).await;
             }
             lease.acks().await;
         }

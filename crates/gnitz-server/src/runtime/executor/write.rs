@@ -21,24 +21,14 @@ use gnitz_wire::txn_frame::BLIND;
 use gnitz_wire::{ClientVerb, DecodedControl, Target, WireConflictMode, WireFault, WireStatus};
 use gnitz_zset::repr::MemBatch;
 
-/// `GNITZ_INJECT_PUSH_HOLD_FOR_DDL`: see `hold_push_for_ddl`.
+/// `GNITZ_INJECT_PUSH_HOLD_FOR_DDL`: hold one decoded push, before its catalog
+/// read lock, until a DDL has replaced the schema record its decode matched —
+/// the window a queued `ALTER TABLE` writer opens between that match and the
+/// gate. One-shot.
 static PUSH_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_PUSH_HOLD_FOR_DDL");
 
 /// Poll bound for [`PUSH_HOLD_FOR_DDL`], in 1 ms ticks.
 const PUSH_HOLD_MAX_POLLS: u32 = 2_000;
-
-/// Hold one decoded push, before its catalog read lock, until a DDL has replaced
-/// the schema record its decode matched — the window a queued `ALTER TABLE`
-/// writer opens between that match and the gate.
-async fn hold_push_for_ddl(shared: &Shared, push: &DecodedPush) {
-    park_until(shared, PUSH_HOLD_MAX_POLLS, "push hold", || {
-        shared
-            .cat()
-            .wire_target(push.target.tid)
-            .is_none_or(|(_, now)| !Rc::ptr_eq(&push.seen, now))
-    })
-    .await
-}
 
 /// The per-table write state: the table locks, the OCC commit-LSN map, and the
 /// validation caches.
@@ -244,7 +234,13 @@ pub(super) fn decode_push_frame(
 pub(super) async fn handle_push(shared: &Shared, mut buf: RecvBuf, ctrl: DecodedControl) -> Result<u64, WireFault> {
     let push = decode_push_frame(&shared.cat(), buf.as_mut_slice(), ctrl)?;
     if PUSH_HOLD_FOR_DDL.take_once() {
-        hold_push_for_ddl(shared, &push).await;
+        park_until(shared, PUSH_HOLD_MAX_POLLS, "push hold", || {
+            shared
+                .cat()
+                .wire_target(push.target.tid)
+                .is_none_or(|(_, now)| !Rc::ptr_eq(&push.seen, now))
+        })
+        .await;
     }
     let catalog = shared.catalog_rwlock.read().await;
     let Some(family) = push.admit(&shared.cat(), Access::Write, &Rc::new(buf))? else {

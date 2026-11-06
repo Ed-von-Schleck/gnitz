@@ -35,9 +35,10 @@ def test_a_ddl_during_an_in_flight_tick(own_server, before, ddl, after, read):
     holds every source row once.
 
     `GNITZ_INJECT_TICK_HOLD_FOR_DDL` holds the server's first tick in flight — its
-    group written, the tick gate held, its ACKs outstanding — until a DDL is
-    waiting on the tick gate. `ddl` is the only DDL issued after the push, so the
-    hold's logged release proves it landed on a mid-epoch tick."""
+    group written, the tick gate held, its ACKs outstanding — until a writer is
+    waiting on the tick gate. Nothing here asks for a checkpoint, the gate's other
+    writer, and `ddl` is the only DDL issued after the push, so the hold's logged
+    release proves it landed on a mid-epoch tick."""
     c = gnitz.connect(own_server.start(extra_env={
         "GNITZ_INJECT_TICK_HOLD_FOR_DDL": "1", "GNITZ_TICK_COALESCE_ROWS": str(COALESCE_ROWS)}).target)
     c.execute_sql("; ".join([*before,

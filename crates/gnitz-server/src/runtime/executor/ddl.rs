@@ -38,7 +38,7 @@ async fn enter_ddl(shared: &Shared) -> DdlLocks {
     drop(shared.committer.pause().await);
     let catalog = shared.catalog_rwlock.write().await;
     let committer = shared.committer.pause().await;
-    let ticks = shared.ticks.gate_for_ddl().await;
+    let ticks = shared.ticks.gate.write().await;
     DdlLocks {
         catalog,
         _committer: committer,
@@ -46,19 +46,15 @@ async fn enter_ddl(shared: &Shared) -> DdlLocks {
     }
 }
 
-/// `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT`: see `hold_ddl_for_checkpoint`.
+/// `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT`: hold the first DDL, its zone written
+/// and its locks still held, until a request is queued behind its pause of the
+/// committer. Below a checkpoint threshold of one zone, that request is the
+/// watchdog's reclaim wake, so a checkpoint is asked for inside the DDL.
+/// One-shot.
 static DDL_HOLD_FOR_CHECKPOINT: Seam = Seam::new("GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT");
 
 /// Poll bound for [`DDL_HOLD_FOR_CHECKPOINT`], in 1 ms ticks.
 const DDL_HOLD_MAX_POLLS: u32 = 10_000;
-
-/// Hold the first DDL, its zone written and its locks still held, until a
-/// request is queued behind its pause of the committer. Below a checkpoint
-/// threshold of one zone, that request is the watchdog's reclaim wake, so a
-/// checkpoint is asked for inside the DDL. One-shot.
-async fn hold_ddl_for_checkpoint(shared: &Shared) {
-    park_until(shared, DDL_HOLD_MAX_POLLS, "ddl hold", || shared.committer.has_queued()).await
-}
 
 /// Decode one `DDL_TXN` item's block, in `frame`, under its family's own schema.
 fn decode_sys_family(frame: &[u8], ctrl: DecodedControl) -> Result<(SysFamily, Batch), String> {
@@ -137,7 +133,7 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, body: &[u8]) -> Result<u64, 
     shared.feeds.wake_all();
 
     if DDL_HOLD_FOR_CHECKPOINT.take_once() {
-        hold_ddl_for_checkpoint(shared).await;
+        park_until(shared, DDL_HOLD_MAX_POLLS, "ddl hold", || shared.committer.has_queued()).await;
     }
     drop(locks);
     Ok(zone_lsn)
