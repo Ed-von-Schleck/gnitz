@@ -199,15 +199,19 @@ impl Reactor {
         AckLease(self.lease(set, |left| Route::Acks(AckRoute { left, waker: None })))
     }
 
-    /// The lease every worker's ready ACK answers; [`Reactor::new`] takes it.
-    pub(super) fn ready_lease(&self) -> ReadyLease {
+    /// Resolves once every worker has ACKed its boot recovery: the lease its
+    /// ready ACKs answer, which [`Reactor::new`] takes first.
+    pub(super) fn boot_ready(&self) -> impl Future<Output = ReadyAcked> {
         let acks = self.lease_acks(WorkerSet::ALL);
         assert_eq!(
             acks.id(),
             RequestId::BOOT_READY,
             "the ready lease is the reactor's first"
         );
-        ReadyLease(acks)
+        async move {
+            acks.acks().await;
+            ReadyAcked(())
+        }
     }
 
     /// One request id, answered by a train of frames from every worker in `set`.
@@ -307,17 +311,6 @@ impl AckLease {
             Poll::Pending
         })
         .await
-    }
-}
-
-/// The lease every worker's ready ACK answers, which [`Reactor::new`] hands out.
-pub(crate) struct ReadyLease(AckLease);
-
-impl ReadyLease {
-    /// Resolves once every worker has ACKed its boot recovery.
-    pub(crate) async fn all_acked(self) -> ReadyAcked {
-        self.0.acks().await;
-        ReadyAcked(())
     }
 }
 

@@ -131,7 +131,7 @@ fn reactor_flood_bench() {
                 });
             }
             let before = voluntary_ctx_switches();
-            let (_, instructions) = counter.measure(|| r.block_on(ready.all_acked()));
+            let (_, instructions) = counter.measure(|| r.block_on(ready));
             (instructions, voluntary_ctx_switches() - before)
         });
         let wakes = r.w2m.wakes() - wakes_before;

@@ -42,7 +42,7 @@ mod uring;
 pub(crate) use conn::{
     Accepted, Charge, ClientConn, FrameSink, Limits, PeerGone, Plain, RecvBuf, RecvEnd, RecvFilter, SendBody,
 };
-pub(crate) use lease::{AckLease, ReadyAcked, ReadyLease, TrainFrame, TrainLease};
+pub(crate) use lease::{AckLease, ReadyAcked, TrainFrame, TrainLease};
 pub(crate) use uring::check_host;
 
 // ---------------------------------------------------------------------------
@@ -202,8 +202,9 @@ impl std::ops::Deref for Reactor {
 }
 
 impl Reactor {
-    /// The reactor, and the lease every worker's ready ACK answers.
-    pub(crate) fn new(limits: Limits, w2m: W2mReceiver) -> std::io::Result<(Self, ReadyLease)> {
+    /// The reactor, and the future that resolves once every worker has ACKed
+    /// its boot recovery.
+    pub(crate) fn new(limits: Limits, w2m: W2mReceiver) -> std::io::Result<(Self, impl Future<Output = ReadyAcked>)> {
         let ring = IoUringRing::new()?;
         // Before the shared state exists: a refused claim then drops none of it,
         // and so does not end the live reactor's claim.
@@ -219,7 +220,7 @@ impl Reactor {
             conns: conn::Conns::new(limits),
             w2m,
         }));
-        let ready = reactor.ready_lease();
+        let ready = reactor.boot_ready();
         Ok((reactor, ready))
     }
 

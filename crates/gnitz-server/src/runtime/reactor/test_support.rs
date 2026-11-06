@@ -66,8 +66,8 @@ pub(crate) fn train_lease(n: usize, kind: &'static str) -> (Reactor, TrainLease,
     (reactor, lease, writers)
 }
 
-/// [`reactor_with_rings`], with the lease the workers' ready ACKs answer.
-pub(super) fn booting_reactor(n: usize) -> (Reactor, ReadyLease, Vec<W2mWriter>) {
+/// [`reactor_with_rings`], with the future that resolves on every worker's ready ACK.
+pub(super) fn booting_reactor(n: usize) -> (Reactor, impl Future<Output = ReadyAcked>, Vec<W2mWriter>) {
     let (writers, receiver) = test_rings(n, 64 * 1024);
     let (reactor, ready) = Reactor::new(Limits::TEST, receiver).expect("reactor");
     (reactor, ready, writers)

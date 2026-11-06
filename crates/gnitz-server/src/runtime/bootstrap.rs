@@ -428,7 +428,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     // Both waits race a worker's death, which would leave them waiting forever.
     let died = |w: usize| format!("worker {w} exited during recovery (log: {})", worker_log(data_dir, w));
     let acked = reactor.block_on(async {
-        match select2(ready.all_acked(), worker_death(&reactor, &worker_pids)).await {
+        match select2(ready, worker_death(&reactor, &worker_pids)).await {
             Either::A(acked) => Ok(acked),
             Either::B(w) => Err(died(w)),
         }

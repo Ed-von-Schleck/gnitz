@@ -316,7 +316,7 @@ fn w2m_publishes_from_another_process_wake_the_parked_reactor() {
     };
     let pid = unsafe { fork_child(child) };
 
-    if let Either::B(()) = r.block_on(select2(ready.all_acked(), r.sleep(TIMEOUT))) {
+    if let Either::B(()) = r.block_on(select2(ready, r.sleep(TIMEOUT))) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!("reactor stalled after {TIMEOUT:?}: a lost wake");
     }
