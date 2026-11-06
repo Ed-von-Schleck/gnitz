@@ -267,8 +267,14 @@ enum Slot {
     /// RESOLVE: the descriptor, or `None` when no such relation exists.
     /// Uncorrelated on the wire, because the request names no id.
     Resolve { to: Promise<Option<Arc<RelDescriptor>>> },
-    /// SCAN_MULTI: one train per relation, in request order.
-    Scan(Scan),
+    /// SCAN_MULTI: one train per relation, in request order, each reply
+    /// gathered as its train terminates. The train in progress is
+    /// `trains[replies.len()]`.
+    Scan {
+        trains: Vec<Train>,
+        replies: Vec<ScanReply>,
+        to: Promise<Vec<ScanReply>>,
+    },
     /// One view's delta read: a scan's train, whose terminal carries the cursor
     /// to read from next.
     Delta {
@@ -357,22 +363,6 @@ impl Train {
             lsn,
         })
     }
-}
-
-/// A scan's trains and where their replies go: a one-item scan answers with
-/// its one reply, a multi-read with every relation's, gathered as each train
-/// terminates.
-enum Scan {
-    One {
-        train: Train,
-        to: Promise<ScanReply>,
-    },
-    /// The train in progress is `trains[replies.len()]`.
-    All {
-        trains: Vec<Train>,
-        replies: Vec<ScanReply>,
-        to: Promise<Vec<ScanReply>>,
-    },
 }
 
 /// How one view's train ends: the cursor its terminal carries, or the fault
@@ -627,19 +617,8 @@ impl Session {
         spec: &gnitz_wire::ReadSpec,
         reply_schema: &Arc<Schema>,
     ) -> Sent<ScanReply> {
-        let (to, sent) = promise();
-        let slot = Slot::Scan(Scan::One {
-            train: Train::new(target.tid, reply_schema),
-            to,
-        });
-        let spec = spec.encode();
-        let item = txn_frame::ScanItem {
-            target,
-            reply_layout: reply_schema.layout().layout_digest(),
-            spec: &spec,
-        };
-        self.enqueue(|out| txn_frame::encode_scan_multi(out, &[item]), slot);
-        sent
+        self.submit_scan_multi(&[(target, spec, reply_schema)])
+            .map(|mut replies| replies.pop().expect("a one-item scan answers with one reply"))
     }
 
     /// SNAPSHOT_PAGE: up to `limit` rows of `tid` as snapshot `snapshot` holds
@@ -670,7 +649,8 @@ impl Session {
         sent
     }
 
-    /// SCAN_MULTI: N [`Self::submit_scan`]s as one request, replied in order.
+    /// SCAN_MULTI: a read of N relations as one request, replied in order, each
+    /// in its schema's layout.
     pub(crate) fn submit_scan_multi(
         &mut self,
         scans: &[(Target, &gnitz_wire::ReadSpec, &Arc<Schema>)],
@@ -689,14 +669,14 @@ impl Session {
             })
             .collect();
         let (to, sent) = promise();
-        let slot = Slot::Scan(Scan::All {
+        let slot = Slot::Scan {
             trains: scans
                 .iter()
                 .map(|&(target, _, schema)| Train::new(target.tid, schema))
                 .collect(),
             replies: Vec::with_capacity(scans.len()),
             to,
-        });
+        };
         self.enqueue(|out| txn_frame::encode_scan_multi(out, &items), slot);
         sent
     }
@@ -1063,8 +1043,7 @@ impl Slot {
         match self {
             Slot::Ack { to, .. } => to.fulfil(Ok(ctrl.hdr.arg0)),
             Slot::Resolve { to } => to.fulfil(Ok(resolve_descriptor(&ctrl, &buf)?)),
-            Slot::Scan(Scan::One { train, to }) => to.fulfil(Ok(train.reply(last(), Some(ctrl.hdr.arg0))?)),
-            Slot::Scan(Scan::All { trains, replies, to }) => {
+            Slot::Scan { trains, replies, to } => {
                 let reply = trains[replies.len()].reply(last(), Some(ctrl.hdr.arg0))?;
                 replies.push(reply);
                 if replies.len() < trains.len() {
@@ -1106,8 +1085,8 @@ impl Slot {
     /// carries none, or keeps its blocks raw.
     fn train(&mut self) -> Option<&mut Train> {
         match self {
-            Slot::Scan(Scan::One { train, .. }) | Slot::Delta { train, .. } | Slot::Page { train, .. } => Some(train),
-            Slot::Scan(Scan::All { trains, replies, .. }) => trains.get_mut(replies.len()),
+            Slot::Delta { train, .. } | Slot::Page { train, .. } => Some(train),
+            Slot::Scan { trains, replies, .. } => trains.get_mut(replies.len()),
             _ => None,
         }
     }
@@ -1118,8 +1097,7 @@ impl Slot {
         match self {
             Slot::Ack { to, .. } => to.fulfil(Err(why)),
             Slot::Resolve { to } => to.fulfil(Err(why)),
-            Slot::Scan(Scan::One { to, .. }) => to.fulfil(Err(why)),
-            Slot::Scan(Scan::All { to, .. }) => to.fulfil(Err(why)),
+            Slot::Scan { to, .. } => to.fulfil(Err(why)),
             Slot::Page { to, .. } => to.fulfil(Err(why)),
             Slot::Delta { to, .. } => to.fulfil(Err(why)),
             Slot::DeltaPoll { views, at, poll, first } => {
