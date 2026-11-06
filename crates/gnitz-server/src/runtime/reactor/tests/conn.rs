@@ -383,7 +383,7 @@ fn retire_defers_the_shutdown_to_the_egress_owner_and_fail_ends_the_recv() {
     let r = make_reactor();
     let (owner, mut woken) = chan::unbounded::<()>();
     let (accepted, partner) = accepted_pair(&r);
-    let conn = r.connect(accepted, Some(owner), |_| Plain::new());
+    let conn = r.connect(accepted, Some(owner), Plain::new());
 
     conn.retire();
     assert!(woken.try_recv().is_some() && woken.try_recv().is_none(), "one wake");
@@ -404,7 +404,7 @@ fn a_recv_landing_after_retire_is_discarded() {
     // Owned egress, so `retire` leaves the socket open for the late bytes.
     let (owner, _woken) = chan::unbounded::<()>();
     let (accepted, mut partner) = accepted_pair(&r);
-    let conn = r.connect(accepted, Some(owner), |_| Plain::new());
+    let conn = r.connect(accepted, Some(owner), Plain::new());
     r.tick(); // the recv is submitted
 
     conn.retire();
@@ -518,7 +518,7 @@ fn accept_retries_after_a_failure() {
         poll_until(&r, || accepted.borrow().is_some()),
         "the retry takes the connection"
     );
-    let conn = r.connect(accepted.take().expect("just seen"), None, |_| Plain::new());
+    let conn = r.connect(accepted.take().expect("just seen"), None, Plain::new());
     assert_eq!(conn.peer_addr(), client.local_addr().ok());
 }
 
@@ -530,9 +530,11 @@ fn peer_addr_names_a_tcp_peer_and_leaves_the_fd_open() {
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
     let client = std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
     let (server, _) = listener.accept().expect("accept");
-    let conn = r.connect(r.admit(OwnedFd::from(server)).expect("under the cap"), None, |_| {
-        Plain::new()
-    });
+    let conn = r.connect(
+        r.admit(OwnedFd::from(server)).expect("under the cap"),
+        None,
+        Plain::new(),
+    );
     assert_eq!(conn.peer_addr(), client.local_addr().ok(), "a TCP peer's address");
     assert_eq!(
         conn.peer_addr(),

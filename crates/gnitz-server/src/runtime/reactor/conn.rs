@@ -339,7 +339,7 @@ impl ClientConn {
         self.shutdown();
     }
 
-    pub(crate) fn wake_egress(&self) {
+    fn wake_egress(&self) {
         if let Some(owner) = &self.egress_owner {
             owner.send(());
         }
@@ -376,6 +376,11 @@ pub(crate) trait RecvFilter {
     fn window(&mut self) -> &mut [MaybeUninit<u8>];
     /// `n` bytes landed in the window: queue the frames they complete.
     fn ingest(&mut self, n: usize, sink: &mut FrameSink) -> Result<(), RecvEnd>;
+    /// Whether the filter holds bytes for the socket after an ingest; the
+    /// reactor then wakes the connection's egress owner to ship them.
+    fn owes_egress(&self) -> bool {
+        false
+    }
 }
 
 /// Size of [`Plain`]'s carry.
@@ -569,14 +574,14 @@ impl Reactor {
     }
 
     /// A connection over `accepted`, charging frames to the inbound budget, its
-    /// first recv armed into the filter `filter` builds over it; the reactor
-    /// holds it until the recv side ends. `egress_owner` wakes the task that
+    /// first recv armed into `filter`; the reactor holds it until the recv side
+    /// ends. `egress_owner` wakes the task that
     /// sends on the socket outside requests, if one does.
-    pub(crate) fn connect<F: RecvFilter + 'static>(
+    pub(crate) fn connect(
         &self,
         accepted: Accepted,
         egress_owner: Option<chan::Sender<()>>,
-        filter: impl FnOnce(&Rc<ClientConn>) -> F,
+        filter: impl RecvFilter + 'static,
     ) -> Rc<ClientConn> {
         let conn = Rc::new(ClientConn {
             fd: accepted.fd,
@@ -585,7 +590,7 @@ impl Reactor {
             gone: Cell::new(false),
             egress_owner,
         });
-        let filter: Box<dyn RecvFilter> = Box::new(filter(&conn));
+        let filter: Box<dyn RecvFilter> = Box::new(filter);
         let mut recvs = self.conns.recvs.borrow_mut();
         let entry = recvs.vacant_entry();
         let key = entry.key();
@@ -610,6 +615,9 @@ impl Reactor {
                     let ingested = armed.filter.ingest(n as usize, &mut q);
                     let over = q.over(self.conns.limits.conn_inbound_share);
                     drop(q);
+                    if armed.filter.owes_egress() {
+                        armed.conn.wake_egress();
+                    }
                     match ingested {
                         // Not re-armed: the socket's bytes stay in the kernel, whose
                         // flow control holds the client off.

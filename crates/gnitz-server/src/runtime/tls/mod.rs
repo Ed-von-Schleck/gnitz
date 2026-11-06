@@ -91,12 +91,15 @@ impl TlsShared {
         sess.set_buffer_limit(Some(SEND_BUFFER_BYTES));
         let state = Rc::new(RefCell::new(sess));
         let (flush_tx, flush_rx) = chan::unbounded::<()>();
-        let conn = reactor.connect(accepted, Some(flush_tx), |conn| TlsIngress {
-            state: Rc::clone(&state),
-            conn: Rc::clone(conn),
-            cipher: Box::new_uninit_slice(CIPHER_WINDOW_BYTES),
-            deframer: Deframer::default(),
-        });
+        let conn = reactor.connect(
+            accepted,
+            Some(flush_tx),
+            TlsIngress {
+                state: Rc::clone(&state),
+                cipher: Box::new_uninit_slice(CIPHER_WINDOW_BYTES),
+                deframer: Deframer::default(),
+            },
+        );
         let tls = Rc::new(TlsShared {
             reactor,
             conn,
@@ -161,8 +164,6 @@ impl TlsShared {
 /// pipelining pushes ahead of reading its ACKs cannot deadlock it.
 struct TlsIngress {
     state: Rc<RefCell<rustls::ServerConnection>>,
-    /// Woken to egress when rustls has records to ship.
-    conn: Rc<ClientConn>,
     cipher: Box<[MaybeUninit<u8>]>,
     /// Deframes the plaintext.
     deframer: Deframer<Charge>,
@@ -174,14 +175,14 @@ impl RecvFilter for TlsIngress {
     }
 
     fn ingest(&mut self, n: usize, sink: &mut FrameSink) -> Result<(), RecvEnd> {
-        let mut sess = self.state.borrow_mut();
         // SAFETY: `n` counts bytes the completed recv wrote into the window.
         let cipher = unsafe { self.cipher[..n].assume_init_ref() };
-        let result = ingest_cipher(&mut sess, cipher, &mut self.deframer, sink);
-        if sess.wants_write() {
-            self.conn.wake_egress();
-        }
-        result
+        ingest_cipher(&mut self.state.borrow_mut(), cipher, &mut self.deframer, sink)
+    }
+
+    /// The flusher ships the records rustls queued.
+    fn owes_egress(&self) -> bool {
+        self.state.borrow().wants_write()
     }
 }
 

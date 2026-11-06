@@ -90,7 +90,7 @@ pub(crate) fn accepted_pair(r: &Reactor) -> (Accepted, UnixStream) {
 /// and the other end.
 pub(super) fn registered(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
     let (accepted, partner) = accepted_pair(r);
-    (r.connect(accepted, None, |_| Plain::new()), partner)
+    (r.connect(accepted, None, Plain::new()), partner)
 }
 
 /// [`registered`], past its handshake: admitting frames up to the payload ceiling.
