@@ -2,8 +2,8 @@
 //! and waiting for every peer's, part by part.
 
 use super::*;
-use gnitz_zset::algebra::ScatterPlan;
-use std::borrow::Cow;
+use crate::query::Lane;
+use crate::runtime::mesh::Round;
 
 impl DriveHost for WorkerProcess<'_> {
     fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry) {
@@ -11,18 +11,28 @@ impl DriveHost for WorkerProcess<'_> {
         (&mut cat.dag, &mut cat.registry)
     }
 
-    /// Publish `batch` as this worker's round of `view_id` and block until every
-    /// part of it is complete. SAL groups arriving meanwhile go through
-    /// [`WorkerProcess::dispatch`] with `in_drive`.
-    fn exchange(
+    /// Publish `lanes` as this worker's rounds — one, or as few as hold them —
+    /// and block until every part of each is complete. SAL groups arriving
+    /// meanwhile go through [`WorkerProcess::dispatch`] with `in_drive`.
+    fn exchange<'b>(
         &mut self,
-        view_id: u64,
-        batch: Cow<'_, Batch>,
-        plan: &ScatterPlan,
-        fold: bool,
+        mut lanes: impl ExactSizeIterator<Item = Lane<'b>>,
         drained: bool,
-    ) -> (Batch, bool) {
-        let mut round = self.mesh.open(view_id, batch, plan, fold, drained);
+        gathered: &mut Vec<Batch>,
+    ) -> bool {
+        let (max, mut all) = (self.mesh.max_lanes(), true);
+        while lanes.len() > 0 {
+            let mut round = self.mesh.open(lanes.by_ref().take(max), drained);
+            all &= self.finish_round(&mut round, gathered);
+        }
+        all
+    }
+}
+
+impl WorkerProcess<'_> {
+    /// Wait out every part of `round`, serving SAL groups meanwhile, and push
+    /// each lane's rows to `gathered`: whether every worker was drained.
+    fn finish_round(&mut self, round: &mut Round<'_>, gathered: &mut Vec<Batch>) -> bool {
         loop {
             self.mesh.spin_for_part(|| !self.sal_reader.is_empty());
             self.mesh
@@ -37,8 +47,8 @@ impl DriveHost for WorkerProcess<'_> {
                     break;
                 }
             }
-            if let Some(gathered) = self.mesh.step(&mut round) {
-                return gathered;
+            if let Some(drained) = self.mesh.step(round, gathered) {
+                return drained;
             }
         }
     }

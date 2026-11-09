@@ -67,9 +67,20 @@ pub(super) fn register_count(
     group_cols: &[u32],
     name: &str,
 ) -> (u64, ReducePlan) {
+    register_count_of(engine, source, &make_schema_u64_i64(), group_cols, name)
+}
+
+/// [`register_count`] over a relation of `schema`.
+fn register_count_of(
+    engine: &mut CatalogEngine,
+    source: u64,
+    schema: &SchemaDescriptor,
+    group_cols: &[u32],
+    name: &str,
+) -> (u64, ReducePlan) {
     let aggs = [AggDescriptor::COUNT_STAR];
     // Only a global reduce owes a ground row; `ReducePlan` refuses one on a grouped reduce.
-    let plan = ReducePlan::from_wire(&make_schema_u64_i64(), group_cols, &aggs, group_cols.is_empty()).unwrap();
+    let plan = ReducePlan::from_wire(schema, group_cols, &aggs, group_cols.is_empty()).unwrap();
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(source, ReadBound::None);
     circuit.reduce(
@@ -137,6 +148,43 @@ fn an_empty_tick_runs_every_round() {
     let mut host = EchoDrive::new(&mut engine);
     tick(&mut host, base, 1).unwrap();
     assert_eq!(host.rounds, 2, "one round per count, none for the identity");
+}
+
+/// A tick's rounds share one wait per wave: every step whose sources are done
+/// runs to its round, and a view over one still at a round waits for the next
+/// wave. Each view still lands what its own rounds give it, as a backfill
+/// over the same rows does.
+#[test]
+fn a_ticks_independent_rounds_share_one_wait() {
+    let (mut engine, base) = table_engine("dag_exec", "waves", 4, &u64_i64_cols());
+    let once = register_identity_view(&mut engine, base, "once", &u64_i64_cols());
+    let (count_v, plan_v) = register_count(&mut engine, base, &[1], "count_v");
+    let (count_once, _) = register_count(&mut engine, once, &[1], "count_once");
+    let counts = *plan_v.output_schema();
+    let (total, _) = register_count_of(&mut engine, count_v, &counts, &[], "total");
+    let rows = [(1, 1, 10), (2, 1, 20), (3, 1, 10)];
+    engine.ingest_unticked(base, base_rows(&rows), PkRule::Enforce).unwrap();
+    let mut host = EchoDrive::new(&mut engine);
+    tick(&mut host, base, 1).unwrap();
+    // `count_v` and `count_once`, behind `once`, which runs no round, stand at
+    // their rounds together; `total` reads `count_v`.
+    assert_eq!((host.rounds, host.waits), (3, 2));
+    let oracles = [
+        (count_v, base, None),
+        (count_once, once, None),
+        (total, count_v, Some(counts)),
+    ];
+    for (view, source, schema) in oracles {
+        let name = format!("oracle_{view}");
+        let (oracle, _) = match schema {
+            None => register_count(&mut engine, source, &[1], &name),
+            Some(schema) => register_count_of(&mut engine, source, &schema, &[], &name),
+        };
+        backfill(&mut engine, oracle).unwrap();
+        let want = held(&mut engine, oracle);
+        assert!(!want.is_empty());
+        assert_eq!(held(&mut engine, view), want, "view {view}");
+    }
 }
 
 /// `a ⋈ b` on their `v`, `a`'s side through a `DISTINCT` where `distinct`: a

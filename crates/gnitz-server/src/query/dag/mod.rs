@@ -23,21 +23,31 @@ pub(crate) use exec::{backfill, tick};
 
 use meta::{DepMap, Step};
 
+/// One view's rows of an exchange round: lent, or given to the round, which
+/// frees them once they are sent.
+pub(crate) struct Lane<'b> {
+    pub(crate) view: u64,
+    pub(crate) batch: Cow<'b, Batch>,
+    pub(crate) plan: &'b ScatterPlan,
+    /// The rows land where they fold: gathered by merge from consolidated
+    /// senders, concatenated otherwise.
+    pub(crate) fold: bool,
+}
+
 /// What a drive needs from the process running it: the engine it drives, and
 /// the other workers.
 pub(crate) trait DriveHost {
     fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry);
-    /// This worker's share of every worker's `batch` for `view_id` under `plan`,
-    /// merged from consolidated slices where `fold` and concatenated otherwise,
-    /// and whether every worker passed `drained`.
-    fn exchange(
+    /// Trade `lanes` with every worker, which trades the same lanes in the same
+    /// order, and push to `gathered`, per lane, this worker's share of every
+    /// worker's batch under its plan. Answers whether every worker passed
+    /// `drained`. The lanes share their waits.
+    fn exchange<'b>(
         &mut self,
-        view_id: u64,
-        batch: Cow<'_, Batch>,
-        plan: &ScatterPlan,
-        fold: bool,
+        lanes: impl ExactSizeIterator<Item = Lane<'b>>,
         drained: bool,
-    ) -> (Batch, bool);
+        gathered: &mut Vec<Batch>,
+    ) -> bool;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,13 +75,8 @@ pub(crate) struct DagEngine {
     /// Views the boot verdict ([`Self::decide_rebuild`]) rejected, closed under
     /// dependents and chains, each until its rebuild backfill starts.
     rebuild: FxHashSet<u64>,
-    /// The batch each producer of the running tick has emitted, keyed by
-    /// producer; empty between ticks, kept for its capacity.
-    tick_outputs: FxHashMap<u64, Batch>,
-    /// What each relay round of the running tick gathered, indexed by
-    /// [`meta::RelaySlot`], from the round's run to its last reader; empty between
-    /// ticks, kept for its capacity.
-    tick_relays: Vec<Batch>,
+    /// The running tick's state; between ticks empty, kept for its capacity.
+    tick: exec::TickRun,
 }
 
 impl DagEngine {

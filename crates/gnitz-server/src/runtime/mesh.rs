@@ -9,18 +9,22 @@
 //! ```text
 //! [0, 8)                         arrivals: AtomicU64 — parts published since boot
 //! [HEADER_BYTES + (2w + p) * outbox_bytes, +outbox_bytes)   worker w's outbox p
-//!   outbox: [Head, padded to BLOCKS_AT][blocks, 8-aligned]
+//!   outbox: [Head, one LaneHead + nw Spans per lane, padded to BLOCKS_AT][blocks, 8-aligned]
 //! ```
 //!
-//! A block is one receiver's rows of a part as a WAL block of the round's
+//! A round carries one or more lanes, each one view's rows traded as a round of
+//! its own would be, so several views' exchanges share one wait per part. A
+//! block is one receiver's rows of a lane in a part as a WAL block of the lane's
 //! schema, which every worker already holds from its own partition; an empty
-//! [`Span`] sends none. The [`Head`] names the view, and is the divergence check.
+//! [`Span`] sends none. Each [`LaneHead`] names its view, and is the divergence
+//! check.
 
 use std::borrow::Cow;
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::query::Lane;
 use crate::runtime::park::{Park, WorkerParks, WorkerSet};
 use gnitz_foundation::posix_io;
 use gnitz_wire::MAX_WORKERS;
@@ -43,7 +47,10 @@ const HEADER_BYTES: usize = PAGE_BYTES;
 
 /// Where an outbox's blocks start: past its [`Head`].
 const BLOCKS_AT: usize = PAGE_BYTES;
-const _: () = assert!(size_of::<Head>() <= BLOCKS_AT, "an outbox's head fits its first page");
+const _: () = assert!(
+    size_of::<Head>() + size_of::<LaneHead>() + MAX_WORKERS * size_of::<Span>() <= BLOCKS_AT,
+    "an outbox's first page holds its head and a lane's"
+);
 
 /// How many `spin_loop` polls a worker on a core of its own spends waiting for a
 /// part before it parks. A peer's arrival in a small tick usually lands within tens of
@@ -101,19 +108,26 @@ struct Span {
     len: u32,
 }
 
-/// An outbox's first bytes: what the publisher's part is, and each receiver's
-/// block of it.
+/// An outbox's first bytes: what the publisher's part is. Its lanes' heads
+/// follow it in the same page.
 #[repr(C)]
 struct Head {
-    view: u64,
+    /// How many lanes the round carries; each worker's round carries the same.
+    lanes: u64,
     /// The publisher's claim that its source is drained.
     drained: u64,
-    /// The published partition was consolidated and the round lands where it
-    /// folds, so every block is merged on gather.
-    consolidated: u64,
     /// The publisher has rows left for another part of this round.
     more: u64,
-    blocks: [Span; MAX_WORKERS],
+}
+
+/// One lane's head, followed by one [`Span`] per worker: each receiver's block
+/// of the lane in this part.
+#[repr(C)]
+struct LaneHead {
+    view: u64,
+    /// The lane's published partition was consolidated and it lands where it
+    /// folds, so every block of it is merged on gather.
+    consolidated: u64,
 }
 
 /// One worker's view of the mesh.
@@ -131,7 +145,8 @@ pub(crate) struct Mesh {
     in_round: bool,
     /// Every worker's park; a part's last arrival wakes the peers.
     parks: WorkerParks,
-    /// Per-receiver row lists of the round being sent, reused across rounds.
+    /// Per-receiver row lists of the lane being sent, reused across lanes and
+    /// rounds.
     routed: Vec<Vec<u32>>,
     /// How far into each of this worker's outboxes pages may be resident.
     resident: [usize; 2],
@@ -140,29 +155,40 @@ pub(crate) struct Mesh {
     spins: u32,
 }
 
-/// One exchange round, from [`Mesh::open`] to the [`Mesh::step`] that closes it.
+/// One exchange round, from [`Mesh::open`] to the [`Mesh::step`] that closes it:
+/// one or more lanes, each traded as a round of its own would be, behind one
+/// arrival per part.
 pub(crate) struct Round<'b> {
-    view: u64,
-    schema: SchemaDescriptor,
     /// This worker's claim that its source is drained, sent with every part.
     drained: bool,
-    /// The published batch was consolidated and the round lands where it folds.
+    lanes: Vec<LaneRound<'b>>,
+    /// How far this worker's writing has come; `None` once every row it sends
+    /// is written.
+    at: Option<Cursor>,
+}
+
+/// One lane of an open [`Round`].
+struct LaneRound<'b> {
+    view: u64,
+    schema: SchemaDescriptor,
+    /// The published batch was consolidated and the lane lands where it folds.
     consolidated: bool,
-    /// How far this worker's writing has come, and the batch it writes from;
-    /// `None`, dropping the batch, once every row it sends is written.
-    unsent: Option<(Cursor, Cow<'b, Batch>)>,
-    /// This receiver's non-empty blocks from the round's earlier parts, copied
-    /// out raw.
+    /// The batch the lane writes from and the plan routing it; `None`, dropping
+    /// a given batch, once every row it sends is written.
+    unsent: Option<(Cow<'b, Batch>, &'b ScatterPlan)>,
+    /// This receiver's non-empty blocks of the lane from the round's earlier
+    /// parts, copied out raw.
     saved: Vec<Vec<u8>>,
-    /// Every sender of a block this receiver took in so far this round was
-    /// consolidated, so the round's blocks are merged on close.
+    /// Every sender of a block this receiver took in so far was consolidated,
+    /// so the lane's blocks are merged on close.
     merge: bool,
 }
 
-/// How far a round's writing has come through its row lists: at
+/// How far a round's writing has come: in lane `lane`, at
 /// `routed[list][offset..]`.
 struct Cursor {
-    /// How many lists the round's plan routed into: one per receiver, or the
+    lane: usize,
+    /// How many lists the lane's plan routed into: one per receiver, or the
     /// one list every receiver is sent.
     lists: usize,
     list: usize,
@@ -201,70 +227,119 @@ impl Mesh {
         (self.part % 2) as usize
     }
 
-    /// Open a round of `view`: send the nonzero-weight rows of `batch` split by `plan` as its
-    /// first part. `fold` is [`crate::query::DriveHost::exchange`]'s; `drained` is
-    /// this worker's claim, which [`Self::step`] answers with every worker's.
-    /// Fatal while a round is open, or on a row larger than an outbox.
-    pub(crate) fn open<'b>(
-        &mut self,
-        view: u64,
-        batch: Cow<'b, Batch>,
-        plan: &ScatterPlan,
-        fold: bool,
-        drained: bool,
-    ) -> Round<'b> {
-        assert!(!self.in_round, "exchange of view {view}: a round is already open");
+    /// The most lanes one round carries: as many heads as fit the page before
+    /// the blocks.
+    pub(crate) fn max_lanes(&self) -> usize {
+        (BLOCKS_AT - size_of::<Head>()) / self.lane_bytes()
+    }
+
+    fn lane_bytes(&self) -> usize {
+        size_of::<LaneHead>() + self.nw() * size_of::<Span>()
+    }
+
+    /// Open a round of `lanes`: send the nonzero-weight rows of each lane's
+    /// batch split by its plan, all behind the same arrivals, as the round's
+    /// first part. Every worker opens the same lanes in the same order, at most
+    /// [`Self::max_lanes`]. `drained` is this worker's claim, which
+    /// [`Self::step`] answers with every worker's. Fatal while a round is open,
+    /// or on a row larger than an outbox.
+    pub(crate) fn open<'b>(&mut self, lanes: impl ExactSizeIterator<Item = Lane<'b>>, drained: bool) -> Round<'b> {
+        assert!(!self.in_round, "exchange: a round is already open");
+        assert!(
+            (1..=self.max_lanes()).contains(&lanes.len()),
+            "exchange: a round of {} lanes",
+            lanes.len()
+        );
         self.in_round = true;
-        let nw = self.nw();
-        let lists = plan.route(&batch.as_mem_batch(), &mut self.routed, nw).len();
-        let mut round = Round {
-            view,
-            schema: *batch.schema(),
-            drained,
-            consolidated: fold && batch.is_consolidated(),
-            unsent: Some((Cursor { lists, list: 0, offset: 0 }, batch)),
-            saved: Vec::new(),
-            merge: true,
-        };
+        let lanes = lanes
+            .map(|Lane { view, batch, plan, fold }| LaneRound {
+                view,
+                schema: *batch.schema(),
+                consolidated: fold && batch.is_consolidated(),
+                unsent: Some((batch, plan)),
+                saved: Vec::new(),
+                merge: true,
+            })
+            .collect();
+        let mut round = Round { drained, lanes, at: None };
+        round.at = self.enter(&round, 0);
         self.send_part(&mut round);
         round
     }
 
+    /// Route `round`'s lane `lane`, the next to write, into [`Self::routed`],
+    /// and answer a cursor at its first list; `None` past the last lane.
+    fn enter(&mut self, round: &Round<'_>, lane: usize) -> Option<Cursor> {
+        let (batch, plan) = round
+            .lanes
+            .get(lane)?
+            .unsent
+            .as_ref()
+            .expect("a lane is entered unsent");
+        let nw = self.nw();
+        let lists = plan.route(&batch.as_mem_batch(), &mut self.routed, nw).len();
+        Some(Cursor { lane, lists, list: 0, offset: 0 })
+    }
+
+    /// Lane `lane`'s head, and the [`Span`]s after it, in worker `w`'s outbox
+    /// for the current part.
+    fn lane_at(&self, w: usize, lane: usize) -> (*mut LaneHead, *mut Span) {
+        // SAFETY: `open` bounds the lanes to what fits the outbox's first page.
+        unsafe {
+            let head = self.outbox(w).add(size_of::<Head>() + lane * self.lane_bytes());
+            (head.cast(), head.add(size_of::<LaneHead>()).cast())
+        }
+    }
+
     /// Send `round`'s next part: what is left of its rows, or nothing.
     fn send_part(&mut self, round: &mut Round<'_>) {
-        let mut head = Head {
-            view: round.view,
-            drained: round.drained as u64,
-            consolidated: round.consolidated as u64,
-            more: 0,
-            blocks: [Span { at: 0, len: 0 }; MAX_WORKERS],
-        };
-        let mut end = BLOCKS_AT;
-        if let Some((at, batch)) = &mut round.unsent {
-            let more;
-            (end, more) = self.write_rows(batch, at, &mut head.blocks);
-            if more && end == BLOCKS_AT {
-                gnitz_fatal_abort!(
-                    "exchange of view {}: a row does not fit the {}-byte outbox",
-                    head.view,
-                    self.outbox_bytes
-                );
-            }
-            head.more = more as u64;
-            if !more {
-                round.unsent = None;
+        let nw = self.nw();
+        for (i, lane) in round.lanes.iter().enumerate() {
+            let (head, spans) = self.lane_at(self.rank, i);
+            // SAFETY: this worker's own outbox, which no peer reads until the
+            // arrival that follows; a lane's head is 8-aligned.
+            unsafe {
+                head.write(LaneHead {
+                    view: lane.view,
+                    consolidated: lane.consolidated as u64,
+                });
+                std::slice::from_raw_parts_mut(spans, nw).fill(Span { at: 0, len: 0 });
             }
         }
+        let (mut end, mut more) = (BLOCKS_AT, false);
+        while let Some(at) = &mut round.at {
+            let lane = &mut round.lanes[at.lane];
+            let (batch, _) = lane.unsent.as_ref().expect("the cursor's lane is unsent");
+            // SAFETY: as above.
+            let spans = unsafe { std::slice::from_raw_parts_mut(self.lane_at(self.rank, at.lane).1, nw) };
+            (end, more) = self.write_rows(batch, at, end, spans);
+            if more {
+                if end == BLOCKS_AT {
+                    gnitz_fatal_abort!(
+                        "exchange of view {}: a row does not fit the {}-byte outbox",
+                        lane.view,
+                        self.outbox_bytes
+                    );
+                }
+                break;
+            }
+            lane.unsent = None;
+            let next = at.lane + 1;
+            round.at = self.enter(round, next);
+        }
+        let head = Head {
+            lanes: round.lanes.len() as u64,
+            drained: round.drained as u64,
+            more: more as u64,
+        };
         self.arrive(&head, end);
     }
 
-    /// Write `batch`'s rows from `at` as one block per row list, naming each in
-    /// `blocks`, until the lists end or the outbox fills. Returns where the
-    /// blocks end, and whether rows are left.
-    fn write_rows(&self, batch: &Batch, at: &mut Cursor, blocks: &mut [Span; MAX_WORKERS]) -> (usize, bool) {
-        let nw = self.nw();
+    /// Write `batch`'s rows from `at`, starting at `end`, as one block per row
+    /// list of its lane, naming each in `spans`, until the lists end or the
+    /// outbox fills. Returns where the blocks end, and whether rows are left.
+    fn write_rows(&self, batch: &Batch, at: &mut Cursor, mut end: usize, spans: &mut [Span]) -> (usize, bool) {
         let outbox = self.outbox(self.rank);
-        let mut end = BLOCKS_AT;
         while at.list < at.lists {
             let rest = &self.routed[at.list][at.offset..];
             if !rest.is_empty() {
@@ -276,8 +351,8 @@ impl Mesh {
                 };
                 let span = Span { at: end as u32, len: len as u32 };
                 match at.lists {
-                    1 => blocks[..nw].fill(span),
-                    _ => blocks[at.list] = span,
+                    1 => spans.fill(span),
+                    _ => spans[at.list] = span,
                 }
                 end = (end + len).next_multiple_of(8);
                 if n < rest.len() {
@@ -351,61 +426,80 @@ impl Mesh {
 
     /// Take in the current part once it is complete. `None`: the part is
     /// incomplete, or `round`'s next part was sent. `Some`: the round is closed —
-    /// the rows every peer sent this worker, and whether every worker's source
-    /// was drained.
-    pub(crate) fn step(&mut self, round: &mut Round<'_>) -> Option<(Batch, bool)> {
+    /// pushed to `gathered`, per lane, the rows every peer sent this worker;
+    /// answered, whether every worker's source was drained.
+    pub(crate) fn step(&mut self, round: &mut Round<'_>, gathered: &mut Vec<Batch>) -> Option<bool> {
         assert!(self.in_round, "step without an open round");
         if !self.complete() {
             return None;
         }
-        let (view, rank, nw) = (round.view, self.rank, self.nw());
+        let (rank, nw) = (self.rank, self.nw());
         let (mut drained, mut more) = (true, false);
-        // The non-empty blocks peers sent this worker; they stay as read until
-        // this worker's next arrival.
-        let mut blocks: SmallVec<[&[u8]; MAX_WORKERS]> = SmallVec::new();
         for peer in 0..nw {
             let head = self.head(peer);
-            if head.view != view {
+            if head.lanes != round.lanes.len() as u64 {
                 gnitz_fatal_abort!(
-                    "exchange of view {view}: worker {peer} published view {} — workers diverged",
-                    head.view
+                    "exchange of view {}: worker {peer} published {} lanes, not {} — workers diverged",
+                    round.lanes[0].view,
+                    head.lanes,
+                    round.lanes.len()
                 );
             }
             drained &= head.drained != 0;
             more |= head.more != 0;
-            let block = self.block(peer, head.blocks[rank]);
-            if !block.is_empty() {
-                round.merge &= head.consolidated != 0;
-                blocks.push(block);
-            }
         }
+        for (i, lane) in round.lanes.iter_mut().enumerate() {
+            let view = lane.view;
+            // The non-empty blocks peers sent this worker; they stay as read
+            // until this worker's next arrival.
+            let mut blocks: SmallVec<[&[u8]; MAX_WORKERS]> = SmallVec::new();
+            for peer in 0..nw {
+                let (head, spans) = self.lane_at(peer, i);
+                // SAFETY: the peer wrote its lane heads before the arrival
+                // `complete` observed, and rewrites them only after this
+                // worker's next arrival; `head.lanes` bounds `i`.
+                let (head, span) = unsafe { (&*head, *spans.add(rank)) };
+                if head.view != view {
+                    gnitz_fatal_abort!(
+                        "exchange of view {view}: worker {peer} published view {} — workers diverged",
+                        head.view
+                    );
+                }
+                let block = self.block(peer, span);
+                if !block.is_empty() {
+                    lane.merge &= head.consolidated != 0;
+                    blocks.push(block);
+                }
+            }
+            if more {
+                lane.saved.extend(blocks.into_iter().map(<[u8]>::to_vec));
+                continue;
+            }
+            let schema = &lane.schema;
+            let slices: SmallVec<[MemBatch; MAX_WORKERS]> = lane
+                .saved
+                .iter()
+                .map(Vec::as_slice)
+                .chain(blocks)
+                .map(|block| {
+                    MemBatch::of_wal_block(block, schema)
+                        .unwrap_or_else(|e| gnitz_fatal_abort!("exchange of view {view}: a peer's block: {e}"))
+                })
+                .collect();
+            // Z-set `+` over the lane's slices: merged where every sender's were
+            // consolidated, else concatenated in order.
+            gathered.push(match lane.merge {
+                true => merge_consolidated(&slices, schema),
+                false => Batch::concat(schema, slices.iter().copied()),
+            });
+        }
+        self.part += 1;
         if more {
-            round.saved.extend(blocks.into_iter().map(<[u8]>::to_vec));
-            self.part += 1;
             self.send_part(round);
             return None;
         }
-        let schema = &round.schema;
-        let slices: SmallVec<[MemBatch; MAX_WORKERS]> = round
-            .saved
-            .iter()
-            .map(Vec::as_slice)
-            .chain(blocks)
-            .map(|block| {
-                MemBatch::of_wal_block(block, schema)
-                    .unwrap_or_else(|e| gnitz_fatal_abort!("exchange of view {view}: a peer's block: {e}"))
-            })
-            .collect();
-        // Z-set `+` over the round's slices: merged where every sender's were
-        // consolidated, else concatenated in order.
-        let rows = match round.merge {
-            true => merge_consolidated(&slices, schema),
-            false => Batch::concat(schema, slices.iter().copied()),
-        };
-        drop(slices);
-        self.part += 1;
         self.in_round = false;
-        Some((rows, drained))
+        Some(drained)
     }
 
     /// `peer`'s head for the current part.

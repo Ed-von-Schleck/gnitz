@@ -35,9 +35,9 @@ fn mesh_round_bench() {
                     for _ in 0..ROUNDS {
                         rounds.clear();
                         let opened = mesh.iter_mut().zip(&parts);
-                        rounds.extend(opened.map(|(m, batch)| m.open(9, Cow::Borrowed(batch), plan, fold, true)));
+                        rounds.extend(opened.map(|(m, batch)| m.open_one(9, Cow::Borrowed(batch), plan, fold, true)));
                         for (m, round) in mesh.iter_mut().zip(&mut rounds) {
-                            let (rows, _) = m.step(round).expect("a round that fits one part");
+                            let (rows, _) = m.step_one(round).expect("a round that fits one part");
                             got += rows.len() as u64;
                         }
                     }

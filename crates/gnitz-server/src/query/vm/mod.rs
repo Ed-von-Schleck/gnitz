@@ -201,6 +201,9 @@ pub(in crate::query) struct Vm {
     out_reg: DeltaReg,
     /// The child stores the instructions and integrates address.
     layout: StateLayout,
+    /// An epoch stopped at a round since the last end of a run: the registers
+    /// may hold its rows.
+    standing: bool,
 }
 
 /// Who last reads a register: an instruction, an integrate — which run after
@@ -260,6 +263,26 @@ impl Vm {
     /// it stands.
     pub(in crate::query) fn folds(&self, reg: DeltaReg) -> bool {
         self.regs[reg.at()].fold
+    }
+
+    /// Label `seed` with `reg`'s schema and fold it where `reg` folds: what an
+    /// epoch seeding `reg` makes of its seed, so a lent seed comes back so.
+    pub(in crate::query) fn label_seed(&self, reg: DeltaReg, seed: &mut Batch) {
+        let want = &self.regs[reg.at()].schema;
+        // Rows under the wrong layout would scramble every downstream read
+        // silently.
+        assert!(
+            seed.schema().same_region_types(want),
+            "VM register {} schema/batch region mismatch",
+            reg.0,
+        );
+        // A producer's label may be narrower in nullability. Every kernel labels
+        // what it writes with its register's schema, so from here on every
+        // register's batch carries its own.
+        seed.set_schema(want);
+        if self.regs[reg.at()].fold {
+            seed.consolidate_in_place();
+        }
     }
 
     /// An epoch seeding `reg` with an empty delta does nothing: it runs no

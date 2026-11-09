@@ -134,12 +134,18 @@ impl TestVm {
         mut gather: impl FnMut(&Batch, bool) -> Batch,
     ) -> Batch {
         self.drive(|vm, stores| {
-            let mut epoch = Epoch::tick(reg, seed, take);
+            let mut epoch = Epoch::tick(reg, seed.take(), take);
             let mut gathered = None;
             loop {
                 match run(vm, stores, &mut epoch, gathered.take())? {
-                    Ran::Done(out) => return Ok(out),
-                    Ran::Round { batch, .. } => {
+                    Ran::Done(out) => {
+                        if let Some(lent) = epoch.into_lent() {
+                            *seed = lent;
+                        }
+                        return Ok(out);
+                    }
+                    Ran::Round { .. } => {
+                        let batch = epoch.operand();
                         let lent = matches!(batch, Cow::Borrowed(_));
                         gathered = Some(gather(&batch, lent));
                     }
@@ -492,6 +498,39 @@ fn a_round_sends_its_operand_and_resumes_from_what_it_gathered() {
         [(true, true, weighted_rows(&make_batch_u128(&schema, &[(1, -1, 10)])))]
     );
     assert_rows(&got, &[(1, -1, 10), (7, 2, 70)]);
+}
+
+/// An epoch given up at its round leaves rows in a register a later
+/// instruction reads; the program's next run frees them before it starts, so an
+/// empty seed, which skips the instruction that writes that register, does not
+/// read them.
+#[test]
+fn a_run_after_an_epoch_left_at_its_round_starts_from_empty_registers() {
+    let schema = make_schema_u128_i64();
+    let mut p = ProgramBuilder::default();
+    let r0 = p.seed(schema);
+    let negated = p.push(r0, schema, Op::Negate);
+    let gathered = p.round(r0, own_rows(&schema));
+    let out = p.push(gathered, schema, Op::Union { in_b: negated });
+    let mut vm = TestVm::open(p, out);
+
+    let mut stores = Stores {
+        own: &mut vm.state,
+        registry: &vm.registry,
+        unfed: &vm.unfed,
+    };
+    let mut left = Epoch::tick(r0, make_batch_u128(&schema, &[(1, 1, 10)]), true);
+    let ran = run(&mut vm.vm, &mut stores, &mut left, None).unwrap();
+    assert!(matches!(ran, Ran::Round { .. }));
+    drop(left);
+    assert!(
+        vm.vm.batches.iter().any(|b| !b.is_empty()),
+        "the abandoned epoch's negation stands"
+    );
+
+    let mut seed = Batch::empty_with_schema(&schema);
+    let got = vm.epoch_with(r0, &mut seed, true, |_, _| make_batch_u128(&schema, &[(7, 2, 70)]));
+    assert_rows(&got, &[(7, 2, 70)]);
 }
 
 /// A round over the seed lends the caller's batch on, taking it only where the

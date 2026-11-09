@@ -344,15 +344,14 @@ impl crate::query::DriveHost for CatalogEngine {
         (&mut self.dag, &mut self.registry)
     }
 
-    fn exchange(
+    fn exchange<'b>(
         &mut self,
-        _view_id: u64,
-        batch: std::borrow::Cow<'_, Batch>,
-        _plan: &gnitz_zset::algebra::ScatterPlan,
-        _fold: bool,
+        lanes: impl ExactSizeIterator<Item = crate::query::Lane<'b>>,
         drained: bool,
-    ) -> (Batch, bool) {
-        (batch.into_owned(), drained)
+        gathered: &mut Vec<Batch>,
+    ) -> bool {
+        gathered.extend(lanes.map(|lane| lane.batch.into_owned()));
+        drained
     }
 }
 
@@ -362,15 +361,17 @@ pub fn push_and_tick(engine: &mut CatalogEngine, tid: u64, rows: Batch) {
     crate::query::tick(engine, tid, 1).unwrap();
 }
 
-/// A [`CatalogEngine`] driven as itself, counting the rounds it exchanged.
+/// A [`CatalogEngine`] driven as itself, counting the rounds it exchanged and
+/// the waits they shared.
 pub struct EchoDrive<'a> {
     pub cat: &'a mut CatalogEngine,
     pub rounds: u64,
+    pub waits: u64,
 }
 
 impl<'a> EchoDrive<'a> {
     pub fn new(cat: &'a mut CatalogEngine) -> Self {
-        EchoDrive { cat, rounds: 0 }
+        EchoDrive { cat, rounds: 0, waits: 0 }
     }
 }
 
@@ -384,16 +385,15 @@ impl crate::query::DriveHost for EchoDrive<'_> {
         crate::query::DriveHost::parts(self.cat)
     }
 
-    fn exchange(
+    fn exchange<'b>(
         &mut self,
-        view_id: u64,
-        batch: std::borrow::Cow<'_, Batch>,
-        plan: &gnitz_zset::algebra::ScatterPlan,
-        fold: bool,
+        lanes: impl ExactSizeIterator<Item = crate::query::Lane<'b>>,
         drained: bool,
-    ) -> (Batch, bool) {
-        self.rounds += 1;
-        crate::query::DriveHost::exchange(self.cat, view_id, batch, plan, fold, drained)
+        gathered: &mut Vec<Batch>,
+    ) -> bool {
+        self.rounds += lanes.len() as u64;
+        self.waits += 1;
+        crate::query::DriveHost::exchange(self.cat, lanes, drained, gathered)
     }
 }
 

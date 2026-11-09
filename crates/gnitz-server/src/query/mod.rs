@@ -6,4 +6,4 @@ mod compiler;
 mod dag;
 mod vm;
 
-pub(crate) use dag::{backfill, tick, DagEngine, DriveHost};
+pub(crate) use dag::{backfill, tick, DagEngine, DriveHost, Lane};

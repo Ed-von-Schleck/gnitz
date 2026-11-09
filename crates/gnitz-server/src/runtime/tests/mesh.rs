@@ -1,10 +1,33 @@
 use super::*;
+use crate::query::Lane;
 use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, make_string_batch,
     opk_pk, weighted_rows,
 };
 use gnitz_wire::wal::WAL_HEADER_SIZE;
 use gnitz_zset::algebra::{Placement, Slot};
+
+impl Mesh {
+    /// Open a round of one lane, of view `view`.
+    pub(crate) fn open_one<'b>(
+        &mut self,
+        view: u64,
+        batch: Cow<'b, Batch>,
+        plan: &'b ScatterPlan,
+        fold: bool,
+        drained: bool,
+    ) -> Round<'b> {
+        self.open(std::iter::once(Lane { view, batch, plan, fold }), drained)
+    }
+
+    /// [`Self::step`] of a round of one lane: its rows, and the round's verdict.
+    pub(crate) fn step_one(&mut self, round: &mut Round<'_>) -> Option<(Batch, bool)> {
+        let mut rows = Vec::with_capacity(1);
+        let drained = self.step(round, &mut rows)?;
+        assert_eq!(rows.len(), 1, "a round of one lane");
+        Some((rows.pop().expect("one lane"), drained))
+    }
+}
 
 const NW: usize = 3;
 
@@ -72,7 +95,7 @@ fn assert_gathered(
 /// Worker `r` gathers round `round` of [`partition`]s of 8 rows, a single part.
 fn gather_one(mesh: &mut Mesh, open: &mut Round<'_>, round: u64, spec: &ScatterPlan, drained: [bool; NW]) {
     let parts: Vec<Batch> = (0..NW).map(|w| partition(w, round, 8)).collect();
-    let got = mesh.step(open).expect("a round that fits one part");
+    let got = mesh.step_one(open).expect("a round that fits one part");
     assert_gathered(mesh.rank, got, &parts, spec, &drained, true);
 }
 
@@ -82,7 +105,7 @@ fn run_round(mesh: &mut [Mesh], parts: &[Batch], spec: &ScatterPlan, drained: &[
         .iter_mut()
         .zip(parts)
         .zip(drained)
-        .map(|((m, batch), &d)| m.open(9, Cow::Borrowed(batch), spec, fold, d))
+        .map(|((m, batch), &d)| m.open_one(9, Cow::Borrowed(batch), spec, fold, d))
         .collect();
     finish_round(mesh, rounds, parts, spec, drained, fold)
 }
@@ -100,7 +123,7 @@ fn finish_round(
     let mut count = 1;
     loop {
         assert!(mesh.iter().all(Mesh::complete), "part {count} completes");
-        let out: Vec<Option<(Batch, bool)>> = mesh.iter_mut().zip(&mut rounds).map(|(m, r)| m.step(r)).collect();
+        let out: Vec<Option<(Batch, bool)>> = mesh.iter_mut().zip(&mut rounds).map(|(m, r)| m.step_one(r)).collect();
         if out.iter().all(Option::is_some) {
             for (r, got) in out.into_iter().flatten().enumerate() {
                 assert_gathered(r, got, parts, spec, drained, fold);
@@ -126,7 +149,7 @@ fn every_worker_gathers_each_round_from_every_peer() {
     let routes = [&pk, &ScatterPlan::broadcast()];
     let drained = [[true, true, false], [true; NW]];
     let open = |m: &mut Mesh, w: usize, round: usize| {
-        m.open(
+        m.open_one(
             9,
             Cow::Owned(partition(w, round as u64, 8)),
             routes[round],
@@ -147,7 +170,7 @@ fn every_worker_gathers_each_round_from_every_peer() {
         rounds[w] = open(&mut mesh[w], w, 1);
     }
     assert!(
-        mesh[0].step(&mut rounds[0]).is_none(),
+        mesh[0].step_one(&mut rounds[0]).is_none(),
         "round 1 is incomplete until the last worker opens it"
     );
     let last = NW - 1;
@@ -165,8 +188,9 @@ fn every_worker_gathers_each_round_from_every_peer() {
 fn a_second_open_before_the_round_closes_is_refused() {
     let mut mesh = meshes(NW, SMALL_OUTBOX);
     let batch = partition(0, 0, 8);
-    let _first = mesh[0].open(9, Cow::Borrowed(&batch), &ScatterPlan::broadcast(), true, true);
-    mesh[0].open(9, Cow::Borrowed(&batch), &ScatterPlan::broadcast(), true, true);
+    let plan = ScatterPlan::broadcast();
+    let _first = mesh[0].open_one(9, Cow::Borrowed(&batch), &plan, true, true);
+    mesh[0].open_one(9, Cow::Borrowed(&batch), &plan, true, true);
 }
 
 // ── Multi-part rounds ───────────────────────────────────────────────────────
@@ -273,17 +297,75 @@ fn a_list_that_fills_the_outbox_exactly_defers_the_next() {
     let rounds: Vec<Round> = mesh
         .iter_mut()
         .zip(&parts)
-        .map(|(m, batch)| m.open(9, Cow::Borrowed(batch), &spec, true, true))
+        .map(|(m, batch)| m.open_one(9, Cow::Borrowed(batch), &spec, true, true))
         .collect();
-    // SAFETY: worker 0 wrote its head before its arrival.
-    let head = unsafe { &*mesh[0].outbox(0).cast::<Head>() };
+    // SAFETY: worker 0 wrote its lane's spans before its arrival.
+    let spans = unsafe { &*mesh[0].lane_at(0, 0).1.cast::<[Span; 2]>() };
     assert_eq!(
-        head.blocks[0].at + head.blocks[0].len,
+        spans[0].at + spans[0].len,
         SMALL_OUTBOX as u32,
         "list 0 fills the outbox"
     );
-    assert_eq!(head.blocks[1].len, 0, "list 1 waits for the next part");
+    assert_eq!(spans[1].len, 0, "list 1 waits for the next part");
     assert_eq!(finish_round(&mut mesh, rounds, &parts, &spec, &[true, true], true), 2);
+}
+
+/// Several views' lanes share one round: each lane is gathered as a round of
+/// its own would be — an empty lane, a broadcast one, and one that overflows
+/// into later parts while the lanes before it are already sent.
+#[test]
+fn a_round_of_several_lanes_gathers_each_as_its_own() {
+    let mut mesh = meshes(NW, SMALL_OUTBOX);
+    let schema = make_schema_u64_i64();
+    let pk = by_pk(&schema);
+    let broadcast = ScatterPlan::broadcast();
+    let specs = [&pk, &pk, &broadcast, &pk];
+    let lanes: Vec<Vec<Batch>> = vec![
+        (0..NW).map(|w| partition(w, 0, 8)).collect(),
+        (0..NW).map(|_| Batch::empty_with_schema(&schema)).collect(),
+        (0..NW).map(|w| partition(w, 1, 5)).collect(),
+        (0..NW).map(|w| partition(w, 2, 1000)).collect(),
+    ];
+    assert!(mesh[0].max_lanes() >= lanes.len());
+    let mut rounds: Vec<Round> = mesh
+        .iter_mut()
+        .enumerate()
+        .map(|(w, m)| {
+            let lanes: Vec<Lane> = (lanes.iter().zip(specs).enumerate())
+                .map(|(i, (parts, plan))| Lane {
+                    view: 7 + i as u64,
+                    batch: Cow::Borrowed(&parts[w]),
+                    plan,
+                    fold: true,
+                })
+                .collect();
+            m.open(lanes.into_iter(), true)
+        })
+        .collect();
+    let mut count = 1;
+    let gathered = loop {
+        let out: Vec<_> = (mesh.iter_mut().zip(&mut rounds))
+            .map(|(m, r)| {
+                let mut rows = Vec::new();
+                m.step(r, &mut rows).map(|drained| (rows, drained))
+            })
+            .collect();
+        if out.iter().all(Option::is_some) {
+            break out;
+        }
+        assert!(
+            out.iter().all(Option::is_none),
+            "every worker agrees whether another part runs"
+        );
+        count += 1;
+    };
+    assert!(count >= 3, "the last lane crosses several parts: {count}");
+    for (r, (rows, drained)) in gathered.into_iter().flatten().enumerate() {
+        assert_eq!(rows.len(), lanes.len());
+        for ((rows, parts), spec) in rows.into_iter().zip(&lanes).zip(specs) {
+            assert_gathered(r, (rows, drained), parts, spec, &[true; NW], true);
+        }
+    }
 }
 
 /// A trim frees the pages past the part, in a mapping every worker shares.

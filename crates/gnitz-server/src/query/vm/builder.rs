@@ -152,6 +152,7 @@ impl ProgramBuilder {
             regs: regs.into_boxed_slice(),
             out_reg,
             layout,
+            standing: false,
         }
     }
 }

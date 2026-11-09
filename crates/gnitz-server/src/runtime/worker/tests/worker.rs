@@ -1,5 +1,6 @@
 use super::*;
 use crate::catalog::SysFamily;
+use crate::query::Lane;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::test_log;
@@ -408,8 +409,16 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
 
     // One worker: its own publish completes the round.
     let part = make_batch_raw(&schema, &[(1, 1, 10)]);
-    let (got, _) = wp.exchange(9, Cow::Borrowed(&part), &ScatterPlan::broadcast(), false, false);
-    assert_eq!(weighted_rows(&got), weighted_rows(&part));
+    let plan = ScatterPlan::broadcast();
+    let lane = Lane {
+        view: 9,
+        batch: Cow::Borrowed(&part),
+        plan: &plan,
+        fold: false,
+    };
+    let mut got = Vec::new();
+    wp.exchange(std::iter::once(lane), false, &mut got);
+    assert_eq!(weighted_rows(&got[0]), weighted_rows(&part));
     assert_eq!(reqs(&frames(&rx)), [1]);
     let next = wp.next_request().expect("the second read is still on the SAL");
     assert!(matches!(next, Inbound::Read { route, .. } if route.request_id == id(2)));
@@ -429,8 +438,14 @@ fn exchange_answers_the_rounds_verdict() {
         let mut peer = meshes.pop().unwrap();
         wp.mesh = meshes.pop().unwrap();
         // The peer arrives first, so this worker's own open completes the round.
-        let _peers_round = peer.open(9, Cow::Borrowed(&part), &plan, false, peers);
-        let (_, drained) = wp.exchange(9, Cow::Borrowed(&part), &plan, false, own);
+        let _peers_round = peer.open_one(9, Cow::Borrowed(&part), &plan, false, peers);
+        let lane = Lane {
+            view: 9,
+            batch: Cow::Borrowed(&part),
+            plan: &plan,
+            fold: false,
+        };
+        let drained = wp.exchange(std::iter::once(lane), own, &mut Vec::new());
         assert_eq!(drained, all, "own claim {own}, the peer's {peers}");
     }
 }
