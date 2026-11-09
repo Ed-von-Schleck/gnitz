@@ -125,7 +125,7 @@ fn a_published_store_put_elsewhere_opens_with_the_checkpointed_rows() {
     let mut r = relation_fixture_with(
         spilling(),
         Slot::SOLO,
-        RelationKind::BaseTable,
+        spec(TID, RelationKind::BaseTable, schema),
         schema,
         &[&[1]],
         [make_batch_raw(&schema, &rows)],

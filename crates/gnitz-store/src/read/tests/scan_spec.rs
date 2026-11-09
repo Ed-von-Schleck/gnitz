@@ -1,12 +1,13 @@
 use super::*;
-use crate::relation::{Cut as At, RelationKind};
+use crate::relation::{Cut as At, RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
     batch_rows, between, col_range, cut, id_rows, img, make_batch_raw, make_schema_u64_i64, map_of, order_by,
-    relation_fixture, rows_spec, zset_of, RelationFixture, Rng, TID,
+    relation_fixture, relation_fixture_with, rows_spec, spec, spilling, zset_of, RelationFixture, Rng, TID,
 };
 use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::{AggDescriptor, GroupAggs, KeyRange, PkColList, ReadBound, ReadSink, SinkKind};
 use gnitz_wire::{PkKeys, TypeCode, ViewBudget};
+use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::{BatchBuilder, SourceCursor};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
@@ -15,8 +16,22 @@ use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 /// may repeat and a weight above 1 is admitted verbatim.
 fn view(rows: &[(u64, i64, i64)]) -> RelationFixture {
     let schema = make_schema_u64_i64();
-    let kind = RelationKind::View(ViewBudget::Plain);
-    relation_fixture(kind, schema, &[], [make_batch_raw(&schema, rows)])
+    let batch = make_batch_raw(&schema, rows);
+    view_with(StoreConfig::default(), schema, [batch])
+}
+
+/// A plain view over `schema` under `config`, holding `rounds`: a view whose
+/// PKs repeat.
+fn view_with(
+    config: StoreConfig,
+    schema: SchemaDescriptor,
+    rounds: impl IntoIterator<Item = Batch>,
+) -> RelationFixture {
+    let spec = RelationSpec {
+        pk_repeats: true,
+        ..spec(TID, RelationKind::View(ViewBudget::Plain), schema)
+    };
+    relation_fixture_with(config, Slot::SOLO, spec, schema, &[], rounds)
 }
 
 /// `spec` over `TID`, replying in the layout its sink produces.
@@ -141,19 +156,11 @@ fn a_filtered_read_over_many_runs_keeps_the_survivors_net_weights() {
             .map(|((id, val), w)| (id, w, val))
             .collect();
         want.sort_unstable();
-        for config in [crate::relation::StoreConfig::default(), crate::test_support::spilling()] {
+        for config in [StoreConfig::default(), spilling()] {
             let batches = rounds
                 .iter()
                 .map(|rows| make_batch_raw(&schema, rows).into_consolidated());
-            let kind = RelationKind::View(ViewBudget::Plain);
-            let mut r = crate::test_support::relation_fixture_with(
-                config,
-                gnitz_zset::algebra::Slot::SOLO,
-                kind,
-                schema,
-                &[],
-                batches,
-            );
+            let mut r = view_with(config, schema, batches);
             r.set_scan_chunk_rows(1 + rng.gen_range(24) as usize);
             let spec = ReadSpec {
                 predicate: between(1, lo, hi),

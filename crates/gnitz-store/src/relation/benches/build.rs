@@ -13,7 +13,7 @@ fn index_fill_bench() {
     let counter = gnitz_foundation::perf::Counter::instructions();
     for shards in [1, 3] {
         for (what, cols) in [("I64 column", &[1u32][..]), ("two I64 columns", &[1, 3])] {
-            let mut r = wide_on_disk(3 << 17, shards);
+            let mut r = wide_on_disk(RelationKind::BaseTable, 3 << 17, shards);
             let rows = r.relation(TID).unwrap().table().estimated_rows();
             let claim = (
                 IndexClaim::Index { id: TID + 1, unique: false },

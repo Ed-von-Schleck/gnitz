@@ -115,6 +115,9 @@ pub(in crate::query) struct HistoryTerm {
     /// one of the clamp's input.
     pub(in crate::query) steps: Box<[usize]>,
     pub(in crate::query) negated: bool,
+    /// The relation's payload columns, as payload bits, its scan's readers
+    /// read: every one the steps do.
+    pub(in crate::query) read: u64,
 }
 
 /// The integral of a delta, as its readers find it: a join's probe, a reduce's

@@ -1,7 +1,7 @@
 use super::*;
 use crate::relation::RelationKind;
 use crate::test_support::{
-    make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, relation_fixture_with, spilling, TID,
+    make_batch_raw, make_schema_u64_i64, opk_pk, payload0_i64, relation_fixture_with, spec, spilling, TID,
 };
 use gnitz_wire::PkBuf;
 
@@ -32,7 +32,14 @@ fn pinned(slot: Slot) -> crate::test_support::RelationFixture {
     // Every third key retracted in a later round, so a drain meets cancelled groups.
     let cancelled: Vec<_> = (0..100).step_by(3).map(|k| (k, -1, 0)).collect();
     let rounds = [make_batch_raw(&schema, &all), make_batch_raw(&schema, &cancelled)];
-    let mut r = relation_fixture_with(spilling(), slot, RelationKind::BaseTable, schema, &[], rounds);
+    let mut r = relation_fixture_with(
+        spilling(),
+        slot,
+        spec(TID, RelationKind::BaseTable, schema),
+        schema,
+        &[],
+        rounds,
+    );
     r.pin(1).unwrap();
     r
 }

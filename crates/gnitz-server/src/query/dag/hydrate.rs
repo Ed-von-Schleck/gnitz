@@ -2,6 +2,7 @@
 //! output rows by replaying the view's own program over a key-restricted seed.
 
 use super::*;
+use crate::query::vm::Integral;
 use gnitz_wire::PkKeys;
 use gnitz_zset::repr::empty_cursor;
 use gnitz_zset::stream;
@@ -20,8 +21,13 @@ impl DagEngine {
             .hydration
             .ok_or_else(|| format!("view {view_id} holds skeleton rows but was compiled unbounded"))?;
 
+        // The replay reads of a scanned source's rows what its backfill does.
+        let read = match hydration.seed {
+            Integral::Relation(source) => code.scan(source).read,
+            Integral::Own(_) => u64::MAX,
+        };
         let vm = &mut code.vm;
-        let mut gather = stores.gather(hydration.seed, keys)?;
+        let mut gather = stores.gather(hydration.seed, keys, read)?;
         let mut out = Batch::empty_with_schema(vm.out_schema());
         while let Some(mut seed) = gather.drain_chunk(registry.scan_chunk_rows()) {
             if let Some(kind) = hydration.clamp {

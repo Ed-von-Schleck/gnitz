@@ -66,7 +66,7 @@ impl Stores<'_> {
         let mut keys = PkKeys::from_ascending(delta.schema().pk_stride(), delta.pk());
         let mut runs = SmallVec::new();
         for term in terms {
-            let mut gather = self.gather(Integral::Relation(term.relation), keys)?;
+            let mut gather = self.gather(Integral::Relation(term.relation), keys, term.read)?;
             let chunk = gather.drain_chunk(usize::MAX);
             keys = gather.into_keys();
             let Some(mut rows) = chunk else {
@@ -88,11 +88,12 @@ impl Stores<'_> {
         Ok(runs)
     }
 
-    /// Every live row of `keys` in `integral`.
-    pub(in crate::query) fn gather(&self, integral: Integral, keys: PkKeys) -> Result<PkSetGather, String> {
+    /// Every live row of `keys` in `integral`, for a reader of the payload
+    /// columns `read` names, as payload bits, of a relation's rows.
+    pub(in crate::query) fn gather(&self, integral: Integral, keys: PkKeys, read: u64) -> Result<PkSetGather, String> {
         Ok(match self.trace(integral)? {
             Trace::Child(idx) => self.own.gather(idx, keys),
-            Trace::Relation(relation) => relation.gather(keys, Cut::Sealed),
+            Trace::Relation(relation) => relation.gather(keys, Cut::Sealed, read),
             Trace::Unfed(relation) => PkSetGather::over(empty_cursor(relation.schema()), keys),
         })
     }

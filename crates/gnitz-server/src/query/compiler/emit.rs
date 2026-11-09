@@ -120,12 +120,9 @@ impl<'a> EmitCtx<'a> {
         }
     }
 
-    /// The source whose scans read `reg`.
-    fn scanned_at(&self, reg: DeltaReg) -> Option<u64> {
-        self.sources
-            .iter()
-            .find(|(_, scan)| scan.reg == reg)
-            .map(|&(source, _)| source)
+    /// The source whose scans read `reg`, and its scan.
+    fn scanned_at(&self, reg: DeltaReg) -> Option<&(u64, Scan)> {
+        self.sources.iter().find(|(_, scan)| scan.reg == reg)
     }
 
     /// `source`'s store where it holds, on this worker, the integral of the delta
@@ -154,7 +151,7 @@ impl<'a> EmitCtx<'a> {
         let (_, Op::Map(rekey), entry) = self.prog.writer(self.regs[of])? else {
             return None;
         };
-        let relation = self.integral_store(self.scanned_at(entry)?)?;
+        let relation = self.integral_store(self.scanned_at(entry)?.0)?;
         // The table's rows then sort by the integral's key first.
         rekey.rekeys_onto_pk_prefix()?;
         // An equal-key probe alone walks rows keyed wider than its delta.
@@ -184,9 +181,10 @@ impl<'a> EmitCtx<'a> {
     /// on the way, where the scanned table's store holds their history.
     fn history_term(&self, mut reg: DeltaReg, negated: bool) -> Option<HistoryTerm> {
         let mut steps = Vec::new();
-        let relation = loop {
-            if let Some(source) = self.scanned_at(reg) {
-                break source;
+        let (relation, read) = loop {
+            // The steps are readers of the scan, so read no column it does not.
+            if let Some(&(source, ref scan)) = self.scanned_at(reg) {
+                break (source, scan.read);
             }
             let (pc, op, input) = self.prog.writer(reg)?;
             match op {
@@ -200,7 +198,12 @@ impl<'a> EmitCtx<'a> {
         };
         self.integral_store(relation)?;
         steps.reverse();
-        Some(HistoryTerm { relation, steps: steps.into(), negated })
+        Some(HistoryTerm {
+            relation,
+            steps: steps.into(),
+            negated,
+            read,
+        })
     }
 
     /// The child integrating `of`'s register, declared and scheduled the first time

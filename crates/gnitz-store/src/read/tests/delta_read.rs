@@ -2,10 +2,10 @@
 //! under the same one holds that spec applied to the view, weight for weight.
 
 use super::*;
-use crate::relation::{RelationKind, StoreConfig};
+use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
     batch_rows, between, cmp_all, col_range, cut, fed_view, id_rows, img, make_batch_raw, make_schema_u64_i64, map_of,
-    pk_only_schema, pk_payload_schema, relation_fixture, relation_fixture_with, rows_spec, Rng, TID,
+    pk_only_schema, pk_payload_schema, relation_fixture, relation_fixture_with, rows_spec, spec, Rng, TID,
 };
 use gnitz_expr::{CmpOp, LogicalProgram};
 use gnitz_wire::{PkKeys, ReadSink, TypeCode, ViewBudget};
@@ -31,6 +31,15 @@ fn view_schema() -> SchemaDescriptor {
         ],
         &[3, 1],
     )
+}
+
+/// The fed view [`reads_past_any_cursor_match_a_model`] reads: its model
+/// holds several rows under one key, some at weights above 1.
+fn feed_spec(budget: u64) -> RelationSpec {
+    RelationSpec {
+        pk_repeats: true,
+        ..spec(TID, fed_view(budget), view_schema())
+    }
 }
 
 /// The reply of a projection onto `a`: `k2, k1 | a`.
@@ -247,7 +256,7 @@ fn reads_past_any_cursor_match_a_model() {
             ram_tier_bytes: [1 << 11, StoreConfig::default().ram_tier_bytes][(seed % 2) as usize],
             ..StoreConfig::default()
         };
-        let mut r = relation_fixture_with(config, Slot::SOLO, fed_view(budget), view_schema(), &[], []);
+        let mut r = relation_fixture_with(config, Slot::SOLO, feed_spec(budget), view_schema(), &[], []);
         r.set_scan_chunk_rows([1, 3, 200, 8192][(seed % 4) as usize]);
         let cases = cases();
         let mut subs: Vec<Subscriber> = (0..cases.len())

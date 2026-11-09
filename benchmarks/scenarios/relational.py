@@ -105,11 +105,20 @@ def parents(n, rng):
     }
 
 
+def overlap_row(k):
+    return dict(pk=k + 1, val=scatter(k, 32) % 500)
+
+
 def overlap(n, rng):
     """`t2` holds a tenth of `t1`'s keys, with the same value for each: the two
     agree on every row they share."""
+    return [], {"t1": Fact(overlap_row), "t2": Fact(overlap_row, share=0.1)}
+
+
+def overlap_wide(n, rng):
+    """`overlap`, each row carrying three TEXT columns no set operator reads."""
     def row(k):
-        return dict(pk=k + 1, val=scatter(k, 32) % 500)
+        return dict(overlap_row(k), **{c: f"wide column {c} of row {k:09d} " + "pad " * 8 for c in "xyz"})
     return [], {"t1": Fact(row), "t2": Fact(row, share=0.1)}
 
 
@@ -247,6 +256,15 @@ SCENARIOS = [
              ("union_all", "UNION ALL"), ("union", "UNION"), ("intersect", "INTERSECT"),
              ("intersect_all", "INTERSECT ALL"), ("except", "EXCEPT"), ("except_all", "EXCEPT ALL")))],
         overlap),
+    Shape(
+        "setops_wide", "relational",
+        "the PK-carrying set operators over two wide tables, each reading two of their five columns",
+        ("l0", "compacted"),
+        [*(f"CREATE TABLE {t} (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL, x TEXT NOT NULL, "
+           "y TEXT NOT NULL, z TEXT NOT NULL)" for t in ("t1", "t2")),
+         *(f"CREATE VIEW v_{name} AS SELECT pk, val FROM t1 {op} SELECT pk, val FROM t2" for name, op in (
+             ("union", "UNION"), ("intersect", "INTERSECT"), ("except", "EXCEPT")))],
+        overlap_wide),
     Shape(
         "aggregates", "relational",
         "one table under every aggregate and per-row shape: global, two-key and TEXT-keyed groups, a sum of an "

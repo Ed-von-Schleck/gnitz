@@ -136,13 +136,16 @@ impl SecondaryIndex {
             IndexStore::OwnerPk => {
                 let key_size = self.key_spec.key_size();
                 let mut entry = Vec::with_capacity(key_size + owner.schema().pk_stride());
-                owner.gather(spans, Cut::Now).for_each_positive_capped(cap, |c| {
-                    let pk = c.current_pk_bytes();
-                    entry.clear();
-                    entry.extend_from_slice(&pk[..key_size]);
-                    entry.extend_from_slice(pk);
-                    f(&entry);
-                });
+                owner
+                    .table()
+                    .gather(spans, Cut::Now)
+                    .for_each_positive_capped(cap, |c| {
+                        let pk = c.current_pk_bytes();
+                        entry.clear();
+                        entry.extend_from_slice(&pk[..key_size]);
+                        entry.extend_from_slice(pk);
+                        f(&entry);
+                    });
             }
             _ => self
                 .held()
@@ -364,13 +367,13 @@ impl Relation {
     }
 
     /// The payload columns, as payload bits, a drain of this relation's store
-    /// writes as zeroes for a reader of `read` alone: every other one of a base
-    /// table, which holds one live row per PK, so its rows stay distinct and
-    /// its chunks consolidated with those columns zeroed; none otherwise.
+    /// writes as zeroes for a reader of `read` alone: every other one where no
+    /// two live rows share a PK, whose rows then stay distinct and its chunks
+    /// consolidated with those columns zeroed; none otherwise.
     pub(crate) fn unread(&self, read: u64) -> u64 {
-        match self.kind() {
-            RelationKind::BaseTable => self.schema().payload_slots() & !read,
-            _ => 0,
+        match self.pk_repeats() {
+            true => 0,
+            false => self.schema().payload_slots() & !read,
         }
     }
 
@@ -386,9 +389,12 @@ impl Relation {
     }
 
     /// Every live row of `keys` — whole PKs, or the same leading columns of one,
-    /// each then naming every row it prefixes — among the rows `cut` reads.
-    pub fn gather(&self, keys: PkKeys, cut: Cut) -> PkSetGather {
-        self.table().gather(keys, cut)
+    /// each then naming every row it prefixes — among the rows `cut` reads, for
+    /// a reader of the payload columns `read` names, as payload bits.
+    pub fn gather(&self, keys: PkKeys, cut: Cut, read: u64) -> PkSetGather {
+        let mut gather = self.table().gather(keys, cut);
+        gather.skip_payload(self.unread(read));
+        gather
     }
 
     /// A cursor for probing at the keys in `[first, last]` — whole PKs, or the
@@ -480,7 +486,8 @@ pub struct RelationSpec {
     pub kind: RelationKind,
     pub placement: Placement,
     /// Whether two of its rows may share a PK. `false` is a promise the index
-    /// gather relies on, so a host that cannot vouch for it passes `true`.
+    /// gather and a drain that zeroes unread columns rely on, so a host that
+    /// cannot vouch for it passes `true`.
     pub pk_repeats: bool,
     /// `WITH (compress = true)`: its rows' store codes its shards' heaps under
     /// a symbol table where that pays.

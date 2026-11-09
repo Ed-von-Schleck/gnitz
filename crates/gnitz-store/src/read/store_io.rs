@@ -128,7 +128,7 @@ impl Relation {
                 // A key this worker holds no row for copies nothing.
                 let gather = match unique {
                     Some(store) => KeyGather::unique(store, schema, keys),
-                    None => KeyGather::Merge(self.gather(keys, cut)),
+                    None => KeyGather::Merge(self.table().gather(keys, cut)),
                 };
                 (SourceCursor::PkSet(gather), None)
             }

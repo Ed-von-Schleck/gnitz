@@ -128,14 +128,21 @@ pub(crate) fn relation_fixture(
     indexed: &[&[u32]],
     rounds: impl IntoIterator<Item = Batch>,
 ) -> RelationFixture {
-    relation_fixture_with(StoreConfig::default(), Slot::SOLO, kind, schema, indexed, rounds)
+    relation_fixture_with(
+        StoreConfig::default(),
+        Slot::SOLO,
+        spec(TID, kind, schema),
+        schema,
+        indexed,
+        rounds,
+    )
 }
 
-/// [`relation_fixture`] under `config`, at `slot`.
+/// [`relation_fixture`] under `config`, at `slot`, registered as `spec`.
 pub(crate) fn relation_fixture_with(
     config: StoreConfig,
     slot: Slot,
-    kind: RelationKind,
+    spec: RelationSpec,
     schema: SchemaDescriptor,
     indexed: &[&[u32]],
     rounds: impl IntoIterator<Item = Batch>,
@@ -146,9 +153,7 @@ pub(crate) fn relation_fixture_with(
         .zip(indexed)
         .map(|(id, &cols)| (IndexClaim::Index { id, unique: false }, PkColList::from_slice(cols)))
         .collect();
-    registry
-        .register_at(spec(TID, kind, schema), schema, &indexes, None)
-        .unwrap();
+    registry.register_at(spec, schema, &indexes, None).unwrap();
     for rows in rounds {
         registry.ingest(TID, rows).unwrap();
     }
@@ -231,14 +236,14 @@ pub(crate) fn map_of(program: LogicalProgram, reply: &SchemaDescriptor) -> Optio
 }
 
 /// `id | c0 = id % 512 | c1 = id % 2 | four I64 | two STRING`, the out-of-line
-/// strings on every other row, as a base table whose ids `0..rows` sit in
+/// strings on every other row, as a `kind` relation whose ids `0..rows` sit in
 /// `shards` shards, interleaved, and none in the RAM tier.
-pub(crate) fn wide_on_disk(rows: u64, shards: usize) -> RelationFixture {
+pub(crate) fn wide_on_disk(kind: RelationKind, rows: u64, shards: usize) -> RelationFixture {
     use gnitz_wire::TypeCode::{String as S, I64};
     use gnitz_zset::schema::SchemaColumn;
     let cols = [I64, I64, I64, I64, I64, I64, S, S].map(|tc| SchemaColumn::new(tc, false));
     let schema = gnitz_zset_testkit::u64_pk_schema(&cols);
-    let mut r = relation_fixture(RelationKind::BaseTable, schema, &[], []);
+    let mut r = relation_fixture(kind, schema, &[], []);
     for at in 0..shards as u64 {
         let batch = id_rows(&schema, (at..rows).step_by(shards).map(|id| (id, 1)), |bb, id| {
             bb.put_u64(id % 512);
@@ -254,7 +259,10 @@ pub(crate) fn wide_on_disk(rows: u64, shards: usize) -> RelationFixture {
             }
         });
         r.ingest(TID, batch).unwrap();
-        r.checkpoint_base().unwrap();
+        match kind.is_base_table() {
+            true => r.checkpoint_base().unwrap(),
+            false => r.checkpoint_ephemeral([], at + 1, |_| true).unwrap(),
+        }
     }
     let table = r.relation(TID).unwrap().table();
     assert_eq!(

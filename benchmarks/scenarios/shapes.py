@@ -142,10 +142,22 @@ def click_twins(n, rng):
     return [], {"clicks": Fact(row), "visits": Fact(row)}
 
 
+def message(k, rng):
+    return dict(id=k + 1, kind=rng.randrange(4),
+                body=f"message {rng.randrange(10**9):09d} " + " ".join(rng.choice(WORDS) for _ in range(6)))
+
+
 def messages(n, rng):
+    return [], {"messages": Fact(lambda k: message(k, rng))}
+
+
+def messages_wide(n, rng):
+    """`messages`, each row carrying five columns the views do not read."""
     return [], {"messages": Fact(lambda k: dict(
-        id=k + 1, kind=rng.randrange(4),
-        body=f"message {rng.randrange(10**9):09d} " + " ".join(rng.choice(WORDS) for _ in range(6))))}
+        message(k, rng),
+        header=" ".join(rng.choice(WORDS) for _ in range(12)),
+        footer=" ".join(rng.choice(WORDS) for _ in range(12)),
+        a=rng.randrange(10**12), b=rng.randrange(10**12), c=rng.randrange(10**12)))}
 
 
 @dataclass
@@ -320,4 +332,13 @@ SCENARIOS = [
          "CREATE VIEW v_bounded WITH (capacity = '1 MB') AS SELECT id, body FROM messages WHERE kind < 3",
          "CREATE VIEW v_twin AS SELECT id, body FROM messages WHERE kind < 3"],
         messages),
+    Bounded(
+        "bounded_wide", "policy",
+        "the bounded filter view over a source table with five columns it does not read",
+        BYTES,
+        ["CREATE TABLE messages (id BIGINT NOT NULL PRIMARY KEY, kind INT NOT NULL, body TEXT NOT NULL, "
+         "header TEXT NOT NULL, footer TEXT NOT NULL, a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NOT NULL)",
+         "CREATE VIEW v_bounded WITH (capacity = '1 MB') AS SELECT id, body FROM messages WHERE kind < 3",
+         "CREATE VIEW v_twin AS SELECT id, body FROM messages WHERE kind < 3"],
+        messages_wide),
 ]

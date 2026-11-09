@@ -43,7 +43,7 @@ impl PkSetGather {
     }
 
     /// [`ReadCursor::skip_payload`] on the cursor the keys are gathered from.
-    pub(super) fn skip_payload(&mut self, skip: u64) {
+    pub fn skip_payload(&mut self, skip: u64) {
         self.cursor.skip_payload(skip);
     }
 

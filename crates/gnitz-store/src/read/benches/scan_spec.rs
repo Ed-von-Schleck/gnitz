@@ -18,6 +18,7 @@ use crate::test_support::{RelationFixture, TID};
 use gnitz_expr::{CmpOp, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::{
     AggDescriptor, AggFunc, ComputeMap, GroupAggs, PkKeys, ReadBound, ReadSink, ReadSpec, SinkKind, TypeCode,
+    ViewBudget,
 };
 use gnitz_zset::repr::{BatchBuilder, SourceCursor};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
@@ -232,40 +233,45 @@ fn scan_spec_bench() {
     // A wide table on disk, read for a few of its columns, and whole: one shard
     // alone, which the drain slices, then three, which it merges.
     let c0 = || rows_spec(map_of(LogicalProgram::copy_cols(&[1]), &schema(&[I64])), None);
-    for shards in [1, 3] {
-        let r = wide_on_disk(ROWS, shards);
-        let label = |what: &str| format!("{what}, wide, {shards} shard(s)");
-        let filtered = |spec: ReadSpec| ReadSpec { predicate: lt(2, 1), ..spec };
-        let keyed = |spec: ReadSpec| ReadSpec {
-            bound: ReadBound::PkSet(PkKeys::from_sorted(
-                8,
-                (0..ROWS).step_by(16).flat_map(u64::to_be_bytes).collect(),
-            )),
-            ..spec
-        };
-        cell(
-            &label("one copied column, key list"),
-            &r,
-            keyed(c0()),
-            ROWS / 16,
-            ROWS / 16,
-        );
-        let folded = ReadSpec { sink: fold(None, vec![1], 2), ..c0() };
-        cell(&label("one copied column"), &r, c0(), ROWS, ROWS);
-        cell(&label("fold"), &r, folded, 512, ROWS);
-        cell(
-            &label("one copied column, 1-row ranges"),
-            &r,
-            filtered(c0()),
-            ROWS / 2,
-            ROWS,
-        );
-        cell(
-            &label("rows, 1-row ranges"),
-            &r,
-            filtered(rows_spec(None, None)),
-            ROWS / 2,
-            ROWS,
-        );
+    for (kind, name) in [
+        (RelationKind::BaseTable, "table"),
+        (RelationKind::View(ViewBudget::Plain), "view"),
+    ] {
+        for shards in [1, 3] {
+            let r = wide_on_disk(kind, ROWS, shards);
+            let label = |what: &str| format!("{what}, wide {name}, {shards} shard(s)");
+            let filtered = |spec: ReadSpec| ReadSpec { predicate: lt(2, 1), ..spec };
+            let keyed = |spec: ReadSpec| ReadSpec {
+                bound: ReadBound::PkSet(PkKeys::from_sorted(
+                    8,
+                    (0..ROWS).step_by(16).flat_map(u64::to_be_bytes).collect(),
+                )),
+                ..spec
+            };
+            cell(
+                &label("one copied column, key list"),
+                &r,
+                keyed(c0()),
+                ROWS / 16,
+                ROWS / 16,
+            );
+            let folded = ReadSpec { sink: fold(None, vec![1], 2), ..c0() };
+            cell(&label("one copied column"), &r, c0(), ROWS, ROWS);
+            cell(&label("fold"), &r, folded, 512, ROWS);
+            cell(
+                &label("one copied column, 1-row ranges"),
+                &r,
+                filtered(c0()),
+                ROWS / 2,
+                ROWS,
+            );
+            cell(
+                &label("rows, 1-row ranges"),
+                &r,
+                filtered(rows_spec(None, None)),
+                ROWS / 2,
+                ROWS,
+            );
+        }
     }
 }

@@ -10,8 +10,8 @@ use super::enforce_unique_pk;
 use crate::relation::{PkRule, RelationKind, StoreConfig};
 use crate::storage::DEFAULT_RAM_TIER_BYTES;
 use crate::test_support::{
-    make_schema_pk_u64_payload_string, make_schema_u64_i64, mix, relation_fixture_with, table_shards, u64_pk_schema,
-    TID,
+    make_schema_pk_u64_payload_string, make_schema_u64_i64, mix, relation_fixture_with, spec, table_shards,
+    u64_pk_schema, TID,
 };
 use gnitz_wire::TypeCode;
 use gnitz_zset::algebra::Slot;
@@ -140,7 +140,14 @@ fn unique_pk_bench() {
                     ..StoreConfig::default()
                 };
                 let held = pushes(&schema, 1000, |s| (s, 1, 0));
-                let mut r = relation_fixture_with(config, Slot::SOLO, RelationKind::BaseTable, schema, &[], held);
+                let mut r = relation_fixture_with(
+                    config,
+                    Slot::SOLO,
+                    spec(TID, RelationKind::BaseTable, schema),
+                    schema,
+                    &[],
+                    held,
+                );
                 let spilled = tier == SPILL_TIER;
                 let in_shards = |r: &crate::test_support::RelationFixture| {
                     !table_shards(r.relation(TID).unwrap().table()).is_empty()
