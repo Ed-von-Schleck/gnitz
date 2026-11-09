@@ -229,3 +229,37 @@ pub(crate) fn map_of(program: LogicalProgram, reply: &SchemaDescriptor) -> Optio
         ),
     )
 }
+
+/// `id | c0 = id % 512 | c1 = id % 2 | four I64 | two STRING`, the out-of-line
+/// strings on every other row, as a base table whose ids `0..rows` sit in
+/// `shards` shards, interleaved, and none in the RAM tier.
+pub(crate) fn wide_on_disk(rows: u64, shards: usize) -> RelationFixture {
+    use gnitz_wire::TypeCode::{String as S, I64};
+    use gnitz_zset::schema::SchemaColumn;
+    let cols = [I64, I64, I64, I64, I64, I64, S, S].map(|tc| SchemaColumn::new(tc, false));
+    let schema = gnitz_zset_testkit::u64_pk_schema(&cols);
+    let mut r = relation_fixture(RelationKind::BaseTable, schema, &[], []);
+    for at in 0..shards as u64 {
+        let batch = id_rows(&schema, (at..rows).step_by(shards).map(|id| (id, 1)), |bb, id| {
+            bb.put_u64(id % 512);
+            bb.put_u64(id % 2);
+            for k in 0..4 {
+                bb.put_u64(id.wrapping_mul(2_654_435_761 + k));
+            }
+            for k in 0..2 {
+                match id % 2 == 0 {
+                    true => bb.put_string(&format!("an out-of-line string value {k} of row {id}")),
+                    false => bb.put_string("short"),
+                }
+            }
+        });
+        r.ingest(TID, batch).unwrap();
+        r.checkpoint_base().unwrap();
+    }
+    let table = r.relation(TID).unwrap().table();
+    assert_eq!(
+        (table_shards(table).len(), table.runs(Cut::Now).count()),
+        (shards, shards)
+    );
+    r
+}

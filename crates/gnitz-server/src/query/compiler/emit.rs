@@ -49,11 +49,9 @@ pub(in crate::query) struct Scan {
     /// The exchange round the driver relays the source's delta by before it
     /// seeds `seed`, where the route is one.
     pub(in crate::query) relay: Option<Relay>,
-    /// The source's payload columns, as payload bits, that no reader of its
-    /// rows reads, for a base table alone: its backfill drain writes them as
-    /// zeroes. A base table holds one live row per PK, so rows with columns
-    /// zeroed stay distinct and its chunks consolidated.
-    pub(in crate::query) unread: u64,
+    /// The source's payload columns, as payload bits, a reader of its rows
+    /// reads: its backfill drain may write every other one as zeroes.
+    pub(in crate::query) read: u64,
 }
 
 /// A source's relay round: its plan, and the scatter key the plan is built from
@@ -229,25 +227,22 @@ impl<'a> EmitCtx<'a> {
 /// rows. Every other operator, and the output node, whose rows the view's store
 /// integrates, reads every column.
 fn payload_read(circuit: &Circuit, at: NodeId, schema: &SchemaDescriptor) -> u64 {
-    let all = gnitz_wire::low_bits_mask(schema.num_payload_cols());
+    let all = schema.payload_slots();
     if at == circuit.out() {
         return all;
     }
-    let program = |blob: &[u8]| LogicalProgram::from_blob(blob).map_or(all, |p| schema.payload_bits(p.cols_read()));
     let mut read = 0;
     for nid in circuit.readers(at) {
         read |= match circuit.op(nid) {
-            OpNode::Filter(blob) => program(blob) | payload_read(circuit, nid, schema),
+            OpNode::Filter(blob) => LogicalProgram::payload_read(blob, schema) | payload_read(circuit, nid, schema),
             // Routes by its reader's group columns or by the PK.
             OpNode::ExchangeShard | OpNode::WorkerFilter => payload_read(circuit, nid, schema),
-            OpNode::Map(MapKind::Compute(cm)) => program(&cm.program),
+            OpNode::Map(MapKind::Compute(cm)) => LogicalProgram::payload_read(&cm.program, schema),
             OpNode::Map(MapKind::Reindex { keep, key, .. }) => {
                 schema.payload_bits(keep.iter().copied().chain(key.iter().map(|&(c, _)| c)))
             }
             OpNode::Map(MapKind::HashRow { cols }) => schema.payload_bits(cols.iter().map(|&(c, _)| c)),
-            OpNode::Reduce(g) => {
-                schema.payload_bits(g.group_cols.iter().copied().chain(g.aggs.iter().map(|a| a.col_idx)))
-            }
+            OpNode::Reduce(g) => schema.payload_bits(g.cols()),
             _ => all,
         };
     }
@@ -270,13 +265,10 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<DeltaReg, St
             let relation = ctx.registry.relation_or_err(*tid)?;
             let schema = relation.schema();
             // One epoch seeds one delta, and one backfill cursor feeds every scan of it.
-            let unread = match relation.kind().is_base_table() {
-                true => gnitz_wire::low_bits_mask(schema.num_payload_cols()) & !payload_read(ctx.circuit, nid, &schema),
-                false => 0,
-            };
+            let read = payload_read(ctx.circuit, nid, &schema);
             if let Some((_, scan)) = ctx.sources.iter_mut().find(|(s, _)| s == tid) {
                 scan.bound = ReadBound::None;
-                scan.unread &= unread;
+                scan.read |= read;
                 return Ok(scan.reg);
             }
             let seed = ctx.prog.seed(schema);
@@ -298,7 +290,7 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<DeltaReg, St
                     reg,
                     bound,
                     relay,
-                    unread: unread & !routed_by,
+                    read: read | routed_by,
                 },
             ));
             Ok(reg)

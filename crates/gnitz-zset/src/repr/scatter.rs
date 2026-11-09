@@ -453,7 +453,7 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
 ) {
     const FB: usize = FIXED_REGION_BYTES;
     let pks = stride::<PKS>(width);
-    let keep = gnitz_wire::low_bits_mask(writer.schema.num_payload_cols()) & !skip;
+    let keep = writer.schema.payload_slots() & !skip;
     let (pk_dst, wt_dst, nbm_dst) = writer.fixed_mut();
     assert!(pk_dst.len() == rows.len() * pks && wt_dst.len() == rows.len() * FB);
     let (pk_dst, wt_dst, nbm_dst) = (pk_dst.as_mut_ptr(), wt_dst.as_mut_ptr(), nbm_dst.as_mut_ptr());
@@ -505,8 +505,15 @@ fn gather_unified_col<const N: usize>(
 /// source; any other is read through each source's row accessor, so a packed
 /// shard column decodes only the blocks the picks land in: the kernel for picks
 /// sparse in their sources, where [`UnifiedSet`] would decode whole windows.
-pub(crate) fn gather_rows(sources: &[impl ColumnarSource], schema: &SchemaDescriptor, picks: &[Pick]) -> Batch {
-    write_to_batch(schema, picks.len(), 0, |w| gather_into(sources, schema, picks, w))
+/// The payload columns `skip` names are not read: each cell is written as a
+/// zero that is not NULL.
+pub(crate) fn gather_rows(
+    sources: &[impl ColumnarSource],
+    schema: &SchemaDescriptor,
+    picks: &[Pick],
+    skip: u64,
+) -> Batch {
+    write_to_batch(schema, picks.len(), 0, |w| gather_into(sources, schema, picks, skip, w))
 }
 
 /// [`gather_rows`] into the rows `w` writes, one per pick.
@@ -514,14 +521,17 @@ pub(crate) fn gather_into(
     sources: &[impl ColumnarSource],
     schema: &SchemaDescriptor,
     picks: &[Pick],
+    skip: u64,
     w: &mut DirectWriter<'_>,
 ) {
     let mut direct = DirectCols::new();
     let hoist = picks.len() >= HOIST_PICKS_PER_SOURCE * (sources.len() + 1);
     let fixed = all_direct(&mut direct, hoist, sources, |s| s.direct_fixed());
-    stride_dispatch!(schema.pk_stride(), gather_pk_wt_nbm, sources, picks, fixed, w);
+    stride_dispatch!(schema.pk_stride(), gather_pk_wt_nbm, sources, picks, fixed, skip, w);
     for (pi, col) in schema.payload_columns() {
-        if col.type_code.is_german_string() {
+        if skip >> pi & 1 == 1 {
+            w.col_mut(pi).fill(0);
+        } else if col.type_code.is_german_string() {
             let (cells, blob, _) = w.string_col_mut(pi);
             for (cell, &(si, ri, _)) in cells.as_chunks_mut::<16>().0.iter_mut().zip(picks) {
                 let s = &sources[si as usize];
@@ -568,11 +578,12 @@ fn gather_pk_wt_nbm<const PKS: usize>(
     sources: &[impl ColumnarSource],
     picks: &[Pick],
     direct: Option<&[ColPtr]>,
+    skip: u64,
     w: &mut DirectWriter<'_>,
     width: usize,
 ) {
     let pks = stride::<PKS>(width);
-    let keep = gnitz_wire::low_bits_mask(w.schema.num_payload_cols());
+    let keep = w.schema.payload_slots() & !skip;
     let (pk, weight, null_bmp) = w.fixed_mut();
     let weights = weight.as_chunks_mut::<8>().0.iter_mut();
     let nulls = null_bmp.as_chunks_mut::<8>().0.iter_mut();

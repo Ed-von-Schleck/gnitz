@@ -42,6 +42,11 @@ impl PkSetGather {
         }
     }
 
+    /// [`ReadCursor::skip_payload`] on the cursor the keys are gathered from.
+    pub(super) fn skip_payload(&mut self, skip: u64) {
+        self.cursor.skip_payload(skip);
+    }
+
     pub(super) fn schema(&self) -> &SchemaDescriptor {
         &self.cursor.schema
     }
@@ -111,7 +116,8 @@ impl PkSetGather {
                 }
             });
             (visited != 0).then(|| {
-                let mut out = gather_rows(&self.cursor.sources, &self.cursor.schema, picks);
+                let c = &self.cursor;
+                let mut out = gather_rows(&c.sources, &c.schema, picks, c.skip_payload);
                 out.certify_consolidated();
                 out
             })

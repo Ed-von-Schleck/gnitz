@@ -980,6 +980,12 @@ impl LogicalProgram {
         ops.chain(self.sinks.iter().filter_map(|s| s.col()))
     }
 
+    /// The payload columns of `schema`, as payload bits, the program `blob`
+    /// reads: every one for a blob that does not decode.
+    pub fn payload_read(blob: &[u8], schema: &SchemaDescriptor) -> u64 {
+        Self::from_blob(blob).map_or(schema.payload_slots(), |p| schema.payload_bits(p.cols_read()))
+    }
+
     /// The output sinks.
     pub(crate) fn sinks(&self) -> &[Sink] {
         &self.sinks

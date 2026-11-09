@@ -85,8 +85,8 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
         for chunk in [1, 3, 7, 64, usize::MAX] {
             let relation = r.relation(TID).unwrap();
             for (mut cur, unapplied) in [
-                relation.open_bound(bound.clone(), At::Now).unwrap(),
-                relation.open_read(bound.clone()).unwrap(),
+                relation.open_bound(bound.clone(), At::Now, u64::MAX).unwrap(),
+                relation.open_read(bound.clone(), u64::MAX).unwrap(),
             ] {
                 let bounded = walks && !want.is_empty();
                 assert_eq!(matches!(cur, SourceCursor::Bounded(_)), bounded, "{bound:?}");
@@ -107,7 +107,7 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
     let (mut cur, unapplied) = r
         .relation(TID)
         .unwrap()
-        .open_bound(val_range(500, 600), At::Sealed)
+        .open_bound(val_range(500, 600), At::Sealed, u64::MAX)
         .unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)), "nothing pending: the index");
     assert_eq!(unapplied, None);
@@ -125,7 +125,7 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
     let (mut cur, unapplied) = r
         .relation(TID)
         .unwrap()
-        .open_bound(val_range(500, 600), At::Sealed)
+        .open_bound(val_range(500, 600), At::Sealed, u64::MAX)
         .unwrap();
     assert!(matches!(cur, SourceCursor::Full(_)), "rows pending: the sealed store");
     assert_eq!(
@@ -138,7 +138,7 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
     let (mut cur, _) = r
         .relation(TID)
         .unwrap()
-        .open_bound(val_range(500, 600), At::Now)
+        .open_bound(val_range(500, 600), At::Now, u64::MAX)
         .unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)), "a read at now walks the index");
     assert_eq!(drain_all(&mut cur, 7), with_pending());
@@ -147,7 +147,7 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
     let (mut cur, unapplied) = r
         .relation(TID)
         .unwrap()
-        .open_bound(val_range(500, 600), At::Sealed)
+        .open_bound(val_range(500, 600), At::Sealed, u64::MAX)
         .unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)), "sealed: the cuts agree again");
     assert_eq!(unapplied, None);
@@ -189,7 +189,7 @@ fn a_walk_follows_the_relations_writes() {
         let (mut cur, unapplied) = r
             .relation(TID)
             .unwrap()
-            .open_bound(val_range(500, 560), At::Now)
+            .open_bound(val_range(500, 560), At::Now, u64::MAX)
             .unwrap();
         assert!(matches!(cur, SourceCursor::Bounded(_)), "{kind:?}");
         assert_eq!(unapplied, None);
@@ -321,7 +321,13 @@ fn a_composite_range_reads_exactly_the_rows_its_bounds_admit() {
                 .collect();
 
             let bound = ReadBound::Range(range);
-            match r.relation(TID).unwrap().open_bound(bound.clone(), At::Now).unwrap().0 {
+            match r
+                .relation(TID)
+                .unwrap()
+                .open_bound(bound.clone(), At::Now, u64::MAX)
+                .unwrap()
+                .0
+            {
                 SourceCursor::Bounded(_) => walked += usize::from(!admitted.is_empty()),
                 _ => scanned += 1,
             }
@@ -353,7 +359,11 @@ fn an_index_walk_over_a_repeating_key_trips_the_gather() {
         .collect();
     let view = RelationKind::View(ViewBudget::Plain);
     let r = relation_fixture(view, schema, &[&[1]], [make_batch_raw(&schema, &rows)]);
-    let (mut cur, _) = r.relation(TID).unwrap().open_bound(val_range(5, 6), At::Now).unwrap();
+    let (mut cur, _) = r
+        .relation(TID)
+        .unwrap()
+        .open_bound(val_range(5, 6), At::Now, u64::MAX)
+        .unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
     cur.drain_chunk(1024);
 }
@@ -376,7 +386,7 @@ fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
     let (mut cur, unapplied) = r
         .relation(TID)
         .unwrap()
-        .open_bound(ReadBound::Range(range), At::Now)
+        .open_bound(ReadBound::Range(range), At::Now, u64::MAX)
         .unwrap();
     assert!(matches!(cur, SourceCursor::Full(_)), "a PK walk, not the index");
     assert_eq!(unapplied, None, "a PK walk applies the whole range");
@@ -462,7 +472,7 @@ fn a_read_of_what_the_relation_has_not_got_is_refused() {
         (
             r.relation(TID)
                 .unwrap()
-                .open_bound(ReadBound::PkSet(entry()), At::Now)
+                .open_bound(ReadBound::PkSet(entry()), At::Now, u64::MAX)
                 .map(drop),
             "stride",
         ),

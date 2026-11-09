@@ -1,15 +1,16 @@
 //! The worker half of an ad-hoc `ReadSpec` read, over this worker's slice: open
 //! the bound, filter, map, then forward rows or fold them. A capacity-bounded
 //! view's rows hydrate chunk by chunk as the sink drains them.
-use gnitz_wire::{PkKeys, ReadSpec};
+use gnitz_wire::{PkKeys, ReadSink, ReadSpec, SinkKind};
 
 use std::borrow::Cow;
 
 use super::{check_layout, ReadRows};
 use crate::relation::RelationRegistry;
-use gnitz_expr::RowFilter;
+use gnitz_expr::{LogicalProgram, RowFilter};
 use gnitz_zset::algebra::SinkPlan;
 use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::SchemaDescriptor;
 
 impl RelationRegistry {
     /// Execute `spec` on this worker's slice, replying in the layout whose
@@ -32,10 +33,10 @@ impl RelationRegistry {
         let table = entry.table_or_err()?;
         let src_schema = entry.schema();
         let whole = spec.is_whole();
-        let ReadSpec { bound, predicate, sink } = spec;
+        let ReadSpec { bound, predicate, sink: wire_sink } = spec;
         // A bad sink, predicate or walk is a corrupt request: the client
         // pre-compiled the identical program at plan time.
-        let mut sink = SinkPlan::from_wire(&src_schema, &sink, self.config.adhoc_group_cap)
+        let mut sink = SinkPlan::from_wire(&src_schema, &wire_sink, self.config.adhoc_group_cap)
             .map_err(|e| format!("scan_spec: {e}"))?;
         check_layout(reply_layout, sink.output_schema())?;
         // Nothing to hydrate either: the relation whole, off the store's cached
@@ -43,7 +44,7 @@ impl RelationRegistry {
         if whole && !table.has_skeleton_rows() {
             return Ok(ReadRows::Shared(entry.full_scan()));
         }
-        let (mut source, walk) = entry.open_read(bound)?;
+        let (mut source, walk) = entry.open_read(bound, payload_read(&src_schema, &predicate, &wire_sink))?;
         let mut filter =
             RowFilter::for_read(&predicate, walk.as_ref(), &src_schema).map_err(|e| format!("scan_spec: {e}"))?;
         // Chunks bound a read's peak memory only where the sink drops, cuts or
@@ -76,6 +77,21 @@ impl RelationRegistry {
             }
         }
         Ok(ReadRows::Own(sink.finish()))
+    }
+}
+
+/// The payload columns of `schema`, as payload bits, that `predicate` or
+/// `sink` reads. A sink that takes the rows unmapped reads what it folds, or
+/// every column of the rows it forwards; a mapped one reads what its map does.
+fn payload_read(schema: &SchemaDescriptor, predicate: &[u8], sink: &ReadSink) -> u64 {
+    let sink_read = match (&sink.map, &sink.kind) {
+        (Some(map), _) => LogicalProgram::payload_read(&map.program, schema),
+        (None, SinkKind::Fold(fold)) => schema.payload_bits(fold.cols()),
+        (None, SinkKind::Rows { .. }) => return schema.payload_slots(),
+    };
+    match predicate.is_empty() {
+        true => sink_read,
+        false => sink_read | LogicalProgram::payload_read(predicate, schema),
     }
 }
 

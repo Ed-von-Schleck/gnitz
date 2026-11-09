@@ -826,13 +826,14 @@ impl Batch {
         self.push_ranges(src, ranges, &mut cache);
     }
 
-    /// Copy each of `rows` onto this batch's tail at `weight`.
-    pub fn append_stored(&mut self, rows: &[StoredRow], weight: i64) {
+    /// Copy each of `rows` onto this batch's tail at `weight`, each payload
+    /// column `skip` names, as payload bits, as a zero that is not NULL.
+    pub fn append_stored(&mut self, rows: &[StoredRow], weight: i64, skip: u64) {
         if rows.is_empty() {
             return;
         }
         self.reserve_rows(rows.len());
-        let mask = self.schema.string_payload_slots();
+        let mask = self.schema.string_payload_slots() & !skip;
         if mask != 0 {
             self.reserve_blob(
                 rows.iter()
@@ -842,7 +843,7 @@ impl Batch {
         }
         let mut cache = BlobCache::for_rows(&self.schema, rows.len());
         for r in rows {
-            self.append_row_from_source(weight, &r.run, r.row, Some(&mut cache));
+            self.append_row_from_source(weight, &r.run, r.row, skip, Some(&mut cache));
         }
     }
 
@@ -986,23 +987,28 @@ impl Batch {
         Some(base)
     }
 
-    /// Append `source[row]` at `weight`; a `blob_cache` dedups repeated long-string
-    /// spans.
+    /// Append `source[row]` at `weight`, each payload column `skip` names as a
+    /// zero that is not NULL; a `blob_cache` dedups repeated long-string spans.
     pub(super) fn append_row_from_source<S: RowSource>(
         &mut self,
         weight: i64,
         source: &S,
         row: usize,
+        skip: u64,
         mut blob_cache: Option<&mut BlobCache>,
     ) {
         debug_assert_ne!(
             weight, 0,
             "append_row_from_source: zero-weight row (filter before copying)"
         );
-        self.open_row(source.get_pk_bytes(row), weight, source.get_null_word(row));
+        self.open_row(source.get_pk_bytes(row), weight, source.get_null_word(row) & !skip);
         let src_heap = source.heap();
         for pi in 0..self.schema.num_payload_cols() {
             let col = self.schema.columns()[self.schema.payload_col_idx(pi)];
+            if skip >> pi & 1 == 1 {
+                self.extend_col(pi, &[0; 16][..col.size()]);
+                continue;
+            }
             let cell = source.get_col_ptr(row, pi, col.size());
             self.append_payload_cell(pi, col.type_code, cell, src_heap, blob_cache.as_deref_mut());
         }

@@ -132,8 +132,7 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
         // Whether a round relays the source's rows, and whether it folds them.
         let relay_fold = scan.relay.is_some().then(|| code.vm.folds(scan.seed));
         let relation = registry.relation_or_err(source)?;
-        let (mut cursor, _unapplied) = relation.open_bound(scan.bound.clone(), Cut::Sealed)?;
-        cursor.skip_payload(scan.unread);
+        let (mut cursor, _unapplied) = relation.open_bound(scan.bound.clone(), Cut::Sealed, scan.read)?;
         let unfed = &sources[at + 1..];
         loop {
             let mut chunk = cursor.drain_chunk(chunk_rows);

@@ -17,7 +17,7 @@ fn append_row_from_source_carries_the_callers_weight() {
     let src = make_batch(&schema, &[(0xDEAD_BEEF, 1, 0x4242)]);
 
     let mut dst = Batch::with_capacity(&schema, 1);
-    dst.append_row_from_source(-1, &src, 0, None);
+    dst.append_row_from_source(-1, &src, 0, 0, None);
 
     assert_eq!(dst.count, 1);
     assert_eq!(dst.get_pk_bytes(0), &0xDEAD_BEEFu64.to_be_bytes());
@@ -783,7 +783,7 @@ fn append_stored_one_row_at_a_time_grows_the_heap_geometrically() {
     let mut dst = Batch::empty_with_schema(src.schema());
     let mut caps = std::collections::BTreeSet::new();
     for row in 0..N {
-        dst.append_stored(&[StoredRow::new(run.clone(), row)], 1);
+        dst.append_stored(&[StoredRow::new(run.clone(), row)], 1, 0);
         caps.insert(dst.blob.capacity());
     }
     assert_eq!(read_strings(&dst), read_strings(&src));

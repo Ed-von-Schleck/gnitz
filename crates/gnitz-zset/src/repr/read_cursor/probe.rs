@@ -61,7 +61,7 @@ impl GroupProbe<'_> {
         debug_assert!(batch.schema().same_region_types(schema));
         with_picks(|picks| {
             picks.extend(rows.iter().map(|at| at.pick(1)));
-            batch.write_rows(picks.len(), |w| gather_into(sources, schema, picks, w));
+            batch.write_rows(picks.len(), |w| gather_into(sources, schema, picks, 0, w));
         });
     }
 
@@ -69,7 +69,7 @@ impl GroupProbe<'_> {
     #[inline]
     pub(crate) fn copy_row_into(&self, at: CursorRow, batch: &mut Batch, weight: i64) {
         let (src, row) = self.row_at(at);
-        batch.append_row_from_source(weight, src, row, None);
+        batch.append_row_from_source(weight, src, row, 0, None);
     }
 
     /// The first live row of PK `key`, in (PK, payload) order, or `None` for a

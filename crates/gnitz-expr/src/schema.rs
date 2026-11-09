@@ -260,6 +260,12 @@ impl SchemaDescriptor {
         self.string_slots != 0
     }
 
+    /// Bit `pi` set for every payload slot `pi`.
+    #[inline]
+    pub fn payload_slots(&self) -> u64 {
+        gnitz_wire::low_bits_mask(self.num_payload_cols())
+    }
+
     /// Bit `pi` set iff payload slot `pi`'s column is a German string (STRING or BLOB).
     #[inline]
     pub fn string_payload_slots(&self) -> u64 {

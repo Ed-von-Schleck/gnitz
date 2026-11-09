@@ -363,6 +363,17 @@ impl Relation {
         self.spec.pk_repeats
     }
 
+    /// The payload columns, as payload bits, a drain of this relation's store
+    /// writes as zeroes for a reader of `read` alone: every other one of a base
+    /// table, which holds one live row per PK, so its rows stay distinct and
+    /// its chunks consolidated with those columns zeroed; none otherwise.
+    pub(crate) fn unread(&self, read: u64) -> u64 {
+        match self.kind() {
+            RelationKind::BaseTable => self.schema().payload_slots() & !read,
+            _ => 0,
+        }
+    }
+
     /// The unique secondary indexes a write must still check: one covering the
     /// PK cannot collide, so it is not among them.
     pub fn unique_indexes_to_check(&self) -> impl Iterator<Item = &SecondaryIndex> + '_ {

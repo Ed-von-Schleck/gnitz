@@ -4,8 +4,8 @@ use std::borrow::Cow;
 
 use gnitz_store::relation::{IndexClaim, Relation};
 use gnitz_wire::{
-    low_bits_mask, payload_bytes, validate_user_identifier, BitIter, CatalogColumn, ColTabRow, FixedInt, FkRef,
-    IdxTabRow, IdxTabSlot, RowSource, SchemaTabRow, SchemaTabSlot, TableProps, ViewParts,
+    payload_bytes, validate_user_identifier, BitIter, CatalogColumn, ColTabRow, FixedInt, FkRef, IdxTabRow, IdxTabSlot,
+    RowSource, SchemaTabRow, SchemaTabSlot, TableProps, ViewParts,
 };
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::Batch;
@@ -99,7 +99,7 @@ fn payload_differs(
     b: &impl RowSource,
     rb: usize,
 ) -> bool {
-    BitIter(low_bits_mask(schema.num_payload_cols()) & !mask).any(|pi| {
+    BitIter(schema.payload_slots() & !mask).any(|pi| {
         schema
             .locate(schema.payload_col_idx(pi))
             .cmp_non_null(a, ra, b, rb)

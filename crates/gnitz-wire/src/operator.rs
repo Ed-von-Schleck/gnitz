@@ -120,6 +120,15 @@ pub struct GroupAggs {
     pub aggs: Vec<AggDescriptor>,
 }
 
+impl GroupAggs {
+    /// Every input column the aggregation reads: its group columns, then each
+    /// aggregate's.
+    pub fn cols(&self) -> impl Iterator<Item = u32> + '_ {
+        let aggs = self.aggs.iter().map(|a| a.col_idx);
+        self.group_cols.iter().copied().chain(aggs)
+    }
+}
+
 /// The group columns, then the aggregates.
 impl Wire for GroupAggs {
     fn write(&self, w: &mut Writer) {

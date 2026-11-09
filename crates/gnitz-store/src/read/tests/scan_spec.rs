@@ -360,7 +360,11 @@ fn an_index_walk_returns_exactly_its_range() {
     };
     for (col, start, end, walks, want) in walks {
         let bound = col_range(col, start, end);
-        let (cursor, _) = r.relation(TID).unwrap().open_bound(bound.clone(), At::Now).unwrap();
+        let (cursor, _) = r
+            .relation(TID)
+            .unwrap()
+            .open_bound(bound.clone(), At::Now, u64::MAX)
+            .unwrap();
         assert_eq!(matches!(cursor, SourceCursor::Bounded(_)), walks, "{bound:?}");
         let spec = |cut| ReadSpec {
             bound: bound.clone(),
@@ -637,7 +641,7 @@ fn a_raw_drain_over_a_skeleton_run_panics() {
     let r = skeleton_fixture();
     r.relation(TID)
         .unwrap()
-        .open_bound(ReadBound::None, At::Now)
+        .open_bound(ReadBound::None, At::Now, u64::MAX)
         .unwrap()
         .0
         .drain_chunk(usize::MAX);

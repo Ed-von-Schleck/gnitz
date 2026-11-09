@@ -20,7 +20,7 @@ impl ReadCursor {
             "a skeleton row has no payload to copy; hydrate its key"
         );
         let (src, row) = self.row_at(self.current);
-        batch.append_row_from_source(weight, src, row, None);
+        batch.append_row_from_source(weight, src, row, 0, None);
     }
 
     /// Up to `max_rows` rows in merge order, consolidated, each a whole (PK, payload)

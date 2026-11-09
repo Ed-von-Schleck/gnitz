@@ -136,7 +136,7 @@ fn gather_rows_reads_every_backing_alike() {
         // the row accessors.
         let want: Vec<_> = picks
             .chunks(1)
-            .flat_map(|pick| weighted_rows(&gather_rows(&mem, &wide, pick)))
+            .flat_map(|pick| weighted_rows(&gather_rows(&mem, &wide, pick, 0)))
             .collect();
         assert!(want.iter().all(|&(_, w)| w == 2));
         let shards: Vec<Rc<MappedShard>> = (0..SOURCES)
@@ -161,10 +161,10 @@ fn gather_rows_reads_every_backing_alike() {
             .iter()
             .all(|n| n.direct_fixed().is_none() && n.direct_col(2).is_some()));
         let got = [
-            gather_rows(&mem, &wide, &picks),
-            gather_rows(&windows, &wide, &picks),
-            gather_rows(&narrowed, &wide, &picks),
-            gather_rows(&mixed, &wide, &picks),
+            gather_rows(&mem, &wide, &picks, 0),
+            gather_rows(&windows, &wide, &picks, 0),
+            gather_rows(&narrowed, &wide, &picks, 0),
+            gather_rows(&mixed, &wide, &picks, 0),
         ];
         for (i, got) in got.iter().enumerate() {
             assert_eq!(weighted_rows(got), want, "spread={spread}, backing {i}");

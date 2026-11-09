@@ -24,11 +24,13 @@ pub enum SourceCursor<'a> {
 }
 
 impl SourceCursor<'_> {
-    /// [`ReadCursor::skip_payload`] on a whole cursor; the others copy every
-    /// column.
+    /// [`ReadCursor::skip_payload`] on whichever cursor or probe the rows are
+    /// drained from.
     pub fn skip_payload(&mut self, skip: u64) {
-        if let SourceCursor::Full(c) = self {
-            c.skip_payload(skip);
+        match self {
+            SourceCursor::Full(c) => c.skip_payload(skip),
+            SourceCursor::Bounded(c) => c.src.skip_payload(skip),
+            SourceCursor::PkSet(g) => g.skip_payload(skip),
         }
     }
 
@@ -205,7 +207,7 @@ impl<'a> KeyGather<'a> {
     /// A gather of `keys`, whole PKs of `schema`, probed from `store`.
     pub fn unique(store: &'a dyn UniqueRows, schema: SchemaDescriptor, keys: PkKeys) -> Self {
         debug_assert_eq!(keys.stride(), schema.pk_stride());
-        KeyGather::Unique(UniqueGather { store, schema, keys, next: 0 })
+        KeyGather::Unique(UniqueGather { store, schema, keys, next: 0, skip: 0 })
     }
 
     fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
@@ -213,6 +215,13 @@ impl<'a> KeyGather<'a> {
             KeyGather::Merge(g) => g.drain_live_chunk(max_rows, skeletons),
             // A store of one row per key holds no skeleton rows.
             KeyGather::Unique(g) => g.drain_chunk(max_rows),
+        }
+    }
+
+    fn skip_payload(&mut self, skip: u64) {
+        match self {
+            KeyGather::Merge(g) => g.skip_payload(skip),
+            KeyGather::Unique(g) => g.skip = skip,
         }
     }
 
@@ -273,6 +282,8 @@ pub struct UniqueGather<'a> {
     keys: PkKeys,
     /// Index of the next key, in keys — not bytes.
     next: usize,
+    /// See [`ReadCursor::skip_payload`].
+    skip: u64,
 }
 
 impl UniqueGather<'_> {
@@ -291,7 +302,7 @@ impl UniqueGather<'_> {
             return None;
         }
         let mut out = Batch::empty_with_schema(&self.schema);
-        out.append_stored(&rows, 1);
+        out.append_stored(&rows, 1, self.skip);
         out.certify_consolidated();
         Some(out)
     }

@@ -196,10 +196,11 @@ fn advance_to_bench() {
 }
 
 /// Instructions per gathered row of a `pk IN (…)` drain, over one and four
-/// runs, fixed-width and string payloads, dense and sparse key lists. The runs
-/// are in-memory batches, or shards: `packed` stores the integer columns
-/// frame-of-reference coded, `raw` holds values no encoding shrinks, so they
-/// are stored as they stand.
+/// runs, fixed-width and string payloads, dense and sparse key lists, every
+/// payload column read and the last two skipped. The runs are in-memory
+/// batches, or shards: `packed` stores the integer columns frame-of-reference
+/// coded, `raw` holds values no encoding shrinks, so they are stored as they
+/// stand.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn pk_set_gather_drain_bench() {
@@ -247,29 +248,34 @@ fn pk_set_gather_drain_bench() {
                     let n_keys = (keys.len() / 8) as f64;
                     // The first pass takes the pool's first allocations and
                     // decodes the shards' blocks.
-                    let [_, instructions] = [(); 2].map(|()| {
-                        let keys = PkKeys::from_sorted(8, keys.clone());
-                        let cursor = from_runs_in_band(
-                            runs.iter().cloned(),
-                            schema,
-                            runs.len(),
-                            keys.iter().next().unwrap(),
-                            None,
-                        );
-                        let mut g = PkSetGather::over(cursor, keys);
-                        let (rows, instructions) = counter.measure(|| {
-                            let mut rows = 0;
-                            while let Some(c) = g.drain_chunk(65_536) {
-                                rows += c.len();
-                            }
-                            rows
+                    let per_row = |skip: u64| {
+                        let [_, instructions] = [(); 2].map(|()| {
+                            let keys = PkKeys::from_sorted(8, keys.clone());
+                            let cursor = from_runs_in_band(
+                                runs.iter().cloned(),
+                                schema,
+                                runs.len(),
+                                keys.iter().next().unwrap(),
+                                None,
+                            );
+                            let mut g = PkSetGather::over(cursor, keys);
+                            g.skip_payload(skip);
+                            let (rows, instructions) = counter.measure(|| {
+                                let mut rows = 0;
+                                while let Some(c) = g.drain_chunk(65_536) {
+                                    rows += c.len();
+                                }
+                                rows
+                            });
+                            assert_eq!(rows as f64, n_keys);
+                            instructions
                         });
-                        assert_eq!(rows as f64, n_keys);
-                        instructions
-                    });
-                    println!(
-                        "pk-set gather {backing:<12} {label:<13} src={srcs} every={every:<2} {:>7.1} instr/row",
                         instructions as f64 / n_keys
+                    };
+                    println!(
+                        "pk-set gather {backing:<12} {label:<13} src={srcs} every={every:<2} {:>7.1} instr/row, {:>7.1} skipping",
+                        per_row(0),
+                        per_row(0b110)
                     );
                 }
             }
