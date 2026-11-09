@@ -9,7 +9,7 @@ use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::runtime::reactor::{Accepted, ClientConn, PeerGone, Plain, Reactor, RecvBuf, SendBody};
+use crate::runtime::reactor::{Accepted, ClientConn, PeerGone, Reactor, RecvBuf, SendBody};
 use crate::runtime::sync::{select2, Either};
 use crate::runtime::tls::TlsShared;
 use gnitz_zset::repr::PooledBuf;
@@ -43,7 +43,7 @@ impl Peer {
     pub(super) fn new(reactor: &Reactor, accepted: Accepted, tls: Option<&Arc<rustls::ServerConfig>>) -> Peer {
         let (conn, transport) = match tls {
             None => {
-                let conn = reactor.connect(accepted, None, Plain::new());
+                let conn = reactor.connect(accepted, None, None);
                 (conn, Transport::Plain(reactor.clone()))
             }
             Some(cfg) => {

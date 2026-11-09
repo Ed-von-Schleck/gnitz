@@ -1,4 +1,6 @@
-//! Reactor state: `fsync` submits eagerly and yields its CQE.
+//! One-shot ops: the slot an op's CQE and its awaiter meet in, freed by the
+//! later of the two, and `fsync`, which submits at its first poll and yields
+//! its CQE.
 
 use std::os::fd::OwnedFd;
 use std::time::Duration;
@@ -6,9 +8,8 @@ use std::time::Duration;
 use super::test_support::*;
 use super::*;
 
-/// `fsync` submits its SQE before returning, so its CQE arrives with no tick
-/// driven — which is what lets it run while the caller works on — and resolves to
-/// the CQE `res` verbatim: 0, or a socket's `-EINVAL`.
+/// `fsync` submits its SQE at its first poll, so its CQE arrives with no tick
+/// driven, and resolves to the CQE `res` verbatim: 0, or a socket's `-EINVAL`.
 #[test]
 fn fsync_is_submitted_eagerly_and_yields_the_cqe_res() {
     let r = make_reactor();
@@ -37,14 +38,6 @@ fn complete_queued(r: &Reactor) {
     r.run_ready();
 }
 
-/// An awaited op yields its CQE `res`, and taking it frees the op's slot.
-#[test]
-fn an_awaited_op_yields_its_res_and_frees_its_slot() {
-    let r = make_reactor();
-    assert_eq!(r.block_on(nop(&r)), 0);
-    assert_eq!(r.ops.borrow().len(), 0);
-}
-
 /// An op dropped before its CQE keeps its slot until the CQE, which frees it;
 /// the freed slot serves the next op.
 #[test]
@@ -54,7 +47,7 @@ fn an_op_dropped_before_its_cqe_is_freed_by_the_cqe() {
     assert_eq!(r.ops.borrow().len(), 1, "the slot outlives its dropped awaiter");
     complete_queued(&r);
     assert_eq!(r.ops.borrow().len(), 0, "the CQE freed the abandoned slot");
-    assert_eq!(r.block_on(nop(&r)), 0);
+    assert_eq!(r.block_on(nop(&r)).0, 0);
     assert_eq!(r.ops.borrow().len(), 0);
 }
 
@@ -64,11 +57,11 @@ fn an_op_dropped_before_its_cqe_is_freed_by_the_cqe() {
 fn an_op_dropped_after_its_cqe_frees_its_slot() {
     let r = make_reactor();
     let mut op = nop(&r);
-    assert_eq!(try_poll_once(&mut op), None);
+    assert!(try_poll_once(&mut op).is_none());
     complete_queued(&r);
     assert_eq!(r.ops.borrow().len(), 1, "the CQE leaves the result in the slot");
     drop(op);
     assert_eq!(r.ops.borrow().len(), 0, "the drop freed the completed slot");
-    assert_eq!(r.block_on(nop(&r)), 0);
+    assert_eq!(r.block_on(nop(&r)).0, 0);
     assert_eq!(r.ops.borrow().len(), 0);
 }

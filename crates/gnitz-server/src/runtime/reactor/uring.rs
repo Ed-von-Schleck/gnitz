@@ -20,8 +20,9 @@ fn entered(rc: std::io::Result<usize>) {
         // A wait that timed out, or that a signal ended.
         Some(libc::ETIME | libc::EINTR) => {}
         // No request memory, or completions overflowed: the SQEs stay queued for
-        // the next submit.
-        Some(libc::EAGAIN | libc::EBUSY) => gnitz_warn!("reactor: io_uring_enter: {e}; retrying"),
+        // the loop's next submit; a push that needed this submit to make room
+        // aborts instead.
+        Some(libc::EAGAIN | libc::EBUSY) => gnitz_warn!("reactor: io_uring_enter: {e}; the SQEs stay queued"),
         // A broken ring or a lost completion, which no later pass repairs.
         _ => gnitz_fatal_abort!("reactor: io_uring_enter failed: {e}"),
     }
@@ -83,7 +84,7 @@ impl IoUringRing {
         }
         // SAFETY: forwarded to the caller.
         if unsafe { self.ring.submission().push(&sqe.user_data(user_data)) }.is_err() {
-            gnitz_fatal_abort!("reactor: the SQ is still full after a submit");
+            gnitz_fatal_abort!("reactor: the SQ is full and the kernel refused its submit");
         }
     }
 

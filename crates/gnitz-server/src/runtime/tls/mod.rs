@@ -1,5 +1,5 @@
-//! TLS 1.3 server transport. The recv filter ([`TlsIngress`]) decrypts into the
-//! connection's `FrameSink` and never sends; ciphertext leaves only through
+//! TLS 1.3 server transport. The recv side decrypts into the connection's
+//! `FrameSink` through the session's [`Decrypt`] and never sends; ciphertext leaves only through
 //! [`TlsShared::flush_records`], so records reach the socket in emission order.
 
 mod config;
@@ -10,20 +10,14 @@ pub(crate) use tokens::mint as mint_token;
 
 use std::cell::RefCell;
 use std::io::{BufRead, ErrorKind, Write};
-use std::mem::MaybeUninit;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gnitz_zset::repr::PooledBuf;
 
-use crate::runtime::reactor::{
-    Accepted, Charge, ClientConn, FrameSink, PeerGone, Reactor, RecvEnd, RecvFilter, SendBody,
-};
+use crate::runtime::reactor::{Accepted, Charge, ClientConn, Decrypt, FrameSink, PeerGone, Reactor, RecvEnd, SendBody};
 use crate::runtime::sync::{chan, AsyncRwLock, WriteGuard};
 use gnitz_wire::Deframer;
-
-/// Size of the ciphertext window each recv lands in.
-const CIPHER_WINDOW_BYTES: usize = 64 * 1024;
 
 /// The most plaintext one TLS record carries.
 const TLS_MAX_FRAGMENT: usize = 16 * 1024;
@@ -67,7 +61,7 @@ pub(crate) struct TlsShared {
     reactor: Reactor,
     /// The socket and its deframed frames; see `ClientConn` for the fd's lifetime.
     conn: Rc<ClientConn>,
-    /// The codec state, and nothing else, shared with the recv filter. Never
+    /// The codec state, and nothing else, shared with the recv side. Never
     /// borrowed across an await.
     state: Rc<RefCell<rustls::ServerConnection>>,
     /// Held across every ciphertext extraction and send. `ClientConn::retire` and
@@ -91,15 +85,7 @@ impl TlsShared {
         sess.set_buffer_limit(Some(SEND_BUFFER_BYTES));
         let state = Rc::new(RefCell::new(sess));
         let (flush_tx, flush_rx) = chan::unbounded::<()>();
-        let conn = reactor.connect(
-            accepted,
-            Some(flush_tx),
-            TlsIngress {
-                state: Rc::clone(&state),
-                cipher: Box::new_uninit_slice(CIPHER_WINDOW_BYTES),
-                deframer: Deframer::default(),
-            },
-        );
+        let conn = reactor.connect(accepted, Some(flush_tx), Some(Rc::clone(&state) as Rc<dyn Decrypt>));
         let tls = Rc::new(TlsShared {
             reactor,
             conn,
@@ -160,29 +146,17 @@ impl TlsShared {
 }
 
 /// Ciphertext in, plaintext frames out, inside the recv completion. Never locks
-/// `send_lock` and never sends — it only notifies the flusher — so a client
-/// pipelining pushes ahead of reading its ACKs cannot deadlock it.
-struct TlsIngress {
-    state: Rc<RefCell<rustls::ServerConnection>>,
-    cipher: Box<[MaybeUninit<u8>]>,
-    /// Deframes the plaintext.
-    deframer: Deframer<Charge>,
-}
-
-impl RecvFilter for TlsIngress {
-    fn window(&mut self) -> &mut [MaybeUninit<u8>] {
-        &mut self.cipher
-    }
-
-    fn ingest(&mut self, n: usize, sink: &mut FrameSink) -> Result<(), RecvEnd> {
-        // SAFETY: `n` counts bytes the completed recv wrote into the window.
-        let cipher = unsafe { self.cipher[..n].assume_init_ref() };
-        ingest_cipher(&mut self.state.borrow_mut(), cipher, &mut self.deframer, sink)
+/// `send_lock` and never sends: what rustls queues meanwhile it reports through
+/// `owes_egress`, and the reactor wakes the flusher. So a client pipelining
+/// pushes ahead of reading its ACKs cannot deadlock it.
+impl Decrypt for RefCell<rustls::ServerConnection> {
+    fn ingest(&self, cipher: &[u8], deframer: &mut Deframer<Charge>, sink: &mut FrameSink) -> Result<(), RecvEnd> {
+        ingest_cipher(&mut self.borrow_mut(), cipher, deframer, sink)
     }
 
     /// The flusher ships the records rustls queued.
     fn owes_egress(&self) -> bool {
-        self.state.borrow().wants_write()
+        self.borrow().wants_write()
     }
 }
 

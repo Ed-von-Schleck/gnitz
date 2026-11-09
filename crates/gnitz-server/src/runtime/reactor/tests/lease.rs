@@ -11,33 +11,30 @@ use crate::runtime::w2m::fixtures::id;
 #[test]
 fn lease_ids_wrap_past_zero_and_skip_live_ids() {
     let (r, _writers) = reactor_with_rings(1);
-    let dropped = r.lease_acks(WorkerSet::ALL).id();
-    assert_ne!(r.lease_acks(WorkerSet::ALL).id(), dropped);
+    let dropped = r.lease_acks().id();
+    assert_ne!(r.lease_acks().id(), dropped);
 
-    r.routes.next_id.set(RequestId::MAX);
-    let top = r.lease_acks(WorkerSet::ALL);
+    r.routes.borrow_mut().next_id = RequestId::MAX;
+    let top = r.lease_acks();
     assert_eq!(top.id(), RequestId::MAX);
-    let wrapped = r.lease_acks(WorkerSet::ALL);
+    let wrapped = r.lease_acks();
     assert_eq!(wrapped.id(), id(1), "the id after the largest is 1, not 0");
 
-    r.routes.next_id.set(id(1));
+    r.routes.borrow_mut().next_id = id(1);
     let skipped = r.lease_train(WorkerSet::ALL, "ScanSpec");
     assert_eq!(skipped.id(), id(2), "a live lease's id is skipped");
 }
 
-/// An ACK lease is complete on its own set's ACKs — the other workers are never
-/// waited on — and keeps an ACK drained before anything awaits it; one over the
-/// empty set is complete at once, and one over every worker is clipped to the
-/// launched.
+/// An ACK lease waits on every launched worker, and keeps the ACKs drained
+/// before anything awaits it.
 #[test]
-fn an_ack_lease_resolves_on_its_own_sets_acks() {
+fn an_ack_lease_keeps_early_acks_and_resolves_on_every_workers() {
     let (r, mut writers) = reactor_with_rings(4);
-    assert_eq!(r.lease_acks(WorkerSet::ALL).workers().len(), 4);
-    assert!(try_poll_once(r.lease_acks(WorkerSet::EMPTY).acks()).is_some());
-
-    let lease = r.lease_acks(WorkerSet::one(1).with(3));
+    let lease = r.lease_acks();
     let id = lease.id();
-    writers[3].ack(id);
+    for w in [0, 1, 3] {
+        writers[w].ack(id);
+    }
     r.tick(); // drained before any awaiter
     let done = Rc::new(Cell::new(false));
     let d = Rc::clone(&done);
@@ -46,8 +43,8 @@ fn an_ack_lease_resolves_on_its_own_sets_acks() {
         d.set(true);
     });
     r.tick();
-    assert!(!done.get(), "one of the two has answered");
-    writers[1].ack(id);
+    assert!(!done.get(), "three of the four have answered");
+    writers[2].ack(id);
     r.tick(); // the drain wakes the awaiter, and the same pass polls it
     assert!(done.get());
 }
@@ -80,8 +77,8 @@ fn a_frame_no_lease_holds_is_released() {
 #[test]
 fn acks_resolve_their_own_leases_in_any_order_past_a_held_frame() {
     let (r, train, mut writers) = train_lease(1, "ScanSpec");
-    let tick = r.lease_acks(WorkerSet::ALL);
-    let push = r.lease_acks(WorkerSet::ALL);
+    let tick = r.lease_acks();
+    let push = r.lease_acks();
     writers[0].send_train_frame(train.id(), false, None);
     r.drain_all_w2m();
     assert!(
@@ -252,10 +249,10 @@ fn a_reused_queue_box_holds_only_its_own_leases_frames() {
     r.drain_all_w2m();
     assert_eq!(read_all(&read), [1]);
     drop(read);
-    assert_eq!(r.routes.spare.borrow().len(), 1, "the box is kept");
+    assert_eq!(r.routes.borrow().spare.len(), 1, "the box is kept");
 
     let unread = r.lease_train(WorkerSet::one(0).with(2), "ScanSpec");
-    assert!(r.routes.spare.borrow().is_empty(), "the kept box is taken");
+    assert!(r.routes.borrow().spare.is_empty(), "the kept box is taken");
     for w in [0, 2] {
         writers[w].send_train_frame(unread.id(), false, Some(&rows(2)));
     }
@@ -271,7 +268,7 @@ fn a_reused_queue_box_holds_only_its_own_leases_frames() {
     }
 
     let next = r.lease_train(WorkerSet::ALL, "ScanSpec");
-    assert!(r.routes.spare.borrow().is_empty(), "the kept box is taken");
+    assert!(r.routes.borrow().spare.is_empty(), "the kept box is taken");
     for (w, writer) in writers.iter_mut().enumerate() {
         writer.send_train_frame(next.id(), true, (w == 2).then(|| rows(3)).as_ref());
     }

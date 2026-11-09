@@ -5,7 +5,6 @@ use gnitz_foundation::perf::{voluntary_ctx_switches, Counter};
 
 use super::super::test_support::*;
 use super::*;
-use crate::runtime::park::WorkerSet;
 use crate::runtime::w2m::fixtures::id;
 use crate::runtime::w2m::RequestId;
 
@@ -85,7 +84,7 @@ fn reactor_pass_bench() {
         let id = Rc::new(Cell::new(0));
         let (r2, leased) = (r.clone(), Rc::clone(&id));
         let acks = async move || {
-            let lease = r2.lease_acks(WorkerSet::ALL);
+            let lease = r2.lease_acks();
             leased.set(lease.id().get());
             lease.acks().await;
         };
@@ -185,7 +184,7 @@ fn reactor_round_bench() {
             }
             let before = voluntary_ctx_switches();
             for _ in 0..ROUNDS {
-                let lease = r.lease_acks(WorkerSet::ALL);
+                let lease = r.lease_acks();
                 round.store(lease.id().get(), Ordering::Release);
                 r.block_on(lease.acks());
             }

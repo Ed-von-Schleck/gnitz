@@ -7,7 +7,6 @@ use std::time::Duration;
 use super::super::test_support::*;
 use super::super::uring::SQ_ENTRIES;
 use super::*;
-use crate::runtime::park::WorkerSet;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 use crate::runtime::w2m::fixtures::id;
 use crate::runtime::w2m::RequestId;
@@ -190,7 +189,7 @@ fn block_on_submits_the_pass_that_completed_it() {
     r.dispatch_cqes();
     assert_eq!(
         try_poll_once(&mut op),
-        Some(0),
+        Some((0, ())),
         "block_on returned with its last pass's SQE unsubmitted"
     );
 }
@@ -222,7 +221,7 @@ fn a_pass_past_the_sq_and_the_drain_batch_loses_no_completion() {
     let ops: Vec<_> = (0..n).map(|_| nop(&r)).collect();
     r.tick();
     r.run_ready();
-    assert!(ops.into_iter().all(|op| try_poll_once(op) == Some(0)));
+    assert!(ops.into_iter().all(|op| try_poll_once(op) == Some((0, ()))));
 }
 
 /// The drain the arm runs first can route a frame that wakes a task; that tick
@@ -232,7 +231,7 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
     within(|| {
         let (r, mut writers) = reactor_with_rings(1);
         let mut writer = writers.pop().expect("one ring");
-        let lease = r.lease_acks(WorkerSet::ALL);
+        let lease = r.lease_acks();
         let id = lease.id();
         let done = Rc::new(Cell::new(false));
         let d = Rc::clone(&done);

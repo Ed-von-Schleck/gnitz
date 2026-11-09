@@ -20,11 +20,11 @@ use crate::runtime::w2m::{RequestId, W2mSlot};
 
 /// Every live lease's request id and what its workers have answered on it.
 pub(super) struct Routes {
-    map: RefCell<FxHashMap<RequestId, Route>>,
+    map: FxHashMap<RequestId, Route>,
     /// The next request id a lease starts from.
-    next_id: Cell<RequestId>,
+    next_id: RequestId,
     /// Emptied queue boxes of dropped train leases, taken by the next ones.
-    spare: RefCell<Vec<Box<[VecDeque<W2mSlot>]>>>,
+    spare: Vec<Box<[VecDeque<W2mSlot>]>>,
 }
 
 /// The most queue boxes [`Routes`] keeps for reuse.
@@ -37,10 +37,26 @@ const SPARE_QUEUE_CAP: usize = 16;
 impl Routes {
     pub(super) fn new() -> Self {
         Routes {
-            map: RefCell::new(FxHashMap::default()),
-            next_id: Cell::new(RequestId::BOOT_READY),
-            spare: RefCell::new(Vec::new()),
+            map: FxHashMap::default(),
+            next_id: RequestId::BOOT_READY,
+            spare: Vec::new(),
         }
+    }
+
+    /// Route `route` under a request id no live lease holds, and return the id.
+    fn insert(&mut self, route: Route) -> RequestId {
+        let mut id = self.next_id;
+        loop {
+            match self.map.entry(id) {
+                Entry::Vacant(free) => {
+                    free.insert(route);
+                    break;
+                }
+                Entry::Occupied(_) => id = id.next(),
+            }
+        }
+        self.next_id = id.next();
+        id
     }
 }
 
@@ -99,7 +115,7 @@ impl Reactor {
     /// lease's train on `w`.
     #[cold]
     fn give_back(&self, w: usize) {
-        for (&id, route) in self.routes.map.borrow_mut().iter_mut() {
+        for (&id, route) in self.routes.borrow_mut().map.iter_mut() {
             let Route::Train(t) = route else { continue };
             if !t.set.contains(w) {
                 continue;
@@ -119,7 +135,7 @@ impl Reactor {
 
     /// Count worker `w`'s ACK of `id` towards the lease it names.
     fn route_ack(&self, w: usize, id: RequestId) {
-        match self.routes.map.borrow_mut().get_mut(&id) {
+        match self.routes.borrow_mut().map.get_mut(&id) {
             Some(Route::Acks(r)) => {
                 debug_assert!(
                     r.left.contains(w),
@@ -151,7 +167,7 @@ impl Reactor {
     /// behind slots of leases written before its own.
     fn route(&self, mut slot: W2mSlot) {
         let w = slot.worker as usize;
-        match self.routes.map.borrow_mut().get_mut(&slot.request_id) {
+        match self.routes.borrow_mut().map.get_mut(&slot.request_id) {
             Some(Route::Train(t)) => {
                 if t.set.contains(w) {
                     let reader = t.reader.take_if(|(r, _)| *r == w);
@@ -173,36 +189,21 @@ impl Reactor {
         }
     }
 
-    /// A request id no live lease holds, routed to what `route` builds over
-    /// `set` clipped to the launched workers.
-    fn lease(&self, set: WorkerSet, route: impl FnOnce(WorkerSet) -> Route) -> Lease {
-        let workers = set.within(self.w2m.num_workers());
-        let mut map = self.routes.map.borrow_mut();
-        let mut id = self.routes.next_id.get();
-        loop {
-            match map.entry(id) {
-                Entry::Vacant(free) => {
-                    free.insert(route(workers));
-                    break;
-                }
-                Entry::Occupied(_) => id = id.next(),
-            }
-        }
-        drop(map);
-        self.routes.next_id.set(id.next());
-        Lease { reactor: self.clone(), id, set: workers }
-    }
-
-    /// One request id, answered by one ACK from every worker in `set`. See
+    /// One request id, answered by one ACK from every launched worker. See
     /// [`AckLease`].
-    pub(crate) fn lease_acks(&self, set: WorkerSet) -> AckLease {
-        AckLease(self.lease(set, |left| Route::Acks(AckRoute { left, waker: None })))
+    pub(crate) fn lease_acks(&self) -> AckLease {
+        let left = WorkerSet::ALL.within(self.w2m.num_workers());
+        let id = self
+            .routes
+            .borrow_mut()
+            .insert(Route::Acks(AckRoute { left, waker: None }));
+        AckLease { reactor: self.clone(), id }
     }
 
     /// Resolves once every worker has ACKed its boot recovery: the lease its
     /// ready ACKs answer, which [`Reactor::new`] takes first.
     pub(super) fn boot_ready(&self) -> impl Future<Output = ReadyAcked> {
-        let acks = self.lease_acks(WorkerSet::ALL);
+        let acks = self.lease_acks();
         assert_eq!(
             acks.id(),
             RequestId::BOOT_READY,
@@ -218,60 +219,27 @@ impl Reactor {
     /// `what` names the request in every fault the lease reports. See
     /// [`TrainLease`].
     pub(crate) fn lease_train(&self, set: WorkerSet, what: &'static str) -> TrainLease {
-        let spare = self.routes.spare.borrow_mut().pop();
-        let queues = spare.unwrap_or_else(|| (0..self.w2m.num_workers()).map(|_| VecDeque::new()).collect());
-        let lease = self.lease(set, |set| {
-            Route::Train(TrainRoute {
+        let nw = self.w2m.num_workers();
+        let set = set.within(nw);
+        let id = {
+            let mut routes = self.routes.borrow_mut();
+            let queues = routes
+                .spare
+                .pop()
+                .unwrap_or_else(|| (0..nw).map(|_| VecDeque::new()).collect());
+            routes.insert(Route::Train(TrainRoute {
                 set,
                 held: WorkerSet::EMPTY,
                 queues,
                 reader: None,
-            })
-        });
-        let left = Cell::new(lease.set);
-        TrainLease { lease, left, what }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Lease
-// ---------------------------------------------------------------------------
-
-/// A live route. Dropping it removes the route, and with it whatever the route
-/// still holds.
-struct Lease {
-    reactor: Reactor,
-    id: RequestId,
-    /// The set the route was built over.
-    set: WorkerSet,
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        let route = self.reactor.routes.map.borrow_mut().remove(&self.id);
-        // Matched so an ACK route, which every round drops, drops inline rather
-        // than through the route's drop glue.
-        match route {
-            Some(Route::Acks(acks)) => drop(acks),
-            Some(Route::Train(mut train)) => {
-                for w in train.held.iter() {
-                    self.reactor.w2m.unhold(w, self.id);
-                }
-                // Every slot is dropped before the box is kept: one left queued
-                // would hold up its ring's released prefix and reach the next
-                // lease to take the box.
-                for q in train.queues.iter_mut() {
-                    q.clear();
-                    if q.capacity() > SPARE_QUEUE_CAP {
-                        *q = VecDeque::new();
-                    }
-                }
-                let mut spare = self.reactor.routes.spare.borrow_mut();
-                if spare.len() < SPARE_QUEUES {
-                    spare.push(train.queues);
-                }
-            }
-            None => {}
+            }))
+        };
+        TrainLease {
+            reactor: self.clone(),
+            id,
+            set,
+            left: Cell::new(set),
+            what,
         }
     }
 }
@@ -280,28 +248,37 @@ impl Drop for Lease {
 // AckLease
 // ---------------------------------------------------------------------------
 
-/// One request id, answered by one ACK from every worker of its set, routed
-/// while it lives, so an ACK beating its awaiter is kept.
-pub(crate) struct AckLease(Lease);
+/// One request id, answered by one ACK from every launched worker, routed
+/// while it lives, so an ACK beating its awaiter is kept. Dropping it removes
+/// the route.
+pub(crate) struct AckLease {
+    reactor: Reactor,
+    id: RequestId,
+}
+
+impl Drop for AckLease {
+    fn drop(&mut self) {
+        let mut routes = self.reactor.routes.borrow_mut();
+        let Some(Route::Acks(acks)) = routes.map.remove(&self.id) else {
+            unreachable!("an ACK lease's id routes to its ACKs")
+        };
+        // Under the borrow: the waker reaches no route.
+        drop(acks);
+    }
+}
 
 impl AckLease {
     /// The request id its workers ACK on.
     pub(crate) fn id(&self) -> RequestId {
-        self.0.id
+        self.id
     }
 
-    /// The workers that ACK it: the set it was leased over, clipped to the
-    /// launched workers.
-    pub(crate) fn workers(&self) -> WorkerSet {
-        self.0.set
-    }
-
-    /// Resolves once every worker of the set has ACKed. A worker that cannot
+    /// Resolves once every launched worker has ACKed. A worker that cannot
     /// apply what it is to ACK exits instead, which the master's death watch sees.
     pub(crate) async fn acks(&self) {
         std::future::poll_fn(|cx| {
-            let mut routes = self.0.reactor.routes.map.borrow_mut();
-            let Some(Route::Acks(r)) = routes.get_mut(&self.0.id) else {
+            let mut routes = self.reactor.routes.borrow_mut();
+            let Some(Route::Acks(r)) = routes.map.get_mut(&self.id) else {
                 unreachable!("an ACK lease's id routes to its ACKs")
             };
             if r.left == WorkerSet::EMPTY {
@@ -326,11 +303,40 @@ pub(crate) struct ReadyAcked(());
 /// One request id, answered by a train of frames from each worker of its set,
 /// routed while it lives. Dropping it releases every frame the route holds.
 pub(crate) struct TrainLease {
-    lease: Lease,
+    reactor: Reactor,
+    id: RequestId,
+    /// The workers it was written to: the set it was leased over, clipped to
+    /// the launched workers.
+    set: WorkerSet,
     /// The workers whose terminal frame has not been read.
     left: Cell<WorkerSet>,
     /// What the lease was written for, named in every fault it reports.
     what: &'static str,
+}
+
+impl Drop for TrainLease {
+    fn drop(&mut self) {
+        // Held across the drops below: a slot or a hold reaches no route.
+        let mut routes = self.reactor.routes.borrow_mut();
+        let Some(Route::Train(mut train)) = routes.map.remove(&self.id) else {
+            unreachable!("a train lease's id routes to its train")
+        };
+        for w in train.held.iter() {
+            self.reactor.w2m.unhold(w, self.id);
+        }
+        // Every slot is dropped before the box is kept: one left queued would
+        // hold up its ring's released prefix and reach the next lease to take
+        // the box.
+        for q in train.queues.iter_mut() {
+            q.clear();
+            if q.capacity() > SPARE_QUEUE_CAP {
+                *q = VecDeque::new();
+            }
+        }
+        if routes.spare.len() < SPARE_QUEUES {
+            routes.spare.push(train.queues);
+        }
+    }
 }
 
 /// One frame of a train that carries rows.
@@ -355,13 +361,13 @@ impl TrainFrame {
 impl TrainLease {
     /// The request id its workers reply on.
     pub(crate) fn id(&self) -> RequestId {
-        self.lease.id
+        self.id
     }
 
     /// The workers that reply: the set it was leased over, clipped to the
     /// launched workers.
     pub(crate) fn workers(&self) -> WorkerSet {
-        self.lease.set
+        self.set
     }
 
     /// Worker `w`'s next frame, row-less ones included, with the range of its
@@ -418,8 +424,8 @@ impl TrainLease {
     /// Worker `w`'s next routed slot.
     async fn next_slot(&self, w: usize) -> W2mSlot {
         std::future::poll_fn(|cx| {
-            let mut routes = self.lease.reactor.routes.map.borrow_mut();
-            let Some(Route::Train(route)) = routes.get_mut(&self.lease.id) else {
+            let mut routes = self.reactor.routes.borrow_mut();
+            let Some(Route::Train(route)) = routes.map.get_mut(&self.id) else {
                 unreachable!("a train lease's id routes to its train")
             };
             debug_assert!(route.set.contains(w), "the train was written to `w`");
@@ -429,7 +435,7 @@ impl TrainLease {
                     // Every copied frame is taken: `w` sends the train on.
                     if route.held.contains(w) {
                         route.held = route.held.without(w);
-                        self.lease.reactor.w2m.unhold(w, self.lease.id);
+                        self.reactor.w2m.unhold(w, self.id);
                     }
                     route.reader = Some((w, cx.waker().clone()));
                     Poll::Pending

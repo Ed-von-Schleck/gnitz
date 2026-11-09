@@ -1,6 +1,6 @@
-//! The reactor's timers: a [`Reactor::sleep_until`] holds one entry in the
-//! deadline map while it is pending, and each pass wakes every entry whose
-//! deadline has passed.
+//! The reactor's timers: a [`Reactor::sleep_until`] polled before its deadline
+//! holds one entry in the deadline map until that deadline passes or it drops;
+//! each pass removes and wakes every entry whose deadline has passed.
 
 use std::collections::BTreeMap;
 
@@ -45,7 +45,9 @@ impl Timers {
     }
 }
 
-/// A deadline. Its entry in the deadline map lives until the future drops.
+/// A deadline. A pending poll puts its entry in the deadline map; the pass whose
+/// clock passes it removes the entry and wakes it, and a drop removes it before
+/// then.
 struct TimerFuture {
     deadline: Instant,
     id: u64,

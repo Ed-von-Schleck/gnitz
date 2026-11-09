@@ -2,7 +2,7 @@
 //! by [`Reactor::block_on`] alone. A task's waker is its key (see `waker_wake`);
 //! a one-CQE awaiter polls its op's slot in `ops`, next-of-many awaiters park in
 //! a [`WakeQueue`](crate::runtime::sync::WakeQueue), an ACK round parks on its
-//! lease's route until every worker of its set has answered, and every deadline
+//! lease's route until every launched worker has answered, and every deadline
 //! sits in one deadline map.
 //!
 //! This file holds the reactor's state, the CQE `user_data` encoding, one-shot
@@ -39,9 +39,7 @@ pub(super) mod test_support;
 mod timer;
 mod uring;
 
-pub(crate) use conn::{
-    Accepted, Charge, ClientConn, FrameSink, Limits, PeerGone, Plain, RecvBuf, RecvEnd, RecvFilter, SendBody,
-};
+pub(crate) use conn::{Accepted, Charge, ClientConn, Decrypt, FrameSink, Limits, PeerGone, RecvBuf, RecvEnd, SendBody};
 pub(crate) use lease::{AckLease, ReadyAcked, TrainFrame, TrainLease};
 pub(crate) use uring::check_host;
 
@@ -65,10 +63,10 @@ const fn udata(kind: u64, id: u64) -> u64 {
     (kind << KIND_SHIFT) | (id & ID_MASK)
 }
 
-/// The low bits of a one-shot op's id, its slot in `ops`; the bits above count
-/// the ops pushed, so a cancel still queued when its op completes and the slot
-/// is reused (a submit that failed or took only part of the SQ) names its own
-/// op, not the slot's next one.
+/// The low 32 bits of a one-shot op's id, its slot in `ops`. The 24 bits above
+/// them that `ID_MASK` keeps count the ops pushed, wrapping, so a cancel still
+/// queued when its op completes and the slot is reused (a submit that failed or
+/// took only part of the SQ) names its own op, not the slot's next one.
 const OP_SLOT_MASK: u64 = 0xFFFF_FFFF;
 
 // ---------------------------------------------------------------------------
@@ -88,12 +86,13 @@ pub(crate) struct ReactorShared {
     /// One-shot ops, each in a slot freed by the later of its CQE and its
     /// awaiter's end (taking the result, or being dropped).
     ops: RefCell<Slab<OpSlot>>,
-    /// One-shot ops pushed: the high bits of each op's id.
+    /// One-shot ops pushed. Each op's id holds this count, cut to the bits above
+    /// its slot that `ID_MASK` keeps.
     ops_pushed: Cell<u64>,
     /// A `FUTEX_WAIT` SQE on the W2M park is outstanding. Cleared by its CQE.
     parked: Cell<bool>,
     timers: timer::Timers,
-    routes: lease::Routes,
+    routes: RefCell<lease::Routes>,
     conns: conn::Conns,
     w2m: W2mReceiver,
 }
@@ -109,15 +108,14 @@ enum OpSlot {
     Abandoned(Box<dyn Any>),
 }
 
-/// The awaiter of a one-shot op: yields its CQE `res`. It holds `carry`, what
-/// the SQE names, until the CQE; dropped before it, it leaves `carry` to the
-/// slot.
+/// The awaiter of a one-shot op: yields its CQE `res` and its carry. It holds
+/// `carry`, what the SQE names, until the CQE; dropped before it, it leaves
+/// `carry` to the slot.
 struct Op<C: 'static> {
     reactor: Reactor,
     user_data: u64,
+    /// `None` once the result is taken and the slot freed.
     carry: Option<C>,
-    /// The result was taken, and the slot freed.
-    finished: bool,
 }
 
 impl<C: 'static> Op<C> {
@@ -130,29 +128,22 @@ impl<C: 'static> Op<C> {
         self.carry.as_ref().expect("an op holds its carry until its end")
     }
 
-    /// The carry, once the result is taken: no SQE names it any more.
-    fn into_carry(mut self) -> C {
-        assert!(self.finished, "a carry taken before its CQE");
-        self.carry.take().expect("an op holds its carry until its end")
-    }
-
     /// Cancel this op, which has not completed: its CQE comes early,
-    /// `-ECANCELED` unless it was completing anyway. Submitted now, so the
-    /// cancel reaches the kernel while the op's slot is still its own.
+    /// `-ECANCELED` unless it was completing anyway. Queued like any SQE: its
+    /// `user_data` carries the op's count, so a cancel still queued when the op
+    /// completes and its slot is reused names no other op.
     fn cancel(&self) {
         let sqe = opcode::AsyncCancel::new(self.user_data).build();
-        let mut ring = self.reactor.ring.borrow_mut();
         // SAFETY: the SQE names no memory.
-        unsafe { ring.push(sqe, udata(KIND_CANCEL, 0)) };
-        ring.submit();
+        unsafe { self.reactor.ring.borrow_mut().push(sqe, udata(KIND_CANCEL, 0)) };
     }
 }
 
 impl<C: 'static + Unpin> Future for Op<C> {
-    type Output = i32;
+    type Output = (i32, C);
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
-        assert!(!self.finished, "an op polled after its result");
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<(i32, C)> {
+        assert!(self.carry.is_some(), "an op polled after its result");
         let slot = self.slot();
         let mut ops = self.reactor.ops.borrow_mut();
         let res = match &mut ops[slot] {
@@ -168,23 +159,19 @@ impl<C: 'static + Unpin> Future for Op<C> {
         };
         ops.remove(slot);
         drop(ops);
-        self.finished = true;
-        Poll::Ready(res)
+        Poll::Ready((res, self.carry.take().expect("checked above")))
     }
 }
 
 impl<C: 'static> Drop for Op<C> {
     fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
+        let Some(carry) = self.carry.take() else { return };
         let slot = self.slot();
         let mut ops = self.reactor.ops.borrow_mut();
         if let OpSlot::Done(_) = ops[slot] {
-            // The carry drops with `self`, after the borrow.
+            // `carry` drops at the end, after the borrow.
             ops.remove(slot);
         } else {
-            let carry = self.carry.take().expect("an op holds its carry until its end");
             ops[slot] = OpSlot::Abandoned(Box::new(carry));
         }
     }
@@ -216,7 +203,7 @@ impl Reactor {
             ops_pushed: Cell::new(0),
             parked: Cell::new(false),
             timers: timer::Timers::new(),
-            routes: lease::Routes::new(),
+            routes: RefCell::new(lease::Routes::new()),
             conns: conn::Conns::new(limits),
             w2m,
         }));
@@ -225,12 +212,15 @@ impl Reactor {
     }
 
     /// Queue `sqe` as a one-shot op holding `carry` until its CQE, and return
-    /// its awaiter, which yields the CQE `res`. Not submitted. The op's slot is
-    /// freed by the later of its one CQE and its awaiter's end, and then
-    /// reused, so `sqe` must be an opcode that posts exactly one CQE.
+    /// its awaiter, which yields the CQE `res` and `carry`. Not submitted. The
+    /// op's slot is freed by the later of its CQE and its awaiter's end, and
+    /// then reused.
     ///
     /// # Safety
     /// As [`IoUringRing::push`]; what `carry` holds counts as valid until the CQE.
+    /// `sqe` posts exactly one CQE: the dispatch finds an op's slot by its low
+    /// bits alone, so a second CQE would complete the slot's next op early and
+    /// free that op's carry while its SQE still reads it.
     unsafe fn push_op<C: 'static>(&self, sqe: io_uring::squeue::Entry, carry: C) -> Op<C> {
         let slot = self.ops.borrow_mut().insert(OpSlot::Waiting(None)) as u64;
         debug_assert!(slot <= OP_SLOT_MASK, "{slot} ops in flight");
@@ -243,20 +233,20 @@ impl Reactor {
             reactor: self.clone(),
             user_data,
             carry: Some(carry),
-            finished: false,
         }
     }
 
-    /// Queue an fdatasync of `fd` and submit it now, so it runs while the caller
-    /// works on. The future yields the CQE `res`: 0, or a negative errno.
-    pub(crate) fn fsync(&self, fd: BorrowedFd<'static>) -> impl Future<Output = i32> {
+    /// An fdatasync of `fd`, submitted at its first poll rather than with the
+    /// pass's own submit, so it runs while the rest of the pass does. Yields
+    /// the CQE `res`: 0, or a negative errno.
+    pub(crate) async fn fsync(&self, fd: BorrowedFd<'static>) -> i32 {
         let sqe = opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
             .flags(types::FsyncFlags::DATASYNC)
             .build();
         // SAFETY: `fd` is open for the process's life; the SQE names no memory.
         let op = unsafe { self.push_op(sqe, ()) };
         self.ring.borrow_mut().submit();
-        op
+        op.await.0
     }
 }
 

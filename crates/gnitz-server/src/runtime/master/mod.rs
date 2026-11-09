@@ -20,7 +20,6 @@ use std::num::NonZero;
 use rustc_hash::FxHashMap;
 
 use crate::catalog::CatalogEngine;
-use crate::runtime::park::WorkerSet;
 use crate::runtime::reactor::{Reactor, TrainLease};
 use crate::runtime::sal::{GroupData, GroupTargets, Read, SalExcl, SalGroup, SalWriter};
 use gnitz_wire::WireFault;

@@ -291,6 +291,10 @@ const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_wake
 /// most one spurious poll per wake.
 fn make_waker(key: usize) -> Waker {
     let raw = RawWaker::new(key as *const (), &WAKER_VTABLE);
+    // SAFETY: no vtable function reads memory through `data`, which is the key
+    // itself, copied by value; a wake touches only the waking thread's run
+    // queue. So a wake from another thread is never unsound: it is lost for this
+    // reactor, and at most spuriously polls a task of that thread's own reactor.
     unsafe { Waker::from_raw(raw) }
 }
 

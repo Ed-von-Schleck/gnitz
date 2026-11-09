@@ -25,10 +25,10 @@ impl MasterDispatcher {
     /// Write `group` to every worker on a fresh ACK lease, and wake them now: a
     /// caller may await the ACKs under this hold.
     fn write_acked(&self, excl: &mut SalExcl<'_>, group: SalGroup<'_>) -> Result<AckLease, WireFault> {
-        let lease = self.reactor.lease_acks(WorkerSet::ALL);
+        let lease = self.reactor.lease_acks();
         let targets = GroupTargets {
-            set: lease.workers(),
             reply: Some(lease.id()),
+            ..GroupTargets::SILENT
         };
         excl.write(&SalGroup { targets, ..group })?;
         excl.wake();

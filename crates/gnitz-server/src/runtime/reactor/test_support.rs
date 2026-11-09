@@ -20,7 +20,6 @@ impl Limits {
         inbound_cap: usize::MAX,
         conn_inbound_share: usize::MAX,
         client_send_timeout: Duration::from_secs(30),
-        accept_rearm_backoff: Duration::from_millis(2),
         max_conns: usize::MAX,
     };
 }
@@ -90,7 +89,7 @@ pub(crate) fn accepted_pair(r: &Reactor) -> (Accepted, UnixStream) {
 /// and the other end.
 pub(super) fn registered(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
     let (accepted, partner) = accepted_pair(r);
-    (r.connect(accepted, None, Plain::new()), partner)
+    (r.connect(accepted, None, None), partner)
 }
 
 /// [`registered`], past its handshake: admitting frames up to the payload ceiling.
