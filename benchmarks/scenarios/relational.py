@@ -3,6 +3,8 @@ operations, aggregates and the per-row programs under them, ordered state."""
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from .base import BYTES, WORDS, Fact, Shape, Zipf, scatter
 
 FLOAT = "a float sum depends on the order its rows are folded in"
@@ -90,6 +92,8 @@ def ranges(n, rng):
     return dims, {
         "ra": Fact(lambda k: dict(pk=k + 1, x=rng.randrange(RANGE_DIM + 1))),
         "ba": Fact(lambda k: dict(pk=k + 1, k=hot(rng), lo=rng.randrange(1001))),
+        # One row per thousand of `ra`: a write to it re-emits every `ra` row it crosses.
+        "rc": Fact(lambda k: dict(pk=k + 1, z=rng.randrange(1000)), share=1 / 1000),
     }
 
 
@@ -120,10 +124,33 @@ def measures(n, rng):
     return [], {"e": Fact(row)}
 
 
+def hits(n, rng):
+    """A web server's request log: a row every five seconds or so, over a few
+    hundred paths and a user a fiftieth as many as the rows."""
+    users = max(n // 50, 1)
+    paths = [f"/{area}/v{v}/{noun}/{i}" for area in ("api", "static", "account") for v in (1, 2)
+             for noun in ("orders", "items", "search", "profile", "assets") for i in range(10)]
+    agents = [f"Mozilla/5.0 (X11; Linux x86_64; rv:{100 + i}.0) Gecko/20100101 Firefox/{100 + i}.0" for i in range(10)]
+    agents += [f"Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 Version/{15 + i}.0 Safari/605.1.15" for i in range(10)]
+    t0 = datetime(2024, 3, 1)
+    return [], {"hits": Fact(lambda k: dict(
+        id=k + 1, ts=t0 + timedelta(seconds=k * 5 + rng.randrange(5)), user_id=rng.randrange(users),
+        method=rng.choice(("GET", "GET", "GET", "POST", "PUT", "DELETE")), url=rng.choice(paths),
+        status=rng.choice((200, 200, 200, 200, 304, 404, 500)), agent=rng.choice(agents), ms=rng.randrange(2000)))}
+
+
 def ledger(n, rng):
     accounts = max(n // 100, 1)
     return [], {"tx": Fact(lambda k: dict(
         id=k + 1, acct=rng.randrange(accounts), ts=k * 7 + rng.randrange(7), amount=rng.randrange(1, 10**6)))}
+
+
+FANOUT = Shape(
+    "fanout", "join",
+    "six views and an index that each read an order table by its customer: three joins, a join under an "
+    "aggregate, a MIN/MAX and a SUM per customer",
+    BYTES,
+    [CUSTOMERS, ORDERS, "CREATE INDEX ON orders(customer_id)", *FANOUT_VIEWS], orders(1))
 
 
 SCENARIOS = [
@@ -137,12 +164,7 @@ SCENARIOS = [
          "CREATE VIEW v_left AS SELECT o.id, o.amount, c.name "
          "FROM orders o LEFT JOIN customers c ON o.customer_id = c.id"],
         orders(1.2)),
-    Shape(
-        "fanout", "join",
-        "six views and an index that each read an order table by its customer: three joins, a join under an "
-        "aggregate, a MIN/MAX and a SUM per customer",
-        BYTES,
-        [CUSTOMERS, ORDERS, "CREATE INDEX ON orders(customer_id)", *FANOUT_VIEWS], orders(1)),
+    FANOUT,
     Shape(
         "fanout_clustered", "join",
         "the fanout scenario over an order table keyed and clustered by its customer, whose own store is "
@@ -181,14 +203,16 @@ SCENARIOS = [
         multiway),
     Shape(
         "range_joins", "join",
-        f"a band join, and an inner and a left join on an inequality alone against {RANGE_DIM} rows, whose "
-        "views are 32 times their input",
+        f"a band join, an inner and a left join on an inequality alone against {RANGE_DIM} rows, whose "
+        "views are 32 times their input, and a cross join to a table a thousandth the size of its other side",
         ("l0", "compacted"),
         ["CREATE TABLE ra (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
          "CREATE TABLE rb (pk BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)",
          "CREATE TABLE ba (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)",
          "CREATE TABLE bb (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
+         "CREATE TABLE rc (pk BIGINT NOT NULL PRIMARY KEY, z BIGINT NOT NULL)",
          "CREATE VIEW v_band AS SELECT ba.k AS k, ba.lo AS lo, bb.t AS t FROM ba JOIN bb ON ba.k = bb.k AND ba.lo <= bb.t",
+         "CREATE VIEW v_cross AS SELECT ra.x AS x, rc.z AS z FROM ra CROSS JOIN rc",
          "CREATE VIEW v_ri AS SELECT ra.x AS x, rb.y AS y FROM ra JOIN rb ON ra.x < rb.y",
          "CREATE VIEW v_rl AS SELECT ra.x AS x, rb.y AS y FROM ra LEFT JOIN rb ON ra.x < rb.y"],
         ranges, fixed_rows=30_000),
@@ -246,6 +270,25 @@ SCENARIOS = [
          "CREATE VIEW v_band AS SELECT pk AS id FROM e WHERE d BETWEEN 100 AND 200 AND disc BETWEEN 0.05 AND 0.07",
          "CREATE VIEW v_noted AS SELECT pk AS id, v, note FROM e WHERE note IS NOT NULL"],
         measures, unverified={"v_net_sum": FLOAT}),
+    Shape(
+        "expressions", "relational",
+        "a request log under the string and calendar functions: LIKE and ILIKE filters, a projection of "
+        "string functions, groups keyed on DATE_TRUNC and EXTRACT, COUNT(DISTINCT) and a HAVING",
+        ("l0", "compacted"),
+        ["CREATE TABLE hits (id BIGINT NOT NULL PRIMARY KEY, ts TIMESTAMP NOT NULL, user_id BIGINT NOT NULL, "
+         "method TEXT NOT NULL, url TEXT NOT NULL, status INT NOT NULL, agent TEXT NOT NULL, ms BIGINT NOT NULL)",
+         "CREATE VIEW v_api AS SELECT id, method, url FROM hits WHERE url LIKE '/api/%/orders/%' "
+         "AND agent ILIKE '%firefox%'",
+         "CREATE VIEW v_lines AS SELECT id, LOWER(method) AS m, SUBSTRING(url, 1, 12) AS area, "
+         "CONCAT(method, ' ', url, ' ', status) AS line, LENGTH(agent) AS agent_len FROM hits",
+         "CREATE VIEW v_hourly AS SELECT DATE_TRUNC('hour', ts) AS hour, COUNT(DISTINCT user_id) AS users "
+         "FROM hits GROUP BY DATE_TRUNC('hour', ts)",
+         "CREATE VIEW v_weekday AS SELECT EXTRACT(DOW FROM ts) AS dow, status, COUNT(*) AS n, SUM(ms) AS total_ms "
+         "FROM hits GROUP BY EXTRACT(DOW FROM ts), status",
+         "CREATE VIEW v_url_users AS SELECT url, COUNT(DISTINCT user_id) AS users FROM hits GROUP BY url",
+         "CREATE VIEW v_heavy AS SELECT user_id, COUNT(*) AS n, MAX(ms) AS slowest FROM hits GROUP BY user_id "
+         "HAVING COUNT(*) > 60"],
+        hits),
     Shape(
         "operators", "relational",
         "a DISTINCT and an EXCEPT, whose leaves are keyed on their columns, and a per-group top-N",

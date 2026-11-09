@@ -5,9 +5,13 @@ of its store."""
 from __future__ import annotations
 
 import itertools
+import random
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+
+from harness.run import bag
 
 from . import corpus
 from .base import BYTES, WORDS, Fact, Shape, scatter
@@ -142,6 +146,33 @@ def messages(n, rng):
     return [], {"messages": Fact(lambda k: dict(
         id=k + 1, kind=rng.randrange(4),
         body=f"message {rng.randrange(10**9):09d} " + " ".join(rng.choice(WORDS) for _ in range(6))))}
+
+
+@dataclass
+class Bounded(Shape):
+    """A Shape whose `v_bounded` is held under a capacity beside its unbounded
+    `v_twin`, followed by reads of both: point seeks of keys the capacity has
+    largely reduced to skeleton rows, which a read recomputes, and whole scans.
+    Each read of the bounded view must return what its twin's does."""
+
+    def run(self, run):
+        super().run(run)
+        c, n = run.conn, run.rows
+        ids = random.Random(11).sample(range(1, n + 1), max(n // 1000, 200))
+        got = {}
+        for v in ("v_bounded", "v_twin"):
+            vid, schema = c.resolve_table(v)
+            name = v.removeprefix("v_")
+            # Reads alone owe no tick, so neither phase drains.
+            with run.phase(f"seek_{name}", drain=False) as ph:
+                seeks = [bag(ph.timed("seek", c.seek, vid, schema, i)) for i in ids]
+                ph.rows += sum(map(len, seeks))
+            with run.phase(f"scan_{name}", drain=False) as ph:
+                for _ in range(3):
+                    scan = bag(ph.timed("scan", c.scan, vid, schema))
+                    ph.rows += len(scan)
+            got[v] = (seeks, scan)
+        assert got["v_bounded"] == got["v_twin"], "a read of the bounded view returns what its twin's does"
 
 
 SCENARIOS = [
@@ -280,9 +311,10 @@ SCENARIOS = [
          "WITH (compress = true)",
          "CREATE VIEW v_kind0 WITH (compress = true) AS SELECT id, body FROM passages WHERE kind = 0"],
         strings_prose, fixed_rows=70_000),
-    Shape(
+    Bounded(
         "bounded", "policy",
-        "a filter view held under a capacity a sixth of what it would take, beside its unbounded twin",
+        "a filter view held under a capacity a sixth of what it would take, beside its unbounded twin, "
+        "then point seeks and scans of each",
         BYTES,
         ["CREATE TABLE messages (id BIGINT NOT NULL PRIMARY KEY, kind INT NOT NULL, body TEXT NOT NULL)",
          "CREATE VIEW v_bounded WITH (capacity = '1 MB') AS SELECT id, body FROM messages WHERE kind < 3",

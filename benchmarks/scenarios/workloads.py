@@ -1,6 +1,7 @@
 """Scenarios that vary how the server is used: statements through the parser,
-read verbs against views, transactions, contended writers, readers beside
-writers, replicated placement, and views pushed out to subscribers."""
+read verbs against views, the transport under them, transactions, contended
+writers, readers beside writers, views created under writes, placement and
+worker count, and views pushed out to subscribers."""
 
 from __future__ import annotations
 
@@ -8,15 +9,15 @@ import asyncio
 import random
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import gnitz
 from gnitz import aio
 
-from harness.run import time_calls, time_pushes
+from harness.run import bag, time_calls, time_pushes
 
 from .base import INGEST_BATCH, LOAD_BATCH, Fact, Scenario, Shape, Zipf, scatter
-from .relational import FLOAT, NATIONS, SHIPMODES
+from .relational import FANOUT, FLOAT, NATIONS, SHIPMODES
 
 
 def ops_for(run, per=1000, least=200):
@@ -40,7 +41,12 @@ class Statements(Scenario):
                 "CREATE TABLE inv (pk BIGINT NOT NULL PRIMARY KEY, qty BIGINT NOT NULL)",
                 "CREATE TABLE srl (id BIGSERIAL PRIMARY KEY, v BIGINT NOT NULL)",
                 "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)",
-                "CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT NOT NULL REFERENCES parent(id))")
+                "CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT NOT NULL REFERENCES parent(id))",
+                "CREATE TABLE uq (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL, cat BIGINT NOT NULL)",
+                "CREATE UNIQUE INDEX uq_val ON uq(val)",
+                "CREATE TABLE owner (id BIGINT NOT NULL PRIMARY KEY)",
+                "CREATE TABLE item (id BIGINT NOT NULL PRIMARY KEY, "
+                "owner_id BIGINT NOT NULL REFERENCES owner(id) ON DELETE CASCADE)")
         rng = random.Random(7)
         span = 1_000_000_000
 
@@ -53,13 +59,13 @@ class Statements(Scenario):
         with run.phase("load") as ph:
             ph.replay(load)
 
-        at = [n]
+        at = {"t": n, "uq": n}
 
-        def insert(batch):
+        def insert(batch, table="t"):
             def stmt(_):
-                lo = at[0]
-                at[0] += batch
-                return ("INSERT INTO t (pk, val, cat) VALUES "
+                lo = at[table]
+                at[table] += batch
+                return (f"INSERT INTO {table} (pk, val, cat) VALUES "
                         + ", ".join(f"({k + 1}, {scatter(k, 40) % span}, {k % 20})" for k in range(lo, lo + batch)))
             return stmt
 
@@ -75,9 +81,9 @@ class Statements(Scenario):
         each("insert_1", insert(1))
         each("insert_10", insert(10), rows=10)
         each("insert_100", insert(100), rows=100)
-        each("select_all", lambda i: "SELECT * FROM t", 20, rows=at[0])
-        each("select_payload", lambda i: "SELECT val, cat FROM t", 20, rows=at[0])
-        each("select_key_val", lambda i: "SELECT pk, val FROM t", 20, rows=at[0])
+        each("select_all", lambda i: "SELECT * FROM t", 20, rows=at["t"])
+        each("select_payload", lambda i: "SELECT val, cat FROM t", 20, rows=at["t"])
+        each("select_key_val", lambda i: "SELECT pk, val FROM t", 20, rows=at["t"])
         each("select_pk", lambda i: f"SELECT * FROM t WHERE pk = {scatter(i, 40) % n + 1}")
         each("select_limit", lambda i: "SELECT * FROM t LIMIT 100", rows=100)
         each("select_ordered", lambda i: "SELECT * FROM t ORDER BY pk LIMIT 100", rows=100)
@@ -89,7 +95,7 @@ class Statements(Scenario):
         each("delete_pk", lambda i: f"DELETE FROM t WHERE pk = {i * 3 + 1}")
         each("delete_scan", lambda i: f"DELETE FROM t WHERE val > {span // 2 + i * (span // 1000)} AND val < {span // 2 + (i + 1) * (span // 1000)}",
              10, counted=True)
-        each("create_index", lambda i: "CREATE INDEX ON t(val)", 1, rows=at[0])
+        each("create_index", lambda i: "CREATE INDEX ON t(val)", 1, rows=at["t"])
         probes = [scatter(k, 40) % span for k in range(n // 2, n // 2 + ops)]
         each("select_index", lambda i: f"SELECT * FROM t WHERE val = {probes[i]}")
         each("update_index", lambda i: f"UPDATE t SET cat = {i} WHERE val = {probes[i]}")
@@ -100,6 +106,20 @@ class Statements(Scenario):
         each("insert_returning", lambda i: f"INSERT INTO srl (v) VALUES ({i * 10}) RETURNING id")
         each("insert_fk", lambda i: "INSERT INTO child VALUES "
                                     + ", ".join(f"({i * 50 + j + 1}, {i * 50 + j + 1})" for j in range(50)), rows=50)
+
+        # `t`'s twin under a unique index on `val`: each insert first proves its values are new.
+        load = run.ops("uq", (row(k) for k in range(n)), LOAD_BATCH)
+        with run.phase("load_unique") as ph:
+            ph.replay(load)
+        each("insert_100_unique", insert(100, "uq"), rows=100)
+
+        items = 10
+        load = (run.ops("owner", (dict(id=k + 1) for k in range(ops)), LOAD_BATCH)
+                + run.ops("item", (dict(id=k + 1, owner_id=k // items + 1) for k in range(ops * items)), LOAD_BATCH))
+        with run.phase("load_cascade") as ph:
+            ph.replay(load)
+        each("delete_cascade", lambda i: f"DELETE FROM owner WHERE id = {i + 1}", rows=1 + items)
+        assert not bag(run.scan("item")), "a cascade left an item"
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +180,52 @@ class Reads(Scenario):
         with run.phase("scan_eight_views") as ph:
             for _ in range(ops):
                 ph.timed("scan_many", c.scan_many, many, rows=8 * groups)
+
+
+# ---------------------------------------------------------------------------
+# Transport
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Transport(Scenario):
+    """The same requests over the Unix socket and over TLS on loopback, which
+    is how a client on another host reaches the server: one-row pushes, bulk
+    pushes, seeks of a grouped view, and scans of the whole table."""
+
+    def run(self, run):
+        n, ops = run.rows, ops_for(run, 200, 1000)
+        groups = 1000
+        run.ddl("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, v BIGINT NOT NULL, "
+                "body TEXT NOT NULL)",
+                "CREATE VIEW v_g AS SELECT g, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY g")
+        rng = random.Random(7)
+
+        def row(k):
+            return dict(pk=k + 1, g=k % groups, v=rng.randrange(1000),
+                        body=f"request {k:09d} from {rng.choice(NATIONS)}: {rng.randrange(10**12):012d}")
+        transports = (("unix", run.server.sock_path), ("tls", run.server.tls_target))
+        lo = 0
+        for name, target in transports:
+            singles = run.ops("t", (row(k) for k in range(lo, lo + ops)), 1)
+            bulk = run.ops("t", (row(k) for k in range(lo + ops, lo + ops + n // 2)), LOAD_BATCH)
+            lo += ops + n // 2
+            with gnitz.connect(target) as c:
+                with run.phase(f"push_1_{name}") as ph:
+                    ph.replay(singles, conn=c)
+                with run.phase(f"push_bulk_{name}") as ph:
+                    ph.replay(bulk, conn=c)
+        # The reads follow every write, so each transport reads the same rows.
+        t = run.tables["t"]
+        for name, target in transports:
+            with gnitz.connect(target) as c:
+                vid, schema = c.resolve_table("v_g")
+                # Reads alone owe no tick, so neither phase drains.
+                with run.phase(f"seek_{name}", drain=False) as ph:
+                    for i in range(ops):
+                        ph.rows += len(ph.timed("seek", c.seek, vid, schema, i * 7 % groups))
+                with run.phase(f"scan_{name}", drain=False) as ph:
+                    for _ in range(3):
+                        ph.timed("scan", c.scan, t.tid, t.schema, rows=lo)
 
 
 # ---------------------------------------------------------------------------
@@ -370,12 +436,18 @@ class Htap(Scenario):
 READER_GROUP_BASE, READER_PK_BASE = 10_000_000, 100_000_000
 
 
-def _background_writer(conn, widx, pushes, groups):
-    tid, schema = conn.resolve_table("o")
-    rng = random.Random(widx)
-    rows = [gnitz.ZSetBatch(schema).extend([dict(pk=READER_PK_BASE * (100 + widx) + i, cust=rng.randrange(groups) + 1, amt=1)])
+def _background_writes(run, widx, pushes, groups):
+    """The `(fn, *args)` of a client pushing `pushes` one-row writes to `o`,
+    its batches built here, before the phase its pushes are timed in."""
+    o, rng = run.tables["o"], random.Random(widx)
+    rows = [gnitz.ZSetBatch(o.schema).extend([dict(pk=READER_PK_BASE * (100 + widx) + i,
+                                                   cust=rng.randrange(groups) + 1, amt=1)])
             for i in range(pushes)]
-    return {"calls": {"background_push": (time_calls(lambda i: conn.push(tid, rows[i]), pushes), pushes)}}
+    return _background_writer, o.tid, rows
+
+
+def _background_writer(conn, tid, rows):
+    return {"calls": {"background_push": (time_calls(lambda i: conn.push(tid, rows[i]), len(rows)), len(rows))}}
 
 
 def _own_writes_reader(conn, ridx, ops, view):
@@ -411,11 +483,46 @@ class Serving(Scenario):
         with run.phase("load") as ph:
             ph.replay(load)
         for i, (name, view) in enumerate((("grouped", "v_rev"), ("passthrough", "v_passthru"))):
+            writer = _background_writes(run, i, 3 * ops, groups)
             with run.phase(name) as ph:
-                got = ph.clients([(_own_writes_reader, 10 * i + r, ops, view) for r in range(3)]
-                                 + [(_background_writer, i, 3 * ops, groups)])
+                got = ph.clients([(_own_writes_reader, 10 * i + r, ops, view) for r in range(3)] + [writer])
                 ph.extra["stale_seeks"] = got["stale"]
             assert got["stale"] == 0, f"{got['stale']} seeks of {view} missed the write before them"
+
+
+def _view_creator(conn, stmts):
+    return {"calls": {"create_view": (time_calls(lambda i: conn.execute_sql(stmts[i]), len(stmts)), 0)}}
+
+
+@dataclass
+class OnlineDdl(Scenario):
+    """Views created while writers push: what a backfill costs beside traffic,
+    and what the writers' pushes wait for while it runs. The views created
+    under writes must hold every write, the ones before and during the DDL
+    alike, which the backfill check proves."""
+
+    def run(self, run):
+        n, groups, pushes = run.rows, 1000, ops_for(run, 100, 2000)
+        run.ddl("CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)",
+                "CREATE TABLE o (pk BIGINT NOT NULL PRIMARY KEY, cust BIGINT UNSIGNED NOT NULL, amt BIGINT NOT NULL)",
+                "CREATE VIEW v_rev AS SELECT cust, SUM(amt) AS s FROM o GROUP BY cust")
+        rng = random.Random(7)
+        load = (run.ops("c", (dict(id=k + 1, region=k % 5) for k in range(groups)), LOAD_BATCH)
+                + run.ops("o", (dict(pk=k + 1, cust=rng.randrange(groups) + 1, amt=rng.randrange(1000))
+                                for k in range(n)), LOAD_BATCH))
+        with run.phase("load") as ph:
+            ph.replay(load)
+        stmts = ["CREATE VIEW v_by_region AS SELECT c.region, COUNT(*) AS n, SUM(o.amt) AS total "
+                 "FROM o JOIN c ON o.cust = c.id GROUP BY c.region",
+                 "CREATE VIEW v_large AS SELECT pk, cust, amt FROM o WHERE amt > 900",
+                 "CREATE VIEW v_cust_ext AS SELECT cust, MIN(amt) AS lo, MAX(amt) AS hi FROM o GROUP BY cust"]
+        writers = [_background_writes(run, w, pushes, groups) for w in range(2)]
+        with run.phase("create_under_writes") as ph:
+            ph.clients([(_view_creator, stmts)] + writers)
+            run.created(*stmts)     # before the phase's drain reads them
+        writers = [_background_writes(run, w, pushes, groups) for w in range(2, 4)]
+        with run.phase("writes_after") as ph:
+            ph.clients(writers)
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +762,8 @@ SCENARIOS = [
     Statements("statements", "sql", Statements.__doc__.split(":")[0]),
     Reads("reads", "sql", "the binary read verbs against views: scan, seek by a group key and by a base key, "
                           "an index seek, an ad-hoc aggregate, and one snapshot of two and of eight views"),
+    Transport("transport", "sql", "one-row and bulk pushes, view seeks and table scans over the Unix socket and "
+                                  "over TLS on loopback"),
     Transactions("transactions", "concurrency", "atomic multi-table commits from four writers, a transaction of "
                                                 "compounding UPDATEs against its autocommit twin, and the bare round trips"),
     Contention("contention", "concurrency", "one, two and four writers incrementing the same 1, 8 and 64 rows "
@@ -663,8 +772,14 @@ SCENARIOS = [
                                 "views at one cut, with no snapshot torn"),
     Serving("serving", "concurrency", "three clients that each seek a view for their own last write, beside a "
                                       "writer to everyone else's keys, with no seek stale"),
+    OnlineDdl("online_ddl", "concurrency", "three views, a join among them, created while two writers push, "
+                                           "and the same writers once they exist"),
     Replicated("replicated", "placement", "a replicated table against its partitioned twin: write, scan, "
                                           "backfill and maintenance of a UNION ALL view over each"),
+    replace(FANOUT, name="rescale", family="placement",
+            doc="the fanout scenario booted at twice its worker count after the load, and back at its own after "
+                "the kill: every store relaid onto a wider count, and the log tail re-sliced onto a narrower one",
+            regimes=("l0", "compacted"), rescale=2),
     Feed("feed", "distribution", "eight subscribers that each keep one tenant's rows of a filter view, and a "
                                  "mirror that follows an aggregate view and a filtered alias as a local store"),
     Follow("follow", "distribution", "awaited one-row pushes on a connection that follows a mirrored view with a "

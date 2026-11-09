@@ -57,6 +57,10 @@ class Shape(Scenario):
     trickle   a tenth as many, in small batches each read back at once
     churn     rows rewritten and rows deleted
     recover   a kill, and the boot that replays the log
+
+    With `rescale`, `boot` runs at `rescale` times the run's worker count and
+    `recover` back at the run's own, so the stores are relaid onto a wider count
+    and the log tail is re-sliced onto a narrower one.
     """
 
     ddl: list = field(default_factory=list)
@@ -66,6 +70,7 @@ class Shape(Scenario):
     rewrites: float = 0.25      # rows rewritten in `churn`, per loaded row
     deletes: float = 0.05       # rows deleted in `churn`, per loaded row
     read: str | None = None     # the view `trickle` reads; the last one by default
+    rescale: int = 1
 
     def run(self, run):
         n = run.rows
@@ -84,7 +89,8 @@ class Shape(Scenario):
         last = next(reversed(run.views))
         with run.phase("load") as ph:
             ph.replay(ops, read=last)
-        run.restart("loaded")
+        home = run.server.workers
+        run.restart("loaded", workers=home * self.rescale)
 
         at = n
         ops = fresh(at, at + n // 2, INGEST_BATCH)
@@ -117,7 +123,9 @@ class Shape(Scenario):
                     table = run.tables[t]
                     ph.timed("delete", run.conn.delete, table.tid, table.schema, keys, rows=len(keys))
 
-        run.crash()
+        run.crash(workers=home)
+        if self.rescale != 1:
+            assert run.phases[-1]["resliced"], "the boot at the run's own worker count re-sliced the log tail"
 
 
 class Zipf:

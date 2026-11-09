@@ -110,6 +110,15 @@ async def time_pushes(conn, ops):
     return out
 
 
+def bag(rows):
+    """`{row: summed weight}` of `rows`, ghosts dropped."""
+    acc = {}
+    for r in rows:
+        k = tuple(r)
+        acc[k] = acc.get(k, 0) + r._weight
+    return {k: w for k, w in acc.items() if w}
+
+
 class Phase:
     """`boots` is a phase a boot runs in: no process of the server exists when
     it opens, so its groups are the server's, with their totals since they
@@ -142,13 +151,14 @@ class Phase:
         self.add(kind, [(time.perf_counter() - t) * 1e3], rows)
         return out
 
-    def push(self, op):
-        self.timed("push", self.run.conn.push, op.table.tid, op.batch, rows=op.rows)
+    def push(self, op, conn=None):
+        """`op` on `conn`, the run's own connection by default."""
+        self.timed("push", (conn or self.run.conn).push, op.table.tid, op.batch, rows=op.rows)
 
-    def replay(self, ops, read=None):
+    def replay(self, ops, read=None, conn=None):
         """Send `ops` in order; with `read`, read that view after each."""
         for op in ops:
-            self.push(op)
+            self.push(op, conn)
             if read:
                 self.timed("read", self.run.conn.execute_sql, f"SELECT * FROM {read} LIMIT 1")
 
@@ -238,8 +248,9 @@ class Run:
 
     # -- server ---------------------------------------------------------------
 
-    def boot(self):
-        self.server.start(workers=self.params.workers, timeout=60.0)
+    def boot(self, workers=None):
+        """Boot, at `workers` from now on when given: the server keeps the count."""
+        self.server.start(workers=workers, timeout=60.0)
         self.conn = gnitz.connect(self.server.sock_path)
         self._workers = self.server.worker_pids()
         self.layers.server_started(self.groups())
@@ -256,23 +267,26 @@ class Run:
         deltas pushed after it exists."""
         for stmt in stmts:
             self.conn.execute_sql(stmt)
-            self._created(stmt)
+            self.created(stmt)
 
     def ddl_in(self, phase, stmt, rows=0):
         """One statement of DDL as a timed call of `phase`."""
         phase.sql("ddl", stmt, rows=rows)
-        self._created(stmt)
+        self.created(stmt)
 
-    def _created(self, stmt):
-        if m := _VIEW.match(stmt.strip()):
-            self.views[m[1]] = m[2]
-        elif m := _TABLE.match(stmt.strip()):
-            tid, schema = self.conn.resolve_table(m[1])
-            cols = schema.columns
-            self.tables[m[1]] = Table(
-                m[1], tid, schema, [cols[i].name for i in schema.pk_indices],
-                {c.name: WIDTHS.get(gnitz.TypeCode(c.type_code).name) for c in cols},
-                bool(re.search(r"stream\s*=\s*true", stmt, re.I)))
+    def created(self, *stmts):
+        """Record DDL that has run, on whichever connection: a view joins the
+        ones every later drain reads."""
+        for stmt in stmts:
+            if m := _VIEW.match(stmt.strip()):
+                self.views[m[1]] = m[2]
+            elif m := _TABLE.match(stmt.strip()):
+                tid, schema = self.conn.resolve_table(m[1])
+                cols = schema.columns
+                self.tables[m[1]] = Table(
+                    m[1], tid, schema, [cols[i].name for i in schema.pk_indices],
+                    {c.name: WIDTHS.get(gnitz.TypeCode(c.type_code).name) for c in cols},
+                    bool(re.search(r"stream\s*=\s*true", stmt, re.I)))
 
     @staticmethod
     def _price(t, row):
@@ -332,16 +346,18 @@ class Run:
             self.data_dir, relations, {t.tid for t in self.tables.values()}, value_bytes,
             sum(t.pushed for t in self.tables.values()))
 
-    def _boot_phase(self, name, rows):
+    def _boot_phase(self, name, rows, workers=None):
         with self.phase(name, boots=True) as ph:
-            self.boot()
+            self.boot(workers)
             ph.rows = rows
             ph.extra.update(ready_s=time.clock_gettime(time.CLOCK_MONOTONIC) - ph.t0,
-                            rebuilt_views=self.server.rebuilt_view_count())
+                            workers=self.server.workers, rebuilt_views=self.server.rebuilt_view_count(),
+                            resliced=self.server.resliced())
 
-    def restart(self, reading):
-        """A graceful stop and the boot on what it left, as the phases
-        `checkpoint` and `boot`, with the disk reading `reading` between them."""
+    def restart(self, reading, workers=None):
+        """A graceful stop and the boot on what it left, at `workers` when
+        given, as the phases `checkpoint` and `boot`, with the disk reading
+        `reading` between them."""
         relations, value_bytes = self._held()
         rows = sum(relations[t.tid][1] for t in self.tables.values())
         self.conn.close()
@@ -351,26 +367,22 @@ class Run:
             ph.extra["unpaced"] = True
             self.server.stop_graceful(timeout=600)
         self._read_disk(reading, relations, value_bytes)
-        self._boot_phase("boot", rows)
+        self._boot_phase("boot", rows, workers)
 
-    def crash(self):
-        """A kill, and the boot that replays the log as the phase `recover`."""
+    def crash(self, workers=None):
+        """A kill, and the boot that replays the log, at `workers` when given,
+        as the phase `recover`."""
         rows = self.base_rows()
         self.conn.close()
         self.server.stop()
         self.layers.server_stopped()
-        self._boot_phase("recover", rows)
+        self._boot_phase("recover", rows, workers)
 
     # -- backfill and verification ---------------------------------------------
 
-    def bag(self, name):
-        """`{row: summed weight}` of a scan of `name`, ghosts dropped."""
-        tid, schema = self.conn.resolve_table(name)
-        acc = {}
-        for r in self.conn.scan(tid, schema):
-            k = tuple(r)
-            acc[k] = acc.get(k, 0) + r._weight
-        return {k: w for k, w in acc.items() if w}
+    def scan(self, name):
+        """Every row of the relation `name`, weights and all."""
+        return self.conn.scan(*self.conn.resolve_table(name))
 
     def verify(self):
         """Create every view a second time over the data it already holds — the
@@ -388,7 +400,7 @@ class Run:
         for v in self.views:
             if v in skipped:
                 continue
-            a, b = self.bag(v), self.bag(f"{v}__twin")
+            a, b = bag(self.scan(v)), bag(self.scan(f"{v}__twin"))
             checked += 1
             if a != b:
                 wrong.append({"view": v, "maintained_rows": len(a), "backfilled_rows": len(b),
@@ -405,7 +417,7 @@ class Run:
         p = self.params
         try:
             self.layers.start()
-            self.boot()
+            self.boot(p.workers)
             self.scenario.run(self)
             verified = self.verify()
             relations, value_bytes = self._held()
