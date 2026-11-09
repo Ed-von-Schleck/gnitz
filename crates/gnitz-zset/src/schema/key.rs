@@ -175,6 +175,13 @@ pub fn probe_key(opk: &[u8]) -> u64 {
     gnitz_wire::checksum(opk)
 }
 
+/// The widest span whose [`probe_key`] is injective over spans of its width.
+/// XXH3-64 packs an input of 1 to 8 bytes losslessly into one word and mixes
+/// that word only by steps that are each a bijection — a constant XOR, odd
+/// multiplies, xorshifts and an invertible rotate-XOR — so two such inputs of
+/// one length never share a fingerprint.
+pub const PROBE_KEY_INJECTIVE_BYTES: usize = 8;
+
 /// The half-open OPK key band `[start, end)` `range` walks over a store keyed by
 /// `schema`, whose leading PK columns are `range`'s columns at their own widths:
 /// every key from the group of `eq ‖ first` through the group of `eq ‖ last`.

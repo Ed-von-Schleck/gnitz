@@ -105,3 +105,39 @@ fn validate_rejects_each_way_a_descriptor_can_be_wrong() {
         assert!(!validate(&d, len), "{name} must be rejected");
     }
 }
+
+/// A key no wider than [`PROBE_KEY_INJECTIVE_BYTES`] skips the sort and deduplication,
+/// and its region is byte for byte the one its sorted, deduplicated
+/// fingerprints build.
+#[test]
+fn a_narrow_key_builds_the_filter_its_sorted_fingerprints_build() {
+    let sorted_region = |pk_region: &[u8], stride: usize| {
+        let mut keys: Vec<u64> = pk_region.chunks_exact(stride).map(crate::schema::probe_key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let filter = BinaryFuse8::try_from(keys.as_slice()).unwrap();
+        let mut buf = vec![0u8; Descriptor::DMA_LEN + filter.fingerprints.len()];
+        filter.dma_copy_descriptor_to(&mut buf[..Descriptor::DMA_LEN]);
+        buf[Descriptor::DMA_LEN..].copy_from_slice(filter.dma_fingerprints());
+        buf
+    };
+    let mut rng = Rng::new(0x5_0471);
+    for stride in 1..=PROBE_KEY_INJECTIVE_BYTES {
+        let span = 1u64.checked_shl(8 * stride as u32).unwrap_or(0).wrapping_sub(1);
+        for n in [1usize, 2, 3, 100, 70_000] {
+            // Ascending, each key repeated by up to three rows.
+            let mut pks: Vec<u64> = (0..n).map(|_| rng.next_u64() & span).collect();
+            pks.extend(pks.clone().iter().step_by(3));
+            pks.sort_unstable();
+            let region: Vec<u8> = pks
+                .iter()
+                .flat_map(|k| k.to_be_bytes()[8 - stride..].to_vec())
+                .collect();
+            assert_eq!(
+                build(&region, stride).unwrap(),
+                sorted_region(&region, stride),
+                "stride {stride}, {n} keys"
+            );
+        }
+    }
+}

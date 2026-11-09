@@ -15,15 +15,18 @@
 //! panics rather than answering wrongly. [`parse`] therefore puts
 //! [`validate`] between the region and any [`BinaryFuse8Ref`].
 
+use crate::schema::PROBE_KEY_INJECTIVE_BYTES;
 use gnitz_wire::{read_u32_le, read_u64_le};
 use xorf::{BinaryFuse8, BinaryFuse8Ref, Descriptor, DmaSerializable, FilterRef};
 
 /// Build the filter over a PK-sorted region of `stride`-byte keys, as its region
 /// bytes `[descriptor][fingerprints]`. Rows sharing a PK are adjacent, so
-/// skipping a key byte-equal to its predecessor bounds the sort at the distinct
-/// PKs. The keys are deduplicated again after hashing: `probe_key` is a 64-bit
-/// digest, so distinct PKs collide, and the construction requires distinct keys
-/// (asserted under `debug_assertions`).
+/// skipping a key byte-equal to its predecessor leaves each distinct PK once.
+/// The construction requires distinct keys (asserted under `debug_assertions`)
+/// and builds the same filter from them in any order. A key of
+/// [`PROBE_KEY_INJECTIVE_BYTES`] bytes or fewer has a `probe_key` of its own, so
+/// its fingerprints are distinct already; a wider key's 64-bit digest can collide
+/// with another's, so those fingerprints are sorted and deduplicated.
 ///
 /// `None` on a construction failure, which writes the shard filterless — a
 /// permanent read-cost regression for that one file — and logs a warning: a
@@ -38,8 +41,10 @@ pub(crate) fn build(pk_region: &[u8], stride: usize) -> Option<Vec<u8>> {
         prev = Some(chunk);
         keys.push(crate::schema::probe_key(chunk));
     }
-    keys.sort_unstable();
-    keys.dedup();
+    if stride > PROBE_KEY_INJECTIVE_BYTES {
+        keys.sort_unstable();
+        keys.dedup();
+    }
     let filter = match BinaryFuse8::try_from(keys.as_slice()) {
         Ok(f) => f,
         Err(e) => {
