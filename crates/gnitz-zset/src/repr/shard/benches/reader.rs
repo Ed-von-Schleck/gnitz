@@ -31,9 +31,9 @@ fn slice_blob_relocate_bench() {
     let cycles = Counter::cycles();
     let arm = |shard: &MappedShard, rc: usize, relocate: bool| {
         let carried = (!relocate).then(|| shard.heap().plain().expect("a plain heap").len());
-        let slice = || drop(black_box(shard.slice_to_owned_batch_with(0, rc, carried)));
+        let slice = || drop(black_box(shard.slice_to_owned_batch_with(0, rc, carried, 0)));
         // The first slice faults in the cold mmap pages.
-        assert_eq!(shard.slice_to_owned_batch_with(0, rc, carried).len(), rc);
+        assert_eq!(shard.slice_to_owned_batch_with(0, rc, carried, 0).len(), rc);
         cycles.measure(|| (0..ITERS).for_each(|_| slice())).1 as f64 / ITERS as f64
     };
 
@@ -285,12 +285,12 @@ fn shard_read_bench() {
             .map(|(role, encoding, size)| format!("{role}:{size}/{encoding}"))
             .collect();
         let shard = MappedShard::open(&path, &schema).unwrap();
-        let (whole, slice_i) = instructions.measure(|| black_box(shard.slice_to_owned_batch(0, N)));
+        let (whole, slice_i) = instructions.measure(|| black_box(shard.slice_to_owned_batch(0, N, 0)));
         let want = weighted_rows(batch);
         assert_eq!(weighted_rows(&whole), want, "{label}: slice");
         let (_, window_i) = instructions.measure(|| {
             for start in (0..N).step_by(WINDOW) {
-                black_box(shard.slice_to_owned_batch(start, WINDOW.min(N - start)));
+                black_box(shard.slice_to_owned_batch(start, WINDOW.min(N - start), 0));
             }
         });
         let cells = || {

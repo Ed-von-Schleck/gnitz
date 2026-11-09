@@ -135,10 +135,11 @@ impl ColumnarSource for Run {
         cols: &mut ColTable,
         window: Range<usize>,
         decoded: &mut DecodedColumns,
+        skip: u64,
     ) -> UnifiedSource<'_> {
         match self {
             Run::Mem(b) => mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
-            Run::Shard(s) => s.to_unified(schema, cols, window, decoded),
+            Run::Shard(s) => s.to_unified(schema, cols, window, decoded, skip),
         }
     }
 

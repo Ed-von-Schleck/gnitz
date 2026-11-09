@@ -136,7 +136,7 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
         for w in [0..n, 0..0, mid.clone()] {
             // A whole heap charged dead bounds any slice's.
             let carried = shard.heap().plain().filter(|_| !relocate).map(<[u8]>::len);
-            let b = shard.slice_to_owned_batch_with(w.start, w.len(), carried);
+            let b = shard.slice_to_owned_batch_with(w.start, w.len(), carried, 0);
             if let Some(heap) = shard.heap().plain().filter(|_| relocate && w.len() == n) {
                 assert!(b.blob().len() <= heap.len(), "{label}: a relocated span copied twice");
             }
@@ -149,9 +149,13 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
     }
     for w in [0..n, mid] {
         let rows: Vec<Pick> = w.clone().map(|r| (0, r as u32, want.get_weight(r))).collect();
-        let b = UnifiedSet::with(std::slice::from_ref(shard), schema, std::iter::once(w.clone()), |set| {
-            set.materialize(&rows, None)
-        });
+        let b = UnifiedSet::with(
+            std::slice::from_ref(shard),
+            schema,
+            std::iter::once(w.clone()),
+            0,
+            |set| set.materialize(&rows, None),
+        );
         assert_eq!(
             rows_of(&b.as_mem_batch(), schema),
             want_rows[w.clone()],
@@ -834,7 +838,7 @@ fn a_point_read_decodes_one_block_and_keeps_its_address() {
     assert_eq!(shard.seek(&key, Some(3)), row);
     assert_eq!(shard.pk_at(row).pk_bytes(), key);
     assert_eq!(shard.pk_rows(&key), row..row + 1);
-    std::hint::black_box(shard.slice_to_owned_batch(100, n - 200));
+    std::hint::black_box(shard.slice_to_owned_batch(100, n - 200, 0));
     let rows: Vec<Pick> = (0..n as u32).map(|r| (0, r, 1)).collect();
     let schema = make_schema_u64_i64();
     std::hint::black_box(UnifiedSet::with_whole(std::slice::from_ref(&shard), &schema, |set| {
@@ -892,7 +896,10 @@ fn shard_wider_than_reader_schema_opens() {
     );
     let shard = MappedShard::open(&shard_path, &narrow).unwrap();
     assert_eq!(rows_of(&shard, &narrow), want);
-    assert_eq!(rows_of(&shard.slice_to_owned_batch(0, 3).as_mem_batch(), &narrow), want);
+    assert_eq!(
+        rows_of(&shard.slice_to_owned_batch(0, 3, 0).as_mem_batch(), &narrow),
+        want
+    );
     // The blob region came from the *file's* index, not the reader's.
     assert_eq!(shard.heap().plain_len(), 0);
 }
@@ -953,19 +960,19 @@ fn slice_relocates_only_its_own_strings() {
     let shard = MappedShard::open(&write(dir.path(), "reloc.db", &batch), &schema).unwrap();
     assert_eq!(shard.heap().plain().map(<[u8]>::len), Some(N * W));
 
-    let one = shard.slice_to_owned_batch(37, 1);
+    let one = shard.slice_to_owned_batch(37, 1, 0);
     assert_eq!(one.blob().len(), W, "a one-row slice carries one string");
 
-    let under = shard.slice_to_owned_batch(0, CUT - 1);
+    let under = shard.slice_to_owned_batch(0, CUT - 1, 0);
     assert_eq!((under.blob().len(), under.dead_heap()), ((CUT - 1) * W, 0), "relocates");
 
-    let at = shard.slice_to_owned_batch(0, CUT);
+    let at = shard.slice_to_owned_batch(0, CUT, 0);
     assert_eq!(
         (at.blob().len(), at.dead_heap()),
         (N * W, (N - CUT) * W),
         "at the cut the whole region is copied, the rows left out charged dead"
     );
-    let full = shard.slice_to_owned_batch(0, N);
+    let full = shard.slice_to_owned_batch(0, N, 0);
     assert_eq!(Some(full.blob()), shard.heap().plain(), "whole shard: verbatim");
 }
 

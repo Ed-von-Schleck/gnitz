@@ -137,7 +137,7 @@ proptest! {
             // Direct shard decode of the on-disk region layout.
             let owned: Vec<Batch> = test_support::table_shards(&table)
                 .iter()
-                .map(|s| s.slice_to_owned_batch(0, s.row_count()))
+                .map(|s| s.slice_to_owned_batch(0, s.row_count(), 0))
                 .collect();
             prop_assert_eq!(&expected, &zset_sum(&owned, &schema));
         } else {

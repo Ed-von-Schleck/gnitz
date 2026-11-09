@@ -456,7 +456,7 @@ fn a_schema_change_rebinds_every_shard() {
         publish_manifest(&mut idx);
         idx.swap_schema(new).unwrap();
         for e in idx.all_entries() {
-            let row = e.shard.slice_to_owned_batch(0, 1);
+            let row = e.shard.slice_to_owned_batch(0, 1, 0);
             assert!(*row.schema() == new);
             let nw = row.get_null_word(0);
             assert!(

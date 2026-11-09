@@ -127,13 +127,13 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
     for (at, &source) in sources.iter().enumerate() {
         let (dag, registry) = host.parts();
         // `sources` came from this view's own plan.
-        let bound = dag.views[&view].code.scan(source).bound.clone();
         let code = &dag.views[&view].code;
-        let seed = code.scan(source).seed;
+        let scan = code.scan(source);
         // Whether a round relays the source's rows, and whether it folds them.
-        let relay_fold = code.scan(source).relay.is_some().then(|| code.vm.folds(seed));
+        let relay_fold = scan.relay.is_some().then(|| code.vm.folds(scan.seed));
         let relation = registry.relation_or_err(source)?;
-        let (mut cursor, _unapplied) = relation.open_bound(bound, Cut::Sealed)?;
+        let (mut cursor, _unapplied) = relation.open_bound(scan.bound.clone(), Cut::Sealed)?;
+        cursor.skip_payload(scan.unread);
         let unfed = &sources[at + 1..];
         loop {
             let mut chunk = cursor.drain_chunk(chunk_rows);

@@ -414,6 +414,14 @@ impl SchemaDescriptor {
         self.try_locate(ci)?.payload_slot()
     }
 
+    /// Bit `pi` set iff one of `cols` sits in payload slot `pi`; a PK or an
+    /// out-of-range column sets none.
+    pub fn payload_bits(&self, cols: impl IntoIterator<Item = u32>) -> u64 {
+        cols.into_iter()
+            .filter_map(|c| self.payload_slot(c as usize))
+            .fold(0, |bits, pi| bits | 1 << pi)
+    }
+
     /// Every payload column's locator, in slot order.
     pub fn payload_locators(&self) -> Vec<ColumnLocator> {
         self.payload_locator_iter().collect()

@@ -178,7 +178,7 @@ impl GuardMerge {
         if survivors.is_empty() {
             return None;
         }
-        Some(UnifiedSet::with(&shards, &self.out_schema, windows, |set| {
+        Some(UnifiedSet::with(&shards, &self.out_schema, windows, 0, |set| {
             set.materialize(&survivors, codebook)
         }))
     }
@@ -227,7 +227,7 @@ impl GuardMerge {
                     }
                     _ => StringDest::Placed(codebook),
                 };
-                s.decode_rows_into(w.clone(), dw, dest);
+                s.decode_rows_into(w.clone(), dw, dest, 0);
                 (w.len(), ())
             });
         }

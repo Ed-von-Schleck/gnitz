@@ -40,7 +40,7 @@ enum PayloadRegion {
     Dict(DictImage<'static>),
 }
 
-/// What every row of a column the file predates reads.
+/// What every row of a column the file predates, or a skipped one, reads.
 static ZERO_CELL: [u8; 16] = [0; 16];
 
 /// A payload region read through a decode. A per-row read decodes the block it
@@ -572,22 +572,24 @@ impl MappedShard {
     /// is bound to, the blob arm picked by [`carried_dead`]. A shard holds no dead
     /// bytes of its own; a carried heap charges the long bytes of the rows outside
     /// the slice. A coded heap is never carried: its values are decoded into the
-    /// batch's own.
+    /// batch's own. The payload columns `skip` names, as payload bits, are
+    /// written as zeroes that are not NULL, for a reader that never reads them.
     #[inline]
-    pub fn slice_to_owned_batch(&self, start: usize, row_count: usize) -> Batch {
+    pub fn slice_to_owned_batch(&self, start: usize, row_count: usize, skip: u64) -> Batch {
         let n = self.header.row_count;
-        let carried = self.heap().plain().and_then(|blob| {
+        let strings = self.schema.string_payload_slots() & !skip;
+        let carried = self.heap().plain().filter(|_| strings != 0).and_then(|blob| {
             carried_dead(blob.len(), 0, n, row_count, || {
-                long_bytes_outside(self, self.schema.string_payload_slots(), &[(start, start + row_count)])
+                long_bytes_outside(self, strings, &[(start, start + row_count)])
             })
         });
-        self.slice_to_owned_batch_with(start, row_count, carried)
+        self.slice_to_owned_batch_with(start, row_count, carried, skip)
     }
 
     /// [`slice_to_owned_batch`](Self::slice_to_owned_batch) with the blob arm
     /// passed in rather than derived, so both arms can be forced on one slice:
     /// `carried` is the dead-byte bound of a carried heap, `None` relocating.
-    fn slice_to_owned_batch_with(&self, start: usize, row_count: usize, carried: Option<usize>) -> Batch {
+    fn slice_to_owned_batch_with(&self, start: usize, row_count: usize, carried: Option<usize>, skip: u64) -> Batch {
         assert!(
             !self.header.skeleton,
             "a skeleton shard has no payload to slice; hydrate its keys"
@@ -598,7 +600,10 @@ impl MappedShard {
         let heap = self.heap();
         let relocate = carried.is_none();
         let blob_cap = if relocate {
-            prorated_blob_cap(heap.plain_len(), self.header.row_count, row_count)
+            match schema.string_payload_slots() & !skip {
+                0 => 0,
+                _ => prorated_blob_cap(heap.plain_len(), self.header.row_count, row_count),
+            }
         } else {
             heap.plain_len()
         };
@@ -609,7 +614,7 @@ impl MappedShard {
                 true => StringDest::Placed(None),
                 false => StringDest::Carried(w.adopt_heap(heap.plain().expect("only a plain heap is carried"))),
             };
-            self.decode_rows_into(start..start + row_count, w, dest);
+            self.decode_rows_into(start..start + row_count, w, dest, skip);
         });
         batch.charge_dead(carried.unwrap_or(0));
         batch.certify_consolidated();
@@ -619,8 +624,15 @@ impl MappedShard {
     /// Decode `rows` into `w`, a writer of exactly that many rows under this
     /// shard's schema, or under its PK-only schema for a skeleton shard, whose
     /// every null word is zero. Each long value's cell is rebased onto the
-    /// writer's heap as `dest` says.
-    pub(crate) fn decode_rows_into(&self, rows: Range<usize>, w: &mut DirectWriter<'_>, dest: StringDest<'_>) {
+    /// writer's heap as `dest` says; the payload columns `skip` names are
+    /// written as zeroes that are not NULL.
+    pub(crate) fn decode_rows_into(
+        &self,
+        rows: Range<usize>,
+        w: &mut DirectWriter<'_>,
+        dest: StringDest<'_>,
+        skip: u64,
+    ) {
         assert!(rows.end <= self.header.row_count, "rows out of range");
         debug_assert_eq!(rows.len(), w.rows(), "a writer of another row count");
         let (schema, start) = (&self.schema, rows.start);
@@ -639,12 +651,17 @@ impl MappedShard {
             return;
         }
         self.null_bmp.decode(start, null_bmp);
-        if self.null_pad_mask != 0 {
+        if self.null_pad_mask != 0 || skip != 0 {
             for word in null_bmp.as_chunks_mut::<8>().0 {
-                *word = (u64::from_le_bytes(*word) | self.null_pad_mask).to_le_bytes();
+                *word = ((u64::from_le_bytes(*word) | self.null_pad_mask) & !skip).to_le_bytes();
             }
         }
         for (pi, col) in schema.payload_columns() {
+            if skip >> pi & 1 == 1 {
+                // Zero cells, an empty string's included.
+                w.col_mut(pi).fill(0);
+                continue;
+            }
             self.decode_payload(pi, col.size(), start, w.col_mut(pi));
             if col.type_code.is_german_string() {
                 w.rebase_string_col(pi, self.heap(), dest);
@@ -714,6 +731,7 @@ impl MappedShard {
         cols: &mut ColTable,
         window: Range<usize>,
         decoded: &mut DecodedColumns,
+        skip: u64,
     ) -> UnifiedSource<'_> {
         debug_assert!(window.end <= self.header.row_count);
         let cols_off = cols.len();
@@ -722,6 +740,11 @@ impl MappedShard {
                 .payload_columns()
                 .take(schema.num_payload_cols())
                 .map(|(pi, col)| {
+                    // The scatter writes a skipped column as zeroes, without
+                    // reading it.
+                    if skip >> pi & 1 == 1 {
+                        return ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 };
+                    }
                     self.direct_col(pi).unwrap_or_else(|| {
                         decoded.column(&window, col.size(), |column| {
                             self.decode_payload(pi, col.size(), window.start, column)
@@ -751,9 +774,10 @@ impl ColumnarSource for MappedShard {
         cols: &mut ColTable,
         window: Range<usize>,
         decoded: &mut DecodedColumns,
+        skip: u64,
     ) -> UnifiedSource<'_> {
         let pk = self.pk.window(&window, schema.pk_stride(), decoded);
-        self.unified(pk, schema, cols, window, decoded)
+        self.unified(pk, schema, cols, window, decoded, skip)
     }
 
     #[inline(always)]
@@ -840,9 +864,10 @@ impl ColumnarSource for ShardWindow<'_> {
         cols: &mut ColTable,
         window: Range<usize>,
         decoded: &mut DecodedColumns,
+        skip: u64,
     ) -> UnifiedSource<'_> {
         debug_assert!(self.rows.start <= window.start && window.end <= self.rows.end);
-        self.shard.unified(self.pk, schema, cols, window, decoded)
+        self.shard.unified(self.pk, schema, cols, window, decoded, skip)
     }
 
     #[inline(always)]

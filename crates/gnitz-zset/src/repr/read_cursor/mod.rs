@@ -121,9 +121,20 @@ pub struct ReadCursor {
     /// newer than every source after them; set by
     /// [`Self::mark_heap_newest_first`], 0 otherwise.
     heap_newest_first: u32,
+    /// See [`Self::skip_payload`].
+    skip_payload: u64,
 }
 
 impl ReadCursor {
+    /// Let every drain from here on write the payload columns `skip` names, as
+    /// payload bits, as zeroes that are not NULL instead of decoding them: for a
+    /// reader that never reads them. A drain of one in-memory run alone copies
+    /// them as they are. Only over a store of one live row per PK, whose chunks
+    /// stay consolidated with columns zeroed.
+    pub fn skip_payload(&mut self, skip: u64) {
+        self.skip_payload = skip;
+    }
+
     /// The one live source, or `None` for none or several. Re-derived rather than
     /// the source set being narrowed: a seek is backward-capable, so a later one
     /// at a lower key can re-liven a source an earlier range seek emptied.
@@ -721,6 +732,7 @@ fn build(
         current_weight: 0,
         current: CursorRow { src: 0, row: 0 },
         heap_newest_first: 0,
+        skip_payload: 0,
     };
     position(&mut cursor);
     cursor

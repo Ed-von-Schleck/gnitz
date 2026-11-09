@@ -24,6 +24,14 @@ pub enum SourceCursor<'a> {
 }
 
 impl SourceCursor<'_> {
+    /// [`ReadCursor::skip_payload`] on a whole cursor; the others copy every
+    /// column.
+    pub fn skip_payload(&mut self, skip: u64) {
+        if let SourceCursor::Full(c) = self {
+            c.skip_payload(skip);
+        }
+    }
+
     /// The next non-empty source chunk, or `None` once the source is exhausted.
     /// `PkSet` exceeds `max_rows` rather than split a PK group.
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {

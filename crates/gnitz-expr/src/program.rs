@@ -325,6 +325,14 @@ impl Sink {
             Sink::Reg(r) => Some(r),
         }
     }
+
+    /// The input column this sink copies, the other half of [`Self::reg`].
+    fn col(self) -> Option<u32> {
+        match self {
+            Sink::Col(c) => Some(c),
+            Sink::Reg(_) => None,
+        }
+    }
 }
 
 /// One instruction with logical (schema) column indices, mirroring the wire
@@ -960,6 +968,16 @@ impl LogicalProgram {
     /// register `i`.
     pub fn instrs(&self) -> &[LogicalInstr] {
         &self.instrs
+    }
+
+    /// Every input column the program reads: an instruction's column operand or
+    /// a sink's copied column.
+    pub fn cols_read(&self) -> impl Iterator<Item = u32> + '_ {
+        let ops = self
+            .instrs
+            .iter()
+            .flat_map(|i| operands(i).cols.into_iter().flatten().map(|(c, _)| c));
+        ops.chain(self.sinks.iter().filter_map(|s| s.col()))
     }
 
     /// The output sinks.

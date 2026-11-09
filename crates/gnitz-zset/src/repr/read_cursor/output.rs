@@ -82,9 +82,13 @@ impl ReadCursor {
             if !filter.keeps_all() {
                 retain_kept(&self.sources, &windows, picks, filter);
             }
-            UnifiedSet::with(&self.sources, &self.schema, windows.iter().cloned(), |set| {
-                set.materialize(picks, None)
-            })
+            UnifiedSet::with(
+                &self.sources,
+                &self.schema,
+                windows.iter().cloned(),
+                self.skip_payload,
+                |set| set.materialize(picks, None),
+            )
         });
         batch.certify_consolidated();
         self.drain_windows = windows;
@@ -127,7 +131,7 @@ impl ReadCursor {
                     *shard.schema() == self.schema,
                     "a shard slices under the schema it is bound to"
                 );
-                shard.slice_to_owned_batch(start, row_count)
+                shard.slice_to_owned_batch(start, row_count, self.skip_payload)
             }
             Run::Mem(b) => {
                 let ranges = filter.ranges_in(&b.as_mem_batch(), start..start + row_count);

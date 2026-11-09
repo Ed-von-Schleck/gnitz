@@ -228,10 +228,7 @@ impl MapPlan {
                 let out_schema = packer.output_schema(in_schema, keep)?;
                 let drop_nulls = match nulls {
                     gnitz_wire::NullKeys::Drop => {
-                        key.iter()
-                            .filter_map(|&(c, _)| in_schema.payload_slot(c as usize))
-                            .fold(0, |mask, slot| mask | 1u64 << slot)
-                            & in_schema.nullable_payload_slots()
+                        in_schema.payload_bits(key.iter().map(|&(c, _)| c)) & in_schema.nullable_payload_slots()
                     }
                     gnitz_wire::NullKeys::Keep => 0,
                 };

@@ -599,3 +599,102 @@ proptest! {
         }
     }
 }
+
+/// Generation `generation` of key `pk` over [`skipping_schema`]: a nullable
+/// I64, a heap STRING and an I64.
+fn put_skipping_row(bb: &mut BatchBuilder, pk: u64, generation: u64, weight: i64) {
+    bb.begin_row(pk as u128, weight);
+    bb.put_opt_int((pk % 3 != 1).then_some((pk * 10 + generation) as u128));
+    bb.put_string(&format!("{pk:0>24}/{generation}"));
+    bb.put_int((pk + generation) as u128);
+    bb.end_row();
+}
+
+fn skipping_schema() -> SchemaDescriptor {
+    u64_pk_schema(&[
+        SchemaColumn::new(TypeCode::I64, true),
+        SchemaColumn::new(TypeCode::String, false),
+        SchemaColumn::new(TypeCode::I64, false),
+    ])
+}
+
+/// Every chunk of a drain of `c`, `skip` its skipped payload columns.
+fn drain_skipping(mut c: ReadCursor, skip: u64) -> Vec<Batch> {
+    c.skip_payload(skip);
+    std::iter::from_fn(|| c.drain_chunk(64)).collect()
+}
+
+/// A drain that skips payload columns emits the rows and weights of one that
+/// does not, every kept cell as it, and each skipped cell as a zero that is
+/// not NULL: through the merge of shards and a heap run, and through the
+/// single-source slice of one shard.
+#[test]
+fn a_drain_writes_skipped_payload_columns_as_zeroes() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = skipping_schema();
+    let run = |rows: Vec<(u64, u64, i64)>| {
+        let mut bb = BatchBuilder::new(&schema);
+        for (pk, generation, w) in rows {
+            put_skipping_row(&mut bb, pk, generation, w);
+        }
+        bb.finish().into_consolidated()
+    };
+    // Every key at generation 0; a newer shard rewrites every third key, which
+    // ties it across the shards, and a heap run deletes every tenth.
+    let latest = |pk: u64| u64::from(pk.is_multiple_of(3));
+    let old = map_shard(
+        &dir.path().join("old.db"),
+        &run((0..200).map(|pk| (pk, 0, 1)).collect()),
+    );
+    let new = map_shard(
+        &dir.path().join("new.db"),
+        &run((0..200).step_by(3).flat_map(|pk| [(pk, 0, -1), (pk, 1, 1)]).collect()),
+    );
+    let gone = Rc::new(run((0..200).step_by(10).map(|pk| (pk, latest(pk), -1)).collect()));
+
+    let open = |label| match label {
+        "merged" => create_read_cursor(&[Rc::clone(&gone)], &[Rc::clone(&old), Rc::clone(&new)], schema),
+        _ => create_read_cursor(&[], &[Rc::clone(&old)], schema),
+    };
+    assert!(
+        open("single").mode.is_some(),
+        "one source drains through the single-source copy"
+    );
+    for label in ["merged", "single"] {
+        let want = drain_skipping(open(label), 0);
+        for skip in [0b001, 0b010, 0b011, 0b110] {
+            let got = drain_skipping(open(label), skip);
+            assert_eq!(got.len(), want.len(), "{label} {skip:#b}: chunks");
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(g.len(), w.len(), "{label} {skip:#b}: rows");
+                assert!(g.is_consolidated(), "{label} {skip:#b}");
+                for i in 0..g.len() {
+                    assert_eq!(
+                        (g.get_pk_bytes(i), g.get_weight(i)),
+                        (w.get_pk_bytes(i), w.get_weight(i))
+                    );
+                    for pi in 0..3 {
+                        let null = |b: &Batch| gnitz_wire::null_word_get(b.get_null_word(i), pi);
+                        let cell = |b: &Batch| match pi {
+                            1 => gnitz_wire::payload_bytes(b, i, pi).into_owned(),
+                            _ => gnitz_wire::payload_u64(b, i, pi).to_le_bytes().to_vec(),
+                        };
+                        if skip >> pi & 1 == 1 {
+                            assert!(!null(g), "{label} {skip:#b}: row {i} column {pi} is NULL");
+                            assert!(
+                                cell(g).iter().all(|&b| b == 0),
+                                "{label} {skip:#b}: row {i} column {pi}"
+                            );
+                        } else {
+                            assert_eq!(
+                                (null(g), cell(g)),
+                                (null(w), cell(w)),
+                                "{label} {skip:#b}: row {i} column {pi}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

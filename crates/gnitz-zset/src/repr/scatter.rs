@@ -297,6 +297,7 @@ pub(crate) trait ColumnarSource: RowSource {
         cols: &mut ColTable,
         window: Range<usize>,
         decoded: &mut DecodedColumns,
+        skip: u64,
     ) -> UnifiedSource<'_>;
 
     /// Whether this source's rows are (PK, coarse weight) pairs with no payload —
@@ -328,6 +329,7 @@ impl<'a> ColumnarSource for MemBatch<'a> {
         cols: &mut ColTable,
         _window: Range<usize>,
         _decoded: &mut DecodedColumns,
+        _skip: u64,
     ) -> UnifiedSource<'_> {
         mem_batch_to_unified(self, schema, cols)
     }
@@ -370,6 +372,7 @@ fn scatter_unified_sources(
     cols: &[ColPtr],
     rows: &[Pick],
     codebook: Option<&Codebook>,
+    skip: u64,
     writer: &mut DirectWriter<'_>,
 ) {
     assert_eq!(
@@ -387,13 +390,17 @@ fn scatter_unified_sources(
         scatter_unified_pk_wt_nbm,
         sources,
         rows,
+        skip,
         writer
     );
 
     let schema = writer.schema;
     for (pi, col) in schema.payload_columns() {
         let cs = col.size();
-        if col.type_code.is_german_string() {
+        if skip >> pi & 1 == 1 {
+            // A column the reader never reads: zero cells, an empty string's included.
+            writer.col_mut(pi).fill(0);
+        } else if col.type_code.is_german_string() {
             let (cells, blob, mut cache) = writer.string_col_mut(pi);
             let picked = cells
                 .as_chunks_mut::<16>()
@@ -440,12 +447,13 @@ fn scatter_unified_sources(
 fn scatter_unified_pk_wt_nbm<const PKS: usize>(
     sources: &[UnifiedSource<'_>],
     rows: &[Pick],
+    skip: u64,
     writer: &mut DirectWriter<'_>,
     width: usize,
 ) {
     const FB: usize = FIXED_REGION_BYTES;
     let pks = stride::<PKS>(width);
-    let keep = gnitz_wire::low_bits_mask(writer.schema.num_payload_cols());
+    let keep = gnitz_wire::low_bits_mask(writer.schema.num_payload_cols()) & !skip;
     let (pk_dst, wt_dst, nbm_dst) = writer.fixed_mut();
     assert!(pk_dst.len() == rows.len() * pks && wt_dst.len() == rows.len() * FB);
     let (pk_dst, wt_dst, nbm_dst) = (pk_dst.as_mut_ptr(), wt_dst.as_mut_ptr(), nbm_dst.as_mut_ptr());
@@ -659,18 +667,22 @@ pub(crate) struct UnifiedSet<'a> {
     src_blob: usize,
     src_rows: usize,
     _decoded: DecodedColumns,
+    /// Payload columns written as zeroes instead of copied.
+    skip: u64,
     #[cfg(debug_assertions)]
     windows: Vec<Range<usize>>,
 }
 
 impl<'a> UnifiedSet<'a> {
     /// `f` applied to views over `sources` under `schema`, source `si` readable
-    /// at rows in the `si`-th window. The set is built in this frame and lent to
-    /// `f`, so its inline tables are never copied out by a return.
+    /// at rows in the `si`-th window, the payload columns `skip` names left
+    /// undecoded and written as zeroes. The set is built in this frame and lent
+    /// to `f`, so its inline tables are never copied out by a return.
     pub(crate) fn with<S: ColumnarSource, R>(
         sources: &'a [S],
         schema: &SchemaDescriptor,
         windows: impl IntoIterator<Item = Range<usize>>,
+        skip: u64,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         #[cfg(debug_assertions)]
@@ -688,12 +700,13 @@ impl<'a> UnifiedSet<'a> {
             src_blob: sources.iter().map(|s| s.heap().plain_len()).sum(),
             src_rows: sources.iter().map(|s| s.row_count()).sum(),
             _decoded: DecodedColumns::default(),
+            skip,
             #[cfg(debug_assertions)]
             windows,
         };
         set.cols.reserve(sources.len() * schema.num_payload_cols());
         for (s, w) in sources.iter().zip(each) {
-            let view = s.to_unified(schema, &mut set.cols, w, &mut set._decoded);
+            let view = s.to_unified(schema, &mut set.cols, w, &mut set._decoded, skip);
             set.sources.push(view);
         }
         f(&mut set)
@@ -705,19 +718,20 @@ impl<'a> UnifiedSet<'a> {
         schema: &SchemaDescriptor,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        Self::with(sources, schema, sources.iter().map(|s| 0..s.row_count()), f)
+        Self::with(sources, schema, sources.iter().map(|s| 0..s.row_count()), 0, f)
     }
 
     /// Copy the rows `rows` names, in the order given, each at the weight its
     /// pick carries, into a fresh unconsolidated batch under the set's schema,
     /// its heap coded under `codebook` where one is given (see
     /// [`Codebook::append`]). The heap reserved is prorated from the whole
-    /// sources, and none under a schema without a string column, such as a
-    /// skeleton merge's PK-only one over sources that hold strings.
+    /// sources, and none where the set writes no string column: under a
+    /// schema without one, such as a skeleton merge's PK-only one over sources
+    /// that hold strings, or where every one is skipped.
     pub(crate) fn materialize(&self, rows: &[Pick], codebook: Option<&Codebook>) -> Batch {
-        let blob_cap = match self.schema.has_german_string() {
-            true => prorated_blob_cap(self.src_blob, self.src_rows, rows.len()),
-            false => 0,
+        let blob_cap = match self.schema.string_payload_slots() & !self.skip {
+            0 => 0,
+            _ => prorated_blob_cap(self.src_blob, self.src_rows, rows.len()),
         };
         self.write(rows, blob_cap, codebook)
     }
@@ -740,7 +754,7 @@ impl<'a> UnifiedSet<'a> {
                     debug_assert_eq!(base, at, "carried heaps land in source order");
                 }
             }
-            scatter_unified_sources(&self.sources, &self.cols, rows, codebook, writer);
+            scatter_unified_sources(&self.sources, &self.cols, rows, codebook, self.skip, writer);
         })
     }
 }
