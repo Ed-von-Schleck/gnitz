@@ -3,10 +3,12 @@ use std::num::NonZeroU64;
 
 use super::*;
 use crate::catalog::SysFamily;
-use crate::runtime::sal::fixtures::test_log;
-use crate::runtime::sal::{GroupData, GroupTargets, SalGroup, SalReader};
+use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::fixtures::{group_at, test_log};
+use crate::runtime::sal::format::payload_rows;
+use crate::runtime::sal::group::{Group, Payloads, Routed};
+use crate::runtime::w2m::fixtures::id;
 use crate::test_support::{make_batch, make_schema_u64_i64, schema_tab_batch};
-use gnitz_wire::peek_control_block;
 use gnitz_zset::schema::encode_schema_block;
 
 /// Every request, each field a value no other field of it holds, so a swapped
@@ -72,61 +74,61 @@ fn every_request() -> Vec<SalRequest<'static>> {
     ]
 }
 
-/// The head a worker decodes is the one `lay_out` wrote: every request through
+/// The request a worker decodes is the one `lay_out` wrote: every request through
 /// a written group, the two that carry rows through their own constructors.
 #[test]
 fn every_request_decodes_from_its_written_group() {
     let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
     let record = encode_schema_block(batch.schema());
-    let mut groups: Vec<SalGroup> = every_request().into_iter().map(SalGroup::new).collect();
-    groups.push(SalGroup::push(
-        15,
-        PkRule::Fresh,
-        &record,
-        GroupData::Same(batch.wire_whole()),
-        GroupTargets::SILENT,
+    let requests = every_request();
+    let mut groups: Vec<(&SalRequest, Group)> = (requests.iter())
+        .map(|request| {
+            let group = match request {
+                SalRequest::Read(read) => Group::read(read, WorkerSet::ALL, None, id(1)),
+                SalRequest::Apply(apply) => Group::apply(apply, id(1)),
+                SalRequest::Shutdown => Group::shutdown(),
+            };
+            (request, group)
+        })
+        .collect();
+    let push = Apply::Push { tid: 15, rule: PkRule::Fresh }.into();
+    groups.push((
+        &push,
+        Group::push(15, PkRule::Fresh, &record, Routed::Same(batch.wire_whole())),
     ));
     let schemas = schema_tab_batch(&[(100, "s", 1)]);
-    groups.push(SalGroup::ddl_sync(SysFamily::Schema, &schemas));
-    let mut kinds: Vec<u8> = groups.iter().map(|g| g.request.encode().0.as_wire()).collect();
+    let ddl_sync = Apply::DdlSync { family: SysFamily::Schema }.into();
+    groups.push((&ddl_sync, Group::ddl_sync(SysFamily::Schema, &schemas)));
+    let mut kinds: Vec<u8> = groups.iter().map(|(_, g)| g.request.kind.as_wire()).collect();
     kinds.sort_unstable();
     kinds.dedup();
     assert_eq!(kinds.len(), SalMessageKind::ALL.len(), "every kind is written");
 
-    for group in groups {
-        // A fresh log each: a flush moves a reader to the next epoch.
+    for (request, group) in groups {
         let log = test_log(1 << 20, 2, 1);
         log.excl().write(&group).expect("group fits");
-        let (msg, slot) = SalReader::new(log.log(), 1, 1)
-            .next()
-            .expect("the group addresses the worker");
-        let control = peek_control_block(slot).expect("a control block");
-        let decoded = SalRequest::decode(
-            msg.head.kind,
-            msg.head.target_id,
-            &control.hdr,
-            &slot[control.blob.clone()],
-        );
-        assert_eq!(decoded.as_ref(), Ok(&group.request));
-        let (kind, target, _) = group.request.encode();
-        assert_eq!(msg.head.kind, kind);
-        assert_eq!(msg.head.target_id, target);
-        assert_eq!(control.hdr.target_id, 0, "a payload carries no target");
-        assert_eq!(control.data.is_some(), group.schema.is_some(), "{:?}", group.request);
+        let msg = group_at(log.log(), 0);
+        let slot = msg.slot(1).expect("the group addresses the worker");
+        let (blob, rows) = payload_rows(slot, |_| None).expect("a payload");
+        let decoded = SalRequest::decode(&msg.head.request, blob);
+        assert_eq!(decoded.as_ref(), Ok(request));
+        assert_eq!(msg.head.request, group.request);
+        let carries_rows = matches!(group.data, Payloads::Shared(Some(_)) | Payloads::EachRows(..));
+        assert_eq!(rows.is_some(), carries_rows, "{request:?}");
     }
 }
 
 #[test]
 fn a_blob_of_the_wrong_width_is_refused() {
-    let hdr = ControlHeader::default();
-    assert!(SalRequest::decode(SalMessageKind::Tick, 0, &hdr, &[0u8; 12]).is_err());
+    let head = RequestHead::new(SalMessageKind::Tick, 0, 0, 0);
+    assert!(SalRequest::decode(&head, &[0u8; 12]).is_err());
 }
 
 /// A `Push` group's rule word is 0 or 1.
 #[test]
 fn a_push_rule_no_group_writes_is_refused() {
-    let hdr = ControlHeader { arg0: 2, ..Default::default() };
-    assert!(SalRequest::decode(SalMessageKind::Push, 15, &hdr, &[]).is_err());
+    let head = RequestHead::new(SalMessageKind::Push, 15, 2, 0);
+    assert!(SalRequest::decode(&head, &[]).is_err());
 }
 
 /// A `HasPk` group's arguments must be the ones its probe kind writes.
@@ -142,9 +144,8 @@ fn a_probe_no_kind_writes_is_refused() {
         (SalMessageKind::HasPkIndex, 9, 0),
         (SalMessageKind::HasPkIndex, 9, 7),
     ] {
-        let hdr = ControlHeader { arg0, arg1, ..Default::default() };
         assert!(
-            SalRequest::decode(kind, 0, &hdr, &[]).is_err(),
+            SalRequest::decode(&RequestHead::new(kind, 0, arg0, arg1), &[]).is_err(),
             "{kind:?} {arg0} {arg1:#x}"
         );
     }
@@ -154,10 +155,10 @@ fn a_probe_no_kind_writes_is_refused() {
 /// copy outlives those bytes.
 #[test]
 fn a_read_borrows_its_blob_until_owned() {
-    let hdr = ControlHeader { arg0: 7, ..Default::default() };
+    let head = RequestHead::new(SalMessageKind::ScanSpec, 5, 7, 0);
     let owned = {
         let blob = vec![1u8, 2, 3];
-        let SalRequest::Read(read) = SalRequest::decode(SalMessageKind::ScanSpec, 5, &hdr, &blob).unwrap() else {
+        let SalRequest::Read(read) = SalRequest::decode(&head, &blob).unwrap() else {
             panic!("a scan is a read")
         };
         let Read::ScanSpec { spec: Cow::Borrowed(spec), .. } = &read else {
@@ -167,7 +168,7 @@ fn a_read_borrows_its_blob_until_owned() {
         read.into_owned()
     };
     assert!(matches!(
-        *owned,
+        owned,
         Read::ScanSpec { tid: 5, reply_layout: 7, spec: Cow::Owned(ref s) } if s == &[1, 2, 3]
     ));
 }
@@ -177,6 +178,6 @@ fn into_owned_keeps_every_read() {
     for request in every_request() {
         let SalRequest::Read(read) = request else { continue };
         let expected = format!("{read:?}");
-        assert_eq!(format!("{:?}", *read.into_owned()), expected);
+        assert_eq!(format!("{:?}", read.into_owned()), expected);
     }
 }

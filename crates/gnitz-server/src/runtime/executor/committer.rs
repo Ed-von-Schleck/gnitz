@@ -202,8 +202,11 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
         }
 
         // A write the SAL refused for want of room goes again behind a
-        // checkpoint, merged with none, until each has committed or been refused
-        // on an empty log.
+        // checkpoint, merged with none, until each has committed or failed.
+        // Every pass ends: behind a checkpoint the first unit starts at the
+        // checkpoint's floor unless another task's groups — reads, ticks —
+        // were written in between, and a unit refused where it started at the
+        // floor fails, so a pass with no such group commits or fails a unit.
         let mut merge = true;
         while !s.writes.is_empty() {
             commit_writes(&shared, &mut s, merge).await;
@@ -263,9 +266,10 @@ fn drain_ready_batch(
     None
 }
 
-/// The checkpoint sequence: base round, drain, ephemeral round. A failed round
-/// aborts: the workers are re-epoched against an un-reset SAL, which only a
-/// restart's replay repairs.
+/// The checkpoint sequence: base round, drain, ephemeral round. A failed base
+/// round aborts: the workers have left the epoch of a SAL that was not rewound,
+/// which only a restart's replay repairs. A failed ephemeral round aborts too:
+/// its views are stamped and the master's system rows are not durable.
 async fn run_checkpoint_sequence(shared: &Shared) {
     shared
         .dispatcher
@@ -431,7 +435,8 @@ fn build_units(s: &mut CommitScratch, merge: bool) {
 ///
 /// Leaves in `s.writes` the writes to commit again behind a checkpoint: the
 /// first unit the SAL had no room for, and every unit after it. A unit of one
-/// write too large for a log with nothing else in its epoch fails instead. A
+/// write fails instead when no checkpoint can make room for it: it is over the
+/// limit of a push, or it was refused starting directly behind a checkpoint. A
 /// merged run comes back as the writes it merged, which a batch that does not
 /// `merge` commits one by one. `s.units` is empty again on return.
 async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
@@ -452,8 +457,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
         // write that runs out of SAL space part-way can take its earlier
         // families back. Every write and the commit are in this one synchronous
         // block, so no reader ever observes the gap.
-        let mut scope = excl.begin("commit");
-        let zone_lsn = scope.lsn();
+        let mut scope = excl.begin();
 
         // A unit is all-or-nothing: a family that does not fit takes back the
         // unit's earlier families, which were never published.
@@ -473,12 +477,14 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
                     }
                 }
                 // A merged run goes again as the writes it merged; a unit of one
-                // write, if a checkpoint can make room for it.
+                // write, if a checkpoint may make room for it. The unit was taken
+                // back, so the scope's next group starts where the unit did.
                 Err(e)
                     if e.status == WireStatus::SalFull
                         && (unit.is_merged()
-                            || disp
-                                .commit_fits_empty_log(&scope, unit.laid().iter().map(|f| (f.tid, f.rows.view())))) =>
+                            || scope.checkpoint_may_admit_pushes(|| {
+                                disp.commit_footprint(unit.laid().iter().map(|f| (f.tid, f.rows.view())))
+                            })) =>
                 {
                     refused_at = Some(at);
                     break;
@@ -491,8 +497,9 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
         let again = refused_at.map(|at| s.units.split_off(at));
 
         // Started now rather than at the first writer's wait for it.
-        if scope.commit() {
-            disp.sal().want_durable(zone_lsn);
+        let zone_lsn = scope.commit();
+        if let Some(lsn) = zone_lsn {
+            disp.sal().want_durable(lsn);
         }
         // The auto-tick this may fire overlaps the fdatasync.
         shared.note_commit_rows(
@@ -502,7 +509,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
                 .flat_map(CommitUnit::laid)
                 .map(|f| (f.tid, f.rows.view().len())),
         );
-        (zone_lsn, again)
+        (zone_lsn.unwrap_or(0), again)
     };
 
     // The caches and commit LSNs, then the table locks. No OCC check of a

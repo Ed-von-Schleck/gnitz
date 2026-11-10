@@ -155,7 +155,7 @@ async fn commit_bundle(
     unique_creates: &[(u64, PkColList)],
 ) -> Result<Committed, WireFault> {
     // Pre-flight global uniqueness for every unique secondary index in this
-    // bundle before reserving the zone LSN or mutating the catalog, so a
+    // bundle before opening the zone or mutating the catalog, so a
     // violation needs no rollback.
     let mut filter_seeds = Vec::new();
     for &(owner_id, cols) in unique_creates {

@@ -21,7 +21,7 @@ use rustc_hash::FxHashMap;
 
 use crate::catalog::CatalogEngine;
 use crate::runtime::reactor::{Reactor, TrainLease};
-use crate::runtime::sal::{GroupData, GroupTargets, Read, SalExcl, SalGroup, SalWriter};
+use crate::runtime::sal::{Read, SalExcl, SalWriter};
 use gnitz_wire::WireFault;
 
 pub(crate) use dispatch::worker_death;
@@ -112,11 +112,7 @@ impl MasterDispatcher {
         &self,
         build: impl FnOnce(&mut ScanCut<'_>) -> Result<R, WireFault>,
     ) -> Result<R, WireFault> {
-        let mut cut = ScanCut {
-            disp: self,
-            excl: self.sal.lock().await,
-            written: false,
-        };
+        let mut cut = ScanCut { disp: self, excl: self.sal.lock().await };
         build(&mut cut)
     }
 
@@ -137,8 +133,6 @@ impl MasterDispatcher {
 pub(crate) struct ScanCut<'d> {
     disp: &'d MasterDispatcher,
     excl: SalExcl<'d>,
-    /// Whether the cut's first group has been written; the rest join it.
-    written: bool,
 }
 
 impl<'d> ScanCut<'d> {
@@ -152,24 +146,10 @@ impl<'d> ScanCut<'d> {
     /// the lease its replies are read through.
     pub(crate) fn read(&mut self, read: Read<'_>) -> Result<TrainLease, WireFault> {
         let route = route::route_read(&read, &self.disp.cat().registry, self.disp.num_workers());
-        let group = SalGroup::new(read);
-        let data = route.per_worker.as_deref().map_or(group.data, GroupData::Blobs);
-        let lease = self
-            .disp
-            .reactor
-            .lease_train(route.set, group.request.encode().0.variant_name());
+        let lease = self.disp.reactor.lease_train(route.set, read.name());
         debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
-        let targets = GroupTargets {
-            set: lease.workers(),
-            reply: Some(lease.id()),
-        };
-        let group = SalGroup { data, targets, ..group };
-        if self.written {
-            self.excl.join(&group)?;
-        } else {
-            self.excl.write(&group)?;
-            self.written = true;
-        }
+        self.excl
+            .read(read, lease.workers(), route.per_worker.as_deref(), lease.id())?;
         Ok(lease)
     }
 }

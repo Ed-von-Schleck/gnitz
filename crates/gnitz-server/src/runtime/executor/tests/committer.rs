@@ -1,14 +1,20 @@
 //! How one committer batch is drained off the request channel, how its writes
 //! form commit units, how a commit unit answers its clients, how a merged run is
-//! taken back as its writes, and how a pause is released. The SAL layout and the
-//! checkpoint sequence need a live dispatcher and worker ACKs, so they are
-//! covered end to end.
+//! taken back as its writes, how a pause is released, and how a write the SAL
+//! refuses goes again behind a checkpoint or fails — over a dispatcher no
+//! worker is launched for. What a worker does with the groups is covered end
+//! to end.
 
+use super::super::tick::tick_loop;
 use super::*;
-use crate::runtime::test_support::try_poll_once;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64};
-use gnitz_wire::WireConflictMode;
+use crate::catalog::CatalogEngine;
+use crate::runtime::master::fixtures::test_dispatcher;
+use crate::runtime::sal::Routed;
+use crate::runtime::test_support::{empty_catalog, try_poll_once, within};
+use crate::test_support::{col_def, make_batch_bytes, make_batch_raw, make_schema_u64_i64};
+use gnitz_wire::{TableDistribution, TableProps, TypeCode, WireConflictMode};
 use gnitz_zset::repr::MemBatch;
+use std::time::Duration;
 
 fn batch_of(rows: usize) -> Batch {
     make_batch_raw(&make_schema_u64_i64(), &vec![(0, 1, 0); rows])
@@ -249,4 +255,99 @@ fn a_push_merges_behind_the_last_write_to_its_table() {
     ];
     assert_eq!(units, want);
     assert!(s.last_unit.is_empty() && s.tails.is_empty());
+}
+
+/// The committer and the tick loop its checkpoints drain through, serving
+/// `engine` with no worker launched: every round's ACKs are in at its write.
+/// The feeds' pump is not running; its requests are returned to stay open.
+fn workerless_committer(engine: CatalogEngine) -> (Rc<Shared>, impl Sized) {
+    let (dispatcher, _) = test_dispatcher(0, engine);
+    let reactor = dispatcher.reactor().clone();
+    let (shared, requests, tick_requests, asks) = Shared::new(dispatcher, Duration::ZERO, None);
+    reactor.spawn(tick_loop(Rc::clone(&shared), tick_requests));
+    reactor.spawn(run(requests, Rc::clone(&shared)));
+    (shared, asks)
+}
+
+/// A write refused for want of room goes again behind a checkpoint only when
+/// one may make room for it: it is within the limit of a push, and it was
+/// refused past the checkpoint's floor. A write of exactly the room a
+/// checkpoint leaves commits behind one checkpoint. A write larger than that
+/// room is answered `SalFull` once it is refused directly behind a checkpoint,
+/// which calls for no further one; a write over the limit is answered `SalFull`
+/// where it is first refused. The committer goes on to commit what follows.
+#[test]
+fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
+    within(|| {
+        let (_tmp, mut engine) = empty_catalog();
+        // Replicated, so the one payload holds the rows whatever the width.
+        let replicated = TableProps {
+            distribution: TableDistribution::Replicated,
+            ..Default::default()
+        };
+        let cols = [col_def("id", TypeCode::U64), col_def("s", TypeCode::String)];
+        let tid = engine.create_table_with("public.t", &cols, &[0], replicated).unwrap();
+        let (shared, _asks) = workerless_committer(engine);
+        let disp = &shared.dispatcher;
+        let sal = disp.sal();
+
+        // One row whose push occupies `footprint` log bytes, when given; a
+        // small one otherwise.
+        let rows = |footprint: Option<usize>| {
+            let cat = shared.cat();
+            let (rel, record) = cat.wire_target(tid).unwrap();
+            let sized = |len: usize| {
+                let batch = make_batch_bytes(&rel.schema(), &[(1, 1, &vec![b'x'; len])]);
+                let bytes = sal.push_footprint(record, Routed::Same(batch.wire_whole()));
+                (batch, bytes)
+            };
+            let (small, bytes) = sized(64);
+            let Some(footprint) = footprint else { return small };
+            let (batch, got) = sized(64 + footprint - bytes);
+            assert_eq!(got, footprint);
+            batch
+        };
+        let commit = |footprint: Option<usize>| {
+            let family = TxnFamily::new(tid, WireConflictMode::Update, FamilyRows::Built(rows(footprint)));
+            disp.reactor()
+                .block_on(shared.committer.write(vec![family], HeldTables::default()))
+        };
+
+        // No ephemeral round yet: the floor is offset 0.
+        let limit = sal.push_room();
+        disp.reactor().block_on(disp.boot_checkpoint()).unwrap();
+        let room = sal.push_room();
+        assert!(room < limit, "the boot checkpoint's group is in the log");
+        commit(None).expect("a small write commits");
+        assert_eq!(sal.epoch(), 1);
+
+        // Refused behind the small write, and laid out directly behind the
+        // checkpoint that makes room for it.
+        commit(Some(room)).expect("the write fits behind a checkpoint");
+        assert_eq!(sal.epoch(), 2, "one checkpoint made room");
+        assert_eq!(sal.push_room(), room, "which left what the boot's did");
+
+        // The log is past its threshold, so this batch starts with a
+        // checkpoint: the write is refused directly behind it.
+        let e = commit(Some(room + 8)).expect_err("no checkpoint leaves room for it");
+        assert_eq!(e.status, WireStatus::SalFull, "{e}");
+        assert_eq!(sal.epoch(), 3, "no checkpoint is run for a write refused at the floor");
+        commit(None).expect("the committer serves the next write");
+        assert_eq!(sal.epoch(), 3, "and the refusal called for none");
+
+        // Refused behind the small write, so it goes again: once, to be refused
+        // directly behind the checkpoint.
+        let e = commit(Some(room + 8)).expect_err("no checkpoint leaves room for it");
+        assert_eq!(e.status, WireStatus::SalFull, "{e}");
+        assert_eq!(sal.epoch(), 4, "one checkpoint was run for it");
+        commit(None).expect("the committer serves the next write");
+        assert_eq!(sal.epoch(), 4);
+
+        // Over the limit: refused behind the small write, and no checkpoint
+        // helps.
+        let e = commit(Some(limit + 8)).expect_err("no log holds it");
+        assert_eq!(e.status, WireStatus::SalFull, "{e}");
+        commit(None).expect("the committer serves the next write");
+        assert_eq!(sal.epoch(), 4, "no checkpoint is run for a write over the limit");
+    });
 }

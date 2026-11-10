@@ -96,47 +96,45 @@ impl<'c> WorkerProcess<'c> {
     /// Process all pending SAL message groups. Shutdown `_exit`s inline.
     fn drain_sal(&mut self) {
         self.emit_reply_frame();
-        while let Some(req) = self.next_request() {
-            self.dispatch(req, false);
+        while self.serve_next(false).is_some() {
             // One frame per request served: neither waits for the other to run dry.
             self.emit_reply_frame();
         }
     }
 
-    /// The next SAL group this worker acts on: the single decode point of both
-    /// drain loops.
-    fn next_request(&mut self) -> Option<Inbound<'static>> {
-        let cat = &*self.catalog;
-        self.sal_reader
-            .next_request(|tid, record| cat.known_decode(tid, record))
-    }
-
-    /// Run one request — the one place its outcome is chosen: a read's failure
-    /// is a fault frame to its asker, a state change's a fail-stop. `in_drive`:
-    /// the request arrived inside an exchange wait of a `Tick` or `Backfill`.
-    /// Total, so a new request cannot compile without a decision.
-    pub(super) fn dispatch(&mut self, req: Inbound<'_>, in_drive: bool) {
-        match req {
+    /// Read the next SAL group this worker acts on and run it: the one place
+    /// either drain loop decodes a group, and the one place a request's outcome
+    /// is chosen — a read's failure is a fault frame to its asker, a state
+    /// change's a fail-stop. `in_drive`: the group arrives inside an exchange
+    /// wait of a `Tick` or `Backfill`.
+    ///
+    /// `None` when the SAL holds no group for this worker, else whether the one
+    /// served was a read.
+    pub(super) fn serve_next(&mut self, in_drive: bool) -> Option<bool> {
+        let cat = &mut *self.catalog;
+        match self
+            .sal_reader
+            .next_request(|tid, record| cat.known_decode(tid, record))?
+        {
             Inbound::Shutdown => unsafe { libc::_exit(0) },
-            // A drive writes views, so a read of one would see the tick half-run:
-            // it parks, owning its bytes, since the drive may read past a `Flush`
-            // before it is answered.
-            Inbound::Read { route, read }
+            Inbound::Read { route, read } => {
+                // A drive writes views, so a read of one would see the tick
+                // half-run: it parks, owning its bytes, since the drive reads
+                // further groups before it is answered. A drive writes no other
+                // store, so every other read is answered here, at its place in
+                // the SAL — a push behind it must not reach it.
                 if in_drive
-                    && self
-                        .catalog
+                    && cat
                         .registry
                         .relation(route.target_id)
-                        .is_some_and(|r| r.kind().is_view()) =>
-            {
-                self.replies.push_back(Owed::Parked(route, read.into_owned()))
-            }
-            // A drive writes no other store, so every other read is answered here,
-            // at its place in the SAL — a push behind it must not reach it — and
-            // before the next group is read, while its borrowed bytes are intact.
-            Inbound::Read { route, read } => {
-                let answer = answer(self.catalog, &read);
-                self.reply(route, answer);
+                        .is_some_and(|r| r.kind().is_view())
+                {
+                    self.replies.push_back(Owed::Parked(route, read.into_owned()));
+                } else {
+                    let answer = answer(cat, &read);
+                    self.reply(route, answer);
+                }
+                Some(true)
             }
             Inbound::Apply { ack, apply, rows } => {
                 let role = drive_role(&apply);
@@ -154,6 +152,7 @@ impl<'c> WorkerProcess<'c> {
                 if role == DriveRole::Drives {
                     self.answer_parked();
                 }
+                Some(false)
             }
         }
     }
@@ -209,8 +208,8 @@ enum DriveRole {
 
 fn drive_role(apply: &Apply<'_>) -> DriveRole {
     match apply {
-        // The master holds the SAL writer until every worker ACKs a flush, so
-        // deferred, a flush would wait for the drive. A read of a table behind
+        // The master holds the SAL writer until every worker ACKs a base
+        // round's `Flush`, so deferred, it would wait for the drive. A read of a table behind
         // a push is answered inside the drive, so the push is applied there too.
         Apply::Flush | Apply::Push { .. } => DriveRole::BesideDrive,
         Apply::Tick { .. } | Apply::Backfill { .. } => DriveRole::Drives,

@@ -15,6 +15,7 @@ to a row-set or `len()` comparison, and it is the one a replay bug produces.
 import pytest
 import gnitz
 from _read import bag, rows, scanned
+from _schemas import KV, kv
 from _sql import insert
 
 _COLS = ("pk", "val", "s", "n")
@@ -170,11 +171,14 @@ def test_an_acked_create_index_survives_a_crash(own_server):
     serves after a crash. Each FK column's auto-index moves its family's LSN
     counter outside any DDL zone, and the checkpoint persists that counter as the
     family's replay watermark, so the CREATE INDEX's zone must be allocated above
-    it or the replay skips it."""
-    # Past the FK DDL, under the CREATE INDEX: the DDL's bytes run a checkpoint,
-    # and nothing after the INSERTs can.
-    own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "2048"})
-    booted = own_server.sal_checkpoints()
+    it or the replay skips it.
+
+    The checkpoint is forced by a push larger than the threshold, written behind
+    the FK DDL: the next write runs it ahead of its own commit. The threshold is
+    far above everything written from there on, so the CREATE INDEX stays in the
+    SAL tail."""
+    threshold = 64 * 1024
+    own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": str(threshold)})
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
             "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
@@ -187,18 +191,23 @@ def test_an_acked_create_index_survives_a_crash(own_server):
                 "  f3 BIGINT NOT NULL REFERENCES p(id),"
                 "  f4 BIGINT NOT NULL REFERENCES p(id),"
                 "  val BIGINT NOT NULL)")
+        # Each row is at least its 16 key and value bytes in the SAL, so the push
+        # is past the threshold however a group is framed.
+        pad = conn.create_table("pad", KV)
+        armed = own_server.sal_checkpoints()
+        conn.push(pad, kv(*((i, i) for i in range(threshold // 8))))
         conn.execute_sql("INSERT INTO p VALUES (1, 100)")
         conn.execute_sql("INSERT INTO c1 VALUES (1, 1, 1, 1, 1, 77)")
         checkpointed = own_server.sal_checkpoints()
-        assert checkpointed > booted, "no checkpoint followed the FK DDL"
+        assert checkpointed > armed, "no checkpoint followed the FK DDL"
 
         conn.execute_sql("CREATE INDEX ON c1(val)")
         c1, c1_schema = conn.resolve_table("c1")
         VAL_COL = 5  # cid, f1..f4, val
         assert bag(conn.seek_by_index(c1, c1_schema, [VAL_COL], [77]), "cid") == {(1,): 1}, \
             "index missing pre-crash"
-    # Below the threshold no checkpoint can start, so the CREATE INDEX lives only
-    # in the SAL when the SIGKILL lands.
+    # Nothing behind that checkpoint comes near the threshold, so none can start
+    # and the CREATE INDEX lives only in the SAL when the SIGKILL lands.
     assert own_server.sal_checkpoints() == checkpointed, "the CREATE INDEX was checkpointed"
     own_server.restart()
     with gnitz.connect(own_server.target) as conn:

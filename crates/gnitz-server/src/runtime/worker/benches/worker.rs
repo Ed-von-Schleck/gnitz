@@ -1,6 +1,7 @@
-use super::tests::{addressed, frames, pk_keys, probe, push, worker_over};
+use super::tests::{ask, frames, pk_keys, probe, worker_over};
 use super::*;
 use crate::runtime::sal::SalExcl;
+use crate::runtime::w2m::fixtures::id;
 use crate::test_support::{
     make_batch_raw, make_schema_u64_i64, net_weight, register_identity_view, table_engine, u64_i64_cols,
 };
@@ -78,18 +79,16 @@ fn worker_request_bench() {
     let n = REQUESTS as usize;
     let bare = |_: &mut CatalogEngine, _: u64| ();
 
-    let ack =
-        |excl: &mut SalExcl, tid, _: &[u8], id| excl.write(&addressed(Apply::Push { tid, rule: PkRule::Enforce }, id));
+    let ack = |excl: &mut SalExcl, tid, _: &[u8], n| excl.apply(Apply::Push { tid, rule: PkRule::Enforce }, id(n));
     arm("ack", 0, bare, REQUESTS, ack, n, 0);
 
-    let one_row = |excl: &mut SalExcl, tid, record: &[u8], id: u32| {
-        let row = make_batch_raw(&schema, &[(id as u64, 1, id as i64)]);
-        excl.write(&push(tid, record, &row, id))
+    let one_row = |excl: &mut SalExcl, tid, record: &[u8], n: u32| {
+        let row = make_batch_raw(&schema, &[(n as u64, 1, n as i64)]);
+        excl.acked_push(tid, record, &row, id(n))
     };
     arm("push", 0, bare, REQUESTS, one_row, n, REQUESTS as u64);
 
-    let has_pk =
-        |excl: &mut SalExcl, tid, _: &[u8], id: u32| excl.write(&probe(tid, &pk_keys(&[id as u64 % HELD]), id));
+    let has_pk = |excl: &mut SalExcl, tid, _: &[u8], n: u32| ask(excl, probe(tid, &pk_keys(&[n as u64 % HELD])), n);
     arm("has_pk", HELD, bare, REQUESTS, has_pk, n, HELD);
 
     let scan = |excl: &mut SalExcl, tid, _: &[u8], id: u32| {
@@ -101,19 +100,19 @@ fn worker_request_bench() {
                 .encode()
                 .into(),
         };
-        excl.write(&addressed(read, id))
+        ask(excl, read, id)
     };
     arm("scan_spec", HELD, bare, REQUESTS, scan, n, HELD);
 
     let viewed = |engine: &mut CatalogEngine, tid| {
         register_identity_view(engine, tid, "v", &u64_i64_cols());
     };
-    let tick = |excl: &mut SalExcl, tid, _: &[u8], id: u32| {
+    let tick = |excl: &mut SalExcl, tid, _: &[u8], n: u32| {
         let tick = Apply::Tick {
-            first_round: id as u64 + 1,
+            first_round: n as u64 + 1,
             tids: vec![tid].into(),
         };
-        excl.write(&addressed(tick, id))
+        excl.apply(tick, id(n))
     };
     arm("tick", 0, viewed, REQUESTS, tick, n, 0);
 
@@ -123,8 +122,7 @@ fn worker_request_bench() {
         let claim = IndexClaim::Index { id: tid + 1, unique: false };
         engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
     };
-    let spans =
-        |excl: &mut SalExcl, tid, _: &[u8], id| excl.write(&addressed(Read::KeySpans { tid, cols, claim: false }, id));
+    let spans = |excl: &mut SalExcl, tid, _: &[u8], n| ask(excl, Read::KeySpans { tid, cols, claim: false }, n);
     let held = (CHUNKS * CHUNK_ROWS) as u64;
     // A frame per chunk, then the train's end.
     arm("spans", held, indexed, 1, spans, CHUNKS + 1, held);

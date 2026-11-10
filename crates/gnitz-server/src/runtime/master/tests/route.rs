@@ -1,13 +1,13 @@
 use super::*;
-use crate::runtime::sal::fixtures::{group_at, holders_of, scan, test_log};
-use crate::runtime::sal::{SalGroup, SalWriter};
+use crate::runtime::sal::fixtures::{group_at, scan, test_log};
+use crate::runtime::sal::SalWriter;
 use crate::test_support::{
     make_batch, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
     pk_only_schema, pk_payload_schema, weighted_rows, zset_of,
 };
 use gnitz_store::relation::PkRule;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
-use gnitz_wire::{peek_control_block, KeyRange, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode};
+use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound, ReadSpec, TypeCode};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::encode_schema_block;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
@@ -15,14 +15,16 @@ use std::num::NonZeroU64;
 
 /// Write `batch` to `log` as the master's push of it to relation 16, placed by
 /// `placement`, handing `inspect` the layout the scatter picked.
-fn push(log: &SalWriter, batch: &Batch, placement: Placement, inspect: impl FnOnce(&GroupData)) {
+fn push(log: &SalWriter, batch: &Batch, placement: Placement, inspect: impl FnOnce(&Routed)) {
     let record = encode_schema_block(batch.schema());
-    with_routed(batch.as_mem_batch(), placement, log.num_workers(), |data| {
-        inspect(&data);
-        log.excl()
-            .write(&SalGroup::push(16, PkRule::Enforce, &record, data, holders_of(&data)))
+    let mut excl = log.excl();
+    let mut scope = excl.begin();
+    with_routed(batch.as_mem_batch(), placement, log.num_workers(), |rows| {
+        inspect(&rows);
+        scope.push(16, PkRule::Enforce, &record, rows, false)
     })
     .expect("group fits");
+    scope.commit();
 }
 
 /// A keyed push addresses exactly the workers that own its rows, each sent its
@@ -45,17 +47,17 @@ fn a_push_group_decodes_to_each_workers_rows() {
     let fixed = make_schema_u64_i64();
     let keyed = |b: Batch| (Placement::full_pk(b.schema()), b);
     let replicated = |b: Batch| (Placement::Replicated, b);
-    type LaidOut = fn(&GroupData, &Batch) -> bool;
+    type LaidOut = fn(&Routed, &Batch) -> bool;
     let cases: [(&str, (Placement, Batch), LaidOut); 6] = [
         (
             "keyed single row: framed from the batch, its owner alone addressed",
             keyed(make_batch(&fixed, &[(1, 1, 10)])),
-            |g, _| matches!(g, GroupData::Each(_)),
+            |g, _| matches!(g, Routed::Each(_)),
         ),
         (
             "keyed fixed-width: framed from the batch",
             keyed(make_batch_raw(&narrow, &[(0, 1, 0), (1, 1, 1), (2, 1, 2)])),
-            |g, _| matches!(g, GroupData::Each(_)),
+            |g, _| matches!(g, Routed::Each(_)),
         ),
         (
             "keyed inline strings: framed from the batch",
@@ -63,7 +65,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
                 &string,
                 &[(1, 1, b"a"), (2, 3, b"twelve bytes"), (3, 1, b"")],
             )),
-            |g, _| matches!(g, GroupData::Each(_)),
+            |g, _| matches!(g, Routed::Each(_)),
         ),
         (
             "keyed heap strings: framed from the batch, one entry per worker",
@@ -75,12 +77,12 @@ fn a_push_group_decodes_to_each_workers_rows() {
                     .map(|(pk, s)| (pk as u64, 1, s.as_bytes()))
                     .collect::<Vec<_>>(),
             )),
-            |g, _| matches!(g, GroupData::Each(e) if e.len() == 4),
+            |g, _| matches!(g, Routed::Each(e) if e.len() == 4),
         ),
         (
             "replicated live rows: the batch itself",
             replicated(make_batch(&fixed, &[(1, 1, 10), (2, 2, 20), (3, -1, 30)])),
-            |g, batch| matches!(g, GroupData::Same(Some(d)) if d.rows() == batch.len()),
+            |g, batch| matches!(g, Routed::Same(Some(d)) if d.rows() == batch.len()),
         ),
         (
             "replicated with a weight-0 row: one whole batch",
@@ -88,7 +90,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
                 &string,
                 &[(1, 1, long[0].as_bytes()), (2, 0, b"dropped"), (3, 2, b"c")],
             )),
-            |g, _| matches!(g, GroupData::Same(Some(_))),
+            |g, _| matches!(g, Routed::Same(Some(_))),
         ),
     ];
 
@@ -100,13 +102,7 @@ fn a_push_group_decodes_to_each_workers_rows() {
         let sent: Vec<(usize, Batch)> = (0..nw)
             .filter_map(|w| {
                 let bytes = msg.slot(w as u32)?;
-                let control = peek_control_block(bytes).expect("a control block");
                 let rows = msg.rows(bytes, |_, _| None).expect("every payload decodes");
-                assert_eq!(
-                    control.schema.is_some(),
-                    rows.is_some(),
-                    "{case}: worker {w}'s schema block"
-                );
                 Some((
                     w,
                     rows.unwrap_or_else(|| panic!("{case}: worker {w} is addressed without rows")),
@@ -128,7 +124,13 @@ fn a_push_group_decodes_to_each_workers_rows() {
             let owners = (0..batch.len())
                 .map(|row| placement.owner(batch.get_pk_bytes(row), nw).expect("a keyed placement"))
                 .collect::<WorkerSet>();
-            assert_eq!(msg.head.targets, owners, "{case}: the owners alone are addressed");
+            for w in 0..nw {
+                assert_eq!(
+                    msg.slot(w as u32).is_some(),
+                    owners.contains(w),
+                    "{case}: worker {w} is addressed iff it owns a row"
+                );
+            }
             assert_eq!(msg.payloads().count(), owners.len(), "{case}: one payload each");
             for (w, s) in &sent {
                 for row in 0..s.len() {
@@ -171,7 +173,7 @@ fn a_keyed_push_of_rows_sharing_a_span_keeps_each_heap_within_the_pushed_one() {
     let placement = Placement::full_pk(&schema);
     let log = test_log(1 << 20, nw, 1);
     push(&log, &batch, placement, |g| {
-        assert!(matches!(g, GroupData::Each(e) if e.len() == nw))
+        assert!(matches!(g, Routed::Each(e) if e.len() == nw))
     });
     let msg = group_at(log.log(), 0);
     let sent: Vec<Batch> = (0..nw)

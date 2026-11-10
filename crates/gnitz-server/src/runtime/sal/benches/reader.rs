@@ -1,5 +1,8 @@
-use super::fixtures::{scan, test_log};
-use super::{GroupData, GroupTargets, SalGroup, SalReader, SalWriter, WorkerSet};
+use crate::runtime::park::WorkerSet;
+use crate::runtime::sal::fixtures::{scan, test_log};
+use crate::runtime::sal::group::Group;
+use crate::runtime::sal::SalWriter;
+use crate::runtime::w2m::fixtures::id;
 use gnitz_foundation::perf::Counter;
 use std::hint::black_box;
 
@@ -9,23 +12,19 @@ const GROUPS: u64 = 10_000;
 /// count; a per-worker group holds one per addressed worker.
 const LAYOUTS: [(&str, usize, bool); 3] = [("shared", 2, false), ("per worker", 4, true), ("per worker", 16, true)];
 
-/// A log of [`GROUPS`] control-only groups addressed to `set`, written under one
-/// hold, and the instructions writing them took.
+/// A log of [`GROUPS`] control-only reads addressed to `set`, and the
+/// instructions writing them took. One hold writes them all, each as a cut of
+/// its own — a hold per read is what a lone read takes, and its lock and wake
+/// are not the writer's cost.
 fn written_log(counter: &Counter, nw: usize, per_worker: bool, set: WorkerSet) -> (SalWriter, u64) {
     let blobs = vec![Vec::new(); nw];
     let log = test_log(32 << 20, nw, 1);
-    let group = SalGroup {
-        data: if per_worker {
-            GroupData::Blobs(&blobs)
-        } else {
-            GroupData::Same(None)
-        },
-        targets: GroupTargets { set, ..GroupTargets::SILENT },
-        ..SalGroup::new(scan(0, &[]))
-    };
+    let read = scan(0, &[]);
+    let group = Group::read(&read, set, per_worker.then_some(&blobs), id(1));
     let mut excl = log.excl();
     let ((), written) = counter.measure(|| {
         for _ in 0..GROUPS {
+            excl.end_cut();
             excl.write(&group).expect("group fits");
         }
     });
@@ -34,8 +33,10 @@ fn written_log(counter: &Counter, nw: usize, per_worker: bool, set: WorkerSet) -
 }
 
 /// Instructions per control-only group: what the writer spends on one, and
-/// what the reader spends on one addressed to it and on one it steps over. The
-/// reader is the last worker of the group's width.
+/// what the reader spends on one addressed to it and on one it steps over —
+/// read as its header and bytes ([`SalReader::next`]), and decoded to its
+/// request ([`SalReader::next_request`]). The reader is the last worker of the
+/// group's width.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn sal_group_bench() {
@@ -49,10 +50,10 @@ fn sal_group_bench() {
                 WorkerSet::ALL.without(me)
             };
             let (log, written) = written_log(&counter, nw, per_worker, set);
-            let mut reader = SalReader::new(log.log(), me as u32, 1);
+            let mut reader = log.reader(me as u32);
             let (read, walked) = counter.measure(|| {
                 let mut read = 0;
-                while let Some((msg, slot)) = reader.next() {
+                while let Some((msg, slot, _)) = reader.next() {
                     black_box((msg.head.reply, slot.len()));
                     read += 1;
                 }
@@ -65,10 +66,21 @@ fn sal_group_bench() {
                 log.cursor(),
                 "{layout} {case} at nw={nw}: every group was walked"
             );
+            let mut reader = log.reader(me as u32);
+            let (requests, decoded) = counter.measure(|| {
+                let mut requests = 0;
+                while let Some(request) = reader.next_request(|_, _| None) {
+                    black_box(&request);
+                    requests += 1;
+                }
+                requests
+            });
+            assert_eq!(requests, read, "{layout} {case} at nw={nw}: every group read decodes");
             println!(
-                "sal_group_bench nw={nw:<2} {layout:<10} {case:<12} {:>6.1} instr/group written, {:>6.1} read",
+                "sal_group_bench nw={nw:<2} {layout:<10} {case:<12} {:>6.1} instr/group written, {:>6.1} read, {:>6.1} decoded",
                 written as f64 / GROUPS as f64,
-                walked as f64 / GROUPS as f64
+                walked as f64 / GROUPS as f64,
+                decoded as f64 / GROUPS as f64
             );
         }
     }
@@ -86,14 +98,14 @@ fn sal_park_cycle_bench() {
         let (log, _) = written_log(&counter, nw, per_worker, WorkerSet::ALL);
         let mut per_group = [0.0; 2];
         for (peek, cost) in [false, true].into_iter().zip(&mut per_group) {
-            let mut reader = SalReader::new(log.log(), me as u32, 1);
+            let mut reader = log.reader(me as u32);
             let (read, instructions) = counter.measure(|| {
                 let mut read = 0u64;
                 loop {
                     if peek && black_box(reader.is_empty()) {
                         break;
                     }
-                    let Some((msg, slot)) = reader.next() else { break };
+                    let Some((msg, slot, _)) = reader.next() else { break };
                     black_box((msg.head.reply, slot.len()));
                     read += 1;
                 }
@@ -107,39 +119,6 @@ fn sal_park_cycle_bench() {
             per_group[0],
             per_group[1],
             per_group[1] - per_group[0]
-        );
-    }
-}
-
-/// Instructions per payload byte of a group large enough to be laid out in the
-/// writer's scratch buffer and written with `pwrite`: one blob per worker.
-#[test]
-#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn sal_large_group_bench() {
-    const NW: usize = 4;
-    const LARGE_GROUPS: usize = 16;
-    let counter = Counter::instructions();
-    for blob_len in [4 << 10, 64 << 10, 1 << 20] {
-        let blobs = vec![vec![7u8; blob_len]; NW];
-        let log = test_log(LARGE_GROUPS * NW * (blob_len + 4096) + (16 << 20), NW, 1);
-        let group = SalGroup {
-            data: GroupData::Blobs(&blobs),
-            ..SalGroup::new(scan(16, &[]))
-        };
-        let mut excl = log.excl();
-        // One group first, so the scratch buffer has grown before the count.
-        excl.write(&group).expect("group fits");
-        let ((), written) = counter.measure(|| {
-            for _ in 0..LARGE_GROUPS {
-                excl.write(&group).expect("group fits");
-            }
-        });
-        drop(excl);
-        let bytes = (LARGE_GROUPS * NW * blob_len) as f64;
-        println!(
-            "sal_large_group_bench nw={NW} blob={blob_len:>8} {:>10.0} instr/group, {:.4} instr/payload byte",
-            written as f64 / LARGE_GROUPS as f64,
-            written as f64 / bytes
         );
     }
 }

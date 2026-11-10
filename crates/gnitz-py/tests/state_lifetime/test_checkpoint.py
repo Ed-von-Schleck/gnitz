@@ -12,6 +12,7 @@ Hang detection is `thread.join` against the shared ceilings in `_serverproc`,
 which are deadlock detectors rather than performance budgets.
 """
 import threading
+import time
 
 import pytest
 import gnitz
@@ -167,3 +168,32 @@ def test_no_checkpoint_runs_inside_a_ddl(own_server):
         assert "SAL checkpoint epoch=" not in log[parked:released]
         assert "SAL checkpoint epoch=" in log[released:]
         assert bag(scanned(conn, "v"), "pk", "val") == {(2, 20): 1}
+
+
+def test_an_idle_server_stops_checkpointing(own_server):
+    """A checkpoint leaves its own groups in the SAL, and the threshold counts
+    only what is written behind them: at a one-byte threshold every write and
+    every read calls for a checkpoint, and a server left alone settles after the
+    last one instead of checkpointing what its own checkpoint wrote, forever."""
+    own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "1"})
+    # The watchdog first looks 100 ms after the server is ready, and a
+    # checkpoint is logged a worker round trip later: several of its periods,
+    # so one the boot's checkpoint called for is in the log by now.
+    time.sleep(0.5)
+    assert own_server.sal_checkpoints() == 0, "the boot's checkpoint called for another"
+    with gnitz.connect(own_server.target) as conn:
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
+            "INSERT INTO t VALUES (1, 10)")
+        assert bag(scanned(conn, "t"), "pk", "val") == {(1, 10): 1}
+    armed = own_server.sal_checkpoints()
+    assert armed > 0, "the traffic never crossed the threshold"
+
+    # The watchdog polls every 100 ms; the scan's checkpoint may still be due.
+    deadline = time.monotonic() + START_TIMEOUT
+    while True:
+        before = own_server.sal_checkpoints()
+        time.sleep(0.5)
+        if own_server.sal_checkpoints() == before:
+            break
+        assert time.monotonic() < deadline, "an idle server keeps checkpointing"

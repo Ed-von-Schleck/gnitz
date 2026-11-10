@@ -1,6 +1,5 @@
 use super::*;
-use crate::runtime::sal::fixtures::{holders_of, scan, test_log};
-use crate::runtime::sal::SalGroup;
+use crate::runtime::sal::fixtures::{scan, test_log};
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_store::relation::PkRule;
@@ -67,18 +66,14 @@ fn push_group_layout_bench() {
             let mut excl = log.excl();
             excl.checkpoint_reset();
             counter.measure(|| {
-                let mut scope = excl.begin("bench");
-                let own = with_routed(batch.as_mem_batch(), placement, nw, |data| {
+                let mut scope = excl.begin();
+                let own = with_routed(batch.as_mem_batch(), placement, nw, |rows| {
                     scope
-                        .write(
-                            &SalGroup::push(16, PkRule::Enforce, &record, data, holders_of(&data)),
-                            zoned,
-                        )
+                        .push(16, PkRule::Enforce, &record, rows, zoned)
                         .expect("group fits");
-                    match data {
-                        GroupData::Same(_) => None,
-                        GroupData::Each(each) => Some(each.iter().flatten().count()),
-                        GroupData::Blobs(_) => unreachable!("a push is routed by its rows"),
+                    match rows {
+                        Routed::Same(_) => None,
+                        Routed::Each(each) => Some(each.iter().flatten().count()),
                     }
                 });
                 scope.commit();

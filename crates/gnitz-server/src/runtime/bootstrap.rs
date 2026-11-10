@@ -20,7 +20,7 @@ use crate::runtime::master::{worker_death, MasterDispatcher};
 use crate::runtime::mesh::{self, Mesh};
 use crate::runtime::park::WorkerParks;
 use crate::runtime::reactor::{check_host, Limits, Reactor};
-use crate::runtime::sal::{CommittedTail, SalLog, SalMessage, SalReader, SalWriter};
+use crate::runtime::sal::{CommittedTail, SalWriter};
 use crate::runtime::signals;
 use crate::runtime::sync::{select2, Either};
 use crate::runtime::tls::{ResolvedTls, TlsListener};
@@ -38,30 +38,25 @@ use gnitz_zset::algebra::Slot;
 
 /// Stage every committed DdlSync group above its family's replay floor into the
 /// system stores.
-fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Result<(), String> {
+fn stage_system_tail(tail: &CommittedTail, catalog: &mut UnreplayedCatalog) -> Result<(), String> {
     let floors = catalog.system_replay_floors();
-    let mine = |msg: SalMessage| {
-        let family = SysFamily::from_id(msg.head.target_id)?;
-        let floor = *floors.get(&family.id())?;
-        (msg.head.lsn > floor).then_some((msg, family))
-    };
-
     let mut replayed: u32 = 0;
-    for (msg, family) in tail.ddl_syncs().filter_map(mine) {
-        let data = msg.shared_payload().ok_or_else(|| {
-            format!(
-                "SAL replay: DdlSync group at offset={} (lsn={}) carries no shared payload",
-                msg.base, msg.head.lsn
-            )
-        })?;
-        let Some(batch) = msg.rows(data, |_, _| None)? else {
+    for msg in tail.ddl_syncs() {
+        let Some(family) = SysFamily::from_id(msg.head.request.target_id) else {
+            continue;
+        };
+        let lsn = tail.lsn(&msg);
+        if floors.get(&family.id()).is_none_or(|&floor| lsn <= floor) {
+            continue;
+        }
+        let Some(batch) = msg.rows(msg.first_payload(), |_, _| None)? else {
             continue;
         };
         // Master-validated rows that already carry a drop's children.
-        catalog.stage(family, msg.head.lsn, batch).map_err(|e| {
+        catalog.stage(family, lsn, batch).map_err(|e| {
             format!(
-                "SAL system-table recovery apply failed (table_id={}, lsn={}): {e}",
-                msg.head.target_id, msg.head.lsn
+                "SAL system-table recovery apply failed (table_id={}, lsn={lsn}): {e}",
+                family.id()
             )
         })?;
         replayed += 1;
@@ -93,14 +88,14 @@ fn inject_recovery_panic(stage: &str) {
 /// floor: the enforced rule makes re-applying a group the shards already hold a
 /// no-op, where a group's [`PkRule::Fresh`] holds only of the store it was first
 /// applied to.
-fn recover_from_sal(tail: CommittedTail, slot: Slot, catalog: &mut CatalogEngine) -> Result<(), String> {
+fn recover_from_sal(tail: &CommittedTail, slot: Slot, catalog: &mut CatalogEngine) -> Result<(), String> {
     // Groups that applied at least one payload, and the width a re-sliced tail was
     // written at — the boot record's re-slice marker. No boot writes at a
     // previously-used epoch, so every group a walk sees carries the same width.
     let mut replayed: u32 = 0;
     let mut resliced_from: Option<u32> = None;
     for msg in tail.pushes() {
-        let tid = msg.head.target_id;
+        let tid = msg.head.request.target_id;
         // A table dropped later in the tail has no relation, and nothing to
         // recover into.
         let Some(relation) = catalog.registry.relation(tid) else {
@@ -110,9 +105,9 @@ fn recover_from_sal(tail: CommittedTail, slot: Slot, catalog: &mut CatalogEngine
         let (schema, placement) = (relation.schema(), relation.placement());
         // Written for another width, so no payload is this rank's share: every one
         // is re-cut for the launched topology.
-        let reslice = msg.head.width() != slot.of;
+        let reslice = msg.width() != slot.of;
         if reslice {
-            resliced_from = Some(msg.head.width());
+            resliced_from = Some(msg.width());
         }
         let own = (!reslice).then(|| msg.slot(slot.rank)).flatten();
         let all = reslice.then(|| msg.payloads()).into_iter().flatten();
@@ -136,9 +131,13 @@ fn recover_from_sal(tail: CommittedTail, slot: Slot, catalog: &mut CatalogEngine
             if owned.schema().num_payload_cols() < schema.num_payload_cols() {
                 owned = owned.widened_with_nulls(&schema, false);
             }
-            catalog
-                .ingest_unticked(tid, owned, PkRule::Enforce)
-                .map_err(|e| format!("SAL replay apply failed (table_id={}, lsn={}): {e}", tid, msg.head.lsn))?;
+            catalog.ingest_unticked(tid, owned, PkRule::Enforce).map_err(|e| {
+                format!(
+                    "SAL replay apply failed (table_id={}, lsn={}): {e}",
+                    tid,
+                    tail.lsn(&msg)
+                )
+            })?;
             applied = true;
         }
         replayed += u32::from(applied);
@@ -155,7 +154,7 @@ fn recover_from_sal(tail: CommittedTail, slot: Slot, catalog: &mut CatalogEngine
 
 /// Worker-boot catalog recovery. On `Err` the worker exits without its ready
 /// ACK, which fails the boot.
-fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: CommittedTail, slot: Slot) -> Result<(), String> {
+fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: &CommittedTail, slot: Slot) -> Result<(), String> {
     // Before any other catalog work, and before the replay below, which
     // projects the tail into each index exactly once.
     let rebuilt = catalog.open_stores(slot.rank, Residency::Worker)?;
@@ -207,7 +206,7 @@ fn run_worker_child(
     data_dir: &str,
     master_pid: i32,
     catalog: &mut CatalogEngine,
-    tail: CommittedTail,
+    tail: &CommittedTail,
     (mut w2m_writer, mut mesh): (W2mWriter, Mesh),
     pinning: Option<&affinity::Pinning>,
 ) -> ! {
@@ -243,14 +242,14 @@ fn run_worker_child(
         mesh.spin_before_park();
     }
 
-    let sal_reader = SalReader::new(tail.log(), slot.rank, tail.live_epoch());
+    let sal_reader = tail.reader(slot.rank);
     w2m_writer.ack(RequestId::BOOT_READY);
     WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh).run()
 }
 
 /// The master's half of recovery before any worker exists: the catalog staged
 /// and replayed from the tail, and the system families made durable.
-fn master_pre_fork_recovery(mut opened: UnreplayedCatalog, tail: CommittedTail) -> Result<CatalogEngine, String> {
+fn master_pre_fork_recovery(mut opened: UnreplayedCatalog, tail: &CommittedTail) -> Result<CatalogEngine, String> {
     stage_system_tail(tail, &mut opened)?;
     let mut catalog = opened.replay().map_err(|e| format!("failed to replay catalog: {e}"))?;
     if tail.holds_pushes() {
@@ -275,7 +274,7 @@ fn master_pre_fork_recovery(mut opened: UnreplayedCatalog, tail: CommittedTail) 
 fn fork_workers(
     catalog: &mut CatalogEngine,
     data_dir: &str,
-    tail: CommittedTail,
+    tail: &CommittedTail,
     workers: Vec<(W2mWriter, Mesh)>,
     pinning: Option<&affinity::Pinning>,
 ) -> Result<Vec<NonZero<libc::pid_t>>, String> {
@@ -407,9 +406,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
 
     // The committed tail every recovery replays, and the epoch the next writer
     // epoch starts above. Read once, before the fork.
-    let log = SalLog::open(data_dir)?;
-    let tail = CommittedTail::read(log)?;
-    log.advise_random();
+    let tail = CommittedTail::open(data_dir)?;
     // The workers' parks, one W2M ring per worker, and the exchange mesh. None of
     // it is reclaimed on error: a failed boot exits the process, which returns
     // all of it to the kernel.
@@ -419,9 +416,9 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
         mesh::create(mesh::outbox_bytes(), parks).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
     let workers: Vec<(W2mWriter, Mesh)> = writers.into_iter().zip(meshes).collect();
 
-    let mut catalog = master_pre_fork_recovery(opened, tail)?;
+    let mut catalog = master_pre_fork_recovery(opened, &tail)?;
 
-    let worker_pids = fork_workers(&mut catalog, data_dir, tail, workers, pinning.as_ref())?;
+    let worker_pids = fork_workers(&mut catalog, data_dir, &tail, workers, pinning.as_ref())?;
 
     // --- Parent process ---
     let (reactor, ready) = Reactor::new(limits, receiver).map_err(|e| format!("io_uring init failed: {e}"))?;
@@ -433,8 +430,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
             Either::B(w) => Err(died(w)),
         }
     })?;
-    // Read before the writer's rewind empties the ring the tail walks.
-    let pushed = tail.pushed();
+    let pushed = tail.pushed().clone();
     let sal = SalWriter::boot(tail, parks, acked);
     inject_recovery_panic("reset");
 

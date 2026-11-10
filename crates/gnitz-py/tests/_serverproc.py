@@ -504,8 +504,9 @@ class ServerProc:
         return any("re-sliced from" in t for t in self.worker_log_texts())
 
     def sal_checkpoints(self):
-        """How many SAL resets this boot has logged: one at the boot's own
-        checkpoint, then two per checkpoint — its base and its ephemeral round."""
+        """How many checkpoints this boot has logged: one line per checkpoint, at
+        its base round's rewind of the SAL. The boot's own checkpoint has no base
+        round and logs none."""
         return self.log_text().count("SAL checkpoint epoch=")
 
 

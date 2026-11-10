@@ -13,7 +13,7 @@ impl DriveHost for WorkerProcess<'_> {
 
     /// Publish `lanes` as this worker's rounds — one, or as few as hold them —
     /// and block until every part of each is complete. SAL groups arriving
-    /// meanwhile go through [`WorkerProcess::dispatch`] with `in_drive`.
+    /// meanwhile go through [`WorkerProcess::serve_next`] with `in_drive`.
     fn exchange<'b>(
         &mut self,
         mut lanes: impl ExactSizeIterator<Item = Lane<'b>>,
@@ -38,11 +38,9 @@ impl WorkerProcess<'_> {
             self.mesh
                 .park()
                 .park(|| self.sal_reader.is_empty() && !self.mesh.complete());
-            while let Some(req) = self.next_request() {
-                // Once the round is complete the drive goes on; the next wait, or
-                // the top level, serves what the SAL still holds, in order.
-                let read = matches!(req, Inbound::Read { .. });
-                self.dispatch(req, true);
+            // Once the round is complete the drive goes on; the next wait, or
+            // the top level, serves what the SAL still holds, in order.
+            while let Some(read) = self.serve_next(true) {
                 if read && self.mesh.complete() {
                     break;
                 }

@@ -1,5 +1,5 @@
-//! The frame encoder: a [`WireMsg`] sized and written into a w2m slot, a SAL
-//! group's payload or a client reply.
+//! The frame encoder: a [`WireMsg`] sized and written into a w2m slot or a
+//! client reply.
 
 use gnitz_wire::{ControlHeader, WireFault, WireFlags, WireStatus};
 use gnitz_zset::repr::{Batch, WireRows};

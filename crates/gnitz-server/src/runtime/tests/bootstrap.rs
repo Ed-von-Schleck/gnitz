@@ -1,8 +1,9 @@
 use super::*;
 use crate::catalog::SysFamily;
 use crate::runtime::master::route::with_routed;
-use crate::runtime::sal::fixtures::{holders_of, test_log};
-use crate::runtime::sal::SalGroup;
+use crate::runtime::sal::fixtures::test_log;
+use crate::runtime::sal::Apply;
+use crate::runtime::w2m::fixtures::id;
 use crate::test_support::{
     batch_rows, circuit_batch, col_tab_batch, identity_circuit, make_batch, net_weight, register_identity_view,
     sys_batch, table_tab_batch, u64_i64_cols, view_tab_row,
@@ -28,19 +29,23 @@ fn replicated() -> TableProps {
 /// Boot the database at `dir` as `slot`'s worker over `log`'s committed tail:
 /// the master's recovery and then the worker's, with no fork between them.
 fn boot(dir: &str, slot: Slot, log: &SalWriter) -> CatalogEngine {
-    let tail = CommittedTail::read(log.log()).unwrap();
+    let tail = CommittedTail::read(*log.log()).unwrap();
     let opened = CatalogEngine::open_master(dir, slot.of, Default::default()).unwrap();
-    let mut engine = master_pre_fork_recovery(opened, tail).unwrap();
-    worker_boot_recovery(&mut engine, tail, slot).unwrap();
+    let mut engine = master_pre_fork_recovery(opened, &tail).unwrap();
+    worker_boot_recovery(&mut engine, &tail, slot).unwrap();
     engine
 }
 
 /// Write `rows` to `log` as the master's push of them to `tid`.
 fn push(log: &SalWriter, engine: &CatalogEngine, tid: u64, rows: &Batch) {
     let (rel, record) = engine.wire_target(tid).unwrap();
+    let mut excl = log.excl();
+    let mut scope = excl.begin();
     with_routed(rows.as_mem_batch(), rel.placement(), log.num_workers(), |data| {
-        log.commit_zone(&[SalGroup::push(tid, PkRule::Enforce, record, data, holders_of(&data))]);
-    });
+        scope.push(tid, PkRule::Enforce, record, data, true)
+    })
+    .expect("group fits");
+    scope.commit().expect("the zone was open");
 }
 
 /// The rows `tid`'s store holds, with their weights.
@@ -148,6 +153,45 @@ fn a_tail_written_at_another_width_replays_for_the_launched_one() {
         let engine = boot(dir, slot, log);
         assert_eq!(&held(&engine, *tid), *expected, "table {tid} written at {written_at}");
     }
+}
+
+/// A crash behind a completed checkpoint leaves the drain's tick and the
+/// ephemeral round ahead of the pushes committed since, in one epoch. The tail
+/// is those pushes alone, and the boot replays exactly them.
+#[test]
+fn a_tail_behind_an_ephemeral_round_replays_the_pushes_behind_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let slot = Slot::new(0, 1);
+    let mut engine = CatalogEngine::open(dir, slot.of).unwrap();
+    let t = engine.create_table("public.t", &u64_i64_cols(), &[0]).unwrap();
+    let rows = [(1, 1, 10), (2, 1, 20)];
+    let log = test_log(SAL_SIZE, slot.of as usize, 1);
+    {
+        let mut excl = log.excl();
+        let tick = Apply::Tick { first_round: 2, tids: vec![t].into() };
+        excl.apply(tick, id(1)).expect("group fits");
+        excl.apply(Apply::FlushEph { generation: 1 }, id(1))
+            .expect("group fits");
+    }
+    let behind = log.cursor();
+    push(
+        &log,
+        &engine,
+        t,
+        &make_batch(&engine.registry.relation(t).unwrap().schema(), &rows),
+    );
+    engine.close();
+
+    let tail = CommittedTail::read(*log.log()).unwrap();
+    let members: Vec<_> = tail.pushes().map(|m| (m.head.request.target_id, m.base)).collect();
+    assert_eq!(members, [(t, behind)], "the push zone, behind both groups ahead of it");
+    assert_eq!(tail.ddl_syncs().count(), 0);
+    assert!(tail.holds_pushes());
+    assert_eq!(tail.pushed().iter().copied().collect::<Vec<_>>(), [t]);
+
+    let engine = boot(dir, slot, &log);
+    assert_eq!(held(&engine, t), rows, "each row once, at its weight");
 }
 
 /// A replayed push lands above its base's cut, past the boot flush, only for a

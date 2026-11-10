@@ -7,7 +7,7 @@ use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::repr::MemBatch;
 
 use crate::runtime::park::WorkerSet;
-use crate::runtime::sal::{GroupData, Read};
+use crate::runtime::sal::{Read, Routed};
 use gnitz_store::read::Probe;
 use gnitz_store::relation::RelationRegistry;
 use gnitz_wire::{BoundPeek, MAX_WORKERS};
@@ -18,38 +18,38 @@ thread_local! {
     static SCATTER_INDICES: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Route `batch`'s nonzero-weight rows to the workers `placement` names, and hand `f` the
-/// group data that carries them, framed straight from `batch`.
+/// Route `batch`'s nonzero-weight rows to the workers `placement` names, and hand `f` what
+/// each is sent, framed straight from `batch`.
 pub(crate) fn with_routed<R>(
     batch: MemBatch<'_>,
     placement: Placement,
     num_workers: usize,
-    f: impl FnOnce(GroupData<'_>) -> R,
+    f: impl FnOnce(Routed<'_>) -> R,
 ) -> R {
     // One payload for every worker is the batch itself unless it holds a
     // ghost, and then no row needs routing.
     let shared = num_workers == 1 || matches!(placement, Placement::Replicated);
     if shared && !batch.has_ghost() {
-        return f(GroupData::Same(batch.wire_whole()));
+        return f(Routed::Same(batch.wire_whole()));
     }
     // One row has one owner, named by the placement's point query: no list is built.
     if batch.len() == 1 && !batch.has_ghost() {
         if let Some(owner) = placement.owner(batch.get_pk_bytes(0), num_workers) {
             let mut each = [None; MAX_WORKERS];
             each[owner] = batch.wire_whole();
-            return f(GroupData::Each(&each[..num_workers]));
+            return f(Routed::Each(&each[..num_workers]));
         }
     }
     SCATTER_INDICES.with(|pool| {
         let mut pool = pool.borrow_mut();
         match ScatterPlan::native(placement).route(&batch, &mut pool, num_workers) {
-            [live] => f(GroupData::Same(batch.wire_listed(live))),
+            [live] => f(Routed::Same(batch.wire_listed(live))),
             lists => {
                 let mut each = [None; MAX_WORKERS];
                 for (rows, list) in each.iter_mut().zip(lists) {
                     *rows = batch.wire_listed(list);
                 }
-                f(GroupData::Each(&each[..lists.len()]))
+                f(Routed::Each(&each[..lists.len()]))
             }
         }
     })

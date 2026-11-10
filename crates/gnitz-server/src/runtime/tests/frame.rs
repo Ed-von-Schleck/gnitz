@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+use gnitz_wire::{peek_control_block, ClientVerb};
 
 /// Walk `batch` through [`WireMsg::next_train_frame`] as a sender does, each
 /// frame's returned row committed: the rows each frame carries and whether it
@@ -33,4 +34,43 @@ fn next_train_frame_cuts_every_row_once_and_flags_only_the_end() {
     assert_eq!(cut(&batch, budget, false), [(4, false), (4, false), (2, false)]);
     let empty = Batch::empty_with_schema(&schema);
     assert_eq!(cut(&empty, budget, true), [(0, true)]);
+}
+
+/// A frame's control header and blob decode to what was sent, and no proper
+/// prefix of the frame decodes.
+#[test]
+fn a_control_only_frame_round_trips_and_no_prefix_decodes() {
+    let shapes = [
+        WireMsg {
+            target_id: 0xDEAD,
+            flags: WireFlags {
+                verb: ClientVerb::PushTxn,
+                continuation: true,
+                ..Default::default()
+            },
+            arg0: 0x1111_2222_3333_4444,
+            arg1: 0x5555,
+            ..Default::default()
+        },
+        WireMsg {
+            target_id: 7,
+            status: WireStatus::Error,
+            blob: b"something went wrong",
+            ..Default::default()
+        },
+    ];
+    for (shape, msg) in shapes.into_iter().enumerate() {
+        let wire = msg.encode_to_vec();
+        let control = peek_control_block(&wire).unwrap_or_else(|e| panic!("shape {shape}: {e}"));
+        assert_eq!(control.hdr, msg.header(), "shape {shape}");
+        assert_eq!(&wire[control.blob], msg.blob, "shape {shape}");
+        assert!(control.schema.is_none() && control.data.is_none(), "shape {shape}");
+        for cut in 0..wire.len() {
+            assert!(
+                peek_control_block(&wire[..cut]).is_err(),
+                "shape {shape}: a {cut}/{}-byte prefix decodes",
+                wire.len()
+            );
+        }
+    }
 }

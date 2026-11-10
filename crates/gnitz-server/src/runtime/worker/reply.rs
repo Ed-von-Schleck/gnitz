@@ -5,7 +5,7 @@
 use super::*;
 
 use crate::runtime::frame::WireMsg;
-use crate::runtime::sal::{Cut, OwnedRead};
+use crate::runtime::sal::Cut;
 use gnitz_store::read::{KeySpans, ReadRows};
 
 /// One reply this worker owes.
@@ -13,8 +13,8 @@ use gnitz_store::read::{KeySpans, ReadRows};
 #[allow(clippy::large_enum_variant)]
 pub(super) enum Owed {
     /// A read of a view, received while a drive was writing views. It owns its
-    /// bytes: it is answered after the drive, which may read past a `Flush`.
-    Parked(ReplyRoute, OwnedRead),
+    /// bytes: it is answered after the drive, which reads further groups.
+    Parked(ReplyRoute, Read<'static>),
     Fault(ReplyRoute, WireFault),
     Train(Train),
 }

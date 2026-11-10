@@ -511,7 +511,7 @@ const fn fold_family(mut h: u64, f: &WireSysFamily) -> u64 {
 }
 
 /// Digest of every system family's stored shape, and of the blob layouts stored
-/// *inside* one. Shards and SAL frames are decoded against the *live* schema, so
+/// *inside* one. Shards and SAL payloads are decoded against the *live* schema, so
 /// a shape change silently reinterprets an existing data directory unless a
 /// format word rejects it first. Both do: the engine's `SHARD_VERSION` and
 /// [`crate::WIRE_VERSION`] each XOR this in, so each moves when a family's shape

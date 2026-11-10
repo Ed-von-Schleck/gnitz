@@ -5,11 +5,11 @@ use super::super::fixtures::test_dispatcher;
 use super::super::MasterDispatcher;
 use super::{check_workers, worker_death};
 use crate::catalog::{CatalogEngine, DdlBundle};
-use crate::runtime::park::WorkerSet;
-use crate::runtime::reactor::test_support::make_reactor;
-use crate::runtime::sal::GroupTargets;
-use crate::runtime::sal::{Apply, GroupData, SalGroup};
+use crate::runtime::reactor::test_support::{make_reactor, reactor_with_rings};
+use crate::runtime::sal::fixtures::test_log;
+use crate::runtime::sal::{Apply, Inbound, Routed};
 use crate::runtime::test_support::{assert_child_exited_ok, empty_catalog, fork_child, within};
+use crate::runtime::w2m::fixtures::id;
 use gnitz_foundation::posix_io::retry_eintr;
 use gnitz_wire::{ColTabRow, WireFault, WireStatus};
 
@@ -93,7 +93,7 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
                     first_round: 2,
                     tids: vec![0; if refused { 2 << 17 } else { 1 }].into(),
                 };
-                let lease = disp.write_acked(&mut disp.sal().lock().await, SalGroup::new(tick))?;
+                let lease = disp.write_acked(&mut disp.sal().lock().await, tick)?;
                 writers.iter_mut().for_each(|w| w.ack(lease.id()));
                 lease.acks().await;
                 Ok::<(), WireFault>(())
@@ -107,10 +107,44 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
     });
 }
 
+/// A tick the SAL refuses takes no round: the next tick written starts at the
+/// round the refused one would have.
+#[test]
+fn a_refused_tick_takes_no_round() {
+    let (_tmp, engine) = empty_catalog();
+    let (disp, _) = test_dispatcher(1, engine);
+    let mut excl = disp.sal().excl();
+    let before = disp.rounds.round.get();
+
+    // Wider than the fixture's whole SAL.
+    let e = disp
+        .emit_tick(&mut excl, &vec![0; 2 << 17])
+        .map(drop)
+        .expect_err("no room for the tick");
+    assert_eq!(e.status, WireStatus::SalFull, "{e}");
+    assert_eq!(disp.rounds.round.get(), before, "the refused tick took no round");
+
+    disp.emit_tick(&mut excl, &[7, 8]).expect("the tick fits");
+    assert_eq!(disp.rounds.round.get(), before + 2, "one round per relation ticked");
+    drop(excl);
+    let mut reader = disp.sal().reader(0);
+    let written = reader.next_request(|_, _| None);
+    assert!(
+        matches!(
+            &written,
+            Some(Inbound::Apply { apply: Apply::Tick { first_round, tids }, .. })
+                if *first_round == before + 1 && tids[..] == [7, 8]
+        ),
+        "the tick written starts at the round behind the last one taken"
+    );
+    drop(written);
+    disp.into_catalog().close();
+}
+
 /// Fill the log until it refuses a group far smaller than any DDL zone, and
 /// require `make()`'s zone to be refused with the SAL's own status and its scope
 /// discarded; run `refused`, then require the same zone to apply once a
-/// checkpoint has reset the log, and run `applied`.
+/// checkpoint's base round has rewound the log, and run `applied`.
 fn refused_then_applied(
     engine: CatalogEngine,
     make: impl Fn() -> DdlBundle,
@@ -124,7 +158,7 @@ fn refused_then_applied(
             first_round: 2,
             tids: vec![0; tids].into(),
         };
-        while excl.write(&SalGroup::new(tick())).is_ok() {}
+        while excl.apply(tick(), id(1)).is_ok() {}
     }
     let watermark = disp.sal().watermark();
 
@@ -139,18 +173,19 @@ fn refused_then_applied(
     );
     refused(&disp);
 
-    disp.checkpoint_post_ack(&mut excl).unwrap();
-    disp.emit_zone(&mut excl, |cat, sink| cat.apply_bundle(make(), sink))
-        .expect("the reset log takes the zone");
+    // No worker is launched, so the round's ACKs are in at once.
+    drop(excl);
+    disp.reactor().block_on(disp.checkpoint_base()).unwrap();
+    disp.emit_zone(&mut disp.sal().excl(), |cat, sink| cat.apply_bundle(make(), sink))
+        .expect("the rewound log takes the zone");
     applied(&disp);
 
-    drop(excl);
     disp.into_catalog().close();
 }
 
 /// A zone the log has no room for is refused with the SAL's own status and
 /// reaches no store: every system family holds the rows and weights it held
-/// before, and the same bundle applies once a checkpoint has reset the log.
+/// before, and the same bundle applies once a checkpoint has rewound the log.
 #[test]
 fn a_zone_the_log_refuses_reaches_no_store_and_applies_after_a_checkpoint() {
     use crate::catalog::SysFamily;
@@ -190,7 +225,7 @@ fn a_zone_the_log_refuses_reaches_no_store_and_applies_after_a_checkpoint() {
 
 /// An ADD COLUMN the log refuses leaves the table's schema and column records
 /// as they were — its descriptor swap cannot be undone, so it must never run —
-/// and applies once a checkpoint has reset the log.
+/// and applies once a checkpoint has rewound the log.
 #[test]
 fn a_log_refusal_of_add_column_leaves_the_schema() {
     use crate::catalog::SysFamily;
@@ -229,12 +264,11 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
     );
 }
 
-/// The checkpoint finalizer flushes system tables before resetting the SAL. A
-/// sequence advance can reach the `sys_sequences` MemTable after the base
-/// round's reset, so the finalizer is its only durability event before the
-/// ephemeral reset makes the SAL useless for recovery.
+/// An ephemeral round flushes the system tables behind its ACKs: a sequence
+/// advance that reached the `sys_sequences` MemTable after the base round's
+/// flush is durable once the checkpoint has finished.
 #[test]
-fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
+fn an_ephemeral_round_flushes_a_memtable_only_sequence_advance() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
     let user_seq;
@@ -246,10 +280,10 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
         engine.reserve_user_sequence(user_seq, 64, &mut |_, _| Ok(())).unwrap();
 
         let (disp, _) = test_dispatcher(0, engine);
-        disp.checkpoint_post_ack(&mut disp.sal().excl()).unwrap();
+        disp.reactor().block_on(disp.checkpoint_ephemeral()).unwrap();
 
         // Crash semantics: no `engine.close()`, and no Drop impl — only what the
-        // finalizer flushed survives.
+        // round flushed survives.
         drop(disp);
     }
 
@@ -257,9 +291,22 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
     assert_eq!(
         engine.sequence_value(user_seq),
         Some(64),
-        "sys_sequences high-water must survive a crash right after the checkpoint finalize"
+        "sys_sequences high-water must survive a crash right after the ephemeral round"
     );
     engine.close();
+}
+
+/// The boot checkpoint's `FlushEph` is the last group of a checkpoint: at a
+/// one-byte threshold, the log it leaves calls for no further one.
+#[test]
+fn the_boot_checkpoint_calls_for_no_other() {
+    let (_tmp, engine) = empty_catalog();
+    let (reactor, _) = reactor_with_rings(0);
+    let sal = test_log(1 << 20, 0, 1).checkpoint_at(1);
+    let disp = MasterDispatcher::new(Vec::new(), engine, sal, reactor);
+    disp.reactor().block_on(disp.boot_checkpoint()).unwrap();
+    assert!(disp.sal().cursor() > 0, "the boot checkpoint's group is in the log");
+    assert!(!disp.sal().needs_checkpoint());
 }
 
 /// A whole checkpoint is `checkpoint_base` + an ephemeral round. The base round
@@ -268,40 +315,40 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
 /// round moves no base store, and the views checkpointed at the generation in
 /// force stay valid. Neither the ephemeral round nor the boot checkpoint's
 /// restamp bumps.
+///
+/// The base round alone moves the SAL into its next epoch: the ephemeral round
+/// and the boot checkpoint leave their groups in the epoch they were written in.
 #[test]
 fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
     let (_tmp, engine) = empty_catalog();
     let (disp, _) = test_dispatcher(0, engine);
     let gen = disp.cat().durable_generation();
     let checkpoint = |disp: &MasterDispatcher| {
+        let epoch = disp.sal().epoch();
         disp.reactor()
             .block_on(async {
                 disp.checkpoint_base().await?;
+                assert_eq!(disp.sal().epoch(), epoch + 1, "the base round's rewind");
+                assert_eq!(disp.sal().cursor(), 0);
                 disp.checkpoint_ephemeral().await?;
-                disp.boot_checkpoint().await
+                let behind = disp.sal().cursor();
+                assert!(behind > 0, "the ephemeral round's group stays in the log");
+                disp.boot_checkpoint().await?;
+                assert!(disp.sal().cursor() > behind);
+                Ok::<(), WireFault>(())
             })
             .unwrap();
+        assert_eq!(disp.sal().epoch(), epoch + 1, "one epoch per checkpoint");
         disp.cat().durable_generation()
     };
 
     assert_eq!(checkpoint(&disp), gen, "no push since the last base round");
     {
         let mut excl = disp.sal().excl();
-        let mut scope = excl.begin("test");
-        // No rows, so no schema block is framed, and addressed to no worker, so
-        // no ACK is owed.
-        let push = SalGroup::push(
-            1,
-            PkRule::Enforce,
-            &[],
-            GroupData::Same(None),
-            GroupTargets {
-                set: WorkerSet::EMPTY,
-                ..GroupTargets::SILENT
-            },
-        );
-        scope.write(&push, true).unwrap();
-        assert!(scope.commit(), "the push is a zone member");
+        let mut scope = excl.begin();
+        // No rows, so no schema block is framed; no worker is launched to read it.
+        scope.push(1, PkRule::Enforce, &[], Routed::Same(None), true).unwrap();
+        assert!(scope.commit().is_some(), "the push is a zone member");
     }
     assert_eq!(checkpoint(&disp), gen + 1);
     assert_eq!(checkpoint(&disp), gen + 1, "the base round took the push with it");

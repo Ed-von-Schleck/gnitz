@@ -4,10 +4,9 @@ use crate::query::Lane;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::test_log;
-use crate::runtime::sal::GroupTargets;
-use crate::runtime::sal::{Cut, GroupData, SalGroup, SalRequest, SalWriter};
+use crate::runtime::sal::{Cut, Routed, SalExcl, SalWriter};
 use crate::runtime::w2m::fixtures::id;
-use crate::runtime::w2m::{self, RequestId, W2mReceiver};
+use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{
     make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema,
     register_full_pk, register_identity_view, scan_all, table_engine, u64_i64_cols, weighted_rows,
@@ -45,7 +44,7 @@ pub(super) fn worker_over(
         .unwrap()
         .pop()
         .unwrap();
-    let mut wp = WorkerProcess::new(catalog, SalReader::new(sal.log(), 0, 1), writers.pop().unwrap(), mesh);
+    let mut wp = WorkerProcess::new(catalog, sal.reader(0), writers.pop().unwrap(), mesh);
     wp.reply_frame_budget = gnitz_wire::MAX_FRAME_PAYLOAD;
     (wp, sal, receiver)
 }
@@ -59,15 +58,9 @@ fn route(target_id: u64, request_id: u32, cut: u64) -> ReplyRoute {
     }
 }
 
-/// `request` answered on `request_id`, 0 for none.
-pub(super) fn addressed<'a>(request: impl Into<SalRequest<'a>>, request_id: u32) -> SalGroup<'a> {
-    SalGroup {
-        targets: GroupTargets {
-            reply: RequestId::from_wire(request_id),
-            ..GroupTargets::SILENT
-        },
-        ..SalGroup::new(request)
-    }
+/// Write `read` to every worker, answered on `request_id`.
+pub(super) fn ask(excl: &mut SalExcl, read: Read<'_>, request_id: u32) -> Result<(), WireFault> {
+    excl.read(read, WorkerSet::ALL, None, id(request_id))
 }
 
 /// An unbounded read of every row of `tid`, whose rows lay out as `schema`.
@@ -97,24 +90,8 @@ pub(super) fn pk_keys(ids: &[u64]) -> Vec<u8> {
 }
 
 /// A PK probe of `tid` at `keys`.
-pub(super) fn probe(tid: u64, keys: &[u8], request_id: u32) -> SalGroup<'_> {
-    addressed(Read::HasPk { tid, probe: Probe::Pk, keys: keys.into() }, request_id)
-}
-
-/// A push of `rows` into `tid`, whose schema record is `record`, ACKed on
-/// `request_id`.
-pub(super) fn push<'a>(tid: u64, record: &'a [u8], rows: &'a Batch, request_id: u32) -> SalGroup<'a> {
-    let targets = GroupTargets {
-        reply: RequestId::from_wire(request_id),
-        ..GroupTargets::SILENT
-    };
-    SalGroup::push(
-        tid,
-        PkRule::Enforce,
-        record,
-        GroupData::Same(rows.wire_whole()),
-        targets,
-    )
+pub(super) fn probe(tid: u64, keys: &[u8]) -> Read<'_> {
+    Read::HasPk { tid, probe: Probe::Pk, keys: keys.into() }
 }
 
 /// One published ring message: its ring-prefix request id, control block and
@@ -182,11 +159,9 @@ fn drain_replies(wp: &mut WorkerProcess) {
     panic!("the replies must drain within a bounded pass count");
 }
 
-/// Dispatch every group on the SAL as an exchange wait does: `dispatch(req, true)`.
+/// Serve every group on the SAL as an exchange wait does: `serve_next(true)`.
 fn drain_in_wait(wp: &mut WorkerProcess) {
-    while let Some(req) = wp.next_request() {
-        wp.dispatch(req, true);
-    }
+    while wp.serve_next(true).is_some() {}
 }
 
 /// Wire size of `batch` sent whole as one frame.
@@ -210,7 +185,7 @@ fn weight(i: u64) -> i64 {
 
 // -- dispatch ---------------------------------------------------------------
 
-/// `dispatch(req, true)`, driven as the exchange wait's own drain loop drives it:
+/// `serve_next(true)`, driven as the exchange wait's own drain loop drives it:
 /// a read of a view parks in SAL order; a read of a base table, `Push` and
 /// `Flush` answer from inside the wait; a DdlSync that addresses no worker is
 /// stepped over; and a train stays unsent — a slow client can fill the ring, and
@@ -226,38 +201,37 @@ fn in_wait_dispositions() {
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
     let spans = Read::KeySpans { tid, cols, claim: false };
-    let ddl = SalGroup {
-        targets: GroupTargets {
-            set: WorkerSet::EMPTY,
-            ..GroupTargets::SILENT
-        },
-        ..SalGroup::new(Apply::DdlSync { family: SysFamily::Sequence })
-    };
+    // Each under a hold of its own: no two reads share a cut.
+    let reads = [
+        scan(vid, &schema),
+        delta(vid, &schema),
+        scan(tid, &schema),
+        spans,
+        probe(tid, &[]),
+    ];
+    for (read, request_id) in reads.into_iter().zip(1..) {
+        ask(&mut sal.excl(), read, request_id).expect("group fits");
+    }
     // A control-only push carries no rows, so it ACKs without reaching the
     // store. `Flush` goes last: the reader leaves the epoch on stepping past it.
-    let groups = [
-        addressed(scan(vid, &schema), 1),
-        addressed(delta(vid, &schema), 2),
-        addressed(scan(tid, &schema), 3),
-        addressed(spans, 4),
-        probe(tid, &[], 5),
-        addressed(Apply::Push { tid, rule: PkRule::Enforce }, 6),
-        ddl,
-        addressed(Apply::Flush, 7),
-    ];
-    for group in &groups {
-        sal.excl().write(group).expect("group fits");
-    }
+    sal.excl()
+        .apply(Apply::Push { tid, rule: PkRule::Enforce }, id(6))
+        .expect("group fits");
+    sal.ddl_zone(&[(
+        SysFamily::Sequence,
+        &Batch::empty_with_schema(SysFamily::Sequence.schema()),
+    )]);
+    sal.excl().apply(Apply::Flush, id(7)).expect("group fits");
     drain_in_wait(&mut wp);
 
     assert_eq!(owed(&wp), [("parked", 1), ("parked", 2), ("train", 4)]);
-    // A parked read is answered after the drive reads past a `Flush`, which
-    // lets the master rewrite the SAL bytes it was decoded from.
+    // A parked read is answered after the drive read further groups, a `Flush`
+    // among them, behind which the master rewrites the SAL bytes it came in.
     for owed in &wp.replies {
         if let Owed::Parked(_, read) = owed {
             assert!(
                 matches!(
-                    **read,
+                    *read,
                     Read::ScanSpec { spec: Cow::Owned(_), .. } | Read::Delta { spec: Cow::Owned(_), .. }
                 ),
                 "a parked read owns its bytes: {read:?}"
@@ -303,7 +277,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
         first_round: 7,
         tids: vec![500, 501].into(),
     };
-    sal.excl().write(&addressed(tick, 9)).expect("group fits");
+    sal.excl().apply(tick, id(9)).expect("group fits");
     wp.drain_sal();
 
     for tid in [500, 501] {
@@ -324,8 +298,8 @@ fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
-    sal.excl().write(&addressed(scan(tid, &schema), 1)).expect("group fits");
-    sal.excl().write(&push(tid, &record, &row, 2)).expect("group fits");
+    ask(&mut sal.excl(), scan(tid, &schema), 1).expect("group fits");
+    sal.excl().acked_push(tid, &record, &row, id(2)).expect("group fits");
     drain_in_wait(&mut wp);
 
     let out = frames(&rx);
@@ -350,8 +324,8 @@ fn a_parked_view_read_answers_ahead_of_the_cut_member_behind_it() {
 
     {
         let mut excl = sal.excl();
-        excl.write(&addressed(scan(vid, &schema), 1)).expect("group fits");
-        excl.join(&addressed(scan(tid, &schema), 2)).expect("group fits");
+        ask(&mut excl, scan(vid, &schema), 1).expect("group fits");
+        ask(&mut excl, scan(tid, &schema), 2).expect("group fits");
     }
     drain_in_wait(&mut wp);
     assert_eq!(owed(&wp), [("parked", 1), ("train", 2)]);
@@ -376,13 +350,11 @@ fn a_burst_passes_what_another_cut_owes() {
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
     let keys = pk_keys(&[1]);
-    sal.excl()
-        .write(&addressed(delta(vid, &schema), 1))
-        .expect("group fits");
+    ask(&mut sal.excl(), delta(vid, &schema), 1).expect("group fits");
     {
         let mut excl = sal.excl();
-        excl.write(&probe(tid, &keys, 2)).expect("group fits");
-        excl.join(&probe(tid, &keys, 3)).expect("group fits");
+        ask(&mut excl, probe(tid, &keys), 2).expect("group fits");
+        ask(&mut excl, probe(tid, &keys), 3).expect("group fits");
     }
     drain_in_wait(&mut wp);
 
@@ -402,9 +374,7 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
     let schema = make_schema_u64_i64();
     let (mut wp, sal, rx) = test_worker(&mut engine);
     for request_id in [1, 2] {
-        sal.excl()
-            .write(&addressed(scan(tid, &schema), request_id))
-            .expect("group fits");
+        ask(&mut sal.excl(), scan(tid, &schema), request_id).expect("group fits");
     }
 
     // One worker: its own publish completes the round.
@@ -420,8 +390,11 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
     wp.exchange(std::iter::once(lane), false, &mut got);
     assert_eq!(weighted_rows(&got[0]), weighted_rows(&part));
     assert_eq!(reqs(&frames(&rx)), [1]);
-    let next = wp.next_request().expect("the second read is still on the SAL");
-    assert!(matches!(next, Inbound::Read { route, .. } if route.request_id == id(2)));
+    let next = wp.sal_reader.next_request(|_, _| None);
+    assert!(
+        matches!(next, Some(Inbound::Read { route, .. }) if route.request_id == id(2)),
+        "the second read is still on the SAL"
+    );
 }
 
 /// A round is opened with the drive's own claim, and its close answers every
@@ -711,9 +684,12 @@ fn a_train_advances_with_every_request() {
 
     for _ in 0..GROUPS {
         // Control-only and unanswered: nothing of its own reaches the ring.
-        sal.excl()
-            .write(&SalGroup::new(Apply::Push { tid, rule: PkRule::Enforce }))
+        let mut excl = sal.excl();
+        let mut scope = excl.begin();
+        scope
+            .push(tid, PkRule::Enforce, &[], Routed::Same(None), false)
             .expect("group fits");
+        scope.commit();
     }
     wp.drain_sal();
     assert_eq!(reqs(&frames(&rx)), [11; GROUPS + 1]);
@@ -743,7 +719,7 @@ fn a_claiming_span_read_holds_its_index_until_its_release() {
     };
 
     let spans = Read::KeySpans { tid, cols, claim: true };
-    sal.excl().write(&addressed(spans, 1)).expect("group fits");
+    ask(&mut sal.excl(), spans, 1).expect("group fits");
     wp.drain_sal();
     drain_replies(&mut wp);
     assert!(indexed(&wp));
@@ -755,9 +731,7 @@ fn a_claiming_span_read_holds_its_index_until_its_release() {
         held.len()
     );
 
-    sal.excl()
-        .write(&addressed(Read::ReleasePreflight, 2))
-        .expect("group fits");
+    ask(&mut sal.excl(), Read::ReleasePreflight, 2).expect("group fits");
     wp.drain_sal();
     assert!(!indexed(&wp));
     assert_eq!(reqs(&frames(&rx)), [2]);

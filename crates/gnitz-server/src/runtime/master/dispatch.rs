@@ -8,7 +8,7 @@ use super::route::with_routed;
 use super::*;
 use crate::catalog::{ZoneError, ZoneSink};
 use crate::runtime::reactor::AckLease;
-use crate::runtime::sal::{Apply, GroupTargets, SalMessageKind, SalRequest, SalScope};
+use crate::runtime::sal::{Apply, Routed, SalScope};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io::retry_eintr;
 use gnitz_store::relation::PkRule;
@@ -22,16 +22,11 @@ const WORKER_WATCH: Duration = Duration::from_millis(100);
 static BACKUP_ABORT: Seam = Seam::new("GNITZ_INJECT_BACKUP_ABORT");
 
 impl MasterDispatcher {
-    /// Write `group` to every worker on a fresh ACK lease, and wake them now: a
-    /// caller may await the ACKs under this hold.
-    fn write_acked(&self, excl: &mut SalExcl<'_>, group: SalGroup<'_>) -> Result<AckLease, WireFault> {
+    /// Write `apply` to every worker on a fresh ACK lease; they are woken at the
+    /// write, so a caller may await the ACKs under this hold.
+    fn write_acked(&self, excl: &mut SalExcl<'_>, apply: Apply<'_>) -> Result<AckLease, WireFault> {
         let lease = self.reactor.lease_acks();
-        let targets = GroupTargets {
-            reply: Some(lease.id()),
-            ..GroupTargets::SILENT
-        };
-        excl.write(&SalGroup { targets, ..group })?;
-        excl.wake();
+        excl.apply(apply, lease.id())?;
         Ok(lease)
     }
 
@@ -48,40 +43,54 @@ impl MasterDispatcher {
     /// moves no base store, the generation stands, and the ephemeral round
     /// republishes only the stores whose manifests changed.
     ///
-    /// Once its ACKs are in, the round removes every directory no live entity
-    /// owns.
+    /// Once its ACKs are in, the round flushes the system tables and rewinds the
+    /// SAL into the next epoch, under the hold its `Flush` was written under,
+    /// then removes every directory no live entity owns. A failed system flush
+    /// returns its error without the rewind: the log's entries are those rows'
+    /// only durable copy, and the caller aborts or fails the boot on a log left
+    /// whole.
     pub(crate) async fn checkpoint_base(&self) -> Result<(), WireFault> {
         let mut excl = self.sal.lock().await;
         if self.sal.holds_pushes() {
             self.cat_mut().advance_durable_generation()?;
         }
-        self.flush_round(&mut excl, Apply::Flush).await?;
+        let lease = self.write_acked(&mut excl, Apply::Flush)?;
+        lease.acks().await;
+        self.cat_mut().flush_all_system_tables()?;
+        let epoch = excl.checkpoint_reset();
+        gnitz_note!("SAL checkpoint epoch={epoch}");
         // Every worker ACKed the Flush, so each has applied every DdlSync written
-        // before it, and the post-ACK system flush made every applied DROP
-        // durable. The checkpoint's one orphan sweep: a DDL pauses the committer,
-        // so none lands before the ephemeral round, and at boot
-        // `reconcile_child_dirs` has already swept.
+        // before it, and the system flush made every applied DROP durable. The
+        // checkpoint's one orphan sweep: a DDL pauses the committer, so none
+        // lands before the ephemeral round, and at boot `reconcile_child_dirs`
+        // has already swept.
         self.cat().reclaim_orphan_dirs();
         Ok(())
     }
 
     /// A checkpoint's second half: the round that flushes every resumable
     /// view's traces and output stores, stamped with the durable generation.
+    /// It rewinds nothing: its `FlushEph` stays in the epoch it is written in —
+    /// the one the base round's rewind opened, or the boot's — and the SAL hold
+    /// it is written under ends before its ACKs.
+    ///
+    /// Once the ACKs are in, the round flushes the system tables: that makes a
+    /// boot's recorded topology durable only behind the stamps taken at it, and
+    /// puts a SERIAL reservation published since that rewind under the replay
+    /// floor.
     pub(crate) async fn checkpoint_ephemeral(&self) -> Result<(), WireFault> {
-        let mut excl = self.sal.lock().await;
-        debug_assert!(
-            !self.sal.holds_pushes(),
-            "an ephemeral round's reset would discard pushes no base round flushed"
-        );
-        let generation = self.cat().durable_generation();
-        self.flush_round(&mut excl, Apply::FlushEph { generation }).await
-    }
-
-    /// Write `round`'s group, wait for every worker's ACK, finalize.
-    async fn flush_round(&self, excl: &mut SalExcl<'_>, round: Apply<'_>) -> Result<(), WireFault> {
-        let lease = self.write_acked(excl, SalGroup::new(round))?;
+        let lease = {
+            let mut excl = self.sal.lock().await;
+            debug_assert!(
+                !self.sal.holds_pushes(),
+                "a push ahead of the ephemeral round in its epoch is integrated by the views the round stamps and replayed into them again at boot"
+            );
+            let generation = self.cat().durable_generation();
+            self.write_acked(&mut excl, Apply::FlushEph { generation })?
+        };
         lease.acks().await;
-        self.checkpoint_post_ack(excl)
+        self.cat_mut().flush_all_system_tables()?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -97,8 +106,8 @@ impl MasterDispatcher {
         if ordered.is_empty() {
             return Ok(());
         }
-        let group = SalGroup::new(Apply::Backfill { views: ordered.into() });
-        let lease = self.write_acked(&mut self.sal.lock().await, group)?;
+        let backfill = Apply::Backfill { views: ordered.into() };
+        let lease = self.write_acked(&mut self.sal.lock().await, backfill)?;
         lease.acks().await;
         Ok(())
     }
@@ -125,12 +134,11 @@ impl MasterDispatcher {
         excl: &mut SalExcl<'_>,
         write: impl FnOnce(&mut CatalogEngine, &mut ZoneSink<'_>) -> Result<T, ZoneError>,
     ) -> Result<(T, u64), WireFault> {
-        let mut scope = excl.begin("ddl");
-        let zone_lsn = scope.lsn();
-        // Each DDL batch is logged inside the zone, under its one LSN, so recovery
-        // groups a DDL's groups atomically.
+        let mut scope = excl.begin();
+        // Each DDL batch is logged inside the zone, so recovery groups a DDL's
+        // groups atomically.
         let written = write(&mut self.cat_mut(), &mut |family, batch| {
-            scope.write(&SalGroup::ddl_sync(family, batch), true)?;
+            scope.ddl_sync(family, batch)?;
             gnitz_debug!("ddl group tid={} rows={}", family.id(), batch.len());
             Ok(())
         });
@@ -139,23 +147,23 @@ impl MasterDispatcher {
             Err(ZoneError::Refused(e)) => return Err(e),
             Err(ZoneError::Diverged(e)) => gnitz_fatal_abort!("{}: {e}", std::panic::Location::caller()),
         };
-        // Only a closed zone raises the replay floor: an LSN no member carries can
-        // be the next scope's, whose zone boot replay would then skip.
-        if !scope.commit() {
+        // Only a zone has an LSN, so only a closed zone raises the replay floor.
+        let Some(zone_lsn) = scope.commit() else {
             return Ok((value, 0));
-        }
+        };
         self.cat_mut().mark_zone_applied(zone_lsn);
         Ok((value, zone_lsn))
     }
 
     /// Write one Tick group for `tids` at consecutive tick rounds, on a fresh ACK
-    /// lease. A refused write burns its rounds.
+    /// lease. A refused write takes no round.
     pub(crate) fn emit_tick(&self, excl: &mut SalExcl<'_>, tids: &[u64]) -> Result<AckLease, WireFault> {
         let first = self.rounds.round.get() + 1;
+        let tick = Apply::Tick { first_round: first, tids: tids.into() };
+        let lease = self.write_acked(excl, tick)?;
         self.rounds.round.set(first + tids.len() as u64 - 1);
         self.record_delta_rounds(tids, first);
-        let tick = Apply::Tick { first_round: first, tids: tids.into() };
-        self.write_acked(excl, SalGroup::new(tick))
+        Ok(lease)
     }
 
     /// Raise each fed view's last-reached round to the last of `tids`' rounds
@@ -211,7 +219,7 @@ impl MasterDispatcher {
     /// probes workers that exited on request.
     pub(crate) async fn shutdown_workers(&self) {
         // A refusal would hang the reap below, so it must not vanish.
-        if let Err(e) = self.sal.lock().await.write(&SalGroup::new(SalRequest::Shutdown)) {
+        if let Err(e) = self.sal.lock().await.shutdown() {
             gnitz_warn!("SAL refused the Shutdown broadcast: {}; the worker reap will block", e);
         }
         self.reap_workers();
@@ -225,25 +233,23 @@ impl MasterDispatcher {
         }
     }
 
-    /// The SAL group of one push of `batch` to `target_id`, held to `rule`,
-    /// addressed to the workers that own its rows and to no reply, handed to `f`
-    /// with whether it rides inside the zone. A base table's rows do; a
-    /// stream's, which no restart recovers, ride outside.
+    /// One push of `batch` to `target_id` as its SAL group carries it: the
+    /// target's schema record and the rows routed to the workers that own them,
+    /// handed to `f` with whether the group rides inside the zone. A base
+    /// table's rows do; a stream's, which no restart recovers, ride outside.
     fn with_commit_group<R>(
         &self,
         target_id: u64,
-        rule: PkRule,
         batch: MemBatch<'_>,
-        f: impl FnOnce(SalGroup<'_>, bool) -> R,
+        f: impl FnOnce(&[u8], Routed<'_>, bool) -> R,
     ) -> R {
         let cat = self.cat();
         let (rel, record) = cat
             .wire_target(target_id)
             .expect("a push target is registered under the catalog lock");
         let recoverable = rel.kind().is_base_table();
-        with_routed(batch, rel.placement(), self.num_workers(), |data| {
-            let targets = GroupTargets { set: data.holders(), reply: None };
-            f(SalGroup::push(target_id, rule, record, data, targets), recoverable)
+        with_routed(batch, rel.placement(), self.num_workers(), |rows| {
+            f(record, rows, recoverable)
         })
     }
 
@@ -258,48 +264,22 @@ impl MasterDispatcher {
         rule: PkRule,
         batch: MemBatch<'_>,
     ) -> Result<bool, WireFault> {
-        self.with_commit_group(target_id, rule, batch, |g, recoverable| {
-            scope.write(&g, recoverable)?;
+        self.with_commit_group(target_id, batch, |record, rows, recoverable| {
+            scope.push(target_id, rule, record, rows, recoverable)?;
             Ok(recoverable)
         })
     }
 
-    /// Whether the commit groups of `families`, laid out back to back as
-    /// [`Self::write_commit_group`] lays each out, fit a log with nothing else
-    /// in its epoch: whether a checkpoint can make room for them.
-    pub(crate) fn commit_fits_empty_log<'b>(
-        &self,
-        scope: &SalScope,
-        families: impl IntoIterator<Item = (u64, MemBatch<'b>)>,
-    ) -> bool {
-        let bytes = (families.into_iter())
-            // The rule rides in the group head, so it sizes no group.
+    /// The log bytes the commit groups of `families` occupy, laid out back to
+    /// back as [`Self::write_commit_group`] lays each out.
+    pub(crate) fn commit_footprint<'b>(&self, families: impl IntoIterator<Item = (u64, MemBatch<'b>)>) -> usize {
+        (families.into_iter())
             .map(|(target_id, batch)| {
-                self.with_commit_group(target_id, PkRule::Enforce, batch, |g, _| scope.footprint(&g))
+                self.with_commit_group(target_id, batch, |record, rows, _| {
+                    self.sal.push_footprint(record, rows)
+                })
             })
-            .sum();
-        scope.fits_empty_log(SalMessageKind::Push, bytes)
-    }
-
-    /// Post-ACK checkpoint cleanup, run once a round's Flush ACKs are in: flush
-    /// the system tables before resetting the SAL cursor (their data lives in
-    /// SAL entries about to be discarded), then advance the epoch.
-    ///
-    /// Finalizes **both** rounds. The ephemeral one must flush too: a
-    /// `reserve_serial_range` advance can land in the `sys_sequences`
-    /// MemTable during the drain window, after the base round's reset, so this
-    /// flush is its only durability event before the ephemeral reset makes the
-    /// SAL tail useless for recovery.
-    ///
-    /// Returns the flush error WITHOUT resetting the SAL when the system-table
-    /// flush fails: the SAL entries about to be discarded are that data's only
-    /// durable copy, so resetting on a swallowed failure destroys it. The caller
-    /// leaves the SAL intact and aborts or fails the boot.
-    fn checkpoint_post_ack(&self, excl: &mut SalExcl<'_>) -> Result<(), WireFault> {
-        self.cat_mut().flush_all_system_tables()?;
-        let epoch = excl.checkpoint_reset();
-        gnitz_note!("SAL checkpoint epoch={epoch}");
-        Ok(())
+            .sum()
     }
 
     /// A backup's copy, run by the committer right behind a checkpoint: every

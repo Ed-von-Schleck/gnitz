@@ -30,12 +30,12 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
 use std::time::Duration;
 
-use self::committer::Committer;
+use self::committer::{CommitRequests, Committer};
 use self::ddl::{handle_ddl_txn, reserve_serial_range};
 use self::delta::{handle_delta_poll, Feeds, Subscriptions};
 use self::peer::Peer;
 use self::snapshot::HeldSnapshots;
-use self::tick::Ticks;
+use self::tick::{TickRequests, Ticks};
 use self::write::{handle_push, handle_push_txn, Writes};
 use crate::catalog::CatalogEngine;
 use crate::runtime::frame::WireMsg;
@@ -43,7 +43,7 @@ use crate::runtime::listen::ClientListener;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{RecvBuf, SendBody, TrainLease};
 use crate::runtime::signals;
-use crate::runtime::sync::{select2, AsyncRwLock, Either, WriteGuard};
+use crate::runtime::sync::{chan, oneshot, select2, AsyncRwLock, Either, WriteGuard};
 use crate::runtime::tls::{Served, TlsListener};
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_wire::{ClientVerb, Target, WireFault, WireStatus};
@@ -92,6 +92,36 @@ struct Shared {
 }
 
 impl Shared {
+    /// The state of an executor over `dispatcher`, and the request queues of
+    /// its committer, its tick loop and its delta pump.
+    fn new(
+        dispatcher: MasterDispatcher,
+        hello_timeout: Duration,
+        backup_dir: Option<String>,
+    ) -> (
+        Rc<Shared>,
+        CommitRequests,
+        TickRequests,
+        chan::Receiver<oneshot::Sender<()>>,
+    ) {
+        let boot_seed = dispatcher.sal().watermark();
+        let (committer, committer_rx) = Committer::new();
+        let (ticks, tick_rx) = Ticks::new(boot_seed);
+        let (feeds, asks) = Feeds::new();
+        let shared = Rc::new(Shared {
+            dispatcher,
+            committer,
+            catalog_rwlock: AsyncRwLock::default(),
+            ticks,
+            writes: Writes::new(boot_seed),
+            feeds,
+            hello_timeout,
+            last_snapshot: Cell::new(0),
+            backup_dir,
+        });
+        (shared, committer_rx, tick_rx, asks)
+    }
+
     fn cat(&self) -> Ref<'_, CatalogEngine> {
         self.dispatcher.cat()
     }
@@ -123,25 +153,11 @@ pub(super) fn run(
     listeners: Vec<ClientListener>,
 ) -> Option<usize> {
     let reactor = dispatcher.reactor().clone();
-    let boot_seed = dispatcher.sal().watermark();
-
-    let (committer, committer_rx) = Committer::new();
-    let (ticks, tick_rx) = Ticks::new(boot_seed);
-    let (feeds, asks) = Feeds::new();
-    let shared = Rc::new(Shared {
-        dispatcher,
-        committer,
-        catalog_rwlock: AsyncRwLock::default(),
-        ticks,
-        writes: Writes::new(boot_seed),
-        feeds,
-        hello_timeout: Duration::from_millis(gnitz_foundation::env::env_num(
-            "GNITZ_HELLO_TIMEOUT_MS",
-            (gnitz_wire::CONNECT_TIMEOUT * 3 / 2).as_millis() as u64,
-        )),
-        last_snapshot: Cell::new(0),
-        backup_dir,
-    });
+    let hello_timeout = Duration::from_millis(gnitz_foundation::env::env_num(
+        "GNITZ_HELLO_TIMEOUT_MS",
+        (gnitz_wire::CONNECT_TIMEOUT * 3 / 2).as_millis() as u64,
+    ));
+    let (shared, committer_rx, tick_rx, asks) = Shared::new(dispatcher, hello_timeout, backup_dir);
 
     signals::catch_shutdown();
     // Past the last env knob the boot reads, so one it refuses stops the

@@ -1,23 +1,22 @@
-//! What a SAL group asks of a worker, typed: the master builds a [`SalRequest`]
-//! over its bytes, a worker decodes one that borrows the SAL's, and
-//! [`SalRequest::encode`] and [`SalRequest::decode`] are the one mapping between
-//! its fields and a frame head.
+//! What a SAL group asks of a worker, typed: the master names a [`Read`] or an
+//! [`Apply`] over its bytes, a worker decodes one that borrows the SAL's, and
+//! [`Read::encode`], [`Apply::encode`] and [`SalRequest::decode`] are the one
+//! mapping between its fields and a group's header scalars and blob.
 
 use std::borrow::Cow;
 use std::num::NonZeroU64;
 
-use super::SalMessageKind;
+use super::format::{RequestHead, SalMessageKind};
 use crate::catalog::SysFamily;
-use crate::runtime::frame::WireMsg;
 use gnitz_store::read::Probe;
 use gnitz_store::relation::PkRule;
-use gnitz_wire::{ControlHeader, PkColList, PkListRole};
+use gnitz_wire::{PkColList, PkListRole};
 
 /// A request answered with a reply train; its failure is a fault frame to the
 /// asker, so it may change only state the asker can retry or release.
 ///
-/// A decoded read borrows its byte fields from the SAL group it came in; whoever
-/// keeps one past that group's dispatch takes [`Read::into_owned`] first.
+/// A decoded read borrows its byte fields from the SAL group it came in;
+/// [`Read::into_owned`] is the one kept past it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Read<'a> {
     /// `probe` at `keys`, encoded by [`gnitz_wire::PkKeys::encode_probe`].
@@ -80,105 +79,79 @@ pub(crate) enum Apply<'a> {
     Tick { first_round: u64, tids: Cow<'a, [u64]> },
 }
 
+/// A decoded request: a read borrows its group's bytes, an apply owns what it
+/// carries.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum SalRequest<'a> {
-    Read(Read<'a>),
-    Apply(Apply<'a>),
+pub(super) enum SalRequest<'r> {
+    Read(Read<'r>),
+    Apply(Apply<'static>),
     Shutdown,
 }
 
-impl SalRequest<'_> {
-    /// The kind byte of the request's group, the target its group head carries,
-    /// and the frame head every payload of the group shares: the inverse of
-    /// [`Self::decode`].
-    pub(crate) fn encode(&self) -> (SalMessageKind, u64, WireMsg<'_>) {
+impl Apply<'_> {
+    /// The scalars the apply's group header carries, and the blob each payload
+    /// of the group does: the inverse of [`SalRequest::decode`].
+    pub(super) fn encode(&self) -> (RequestHead, &[u8]) {
         use SalMessageKind as K;
-        let head = WireMsg::default();
+        let head = RequestHead::new;
+        let none: &[u8] = &[];
         match *self {
-            SalRequest::Shutdown => (K::Shutdown, 0, head),
-            SalRequest::Apply(Apply::Flush) => (K::Flush, 0, head),
-            SalRequest::Apply(Apply::FlushEph { generation }) => (K::FlushEph, 0, WireMsg { arg0: generation, ..head }),
-            SalRequest::Apply(Apply::DdlSync { family }) => (K::DdlSync, family.id(), head),
-            SalRequest::Apply(Apply::Push { tid, rule }) => (
-                K::Push,
-                tid,
-                WireMsg {
-                    arg0: u64::from(rule == PkRule::Fresh),
-                    ..head
-                },
-            ),
-            SalRequest::Apply(Apply::Backfill { ref views }) => (
-                K::Backfill,
-                0,
-                WireMsg {
-                    blob: gnitz_wire::as_le_bytes(views),
-                    ..head
-                },
-            ),
-            SalRequest::Apply(Apply::Tick { first_round, ref tids }) => (
-                K::Tick,
-                0,
-                WireMsg {
-                    arg0: first_round,
-                    blob: gnitz_wire::as_le_bytes(tids),
-                    ..head
-                },
-            ),
-            SalRequest::Read(Read::HasPk { tid, probe, ref keys }) => {
-                let (kind, arg0, arg1) = match probe {
-                    Probe::Pk => (K::HasPk, 0, 0),
-                    Probe::PkColumn(col) => (K::HasPkColumn, col.into(), 0),
-                    Probe::Index(cols, cap) => (K::HasPkIndex, cap.get(), cols.pack()),
-                };
-                (kind, tid, WireMsg { arg0, arg1, blob: keys, ..head })
-            }
-            SalRequest::Read(Read::KeySpans { tid, cols, claim }) => (
-                K::KeySpans,
-                tid,
-                WireMsg {
-                    arg0: claim.into(),
-                    arg1: cols.pack(),
-                    ..head
-                },
-            ),
-            SalRequest::Read(Read::ReleasePreflight) => (K::ReleasePreflight, 0, head),
-            SalRequest::Read(Read::ScanSpec { tid, reply_layout, ref spec }) => {
-                (K::ScanSpec, tid, WireMsg { arg0: reply_layout, blob: spec, ..head })
-            }
-            SalRequest::Read(Read::Delta { view, after_tick, reply_layout, ref spec }) => (
-                K::Delta,
-                view,
-                WireMsg {
-                    arg0: reply_layout,
-                    arg1: after_tick,
-                    blob: spec,
-                    ..head
-                },
-            ),
-            SalRequest::Read(Read::Pin { snapshot }) => (K::Pin, 0, WireMsg { arg0: snapshot, ..head }),
-            SalRequest::Read(Read::Unpin { snapshot }) => (K::Unpin, 0, WireMsg { arg0: snapshot, ..head }),
-            SalRequest::Read(Read::SnapshotPage { snapshot, tid, ref page }) => {
-                (K::SnapshotPage, tid, WireMsg { arg0: snapshot, blob: page, ..head })
-            }
-            SalRequest::Read(Read::Backup { ref dir }) => (K::Backup, 0, WireMsg { blob: dir, ..head }),
+            Apply::Flush => (head(K::Flush, 0, 0, 0), none),
+            Apply::FlushEph { generation } => (head(K::FlushEph, 0, generation, 0), none),
+            Apply::DdlSync { family } => (head(K::DdlSync, family.id(), 0, 0), none),
+            Apply::Push { tid, rule } => (head(K::Push, tid, u64::from(rule == PkRule::Fresh), 0), none),
+            Apply::Backfill { ref views } => (head(K::Backfill, 0, 0, 0), gnitz_wire::as_le_bytes(views)),
+            Apply::Tick { first_round, ref tids } => (head(K::Tick, 0, first_round, 0), gnitz_wire::as_le_bytes(tids)),
         }
     }
 }
 
-impl<'a> SalRequest<'a> {
-    /// The inverse of [`Self::encode`]. A read borrows what it reads of `blob`;
+impl Read<'_> {
+    /// The scalars the read's group header carries, and the blob each payload
+    /// of the group does unless a worker is sent its own: the inverse of
+    /// [`SalRequest::decode`].
+    pub(super) fn encode(&self) -> (RequestHead, &[u8]) {
+        use SalMessageKind as K;
+        let head = RequestHead::new;
+        let none: &[u8] = &[];
+        match *self {
+            Read::HasPk { tid, probe, ref keys } => (
+                match probe {
+                    Probe::Pk => head(K::HasPk, tid, 0, 0),
+                    Probe::PkColumn(col) => head(K::HasPkColumn, tid, col.into(), 0),
+                    Probe::Index(cols, cap) => head(K::HasPkIndex, tid, cap.get(), cols.pack()),
+                },
+                keys,
+            ),
+            Read::KeySpans { tid, cols, claim } => (head(K::KeySpans, tid, claim.into(), cols.pack()), none),
+            Read::ReleasePreflight => (head(K::ReleasePreflight, 0, 0, 0), none),
+            Read::ScanSpec { tid, reply_layout, ref spec } => (head(K::ScanSpec, tid, reply_layout, 0), spec),
+            Read::Delta { view, after_tick, reply_layout, ref spec } => {
+                (head(K::Delta, view, reply_layout, after_tick), spec)
+            }
+            Read::Pin { snapshot } => (head(K::Pin, 0, snapshot, 0), none),
+            Read::Unpin { snapshot } => (head(K::Unpin, 0, snapshot, 0), none),
+            Read::SnapshotPage { snapshot, tid, ref page } => (head(K::SnapshotPage, tid, snapshot, 0), page),
+            Read::Backup { ref dir } => (head(K::Backup, 0, 0, 0), dir),
+        }
+    }
+
+    /// The name of the kind the read is logged under.
+    pub(crate) fn name(&self) -> &'static str {
+        self.encode().0.kind.variant_name()
+    }
+}
+
+impl<'r> SalRequest<'r> {
+    /// The inverse of [`Read::encode`] and [`Apply::encode`]. A read borrows what it reads of `blob`;
     /// the tid lists of `Backfill` and `Tick` are owned, since a drive iterates
-    /// them while it reads later groups, a `Flush` among them.
-    pub(super) fn decode(
-        kind: SalMessageKind,
-        tid: u64,
-        hdr: &ControlHeader,
-        blob: &'a [u8],
-    ) -> Result<SalRequest<'a>, String> {
+    /// them while it reads later groups.
+    pub(super) fn decode(head: &RequestHead, blob: &'r [u8]) -> Result<Self, String> {
+        let RequestHead { kind, target_id: tid, arg0, arg1 } = *head;
         Ok(match kind {
             SalMessageKind::Shutdown => SalRequest::Shutdown,
             SalMessageKind::Flush => Apply::Flush.into(),
-            SalMessageKind::FlushEph => Apply::FlushEph { generation: hdr.arg0 }.into(),
+            SalMessageKind::FlushEph => Apply::FlushEph { generation: arg0 }.into(),
             SalMessageKind::DdlSync => Apply::DdlSync {
                 family: SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?,
             }
@@ -189,20 +162,20 @@ impl<'a> SalRequest<'a> {
             .into(),
             SalMessageKind::Push => Apply::Push {
                 tid,
-                rule: match gnitz_wire::bool_word(hdr.arg0)? {
+                rule: match gnitz_wire::bool_word(arg0)? {
                     true => PkRule::Fresh,
                     false => PkRule::Enforce,
                 },
             }
             .into(),
             SalMessageKind::Tick => Apply::Tick {
-                first_round: hdr.arg0,
+                first_round: arg0,
                 tids: gnitz_wire::le_scalars(blob)?.into(),
             }
             .into(),
             SalMessageKind::HasPk | SalMessageKind::HasPkColumn | SalMessageKind::HasPkIndex => {
-                let refused = || format!("no probe is carried as ({}, {:#x})", hdr.arg0, hdr.arg1);
-                let probe = match (kind, hdr.arg0, hdr.arg1) {
+                let refused = || format!("no probe is carried as ({}, {:#x})", arg0, arg1);
+                let probe = match (kind, arg0, arg1) {
                     (SalMessageKind::HasPk, 0, 0) => Probe::Pk,
                     (SalMessageKind::HasPkColumn, col, 0) => {
                         Probe::PkColumn(u32::try_from(col).map_err(|_| refused())?)
@@ -217,28 +190,28 @@ impl<'a> SalRequest<'a> {
             }
             SalMessageKind::KeySpans => Read::KeySpans {
                 tid,
-                cols: PkColList::unpack_as(hdr.arg1, PkListRole::ColumnList)?,
-                claim: gnitz_wire::bool_word(hdr.arg0)?,
+                cols: PkColList::unpack_as(arg1, PkListRole::ColumnList)?,
+                claim: gnitz_wire::bool_word(arg0)?,
             }
             .into(),
             SalMessageKind::ReleasePreflight => Read::ReleasePreflight.into(),
             SalMessageKind::ScanSpec => Read::ScanSpec {
                 tid,
-                reply_layout: hdr.arg0,
+                reply_layout: arg0,
                 spec: Cow::Borrowed(blob),
             }
             .into(),
             SalMessageKind::Delta => Read::Delta {
                 view: tid,
-                after_tick: hdr.arg1,
-                reply_layout: hdr.arg0,
+                after_tick: arg1,
+                reply_layout: arg0,
                 spec: Cow::Borrowed(blob),
             }
             .into(),
-            SalMessageKind::Pin => Read::Pin { snapshot: hdr.arg0 }.into(),
-            SalMessageKind::Unpin => Read::Unpin { snapshot: hdr.arg0 }.into(),
+            SalMessageKind::Pin => Read::Pin { snapshot: arg0 }.into(),
+            SalMessageKind::Unpin => Read::Unpin { snapshot: arg0 }.into(),
             SalMessageKind::SnapshotPage => Read::SnapshotPage {
-                snapshot: hdr.arg0,
+                snapshot: arg0,
                 tid,
                 page: Cow::Borrowed(blob),
             }
@@ -248,26 +221,11 @@ impl<'a> SalRequest<'a> {
     }
 }
 
-/// A read that owns its bytes, so it may outlive the SAL group it was decoded
-/// from. Only [`Read::into_owned`] builds one: a SAL read is handed out as
-/// `Read<'static>` while it borrows the group, so the lifetime alone cannot
-/// say that it owns them.
-#[derive(Debug)]
-pub(crate) struct OwnedRead(Read<'static>);
-
-impl std::ops::Deref for OwnedRead {
-    type Target = Read<'static>;
-
-    fn deref(&self) -> &Read<'static> {
-        &self.0
-    }
-}
-
 impl Read<'_> {
     /// The same read, owning its bytes.
-    pub(crate) fn into_owned(self) -> OwnedRead {
+    pub(crate) fn into_owned(self) -> Read<'static> {
         let own = |c: Cow<'_, [u8]>| Cow::Owned(c.into_owned());
-        OwnedRead(match self {
+        match self {
             Read::HasPk { tid, probe, keys } => Read::HasPk { tid, probe, keys: own(keys) },
             Read::KeySpans { tid, cols, claim } => Read::KeySpans { tid, cols, claim },
             Read::ReleasePreflight => Read::ReleasePreflight,
@@ -282,18 +240,18 @@ impl Read<'_> {
             Read::Unpin { snapshot } => Read::Unpin { snapshot },
             Read::SnapshotPage { snapshot, tid, page } => Read::SnapshotPage { snapshot, tid, page: own(page) },
             Read::Backup { dir } => Read::Backup { dir: own(dir) },
-        })
+        }
     }
 }
 
-impl<'a> From<Read<'a>> for SalRequest<'a> {
-    fn from(read: Read<'a>) -> Self {
+impl<'r> From<Read<'r>> for SalRequest<'r> {
+    fn from(read: Read<'r>) -> Self {
         SalRequest::Read(read)
     }
 }
 
-impl<'a> From<Apply<'a>> for SalRequest<'a> {
-    fn from(apply: Apply<'a>) -> Self {
+impl From<Apply<'static>> for SalRequest<'_> {
+    fn from(apply: Apply<'static>) -> Self {
         SalRequest::Apply(apply)
     }
 }
