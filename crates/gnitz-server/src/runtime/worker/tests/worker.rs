@@ -4,7 +4,7 @@ use crate::query::Lane;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::test_log;
-use crate::runtime::sal::{Cut, Routed, SalExcl, SalWriter};
+use crate::runtime::sal::{Cut, Routed, SalExcl, SalFull, SalWriter};
 use crate::runtime::w2m::fixtures::id;
 use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{
@@ -59,7 +59,7 @@ fn route(target_id: u64, request_id: u32, cut: u64) -> ReplyRoute {
 }
 
 /// Write `read` to every worker, answered on `request_id`.
-pub(super) fn ask(excl: &mut SalExcl, read: Read<'_>, request_id: u32) -> Result<(), WireFault> {
+pub(super) fn ask(excl: &mut SalExcl, read: Read<'_>, request_id: u32) -> Result<(), SalFull> {
     excl.read(read, WorkerSet::ALL, None, id(request_id))
 }
 

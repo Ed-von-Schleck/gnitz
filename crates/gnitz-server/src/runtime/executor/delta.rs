@@ -33,8 +33,8 @@ const DELTA_CUT_READS: usize = 64;
 /// The longest a SYNC_PUSHED is held, whatever wait it asks for.
 const SYNC_MAX_WAIT: Duration = Duration::from_secs(3600);
 
-/// The leases of one delta cut, one per read in the order given, or the one
-/// refusal that wrote none of them.
+/// The leases of one delta cut, one per read in the order given, or the
+/// refusal that ended it, the leases of the reads written ahead of it dropped.
 struct CutReads(Result<std::vec::IntoIter<(TrainLease, u64)>, WireFault>);
 
 impl CutReads {

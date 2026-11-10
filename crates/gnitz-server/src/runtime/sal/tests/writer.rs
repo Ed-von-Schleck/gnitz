@@ -1,7 +1,7 @@
 use super::fixtures::{control_push as to, group_at, scan, test_log, unanswered};
 use super::{
-    epoch_word, group_header_size, group_limit, Apply, Routed, SalExcl, SalMessageKind, SalScope, SalWriter, WorkerSet,
-    CHECKPOINT_RESERVE, PREFIX_BYTES,
+    epoch_word, group_header_size, group_limit, Apply, Routed, SalExcl, SalFull, SalMessageKind, SalScope, SalWriter,
+    WorkerSet, CHECKPOINT_RESERVE, PREFIX_BYTES,
 };
 use crate::catalog::SysFamily;
 use crate::runtime::reactor::test_support::make_reactor;
@@ -11,7 +11,6 @@ use crate::runtime::w2m::fixtures::id;
 use crate::runtime::w2m::RequestId;
 use crate::test_support::{make_batch, make_schema_u64_i64};
 use gnitz_store::relation::PkRule;
-use gnitz_wire::WireStatus;
 use gnitz_zset::schema::encode_schema_block;
 use std::task::Poll;
 
@@ -24,10 +23,8 @@ fn a_group_that_does_not_fit_is_refused_sal_full() {
     let log = test_log(PREFIX_BYTES + CHECKPOINT_RESERVE + cap, 1, 1);
     let refuse = |payload: usize| {
         let before = log.cursor();
-        let err = log
-            .try_forge(0, false, SalMessageKind::ScanSpec, &[&vec![0; payload]])
+        log.try_forge(0, false, SalMessageKind::ScanSpec, &[&vec![0; payload]])
             .expect_err("the group must be refused");
-        assert_eq!(err.status, WireStatus::SalFull);
         assert_eq!(log.cursor(), before, "the log is untouched");
     };
 
@@ -57,10 +54,9 @@ fn a_group_that_does_not_fit_is_refused_sal_full() {
 }
 
 /// With the cursor inside the checkpoint band, where a group of any other kind
-/// is refused, the band admits a `FlushEph`, a `Flush` and a `Shutdown` one
-/// behind the other.
+/// is refused, the band admits a `FlushEph` and a `Flush` one behind the other.
 #[test]
-fn the_checkpoint_band_admits_both_rounds_and_the_shutdown() {
+fn the_checkpoint_band_admits_both_rounds() {
     let cap = 1024;
     let log = test_log(PREFIX_BYTES + CHECKPOINT_RESERVE + cap, 1, 1);
     log.seek(cap as u64);
@@ -74,30 +70,21 @@ fn the_checkpoint_band_admits_both_rounds_and_the_shutdown() {
         ),
         ("a push", excl.write_group(&to(1))),
     ] {
-        let err = refused.expect_err(name);
-        assert_eq!(err.status, WireStatus::SalFull, "{name}");
+        refused.expect_err(name);
     }
     assert_eq!(log.cursor(), cap as u64, "a refused group leaves the log untouched");
 
     excl.apply(Apply::FlushEph { generation: 1 }, id(1))
         .expect("an ephemeral round fits the band");
     excl.apply(Apply::Flush, id(1)).expect("a base round fits behind it");
-    excl.shutdown().expect("and a shutdown behind both");
 
     let mut at = cap as u64;
-    let kinds = [(); 3].map(|()| {
+    let kinds = [(); 2].map(|()| {
         let msg = group_at(log.log(), at);
         at = msg.end;
         msg.head.request.kind
     });
-    assert_eq!(
-        kinds,
-        [
-            SalMessageKind::FlushEph,
-            SalMessageKind::Flush,
-            SalMessageKind::Shutdown
-        ]
-    );
+    assert_eq!(kinds, [SalMessageKind::FlushEph, SalMessageKind::Flush]);
     excl.write_group(&to(1)).expect_err("the band stays closed to a push");
 }
 
@@ -188,14 +175,13 @@ fn a_failed_unit_is_taken_back_and_the_rest_commits() {
     scope.write(&to(1), true).expect("group fits");
     let taken_back = scope.end();
     let oversized = vec![0u8; 1 << 20];
-    let err = scope
-        .all_or_nothing(|s| {
+    scope
+        .unit(|s| {
             s.write(&to(2), true)?;
             s.write(&to(3), false)?;
             s.write(&unanswered(&scan(4, &oversized)), true)
         })
         .expect_err("the last group of the unit does not fit");
-    assert_eq!(err.status, WireStatus::SalFull);
     assert_eq!(scope.end(), taken_back, "the staged end is restored");
     assert!(scope.commit().is_some(), "the zone before the unit closes");
     assert_eq!(log.cursor(), taken_back);
@@ -218,9 +204,10 @@ fn a_failed_unit_is_taken_back_and_the_rest_commits() {
     );
 }
 
-/// A unit taken back because its last group did not fit a nearly full ring,
-/// though it is within its kind's limit, calls for a checkpoint: the refusal is
-/// the writer's to remember, whatever the scope does with the unit.
+/// A unit taken back because its second group did not fit a nearly full ring
+/// is refused whole: the group behind the refused one is measured, not laid
+/// out. Within its kind's limit, the unit calls for a checkpoint: the refusal
+/// is the writer's to remember, whatever the scope does with the unit.
 #[test]
 fn a_taken_back_unit_a_checkpoint_may_admit_calls_for_one() {
     let cap = 1024;
@@ -232,14 +219,16 @@ fn a_taken_back_unit_a_checkpoint_may_admit_calls_for_one() {
     let mut excl = log.excl();
     let mut scope = excl.begin();
     let err = scope
-        .all_or_nothing(|s| {
+        .unit(|s| {
             s.write(&to(1), true)?;
-            assert!(!log.needs_checkpoint(), "the first group fits");
-            s.write(&to(2), true)
+            s.write(&to(2), true)?;
+            assert!(!log.needs_checkpoint(), "the unit is judged whole");
+            s.write(&to(3), true)
         })
         .expect_err("the second group does not fit");
-    assert_eq!(err.status, WireStatus::SalFull);
     assert_eq!(scope.end(), at, "the unit is taken back");
+    assert_eq!(err.end - at, 3 * one as u64, "the refusal spans the whole unit");
+    assert!(err.checkpoint_may_admit(), "within the limit, past the floor");
     assert!(log.needs_checkpoint(), "a checkpoint may admit the unit");
     assert_eq!(scope.commit(), None, "nothing was left to publish");
     assert_eq!(log.cursor(), at);
@@ -248,46 +237,31 @@ fn a_taken_back_unit_a_checkpoint_may_admit_calls_for_one() {
     assert!(!log.needs_checkpoint(), "the rewind clears the refusal");
 }
 
-/// A push's footprint is what laying it out advances the cursor by, a shared
-/// group's one payload and a per-worker group's several alike.
-#[test]
-fn a_footprint_is_the_cursor_advance() {
-    let log = test_log(1 << 20, 3, 1);
-    let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10), (2, 1, 20)]);
-    let record = encode_schema_block(batch.schema());
-    let each = [batch.wire_whole(), None, batch.wire_whole()];
-    let mut excl = log.excl();
-    let mut scope = excl.begin();
-    for (i, rows) in [Routed::Same(batch.wire_whole()), Routed::Each(&each)]
-        .into_iter()
-        .enumerate()
-    {
-        let (at, footprint) = (scope.end(), log.push_footprint(&record, rows));
-        scope
-            .push(16, PkRule::Enforce, &record, rows, false)
-            .expect("group fits");
-        assert_eq!(scope.end() - at, footprint as u64, "push {i}");
-    }
-}
-
-/// A checkpoint may make room for pushes a scope was refused exactly when they
-/// are within the limit of a push and the scope would lay them out past the
-/// checkpoint's floor, which is offset 0 in an epoch without an ephemeral
+/// A checkpoint may make room for a span of pushes exactly when it is within
+/// the limit of a push and starts past the checkpoint's floor, which is offset 0 in an epoch without an ephemeral
 /// round. Directly behind the `FlushEph`, the push of exactly what the
 /// checkpoint's groups leave of the limit is laid out, and one a byte larger is
 /// refused without calling for a checkpoint.
 #[test]
-fn a_checkpoint_may_admit_pushes_within_the_limit_refused_past_its_floor() {
+fn a_checkpoint_may_admit_a_unit_within_the_limit_refused_past_its_floor() {
     let ring = PREFIX_BYTES + CHECKPOINT_RESERVE + 4096;
     let log = test_log(ring, 1, 1);
     let limit = group_limit(SalMessageKind::Push, ring);
-    // Asked of a scope whose staged end is the published end, then of one
-    // with a group staged.
+    let span = |from: u64, bytes: usize| SalFull {
+        kind: SalMessageKind::Push,
+        end: from + bytes as u64,
+        may_admit: false,
+    };
+    // Asked of a span at the published end, then of one behind a staged group.
     let may_admit = |excl: &mut SalExcl, bytes: usize| {
+        let w = excl.writer;
         let mut scope = excl.begin();
-        let at_published_end = scope.checkpoint_may_admit_pushes(|| bytes);
+        let at_published_end = w.checkpoint_may_admit(scope.end(), &span(scope.end(), bytes));
         scope.write(&to(1), false).expect("group fits");
-        (at_published_end, scope.checkpoint_may_admit_pushes(|| bytes))
+        (
+            at_published_end,
+            w.checkpoint_may_admit(scope.end(), &span(scope.end(), bytes)),
+        )
     };
     let mut excl = log.excl();
     assert_eq!(may_admit(&mut excl, 8), (false, true), "an empty log");
@@ -312,20 +286,19 @@ fn a_checkpoint_may_admit_pushes_within_the_limit_refused_past_its_floor() {
 
     let payload = vec![0u8; left - PREFIX_BYTES - group_header_size(1)];
     let refuse = [&payload[..], &[0u8; 1]].concat();
-    let err = log
-        .try_forge(1, false, SalMessageKind::Push, &[&refuse])
+    log.try_forge(1, false, SalMessageKind::Push, &[&refuse])
         .expect_err("one byte past what the checkpoint leaves");
-    assert_eq!(err.status, WireStatus::SalFull);
     assert!(!log.needs_checkpoint(), "no checkpoint is called for at the floor");
     log.try_forge(1, false, SalMessageKind::Push, &[&payload])
         .expect("exactly what the checkpoint leaves");
     assert_eq!(log.cursor() as usize, limit);
 
-    let mut excl = log.excl();
+    let at = log.cursor();
     assert!(
-        excl.begin().checkpoint_may_admit_pushes(|| 8),
+        log.checkpoint_may_admit(at, &span(at, 8)),
         "a push is ahead of the floor"
     );
+    let mut excl = log.excl();
     excl.checkpoint_reset();
     assert_eq!(may_admit(&mut excl, 8), (false, true), "the rewind empties the log");
 }
@@ -361,7 +334,7 @@ fn a_committed_zoned_push_marks_the_writer_as_holding_pushes() {
     let mut scope = excl.begin();
     scope.ddl_sync(SysFamily::Table, &batch).expect("group fits");
     scope
-        .all_or_nothing(|s| {
+        .unit(|s| {
             push(s, true)?;
             s.write(&unanswered(&scan(4, &oversized)), true)
         })
@@ -511,7 +484,7 @@ fn a_read_joins_the_cut_of_the_read_written_directly_before_it() {
         let err = excl
             .read(scan(0, &oversized), WorkerSet::ALL, None, id(99))
             .expect_err("the read does not fit");
-        assert_eq!(err.status, WireStatus::SalFull);
+        assert_eq!(err.kind, SalMessageKind::ScanSpec);
     };
 
     let mut excl = log.excl();
@@ -558,7 +531,7 @@ fn a_read_joins_the_cut_of_the_read_written_directly_before_it() {
 }
 
 /// Dropping a `SalExcl` wakes each worker a group written under it reached —
-/// once, however many groups reached it — and no other; a `Shutdown` wakes at
+/// once, however many groups reached it — and no other; an apply wakes at
 /// its write.
 #[test]
 fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
@@ -578,7 +551,7 @@ fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
     assert_eq!(seqs(), [1, 0, 1, 0], "a worker reached twice is woken once");
 
     let mut excl = log.excl();
-    excl.shutdown().expect("group fits");
+    excl.apply(Apply::Flush, id(1)).expect("group fits");
     assert_eq!(
         seqs(),
         [2, 1, 2, 1],

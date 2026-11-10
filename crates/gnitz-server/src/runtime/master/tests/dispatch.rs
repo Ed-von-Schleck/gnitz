@@ -1,83 +1,14 @@
 use gnitz_store::relation::PkRule;
-use std::num::NonZero;
 
 use super::super::fixtures::test_dispatcher;
 use super::super::MasterDispatcher;
-use super::{check_workers, worker_death};
 use crate::catalog::{CatalogEngine, DdlBundle};
-use crate::runtime::reactor::test_support::{make_reactor, reactor_with_rings};
+use crate::runtime::reactor::test_support::reactor_with_rings;
 use crate::runtime::sal::fixtures::test_log;
 use crate::runtime::sal::{Apply, Inbound, Routed};
-use crate::runtime::test_support::{assert_child_exited_ok, empty_catalog, fork_child, within};
+use crate::runtime::test_support::{empty_catalog, within};
 use crate::runtime::w2m::fixtures::id;
-use gnitz_foundation::posix_io::retry_eintr;
 use gnitz_wire::{ColTabRow, WireFault, WireStatus};
-
-/// Fork a child that exits immediately, and wait until it is a zombie *without*
-/// reaping it, so the probe's own `waitpid(WNOHANG)` finds it on the first call.
-/// `waitpid` rejects `WNOWAIT`, hence `waitid`.
-fn spawn_zombie() -> NonZero<libc::pid_t> {
-    let pid = unsafe { fork_child(|| {}) };
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    retry_eintr(|| unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) })
-        .expect("waitid pre-sync");
-    NonZero::new(pid).unwrap()
-}
-
-/// The pid of a child already reaped, which every `waitpid` answers ECHILD.
-fn spawn_and_reap_dead() -> NonZero<libc::pid_t> {
-    let pid = unsafe { fork_child(|| {}) };
-    unsafe { assert_child_exited_ok(pid) };
-    NonZero::new(pid).unwrap()
-}
-
-/// A child that lives until it is killed, or until this thread exits.
-fn spawn_live() -> NonZero<libc::pid_t> {
-    // `PR_SET_PDEATHSIG` on the forking thread: a panicking test unwinds off
-    // this thread and takes the paused child with it, rather than orphaning it.
-    let pid = unsafe {
-        fork_child(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
-            libc::pause();
-        })
-    };
-    NonZero::new(pid).unwrap()
-}
-
-/// Kill and reap `pid`.
-fn kill(pid: NonZero<libc::pid_t>) {
-    unsafe {
-        libc::kill(pid.get(), libc::SIGKILL);
-        libc::waitpid(pid.get(), &mut 0, 0);
-    }
-}
-
-/// `check_workers` reports the first dead worker on every probe. Both dead arms
-/// are covered: worker 1's zombie is reaped by the first probe's own `waitpid`,
-/// and answers ECHILD on every probe after.
-#[test]
-fn check_workers_keeps_reporting_a_dead_worker() {
-    let live = spawn_live();
-    let pids = [live, spawn_zombie()];
-
-    assert_eq!(check_workers(&pids), Some(1), "the unreaped zombie is detected dead");
-    assert_eq!(check_workers(&pids), Some(1), "and still reported once reaped");
-
-    kill(live);
-}
-
-/// `worker_death` resolves with the dead worker's rank, here a pid every probe
-/// answers ECHILD for.
-#[test]
-fn worker_death_names_the_dead_worker() {
-    let live = spawn_live();
-    within(move || {
-        let reactor = make_reactor();
-        let pids = [live, spawn_and_reap_dead()];
-        assert_eq!(reactor.block_on(worker_death(&reactor, &pids)), 1);
-    });
-    kill(live);
-}
 
 /// A group written on an ACK lease ends on every worker's ACK; one the SAL has
 /// no room for is refused with the SAL's own status.
@@ -114,7 +45,7 @@ fn a_refused_tick_takes_no_round() {
     let (_tmp, engine) = empty_catalog();
     let (disp, _) = test_dispatcher(1, engine);
     let mut excl = disp.sal().excl();
-    let before = disp.rounds.round.get();
+    let before = disp.round.get();
 
     // Wider than the fixture's whole SAL.
     let e = disp
@@ -122,10 +53,10 @@ fn a_refused_tick_takes_no_round() {
         .map(drop)
         .expect_err("no room for the tick");
     assert_eq!(e.status, WireStatus::SalFull, "{e}");
-    assert_eq!(disp.rounds.round.get(), before, "the refused tick took no round");
+    assert_eq!(disp.round.get(), before, "the refused tick took no round");
 
     disp.emit_tick(&mut excl, &[7, 8]).expect("the tick fits");
-    assert_eq!(disp.rounds.round.get(), before + 2, "one round per relation ticked");
+    assert_eq!(disp.round.get(), before + 2, "one round per relation ticked");
     drop(excl);
     let mut reader = disp.sal().reader(0);
     let written = reader.next_request(|_, _| None);
@@ -138,6 +69,46 @@ fn a_refused_tick_takes_no_round() {
         "the tick written starts at the round behind the last one taken"
     );
     drop(written);
+    disp.into_catalog().close();
+}
+
+/// A view's last round is the last one that ticked a relation it reads,
+/// directly or through a view under it — taken at the write, with no ACK in —
+/// and a refused tick or a tick of other relations leaves it.
+#[test]
+fn a_views_last_round_is_the_last_tick_of_a_source() {
+    use crate::test_support::{col_def, register_identity_view};
+
+    let (_tmp, mut engine) = empty_catalog();
+    let cols = [col_def("id", gnitz_wire::TypeCode::U64)];
+    let [t, other] = ["public.t", "public.other"].map(|name| engine.create_table(name, &cols, &[0]).unwrap());
+    let under = register_identity_view(&mut engine, t, "under", &cols);
+    let view = register_identity_view(&mut engine, under, "v", &cols);
+    let (disp, _) = test_dispatcher(1, engine);
+    let mut excl = disp.sal().excl();
+    assert_eq!(disp.last_delta_round(view), 1, "no source ticked");
+
+    let first = disp.round.get() + 1;
+    let _unacked = disp.emit_tick(&mut excl, &[other, t, other]).expect("the tick fits");
+    assert_eq!(
+        disp.last_delta_round(view),
+        first + 1,
+        "the round of `t`, through the view under it"
+    );
+    assert_eq!(disp.last_delta_round(under), first + 1);
+
+    disp.emit_tick(&mut excl, &[other]).expect("the tick fits");
+    // Wider than the fixture's whole SAL.
+    let mut wide = vec![other; 2 << 17];
+    wide.push(t);
+    disp.emit_tick(&mut excl, &wide)
+        .map(drop)
+        .expect_err("no room for the tick");
+    assert_eq!(disp.last_delta_round(view), first + 1);
+
+    disp.forget_relation(t);
+    assert_eq!(disp.last_delta_round(view), 1, "a forgotten source holds no round");
+    drop((excl, _unacked));
     disp.into_catalog().close();
 }
 
@@ -173,7 +144,7 @@ fn refused_then_applied(
     );
     refused(&disp);
 
-    // No worker is launched, so the round's ACKs are in at once.
+    // At worker count 0 the round owes no ACK.
     drop(excl);
     disp.reactor().block_on(disp.checkpoint_base()).unwrap();
     disp.emit_zone(&mut disp.sal().excl(), |cat, sink| cat.apply_bundle(make(), sink))
@@ -303,7 +274,7 @@ fn the_boot_checkpoint_calls_for_no_other() {
     let (_tmp, engine) = empty_catalog();
     let (reactor, _) = reactor_with_rings(0);
     let sal = test_log(1 << 20, 0, 1).checkpoint_at(1);
-    let disp = MasterDispatcher::new(Vec::new(), engine, sal, reactor);
+    let disp = MasterDispatcher::new(engine, sal, reactor);
     disp.reactor().block_on(disp.boot_checkpoint()).unwrap();
     assert!(disp.sal().cursor() > 0, "the boot checkpoint's group is in the log");
     assert!(!disp.sal().needs_checkpoint());

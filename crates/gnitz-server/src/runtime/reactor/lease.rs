@@ -363,7 +363,7 @@ impl TrainLease {
     /// Worker `w`'s next frame, row-less ones included, with the range of its
     /// rows when it carries any; `None` once its train has ended. The terminal
     /// frame is the one carrying `scan_last`, and is handed out like the rest.
-    /// `Err` on a fault frame.
+    /// `Err` on a fault frame, which ends `w`'s train too.
     pub(crate) async fn frame_of(&self, w: usize) -> Result<Option<(W2mSlot, Option<Range<usize>>)>, WireFault> {
         if !self.left.get().contains(w) {
             return Ok(None);
@@ -371,6 +371,7 @@ impl TrainLease {
         let slot = self.next_slot(w).await;
         let ctrl = slot.control();
         if let Some(f) = ctrl.fault(slot.bytes()) {
+            self.left.set(self.left.get().without(w));
             return Err(f.in_context(format_args!("worker {w}: {}", self.what)));
         }
         debug_assert!(

@@ -6,6 +6,7 @@
 //! **Recovery order is a crash guard**: every step is placed so a crash at any
 //! point rebuilds a view rather than silently resuming a stale one.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::num::NonZero;
 use std::os::fd::AsRawFd;
@@ -16,7 +17,7 @@ use gnitz_foundation::fault::Seam;
 use crate::runtime::affinity;
 use crate::runtime::executor;
 use crate::runtime::listen;
-use crate::runtime::master::{worker_death, MasterDispatcher};
+use crate::runtime::master::{MasterDispatcher, Workers};
 use crate::runtime::mesh::{self, Mesh};
 use crate::runtime::park::WorkerParks;
 use crate::runtime::reactor::{check_host, Limits, Reactor};
@@ -199,8 +200,9 @@ fn worker_log(data_dir: &str, w: usize) -> String {
 }
 
 /// The forked child's whole life: latch its rank, redirect its logs to
-/// `worker_N.log`, recover, and run the worker loop. Never returns — the worker
-/// exits via `libc::_exit`.
+/// `worker_N.log`, recover, and run the worker loop. Never returns: a
+/// failed boot `_exit`s, and a worker that serves runs until it is killed or
+/// fail-stops.
 fn run_worker_child(
     slot: Slot,
     data_dir: &str,
@@ -270,14 +272,14 @@ fn master_pre_fork_recovery(mut opened: UnreplayedCatalog, tail: &CommittedTail)
 }
 
 /// Fork one child per worker, each of which never returns and takes its own
-/// ends with it. Yields the parent's pid list.
+/// ends with it. Yields the parent's children.
 fn fork_workers(
     catalog: &mut CatalogEngine,
     data_dir: &str,
     tail: &CommittedTail,
     workers: Vec<(W2mWriter, Mesh)>,
     pinning: Option<&affinity::Pinning>,
-) -> Result<Vec<NonZero<libc::pid_t>>, String> {
+) -> Result<Workers, String> {
     let master_pid = unsafe { libc::getpid() };
     let num_workers = workers.len() as u32;
     let mut worker_pids = Vec::with_capacity(workers.len());
@@ -296,7 +298,7 @@ fn fork_workers(
             pid => worker_pids.push(NonZero::new(pid).expect("fork answers the parent a child's pid")),
         }
     }
-    Ok(worker_pids)
+    Ok(Workers::new(worker_pids))
 }
 
 /// The master's half of recovery once the workers have recovered and the SAL is
@@ -418,43 +420,39 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
 
     let mut catalog = master_pre_fork_recovery(opened, &tail)?;
 
-    let worker_pids = fork_workers(&mut catalog, data_dir, &tail, workers, pinning.as_ref())?;
+    let workers = fork_workers(&mut catalog, data_dir, &tail, workers, pinning.as_ref())?;
 
     // --- Parent process ---
     let (reactor, ready) = Reactor::new(limits, receiver).map_err(|e| format!("io_uring init failed: {e}"))?;
-    // Both waits race a worker's death, which would leave them waiting forever.
-    let died = |w: usize| format!("worker {w} exited during recovery (log: {})", worker_log(data_dir, w));
-    let acked = reactor.block_on(async {
-        match select2(ready, worker_death(&reactor, &worker_pids)).await {
-            Either::A(acked) => Ok(acked),
-            Either::B(w) => Err(died(w)),
+    let serving = Cell::new(false);
+    let served = async {
+        let pushed = tail.pushed().clone();
+        let sal = SalWriter::boot(tail, parks, ready.await);
+        inject_recovery_panic("reset");
+        let dispatcher = MasterDispatcher::new(catalog, sal, reactor.clone());
+        master_post_fork_recovery(&dispatcher, pushed).await?;
+        let listeners = listen::bind_listeners(data_dir, &args.socket_path, tls)?;
+        serving.set(true);
+        executor::serve(dispatcher, args.backup_dir, listeners).await;
+        Ok(ServerExit::Clean)
+    };
+    // Raced against a worker's death, which would leave a wait of the recovery,
+    // or every request a worker answers, waiting forever. `workers` drops at the
+    // return, which kills them: after the final checkpoint, a death, or a
+    // failed recovery.
+    reactor.block_on(async {
+        match select2(served, workers.death(&reactor)).await {
+            Either::A(served) => served,
+            Either::B(w) if serving.get() => {
+                gnitz_error!("Worker {w} crashed (log: {}); workers stopped", worker_log(data_dir, w));
+                Ok(ServerExit::WorkerDied)
+            }
+            Either::B(w) => Err(format!(
+                "worker {w} exited during recovery (log: {})",
+                worker_log(data_dir, w)
+            )),
         }
-    })?;
-    let pushed = tail.pushed().clone();
-    let sal = SalWriter::boot(tail, parks, acked);
-    inject_recovery_panic("reset");
-
-    let dispatcher = MasterDispatcher::new(worker_pids, catalog, sal, reactor);
-    dispatcher.reactor().block_on(async {
-        match select2(
-            master_post_fork_recovery(&dispatcher, pushed),
-            dispatcher.worker_death(),
-        )
-        .await
-        {
-            Either::A(r) => r,
-            Either::B(w) => Err(died(w)),
-        }
-    })?;
-
-    let listeners = listen::bind_listeners(data_dir, &args.socket_path, tls)?;
-    match executor::run(dispatcher, args.backup_dir, listeners) {
-        None => Ok(ServerExit::Clean),
-        Some(w) => {
-            gnitz_error!("Worker {w} crashed (log: {}); workers stopped", worker_log(data_dir, w));
-            Ok(ServerExit::WorkerDied)
-        }
-    }
+    })
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! One-shot ops: an SQE that posts one CQE to one awaiter, the two meeting in a
-//! slot freed by the later of them. `fsync` is one; `conn` pushes the rest.
+//! slot freed by the later of them. `fsync` and `child_exit` are two; `conn`
+//! pushes the rest.
 
 use std::any::Any;
 
@@ -170,6 +171,16 @@ impl Reactor {
             .flags(types::FsyncFlags::DATASYNC)
             .build();
         // SAFETY: `fd` is open for the process's life; the SQE names no memory.
+        let op = unsafe { self.push_op(sqe, ()) };
+        self.ring.borrow_mut().submit();
+        op.await.0
+    }
+
+    /// Resolves once child `pid` has exited, leaving it a zombie (`WNOWAIT`) for
+    /// a later wait to reap. Yields the CQE `res`: 0, or a negative errno.
+    pub(crate) async fn child_exit(&self, pid: libc::pid_t) -> i32 {
+        let sqe = opcode::WaitId::new(libc::P_PID, pid as libc::id_t, libc::WEXITED | libc::WNOWAIT).build();
+        // SAFETY: the SQE names no memory: with no `infop`, no siginfo is written.
         let op = unsafe { self.push_op(sqe, ()) };
         self.ring.borrow_mut().submit();
         op.await.0

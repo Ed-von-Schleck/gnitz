@@ -201,7 +201,7 @@ fn a_keyed_push_of_rows_sharing_a_span_keeps_each_heap_within_the_pushed_one() {
 const NW: usize = 4;
 
 /// A registry holding one relation of `schema` placed by `placement`, id 16.
-fn registry(schema: SchemaDescriptor, placement: Placement) -> RelationRegistry {
+pub(super) fn registry(schema: SchemaDescriptor, placement: Placement) -> RelationRegistry {
     // A stream is storeless, so it registers without a directory.
     let mut registry = RelationRegistry::new("", gnitz_zset::algebra::Slot::SOLO, StoreConfig::default());
     let spec = RelationSpec {
@@ -216,7 +216,7 @@ fn registry(schema: SchemaDescriptor, placement: Placement) -> RelationRegistry 
 }
 
 /// `keys` of `stride`-byte big-endian ids, as a `PkSet` bound.
-fn pk_set(stride: usize, keys: &[u64]) -> ReadBound {
+pub(super) fn pk_set(stride: usize, keys: &[u64]) -> ReadBound {
     ReadBound::PkSet(pk_keys(stride, keys))
 }
 
@@ -270,6 +270,13 @@ fn a_read_reaches_the_owners_its_bound_names() {
         ("empty set", schema, keyed, Some(set(&[])), WorkerSet::one(0)),
         ("Local", schema, Placement::Local, Some(set(&[0, b])), WorkerSet::ALL),
         (
+            "Local, one key",
+            schema,
+            Placement::Local,
+            Some(set(&[42])),
+            WorkerSet::ALL,
+        ),
+        (
             "foreign stride",
             wide,
             Placement::full_pk(&wide),
@@ -317,6 +324,21 @@ fn a_probe_routes_by_the_store_it_reads() {
         assert_eq!(r.set, WorkerSet::one(owner(0)).with(owner(b)), "{own:?}");
         assert!(r.per_worker.is_some(), "{own:?}: each worker is sent its own keys");
     }
+    let one = pk_keys(8, &[b]).encode_probe();
+    let r = route_read(
+        &Read::HasPk {
+            tid: 16,
+            probe: Probe::Pk,
+            keys: (&one[..]).into(),
+        },
+        &replicated,
+        NW,
+    );
+    assert_eq!(
+        (r.set, r.per_worker),
+        (WorkerSet::one(owner(b)), None),
+        "one key, its one owner"
+    );
     let r = route_read(
         &scan(16, &ReadSpec::all_rows(pk_set(8, &[0, b])).encode()),
         &replicated,

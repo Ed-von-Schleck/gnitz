@@ -1,21 +1,23 @@
-//! Master-side dispatcher: the master's handle on its workers. It writes every
-//! master→worker request to the shared append-only log (SAL) as a group under a
-//! reply lease from the reactor, which routes the workers' W2M replies to that
-//! lease. The child `route` decides which workers a read or push reaches;
-//! `dispatch` holds its writes, the tick rounds they allocate and worker reaping.
+//! Master-side dispatcher: the master's catalog, SAL writer and reactor as one
+//! value. Every group a worker answers is written here, under the lease the
+//! reactor routes its W2M replies to: a read on a train lease, an apply on an
+//! ACK lease. A push group and a catalog zone, which no worker answers, are laid
+//! out here in a hold or scope of the caller's. The child `route` decides which
+//! workers a read or push reaches; `dispatch` holds the writes and the tick
+//! rounds they allocate; `workers` holds the worker processes.
 
 pub(crate) mod route;
 
 mod dispatch;
+mod workers;
 
-/// The inert dispatcher the unit tests of the `master` submodules and of the
-/// executor's write validation construct.
+/// A dispatcher with no processes behind it, for the tests and benchmarks that
+/// need one.
 #[cfg(test)]
 #[path = "tests/fixtures.rs"]
 pub(crate) mod fixtures;
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
-use std::num::NonZero;
 
 use rustc_hash::FxHashMap;
 
@@ -24,55 +26,33 @@ use crate::runtime::reactor::{Reactor, TrainLease};
 use crate::runtime::sal::{Read, SalExcl, SalWriter};
 use gnitz_wire::WireFault;
 
-pub(crate) use dispatch::worker_death;
+pub(crate) use workers::Workers;
 
 // ---------------------------------------------------------------------------
 // MasterDispatcher
 // ---------------------------------------------------------------------------
 
-pub struct MasterDispatcher {
-    /// One per worker, or none for a dispatcher with no processes behind it.
-    worker_pids: Vec<NonZero<libc::pid_t>>,
+pub(crate) struct MasterDispatcher {
     sal: SalWriter,
     /// The master's one event loop, which reads every worker's replies.
     reactor: Reactor,
     catalog: RefCell<CatalogEngine>,
-    /// The tick rounds the dispatcher's tick groups allocated.
-    rounds: TickRounds,
-}
-
-/// The tick rounds of a [`MasterDispatcher`]. `round` and `last_delta_round`
-/// grow under the SAL hold their tick groups are written under; a dropped
-/// relation's entries are removed under the catalog write guard.
-struct TickRounds {
-    /// The last tick round allocated, one per tid a tick group carries. Starts at 1, which is
-    /// never emitted, so `after_tick = 0` names no round.
+    /// The last tick round allocated, one per tid a tick group carries. Starts
+    /// at 1, which is never emitted, so `after_tick = 0` names no round. Grows
+    /// under the SAL hold its tick groups are written under.
     round: Cell<u64>,
-    /// Feed-enabled view id → the last round that reached it, absent reading as 1.
-    /// May name a round that left the view no rows; never misses one that did.
-    last_delta_round: RefCell<FxHashMap<u64, u64>>,
+    /// Ticked relation id → the last round that ticked it.
+    last_tick: RefCell<FxHashMap<u64, u64>>,
 }
 
 impl MasterDispatcher {
-    pub(crate) fn new(
-        worker_pids: Vec<NonZero<libc::pid_t>>,
-        catalog: CatalogEngine,
-        sal: SalWriter,
-        reactor: Reactor,
-    ) -> Self {
-        assert!(
-            worker_pids.is_empty() || worker_pids.len() == sal.num_workers(),
-            "the SAL is written at the worker count"
-        );
+    pub(crate) fn new(catalog: CatalogEngine, sal: SalWriter, reactor: Reactor) -> Self {
         MasterDispatcher {
-            worker_pids,
             sal,
             reactor,
             catalog: RefCell::new(catalog),
-            rounds: TickRounds {
-                round: Cell::new(1),
-                last_delta_round: RefCell::new(FxHashMap::default()),
-            },
+            round: Cell::new(1),
+            last_tick: RefCell::default(),
         }
     }
 
@@ -94,15 +74,6 @@ impl MasterDispatcher {
     /// The master's event loop.
     pub(crate) fn reactor(&self) -> &Reactor {
         &self.reactor
-    }
-
-    pub(crate) fn num_workers(&self) -> usize {
-        self.sal.num_workers()
-    }
-
-    /// Drop a dropped relation's last delta round.
-    pub(crate) fn forget_relation(&self, id: u64) {
-        self.rounds.last_delta_round.borrow_mut().remove(&id);
     }
 
     /// The scan-shaped requests `build` writes as one
@@ -145,7 +116,7 @@ impl<'d> ScanCut<'d> {
     /// own key set when the bound splits one, under a reply id leased for them;
     /// the lease its replies are read through.
     pub(crate) fn read(&mut self, read: Read<'_>) -> Result<TrainLease, WireFault> {
-        let route = route::route_read(&read, &self.disp.cat().registry, self.disp.num_workers());
+        let route = route::route_read(&read, &self.disp.cat().registry, self.disp.sal.num_workers());
         let lease = self.disp.reactor.lease_train(route.set, read.name());
         debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
         self.excl

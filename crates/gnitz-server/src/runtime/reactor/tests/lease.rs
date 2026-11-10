@@ -140,6 +140,30 @@ fn a_passing_frame_is_copied_out_unless_its_reader_waits_on_its_worker() {
     assert_eq!(slot.bytes(), last.encode_to_vec());
 }
 
+/// A fault frame is its worker's last: the lease reports it once, then reads
+/// the remaining workers' trains without waiting on the faulted one again.
+#[test]
+fn a_fault_frame_ends_its_workers_train() {
+    let (r, lease, mut writers) = train_lease(2, "ScanSpec");
+    let fault = gnitz_wire::WireFault::from("no such store");
+    writers[0].send_msg(lease.id(), &WireMsg::fault(&fault));
+    writers[1].send_msg(lease.id(), &WireMsg::train_frame(0, true, None));
+    r.drain_all_w2m();
+
+    let err = try_poll_once(lease.next())
+        .expect("routed")
+        .map(drop)
+        .expect_err("worker 0 faulted");
+    assert!(err.text.starts_with("worker 0: ScanSpec"), "{err}");
+    assert!(
+        matches!(try_poll_once(lease.frame_of(0)), Some(Ok(None))),
+        "worker 0 owes no further frame"
+    );
+    try_poll_once(lease.finish())
+        .expect("only worker 1 is waited on")
+        .expect("no second fault");
+}
+
 /// A wait dropped while parked on one worker no longer counts as the reader
 /// parked there once the reader parks on another.
 #[test]

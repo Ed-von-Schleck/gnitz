@@ -71,7 +71,8 @@ impl<'c> WorkerProcess<'c> {
 
     // ── Main event loop ────────────────────────────────────────────────
 
-    /// Serve the SAL until a `Shutdown` exits the process.
+    /// Serve the SAL until the process is killed or fail-stops: no request ends
+    /// the loop.
     pub fn run(&mut self) -> ! {
         loop {
             // An owed reply goes out without waiting on the SAL, unless the ring
@@ -93,7 +94,7 @@ impl<'c> WorkerProcess<'c> {
         self.w2m_writer.short_of_room() || self.sendable().next().is_none()
     }
 
-    /// Process all pending SAL message groups. Shutdown `_exit`s inline.
+    /// Process all pending SAL message groups.
     fn drain_sal(&mut self) {
         self.emit_reply_frame();
         while self.serve_next(false).is_some() {
@@ -116,7 +117,6 @@ impl<'c> WorkerProcess<'c> {
             .sal_reader
             .next_request(|tid, record| cat.known_decode(tid, record))?
         {
-            Inbound::Shutdown => unsafe { libc::_exit(0) },
             Inbound::Read { route, read } => {
                 // A drive writes views, so a read of one would see the tick
                 // half-run: it parks, owning its bytes, since the drive reads

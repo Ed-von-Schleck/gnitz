@@ -16,7 +16,6 @@ use gnitz_zset::schema::encode_schema_block;
 fn every_request() -> Vec<SalRequest<'static>> {
     let cols = PkColList::from_slice(&[3, 1]);
     vec![
-        SalRequest::Shutdown,
         Apply::Flush.into(),
         Apply::FlushEph { generation: 11 }.into(),
         Apply::DdlSync { family: SysFamily::Sequence }.into(),
@@ -86,7 +85,6 @@ fn every_request_decodes_from_its_written_group() {
             let group = match request {
                 SalRequest::Read(read) => Group::read(read, WorkerSet::ALL, None, id(1)),
                 SalRequest::Apply(apply) => Group::apply(apply, id(1)),
-                SalRequest::Shutdown => Group::shutdown(),
             };
             (request, group)
         })

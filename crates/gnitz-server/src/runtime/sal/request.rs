@@ -85,7 +85,6 @@ pub(crate) enum Apply<'a> {
 pub(super) enum SalRequest<'r> {
     Read(Read<'r>),
     Apply(Apply<'static>),
-    Shutdown,
 }
 
 impl Apply<'_> {
@@ -149,7 +148,6 @@ impl<'r> SalRequest<'r> {
     pub(super) fn decode(head: &RequestHead, blob: &'r [u8]) -> Result<Self, String> {
         let RequestHead { kind, target_id: tid, arg0, arg1 } = *head;
         Ok(match kind {
-            SalMessageKind::Shutdown => SalRequest::Shutdown,
             SalMessageKind::Flush => Apply::Flush.into(),
             SalMessageKind::FlushEph => Apply::FlushEph { generation: arg0 }.into(),
             SalMessageKind::DdlSync => Apply::DdlSync {

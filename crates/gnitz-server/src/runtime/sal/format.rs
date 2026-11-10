@@ -49,7 +49,6 @@ gnitz_wire::wire_enum! {
     /// `ALL`/`from_wire` come from the one variant list, so a decode cannot fall
     /// behind the enum.
     pub(super) enum SalMessageKind: u8 {
-        Shutdown = 1,
         Flush = 2,
         FlushEph = 3,
         DdlSync = 4,

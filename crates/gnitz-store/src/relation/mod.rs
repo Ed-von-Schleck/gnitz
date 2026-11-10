@@ -694,14 +694,6 @@ impl RelationRegistry {
     fn unregistered(id: u64) -> String {
         format!("relation {id} is not registered")
     }
-
-    /// The ids of the registered relations that carry a delta feed.
-    pub fn delta_fed(&self) -> impl Iterator<Item = u64> + '_ {
-        self.relations
-            .iter()
-            .filter(|(_, r)| r.kind().has_delta_feed())
-            .map(|(&id, _)| id)
-    }
 }
 
 // ---------------------------------------------------------------------------

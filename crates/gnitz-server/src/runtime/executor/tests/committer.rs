@@ -12,7 +12,7 @@ use crate::runtime::master::fixtures::test_dispatcher;
 use crate::runtime::sal::Routed;
 use crate::runtime::test_support::{empty_catalog, try_poll_once, within};
 use crate::test_support::{col_def, make_batch_bytes, make_batch_raw, make_schema_u64_i64};
-use gnitz_wire::{TableDistribution, TableProps, TypeCode, WireConflictMode};
+use gnitz_wire::{TableDistribution, TableProps, TypeCode, WireConflictMode, WireStatus};
 use gnitz_zset::repr::MemBatch;
 use std::time::Duration;
 
@@ -275,7 +275,10 @@ fn workerless_committer(engine: CatalogEngine) -> (Rc<Shared>, impl Sized) {
 /// checkpoint leaves commits behind one checkpoint. A write larger than that
 /// room is answered `SalFull` once it is refused directly behind a checkpoint,
 /// which calls for no further one; a write over the limit is answered `SalFull`
-/// where it is first refused. The committer goes on to commit what follows.
+/// where it is first refused. A write of several families is measured whole,
+/// its families behind the one refused included: over the limit, it fails at
+/// once; within it, it goes again. The committer goes on to commit what
+/// follows.
 #[test]
 fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
     within(|| {
@@ -286,7 +289,8 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
             ..Default::default()
         };
         let cols = [col_def("id", TypeCode::U64), col_def("s", TypeCode::String)];
-        let tid = engine.create_table_with("public.t", &cols, &[0], replicated).unwrap();
+        let [tid, tid_b, tid_c] = ["public.t", "public.b", "public.c"]
+            .map(|name| engine.create_table_with(name, &cols, &[0], replicated).unwrap());
         let (shared, _asks) = workerless_committer(engine);
         let disp = &shared.dispatcher;
         let sal = disp.sal();
@@ -307,11 +311,16 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
             assert_eq!(got, footprint);
             batch
         };
-        let commit = |footprint: Option<usize>| {
-            let family = TxnFamily::new(tid, WireConflictMode::Update, FamilyRows::Built(rows(footprint)));
+        let commit_all = |families: &[(u64, Option<usize>)]| {
+            let families = (families.iter())
+                .map(|&(tid, footprint)| {
+                    TxnFamily::new(tid, WireConflictMode::Update, FamilyRows::Built(rows(footprint)))
+                })
+                .collect();
             disp.reactor()
-                .block_on(shared.committer.write(vec![family], HeldTables::default()))
+                .block_on(shared.committer.write(families, HeldTables::default()))
         };
+        let commit = |footprint: Option<usize>| commit_all(&[(tid, footprint)]);
 
         // No ephemeral round yet: the floor is offset 0.
         let limit = sal.push_room();
@@ -349,5 +358,18 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
         assert_eq!(e.status, WireStatus::SalFull, "{e}");
         commit(None).expect("the committer serves the next write");
         assert_eq!(sal.epoch(), 4, "no checkpoint is run for a write over the limit");
+
+        // Three families, each within the room, refused at the second behind
+        // the small write: the third counted, the write is over the limit.
+        let half = Some(room / 2);
+        let e = commit_all(&[(tid, half), (tid_b, half), (tid_c, half)]).expect_err("no log holds it");
+        assert_eq!(e.status, WireStatus::SalFull, "{e}");
+        commit(None).expect("the committer serves the next write");
+        assert_eq!(sal.epoch(), 4, "no checkpoint is run for it, nor called for by it");
+
+        // Two such families are within the room: refused at the second, the
+        // write goes again, and commits directly behind the checkpoint.
+        commit_all(&[(tid, half), (tid_b, half)]).expect("the write fits behind a checkpoint");
+        assert_eq!(sal.epoch(), 5, "one checkpoint made room");
     });
 }

@@ -48,6 +48,13 @@ pub(crate) fn test_log(size: usize, workers: usize, epoch: u32) -> SalWriter {
 }
 
 impl SalWriter {
+    /// The log bytes a push of `rows` under the schema record `record` occupies,
+    /// wherever [`SalScope::push`] lays it out. Neither its target nor its rule
+    /// sizes a group.
+    pub(crate) fn push_footprint(&self, record: &[u8], rows: Routed<'_>) -> usize {
+        self.footprint(&Group::push(0, PkRule::Enforce, record, rows))
+    }
+
     /// Every worker's park: where the writer's wakes land.
     pub(crate) fn parks(&self) -> WorkerParks {
         self.parks
@@ -132,7 +139,7 @@ impl SalWriter {
         zoned: bool,
         kind: SalMessageKind,
         payloads: &[&[u8]],
-    ) -> Result<u64, WireFault> {
+    ) -> Result<u64, SalFull> {
         let written = || payloads.iter().enumerate().filter(|(_, p)| !p.is_empty());
         let sizes: Vec<usize> = written().map(|(_, p)| p.len()).collect();
         let request = RequestHead {
@@ -144,7 +151,11 @@ impl SalWriter {
         let head = GroupHead::new(request, zoned, false, false, None, written().map(|(w, _)| w).collect());
         let bytes: Vec<&[u8]> = written().map(|(_, p)| *p).collect();
         let base = self.cursor();
-        let end = self.write_slots(base, head, &sizes, |i, slot| slot.copy_from_slice(bytes[i]))?;
+        let end =
+            (self.write_slots(base, head, &sizes, |i, slot| slot.copy_from_slice(bytes[i]))).map_err(|mut full| {
+                self.judge(base, &mut full);
+                full
+            })?;
         self.publish(base);
         self.seek(end);
         Ok(base)
@@ -237,7 +248,7 @@ impl SalWriter {
 
 impl SalExcl<'_> {
     /// Write and publish `g` outside every zone, whatever its shape.
-    pub(in crate::runtime::sal) fn write(&mut self, g: &Group) -> Result<(), WireFault> {
+    pub(in crate::runtime::sal) fn write(&mut self, g: &Group) -> Result<(), SalFull> {
         self.write_group(g)
     }
 
@@ -249,13 +260,7 @@ impl SalExcl<'_> {
     /// A push of `rows` into `tid` sent whole to every worker and acknowledged
     /// on `ack`: a shape no production writer frames, since a push is answered
     /// by none.
-    pub(crate) fn acked_push(
-        &mut self,
-        tid: u64,
-        record: &[u8],
-        rows: &Batch,
-        ack: RequestId,
-    ) -> Result<(), WireFault> {
+    pub(crate) fn acked_push(&mut self, tid: u64, record: &[u8], rows: &Batch, ack: RequestId) -> Result<(), SalFull> {
         self.write_group(&Group {
             reply: Some(ack),
             ..Group::push(tid, PkRule::Enforce, record, Routed::Same(rows.wire_whole()))

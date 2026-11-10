@@ -1,10 +1,10 @@
+use super::tests::{pk_set, registry};
 use super::*;
 use crate::runtime::sal::fixtures::{scan, test_log};
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_store::relation::PkRule;
-use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
-use gnitz_wire::{PkKeys, ReadBound, ReadSpec, TypeCode};
+use gnitz_wire::{ReadBound, ReadSpec, TypeCode};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::encode_schema_block;
@@ -101,17 +101,8 @@ fn push_group_layout_bench() {
 fn route_read_pkset_bench() {
     const KEYS: u64 = 100_000;
     let schema = pk_only_schema(&[TypeCode::U64]);
-    let mut registry = RelationRegistry::new("", gnitz_zset::algebra::Slot::SOLO, StoreConfig::default());
-    let spec = RelationSpec {
-        id: 16,
-        kind: RelationKind::Stream,
-        placement: Placement::full_pk(&schema),
-        pk_repeats: false,
-        compress: false,
-    };
-    registry.register(spec, schema).unwrap();
-    let keys: Vec<[u8; 8]> = (0..KEYS).map(u64::to_be_bytes).collect();
-    let blob = ReadSpec::all_rows(ReadBound::PkSet(PkKeys::from_keys(8, keys.iter().map(|k| &k[..])))).encode();
+    let registry = registry(schema, Placement::full_pk(&schema));
+    let blob = ReadSpec::all_rows(pk_set(8, &(0..KEYS).collect::<Vec<_>>())).encode();
     let read = scan(16, &blob);
     let counter = Counter::instructions();
     for nw in [4usize, 16] {
@@ -122,6 +113,37 @@ fn route_read_pkset_bench() {
         println!(
             "route_read_pkset_bench nw={nw:<2} {KEYS} keys {:>6.1} instr/key",
             instructions as f64 / KEYS as f64
+        );
+    }
+}
+
+/// What the master pays to route one small read, in instructions per read: a
+/// scan of the whole relation, and scans bounded by a PK set of one key, which
+/// the placement's point query routes, and of eight, which is split among its
+/// owners.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn route_read_small_bench() {
+    const READS: u64 = 10_000;
+    let schema = pk_only_schema(&[TypeCode::U64]);
+    let registry = registry(schema, Placement::full_pk(&schema));
+    let keys = |n: u64| ReadSpec::all_rows(pk_set(8, &(0..n).collect::<Vec<_>>())).encode();
+    let counter = Counter::instructions();
+    let whole = ReadSpec::all_rows(ReadBound::None).encode();
+    for (name, blob) in [("whole", whole), ("1 key", keys(1)), ("8 keys", keys(8))] {
+        let read = scan(16, &blob);
+        let run = || {
+            counter.measure(|| {
+                for _ in 0..READS {
+                    std::hint::black_box(route_read(std::hint::black_box(&read), &registry, 4));
+                }
+            })
+        };
+        run();
+        let ((), instructions) = run();
+        println!(
+            "route_read_small_bench nw=4 {name:<6} {:>7.1} instr/read",
+            instructions as f64 / READS as f64
         );
     }
 }

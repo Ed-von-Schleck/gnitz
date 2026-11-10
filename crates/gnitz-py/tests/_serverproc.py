@@ -378,7 +378,7 @@ class ServerProc:
     def stop_graceful(self, timeout=30):
         """SIGTERM the *master only* (not the process group), so its shutdown
         watcher can drive a final checkpoint (which needs live workers to ACK
-        the flush) before broadcasting Shutdown and exiting. A non-zero exit
+        the flush) before killing them and exiting. A non-zero exit
         means that checkpoint failed and the shards a caller is about to read
         are still in the SAL, so it fails here rather than at each call site."""
         assert self.proc is not None, "no running server"

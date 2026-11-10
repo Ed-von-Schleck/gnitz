@@ -1,7 +1,7 @@
 //! One group as the writer encodes it: the request its header carries, plus
 //! the rows or blob each worker is sent.
 
-use super::format::{payload_size, PayloadRows, RequestHead, SalMessageKind};
+use super::format::{payload_size, PayloadRows, RequestHead};
 use super::request::{Apply, Read};
 use crate::catalog::SysFamily;
 use crate::runtime::park::WorkerSet;
@@ -88,18 +88,6 @@ impl<'a> Group<'a> {
             data: Payloads::Shared(None),
             to: WorkerSet::ALL,
             reply: Some(ack),
-        }
-    }
-
-    /// The broadcast that ends every worker, which nothing answers.
-    pub(super) fn shutdown() -> Self {
-        Group {
-            request: RequestHead::new(SalMessageKind::Shutdown, 0, 0, 0),
-            blob: &[],
-            reads: false,
-            data: Payloads::Shared(None),
-            to: WorkerSet::ALL,
-            reply: None,
         }
     }
 

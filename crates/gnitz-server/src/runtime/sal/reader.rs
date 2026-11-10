@@ -51,7 +51,6 @@ pub(crate) enum Inbound<'a> {
         /// those moves, for a request that carries none as well.
         rows: Option<Box<Batch>>,
     },
-    Shutdown,
 }
 
 pub(crate) struct SalReader {
@@ -165,7 +164,6 @@ impl SalReader {
                 apply,
                 rows: rows.take().map(Box::new),
             },
-            SalRequest::Shutdown => Inbound::Shutdown,
         })
     }
 

@@ -145,13 +145,8 @@ impl Shared {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Serve `listeners` until a shutdown signal (`None`) or a worker's death
-/// (`Some(rank)`), having killed and reaped the remaining workers.
-pub(super) fn run(
-    dispatcher: MasterDispatcher,
-    backup_dir: Option<String>,
-    listeners: Vec<ClientListener>,
-) -> Option<usize> {
+/// Serve `listeners` until a shutdown signal, having run the final checkpoint.
+pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<String>, listeners: Vec<ClientListener>) {
     let reactor = dispatcher.reactor().clone();
     let hello_timeout = Duration::from_millis(gnitz_foundation::env::env_num(
         "GNITZ_HELLO_TIMEOUT_MS",
@@ -174,20 +169,7 @@ pub(super) fn run(
     reactor.spawn(tick::tick_loop(Rc::clone(&shared), tick_rx));
     reactor.spawn(delta::pump(Rc::clone(&shared), asks));
 
-    reactor.block_on(async move {
-        match select2(
-            serve_until_signalled(&shared, tls.as_deref()),
-            shared.dispatcher.worker_death(),
-        )
-        .await
-        {
-            Either::A(()) => None,
-            Either::B(crashed) => {
-                shared.dispatcher.kill_workers();
-                Some(crashed)
-            }
-        }
-    })
+    serve_until_signalled(&shared, tls.as_deref()).await
 }
 
 // ---------------------------------------------------------------------------
@@ -308,8 +290,7 @@ const SIGNAL_POLL: Duration = Duration::from_millis(100);
 
 /// Until SIGTERM/SIGINT: poke the committer whenever the SAL wants a checkpoint.
 /// Then, with [`Committer::write`] and [`Committer::backup`] refusing since the
-/// signal, run one final checkpoint behind every write it admitted, and stop the
-/// workers.
+/// signal, run one final checkpoint behind every write it admitted.
 async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>) {
     loop {
         shared.dispatcher.reactor().sleep(SIGNAL_POLL).await;
@@ -324,7 +305,6 @@ async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>) {
             // of the request and then run the final checkpoint over them, whose
             // drain ticks every push no tick has taken yet.
             shared.committer.final_checkpoint().await;
-            shared.dispatcher.shutdown_workers().await;
             return;
         }
 

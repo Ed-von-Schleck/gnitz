@@ -11,7 +11,7 @@ use super::Shared;
 use crate::runtime::signals;
 use crate::runtime::sync::{chan, oneshot};
 use gnitz_store::relation::PkRule;
-use gnitz_wire::{WireFault, WireStatus};
+use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;
 use rustc_hash::FxHashMap;
 use smallvec::{smallvec, SmallVec};
@@ -464,7 +464,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
         let mut refused_at = None;
         for (at, unit) in s.units.iter_mut().enumerate() {
             let mut unit_in_zone = false;
-            let written = scope.all_or_nothing(|scope| {
+            let written = scope.unit(|scope| {
                 for f in unit.laid() {
                     unit_in_zone |= disp.write_commit_group(scope, f.tid, f.pk_rule, f.rows.view())?;
                 }
@@ -479,17 +479,11 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
                 // A merged run goes again as the writes it merged; a unit of one
                 // write, if a checkpoint may make room for it. The unit was taken
                 // back, so the scope's next group starts where the unit did.
-                Err(e)
-                    if e.status == WireStatus::SalFull
-                        && (unit.is_merged()
-                            || scope.checkpoint_may_admit_pushes(|| {
-                                disp.commit_footprint(unit.laid().iter().map(|f| (f.tid, f.rows.view())))
-                            })) =>
-                {
+                Err(full) if unit.is_merged() || full.checkpoint_may_admit() => {
                     refused_at = Some(at);
                     break;
                 }
-                Err(e) => unit.outcome = Outcome::Failed(e),
+                Err(full) => unit.outcome = Outcome::Failed(full.into()),
             }
         }
         // Allocates only on the refusal path; `s.units` keeps the units that

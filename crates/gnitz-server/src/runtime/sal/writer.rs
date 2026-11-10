@@ -36,26 +36,22 @@ static ZONE_PANIC: Seam = Seam::new("GNITZ_INJECT_SAL_ZONE_PANIC");
 const PAYLOAD_PWRITE_BYTES: usize = 4096;
 
 /// Space only a checkpoint's two rounds — the base round's `Flush`, the
-/// ephemeral round's `FlushEph` — and the `Shutdown` broadcast may spend, so
-/// those always fit.
+/// ephemeral round's `FlushEph` — may spend, so those always fit.
 const CHECKPOINT_RESERVE: usize = 64 << 10;
 
 const _: () = {
     let control_only = PREFIX_BYTES + group_header_size(1) + PAYLOAD_HEAD;
     assert!(
-        CHECKPOINT_RESERVE >= 3 * control_only,
-        "the checkpoint band must hold three control-only groups: one epoch can spend it on a FlushEph, a Flush and a Shutdown"
+        CHECKPOINT_RESERVE >= 2 * control_only,
+        "the checkpoint band must hold two control-only groups: one epoch can spend it on a FlushEph and a Flush"
     );
 };
 
 /// The highest byte a group of `kind` may occupy: its end prefix stays free,
-/// and so does the checkpoint band unless the group is one of the three that
+/// and so does the checkpoint band unless the group is one of the two that
 /// must never be refused.
 fn group_limit(kind: SalMessageKind, ring_len: usize) -> usize {
-    let band = if matches!(
-        kind,
-        SalMessageKind::Flush | SalMessageKind::FlushEph | SalMessageKind::Shutdown
-    ) {
+    let band = if matches!(kind, SalMessageKind::Flush | SalMessageKind::FlushEph) {
         0
     } else {
         CHECKPOINT_RESERVE
@@ -67,6 +63,35 @@ const _: () = assert!(
     PREFIX_BYTES + CHECKPOINT_RESERVE < MIN_SAL_BYTES / 64,
     "the checkpoint reserve must leave ordinary groups nearly all of the smallest SAL"
 );
+
+/// A span of groups the log had no room for: one group, or a unit of a scope
+/// ([`SalScope::unit`]).
+#[derive(Debug)]
+pub(crate) struct SalFull {
+    /// The kind of the group refused.
+    kind: SalMessageKind,
+    /// Where the span would have ended.
+    end: u64,
+    /// See [`Self::checkpoint_may_admit`].
+    may_admit: bool,
+}
+
+impl SalFull {
+    /// Whether a checkpoint may make room for the span; see
+    /// [`SalWriter::checkpoint_may_admit`].
+    pub(crate) fn checkpoint_may_admit(&self) -> bool {
+        self.may_admit
+    }
+}
+
+impl From<SalFull> for WireFault {
+    fn from(full: SalFull) -> Self {
+        WireFault {
+            status: WireStatus::SalFull,
+            text: format!("SAL full: {:?} group did not fit", full.kind),
+        }
+    }
+}
 
 /// The tag of a [`SalWriter`]'s lock.
 enum SalLock {}
@@ -85,7 +110,7 @@ pub(crate) struct SalWriter {
     /// checkpoint left in the log; 0 while the epoch has none. Set where
     /// [`SalExcl::apply`] writes one, cleared by [`Self::rewind`].
     checkpoint_floor: Cell<u64>,
-    /// A group a checkpoint may admit ([`Self::checkpoint_may_admit`]) was
+    /// A span a checkpoint may admit ([`Self::checkpoint_may_admit`]) was
     /// refused since the last rewind, so a checkpoint is warranted whatever the
     /// write cursor says. Cleared by [`Self::rewind`].
     refused_transient: Cell<bool>,
@@ -150,43 +175,54 @@ impl SalWriter {
         self.parks.len()
     }
 
-    /// The log bytes a push of `rows` under the schema record `record` occupies,
-    /// wherever [`SalScope::push`] lays it out. Neither its target nor its rule
-    /// sizes a group.
-    pub(crate) fn push_footprint(&self, record: &[u8], rows: Routed<'_>) -> usize {
-        let mut sizes = [0usize; MAX_WORKERS];
-        let payloads = Group::push(0, PkRule::Enforce, record, rows).sizes(self.parks.len(), &mut sizes);
-        let sizes = &sizes[..payloads.len()];
-        group_total_size(group_header_size(sizes.len()), sizes.iter().copied())
+    /// Whether a checkpoint may make room for the span refused on `full`, which
+    /// starts at `from`: `from` lies past
+    /// `checkpoint_floor`, and the span is within its kind's [`group_limit`],
+    /// so something other than a checkpoint's own groups is ahead of it in the
+    /// log. A checkpoint removes that and nothing else; what it leaves ahead in
+    /// its place is its own groups, whose size this does not predict, so the
+    /// answer is "may". A span refused directly at the floor — offset 0 in an
+    /// epoch without an ephemeral round — has nothing ahead of it a checkpoint
+    /// would remove.
+    fn checkpoint_may_admit(&self, from: u64, full: &SalFull) -> bool {
+        let limit = group_limit(full.kind, self.log.ring_len) as u64;
+        from > self.checkpoint_floor.get() && full.end - from <= limit
     }
 
-    /// Whether a checkpoint may make room for groups refused at `base`, `bytes`
-    /// sizing them and `limit` being their kind's [`group_limit`]: `base` lies
-    /// past `checkpoint_floor`, and they are within the limit, so something other than
-    /// a checkpoint's own groups is ahead of them in the log. A checkpoint
-    /// removes that and nothing else; what it leaves ahead in its place is its
-    /// own groups, whose size this does not predict, so the answer is "may".
-    /// Groups refused directly at the floor — offset 0 in an epoch without an
-    /// ephemeral round — have nothing ahead of them a checkpoint would remove.
-    /// `bytes` runs only when `base` leaves the question open.
-    fn checkpoint_may_admit(&self, limit: usize, base: u64, bytes: impl FnOnce() -> usize) -> bool {
-        base > self.checkpoint_floor.get() && bytes() <= limit
+    /// Answer [`Self::checkpoint_may_admit`] on `full`, and call for a
+    /// checkpoint if so. Judged by whoever owns the span: what a retry lays
+    /// out again.
+    fn judge(&self, from: u64, full: &mut SalFull) {
+        full.may_admit = self.checkpoint_may_admit(from, full);
+        if full.may_admit {
+            self.refused_transient.set(true);
+        }
+    }
+
+    /// The log bytes `g` occupies, wherever it is laid out.
+    fn footprint(&self, g: &Group) -> usize {
+        let mut sizes = [0usize; MAX_WORKERS];
+        let payloads = g.sizes(self.parks.len(), &mut sizes);
+        group_total_size(
+            group_header_size(payloads.len()),
+            sizes[..payloads.len()].iter().copied(),
+        )
     }
 
     /// Lay one group out at `base`, which is at or past the published end, `fill`
     /// writing the bytes of each payload, named by its directory index, and return the group's
     /// end — the group is complete on the log but for its digest, and
     /// unpublished; [`Self::publish`] does both. Moves no writer position. A
-    /// group that does not fit is refused with [`WireStatus::SalFull`] and leaves
-    /// the log untouched; the refusal reaches clients verbatim, so `base` goes
-    /// to the operator log instead. A zone member checksums its payload bytes.
+    /// group that does not fit is refused and leaves the log untouched; the
+    /// refusal reaches clients verbatim, so `base` goes to the operator log
+    /// instead. A zone member checksums its payload bytes.
     fn write_slots(
         &self,
         base: u64,
         head: GroupHead,
         sizes: &[usize],
         mut fill: impl FnMut(usize, &mut [u8]),
-    ) -> Result<u64, WireFault> {
+    ) -> Result<u64, SalFull> {
         let epoch = self.epoch.get();
         assert!(
             epoch >= 1,
@@ -204,11 +240,6 @@ impl SalWriter {
         let total = group_total_size(hdr_size, sizes.iter().copied());
         let cap = group_limit(head.request.kind, self.log.ring_len);
         if total > cap.saturating_sub(base as usize) {
-            // On the writer, not on the scope: the group did not fit whether or
-            // not a rolled-back transaction contained it.
-            if self.checkpoint_may_admit(cap, base, || total) {
-                self.refused_transient.set(true);
-            }
             gnitz_debug!(
                 "SAL group refused: cursor={} mmap={} epoch={} need={} cap={}",
                 base,
@@ -217,9 +248,10 @@ impl SalWriter {
                 total,
                 cap
             );
-            return Err(WireFault {
-                status: WireStatus::SalFull,
-                text: format!("SAL full: {:?} group did not fit", head.request.kind),
+            return Err(SalFull {
+                kind: head.request.kind,
+                end: base + total as u64,
+                may_admit: false,
             });
         }
 
@@ -303,7 +335,7 @@ impl SalWriter {
     }
 
     /// Whether a checkpoint is warranted: the bytes published behind this
-    /// epoch's checkpoint have crossed the configured threshold, or a group a
+    /// epoch's checkpoint have crossed the configured threshold, or a span a
     /// checkpoint may admit ([`Self::checkpoint_may_admit`]) has been refused
     /// since the last rewind, on a log that may still sit below the threshold.
     pub(crate) fn needs_checkpoint(&self) -> bool {
@@ -404,7 +436,7 @@ impl<'a> SalExcl<'a> {
     /// `zoned`, and return its end. A read laid out directly behind another read
     /// of this hold joins its [`Cut`](super::reader::Cut); a refused group leaves
     /// the cut as it was. The one encode path.
-    fn lay_out(&mut self, g: &Group, base: u64, zoned: bool) -> Result<u64, WireFault> {
+    fn lay_out(&mut self, g: &Group, base: u64, zoned: bool) -> Result<u64, SalFull> {
         let nw = self.writer.parks.len();
         let set = g.to.within(nw);
         let mut sizes = [0usize; MAX_WORKERS];
@@ -423,10 +455,13 @@ impl<'a> SalExcl<'a> {
     }
 
     /// Write and publish one group, outside every zone.
-    fn write_group(&mut self, g: &Group) -> Result<(), WireFault> {
+    fn write_group(&mut self, g: &Group) -> Result<(), SalFull> {
         let w = self.writer;
         let base = w.write_cursor.get();
-        let end = self.lay_out(g, base, false)?;
+        let end = self.lay_out(g, base, false).map_err(|mut full| {
+            w.judge(base, &mut full);
+            full
+        })?;
         w.publish(base);
         w.write_cursor.set(end);
         Ok(())
@@ -436,14 +471,15 @@ impl<'a> SalExcl<'a> {
     /// sent `blobs[w]` in place of the read's own blob. Consecutive reads written
     /// under one hold form one [`Cut`](super::reader::Cut): any other group
     /// between two of them ends it, a scope's included whether or not the scope
-    /// committed.
+    /// committed. Each read is published as it is written, so a refused one
+    /// leaves those ahead of it in the cut on their way to their workers.
     pub(crate) fn read(
         &mut self,
         read: Read<'_>,
         to: WorkerSet,
         blobs: Option<&[Vec<u8>]>,
         reply: RequestId,
-    ) -> Result<(), WireFault> {
+    ) -> Result<(), SalFull> {
         self.write_group(&Group::read(&read, to, blobs, reply))
     }
 
@@ -451,19 +487,12 @@ impl<'a> SalExcl<'a> {
     /// a caller may await the ACKs under this hold. A `Push` or `DdlSync` written
     /// here carries no rows. A `FlushEph` is the last group of its checkpoint:
     /// what follows it counts toward the next one.
-    pub(crate) fn apply(&mut self, apply: Apply<'_>, ack: RequestId) -> Result<(), WireFault> {
+    pub(crate) fn apply(&mut self, apply: Apply<'_>, ack: RequestId) -> Result<(), SalFull> {
         let ends_checkpoint = matches!(apply, Apply::FlushEph { .. });
         self.write_group(&Group::apply(&apply, ack))?;
         if ends_checkpoint {
             self.writer.checkpoint_floor.set(self.writer.write_cursor.get());
         }
-        self.wake();
-        Ok(())
-    }
-
-    /// Broadcast `Shutdown` and wake every worker.
-    pub(crate) fn shutdown(&mut self) -> Result<(), WireFault> {
-        self.write_group(&Group::shutdown())?;
         self.wake();
         Ok(())
     }
@@ -478,6 +507,8 @@ impl<'a> SalExcl<'a> {
                 end: self.writer.write_cursor.get(),
                 zone: None,
             },
+            in_unit: false,
+            refused: None,
             excl: self,
         }
     }
@@ -527,14 +558,35 @@ struct Staged {
 pub(crate) struct SalScope<'s, 'w> {
     excl: &'s mut SalExcl<'w>,
     staged: Staged,
+    /// A [`Self::unit`] is open.
+    in_unit: bool,
+    /// The open unit's refusal, which its groups behind the one refused are
+    /// measured into.
+    refused: Option<SalFull>,
 }
 
 impl SalScope<'_, '_> {
     /// Lay `g` out inside the scope, unpublished. `zoned` puts it in the
-    /// scope's atomic zone.
-    fn write(&mut self, g: &Group, zoned: bool) -> Result<(), WireFault> {
+    /// scope's atomic zone. A refusal outside a unit is judged from the scope's
+    /// start, all a retry lays out again; inside one, see [`Self::unit`].
+    fn write(&mut self, g: &Group, zoned: bool) -> Result<(), SalFull> {
+        let w = self.excl.writer;
+        if let Some(full) = &mut self.refused {
+            full.end += w.footprint(g) as u64;
+            return Ok(());
+        }
         let base = self.staged.end;
-        self.staged.end = self.excl.lay_out(g, base, zoned)?;
+        match self.excl.lay_out(g, base, zoned) {
+            Ok(end) => self.staged.end = end,
+            Err(full) if self.in_unit => {
+                self.refused = Some(full);
+                return Ok(());
+            }
+            Err(mut full) => {
+                w.judge(w.write_cursor.get(), &mut full);
+                return Err(full);
+            }
+        }
         if zoned {
             let pushes = g.request.kind == SalMessageKind::Push || self.staged.zone.is_some_and(|z| z.pushes);
             self.staged.zone = Some(OpenZone { last: base, pushes });
@@ -545,7 +597,7 @@ impl SalScope<'_, '_> {
     /// Lay out a catalog mutation of `family` as a member of the scope's zone:
     /// `batch`, sent whole to every worker, or to none for a family that reaches
     /// no worker.
-    pub(crate) fn ddl_sync(&mut self, family: SysFamily, batch: &Batch) -> Result<(), WireFault> {
+    pub(crate) fn ddl_sync(&mut self, family: SysFamily, batch: &Batch) -> Result<(), SalFull> {
         self.write(&Group::ddl_sync(family, batch), true)
     }
 
@@ -560,36 +612,30 @@ impl SalScope<'_, '_> {
         record: &[u8],
         rows: Routed<'_>,
         recovered: bool,
-    ) -> Result<(), WireFault> {
+    ) -> Result<(), SalFull> {
         self.write(&Group::push(tid, rule, record, rows), recovered)
     }
 
-    /// Whether a checkpoint may make room for the pushes refused where the
-    /// scope's next group is laid out, `bytes` sizing them: the question
-    /// [`SalWriter::checkpoint_may_admit`] answers, asked of a unit of pushes
-    /// that [`Self::all_or_nothing`] has just taken back, which starts there.
-    pub(crate) fn checkpoint_may_admit_pushes(&self, bytes: impl FnOnce() -> usize) -> bool {
-        let w = self.excl.writer;
-        w.checkpoint_may_admit(
-            group_limit(SalMessageKind::Push, w.log.ring_len),
-            self.staged.end,
-            bytes,
-        )
-    }
-
-    /// Run `f`, and take back every group it laid out when it fails: nothing in
-    /// a scope is published, so restoring what the scope has staged is the whole
-    /// undo.
-    pub(crate) fn all_or_nothing<T>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> Result<T, WireFault>,
-    ) -> Result<T, WireFault> {
+    /// Lay out a unit of groups with `f`, all or none. A unit the log has no
+    /// room for is taken back whole — nothing in a scope is published, so
+    /// restoring what the scope has staged is the whole undo — and refused
+    /// whole: every group `f` lays out behind the one refused is measured into
+    /// the refusal instead of laid out, and answered `Ok`, so `f` must do
+    /// nothing a refused unit would have to undo but lay out groups. The
+    /// refusal is judged ([`SalWriter::judge`]) from the unit's start, where
+    /// the scope's next group now starts.
+    pub(crate) fn unit<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, SalFull>) -> Result<T, SalFull> {
+        debug_assert!(!self.in_unit, "units do not nest");
         let saved = self.staged;
+        self.in_unit = true;
         let done = f(self);
-        if done.is_err() {
-            self.staged = saved;
-        }
-        done
+        self.in_unit = false;
+        let Some(mut full) = self.refused.take() else {
+            return done;
+        };
+        self.staged = saved;
+        self.excl.writer.judge(saved.end, &mut full);
+        Err(full)
     }
 
     /// Publish the span in layout order. Answers the zone's LSN — the log

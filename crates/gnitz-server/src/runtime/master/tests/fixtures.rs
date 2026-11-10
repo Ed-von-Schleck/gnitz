@@ -10,7 +10,7 @@ use crate::runtime::w2m::W2mWriter;
 pub(crate) fn test_dispatcher(workers: usize, catalog: CatalogEngine) -> (MasterDispatcher, Vec<W2mWriter>) {
     let (reactor, writers) = reactor_with_rings(workers);
     let sal = test_log(1 << 20, workers, 1);
-    let disp = MasterDispatcher::new(Vec::new(), catalog, sal, reactor);
+    let disp = MasterDispatcher::new(catalog, sal, reactor);
     (disp, writers)
 }
 

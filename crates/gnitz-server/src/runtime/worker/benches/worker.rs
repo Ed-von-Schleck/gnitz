@@ -1,6 +1,6 @@
 use super::tests::{ask, frames, pk_keys, probe, worker_over};
 use super::*;
-use crate::runtime::sal::SalExcl;
+use crate::runtime::sal::{SalExcl, SalFull};
 use crate::runtime::w2m::fixtures::id;
 use crate::test_support::{
     make_batch_raw, make_schema_u64_i64, net_weight, register_identity_view, table_engine, u64_i64_cols,
@@ -27,7 +27,7 @@ fn arm(
     held: u64,
     prepare: impl FnOnce(&mut CatalogEngine, u64),
     requests: u32,
-    request: impl Fn(&mut SalExcl, u64, &[u8], u32) -> Result<(), WireFault>,
+    request: impl Fn(&mut SalExcl, u64, &[u8], u32) -> Result<(), SalFull>,
     frames_owed: usize,
     holds: u64,
 ) {

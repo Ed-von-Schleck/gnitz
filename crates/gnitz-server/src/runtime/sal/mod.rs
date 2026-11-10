@@ -44,4 +44,4 @@ pub(crate) use request::{Apply, Read};
 pub(crate) use tail::CommittedTail;
 #[cfg(test)]
 pub(crate) use writer::fixtures;
-pub(crate) use writer::{SalExcl, SalScope, SalWriter};
+pub(crate) use writer::{SalExcl, SalFull, SalScope, SalWriter};

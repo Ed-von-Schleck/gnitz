@@ -98,6 +98,12 @@ pub(super) fn route_read(read: &Read<'_>, registry: &RelationRegistry, nw: usize
                 .map_or(WorkerSet::ALL, WorkerSet::one),
         ),
         (_, Some(BoundPeek::PkSet(s))) if placement.is_key_routed() && s.stride == schema.pk_stride() => {
+            // One key has one owner, named by the placement's point query: no
+            // owner list is built.
+            if s.keys.len() == s.stride {
+                let owner = placement.owner(s.keys, nw);
+                return whole(WorkerSet::one(owner.expect("a key-routed placement owns every key")));
+            }
             let owners = (placement.owners(s.keys, s.stride, nw)).expect("a key-routed placement owns every key");
             let set: WorkerSet = owners.iter().map(|&o| o as usize).collect();
             match set.len() {
