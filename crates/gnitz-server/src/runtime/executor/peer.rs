@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::runtime::reactor::{Accepted, ClientConn, PeerGone, Reactor, RecvBuf, SendBody};
 use crate::runtime::sync::{select2, Either};
-use crate::runtime::tls::TlsShared;
+use crate::runtime::tls::TlsSession;
 use gnitz_zset::repr::PooledBuf;
 
 /// Ceiling on a concatenation of client-bound frames (coalesced scan heads, corked
@@ -23,37 +23,30 @@ const COALESCE_MAX_BYTES: usize = 32 * 1024;
 /// task; handlers borrow it to send replies. A `PeerGone` from any send or flush
 /// means the connection is finished, and every later send or flush refuses too.
 pub(super) struct Peer {
+    reactor: Reactor,
     conn: Rc<ClientConn>,
-    transport: Transport,
+    /// `None` on a plain socket, whose bytes the reactor sends directly.
+    tls: Option<Rc<TlsSession>>,
     /// Replies written but not yet sent, concatenated so a run of pipelined
     /// requests leaves as one send. `None` when nothing is pending.
     egress: RefCell<Option<PooledBuf>>,
-}
-
-enum Transport {
-    /// The socket's own bytes: the reactor sends on it directly.
-    Plain(Reactor),
-    /// TLS 1.3 over TCP; record I/O lives in `runtime::tls`.
-    Tls(Rc<TlsShared>),
 }
 
 impl Peer {
     /// Build a connection over `accepted`, arm its recv and start serving it: a
     /// TLS session under `tls`, the socket's own bytes otherwise.
     pub(super) fn new(reactor: &Reactor, accepted: Accepted, tls: Option<&Arc<rustls::ServerConfig>>) -> Peer {
-        let (conn, transport) = match tls {
-            None => {
-                let conn = reactor.connect(accepted, None, None);
-                (conn, Transport::Plain(reactor.clone()))
-            }
+        let (conn, tls) = match tls {
+            None => (reactor.connect(accepted, None), None),
             Some(cfg) => {
-                let tls = TlsShared::start(reactor.clone(), accepted, Arc::clone(cfg));
-                (Rc::clone(tls.conn()), Transport::Tls(tls))
+                let (conn, tls) = TlsSession::start(reactor, accepted, Arc::clone(cfg));
+                (conn, Some(tls))
             }
         };
         Peer {
+            reactor: reactor.clone(),
             conn,
-            transport,
+            tls,
             egress: RefCell::new(None),
         }
     }
@@ -169,9 +162,9 @@ impl Peer {
     async fn send_raw(&self, body: SendBody) -> Result<(), PeerGone> {
         #[cfg(test)]
         SENDS.with(|n| n.set(n.get() + 1));
-        match &self.transport {
-            Transport::Plain(r) => r.send_owned(&self.conn, body).await,
-            Transport::Tls(t) => t.send(body).await,
+        match &self.tls {
+            None => self.reactor.send_owned(&self.conn, body).await,
+            Some(t) => t.send(&self.reactor, &self.conn, body).await,
         }
     }
 

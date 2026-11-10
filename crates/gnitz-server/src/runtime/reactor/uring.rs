@@ -76,8 +76,8 @@ impl IoUringRing {
     /// is full.
     ///
     /// # Safety
-    /// Every buffer and fd `sqe` names stays valid until its CQE, or until the ring
-    /// drops.
+    /// Every buffer and fd `sqe` names stays valid until its CQE, or until
+    /// [`Self::cancel_all`], after which nothing is pushed or submitted.
     pub(super) unsafe fn push(&mut self, sqe: squeue::Entry, user_data: u64) {
         if self.ring.submission().is_full() {
             self.submit();
@@ -115,12 +115,12 @@ impl IoUringRing {
     pub(super) fn fill<'a>(&mut self, buf: &'a mut [MaybeUninit<cqueue::Entry>]) -> &'a [cqueue::Entry] {
         self.ring.completion().fill(buf)
     }
-}
 
-impl Drop for IoUringRing {
-    /// Cancel every submitted op. One already running in the kernel's worker pool
-    /// (an fsync) runs on, and names no memory.
-    fn drop(&mut self) {
+    /// Cancel every submitted op, after which the kernel touches nothing their
+    /// SQEs name. The ring's last use: an SQE still queued is never submitted.
+    /// An op already running in the kernel's worker pool (an fsync) runs on,
+    /// and names no memory.
+    pub(super) fn cancel_all(&mut self) {
         // NotFound when nothing is in flight.
         let _ = self
             .ring

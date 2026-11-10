@@ -195,12 +195,16 @@ fn block_on_submits_the_pass_that_completed_it() {
 }
 
 /// A thread holds one live reactor at a time: its wakes land in the one
-/// thread-local run queue.
+/// thread-local run queue. A refused reactor leaves the live one's claim
+/// standing, so the next is refused too.
 #[test]
-#[should_panic(expected = "second reactor")]
 fn a_second_live_reactor_on_one_thread_panics() {
     let _first = make_reactor();
-    let _second = make_reactor();
+    for _ in 0..2 {
+        let refused = std::panic::catch_unwind(make_reactor).err().expect("a second reactor");
+        let why = refused.downcast_ref::<&str>().expect("a panic message");
+        assert!(why.contains("second reactor"), "{why}");
+    }
 }
 
 /// The thread's claim ends with its reactor, so a later one may take it.

@@ -1,7 +1,7 @@
 //! Client connections: the frame queue's ceilings, the global inbound-memory
 //! budget every `RecvBuf` is charged against and a connection's share of it,
-//! the accept op, the send loop and its eviction deadline, and how a
-//! connection's recv side ends and its socket closes.
+//! the accept op, the send loop and its eviction deadline, how a connection's
+//! recv side ends and its socket closes, and what a session changes of each.
 
 use std::io::Write;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -28,13 +28,33 @@ fn is_paused(r: &Reactor, conn: &Rc<ClientConn>) -> bool {
         .any(|&key| Rc::ptr_eq(&recvs[key].conn, conn))
 }
 
+/// A session whose plaintext is its ciphertext, and which leaves the socket
+/// open when its connection retires, counting the calls.
+#[derive(Default)]
+struct Passthrough {
+    retired: Cell<u32>,
+}
+
+impl Session for Passthrough {
+    fn ingest(&self, cipher: &[u8], plain: &mut dyn FnMut(&[u8]) -> Result<(), RecvEnd>) -> Result<(), RecvEnd> {
+        plain(cipher)
+    }
+
+    fn retired(&self) {
+        self.retired.set(self.retired.get() + 1);
+    }
+}
+
 /// Frames deframed, and why the feed ended, if it did.
 pub(super) type Deframed = (Vec<Vec<u8>>, Option<RecvEnd>);
 
 /// The frames `stream` deframes to under a `cap`-byte budget, fed `step` bytes a
 /// read, and why the feed ended, if it did.
 pub(super) fn deframe(stream: &[u8], step: usize, admitted: bool, cap: usize) -> Deframed {
-    let mut q = frame_sink(cap, admitted);
+    let mut q = FrameSink::new(Budget::new(cap));
+    if admitted {
+        q.admit_full_frames();
+    }
     let mut deframer = Deframer::default();
     let mut frames = Vec::new();
     for read in stream.chunks(step) {
@@ -374,21 +394,21 @@ fn the_connection_cap_refuses_past_it_until_a_connection_ends() {
     registered(&r); // an ended connection frees its slot
 }
 
-/// Under an egress owner, `retire` leaves the socket open to it and wakes it
-/// once; `fail` shuts the socket down now, whoever owns egress, which ends an
-/// armed recv — even one not yet submitted — so a silent peer cannot pin the
-/// connection.
+/// Under a session, `retire` leaves the shutdown to it and tells it once;
+/// `fail` shuts the socket down now, session or none, which ends an armed recv
+/// — even one not yet submitted — so a silent peer cannot pin the connection.
 #[test]
-fn retire_defers_the_shutdown_to_the_egress_owner_and_fail_ends_the_recv() {
+fn retire_defers_the_shutdown_to_the_session_and_fail_ends_the_recv() {
     let r = make_reactor();
-    let (owner, mut woken) = chan::unbounded::<()>();
+    let session = Rc::new(Passthrough::default());
     let (accepted, partner) = accepted_pair(&r);
-    let conn = r.connect(accepted, Some(owner), None);
+    let conn = r.connect(accepted, Some(session.clone()));
 
     conn.retire();
-    assert!(woken.try_recv().is_some() && woken.try_recv().is_none(), "one wake");
+    assert_eq!(session.retired.get(), 1);
     assert_eq!(read_nonblocking(&partner, 1), None, "the socket stays open");
     conn.fail();
+    assert_eq!(session.retired.get(), 1, "a retired connection retires no more");
     assert_eq!(read_nonblocking(&partner, 1), Some(vec![]), "fail shuts it down");
     assert!(
         poll_until(&r, || Rc::strong_count(&conn) == 1),
@@ -401,10 +421,9 @@ fn retire_defers_the_shutdown_to_the_egress_owner_and_fail_ends_the_recv() {
 #[test]
 fn a_recv_landing_after_retire_is_discarded() {
     let r = make_reactor();
-    // Owned egress, so `retire` leaves the socket open for the late bytes.
-    let (owner, _woken) = chan::unbounded::<()>();
+    // Under a session, so `retire` leaves the socket open for the late bytes.
     let (accepted, mut partner) = accepted_pair(&r);
-    let conn = r.connect(accepted, Some(owner), None);
+    let conn = r.connect(accepted, Some(Rc::new(Passthrough::default())));
     r.tick(); // the recv is submitted
 
     conn.retire();
@@ -437,7 +456,43 @@ fn send_owned_loops_until_full_payload_sent_over_socketpair() {
     conn.fail();
     let received = drain_t.join().expect("drain thread");
     assert_eq!((sent, received), (Ok(()), payload_len as u64));
-    assert!(r.ops.borrow().is_empty());
+    assert_eq!(r.ops.len(), 0);
+}
+
+/// An empty body is sent with no op, and a send the socket refuses finishes
+/// the connection.
+#[test]
+fn send_owned_skips_an_empty_body_and_fails_the_connection_on_a_refused_send() {
+    let r = make_reactor();
+    let (conn, partner) = registered(&r);
+    let empty = r.send_owned(&conn, SendBody::Pooled(PooledBuf(Vec::new())));
+    assert_eq!(try_poll_once(empty), Some(Ok(())));
+    assert_eq!(r.ops.len(), 0, "no op was pushed");
+    assert_eq!(read_nonblocking(&partner, 1), None, "nothing was sent");
+
+    drop(partner);
+    let sent = r.block_on(r.send_owned(&conn, SendBody::Pooled(PooledBuf(vec![1]))));
+    assert_eq!(sent, Err(PeerGone));
+    assert!(conn.is_gone());
+}
+
+/// Under a session, what a recv lands reaches the queue as the plaintext the
+/// session hands over, deframed across recvs.
+#[test]
+fn a_session_feeds_the_queue_its_plaintext() {
+    let r = make_reactor();
+    let (accepted, mut partner) = accepted_pair(&r);
+    let conn = r.connect(accepted, Some(Rc::new(Passthrough::default())));
+    let wire = [framed(b"one"), framed(b"two")].concat();
+    let (head, tail) = wire.split_at(wire.len() - 2);
+    partner.write_all(head).expect("write");
+    assert!(poll_until(&r, || conn.is_readable()), "the first frame, whole");
+    partner.write_all(tail).expect("write");
+    let got = r.block_on(async { [conn.recv().await, conn.recv().await] });
+    assert_eq!(
+        got.map(|f| f.map(|f| f.as_slice().to_vec())),
+        [b"one", b"two"].map(|f| Some(f.to_vec()))
+    );
 }
 
 /// A peer that never reads is evicted once a send makes no progress past the
@@ -470,7 +525,7 @@ fn send_owned_evicts_a_client_that_never_drains() {
     );
     // No pass has drained since the eviction's.
     assert_eq!(
-        (r.ops.borrow().len(), Rc::strong_count(&conn), ring.release_cursor(0)),
+        (r.ops.len(), Rc::strong_count(&conn), ring.release_cursor(0)),
         (1, 3, held),
         "the abandoned send holds its connection and body, beside the recv"
     );
@@ -518,7 +573,7 @@ fn accept_retries_after_a_failure() {
         poll_until(&r, || accepted.borrow().is_some()),
         "the retry takes the connection"
     );
-    let conn = r.connect(accepted.take().expect("just seen"), None, None);
+    let conn = r.connect(accepted.take().expect("just seen"), None);
     assert_eq!(conn.peer_addr(), client.local_addr().ok());
 }
 
@@ -530,7 +585,7 @@ fn peer_addr_names_a_tcp_peer_and_leaves_the_fd_open() {
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
     let client = std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
     let (server, _) = listener.accept().expect("accept");
-    let conn = r.connect(r.admit(OwnedFd::from(server)).expect("under the cap"), None, None);
+    let conn = r.connect(r.admit(OwnedFd::from(server)).expect("under the cap"), None);
     assert_eq!(conn.peer_addr(), client.local_addr().ok(), "a TCP peer's address");
     assert_eq!(
         conn.peer_addr(),

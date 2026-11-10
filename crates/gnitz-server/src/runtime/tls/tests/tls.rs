@@ -1,14 +1,14 @@
 //! Unit tests for what is specific to TLS: what a listener serves, the minted
-//! identity kept in the data directory, the reload, and driving the
-//! connection's `FrameSink` from rustls's `fill_buf` across record boundaries
-//! and awkward socket-chunk splits. The policy the queue owns — the per-frame
-//! ceiling, the inbound charge, the zero-length prefix — is covered once, on
-//! the fd path, in `reactor::tests`; what `TlsArgs::resolve` refuses is
+//! identity kept in the data directory, the reload, and handing a connection
+//! the plaintext of rustls's `fill_buf` across record boundaries and awkward
+//! socket-chunk splits. Deframing that plaintext, and the policy its queue
+//! owns — the per-frame ceiling, the inbound charge, the zero-length prefix —
+//! are covered once, in `reactor::conn::tests`; what `TlsArgs::resolve` refuses is
 //! covered from argv, beside the binary's argument parser.
 //!
 //! Handshakes shuttle ciphertext between a rustls client and server in memory,
 //! the client verifying for real against the certificate it is told to trust.
-//! The session tests run a `TlsShared` over a socketpair.
+//! The session tests run a `TlsSession` over a socketpair.
 
 use std::io::Read as _;
 use std::os::unix::net::UnixStream;
@@ -18,9 +18,8 @@ use rustls::pki_types::{CertificateDer, ServerName};
 
 use super::config::{TLS_CERT_FILE, TLS_KEY_FILE};
 use super::*;
-use crate::runtime::reactor::test_support::{accepted_pair, frame_sink, make_reactor, poll_until};
+use crate::runtime::reactor::test_support::{accepted_pair, make_reactor, poll_until};
 use crate::runtime::test_support::read_nonblocking;
-use gnitz_wire::framed;
 
 const LOOPBACK: &str = "127.0.0.1:0";
 
@@ -213,30 +212,29 @@ fn a_reload_replaces_what_is_served_unless_it_fails() {
     handshake(&listener.current(), &renewed, "localhost").expect("a failed reload keeps the last good setup");
 }
 
-/// Pipelined frames spanning several records deframe in order under any
-/// ciphertext split, and a close_notify behind them ends the recv side only once
-/// every frame ahead of it is queued.
+/// Plaintext spanning several records is handed over in order under any
+/// ciphertext split, and a close_notify behind it ends the recv side only once
+/// every byte ahead of it is handed over.
 #[test]
-fn frames_deframe_in_order_under_any_split_until_close_notify() {
+fn plaintext_arrives_in_order_under_any_split_until_close_notify() {
     let (dev, pem, _dir) = load_minted(TlsArgs::on(LOOPBACK));
-    let frames = [
-        vec![0xAAu8; 10],
-        (0..100_000).map(|i| (i % 251) as u8).collect(), // spans several 16 KiB records
-        b"tail".to_vec(),
-    ];
+    // Spans several 16 KiB records.
+    let sent: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
     for chunk in [usize::MAX, 1_313] {
         let (mut client, mut server) = handshake(&dev, &pem, "localhost").unwrap();
         client.set_buffer_limit(None);
-        for f in &frames {
-            client.writer().write_all(&framed(f)).unwrap();
-        }
+        client.writer().write_all(&sent).unwrap();
         client.send_close_notify();
-        let mut q = frame_sink(usize::MAX, true);
-        let mut deframer = Deframer::default();
+        let mut got = Vec::new();
 
         let ends: Vec<_> = ciphertext(&mut client)
             .chunks(chunk)
-            .map(|c| ingest_cipher(&mut server, c, &mut deframer, &mut q))
+            .map(|c| {
+                ingest_cipher(&mut server, c, &mut |plain| {
+                    got.extend_from_slice(plain);
+                    Ok(())
+                })
+            })
             .collect();
         let (last, rest) = ends.split_last().unwrap();
         assert!(
@@ -244,21 +242,18 @@ fn frames_deframe_in_order_under_any_split_until_close_notify() {
             "a chunk ending mid-record waits: {ends:?}"
         );
         assert!(matches!(last, Err(RecvEnd::PeerClosed)), "{last:?}");
-        let got: Vec<_> = std::iter::from_fn(|| q.try_recv())
-            .map(|b| b.as_slice().to_vec())
-            .collect();
-        assert_eq!(got, frames);
+        assert!(got == sent, "{} of {} bytes, or out of order", got.len(), sent.len());
     }
 }
 
-/// A `TlsShared` over one end of a socketpair, the other end, which is the
-/// client's, and the PEM the client trusts.
-fn tls_over_socketpair() -> (Reactor, Rc<TlsShared>, UnixStream, String) {
+/// A TLS connection over one end of a socketpair and its session, the other
+/// end, which is the client's, and the PEM the client trusts.
+fn tls_over_socketpair() -> (Reactor, Rc<ClientConn>, Rc<TlsSession>, UnixStream, String) {
     let r = make_reactor();
     let (accepted, receiver) = accepted_pair(&r);
     let (served, pem, _dir) = load_minted(TlsArgs::on(LOOPBACK));
-    let tls = TlsShared::start(r.clone(), accepted, Arc::clone(&served.cfg));
-    (r, tls, receiver, pem)
+    let (conn, tls) = TlsSession::start(&r, accepted, Arc::clone(&served.cfg));
+    (r, conn, tls, receiver, pem)
 }
 
 /// Tick until the client end reads EOF, returning every byte before it; `None`
@@ -285,7 +280,7 @@ const ALERT_HEADER: [u8; 5] = [0x15, 3, 3, 0, 2];
 /// before the EOF, and no close_notify behind it.
 #[test]
 fn a_protocol_error_reaches_the_client_as_one_fatal_alert() {
-    let (r, _tls, client, _) = tls_over_socketpair();
+    let (r, _conn, _tls, client, _) = tls_over_socketpair();
     (&client).write_all(b"GET / HTTP/1.1\r\n\r\n").expect("write");
 
     let seen = read_until_eof(&r, &client).expect("the session ends");
@@ -298,8 +293,8 @@ fn a_protocol_error_reaches_the_client_as_one_fatal_alert() {
 /// A local close ships the close_notify, then shuts the socket down.
 #[test]
 fn a_tls_close_ships_close_notify_before_the_shutdown() {
-    let (r, tls, client, _) = tls_over_socketpair();
-    tls.conn.retire();
+    let (r, conn, _tls, client, _) = tls_over_socketpair();
+    conn.retire();
 
     let seen = read_until_eof(&r, &client).expect("the flusher shuts the socket down");
     assert_eq!(
@@ -326,22 +321,27 @@ fn exchange(fd: &UnixStream, client: &mut rustls::ClientConnection, got: &mut Ve
     }
 }
 
-/// The recv filter and the flusher drive a handshake, and a body far past
+/// The recv side and the flusher drive a handshake, and a body far past
 /// rustls's outgoing buffer reaches the client whole and in order.
 #[test]
 fn a_send_past_the_outgoing_buffer_reaches_the_client_whole() {
-    let (r, tls, fd, pem) = tls_over_socketpair();
+    let (r, conn, tls, fd, pem) = tls_over_socketpair();
     let mut client = client_trusting(&pem, "localhost");
     let mut got = Vec::new();
     let handshaken = poll_until(&r, || {
         exchange(&fd, &mut client, &mut got);
-        !client.is_handshaking() && !tls.state.borrow().is_handshaking()
+        !client.is_handshaking() && !tls.sess.borrow().is_handshaking()
     });
     assert!(handshaken, "the handshake completes");
 
     let body: Vec<u8> = (0..1 << 20).map(|i| (i % 251) as u8).collect();
-    let (sender, sent) = (Rc::clone(&tls), body.clone());
-    r.spawn(async move { sender.send(SendBody::Pooled(PooledBuf(sent))).await.expect("sent") });
+    let (sender, reactor, sent) = (Rc::clone(&tls), r.clone(), body.clone());
+    r.spawn(async move {
+        sender
+            .send(&reactor, &conn, SendBody::Pooled(PooledBuf(sent)))
+            .await
+            .expect("sent")
+    });
     let arrived = poll_until(&r, || {
         exchange(&fd, &mut client, &mut got);
         got.len() >= body.len()

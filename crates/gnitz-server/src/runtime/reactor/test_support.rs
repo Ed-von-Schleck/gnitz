@@ -4,6 +4,7 @@
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
+use super::op::Op;
 use super::*;
 use crate::runtime::park::WorkerSet;
 pub(super) use crate::runtime::sync::{oneshot, select2, Either};
@@ -35,7 +36,7 @@ pub(super) fn make_reactor_with(limits: Limits) -> Reactor {
 }
 
 /// The drivers every reactor suite runs on. An inherent impl here rather than in
-/// `runloop`/`mod`, so the production files carry no test-only method.
+/// `runloop`, so production code carries no test-only method.
 impl Reactor {
     /// Tick until no task is left. Bounded as [`poll_until`] is: the tests that
     /// use this guard against lost wakes and lock deadlocks, which an unbounded
@@ -85,11 +86,11 @@ pub(crate) fn accepted_pair(r: &Reactor) -> (Accepted, UnixStream) {
     (r.admit(OwnedFd::from(local)).expect("under the cap"), partner)
 }
 
-/// A connection over an [`accepted_pair`], its recv armed and no egress owner,
-/// and the other end.
+/// A plain connection over an [`accepted_pair`], its recv armed, and the other
+/// end.
 pub(super) fn registered(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
     let (accepted, partner) = accepted_pair(r);
-    (r.connect(accepted, None, None), partner)
+    (r.connect(accepted, None), partner)
 }
 
 /// [`registered`], past its handshake: admitting frames up to the payload ceiling.
@@ -97,16 +98,6 @@ pub(super) fn admitted(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
     let (conn, partner) = registered(r);
     conn.admit_full_frames();
     (conn, partner)
-}
-
-/// A frame sink with a `cap`-byte budget of its own, past the handshake when
-/// `admitted`.
-pub(crate) fn frame_sink(cap: usize, admitted: bool) -> FrameSink {
-    let mut q = FrameSink::new(conn::Budget::new(cap));
-    if admitted {
-        q.admit_full_frames();
-    }
-    q
 }
 
 /// Drive the reactor in non-blocking ticks until `cond` holds after one, for at

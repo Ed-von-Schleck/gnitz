@@ -148,7 +148,6 @@ impl Reactor {
     }
 
     fn dispatch_cqe(&self, user_data: u64, res: i32) {
-        let id = user_data & ID_MASK;
         match user_data >> KIND_SHIFT {
             KIND_PARK => {
                 // No drain here: the pass's own drain follows CQE dispatch.
@@ -165,28 +164,8 @@ impl Reactor {
                 // and the next `arm` sets it again and re-tests the rings.
                 self.parked.set(false);
             }
-            KIND_OP => {
-                let slot = (id & OP_SLOT_MASK) as usize;
-                let mut ops = self.ops.borrow_mut();
-                let entry = ops.get_mut(slot).expect("an op's entry lives until its CQE");
-                match std::mem::replace(entry, OpSlot::Done(res)) {
-                    OpSlot::Waiting(waker) => {
-                        drop(ops);
-                        if let Some(w) = waker {
-                            w.wake();
-                        }
-                    }
-                    OpSlot::Abandoned(carry) => {
-                        ops.remove(slot);
-                        drop(ops);
-                        // Outside the borrow: the carry may hold the last handle
-                        // on a connection.
-                        drop(carry);
-                    }
-                    OpSlot::Done(_) => unreachable!("a second CQE for op {user_data:#x}"),
-                }
-            }
-            KIND_RECV => self.handle_recv_cqe(id as usize, res),
+            KIND_OP => self.ops.complete(user_data, res),
+            KIND_RECV => self.handle_recv_cqe((user_data & ID_MASK) as usize, res),
             KIND_CANCEL => {}
             kind => unreachable!("CQE kind {kind} (user_data={user_data:#x}) was never issued"),
         }
@@ -243,7 +222,7 @@ impl RunQueue {
 thread_local! {
     /// The run queue of the reactor on this thread, for the waker vtable to reach
     /// without per-wake `Rc` traffic. A wake with no reactor live lands here
-    /// harmlessly; `claim_thread` clears what a dropped reactor left.
+    /// harmlessly; the next [`ThreadClaim`] clears what a dropped reactor left.
     static RUN_QUEUE: RefCell<RunQueue> = const { RefCell::new(RunQueue::new()) };
     /// A reactor is live on this thread.
     static REACTOR_LIVE: Cell<bool> = const { Cell::new(false) };
@@ -253,17 +232,24 @@ fn run_queue_is_empty() -> bool {
     RUN_QUEUE.with(|q| q.borrow().len() == 0)
 }
 
-/// Claim this thread for a new reactor, starting it on an empty run queue.
-pub(super) fn claim_thread() {
-    assert!(
-        !REACTOR_LIVE.replace(true),
-        "a second reactor on this thread would orphan the first's wakes"
-    );
-    RUN_QUEUE.with(|q| q.borrow_mut().clear());
+/// A reactor's claim on its thread's run queue, held for the reactor's life.
+pub(super) struct ThreadClaim(());
+
+impl ThreadClaim {
+    /// Claim this thread for a new reactor, starting it on an empty run queue.
+    /// A refused claim panics with no `ThreadClaim` built, so the live
+    /// reactor's stands.
+    pub(super) fn take() -> Self {
+        assert!(
+            !REACTOR_LIVE.replace(true),
+            "a second reactor on this thread would orphan the first's wakes"
+        );
+        RUN_QUEUE.with(|q| q.borrow_mut().clear());
+        ThreadClaim(())
+    }
 }
 
-/// The thread's claim ends when the last handle drops.
-impl Drop for ReactorShared {
+impl Drop for ThreadClaim {
     fn drop(&mut self) {
         REACTOR_LIVE.set(false);
     }

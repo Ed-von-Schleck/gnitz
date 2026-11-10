@@ -45,7 +45,7 @@ fn arm(label: &str, r: Reactor, park: impl AsyncFn() + 'static, mut publish: imp
 ///
 /// `task` wakes itself, and is the floor under the others. `op` is a one-shot op
 /// through the ring, `op+deadline` the same raced against a timer as every client
-/// send is. `recv` is one client frame through the armed recv, its filter and the
+/// send is. `recv` is one client frame through the armed recv and the
 /// connection's queue. `acks` is a lease over every worker, answered by each, and
 /// `train` one row frame of a scan's reply.
 #[test]
