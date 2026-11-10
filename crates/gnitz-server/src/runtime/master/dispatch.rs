@@ -230,7 +230,7 @@ impl MasterDispatcher {
     /// the master puts its system families', each store with the entries that
     /// reach it durable. `dir` exists; everything under it is made here.
     pub(crate) async fn backup_round(&self, dir: &str) -> Result<(), WireFault> {
-        self.command(Read::Backup { dir: dir.as_bytes().into() }).await?;
+        self.command(Read::Backup { dir: dir.into() }).await?;
         if BACKUP_ABORT.armed() {
             gnitz_fatal_abort!("injected backup abort");
         }

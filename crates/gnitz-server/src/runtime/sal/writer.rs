@@ -484,9 +484,8 @@ impl<'a> SalExcl<'a> {
     }
 
     /// Write `apply` to every worker, acknowledged on `ack`, and wake them now:
-    /// a caller may await the ACKs under this hold. A `Push` or `DdlSync` written
-    /// here carries no rows. A `FlushEph` is the last group of its checkpoint:
-    /// what follows it counts toward the next one.
+    /// a caller may await the ACKs under this hold. A `FlushEph` is the last
+    /// group of its checkpoint: what follows it counts toward the next one.
     pub(crate) fn apply(&mut self, apply: Apply<'_>, ack: RequestId) -> Result<(), SalFull> {
         let ends_checkpoint = matches!(apply, Apply::FlushEph { .. });
         self.write_group(&Group::apply(&apply, ack))?;

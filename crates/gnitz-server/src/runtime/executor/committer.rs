@@ -266,16 +266,24 @@ fn drain_ready_batch(
     None
 }
 
-/// The checkpoint sequence: base round, drain, ephemeral round. A failed base
-/// round aborts: the workers have left the epoch of a SAL that was not rewound,
-/// which only a restart's replay repairs. A failed ephemeral round aborts too:
-/// its views are stamped and the master's system rows are not durable.
+/// The checkpoint sequence: base round, drain, ephemeral round, each round with
+/// no tick in flight. A failed base round aborts: the workers have left the
+/// epoch of a SAL that was not rewound, which only a restart's replay repairs.
+/// A failed ephemeral round aborts too: its views are stamped and the master's
+/// system rows are not durable.
 async fn run_checkpoint_sequence(shared: &Shared) {
-    shared
-        .dispatcher
-        .checkpoint_base()
-        .await
-        .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
+    // The base round runs with no tick in flight either, so a worker meets no
+    // `Flush` inside a drive. It waits out the tick before it takes the SAL
+    // writer: a checkpoint a refusal called for frees no room until then.
+    // Released before the drain, whose tick takes the gate.
+    {
+        let _park = shared.ticks.gate.write().await;
+        shared
+            .dispatcher
+            .checkpoint_base()
+            .await
+            .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
+    }
 
     // One drain suffices: no write is committed meanwhile, so the pending-tick
     // counts cannot grow.

@@ -3,7 +3,7 @@
 //!
 //! A child of `writer`, so it reaches `write_slots` and the cursor directly: the
 //! forged groups below are what no scope writes — arbitrary payload bytes, an
-//! open zone, an ACKed push that carries rows — and every other group goes
+//! open zone, a read answered on no id — and every other group goes
 //! through [`SalExcl`]. The one test `impl` of the writer: the log shapes and
 //! the damage every SAL test builds on are here.
 
@@ -257,14 +257,13 @@ impl SalExcl<'_> {
         self.in_cut = false;
     }
 
-    /// A push of `rows` into `tid` sent whole to every worker and acknowledged
-    /// on `ack`: a shape no production writer frames, since a push is answered
-    /// by none.
-    pub(crate) fn acked_push(&mut self, tid: u64, record: &[u8], rows: &Batch, ack: RequestId) -> Result<(), SalFull> {
-        self.write_group(&Group {
-            reply: Some(ack),
-            ..Group::push(tid, PkRule::Enforce, record, Routed::Same(rows.wire_whole()))
-        })
+    /// Push `rows` into `tid`, a unit of its own outside every zone: a push no
+    /// restart recovers.
+    pub(crate) fn push(&mut self, tid: u64, record: &[u8], rows: Routed<'_>) -> Result<(), SalFull> {
+        let mut scope = self.begin();
+        scope.push(tid, PkRule::Enforce, record, rows, false)?;
+        scope.commit();
+        Ok(())
     }
 }
 

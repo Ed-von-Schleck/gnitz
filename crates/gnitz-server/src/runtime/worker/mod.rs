@@ -4,102 +4,82 @@
 //! the master via the SAL (shared append-only log), sends responses via a
 //! per-worker W2M shared region, and trades exchange rounds with its peers on
 //! the mesh.
-
-use std::collections::VecDeque;
-
-use crate::catalog::CatalogEngine;
-use crate::query::{DagEngine, DriveHost};
-use crate::runtime::mesh::Mesh;
-use crate::runtime::sal::{Apply, Cut, Inbound, Read, ReplyRoute, SalReader};
-use crate::runtime::w2m::W2mWriter;
-use gnitz_foundation::fault::Seam;
-use gnitz_store::relation::{IndexClaim, RelationRegistry};
-use gnitz_wire::TypeCode;
-use gnitz_wire::{PkKeys, WireFault};
-use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
-
-// ---------------------------------------------------------------------------
-// WorkerProcess
-// ---------------------------------------------------------------------------
-
-pub struct WorkerProcess<'c> {
-    catalog: &'c mut CatalogEngine,
-    sal_reader: SalReader,
-    w2m_writer: W2mWriter,
-    /// Where this worker trades its exchange rounds with its peers, and parks
-    /// for a SAL group or an exchange part.
-    mesh: Mesh,
-    /// Replies this worker owes, in the order they reach the ring, which is
-    /// request order within a [`Cut`](crate::runtime::sal::Cut).
-    replies: VecDeque<Owed>,
-    /// The runs of one cut's publishes the master has not released, oldest
-    /// first: where each ends, and the cut whose bytes hold the ring there.
-    unreleased: VecDeque<(u64, Cut)>,
-    /// Per-frame wire budget of every W2M train, never past what the ring holds.
-    /// `GNITZ_REPLY_FRAME_BUDGET` lowers it, so tests reach multi-frame trains on
-    /// small tables.
-    reply_frame_budget: usize,
-}
+//!
+//! This file reads the SAL and runs what it asks: a read is answered off the
+//! catalog, rows are ingested, a round is run and ACKed. `reply` owns the ring
+//! and what the worker owes on it; `exchange` is the wait a drive's round spends
+//! on its peers, and what of the SAL is served meanwhile.
 
 mod exchange;
 mod reply;
 
-use reply::{Owed, Rows};
+use crate::catalog::CatalogEngine;
+use crate::runtime::mesh::Mesh;
+use crate::runtime::sal::{Apply, Inbound, Ingest, Read, SalReader};
+use crate::runtime::w2m::W2mWriter;
+use gnitz_foundation::fault::Seam;
+use gnitz_store::relation::IndexClaim;
+use gnitz_wire::TypeCode;
+use gnitz_wire::{PkKeys, WireFault};
+use gnitz_zset::repr::Batch;
+use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
+use reply::{Replies, Rows};
+
+pub(super) struct WorkerProcess<'c> {
+    catalog: &'c mut CatalogEngine,
+    sal_reader: SalReader,
+    /// Where this worker trades its exchange rounds with its peers, and parks
+    /// for a SAL group or an exchange part.
+    mesh: Mesh,
+    replies: Replies,
+    /// A source of the `Tick` group being run is still to be sealed. Each tick
+    /// seals its source as it starts, and a seal takes every row pending: a push
+    /// written behind the group must not be applied ahead of one.
+    seals_ahead: bool,
+}
 
 /// `GNITZ_INJECT_KEY_SPANS_ERROR`: fail every `KeySpans` request, after its claim.
 static KEY_SPANS_ERROR: Seam = Seam::new("GNITZ_INJECT_KEY_SPANS_ERROR");
 
 impl<'c> WorkerProcess<'c> {
-    pub fn new(catalog: &'c mut CatalogEngine, sal_reader: SalReader, w2m_writer: W2mWriter, mesh: Mesh) -> Self {
-        let max_message = w2m_writer.max_message_bytes();
+    pub(super) fn new(
+        catalog: &'c mut CatalogEngine,
+        sal_reader: SalReader,
+        w2m_writer: W2mWriter,
+        mesh: Mesh,
+    ) -> Self {
         WorkerProcess {
             catalog,
             sal_reader,
-            w2m_writer,
             mesh,
-            replies: VecDeque::new(),
-            unreleased: VecDeque::new(),
-            reply_frame_budget: gnitz_foundation::env::env_num(
-                "GNITZ_REPLY_FRAME_BUDGET",
-                gnitz_wire::MAX_FRAME_PAYLOAD,
-            )
-            .min(gnitz_wire::MAX_FRAME_PAYLOAD)
-            .min(max_message),
+            replies: Replies::new(w2m_writer),
+            seals_ahead: false,
         }
     }
 
-    // ── Main event loop ────────────────────────────────────────────────
-
     /// Serve the SAL until the process is killed or fail-stops: no request ends
     /// the loop.
-    pub fn run(&mut self) -> ! {
+    pub(super) fn run(&mut self) -> ! {
         loop {
             // An owed reply goes out without waiting on the SAL, unless the ring
             // is short of room or the master holds every reply owed; then the
             // master's release or end of a hold wakes the park too.
             if self.replies.is_empty() {
                 self.mesh.park().park(|| self.sal_reader.is_empty());
-            } else if self.waits_on_master() {
-                self.w2m_writer
-                    .park_for_master(|| self.sal_reader.is_empty() && self.waits_on_master());
+            } else {
+                self.replies.wait_for_master(|| self.sal_reader.is_empty());
             }
 
             self.drain_sal();
         }
     }
 
-    /// No owed reply can leave before the master releases room or ends a hold.
-    fn waits_on_master(&self) -> bool {
-        self.w2m_writer.short_of_room() || self.sendable().next().is_none()
-    }
-
     /// Process all pending SAL message groups.
     fn drain_sal(&mut self) {
-        self.emit_reply_frame();
+        self.replies.emit_frame();
         while self.serve_next(false).is_some() {
             // One frame per request served: neither waits for the other to run dry.
-            self.emit_reply_frame();
+            self.replies.emit_frame();
         }
     }
 
@@ -111,7 +91,7 @@ impl<'c> WorkerProcess<'c> {
     ///
     /// `None` when the SAL holds no group for this worker, else whether the one
     /// served was a read.
-    pub(super) fn serve_next(&mut self, in_drive: bool) -> Option<bool> {
+    fn serve_next(&mut self, in_drive: bool) -> Option<bool> {
         let cat = &mut *self.catalog;
         match self
             .sal_reader
@@ -129,57 +109,76 @@ impl<'c> WorkerProcess<'c> {
                         .relation(route.target_id)
                         .is_some_and(|r| r.kind().is_view())
                 {
-                    self.replies.push_back(Owed::Parked(route, read.into_owned()));
+                    self.replies.park(route, read.into_owned());
                 } else {
                     let answer = answer(cat, &read);
-                    self.reply(route, answer);
+                    self.replies.reply(route, answer);
                 }
                 Some(true)
             }
-            Inbound::Apply { ack, apply, rows } => {
-                let role = drive_role(&apply);
-                if in_drive && role != DriveRole::BesideDrive {
+            // The views and the DAG are a drive's own while it runs: of the
+            // requests that touch them the master pipelines only reads, which
+            // park above, and holds every other back until the drive's ACK, as
+            // it does every round. So a drive that serves the SAL meets reads
+            // and pushes alone.
+            Inbound::Ingest { ingest, rows } => {
+                if in_drive && matches!(ingest, Ingest::DdlSync { .. }) {
+                    gnitz_fatal_abort!("{ingest:?} inside an exchange wait — diverged from the master");
+                }
+                // A group without a data block carries an empty delta.
+                if let Some(rows) = rows {
+                    if let Err(e) = self.ingest(ingest, rows) {
+                        gnitz_fatal_abort!("worker: {ingest:?} failed: {e} — aborting for restart");
+                    }
+                }
+                Some(false)
+            }
+            Inbound::Apply { ack, apply } => {
+                if in_drive {
                     gnitz_fatal_abort!("{apply:?} inside an exchange wait — diverged from the master");
                 }
-                if let Err(e) = self.apply(&apply, rows) {
+                if let Err(e) = self.apply(&apply) {
                     gnitz_fatal_abort!("worker: {apply:?} failed: {e} — aborting for restart");
                 }
-                if let Some(id) = ack {
-                    self.w2m_writer.ack(id);
-                }
+                self.replies.ack(ack);
                 // Before the next group: a parked read answers from the state its
                 // drive left.
-                if role == DriveRole::Drives {
-                    self.answer_parked();
+                if matches!(apply, Apply::Tick { .. } | Apply::Backfill { .. }) {
+                    let cat = &mut *self.catalog;
+                    self.replies.answer_parked(|read| answer(cat, read));
                 }
                 Some(false)
             }
         }
     }
 
-    /// Apply a state change. The SAL holds the change and every other worker
-    /// applies it: a worker that cannot has diverged from the log, and only a
+    /// Take a group's rows. The SAL holds them and every worker they reach
+    /// takes them: a worker that cannot has diverged from the log, and only a
     /// restart brings it back.
-    fn apply(&mut self, apply: &Apply<'_>, rows: Option<Box<Batch>>) -> Result<(), String> {
-        match *apply {
-            Apply::Flush => self.catalog.registry.checkpoint_base(),
-            Apply::FlushEph { generation } => self.catalog.flush_ephemeral_round(generation),
-            // A group without a data block carries an empty delta.
-            Apply::DdlSync { family } => {
-                let Some(rows) = rows else { return Ok(()) };
+    fn ingest(&mut self, ingest: Ingest, rows: Box<Batch>) -> Result<(), String> {
+        match ingest {
+            Ingest::DdlSync { family } => {
                 self.catalog.ddl_sync(family, *rows)?;
                 gnitz_debug!("ddl_sync tid={}", family.id());
-                Ok(())
             }
-            Apply::Push { tid, rule } => {
-                let Some(rows) = rows else { return Ok(()) };
+            Ingest::Push { tid, rule } => {
                 let row_count = rows.len();
                 self.catalog.ingest_unticked(tid, *rows, rule)?;
                 gnitz_debug!("push tid={} rows={}", tid, row_count);
-                Ok(())
             }
+        }
+        Ok(())
+    }
+
+    /// Run a round every worker runs: one that cannot has diverged from the
+    /// log, and only a restart brings it back.
+    fn apply(&mut self, apply: &Apply<'_>) -> Result<(), String> {
+        match *apply {
+            Apply::Flush => self.catalog.registry.checkpoint_base(),
+            Apply::FlushEph { generation } => self.catalog.flush_ephemeral_round(generation),
             Apply::Tick { first_round, ref tids } => {
                 for (i, &source) in tids.iter().enumerate() {
+                    self.seals_ahead = i + 1 < tids.len();
                     crate::query::tick(self, source, first_round + i as u64)?;
                 }
                 Ok(())
@@ -191,29 +190,6 @@ impl<'c> WorkerProcess<'c> {
                 })
             }
         }
-    }
-}
-
-/// How a state change relates to a drive: the exchange waits of a `Tick` or
-/// `Backfill`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DriveRole {
-    /// Applied when it arrives, inside an exchange wait too.
-    BesideDrive,
-    /// Is a drive.
-    Drives,
-    /// Never arrives inside an exchange wait.
-    Outside,
-}
-
-fn drive_role(apply: &Apply<'_>) -> DriveRole {
-    match apply {
-        // The master holds the SAL writer until every worker ACKs a base
-        // round's `Flush`, so deferred, it would wait for the drive. A read of a table behind
-        // a push is answered inside the drive, so the push is applied there too.
-        Apply::Flush | Apply::Push { .. } => DriveRole::BesideDrive,
-        Apply::Tick { .. } | Apply::Backfill { .. } => DriveRole::Drives,
-        Apply::DdlSync { .. } | Apply::FlushEph { .. } => DriveRole::Outside,
     }
 }
 
@@ -266,7 +242,6 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
             Ok(Rows::from(cat.registry.pinned_page(snapshot, tid, &page)?))
         }
         Read::Backup { ref dir } => {
-            let dir = std::str::from_utf8(dir).map_err(|_| "a backup directory that is not UTF-8".to_string())?;
             cat.registry.link_published_into(dir)?;
             Ok(no_rows())
         }

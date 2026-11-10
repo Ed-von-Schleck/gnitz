@@ -2,7 +2,7 @@
 //! the rows or blob each worker is sent.
 
 use super::format::{payload_size, PayloadRows, RequestHead};
-use super::request::{Apply, Read};
+use super::request::{Apply, Ingest, Read};
 use crate::catalog::SysFamily;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::w2m::RequestId;
@@ -95,7 +95,7 @@ impl<'a> Group<'a> {
     /// `record`: sent to the workers `rows` holds rows for, answered by none.
     pub(super) fn push(tid: u64, rule: PkRule, record: &'a [u8], rows: Routed<'a>) -> Self {
         Group {
-            request: Apply::Push { tid, rule }.encode().0,
+            request: Ingest::Push { tid, rule }.encode(),
             blob: &[],
             reads: false,
             data: match rows {
@@ -111,7 +111,7 @@ impl<'a> Group<'a> {
     /// family that reaches no worker is logged and addresses none.
     pub(super) fn ddl_sync(family: SysFamily, batch: &'a Batch) -> Self {
         Group {
-            request: Apply::DdlSync { family }.encode().0,
+            request: Ingest::DdlSync { family }.encode(),
             blob: &[],
             reads: false,
             data: Payloads::Shared(batch.wire_whole().map(|d| (family.record(), d))),

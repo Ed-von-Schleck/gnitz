@@ -1,7 +1,8 @@
-//! What a SAL group asks of a worker, typed: the master names a [`Read`] or an
-//! [`Apply`] over its bytes, a worker decodes one that borrows the SAL's, and
-//! [`Read::encode`], [`Apply::encode`] and [`SalRequest::decode`] are the one
-//! mapping between its fields and a group's header scalars and blob.
+//! What a SAL group asks of a worker, typed by who answers it: a [`Read`] by a
+//! reply train, an [`Apply`] by an ACK, an [`Ingest`] by nobody. The master
+//! names one over its bytes, a worker decodes one that borrows the SAL's, and
+//! each `encode` and [`SalRequest::decode`] are the one mapping between its
+//! fields and a group's header scalars and blob.
 
 use std::borrow::Cow;
 use std::num::NonZeroU64;
@@ -57,11 +58,11 @@ pub(crate) enum Read<'a> {
         page: Cow<'a, [u8]>,
     },
     /// Link every store this process published into the data directory `dir`.
-    Backup { dir: Cow<'a, [u8]> },
+    Backup { dir: Cow<'a, str> },
 }
 
-/// A request ACKed once applied; a worker that cannot apply it has diverged
-/// from the log and fail-stops.
+/// A request every worker runs and ACKs once done; a worker that cannot has
+/// diverged from the log and fail-stops.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Apply<'a> {
     /// Base round of a checkpoint: flush base and system tables.
@@ -69,22 +70,29 @@ pub(crate) enum Apply<'a> {
     /// Ephemeral round of a checkpoint: flush every view's traces and output
     /// stores, stamped with `generation`.
     FlushEph { generation: u64 },
-    /// The catalog rows the group carries.
-    DdlSync { family: SysFamily },
     /// The fill of each of `views`, in order, from the relations it scans.
     Backfill { views: Cow<'a, [u64]> },
-    /// The rows the group carries, a base table's held to `rule`.
-    Push { tid: u64, rule: PkRule },
     /// One tick per tid, at consecutive rounds from `first_round`.
     Tick { first_round: u64, tids: Cow<'a, [u64]> },
 }
 
-/// A decoded request: a read borrows its group's bytes, an apply owns what it
-/// carries.
+/// The rows a group carries into a relation, answered by nobody: a worker
+/// that cannot take them has diverged from the log and fail-stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ingest {
+    /// Catalog rows of `family`.
+    DdlSync { family: SysFamily },
+    /// Rows of `tid`, a base table's held to `rule`.
+    Push { tid: u64, rule: PkRule },
+}
+
+/// A decoded request: a read borrows its group's bytes, the others own what
+/// they carry.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SalRequest<'r> {
     Read(Read<'r>),
     Apply(Apply<'static>),
+    Ingest(Ingest),
 }
 
 impl Apply<'_> {
@@ -97,10 +105,20 @@ impl Apply<'_> {
         match *self {
             Apply::Flush => (head(K::Flush, 0, 0, 0), none),
             Apply::FlushEph { generation } => (head(K::FlushEph, 0, generation, 0), none),
-            Apply::DdlSync { family } => (head(K::DdlSync, family.id(), 0, 0), none),
-            Apply::Push { tid, rule } => (head(K::Push, tid, u64::from(rule == PkRule::Fresh), 0), none),
             Apply::Backfill { ref views } => (head(K::Backfill, 0, 0, 0), gnitz_wire::as_le_bytes(views)),
             Apply::Tick { first_round, ref tids } => (head(K::Tick, 0, first_round, 0), gnitz_wire::as_le_bytes(tids)),
+        }
+    }
+}
+
+impl Ingest {
+    /// The scalars the group's header carries; it has no blob. The inverse of
+    /// [`SalRequest::decode`].
+    pub(super) fn encode(self) -> RequestHead {
+        use SalMessageKind as K;
+        match self {
+            Ingest::DdlSync { family } => RequestHead::new(K::DdlSync, family.id(), 0, 0),
+            Ingest::Push { tid, rule } => RequestHead::new(K::Push, tid, u64::from(rule == PkRule::Fresh), 0),
         }
     }
 }
@@ -131,7 +149,7 @@ impl Read<'_> {
             Read::Pin { snapshot } => (head(K::Pin, 0, snapshot, 0), none),
             Read::Unpin { snapshot } => (head(K::Unpin, 0, snapshot, 0), none),
             Read::SnapshotPage { snapshot, tid, ref page } => (head(K::SnapshotPage, tid, snapshot, 0), page),
-            Read::Backup { ref dir } => (head(K::Backup, 0, 0, 0), dir),
+            Read::Backup { ref dir } => (head(K::Backup, 0, 0, 0), dir.as_bytes()),
         }
     }
 
@@ -142,15 +160,15 @@ impl Read<'_> {
 }
 
 impl<'r> SalRequest<'r> {
-    /// The inverse of [`Read::encode`] and [`Apply::encode`]. A read borrows what it reads of `blob`;
-    /// the tid lists of `Backfill` and `Tick` are owned, since a drive iterates
-    /// them while it reads later groups.
+    /// The inverse of [`Read::encode`], [`Apply::encode`] and [`Ingest::encode`].
+    /// A read borrows what it reads of `blob`; the tid lists of `Backfill` and
+    /// `Tick` are owned, since a drive iterates them while it reads later groups.
     pub(super) fn decode(head: &RequestHead, blob: &'r [u8]) -> Result<Self, String> {
         let RequestHead { kind, target_id: tid, arg0, arg1 } = *head;
         Ok(match kind {
             SalMessageKind::Flush => Apply::Flush.into(),
             SalMessageKind::FlushEph => Apply::FlushEph { generation: arg0 }.into(),
-            SalMessageKind::DdlSync => Apply::DdlSync {
+            SalMessageKind::DdlSync => Ingest::DdlSync {
                 family: SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?,
             }
             .into(),
@@ -158,7 +176,7 @@ impl<'r> SalRequest<'r> {
                 views: gnitz_wire::le_scalars(blob)?.into(),
             }
             .into(),
-            SalMessageKind::Push => Apply::Push {
+            SalMessageKind::Push => Ingest::Push {
                 tid,
                 rule: match gnitz_wire::bool_word(arg0)? {
                     true => PkRule::Fresh,
@@ -214,7 +232,10 @@ impl<'r> SalRequest<'r> {
                 page: Cow::Borrowed(blob),
             }
             .into(),
-            SalMessageKind::Backup => Read::Backup { dir: Cow::Borrowed(blob) }.into(),
+            SalMessageKind::Backup => Read::Backup {
+                dir: Cow::Borrowed(std::str::from_utf8(blob).map_err(|_| "a backup directory that is not UTF-8")?),
+            }
+            .into(),
         })
     }
 }
@@ -237,7 +258,7 @@ impl Read<'_> {
             Read::Pin { snapshot } => Read::Pin { snapshot },
             Read::Unpin { snapshot } => Read::Unpin { snapshot },
             Read::SnapshotPage { snapshot, tid, page } => Read::SnapshotPage { snapshot, tid, page: own(page) },
-            Read::Backup { dir } => Read::Backup { dir: own(dir) },
+            Read::Backup { dir } => Read::Backup { dir: Cow::Owned(dir.into_owned()) },
         }
     }
 }
@@ -251,6 +272,12 @@ impl<'r> From<Read<'r>> for SalRequest<'r> {
 impl From<Apply<'static>> for SalRequest<'_> {
     fn from(apply: Apply<'static>) -> Self {
         SalRequest::Apply(apply)
+    }
+}
+
+impl From<Ingest> for SalRequest<'_> {
+    fn from(ingest: Ingest) -> Self {
+        SalRequest::Ingest(ingest)
     }
 }
 

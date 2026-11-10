@@ -40,7 +40,7 @@ mod writer;
 
 pub(crate) use group::Routed;
 pub(crate) use reader::{Cut, Inbound, ReplyRoute, SalReader};
-pub(crate) use request::{Apply, Read};
+pub(crate) use request::{Apply, Ingest, Read};
 pub(crate) use tail::CommittedTail;
 #[cfg(test)]
 pub(crate) use writer::fixtures;

@@ -22,7 +22,7 @@ static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
 
 /// `GNITZ_INJECT_TICK_HOLD_FOR_DDL`: hold the first tick that emitted a group in
 /// flight, its gate held and its ACKs outstanding, until a writer — a DDL, or a
-/// checkpoint's ephemeral round — parks on the tick gate. With no checkpoint
+/// round of a checkpoint — parks on the tick gate. With no checkpoint
 /// asked for, a DDL then provably lands mid-tick. One-shot.
 static TICK_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_TICK_HOLD_FOR_DDL");
 

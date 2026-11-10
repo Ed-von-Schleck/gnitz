@@ -71,9 +71,8 @@ fn a_frame_no_lease_holds_is_released() {
     assert!(r.w2m.acks(0).is_empty(), "the drain read the ACK");
 }
 
-/// ACKs resolve the lease each names whatever order they come in, as a group
-/// applied inside a drive is ACKed ahead of the drive's own; and they take no
-/// room a held reply frame pins.
+/// ACKs resolve the lease each names whatever order they come in, and they
+/// take no room a held reply frame pins.
 #[test]
 fn acks_resolve_their_own_leases_in_any_order_past_a_held_frame() {
     let (r, train, mut writers) = train_lease(1, "ScanSpec");

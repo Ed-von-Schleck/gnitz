@@ -70,9 +70,10 @@ gnitz_wire::wire_enum! {
 }
 
 /// The scalars of a request, which its group's header carries: all of the
-/// request but its blob. [`Read::encode`](super::request::Read::encode) and
-/// [`Apply::encode`](super::request::Apply::encode) say what each kind stores
-/// in the two arguments.
+/// request but its blob. [`Read::encode`](super::request::Read::encode),
+/// [`Apply::encode`](super::request::Apply::encode) and
+/// [`Ingest::encode`](super::request::Ingest::encode) say what each kind
+/// stores in the two arguments.
 ///
 /// Laid out in declaration order: in the order the compiler otherwise picks,
 /// reading a verified header costs the live drain more instructions per group.
@@ -415,7 +416,10 @@ type ParsedPayload<'a> = (&'a [u8], Option<(&'a [u8], &'a [u8])>);
 /// The parts of the payload `bytes`. A payload without rows must end with its
 /// blob; the block of one with rows is the rest of it, whose length the block's
 /// decoder holds to the size the block declares.
-#[inline]
+///
+/// Always inlined: left to the inliner, it becomes a call in the live drain
+/// whenever the worker's own code around it changes shape.
+#[inline(always)]
 fn payload_parse(bytes: &[u8]) -> Result<ParsedPayload<'_>, String> {
     let Some((head, body)) = bytes.split_first_chunk::<PAYLOAD_HEAD>() else {
         return Err(format!("a payload of {} bytes holds no payload head", bytes.len()));

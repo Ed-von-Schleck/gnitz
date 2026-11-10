@@ -1,13 +1,13 @@
-use super::tests::{ask, frames, pk_keys, probe, worker_over};
+use super::reply::tests::frames;
+use super::tests::{ask, pk_keys, probe, worker_over};
 use super::*;
-use crate::runtime::sal::{SalExcl, SalFull};
+use crate::runtime::sal::{Routed, SalExcl, SalFull};
 use crate::runtime::w2m::fixtures::id;
 use crate::test_support::{
     make_batch_raw, make_schema_u64_i64, net_weight, register_identity_view, table_engine, u64_i64_cols,
 };
 use gnitz_foundation::perf::Counter;
 use gnitz_store::relation::IndexClaim;
-use gnitz_store::relation::PkRule;
 use gnitz_wire::{PkColList, PkKeys, ReadBound, ReadSpec, WireStatus};
 
 /// Requests an arm writes, unless it says otherwise: no more ACKs than an ACK
@@ -52,9 +52,15 @@ fn arm(
     assert_eq!(sent.len() + rx.acks(0).len(), frames_owed, "{label}");
     assert!(sent.iter().all(|f| f.ctrl.hdr.status == WireStatus::Ok), "{label}");
     assert_eq!(net_weight(wp.catalog, tid), holds as i64, "{label}");
+    // Per reply frame, or per request of an arm nobody answers.
+    let per = if frames_owed == 0 {
+        requests as usize
+    } else {
+        frames_owed
+    };
     println!(
         "worker_request_bench {label:<11} {:>9.1} instr/frame",
-        instructions as f64 / frames_owed as f64
+        instructions as f64 / per as f64
     );
     drop(wp);
     let dir = engine.registry.base_dir().to_owned();
@@ -66,7 +72,8 @@ fn arm(
 /// off the SAL, decoded, applied or answered, and its reply on the ring. Every
 /// arm but `spans` answers a request in one frame.
 ///
-/// `ack` is a push that carries no rows, the floor under the others. `tick` runs
+/// `empty` is a push that carries no rows, the floor under the others; it and
+/// `push` are answered by nobody, so theirs are instructions per request. `tick` runs
 /// one identity view over an empty delta. `spans` is one train over the table's
 /// second column, a chunk of spans per frame, read off an index of that column.
 #[test]
@@ -79,14 +86,14 @@ fn worker_request_bench() {
     let n = REQUESTS as usize;
     let bare = |_: &mut CatalogEngine, _: u64| ();
 
-    let ack = |excl: &mut SalExcl, tid, _: &[u8], n| excl.apply(Apply::Push { tid, rule: PkRule::Enforce }, id(n));
-    arm("ack", 0, bare, REQUESTS, ack, n, 0);
+    let empty = |excl: &mut SalExcl, tid, record: &[u8], _: u32| excl.push(tid, record, Routed::Same(None));
+    arm("empty", 0, bare, REQUESTS, empty, 0, 0);
 
     let one_row = |excl: &mut SalExcl, tid, record: &[u8], n: u32| {
         let row = make_batch_raw(&schema, &[(n as u64, 1, n as i64)]);
-        excl.acked_push(tid, record, &row, id(n))
+        excl.push(tid, record, Routed::Same(row.wire_whole()))
     };
-    arm("push", 0, bare, REQUESTS, one_row, n, REQUESTS as u64);
+    arm("push", 0, bare, REQUESTS, one_row, 0, REQUESTS as u64);
 
     let has_pk = |excl: &mut SalExcl, tid, _: &[u8], n: u32| ask(excl, probe(tid, &pk_keys(&[n as u64 % HELD])), n);
     arm("has_pk", HELD, bare, REQUESTS, has_pk, n, HELD);

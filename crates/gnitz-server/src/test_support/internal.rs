@@ -723,3 +723,28 @@ pub fn try_register_identity_view(
 pub fn register_identity_view(engine: &mut CatalogEngine, source_tid: u64, name: &str, cols: &[CatalogColumn]) -> u64 {
     try_register_identity_view(engine, source_tid, name, cols, 0, 0).unwrap()
 }
+
+/// `COUNT(*)` over `source`, a relation of `schema`, grouped by `group_cols`,
+/// registered as `name`; and its plan.
+pub fn register_count_of(
+    engine: &mut CatalogEngine,
+    source: u64,
+    schema: &SchemaDescriptor,
+    group_cols: &[u32],
+    name: &str,
+) -> (u64, gnitz_zset::stream::ReducePlan) {
+    let aggs = [gnitz_wire::AggDescriptor::COUNT_STAR];
+    // Only a global reduce owes a ground row; `ReducePlan` refuses one on a grouped reduce.
+    let plan = gnitz_zset::stream::ReducePlan::from_wire(schema, group_cols, &aggs, group_cols.is_empty()).unwrap();
+    let mut circuit = Circuit::default();
+    let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
+    circuit.reduce(
+        scan,
+        gnitz_wire::GroupAggs {
+            group_cols: group_cols.to_vec(),
+            aggs: aggs.to_vec(),
+        },
+    );
+    let view = try_register_view(engine, circuit, name, &cols_of(plan.output_schema()), 0, 0).unwrap();
+    (view, plan)
+}

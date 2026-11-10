@@ -3,11 +3,12 @@
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    col_def, cols_of, make_batch, make_schema_u64_i64, push_and_tick, register_identity_view, scan_all, scan_keyed,
-    scratch_dir, table_engine, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, EchoDrive, RowKey,
+    col_def, make_batch, make_schema_u64_i64, push_and_tick, register_count_of, register_identity_view, scan_all,
+    scan_keyed, scratch_dir, table_engine, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, EchoDrive,
+    RowKey,
 };
 use gnitz_store::relation::PkRule;
-use gnitz_wire::{AggDescriptor, Circuit, GroupAggs, ReadBound, TypeCode};
+use gnitz_wire::{Circuit, ReadBound, TypeCode};
 use gnitz_zset::stream::ReducePlan;
 use std::collections::HashMap;
 
@@ -68,30 +69,6 @@ pub(super) fn register_count(
     name: &str,
 ) -> (u64, ReducePlan) {
     register_count_of(engine, source, &make_schema_u64_i64(), group_cols, name)
-}
-
-/// [`register_count`] over a relation of `schema`.
-fn register_count_of(
-    engine: &mut CatalogEngine,
-    source: u64,
-    schema: &SchemaDescriptor,
-    group_cols: &[u32],
-    name: &str,
-) -> (u64, ReducePlan) {
-    let aggs = [AggDescriptor::COUNT_STAR];
-    // Only a global reduce owes a ground row; `ReducePlan` refuses one on a grouped reduce.
-    let plan = ReducePlan::from_wire(schema, group_cols, &aggs, group_cols.is_empty()).unwrap();
-    let mut circuit = Circuit::default();
-    let scan = circuit.input_delta(source, ReadBound::None);
-    circuit.reduce(
-        scan,
-        GroupAggs {
-            group_cols: group_cols.to_vec(),
-            aggs: aggs.to_vec(),
-        },
-    );
-    let view = try_register_view(engine, circuit, name, &cols_of(plan.output_schema()), 0, 0).unwrap();
-    (view, plan)
 }
 
 /// The Z-set a relation holds.

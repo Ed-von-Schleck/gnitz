@@ -3,7 +3,7 @@
 
 use super::format::{next_epoch, payload_rows, SalMessageKind};
 use super::log::{SalLog, SalMessage};
-use super::request::{Apply, Read, SalRequest};
+use super::request::{Apply, Ingest, Read, SalRequest};
 use crate::runtime::w2m::RequestId;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
@@ -34,21 +34,21 @@ pub(crate) struct ReplyRoute {
     pub(crate) cut: Cut,
 }
 
-/// One group addressed to a worker, decoded. A read borrows its group's SAL
-/// bytes, and with them the reader, until the next group is read; an apply owns
-/// what it carries.
+/// One group addressed to a worker, decoded, by who answers it. A read borrows
+/// its group's SAL bytes, and with them the reader, until the next group is
+/// read; the others own what they carry.
 pub(crate) enum Inbound<'a> {
-    Read {
-        route: ReplyRoute,
-        read: Read<'a>,
-    },
-    Apply {
-        /// The id the change is acknowledged on; `None` when nothing waits for it.
-        ack: Option<RequestId>,
-        apply: Apply<'static>,
-        /// Boxed, so a request moves from its decode to where it is served as a
-        /// few words: held inline, the batch would be copied whole at each of
-        /// those moves, for a request that carries none as well.
+    /// Answered by a reply train.
+    Read { route: ReplyRoute, read: Read<'a> },
+    /// Answered by one ACK on `ack`.
+    Apply { ack: RequestId, apply: Apply<'static> },
+    /// Answered by nobody.
+    Ingest {
+        ingest: Ingest,
+        /// `None` is an empty delta. Boxed, so a request moves from its decode
+        /// to where it is served as a few words: held inline, the batch would
+        /// be copied whole at each of those moves, for a request that carries
+        /// none as well.
         rows: Option<Box<Batch>>,
     },
 }
@@ -115,8 +115,9 @@ impl SalReader {
         }
     }
 
-    /// The next group addressed to this worker. The master authored it, so bytes
-    /// that do not decode fail-stop, as a corrupt header does in [`Self::next`].
+    /// The next group addressed to this worker. The master authored its head
+    /// and framing, so those failing to decode fail-stop, as a corrupt header
+    /// does in [`Self::next`]; a blob of client bytes comes back undecoded.
     /// `catalog_schema` answers what a relation's catalog record decodes to.
     #[inline]
     pub(crate) fn next_request(
@@ -138,32 +139,36 @@ impl SalReader {
             Ok(payload) => payload,
             Err(e) => undecodable(std::mem::take(e)),
         };
-        // [`SalScope::push`] and [`SalScope::ddl_sync`] write the only groups
-        // that carry rows.
-        if rows.is_some() && !matches!(msg.head.request.kind, SalMessageKind::Push | SalMessageKind::DdlSync) {
-            undecodable(format!("a {:?} group carries no rows", msg.head.request.kind));
-        }
         let what = match SalRequest::decode(&msg.head.request, blob) {
             Ok(what) => what,
             Err(e) => undecodable(e),
         };
+        // An ingest carries the group's rows and names no request id; every
+        // other group names one and carries none.
+        let answered = |rows: bool| -> RequestId {
+            if rows {
+                undecodable(format!("a {:?} group carries no rows", msg.head.request.kind));
+            }
+            let Some(id) = msg.head.reply else {
+                undecodable(format!("a {:?} group carries no request id", msg.head.request.kind))
+            };
+            id
+        };
         Some(match what {
             SalRequest::Read(read) => {
-                let Some(request_id) = msg.head.reply else {
-                    undecodable("a read group carries no request id".into())
-                };
                 let route = ReplyRoute {
                     target_id: msg.head.request.target_id,
-                    request_id,
+                    request_id: answered(rows.is_some()),
                     cut,
                 };
                 Inbound::Read { route, read }
             }
-            SalRequest::Apply(apply) => Inbound::Apply {
-                ack: msg.head.reply,
-                apply,
-                rows: rows.take().map(Box::new),
-            },
+            SalRequest::Apply(apply) => Inbound::Apply { ack: answered(rows.is_some()), apply },
+            SalRequest::Ingest(_) if msg.head.reply.is_some() => {
+                undecodable("a group of rows names a request id".into())
+            }
+            // Moved once, here: the batch is not copied out for a group that carries none.
+            SalRequest::Ingest(ingest) => Inbound::Ingest { ingest, rows: rows.take().map(Box::new) },
         })
     }
 

@@ -236,7 +236,7 @@ fn a_read_group_without_a_request_id_aborts() {
     assert_fail_stops(
         module_path!(),
         "a_read_group_without_a_request_id_aborts_internal",
-        "a read group carries no request id",
+        "a ScanSpec group carries no request id",
     );
 }
 
@@ -315,7 +315,7 @@ fn rows_on_a_group_that_carries_none_abort_internal() {
     assert!(
         matches!(
             reader.next_request(|_, _| None),
-            Some(Inbound::Apply { rows: Some(_), .. })
+            Some(Inbound::Ingest { rows: Some(_), .. })
         ),
         "the same payload decodes on a push"
     );

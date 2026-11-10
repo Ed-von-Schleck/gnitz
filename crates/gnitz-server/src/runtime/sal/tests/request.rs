@@ -18,10 +18,10 @@ fn every_request() -> Vec<SalRequest<'static>> {
     vec![
         Apply::Flush.into(),
         Apply::FlushEph { generation: 11 }.into(),
-        Apply::DdlSync { family: SysFamily::Sequence }.into(),
+        Ingest::DdlSync { family: SysFamily::Schema }.into(),
         Apply::Backfill { views: vec![13, 14].into() }.into(),
-        Apply::Push { tid: 15, rule: PkRule::Enforce }.into(),
-        Apply::Push { tid: 50, rule: PkRule::Fresh }.into(),
+        Ingest::Push { tid: 15, rule: PkRule::Enforce }.into(),
+        Ingest::Push { tid: 50, rule: PkRule::Fresh }.into(),
         Apply::Tick {
             first_round: 16,
             tids: vec![17, 18].into(),
@@ -69,7 +69,7 @@ fn every_request() -> Vec<SalRequest<'static>> {
             page: vec![48u8, 49].into(),
         }
         .into(),
-        Read::Backup { dir: b"/backup".to_vec().into() }.into(),
+        Read::Backup { dir: String::from("/backup").into() }.into(),
     ]
 }
 
@@ -80,23 +80,20 @@ fn every_request_decodes_from_its_written_group() {
     let batch = make_batch(&make_schema_u64_i64(), &[(1, 1, 10)]);
     let record = encode_schema_block(batch.schema());
     let requests = every_request();
-    let mut groups: Vec<(&SalRequest, Group)> = (requests.iter())
+    let schemas = schema_tab_batch(&[(100, "s", 1)]);
+    let groups: Vec<(&SalRequest, Group)> = (requests.iter())
         .map(|request| {
-            let group = match request {
-                SalRequest::Read(read) => Group::read(read, WorkerSet::ALL, None, id(1)),
-                SalRequest::Apply(apply) => Group::apply(apply, id(1)),
+            let group = match *request {
+                SalRequest::Read(ref read) => Group::read(read, WorkerSet::ALL, None, id(1)),
+                SalRequest::Apply(ref apply) => Group::apply(apply, id(1)),
+                SalRequest::Ingest(Ingest::Push { tid, rule }) => {
+                    Group::push(tid, rule, &record, Routed::Same(batch.wire_whole()))
+                }
+                SalRequest::Ingest(Ingest::DdlSync { family }) => Group::ddl_sync(family, &schemas),
             };
             (request, group)
         })
         .collect();
-    let push = Apply::Push { tid: 15, rule: PkRule::Fresh }.into();
-    groups.push((
-        &push,
-        Group::push(15, PkRule::Fresh, &record, Routed::Same(batch.wire_whole())),
-    ));
-    let schemas = schema_tab_batch(&[(100, "s", 1)]);
-    let ddl_sync = Apply::DdlSync { family: SysFamily::Schema }.into();
-    groups.push((&ddl_sync, Group::ddl_sync(SysFamily::Schema, &schemas)));
     let mut kinds: Vec<u8> = groups.iter().map(|(_, g)| g.request.kind.as_wire()).collect();
     kinds.sort_unstable();
     kinds.dedup();
