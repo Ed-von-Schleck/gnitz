@@ -18,7 +18,7 @@ use super::request::{Apply, Read};
 use super::tail::CommittedTail;
 use crate::catalog::SysFamily;
 use crate::runtime::park::{WorkerParks, WorkerSet};
-use crate::runtime::reactor::{Reactor, ReadyAcked};
+use crate::runtime::reactor::Reactor;
 use crate::runtime::sync::{AsyncRwLock, WriteGuard};
 use crate::runtime::w2m::RequestId;
 use gnitz_foundation::fault::Seam;
@@ -128,8 +128,13 @@ pub(crate) struct SalWriter {
 }
 
 impl SalWriter {
-    /// The writer of the boot that recovered `tail`, rewound to its live epoch.
-    pub(crate) fn boot(tail: CommittedTail, parks: WorkerParks, _: ReadyAcked) -> Self {
+    /// The writer of the boot that recovered `tail`, rewound to its live epoch
+    /// once every worker has published the position its drain starts at. A
+    /// worker publishes it behind its boot recovery, which flushes the rows it
+    /// replayed from the tail to its stores: until then the tail is those rows'
+    /// only durable copy, which the rewind gives up.
+    pub(crate) async fn boot(tail: CommittedTail, parks: WorkerParks, reactor: &Reactor) -> Self {
+        reactor.applied_through(epoch_word(tail.live_epoch(), 0)).acks().await;
         Self::rewound(tail.log(), parks, tail.live_epoch())
     }
 
@@ -165,7 +170,6 @@ impl SalWriter {
         SalExcl {
             writer: self,
             reached: WorkerSet::EMPTY,
-            in_cut: false,
             _guard: self.excl.write().await,
         }
     }
@@ -425,23 +429,18 @@ pub(crate) struct SalExcl<'a> {
     writer: &'a SalWriter,
     /// The workers groups laid out since the last [`Self::wake`] reached.
     reached: WorkerSet,
-    /// Whether the group last laid out under this hold was a read: the open
-    /// [`Cut`](super::reader::Cut) the next read joins.
-    in_cut: bool,
     _guard: WriteGuard<SalLock>,
 }
 
 impl<'a> SalExcl<'a> {
     /// Lay `g` out at `base`, unpublished, as a member of its scope's zone when
-    /// `zoned`, and return its end. A read laid out directly behind another read
-    /// of this hold joins its [`Cut`](super::reader::Cut); a refused group leaves
-    /// the cut as it was. The one encode path.
+    /// `zoned`, and return its end. The one encode path.
     fn lay_out(&mut self, g: &Group, base: u64, zoned: bool) -> Result<u64, SalFull> {
         let nw = self.writer.parks.len();
         let set = g.to.within(nw);
         let mut sizes = [0usize; MAX_WORKERS];
         let payloads = g.sizes(nw, &mut sizes);
-        let head = GroupHead::new(g.request, zoned, self.in_cut && g.reads, g.shared(), g.reply, set);
+        let head = GroupHead::new(g.request, zoned, g.shared(), g.reply, set);
         let mut workers = payloads.iter();
         let end = self
             .writer
@@ -450,7 +449,6 @@ impl<'a> SalExcl<'a> {
                 payload_encode(slot, blob, rows)
             })?;
         self.reached = self.reached.union(set);
-        self.in_cut = g.reads;
         Ok(end)
     }
 
@@ -468,11 +466,11 @@ impl<'a> SalExcl<'a> {
     }
 
     /// Write `read` to `to`, answered on `reply`; with `blobs`, worker `w` is
-    /// sent `blobs[w]` in place of the read's own blob. Consecutive reads written
-    /// under one hold form one [`Cut`](super::reader::Cut): any other group
-    /// between two of them ends it, a scope's included whether or not the scope
-    /// committed. Each read is published as it is written, so a refused one
-    /// leaves those ahead of it in the cut on their way to their workers.
+    /// sent `blobs[w]` in place of the read's own blob. The reads answered on
+    /// one `reply` are written under one hold with no other read between them,
+    /// so each worker answers them in the order written, one train per read.
+    /// Each read is published as it is written, so a refused one leaves those
+    /// ahead of it on their way to their workers.
     pub(crate) fn read(
         &mut self,
         read: Read<'_>,
@@ -483,17 +481,21 @@ impl<'a> SalExcl<'a> {
         self.write_group(&Group::read(&read, to, blobs, reply))
     }
 
-    /// Write `apply` to every worker, acknowledged on `ack`, and wake them now:
-    /// a caller may await the ACKs under this hold. A `FlushEph` is the last
-    /// group of its checkpoint: what follows it counts toward the next one.
-    pub(crate) fn apply(&mut self, apply: Apply<'_>, ack: RequestId) -> Result<(), SalFull> {
+    /// Write `apply` to every worker and wake them now: a caller may await
+    /// their ACKs under this hold. Answers the group's end as an LSN, the
+    /// position every worker's applied position reaches once it has run the
+    /// group. A `FlushEph` is the last group of its checkpoint: what follows it
+    /// counts toward the next one.
+    pub(crate) fn apply(&mut self, apply: Apply<'_>) -> Result<u64, SalFull> {
+        let w = self.writer;
         let ends_checkpoint = matches!(apply, Apply::FlushEph { .. });
-        self.write_group(&Group::apply(&apply, ack))?;
+        self.write_group(&Group::apply(&apply))?;
+        let end = w.write_cursor.get();
         if ends_checkpoint {
-            self.writer.checkpoint_floor.set(self.writer.write_cursor.get());
+            w.checkpoint_floor.set(end);
         }
         self.wake();
-        Ok(())
+        Ok(epoch_word(w.epoch.get(), end))
     }
 
     /// Open a publication scope at the published end: groups laid out in it are

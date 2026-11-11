@@ -5,8 +5,9 @@
 use super::route::with_routed;
 use super::*;
 use crate::catalog::{ZoneError, ZoneSink};
-use crate::runtime::reactor::AckLease;
+use crate::runtime::reactor::AckWait;
 use crate::runtime::sal::{Apply, SalFull, SalScope};
+use crate::runtime::sync::WriteGuard;
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::PkRule;
 use gnitz_zset::repr::MemBatch;
@@ -16,12 +17,16 @@ use gnitz_zset::repr::MemBatch;
 static BACKUP_ABORT: Seam = Seam::new("GNITZ_INJECT_BACKUP_ABORT");
 
 impl MasterDispatcher {
-    /// Write `apply` to every worker on a fresh ACK lease; they are woken at the
-    /// write, so a caller may await the ACKs under this hold.
-    fn write_acked(&self, excl: &mut SalExcl<'_>, apply: Apply<'_>) -> Result<AckLease, WireFault> {
-        let lease = self.reactor.lease_acks();
-        excl.apply(apply, lease.id())?;
-        Ok(lease)
+    /// Write `apply` to every worker, and answer the wait for all of them to
+    /// have run it; they are woken at the write, so a caller may await the ACKs
+    /// under the hold of `excl`. `_alone` is the caller's hold of the apply lock.
+    fn write_acked(
+        &self,
+        _alone: &WriteGuard<ApplyLock>,
+        excl: &mut SalExcl<'_>,
+        apply: Apply<'_>,
+    ) -> Result<AckWait, WireFault> {
+        Ok(self.reactor.applied_through(excl.apply(apply)?))
     }
 
     // -----------------------------------------------------------------------
@@ -42,19 +47,19 @@ impl MasterDispatcher {
     /// then removes every directory no live entity owns. A failed system flush
     /// returns its error without the rewind: the log's entries are those rows'
     /// only durable copy, and the committer aborts on a log left whole.
-    pub(crate) async fn checkpoint_base(&self) -> Result<(), WireFault> {
+    pub(crate) async fn checkpoint_base(&self, alone: &WriteGuard<ApplyLock>) -> Result<(), WireFault> {
         let mut excl = self.sal.lock().await;
         if self.sal.holds_pushes() {
             self.cat_mut().advance_durable_generation()?;
         }
-        let lease = self.write_acked(&mut excl, Apply::Flush)?;
-        lease.acks().await;
+        let wait = self.write_acked(alone, &mut excl, Apply::Flush)?;
+        wait.acks().await;
         self.cat_mut().flush_all_system_tables()?;
         let epoch = excl.checkpoint_reset();
         gnitz_note!("SAL checkpoint epoch={epoch}");
         // Every worker ACKed the Flush, so each has applied every DdlSync written
         // before it, and the system flush made every applied DROP durable. The
-        // checkpoint's one orphan sweep: the committer holds the tick gate a
+        // checkpoint's one orphan sweep: the committer holds the apply lock a
         // DDL body runs under through the ephemeral round, so no DDL lands
         // before it, and at boot `reconcile_child_dirs` has already swept.
         self.cat().reclaim_orphan_dirs();
@@ -71,17 +76,17 @@ impl MasterDispatcher {
     /// boot's recorded topology durable only behind the stamps taken at it, and
     /// puts a SERIAL reservation published since that rewind under the replay
     /// floor.
-    pub(crate) async fn checkpoint_ephemeral(&self) -> Result<(), WireFault> {
-        let lease = {
+    pub(crate) async fn checkpoint_ephemeral(&self, alone: &WriteGuard<ApplyLock>) -> Result<(), WireFault> {
+        let wait = {
             let mut excl = self.sal.lock().await;
             debug_assert!(
                 !self.sal.holds_pushes(),
                 "a push ahead of the ephemeral round in its epoch is integrated by the views the round stamps and replayed into them again at boot"
             );
             let generation = self.cat().durable_generation();
-            self.write_acked(&mut excl, Apply::FlushEph { generation })?
+            self.write_acked(alone, &mut excl, Apply::FlushEph { generation })?
         };
-        lease.acks().await;
+        wait.acks().await;
         self.cat_mut().flush_all_system_tables()?;
         Ok(())
     }
@@ -90,13 +95,13 @@ impl MasterDispatcher {
     /// resumable view and every index at the durable generation, which a boot
     /// that replayed a push advanced pre-fork. The workers published their base
     /// stores during recovery, and no push is admitted yet.
-    pub(crate) async fn boot_checkpoint(&self) -> Result<(), WireFault> {
+    pub(crate) async fn boot_checkpoint(&self, alone: &WriteGuard<ApplyLock>) -> Result<(), WireFault> {
         {
             let mut cat = self.cat_mut();
             let width = cat.registry.slot().of;
             cat.record_topology(width)?;
         }
-        self.checkpoint_ephemeral().await
+        self.checkpoint_ephemeral(alone).await
     }
 
     // -----------------------------------------------------------------------
@@ -105,7 +110,11 @@ impl MasterDispatcher {
 
     /// Backfill `view_ids` as one group, in id order: a view's id exceeds that of
     /// every relation it scans.
-    pub(crate) async fn backfill_views_in_dep_order(&self, view_ids: &[u64]) -> Result<(), WireFault> {
+    pub(crate) async fn backfill_views_in_dep_order(
+        &self,
+        alone: &WriteGuard<ApplyLock>,
+        view_ids: &[u64],
+    ) -> Result<(), WireFault> {
         let mut ordered = view_ids.to_vec();
         ordered.sort_unstable();
         ordered.dedup();
@@ -113,18 +122,18 @@ impl MasterDispatcher {
             return Ok(());
         }
         let backfill = Apply::Backfill { views: ordered.into() };
-        let lease = self.write_acked(&mut self.sal.lock().await, backfill)?;
-        lease.acks().await;
+        let wait = self.write_acked(alone, &mut self.sal.lock().await, backfill)?;
+        wait.acks().await;
         Ok(())
     }
 
     /// Tick every one of `tids`, in order, in one group, and await its ACKs.
-    pub(crate) async fn drain_tick(&self, tids: &[u64]) -> Result<(), WireFault> {
+    pub(crate) async fn drain_tick(&self, alone: &WriteGuard<ApplyLock>, tids: &[u64]) -> Result<(), WireFault> {
         if tids.is_empty() {
             return Ok(());
         }
-        let lease = self.emit_tick(&mut self.sal.lock().await, tids)?;
-        lease.acks().await;
+        let wait = self.emit_tick(alone, &mut self.sal.lock().await, tids)?;
+        wait.acks().await;
         Ok(())
     }
 
@@ -161,12 +170,17 @@ impl MasterDispatcher {
         Ok((value, zone_lsn))
     }
 
-    /// Write one Tick group for `tids` at consecutive tick rounds, on a fresh ACK
-    /// lease. A refused write takes no round.
-    pub(crate) fn emit_tick(&self, excl: &mut SalExcl<'_>, tids: &[u64]) -> Result<AckLease, WireFault> {
+    /// Write one Tick group for `tids` at consecutive tick rounds, and answer
+    /// the wait for its ACKs. A refused write takes no round.
+    pub(crate) fn emit_tick(
+        &self,
+        alone: &WriteGuard<ApplyLock>,
+        excl: &mut SalExcl<'_>,
+        tids: &[u64],
+    ) -> Result<AckWait, WireFault> {
         let first = self.round.get() + 1;
         let tick = Apply::Tick { first_round: first, tids: tids.into() };
-        let lease = self.write_acked(excl, tick)?;
+        let wait = self.write_acked(alone, excl, tick)?;
         self.round.set(first + tids.len() as u64 - 1);
         // At the write, not at the ACKs: a round written has already reached the
         // workers, and a ledger behind it would let a feed's gate answer "nothing
@@ -175,7 +189,7 @@ impl MasterDispatcher {
         for (&tid, round) in tids.iter().zip(first..) {
             last_tick.insert(tid, round);
         }
-        Ok(lease)
+        Ok(wait)
     }
 
     /// The last round that ticked a relation `view_id` reads, directly or
@@ -230,7 +244,7 @@ impl MasterDispatcher {
     /// the master puts its system families', each store with the entries that
     /// reach it durable. `dir` exists; everything under it is made here.
     pub(crate) async fn backup_round(&self, dir: &str) -> Result<(), WireFault> {
-        self.command(Read::Backup { dir: dir.into() }).await?;
+        self.command(Read::Backup { dir }).await?;
         if BACKUP_ABORT.armed() {
             gnitz_fatal_abort!("injected backup abort");
         }

@@ -227,7 +227,7 @@ fn sized_row(shared: &Shared, tid: u64, footprint: Option<usize>) -> Batch {
     batch
 }
 
-/// A checkpoint ticks what is pending under its own hold of the tick gate,
+/// A checkpoint ticks what is pending under its own hold of the apply lock,
 /// with no tick loop running, and that emit answers a read waiting on a drain.
 #[test]
 fn a_checkpoint_ticks_what_is_pending_and_answers_a_waiting_read() {
@@ -245,9 +245,45 @@ fn a_checkpoint_ticks_what_is_pending_and_answers_a_waiting_read() {
 
         let mut read = std::pin::pin!(fresh_read_lock(&shared, [v], reactor.now()));
         assert!(try_poll_once(read.as_mut()).is_none(), "the read waits on a drain");
-        reactor.block_on(shared.committer.final_checkpoint());
+        reactor.block_on(shared.committer.close());
         assert!(shared.ticks.all_ticked(&shared.cat().dag, [v]));
         assert!(try_poll_once(read.as_mut()).is_some_and(|locked| locked.is_ok()));
+    });
+}
+
+/// A closed committer refuses a write and a backup without queueing them; a
+/// write admitted before the close commits ahead of the closing checkpoint.
+#[test]
+fn a_closed_committer_refuses_a_write_and_a_backup() {
+    within(|| {
+        let (_tmp, mut engine) = empty_catalog();
+        let [tid] = string_tables(&mut engine, ["public.t"]);
+        let (shared, _asks) = workerless_committer(engine);
+        let disp = &shared.dispatcher;
+        disp.reactor().block_on(disp.boot_checkpoint(&disp.alone())).unwrap();
+        let write = || {
+            let rows = FamilyRows::Built(sized_row(&shared, tid, None));
+            let families = vec![TxnFamily::new(tid, WireConflictMode::Update, rows)];
+            Box::pin(shared.committer.write(families, HeldTables::default()))
+        };
+
+        let mut admitted = write();
+        assert!(try_poll_once(admitted.as_mut()).is_none(), "queued, not yet committed");
+        let epoch = disp.sal().epoch();
+        let closed = shared.committer.close();
+
+        let e = try_poll_once(write())
+            .expect("refused without waiting")
+            .expect_err("closed");
+        assert!(e.text.contains("shutting down"), "{e}");
+        let backup = try_poll_once(shared.committer.backup("dir".to_string()));
+        assert!(backup.expect("refused without waiting").is_err());
+
+        disp.reactor()
+            .block_on(admitted.as_mut())
+            .expect("admitted ahead of the close");
+        disp.reactor().block_on(closed);
+        assert_eq!(disp.sal().epoch(), epoch + 1, "the closing checkpoint ran");
     });
 }
 
@@ -261,7 +297,7 @@ fn a_settle_runs_the_checkpoint_that_is_due() {
         let (shared, _asks) = workerless_committer(engine);
         let disp = &shared.dispatcher;
         let sal = disp.sal();
-        disp.reactor().block_on(disp.boot_checkpoint()).unwrap();
+        disp.reactor().block_on(disp.boot_checkpoint(&disp.alone())).unwrap();
 
         let rows = FamilyRows::Built(sized_row(&shared, tid, Some(sal.push_room())));
         let families = vec![TxnFamily::new(tid, WireConflictMode::Update, rows)];
@@ -313,7 +349,7 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
 
         // No ephemeral round yet: the floor is offset 0.
         let limit = sal.push_room();
-        disp.reactor().block_on(disp.boot_checkpoint()).unwrap();
+        disp.reactor().block_on(disp.boot_checkpoint(&disp.alone())).unwrap();
         let room = sal.push_room();
         assert!(room < limit, "the boot checkpoint's group is in the log");
         commit(None).expect("a small write commits");
@@ -373,7 +409,7 @@ fn a_refused_merged_run_goes_again_as_its_writes() {
         let (shared, _asks) = workerless_committer(engine);
         let disp = &shared.dispatcher;
         let sal = disp.sal();
-        disp.reactor().block_on(disp.boot_checkpoint()).unwrap();
+        disp.reactor().block_on(disp.boot_checkpoint(&disp.alone())).unwrap();
         let room = sal.push_room();
 
         // Each fits behind a checkpoint, the two together in no log. The

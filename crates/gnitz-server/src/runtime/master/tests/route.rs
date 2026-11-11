@@ -315,7 +315,7 @@ fn a_probe_routes_by_the_store_it_reads() {
     let owner = |k: u64| full.owner(&k.to_be_bytes(), NW).unwrap();
     let b = (1..).find(|&k| owner(k) != owner(0)).expect("keys spread");
     let keys = pk_keys(8, &[0, b]).encode_probe();
-    let probe = |probe| Read::HasPk { tid: 16, probe, keys: (&keys[..]).into() };
+    let probe = |probe| Read::HasPk { tid: 16, probe, keys: &keys[..] };
     let index = Probe::Index(PkColList::from_slice(&[1]), NonZeroU64::MAX);
 
     let replicated = registry(schema, Placement::Replicated);
@@ -329,7 +329,7 @@ fn a_probe_routes_by_the_store_it_reads() {
         &Read::HasPk {
             tid: 16,
             probe: Probe::Pk,
-            keys: (&one[..]).into(),
+            keys: &one[..],
         },
         &replicated,
         NW,

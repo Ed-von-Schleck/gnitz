@@ -6,12 +6,11 @@
 //! **Recovery order is a crash guard**: every step is placed so a crash at any
 //! point rebuilds a view rather than silently resuming a stale one.
 
-use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::num::NonZero;
 use std::os::fd::AsRawFd;
 
-use crate::catalog::{CatalogEngine, SysFamily, UnreplayedCatalog};
+use crate::catalog::{CatalogEngine, UnreplayedCatalog};
 use gnitz_foundation::fault::Seam;
 
 use crate::runtime::affinity;
@@ -21,11 +20,11 @@ use crate::runtime::master::{MasterDispatcher, Workers};
 use crate::runtime::mesh::{self, Mesh};
 use crate::runtime::park::WorkerParks;
 use crate::runtime::reactor::{check_host, Limits, Reactor};
-use crate::runtime::sal::{CommittedTail, SalWriter};
+use crate::runtime::sal::{CommittedTail, Ingest, SalWriter};
 use crate::runtime::signals;
 use crate::runtime::sync::{select2, Either};
 use crate::runtime::tls::{ResolvedTls, TlsListener};
-use crate::runtime::w2m::{self, RequestId, W2mWriter};
+use crate::runtime::w2m::{self, W2mWriter};
 use crate::runtime::worker::WorkerProcess;
 use crate::runtime::ServerExit;
 use gnitz_store::relation::{PkRule, Residency, StoreConfig};
@@ -34,7 +33,7 @@ use gnitz_zset::algebra::Slot;
 // ---------------------------------------------------------------------------
 // SAL recovery: both drivers below read the log through `sal::CommittedTail`
 // and differ only in which groups are theirs and what they do with the bytes.
-// A group whose rows do not decode fails the boot.
+// A group that does not decode, head or rows, fails the boot.
 // ---------------------------------------------------------------------------
 
 /// Stage every committed DdlSync group above its family's replay floor into the
@@ -42,15 +41,16 @@ use gnitz_zset::algebra::Slot;
 fn stage_system_tail(tail: &CommittedTail, catalog: &mut UnreplayedCatalog) -> Result<(), String> {
     let floors = catalog.system_replay_floors();
     let mut replayed: u32 = 0;
-    for msg in tail.ddl_syncs() {
-        let Some(family) = SysFamily::from_id(msg.head.request.target_id) else {
+    for group in tail.ingests() {
+        let (Ingest::DdlSync { family }, msg) = group? else {
             continue;
         };
         let lsn = tail.lsn(&msg);
         if floors.get(&family.id()).is_none_or(|&floor| lsn <= floor) {
             continue;
         }
-        let Some(batch) = msg.rows(msg.first_payload(), |_, _| None)? else {
+        // A DdlSync group is shared: its one payload holds the rows.
+        let Some(batch) = msg.rows(msg.payloads().next().unwrap_or_default(), |_, _| None)? else {
             continue;
         };
         // Master-validated rows that already carry a drop's children.
@@ -95,8 +95,10 @@ fn recover_from_sal(tail: &CommittedTail, slot: Slot, catalog: &mut CatalogEngin
     // previously-used epoch, so every group a walk sees carries the same width.
     let mut replayed: u32 = 0;
     let mut resliced_from: Option<u32> = None;
-    for msg in tail.pushes() {
-        let tid = msg.head.request.target_id;
+    for group in tail.ingests() {
+        let (Ingest::Push { tid, .. }, msg) = group? else {
+            continue;
+        };
         // A table dropped later in the tail has no relation, and nothing to
         // recover into.
         let Some(relation) = catalog.registry.relation(tid) else {
@@ -153,8 +155,8 @@ fn recover_from_sal(tail: &CommittedTail, slot: Slot, catalog: &mut CatalogEngin
     Ok(())
 }
 
-/// Worker-boot catalog recovery. On `Err` the worker exits without its ready
-/// ACK, which fails the boot.
+/// Worker-boot catalog recovery. On `Err` the worker exits without publishing
+/// its position, which fails the boot.
 fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: &CommittedTail, slot: Slot) -> Result<(), String> {
     // Before any other catalog work, and before the replay below, which
     // projects the tail into each index exactly once.
@@ -245,7 +247,8 @@ fn run_worker_child(
     }
 
     let sal_reader = tail.reader(slot.rank);
-    w2m_writer.ack(RequestId::BOOT_READY);
+    // The boot ACK: the recovery above has flushed what it replayed.
+    w2m_writer.applied(sal_reader.position());
     WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh).run()
 }
 
@@ -305,6 +308,8 @@ fn fork_workers(
 /// rewound, ending in the checkpoint a clean restart resumes from.
 /// `pushed` holds the base tables the tail pushed to.
 async fn master_post_fork_recovery(disp: &MasterDispatcher, pushed: BTreeSet<u64>) -> Result<(), String> {
+    // Boot is the lock's only holder: no task of the executor exists yet.
+    let alone = disp.apply_lock().await;
     // The scanned ones: only a replayed push lands rows above a base store's cut,
     // and the backfill below reads at the cut. A view's operator state needs no
     // tick: the boot checkpoint opens every resumed view's.
@@ -312,7 +317,7 @@ async fn master_post_fork_recovery(disp: &MasterDispatcher, pushed: BTreeSet<u64
         let cat = disp.cat();
         pushed.into_iter().filter(|&t| cat.dag.is_scanned(t)).collect()
     };
-    disp.drain_tick(&ticked)
+    disp.drain_tick(&alone, &ticked)
         .await
         .map_err(|e| format!("recovery tick sweep failed: {e}"))?;
 
@@ -325,7 +330,7 @@ async fn master_post_fork_recovery(disp: &MasterDispatcher, pushed: BTreeSet<u64
     // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
     // E2E): 0 ⇒ every view resumed from its checkpoint.
     gnitz_note!("recovery: rebuilding {} invalid view(s)", invalid.len());
-    disp.backfill_views_in_dep_order(&invalid)
+    disp.backfill_views_in_dep_order(&alone, &invalid)
         .await
         .map_err(|e| format!("invalid-view rebuild failed: {e}"))?;
 
@@ -334,7 +339,7 @@ async fn master_post_fork_recovery(disp: &MasterDispatcher, pushed: BTreeSet<u64
     // A full checkpoint before the socket opens, so a clean restart resumes from
     // it. No drain — recovery already drained everything and no pushes are
     // admitted yet.
-    disp.boot_checkpoint()
+    disp.boot_checkpoint(&alone)
         .await
         .map_err(|e| format!("boot checkpoint failed: {e}"))?;
     Ok(())
@@ -423,36 +428,38 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     let workers = fork_workers(&mut catalog, data_dir, &tail, workers, pinning.as_ref())?;
 
     // --- Parent process ---
-    let (reactor, ready) = Reactor::new(limits, receiver).map_err(|e| format!("io_uring init failed: {e}"))?;
-    let serving = Cell::new(false);
-    let served = async {
+    let reactor = Reactor::new(limits, receiver).map_err(|e| format!("io_uring init failed: {e}"))?;
+    // One watch, raced against both phases below: a worker's death would leave
+    // a wait of the recovery, or every request a worker answers, waiting
+    // forever. `workers` drops at the return, which kills them: after the final
+    // checkpoint, a death, or a failed boot.
+    let mut death = std::pin::pin!(workers.death(&reactor));
+    let recovered = async {
         let pushed = tail.pushed().clone();
-        let sal = SalWriter::boot(tail, parks, ready.await);
+        let sal = SalWriter::boot(tail, parks, &reactor).await;
         inject_recovery_panic("reset");
         let dispatcher = MasterDispatcher::new(catalog, sal, reactor.clone());
         master_post_fork_recovery(&dispatcher, pushed).await?;
-        let listeners = listen::bind_listeners(data_dir, &args.socket_path, tls)?;
-        serving.set(true);
-        executor::serve(dispatcher, args.backup_dir, listeners).await;
-        Ok(ServerExit::Clean)
+        Ok::<_, String>(dispatcher)
     };
-    // Raced against a worker's death, which would leave a wait of the recovery,
-    // or every request a worker answers, waiting forever. `workers` drops at the
-    // return, which kills them: after the final checkpoint, a death, or a
-    // failed recovery.
-    reactor.block_on(async {
-        match select2(served, workers.death(&reactor)).await {
-            Either::A(served) => served,
-            Either::B(w) if serving.get() => {
-                gnitz_error!("Worker {w} crashed (log: {}); workers stopped", worker_log(data_dir, w));
-                Ok(ServerExit::WorkerDied)
-            }
-            Either::B(w) => Err(format!(
+    let dispatcher = match reactor.block_on(select2(recovered, death.as_mut())) {
+        Either::A(recovered) => recovered?,
+        Either::B(w) => {
+            return Err(format!(
                 "worker {w} exited during recovery (log: {})",
                 worker_log(data_dir, w)
-            )),
+            ))
         }
-    })
+    };
+    // Outside the loop: the bind may sleep on an address still in use.
+    let listeners = listen::bind_listeners(data_dir, &args.socket_path, tls)?;
+    match reactor.block_on(select2(executor::serve(dispatcher, args.backup_dir, listeners), death)) {
+        Either::A(()) => Ok(ServerExit::Clean),
+        Either::B(w) => {
+            gnitz_error!("Worker {w} crashed (log: {}); workers stopped", worker_log(data_dir, w));
+            Ok(ServerExit::WorkerDied)
+        }
+    }
 }
 
 #[cfg(test)]

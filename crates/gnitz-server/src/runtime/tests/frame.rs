@@ -74,3 +74,26 @@ fn a_control_only_frame_round_trips_and_no_prefix_decodes() {
         }
     }
 }
+
+/// A fault frame carries its fault's status and its text, cut at the last
+/// character boundary within [`MAX_FAULT_TEXT`] bytes, so the fault of a
+/// request that was a whole frame of echoed text is itself a frame.
+#[test]
+fn a_fault_frame_carries_a_bounded_prefix_of_its_text() {
+    let short = WireFault::from("no such relation");
+    assert_eq!(WireMsg::fault(&short).blob, short.text.as_bytes());
+
+    let kept = "x".repeat(MAX_FAULT_TEXT - 1);
+    let straddling = WireFault {
+        status: WireStatus::NotFound,
+        text: format!("{kept}\u{e9}{}", "y".repeat(100)),
+    };
+    let msg = WireMsg::fault(&straddling);
+    assert_eq!(msg.status, WireStatus::NotFound);
+    assert_eq!(msg.blob, kept.as_bytes());
+
+    let echo = WireFault::from("x".repeat(gnitz_wire::MAX_FRAME_PAYLOAD));
+    let msg = WireMsg::fault(&echo);
+    assert_eq!(msg.blob.len(), MAX_FAULT_TEXT);
+    assert!(msg.check_size().is_ok());
+}

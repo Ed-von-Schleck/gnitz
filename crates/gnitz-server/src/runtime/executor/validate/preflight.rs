@@ -73,7 +73,8 @@ enum RetireVerb {
 struct ParentDelta {
     /// Values the bundle removed, each under the verb of the write that retired it.
     retired: FxHashMap<u128, RetireVerb>,
-    /// The surviving rows' non-NULL values.
+    /// The surviving rows' non-NULL values. Empty for a table's whole key: there
+    /// the fold's own keys answer, which F1 plans against and no deleted key is.
     added: FxHashSet<u128>,
 }
 
@@ -115,23 +116,23 @@ async fn execute_probe_burst<P>(
     if checks.is_empty() {
         return Ok(());
     }
-    let leases = disp
+    let mut lease = disp
         .scan_cut(|cut| {
-            let mut leases = Vec::with_capacity(checks.len());
             for check in checks.iter() {
-                leases.push(cut.read(Read::HasPk {
+                cut.read(Read::HasPk {
                     tid: check.tid,
                     probe: check.probe,
-                    keys: (&check.keys[..]).into(),
-                })?);
+                    keys: &check.keys[..],
+                })?;
             }
-            Ok(leases)
+            Ok(())
         })
         .await?;
 
-    for (lease, check) in leases.iter().zip(checks) {
+    for check in checks.iter_mut() {
         let reply = check.reply;
-        while let Some(f) = lease.next().await? {
+        let train = lease.next_train().await;
+        while let Some(f) = train.next().await? {
             sink(check, &f.rows(&reply))?;
         }
     }
@@ -341,10 +342,10 @@ fn plan_pk_checks<'a>(
 const COLUMNAR_SPANS_MIN_ROWS: usize = 3;
 
 /// Rule U-SEC, planning half: every (table, unique index)'s surviving spans,
-/// those its filter proves absent claimed in `claims`, with one
-/// committed-holder probe appended to `checks` for the rest. Two surviving
-/// rows claiming one span fill an empty `violation`, and their index plans no
-/// probe and claims nothing.
+/// claimed in `claims` where its filter proves one absent, with one
+/// committed-holder probe appended to `checks` for the spans it cannot. Two
+/// surviving rows claiming one span fill an empty `violation`, and their index
+/// plans no probe and claims nothing.
 fn plan_unique_checks<'a>(
     cat: &CatalogEngine,
     caches: &Checks,
@@ -383,8 +384,11 @@ fn plan_unique_checks<'a>(
                 continue;
             }
 
-            // A span the filter proves absent has no committed holder to answer for.
-            claims.extend(caches.unique_filter_retain_possible(tid, col_indices, &mut keys));
+            // A span the filter proves absent has no committed holder to answer
+            // for, and is one the filter takes if the write is admitted.
+            if caches.unique_filter_retain_possible(tid, col_indices, &mut keys) {
+                claims.push(SpanClaim { tid, cols: col_indices, key_size, spans });
+            }
             if keys.is_empty() {
                 continue;
             }
@@ -507,13 +511,22 @@ fn resolve_parent_deltas(b: &TxnBundle<'_>, checks: &[Check<Rule<'_>>], children
     for (ptid, pcol) in needed {
         let t = b.table(ptid);
         let delta = match t.schema.locate(pcol) {
+            // The whole key: a deleted key is the value that leaves, committed or
+            // not, since no other row holds it.
+            ColumnLocator::Pk { .. } if t.schema.lone_pk_col() == Some(pcol) => ParentDelta {
+                retired: t
+                    .fold
+                    .iter()
+                    .filter(|(_, e)| matches!(e.last, FoldOp::Deleted))
+                    .map(|(pk, _)| (gnitz_wire::widen_pk_be(pk), RetireVerb::Delete))
+                    .collect(),
+                added: FxHashSet::default(),
+            },
+            // A key member: a deleted key retires its value only where it was committed.
             ColumnLocator::Pk { byte_off, size, .. } => {
                 let (off, size) = (byte_off as usize, size as usize);
-                let lone = t.schema.lone_pk_col() == Some(pcol);
-                // A surviving row holds its own key; a deleted one's value is the
-                // whole key, which no other row holds, where it is the lone column.
                 parent_retired_added(b, ptid, pcol, |pk, e| {
-                    (matches!(e.last, FoldOp::Deleted) && (lone || e.committed))
+                    (matches!(e.last, FoldOp::Deleted) && e.committed)
                         .then(|| gnitz_wire::widen_pk_be(&pk[off..off + size]))
                 })
             }
@@ -640,7 +653,9 @@ async fn removed_references(
     loop {
         for (edge, cascades, values) in &mut seeds {
             if *cascades {
-                // A value a surviving row of the bundle holds has not left.
+                // A key member's value a surviving row of the bundle holds has not
+                // left. A found row's whole key leaves with the row, so it is asked
+                // about at once.
                 if let Some(d) = deltas.get(&delta_key(edge)) {
                     values.retain(|v| !d.added.contains(v));
                 }

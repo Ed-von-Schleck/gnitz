@@ -6,7 +6,6 @@ use gnitz_foundation::perf::{voluntary_ctx_switches, Counter};
 use super::super::test_support::*;
 use super::*;
 use crate::runtime::w2m::fixtures::id;
-use crate::runtime::w2m::RequestId;
 
 const PASSES: u64 = 100_000;
 
@@ -46,8 +45,8 @@ fn arm(label: &str, r: Reactor, park: impl AsyncFn() + 'static, mut publish: imp
 /// `task` wakes itself, and is the floor under the others. `op` is a one-shot op
 /// through the ring, `op+deadline` the same raced against a timer as every client
 /// send is. `recv` is one client frame through the armed recv and the
-/// connection's queue. `acks` is a lease over every worker, answered by each, and
-/// `train` one row frame of a scan's reply.
+/// connection's queue. `acks` is a wait on a position every worker publishes,
+/// and `train` one row frame of a scan's reply.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn reactor_pass_bench() {
@@ -81,18 +80,15 @@ fn reactor_pass_bench() {
 
     for nw in [1, 4, 16] {
         let (r, mut writers) = reactor_with_rings(nw);
-        // The wire value of the live lease's id, 0 before the first.
-        let id = Rc::new(Cell::new(0));
-        let (r2, leased) = (r.clone(), Rc::clone(&id));
+        // The position the task waits on, 0 before its first wait.
+        let awaited = Rc::new(Cell::new(0));
+        let (r2, next) = (r.clone(), Rc::clone(&awaited));
         let acks = async move || {
-            let lease = r2.lease_acks();
-            leased.set(lease.id().get());
-            lease.acks().await;
+            next.set(next.get() + 1);
+            r2.applied_through(next.get()).acks().await;
         };
         arm(&format!("acks nw={nw}"), r, acks, || {
-            if let Some(id) = RequestId::from_wire(id.get()) {
-                writers.iter_mut().for_each(|w| w.ack(id));
-            }
+            writers.iter_mut().for_each(|w| w.applied(awaited.get()));
         });
     }
 
@@ -100,7 +96,9 @@ fn reactor_pass_bench() {
     let id = lease.id();
     let schema = crate::test_support::make_schema_u64_i64();
     let rows = crate::test_support::make_batch(&schema, &[(1, 1, 0)]);
-    let next = async move || assert!(matches!(black_box(lease.next().await), Ok(Some(_))));
+    // Leaked: the task parks on the lease's one train for as long as it runs.
+    let train = train_of(Box::leak(Box::new(lease)));
+    let next = async move || assert!(matches!(black_box(train.next().await), Ok(Some(_))));
     arm("train", r, next, || {
         drop(writers[0].send_train_frame(id, false, Some(&rows)))
     });
@@ -110,7 +108,7 @@ fn reactor_pass_bench() {
 /// that park costs the workers.
 ///
 /// Each worker publishes `N` frames from a thread of its own while the reactor
-/// runs its loop: frames no lease takes, then the ACK the run ends on. The
+/// runs its loop: frames no lease takes, then the position the run ends on. The
 /// publish that takes an arm spends a `FUTEX_WAKE`, counted by the park itself.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
@@ -119,7 +117,7 @@ fn reactor_flood_bench() {
 
     let counter = Counter::instructions();
     for nw in [1, 4, 16] {
-        let (r, ready, writers) = booting_reactor(nw);
+        let (r, writers) = reactor_with_rings(nw);
         let wakes_before = r.w2m.wakes();
         let (instructions, sleeps) = std::thread::scope(|s| {
             for mut writer in writers {
@@ -127,11 +125,11 @@ fn reactor_flood_bench() {
                     for n in 2..=N {
                         writer.send_msg(id(n), &Default::default());
                     }
-                    writer.ack(RequestId::BOOT_READY);
+                    writer.applied(1);
                 });
             }
             let before = voluntary_ctx_switches();
-            let (_, instructions) = counter.measure(|| r.block_on(ready));
+            let (_, instructions) = counter.measure(|| r.block_on(r.applied_through(1).acks()));
             (instructions, voluntary_ctx_switches() - before)
         });
         let wakes = r.w2m.wakes() - wakes_before;
@@ -146,12 +144,12 @@ fn reactor_flood_bench() {
 }
 
 /// What one broadcast round costs in the regime of every checkpoint, tick, DDL
-/// and scan: the master asleep in its park, and every worker answering one lease
-/// over all of them.
+/// and scan: the master asleep in its park, and every worker answering one
+/// round sent to all of them.
 ///
 /// Each worker is a thread that polls for a new round every 100 µs with a plain
 /// sleep, which also stands for its answer latency, and ACKs it. The master runs
-/// `ROUNDS` leases, each resolving only on its last ACK, so the loop finishing is
+/// `ROUNDS` waits, each resolving only on its last ACK, so the loop finishing is
 /// the proof every round took `nw` ACKs. The publish that takes an arm spends a
 /// `FUTEX_WAKE`, counted by the park itself; `perf stat -e
 /// syscalls:sys_enter_futex` over this test run alone counts the same wakes, the
@@ -159,13 +157,13 @@ fn reactor_flood_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn reactor_round_bench() {
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    const ROUNDS: u32 = 3000;
+    const ROUNDS: u64 = 3000;
 
     for nw in [1, 4, 16] {
         let (r, writers) = reactor_with_rings(nw);
-        let round = AtomicU32::new(0); // 0: no round yet
+        let round = AtomicU64::new(0); // 0: no round yet
         let stop = AtomicBool::new(false);
         let wakes_before = r.w2m.wakes();
         let sleeps = std::thread::scope(|s| {
@@ -175,19 +173,18 @@ fn reactor_round_bench() {
                     let mut last = 0;
                     while !stop.load(Ordering::Acquire) {
                         std::thread::sleep(std::time::Duration::from_micros(100));
-                        let id = round.load(Ordering::Acquire);
-                        if let Some(req) = RequestId::from_wire(id).filter(|_| id != last) {
-                            writer.ack(req);
-                            last = id;
+                        let at = round.load(Ordering::Acquire);
+                        if at != last {
+                            writer.applied(at);
+                            last = at;
                         }
                     }
                 });
             }
             let before = voluntary_ctx_switches();
-            for _ in 0..ROUNDS {
-                let lease = r.lease_acks();
-                round.store(lease.id().get(), Ordering::Release);
-                r.block_on(lease.acks());
+            for at in 1..=ROUNDS {
+                round.store(at, Ordering::Release);
+                r.block_on(r.applied_through(at).acks());
             }
             let sleeps = voluntary_ctx_switches() - before;
             stop.store(true, Ordering::Release);

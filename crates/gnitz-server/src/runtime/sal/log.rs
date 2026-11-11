@@ -61,9 +61,9 @@ unsafe fn word_atomic<'a>(sal_ptr: *const u8, offset: usize) -> &'a AtomicU64 {
 /// One SAL group as a reader sees it: the header verified at its own offset,
 /// and the payload bytes its directory describes.
 pub(crate) struct SalMessage<'a> {
-    pub(crate) head: GroupHead,
+    pub(super) head: GroupHead,
     /// The group's byte offset in the ring — what a recovery error names.
-    pub(crate) base: u64,
+    pub(super) base: u64,
     /// The offset past the group.
     pub(super) end: u64,
     /// The group's payload bytes, from the header's end to the end of the group.
@@ -88,12 +88,6 @@ impl<'a> SalMessage<'a> {
     pub(crate) fn payloads(&self) -> impl Iterator<Item = &'a [u8]> + use<'a> {
         let payload = self.payload;
         payload_spans(dir_sizes(self.dir)).map(move |(off, sz)| &payload[off..off + sz])
-    }
-
-    /// The group's first payload — a shared group's one, which a `DdlSync`
-    /// group always is — and no bytes on a group that holds none.
-    pub(crate) fn first_payload(&self) -> &'a [u8] {
-        &self.payload[..dir_sizes(self.dir).next().unwrap_or(0)]
     }
 
     /// The worker count the group was written at.

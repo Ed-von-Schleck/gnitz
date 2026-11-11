@@ -49,7 +49,6 @@ fn marking_durable_wakes_the_waiters_at_or_below_it_and_no_other() {
     durable.mark(9);
     assert_eq!(woken(), [1, 1, 2], "once per time it parked");
     assert_eq!(poll(2), Poll::Ready(()));
-    assert!(durable.waiters.borrow().is_empty());
 }
 
 /// An fdatasync makes durable what was published when it was submitted and no

@@ -1,15 +1,15 @@
 //! Single-threaded io_uring reactor: the master process's one event loop, driven
 //! by [`Reactor::block_on`] alone. A task's waker is its key (see `waker_wake`);
 //! a one-CQE awaiter polls its op's slot, next-of-many awaiters park in
-//! a [`WakeQueue`](crate::runtime::sync::WakeQueue), an ACK round parks on its
-//! lease's route until every launched worker has answered, and every deadline
-//! sits in one deadline map.
+//! a [`WakeQueue`](crate::runtime::sync::WakeQueue), an ACK round parks on the
+//! applied [`Level`] until every launched worker has applied the log through
+//! its group, and every deadline sits in one deadline map.
 //!
 //! This file holds the reactor's state and the CQE `user_data` encoding. The
 //! rest is split by concept: `runloop` (scheduling, the pass and its sleep on
-//! the W2M park, CQE dispatch), `op` (one-shot ops), `lease` (W2M ingest and
-//! the leases it routes to), `conn` (client connections and their limits),
-//! `timer` (deadlines) and `uring` (the ring).
+//! the W2M park, CQE dispatch), `op` (one-shot ops), `lease` (W2M ingest, the
+//! applied level it raises and the leases it routes to), `conn` (client
+//! connections and their limits), `timer` (deadlines) and `uring` (the ring).
 //!
 //! The reactor reads the W2M rings (`w2m`, `park`) and shares the task
 //! primitives of `sync`; it names nothing that schedules work on it (`sal`,
@@ -28,6 +28,7 @@ use slab::Slab;
 
 use self::uring::IoUringRing;
 
+use crate::runtime::sync::Level;
 use crate::runtime::w2m::W2mReceiver;
 
 mod conn;
@@ -40,7 +41,7 @@ mod timer;
 mod uring;
 
 pub(crate) use conn::{Accepted, ClientConn, Limits, PeerGone, RecvBuf, RecvEnd, SendBody, Session};
-pub(crate) use lease::{AckLease, ReadyAcked, TrainFrame, TrainLease};
+pub(crate) use lease::{AckWait, Train, TrainLease};
 pub(crate) use uring::check_host;
 
 // ---------------------------------------------------------------------------
@@ -80,6 +81,9 @@ pub(crate) struct ReactorShared {
     ops: op::Ops,
     timers: timer::Timers,
     routes: RefCell<lease::Routes>,
+    /// How far every launched worker has applied the log: the lowest position
+    /// any of them has published.
+    applied: Level,
     conns: conn::Conns,
     w2m: W2mReceiver,
     _thread: runloop::ThreadClaim,
@@ -105,21 +109,18 @@ impl std::ops::Deref for Reactor {
 }
 
 impl Reactor {
-    /// The reactor, and the future that resolves once every worker has ACKed
-    /// its boot recovery.
-    pub(crate) fn new(limits: Limits, w2m: W2mReceiver) -> std::io::Result<(Self, impl Future<Output = ReadyAcked>)> {
-        let reactor = Reactor(Rc::new(ReactorShared {
+    pub(crate) fn new(limits: Limits, w2m: W2mReceiver) -> std::io::Result<Self> {
+        Ok(Reactor(Rc::new(ReactorShared {
             ring: RefCell::new(IoUringRing::new()?),
             tasks: RefCell::new(Slab::new()),
             parked: Cell::new(false),
             ops: op::Ops::new(),
             timers: timer::Timers::new(),
             routes: RefCell::new(lease::Routes::new()),
+            applied: Level::default(),
             conns: conn::Conns::new(limits),
             w2m,
             _thread: runloop::ThreadClaim::take(),
-        }));
-        let ready = reactor.boot_ready();
-        Ok((reactor, ready))
+        })))
     }
 }

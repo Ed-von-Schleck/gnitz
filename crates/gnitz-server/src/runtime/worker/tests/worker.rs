@@ -48,22 +48,27 @@ pub(super) fn ask(excl: &mut SalExcl, read: Read<'_>, request_id: u32) -> Result
     excl.read(read, WorkerSet::ALL, None, id(request_id))
 }
 
-/// An unbounded read of every row of `tid`, whose rows lay out as `schema`.
-fn scan(tid: u64, schema: &SchemaDescriptor) -> Read<'static> {
+/// The encoded spec of an unbounded read of every row.
+fn all_rows() -> Vec<u8> {
+    ReadSpec::all_rows(ReadBound::None).encode()
+}
+
+/// A read of `tid` under `spec`, whose rows lay out as `schema`.
+fn scan<'a>(tid: u64, schema: &SchemaDescriptor, spec: &'a [u8]) -> Read<'a> {
     Read::ScanSpec {
         tid,
         reply_layout: schema.layout_digest(),
-        spec: ReadSpec::all_rows(ReadBound::None).encode().into(),
+        spec,
     }
 }
 
-/// An unbounded delta read of every round of `view` after tick 0, whose rows lay out as `schema`.
-fn delta(view: u64, schema: &SchemaDescriptor) -> Read<'static> {
+/// A delta read of every round of `view` after tick 0 under `spec`, whose rows lay out as `schema`.
+fn delta<'a>(view: u64, schema: &SchemaDescriptor, spec: &'a [u8]) -> Read<'a> {
     Read::Delta {
         view,
         after_tick: 0,
         reply_layout: schema.layout_digest(),
-        spec: ReadSpec::all_rows(ReadBound::None).encode().into(),
+        spec,
     }
 }
 
@@ -76,7 +81,7 @@ pub(super) fn pk_keys(ids: &[u64]) -> Vec<u8> {
 
 /// A PK probe of `tid` at `keys`.
 pub(super) fn probe(tid: u64, keys: &[u8]) -> Read<'_> {
-    Read::HasPk { tid, probe: Probe::Pk, keys: keys.into() }
+    Read::HasPk { tid, probe: Probe::Pk, keys }
 }
 
 /// Serve every group on the SAL as an exchange wait does: `serve_next(true)`.
@@ -98,16 +103,17 @@ fn in_wait_dispositions() {
     let claim = IndexClaim::Index { id: vid + 1, unique: false };
     engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
     let schema = make_schema_u64_i64();
+    let spec = all_rows();
     let record = engine.wire_target(tid).unwrap().1.clone();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
     let spans = Read::KeySpans { tid, cols, claim: false };
-    // Each under a hold of its own: no two reads share a cut.
+    // Each on an id of its own: no two reads share a lease.
     let reads = [
-        scan(vid, &schema),
-        delta(vid, &schema),
-        scan(tid, &schema),
+        scan(vid, &schema, &spec),
+        delta(vid, &schema, &spec),
+        scan(tid, &schema, &spec),
         spans,
         probe(tid, &[]),
     ];
@@ -126,7 +132,7 @@ fn in_wait_dispositions() {
     assert_eq!(owed(&wp.replies), [("parked", 1), ("parked", 2), ("train", 4)]);
     let out = frames(&rx);
     assert_eq!(reqs(&out), [3, 5]);
-    assert!(rx.acks(0).is_empty(), "nothing served in a wait is ACKed");
+    assert_eq!(rx.lowest_applied(), 0, "nothing served in a wait is ACKed");
     assert_eq!(
         weighted_rows(&scan_all(wp.catalog, tid)),
         weighted_rows(&row),
@@ -144,9 +150,9 @@ fn in_wait_dispositions() {
 }
 
 /// One Tick group carrying two tids ticks both — each drains its buffered
-/// delta — and ACKs once.
+/// delta — and is ACKed at the position its write answered.
 #[test]
-fn a_two_tid_tick_group_ticks_both_and_acks_once() {
+fn a_two_tid_tick_group_ticks_both_and_acks_its_end() {
     let dir = crate::test_support::scratch_dir("worker", "two_tid_tick");
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
     let schema = make_schema_u64_i64();
@@ -168,13 +174,13 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
         first_round: 7,
         tids: vec![500, 501].into(),
     };
-    sal.excl().apply(tick, id(9)).expect("group fits");
+    let at = sal.excl().apply(tick).expect("group fits");
     wp.drain_sal();
 
     for tid in [500, 501] {
         assert!(wp.catalog.registry.seal(tid).unwrap().is_none(), "tid {tid} was ticked");
     }
-    assert_eq!(rx.acks(0), [9], "the group ACKs once");
+    assert_eq!(rx.lowest_applied(), at, "the group is ACKed at its end");
     assert!(frames(&rx).is_empty(), "an ACK takes no reply slot");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -185,11 +191,12 @@ fn a_two_tid_tick_group_ticks_both_and_acks_once() {
 fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
     let (mut engine, tid) = table_engine("worker", "push_behind_read", 1, &u64_i64_cols());
     let schema = make_schema_u64_i64();
+    let spec = all_rows();
     let record = engine.wire_target(tid).unwrap().1.clone();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
-    ask(&mut sal.excl(), scan(tid, &schema), 1).expect("group fits");
+    ask(&mut sal.excl(), scan(tid, &schema, &spec), 1).expect("group fits");
     sal.excl()
         .push(tid, &record, Routed::Same(row.wire_whole()))
         .expect("group fits");
@@ -202,57 +209,60 @@ fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
     assert_eq!(weighted_rows(&scan_all(wp.catalog, tid)), weighted_rows(&row));
 }
 
-/// A view read drained inside an exchange wait parks, and the cut member behind
-/// it — a base-table read, answered in the wait — stays behind it: the view's
-/// reply reaches the ring first.
+/// A view read drained inside an exchange wait parks, and the read behind it
+/// on its lease — a base-table read, answered in the wait — stays behind it:
+/// the view's reply reaches the ring first.
 #[test]
-fn a_parked_view_read_answers_ahead_of_the_cut_member_behind_it() {
+fn a_parked_view_read_answers_ahead_of_the_read_behind_it_on_its_lease() {
     let (mut engine, tid) = table_engine("worker", "parked_view_read", 1, &u64_i64_cols());
     let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let schema = make_schema_u64_i64();
+    let spec = all_rows();
     let held = make_batch_raw(&schema, &[(1, 1, 10)]);
     engine.registry.ingest(tid, held.clone()).unwrap();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
     {
         let mut excl = sal.excl();
-        ask(&mut excl, scan(vid, &schema), 1).expect("group fits");
-        ask(&mut excl, scan(tid, &schema), 2).expect("group fits");
+        ask(&mut excl, scan(vid, &schema, &spec), 1).expect("group fits");
+        ask(&mut excl, scan(tid, &schema, &spec), 1).expect("group fits");
     }
     drain_in_wait(&mut wp);
-    assert_eq!(owed(&wp.replies), [("parked", 1), ("train", 2)]);
-    assert!(frames(&rx).is_empty(), "nothing of the cut passes its parked member");
+    assert_eq!(owed(&wp.replies), [("parked", 1), ("train", 1)]);
+    assert!(frames(&rx).is_empty(), "nothing of the lease passes its parked read");
 
     let cat = &mut *wp.catalog;
     wp.replies.answer_parked(|read| answer(cat, read));
-    assert_eq!(owed(&wp.replies), [("train", 2)]);
+    assert_eq!(owed(&wp.replies), [("train", 1)]);
     drain(&mut wp.replies);
     let out = frames(&rx);
-    assert_eq!(reqs(&out), [1, 2]);
+    assert_eq!(reqs(&out), [1, 1]);
+    assert!(out.iter().all(|f| f.ctrl.hdr.flags.scan_last), "one frame per read");
     assert!(out[0].rows(&schema).is_empty(), "no tick has fed the view");
     assert_eq!(weighted_rows(&out[1].rows(&schema)), weighted_rows(&held));
 }
 
 /// Every probe of a validation burst answers from inside an exchange wait,
-/// past what another cut owes.
+/// past what another lease owes.
 #[test]
-fn a_burst_passes_what_another_cut_owes() {
+fn a_burst_passes_what_another_lease_owes() {
     let (mut engine, tid) = table_engine("worker", "burst", 1, &u64_i64_cols());
     let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let schema = make_schema_u64_i64();
+    let spec = all_rows();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
     let keys = pk_keys(&[1]);
-    ask(&mut sal.excl(), delta(vid, &schema), 1).expect("group fits");
+    ask(&mut sal.excl(), delta(vid, &schema, &spec), 1).expect("group fits");
     {
         let mut excl = sal.excl();
         ask(&mut excl, probe(tid, &keys), 2).expect("group fits");
-        ask(&mut excl, probe(tid, &keys), 3).expect("group fits");
+        ask(&mut excl, probe(tid, &keys), 2).expect("group fits");
     }
     drain_in_wait(&mut wp);
 
     let out = frames(&rx);
-    assert_eq!(reqs(&out), [2, 3]);
+    assert_eq!(reqs(&out), [2, 2]);
     assert!(out
         .iter()
         .all(|f| f.ctrl.hdr.status == WireStatus::Ok && f.ctrl.hdr.flags.scan_last));
@@ -265,9 +275,10 @@ fn a_burst_passes_what_another_cut_owes() {
 fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
     let (mut engine, tid) = table_engine("worker", "round_first", 1, &u64_i64_cols());
     let schema = make_schema_u64_i64();
+    let spec = all_rows();
     let (mut wp, sal, rx) = test_worker(&mut engine);
     for request_id in [1, 2] {
-        ask(&mut sal.excl(), scan(tid, &schema), request_id).expect("group fits");
+        ask(&mut sal.excl(), scan(tid, &schema, &spec), request_id).expect("group fits");
     }
 
     // One worker: its own publish completes the round.
@@ -327,7 +338,7 @@ fn a_train_advances_with_every_request() {
     let (mut wp, sal, rx) = test_worker(&mut engine);
     wp.replies
         .set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 4])));
-    wp.replies.reply(route(1, 11, 1), Ok(Rows::from(rows)));
+    wp.replies.reply(route(1, 11), Ok(Rows::from(rows)));
 
     for _ in 0..GROUPS {
         // Control-only and unanswered: nothing of its own reaches the ring.
@@ -386,6 +397,7 @@ fn a_claiming_span_read_holds_its_index_until_its_release() {
 fn a_push_behind_a_two_source_tick_waits_for_the_next() {
     let cols = u64_i64_cols();
     let schema = make_schema_u64_i64();
+    let spec = all_rows();
     let (mut engine, t1) = table_engine("worker", "tick_seal_window", 4, &cols);
     let t2 = engine.create_table("public.t2", &cols, &[0]).unwrap();
     // A tick of `t1` waits on an exchange round, and on another a wave later.
@@ -404,8 +416,8 @@ fn a_push_behind_a_two_source_tick_waits_for_the_next() {
         first_round: 2,
         tids: vec![t1, t2].into(),
     };
-    sal.excl().apply(tick, id(1)).expect("group fits");
-    ask(&mut sal.excl(), scan(v2, &schema), 2).expect("group fits");
+    sal.excl().apply(tick).expect("group fits");
+    ask(&mut sal.excl(), scan(v2, &schema, &spec), 2).expect("group fits");
     sal.excl()
         .push(t2, &record, Routed::Same(row.wire_whole()))
         .expect("group fits");

@@ -20,14 +20,17 @@ fn emit_tick_bench() {
             .collect();
         let (disp, _) = test_dispatcher(0, engine);
         let tids = &tids[..ticked];
+        let alone = disp.alone();
         let mut excl = disp.sal().excl();
         let mut run = || {
             excl.checkpoint_reset();
             counter.measure(|| {
                 for _ in 0..GROUPS {
-                    drop(std::hint::black_box(
-                        disp.emit_tick(&mut excl, std::hint::black_box(tids)),
-                    ));
+                    drop(std::hint::black_box(disp.emit_tick(
+                        &alone,
+                        &mut excl,
+                        std::hint::black_box(tids),
+                    )));
                 }
             })
         };

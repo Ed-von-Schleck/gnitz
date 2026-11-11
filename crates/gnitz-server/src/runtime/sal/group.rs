@@ -54,12 +54,10 @@ pub(super) struct Group<'a> {
     pub(super) request: RequestHead,
     /// The request's blob, which a worker is sent unless it is sent its own.
     pub(super) blob: &'a [u8],
-    /// Whether the request is a [`Read`].
-    pub(super) reads: bool,
     pub(super) data: Payloads<'a>,
     /// The workers the group addresses.
     pub(super) to: WorkerSet,
-    /// The request id they answer on.
+    /// The request id a read's reply train carries.
     pub(super) reply: Option<RequestId>,
 }
 
@@ -71,23 +69,21 @@ impl<'a> Group<'a> {
         Group {
             request,
             blob,
-            reads: true,
             data: blobs.map_or(Payloads::Shared(None), Payloads::EachBlob),
             to,
             reply: Some(reply),
         }
     }
 
-    /// `apply` sent to every worker with no rows, acknowledged on `ack`.
-    pub(super) fn apply(apply: &'a Apply<'_>, ack: RequestId) -> Self {
+    /// `apply` sent to every worker with no rows.
+    pub(super) fn apply(apply: &'a Apply<'_>) -> Self {
         let (request, blob) = apply.encode();
         Group {
             request,
             blob,
-            reads: false,
             data: Payloads::Shared(None),
             to: WorkerSet::ALL,
-            reply: Some(ack),
+            reply: None,
         }
     }
 
@@ -97,7 +93,6 @@ impl<'a> Group<'a> {
         Group {
             request: Ingest::Push { tid, rule }.encode(),
             blob: &[],
-            reads: false,
             data: match rows {
                 Routed::Same(d) => Payloads::Shared(d.map(|d| (record, d))),
                 Routed::Each(each) => Payloads::EachRows(record, each),
@@ -113,7 +108,6 @@ impl<'a> Group<'a> {
         Group {
             request: Ingest::DdlSync { family }.encode(),
             blob: &[],
-            reads: false,
             data: Payloads::Shared(batch.wire_whole().map(|d| (family.record(), d))),
             to: if family.master_only() {
                 WorkerSet::EMPTY

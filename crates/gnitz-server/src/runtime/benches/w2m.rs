@@ -26,7 +26,7 @@ fn w2m_ring_bench() {
                 .measure(|| {
                     for &req in &reqs {
                         assert!(
-                            writer.try_send_msg(req, false, &WireMsg::default()),
+                            writer.try_send_msg(req, false, &WireMsg::default()).is_ok(),
                             "the ring holds a lap"
                         );
                     }

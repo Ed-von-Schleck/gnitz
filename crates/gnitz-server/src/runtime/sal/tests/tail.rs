@@ -1,6 +1,8 @@
 use super::*;
-use crate::runtime::sal::fixtures::{test_log, zone_rows};
-use crate::runtime::sal::format::{anchor_word, PREFIX_BYTES};
+use crate::catalog::SysFamily;
+use crate::runtime::sal::fixtures::{scan, test_log, unanswered, zone_rows};
+use crate::runtime::sal::format::{anchor_word, RequestHead, PREFIX_BYTES};
+use crate::runtime::sal::group::Group;
 use crate::runtime::sal::{Routed, SalWriter};
 use crate::test_support::sweep_bit_flips;
 use gnitz_store::relation::PkRule;
@@ -225,7 +227,7 @@ fn the_tail_and_its_writer_agree_on_holding_pushes() {
         ),
         (
             "a DDL-only zone",
-            |log| log.ddl_zone(&[(crate::catalog::SysFamily::Table, &zone_rows())]),
+            |log| log.ddl_zone(&[(SysFamily::Table, &zone_rows())]),
             false,
         ),
         (
@@ -329,4 +331,54 @@ fn slot_damage_in_an_unzoned_group_does_not_stop_the_walk() {
         "both members replay; the stream group is not one"
     );
     assert_eq!(committed(*log.log()), [lsn], "the zone closes at the scope's end");
+}
+
+// -----------------------------------------------------------------------
+// The typed read
+// -----------------------------------------------------------------------
+
+/// The members of the closed zones, each as its ingest: a command between
+/// zones and the member of an open zone are not among them.
+#[test]
+fn the_tail_yields_each_members_ingest_in_log_order() {
+    let log = test_log(SIZE, NW, 1);
+    log.ddl_zone(&[(SysFamily::Table, &zone_rows())]);
+    log.push_zone(&[TID, TID + 1]);
+    log.command();
+    log.open_member();
+
+    let tail = CommittedTail::read(*log.log()).expect("the anchor verifies");
+    let ingests: Vec<_> = tail.ingests().map(|g| g.expect("an ingest").0).collect();
+    assert_eq!(
+        ingests,
+        [
+            Ingest::DdlSync { family: SysFamily::Table },
+            Ingest::Push { tid: TID, rule: PkRule::Enforce },
+            Ingest::Push { tid: TID + 1, rule: PkRule::Enforce },
+        ]
+    );
+}
+
+/// A committed zone member whose header decodes to no ingest is an error of
+/// the replay.
+#[test]
+fn a_zone_member_that_is_no_ingest_fails_the_replay() {
+    let rows = zone_rows();
+    let read = scan(4, &[]);
+    let cases = [
+        (
+            "a DdlSync naming no system family",
+            Group {
+                request: RequestHead::new(SalMessageKind::DdlSync, u64::MAX, 0, 0),
+                ..Group::ddl_sync(SysFamily::Table, &rows)
+            },
+        ),
+        ("a zoned read", unanswered(&read)),
+    ];
+    for (case, group) in cases {
+        let log = test_log(SIZE, NW, 1);
+        log.commit_zone(&[group]);
+        let tail = CommittedTail::read(*log.log()).expect("the anchor verifies");
+        assert!(tail.ingests().next().is_some_and(|g| g.is_err()), "{case}");
+    }
 }

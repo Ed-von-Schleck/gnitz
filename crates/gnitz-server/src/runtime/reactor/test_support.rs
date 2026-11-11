@@ -32,7 +32,7 @@ pub(crate) fn make_reactor() -> Reactor {
 
 /// [`make_reactor`] built with `limits`.
 pub(super) fn make_reactor_with(limits: Limits) -> Reactor {
-    Reactor::new(limits, test_rings(1, 64 * 1024).1).expect("reactor").0
+    Reactor::new(limits, test_rings(1, 64 * 1024).1).expect("reactor")
 }
 
 /// The drivers every reactor suite runs on. An inherent impl here rather than in
@@ -55,22 +55,28 @@ impl Reactor {
 
 /// A reactor over `n` fresh W2M rings, with the writer of each.
 pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
-    let (reactor, _ready, writers) = booting_reactor(n);
-    (reactor, writers)
+    let (writers, receiver) = test_rings(n, 64 * 1024);
+    let r = Reactor::new(Limits::TEST, receiver).expect("reactor");
+    if n == 0 {
+        // A drain raises the level only when a worker moves its position, which
+        // over no worker never happens: there every position is applied.
+        r.applied.raise(u64::MAX);
+    }
+    (r, writers)
 }
 
-/// A train lease of `kind` over every one of `n` fresh rings, with each ring's writer.
+/// A train lease of one read of `kind`, written to every one of `n` fresh
+/// rings, with each ring's writer.
 pub(crate) fn train_lease(n: usize, kind: &'static str) -> (Reactor, TrainLease, Vec<W2mWriter>) {
     let (reactor, writers) = reactor_with_rings(n);
-    let lease = reactor.lease_train(WorkerSet::ALL, kind);
+    let mut lease = reactor.lease_train();
+    lease.add(WorkerSet::ALL, kind);
     (reactor, lease, writers)
 }
 
-/// [`reactor_with_rings`], with the future that resolves on every worker's ready ACK.
-pub(super) fn booting_reactor(n: usize) -> (Reactor, impl Future<Output = ReadyAcked>, Vec<W2mWriter>) {
-    let (writers, receiver) = test_rings(n, 64 * 1024);
-    let (reactor, ready) = Reactor::new(Limits::TEST, receiver).expect("reactor");
-    (reactor, ready, writers)
+/// The next read's train of `lease`, every read before it having ended.
+pub(crate) fn train_of(lease: &mut TrainLease) -> Train<'_> {
+    try_poll_once(lease.next_train()).expect("every earlier read has ended")
 }
 
 /// A one-shot op the kernel completes at its submit.

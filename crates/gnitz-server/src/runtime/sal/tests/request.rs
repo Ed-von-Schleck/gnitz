@@ -30,19 +30,19 @@ fn every_request() -> Vec<SalRequest<'static>> {
         Read::HasPk {
             tid: 19,
             probe: Probe::Pk,
-            keys: vec![38u8, 39].into(),
+            keys: &[38, 39],
         }
         .into(),
         Read::HasPk {
             tid: 20,
             probe: Probe::PkColumn(21),
-            keys: vec![40u8].into(),
+            keys: &[40],
         }
         .into(),
         Read::HasPk {
             tid: 22,
             probe: Probe::Index(cols, NonZeroU64::new(23).unwrap()),
-            keys: vec![41u8, 42, 43].into(),
+            keys: &[41, 42, 43],
         }
         .into(),
         Read::KeySpans { tid: 24, cols, claim: false }.into(),
@@ -51,25 +51,20 @@ fn every_request() -> Vec<SalRequest<'static>> {
         Read::ScanSpec {
             tid: 25,
             reply_layout: 26,
-            spec: vec![27u8, 28, 29].into(),
+            spec: &[27, 28, 29],
         }
         .into(),
         Read::Delta {
             view: 30,
             after_tick: 31,
             reply_layout: 36,
-            spec: vec![33u8, 34, 35].into(),
+            spec: &[33, 34, 35],
         }
         .into(),
         Read::Pin { snapshot: 44 }.into(),
         Read::Unpin { snapshot: 45 }.into(),
-        Read::SnapshotPage {
-            snapshot: 46,
-            tid: 47,
-            page: vec![48u8, 49].into(),
-        }
-        .into(),
-        Read::Backup { dir: String::from("/backup").into() }.into(),
+        Read::SnapshotPage { snapshot: 46, tid: 47, page: &[48, 49] }.into(),
+        Read::Backup { dir: "/backup" }.into(),
     ]
 }
 
@@ -85,7 +80,7 @@ fn every_request_decodes_from_its_written_group() {
         .map(|request| {
             let group = match *request {
                 SalRequest::Read(ref read) => Group::read(read, WorkerSet::ALL, None, id(1)),
-                SalRequest::Apply(ref apply) => Group::apply(apply, id(1)),
+                SalRequest::Apply(ref apply) => Group::apply(apply),
                 SalRequest::Ingest(Ingest::Push { tid, rule }) => {
                     Group::push(tid, rule, &record, Routed::Same(batch.wire_whole()))
                 }
@@ -146,33 +141,20 @@ fn a_probe_no_kind_writes_is_refused() {
     }
 }
 
-/// A decoded read borrows the bytes it came in; `into_owned` copies them, and the
-/// copy outlives those bytes.
+/// A kept read is the read it was kept from, once the blob that read borrowed
+/// is gone.
 #[test]
-fn a_read_borrows_its_blob_until_owned() {
-    let head = RequestHead::new(SalMessageKind::ScanSpec, 5, 7, 0);
-    let owned = {
-        let blob = vec![1u8, 2, 3];
-        let SalRequest::Read(read) = SalRequest::decode(&head, &blob).unwrap() else {
-            panic!("a scan is a read")
-        };
-        let Read::ScanSpec { spec: Cow::Borrowed(spec), .. } = &read else {
-            panic!("a decoded spec borrows its blob")
-        };
-        assert_eq!(spec.as_ptr(), blob.as_ptr());
-        read.into_owned()
-    };
-    assert!(matches!(
-        owned,
-        Read::ScanSpec { tid: 5, reply_layout: 7, spec: Cow::Owned(ref s) } if s == &[1, 2, 3]
-    ));
-}
-
-#[test]
-fn into_owned_keeps_every_read() {
+fn a_kept_read_outlives_the_blob_it_was_decoded_from() {
     for request in every_request() {
         let SalRequest::Read(read) = request else { continue };
-        let expected = format!("{read:?}");
-        assert_eq!(format!("{:?}", read.into_owned()), expected);
+        let (head, blob) = read.encode();
+        let kept = {
+            let blob = blob.to_vec();
+            let SalRequest::Read(decoded) = SalRequest::decode(&head, &blob).unwrap() else {
+                panic!("{read:?} decodes to a read")
+            };
+            decoded.keep()
+        };
+        assert_eq!(kept.read(), read);
     }
 }

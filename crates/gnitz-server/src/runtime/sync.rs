@@ -1,5 +1,5 @@
-//! Async primitives for one thread's tasks: `WakeQueue`, `oneshot`, `chan`,
-//! `AsyncRwLock` and `select2`.
+//! Async primitives for one thread's tasks: `WakeQueue`, `Level`, `oneshot`,
+//! `chan`, `AsyncRwLock` and `select2`.
 //!
 //! All `!Send` and `Rc<RefCell<_>>`-based on purpose: the master's tasks never
 //! leave the reactor's thread, so a channel send costs no atomic and a waker
@@ -8,7 +8,7 @@
 //! Each primitive wakes while holding its own `RefCell` borrow, which is sound
 //! only for a waker that queues and never polls, as the reactor's does.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -97,6 +97,50 @@ impl<T> WakeQueue<T> {
     /// Drop every queued value and the capacity they held.
     pub(crate) fn clear(&mut self) {
         self.queue = VecDeque::new();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Level
+// ---------------------------------------------------------------------------
+
+/// A `u64` that only rises, and the tasks waiting for it to reach a value.
+#[derive(Default)]
+pub(crate) struct Level {
+    at: Cell<u64>,
+    /// Each parked waiter, with the value it waits for. A dropped waiter's
+    /// waker stays behind; its wake is a spurious poll.
+    waiters: RefCell<Vec<(u64, Waker)>>,
+}
+
+impl Level {
+    pub(crate) fn get(&self) -> u64 {
+        self.at.get()
+    }
+
+    /// Raise the level to `to` and wake whoever waits for no more; a `to` at
+    /// or below the level moves nothing.
+    pub(crate) fn raise(&self, to: u64) {
+        if to <= self.at.get() {
+            return;
+        }
+        self.at.set(to);
+        self.waiters.borrow_mut().retain(|(waits_for, waker)| {
+            let done = *waits_for <= to;
+            if done {
+                waker.wake_by_ref();
+            }
+            !done
+        });
+    }
+
+    /// Ready once the level is at or above `v`; until then the caller parks.
+    pub(crate) fn poll_reached(&self, v: u64, cx: &Context<'_>) -> Poll<()> {
+        if self.at.get() >= v {
+            return Poll::Ready(());
+        }
+        self.waiters.borrow_mut().push((v, cx.waker().clone()));
+        Poll::Pending
     }
 }
 

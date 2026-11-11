@@ -45,11 +45,6 @@ fn a_per_worker_group_gives_each_addressed_worker_its_own_bytes() {
                 width.div_ceil(2),
                 "width {width}: one per addressed worker"
             );
-            assert_eq!(
-                g.first_payload(),
-                g.payloads().next().unwrap(),
-                "width {width}: the first worker's"
-            );
             for (w, buf) in bufs.iter().enumerate() {
                 let written = (!buf.is_empty()).then_some(buf.as_slice());
                 assert_eq!(g.slot(w as u32), written, "width {width}: worker {w}");
@@ -85,7 +80,6 @@ fn a_shared_group_gives_every_addressed_worker_the_same_bytes() {
         let msg = group_at(log.log(), base);
         let payloads: Vec<_> = msg.payloads().collect();
         assert_eq!(payloads.len(), 1, "one directory entry");
-        assert_eq!(msg.first_payload(), payloads[0]);
         assert_eq!(msg.width(), 4);
         for (w, addressed) in addressed.into_iter().enumerate() {
             assert_eq!(msg.slot(w as u32), addressed.then_some(payloads[0]), "worker {w}");

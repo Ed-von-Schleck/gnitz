@@ -181,9 +181,7 @@ impl Reactor {
     pub(crate) async fn child_exit(&self, pid: libc::pid_t) -> i32 {
         let sqe = opcode::WaitId::new(libc::P_PID, pid as libc::id_t, libc::WEXITED | libc::WNOWAIT).build();
         // SAFETY: the SQE names no memory: with no `infop`, no siginfo is written.
-        let op = unsafe { self.push_op(sqe, ()) };
-        self.ring.borrow_mut().submit();
-        op.await.0
+        unsafe { self.push_op(sqe, ()) }.await.0
     }
 }
 

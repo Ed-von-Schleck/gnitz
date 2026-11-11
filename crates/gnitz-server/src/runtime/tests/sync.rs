@@ -1,13 +1,48 @@
-//! The single-threaded async primitives: `oneshot`, `AsyncRwLock`, `select2` and
-//! the cancellation shapes each must survive.
+//! The single-threaded async primitives: `Level`, `oneshot`, `AsyncRwLock`,
+//! `select2` and the cancellation shapes each must survive.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::Wake;
 
 use super::*;
 use crate::runtime::reactor::test_support::{make_reactor, poll_until};
 use crate::runtime::test_support::try_poll_once;
 use crate::runtime::test_support::yield_once;
+
+/// Raising a level wakes each waiter at or below it once, keeps none of them
+/// and leaves the rest parked; a raise at or below the level moves nothing.
+#[test]
+fn a_raised_level_wakes_the_waiters_at_or_below_it_and_no_other() {
+    #[derive(Default)]
+    struct Wakes(AtomicUsize);
+    impl Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let level = Level::default();
+    let wakes = [5u64, 9].map(|_| Arc::new(Wakes::default()));
+    let wakers = wakes.each_ref().map(|w| Waker::from(Arc::clone(w)));
+    let poll = |i: usize| level.poll_reached([5, 9][i], &Context::from_waker(&wakers[i]));
+    let woken = || wakes.each_ref().map(|w| w.0.load(Ordering::Relaxed));
+
+    assert_eq!((poll(0), poll(1)), (Poll::Pending, Poll::Pending));
+    level.raise(7);
+    assert_eq!(woken(), [1, 0]);
+    assert_eq!((poll(0), poll(1)), (Poll::Ready(()), Poll::Pending));
+
+    level.raise(6);
+    assert_eq!(level.get(), 7, "a level does not move back");
+    assert_eq!(woken(), [1, 0]);
+
+    level.raise(9);
+    assert_eq!(woken(), [1, 2], "once per time it parked");
+    assert_eq!(poll(1), Poll::Ready(()));
+    assert!(level.waiters.borrow().is_empty());
+}
 
 /// Sending to a cancelled receiver is not an error and never was to any caller:
 /// the value is parked where nothing will read it and dropped with the channel.

@@ -31,13 +31,9 @@ impl Replies {
     }
 }
 
-/// The route of request `request_id`, written in cut `cut`.
-pub(in crate::runtime::worker) fn route(target_id: u64, request_id: u32, cut: u64) -> ReplyRoute {
-    ReplyRoute {
-        target_id,
-        request_id: id(request_id),
-        cut: Cut::nth(cut),
-    }
+/// The route of a read of `target_id` answered on lease `request_id`.
+pub(in crate::runtime::worker) fn route(target_id: u64, request_id: u32) -> ReplyRoute {
+    ReplyRoute { target_id, request_id: id(request_id) }
 }
 
 /// One published ring message: its ring-prefix request id, control block and
@@ -127,11 +123,12 @@ fn weight(i: u64) -> i64 {
 // -- the reply queue --------------------------------------------------------
 
 /// Every reply shape through one budget. A reply that fits leaves at once
-/// unless its own cut still owes something; every other reply queues, and the
-/// queue drains front first, train by train. Each train's frames carry
-/// `continuation`, no schema block, and `scan_last` on the terminal frame alone,
-/// and reassemble to the source — PKs, payloads and **weights**, since in a
-/// Z-set engine a row-set comparison would test nothing.
+/// unless its own lease still owes something; every other reply queues, and the
+/// queue drains front first, train by train, one lease's trains split at their
+/// terminals. Each train's frames carry `continuation`, no schema block, and
+/// `scan_last` on the terminal frame alone, and reassemble to the source —
+/// PKs, payloads and **weights**, since in a Z-set engine a row-set comparison
+/// would test nothing.
 #[test]
 fn reply_trains_drain_in_order_and_reassemble_exactly() {
     let fixed = make_schema_u64_i64();
@@ -150,31 +147,31 @@ fn reply_trains_drain_in_order_and_reassemble_exactly() {
     let c = make_batch_bytes_raw(&strings, &[(1, 1, wide[0].as_bytes()), (2, -2, wide[1].as_bytes())]);
     let one = make_batch_raw(&fixed, &[(9, -3, 90)]);
     let empty = Batch::empty_with_schema(&fixed);
-    let trains = [
+    let sources = [
         (11, &a, fixed),
         (22, &b, strings),
         (33, &c, strings),
-        (55, &one, fixed),
-        (66, &empty, fixed),
+        (33, &one, fixed),
+        (33, &empty, fixed),
     ];
 
     let (mut q, rx) = queue_over(1 << 22);
     q.set_frame_budget(budget);
-    q.reply(route(1, 11, 1), Ok(Rows::from(a.clone())));
-    q.reply(route(2, 22, 2), Ok(Rows::from(b.clone())));
-    // Cut 3: a train, then two members that fit and stay behind it.
-    q.reply(route(3, 33, 3), Ok(Rows::from(c.clone())));
-    q.reply(route(5, 55, 3), Ok(Rows::from(one.clone())));
-    q.reply(route(6, 66, 3), Ok(Rows::from(empty.clone())));
-    // Cut 4 owes nothing: both members pass the queue.
-    q.reply(route(4, 44, 4), Ok(Rows::from(one.clone())));
-    q.reply(route(4, 45, 4), Ok(Rows::from(one.clone())));
+    q.reply(route(1, 11), Ok(Rows::from(a.clone())));
+    q.reply(route(2, 22), Ok(Rows::from(b.clone())));
+    // Lease 33: a train, then two reads that fit and stay behind it.
+    q.reply(route(3, 33), Ok(Rows::from(c.clone())));
+    q.reply(route(5, 33), Ok(Rows::from(one.clone())));
+    q.reply(route(6, 33), Ok(Rows::from(empty.clone())));
+    // Lease 44 owes nothing: both its reads pass the queue.
+    q.reply(route(4, 44), Ok(Rows::from(one.clone())));
+    q.reply(route(4, 44), Ok(Rows::from(one.clone())));
 
     let inline = frames(&rx);
     assert_eq!(
         reqs(&inline),
-        [44, 45],
-        "only a fitting reply whose cut owes nothing leaves at once"
+        [44, 44],
+        "only a fitting reply whose lease owes nothing leaves at once"
     );
     for f in &inline {
         assert!(f.ctrl.hdr.flags.scan_last);
@@ -183,16 +180,15 @@ fn reply_trains_drain_in_order_and_reassemble_exactly() {
 
     drain(&mut q);
     let out = frames(&rx);
-    let mut order = reqs(&out);
-    order.dedup();
-    assert_eq!(
-        order,
-        [11, 22, 33, 55, 66],
-        "each train's frames fully precede the next's"
-    );
+    // One train per terminal, in the order the reads were answered.
+    let trains: Vec<&[Frame]> = out.split_inclusive(|f| f.ctrl.hdr.flags.scan_last).collect();
+    assert_eq!(trains.len(), sources.len(), "one terminal per read");
 
-    for (req, source, schema) in trains {
-        let train: Vec<&Frame> = out.iter().filter(|f| f.req == req).collect();
+    for (train, (req, source, schema)) in trains.iter().zip(sources) {
+        assert!(
+            train.iter().all(|f| f.req == req),
+            "each train's frames fully precede the next's"
+        );
         let mut got = Vec::new();
         for (i, f) in train.iter().enumerate() {
             let hdr = &f.ctrl.hdr;
@@ -209,15 +205,15 @@ fn reply_trains_drain_in_order_and_reassemble_exactly() {
         assert_eq!(got, weighted_rows(source), "train {req} reassembles to its source");
     }
 
-    let sizes = |req| -> Vec<(usize, usize)> {
-        out.iter()
-            .filter(|f| f.req == req)
-            .map(|f| (f.rows(if req == 11 { &fixed } else { &strings }).len(), f.bytes.len()))
+    let sizes = |train: usize| -> Vec<(usize, usize)> {
+        trains[train]
+            .iter()
+            .map(|f| (f.rows(&sources[train].2).len(), f.bytes.len()))
             .collect()
     };
     // Fixed width: every non-terminal frame fills the budget exactly.
     assert_eq!(
-        sizes(11),
+        sizes(0),
         [
             (4, budget),
             (4, budget),
@@ -225,11 +221,11 @@ fn reply_trains_drain_in_order_and_reassemble_exactly() {
         ]
     );
     // Heap strings: several rows a frame, each frame compacted to its own heap.
-    let b_sizes = sizes(22);
+    let b_sizes = sizes(1);
     assert!(b_sizes.len() >= 2, "{b_sizes:?}");
     assert!(b_sizes.iter().all(|&(_, bytes)| bytes <= budget), "{b_sizes:?}");
     // A row wider than the budget ships alone, over budget, with no fault.
-    let c_sizes = sizes(33);
+    let c_sizes = sizes(2);
     assert_eq!(c_sizes.len(), 2);
     assert!(
         c_sizes.iter().all(|&(rows, bytes)| rows == 1 && bytes > budget),
@@ -263,15 +259,15 @@ fn a_fitting_reply_is_the_source_batch_verbatim() {
     );
 
     let (mut q, rx) = queue_over(1 << 22);
-    q.reply(route(1, 5, 1), Ok(Rows::from(ReadRows::Shared(Rc::clone(&batch)))));
-    assert!(q.is_empty(), "the first member of its cut leaves at once");
-    // Behind a fault its own cut owes, the same reply waits in the queue.
-    q.reply_owed(route(1, 6, 2), Err("boom".into()));
-    q.reply(route(1, 7, 2), Ok(Rows::from(ReadRows::Shared(Rc::clone(&batch)))));
+    q.reply(route(1, 5), Ok(Rows::from(ReadRows::Shared(Rc::clone(&batch)))));
+    assert!(q.is_empty(), "the first read of its lease leaves at once");
+    // Behind a fault its own lease owes, the same reply waits in the queue.
+    q.reply_owed(route(1, 6), Err("boom".into()));
+    q.reply(route(1, 6), Ok(Rows::from(ReadRows::Shared(Rc::clone(&batch)))));
     drain(&mut q);
 
     let out = frames(&rx);
-    assert_eq!(reqs(&out), [5, 6, 7]);
+    assert_eq!(reqs(&out), [5, 6, 6]);
     for f in [&out[0], &out[2]] {
         assert!(f.ctrl.hdr.flags.scan_last);
         assert_eq!(
@@ -295,13 +291,13 @@ fn a_row_wider_than_the_frame_cap_faults_its_train_alone() {
     let next = make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 10)]);
 
     let (mut q, rx) = queue_over(1 << 22);
-    q.reply(route(1, 5, 1), Ok(Rows::from(batch)));
-    q.reply(route(2, 6, 1), Ok(Rows::from(next)));
-    assert_eq!(owed(&q), [("train", 5), ("train", 6)]);
+    q.reply(route(1, 5), Ok(Rows::from(batch)));
+    q.reply(route(2, 5), Ok(Rows::from(next)));
+    assert_eq!(owed(&q), [("train", 5), ("train", 5)]);
     drain(&mut q);
 
     let out = frames(&rx);
-    assert_eq!(reqs(&out), [5, 6]);
+    assert_eq!(reqs(&out), [5, 5]);
     let fault = out[0].ctrl.fault(&out[0].bytes).expect("a fault frame");
     assert_eq!(fault.status, WireStatus::Error);
     assert!(
@@ -319,7 +315,7 @@ fn a_row_wider_than_the_ring_faults_its_train() {
     let schema = make_schema_pk_u64_payload_string();
     let batch = make_batch_bytes_raw(&schema, &[(1, 1, "z".repeat(8192).as_bytes())]);
     let (mut q, rx) = queue_over(4096);
-    q.reply(route(1, 5, 1), Ok(Rows::from(batch)));
+    q.reply(route(1, 5), Ok(Rows::from(batch)));
     drain(&mut q);
 
     let out = frames(&rx);
@@ -328,30 +324,30 @@ fn a_row_wider_than_the_ring_faults_its_train() {
     assert!(fault.text.contains("exceeds what the reply ring holds"), "{fault}");
 }
 
-/// A fault is ordered as any reply is: behind the train its own cut still owes,
-/// and at once past what another cut owes.
+/// A fault is ordered as any reply is: behind the train its own lease still
+/// owes, and at once past what another lease owes.
 #[test]
-fn an_ordered_fault_stays_behind_its_cuts_queued_train() {
+fn an_ordered_fault_stays_behind_its_leases_queued_train() {
     let fixed = make_schema_u64_i64();
     let rows = make_batch_raw(&fixed, &(0..10).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
     let (mut q, rx) = queue_over(1 << 22);
     q.set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 4])));
 
-    q.reply(route(1, 11, 1), Ok(Rows::from(rows)));
-    q.reply(route(1, 12, 1), Err("of the train's cut".into()));
-    q.reply(route(1, 13, 2), Err("of another cut".into()));
+    q.reply(route(1, 11), Ok(Rows::from(rows)));
+    q.reply(route(1, 11), Err("of the train's lease".into()));
+    q.reply(route(1, 13), Err("of another lease".into()));
     let passing = frames(&rx);
-    assert_eq!(reqs(&passing), [13], "another cut's fault leaves at once");
+    assert_eq!(reqs(&passing), [13], "another lease's fault leaves at once");
     assert!(passing[0].passed, "published as passing the owed train");
-    assert_eq!(owed(&q), [("train", 11), ("fault", 12)]);
+    assert_eq!(owed(&q), [("train", 11), ("fault", 11)]);
 
     drain(&mut q);
     let out = frames(&rx);
-    assert_eq!(reqs(&out), [11, 11, 11, 12], "the fault follows the train's last frame");
+    assert_eq!(reqs(&out), [11; 4]);
     assert!(out.iter().all(|f| !f.passed), "each was the front of the queue");
-    assert!(out[2].ctrl.hdr.flags.scan_last);
-    let fault = out[3].ctrl.fault(&out[3].bytes).expect("a fault frame");
-    assert_eq!(fault.text, "of the train's cut");
+    assert!(out[2].ctrl.hdr.flags.scan_last, "the train's last frame");
+    let fault = out[3].ctrl.fault(&out[3].bytes).expect("the fault follows it");
+    assert_eq!(fault.text, "of the train's lease");
 }
 
 /// With no room on the ring a reply is owed, not waited for; the emitter sends
@@ -361,10 +357,10 @@ fn a_full_ring_owes_instead_of_blocking() {
     let fixed = make_schema_u64_i64();
     let one = make_batch_raw(&fixed, &[(9, -3, 90)]);
     let (mut q, rx) = queue_over(4096);
-    while q.w2m.try_send_msg(id(1), false, &WireMsg::default()) {}
+    while q.w2m.try_send_msg(id(1), false, &WireMsg::default()).is_ok() {}
 
-    q.reply(route(1, 5, 1), Ok(Rows::from(one.clone())));
-    q.reply(route(1, 6, 2), Err("boom".into()));
+    q.reply(route(1, 5), Ok(Rows::from(one.clone())));
+    q.reply(route(1, 6), Err("boom".into()));
     assert_eq!(owed(&q), [("train", 5), ("fault", 6)]);
 
     assert!(
@@ -406,7 +402,7 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
         q.set_frame_budget(budget);
 
         let spans = engine.registry.key_spans(tid, cols.as_slice()).unwrap();
-        q.reply(route(tid, 9, 1), Ok(Rows::Spans(Box::new(spans))));
+        q.reply(route(tid, 9), Ok(Rows::Spans(Box::new(spans))));
         assert!(
             frames(&rx).is_empty(),
             "a span train is never sent from where it is answered"
@@ -437,36 +433,67 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
 }
 
 /// A refusal asks the master for the ring back only when what holds the ring
-/// is another cut's than a reply that waits: a train held up by its own frames
-/// asks nothing, a reply of another cut behind those frames does.
+/// is another lease's than a reply that waits: a train held up by its own
+/// lease's frames asks nothing, a reply of another lease behind those frames
+/// does.
 #[test]
-fn a_refusal_names_a_shortage_only_behind_another_cuts_bytes() {
+fn a_refusal_names_a_shortage_only_behind_another_leases_bytes() {
     let fixed = make_schema_u64_i64();
     let rows = make_batch_raw(&fixed, &(0..1000).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
     let (mut q, rx) = queue_over(4096);
     q.set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 16])));
 
-    q.reply(route(1, 11, 1), Ok(Rows::from(rows)));
-    while !q.w2m.short_of_room() {
+    q.reply(route(1, 11), Ok(Rows::from(rows)));
+    while !q.waits_on_master() {
         q.emit_frame();
     }
     assert!(!rx.answer_shortage(0), "a train held up by its own frames asks nothing");
 
     // As large as the train's frame the ring just refused.
     let behind = make_batch_raw(&fixed, &(0..16).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
-    q.reply(route(2, 22, 2), Ok(Rows::from(behind)));
-    assert_eq!(owed(&q), [("train", 11), ("train", 22)]);
+    q.reply(route(2, 11), Ok(Rows::from(behind.clone())));
+    assert_eq!(owed(&q), [("train", 11), ("train", 11)]);
+    assert!(
+        !rx.answer_shortage(0),
+        "nor does the next read of its lease, queued behind it"
+    );
+    q.reply(route(2, 22), Ok(Rows::from(behind)));
+    assert_eq!(owed(&q), [("train", 11), ("train", 11), ("train", 22)]);
     assert!(
         rx.answer_shortage(0),
-        "a reply of another cut behind them asks for the ring"
+        "a reply of another lease behind them asks for the ring"
     );
     q.w2m.name_shortage();
     assert!(!rx.answer_shortage(0), "once per release");
 }
 
-/// A train the master holds sends nothing and holds up only its own cut: the
-/// first sendable reply behind it goes, and with every reply held the worker
-/// waits on the master, until the hold ends.
+/// A train the ring refused keeps the worker waiting on the master while a
+/// reply of another lease passes it into the room left, until a release.
+#[test]
+fn a_refused_train_waits_on_the_master_past_a_passing_reply() {
+    let fixed = make_schema_u64_i64();
+    let rows = make_batch_raw(&fixed, &(0..1000).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
+    let (mut q, rx) = queue_over(4096);
+    q.set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 16])));
+
+    q.reply(route(1, 11), Ok(Rows::from(rows)));
+    while !q.waits_on_master() {
+        q.emit_frame();
+    }
+    q.reply(route(2, 22), Err("boom".into()));
+    assert_eq!(owed(&q), [("train", 11)], "the fault fit the room left");
+    assert!(q.waits_on_master());
+    let written = rx.write_cursor(0);
+    q.emit_frame();
+    assert_eq!(rx.write_cursor(0), written, "the refused frame is not tried again");
+
+    drop(rx.try_read_slot(0).expect("a frame"));
+    assert!(!q.waits_on_master());
+}
+
+/// A lease the master holds sends nothing, whichever of its trains is next:
+/// the first sendable reply behind them goes, and with every reply held the
+/// worker waits on the master, until the hold ends.
 #[test]
 fn a_held_train_steps_aside_until_its_hold_ends() {
     let fixed = make_schema_u64_i64();
@@ -474,24 +501,28 @@ fn a_held_train_steps_aside_until_its_hold_ends() {
     let (mut q, rx) = queue_over(1 << 22);
     q.set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 16])));
 
-    q.reply(route(1, 11, 1), Ok(Rows::from(rows.clone())));
-    q.reply(route(1, 12, 1), Ok(Rows::from(rows)));
-    q.reply_owed(route(2, 21, 2), Err("boom".into()));
+    q.reply(route(1, 11), Ok(Rows::from(rows.clone())));
+    q.reply(route(1, 11), Ok(Rows::from(rows)));
+    q.reply_owed(route(2, 21), Err("boom".into()));
     assert!(rx.hold(0, id(11)));
     q.emit_frame();
     assert_eq!(
         reqs(&frames(&rx)),
         [21],
-        "the next cut's reply goes past the held train"
+        "the next lease's reply goes past the held trains"
     );
     q.emit_frame();
-    assert!(frames(&rx).is_empty(), "nor does the train behind it in its cut");
+    assert!(frames(&rx).is_empty(), "nothing of the held lease goes");
     assert!(q.waits_on_master());
 
     rx.unhold(0, id(11));
     assert!(!q.waits_on_master());
     drain(&mut q);
-    let mut order = reqs(&frames(&rx));
-    order.dedup();
-    assert_eq!(order, [11, 12]);
+    let out = frames(&rx);
+    assert!(out.iter().all(|f| f.req == 11));
+    assert_eq!(
+        out.iter().filter(|f| f.ctrl.hdr.flags.scan_last).count(),
+        2,
+        "both of its trains, each to its terminal"
+    );
 }

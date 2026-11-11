@@ -1,9 +1,10 @@
-//! Server executor: the serving loop (accept, the signal loop, the race against
-//! a worker's death), the `Shared` state, the request router, and the
-//! reply-frame vocabulary. Each child module states its own scope.
+//! Server executor: the serving loop (accept, the signal loop), the `Shared`
+//! state, the request router, and the reply-frame vocabulary. Each child
+//! module states its own scope.
 //!
-//! The master owns one `Reactor`: [`run`] spawns its tasks on it
-//! and races the signal loop against a worker's death.
+//! The master owns one `Reactor`: [`serve`] spawns its tasks on it and runs the
+//! signal loop until a shutdown signal; `bootstrap` races it against a worker's
+//! death.
 //!
 //! The router writes a request's last frame when it is the ACK naming the
 //! request's own `target_id`, or a fault of the request as a whole. A scan, a
@@ -41,7 +42,7 @@ use crate::catalog::CatalogEngine;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::listen::ClientListener;
 use crate::runtime::master::MasterDispatcher;
-use crate::runtime::reactor::{RecvBuf, SendBody, TrainLease};
+use crate::runtime::reactor::{RecvBuf, SendBody, Train};
 use crate::runtime::signals;
 use crate::runtime::sync::{chan, oneshot, select2, AsyncRwLock, Either, WriteGuard};
 use crate::runtime::tls::{Served, TlsListener};
@@ -71,7 +72,7 @@ enum CatalogLock {}
 
 /// Shared executor state held by every task.
 ///
-/// Lock order: the catalog, then a table lock, then the tick gate, then the
+/// Lock order: the catalog, then a table lock, then the apply lock, then the
 /// SAL writer.
 struct Shared {
     dispatcher: MasterDispatcher,
@@ -291,8 +292,8 @@ fn reload_tls(tls: Option<&TlsListener>) {
 const SIGNAL_POLL: Duration = Duration::from_millis(100);
 
 /// Until SIGTERM/SIGINT: poke the committer whenever the SAL wants a checkpoint.
-/// Then, with [`Committer::write`] and [`Committer::backup`] refusing since the
-/// signal, run one final checkpoint behind every write it admitted.
+/// Then close the committer, which runs one final checkpoint behind every write
+/// it admitted.
 async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>) {
     loop {
         shared.dispatcher.reactor().sleep(SIGNAL_POLL).await;
@@ -303,10 +304,8 @@ async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>) {
 
         if signals::shutdown_requested() {
             gnitz_info!("shutdown signal received; draining, checkpointing, and stopping");
-            // Resolves once the committer has committed every write queued ahead
-            // of the request and then run the final checkpoint over them, which
-            // ticks every push no tick has taken yet.
-            shared.committer.final_checkpoint().await;
+            // The final checkpoint ticks every push no tick has taken yet.
+            shared.committer.close().await;
             return;
         }
 
@@ -471,11 +470,11 @@ fn target_kind(cat: &CatalogEngine, target: Target, access: Access) -> Result<Re
 // Wire-protocol response helpers
 // ---------------------------------------------------------------------------
 
-/// Forward every frame of `lease` that carries rows to `peer`, workers in ascending
+/// Forward every frame of `train` that carries rows to `peer`, workers in ascending
 /// order. Stops at the first failed send, which closes the peer; `Err` on the first
 /// worker fault, leaving the rest undrained.
-async fn forward_scan(peer: &mut Peer, lease: &TrainLease) -> Result<(), WireFault> {
-    while let Some(f) = lease.next().await? {
+async fn forward_scan(peer: &mut Peer, train: Train<'_>) -> Result<(), WireFault> {
+    while let Some(f) = train.next().await? {
         if peer.send(SendBody::Slot(f.slot)).await.is_err() {
             return Ok(());
         }
@@ -484,8 +483,8 @@ async fn forward_scan(peer: &mut Peer, lease: &TrainLease) -> Result<(), WireFau
 }
 
 /// Cork `msg` for the client; the connection loop ships it. Every frame the
-/// master mints is a head and a bounded text but a RESOLVE answer, sized before
-/// it is corked, and [`cork_train`]'s.
+/// master mints is a bare head or a fault, whose text [`WireMsg::fault`] cuts,
+/// but a RESOLVE answer, sized before it is corked, and [`cork_train`]'s.
 fn cork_msg(peer: &mut Peer, msg: WireMsg<'_>) {
     debug_assert!(
         msg.check_size().is_ok(),

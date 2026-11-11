@@ -25,14 +25,18 @@ fn an_empty_ring_starts_over_at_its_head() {
     let (mut writer, recv) = make_ring(MSG, 8, 8);
     for round in 0..3u8 {
         let at = recv.write_cursor(0);
-        assert!(writer.try_publish(id(round as u32 + 1), false, MSG, |slot| {
-            let origin = recv.header(0).origin.load(Ordering::Acquire);
-            assert_eq!(origin, at, "round {round}: the origin moves first");
-            assert_eq!(recv.write_cursor(0), at, "and the message is not yet published");
-            slot.fill(round * 2);
-        }));
+        assert!(writer
+            .try_publish(id(round as u32 + 1), false, MSG, |slot| {
+                let origin = recv.header(0).origin.load(Ordering::Acquire);
+                assert_eq!(origin, at, "round {round}: the origin moves first");
+                assert_eq!(recv.write_cursor(0), at, "and the message is not yet published");
+                slot.fill(round * 2);
+            })
+            .is_ok());
         // The second one is published into a ring that holds the first.
-        assert!(writer.try_publish(id(1), false, MSG, |slot| slot.fill(round * 2 + 1)));
+        assert!(writer
+            .try_publish(id(1), false, MSG, |slot| slot.fill(round * 2 + 1))
+            .is_ok());
         let first = recv.try_read_slot(0).expect("the first message");
         assert_eq!(first.request_id.get(), round as u32 + 1);
         assert_eq!(first.frame_bytes(), gnitz_wire::framed(&[round * 2; MSG]));
@@ -58,13 +62,13 @@ fn a_message_short_of_the_tail_is_read_at_the_head_past_it() {
     let (mut writer, recv) = make_ring(MSG, 4, 8);
     let read = || recv.try_read_slot(0).expect("the next message");
     for tag in 1..=3u8 {
-        assert!(writer.try_publish(id(1), false, MSG, |slot| slot.fill(tag)));
+        assert!(writer.try_publish(id(1), false, MSG, |slot| slot.fill(tag)).is_ok());
     }
     // Never empty: each publish finds the message before it unread.
     drop((read(), read()));
-    assert!(writer.try_publish(id(1), false, MSG, |slot| slot.fill(4)));
+    assert!(writer.try_publish(id(1), false, MSG, |slot| slot.fill(4)).is_ok());
     drop(read());
-    assert!(writer.try_publish(id(1), false, MSG, |slot| slot.fill(5)));
+    assert!(writer.try_publish(id(1), false, MSG, |slot| slot.fill(5)).is_ok());
     assert_eq!(recv.write_cursor(0), 5 * slot_stride(MSG) + 8);
 
     assert!(read().bytes().iter().all(|&b| b == 4));
@@ -72,6 +76,54 @@ fn a_message_short_of_the_tail_is_read_at_the_head_past_it() {
     assert_eq!(wrapped.bytes().as_ptr(), data_head(&writer));
     assert!(wrapped.bytes().iter().all(|&b| b == 5));
     assert!(recv.try_read_slot(0).is_none());
+}
+
+/// The oldest publish the master has not released names the lease it answers
+/// on, wherever it was placed — at the head of an emptied ring, behind the
+/// publish before it, or at the head past a tail it skipped — and whether or
+/// not it was published as passing. A slot released behind a held one frees
+/// nothing, and a ring released whole names no lease.
+#[test]
+fn the_oldest_unreleased_publish_names_its_lease() {
+    let (mut writer, recv) = make_ring(MSG, 4, 8);
+    let read = || recv.try_read_slot(0).expect("the next message");
+    let publish = |writer: &mut W2mWriter, n: u32| {
+        assert!(writer.try_publish(id(n), n % 2 == 1, MSG, |slot| slot.fill(0)).is_ok());
+    };
+    assert_eq!(writer.oldest_unreleased(), None, "nothing was published");
+
+    for n in 1..=3 {
+        publish(&mut writer, n);
+    }
+    assert_eq!(writer.oldest_unreleased(), Some(id(1)), "at the head of the ring");
+    let (first, second, third) = (read(), read(), read());
+    drop(second);
+    assert_eq!(writer.oldest_unreleased(), Some(id(1)), "the first is still held");
+    drop(first);
+    assert_eq!(writer.oldest_unreleased(), Some(id(3)), "behind the two released");
+
+    // The fourth ends 8 bytes short of the ring's end, so the fifth skips them.
+    publish(&mut writer, 4);
+    publish(&mut writer, 5);
+    assert_eq!(recv.write_cursor(0), 5 * slot_stride(MSG) + 8);
+    drop(third);
+    assert_eq!(writer.oldest_unreleased(), Some(id(4)));
+    drop(read());
+    assert_eq!(
+        writer.oldest_unreleased(),
+        Some(id(5)),
+        "at the head, past the tail skipped"
+    );
+    drop(read());
+    assert_eq!(writer.oldest_unreleased(), None, "a ring released whole");
+
+    publish(&mut writer, 6);
+    assert_eq!(recv.header(0).origin.load(Ordering::Acquire), 5 * slot_stride(MSG) + 8);
+    assert_eq!(
+        writer.oldest_unreleased(),
+        Some(id(6)),
+        "at the head of the ring started over"
+    );
 }
 
 #[derive(Clone, Debug)]
@@ -107,7 +159,7 @@ proptest! {
                 SlotOp::Publish(len) => {
                     let len = len.min((writer.wc.dcap() - RING_PREFIX_BYTES) as usize);
                     let empty = unread.is_empty() && held.is_empty();
-                    if writer.try_publish(id(1), false, len, |slot| slot.fill(tag)) {
+                    if writer.try_publish(id(1), false, len, |slot| slot.fill(tag)).is_ok() {
                         unread.push_back((tag, len, empty));
                     } else {
                         prop_assert!(!empty, "an empty ring refused a {}-byte publish", len);
@@ -144,7 +196,7 @@ proptest! {
 fn an_oversized_publish_panics() {
     let (mut writer, _receiver) = make_ring(64, 4, 8);
     let dcap = writer.wc.dcap();
-    writer.try_publish(id(1), false, dcap as usize + 1, |_| {});
+    let _ = writer.try_publish(id(1), false, dcap as usize + 1, |_| {});
 }
 
 // -- slot retirement -----------------------------------------------------
@@ -162,7 +214,10 @@ fn release_follows_the_front_consecutive_prefix() {
     ] {
         let (mut writer, receiver) = make_ring(8, N, 8);
         for i in 0..N {
-            assert!(writer.try_publish(id(1), false, 8, |s| s[0] = i as u8), "publish #{i}");
+            assert!(
+                writer.try_publish(id(1), false, 8, |s| s[0] = i as u8).is_ok(),
+                "publish #{i}"
+            );
         }
         // The ring never wraps, so slot `i` ends at `(i + 1)` strides.
         let mut slots: Vec<Option<W2mSlot>> = (0..N).map(|_| receiver.try_read_slot(0)).collect();
@@ -187,7 +242,7 @@ fn a_writer_short_of_room_after_a_release_waits_for_the_next() {
         let small = CTRL_HEADER_SIZE;
         let (mut writer, receiver) = make_ring(small, 3, 0);
         for n in 1..=3 {
-            assert!(writer.try_publish(id(n), false, small, |s| s[0] = n as u8));
+            assert!(writer.try_publish(id(n), false, small, |s| s[0] = n as u8).is_ok());
         }
         let big = (3 * slot_stride(small) - RING_PREFIX_BYTES) as usize;
         let writer = std::thread::spawn(move || {
@@ -225,10 +280,10 @@ fn the_master_park_arms_only_while_every_ring_is_quiet() {
         receiver.arm().expect("quiet rings arm");
         assert!(writers[w].master_parked());
         let wakes = receiver.wakes();
-        assert!(writers[w].try_publish(id(1), false, 64, |s| s[0] = 1));
+        assert!(writers[w].try_publish(id(1), false, 64, |s| s[0] = 1).is_ok());
         assert!(!writers[1 - w].master_parked(), "ring {w}'s publish took the one arm");
         assert_eq!(receiver.wakes(), wakes + 1, "the take moved the waited value");
-        assert!(writers[1 - w].try_publish(id(1), false, 64, |s| s[0] = 2));
+        assert!(writers[1 - w].try_publish(id(1), false, 64, |s| s[0] = 2).is_ok());
         assert_eq!(receiver.wakes(), wakes + 1, "a publish behind the take wakes nobody");
 
         assert!(receiver.arm().is_none(), "unread data refuses the arm");

@@ -62,8 +62,8 @@ impl<'c> WorkerProcess<'c> {
     pub(super) fn run(&mut self) -> ! {
         loop {
             // An owed reply goes out without waiting on the SAL, unless the ring
-            // is short of room or the master holds every reply owed; then the
-            // master's release or end of a hold wakes the park too.
+            // refused the next frame to leave or the master holds every reply
+            // owed; then the master's release or end of a hold wakes the park too.
             if self.replies.is_empty() {
                 self.mesh.park().park(|| self.sal_reader.is_empty());
             } else {
@@ -99,8 +99,8 @@ impl<'c> WorkerProcess<'c> {
         {
             Inbound::Read { route, read } => {
                 // A drive writes views, so a read of one would see the tick
-                // half-run: it parks, owning its bytes, since the drive reads
-                // further groups before it is answered. A drive writes no other
+                // half-run: it parks, kept, since the drive reads further
+                // groups before it is answered. A drive writes no other
                 // store, so every other read is answered here, at its place in
                 // the SAL — a push behind it must not reach it.
                 if in_drive
@@ -109,7 +109,7 @@ impl<'c> WorkerProcess<'c> {
                         .relation(route.target_id)
                         .is_some_and(|r| r.kind().is_view())
                 {
-                    self.replies.park(route, read.into_owned());
+                    self.replies.park(route, &read);
                 } else {
                     let answer = answer(cat, &read);
                     self.replies.reply(route, answer);
@@ -133,20 +133,19 @@ impl<'c> WorkerProcess<'c> {
                 }
                 Some(false)
             }
-            Inbound::Apply { ack, apply } => {
+            Inbound::Apply { apply } => {
                 if in_drive {
                     gnitz_fatal_abort!("{apply:?} inside an exchange wait — diverged from the master");
                 }
                 if let Err(e) = self.apply(&apply) {
                     gnitz_fatal_abort!("worker: {apply:?} failed: {e} — aborting for restart");
                 }
-                self.replies.ack(ack);
+                // The ACK: every apply at or below the drain's position has run.
+                self.replies.applied(self.sal_reader.position());
                 // Before the next group: a parked read answers from the state its
                 // drive left.
-                if matches!(apply, Apply::Tick { .. } | Apply::Backfill { .. }) {
-                    let cat = &mut *self.catalog;
-                    self.replies.answer_parked(|read| answer(cat, read));
-                }
+                let cat = &mut *self.catalog;
+                self.replies.answer_parked(|read| answer(cat, read));
                 Some(false)
             }
         }
@@ -199,16 +198,16 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
     // Each arm builds its own `Ok`: wrapped around the whole match, every answer
     // would be copied at the width of the widest one.
     match *read {
-        Read::HasPk { tid, probe, ref keys } => {
+        Read::HasPk { tid, probe, keys } => {
             let keys = PkKeys::decode_probe(keys)?;
             Ok(Rows::from(cat.registry.probe(tid, probe, keys)?))
         }
-        Read::ScanSpec { tid, reply_layout, ref spec } => Ok(Rows::from(cat.scan_spec(
+        Read::ScanSpec { tid, reply_layout, spec } => Ok(Rows::from(cat.scan_spec(
             tid,
             gnitz_wire::ReadSpec::decode(spec)?,
             reply_layout,
         )?)),
-        Read::Delta { view, after_tick, reply_layout, ref spec } => Ok(Rows::from(cat.registry.delta_read(
+        Read::Delta { view, after_tick, reply_layout, spec } => Ok(Rows::from(cat.registry.delta_read(
             view,
             after_tick,
             gnitz_wire::ReadSpec::decode(spec)?,
@@ -237,11 +236,11 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
             cat.registry.unpin(snapshot);
             Ok(no_rows())
         }
-        Read::SnapshotPage { snapshot, tid, ref page } => {
+        Read::SnapshotPage { snapshot, tid, page } => {
             let page = gnitz_wire::snapshot::PageRequest::decode(page)?;
             Ok(Rows::from(cat.registry.pinned_page(snapshot, tid, &page)?))
         }
-        Read::Backup { ref dir } => {
+        Read::Backup { dir } => {
             cat.registry.link_published_into(dir)?;
             Ok(no_rows())
         }

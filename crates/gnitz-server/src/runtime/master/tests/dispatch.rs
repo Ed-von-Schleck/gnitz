@@ -7,11 +7,10 @@ use crate::runtime::reactor::test_support::reactor_with_rings;
 use crate::runtime::sal::fixtures::test_log;
 use crate::runtime::sal::{Apply, Inbound, Routed};
 use crate::runtime::test_support::{empty_catalog, within};
-use crate::runtime::w2m::fixtures::id;
 use gnitz_wire::{ColTabRow, WireFault, WireStatus};
 
-/// A group written on an ACK lease ends on every worker's ACK; one the SAL has
-/// no room for is refused with the SAL's own status.
+/// An ACKed group ends once every worker has applied the log through it; one
+/// the SAL has no room for is refused with the SAL's own status.
 #[test]
 fn an_acked_group_ends_on_its_acks_or_is_refused() {
     within(|| {
@@ -24,9 +23,14 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
                     first_round: 2,
                     tids: vec![0; if refused { 2 << 17 } else { 1 }].into(),
                 };
-                let lease = disp.write_acked(&mut disp.sal().lock().await, tick)?;
-                writers.iter_mut().for_each(|w| w.ack(lease.id()));
-                lease.acks().await;
+                let wait = disp.write_acked(&disp.apply_lock().await, &mut disp.sal().lock().await, tick)?;
+                // Each worker's drain, read past the group.
+                for (w, writer) in writers.iter_mut().enumerate() {
+                    let mut reader = disp.sal().reader(w as u32);
+                    assert!(matches!(reader.next_request(|_, _| None), Some(Inbound::Apply { .. })));
+                    writer.applied(reader.position());
+                }
+                wait.acks().await;
                 Ok::<(), WireFault>(())
             });
             match (refused, got) {
@@ -44,18 +48,19 @@ fn an_acked_group_ends_on_its_acks_or_is_refused() {
 fn a_refused_tick_takes_no_round() {
     let (_tmp, engine) = empty_catalog();
     let (disp, _) = test_dispatcher(1, engine);
+    let alone = disp.alone();
     let mut excl = disp.sal().excl();
     let before = disp.round.get();
 
     // Wider than the fixture's whole SAL.
     let e = disp
-        .emit_tick(&mut excl, &vec![0; 2 << 17])
+        .emit_tick(&alone, &mut excl, &vec![0; 2 << 17])
         .map(drop)
         .expect_err("no room for the tick");
     assert_eq!(e.status, WireStatus::SalFull, "{e}");
     assert_eq!(disp.round.get(), before, "the refused tick took no round");
 
-    disp.emit_tick(&mut excl, &[7, 8]).expect("the tick fits");
+    disp.emit_tick(&alone, &mut excl, &[7, 8]).expect("the tick fits");
     assert_eq!(disp.round.get(), before + 2, "one round per relation ticked");
     drop(excl);
     let mut reader = disp.sal().reader(0);
@@ -63,7 +68,7 @@ fn a_refused_tick_takes_no_round() {
     assert!(
         matches!(
             &written,
-            Some(Inbound::Apply { apply: Apply::Tick { first_round, tids }, .. })
+            Some(Inbound::Apply { apply: Apply::Tick { first_round, tids } })
                 if *first_round == before + 1 && tids[..] == [7, 8]
         ),
         "the tick written starts at the round behind the last one taken"
@@ -85,11 +90,14 @@ fn a_views_last_round_is_the_last_tick_of_a_source() {
     let under = register_identity_view(&mut engine, t, "under", &cols);
     let view = register_identity_view(&mut engine, under, "v", &cols);
     let (disp, _) = test_dispatcher(1, engine);
+    let alone = disp.alone();
     let mut excl = disp.sal().excl();
     assert_eq!(disp.last_delta_round(view), 1, "no source ticked");
 
     let first = disp.round.get() + 1;
-    let _unacked = disp.emit_tick(&mut excl, &[other, t, other]).expect("the tick fits");
+    let _unacked = disp
+        .emit_tick(&alone, &mut excl, &[other, t, other])
+        .expect("the tick fits");
     assert_eq!(
         disp.last_delta_round(view),
         first + 1,
@@ -97,11 +105,11 @@ fn a_views_last_round_is_the_last_tick_of_a_source() {
     );
     assert_eq!(disp.last_delta_round(under), first + 1);
 
-    disp.emit_tick(&mut excl, &[other]).expect("the tick fits");
+    disp.emit_tick(&alone, &mut excl, &[other]).expect("the tick fits");
     // Wider than the fixture's whole SAL.
     let mut wide = vec![other; 2 << 17];
     wide.push(t);
-    disp.emit_tick(&mut excl, &wide)
+    disp.emit_tick(&alone, &mut excl, &wide)
         .map(drop)
         .expect_err("no room for the tick");
     assert_eq!(disp.last_delta_round(view), first + 1);
@@ -129,7 +137,7 @@ fn refused_then_applied(
             first_round: 2,
             tids: vec![0; tids].into(),
         };
-        while excl.apply(tick(), id(1)).is_ok() {}
+        while excl.apply(tick()).is_ok() {}
     }
     let watermark = disp.sal().watermark();
 
@@ -146,7 +154,7 @@ fn refused_then_applied(
 
     // At worker count 0 the round owes no ACK.
     drop(excl);
-    disp.reactor().block_on(disp.checkpoint_base()).unwrap();
+    disp.reactor().block_on(disp.checkpoint_base(&disp.alone())).unwrap();
     disp.emit_zone(&mut disp.sal().excl(), |cat, sink| cat.apply_bundle(make(), sink))
         .expect("the rewound log takes the zone");
     applied(&disp);
@@ -251,7 +259,9 @@ fn an_ephemeral_round_flushes_a_memtable_only_sequence_advance() {
         engine.reserve_user_sequence(user_seq, 64, &mut |_, _| Ok(())).unwrap();
 
         let (disp, _) = test_dispatcher(0, engine);
-        disp.reactor().block_on(disp.checkpoint_ephemeral()).unwrap();
+        disp.reactor()
+            .block_on(disp.checkpoint_ephemeral(&disp.alone()))
+            .unwrap();
 
         // Crash semantics: no `engine.close()`, and no Drop impl — only what the
         // round flushed survives.
@@ -275,7 +285,7 @@ fn the_boot_checkpoint_calls_for_no_other() {
     let (reactor, _) = reactor_with_rings(0);
     let sal = test_log(1 << 20, 0, 1).checkpoint_at(1);
     let disp = MasterDispatcher::new(engine, sal, reactor);
-    disp.reactor().block_on(disp.boot_checkpoint()).unwrap();
+    disp.reactor().block_on(disp.boot_checkpoint(&disp.alone())).unwrap();
     assert!(disp.sal().cursor() > 0, "the boot checkpoint's group is in the log");
     assert!(!disp.sal().needs_checkpoint());
 }
@@ -298,13 +308,14 @@ fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
         let epoch = disp.sal().epoch();
         disp.reactor()
             .block_on(async {
-                disp.checkpoint_base().await?;
+                let alone = disp.apply_lock().await;
+                disp.checkpoint_base(&alone).await?;
                 assert_eq!(disp.sal().epoch(), epoch + 1, "the base round's rewind");
                 assert_eq!(disp.sal().cursor(), 0);
-                disp.checkpoint_ephemeral().await?;
+                disp.checkpoint_ephemeral(&alone).await?;
                 let behind = disp.sal().cursor();
                 assert!(behind > 0, "the ephemeral round's group stays in the log");
-                disp.boot_checkpoint().await?;
+                disp.boot_checkpoint(&alone).await?;
                 assert!(disp.sal().cursor() > behind);
                 Ok::<(), WireFault>(())
             })

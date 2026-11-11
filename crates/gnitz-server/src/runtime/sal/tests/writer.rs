@@ -8,7 +8,6 @@ use crate::runtime::reactor::test_support::make_reactor;
 use crate::runtime::sal::format::payload_rows;
 use crate::runtime::test_support::try_poll_once;
 use crate::runtime::w2m::fixtures::id;
-use crate::runtime::w2m::RequestId;
 use crate::test_support::{make_batch, make_schema_u64_i64};
 use gnitz_store::relation::PkRule;
 use gnitz_zset::schema::encode_schema_block;
@@ -38,9 +37,7 @@ fn a_group_that_does_not_fit_is_refused_sal_full() {
     log.excl().checkpoint_reset();
     assert!(!log.needs_checkpoint(), "the rewind clears the refusal");
 
-    log.excl()
-        .apply(Apply::FlushEph { generation: 1 }, id(1))
-        .expect("group fits");
+    log.excl().apply(Apply::FlushEph { generation: 1 }).expect("group fits");
     let over = cap - log.cursor() as usize - PREFIX_BYTES - group_header_size(1) + 8;
     refuse(over);
     assert!(
@@ -66,7 +63,8 @@ fn the_checkpoint_band_admits_both_rounds() {
         ("a read", excl.read(scan(0, &[]), WorkerSet::ALL, None, id(1))),
         (
             "a tick",
-            excl.apply(Apply::Tick { first_round: 2, tids: [1][..].into() }, id(1)),
+            excl.apply(Apply::Tick { first_round: 2, tids: [1][..].into() })
+                .map(drop),
         ),
         ("a push", excl.write_group(&to(1))),
     ] {
@@ -74,9 +72,9 @@ fn the_checkpoint_band_admits_both_rounds() {
     }
     assert_eq!(log.cursor(), cap as u64, "a refused group leaves the log untouched");
 
-    excl.apply(Apply::FlushEph { generation: 1 }, id(1))
+    excl.apply(Apply::FlushEph { generation: 1 })
         .expect("an ephemeral round fits the band");
-    excl.apply(Apply::Flush, id(1)).expect("a base round fits behind it");
+    excl.apply(Apply::Flush).expect("a base round fits behind it");
 
     let mut at = cap as u64;
     let kinds = [(); 2].map(|()| {
@@ -103,17 +101,16 @@ fn a_checkpoint_is_due_by_the_bytes_behind_the_last_one() {
 
     // The checkpoint: the base round and its rewind, a tick of the drain, the
     // ephemeral round.
-    excl.apply(Apply::Flush, id(1)).expect("group fits");
+    excl.apply(Apply::Flush).expect("group fits");
     excl.checkpoint_reset();
     assert!(!log.needs_checkpoint(), "the rewind empties the log");
-    excl.apply(Apply::Tick { first_round: 2, tids: [1][..].into() }, id(1))
+    excl.apply(Apply::Tick { first_round: 2, tids: [1][..].into() })
         .expect("group fits");
     assert!(
         log.needs_checkpoint(),
         "the drain's tick is ahead of the ephemeral round"
     );
-    excl.apply(Apply::FlushEph { generation: 1 }, id(1))
-        .expect("group fits");
+    excl.apply(Apply::FlushEph { generation: 1 }).expect("group fits");
     assert!(log.cursor() > 1, "the checkpoint left its groups in the log");
     assert!(!log.needs_checkpoint(), "nothing is behind the completed checkpoint");
 
@@ -268,15 +265,14 @@ fn a_checkpoint_may_admit_a_unit_within_the_limit_refused_past_its_floor() {
     assert_eq!(may_admit(&mut excl, limit), (false, true));
     assert_eq!(may_admit(&mut excl, limit + 1), (false, false), "over the limit");
 
-    excl.apply(Apply::Tick { first_round: 2, tids: [1][..].into() }, id(1))
+    excl.apply(Apply::Tick { first_round: 2, tids: [1][..].into() })
         .expect("group fits");
     assert_eq!(
         may_admit(&mut excl, 8),
         (true, true),
         "a tick in an epoch without an ephemeral round is ahead of the floor"
     );
-    excl.apply(Apply::FlushEph { generation: 1 }, id(1))
-        .expect("group fits");
+    excl.apply(Apply::FlushEph { generation: 1 }).expect("group fits");
     assert_eq!(may_admit(&mut excl, 8), (false, true), "directly behind the checkpoint");
     assert_eq!(may_admit(&mut excl, limit), (false, true));
     assert_eq!(may_admit(&mut excl, limit + 1), (false, false), "over the limit");
@@ -471,65 +467,6 @@ fn an_fdatasync_in_flight_covers_everything_until_a_zone_commits_under_it() {
     });
 }
 
-/// A read joins the cut of the read written directly before it under the same
-/// hold, and nothing else joins one: not the first read of a hold, not a read
-/// behind an apply or behind a scope's group, committed or dropped. A refused
-/// read leaves the cut as it was.
-#[test]
-fn a_read_joins_the_cut_of_the_read_written_directly_before_it() {
-    let log = test_log(1 << 20, 1, 1);
-    let oversized = vec![0u8; 1 << 20];
-    let read = |excl: &mut SalExcl, n| excl.read(scan(0, &[]), WorkerSet::ALL, None, id(n));
-    let refused = |excl: &mut SalExcl| {
-        let err = excl
-            .read(scan(0, &oversized), WorkerSet::ALL, None, id(99))
-            .expect_err("the read does not fit");
-        assert_eq!(err.kind, SalMessageKind::ScanSpec);
-    };
-
-    let mut excl = log.excl();
-    refused(&mut excl);
-    read(&mut excl, 1).expect("group fits");
-    read(&mut excl, 2).expect("group fits");
-    excl.apply(Apply::Backfill { views: vec![7].into() }, id(50))
-        .expect("group fits");
-    read(&mut excl, 3).expect("group fits");
-    refused(&mut excl);
-    read(&mut excl, 4).expect("group fits");
-    let mut scope = excl.begin();
-    scope.write(&to(60), false).expect("group fits");
-    assert_eq!(scope.commit(), None, "no zone was open");
-    read(&mut excl, 5).expect("group fits");
-    excl.begin().write(&to(61), false).expect("group fits");
-    read(&mut excl, 6).expect("group fits");
-    drop(excl);
-    let mut excl = log.excl();
-    read(&mut excl, 7).expect("group fits");
-    read(&mut excl, 8).expect("group fits");
-    drop(excl);
-
-    let joins: Vec<_> = log
-        .log()
-        .walk(1)
-        .map(|m| (RequestId::to_wire(m.head.reply), m.head.joins_cut()))
-        .collect();
-    assert_eq!(
-        joins,
-        [
-            (1, false),
-            (2, true),
-            (50, false),
-            (3, false),
-            (4, true),
-            (0, false),
-            (5, false),
-            (6, false),
-            (7, false),
-            (8, true)
-        ]
-    );
-}
-
 /// Dropping a `SalExcl` wakes each worker a group written under it reached —
 /// once, however many groups reached it — and no other; an apply wakes at
 /// its write.
@@ -551,7 +488,7 @@ fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
     assert_eq!(seqs(), [1, 0, 1, 0], "a worker reached twice is woken once");
 
     let mut excl = log.excl();
-    excl.apply(Apply::Flush, id(1)).expect("group fits");
+    excl.apply(Apply::Flush).expect("group fits");
     assert_eq!(
         seqs(),
         [2, 1, 2, 1],

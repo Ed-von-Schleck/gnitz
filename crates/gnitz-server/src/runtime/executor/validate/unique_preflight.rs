@@ -4,20 +4,18 @@
 
 use super::*;
 
-use std::ops::Range;
-
-use crate::runtime::reactor::TrainFrame;
 use gnitz_store::relation::Relation;
 use gnitz_wire::PkBuf;
 use gnitz_zset::schema::SchemaDescriptor;
 
-/// One worker's sorted spans in `merge_index_scan`: the frame being read, copied
-/// out of its ring, and the byte range of its unread keys inside it.
+/// One worker's sorted spans in `merge_index_scan`: the spans of the frame being
+/// read and how far the merge has read them. Copied out of the frame, so no ring
+/// slot is held while the merge waits on the other workers' trains.
 struct PreflightKeyStream<'l> {
-    lease: &'l TrainLease,
+    train: Train<'l>,
     w: usize,
-    frame: Option<TrainFrame>,
-    keys: Range<usize>,
+    keys: Vec<u8>,
+    at: usize,
 }
 
 impl PreflightKeyStream<'_> {
@@ -25,44 +23,32 @@ impl PreflightKeyStream<'_> {
     /// `Ok(None)` once the train has ended.
     async fn next_key(&mut self, frame_schema: &SchemaDescriptor) -> Result<Option<PkBuf>, WireFault> {
         let stride = frame_schema.pk_stride();
-        loop {
-            if let Some(f) = &self.frame {
-                if !self.keys.is_empty() {
-                    let s = self.keys.start;
-                    self.keys.start += stride;
-                    return Ok(Some(PkBuf::from_bytes(&f.slot.bytes()[s..s + stride])));
-                }
-            }
-            self.frame = None; // release the ring slot before waiting on the next
-            let Some(mut f) = self.lease.next_of(self.w).await? else {
+        while self.at == self.keys.len() {
+            let Some(f) = self.train.next_of(self.w).await? else {
                 return Ok(None);
             };
-            // Held while the merge waits on the other workers' trains: a slot held
-            // there would wait on them, and no give-back reaches it.
-            f.slot.detach();
-            let mb = f.rows(frame_schema);
-            let start = mb.pk().as_ptr() as usize - f.slot.bytes().as_ptr() as usize;
-            self.keys = start..start + mb.len() * stride;
-            self.frame = Some(f);
+            self.keys.clear();
+            self.keys.extend_from_slice(f.rows(frame_schema).pk());
+            self.at = 0;
         }
+        let key = PkBuf::from_bytes(&self.keys[self.at..self.at + stride]);
+        self.at += stride;
+        Ok(Some(key))
     }
 }
 
-/// Streaming k-way merge over the workers' sorted span trains, holding one frame
-/// per worker. Equal spans pop adjacently whether one worker or two hold them, so
-/// the first adjacent equal pair is a duplicate: `None`, the rest of the trains
-/// left for the lease drop. Otherwise the filter of every distinct span.
-async fn merge_index_scan(
-    scan: &TrainLease,
-    frame_schema: &SchemaDescriptor,
-) -> Result<Option<UniqueFilter>, WireFault> {
+/// Streaming k-way merge over the workers' sorted span trains, holding one frame's
+/// spans per worker. Equal spans pop adjacently whether one worker or two hold
+/// them, so the first adjacent equal pair is a duplicate: `None`, the rest of the
+/// trains left for the lease drop. Otherwise the filter of every distinct span.
+async fn merge_index_scan(scan: Train<'_>, frame_schema: &SchemaDescriptor) -> Result<Option<UniqueFilter>, WireFault> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
     let mut streams: Vec<PreflightKeyStream> = scan
         .workers()
         .iter()
-        .map(|w| PreflightKeyStream { lease: scan, w, frame: None, keys: 0..0 })
+        .map(|w| PreflightKeyStream { train: scan, w, keys: Vec::new(), at: 0 })
         .collect();
 
     let mut heap: BinaryHeap<Reverse<(PkBuf, usize)>> = BinaryHeap::with_capacity(streams.len());
@@ -96,7 +82,7 @@ async fn merge_index_scan(
 ///
 /// Runs under the DDL's catalog write, before the zone is laid out, so the index
 /// each worker filled is the one its catalog claim adopts; the caller releases
-/// every claim it leaves. The DDL's hold of the tick gate keeps a checkpoint's
+/// every claim it leaves. The DDL's hold of the apply lock keeps a checkpoint's
 /// sweep off the claimed directory meanwhile.
 ///
 /// `Some(filter)` seeds the index's unique filter; `None` when the
@@ -124,9 +110,9 @@ pub(in crate::runtime::executor) async fn validate_unique_index_create(
 
     // A replicated owner is read on one worker: every worker's copy would
     // pop each value `nw` times.
-    let lease = disp.scan(Read::KeySpans { tid: owner_id, cols, claim: true }).await?;
+    let mut lease = disp.scan(Read::KeySpans { tid: owner_id, cols, claim: true }).await?;
 
-    let Some(seed) = merge_index_scan(&lease, &frame_schema).await? else {
+    let Some(seed) = merge_index_scan(lease.next_train().await, &frame_schema).await? else {
         let cat = disp.cat();
         return Err(integrity_violation(format!(
             "cannot create unique index on '{}' column '{}': column contains duplicate values",

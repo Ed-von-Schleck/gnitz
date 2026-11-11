@@ -1,10 +1,12 @@
 //! Master-side dispatcher: the master's catalog, SAL writer and reactor as one
-//! value. Every group a worker answers is written here, under the lease the
-//! reactor routes its W2M replies to: a read on a train lease, an apply on an
-//! ACK lease. A push group and a catalog zone, which no worker answers, are laid
-//! out here in a hold or scope of the caller's. The child `route` decides which
-//! workers a read or push reaches; `dispatch` holds the writes and the tick
-//! rounds they allocate; `workers` holds the worker processes.
+//! value. Every group a worker answers is written here, with what the reactor
+//! reads the answer through: a read under the train lease its W2M replies are
+//! routed to, an apply — under the apply lock — with a wait on the position
+//! the workers apply the log through. A push group and a catalog zone, which
+//! no worker answers, are laid out here in a hold or scope of the caller's.
+//! The child `route` decides which workers a read or push reaches; `dispatch`
+//! holds the writes and the tick rounds they allocate; `workers` holds the
+//! worker processes.
 
 pub(crate) mod route;
 
@@ -24,6 +26,7 @@ use rustc_hash::FxHashMap;
 use crate::catalog::CatalogEngine;
 use crate::runtime::reactor::{Reactor, TrainLease};
 use crate::runtime::sal::{Read, SalExcl, SalWriter};
+use crate::runtime::sync::{AsyncRwLock, WriteFuture};
 use gnitz_wire::WireFault;
 
 pub(crate) use workers::Workers;
@@ -31,6 +34,10 @@ pub(crate) use workers::Workers;
 // ---------------------------------------------------------------------------
 // MasterDispatcher
 // ---------------------------------------------------------------------------
+
+/// The tag of the apply lock: a guard of it is held by the one task that may
+/// write an apply, from the write through its ACKs.
+pub(crate) enum ApplyLock {}
 
 pub(crate) struct MasterDispatcher {
     sal: SalWriter,
@@ -43,6 +50,12 @@ pub(crate) struct MasterDispatcher {
     round: Cell<u64>,
     /// Ticked relation id → the last round that ticked it.
     last_tick: RefCell<FxHashMap<u64, u64>>,
+    /// Taken by whoever writes an apply — a tick, a checkpoint's rounds, a
+    /// backfill — and by a DDL body, whose zone every worker ingests. A worker
+    /// inside the exchange wait of a `Tick` or `Backfill` fail-stops on either,
+    /// so a holder awaits an apply's ACKs before it writes another apply or a
+    /// zone, or releases the lock.
+    applies: AsyncRwLock<ApplyLock>,
 }
 
 impl MasterDispatcher {
@@ -53,7 +66,13 @@ impl MasterDispatcher {
             catalog: RefCell::new(catalog),
             round: Cell::new(1),
             last_tick: RefCell::default(),
+            applies: AsyncRwLock::default(),
         }
+    }
+
+    /// The apply lock, exclusively, once no other task holds it.
+    pub(crate) fn apply_lock(&self) -> WriteFuture<ApplyLock> {
+        self.applies.write()
     }
 
     /// The catalog.
@@ -76,15 +95,20 @@ impl MasterDispatcher {
         &self.reactor
     }
 
-    /// The scan-shaped requests `build` writes as one
-    /// [`Cut`](crate::runtime::sal::Cut); `build` keeps the lease each
-    /// [`ScanCut::read`] hands it.
-    pub(crate) async fn scan_cut<R>(
+    /// The scan-shaped requests `build` writes under one SAL hold: the one
+    /// lease their replies are read through, a train per read in the order
+    /// written.
+    pub(crate) async fn scan_cut(
         &self,
-        build: impl FnOnce(&mut ScanCut<'_>) -> Result<R, WireFault>,
-    ) -> Result<R, WireFault> {
-        let mut cut = ScanCut { disp: self, excl: self.sal.lock().await };
-        build(&mut cut)
+        build: impl FnOnce(&mut ScanCut<'_>) -> Result<(), WireFault>,
+    ) -> Result<TrainLease, WireFault> {
+        let mut cut = ScanCut {
+            disp: self,
+            excl: self.sal.lock().await,
+            lease: self.reactor.lease_train(),
+        };
+        build(&mut cut)?;
+        Ok(cut.lease)
     }
 
     /// One scan-shaped read under its own SAL hold.
@@ -95,15 +119,18 @@ impl MasterDispatcher {
     /// `read`, answered with no rows by every worker it reaches, under its own
     /// SAL hold; the first worker fault.
     pub(crate) async fn command(&self, read: Read<'_>) -> Result<(), WireFault> {
-        self.scan(read).await?.finish().await
+        self.scan(read).await?.next_train().await.finish().await
     }
 }
 
-/// Scan-shaped requests written under one SAL hold: one
-/// [`Cut`](crate::runtime::sal::Cut).
+/// Scan-shaped requests written under one SAL hold, all answered on one lease:
+/// every worker runs them at one point of the log, and answers them in the
+/// order written.
 pub(crate) struct ScanCut<'d> {
     disp: &'d MasterDispatcher,
     excl: SalExcl<'d>,
+    /// The lease the cut's reads are answered on.
+    lease: TrainLease,
 }
 
 impl<'d> ScanCut<'d> {
@@ -113,14 +140,14 @@ impl<'d> ScanCut<'d> {
     }
 
     /// `read` written to the workers its target and bound reach, each sent its
-    /// own key set when the bound splits one, under a reply id leased for them;
-    /// the lease its replies are read through.
-    pub(crate) fn read(&mut self, read: Read<'_>) -> Result<TrainLease, WireFault> {
+    /// own key set when the bound splits one, under the cut's reply id. A
+    /// refused read is not one of the lease's.
+    pub(crate) fn read(&mut self, read: Read<'_>) -> Result<(), WireFault> {
         let route = route::route_read(&read, &self.disp.cat().registry, self.disp.sal.num_workers());
-        let lease = self.disp.reactor.lease_train(route.set, read.name());
-        debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
+        let what = read.name();
         self.excl
-            .read(read, lease.workers(), route.per_worker.as_deref(), lease.id())?;
-        Ok(lease)
+            .read(read, route.set, route.per_worker.as_deref(), self.lease.id())?;
+        self.lease.add(route.set, what);
+        Ok(())
     }
 }

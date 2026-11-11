@@ -1,5 +1,5 @@
-//! W2M ingest: every ring drained into the routes of [`AckLease`] and
-//! [`TrainLease`].
+//! W2M ingest: every ring drained into the applied level an [`AckWait`] parks
+//! on and the routes of [`TrainLease`].
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -8,6 +8,7 @@ use gnitz_wire::WireFault;
 use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use super::*;
 use crate::runtime::park::WorkerSet;
@@ -17,10 +18,8 @@ use crate::runtime::w2m::{RequestId, W2mSlot};
 // Routes
 // ---------------------------------------------------------------------------
 
-/// Every live lease's request id and what its workers have answered on it. An
-/// id is live in at most one of the two tables.
+/// Every live train lease's request id and what its workers have answered on it.
 pub(super) struct Routes {
-    acks: FxHashMap<RequestId, AckRoute>,
     trains: FxHashMap<RequestId, TrainRoute>,
     /// The next request id a lease starts from.
     next_id: RequestId,
@@ -38,9 +37,8 @@ const SPARE_QUEUE_CAP: usize = 16;
 impl Routes {
     pub(super) fn new() -> Self {
         Routes {
-            acks: FxHashMap::default(),
             trains: FxHashMap::default(),
-            next_id: RequestId::BOOT_READY,
+            next_id: RequestId::MIN,
             spare: Vec::new(),
         }
     }
@@ -48,7 +46,7 @@ impl Routes {
     /// A request id no live lease holds.
     fn fresh_id(&mut self) -> RequestId {
         let mut id = self.next_id;
-        while self.acks.contains_key(&id) || self.trains.contains_key(&id) {
+        while self.trains.contains_key(&id) {
             id = id.next();
         }
         self.next_id = id.next();
@@ -56,20 +54,12 @@ impl Routes {
     }
 }
 
-/// What the workers have answered on one [`AckLease`] id.
-struct AckRoute {
-    /// The workers yet to answer.
-    left: WorkerSet,
-    /// The `acks` awaiter parked on this id.
-    waker: Option<Waker>,
-}
-
 /// The undecoded frames of one [`TrainLease`]; each pins its ring space until
 /// dropped, unless it was copied out of the ring.
 struct TrainRoute {
-    /// The workers the scan was written to.
+    /// The workers the lease's reads were written to.
     set: WorkerSet,
-    /// The workers holding this lease's train: their queued frames were copied
+    /// The workers holding this lease's trains: their queued frames were copied
     /// out when their ring was given back, and each sends it nothing more until
     /// its reader has taken that worker's copies and waits on it for the next
     /// frame, or the lease drops.
@@ -84,14 +74,17 @@ struct TrainRoute {
 }
 
 impl Reactor {
-    /// Route every unread ACK and slot of every worker's rings, and give back
-    /// each ring whose worker named a shortage of room.
+    /// Route every unread slot of every worker's ring, raise the applied level
+    /// when a worker has moved its position, and give back each ring whose
+    /// worker named a shortage of room.
     pub(super) fn drain_all_w2m(&self) {
+        if let Some(at) = self.w2m.lowest_applied_if_moved() {
+            self.applied.raise(at);
+        }
         for w in 0..self.w2m.num_workers() {
             // Answered ahead of the reads: a worker names a shortage behind its
             // last publish, so the reads route every slot the give-back must reach.
             let short = self.w2m.answer_shortage(w);
-            self.w2m.drain_acks(w, |id| self.route_ack(w, id));
             while let Some(slot) = self.w2m.try_read_slot(w) {
                 self.route(slot);
             }
@@ -103,7 +96,7 @@ impl Reactor {
 
     /// Give worker `w`'s ring back (see `w2m`'s module header): copy every
     /// frame of it a lease holds queued out of the ring, holding each such
-    /// lease's train on `w`.
+    /// lease's trains on `w`.
     #[cold]
     fn give_back(&self, w: usize) {
         for (&id, t) in self.routes.borrow_mut().trains.iter_mut() {
@@ -123,33 +116,13 @@ impl Reactor {
         }
     }
 
-    /// Count worker `w`'s ACK of `id` towards the lease it names.
-    fn route_ack(&self, w: usize, id: RequestId) {
-        let mut routes = self.routes.borrow_mut();
-        // No lease takes it: an abandoned request's late ACK.
-        let Some(r) = routes.acks.get_mut(&id) else {
-            debug_assert!(!routes.trains.contains_key(&id), "worker {w} ACKed a read");
-            return;
-        };
-        debug_assert!(
-            r.left.contains(w),
-            "worker {w} ACKed a request it was not sent, or ACKed it twice"
-        );
-        r.left = r.left.without(w);
-        if r.left == WorkerSet::EMPTY {
-            if let Some(waker) = r.waker.take() {
-                waker.wake();
-            }
-        }
-    }
-
     /// Hand a slot to the lease its ring id names, on behalf of the worker whose
     /// ring it was read from.
     ///
     /// A ring frees only a released prefix, so a slot queued in place holds up
     /// every slot behind it until its reader takes it. A passing reply is one
-    /// its worker sent ahead of an earlier cut's owed frames, whose reader may
-    /// be far from taking it: it is copied out here unless that reader waits on
+    /// its worker sent ahead of the frames it owes another lease, whose reader
+    /// may be far from taking it: it is copied out here unless that reader waits on
     /// its worker, which takes it now. Any other slot queued when its ring runs
     /// short of room is copied out by [`Self::give_back`].
     fn route(&self, mut slot: W2mSlot) {
@@ -157,10 +130,6 @@ impl Reactor {
         let mut routes = self.routes.borrow_mut();
         // No lease takes it: it drops here undecoded, releasing its ring space.
         let Some(t) = routes.trains.get_mut(&slot.request_id) else {
-            debug_assert!(
-                !routes.acks.contains_key(&slot.request_id),
-                "worker {w} answered an ACKed request with a frame"
-            );
             return;
         };
         if !t.set.contains(w) {
@@ -177,37 +146,16 @@ impl Reactor {
         }
     }
 
-    /// One request id, answered by one ACK from every launched worker. See
-    /// [`AckLease`].
-    pub(crate) fn lease_acks(&self) -> AckLease {
-        let left = WorkerSet::ALL.within(self.w2m.num_workers());
-        let mut routes = self.routes.borrow_mut();
-        let id = routes.fresh_id();
-        routes.acks.insert(id, AckRoute { left, waker: None });
-        AckLease { reactor: self.clone(), id }
+    /// A wait for every launched worker to apply the log through `at`: the
+    /// position a group every worker runs ends at. See [`AckWait`].
+    pub(crate) fn applied_through(&self, at: u64) -> AckWait {
+        AckWait { reactor: self.clone(), at }
     }
 
-    /// Resolves once every worker has ACKed its boot recovery: the lease its
-    /// ready ACKs answer, which [`Reactor::new`] takes first.
-    pub(super) fn boot_ready(&self) -> impl Future<Output = ReadyAcked> {
-        let acks = self.lease_acks();
-        assert_eq!(
-            acks.id(),
-            RequestId::BOOT_READY,
-            "the ready lease is the reactor's first"
-        );
-        async move {
-            acks.acks().await;
-            ReadyAcked(())
-        }
-    }
-
-    /// One request id, answered by a train of frames from every worker in `set`.
-    /// `what` names the request in every fault the lease reports. See
-    /// [`TrainLease`].
-    pub(crate) fn lease_train(&self, set: WorkerSet, what: &'static str) -> TrainLease {
+    /// One request id, routed from no worker until a read is written under it.
+    /// See [`TrainLease`].
+    pub(crate) fn lease_train(&self) -> TrainLease {
         let nw = self.w2m.num_workers();
-        let set = set.within(nw);
         let id = {
             let mut routes = self.routes.borrow_mut();
             let queues = routes
@@ -218,7 +166,7 @@ impl Reactor {
             routes.trains.insert(
                 id,
                 TrainRoute {
-                    set,
+                    set: WorkerSet::EMPTY,
                     held: WorkerSet::EMPTY,
                     queues,
                     reader: None,
@@ -229,79 +177,62 @@ impl Reactor {
         TrainLease {
             reactor: self.clone(),
             id,
-            set,
-            left: Cell::new(set),
-            what,
+            reads: SmallVec::new(),
+            taken: 0,
+            left: Cell::new(WorkerSet::EMPTY),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// AckLease
+// AckWait
 // ---------------------------------------------------------------------------
 
-/// One request id, answered by one ACK from every launched worker, routed
-/// while it lives, so an ACK beating its awaiter is kept. Dropping it removes
-/// the route.
-pub(crate) struct AckLease {
+/// A SAL position every launched worker is to apply the log through. The level
+/// it waits on keeps what the workers published before anything awaited it.
+pub(crate) struct AckWait {
     reactor: Reactor,
-    id: RequestId,
+    at: u64,
 }
 
-impl Drop for AckLease {
-    fn drop(&mut self) {
-        let route = self.reactor.routes.borrow_mut().acks.remove(&self.id);
-        assert!(route.is_some(), "a lease's id is routed while it lives");
-    }
-}
-
-impl AckLease {
-    /// The request id its workers ACK on.
-    pub(crate) fn id(&self) -> RequestId {
-        self.id
-    }
-
-    /// Resolves once every launched worker has ACKed. A worker that cannot
-    /// apply what it is to ACK exits instead, which the master's death watch sees.
+impl AckWait {
+    /// Resolves once every launched worker has applied the log through the
+    /// position. A worker that cannot apply what lies below it exits instead,
+    /// which the master's death watch sees.
     pub(crate) async fn acks(&self) {
-        std::future::poll_fn(|cx| {
-            let mut routes = self.reactor.routes.borrow_mut();
-            let r = routes
-                .acks
-                .get_mut(&self.id)
-                .expect("a lease's id is routed while it lives");
-            if r.left == WorkerSet::EMPTY {
-                return Poll::Ready(());
-            }
-            r.waker = Some(cx.waker().clone());
-            Poll::Pending
-        })
-        .await
+        std::future::poll_fn(|cx| self.reactor.applied.poll_reached(self.at, cx)).await
     }
 }
-
-/// Every worker has ACKed its boot recovery, which flushes the rows it replayed
-/// from the SAL tail to its stores. Until then the tail is those rows' only
-/// durable copy, so only this token lets a writer rewind the SAL at boot.
-pub(crate) struct ReadyAcked(());
 
 // ---------------------------------------------------------------------------
 // TrainLease
 // ---------------------------------------------------------------------------
 
-/// One request id, answered by a train of frames from each worker of its set,
-/// routed while it lives. Dropping it releases every frame the route holds.
+/// One request id and the reads written under it, routed while it lives. Each
+/// worker a read was written to answers it with one train of frames, ended by
+/// its terminal: the frame carrying `scan_last`, or a fault frame. A worker
+/// sends its trains in the order their reads were written, so the reads are
+/// taken in that order, one [`Train`] at a time. Dropping the lease releases
+/// every frame the route holds.
 pub(crate) struct TrainLease {
     reactor: Reactor,
     id: RequestId,
-    /// The workers it was written to: the set it was leased over, clipped to
-    /// the launched workers.
-    set: WorkerSet,
-    /// The workers whose terminal frame has not been read.
+    /// Each read written under the id, in the order written: what it was
+    /// written for, named in every fault its train reports, and the workers it
+    /// was written to.
+    reads: SmallVec<[(&'static str, WorkerSet); 1]>,
+    /// The trains handed out: read `taken - 1` is the one being taken, and
+    /// every earlier one has ended or was given up.
+    taken: usize,
+    /// The workers of the read being taken whose terminal frame has not been
+    /// read.
     left: Cell<WorkerSet>,
-    /// What the lease was written for, named in every fault it reports.
-    what: &'static str,
 }
+
+/// One read of a [`TrainLease`]: the train each of its workers answers it
+/// with. A copy reads the same train.
+#[derive(Clone, Copy)]
+pub(crate) struct Train<'a>(&'a TrainLease);
 
 impl Drop for TrainLease {
     fn drop(&mut self) {
@@ -354,62 +285,50 @@ impl TrainLease {
         self.id
     }
 
-    /// The workers that reply: the set it was leased over, clipped to the
-    /// launched workers.
-    pub(crate) fn workers(&self) -> WorkerSet {
-        self.set
+    /// Count a read written to `set` under the id, named `what` in every fault
+    /// its train reports.
+    pub(crate) fn add(&mut self, set: WorkerSet, what: &'static str) {
+        let set = set.within(self.reactor.w2m.num_workers());
+        debug_assert!(set.len() > 0, "every read owes at least one reply");
+        let mut routes = self.reactor.routes.borrow_mut();
+        let route = routes
+            .trains
+            .get_mut(&self.id)
+            .expect("a lease's id is routed while it lives");
+        route.set = route.set.union(set);
+        self.reads.push((what, set));
     }
 
-    /// Worker `w`'s next frame, row-less ones included, with the range of its
-    /// rows when it carries any; `None` once its train has ended. The terminal
-    /// frame is the one carrying `scan_last`, and is handed out like the rest.
-    /// `Err` on a fault frame, which ends `w`'s train too.
-    pub(crate) async fn frame_of(&self, w: usize) -> Result<Option<(W2mSlot, Option<Range<usize>>)>, WireFault> {
-        if !self.left.get().contains(w) {
-            return Ok(None);
-        }
-        let slot = self.next_slot(w).await;
-        let ctrl = slot.control();
-        if let Some(f) = ctrl.fault(slot.bytes()) {
-            self.left.set(self.left.get().without(w));
-            return Err(f.in_context(format_args!("worker {w}: {}", self.what)));
-        }
-        debug_assert!(
-            ctrl.schema.is_none(),
-            "worker {w}: a reply frame carries a schema block"
-        );
-        if ctrl.hdr.flags.scan_last {
-            self.left.set(self.left.get().without(w));
-        }
-        Ok(Some((slot, ctrl.data)))
-    }
-
-    /// Worker `w`'s next frame that carries rows, `None` once its train has ended;
-    /// `Err` on a fault frame.
-    pub(crate) async fn next_of(&self, w: usize) -> Result<Option<TrainFrame>, WireFault> {
-        while let Some((slot, data)) = self.frame_of(w).await? {
-            if let Some(data) = data {
-                return Ok(Some(TrainFrame { slot, data }));
-            }
-        }
-        Ok(None)
-    }
-
-    /// The next frame that carries rows, workers in ascending order.
-    pub(crate) async fn next(&self) -> Result<Option<TrainFrame>, WireFault> {
+    /// The next read's train, the reads taken in the order written: whatever
+    /// the read before has left unread is read off first, each worker's train
+    /// to its terminal.
+    pub(crate) async fn next_train(&mut self) -> Train<'_> {
         while let Some(w) = self.left.get().iter().next() {
-            if let Some(f) = self.next_of(w).await? {
-                return Ok(Some(f));
-            }
+            // A fault frame ends `w`'s train as its terminal does.
+            let _ = Train(self).frame_of(w).await;
         }
-        Ok(None)
+        let &(_, set) = self
+            .reads
+            .get(self.taken)
+            .expect("a lease hands out one train per read written");
+        self.taken += 1;
+        self.left.set(set);
+        Train(self)
     }
 
-    /// Wait out every worker's train, for a request answered with no rows; the
-    /// first fault.
-    pub(crate) async fn finish(&self) -> Result<(), WireFault> {
-        while self.next().await?.is_some() {}
-        Ok(())
+    /// The read being taken: what it was written for, and its workers.
+    fn taking(&self) -> (&'static str, WorkerSet) {
+        self.reads[self.taken - 1]
+    }
+
+    /// End worker `w`'s train of the read being taken on its fault frame: `f`,
+    /// naming the worker and the read. Out of line: inlined, the registers it
+    /// needs are saved on the path of every frame.
+    #[cold]
+    #[inline(never)]
+    fn faulted(&self, w: usize, f: WireFault) -> WireFault {
+        self.left.set(self.left.get().without(w));
+        f.in_context(format_args!("worker {w}: {}", self.taking().0))
     }
 
     /// Worker `w`'s next routed slot.
@@ -424,7 +343,7 @@ impl TrainLease {
             match route.queues[w].pop_front() {
                 Some(slot) => Poll::Ready(slot),
                 None => {
-                    // Every copied frame is taken: `w` sends the train on.
+                    // Every copied frame is taken: `w` sends the lease's trains on.
                     if route.held.contains(w) {
                         route.held = route.held.without(w);
                         self.reactor.w2m.unhold(w, self.id);
@@ -435,6 +354,66 @@ impl TrainLease {
             }
         })
         .await
+    }
+}
+
+impl Train<'_> {
+    /// The workers that answer the read: the set it was written to, clipped to
+    /// the launched workers.
+    pub(crate) fn workers(self) -> WorkerSet {
+        self.0.taking().1
+    }
+
+    /// Worker `w`'s next frame, row-less ones included, with the range of its
+    /// rows when it carries any; `None` once its train has ended. The terminal
+    /// frame is the one carrying `scan_last`, and is handed out like the rest.
+    /// `Err` on a fault frame, which ends `w`'s train too.
+    pub(crate) async fn frame_of(self, w: usize) -> Result<Option<(W2mSlot, Option<Range<usize>>)>, WireFault> {
+        let lease = self.0;
+        if !lease.left.get().contains(w) {
+            return Ok(None);
+        }
+        let slot = lease.next_slot(w).await;
+        let ctrl = slot.control();
+        if let Some(f) = ctrl.fault(slot.bytes()) {
+            return Err(lease.faulted(w, f));
+        }
+        debug_assert!(
+            ctrl.schema.is_none(),
+            "worker {w}: a reply frame carries a schema block"
+        );
+        if ctrl.hdr.flags.scan_last {
+            lease.left.set(lease.left.get().without(w));
+        }
+        Ok(Some((slot, ctrl.data)))
+    }
+
+    /// Worker `w`'s next frame that carries rows, `None` once its train has ended;
+    /// `Err` on a fault frame.
+    pub(crate) async fn next_of(self, w: usize) -> Result<Option<TrainFrame>, WireFault> {
+        while let Some((slot, data)) = self.frame_of(w).await? {
+            if let Some(data) = data {
+                return Ok(Some(TrainFrame { slot, data }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The next frame that carries rows, workers in ascending order.
+    pub(crate) async fn next(self) -> Result<Option<TrainFrame>, WireFault> {
+        while let Some(w) = self.0.left.get().iter().next() {
+            if let Some(f) = self.next_of(w).await? {
+                return Ok(Some(f));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Wait out every worker's train, for a request answered with no rows; the
+    /// first fault.
+    pub(crate) async fn finish(self) -> Result<(), WireFault> {
+        while self.next().await?.is_some() {}
+        Ok(())
     }
 }
 

@@ -1,7 +1,7 @@
-//! Tick scheduling and read freshness: the pending-tick ledger, the task that
-//! ticks the views on request, the requests that wake it, and the read lock
-//! that asks for a drain when a read would otherwise miss a commit no tick has
-//! taken yet.
+//! Tick scheduling and read freshness: the pending-tick ledger and the waits
+//! on it, the task that ticks the views on request, the requests that wake it,
+//! and the read lock that asks for a drain when a read would otherwise miss a
+//! commit no tick has taken yet.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -9,31 +9,34 @@ use std::time::{Duration, Instant};
 
 use super::{park_until, CatalogLock, Shared};
 use crate::query::DagEngine;
-use crate::runtime::reactor::AckLease;
+use crate::runtime::master::ApplyLock;
+use crate::runtime::reactor::AckWait;
 use crate::runtime::sal::SalExcl;
-use crate::runtime::sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard};
+use crate::runtime::sync::{chan, oneshot, select2, Either, ReadGuard, WriteGuard};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::RelationKind;
 use gnitz_wire::WireFault;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next tick emit, once, as a full SAL
 /// would.
 static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
 
 /// `GNITZ_INJECT_TICK_HOLD_FOR_DDL`: hold the first tick that emitted a group in
-/// flight, its gate held and its ACKs outstanding, until a writer — a DDL, or a
-/// checkpoint — parks on the tick gate. With no checkpoint asked for, a DDL
-/// then provably lands mid-tick. One-shot.
+/// flight, the apply lock held and its ACKs outstanding, until a DDL or a
+/// checkpoint parks on that lock. With no checkpoint asked for, a DDL then
+/// provably lands mid-tick. One-shot.
 static TICK_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_TICK_HOLD_FOR_DDL");
 
 /// Poll bound for [`TICK_HOLD_FOR_DDL`], in 1 ms ticks.
 const TICK_HOLD_MAX_POLLS: u32 = 10_000;
 
-/// The tick loop's handle and pacing, and the pending-tick ledger: what the
-/// next tick owes and what the last one covered. `pending` grows under the SAL
-/// hold its commit groups are written under; a dropped relation's entry is
-/// removed under the catalog write guard.
+/// The tick loop's handle and pacing, and the pending-tick ledger with the two
+/// waits on it: what the next tick owes and what the last one covered, the
+/// drains waiting for the next emit, and the watches waiting for a relation's
+/// first un-ticked commit. `pending` grows under the SAL hold its commit groups
+/// are written under; a dropped relation's entry is removed under the catalog
+/// write guard.
 pub(super) struct Ticks {
     /// The requests to [`tick_loop`]: tick whatever is pending, even nothing,
     /// by the time sent. A commit that brings a tid to the row coalesce
@@ -42,10 +45,6 @@ pub(super) struct Ticks {
     /// The drains awaiting a verdict. Each sent [`tick_loop`] a request of its
     /// own as it was pushed here.
     drains: RefCell<Vec<oneshot::Sender<Result<(), WireFault>>>>,
-    /// Held shared by the tick loop across each of its ticks, and exclusively
-    /// by a DDL body and by a checkpoint, so either runs with no tick in flight
-    /// but its own.
-    pub(super) gate: AsyncRwLock,
     /// How long after a tick the next one waits for a request to fall due
     /// (`GNITZ_PATIENT_TICK_GAP_MS`): a held sync is re-issued the moment it is
     /// answered, so unpaced it would tick per commit.
@@ -53,6 +52,12 @@ pub(super) struct Ticks {
     /// Tables with a pending delta, each with the row count feeding the
     /// coalesce threshold.
     pending: RefCell<FxHashMap<u64, usize>>,
+    /// The waits for a relation to gain an un-ticked commit. An entry leaves
+    /// when a relation it names enters `pending`, at a `wake_watches`, or with
+    /// its [`Watching`].
+    watches: RefCell<Vec<Watch>>,
+    /// The id of the next [`Watch`].
+    next_watch: Cell<u64>,
     /// Scratch for the tids a tick is emitted for, kept across ticks.
     tids: RefCell<Vec<u64>>,
     /// The pending rows of one table that fire an auto-tick.
@@ -67,6 +72,27 @@ pub(super) struct Ticks {
 /// The requests [`tick_loop`] receives.
 pub(super) struct TickRequests(chan::Receiver<Instant>);
 
+struct Watch {
+    id: u64,
+    relations: FxHashSet<u64>,
+    wake: oneshot::Sender<()>,
+}
+
+/// One wait registered by [`Ticks::watch`], given up on drop.
+pub(super) struct Watching<'a> {
+    ticks: &'a Ticks,
+    id: u64,
+    /// Resolves when a watched relation gains an un-ticked commit, or at a
+    /// [`Ticks::wake_watches`].
+    pub(super) woken: oneshot::Receiver<()>,
+}
+
+impl Drop for Watching<'_> {
+    fn drop(&mut self) {
+        self.ticks.watches.borrow_mut().retain(|w| w.id != self.id);
+    }
+}
+
 impl Ticks {
     /// The ticks' handle, and the requests [`tick_loop`] is to be spawned on.
     /// `boot_seed` is the SAL watermark after the recovery tick sweep: every
@@ -76,9 +102,10 @@ impl Ticks {
         let ticks = Ticks {
             tx,
             drains: RefCell::new(Vec::new()),
-            gate: AsyncRwLock::default(),
             patient_gap: Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_PATIENT_TICK_GAP_MS", 10)),
             pending: RefCell::new(FxHashMap::default()),
+            watches: RefCell::new(Vec::new()),
+            next_watch: Cell::new(0),
             tids: RefCell::new(Vec::new()),
             coalesce_rows: gnitz_foundation::env::env_num("GNITZ_TICK_COALESCE_ROWS", 10_000),
             last_lsn: Cell::new(boot_seed),
@@ -99,9 +126,39 @@ impl Ticks {
     }
 
     /// True when none of `relations` has a commit no emitted tick has taken.
-    pub(super) fn none_pending(&self, relations: impl IntoIterator<Item = u64>) -> bool {
+    fn none_pending(&self, relations: impl IntoIterator<Item = u64>) -> bool {
         let pending = self.pending.borrow();
         pending.is_empty() || relations.into_iter().all(|s| !pending.contains_key(&s))
+    }
+
+    /// Wait for one of `relations` to gain a commit no emitted tick has taken;
+    /// `None` when one already has. The check and the registration share no
+    /// await, so no commit falls between them.
+    pub(super) fn watch(&self, relations: FxHashSet<u64>) -> Option<Watching<'_>> {
+        if !self.none_pending(relations.iter().copied()) {
+            return None;
+        }
+        let id = self.next_watch.get();
+        self.next_watch.set(id + 1);
+        let (wake, woken) = oneshot::channel();
+        self.watches.borrow_mut().push(Watch { id, relations, wake });
+        Some(Watching { ticks: self, id, woken })
+    }
+
+    /// Wake every watch naming `relation`, which just entered `pending`.
+    fn wake(&self, relation: u64) {
+        let mut watches = self.watches.borrow_mut();
+        for watch in watches.extract_if(.., |w| w.relations.contains(&relation)) {
+            watch.wake.send(());
+        }
+    }
+
+    /// Wake every watch. A watch names relations read off a catalog its holder
+    /// has released, and a DDL's own tick passes through no `pending` entry.
+    pub(super) fn wake_watches(&self) {
+        for watch in self.watches.take() {
+            watch.wake.send(());
+        }
     }
 
     /// Drop a dropped relation's pending entry.
@@ -140,7 +197,7 @@ impl Shared {
     /// the auto-tick when a tid stands at or above the coalesce threshold.
     /// Below it a push only accumulates, and is taken by the next emit,
     /// whichever task runs it. A tid's first commit since the emit that last
-    /// took it wakes the syncs parked on it. `_laid_out` is the SAL hold the
+    /// took it wakes the watches naming it. `_laid_out` is the SAL hold the
     /// rows' groups were written under.
     pub(super) fn note_commit_rows(&self, _laid_out: &SalExcl<'_>, rows: impl Iterator<Item = (u64, usize)>) {
         let ticks = &self.ticks;
@@ -148,7 +205,7 @@ impl Shared {
         let dag = &self.cat().dag;
         for (tid, n) in rows.filter(|&(tid, _)| dag.is_scanned(tid)) {
             *pending.entry(tid).or_insert_with(|| {
-                self.feeds.wake(tid);
+                ticks.wake(tid);
                 0
             }) += n;
         }
@@ -158,14 +215,15 @@ impl Shared {
     }
 
     /// Tick every table with a pending delta as one Tick group, and answer the
-    /// lease its workers ACK on; `None` when nothing was pending. A refused emit
-    /// leaves every delta pending.
+    /// wait for its workers' ACKs; `None` when nothing was pending. A refused emit
+    /// leaves every delta pending. `alone` is the caller's hold of the apply
+    /// lock, which it keeps through those ACKs.
     ///
     /// Every drain waiting is answered with the emit's verdict, at the emit and
     /// not its ACKs: its reader's scan follows the Tick group in the SAL. The
     /// answer shares no await with the read of `pending`, so every commit
     /// pending when the drain was asked for is in the group.
-    pub(super) async fn emit_pending_tick(&self) -> Result<Option<AckLease>, WireFault> {
+    pub(super) async fn emit_pending_tick(&self, alone: &WriteGuard<ApplyLock>) -> Result<Option<AckWait>, WireFault> {
         let ticks = &self.ticks;
         let sal = self.dispatcher.sal();
         let emitted = async {
@@ -179,15 +237,15 @@ impl Shared {
             if TICK_EMIT_ERROR.take_once() {
                 return Err("injected tick emit error".to_string().into());
             }
-            let lease = {
+            let wait = {
                 let mut tids = ticks.tids.borrow_mut();
                 tids.clear();
                 tids.extend(ticks.pending.borrow().keys().copied());
-                self.dispatcher.emit_tick(&mut excl, &tids)?
+                self.dispatcher.emit_tick(alone, &mut excl, &tids)?
             };
             ticks.pending.borrow_mut().clear();
             ticks.last_lsn.set(sal.watermark());
-            Ok(Some(lease))
+            Ok(Some(wait))
         }
         .await;
         ticks.answer_drains(emitted.as_ref().map(|_| ()).map_err(WireFault::clone));
@@ -215,16 +273,14 @@ pub(super) async fn tick_loop(shared: Rc<Shared>, TickRequests(mut rx): TickRequ
             };
         }
 
-        let ticking = shared.ticks.gate.read().await;
-        match shared.emit_pending_tick().await {
+        let ticking = shared.dispatcher.apply_lock().await;
+        match shared.emit_pending_tick(&ticking).await {
             Err(e) => gnitz_warn!("tick error: {}", e),
-            Ok(Some(lease)) => {
+            Ok(Some(wait)) => {
                 if TICK_HOLD_FOR_DDL.take_once() {
-                    // A held read guard is contended only by a queued writer:
-                    // readers park only behind one.
                     park_until(&shared, TICK_HOLD_MAX_POLLS, "tick hold", || ticking.contended()).await;
                 }
-                lease.acks().await;
+                wait.acks().await;
             }
             Ok(None) => {}
         }
@@ -246,7 +302,7 @@ pub(super) async fn tick_loop(shared: Rc<Shared>, TickRequests(mut rx): TickRequ
 ///
 /// A failed tick is reported, not swallowed: its views are stale, and serving
 /// them under `WireStatus::Ok` is a silent stale read. Every emit holds the
-/// tick gate through its ACKs, so the drain also puts the read behind a tick
+/// apply lock through its ACKs, so the drain also puts the read behind a tick
 /// already running.
 pub(super) async fn fresh_read_lock(
     shared: &Shared,

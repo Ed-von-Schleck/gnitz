@@ -3,7 +3,6 @@ use crate::catalog::SysFamily;
 use crate::runtime::master::route::with_routed;
 use crate::runtime::sal::fixtures::test_log;
 use crate::runtime::sal::Apply;
-use crate::runtime::w2m::fixtures::id;
 use crate::test_support::{
     batch_rows, circuit_batch, col_tab_batch, identity_circuit, make_batch, net_weight, register_identity_view,
     sys_batch, table_tab_batch, u64_i64_cols, view_tab_row,
@@ -36,8 +35,9 @@ fn boot(dir: &str, slot: Slot, log: &SalWriter) -> CatalogEngine {
     engine
 }
 
-/// Write `rows` to `log` as the master's push of them to `tid`.
-fn push(log: &SalWriter, engine: &CatalogEngine, tid: u64, rows: &Batch) {
+/// Write `rows` to `log` as the master's push of them to `tid`, in a zone of its
+/// own: that zone's LSN.
+fn push(log: &SalWriter, engine: &CatalogEngine, tid: u64, rows: &Batch) -> u64 {
     let (rel, record) = engine.wire_target(tid).unwrap();
     let mut excl = log.excl();
     let mut scope = excl.begin();
@@ -45,7 +45,7 @@ fn push(log: &SalWriter, engine: &CatalogEngine, tid: u64, rows: &Batch) {
         scope.push(tid, PkRule::Enforce, record, data, true)
     })
     .expect("group fits");
-    scope.commit().expect("the zone was open");
+    scope.commit().expect("the zone was open")
 }
 
 /// The rows `tid`'s store holds, with their weights.
@@ -170,12 +170,10 @@ fn a_tail_behind_an_ephemeral_round_replays_the_pushes_behind_it() {
     {
         let mut excl = log.excl();
         let tick = Apply::Tick { first_round: 2, tids: vec![t].into() };
-        excl.apply(tick, id(1)).expect("group fits");
-        excl.apply(Apply::FlushEph { generation: 1 }, id(1))
-            .expect("group fits");
+        excl.apply(tick).expect("group fits");
+        excl.apply(Apply::FlushEph { generation: 1 }).expect("group fits");
     }
-    let behind = log.cursor();
-    push(
+    let lsn = push(
         &log,
         &engine,
         t,
@@ -184,9 +182,16 @@ fn a_tail_behind_an_ephemeral_round_replays_the_pushes_behind_it() {
     engine.close();
 
     let tail = CommittedTail::read(*log.log()).unwrap();
-    let members: Vec<_> = tail.pushes().map(|m| (m.head.request.target_id, m.base)).collect();
-    assert_eq!(members, [(t, behind)], "the push zone, behind both groups ahead of it");
-    assert_eq!(tail.ddl_syncs().count(), 0);
+    let members: Vec<_> = tail
+        .ingests()
+        .map(|g| g.map(|(ingest, msg)| (ingest, tail.lsn(&msg))))
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        members,
+        [(Ingest::Push { tid: t, rule: PkRule::Enforce }, lsn)],
+        "the push zone alone, behind both groups ahead of it"
+    );
     assert!(tail.holds_pushes());
     assert_eq!(tail.pushed().iter().copied().collect::<Vec<_>>(), [t]);
 

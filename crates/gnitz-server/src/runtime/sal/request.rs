@@ -16,16 +16,12 @@ use gnitz_wire::{PkColList, PkListRole};
 /// A request answered with a reply train; its failure is a fault frame to the
 /// asker, so it may change only state the asker can retry or release.
 ///
-/// A decoded read borrows its byte fields from the SAL group it came in;
-/// [`Read::into_owned`] is the one kept past it.
-#[derive(Debug, PartialEq, Eq)]
+/// Its byte fields borrow: a decoded read's from the SAL group it came in.
+/// [`KeptRead`] is the one kept past that group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Read<'a> {
     /// `probe` at `keys`, encoded by [`gnitz_wire::PkKeys::encode_probe`].
-    HasPk {
-        tid: u64,
-        probe: Probe,
-        keys: Cow<'a, [u8]>,
-    },
+    HasPk { tid: u64, probe: Probe, keys: &'a [u8] },
     /// The sorted spans of `cols` over `tid`, off its index on `cols`. With
     /// `claim`, the `CREATE UNIQUE INDEX` pre-flight's: that index is first
     /// entered under the pre-flight's claim, filled from `tid`'s rows if absent.
@@ -36,7 +32,7 @@ pub(crate) enum Read<'a> {
     ScanSpec {
         tid: u64,
         reply_layout: u64,
-        spec: Cow<'a, [u8]>,
+        spec: &'a [u8],
     },
     /// `view`'s deltas in the rounds after `after_tick`, under the encoded
     /// `ReadSpec` `spec`, in the layout whose digest is `reply_layout`.
@@ -44,7 +40,7 @@ pub(crate) enum Read<'a> {
         view: u64,
         after_tick: u64,
         reply_layout: u64,
-        spec: Cow<'a, [u8]>,
+        spec: &'a [u8],
     },
     /// Pin every base table's store as snapshot `snapshot`, here in the log.
     Pin { snapshot: u64 },
@@ -52,13 +48,9 @@ pub(crate) enum Read<'a> {
     Unpin { snapshot: u64 },
     /// A page of `tid` as `snapshot` pinned it: the encoded
     /// `gnitz_wire::snapshot::PageRequest` `page` names its rows.
-    SnapshotPage {
-        snapshot: u64,
-        tid: u64,
-        page: Cow<'a, [u8]>,
-    },
+    SnapshotPage { snapshot: u64, tid: u64, page: &'a [u8] },
     /// Link every store this process published into the data directory `dir`.
-    Backup { dir: Cow<'a, str> },
+    Backup { dir: &'a str },
 }
 
 /// A request every worker runs and ACKs once done; a worker that cannot has
@@ -132,7 +124,7 @@ impl Read<'_> {
         let head = RequestHead::new;
         let none: &[u8] = &[];
         match *self {
-            Read::HasPk { tid, probe, ref keys } => (
+            Read::HasPk { tid, probe, keys } => (
                 match probe {
                     Probe::Pk => head(K::HasPk, tid, 0, 0),
                     Probe::PkColumn(col) => head(K::HasPkColumn, tid, col.into(), 0),
@@ -142,14 +134,14 @@ impl Read<'_> {
             ),
             Read::KeySpans { tid, cols, claim } => (head(K::KeySpans, tid, claim.into(), cols.pack()), none),
             Read::ReleasePreflight => (head(K::ReleasePreflight, 0, 0, 0), none),
-            Read::ScanSpec { tid, reply_layout, ref spec } => (head(K::ScanSpec, tid, reply_layout, 0), spec),
-            Read::Delta { view, after_tick, reply_layout, ref spec } => {
+            Read::ScanSpec { tid, reply_layout, spec } => (head(K::ScanSpec, tid, reply_layout, 0), spec),
+            Read::Delta { view, after_tick, reply_layout, spec } => {
                 (head(K::Delta, view, reply_layout, after_tick), spec)
             }
             Read::Pin { snapshot } => (head(K::Pin, 0, snapshot, 0), none),
             Read::Unpin { snapshot } => (head(K::Unpin, 0, snapshot, 0), none),
-            Read::SnapshotPage { snapshot, tid, ref page } => (head(K::SnapshotPage, tid, snapshot, 0), page),
-            Read::Backup { ref dir } => (head(K::Backup, 0, 0, 0), dir.as_bytes()),
+            Read::SnapshotPage { snapshot, tid, page } => (head(K::SnapshotPage, tid, snapshot, 0), page),
+            Read::Backup { dir } => (head(K::Backup, 0, 0, 0), dir.as_bytes()),
         }
     }
 
@@ -202,7 +194,7 @@ impl<'r> SalRequest<'r> {
                     }
                     _ => return Err(refused()),
                 };
-                Read::HasPk { tid, probe, keys: Cow::Borrowed(blob) }.into()
+                Read::HasPk { tid, probe, keys: blob }.into()
             }
             SalMessageKind::KeySpans => Read::KeySpans {
                 tid,
@@ -211,54 +203,46 @@ impl<'r> SalRequest<'r> {
             }
             .into(),
             SalMessageKind::ReleasePreflight => Read::ReleasePreflight.into(),
-            SalMessageKind::ScanSpec => Read::ScanSpec {
-                tid,
-                reply_layout: arg0,
-                spec: Cow::Borrowed(blob),
-            }
-            .into(),
+            SalMessageKind::ScanSpec => Read::ScanSpec { tid, reply_layout: arg0, spec: blob }.into(),
             SalMessageKind::Delta => Read::Delta {
                 view: tid,
                 after_tick: arg1,
                 reply_layout: arg0,
-                spec: Cow::Borrowed(blob),
+                spec: blob,
             }
             .into(),
             SalMessageKind::Pin => Read::Pin { snapshot: arg0 }.into(),
             SalMessageKind::Unpin => Read::Unpin { snapshot: arg0 }.into(),
-            SalMessageKind::SnapshotPage => Read::SnapshotPage {
-                snapshot: arg0,
-                tid,
-                page: Cow::Borrowed(blob),
-            }
-            .into(),
+            SalMessageKind::SnapshotPage => Read::SnapshotPage { snapshot: arg0, tid, page: blob }.into(),
             SalMessageKind::Backup => Read::Backup {
-                dir: Cow::Borrowed(std::str::from_utf8(blob).map_err(|_| "a backup directory that is not UTF-8")?),
+                dir: std::str::from_utf8(blob).map_err(|_| "a backup directory that is not UTF-8")?,
             }
             .into(),
         })
     }
 }
 
+/// A read kept past the SAL group it came in, as a group carries it: its
+/// header scalars and a copy of its blob.
+pub(crate) struct KeptRead {
+    head: RequestHead,
+    blob: Box<[u8]>,
+}
+
 impl Read<'_> {
-    /// The same read, owning its bytes.
-    pub(crate) fn into_owned(self) -> Read<'static> {
-        let own = |c: Cow<'_, [u8]>| Cow::Owned(c.into_owned());
-        match self {
-            Read::HasPk { tid, probe, keys } => Read::HasPk { tid, probe, keys: own(keys) },
-            Read::KeySpans { tid, cols, claim } => Read::KeySpans { tid, cols, claim },
-            Read::ReleasePreflight => Read::ReleasePreflight,
-            Read::ScanSpec { tid, reply_layout, spec } => Read::ScanSpec { tid, reply_layout, spec: own(spec) },
-            Read::Delta { view, after_tick, reply_layout, spec } => Read::Delta {
-                view,
-                after_tick,
-                reply_layout,
-                spec: own(spec),
-            },
-            Read::Pin { snapshot } => Read::Pin { snapshot },
-            Read::Unpin { snapshot } => Read::Unpin { snapshot },
-            Read::SnapshotPage { snapshot, tid, page } => Read::SnapshotPage { snapshot, tid, page: own(page) },
-            Read::Backup { dir } => Read::Backup { dir: Cow::Owned(dir.into_owned()) },
+    /// The read, owning its bytes.
+    pub(crate) fn keep(&self) -> KeptRead {
+        let (head, blob) = self.encode();
+        KeptRead { head, blob: blob.into() }
+    }
+}
+
+impl KeptRead {
+    /// The read kept.
+    pub(crate) fn read(&self) -> Read<'_> {
+        match SalRequest::decode(&self.head, &self.blob) {
+            Ok(SalRequest::Read(read)) => read,
+            other => unreachable!("a kept read decodes to itself: {other:?}"),
         }
     }
 }

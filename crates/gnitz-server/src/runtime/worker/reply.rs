@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 
 use crate::runtime::frame::WireMsg;
-use crate::runtime::sal::{Cut, Read, ReplyRoute};
+use crate::runtime::sal::{KeptRead, Read, ReplyRoute};
 use crate::runtime::w2m::{RequestId, W2mWriter};
 use gnitz_store::read::{KeySpans, ReadRows};
 use gnitz_wire::WireFault;
@@ -15,28 +15,25 @@ use gnitz_zset::repr::Batch;
 pub(super) struct Replies {
     w2m: W2mWriter,
     /// Replies this worker owes, in the order their requests were read off the
-    /// SAL: a cut's are consecutive.
+    /// SAL: one lease's are consecutive.
     owed: VecDeque<Owed>,
-    /// The runs of one cut's publishes the master has not released, oldest
-    /// first: where each ends, and the cut whose bytes hold the ring there.
-    unreleased: VecDeque<(u64, Cut)>,
 }
 
 /// One reply this worker owes.
 // One per queued reply, which is not the path a one-frame reply takes.
 #[allow(clippy::large_enum_variant)]
 enum Owed {
-    /// A read of a view, received while a drive was writing views. It owns its
-    /// bytes: it is answered after the drive, which reads further groups.
-    Parked(ReplyRoute, Read<'static>),
+    /// A read of a view, received while a drive was writing views. It is kept:
+    /// it is answered after the drive, which reads further groups.
+    Parked(ReplyRoute, KeptRead),
     Train(Train),
 }
 
 impl Owed {
-    /// The cut of the request it answers.
-    fn cut(&self) -> Cut {
+    /// The lease it answers on.
+    fn id(&self) -> RequestId {
         match self {
-            Owed::Parked(route, _) | Owed::Train(Train { route, .. }) => route.cut,
+            Owed::Parked(route, _) | Owed::Train(Train { route, .. }) => route.request_id,
         }
     }
 }
@@ -87,14 +84,15 @@ impl Train {
         }
     }
 
-    /// Send the next frame, if the ring has room for it now: `Some(last)`,
-    /// `last` once it was the last; `None` refused. A row too wide for any
-    /// frame, or for the ring, turns the train into that fault.
-    fn emit_next(&mut self, w2m: &mut W2mWriter) -> Option<bool> {
+    /// Send the next frame, if the ring has room for it now: `Ok(last)`, `last`
+    /// once it was the last; `Err` refused, with the release cursor the ring
+    /// weighed. A row too wide for any frame, or for the ring, turns the train
+    /// into that fault.
+    fn emit_next(&mut self, w2m: &mut W2mWriter) -> Result<bool, u64> {
         let id = self.route.request_id;
         loop {
             let (batch, ends) = match &mut self.answer {
-                Err(fault) => return w2m.try_send_msg(id, false, &WireMsg::fault(fault)).then_some(true),
+                Err(fault) => return w2m.try_send_msg(id, false, &WireMsg::fault(fault)).map(|()| true),
                 Ok(Rows::Batch(batch)) => (&**batch, true),
                 Ok(Rows::Spans(spans)) => {
                     if self.next_row == spans.chunk().len() {
@@ -111,11 +109,9 @@ impl Train {
                         format!("a row of {} bytes exceeds what the reply ring holds", msg.size()).into()
                     }
                     Ok((msg, next_row)) => {
-                        if !w2m.try_send_msg(id, false, &msg) {
-                            return None;
-                        }
+                        w2m.try_send_msg(id, false, &msg)?;
                         self.next_row = next_row;
-                        return Some(msg.flags.scan_last);
+                        return Ok(msg.flags.scan_last);
                     }
                     Err(fault) => fault,
                 };
@@ -139,11 +135,7 @@ fn whole<'a>(route: &ReplyRoute, answer: &'a Result<Rows, WireFault>, budget: us
 
 impl Replies {
     pub(super) fn new(w2m: W2mWriter) -> Self {
-        Replies {
-            w2m,
-            owed: VecDeque::new(),
-            unreleased: VecDeque::new(),
-        }
+        Replies { w2m, owed: VecDeque::new() }
     }
 
     /// Nothing is owed.
@@ -152,30 +144,32 @@ impl Replies {
         self.owed.is_empty()
     }
 
-    /// ACK `id`: on the ACK ring, which no owed reply holds up.
+    /// Publish that this worker has applied the log through `at`: in the
+    /// ring's header, which no owed reply holds up.
     #[inline]
-    pub(super) fn ack(&mut self, id: RequestId) {
-        self.w2m.ack(id);
+    pub(super) fn applied(&mut self, at: u64) {
+        self.w2m.applied(at);
     }
 
     /// Owe `route` the answer of `read`, once [`Self::answer_parked`] asks for it.
-    pub(super) fn park(&mut self, route: ReplyRoute, read: Read<'static>) {
-        self.owed.push_back(Owed::Parked(route, read));
+    pub(super) fn park(&mut self, route: ReplyRoute, read: &Read<'_>) {
+        self.owed.push_back(Owed::Parked(route, read.keep()));
     }
 
     /// Answer `route`: now, when the answer is one frame, may pass what is
     /// queued and the ring has room for it; owed at the back of the queue
     /// otherwise. A reply may pass what is queued only when the entry directly
-    /// ahead of it is of another cut, and one that does is published as
+    /// ahead of it answers on another lease, and one that does is published as
     /// passing. Never blocks.
     pub(super) fn reply(&mut self, route: ReplyRoute, answer: Result<Rows, WireFault>) {
-        if self.owed.back().is_none_or(|ahead| ahead.cut() != route.cut) {
+        let id = route.request_id;
+        if self.owed.back().is_none_or(|ahead| ahead.id() != id) {
             if let Some(msg) = whole(&route, &answer, self.w2m.frame_budget()) {
                 let passing = !self.owed.is_empty();
-                if self.w2m.try_send_msg(route.request_id, passing, &msg) {
-                    return self.published(route.cut);
+                if self.w2m.try_send_msg(id, passing, &msg).is_ok() {
+                    return;
                 }
-                self.refused(route.cut);
+                self.refused(id);
             }
         }
         self.owed.push_back(Owed::Train(Train::new(route, answer)));
@@ -183,13 +177,13 @@ impl Replies {
 
     /// Answer every parked read where it stands in the queue, by `answer`: the
     /// queue is owed again in its order, each parked read as its reply.
-    pub(super) fn answer_parked(&mut self, mut answer: impl FnMut(&Read<'static>) -> Result<Rows, WireFault>) {
+    pub(super) fn answer_parked(&mut self, mut answer: impl FnMut(&Read<'_>) -> Result<Rows, WireFault>) {
         if !self.owed.iter().any(|owed| matches!(owed, Owed::Parked(..))) {
             return;
         }
         for owed in std::mem::take(&mut self.owed) {
             match owed {
-                Owed::Parked(route, read) => self.reply(route, answer(&read)),
+                Owed::Parked(route, kept) => self.reply(route, answer(&kept.read())),
                 train => self.owed.push_back(train),
             }
         }
@@ -210,19 +204,20 @@ impl Replies {
         let Owed::Train(train) = &mut self.owed[i] else {
             unreachable!("a parked read is not sendable")
         };
-        let cut = train.route.cut;
-        let release = self.w2m.release_cursor();
-        if train.refused_at != Some(release) {
-            let Some(last) = train.emit_next(&mut self.w2m) else {
-                train.refused_at = Some(release);
-                return self.refused(cut);
-            };
-            self.published(cut);
-            if last {
-                self.owed.remove(i);
+        let id = train.route.request_id;
+        if train.refused_at == Some(self.w2m.release_cursor()) {
+            return self.refused(id);
+        }
+        match train.emit_next(&mut self.w2m) {
+            Ok(last) => {
+                if last {
+                    self.owed.remove(i);
+                }
             }
-        } else {
-            self.refused(cut);
+            Err(at) => {
+                train.refused_at = Some(at);
+                self.refused(id);
+            }
         }
     }
 
@@ -235,50 +230,34 @@ impl Replies {
         }
     }
 
-    /// No owed reply can leave before the master releases room or ends a hold.
+    /// No owed reply can leave before the master releases room or ends a hold:
+    /// none is sendable, or the ring refused the first sendable one's next frame
+    /// at the release cursor as it stands.
     fn waits_on_master(&self) -> bool {
-        self.w2m.short_of_room() || self.sendable().next().is_none()
+        let release = self.w2m.release_cursor();
+        self.sendable()
+            .next()
+            .is_none_or(|i| matches!(&self.owed[i], Owed::Train(t) if t.refused_at == Some(release)))
     }
 
     /// The entries a frame may go for now, in queue order: the first of each
-    /// cut's run, unless it is a parked read or a train the master holds,
+    /// lease's run, unless it is a parked read or a train the master holds,
     /// which hold up the rest of their run.
     fn sendable(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.owed.len()).filter(|&i| {
-            (i == 0 || self.owed[i - 1].cut() != self.owed[i].cut())
+            (i == 0 || self.owed[i - 1].id() != self.owed[i].id())
                 && matches!(&self.owed[i], Owed::Train(t) if !self.w2m.held(t.route.request_id))
         })
     }
 
-    /// Record a publish of `cut`'s that just fit: the ring bytes below the
-    /// write cursor are `cut`'s down to the last publish's end, which extends
-    /// the last run when that run is `cut`'s too.
-    fn published(&mut self, cut: Cut) {
-        self.forget_released();
-        let end = self.w2m.write_cursor();
-        match self.unreleased.back_mut() {
-            Some((last, c)) if *c == cut => *last = end,
-            _ => self.unreleased.push_back((end, cut)),
-        }
-    }
-
-    /// Forget every run the master has released.
-    fn forget_released(&mut self) {
-        let release = self.w2m.release_cursor();
-        while self.unreleased.front().is_some_and(|&(end, _)| end <= release) {
-            self.unreleased.pop_front();
-        }
-    }
-
-    /// A publish of `cut`'s found no room. Its own reader frees the room its
-    /// cut's bytes hold, at its own pace; bytes of another cut wait on another
-    /// reader, perhaps one that has stopped. So ask the master for the ring
-    /// back when the oldest unreleased publish is another cut's than a reply
-    /// that waits: `cut`'s, or that of another sendable entry.
-    fn refused(&mut self, cut: Cut) {
-        self.forget_released();
-        let blocker = self.unreleased.front().map(|&(_, c)| c);
-        if blocker != Some(cut) || self.sendable().any(|i| Some(self.owed[i].cut()) != blocker) {
+    /// A publish answering on `id` found no room. A lease's own reader frees
+    /// the room its bytes hold, at its own pace; bytes of another lease wait
+    /// on another reader, perhaps one that has stopped. So ask the master for
+    /// the ring back when the oldest unreleased publish answers on another
+    /// lease than a reply that waits: `id`, or that of another sendable entry.
+    fn refused(&mut self, id: RequestId) {
+        let blocker = self.w2m.oldest_unreleased();
+        if blocker != Some(id) || self.sendable().any(|i| Some(self.owed[i].id()) != blocker) {
             self.w2m.name_shortage();
         }
     }

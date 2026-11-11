@@ -17,7 +17,7 @@ use gnitz_zset::repr::{Batch, WireRows};
 /// caller names only what it sends:
 ///
 /// ```ignore
-/// let msg = WireMsg { status: WireStatus::Error, blob: text, ..Default::default() };
+/// let msg = WireMsg { target_id, arg0: lsn, ..Default::default() };
 /// writer.try_send_msg(request_id, false, &msg);
 /// ```
 #[derive(Clone, Copy, Default)]
@@ -35,12 +35,18 @@ pub struct WireMsg<'a> {
     pub blob: &'a [u8],
 }
 
+/// The longest text a fault frame carries. A refusal's text may echo what its
+/// request named, and a request may be a whole frame of that.
+const MAX_FAULT_TEXT: usize = 16 << 10;
+
 impl<'a> WireMsg<'a> {
-    /// The control-only frame of `fault`: its status, and its text as the blob.
+    /// The control-only frame of `fault`: its status, and as the blob its text
+    /// up to the last character boundary within [`MAX_FAULT_TEXT`] bytes.
     pub(crate) fn fault(fault: &'a WireFault) -> Self {
+        let text = &fault.text;
         WireMsg {
             status: fault.status,
-            blob: fault.text.as_bytes(),
+            blob: &text.as_bytes()[..text.floor_char_boundary(MAX_FAULT_TEXT)],
             ..Default::default()
         }
     }

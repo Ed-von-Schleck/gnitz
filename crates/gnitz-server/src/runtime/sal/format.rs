@@ -79,10 +79,10 @@ gnitz_wire::wire_enum! {
 /// reading a verified header costs the live drain more instructions per group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
-pub(crate) struct RequestHead {
+pub(super) struct RequestHead {
     pub(super) kind: SalMessageKind,
     /// The relation the request names, or 0.
-    pub(crate) target_id: u64,
+    pub(super) target_id: u64,
     pub(super) arg0: u64,
     pub(super) arg1: u64,
 }
@@ -105,13 +105,11 @@ const OFF_FLAGS: usize = 9;
 /// Set on a zone's last member, only together with [`FLAG_ZONE`]: the zone is
 /// closed.
 const FLAG_ZONE_END: u8 = 1;
-/// The group is a later member of its [`Cut`](super::reader::Cut).
-const FLAG_JOINS_CUT: u8 = 2;
 /// The group holds one payload, which every addressed worker reads.
 const FLAG_SHARED: u8 = 4;
 /// The group is a member of its scope's zone.
 const FLAG_ZONE: u8 = 8;
-const KNOWN_FLAGS: u8 = FLAG_ZONE_END | FLAG_JOINS_CUT | FLAG_SHARED | FLAG_ZONE;
+const KNOWN_FLAGS: u8 = FLAG_ZONE_END | FLAG_SHARED | FLAG_ZONE;
 /// The worker count the group was written at, one byte.
 const OFF_WIDTH: usize = 10;
 /// The group's [`RequestId`], 0 for none.
@@ -212,9 +210,9 @@ pub(super) fn directory(hdr: &[u8]) -> &[u8] {
 /// What a group's author says of it: every header scalar but the ones stamped
 /// where it is laid out, which [`Header`] adds.
 #[derive(Clone, Copy)]
-pub(crate) struct GroupHead {
+pub(super) struct GroupHead {
     /// The request the group carries, but for its blob.
-    pub(crate) request: RequestHead,
+    pub(super) request: RequestHead,
     /// `FLAG_*` bits.
     flags: u8,
     pub(super) reply: Option<RequestId>,
@@ -224,22 +222,18 @@ pub(crate) struct GroupHead {
 
 impl GroupHead {
     /// The head of an open group carrying `request` to `targets`, answered on
-    /// `reply`: a member of its scope's zone when `zoned`, a later member of its
-    /// [`Cut`](super::reader::Cut) when `joins_cut`, holding one payload for all
-    /// of `targets` when `shared`.
+    /// `reply`: a member of its scope's zone when `zoned`, holding one payload
+    /// for all of `targets` when `shared`.
     pub(super) fn new(
         request: RequestHead,
         zoned: bool,
-        joins_cut: bool,
         shared: bool,
         reply: Option<RequestId>,
         targets: WorkerSet,
     ) -> Self {
         GroupHead {
             request,
-            flags: if zoned { FLAG_ZONE } else { 0 }
-                | if joins_cut { FLAG_JOINS_CUT } else { 0 }
-                | if shared { FLAG_SHARED } else { 0 },
+            flags: if zoned { FLAG_ZONE } else { 0 } | if shared { FLAG_SHARED } else { 0 },
             reply,
             targets,
         }
@@ -253,11 +247,6 @@ impl GroupHead {
     /// Whether this group is its zone's last member, the one that closes it.
     pub(super) fn zone_end(&self) -> bool {
         self.flags & FLAG_ZONE_END != 0
-    }
-
-    /// Whether the group is a later member of its [`Cut`](super::reader::Cut).
-    pub(super) fn joins_cut(&self) -> bool {
-        self.flags & FLAG_JOINS_CUT != 0
     }
 
     /// Whether the group holds one payload for every addressed worker.

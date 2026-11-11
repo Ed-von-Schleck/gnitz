@@ -148,7 +148,7 @@ impl SalWriter {
             arg0: 0,
             arg1: 0,
         };
-        let head = GroupHead::new(request, zoned, false, false, None, written().map(|(w, _)| w).collect());
+        let head = GroupHead::new(request, zoned, false, None, written().map(|(w, _)| w).collect());
         let bytes: Vec<&[u8]> = written().map(|(_, p)| *p).collect();
         let base = self.cursor();
         let end =
@@ -252,11 +252,6 @@ impl SalExcl<'_> {
         self.write_group(g)
     }
 
-    /// End the open cut: the next read written under this hold starts one.
-    pub(in crate::runtime::sal) fn end_cut(&mut self) {
-        self.in_cut = false;
-    }
-
     /// Push `rows` into `tid`, a unit of its own outside every zone: a push no
     /// restart recovers.
     pub(crate) fn push(&mut self, tid: u64, record: &[u8], rows: Routed<'_>) -> Result<(), SalFull> {
@@ -284,7 +279,7 @@ pub(crate) fn group_at(log: &SalLog, base: u64) -> SalMessage<'_> {
 
 /// A read of `tid` under the blob `spec`.
 pub(crate) fn scan(tid: u64, spec: &[u8]) -> Read<'_> {
-    Read::ScanSpec { tid, reply_layout: 0, spec: spec.into() }
+    Read::ScanSpec { tid, reply_layout: 0, spec }
 }
 
 /// Run the test `internal` of the module `module` in a re-exec'd child and

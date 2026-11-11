@@ -18,9 +18,11 @@ fn train_route_bench() {
         let batch =
             crate::test_support::make_batch(&schema, &(0..rows as u64).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
         let (mut writers, receiver) = test_rings(1, 16 << 20);
-        let (r, _ready) = Reactor::new(Limits::TEST, receiver).expect("reactor");
-        let lease = r.lease_train(WorkerSet::ALL, "ScanSpec");
+        let r = Reactor::new(Limits::TEST, receiver).expect("reactor");
+        let mut lease = r.lease_train();
+        lease.add(WorkerSet::ALL, "ScanSpec");
         let id = lease.id();
+        let train = train_of(&mut lease);
         let counter = Counter::instructions();
         let (mut instructions, mut bytes) = (0, 0);
         for _ in 0..laps {
@@ -31,7 +33,7 @@ fn train_route_bench() {
                 .measure(|| {
                     r.drain_all_w2m();
                     for _ in 0..LAP {
-                        let f = try_poll_once(lease.next())
+                        let f = try_poll_once(train.next())
                             .expect("routed")
                             .expect("no fault")
                             .expect("a row frame");

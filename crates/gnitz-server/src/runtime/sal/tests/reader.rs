@@ -2,7 +2,8 @@ use super::{Inbound, SalMessageKind, SalReader};
 use crate::runtime::frame::WireMsg;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::{assert_fail_stops, control_push as to, group_at, scan, test_log, unanswered};
-use crate::runtime::sal::format::{payload_encode, payload_rows, payload_size};
+use crate::runtime::sal::format::{epoch_word, payload_encode, payload_rows, payload_size};
+use crate::runtime::sal::group::Group;
 use crate::runtime::sal::{Apply, SalExcl};
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
 use crate::runtime::w2m::fixtures::{id, test_rings};
@@ -13,7 +14,8 @@ use gnitz_zset::schema::encode_schema_block;
 /// A reader steps past a `Flush` into the next epoch on its own: what follows
 /// in the old epoch is never read, and the next epoch's first group is. A
 /// `FlushEph` ends no epoch: the reader stays where the writer does, and reads
-/// what is written behind it.
+/// what is written behind it. Its position reaches the one an apply answers
+/// exactly when it has read that apply.
 #[test]
 fn a_reader_leaves_its_epoch_on_stepping_past_a_flush_alone() {
     let log = test_log(1 << 20, 2, 1);
@@ -25,22 +27,26 @@ fn a_reader_leaves_its_epoch_on_stepping_past_a_flush_alone() {
     };
     let mut excl = log.excl();
     excl.write(&to(1)).expect("group fits");
-    excl.apply(Apply::Flush, id(1)).expect("group fits");
+    let flushed = excl.apply(Apply::Flush).expect("group fits");
     excl.write(&to(2)).expect("group fits");
 
     assert_eq!(read(&mut reader), Some((SalMessageKind::Push, 1)));
+    assert!(reader.position() < flushed, "short of an apply still to be read");
     assert_eq!(read(&mut reader), Some((SalMessageKind::Flush, 0)));
+    assert_eq!(reader.position(), epoch_word(2, 0), "the start of the next epoch");
+    assert!(reader.position() > flushed, "which is past the Flush");
     assert_eq!(read(&mut reader), None, "nothing behind a Flush is read");
     assert!(reader.is_empty(), "the old epoch's groups are leftovers");
 
     excl.checkpoint_reset();
     excl.write(&to(3)).expect("group fits");
-    excl.apply(Apply::FlushEph { generation: 0 }, id(1))
-        .expect("group fits");
+    let stamped = excl.apply(Apply::FlushEph { generation: 0 }).expect("group fits");
     excl.write(&to(4)).expect("group fits");
 
     assert_eq!(read(&mut reader), Some((SalMessageKind::Push, 3)), "the next epoch");
+    assert!(reader.position() < stamped);
     assert_eq!(read(&mut reader), Some((SalMessageKind::FlushEph, 0)));
+    assert_eq!(reader.position(), stamped, "the end of the apply last read");
     assert_eq!(
         read(&mut reader),
         Some((SalMessageKind::Push, 4)),
@@ -95,18 +101,16 @@ fn sal_cross_process_checkpoint() {
 
     // Each write is the wake.
     let mut excl = log.excl();
-    excl.apply(Apply::FlushEph { generation: 1 }, id(1))
-        .expect("group fits");
+    excl.apply(Apply::FlushEph { generation: 1 }).expect("group fits");
     assert_eq!(report(), (Some(SalMessageKind::FlushEph), 1));
     assert_eq!(log.epoch(), 1);
 
     // The rewind follows the worker's answer to the `Flush`, as it follows
     // every worker's ACK in a base round.
-    excl.apply(Apply::Flush, id(1)).expect("group fits");
+    excl.apply(Apply::Flush).expect("group fits");
     assert_eq!(report(), (Some(SalMessageKind::Flush), 0));
     assert_eq!(excl.checkpoint_reset(), 2);
-    excl.apply(Apply::FlushEph { generation: 2 }, id(1))
-        .expect("group fits");
+    excl.apply(Apply::FlushEph { generation: 2 }).expect("group fits");
     assert_eq!(
         log.cursor(),
         group_at(log.log(), 0).end,
@@ -130,48 +134,41 @@ fn a_group_is_read_by_the_workers_it_addresses_on_one_id() {
 
     for w in 0..4u32 {
         let mut reader = log.reader(w);
-        let mut read = std::iter::from_fn(|| {
-            reader
-                .next()
-                .map(|(m, ..)| (RequestId::to_wire(m.head.reply), m.head.joins_cut()))
-        });
+        let mut read = std::iter::from_fn(|| reader.next().map(|(m, _)| RequestId::to_wire(m.head.reply)));
         if w == 1 || w == 3 {
-            assert_eq!(
-                read.next(),
-                Some((40, false)),
-                "worker {w} reads the group written to it"
-            );
+            assert_eq!(read.next(), Some(40), "worker {w} reads the group written to it");
         }
-        assert_eq!(read.next(), Some((0, false)), "worker {w} reads the unaddressed group");
+        assert_eq!(read.next(), Some(0), "worker {w} reads the unaddressed group");
         assert_eq!(read.next(), None, "worker {w}");
     }
 }
 
-/// Every member of a cut reads one count, two cuts read two, and a worker a
-/// cut's first member does not address reads the same count as one it does.
+/// The reads written on one id under one hold reach each worker they address
+/// in the order written, with no other read between them, whichever of them
+/// address it.
 #[test]
-fn every_worker_numbers_a_cut_alike() {
+fn a_worker_reads_one_ids_reads_in_a_row_in_the_order_written() {
     let log = test_log(1 << 20, 2, 1);
-    let member = |excl: &mut SalExcl, set, n| excl.read(scan(0, &[]), set, None, id(n)).expect("group fits");
-    // One cut whose first member addresses worker 0 alone, then a cut of one.
+    let read = |excl: &mut SalExcl, set, tid, n| excl.read(scan(tid, &[]), set, None, id(n)).expect("group fits");
+    // Three reads on one id, the first to worker 0 alone, then one on another.
     let mut excl = log.excl();
-    member(&mut excl, WorkerSet::one(0), 1);
-    member(&mut excl, WorkerSet::ALL, 2);
-    member(&mut excl, WorkerSet::ALL, 3);
+    read(&mut excl, WorkerSet::one(0), 10, 1);
+    read(&mut excl, WorkerSet::ALL, 11, 1);
+    read(&mut excl, WorkerSet::ALL, 12, 1);
     drop(excl);
-    member(&mut log.excl(), WorkerSet::ALL, 4);
+    read(&mut log.excl(), WorkerSet::ALL, 13, 2);
 
-    let cuts = |w| {
+    let reads = |w| {
         let mut reader = log.reader(w);
         std::iter::from_fn(|| {
             reader
                 .next()
-                .map(|(m, _, cut)| (RequestId::to_wire(m.head.reply), cut.0))
+                .map(|(m, _)| (RequestId::to_wire(m.head.reply), m.head.request.target_id))
         })
         .collect::<Vec<_>>()
     };
-    assert_eq!(cuts(0), [(1, 1), (2, 1), (3, 1), (4, 2)]);
-    assert_eq!(cuts(1), [(2, 1), (3, 1), (4, 2)]);
+    assert_eq!(reads(0), [(1, 10), (1, 11), (1, 12), (2, 13)]);
+    assert_eq!(reads(1), [(1, 11), (1, 12), (2, 13)]);
 }
 
 #[test]
@@ -258,6 +255,40 @@ fn a_read_group_without_a_request_id_aborts_internal() {
     );
     let _ = reader.next_request(|_, _| None);
     unreachable!("a read nobody answers must fail-stop");
+}
+
+/// An apply is answered on no request id, so one that names an id is refused at
+/// decode.
+#[test]
+fn an_apply_group_naming_a_request_id_aborts() {
+    assert_fail_stops(
+        module_path!(),
+        "an_apply_group_naming_a_request_id_aborts_internal",
+        "a Tick group names a request id",
+    );
+}
+
+/// Runs only in the re-exec'd abort child.
+#[test]
+fn an_apply_group_naming_a_request_id_aborts_internal() {
+    if !crate::test_support::in_child_test() {
+        return;
+    }
+    let tick = Apply::Tick { first_round: 2, tids: vec![1].into() };
+    let log = test_log(1 << 20, 1, 1);
+    log.excl().write(&Group::apply(&tick)).expect("group fits");
+    let named = Group {
+        reply: Some(id(1)),
+        ..Group::apply(&tick)
+    };
+    log.excl().write(&named).expect("group fits");
+    let mut reader = log.reader(0);
+    assert!(
+        matches!(reader.next_request(|_, _| None), Some(Inbound::Apply { .. })),
+        "an apply naming no id decodes"
+    );
+    let _ = reader.next_request(|_, _| None);
+    unreachable!("an apply naming a request id must fail-stop");
 }
 
 /// A payload the master would never write is refused at decode: the worker

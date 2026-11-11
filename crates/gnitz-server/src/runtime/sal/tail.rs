@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use super::format::{epoch_word, next_epoch, SalMessageKind};
 use super::log::{SalLog, SalMessage};
 use super::reader::SalReader;
+use super::request::{Ingest, SalRequest};
 
 /// The committed part of the un-checkpointed tail.
 pub(crate) struct CommittedTail {
@@ -52,19 +53,20 @@ impl CommittedTail {
         !self.pushed.is_empty()
     }
 
-    /// The tail's Push groups, in log order. A stream's push is written outside
-    /// every zone, and every tail group is a zone member, so each targets a base
-    /// table.
-    pub(crate) fn pushes(&self) -> impl Iterator<Item = SalMessage<'_>> {
-        self.groups().filter(|m| m.head.request.kind == SalMessageKind::Push)
+    /// Every group a boot replays, in log order, as the ingest it carries: a zone
+    /// holds nothing else, and an ingest has no blob. A stream's push is written
+    /// outside every zone, so each push here targets a base table.
+    pub(crate) fn ingests(&self) -> impl Iterator<Item = Result<(Ingest, SalMessage<'_>), String>> {
+        self.groups().map(|m| match SalRequest::decode(&m.head.request, &[]) {
+            Ok(SalRequest::Ingest(ingest)) => Ok((ingest, m)),
+            other => Err(format!(
+                "SAL replay: the zone member at offset={} carries no ingest: {other:?}",
+                m.base
+            )),
+        })
     }
 
-    /// The tail's DdlSync groups, in log order.
-    pub(crate) fn ddl_syncs(&self) -> impl Iterator<Item = SalMessage<'_>> {
-        self.groups().filter(|m| m.head.request.kind == SalMessageKind::DdlSync)
-    }
-
-    /// The relations [`Self::pushes`] target, each once, ascending.
+    /// The base tables the tail's pushes target, each once, ascending.
     pub(crate) fn pushed(&self) -> &BTreeSet<u64> {
         &self.pushed
     }

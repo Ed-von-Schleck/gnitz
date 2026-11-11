@@ -152,7 +152,7 @@ def test_no_checkpoint_runs_inside_a_ddl(own_server):
     """A checkpoint asked for while a DDL holds its locks runs only after the DDL.
 
     `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT` holds the first DDL, its zone written
-    and its locks held, until a task parks on the tick gate it holds. At a
+    and its locks held, until a task parks on the apply lock it holds. At a
     one-byte threshold the zone alone crosses it, and nothing here asks for a
     tick, so that task is the committer, in the checkpoint the watchdog's
     reclaim wake called for. No checkpoint may finish between the hold's park

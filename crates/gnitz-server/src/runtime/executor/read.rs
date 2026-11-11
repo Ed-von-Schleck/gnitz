@@ -50,12 +50,10 @@ pub(super) async fn handle_resolve(shared: &Shared, peer: &mut Peer, name_blob: 
 struct Scanned {
     kind: RelationKind,
     /// A system catalog family's rows, read off the master's own copy; `None`
-    /// for a scan that takes the next lease of the cut.
+    /// for a scan its workers answer.
     local: Option<ReadRows>,
     /// The read's watermark; a fanned scan's is sampled inside the cut.
     lsn: u64,
-    /// A fanned scan's lease, written in the cut.
-    lease: Option<TrainLease>,
 }
 
 /// SCAN_MULTI: one reply per scan, in request order. The scans
@@ -87,22 +85,24 @@ pub(super) async fn handle_scan(shared: &Shared, peer: &mut Peer, scans: &[ScanI
             }
             _ => (None, 0),
         };
-        scanned.push(Scanned { kind, local, lsn, lease: None });
+        scanned.push(Scanned { kind, local, lsn });
     }
+    // The lease the fanned scans are answered on.
+    let mut lease: Option<TrainLease> = None;
     if scanned.iter().any(|s| s.local.is_none()) {
         let fanned = scans.iter().zip(&mut scanned).filter(|(_, s)| s.local.is_none());
         let cut = shared.dispatcher.scan_cut(|cut| {
             for (scan, s) in fanned {
                 s.lsn = read_watermark(shared, s.kind, cut.sal());
-                s.lease = Some(cut.read(Read::ScanSpec {
+                cut.read(Read::ScanSpec {
                     tid: scan.target.tid,
                     reply_layout: scan.reply_layout,
-                    spec: scan.spec.into(),
-                })?);
+                    spec: scan.spec,
+                })?;
             }
             Ok(())
         });
-        cut.await?;
+        lease = Some(cut.await?);
     }
     // The replies read no catalog state, and a slow client's egress must not
     // hold the catalog read lock.
@@ -112,9 +112,13 @@ pub(super) async fn handle_scan(shared: &Shared, peer: &mut Peer, scans: &[ScanI
         let target_id = scan.target.tid;
         match &s.local {
             Some(rows) => cork_train(peer, target_id, rows)?,
-            // This relation's train, all workers, before the next: within a
-            // cut each worker's ring order is request order.
-            None => forward_scan(peer, s.lease.as_ref().expect("a fanned scan has a lease")).await?,
+            // This relation's train, all workers, before the next: each
+            // worker sends a lease's trains in request order.
+            None => {
+                let lease = lease.as_mut().expect("a fanned scan's cut has a lease");
+                let train = lease.next_train().await;
+                forward_scan(peer, train).await?
+            }
         }
         cork_ack(peer, target_id, s.lsn);
         // Carry no more than the budget into the next reply, and learn here

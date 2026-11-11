@@ -33,18 +33,19 @@ pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u6
     shared.last_snapshot.set(id);
     // No DDL moves the catalog between the master's pin and the workers'.
     let catalog = shared.catalog_rwlock.read().await;
-    let lease = shared
+    let cut = shared
         .dispatcher
         .scan_cut(|cut| {
             // The master pins only once the workers' Pin group is written, so
             // a refused cut pinned nothing.
-            let lease = cut.read(Read::Pin { snapshot: id })?;
+            cut.read(Read::Pin { snapshot: id })?;
             (shared.cat_mut().registry.pin(id)).expect("a snapshot id is fresh this boot");
-            Ok(lease)
+            Ok(())
         })
         .await;
     drop(catalog);
-    if let Err(e) = lease?.finish().await {
+    let mut lease = cut?;
+    if let Err(e) = lease.next_train().await.finish().await {
         release(shared, id).await;
         return Err(e);
     }
@@ -74,10 +75,11 @@ pub(super) async fn page(
         let rows = shared.cat().registry.pinned_page(id, tid, &request)?;
         cork_train(peer, tid, &rows)?;
     } else {
-        let read = Read::SnapshotPage { snapshot: id, tid, page: blob.into() };
-        let lease = shared.dispatcher.scan(read).await?;
-        'forward: for w in lease.workers().iter() {
-            while let Some((slot, _)) = lease.frame_of(w).await? {
+        let read = Read::SnapshotPage { snapshot: id, tid, page: blob };
+        let mut lease = shared.dispatcher.scan(read).await?;
+        let train = lease.next_train().await;
+        'forward: for w in train.workers().iter() {
+            while let Some((slot, _)) = train.frame_of(w).await? {
                 if peer.send(SendBody::Slot(slot)).await.is_err() {
                     break 'forward;
                 }

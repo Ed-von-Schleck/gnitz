@@ -59,12 +59,14 @@ impl UniqueFilter {
 }
 
 /// The spans a write's surviving rows hold in the unique index on `cols` of
-/// `tid` that its filter proved absent: what the write adds to the filter if
-/// it is admitted.
+/// `tid`, taken where its filter proved one of them absent: what the filter
+/// holds once the write is admitted.
 pub(super) struct SpanClaim {
     pub(super) tid: u64,
     pub(super) cols: PkColList,
-    pub(super) absent: PkKeys,
+    pub(super) key_size: usize,
+    /// The spans back to back, `key_size` bytes each, in row order.
+    pub(super) spans: Vec<u8>,
 }
 
 impl Checks {
@@ -82,34 +84,21 @@ impl Checks {
         let mut filters = self.unique_filters.borrow_mut();
         for c in claims {
             let filter = filters.get_mut(&(c.tid, c.cols)).expect("a claim's filter stays");
-            filter.insert_all(c.absent.iter());
+            filter.insert_all(c.spans.chunks_exact(c.key_size));
         }
     }
 
     /// Keep in `keys` the spans the filter for `(table_id, cols)` cannot prove
-    /// absent, all of them where it has none, and answer the ones it dropped
-    /// as the write's claim on the filter; `None` where it dropped none.
-    pub(super) fn unique_filter_retain_possible(
-        &self,
-        table_id: u64,
-        cols: PkColList,
-        keys: &mut PkKeys,
-    ) -> Option<SpanClaim> {
+    /// absent, all of them where it has none; true where it dropped one, so the
+    /// write holds a span its filter does not.
+    pub(super) fn unique_filter_retain_possible(&self, table_id: u64, cols: PkColList, keys: &mut PkKeys) -> bool {
         let filters = self.unique_filters.borrow();
-        let f = filters.get(&(table_id, cols))?;
-        let mut absent = Vec::new();
-        keys.retain(|k| {
-            let possible = f.may_contain(k);
-            if !possible {
-                absent.extend_from_slice(k);
-            }
-            possible
-        });
-        (!absent.is_empty()).then(|| SpanClaim {
-            tid: table_id,
-            cols,
-            absent: PkKeys::from_sorted(keys.stride(), absent),
-        })
+        let Some(f) = filters.get(&(table_id, cols)) else {
+            return false;
+        };
+        let before = keys.len();
+        keys.retain(|k| f.may_contain(k));
+        keys.len() != before
     }
 
     /// Drop the filter for one index, leaving the table's other filters.
@@ -139,10 +128,11 @@ impl Checks {
             if self.unique_filters.borrow().contains_key(&(table_id, cols)) {
                 continue;
             }
-            let lease = disp.scan(Read::KeySpans { tid: table_id, cols, claim: false }).await?;
+            let mut lease = disp.scan(Read::KeySpans { tid: table_id, cols, claim: false }).await?;
+            let train = lease.next_train().await;
             let (span_schema, mut filter) = (spec.span_schema(), UniqueFilter::new());
             // A capped filter reads no further; the lease drop discards the rest.
-            while let Some(frame) = lease.next().await? {
+            while let Some(frame) = train.next().await? {
                 let spans = frame.rows(&span_schema).pk().chunks_exact(span_schema.pk_stride());
                 if !filter.insert_all(spans) {
                     break;

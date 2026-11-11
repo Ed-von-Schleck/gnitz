@@ -11,19 +11,20 @@
 use super::validate::{self, UniqueFilter};
 use super::{decode_fault, park_until, CatalogLock, Shared};
 use crate::catalog::{AppliedDdl, DdlBundle, SysFamily};
+use crate::runtime::master::ApplyLock;
 use crate::runtime::sal::Read;
 use crate::runtime::sync::WriteGuard;
 use gnitz_foundation::fault::Seam;
 use gnitz_wire::{ClientVerb, DecodedControl, PkColList, Target, WireFault};
 use gnitz_zset::repr::Batch;
 
-/// What a DDL body runs under: the catalog write, and the tick gate's write, so
-/// no tick is in flight, every broadcast DdlSync lands between epochs, and no
-/// checkpoint, which holds the gate from its base round through its ephemeral
+/// What a DDL body runs under: the catalog write, and the apply lock, so no
+/// tick is in flight, every broadcast DdlSync lands between epochs, and no
+/// checkpoint, which holds the lock from its base round through its ephemeral
 /// round, runs inside the DDL.
 struct DdlLocks {
     catalog: WriteGuard<CatalogLock>,
-    ticks: WriteGuard,
+    applies: WriteGuard<ApplyLock>,
 }
 
 /// Take [`DdlLocks`].
@@ -34,14 +35,14 @@ async fn enter_ddl(shared: &Shared) -> DdlLocks {
     let catalog = shared.catalog_rwlock.write().await;
     // Every writer holds a catalog read until its fdatasync, so none is queued:
     // a checkpoint due now runs, and the DDL's groups start on a log below the
-    // threshold. Ahead of the gate, which that checkpoint takes.
+    // threshold. Ahead of the apply lock, which that checkpoint takes.
     shared.committer.settle().await;
-    let ticks = shared.ticks.gate.write().await;
-    DdlLocks { catalog, ticks }
+    let applies = shared.dispatcher.apply_lock().await;
+    DdlLocks { catalog, applies }
 }
 
 /// `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT`: hold the first DDL, its zone written
-/// and its locks still held, until a task parks on the tick gate it holds.
+/// and its locks still held, until a task parks on the apply lock it holds.
 /// Below a checkpoint threshold of one zone, and with no tick request
 /// outstanding, that task is the committer, inside the checkpoint the
 /// watchdog's reclaim wake called for. One-shot.
@@ -88,7 +89,7 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, body: &[u8]) -> Result<u64, 
     let unique_creates = families.unique_index_creates();
 
     let locks = enter_ddl(shared).await;
-    let committed = commit_bundle(shared, families, &unique_creates).await;
+    let committed = commit_bundle(shared, &locks.applies, families, &unique_creates).await;
     if !unique_creates.is_empty() {
         release_preflight(shared).await;
     }
@@ -111,7 +112,7 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, body: &[u8]) -> Result<u64, 
     // is durable), so abort — restart's boot rebuild refills it.
     if let Err(e) = shared
         .dispatcher
-        .backfill_views_in_dep_order(&applied.created_views)
+        .backfill_views_in_dep_order(&locks.applies, &applied.created_views)
         .await
     {
         gnitz_fatal_abort!("live CREATE VIEW backfill failed after the CREATE was made durable: {e}");
@@ -119,15 +120,15 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, body: &[u8]) -> Result<u64, 
 
     // After the backfill: a new view has read the sealed families, and these
     // rows reach the views that already scanned them.
-    if let Err(e) = shared.dispatcher.drain_tick(&applied.held_above).await {
+    if let Err(e) = shared.dispatcher.drain_tick(&locks.applies, &applied.held_above).await {
         gnitz_fatal_abort!("catalog tick failed after the DDL was made durable: {e}");
     }
     // Any DDL may change what a parked sync reads: a view dropped, a source's
     // token reset, catalog rows a view scans.
-    shared.feeds.wake_all();
+    shared.ticks.wake_watches();
 
     if DDL_HOLD_FOR_CHECKPOINT.take_once() {
-        park_until(shared, DDL_HOLD_MAX_POLLS, "ddl hold", || locks.ticks.contended()).await;
+        park_until(shared, DDL_HOLD_MAX_POLLS, "ddl hold", || locks.applies.contended()).await;
     }
     drop(locks);
     Ok(zone_lsn)
@@ -145,6 +146,7 @@ struct Committed {
 /// durable. Every `Err` leaves the catalog as it was.
 async fn commit_bundle(
     shared: &Shared,
+    alone: &WriteGuard<ApplyLock>,
     families: DdlBundle,
     unique_creates: &[(u64, PkColList)],
 ) -> Result<Committed, WireFault> {
@@ -162,8 +164,8 @@ async fn commit_bundle(
     // Before the views exist: a tick owed now carries rows pushed ahead of them,
     // and a stream's must not reach them.
     if families.get(SysFamily::Circuit).is_some() {
-        if let Some(lease) = shared.emit_pending_tick().await? {
-            lease.acks().await;
+        if let Some(wait) = shared.emit_pending_tick(alone).await? {
+            wait.acks().await;
         }
     }
     let (applied, zone_lsn) = {
@@ -177,7 +179,7 @@ async fn commit_bundle(
 }
 
 /// Release the pre-flight's index claims, committed or not, while the DDL still
-/// holds the tick gate. The release follows the zone in the log, so a
+/// holds the apply lock. The release follows the zone in the log, so a
 /// worker enters the catalog's claim on an index the DDL created before it drops
 /// the pre-flight's. A claim left standing would keep an index no catalog row
 /// owns, whose directory the next checkpoint's sweep removes from under it.

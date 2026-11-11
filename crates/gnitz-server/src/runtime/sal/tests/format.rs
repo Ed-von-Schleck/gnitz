@@ -1,7 +1,7 @@
 use super::{
     dir_sizes, directory, group_header_size, payload_encode, payload_parse, payload_rows, payload_size, GroupHead,
-    Header, PayloadRows, SalMessageKind, FLAG_JOINS_CUT, FLAG_SHARED, FLAG_ZONE, FLAG_ZONE_END, KNOWN_FLAGS,
-    MAX_WORKERS, OFF_ARG0, OFF_BASE, OFF_FLAGS, OFF_KIND, OFF_TARGETS, OFF_WIDTH, PAYLOAD_HEAD,
+    Header, PayloadRows, SalMessageKind, FLAG_SHARED, FLAG_ZONE, FLAG_ZONE_END, KNOWN_FLAGS, MAX_WORKERS, OFF_ARG0,
+    OFF_BASE, OFF_FLAGS, OFF_KIND, OFF_TARGETS, OFF_WIDTH, PAYLOAD_HEAD,
 };
 use crate::runtime::park::WorkerSet;
 use crate::runtime::sal::fixtures::{assert_fail_stops, group_at, test_log};
@@ -59,13 +59,13 @@ fn every_header_field_round_trips() {
         arg1: 0x5555_6666_7777_8888,
     };
     let base = 0xFFFF_FFF8u32;
-    let shapes: [(bool, bool, bool, _, &[usize]); 2] = [
-        (true, true, false, Some(id(0x0A0B_0C0D)), &[8, 0, 24]),
-        (false, false, true, None, &[40]),
+    let shapes: [(bool, bool, _, &[usize]); 2] = [
+        (true, false, Some(id(0x0A0B_0C0D)), &[8, 0, 24]),
+        (false, true, None, &[40]),
     ];
-    for (zoned, joins_cut, shared, reply, sizes) in shapes {
+    for (zoned, shared, reply, sizes) in shapes {
         let header = Header {
-            head: GroupHead::new(request, zoned, joins_cut, shared, reply, targets),
+            head: GroupHead::new(request, zoned, shared, reply, targets),
             base,
             epoch: u32::MAX,
             width: 5,
@@ -80,13 +80,8 @@ fn every_header_field_round_trips() {
         let got = Header::verify(&hdr, u64::from(base)).expect("the header verifies where it was sealed");
         assert_eq!(got.head.request, request);
         assert_eq!(
-            (
-                got.head.zoned(),
-                got.head.zone_end(),
-                got.head.joins_cut(),
-                got.head.shared()
-            ),
-            (zoned, zoned, joins_cut, shared)
+            (got.head.zoned(), got.head.zone_end(), got.head.shared()),
+            (zoned, zoned, shared)
         );
         assert_eq!((got.head.reply, got.head.targets), (reply, targets));
         assert_eq!(
@@ -115,14 +110,7 @@ fn a_header_is_these_bytes() {
         arg1: 0x1112_1314_1516_1718,
     };
     let header = Header {
-        head: GroupHead::new(
-            request,
-            true,
-            false,
-            false,
-            Some(id(0x0A0B_0C0D)),
-            WorkerSet::one(1).with(3),
-        ),
+        head: GroupHead::new(request, true, false, Some(id(0x0A0B_0C0D)), WorkerSet::one(1).with(3)),
         base: 0x00C0_FFE8,
         epoch: 7,
         width: 4,
@@ -163,7 +151,7 @@ fn an_unknown_ordinal_in_a_verified_header_does_not_verify() {
         arg1: 0,
     };
     let header = Header {
-        head: GroupHead::new(request, true, false, false, None, WorkerSet::one(0)),
+        head: GroupHead::new(request, true, false, None, WorkerSet::one(0)),
         base: 0,
         epoch: 1,
         width: 1,
@@ -186,14 +174,14 @@ fn an_unknown_ordinal_in_a_verified_header_does_not_verify() {
 
     reseal(&mut hdr, |hdr| {
         hdr[OFF_KIND] = SalMessageKind::ScanSpec.as_wire();
-        hdr[OFF_FLAGS] = FLAG_ZONE | FLAG_ZONE_END | FLAG_JOINS_CUT;
+        hdr[OFF_FLAGS] = FLAG_ZONE | FLAG_ZONE_END | FLAG_SHARED;
     });
     assert!(
         verify(&hdr).expect("the known flags verify").head.zone_end(),
         "the known flags verify"
     );
 
-    reseal(&mut hdr, |hdr| hdr[OFF_FLAGS] = FLAG_ZONE_END | FLAG_JOINS_CUT);
+    reseal(&mut hdr, |hdr| hdr[OFF_FLAGS] = FLAG_ZONE_END | FLAG_SHARED);
     assert!(verify(&hdr).is_none(), "a zone end outside every zone must not verify");
 
     reseal(&mut hdr, |hdr| hdr[OFF_FLAGS] = KNOWN_FLAGS + 1);
@@ -261,7 +249,7 @@ fn the_live_path_aborts_on_a_damaged_request_argument_internal() {
     }
     let mut log = test_log(1 << 20, 1, 1);
     let tick = || Apply::Tick { first_round: 5, tids: vec![9].into() };
-    log.excl().apply(tick(), id(1)).expect("group fits");
+    log.excl().apply(tick()).expect("group fits");
     // A sanity read before the damage, so the abort below is the damage.
     let mut reader = log.reader(0);
     assert!(

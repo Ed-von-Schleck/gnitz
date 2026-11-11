@@ -13,9 +13,8 @@ const GROUPS: u64 = 10_000;
 const LAYOUTS: [(&str, usize, bool); 3] = [("shared", 2, false), ("per worker", 4, true), ("per worker", 16, true)];
 
 /// A log of [`GROUPS`] control-only reads addressed to `set`, and the
-/// instructions writing them took. One hold writes them all, each as a cut of
-/// its own — a hold per read is what a lone read takes, and its lock and wake
-/// are not the writer's cost.
+/// instructions writing them took. One hold writes them all: a hold per read
+/// is what a lone read takes, and its lock and wake are not the writer's cost.
 fn written_log(counter: &Counter, nw: usize, per_worker: bool, set: WorkerSet) -> (SalWriter, u64) {
     let blobs = vec![Vec::new(); nw];
     let log = test_log(32 << 20, nw, 1);
@@ -24,7 +23,6 @@ fn written_log(counter: &Counter, nw: usize, per_worker: bool, set: WorkerSet) -
     let mut excl = log.excl();
     let ((), written) = counter.measure(|| {
         for _ in 0..GROUPS {
-            excl.end_cut();
             excl.write(&group).expect("group fits");
         }
     });
@@ -53,7 +51,7 @@ fn sal_group_bench() {
             let mut reader = log.reader(me as u32);
             let (read, walked) = counter.measure(|| {
                 let mut read = 0;
-                while let Some((msg, slot, _)) = reader.next() {
+                while let Some((msg, slot)) = reader.next() {
                     black_box((msg.head.reply, slot.len()));
                     read += 1;
                 }
@@ -105,7 +103,7 @@ fn sal_park_cycle_bench() {
                     if peek && black_box(reader.is_empty()) {
                         break;
                     }
-                    let Some((msg, slot, _)) = reader.next() else { break };
+                    let Some((msg, slot)) = reader.next() else { break };
                     black_box((msg.head.reply, slot.len()));
                     read += 1;
                 }

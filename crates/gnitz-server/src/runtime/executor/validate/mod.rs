@@ -23,7 +23,7 @@ use rustc_hash::FxHashMap;
 
 use crate::catalog::CatalogEngine;
 use crate::runtime::master::MasterDispatcher;
-use crate::runtime::reactor::TrainLease;
+use crate::runtime::reactor::Train;
 use crate::runtime::sal::Read;
 use gnitz_store::read::Probe;
 use gnitz_wire::{PkColList, WireFault};

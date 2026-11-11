@@ -8,8 +8,6 @@ use super::super::test_support::*;
 use super::super::uring::SQ_ENTRIES;
 use super::*;
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child};
-use crate::runtime::w2m::fixtures::id;
-use crate::runtime::w2m::RequestId;
 
 /// A panic during poll must propagate rather than be swallowed: it unwinds
 /// through the pass and, in real use, up to `block_on`'s caller.
@@ -228,21 +226,20 @@ fn a_pass_past_the_sq_and_the_drain_batch_loses_no_completion() {
     assert!(ops.into_iter().all(|op| try_poll_once(op) == Some((0, ()))));
 }
 
-/// The drain the arm runs first can route a frame that wakes a task; that tick
+/// The drain the arm runs first can read a position that wakes a task; that tick
 /// must then run on instead of arming and sleeping, where nothing would wake it.
 #[test]
 fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
     within(|| {
         let (r, mut writers) = reactor_with_rings(1);
         let mut writer = writers.pop().expect("one ring");
-        let lease = r.lease_acks();
-        let id = lease.id();
+        let wait = r.applied_through(1);
         let done = Rc::new(Cell::new(false));
         let d = Rc::clone(&done);
         r.spawn(async move {
             // Published during the poll, after this tick's own drain.
-            writer.ack(id);
-            lease.acks().await;
+            writer.applied(1);
+            wait.acks().await;
             d.set(true);
         });
         r.run_ready();
@@ -275,9 +272,11 @@ fn a_publish_wakes_the_sleep_and_takes_the_arm() {
         let publisher = std::thread::spawn({
             let woke = woke.clone();
             move || {
+                let mut at = 0;
                 while !woke.load(std::sync::atomic::Ordering::SeqCst) {
                     if writer.master_parked() {
-                        writer.ack(RequestId::BOOT_READY); // no lease holds it
+                        at += 1;
+                        writer.applied(at); // nothing waits on it
                     }
                     std::thread::yield_now();
                 }
@@ -293,33 +292,31 @@ fn a_publish_wakes_the_sleep_and_takes_the_arm() {
 }
 
 /// A forked child publishes to a reactor parked on the one master park word over
-/// two rings: a lost wake runs into the timeout, a torn frame loses an id. The child
-/// waits until the reactor parks with nothing published, so only its answer on
-/// ring 1 can wake it; then it floods ring 0 as fast as it can, so the
-/// drain-arm race is under pressure: ids no lease routes, which are
-/// released unrouted, and the ready ACK last, so the lease resolves only once
-/// every one is drained.
+/// two rings: a lost wake runs into the timeout. The child waits until the
+/// reactor parks with nothing published, so only its position on ring 1 can
+/// wake it; then it raises ring 0's position as fast as it can, so the drain-arm
+/// race is under pressure, and the wait resolves only on the last of them.
 #[test]
 fn w2m_publishes_from_another_process_wake_the_parked_reactor() {
-    const N_MESSAGES: u32 = 500;
+    const N_POSITIONS: u64 = 500;
     const TIMEOUT: Duration = Duration::from_secs(30);
 
-    let (r, ready, mut writers) = booting_reactor(2);
+    let (r, mut writers) = reactor_with_rings(2);
     let child = || {
         let deadline = Instant::now() + TIMEOUT;
         while !writers[1].master_parked() {
             assert!(Instant::now() < deadline, "the reactor never parked");
             std::thread::yield_now();
         }
-        writers[1].ack(RequestId::BOOT_READY);
-        for n in 2..=N_MESSAGES {
-            writers[0].ack(id(n));
+        writers[1].applied(N_POSITIONS);
+        for n in 1..=N_POSITIONS {
+            writers[0].applied(n);
         }
-        writers[0].ack(RequestId::BOOT_READY);
     };
     let pid = unsafe { fork_child(child) };
 
-    if let Either::B(()) = r.block_on(select2(ready, r.sleep(TIMEOUT))) {
+    let reached = r.applied_through(N_POSITIONS);
+    if let Either::B(()) = r.block_on(select2(reached.acks(), r.sleep(TIMEOUT))) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!("reactor stalled after {TIMEOUT:?}: a lost wake");
     }

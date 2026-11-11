@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::reactor::test_support::train_lease;
+use crate::runtime::reactor::test_support::{train_lease, train_of};
 use crate::test_support::pk_only_schema;
 use gnitz_wire::TypeCode;
 use gnitz_zset::repr::Batch;
@@ -8,8 +8,9 @@ use gnitz_zset::repr::Batch;
 /// a row-less terminal frame.
 fn merge(partitions: &[&[u64]]) -> Option<UniqueFilter> {
     let frame_schema = pk_only_schema(&[TypeCode::U64]);
-    let (reactor, lease, mut writers) = train_lease(partitions.len(), "KeySpans");
+    let (reactor, mut lease, mut writers) = train_lease(partitions.len(), "KeySpans");
     let req = lease.id();
+    let train = train_of(&mut lease);
     for (writer, keys) in writers.iter_mut().zip(partitions) {
         let mut spans = Batch::empty_with_schema(&frame_schema);
         for pair in keys.chunks(2) {
@@ -22,7 +23,7 @@ fn merge(partitions: &[&[u64]]) -> Option<UniqueFilter> {
         writer.send_train_frame(req, true, None);
     }
     reactor
-        .block_on(merge_index_scan(&lease, &frame_schema))
+        .block_on(merge_index_scan(train, &frame_schema))
         .expect("no fault")
 }
 

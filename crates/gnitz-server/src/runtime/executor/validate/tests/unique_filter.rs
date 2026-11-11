@@ -53,24 +53,51 @@ fn a_seed_drops_absent_spans_under_its_own_index() {
     assert_eq!(kept(8, a), [1, 5], "a capped filter proves nothing");
 }
 
-/// The spans a filter proves absent are the claim, and an admitted claim
-/// enters that filter; an index without a filter claims nothing.
+/// A write claims its spans where its filter proves one of them absent, and an
+/// admitted claim enters that filter; a write whose index has no filter, whose
+/// filter holds its every span, or whose filter capped claims nothing.
 #[test]
-fn a_claim_is_the_absent_spans_and_enters_its_filter() {
+fn a_claim_is_taken_where_a_span_is_absent_and_enters_its_filter() {
     let checks = Checks::new();
     let (a, b) = (PkColList::from_slice(&[0]), PkColList::from_slice(&[1]));
     let mut seed = UniqueFilter::new();
     seed.insert(&1u64.to_be_bytes());
     checks.unique_filter_seed(7, a, seed);
-    let spans = [1u64.to_be_bytes(), 2u64.to_be_bytes()];
-    let keys = || PkKeys::from_keys(8, spans.iter().map(|s| &s[..]));
+    let mut capped = UniqueFilter { cap: 0, ..UniqueFilter::new() };
+    assert!(!capped.insert(&9u64.to_be_bytes()));
+    checks.unique_filter_seed(8, a, capped);
+    let keys_of = |vals: &[u64]| {
+        PkKeys::from_keys(
+            8,
+            vals.iter()
+                .map(|v| v.to_be_bytes())
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|s| &s[..]),
+        )
+    };
 
-    assert!(checks.unique_filter_retain_possible(7, b, &mut keys()).is_none());
-    let claim = checks
-        .unique_filter_retain_possible(7, a, &mut keys())
-        .expect("2 is absent");
-    assert_eq!(claim.absent.as_bytes(), 2u64.to_be_bytes());
-    checks.unique_filters_admit(&[claim]);
+    assert!(
+        !checks.unique_filter_retain_possible(7, b, &mut keys_of(&[1, 2])),
+        "no filter"
+    );
+    assert!(
+        !checks.unique_filter_retain_possible(7, a, &mut keys_of(&[1])),
+        "every span held"
+    );
+    assert!(
+        !checks.unique_filter_retain_possible(8, a, &mut keys_of(&[1, 2])),
+        "a capped filter"
+    );
+    let mut possible = keys_of(&[1, 2]);
+    assert!(checks.unique_filter_retain_possible(7, a, &mut possible), "2 is absent");
+    assert_eq!(possible.as_bytes(), 1u64.to_be_bytes());
+    checks.unique_filters_admit(&[SpanClaim {
+        tid: 7,
+        cols: a,
+        key_size: 8,
+        spans: [1u64.to_be_bytes(), 2u64.to_be_bytes()].concat(),
+    }]);
 
     let filters = checks.unique_filters.borrow();
     let held = |v: u64| filters[&(7, a)].may_contain(&v.to_be_bytes());
