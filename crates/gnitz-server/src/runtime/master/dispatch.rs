@@ -54,9 +54,9 @@ impl MasterDispatcher {
         gnitz_note!("SAL checkpoint epoch={epoch}");
         // Every worker ACKed the Flush, so each has applied every DdlSync written
         // before it, and the system flush made every applied DROP durable. The
-        // checkpoint's one orphan sweep: a DDL pauses the committer, so none
-        // lands before the ephemeral round, and at boot `reconcile_child_dirs`
-        // has already swept.
+        // checkpoint's one orphan sweep: the committer holds the tick gate a
+        // DDL body runs under through the ephemeral round, so no DDL lands
+        // before it, and at boot `reconcile_child_dirs` has already swept.
         self.cat().reclaim_orphan_dirs();
         Ok(())
     }

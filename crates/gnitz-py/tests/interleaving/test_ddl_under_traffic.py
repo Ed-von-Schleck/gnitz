@@ -9,7 +9,7 @@ import gnitz
 import pytest
 from _read import bag, rows, scanned
 from _schemas import KV, kv
-from _serverproc import START_TIMEOUT, across, await_log, join_or_fail, spawn
+from _serverproc import across
 from _sql import values
 
 
@@ -56,26 +56,27 @@ def test_every_insert_acked_across_a_create_unique_index_reads_back(client, peer
     client.execute_sql("INSERT INTO t VALUES (888888, 888888)")
 
 
-def test_a_push_decoded_before_an_alter_is_refused(own_server):
-    """A push matches its schema record against the catalog's and decodes its
-    batch before it takes the catalog read lock, and the lock is
-    writer-preferring, so an ALTER queued in between is applied first and the
-    push resumes holding a batch laid out for the old width. The re-check under
-    the lock must refuse it, not commit it.
-
-    `GNITZ_INJECT_PUSH_HOLD_FOR_DDL` parks the server's first matched push
-    between its decode and the lock, holding no lock, until a DDL replaces its
-    target's schema record. The ALTER is issued once that push is parked."""
-    target = own_server.start(extra_env={"GNITZ_INJECT_PUSH_HOLD_FOR_DDL": "1"}).target
-    client = gnitz.connect(target)
+def test_a_push_of_the_old_width_across_an_add_column_is_acked_or_refused(client, peer):
+    """A binary pusher laying its batch out for the pre-ALTER width runs across
+    `ALTER TABLE ADD COLUMN`. A push is judged against the catalog it commits
+    under, so each is either an ACK, whose row reads back with the new column
+    NULL, or a refusal that wrote nothing; once the ALTER has returned the old
+    width is refused for good."""
     tid = client.create_table("t", KV)
-    with gnitz.connect(target) as pusher:
-        held = spawn(pusher.push, tid, kv((1, 7)))
-        await_log(own_server.proc, own_server.log_text, "push hold: parked", START_TIMEOUT)
-        client.execute_sql("ALTER TABLE t ADD COLUMN c BIGINT")
-        with pytest.raises(gnitz.GnitzRefusedError):
-            join_or_fail("the held push never returned", held)
-    assert bag(scanned(client, "t")) == {}
+    conn = peer()
+    acked = []
+
+    def push(k):
+        try:
+            conn.push(tid, kv((k, k)))
+            acked.append(k)
+        except gnitz.GnitzRefusedError:
+            pass
+
+    n = across(lambda: client.execute_sql("ALTER TABLE t ADD COLUMN c BIGINT"), push)
+    with pytest.raises(gnitz.GnitzRefusedError, match="Schema mismatch"):
+        conn.push(tid, kv((n, n)))
+    assert bag(rows(client, "SELECT * FROM t"), "pk", "val", "c") == {(k, k, None): 1 for k in acked}
 
 
 def test_a_bundle_into_a_table_dropped_before_commit_is_not_found(client, peer):

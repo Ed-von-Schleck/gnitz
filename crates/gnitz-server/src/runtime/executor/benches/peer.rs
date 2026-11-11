@@ -17,7 +17,7 @@ fn fanout_coalesced_egress_bench() {
         for frame_len in [CAP / 32, CAP / 8, CAP / 2, CAP, 2 * CAP] {
             let total = w * frame_len;
             let r = make_reactor();
-            let (peer, receiver) = Peer::over_socketpair(&r);
+            let (mut peer, receiver) = Peer::over_socketpair(&r);
             // The reader keeps the socket buffers from ever stalling a send, so
             // the timed region is kernel-op cost, not backpressure.
             let expect = 2 * ROUNDS * total;
@@ -31,7 +31,7 @@ fn fanout_coalesced_egress_bench() {
                 // at the size it will hold: the copy into it is what is timed.
                 for i in 0..2 * ROUNDS {
                     if matches!(i % 4, 1 | 2) {
-                        *peer.egress.borrow_mut() = Some(PooledBuf::with_capacity(total));
+                        peer.egress = Some(PooledBuf::with_capacity(total));
                         let t = Instant::now();
                         for _ in 0..w {
                             peer.cork(&frame);
@@ -116,7 +116,7 @@ fn pushed_train_band_bench() {
                     let before = SENDS.with(Cell::get);
                     let ((), counted) = counter.measure(|| {
                         r.block_on(async {
-                            for peer in &peers {
+                            for peer in &mut peers {
                                 peer.cork(&head);
                                 let body = SendBody::Shared(Rc::clone(&body));
                                 if arm == 0 && body_len > CAP / 2 {

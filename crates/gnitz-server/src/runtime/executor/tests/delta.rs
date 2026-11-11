@@ -1,8 +1,10 @@
 use std::io::Read;
 
 use super::*;
+use crate::runtime::master::fixtures::test_dispatcher;
 use crate::runtime::reactor::test_support::make_reactor;
-use crate::runtime::test_support::try_poll_once;
+use crate::runtime::test_support::{empty_catalog, try_poll_once, within};
+use crate::test_support::{register_identity_view, u64_i64_cols};
 
 /// Trains queued for a connection reach the wire whole and in queue order
 /// behind the reply already corked, and are counted until the connection's
@@ -11,7 +13,7 @@ use crate::runtime::test_support::try_poll_once;
 fn queued_trains_are_shipped_whole_behind_the_reply() {
     const LARGE: usize = 1 << 20;
     let r = make_reactor();
-    let (peer, receiver) = Peer::over_socketpair(&r);
+    let (mut peer, receiver) = Peer::over_socketpair(&r);
     let subs = Subscriptions::default();
     let id = |id| SubId::new(id).unwrap();
     subs.out.send(7, id(1), Rc::new(vec![0x11; 100]));
@@ -27,7 +29,7 @@ fn queued_trains_are_shipped_whole_behind_the_reply() {
         wire
     });
     r.block_on(async {
-        subs.ship(&peer).await.expect("an open peer");
+        subs.ship(&mut peer).await.expect("an open peer");
         peer.flush_egress().await.expect("an open peer");
     });
     assert!(subs.out.is_empty());
@@ -53,12 +55,12 @@ fn queued_trains_are_shipped_whole_behind_the_reply() {
 #[test]
 fn a_second_ship_sends_only_the_trains_queued_since() {
     let r = make_reactor();
-    let (peer, receiver) = Peer::over_socketpair(&r);
+    let (mut peer, receiver) = Peer::over_socketpair(&r);
     let subs = Subscriptions::default();
     let id = |id| SubId::new(id).unwrap();
     subs.out.send(7, id(1), Rc::new(vec![0x11; 10]));
     subs.out.send(7, id(2), Rc::new(vec![0x21; 20]));
-    r.block_on(async { subs.ship(&peer).await.expect("an open peer") });
+    r.block_on(async { subs.ship(&mut peer).await.expect("an open peer") });
     assert!(subs.out.is_empty());
     subs.out.send(9, id(3), Rc::new(vec![0x31; 30]));
     let len = 3 * HEAD_FRAME_BYTES + 60;
@@ -68,7 +70,7 @@ fn a_second_ship_sends_only_the_trains_queued_since() {
         wire
     });
     r.block_on(async {
-        subs.ship(&peer).await.expect("an open peer");
+        subs.ship(&mut peer).await.expect("an open peer");
         peer.flush_egress().await.expect("an open peer");
     });
     assert!(subs.out.is_empty());
@@ -106,6 +108,44 @@ fn a_parked_sync_is_woken_by_what_it_watches_and_leaves_with_its_guard() {
         waiters.parked.borrow().is_empty(),
         "a sync that timed out is not left parked"
     );
+}
+
+/// A relation's first commit since a tick took it wakes the syncs parked on
+/// it, and no other; once a tick has taken it, its next commit wakes again.
+#[test]
+fn a_relations_first_unticked_commit_wakes_the_syncs_parked_on_it() {
+    within(|| {
+        let (_tmp, mut engine) = empty_catalog();
+        let cols = u64_i64_cols();
+        let t = engine.create_table("public.t", &cols, &[0]).unwrap();
+        let u = engine.create_table("public.u", &cols, &[0]).unwrap();
+        register_identity_view(&mut engine, t, "v", &cols);
+        register_identity_view(&mut engine, u, "w", &cols);
+        let (dispatcher, _) = test_dispatcher(0, engine);
+        let (shared, _commits, _ticks, _asks) = Shared::new(dispatcher, Duration::ZERO, None);
+        let reactor = shared.dispatcher.reactor();
+        let commit = |tid| {
+            reactor.block_on(async {
+                let laid_out = shared.dispatcher.sal().lock().await;
+                shared.note_commit_rows(&laid_out, [(tid, 1)].into_iter());
+            });
+        };
+        let waiters = &shared.feeds.waiters;
+
+        let mut on_t = waiters.park([t].into_iter().collect());
+        let mut on_u = waiters.park([u].into_iter().collect());
+        commit(t);
+        assert!(try_poll_once(&mut on_t.woken).is_some(), "`t` gained a pending tick");
+        assert!(try_poll_once(&mut on_u.woken).is_none(), "`u` did not");
+
+        reactor
+            .block_on(shared.emit_pending_tick())
+            .expect("the tick of `t` is emitted");
+        let mut on_t = waiters.park([t].into_iter().collect());
+        commit(t);
+        assert!(try_poll_once(&mut on_t.woken).is_some(), "`t` is pending again");
+        assert!(try_poll_once(&mut on_u.woken).is_none());
+    });
 }
 
 /// A view's cursor tag is of one (boot, view, spec): the same view under the

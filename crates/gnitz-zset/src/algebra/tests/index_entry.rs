@@ -8,8 +8,8 @@ use gnitz_wire::{cmp_col_window, key_image, KeyRange, PkColList, TypeCode, MAX_P
 
 /// Over PKs of every suffix width and a nullable indexed column of every
 /// indexable width: the projection holds exactly the rows `KeySpec::span` admits,
-/// each as its span followed by its own PK, in source order — and `spans` the
-/// positive-weight rows' spans.
+/// each as its span followed by its own PK, in source order — and `extend_spans`
+/// the positive-weight rows' spans.
 #[test]
 fn index_entries_are_each_admitted_rows_span_and_pk() {
     use TypeCode::{I128, I16, I64, U128, U32, U64, U8};
@@ -65,7 +65,9 @@ fn index_entries_are_each_admitted_rows_span_and_pk() {
                 .filter(|(_, w)| *w > 0)
                 .flat_map(|(e, _)| e[..key_size].to_vec())
                 .collect();
-            assert_eq!(spans(&mb, &spec), want_spans, "{pk:?} {tc} indexed on {indexed:?}");
+            let mut spans = Vec::new();
+            extend_spans(&mut spans, &mb, &spec);
+            assert_eq!(spans, want_spans, "{pk:?} {tc} indexed on {indexed:?}");
         }
     }
 }

@@ -81,11 +81,6 @@ impl CatalogEngine {
         Some(rel.schema())
     }
 
-    /// Whether a frame whose record matched `seen` still lays out `tid`'s columns.
-    pub(crate) fn recheck_record(&self, tid: u64, seen: &[u8]) -> Result<(), String> {
-        check_same_types(seen, &self.relation_entry(tid).record)
-    }
-
     /// What a RESOLVE of `tid` answers: its encoded descriptor, its named record
     /// and its descriptor token. `None` for an unregistered id.
     ///

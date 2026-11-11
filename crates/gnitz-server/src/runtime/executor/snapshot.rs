@@ -11,7 +11,7 @@
 //! SNAPSHOT_CLOSE or when the connection ends.
 
 use super::peer::Peer;
-use super::{cork_ack, cork_train, decode_fault, Shared};
+use super::{cork_train, decode_fault, Shared};
 use crate::runtime::reactor::SendBody;
 use crate::runtime::sal::Read;
 use gnitz_wire::snapshot::PageRequest;
@@ -57,10 +57,10 @@ pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u6
 /// every worker the rest, each worker's train forwarded whole in rank order,
 /// its row-less frames and its terminal included, so the client reads one
 /// `scan_last` frame per worker and reads each worker's last key by its
-/// position.
+/// position. The router's ACK follows the trains and ends the page.
 pub(super) async fn page(
     shared: &Shared,
-    peer: &Peer,
+    peer: &mut Peer,
     held: &HeldSnapshots,
     hdr: &ControlHeader,
     blob: &[u8],
@@ -84,7 +84,6 @@ pub(super) async fn page(
             }
         }
     }
-    cork_ack(peer, tid, 0);
     Ok(())
 }
 

@@ -16,7 +16,7 @@ use gnitz_wire::{ReadSpec, WireFault, WireStatus};
 /// Under a plain read guard, not `fresh_read_lock`: a resolve answers catalog
 /// shape, and a view tick moves a view's rows, never its shape, so the tick
 /// drain that one waits for buys nothing here.
-pub(super) async fn handle_resolve(shared: &Shared, peer: &Peer, name_blob: &[u8]) -> Result<(), WireFault> {
+pub(super) async fn handle_resolve(shared: &Shared, peer: &mut Peer, name_blob: &[u8]) -> Result<(), WireFault> {
     let qname = std::str::from_utf8(name_blob).map_err(|_| "RESOLVE: name is not valid UTF-8".to_string())?;
     let (schema_name, name) = qname
         .split_once('.')
@@ -64,7 +64,7 @@ struct Scanned {
 ///
 /// An `Err` ends the reply: nothing of the request follows the router's fault
 /// frame.
-pub(super) async fn handle_scan(shared: &Shared, peer: &Peer, scans: &[ScanItem<'_>]) -> Result<(), WireFault> {
+pub(super) async fn handle_scan(shared: &Shared, peer: &mut Peer, scans: &[ScanItem<'_>]) -> Result<(), WireFault> {
     // Every target's kind is resolved under this guard, so a DDL during the
     // drain is caught there and an unknown tid is rejected there.
     let catalog = fresh_read_lock(

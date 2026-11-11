@@ -60,7 +60,6 @@ fn a_bulk_write_evicts_and_records_nothing() {
 /// invalidated, and a durable batch reaches that table's cache alone.
 #[test]
 fn a_table_has_a_cache_from_its_first_found_key() {
-    let (_tmp, engine) = crate::runtime::test_support::empty_catalog();
     let checks = Checks::new();
     let held = |keys: [u64; 3]| checks.fk_presence_of(9).map(|cache| held(&cache, keys));
     assert_eq!(held([5, 6, 7]), None);
@@ -69,11 +68,10 @@ fn a_table_has_a_cache_from_its_first_found_key() {
     checks.fk_presence_found(9, 7);
     assert_eq!(held([5, 6, 7]), Some(vec![5, 7]));
 
-    checks.committed(&engine, 8, batch([(7, -1)]).as_mem_batch());
-    checks.committed(&engine, 9, batch([(5, -1)]).as_mem_batch());
+    checks.committed(8, batch([(7, -1)]).as_mem_batch());
+    checks.committed(9, batch([(5, -1)]).as_mem_batch());
     checks.forget(8);
     assert_eq!(held([5, 6, 7]), Some(vec![7]));
     checks.forget(9);
     assert_eq!(held([5, 6, 7]), None);
-    engine.close();
 }

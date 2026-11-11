@@ -41,7 +41,7 @@ fn send_corks_what_fits_and_never_reorders() {
         let (_ring, slot) = ring_slot(pad);
         let all = [vec![0x5Au8; pre], slot.frame_bytes().to_vec()].concat();
         let r = make_reactor();
-        let (peer, receiver) = Peer::over_socketpair(&r);
+        let (mut peer, receiver) = Peer::over_socketpair(&r);
         peer.cork(&all[..pre]);
         r.block_on(peer.send(SendBody::Slot(slot))).expect("an open peer");
 
@@ -69,7 +69,7 @@ fn send_corks_what_fits_and_never_reorders() {
 fn flush_if_full_ships_only_a_full_cork() {
     for corked in [COALESCE_MAX_BYTES - 1, COALESCE_MAX_BYTES] {
         let r = make_reactor();
-        let (peer, receiver) = Peer::over_socketpair(&r);
+        let (mut peer, receiver) = Peer::over_socketpair(&r);
         peer.cork(&vec![0x3Cu8; corked]);
         r.block_on(peer.flush_if_full()).expect("an open peer");
         let left = peer.corked_len();
@@ -92,7 +92,7 @@ fn a_failed_send_finishes_the_peer() {
     let (_small_ring, small) = ring_slot(64);
 
     let r = make_reactor();
-    let (peer, receiver) = Peer::over_socketpair(&r);
+    let (mut peer, receiver) = Peer::over_socketpair(&r);
     drop(receiver);
 
     r.block_on(async {
@@ -118,7 +118,7 @@ fn a_failed_send_finishes_the_peer() {
 #[test]
 fn next_request_keeps_the_cork_while_requests_are_queued() {
     let r = make_reactor();
-    let (peer, partner) = Peer::over_socketpair(&r);
+    let (mut peer, partner) = Peer::over_socketpair(&r);
     (&partner)
         .write_all(&[framed(b"a"), framed(b"b")].concat())
         .expect("write");
@@ -138,7 +138,7 @@ fn next_request_keeps_the_cork_while_requests_are_queued() {
 #[test]
 fn next_request_ships_to_a_half_closed_client() {
     let r = make_reactor();
-    let (peer, partner) = Peer::over_socketpair(&r);
+    let (mut peer, partner) = Peer::over_socketpair(&r);
     (&partner).write_all(&framed(b"a")).expect("write");
     partner.shutdown(std::net::Shutdown::Write).expect("shutdown");
 
@@ -155,7 +155,7 @@ fn next_request_ships_to_a_half_closed_client() {
 #[test]
 fn next_request_ships_before_parking() {
     let r = make_reactor();
-    let (peer, receiver) = Peer::over_socketpair(&r);
+    let (mut peer, receiver) = Peer::over_socketpair(&r);
     let frame = vec![0x6Bu8; 300];
     peer.cork(&frame);
 
@@ -175,7 +175,7 @@ fn next_request_ships_before_parking() {
 #[test]
 fn a_shared_body_is_sent_behind_what_is_corked() {
     let r = make_reactor();
-    let (peer, receiver) = Peer::over_socketpair(&r);
+    let (mut peer, receiver) = Peer::over_socketpair(&r);
     let small = Rc::new(vec![0x11u8; 100]);
     let large = Rc::new(vec![0x21u8; COALESCE_MAX_BYTES]);
 

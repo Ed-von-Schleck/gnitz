@@ -144,7 +144,7 @@ fn feed_readable(shared: &Shared, feed: &Feed) -> Result<(), WireFault> {
 /// and the rest of the poll continues.
 pub(super) async fn handle_delta_poll(
     shared: &Shared,
-    peer: &Peer,
+    peer: &mut Peer,
     subs: &mut Subscriptions,
     prologue: &ControlHeader,
     body: &[u8],
@@ -331,10 +331,11 @@ struct Feed {
 /// whose change ends its wait.
 ///
 /// A sync parks only while every subscription it covers is readable and caught
-/// up. A commit to a relation it watches, woken by relation once the commit's
-/// LSN is raised, and a DDL, which wakes every parked sync, are what can change
-/// that. A lag or a failed read ends only a subscriber behind, whose connection
-/// is not parked, and a feed ended as unreadable became so by a DDL.
+/// up, and none of the relations it watches has an un-ticked commit. The
+/// commit that makes one of those relations pending wakes it, by relation, and
+/// a DDL wakes every parked sync. A lag or a failed read ends only a
+/// subscriber behind, whose connection is not parked, and a feed ended as
+/// unreadable became so by a DDL.
 #[derive(Default)]
 struct SyncWaiters {
     next_id: Cell<u64>,
@@ -428,7 +429,8 @@ impl Feeds {
         (feeds, asks)
     }
 
-    /// Wake every sync watching `relation`: it committed.
+    /// Wake every sync watching `relation`: it gained a commit no tick has
+    /// taken.
     pub(super) fn wake(&self, relation: u64) {
         self.waiters.wake(relation);
     }
@@ -530,16 +532,14 @@ impl Subscriptions {
     /// Send each subscription queued through rounds that left it no row where
     /// it stands, as a train of its terminal alone: its client's cursor passes
     /// those rounds too.
-    fn tell(&self, peer: &Peer) {
+    fn tell(&self, peer: &mut Peer) {
         debug_assert!(self.out.is_empty(), "a position is sent behind every train");
         for (sub, feed) in &self.asked.held {
             let Some(after) = sub.after_tick.get() else { continue };
             if sub.told.replace(after) != after {
                 let tid = feed.key.view.tid;
-                peer.cork_with(|out| {
-                    pushed_marker(tid, sub.id).encode_framed(out);
-                    terminal(tid, after, feed.tag).encode_framed(out);
-                });
+                cork_msg(peer, pushed_marker(tid, sub.id));
+                cork_msg(peer, terminal(tid, after, feed.tag));
             }
         }
     }
@@ -585,7 +585,7 @@ impl Subscriptions {
 
     /// Answer the oldest sync, whose wait ended as `synced`: the trains
     /// queued, then the frame that ends it.
-    pub(super) async fn answer_sync(&mut self, peer: &Peer, synced: Result<(), WireFault>) {
+    pub(super) async fn answer_sync(&mut self, peer: &mut Peer, synced: Result<(), WireFault>) {
         self.asked_mut().syncs.pop_front();
         if self.ship(peer).await.is_err() {
             return;
@@ -602,11 +602,11 @@ impl Subscriptions {
             lane: gnitz_wire::WireLane::SyncAnswer,
             ..Default::default()
         };
-        peer.cork_with(|out| WireMsg { flags, ..end }.encode_framed(out));
+        cork_msg(peer, WireMsg { flags, ..end });
     }
 
     /// Ship every queued train behind what is corked.
-    pub(super) async fn ship(&self, peer: &Peer) -> Result<(), PeerGone> {
+    pub(super) async fn ship(&self, peer: &mut Peer) -> Result<(), PeerGone> {
         // Each pass swaps the drained Vec back in for the trains queued since,
         // so the Outbox keeps one allocation across ships.
         let mut batch = Vec::new();
@@ -616,7 +616,7 @@ impl Subscriptions {
                 return Ok(());
             }
             for Train { view, id, body } in batch.drain(..) {
-                peer.cork_with(|out| pushed_marker(view, id).encode_framed(out));
+                cork_msg(peer, pushed_marker(view, id));
                 peer.send(SendBody::Shared(body)).await?;
             }
         }
@@ -685,23 +685,23 @@ async fn sync_wait(
         };
         let catalog = fresh_read_lock(shared, views(), until).await?;
         // Nothing to report: held until a relation one of the views reads
-        // changes or `until` comes. No await from this test to the park, so no
-        // commit is acknowledged between them; a commit the drain above did not
+        // gains an un-ticked commit, a DDL, or `until`. A commit to a relation
+        // already pending wakes nobody, so the set parked on is the one found
+        // ticked, with no await between; a commit the drain above did not
         // take is un-ticked here.
-        if until > shared.dispatcher.reactor().now()
-            && shared.ticks.all_ticked(&shared.cat().dag, views())
-            && out.unsynced() == 0
-            && held.iter().all(caught_up)
-        {
-            // A commit reaches a view through the view or anything it reads.
+        if until > shared.dispatcher.reactor().now() && out.unsynced() == 0 && held.iter().all(caught_up) {
             let watched: FxHashSet<u64> = {
                 let cat = shared.cat();
-                views().flat_map(|v| cat.dag.self_and_sources(v)).collect()
+                views()
+                    .flat_map(|v| cat.dag.source_closure_of(v).iter().copied())
+                    .collect()
             };
-            let mut parked = feeds.waiters.park(watched);
-            drop(catalog);
-            select2(&mut parked.woken, shared.dispatcher.reactor().sleep_until(until)).await;
-            continue;
+            if shared.ticks.none_pending(watched.iter().copied()) {
+                let mut parked = feeds.waiters.park(watched);
+                drop(catalog);
+                select2(&mut parked.woken, shared.dispatcher.reactor().sleep_until(until)).await;
+                continue;
+            }
         }
         // Every commit acknowledged before the sync is ticked here, so only a
         // subscription behind asks for a pump.

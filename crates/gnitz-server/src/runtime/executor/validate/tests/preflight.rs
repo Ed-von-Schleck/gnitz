@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk, pk_only_schema, u64_i64_cols};
+use crate::test_support::{make_batch_raw, make_schema_u64_i64, u64_i64_cols};
 use gnitz_wire::TypeCode;
 
 /// A write to a parent referenced through its lone PK column probes nothing
@@ -39,61 +39,18 @@ fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
     disp.into_catalog().close();
 }
 
-/// Each PK column decodes at its own offset and width, signed and
-/// wider-than-16-byte keys included.
-#[test]
-fn format_pk_bytes_renders_every_pk_column_from_its_opk_image() {
-    for (tc, v, want) in [
-        (TypeCode::I8, -5i128, "-5"),
-        (TypeCode::I16, -300, "-300"),
-        (TypeCode::I32, -70_000, "-70000"),
-        (TypeCode::I64, i64::MIN as i128, "-9223372036854775808"),
-        (TypeCode::U8, 200, "200"),
-        (TypeCode::U64, u64::MAX as i128, "18446744073709551615"),
-        (
-            TypeCode::U128,
-            u128::MAX as i128,
-            "340282366920938463463374607431768211455",
-        ),
-        (TypeCode::I128, -1, "-1"),
-        (TypeCode::I128, i128::MIN, "-170141183460469231731687303715884105728"),
-    ] {
-        let schema = pk_only_schema(&[tc]);
-        assert_eq!(
-            format_pk_bytes(&schema, &opk_pk(&schema, &[v as u128])),
-            want,
-            "type {tc}"
-        );
-    }
+/// `(pk, weight, value)` rows; `None` is a NULL value.
+type Rows<'r> = &'r [(u64, i64, Option<i64>)];
 
-    let uuid = pk_only_schema(&[TypeCode::UUID]);
-    let v = 0x550e8400_e29b_41d4_a716_446655440000u128;
-    assert_eq!(
-        format_pk_bytes(&uuid, &opk_pk(&uuid, &[v])),
-        "550e8400-e29b-41d4-a716-446655440000",
-        "a UUID renders from all 128 bits, not a truncated low word",
-    );
-
-    // 24-byte compound PK: every column read at its own offset.
-    let wide = pk_only_schema(&[TypeCode::U64; 3]);
-    assert_eq!(format_pk_bytes(&wide, &opk_pk(&wide, &[7, 8, 9])), "7, 8, 9");
-}
-
-/// U-SEC's in-bundle duplicate verdict over a table with a UNIQUE index on its
-/// nullable payload column, whose filter is seeded empty so no write probes:
-/// one row per PK (packed a column at a time once there are enough of them)
-/// and a PK touched twice (packed per surviving row) decide alike, across
-/// families, deletes, and NULLs, which are unindexed.
-#[test]
-fn a_unique_index_refuses_exactly_the_spans_two_surviving_rows_claim() {
-    use super::super::unique_filter::UniqueFilter;
+/// A table with a UNIQUE index on its nullable payload column, behind a
+/// one-worker dispatcher: its id, its schema, and the index's column list.
+fn uniquely_indexed_table() -> (tempfile::TempDir, MasterDispatcher, u64, SchemaDescriptor, PkColList) {
     use crate::catalog::SysFamily;
     use crate::runtime::master::fixtures::test_dispatcher;
-    use crate::runtime::test_support::{empty_catalog, try_poll_once};
+    use crate::runtime::test_support::empty_catalog;
     use crate::test_support::{apply_ddl, idx_tab_batch, nullable_def};
-    use gnitz_zset::repr::BatchBuilder;
 
-    let (_tmp, mut engine) = empty_catalog();
+    let (tmp, mut engine) = empty_catalog();
     let cols = [u64_i64_cols()[0].clone(), nullable_def("v", TypeCode::I64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let id = engine.allocate_ids(1).unwrap();
@@ -101,22 +58,35 @@ fn a_unique_index_refuses_exactly_the_spans_two_surviving_rows_claim() {
     apply_ddl(&mut engine, [(SysFamily::Index, idx)]).unwrap();
     let schema = engine.registry.relation(tid).unwrap().schema();
     let (disp, _) = test_dispatcher(1, engine);
-    let checks = Checks::new();
-    checks.unique_filter_seed(tid, PkColList::from_slice(&[1]), UniqueFilter::new());
+    (tmp, disp, tid, schema, PkColList::from_slice(&[1]))
+}
 
-    // `(pk, weight, value)` rows per family; `None` is a NULL value.
-    type Rows<'r> = &'r [(u64, i64, Option<i64>)];
-    let family = |rows: Rows<'_>| {
-        let mut bb = BatchBuilder::new(&schema);
-        for &(pk, w, v) in rows {
-            bb.begin_row(pk as u128, w);
-            bb.put_opt_int(v.map(|v| v as u128));
-            bb.end_row();
-        }
-        TxnFamily::new(tid, WireConflictMode::Update, FamilyRows::Built(bb.finish()))
-    };
+/// An Update family of `rows` of [`uniquely_indexed_table`].
+fn update_family(tid: u64, schema: &SchemaDescriptor, rows: Rows<'_>) -> TxnFamily {
+    let mut bb = gnitz_zset::repr::BatchBuilder::new(schema);
+    for &(pk, w, v) in rows {
+        bb.begin_row(pk as u128, w);
+        bb.put_opt_int(v.map(|v| v as u128));
+        bb.end_row();
+    }
+    TxnFamily::new(tid, WireConflictMode::Update, FamilyRows::Built(bb.finish()))
+}
+
+/// U-SEC's in-bundle duplicate verdict over a table with a UNIQUE index on its
+/// nullable payload column, each write over a filter seeded empty so none
+/// probes: one row per PK (packed a column at a time once there are enough of
+/// them) and a PK touched twice (packed per surviving row) decide alike, across
+/// families, deletes, and NULLs, which are unindexed.
+#[test]
+fn a_unique_index_refuses_exactly_the_spans_two_surviving_rows_claim() {
+    use super::super::unique_filter::UniqueFilter;
+    use crate::runtime::test_support::try_poll_once;
+
+    let (_tmp, disp, tid, schema, cols) = uniquely_indexed_table();
+    let checks = Checks::new();
     let refused = |fams: &[Rows<'_>]| {
-        let mut families: Vec<TxnFamily> = fams.iter().map(|&r| family(r)).collect();
+        checks.unique_filter_seed(tid, cols, UniqueFilter::new());
+        let mut families: Vec<TxnFamily> = fams.iter().map(|&r| update_family(tid, &schema, r)).collect();
         match try_poll_once(checks.validate_txn(&disp, &mut families)) {
             Some(Ok(())) => false,
             Some(Err(e)) => {
@@ -186,6 +156,30 @@ fn a_unique_index_refuses_exactly_the_spans_two_surviving_rows_claim() {
     for (label, fams, want) in cases {
         assert_eq!(refused(fams), want, "{label}");
     }
+
+    disp.into_catalog().close();
+}
+
+/// A filter takes a write's spans at the write's verdict: a refused write's
+/// stay proven absent, and an admitted write's send the next write that claims
+/// one to a probe.
+#[test]
+fn a_filter_takes_the_spans_of_an_admitted_write_alone() {
+    use super::super::unique_filter::UniqueFilter;
+    use crate::runtime::test_support::try_poll_once;
+
+    let (_tmp, disp, tid, schema, cols) = uniquely_indexed_table();
+    let checks = Checks::new();
+    checks.unique_filter_seed(tid, cols, UniqueFilter::new());
+    let validate = |rows: Rows<'_>| {
+        let mut families = vec![update_family(tid, &schema, rows)];
+        try_poll_once(checks.validate_txn(&disp, &mut families))
+    };
+
+    let refused = validate(&[(1, 1, Some(5)), (2, 1, Some(5)), (3, 1, Some(6))]);
+    assert!(matches!(refused, Some(Err(e)) if e.text.contains("duplicate in batch")));
+    assert!(matches!(validate(&[(4, 1, Some(5)), (5, 1, None)]), Some(Ok(()))));
+    assert!(validate(&[(6, 1, Some(5))]).is_none());
 
     disp.into_catalog().close();
 }

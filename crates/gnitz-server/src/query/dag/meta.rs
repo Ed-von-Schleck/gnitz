@@ -218,7 +218,7 @@ impl DagEngine {
     }
 
     /// `id`, then [`Self::source_closure_of`] it.
-    pub(crate) fn self_and_sources(&self, id: u64) -> impl Iterator<Item = u64> + '_ {
+    pub(super) fn self_and_sources(&self, id: u64) -> impl Iterator<Item = u64> + '_ {
         std::iter::once(id).chain(self.source_closure_of(id).iter().copied())
     }
 

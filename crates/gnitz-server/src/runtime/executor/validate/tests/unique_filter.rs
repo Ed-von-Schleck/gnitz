@@ -1,8 +1,4 @@
 use super::*;
-use crate::test_support::u64_pk_schema;
-use gnitz_wire::TypeCode;
-use gnitz_zset::repr::BatchBuilder;
-use gnitz_zset::schema::SchemaColumn;
 
 /// A filter proves absence until it caps: a repeat span costs no capacity, and
 /// the first distinct span past the cap drops the whole set.
@@ -22,33 +18,6 @@ fn filter_proves_absence_only_until_it_caps() {
     assert!(!f.insert(&span(1)), "and records nothing more");
 }
 
-/// A retraction is not an occupancy, and a NULL in an indexed column is not a
-/// key: only the live, non-NULL rows' spans enter the filter.
-#[test]
-fn insert_all_of_spans_takes_only_live_non_null_spans() {
-    let schema = u64_pk_schema(&[SchemaColumn::new(TypeCode::U64, true)]);
-    let mut bb = BatchBuilder::new(&schema);
-    for (pk, weight, payload) in [(1, 1, Some(100)), (2, 1, None), (3, -1, Some(300))] {
-        bb.begin_row(pk, weight);
-        bb.put_opt_int(payload);
-        bb.end_row();
-    }
-    let batch = bb.finish();
-
-    for (col, present, absent) in [(0, &[1, 2][..], &[3][..]), (1, &[100], &[0, 300])] {
-        let spec = KeySpec::new(&[col], &schema).unwrap();
-        let mut f = UniqueFilter::new();
-        f.insert_all(spans(&batch.as_mem_batch(), &spec).chunks_exact(spec.key_size()));
-        let held = |v: u64| f.may_contain(&v.to_be_bytes());
-        for &v in present {
-            assert!(held(v), "column {col}: {v} is present");
-        }
-        for &v in absent {
-            assert!(!held(v), "column {col}: {v} is absent");
-        }
-    }
-}
-
 /// A published seed drops the spans it proves absent, only for its own
 /// `(table, columns)`, until it caps or its index or its table drops it.
 #[test]
@@ -63,9 +32,9 @@ fn a_seed_drops_absent_spans_under_its_own_index() {
     // Of spans 1 and 5, the ones the filter keeps.
     let kept = |tid, cols| {
         let spans = [1u64.to_be_bytes(), 5u64.to_be_bytes()];
-        let keys = PkKeys::from_keys(8, spans.iter().map(|s| &s[..]));
-        let kept = checks.unique_filter_retain_possible(tid, cols, keys);
-        kept.iter()
+        let mut keys = PkKeys::from_keys(8, spans.iter().map(|s| &s[..]));
+        checks.unique_filter_retain_possible(tid, cols, &mut keys);
+        keys.iter()
             .map(|k| u64::from_be_bytes(k.try_into().unwrap()))
             .collect::<Vec<_>>()
     };
@@ -82,4 +51,28 @@ fn a_seed_drops_absent_spans_under_its_own_index() {
     assert!(!capped.insert(&9u64.to_be_bytes()));
     checks.unique_filter_seed(8, a, capped);
     assert_eq!(kept(8, a), [1, 5], "a capped filter proves nothing");
+}
+
+/// The spans a filter proves absent are the claim, and an admitted claim
+/// enters that filter; an index without a filter claims nothing.
+#[test]
+fn a_claim_is_the_absent_spans_and_enters_its_filter() {
+    let checks = Checks::new();
+    let (a, b) = (PkColList::from_slice(&[0]), PkColList::from_slice(&[1]));
+    let mut seed = UniqueFilter::new();
+    seed.insert(&1u64.to_be_bytes());
+    checks.unique_filter_seed(7, a, seed);
+    let spans = [1u64.to_be_bytes(), 2u64.to_be_bytes()];
+    let keys = || PkKeys::from_keys(8, spans.iter().map(|s| &s[..]));
+
+    assert!(checks.unique_filter_retain_possible(7, b, &mut keys()).is_none());
+    let claim = checks
+        .unique_filter_retain_possible(7, a, &mut keys())
+        .expect("2 is absent");
+    assert_eq!(claim.absent.as_bytes(), 2u64.to_be_bytes());
+    checks.unique_filters_admit(&[claim]);
+
+    let filters = checks.unique_filters.borrow();
+    let held = |v: u64| filters[&(7, a)].may_contain(&v.to_be_bytes());
+    assert_eq!([held(1), held(2), held(3)], [true, true, false]);
 }

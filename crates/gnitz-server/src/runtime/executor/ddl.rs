@@ -8,7 +8,6 @@
 //! none of that: a `sys_sequences` advance has no DAG evaluation, and the row
 //! it logs is one no worker reads.
 
-use super::committer::Paused;
 use super::validate::{self, UniqueFilter};
 use super::{decode_fault, park_until, CatalogLock, Shared};
 use crate::catalog::{AppliedDdl, DdlBundle, SysFamily};
@@ -18,39 +17,34 @@ use gnitz_foundation::fault::Seam;
 use gnitz_wire::{ClientVerb, DecodedControl, PkColList, Target, WireFault};
 use gnitz_zset::repr::Batch;
 
-/// What a DDL body runs under: the catalog write; the committer paused, so no
-/// checkpoint round runs inside the DDL; and the tick gate's write, so no tick
-/// is in flight and every broadcast DdlSync lands between epochs.
+/// What a DDL body runs under: the catalog write, and the tick gate's write, so
+/// no tick is in flight, every broadcast DdlSync lands between epochs, and no
+/// checkpoint, which holds the gate from its base round through its ephemeral
+/// round, runs inside the DDL.
 struct DdlLocks {
     catalog: WriteGuard<CatalogLock>,
-    _committer: Paused,
-    _ticks: WriteGuard,
+    ticks: WriteGuard,
 }
 
-/// Take [`DdlLocks`]. The pause comes after the catalog write: a writer holds a
-/// catalog read while it awaits the committer, so a pause taken first would park
-/// the committer ahead of a write the catalog write waits out. It comes before
-/// the gate: a checkpoint the committer runs ahead of its park drains ticks.
-///
-/// A pause released at once ahead of them all lets a checkpoint already queued
-/// finish before the catalog write starts holding off readers.
+/// Take [`DdlLocks`].
 async fn enter_ddl(shared: &Shared) -> DdlLocks {
-    drop(shared.committer.pause().await);
+    // A checkpoint already queued, or due before the writes queued with this
+    // settle, finishes before the catalog write holds off readers.
+    shared.committer.settle().await;
     let catalog = shared.catalog_rwlock.write().await;
-    let committer = shared.committer.pause().await;
+    // Every writer holds a catalog read until its fdatasync, so none is queued:
+    // a checkpoint due now runs, and the DDL's groups start on a log below the
+    // threshold. Ahead of the gate, which that checkpoint takes.
+    shared.committer.settle().await;
     let ticks = shared.ticks.gate.write().await;
-    DdlLocks {
-        catalog,
-        _committer: committer,
-        _ticks: ticks,
-    }
+    DdlLocks { catalog, ticks }
 }
 
 /// `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT`: hold the first DDL, its zone written
-/// and its locks still held, until a request is queued behind its pause of the
-/// committer. Below a checkpoint threshold of one zone, that request is the
-/// watchdog's reclaim wake, so a checkpoint is asked for inside the DDL.
-/// One-shot.
+/// and its locks still held, until a task parks on the tick gate it holds.
+/// Below a checkpoint threshold of one zone, and with no tick request
+/// outstanding, that task is the committer, inside the checkpoint the
+/// watchdog's reclaim wake called for. One-shot.
 static DDL_HOLD_FOR_CHECKPOINT: Seam = Seam::new("GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT");
 
 /// Poll bound for [`DDL_HOLD_FOR_CHECKPOINT`], in 1 ms ticks.
@@ -133,7 +127,7 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, body: &[u8]) -> Result<u64, 
     shared.feeds.wake_all();
 
     if DDL_HOLD_FOR_CHECKPOINT.take_once() {
-        park_until(shared, DDL_HOLD_MAX_POLLS, "ddl hold", || shared.committer.has_queued()).await;
+        park_until(shared, DDL_HOLD_MAX_POLLS, "ddl hold", || locks.ticks.contended()).await;
     }
     drop(locks);
     Ok(zone_lsn)
@@ -183,7 +177,7 @@ async fn commit_bundle(
 }
 
 /// Release the pre-flight's index claims, committed or not, while the DDL still
-/// holds the committer paused. The release follows the zone in the log, so a
+/// holds the tick gate. The release follows the zone in the log, so a
 /// worker enters the catalog's claim on an index the DDL created before it drops
 /// the pre-flight's. A claim left standing would keep an index no catalog row
 /// owns, whose directory the next checkpoint's sweep removes from under it.

@@ -4,7 +4,6 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -29,7 +28,7 @@ pub(super) struct Peer {
     tls: Option<Rc<TlsSession>>,
     /// Replies written but not yet sent, concatenated so a run of pipelined
     /// requests leaves as one send. `None` when nothing is pending.
-    egress: RefCell<Option<PooledBuf>>,
+    egress: Option<PooledBuf>,
 }
 
 impl Peer {
@@ -47,7 +46,7 @@ impl Peer {
             reactor: reactor.clone(),
             conn,
             tls,
-            egress: RefCell::new(None),
+            egress: None,
         }
     }
 
@@ -63,7 +62,7 @@ impl Peer {
 
     /// The next request, shipping what is corked before parking on the client.
     /// `None` once the client is gone or has sent its last request.
-    pub(super) async fn next_request(&self) -> Option<RecvBuf> {
+    pub(super) async fn next_request(&mut self) -> Option<RecvBuf> {
         self.flush_if_full().await.ok()?;
         // Not `is_readable`: a client that closed its sending side is readable,
         // and is still owed what is corked.
@@ -76,7 +75,7 @@ impl Peer {
 
     /// What `waited` resolves to, or `None` once [`Self::next_request`] would
     /// not park. What is corked ships first, so `waited` is raced with no send.
-    pub(super) async fn until_request<T>(&self, waited: impl Future<Output = T>) -> Result<Option<T>, PeerGone> {
+    pub(super) async fn until_request<T>(&mut self, waited: impl Future<Output = T>) -> Result<Option<T>, PeerGone> {
         if !self.conn.is_readable() {
             self.flush_egress().await?;
         }
@@ -86,37 +85,34 @@ impl Peer {
         })
     }
 
-    /// Append a reply written by `write`, to leave with whatever is corked
-    /// beside it. Synchronous, so a caller holding a W2M ring slot can copy out
-    /// of it and release it before any await.
-    pub(super) fn cork_with(&self, write: impl FnOnce(&mut Vec<u8>)) {
-        let mut e = self.egress.borrow_mut();
-        let acc = e.get_or_insert_with(|| PooledBuf::with_capacity(COALESCE_MAX_BYTES));
-        write(&mut acc.0);
+    /// The cork: replies appended here leave with whatever is corked beside
+    /// them.
+    pub(super) fn corked(&mut self) -> &mut Vec<u8> {
+        &mut (self.egress)
+            .get_or_insert_with(|| PooledBuf::with_capacity(COALESCE_MAX_BYTES))
+            .0
     }
 
-    /// Append `payload` framed: its length prefix, then its bytes. See
-    /// [`Self::cork_with`].
-    pub(super) fn cork_frame(&self, payload: &[u8]) {
-        self.cork_with(|acc| {
-            acc.extend_from_slice(&gnitz_wire::frame_len_prefix(payload.len()));
-            acc.extend_from_slice(payload);
-        });
+    /// Append `payload` framed: its length prefix, then its bytes.
+    pub(super) fn cork_frame(&mut self, payload: &[u8]) {
+        let out = self.corked();
+        out.extend_from_slice(&gnitz_wire::frame_len_prefix(payload.len()));
+        out.extend_from_slice(payload);
     }
 
-    /// Append `frame`'s bytes. See [`Self::cork_with`].
-    pub(super) fn cork(&self, frame: &[u8]) {
-        self.cork_with(|acc| acc.extend_from_slice(frame));
+    /// Append `frame`'s bytes.
+    pub(super) fn cork(&mut self, frame: &[u8]) {
+        self.corked().extend_from_slice(frame);
     }
 
     /// Bytes currently corked.
     fn corked_len(&self) -> usize {
-        self.egress.borrow().as_ref().map_or(0, |b| b.0.len())
+        self.egress.as_ref().map_or(0, |b| b.0.len())
     }
 
     /// Ship what is corked once it reaches [`COALESCE_MAX_BYTES`], bounding the
     /// accumulator across a long pipelined run.
-    pub(super) async fn flush_if_full(&self) -> Result<(), PeerGone> {
+    pub(super) async fn flush_if_full(&mut self) -> Result<(), PeerGone> {
         self.live()?;
         if self.corked_len() < COALESCE_MAX_BYTES {
             return Ok(());
@@ -125,10 +121,9 @@ impl Peer {
     }
 
     /// Write everything corked, as one send. No-op when nothing is pending.
-    pub(super) async fn flush_egress(&self) -> Result<(), PeerGone> {
+    pub(super) async fn flush_egress(&mut self) -> Result<(), PeerGone> {
         self.live()?;
-        // Taken, not borrowed across the await: the flushed task re-enters `Peer`.
-        let Some(buf) = self.egress.borrow_mut().take() else {
+        let Some(buf) = self.egress.take() else {
             return Ok(());
         };
         self.send_raw(SendBody::Pooled(buf)).await
@@ -137,7 +132,7 @@ impl Peer {
     /// Send `body` behind whatever is corked: copied into the cork, or alone
     /// and uncopied when it is too large to join it. A corked body reports a
     /// gone peer at its flush, not here.
-    pub(super) async fn send(&self, mut body: SendBody) -> Result<(), PeerGone> {
+    pub(super) async fn send(&mut self, mut body: SendBody) -> Result<(), PeerGone> {
         self.live()?;
         let len = body.bytes().len();
         let corked = self.corked_len();

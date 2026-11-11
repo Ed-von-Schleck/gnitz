@@ -96,7 +96,7 @@ async fn merge_index_scan(
 ///
 /// Runs under the DDL's catalog write, before the zone is laid out, so the index
 /// each worker filled is the one its catalog claim adopts; the caller releases
-/// every claim it leaves. The DDL's pause of the committer keeps a checkpoint's
+/// every claim it leaves. The DDL's hold of the tick gate keeps a checkpoint's
 /// sweep off the claimed directory meanwhile.
 ///
 /// `Some(filter)` seeds the index's unique filter; `None` when the

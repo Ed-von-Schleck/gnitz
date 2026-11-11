@@ -18,8 +18,8 @@
 
 use std::collections::HashSet;
 
-use super::validate::TxnFamily;
-use super::write::{decode_push_frame, decode_push_txn_frame};
+use super::family::TxnFamily;
+use super::write::{admit_push, admit_push_txn};
 use super::*;
 use crate::catalog::{SysFamily, ZoneError, PUBLIC_SCHEMA_ID};
 use crate::test_support::{left_join_circuit, left_join_cols, sys_batch, table_blocks, view_blocks, view_tab_row};
@@ -98,12 +98,10 @@ impl Session {
         match verb {
             ClientVerb::DdlTxn => self.ddl(body),
             ClientVerb::Push => {
-                let Ok(push) = decode_push_frame(&self.cat, buf.as_mut_slice(), ctrl) else {
+                let Ok(Some(push)) = admit_push(&self.cat, buf.as_mut_slice(), ctrl, Access::Write) else {
                     return;
                 };
-                let Ok(Some(family)) = push.admit(&self.cat, Access::Write, &Rc::new(buf)) else {
-                    return;
-                };
+                let family = push.family(&Rc::new(buf));
                 let stream = self
                     .cat
                     .registry
@@ -114,20 +112,11 @@ impl Session {
                 }
             }
             ClientVerb::PushTxn => {
-                let Ok(items) = decode_push_txn_frame(&self.cat, buf.as_mut_slice(), ctrl.body.clone()) else {
+                let Ok(items) = admit_push_txn(&self.cat, buf.as_mut_slice(), ctrl.body.clone()) else {
                     return;
                 };
                 let buf = Rc::new(buf);
-                let Ok(families) = items
-                    .into_iter()
-                    .map(|(_, push)| {
-                        let family = push.admit(&self.cat, Access::TxnWrite, &buf);
-                        family.map(|f| f.expect("a PUSH_TXN item carries a data block"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                else {
-                    return;
-                };
+                let families: Vec<TxnFamily> = items.into_iter().map(|(_, push)| push.family(&buf)).collect();
                 if families.iter().all(|f| self.inserts(f.tid, &f.rows.view())) {
                     self.ingest(families);
                 }
@@ -189,7 +178,11 @@ impl Session {
     /// Ingest every one of `families`, which the master admitted, and tick each.
     fn ingest(&mut self, families: Vec<TxnFamily>) {
         for f in families {
-            if self.cat.ingest_unticked(f.tid, f.rows.into_batch(), f.pk_rule).is_ok() {
+            if self
+                .cat
+                .ingest_unticked(f.tid, f.rows.view().to_batch(), f.pk_rule)
+                .is_ok()
+            {
                 self.filled.insert(f.tid);
                 self.tick(f.tid);
             }

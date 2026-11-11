@@ -30,8 +30,8 @@ def test_a_seek_reflects_every_acked_push_under_concurrent_ddl(client, peer):
     a tick applied twice shows as weight 2.
 
     A third connection churns CREATE/DROP VIEW on an unrelated table throughout.
-    The seek releases the catalog read lock to drain and re-takes it; a drain
-    under the lock would deadlock against the writer-preferring DDL."""
+    The seek drains before it takes the catalog read lock, so it never holds
+    the lock across a drain and the writer-preferring DDL never waits one out."""
     tid = client.create_table("t", KV)
     client.create_table("t2", KV)
     client.execute_sql("CREATE VIEW v1 AS SELECT * FROM t WHERE val >= 0; "

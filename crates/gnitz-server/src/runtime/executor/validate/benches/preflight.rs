@@ -136,7 +136,7 @@ fn preflight_sink_bench() {
             let (b, fold) = counter.measure(|| TxnBundle::new(&disp.cat(), &families).unwrap());
             let mut b = std::hint::black_box(b);
             let mut checks: Vec<Check<Rule>> = Vec::new();
-            let ((), plan) = counter.measure(|| plan_pk_checks(&disp, &b, &mut checks).unwrap());
+            let ((), plan) = counter.measure(|| plan_pk_checks(&disp.cat(), &b, &mut checks).unwrap());
             let [Check { plan: Rule::Gather { old, .. }, .. }] = &mut checks[..] else {
                 panic!("one PK-column probe");
             };

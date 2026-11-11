@@ -81,10 +81,10 @@ def test_a_view_tracks_its_base_under_sustained_ingest_with_scans(target):
 
 
 def test_a_unique_constraint_holds_under_checkpoint_pressure(target):
-    """The unique filter must be updated exactly once per durably committed
-    batch, and no checkpoint may reset it. Inserts against a unique indexed column
-    run while the SAL floods; afterwards every row must be visible and a duplicate
-    must still be rejected — a lost or reset filter accepts it."""
+    """The unique filter must hold every span a committed row holds, and no
+    checkpoint may reset it. Inserts against a unique indexed column run while
+    the SAL floods; afterwards every row must be visible and a duplicate must
+    still be rejected — a lost or reset filter accepts it."""
     with gnitz.connect(target) as pusher, gnitz.connect(target) as inserter:
         filler = pusher.create_table("filler", KV)
         inserter.execute_sql(
@@ -152,10 +152,11 @@ def test_no_checkpoint_runs_inside_a_ddl(own_server):
     """A checkpoint asked for while a DDL holds its locks runs only after the DDL.
 
     `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT` holds the first DDL, its zone written
-    and its locks held, until a request queues behind its pause of the
-    committer. At a one-byte threshold the zone alone crosses it, so that
-    request is the watchdog's reclaim wake. No checkpoint may finish between the
-    hold's park and its release, and that wake runs one once the DDL ends."""
+    and its locks held, until a task parks on the tick gate it holds. At a
+    one-byte threshold the zone alone crosses it, and nothing here asks for a
+    tick, so that task is the committer, in the checkpoint the watchdog's
+    reclaim wake called for. No checkpoint may finish between the hold's park
+    and its release, and that one runs once the DDL ends."""
     own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "1", "GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT": "1"})
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(

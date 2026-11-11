@@ -9,7 +9,7 @@ use std::hint::black_box;
 const N: usize = 500_000;
 
 /// Instructions per input row of a secondary index's projection — the span
-/// alone ([`spans`]) and the whole entry ([`index_entries`]) — by span
+/// alone ([`extend_spans`]) and the whole entry ([`index_entries`]) — by span
 /// shape, NULL density of the indexed columns, and width of the source PK the
 /// entry ends in.
 #[test]
@@ -23,8 +23,13 @@ fn index_entries_bench() {
             .unwrap();
         let mb = batch.as_mem_batch();
         let key_size = spec.key_size();
-        black_box(spans(&mb, &spec));
-        let (spans, span) = counter.measure(|| spans(&mb, &spec));
+        let spans = || {
+            let mut out = Vec::new();
+            extend_spans(&mut out, &mb, &spec);
+            out
+        };
+        black_box(spans());
+        let (spans, span) = counter.measure(spans);
         black_box(index_entries(batch, &spec, &idx_schema));
         let (entries, entry) = counter.measure(|| index_entries(batch, &spec, &idx_schema));
         assert_eq!((entries.len(), spans.len()), (live, live * key_size), "{label}");

@@ -177,11 +177,6 @@ pub(crate) mod chan {
         pub(crate) fn send(&self, v: T) {
             self.inner.borrow_mut().push(v);
         }
-
-        /// Whether no value waits for the receiver.
-        pub(crate) fn is_empty(&self) -> bool {
-            !self.inner.borrow().is_ready()
-        }
     }
 
     impl<T> Receiver<T> {

@@ -2,10 +2,10 @@
 //! is queued behind the first request (see [`drain_ready_batch`]). A write's
 //! table locks are dropped once it is laid out, when its writer is answered;
 //! the writer then waits for the SAL's fdatasync to cover it. Checkpoints,
-//! backups and DDL pauses end a batch. Once serving, it is the one task that
-//! runs a checkpoint.
+//! backups and a DDL's settles end a batch. Once serving, it is the one task
+//! that runs a checkpoint.
 
-use super::validate::{FamilyRows, TxnFamily};
+use super::family::{FamilyRows, TxnFamily};
 use super::write::HeldTables;
 use super::Shared;
 use crate::runtime::signals;
@@ -44,43 +44,25 @@ enum BatchEnd {
         dir: String,
         done: oneshot::Sender<Result<(), WireFault>>,
     },
-    /// Signal `parked`, then run nothing until `resume`.
-    Pause {
-        parked: oneshot::Sender<()>,
-        resume: oneshot::Receiver<()>,
-    },
+    /// Nothing: its answer says the `needs_checkpoint` test of its batch has
+    /// run, ahead of the batch's writes.
+    Settle(oneshot::Sender<()>),
 }
 
-/// The committer paused: it runs no batch, and so no checkpoint, until this is
-/// dropped.
-pub(super) struct Paused(Option<oneshot::Sender<()>>);
-
-impl Drop for Paused {
-    fn drop(&mut self) {
-        if let Some(resume) = self.0.take() {
-            resume.send(());
-        }
-    }
-}
-
-/// One write awaiting commit, all-or-nothing: each family is one `Push` group,
-/// in frame order.
+/// One write awaiting commit, all-or-nothing: its families in frame order. Its
+/// client holds the table locks `held` until the write is laid out in the SAL,
+/// when `done` resolves to the write's commit LSN or to the error that rolled
+/// the whole write back.
 struct PendingWrite {
     families: Vec<TxnFamily>,
-    waiter: Waiter,
-}
-
-/// The client of one write: the rows it wrote, and the table locks it holds
-/// until the write is laid out in the SAL, when `done` resolves to the write's
-/// commit LSN or to the error that rolled the whole write back.
-struct Waiter {
-    done: oneshot::Sender<Result<u64, WireFault>>,
+    /// The rows of every family.
     rows: usize,
     held: HeldTables,
+    done: oneshot::Sender<Result<u64, WireFault>>,
 }
 
 /// The way to the committer task. A write and a backup are refused once a
-/// graceful shutdown has been requested; the pause, the reclaim poke and the
+/// graceful shutdown has been requested; a settle, the reclaim poke and the
 /// final checkpoint itself are always queued.
 ///
 /// Everything a refusing request admits is queued ahead of the final
@@ -105,11 +87,8 @@ impl Committer {
     /// then to the write's commit LSN, which is not yet durable.
     pub(super) async fn write(&self, families: Vec<TxnFamily>, held: HeldTables) -> Result<u64, WireFault> {
         let rows = families.iter().map(|f| f.rows.view().len()).sum();
-        self.admit(|done| {
-            let waiter = Waiter { done, rows, held };
-            CommitRequest::Write(PendingWrite { families, waiter })
-        })?
-        .await
+        self.admit(|done| CommitRequest::Write(PendingWrite { families, rows, held, done }))?
+            .await
     }
 
     /// Checkpoint, then copy every published store into `dir`.
@@ -118,20 +97,12 @@ impl Committer {
             .await
     }
 
-    /// Resolves once the batch queued ahead is laid out and the committer has
-    /// parked. A checkpoint the SAL needs runs ahead of the park.
-    pub(super) async fn pause(&self) -> Paused {
-        let (resume, on_resume) = oneshot::channel();
-        // Built before the await, so a dropped caller still resumes the committer.
-        let paused = Paused(Some(resume));
-        let parked = self.queue(|parked| CommitRequest::End(BatchEnd::Pause { parked, resume: on_resume }));
-        parked.await;
-        paused
-    }
-
-    /// Whether a request waits for the committer to take it.
-    pub(super) fn has_queued(&self) -> bool {
-        !self.tx.is_empty()
+    /// Resolves once every write queued ahead has committed or failed. The
+    /// committer tests `needs_checkpoint` before it lays out the batch the
+    /// settle ends, so only with no write queued ahead is the log then below
+    /// its checkpoint threshold.
+    pub(super) fn settle(&self) -> oneshot::Receiver<()> {
+        self.queue(|done| CommitRequest::End(BatchEnd::Settle(done)))
     }
 
     /// Resolves once every write queued ahead has committed and a checkpoint
@@ -172,9 +143,6 @@ struct CommitScratch {
     units: Vec<CommitUnit>,
     /// Per table, the last of `units` that writes it; empty between batches.
     last_unit: FxHashMap<u64, usize>,
-    /// Per unit, the batches merged behind its one family's; empty between
-    /// batches.
-    tails: Vec<Vec<FamilyRows>>,
 }
 
 /// The committer task loop. Never returns.
@@ -189,7 +157,7 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
         // its table locks; unless a write is parked on one, it waits that
         // fdatasync out and takes in what queued meanwhile.
         let sal = shared.dispatcher.sal();
-        if end.is_none() && sal.syncing_all() && !s.writes.iter().any(|w| w.waiter.held.contended()) {
+        if end.is_none() && sal.syncing_all() && !s.writes.iter().any(|w| w.held.contended()) {
             sal.durable_through(sal.watermark()).await;
             if let Some(next) = rx.try_recv() {
                 end = drain_ready_batch(&mut rx, next, &mut s.writes);
@@ -226,10 +194,7 @@ pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Share
                 run_checkpoint_sequence(&shared).await;
                 done.send(shared.dispatcher.backup_round(&dir).await);
             }
-            Some(BatchEnd::Pause { parked, resume }) => {
-                parked.send(());
-                resume.await;
-            }
+            Some(BatchEnd::Settle(done)) => done.send(()),
         }
     }
 }
@@ -248,14 +213,14 @@ fn drain_ready_batch(
     first: CommitRequest,
     writes: &mut Vec<PendingWrite>,
 ) -> Option<BatchEnd> {
-    let mut row_count = writes.iter().map(|w| w.waiter.rows).sum::<usize>();
+    let mut row_count = writes.iter().map(|w| w.rows).sum::<usize>();
     let mut next = Some(first);
     while let Some(req) = next {
         match req {
             // A write is one indivisible entry: its whole family set rides this
             // batch, and counts every family's rows.
             CommitRequest::Write(w) => {
-                row_count += w.waiter.rows;
+                row_count += w.rows;
                 writes.push(w);
             }
             CommitRequest::End(end) => return Some(end),
@@ -266,38 +231,40 @@ fn drain_ready_batch(
     None
 }
 
-/// The checkpoint sequence: base round, drain, ephemeral round, each round with
-/// no tick in flight. A failed base round aborts: the workers have left the
-/// epoch of a SAL that was not rewound, which only a restart's replay repairs.
-/// A failed ephemeral round aborts too: its views are stamped and the master's
-/// system rows are not durable.
+/// The checkpoint sequence: base round, a tick of everything pending, ephemeral
+/// round, under one hold of the tick gate. A failed base round aborts: the
+/// workers have left the epoch of a SAL that was not rewound, which only a
+/// restart's replay repairs. A failed ephemeral round aborts too: its views are
+/// stamped and the master's system rows are not durable.
 async fn run_checkpoint_sequence(shared: &Shared) {
-    // The base round runs with no tick in flight either, so a worker meets no
-    // `Flush` inside a drive. It waits out the tick before it takes the SAL
-    // writer: a checkpoint a refusal called for frees no room until then.
-    // Released before the drain, whose tick takes the gate.
-    {
-        let _park = shared.ticks.gate.write().await;
-        shared
-            .dispatcher
-            .checkpoint_base()
-            .await
-            .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
-    }
+    // Held through the ephemeral round, so neither round has a tick in flight
+    // (a worker meets no `Flush` inside a drive) and no DDL body, which runs
+    // under the gate too, lands between them. A tick in flight is waited out
+    // before the base round takes the SAL writer: a checkpoint a refusal
+    // called for frees no room until then.
+    let _no_tick = shared.ticks.gate.write().await;
+    shared
+        .dispatcher
+        .checkpoint_base()
+        .await
+        .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
 
-    // One drain suffices: no write is committed meanwhile, so the pending-tick
-    // counts cannot grow.
-    // Stamping after a failed drain would make the views' missing deltas
+    // One tick takes everything pending: the committer is the task running
+    // this, so no write is committed meanwhile and the pending-tick counts
+    // cannot grow.
+    // Stamping after a failed tick would make the views' missing deltas
     // generation-valid. Unstamped, they stay behind the generation the base
     // round that flushed those deltas' rows advanced to, and are rebuilt at the
     // next boot. Not an abort: this path also serves the shutdown checkpoint.
-    if let Err(e) = shared.ticks.drain(shared.dispatcher.reactor().now()).await {
-        gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);
-        return;
+    match shared.emit_pending_tick().await {
+        Ok(Some(lease)) => lease.acks().await,
+        Ok(None) => {}
+        Err(e) => {
+            gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);
+            return;
+        }
     }
 
-    // The ephemeral round runs with no tick in flight.
-    let _park = shared.ticks.gate.write().await;
     shared
         .dispatcher
         .checkpoint_ephemeral()
@@ -306,81 +273,51 @@ async fn run_checkpoint_sequence(shared: &Shared) {
 }
 
 /// One client-visible commit unit, all-or-nothing: the SAL groups it emits and
-/// the clients waiting on their shared verdict.
+/// the writes waiting on their shared verdict.
 struct CommitUnit {
-    outcome: Outcome,
-    /// The unit's clients in arrival order: a write's one, or a merged run's
-    /// several.
-    waiters: SmallVec<[Waiter; 1]>,
-}
-
-/// Where a [`CommitUnit`] stands.
-enum Outcome {
-    /// One group each, in frame order. A run of one-family writes to one table
-    /// is one unit of one family, their batches merged. `in_zone` once laid out:
-    /// whether one of its groups rode inside the zone, which a restart recovers.
-    Laid { families: Vec<TxnFamily>, in_zone: bool },
-    /// Why none of the unit's writes committed.
-    Failed(WireFault),
+    /// The unit's writes in arrival order: one, or a merged run's several.
+    writes: SmallVec<[PendingWrite; 1]>,
+    /// A merged run's one family: its writes' batches concatenated. The writes
+    /// keep their own rows, which a refused run goes again from.
+    merged: Option<Box<TxnFamily>>,
+    /// Whether one of the unit's groups rode inside the zone, which a restart
+    /// recovers, `false` until it is laid out; or why none of its writes
+    /// committed.
+    outcome: Result<bool, WireFault>,
 }
 
 impl CommitUnit {
-    /// The families the unit laid out; none once it failed.
+    /// The families the unit lays out, one group each in frame order: a merged
+    /// run's one, else its write's. None once it failed.
     fn laid(&self) -> &[TxnFamily] {
-        match &self.outcome {
-            Outcome::Laid { families, .. } => families,
-            Outcome::Failed(_) => &[],
+        match (&self.outcome, &self.merged) {
+            (Err(_), _) => &[],
+            (Ok(_), Some(merged)) => std::slice::from_ref(&**merged),
+            (Ok(_), None) => &self.writes[0].families,
         }
     }
 
     /// A run of several clients' writes merged into one.
     fn is_merged(&self) -> bool {
-        self.waiters.len() > 1
+        self.merged.is_some()
     }
 
     /// The commit LSN of a laid unit: the zone LSN when one of its groups rode
-    /// inside the zone, which a restart recovers, else `0`.
+    /// inside the zone, else `0`.
     fn lsn(&self, zone_lsn: u64) -> u64 {
-        match self.outcome {
-            Outcome::Laid { in_zone: true, .. } => zone_lsn,
-            _ => 0,
+        if matches!(self.outcome, Ok(true)) {
+            zone_lsn
+        } else {
+            0
         }
-    }
-
-    /// The unit as the writes it was built from: a merged run split back into
-    /// its clients' pushes, by the rows each wrote.
-    fn into_writes(self) -> Vec<PendingWrite> {
-        let Outcome::Laid { mut families, .. } = self.outcome else {
-            unreachable!("only a unit not yet laid out is taken back")
-        };
-        if self.waiters.len() == 1 {
-            let waiter = self.waiters.into_iter().next().expect("a unit answers one client");
-            return vec![PendingWrite { families, waiter }];
-        }
-        let TxnFamily { tid, mode, rows, pk_rule } = families.pop().expect("a merged run is one family");
-        let batch = rows.into_batch();
-        let mut start = 0;
-        (self.waiters.into_iter())
-            .map(|waiter| {
-                let range = (start, start + waiter.rows);
-                start += waiter.rows;
-                let rows = FamilyRows::Built(Batch::from_ranges(&batch, &[range], 0));
-                PendingWrite {
-                    families: vec![TxnFamily { tid, mode, rows, pk_rule }],
-                    waiter,
-                }
-            })
-            .collect()
     }
 
     /// Drop every client's table locks and answer it: [`CommitUnit::lsn`] for
     /// a laid unit, the error for a failed one.
     fn resolve(self, zone_lsn: u64) {
-        let result = match self.outcome {
-            Outcome::Laid { .. } => Ok(self.lsn(zone_lsn)),
-            Outcome::Failed(e) => Err(e),
-        };
-        for Waiter { done, held, .. } in self.waiters {
+        let lsn = self.lsn(zone_lsn);
+        let result = self.outcome.map(|_| lsn);
+        for PendingWrite { held, done, .. } in self.writes {
             drop(held);
             done.send(result.clone());
         }
@@ -390,54 +327,47 @@ impl CommitUnit {
 /// Build `s.units` from `s.writes`, in arrival order: one unit per write, but
 /// under `merge` a one-family write joins the unit of the last write before it
 /// to its table when that is a one-family write too, so it moves past only
-/// writes to other tables. A unit's batches stay in arrival order, which is
-/// what makes intra-batch last-insert-wins mean last *inserted*. No unit a
-/// write merges into is held to [`PkRule::Fresh`]: such a write holds its
-/// table's exclusive lock until its unit resolves, after this, so no other
-/// write to the table is in the batch.
+/// writes to other tables. A merged run's family holds its writes' batches in
+/// arrival order, which is what makes intra-batch last-insert-wins mean last
+/// *inserted*. No unit a write merges into is held to [`PkRule::Fresh`]: such
+/// a write holds its table's exclusive lock until its unit resolves, after
+/// this, so no other write to the table is in the batch.
 fn build_units(s: &mut CommitScratch, merge: bool) {
     s.units.reserve(s.writes.len());
-    for PendingWrite { families, waiter } in s.writes.drain(..) {
-        if let ([f], true) = (&families[..], merge) {
+    for write in s.writes.drain(..) {
+        if let ([f], true) = (&write.families[..], merge) {
             if let Some(&at) = s.last_unit.get(&f.tid) {
-                if matches!(s.units[at].laid(), [g] if g.tid == f.tid) {
-                    debug_assert!([f, &s.units[at].laid()[0]].iter().all(|g| g.pk_rule == PkRule::Enforce));
-                    s.units[at].waiters.push(waiter);
-                    s.tails[at].extend(families.into_iter().map(|f| f.rows));
+                let head = &s.units[at].writes[0].families;
+                if matches!(&head[..], [g] if g.tid == f.tid) {
+                    debug_assert!([f, &head[0]].iter().all(|g| g.pk_rule == PkRule::Enforce));
+                    s.units[at].writes.push(write);
                     continue;
                 }
             }
         }
-        for f in &families {
+        for f in &write.families {
             s.last_unit.insert(f.tid, s.units.len());
         }
         s.units.push(CommitUnit {
-            outcome: Outcome::Laid { families, in_zone: false },
-            waiters: smallvec![waiter],
+            writes: smallvec![write],
+            merged: None,
+            outcome: Ok(false),
         });
-        // A unit nothing merges into builds no `Vec`.
-        s.tails.push(Vec::new());
     }
     s.last_unit.clear();
-    for (unit, tail) in s.units.iter_mut().zip(s.tails.drain(..)) {
-        if tail.is_empty() {
-            continue;
-        }
-        let Outcome::Laid { families, .. } = &mut unit.outcome else {
-            unreachable!("no unit has been laid out yet")
-        };
-        let head = &mut families[0];
-        let first = head.rows.view();
-        let merged = Batch::concat(
-            first.schema(),
-            std::iter::once(first).chain(tail.iter().map(FamilyRows::view)),
+    for unit in &mut s.units {
+        let [head, _, ..] = &unit.writes[..] else { continue };
+        let head = &head.families[0];
+        let rows = Batch::concat(
+            head.rows.view().schema(),
+            unit.writes.iter().map(|w| w.families[0].rows.view()),
         );
-        head.rows = FamilyRows::Built(merged);
+        unit.merged = Some(Box::new(TxnFamily::new(head.tid, head.mode, FamilyRows::Built(rows))));
     }
 }
 
 /// Commit the batch of writes in `s.writes`. Lays out every group and queues
-/// their tids for the tick under one SAL hold, then raises the validation
+/// their tids for the tick under one SAL hold, then raises the FK presence
 /// caches and commit LSNs, and drops the writers' table locks as it answers
 /// them.
 ///
@@ -479,11 +409,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
                 Ok(())
             });
             match written {
-                Ok(()) => {
-                    if let Outcome::Laid { in_zone, .. } = &mut unit.outcome {
-                        *in_zone = unit_in_zone;
-                    }
-                }
+                Ok(()) => unit.outcome = Ok(unit_in_zone),
                 // A merged run goes again as the writes it merged; a unit of one
                 // write, if a checkpoint may make room for it. The unit was taken
                 // back, so the scope's next group starts where the unit did.
@@ -491,7 +417,7 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
                     refused_at = Some(at);
                     break;
                 }
-                Err(full) => unit.outcome = Outcome::Failed(full.into()),
+                Err(full) => unit.outcome = Err(full.into()),
             }
         }
         // Allocates only on the refusal path; `s.units` keeps the units that
@@ -514,21 +440,19 @@ async fn commit_writes(shared: &Shared, s: &mut CommitScratch, merge: bool) {
         (zone_lsn.unwrap_or(0), again)
     };
 
-    // The caches and commit LSNs, then the table locks. No OCC check of a
-    // later write to one of the tables runs before the raise. Such a write is
-    // laid out behind this batch, so the fdatasync that covers it covers this
-    // batch too.
+    // The FK presence caches and commit LSNs, then the table locks. No OCC
+    // check of a later write to one of the tables runs before the raise. Such a
+    // write is laid out behind this batch, so the fdatasync that covers it
+    // covers this batch too.
     for unit in s.units.drain(..) {
         let lsn = unit.lsn(zone_lsn);
         for f in unit.laid() {
-            shared.writes.committed(&shared.cat(), f.tid, f.rows.view(), lsn);
-            // After the raise, which is what a woken poll reads as staleness.
-            shared.feeds.wake(f.tid);
+            shared.writes.committed(f.tid, f.rows.view(), lsn);
         }
         unit.resolve(zone_lsn);
     }
     s.writes
-        .extend(again.into_iter().flatten().flat_map(CommitUnit::into_writes));
+        .extend(again.into_iter().flatten().flat_map(|unit| unit.writes));
 }
 
 #[cfg(test)]

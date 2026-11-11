@@ -25,9 +25,9 @@ fn forward_scan_sends_every_row_frame_in_worker_order() {
     writers[1].send_train_frame(req, true, None);
     want.extend(writers[2].send_train_frame(req, true, Some(&make_batch(&schema, &[(2, 1, 20)]))));
 
-    let (peer, partner) = Peer::over_socketpair(&reactor);
+    let (mut peer, partner) = Peer::over_socketpair(&reactor);
     reactor.block_on(async {
-        forward_scan(&peer, &lease).await.expect("healthy trains");
+        forward_scan(&mut peer, &lease).await.expect("healthy trains");
         peer.flush_egress().await.expect("the partner is open");
     });
     assert_eq!(read_nonblocking(&partner, 64 * 1024), Some(want));
@@ -44,10 +44,10 @@ fn forward_scan_stops_at_a_failed_send() {
     writers[0].send_train_frame(req, true, Some(&rows));
     writers[1].send_train_frame(req, true, Some(&rows));
 
-    let (peer, _partner) = Peer::over_socketpair(&reactor);
+    let (mut peer, _partner) = Peer::over_socketpair(&reactor);
     peer.close();
     reactor
-        .block_on(forward_scan(&peer, &lease))
+        .block_on(forward_scan(&mut peer, &lease))
         .expect("a gone peer is not a fault");
     assert_frame_still_parked(&lease, 1);
 }

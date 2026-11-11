@@ -49,11 +49,6 @@ impl UniqueFilter {
         spans.into_iter().all(|span| self.insert(span))
     }
 
-    /// Whether the cap has disabled the filter.
-    pub(super) fn is_capped(&self) -> bool {
-        self.values.is_none()
-    }
-
     /// A fingerprint probe: a collision, and every span once the filter has
     /// capped, answers true.
     pub(super) fn may_contain(&self, span: &[u8]) -> bool {
@@ -63,14 +58,58 @@ impl UniqueFilter {
     }
 }
 
+/// The spans a write's surviving rows hold in the unique index on `cols` of
+/// `tid` that its filter proved absent: what the write adds to the filter if
+/// it is admitted.
+pub(super) struct SpanClaim {
+    pub(super) tid: u64,
+    pub(super) cols: PkColList,
+    pub(super) absent: PkKeys,
+}
+
 impl Checks {
-    /// The spans of `keys` the filter for `(table_id, cols)` cannot prove
-    /// absent: all of them where it has none.
-    pub(super) fn unique_filter_retain_possible(&self, table_id: u64, cols: PkColList, mut keys: PkKeys) -> PkKeys {
-        if let Some(f) = self.unique_filters.borrow().get(&(table_id, cols)) {
-            keys.retain(|k| f.may_contain(k));
+    /// Record the spans of a write its validation admitted. Per PK, the row
+    /// validation finds surviving is the row the store keeps, so a filter holds
+    /// every span a committed row holds; it holds more after a delete, and
+    /// after a write its committer fails.
+    ///
+    /// No filter is built or dropped between a write's validation and its
+    /// commit: a warm scan runs under the table's write guard, which the write
+    /// holds until it is laid out, and a DDL seeds or removes a filter under
+    /// the catalog write guard, which the write's read guard keeps out. So the
+    /// filter each claim was taken against is still there.
+    pub(super) fn unique_filters_admit(&self, claims: &[SpanClaim]) {
+        let mut filters = self.unique_filters.borrow_mut();
+        for c in claims {
+            let filter = filters.get_mut(&(c.tid, c.cols)).expect("a claim's filter stays");
+            filter.insert_all(c.absent.iter());
         }
-        keys
+    }
+
+    /// Keep in `keys` the spans the filter for `(table_id, cols)` cannot prove
+    /// absent, all of them where it has none, and answer the ones it dropped
+    /// as the write's claim on the filter; `None` where it dropped none.
+    pub(super) fn unique_filter_retain_possible(
+        &self,
+        table_id: u64,
+        cols: PkColList,
+        keys: &mut PkKeys,
+    ) -> Option<SpanClaim> {
+        let filters = self.unique_filters.borrow();
+        let f = filters.get(&(table_id, cols))?;
+        let mut absent = Vec::new();
+        keys.retain(|k| {
+            let possible = f.may_contain(k);
+            if !possible {
+                absent.extend_from_slice(k);
+            }
+            possible
+        });
+        (!absent.is_empty()).then(|| SpanClaim {
+            tid: table_id,
+            cols,
+            absent: PkKeys::from_sorted(keys.stride(), absent),
+        })
     }
 
     /// Drop the filter for one index, leaving the table's other filters.
