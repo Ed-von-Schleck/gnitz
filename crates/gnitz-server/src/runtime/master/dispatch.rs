@@ -1,6 +1,6 @@
-//! The MasterDispatcher's writes: ACKed rounds (checkpoint halves, the boot-end
-//! stamp, backfill, tick) and the tick rounds they allocate, the DDL zone, push
-//! groups, and the backup round.
+//! The MasterDispatcher's writes: ACKed rounds (checkpoint halves, backfill,
+//! tick) and the tick rounds they allocate, the DDL zone, push groups, and the
+//! backup round.
 
 use super::route::with_routed;
 use super::*;
@@ -72,10 +72,12 @@ impl MasterDispatcher {
     /// the one the base round's rewind opened, or the boot's — and the SAL hold
     /// it is written under ends before its ACKs.
     ///
-    /// Once the ACKs are in, the round flushes the system tables: that makes a
-    /// boot's recorded topology durable only behind the stamps taken at it, and
-    /// puts a SERIAL reservation published since that rewind under the replay
-    /// floor.
+    /// Once the ACKs are in, the round flushes the system tables: that puts a
+    /// SERIAL reservation published since that rewind under the replay floor.
+    ///
+    /// A boot ends with this round alone: its workers published their base
+    /// stores during recovery, at the generation a replayed push advanced
+    /// pre-fork, and no push is admitted yet.
     pub(crate) async fn checkpoint_ephemeral(&self, alone: &WriteGuard<ApplyLock>) -> Result<(), WireFault> {
         let wait = {
             let mut excl = self.sal.lock().await;
@@ -89,19 +91,6 @@ impl MasterDispatcher {
         wait.acks().await;
         self.cat_mut().flush_all_system_tables()?;
         Ok(())
-    }
-
-    /// Boot-end checkpoint: record the launched topology, then stamp every
-    /// resumable view and every index at the durable generation, which a boot
-    /// that replayed a push advanced pre-fork. The workers published their base
-    /// stores during recovery, and no push is admitted yet.
-    pub(crate) async fn boot_checkpoint(&self, alone: &WriteGuard<ApplyLock>) -> Result<(), WireFault> {
-        {
-            let mut cat = self.cat_mut();
-            let width = cat.registry.slot().of;
-            cat.record_topology(width)?;
-        }
-        self.checkpoint_ephemeral(alone).await
     }
 
     // -----------------------------------------------------------------------

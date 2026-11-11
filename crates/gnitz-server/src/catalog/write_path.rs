@@ -5,6 +5,7 @@
 use gnitz_store::relation::PkRule;
 use gnitz_wire::{payload_u64, IdxTabRow, IdxTabSlot, PkColList, ViewTabSlot, WireFault};
 use gnitz_zset::repr::Batch;
+use rustc_hash::FxHashSet;
 
 use super::sys_tables::{pk_signatures, DdlBundle, IdSet, PkShape, SysFamily};
 use super::CatalogEngine;
@@ -145,7 +146,9 @@ impl CatalogEngine {
     /// Apply one `DDL_TXN` bundle, laying each group out through `sink` before it
     /// is applied, and answer what it did; the ids it created are spent. A bundle
     /// that fails is undone here: `Refused` leaves the catalog as it was, its ids
-    /// unspent.
+    /// unspent. Undoing a drop registers the relation again, with the rows its
+    /// directory holds: a master's own stores are none of a user relation's, but
+    /// a store-owning host loses that relation's unflushed rows.
     pub(crate) fn apply_bundle(
         &mut self,
         families: DdlBundle,
@@ -180,7 +183,7 @@ impl CatalogEngine {
         families: DdlBundle,
         zone: &mut Vec<ZoneGroup>,
         sink: &mut ZoneSink<'_>,
-    ) -> Result<Vec<u64>, WireFault> {
+    ) -> Result<FxHashSet<u64>, WireFault> {
         let created = self.precheck_bundle(&families)?;
         let mut ordered: Vec<(SysFamily, Batch)> = families.into_blocks().collect();
         if ordered.iter().all(|(_, b)| (0..b.len()).all(|i| b.get_weight(i) < 0)) {
@@ -235,6 +238,12 @@ impl CatalogEngine {
     /// Record that the system families hold every row of zone `zone_lsn`: every
     /// system flush after it records this floor.
     pub(crate) fn mark_zone_applied(&mut self, zone_lsn: u64) {
-        self.system_zone = self.system_zone.max(zone_lsn);
+        self.applied_zone = self.applied_zone.max(zone_lsn);
+    }
+
+    /// The newest zone the system families hold: their replay floor at the next
+    /// system flush.
+    pub(crate) fn applied_zone(&self) -> u64 {
+        self.applied_zone
     }
 }

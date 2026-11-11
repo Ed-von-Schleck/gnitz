@@ -148,7 +148,10 @@ impl Session {
     }
 
     /// Apply a DDL bundle, then fill every view it created and tick every
-    /// family a view scans, as the master does once the bundle is durable.
+    /// family a view scans, as the master does once the bundle is durable. A
+    /// bundle lands at the cut here, where a worker's DdlSync holds it above, so
+    /// the tick carries no rows: a view over a system family is maintained from
+    /// a DDL only against a server.
     fn ddl(&mut self, body: &[u8]) {
         let Ok(families) = ddl::decode_bundle(body) else { return };
         // The master refuses a unique index over rows a duplicate may be

@@ -244,7 +244,7 @@ fn a_log_refusal_of_add_column_leaves_the_schema() {
 }
 
 /// An ephemeral round flushes the system tables behind its ACKs: a sequence
-/// advance that reached the `sys_sequences` MemTable after the base round's
+/// advance that reached the `sequences` MemTable after the base round's
 /// flush is durable once the checkpoint has finished.
 #[test]
 fn an_ephemeral_round_flushes_a_memtable_only_sequence_advance() {
@@ -255,7 +255,7 @@ fn an_ephemeral_round_flushes_a_memtable_only_sequence_advance() {
         let mut engine = CatalogEngine::open(dir, 1).unwrap();
         user_seq = engine.create_serial_table("public.t").unwrap();
         // Reserve straight into the catalog — no SAL involved, so the advance
-        // lands ONLY in the sys_sequences MemTable.
+        // lands ONLY in the `sequences` MemTable.
         engine.reserve_user_sequence(user_seq, 64, &mut |_, _| Ok(())).unwrap();
 
         let (disp, _) = test_dispatcher(0, engine);
@@ -272,21 +272,23 @@ fn an_ephemeral_round_flushes_a_memtable_only_sequence_advance() {
     assert_eq!(
         engine.sequence_value(user_seq),
         Some(64),
-        "sys_sequences high-water must survive a crash right after the ephemeral round"
+        "the `sequences` high-water must survive a crash right after the ephemeral round"
     );
     engine.close();
 }
 
-/// The boot checkpoint's `FlushEph` is the last group of a checkpoint: at a
+/// An ephemeral round's `FlushEph` is the last group of a checkpoint: at a
 /// one-byte threshold, the log it leaves calls for no further one.
 #[test]
-fn the_boot_checkpoint_calls_for_no_other() {
+fn an_ephemeral_round_calls_for_no_other_checkpoint() {
     let (_tmp, engine) = empty_catalog();
     let (reactor, _) = reactor_with_rings(0);
     let sal = test_log(1 << 20, 0, 1).checkpoint_at(1);
     let disp = MasterDispatcher::new(engine, sal, reactor);
-    disp.reactor().block_on(disp.boot_checkpoint(&disp.alone())).unwrap();
-    assert!(disp.sal().cursor() > 0, "the boot checkpoint's group is in the log");
+    disp.reactor()
+        .block_on(disp.checkpoint_ephemeral(&disp.alone()))
+        .unwrap();
+    assert!(disp.sal().cursor() > 0, "the round's group is in the log");
     assert!(!disp.sal().needs_checkpoint());
 }
 
@@ -294,11 +296,11 @@ fn the_boot_checkpoint_calls_for_no_other() {
 /// owns the one generation bump that invalidates every checkpointed view, and
 /// makes it only when a push group was written since the last: without one the
 /// round moves no base store, and the views checkpointed at the generation in
-/// force stay valid. Neither the ephemeral round nor the boot checkpoint's
-/// restamp bumps.
+/// force stay valid. An ephemeral round never bumps, the one a boot ends with
+/// included.
 ///
-/// The base round alone moves the SAL into its next epoch: the ephemeral round
-/// and the boot checkpoint leave their groups in the epoch they were written in.
+/// The base round alone moves the SAL into its next epoch: an ephemeral round
+/// leaves its group in the epoch it was written in.
 #[test]
 fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
     let (_tmp, engine) = empty_catalog();
@@ -313,10 +315,7 @@ fn a_checkpoint_bumps_the_generation_once_iff_a_push_was_written() {
                 assert_eq!(disp.sal().epoch(), epoch + 1, "the base round's rewind");
                 assert_eq!(disp.sal().cursor(), 0);
                 disp.checkpoint_ephemeral(&alone).await?;
-                let behind = disp.sal().cursor();
-                assert!(behind > 0, "the ephemeral round's group stays in the log");
-                disp.boot_checkpoint(&alone).await?;
-                assert!(disp.sal().cursor() > behind);
+                assert!(disp.sal().cursor() > 0, "the ephemeral round's group stays in the log");
                 Ok::<(), WireFault>(())
             })
             .unwrap();

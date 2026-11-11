@@ -203,8 +203,8 @@ fn create_stream(engine: &mut CatalogEngine, name: &str, cols: &[CatalogColumn])
 /// `source` holds rows no SAL replay brings back, so a view reaching it must
 /// await a rebuild at reopen, and the verdict cascades to a view over that one.
 ///
-/// Every view here gets a matching topology and an output manifest at the
-/// committed generation, published by an ephemeral round that skips the filter
+/// Every view here gets an output manifest at the committed generation,
+/// published by an ephemeral round that skips the filter
 /// `flush_ephemeral_round` applies, so the `source` clause alone decides the
 /// verdict. A view over the base table `public.t` is the control: it resumes.
 fn assert_unreplayed_source_rebuilds_at_reopen(mut engine: CatalogEngine, source: u64, source_cols: &[CatalogColumn]) {
@@ -216,10 +216,9 @@ fn assert_unreplayed_source_rebuilds_at_reopen(mut engine: CatalogEngine, source
     let downstream = register_identity_view(&mut engine, direct, "v_downstream", source_cols);
     let over_table = register_identity_view(&mut engine, tid, "v_table", &cols);
 
-    // The two halves of the resume verdict, written the way a boot writes them,
-    // then every view's output store published through an ephemeral round at
+    // The generation advanced the way a boot advances it, then every view's
+    // output store published through an ephemeral round at
     // that generation — a completed checkpoint.
-    engine.record_topology(1).unwrap();
     let g = engine.advance_durable_generation().unwrap();
     engine.registry.checkpoint_ephemeral([], g, |_| true).unwrap();
     engine.close();
@@ -250,7 +249,6 @@ fn assert_round_publishes_nothing_reaching(mut engine: CatalogEngine, source: u6
     let downstream = traced_view(&mut engine, direct, "v_downstream", source_cols);
     let over_table = traced_view(&mut engine, tid, "v_table", &cols);
 
-    engine.record_topology(1).unwrap();
     let g = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g).unwrap();
 

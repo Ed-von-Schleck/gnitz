@@ -67,7 +67,7 @@ impl std::fmt::Display for RelRow<'_> {
 /// same refusals.
 pub(super) fn read_rel_row(family: SysFamily, batch: &Batch, row: usize) -> Result<RelRow<'_>, String> {
     let (noun, id) = (family.row_noun(), gnitz_wire::sys_leading_id(batch.get_pk_bytes(row)));
-    let unreadable = |e: String| format!("catalog invariant violated: {noun} (id={id}) {e}");
+    let unreadable = |e: String| format!("{noun} (id={id}) {e}");
     let (schema_id, name, parts) = match family {
         SysFamily::Table => {
             let r = TableTabRow::read(batch, row).map_err(unreadable)?;
@@ -81,7 +81,7 @@ pub(super) fn read_rel_row(family: SysFamily, batch: &Batch, row: usize) -> Resu
         }
         _ => unreachable!("{} is not a relation family", family.name()),
     };
-    let (pk, detail) = parts.map_err(|e| format!("catalog invariant violated: {noun} '{name}' (id={id}) {e}"))?;
+    let (pk, detail) = parts.map_err(|e| format!("{noun} '{name}' (id={id}) {e}"))?;
     Ok(RelRow { id, schema_id, name, pk, detail })
 }
 
@@ -195,12 +195,12 @@ impl DdlBundle {
     }
 
     /// How many families the bundle carries a block for.
-    pub(crate) fn family_count(&self) -> usize {
+    pub(in crate::catalog) fn family_count(&self) -> usize {
         self.0.iter().flatten().count()
     }
 
     /// The ids of the rows the bundle's `family` block creates.
-    pub(crate) fn creates(&self, family: SysFamily) -> impl Iterator<Item = u64> {
+    pub(in crate::catalog) fn creates(&self, family: SysFamily) -> impl Iterator<Item = u64> {
         let sigs = self.get(family).map(pk_signatures).unwrap_or_default();
         sigs.into_iter()
             .filter(|s| s.shape() == PkShape::Create)
@@ -227,7 +227,7 @@ impl DdlBundle {
     }
 
     /// The blocks in [`SysFamily::ALL`] order.
-    pub(crate) fn into_blocks(self) -> impl Iterator<Item = (SysFamily, Batch)> {
+    pub(in crate::catalog) fn into_blocks(self) -> impl Iterator<Item = (SysFamily, Batch)> {
         SysFamily::ALL
             .into_iter()
             .zip(self.0)
@@ -383,7 +383,11 @@ impl SysFamily {
                         schema_id: SYSTEM_SCHEMA_ID,
                         name: family.name().into(),
                         pk_col_idx: PkColList::from_slice(family.wire().pk_cols),
-                        flags: gnitz_wire::TableProps::default(),
+                        // As registered at open.
+                        flags: gnitz_wire::TableProps {
+                            distribution: gnitz_wire::TableDistribution::Replicated,
+                            ..Default::default()
+                        },
                     };
                     row.write(bb, 1);
                 }
@@ -399,7 +403,10 @@ impl SysFamily {
         }
     }
 
-    /// The families this family's hook reads, which are applied before it.
+    /// The families applied before this one: those whose rows its register hook
+    /// reads from the store (COL_TAB, CIRCUIT_TAB), whose registrations it reads
+    /// (an index's owner), or whose rows its precheck reads (a relation's
+    /// schema, which only a live bundle needs applied).
     const fn applies_after(self) -> &'static [SysFamily] {
         match self {
             SysFamily::Schema | SysFamily::Column | SysFamily::Circuit | SysFamily::Sequence => &[],
@@ -504,7 +511,7 @@ const _: () = {
         while d < deps.len() {
             assert!(
                 deps[d].index() < i,
-                "gnitz_wire::SYS_FAMILIES must order a family after every family its hook reads"
+                "gnitz_wire::SYS_FAMILIES must order a family after every family it applies after"
             );
             d += 1;
         }

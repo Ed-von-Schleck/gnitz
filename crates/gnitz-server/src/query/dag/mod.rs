@@ -75,6 +75,9 @@ pub(crate) struct DagEngine {
     /// Views the boot verdict ([`Self::decide_rebuild`]) rejected, closed under
     /// dependents and chains, each until its rebuild backfill starts.
     rebuild: FxHashSet<u64>,
+    /// The committed checkpoint generation the boot verdict was decided at:
+    /// the stamp a kept relation's rederived state resumes from.
+    pub(crate) resume_at: u64,
     /// The running tick's state; between ticks empty, kept for its capacity.
     tick: exec::TickRun,
 }
@@ -147,16 +150,22 @@ impl DagEngine {
         self.rebuild.contains(&id)
     }
 
+    /// The generation `id`'s rederived state resumes from at this boot's store
+    /// open, `None` when the verdict rebuilds it. Read before
+    /// [`Self::take_rebuild`].
+    pub(crate) fn resumes_at(&self, id: u64) -> Option<u64> {
+        (!self.awaits_rebuild(id)).then_some(self.resume_at)
+    }
+
     /// Decide which views this boot rebuilds rather than resumes — their
     /// checkpointed state, output stores and operator traces alike. A view is
     /// **valid** (resumed) iff:
-    ///   * `resume_at` is `Some`. It is `None` when the recorded topology (worker
-    ///     count, STATE_FORMAT) is not the launched one: every view rebuilds and
-    ///     no manifest is read;
     ///   * its output child and every trace child its compiled circuit declares
-    ///     are stamped with `resume_at`'s G, the committed checkpoint generation,
-    ///     which [`RelationRegistry::view_children_resumable`] answers. The
-    ///     durable generation is `G+1` before any store opens when the boot
+    ///     are stamped with `g`, the committed checkpoint generation, which
+    ///     [`RelationRegistry::view_children_resumable`] answers. A child is named
+    ///     by its worker's slot and stamped under the operator-state format, so
+    ///     one written at another worker count or format is none of these. The
+    ///     durable generation is past `g` before any store opens when the boot
     ///     replays a push; and
     ///   * every VIEW it scans is itself valid — else it could read a rebuilt
     ///     sibling's freshly-emptied output store; and
@@ -169,11 +178,7 @@ impl DagEngine {
     /// Each view's **local** validity is decided first (direct sources + child
     /// manifests), then [`Self::rebuilt_with`] propagates invalidity to any view
     /// scanning an invalid source and to the whole chain of any invalid view.
-    pub(crate) fn decide_rebuild(&mut self, registry: &RelationRegistry, resume_at: Option<u64>) {
-        let Some(g) = resume_at else {
-            self.rebuild = self.views.keys().copied().collect();
-            return;
-        };
+    pub(crate) fn decide_rebuild(&mut self, registry: &RelationRegistry, g: u64) {
         // A view over a stream or a system family needs no manifest read. An
         // unreadable manifest reads as a mismatch, the verdict a child whose
         // manifest a previous open erased must get: its siblings may still be at `g`.
@@ -186,6 +191,7 @@ impl DagEngine {
             .collect();
         invalid.extend(stale);
         self.rebuild = self.rebuilt_with(invalid);
+        self.resume_at = g;
     }
 
     /// The views every boot rebuilds whatever their stores hold: those a stream or

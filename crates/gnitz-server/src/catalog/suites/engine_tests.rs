@@ -141,21 +141,25 @@ fn test_boot_generation_advance_monotonic() {
     let dir = temp_dir("recovery_start_gen_bump");
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        engine.record_topology(1).unwrap();
-        assert_eq!(engine.advance_durable_generation().unwrap(), 1);
-        assert_eq!(engine.advance_durable_generation().unwrap(), 2);
+        let fresh = engine.durable_generation();
+        assert_eq!(engine.advance_durable_generation().unwrap(), fresh + 1);
+        assert_eq!(engine.advance_durable_generation().unwrap(), fresh + 2);
         engine.close();
     }
-    {
+    let recovered = {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        assert_eq!(engine.durable_generation(), 2);
-        assert_eq!(engine.advance_durable_generation().unwrap(), 3);
-        assert_eq!(engine.resume_at, Some(2));
-        assert_eq!(engine.advance_durable_generation().unwrap(), 4);
+        let recovered = engine.durable_generation();
+        assert_eq!(engine.advance_durable_generation().unwrap(), recovered + 1);
+        assert_eq!(
+            engine.dag.resume_at, recovered,
+            "the resume point stays the recovered generation"
+        );
+        assert_eq!(engine.advance_durable_generation().unwrap(), recovered + 2);
         engine.close();
-    }
+        recovered
+    };
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(engine.durable_generation(), 4);
+    assert_eq!(engine.durable_generation(), recovered + 2);
     finish(engine);
 }
 
@@ -248,7 +252,7 @@ fn test_sequence_gap_recovery() {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         engine.create_table("public.t1", &cols, &[0]).unwrap();
 
-        // Inject table record for tid=250 directly into sys_tables
+        // Inject table record for tid=250 directly into TABLE_TAB
         engine
             .registry
             .ingest(SysFamily::Table.id(), table_tab_batch(&[(250, "gap_table", 1)]))
@@ -387,18 +391,14 @@ fn the_newest_applied_zone_is_every_familys_replay_floor() {
     engine.mark_zone_applied(7);
     engine.create_table("z.t2", &cols, &[0]).unwrap();
     engine.mark_zone_applied(9);
-    assert_eq!(engine.system_zone, 9);
+    assert_eq!(engine.applied_zone, 9);
 
     engine.close();
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    let map = engine.registry.system_replay_floors();
-    assert!(map.contains_key(&gnitz_wire::TABLE_TAB));
-    assert!(map.keys().all(|&t| t < gnitz_wire::FIRST_USER_TABLE_ID));
-    assert!(
-        map.values().all(|&floor| floor == 9),
-        "every family flushed zone 9: {map:?}"
-    );
-    assert_eq!(engine.system_zone, 9);
+    for family in SysFamily::ALL {
+        assert_eq!(engine.replay_floor(family), 9, "{family:?} flushed zone 9");
+    }
+    assert_eq!(engine.applied_zone, 9);
 
     discard(engine);
 }
@@ -410,17 +410,18 @@ fn the_newest_applied_zone_is_every_familys_replay_floor() {
 #[test]
 fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
     let dir = temp_dir("catalog_ddl_sync_pin");
-    let mut unreplayed = CatalogEngine::open_master(&dir, 1, Default::default()).unwrap();
+    let boot = || {
+        let group = (SysFamily::Schema, 500, schema_tab_batch(&[(100, "synced", 1)]));
+        CatalogEngine::open_master(&dir, 1, Default::default(), [Ok(group)]).unwrap()
+    };
 
-    unreplayed
-        .stage(SysFamily::Schema, 500, schema_tab_batch(&[(100, "synced", 1)]))
-        .unwrap();
-
-    unreplayed.replay().unwrap().close();
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
-    let flushed = engine.registry.system_replay_floors()[&gnitz_wire::SCHEMA_TAB];
-    assert_eq!(flushed, 500, "the flushed SCHEMA_TAB must dedup the group at lsn 500");
-    assert!(engine.schema_id("synced").is_some());
+    boot().close();
+    let engine = boot();
+    assert_eq!(engine.replay_floor(SysFamily::Schema), 500);
+    let (weight, _) = engine
+        .sys_relation(SysFamily::Schema)
+        .live_row_at(&gnitz_wire::sys_key(100));
+    assert_eq!(weight, 1, "the group at the flushed floor is staged once");
 
     discard(engine);
 }
@@ -432,10 +433,7 @@ fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
 #[test]
 fn test_master_holds_no_user_store() {
     let dir = temp_dir("catalog_master_no_user_store");
-    let mut engine = CatalogEngine::open_master(&dir, 1, Default::default())
-        .unwrap()
-        .replay()
-        .unwrap();
+    let mut engine = CatalogEngine::open_master(&dir, 1, Default::default(), []).unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 

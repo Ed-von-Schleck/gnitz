@@ -4,9 +4,12 @@
 //!
 //! # Hook model
 //!
-//! Every system-table write flows through
-//! [`fire_hooks`](CatalogEngine::fire_hooks), which runs, per family, that family's
-//! register hook. A registration reads the relation's COL_TAB rows, and a view's
+//! Every DDL group — a bundle's on the master, a DdlSync's on a worker — is
+//! ingested and then run through [`fire_hooks`](CatalogEngine::fire_hooks),
+//! which runs, per family, that family's register hook; boot ingests the
+//! recovered groups hook-free and then fires each family's hook once over its
+//! whole store. `sequences` has no hook, and its writes fire none. A
+//! registration reads the relation's COL_TAB rows, and a view's
 //! its CIRCUIT_TAB row, from the store, so those families are applied first:
 //! [`SysFamily::ALL`] is the apply order — of a live bundle, of `replay_catalog`
 //! at boot — reversed for a bundle that only retracts, so a dependent is retired
@@ -41,7 +44,6 @@ use crate::query::DagEngine;
 use relations::CatalogCacheSet;
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
-pub(crate) use bootstrap::UnreplayedCatalog;
 pub(crate) use relations::{FkEdge, LockSet, RowConstraints};
 #[cfg(test)]
 pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
@@ -66,8 +68,8 @@ pub(crate) struct CatalogEngine {
     pub(in crate::catalog) caches: CatalogCacheSet,
 
     /// The next catalog object id (schema, relation or index) `allocate_ids`
-    /// hands out. Boot raises it past every stored id; the precheck admits no id
-    /// at or above it.
+    /// hands out. Boot raises it past every stored id; the precheck admits no
+    /// create at or above it.
     pub(in crate::catalog) next_id: u64,
     /// `next_id` as this boot's catalog replay left it: every id below it was
     /// handed out by an earlier boot, whose connections are gone.
@@ -78,9 +80,5 @@ pub(crate) struct CatalogEngine {
     pub(in crate::catalog) used_ids: FxHashSet<u64>,
     /// The newest SAL zone applied to the system families; every system flush
     /// records it as its replay floor.
-    pub(in crate::catalog) system_zone: u64,
-    /// The checkpoint generation this boot's rederived stores resume from: the
-    /// recovered one, or `None` when the recorded topology (worker count,
-    /// STATE_FORMAT) is not the launched one and nothing resumes.
-    pub(crate) resume_at: Option<u64>,
+    pub(in crate::catalog) applied_zone: u64,
 }

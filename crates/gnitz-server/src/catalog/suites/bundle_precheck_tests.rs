@@ -125,8 +125,7 @@ fn a_view_row_names_a_real_owner_and_a_canonical_name() {
     };
 
     let not_created = "is not a user view this bundle creates";
-    let with_option =
-        format!("catalog invariant violated: view '_seg' (id={vid}) is a chain segment carrying a WITH option");
+    let with_option = format!("view '_seg' (id={vid}) is a chain segment carrying a WITH option");
     for (rows, why) in [
         (&[(vid, "_seg", 999_999, 0)][..], not_created),
         (&[(vid, "_seg", table, 0)], not_created),
@@ -193,7 +192,8 @@ fn a_column_block_needs_an_owner_its_bundle_creates_or_the_catalog_holds() {
 /// pair on VIEW_TAB creates nothing.
 #[test]
 fn a_circuit_block_names_only_views_its_bundle_creates() {
-    let engine = fresh("bundle_circuit_owner");
+    let mut engine = fresh("bundle_circuit_owner");
+    engine.allocate_ids(16).unwrap();
     let views = |rows: &[(i64, u64)]| {
         let mut circuits = crate::test_support::circuit_batch(30, &negate_chain(16, 2));
         circuits.append_batch(&crate::test_support::circuit_batch(20, &negate_chain(16, 2)));

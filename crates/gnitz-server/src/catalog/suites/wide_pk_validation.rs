@@ -7,8 +7,9 @@ use gnitz_store::relation::RelationKind;
 use gnitz_wire::payload_u64;
 
 /// Register a wide-PK table owning a UNIQUE secondary index on col 3, seeded
-/// with `base_rows` of `(pk, weight, val)`. Bypasses `create_table`'s stride
-/// gate and the push path, so it does not exercise the enforcement path.
+/// with `base_rows` of `(pk, weight, val)`. Straight into the registry, with no
+/// catalog row and off the push path, so it does not exercise the enforcement
+/// path.
 fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24], i64, i64)]) {
     // `pk_stride` = 24 (wide): three U64 PK columns + one payload `val`.
     let schema = pk_payload_schema(&[TypeCode::U64; 3]);

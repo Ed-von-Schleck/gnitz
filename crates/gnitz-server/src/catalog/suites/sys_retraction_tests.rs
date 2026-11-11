@@ -54,7 +54,13 @@ fn a_write_must_retract_the_live_row_and_leave_one_or_none() {
             }
             bb.finish()
         };
-        for (leading, why) in [(id, "differs from the current one"), (unused, "no longer exists")] {
+        // The last is an id the counter has not reached: no rule of its own
+        // refuses its retraction, since no live row sits there.
+        for (leading, why) in [
+            (id, "differs from the current one"),
+            (unused, "no longer exists"),
+            (unused + 1, "no longer exists"),
+        ] {
             let err = engine.precheck_family(family, &retraction(leading)).unwrap_err();
             assert!(err.contains(why), "{family:?}: {err}");
         }

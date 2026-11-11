@@ -162,7 +162,8 @@ impl CatalogEngine {
             if SysFamily::from_id(id).is_some() {
                 continue;
             }
-            let rel = read_rel_row(family, batch, row)?;
+            // The precheck admitted the row, or a log or store handed it back.
+            let rel = read_rel_row(family, batch, row).map_err(|e| format!("catalog invariant violated: {e}"))?;
             // A view registers empty; the backfill, checkpoint resume or boot rebuild
             // fills it.
             self.register_relation(&rel).map_err(|e| format!("{rel} {e}"))?;

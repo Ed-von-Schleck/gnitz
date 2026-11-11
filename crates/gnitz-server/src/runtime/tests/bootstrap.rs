@@ -28,9 +28,8 @@ fn replicated() -> TableProps {
 /// Boot the database at `dir` as `slot`'s worker over `log`'s committed tail:
 /// the master's recovery and then the worker's, with no fork between them.
 fn boot(dir: &str, slot: Slot, log: &SalWriter) -> CatalogEngine {
-    let tail = CommittedTail::read(*log.log()).unwrap();
-    let opened = CatalogEngine::open_master(dir, slot.of, Default::default()).unwrap();
-    let mut engine = master_pre_fork_recovery(opened, &tail).unwrap();
+    let mut tail = CommittedTail::read(*log.log()).unwrap();
+    let mut engine = master_pre_fork_recovery(dir, slot.of, Default::default(), &mut tail).unwrap();
     worker_boot_recovery(&mut engine, &tail, slot).unwrap();
     engine
 }
@@ -211,7 +210,6 @@ fn a_tail_lands_above_the_cut_only_under_a_kept_view() {
     let kept = engine.create_table("public.kept", &u64_i64_cols(), &[0]).unwrap();
     let rejected = engine.create_table("public.rejected", &u64_i64_cols(), &[0]).unwrap();
     register_identity_view(&mut engine, kept, "v_kept", &u64_i64_cols());
-    engine.record_topology(slot.of).unwrap();
     let g = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g).unwrap();
     // Created after the checkpoint, so the boot rebuilds it.

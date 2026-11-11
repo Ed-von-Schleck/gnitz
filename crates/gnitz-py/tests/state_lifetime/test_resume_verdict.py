@@ -1,9 +1,9 @@
 """Resume or rebuild: which of the two a boot chooses, and that either answer
 leaves the view correct.
 
-A view resumes iff the recorded topology matches the launched `(worker_count,
-STATE_FORMAT)`, every one of its output children is at the committed generation,
-and every view it scans is itself valid; otherwise it is reset and rebuilt from
+A view resumes iff every one of its output children, each written by the
+launched worker count under the launched operator-state format, is at the
+committed generation, and every view it scans is itself valid; otherwise it is reset and rebuilt from
 base. Correctness alone cannot tell the two apart — a rebuild re-derives the view
 and silently repairs whatever the resume would have loaded — so every test here
 reads the boot's own `recovery: rebuilding N invalid view(s)` marker alongside

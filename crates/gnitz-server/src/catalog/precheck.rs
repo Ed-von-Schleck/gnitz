@@ -1,5 +1,8 @@
 //! Catalog precheck — the master's trust boundary against client-pushed
-//! system-table deltas.
+//! system-table deltas: row shape, the CAS against the stored row, and the
+//! catalog-level guards. A created view's circuit and the rules on what it
+//! scans are refused by its register hook, and `apply_bundle` undoes the
+//! bundle.
 use std::borrow::Cow;
 
 use gnitz_store::relation::{IndexClaim, Relation};
@@ -18,9 +21,9 @@ use super::sys_tables::{
 };
 use super::CatalogEngine;
 
-/// The name rule a catalog row must satisfy to be stored: a chain segment's
-/// name (`segment`) is `_` then `[A-Za-z0-9_]`, every other name a user
-/// identifier; and every one already canonical, since every name-index key is
+/// The name rule a schema, relation or index row must satisfy to be stored: a
+/// chain segment's name (`segment`) is `_` then `[A-Za-z0-9_]`, every other
+/// name a user identifier; and every one already canonical, since every name-index key is
 /// compared byte-wise against the client's folded form.
 fn check_stored_name(name: &str, noun: &str, segment: bool) -> Result<(), String> {
     if !segment {
@@ -64,24 +67,16 @@ fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), Str
     Ok(())
 }
 
-/// Bootstrap-owned ids sit below [`gnitz_wire::FIRST_USER_TABLE_ID`], and one at
-/// or above `next_id`, the id counter, was never allocated. Both are properties
-/// of the id space rather than of the mutation's shape, so they cover every sign:
-/// a `-1` drops a bootstrap row, a bare `+1` aliases a bootstrap id into the name
-/// indexes, and a pair renames one.
-fn check_id_range(family: SysFamily, sig: &PkSignature, next_id: u64) -> Result<(), String> {
-    let id = sig.leading;
-    if id < gnitz_wire::FIRST_USER_TABLE_ID {
+/// Bootstrap-owned ids sit below [`gnitz_wire::FIRST_USER_TABLE_ID`]. That is a
+/// property of the id space rather than of the mutation's shape, so it covers
+/// every sign: a `-1` drops a bootstrap row, a bare `+1` aliases a bootstrap id
+/// into the name indexes, and a pair renames one.
+fn check_bootstrap_id(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
+    if sig.leading < gnitz_wire::FIRST_USER_TABLE_ID {
         return Err(format!(
             "cannot {} a system {} ({})",
             sig.verb(),
             family.row_noun(),
-            family.pk_label(sig)
-        ));
-    }
-    if family.allocates_ids() && id >= next_id {
-        return Err(format!(
-            "{} was never allocated (next id {next_id})",
             family.pk_label(sig)
         ));
     }
@@ -129,9 +124,8 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
     Ok(())
 }
 
-/// The rules a system batch must satisfy on its own, before any store is read,
-/// with the id counter at `next_id`.
-fn check_batch_shape(family: SysFamily, batch: &Batch, next_id: u64) -> Result<Vec<PkSignature>, String> {
+/// The rules a system batch must satisfy on its own, before any store is read.
+fn check_batch_shape(family: SysFamily, batch: &Batch) -> Result<Vec<PkSignature>, String> {
     check_row_weights(family, batch)?;
     let sigs = pk_signatures(batch);
     for sig in &sigs {
@@ -143,7 +137,7 @@ fn check_batch_shape(family: SysFamily, batch: &Batch, next_id: u64) -> Result<V
                 family.pk_label(sig)
             ));
         }
-        check_id_range(family, sig, next_id)?;
+        check_bootstrap_id(family, sig)?;
         check_pair_fields(family, batch, sig)?;
     }
     Ok(sigs)
@@ -484,7 +478,7 @@ impl CatalogEngine {
     /// decide here whether it carries guards beyond the contract, rather than
     /// falling into a silent `_` arm.
     pub(in crate::catalog) fn precheck_family(&self, family: SysFamily, batch: &Batch) -> Result<IdSet, String> {
-        let sigs = check_batch_shape(family, batch, self.next_id)?;
+        let sigs = check_batch_shape(family, batch)?;
         for sig in &sigs {
             self.check_cas_and_net(family, batch, sig)?;
         }
@@ -503,7 +497,7 @@ impl CatalogEngine {
     /// can see, because each is prechecked against a catalog the bundle's other
     /// families have not reached yet. Run before the first family is applied, so
     /// a rejection has written nothing. Answers the ids the bundle creates.
-    pub(in crate::catalog) fn precheck_bundle(&self, families: &DdlBundle) -> Result<Vec<u64>, String> {
+    pub(in crate::catalog) fn precheck_bundle(&self, families: &DdlBundle) -> Result<FxHashSet<u64>, String> {
         let created = self.check_single_use(families)?;
         let created_views = IdSet::new(families.creates(SysFamily::View));
         if let Some(cols) = families.get(SysFamily::Column) {
@@ -520,24 +514,32 @@ impl CatalogEngine {
         Ok(created)
     }
 
-    /// A create takes its id once, across every family that allocates ids from
-    /// the one counter: an id an earlier boot handed out, one a committed bundle
-    /// of this process created, or one the bundle creates twice is refused. So an
-    /// id never names two objects, and a create never reopens a dropped
-    /// relation's store. Answers the bundle's created ids.
-    fn check_single_use(&self, families: &DdlBundle) -> Result<Vec<u64>, String> {
-        let mut created: Vec<u64> = Vec::new();
+    /// A create takes an id this boot allocated, once, across every family that
+    /// allocates ids from the one counter: an id the counter has not reached, one
+    /// an earlier boot handed out, one a committed bundle of this process
+    /// created, or one the bundle creates twice is refused. So an id never names
+    /// two objects, and a create never reopens a dropped relation's store. A
+    /// retraction needs no such rule: it names a live row, and none sits at or
+    /// above the counter. Answers the bundle's created ids.
+    fn check_single_use(&self, families: &DdlBundle) -> Result<FxHashSet<u64>, String> {
+        let mut created = FxHashSet::default();
         for family in SysFamily::ALL.into_iter().filter(|f| f.allocates_ids()) {
             for id in families.creates(family) {
+                if id >= self.next_id {
+                    return Err(format!(
+                        "{} {id} was never allocated (next id {})",
+                        family.row_noun(),
+                        self.next_id
+                    ));
+                }
                 // An id below the bootstrap floor is the shape check's refusal.
                 let earlier_boot = (gnitz_wire::FIRST_USER_TABLE_ID..self.id_floor).contains(&id);
-                if earlier_boot || self.used_ids.contains(&id) || created.contains(&id) {
+                if earlier_boot || self.used_ids.contains(&id) || !created.insert(id) {
                     return Err(format!(
                         "{} {id} was allocated before this boot or already used; ids are single-use",
                         family.row_noun()
                     ));
                 }
-                created.push(id);
             }
         }
         Ok(created)

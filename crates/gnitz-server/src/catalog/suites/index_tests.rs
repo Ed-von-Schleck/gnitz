@@ -92,7 +92,7 @@ fn test_failed_create_index_rolls_back() {
 }
 
 // ── drop_table cascades to owned indices ─────────────────────────────
-// A sys_indices row whose owner is gone fails the next boot's replay, leaving
+// A IDX_TAB row whose owner is gone fails the next boot's replay, leaving
 // the database un-openable.
 
 #[test]
@@ -149,7 +149,7 @@ fn test_drop_table_cascades_multiple_indices() {
     assert_eq!(
         owned_indices(&engine).len(),
         2,
-        "sys_indices must name both indices under the table"
+        "IDX_TAB must name both indices under the table"
     );
     let (name1, name2) = (
         make_secondary_index_name("public", "t", "val1"),
@@ -169,15 +169,15 @@ fn test_drop_table_cascades_multiple_indices() {
     assert!(!engine.has_index_by_name(&name2), "idx2 must be gone");
     assert!(
         owned_indices(&engine).is_empty(),
-        "sys_indices must name no index under the dropped table"
+        "IDX_TAB must name no index under the dropped table"
     );
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Index).cursor()),
         idx_count_before - 2,
-        "sys_indices must retract exactly two records"
+        "IDX_TAB must retract exactly two records"
     );
 
-    // Reopen: replay must succeed without orphaned sys_indices rows
+    // Reopen: replay must succeed without orphaned IDX_TAB rows
     let dir = engine.registry.base_dir().to_owned();
     engine.close();
     let engine2 = CatalogEngine::open(&dir, 1).unwrap();

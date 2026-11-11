@@ -5,7 +5,7 @@
 //! fsync.
 //!
 //! A DDL bundle additionally runs under [`DdlLocks`]. The serial path needs
-//! none of that: a `sys_sequences` advance has no DAG evaluation, and the row
+//! none of that: a `sequences` advance has no DAG evaluation, and the row
 //! it logs is one no worker reads.
 
 use super::validate::{self, UniqueFilter};

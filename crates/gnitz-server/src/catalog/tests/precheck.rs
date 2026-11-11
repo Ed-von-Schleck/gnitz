@@ -54,9 +54,6 @@ fn assert_verdict(got: Result<impl Sized, String>, want: &str, ctx: impl std::fm
 /// An id every family's range admits.
 const ID: u64 = 20;
 
-/// The id counter the shape rules run under.
-const NEXT_ID: u64 = 4096;
-
 /// That the shape rules refuse `family` rows `(leading id, weight, differing
 /// column)` with an error containing `want`, or pass them when `want` is `""`.
 /// Every row carries the same payload, except that a row's named column holds
@@ -71,7 +68,7 @@ fn assert_shape(family: SysFamily, rows: &[(u64, i64, &str)], want: &str) {
         });
     }
     assert_verdict(
-        check_batch_shape(family, &bb.finish(), NEXT_ID),
+        check_batch_shape(family, &bb.finish()),
         want,
         format_args!("{family:?} {rows:?}"),
     );
@@ -95,9 +92,8 @@ fn a_repeated_sign_on_one_pk_is_rejected() {
     }
 }
 
-/// The id space bounds every sign: below the floor is the bootstrap's, at or
-/// past the counter was never allocated. A family whose rows go only with their
-/// owner refuses any unpaired `-1` first.
+/// The id space bounds every sign: below the floor is the bootstrap's. A family
+/// whose rows go only with their owner refuses any unpaired `-1` first.
 #[test]
 fn an_id_is_checked_against_its_familys_range_and_owner() {
     let below = FIRST_USER_TABLE_ID - 1;
@@ -109,16 +105,12 @@ fn an_id_is_checked_against_its_familys_range_and_owner() {
                 or
             }
         };
-        let unallocated = if family.allocates_ids() { "never allocated" } else { "" };
         for (rows, want) in [
             (&[(FIRST_USER_TABLE_ID, 1, "")][..], ""),
-            (&[(NEXT_ID - 1, 1, "")], ""),
             (&[(ID, -1, "")], retract("")),
             (&[(below, 1, "")], "cannot CREATE a system"),
             (&[(below, -1, "")], retract("cannot DROP a system")),
             (&[(below, -1, ""), (below, 1, "name")], "cannot ALTER a system"),
-            (&[(NEXT_ID, 1, "")], unallocated),
-            (&[(NEXT_ID, -1, "")], retract(unallocated)),
         ] {
             assert_shape(family, rows, want);
         }

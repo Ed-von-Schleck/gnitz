@@ -157,15 +157,13 @@ fn index_resumed(engine: &CatalogEngine, tid: u64) -> bool {
 }
 
 /// `base_with_index`, plus the state a completed checkpoint leaves behind:
-/// the recorded topology — at `recorded_workers` workers — and generation the
-/// resume gate compares against, and the index published through an ephemeral
-/// round stamped at that generation. Returns `(table id, generation)`.
-fn checkpointed_table_with_index(dir: &str, recorded_workers: u32) -> (u64, u64) {
+/// the generation the resume gate compares against, and the index published
+/// through an ephemeral round stamped at that generation. Returns `(table id,
+/// generation)`.
+fn checkpointed_table_with_index(dir: &str) -> (u64, u64) {
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let tid = base_with_index(&mut engine);
 
-    // The two halves of the verdict, written the way a boot writes them.
-    engine.record_topology(recorded_workers).unwrap();
     let g = engine.advance_durable_generation().unwrap();
 
     // The index is the only rederived store this table owns, so the ephemeral
@@ -180,13 +178,10 @@ fn checkpointed_table_with_index(dir: &str, recorded_workers: u32) -> (u64, u64)
 #[test]
 fn index_rebuild_is_skipped_after_resume() {
     let dir = temp_dir("index_resume_skips_rebuild");
-    let (tid, g) = checkpointed_table_with_index(&dir, 1);
+    let (tid, g) = checkpointed_table_with_index(&dir);
 
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(
-        engine.resume_at == Some(g),
-        "a matching topology leaves the recovered generation as the whole verdict"
-    );
+    assert_eq!(engine.dag.resume_at, g, "the recovered generation is the resume point");
     assert!(
         index_resumed(&engine, tid),
         "a generation-valid index must resume from its checkpoint, not rebuild"
@@ -200,27 +195,26 @@ fn index_rebuild_is_skipped_after_resume() {
     finish(engine);
 }
 
-// ── index_rebuild_forced_by_topology_change ─────────────────────────────
-// The checkpoint recorded four workers and this boot launches one: the
-// generation matches, the topology does not.
+// ── index_rebuild_forced_by_worker_count_change ─────────────────────────
+// The checkpoint was taken at one worker and this boot launches two: the
+// generation matches, but the index it stamped is another slot's.
 #[test]
-fn index_rebuild_forced_by_topology_change() {
-    let dir = temp_dir("index_resume_topology_change");
-    let (tid, _g) = checkpointed_table_with_index(&dir, 4);
+fn index_rebuild_forced_by_worker_count_change() {
+    let dir = temp_dir("index_resume_worker_count_change");
+    let (tid, g) = checkpointed_table_with_index(&dir);
 
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(
-        engine.resume_at.is_none(),
-        "a foreign topology must refuse every manifest"
-    );
+    let engine = CatalogEngine::open(&dir, 2).unwrap();
+    assert_eq!(engine.dag.resume_at, g);
     assert!(
         !index_resumed(&engine, tid),
-        "a topology change must erase the index despite a matching generation"
+        "an index stamped at another worker count must not resume despite a matching generation"
     );
+    let share = net_weight(&engine, tid);
+    assert!(0 < share && share < N, "rank 0 of 2 holds a share of the base: {share}");
     assert_eq!(
         index_weight(&engine, tid),
-        N,
-        "the open's rebuild replaces the erased state, never adds to it"
+        share,
+        "the open's rebuild covers this rank's share of the base exactly once"
     );
 
     finish(engine);
@@ -248,7 +242,6 @@ fn checkpointed_traced_view(dir: &str) -> (u64, u64) {
 
     let vid = traced_view(&mut engine, tid, "v_traced", &cols);
 
-    engine.record_topology(1).unwrap();
     let g = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g).unwrap();
 
@@ -405,7 +398,6 @@ fn a_chain_resumes_or_rebuilds_as_one() {
         "a tick passes through it"
     );
 
-    engine.record_topology(1).unwrap();
     let g = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g).unwrap();
     engine.close();

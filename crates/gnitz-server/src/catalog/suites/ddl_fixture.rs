@@ -42,7 +42,7 @@ impl CatalogEngine {
         self.index_id_by_name(name).is_some()
     }
 
-    /// The ids of the live `sys_indices` rows `owner` owns.
+    /// The ids of the live IDX_TAB rows `owner` owns.
     pub(super) fn index_ids_of(&self, owner: u64) -> Vec<u64> {
         let rows = self.sys_rows_where(SysFamily::Index, |s, i| {
             payload_u64(s, i, IdxTabSlot::owner_id as usize) == owner

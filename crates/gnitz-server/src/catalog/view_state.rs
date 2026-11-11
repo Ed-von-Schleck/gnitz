@@ -20,12 +20,11 @@ impl CatalogEngine {
         )
     }
 
-    /// Open this process's stores: a relation's rederived state resumes at
-    /// `resume_at` unless the verdict rebuilds it.
+    /// Open this process's stores: a relation's rederived state resumes at the
+    /// boot verdict's generation unless the verdict rebuilds it.
     pub(crate) fn open_stores(&mut self, rank: u32, residency: Residency) -> Result<usize, String> {
-        let (resume_at, dag) = (self.resume_at, &self.dag);
-        self.registry
-            .open_stores(rank, residency, |id| resume_at.filter(|_| !dag.awaits_rebuild(id)))
+        let dag = &self.dag;
+        self.registry.open_stores(rank, residency, |id| dag.resumes_at(id))
     }
 
     /// The ephemeral checkpoint round: persist the operator traces, output store

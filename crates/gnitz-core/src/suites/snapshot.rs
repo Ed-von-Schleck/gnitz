@@ -306,6 +306,31 @@ fn a_backup_boots_as_the_server_stood_at_its_checkpoint() {
     assert_eq!(scan_all(&mut client, tid, &schema).len(), 1991);
 }
 
+/// A backup carries no log, so a server restored from one starts a log of its
+/// own: what it acknowledges survives its crash, its first DDL included.
+#[test]
+fn a_restored_backup_recovers_what_it_acknowledged() {
+    let srv = ServerHandle::start_with_backups(WORKERS, &[]);
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    let (_, tid, schema) = create_table(&mut client, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
+    push(&mut client, tid, &schema, rows(&schema, 0..2000));
+    block_on(client.backup("cut")).unwrap();
+
+    let mut restored = ServerHandle::start_on(&srv.backups().join("cut"), WORKERS);
+    let mut client = GnitzClient::connect(restored.sock_path()).unwrap();
+    let (sn, created, _) = create_table(&mut client, schema_of(&[("pk", TypeCode::U64), ("v", TypeCode::I64)]));
+    push(&mut client, created, &schema, rows(&schema, 0..10));
+    drop(client);
+
+    restored.restart().unwrap();
+    let mut client = GnitzClient::connect(restored.sock_path()).unwrap();
+    let recovered = block_on(client.resolve_relation(&rel(&sn, "t"))).unwrap();
+    assert_eq!(recovered.tid, created);
+    let want = weighted_rows(&rows(&schema, 0..10));
+    assert_eq!(weighted_rows(&scan_all(&mut client, created, &schema)), want);
+    assert_eq!(scan_all(&mut client, tid, &schema).len(), 2000);
+}
+
 /// A backup interrupted part-way leaves no entry under its name: its copy is
 /// made under another, which the entry's takes only once the copy is whole.
 #[test]

@@ -112,22 +112,19 @@ fn a_malformed_create_is_refused_at_the_precheck() {
 #[test]
 fn a_recovered_row_raises_the_id_counter_past_its_id() {
     let dir = temp_dir("atomicity_recovered_ids");
-    let mut unreplayed = CatalogEngine::open_master(&dir, 1, Default::default()).unwrap();
     let (sid, tail) = (
         gnitz_wire::FIRST_USER_TABLE_ID + 500,
         gnitz_wire::FIRST_USER_TABLE_ID + 900,
     );
-    unreplayed
-        .stage(SysFamily::Schema, 500, schema_tab_batch(&[(sid, "recovered", 1)]))
-        .unwrap();
-    let mut engine = unreplayed.replay().unwrap();
+    let boot = |lsn, id, name| {
+        let group = (SysFamily::Schema, lsn, schema_tab_batch(&[(id, name, 1)]));
+        CatalogEngine::open_master(&dir, 1, Default::default(), [Ok(group)]).unwrap()
+    };
+    let mut engine = boot(500, sid, "recovered");
     assert_eq!(engine.allocate_ids(1).unwrap(), sid + 1);
     drop(engine);
 
-    let mut unreplayed = CatalogEngine::open_master(&dir, 1, Default::default()).unwrap();
-    let schema = schema_tab_batch(&[(tail, "recovered_too", 1)]);
-    unreplayed.stage(SysFamily::Schema, 501, schema).unwrap();
-    assert_eq!(unreplayed.replay().unwrap().allocate_ids(1).unwrap(), tail + 1);
+    assert_eq!(boot(501, tail, "recovered_too").allocate_ids(1).unwrap(), tail + 1);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -245,17 +242,15 @@ fn ddl_txn_hook_failure_is_undone() {
 fn sequence_advances_leave_no_negative_ghost() {
     let mut engine = fresh("atomicity_seq_no_ghost");
 
-    // First use of every master scalar: the next id, the checkpoint generation
-    // and the topology word are all seeded on demand.
+    // First use of every master scalar: the next id and the checkpoint
+    // generation are both seeded on demand.
     engine.create_schema("s").unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     engine.create_table("s.t", &cols, &[0]).unwrap();
     engine.create_index("s.t", &["val"], false).unwrap();
-    engine.record_topology(1).unwrap();
     engine.advance_durable_generation().unwrap();
     // …and a second round, where each retraction now has a live row to cancel.
     engine.create_table("s.t2", &cols, &[0]).unwrap();
-    engine.record_topology(4).unwrap();
     engine.advance_durable_generation().unwrap();
 
     assert_eq!(

@@ -260,7 +260,9 @@ fn a_closed_committer_refuses_a_write_and_a_backup() {
         let [tid] = string_tables(&mut engine, ["public.t"]);
         let (shared, _asks) = workerless_committer(engine);
         let disp = &shared.dispatcher;
-        disp.reactor().block_on(disp.boot_checkpoint(&disp.alone())).unwrap();
+        disp.reactor()
+            .block_on(disp.checkpoint_ephemeral(&disp.alone()))
+            .unwrap();
         let write = || {
             let rows = FamilyRows::Built(sized_row(&shared, tid, None));
             let families = vec![TxnFamily::new(tid, WireConflictMode::Update, rows)];
@@ -297,7 +299,9 @@ fn a_settle_runs_the_checkpoint_that_is_due() {
         let (shared, _asks) = workerless_committer(engine);
         let disp = &shared.dispatcher;
         let sal = disp.sal();
-        disp.reactor().block_on(disp.boot_checkpoint(&disp.alone())).unwrap();
+        disp.reactor()
+            .block_on(disp.checkpoint_ephemeral(&disp.alone()))
+            .unwrap();
 
         let rows = FamilyRows::Built(sized_row(&shared, tid, Some(sal.push_room())));
         let families = vec![TxnFamily::new(tid, WireConflictMode::Update, rows)];
@@ -349,7 +353,9 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
 
         // No ephemeral round yet: the floor is offset 0.
         let limit = sal.push_room();
-        disp.reactor().block_on(disp.boot_checkpoint(&disp.alone())).unwrap();
+        disp.reactor()
+            .block_on(disp.checkpoint_ephemeral(&disp.alone()))
+            .unwrap();
         let room = sal.push_room();
         assert!(room < limit, "the boot checkpoint's group is in the log");
         commit(None).expect("a small write commits");
@@ -409,7 +415,9 @@ fn a_refused_merged_run_goes_again_as_its_writes() {
         let (shared, _asks) = workerless_committer(engine);
         let disp = &shared.dispatcher;
         let sal = disp.sal();
-        disp.reactor().block_on(disp.boot_checkpoint(&disp.alone())).unwrap();
+        disp.reactor()
+            .block_on(disp.checkpoint_ephemeral(&disp.alone()))
+            .unwrap();
         let room = sal.push_room();
 
         // Each fits behind a checkpoint, the two together in no log. The

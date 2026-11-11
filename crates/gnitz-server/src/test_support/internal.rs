@@ -475,10 +475,10 @@ impl CatalogEngine {
         Self::open_with(base_dir, num_workers, StoreConfig::from_env("GNITZ_"))
     }
 
-    /// [`Self::open_master`] and its replay, then the rest of a store-owning
+    /// [`Self::open_master`] over an empty log, then the rest of a store-owning
     /// boot, as a standalone host at rank 0.
     pub(crate) fn open_with(base_dir: &str, num_workers: u32, config: StoreConfig) -> Result<Self, String> {
-        let mut engine = Self::open_master(base_dir, num_workers, config)?.replay()?;
+        let mut engine = Self::open_master(base_dir, num_workers, config, [])?;
         engine.open_stores(0, gnitz_store::relation::Residency::Origin)?;
         Ok(engine)
     }

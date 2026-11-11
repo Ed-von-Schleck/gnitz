@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::num::NonZero;
 use std::os::fd::AsRawFd;
 
-use crate::catalog::{CatalogEngine, UnreplayedCatalog};
+use crate::catalog::{CatalogEngine, SysFamily};
 use gnitz_foundation::fault::Seam;
 
 use crate::runtime::affinity;
@@ -29,6 +29,7 @@ use crate::runtime::worker::WorkerProcess;
 use crate::runtime::ServerExit;
 use gnitz_store::relation::{PkRule, Residency, StoreConfig};
 use gnitz_zset::algebra::Slot;
+use gnitz_zset::repr::Batch;
 
 // ---------------------------------------------------------------------------
 // SAL recovery: both drivers below read the log through `sal::CommittedTail`
@@ -36,37 +37,21 @@ use gnitz_zset::algebra::Slot;
 // A group that does not decode, head or rows, fails the boot.
 // ---------------------------------------------------------------------------
 
-/// Stage every committed DdlSync group above its family's replay floor into the
-/// system stores.
-fn stage_system_tail(tail: &CommittedTail, catalog: &mut UnreplayedCatalog) -> Result<(), String> {
-    let floors = catalog.system_replay_floors();
-    let mut replayed: u32 = 0;
-    for group in tail.ingests() {
-        let (Ingest::DdlSync { family }, msg) = group? else {
-            continue;
+/// The tail's committed DdlSync groups, each with its LSN, in log order:
+/// what the catalog stages at open.
+fn system_tail(tail: &CommittedTail) -> impl Iterator<Item = Result<(SysFamily, u64, Batch), String>> + '_ {
+    tail.ingests().filter_map(move |group| {
+        let (family, msg) = match group {
+            Ok((Ingest::DdlSync { family }, msg)) => (family, msg),
+            Ok(_) => return None,
+            Err(e) => return Some(Err(e)),
         };
-        let lsn = tail.lsn(&msg);
-        if floors.get(&family.id()).is_none_or(|&floor| lsn <= floor) {
-            continue;
-        }
-        // A DdlSync group is shared: its one payload holds the rows.
-        let Some(batch) = msg.rows(msg.payloads().next().unwrap_or_default(), |_, _| None)? else {
-            continue;
-        };
-        // Master-validated rows that already carry a drop's children.
-        catalog.stage(family, lsn, batch).map_err(|e| {
-            format!(
-                "SAL system-table recovery apply failed (table_id={}, lsn={lsn}): {e}",
-                family.id()
-            )
-        })?;
-        replayed += 1;
-    }
-
-    if replayed > 0 {
-        gnitz_note!("SAL system table recovery: replayed {replayed} entries");
-    }
-    Ok(())
+        // A DdlSync group is shared: its one payload holds the rows, which the
+        // master validated and which already carry a drop's children.
+        msg.rows(msg.payloads().next().unwrap_or_default(), |_, _| None)
+            .map(|rows| Some((family, tail.lsn(&msg), rows?)))
+            .transpose()
+    })
 }
 
 /// `GNITZ_INJECT_RECOVERY_PANIC=<stage>`: panic when recovery reaches the named
@@ -168,7 +153,7 @@ fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: &CommittedTail, slot:
     // Before the master's boot rewind puts the write cursor back to 0: these rows
     // still live only in SAL entries a second crash would then overwrite.
     debug_assert!(
-        !tail.holds_pushes() || catalog.resume_at.is_none_or(|g| catalog.durable_generation() > g),
+        !tail.holds_pushes() || catalog.durable_generation() > catalog.dag.resume_at,
         "boot base flush of replayed pushes without the pre-fork generation advance ahead of it",
     );
     catalog
@@ -252,16 +237,23 @@ fn run_worker_child(
     WorkerProcess::new(catalog, sal_reader, w2m_writer, mesh).run()
 }
 
-/// The master's half of recovery before any worker exists: the catalog staged
-/// and replayed from the tail, and the system families made durable.
-fn master_pre_fork_recovery(mut opened: UnreplayedCatalog, tail: &CommittedTail) -> Result<CatalogEngine, String> {
-    stage_system_tail(tail, &mut opened)?;
-    let mut catalog = opened.replay().map_err(|e| format!("failed to replay catalog: {e}"))?;
+/// The master's half of recovery before any worker exists: the catalog opened
+/// over the tail's system groups, the system families made durable, and the
+/// boot's epoch raised above what they hold — every worker's drain starts at
+/// the epoch the writer does.
+fn master_pre_fork_recovery(
+    data_dir: &str,
+    num_workers: u32,
+    config: StoreConfig,
+    tail: &mut CommittedTail,
+) -> Result<CatalogEngine, String> {
+    let mut catalog = CatalogEngine::open_master(data_dir, num_workers, config, system_tail(tail))
+        .map_err(|e| format!("failed to open catalog: {e}"))?;
     if tail.holds_pushes() {
         // G → G+1, the resume point left at G: the workers' boot flush moves
-        // the base stores past what the views at G integrate, so until
-        // `boot_checkpoint` restamps at G+1 a crash rebuilds every view instead
-        // of resuming it.
+        // the base stores past what the views at G integrate, so until the
+        // boot's ephemeral round restamps at G+1 a crash rebuilds every view
+        // instead of resuming it.
         catalog.advance_durable_generation()?;
     } else {
         // No push is replayed, so every base store stays what the views at G
@@ -271,6 +263,7 @@ fn master_pre_fork_recovery(mut opened: UnreplayedCatalog, tail: &CommittedTail)
             .map_err(|e| format!("boot system flush failed: {e}"))?;
     }
     inject_recovery_panic("genbump");
+    tail.write_above(catalog.applied_zone());
     Ok(catalog)
 }
 
@@ -339,7 +332,7 @@ async fn master_post_fork_recovery(disp: &MasterDispatcher, pushed: BTreeSet<u64
     // A full checkpoint before the socket opens, so a clean restart resumes from
     // it. No drain — recovery already drained everything and no pushes are
     // admitted yet.
-    disp.boot_checkpoint(&alone)
+    disp.checkpoint_ephemeral(&alone)
         .await
         .map_err(|e| format!("boot checkpoint failed: {e}"))?;
     Ok(())
@@ -400,8 +393,6 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     // Held for the life of the process, from before any store opens; a forked
     // worker shares it.
     let _dir_lock = gnitz_store::relation::lock_data_dir(data_dir)?;
-    let opened = CatalogEngine::open_master(data_dir, num_workers, StoreConfig::from_env("GNITZ_"))
-        .map_err(|e| format!("failed to open catalog: {e}"))?;
     listen::clear_published(data_dir)?;
     // Ahead of recovery, so an identity that cannot be read or minted refuses
     // the boot before it costs one.
@@ -411,9 +402,9 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     // The template of `worker_log`.
     gnitz_note!("Worker logs: {}/worker_N.log (N=0..{})", data_dir, num_workers - 1);
 
-    // The committed tail every recovery replays, and the epoch the next writer
-    // epoch starts above. Read once, before the fork.
-    let tail = CommittedTail::open(data_dir)?;
+    // The committed tail every recovery replays, and the epoch this boot writes
+    // at. Read once, before the fork.
+    let mut tail = CommittedTail::open(data_dir)?;
     // The workers' parks, one W2M ring per worker, and the exchange mesh. None of
     // it is reclaimed on error: a failed boot exits the process, which returns
     // all of it to the kernel.
@@ -423,7 +414,7 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
         mesh::create(mesh::outbox_bytes(), parks).map_err(|e| format!("failed to map the exchange mesh: {e}"))?;
     let workers: Vec<(W2mWriter, Mesh)> = writers.into_iter().zip(meshes).collect();
 
-    let mut catalog = master_pre_fork_recovery(opened, &tail)?;
+    let mut catalog = master_pre_fork_recovery(data_dir, num_workers, StoreConfig::from_env("GNITZ_"), &mut tail)?;
 
     let workers = fork_workers(&mut catalog, data_dir, &tail, workers, pinning.as_ref())?;
 

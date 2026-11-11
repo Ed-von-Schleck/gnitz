@@ -174,16 +174,6 @@ impl RelationRegistry {
         Ok(filled)
     }
 
-    /// The system families' `table id → replay floor` their stores opened with:
-    /// the floors of the master's pre-fork SAL walk.
-    pub fn system_replay_floors(&self) -> std::collections::HashMap<u64, u64> {
-        self.relations
-            .iter()
-            .filter(|(_, entry)| entry.kind() == RelationKind::SystemCatalog)
-            .map(|(&id, entry)| (id, entry.loaded_mark().unwrap_or(0)))
-            .collect()
-    }
-
     /// This process's rows of a relation: its store and a fed view's feed. A
     /// view's rows resume from the manifest at `resume_at`, or are rebuilt.
     fn build_rows(&self, spec: RelationSpec, schema: SchemaDescriptor, resume_at: Option<u64>) -> Result<Rows, String> {

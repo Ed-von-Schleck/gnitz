@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use super::format::{epoch_word, next_epoch, SalMessageKind};
+use super::format::{epoch_word, next_epoch, word_epoch, SalMessageKind};
 use super::log::{SalLog, SalMessage};
 use super::reader::SalReader;
 use super::request::{Ingest, SalRequest};
@@ -16,13 +16,24 @@ pub(crate) struct CommittedTail {
     end: u64,
     /// The relations the tail's Push groups target.
     pushed: BTreeSet<u64>,
+    /// The epoch this boot writes and drains at.
+    live_epoch: u32,
 }
 
 impl CommittedTail {
-    /// Open `data_dir`'s SAL and read its tail; from here on, a fault on the
-    /// mapping reads no pages ahead ([`SalLog::advise_random`]).
+    /// Open `data_dir`'s SAL and read its tail, made durable before a boot acts
+    /// on it: a zone a crash left intact but unsynced is committed by the stores
+    /// the boot flushes it into. A tail without a zone has nothing to sync. From
+    /// here on, a fault on the mapping reads no pages ahead
+    /// ([`SalLog::advise_random`]).
     pub(crate) fn open(data_dir: &str) -> Result<Self, String> {
         let tail = Self::read(SalLog::open(data_dir)?)?;
+        if tail.end > 0 {
+            tail.log
+                .file
+                .sync_data()
+                .map_err(|e| format!("failed to sync the SAL tail: {e}"))?;
+        }
         tail.log.advise_random();
         Ok(tail)
     }
@@ -44,7 +55,21 @@ impl CommittedTail {
                 pushed.extend(zone.drain(..));
             }
         }
-        Ok(CommittedTail { log, epoch, end, pushed })
+        Ok(CommittedTail {
+            log,
+            epoch,
+            end,
+            pushed,
+            live_epoch: next_epoch(epoch),
+        })
+    }
+
+    /// Start this boot's epoch above `floor`'s too: the newest zone the system
+    /// stores hold, an LSN of the log they were flushed beside. That is this log
+    /// unless the data directory came without one, as a backup does, and a zone
+    /// written at or below a floor is one a later boot takes for flushed.
+    pub(crate) fn write_above(&mut self, floor: u64) {
+        self.live_epoch = self.live_epoch.max(next_epoch(word_epoch(floor)));
     }
 
     /// Whether a push committed since the last base round: this boot's replay
@@ -81,9 +106,9 @@ impl CommittedTail {
         self.log
     }
 
-    /// The epoch this boot writes and drains at: one above the tail's.
+    /// The epoch this boot writes and drains at: above the tail's.
     pub(super) fn live_epoch(&self) -> u32 {
-        next_epoch(self.epoch)
+        self.live_epoch
     }
 
     /// Every zone member below the committed end, in log order, undecoded.

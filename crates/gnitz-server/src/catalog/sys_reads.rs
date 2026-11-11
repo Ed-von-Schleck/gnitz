@@ -59,7 +59,7 @@ impl CatalogEngine {
         batch
     }
 
-    // -- Read column definitions from sys_columns --------------------------
+    // -- Read column definitions from COL_TAB ------------------------------
 
     /// Column definitions for `owner_id`, in key order.
     pub(in crate::catalog) fn read_column_defs(&self, owner_id: u64) -> Result<Vec<CatalogColumn>, String> {
@@ -94,8 +94,8 @@ impl CatalogEngine {
         Some(stored.name.into_owned())
     }
 
-    /// The qualified `(schema, name)` of `table_id` from its live `sys_tables` or
-    /// `sys_views` row; `"?"` for a part the catalog has no entry for.
+    /// The qualified `(schema, name)` of `table_id` from its live TABLE_TAB or
+    /// VIEW_TAB row; `"?"` for a part the catalog has no entry for.
     pub(crate) fn qualified_name_or_unknown(&self, table_id: u64) -> (String, String) {
         let Some(row) = self
             .live_sys_row(SysFamily::Table, table_id)
