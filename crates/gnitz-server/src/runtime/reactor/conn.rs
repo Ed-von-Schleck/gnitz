@@ -141,7 +141,7 @@ impl RecvBuf {
 
 /// Why a connection's recv side ended. Logged once, where the reactor retires
 /// the connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RecvEnd {
     /// EOF or a `close_notify`: the peer is done.
     PeerClosed,
@@ -155,6 +155,8 @@ pub(crate) enum RecvEnd {
     Alloc { len: usize },
     /// The bytes did not parse as this transport's framing.
     Protocol,
+    /// The connection's [`Session`] refused the bytes, for this reason.
+    Session(String),
 }
 
 impl std::fmt::Display for RecvEnd {
@@ -166,6 +168,7 @@ impl std::fmt::Display for RecvEnd {
             RecvEnd::CapBreach { want } => write!(f, "a {want}-byte frame would pass the inbound cap"),
             RecvEnd::Alloc { len } => write!(f, "a {len}-byte frame could not be allocated"),
             RecvEnd::Protocol => f.write_str("a framing violation"),
+            RecvEnd::Session(why) => write!(f, "the session refused the bytes: {why}"),
         }
     }
 }
@@ -268,13 +271,24 @@ pub(crate) struct Accepted {
     _slot: Charge,
 }
 
+/// How far a [`ClientConn`] has ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum End {
+    Open,
+    /// No frame is delivered any more; the socket stays open for what
+    /// [`Reactor::close`] sends.
+    Retired,
+    /// The socket is shut down: nothing is sent on it any more.
+    Shut,
+}
+
 /// One client connection: its socket and the frames deframed off it. The socket
 /// closes with the last holder, and every SQE naming it is queued through one.
 pub(crate) struct ClientConn {
     /// The socket and its place under the connection cap.
     sock: Accepted,
     q: RefCell<FrameSink>,
-    gone: Cell<bool>,
+    end: Cell<End>,
     /// `None` on a plain socket.
     session: Option<Rc<dyn Session>>,
 }
@@ -298,14 +312,14 @@ impl ClientConn {
 
     /// `shutdown(SHUT_RDWR)`: errors out a pending recv or send on the socket, which
     /// `close` would not. Never closes the fd; a peer already gone is not an error.
-    pub(crate) fn shutdown(&self) {
+    fn shutdown(&self) {
         // SAFETY: the connection's own fd, open while `self` lives; shutdown
         // reads or writes no memory.
         unsafe { libc::shutdown(self.fd(), libc::SHUT_RDWR) };
     }
 
     pub(crate) fn is_gone(&self) -> bool {
-        self.gone.get()
+        self.end.get() != End::Open
     }
 
     /// The client closed its sending side. Frames already queued are still
@@ -314,31 +328,29 @@ impl ClientConn {
         self.q.borrow_mut().frames.close();
     }
 
-    /// Finish the connection and discard the frames it queued. A session shuts
-    /// the socket down itself, once it has shipped what it owes.
-    pub(crate) fn retire(&self) {
-        if self.gone.replace(true) {
+    /// Finish the connection and discard the frames it queued. The socket stays
+    /// open for what [`Reactor::close`] sends before shutting it down.
+    fn retire(&self) {
+        if self.is_gone() {
             return;
         }
-        {
-            let mut q = self.q.borrow_mut();
-            q.frames.clear();
-            q.frames.close();
-        }
-        match &self.session {
-            Some(session) => session.retired(),
-            None => self.shutdown(),
-        }
+        self.end.set(End::Retired);
+        let mut q = self.q.borrow_mut();
+        q.frames.clear();
+        q.frames.close();
     }
 
-    /// [`Self::retire`], and shut the socket down now, session or none.
+    /// [`Self::retire`], and shut the socket down now: the client is owed
+    /// nothing more.
     pub(crate) fn fail(&self) {
         self.retire();
+        self.end.set(End::Shut);
         self.shutdown();
     }
 
-    /// Next frame, or `None` once the recv side has ended and is drained.
-    pub(crate) async fn recv(&self) -> Option<RecvBuf> {
+    /// Next frame, or `None` once the recv side has ended and is drained. What
+    /// a session owes the socket meanwhile is [`Reactor::recv`]'s to send.
+    async fn recv(&self) -> Option<RecvBuf> {
         std::future::poll_fn(|cx| self.q.borrow_mut().poll(cx)).await
     }
 
@@ -360,18 +372,27 @@ impl ClientConn {
     }
 }
 
-/// What sits between a connection's socket and its frames: it turns the bytes
-/// a recv lands into the plaintext the frames are deframed from, and sends on
-/// the socket outside requests. A plain socket has none: its bytes are the
-/// frames, and nothing is sent on it but replies.
+/// The codec between a connection's socket and its frames: it turns the bytes
+/// a recv lands into the plaintext the frames are deframed from, and the
+/// replies into the records the socket is sent. It does no I/O; the
+/// connection's one task sends every record, so they leave in the order they
+/// were sealed. A plain socket has none: its bytes are the frames.
 pub(crate) trait Session {
     /// `cipher`, the bytes one recv landed: hand their plaintext to `plain`, in
-    /// order, ending at its first refusal. Called inside the recv's completion,
-    /// so it sends nothing: what it then owes the socket is its own to ship.
+    /// order, ending at its first refusal.
     fn ingest(&self, cipher: &[u8], plain: &mut dyn FnMut(&[u8]) -> Result<(), RecvEnd>) -> Result<(), RecvEnd>;
-    /// The connection retired: ship what the socket is owed, then shut it down.
-    fn retired(&self);
+    /// Whether records no reply asked for await a [`Self::seal`]: a handshake
+    /// flight, or the alert that refuses what was ingested.
+    fn owes(&self) -> bool;
+    /// The records of all of `plain`, behind every record owed.
+    fn seal(&self, plain: &[u8]) -> PooledBuf;
+    /// The goodbye's records, behind every record owed.
+    fn close(&self) -> PooledBuf;
 }
+
+/// The most plaintext one [`Session::seal`] is handed, and so about how much
+/// one send under a session carries.
+const SEAL_TURN_BYTES: usize = 256 * 1024;
 
 /// Size of a plain connection's carry, which a recv lands in unless the
 /// deframer's payload in progress takes it.
@@ -519,7 +540,12 @@ impl Armed {
             Some(session) => {
                 // SAFETY: the caller's contract; the window was the carry.
                 let cipher = unsafe { carry[..n].assume_init_ref() };
-                session.ingest(cipher, &mut |plain| sink.feed(deframer, plain))
+                let ingested = session.ingest(cipher, &mut |plain| sink.feed(deframer, plain));
+                if session.owes() {
+                    // For [`Reactor::recv`], parked on the frames.
+                    sink.frames.wake();
+                }
+                ingested
             }
         }
     }
@@ -583,7 +609,7 @@ impl Reactor {
         let conn = Rc::new(ClientConn {
             sock: accepted,
             q: RefCell::new(FrameSink::new(Rc::clone(&self.conns.inbound))),
-            gone: Cell::new(false),
+            end: Cell::new(End::Open),
             session,
         });
         let mut recvs = self.conns.recvs.borrow_mut();
@@ -636,11 +662,13 @@ impl Reactor {
             self.conns.inbound.held(),
             self.conns.inbound.cap(),
         );
-        match end {
-            // A session may owe the client a reply to the violation.
-            RecvEnd::Protocol => armed.conn.retire(),
-            // Owed nothing, and possibly not reading.
-            _ => armed.conn.fail(),
+        // A session owing the client its alert leaves the socket to the
+        // connection's task, which sends it ahead of the shutdown. Otherwise the
+        // client is owed nothing, and possibly not reading.
+        if armed.conn.session.as_ref().is_some_and(|s| s.owes()) {
+            armed.conn.retire();
+        } else {
+            armed.conn.fail();
         }
     } // `armed` drops: the reactor's hold on the connection ends
 
@@ -669,15 +697,82 @@ impl Reactor {
         });
     }
 
+    /// The next frame on `conn`, or `None` once its recv side has ended and is
+    /// drained; sending meanwhile what its session owes the socket unasked, its
+    /// handshake flight or an alert.
+    ///
+    /// Not cancel-safe under a session: a future dropped mid-send leaves a
+    /// flight cut short, after which the connection can only
+    /// [`ClientConn::fail`].
+    pub(crate) async fn recv(&self, conn: &Rc<ClientConn>) -> Option<RecvBuf> {
+        let Some(session) = &conn.session else {
+            return conn.recv().await;
+        };
+        loop {
+            let frame = std::future::poll_fn(|cx| {
+                if session.owes() {
+                    return Poll::Ready(None);
+                }
+                conn.q.borrow_mut().poll(cx).map(Some)
+            })
+            .await;
+            match frame {
+                Some(frame) => return frame,
+                None => self.send_owned(conn, SendBody::Pooled(session.seal(&[]))).await.ok()?,
+            }
+        }
+    }
+
+    /// Send `body` on `conn`: as it is on a plain socket, sealed by the session
+    /// [`SEAL_TURN_BYTES`] a turn otherwise. Every turn but the last is sent
+    /// under [`SendBody::holding`], so no send waits on the client holding a
+    /// W2M slot whose ring was given back; the last is sent with `body`
+    /// dropped.
+    pub(crate) async fn send(&self, conn: &Rc<ClientConn>, mut body: SendBody) -> Result<(), PeerGone> {
+        let Some(session) = &conn.session else {
+            return self.send_owned(conn, body).await;
+        };
+        let len = body.bytes().len();
+        let mut off = 0;
+        loop {
+            if conn.is_gone() {
+                return Err(PeerGone);
+            }
+            let turn = (len - off).min(SEAL_TURN_BYTES);
+            let records = session.seal(&body.bytes()[off..off + turn]);
+            off += turn;
+            let sending = self.send_owned(conn, SendBody::Pooled(records));
+            if off == len {
+                drop(body);
+                return sending.await;
+            }
+            body.holding(sending).await?;
+        }
+    }
+
+    /// Finish `conn` and shut its socket down, behind its session's goodbye
+    /// and whatever else the session owes.
+    pub(crate) async fn close(&self, conn: &Rc<ClientConn>) {
+        conn.retire();
+        if let Some(session) = &conn.session {
+            let _ = self.send_owned(conn, SendBody::Pooled(session.close())).await;
+        }
+        conn.fail();
+    }
+
     /// Send `body`'s whole byte range on `conn`. Loops on short sends; each kernel
     /// send has its own `Limits::client_send_timeout` deadline, past which the
     /// client is evicted. A failed or evicted send finishes the connection
-    /// ([`ClientConn::fail`]). An empty body sends nothing.
+    /// ([`ClientConn::fail`]). An empty body sends nothing, and nothing is sent
+    /// on a socket already shut down.
     ///
     /// A W2M slot is sent from its ring until the ring is given back while a
     /// send waits on the client: that send is cancelled, the slot copied out,
     /// and the rest sent from the copy.
-    pub(crate) async fn send_owned(&self, conn: &Rc<ClientConn>, body: SendBody) -> Result<(), PeerGone> {
+    async fn send_owned(&self, conn: &Rc<ClientConn>, body: SendBody) -> Result<(), PeerGone> {
+        if conn.end.get() == End::Shut {
+            return Err(PeerGone);
+        }
         if body.bytes().is_empty() {
             return Ok(());
         }

@@ -70,8 +70,8 @@ Options:
                        minted into <data_dir>/tls_cert.pem (its key into
                        tls_key.pem, owner-only) and kept across boots: a client
                        trusts it with ca=<copy of tls_cert.pem>. Delete both
-                       files to mint a new one. A bind to one non-loopback
-                       address REQUIRES cert+key or --tls-name.
+                       files to mint a new one at the next boot. A bind to one
+                       non-loopback address REQUIRES cert+key or --tls-name.
   --tls-key=PEM        Server private key (see --tls-cert)
   --tls-name=NAME[,NAME...]
                        DNS names or IP addresses the minted certificate covers
@@ -103,8 +103,8 @@ Options:
                        does not. Start a server on an entry to restore it, at
                        any worker count. Without it BACKUP is refused.
   --new-token          Start no server: mint an access token named <name>,
-                       append its SHA-256 to <token_file> (created owner-only if
-                       absent) and print the token, which is kept nowhere else.
+                       append its SHA-256 to <token_file> (written anew, owner-
+                       only) and print the token, which is kept nowhere else.
   --disk-usage         Start no server: print what <data_dir> holds on disk, by
                        relation id, store and LSM level, with each shard
                        region's share and the shards two stores hold byte for
@@ -117,10 +117,11 @@ unrecognised argument is an error.
 
 Signals:
   SIGTERM, SIGINT  Checkpoint and stop.
-  SIGHUP           Reload the TLS listener: its certificate and key (a renewal),
-                   its client CA and its token file (a revocation), for the
-                   connections accepted from then on. A reload that fails keeps
-                   what is served and logs why.
+  SIGHUP           Reload the TLS listener: its --tls-cert and --tls-key (a
+                   renewal), its client CA and its token file (a revocation),
+                   for the connections accepted from then on. A minted
+                   certificate is read at boot alone. A reload that fails
+                   keeps what is served and logs why.
 
 Environment:
   A variable that is set to a value it cannot be read as stops the server;

@@ -184,7 +184,7 @@ async fn accept_loop(shared: Rc<Shared>, listener: ClientListener) {
     loop {
         let accepted = reactor.accept(fd.as_fd()).await;
         let served = tls.as_ref().map(|t| t.current());
-        let peer = Peer::new(&reactor, accepted, served.as_ref().map(|s| &s.cfg));
+        let peer = Peer::new(&reactor, accepted, served.as_ref().map(|s| s.session()));
         reactor.spawn(connection_loop(peer, Rc::clone(&shared), served));
     }
 }
@@ -193,7 +193,7 @@ async fn connection_loop(mut peer: Peer, shared: Rc<Shared>, served: Option<Rc<S
     serve_connection(&mut peer, &shared, served).await;
     // The one exit: ship what is corked, a refusal included, then retire the fd.
     let _ = peer.flush_egress().await;
-    peer.close();
+    peer.close().await;
 }
 
 /// One message is handled to completion before the next is received, so
@@ -205,7 +205,9 @@ async fn serve_connection(peer: &mut Peer, shared: &Rc<Shared>, served: Option<R
     let deadline = shared.dispatcher.reactor().sleep(shared.hello_timeout);
     match select2(handshake(peer, served), deadline).await {
         Either::A(true) => peer.admit_full_frames(),
-        Either::A(false) | Either::B(()) => return,
+        Either::A(false) => return,
+        // The deadline may have cut a session's handshake flight short.
+        Either::B(()) => return peer.abort(),
     }
 
     let mut subs = Subscriptions::default();

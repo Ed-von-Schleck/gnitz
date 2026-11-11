@@ -11,6 +11,7 @@ use gnitz_wire::ALPN_GNITZ;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::danger::ClientCertVerifier;
+use rustls::sign::{CertifiedKey, SingleCertAndKey};
 
 use super::tokens::{sha256, Tokens};
 
@@ -42,24 +43,33 @@ const LOOPBACK_NAMES: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 pub(super) const TLS_CERT_FILE: &str = "tls_cert.pem";
 pub(super) const TLS_KEY_FILE: &str = "tls_key.pem";
 
-/// What one load of a [`TlsArgs`] serves connections under.
+/// What a TLS listener serves connections under, between two reloads.
 pub(crate) struct Served {
-    pub(crate) cfg: Arc<rustls::ServerConfig>,
+    pub(super) cfg: Arc<rustls::ServerConfig>,
     /// `None`: no token is asked for.
     pub(crate) tokens: Option<Tokens>,
-    /// The served certificate's SHA-256, as `openssl x509 -fingerprint -sha256` prints it.
-    pub(super) fingerprint: String,
+    identity: Arc<CertifiedKey>,
 }
 
-/// [`TlsArgs`] the bind policy admits, every file of which loaded once.
-pub(crate) struct ResolvedTls(TlsArgs);
-
-#[cfg(test)]
-impl ResolvedTls {
-    /// `args`, past no bind policy and no load.
-    pub(crate) fn unchecked(args: TlsArgs) -> Self {
-        ResolvedTls(args)
+impl Served {
+    /// The served certificate's SHA-256, as `openssl x509 -fingerprint -sha256` prints it.
+    pub(super) fn fingerprint(&self) -> String {
+        sha256(&self.identity.cert[0]).map(|b| format!("{b:02X}")).join(":")
     }
+}
+
+/// What the files the flags name hold, at one read of them.
+struct Files {
+    /// `None` under [`CertSource::Minted`], which names no file.
+    identity: Option<Arc<CertifiedKey>>,
+    verifier: Option<Arc<dyn ClientCertVerifier>>,
+    tokens: Option<Tokens>,
+}
+
+/// [`TlsArgs`] the bind policy admits, and what their files held.
+pub(crate) struct ResolvedTls {
+    args: TlsArgs,
+    files: Files,
 }
 
 impl TlsArgs {
@@ -96,48 +106,20 @@ impl TlsArgs {
                 LOOPBACK_NAMES.join(", "),
             );
         }
-        // Every file the flags name is loaded once now, so one that does not
-        // load is refused as argv. A minted identity is the data directory's.
-        match &self.cert {
-            CertSource::Operator { cert, key } => drop(self.serve(operator_identity(cert, key)?)?),
-            CertSource::Minted(_) => {
-                self.client_ca.as_deref().map(client_verifier).transpose()?;
-                self.auth_tokens.as_deref().map(Tokens::load).transpose()?;
-            }
-        }
-        Ok(ResolvedTls(self))
+        // Read now, so a file that does not load is refused as argv.
+        let files = self.read()?;
+        Ok(ResolvedTls { args: self, files })
     }
 
-    /// Read every file the flags name, and the identity minted in `data_dir`
-    /// unless an operator's is named, into what connections are served under.
-    fn load(&self, data_dir: &str) -> Result<Served, String> {
-        let identity = match &self.cert {
-            CertSource::Operator { cert, key } => operator_identity(cert, key)?,
-            CertSource::Minted(names) => minted_identity(data_dir, names)?,
-        };
-        self.serve(identity)
-    }
-
-    /// What connections are served under with `identity`.
-    fn serve(&self, (chain, key): Identity) -> Result<Served, String> {
-        let fingerprint = sha256(&chain[0]).map(|b| format!("{b:02X}")).join(":");
-        let builder = rustls::ServerConfig::builder();
-        let auth = match &self.client_ca {
-            Some(path) => builder.with_client_cert_verifier(client_verifier(path)?),
-            None => builder.with_no_client_auth(),
-        };
-        let mut cfg = auth
-            .with_single_cert(chain, key)
-            .map_err(|e| format!("tls cert/key rejected: {e}"))?;
-        cfg.alpn_protocols = vec![ALPN_GNITZ.to_vec()];
-        // Connections are long-lived: resumption buys nothing.
-        cfg.send_tls13_tickets = 0;
-        // Early data is replayable.
-        cfg.max_early_data_size = 0;
-        Ok(Served {
-            cfg: Arc::new(cfg),
+    /// Read every file the flags name.
+    fn read(&self) -> Result<Files, String> {
+        Ok(Files {
+            identity: match &self.cert {
+                CertSource::Operator { cert, key } => Some(read_identity(cert, key)?),
+                CertSource::Minted(_) => None,
+            },
+            verifier: self.client_ca.as_deref().map(client_verifier).transpose()?,
             tokens: self.auth_tokens.as_deref().map(Tokens::load).transpose()?,
-            fingerprint,
         })
     }
 }
@@ -145,19 +127,37 @@ impl TlsArgs {
 /// A TLS listener's flags, and what its next connection is served under.
 pub(crate) struct TlsListener {
     args: TlsArgs,
-    data_dir: String,
     served: RefCell<Rc<Served>>,
 }
 
 impl TlsListener {
-    /// The first load of `args`.
-    pub(crate) fn open(ResolvedTls(args): ResolvedTls, data_dir: &str) -> Result<TlsListener, String> {
-        let served = args.load(data_dir)?;
-        Ok(TlsListener {
-            args,
-            data_dir: data_dir.to_string(),
-            served: RefCell::new(Rc::new(served)),
-        })
+    /// Serve what `resolved` read, under the identity minted in `data_dir`
+    /// where the flags name none.
+    pub(crate) fn open(ResolvedTls { args, mut files }: ResolvedTls, data_dir: &str) -> Result<TlsListener, String> {
+        let identity = match &args.cert {
+            CertSource::Minted(names) => minted_identity(data_dir, names)?,
+            CertSource::Operator { .. } => {
+                (files.identity.take()).expect("an operator's identity is read with its flags")
+            }
+        };
+        let served = RefCell::new(Rc::new(Self::serve(identity, files)));
+        Ok(TlsListener { args, served })
+    }
+
+    /// What connections are served under with `identity` and `files`.
+    fn serve(identity: Arc<CertifiedKey>, Files { verifier, tokens, .. }: Files) -> Served {
+        let builder = rustls::ServerConfig::builder();
+        let auth = match verifier {
+            Some(verifier) => builder.with_client_cert_verifier(verifier),
+            None => builder.with_no_client_auth(),
+        };
+        let mut cfg = auth.with_cert_resolver(Arc::new(SingleCertAndKey::from(Arc::clone(&identity))));
+        cfg.alpn_protocols = vec![ALPN_GNITZ.to_vec()];
+        // Connections are long-lived: resumption buys nothing.
+        cfg.send_tls13_tickets = 0;
+        // Early data is replayable.
+        cfg.max_early_data_size = 0;
+        Served { cfg: Arc::new(cfg), tokens, identity }
     }
 
     pub(crate) fn listen(&self) -> SocketAddr {
@@ -168,9 +168,12 @@ impl TlsListener {
         Rc::clone(&self.served.borrow())
     }
 
-    /// Load the flags' files again; a failed load keeps what is served.
+    /// Read the flags' files again; a failed read keeps what is served. A
+    /// minted identity is no flag's file, and stays the one read at the open.
     pub(crate) fn reload(&self) -> Result<(), String> {
-        let served = self.args.load(&self.data_dir)?;
+        let mut files = self.args.read()?;
+        let identity = (files.identity.take()).unwrap_or_else(|| Arc::clone(&self.current().identity));
+        let served = Self::serve(identity, files);
         *self.served.borrow_mut() = Rc::new(served);
         Ok(())
     }
@@ -186,15 +189,14 @@ impl TlsListener {
         };
         format!(
             "certificate SHA-256 {}; a client is authenticated by {auth}",
-            served.fingerprint
+            served.fingerprint()
         )
     }
 }
 
-type Identity = (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>);
-
-/// The operator's certificate chain and key, as `--tls-cert`/`--tls-key` name them.
-fn operator_identity(cert_path: &str, key_path: &str) -> Result<Identity, String> {
+/// The certificate chain and the key of two PEM files, the key matching the
+/// chain's first certificate.
+fn read_identity(cert_path: &str, key_path: &str) -> Result<Arc<CertifiedKey>, String> {
     let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
         .and_then(|it| it.collect())
         .map_err(|e| format!("tls cert {cert_path:?}: {e}"))?;
@@ -202,7 +204,9 @@ fn operator_identity(cert_path: &str, key_path: &str) -> Result<Identity, String
         return Err(format!("tls cert {cert_path:?}: no certificates"));
     }
     let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| format!("tls key {key_path:?}: {e}"))?;
-    Ok((chain, key))
+    CertifiedKey::from_der(chain, key, &rustls::crypto::ring::default_provider())
+        .map(Arc::new)
+        .map_err(|e| format!("tls cert/key rejected: {e}"))
 }
 
 /// The client certificate verifier `--tls-client-ca` names: a client
@@ -220,7 +224,7 @@ fn client_verifier(path: &str) -> Result<Arc<dyn ClientCertVerifier>, String> {
 
 /// The self-signed identity kept in `data_dir`, minted for [`LOOPBACK_NAMES`]
 /// and `names` when absent. Clients pin it, so a kept one is never replaced.
-fn minted_identity(data_dir: &str, names: &[ServerName<'static>]) -> Result<Identity, String> {
+fn minted_identity(data_dir: &str, names: &[ServerName<'static>]) -> Result<Arc<CertifiedKey>, String> {
     let cert_path = format!("{data_dir}/{TLS_CERT_FILE}");
     let key_path = format!("{data_dir}/{TLS_KEY_FILE}");
     let mut all: Vec<ServerName<'static>> = LOOPBACK_NAMES
@@ -236,15 +240,18 @@ fn minted_identity(data_dir: &str, names: &[ServerName<'static>]) -> Result<Iden
         let ck = rcgen::generate_simple_self_signed(sans.clone())
             .map_err(|e| format!("tls certificate mint failed: {e}"))?;
         // The certificate last: a crash leaves no certificate, which mints anew.
-        write_file(&key_path, ck.signing_key.serialize_pem().as_bytes(), 0o600)?;
-        write_file(&cert_path, ck.cert.pem().as_bytes(), 0o644)?;
+        let write = |path: &str, pem: String, mode| {
+            write_file_durable(path, pem.as_bytes(), mode).map_err(|e| format!("failed to write {path}: {e}"))
+        };
+        write(&key_path, ck.signing_key.serialize_pem(), 0o600)?;
+        write(&cert_path, ck.cert.pem(), 0o644)?;
         gnitz_note!(
             "TLS: minted a self-signed certificate for {}; a client trusts it with ca={cert_path}",
             sans.join(", ")
         );
     }
-    let identity = operator_identity(&cert_path, &key_path)?;
-    let leaf = rustls::server::ParsedCertificate::try_from(&identity.0[0])
+    let identity = read_identity(&cert_path, &key_path)?;
+    let leaf = rustls::server::ParsedCertificate::try_from(&identity.cert[0])
         .map_err(|e| format!("tls cert {cert_path:?}: {e}"))?;
     for name in &all {
         if rustls::client::verify_server_name(&leaf, name).is_err() {
@@ -257,9 +264,4 @@ fn minted_identity(data_dir: &str, names: &[ServerName<'static>]) -> Result<Iden
         }
     }
     Ok(identity)
-}
-
-/// [`write_file_durable`], its error in words.
-pub(super) fn write_file(path: &str, bytes: &[u8], mode: u32) -> Result<(), String> {
-    write_file_durable(path, bytes, mode).map_err(|e| format!("failed to write {path}: {e}"))
 }

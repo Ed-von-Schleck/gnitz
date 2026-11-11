@@ -78,7 +78,8 @@ impl<T> WakeQueue<T> {
         self.closed || !self.queue.is_empty()
     }
 
-    fn wake(&mut self) {
+    /// Wake the awaiter, if one is parked, with nothing queued for it.
+    pub(crate) fn wake(&mut self) {
         if let Some(w) = self.waker.take() {
             w.wake();
         }

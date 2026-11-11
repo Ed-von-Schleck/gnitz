@@ -75,7 +75,8 @@ fn reactor_pass_bench() {
     let r = make_reactor();
     let (conn, partner) = registered(&r);
     let frame = gnitz_wire::framed(b"x");
-    let recv = async move || drop(black_box(conn.recv().await.expect("a frame")));
+    let r2 = r.clone();
+    let recv = async move || drop(black_box(r2.recv(&conn).await.expect("a frame")));
     arm("recv", r, recv, || (&partner).write_all(&frame).expect("write"));
 
     for nw in [1, 4, 16] {

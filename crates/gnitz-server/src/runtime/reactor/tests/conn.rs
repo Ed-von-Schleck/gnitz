@@ -28,11 +28,17 @@ fn is_paused(r: &Reactor, conn: &Rc<ClientConn>) -> bool {
         .any(|&key| Rc::ptr_eq(&recvs[key].conn, conn))
 }
 
-/// A session whose plaintext is its ciphertext, and which leaves the socket
-/// open when its connection retires, counting the calls.
+/// A session whose records are its plaintext, sealed behind what it owes, and
+/// whose goodbye is [`Passthrough::BYE`].
 #[derive(Default)]
 struct Passthrough {
-    retired: Cell<u32>,
+    owed: RefCell<Vec<u8>>,
+    /// The length of every seal's plaintext.
+    sealed: RefCell<Vec<usize>>,
+}
+
+impl Passthrough {
+    const BYE: &[u8] = b"bye";
 }
 
 impl Session for Passthrough {
@@ -40,8 +46,20 @@ impl Session for Passthrough {
         plain(cipher)
     }
 
-    fn retired(&self) {
-        self.retired.set(self.retired.get() + 1);
+    fn owes(&self) -> bool {
+        !self.owed.borrow().is_empty()
+    }
+
+    fn seal(&self, plain: &[u8]) -> PooledBuf {
+        self.sealed.borrow_mut().push(plain.len());
+        let mut records = self.owed.take();
+        records.extend_from_slice(plain);
+        PooledBuf(records)
+    }
+
+    fn close(&self) -> PooledBuf {
+        self.owed.borrow_mut().extend_from_slice(Self::BYE);
+        self.seal(&[])
     }
 }
 
@@ -109,8 +127,7 @@ fn a_queue_deframes_until_a_header_refuses() {
 /// A refusal finishes the connection without delivering a frame: the frames
 /// ahead of it are discarded and refunded while the connection is still held,
 /// and the socket is shut down so the peer — and any task parked in a send to
-/// it — sees the end now. Both arms: a framing violation retires, a cap breach
-/// fails.
+/// it — sees the end now. A framing violation and a cap breach alike.
 #[test]
 fn a_refusal_discards_the_queue_and_shuts_the_socket_down() {
     for (cap, wire) in [
@@ -394,21 +411,17 @@ fn the_connection_cap_refuses_past_it_until_a_connection_ends() {
     registered(&r); // an ended connection frees its slot
 }
 
-/// Under a session, `retire` leaves the shutdown to it and tells it once;
-/// `fail` shuts the socket down now, session or none, which ends an armed recv
-/// — even one not yet submitted — so a silent peer cannot pin the connection.
+/// `retire` leaves the socket open; `fail` shuts it down now, which ends an
+/// armed recv — even one not yet submitted — so a silent peer cannot pin the
+/// connection.
 #[test]
-fn retire_defers_the_shutdown_to_the_session_and_fail_ends_the_recv() {
+fn retire_leaves_the_socket_open_and_fail_ends_the_recv() {
     let r = make_reactor();
-    let session = Rc::new(Passthrough::default());
-    let (accepted, partner) = accepted_pair(&r);
-    let conn = r.connect(accepted, Some(session.clone()));
+    let (conn, partner) = registered(&r);
 
     conn.retire();
-    assert_eq!(session.retired.get(), 1);
     assert_eq!(read_nonblocking(&partner, 1), None, "the socket stays open");
     conn.fail();
-    assert_eq!(session.retired.get(), 1, "a retired connection retires no more");
     assert_eq!(read_nonblocking(&partner, 1), Some(vec![]), "fail shuts it down");
     assert!(
         poll_until(&r, || Rc::strong_count(&conn) == 1),
@@ -421,9 +434,7 @@ fn retire_defers_the_shutdown_to_the_session_and_fail_ends_the_recv() {
 #[test]
 fn a_recv_landing_after_retire_is_discarded() {
     let r = make_reactor();
-    // Under a session, so `retire` leaves the socket open for the late bytes.
-    let (accepted, mut partner) = accepted_pair(&r);
-    let conn = r.connect(accepted, Some(Rc::new(Passthrough::default())));
+    let (conn, mut partner) = registered(&r);
     r.tick(); // the recv is submitted
 
     conn.retire();
@@ -438,6 +449,49 @@ fn a_recv_landing_after_retire_is_discarded() {
         Some(true),
         "the late frame was not queued"
     );
+}
+
+/// Under a session a recv sends what the session owes until the client's
+/// first frame, a send leaves sealed turn by turn, in order, and a close shuts
+/// the socket down behind the goodbye.
+#[test]
+fn a_session_seals_what_is_sent_and_closes_behind_its_goodbye() {
+    let r = make_reactor();
+    let session = Rc::new(Passthrough::default());
+    let (accepted, mut partner) = accepted_pair(&r);
+    let conn = r.connect(accepted, Some(session.clone()));
+
+    session.owed.borrow_mut().extend_from_slice(b"flight");
+    let received = Rc::new(Cell::new(false));
+    let (reactor, c, done) = (r.clone(), Rc::clone(&conn), Rc::clone(&received));
+    r.spawn(async move {
+        let frame = reactor.recv(&c).await.expect("the partner is open");
+        assert_eq!(frame.as_slice(), b"hello");
+        done.set(true);
+    });
+    assert!(poll_until(&r, || read_nonblocking(&partner, 64).is_some_and(|b| b == b"flight")));
+    assert!(!received.get(), "no frame is queued yet");
+    partner.write_all(&framed(b"hello")).expect("write");
+    assert!(poll_until(&r, || received.get()));
+
+    // Read concurrently: the body outgrows the socketpair's buffers.
+    let body: Vec<u8> = (0..2 * SEAL_TURN_BYTES + 5).map(|i| (i % 251) as u8).collect();
+    let (reactor, c, sent) = (r.clone(), Rc::clone(&conn), body.clone());
+    r.spawn(async move { reactor.send(&c, SendBody::Pooled(PooledBuf(sent))).await.expect("sent") });
+    let mut got = Vec::new();
+    assert!(poll_until(&r, || {
+        while let Some(bytes) = read_nonblocking(&partner, 64 * 1024) {
+            got.extend_from_slice(&bytes);
+        }
+        got.len() >= body.len()
+    }));
+    assert!(got == body, "the body arrives as it was sent");
+    // The flight, then the body.
+    assert_eq!(*session.sealed.borrow(), [0, SEAL_TURN_BYTES, SEAL_TURN_BYTES, 5]);
+
+    r.block_on(r.close(&conn));
+    assert_eq!(read_nonblocking(&partner, 64), Some(Passthrough::BYE.to_vec()));
+    assert_eq!(read_nonblocking(&partner, 1), Some(vec![]), "then the shutdown");
 }
 
 /// A payload far larger than the socket buffers completes across many short

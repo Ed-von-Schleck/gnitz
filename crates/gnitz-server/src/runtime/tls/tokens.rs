@@ -5,7 +5,7 @@ use ring::digest::{digest, SHA256};
 use ring::rand::{generate, SystemRandom};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::config::write_file;
+use gnitz_foundation::posix_io::write_file_durable;
 
 /// What every minted token opens with, so a secret scanner recognises a leaked one.
 const TOKEN_PREFIX: &str = "gnitz_";
@@ -101,14 +101,16 @@ fn parse(text: &str) -> Result<Tokens, String> {
     Ok(tokens)
 }
 
-/// Mint a token named `name` into the token file at `path`, created owner-only,
-/// and return it. A malformed file, or one holding `name`, is left unchanged.
+/// Mint a token named `name` into the token file at `path` and return it. The
+/// file is written anew, owner-only whatever its mode was. A malformed file,
+/// or one holding `name`, is left unchanged.
 pub(crate) fn mint(path: &str, name: &str) -> Result<String, String> {
     check_name(name)?;
+    let at = |e: &dyn std::fmt::Display| format!("auth tokens {path:?}: {e}");
     let mut text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("auth tokens {path:?}: {e}")),
+        Err(e) => return Err(at(&e)),
     };
     let secret: [u8; 32] = generate(&SystemRandom::new())
         .map_err(|_| "the OS random number generator failed".to_string())?
@@ -120,8 +122,8 @@ pub(crate) fn mint(path: &str, name: &str) -> Result<String, String> {
     }
     text += &format!("{name} {}\n", to_hex(&sha256(token.as_bytes())));
     // The file with the new line must load, which refuses a name already held.
-    parse(&text).map_err(|e| format!("auth tokens {path:?}: {e}"))?;
-    write_file(path, text.as_bytes(), 0o600)?;
+    parse(&text).map_err(|e| at(&e))?;
+    write_file_durable(path, text.as_bytes(), 0o600).map_err(|e| at(&e))?;
     Ok(token)
 }
 

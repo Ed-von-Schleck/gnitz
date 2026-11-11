@@ -45,7 +45,7 @@ fn forward_scan_stops_at_a_failed_send() {
     writers[1].send_train_frame(req, true, Some(&rows));
 
     let (mut peer, _partner) = Peer::over_socketpair(&reactor);
-    peer.close();
+    peer.abort();
     reactor
         .block_on(forward_scan(&mut peer, &lease))
         .expect("a gone peer is not a fault");

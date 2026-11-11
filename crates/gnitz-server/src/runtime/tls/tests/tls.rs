@@ -8,10 +8,11 @@
 //!
 //! Handshakes shuttle ciphertext between a rustls client and server in memory,
 //! the client verifying for real against the certificate it is told to trust.
-//! The session tests run a `TlsSession` over a socketpair.
+//! The session tests run a connection under a TLS session over a socketpair.
 
 use std::io::Read as _;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -19,7 +20,8 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use super::config::{TLS_CERT_FILE, TLS_KEY_FILE};
 use super::*;
 use crate::runtime::reactor::test_support::{accepted_pair, make_reactor, poll_until};
-use crate::runtime::test_support::read_nonblocking;
+use crate::runtime::reactor::{ClientConn, Reactor, SendBody};
+use crate::runtime::test_support::{read_nonblocking, within};
 
 const LOOPBACK: &str = "127.0.0.1:0";
 
@@ -105,15 +107,21 @@ fn a_minted_identity_is_served_and_kept() {
     assert_eq!((dev.cfg.send_tls13_tickets, dev.cfg.max_early_data_size), (0, 0));
     let (client, _) = handshake(&dev, &pem, "localhost").unwrap();
     assert_eq!(client.alpn_protocol(), Some(gnitz_wire::ALPN_GNITZ));
-    assert_eq!(dev.fingerprint.len(), 32 * 3 - 1, "{}", dev.fingerprint);
+    assert_eq!(dev.fingerprint().len(), 32 * 3 - 1, "{}", dev.fingerprint());
 
     let again = open_in(TlsArgs::on(LOOPBACK), &dir).unwrap().current();
-    assert_eq!(again.fingerprint, dev.fingerprint, "a kept identity is served again");
+    assert_eq!(again.fingerprint(), dev.fingerprint(), "a kept identity is served again");
 
-    // A key without its certificate, what a crash mid-mint leaves, mints a new identity.
+    // A key without its certificate is what a crash mid-mint leaves. A reload
+    // reads no minted identity; the next open mints a new one.
     std::fs::remove_file(dir.path().join(TLS_CERT_FILE)).unwrap();
-    let minted = open_in(TlsArgs::on(LOOPBACK), &dir).unwrap().current();
-    assert_ne!(minted.fingerprint, dev.fingerprint);
+    let kept = open_in(TlsArgs::on(LOOPBACK), &dir).unwrap();
+    assert_ne!(kept.current().fingerprint(), dev.fingerprint());
+    let minted = kept.current().fingerprint();
+    std::fs::remove_file(dir.path().join(TLS_CERT_FILE)).unwrap();
+    kept.reload().unwrap();
+    assert_eq!(kept.current().fingerprint(), minted);
+    assert!(!dir.path().join(TLS_CERT_FILE).exists(), "a reload mints nothing");
 }
 
 #[test]
@@ -246,14 +254,30 @@ fn plaintext_arrives_in_order_under_any_split_until_close_notify() {
     }
 }
 
-/// A TLS connection over one end of a socketpair and its session, the other
+/// A handshake message that outgrows rustls's buffer ends the recv side: no
+/// retry of the read can take the bytes behind it.
+#[test]
+fn a_handshake_message_past_the_buffer_is_refused() {
+    within(|| {
+        let (dev, _pem, _dir) = load_minted(TlsArgs::on(LOOPBACK));
+        // A ClientHello declaring 0xffff bytes, over four full handshake records.
+        let mut record = vec![0x16, 3, 3, 0x40, 0x00];
+        record.resize(5 + 16 * 1024, 0);
+        let mut cipher = record.repeat(4);
+        cipher[5..9].copy_from_slice(&[1, 0x00, 0xff, 0xff]);
+        let end = dev.session().ingest(&cipher, &mut |_| Ok(()));
+        assert_eq!(end, Err(RecvEnd::Oversize));
+    });
+}
+
+/// A connection under a TLS session over one end of a socketpair, the other
 /// end, which is the client's, and the PEM the client trusts.
-fn tls_over_socketpair() -> (Reactor, Rc<ClientConn>, Rc<TlsSession>, UnixStream, String) {
+fn tls_over_socketpair() -> (Reactor, Rc<ClientConn>, UnixStream, String) {
     let r = make_reactor();
     let (accepted, receiver) = accepted_pair(&r);
     let (served, pem, _dir) = load_minted(TlsArgs::on(LOOPBACK));
-    let (conn, tls) = TlsSession::start(&r, accepted, Arc::clone(&served.cfg));
-    (r, conn, tls, receiver, pem)
+    let conn = r.connect(accepted, Some(served.session()));
+    (r, conn, receiver, pem)
 }
 
 /// Tick until the client end reads EOF, returning every byte before it; `None`
@@ -280,7 +304,12 @@ const ALERT_HEADER: [u8; 5] = [0x15, 3, 3, 0, 2];
 /// before the EOF, and no close_notify behind it.
 #[test]
 fn a_protocol_error_reaches_the_client_as_one_fatal_alert() {
-    let (r, _conn, _tls, client, _) = tls_over_socketpair();
+    let (r, conn, client, _) = tls_over_socketpair();
+    let reactor = r.clone();
+    r.spawn(async move {
+        assert!(reactor.recv(&conn).await.is_none(), "no frame is delivered");
+        reactor.close(&conn).await;
+    });
     (&client).write_all(b"GET / HTTP/1.1\r\n\r\n").expect("write");
 
     let seen = read_until_eof(&r, &client).expect("the session ends");
@@ -293,10 +322,10 @@ fn a_protocol_error_reaches_the_client_as_one_fatal_alert() {
 /// A local close ships the close_notify, then shuts the socket down.
 #[test]
 fn a_tls_close_ships_close_notify_before_the_shutdown() {
-    let (r, conn, _tls, client, _) = tls_over_socketpair();
-    conn.retire();
+    let (r, conn, client, _) = tls_over_socketpair();
+    r.block_on(r.close(&conn));
 
-    let seen = read_until_eof(&r, &client).expect("the flusher shuts the socket down");
+    let seen = read_until_eof(&r, &client).expect("the close shuts the socket down");
     assert_eq!(
         seen,
         [&ALERT_HEADER[..], &[1, 0]].concat(),
@@ -321,27 +350,26 @@ fn exchange(fd: &UnixStream, client: &mut rustls::ClientConnection, got: &mut Ve
     }
 }
 
-/// The recv side and the flusher drive a handshake, and a body far past
-/// rustls's outgoing buffer reaches the client whole and in order.
+/// The connection's task drives the handshake up to the client's first frame,
+/// and a body of many seals reaches the client whole and in order.
 #[test]
-fn a_send_past_the_outgoing_buffer_reaches_the_client_whole() {
-    let (r, conn, tls, fd, pem) = tls_over_socketpair();
+fn a_send_of_many_seals_reaches_the_client_whole() {
+    let (r, conn, fd, pem) = tls_over_socketpair();
     let mut client = client_trusting(&pem, "localhost");
     let mut got = Vec::new();
+    let body: Vec<u8> = (0..1 << 20).map(|i| (i % 251) as u8).collect();
+    let (reactor, sent) = (r.clone(), body.clone());
+    r.spawn(async move {
+        reactor.recv(&conn).await.expect("the client's first frame");
+        let sent = SendBody::Pooled(PooledBuf(sent));
+        reactor.send(&conn, sent).await.expect("sent")
+    });
     let handshaken = poll_until(&r, || {
         exchange(&fd, &mut client, &mut got);
-        !client.is_handshaking() && !tls.sess.borrow().is_handshaking()
+        !client.is_handshaking()
     });
     assert!(handshaken, "the handshake completes");
-
-    let body: Vec<u8> = (0..1 << 20).map(|i| (i % 251) as u8).collect();
-    let (sender, reactor, sent) = (Rc::clone(&tls), r.clone(), body.clone());
-    r.spawn(async move {
-        sender
-            .send(&reactor, &conn, SendBody::Pooled(PooledBuf(sent)))
-            .await
-            .expect("sent")
-    });
+    client.writer().write_all(&gnitz_wire::framed(b"hello")).unwrap();
     let arrived = poll_until(&r, || {
         exchange(&fd, &mut client, &mut got);
         got.len() >= body.len()

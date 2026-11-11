@@ -1,16 +1,13 @@
-//! Transport-neutral client-connection handle. Both transports deframe into one
-//! [`ClientConn`], which also owns the connection's end; only sending dispatches
-//! on the transport.
+//! Transport-neutral client-connection handle: the cork over one
+//! [`ClientConn`], whose reactor sends and receives under either transport.
 
 #[cfg(test)]
 use std::cell::Cell;
 use std::future::Future;
 use std::rc::Rc;
-use std::sync::Arc;
 
-use crate::runtime::reactor::{Accepted, ClientConn, PeerGone, Reactor, RecvBuf, SendBody};
+use crate::runtime::reactor::{Accepted, ClientConn, PeerGone, Reactor, RecvBuf, SendBody, Session};
 use crate::runtime::sync::{select2, Either};
-use crate::runtime::tls::TlsSession;
 use gnitz_zset::repr::PooledBuf;
 
 /// Ceiling on a concatenation of client-bound frames (coalesced scan heads, corked
@@ -24,28 +21,18 @@ const COALESCE_MAX_BYTES: usize = 32 * 1024;
 pub(super) struct Peer {
     reactor: Reactor,
     conn: Rc<ClientConn>,
-    /// `None` on a plain socket, whose bytes the reactor sends directly.
-    tls: Option<Rc<TlsSession>>,
     /// Replies written but not yet sent, concatenated so a run of pipelined
     /// requests leaves as one send. `None` when nothing is pending.
     egress: Option<PooledBuf>,
 }
 
 impl Peer {
-    /// Build a connection over `accepted`, arm its recv and start serving it: a
-    /// TLS session under `tls`, the socket's own bytes otherwise.
-    pub(super) fn new(reactor: &Reactor, accepted: Accepted, tls: Option<&Arc<rustls::ServerConfig>>) -> Peer {
-        let (conn, tls) = match tls {
-            None => (reactor.connect(accepted, None), None),
-            Some(cfg) => {
-                let (conn, tls) = TlsSession::start(reactor, accepted, Arc::clone(cfg));
-                (conn, Some(tls))
-            }
-        };
+    /// Build a connection over `accepted` and arm its recv: under `session`,
+    /// or the socket's own bytes with none.
+    pub(super) fn new(reactor: &Reactor, accepted: Accepted, session: Option<Rc<dyn Session>>) -> Peer {
         Peer {
             reactor: reactor.clone(),
-            conn,
-            tls,
+            conn: reactor.connect(accepted, session),
             egress: None,
         }
     }
@@ -61,7 +48,8 @@ impl Peer {
     }
 
     /// The next request, shipping what is corked before parking on the client.
-    /// `None` once the client is gone or has sent its last request.
+    /// `None` once the client is gone or has sent its last request. Not
+    /// cancel-safe under a session: see [`Reactor::recv`].
     pub(super) async fn next_request(&mut self) -> Option<RecvBuf> {
         self.flush_if_full().await.ok()?;
         // Not `is_readable`: a client that closed its sending side is readable,
@@ -70,7 +58,7 @@ impl Peer {
             return Some(buf);
         }
         self.flush_egress().await.ok()?;
-        self.conn.recv().await
+        self.reactor.recv(&self.conn).await
     }
 
     /// What `waited` resolves to, or `None` once [`Self::next_request`] would
@@ -157,14 +145,17 @@ impl Peer {
     async fn send_raw(&self, body: SendBody) -> Result<(), PeerGone> {
         #[cfg(test)]
         SENDS.with(|n| n.set(n.get() + 1));
-        match &self.tls {
-            None => self.reactor.send_owned(&self.conn, body).await,
-            Some(t) => t.send(&self.reactor, &self.conn, body).await,
-        }
+        self.reactor.send(&self.conn, body).await
     }
 
-    pub(super) fn close(&self) {
-        self.conn.retire();
+    /// Finish the connection, the client told so.
+    pub(super) async fn close(&self) {
+        self.reactor.close(&self.conn).await;
+    }
+
+    /// Finish the connection now, the client owed nothing more.
+    pub(super) fn abort(&self) {
+        self.conn.fail();
     }
 }
 

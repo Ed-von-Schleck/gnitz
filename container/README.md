@@ -84,8 +84,9 @@ listener.
 - **Stopping.** `SIGTERM` drains, checkpoints and exits 0. Give it a stop timeout
   longer than the largest checkpoint you expect; the default (10 s for Docker, 30 s for
   Kubernetes) may be too short. A `SIGKILL` loses nothing that was acknowledged, but the
-  next boot replays the WAL tail. `docker kill -s HUP` reloads the TLS certificate, the
-  client CA and the token file.
+  next boot replays the WAL tail. `docker kill -s HUP` reloads `--tls-cert` and
+  `--tls-key`, the client CA and the token file; the minted certificate is read at boot
+  alone.
 - **Logs.** The master logs to stderr, which is what `docker logs` shows. Each worker
   logs to `/data/worker_<N>.log`.
 

@@ -19,8 +19,9 @@ pub const WIRE_VERSION: u32 = WIRE_EPOCH ^ ((SYS_SCHEMA_DIGEST ^ (SYS_SCHEMA_DIG
 /// A client's deadline over its connect, TLS handshake and HELLO exchange together.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// ALPN protocol both sides of the TLS transport pin; a mismatch fails the
-/// handshake.
+/// ALPN protocol both sides of the TLS transport offer: a peer offering only
+/// others fails the handshake. A client offering none is admitted, and judged
+/// by its HELLO.
 pub const ALPN_GNITZ: &[u8] = b"gnitz/1";
 
 /// What the first frame's payload in each direction opens with, in the one
