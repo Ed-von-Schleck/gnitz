@@ -86,18 +86,16 @@ fn ab(a: TypeCode) -> SchemaDescriptor {
 /// `10 ⋈ 11` on `10.a = 11.k`, 11 being `(k | w)`: 10 re-keyed onto `key`, a
 /// `distinct` in between where `distinct`, each side stating its key as its route.
 fn rekeyed_join(c: &mut Circuit, key: &[ReindexSlot], distinct: bool, kind: JoinKind) {
-    use gnitz_wire::{NullKeys, ReindexRole};
-    let role = |key: &[ReindexSlot]| ReindexRole::ScatterKey {
-        source_cols: key.iter().map(|slot| slot.0).collect(),
-    };
-    let (mut a, b) = (scan(c, 10), scan(c, 11));
+    use gnitz_wire::{NullKeys, ReadBound};
+    // Both sides pack at the one type the pair shares.
+    let b_key = [(0, key[0].1)];
+    let mut a = c.input_scattered(10, ReadBound::None, Some(key.to_vec()));
+    let b = c.input_scattered(11, ReadBound::None, Some(b_key.to_vec()));
     if distinct {
         a = c.distinct(a);
     }
-    let ra = c.map_reindex(a, key, &[1, 2], role(key), NullKeys::Drop);
-    // Both sides pack at the one type the pair shares.
-    let b_key = [(0, key[0].1)];
-    let rb = c.map_reindex(b, &b_key, &[1], role(&b_key), NullKeys::Drop);
+    let ra = c.map_reindex(a, key, &[1, 2], NullKeys::Drop);
+    let rb = c.map_reindex(b, &b_key, &[1], NullKeys::Drop);
     c.join([ra, rb], [ra, rb], kind);
 }
 
@@ -319,7 +317,7 @@ fn a_delta_is_relayed_only_where_it_is_not_already_in_place() {
         c.join([a, b], [a, b], JoinKind::Equi);
     };
     type Case = (&'static str, u32, [Source; 2], Build, (usize, usize));
-    let cases: [Case; 10] = [
+    let cases: [Case; 9] = [
         (
             "a shard on the key its scan's rows are placed by",
             4,
@@ -354,22 +352,6 @@ fn a_delta_is_relayed_only_where_it_is_not_already_in_place() {
             (1, 1),
         ),
         (
-            // The trim is a share of its own.
-            "a trimmed side emits a slice of the replica, not the replica",
-            4,
-            [replicated, keyed],
-            |c| {
-                let a = scan(c, 7);
-                let a = c.worker_filter(a);
-                let a = c.shard(a);
-                let b = scan(c, 9);
-                let b = c.negate(b);
-                let b = c.shard(b);
-                c.union(a, b);
-            },
-            (2, 1),
-        ),
-        (
             "a replica's share is one worker's rows: an exchange behind it takes a round",
             4,
             [replicated, keyed],
@@ -401,8 +383,8 @@ fn a_delta_is_relayed_only_where_it_is_not_already_in_place() {
             (2, 0),
         ),
         (
-            // Each source's relay runs, and so does the exchange.
-            "the output exchange behind a scan a join's relay moved off its owner",
+            // Each source's relay runs, and so does the reduce's exchange.
+            "a reduce's exchange behind a scan a join's relay moved off its owner",
             4,
             [keyed; 2],
             |c| {
@@ -420,9 +402,8 @@ fn a_delta_is_relayed_only_where_it_is_not_already_in_place() {
     }
 }
 
-/// The output exchange in front of a reduce moves nothing exactly where a walk
-/// back through row-local nodes ends at a scan whose rows are already placed by
-/// the reduce's group key.
+/// A reduce's co-location moves nothing exactly where a walk back through
+/// row-local nodes ends at a scan whose rows are already placed by its group key.
 #[test]
 fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_by_its_key() {
     let i64 = SchemaColumn::new(TypeCode::I64, false);
@@ -437,7 +418,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         let other = scan(c, 9);
         c.union(n, other)
     };
-    let cases: [(&str, Source, Stage, &[u32], bool); 14] = [
+    let cases: [(&str, Source, Stage, &[u32], bool); 13] = [
         ("a bare scan", pk_last, bare, &[2], true),
         ("a payload column", pk_last, bare, &[0], false),
         ("an empty key", pk_last, bare, &[], false),
@@ -487,22 +468,9 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
             pk_last,
             |c, n| {
                 let key = [(0, TypeCode::I64)];
-                c.map_reindex(
-                    n,
-                    &key,
-                    &[0],
-                    gnitz_wire::ReindexRole::Auxiliary,
-                    gnitz_wire::NullKeys::Keep,
-                )
+                c.map_reindex(n, &key, &[0], gnitz_wire::NullKeys::Keep)
             },
             &[0],
-            false,
-        ),
-        (
-            "a WorkerFilter is not a Filter",
-            pk_last,
-            |c, n| c.worker_filter(n),
-            &[2],
             false,
         ),
         ("a fan-in draws from two sources", pk_last, fan_in, &[2], false),
@@ -628,5 +596,97 @@ fn a_clamp_reads_its_sources_where_they_hold_its_history() {
             .ops()
             .filter(|op| matches!(op, Op::WeightClamp { hist: ClampHistory::Own(_), .. }));
         assert_eq!(own.count(), want, "{why}");
+    }
+}
+
+/// A scan reads the payload columns its readers can tell from zeroes: a filter
+/// and an exchange hand their rows on to readers of their own, a map and a
+/// reduce read the columns they name, and every other reader — the view's store
+/// among them — reads them all.
+#[test]
+fn a_scan_reads_the_columns_its_readers_name() {
+    use TypeCode::I64;
+    // PK column 0, then payload columns 1..=5 at payload bits 0..=4.
+    let schema = crate::test_support::u64_pk_schema(&[SchemaColumn::new(I64, false); 5]);
+    let cases: [(&str, Build, u64); 9] = [
+        ("the output", |c| _ = scan(c, 10), 0b11111),
+        (
+            "a map",
+            |c| {
+                let a = scan(c, 10);
+                map_copy(c, a, &[(2, I64)]);
+            },
+            0b00010,
+        ),
+        (
+            "a filter hands its rows on",
+            |c| {
+                let a = scan(c, 10);
+                let kept = c.filter(a, predicate(3));
+                map_copy(c, kept, &[(2, I64)]);
+            },
+            0b00110,
+        ),
+        (
+            "a filter the view stores",
+            |c| {
+                let a = scan(c, 10);
+                c.filter(a, predicate(3));
+            },
+            0b11111,
+        ),
+        (
+            "an exchange hands its rows on",
+            |c| {
+                let a = scan(c, 10);
+                let placed = c.shard(a);
+                map_copy(c, placed, &[(1, I64)]);
+            },
+            0b00001,
+        ),
+        (
+            "a reduce's group columns",
+            |c| {
+                let a = scan(c, 10);
+                c.reduce(a, count_by(&[4]));
+            },
+            0b01000,
+        ),
+        (
+            "a top-N keeps its rows",
+            |c| {
+                let a = scan(c, 10);
+                let by = gnitz_wire::OrderKey { col: 1, desc: false, nulls_first: false };
+                c.top_n(a, &[4], &[by], 3, 0);
+            },
+            0b11111,
+        ),
+        (
+            "two readers",
+            |c| {
+                let a = scan(c, 10);
+                let x = map_copy(c, a, &[(1, I64)]);
+                let y = map_copy(c, a, &[(5, I64)]);
+                c.union(x, y);
+            },
+            0b10001,
+        ),
+        (
+            "two scans of one source",
+            |c| {
+                let x = scan(c, 10);
+                let x = map_copy(c, x, &[(1, I64)]);
+                let y = scan(c, 10);
+                let y = map_copy(c, y, &[(2, I64)]);
+                c.union(x, y);
+            },
+            0b00011,
+        ),
+    ];
+    for (why, build, read) in cases {
+        let mut c = Circuit::default();
+        build(&mut c);
+        let out = compile(&c, &sources_at(Slot::new(0, 4), [(10, schema)]), false).expect(why);
+        assert_eq!(out.scan(10).read, read, "{why}: {:#07b}", out.scan(10).read);
     }
 }

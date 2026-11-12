@@ -37,7 +37,6 @@ wire_enum! {
         JoinCross = 14,
         ExchangeShard = 16,
         NullExtend = 17,
-        WorkerFilter = 18,
         /// Per-group top-N: the rows filling the first `limit` weight slots past
         /// `offset` of each group in ORDER BY order.
         TopN = 19,
@@ -49,7 +48,7 @@ wire_enum! {
 
 /// The layout of a `CIRCUIT_TAB` cell ([`Circuit::encode`]), folded into
 /// [`crate::SYS_SCHEMA_DIGEST`].
-pub(crate) const CIRCUIT_VERSION: u8 = 16;
+pub(crate) const CIRCUIT_VERSION: u8 = 19;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation
@@ -114,17 +113,6 @@ pub enum ClampKind {
     PositivePart,
 }
 
-/// Whether a reindex `Map` states the route of the source it reads.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReindexRole {
-    /// A re-key that states no route.
-    Auxiliary,
-    /// The columns, in the source whose scan the node reads, of the leading slots
-    /// of the Map's `key` that source's delta is scattered by — each at its key
-    /// slot's type; none broadcasts it.
-    ScatterKey { source_cols: Vec<u32> },
-}
-
 wire_enum! {
     /// What a reindex does with a row NULL in a key column. SQL 3VL: a NULL join key
     /// matches nothing, so a join's key re-key drops the row; a re-key whose NULL-keyed
@@ -151,7 +139,6 @@ pub enum MapKind {
     Reindex {
         keep: Vec<u32>,
         key: Vec<ReindexSlot>,
-        role: ReindexRole,
         nulls: NullKeys,
     },
     /// A projection of `cols`, each at its output column's type, keyed by a hash
@@ -164,10 +151,17 @@ pub enum MapKind {
 /// framing here only frames.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpNode {
-    /// Delta input for `source`, whose backfill scan `bound` narrows.
+    /// Delta input for `source`, whose backfill scan `bound` narrows. `scatter`
+    /// is the key the delta is co-located by before it enters the circuit: the
+    /// source's own columns, each at the type its slot is packed as. An empty
+    /// one hands every worker the whole delta. The key is the source's, not the
+    /// scan's: every scan of one source that states a key states the same one,
+    /// and a scan stating none enters under it too — where the source's store
+    /// places it only when no scan states one.
     ScanDelta {
         source: u64,
         bound: crate::ReadBound,
+        scatter: Option<Vec<ReindexSlot>>,
     },
     /// Expression predicate blob. "No `WHERE`" is spelled by emitting no node at
     /// all, so no absent cell can decode to a silent `WHERE TRUE`.
@@ -176,18 +170,21 @@ pub enum OpNode {
     Negate,
     Union,
     WeightClamp(ClampKind),
-    /// Over no group columns, behind an `ExchangeShard` it aggregates the whole
-    /// relation and owes one row over an empty input; with no exchange it
-    /// aggregates each worker's slice and owes none. Carries a `Count`; a
-    /// reduce without one is refused.
-    Reduce(GroupAggs),
+    /// Aggregates its input co-located by its group columns, or, `local`, each
+    /// worker's slice of it as that worker holds it. Over no group columns it
+    /// aggregates the whole relation and owes one row over an empty input; a
+    /// `local` one owes none. Carries a `Count`; a reduce without one is refused.
+    Reduce {
+        group: GroupAggs,
+        local: bool,
+    },
     /// The bilinear join of SQL sides A and B over slots `[ΔA, ΔB, iA, iB]`:
     /// `ΔA ⋈ z⁻¹(I(iB)) + ΔB ⋈ z⁻¹(I(iA))`, written `[key, A payload…, B
     /// payload…]`. A side's integrand is its delta, or the slice of it a worker
     /// keeps.
     Join(JoinKind),
-    /// Co-locates its input by the key of what reads it — the group columns of a
-    /// `Reduce`, `TopN` or `Window` reader, else the input's own PK.
+    /// Co-locates its input by the input's own PK: of rows every worker holds,
+    /// each worker keeps those whose PK it owns.
     ExchangeShard,
     /// Widen every row with NULL columns of `type_codes`, ahead of the input's
     /// payload under `nulls_first` and behind it otherwise — the side order an
@@ -196,11 +193,10 @@ pub enum OpNode {
         type_codes: Vec<TypeCode>,
         nulls_first: bool,
     },
-    /// Keep only the rows whose PK this worker owns.
-    WorkerFilter,
     /// Per-group top-N: for each `group_cols` value, the rows filling weight slots
     /// `offset .. offset + limit` of the group in `order`, each at the weight of
-    /// the slots it fills. Keyed like a `Reduce` over the same group set.
+    /// the slots it fills. Keyed like a `Reduce` over the same group set, and reads
+    /// its input co-located by it.
     TopN {
         group_cols: Vec<u32>,
         order: Vec<OrderKey>,
@@ -213,7 +209,7 @@ pub enum OpNode {
     /// `rank`, one more than the weight of the rows before the row's peers; then
     /// `dense_rank`, the number of peer groups up to and including the row's;
     /// then each of `aggs` over those rows, the peers included. Keyed like a
-    /// `Reduce` over the same group set.
+    /// `Reduce` over the same group set, and reads its input co-located by it.
     Window {
         group: GroupAggs,
         order: Vec<OrderKey>,
@@ -223,11 +219,10 @@ pub enum OpNode {
 }
 
 impl OpNode {
-    /// The columns of its input this operator groups by, for one that groups:
-    /// the key an [`OpNode::ExchangeShard`] in front of it co-locates by.
+    /// The columns of its input this operator groups by, for one that groups.
     pub fn group_cols(&self) -> Option<&[u32]> {
         match self {
-            OpNode::Reduce(GroupAggs { group_cols, .. })
+            OpNode::Reduce { group: GroupAggs { group_cols, .. }, .. }
             | OpNode::TopN { group_cols, .. }
             | OpNode::Window { group: GroupAggs { group_cols, .. }, .. } => Some(group_cols),
             OpNode::ScanDelta { .. }
@@ -238,9 +233,16 @@ impl OpNode {
             | OpNode::WeightClamp(_)
             | OpNode::Join(_)
             | OpNode::ExchangeShard
-            | OpNode::NullExtend { .. }
-            | OpNode::WorkerFilter => None,
+            | OpNode::NullExtend { .. } => None,
         }
+    }
+
+    /// The operator moves its input's rows between workers before it reads them.
+    pub fn exchanges(&self) -> bool {
+        matches!(
+            self,
+            OpNode::ExchangeShard | OpNode::Reduce { local: false, .. } | OpNode::TopN { .. } | OpNode::Window { .. }
+        )
     }
 
     /// How many input slots this operator is wired on.
@@ -254,10 +256,9 @@ impl OpNode {
             | OpNode::Map(_)
             | OpNode::Negate
             | OpNode::WeightClamp(_)
-            | OpNode::Reduce(_)
+            | OpNode::Reduce { .. }
             | OpNode::ExchangeShard
             | OpNode::NullExtend { .. }
-            | OpNode::WorkerFilter
             | OpNode::TopN { .. }
             | OpNode::Window { .. } => 1,
         }
@@ -266,22 +267,15 @@ impl OpNode {
     /// What holds of an operator under every schema.
     fn check(&self) -> Result<(), String> {
         match self {
-            OpNode::Map(MapKind::Reindex { key, role, .. }) => {
-                if key.is_empty() {
-                    return Err("a reindex names no key columns".into());
-                }
-                if let ReindexRole::ScatterKey { source_cols } = role {
-                    if source_cols.len() > key.len() {
-                        return Err("a scatter key is longer than its reindex key".into());
-                    }
-                }
+            OpNode::Map(MapKind::Reindex { key, .. }) if key.is_empty() => {
+                return Err("a reindex names no key columns".into());
             }
             // An empty list hashes no bytes, collapsing every row onto one PK.
             OpNode::Map(MapKind::HashRow { cols }) if cols.is_empty() => {
                 return Err("a hash-row map names no columns".into());
             }
             // The engine reads whether a group exists from its count.
-            OpNode::Reduce(g) if !g.aggs.iter().any(|d| d.agg_op == crate::AggFunc::Count) => {
+            OpNode::Reduce { group: g, .. } if !g.aggs.iter().any(|d| d.agg_op == crate::AggFunc::Count) => {
                 return Err("a reduce carries no COUNT(*)".into());
             }
             _ => {}
@@ -292,22 +286,24 @@ impl OpNode {
     /// The operator's tag, then its fields.
     fn write(&self, w: &mut Writer) {
         match self {
-            OpNode::ScanDelta { source, bound } => w.put(&Opcode::ScanDelta).u64(*source).put(bound),
+            OpNode::ScanDelta { source, bound, scatter } => {
+                w.put(&Opcode::ScanDelta).u64(*source).put(bound);
+                match scatter {
+                    None => w.bool(false),
+                    Some(key) => w.bool(true).list(key),
+                }
+            }
             OpNode::Filter(program) => w.put(&Opcode::Filter).bytes32(program),
             OpNode::Map(MapKind::Compute(map)) => w.put(&Opcode::MapExpr).put(map),
-            OpNode::Map(MapKind::Reindex { keep, key, role, nulls }) => {
-                w.put(&Opcode::MapReindex).put(nulls).list(key).list(keep);
-                match role {
-                    ReindexRole::Auxiliary => w.bool(false),
-                    ReindexRole::ScatterKey { source_cols } => w.bool(true).list(source_cols),
-                }
+            OpNode::Map(MapKind::Reindex { keep, key, nulls }) => {
+                w.put(&Opcode::MapReindex).put(nulls).list(key).list(keep)
             }
             OpNode::Map(MapKind::HashRow { cols }) => w.put(&Opcode::MapHashRow).list(cols),
             OpNode::Negate => w.put(&Opcode::Negate),
             OpNode::Union => w.put(&Opcode::Union),
             OpNode::WeightClamp(ClampKind::Distinct) => w.put(&Opcode::Distinct),
             OpNode::WeightClamp(ClampKind::PositivePart) => w.put(&Opcode::PositivePart),
-            OpNode::Reduce(g) => w.put(&Opcode::Reduce).put(g),
+            OpNode::Reduce { group, local } => w.put(&Opcode::Reduce).bool(*local).put(group),
             OpNode::Join(kind) => match kind {
                 JoinKind::Equi => w.put(&Opcode::JoinEqui),
                 JoinKind::Range { rel } => w.put(&Opcode::JoinRange).put(rel),
@@ -317,7 +313,6 @@ impl OpNode {
             OpNode::NullExtend { type_codes, nulls_first } => {
                 w.put(&Opcode::NullExtend).bool(*nulls_first).list(type_codes)
             }
-            OpNode::WorkerFilter => w.put(&Opcode::WorkerFilter),
             OpNode::TopN { group_cols, order, limit, offset } => w
                 .put(&Opcode::TopN)
                 .u64(*limit)
@@ -339,25 +334,31 @@ impl OpNode {
             r.list("slot list", MAX_COLUMNS)
         }
         Ok(match r.get::<Opcode>()? {
-            Opcode::ScanDelta => OpNode::ScanDelta { source: r.u64()?, bound: r.get()? },
+            Opcode::ScanDelta => {
+                let (source, bound) = (r.u64()?, r.get()?);
+                let scatter = match r.bool()? {
+                    false => None,
+                    true => Some(slots(r)?),
+                };
+                OpNode::ScanDelta { source, bound, scatter }
+            }
             Opcode::Filter => OpNode::Filter(r.bytes32()?.to_vec()),
             Opcode::MapExpr => OpNode::Map(MapKind::Compute(r.get()?)),
             Opcode::MapReindex => {
                 let nulls = r.get()?;
                 let key = slots(r)?;
                 let keep = col_list(r)?;
-                let role = match r.bool()? {
-                    false => ReindexRole::Auxiliary,
-                    true => ReindexRole::ScatterKey { source_cols: col_list(r)? },
-                };
-                OpNode::Map(MapKind::Reindex { keep, key, role, nulls })
+                OpNode::Map(MapKind::Reindex { keep, key, nulls })
             }
             Opcode::MapHashRow => OpNode::Map(MapKind::HashRow { cols: slots(r)? }),
             Opcode::Negate => OpNode::Negate,
             Opcode::Union => OpNode::Union,
             Opcode::Distinct => OpNode::WeightClamp(ClampKind::Distinct),
             Opcode::PositivePart => OpNode::WeightClamp(ClampKind::PositivePart),
-            Opcode::Reduce => OpNode::Reduce(r.get()?),
+            Opcode::Reduce => {
+                let local = r.bool()?;
+                OpNode::Reduce { group: r.get()?, local }
+            }
             Opcode::JoinEqui => OpNode::Join(JoinKind::Equi),
             Opcode::JoinRange => OpNode::Join(JoinKind::Range { rel: r.get()? }),
             Opcode::JoinCross => OpNode::Join(JoinKind::Cross),
@@ -367,7 +368,6 @@ impl OpNode {
                 let type_codes = r.list("type list", MAX_COLUMNS)?;
                 OpNode::NullExtend { type_codes, nulls_first }
             }
-            Opcode::WorkerFilter => OpNode::WorkerFilter,
             Opcode::TopN => {
                 let limit = r.u64()?;
                 let offset = r.u64()?;
@@ -496,10 +496,9 @@ impl Circuit {
     }
 
     /// `nid` is a reduce that owes a row over an empty input: one over no group
-    /// columns reading an `ExchangeShard`.
+    /// columns that is not `local`.
     pub fn owes_ground_row(&self, nid: NodeId) -> bool {
-        matches!(self.op(nid), OpNode::Reduce(g) if g.group_cols.is_empty())
-            && matches!(self.op(self.inputs(nid)[0]), OpNode::ExchangeShard)
+        matches!(self.op(nid), OpNode::Reduce { group, local: false } if group.group_cols.is_empty())
     }
 
     /// Every relation the circuit scans, once per scan.
@@ -526,7 +525,18 @@ impl Circuit {
     /// A source's delta input. `bound` narrows only the source's backfill scan,
     /// never the rows the view holds, so the caller still emits the full `Filter`.
     pub fn input_delta(&mut self, source: u64, bound: crate::ReadBound) -> NodeId {
-        self.add(OpNode::ScanDelta { source, bound }, &[])
+        self.input_scattered(source, bound, None)
+    }
+
+    /// [`Self::input_delta`], the delta co-located by `scatter` — see
+    /// [`OpNode::ScanDelta`].
+    pub fn input_scattered(
+        &mut self,
+        source: u64,
+        bound: crate::ReadBound,
+        scatter: Option<Vec<ReindexSlot>>,
+    ) -> NodeId {
+        self.add(OpNode::ScanDelta { source, bound, scatter }, &[])
     }
 
     /// [`OpNode::Filter`] over an encoded predicate program.
@@ -540,18 +550,10 @@ impl Circuit {
     }
 
     /// [`MapKind::Reindex`].
-    pub fn map_reindex(
-        &mut self,
-        input: NodeId,
-        key: &[ReindexSlot],
-        keep: &[u32],
-        role: ReindexRole,
-        nulls: NullKeys,
-    ) -> NodeId {
+    pub fn map_reindex(&mut self, input: NodeId, key: &[ReindexSlot], keep: &[u32], nulls: NullKeys) -> NodeId {
         let op = OpNode::Map(MapKind::Reindex {
             keep: keep.to_vec(),
             key: key.to_vec(),
-            role,
             nulls,
         });
         self.add(op, &[input])
@@ -597,37 +599,30 @@ impl Circuit {
         self.add(OpNode::Join(kind), &[da, db, ia, ib])
     }
 
-    /// [`OpNode::WorkerFilter`].
-    pub fn worker_filter(&mut self, input: NodeId) -> NodeId {
-        self.add(OpNode::WorkerFilter, &[input])
+    /// [`OpNode::Reduce`] over `input` co-located by its group columns. Over no
+    /// group columns it owes a row over an empty input.
+    pub fn reduce(&mut self, input: NodeId, group: GroupAggs) -> NodeId {
+        self.add(OpNode::Reduce { group, local: false }, &[input])
     }
 
-    /// [`OpNode::Reduce`] behind an [`OpNode::ExchangeShard`] on its group columns.
-    /// Over no group columns it owes a row over an empty input.
-    pub fn reduce(&mut self, input: NodeId, agg: GroupAggs) -> NodeId {
-        let sharded = self.shard(input);
-        self.reduce_local(sharded, agg)
+    /// A `local` [`OpNode::Reduce`]: it aggregates `input` as each worker holds
+    /// it, and emits nothing over an empty input.
+    pub fn reduce_local(&mut self, input: NodeId, group: GroupAggs) -> NodeId {
+        self.add(OpNode::Reduce { group, local: true }, &[input])
     }
 
-    /// [`OpNode::Reduce`] with **no upstream exchange**: it aggregates `input` as
-    /// each worker holds it, and emits nothing over an empty input.
-    pub fn reduce_local(&mut self, input: NodeId, agg: GroupAggs) -> NodeId {
-        self.add(OpNode::Reduce(agg), &[input])
-    }
-
-    /// [`OpNode::TopN`] behind an [`OpNode::ExchangeShard`] on its group columns.
+    /// [`OpNode::TopN`].
     pub fn top_n(&mut self, input: NodeId, group_cols: &[u32], order: &[OrderKey], limit: u64, offset: u64) -> NodeId {
-        let sharded = self.shard(input);
         let op = OpNode::TopN {
             group_cols: group_cols.to_vec(),
             order: order.to_vec(),
             limit,
             offset,
         };
-        self.add(op, &[sharded])
+        self.add(op, &[input])
     }
 
-    /// [`OpNode::Window`] behind an [`OpNode::ExchangeShard`] on its group columns.
+    /// [`OpNode::Window`].
     pub fn window(
         &mut self,
         input: NodeId,
@@ -635,14 +630,13 @@ impl Circuit {
         order: &[OrderKey],
         (rank, dense_rank): (bool, bool),
     ) -> NodeId {
-        let sharded = self.shard(input);
         let op = OpNode::Window {
             group,
             order: order.to_vec(),
             rank,
             dense_rank,
         };
-        self.add(op, &[sharded])
+        self.add(op, &[input])
     }
 
     /// [`OpNode::ExchangeShard`].

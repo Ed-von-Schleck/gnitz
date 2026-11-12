@@ -224,20 +224,17 @@ pub fn map_copy(
     circuit.map_expr(input, gnitz_expr::LogicalProgram::copy_cols(&sources).to_map(slots))
 }
 
-/// `source` scanned and reindexed on `key`, keeping its column 0, with the
-/// leading `routed` slots of `key` stated as its scatter key — what a spine that
-/// moves no column produces.
+/// `source` scanned under the leading `routed` slots of `key` as its scatter
+/// key, and reindexed on `key`, keeping its column 0 — what a spine that moves
+/// no column produces.
 pub fn scan_routed(
     circuit: &mut Circuit,
     source: u64,
     key: &[gnitz_wire::ReindexSlot],
     routed: usize,
 ) -> gnitz_wire::NodeId {
-    let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
-    let role = gnitz_wire::ReindexRole::ScatterKey {
-        source_cols: key[..routed].iter().map(|slot| slot.0).collect(),
-    };
-    circuit.map_reindex(scan, key, &[0], role, gnitz_wire::NullKeys::Keep)
+    let scan = circuit.input_scattered(source, gnitz_wire::ReadBound::None, Some(key[..routed].to_vec()));
+    circuit.map_reindex(scan, key, &[0], gnitz_wire::NullKeys::Keep)
 }
 
 /// [`scan_routed`] by the whole of `key`.
@@ -277,20 +274,18 @@ pub fn two_term_join_circuit(a: u64, b: u64, tc: gnitz_wire::TypeCode) -> Circui
 /// alone is nullable, so only a join on it re-keys `a` a second time, keeping
 /// its NULL-keyed rows. Answers the circuit and `a`'s join re-key.
 pub fn left_join_circuit(a: u64, b: u64, key: u32) -> (Circuit, gnitz_wire::NodeId) {
-    use gnitz_wire::{JoinKind, NullKeys, ReindexRole};
+    use gnitz_wire::{JoinKind, NullKeys, ReadBound};
     let mut c = Circuit::default();
     let a_key = [(key, TypeCode::U64)];
-    let role = || ReindexRole::ScatterKey { source_cols: vec![key] };
+    let b_key = [(1, TypeCode::U64)];
     // `b` first: a backfill feeds the sources in scan order, and `a`'s rows are
     // then null-filled against a `b` that is already there.
-    let sb = c.input_delta(b, gnitz_wire::ReadBound::None);
-    let sa = c.input_delta(a, gnitz_wire::ReadBound::None);
-    let b_key = [(1, TypeCode::U64)];
-    let b_role = ReindexRole::ScatterKey { source_cols: vec![1] };
-    let rb = c.map_reindex(sb, &b_key, &[2], b_role, NullKeys::Drop);
-    let ra = c.map_reindex(sa, &a_key, &[0, 1, 2], role(), NullKeys::Drop);
+    let sb = c.input_scattered(b, ReadBound::None, Some(b_key.to_vec()));
+    let sa = c.input_scattered(a, ReadBound::None, Some(a_key.to_vec()));
+    let rb = c.map_reindex(sb, &b_key, &[2], NullKeys::Drop);
+    let ra = c.map_reindex(sa, &a_key, &[0, 1, 2], NullKeys::Drop);
     let all = match key == 2 {
-        true => c.map_reindex(sa, &a_key, &[0, 1, 2], role(), NullKeys::Keep),
+        true => c.map_reindex(sa, &a_key, &[0, 1, 2], NullKeys::Keep),
         false => ra,
     };
     let inner = c.join([ra, rb], [ra, rb], JoinKind::Equi);

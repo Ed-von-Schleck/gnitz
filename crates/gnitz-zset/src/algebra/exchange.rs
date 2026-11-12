@@ -20,7 +20,7 @@ impl ScatterPlan {
         Ok(ScatterPlan(Some(GroupKey::new(schema, cols)?)))
     }
 
-    /// An equi-join key, keyed by the `_join_pk` the reindex Map packs from `slots`.
+    /// An equi-join key, keyed by the `_join_pk` a reindex `Map` packs from `slots`.
     pub fn join(schema: &SchemaDescriptor, slots: &[gnitz_wire::ReindexSlot]) -> Result<Self, String> {
         Ok(ScatterPlan(Some(GroupKey::packed(KeyPacker::new(schema, slots)?))))
     }

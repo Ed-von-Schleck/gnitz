@@ -70,7 +70,7 @@ const WINDOW: Stage = |c, a| {
         (true, false),
     )
 };
-/// A reduce of each worker's slice: no exchange in front of it.
+/// A reduce of each worker's slice.
 const LOCAL_SUM: Stage = |c, a| c.reduce_local(a, global(AggFunc::Sum));
 
 /// `build` over a scan of 10, compiled as worker `slot` into the view its
@@ -107,6 +107,11 @@ fn a_global_operator_splits_only_where_partials_combine_and_workers_differ() {
             .ops()
             .filter(|op| matches!(op, Op::Reduce { .. } | Op::Ordered { .. }));
         assert_eq!(stateful.count() == 2, split, "{why}");
+        let on_view_store = out
+            .vm
+            .ops()
+            .filter(|op| matches!(op, Op::Reduce { out_trace: Integral::Relation(_), .. }));
+        assert!(on_view_store.count() <= 1, "{why}: a partial's trace is its own");
     }
 }
 
@@ -134,29 +139,9 @@ fn an_exchange_behind_a_global_aggregate_is_rejected() {
     );
 }
 
-/// An exchange places its rows by the key of the reduce, top-N or window reading
-/// it, so a second reader would be handed rows placed by a key that is not its own.
-#[test]
-fn an_exchange_a_reduce_shares_with_another_reader_is_rejected() {
-    let keyed = Source::from(make_schema_u64_i64());
-    for op in [SUM, TOP_N, WINDOW] {
-        let beside = |c: &mut Circuit, a| {
-            let op = op(c, a);
-            c.negate(c.inputs(op)[0]);
-        };
-        for of in [1, 4] {
-            assert_eq!(
-                rejection(compile_global(beside, keyed, Slot::new(0, of))),
-                "an exchange in front of a reduce, top-N or window has another reader",
-                "of {of}"
-            );
-        }
-    }
-}
-
-/// A global reduce behind an exchange owes a ground row, and its plan says so at
-/// every rank: which process mints it is the backfill's to say. With no exchange the
-/// reduce aggregates each worker's slice, and owes none.
+/// A global reduce owes a ground row, and its plan says so at every rank: which
+/// process mints it is the backfill's to say. A local one aggregates each
+/// worker's slice, and owes none.
 #[test]
 fn the_ground_row_is_seeded_where_the_whole_input_arrives() {
     let keyed = Source::from(make_schema_u64_i64());

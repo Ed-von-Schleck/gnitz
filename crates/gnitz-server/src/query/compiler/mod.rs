@@ -12,7 +12,7 @@ use std::rc::Rc;
 use crate::query::vm::{DeltaReg, Integral, Replay, Vm};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::relation::{Relation, RelationRegistry, StateIdx};
-use gnitz_wire::{AggDescriptor, Circuit, ClampKind, JoinKind, MapKind, NodeId, OpNode, ReadBound};
+use gnitz_wire::{Circuit, ClampKind, GroupAggs, JoinKind, MapKind, NodeId, OpNode, ReadBound};
 use gnitz_zset::algebra::{MapPlan, Placement, ScatterPlan};
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -32,8 +32,8 @@ use routing::ViewMeta;
 // Circuit walks
 // ---------------------------------------------------------------------------
 
-/// True iff `op` carries every row through on its own worker with the PK region
-/// intact.
+/// True iff `op` hands a subset of its input's rows on, each on its own worker
+/// with the PK region intact.
 fn keeps_rows_and_pk_region(op: &OpNode) -> bool {
     matches!(op, OpNode::Filter(_) | OpNode::Map(MapKind::Compute(_)))
 }
@@ -53,15 +53,6 @@ fn scanned_row_locally(circuit: &Circuit, from: NodeId) -> Option<u64> {
         OpNode::ScanDelta { source, .. } => Some(*source),
         _ => None,
     }
-}
-
-/// The reader of `shard` that groups its input, and its group columns — the key
-/// the exchange co-locates by. `None` where no reader is one: the rows are placed
-/// by their own PK.
-fn keyed_reader(circuit: &Circuit, shard: NodeId) -> Option<(NodeId, &[u32])> {
-    circuit
-        .readers(shard)
-        .find_map(|n| Some((n, circuit.op(n).group_cols()?)))
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +97,7 @@ pub(super) fn compile_view(
     bounded: bool,
 ) -> Result<(CompileOutput, Placement), String> {
     let (meta, placement) = ViewMeta::derive(circuit, registry, view_schema)?;
-    let EmitCtx { prog, regs, integrals, sources, .. } = EmitCtx::emit(circuit, registry, &meta, view_id)?;
+    let EmitCtx { prog, regs, integrals, sources, .. } = EmitCtx::emit(circuit, &meta, view_id)?;
     let vm = prog.finish(regs[circuit.out()]);
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
@@ -120,7 +111,7 @@ pub(super) fn compile_view(
         self_contained: meta.self_contained,
     };
     if bounded {
-        output.hydration = Some(derive_hydration(circuit, registry, &output, &regs, &integrals)?);
+        output.hydration = Some(derive_hydration(circuit, &meta, &output, &regs, &integrals)?);
     }
     Ok((output, placement))
 }

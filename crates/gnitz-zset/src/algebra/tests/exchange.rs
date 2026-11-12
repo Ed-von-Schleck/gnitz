@@ -4,7 +4,7 @@ use crate::algebra::{ground_owner, MapPlan, Placement};
 use crate::repr::BatchBuilder;
 use crate::schema::SchemaColumn;
 use crate::test_support::{pk_payload_schema, self_typed_slots, u64_pk_schema, weighted_rows};
-use gnitz_wire::{MapKind, NullKeys, ReindexRole, TypeCode};
+use gnitz_wire::{MapKind, NullKeys, TypeCode};
 
 /// PK `(U32, I32, U64, U64)` — 24 bytes, so the whole PK routes by the wide
 /// hash and every proper prefix by its narrow image — over
@@ -161,7 +161,6 @@ fn a_join_scatter_routes_each_row_to_its_reindexed_owner() {
         let reindex = MapKind::Reindex {
             keep: vec![],
             key: slots.clone(),
-            role: ReindexRole::Auxiliary,
             nulls: NullKeys::Keep,
         };
         let mut map = MapPlan::from_wire(&schema, &reindex).expect("the fixture key packs");

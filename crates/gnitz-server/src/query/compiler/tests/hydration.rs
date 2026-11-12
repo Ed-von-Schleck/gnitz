@@ -16,8 +16,8 @@ fn a_shape_outside_the_equation_is_refused() {
     let cases: [(&str, Build); 4] = [
         ("a delta joins another integral than the other delta's", |c| {
             let [da, db] = [100, 200].map(|s| reindexed_on_col1(c, s, TypeCode::I64));
-            let slice = c.worker_filter(db);
-            c.join([da, db], [da, slice], JoinKind::Equi);
+            let other = c.negate(db);
+            c.join([da, db], [da, other], JoinKind::Equi);
         }),
         ("a non-equi kind", |c| {
             let deltas = [100, 200].map(|s| reindexed_on_col1(c, s, TypeCode::I64));

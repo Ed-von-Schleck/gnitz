@@ -3,7 +3,7 @@ use crate::query::compiler::fixtures::*;
 use crate::test_support::{
     make_schema_u64_i64, map_copy, mix, pk_payload_schema, scan_keyed, scan_routed, self_typed_slots, u64_pk_schema,
 };
-use gnitz_wire::{Circuit, JoinKind, NullKeys, RangeRel, ReindexRole, TypeCode};
+use gnitz_wire::{Circuit, JoinKind, NullKeys, RangeRel, ReadBound, TypeCode};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::SchemaColumn;
@@ -38,7 +38,7 @@ fn route(plan: Option<&Rc<ScatterPlan>>) -> Route {
 
 /// The routes of sources 7 and 9.
 fn routes(meta: &ViewMeta) -> [Route; 2] {
-    [7, 9].map(|tid| route(meta.source_route(tid).map(|(plan, _)| plan)))
+    [7, 9].map(|tid| route(meta.source_route(tid).map(|r| &r.plan)))
 }
 
 /// A range join: a pure range over a one-slot key, a band over a wider one.
@@ -49,12 +49,14 @@ fn join_with_own_trace(c: &mut Circuit, d: NodeId, kind: JoinKind) -> NodeId {
     c.join([d, d], [d, d], kind)
 }
 
-/// A reindex of `input` on `cols` of [`wide_schema`], stated as the route of the
-/// source `input` reads.
-fn states_route(c: &mut Circuit, input: NodeId, cols: &[u32]) -> NodeId {
-    let key = self_typed_slots(&wide_schema(), cols);
-    let role = ReindexRole::ScatterKey { source_cols: cols.to_vec() };
-    c.map_reindex(input, &key, &[0], role, NullKeys::Keep)
+/// A scan of `source` stating `cols` of [`wide_schema`] as its scatter key.
+fn scattered(c: &mut Circuit, source: u64, cols: &[u32]) -> NodeId {
+    c.input_scattered(source, ReadBound::None, Some(self_typed_slots(&wide_schema(), cols)))
+}
+
+/// `input` re-keyed onto `cols` of [`wide_schema`].
+fn rekeyed(c: &mut Circuit, input: NodeId, cols: &[u32]) -> NodeId {
+    reindex(c, input, &self_typed_slots(&wide_schema(), cols))
 }
 
 /// How many leading slots of a `key_len`-slot key a join of `kind` co-locates
@@ -73,9 +75,9 @@ fn scan_joined(c: &mut Circuit, source: u64, key: &[gnitz_wire::ReindexSlot], ki
     scan_routed(c, source, key, routed(kind, key.len()))
 }
 
-/// A reindex on `key` that states no route.
-fn aux_reindex(c: &mut Circuit, input: NodeId, key: &[gnitz_wire::ReindexSlot]) -> NodeId {
-    c.map_reindex(input, key, &[0], ReindexRole::Auxiliary, NullKeys::Keep)
+/// `input` re-keyed onto `key`.
+fn reindex(c: &mut Circuit, input: NodeId, key: &[gnitz_wire::ReindexSlot]) -> NodeId {
+    c.map_reindex(input, key, &[0], NullKeys::Keep)
 }
 
 /// `relay` is keyed and splits rows by the join key over `cols` of `schema`: it
@@ -103,7 +105,7 @@ fn assert_routes_by(relay: Option<&Rc<ScatterPlan>>, schema: &SchemaDescriptor, 
 
 /// The two-term join of sources 7 and 9, each reindexed on `key_cols` and
 /// optionally clamped to a set, behind an output shard.
-fn join_meta_in(kind: JoinKind, key_cols: &[u32], distinct: [bool; 2], ext: RelationRegistry) -> ViewMeta {
+fn join_meta_in<'a>(kind: JoinKind, key_cols: &[u32], distinct: [bool; 2], ext: &'a RelationRegistry) -> ViewMeta<'a> {
     let mut c = Circuit::default();
     let deltas = [(7, distinct[0]), (9, distinct[1])].map(|(source, set)| {
         let schema = ext.relation(source).expect("a registered source").schema();
@@ -115,7 +117,7 @@ fn join_meta_in(kind: JoinKind, key_cols: &[u32], distinct: [bool; 2], ext: Rela
     });
     let joined = c.join(deltas, deltas, kind);
     c.shard(joined);
-    routing(&c, &ext).expect("fixture routes")
+    routing(&c, ext).expect("fixture routes")
 }
 
 /// A source's relay follows what its join needs co-located and what is already
@@ -248,7 +250,8 @@ fn a_joins_sources_relay_only_where_their_matches_are_not_already_local() {
         ),
     ];
     for (why, kind, key_cols, distinct, [a, b], want) in cases {
-        let meta = join_meta_in(kind, key_cols, distinct, of_four([(7, a), (9, b)]));
+        let ext = of_four([(7, a), (9, b)]);
+        let meta = join_meta_in(kind, key_cols, distinct, &ext);
         assert_eq!(routes(&meta), want, "{why}");
     }
 }
@@ -289,76 +292,52 @@ fn a_source_routes_by_the_prefix_of_its_key_it_states() {
         (RANGE, &[2, 3, 4], &[2, 3]),
         (JoinKind::Equi, &[3, 4], &[3, 4]),
     ] {
-        let meta = join_meta_in(kind, key, [false; 2], of_four([(7, wide_schema()), (9, wide_schema())]));
-        assert_routes_by(meta.source_route(7).map(|(plan, _)| plan), &wide_schema(), routed);
+        let ext = of_four([(7, wide_schema()), (9, wide_schema())]);
+        let meta = join_meta_in(kind, key, [false; 2], &ext);
+        assert_routes_by(meta.source_route(7).map(|r| &r.plan), &wide_schema(), routed);
     }
 }
 
-/// A source whose re-key only an owner filter reads never takes the
-/// replicated-partner skip: its filter drops every row the relay did not place.
+/// A replicated partner makes each match once only beside a side that stays on
+/// its own worker: a broadcast side meets it on every worker, so the replicated
+/// source keeps its share by the key it states.
 #[test]
-fn an_owner_trimmed_source_routes_by_the_key_it_states() {
+fn a_source_beside_a_broadcast_one_routes_by_the_key_it_states() {
     let base = Source::from(make_schema_u64_i64());
     let replicated = base.placed(Placement::Replicated);
-    let trimmed = |kind: JoinKind, key_cols: &[u32], [a, b]: [Source; 2]| {
+    let routed = |[a, b]: [Source; 2]| {
+        let ext = of_four([(7, a), (9, b)]);
         let mut c = Circuit::default();
-        let keyed = scan_keyed(&mut c, 7, &self_typed_slots(&a.schema, key_cols));
-        let owned = c.worker_filter(keyed);
-        let delta = scan_joined(&mut c, 9, &self_typed_slots(&b.schema, &[1]), kind);
-        c.join([delta, owned], [delta, owned], kind);
-        routing(&c, &of_four([(7, a), (9, b)])).unwrap()
+        let keyed = scan_keyed(&mut c, 7, &self_typed_slots(&a.schema, &[0]));
+        let delta = scan_joined(&mut c, 9, &self_typed_slots(&b.schema, &[1]), RANGE);
+        c.join([keyed, delta], [keyed, delta], RANGE);
+        routes(&routing(&c, &ext).unwrap())
     };
-
-    let meta = trimmed(JoinKind::Equi, &[1], [base, replicated]);
-    assert_eq!(routes(&meta), [Route::Keyed, Route::Stays]);
-    assert_routes_by(meta.source_route(7).map(|(plan, _)| plan), &base.schema, &[1]);
-
-    let meta = trimmed(RANGE, &[0], [base, base]);
     assert_eq!(
-        routes(&meta),
+        routed([base, base]),
         [Route::Stays, Route::Broadcast],
         "already on its PK's owner"
     );
-
-    let meta = trimmed(RANGE, &[0], [replicated, base]);
-    assert_eq!(
-        routes(&meta),
-        [Route::Keyed, Route::Broadcast],
-        "a replicated copy is kept by key where it stands"
-    );
-    assert_routes_by(meta.source_route(7).map(|(plan, _)| plan), &replicated.schema, &[0]);
+    assert_eq!(routed([replicated, base]), [Route::Keyed, Route::Broadcast]);
 }
 
-/// A source states one route however many reindexes name it, and none when it
-/// feeds no join: source 20 reaches the output through a `Union` beside the join's
-/// output, so its rows are already where the view needs them.
+/// A source routes by the key its scan states, however many re-keys read it,
+/// and by none when it states none: source 20 reaches the output through a
+/// `Union` beside the join's output, so its rows are already where the view
+/// needs them.
 #[test]
 fn a_source_routes_by_the_one_key_it_states() {
     let mut c = Circuit::default();
-    let source = scan(&mut c, 10);
-    let delta = states_route(&mut c, source, &[2]);
-    let again = states_route(&mut c, source, &[2]);
+    let source = scattered(&mut c, 10, &[2]);
+    let delta = rekeyed(&mut c, source, &[2]);
+    let again = rekeyed(&mut c, source, &[2]);
     let joined = c.join([delta, again], [delta, again], JoinKind::Equi);
     let other = scan(&mut c, 20);
     c.union(joined, other);
-    let meta = routing(&c, &of_four([(10, wide_schema()), (20, wide_schema())])).unwrap();
-    assert_routes_by(meta.source_route(10).map(|(plan, _)| plan), &wide_schema(), &[2]);
-    assert_eq!(route(meta.source_route(20).map(|(plan, _)| plan)), Route::Stays);
-}
-
-/// A `Map` between the scan and the reindex moves the key, so the route is read
-/// as the source's own columns: reading the node's own key would scatter source
-/// 7 by column 2 of a relation whose join column is 5.
-#[test]
-fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
-    let mut c = Circuit::default();
-    let source = scan(&mut c, 7);
-    let moved = map_copy(&mut c, source, &[(5, TypeCode::I64)]);
-    let role = ReindexRole::ScatterKey { source_cols: vec![5] };
-    let delta = c.map_reindex(moved, &[(2, TypeCode::I64)], &[0], role, NullKeys::Keep);
-    join_with_own_trace(&mut c, delta, JoinKind::Equi);
-    let meta = routing(&c, &of_four([(7, wide_schema())])).unwrap();
-    assert_routes_by(meta.source_route(7).map(|(plan, _)| plan), &wide_schema(), &[5]);
+    let ext = of_four([(10, wide_schema()), (20, wide_schema())]);
+    let meta = routing(&c, &ext).unwrap();
+    assert_routes_by(meta.source_route(10).map(|r| &r.plan), &wide_schema(), &[2]);
+    assert_eq!(route(meta.source_route(20).map(|r| &r.plan)), Route::Stays);
 }
 
 /// A circuit is client-supplied, and workers route by its metadata mid-round,
@@ -366,12 +345,12 @@ fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
 /// refused there, on the master and on every worker alike.
 #[test]
 fn a_circuit_routing_cannot_stand_behind_is_rejected() {
-    let cases: [(Build, &str); 5] = [
+    let cases: [(Build, &str); 4] = [
         // Integrated wherever it was produced, beside a trace scattered by the key.
         (
             |c: &mut Circuit| {
                 let source = scan(c, 7);
-                let delta = aux_reindex(c, source, &self_typed_slots(&wide_schema(), &[1]));
+                let delta = rekeyed(c, source, &[1]);
                 join_with_own_trace(c, delta, JoinKind::Equi);
             },
             "source 7 feeds a join and states no scatter key",
@@ -379,11 +358,10 @@ fn a_circuit_routing_cannot_stand_behind_is_rejected() {
         // Scattering by either key alone leaves the trace side keyed by the other.
         (
             |c: &mut Circuit| {
-                let source = scan(c, 7);
-                let (a, b) = (states_route(c, source, &[1]), states_route(c, source, &[2]));
+                let [a, b] = [1, 2].map(|col| scan_keyed(c, 7, &self_typed_slots(&wide_schema(), &[col])));
                 c.join([a, b], [a, b], JoinKind::Equi);
             },
-            "source 7 feeds several distinct scatter keys",
+            "source 7 is scanned under several distinct scatter keys",
         ),
         // A column the relation has not got.
         (
@@ -392,15 +370,6 @@ fn a_circuit_routing_cannot_stand_behind_is_rejected() {
                 join_with_own_trace(c, delta, JoinKind::Equi);
             },
             "source 7 scatter key",
-        ),
-        (
-            |c: &mut Circuit| {
-                // A union's rows are no one source's.
-                let (a, b) = (scan(c, 7), scan(c, 9));
-                let both = c.union(a, b);
-                states_route(c, both, &[1]);
-            },
-            "a scatter key over no scanned source",
         ),
         (
             |c: &mut Circuit| {
@@ -433,7 +402,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
     let clustered = Source::from(schema).placed(Placement::keyed(&schema, 1));
     let inherited = clustered.placement;
     let replicated = clustered.placed(Placement::Replicated);
-    let cases: [(&str, Build, [Source; 2], Placement); 11] = [
+    let cases: [(&str, Build, [Source; 2], Placement); 10] = [
         (
             "a bare scan re-emits its source's PK region",
             |c| _ = scan(c, 7),
@@ -454,16 +423,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
             "a bare reindex exchanges nothing and still replaces the PK region",
             |c| {
                 let a = scan(c, 7);
-                aux_reindex(c, a, &[(3, I64)]);
-            },
-            [clustered; 2],
-            Placement::Local,
-        ),
-        (
-            "a WorkerFilter is not a Filter",
-            |c| {
-                let a = scan(c, 7);
-                c.worker_filter(a);
+                reindex(c, a, &[(3, I64)]);
             },
             [clustered; 2],
             Placement::Local,
@@ -498,9 +458,8 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
         (
             "a source's rows walked back to its scan, while a join relays its delta",
             |c| {
-                let a = scan(c, 7);
-                let role = ReindexRole::ScatterKey { source_cols: vec![3] };
-                let da = c.map_reindex(a, &[(3, I64)], &[0], role, NullKeys::Keep);
+                let a = c.input_scattered(7, ReadBound::None, Some(vec![(3, I64)]));
+                let da = reindex(c, a, &[(3, I64)]);
                 let db = scan_keyed(c, 9, &[(3, I64)]);
                 c.join([da, db], [da, db], JoinKind::Equi);
                 c.filter(a, predicate(3));

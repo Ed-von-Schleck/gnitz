@@ -1,5 +1,5 @@
 use gnitz_expr::{ConstIdx, IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
-use gnitz_wire::{MapKind, NullKeys, ReindexRole, TypeCode, MAX_PK_COLUMNS};
+use gnitz_wire::{MapKind, NullKeys, TypeCode, MAX_PK_COLUMNS};
 
 use super::MapPlan;
 use crate::repr::{Batch, BatchBuilder};
@@ -435,12 +435,8 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
 #[test]
 fn a_malformed_map_is_refused_by_name() {
     let s = make_schema_u64_i64();
-    let reindex = |keep: Vec<u32>, key: Vec<gnitz_wire::ReindexSlot>| MapKind::Reindex {
-        keep,
-        key,
-        role: ReindexRole::Auxiliary,
-        nulls: NullKeys::Keep,
-    };
+    let reindex =
+        |keep: Vec<u32>, key: Vec<gnitz_wire::ReindexSlot>| MapKind::Reindex { keep, key, nulls: NullKeys::Keep };
     let compute = |program: Vec<u8>, n: usize| {
         MapKind::Compute(gnitz_wire::ComputeMap {
             program,

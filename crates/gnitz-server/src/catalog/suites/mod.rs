@@ -26,8 +26,8 @@ use std::fs;
 
 use gnitz_store::relation::{relation_dir, ChildKind, IndexClaim, Relation, RelationKind, SecondaryIndex, StoreConfig};
 use gnitz_wire::{
-    payload_u64, CatalogColumn, Circuit, ColTabRow, NullKeys, PkColList, ReindexRole, SysRow, TableTabRow, TypeCode,
-    ViewTabRow, PK_LIST_PACKED_FLAG,
+    payload_u64, CatalogColumn, Circuit, ColTabRow, NullKeys, PkColList, SysRow, TableTabRow, TypeCode, ViewTabRow,
+    PK_LIST_PACKED_FLAG,
 };
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
 
@@ -181,7 +181,7 @@ fn traced_circuit(source: u64, cols: &[CatalogColumn]) -> Circuit {
     let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
     let keep: Vec<u32> = (1..cols.len() as u32).collect();
     let key = [(0, cols[0].def.ty.tc)];
-    let rekeyed = circuit.map_reindex(scan, &key, &keep, ReindexRole::Auxiliary, NullKeys::Keep);
+    let rekeyed = circuit.map_reindex(scan, &key, &keep, NullKeys::Keep);
     circuit.distinct(rekeyed);
     circuit
 }

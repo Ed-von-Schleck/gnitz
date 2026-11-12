@@ -9,7 +9,7 @@ Because each delta is broadcast and paired, on every worker, with that worker's
 slice of the other side, every check here is a weighted bag: a row set reads a
 W× duplication as correct.
 
-Run with GNITZ_WORKERS=4 — the broadcast and the trace's worker filter are what
+Run with GNITZ_WORKERS=4 — the broadcast and the trace's own-PK exchange are what
 keep the product from multiplying.
 """
 from _read import bag, scanned

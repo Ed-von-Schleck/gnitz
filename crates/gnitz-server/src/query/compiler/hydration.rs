@@ -2,7 +2,6 @@
 //! circuit graph, then against the plan the emitter produced.
 
 use super::*;
-use crate::query::vm::Replay;
 use gnitz_store::relation::RelationKind;
 
 const UNSUPPORTED: &str =
@@ -18,7 +17,7 @@ const READS_OWN_STORE: &str =
 /// which a row-local walk and an equi join's delta both keep.
 pub(super) fn derive_hydration(
     circuit: &Circuit,
-    registry: &RelationRegistry,
+    meta: &ViewMeta,
     code: &CompileOutput,
     regs: &[DeltaReg],
     integrals: &[Option<(Integral, DeltaReg, Option<ClampKind>)>],
@@ -27,17 +26,22 @@ pub(super) fn derive_hydration(
         return Err(READS_OWN_STORE.into());
     }
     // A replay runs on one worker, and so no exchange round.
-    if circuit.ops().any(|(_, op)| matches!(op, OpNode::ExchangeShard)) {
+    if circuit.ops().any(|(_, op)| op.exchanges()) {
         return Err(UNSUPPORTED.into());
     }
     let origin = row_local_origin(circuit, circuit.out());
     let (in_reg, seed, clamp) = match circuit.op(origin) {
         OpNode::ScanDelta { source, .. } => {
-            if registry.relation_or_err(*source)?.kind() == RelationKind::Stream {
+            if meta.source(*source).kind() == RelationKind::Stream {
                 return Err(
                     "capacity-bounded view: a filter/projection over a stream has no stored rows to recompute from"
                         .into(),
                 );
+            }
+            // The view's rows would sit where the route puts them, and the
+            // source's where its store does.
+            if meta.states_route(*source) {
+                return Err(UNSUPPORTED.into());
             }
             (regs[origin], Integral::Relation(*source), None)
         }

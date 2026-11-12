@@ -6,9 +6,7 @@ use super::super::{HirCol, ProjEntry, RelExpr, SetOpKind};
 use super::spine::{open, Top};
 use super::{project_front, EmitPieces, ViewChain};
 use crate::error::GnitzSqlError;
-use gnitz_wire::{
-    Circuit, ColumnDef, NodeId, NullKeys, ReadBound, ReindexRole, ReindexSlot, TypeCode, NARROW_PK_MAX_BYTES,
-};
+use gnitz_wire::{Circuit, ColumnDef, NodeId, NullKeys, ReadBound, ReindexSlot, TypeCode, NARROW_PK_MAX_BYTES};
 use std::rc::Rc;
 
 /// A leaf emitted into the circuit: its columns, its node, and the frame that
@@ -81,7 +79,7 @@ pub(super) fn lower_setop(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<Em
         Ok(match key {
             // A leaf row NULL where `out` is NOT NULL is of no element of the result.
             ElementKey::Natural(_) => {
-                let node = cb.map_reindex(leaf.node, &slots, &[], ReindexRole::Auxiliary, NullKeys::Drop);
+                let node = cb.map_reindex(leaf.node, &slots, &[], NullKeys::Drop);
                 cb.shard(node)
             }
             _ => cb.map_hash_row(leaf.node, &slots),

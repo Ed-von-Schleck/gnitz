@@ -343,7 +343,6 @@ fn a_join_over_its_source_reads_it_up_to_its_cut() {
     let rekey = gnitz_wire::MapKind::Reindex {
         keep: vec![1],
         key: vec![(0, TypeCode::U128)],
-        role: gnitz_wire::ReindexRole::Auxiliary,
         nulls: gnitz_wire::NullKeys::Drop,
     };
     let rekey = MapPlan::from_wire(&schema, &rekey).unwrap();

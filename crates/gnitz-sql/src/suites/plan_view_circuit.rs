@@ -2,8 +2,7 @@
 //!
 //! Each row pins only what CLAUDE.md §3 and the placement contracts require:
 //! segment count, where the exchanges sit and what reads them, the bilinear
-//! joins, the reduce / clamp / null-fill /
-//! worker-filter / filter node counts. Projection lists, map counts, union
+//! joins, the reduce / clamp / null-fill / filter node counts. Projection lists, map counts, union
 //! counts and node numbering are free to change.
 
 use gnitz_wire::{Circuit, OpNode, TypeCode};
@@ -11,13 +10,13 @@ use gnitz_wire::{ClampKind, JoinKind, ReadBound};
 
 use super::*;
 
-/// What an `ExchangeShard` co-locates by: the group columns of the reduce or
-/// top-N reading it, or [`PK`] where no reader is one.
+/// What an exchange co-locates by: the group columns of the reduce, top-N or
+/// window that reads its input so, or [`PK`] for an `ExchangeShard`.
 type Exchange = Option<&'static [u32]>;
 const PK: Exchange = None;
 
 /// One row of the shape matrix: body, segment count, the exchanges (one
-/// [`Exchange`] per `ExchangeShard`, any order), and the node kinds the body must
+/// [`Exchange`] per exchanging node, any order), and the node kinds the body must
 /// compile to, with their counts. A kind a row omits must not appear at all, so a
 /// new kind touches [`Node`] and only the rows that carry it.
 type Row = (&'static str, usize, &'static [Exchange], &'static [(Node, usize)]);
@@ -33,7 +32,6 @@ enum Node {
     GlobalGround,
     Distinct,
     PositivePart,
-    WorkerFilter,
     NullExtend,
     Filter,
     TopN,
@@ -50,7 +48,6 @@ impl Node {
         GlobalGround,
         Distinct,
         PositivePart,
-        WorkerFilter,
         NullExtend,
         Filter,
         TopN,
@@ -63,11 +60,10 @@ impl Node {
             EquiJoin => matches!(op, OpNode::Join(JoinKind::Equi)),
             RangeJoin => matches!(op, OpNode::Join(JoinKind::Range { .. })),
             CrossJoin => matches!(op, OpNode::Join(JoinKind::Cross)),
-            Reduce => matches!(op, OpNode::Reduce(_)),
+            Reduce => matches!(op, OpNode::Reduce { .. }),
             GlobalGround => circuit.owes_ground_row(nid),
             Distinct => matches!(op, OpNode::WeightClamp(ClampKind::Distinct)),
             PositivePart => matches!(op, OpNode::WeightClamp(ClampKind::PositivePart)),
-            WorkerFilter => matches!(op, OpNode::WorkerFilter),
             NullExtend => matches!(op, OpNode::NullExtend { .. }),
             Filter => matches!(op, OpNode::Filter(_)),
             TopN => matches!(op, OpNode::TopN { .. }),
@@ -103,20 +99,12 @@ fn total(chain: &ViewBundle, kind: Node) -> usize {
 }
 
 /// Every exchange of every segment, by the group columns of the reduce, top-N
-/// or window reading it.
+/// or window making it.
 fn exchanges(chain: &ViewBundle) -> Vec<Option<Vec<u32>>> {
     let mut out: Vec<Option<Vec<u32>>> = all_views(chain)
-        .flat_map(|pv| {
-            let circuit = &pv.circuit;
-            circuit
-                .ops()
-                .filter(|(_, op)| matches!(op, OpNode::ExchangeShard))
-                .map(move |(at, _)| {
-                    circuit
-                        .readers(at)
-                        .find_map(|n| circuit.op(n).group_cols().map(<[u32]>::to_vec))
-                })
-        })
+        .flat_map(|pv| pv.circuit.ops().map(|(_, op)| op))
+        .filter(|op| op.exchanges())
+        .map(|op| op.group_cols().map(<[u32]>::to_vec))
         .collect();
     out.sort();
     out
@@ -151,36 +139,36 @@ const SHAPES: &[Row] = &[
     ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k AND b.w > 3", 1, &[], &[(EquiJoin, 2), (Distinct, 1), (NullExtend, 1), (Filter, 1)]),
     // A filtered derived-table input fuses into the join, cutting no segment.
     ("SELECT a.id AS aid, d.w FROM a JOIN (SELECT k, w FROM b WHERE w > 3) d ON a.k = d.k", 1, &[], &[(EquiJoin, 1), (Filter, 1)]),
-    // Band join: one range join, one output exchange on the pair-PK, no worker filter.
+    // Band join: one range join, one output exchange on the pair-PK.
     ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[PK], &[(RangeJoin, 1)]),
     ("SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[PK], &[(RangeJoin, 1), (PositivePart, 1), (NullExtend, 1)]),
     ("SELECT a.id AS aid, b.id AS bid FROM a RIGHT JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[PK], &[(RangeJoin, 1), (PositivePart, 1), (NullExtend, 1)]),
     ("SELECT a.id AS aid, b.id AS bid FROM a FULL JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[PK], &[(RangeJoin, 1), (PositivePart, 2), (NullExtend, 2)]),
     ("SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.k = b.k AND a.v <= b.w WHERE a.id > 5", 1, &[PK], &[(RangeJoin, 1), (PositivePart, 1), (NullExtend, 1), (Filter, 1)]),
     ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k AND a.v < b.w AND a.id > b.id", 1, &[PK], &[(RangeJoin, 1), (Filter, 1)]),
-    // Pure range: broadcast trimmed by one worker filter per side; LEFT derives
+    // Pure range: broadcast trimmed by one PK exchange per side; LEFT derives
     // its null-fill from a threshold reduce, so no clamp.
-    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v < b.w", 1, &[PK], &[(RangeJoin, 1), (WorkerFilter, 2)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.v < b.w", 1, &[PK], &[(RangeJoin, 2), (Reduce, 1), (WorkerFilter, 2), (NullExtend, 1)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v < b.w AND a.id <> b.id", 1, &[PK], &[(RangeJoin, 1), (WorkerFilter, 2), (Filter, 1)]),
-    // Keyless (cross) join: one cross join, one worker filter per side, the
+    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v < b.w", 1, &[PK, PK, PK], &[(RangeJoin, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.v < b.w", 1, &[PK, PK, PK], &[(RangeJoin, 2), (Reduce, 1), (NullExtend, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v < b.w AND a.id <> b.id", 1, &[PK, PK, PK], &[(RangeJoin, 1), (Filter, 1)]),
+    // Keyless (cross) join: one cross join, one PK exchange per side, the
     // pair-PK output shard; a residual — a constant `ON 1 = 1` included — or a
     // WHERE is one filter. A self product wraps the second copy in a segment,
     // and a third relation is one more keyless step over the cut product.
-    ("SELECT a.id AS aid, b.id AS bid FROM a CROSS JOIN b", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a, b", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON 1 = 1", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2), (Filter, 1)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v <> b.w", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2), (Filter, 1)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a, b WHERE a.v <> b.w", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2), (Filter, 1)]),
-    ("SELECT a.id AS aid, b.id AS bid FROM a CROSS JOIN b WHERE a.v > 3", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2), (Filter, 1)]),
-    ("SELECT c.v AS cv, b.id AS bid FROM c CROSS JOIN b", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
-    ("SELECT c.v AS cv, ty.id AS tid FROM c NATURAL JOIN ty", 1, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
-    ("SELECT x.id AS xa, y.id AS yb FROM a x, a y", 2, &[PK], &[(CrossJoin, 1), (WorkerFilter, 2)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a CROSS JOIN b", 1, &[PK, PK, PK], &[(CrossJoin, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a, b", 1, &[PK, PK, PK], &[(CrossJoin, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON 1 = 1", 1, &[PK, PK, PK], &[(CrossJoin, 1), (Filter, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v <> b.w", 1, &[PK, PK, PK], &[(CrossJoin, 1), (Filter, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a, b WHERE a.v <> b.w", 1, &[PK, PK, PK], &[(CrossJoin, 1), (Filter, 1)]),
+    ("SELECT a.id AS aid, b.id AS bid FROM a CROSS JOIN b WHERE a.v > 3", 1, &[PK, PK, PK], &[(CrossJoin, 1), (Filter, 1)]),
+    ("SELECT c.v AS cv, b.id AS bid FROM c CROSS JOIN b", 1, &[PK, PK, PK], &[(CrossJoin, 1)]),
+    ("SELECT c.v AS cv, ty.id AS tid FROM c NATURAL JOIN ty", 1, &[PK, PK, PK], &[(CrossJoin, 1)]),
+    ("SELECT x.id AS xa, y.id AS yb FROM a x, a y", 2, &[PK, PK, PK], &[(CrossJoin, 1)]),
     // A self-join with a computed key cuts the computed side alone: its segment is a
     // second source.
     ("SELECT x.id AS xid, y.v FROM (SELECT id, v + 1 AS s FROM a) x JOIN a y ON x.s = y.k", 2, &[], &[(EquiJoin, 1)]),
     ("SELECT x.id AS xid, y.v FROM (SELECT id, v + 1 AS s FROM a) x LEFT JOIN a y ON x.s = y.k", 2, &[], &[(EquiJoin, 2), (Distinct, 1), (NullExtend, 1)]),
-    ("SELECT a.id AS aid, b.id AS bid, u.id AS uid FROM a, b, u", 2, &[PK, PK], &[(CrossJoin, 2), (WorkerFilter, 4)]),
+    ("SELECT a.id AS aid, b.id AS bid, u.id AS uid FROM a, b, u", 2, &[PK, PK, PK, PK, PK, PK], &[(CrossJoin, 2)]),
     // Semi / anti / mark / IN: a join against B's key set, no exchange.
     ("SELECT a.v FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", 1, &[], &[(EquiJoin, 1), (Distinct, 1)]),
     ("SELECT a.v FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", 1, &[], &[(EquiJoin, 1), (Distinct, 1)]),
@@ -195,8 +183,8 @@ const SHAPES: &[Row] = &[
     ("SELECT id FROM n WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = n.k AND b.w = n.id)", 1, &[], &[(EquiJoin, 1), (Distinct, 1)]),
     ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w < a.v)", 1, &[PK], &[(RangeJoin, 1), (PositivePart, 1)]),
     // Pure range: A is owned before the join, so its output needs no exchange.
-    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[], &[(RangeJoin, 1), (Reduce, 1), (WorkerFilter, 1)]),
-    ("SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[], &[(RangeJoin, 1), (Reduce, 1), (WorkerFilter, 1)]),
+    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[], &[(RangeJoin, 1), (Reduce, 1)]),
+    ("SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[], &[(RangeJoin, 1), (Reduce, 1)]),
     // Reduce: an exchange on the group columns — for a global aggregate an empty
     // key, and a ground row.
     ("SELECT g, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY g", 1, &[Some(&[1])], &[(Reduce, 1)]),
@@ -248,7 +236,7 @@ const SHAPES: &[Row] = &[
     // Segments: a non-trivial CTE and a subquery cut; a derived table over one
     // relation, a computed group key and a projection over a join do not.
     ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1), (NullExtend, 1)]),
-    ("SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM b)", 2, &[PK, Some(&[])], &[(RangeJoin, 1), (Reduce, 1), (GlobalGround, 1), (WorkerFilter, 2)]),
+    ("SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM b)", 2, &[PK, PK, PK, Some(&[])], &[(RangeJoin, 1), (Reduce, 1), (GlobalGround, 1)]),
     ("WITH agg AS (SELECT k, SUM(v) AS total FROM a GROUP BY k) SELECT b.w AS nm, agg.total AS tot FROM agg JOIN b ON agg.k = b.k", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1)]),
     ("SELECT d.id FROM (SELECT id, v FROM t WHERE v > 2) d", 1, &[], &[(Filter, 1)]),
     ("WITH c AS (SELECT id, v FROM t WHERE v > 1) SELECT id FROM c", 2, &[], &[(Filter, 1)]),
@@ -426,7 +414,7 @@ fn a_having_without_a_group_by_is_the_whole_relation_group_on_both_surfaces() {
     let reduces: Vec<(Vec<u32>, Vec<gnitz_wire::AggFunc>, bool)> = all_views(&chain)
         .flat_map(|pv| pv.circuit.ops().map(|(nid, op)| (&pv.circuit, nid, op)))
         .filter_map(|(circuit, nid, op)| match op {
-            OpNode::Reduce(g) => Some((
+            OpNode::Reduce { group: g, .. } => Some((
                 g.group_cols.clone(),
                 g.aggs.iter().map(|d| d.agg_op).collect(),
                 circuit.owes_ground_row(nid),
@@ -499,26 +487,12 @@ fn a_permutation_of_leading_pk_columns_groups_in_pk_order() {
 }
 
 /// Every scatter key of the final view, as `(source, the columns it states)`, in
-/// circuit order: each re-key walked back to the scan it reads.
+/// circuit order.
 fn scatter_keys(chain: &ViewBundle) -> Vec<(u64, Vec<u32>)> {
-    use gnitz_wire::{MapKind, ReindexRole};
-    let circuit = &final_view(chain).circuit;
-    circuit
-        .ops()
-        .filter_map(|(mut at, op)| {
-            let OpNode::Map(MapKind::Reindex {
-                role: ReindexRole::ScatterKey { source_cols },
-                ..
-            }) = op
-            else {
-                return None;
-            };
-            loop {
-                match circuit.op(at) {
-                    OpNode::ScanDelta { source, .. } => return Some((*source, source_cols.clone())),
-                    _ => at = circuit.inputs(at)[0],
-                }
-            }
+    (final_view(chain).circuit.ops())
+        .filter_map(|(_, op)| match op {
+            OpNode::ScanDelta { source, scatter: Some(key), .. } => Some((*source, key.iter().map(|s| s.0).collect())),
+            _ => None,
         })
         .collect()
 }
@@ -566,7 +540,24 @@ fn a_join_side_states_the_slots_its_delta_is_routed_by() {
 fn the_null_keeping_rekey_is_emitted_only_over_a_nullable_key() {
     let cat = cat();
     let n = 20;
-    let rekeys = |body: &str, source: u64| scatter_keys(&view(&cat, body)).iter().filter(|k| k.0 == source).count();
+    // The re-keys of `source`'s rows as scanned, through filters and projections.
+    let rekeys = |body: &str, source: u64| {
+        use gnitz_wire::MapKind;
+        let chain = view(&cat, body);
+        let circuit = &final_view(&chain).circuit;
+        let scanned = |mut at: gnitz_wire::NodeId| loop {
+            match circuit.op(at) {
+                OpNode::ScanDelta { source, .. } => return Some(*source),
+                OpNode::Filter(_) | OpNode::Map(MapKind::Compute(_)) => at = circuit.inputs(at)[0],
+                _ => return None,
+            }
+        };
+        (circuit.ops())
+            .filter(|(at, op)| {
+                matches!(op, OpNode::Map(MapKind::Reindex { .. })) && scanned(circuit.inputs(*at)[0]) == Some(source)
+            })
+            .count()
+    };
     let not_null = "SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k";
     assert_eq!([rekeys(not_null, A), rekeys(not_null, B)], [1, 1]);
     let nullable = "SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k";

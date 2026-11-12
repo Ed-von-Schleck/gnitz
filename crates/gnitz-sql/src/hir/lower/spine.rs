@@ -10,8 +10,9 @@ use super::{
 use crate::access::candidates;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
+use gnitz_core::Schema;
 use gnitz_wire::ReadBound;
-use gnitz_wire::{Circuit, NodeId, ReindexRole, ReindexSlot};
+use gnitz_wire::{Circuit, NodeId, ReindexSlot};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -21,6 +22,9 @@ use std::rc::Rc;
 pub(super) struct Spine<'a> {
     seg: SegInput,
     levels: Vec<(Level<'a>, HashSet<ColId>)>,
+    /// The key the source's delta is co-located by ahead of the circuit, in the
+    /// source's own columns; `None` leaves it where the source's store places it.
+    scatter: Option<Vec<ReindexSlot>>,
 }
 
 enum Level<'a> {
@@ -55,54 +59,11 @@ pub(super) enum Top {
     Slots,
 }
 
-/// Where an opened input's columns come from in the scanned relation: the
-/// source column behind each surviving column, and the source PK, which the
-/// levels carry verbatim at the front of the key region.
-pub(super) struct SourceOrigin {
-    /// Keyed by the id a column carries above the fused levels; a computed
-    /// column is absent.
-    cols: HashMap<ColId, u32>,
-    pk: Vec<u32>,
-}
-
-impl SourceOrigin {
-    /// True iff `id` names a verbatim copy of a source column.
-    pub(super) fn resolves(&self, id: ColId) -> bool {
-        self.cols.contains_key(&id)
-    }
-
-    /// Slot `slot` of `frame` as a column of the source relation.
-    fn slot(&self, frame: &Frame, slot: usize) -> Option<u32> {
-        let by_id = frame
-            .layout
-            .get(slot)
-            .copied()
-            .flatten()
-            .and_then(|id| self.cols.get(&id))
-            .copied();
-        // An auto-prepended PK column carries no id to look up.
-        let by_pk = frame
-            .schema
-            .pk_cols()
-            .iter()
-            .position(|&c| c as usize == slot)
-            .and_then(|j| self.pk.get(j))
-            .copied();
-        debug_assert!(
-            by_id.is_none() || by_pk.is_none() || by_id == by_pk,
-            "slot {slot} resolves to source column {by_id:?} by id and {by_pk:?} by PK position",
-        );
-        by_id.or(by_pk)
-    }
-
-    /// The columns of `key`, restated over the source relation.
-    pub(super) fn scatter_role(&self, frame: &Frame, key: &[ReindexSlot]) -> Option<ReindexRole> {
-        let source_cols = key
-            .iter()
-            .map(|&(c, _)| self.slot(frame, c as usize))
-            .collect::<Option<Vec<u32>>>()?;
-        Some(ReindexRole::ScatterKey { source_cols })
-    }
+/// `schema`'s PK as a reindex key: each column at its key slot's type.
+pub(super) fn pk_slots(schema: &Schema) -> Vec<ReindexSlot> {
+    (schema.pk_cols().iter())
+        .map(|&c| (c, schema.columns()[c as usize].ty.tc.reindex_output_type()))
+        .collect()
 }
 
 /// Open `rel` for a consumer reading `live` of it. Its `Filter` / `Project` levels
@@ -141,7 +102,7 @@ pub(super) fn open<'a>(
     };
     levels.truncate(fused);
     levels.reverse();
-    Ok(Spine { seg, levels })
+    Ok(Spine { seg, levels, scatter: None })
 }
 
 impl Spine<'_> {
@@ -156,13 +117,25 @@ impl Spine<'_> {
 
     /// A hidden segment read whole, with nothing fused above it.
     pub(super) fn segment(seg: SegInput) -> Spine<'static> {
-        Spine { seg, levels: Vec::new() }
+        Spine { seg, levels: Vec::new(), scatter: None }
     }
 
-    /// Where this spine's columns come from in the opened relation. A bare
-    /// column reference copies its column verbatim, whether [`Self::emit`]
-    /// relabels it or emits it; anything else ends that column's chain.
-    pub(super) fn origin(&self) -> SourceOrigin {
+    /// The source's delta co-located by `key`, its own columns, ahead of the
+    /// circuit; broadcast by an empty one.
+    pub(super) fn scatter(&mut self, key: Vec<ReindexSlot>) {
+        self.scatter = Some(key);
+    }
+
+    /// The source's PK as a scatter key.
+    pub(super) fn pk_key(&self) -> Vec<ReindexSlot> {
+        pk_slots(&self.seg.frame.schema)
+    }
+
+    /// The column of the opened relation each of `ids` is a verbatim copy of, or
+    /// `None` where one is computed. A bare column reference copies its column
+    /// verbatim, whether [`Self::emit`] relabels it or emits it; anything else
+    /// ends that column's chain.
+    pub(super) fn source_cols(&self, ids: impl IntoIterator<Item = ColId>) -> Option<Vec<u32>> {
         let mut cols: HashMap<ColId, u32> = self
             .seg
             .frame
@@ -179,16 +152,13 @@ impl Spine<'_> {
                 .filter_map(|it| Some((it.out.id, *cols.get(&it.expr.as_col()?)?)))
                 .collect();
         }
-        SourceOrigin {
-            cols,
-            pk: self.seg.frame.schema.pk_cols().to_vec(),
-        }
+        ids.into_iter().map(|id| cols.get(&id).copied()).collect()
     }
 
     /// Emit the levels into `cb`. A rename-only projection relabels the frame
     /// instead of emitting a node, except the outermost one under `Top::Output`.
     pub(super) fn emit(self, cb: &mut Circuit, top: Top) -> Result<(NodeId, Frame), GnitzSqlError> {
-        let Spine { seg, levels } = self;
+        let Spine { seg, levels, mut scatter } = self;
         let SegInput { src, mut frame } = seg;
         let output_at = match top {
             Top::Output => levels.iter().rposition(|(l, _)| matches!(l, Level::Project(_))),
@@ -213,7 +183,7 @@ impl Spine<'_> {
                     }
                     let at = match node {
                         Some(at) => at,
-                        None => source(cb, &src, &frame, std::mem::take(&mut leading))?,
+                        None => source(cb, &src, &frame, std::mem::take(&mut leading), scatter.take())?,
                     };
                     let (at, out) = project_front(cb, at, &items, &frame)?;
                     node = Some(at);
@@ -223,19 +193,20 @@ impl Spine<'_> {
         }
         let node = match node {
             Some(at) => at,
-            None => source(cb, &src, &frame, leading)?,
+            None => source(cb, &src, &frame, leading, scatter.take())?,
         };
         Ok((node, frame))
     }
 }
 
-/// `src`'s delta node, bounded by what `leading` gives a catalog source, then one
-/// filter per leading WHERE.
+/// `src`'s delta node, co-located by `scatter` and bounded by what `leading`
+/// gives a catalog source, then one filter per leading WHERE.
 fn source(
     cb: &mut Circuit,
     src: &SegSource,
     frame: &Frame,
     leading: Vec<Vec<BoundExpr>>,
+    scatter: Option<Vec<ReindexSlot>>,
 ) -> Result<NodeId, GnitzSqlError> {
     // The bound only narrows the scan; every leading conjunct is still filtered below.
     let bound = match src {
@@ -255,7 +226,7 @@ fn source(
                 .unwrap_or(ReadBound::None)
         }
     };
-    let mut node = cb.input_delta(src.tid(), bound);
+    let mut node = cb.input_scattered(src.tid(), bound, scatter);
     for preds in &leading {
         node = filter(cb, node, preds, &frame.schema)?;
     }

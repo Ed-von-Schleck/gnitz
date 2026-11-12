@@ -9,7 +9,7 @@ use gnitz_zset::algebra::{Placement, Slot};
 
 /// `circuit`'s routing. A view's schema decides only which key its placement
 /// names, which no route reads.
-pub(super) fn routing(circuit: &Circuit, registry: &RelationRegistry) -> Result<ViewMeta, String> {
+pub(super) fn routing<'a>(circuit: &Circuit, registry: &'a RelationRegistry) -> Result<ViewMeta<'a>, String> {
     let view = crate::test_support::make_schema_u64_i64();
     ViewMeta::derive(circuit, registry, &view).map(|(meta, _)| meta)
 }
@@ -20,7 +20,7 @@ pub(super) const VIEW: u64 = 99;
 /// `circuit` compiled into a view of the schema it outputs.
 pub(super) fn compile(circuit: &Circuit, registry: &RelationRegistry, bounded: bool) -> Result<CompileOutput, String> {
     let meta = routing(circuit, registry)?;
-    let ctx = EmitCtx::emit(circuit, registry, &meta, VIEW)?;
+    let ctx = EmitCtx::emit(circuit, &meta, VIEW)?;
     let view = ctx.prog.schema_of(ctx.regs[circuit.out()]);
     compile_view(circuit, registry, VIEW, &view, bounded).map(|(out, _)| out)
 }

@@ -15,14 +15,17 @@ fn sample(op: Opcode) -> OpNode {
         Opcode::JoinRange => OpNode::Join(JoinKind::Range { rel: RangeRel::Le }),
         Opcode::JoinCross => OpNode::Join(JoinKind::Cross),
         // Every aggregate, at a distinct source column.
-        Opcode::Reduce => OpNode::Reduce(GroupAggs {
-            group_cols: vec![2, 7],
-            aggs: AggFunc::ALL
-                .iter()
-                .enumerate()
-                .map(|(i, &agg_op)| AggDescriptor { agg_op, col_idx: i as u32 })
-                .collect(),
-        }),
+        Opcode::Reduce => OpNode::Reduce {
+            group: GroupAggs {
+                group_cols: vec![2, 7],
+                aggs: AggFunc::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &agg_op)| AggDescriptor { agg_op, col_idx: i as u32 })
+                    .collect(),
+            },
+            local: false,
+        },
         Opcode::Distinct => OpNode::WeightClamp(ClampKind::Distinct),
         // A non-ascending index column list: `PkColList`'s `PartialEq` spans the
         // whole backing array, so a reordered list fails the round-trip.
@@ -34,6 +37,7 @@ fn sample(op: Opcode) -> OpNode {
                 5,
                 89,
             )),
+            scatter: Some(vec![(1, TypeCode::I64), (6, TypeCode::U32)]),
         },
         Opcode::ExchangeShard => OpNode::ExchangeShard,
         Opcode::NullExtend => OpNode::NullExtend {
@@ -47,12 +51,10 @@ fn sample(op: Opcode) -> OpNode {
         Opcode::MapHashRow => OpNode::Map(MapKind::HashRow {
             cols: vec![(1, TypeCode::String), (2, TypeCode::I32)],
         }),
-        Opcode::WorkerFilter => OpNode::WorkerFilter,
         Opcode::PositivePart => OpNode::WeightClamp(ClampKind::PositivePart),
         Opcode::MapReindex => OpNode::Map(MapKind::Reindex {
             keep: vec![0],
             key: vec![(2, TypeCode::I64), (5, TypeCode::U32)],
-            role: ReindexRole::ScatterKey { source_cols: vec![1, 6] },
             nulls: NullKeys::Drop,
         }),
         Opcode::TopN => OpNode::TopN {
@@ -77,11 +79,16 @@ fn sample(op: Opcode) -> OpNode {
 }
 
 fn scan(source: u64) -> OpNode {
-    OpNode::ScanDelta { source, bound: crate::ReadBound::None }
+    OpNode::ScanDelta {
+        source,
+        bound: crate::ReadBound::None,
+        scatter: None,
+    }
 }
 
-/// The bytes of one unbounded scan in a cell: its tag, its source, its bound tag.
-const SCAN_LEN: usize = 10;
+/// The bytes of one unbounded scan stating no scatter key in a cell: its tag,
+/// its source, its bound tag, its scatter flag.
+const SCAN_LEN: usize = 11;
 
 /// `op` behind one unbounded scan per input slot, wired on them in descending
 /// order, so a codec that swapped a binary operator's slots fails the round-trip.
@@ -120,8 +127,9 @@ fn cell(nodes: &[(OpNode, &[NodeId])]) -> Vec<u8> {
 #[test]
 fn every_op_node_variant_roundtrips() {
     let mut nodes: Vec<OpNode> = Opcode::ALL.iter().map(|&op| sample(op)).collect();
-    // The shapes an opcode's own sample cannot also be: the other bound kinds,
-    // and the empty lists each counted layout allows.
+    // The shapes an opcode's own sample cannot also be: the other bound kinds, a
+    // scan stating no scatter key and one stating a broadcast, and the empty lists
+    // each counted layout allows.
     nodes.extend([
         scan(7),
         OpNode::ScanDelta {
@@ -130,14 +138,18 @@ fn every_op_node_variant_roundtrips() {
                 8,
                 [&7u64.to_be_bytes()[..], &2u64.to_be_bytes()[..]],
             )),
+            scatter: Some(vec![]),
         },
         OpNode::Map(MapKind::Compute(ComputeMap { program: vec![9, 9], out_cols: vec![] })),
         // A hash-row target's domain is the copy kernel's, not this decode's.
         OpNode::Map(MapKind::HashRow { cols: vec![(3, TypeCode::U128)] }),
-        OpNode::Reduce(GroupAggs {
-            group_cols: vec![],
-            aggs: vec![AggDescriptor::COUNT_STAR],
-        }),
+        OpNode::Reduce {
+            group: GroupAggs {
+                group_cols: vec![],
+                aggs: vec![AggDescriptor::COUNT_STAR],
+            },
+            local: false,
+        },
         // The global shape: no group, one key, no offset — and a zero limit,
         // which frames fine: refusing it is the top-N kernel's.
         OpNode::TopN {
@@ -146,18 +158,10 @@ fn every_op_node_variant_roundtrips() {
             limit: 0,
             offset: 0,
         },
-        // The other role and NULL-key rule than the sample's.
+        // The other NULL-key rule than the sample's.
         OpNode::Map(MapKind::Reindex {
             keep: vec![0],
             key: vec![(2, TypeCode::I64)],
-            role: ReindexRole::Auxiliary,
-            nulls: NullKeys::Keep,
-        }),
-        // A stated route of no columns: a broadcast.
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            key: vec![(2, TypeCode::I64)],
-            role: ReindexRole::ScatterKey { source_cols: vec![] },
             nulls: NullKeys::Keep,
         }),
     ]);
@@ -211,7 +215,7 @@ fn each_opcode_cell_refuses_every_perturbation() {
 #[test]
 fn the_cell_layout_is_pinned_to_its_version() {
     let cells: Vec<u8> = Opcode::ALL.iter().flat_map(|&op| wired(sample(op)).encode()).collect();
-    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (16, 0x5a00_1a9f_b96b_b403));
+    assert_eq!((CIRCUIT_VERSION, crate::checksum(&cells)), (19, 0x46dc_49ec_c771_df88));
 }
 
 /// Every framing guard, against the forgery that trips it.
@@ -223,11 +227,10 @@ fn each_decode_guard_rejects_its_own_forgery() {
         bytes[tag_at(op) + off] = v;
         bytes
     };
-    // tag 0 | nulls 1 | key count 2..4 | col 4..8 | type 8 | keep count 9..11 | role 11
+    // tag 0 | nulls 1 | key count 2..4 | col 4..8 | type 8 | keep count 9..11
     let aux = OpNode::Map(MapKind::Reindex {
         keep: vec![],
         key: vec![(3, TypeCode::I64)],
-        role: ReindexRole::Auxiliary,
         nulls: NullKeys::Keep,
     });
     // tag 0 | count 1..3 | col 3..7 | type 7
@@ -237,16 +240,19 @@ fn each_decode_guard_rejects_its_own_forgery() {
         type_codes: vec![TypeCode::I64],
         nulls_first: false,
     };
-    // tag 0 | group count 1..3 | agg count 3..5 | func 5
-    let reduce = OpNode::Reduce(GroupAggs {
-        group_cols: vec![],
-        aggs: vec![AggDescriptor::COUNT_STAR],
-    });
+    // tag 0 | local 1 | group count 2..4 | agg count 4..6 | func 6
+    let reduce = OpNode::Reduce {
+        group: GroupAggs {
+            group_cols: vec![],
+            aggs: vec![AggDescriptor::COUNT_STAR],
+        },
+        local: false,
+    };
     let cases = [
         (poke(&aux, 1, outside(NullKeys::from_wire)), "unknown NullKeys"),
         (poke(&aux, 8, 0), "unknown TypeCode 0"),
         (poke(&aux, 8, 200), "unknown TypeCode 200"),
-        (poke(&aux, 11, 2), "boolean byte 2"),
+        (poke(&reduce, 1, 2), "boolean byte 2"),
         (poke(&hash_row, 7, 0), "unknown TypeCode 0"),
         (poke(&null_ext, 4, 200), "unknown TypeCode 200"),
         // tag 0 | rel 1
@@ -254,7 +260,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
             poke(&sample(Opcode::JoinRange), 1, outside(RangeRel::from_wire)),
             "unknown RangeRel",
         ),
-        (poke(&reduce, 5, outside(AggFunc::from_wire)), "unknown AggFunc"),
+        (poke(&reduce, 6, outside(AggFunc::from_wire)), "unknown AggFunc"),
         // The encoder is infallible; the decode refuses by the count before
         // reading the body.
         (
@@ -305,38 +311,29 @@ fn decode_accepts_a_circuit_at_the_node_cap() {
 /// spell one, its operator fixing how many inputs it reads.
 #[test]
 fn push_refuses_a_malformed_operator_built_or_decoded() {
-    let key = vec![(3, TypeCode::I64)];
-    let reindex = |role, key| {
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![],
-            key,
-            role,
-            nulls: NullKeys::Keep,
-        })
-    };
-    let scatter = |source_cols| ReindexRole::ScatterKey { source_cols };
+    let keyless = OpNode::Map(MapKind::Reindex {
+        keep: vec![],
+        key: vec![],
+        nulls: NullKeys::Keep,
+    });
     let forward = "a node's input is not an earlier node";
     let arity = "node's inputs do not match its operator's arity";
-    let reduce = OpNode::Reduce(GroupAggs {
-        group_cols: vec![0],
-        aggs: vec![AggDescriptor::COUNT_STAR],
-    });
-    let countless = OpNode::Reduce(GroupAggs {
-        group_cols: vec![0],
-        aggs: vec![AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum }],
-    });
-    let cases: [(OpNode, &[NodeId], &str); 8] = [
-        (
-            reindex(ReindexRole::Auxiliary, vec![]),
-            &[0],
-            "a reindex names no key columns",
-        ),
-        // A route names leading slots of the key.
-        (
-            reindex(scatter(vec![1, 2]), key),
-            &[0],
-            "a scatter key is longer than its reindex key",
-        ),
+    let reduce = OpNode::Reduce {
+        group: GroupAggs {
+            group_cols: vec![0],
+            aggs: vec![AggDescriptor::COUNT_STAR],
+        },
+        local: false,
+    };
+    let countless = OpNode::Reduce {
+        group: GroupAggs {
+            group_cols: vec![0],
+            aggs: vec![AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum }],
+        },
+        local: false,
+    };
+    let cases: [(OpNode, &[NodeId], &str); 7] = [
+        (keyless, &[0], "a reindex names no key columns"),
         (
             OpNode::Map(MapKind::HashRow { cols: vec![] }),
             &[0],
@@ -427,5 +424,9 @@ fn the_reduce_builders_differ_in_the_exchange() {
         [global, grouped, local].map(|id| c.owes_ground_row(id)),
         [true, false, false]
     );
-    assert_eq!(c.op(c.inputs(grouped)[0]), &OpNode::ExchangeShard);
+    assert_eq!(
+        [global, grouped, local].map(|id| c.op(id).exchanges()),
+        [true, true, false]
+    );
+    assert_eq!(c.inputs(grouped), [input]);
 }

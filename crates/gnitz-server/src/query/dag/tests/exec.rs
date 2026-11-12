@@ -167,17 +167,16 @@ fn a_ticks_independent_rounds_share_one_wait() {
 /// `a ⋈ b` on their `v`, `a`'s side through a `DISTINCT` where `distinct`: a
 /// clamp folds the register `a`'s relay round writes, a plain re-key does not.
 fn join_on_v(a: u64, b: u64, distinct: bool) -> Circuit {
-    use gnitz_wire::{NullKeys, ReindexRole};
+    use gnitz_wire::NullKeys;
     let mut circuit = Circuit::default();
     let key = [(1, TypeCode::I64)];
     let deltas = [(a, distinct), (b, false)].map(|(source, distinct)| {
-        let scan = circuit.input_delta(source, ReadBound::None);
+        let scan = circuit.input_scattered(source, ReadBound::None, Some(key.to_vec()));
         let rows = match distinct {
             true => circuit.distinct(scan),
             false => scan,
         };
-        let role = ReindexRole::ScatterKey { source_cols: vec![1] };
-        circuit.map_reindex(rows, &key, &[0], role, NullKeys::Keep)
+        circuit.map_reindex(rows, &key, &[0], NullKeys::Keep)
     });
     circuit.join(deltas, deltas, gnitz_wire::JoinKind::Equi);
     circuit

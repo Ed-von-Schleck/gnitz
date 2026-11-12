@@ -30,7 +30,6 @@ pub(crate) fn rekey_plan(
     let rekey = gnitz_wire::MapKind::Reindex {
         keep: keep.to_vec(),
         key: self_typed_slots(source, key),
-        role: gnitz_wire::ReindexRole::Auxiliary,
         nulls,
     };
     crate::algebra::MapPlan::from_wire(source, &rekey).expect("fixture reindex is well-formed")
