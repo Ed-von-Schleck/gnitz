@@ -14,9 +14,10 @@ fn plan(registry: &RelationRegistry, build: impl FnOnce(&mut Circuit)) -> Result
     compile(&c, registry, false).map(|out| out.vm)
 }
 
-/// A join's two terms each read the other side as it stood before the epoch, so
-/// a relation feeding both deltas would lose their product in every epoch of
-/// it — whether through two scans or through one delta computed from the other.
+/// A join's two terms each read an integral as it stood before the epoch, so a
+/// relation feeding a term's delta and its integral would lose their product in
+/// every epoch of it — whether through two scans, through one delta computed
+/// from the other, or through an integrand the other delta does not feed.
 /// A `Filter` program that does not decode aborts the compile: passing every row
 /// instead would turn the WHERE into WHERE TRUE.
 #[test]
@@ -24,13 +25,13 @@ fn a_join_one_relation_feeds_twice_and_a_corrupt_filter_are_rejected() {
     use TypeCode::I64;
     let schema = make_schema_u64_i64();
     let registry = sources([(10, schema), (11, schema)]);
-    let cases: [(Build, &str); 4] = [
+    let cases: [(Build, &str); 5] = [
         (
             |c| {
                 let deltas = [10, 10].map(|s| reindexed_on_col1(c, s, I64));
                 c.join(deltas, deltas, JoinKind::Equi);
             },
-            "join: one relation feeds both deltas",
+            "join: one relation feeds a delta and the integral it probes",
         ),
         (
             |c| {
@@ -38,7 +39,15 @@ fn a_join_one_relation_feeds_twice_and_a_corrupt_filter_are_rejected() {
                 let dm = c.negate(da);
                 c.join([da, dm], [da, dm], JoinKind::Equi);
             },
-            "join: one relation feeds both deltas",
+            "join: one relation feeds a delta and the integral it probes",
+        ),
+        (
+            |c| {
+                let [da, db, again] = [10, 11, 10].map(|s| reindexed_on_col1(c, s, I64));
+                let ib = c.union(db, again);
+                c.join([da, db], [da, ib], JoinKind::Equi);
+            },
+            "join: one relation feeds a delta and the integral it probes",
         ),
         (
             |c| {
@@ -284,7 +293,7 @@ fn relays(of: u32, sources: [Source; 2], build: impl FnOnce(&mut Circuit)) -> (u
     build(&mut c);
     let out = compile(&c, &registry, false).expect("the fixture compiles");
     let relayed = out.source_ids().filter(|&s| out.scan(s).relay.is_some()).count();
-    let rounds = out.vm.ops().filter(|op| matches!(op, Op::Round { .. })).count();
+    let rounds = out.vm.ops().filter(|op| matches!(op, Op::Round(_))).count();
     let shares = out.vm.ops().filter(|op| matches!(op, Op::Share(_))).count();
     (relayed + rounds, shares)
 }

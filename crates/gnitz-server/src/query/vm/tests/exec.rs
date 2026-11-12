@@ -21,6 +21,13 @@ impl Vm {
     }
 }
 
+impl Replay {
+    /// The integral the replay's seed is gathered from.
+    pub(in crate::query) fn seed(&self) -> Integral {
+        self.seed
+    }
+}
+
 /// The view a test program's children are opened under.
 const VIEW_ID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
 
@@ -106,6 +113,7 @@ impl TestVm {
             unfed: &self.unfed,
         };
         let out = f(&mut self.vm, &mut stores).unwrap();
+        assert_eq!(self.vm.batches.len(), self.vm.regs.len(), "a run left no registers");
         assert!(
             self.vm.batches.iter().all(Batch::is_empty),
             "a run left a register holding rows"
@@ -124,8 +132,9 @@ impl TestVm {
         self.epoch_with(reg, &mut seed, true, |_, _| panic!("the program stands at a round"))
     }
 
-    /// One tick's epoch over the lent `seed`, each round it stands at answered by
-    /// `gather`, which is handed the round's rows and whether they were lent.
+    /// One tick's epoch over `seed`, given where `take` and lent otherwise, each
+    /// round it stands at answered by `gather`, which is handed the round's rows
+    /// and whether they were lent.
     fn epoch_with(
         &mut self,
         reg: DeltaReg,
@@ -134,29 +143,23 @@ impl TestVm {
         mut gather: impl FnMut(&Batch, bool) -> Batch,
     ) -> Batch {
         self.drive(|vm, stores| {
-            let mut epoch = Epoch::tick(reg, seed.take(), take);
-            let mut gathered = None;
+            let seed = Some(seed).filter(|seed| !seed.is_empty());
+            let mut ran = start(vm, stores, reg, seed, take)?;
             loop {
-                match run(vm, stores, &mut epoch, gathered.take())? {
-                    Ran::Done(out) => {
-                        if let Some(lent) = epoch.into_lent() {
-                            *seed = lent;
-                        }
-                        return Ok(out);
-                    }
-                    Ran::Round { .. } => {
-                        let batch = epoch.operand();
-                        let lent = matches!(batch, Cow::Borrowed(_));
-                        gathered = Some(gather(&batch, lent));
-                    }
-                }
+                let mut epoch = match ran {
+                    Ran::Done(out) => return Ok(out),
+                    Ran::Round(epoch) => epoch,
+                };
+                let (batch, _, _) = epoch.round();
+                let rows = gather(&batch, matches!(batch, Cow::Borrowed(_)));
+                ran = resume(vm, stores, epoch, rows)?;
             }
         })
     }
 
     fn replay(&mut self, reg: DeltaReg, seed: Batch) -> Batch {
-        let entry = self.vm.replay_entry(reg).unwrap();
-        self.drive(|vm, stores| replay_chunk(vm, stores, entry, seed))
+        self.vm.replayable(reg).unwrap();
+        self.drive(|vm, stores| run_through(vm, stores, reg, false, seed))
     }
 
     /// The rows one child store holds, at their net weights.
@@ -373,7 +376,7 @@ fn a_join_over_its_source_reads_it_up_to_its_cut() {
 }
 
 /// A hydration replay seeds any register, a mid-program one included, and runs
-/// from its first reader past every stateful operator its seed does not reach,
+/// past every stateful operator its seed does not reach,
 /// integrating nothing: an integrate would write the seed back and double the
 /// trace's weights on every read. It is refused where the seed reaches a
 /// stateful operator, directly or through another operator.
@@ -389,8 +392,8 @@ fn a_replay_runs_past_what_its_seed_does_not_reach_and_integrates_nothing() {
     let out = p.push(mid, schema, Op::Union { in_b: clamped });
     p.integrate(out, trace);
     let mut vm = TestVm::open(p, out);
-    assert!(vm.replay_entry(nb).is_err(), "the clamp reads it");
-    assert!(vm.replay_entry(b).is_err(), "the clamp reads it through the negate");
+    assert!(vm.replayable(nb).is_err(), "the clamp reads it");
+    assert!(vm.replayable(b).is_err(), "the clamp reads it through the negate");
 
     assert_rows(&vm.epoch(b, make_batch_u128(&schema, &[(1, -1, 10)])), &[(1, 1, 10)]);
     let held = |vm: &TestVm| [hist, trace].map(|t| weighted_rows(&vm.held(t)));
@@ -500,12 +503,12 @@ fn a_round_sends_its_operand_and_resumes_from_what_it_gathered() {
     assert_rows(&got, &[(1, -1, 10), (7, 2, 70)]);
 }
 
-/// An epoch given up at its round leaves rows in a register a later
-/// instruction reads; the program's next run frees them before it starts, so an
-/// empty seed, which skips the instruction that writes that register, does not
-/// read them.
+/// An epoch dropped at its round takes the registers with it, the rows a
+/// later instruction reads among them: the program's next run starts from
+/// fresh ones, so an empty seed, which skips the instruction that writes that
+/// register, reads none of them.
 #[test]
-fn a_run_after_an_epoch_left_at_its_round_starts_from_empty_registers() {
+fn a_run_after_an_epoch_dropped_at_its_round_starts_from_empty_registers() {
     let schema = make_schema_u128_i64();
     let mut p = ProgramBuilder::default();
     let r0 = p.seed(schema);
@@ -519,62 +522,85 @@ fn a_run_after_an_epoch_left_at_its_round_starts_from_empty_registers() {
         registry: &vm.registry,
         unfed: &vm.unfed,
     };
-    let mut left = Epoch::tick(r0, make_batch_u128(&schema, &[(1, 1, 10)]), true);
-    let ran = run(&mut vm.vm, &mut stores, &mut left, None).unwrap();
-    assert!(matches!(ran, Ran::Round { .. }));
-    drop(left);
-    assert!(
-        vm.vm.batches.iter().any(|b| !b.is_empty()),
-        "the abandoned epoch's negation stands"
-    );
+    let mut seed = make_batch_u128(&schema, &[(1, 1, 10)]);
+    let ran = start(&mut vm.vm, &mut stores, r0, Some(&mut seed), true).unwrap();
+    assert!(matches!(ran, Ran::Round(_)));
+    drop(ran);
+    assert!(vm.vm.batches.is_empty(), "the dropped epoch held the registers");
 
     let mut seed = Batch::empty_with_schema(&schema);
     let got = vm.epoch_with(r0, &mut seed, true, |_, _| make_batch_u128(&schema, &[(7, 2, 70)]));
     assert_rows(&got, &[(7, 2, 70)]);
 }
 
-/// A round over the seed lends the caller's batch on, taking it only where the
-/// caller let it, and sends it as its register holds it: folded in place where
-/// a broadcast owes its reader the fold — one sort, not one per worker — and as
-/// the caller made it under a keyed round, whose receiver folds. A lent seed
-/// comes back as sent, a taken one empty.
+/// A round over the seed sends it as the caller made it — the round's receiver
+/// folds — and takes it: the caller's batch where given, and where lent the
+/// epoch's own copy, the caller's delta its again as it lent it.
 #[test]
-fn a_round_over_the_seed_sends_it_as_its_register_holds_it() {
+fn a_round_over_the_seed_sends_it_as_the_caller_made_it() {
     let schema = make_schema_u128_i64();
     let raw = [(2, 1, 20), (1, 1, 10), (2, 1, 20)];
-    for broadcast in [false, true] {
-        for take in [false, true] {
-            let plan = if broadcast {
-                Rc::new(ScatterPlan::broadcast())
-            } else {
-                own_rows(&schema)
-            };
-            let mut p = ProgramBuilder::default();
-            let r0 = p.seed(schema);
-            let gathered = p.round(r0, plan);
-            let (out, _) = distinct(&mut p, gathered);
-            let mut vm = TestVm::open(p, out);
+    for take in [false, true] {
+        let mut p = ProgramBuilder::default();
+        let r0 = p.seed(schema);
+        let gathered = p.round(r0, own_rows(&schema));
+        let (out, _) = distinct(&mut p, gathered);
+        let mut vm = TestVm::open(p, out);
 
-            let mut seed = make_batch_u128_raw(&schema, &raw);
-            let mut sent = Vec::new();
-            let got = vm.epoch_with(r0, &mut seed, take, |rows, lent| {
-                sent.push((rows.is_consolidated(), lent));
-                rows.clone()
-            });
-            let case = format!("broadcast {broadcast}, take {take}");
-            assert_eq!(sent, [(broadcast, !take)], "{case}");
-            assert_rows(&got, &[(1, 1, 10), (2, 1, 20)]);
-            let back: &[_] = match (take, broadcast) {
-                (true, _) => &[],
-                (false, true) => &[(1, 1, 10), (2, 2, 20)],
-                (false, false) => &raw,
+        let mut seed = make_batch_u128_raw(&schema, &raw);
+        let mut sent = Vec::new();
+        let got = vm.epoch_with(r0, &mut seed, take, |rows, lent| {
+            sent.push((rows.is_consolidated(), lent));
+            rows.clone()
+        });
+        assert_eq!(sent, [(false, false)], "take {take}");
+        assert_rows(&got, &[(1, 1, 10), (2, 1, 20)]);
+        let back: &[_] = if take { &[] } else { &raw };
+        assert_eq!(
+            weighted_rows(&seed),
+            weighted_rows(&make_batch_u128_raw(&schema, back)),
+            "take {take}"
+        );
+    }
+}
+
+/// A lent seed is the caller's again once the epoch stands at a round, and
+/// stays so: the batch itself where the epoch reads its seed no more, and a
+/// copy where an instruction past the round reads it.
+#[test]
+fn a_lent_seed_is_the_callers_again_at_the_first_round() {
+    let schema = make_schema_u128_i64();
+    let rows = [(1, 1, 10)];
+    for reads_again in [false, true] {
+        let mut p = ProgramBuilder::default();
+        let r0 = p.seed(schema);
+        let negated = p.push(r0, schema, Op::Negate);
+        let gathered = p.round(negated, own_rows(&schema));
+        let out = match reads_again {
+            true => p.push(gathered, schema, Op::Union { in_b: r0 }),
+            false => gathered,
+        };
+        let mut vm = TestVm::open(p, out);
+
+        let mut seed = make_batch_u128(&schema, &rows);
+        let got = vm.drive(|vm, stores| {
+            let Ran::Round(mut epoch) = start(vm, stores, r0, Some(&mut seed), false)? else {
+                panic!("the epoch stands at its round")
             };
-            assert_eq!(
-                weighted_rows(&seed),
-                weighted_rows(&make_batch_u128_raw(&schema, back)),
-                "{case}"
-            );
-        }
+            assert_rows(&seed, &rows);
+            assert_rows(&epoch.round().0, &[(1, -1, 10)]);
+            match resume(vm, stores, epoch, make_batch_u128(&schema, &[(7, 2, 70)]))? {
+                Ran::Done(out) => Ok(out),
+                Ran::Round(_) => panic!("the program has one round"),
+            }
+        });
+        let want: &[_] = if reads_again {
+            &[(1, 1, 10), (7, 2, 70)]
+        } else {
+            &[(7, 2, 70)]
+        };
+        assert_rows(&got, want);
+        assert_rows(&seed, &rows);
     }
 }
 
@@ -603,6 +629,6 @@ fn a_round_runs_by_what_its_epoch_seeds_not_by_what_the_seed_holds() {
     assert_rows(&vm.epoch_with(b, &mut rows, true, &mut echo), &[(1, 1, 10)]);
     assert_eq!(rounds, 1, "the empty epoch of `a`, and not the epoch of `b`");
 
-    assert!(vm.replay_entry(a).is_err());
+    assert!(vm.replayable(a).is_err());
     assert_rows(&vm.replay(b, make_batch_u128(&schema, &[(3, 1, 30)])), &[(3, 1, 30)]);
 }

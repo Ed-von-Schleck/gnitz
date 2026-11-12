@@ -356,10 +356,11 @@ fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &OpNode) -> Result<DeltaReg, St
             let &[da, db, ia, ib] = ctx.circuit.inputs(nid) else {
                 unreachable!("a join is wired on four inputs")
             };
-            // Each term joins a delta to the other side as it stood before the
-            // epoch, so an epoch seeding both deltas would miss their product.
-            if ctx.prog.share_a_seed(ctx.regs[da], ctx.regs[db]) {
-                return Err("join: one relation feeds both deltas".into());
+            // Each term joins a delta to an integral as it stood before the
+            // epoch, so an epoch moving both would miss their product.
+            let shared = |d: NodeId, i: NodeId| ctx.prog.share_a_seed(ctx.regs[d], ctx.regs[i]);
+            if shared(da, ib) || shared(db, ia) {
+                return Err("join: one relation feeds a delta and the integral it probes".into());
             }
             let ab = emit_join_term(ctx, da, ib, *kind, false)?;
             let ba = emit_join_term(ctx, db, ia, *kind, true)?;

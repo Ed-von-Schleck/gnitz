@@ -17,7 +17,7 @@ mod builder;
 mod exec;
 
 pub(in crate::query) use builder::ProgramBuilder;
-pub(in crate::query) use exec::{mint_ground_rows, replay_chunk, run, Epoch, Ran, Stores};
+pub(in crate::query) use exec::{mint_ground_rows, replay_keys, resume, start, Epoch, Ran, Stores};
 
 // ---------------------------------------------------------------------------
 // Instruction set
@@ -70,13 +70,10 @@ pub(in crate::query) enum Op {
     /// worker holds whole.
     Share(Rc<ScatterPlan>),
     /// One exchange round under the plan: every worker's delta in, this worker's
-    /// share of them all out. `seeds`: the seeded registers whose delta reaches
-    /// it. An epoch runs the round iff it seeds one of them, whatever the delta
-    /// holds, so every worker runs the same rounds.
-    Round {
-        plan: Rc<ScatterPlan>,
-        seeds: Box<[DeltaReg]>,
-    },
+    /// share of them all out. An epoch runs the round iff its seed reaches the
+    /// round's operand ([`Reg::rounds`]), whatever the delta holds, so every
+    /// worker runs the same rounds.
+    Round(Rc<ScatterPlan>),
     /// Widen every row with NULL-filled payload columns — the LEFT JOIN
     /// null-fill's unmatched preserved rows — on the side `nulls_first` names.
     /// The column count is the difference between the two registers' schemas.
@@ -149,7 +146,7 @@ fn facts(op: &Op) -> OpFacts {
     let linear = OpFacts { consolidates_in: false, stateful: false };
     match op {
         Op::Filter(_) | Op::Map(_) | Op::Negate | Op::Union { .. } | Op::Share(_) | Op::NullExtend { .. } => linear,
-        Op::Round { .. } => OpFacts { stateful: true, ..linear },
+        Op::Round(_) => OpFacts { stateful: true, ..linear },
         Op::WeightClamp { .. } => OpFacts { consolidates_in: true, stateful: true },
         Op::JoinDT { .. } => OpFacts { consolidates_in: true, ..linear },
         Op::Reduce { plan, .. } => OpFacts {
@@ -174,7 +171,7 @@ impl Instr {
             | Op::WeightClamp { hist: _, kind: _ }
             | Op::JoinDT { trace: _, plan: _ }
             | Op::Share(_)
-            | Op::Round { plan: _, seeds: _ }
+            | Op::Round(_)
             | Op::NullExtend { nulls_first: _ }
             | Op::Reduce { out_trace: _, index: _, plan: _ }
             | Op::Ordered { index: _, plan: _ } => None,
@@ -198,15 +195,13 @@ pub(in crate::query) struct Vm {
     /// a replay read-only.
     integrates: Box<[(DeltaReg, StateIdx)]>,
     regs: Box<[Reg]>,
-    /// One batch per register.
+    /// One batch per register, each empty between runs. An epoch standing at a
+    /// round holds them, and none is here until it runs on.
     batches: Box<[Batch]>,
     /// The register the epoch's output is extracted from.
     out_reg: DeltaReg,
     /// The child stores the instructions and integrates address.
     layout: StateLayout,
-    /// An epoch stopped at a round since the last end of a run: the registers
-    /// may hold its rows.
-    standing: bool,
 }
 
 /// Who last reads a register: an instruction, an integrate — which run after
@@ -219,6 +214,11 @@ enum LastRead {
     Integrate(usize),
 }
 
+/// An empty batch per register, each under its register's label.
+fn registers(regs: &[Reg]) -> Box<[Batch]> {
+    regs.iter().map(|r| Batch::empty_with_schema(&r.schema)).collect()
+}
+
 /// What [`ProgramBuilder::finish`] derived about one register.
 struct Reg {
     schema: SchemaDescriptor,
@@ -226,16 +226,22 @@ struct Reg {
     fold: bool,
     /// Its last reader, which may take its batch.
     last_read: LastRead,
-    /// An epoch seeding it runs an exchange round.
-    feeds_round: bool,
+    /// The exchange rounds, by instruction, an epoch seeding it runs: those
+    /// whose operand its delta reaches.
+    rounds: Box<[usize]>,
 }
 
-/// Where a read-only replay enters a program: the register it seeds and the
-/// first instruction reading it.
+/// A bounded view's read-only replay: the register it seeds, the integral the
+/// seed is gathered from, the clamp the gathered weights are read through — a
+/// clamp's history holds its input, whose clamp is its output — and the payload
+/// columns, as payload bits, it reads of a relation's rows. Made only by
+/// [`Vm::replay`], which refuses a register a replay cannot seed.
 #[derive(Clone, Copy)]
-pub(in crate::query) struct ReplayEntry {
+pub(in crate::query) struct Replay {
     reg: DeltaReg,
-    pc: usize,
+    seed: Integral,
+    clamp: Option<ClampKind>,
+    read: u64,
 }
 
 impl Vm {
@@ -268,49 +274,64 @@ impl Vm {
         self.regs[reg.at()].fold
     }
 
-    /// Label `seed` with `reg`'s schema and fold it where `reg` folds: what an
-    /// epoch seeding `reg` makes of its seed, so a lent seed comes back so.
-    pub(in crate::query) fn label_seed(&self, reg: DeltaReg, seed: &mut Batch) {
+    /// Label `batch` with `reg`'s schema: rows that enter the program at `reg`.
+    pub(in crate::query) fn label(&self, reg: DeltaReg, batch: &mut Batch) {
         let want = &self.regs[reg.at()].schema;
         // Rows under the wrong layout would scramble every downstream read
         // silently.
         assert!(
-            seed.schema().same_region_types(want),
+            batch.schema().same_region_types(want),
             "VM register {} schema/batch region mismatch",
             reg.0,
         );
         // A producer's label may be narrower in nullability. Every kernel labels
         // what it writes with its register's schema, so from here on every
         // register's batch carries its own.
-        seed.set_schema(want);
-        if self.regs[reg.at()].fold {
-            seed.consolidate_in_place();
-        }
+        batch.set_schema(want);
     }
 
     /// An epoch seeding `reg` with an empty delta does nothing: it runs no
     /// exchange round.
     pub(in crate::query) fn idles_on_empty(&self, reg: DeltaReg) -> bool {
-        !self.regs[reg.at()].feeds_round
+        self.regs[reg.at()].rounds.is_empty()
     }
 
-    /// Enter a read-only replay at `reg`'s first reader. Refused where the seed
-    /// would reach a stateful operator.
-    pub(in crate::query) fn replay_entry(&self, reg: DeltaReg) -> Result<ReplayEntry, String> {
-        let pc = self
-            .instructions
-            .iter()
-            .position(|i| i.reads().into_iter().flatten().any(|r| r == reg))
-            .unwrap_or(self.instructions.len());
+    /// Whether anything reads `reg` at or after instruction `pc`: an
+    /// instruction from there on, an integrate, or the epoch's end, which
+    /// extracts the output register.
+    fn read_from(&self, reg: DeltaReg, pc: usize) -> bool {
+        match self.regs[reg.at()].last_read {
+            LastRead::Instr(last) => last >= pc,
+            LastRead::Integrate(_) => true,
+            LastRead::Nobody => reg == self.out_reg,
+        }
+    }
+
+    /// Refuse a replay seeding `reg` where the seed would reach a stateful
+    /// operator.
+    fn replayable(&self, reg: DeltaReg) -> Result<(), String> {
         let mut seeded = vec![false; self.regs.len()];
         seeded[reg.at()] = true;
-        for instr in &self.instructions[pc..] {
+        for instr in self.instructions.iter() {
             let reads_seed = instr.reads().into_iter().flatten().any(|r| seeded[r.at()]);
             if facts(&instr.op).stateful && reads_seed {
                 return Err("replay: the seed reaches a stateful operator".into());
             }
             seeded[instr.out_reg.at()] |= reads_seed;
         }
-        Ok(ReplayEntry { reg, pc })
+        Ok(())
+    }
+
+    /// The replay seeding `reg` with what `seed` holds, read through `clamp`
+    /// and, of a relation's rows, at the payload columns `read`.
+    pub(in crate::query) fn replay(
+        &self,
+        reg: DeltaReg,
+        seed: Integral,
+        clamp: Option<ClampKind>,
+        read: u64,
+    ) -> Result<Replay, String> {
+        self.replayable(reg)?;
+        Ok(Replay { reg, seed, clamp, read })
     }
 }

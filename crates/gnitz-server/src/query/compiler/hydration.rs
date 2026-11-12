@@ -2,18 +2,8 @@
 //! circuit graph, then against the plan the emitter produced.
 
 use super::*;
-use crate::query::vm::ReplayEntry;
+use crate::query::vm::Replay;
 use gnitz_store::relation::RelationKind;
-
-/// Where a bounded view's per-key replay seeds: the register it enters at, the
-/// integral the seed is gathered from, and the clamp the gathered weights are
-/// read through — a clamp's history holds its input, whose clamp is its output.
-#[derive(Clone, Copy)]
-pub(in crate::query) struct Hydration {
-    pub(in crate::query) entry: ReplayEntry,
-    pub(in crate::query) seed: Integral,
-    pub(in crate::query) clamp: Option<ClampKind>,
-}
 
 const UNSUPPORTED: &str =
     "capacity-bounded view: only a filter/projection over one relation or over an inner equi-join is supported";
@@ -21,17 +11,19 @@ const UNSUPPORTED: &str =
 const READS_OWN_STORE: &str =
     "capacity-bounded view: a reduce as its output would read the view's skeleton rows back as its trace";
 
-/// Resolve the seed against the plan the emitter produced for it. The seed is
+/// A bounded view's per-key replay: the register it seeds, the integral the
+/// seed is gathered from, and the clamp the gathered weights are read through,
+/// resolved against the plan the emitter produced. The seed is
 /// gathered by the view's own keys: the output's PK region is the seeded node's,
 /// which a row-local walk and an equi join's delta both keep.
 pub(super) fn derive_hydration(
     circuit: &Circuit,
     registry: &RelationRegistry,
-    vm: &Vm,
+    code: &CompileOutput,
     regs: &[DeltaReg],
     integrals: &[Option<(Integral, DeltaReg, Option<ClampKind>)>],
-) -> Result<Hydration, String> {
-    if vm.reads_view_store() {
+) -> Result<Replay, String> {
+    if code.vm.reads_view_store() {
         return Err(READS_OWN_STORE.into());
     }
     // A replay runs on one worker, and so no exchange round.
@@ -63,11 +55,12 @@ pub(super) fn derive_hydration(
         }
         _ => return Err(UNSUPPORTED.into()),
     };
-    Ok(Hydration {
-        entry: vm.replay_entry(in_reg)?,
-        seed,
-        clamp,
-    })
+    // The replay reads of a scanned source's rows what its backfill does.
+    let read = match seed {
+        Integral::Relation(source) => code.scan(source).read,
+        Integral::Own(_) => u64::MAX,
+    };
+    code.vm.replay(in_reg, seed, clamp, read)
 }
 
 // ---------------------------------------------------------------------------

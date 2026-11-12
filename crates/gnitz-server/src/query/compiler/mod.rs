@@ -9,7 +9,7 @@
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 
-use crate::query::vm::{DeltaReg, Integral, Vm};
+use crate::query::vm::{DeltaReg, Integral, Replay, Vm};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::relation::{Relation, RelationRegistry, StateIdx};
 use gnitz_wire::{AggDescriptor, Circuit, ClampKind, JoinKind, MapKind, NodeId, OpNode, ReadBound};
@@ -25,7 +25,7 @@ mod routing;
 mod fixtures;
 
 use emit::*;
-use hydration::{derive_hydration, Hydration};
+use hydration::derive_hydration;
 use routing::ViewMeta;
 
 // ---------------------------------------------------------------------------
@@ -75,7 +75,7 @@ pub(super) struct CompileOutput {
     /// Each scanned source's scan, once per source, in first-scan order.
     sources: Box<[(u64, Scan)]>,
     /// `Some` iff the view is capacity-bounded.
-    pub(in crate::query) hydration: Option<Hydration>,
+    pub(in crate::query) hydration: Option<Replay>,
     /// Each worker computes the view's whole result locally: it is replicated, or
     /// there is one worker.
     pub(in crate::query) self_contained: bool,
@@ -113,15 +113,15 @@ pub(super) fn compile_view(
     if !vm.out_schema().same_region_types(view_schema) {
         return Err("the circuit's output schema is not the view's".into());
     }
-    let hydration = bounded
-        .then(|| derive_hydration(circuit, registry, &vm, &regs, &integrals))
-        .transpose()?;
-    let output = CompileOutput {
+    let mut output = CompileOutput {
         vm,
         sources: sources.into_boxed_slice(),
-        hydration,
+        hydration: None,
         self_contained: meta.self_contained,
     };
+    if bounded {
+        output.hydration = Some(derive_hydration(circuit, registry, &output, &regs, &integrals)?);
+    }
     Ok((output, placement))
 }
 

@@ -81,7 +81,7 @@ fn a_bounded_view_seeds_from_the_store_holding_its_rows() {
         let (registry, _dir) = tables_at(Slot::SOLO, [(10, kind, table), (11, BaseTable, table)]);
         let mut c = Circuit::default();
         build(&mut c);
-        compile(&c, &registry, true).map(|out| out.hydration.expect("a bounded view").seed)
+        compile(&c, &registry, true).map(|out| out.hydration.expect("a bounded view").seed())
     };
     assert_eq!(seed(BaseTable, linear), Ok(Integral::Relation(10)), "a linear body");
     assert_eq!(seed(BaseTable, on_pk), Ok(Integral::Relation(10)), "a join on the PK");

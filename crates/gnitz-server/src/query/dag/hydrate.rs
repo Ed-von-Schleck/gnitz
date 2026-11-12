@@ -2,10 +2,7 @@
 //! output rows by replaying the view's own program over a key-restricted seed.
 
 use super::*;
-use crate::query::vm::Integral;
 use gnitz_wire::PkKeys;
-use gnitz_zset::repr::empty_cursor;
-use gnitz_zset::stream;
 
 impl DagEngine {
     /// Every row of `view_id` at `keys`, each held by the view's store as a
@@ -17,29 +14,10 @@ impl DagEngine {
         keys: PkKeys,
     ) -> Result<Batch, String> {
         let (code, mut stores) = opened(&mut self.views, registry, view_id, &[])?;
-        let hydration = code
+        let replay = code
             .hydration
             .ok_or_else(|| format!("view {view_id} holds skeleton rows but was compiled unbounded"))?;
-
-        // The replay reads of a scanned source's rows what its backfill does.
-        let read = match hydration.seed {
-            Integral::Relation(source) => code.scan(source).read,
-            Integral::Own(_) => u64::MAX,
-        };
-        let vm = &mut code.vm;
-        let mut gather = stores.gather(hydration.seed, keys, read)?;
-        let mut out = Batch::empty_with_schema(vm.out_schema());
-        while let Some(mut seed) = gather.drain_chunk(registry.scan_chunk_rows()) {
-            if let Some(kind) = hydration.clamp {
-                // Clamped against no history: each gathered weight, clamped.
-                let schema = *seed.schema();
-                let history = stream::History::Before(&mut |_, _| empty_cursor(schema));
-                seed = stream::op_weight_clamp(Cow::Owned(seed), history, kind);
-            }
-            let produced = vm::replay_chunk(vm, &mut stores, hydration.entry, seed)?;
-            out.append_above(produced.into_consolidated());
-        }
-        Ok(out)
+        vm::replay_keys(&mut code.vm, &mut stores, &replay, keys)
     }
 }
 

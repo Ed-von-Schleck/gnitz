@@ -17,40 +17,64 @@ use std::collections::VecDeque;
 fn run_view_epoch(
     host: &mut impl DriveHost,
     view_id: u64,
-    input: Option<Batch>,
+    mut input: Option<Batch>,
     src_id: u64,
     unfed: &[u64],
     drained: &mut bool,
 ) -> Result<Option<Batch>, String> {
-    let (dag, registry) = host.parts();
-    let (mut code, mut stores) = opened(&mut dag.views, registry, view_id, unfed)?;
-    let reg = code.scan(src_id).seed;
-    let seed = match input.filter(|input| !input.is_empty()) {
-        Some(input) => input,
-        None if code.vm.idles_on_empty(reg) => return Ok(None),
-        // Its round runs on every worker, whatever this one holds.
-        None => Batch::empty_with_schema(code.vm.schema_of(reg)),
-    };
-    let mut epoch = vm::Epoch::tick(reg, seed, true);
-    let (mut gathered, mut rows) = (Vec::new(), None);
+    let mut ran = start_epoch(host, view_id, src_id, input.as_mut(), true, unfed)?;
+    let mut gathered = Vec::new();
     loop {
-        match vm::run(&mut code.vm, &mut stores, &mut epoch, rows.take())? {
-            vm::Ran::Done(out) => return Ok((!out.is_empty()).then_some(out)),
-            vm::Ran::Round { plan, fold } => {
-                let lane = Lane {
-                    view: view_id,
-                    batch: epoch.operand(),
-                    plan: &plan,
-                    fold,
-                };
-                *drained = host.exchange(std::iter::once(lane), *drained, &mut gathered);
-                rows = gathered.pop();
-                // The exchange held the host: the plan and its stores are looked up again.
-                let (dag, registry) = host.parts();
-                (code, stores) = opened(&mut dag.views, registry, view_id, unfed)?;
-            }
-        }
+        let mut epoch = match ran {
+            None => return Ok(None),
+            Some(vm::Ran::Done(out)) => return Ok((!out.is_empty()).then_some(out)),
+            Some(vm::Ran::Round(epoch)) => epoch,
+        };
+        let (batch, plan, fold) = epoch.round();
+        let lane = Lane { view: view_id, batch, plan, fold };
+        *drained = host.exchange(std::iter::once(lane), *drained, &mut gathered);
+        let rows = gathered.pop().expect("a lane per round");
+        ran = Some(resume_epoch(host, view_id, epoch, rows, unfed)?);
     }
+}
+
+/// Start view `view_id`'s epoch over `input`, `src_id`'s delta, given where
+/// `take` and lent otherwise, as [`vm::start`] runs it. `None` where the epoch
+/// idles: its delta is empty and reaches no round. `unfed` as [`opened`]'s.
+fn start_epoch(
+    host: &mut impl DriveHost,
+    view_id: u64,
+    src_id: u64,
+    input: Option<&mut Batch>,
+    take: bool,
+    unfed: &[u64],
+) -> Result<Option<vm::Ran>, String> {
+    let (dag, registry) = host.parts();
+    // A view's run reaches it only from a source its circuit scans.
+    let code = &dag.views[&view_id].code;
+    let reg = code.scan(src_id).seed;
+    let seed = input.filter(|input| !input.is_empty());
+    // An empty delta still runs its round, on every worker, whatever this one
+    // holds. One that runs none is skipped before its view's stores are opened.
+    if seed.is_none() && code.vm.idles_on_empty(reg) {
+        return Ok(None);
+    }
+    let (code, mut stores) = opened(&mut dag.views, registry, view_id, unfed)?;
+    vm::start(&mut code.vm, &mut stores, reg, seed, take).map(Some)
+}
+
+/// Run view `view_id`'s `epoch` on over `rows`, what its round gathered. The
+/// exchange held the host: the plan and its stores are looked up again.
+fn resume_epoch(
+    host: &mut impl DriveHost,
+    view_id: u64,
+    epoch: vm::Epoch,
+    rows: Batch,
+    unfed: &[u64],
+) -> Result<vm::Ran, String> {
+    let (dag, registry) = host.parts();
+    let (code, mut stores) = opened(&mut dag.views, registry, view_id, unfed)?;
+    vm::resume(&mut code.vm, &mut stores, epoch, rows)
 }
 
 /// What the round relaying `input`, `src_id`'s delta, into view `view_id` sends
@@ -68,16 +92,11 @@ fn relay_operand(
     let code = &host.parts().0.views[&view_id].code;
     let scan = code.scan(src_id);
     let plan = Rc::clone(&scan.relay.as_ref().expect("a relayed scan has a relay").plan);
-    let schema = *code.vm.schema_of(scan.seed);
     let Some(input) = input else {
-        return (Batch::empty_with_schema(&schema), plan);
+        return (Batch::empty_with_schema(code.vm.schema_of(scan.seed)), plan);
     };
     // Every worker sends its rows, and decodes theirs, under the seed's label.
-    assert!(
-        input.schema().same_region_types(&schema),
-        "relay of {src_id} into view {view_id}: schema/batch region mismatch"
-    );
-    input.set_schema(&schema);
+    code.vm.label(scan.seed, input);
     // Every worker gathers every row of a broadcast: one fold at the sender
     // serves them all.
     if fold && plan.is_broadcast() {
@@ -164,6 +183,7 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
 }
 
 /// The round a step of the running tick stands at.
+#[expect(clippy::large_enum_variant, reason = "held once per round, and boxing allocates")]
 enum Stage {
     /// Its relay round, which sends `rows` under `plan`.
     Relay {
@@ -171,12 +191,8 @@ enum Stage {
         plan: Rc<ScatterPlan>,
         fold: bool,
     },
-    /// A round of its epoch, under `plan`.
-    Epoch {
-        epoch: vm::Epoch,
-        plan: Rc<ScatterPlan>,
-        fold: bool,
-    },
+    /// A round of its epoch.
+    Epoch(vm::Epoch),
 }
 
 /// One tick's run of its schedule, in waves: steps start in schedule order, each
@@ -188,9 +204,9 @@ enum Stage {
 /// A step starts only once no step standing at a round is of its view or of a
 /// relation its view scans: a view then reads each source's store and output as
 /// a run one step at a time leaves them. A round's lanes follow the schedule,
-/// the same on every worker. An epoch at a round holds its registers and its own
-/// copy of its delta until the round gathers, so a tick holds the state of every
-/// epoch of a wave at once.
+/// the same on every worker. An epoch at a round holds its registers, and with
+/// them its own copy of a delta it reads again, until the round gathers, so a
+/// tick holds the state of every epoch of a wave at once.
 ///
 /// The engine keeps one between ticks, empty, for its capacity.
 #[derive(Default)]
@@ -253,57 +269,25 @@ impl TickRun {
         self.start_epoch(host, i)
     }
 
-    /// Start step `i`'s epoch over its [`Self::feed`].
+    /// Start step `i`'s epoch over its [`Self::feed`], lent where a later step
+    /// reads it too.
     fn start_epoch(&mut self, host: &mut impl DriveHost, i: usize) -> Result<(), String> {
         let Step { view, producer, .. } = self.schedule[i];
-        let code = &host.parts().0.views[&view].code;
-        // A tick reaches a view only from a source its circuit scans.
-        let reg = code.scan(producer).seed;
-        let idles = code.vm.idles_on_empty(reg);
-        let epoch = match self.feed(i) {
-            (Some(input), take) if !input.is_empty() => match (take, idles) {
-                (true, _) => vm::Epoch::tick(reg, input.take(), true),
-                // It runs no round, so it ends before any later reader starts:
-                // lent the delta, it hands it back.
-                (false, true) => vm::Epoch::tick(reg, input.take(), false),
-                // It may stand at a round beside a later reader, so it holds a
-                // copy, of the delta as an epoch makes it: every later copy
-                // shares its fold.
-                (false, false) => {
-                    code.vm.label_seed(reg, input);
-                    vm::Epoch::tick(reg, input.clone(), true)
-                }
-            },
-            _ if idles => return Ok(()),
-            // Its round runs on every worker, whatever this one holds.
-            _ => vm::Epoch::tick(reg, Batch::empty_with_schema(code.vm.schema_of(reg)), true),
-        };
-        self.run_epoch(host, i, epoch, None)
+        let (input, take) = self.feed(i);
+        match start_epoch(host, view, producer, input, take, &[])? {
+            Some(ran) => self.ran(host, i, ran),
+            None => Ok(()),
+        }
     }
 
-    /// Run step `i`'s `epoch` on, `gathered` what the round it stood at
-    /// gathered: to the next round, where it stands, or to its end.
-    fn run_epoch(
-        &mut self,
-        host: &mut impl DriveHost,
-        i: usize,
-        mut epoch: vm::Epoch,
-        gathered: Option<Batch>,
-    ) -> Result<(), String> {
-        let view = self.schedule[i].view;
-        let (dag, registry) = host.parts();
-        let (code, mut stores) = opened(&mut dag.views, registry, view, &[])?;
-        match vm::run(&mut code.vm, &mut stores, &mut epoch, gathered)? {
-            vm::Ran::Round { plan, fold } => {
-                self.standing.push_back((i, Stage::Epoch { epoch, plan, fold }));
+    /// Step `i`'s epoch ran to `ran`: a round, where it stands, or its end.
+    fn ran(&mut self, host: &mut impl DriveHost, i: usize, ran: vm::Ran) -> Result<(), String> {
+        match ran {
+            vm::Ran::Round(epoch) => {
+                self.standing.push_back((i, Stage::Epoch(epoch)));
                 Ok(())
             }
-            vm::Ran::Done(out) => {
-                if let Some(lent) = epoch.into_lent() {
-                    *self.feed(i).0.expect("a lent delta has its slot") = lent;
-                }
-                self.complete(host, i, out)
-            }
+            vm::Ran::Done(out) => self.complete(host, i, out),
         }
     }
 
@@ -351,14 +335,14 @@ impl TickRun {
             let lanes = self.standing.iter_mut().map(|(i, stage)| {
                 let (batch, plan, fold) = match stage {
                     // A relay's rows are its round's to free once sent.
-                    Stage::Relay { rows, plan, fold } => (Cow::Owned(rows.take()), plan, fold),
-                    Stage::Epoch { epoch, plan, fold } => (epoch.operand(), plan, fold),
+                    Stage::Relay { rows, plan, fold } => (Cow::Owned(rows.take()), &**plan, *fold),
+                    Stage::Epoch(epoch) => epoch.round(),
                 };
                 Lane {
                     view: schedule[*i].view,
                     batch,
                     plan,
-                    fold: *fold,
+                    fold,
                 }
             });
             host.exchange(lanes, false, &mut self.gathered);
@@ -372,7 +356,10 @@ impl TickRun {
                         self.relays[slot.at] = Some(rows);
                         self.start_epoch(host, i)?;
                     }
-                    Stage::Epoch { epoch, .. } => self.run_epoch(host, i, epoch, Some(rows))?,
+                    Stage::Epoch(epoch) => {
+                        let ran = resume_epoch(host, self.schedule[i].view, epoch, rows, &[])?;
+                        self.ran(host, i, ran)?;
+                    }
                 }
             }
             self.gathered = gathered;
@@ -393,8 +380,8 @@ fn run_tick(host: &mut impl DriveHost, source: u64, round: u64, delta: Option<Ba
     run.outputs.reserve(run.schedule.len());
     run.outputs.extend(delta.map(|delta| (source, delta)));
     let ran = run.run(host);
-    // A failed step leaves the others' epochs at their rounds: dropped here, and
-    // each program frees its registers when it next runs.
+    // A failed step leaves the others' epochs at their rounds: dropped here,
+    // registers and all.
     run.outputs.clear();
     run.relays.clear();
     run.standing.clear();

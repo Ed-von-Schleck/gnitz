@@ -67,10 +67,11 @@ impl ProgramBuilder {
         Ok(self.push(a, schema, Op::Union { in_b: b }))
     }
 
-    /// Push an exchange round of `in_reg` under `plan`.
+    /// Push an exchange round of `in_reg` under `plan`, a keyed one: the round's
+    /// receiver folds what it gathers.
     pub(in crate::query) fn round(&mut self, in_reg: DeltaReg, plan: Rc<ScatterPlan>) -> DeltaReg {
-        let seeds = self.reach[in_reg.at()].as_slice().into();
-        self.push(in_reg, self.schema_of(in_reg), Op::Round { plan, seeds })
+        debug_assert!(!plan.is_broadcast(), "a broadcast's fold is its sender's");
+        self.push(in_reg, self.schema_of(in_reg), Op::Round(plan))
     }
 
     /// Accumulate `reg` into `trace` after every instruction of each epoch: a
@@ -96,8 +97,8 @@ impl ProgramBuilder {
             instructions,
             mut integrates,
             schemas,
+            reach,
             layout,
-            ..
         } = self;
         for instr in &instructions {
             match &instr.op {
@@ -107,15 +108,25 @@ impl ProgramBuilder {
             }
         }
 
+        // The rounds each seed's delta reaches, by instruction.
+        let mut rounds = vec![Vec::new(); schemas.len()];
+        for (pc, instr) in instructions.iter().enumerate() {
+            if let Op::Round(_) = instr.op {
+                for seed in &reach[instr.in_reg.at()] {
+                    rounds[seed.at()].push(pc);
+                }
+            }
+        }
         // Over the emitted instructions, which already name the register an
         // elided node's readers read.
         let mut regs: Vec<Reg> = schemas
             .into_iter()
-            .map(|schema| Reg {
+            .zip(rounds)
+            .map(|(schema, rounds)| Reg {
                 schema,
                 fold: false,
                 last_read: LastRead::Nobody,
-                feeds_round: false,
+                rounds: rounds.into_boxed_slice(),
             })
             .collect();
         // Forward, so a later reader replaces an earlier one.
@@ -125,20 +136,6 @@ impl ProgramBuilder {
             }
             regs[instr.in_reg.at()].fold |= facts(&instr.op).consolidates_in;
         }
-        // A broadcast hands every worker every row, so the fold its gathering
-        // register owes is the sender's: one sort, not one per worker. A keyed
-        // round's rows are each gathered once and folded there. Backward, so a
-        // broadcast behind a broadcast hands the fold on.
-        for instr in instructions.iter().rev() {
-            if let Op::Round { plan, seeds } = &instr.op {
-                if plan.is_broadcast() {
-                    regs[instr.in_reg.at()].fold |= regs[instr.out_reg.at()].fold;
-                }
-                for seed in seeds.iter() {
-                    regs[seed.at()].feeds_round = true;
-                }
-            }
-        }
         for (i, &(reg, _)) in integrates.iter().enumerate() {
             regs[reg.at()].last_read = LastRead::Integrate(i);
         }
@@ -146,13 +143,12 @@ impl ProgramBuilder {
         regs[out_reg.at()].last_read = LastRead::Nobody;
 
         Vm {
-            batches: regs.iter().map(|r| Batch::empty_with_schema(&r.schema)).collect(),
+            batches: registers(&regs),
             instructions: instructions.into_boxed_slice(),
             integrates: integrates.into_boxed_slice(),
             regs: regs.into_boxed_slice(),
             out_reg,
             layout,
-            standing: false,
         }
     }
 }

@@ -1,4 +1,4 @@
-//! Epoch execution: the two entry points and the opcode dispatch loop.
+//! Epoch execution: the entry points and the opcode dispatch loop.
 
 use std::borrow::Cow;
 
@@ -90,7 +90,7 @@ impl Stores<'_> {
 
     /// Every live row of `keys` in `integral`, for a reader of the payload
     /// columns `read` names, as payload bits, of a relation's rows.
-    pub(in crate::query) fn gather(&self, integral: Integral, keys: PkKeys, read: u64) -> Result<PkSetGather, String> {
+    fn gather(&self, integral: Integral, keys: PkKeys, read: u64) -> Result<PkSetGather, String> {
         Ok(match self.trace(integral)? {
             Trace::Child(idx) => self.own.gather(idx, keys),
             Trace::Relation(relation) => relation.gather(keys, Cut::Sealed, read),
@@ -105,122 +105,113 @@ fn ingest_err(op: &str, idx: StateIdx, e: StorageError) -> String {
     format!("vm: {op} ingest (state_idx={idx:?}): {e}")
 }
 
-/// One run of a program over the delta seeding one register. The epoch holds
-/// its seed; where `take` is false the seed is lent, and [`Epoch::into_lent`]
-/// hands it back labelled with its register's schema and folded where its
-/// register folds.
-pub(in crate::query) struct Epoch {
+/// How one run reads the register it seeds.
+struct Pass<'s> {
+    /// The register the run seeds.
     reg: DeltaReg,
-    /// The one slot a batch leaves the program through: the seed until the
-    /// epoch begins, then the batch its register held, swapped for a round's
-    /// operand while that round is out.
-    seed: Batch,
-    take: bool,
-    /// The round the epoch stands at gives its operand rather than lending it.
-    round_take: bool,
-    /// The next instruction.
-    pc: usize,
-    /// A tick's epoch, which integrates. A replay does not.
+    /// The caller's batch the seed was lent from, until it is handed back:
+    /// while lent, no reader takes it.
+    lent: Option<&'s mut Batch>,
+    /// A tick's run, which integrates. A replay does not.
     tick: bool,
 }
 
+/// A tick's epoch standing at an exchange round: the program's registers, and
+/// the round they wait at. Dropped there, it frees the rows it holds.
+pub(in crate::query) struct Epoch {
+    batches: Box<[Batch]>,
+    /// The register the epoch seeded.
+    reg: DeltaReg,
+    /// The round's instruction.
+    pc: usize,
+    /// The round's operand, and whether the round is its last reader.
+    operand: DeltaReg,
+    take: bool,
+    plan: Rc<ScatterPlan>,
+    /// The round's output register folds.
+    fold: bool,
+}
+
 impl Epoch {
-    /// A tick's epoch over `seed`, the delta of the source seeding `reg`.
-    pub(in crate::query) fn tick(reg: DeltaReg, seed: Batch, take: bool) -> Self {
-        Epoch {
-            reg,
-            seed,
-            take,
-            round_take: false,
-            pc: 0,
-            tick: true,
-        }
-    }
-
-    /// The operand of the round the last [`run`] stopped at: lent, or given
-    /// where the round is its last reader.
-    pub(in crate::query) fn operand(&mut self) -> Cow<'_, Batch> {
-        operand(&mut self.seed, self.round_take)
-    }
-
-    /// The seed of an ended epoch, where it was lent rather than given.
-    pub(in crate::query) fn into_lent(self) -> Option<Batch> {
-        (!self.take).then_some(self.seed)
+    /// The round the epoch stands at: its operand — lent, or given where the
+    /// round is its last reader — the plan it is sent under, and whether what
+    /// it gathers is gathered by merge.
+    pub(in crate::query) fn round(&mut self) -> (Cow<'_, Batch>, &ScatterPlan, bool) {
+        let batch = operand(&mut self.batches[self.operand.at()], self.take);
+        (batch, &self.plan, self.fold)
     }
 }
 
-/// Where a [`run`] stopped.
+/// Where a run stopped.
 #[expect(clippy::large_enum_variant, reason = "returned once per round, and boxing allocates")]
 pub(in crate::query) enum Ran {
     /// At its end, with the output register's batch: empty when the epoch
     /// produced nothing.
     Done(Batch),
-    /// At an exchange round of [`Epoch::operand`] under `plan`, gathered by
-    /// merge iff `fold`. The next [`run`] is handed what the round gathered.
-    Round { plan: Rc<ScatterPlan>, fold: bool },
+    /// At an exchange round. [`resume`] runs the epoch on over what the round
+    /// gathered.
+    Round(Epoch),
 }
 
-/// Run `epoch` to its next exchange round or to its end. `gathered`: this
-/// worker's share of the round the last run stopped at, `None` on the first.
-pub(in crate::query) fn run(
+/// Run a tick's epoch over `seed`, the delta of the source seeding `reg` —
+/// `None` an empty one — to its first exchange round or to its end. Where
+/// `take`, the seed is taken and left empty. Else it is lent, and is the
+/// caller's again when this returns, labelled with its register's schema and
+/// folded where its register folds: a copy, where the epoch stands at a round
+/// and reads its seed past it.
+pub(in crate::query) fn start(
     vm: &mut Vm,
     stores: &mut Stores<'_>,
-    epoch: &mut Epoch,
-    gathered: Option<Batch>,
+    reg: DeltaReg,
+    mut seed: Option<&mut Batch>,
+    take: bool,
 ) -> Result<Ran, String> {
-    match gathered {
-        None => begin(vm, epoch),
-        Some(rows) => {
-            let Instr { in_reg, out_reg, .. } = vm.instructions[epoch.pc];
-            // The round's operand comes back from the epoch's slot, empty where
-            // the round took it.
-            std::mem::swap(&mut vm.batches[in_reg.at()], &mut epoch.seed);
-            vm.batches[out_reg.at()] = rows;
-            fold_written(&mut vm.batches, &vm.regs, out_reg);
-            epoch.pc += 1;
-        }
-    }
-    let ran = run_instructions(vm, stores, epoch).and_then(|round| match round {
-        None if epoch.tick => run_integrates(vm, stores.own, epoch).map(|()| None),
-        round => Ok(round),
-    });
-    let pc = match ran {
-        Ok(Some(pc)) => pc,
-        Ok(None) => return Ok(Ran::Done(end(vm, epoch))),
-        Err(e) => {
-            end(vm, epoch);
-            return Err(e);
-        }
-    };
-    let instr = &vm.instructions[pc];
-    let Op::Round { plan, .. } = &instr.op else {
-        unreachable!("a run stops only at a round")
-    };
-    let (plan, in_reg) = (Rc::clone(plan), instr.in_reg);
-    let fold = vm.regs[instr.out_reg.at()].fold;
-    let take = takes(&vm.regs, epoch, in_reg, LastRead::Instr(pc));
-    epoch.pc = pc;
-    epoch.round_take = take;
-    vm.standing = true;
-    // The operand leaves for the round through the epoch's slot, lent or given.
-    std::mem::swap(&mut vm.batches[in_reg.at()], &mut epoch.seed);
-    // Every worker sends its rows, and decodes theirs, under this label.
-    debug_assert_eq!(epoch.seed.schema(), &vm.regs[in_reg.at()].schema);
-    Ok(Ran::Round { plan, fold })
+    enter(vm, reg, seed.as_deref_mut());
+    let lent = seed.filter(|_| !take);
+    run_on(vm, stores, Pass { reg, lent, tick: true }, 0)
 }
 
-/// One chunk of a capacity-bounded view's hydration replay.
-pub(in crate::query) fn replay_chunk(
+/// Run `epoch` on from the round it stands at, `gathered` this worker's share
+/// of that round, to its next round or to its end.
+pub(in crate::query) fn resume(
     vm: &mut Vm,
     stores: &mut Stores<'_>,
-    entry: ReplayEntry,
-    seed: Batch,
-) -> Result<Batch, String> {
-    run_through(vm, stores, entry.reg, entry.pc, false, seed)
+    epoch: Epoch,
+    gathered: Batch,
+) -> Result<Ran, String> {
+    let Epoch { batches, reg, pc, .. } = epoch;
+    vm.batches = batches;
+    let out_reg = vm.instructions[pc].out_reg;
+    vm.batches[out_reg.at()] = gathered;
+    fold_written(&mut vm.batches, &vm.regs, out_reg);
+    run_on(vm, stores, Pass { reg, lent: None, tick: true }, pc + 1)
 }
 
-/// Mint the row each global aggregate owes over an empty input, each in an
-/// epoch of its own entered behind its reduce, and answer what they produced.
+/// Every row of a bounded view at `keys`, recomputed: `replay`'s seed gathered
+/// at them and run through the program, chunk by chunk, integrating nothing.
+pub(in crate::query) fn replay_keys(
+    vm: &mut Vm,
+    stores: &mut Stores<'_>,
+    replay: &Replay,
+    keys: PkKeys,
+) -> Result<Batch, String> {
+    let mut gather = stores.gather(replay.seed, keys, replay.read)?;
+    let mut out = Batch::empty_with_schema(vm.out_schema());
+    while let Some(mut seed) = gather.drain_chunk(stores.registry.scan_chunk_rows()) {
+        if let Some(kind) = replay.clamp {
+            // Clamped against no history: each gathered weight, clamped.
+            let schema = *seed.schema();
+            let history = stream::History::Before(&mut |_, _| empty_cursor(schema));
+            seed = stream::op_weight_clamp(Cow::Owned(seed), history, kind);
+        }
+        let produced = run_through(vm, stores, replay.reg, false, seed)?;
+        out.append_above(produced.into_consolidated());
+    }
+    Ok(out)
+}
+
+/// Mint the row each global aggregate owes over an empty input, each in a run
+/// of its own seeding its reduce's output, and answer what they produced.
 pub(in crate::query) fn mint_ground_rows(vm: &mut Vm, stores: &mut Stores<'_>) -> Result<Batch, String> {
     let mut minted = Batch::empty_with_schema(vm.out_schema());
     for pc in 0..vm.instructions.len() {
@@ -230,55 +221,94 @@ pub(in crate::query) fn mint_ground_rows(vm: &mut Vm, stores: &mut Stores<'_>) -
             continue;
         };
         let reg = instr.out_reg;
-        minted.append_batch(&run_through(vm, stores, reg, pc + 1, true, row)?);
+        minted.append_batch(&run_through(vm, stores, reg, true, row)?);
     }
     Ok(minted)
 }
 
-/// Run `seed`, taken, from `reg` and instruction `pc` to the program's end,
-/// integrating iff `tick`. A replay entry passes no round: `replay_entry` refuses
-/// a seed that reaches a stateful op, a round included. A ground-row mint enters
-/// at a reduce's output, which no round's seeds name, so a round behind it would
+/// Run `seed`, taken, from `reg` to the program's end, integrating iff `tick`.
+/// `reg` may be one an instruction writes: every instruction up to its writer
+/// reads empty registers, and is skipped. No round stands: a replay's seed
+/// reaches no stateful operator, a round included, and a ground-row mint seeds
+/// a reduce's output, which is in no round's reach, so a round behind it would
 /// be skipped; routing refuses any exchange behind a global aggregate.
 fn run_through(
     vm: &mut Vm,
     stores: &mut Stores<'_>,
     reg: DeltaReg,
-    pc: usize,
     tick: bool,
-    seed: Batch,
+    mut seed: Batch,
 ) -> Result<Batch, String> {
-    let mut epoch = Epoch {
-        reg,
-        seed,
-        take: true,
-        round_take: false,
-        pc,
-        tick,
-    };
-    match run(vm, stores, &mut epoch, None)? {
+    enter(vm, reg, Some(&mut seed));
+    match run_on(vm, stores, Pass { reg, lent: None, tick }, 0)? {
         Ran::Done(out) => Ok(out),
-        Ran::Round { .. } => unreachable!("no round stands past the entry"),
+        Ran::Round(_) => unreachable!("no round stands past the entry"),
     }
 }
 
-/// Stand the seed in its register, until the epoch ends, labelled with the
-/// register's schema and folded where the register folds. An epoch left at a
-/// round, which no [`end`] closed, left its registers holding rows: they are
-/// freed first, so every run starts from empty ones.
-fn begin(vm: &mut Vm, epoch: &mut Epoch) {
-    if vm.standing {
-        release(vm);
+/// Ready the registers for a run from the first instruction, `seed` standing in
+/// `reg`, labelled with the register's schema and folded where the register
+/// folds: the caller's batch is left holding what `reg` held, empty.
+fn enter(vm: &mut Vm, reg: DeltaReg, seed: Option<&mut Batch>) {
+    // An epoch dropped at its round took the registers with it.
+    if vm.batches.len() != vm.regs.len() {
+        vm.batches = registers(&vm.regs);
     }
-    vm.label_seed(epoch.reg, &mut epoch.seed);
-    std::mem::swap(&mut vm.batches[epoch.reg.at()], &mut epoch.seed);
+    if let Some(seed) = seed {
+        vm.label(reg, seed);
+        std::mem::swap(&mut vm.batches[reg.at()], seed);
+        fold_written(&mut vm.batches, &vm.regs, reg);
+    }
+}
+
+/// Run from instruction `pc` to the next exchange round or to the end. A lent
+/// seed goes back to the caller wherever the run stops.
+fn run_on(vm: &mut Vm, stores: &mut Stores<'_>, pass: Pass, pc: usize) -> Result<Ran, String> {
+    let ran = run_instructions(vm, stores, &pass, pc).and_then(|round| match round {
+        None if pass.tick => run_integrates(vm, stores.own, &pass).map(|()| None),
+        round => Ok(round),
+    });
+    let pc = match ran {
+        Ok(Some(pc)) => pc,
+        Ok(None) => return Ok(Ran::Done(end(vm, pass))),
+        Err(e) => {
+            end(vm, pass);
+            return Err(e);
+        }
+    };
+    if let Some(seed) = pass.lent {
+        // The caller reads its delta while the epoch stands, so the epoch keeps
+        // the batch only where it reads it again, and hands back a copy.
+        let keeps = vm.read_from(pass.reg, pc);
+        let held = &mut vm.batches[pass.reg.at()];
+        match keeps {
+            true => *seed = held.clone(),
+            false => std::mem::swap(seed, held),
+        }
+    }
+    let instr = &vm.instructions[pc];
+    let Op::Round(plan) = &instr.op else {
+        unreachable!("a run stops only at a round")
+    };
+    let operand = instr.in_reg;
+    // Every worker sends its rows, and decodes theirs, under this label.
+    debug_assert_eq!(vm.batches[operand.at()].schema(), &vm.regs[operand.at()].schema);
+    Ok(Ran::Round(Epoch {
+        reg: pass.reg,
+        pc,
+        operand,
+        take: vm.regs[operand.at()].last_read == LastRead::Instr(pc),
+        plan: Rc::clone(plan),
+        fold: vm.regs[instr.out_reg.at()].fold,
+        batches: std::mem::take(&mut vm.batches),
+    }))
 }
 
 /// Whether `reader` may take `reg`'s batch: it is the register's last reader,
-/// and the batch is the program's own or a seed lent to be taken.
+/// and the batch is the program's own rather than a lent seed.
 #[inline]
-fn takes(regs: &[Reg], epoch: &Epoch, reg: DeltaReg, reader: LastRead) -> bool {
-    regs[reg.at()].last_read == reader && (reg != epoch.reg || epoch.take)
+fn takes(regs: &[Reg], pass: &Pass, reg: DeltaReg, reader: LastRead) -> bool {
+    regs[reg.at()].last_read == reader && !(pass.lent.is_some() && reg == pass.reg)
 }
 
 /// Fold `reg`'s batch, just written, when its register folds: every reader runs
@@ -299,21 +329,21 @@ fn operand(batch: &mut Batch, take: bool) -> Cow<'_, Batch> {
     }
 }
 
-/// Run the instruction stream from `epoch.pc`, to its end or to the round it
-/// next stands at.
-fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch) -> Result<Option<usize>, String> {
+/// Run the instruction stream from `from`, to its end or to the round it next
+/// stands at.
+fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, pass: &Pass, from: usize) -> Result<Option<usize>, String> {
     let Vm { instructions, regs, batches, .. } = vm;
 
-    for pc in epoch.pc..instructions.len() {
+    for pc in from..instructions.len() {
         let (before, rest) = instructions.split_at_mut(pc);
         let instr = &mut rest[0];
         let (in_reg, out_reg) = (instr.in_reg, instr.out_reg);
-        let takes = |r: DeltaReg| takes(regs, epoch, r, LastRead::Instr(pc));
+        let takes = |r: DeltaReg| takes(regs, pass, r, LastRead::Instr(pc));
 
         let reads = instr.reads();
         let all_empty = reads.into_iter().flatten().all(|r| batches[r.at()].is_empty());
         let out = match &mut instr.op {
-            Op::Round { seeds, .. } => match seeds.contains(&epoch.reg) {
+            Op::Round(_) => match regs[pass.reg.at()].rounds.contains(&pc) {
                 true => return Ok(Some(pc)),
                 // The register stays as every run leaves it: empty.
                 false => continue,
@@ -424,14 +454,14 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, epoch: &Epoch) -> Resu
 
 /// Accumulate each delta into its trace, after the whole instruction range — so
 /// no cursor opened in that range can observe this tick's integration.
-fn run_integrates(vm: &mut Vm, state: &mut CircuitState, epoch: &Epoch) -> Result<(), String> {
+fn run_integrates(vm: &mut Vm, state: &mut CircuitState, pass: &Pass) -> Result<(), String> {
     let Vm { integrates, regs, batches, .. } = vm;
     for (i, &(reg, trace)) in integrates.iter().enumerate() {
         // Nothing to add, as for most of a join's integrands in any one epoch.
         if batches[reg.at()].is_empty() {
             continue;
         }
-        let take = takes(regs, epoch, reg, LastRead::Integrate(i));
+        let take = takes(regs, pass, reg, LastRead::Integrate(i));
         gnitz_debug!("vm: INTEGRATE in_count={}", batches[reg.at()].len());
         let batch = match operand(&mut batches[reg.at()], take) {
             Cow::Owned(batch) => batch,
@@ -447,27 +477,19 @@ fn run_integrates(vm: &mut Vm, state: &mut CircuitState, epoch: &Epoch) -> Resul
 /// End a run: extract the output, hand a lent seed back, and free every
 /// register — so none holds rows between runs, whether the run completed,
 /// failed, or left a register nothing reads.
-fn end(vm: &mut Vm, epoch: &mut Epoch) -> Batch {
+fn end(vm: &mut Vm, pass: Pass) -> Batch {
     let Vm { regs, batches, out_reg, .. } = vm;
     // The output register has no reader to take it but this extraction.
-    let take = takes(regs, epoch, *out_reg, LastRead::Nobody);
+    let take = takes(regs, &pass, *out_reg, LastRead::Nobody);
     let batch = operand(&mut batches[out_reg.at()], take).into_owned();
-    // A seed that was given is not handed back: the caller holds the
-    // register's empty batch, and the release below frees what nothing read.
-    if !epoch.take {
-        std::mem::swap(&mut batches[epoch.reg.at()], &mut epoch.seed);
+    if let Some(seed) = pass.lent {
+        std::mem::swap(&mut batches[pass.reg.at()], seed);
     }
     debug_assert_eq!(batch.schema(), &regs[out_reg.at()].schema);
-    release(vm);
-    batch
-}
-
-/// Free every register.
-fn release(vm: &mut Vm) {
-    for held in vm.batches.iter_mut() {
+    for held in batches.iter_mut() {
         held.release_buffers();
     }
-    vm.standing = false;
+    batch
 }
 
 #[cfg(test)]
