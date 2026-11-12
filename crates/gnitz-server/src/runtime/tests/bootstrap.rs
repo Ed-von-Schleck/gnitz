@@ -198,11 +198,11 @@ fn a_tail_behind_an_ephemeral_round_replays_the_pushes_behind_it() {
     assert_eq!(held(&engine, t), rows, "each row once, at its weight");
 }
 
-/// A replayed push lands above its base's cut, past the boot flush, only for a
-/// tick to take: under a view the boot keeps, and not under one that awaits its
-/// rebuild, whose backfill reads the base whole.
+/// A replayed push lands above its base's cut, past the boot flush, for a tick
+/// to take: under a view the boot keeps and under one it rebuilds alike, whose
+/// backfill reads the base at the cut.
 #[test]
-fn a_tail_lands_above_the_cut_only_under_a_kept_view() {
+fn a_tail_lands_above_the_cut_of_a_scanned_table() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
     let slot = Slot::new(0, 1);
@@ -213,7 +213,7 @@ fn a_tail_lands_above_the_cut_only_under_a_kept_view() {
     let g = engine.advance_durable_generation().unwrap();
     engine.flush_ephemeral_round(g).unwrap();
     // Created after the checkpoint, so the boot rebuilds it.
-    register_identity_view(&mut engine, rejected, "v_rejected", &u64_i64_cols());
+    let v_rejected = register_identity_view(&mut engine, rejected, "v_rejected", &u64_i64_cols());
     let rows = [(1, 1, 10), (2, 1, 20)];
     let log = test_log(SAL_SIZE, slot.of as usize, 1);
     for tid in [kept, rejected] {
@@ -230,13 +230,19 @@ fn a_tail_lands_above_the_cut_only_under_a_kept_view() {
     for tid in [kept, rejected] {
         assert_eq!(held(&engine, tid), rows, "table {tid}");
     }
+    assert!(engine.boot.rebuild.contains(&v_rejected));
+    // The boot's order: the rebuild reads its source at the cut, then the tick
+    // brings the tail.
+    crate::query::backfill(&mut engine, v_rejected).unwrap();
+    assert!(held(&engine, v_rejected).is_empty(), "the tail is above the cut");
+    crate::query::tick(&mut engine, rejected, 2).unwrap();
+    assert_eq!(held(&engine, v_rejected), rows, "each tail row once");
     let above = engine
         .registry
         .seal(kept)
         .unwrap()
         .expect("the kept view's tick takes the tail");
     assert_eq!(above.len(), 2);
-    assert!(engine.registry.seal(rejected).unwrap().is_none());
 }
 
 // -- The descriptor limit ---------------------------------------------------

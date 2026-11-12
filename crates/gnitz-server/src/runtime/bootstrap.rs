@@ -153,7 +153,7 @@ fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: &CommittedTail, slot:
     // Before the master's boot rewind puts the write cursor back to 0: these rows
     // still live only in SAL entries a second crash would then overwrite.
     debug_assert!(
-        !tail.holds_pushes() || catalog.durable_generation() > catalog.dag.resume_at,
+        !tail.holds_pushes() || catalog.durable_generation() > catalog.boot.resume_at,
         "boot base flush of replayed pushes without the pre-fork generation advance ahead of it",
     );
     catalog
@@ -303,23 +303,10 @@ fn fork_workers(
 async fn master_post_fork_recovery(disp: &MasterDispatcher, pushed: BTreeSet<u64>) -> Result<(), String> {
     // Boot is the lock's only holder: no task of the executor exists yet.
     let alone = disp.apply_lock().await;
-    // The scanned ones: only a replayed push lands rows above a base store's cut,
-    // and the backfill below reads at the cut. A view's operator state needs no
-    // tick: the boot checkpoint opens every resumed view's.
-    let ticked: Vec<u64> = {
-        let cat = disp.cat();
-        pushed.into_iter().filter(|&t| cat.dag.is_scanned(t)).collect()
-    };
-    disp.drain_tick(&alone, &ticked)
-        .await
-        .map_err(|e| format!("recovery tick sweep failed: {e}"))?;
-
-    inject_recovery_panic("sweep");
-
     // Rebuild the views the boot verdict rejected, through the driver a live
-    // CREATE VIEW uses; they opened empty, and no tick reaches them until their
-    // backfill.
-    let invalid: Vec<u64> = disp.cat_mut().dag.take_rebuild().into_iter().collect();
+    // CREATE VIEW uses; they opened empty. Ahead of the tail's tick: a backfill
+    // reads its sources at their cut, which a replayed push landed above.
+    let invalid: Vec<u64> = std::mem::take(&mut disp.cat_mut().boot.rebuild).into_iter().collect();
     // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
     // E2E): 0 ⇒ every view resumed from its checkpoint.
     gnitz_note!("recovery: rebuilding {} invalid view(s)", invalid.len());
@@ -328,6 +315,20 @@ async fn master_post_fork_recovery(disp: &MasterDispatcher, pushed: BTreeSet<u64
         .map_err(|e| format!("invalid-view rebuild failed: {e}"))?;
 
     inject_recovery_panic("backfill");
+
+    // The replayed tail, above the cut of every scanned base store it pushed to:
+    // one tick brings it to every view, resumed or rebuilt, each row once. A
+    // view's operator state needs no tick: the boot checkpoint opens every
+    // resumed view's.
+    let ticked: Vec<u64> = {
+        let cat = disp.cat();
+        pushed.into_iter().filter(|&t| cat.dag.is_scanned(t)).collect()
+    };
+    disp.drain_tick(&alone, &ticked)
+        .await
+        .map_err(|e| format!("recovery tick of the replayed tail failed: {e}"))?;
+
+    inject_recovery_panic("sweep");
 
     // A full checkpoint before the socket opens, so a clean restart resumes from
     // it. No drain — recovery already drained everything and no pushes are

@@ -30,11 +30,11 @@ fn engine_with_tables<const N: usize>(name: &str, more: [&str; N]) -> (CatalogEn
     (engine, t, ids)
 }
 
-/// Both closures walk transitively over a three-view chain, a diamond and a
-/// disconnected pair; the cached source closures answer the dependent closure of
-/// one id.
+/// A view's roots and a relation's downstream views walk the same edges
+/// transitively, over a three-view chain, a diamond and a disconnected pair: a
+/// view has a root exactly when it is downstream of it.
 #[test]
-fn the_closures_walk_both_directions_transitively() {
+fn roots_and_downstream_walk_both_directions_transitively() {
     // chain a → c1 → c2 → c3, diamond d → {d1, d2} → d3, disconnected pair p → p1.
     let (mut engine, a, [d, p]) = engine_with_tables("closures", ["d", "p"]);
     let cols = u64_i64_cols();
@@ -47,42 +47,38 @@ fn the_closures_walk_both_directions_transitively() {
     let p1 = register_identity_view(&mut engine, p, "p1", &cols);
     let dag = &engine.dag;
 
-    assert_eq!(dag.source_closure_of(c1), [a]);
-    assert_eq!(dag.source_closure_of(c2), [a, c1]);
-    assert_eq!(dag.source_closure_of(c3), [a, c1, c2]);
-    assert_eq!(dag.source_closure_of(d3), [d, d1, d2]);
-    assert_eq!(dag.source_closure_of(p1), [p]);
-    assert!(dag.source_closure_of(a).is_empty());
-    assert!(dag.source_closure_of(u64::MAX).is_empty());
+    for (view, root) in [(c1, a), (c2, a), (c3, a), (d1, d), (d3, d), (p1, p)] {
+        assert_eq!(dag.roots_of(view), [root], "view {view}");
+    }
+    assert!(dag.roots_of(a).is_empty());
+    assert!(dag.roots_of(u64::MAX).is_empty());
     // The other direction, so a walk that read the wrong half of the graph
     // cannot pass both.
-    assert_eq!(dag.dependent_closure([a]), set(&[c1, c2, c3]));
-    assert_eq!(dag.dependent_closure([d]), set(&[d1, d2, d3]));
-    assert!(dag.dependent_closure([p1]).is_empty());
+    assert_eq!(dag.dep.downstream([a]), set(&[c1, c2, c3]));
+    assert_eq!(dag.dep.downstream([d]), set(&[d1, d2, d3]));
+    assert_eq!(dag.dep.downstream([c1]), set(&[c2, c3]));
+    assert_eq!(dag.dep.downstream([d1, d2]), set(&[d3]));
+    assert!(dag.dep.downstream([p1, u64::MAX]).is_empty());
 
     let views = [c1, c2, c3, d1, d2, d3, p1];
-    let reading = |id| {
-        let reads = |v: &u64| dag.source_closure_of(*v).binary_search(&id).is_ok();
-        views.into_iter().filter(reads).collect::<FxHashSet<u64>>()
-    };
-    for id in [a, c1, c2, c3, d, d1, d2, d3, p, p1, u64::MAX] {
-        assert_eq!(reading(id), dag.dependent_closure([id]), "views reading {id}");
+    for root in [a, d, p] {
+        let rooted = |v: &u64| dag.roots_of(*v).contains(&root);
+        let rooted: FxHashSet<u64> = views.into_iter().filter(rooted).collect();
+        assert_eq!(rooted, dag.dep.downstream([root]), "views under {root}");
     }
-    assert_eq!(reading(c1), set(&[c2, c3]));
-    assert_eq!(reading(d1), set(&[d3]));
 }
 
-/// A view registered again under a dropped id takes the closure of its new plan.
+/// A view registered again under a dropped id takes the roots of its new plan.
 #[test]
-fn a_source_closure_is_dropped_and_recomputed_with_its_view() {
+fn a_views_roots_are_dropped_and_recomputed_with_its_view() {
     let (mut engine, t1, [t2]) = engine_with_tables("reregister", ["t2"]);
     let cols = u64_i64_cols();
     let v1 = register_identity_view(&mut engine, t1, "v1", &cols);
     let v2 = register_identity_view(&mut engine, v1, "v2", &cols);
-    assert_eq!(engine.dag.source_closure_of(v2), [t1, v1]);
+    assert_eq!(engine.dag.roots_of(v2), [t1]);
     engine.dag.forget(v2);
-    assert!(engine.dag.source_closure_of(v2).is_empty());
-    assert_eq!(engine.dag.source_closure_of(v1), [t1]);
+    assert!(engine.dag.roots_of(v2).is_empty());
+    assert_eq!(engine.dag.roots_of(v1), [t1]);
 
     let circuit = crate::test_support::identity_circuit(t2, ReadBound::None);
     let registry = &engine.registry;
@@ -91,7 +87,7 @@ fn a_source_closure_is_dropped_and_recomputed_with_its_view() {
         .dag
         .register_view(registry, v2, &schema, false, v2, &circuit)
         .unwrap();
-    assert_eq!(engine.dag.source_closure_of(v2), [t2]);
+    assert_eq!(engine.dag.roots_of(v2), [t2]);
 }
 
 /// A view links to each source once however many scans name it, in first-scan
@@ -107,12 +103,11 @@ fn forgetting_a_view_drops_only_what_it_linked() {
     assert_eq!(dag.sources_of(v).collect::<Vec<_>>(), [t2, t1]);
     assert_eq!(dag.dependents_of(t1), [v, sibling]);
     assert_eq!(dag.dependents_of(t2), [v]);
-    dag.rebuild = [v].into_iter().collect();
 
     for _ in 0..2 {
         dag.forget(v);
         dag.forget(u64::MAX);
-        assert!(dag.sources_of(v).next().is_none() && !dag.awaits_rebuild(v));
+        assert!(dag.sources_of(v).next().is_none());
         assert_eq!(dag.dependents_of(t1), [sibling]);
         assert_eq!(dag.sources_of(sibling).collect::<Vec<_>>(), [t1]);
         assert!(!dag.dep.forward.contains_key(&t2));
@@ -121,26 +116,10 @@ fn forgetting_a_view_drops_only_what_it_linked() {
     assert!(dag.dep.forward.is_empty());
 }
 
-/// A tick of a relation drives a view while one that scans it does not await
-/// its rebuild.
-#[test]
-fn a_relation_is_ticked_while_a_view_scanning_it_is_not_awaiting_its_rebuild() {
-    let mut dag = DagEngine::default();
-    dag.dep.link(5, [1]);
-    dag.dep.link(6, [1]);
-    assert!(dag.is_ticked(1) && !dag.is_ticked(2));
-
-    dag.rebuild = [5].into_iter().collect();
-    assert!(dag.is_ticked(1));
-    dag.rebuild = [5, 6].into_iter().collect();
-    assert!(!dag.is_ticked(1) && dag.is_scanned(1));
-}
-
 /// The schedule names one step per dependency edge out of the source's forward
 /// closure, ordered by view id — so a producer always precedes the steps it
-/// feeds — and leaves out the views awaiting a rebuild. Each step says whether
-/// it is its producer's last reader and whether a later one reads its view, of
-/// the steps the schedule runs.
+/// feeds. Each step says whether it is its producer's last reader and whether a
+/// later one reads its view.
 #[test]
 fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
     // `(view, producer, last, needed)` of each step.
@@ -162,14 +141,7 @@ fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
     ];
     assert_eq!(steps(&mut dag), every);
 
-    // A rebuild set is closed under dependents.
-    dag.rebuild = [2, 4, 5].into_iter().collect();
-    assert_eq!(steps(&mut dag), [(3, 1, true, false)], "of the steps it runs");
-    dag.rebuild.remove(&2);
-    assert_eq!(steps(&mut dag), [(2, 1, false, false), (3, 1, true, false)]);
-
     // A view linked or dropped after a schedule was read moves that schedule.
-    dag.take_rebuild();
     dag.dep.link(8, [5]);
     let mut grown = every.to_vec();
     grown[4].3 = true;
@@ -181,8 +153,9 @@ fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
 
 /// Steps relaying one producer by one scatter key share one round: the first
 /// runs it, the last is told no later step reads it, and it folds where any of
-/// them folds. Another key, or another
-/// producer, is a round of its own, and a step its view does not relay reads none.
+/// them folds. Another key, or another producer, is a round of its own, and a
+/// step its view does not relay reads none. Only a step that runs a round or
+/// relays nothing reads the producer's own rows, so the last of those takes them.
 #[test]
 fn steps_relaying_one_producer_by_one_key_share_a_round() {
     let by_v = [(1, gnitz_wire::TypeCode::I64)];
@@ -199,19 +172,28 @@ fn steps_relaying_one_producer_by_one_key_share_a_round() {
         }
     };
     let edges = vec![(2, 1), (3, 1), (4, 1), (5, 1), (5, 2), (6, 1)];
-    let relays: Vec<_> = schedule(edges, relay_key).iter().map(|s| s.relay).collect();
-    let slot = |at, last, fold| Some(RelaySlot { at, last, fold });
+    let steps = schedule(edges, relay_key);
+    let relays: Vec<_> = steps.iter().map(|s| s.relay).collect();
+    let slot = |at, first, last, fold| Some(RelaySlot { at, first, last, fold });
     assert_eq!(
         relays,
         [
-            slot(0, false, true),
-            slot(0, false, true),
-            slot(1, true, false),
-            slot(0, true, true),
-            slot(2, true, false),
+            slot(0, true, false, true),
+            slot(0, false, false, true),
+            slot(1, true, true, false),
+            slot(0, false, true, true),
+            slot(2, true, true, false),
             None
         ]
     );
+    let last: Vec<bool> = steps.iter().map(|s| s.last).collect();
+    assert_eq!(last, [false, false, false, false, true, true], "of producers 1 and 2");
+
+    // With no direct reader behind them, the step running the shared round is
+    // the last to read the producer's own rows.
+    let steps = schedule(vec![(2, 1), (3, 1), (5, 1)], relay_key);
+    let last: Vec<bool> = steps.iter().map(|s| s.last).collect();
+    assert_eq!(last, [true, false, false]);
 }
 
 /// A view scans only relations older than it: ticks and backfills take ascending

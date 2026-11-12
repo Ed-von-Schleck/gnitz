@@ -49,9 +49,9 @@ def _assert_doubled(srv, keys, ctx):
 
 def test_a_stream_fed_view_rebuilds_alone_and_counts_the_tail_once(own_server):
     """A view over a stream is rejected on every boot, while its sibling over the
-    table alone resumes. The rejected view's store opens empty and the recovery
-    sweep must leave it alone: a tail ticked into it and then backfilled again
-    would hold every tail row at weight 2."""
+    table alone resumes. The rejected view's store opens empty and is filled from
+    the table at its cut, with the tail above it: a backfill that read the tail
+    too, ahead of the tick that brings it, would hold every tail row at weight 2."""
     own_server.start()
     with gnitz.connect(own_server.target) as conn:
         conn.execute_sql(
@@ -190,7 +190,7 @@ def test_a_checkpoint_with_no_push_behind_it_publishes_new_derived_state_resumab
 
     The GROUP BY holds operator traces where a projection holds none, so it is
     the shape whose verdict reads trace manifests. The two boots compile it by
-    different routes — the CREATE, then the boot tick sweep — and each one's
+    different routes — the CREATE, then the boot's tick of the tail — and each one's
     checkpoint must stamp them."""
     _checkpoint_cut(own_server)
     own_server.start()

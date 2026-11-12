@@ -221,7 +221,7 @@ impl CatalogEngine {
         if !kind.is_ingestion_point() {
             return Err(format!("relation {tid} is a {}, not an ingestion point", kind.noun()));
         }
-        match self.dag.is_ticked(tid) {
+        match self.dag.is_scanned(tid) {
             true => self.registry.ingest_pending_under(tid, batch, rule),
             false => self.registry.ingest_under(tid, batch, rule),
         }

@@ -3,6 +3,7 @@
 
 use super::*;
 use std::collections::hash_map::Entry;
+use std::collections::VecDeque;
 
 // ── Epoch execution ─────────────────────────────────────────────────────
 
@@ -105,17 +106,12 @@ pub(crate) fn tick(host: &mut impl DriveHost, source: u64, round: u64) -> Result
     run_tick(host, source, round, delta)
 }
 
-/// Fill `view`, and it alone, from each relation it scans, in scan order. Views
-/// fill in id order: one whose source still awaits its own fill is refused, which
-/// keeps the rebuild set closed under dependents.
+/// Fill `view`, and it alone, from each relation it scans, in scan order, each
+/// read at its cut: rows above it reach the view with the tick that seals them.
+/// The caller fills views in id order, a view after every view it scans.
 pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), String> {
     let (dag, registry) = host.parts();
     let sources: Vec<u64> = dag.sources_of(view).collect();
-    if let Some(source) = sources.iter().find(|&&s| dag.awaits_rebuild(s)) {
-        return Err(format!("view {view} filled before its source {source}"));
-    }
-    // Its ticks run from here on.
-    dag.rebuild.remove(&view);
     let chunk_rows = registry.scan_chunk_rows();
     let mut gathered = Vec::new();
     // No source has fed the view yet.
@@ -167,19 +163,15 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
     host.parts().1.fold_to_ram(view)
 }
 
-/// Where a step of the running tick stands.
-#[derive(Default)]
+/// The round a step of the running tick stands at.
 enum Stage {
-    /// Not at a round: not started, or done.
-    #[default]
-    Idle,
-    /// At its relay round, which sends `rows` under `plan`.
+    /// Its relay round, which sends `rows` under `plan`.
     Relay {
         rows: Batch,
         plan: Rc<ScatterPlan>,
         fold: bool,
     },
-    /// Its epoch, at a round under `plan`.
+    /// A round of its epoch, under `plan`.
     Epoch {
         epoch: vm::Epoch,
         plan: Rc<ScatterPlan>,
@@ -187,17 +179,18 @@ enum Stage {
     },
 }
 
-/// One tick's run of its schedule, in waves: every step that can start runs to
-/// its first round or its end, then the rounds every step stands at run as one
-/// [`DriveHost::exchange`]. Each epoch sends and gathers exactly the rows a
-/// round of its own would; only the waits are shared.
+/// One tick's run of its schedule, in waves: steps start in schedule order, each
+/// run to its first round or its end, up to the first that cannot start yet;
+/// then the rounds every step stands at run as one [`DriveHost::exchange`]. Each
+/// epoch sends and gathers exactly the rows a round of its own would; only the
+/// waits are shared.
 ///
-/// Steps start in schedule order, and one starts only once no step standing at
-/// a round is of its view or of a relation its view scans: a view then reads
-/// each source's store and output as a run one step at a time leaves them. A
-/// round's lanes follow the schedule, the same on every worker. An epoch at a
-/// round holds its registers and its own copy of its delta until the round
-/// gathers, so a tick holds the state of every epoch of a wave at once.
+/// A step starts only once no step standing at a round is of its view or of a
+/// relation its view scans: a view then reads each source's store and output as
+/// a run one step at a time leaves them. A round's lanes follow the schedule,
+/// the same on every worker. An epoch at a round holds its registers and its own
+/// copy of its delta until the round gathers, so a tick holds the state of every
+/// epoch of a wave at once.
 ///
 /// The engine keeps one between ticks, empty, for its capacity.
 #[derive(Default)]
@@ -210,8 +203,10 @@ pub(super) struct TickRun {
     /// What each relay round gathered, indexed by [`meta::RelaySlot`], from
     /// the round's run to its last reader; `None` while its round is out.
     relays: Vec<Option<Batch>>,
-    /// Each step's [`Stage`], by its index in the schedule.
-    stages: Vec<Stage>,
+    /// The steps standing at a round, each by its index in the schedule, in
+    /// schedule order: the order their lanes go out. A step run on from a
+    /// gathered round that stands again goes behind the rest of its wave.
+    standing: VecDeque<(usize, Stage)>,
     /// What a wave's rounds gathered, one batch per step at a round.
     gathered: Vec<Batch>,
 }
@@ -230,33 +225,30 @@ impl TickRun {
     /// Whether step `i` can start: a relay round another step runs for it has
     /// gathered, and no step at a round holds it back.
     fn ready(&self, host: &mut impl DriveHost, i: usize) -> bool {
+        // A relay round is out only while the step that runs it stands.
+        if self.standing.is_empty() {
+            return true;
+        }
         let Step { view, relay, .. } = self.schedule[i];
         if relay.is_some_and(|slot| self.relays.get(slot.at).is_some_and(Option::is_none)) {
             return false;
         }
-        let dag = host.parts().0;
-        let mut standing = (self.stages.iter().zip(self.schedule.iter()))
-            .filter(|(stage, _)| !matches!(stage, Stage::Idle))
-            .map(|(_, step)| step.view);
-        !standing.any(|held| held == view || dag.sources_of(view).any(|s| s == held))
+        let code = &host.parts().0.views[&view].code;
+        let mut standing = self.standing.iter().map(|&(at, _)| self.schedule[at].view);
+        !standing.any(|held| held == view || code.source_ids().any(|s| s == held))
     }
 
     /// Start step `i`: run it to its first round, or its end.
     fn start(&mut self, host: &mut impl DriveHost, i: usize) -> Result<(), String> {
         let Step { view, producer, last, relay, .. } = self.schedule[i];
         // A relayed step reads its round's rows: the round's first reader runs it.
-        if let Some(slot) = relay {
-            if slot.at == self.relays.len() {
-                let (rows, plan) =
-                    relay_operand(host, view, producer, self.outputs.get_mut(&producer), last, slot.fold);
-                self.relays.push(None);
-                self.stages[i] = Stage::Relay { rows, plan, fold: slot.fold };
-                return Ok(());
-            }
-            if last {
-                // No later step reads the producer's own rows.
-                self.outputs.remove(&producer);
-            }
+        if let Some(slot) = relay.filter(|slot| slot.first) {
+            debug_assert_eq!(slot.at, self.relays.len(), "rounds start in slot order");
+            let (rows, plan) = relay_operand(host, view, producer, self.outputs.get_mut(&producer), last, slot.fold);
+            self.relays.push(None);
+            let fold = slot.fold;
+            self.standing.push_back((i, Stage::Relay { rows, plan, fold }));
+            return Ok(());
         }
         self.start_epoch(host, i)
     }
@@ -303,7 +295,7 @@ impl TickRun {
         let (code, mut stores) = opened(&mut dag.views, registry, view, &[])?;
         match vm::run(&mut code.vm, &mut stores, &mut epoch, gathered)? {
             vm::Ran::Round { plan, fold } => {
-                self.stages[i] = Stage::Epoch { epoch, plan, fold };
+                self.standing.push_back((i, Stage::Epoch { epoch, plan, fold }));
                 Ok(())
             }
             vm::Ran::Done(out) => {
@@ -351,43 +343,38 @@ impl TickRun {
                 self.start(host, next)?;
                 next += 1;
             }
-            // A relay's rows are its round's to free once sent.
-            let lanes: Vec<Lane> = (self.stages.iter_mut().zip(self.schedule.iter()))
-                .filter_map(|(stage, step)| {
-                    let (batch, plan, fold) = match stage {
-                        Stage::Idle => return None,
-                        Stage::Relay { rows, plan, fold } => (Cow::Owned(rows.take()), plan, fold),
-                        Stage::Epoch { epoch, plan, fold } => (epoch.operand(), plan, fold),
-                    };
-                    Some(Lane {
-                        view: step.view,
-                        batch,
-                        plan,
-                        fold: *fold,
-                    })
-                })
-                .collect();
-            if lanes.is_empty() {
+            if self.standing.is_empty() {
                 debug_assert_eq!(next, self.schedule.len(), "a step waits on no round");
                 return Ok(());
             }
-            host.exchange(lanes.into_iter(), false, &mut self.gathered);
+            let schedule = &self.schedule;
+            let lanes = self.standing.iter_mut().map(|(i, stage)| {
+                let (batch, plan, fold) = match stage {
+                    // A relay's rows are its round's to free once sent.
+                    Stage::Relay { rows, plan, fold } => (Cow::Owned(rows.take()), plan, fold),
+                    Stage::Epoch { epoch, plan, fold } => (epoch.operand(), plan, fold),
+                };
+                Lane {
+                    view: schedule[*i].view,
+                    batch,
+                    plan,
+                    fold: *fold,
+                }
+            });
+            host.exchange(lanes, false, &mut self.gathered);
             let mut gathered = std::mem::take(&mut self.gathered);
-            let mut rows = gathered.drain(..).map(Some);
-            for i in 0..self.stages.len() {
-                match std::mem::take(&mut self.stages[i]) {
-                    Stage::Idle => continue,
+            debug_assert_eq!(self.standing.len(), gathered.len(), "a lane per round");
+            for rows in gathered.drain(..) {
+                let (i, stage) = self.standing.pop_front().expect("a lane per round");
+                match stage {
                     Stage::Relay { .. } => {
                         let slot = self.schedule[i].relay.expect("a relay step");
-                        self.relays[slot.at] = rows.next().expect("a lane per round");
+                        self.relays[slot.at] = Some(rows);
                         self.start_epoch(host, i)?;
                     }
-                    Stage::Epoch { epoch, .. } => {
-                        self.run_epoch(host, i, epoch, rows.next().expect("a lane per round"))?;
-                    }
+                    Stage::Epoch { epoch, .. } => self.run_epoch(host, i, epoch, Some(rows))?,
                 }
             }
-            drop(rows);
             self.gathered = gathered;
         }
     }
@@ -405,13 +392,12 @@ fn run_tick(host: &mut impl DriveHost, source: u64, round: u64, delta: Option<Ba
     // Room for the schedule: growing the map rehashes it once per doubling.
     run.outputs.reserve(run.schedule.len());
     run.outputs.extend(delta.map(|delta| (source, delta)));
-    run.stages.resize_with(run.schedule.len(), Stage::default);
     let ran = run.run(host);
     // A failed step leaves the others' epochs at their rounds: dropped here, and
     // each program frees its registers when it next runs.
     run.outputs.clear();
     run.relays.clear();
-    run.stages.clear();
+    run.standing.clear();
     run.gathered.clear();
     host.parts().0.tick = run;
     ran

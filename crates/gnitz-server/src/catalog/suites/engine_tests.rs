@@ -151,7 +151,7 @@ fn test_boot_generation_advance_monotonic() {
         let recovered = engine.durable_generation();
         assert_eq!(engine.advance_durable_generation().unwrap(), recovered + 1);
         assert_eq!(
-            engine.dag.resume_at, recovered,
+            engine.boot.resume_at, recovered,
             "the resume point stays the recovered generation"
         );
         assert_eq!(engine.advance_durable_generation().unwrap(), recovered + 2);

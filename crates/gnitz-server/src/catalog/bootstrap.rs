@@ -34,6 +34,7 @@ impl CatalogEngine {
             id_floor: gnitz_wire::FIRST_USER_TABLE_ID,
             used_ids: FxHashSet::default(),
             applied_zone: 0,
+            boot: super::BootVerdict::default(),
         };
 
         for family in SysFamily::ALL {
@@ -80,7 +81,9 @@ impl CatalogEngine {
             .registry
             .reconcile_child_dirs(|id| engine.dag.layout_of(id))
             .map_err(|e| format!("child-dir sweep failed: {e}"))?;
-        engine.dag.decide_rebuild(&engine.registry, engine.durable_generation());
+        let resume_at = engine.durable_generation();
+        let rebuild = engine.dag.decide_rebuild(&engine.registry, resume_at);
+        engine.boot = super::BootVerdict { resume_at, rebuild };
         Ok(engine)
     }
 

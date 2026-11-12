@@ -1,7 +1,7 @@
 //! DagEngine: every registered view's compiled plan, the operator state of the
-//! views this process runs, and the boot verdict on which views rebuild rather
-//! than resume. Epoch execution lives in `exec`, per-key
-//! hydration in `hydrate`, the dependency map in `meta`.
+//! views this process runs, and the decision of the boot verdict on which views
+//! rebuild rather than resume. Epoch execution lives in `exec`, per-key
+//! hydration in `hydrate`, the dependency graph and the tick schedules in `meta`.
 
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -61,10 +61,10 @@ struct RegisteredView {
     state: Option<CircuitState>,
     /// The user view whose chain holds this view: its owner, or itself.
     chain: u64,
-    /// Every relation one or more `view → sources` edges from this view, sorted and
-    /// each once: source views and bases, never the view itself. Fixed from
+    /// Every relation that is no view one or more `view → sources` edges from this
+    /// view, sorted and each once: the relations whose ticks reach it. Fixed from
     /// registration to drop, since a source registers before and drops after it.
-    sources: Box<[u64]>,
+    roots: Box<[u64]>,
 }
 
 #[derive(Default)]
@@ -72,12 +72,6 @@ pub(crate) struct DagEngine {
     dep: DepMap,
     /// Every registered view, from its registration to its drop.
     views: FxHashMap<u64, RegisteredView>,
-    /// Views the boot verdict ([`Self::decide_rebuild`]) rejected, closed under
-    /// dependents and chains, each until its rebuild backfill starts.
-    rebuild: FxHashSet<u64>,
-    /// The committed checkpoint generation the boot verdict was decided at:
-    /// the stamp a kept relation's rederived state resumes from.
-    pub(crate) resume_at: u64,
     /// The running tick's state; between ticks empty, kept for its capacity.
     tick: exec::TickRun,
 }
@@ -102,17 +96,23 @@ impl DagEngine {
             return Err(format!("scans relation {src}, which is not older than it"));
         }
         let (code, placement) = compiler::compile_view(circuit, registry, view_id, view, bounded)?;
-        // The closure below is exact only if every source view is registered here.
+        // A source not registered here is a root only if it is no view.
         debug_assert!(code
             .source_ids()
             .all(|s| self.views.contains_key(&s) || !registry.relation(s).is_some_and(|r| r.kind().is_view())));
-        let mut sources: Vec<u64> = code.source_ids().flat_map(|s| self.self_and_sources(s)).collect();
-        sources.sort_unstable();
-        sources.dedup();
+        let mut roots = Vec::new();
+        for source in code.source_ids() {
+            match self.views.get(&source) {
+                Some(view) => roots.extend_from_slice(&view.roots),
+                None => roots.push(source),
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
         self.dep.link(view_id, code.source_ids());
-        let sources = sources.into_boxed_slice();
+        let roots = roots.into_boxed_slice();
         self.views
-            .insert(view_id, RegisteredView { code, state: None, chain, sources });
+            .insert(view_id, RegisteredView { code, state: None, chain, roots });
         Ok(placement)
     }
 
@@ -140,22 +140,9 @@ impl DagEngine {
         if let Some(view) = self.views.remove(&id) {
             self.dep.unlink(id, view.code.source_ids());
         }
-        self.rebuild.remove(&id);
     }
 
-    // ── The boot rebuild set ────────────────────────────────────────────
-
-    /// Whether `id` awaits its rebuild backfill.
-    pub(crate) fn awaits_rebuild(&self, id: u64) -> bool {
-        self.rebuild.contains(&id)
-    }
-
-    /// The generation `id`'s rederived state resumes from at this boot's store
-    /// open, `None` when the verdict rebuilds it. Read before
-    /// [`Self::take_rebuild`].
-    pub(crate) fn resumes_at(&self, id: u64) -> Option<u64> {
-        (!self.awaits_rebuild(id)).then_some(self.resume_at)
-    }
+    // ── The boot verdict ────────────────────────────────────────────────
 
     /// Decide which views this boot rebuilds rather than resumes — their
     /// checkpointed state, output stores and operator traces alike. A view is
@@ -175,10 +162,10 @@ impl DagEngine {
     ///     integrates stream rows that are gone, or catalog rows no boot replays
     ///     into it.
     ///
-    /// Each view's **local** validity is decided first (direct sources + child
+    /// Each view's **local** validity is decided first (roots + child
     /// manifests), then [`Self::rebuilt_with`] propagates invalidity to any view
     /// scanning an invalid source and to the whole chain of any invalid view.
-    pub(crate) fn decide_rebuild(&mut self, registry: &RelationRegistry, g: u64) {
+    pub(crate) fn decide_rebuild(&self, registry: &RelationRegistry, g: u64) -> FxHashSet<u64> {
         // A view over a stream or a system family needs no manifest read. An
         // unreadable manifest reads as a mismatch, the verdict a child whose
         // manifest a previous open erased must get: its siblings may still be at `g`.
@@ -190,8 +177,7 @@ impl DagEngine {
             .map(|(&id, _)| id)
             .collect();
         invalid.extend(stale);
-        self.rebuild = self.rebuilt_with(invalid);
-        self.resume_at = g;
+        self.rebuilt_with(invalid)
     }
 
     /// The views every boot rebuilds whatever their stores hold: those a stream or
@@ -201,39 +187,36 @@ impl DagEngine {
         self.rebuilt_with(self.over_unreplayed_sources(registry))
     }
 
-    /// The views with a direct source whose deltas no boot replays into a kept view.
-    /// Boot replays a base table's tail alone: a stream's rows are gone, and a system
-    /// family's tail is applied before any view exists.
+    /// The views reached by a relation whose deltas no boot replays into a kept
+    /// view. Boot replays a base table's tail alone: a stream's rows are gone, and
+    /// a system family's tail is applied before any view exists.
     fn over_unreplayed_sources(&self, registry: &RelationRegistry) -> FxHashSet<u64> {
-        let unreplayed = |s: &u64| {
-            registry.relation(*s).is_some_and(|r| {
-                let k = r.kind();
-                !(k.is_view() || k.is_base_table())
-            })
-        };
-        self.views
-            .keys()
-            .copied()
-            .filter(|&vid| self.sources_of(vid).any(|s| unreplayed(&s)))
-            .collect()
-    }
-
-    /// Every view a rebuild of `invalid` takes with it: each view downstream of one,
-    /// then every view of a chain holding one. `tick_schedule` relies on this closure.
-    fn rebuilt_with(&self, mut invalid: FxHashSet<u64>) -> FxHashSet<u64> {
-        let downstream = self.dependent_closure(invalid.iter().copied());
-        invalid.extend(downstream);
-        let chains: FxHashSet<u64> = invalid.iter().map(|&v| self.chain_of(v)).collect();
+        let unreplayed = |root: &u64| registry.relation(*root).is_some_and(|r| !r.kind().is_base_table());
         self.views
             .iter()
-            .filter(|(_, v)| chains.contains(&v.chain))
+            .filter(|(_, v)| v.roots.iter().any(unreplayed))
             .map(|(&id, _)| id)
             .collect()
     }
 
-    /// Every view awaiting a rebuild backfill, removed.
-    pub(crate) fn take_rebuild(&mut self) -> FxHashSet<u64> {
-        std::mem::take(&mut self.rebuild)
+    /// Every view a rebuild of `invalid` takes with it: the least set holding
+    /// `invalid`, every view that scans a member, and every view of a chain
+    /// holding one.
+    fn rebuilt_with(&self, invalid: FxHashSet<u64>) -> FxHashSet<u64> {
+        let mut rebuilt = FxHashSet::default();
+        let mut chains = FxHashSet::default();
+        let mut stack: Vec<u64> = invalid.into_iter().collect();
+        while let Some(id) = stack.pop() {
+            if !rebuilt.insert(id) {
+                continue;
+            }
+            stack.extend_from_slice(self.dependents_of(id));
+            let chain = self.chain_of(id);
+            if chains.insert(chain) {
+                stack.extend(self.views.iter().filter(|(_, v)| v.chain == chain).map(|(&m, _)| m));
+            }
+        }
+        rebuilt
     }
 
     // ── Operator state ──────────────────────────────────────────────────

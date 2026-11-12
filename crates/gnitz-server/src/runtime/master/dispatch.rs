@@ -190,8 +190,8 @@ impl MasterDispatcher {
     pub(crate) fn last_delta_round(&self, view_id: u64) -> u64 {
         let last_tick = self.last_tick.borrow();
         let cat = self.cat();
-        let sources = cat.dag.source_closure_of(view_id);
-        sources
+        let roots = cat.dag.roots_of(view_id);
+        roots
             .iter()
             .filter_map(|s| last_tick.get(s))
             .copied()

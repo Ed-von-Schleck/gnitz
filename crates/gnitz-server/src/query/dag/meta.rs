@@ -1,4 +1,5 @@
-//! The view-dependency graph and the closures over it.
+//! The view-dependency graph, the closures over it, and the tick schedule
+//! derived from it.
 
 use super::*;
 use gnitz_wire::ReindexSlot;
@@ -9,7 +10,8 @@ use std::collections::hash_map::Entry;
 pub(super) struct Step {
     pub(super) view: u64,
     pub(super) producer: u64,
-    /// No later step reads `producer`'s output.
+    /// No later step reads `producer`'s own output: one sharing a relay round
+    /// another step ran reads what the round gathered instead.
     pub(super) last: bool,
     /// A later step reads `view`'s output.
     pub(super) needed: bool,
@@ -26,6 +28,8 @@ pub(super) struct Step {
 pub(super) struct RelaySlot {
     /// The round's index among the tick's relay rounds.
     pub(super) at: usize,
+    /// This step runs the round: no earlier step reads it.
+    pub(super) first: bool,
     /// No later step reads the round.
     pub(super) last: bool,
     /// Some step reading the round folds what it gathered, so it gathers by merge.
@@ -52,22 +56,26 @@ fn schedule<'k>(mut edges: Vec<(u64, u64)>, relay_key: impl Fn(u64, u64) -> Rela
             last: false,
             needed: false,
             relay: relay_key(view, producer).map(|(key, fold)| {
-                let at = match rounds.iter().position(|&(p, k, _)| (p, k) == (producer, key)) {
-                    Some(at) => at,
-                    None => {
-                        rounds.push((producer, key, false));
-                        rounds.len() - 1
-                    }
-                };
+                let shared = rounds.iter().position(|&(p, k, _)| (p, k) == (producer, key));
+                let at = shared.unwrap_or(rounds.len());
+                if shared.is_none() {
+                    rounds.push((producer, key, false));
+                }
                 rounds[at].2 |= fold;
-                RelaySlot { at, last: false, fold: false }
+                RelaySlot {
+                    at,
+                    first: shared.is_none(),
+                    last: false,
+                    fold: false,
+                }
             }),
         })
         .collect();
     let mut read: FxHashSet<u64> = FxHashSet::default();
     let mut relayed: FxHashSet<usize> = FxHashSet::default();
     for step in steps.iter_mut().rev() {
-        step.last = read.insert(step.producer);
+        // Every producer still enters `read`: each round has a step that runs it.
+        step.last = step.relay.is_none_or(|slot| slot.first) && read.insert(step.producer);
         if let Some(slot) = &mut step.relay {
             slot.last = relayed.insert(slot.at);
             slot.fold = rounds[slot.at].2;
@@ -86,7 +94,8 @@ fn schedule<'k>(mut edges: Vec<(u64, u64)>, relay_key: impl Fn(u64, u64) -> Rela
 pub(super) struct DepMap {
     /// source_table_id → view_ids
     forward: FxHashMap<u64, Vec<u64>>,
-    /// source id → [`Self::tick_steps`] of it, each kept until an edge moves.
+    /// source id → [`DagEngine::tick_schedule`] of it, each kept until an edge
+    /// moves.
     tick_steps: FxHashMap<u64, Rc<[Step]>>,
 }
 
@@ -112,84 +121,59 @@ impl DepMap {
         }
     }
 
-    /// One [`Step`] per dependency edge out of `source`'s forward closure, in
-    /// execution order. A tick runs these every time, so they are derived once
-    /// per shape of the graph.
-    fn tick_steps<'k>(&mut self, source: u64, relay_key: impl Fn(u64, u64) -> RelayKey<'k>) -> Rc<[Step]> {
-        match self.tick_steps.get(&source) {
-            Some(steps) => Rc::clone(steps),
-            None => self.derive_tick_steps(source, relay_key),
-        }
-    }
-
-    /// [`Self::tick_steps`] on a miss: derived and kept.
-    // Out of line: a tick reads the kept steps, and the derivation inlined into
-    // it costs every tick.
-    #[cold]
-    #[inline(never)]
-    fn derive_tick_steps<'k>(&mut self, source: u64, relay_key: impl Fn(u64, u64) -> RelayKey<'k>) -> Rc<[Step]> {
-        let producers = std::iter::once(source).chain(closure(|id| self.forward_of(id).iter().copied(), [source]));
-        let edges = producers
-            .flat_map(|producer| self.forward_of(producer).iter().map(move |&view| (view, producer)))
-            .collect();
-        let steps = schedule(edges, relay_key);
-        self.tick_steps.insert(source, Rc::clone(&steps));
-        steps
-    }
-
     /// The views that scan `id` directly. Empty when none do.
     fn forward_of(&self, id: u64) -> &[u64] {
         self.forward.get(&id).map_or(&[], Vec::as_slice)
     }
-}
 
-/// Every id one or more `next` edges from some seed — a seed only when another
-/// seed reaches it. Seeds with no edge allocate nothing.
-fn closure<I: IntoIterator<Item = u64>>(
-    next: impl Fn(u64) -> I,
-    seeds: impl IntoIterator<Item = u64>,
-) -> FxHashSet<u64> {
-    let mut reachable: FxHashSet<u64> = FxHashSet::default();
-    let mut stack: Vec<u64> = seeds
-        .into_iter()
-        .filter(|&id| next(id).into_iter().next().is_some())
-        .collect();
-    while let Some(id) = stack.pop() {
-        for n in next(id) {
-            if reachable.insert(n) {
-                stack.push(n);
+    /// Every view one or more `source → dependents` edges from some seed — a seed
+    /// only when another seed reaches it: the views a tick of the seeds reaches.
+    pub(super) fn downstream(&self, seeds: impl IntoIterator<Item = u64>) -> FxHashSet<u64> {
+        let mut reached: FxHashSet<u64> = FxHashSet::default();
+        let mut stack: Vec<u64> = seeds.into_iter().collect();
+        while let Some(id) = stack.pop() {
+            for &view in self.forward_of(id) {
+                if reached.insert(view) {
+                    stack.push(view);
+                }
             }
         }
+        reached
     }
-    reachable
 }
 
 impl DagEngine {
-    /// One [`Step`] per dependency edge out of `source_id`'s forward closure, in
-    /// execution order, skipping non-resumable views: their backfill fills them.
-    /// The skipped set is closed under dependents (`rebuilt_with` closes it,
-    /// `backfill` keeps it so), so no step reads a skipped producer.
-    /// Worker-identical, which keeps the workers in lockstep.
-    pub(super) fn tick_schedule(&mut self, source_id: u64) -> Rc<[Step]> {
-        let views = &self.views;
+    /// One [`Step`] per dependency edge out of `source`'s forward closure, in
+    /// execution order. Worker-identical, which keeps the workers in lockstep.
+    /// A tick runs these every time, so they are derived once per shape of the
+    /// graph.
+    pub(super) fn tick_schedule(&mut self, source: u64) -> Rc<[Step]> {
+        match self.dep.tick_steps.get(&source) {
+            Some(steps) => Rc::clone(steps),
+            None => self.derive_tick_schedule(source),
+        }
+    }
+
+    /// [`Self::tick_schedule`] on a miss: derived and kept.
+    // Out of line: a tick reads the kept steps, and the derivation inlined into
+    // it costs every tick.
+    #[cold]
+    #[inline(never)]
+    fn derive_tick_schedule(&mut self, source: u64) -> Rc<[Step]> {
+        let (views, dep) = (&self.views, &mut self.dep);
         // A step's view scans its producer.
         let relay_key = |view: u64, producer: u64| {
             let code = &views.get(&view)?.code;
             let scan = code.scan(producer);
             Some((&*scan.relay.as_ref()?.key, code.vm.folds(scan.seed)))
         };
-        let steps = self.dep.tick_steps(source_id, relay_key);
-        match self.rebuild.is_empty() {
-            true => steps,
-            false => schedule(
-                steps
-                    .iter()
-                    .filter(|s| !self.awaits_rebuild(s.view))
-                    .map(|s| (s.view, s.producer))
-                    .collect(),
-                relay_key,
-            ),
-        }
+        let producers = std::iter::once(source).chain(dep.downstream([source]));
+        let edges = producers
+            .flat_map(|producer| dep.forward_of(producer).iter().map(move |&view| (view, producer)))
+            .collect();
+        let steps = schedule(edges, relay_key);
+        dep.tick_steps.insert(source, Rc::clone(&steps));
+        steps
     }
 
     // ── Dependency map ──────────────────────────────────────────────────
@@ -210,29 +194,11 @@ impl DagEngine {
         self.views.get(&view_id).into_iter().flat_map(|v| v.code.source_ids())
     }
 
-    /// Every relation one or more `view → sources` edges from `view` — through
-    /// view sources, down to the bases — sorted, without `view` itself. Empty for
-    /// an id that is no registered view.
-    pub(crate) fn source_closure_of(&self, view: u64) -> &[u64] {
-        self.views.get(&view).map_or(&[], |v| &v.sources)
-    }
-
-    /// `id`, then [`Self::source_closure_of`] it.
-    pub(super) fn self_and_sources(&self, id: u64) -> impl Iterator<Item = u64> + '_ {
-        std::iter::once(id).chain(self.source_closure_of(id).iter().copied())
-    }
-
-    /// The other direction over the same edges: every view one or more
-    /// `source → dependents` edges from some seed — which views a tick of these
-    /// sources reaches.
-    pub(crate) fn dependent_closure(&self, seeds: impl IntoIterator<Item = u64>) -> FxHashSet<u64> {
-        closure(|id| self.dependents_of(id).iter().copied(), seeds)
-    }
-
-    /// Whether a tick of `id` drives a view: one scans it that does not await its
-    /// rebuild.
-    pub(crate) fn is_ticked(&self, id: u64) -> bool {
-        self.dependents_of(id).iter().any(|v| !self.rebuild.contains(v))
+    /// Every relation that is no view and reaches `view` through the relations it
+    /// scans — the relations whose ticks reach it — sorted. Empty for an id that
+    /// is no registered view.
+    pub(crate) fn roots_of(&self, view: u64) -> &[u64] {
+        self.views.get(&view).map_or(&[], |v| &v.roots)
     }
 }
 

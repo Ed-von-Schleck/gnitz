@@ -626,9 +626,7 @@ async fn sync_wait(
         if until > shared.dispatcher.reactor().now() && out.unsynced() == 0 && held.iter().all(caught_up) {
             let watched: FxHashSet<u64> = {
                 let cat = shared.cat();
-                views()
-                    .flat_map(|v| cat.dag.source_closure_of(v).iter().copied())
-                    .collect()
+                views().flat_map(|v| cat.dag.roots_of(v).iter().copied()).collect()
             };
             if let Some(mut watching) = shared.ticks.watch(watched) {
                 drop(catalog);

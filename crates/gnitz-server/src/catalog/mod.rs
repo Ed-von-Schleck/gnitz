@@ -81,4 +81,15 @@ pub(crate) struct CatalogEngine {
     /// The newest SAL zone applied to the system families; every system flush
     /// records it as its replay floor.
     pub(in crate::catalog) applied_zone: u64,
+    /// What this boot resumes: decided once, before any store opens.
+    pub(crate) boot: BootVerdict,
+}
+
+/// The boot verdict: the committed checkpoint generation kept state resumes
+/// from, and the views rebuilt instead. Read at store open; the master's
+/// recovery takes the rebuild set to rebuild them.
+#[derive(Default)]
+pub(crate) struct BootVerdict {
+    pub(crate) resume_at: u64,
+    pub(crate) rebuild: FxHashSet<u64>,
 }

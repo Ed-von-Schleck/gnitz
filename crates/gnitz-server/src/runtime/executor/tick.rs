@@ -95,8 +95,8 @@ impl Drop for Watching<'_> {
 
 impl Ticks {
     /// The ticks' handle, and the requests [`tick_loop`] is to be spawned on.
-    /// `boot_seed` is the SAL watermark after the recovery tick sweep: every
-    /// commit recovered at boot is reflected in every view.
+    /// `boot_seed` is the SAL watermark after the recovery's tick of the replayed
+    /// tail: every commit recovered at boot is reflected in every view.
     pub(super) fn new(boot_seed: u64) -> (Ticks, TickRequests) {
         let (tx, rx) = chan::unbounded();
         let ticks = Ticks {
@@ -113,16 +113,12 @@ impl Ticks {
         (ticks, TickRequests(rx))
     }
 
-    /// True when no relation in the source closure of any of `targets` has a
+    /// True when no relation whose ticks reach any of `targets` has a
     /// commit no emitted tick has taken, so a read of them misses nothing.
     /// A commit is pending from its layout on, ahead of its ACK, so this errs
     /// towards false, which costs one extra drain.
     pub(super) fn all_ticked(&self, dag: &DagEngine, targets: impl IntoIterator<Item = u64>) -> bool {
-        self.none_pending(
-            targets
-                .into_iter()
-                .flat_map(|t| dag.source_closure_of(t).iter().copied()),
-        )
+        self.none_pending(targets.into_iter().flat_map(|t| dag.roots_of(t).iter().copied()))
     }
 
     /// True when none of `relations` has a commit no emitted tick has taken.

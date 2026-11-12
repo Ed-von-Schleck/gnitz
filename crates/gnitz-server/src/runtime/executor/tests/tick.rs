@@ -3,10 +3,10 @@ use crate::runtime::master::fixtures::test_dispatcher;
 use crate::runtime::test_support::{empty_catalog, try_poll_once, within};
 use crate::test_support::{register_identity_view, table_engine, u64_i64_cols};
 
-/// A pending commit leaves unticked exactly the targets whose source closure
-/// holds its relation, through a view in between, until its entry goes.
+/// A pending commit leaves unticked exactly the targets its relation's tick
+/// reaches, through a view in between, until its entry goes.
 #[test]
-fn all_ticked_reads_each_targets_source_closure() {
+fn all_ticked_reads_each_targets_roots() {
     let cols = u64_i64_cols();
     let (mut engine, t) = table_engine("ticks", "all_ticked", 1, &cols);
     let u = engine.create_table("public.u", &cols, &[0]).unwrap();
@@ -21,7 +21,7 @@ fn all_ticked_reads_each_targets_source_closure() {
     assert!(!ticks.all_ticked(dag, [v2]));
     assert!(!ticks.all_ticked(dag, [w, v1]));
     assert!(ticks.all_ticked(dag, [w]));
-    // A target that is no view has no sources.
+    // A target that is no view has no roots.
     assert!(ticks.all_ticked(dag, [t, u, u64::MAX]));
     assert!(ticks.all_ticked(dag, []));
     ticks.forget(t);

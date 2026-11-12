@@ -174,16 +174,21 @@ fn published_children(dir: &str, id: u64) -> Vec<String> {
     names
 }
 
-/// A backfilled `DISTINCT` view over `source` re-keyed onto its column 0: an
-/// output store and one trace.
-fn traced_view(engine: &mut CatalogEngine, source: u64, name: &str, cols: &[CatalogColumn]) -> u64 {
+/// A `DISTINCT` over `source` re-keyed onto its column 0: an output store and
+/// one trace.
+fn traced_circuit(source: u64, cols: &[CatalogColumn]) -> Circuit {
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(source, gnitz_wire::ReadBound::None);
     let keep: Vec<u32> = (1..cols.len() as u32).collect();
     let key = [(0, cols[0].def.ty.tc)];
     let rekeyed = circuit.map_reindex(scan, &key, &keep, ReindexRole::Auxiliary, NullKeys::Keep);
     circuit.distinct(rekeyed);
-    let vid = try_register_view(engine, circuit, name, cols, 0, 0).unwrap();
+    circuit
+}
+
+/// A backfilled [`traced_circuit`] view.
+fn traced_view(engine: &mut CatalogEngine, source: u64, name: &str, cols: &[CatalogColumn]) -> u64 {
+    let vid = try_register_view(engine, traced_circuit(source, cols), name, cols, 0, 0).unwrap();
     backfill(engine, vid);
     vid
 }
@@ -225,12 +230,12 @@ fn assert_unreplayed_source_rebuilds_at_reopen(mut engine: CatalogEngine, source
 
     let engine = CatalogEngine::open(dir, 1).unwrap();
     assert!(
-        engine.dag.awaits_rebuild(direct),
+        engine.boot.rebuild.contains(&direct),
         "a direct unreplayed source invalidates"
     );
-    assert!(engine.dag.awaits_rebuild(downstream), "and the verdict cascades");
+    assert!(engine.boot.rebuild.contains(&downstream), "and the verdict cascades");
     assert!(
-        !engine.dag.awaits_rebuild(over_table),
+        !engine.boot.rebuild.contains(&over_table),
         "a checkpointed view over a base table resumes, so the rejection is about the source"
     );
 
@@ -263,9 +268,9 @@ fn assert_round_publishes_nothing_reaching(mut engine: CatalogEngine, source: u6
     engine.close();
 
     let engine = CatalogEngine::open(dir, 1).unwrap();
-    assert!(engine.dag.awaits_rebuild(direct));
-    assert!(engine.dag.awaits_rebuild(downstream));
-    assert!(!engine.dag.awaits_rebuild(over_table));
+    assert!(engine.boot.rebuild.contains(&direct));
+    assert!(engine.boot.rebuild.contains(&downstream));
+    assert!(!engine.boot.rebuild.contains(&over_table));
 
     discard(engine);
 }

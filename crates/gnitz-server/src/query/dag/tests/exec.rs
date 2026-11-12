@@ -282,23 +282,21 @@ fn a_backfill_runs_only_the_named_view() {
     }
 }
 
-/// A view is not filled while a source of its own still awaits its fill: its
-/// ticks would then run over a producer the tick schedule skips.
-#[test]
-fn a_backfill_refuses_a_view_ahead_of_its_source() {
-    let (mut engine, base, views) = engine_with_views("backfill_order");
-    let rows = [(1, 1, 10)];
-    engine.registry.ingest(base, base_rows(&rows)).unwrap();
-    engine.dag.rebuild = [views.twice, views.deep].into_iter().collect();
-
-    assert!(backfill(&mut engine, views.deep).is_err());
-    assert!(
-        engine.dag.awaits_rebuild(views.deep),
-        "a refused view still awaits its fill"
-    );
-    backfill(&mut engine, views.twice).unwrap();
-    backfill(&mut engine, views.deep).unwrap();
-    assert_eq!(held(&mut engine, views.deep), times(&rows, 2));
+/// A view `name` joining tables `a` and `b`, each `(id, k)`, on column `key` of
+/// both: `(key, a_id, b_id)`. Keyed on `k` the join keeps its own traces; keyed
+/// on `id` it reads the tables' stores.
+fn register_join(engine: &mut CatalogEngine, [a, b]: [u64; 2], key: u32, name: &str) -> u64 {
+    let circuit = match key {
+        1 => two_term_join_circuit(a, b, TypeCode::U64),
+        _ => {
+            let mut circuit = Circuit::default();
+            let deltas = [a, b].map(|source| scan_keyed(&mut circuit, source, &[(0, TypeCode::U64)]));
+            circuit.join(deltas, deltas, gnitz_wire::JoinKind::Equi);
+            circuit
+        }
+    };
+    let join_cols = ["k", "a_id", "b_id"].map(|name| col_def(name, TypeCode::U64));
+    try_register_view(engine, circuit, name, &join_cols, 0, 0).unwrap()
 }
 
 /// A backfill feeds a join its sources one after the other, each joined against
@@ -317,17 +315,7 @@ fn a_backfill_of_a_join_feeds_each_source_against_the_ones_before_it() {
         let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
         let a = engine.create_table("public.a", &cols, &[0]).unwrap();
         let b = engine.create_table("public.b", &cols, &[0]).unwrap();
-        let circuit = match key {
-            1 => two_term_join_circuit(a, b, TypeCode::U64),
-            _ => {
-                let mut circuit = Circuit::default();
-                let deltas = [a, b].map(|source| scan_keyed(&mut circuit, source, &[(0, TypeCode::U64)]));
-                circuit.join(deltas, deltas, gnitz_wire::JoinKind::Equi);
-                circuit
-            }
-        };
-        let join_cols = ["k", "a_id", "b_id"].map(|name| col_def(name, TypeCode::U64));
-        let view = try_register_view(&mut engine, circuit, "join", &join_cols, 0, 0).unwrap();
+        let view = register_join(&mut engine, [a, b], key, "join");
         for (tid, rows) in [(a, &a_rows[..]), (b, &b_rows)] {
             let rows = make_batch(&engine.registry.relation_or_err(tid).unwrap().schema(), rows);
             engine.registry.ingest(tid, rows).unwrap();
@@ -349,6 +337,42 @@ fn a_backfill_of_a_join_feeds_each_source_against_the_ones_before_it() {
             zset_of(&bb.finish(), &schema),
             "keyed on column {key}"
         );
+    }
+}
+
+/// A backfill reads each source at its cut, and the ticks sealing what lay above
+/// it bring the rest, each row once — the order a boot rebuilds a view in, ahead
+/// of its replayed tail. A join then pairs each tail with the other table as the
+/// earlier steps left it; a view filled once everything is sealed holds the same.
+#[test]
+fn a_backfill_at_the_cut_and_the_ticks_above_it_fill_a_join_once() {
+    let sealed = [[(1, 1, 10), (2, 1, 20)], [(2, 1, 10), (3, 1, 20)]];
+    let above = [[(3, 1, 10), (4, 1, 30)], [(4, 1, 30), (5, 1, 10)]];
+    for key in [1, 0] {
+        let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", &format!("backfill_cut_{key}")), 1).unwrap();
+        let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
+        let tables = ["a", "b"].map(|name| engine.create_table(&format!("public.{name}"), &cols, &[0]).unwrap());
+        let view = register_join(&mut engine, tables, key, "join");
+        for (i, &tid) in tables.iter().enumerate() {
+            let schema = engine.registry.relation_or_err(tid).unwrap().schema();
+            engine.registry.ingest(tid, make_batch(&schema, &sealed[i])).unwrap();
+            engine
+                .registry
+                .ingest_pending(tid, make_batch(&schema, &above[i]))
+                .unwrap();
+        }
+
+        backfill(&mut engine, view).unwrap();
+        let at_cut = held(&mut engine, view);
+        for (&tid, round) in tables.iter().zip(2..) {
+            tick(&mut engine, tid, round).unwrap();
+        }
+
+        let fresh = register_join(&mut engine, tables, key, "fresh");
+        backfill(&mut engine, fresh).unwrap();
+        let (got, want) = (held(&mut engine, view), held(&mut engine, fresh));
+        assert_eq!(got, want, "keyed on column {key}");
+        assert!(at_cut.len() < want.len(), "premise: the tail adds matches");
     }
 }
 
