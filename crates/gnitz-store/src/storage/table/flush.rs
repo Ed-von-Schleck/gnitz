@@ -1,7 +1,7 @@
 //! [`Table`]'s flush path: the overflow fold and spill, and the multi-table
 //! durable flush barrier.
 
-use super::super::shard_index::{FlushWork, ShardIndex};
+use super::super::manifest::{FlushWork, StoreDir};
 use super::Table;
 use gnitz_zset::repr::StorageError;
 
@@ -13,11 +13,9 @@ pub(crate) fn flush_barrier<'a>(
 ) -> Result<(), StorageError> {
     let mut work = Vec::new();
     for t in tables {
-        if let Some(w) = t.flush_prepare(checkpoint_mark)? {
-            work.push((&mut t.shard_index, w));
-        }
+        work.extend(t.flush_prepare(checkpoint_mark)?);
     }
-    ShardIndex::publish(work)
+    StoreDir::publish(work)
 }
 
 impl Table {
@@ -48,9 +46,9 @@ impl Table {
     // Barrier prepare
     // ------------------------------------------------------------------
 
-    /// Fold memtable and RAM tier into one shard and [stage](ShardIndex::stage)
+    /// Fold memtable and RAM tier into one shard and [stage](super::super::shard_index::ShardIndex::stage)
     /// the manifest naming it.
-    pub(super) fn flush_prepare(&mut self, checkpoint_mark: u64) -> Result<Option<FlushWork>, StorageError> {
+    pub(super) fn flush_prepare(&mut self, checkpoint_mark: u64) -> Result<Option<FlushWork<'_>>, StorageError> {
         debug_assert!(!self.held_in_ram, "a barrier over a store held in RAM only");
         // The memtable drains into the RAM tier, which spills as one shard.
         self.rejudge_live_floor();

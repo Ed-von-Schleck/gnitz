@@ -38,16 +38,14 @@ fn for_compaction_bench() {
         let guard_keys: Vec<PkBuf> = (0..guards)
             .map(|g| PkBuf::from_bytes(&((g * per / guards) as u64).to_be_bytes()))
             .collect();
-        let mut merge = GuardMerge::begin(inputs, skeleton).unwrap();
+        let mut merge = GuardMerge::begin(inputs, guard_keys[1..].to_vec(), skeleton).unwrap();
         let ((rows, i), c) = cycles.measure(|| {
             instructions.measure(|| {
-                (0..guard_keys.len())
-                    .filter_map(|g| {
-                        let until = guard_keys.get(g + 1).map(PkBuf::pk_bytes);
-                        merge.next(until, None)
-                    })
-                    .map(|run| black_box(run).row_count())
-                    .sum::<usize>()
+                let mut rows = 0;
+                while !merge.done() {
+                    rows += merge.next(None).map_or(0, |run| black_box(run).row_count());
+                }
+                rows
             })
         });
         // Every source holds every key, each under its own payload.
@@ -110,9 +108,9 @@ fn distinct_compaction_bench() {
                 .zip(builders)
                 .map(|(s, b)| map_shard(&dir.path().join(format!("{pk}_{deal}_{s}.db")), &b.finish()))
                 .collect();
-            let mut merge = GuardMerge::begin(inputs.clone(), false).unwrap();
+            let mut merge = GuardMerge::begin(inputs.clone(), Vec::new(), false).unwrap();
             let ((), whole) = instructions.measure(|| {
-                let run = merge.next(None, None).unwrap();
+                let run = merge.next(None).unwrap();
                 let batch = run.plain().unwrap();
                 assert_eq!(batch.len() as u64, TOTAL);
                 black_box(batch);
@@ -163,8 +161,8 @@ fn coded_compaction_bench() {
         .zip(&batches)
         .map(|(s, b)| map_coded_shard(&dir.path().join(format!("{s}.db")), b, &book))
         .collect();
-    let mut merge = GuardMerge::begin(inputs, false).unwrap();
-    let (rows, i) = instructions.measure(|| black_box(merge.next(None, Some(&book)).unwrap()).row_count());
+    let mut merge = GuardMerge::begin(inputs, Vec::new(), false).unwrap();
+    let (rows, i) = instructions.measure(|| black_box(merge.next(Some(&book)).unwrap()).row_count());
     assert_eq!(rows, TOTAL);
     println!(
         "{SOURCES} coded sources, 3 long strings: {:.1} instr/row",
@@ -210,9 +208,9 @@ fn disjoint_coded_compaction_bench() {
         .zip(&batches)
         .map(|(s, b)| map_coded_shard(&dir.path().join(format!("{s}.db")), b, &book))
         .collect();
-    let mut merge = GuardMerge::begin(inputs.clone(), false).unwrap();
+    let mut merge = GuardMerge::begin(inputs.clone(), Vec::new(), false).unwrap();
     let (heap, i) = instructions.measure(|| {
-        let run = black_box(merge.next(None, Some(&book)).unwrap());
+        let run = black_box(merge.next(Some(&book)).unwrap());
         assert_eq!(run.row_count(), TOTAL);
         run.batch.blob().len()
     });
@@ -224,7 +222,10 @@ fn disjoint_coded_compaction_bench() {
     let skeletons: Vec<Rc<MappedShard>> = (0..)
         .zip(inputs)
         .map(|(s, input)| {
-            let run = GuardMerge::begin(vec![input], true).unwrap().next(None, None).unwrap();
+            let run = GuardMerge::begin(vec![input], Vec::new(), true)
+                .unwrap()
+                .next(None)
+                .unwrap();
             let path = dir.path().join(format!("skeleton_{s}.db"));
             let path = path.to_str().unwrap();
             (run.batch
@@ -233,8 +234,8 @@ fn disjoint_coded_compaction_bench() {
             Rc::new(MappedShard::open(path, &schema).unwrap())
         })
         .collect();
-    let mut merge = GuardMerge::begin(skeletons, false).unwrap();
-    let (rows, i) = instructions.measure(|| black_box(merge.next(None, Some(&book)).unwrap()).row_count());
+    let mut merge = GuardMerge::begin(skeletons, Vec::new(), false).unwrap();
+    let (rows, i) = instructions.measure(|| black_box(merge.next(Some(&book)).unwrap()).row_count());
     assert_eq!(rows, TOTAL);
     println!(
         "{SOURCES} disjoint skeleton sources: {:.1} instr/row",

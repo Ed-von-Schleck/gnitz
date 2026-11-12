@@ -1,8 +1,9 @@
 //! One store directory: the manifest serde, the directory's file names and the
-//! primitives over them. A store owns its directory, so every shard and staging
-//! file in it is the store's.
+//! primitives over them, and the [`StoreDir`] a store draws its shards in and
+//! publishes them through. A store owns its directory, so every shard and
+//! staging file in it is the store's.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -147,7 +148,7 @@ pub(super) fn shard_seqs(dir: &str) -> io::Result<Vec<u64>> {
 }
 
 /// The path of the shard drawn at `seq` in the store at `dir`.
-pub(super) fn shard_path(dir: &str, seq: u64) -> String {
+fn shard_path(dir: &str, seq: u64) -> String {
     format!("{dir}/{}", ShardName(seq))
 }
 
@@ -160,7 +161,7 @@ fn absent_ok(r: io::Result<()>) -> io::Result<()> {
 }
 
 /// Remove the staging file and every shard `live` does not hold from `dir`.
-pub(super) fn remove_stale_files(dir: &str, live: impl Fn(u64) -> bool) -> io::Result<()> {
+fn remove_stale_files(dir: &str, live: impl Fn(u64) -> bool) -> io::Result<()> {
     absent_ok(fs::remove_file(staging_path(dir)))?;
     for seq in shard_seqs(dir)? {
         if !live(seq) {
@@ -183,7 +184,7 @@ pub(crate) fn shard_files(dir: &str) -> Result<Vec<(String, Option<u64>)>, Stora
 
 /// Read and decode `dir`'s manifest. `Ok(None)` when it does not exist yet;
 /// `Err` on damage or a failed read.
-pub(super) fn read(dir: &str) -> Result<Option<Manifest>, StorageError> {
+fn read(dir: &str) -> Result<Option<Manifest>, StorageError> {
     match fs::read(manifest_path(dir)) {
         Ok(buf) => decode(&buf).map(Some),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -205,13 +206,17 @@ pub(crate) fn read_at(dir: &str, generation: u64) -> Result<Option<Manifest>, St
 }
 
 /// Write `m` to `dir`'s [`staging_path`], for [`commit`] to publish.
-pub(super) fn stage(dir: &str, m: &Manifest) -> Result<(), StorageError> {
+fn stage(dir: &str, m: &Manifest) -> Result<(), StorageError> {
     fs::write(staging_path(dir), encode(m))?;
     Ok(())
 }
 
 /// Rename the manifest staged at [`staging_path`] onto `dir`'s manifest path.
-pub(super) fn commit(dir: &str) -> Result<(), StorageError> {
+///
+/// The new shards' directory entries are synced only after the rename, so a
+/// crash in between relies on the filesystem ordering its metadata (ext4,
+/// xfs), which POSIX does not promise.
+fn commit(dir: &str) -> Result<(), StorageError> {
     fs::rename(staging_path(dir), manifest_path(dir))?;
     Ok(())
 }
@@ -221,7 +226,7 @@ pub(super) fn commit(dir: &str) -> Result<(), StorageError> {
 /// too, for the entries that reach it. A store directory sits at most two below
 /// the data directory's `_relations` (`relation_dir[/child]`), whose own entry
 /// `lock_data_dir` syncs.
-pub(super) fn owed_dirs(dir: &str, first: bool) -> impl Iterator<Item = &Path> + '_ {
+fn owed_dirs(dir: &str, first: bool) -> impl Iterator<Item = &Path> + '_ {
     Path::new(dir)
         .ancestors()
         .take(if first { 3 } else { 1 })
@@ -230,7 +235,7 @@ pub(super) fn owed_dirs(dir: &str, first: bool) -> impl Iterator<Item = &Path> +
 
 /// Durably unlink the manifest of every store in `dirs`, in one sync batch; an
 /// absent manifest or directory is already unlinked.
-pub(super) fn unlink<S: AsRef<str>>(dirs: &[S]) -> Result<(), StorageError> {
+fn unlink<S: AsRef<str>>(dirs: &[S]) -> Result<(), StorageError> {
     let mut present = Vec::with_capacity(dirs.len());
     for dir in dirs.iter().map(AsRef::as_ref) {
         absent_ok(fs::remove_file(manifest_path(dir)))?;
@@ -298,6 +303,262 @@ pub(crate) fn link_stores(pairs: &[(String, String)]) -> Result<(), StorageError
         commit(dst)?;
     }
     sync.sync_paths(&dirs, FsyncFlags::empty())
+}
+
+// ---------------------------------------------------------------------------
+// The store directory
+// ---------------------------------------------------------------------------
+
+/// How a relation's tail is recovered across a restart.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RecoverySource {
+    /// The tail is recovered by replaying the fsynced SAL over the shards loaded
+    /// from the manifest at open.
+    SalReplay,
+    /// Derived state, persisted under a generation-stamped manifest by each
+    /// ephemeral round that picks its relation.
+    Rederive {
+        /// The generation a manifest must carry for the open to resume from it
+        /// instead of erasing it; `None` erases it.
+        resume_at: Option<u64>,
+    },
+}
+
+/// What this process knows of the manifest in place in a store's directory.
+#[derive(Debug)]
+enum InPlace {
+    /// None, or one staged whose barrier has not completed: a failed publish
+    /// may have renamed it.
+    Unknown,
+    /// Renamed into place, its directory entries possibly not durable: the one
+    /// an open read, whose rename may predate a kill that came before the
+    /// directory syncs.
+    Renamed(Manifest),
+    /// Renamed, and its directories synced by a barrier of this process.
+    Durable(Manifest),
+}
+
+/// One store's directory: the seqs its shards are drawn at, which of them the
+/// manifest in place names, the shards dropped since, and that manifest.
+pub(super) struct StoreDir {
+    path: String,
+    /// The last seq drawn; a shard is named by its seq.
+    seq: u64,
+    /// The last seq drawn when the most recently renamed manifest was built:
+    /// a live shard drawn at or below it is one that manifest names.
+    published_through: u64,
+    /// Shards dropped that a published manifest names, unlinked once one that
+    /// does not is durable.
+    retired: Vec<u64>,
+    in_place: InPlace,
+    /// The checkpoint mark of the manifest the open loaded.
+    loaded_mark: Option<u64>,
+    /// What the next publish writes as the manifest's caller record.
+    caller_record: Vec<u8>,
+}
+
+/// A publish [`StoreDir::stage`] staged and [`StoreDir::publish`] completes. It
+/// holds its store until then, so nothing draws or drops a shard in between.
+pub(super) struct FlushWork<'a> {
+    dir: &'a mut StoreDir,
+    /// The manifest staged for the rename. Without one the manifest in place
+    /// is already current, and only the directory syncs are owed.
+    staged: Option<Manifest>,
+    /// Whether no publish of this store is known durable, so the entries that
+    /// reach its directory are owed a sync beside the directory itself.
+    first_sync: bool,
+}
+
+impl StoreDir {
+    /// Open the store directory at `path`, creating it if it is missing.
+    /// `recovery` decides which manifest, if any, the open loads; every shard
+    /// that manifest does not name, and the staging file, are unlinked.
+    pub(super) fn open(path: &str, recovery: RecoverySource) -> Result<Self, StorageError> {
+        // First, so an unusable directory fails the open rather than the first
+        // flush. `created` is `mkdir`'s own verdict, never a `stat`'s: a store
+        // read as freshly created skips its manifest, and so unlinks every
+        // shard in the directory.
+        let created = match fs::create_dir(path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(path)?;
+                true
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(e) => return Err(e.into()),
+        };
+        let rederived = matches!(recovery, RecoverySource::Rederive { .. });
+        let loaded = match recovery {
+            _ if created => None,
+            // Erased at open, so it reads nothing: an I/O error on the file it is
+            // about to unlink must not abort it.
+            RecoverySource::Rederive { resume_at: None } => None,
+            // Rebuilt from its sources, so damage is erased rather than fatal.
+            RecoverySource::Rederive { resume_at: Some(want) } => read_at(path, want)?,
+            // Its shards are its only copy, so damage stops the open.
+            RecoverySource::SalReplay => read(path)?,
+        };
+        if loaded.is_none() && rederived && !created {
+            // So a later re-open cannot reload what this one rejected.
+            unlink(&[path])?;
+        }
+        let live: HashSet<u64> = loaded.iter().flat_map(|m| &m.shards.entries).map(|e| e.seq).collect();
+        remove_stale_files(path, |seq| live.contains(&seq))?;
+        let seq = live.into_iter().max().unwrap_or(0);
+        Ok(StoreDir {
+            path: path.to_string(),
+            seq,
+            published_through: seq,
+            retired: Vec::new(),
+            loaded_mark: loaded.as_ref().map(|m| m.checkpoint_mark),
+            caller_record: loaded.as_ref().map(|m| m.caller_record.clone()).unwrap_or_default(),
+            in_place: loaded.map_or(InPlace::Unknown, InPlace::Renamed),
+        })
+    }
+
+    /// The shard set of the manifest in place; at open, the one it loaded.
+    pub(super) fn in_place(&self) -> Option<&ShardSet> {
+        match &self.in_place {
+            InPlace::Unknown => None,
+            InPlace::Renamed(m) | InPlace::Durable(m) => Some(&m.shards),
+        }
+    }
+
+    /// The checkpoint mark of the manifest the open loaded; `None` without one.
+    pub(super) fn loaded_mark(&self) -> Option<u64> {
+        self.loaded_mark
+    }
+
+    /// The caller record of the manifest in place, or of the next publish
+    /// once set.
+    #[cfg(test)]
+    pub(super) fn caller_record(&self) -> &[u8] {
+        &self.caller_record
+    }
+
+    /// What the next publish writes as the manifest's caller record.
+    pub(super) fn set_caller_record(&mut self, record: Vec<u8>) {
+        self.caller_record = record;
+    }
+
+    #[cfg(test)]
+    pub(super) fn path(&self) -> &str {
+        &self.path
+    }
+
+    #[cfg(test)]
+    pub(super) fn last_seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Treat every shard drawn so far as published.
+    #[cfg(test)]
+    pub(super) fn mark_published(&mut self) {
+        self.published_through = self.seq;
+    }
+
+    /// The path of the shard drawn at `seq`.
+    pub(super) fn shard_path(&self, seq: u64) -> String {
+        shard_path(&self.path, seq)
+    }
+
+    /// A fresh seq, and the path of the shard it names.
+    pub(super) fn draw(&mut self) -> (u64, String) {
+        self.seq += 1;
+        (self.seq, self.shard_path(self.seq))
+    }
+
+    /// Whether the manifest last renamed names the live shard drawn at `seq`.
+    pub(super) fn published(&self, seq: u64) -> bool {
+        seq <= self.published_through
+    }
+
+    /// Unlink the shard drawn at `seq`, best-effort.
+    fn unlink_shard(&self, seq: u64) {
+        let _ = fs::remove_file(self.shard_path(seq));
+    }
+
+    /// Drop the shard drawn at `seq`: unlinked now if no published manifest
+    /// names it, else once a manifest that does not is durable.
+    pub(super) fn retire(&mut self, seq: u64) {
+        if self.published(seq) {
+            self.retired.push(seq);
+        } else {
+            self.unlink_shard(seq);
+        }
+    }
+
+    /// Stage the manifest of `shards` carrying `checkpoint_mark` and the
+    /// caller record for [`Self::publish`], unless it is the manifest in place;
+    /// `None` when that one is also durable.
+    pub(super) fn stage(
+        &mut self,
+        checkpoint_mark: u64,
+        shards: ShardSet,
+    ) -> Result<Option<FlushWork<'_>>, StorageError> {
+        let m = Manifest {
+            checkpoint_mark,
+            caller_record: self.caller_record.clone(),
+            shards,
+        };
+        let first_sync = !matches!(self.in_place, InPlace::Durable(_));
+        let staged = match &self.in_place {
+            InPlace::Durable(p) if *p == m => return Ok(None),
+            InPlace::Renamed(p) if *p == m => {
+                debug_assert!(
+                    m.shards.entries.iter().all(|e| self.published(e.seq)),
+                    "the manifest in place names an unsynced shard"
+                );
+                None
+            }
+            _ => {
+                // Until the barrier records otherwise: a failed publish may have
+                // renamed it.
+                self.in_place = InPlace::Unknown;
+                stage(&self.path, &m)?;
+                Some(m)
+            }
+        };
+        Ok(Some(FlushWork { dir: self, staged, first_sync }))
+    }
+
+    /// Durably publish every store in `work` as [`Self::stage`] staged it, then
+    /// unlink the shards its new manifest no longer names.
+    pub(super) fn publish(mut work: Vec<FlushWork<'_>>) -> Result<(), StorageError> {
+        let mut sync = Syncer::default();
+        // Every staged manifest, and every shard it names that no published one
+        // did, before any rename.
+        sync.sync_paths(
+            work.iter().flat_map(|w| {
+                w.staged.iter().flat_map(|m| {
+                    let unsynced = m.shards.entries.iter().filter(|e| !w.dir.published(e.seq));
+                    (unsynced.map(|e| w.dir.shard_path(e.seq))).chain([staging_path(&w.dir.path)])
+                })
+            }),
+            FsyncFlags::DATASYNC,
+        )?;
+        for w in &mut work {
+            if w.staged.is_some() {
+                // The rename publishes every shard the manifest names.
+                commit(&w.dir.path)?;
+                w.dir.published_through = w.dir.seq;
+            }
+        }
+        // After every rename. A rename is metadata: a full fsync, not fdatasync.
+        let dirs: BTreeSet<&Path> = work.iter().flat_map(|w| owed_dirs(&w.dir.path, w.first_sync)).collect();
+        sync.sync_paths(&dirs, FsyncFlags::empty())?;
+        // No durable manifest names a superseded shard any more.
+        for FlushWork { dir, staged, .. } in work {
+            dir.in_place = match (staged, std::mem::replace(&mut dir.in_place, InPlace::Unknown)) {
+                (Some(m), _) | (None, InPlace::Renamed(m) | InPlace::Durable(m)) => InPlace::Durable(m),
+                (None, InPlace::Unknown) => unreachable!("a store stages nothing only over a manifest in place"),
+            };
+            for seq in std::mem::take(&mut dir.retired) {
+                dir.unlink_shard(seq);
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

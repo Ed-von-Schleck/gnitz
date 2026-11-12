@@ -1,15 +1,13 @@
-//! FLSM Shard Index: the tree a store's shards form — levels of guards and the
-//! shard entries in them, the compaction policy's constants and its learned
-//! cancel yield — and the manifest it is opened from and stages and publishes.
-//! The writer, probes and upkeep over the tree are [`index`]'s.
+//! FLSM Shard Index: the tree a store's shards form — L0, levels of guards and
+//! the shard entries in them, the compaction policy's constants and its learned
+//! cancel yield — opened from the shard set of its directory's manifest. The
+//! writer, probes and upkeep over the tree are [`index`]'s; the files, and the
+//! publish that makes a tree durable, are the [`StoreDir`]'s.
 
-use std::collections::HashSet;
-use std::fs;
-use std::io;
 use std::ops::Range;
 use std::rc::Rc;
 
-use super::manifest::{self, Manifest, ManifestEntry, ShardSet};
+use super::manifest::{ManifestEntry, RecoverySource, ShardSet, StoreDir};
 use super::pk_ranges_overlap;
 use gnitz_wire::PkBuf;
 use gnitz_wire::RowSource;
@@ -85,23 +83,19 @@ impl ShardIndex {
     /// The tree's shape as counts: L0 shards, then L1's and the terminal level's
     /// guards.
     pub(crate) fn level_shape(&self) -> (usize, [usize; 2]) {
-        (
-            self.levels[L0].entries().count(),
-            [L1, TERMINAL].map(|l| self.levels[l].guards.len()),
-        )
+        (self.l0.len(), [L1, TERMINAL].map(|l| self.levels[l].guards.len()))
     }
 }
 
-/// The tree's levels, top down. Every level is a guard partition of the key line.
-const LEVELS: usize = 3;
-/// Spills as they arrive: at most one guard, keyed zero and so owning every key,
-/// whose shards overlap. Folded down into L1, never in place.
-const L0: usize = 0;
+/// The tree's guarded levels, top down, under L0. Every one is a guard partition
+/// of the key line.
+const LEVELS: usize = 2;
 /// Guards of overlapping shards, each folding its newest ones in place past
 /// [`GUARD_FILE_THRESHOLD`] and drained into the terminal level.
-const L1: usize = 1;
-/// The deepest level: one shard per guard, and the only one a sweep dehydrates.
-const TERMINAL: usize = 2;
+const L1: usize = 0;
+/// The deepest level: one shard per guard, keyed at the shard's least key, and
+/// the only level a sweep dehydrates.
+const TERMINAL: usize = 1;
 /// L0 shards past this count trigger the fold into L1.
 pub(super) const L0_COMPACT_THRESHOLD: usize = 4;
 /// Files one guard holds at rest.
@@ -149,6 +143,7 @@ impl ShardEntry {
     /// This shard's rows of OPK `key` (exactly `pk_stride` wide), where it has
     /// any. `filter_key` is `probe_key(key)` — the caller hoists it because it is
     /// the same value for every shard in one sweep.
+    #[inline]
     fn probe_pk_bytes(&self, key: &[u8], filter_key: u64) -> Option<Range<usize>> {
         if !pk_ranges_overlap(self.pk_min.pk_bytes(), self.pk_max.pk_bytes(), key, key) {
             return None;
@@ -186,6 +181,12 @@ impl LevelGuard {
     /// shard but the oldest, which has no older one here to retract from.
     fn retractions(&self) -> usize {
         self.entries.iter().skip(1).map(|e| e.shard.retraction_rows()).sum()
+    }
+
+    /// Whether this guard's entries can hold a key of `[lo, hi]`.
+    fn overlaps(&self, lo: PkBuf, hi: PkBuf) -> bool {
+        let (min, max) = self.key_extent();
+        min <= hi && max >= lo
     }
 
     /// The key span this guard's entries actually cover. The guard *key* is only
@@ -265,6 +266,7 @@ impl FLSMLevel {
     }
 
     /// Every shard in this level, in guard order.
+    #[cfg(test)]
     fn entries(&self) -> impl Iterator<Item = &ShardEntry> {
         self.guards.iter().flat_map(|g| g.entries.iter())
     }
@@ -288,35 +290,19 @@ impl FLSMLevel {
 }
 
 pub(super) struct ShardIndex {
-    output_dir: String,
+    /// The directory the shards are drawn in and published through.
+    pub(super) dir: StoreDir,
     pub(super) schema: SchemaDescriptor,
 
+    /// L0: spills as they arrive, oldest first, whose key spans overlap. Folded
+    /// down into L1 whole, never in place.
+    l0: Vec<ShardEntry>,
     levels: [FLSMLevel; LEVELS],
     /// Shards a flush wrote of rows above the store's cut: read by every reader
     /// but one at the cut, compacted with nothing, and entered into L0 by
     /// [`Self::seal_pending`]. A reopen finds them in L0.
     pending: Vec<ShardEntry>,
 
-    /// The last seq drawn; a shard is named by its seq.
-    shard_seq: u64,
-    /// The last seq drawn when the most recently renamed manifest was built; see
-    /// [`Self::published`].
-    published_through: u64,
-    /// Published shards the index has dropped, unlinked by
-    /// [`Self::unlink_retired`].
-    retired: Vec<u64>,
-    /// The manifest in place: the one this open read, or the one this
-    /// process's last barrier renamed. `None` for a store that has none, and
-    /// from the staging of another until its barrier completes.
-    manifest_in_place: Option<Manifest>,
-    /// Whether a barrier of this process synced the directories behind
-    /// `manifest_in_place`. The rename of a manifest read at open may predate a
-    /// kill that came before them.
-    manifest_synced: bool,
-    /// The checkpoint mark of the manifest this open loaded.
-    pub(super) loaded_mark: Option<u64>,
-    /// What the next publish writes as the manifest's caller record.
-    pub(super) caller_record: Vec<u8>,
     /// `R`, the unit every byte target is stated in: the running max of the
     /// registered L0 bytes one L0 fold consumed, of one shard it wrote and of
     /// one terminal run, floored at [`MIN_GUARD_BYTES`] and persisted in the
@@ -382,31 +368,6 @@ impl CancelYield {
     }
 }
 
-/// How a relation's tail is recovered across a restart.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum RecoverySource {
-    /// The tail is recovered by replaying the fsynced SAL over the shards loaded
-    /// from the manifest at open.
-    SalReplay,
-    /// Derived state, persisted under a generation-stamped manifest by each
-    /// ephemeral round that picks its relation.
-    Rederive {
-        /// The generation a manifest must carry for the open to resume from it
-        /// instead of erasing it; `None` erases it.
-        resume_at: Option<u64>,
-    },
-}
-
-/// A publish [`ShardIndex::stage`] staged and [`ShardIndex::publish`] completes.
-pub(super) struct FlushWork {
-    /// The manifest staged for the rename. Without one the manifest in place
-    /// is already current, and only the directory syncs are owed.
-    staged: Option<Manifest>,
-    /// Whether no publish of this store is known durable, so the entries that
-    /// reach its directory are owed a sync beside the directory itself.
-    first_sync: bool,
-}
-
 impl ShardIndex {
     /// Open the store at `output_dir`, creating the directory if it is missing.
     /// `recovery` decides which manifest, if any, the open loads; every shard
@@ -418,55 +379,18 @@ impl ShardIndex {
         capacity: Option<u64>,
         compress: bool,
     ) -> Result<Self, StorageError> {
-        // First, so an unusable directory fails the open rather than the first
-        // flush. `created` is `mkdir`'s own verdict, never a `stat`'s: a store
-        // read as freshly created skips its manifest, and so unlinks every
-        // shard in the directory.
-        let created = match fs::create_dir(output_dir) {
-            Ok(()) => true,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir_all(output_dir)?;
-                true
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
-            Err(e) => return Err(e.into()),
-        };
-        let rederived = matches!(recovery, RecoverySource::Rederive { .. });
-        let loaded = match recovery {
-            _ if created => None,
-            // Erased at open, so it reads nothing: an I/O error on the file it is
-            // about to unlink must not abort it.
-            RecoverySource::Rederive { resume_at: None } => None,
-            // Rebuilt from its sources, so damage is erased rather than fatal.
-            RecoverySource::Rederive { resume_at: Some(want) } => manifest::read_at(output_dir, want)?,
-            // Its shards are its only copy, so damage stops the open.
-            RecoverySource::SalReplay => manifest::read(output_dir)?,
-        };
-        if loaded.is_none() && rederived && !created {
-            // So a later re-open cannot reload what this one rejected.
-            manifest::unlink(&[output_dir])?;
-        }
-        // A rederived store's shards carry no PK filter: nothing probes it by PK.
-        let skip_pk_filter = rederived;
-        let none = ShardSet::default();
-        let shards = loaded.as_ref().map_or(&none, |m| &m.shards);
-        let live: HashSet<u64> = shards.entries.iter().map(|e| e.seq).collect();
-        let shard_seq = live.iter().copied().max().unwrap_or(0);
+        let dir = StoreDir::open(output_dir, recovery)?;
+        let shards = dir.in_place().cloned().unwrap_or_default();
         let mut idx = ShardIndex {
-            output_dir: output_dir.to_string(),
+            dir,
             schema,
+            l0: Vec::new(),
             levels: Default::default(),
             pending: Vec::new(),
-            shard_seq,
-            published_through: shard_seq,
-            retired: Vec::new(),
-            manifest_in_place: None,
-            manifest_synced: false,
-            loaded_mark: loaded.as_ref().map(|m| m.checkpoint_mark),
-            caller_record: loaded.as_ref().map(|m| m.caller_record.clone()).unwrap_or_default(),
             l0_run_bytes: shards.run_bytes.max(MIN_GUARD_BYTES),
             capacity,
-            skip_pk_filter,
+            // A rederived store's shards carry no PK filter: nothing probes it by PK.
+            skip_pk_filter: matches!(recovery, RecoverySource::Rederive { .. }),
             compress,
             codebook: None,
             cancel_yield: CancelYield::FRESH,
@@ -477,12 +401,13 @@ impl ShardIndex {
             bands: Vec::new(),
         };
         for e in &shards.entries {
-            let entry = ShardEntry::open(&manifest::shard_path(output_dir, e.seq), e.seq, &idx.schema, e.newest)?;
-            let level = idx
-                .levels
-                .get_mut(e.level as usize)
-                .ok_or(StorageError::Corrupt("manifest level"))?;
-            level.get_or_create_guard(e.guard_key).entries.push(entry);
+            let entry = ShardEntry::open(&idx.dir.shard_path(e.seq), e.seq, &idx.schema, e.newest)?;
+            match e.level {
+                // L0's manifest entries, pending ones included, carry no guard.
+                0 => idx.l0.push(entry),
+                level if level as usize <= LEVELS => idx.register(level as usize - 1, e.guard_key, entry),
+                _ => return Err(StorageError::Corrupt("manifest level")),
+            }
         }
         if compress {
             let newest_coded = idx
@@ -491,34 +416,28 @@ impl ShardIndex {
                 .max_by_key(|e| e.seq);
             idx.codebook = newest_coded.and_then(|e| Codebook::of_shard(&e.shard)).map(Rc::new);
         }
-        manifest::remove_stale_files(output_dir, |seq| live.contains(&seq))?;
-        idx.manifest_in_place = loaded;
         Ok(idx)
     }
 
-    /// The shard set this index publishes.
+    /// The shard set this index publishes: L0 at level 0 under no guard, then
+    /// each guarded level below it. Pending shards go in at level 0, so a
+    /// reopen finds them in L0.
     pub(super) fn shard_set(&self) -> ShardSet {
+        let entry = |level, guard_key, e: &ShardEntry| ManifestEntry {
+            seq: e.seq,
+            newest: e.newest,
+            level,
+            guard_key,
+        };
         let whole = PkBuf::zeroed(self.schema.pk_stride());
-        let entries = (0u64..)
-            .zip(&self.levels)
-            .flat_map(|(level, l)| {
-                l.guards.iter().flat_map(move |g| {
-                    g.entries.iter().map(move |e| ManifestEntry {
-                        seq: e.seq,
-                        newest: e.newest,
-                        level,
-                        guard_key: g.guard_key,
-                    })
-                })
-            })
-            .chain(self.pending.iter().map(|e| ManifestEntry {
-                seq: e.seq,
-                newest: e.newest,
-                level: L0 as u64,
-                guard_key: whole,
-            }))
-            .collect();
-        ShardSet { run_bytes: self.l0_run_bytes, entries }
+        let l0 = (self.l0.iter()).chain(&self.pending).map(|e| entry(0, whole, e));
+        let guarded = (1u64..).zip(&self.levels).flat_map(|(level, l)| {
+            (l.guards.iter()).flat_map(move |g| g.entries.iter().map(move |e| entry(level, g.guard_key, e)))
+        });
+        ShardSet {
+            run_bytes: self.l0_run_bytes,
+            entries: l0.chain(guarded).collect(),
+        }
     }
 
     /// Publish `schema`, rebinding every registered shard to it. A failure on any

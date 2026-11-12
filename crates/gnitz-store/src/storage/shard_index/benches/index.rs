@@ -9,7 +9,7 @@ use crate::test_support::{make_batch_raw, make_schema_u64_i64, Rng};
 use gnitz_zset::schema::probe_key;
 
 /// The two read entries over a tree the upkeep built from scattered spills, at
-/// a PK stride in each width arm: instructions per `ShardIndex::find_pk_bytes`,
+/// a PK stride in each width arm: instructions per `ShardIndex::holding` walked whole,
 /// and per bounded `ShardIndex::shard_arcs` with the shards it hands a cursor.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
@@ -54,7 +54,7 @@ fn shard_probe_bench() {
                 let mut hits = 0;
                 for k in &keys {
                     let key = k.pk_bytes();
-                    idx.find_pk_bytes(key, probe_key(key), |_, _| hits += 1);
+                    hits += idx.holding(key, probe_key(key)).count();
                 }
                 hits
             });
@@ -259,7 +259,7 @@ fn compaction_amplification_bench() {
         for n in 0..runs {
             let run = make_batch_raw(&schema, &rows(n, &mut rng)).into_consolidated();
             spill += counter.measure(|| idx.append_l0_run(&run).unwrap()).1;
-            spilled += idx.levels[L0].entries().last().unwrap().shard.file_len();
+            spilled += idx.l0.last().unwrap().shard.file_len();
             spilled_rows += run.len();
             let (_, kept_up) = counter.measure(|| idx.maintain(u64::MAX).unwrap());
             upkeep += kept_up;
@@ -270,7 +270,7 @@ fn compaction_amplification_bench() {
                         *shards += 1;
                         *bytes += e.shard.file_len();
                     }
-                    (*through, *covered) = (idx.shard_seq, spilled);
+                    (*through, *covered) = (idx.dir.last_seq(), spilled);
                 }
             }
         }
@@ -286,10 +286,14 @@ fn compaction_amplification_bench() {
             "{label}: {resident} B resident"
         );
         let r = idx.l0_run_bytes;
-        let levels: Vec<String> = idx
-            .levels
-            .iter()
-            .map(|l| format!("{}B/{}g/{}f", l.bytes(), l.guards.len(), l.entries().count()))
+        let l0 = format!(
+            "{}B/{}g/{}f",
+            idx.l0_bytes(),
+            usize::from(!idx.l0.is_empty()),
+            idx.l0.len()
+        );
+        let levels: Vec<String> = std::iter::once(l0)
+            .chain((idx.levels.iter()).map(|l| format!("{}B/{}g/{}f", l.bytes(), l.guards.len(), l.entries().count())))
             .collect();
         println!(
             "compaction_amplification_bench {label}: {spilled} B spilled, R={r}, L1 target {}, levels {}, \
@@ -322,7 +326,7 @@ fn compaction_amplification_bench() {
             wrote as f64 / spilled as f64,
             upkeep as f64 / read as f64
         );
-        let written = idx.shard_seq;
+        let written = idx.dir.last_seq();
         println!(
             "  {:.2} shards written per spill, {} B each, {} of {written} registered",
             written as f64 / runs as f64,

@@ -12,12 +12,12 @@
 //!
 //! Oldest to newest, the runs are: the shard levels, the RAM tier, the
 //! memtable, then above the cut the pending shards and the `pending` set. Each
-//! heap run is the consolidated sum of a contiguous stretch of ingests, and
-//! every heap run is newer than every shard below the cut: a barrier empties
-//! every heap tier into shards, a spill moves the oldest, and an ingest below
-//! the cut lands only while nothing is pending. Readers rely on that order:
-//! a cursor is [marked](ReadCursor::mark_heap_newest_first) heap newest first,
-//! and [`Table::unique_live_row_at`] lets the newest heap run decide a key.
+//! run is the consolidated sum of a contiguous stretch of ingests, and every
+//! heap run is newer than every shard below the cut: a barrier empties every
+//! heap tier into shards, a spill moves the oldest, and an ingest below the cut
+//! lands only while nothing is pending. Readers rely on that order: a cursor is
+//! [marked](ReadCursor::mark_heap_newest_first) heap newest first, and
+//! [`Table::unique_live_row_at`] lets the newest run holding a key decide it.
 //!
 //! A row and its retraction stay stored until a fold merges their runs. An open
 //! starts at the store's [`LiveFloor`] rather than walking the cancelled pairs
@@ -27,8 +27,9 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
 
+use super::manifest::RecoverySource;
 use super::run_set::RunSet;
-use super::shard_index::{RecoverySource, ShardIndex};
+use super::shard_index::ShardIndex;
 use super::Cut;
 use gnitz_wire::{KeyRange, PkBuf, PkKeys};
 use gnitz_zset::repr::Batch;
@@ -132,7 +133,7 @@ impl Table {
 
     /// The checkpoint mark of the manifest this open loaded; `None` without one.
     pub(crate) fn loaded_mark(&self) -> Option<u64> {
-        self.shard_index.loaded_mark
+        self.shard_index.dir.loaded_mark()
     }
 
     /// See [`ShardIndex::append_terminal_run`].
@@ -273,7 +274,7 @@ impl Table {
 
     /// The bytes this store's next published manifest carries for its owner.
     pub(crate) fn set_caller_record(&mut self, record: Vec<u8>) {
-        self.shard_index.caller_record = record;
+        self.shard_index.dir.set_caller_record(record);
     }
 
     // ------------------------------------------------------------------
@@ -451,59 +452,57 @@ impl Table {
     #[inline]
     pub(crate) fn has_pk_bytes(&self, key: &[u8]) -> bool {
         let mut w: i64 = 0;
-        self.for_each_pk_candidate(key, probe_key(key), true, |run, row| w += run.get_weight(row));
+        self.for_each_pk_candidate(key, |run, row| w += run.get_weight(row));
         w > 0
     }
 
-    /// The newest heap run holding `key`, whose [`probe_key`] is `fingerprint`,
-    /// with its rows of that key.
-    #[inline]
-    fn newest_heap_rows(&self, key: &[u8], fingerprint: u64) -> Option<(&Rc<Batch>, Range<usize>)> {
-        self.ram_tiers(Cut::Now)
-            .find_map(|set| set.holding(key, fingerprint).next())
-    }
-
-    /// Visit every row whose PK equals `key`, whose [`probe_key`] is
-    /// `fingerprint`: the heap tiers' when `heap`, newest first, which puts
+    /// Visit every row whose PK equals `key`, newest run first, which puts
     /// `live_row_at`'s live row ahead of the retracted history it would
-    /// otherwise scan past, then the shards'.
-    fn for_each_pk_candidate(&self, key: &[u8], fingerprint: u64, heap: bool, mut f: impl FnMut(&Run, usize)) {
+    /// otherwise scan past. The heap tiers go ahead of the pending shards, which
+    /// the module doc orders between the memtable and the `pending` set: a
+    /// barrier that writes a pending shard empties the memtable and the RAM
+    /// tier, and nothing lands below the cut while a shard is pending.
+    ///
+    /// A visitor rather than an iterator: an adaptor chain over the tiers does
+    /// not inline into the per-key probes.
+    fn for_each_pk_candidate(&self, key: &[u8], mut f: impl FnMut(&Run, usize)) {
+        let fingerprint = probe_key(key);
         let mut visit = |run: Run, rows: Range<usize>| {
             for row in rows {
                 f(&run, row);
             }
         };
-        if heap {
-            for set in self.ram_tiers(Cut::Now) {
-                for (batch, rows) in set.holding(key, fingerprint) {
-                    visit(Run::Mem(Rc::clone(batch)), rows);
-                }
+        for set in self.ram_tiers(Cut::Now) {
+            for (batch, rows) in set.holding(key, fingerprint) {
+                visit(Run::Mem(Rc::clone(batch)), rows);
             }
         }
-        self.shard_index.find_pk_bytes(key, fingerprint, |shard, rows| {
-            visit(Run::Shard(Rc::clone(shard)), rows)
-        });
+        for (shard, rows) in self.shard_index.holding(key, fingerprint) {
+            visit(Run::Shard(Rc::clone(shard)), rows);
+        }
     }
 
     /// [`Self::live_row_at`]'s row, for a store whose every key nets 0 or 1 —
     /// a base table's, under its unique-PK rule.
     ///
-    /// By the run order the module doc states, the newest heap run holding
-    /// `key` decides it: what that stretch of ingests left is the key's state
-    /// now, and its rows of the key are that state less the one it started
-    /// from — a positive row is the live one, and a retraction alone means the
-    /// stretch deleted the key. A key no heap run holds is summed over the
-    /// shards.
+    /// By the run order the module doc states, the newest run holding `key`
+    /// decides it: what that stretch of ingests left is the key's state now,
+    /// and its rows of the key are that state less the one it started from — a
+    /// positive row is the live one, and a retraction alone means the stretch
+    /// deleted the key.
     #[inline]
     pub(crate) fn unique_live_row_at(&self, key: &[u8]) -> Option<StoredRow> {
-        let fingerprint = probe_key(key);
-        let live = match self.newest_heap_rows(key, fingerprint) {
-            Some((run, rows)) => {
-                let live = rows.into_iter().find(|&row| run.get_weight(row) > 0);
-                live.map(|row| StoredRow::new(Run::Mem(Rc::clone(run)), row))
+        // The first run [`Self::for_each_pk_candidate`] visits.
+        let fp = probe_key(key);
+        let heap = self.ram_tiers(Cut::Now).find_map(|set| set.holding(key, fp).next());
+        let (run, mut rows) = match heap {
+            Some((batch, rows)) => (Run::Mem(Rc::clone(batch)), rows),
+            None => {
+                let (shard, rows) = self.shard_index.holding(key, fp).next()?;
+                (Run::Shard(Rc::clone(shard)), rows)
             }
-            None => self.live_row_in(key, fingerprint, false).1,
         };
+        let live = (rows.find(|&row| run.get_weight(row) > 0)).map(|row| StoredRow::new(run, row));
         debug_assert!(
             {
                 let (w, _) = self.live_row_at(key);
@@ -518,17 +517,11 @@ impl Table {
     /// (PK, payload) row: one whose payload group across every tier nets
     /// positive.
     pub(crate) fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
-        self.live_row_in(key, probe_key(key), true)
-    }
-
-    /// [`Self::live_row_at`] over the shards, and the heap tiers too when `heap`;
-    /// `fingerprint` is `key`'s [`probe_key`].
-    fn live_row_in(&self, key: &[u8], fingerprint: u64, heap: bool) -> (i64, Option<StoredRow>) {
         // The scratch pool is taken only once a candidate turns up: most probes
         // of a fresh key find none.
         let mut pool = None;
         let mut total_w: i64 = 0;
-        self.for_each_pk_candidate(key, fingerprint, heap, |run, row| {
+        self.for_each_pk_candidate(key, |run, row| {
             total_w += run.get_weight(row);
             pool.get_or_insert_with(|| self.live_row_scratch.take())
                 .push(StoredRow::new(run.clone(), row));

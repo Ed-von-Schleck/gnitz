@@ -385,3 +385,50 @@ fn open_cursor_bench() {
         );
     }
 }
+
+/// Instructions per `Table::unique_live_row_at` over a unique-PK store whose
+/// heap tiers are empty, by where the key's newest version sits: rewritten
+/// after the bulk load, so a newer shard above the one holding its insert; only
+/// inserted; or absent.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn unique_live_row_bench() {
+    const KEYS: u64 = 200_000;
+    const SPILL: u64 = 8192;
+    const UPDATED: u64 = 4096;
+    let schema = make_schema_u64_i64();
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = new_table(dir.path(), schema, RecoverySource::SalReplay, 1 << 18);
+    let scattered = |k: u64| k * 0x9E37_79B1 % KEYS;
+    for base in (0..KEYS).step_by(SPILL as usize) {
+        let rows: Vec<_> = (base..(base + SPILL).min(KEYS)).map(|k| (scattered(k), 1, 0)).collect();
+        t.ingest(make_batch_raw(&schema, &rows)).unwrap();
+    }
+    let updated: Vec<u64> = (0..UPDATED).map(|i| scattered(i * (KEYS / UPDATED))).collect();
+    let rows: Vec<_> = updated.iter().flat_map(|&k| [(k, -1, 0), (k, 1, 1)]).collect();
+    t.ingest(make_batch_raw(&schema, &rows)).unwrap();
+    flush_barrier([&mut t], 0).unwrap();
+    assert!(
+        t.ram_tiers(Cut::Now).all(|set| set.len() == 0),
+        "premise: every row is on disk"
+    );
+    println!("unique_live_row_bench: {} shards", table_shards(&t).len());
+
+    let counter = Counter::instructions();
+    let inserted: Vec<u64> = (0..UPDATED).map(|i| scattered(i * (KEYS / UPDATED) + 1)).collect();
+    let absent: Vec<u64> = (0..UPDATED).map(|i| KEYS + i).collect();
+    for (label, keys, live) in [
+        ("rewritten", &updated, true),
+        ("inserted", &inserted, true),
+        ("absent", &absent, false),
+    ] {
+        let keys: Vec<[u8; 8]> = keys.iter().map(|k| k.to_be_bytes()).collect();
+        let (found, instructions) = counter.measure(|| {
+            keys.iter()
+                .filter(|k| std::hint::black_box(t.unique_live_row_at(&k[..])).is_some())
+                .count()
+        });
+        assert_eq!(found, if live { keys.len() } else { 0 }, "{label}");
+        println!("  {label}: {:.1} instr/probe", instructions as f64 / keys.len() as f64);
+    }
+}

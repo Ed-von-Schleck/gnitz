@@ -12,7 +12,7 @@ use crate::repr::string_heap::{long_bytes, prorated_blob_cap, BlobCache, StringD
 use crate::repr::{Batch, StorageError};
 use crate::schema::{compare_pk_ordering, SchemaDescriptor};
 use gnitz_wire::RowSource;
-use gnitz_wire::{CodedHeap, Heap};
+use gnitz_wire::{CodedHeap, Heap, PkBuf};
 use smallvec::SmallVec;
 use std::ops::Range;
 use std::rc::Rc;
@@ -91,12 +91,18 @@ impl RowSource for GuardRun<'_> {
     }
 }
 
-/// A fold's merge over its input shards, one guard at a time: each guard's
-/// window of every shard starts where the previous guard's ended.
+/// A fold's merge over its input shards into its destinations, one at a time:
+/// the first receives the rows below the first fence, each fence starts the
+/// next, and the last runs to the end — the rows [`guard_slot`] routes to each
+/// destination among guards keyed at the fences.
 pub struct GuardMerge {
     shards: Vec<Rc<MappedShard>>,
     /// Where the next window starts in each shard.
     starts: Vec<usize>,
+    /// The keys each destination after the first starts at, ascending.
+    fences: Vec<PkBuf>,
+    /// The destination to merge next.
+    next: usize,
     /// Whether every run is a skeleton one.
     skeleton: bool,
     /// The schema every run is merged under.
@@ -104,11 +110,13 @@ pub struct GuardMerge {
 }
 
 impl GuardMerge {
-    /// A merge over `shards` from their first rows, once each body matches its
-    /// checksum. Every run is a skeleton one when `dehydrate` is set or any input
-    /// is a skeleton shard, whose rows carry no payload to write back.
-    pub fn begin(shards: Vec<Rc<MappedShard>>, dehydrate: bool) -> Result<Self, StorageError> {
+    /// A merge of `shards` from their first rows into the destinations
+    /// `fences` cuts them into, once each body matches its checksum. Every run is a skeleton one when
+    /// `dehydrate` is set or any input is a skeleton shard, whose rows carry no
+    /// payload to write back.
+    pub fn begin(shards: Vec<Rc<MappedShard>>, fences: Vec<PkBuf>, dehydrate: bool) -> Result<Self, StorageError> {
         let schema = *shards.first().expect("a guard merge has an input shard").schema();
+        assert!(fences.windows(2).all(|w| w[0] < w[1]), "a guard merge's fences ascend");
         debug_assert!(
             shards.iter().all(|s| *s.schema() == schema),
             "a guard merge's shards share one schema"
@@ -120,6 +128,8 @@ impl GuardMerge {
         let skeleton = dehydrate || shards.iter().any(|s| s.is_skeleton());
         Ok(GuardMerge {
             starts: vec![0; shards.len()],
+            fences,
+            next: 0,
             shards,
             skeleton,
             out_schema: if skeleton { schema.pk_only() } else { schema },
@@ -131,40 +141,50 @@ impl GuardMerge {
         &self.shards
     }
 
-    /// The input rows merged so far.
-    pub fn rows_merged(&self) -> usize {
-        self.starts.iter().sum()
+    /// Whether every destination is merged.
+    pub fn done(&self) -> bool {
+        self.next > self.fences.len()
     }
 
-    /// Merge the rows below `until` (all, when `None`) that earlier calls left
-    /// into one run; `None` when every row cancelled. Long values are coded under
-    /// `codebook` where given; those of a shard of the same table keep their codes.
+    /// The input bytes merged so far: each shard's file share of the rows of it
+    /// merged.
+    pub fn bytes_merged(&self) -> u64 {
+        (self.shards.iter().zip(&self.starts))
+            .map(|(s, &at)| (u128::from(s.file_len()) * at as u128 / s.row_count().max(1) as u128) as u64)
+            .sum()
+    }
+
+    /// The window of every shard the next destination merges.
+    fn windows(&self) -> Vec<Range<usize>> {
+        let until = self.fences.get(self.next).map(PkBuf::pk_bytes);
+        (self.shards.iter().zip(&self.starts))
+            .map(|(shard, &start)| match until {
+                Some(key) => start..shard.seek(key, Some(start)),
+                None => start..shard.row_count(),
+            })
+            .collect()
+    }
+
+    /// Merge the next destination's rows into one run; `None` when every row
+    /// cancelled. Long values are coded under `codebook` where given; those of
+    /// a shard of the same table keep their codes.
     ///
     /// Out of line: inlined into a caller, the payload comparator drops out of
     /// the merge loop.
     #[inline(never)]
-    pub fn next<'a>(&mut self, until: Option<&[u8]>, codebook: Option<&'a Codebook>) -> Option<GuardRun<'a>> {
-        let (skeleton, out_schema) = (self.skeleton, &self.out_schema);
-        let windows: Vec<Range<usize>> = self
-            .shards
-            .iter()
-            .zip(&mut self.starts)
-            .map(|(shard, start)| {
-                let end = match until {
-                    Some(key) => shard.seek(key, Some(*start)),
-                    None => shard.row_count(),
-                };
-                assert!(end >= *start, "guard keys ascend");
-                std::mem::replace(start, end)..end
-            })
-            .collect();
+    pub fn next<'a>(&mut self, codebook: Option<&'a Codebook>) -> Option<GuardRun<'a>> {
+        let windows = self.windows();
+        for (start, w) in self.starts.iter_mut().zip(&windows) {
+            *start = w.end;
+        }
+        self.next += 1;
         // A skeleton run holds no string.
-        let codebook = codebook.filter(|_| !skeleton);
+        let codebook = codebook.filter(|_| !self.skeleton);
         let batch = match self.in_order(&windows) {
-            Some(order) => self.concat(&windows, &order, codebook)?,
-            None => self.merged(windows, codebook)?,
-        };
-        Some(GuardRun::new(batch, out_schema, codebook, skeleton))
+            Some(order) => self.concat(&windows, &order, codebook),
+            None => self.merged(windows, codebook),
+        }?;
+        Some(GuardRun::new(batch, &self.out_schema, codebook, self.skeleton))
     }
 
     /// The run of `windows`, one per shard, merged: every key compared and

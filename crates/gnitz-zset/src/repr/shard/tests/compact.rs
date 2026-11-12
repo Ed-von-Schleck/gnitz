@@ -13,21 +13,23 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-/// Every `(guard_key, skeleton, batch)` a [`GuardMerge`] answers over
-/// `guards` in order.
+/// Every `(guard_key, skeleton, batch)` a [`GuardMerge`] into `guards`
+/// answers, in order.
 fn route(shards: &[Rc<MappedShard>], guards: &[PkBuf], dehydrate: bool) -> Vec<(PkBuf, bool, Batch)> {
-    let mut merge = GuardMerge::begin(shards.to_vec(), dehydrate).unwrap();
-    (0..guards.len())
-        .filter_map(|g| {
-            let until = guards.get(g + 1).map(PkBuf::pk_bytes);
-            let run = merge.next(until, None)?;
-            Some((
-                guards[g],
-                run.skeleton,
-                run.plain().expect("a merge given no codebook is plain").clone(),
-            ))
+    let mut merge = GuardMerge::begin(shards.to_vec(), guards[1..].to_vec(), dehydrate).unwrap();
+    (guards.iter())
+        .filter_map(|&key| {
+            let run = merge.next(None)?;
+            let batch = run.plain().expect("a merge given no codebook is plain").clone();
+            Some((key, run.skeleton, batch))
         })
         .collect()
+}
+
+/// The one run a merge of `shards` into one destination writes.
+fn whole_run<'a>(shards: &[Rc<MappedShard>], dehydrate: bool, codebook: Option<&'a Codebook>) -> GuardRun<'a> {
+    let mut merge = GuardMerge::begin(shards.to_vec(), Vec::new(), dehydrate).unwrap();
+    merge.next(codebook).expect("rows survive")
 }
 
 /// Guard routing is a saturating slot lookup: slot 0 owns every key below the
@@ -68,24 +70,23 @@ fn a_merge_refuses_a_corrupt_input() {
     let path = other.path().join("s.db");
     std::fs::write(&path, &image).unwrap();
     let corrupt = Rc::new(MappedShard::open(path.to_str().unwrap(), &schema).unwrap());
-    assert!(GuardMerge::begin(vec![Rc::clone(&intact)], false).is_ok());
+    assert!(GuardMerge::begin(vec![Rc::clone(&intact)], Vec::new(), false).is_ok());
     assert_eq!(
-        GuardMerge::begin(vec![intact, corrupt], false).err(),
+        GuardMerge::begin(vec![intact, corrupt], Vec::new(), false).err(),
         Some(StorageError::Corrupt("body checksum"))
     );
 }
 
-/// A guard key below the last one would merge rows a second time.
+/// A fence below the last one would merge rows a second time.
 #[test]
-#[should_panic(expected = "guard keys ascend")]
+#[should_panic(expected = "fences ascend")]
 fn a_descending_guard_key_panics() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let rows: Vec<(u64, i64, i64)> = (1..=100).map(|i| (i, 1, i as i64)).collect();
     let shard = map_shard(&dir.path().join("s.db"), &make_batch(&schema, &rows));
-    let mut merge = GuardMerge::begin(vec![shard], false).unwrap();
-    assert!(merge.next(Some(&60u64.to_be_bytes()), None).is_some());
-    merge.next(Some(&30u64.to_be_bytes()), None);
+    let keys = [60u64, 30].map(|k| PkBuf::from_bytes(&k.to_be_bytes())).to_vec();
+    let _ = GuardMerge::begin(vec![shard], keys, false);
 }
 
 proptest! {
@@ -324,9 +325,8 @@ fn a_coded_merge_keeps_the_codes_of_its_own_table() {
         map_shard(&dir.path().join("retracted.db"), &retracted),
     ];
 
-    let merge = || GuardMerge::begin(shards.to_vec(), false).unwrap();
-    let plain = merge().next(None, None).unwrap();
-    let coded = merge().next(None, Some(&book)).unwrap();
+    let plain = whole_run(&shards, false, None);
+    let coded = whole_run(&shards, false, Some(&book));
     let plain = plain.plain().unwrap();
     let want = string_rows(plain, |r| plain.get_weight(r));
     assert_eq!(want.len(), 250 + 280 + 300);
@@ -380,10 +380,10 @@ fn ascending_windows_are_the_merge_of_their_rows() {
             .collect()
     };
 
-    let mut merge = GuardMerge::begin(shards.to_vec(), false).unwrap();
-    for (until, pks) in [(Some(450u64), 1..=449), (None, 450..=900)] {
-        let until = until.map(u64::to_be_bytes);
-        let run = merge.next(until.as_ref().map(|k| &k[..]), None).unwrap();
+    let fences = vec![PkBuf::from_bytes(&450u64.to_be_bytes())];
+    let mut merge = GuardMerge::begin(shards.to_vec(), fences, false).unwrap();
+    for pks in [1..=449, 450..=900] {
+        let run = merge.next(None).unwrap();
         let batch = run.plain().unwrap();
         assert!(batch.is_consolidated());
         assert_eq!(
@@ -393,23 +393,14 @@ fn ascending_windows_are_the_merge_of_their_rows() {
         );
     }
     // The coded run of the same windows holds the same rows.
-    let coded = GuardMerge::begin(shards.to_vec(), false)
-        .unwrap()
-        .next(None, Some(&book))
-        .unwrap();
+    let coded = whole_run(&shards, false, Some(&book));
     assert_eq!(string_rows(&coded, |r| coded.batch.get_weight(r)), want(1..=900));
 }
 
-/// The run [`GuardMerge::merged`] writes for the windows ending below `until`,
-/// and the windows; the merge itself is left where it was.
-fn merged_run<'a>(
-    merge: &GuardMerge,
-    until: Option<&[u8]>,
-    codebook: Option<&'a Codebook>,
-) -> (GuardRun<'a>, Vec<std::ops::Range<usize>>) {
-    let windows: Vec<_> = (merge.shards.iter().zip(&merge.starts))
-        .map(|(s, &start)| start..until.map_or(s.row_count(), |key| s.seek(key, Some(start))))
-        .collect();
+/// The run [`GuardMerge::merged`] writes for the windows of the merge's next
+/// destination, and the windows; the merge itself is left where it was.
+fn merged_run<'a>(merge: &GuardMerge, codebook: Option<&'a Codebook>) -> (GuardRun<'a>, Vec<std::ops::Range<usize>>) {
+    let windows = merge.windows();
     let batch = merge.merged(windows.clone(), codebook).expect("rows survive");
     let run = GuardRun::new(batch, &merge.out_schema, codebook, merge.skeleton);
     (run, windows)
@@ -490,18 +481,17 @@ fn ascending_windows_decode_to_the_run_their_merge_writes() {
         map_coded_shard(&path("a.db"), &blocks[0], &book),
         map_coded_shard(&path("b.db"), &blocks[1], &book),
     ];
-    let guards = [Some(300u64), Some(320), None];
+    let fences = [300u64, 320].map(|k| PkBuf::from_bytes(&k.to_be_bytes())).to_vec();
     let fold = |shards: &[Rc<MappedShard>], codebook: Option<&Codebook>| {
-        let mut merge = GuardMerge::begin(shards.to_vec(), false).unwrap();
-        for until in guards {
-            let until = until.map(u64::to_be_bytes);
-            let until = until.as_ref().map(|k| &k[..]);
-            let (want, windows) = merged_run(&merge, until, codebook);
+        let mut merge = GuardMerge::begin(shards.to_vec(), fences.clone(), false).unwrap();
+        while !merge.done() {
+            let (want, windows) = merged_run(&merge, codebook);
             assert!(merge.in_order(&windows).is_some(), "premise: the windows need no merge");
-            let got = merge.next(until, codebook).unwrap();
-            assert_eq!(got.batch.is_consolidated(), codebook.is_none(), "{until:?}");
-            assert_eq!(run_rows(&got), run_rows(&want), "{until:?}");
-            assert!(got.batch.blob().len() <= want.batch.blob().len(), "{until:?}");
+            let at = merge.next;
+            let got = merge.next(codebook).unwrap();
+            assert_eq!(got.batch.is_consolidated(), codebook.is_none(), "destination {at}");
+            assert_eq!(run_rows(&got), run_rows(&want), "destination {at}");
+            assert!(got.batch.blob().len() <= want.batch.blob().len(), "destination {at}");
             assert_eq!(got.coded.map(|c| c.1), want.coded.map(|c| c.1));
         }
     };
@@ -512,10 +502,7 @@ fn ascending_windows_decode_to_the_run_their_merge_writes() {
     let skeletons: Vec<Rc<MappedShard>> = (0..)
         .zip(shards.iter().filter(|s| s.retraction_rows() == 0))
         .map(|(s, shard)| {
-            let run = GuardMerge::begin(vec![Rc::clone(shard)], true)
-                .unwrap()
-                .next(None, None)
-                .unwrap();
+            let run = whole_run(std::slice::from_ref(shard), true, None);
             let path = path(&format!("skeleton_{s}.db"));
             let path = path.to_str().unwrap();
             (run.batch
@@ -524,15 +511,14 @@ fn ascending_windows_decode_to_the_run_their_merge_writes() {
             Rc::new(MappedShard::open(path, &schema).unwrap())
         })
         .collect();
-    let mut merge = GuardMerge::begin(skeletons, false).unwrap();
-    for until in guards {
-        let until = until.map(u64::to_be_bytes);
-        let until = until.as_ref().map(|k| &k[..]);
-        let (want, windows) = merged_run(&merge, until, None);
+    let mut merge = GuardMerge::begin(skeletons, fences, false).unwrap();
+    while !merge.done() {
+        let (want, windows) = merged_run(&merge, None);
         assert!(merge.in_order(&windows).is_some(), "premise: the windows need no merge");
-        let got = merge.next(until, Some(&book)).unwrap();
+        let at = merge.next;
+        let got = merge.next(Some(&book)).unwrap();
         assert!(got.skeleton && got.coded.is_none());
         assert_eq!(*got.batch.schema(), schema.pk_only());
-        assert_eq!(run_rows(&got), run_rows(&want), "{until:?}");
+        assert_eq!(run_rows(&got), run_rows(&want), "destination {at}");
     }
 }

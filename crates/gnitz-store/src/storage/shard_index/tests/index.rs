@@ -1,6 +1,6 @@
-use super::super::manifest;
 use super::super::*;
 use super::Fold;
+use crate::storage::manifest::{self, StoreDir};
 use crate::storage::Cut;
 use crate::test_support::{
     make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, mix, pk_payload_schema,
@@ -13,6 +13,13 @@ use std::path::Path;
 
 /// The upkeep's parts, each run to its end, for the tests that drive one alone.
 impl ShardIndex {
+    /// Every live shard no published manifest names yet.
+    fn unsynced_paths(&self) -> impl Iterator<Item = String> + '_ {
+        self.all_entries()
+            .filter(|e| !self.dir.published(e.seq))
+            .map(|e| self.dir.shard_path(e.seq))
+    }
+
     fn run(&mut self, fold: Fold) -> Result<(), StorageError> {
         debug_assert!(self.running.is_none(), "one fold at a time");
         self.begin(fold)?;
@@ -56,10 +63,8 @@ impl ShardIndex {
         if let Some(cut) = self.plan_drain(src) {
             self.run(cut)?;
         }
-        while let Some(band) = self.bands.pop() {
-            if let Some(fold) = self.plan_band(band) {
-                self.run(fold)?;
-            }
+        while let Some(fold) = self.next_band_fold() {
+            self.run(fold)?;
         }
         self.rebalance_guards(TERMINAL)
     }
@@ -167,7 +172,7 @@ fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, batch: &Batch,
         .write_with(Some(stamp), |path, opts| batch.write_as_shard(path, opts))
         .unwrap();
     idx.levels[level_idx].get_or_create_guard(key).entries.push(entry);
-    idx.mark_published();
+    idx.dir.mark_published();
 }
 
 /// [`seed_guard`] of a stable shard of keys `base..`; answers them.
@@ -185,10 +190,20 @@ fn seed_stable(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, base: u64, st
     (base..base + STABLE_ROWS).collect()
 }
 
+/// A stable terminal guard of the even keys from `base`, so odd keys inside its
+/// extent are free for a source to hold; answers its keys.
+fn seed_even_terminal(idx: &mut ShardIndex, base: u64) -> Vec<u64> {
+    let pks: Vec<u64> = (0..STABLE_ROWS).map(|i| base + 2 * i).collect();
+    let vals: Vec<i64> = pks.iter().map(|&p| spread(p)).collect();
+    seed_guard(idx, TERMINAL, gk(base), &test_batch(&pks, &vals), 80);
+    assert_stable(idx.levels[TERMINAL].guards.last().unwrap().bytes());
+    pks
+}
+
 /// Append a stable shard of keys `base..` to L0; answers its bytes.
 fn append_stable(idx: &mut ShardIndex, base: u64) -> u64 {
     idx.append_l0_run(&dense_batch(base, STABLE_ROWS)).unwrap();
-    let len = idx.levels[L0].entries().last().unwrap().shard.file_len();
+    let len = idx.l0.last().unwrap().shard.file_len();
     assert_stable(len);
     len
 }
@@ -198,10 +213,9 @@ fn append_stable(idx: &mut ShardIndex, base: u64) -> u64 {
 fn assert_weighs(idx: &ShardIndex, weight: i64, keys: impl IntoIterator<Item = PkBuf>) {
     for k in keys {
         let key = k.pk_bytes();
-        let mut sum = 0;
-        idx.find_pk_bytes(key, probe_key(key), |shard, rows| {
-            sum += rows.map(|r| shard.get_weight(r)).sum::<i64>();
-        });
+        let sum: i64 = (idx.holding(key, probe_key(key)))
+            .flat_map(|(shard, rows)| rows.map(|r| shard.get_weight(r)))
+            .sum();
         assert_eq!(sum, weight, "key {key:?} through the guard partition");
     }
 }
@@ -214,14 +228,14 @@ fn assert_all_found(idx: &ShardIndex, keys: impl IntoIterator<Item = u64>) {
 /// Publish the index's manifest as the barrier does.
 fn publish_manifest(idx: &mut ShardIndex) {
     if let Some(w) = idx.stage(0).unwrap() {
-        ShardIndex::publish(vec![(idx, w)]).unwrap();
+        StoreDir::publish(vec![w]).unwrap();
     }
 }
 
 /// `idx` published and reopened under `budget`, which binds only at open.
 fn reopened_under(mut idx: ShardIndex, budget: Option<u64>) -> ShardIndex {
     publish_manifest(&mut idx);
-    let (dir, schema) = (idx.output_dir.clone(), idx.schema);
+    let (dir, schema) = (idx.dir.path().to_string(), idx.schema);
     drop(idx);
     open(Path::new(&dir), schema, budget)
 }
@@ -242,7 +256,7 @@ fn a_fold_and_reload_keep_every_key_and_track_what_is_unsynced() {
     assert_eq!(spills.len(), 5);
 
     idx.run_compact().unwrap();
-    assert!(idx.levels[L0].guards.is_empty() && !idx.levels[L1].guards.is_empty());
+    assert!(idx.l0.is_empty() && !idx.levels[L1].guards.is_empty());
     assert!(
         spills.iter().all(|p| !Path::new(p).exists()),
         "unpublished inputs are unlinked"
@@ -259,7 +273,7 @@ fn a_fold_and_reload_keep_every_key_and_track_what_is_unsynced() {
     let loaded = idx2.all_entries().map(|e| e.seq).max().unwrap();
     idx2.append_l0_run(&test_batch(&[99], &[990])).unwrap();
     assert!(
-        idx2.levels[L0].entries().all(|e| e.seq > loaded),
+        idx2.l0.iter().all(|e| e.seq > loaded),
         "a write after the reload takes a fresh name"
     );
     assert_all_found(&idx2, pks.iter().copied().chain([99]));
@@ -348,17 +362,17 @@ fn a_failing_vertical_band_leaves_the_bands_before_it_folded() {
     // Two destination guards over disjoint key bands, each large enough that
     // the trailing rebalance would neither merge nor split them.
     let mut dest_pks = Vec::new();
-    for (base, key) in [(200u64, gk(100)), (100_100, gk(100_000))] {
-        dest_pks.extend(seed_stable(&mut idx, TERMINAL, key, base, 80));
+    for base in [200u64, 100_100] {
+        dest_pks.extend(seed_even_terminal(&mut idx, base));
     }
     // One L1 guard spanning both of them.
-    let src_pks: Vec<u64> = vec![100, 150, 100_050, 100_060];
+    let src_pks: Vec<u64> = vec![201, 301, 100_101, 100_201];
     for &pk in &src_pks {
-        seed_guard(&mut idx, L1, gk(100), &test_batch(&[pk], &[pk as i64]), 100);
+        seed_guard(&mut idx, L1, gk(201), &test_batch(&[pk], &[pk as i64]), 100);
     }
 
     let (split_outputs, first_band_fold) = (2, 1);
-    let second_band_fold = idx.shard_seq + split_outputs + first_band_fold + 1;
+    let second_band_fold = idx.dir.last_seq() + split_outputs + first_band_fold + 1;
     let blocker = dir.path().join(manifest::shard_name(second_band_fold));
     std::fs::create_dir_all(&blocker).unwrap();
 
@@ -368,7 +382,7 @@ fn a_failing_vertical_band_leaves_the_bands_before_it_folded() {
     assert_eq!(idx.levels[L1].guards.len(), 1, "only the failed band is left in L1");
     assert_eq!(
         idx.levels[L1].guards[0].guard_key,
-        gk(100_000),
+        gk(100_100),
         "the failed band keeps its own source guard",
     );
     assert_eq!(
@@ -505,7 +519,7 @@ fn an_ascending_run_folds_into_one_guard_and_is_not_cut_out_of_it() {
             let vals: Vec<i64> = pks.iter().map(|&p| spread(p)).collect();
             idx.append_l0_run(&test_batch(&pks, &vals)).unwrap();
         }
-        let spilled = idx.levels[L0].bytes();
+        let spilled = idx.l0_bytes();
         idx.run_compact().unwrap();
         let guards = &idx.levels[L1].guards;
         // The first run found L1 empty, and was routed by its spills' own bounds.
@@ -533,7 +547,7 @@ fn a_failing_compaction_leaves_its_inputs_and_no_output() {
         idx.append_l0_run(&test_batch(&[10, 50], &[1, 1])).unwrap();
         idx.append_l0_run(&test_batch(&[150, 250], &[1, 1])).unwrap();
         // A directory at an output's name: that shard cannot be created.
-        std::fs::create_dir_all(dir.path().join(manifest::shard_name(idx.shard_seq + failing))).unwrap();
+        std::fs::create_dir_all(dir.path().join(manifest::shard_name(idx.dir.last_seq() + failing))).unwrap();
         let before = shard_seqs(dir.path());
 
         assert!(idx.run_compact().is_err(), "output {failing} cannot be written");
@@ -551,30 +565,6 @@ fn a_failing_compaction_leaves_its_inputs_and_no_output() {
     }
 }
 
-/// A vertical whose source lies below its destination guard's key folds into
-/// that guard, which owns the keys below it.
-#[test]
-fn a_vertical_into_a_guards_lower_tail_does_not_shadow_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    let mut idx = fresh(dir.path(), schema);
-
-    // L2 guard at key 200, holding keys on both sides of it.
-    let dest_pks = [50u64, 150, 250];
-    let vals: Vec<i64> = dest_pks.iter().map(|&p| p as i64).collect();
-    seed_guard(&mut idx, TERMINAL, gk(200), &test_batch(&dest_pks, &vals), 80);
-
-    // L1 guard whose whole extent is below the destination's key.
-    let src_pks = [100u64, 180];
-    let vals: Vec<i64> = src_pks.iter().map(|&p| p as i64).collect();
-    seed_guard(&mut idx, L1, gk(100), &test_batch(&src_pks, &vals), 100);
-
-    idx.vertical_fold(0).unwrap();
-
-    assert_eq!(idx.levels[TERMINAL].guards.len(), 1, "no second guard was minted");
-    assert_all_found(&idx, dest_pks.into_iter().chain(src_pks));
-}
-
 /// A source guard spanning several terminal guards folds into exactly the
 /// guards its key extent overlaps, and leaves the destination partition as it
 /// was.
@@ -584,8 +574,8 @@ fn a_vertical_rewrites_exactly_the_terminal_guards_its_source_overlaps() {
     let mut idx = fresh(dir.path(), make_schema_u64_i64());
 
     let mut dest_pks = Vec::new();
-    for (base, key) in [(200u64, gk(100)), (100_100, gk(100_000)), (200_100, gk(200_000))] {
-        dest_pks.extend(seed_stable(&mut idx, TERMINAL, key, base, 80));
+    for base in [200u64, 100_100, 200_100] {
+        dest_pks.extend(seed_even_terminal(&mut idx, base));
     }
     let terminal = |idx: &ShardIndex| -> Vec<(PkBuf, u64)> {
         idx.levels[TERMINAL]
@@ -597,9 +587,9 @@ fn a_vertical_rewrites_exactly_the_terminal_guards_its_source_overlaps() {
     let before = terminal(&idx);
 
     // One L1 guard over the first two bands.
-    let src_pks = [100u64, 150, 100_050, 100_060];
+    let src_pks = [201u64, 301, 100_101, 100_201];
     let vals: Vec<i64> = src_pks.iter().map(|&p| p as i64).collect();
-    seed_guard(&mut idx, L1, gk(100), &test_batch(&src_pks, &vals), 100);
+    seed_guard(&mut idx, L1, gk(201), &test_batch(&src_pks, &vals), 100);
 
     idx.vertical_fold(0).unwrap();
 
@@ -624,7 +614,7 @@ fn open_removes_exactly_the_unreferenced_files() {
     assert!(!stray.exists());
     idx.append_l0_run(&test_batch(&[10], &[100])).unwrap();
     publish_manifest(&mut idx);
-    let live = manifest::shard_name(idx.shard_seq);
+    let live = manifest::shard_name(idx.dir.last_seq());
 
     for seq in [99, 7] {
         std::fs::write(dir.path().join(manifest::shard_name(seq)), b"x").unwrap();
@@ -1109,10 +1099,7 @@ fn the_sweep_converges_to_the_skeleton_floor() {
         idx.drain().unwrap();
     }
     let (dehy, hyd) = terminal_split(&idx);
-    assert!(
-        idx.levels[L0].guards.is_empty() && idx.levels[L1].guards.is_empty(),
-        "everything sank"
-    );
+    assert!(idx.l0.is_empty() && idx.levels[L1].guards.is_empty(), "everything sank");
     assert!(!dehy.is_empty() && hyd.is_empty(), "the floor is fully dehydrated");
     assert!(idx.all_entries().all(|e| e.shard.is_skeleton()));
     assert_all_found(&idx, l0_keys(4));
@@ -1124,6 +1111,42 @@ fn the_sweep_converges_to_the_skeleton_floor() {
     assert_eq!(idx.resident_bytes(), floor, "the floor is the fixpoint");
 }
 
+/// Over a skeleton floor that alone meets the capacity, L1 and L0 under their
+/// own triggers stay where they are: draining them would only rewrite the floor.
+#[test]
+fn no_fold_sinks_data_into_a_floor_already_at_the_capacity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut idx = open(tmp.path(), make_schema_u64_i64(), Some(1));
+    for base in [0, 100_000] {
+        append_stable(&mut idx, base);
+    }
+    idx.drain().unwrap();
+    let floor = idx.levels[TERMINAL].bytes();
+    let mut idx = reopened_under(idx, Some(floor));
+    let small = test_batch(&[7_500, 70_007], &[7, 7]);
+    assert!(
+        idx.l1_target_bytes() > 4 * small.total_bytes() as u64,
+        "premise: L1 may hold bytes"
+    );
+
+    idx.append_l0_run(&small).unwrap();
+    let fold = idx.plan_l0_fold().unwrap();
+    idx.run(fold).unwrap();
+    idx.append_l0_run(&test_batch(&[9_500], &[9])).unwrap();
+    let terminal: Vec<u64> = idx.levels[TERMINAL].entries().map(|e| e.seq).collect();
+    idx.drain().unwrap();
+
+    assert!(!idx.levels[L1].guards.is_empty() && !idx.l0.is_empty(), "nothing sank");
+    let after: Vec<u64> = idx.levels[TERMINAL].entries().map(|e| e.seq).collect();
+    assert_eq!(after, terminal, "the floor was not rewritten");
+    assert_all_found(
+        &idx,
+        (0..STABLE_ROWS)
+            .chain(100_000..100_000 + STABLE_ROWS)
+            .chain([7_500, 9_500, 70_007]),
+    );
+}
+
 /// A superseded shard a manifest names waits for the barrier: the fold leaves it
 /// on disk, and the drain after the next publish removes it and nothing live.
 #[test]
@@ -1131,10 +1154,7 @@ fn a_published_shard_a_fold_supersedes_waits_for_the_barrier() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = index_with_l0(tmp.path(), 5, None);
     publish_manifest(&mut idx);
-    let inputs: Vec<String> = idx
-        .all_entries()
-        .map(|e| manifest::shard_path(&idx.output_dir, e.seq))
-        .collect();
+    let inputs: Vec<String> = idx.all_entries().map(|e| idx.dir.shard_path(e.seq)).collect();
     assert_eq!(inputs.len(), 5);
 
     idx.run_compact().unwrap();
@@ -1277,12 +1297,12 @@ fn a_call_stops_at_the_destination_past_its_budget() {
         idx.append_l0_run(&test_batch(&keys, &keys.iter().map(|&k| k as i64).collect::<Vec<_>>()))
             .unwrap();
         // A budget of one byte: the call does one destination and stops.
-        let before = idx.shard_seq;
+        let before = idx.dir.last_seq();
         let done = idx.maintain(1).unwrap();
         // One destination reads no more than the fold it belongs to, and no
         // fold reads more than two guards' worth.
         assert!(done <= 2 * idx.l0_run_bytes + 1, "one call read {done} B");
-        assert!(idx.shard_seq - before <= 1, "one call wrote more than one shard");
+        assert!(idx.dir.last_seq() - before <= 1, "one call wrote more than one shard");
         calls += 1;
         part_way += usize::from(idx.running.is_some());
         deferred += usize::from(idx.owed());
@@ -1292,15 +1312,15 @@ fn a_call_stops_at_the_destination_past_its_budget() {
 
     idx.drain().unwrap();
     assert!(!idx.owed() && idx.running.is_none());
-    assert!(idx.levels[L0].entries().count() <= L0_COMPACT_THRESHOLD);
+    assert!(idx.l0.len() <= L0_COMPACT_THRESHOLD);
     for level in &idx.levels[L1..] {
         assert!(level.guards.iter().all(|g| g.entries.len() <= GUARD_FILE_THRESHOLD));
     }
 }
 
 /// A source guard holding keys below its own key is cut at the low end of its
-/// extent, so each band still meets one terminal guard and no terminal guard is
-/// rewritten twice.
+/// extent, so no terminal guard is rewritten twice, and the band below every
+/// terminal shard moves down without a merge.
 #[test]
 fn a_vertical_of_a_guard_with_a_low_tail_reads_each_terminal_guard_once() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1316,8 +1336,8 @@ fn a_vertical_of_a_guard_with_a_low_tail_reads_each_terminal_guard_once() {
     let vertical = &stats[&CompactionKind::Vertical];
     assert_eq!(
         (vertical.n, vertical.in_files),
-        (2, 4),
-        "two bands, each read with the one terminal guard it meets"
+        (1, 2),
+        "one band, read with the one terminal guard it meets"
     );
     assert_all_found(&idx, [5, 10, 20, 100, 105, 110, 160]);
 }
@@ -1390,20 +1410,6 @@ fn a_fence_stays_above_a_tail_only_l1_guard() {
             .into_iter()
             .chain((0..5).flat_map(|i| 50 + i * 3000..2050 + i * 3000)),
     );
-}
-
-/// A band starting at the key of a terminal guard that holds only its lower
-/// tail folds into that guard.
-#[test]
-fn a_band_at_the_key_of_a_tail_only_terminal_guard_merges_with_it() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut idx = fresh(tmp.path(), make_schema_u64_i64());
-    seed_guard(&mut idx, TERMINAL, gk(100), &test_batch(&[10, 20], &[1, 2]), 1);
-    seed_guard(&mut idx, L1, gk(100), &test_batch(&[100, 150], &[3, 4]), 2);
-
-    idx.vertical_fold(0).unwrap();
-    assert_eq!(idx.levels[TERMINAL].guards.len(), 1);
-    assert_all_found(&idx, [10, 20, 100, 150]);
 }
 
 /// A vertical whose output would cross the target is cut where the split pass
@@ -1513,32 +1519,31 @@ impl Model {
 
 fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
     // Structure.
-    assert!(idx.levels[L0].guards.len() <= 1, "{what}: more than one L0 guard");
+    assert!(idx.l0.iter().all(|e| !e.shard.is_skeleton()), "{what}: skeleton in L0");
     for (li, level) in idx.levels.iter().enumerate() {
+        let l = li + 1;
         assert!(
             level.guards.windows(2).all(|w| w[0].guard_key < w[1].guard_key),
-            "{what}: L{li} guards not sorted and distinct"
+            "{what}: L{l} guards not sorted and distinct"
         );
         for (gi, g) in level.guards.iter().enumerate() {
-            assert!(!g.entries.is_empty(), "{what}: L{li} guard {gi} is empty");
+            assert!(!g.entries.is_empty(), "{what}: L{l} guard {gi} is empty");
             if li == TERMINAL {
                 assert_eq!(g.entries.len(), 1, "{what}: terminal guard {gi}");
+                assert_eq!(g.guard_key, g.entries[0].pk_min, "{what}: terminal guard {gi}'s key");
             } else {
                 assert!(
                     g.entries.iter().all(|e| !e.shard.is_skeleton()),
                     "{what}: skeleton above the terminal level"
                 );
             }
-            if li == L0 {
-                continue;
-            }
             let (lo, hi) = g.key_extent();
             assert!(
                 gi == 0 || lo >= g.guard_key,
-                "{what}: L{li} guard {gi} holds a row below its key"
+                "{what}: L{l} guard {gi} holds a row below its key"
             );
             if let Some(next) = level.guards.get(gi + 1) {
-                assert!(hi < next.guard_key, "{what}: L{li} guard {gi} reaches into the next");
+                assert!(hi < next.guard_key, "{what}: L{l} guard {gi} reaches into the next");
             }
         }
     }
@@ -1554,10 +1559,9 @@ fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
         *per_pk.entry(pk.clone()).or_default() += w;
     }
     for pk in m.seen.iter() {
-        let mut sum = 0;
-        idx.find_pk_bytes(pk, probe_key(pk), |shard, rows| {
-            sum += rows.map(|r| shard.get_weight(r)).sum::<i64>();
-        });
+        let sum: i64 = (idx.holding(pk, probe_key(pk)))
+            .flat_map(|(shard, rows)| rows.map(|r| shard.get_weight(r)))
+            .sum();
         assert_eq!(sum, per_pk.get(pk).copied().unwrap_or(0), "{what}: key {pk:?} by probe");
     }
 
@@ -1615,7 +1619,7 @@ fn shard_index_model() {
                     let blocker = (rng.gen_range(5) == 0).then(|| {
                         let p = tmp
                             .path()
-                            .join(manifest::shard_name(idx.shard_seq + 1 + rng.gen_range(4)));
+                            .join(manifest::shard_name(idx.dir.last_seq() + 1 + rng.gen_range(4)));
                         std::fs::create_dir_all(&p).unwrap();
                         p
                     });
@@ -1639,14 +1643,14 @@ fn shard_index_model() {
                                 interrupted += usize::from(idx.running.is_some());
                             }
                         }
-                        3 if !idx.levels[L0].guards.is_empty() => {
+                        3 if !idx.l0.is_empty() => {
                             let _ = idx.finish_fold();
-                            idx.bands.clear();
+                            idx.abandon_fold();
                             let _ = idx.run_compact();
                         }
                         4 if !idx.levels[L1].guards.is_empty() => {
                             let _ = idx.finish_fold();
-                            idx.bands.clear();
+                            idx.abandon_fold();
                             if !idx.levels[L1].guards.is_empty() {
                                 let gi = rng.gen_range(idx.levels[L1].guards.len() as u64) as usize;
                                 let _ = idx.vertical_fold(gi);
@@ -1657,7 +1661,7 @@ fn shard_index_model() {
                         }
                         6 => {
                             let _ = idx.finish_fold();
-                            idx.bands.clear();
+                            idx.abandon_fold();
                             let _ = idx.rebalance_guards([L1, TERMINAL][rng.gen_range(2) as usize]);
                         }
                         7 => {
@@ -1750,4 +1754,52 @@ fn tier_folds_keep_the_zset() {
             check_model(&idx, &m, &format!("budget {budget:?} reopen {reopen}"));
         }
     }
+}
+
+/// A unique-key history spread over every tier — inserts sunk to the terminal
+/// level, rewrites in L1, two L0 shards and a pending shard — answers each key's live row
+/// from the newest shard holding it.
+#[test]
+fn the_newest_shard_holding_a_key_holds_its_live_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut idx = fresh(tmp.path(), make_schema_u64_i64());
+    let schema = make_schema_u64_i64();
+    // Rewrite `keys` from version `v - 1` to `v`.
+    let rewrite = |keys: std::ops::Range<u64>, v: i64| -> Batch {
+        let rows: Vec<(u64, i64, i64)> = keys.flat_map(|k| [(k, -1, v - 1), (k, 1, v)]).collect();
+        make_batch_raw(&schema, &rows).into_consolidated()
+    };
+    let inserts: Vec<(u64, i64, i64)> = (0..40).map(|k| (k, 1, 0)).collect();
+    idx.append_l0_run(&make_batch_raw(&schema, &inserts).into_consolidated())
+        .unwrap();
+    idx.run_compact().unwrap();
+    while !idx.levels[L1].guards.is_empty() {
+        idx.vertical_fold(0).unwrap();
+    }
+    idx.append_l0_run(&rewrite(0..20, 1)).unwrap();
+    idx.run_compact().unwrap();
+    idx.append_l0_run(&rewrite(0..10, 2)).unwrap();
+    idx.append_l0_run(&rewrite(0..7, 3)).unwrap();
+    idx.append_pending_run(&rewrite(0..5, 4)).unwrap();
+    assert!(
+        [L1, TERMINAL].iter().all(|&l| !idx.levels[l].guards.is_empty()) && !idx.l0.is_empty(),
+        "premise: the history spans every level"
+    );
+
+    for k in 0..40u64 {
+        let want = [(5, 4), (7, 3), (10, 2), (20, 1), (40, 0)]
+            .into_iter()
+            .find(|&(end, _)| k < end)
+            .unwrap()
+            .1;
+        let key = k.to_be_bytes();
+        let (shard, rows) = idx.holding(&key, probe_key(&key)).next().expect("a live key is held");
+        let live: Vec<i64> = rows
+            .filter(|&r| shard.get_weight(r) > 0)
+            .map(|r| i64::from_le_bytes(shard.get_col_ptr(r, 0, 8).try_into().unwrap()))
+            .collect();
+        assert_eq!(live, [want], "key {k}");
+    }
+    let absent = 99u64.to_be_bytes();
+    assert!(idx.holding(&absent, probe_key(&absent)).next().is_none());
 }
