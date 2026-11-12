@@ -180,7 +180,7 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
         }
     }
     // Once, not per chunk: the view's first reads open over fewer runs.
-    host.parts().1.fold_to_ram(view)
+    host.parts().1.settle(view)
 }
 
 /// The round a step of the running tick stands at.

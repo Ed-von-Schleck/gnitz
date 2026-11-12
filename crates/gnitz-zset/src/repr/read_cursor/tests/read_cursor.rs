@@ -26,7 +26,6 @@ pub(super) fn create_read_cursor(
             .map(|b| Run::Mem(Rc::clone(b)))
             .chain(shards.iter().cloned().map(Run::Shard)),
         schema,
-        batches.len() + shards.len(),
     )
 }
 
@@ -85,7 +84,7 @@ proptest! {
                 false => Run::Mem(Rc::new(b.clone())),
             })
             .collect();
-        let open = || from_runs(runs.iter().cloned(), s, runs.len());
+        let open = || from_runs(runs.iter().cloned(), s);
 
         let mat = open().materialize();
         assert_folds(&batches, &mat, "materialize");
@@ -198,7 +197,7 @@ proptest! {
                 let cursor = match prefixes.first() {
                     Some(first) => {
                         let first = group_floor(first, stride);
-                        from_runs_in_band(runs.iter().cloned(), s, runs.len(), first.pk_bytes(), None)
+                        from_runs_in_band(runs.iter().cloned(), s, first.pk_bytes(), None)
                     }
                     None => empty_cursor(s),
                 };
@@ -212,7 +211,7 @@ proptest! {
         // ascending group seek does, from a cursor opened at the whole store or
         // at the first key.
         if let Some(first) = keys.first() {
-            for mut cursor in [open(), from_runs_in_band(runs.iter().cloned(), s, runs.len(), first, None)] {
+            for mut cursor in [open(), from_runs_in_band(runs.iter().cloned(), s, first, None)] {
                 let mut seeking = open();
                 let mut probe = cursor.group_probe(false);
                 for key in &keys {
@@ -588,7 +587,7 @@ proptest! {
                 Run::Shard(map_shard(&dir.path().join(format!("{i}.db")), b))
             }))
             .collect();
-        let mut cursor = from_runs(sources.iter().cloned(), s, sources.len());
+        let mut cursor = from_runs(sources.iter().cloned(), s);
         cursor.mark_heap_newest_first();
         let mut probe = cursor.group_probe(true);
         for pk in 0u128..11 {

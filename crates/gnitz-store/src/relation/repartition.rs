@@ -10,7 +10,7 @@ use std::fs;
 
 use super::dirs::{cluster_children, subdir_names};
 use super::{ChildAddr, ChildKind, StoreConfig};
-use crate::storage::{flush_barrier, link_stores, retire_stores, Cut, RecoverySource, Table};
+use crate::storage::{flush_barrier, link_stores, retire_stores, RecoverySource, Table};
 use gnitz_zset::algebra::{Placement, ScatterPlan, Slot};
 use gnitz_zset::repr::{from_runs, Batch, StorageError};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -132,7 +132,7 @@ fn rewrite_targets(
     for t in &sources {
         t.verify_shards()?;
     }
-    let mut cursor = from_runs(sources.iter().flat_map(|t| t.runs(Cut::Now)), *schema, 0);
+    let mut cursor = from_runs(sources.iter().flat_map(|t| t.runs()), *schema);
     let mut targets = open(launched)?;
     let mut buffers: Vec<Batch> = targets.iter().map(|_| Batch::empty_with_schema(schema)).collect();
     let plan = ScatterPlan::native(placement);

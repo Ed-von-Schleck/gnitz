@@ -69,7 +69,7 @@ impl TestTrace {
 
     /// A cursor over every run.
     pub(crate) fn cursor(&self) -> ReadCursor {
-        from_runs(self.runs.iter().cloned().map(Run::Mem), self.schema, self.runs.len())
+        from_runs(self.runs.iter().cloned().map(Run::Mem), self.schema)
     }
 
     /// A cursor over the rows whose PK begins with a key in `[first, last]` and
@@ -80,7 +80,7 @@ impl TestTrace {
             group_band(first, last, self.schema.pk_stride()).expect("`first <= last`, so the band holds a key");
         let runs = self.runs.iter().cloned().map(Run::Mem);
         let end = end.as_ref().map(PkBuf::pk_bytes);
-        from_runs_in_band(runs, self.schema, self.runs.len(), start.pk_bytes(), end)
+        from_runs_in_band(runs, self.schema, start.pk_bytes(), end)
     }
 }
 

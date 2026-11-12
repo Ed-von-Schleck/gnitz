@@ -10,6 +10,15 @@
 //! first writes the pending rows to shards the disk tier holds apart, which a
 //! reader at the cut leaves out.
 //!
+//! Oldest to newest, the runs are: the shard levels, the RAM tier, the
+//! memtable, then above the cut the pending shards and the `pending` set. Each
+//! heap run is the consolidated sum of a contiguous stretch of ingests, and
+//! every heap run is newer than every shard below the cut: a barrier empties
+//! every heap tier into shards, a spill moves the oldest, and an ingest below
+//! the cut lands only while nothing is pending. Readers rely on that order:
+//! a cursor is [marked](ReadCursor::mark_heap_newest_first) heap newest first,
+//! and [`Table::unique_live_row_at`] lets the newest heap run decide a key.
+//!
 //! A row and its retraction stay stored until a fold merges their runs. An open
 //! starts at the store's [`LiveFloor`] rather than walking the cancelled pairs
 //! under it.
@@ -128,6 +137,10 @@ impl Table {
 
     /// See [`ShardIndex::append_terminal_run`].
     pub(crate) fn append_terminal_run(&mut self, run: &Batch) -> Result<(), StorageError> {
+        debug_assert!(
+            self.ram_tiers(Cut::Sealed).all(|set| set.len() == 0) && !self.has_pending(),
+            "a terminal shard lands under no heap run"
+        );
         self.admit(run);
         self.shard_index.append_terminal_run(run)
     }
@@ -172,10 +185,9 @@ impl Table {
         if run.is_empty() {
             return Ok(());
         }
-        debug_assert_eq!(
-            self.pending.len(),
-            0,
-            "an ingest below the cut lands above every pending run"
+        debug_assert!(
+            !self.has_pending(),
+            "an ingest below the cut lands only while nothing is pending"
         );
         self.admit(&run);
         let ingested = run.total_bytes();
@@ -225,9 +237,8 @@ impl Table {
             true => run,
             // A barrier since the last seal left part of the delta in shards.
             false => {
-                let cap = shards.len() + 1;
                 let runs = run.into_iter().map(Run::Mem).chain(shards.into_iter().map(Run::Shard));
-                Some(from_runs(runs, schema, cap).materialize())
+                Some(from_runs(runs, schema).materialize())
             }
         };
         // The cut now reads every ingest.
@@ -236,7 +247,7 @@ impl Table {
             self.fold_to_ram()?;
         }
         self.upkeep(delta.as_ref().map_or(0, |delta| delta.total_bytes()))?;
-        // Copied only while the memtable still holds the run.
+        // Copied only while a heap tier still holds the run.
         Ok(delta.map(Rc::unwrap_or_clone).filter(|delta| !delta.is_empty()))
     }
 
@@ -249,13 +260,14 @@ impl Table {
         self.shard_index.upkeep(ingested)
     }
 
-    /// Every fold the disk tier owes, in one call: for a caller with no ingest
-    /// to pay for them out of.
+    /// Fold the memtable into the RAM tier, then every fold the disk tier owes,
+    /// in one call: for a caller with no ingest to pay for them out of.
     pub(crate) fn settle(&mut self) -> Result<(), StorageError> {
+        self.fold_to_ram()?;
+        // A read replica of another process's directory must not write into it.
         if self.held_in_ram {
             return Ok(());
         }
-        self.rejudge_live_floor();
         self.shard_index.maintain(u64::MAX).map(drop)
     }
 
@@ -275,37 +287,40 @@ impl Table {
             .skip(usize::from(cut == Cut::Sealed))
     }
 
-    /// The heap-resident runs whose PK extent meets the inclusive `bound`, newest
-    /// first; `None` takes them all. Each is newer than every shard: a barrier
-    /// empties the heap tiers into shards, and a spill the oldest, so a cursor
-    /// over them and the shards after them is
-    /// [marked](ReadCursor::mark_heap_newest_first).
-    fn mem_runs(&self, bound: Option<(PkBuf, PkBuf)>, cut: Cut) -> impl Iterator<Item = Run> + '_ {
+    /// The runs `cut` reads whose PK extent meets the inclusive `bound`, heap
+    /// tiers newest first and then the shards; `None` takes them all.
+    fn sources<'s, 'b>(
+        &'s self,
+        bound: Option<(&'b [u8], &'b [u8])>,
+        cut: Cut,
+    ) -> impl Iterator<Item = Run> + use<'s, 'b> {
         self.ram_tiers(cut)
             .flat_map(move |set| set.runs_overlapping(bound))
             .cloned()
             .map(Run::Mem)
+            .chain(self.shard_index.shard_arcs(bound, cut).map(Run::Shard))
     }
 
-    /// How many cursor sources [`Self::mem_runs`] can yield.
-    fn mem_run_count(&self) -> usize {
-        self.ram_tiers(Cut::Now).map(|s| s.len()).sum()
+    /// Every run the store holds.
+    pub(crate) fn runs(&self) -> impl Iterator<Item = Run> + '_ {
+        self.sources(None, Cut::Now)
     }
 
-    /// Every run `cut` reads.
-    pub(crate) fn runs(&self, cut: Cut) -> impl Iterator<Item = Run> + '_ {
-        self.mem_runs(None, cut)
-            .chain(self.shard_index.shard_arcs(cut).map(Run::Shard))
-    }
-
-    /// Open a read-only cursor over the rows `cut` reads.
+    /// Open a read-only cursor over the rows `cut` reads: every run, unpruned,
+    /// positioned at the [`LiveFloor`], which it judges when that is due.
     pub(crate) fn open_cursor(&self, cut: Cut) -> ReadCursor {
+        let schema = self.shard_index.schema;
         let LiveFloor { at, judged } = self.live_floor.get();
-        let cursor = self.cursor_from(at, cut);
+        let runs = self.sources(None, cut);
+        let mut cursor = match at {
+            Some(at) => from_runs_at(runs, schema, at.pk_bytes()),
+            None => from_runs(runs, schema),
+        };
+        cursor.mark_heap_newest_first();
         if !judged {
             let first_live = cursor.passed_more_than_a_seek().then(|| match cursor.is_valid() {
                 true => PkBuf::from_bytes(cursor.current_pk_bytes()),
-                false => PkBuf::max(self.shard_index.schema.pk_stride()),
+                false => PkBuf::max(schema.pk_stride()),
             });
             // Kept at or under every row above the cut, so it holds at both cuts.
             let at = match (first_live, self.pending_least()) {
@@ -314,19 +329,6 @@ impl Table {
             };
             self.live_floor.set(LiveFloor { at, judged: true });
         }
-        cursor
-    }
-
-    /// A cursor over the rows `cut` reads, on its first live row at or above
-    /// `floor`.
-    fn cursor_from(&self, floor: Option<PkBuf>, cut: Cut) -> ReadCursor {
-        let schema = self.shard_index.schema;
-        let cap = self.mem_run_count() + self.shard_index.shard_count();
-        let mut cursor = match floor {
-            Some(at) => from_runs_at(self.runs(cut), schema, cap, at.pk_bytes()),
-            None => from_runs(self.runs(cut), schema, cap),
-        };
-        cursor.mark_heap_newest_first();
         cursor
     }
 
@@ -364,29 +366,40 @@ impl Table {
     /// same leading bytes of one — positioned on the band they span, over the
     /// rows `cut` reads.
     pub(crate) fn cursor_between(&self, first: &[u8], last: &[u8], cut: Cut) -> ReadCursor {
-        // The zero-width prefix is every key: no run to rule out, no key to seek.
-        if first.is_empty() {
-            return self.open_cursor(cut);
-        }
         let stride = self.shard_index.schema.pk_stride();
         let band = group_band(first, last, stride)
             .expect("`first <= last`, so the band from one's group to the other's holds a key");
-        self.band_cursor(band, cut)
+        self.cursor(Some(band), cut)
     }
 
     /// A cursor positioned on the key band `r` walks, over the rows `cut` reads.
     pub(crate) fn range_cursor(&self, r: &KeyRange, cut: Cut) -> ReadCursor {
-        match range_band(&self.shard_index.schema, r) {
-            Some(band) => self.band_cursor(band, cut),
+        self.cursor(range_band(&self.shard_index.schema, r), cut)
+    }
+
+    /// Every live row of `keys` — whole PKs, or the same leading columns of
+    /// one — over the runs `cut` reads that the span they cover can reach.
+    pub(crate) fn gather(&self, keys: PkKeys, cut: Cut) -> PkSetGather {
+        let cursor = match keys.bounds() {
+            Some((first, last)) => self.cursor_between(first, last, cut),
             None => empty_cursor(self.shard_index.schema),
-        }
+        };
+        PkSetGather::over(cursor, keys)
     }
 
     /// A cursor positioned on the OPK key band `[start, end)` of the rows `cut`
     /// reads (`None` for `end`: the top of the key space), over the runs that can
-    /// hold a key of it.
-    fn band_cursor(&self, (mut start, end): (PkBuf, Option<PkBuf>), cut: Cut) -> ReadCursor {
+    /// hold a key of it; `None` for the band is the empty one. The band is
+    /// clamped to the [`LiveFloor`], and the whole key space is
+    /// [`Self::open_cursor`]'s.
+    fn cursor(&self, band: Option<(PkBuf, Option<PkBuf>)>, cut: Cut) -> ReadCursor {
         let schema = self.shard_index.schema;
+        let Some((mut start, end)) = band else {
+            return empty_cursor(schema);
+        };
+        if end.is_none() && start.pk_bytes().iter().all(|&b| b == 0) {
+            return self.open_cursor(cut);
+        }
         match self.live_floor.get().at {
             Some(at) if at > start => {
                 if end.is_some_and(|end| end <= at) {
@@ -400,26 +413,12 @@ impl Table {
         let hi = end.unwrap_or_else(|| PkBuf::max(stride));
         debug_assert!(
             start.pk_bytes().len() == stride && hi.pk_bytes().len() == stride,
-            "band_cursor: a bound is not pk_stride wide",
+            "Table::cursor: a bound is not pk_stride wide",
         );
-        let runs = self
-            .mem_runs(Some((start, hi)), cut)
-            .chain(self.shard_index.shard_arcs_in_range(start, hi, cut).map(Run::Shard));
-        let cap = self.mem_run_count() + self.shard_index.narrow_range_shards();
-        let end = end.as_ref().map(PkBuf::pk_bytes);
-        let mut cursor = from_runs_in_band(runs, schema, cap, start.pk_bytes(), end);
+        let runs = self.sources(Some((start.pk_bytes(), hi.pk_bytes())), cut);
+        let mut cursor = from_runs_in_band(runs, schema, start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes));
         cursor.mark_heap_newest_first();
         cursor
-    }
-
-    /// Every live row of `keys` — whole PKs, or the same leading columns of
-    /// one — over the runs `cut` reads that the span they cover can reach.
-    pub(crate) fn gather(&self, keys: PkKeys, cut: Cut) -> PkSetGather {
-        let cursor = match keys.bounds() {
-            Some((first, last)) => self.cursor_between(first, last, cut),
-            None => empty_cursor(self.shard_index.schema),
-        };
-        PkSetGather::over(cursor, keys)
     }
 
     /// The consolidated batch of all live rows, cached until the row set moves.
@@ -456,6 +455,14 @@ impl Table {
         w > 0
     }
 
+    /// The newest heap run holding `key`, whose [`probe_key`] is `fingerprint`,
+    /// with its rows of that key.
+    #[inline]
+    fn newest_heap_rows(&self, key: &[u8], fingerprint: u64) -> Option<(&Rc<Batch>, Range<usize>)> {
+        self.ram_tiers(Cut::Now)
+            .find_map(|set| set.holding(key, fingerprint).next())
+    }
+
     /// Visit every row whose PK equals `key`, whose [`probe_key`] is
     /// `fingerprint`: the heap tiers' when `heap`, newest first, which puts
     /// `live_row_at`'s live row ahead of the retracted history it would
@@ -468,7 +475,9 @@ impl Table {
         };
         if heap {
             for set in self.ram_tiers(Cut::Now) {
-                set.find_pk_bytes(key, fingerprint, |batch, rows| visit(Run::Mem(Rc::clone(batch)), rows));
+                for (batch, rows) in set.holding(key, fingerprint) {
+                    visit(Run::Mem(Rc::clone(batch)), rows);
+                }
             }
         }
         self.shard_index.find_pk_bytes(key, fingerprint, |shard, rows| {
@@ -479,22 +488,16 @@ impl Table {
     /// [`Self::live_row_at`]'s row, for a store whose every key nets 0 or 1 —
     /// a base table's, under its unique-PK rule.
     ///
-    /// There every heap run is the consolidated sum of a contiguous stretch of
-    /// ingests, newer than every shard — a barrier empties every heap tier
-    /// into shards, and a spill the oldest — and the heap tiers are walked
-    /// newest first, the pending tier being newer than the memtable since an
-    /// ingest below the cut finds it empty. So the newest heap run holding `key` decides it: what
-    /// that stretch left is the key's state now, and its rows of the key are
-    /// that state less the one it started from — a positive row is the live
-    /// one, and a retraction alone means the stretch deleted the key. A key no
-    /// heap run holds is summed over the shards.
+    /// By the run order the module doc states, the newest heap run holding
+    /// `key` decides it: what that stretch of ingests left is the key's state
+    /// now, and its rows of the key are that state less the one it started
+    /// from — a positive row is the live one, and a retraction alone means the
+    /// stretch deleted the key. A key no heap run holds is summed over the
+    /// shards.
     #[inline]
     pub(crate) fn unique_live_row_at(&self, key: &[u8]) -> Option<StoredRow> {
         let fingerprint = probe_key(key);
-        let newest = self
-            .ram_tiers(Cut::Now)
-            .find_map(|set| set.newest_holding(key, fingerprint));
-        let live = match newest {
+        let live = match self.newest_heap_rows(key, fingerprint) {
             Some((run, rows)) => {
                 let live = rows.into_iter().find(|&row| run.get_weight(row) > 0);
                 live.map(|row| StoredRow::new(Run::Mem(Rc::clone(run)), row))
@@ -521,13 +524,18 @@ impl Table {
     /// [`Self::live_row_at`] over the shards, and the heap tiers too when `heap`;
     /// `fingerprint` is `key`'s [`probe_key`].
     fn live_row_in(&self, key: &[u8], fingerprint: u64, heap: bool) -> (i64, Option<StoredRow>) {
-        let mut pool = self.live_row_scratch.take();
-
+        // The scratch pool is taken only once a candidate turns up: most probes
+        // of a fresh key find none.
+        let mut pool = None;
         let mut total_w: i64 = 0;
         self.for_each_pk_candidate(key, fingerprint, heap, |run, row| {
             total_w += run.get_weight(row);
-            pool.push(StoredRow::new(run.clone(), row));
+            pool.get_or_insert_with(|| self.live_row_scratch.take())
+                .push(StoredRow::new(run.clone(), row));
         });
+        let Some(mut pool) = pool else {
+            return (0, None);
+        };
 
         let mut row = None;
         if total_w > 0 {

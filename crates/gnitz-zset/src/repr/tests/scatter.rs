@@ -254,7 +254,7 @@ fn pick_scratch_interleaves_across_kernels() {
         // Every `round`-th key from 0..64; even keys hold two rows.
         let keys: Vec<u64> = (0..64).step_by(round as usize).collect();
         let pks: Vec<u8> = keys.iter().flat_map(|k| k.to_be_bytes()).collect();
-        let cursor = from_runs(stored().into_iter().map(|b| Run::Mem(Rc::new(b))), schema, 2);
+        let cursor = from_runs(stored().into_iter().map(|b| Run::Mem(Rc::new(b))), schema);
         let mut gather = PkSetGather::over(cursor, PkKeys::from_sorted(8, pks));
         let mut gathered = Vec::new();
         while let Some(b) = gather.drain_chunk(3) {
@@ -271,7 +271,7 @@ fn pick_scratch_interleaves_across_kernels() {
         assert_eq!(gathered, weighted_rows(&make_batch(&schema, &want_rows)));
 
         // Both runs merged by a plain cursor, drained in chunks of `round + 1`.
-        let mut cursor = from_runs(stored().into_iter().map(|b| Run::Mem(Rc::new(b))), schema, 2);
+        let mut cursor = from_runs(stored().into_iter().map(|b| Run::Mem(Rc::new(b))), schema);
         let mut drained = Vec::new();
         while let Some(b) = cursor.drain_chunk(round as usize + 1) {
             drained.extend(weighted_rows(&b));

@@ -43,7 +43,7 @@ fn fixture(payload: &[TypeCode], indexed: &[&[u32]], put_row: impl FnMut(&mut Ba
     let rows = id_rows(&schema, (0..ROWS).map(|id| (id, 1)), put_row);
     let r = relation_fixture(RelationKind::BaseTable, schema, indexed, [rows]);
     let table = r.relation(TID).unwrap().table();
-    assert_eq!((table_shards(table).len(), table.runs(At::Now).count()), (0, 1));
+    assert_eq!((table_shards(table).len(), table.runs().count()), (0, 1));
     r
 }
 
@@ -206,7 +206,7 @@ fn scan_spec_bench() {
     r.checkpoint_base().unwrap();
     r.ingest(TID, half(1)).unwrap();
     let table = r.relation(TID).unwrap().table();
-    assert_eq!((table_shards(table).len(), table.runs(At::Now).count()), (1, 2));
+    assert_eq!((table_shards(table).len(), table.runs().count()), (1, 2));
     let spec = ReadSpec {
         bound: ReadBound::None,
         predicate: lt(1, 256),

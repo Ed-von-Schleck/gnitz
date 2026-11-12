@@ -6,7 +6,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StoreConfig};
-use crate::storage::{Cut, RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
+use crate::storage::{RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{
     ComputeMap, KeyRange, OrderKey, PkColList, ReadBound, ReadSink, ReadSpec, RowsCut, SinkKind, ViewBudget,
@@ -17,7 +17,7 @@ use gnitz_zset::schema::SchemaDescriptor;
 
 /// Every shard `t` holds, the pending ones included, in read order.
 pub(crate) fn table_shards(t: &Table) -> Vec<Rc<MappedShard>> {
-    t.runs(Cut::Now)
+    t.runs()
         .filter_map(|r| match r {
             Run::Shard(s) => Some(s),
             Run::Mem(_) => None,
@@ -265,9 +265,6 @@ pub(crate) fn wide_on_disk(kind: RelationKind, rows: u64, shards: usize) -> Rela
         }
     }
     let table = r.relation(TID).unwrap().table();
-    assert_eq!(
-        (table_shards(table).len(), table.runs(Cut::Now).count()),
-        (shards, shards)
-    );
+    assert_eq!((table_shards(table).len(), table.runs().count()), (shards, shards));
     r
 }

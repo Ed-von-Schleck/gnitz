@@ -14,7 +14,6 @@ use gnitz_zset::schema::SchemaDescriptor;
 use rustc_hash::FxHashMap;
 
 use super::{RelationKind, RelationRegistry};
-use crate::storage::Cut;
 
 /// One relation's store at the moment of a pin.
 pub(crate) struct PinnedStore {
@@ -54,7 +53,7 @@ impl RelationRegistry {
                     _ => (rel.placement().counts_on(self.slot.rank), self.slot),
                 };
                 let runs = match counted {
-                    true => table.runs(Cut::Now).collect(),
+                    true => table.runs().collect(),
                     false => Vec::new(),
                 };
                 Some((id, PinnedStore { schema: *table.schema(), runs, share }))

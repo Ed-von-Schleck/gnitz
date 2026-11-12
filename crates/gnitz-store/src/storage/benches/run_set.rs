@@ -190,7 +190,7 @@ fn run_set_push_bench() {
     }
 }
 
-/// `RunSet::find_pk_bytes` on a RAM tier's set, its rows in one run and in as
+/// `RunSet::holding` on a RAM tier's set, its rows in one run and in as
 /// many as a set holds: the probe that builds the bloom in instructions per held
 /// row, then scattered probes of held keys and of absent keys inside the held
 /// span, in instructions and cycles per probe.
@@ -229,7 +229,7 @@ fn run_set_probe_bench() {
         assert!(!set.is_full(), "{label}: past the tier's ceiling");
 
         let (first, _) = keys(0)[0];
-        let ((), build) = instructions.measure(|| set.find_pk_bytes(&first, probe_key(&first), |_, _| ()));
+        let ((), build) = instructions.measure(|| set.holding(&first, probe_key(&first)).for_each(drop));
         println!(
             "run_set_probe_bench {runs:>2} {label:<17} bloom build {:5.1} instr/row",
             build as f64 / ROWS as f64
@@ -241,9 +241,9 @@ fn run_set_probe_bench() {
                 instructions.measure(|| {
                     let mut found = 0u64;
                     for (key, fingerprint) in &keys {
-                        set.find_pk_bytes(key, *fingerprint, |run, rows| {
+                        for (run, rows) in set.holding(key, *fingerprint) {
                             found += run.get_weight(rows.start) as u64
-                        });
+                        }
                     }
                     found
                 })

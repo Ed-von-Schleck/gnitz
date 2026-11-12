@@ -24,9 +24,9 @@ impl RelationRegistry {
         let schema = store.schema;
         check_layout(page.layout, &schema)?;
         let limit = usize::try_from(rows).unwrap_or(usize::MAX);
-        let (runs, cap) = (store.runs.iter().cloned(), store.runs.len());
+        let runs = store.runs.iter().cloned();
         let mut cursor = match after {
-            None => from_runs(runs, schema, cap),
+            None => from_runs(runs, schema),
             Some(after) => {
                 if after.len() != schema.pk_stride() {
                     return Err(format!(
@@ -38,7 +38,7 @@ impl RelationRegistry {
                 let Some(start) = key_above(after, after.len()) else {
                     return Ok(Batch::empty_with_schema(&schema));
                 };
-                from_runs_in_band(runs, schema, cap, start.pk_bytes(), None)
+                from_runs_in_band(runs, schema, start.pk_bytes(), None)
             }
         };
         // A drain passes over cancelled groups without counting them, and a pin

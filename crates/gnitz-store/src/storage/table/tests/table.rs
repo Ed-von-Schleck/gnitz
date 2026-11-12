@@ -108,7 +108,7 @@ fn assert_serves(t: &Table, live: &HashMap<RowKey, i64>, sealed: &HashMap<RowKey
         );
         for w in keys.windows(2) {
             let (lo, hi) = (PkBuf::from_bytes(&w[0]), PkBuf::from_bytes(&w[1]));
-            let got = zset_of(&t.band_cursor((lo, Some(hi)), cut).materialize(), &s);
+            let got = zset_of(&t.cursor(Some((lo, Some(hi))), cut).materialize(), &s);
             let band: HashMap<RowKey, i64> = want
                 .iter()
                 .filter(|(k, _)| w[0] <= k.0 && k.0 < w[1])
@@ -282,7 +282,7 @@ fn an_open_keeps_the_first_live_key_as_the_floor() {
     assert_eq!(scan(&t, Cut::Sealed), live(&[100]));
     let band = |lo, hi| {
         let band = (PkBuf::from_bytes(&key(lo)), Some(PkBuf::from_bytes(&key(hi))));
-        zset_of(&t.band_cursor(band, Cut::Now).materialize(), &make_schema_u64_i64())
+        zset_of(&t.cursor(Some(band), Cut::Now).materialize(), &make_schema_u64_i64())
     };
     assert_eq!(band(0, 100), live(&[]));
     assert_eq!(band(0, 101), live(&[100]));
@@ -497,7 +497,6 @@ fn a_barrier_publishes_exactly_when_the_manifest_changes() {
     for r in 0..L0_COMPACT_THRESHOLD as u64 {
         t.ingest(round(r, -1)).unwrap();
     }
-    t.fold_to_ram().unwrap();
     t.settle().unwrap();
     assert_eq!(t.shard_index.shard_count(), 0, "the compaction cancelled everything");
     assert!(publishes(&mut t), "an emptied index publishes");

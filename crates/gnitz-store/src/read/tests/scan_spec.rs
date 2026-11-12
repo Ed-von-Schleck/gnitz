@@ -537,7 +537,7 @@ fn skeleton_fixture() -> RelationFixture {
     });
     let mut r = relation_fixture(kind, schema, &[], [rows(0..5)]);
     r.checkpoint_ephemeral([], 1, |_| true).unwrap();
-    r.fold_to_ram(TID).unwrap();
+    r.settle(TID).unwrap();
     assert!(
         r.relation(TID).unwrap().table().has_skeleton_rows(),
         "premise: the capacity sweep must have dehydrated the flushed shard",

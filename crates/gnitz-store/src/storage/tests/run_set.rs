@@ -47,11 +47,11 @@ proptest! {
             let keys: BTreeSet<&[u8]> = pushed.iter().flat_map(|b| (0..b.len()).map(|i| b.get_pk_bytes(i))).collect();
             for key in keys {
                 let mut got: HashMap<RowKey, i64> = HashMap::new();
-                set.find_pk_bytes(key, probe_key(key), |run, rows| {
+                for (run, rows) in set.holding(key, probe_key(key)) {
                     for r in rows {
                         *got.entry(row_key(&**run, &s, r)).or_default() += run.get_weight(r);
                     }
-                });
+                }
                 got.retain(|_, w| *w != 0);
                 let want_key: HashMap<RowKey, i64> =
                     want.iter().filter(|(k, _)| k.0 == key).map(|(k, w)| (k.clone(), *w)).collect();
@@ -80,9 +80,7 @@ fn keyed_run(schema: &SchemaDescriptor, keys: std::ops::Range<u64>, w: i64, v: i
 /// Whether a probe of `set` finds a row under PK `k`.
 fn holds(set: &RunSet, schema: &SchemaDescriptor, k: u64) -> bool {
     let key = opk_pk(schema, &[k as u128]);
-    let mut found = false;
-    set.find_pk_bytes(&key, probe_key(&key), |_, _| found = true);
-    found
+    set.holding(&key, probe_key(&key)).next().is_some()
 }
 
 /// Only a run cancelling rows of the one before it, and not much smaller than

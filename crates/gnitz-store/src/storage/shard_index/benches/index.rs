@@ -10,7 +10,7 @@ use gnitz_zset::schema::probe_key;
 
 /// The two read entries over a tree the upkeep built from scattered spills, at
 /// a PK stride in each width arm: instructions per `ShardIndex::find_pk_bytes`,
-/// and per `ShardIndex::shard_arcs_in_range` with the shards it hands a cursor.
+/// and per bounded `ShardIndex::shard_arcs` with the shards it hands a cursor.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn shard_probe_bench() {
@@ -67,7 +67,7 @@ fn shard_probe_bench() {
         // Label, the range at a held key, the fewest and the most shards it may select.
         type Range = (&'static str, fn(u64) -> (u64, u64), usize, usize);
         let ranges: [Range; 3] = [
-            ("one key", |k| (k, k), 1, idx.narrow_range_shards()),
+            ("one key", |k| (k, k), 1, l0 + GUARD_FILE_THRESHOLD + 1),
             ("a 1/1024 band", |k| (k, k + KEYSPACE / 1024), 1, idx.shard_count()),
             ("the key line", |_| (0, KEYSPACE), idx.shard_count(), idx.shard_count()),
         ];
@@ -81,7 +81,7 @@ fn shard_probe_bench() {
             let (selected, instructions) = counter.measure(|| {
                 let mut selected = Vec::with_capacity(bounds.len());
                 for &(lo, hi) in &bounds {
-                    selected.push(idx.shard_arcs_in_range(lo, hi, Cut::Now).count());
+                    selected.push(idx.shard_arcs(Some((lo.pk_bytes(), hi.pk_bytes())), Cut::Now).count());
                 }
                 selected
             });

@@ -659,10 +659,9 @@ impl ReadCursor {
 }
 
 /// Build a ReadCursor over `runs`, skipping empty ones, and position it on the
-/// first live PK group. Every run must be folded. `cap` is an allocation hint
-/// for the source vectors.
-pub fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usize) -> ReadCursor {
-    build(runs, schema, cap, ReadCursor::rebuild_and_advance)
+/// first live PK group. Every run must be folded.
+pub fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor) -> ReadCursor {
+    build(runs, schema, ReadCursor::rebuild_and_advance)
 }
 
 /// [`from_runs`] positioned on the first live row of the OPK band `[start, end)`,
@@ -670,40 +669,36 @@ pub fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, 
 pub fn from_runs_in_band(
     runs: impl IntoIterator<Item = Run>,
     schema: SchemaDescriptor,
-    cap: usize,
     start: &[u8],
     end: Option<&[u8]>,
 ) -> ReadCursor {
-    build(runs, schema, cap, |c| c.seek_range_bytes(start, end))
+    build(runs, schema, |c| c.seek_range_bytes(start, end))
 }
 
 /// [`from_runs`] positioned on the first live row at or above `key`, each
 /// source galloping from its first row: cheaper than [`from_runs_in_band`]'s
 /// binary search where `key` lies near the bottom of every run.
-pub fn from_runs_at(
-    runs: impl IntoIterator<Item = Run>,
-    schema: SchemaDescriptor,
-    cap: usize,
-    key: &[u8],
-) -> ReadCursor {
-    build(runs, schema, cap, |c| c.reposition_to(key))
+pub fn from_runs_at(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, key: &[u8]) -> ReadCursor {
+    build(runs, schema, |c| c.reposition_to(key))
 }
 
 /// Positioned by `position` before it is returned, so no caller moves a cursor it
-/// has to mutate first.
+/// has to mutate first. The source vectors reserve `runs`' lower size bound; past
+/// it they grow, and the pool keeps what they grew to.
 #[inline]
 fn build(
     runs: impl IntoIterator<Item = Run>,
     schema: SchemaDescriptor,
-    cap: usize,
     position: impl FnOnce(&mut ReadCursor),
 ) -> ReadCursor {
+    let runs = runs.into_iter();
     let CursorBufs { mut sources, mut states, losers, windows } = take(&CURSOR_BUFS, |_| true).unwrap_or_default();
-    sources.reserve(cap);
-    states.reserve(cap);
+    let (hint, _) = runs.size_hint();
+    sources.reserve(hint);
+    states.reserve(hint);
     // `for_each`, not `for`: the stores hand in nested adaptors, which fold
     // far cheaper than they step.
-    runs.into_iter().for_each(|run| {
+    runs.for_each(|run| {
         debug_assert!(
             !matches!(&run, Run::Mem(b) if !b.is_consolidated()),
             "a cursor run must be folded"
@@ -782,7 +777,7 @@ impl Drop for ReadCursor {
 
 /// A cursor over nothing, in `schema`'s shape.
 pub fn empty_cursor(schema: SchemaDescriptor) -> ReadCursor {
-    from_runs(std::iter::empty(), schema, 0)
+    from_runs(std::iter::empty(), schema)
 }
 
 #[cfg(test)]

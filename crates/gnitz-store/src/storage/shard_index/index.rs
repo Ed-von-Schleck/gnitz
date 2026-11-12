@@ -346,38 +346,31 @@ impl ShardIndex {
         Ok(())
     }
 
-    /// Every shard `cut` reads: the pending ones only at [`Cut::Now`].
-    pub(crate) fn shard_arcs(&self, cut: Cut) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
-        self.settled_entries()
-            .chain(self.pending_at(cut))
-            .map(|e| Rc::clone(&e.shard))
-    }
-
-    /// Every shard `cut` reads whose PK extent meets `[lo, hi]`.
-    pub(crate) fn shard_arcs_in_range(
-        &self,
-        lo: PkBuf,
-        hi: PkBuf,
+    /// Every shard `cut` reads whose PK extent meets the inclusive `bound`, the
+    /// pending ones only at [`Cut::Now`]; `None` takes them all.
+    pub(crate) fn shard_arcs<'s, 'b>(
+        &'s self,
+        bound: Option<(&'b [u8], &'b [u8])>,
         cut: Cut,
-    ) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+    ) -> impl Iterator<Item = Rc<MappedShard>> + use<'s, 'b> {
         self.levels
             .iter()
             .flat_map(move |level| {
-                let run = level.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
-                level.guards[run].iter().flat_map(|g| g.entries.iter())
+                let guards = match bound {
+                    Some((lo, hi)) => level.find_guards_for_range(lo, hi),
+                    None => 0..level.guards.len(),
+                };
+                level.guards[guards].iter().flat_map(|g| g.entries.iter())
             })
             .chain(self.pending_at(cut))
-            .filter(move |e| pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo.pk_bytes(), hi.pk_bytes()))
+            .filter(move |e| {
+                bound.is_none_or(|(lo, hi)| pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo, hi))
+            })
             .map(|e| Rc::clone(&e.shard))
     }
 
-    /// A capacity hint for a cursor over a range inside one guard per level.
-    pub(crate) fn narrow_range_shards(&self) -> usize {
-        self.levels[L0].entries().count() + GUARD_FILE_THRESHOLD + 1
-    }
-
-    /// Registered shards across every tier — one cursor source each, which is
-    /// what an unbounded cursor open sizes its vectors to.
+    /// Registered shards across every tier.
+    #[cfg(test)]
     pub(crate) fn shard_count(&self) -> usize {
         self.all_entries().count()
     }

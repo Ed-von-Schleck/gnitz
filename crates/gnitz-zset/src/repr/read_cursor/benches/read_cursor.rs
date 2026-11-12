@@ -68,7 +68,7 @@ fn cursor_drain_bench() {
         let key = shards[0].get_pk_bytes(shards[0].row_count() / 2);
         let (_, band) = instructions.measure(|| {
             let runs = shards.iter().cloned().map(Run::Shard);
-            black_box(from_runs_in_band(runs, schema, shards.len(), key, None).drain_chunk(100))
+            black_box(from_runs_in_band(runs, schema, key, None).drain_chunk(100))
         });
         println!(
             "cursor_drain_bench {label}: {:.1} instr/row, {:.1} cycles/row; a band of 100 rows {band} instr",
@@ -251,13 +251,8 @@ fn pk_set_gather_drain_bench() {
                     let per_row = |skip: u64| {
                         let [_, instructions] = [(); 2].map(|()| {
                             let keys = PkKeys::from_sorted(8, keys.clone());
-                            let cursor = from_runs_in_band(
-                                runs.iter().cloned(),
-                                schema,
-                                runs.len(),
-                                keys.iter().next().unwrap(),
-                                None,
-                            );
+                            let cursor =
+                                from_runs_in_band(runs.iter().cloned(), schema, keys.iter().next().unwrap(), None);
                             let mut g = PkSetGather::over(cursor, keys);
                             g.skip_payload(skip);
                             let (rows, instructions) = counter.measure(|| {

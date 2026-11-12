@@ -216,12 +216,9 @@ impl RelationRegistry {
     /// spills it, then run every fold its disk tier owes, the capacity sweep
     /// included: no manifest publish, no barrier, and nothing of the relation's
     /// indexes. Unregistered is an `Err`.
-    pub fn fold_to_ram(&mut self, id: u64) -> Result<(), String> {
+    pub fn settle(&mut self, id: u64) -> Result<(), String> {
         let store = self.relation_mut_or_err(id)?.rows.held_mut();
-        store
-            .fold_to_ram()
-            .and_then(|()| store.settle())
-            .map_err(|e| format!("fold relation {id} to RAM: {e}"))
+        store.settle().map_err(|e| format!("settle relation {id}: {e}"))
     }
 
     /// The stores this process holds of the relations whose kind `keep` accepts.

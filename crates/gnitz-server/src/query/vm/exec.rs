@@ -394,7 +394,7 @@ fn run_instructions(vm: &mut Vm, stores: &mut Stores<'_>, pass: &Pass, from: usi
                 let runs = stores.source_state(&batches[in_reg.at()], terms, before)?;
                 let schema = regs[in_reg.at()].schema;
                 let delta = operand(&mut batches[in_reg.at()], takes(in_reg));
-                let mut open = |_: &[u8], _: &[u8]| from_runs(runs.iter().cloned(), schema, runs.len());
+                let mut open = |_: &[u8], _: &[u8]| from_runs(runs.iter().cloned(), schema);
                 stream::op_weight_clamp(delta, stream::History::Through(&mut open), *kind)
             }
 

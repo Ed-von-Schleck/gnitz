@@ -953,11 +953,11 @@ fn a_range_gather_visits_only_the_guards_that_can_own_it() {
         seed_guard(&mut idx, L1, gk(base), &dense_batch(base, 200), i + 1);
     }
     let count = |lo: u64, hi: Option<u64>| {
-        idx.shard_arcs_in_range(gk(lo), hi.map_or_else(|| PkBuf::max(8), gk), Cut::Now)
-            .count()
+        let (lo, hi) = (gk(lo), hi.map_or_else(|| PkBuf::max(8), gk));
+        idx.shard_arcs(Some((lo.pk_bytes(), hi.pk_bytes())), Cut::Now).count()
     };
 
-    assert_eq!(idx.shard_arcs(Cut::Now).count(), 4);
+    assert_eq!(idx.shard_arcs(None, Cut::Now).count(), 4);
     assert_eq!(count(1100, Some(1100)), 1, "a point read routes to one guard");
     assert_eq!(count(1100, Some(2100)), 2, "a range takes the run it spans");
     assert_eq!(count(0, None), 4, "an open end takes the rest of the key space");
@@ -1562,7 +1562,7 @@ fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
     }
 
     // The full cursor.
-    let mut cursor = from_runs(idx.shard_arcs(Cut::Now).map(Run::Shard), idx.schema, idx.shard_count());
+    let mut cursor = from_runs(idx.shard_arcs(None, Cut::Now).map(Run::Shard), idx.schema);
     if skeleton {
         // A skeleton row is one merge group at its key's coarse weight.
         let mut sums: BTreeMap<Vec<u8>, i64> = BTreeMap::new();

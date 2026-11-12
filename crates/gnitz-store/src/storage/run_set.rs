@@ -6,7 +6,6 @@ use std::rc::Rc;
 
 use super::bloom::BloomFilter;
 use super::pk_ranges_overlap;
-use gnitz_wire::PkBuf;
 use gnitz_zset::repr::{merge_consolidated, Batch, MemBatch, StorageError};
 use gnitz_zset::schema::probe_key;
 use gnitz_zset::schema::SchemaDescriptor;
@@ -119,46 +118,28 @@ impl RunSet {
 
     /// The runs whose PK extent meets the inclusive `bound`, newest first;
     /// `None` takes them all.
-    pub(super) fn runs_overlapping(&self, bound: Option<(PkBuf, PkBuf)>) -> impl Iterator<Item = &Rc<Batch>> {
-        self.runs.iter().rev().map(|run| &run.batch).filter(move |run| {
-            bound.is_none_or(|(lo, hi)| pk_ranges_overlap(pk_min(run), pk_max(run), lo.pk_bytes(), hi.pk_bytes()))
-        })
+    pub(super) fn runs_overlapping<'s, 'b>(
+        &'s self,
+        bound: Option<(&'b [u8], &'b [u8])>,
+    ) -> impl Iterator<Item = &'s Rc<Batch>> + use<'s, 'b> {
+        self.runs
+            .iter()
+            .rev()
+            .map(|run| &run.batch)
+            .filter(move |run| bound.is_none_or(|(lo, hi)| pk_ranges_overlap(pk_min(run), pk_max(run), lo, hi)))
     }
 
     fn batches(&self) -> impl Iterator<Item = &Rc<Batch>> {
         self.runs.iter().map(|run| &run.batch)
     }
 
-    /// Visit each run holding `key`, newest first, with its rows of that key;
-    /// `fingerprint` is `key`'s [`probe_key`].
-    pub(super) fn find_pk_bytes(
-        &self,
-        key: &[u8],
-        fingerprint: u64,
-        mut visitor: impl FnMut(&Rc<Batch>, Range<usize>),
-    ) {
-        if !self.may_contain(fingerprint) {
-            return;
-        }
-        for run in self.runs.iter().rev() {
-            if let Some(rows) = run.probe(key, fingerprint) {
-                visitor(&run.batch, rows);
-            }
-        }
-    }
-
-    /// [`Self::find_pk_bytes`]'s first run.
+    /// Each run holding `key`, newest first, with its rows of that key;
+    /// `fingerprint` is `key`'s [`probe_key`]. The set's PK bloom is consulted
+    /// once, on the call, and a run is probed only once the walk reaches it.
     #[inline]
-    pub(super) fn newest_holding(&self, key: &[u8], fingerprint: u64) -> Option<(&Rc<Batch>, Range<usize>)> {
-        if !self.may_contain(fingerprint) {
-            return None;
-        }
-        for run in self.runs.iter().rev() {
-            if let Some(rows) = run.probe(key, fingerprint) {
-                return Some((&run.batch, rows));
-            }
-        }
-        None
+    pub(super) fn holding<'s, 'k>(&'s self, key: &'k [u8], fingerprint: u64) -> Holding<'s, 'k> {
+        let runs: &[HeldRun] = if self.may_contain(fingerprint) { &self.runs } else { &[] };
+        Holding { runs, key, fingerprint }
     }
 
     /// How many runs this set holds — one cursor source each.
@@ -373,6 +354,30 @@ impl HeldRun {
 fn bloom_add_batch(bloom: &mut BloomFilter, batch: &Batch) {
     for i in 0..batch.len() {
         bloom.add(probe_key(batch.get_pk_bytes(i)));
+    }
+}
+
+/// [`RunSet::holding`]'s walk: a loop of its own rather than an adaptor
+/// chain, which the per-key probes do not inline.
+pub(super) struct Holding<'s, 'k> {
+    /// The runs not yet walked, oldest first.
+    runs: &'s [HeldRun],
+    key: &'k [u8],
+    fingerprint: u64,
+}
+
+impl<'s> Iterator for Holding<'s, '_> {
+    type Item = (&'s Rc<Batch>, Range<usize>);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((run, rest)) = self.runs.split_last() {
+            self.runs = rest;
+            if let Some(rows) = run.probe(self.key, self.fingerprint) {
+                return Some((&run.batch, rows));
+            }
+        }
+        None
     }
 }
 

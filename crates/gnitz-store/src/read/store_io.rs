@@ -44,8 +44,14 @@ impl RelationRegistry {
                 keyed_as(relation.schema().pk_stride())?;
                 let table = relation.table_or_err()?;
                 let mut echo = Batch::empty_with_schema(&relation.probe_reply_schema(probe)?);
+                // A unique store's key nets 0 or 1, which its unique probe decides
+                // without summing every tier.
+                let unique = relation.unique_rows();
                 keys.iter()
-                    .filter(|k| table.has_pk_bytes(k))
+                    .filter(|k| match unique {
+                        Some(rows) => rows.unique_live_row_at(k).is_some(),
+                        None => table.has_pk_bytes(k),
+                    })
                     .for_each(|key| echo.push_key_row(key, 1));
                 Ok(echo)
             }
