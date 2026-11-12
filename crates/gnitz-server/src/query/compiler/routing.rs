@@ -134,23 +134,35 @@ fn placement(
     if sources.values().all(|s| s.placement().is_replicated()) {
         return Placement::Replicated;
     }
+    // An exchange leaves each row on the owner of the key it scatters by, the PK
+    // its operator emits, wherever its input sat; every path back to one keeps
+    // each row on its worker and that PK region.
+    if behind_exchanges(circuit, circuit.out()) {
+        return Placement::full_pk(view);
+    }
     if sources.values().any(|s| !s.placement().is_key_routed()) {
         return Placement::Local;
     }
-    let moves = circuit
-        .ops()
-        .any(|(_, op)| matches!(op, OpNode::Join(_)) || op.exchanges());
-    match scanned_row_locally(circuit, circuit.out()) {
+    match circuit.op(row_local_origin(circuit, circuit.out())) {
         // The view's PK region is this source's, byte for byte, and its rows sit on
         // that source's owner only while nothing relays its delta. Every source
         // stating a scatter key counts as relayed here, even one whose scatter
         // key routes to its native owner: Local is safe then.
-        Some(tid) if uses[&tid].key.is_none() => sources[&tid].placement(),
-        Some(_) => Placement::Local,
-        // Behind a join or an exchange the rows sit on their own key's owner.
-        None if moves => Placement::full_pk(view),
-        None => Placement::Local,
+        OpNode::ScanDelta { source, .. } if uses[source].key.is_none() => sources[source].placement(),
+        OpNode::ScanDelta { .. } => Placement::Local,
+        // Behind a join over key-routed sources the rows sit on their own key's owner.
+        _ if circuit.ops().any(|(_, op)| matches!(op, OpNode::Join(_))) => Placement::full_pk(view),
+        _ => Placement::Local,
     }
+}
+
+/// True iff every path back from `nid` reaches an exchange through nodes that
+/// keep each row on its worker with the PK region intact.
+fn behind_exchanges(circuit: &Circuit, nid: NodeId) -> bool {
+    let op = circuit.op(nid);
+    let row_local =
+        keeps_rows_and_pk_region(op) || matches!(op, OpNode::Negate | OpNode::Union | OpNode::WeightClamp(_));
+    op.exchanges() || row_local && circuit.inputs(nid).iter().all(|&n| behind_exchanges(circuit, n))
 }
 
 // ---------------------------------------------------------------------------

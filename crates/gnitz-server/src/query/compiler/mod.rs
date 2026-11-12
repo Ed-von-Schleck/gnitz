@@ -67,9 +67,6 @@ pub(super) struct CompileOutput {
     sources: Box<[(u64, Scan)]>,
     /// `Some` iff the view is capacity-bounded.
     pub(in crate::query) hydration: Option<Replay>,
-    /// Each worker computes the view's whole result locally: it is replicated, or
-    /// there is one worker.
-    pub(in crate::query) self_contained: bool,
 }
 
 impl CompileOutput {
@@ -108,7 +105,6 @@ pub(super) fn compile_view(
         vm,
         sources: sources.into_boxed_slice(),
         hydration: None,
-        self_contained: meta.self_contained,
     };
     if bounded {
         output.hydration = Some(derive_hydration(circuit, &meta, &output, &regs, &integrals)?);

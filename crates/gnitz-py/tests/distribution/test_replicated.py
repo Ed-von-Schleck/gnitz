@@ -19,7 +19,7 @@ import pytest
 from _serverproc import NEEDS_MULTI
 from _read import bag, rows, scanned
 from _shapes import ONE_SOURCE_OPS, agg, groups, known, setop
-from _sql import churn, insert, values
+from _sql import churn, insert, inserting, values
 
 pytestmark = NEEDS_MULTI
 
@@ -154,6 +154,77 @@ def test_every_write_reaches_every_copy(client):
         for k in range(1, 5):
             assert bag(client.seek(jid, j_schema, pk=k), "fid", "r2", "nm") == {
                 row: 1 for row, r1 in joined.items() if r1 == k}, (sql, k)
+
+
+# ── A view behind an exchange sits on its own key's owner ────────────────────
+
+def test_an_aggregate_over_a_replicated_join_is_read_from_its_keys_owner(client):
+    """`fact ⋈ dim` beside a replicated `dim` leaves each match on its fact's
+    worker, and the GROUP BY over it exchanges every row to its group's owner:
+    the aggregate is placed by its own key whatever placed the join under it.
+
+    So a read bounded to one group asks one worker, and a view grouped again on
+    that key, or joined on it, moves nothing. Were a group's row anywhere but on
+    its owner, the bounded read would miss it while the scan still found it, and
+    the views over it would split one group across workers — each a row at a
+    partial count, which only the weights and the sums tell from the right one.
+    `band_n` is the same over a band join, whose output the planner shards.
+    """
+    client.execute_sql(
+        "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL)" + _REPL + "; "
+        "CREATE TABLE fact (id BIGINT NOT NULL PRIMARY KEY, r BIGINT NOT NULL, x BIGINT NOT NULL); "
+        "CREATE TABLE label (grp BIGINT NOT NULL PRIMARY KEY, tag BIGINT NOT NULL); "
+        "CREATE VIEW agg AS SELECT dim.grp AS grp, COUNT(*) AS n, SUM(fact.x) AS s "
+        "FROM fact JOIN dim ON fact.r = dim.id GROUP BY dim.grp; "
+        "CREATE VIEW again AS SELECT grp, SUM(n) AS n FROM agg GROUP BY grp; "
+        "CREATE VIEW tagged AS SELECT agg.grp AS grp, agg.s AS s, label.tag AS tag "
+        "FROM agg JOIN label ON agg.grp = label.grp; "
+        "CREATE VIEW band AS SELECT fact.id AS f, dim.id AS d "
+        "FROM fact JOIN dim ON fact.r = dim.id AND fact.x <= dim.grp; "
+        "CREATE VIEW band_n AS SELECT d, COUNT(*) AS n FROM band GROUP BY d")
+    agg_id, agg_schema = client.resolve_table("agg")
+
+    facts = {i: (i % 9 + 1, i) for i in range(1, 61)}
+    steps = [
+        inserting("dim", {d: d % 5 for d in range(1, 7)}),
+        inserting("label", {g: 100 + g for g in range(0, 4)}),
+        inserting("fact", facts),
+        inserting("dim", {d: d % 5 for d in range(7, 10)}),
+        ("UPDATE dim SET grp = 3 WHERE id IN (1, 6)", "dim", {1: 3, 6: 3}),
+        ("UPDATE fact SET x = x + 7 WHERE id <= 12", "fact",
+         {i: (facts[i][0], facts[i][1] + 7) for i in range(1, 13)}),
+        ("DELETE FROM dim WHERE id = 4", "dim", {4: None}),
+        ("DELETE FROM fact WHERE id > 45", "fact", dict.fromkeys(range(46, 61))),
+        ("DELETE FROM label WHERE grp = 3", "label", {3: None}),
+    ]
+    state = {"dim": {}, "fact": {}, "label": {}}
+    for sql in churn(client, state, steps):
+        dims, labels = state["dim"], state["label"]
+        by_grp = groups(((dims[r], x) for r, x in state["fact"].values() if r in dims),
+                        lambda row: row[0])
+        want = {g: (len(rs), sum(x for _, x in rs)) for g, rs in by_grp.items()}
+        banded = Counter(r for r, x in state["fact"].values() if r in dims and x <= dims[r])
+
+        assert bag(scanned(client, "agg"), "grp", "n", "s") == {
+            (g, n, s): 1 for g, (n, s) in want.items()}, sql
+        for g in range(0, 6):
+            one = {(g, *want[g]): 1} if g in want else {}
+            assert bag(rows(client, f"SELECT grp, n, s FROM agg WHERE grp = {g}")) == one, (sql, g)
+            assert bag(client.seek(agg_id, agg_schema, pk=g), "grp", "n", "s") == one, (sql, g)
+        assert bag(scanned(client, "again"), "grp", "n") == {
+            (g, n): 1 for g, (n, _) in want.items()}, sql
+        assert bag(scanned(client, "tagged"), "grp", "s", "tag") == {
+            (g, s, labels[g]): 1 for g, (_, s) in want.items() if g in labels}, sql
+        assert bag(scanned(client, "band_n"), "d", "n") == dict.fromkeys(banded.items(), 1), sql
+
+    # A view of the same body created now is a pure backfill of the same rows.
+    client.execute_sql(
+        "CREATE VIEW again2 AS SELECT grp, SUM(n) AS n FROM agg GROUP BY grp; "
+        "CREATE VIEW tagged2 AS SELECT agg.grp AS grp, agg.s AS s, label.tag AS tag "
+        "FROM agg JOIN label ON agg.grp = label.grp")
+    assert bag(scanned(client, "again2"), "grp", "n") == bag(scanned(client, "again"), "grp", "n")
+    assert bag(scanned(client, "tagged2"), "grp", "s", "tag") == bag(
+        scanned(client, "tagged"), "grp", "s", "tag")
 
 
 # ── Every shape over every replicated placement ──────────────────────────────

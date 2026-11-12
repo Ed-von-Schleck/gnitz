@@ -390,9 +390,11 @@ fn a_circuit_routing_cannot_stand_behind_is_rejected() {
 // ── Placement ───────────────────────────────────────────────────────────
 
 /// A view's rows sit where its circuit leaves them: on every worker when every
-/// source is replicated, on its own key's owner behind an exchange or a join, on
-/// a source's owner while the walk back from the output keeps that source's PK
-/// region and nothing relays its delta — and otherwise wherever they were produced.
+/// source is replicated; on its own key's owner when every path back from its
+/// output reaches an exchange, whatever placed its sources, or behind a join over
+/// key-routed sources; on a source's owner while the walk back from the output
+/// keeps that source's PK region and nothing relays its delta; and otherwise
+/// wherever they were produced.
 #[test]
 fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
     use TypeCode::{I64, U32, U64};
@@ -402,7 +404,7 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
     let clustered = Source::from(schema).placed(Placement::keyed(&schema, 1));
     let inherited = clustered.placement;
     let replicated = clustered.placed(Placement::Replicated);
-    let cases: [(&str, Build, [Source; 2], Placement); 10] = [
+    let cases: [(&str, Build, [Source; 2], Placement); 16] = [
         (
             "a bare scan re-emits its source's PK region",
             |c| _ = scan(c, 7),
@@ -489,6 +491,67 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
         (
             "a source whose rows no key places",
             |c| _ = scan(c, 7),
+            [clustered.placed(Placement::Local); 2],
+            Placement::Local,
+        ),
+        (
+            "a shard moves the rows to the view's own key, whatever placed its source",
+            |c| {
+                let a = scan(c, 7);
+                c.shard(a);
+            },
+            [clustered.placed(Placement::Local); 2],
+            Placement::full_pk(&schema),
+        ),
+        (
+            "a reduce moves each row to its group's owner, whatever placed its source",
+            |c| {
+                let a = scan(c, 7);
+                c.reduce(a, count_by(&[3]));
+            },
+            [clustered.placed(Placement::Local); 2],
+            Placement::Keyed { dist_stride: 8 },
+        ),
+        (
+            "a join beside a replicated partner leaves each match on the other side's worker",
+            |c| {
+                let deltas = [7, 9].map(|s| scan_keyed(c, s, &[(3, I64)]));
+                c.join(deltas, deltas, JoinKind::Equi);
+            },
+            [replicated, clustered],
+            Placement::Local,
+        ),
+        (
+            "a shard behind that join moves its rows to the view's own key",
+            |c| {
+                let deltas = [7, 9].map(|s| scan_keyed(c, s, &[(3, I64)]));
+                let j = c.join(deltas, deltas, JoinKind::Equi);
+                c.shard(j);
+            },
+            [replicated, clustered],
+            Placement::Keyed { dist_stride: 8 },
+        ),
+        (
+            "a set op over sharded leaves keeps each row on its own key's owner",
+            |c| {
+                let [a, b] = [7, 9].map(|s| {
+                    let a = scan(c, s);
+                    c.shard(a)
+                });
+                let u = c.union(a, b);
+                c.distinct(u);
+            },
+            [replicated, clustered.placed(Placement::Local)],
+            Placement::full_pk(&schema),
+        ),
+        (
+            "a union beside an unsharded leaf leaves its rows wherever they were produced",
+            |c| {
+                let a = scan(c, 7);
+                let a = c.shard(a);
+                let b = scan(c, 9);
+                c.union(a, b);
+            },
             [clustered.placed(Placement::Local); 2],
             Placement::Local,
         ),

@@ -116,6 +116,13 @@ impl DagEngine {
         Ok(placement)
     }
 
+    /// View `view_id`'s registration.
+    fn registered(&mut self, view_id: u64) -> Result<&mut RegisteredView, String> {
+        self.views
+            .get_mut(&view_id)
+            .ok_or_else(|| format!("view {view_id} is not registered"))
+    }
+
     /// Whether view `id` is a chain segment whose store no reduce of its own
     /// reads back.
     fn passes_through(&self, id: u64) -> bool {
@@ -180,13 +187,6 @@ impl DagEngine {
         self.rebuilt_with(invalid)
     }
 
-    /// The views every boot rebuilds whatever their stores hold: those a stream or
-    /// a system family reaches, and their chains — a subset of what the boot
-    /// verdict rejects, so a checkpoint round has no reason to publish one.
-    pub(crate) fn never_resumed(&self, registry: &RelationRegistry) -> FxHashSet<u64> {
-        self.rebuilt_with(self.over_unreplayed_sources(registry))
-    }
-
     /// The views reached by a relation whose deltas no boot replays into a kept
     /// view. Boot replays a base table's tail alone: a stream's rows are gone, and
     /// a system family's tail is applied before any view exists.
@@ -221,31 +221,37 @@ impl DagEngine {
 
     // ── Operator state ──────────────────────────────────────────────────
 
-    /// The operator state a round at `generation` stamps, of every view
-    /// `checkpointed` picks: the round that stamps a view's output store stamps
-    /// its traces with it, run or not, so the next boot finds them at one
-    /// generation. A view whose state this process never opened has traces
-    /// untouched since they were published at the mark its output store resumed
-    /// from; when that mark is `generation` they are already stamped, so the
-    /// round leaves them closed, and otherwise opens them to restamp them.
-    pub(crate) fn ephemeral_states<'a>(
-        &'a mut self,
-        registry: &RelationRegistry,
+    /// The checkpoint round at `generation`: persist the operator traces, output
+    /// store and indexes of every view a boot can resume, and every table's
+    /// indexes. The views every boot rebuilds whatever their stores hold — those a
+    /// stream or a system family reaches, and their chains — are a subset of what
+    /// the boot verdict rejects, so the round publishes none of them.
+    ///
+    /// The round that stamps a view's output store stamps its traces with it, run
+    /// or not, so the next boot finds them at one generation. A view whose state
+    /// this process never opened has traces untouched since they were published at
+    /// the mark its output store resumed from; when that mark is `generation` they
+    /// are already stamped, so the round leaves them closed, and otherwise opens
+    /// them to restamp them.
+    pub(crate) fn checkpoint_ephemeral(
+        &mut self,
+        registry: &mut RelationRegistry,
         generation: u64,
-        checkpointed: impl Fn(u64) -> bool,
-    ) -> Result<Vec<&'a mut CircuitState>, String> {
+    ) -> Result<(), String> {
+        let never = self.rebuilt_with(self.over_unreplayed_sources(registry));
+        let resumes = |id: u64| !never.contains(&id);
         let stamped = |id: u64| {
             registry
                 .relation(id)
                 .is_some_and(|r| r.loaded_mark() == Some(generation))
         };
-        let views = self
+        let states = self
             .views
             .iter_mut()
-            .filter(|(&id, v)| checkpointed(id) && (v.state.is_some() || !stamped(id)));
-        views
+            .filter(|(&id, v)| resumes(id) && (v.state.is_some() || !stamped(id)))
             .map(|(&id, v)| open_state(&mut v.state, registry, id, v.code.vm.layout()))
-            .collect()
+            .collect::<Result<Vec<_>, String>>()?;
+        registry.checkpoint_ephemeral(states, generation, resumes)
     }
 
     /// Whether this process has opened view `view_id`'s operator state.
@@ -269,17 +275,17 @@ fn open_state<'a>(
     Ok(state.as_mut().expect("opened above"))
 }
 
-/// `view_id`'s plan, beside the stores a run of it reads: its operator state,
-/// opened on a miss, and `unfed`, the sources it has been fed no row of.
-fn opened<'a>(
-    views: &'a mut FxHashMap<u64, RegisteredView>,
-    registry: &'a RelationRegistry,
-    view_id: u64,
-    unfed: &'a [u64],
-) -> Result<(&'a mut CompileOutput, vm::Stores<'a>), String> {
-    let RegisteredView { code, state, .. } = views
-        .get_mut(&view_id)
-        .ok_or_else(|| format!("view {view_id} is not registered"))?;
-    let own = open_state(state, registry, view_id, code.vm.layout())?;
-    Ok((code, vm::Stores { own, registry, unfed }))
+impl RegisteredView {
+    /// The plan of this view, `view_id`, beside the stores a run of it reads: its
+    /// operator state, opened on a miss, and `unfed`, the sources it has been fed
+    /// no row of.
+    fn opened<'a>(
+        &'a mut self,
+        registry: &'a RelationRegistry,
+        view_id: u64,
+        unfed: &'a [u64],
+    ) -> Result<(&'a mut CompileOutput, vm::Stores<'a>), String> {
+        let own = open_state(&mut self.state, registry, view_id, self.code.vm.layout())?;
+        Ok((&mut self.code, vm::Stores { own, registry, unfed }))
+    }
 }

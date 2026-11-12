@@ -29,14 +29,9 @@ impl CatalogEngine {
         })
     }
 
-    /// The ephemeral checkpoint round: persist the operator traces, output store
-    /// and indexes of every view a boot can resume, and every table's indexes, at
-    /// `generation`.
+    /// The ephemeral checkpoint round at `generation`.
     pub(crate) fn flush_ephemeral_round(&mut self, generation: u64) -> Result<(), String> {
-        let never = self.dag.never_resumed(&self.registry);
-        let resumes = |id| !never.contains(&id);
-        let states = self.dag.ephemeral_states(&self.registry, generation, resumes)?;
-        self.registry.checkpoint_ephemeral(states, generation, resumes)
+        self.dag.checkpoint_ephemeral(&mut self.registry, generation)
     }
 
     /// Remove every relation and index directory no live entity owns. Only sound once

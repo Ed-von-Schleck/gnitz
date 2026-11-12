@@ -40,7 +40,7 @@ fn run_view_epoch(
 
 /// Start view `view_id`'s epoch over `input`, `src_id`'s delta, given where
 /// `take` and lent otherwise, as [`vm::start`] runs it. `None` where the epoch
-/// idles: its delta is empty and reaches no round. `unfed` as [`opened`]'s.
+/// idles: its delta is empty and reaches no round. `unfed` as [`RegisteredView::opened`]'s.
 fn start_epoch(
     host: &mut impl DriveHost,
     view_id: u64,
@@ -51,15 +51,15 @@ fn start_epoch(
 ) -> Result<Option<vm::Ran>, String> {
     let (dag, registry) = host.parts();
     // A view's run reaches it only from a source its circuit scans.
-    let code = &dag.views[&view_id].code;
-    let reg = code.scan(src_id).seed;
+    let view = dag.registered(view_id)?;
+    let reg = view.code.scan(src_id).seed;
     let seed = input.filter(|input| !input.is_empty());
     // An empty delta still runs its round, on every worker, whatever this one
     // holds. One that runs none is skipped before its view's stores are opened.
-    if seed.is_none() && code.vm.idles_on_empty(reg) {
+    if seed.is_none() && view.code.vm.idles_on_empty(reg) {
         return Ok(None);
     }
-    let (code, mut stores) = opened(&mut dag.views, registry, view_id, unfed)?;
+    let (code, mut stores) = view.opened(registry, view_id, unfed)?;
     vm::start(&mut code.vm, &mut stores, reg, seed, take).map(Some)
 }
 
@@ -73,7 +73,7 @@ fn resume_epoch(
     unfed: &[u64],
 ) -> Result<vm::Ran, String> {
     let (dag, registry) = host.parts();
-    let (code, mut stores) = opened(&mut dag.views, registry, view_id, unfed)?;
+    let (code, mut stores) = dag.registered(view_id)?.opened(registry, view_id, unfed)?;
     vm::resume(&mut code.vm, &mut stores, epoch, rows)
 }
 
@@ -112,10 +112,10 @@ fn relay_operand(
 // ── DAG traversal driver ────────────────────────────────────────────────
 
 /// Whether this process mints the row a global aggregate owes over an empty input: each
-/// process holding the view's whole input does, else the one worker the empty group's
-/// exchange sends every row to.
-fn mints_ground_row(slot: Slot, self_contained: bool) -> bool {
-    self_contained || slot.rank as usize == algebra::ground_owner(slot.of as usize)
+/// process of a replicated view does, holding its whole input, else the one worker the
+/// empty group's exchange sends every row to.
+fn mints_ground_row(slot: Slot, replicated: bool) -> bool {
+    replicated || slot.rank as usize == algebra::ground_owner(slot.of as usize)
 }
 
 /// Seal `source` and run its whole dependent closure over what the seal answers,
@@ -134,8 +134,9 @@ pub(crate) fn backfill(host: &mut impl DriveHost, view: u64) -> Result<(), Strin
     let chunk_rows = registry.scan_chunk_rows();
     let mut gathered = Vec::new();
     // No source has fed the view yet.
-    let (code, mut stores) = opened(&mut dag.views, registry, view, &sources)?;
-    if mints_ground_row(registry.slot(), code.self_contained) {
+    let replicated = registry.relation_or_err(view)?.placement().is_replicated();
+    let (code, mut stores) = dag.registered(view)?.opened(registry, view, &sources)?;
+    if mints_ground_row(registry.slot(), replicated) {
         let minted = vm::mint_ground_rows(&mut code.vm, &mut stores)?;
         registry.ingest(view, minted)?;
     }
