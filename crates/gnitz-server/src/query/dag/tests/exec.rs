@@ -400,7 +400,7 @@ fn a_backfill_at_the_cut_and_the_ticks_above_it_fill_a_join_once() {
             engine.registry.ingest(tid, make_batch(&schema, &sealed[i])).unwrap();
             engine
                 .registry
-                .ingest_pending(tid, make_batch(&schema, &above[i]))
+                .ingest_with(tid, make_batch(&schema, &above[i]), PkRule::Enforce, true)
                 .unwrap();
         }
 

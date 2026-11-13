@@ -35,7 +35,7 @@ fn a_pin_answers_as_the_store_stood_whatever_it_takes_after() {
     let before = batch_rows(&r.scan_spec(TID, rows_spec(None, None), layout, None).unwrap());
     assert_eq!(before, (0..80).map(|k| (k, 1, 1)).collect::<Vec<_>>());
 
-    r.pin(7).unwrap();
+    let pin = r.pin();
     // Overwrite every row, delete half, and keep spilling and flushing so the
     // pinned runs are folded away and their shard files retired.
     for i in 0..8 {
@@ -50,19 +50,13 @@ fn a_pin_answers_as_the_store_stood_whatever_it_takes_after() {
     let live = batch_rows(&r.scan_spec(TID, rows_spec(None, None), layout, None).unwrap());
     assert_eq!(live, (40..80).map(|k| (k, 1, 2)).collect::<Vec<_>>());
     assert_eq!(
-        batch_rows(&r.pinned_page(7, TID, &page(layout, MAX_PAGE_ROWS)).unwrap()),
+        batch_rows(&pin.page(TID, &page(layout, MAX_PAGE_ROWS)).unwrap()),
         before
     );
-
-    r.unpin(7);
-    assert!(r.snapshots.is_empty());
-    r.unpin(7);
-    let err = r.pinned_page(7, TID, &page(layout, 1)).err().unwrap();
-    assert!(err.contains("not pinned"), "{err}");
 }
 
 #[test]
-fn a_pin_holds_only_what_its_process_publishes_and_its_id_is_its_own() {
+fn a_pin_holds_only_what_its_process_publishes() {
     let schema = make_schema_u64_i64();
     let tmp = tempfile::tempdir().unwrap();
     // A master publishes the system families' stores alone: a base table's is a
@@ -70,15 +64,12 @@ fn a_pin_holds_only_what_its_process_publishes_and_its_id_is_its_own() {
     let mut r = RelationRegistry::master(tmp.path().to_str().unwrap(), 1, StoreConfig::default());
     r.register_at(spec(TID, RelationKind::BaseTable, schema), schema, &[], None)
         .unwrap();
-    r.pin(1).unwrap();
-    let err = r.pinned_page(1, TID, &page(schema.layout_digest(), 1)).err().unwrap();
+    let pin = r.pin();
+    let err = pin.page(TID, &page(schema.layout_digest(), 1)).err().unwrap();
     assert!(err.contains("holds no relation"), "{err}");
-    assert!(r.pin(1).is_err());
-    assert_eq!(r.snapshots.len(), 1);
-    assert!(!r.pins(1, TID));
+    assert!(!pin.holds(TID));
 
     // An origin publishes every store it registers.
-    let mut origin = relation_fixture(RelationKind::BaseTable, schema, &[], [round(0, 3, 1)]);
-    origin.pin(1).unwrap();
-    assert!(origin.pins(1, TID));
+    let origin = relation_fixture(RelationKind::BaseTable, schema, &[], [round(0, 3, 1)]);
+    assert!(origin.pin().holds(TID));
 }

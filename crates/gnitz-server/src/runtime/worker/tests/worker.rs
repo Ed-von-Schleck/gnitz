@@ -12,6 +12,7 @@ use crate::test_support::{
     scan_all, table_engine, u64_i64_cols, weighted_rows,
 };
 use gnitz_store::read::Probe;
+use gnitz_store::relation::PkRule;
 use gnitz_wire::{PkColList, PkKeys, ReadBound, ReadSpec, TypeCode, WireStatus};
 use gnitz_zset::algebra::ScatterPlan;
 use gnitz_zset::schema::SchemaDescriptor;
@@ -166,7 +167,7 @@ fn a_two_tid_tick_group_ticks_both_and_acks_its_end() {
         );
         engine
             .registry
-            .ingest_pending(tid, make_batch_raw(&schema, &[(tid, 1, 10)]))
+            .ingest_with(tid, make_batch_raw(&schema, &[(tid, 1, 10)]), PkRule::Enforce, true)
             .unwrap();
     }
     let (mut wp, sal, rx) = test_worker(&mut engine);
@@ -231,8 +232,8 @@ fn a_parked_view_read_answers_ahead_of_the_read_behind_it_on_its_lease() {
     assert_eq!(owed(&wp.replies), [("parked", 1), ("train", 1)]);
     assert!(frames(&rx).is_empty(), "nothing of the lease passes its parked read");
 
-    let cat = &mut *wp.catalog;
-    wp.replies.answer_parked(|read| answer(cat, read));
+    wp.replies
+        .answer_parked(|read| answer(wp.catalog, &mut wp.snapshots, read));
     assert_eq!(owed(&wp.replies), [("train", 1)]);
     drain(&mut wp.replies);
     let out = frames(&rx);
@@ -412,7 +413,7 @@ fn a_push_behind_a_two_source_tick_waits_for_the_next() {
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     engine
         .registry
-        .ingest_pending(t1, make_batch_raw(&schema, &[(7, 1, 70)]))
+        .ingest_with(t1, make_batch_raw(&schema, &[(7, 1, 70)]), PkRule::Enforce, true)
         .unwrap();
     let (mut wp, sal, rx) = test_worker(&mut engine);
 

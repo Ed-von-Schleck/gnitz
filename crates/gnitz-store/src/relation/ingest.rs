@@ -137,48 +137,39 @@ impl RelationRegistry {
     // Each verb is one lookup and one call, inlined into its caller: out of
     // line, a batch moving through it by value is copied once more.
 
-    /// Apply `batch` to `id`'s store and its index projections, moving it in.
-    /// Every batch is consolidated, a base table's after its PK rule; a stream
-    /// writes nothing, holding no rows.
-    #[inline]
+    /// [`Self::ingest_with`] at the cut, under [`PkRule::Enforce`].
+    #[inline(always)]
     pub fn ingest(&mut self, id: u64, batch: Batch) -> Result<(), String> {
-        self.ingest_under(id, batch, PkRule::Enforce)
+        self.ingest_with(id, batch, PkRule::Enforce, false)
     }
 
-    /// [`Self::ingest`], a base table's under `rule`.
-    #[inline]
-    pub fn ingest_under(&mut self, id: u64, batch: Batch, rule: PkRule) -> Result<(), String> {
+    /// Apply `batch` to `id`'s store and its index projections, moving it in.
+    /// Every batch is consolidated, a base table's after `rule`; a stream writes
+    /// nothing, holding no rows. At `pending` the rows land above the cut: every
+    /// reader sees them but one at [`Cut::Sealed`](super::Cut::Sealed), until
+    /// [`Self::seal`] answers them, and a view is refused.
+    #[inline(always)]
+    pub fn ingest_with(&mut self, id: u64, batch: Batch, rule: PkRule, pending: bool) -> Result<(), String> {
         let relation = self.relation_mut_or_err(id)?;
-        // Rows left above the cut would stay there: nothing seals a relation no
-        // view reads.
-        if relation.has_pending() {
-            relation.seal()?;
-        }
-        relation
-            .apply(batch, Landing::Cut { round: None, echo: false }, rule)
-            .map(drop)
-    }
-
-    /// [`Self::ingest`] above `id`'s cut: every reader sees the rows but one at
-    /// [`Cut::Sealed`](super::Cut::Sealed), until [`Self::seal`] answers them.
-    /// A view is refused.
-    #[inline]
-    pub fn ingest_pending(&mut self, id: u64, batch: Batch) -> Result<(), String> {
-        self.ingest_pending_under(id, batch, PkRule::Enforce)
-    }
-
-    /// [`Self::ingest_pending`], a base table's under `rule`.
-    #[inline]
-    pub fn ingest_pending_under(&mut self, id: u64, batch: Batch, rule: PkRule) -> Result<(), String> {
-        let relation = self.relation_mut_or_err(id)?;
-        if relation.kind().is_view() {
-            return Err(format!("relation {id} is a view: its rows land only at the cut"));
-        }
-        relation.apply(batch, Landing::Pending, rule).map(drop)
+        let landing = match pending {
+            true if relation.kind().is_view() => {
+                return Err(format!("relation {id} is a view: its rows land only at the cut"));
+            }
+            true => Landing::Pending,
+            false => {
+                // Rows left above the cut would stay there: nothing seals a
+                // relation no view reads.
+                if relation.has_pending() {
+                    relation.seal()?;
+                }
+                Landing::Cut { round: None, echo: false }
+            }
+        };
+        relation.apply(batch, landing, rule).map(drop)
     }
 
     /// [`Self::ingest`], without its seal of pending rows (a view holds none:
-    /// [`Self::ingest_pending`] refuses one), of one round of view `id`'s
+    /// [`Self::ingest_with`] refuses one), of one round of view `id`'s
     /// output, captured as round `round` by the delta feed this process serves
     /// for it; the batch as applied comes back iff `echo` and it holds a row.
     #[inline]
@@ -201,7 +192,7 @@ impl RelationRegistry {
     pub fn clear_rows(&mut self, id: u64) -> Result<(), String> {
         let entry = self.relation_mut_or_err(id)?;
         debug_assert!(entry.kind().is_view() && entry.feed().is_none());
-        entry.rows.held_mut().clear();
+        entry.table_mut().clear();
         entry
             .indexes
             .iter_mut()
@@ -217,7 +208,7 @@ impl RelationRegistry {
     /// included: no manifest publish, no barrier, and nothing of the relation's
     /// indexes. Unregistered is an `Err`.
     pub fn settle(&mut self, id: u64) -> Result<(), String> {
-        let store = self.relation_mut_or_err(id)?.rows.held_mut();
+        let store = self.relation_mut_or_err(id)?.table_mut();
         store.settle().map_err(|e| format!("settle relation {id}: {e}"))
     }
 
@@ -233,9 +224,10 @@ impl RelationRegistry {
 
     /// The bytes `id`'s next published manifest carries beside its rows.
     pub fn set_caller_record(&mut self, id: u64, record: Vec<u8>) -> Result<(), String> {
-        self.relation_mut_or_err(id)?
-            .table_mut_or_err()?
-            .set_caller_record(record);
+        let entry = self.relation_mut_or_err(id)?;
+        let (kind, id) = (entry.kind(), entry.id());
+        let table = entry.rows.table_mut().ok_or_else(|| super::no_store(kind, id))?;
+        table.set_caller_record(record);
         Ok(())
     }
 

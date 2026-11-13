@@ -1,5 +1,5 @@
 use super::*;
-use crate::relation::{IndexClaim, RelationKind};
+use crate::relation::{IndexClaim, PkRule, RelationKind};
 use crate::test_support::{
     batch_rows, col_range, img, make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture, zset_of,
     RelationFixture, Rng, TID,
@@ -145,7 +145,7 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
 
     // One pending row inside the range, one outside it.
     let pending = make_batch_raw(&make_schema_u64_i64(), &[(NBASE, 1, 555), (NBASE + 1, 1, 9_000)]);
-    r.ingest_pending(TID, pending).unwrap();
+    r.ingest_with(TID, pending, PkRule::Enforce, true).unwrap();
     let with_pending = || {
         let mut rows = rows(50..60);
         rows.push((NBASE, 1, 555));

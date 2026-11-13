@@ -1,5 +1,5 @@
-//! The relation registry — what relations this process holds, the stores
-//! behind them, and the snapshots of those stores it has pinned (`snapshot`).
+//! The relation registry — what relations this process holds and the stores
+//! behind them, and the [`Snapshot`]s of those stores it hands out.
 //!
 //! Every relation enters through [`RelationRegistry::register_at`].
 
@@ -30,6 +30,7 @@ pub use circuit_state::{CircuitState, StateIdx, StateLayout};
 pub use dirs::{lock_data_dir, relation_dir, ChildAddr, ChildKind, DirLock};
 pub use disk_usage::{disk_usage, DiskUsage};
 use feed::Feed;
+pub use snapshot::Snapshot;
 use store::{not_held, Rows};
 pub use unique_pk::PkRule;
 
@@ -57,7 +58,8 @@ enum IndexStore {
     /// row's entry `[span ‖ PK]` is its PK with the span's leading bytes
     /// repeated, in the owner's PK order. No process keeps a store for it.
     OwnerPk,
-    /// A store of its own, which another process holds: the master's state.
+    /// A store of its own, which this process does not hold because it holds no
+    /// store of the owner's rows: the master's state.
     NotHeld,
 }
 
@@ -227,7 +229,7 @@ impl RelationKind {
     /// Whether every key of a store of this kind nets 0 or 1, so the newest run
     /// holding a key decides it.
     #[inline]
-    pub fn nets_unit_per_key(self) -> bool {
+    pub(crate) fn nets_unit_per_key(self) -> bool {
         matches!(self, RelationKind::BaseTable | RelationKind::SystemCatalog)
     }
 
@@ -367,6 +369,30 @@ impl Relation {
         self.spec.placement
     }
 
+    /// `Ok` iff this relation may carry a secondary index, `unique` or not.
+    fn admit_index(&self, unique: bool) -> Result<(), String> {
+        let (id, kind) = (self.id(), self.kind());
+        if !kind.admits_index() {
+            return Err(format!(
+                "Index: owner {id} is a {}; only a base table or a view without a capacity can be indexed",
+                kind.noun()
+            ));
+        }
+        if unique && kind.is_view() {
+            return Err(format!(
+                "Index: view {id} cannot carry a UNIQUE index: its circuit cannot refuse a duplicate"
+            ));
+        }
+        // An index walk gathers every row under an in-range entry's source PK, so
+        // a second row under that PK would come back whatever its own key.
+        if self.pk_repeats() {
+            return Err(format!(
+                "Index: owner {id} repeats its primary key, so an index entry does not name one row"
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether two of its rows may share a PK.
     pub fn pk_repeats(&self) -> bool {
         self.spec.pk_repeats
@@ -464,19 +490,22 @@ impl Relation {
     }
 
     /// This process's store of the relation; panics when it holds none.
+    #[track_caller]
     pub(crate) fn table(&self) -> &Table {
-        self.rows.held()
+        let Some(t) = self.rows.table() else { not_held() };
+        t
+    }
+
+    /// [`Self::table`] as `&mut`.
+    #[track_caller]
+    fn table_mut(&mut self) -> &mut Table {
+        let Some(t) = self.rows.table_mut() else { not_held() };
+        t
     }
 
     /// [`Self::table`], `Err` when this process holds no store of the relation.
     pub(crate) fn table_or_err(&self) -> Result<&Table, String> {
         self.rows.table().ok_or_else(|| no_store(self.kind(), self.id()))
-    }
-
-    /// [`Self::table_or_err`] as `&mut`.
-    pub(crate) fn table_mut_or_err(&mut self) -> Result<&mut Table, String> {
-        let (kind, id) = (self.kind(), self.id());
-        self.rows.table_mut().ok_or_else(|| no_store(kind, id))
     }
 }
 
@@ -570,8 +599,6 @@ pub struct RelationRegistry {
     pub(crate) config: StoreConfig,
     /// What this process is to the stores it registered.
     residency: Residency,
-    /// The snapshots this process holds pinned, by id.
-    snapshots: FxHashMap<u64, snapshot::Pinned>,
 }
 
 impl RelationRegistry {
@@ -586,7 +613,6 @@ impl RelationRegistry {
                 ..config
             },
             residency: Residency::Origin,
-            snapshots: FxHashMap::default(),
         }
     }
 
@@ -678,28 +704,10 @@ impl RelationRegistry {
         self.relation(id).ok_or_else(|| Self::unregistered(id))
     }
 
-    /// `owner`, if it may carry a secondary index, `unique` or not. Every path
-    /// that enters an index asks here.
+    /// `owner`, if it may carry a secondary index, `unique` or not.
     pub fn index_owner(&self, owner: u64, unique: bool) -> Result<&Relation, String> {
         let e = self.relation_or_err(owner)?;
-        if !e.kind().admits_index() {
-            return Err(format!(
-                "Index: owner {owner} is a {}; only a base table or a view without a capacity can be indexed",
-                e.kind().noun()
-            ));
-        }
-        if unique && e.kind().is_view() {
-            return Err(format!(
-                "Index: view {owner} cannot carry a UNIQUE index: its circuit cannot refuse a duplicate"
-            ));
-        }
-        // An index walk gathers every row under an in-range entry's source PK, so
-        // a second row under that PK would come back whatever its own key.
-        if e.pk_repeats() {
-            return Err(format!(
-                "Index: owner {owner} repeats its primary key, so an index entry does not name one row"
-            ));
-        }
+        e.admit_index(unique)?;
         Ok(e)
     }
 

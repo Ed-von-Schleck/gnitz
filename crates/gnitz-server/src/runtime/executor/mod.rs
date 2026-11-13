@@ -25,7 +25,7 @@ mod tick;
 mod validate;
 mod write;
 
-use std::cell::{Cell, Ref, RefMut};
+use std::cell::{Cell, Ref};
 use std::os::fd::{AsFd, OwnedFd};
 use std::rc::Rc;
 use std::time::Duration;
@@ -123,10 +123,6 @@ impl Shared {
 
     fn cat(&self) -> Ref<'_, CatalogEngine> {
         self.dispatcher.cat()
-    }
-
-    fn cat_mut(&self) -> RefMut<'_, CatalogEngine> {
-        self.dispatcher.cat_mut()
     }
 
     /// Drop the per-relation state of a relation whose DROP is durable: every

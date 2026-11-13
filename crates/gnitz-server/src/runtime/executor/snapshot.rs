@@ -13,15 +13,16 @@
 use super::{cork_train, decode_fault, Shared};
 use crate::runtime::reactor::{Peer, SendBody};
 use crate::runtime::sal::Read;
+use gnitz_store::relation::Snapshot;
 use gnitz_wire::snapshot::PageRequest;
 use gnitz_wire::{ControlHeader, WireFault};
 
 /// The snapshots one connection may hold at a time.
 const MAX_SNAPSHOTS_PER_CONNECTION: usize = 4;
 
-/// The snapshots one connection holds.
+/// The snapshots one connection holds, by id, each with the master's own pin.
 #[derive(Default)]
-pub(super) struct HeldSnapshots(Vec<u64>);
+pub(super) struct HeldSnapshots(Vec<(u64, Snapshot)>);
 
 /// SNAPSHOT_OPEN: pin, and hold the snapshot for this connection.
 pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u64, WireFault> {
@@ -32,13 +33,12 @@ pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u6
     shared.last_snapshot.set(id);
     // No DDL moves the catalog between the master's pin and the workers'.
     let catalog = shared.catalog_rwlock.read().await;
+    let mut pinned = None;
     let cut = shared
         .dispatcher
         .scan_cut(|cut| {
-            // The master pins only once the workers' Pin group is written, so
-            // a refused cut pinned nothing.
             cut.read(Read::Pin { snapshot: id })?;
-            (shared.cat_mut().registry.pin(id)).expect("a snapshot id is fresh this boot");
+            pinned = Some(shared.cat().registry.pin());
             Ok(())
         })
         .await;
@@ -48,7 +48,7 @@ pub(super) async fn open(shared: &Shared, held: &mut HeldSnapshots) -> Result<u6
         release(shared, id).await;
         return Err(e);
     }
-    held.0.push(id);
+    held.0.push((id, pinned.expect("an accepted cut pinned")));
     Ok(id)
 }
 
@@ -66,12 +66,12 @@ pub(super) async fn page(
     blob: &[u8],
 ) -> Result<(), WireFault> {
     let (id, tid) = (hdr.arg0, hdr.target_id);
-    if !held.0.contains(&id) {
+    let Some((_, pin)) = held.0.iter().find(|(h, _)| *h == id) else {
         return Err(format!("snapshot {id} is not this connection's").into());
-    }
+    };
     let request = PageRequest::decode(blob).map_err(decode_fault)?;
-    if shared.cat().registry.pins(id, tid) {
-        let rows = shared.cat().registry.pinned_page(id, tid, &request)?;
+    if pin.holds(tid) {
+        let rows = pin.page(tid, &request)?;
         cork_train(peer, tid, &rows)?;
     } else {
         let read = Read::SnapshotPage { snapshot: id, tid, page: blob };
@@ -90,7 +90,7 @@ pub(super) async fn page(
 
 /// SNAPSHOT_CLOSE: release snapshot `id` this connection holds.
 pub(super) async fn close(shared: &Shared, held: &mut HeldSnapshots, id: u64) -> Result<(), WireFault> {
-    let Some(at) = held.0.iter().position(|&h| h == id) else {
+    let Some(at) = held.0.iter().position(|(h, _)| *h == id) else {
         return Err(format!("snapshot {id} is not this connection's").into());
     };
     held.0.swap_remove(at);
@@ -100,17 +100,17 @@ pub(super) async fn close(shared: &Shared, held: &mut HeldSnapshots, id: u64) ->
 
 /// Release every snapshot a connection that has ended held.
 pub(super) async fn release_all(shared: &Shared, held: HeldSnapshots) {
-    for id in held.0 {
+    for (id, pin) in held.0 {
+        drop(pin);
         release(shared, id).await;
     }
 }
 
-/// Release snapshot `id` here and on every worker. A worker that cannot answer
+/// Release snapshot `id` on every worker. A worker that cannot answer
 /// the release has left the cluster, which ends the server; the one failure
 /// returned is the SAL refusing the Unpin group, after which the workers keep
 /// the pin until restart, so it is logged rather than fail-stopped.
 async fn release(shared: &Shared, id: u64) {
-    shared.cat_mut().registry.unpin(id);
     let released = shared.dispatcher.command(Read::Unpin { snapshot: id }).await;
     if let Err(e) = released {
         gnitz_warn!("snapshot {id}: release failed: {}", e.text);

@@ -1,4 +1,4 @@
-use crate::relation::{ChildKind, RelationKind};
+use crate::relation::{ChildKind, PkRule, RelationKind};
 use crate::storage::{read_at, read_intact};
 use crate::test_support::{
     assert_index_holds, id_rows, make_batch_raw, make_schema_u64_i64, pk_u64_two_i64_schema, relation_fixture, zset_of,
@@ -57,11 +57,11 @@ fn only_the_ephemeral_round_publishes_an_index() {
 
 /// A view's rows land only at the cut, so pending rows are refused for one.
 #[test]
-fn ingest_pending_refuses_a_view() {
+fn pending_rows_are_refused_for_a_view() {
     let schema = make_schema_u64_i64();
     let mut registry = relation_fixture(RelationKind::View(ViewBudget::Plain), schema, &[], []);
     let err = registry
-        .ingest_pending(TID, make_batch_raw(&schema, &[(1, 1, 10)]))
+        .ingest_with(TID, make_batch_raw(&schema, &[(1, 1, 10)]), PkRule::Enforce, true)
         .unwrap_err();
     assert!(err.contains("is a view"), "{err}");
     assert!(registry.seal(TID).unwrap().is_none());
@@ -80,10 +80,12 @@ fn a_seal_answers_the_pending_rows_as_the_pk_rule_left_them() {
         &[],
         [rows(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)])],
     );
-    registry.ingest_pending(TID, rows(&[(1, 1, 11)])).unwrap();
+    registry
+        .ingest_with(TID, rows(&[(1, 1, 11)]), PkRule::Enforce, true)
+        .unwrap();
     // The second upsert of key 1 retracts the pending row, not the stored one.
     registry
-        .ingest_pending(TID, rows(&[(1, 1, 12), (2, -1, 20), (4, 1, 40)]))
+        .ingest_with(TID, rows(&[(1, 1, 12), (2, -1, 20), (4, 1, 40)]), PkRule::Enforce, true)
         .unwrap();
     let delta = registry.seal(TID).unwrap().expect("rows sat above the cut");
     assert!(delta.is_consolidated());
@@ -93,7 +95,9 @@ fn a_seal_answers_the_pending_rows_as_the_pk_rule_left_them() {
     );
     assert!(registry.seal(TID).unwrap().is_none(), "a seal drains the pending rows");
 
-    registry.ingest_pending(TID, rows(&[(3, -1, 30)])).unwrap();
+    registry
+        .ingest_with(TID, rows(&[(3, -1, 30)]), PkRule::Enforce, true)
+        .unwrap();
     registry.ingest(TID, rows(&[(5, 1, 50)])).unwrap();
     assert!(
         registry.seal(TID).unwrap().is_none(),

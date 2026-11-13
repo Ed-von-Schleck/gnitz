@@ -161,13 +161,10 @@ fn unique_pk_bench() {
                     let (eff, e) = counter.measure(|| enforce_unique_pk(table, probe));
                     eff_rows += eff.len() as u64;
                     drop(eff);
-                    let ((), w) = counter.measure(|| match tick {
-                        None => r.ingest_under(TID, b, rule).unwrap(),
-                        Some(rows) => {
-                            r.ingest_pending(TID, b).unwrap();
-                            if push * per % rows == 0 {
-                                black_box(r.seal(TID).unwrap());
-                            }
+                    let ((), w) = counter.measure(|| {
+                        r.ingest_with(TID, b, rule, tick.is_some()).unwrap();
+                        if tick.is_some_and(|rows| push * per % rows == 0) {
+                            black_box(r.seal(TID).unwrap());
                         }
                     });
                     enforce += e;

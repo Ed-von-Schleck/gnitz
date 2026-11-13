@@ -204,10 +204,7 @@ impl CatalogEngine {
             family.name()
         );
         let id = family.id();
-        match above {
-            true => self.registry.ingest_pending(id, batch.clone()),
-            false => self.registry.ingest(id, batch.clone()),
-        }?;
+        self.registry.ingest_with(id, batch.clone(), PkRule::Enforce, above)?;
         self.fire_hooks(family, batch)
     }
 
@@ -221,10 +218,7 @@ impl CatalogEngine {
         if !kind.is_ingestion_point() {
             return Err(format!("relation {tid} is a {}, not an ingestion point", kind.noun()));
         }
-        match self.dag.is_scanned(tid) {
-            true => self.registry.ingest_pending_under(tid, batch, rule),
-            false => self.registry.ingest_under(tid, batch, rule),
-        }
+        self.registry.ingest_with(tid, batch, rule, self.dag.is_scanned(tid))
     }
 
     /// Apply one DdlSync group: above the store's cut when a view scans the

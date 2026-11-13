@@ -18,12 +18,13 @@ use crate::runtime::mesh::Mesh;
 use crate::runtime::sal::{Apply, Inbound, Ingest, Read, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use gnitz_foundation::fault::Seam;
-use gnitz_store::relation::IndexClaim;
+use gnitz_store::relation::{IndexClaim, Snapshot};
 use gnitz_wire::TypeCode;
 use gnitz_wire::{PkKeys, WireFault};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 use reply::{Replies, Rows};
+use rustc_hash::FxHashMap;
 
 pub(super) struct WorkerProcess<'c> {
     catalog: &'c mut CatalogEngine,
@@ -32,6 +33,8 @@ pub(super) struct WorkerProcess<'c> {
     /// for a SAL group or an exchange part.
     mesh: Mesh,
     replies: Replies,
+    /// The snapshots this worker holds pinned, by id.
+    snapshots: FxHashMap<u64, Snapshot>,
     /// A source of the `Tick` group being run is still to be sealed. Each tick
     /// seals its source as it starts, and a seal takes every row pending: a push
     /// written behind the group must not be applied ahead of one.
@@ -53,6 +56,7 @@ impl<'c> WorkerProcess<'c> {
             sal_reader,
             mesh,
             replies: Replies::new(w2m_writer),
+            snapshots: FxHashMap::default(),
             seals_ahead: false,
         }
     }
@@ -121,7 +125,7 @@ impl<'c> WorkerProcess<'c> {
                 {
                     self.replies.park(route, &read);
                 } else {
-                    let answer = answer(cat, &read);
+                    let answer = answer(cat, &mut self.snapshots, &read);
                     self.replies.reply(route, answer);
                 }
                 true
@@ -154,8 +158,8 @@ impl<'c> WorkerProcess<'c> {
                 self.replies.applied(self.sal_reader.position());
                 // Before the next group: a parked read answers from the state its
                 // drive left.
-                let cat = &mut *self.catalog;
-                self.replies.answer_parked(|read| answer(cat, read));
+                self.replies
+                    .answer_parked(|read| answer(self.catalog, &mut self.snapshots, read));
                 true
             }
         }
@@ -202,9 +206,13 @@ impl<'c> WorkerProcess<'c> {
     }
 }
 
-/// Answer `read`. A function of the catalog alone: it cannot reach the mesh, so
-/// answering a read never enters an exchange wait.
-fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
+/// Answer `read`. A function of the catalog and this worker's pins: it cannot
+/// reach the mesh, so answering a read never enters an exchange wait.
+fn answer(
+    cat: &mut CatalogEngine,
+    snapshots: &mut FxHashMap<u64, Snapshot>,
+    read: &Read<'_>,
+) -> Result<Rows, WireFault> {
     // Each arm builds its own `Ok`: wrapped around the whole match, every answer
     // would be copied at the width of the widest one.
     match *read {
@@ -238,17 +246,22 @@ fn answer(cat: &mut CatalogEngine, read: &Read<'_>) -> Result<Rows, WireFault> {
         }
         // A worker holds no system family a snapshot reads: the master answers
         // those from its own pin.
+        // The master hands out each id once a boot.
         Read::Pin { snapshot } => {
-            cat.registry.pin(snapshot)?;
+            let prior = snapshots.insert(snapshot, cat.registry.pin());
+            debug_assert!(prior.is_none(), "snapshot {snapshot} pinned twice");
             Ok(no_rows())
         }
         Read::Unpin { snapshot } => {
-            cat.registry.unpin(snapshot);
+            snapshots.remove(&snapshot);
             Ok(no_rows())
         }
         Read::SnapshotPage { snapshot, tid, page } => {
             let page = gnitz_wire::snapshot::PageRequest::decode(page)?;
-            Ok(Rows::from(cat.registry.pinned_page(snapshot, tid, &page)?))
+            let pin = snapshots
+                .get(&snapshot)
+                .ok_or_else(|| format!("snapshot {snapshot} is not pinned"))?;
+            Ok(Rows::from(pin.page(tid, &page)?))
         }
         Read::Backup { dir } => {
             cat.registry.link_published_into(dir)?;

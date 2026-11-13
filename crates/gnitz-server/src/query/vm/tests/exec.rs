@@ -6,7 +6,7 @@ use crate::test_support::{
     cmp_all, join_reference, make_batch_u128, make_batch_u128_raw, make_schema_u128_i64, register_full_pk,
     weighted_rows, zset_of,
 };
-use gnitz_store::relation::{RelationKind, StoreConfig};
+use gnitz_store::relation::{PkRule, RelationKind, StoreConfig};
 use gnitz_wire::{AggDescriptor, AggFunc, JoinKind, TypeCode, ViewBudget};
 use gnitz_zset::algebra::{Placement, Slot};
 use gnitz_zset::schema::SchemaColumn;
@@ -363,7 +363,7 @@ fn a_join_over_its_source_reads_it_up_to_its_cut() {
     let sealed = make_batch_u128(&schema, &[(1, 1, 100), (2, 1, 200)]);
     vm.registry.ingest(TABLE, sealed.clone()).unwrap();
     let pending = make_batch_u128(&schema, &[(2, -1, 200), (3, 1, 300)]);
-    vm.registry.ingest_pending(TABLE, pending).unwrap();
+    vm.registry.ingest_with(TABLE, pending, PkRule::Enforce, true).unwrap();
 
     let delta = make_batch_u128(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     let (want, rows) = join_reference(JoinKind::Equi, false, &schema, &schema, &delta, &sealed);

@@ -90,7 +90,11 @@ impl Relation {
     /// payload columns `read` names, as in [`Self::open_sealed`]. A store whose
     /// keys net 0 or 1 answers each whole key it is asked for by its probe
     /// instead of a cursor seek.
-    pub fn open_read(&self, bound: ReadBound, read: u64) -> Result<(SourceCursor<'_>, Option<KeyRange>), String> {
+    pub(crate) fn open_read(
+        &self,
+        bound: ReadBound,
+        read: u64,
+    ) -> Result<(SourceCursor<'_>, Option<KeyRange>), String> {
         self.open_source(bound, Cut::Now, self.unique_rows(), read)
     }
 

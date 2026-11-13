@@ -1,5 +1,6 @@
 //! The read rung — the `ReadSpec` executor and the store read verbs, as
-//! `impl RelationRegistry` and `impl Relation` blocks over `relation`.
+//! `impl RelationRegistry`, `impl Relation` and `impl Snapshot` blocks over
+//! `relation`.
 //!
 //! What is decided here is which source serves a bound — the store, or an index
 //! over it — and who hydrates a skeleton row. The filter `scan_spec` drives is

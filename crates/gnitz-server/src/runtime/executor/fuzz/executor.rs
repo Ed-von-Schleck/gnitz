@@ -16,7 +16,7 @@
 //! store. A transaction lands whole or not at all. The effective delta of any
 //! other push is worked out with the workers, which only a server has.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::family::TxnFamily;
 use super::write::{admit_push, admit_push_txn};
@@ -26,7 +26,7 @@ use crate::test_support::{left_join_circuit, left_join_cols, sys_batch, table_bl
 use gnitz_fuzz::input::Input;
 use gnitz_fuzz::seed::{Frame, Seed, Seeds, SEEDS_ENV};
 use gnitz_store::read::Probe;
-use gnitz_store::relation::RelationKind;
+use gnitz_store::relation::{RelationKind, Snapshot};
 use gnitz_wire::txn_frame::{decode_scan_multi, encode_items, FrameItem, ScanItem};
 use gnitz_wire::{append_frame, ControlHeader, PkKeys, ReadSpec};
 use gnitz_zset::repr::{Batch, BatchBuilder, MemBatch};
@@ -73,8 +73,9 @@ struct Session {
     round: u64,
     /// The tables a push has filled.
     filled: HashSet<u64>,
-    /// The last snapshot id handed out.
-    snapshots: u64,
+    /// The snapshots pinned, by id, and the last id handed out.
+    snapshots: HashMap<u64, Snapshot>,
+    last_snapshot: u64,
 }
 
 impl Session {
@@ -83,7 +84,8 @@ impl Session {
             cat: CatalogEngine::open(path, 1).expect("a fresh catalog opens"),
             round: 1,
             filled: HashSet::new(),
-            snapshots: 0,
+            snapshots: HashMap::new(),
+            last_snapshot: 0,
         }
     }
 
@@ -127,17 +129,20 @@ impl Session {
                 }
             }
             ClientVerb::AllocIds => drop(self.cat.reserve_catalog_ids(ctrl.hdr.arg0, &mut |_, _| Ok(()))),
-            // One process is both the master and its worker, so it pins both.
+            // One process is both the master and its worker: an origin
+            // publishes every store, so its one pin holds what both would.
             ClientVerb::SnapshotOpen => {
-                self.snapshots += 1;
-                self.cat.registry.pin(self.snapshots).expect("a fresh snapshot id pins");
+                self.last_snapshot += 1;
+                self.snapshots.insert(self.last_snapshot, self.cat.registry.pin());
             }
             ClientVerb::SnapshotPage => {
                 if let Ok(page) = gnitz_wire::snapshot::PageRequest::decode(&frame[ctrl.blob.clone()]) {
-                    drop(self.cat.registry.pinned_page(ctrl.hdr.arg0, ctrl.hdr.target_id, &page));
+                    if let Some(pin) = self.snapshots.get(&ctrl.hdr.arg0) {
+                        drop(pin.page(ctrl.hdr.target_id, &page));
+                    }
                 }
             }
-            ClientVerb::SnapshotClose => self.cat.registry.unpin(ctrl.hdr.arg0),
+            ClientVerb::SnapshotClose => drop(self.snapshots.remove(&ctrl.hdr.arg0)),
             // Each reads, or moves, nothing a circuit runs over.
             ClientVerb::Resolve
             | ClientVerb::AllocSerialRange

@@ -133,12 +133,12 @@ pub(super) fn subdir_names(path: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// The directory of every child of `dir` that `pick` selects; a name in no
-/// child grammar is never selected.
+/// The name of every child of `dir` that `pick` selects; a name in no child
+/// grammar is never selected.
 fn children(dir: &str, pick: impl Fn(&ChildAddr) -> bool) -> Result<Vec<String>, String> {
-    let names = subdir_names(dir)?;
-    let picked = names.iter().filter_map(|n| ChildAddr::parse(n)).filter(|c| pick(c));
-    Ok(picked.map(|c| c.dir(dir)).collect())
+    let mut names = subdir_names(dir)?;
+    names.retain(|n| ChildAddr::parse(n).is_some_and(|c| pick(&c)));
+    Ok(names)
 }
 
 /// `<base_dir>/LOCK` — the file whose `flock` makes a data directory
@@ -243,7 +243,11 @@ impl RelationRegistry {
         let dir = relation_dir(&self.base_dir, id);
         // Durably first: a child's manifest carries the record a reopen would revive.
         let fail = |e: String| format!("erase relation {id} (dir={dir}): {e}");
-        let stores = children(&dir, |_| true).map_err(fail)?;
+        let stores: Vec<String> = children(&dir, |_| true)
+            .map_err(fail)?
+            .iter()
+            .map(|n| format!("{dir}/{n}"))
+            .collect();
         retire_stores(&stores).map_err(|e| fail(e.to_string()))?;
         if let Err(e) = fs::remove_dir_all(&dir) {
             gnitz_debug!("relation: failed to erase relation dir {}: {}", dir, e);
@@ -312,7 +316,7 @@ impl RelationRegistry {
                 continue;
             };
             let of = self.slot.of;
-            dead.extend(children(&dir, |c| {
+            let picked = children(&dir, |c| {
                 c.slot.of != of
                     || match c.kind {
                         ChildKind::Index(cols) => entry
@@ -323,7 +327,8 @@ impl RelationRegistry {
                         }
                         ChildKind::Rows => false,
                     }
-            })?);
+            })?;
+            dead.extend(picked.iter().map(|n| format!("{dir}/{n}")));
         }
         gnitz_debug!("relation: reclaiming {} child dir(s) under {}", dead.len(), root);
         retire_stores(&dead).map_err(|e| format!("reclaim the children no relation owns under '{root}': {e}"))
@@ -346,12 +351,8 @@ impl RelationRegistry {
                 pairs.push((src_rel, dst_rel));
                 continue;
             }
-            let names = subdir_names(&src_rel)?;
-            let own = names
-                .iter()
-                .filter_map(|n| ChildAddr::parse(n))
-                .filter(|c| c.slot == self.slot);
-            pairs.extend(own.map(|c| (c.dir(&src_rel), c.dir(&dst_rel))));
+            let own = children(&src_rel, |c| c.slot == self.slot)?;
+            pairs.extend(own.iter().map(|n| (format!("{src_rel}/{n}"), format!("{dst_rel}/{n}"))));
         }
         link_stores(&pairs).map_err(|e| format!("put the published stores into '{dest}': {e}"))
     }

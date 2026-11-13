@@ -1,5 +1,5 @@
 //! What this process holds of one relation's rows ([`Rows`]). Every row verb is
-//! the `Table`'s own, reached through `held`.
+//! the `Table`'s own, reached through `Relation::table`.
 
 use super::feed::Feed;
 use crate::storage::Table;
@@ -60,24 +60,6 @@ impl Rows {
         match self {
             Rows::Held { table, .. } => Some(table),
             Rows::Absent(_) | Rows::Stream { .. } => None,
-        }
-    }
-
-    /// The `Table` this process holds; panics when it holds none.
-    #[track_caller]
-    pub(super) fn held(&self) -> &Table {
-        match self.table() {
-            Some(t) => t,
-            None => not_held(),
-        }
-    }
-
-    /// [`Self::held`] as `&mut`.
-    #[track_caller]
-    pub(super) fn held_mut(&mut self) -> &mut Table {
-        match self.table_mut() {
-            Some(t) => t,
-            None => not_held(),
         }
     }
 
