@@ -114,10 +114,9 @@ impl RelationRegistry {
         let filled = targets.len();
         if filled > 0 {
             // One chunked scan of the owner fills every target.
-            let mut source = entry.rows.held().open_cursor(Cut::Now);
             // An entry reads its row's PK and key columns alone.
             let keys = targets.iter().flat_map(|ix| ix.cols.as_slice().iter().copied());
-            source.skip_payload(entry.unread(entry.schema().payload_bits(keys)));
+            let mut source = entry.open_cursor(Cut::Now, entry.schema().payload_bits(keys));
             while let Some(chunk) = source.drain_chunk(chunk_rows) {
                 for ix in targets.iter_mut() {
                     ix.project_and_ingest(&chunk).map_err(|e| {

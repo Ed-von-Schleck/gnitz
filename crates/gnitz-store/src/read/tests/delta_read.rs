@@ -162,8 +162,7 @@ fn cases() -> Vec<Case> {
         ReadBound::PkSet(PkKeys::from_images(16, images))
     };
     const SET: [(i64, u64); 6] = [(-3, 0), (-1, 2), (0, 0), (0, 5), (2, 1), (3, 3)];
-    // Most keys the model draws: under the lagging subscriber's rounds, more
-    // probes than a keyed read gathers, so it walks the band.
+    // Most keys the model draws, so a round's keyed rows are most of it.
     let wide: Vec<(i64, u64)> = (-3..=3).flat_map(|k2| (0..5).map(move |k1| (k2, k1))).collect();
     let range = col_range(3, img(-1), img(1));
     let none = || ReadBound::None;

@@ -668,6 +668,7 @@ fn a_drain_writes_skipped_payload_columns_as_zeroes() {
     // Every other key, the deleted ones among them, and an index entry `(pk, pk)`
     // for every third live key.
     let keys = || PkKeys::from_sorted(8, (0..200u64).step_by(2).flat_map(u64::to_be_bytes).collect());
+    let none = || PkKeys::from_sorted(8, Vec::new());
     let index_schema = crate::test_support::pk_only_schema(&[TypeCode::I64, TypeCode::U64]);
     let mut entries = BatchBuilder::new(&index_schema);
     for pk in (0..200u64).step_by(3).filter(|pk| pk % 10 != 0) {
@@ -680,14 +681,18 @@ fn a_drain_writes_skipped_payload_columns_as_zeroes() {
     let open = |label| match label {
         "merged" => SourceCursor::Full(merged()),
         "single" => SourceCursor::Full(create_read_cursor(&[], &[Rc::clone(&old)], schema)),
-        "pk set" => SourceCursor::PkSet(KeyGather::Merge(PkSetGather::over(merged(), keys()))),
-        "index range" => SourceCursor::Bounded(Box::new(BoundedIndexCursor::new(index_cursor(), merged()))),
-        "unique pk set" => SourceCursor::PkSet(KeyGather::unique(&unique, schema, keys())),
-        _ => SourceCursor::Bounded(Box::new(BoundedIndexCursor::new_unique(
-            index_cursor(),
-            &unique,
-            schema,
-        ))),
+        "pk set" => SourceCursor::Keyed {
+            gather: KeyGather::Merge(PkSetGather::over(merged(), keys())),
+            walk: None,
+        },
+        "index range" => {
+            SourceCursor::index_walk(index_cursor(), KeyGather::Merge(PkSetGather::over(merged(), none())))
+        }
+        "unique pk set" => SourceCursor::Keyed {
+            gather: KeyGather::unique(&unique, schema, keys()),
+            walk: None,
+        },
+        _ => SourceCursor::index_walk(index_cursor(), KeyGather::unique(&unique, schema, none())),
     };
     assert!(
         create_read_cursor(&[], &[Rc::clone(&old)], schema).mode.is_some(),

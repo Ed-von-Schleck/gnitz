@@ -124,7 +124,8 @@ impl SecondaryIndex {
     /// span, in span order: this index's store, or `owner`'s.
     pub(crate) fn span_cursor(&self, owner: &Relation) -> ReadCursor {
         match self.store {
-            IndexStore::OwnerPk => owner.cursor(),
+            // A span is a prefix of the owner's PK, so no payload column is read.
+            IndexStore::OwnerPk => owner.open_cursor(Cut::Now, 0),
             _ => self.cursor(),
         }
     }
@@ -136,16 +137,14 @@ impl SecondaryIndex {
             IndexStore::OwnerPk => {
                 let key_size = self.key_spec.key_size();
                 let mut entry = Vec::with_capacity(key_size + owner.schema().pk_stride());
-                owner
-                    .table()
-                    .gather(spans, Cut::Now)
-                    .for_each_positive_capped(cap, |c| {
-                        let pk = c.current_pk_bytes();
-                        entry.clear();
-                        entry.extend_from_slice(&pk[..key_size]);
-                        entry.extend_from_slice(pk);
-                        f(&entry);
-                    });
+                // A span is a prefix of the owner's PK, so no payload column is read.
+                owner.gather(spans, Cut::Now, 0).for_each_positive_capped(cap, |c| {
+                    let pk = c.current_pk_bytes();
+                    entry.clear();
+                    entry.extend_from_slice(&pk[..key_size]);
+                    entry.extend_from_slice(pk);
+                    f(&entry);
+                });
             }
             _ => self
                 .held()
@@ -225,6 +224,13 @@ pub enum RelationKind {
 }
 
 impl RelationKind {
+    /// Whether every key of a store of this kind nets 0 or 1, so the newest run
+    /// holding a key decides it.
+    #[inline]
+    pub fn nets_unit_per_key(self) -> bool {
+        matches!(self, RelationKind::BaseTable | RelationKind::SystemCatalog)
+    }
+
     /// What a client is told this relation is.
     #[inline]
     pub fn class(self) -> gnitz_wire::RelClass {
@@ -388,6 +394,15 @@ impl Relation {
         self.table().open_cursor(Cut::Now)
     }
 
+    /// Non-compacting cursor over the rows `cut` reads, for a reader of the
+    /// payload columns `read` names, as payload bits: the cursor may write every
+    /// other column as zeroes.
+    pub(crate) fn open_cursor(&self, cut: Cut, read: u64) -> ReadCursor {
+        let mut cursor = self.table().open_cursor(cut);
+        cursor.skip_payload(self.unread(read));
+        cursor
+    }
+
     /// Every live row of `keys` — whole PKs, or the same leading columns of one,
     /// each then naming every row it prefixes — among the rows `cut` reads, for
     /// a reader of the payload columns `read` names, as payload bits.
@@ -412,10 +427,7 @@ impl Relation {
     /// The live row at `key`, if there is one, of a base table or a system
     /// family, whose every key nets 0 or 1.
     pub fn unique_live_row_at(&self, key: &[u8]) -> Option<StoredRow> {
-        debug_assert!(matches!(
-            self.kind(),
-            RelationKind::BaseTable | RelationKind::SystemCatalog
-        ));
+        debug_assert!(self.kind().nets_unit_per_key());
         self.table().unique_live_row_at(key)
     }
 

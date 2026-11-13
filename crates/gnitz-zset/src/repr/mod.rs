@@ -44,8 +44,8 @@ pub use batch_wire::WireRows;
 pub use merge::merge_consolidated;
 pub use pool::PooledBuf;
 pub use read_cursor::{
-    empty_cursor, from_runs, from_runs_at, from_runs_in_band, project_unique, BoundedIndexCursor, KeyGather,
-    PkSetGather, ReadCursor, SourceCursor, UniqueRows,
+    empty_cursor, from_runs, from_runs_at, from_runs_in_band, project_unique, IndexWalk, KeyGather, PkSetGather,
+    ReadCursor, SourceCursor, UniqueRows,
 };
 pub use run::{Run, StoredRow};
 pub use shard::{

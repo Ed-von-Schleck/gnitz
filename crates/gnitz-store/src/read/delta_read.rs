@@ -66,7 +66,7 @@ impl RelationRegistry {
         let chunk_rows = self.config.scan_chunk_rows;
         let mut read = |rows: Cow<'_, Batch>| plan.push(rows, &mut filter).map(drop);
         if let ReadBound::PkSet(keys) = &bound {
-            check_stride("delta_read", id, keys, view.pk_stride())?;
+            check_stride("delta_read", id, keys.stride(), view.pk_stride())?;
             // The keyed rows of every round, read a chunk at a time.
             let mut keyed = Vec::new();
             let mut chunk = Batch::empty_with_schema(&view);

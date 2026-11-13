@@ -1,5 +1,5 @@
 use super::*;
-use crate::relation::{Cut as At, RelationKind, RelationSpec, StoreConfig};
+use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
     batch_rows, between, col_range, cut, id_rows, img, make_batch_raw, make_schema_u64_i64, map_of, order_by,
     relation_fixture, relation_fixture_with, rows_spec, spec, spilling, zset_of, RelationFixture, Rng, TID,
@@ -367,12 +367,12 @@ fn an_index_walk_returns_exactly_its_range() {
     };
     for (col, start, end, walks, want) in walks {
         let bound = col_range(col, start, end);
-        let (cursor, _) = r
-            .relation(TID)
-            .unwrap()
-            .open_bound(bound.clone(), At::Now, u64::MAX)
-            .unwrap();
-        assert_eq!(matches!(cursor, SourceCursor::Bounded(_)), walks, "{bound:?}");
+        let (cursor, _) = r.relation(TID).unwrap().open_read(bound.clone(), u64::MAX).unwrap();
+        assert_eq!(
+            matches!(cursor, SourceCursor::Keyed { walk: Some(_), .. }),
+            walks,
+            "{bound:?}"
+        );
         let spec = |cut| ReadSpec {
             bound: bound.clone(),
             ..rows_spec(None, cut)
@@ -648,9 +648,8 @@ fn a_raw_drain_over_a_skeleton_run_panics() {
     let r = skeleton_fixture();
     r.relation(TID)
         .unwrap()
-        .open_bound(ReadBound::None, At::Now, u64::MAX)
+        .open_sealed(ReadBound::None, u64::MAX)
         .unwrap()
-        .0
         .drain_chunk(usize::MAX);
 }
 

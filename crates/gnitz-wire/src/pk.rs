@@ -227,12 +227,13 @@ impl PkKeys {
                 let (hi, lo) = k.split_at(NARROW_PK_MAX_BYTES);
                 [widen_pk_be(hi), widen_pk_be(lo)]
             };
-            return Self::sorted(stride, keys.map(words), |bytes, [hi, lo]| {
-                bytes.extend_from_slice(&hi.to_be_bytes());
-                bytes.extend_from_slice(&lo.to_be_bytes()[2 * NARROW_PK_MAX_BYTES - stride..]);
+            return Self::sorted(stride, keys.map(words), |slot, [hi, lo]| {
+                let (high, low) = slot.split_at_mut(NARROW_PK_MAX_BYTES);
+                high.copy_from_slice(&hi.to_be_bytes());
+                low.copy_from_slice(&lo.to_be_bytes()[2 * NARROW_PK_MAX_BYTES - stride..]);
             });
         }
-        Self::sorted(stride, keys, |bytes, k| bytes.extend_from_slice(k))
+        Self::sorted(stride, keys, |slot, k| slot.copy_from_slice(k))
     }
 
     /// Sort and dedup key images, each stored as its low `stride` bytes
@@ -242,24 +243,25 @@ impl PkKeys {
         assert!((1..=NARROW_PK_MAX_BYTES).contains(&stride), "PkKeys: stride {stride}");
         let images = images.into_iter();
         match stride <= 8 {
-            true => Self::sorted(stride, images.map(|v| v as u64), |bytes, v| {
-                bytes.extend_from_slice(&v.to_be_bytes()[8 - stride..])
+            true => Self::sorted(stride, images.map(|v| v as u64), |slot, v| {
+                slot.copy_from_slice(&v.to_be_bytes()[8 - stride..])
             }),
-            false => Self::sorted(stride, images, |bytes, v| {
-                bytes.extend_from_slice(&v.to_be_bytes()[16 - stride..])
+            false => Self::sorted(stride, images, |slot, v| {
+                slot.copy_from_slice(&v.to_be_bytes()[16 - stride..])
             }),
         }
     }
 
-    /// `items` sorted and deduped, each written by `write`; a list of at most
-    /// two items, and its bytes up to `MAX_PK_BYTES`, never touch the heap.
-    fn sorted<T: Ord>(stride: usize, items: impl Iterator<Item = T>, write: impl Fn(&mut PkBytes, T)) -> Self {
+    /// `items` sorted and deduped, each written by `write` into its `stride`
+    /// bytes; a list of at most two items, and its bytes up to `MAX_PK_BYTES`,
+    /// never touch the heap.
+    fn sorted<T: Ord>(stride: usize, items: impl Iterator<Item = T>, write: impl Fn(&mut [u8], T)) -> Self {
         let mut items: SmallVec<[T; 2]> = items.collect();
         items.sort_unstable();
         items.dedup();
-        let mut bytes = PkBytes::with_capacity(items.len() * stride);
-        for item in items {
-            write(&mut bytes, item);
+        let mut bytes = PkBytes::from_elem(0, items.len() * stride);
+        for (slot, item) in bytes.chunks_exact_mut(stride).zip(items) {
+            write(slot, item);
         }
         Self::new(stride, bytes)
     }

@@ -7,7 +7,7 @@ use gnitz_zset::algebra::Slot;
 use gnitz_zset::repr::{from_runs, from_runs_in_band, Batch};
 use gnitz_zset::schema::key_above;
 
-use super::check_layout;
+use super::{check_layout, check_stride};
 use crate::relation::RelationRegistry;
 
 impl RelationRegistry {
@@ -28,12 +28,7 @@ impl RelationRegistry {
         let mut cursor = match after {
             None => from_runs(runs, schema),
             Some(after) => {
-                if after.len() != schema.pk_stride() {
-                    return Err(format!(
-                        "pinned page of {id}: a key is not {} bytes",
-                        schema.pk_stride()
-                    ));
-                }
+                check_stride("pinned_page", id, after.len(), schema.pk_stride())?;
                 // No key sorts above the greatest one.
                 let Some(start) = key_above(after, after.len()) else {
                     return Ok(Batch::empty_with_schema(&schema));

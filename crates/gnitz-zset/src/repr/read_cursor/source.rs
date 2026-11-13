@@ -1,6 +1,6 @@
 //! [`SourceCursor`] — a chunked source of batches, whichever cursor backs it —
-//! [`BoundedIndexCursor`], the walk of a secondary-index range that gathers
-//! each entry's row, and [`KeyGather`], the rows of a key list.
+//! [`KeyGather`], the rows of a key list, and [`IndexWalk`], the walk of a
+//! secondary-index range that feeds a gather each entry's key.
 
 use gnitz_expr::RowFilter;
 use gnitz_wire::PkKeys;
@@ -12,15 +12,26 @@ use crate::repr::run::StoredRow;
 use crate::schema::{project_schema, SchemaDescriptor};
 use gnitz_expr::ColumnLocator;
 
-/// A chunked source of `Batch`es: a whole cursor, an index range, or a key list.
-// One per read, held on the reader's stack; boxing `Full` or `PkSet` would cost
-// every read an allocation. `Bounded` holds a cursor and a gather, so it stays boxed.
-#[allow(clippy::large_enum_variant)]
+/// A chunked source of `Batch`es: a whole cursor, or the rows of a key list.
+// An index walk holds a cursor beside the gather's, so it is boxed.
 pub enum SourceCursor<'a> {
     Full(ReadCursor),
-    Bounded(Box<BoundedIndexCursor<'a>>),
-    /// `pk IN (…)` gather over a listed key set.
-    PkSet(KeyGather<'a>),
+    /// The rows of a key list, resolved by `gather`: listed whole (`pk IN (…)`)
+    /// with no `walk`, or fed a refill at a time by an index range's `walk`.
+    Keyed {
+        gather: KeyGather<'a>,
+        walk: Option<Box<IndexWalk>>,
+    },
+}
+
+impl<'a> SourceCursor<'a> {
+    /// The walk of `idx` — a secondary-index range, positioned on it and
+    /// clamped at its end — gathering each entry's row through `gather`, which
+    /// holds no keys yet.
+    pub fn index_walk(idx: ReadCursor, gather: KeyGather<'a>) -> Self {
+        let walk = IndexWalk { idx, pks: Vec::new() };
+        SourceCursor::Keyed { gather, walk: Some(Box::new(walk)) }
+    }
 }
 
 impl SourceCursor<'_> {
@@ -29,13 +40,12 @@ impl SourceCursor<'_> {
     pub fn skip_payload(&mut self, skip: u64) {
         match self {
             SourceCursor::Full(c) => c.skip_payload(skip),
-            SourceCursor::Bounded(c) => c.src.skip_payload(skip),
-            SourceCursor::PkSet(g) => g.skip_payload(skip),
+            SourceCursor::Keyed { gather, .. } => gather.skip_payload(skip),
         }
     }
 
     /// The next non-empty source chunk, or `None` once the source is exhausted.
-    /// `PkSet` exceeds `max_rows` rather than split a PK group.
+    /// A key list's merge gather exceeds `max_rows` rather than split a PK group.
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
         SkeletonKeys::raw(|s| {
             self.drain_live_chunk(max_rows, s, &mut RowFilter::default())
@@ -92,10 +102,21 @@ impl SourceCursor<'_> {
         skeletons: &mut SkeletonKeys,
         filter: &mut RowFilter,
     ) -> Option<(Batch, bool)> {
-        match self {
-            SourceCursor::Full(c) => c.drain_live_chunk(max_rows, skeletons, filter),
-            SourceCursor::Bounded(c) => c.drain_live_chunk(max_rows, skeletons).map(|b| (b, false)),
-            SourceCursor::PkSet(g) => g.drain_live_chunk(max_rows, skeletons).map(|b| (b, false)),
+        let (gather, mut walk) = match self {
+            SourceCursor::Full(c) => return c.drain_live_chunk(max_rows, skeletons, filter),
+            SourceCursor::Keyed { gather, walk } => (gather, walk.as_deref_mut()),
+        };
+        loop {
+            if let Some(chunk) = gather.drain_live_chunk(max_rows, skeletons) {
+                debug_assert!(
+                    walk.is_none() || (1..chunk.len()).all(|i| chunk.get_pk_bytes(i - 1) != chunk.get_pk_bytes(i)),
+                    "index owner holds two rows under one PK"
+                );
+                return Some((chunk, false));
+            }
+            if !walk.as_mut()?.refill(gather, max_rows) {
+                return None;
+            }
         }
     }
 }
@@ -120,84 +141,43 @@ fn assert_hydration_matches(out: &Batch, keys: &PkKeys, coarse: &[i64]) {
     );
 }
 
-/// A walk of one secondary-index key range, gathering each entry's row from the
-/// relation it indexes, over one snapshot of each. The gather returns every row
-/// under an entry's source PK, so the walk is exact only over rows unique on
-/// their PK: a source PK then has one live row and at most one live index entry.
-pub struct BoundedIndexCursor<'a> {
-    /// Positioned on the index range and clamped at its end.
+/// The walk of one secondary-index key range, feeding each entry's source PK
+/// to a [`KeyGather`] over the relation it indexes, over one snapshot of each.
+/// The gather returns every row under an entry's source PK, so the walk is
+/// exact only over rows unique on their PK: a source PK then has one live row
+/// and at most one live index entry.
+pub struct IndexWalk {
+    /// Positioned on the index range and clamped at its end; an entry is a
+    /// leading span followed by the source PK.
     idx: ReadCursor,
-    src: KeyGather<'a>,
-    /// The width of an entry's leading span; the source PK follows it.
-    span: usize,
-    /// A refill's source PKs in index order, flat at `src`'s `pk_stride`.
+    /// A refill's source PKs in index order, flat at the gather's `pk_stride`.
     pks: Vec<u8>,
 }
 
-impl<'a> BoundedIndexCursor<'a> {
-    /// A walk of `idx`, positioned on the index range and clamped at its end,
-    /// gathering from `src`, a cursor over the relation `idx` indexes.
-    pub fn new(idx: ReadCursor, src: ReadCursor) -> Self {
-        let none = PkKeys::from_sorted(src.schema.pk_stride(), Vec::new());
-        Self::over(idx, KeyGather::Merge(PkSetGather::over(src, none)))
-    }
-
-    /// [`Self::new`], probing `store` — the relation `idx` indexes, in the
-    /// layout `schema` — for each entry's row.
-    pub fn new_unique(idx: ReadCursor, store: &'a dyn UniqueRows, schema: SchemaDescriptor) -> Self {
-        let none = PkKeys::from_sorted(schema.pk_stride(), Vec::new());
-        Self::over(idx, KeyGather::unique(store, schema, none))
-    }
-
-    fn over(idx: ReadCursor, src: KeyGather<'a>) -> Self {
-        let span = idx.schema.pk_stride() - src.schema().pk_stride();
-        BoundedIndexCursor { idx, src, span, pks: Vec::new() }
-    }
-
-    fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
-        assert!(
-            max_rows > 0,
-            "BoundedIndexCursor::drain_live_chunk: max_rows must be positive"
-        );
-        loop {
-            if let Some(chunk) = self.src.drain_live_chunk(max_rows, skeletons) {
-                debug_assert!(
-                    (1..chunk.len()).all(|i| chunk.get_pk_bytes(i - 1) != chunk.get_pk_bytes(i)),
-                    "index owner holds two rows under one PK"
-                );
-                return Some(chunk);
-            }
-            if !self.refill(max_rows) {
-                return None;
-            }
-        }
-    }
-
-    /// Reload the gather with the source PKs of the next `max_rows` index entries;
+impl IndexWalk {
+    /// Reload `gather` with the source PKs of the next `max_rows` index entries;
     /// `false` once the index range is spent.
-    fn refill(&mut self, max_rows: usize) -> bool {
-        let stride = self.src.schema().pk_stride();
+    fn refill(&mut self, gather: &mut KeyGather<'_>, max_rows: usize) -> bool {
+        let stride = gather.schema().pk_stride();
+        let span = self.idx.schema.pk_stride() - stride;
         self.pks.clear();
         let mut taken = 0;
         while taken < max_rows && self.idx.valid {
             debug_assert!(self.idx.current_weight > 0, "an index entry at a non-positive weight");
-            self.pks.extend_from_slice(&self.idx.current_pk_bytes()[self.span..]);
+            self.pks.extend_from_slice(&self.idx.current_pk_bytes()[span..]);
             self.idx.advance();
             taken += 1;
         }
         if taken == 0 {
             return false;
         }
-        self.src
-            .reload(PkKeys::from_keys(stride, self.pks.chunks_exact(stride)));
+        gather.reload(PkKeys::from_keys(stride, self.pks.chunks_exact(stride)));
         true
     }
 }
 
 /// The rows of a strictly ascending list of keys: gathered off a cursor, or
 /// probed key by key from a store whose every key nets 0 or 1.
-// Held inline by `SourceCursor::PkSet` for the reason that holds `PkSet` inline.
-#[allow(clippy::large_enum_variant)]
 pub enum KeyGather<'a> {
     Merge(PkSetGather),
     Unique(UniqueGather<'a>),
@@ -290,7 +270,8 @@ impl UniqueGather<'_> {
     /// The live rows of the next keys, at most `max_rows` of them, at weight 1;
     /// `None` once the list is exhausted.
     fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
-        let mut rows = Vec::new();
+        assert!(max_rows > 0, "UniqueGather::drain_chunk: max_rows must be positive");
+        let mut rows = Vec::with_capacity(max_rows.min(self.keys.len() - self.next));
         for key in self.keys.iter().skip(self.next) {
             if rows.len() >= max_rows {
                 break;

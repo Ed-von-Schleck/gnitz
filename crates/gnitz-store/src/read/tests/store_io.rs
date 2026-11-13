@@ -1,6 +1,5 @@
 use super::*;
-use crate::relation::Cut as At;
-use crate::relation::IndexClaim;
+use crate::relation::{IndexClaim, RelationKind};
 use crate::test_support::{
     batch_rows, col_range, img, make_batch_raw, make_schema_u64_i64, pk_only_schema, relation_fixture, zset_of,
     RelationFixture, Rng, TID,
@@ -26,6 +25,11 @@ fn x10(id: u64) -> i64 {
 /// The bound `val ∈ [lo, hi)`.
 fn val_range(lo: i64, hi: i64) -> ReadBound {
     col_range(1, img(lo), img(hi - 1))
+}
+
+/// Whether `cur` walks a secondary index.
+fn walks_index(cur: &SourceCursor) -> bool {
+    matches!(cur, SourceCursor::Keyed { walk: Some(_), .. })
 }
 
 /// Drain a cursor to its `(id, weight, val)` rows, `chunk` rows at a time so a chunk
@@ -55,7 +59,8 @@ fn rows(ids: impl IntoIterator<Item = u64>) -> Vec<(u64, i64, i64)> {
 /// — 12 of 200 do, 13 do not — and yields exactly its rows at every chunk size; past
 /// the gate, and with no index at all, the source is a full scan and the range comes
 /// back unapplied, for the caller's filter. A range holding no entry opens no walk.
-/// A read at now, which probes the base table for each entry's row, yields the same.
+/// A read at now, which probes the base table for each entry's row, yields what the
+/// sealed read's merge gather does.
 #[test]
 fn a_range_walks_the_index_only_within_the_selectivity_gate() {
     // With `val` anti-correlated to the PK, a range at val's minimum makes the first
@@ -84,33 +89,58 @@ fn a_range_walks_the_index_only_within_the_selectivity_gate() {
         let want: Vec<_> = ids.into_iter().map(|id| (id, 1, val_of(id))).collect();
         for chunk in [1, 3, 7, 64, usize::MAX] {
             let relation = r.relation(TID).unwrap();
-            for (mut cur, unapplied) in [
-                relation.open_bound(bound.clone(), At::Now, u64::MAX).unwrap(),
-                relation.open_read(bound.clone(), u64::MAX).unwrap(),
-            ] {
-                let bounded = walks && !want.is_empty();
-                assert_eq!(matches!(cur, SourceCursor::Bounded(_)), bounded, "{bound:?}");
-                assert_eq!(unapplied.map(ReadBound::Range), (!walks).then(|| bound.clone()));
+            let (read, unapplied) = relation.open_read(bound.clone(), u64::MAX).unwrap();
+            assert_eq!(unapplied.map(ReadBound::Range), (!walks).then(|| bound.clone()));
+            for mut cur in [relation.open_sealed(bound.clone(), u64::MAX).unwrap(), read] {
+                assert_eq!(walks_index(&cur), walks && !want.is_empty(), "{bound:?}");
                 assert_eq!(drain_all(&mut cur, chunk), want, "{bound:?} chunk {chunk}");
             }
         }
     }
 }
 
+/// A key list over a store whose keys net 0 or 1 — a base table's or a system
+/// family's — is probed key by key at now; a view's is gathered off a cursor. Either
+/// way it yields what the sealed read's merge gather does, a retracted key included.
+#[test]
+fn a_key_list_is_probed_only_where_every_key_nets_0_or_1() {
+    let schema = make_schema_u64_i64();
+    let base = make_batch_raw(&schema, &rows(0..NBASE));
+    let keys = || ReadBound::PkSet(PkKeys::from_images(8, [2, 5, 7, 300]));
+    for (kind, probed) in [
+        (RelationKind::BaseTable, true),
+        (RelationKind::SystemCatalog, true),
+        (RelationKind::View(ViewBudget::Plain), false),
+    ] {
+        let mut r = relation_fixture(kind, schema, &[], [base.clone()]);
+        r.ingest(TID, make_batch_raw(&schema, &[(5, -1, 50)])).unwrap();
+        let relation = r.relation(TID).unwrap();
+        let (mut read, unapplied) = relation.open_read(keys(), u64::MAX).unwrap();
+        assert_eq!(unapplied, None);
+        let gather = match &read {
+            SourceCursor::Keyed { gather, walk: None } => gather,
+            _ => panic!("{kind:?}: a key list is a listed gather"),
+        };
+        assert_eq!(matches!(gather, KeyGather::Unique(_)), probed, "{kind:?}");
+        let mut sealed = relation.open_sealed(keys(), u64::MAX).unwrap();
+        assert_eq!(drain_all(&mut read, 2), rows([2, 7]), "{kind:?}");
+        assert_eq!(drain_all(&mut sealed, 2), rows([2, 7]), "{kind:?}");
+    }
+}
+
 /// A backfill's read: an index holds a pending row's entry from its ingest on,
 /// so at the sealed cut it is walked only while nothing is pending. With rows
-/// above the cut the whole sealed store is read and the range handed back.
+/// above the cut the whole sealed store is read.
 #[test]
 fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
     let mut r = fixture(RelationKind::BaseTable, x10);
 
-    let (mut cur, unapplied) = r
+    let mut cur = r
         .relation(TID)
         .unwrap()
-        .open_bound(val_range(500, 600), At::Sealed, u64::MAX)
+        .open_sealed(val_range(500, 600), u64::MAX)
         .unwrap();
-    assert!(matches!(cur, SourceCursor::Bounded(_)), "nothing pending: the index");
-    assert_eq!(unapplied, None);
+    assert!(walks_index(&cur), "nothing pending: the index");
     assert_eq!(drain_all(&mut cur, 7), rows(50..60));
 
     // One pending row inside the range, one outside it.
@@ -122,35 +152,29 @@ fn a_sealed_read_walks_an_index_only_over_a_store_whose_cuts_agree() {
         rows
     };
 
-    let (mut cur, unapplied) = r
+    let mut cur = r
         .relation(TID)
         .unwrap()
-        .open_bound(val_range(500, 600), At::Sealed, u64::MAX)
+        .open_sealed(val_range(500, 600), u64::MAX)
         .unwrap();
-    assert!(matches!(cur, SourceCursor::Full(_)), "rows pending: the sealed store");
-    assert_eq!(
-        unapplied.map(ReadBound::Range).unwrap(),
-        val_range(500, 600),
-        "the range is the caller's to apply"
-    );
+    assert!(!walks_index(&cur), "rows pending: the sealed store");
     assert_eq!(drain_all(&mut cur, 7), rows(0..NBASE), "the pending rows are left out");
 
     let (mut cur, _) = r
         .relation(TID)
         .unwrap()
-        .open_bound(val_range(500, 600), At::Now, u64::MAX)
+        .open_read(val_range(500, 600), u64::MAX)
         .unwrap();
-    assert!(matches!(cur, SourceCursor::Bounded(_)), "a read at now walks the index");
+    assert!(walks_index(&cur), "a read at now walks the index");
     assert_eq!(drain_all(&mut cur, 7), with_pending());
 
     r.seal(TID).unwrap().expect("rows were pending");
-    let (mut cur, unapplied) = r
+    let mut cur = r
         .relation(TID)
         .unwrap()
-        .open_bound(val_range(500, 600), At::Sealed, u64::MAX)
+        .open_sealed(val_range(500, 600), u64::MAX)
         .unwrap();
-    assert!(matches!(cur, SourceCursor::Bounded(_)), "sealed: the cuts agree again");
-    assert_eq!(unapplied, None);
+    assert!(walks_index(&cur), "sealed: the cuts agree again");
     assert_eq!(drain_all(&mut cur, 7), with_pending());
 }
 
@@ -189,9 +213,9 @@ fn a_walk_follows_the_relations_writes() {
         let (mut cur, unapplied) = r
             .relation(TID)
             .unwrap()
-            .open_bound(val_range(500, 560), At::Now, u64::MAX)
+            .open_read(val_range(500, 560), u64::MAX)
             .unwrap();
-        assert!(matches!(cur, SourceCursor::Bounded(_)), "{kind:?}");
+        assert!(walks_index(&cur), "{kind:?}");
         assert_eq!(unapplied, None);
         assert_eq!(drain_all(&mut cur, 4), want, "{kind:?}");
     }
@@ -321,15 +345,9 @@ fn a_composite_range_reads_exactly_the_rows_its_bounds_admit() {
                 .collect();
 
             let bound = ReadBound::Range(range);
-            match r
-                .relation(TID)
-                .unwrap()
-                .open_bound(bound.clone(), At::Now, u64::MAX)
-                .unwrap()
-                .0
-            {
-                SourceCursor::Bounded(_) => walked += usize::from(!admitted.is_empty()),
-                _ => scanned += 1,
+            match walks_index(&r.relation(TID).unwrap().open_read(bound.clone(), u64::MAX).unwrap().0) {
+                true => walked += usize::from(!admitted.is_empty()),
+                false => scanned += 1,
             }
             let got = r.scan_spec(TID, ReadSpec::all_rows(bound), schema.layout_digest(), None);
             assert_eq!(
@@ -359,12 +377,8 @@ fn an_index_walk_over_a_repeating_key_trips_the_gather() {
         .collect();
     let view = RelationKind::View(ViewBudget::Plain);
     let r = relation_fixture(view, schema, &[&[1]], [make_batch_raw(&schema, &rows)]);
-    let (mut cur, _) = r
-        .relation(TID)
-        .unwrap()
-        .open_bound(val_range(5, 6), At::Now, u64::MAX)
-        .unwrap();
-    assert!(matches!(cur, SourceCursor::Bounded(_)));
+    let mut cur = r.relation(TID).unwrap().open_sealed(val_range(5, 6), u64::MAX).unwrap();
+    assert!(walks_index(&cur));
     cur.drain_chunk(1024);
 }
 
@@ -386,9 +400,9 @@ fn a_pk_prefix_range_walks_the_store_over_a_matching_index() {
     let (mut cur, unapplied) = r
         .relation(TID)
         .unwrap()
-        .open_bound(ReadBound::Range(range), At::Now, u64::MAX)
+        .open_read(ReadBound::Range(range), u64::MAX)
         .unwrap();
-    assert!(matches!(cur, SourceCursor::Full(_)), "a PK walk, not the index");
+    assert!(!walks_index(&cur), "a PK walk, not the index");
     assert_eq!(unapplied, None, "a PK walk applies the whole range");
     let b = cur.drain_chunk(64).unwrap();
     assert!(cur.drain_chunk(64).is_none());
@@ -422,7 +436,7 @@ fn a_pk_or_column_probe_of_a_view_is_refused() {
     let r = fixture(RelationKind::View(ViewBudget::Plain), x10);
     for probe in [Probe::Pk, Probe::PkColumn(1)] {
         let err = r.probe(TID, probe, PkKeys::from_images(8, [2])).map(drop).unwrap_err();
-        assert!(err.contains("not a base table"), "{probe:?}: {err}");
+        assert!(err.contains("may net above 1"), "{probe:?}: {err}");
     }
 }
 
@@ -472,7 +486,7 @@ fn a_read_of_what_the_relation_has_not_got_is_refused() {
         (
             r.relation(TID)
                 .unwrap()
-                .open_bound(ReadBound::PkSet(entry()), At::Now, u64::MAX)
+                .open_read(ReadBound::PkSet(entry()), u64::MAX)
                 .map(drop),
             "stride",
         ),
@@ -488,12 +502,20 @@ fn a_read_of_what_the_relation_has_not_got_is_refused() {
     }
 }
 
-/// A stream holds no rows, so a PK or column probe of one is refused.
+/// A stream holds no rows, so a PK or column probe of one, or a source opened
+/// over it at either cut, is refused.
 #[test]
-fn a_pk_probe_of_a_stream_is_refused() {
+fn a_read_of_a_stream_is_refused() {
     let r = relation_fixture(RelationKind::Stream, make_schema_u64_i64(), &[], []);
     for probe in [Probe::Pk, Probe::PkColumn(1)] {
         let err = r.probe(TID, probe, PkKeys::from_images(8, [2])).map(drop).unwrap_err();
         assert!(err.contains("is a stream"), "{probe:?}: {err}");
+    }
+    let relation = r.relation(TID).unwrap();
+    for err in [
+        relation.open_read(ReadBound::None, u64::MAX).map(drop).unwrap_err(),
+        relation.open_sealed(ReadBound::None, u64::MAX).map(drop).unwrap_err(),
+    ] {
+        assert!(err.contains("is a stream"), "{err}");
     }
 }

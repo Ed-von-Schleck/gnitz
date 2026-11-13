@@ -23,7 +23,6 @@ pub use store_io::Probe;
 use std::ops::Deref;
 use std::rc::Rc;
 
-use gnitz_wire::PkKeys;
 use gnitz_zset::repr::Batch;
 use gnitz_zset::schema::SchemaDescriptor;
 
@@ -58,14 +57,13 @@ fn check_layout(reply_layout: u64, produced: &SchemaDescriptor) -> Result<(), St
     }
 }
 
-/// Refuses `keys` unless each is `stride` bytes, the key of the store `verb` reads
-/// of relation `id`: a key list of another width names none of its keys.
-fn check_stride(verb: &str, id: u64, keys: &PkKeys, stride: usize) -> Result<(), String> {
-    match keys.stride() == stride {
+/// Refuses keys of `width` bytes unless it is `stride`, the key of the store
+/// `verb` reads of relation `id`: a key of another width names none of its keys.
+fn check_stride(verb: &str, id: u64, width: usize, stride: usize) -> Result<(), String> {
+    match width == stride {
         true => Ok(()),
         false => Err(format!(
-            "{verb}: key stride {} != the read store's {stride} (relation {id})",
-            keys.stride()
+            "{verb}: key stride {width} != the read store's {stride} (relation {id})"
         )),
     }
 }
