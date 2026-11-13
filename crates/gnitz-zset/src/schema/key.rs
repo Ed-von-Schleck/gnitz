@@ -6,7 +6,7 @@
 //! per-column codec is `gnitz_wire::pk`'s, shared with the client.
 use std::cmp::Ordering;
 
-use gnitz_wire::{KeyRange, PkBuf, NARROW_PK_MAX_BYTES};
+use gnitz_wire::{radix_sort_by_key, KeyRange, PkBuf, NARROW_PK_MAX_BYTES};
 
 use crate::schema::SchemaDescriptor;
 
@@ -89,6 +89,8 @@ pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
 /// against keys built from the same number of bytes.
 pub(crate) trait PkSortKey<'a>: Ord + Copy {
     fn from_opk(opk: &'a [u8]) -> Self;
+    /// Sort `v` by `key`, unstably: a radix sort where the key is an integer.
+    fn sort_by_key<T: Copy + Default>(v: &mut [T], key: impl Fn(&T) -> Self);
 }
 
 /// Run `$body` with `$k` bound to the [`PkSortKey`] matching `$stride` — the one
@@ -127,18 +129,27 @@ impl PkSortKey<'_> for u64 {
             (pack_pk_be(opk) >> 64) as u64
         }
     }
+    #[inline]
+    fn sort_by_key<T: Copy + Default>(v: &mut [T], key: impl Fn(&T) -> Self) {
+        radix_sort_by_key(v, key)
+    }
 }
 
 impl PkSortKey<'_> for u128 {
-    /// The leading 8 bytes over the trailing 8, which overlap below 16 bytes:
-    /// ordered and injective among keys of one 9..=16-byte width, with no length
+    /// The leading 8 bytes, then the trailing 8 shifted past the bytes they
+    /// share with them below 16 bytes: the key left-aligned, with no length
     /// dispatch, so a search's comparison closure stays small enough to inline.
+    /// A byte stands in the key once, so a radix sort passes over it once.
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> u128 {
         let len = opk.len();
         let hi = u64::from_be_bytes(opk[..8].try_into().unwrap()) as u128;
-        let tail = u64::from_be_bytes(opk[len - 8..].try_into().unwrap()) as u128;
-        (hi << 64) | tail
+        let tail = u64::from_be_bytes(opk[len - 8..].try_into().unwrap()) << (8 * (16 - len));
+        (hi << 64) | tail as u128
+    }
+    #[inline]
+    fn sort_by_key<T: Copy + Default>(v: &mut [T], key: impl Fn(&T) -> Self) {
+        radix_sort_by_key(v, key)
     }
 }
 
@@ -146,6 +157,10 @@ impl<'a> PkSortKey<'a> for &'a [u8] {
     #[inline(always)]
     fn from_opk(opk: &'a [u8]) -> Self {
         opk
+    }
+    #[inline]
+    fn sort_by_key<T: Copy + Default>(v: &mut [T], key: impl Fn(&T) -> Self) {
+        v.sort_unstable_by_key(key)
     }
 }
 
@@ -160,6 +175,10 @@ impl PkSortKey<'_> for [u128; 2] {
         } else {
             [hi, pack_pk_be(&opk[16..])]
         }
+    }
+    #[inline]
+    fn sort_by_key<T: Copy + Default>(v: &mut [T], key: impl Fn(&T) -> Self) {
+        radix_sort_by_key(v, key)
     }
 }
 

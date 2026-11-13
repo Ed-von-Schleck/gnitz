@@ -12,6 +12,7 @@
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 
+use gnitz_wire::{radix_sort_by_key, RadixKey};
 use smallvec::SmallVec;
 use std::ops::{ControlFlow, Range};
 
@@ -706,7 +707,7 @@ trait ArgEntry: Copy {
 /// A `(sort key, row-index)` pair. Keeps the key co-located with its index so the
 /// comparator reads from the element being positioned rather than chasing a
 /// separate key array.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 struct SortEntry<K> {
     key: K,
     idx: u32,
@@ -726,8 +727,21 @@ impl<K: Copy + Eq> ArgEntry for SortEntry<K> {
 /// A 17..=[`PACKED_MAX_STRIDE`]-byte PK's `[u128; 2]` key with the row index in
 /// its low four bytes, which the left-aligned key leaves zero: ordered by one
 /// plain compare.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Default)]
 struct PackedEntry([u128; 2]);
+
+/// The key is the bytes above the row index.
+impl RadixKey for PackedEntry {
+    const BYTES: usize = PACKED_MAX_STRIDE;
+    #[inline(always)]
+    fn byte(self, i: usize) -> u8 {
+        self.0.byte(i + size_of::<u32>())
+    }
+    #[inline(always)]
+    fn or_diff(self, a: Self, b: Self) -> Self {
+        PackedEntry(self.0.or_diff(a.0, b.0))
+    }
+}
 
 impl Ord for PackedEntry {
     #[inline(always)]
@@ -775,7 +789,7 @@ fn consolidate_groups_inner<P: PayloadOrder>(batch: &MemBatch, out: &mut Vec<Pic
         let mut entries: Vec<PackedEntry> = (0..n as u32)
             .map(|i| PackedEntry::new(batch.get_pk_bytes(i as usize), i))
             .collect();
-        entries.sort_unstable();
+        radix_sort_by_key(&mut entries, |&e| e);
         return fold_runs(&mut entries, batch, schema, payload, out);
     }
     pk_width_dispatch!(stride, |K| {
@@ -785,7 +799,7 @@ fn consolidate_groups_inner<P: PayloadOrder>(batch: &MemBatch, out: &mut Vec<Pic
                 idx: i,
             })
             .collect();
-        entries.sort_unstable_by(|a, b| Ord::cmp(&a.key, &b.key));
+        K::sort_by_key(&mut entries, |e| e.key);
         fold_runs(&mut entries, batch, schema, payload, out);
     })
 }

@@ -10,10 +10,12 @@ use std::hint::black_box;
 
 /// `into_consolidated` over a batch with no claim, by the order its rows stand
 /// in and by how many of them share a PK. "Ascending but the last" is the input
-/// a check for "ascending" costs the most on; the last two shapes are the only
-/// ones whose sort breaks PK ties on the payload, and the last the only one that
-/// folds rows. The scattered shape runs again at a PK in each wider arm of the
-/// sort key.
+/// a check for "ascending" costs the most on; the shapes with several rows per
+/// PK are the ones whose sort breaks PK ties on the payload, and "every row
+/// twice" the only one that folds rows. A dense PK takes every value of a range,
+/// as serial ids or a join re-keyed on a foreign key do. The scattered shapes
+/// run again at a PK in each wider arm of the sort key, its leading columns
+/// constant where it is dense.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn consolidate_bench() {
@@ -22,13 +24,15 @@ fn consolidate_bench() {
     let schema = make_schema_u64_i64();
     /// Row `i` as `(pk, payload)`.
     type Row = fn(u64) -> (u64, u64);
-    let shapes: [(&str, Row, u64); 6] = [
+    let shapes: [(&str, Row, u64); 8] = [
         ("ascending", |i| (i + 1, i), N),
         ("ascending but the last", |i| (if i == N - 1 { 0 } else { i + 1 }, i), N),
         ("descending", |i| (N - i, i), N),
         ("scattered", |i| (mix(i) >> 8, i), N),
         ("scattered, 8 payloads per PK", |i| (mix(i / 8) >> 8, mix(i)), N),
         ("scattered, every row twice", |i| (mix(i / 2) >> 8, i / 2), N / 2),
+        ("dense, scattered", |i| (dense(i, N), i), N),
+        ("dense, 8 payloads per PK", |i| (dense(i / 8, N / 8), mix(i)), N),
     ];
     for (label, row, survivors) in shapes {
         let rows: Vec<(u64, i64, i64)> = (0..N).map(row).map(|(pk, v)| (pk, 1, v as i64)).collect();
@@ -45,23 +49,37 @@ fn consolidate_bench() {
     }
     for pk_cols in [2usize, 3, 5] {
         let schema = pk_payload_schema(&vec![TypeCode::U64; pk_cols]);
-        let [_, (out, instructions)] = [(); 2].map(|()| {
-            let mut b = BatchBuilder::new(&schema);
-            for i in 0..N {
-                b.begin_row_natives(&vec![mix(i) as u128; pk_cols], 1);
-                b.put_u64(i);
-                b.end_row();
-            }
-            let batch = b.finish();
-            counter.measure(|| black_box(batch).into_consolidated())
-        });
-        assert_eq!(out.count as u64, N);
-        println!(
-            "into_consolidated, {:<28} {:>6.1} instr/row",
-            format!("scattered, {}-byte PK", 8 * pk_cols),
-            instructions as f64 / N as f64
-        );
+        for dense_pk in [false, true] {
+            let [_, (out, instructions)] = [(); 2].map(|()| {
+                let mut b = BatchBuilder::new(&schema);
+                for i in 0..N {
+                    let mut pk = vec![mix(i) as u128; pk_cols];
+                    if dense_pk {
+                        pk.fill(7);
+                        pk[pk_cols - 1] = dense(i, N) as u128;
+                    }
+                    b.begin_row_natives(&pk, 1);
+                    b.put_u64(i);
+                    b.end_row();
+                }
+                let batch = b.finish();
+                counter.measure(|| black_box(batch).into_consolidated())
+            });
+            assert_eq!(out.count as u64, N);
+            let shape = if dense_pk { "dense, scattered" } else { "scattered" };
+            println!(
+                "into_consolidated, {:<28} {:>6.1} instr/row",
+                format!("{shape}, {}-byte PK", 8 * pk_cols),
+                instructions as f64 / N as f64
+            );
+        }
     }
+}
+
+/// `i` of `0..n`, a power of two, to its place in a scattered permutation of
+/// `0..n`.
+fn dense(i: u64, n: u64) -> u64 {
+    i.wrapping_mul(0x9E37_79B9_7F4A_7C15) & (n - 1)
 }
 
 /// `into_consolidated` over the rows a window emits into a view keyed by its

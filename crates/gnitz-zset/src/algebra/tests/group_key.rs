@@ -2,11 +2,12 @@ use super::*;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::SchemaColumn;
 use crate::test_support::{
-    arb_fold_case, cell, fold_batch, le_cell, make_schema_pk_u64_payload_string, mix, opk_pk, pk_only_schema,
-    u64_pk_schema,
+    arb_fold_case, cell, fold_batch, fold_schemas, le_cell, make_schema_pk_u64_payload_string, mix, opk_pk,
+    pk_only_schema, radix_fold_rows, u64_pk_schema,
 };
 use gnitz_wire::TypeCode;
 use proptest::prelude::*;
+use std::collections::HashMap;
 
 /// The identities of `runs`' rows, in row order.
 struct Over<'a>(&'a [(usize, usize)]);
@@ -181,6 +182,40 @@ proptest! {
     #[test]
     fn groups_follow_out_pk_at_every_pk_width((s, rows) in arb_fold_case()) {
         assert_groups_follow_out_pk(&fold_batch(&s, &rows))?;
+    }
+}
+
+/// A batch too long, over too many groups, to number by hashing, grouped by its
+/// whole PK at every width arm: the sort that numbers it puts two rows in one
+/// group iff they share a PK, names each group by its first row, and lists the
+/// groups in PK order.
+#[test]
+fn sorted_groups_of_a_long_batch_follow_its_pk() {
+    for s in fold_schemas() {
+        let batch = fold_batch(&s, &radix_fold_rows(s.pk_stride(), 1024));
+        let (key, _) = GroupOutKey::new(&s, s.pk_cols(), []).unwrap();
+        let mut scratch = GroupScratch::default();
+        key.numbered_into(&batch, &mut scratch);
+        let groups = &scratch.groups;
+        let mb = batch.as_mem_batch();
+        let mut first_of: HashMap<&[u8], usize> = HashMap::new();
+        for row in 0..batch.len() {
+            first_of.entry(mb.get_pk_bytes(row)).or_insert(row);
+        }
+        assert_eq!(groups.len(), first_of.len());
+        for (row, &g) in groups.ord.iter().enumerate() {
+            assert_eq!(
+                groups.first[g as usize] as usize,
+                first_of[mb.get_pk_bytes(row)],
+                "row {row}"
+            );
+        }
+        let pks: Vec<&[u8]> = groups
+            .by_pk
+            .iter()
+            .map(|&g| mb.get_pk_bytes(groups.first[g as usize] as usize))
+            .collect();
+        assert!(pks.is_sorted_by(|a, b| a < b), "groups out of PK order");
     }
 }
 

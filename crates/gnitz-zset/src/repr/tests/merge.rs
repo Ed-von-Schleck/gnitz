@@ -2,8 +2,8 @@ use super::*;
 use crate::repr::BatchBuilder;
 use crate::schema::{Generic, PayloadOrder, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    arb_fold_case, assert_folds, fold_batch, make_schema_pk_u64_payload_string, make_string_batch, u64_pk_schema,
-    FoldRow,
+    arb_fold_case, assert_folds, fold_batch, fold_schemas, make_schema_pk_u64_payload_string, make_string_batch,
+    radix_fold_rows, u64_pk_schema, FoldRow,
 };
 
 // ── The Z-set fold, over every path that runs it ────────────────────────
@@ -129,6 +129,20 @@ proptest::proptest! {
         }
         let input = b.finish();
         assert_folds(std::slice::from_ref(&input), &input.clone().into_consolidated(), "consolidate");
+    }
+}
+
+/// Batches long enough for the radix argsort, at a PK in every arm of the sort
+/// key, fold to their Z-set sum.
+#[test]
+fn a_radix_sorted_batch_folds_to_the_zset() {
+    for s in fold_schemas() {
+        let input = fold_batch(&s, &radix_fold_rows(s.pk_stride(), 5000));
+        assert_folds(
+            std::slice::from_ref(&input),
+            &input.clone().into_consolidated(),
+            "consolidate",
+        );
     }
 }
 

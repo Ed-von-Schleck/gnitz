@@ -508,19 +508,26 @@ impl GroupOrdinals {
     /// Groups numbered in ascending `key` order, found by sorting the rows; `id`
     /// maps a group's key to the identity kept for it, `None` for every key
     /// where none is kept.
-    fn fill_sorted<K: Ord + Copy>(&mut self, n: usize, key: impl Fn(usize) -> K, id: impl Fn(K) -> Option<u128>) {
+    fn fill_sorted<'a, K: PkSortKey<'a> + Default>(
+        &mut self,
+        n: usize,
+        key: impl Fn(usize) -> K,
+        id: impl Fn(K) -> Option<u128>,
+    ) {
         let GroupOrdinals { mut ord, mut first, mut by_pk, mut ids } = self.take_cleared();
-        // The row index breaks ties, so a group's first row is its first in the batch.
         // A batch too small to hash sorts on the stack.
         let mut pairs: SmallVec<[(K, u32); HASH_MIN_ROWS]> = (0..n).map(|i| (key(i), i as u32)).collect();
-        pairs.sort_unstable();
+        K::sort_by_key(&mut pairs, |p| p.0);
         zeroed(&mut ord, n);
-        for (p, (k, row)) in pairs.iter().enumerate() {
-            if p == 0 || *k != pairs[p - 1].0 {
-                first.push(*row);
-                ids.extend(id(*k));
+        for (p, &(k, row)) in pairs.iter().enumerate() {
+            if p == 0 || k != pairs[p - 1].0 {
+                first.push(row);
+                ids.extend(id(k));
             }
-            ord[*row as usize] = (first.len() - 1) as u32;
+            // The sort leaves a group's rows in any order: its first row is its least.
+            let g = first.len() - 1;
+            first[g] = first[g].min(row);
+            ord[row as usize] = g as u32;
         }
         by_pk.extend(0..first.len() as u32);
         *self = GroupOrdinals { ord, first, by_pk, ids };

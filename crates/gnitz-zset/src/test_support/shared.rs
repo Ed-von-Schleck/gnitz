@@ -449,7 +449,7 @@ pub fn zset_sum(inputs: &[Batch], schema: &SchemaDescriptor) -> HashMap<RowKey, 
 /// nullable-string schema under the generic comparator at a narrow PK, a wide
 /// one, and one whose PK columns sit among the payload columns in an order other
 /// than the schema's.
-fn fold_schemas() -> Vec<SchemaDescriptor> {
+pub(crate) fn fold_schemas() -> Vec<SchemaDescriptor> {
     use TypeCode::*;
     let generic = |pk: &[TypeCode]| {
         let mut cols: Vec<SchemaColumn> = pk.iter().map(|&t| SchemaColumn::new(t, false)).collect();
@@ -530,6 +530,22 @@ pub fn arb_fold_case() -> impl Strategy<Value = (SchemaDescriptor, Vec<FoldRow>)
             });
         (Just(s), rows)
     })
+}
+
+/// `n` rows of keys of `stride` that differ in their first byte's low bit and
+/// their last byte alone — so a batch of at least 256 of them takes the radix
+/// sort — with repeats, cancels and payload ties.
+pub fn radix_fold_rows(stride: usize, n: u64) -> Vec<FoldRow> {
+    (0..n)
+        .map(|i| {
+            let r = super::rng::mix(i);
+            let mut pk = vec![0u8; stride];
+            pk[0] = (r >> 40) as u8 & 1;
+            pk[stride - 1] = (r >> 48) as u8;
+            let w = (r >> 20) as i64 % 4 - 1;
+            (pk, w, Some((r >> 8) as u8 % 4), Some((r >> 12) as u8 % 4))
+        })
+        .collect()
 }
 
 /// `rows` as an unconsolidated batch over a `fold_schemas` schema. A NULL and a
