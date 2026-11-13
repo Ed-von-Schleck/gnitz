@@ -291,3 +291,46 @@ fn pk_keys_from_ascending_drops_repeats() {
     );
     assert!(PkKeys::from_ascending(8, &[]).is_empty());
 }
+
+/// Lists long enough for the radix sort, at every stride of an image or a pair
+/// of them: over keys whose varying bytes are few and scattered (the radix arm)
+/// and over random keys (the comparison arm), with duplicates. Each comes out as
+/// the byte sort of its keys, and at a narrow stride sorting their images agrees.
+#[test]
+fn pk_keys_from_images_radix_is_the_byte_sort() {
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for stride in 1..=2 * NARROW_PK_MAX_BYTES {
+        for n in [255usize, 256, 300, 5000] {
+            for sparse in [true, false] {
+                let raw: Vec<Vec<u8>> = (0..n)
+                    .map(|_| match sparse {
+                        // Only the lowest byte and the highest vary.
+                        true => {
+                            let r = next();
+                            let mut key = vec![0u8; stride];
+                            key[0] |= (r >> 8) as u8 & 3;
+                            key[stride - 1] = r as u8;
+                            key
+                        }
+                        false => (0..stride).map(|_| next() as u8).collect(),
+                    })
+                    .collect();
+                let mut want = raw.clone();
+                want.sort_unstable();
+                want.dedup();
+                let got = PkKeys::from_keys(stride, raw.iter().map(|k| &k[..]));
+                assert_eq!(got.as_bytes(), want.concat(), "stride {stride} n {n}");
+                if stride <= NARROW_PK_MAX_BYTES {
+                    let images = raw.iter().map(|k| crate::widen_pk_be(k));
+                    assert_eq!(PkKeys::from_images(stride, images), got, "stride {stride} n {n}");
+                }
+            }
+        }
+    }
+}

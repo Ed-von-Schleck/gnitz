@@ -217,23 +217,32 @@ impl PkKeys {
         let keys = keys
             .into_iter()
             .inspect(|k| assert_eq!(k.len(), stride, "PkKeys: key width"));
-        if stride <= NARROW_PK_MAX_BYTES {
-            return Self::from_images(stride, keys.map(widen_pk_be));
-        }
-        if stride <= 2 * NARROW_PK_MAX_BYTES {
+        const TWO_WORDS: usize = 2 * NARROW_PK_MAX_BYTES;
+        match stride {
+            // The widths a PK most often has, widened without a per-key dispatch.
+            8 => Self::from_images(8, keys.map(|k| u64::from_be_bytes(k.try_into().unwrap()) as u128)),
+            16 => Self::from_images(16, keys.map(|k| u128::from_be_bytes(k.try_into().unwrap()))),
+            _ if stride <= NARROW_PK_MAX_BYTES => Self::from_images(stride, keys.map(widen_pk_be)),
             // Two words, the second right-aligned: equal-width keys order as
             // the pair does, and the sort moves no pointer into the keys.
-            let words = |k: &[u8]| {
-                let (hi, lo) = k.split_at(NARROW_PK_MAX_BYTES);
-                [widen_pk_be(hi), widen_pk_be(lo)]
-            };
-            return Self::sorted(stride, keys.map(words), |slot, [hi, lo]| {
-                let (high, low) = slot.split_at_mut(NARROW_PK_MAX_BYTES);
-                high.copy_from_slice(&hi.to_be_bytes());
-                low.copy_from_slice(&lo.to_be_bytes()[2 * NARROW_PK_MAX_BYTES - stride..]);
-            });
+            _ if stride <= TWO_WORDS => Self::sorted(
+                stride,
+                keys.map(|k| {
+                    let (hi, lo) = k.split_at(NARROW_PK_MAX_BYTES);
+                    [widen_pk_be(hi), widen_pk_be(lo)]
+                }),
+            ),
+            _ => {
+                let mut keys: SmallVec<[&[u8]; 2]> = keys.collect();
+                keys.sort_unstable();
+                keys.dedup();
+                let mut bytes = PkBytes::from_elem(0, keys.len() * stride);
+                for (slot, k) in bytes.chunks_exact_mut(stride).zip(keys) {
+                    slot.copy_from_slice(k);
+                }
+                Self::new(stride, bytes)
+            }
         }
-        Self::sorted(stride, keys, |slot, k| slot.copy_from_slice(k))
     }
 
     /// Sort and dedup key images, each stored as its low `stride` bytes
@@ -243,26 +252,35 @@ impl PkKeys {
         assert!((1..=NARROW_PK_MAX_BYTES).contains(&stride), "PkKeys: stride {stride}");
         let images = images.into_iter();
         match stride <= 8 {
-            true => Self::sorted(stride, images.map(|v| v as u64), |slot, v| {
-                slot.copy_from_slice(&v.to_be_bytes()[8 - stride..])
-            }),
-            false => Self::sorted(stride, images, |slot, v| {
-                slot.copy_from_slice(&v.to_be_bytes()[16 - stride..])
-            }),
+            true => Self::sorted(stride, images.map(|v| v as u64)),
+            false => Self::sorted(stride, images),
         }
     }
 
-    /// `items` sorted and deduped, each written by `write` into its `stride`
-    /// bytes; a list of at most two items, and its bytes up to `MAX_PK_BYTES`,
-    /// never touch the heap.
-    fn sorted<T: Ord>(stride: usize, items: impl Iterator<Item = T>, write: impl Fn(&mut [u8], T)) -> Self {
+    /// `items` sorted, then deduped while written: each a store of its whole
+    /// image shifted to the left of its slot, whose spill past `stride` the
+    /// next key overwrites. A list of at most two images, and its bytes up to
+    /// `MAX_PK_BYTES`, end up inline.
+    fn sorted<T: Image>(stride: usize, items: impl Iterator<Item = T>) -> Self {
         let mut items: SmallVec<[T; 2]> = items.collect();
-        items.sort_unstable();
-        items.dedup();
-        let mut bytes = PkBytes::from_elem(0, items.len() * stride);
-        for (slot, item) in bytes.chunks_exact_mut(stride).zip(items) {
-            write(slot, item);
+        radix_sort(&mut items);
+        let width = std::mem::size_of::<T>();
+        let shift = 8 * (width - stride) as u32;
+        let mut bytes = PkBytes::from_elem(0, items.len() * stride + width - stride);
+        let mut at = 0;
+        if let Some((&first, rest)) = items.split_first() {
+            first.put(shift, &mut bytes[..width]);
+            at = stride;
+            let mut prev = first;
+            for &v in rest {
+                v.put(shift, &mut bytes[at..at + width]);
+                at += stride * (v != prev) as usize;
+                prev = v;
+            }
         }
+        bytes.truncate(at);
+        // Repeats or the spill may leave a list that fits inline on the heap.
+        bytes.shrink_to_fit();
         Self::new(stride, bytes)
     }
 
@@ -545,6 +563,129 @@ impl PkBuf {
         );
         self.len = width as u8;
         self
+    }
+}
+
+/// A key image [`radix_sort`] orders a byte at a time: its bytes read as one
+/// big-endian integer, which orders as the image does.
+trait Image: Copy + Ord + Default {
+    /// Byte `i`, counted from the least significant.
+    fn byte(self, i: usize) -> u8;
+    /// `self` with every bit set where `a` and `b` differ.
+    fn or_diff(self, a: Self, b: Self) -> Self;
+    /// `self << shift`, all its bytes big-endian into `out`.
+    fn put(self, shift: u32, out: &mut [u8]);
+}
+
+impl Image for u64 {
+    #[inline(always)]
+    fn byte(self, i: usize) -> u8 {
+        (self >> (8 * i)) as u8
+    }
+    #[inline(always)]
+    fn or_diff(self, a: Self, b: Self) -> Self {
+        self | (a ^ b)
+    }
+    #[inline(always)]
+    fn put(self, shift: u32, out: &mut [u8]) {
+        out.copy_from_slice(&(self << shift).to_be_bytes());
+    }
+}
+
+impl Image for u128 {
+    /// The half first: a variable shift of the whole `u128` costs a funnel shift.
+    #[inline(always)]
+    fn byte(self, i: usize) -> u8 {
+        let half = if i < 8 { self as u64 } else { (self >> 64) as u64 };
+        half.byte(i & 7)
+    }
+    #[inline(always)]
+    fn or_diff(self, a: Self, b: Self) -> Self {
+        self | (a ^ b)
+    }
+    #[inline(always)]
+    fn put(self, shift: u32, out: &mut [u8]) {
+        out.copy_from_slice(&(self << shift).to_be_bytes());
+    }
+}
+
+/// The high word, then the low; only the low one is short of its width, so
+/// `shift` moves it alone.
+impl Image for [u128; 2] {
+    #[inline(always)]
+    fn byte(self, i: usize) -> u8 {
+        if i < 16 {
+            self[1].byte(i)
+        } else {
+            self[0].byte(i - 16)
+        }
+    }
+    #[inline(always)]
+    fn or_diff(self, a: Self, b: Self) -> Self {
+        [self[0].or_diff(a[0], b[0]), self[1].or_diff(a[1], b[1])]
+    }
+    #[inline(always)]
+    fn put(self, shift: u32, out: &mut [u8]) {
+        let (high, low) = out.split_at_mut(16);
+        self[0].put(0, high);
+        self[1].put(shift, low);
+    }
+}
+
+/// Sort `v` ascending: least-significant-digit radix over the bytes that vary
+/// among its images, or a comparison sort on a list too short to repay one.
+fn radix_sort<T: Image>(v: &mut [T]) {
+    const RADIX_MIN: usize = 256;
+    if v.len() < RADIX_MIN {
+        v.sort_unstable();
+        return;
+    }
+    if v.is_sorted() {
+        return;
+    }
+    let first = v[0];
+    let diff = v.iter().fold(T::default(), |d, &x| d.or_diff(x, first));
+    let digits: SmallVec<[usize; 32]> = (0..std::mem::size_of::<T>()).filter(|&b| diff.byte(b) != 0).collect();
+    // A pass costs about what four levels of a comparison sort do.
+    if 4 * digits.len() > v.len().ilog2() as usize {
+        v.sort_unstable();
+        return;
+    }
+    // The first digit's histogram on its own; each scatter counts the next.
+    let mut count = [0usize; 256];
+    for &x in v.iter() {
+        count[x.byte(digits[0]) as usize] += 1;
+    }
+    let mut buf = vec![T::default(); v.len()];
+    let (mut src, mut dst) = (&mut *v, &mut buf[..]);
+    for (i, &b) in digits.iter().enumerate() {
+        let mut at = 0;
+        for c in count.iter_mut() {
+            (*c, at) = (at, at + *c);
+        }
+        let mut next = [0usize; 256];
+        match digits.get(i + 1) {
+            Some(&nb) => {
+                for &x in src.iter() {
+                    let slot = &mut count[x.byte(b) as usize];
+                    dst[*slot] = x;
+                    *slot += 1;
+                    next[x.byte(nb) as usize] += 1;
+                }
+            }
+            None => {
+                for &x in src.iter() {
+                    let slot = &mut count[x.byte(b) as usize];
+                    dst[*slot] = x;
+                    *slot += 1;
+                }
+            }
+        }
+        count = next;
+        std::mem::swap(&mut src, &mut dst);
+    }
+    if digits.len() % 2 == 1 {
+        v.copy_from_slice(&buf);
     }
 }
 
