@@ -155,7 +155,9 @@ impl MasterDispatcher {
         // checkpoint's one orphan sweep: the committer holds the apply lock a
         // DDL body runs under through the ephemeral round, so no DDL lands
         // before it, and at boot `reconcile_child_dirs` has already swept.
-        self.cat().reclaim_orphan_dirs();
+        if let Err(e) = self.cat().registry.reclaim_orphan_relation_dirs() {
+            gnitz_warn!("catalog: orphan directory sweep failed: {}", e);
+        }
     }
 
     /// A checkpoint's second half: the round that flushes every resumable

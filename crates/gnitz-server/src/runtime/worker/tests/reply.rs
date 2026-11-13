@@ -2,8 +2,8 @@ use super::*;
 use crate::runtime::w2m::fixtures::{id, test_rings};
 use crate::runtime::w2m::W2mReceiver;
 use crate::test_support::{
-    make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64, pk_only_schema,
-    table_engine, u64_i64_cols, weighted_rows,
+    chunked, make_batch_bytes_raw, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
+    pk_only_schema, table_engine_with, u64_i64_cols, weighted_rows,
 };
 use gnitz_store::relation::IndexClaim;
 use gnitz_wire::{peek_control_block, DecodedControl, PkColList, TypeCode, WireStatus};
@@ -388,7 +388,7 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
         (24, 400, 1024, 2..=24),
     ];
     for (n, budget, chunk_rows, carrying) in cases {
-        let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
+        let (_dir, mut engine, tid) = table_engine_with(1, &u64_i64_cols(), chunked(chunk_rows));
         let claim = IndexClaim::Index { id: tid + 1, unique: false };
         engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
         // Values descend as ids ascend, so span order is not row order.
@@ -397,7 +397,6 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
             .registry
             .ingest(tid, make_batch_raw(&make_schema_u64_i64(), &held))
             .unwrap();
-        engine.registry.set_scan_chunk_rows(chunk_rows);
         let (mut q, rx) = queue_over(1 << 22);
         q.set_frame_budget(budget);
 

@@ -189,7 +189,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
         matches!(refused, Err(ZoneError::Refused(_))),
         "the bundle must be refused and undone"
     );
-    engine.reclaim_orphan_dirs();
+    engine.registry.reclaim_orphan_relation_dirs().unwrap();
 
     assert!(
         engine.registry.relation(old_vid).is_some(),

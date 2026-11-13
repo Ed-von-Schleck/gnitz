@@ -3,9 +3,9 @@
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    col_def, empty_catalog, make_batch, make_schema_u64_i64, push_and_tick, register_count_of, register_identity_view,
-    scan_all, scan_keyed, table_engine, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, EchoDrive,
-    RowKey,
+    chunked, col_def, empty_catalog, empty_catalog_with, make_batch, make_schema_u64_i64, push_and_tick,
+    register_count_of, register_identity_view, scan_all, scan_keyed, table_engine, try_register_view,
+    two_term_join_circuit, u64_i64_cols, zset_of, EchoDrive, RowKey,
 };
 use gnitz_store::relation::PkRule;
 use gnitz_wire::{Circuit, ReadBound, TypeCode};
@@ -353,7 +353,7 @@ fn a_backfill_of_a_join_feeds_each_source_against_the_ones_before_it() {
     let on_k: &[(u64, u64, u64)] = &[(10, 1, 2), (10, 1, 5), (10, 3, 2), (10, 3, 5), (20, 2, 4)];
     let on_id: &[(u64, u64, u64)] = &[(2, 2, 2), (3, 3, 3)];
     for (key, want) in [(1, on_k), (0, on_id)] {
-        let (_dir, mut engine) = empty_catalog(1);
+        let (_dir, mut engine) = empty_catalog_with(1, chunked(1));
         let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
         let a = engine.create_table("public.a", &cols, &[0]).unwrap();
         let b = engine.create_table("public.b", &cols, &[0]).unwrap();
@@ -362,7 +362,6 @@ fn a_backfill_of_a_join_feeds_each_source_against_the_ones_before_it() {
             let rows = make_batch(&engine.registry.relation_or_err(tid).unwrap().schema(), rows);
             engine.registry.ingest(tid, rows).unwrap();
         }
-        engine.registry.set_scan_chunk_rows(1);
 
         backfill(&mut engine, view).unwrap();
 

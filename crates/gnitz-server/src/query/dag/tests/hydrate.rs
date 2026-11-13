@@ -1,8 +1,9 @@
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    col_def, empty_catalog, make_batch, make_schema_u64_i64, push_and_tick, reindexed_on_col1, scan_all, table_engine,
-    try_register_identity_view, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, RowKey,
+    chunked, col_def, empty_catalog, make_batch, make_schema_u64_i64, push_and_tick, reindexed_on_col1, scan_all,
+    table_engine_with, try_register_identity_view, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of,
+    RowKey,
 };
 use gnitz_store::relation::PkRule;
 use gnitz_wire::{Circuit, JoinKind, TypeCode};
@@ -20,12 +21,11 @@ fn hydrate(engine: &mut CatalogEngine, view: u64, ids: &[u64]) -> HashMap<RowKey
 #[test]
 fn a_relation_seed_reads_the_source_as_of_its_last_tick() {
     let cols = u64_i64_cols();
-    let (_dir, mut engine, tid) = table_engine(1, &cols);
+    let (_dir, mut engine, tid) = table_engine_with(1, &cols, chunked(1));
     let view = try_register_identity_view(&mut engine, tid, "bounded", &cols, 1 << 20, 0).unwrap();
     let rows: Vec<(u64, i64, i64)> = (1..=8).map(|id| (id, 1, id as i64 * 10)).collect();
     let schema = make_schema_u64_i64();
     push_and_tick(&mut engine, tid, make_batch(&schema, &rows));
-    engine.registry.set_scan_chunk_rows(1);
 
     // Row 8 lies outside every gathered key below.
     let pushed = make_batch(&schema, &[(3, -1, 30), (5, -1, 50), (5, 1, 55), (8, -1, 80)]);

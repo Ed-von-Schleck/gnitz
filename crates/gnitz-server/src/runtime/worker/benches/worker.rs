@@ -3,7 +3,7 @@ use super::tests::{ask, pk_keys, probe, worker_over};
 use super::*;
 use crate::runtime::sal::{Routed, SalExcl, SalFull};
 use crate::test_support::{
-    make_batch_raw, make_schema_u64_i64, net_weight, register_identity_view, table_engine, u64_i64_cols,
+    chunked, make_batch_raw, make_schema_u64_i64, net_weight, register_identity_view, table_engine_with, u64_i64_cols,
 };
 use gnitz_foundation::perf::Counter;
 use gnitz_store::relation::IndexClaim;
@@ -14,6 +14,9 @@ const REQUESTS: u32 = 4096;
 
 /// Rows the table of a read arm holds.
 const HELD: u64 = 1024;
+
+/// Rows per chunk of every arm's scans: no read arm's table fills more than one.
+const CHUNK_ROWS: usize = 1024;
 
 /// One arm: a table `prepare` dresses and `held` rows are then ingested into,
 /// `requests` groups on the SAL, each written by `request` from the table's id, its schema
@@ -30,7 +33,7 @@ fn arm(
     frames_owed: usize,
     holds: u64,
 ) {
-    let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
+    let (_dir, mut engine, tid) = table_engine_with(1, &u64_i64_cols(), chunked(CHUNK_ROWS));
     prepare(&mut engine, tid);
     let rows: Vec<_> = (0..held).map(|i| (i, 1, i as i64)).collect();
     let batch = make_batch_raw(&make_schema_u64_i64(), &rows);
@@ -78,7 +81,6 @@ fn arm(
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn worker_request_bench() {
-    const CHUNK_ROWS: usize = 1024;
     const CHUNKS: usize = 64;
 
     let schema = make_schema_u64_i64();
@@ -124,7 +126,6 @@ fn worker_request_bench() {
 
     let cols = PkColList::from_slice(&[1]);
     let indexed = |engine: &mut CatalogEngine, tid| {
-        engine.registry.set_scan_chunk_rows(CHUNK_ROWS);
         let claim = IndexClaim::Index { id: tid + 1, unique: false };
         engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
     };

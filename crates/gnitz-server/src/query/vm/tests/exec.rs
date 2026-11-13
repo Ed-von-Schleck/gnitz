@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::test_support::{
-    cmp_all, join_reference, make_batch_u128, make_batch_u128_raw, make_schema_u128_i64, register_full_pk,
-    weighted_rows, zset_of,
+    cmp_all, full_pk_spec, join_reference, make_batch_u128, make_batch_u128_raw, make_schema_u128_i64,
+    register_full_pk, weighted_rows, zset_of,
 };
 use gnitz_store::relation::{PkRule, RelationKind, StoreConfig};
 use gnitz_wire::{AggDescriptor, AggFunc, JoinKind, TypeCode, ViewBudget};
@@ -88,15 +88,12 @@ impl TestVm {
     fn open(p: ProgramBuilder, out: DeltaReg) -> TestVm {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = RelationRegistry::new(dir.path().to_str().unwrap(), Slot::SOLO, StoreConfig::default());
-        register_full_pk(
-            &mut registry,
-            VIEW_ID,
-            RelationKind::View(ViewBudget::Plain),
-            make_schema_u128_i64(),
-        );
-        let vm = p.finish(out);
+        let (vm, traces) = p.finish(out);
+        let schema = make_schema_u128_i64();
+        let spec = full_pk_spec(VIEW_ID, RelationKind::View(ViewBudget::Plain), &schema);
+        registry.register_at(spec, schema, &[], traces, None).unwrap();
         TestVm {
-            state: CircuitState::open(&registry, VIEW_ID, vm.layout()).unwrap(),
+            state: CircuitState::open(&registry, VIEW_ID).unwrap(),
             vm,
             registry,
             unfed: Vec::new(),

@@ -518,7 +518,7 @@ fn test_drop_view_removes_directory() {
     // orphan sweep, which production runs once every worker has applied the
     // drop; drive both steps directly here.
     engine.drop_view("public.myview").unwrap();
-    engine.reclaim_orphan_dirs();
+    engine.registry.reclaim_orphan_relation_dirs().unwrap();
     assert!(
         !std::path::Path::new(&view_dir).exists(),
         "view dir must be deleted by the sweep after the drop: {view_dir}"

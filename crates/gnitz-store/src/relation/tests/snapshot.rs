@@ -62,8 +62,7 @@ fn a_pin_holds_only_what_its_process_publishes() {
     // A master publishes the system families' stores alone: a base table's is a
     // worker's.
     let mut r = RelationRegistry::master(tmp.path().to_str().unwrap(), 1, StoreConfig::default());
-    r.register_at(spec(TID, RelationKind::BaseTable, schema), schema, &[], None)
-        .unwrap();
+    r.register(spec(TID, RelationKind::BaseTable, schema), schema).unwrap();
     let pin = r.pin();
     let err = pin.page(TID, &page(schema.layout_digest(), 1)).err().unwrap();
     assert!(err.contains("holds no relation"), "{err}");

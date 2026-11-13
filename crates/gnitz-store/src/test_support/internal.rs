@@ -5,7 +5,9 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::rc::Rc;
 
-use crate::relation::{IndexClaim, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StoreConfig};
+use crate::relation::{
+    IndexClaim, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StateLayout, StoreConfig,
+};
 use crate::storage::{RecoverySource, Table, DEFAULT_RAM_TIER_BYTES};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{
@@ -113,6 +115,14 @@ pub(crate) fn spilling() -> StoreConfig {
     }
 }
 
+/// The default config, scanning `scan_chunk_rows` rows at a time.
+pub(crate) fn chunked(scan_chunk_rows: usize) -> StoreConfig {
+    StoreConfig {
+        scan_chunk_rows,
+        ..StoreConfig::default()
+    }
+}
+
 /// A fed view, its feed retaining `delta_bytes`.
 pub(crate) fn fed_view(delta_bytes: u64) -> RelationKind {
     RelationKind::View(ViewBudget::Fed {
@@ -153,7 +163,9 @@ pub(crate) fn relation_fixture_with(
         .zip(indexed)
         .map(|(id, &cols)| (IndexClaim::Index { id, unique: false }, PkColList::from_slice(cols)))
         .collect();
-    registry.register_at(spec, schema, &indexes, None).unwrap();
+    registry
+        .register_at(spec, schema, &indexes, StateLayout::default(), None)
+        .unwrap();
     for rows in rounds {
         registry.ingest(TID, rows).unwrap();
     }

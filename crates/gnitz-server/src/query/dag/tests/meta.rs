@@ -212,5 +212,5 @@ fn a_view_scanning_a_relation_not_older_than_it_is_refused() {
             Err(format!("scans relation {source}, which is not older than it"))
         );
     }
-    assert!(dag.sources_of(5).next().is_none() && !dag.is_scanned(5) && dag.layout_of(5).is_none());
+    assert!(dag.sources_of(5).next().is_none() && !dag.is_scanned(5));
 }

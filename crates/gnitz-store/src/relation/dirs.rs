@@ -257,7 +257,7 @@ impl RelationRegistry {
 
     /// Relay each base table's children onto this boot's worker count, then
     /// [`Self::reclaim_orphan_relation_dirs`]. Idempotent.
-    pub fn reconcile_child_dirs<'l>(&self, layout_of: impl Fn(u64) -> Option<&'l StateLayout>) -> Result<(), String> {
+    pub fn reconcile_child_dirs(&self) -> Result<(), String> {
         // A relay removes the set it read, and the reclaim deletes directories.
         assert_eq!(
             self.residency,
@@ -274,31 +274,34 @@ impl RelationRegistry {
                 &self.config,
             )?;
         }
-        self.reclaim_orphan_relation_dirs(layout_of)
+        self.reclaim_orphan_relation_dirs()
     }
 
-    /// Whether the rows child and every trace child `layout`, its compiled
-    /// operator state, declares of view `view_id` carry a manifest at
-    /// `generation` on **every launched rank** — the store half of the resume
-    /// verdict.
-    pub fn view_children_resumable(&self, view_id: u64, generation: u64, layout: &StateLayout) -> bool {
+    /// Whether the rows child and every trace child of view `view_id` carry a
+    /// manifest at `generation` on **every launched rank** — the store half of
+    /// the resume verdict. `false` for an unregistered id.
+    pub fn view_children_resumable(&self, view_id: u64, generation: u64) -> bool {
         // A worker cannot speak for its peers.
         assert!(
             matches!(self.residency, Residency::Master | Residency::Origin),
             "view_children_resumable reads every rank's children"
         );
-        children_at_generation(&relation_dir(&self.base_dir, view_id), self.slot.of, generation, layout)
+        self.relations.get(&view_id).is_some_and(|view| {
+            children_at_generation(
+                &relation_dir(&self.base_dir, view_id),
+                self.slot.of,
+                generation,
+                &view.traces,
+            )
+        })
     }
 
     /// Remove every relation directory and child this registry does not own — a
     /// child of another worker count, an index nothing declares or one that
-    /// reads its owner's PK, a trace that `layout_of(id)`, view `id`'s compiled
-    /// operator state, does not declare — the children retired in one batch. Sound only once every process sharing
-    /// `base_dir` has applied this catalog.
-    pub fn reclaim_orphan_relation_dirs<'l>(
-        &self,
-        layout_of: impl Fn(u64) -> Option<&'l StateLayout>,
-    ) -> Result<(), String> {
+    /// reads its owner's PK, a trace its relation does not keep — the children
+    /// retired in one batch. Sound only once every process sharing `base_dir`
+    /// has applied this catalog.
+    pub fn reclaim_orphan_relation_dirs(&self) -> Result<(), String> {
         assert!(
             matches!(self.residency, Residency::Master | Residency::Origin),
             "reclaim_orphan_relation_dirs removes other ranks' children"
@@ -322,9 +325,7 @@ impl RelationRegistry {
                         ChildKind::Index(cols) => entry
                             .index_on(cols.as_slice())
                             .is_none_or(SecondaryIndex::reads_owner_pk),
-                        ChildKind::Scratch(name) => {
-                            !layout_of(entry.id()).is_some_and(|l| l.names().any(|t| t == name))
-                        }
+                        ChildKind::Scratch(name) => !entry.traces.names().any(|t| t == name),
                         ChildKind::Rows => false,
                     }
             })?;

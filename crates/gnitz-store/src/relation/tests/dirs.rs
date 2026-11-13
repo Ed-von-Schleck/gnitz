@@ -195,9 +195,13 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
     let schema = make_schema_u64_i64();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().to_str().unwrap();
-    // Rank 0 of 3, holding a table indexed on its payload column.
+    // Rank 0 of 3, holding a view indexed on its payload column, with one trace.
+    let mut traces = StateLayout::default();
+    traces.declare("agg".to_string(), schema);
+    let agg = traces.names().next().unwrap().to_string();
     let mut r = RelationRegistry::new(base, Slot::new(0, 3), StoreConfig::default());
-    r.register(spec(TID, RelationKind::BaseTable, schema), schema).unwrap();
+    let view = spec(TID, RelationKind::View(ViewBudget::Plain), schema);
+    r.register_at(view, schema, &[], traces, None).unwrap();
     r.add_indexes(
         TID,
         &[(
@@ -206,11 +210,8 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
         )],
     )
     .unwrap();
-    let mut traces = StateLayout::default();
-    traces.declare("agg".to_string(), schema);
-    let agg = traces.names().next().unwrap().to_string();
     r.ingest(TID, make_batch_raw(&schema, &[(1, 1, 7)])).unwrap();
-    r.checkpoint_base().unwrap();
+    r.checkpoint_ephemeral([], 0, |_| true).unwrap();
 
     let rel = relation_dir(base, TID);
     let unowned = [
@@ -234,8 +235,7 @@ fn a_sweep_reclaims_exactly_what_no_relation_owns() {
         std::fs::create_dir_all(dir).unwrap();
     }
     for _ in 0..2 {
-        r.reclaim_orphan_relation_dirs(|id| (id == TID).then_some(&traces))
-            .unwrap();
+        r.reclaim_orphan_relation_dirs().unwrap();
         for dir in &unowned {
             assert!(!std::path::Path::new(dir).exists(), "{dir} is reclaimed");
         }

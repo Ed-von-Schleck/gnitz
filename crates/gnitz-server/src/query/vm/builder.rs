@@ -91,8 +91,9 @@ impl ProgramBuilder {
         self.schemas[reg.at()]
     }
 
-    /// The runnable plan, whose epoch output is extracted from `out_reg`.
-    pub(in crate::query) fn finish(self, out_reg: DeltaReg) -> Vm {
+    /// The runnable plan, whose epoch output is extracted from `out_reg`, and
+    /// the child stores it addresses, to be registered as its view's traces.
+    pub(in crate::query) fn finish(self, out_reg: DeltaReg) -> (Vm, StateLayout) {
         let ProgramBuilder {
             instructions,
             mut integrates,
@@ -142,13 +143,13 @@ impl ProgramBuilder {
         // After the scan, not before: the output register can itself be an operand.
         regs[out_reg.at()].last_read = LastRead::Nobody;
 
-        Vm {
+        let vm = Vm {
             batches: registers(&regs),
             instructions: instructions.into_boxed_slice(),
             integrates: integrates.into_boxed_slice(),
             regs: regs.into_boxed_slice(),
             out_reg,
-            layout,
-        }
+        };
+        (vm, layout)
     }
 }

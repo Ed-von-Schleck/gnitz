@@ -14,7 +14,7 @@ fn dropped_relation_dir_survives_until_the_sweep() {
     engine.drop_table("public.t").unwrap();
     assert!(Path::new(&tbl_dir).exists(), "a drop removes no directory itself");
 
-    engine.reclaim_orphan_dirs();
+    engine.registry.reclaim_orphan_relation_dirs().unwrap();
     assert!(
         !Path::new(&tbl_dir).exists(),
         "the sweep must reclaim a dropped relation's directory"
@@ -35,7 +35,7 @@ fn sweep_keeps_a_re_registered_id() {
     engine.drop_table("public.t").unwrap();
     engine.register_table(tid, PUBLIC_SCHEMA_ID, "t", &cols, &[0]).unwrap();
 
-    engine.reclaim_orphan_dirs();
+    engine.registry.reclaim_orphan_relation_dirs().unwrap();
     assert!(
         Path::new(&tbl_dir).exists(),
         "a re-registered id's directory must survive the sweep"

@@ -108,21 +108,17 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 
 #[test]
 fn index_rebuilds_across_chunk_boundary() {
-    let n: usize = gnitz_store::relation::StoreConfig::default().scan_chunk_rows + 3;
+    let config = chunked(4);
+    let n = config.scan_chunk_rows + 3;
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
 
-    let mut engine = CatalogEngine::open(dir, 1).unwrap();
+    let mut engine = CatalogEngine::open_with(dir, 1, config).unwrap();
 
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
-    let mut next = 0usize;
-    while next < n {
-        let end = (next + 8192).min(n);
-        let chunk = rows(&engine, tid, 1, next as u64..end as u64, |i| [i * 10]);
-        engine.registry.ingest(tid, chunk).unwrap();
-        next += 8192;
-    }
+    let base = rows(&engine, tid, 1, 0..n as u64, |i| [i * 10]);
+    engine.registry.ingest(tid, base).unwrap();
 
     // `val` is distinct, so the unique flavour also covers the live chunked
     // duplicate scan (seen-set across chunks) finding nothing.
@@ -130,7 +126,7 @@ fn index_rebuilds_across_chunk_boundary() {
 
     engine.close();
 
-    let engine2 = CatalogEngine::open(dir, 1).unwrap();
+    let engine2 = CatalogEngine::open_with(dir, 1, chunked(4)).unwrap();
 
     assert_eq!(
         net_weight(&engine2, tid),

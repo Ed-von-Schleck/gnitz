@@ -20,13 +20,13 @@ pub(super) fn compile(circuit: &Circuit, registry: &RelationRegistry, bounded: b
     let meta = routing(circuit, registry)?;
     let ctx = EmitCtx::emit(circuit, &meta, VIEW)?;
     let view = ctx.prog.schema_of(ctx.regs[circuit.out()]);
-    compile_view(circuit, registry, VIEW, &view, bounded).map(|(out, _)| out)
+    compile_view(circuit, registry, VIEW, &view, bounded).map(|(out, ..)| out)
 }
 
 /// The placement a view of the schema `circuit` outputs registers under.
 pub(super) fn placed(circuit: &Circuit, registry: &RelationRegistry) -> Result<Placement, String> {
     let view = *compile(circuit, registry, false)?.vm.out_schema();
-    compile_view(circuit, registry, VIEW, &view, false).map(|(_, placement)| placement)
+    compile_view(circuit, registry, VIEW, &view, false).map(|(_, placement, _)| placement)
 }
 
 /// One table row's circuit, built into an empty [`Circuit`].

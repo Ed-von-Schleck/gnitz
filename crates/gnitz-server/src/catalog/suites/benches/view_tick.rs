@@ -257,9 +257,7 @@ fn one_row_ticks(what: &str, register: impl Fn(&mut CatalogEngine, u64) -> u64) 
         ("few shards", StoreConfig { ram_tier_bytes: 256 << 10, ..d }),
         ("many shards", many),
     ] {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut engine = CatalogEngine::open_with(tmp.path().to_str().unwrap(), 1, config).unwrap();
-        let t = engine.create_table("public.t", &group_cols(), &[0]).unwrap();
+        let (_tmp, mut engine, t) = table_engine_with(1, &group_cols(), config);
         let base = rows(&engine, t, 1, 0..ROWS, group_cells);
         engine.registry.ingest(t, base).unwrap();
 

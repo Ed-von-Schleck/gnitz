@@ -80,7 +80,7 @@ fn compile_global(build: impl Fn(&mut Circuit, NodeId), source: Source, slot: Sl
     let a = scan(&mut c, 10);
     build(&mut c, a);
     let view = *compile(&c, &sources([(10, source)]), false)?.vm.out_schema();
-    compile_view(&c, &sources_at(slot, [(10, source)]), VIEW, &view, false).map(|(out, _)| out)
+    compile_view(&c, &sources_at(slot, [(10, source)]), VIEW, &view, false).map(|(out, ..)| out)
 }
 
 /// A side ends in its global operator's partial — a layout of its own — exactly

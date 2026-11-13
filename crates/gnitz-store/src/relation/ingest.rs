@@ -58,7 +58,7 @@ impl Relation {
     /// `landing` puts it, a base table's under `rule`; the batch as applied
     /// comes back iff it asks for an echo and the batch holds a row.
     fn apply(&mut self, batch: Batch, landing: Landing, rule: PkRule) -> Result<Option<Batch>, String> {
-        let Relation { spec, rows, indexes } = self;
+        let Relation { spec, rows, indexes, .. } = self;
         let id = spec.id;
         // Checked, not asserted: the append path sizes by the destination's region
         // count, so a mismatch would silently drop the extra column.
@@ -143,11 +143,12 @@ impl RelationRegistry {
         self.ingest_with(id, batch, PkRule::Enforce, false)
     }
 
-    /// Apply `batch` to `id`'s store and its index projections, moving it in.
-    /// Every batch is consolidated, a base table's after `rule`; a stream writes
-    /// nothing, holding no rows. At `pending` the rows land above the cut: every
-    /// reader sees them but one at [`Cut::Sealed`](super::Cut::Sealed), until
-    /// [`Self::seal`] answers them, and a view is refused.
+    /// Apply `batch` to `id`'s store and its index projections, moving it in,
+    /// consolidated, a base table's after `rule`. At `pending` the rows land
+    /// above the cut: every reader sees them but one at
+    /// [`Cut::Sealed`](super::Cut::Sealed), until [`Self::seal`] answers them,
+    /// and a view is refused. A stream holds no rows: it keeps a pending batch
+    /// as pushed, for the seal, and writes nothing at the cut.
     #[inline(always)]
     pub fn ingest_with(&mut self, id: u64, batch: Batch, rule: PkRule, pending: bool) -> Result<(), String> {
         let relation = self.relation_mut_or_err(id)?;

@@ -15,16 +15,20 @@ use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
 use gnitz_zset::schema::SchemaDescriptor;
 
-/// Register relation `id`, a `kind` over `schema` placed by its full PK.
-pub fn register_full_pk(registry: &mut RelationRegistry, id: u64, kind: RelationKind, schema: SchemaDescriptor) {
-    let spec = RelationSpec {
+/// Relation `id`, a `kind` over `schema` placed by its full PK.
+pub fn full_pk_spec(id: u64, kind: RelationKind, schema: &SchemaDescriptor) -> RelationSpec {
+    RelationSpec {
         id,
         kind,
-        placement: Placement::full_pk(&schema),
+        placement: Placement::full_pk(schema),
         pk_repeats: false,
         compress: false,
-    };
-    registry.register(spec, schema).unwrap();
+    }
+}
+
+/// Register [`full_pk_spec`].
+pub fn register_full_pk(registry: &mut RelationRegistry, id: u64, kind: RelationKind, schema: SchemaDescriptor) {
+    registry.register(full_pk_spec(id, kind, &schema), schema).unwrap();
 }
 
 // ── Catalog column fixtures ─────────────────────────────────────────────────
@@ -408,17 +412,39 @@ pub fn refusal(e: ZoneError) -> String {
 /// A fresh engine at `workers` on its own temporary directory, which lives as
 /// long as the returned guard.
 pub fn empty_catalog(workers: u32) -> (tempfile::TempDir, CatalogEngine) {
+    empty_catalog_with(workers, StoreConfig::from_env("GNITZ_"))
+}
+
+/// [`empty_catalog`] under `config`.
+pub fn empty_catalog_with(workers: u32, config: StoreConfig) -> (tempfile::TempDir, CatalogEngine) {
     let dir = tempfile::tempdir().unwrap();
-    let engine = CatalogEngine::open(dir.path().to_str().unwrap(), workers).unwrap();
+    let engine = CatalogEngine::open_with(dir.path().to_str().unwrap(), workers, config).unwrap();
     (dir, engine)
 }
 
 /// [`empty_catalog`] holding an empty `public.t` over `cols` on PK column 0;
 /// and its id.
 pub fn table_engine(workers: u32, cols: &[CatalogColumn]) -> (tempfile::TempDir, CatalogEngine, u64) {
-    let (dir, mut engine) = empty_catalog(workers);
+    table_engine_with(workers, cols, StoreConfig::from_env("GNITZ_"))
+}
+
+/// [`table_engine`] under `config`.
+pub fn table_engine_with(
+    workers: u32,
+    cols: &[CatalogColumn],
+    config: StoreConfig,
+) -> (tempfile::TempDir, CatalogEngine, u64) {
+    let (dir, mut engine) = empty_catalog_with(workers, config);
     let tid = engine.create_table("public.t", cols, &[0]).unwrap();
     (dir, engine, tid)
+}
+
+/// The environment's [`StoreConfig`], scanning `scan_chunk_rows` rows at a time.
+pub fn chunked(scan_chunk_rows: usize) -> StoreConfig {
+    StoreConfig {
+        scan_chunk_rows,
+        ..StoreConfig::from_env("GNITZ_")
+    }
 }
 
 /// Split `schema.name`, defaulting the schema half. Only the in-process DDL

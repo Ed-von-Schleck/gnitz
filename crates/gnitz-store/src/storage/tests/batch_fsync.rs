@@ -37,7 +37,7 @@ fn batch_sync_reaps_through_interrupted_and_short_submits() {
 #[test]
 fn sync_paths_spans_several_chunks() {
     let dir = tempfile::tempdir().unwrap();
-    let paths: Vec<_> = (0..2 * FD_CHUNK_THRESHOLD + 1)
+    let paths: Vec<_> = (0..2 * FD_CHUNK + 1)
         .map(|i| {
             let p = dir.path().join(i.to_string());
             File::create(&p).unwrap();

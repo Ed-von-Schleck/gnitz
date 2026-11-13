@@ -1,6 +1,8 @@
 use super::*;
-use crate::relation::{RelationKind, StoreConfig};
-use crate::test_support::{id_rows, pk_only_schema, relation_fixture_with, spec, u64_pk_schema, RelationFixture, TID};
+use crate::relation::RelationKind;
+use crate::test_support::{
+    chunked, id_rows, pk_only_schema, relation_fixture_with, spec, u64_pk_schema, RelationFixture, TID,
+};
 use gnitz_wire::TypeCode;
 use gnitz_zset::algebra::Slot;
 use gnitz_zset::schema::SchemaColumn;
@@ -22,14 +24,10 @@ fn fixture(indexed: bool, chunk_rows: usize) -> RelationFixture {
             bb.put_opt_int(val(id).map(|v| v as u128))
         })
     };
-    let config = StoreConfig {
-        scan_chunk_rows: chunk_rows,
-        ..StoreConfig::default()
-    };
     let indexed: &[&[u32]] = if indexed { &[&[1]] } else { &[] };
     let rounds = [rows(1, &mut (0..ROWS)), rows(-1, &mut (0..ROWS).step_by(3))];
     relation_fixture_with(
-        config,
+        chunked(chunk_rows),
         Slot::SOLO,
         spec(TID, RelationKind::BaseTable, schema),
         schema,

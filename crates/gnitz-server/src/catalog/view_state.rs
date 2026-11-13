@@ -1,6 +1,6 @@
 //! Store state that needs both the registry and the DAG: the store open under
-//! the boot's resume point, the ephemeral checkpoint round, the orphan-directory
-//! sweep, and the hydrating read.
+//! the boot's resume point, the ephemeral checkpoint round, and the hydrating
+//! read.
 
 use gnitz_store::read::ReadRows;
 use gnitz_store::relation::Residency;
@@ -32,13 +32,5 @@ impl CatalogEngine {
     /// The ephemeral checkpoint round at `generation`.
     pub(crate) fn flush_ephemeral_round(&mut self, generation: u64) -> Result<(), String> {
         self.dag.checkpoint_ephemeral(&mut self.registry, generation)
-    }
-
-    /// Remove every relation and index directory no live entity owns. Only sound once
-    /// every worker has ACKed a round written after the last DdlSync.
-    pub(crate) fn reclaim_orphan_dirs(&self) {
-        if let Err(e) = self.registry.reclaim_orphan_relation_dirs(|id| self.dag.layout_of(id)) {
-            gnitz_warn!("catalog: orphan directory sweep failed: {}", e);
-        }
     }
 }

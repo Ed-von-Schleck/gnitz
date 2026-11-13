@@ -156,14 +156,18 @@ fn a_reopened_index_resumes_only_at_its_owners_generation() {
     let rows = make_batch_raw(&schema, &[(1, 1, 30), (2, 1, 10), (3, 1, 20)]);
     {
         let mut origin = solo(tmp.path());
-        origin.register_at(spec, schema, &indexes, None).unwrap();
+        origin
+            .register_at(spec, schema, &indexes, StateLayout::default(), None)
+            .unwrap();
         origin.ingest(9, rows.clone()).unwrap();
         origin.checkpoint_ephemeral([], 4, |_| true).unwrap();
     }
     // How many indexes a reopen at `generation` filled.
     let reopen = |generation: u64| {
         let mut r = solo(tmp.path());
-        let filled = r.register_at(spec, schema, &indexes, Some(generation)).unwrap();
+        let filled = r
+            .register_at(spec, schema, &indexes, StateLayout::default(), Some(generation))
+            .unwrap();
         let ix = r.relation(9).unwrap().index_on(&[1]).unwrap();
         assert_index_holds(ix, &rows, format_args!("generation {generation}"));
         (r, filled)
@@ -262,7 +266,7 @@ fn an_index_leading_the_pk_reads_the_owners_rows() {
     }
 
     std::fs::create_dir_all(dir(leading[0])).unwrap();
-    r.reclaim_orphan_relation_dirs(|_| None).unwrap();
+    r.reclaim_orphan_relation_dirs().unwrap();
     assert!(
         !Path::new(&dir(leading[0])).exists(),
         "an index that reads the PK owns no directory"

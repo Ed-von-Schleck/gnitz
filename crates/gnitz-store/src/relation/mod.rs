@@ -342,6 +342,9 @@ pub struct Relation {
     spec: RelationSpec,
     rows: Rows,
     indexes: Vec<SecondaryIndex>,
+    /// The operator traces a view's compiled circuit keeps, each a child store
+    /// of its own; none for any other relation.
+    traces: StateLayout,
 }
 
 impl Relation {
@@ -685,12 +688,6 @@ impl RelationRegistry {
     /// See [`StoreConfig::scan_chunk_rows`].
     pub fn scan_chunk_rows(&self) -> usize {
         self.config.scan_chunk_rows
-    }
-
-    /// Set the chunk size, clamped to at least one row. Per registry, not
-    /// process-wide. Production sets it once through [`StoreConfig`].
-    pub fn set_scan_chunk_rows(&mut self, rows: usize) {
-        self.config.scan_chunk_rows = rows.max(1);
     }
 
     /// The relation `id` names, or `None` for an unknown id.

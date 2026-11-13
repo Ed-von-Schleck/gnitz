@@ -1,7 +1,7 @@
 use super::*;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
-    batch_rows, between, col_range, cut, id_rows, img, make_batch_raw, make_schema_u64_i64, map_of, order_by,
+    batch_rows, between, chunked, col_range, cut, id_rows, img, make_batch_raw, make_schema_u64_i64, map_of, order_by,
     relation_fixture, relation_fixture_with, rows_spec, spec, spilling, zset_of, RelationFixture, Rng, TID,
 };
 use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
@@ -12,12 +12,13 @@ use gnitz_zset::repr::{BatchBuilder, SourceCursor};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 /// [`relation_fixture`] over a plain `(id U64 PK | val I64)` view holding the
-/// `(id, weight, val)` `rows`. A view's store runs no `enforce_unique_pk`, so a PK
-/// may repeat and a weight above 1 is admitted verbatim.
-fn view(rows: &[(u64, i64, i64)]) -> RelationFixture {
+/// `(id, weight, val)` `rows`, scanned `scan_chunk_rows` rows at a time. A view's
+/// store runs no `enforce_unique_pk`, so a PK may repeat and a weight above 1 is
+/// admitted verbatim.
+fn view(rows: &[(u64, i64, i64)], scan_chunk_rows: usize) -> RelationFixture {
     let schema = make_schema_u64_i64();
     let batch = make_batch_raw(&schema, rows);
-    view_with(StoreConfig::default(), schema, [batch])
+    view_with(chunked(scan_chunk_rows), schema, [batch])
 }
 
 /// A plain view over `schema` under `config`, holding `rounds`: a view whose
@@ -82,8 +83,7 @@ fn a_cut_keeps_the_first_rows_covering_its_window() {
                 (id, w, val)
             })
             .collect();
-        let mut r = view(&rows);
-        r.set_scan_chunk_rows(1 + rng.gen_range(16) as usize);
+        let r = view(&rows, 1 + rng.gen_range(16) as usize);
         let desc = [None, Some(false), Some(true)][rng.gen_range(3) as usize];
         let k = match rng.gen_range(8) {
             0 => 65_537,
@@ -160,8 +160,11 @@ fn a_filtered_read_over_many_runs_keeps_the_survivors_net_weights() {
             let batches = rounds
                 .iter()
                 .map(|rows| make_batch_raw(&schema, rows).into_consolidated());
-            let mut r = view_with(config, schema, batches);
-            r.set_scan_chunk_rows(1 + rng.gen_range(24) as usize);
+            let config = StoreConfig {
+                scan_chunk_rows: 1 + rng.gen_range(24) as usize,
+                ..config
+            };
+            let r = view_with(config, schema, batches);
             let spec = ReadSpec {
                 predicate: between(1, lo, hi),
                 ..rows_spec(None, None)
@@ -177,8 +180,7 @@ fn a_filtered_read_over_many_runs_keeps_the_survivors_net_weights() {
 fn a_fold_counts_the_survivors_of_every_chunk() {
     let schema = make_schema_u64_i64();
     let rows: Vec<_> = (0..20).map(|id| (id, 2, id as i64 % 3)).collect();
-    let mut r = view(&rows);
-    r.set_scan_chunk_rows(4);
+    let r = view(&rows, 4);
     let agg = GroupAggs {
         group_cols: vec![1],
         aggs: vec![AggDescriptor::COUNT_STAR],
@@ -266,10 +268,9 @@ fn keyed_reads_return_each_named_keys_whole_group() {
     let schema = make_schema_u64_i64();
     let mut rows: Vec<_> = (0..10).map(|id| (id, 1, id as i64 * 10)).collect();
     rows.extend([(7, 1, 71), (7, 1, 72), (7, 1, 73)]);
-    let mut r = view(&rows);
+    let mut r = view(&rows, 2);
     // Retracted in a later ingest, (7, 70) is a ghost every read must drop.
     r.ingest(TID, make_batch_raw(&schema, &[(7, -1, 70)])).unwrap();
-    r.set_scan_chunk_rows(2);
     let pk_range = |start, end| col_range(0, start, end);
     let reads = [
         (ReadBound::None, (0..10).collect()),
@@ -405,9 +406,15 @@ fn map_fixture(
 ) -> RelationFixture {
     let schema = SchemaDescriptor::new(cols, &[0]);
     let kind = RelationKind::View(ViewBudget::Plain);
-    let mut r = relation_fixture(kind, schema, &[], [id_rows(&schema, weighted(0..n), put_row)]);
-    r.set_scan_chunk_rows(chunk_rows);
-    r
+    let rows = id_rows(&schema, weighted(0..n), put_row);
+    relation_fixture_with(
+        chunked(chunk_rows),
+        Slot::SOLO,
+        spec(TID, kind, schema),
+        schema,
+        &[],
+        [rows],
+    )
 }
 
 /// `spec`'s reply over `r` is `want`, weight for weight.
@@ -535,7 +542,14 @@ fn skeleton_fixture() -> RelationFixture {
     let kind = RelationKind::View(ViewBudget::Bounded {
         capacity_bytes: std::num::NonZeroU64::MIN,
     });
-    let mut r = relation_fixture(kind, schema, &[], [rows(0..5)]);
+    let mut r = relation_fixture_with(
+        chunked(2),
+        Slot::SOLO,
+        spec(TID, kind, schema),
+        schema,
+        &[],
+        [rows(0..5)],
+    );
     r.checkpoint_ephemeral([], 1, |_| true).unwrap();
     r.settle(TID).unwrap();
     assert!(
@@ -545,7 +559,6 @@ fn skeleton_fixture() -> RelationFixture {
     r.ingest(TID, rows(100..105)).unwrap();
     r.ingest(TID, make_batch_raw(&schema, &[(2, 1, 7), (100, 1, 7)]))
         .unwrap();
-    r.set_scan_chunk_rows(2);
     r
 }
 

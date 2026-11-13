@@ -1,4 +1,4 @@
-use gnitz_store::relation::{IndexClaim, RelationSpec};
+use gnitz_store::relation::{IndexClaim, RelationSpec, StateLayout};
 use gnitz_wire::{IdxTabRow, TableDistribution, ViewParts};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
@@ -43,7 +43,7 @@ impl CatalogEngine {
     fn register_relation(&mut self, rel: &RelRow<'_>) -> Result<(), String> {
         let col_defs = self.read_column_defs(rel.id)?;
         let schema = build_schema_from_col_defs(&col_defs, rel.pk.as_slice())?;
-        let (placement, pk_repeats, compress) = match rel.detail {
+        let (placement, pk_repeats, compress, traces) = match rel.detail {
             RelDetail::View(ViewParts { owner, pk_repeats, props }) => {
                 let circuit = self.read_circuit(rel.id)?;
                 let chain = owner.unwrap_or(rel.id);
@@ -72,7 +72,7 @@ impl CatalogEngine {
                         ));
                     }
                 }
-                let placement = self.dag.register_view(
+                let (placement, traces) = self.dag.register_view(
                     &self.registry,
                     rel.id,
                     &schema,
@@ -80,7 +80,7 @@ impl CatalogEngine {
                     chain,
                     &circuit,
                 )?;
-                (placement, pk_repeats, props.compress)
+                (placement, pk_repeats, props.compress, traces)
             }
             RelDetail::Table(t) => {
                 let placement = match t.distribution {
@@ -89,7 +89,7 @@ impl CatalogEngine {
                     TableDistribution::Keyed { prefix_len } => Placement::keyed(&schema, prefix_len as usize),
                 };
                 // A base table's PK is unique by `enforce_unique_pk`; a stream's is not.
-                (placement, t.stream, t.compress)
+                (placement, t.stream, t.compress, StateLayout::default())
             }
         };
         gnitz_debug!(
@@ -126,7 +126,7 @@ impl CatalogEngine {
             compress,
         };
         let entry = RelationEntry::new(&schema, &col_defs, fks);
-        self.registry.register_at(spec, schema, &fk_indexes, None)?;
+        self.registry.register_at(spec, schema, &fk_indexes, traces, None)?;
         self.caches.enter(rel.id, entry);
         Ok(())
     }

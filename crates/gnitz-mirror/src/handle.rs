@@ -7,7 +7,7 @@ use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::{gnitz_debug, gnitz_error};
 use gnitz_store::relation::{
-    lock_data_dir, DirLock, IndexClaim, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
+    lock_data_dir, DirLock, IndexClaim, RelationKind, RelationRegistry, RelationSpec, StateLayout, StoreConfig,
 };
 use gnitz_wire::{PkColList, ViewBudget};
 use gnitz_zset::algebra::{Placement, Slot};
@@ -122,8 +122,7 @@ impl Mirror {
         }
         // A failure may be transient, and the sweep would delete that copy.
         if all_reopened {
-            // A copy carries no operator state, so no trace child is its own.
-            if let Err(e) = store.registry.reclaim_orphan_relation_dirs(|_| None) {
+            if let Err(e) = store.registry.reclaim_orphan_relation_dirs() {
                 gnitz_debug!("mirror: orphan directory sweep failed: {}", e);
             }
         }
@@ -152,9 +151,11 @@ impl Mirror {
             compress: false,
         };
         let indexes: Vec<_> = rec.indexes.iter().map(|&cols| (index_claim(cols), cols)).collect();
-        // On `Err` nothing is entered, and nothing erased: the fault may be
-        // transient, and the stores resumable.
-        let filled = self.registry.register_at(spec, schema, &indexes, resume)?;
+        // A copy keeps no operator traces. On `Err` nothing is entered, and
+        // nothing erased: the fault may be transient, and the stores resumable.
+        let filled = self
+            .registry
+            .register_at(spec, schema, &indexes, StateLayout::default(), resume)?;
         self.records.insert(tid, rec);
         // A fresh copy has no manifest, and an index that did not resume holds
         // rows no manifest does.

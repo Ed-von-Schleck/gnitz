@@ -185,9 +185,9 @@ impl Instr {
 // ---------------------------------------------------------------------------
 
 /// A compiled DBSP program and the registers it runs over. It owns every
-/// resource its instructions name, and the layout of the child stores they
-/// address; the stores themselves are the caller's: the view's own children
-/// ([`CircuitState`]) and the relations an [`Integral::Relation`] reads.
+/// resource its instructions name; the stores they address are the caller's:
+/// the view's own children ([`CircuitState`]), whose layout its view is
+/// registered with, and the relations an [`Integral::Relation`] reads.
 pub(in crate::query) struct Vm {
     instructions: Box<[Instr]>,
     /// Each tick's accumulation of a register into its trace. Run after the
@@ -200,8 +200,6 @@ pub(in crate::query) struct Vm {
     batches: Box<[Batch]>,
     /// The register the epoch's output is extracted from.
     out_reg: DeltaReg,
-    /// The child stores the instructions and integrates address.
-    layout: StateLayout,
 }
 
 /// Who last reads a register: an instruction, an integrate — which run after
@@ -253,12 +251,6 @@ impl Vm {
     /// The schema of the register the epoch's output leaves in.
     pub(in crate::query) fn out_schema(&self) -> &SchemaDescriptor {
         self.schema_of(self.out_reg)
-    }
-
-    /// The child stores this program addresses, to be opened as its
-    /// [`CircuitState`].
-    pub(in crate::query) fn layout(&self) -> &StateLayout {
-        &self.layout
     }
 
     /// True iff a reduce reads the view's own store as its output trace.

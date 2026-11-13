@@ -75,7 +75,7 @@ impl CatalogEngine {
         // manifests — here, where no worker exists yet.
         engine
             .registry
-            .reconcile_child_dirs(|id| engine.dag.layout_of(id))
+            .reconcile_child_dirs()
             .map_err(|e| format!("child-dir sweep failed: {e}"))?;
         let resume_at = engine.durable_generation();
         let rebuild = engine.dag.decide_rebuild(&engine.registry, resume_at);

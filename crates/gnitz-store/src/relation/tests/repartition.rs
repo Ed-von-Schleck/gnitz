@@ -95,7 +95,7 @@ fn boot(base: &str, of: u32, schema: SchemaDescriptor, placement: Placement) -> 
             schema,
         )
         .unwrap();
-    master.reconcile_child_dirs(|_| None)
+    master.reconcile_child_dirs()
 }
 
 /// Whether any child of `rel`'s `of`-worker set holds a manifest.

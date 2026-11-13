@@ -4,8 +4,8 @@
 use super::*;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::test_support::{
-    batch_rows, between, cmp_all, col_range, cut, fed_view, id_rows, img, make_batch_raw, make_schema_u64_i64, map_of,
-    pk_only_schema, pk_payload_schema, relation_fixture, relation_fixture_with, rows_spec, spec, Rng, TID,
+    batch_rows, between, chunked, cmp_all, col_range, cut, fed_view, id_rows, img, make_batch_raw, make_schema_u64_i64,
+    map_of, pk_only_schema, pk_payload_schema, relation_fixture, relation_fixture_with, rows_spec, spec, Rng, TID,
 };
 use gnitz_expr::{CmpOp, LogicalProgram};
 use gnitz_wire::{PkKeys, ReadSink, TypeCode, ViewBudget};
@@ -253,10 +253,10 @@ fn reads_past_any_cursor_match_a_model() {
         let budget = [1 << 30, 400_000, 60_000][(seed % 3) as usize];
         let config = StoreConfig {
             ram_tier_bytes: [1 << 11, StoreConfig::default().ram_tier_bytes][(seed % 2) as usize],
+            scan_chunk_rows: [1, 3, 200, 8192][(seed % 4) as usize],
             ..StoreConfig::default()
         };
         let mut r = relation_fixture_with(config, Slot::SOLO, feed_spec(budget), view_schema(), &[], []);
-        r.set_scan_chunk_rows([1, 3, 200, 8192][(seed % 4) as usize]);
         let cases = cases();
         let mut subs: Vec<Subscriber> = (0..cases.len())
             .flat_map(|case| [false, true].map(|lagging| (case, lagging)))
@@ -444,8 +444,14 @@ fn a_delta_read_refuses_what_it_cannot_answer() {
 #[test]
 fn a_delta_read_reads_each_round_once_however_rounds_are_chunked() {
     let schema = make_schema_u64_i64();
-    let mut r = relation_fixture(fed_view(1 << 30), schema, &[], []);
-    r.set_scan_chunk_rows(10);
+    let mut r = relation_fixture_with(
+        chunked(10),
+        Slot::SOLO,
+        spec(TID, fed_view(1 << 30), schema),
+        schema,
+        &[],
+        [],
+    );
     // 4 + 4 + 2 fills a chunk of 10; 1 + 7 leaves no room for the 8 after it.
     let sizes = [3, 5, 200, 4, 4, 2, 130, 1, 7, 8, 129, 10, 1];
     let mut want = Vec::new();

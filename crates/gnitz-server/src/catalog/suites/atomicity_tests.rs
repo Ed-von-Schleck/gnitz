@@ -349,7 +349,7 @@ fn refused_create_table_leaves_no_trace() {
         before,
         "no system family may keep a row of the table"
     );
-    engine.reclaim_orphan_dirs();
+    engine.registry.reclaim_orphan_relation_dirs().unwrap();
     assert!(
         !std::path::Path::new(&relation_dir(engine.registry.base_dir(), tid)).exists(),
         "the sweep must reclaim the uncreated table's directory"

@@ -12,7 +12,7 @@ use io_uring::{opcode, types, IoUring};
 use gnitz_zset::repr::StorageError;
 
 /// The fds one sync batch opens, and the ring's SQ size.
-const FD_CHUNK_THRESHOLD: usize = 256;
+const FD_CHUNK: usize = 256;
 
 /// Blocking fsync instead of io_uring, set once this host denied
 /// `io_uring_setup`.
@@ -23,7 +23,7 @@ fn new_ring() -> Result<Option<IoUring>, StorageError> {
     if BLOCKING.load(Relaxed) {
         return Ok(None);
     }
-    let e = match IoUring::new(FD_CHUNK_THRESHOLD as u32) {
+    let e = match IoUring::new(FD_CHUNK as u32) {
         Ok(r) => return Ok(Some(r)),
         Err(e) => e,
     };
@@ -47,7 +47,7 @@ pub(super) struct Syncer {
 }
 
 impl Syncer {
-    /// Sync `paths`, [`FD_CHUNK_THRESHOLD`] open files at a time; `DATASYNC`
+    /// Sync `paths`, [`FD_CHUNK`] open files at a time; `DATASYNC`
     /// in `flags` selects fdatasync.
     pub(super) fn sync_paths<P: AsRef<Path>>(
         &mut self,
@@ -58,7 +58,7 @@ impl Syncer {
         while paths.peek().is_some() {
             let files: Vec<File> = paths
                 .by_ref()
-                .take(FD_CHUNK_THRESHOLD)
+                .take(FD_CHUNK)
                 .map(File::open)
                 .collect::<Result<_, _>>()?;
             let ring = if files.len() > 1 { self.ring()? } else { None };
@@ -96,8 +96,7 @@ fn batch_sync_with(
         let sqe = opcode::Fsync::new(types::Fd(f.as_raw_fd())).flags(flags).build();
         // SAFETY: an Fsync SQE points at no user memory; the kernel takes its
         // own reference to the file when it submits.
-        unsafe { ring.submission().push(&sqe) }
-            .expect("the SQ holds FD_CHUNK_THRESHOLD entries and starts each batch empty");
+        unsafe { ring.submission().push(&sqe) }.expect("the SQ holds FD_CHUNK entries and starts each batch empty");
     }
     // A wait can return early (a signal, a short submit): reap until every CQE is in.
     let mut reaped = 0;

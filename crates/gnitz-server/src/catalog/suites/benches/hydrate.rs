@@ -25,13 +25,13 @@ fn payload(id: u64) -> [u64; 4] {
 
 /// An empty engine whose every store spills past a small RAM tier.
 fn spilling_engine() -> (tempfile::TempDir, CatalogEngine) {
-    let config = StoreConfig {
-        ram_tier_bytes: 1 << 20,
-        ..Default::default()
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let engine = CatalogEngine::open_with(dir.path().to_str().unwrap(), 1, config).unwrap();
-    (dir, engine)
+    empty_catalog_with(
+        1,
+        StoreConfig {
+            ram_tier_bytes: 1 << 20,
+            ..Default::default()
+        },
+    )
 }
 
 /// An identity view over a `ROWS`-row base, bounded at `capacity` bytes and

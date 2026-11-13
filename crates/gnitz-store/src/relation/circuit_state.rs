@@ -40,6 +40,11 @@ impl StateLayout {
     pub(super) fn names(&self) -> impl Iterator<Item = &str> {
         self.children.iter().map(|(name, _)| name.as_str())
     }
+
+    /// Whether no child is declared.
+    pub(super) fn is_empty(&self) -> bool {
+        self.children.is_empty()
+    }
 }
 
 /// The rederived operator state of one compiled circuit: the stores its stateful
@@ -49,13 +54,14 @@ pub struct CircuitState {
 }
 
 impl CircuitState {
-    /// Open every child `layout` declares, in registered view `view_id`'s
-    /// directory at this registry's rank.
-    pub fn open(reg: &RelationRegistry, view_id: u64, layout: &StateLayout) -> Result<Self, String> {
+    /// Open every trace registered view `view_id` keeps, in its directory at
+    /// this registry's rank.
+    pub fn open(reg: &RelationRegistry, view_id: u64) -> Result<Self, String> {
         let view = reg.relation_or_err(view_id)?;
         // The traces resume from the generation the output they feed resumed from.
         let recovery = RecoverySource::Rederive { resume_at: view.loaded_mark() };
-        let tables = layout
+        let tables = view
+            .traces
             .children
             .iter()
             .map(|(child, schema)| {

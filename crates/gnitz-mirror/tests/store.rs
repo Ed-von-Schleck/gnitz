@@ -607,6 +607,7 @@ fn a_damaged_copy_costs_that_copy_alone() {
                     },
                     make_schema_u64_i64(),
                     &[],
+                    Default::default(),
                     Some(FIRST_GENERATION),
                 )
                 .unwrap();

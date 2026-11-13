@@ -81,7 +81,8 @@ impl DagEngine {
 
     /// Compile `circuit` as `view_id`'s plan and link the view to its sources, both
     /// kept until [`Self::forget`], and answer the placement its store registers
-    /// under. `chain`: the user view whose chain holds it — itself for a user view.
+    /// under and the operator traces it is registered with. `chain`: the user view
+    /// whose chain holds it — itself for a user view.
     pub(crate) fn register_view(
         &mut self,
         registry: &RelationRegistry,
@@ -90,12 +91,12 @@ impl DagEngine {
         bounded: bool,
         chain: u64,
         circuit: &gnitz_wire::Circuit,
-    ) -> Result<Placement, String> {
+    ) -> Result<(Placement, StateLayout), String> {
         // Tick scheduling and backfill take ascending id order as dependency order.
         if let Some(src) = circuit.sources().find(|&s| s >= view_id) {
             return Err(format!("scans relation {src}, which is not older than it"));
         }
-        let (code, placement) = compiler::compile_view(circuit, registry, view_id, view, bounded)?;
+        let (code, placement, traces) = compiler::compile_view(circuit, registry, view_id, view, bounded)?;
         // A source not registered here is a root only if it is no view.
         debug_assert!(code
             .source_ids()
@@ -113,7 +114,7 @@ impl DagEngine {
         let roots = roots.into_boxed_slice();
         self.views
             .insert(view_id, RegisteredView { code, state: None, chain, roots });
-        Ok(placement)
+        Ok((placement, traces))
     }
 
     /// View `view_id`'s registration.
@@ -129,12 +130,6 @@ impl DagEngine {
         self.views
             .get(&id)
             .is_some_and(|v| v.chain != id && !v.code.vm.reads_view_store())
-    }
-
-    /// The operator state the compiled circuit of view `id` opens; `None` for an
-    /// id that is no view here.
-    pub(crate) fn layout_of(&self, id: u64) -> Option<&StateLayout> {
-        self.views.get(&id).map(|v| v.code.vm.layout())
     }
 
     /// The user view whose chain holds view `id`: its owner, or `id` itself.
@@ -180,7 +175,7 @@ impl DagEngine {
         let stale: Vec<u64> = self
             .views
             .iter()
-            .filter(|(id, v)| !invalid.contains(*id) && !registry.view_children_resumable(**id, g, v.code.vm.layout()))
+            .filter(|&(id, _)| !invalid.contains(id) && !registry.view_children_resumable(*id, g))
             .map(|(&id, _)| id)
             .collect();
         invalid.extend(stale);
@@ -249,7 +244,7 @@ impl DagEngine {
             .views
             .iter_mut()
             .filter(|(&id, v)| resumes(id) && (v.state.is_some() || !stamped(id)))
-            .map(|(&id, v)| open_state(&mut v.state, registry, id, v.code.vm.layout()))
+            .map(|(&id, v)| open_state(&mut v.state, registry, id))
             .collect::<Result<Vec<_>, String>>()?;
         registry.checkpoint_ephemeral(states, generation, resumes)
     }
@@ -266,10 +261,9 @@ fn open_state<'a>(
     state: &'a mut Option<CircuitState>,
     registry: &RelationRegistry,
     view_id: u64,
-    layout: &StateLayout,
 ) -> Result<&'a mut CircuitState, String> {
     if state.is_none() {
-        let open = CircuitState::open(registry, view_id, layout);
+        let open = CircuitState::open(registry, view_id);
         *state = Some(open.map_err(|e| format!("view_id={view_id}: open operator state: {e}"))?);
     }
     Ok(state.as_mut().expect("opened above"))
@@ -285,7 +279,7 @@ impl RegisteredView {
         view_id: u64,
         unfed: &'a [u64],
     ) -> Result<(&'a mut CompileOutput, vm::Stores<'a>), String> {
-        let own = open_state(&mut self.state, registry, view_id, self.code.vm.layout())?;
+        let own = open_state(&mut self.state, registry, view_id)?;
         Ok((&mut self.code, vm::Stores { own, registry, unfed }))
     }
 }

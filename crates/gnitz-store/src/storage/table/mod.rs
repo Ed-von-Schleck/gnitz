@@ -98,8 +98,9 @@ pub(crate) use flush::flush_barrier;
 
 impl Table {
     /// Open a table at `dir`. `recovery_source` decides what this does with
-    /// whatever is already on disk; the RAM-tier ceiling and `capacity`, which
-    /// bounds the registered on-disk shard bytes, bind for the store's whole life.
+    /// whatever is already on disk; `capacity`, which bounds the registered
+    /// on-disk shard bytes, binds for the store's whole life, and the RAM-tier
+    /// ceiling until [`Self::hold_in_ram`].
     pub(crate) fn new(
         dir: &str,
         schema: SchemaDescriptor,

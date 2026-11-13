@@ -39,9 +39,10 @@ impl RelationRegistry {
         let mut sink = SinkPlan::from_wire(&src_schema, &wire_sink, self.config.adhoc_group_cap)
             .map_err(|e| format!("scan_spec: {e}"))?;
         check_layout(reply_layout, sink.output_schema())?;
+        let skeleton = table.has_skeleton_rows();
         // Nothing to hydrate either: the relation whole, off the store's cached
         // snapshot.
-        if whole && !table.has_skeleton_rows() {
+        if whole && !skeleton {
             return Ok(ReadRows::Shared(entry.full_scan()));
         }
         let (mut source, walk) = entry.open_read(bound, payload_read(&src_schema, &predicate, &wire_sink))?;
@@ -50,7 +51,7 @@ impl RelationRegistry {
         // Chunks bound a read's peak memory only where the sink drops, cuts or
         // maps the rows, or where they hydrate; a read that keeps every row as it
         // is drains its source once.
-        let chunk_rows = if sink.forwards_every_row() && filter.keeps_all() && !table.has_skeleton_rows() {
+        let chunk_rows = if sink.forwards_every_row() && filter.keeps_all() && !skeleton {
             usize::MAX
         } else {
             self.config.scan_chunk_rows

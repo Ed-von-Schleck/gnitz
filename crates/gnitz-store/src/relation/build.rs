@@ -11,30 +11,38 @@ use gnitz_foundation::fault::Seam;
 static TABLE_CREATE_DELAY: Seam = Seam::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS");
 
 impl RelationRegistry {
-    /// [`Self::register_at`] with no index, every store rebuilt.
+    /// [`Self::register_at`] with no index and no trace, every store rebuilt.
     pub fn register(&mut self, spec: RelationSpec, schema: SchemaDescriptor) -> Result<(), String> {
-        self.register_at(spec, schema, &[], None).map(drop)
+        self.register_at(spec, schema, &[], StateLayout::default(), None)
+            .map(drop)
     }
 
     /// Enter a relation, at `schema`, with an index on each `(claim, cols)` of
-    /// `indexes`, all or nothing. At `Some(generation)` a view's rows open from the
-    /// manifest at that generation already in its directory, `Err` when there is
-    /// none, and each index resumes from its own manifest at the same generation
-    /// or is filled from the rows; at `None` everything is rebuilt. Returns how
-    /// many indexes it filled.
+    /// `indexes`, all or nothing; a view with the operator `traces` its compiled
+    /// circuit declares, which [`CircuitState::open`] opens. At
+    /// `Some(generation)` a view's rows open from the manifest at that generation
+    /// already in its directory, `Err` when there is none, and each index
+    /// resumes from its own manifest at the same generation or is filled from
+    /// the rows; at `None` everything is rebuilt. Returns how many indexes it
+    /// filled.
     pub fn register_at(
         &mut self,
         spec: RelationSpec,
         schema: SchemaDescriptor,
         indexes: &[(IndexClaim, PkColList)],
+        traces: StateLayout,
         resume_at: Option<u64>,
     ) -> Result<usize, String> {
         let id = spec.id;
         if self.relations.contains_key(&id) {
             return Err(format!("relation {id} is already registered"));
         }
+        debug_assert!(
+            traces.is_empty() || spec.kind.is_view(),
+            "only a view keeps operator traces"
+        );
         let rows = self.build_rows(spec, schema, resume_at)?;
-        let mut relation = Relation { spec, rows, indexes: Vec::new() };
+        let mut relation = Relation { spec, rows, indexes: Vec::new(), traces };
         let filled = self.enter_indexes(&mut relation, indexes, resume_at)?;
         self.relations.insert(id, relation);
         Ok(filled)
@@ -255,6 +263,11 @@ impl RelationRegistry {
     }
 }
 
+/// An index's fault `e`, on columns `cols` of relation `owner`.
+fn index_fault(owner: u64, cols: PkColList, e: String) -> String {
+    format!("index on columns {:?} of relation {owner}: {e}", cols.as_slice())
+}
+
 #[cfg(test)]
 #[path = "tests/build.rs"]
 mod tests;
@@ -262,8 +275,3 @@ mod tests;
 #[cfg(test)]
 #[path = "benches/build.rs"]
 mod bench;
-
-/// An index's fault `e`, on columns `cols` of relation `owner`.
-fn index_fault(owner: u64, cols: PkColList, e: String) -> String {
-    format!("index on columns {:?} of relation {owner}: {e}", cols.as_slice())
-}

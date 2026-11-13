@@ -420,14 +420,14 @@ fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
 #[test]
 fn test_unique_index_chunked_fill_distinct_succeeds() {
     // Every row must be projected exactly once across several chunks.
-    let (_dir, mut engine, tid) = table_engine(1, &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)]);
+    let cols = [col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
+    let (_dir, mut engine, tid) = table_engine_with(1, &cols, chunked(3));
     engine
         .registry
         .ingest(tid, rows(&engine, tid, 1, 0..10, |i| [100 + i]))
         .unwrap();
     engine.registry.checkpoint_base().unwrap();
 
-    engine.registry.set_scan_chunk_rows(3);
     engine.create_index("public.t", &["val"], true).unwrap();
 
     assert_eq!(

@@ -113,22 +113,22 @@ impl ShardIndex {
     /// picks for it, if any.
     fn write_shard(&mut self, run: &Batch) -> Result<ShardEntry, StorageError> {
         let codebook = self.codebook_for(run);
-        self.write_with(None, |path, opts| {
-            run.write_as_shard(path, ShardWriteOpts { codebook: codebook.as_deref(), ..opts })
-        })
+        self.write_with(None, codebook.as_deref(), |path, opts| run.write_as_shard(path, opts))
     }
 
     /// Write a shard named by a fresh seq through `write`, handed its path and
-    /// the store's options, and open it. `newest` defaults to that seq.
+    /// the store's options with its heap coded under `codebook`, and open it.
+    /// `newest` defaults to that seq.
     fn write_with(
         &mut self,
         newest: Option<u64>,
+        codebook: Option<&Codebook>,
         write: impl FnOnce(&str, ShardWriteOpts<'_>) -> Result<(), StorageError>,
     ) -> Result<ShardEntry, StorageError> {
         let (seq, path) = self.dir.draw();
         let opts = ShardWriteOpts {
             skip_pk_filter: self.skip_pk_filter,
-            ..Default::default()
+            codebook,
         };
         write(&path, opts)
             .and_then(|()| ShardEntry::open(&path, seq, &self.schema, newest.unwrap_or(seq)))
@@ -362,8 +362,8 @@ impl ShardIndex {
         let written = merged.map(|merged| {
             // A store that has coded no heap yet codes the run under one of its own.
             let fresh = merged.plain().and_then(|b| self.codebook_for(b));
-            self.write_with(Some(run.fold.newest), |path, opts| {
-                merged.write_as_shard(path, ShardWriteOpts { codebook: fresh.as_deref(), ..opts })
+            self.write_with(Some(run.fold.newest), fresh.as_deref(), |path, opts| {
+                merged.write_as_shard(path, opts)
             })
         });
         match written.transpose() {
@@ -699,7 +699,7 @@ impl ShardIndex {
     /// The runs are the maximal runs of two or more adjacent guards whose
     /// combined bytes fit half the target. A run also breaks at a change of
     /// representation, because folding a hydrated guard together with a
-    /// dehydrated one would evict it (see [`GuardMerge::next`]).
+    /// dehydrated one would evict it (see [`GuardMerge::begin`]).
     ///
     /// Half the target is the hysteresis: a merged run no larger than its inputs
     /// is under the split trigger.

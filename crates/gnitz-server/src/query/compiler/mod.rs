@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use crate::query::vm::{DeltaReg, Integral, Replay, Vm};
 use gnitz_expr::LogicalProgram;
-use gnitz_store::relation::{Relation, RelationRegistry, StateIdx};
+use gnitz_store::relation::{Relation, RelationRegistry, StateIdx, StateLayout};
 use gnitz_wire::{Circuit, ClampKind, GroupAggs, JoinKind, MapKind, NodeId, OpNode, ReadBound};
 use gnitz_zset::algebra::{MapPlan, Placement, ScatterPlan};
 use gnitz_zset::schema::SchemaDescriptor;
@@ -58,19 +58,19 @@ impl CompileOutput {
 }
 
 /// Compile view `view_id`'s circuit, and answer the placement its store registers
-/// under. Opens nothing.
+/// under and the traces it keeps. Opens nothing.
 pub(super) fn compile_view(
     circuit: &Circuit,
     registry: &RelationRegistry,
     view_id: u64,
     view_schema: &SchemaDescriptor,
     bounded: bool,
-) -> Result<(CompileOutput, Placement), String> {
+) -> Result<(CompileOutput, Placement, StateLayout), String> {
     let meta = ViewMeta::derive(circuit, registry)?;
     let EmitCtx {
         prog, regs, integrals, sources, dists, ..
     } = EmitCtx::emit(circuit, &meta, view_id)?;
-    let vm = prog.finish(regs[circuit.out()]);
+    let (vm, traces) = prog.finish(regs[circuit.out()]);
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
     if !vm.out_schema().same_region_types(view_schema) {
@@ -85,7 +85,7 @@ pub(super) fn compile_view(
     if bounded {
         output.hydration = Some(derive_hydration(circuit, &meta, &output, &regs, &integrals)?);
     }
-    Ok((output, placement))
+    Ok((output, placement, traces))
 }
 
 #[cfg(test)]

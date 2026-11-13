@@ -38,23 +38,26 @@ fn a_resumed_view_refuses_a_missing_manifest() {
     let base = tmp.path().to_str().unwrap();
     let schema = pk_only_schema(&[TypeCode::U64]);
     let spec = spec(7, RelationKind::View(ViewBudget::Plain), schema);
-    let mut layout = StateLayout::default();
-    layout.declare("t".to_string(), schema);
+    let layout = || {
+        let mut layout = StateLayout::default();
+        layout.declare("t".to_string(), schema);
+        layout
+    };
     {
         let mut origin = solo(tmp.path());
-        origin.register(spec, schema).unwrap();
-        let mut state = CircuitState::open(&origin, 7, &layout).unwrap();
+        origin.register_at(spec, schema, &[], layout(), None).unwrap();
+        let mut state = CircuitState::open(&origin, 7).unwrap();
         origin.checkpoint_ephemeral([&mut state], 0, |_| true).unwrap();
     }
     let reopen = || {
         let mut r = solo(tmp.path());
-        r.register_at(spec, schema, &[], Some(0)).map(|_| r)
+        r.register_at(spec, schema, &[], layout(), Some(0)).map(|_| r)
     };
-    let trace = |r: &RelationRegistry| CircuitState::open(r, 7, &layout).map(drop);
+    let trace = |r: &RelationRegistry| CircuitState::open(r, 7).map(drop);
     let worker = |resume: bool| {
         let mut master = RelationRegistry::master(base, 1, StoreConfig::default());
-        master.register(spec, schema).unwrap();
-        master.reconcile_child_dirs(|id| (id == 7).then_some(&layout)).unwrap();
+        master.register_at(spec, schema, &[], layout(), None).unwrap();
+        master.reconcile_child_dirs().unwrap();
         master
             .open_stores(0, Residency::Worker, |_| resume.then_some(0))
             .map(drop)
@@ -63,12 +66,13 @@ fn a_resumed_view_refuses_a_missing_manifest() {
     trace(&reopen().unwrap()).expect("a published trace resumes");
     worker(true).expect("a published view resumes on a worker");
 
-    std::fs::remove_file(child(ChildKind::Scratch(layout.names().next().unwrap()))).unwrap();
+    let declared = layout();
+    std::fs::remove_file(child(ChildKind::Scratch(declared.names().next().unwrap()))).unwrap();
     assert!(trace(&reopen().expect("the rows resume without the trace")).is_err());
 
     std::fs::remove_file(child(ChildKind::Rows)).unwrap();
     let mut r = solo(tmp.path());
-    assert!(r.register_at(spec, schema, &[], Some(0)).is_err());
+    assert!(r.register_at(spec, schema, &[], layout(), Some(0)).is_err());
     assert!(r.relation(7).is_none(), "a refused view is not entered");
     assert!(worker(true).is_err());
     worker(false).expect("told to rebuild, a worker opens the view");
@@ -107,7 +111,9 @@ fn a_refused_index_rolls_its_registration_back() {
     // A UNIQUE index on a view is refused: its circuit cannot refuse a duplicate.
     let view = spec(9, RelationKind::View(ViewBudget::Plain), schema);
     let unique = (IndexClaim::Index { id: 10, unique: true }, PkColList::from_slice(&[1]));
-    assert!(registry.register_at(view, schema, &[unique], None).is_err());
+    assert!(registry
+        .register_at(view, schema, &[unique], StateLayout::default(), None)
+        .is_err());
     assert!(registry.relation(9).is_none(), "a refused registration enters nothing");
     registry
         .register(view, schema)
