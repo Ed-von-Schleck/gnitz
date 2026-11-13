@@ -306,6 +306,11 @@ impl MapPlan {
         Some(self.ev.moves().copies().iter().map(|c| c.src).collect())
     }
 
+    /// The input columns this map copies into output payload slots.
+    pub fn copies(&self) -> &[ColCopy] {
+        self.ev.moves().copies()
+    }
+
     /// True iff this map copies its input's PK region verbatim, and so keeps
     /// every row under its own key.
     pub fn inherits_pk(&self) -> bool {

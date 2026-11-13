@@ -96,6 +96,11 @@ Options:
                        --auth-tokens a loopback bind trusts every local UID (like
                        the always-on AF_UNIX socket), gated only by network
                        reachability and filesystem permissions.
+  --socket-mode=MODE   Permission bits of <socket_path>, in octal (default:
+                       600, owner only). Connecting needs write permission on
+                       the socket, and the AF_UNIX socket asks for no token,
+                       so the mode decides who gets full DDL/DML/scan access:
+                       660 admits the socket's group.
   --backup-dir=DIR     Let clients BACKUP: each backup is a new entry of DIR, an
                        existing directory, holding a copy of the data directory
                        at a checkpoint — every store hard-linked where DIR
@@ -188,6 +193,7 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
     let mut names = Vec::new();
     let mut allow_unauthenticated = false;
     let mut backup_dir = None;
+    let mut socket_mode = 0o600;
     let mut positional: Vec<&String> = Vec::new();
     for arg in args {
         if let Some(val) = arg.strip_prefix("--log-level=") {
@@ -214,6 +220,8 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
             auth_tokens = Some(val.to_string());
         } else if arg == "--allow-unauthenticated" {
             allow_unauthenticated = true;
+        } else if let Some(val) = arg.strip_prefix("--socket-mode=") {
+            socket_mode = parse_socket_mode(val)?;
         } else if let Some(val) = arg.strip_prefix("--backup-dir=") {
             backup_dir = Some(parse_backup_dir(val)?);
         } else if arg.starts_with('-') {
@@ -261,10 +269,19 @@ fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> 
         server: runtime::ServerArgs {
             data_dir: data_dir.clone(),
             socket_path: socket_path.clone(),
+            socket_mode,
             workers,
             backup_dir,
         },
     })
+}
+
+/// `--socket-mode=MODE`: permission bits in octal, at most `777`.
+fn parse_socket_mode(val: &str) -> Result<u32, String> {
+    u32::from_str_radix(val, 8)
+        .ok()
+        .filter(|&mode| mode <= 0o777)
+        .ok_or_else(|| format!("--socket-mode must be octal permission bits, at most 777 (got {val:?})"))
 }
 
 /// `--backup-dir=DIR`: a directory that exists, as an absolute path, so a

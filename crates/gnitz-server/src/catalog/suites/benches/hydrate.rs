@@ -24,20 +24,22 @@ fn payload(id: u64) -> [u64; 4] {
 }
 
 /// An empty engine whose every store spills past a small RAM tier.
-fn spilling_engine(name: &str) -> CatalogEngine {
+fn spilling_engine() -> (tempfile::TempDir, CatalogEngine) {
     let config = StoreConfig {
         ram_tier_bytes: 1 << 20,
         ..Default::default()
     };
-    CatalogEngine::open_with(&temp_dir(name), 1, config).unwrap()
+    let dir = tempfile::tempdir().unwrap();
+    let engine = CatalogEngine::open_with(dir.path().to_str().unwrap(), 1, config).unwrap();
+    (dir, engine)
 }
 
 /// An identity view over a `ROWS`-row base, bounded at `capacity` bytes and
-/// swept. Returns the engine, the base and the view.
-fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, u64, u64) {
+/// swept. Returns the engine's directory guard, the engine, the base and the view.
+fn bounded_fixture(capacity: u64) -> (tempfile::TempDir, CatalogEngine, u64, u64) {
     let mut cols = vec![col_def("id", TypeCode::U64)];
     cols.extend((0..payload(0).len()).map(|c| col_def(&format!("v{c}"), TypeCode::I64)));
-    let mut engine = spilling_engine(name);
+    let (dir, mut engine) = spilling_engine();
     let base = engine.create_table("public.t", &cols, &[0]).unwrap();
     let loaded = rows(&engine, base, 1, 0..ROWS, payload);
     engine.registry.ingest(base, loaded).unwrap();
@@ -45,7 +47,7 @@ fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, u64, u64) {
     let view = try_register_identity_view(&mut engine, base, "bounded", &cols, capacity, 0).unwrap();
     backfill(&mut engine, view);
     sweep(&mut engine);
-    (engine, base, view)
+    (dir, engine, base, view)
 }
 
 /// Run the ephemeral checkpoint round, whose sweep skeletonizes every bounded
@@ -106,11 +108,11 @@ fn cell(label: &str, engine: &mut CatalogEngine, view: u64, spec: &ReadSpec) -> 
 fn hydrate_full_scan_bench() {
     let all = ReadSpec::all_rows(ReadBound::None);
     let mut hydrated = [64 << 10, 24 << 20].map(|capacity: u64| {
-        let (mut engine, _, view) = bounded_fixture("hydrate_full_scan", capacity);
+        let (_dir, mut engine, _, view) = bounded_fixture(capacity);
         let label = format!("full scan, capacity {} KiB", capacity >> 10);
         let (rows, hydrated) = cell(&label, &mut engine, view, &all);
         assert_eq!(rows.len() as u64, ROWS, "{label}: every row read");
-        discard(engine);
+        drop(engine);
         hydrated as u64
     });
     hydrated.reverse();
@@ -128,7 +130,7 @@ const UNTICKED_IDS: u64 = 10_000;
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn hydrate_seek_bench() {
-    let (mut engine, base, view) = bounded_fixture("hydrate_seek", 64 << 10);
+    let (_dir, mut engine, base, view) = bounded_fixture(64 << 10);
     let key = ROWS / 2;
     let spec = point(&engine, view, key);
     let seek = |label: &str, engine: &mut CatalogEngine| {
@@ -147,7 +149,6 @@ fn hydrate_seek_bench() {
     let upserts = rows(&engine, base, 1, ids, |id| payload(id).map(|c| c.wrapping_add(1)));
     engine.ingest_unticked(base, upserts, PkRule::Enforce).unwrap();
     seek("single-key seek, unticked base", &mut engine);
-    discard(engine);
 }
 
 /// A filtered `LIMIT 1` whose one match sits at merge position `M`: the rows it
@@ -156,7 +157,7 @@ fn hydrate_seek_bench() {
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn hydrate_filtered_limit_bench() {
     const M: u64 = 1000;
-    let (mut engine, _, view) = bounded_fixture("hydrate_filtered_limit", 64 << 10);
+    let (_dir, mut engine, _, view) = bounded_fixture(64 << 10);
     let spec = ReadSpec {
         bound: ReadBound::None,
         predicate: cmp_all(&[(gnitz_expr::CmpOp::Eq, 1, payload(M)[0] as i64)]).to_blob_bytes(),
@@ -176,7 +177,6 @@ fn hydrate_filtered_limit_bench() {
         (hydrated as u64) < ROWS / 10,
         "the drain stopped at its match: hydrated {hydrated}"
     );
-    discard(engine);
 }
 
 /// One key of a bounded inner equi-join over two `ROWS`-row bases, which
@@ -184,7 +184,7 @@ fn hydrate_filtered_limit_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn hydrate_join_seek_bench() {
-    let mut engine = spilling_engine("hydrate_join_seek");
+    let (_dir, mut engine) = spilling_engine();
     // `k` is a bijection of `id`, so the two bases join one-to-one.
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
     let bases = ["public.a", "public.b"].map(|name| {
@@ -211,5 +211,4 @@ fn hydrate_join_seek_bench() {
     let spec = point(&engine, join, mix(ROWS / 2));
     let (rows, _) = cell("join point seek", &mut engine, join, &spec);
     assert_eq!(rows.len(), 1, "one match at the sought key");
-    discard(engine);
 }

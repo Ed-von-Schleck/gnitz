@@ -67,7 +67,7 @@ fn projection_view_tick_bench() {
         col_def("b", TypeCode::U64),
     ];
     let cells = |id: u64| [mix(id), mix(id ^ 0x55)];
-    let (mut engine, t) = ingest_fixture("projection_view_tick_bench", &cols, ROWS, cells);
+    let (_dir, mut engine, t) = ingest_fixture(&cols, ROWS, cells);
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(t, ReadBound::None);
     crate::test_support::map_copy(&mut circuit, scan, &[(2, TypeCode::U64)]);
@@ -85,7 +85,6 @@ fn projection_view_tick_bench() {
         "projection view: backfill {:>6.1} instr/row, {WIDE_TICK_ROWS}-row ticks {ticks:>6.1} instr/row",
         fill as f64 / ROWS as f64,
     );
-    discard(engine);
 }
 
 /// The wide ticks of an identity view over a stream, whose output `readers`
@@ -99,7 +98,7 @@ fn echo_fold_view_tick_bench() {
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
     let cells = |id: u64| [mix(id)];
     for readers in [0usize, 1, 2, 4] {
-        let mut engine = fresh(&format!("echo_fold_{readers}"));
+        let (_dir, mut engine) = empty_catalog(1);
         let s = create_stream(&mut engine, "public.s", &cols);
         let a = register_identity_view(&mut engine, s, "a", &cols);
         let last = (0..readers).fold(a, |_, r| {
@@ -116,7 +115,6 @@ fn echo_fold_view_tick_bench() {
             "every row reached the last reader"
         );
         println!("readers {readers}: {ticks:>8.1} instr/row");
-        discard(engine);
     }
 }
 
@@ -147,8 +145,9 @@ fn left_join_view_tick_bench() {
         ("nullable payload key, no match", 2, false),
         ("NOT NULL payload key, one match", 1, true),
     ] {
-        let dir = temp_dir(&format!("left_join_view_tick_bench_{key}_{matched}"));
-        let (mut engine, [a, b], v) = left_join_engine(&dir, key);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let (mut engine, [a, b], v) = left_join_engine(dir, key);
         if matched {
             let held = rows(&engine, b, 1, 0..total, |id| [mix(id), id]);
             tick(&mut engine, &counter, b, held);
@@ -164,7 +163,6 @@ fn left_join_view_tick_bench() {
             "{label}"
         );
         println!("left join view, {label:<31}: {ticks:>6.1} instr/row");
-        discard(engine);
     }
 }
 
@@ -179,8 +177,9 @@ const BACKFILL_ROWS: u64 = 200_000;
 fn left_join_backfill_bench() {
     let counter = perf::Counter::instructions();
     for (label, matched) in [("every row matched", true), ("no row matched", false)] {
-        let dir = temp_dir(&format!("left_join_backfill_bench_{matched}"));
-        let (mut engine, [a, b], v) = left_join_engine(&dir, 1);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let (mut engine, [a, b], v) = left_join_engine(dir, 1);
         let held = rows(&engine, a, 1, 0..BACKFILL_ROWS, |id| [mix(id); 2]);
         engine.registry.ingest(a, held).unwrap();
         // `mix` is a bijection, so the keys past `a`'s ids match none of them.
@@ -199,7 +198,6 @@ fn left_join_backfill_bench() {
             "left join backfill, {label:<17}: {:>7.1} instr/final row",
             fill as f64 / BACKFILL_ROWS as f64
         );
-        discard(engine);
     }
 }
 
@@ -259,8 +257,8 @@ fn one_row_ticks(what: &str, register: impl Fn(&mut CatalogEngine, u64) -> u64) 
         ("few shards", StoreConfig { ram_tier_bytes: 256 << 10, ..d }),
         ("many shards", many),
     ] {
-        let name = format!("view_tick_bench_{what}_{}", label.replace(' ', "_"));
-        let mut engine = CatalogEngine::open_with(&temp_dir(&name), 1, config).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = CatalogEngine::open_with(tmp.path().to_str().unwrap(), 1, config).unwrap();
         let t = engine.create_table("public.t", &group_cols(), &[0]).unwrap();
         let base = rows(&engine, t, 1, 0..ROWS, group_cells);
         engine.registry.ingest(t, base).unwrap();
@@ -287,7 +285,6 @@ fn one_row_ticks(what: &str, register: impl Fn(&mut CatalogEngine, u64) -> u64) 
         println!(
             "{what} view, state {label:<11} ({files:>4} files): insert {inserts:>7} instr/tick, delete {deletes:>7} instr/tick",
         );
-        discard(engine);
     }
 }
 
@@ -366,8 +363,7 @@ fn topn_bulk_view_tick_bench() {
         ("top-3 of 100000 groups", vec![1], 3, 100_000),
     ] {
         let cells = move |id: u64| [mix(id) % groups, 2 * ROWS - id];
-        let name = format!("topn_bulk_{}", label.replace(' ', "_"));
-        let (mut engine, t) = ingest_fixture(&name, &group_cols(), ROWS, cells);
+        let (_dir, mut engine, t) = ingest_fixture(&group_cols(), ROWS, cells);
         let v = top_n_view(&mut engine, t, &group, limit);
         let ((), fill) = counter.measure(|| backfill(&mut engine, v));
         let held = net_weight(&engine, v);
@@ -378,7 +374,6 @@ fn topn_bulk_view_tick_bench() {
             fill as f64 / ROWS as f64,
             net_weight(&engine, v),
         );
-        discard(engine);
     }
 }
 
@@ -397,8 +392,7 @@ fn window_bulk_view_tick_bench() {
         ("256 a group, in front", ROWS / 256, true),
     ] {
         let cells = move |id: u64| [mix(id) % groups, if in_front { 2 * ROWS - id } else { id }];
-        let name = format!("window_bulk_{}", label.replace([' ', ','], "_"));
-        let (mut engine, t) = ingest_fixture(&name, &group_cols(), ROWS, cells);
+        let (_dir, mut engine, t) = ingest_fixture(&group_cols(), ROWS, cells);
         let order = [gnitz_wire::OrderKey { col: 2, desc: false, nulls_first: false }];
         let aggs = [AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum }];
         let mut circuit = Circuit::default();
@@ -421,7 +415,6 @@ fn window_bulk_view_tick_bench() {
              instr/row",
             fill as f64 / ROWS as f64,
         );
-        discard(engine);
     }
 }
 
@@ -465,7 +458,7 @@ fn segment_view_tick_bench() {
     const KEYS: u64 = 1_000;
     let counter = perf::Counter::instructions();
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
-    let mut engine = fresh("segment_view_tick_bench");
+    let (_dir, mut engine) = empty_catalog(1);
     let t = engine.create_table("public.t", &cols, &[0]).unwrap();
     let u = engine.create_table("public.u", &cols, &[0]).unwrap();
     let matches = rows(&engine, u, 1, 0..2 * KEYS, |id| [id % KEYS]);
@@ -507,5 +500,4 @@ fn segment_view_tick_bench() {
     assert_eq!(net_weight(&engine, segment), 0, "the segment stored no tick");
     assert_eq!(net_weight(&engine, view) as u64, KEYS, "a group a key");
     println!("segment into a reduce: {WIDE_TICK_ROWS}-row ticks {ticks:>6.1} instr/row");
-    discard(engine);
 }

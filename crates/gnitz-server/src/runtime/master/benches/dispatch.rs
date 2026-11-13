@@ -1,6 +1,6 @@
 use super::super::fixtures::test_dispatcher;
-use crate::runtime::test_support::empty_catalog;
 use crate::test_support::col_def;
+use crate::test_support::empty_catalog;
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::TypeCode;
 
@@ -14,7 +14,7 @@ fn emit_tick_bench() {
     let cols = [col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
     let counter = Counter::instructions();
     for (relations, ticked) in [(50, 1), (50, 50), (1000, 1), (1000, 50)] {
-        let (_tmp, mut engine) = empty_catalog();
+        let (_tmp, mut engine) = empty_catalog(1);
         let tids: Vec<u64> = (0..relations)
             .map(|i| engine.create_table(&format!("public.t{i}"), &cols, &[0]).unwrap())
             .collect();
@@ -26,7 +26,7 @@ fn emit_tick_bench() {
             excl.checkpoint_reset();
             counter.measure(|| {
                 for _ in 0..GROUPS {
-                    drop(std::hint::black_box(disp.emit_tick(
+                    drop(std::hint::black_box(disp.write_tick(
                         &alone,
                         &mut excl,
                         std::hint::black_box(tids),

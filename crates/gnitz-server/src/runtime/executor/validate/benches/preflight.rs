@@ -27,8 +27,7 @@ fn preflight_probe_bench() {
     let counter = Counter::instructions();
     for (shape, payload, unique) in shapes {
         let cols = [u64_i64_cols()[0].clone(), col_def("v", payload)];
-        let name = format!("preflight_probe_bench_{}", shape.replace(' ', "_"));
-        let (mut engine, tid) = table_engine("validate", &name, 1, &cols);
+        let (_dir, mut engine, tid) = table_engine(1, &cols);
         if unique {
             let id = engine.allocate_ids(1).unwrap();
             let idx = idx_tab_batch(id, tid, &[1], "public__t__idx_v", true, 1);
@@ -78,10 +77,6 @@ fn preflight_probe_bench() {
             );
             engine = disp.into_catalog();
         }
-
-        let dir = engine.registry.base_dir().to_owned();
-        drop(engine);
-        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -95,7 +90,7 @@ fn preflight_probe_bench() {
 fn preflight_sink_bench() {
     use crate::test_support::fk_def;
 
-    let (mut engine, parent) = table_engine("validate", "preflight_sink_bench", 1, &u64_i64_cols());
+    let (_dir, mut engine, parent) = table_engine(1, &u64_i64_cols());
     let id = engine.allocate_ids(1).unwrap();
     let idx = idx_tab_batch(id, parent, &[1], "public__t__idx_v", true, 1);
     apply_ddl(&mut engine, [(SysFamily::Index, idx)]).unwrap();
@@ -158,8 +153,4 @@ fn preflight_sink_bench() {
         );
         engine = disp.into_catalog();
     }
-
-    let dir = engine.registry.base_dir().to_owned();
-    drop(engine);
-    let _ = std::fs::remove_dir_all(dir);
 }

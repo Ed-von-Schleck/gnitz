@@ -21,7 +21,7 @@ fn lock_set(engine: &CatalogEngine, tid: u64) -> Vec<u64> {
 
 #[test]
 fn test_write_lock_set() {
-    let mut engine = fresh("write_lock_set");
+    let (_dir, mut engine) = empty_catalog(1);
 
     // A base table with no FK yet: needs a lock for itself (its writes run
     // enforce_unique_pk against the store), but no peers.
@@ -60,7 +60,7 @@ fn test_write_lock_set() {
     engine.drop_table("public.child").unwrap();
     assert_eq!(lock_set(&engine, parent_tid), expected_c2);
 
-    finish(engine);
+    engine.close();
 }
 
 /// A deleting write locks the children, restricting ones included, of every
@@ -70,7 +70,7 @@ fn test_write_lock_set() {
 /// action.
 #[test]
 fn a_write_locks_what_its_cascade_can_delete_from() {
-    let mut engine = fresh("write_lock_set_cascade");
+    let (_dir, mut engine) = empty_catalog(1);
     let mut table = |name: &str, fks: &[(u64, FkAction)]| {
         let mut cols = vec![col_def("id", TypeCode::U64)];
         for (i, &(parent, on_delete)) in fks.iter().enumerate() {
@@ -118,28 +118,28 @@ fn a_write_locks_what_its_cascade_can_delete_from() {
         .collect();
     assert_eq!(by_parent, [(mid, Cascade), (held, Restrict)]);
 
-    finish(engine);
+    engine.close();
 }
 
 /// A self-referencing cascade ends the walk at the table it started from.
 #[test]
 fn a_self_cascading_table_locks_itself_once() {
-    let mut engine = fresh("write_lock_set_self");
-    let tid = engine.next_id;
+    let (_dir, mut engine) = empty_catalog(1);
+    let tid = engine.next_catalog_id();
     let cols = vec![
         col_def("id", TypeCode::U64),
         fk_def_on_delete("parent", TypeCode::U64, tid, 0, FkAction::Cascade),
     ];
     assert_eq!(engine.create_table("public.tree", &cols, &[0]).unwrap(), tid);
     assert_eq!(lock_set(&engine, tid), [tid]);
-    finish(engine);
+    engine.close();
 }
 
 // ── Dropping an FK child, alone or with its parent, leaves no edge ───────────
 
 #[test]
 fn dropped_fk_child_leaves_no_edge() {
-    let mut engine = fresh("fk_child_drop_lock");
+    let (_dir, mut engine) = empty_catalog(1);
     let parent_tid = fk_parent(&mut engine);
     let child_tid = engine
         .create_table("public.child", &fk_child_cols(parent_tid), &[0])
@@ -155,7 +155,7 @@ fn dropped_fk_child_leaves_no_edge() {
     );
     assert_eq!(lock_set(&engine, parent_tid), vec![parent_tid]);
 
-    finish(engine);
+    engine.close();
 }
 
 /// One TABLE_TAB batch dropping an FK parent and its child, in either row order:
@@ -164,7 +164,7 @@ fn dropped_fk_child_leaves_no_edge() {
 #[test]
 fn co_dropped_fk_parent_and_child_leave_no_edge() {
     for child_first in [false, true] {
-        let mut engine = fresh(&format!("fk_co_drop_lock_{child_first}"));
+        let (_dir, mut engine) = empty_catalog(1);
         let parent_tid = fk_parent(&mut engine);
         let child_tid = engine
             .create_table("public.child", &fk_child_cols(parent_tid), &[0])
@@ -187,13 +187,13 @@ fn co_dropped_fk_parent_and_child_leave_no_edge() {
                 "co-dropped table {tid} must keep no relation entry"
             );
         }
-        finish(engine);
+        engine.close();
     }
 }
 
 #[test]
 fn creating_a_child_of_a_parent_the_same_delta_drops_is_refused() {
-    let mut engine = fresh("fk_child_of_dropped_parent");
+    let (_dir, mut engine) = empty_catalog(1);
     let parent_tid = fk_parent(&mut engine);
     let child_tid = engine.allocate_ids(1).unwrap();
 
@@ -211,14 +211,14 @@ fn creating_a_child_of_a_parent_the_same_delta_drops_is_refused() {
     assert!(engine.registry.relation(parent_tid).is_some());
     assert!(engine.registry.relation(child_tid).is_none());
 
-    finish(engine);
+    engine.close();
 }
 
 // ── test_fk_invalid_targets ──────────────────────────────────────────
 
 #[test]
 fn test_fk_invalid_targets() {
-    let mut engine = fresh("fk_invalid");
+    let (_dir, mut engine) = empty_catalog(1);
     let u = TypeCode::U64;
 
     let parent_tid = engine.create_table("public.p", &u64_i64_cols(), &[0]).unwrap();
@@ -272,14 +272,14 @@ fn test_fk_invalid_targets() {
     let cols = vec![col_def("pk", u), fk_def("fk", u, uq_tid, 1)];
     engine.create_table("public.c_uq", &cols, &[0]).unwrap();
 
-    finish(engine);
+    engine.close();
 }
 
 /// The self-referencing target is the lone PK: the table holds no index yet, so
 /// even a UNIQUE its own CREATE declares cannot count.
 #[test]
 fn a_self_fk_must_target_the_lone_pk() {
-    let mut engine = fresh("fk_self_target");
+    let (_dir, mut engine) = empty_catalog(1);
     let u = TypeCode::U64;
     for (cols, pk, want) in [
         (
@@ -301,7 +301,7 @@ fn a_self_fk_must_target_the_lone_pk() {
         (vec![col_def("id", u), fk_def("p", u, 0, 0)], &[0], ""),
     ] {
         // The id the create takes.
-        let tid = engine.next_id;
+        let tid = engine.next_catalog_id();
         let mut cols = cols;
         cols.iter_mut()
             .filter_map(|c| c.fk.as_mut())
@@ -315,14 +315,14 @@ fn a_self_fk_must_target_the_lone_pk() {
             }
         }
     }
-    finish(engine);
+    engine.close();
 }
 
 /// A stream holds no rows for a referential action to check, so none of its
 /// columns carries an FK; the refusal names the stream and the column.
 #[test]
 fn a_stream_carries_no_foreign_key() {
-    let mut engine = fresh("fk_stream_child");
+    let (_dir, mut engine) = empty_catalog(1);
     let parent_tid = engine.create_table("public.p", &u64_i64_cols(), &[0]).unwrap();
     let cols = [col_def("id", TypeCode::U64), fk_def("r", TypeCode::U64, parent_tid, 0)];
     let stream = gnitz_wire::TableProps { stream: true, ..Default::default() };
@@ -331,7 +331,7 @@ fn a_stream_carries_no_foreign_key() {
         err.contains("stream 's'") && err.contains("column 'r' may not carry a FOREIGN KEY"),
         "{err}"
     );
-    finish(engine);
+    engine.close();
 }
 
 // ── test_fk_child_type_must_equal_parent ─────────────────────────────
@@ -340,7 +340,7 @@ fn a_stream_carries_no_foreign_key() {
 /// at one type only, so a child column must carry exactly the parent's type.
 #[test]
 fn test_fk_child_type_must_equal_parent() {
-    let mut engine = fresh("fk_narrowing");
+    let (_dir, mut engine) = empty_catalog(1);
 
     let parent_tid = engine
         .create_table("public.p", &[col_def("id", TypeCode::I32)], &[0])
@@ -392,14 +392,14 @@ fn test_fk_child_type_must_equal_parent() {
         assert!(err.contains("FK type mismatch"), "{child:?} child: {err}");
     }
 
-    finish(engine);
+    engine.close();
 }
 
 /// A DECIMAL's scale is part of its type: the stored integers of two scales
 /// never mean the same number.
 #[test]
 fn a_decimal_fk_child_must_carry_the_parents_scale() {
-    let mut engine = fresh("fk_decimal_scale");
+    let (_dir, mut engine) = empty_catalog(1);
     let decimal = |name: &str, scale: u8| CatalogColumn {
         def: gnitz_wire::ColumnDef::new(name, gnitz_wire::ColType::decimal(scale), false),
         fk: None,
@@ -423,14 +423,14 @@ fn a_decimal_fk_child_must_carry_the_parents_scale() {
     assert!(err.contains("FK type mismatch"), "got: {err}");
     engine.create_table("public.c_scale4", &child(4), &[0]).unwrap();
 
-    finish(engine);
+    engine.close();
 }
 
 /// An I128 column is a key column like any other: an FK may reference one, and
 /// the child's FK index keys on it.
 #[test]
 fn an_i128_column_is_an_fk_target() {
-    let mut engine = fresh("fk_i128");
+    let (_dir, mut engine) = empty_catalog(1);
     let parent_tid = engine
         .create_table("public.p", &[col_def("id", TypeCode::I128)], &[0])
         .unwrap();
@@ -443,17 +443,17 @@ fn an_i128_column_is_an_fk_target() {
     let index = child.index_on(&[1]).unwrap();
     assert_eq!(index.key_spec().index_schema(&child.schema()).pk_stride(), 16 + 8);
 
-    finish(engine);
+    engine.close();
 }
 
 // ── test_fk_self_reference ───────────────────────────────────────────
 
 #[test]
 fn test_fk_self_reference() {
-    let mut engine = fresh("fk_self");
+    let (_dir, mut engine) = empty_catalog(1);
 
     // Self-referential table: employees.mgr_id -> employees.emp_id
-    let next_tid = engine.next_id;
+    let next_tid = engine.next_catalog_id();
     let emp_cols = vec![
         col_def("emp_id", TypeCode::U64),
         CatalogColumn {
@@ -486,7 +486,7 @@ fn test_fk_self_reference() {
     // a writer takes exactly one guard, not the same guard twice.
     assert_eq!(lock_set(&engine, emp_tid), vec![emp_tid]);
 
-    finish(engine);
+    engine.close();
 }
 
 // ── test_push_reads_committed_state ──────────────────────────────────
@@ -495,7 +495,7 @@ fn test_fk_self_reference() {
 fn test_push_reads_committed_state() {
     use gnitz_wire::WireConflictMode::{Error, Update};
 
-    let mut engine = fresh("push_reads_state");
+    let (_dir, mut engine) = empty_catalog(1);
 
     // Plain unconstrained base table: an upsert validates nothing, so it may
     // hold its table lock shared. The same table under Error mode must not —
@@ -546,7 +546,7 @@ fn test_push_reads_committed_state() {
     // `test_fk_self_reference`), so a predicate reading lock-set cardinality
     // would call this batchable. Both FK terms are non-zero, so it stays on the
     // exclusive guard.
-    let next_tid = engine.next_id;
+    let next_tid = engine.next_catalog_id();
     let tree_cols = vec![
         col_def("id", TypeCode::U64),
         CatalogColumn {
@@ -565,14 +565,14 @@ fn test_push_reads_committed_state() {
     let sid = create_stream(&mut engine, "public.s", &u64_i64_cols());
     assert!(!engine.push_reads_committed_state(sid, Update));
 
-    finish(engine);
+    engine.close();
 }
 
 // ── test_fk_multiple_children_same_parent ───────────────────────────
 
 #[test]
 fn test_fk_multiple_children_same_parent() {
-    let mut engine = fresh("fk_multi_child");
+    let (_dir, mut engine) = empty_catalog(1);
 
     let parent_tid = fk_parent(&mut engine);
     let child1_tid = engine
@@ -607,7 +607,7 @@ fn test_fk_multiple_children_same_parent() {
     assert!(engine.fks_as_parent(parent_tid).is_empty());
     engine.drop_table("public.parent").unwrap();
 
-    finish(engine);
+    engine.close();
 }
 
 // ── test_fk_auto_index_covers_pk_members ─────────────────────────────
@@ -616,7 +616,7 @@ fn test_fk_multiple_children_same_parent() {
 
 #[test]
 fn test_fk_auto_index_covers_pk_members() {
-    let mut engine = fresh("fk_compound_pk_member");
+    let (_dir, mut engine) = empty_catalog(1);
 
     let parent_tid = fk_parent(&mut engine);
     let fk_col = |name: &str| fk_def(name, TypeCode::U64, parent_tid, 0);
@@ -642,5 +642,5 @@ fn test_fk_auto_index_covers_pk_members() {
         assert_eq!(std::path::Path::new(&dir).exists(), !reads_pk, "table {tid} col {c}");
     }
 
-    finish(engine);
+    engine.close();
 }

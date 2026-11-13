@@ -15,12 +15,11 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::peer::Peer;
 use super::tick::fresh_read_lock;
 use super::{cork_fault, cork_msg, decode_fault, forward_scan, target_kind, Access, CatalogLock, Shared};
 use crate::runtime::frame::WireMsg;
 use crate::runtime::master::MasterDispatcher;
-use crate::runtime::reactor::{PeerGone, SendBody, Train, TrainLease};
+use crate::runtime::reactor::{Peer, PeerGone, SendBody, Train, TrainLease};
 use crate::runtime::sal::Read;
 use crate::runtime::sync::{chan, oneshot, select2, ReadGuard};
 use gnitz_wire::txn_frame::{decode_delta_items, delta_poll_kept, DeltaPollItem, SubId};
@@ -628,7 +627,7 @@ async fn sync_wait(
                 let cat = shared.cat();
                 views().flat_map(|v| cat.dag.roots_of(v).iter().copied()).collect()
             };
-            if let Some(mut watching) = shared.ticks.watch(watched) {
+            if let Some(mut watching) = shared.dispatcher.watch(watched) {
                 drop(catalog);
                 select2(&mut watching.woken, shared.dispatcher.reactor().sleep_until(until)).await;
                 continue;

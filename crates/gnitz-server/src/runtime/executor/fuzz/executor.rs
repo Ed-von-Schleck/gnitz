@@ -126,7 +126,7 @@ impl Session {
                     self.scan(s);
                 }
             }
-            ClientVerb::AllocIds => drop(self.cat.allocate_ids(ctrl.hdr.arg0)),
+            ClientVerb::AllocIds => drop(self.cat.reserve_catalog_ids(ctrl.hdr.arg0, &mut |_, _| Ok(()))),
             // One process is both the master and its worker, so it pins both.
             ClientVerb::SnapshotOpen => {
                 self.snapshots += 1;

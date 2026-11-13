@@ -37,7 +37,7 @@ fn boot(dir: &str, slot: Slot, log: &SalWriter) -> CatalogEngine {
 /// Write `rows` to `log` as the master's push of them to `tid`, in a zone of its
 /// own: that zone's LSN.
 fn push(log: &SalWriter, engine: &CatalogEngine, tid: u64, rows: &Batch) -> u64 {
-    let (rel, record) = engine.wire_target(tid).unwrap();
+    let (rel, record) = engine.sal_target(tid).unwrap();
     let mut excl = log.excl();
     let mut scope = excl.begin();
     with_routed(rows.as_mem_batch(), rel.placement(), log.num_workers(), |data| {
@@ -81,17 +81,16 @@ fn a_circuit_behind_its_flushed_view_registers_as_a_clean_boot_does() {
     assert_eq!(net_weight(&engine, SysFamily::View.id()), 1);
 }
 
-/// A table's create flushed without the id counter, its drop only in the SAL.
-/// A second boot over the same tail — a crash between the boot flush and the
-/// SAL reset — finds the drop already flushed and stages it no second time.
+/// A table's create flushed, its drop only in the SAL. A second boot over the
+/// same tail — a crash between the boot flush and the SAL reset — finds the
+/// drop already flushed and stages it no second time.
 #[test]
 fn a_tail_drop_nets_out_once_and_its_id_is_not_reissued() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
     let slot = Slot::new(0, 1);
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
-    // Above the id counter this session flushes.
-    let t: u64 = 10_000;
+    let t = engine.allocate_ids(1).unwrap();
     let table_tab = |weight| table_tab_batch(&[(t, "t", weight)]);
     engine.registry.ingest(SysFamily::Column.id(), col_tab(t, 1)).unwrap();
     engine.registry.ingest(SysFamily::Table.id(), table_tab(1)).unwrap();

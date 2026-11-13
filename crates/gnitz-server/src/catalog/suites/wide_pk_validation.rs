@@ -32,8 +32,8 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: u64, base_rows: &[([u8; 24
 
 #[test]
 fn index_circuit_for_col_finds_index_and_uniqueness() {
-    let mut engine = fresh("index_circuit_for_col");
-    let tid = engine.next_id;
+    let (_dir, mut engine) = empty_catalog(1);
+    let tid = engine.next_catalog_id();
 
     // setup_wide_unique installs a UNIQUE secondary index on source col 3.
     setup_wide_unique(&mut engine, tid, &[(pk24(1, 1, 1), 1, 42)]);
@@ -60,14 +60,14 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
         "unknown table has no circuit"
     );
 
-    finish(engine);
+    engine.close();
 }
 
 #[test]
 fn wide_pk_seek_family_resolves_non_pk_col() {
-    let mut engine = fresh("wide_fk_nonpk");
+    let (_dir, mut engine) = empty_catalog(1);
 
-    let parent_tid = engine.next_id;
+    let parent_tid = engine.next_catalog_id();
     let parent_pk = pk24(100, 200, 300);
     setup_wide_unique(&mut engine, parent_tid, &[(parent_pk, 1, 555)]);
 
@@ -76,14 +76,14 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
     assert_eq!(seen.len(), 1, "the live wide-PK parent row");
     assert_eq!(payload_u64(&*seen, 0, 0), 555, "the row's payload");
 
-    finish(engine);
+    engine.close();
 }
 
 // ── native-key and byte-key point reads agree (narrow PK) ───────
 
 #[test]
 fn native_and_byte_point_reads_agree_narrow() {
-    let mut engine = fresh("seek_bytes_narrow");
+    let (_dir, mut engine) = empty_catalog(1);
 
     // Plain narrow U64-PK table created through the normal path.
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
@@ -117,5 +117,5 @@ fn native_and_byte_point_reads_agree_narrow() {
         }
     }
 
-    finish(engine);
+    engine.close();
 }

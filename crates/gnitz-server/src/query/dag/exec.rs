@@ -206,12 +206,14 @@ enum Stage {
 /// epoch sends and gathers exactly the rows a round of its own would; only the
 /// waits are shared.
 ///
-/// A step starts only once no step standing at a round is of its view or of a
-/// relation its view scans: a view then reads each source's store and output as
-/// a run one step at a time leaves them. A round's lanes follow the schedule,
-/// the same on every worker. An epoch at a round holds its registers, and with
-/// them its own copy of a delta it reads again, until the round gathers, so a
-/// tick holds the state of every epoch of a wave at once.
+/// A step starts only once no step standing at a round is of its view or of its
+/// producer. Besides its producer's output, a view's epoch reads only its own
+/// operator traces and store and base tables' stores at their sealed cut, none
+/// of which another view's step moves: a view's store is never another view's
+/// integral. A round's lanes follow the schedule, the same on every worker. An
+/// epoch at a round holds its registers, and with them its own copy of a delta
+/// it reads again, until the round gathers, so a tick holds the state of every
+/// epoch of a wave at once.
 ///
 /// The engine keeps one between ticks, empty, for its capacity.
 #[derive(Default)]
@@ -244,19 +246,23 @@ impl TickRun {
     }
 
     /// Whether step `i` can start: a relay round another step runs for it has
-    /// gathered, and no step at a round holds it back.
-    fn ready(&self, host: &mut impl DriveHost, i: usize) -> bool {
+    /// gathered, and no step at a round is of its view or of its producer.
+    fn ready(&self, i: usize) -> bool {
         // A relay round is out only while the step that runs it stands.
         if self.standing.is_empty() {
             return true;
         }
-        let Step { view, relay, .. } = self.schedule[i];
-        if relay.is_some_and(|slot| self.relays.get(slot.at).is_some_and(Option::is_none)) {
+        let step = &self.schedule[i];
+        if step
+            .relay
+            .is_some_and(|slot| self.relays.get(slot.at).is_some_and(Option::is_none))
+        {
             return false;
         }
-        let code = &host.parts().0.views[&view].code;
-        let mut standing = self.standing.iter().map(|&(at, _)| self.schedule[at].view);
-        !standing.any(|held| held == view || code.source_ids().any(|s| s == held))
+        !self.standing.iter().any(|&(at, _)| {
+            let held = self.schedule[at].view;
+            held == step.view || held == step.producer
+        })
     }
 
     /// Start step `i`: run it to its first round, or its end.
@@ -328,7 +334,7 @@ impl TickRun {
     fn run(&mut self, host: &mut impl DriveHost) -> Result<(), String> {
         let mut next = 0;
         loop {
-            while next < self.schedule.len() && self.ready(host, next) {
+            while next < self.schedule.len() && self.ready(next) {
                 self.start(host, next)?;
                 next += 1;
             }

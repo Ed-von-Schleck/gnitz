@@ -1,13 +1,17 @@
 //! The MasterDispatcher's writes: ACKed rounds (checkpoint halves, backfill,
-//! tick) and the tick rounds they allocate, the DDL zone, push groups, and the
-//! backup round.
+//! tick) and the tick ledger, the DDL zone, push groups, and the backup round.
+
+use std::cell::Cell;
+use std::collections::hash_map::Entry;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::route::with_routed;
 use super::*;
 use crate::catalog::{ZoneError, ZoneSink};
 use crate::runtime::reactor::AckWait;
 use crate::runtime::sal::{Apply, SalFull, SalScope};
-use crate::runtime::sync::WriteGuard;
+use crate::runtime::sync::{oneshot, WriteGuard};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::PkRule;
 use gnitz_zset::repr::MemBatch;
@@ -15,6 +19,83 @@ use gnitz_zset::repr::MemBatch;
 /// `GNITZ_INJECT_BACKUP_ABORT`: abort the master between the workers' copies and
 /// its own, as a crash part-way through a backup would.
 static BACKUP_ABORT: Seam = Seam::new("GNITZ_INJECT_BACKUP_ABORT");
+
+/// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next tick emit that has something to
+/// tick, once, as a full SAL would.
+static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
+
+/// The relations owed a tick, the rounds the ticks written took, and the waits
+/// on both. `pending` grows under the SAL hold its commit groups are written
+/// under, and every emit takes all of it under the hold its Tick group is
+/// written under.
+pub(super) struct TickLedger {
+    /// The last tick round allocated, one per tid a tick group carries. Starts
+    /// at 1, which is never emitted, so `after_tick = 0` names no round.
+    round: Cell<u64>,
+    /// Ticked relation id → the last round that ticked it.
+    last_tick: RefCell<FxHashMap<u64, u64>>,
+    /// Relations with a commit no emitted tick has taken, each with the row
+    /// count feeding the coalesce threshold.
+    pending: RefCell<FxHashMap<u64, usize>>,
+    /// The SAL watermark the last emit snapshotted, or the dispatcher's
+    /// construction: every commit at or below it is reflected in every view,
+    /// as a read written to the SAL from now on sees it.
+    last_lsn: Cell<u64>,
+    /// Scratch for the tids a tick is emitted for, kept across ticks.
+    tids: RefCell<Vec<u64>>,
+    /// The waits for a relation to gain an un-ticked commit. An entry leaves
+    /// when a relation it names becomes pending, at a
+    /// [`MasterDispatcher::wake_watches`], or with its [`Watching`].
+    watches: RefCell<Vec<Watch>>,
+    /// The id of the next [`Watch`].
+    next_watch: Cell<u64>,
+    /// The waits for the verdict of the next emit.
+    drains: RefCell<Vec<oneshot::Sender<Result<(), WireFault>>>>,
+}
+
+impl TickLedger {
+    pub(super) fn new(last_lsn: u64) -> Self {
+        TickLedger {
+            round: Cell::new(1),
+            last_tick: RefCell::default(),
+            pending: RefCell::default(),
+            last_lsn: Cell::new(last_lsn),
+            tids: RefCell::default(),
+            watches: RefCell::default(),
+            next_watch: Cell::new(0),
+            drains: RefCell::default(),
+        }
+    }
+
+    /// Wake every watch naming `relation`, which just became pending.
+    fn wake(&self, relation: u64) {
+        let mut watches = self.watches.borrow_mut();
+        for watch in watches.extract_if(.., |w| w.relations.contains(&relation)) {
+            watch.wake.send(());
+        }
+    }
+}
+
+struct Watch {
+    id: u64,
+    relations: FxHashSet<u64>,
+    wake: oneshot::Sender<()>,
+}
+
+/// One wait registered by [`MasterDispatcher::watch`], given up on drop.
+pub(crate) struct Watching<'a> {
+    ledger: &'a TickLedger,
+    id: u64,
+    /// Resolves when a watched relation gains an un-ticked commit, or at a
+    /// [`MasterDispatcher::wake_watches`].
+    pub(crate) woken: oneshot::Receiver<()>,
+}
+
+impl Drop for Watching<'_> {
+    fn drop(&mut self) {
+        self.ledger.watches.borrow_mut().retain(|w| w.id != self.id);
+    }
+}
 
 impl MasterDispatcher {
     /// Write `apply` to every worker, and answer the wait for all of them to
@@ -44,17 +125,29 @@ impl MasterDispatcher {
     ///
     /// Once its ACKs are in, the round flushes the system tables and rewinds the
     /// SAL into the next epoch, under the hold its `Flush` was written under,
-    /// then removes every directory no live entity owns. A failed system flush
-    /// returns its error without the rewind: the log's entries are those rows'
-    /// only durable copy, and the committer aborts on a log left whole.
-    pub(crate) async fn checkpoint_base(&self, alone: &WriteGuard<ApplyLock>) -> Result<(), WireFault> {
+    /// then removes every directory no live entity owns.
+    ///
+    /// Every failure ends the process. A failed system flush leaves the log
+    /// unrewound, as the log's entries are those rows' only durable copy, while
+    /// the workers that ACKed the `Flush` have moved into the next epoch: no
+    /// group written after it would reach them, and only a restart's replay
+    /// repairs that.
+    pub(crate) async fn checkpoint_base(&self, alone: &WriteGuard<ApplyLock>) {
         let mut excl = self.sal.lock().await;
         if self.sal.holds_pushes() {
-            self.cat_mut().advance_durable_generation()?;
+            if let Err(e) = self.cat_mut().advance_durable_generation() {
+                gnitz_fatal_abort!("checkpoint generation advance failed: {e}");
+            }
         }
-        let wait = self.write_acked(alone, &mut excl, Apply::Flush)?;
+        let wait = self
+            .write_acked(alone, &mut excl, Apply::Flush)
+            .unwrap_or_else(|e| gnitz_fatal_abort!("checkpoint Flush refused: {e}"));
         wait.acks().await;
-        self.cat_mut().flush_all_system_tables()?;
+        if let Err(e) = self.cat_mut().flush_all_system_tables() {
+            gnitz_fatal_abort!(
+                "system flush after the checkpoint Flush failed; the workers left the epoch and the log was not rewound: {e}"
+            );
+        }
         let epoch = excl.checkpoint_reset();
         gnitz_note!("SAL checkpoint epoch={epoch}");
         // Every worker ACKed the Flush, so each has applied every DdlSync written
@@ -63,7 +156,6 @@ impl MasterDispatcher {
         // DDL body runs under through the ephemeral round, so no DDL lands
         // before it, and at boot `reconcile_child_dirs` has already swept.
         self.cat().reclaim_orphan_dirs();
-        Ok(())
     }
 
     /// A checkpoint's second half: the round that flushes every resumable
@@ -116,16 +208,6 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    /// Tick every one of `tids`, in order, in one group, and await its ACKs.
-    pub(crate) async fn drain_tick(&self, alone: &WriteGuard<ApplyLock>, tids: &[u64]) -> Result<(), WireFault> {
-        if tids.is_empty() {
-            return Ok(());
-        }
-        let wait = self.emit_tick(alone, &mut self.sal.lock().await, tids)?;
-        wait.acks().await;
-        Ok(())
-    }
-
     /// Run catalog write `write` with its groups laid out as one SAL zone, and mark
     /// the zone applied: the write's value and the zone LSN, `0` when the write
     /// published nothing and so opened no zone. A write the catalog or
@@ -159,26 +241,141 @@ impl MasterDispatcher {
         Ok((value, zone_lsn))
     }
 
+    // -----------------------------------------------------------------------
+    // Tick ledger
+    // -----------------------------------------------------------------------
+
+    /// Credit `rows` against `tid`'s pending-tick count, when a view scans
+    /// `tid`. Its first commit since the emit that last took it wakes the
+    /// watches naming it. `_laid_out` is the SAL hold the rows' groups were
+    /// written under.
+    pub(crate) fn credit(&self, _laid_out: &SalExcl<'_>, tid: u64, rows: usize) {
+        if !self.cat().dag.is_scanned(tid) {
+            return;
+        }
+        match self.ticks.pending.borrow_mut().entry(tid) {
+            Entry::Occupied(mut e) => *e.get_mut() += rows,
+            Entry::Vacant(e) => {
+                e.insert(rows);
+                self.ticks.wake(tid);
+            }
+        }
+    }
+
+    /// True when some relation has `rows` or more pending.
+    pub(crate) fn pending_reaches(&self, rows: usize) -> bool {
+        self.ticks.pending.borrow().values().any(|&n| n >= rows)
+    }
+
+    /// True when none of `relations` has a commit no emitted tick has taken.
+    pub(crate) fn none_pending(&self, relations: impl IntoIterator<Item = u64>) -> bool {
+        let pending = self.ticks.pending.borrow();
+        pending.is_empty() || relations.into_iter().all(|s| !pending.contains_key(&s))
+    }
+
+    /// True when no relation whose ticks reach any of `targets` has a commit no
+    /// emitted tick has taken, so a read of them misses nothing. A commit is
+    /// pending from its layout on, ahead of its ACK, so this errs towards
+    /// false, which costs one extra drain.
+    pub(crate) fn all_ticked(&self, targets: impl IntoIterator<Item = u64>) -> bool {
+        let cat = self.cat();
+        self.none_pending(targets.into_iter().flat_map(|t| cat.dag.roots_of(t).iter().copied()))
+    }
+
+    /// Wait for one of `relations` to gain a commit no emitted tick has taken;
+    /// `None` when one already has. The check and the registration share no
+    /// await, so no commit falls between them.
+    pub(crate) fn watch(&self, relations: FxHashSet<u64>) -> Option<Watching<'_>> {
+        if !self.none_pending(relations.iter().copied()) {
+            return None;
+        }
+        let ticks = &self.ticks;
+        let id = ticks.next_watch.get();
+        ticks.next_watch.set(id + 1);
+        let (wake, woken) = oneshot::channel();
+        ticks.watches.borrow_mut().push(Watch { id, relations, wake });
+        Some(Watching { ledger: ticks, id, woken })
+    }
+
+    /// Wake every watch. A watch names relations read off a catalog its holder
+    /// has released, which a DDL may have changed.
+    pub(crate) fn wake_watches(&self) {
+        for watch in self.ticks.watches.take() {
+            watch.wake.send(());
+        }
+    }
+
+    /// The verdict of the next [`Self::emit_tick`], whichever task runs it.
+    pub(crate) fn next_emit(&self) -> oneshot::Receiver<Result<(), WireFault>> {
+        let (done, verdict) = oneshot::channel();
+        self.ticks.drains.borrow_mut().push(done);
+        verdict
+    }
+
+    /// Tick every pending relation as one Tick group, and answer the wait for
+    /// its workers' ACKs; `None` when nothing is pending. `alone` is the
+    /// caller's hold of the apply lock, which it keeps through those ACKs. A
+    /// refused emit leaves every relation pending and takes no round.
+    ///
+    /// The tids and the watermark are read under the hold [`Self::credit`] is
+    /// called under, so they are of the same commits. Every [`Self::next_emit`]
+    /// is answered with the emit's verdict, at the emit and not its ACKs: its
+    /// reader's scan follows the Tick group in the SAL. The answer shares no
+    /// await with the read of what is pending, so every commit pending when the
+    /// wait was registered is in the group.
+    pub(crate) async fn emit_tick(&self, alone: &WriteGuard<ApplyLock>) -> Result<Option<AckWait>, WireFault> {
+        let ticks = &self.ticks;
+        let emitted = async {
+            if ticks.pending.borrow().is_empty() {
+                ticks.last_lsn.set(self.sal.watermark());
+                return Ok(None);
+            }
+            let mut excl = self.sal.lock().await;
+            if TICK_EMIT_ERROR.take_once() {
+                return Err("injected tick emit error".to_string().into());
+            }
+            let mut tids = ticks.tids.borrow_mut();
+            tids.clear();
+            tids.extend(ticks.pending.borrow().keys().copied());
+            let wait = self.write_tick(alone, &mut excl, &tids)?;
+            ticks.pending.borrow_mut().clear();
+            ticks.last_lsn.set(self.sal.watermark());
+            Ok(Some(wait))
+        }
+        .await;
+        let verdict = emitted.as_ref().map(|_| ()).map_err(WireFault::clone);
+        for done in ticks.drains.take() {
+            done.send(verdict.clone());
+        }
+        emitted
+    }
+
     /// Write one Tick group for `tids` at consecutive tick rounds, and answer
     /// the wait for its ACKs. A refused write takes no round.
-    pub(crate) fn emit_tick(
+    fn write_tick(
         &self,
         alone: &WriteGuard<ApplyLock>,
         excl: &mut SalExcl<'_>,
         tids: &[u64],
     ) -> Result<AckWait, WireFault> {
-        let first = self.round.get() + 1;
+        let ticks = &self.ticks;
+        let first = ticks.round.get() + 1;
         let tick = Apply::Tick { first_round: first, tids: tids.into() };
         let wait = self.write_acked(alone, excl, tick)?;
-        self.round.set(first + tids.len() as u64 - 1);
+        ticks.round.set(first + tids.len() as u64 - 1);
         // At the write, not at the ACKs: a round written has already reached the
         // workers, and a ledger behind it would let a feed's gate answer "nothing
         // changed" over rows already in flight.
-        let mut last_tick = self.last_tick.borrow_mut();
+        let mut last_tick = ticks.last_tick.borrow_mut();
         for (&tid, round) in tids.iter().zip(first..) {
             last_tick.insert(tid, round);
         }
         Ok(wait)
+    }
+
+    /// The SAL watermark the last emit snapshotted.
+    pub(crate) fn last_lsn(&self) -> u64 {
+        self.ticks.last_lsn.get()
     }
 
     /// The last round that ticked a relation `view_id` reads, directly or
@@ -188,7 +385,7 @@ impl MasterDispatcher {
     /// that left the view no rows, one from before the view existed among them;
     /// never misses one that did.
     pub(crate) fn last_delta_round(&self, view_id: u64) -> u64 {
-        let last_tick = self.last_tick.borrow();
+        let last_tick = self.ticks.last_tick.borrow();
         let cat = self.cat();
         let roots = cat.dag.roots_of(view_id);
         roots
@@ -199,9 +396,10 @@ impl MasterDispatcher {
             .unwrap_or(1)
     }
 
-    /// Drop a dropped relation's last tick round.
+    /// Drop a dropped relation's pending rows and last tick round.
     pub(crate) fn forget_relation(&self, id: u64) {
-        self.last_tick.borrow_mut().remove(&id);
+        self.ticks.pending.borrow_mut().remove(&id);
+        self.ticks.last_tick.borrow_mut().remove(&id);
     }
 
     /// Lay one push batch out as a SAL group inside `scope`, held to `rule`: the
@@ -219,7 +417,7 @@ impl MasterDispatcher {
     ) -> Result<bool, SalFull> {
         let cat = self.cat();
         let (rel, record) = cat
-            .wire_target(target_id)
+            .sal_target(target_id)
             .expect("a push target is registered under the catalog lock");
         let recoverable = rel.kind().is_base_table();
         with_routed(batch, rel.placement(), self.sal.num_workers(), |rows| {

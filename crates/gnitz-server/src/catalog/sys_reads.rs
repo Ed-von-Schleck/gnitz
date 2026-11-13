@@ -2,7 +2,9 @@
 //! rows and the retraction of one, column records, schema and relation names.
 
 use gnitz_store::relation::{Cut, Relation};
-use gnitz_wire::{payload_bytes, payload_str, payload_u64, CatalogColumn, ColTabRow, SchemaTabRow, SchemaTabSlot};
+use gnitz_wire::{
+    payload_bytes, payload_str, payload_u64, CatalogColumn, ColTabRow, SchemaTabRow, SchemaTabSlot, TableTabRow,
+};
 use gnitz_zset::repr::{Batch, ReadCursor, StoredRow};
 
 use super::sys_tables::SysFamily;
@@ -29,6 +31,15 @@ impl CatalogEngine {
         let (src, ri) = row.source();
         let Ok(stored) = gnitz_wire::CircuitRow::read(src, ri);
         gnitz_wire::Circuit::decode(&stored.circuit)
+    }
+
+    /// Whether `tid` is a SERIAL table, from its live TABLE_TAB row; `false` for
+    /// a view or an id no table holds.
+    pub(in crate::catalog) fn is_serial(&self, tid: u64) -> bool {
+        self.live_sys_row(SysFamily::Table, tid).is_some_and(|row| {
+            let (src, ri) = row.source();
+            TableTabRow::read(src, ri).is_ok_and(|r| r.props().is_ok_and(|p| p.serial))
+        })
     }
 
     /// Visit every live row of `family` whose leading key column is `leading`: the

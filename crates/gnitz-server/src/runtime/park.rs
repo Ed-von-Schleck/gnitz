@@ -181,9 +181,9 @@ impl Park {
         }
     }
 
-    /// The 32-bit futex word aliasing the low half. A ring cursor advances by at
-    /// most its ring's capacity, and a wake sequence or a take by one, so under
-    /// 2^32 an advance always moves the half a futex compares.
+    /// The 32-bit futex word aliasing the low half. The words a futex waits on
+    /// are moved only by a bump or a take, each by one, so every advance moves
+    /// the half a futex compares.
     #[inline]
     fn futex_word(&self) -> *const AtomicU32 {
         &self.0 as *const AtomicU64 as *const AtomicU32

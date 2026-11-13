@@ -390,11 +390,10 @@ fn a_circuit_routing_cannot_stand_behind_is_rejected() {
 // ── Placement ───────────────────────────────────────────────────────────
 
 /// A view's rows sit where its circuit leaves them: on every worker when every
-/// source is replicated; on its own key's owner when every path back from its
-/// output reaches an exchange, whatever placed its sources, or behind a join over
-/// key-routed sources; on a source's owner while the walk back from the output
-/// keeps that source's PK region and nothing relays its delta; and otherwise
-/// wherever they were produced.
+/// source is replicated; on the owner of a leading part of its own key where
+/// every path back from its output leaves each row there — behind an exchange,
+/// a join of co-located operands, or a scan of a source placed by that key whose
+/// delta nothing relays; and otherwise wherever they were produced.
 #[test]
 fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
     use TypeCode::{I64, U32, U64};
@@ -449,13 +448,13 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
             Placement::Keyed { dist_stride: 8 },
         ),
         (
-            "two keyed sources exchange nothing, so each row stays on its own source's owner",
+            "two sources placed by one key exchange nothing, so each row stays on its key's owner",
             |c| {
                 let (a, b) = (scan(c, 7), scan(c, 9));
                 c.union(a, b);
             },
             [clustered; 2],
-            Placement::Local,
+            inherited,
         ),
         (
             "a source's rows walked back to its scan, while a join relays its delta",
@@ -560,9 +559,130 @@ fn a_view_is_placed_by_where_its_circuit_leaves_its_rows() {
         let mut c = Circuit::default();
         build(&mut c);
         let registry = of_four([(7, a), (9, b)]);
-        // The view a compile admits: of the schema the circuit outputs.
-        let view = *compile(&c, &registry, false).expect(why).vm.out_schema();
-        let (_, placement) = ViewMeta::derive(&c, &registry, &view).unwrap();
-        assert_eq!(placement, want, "{why}");
+        assert_eq!(placed(&c, &registry).expect(why), want, "{why}");
+    }
+}
+
+// ── Client circuits the planner never emits ──────────────────────────────
+
+/// A U64 PK and five U64 payload columns, keyed by its whole PK.
+fn wide_u64() -> SchemaDescriptor {
+    u64_pk_schema(&[SchemaColumn::new(TypeCode::U64, false); 5])
+}
+
+/// `cols` of [`wide_u64`], each at its own type.
+fn u64_slots(cols: &[u32]) -> Vec<gnitz_wire::ReindexSlot> {
+    self_typed_slots(&wide_u64(), cols)
+}
+
+/// `7 ⋈ 9` on column 3, each side relayed by it and keeping its column 0:
+/// `[key, 7.0, 9.0]`, each row on its key's owner.
+fn equi_on_3(c: &mut Circuit) -> NodeId {
+    let deltas = [7, 9].map(|s| scan_keyed(c, s, &u64_slots(&[3])));
+    c.join(deltas, deltas, JoinKind::Equi)
+}
+
+/// A client circuit that leaves its rows off their key's owner registers a
+/// placement no read confines to one worker: a point read sent to the key's
+/// owner would miss them.
+#[test]
+fn rows_left_off_their_keys_owner_place_the_view_by_no_key() {
+    let cases: [(&str, Build, Placement); 5] = [
+        (
+            "a join beside a scan relayed by a payload column",
+            |c| {
+                let joined = equi_on_3(c);
+                let other = c.input_scattered(11, ReadBound::None, Some(u64_slots(&[2])));
+                let copied = map_copy(c, other, &u64_slots(&[0, 1]));
+                c.union(joined, copied);
+            },
+            Placement::Local,
+        ),
+        (
+            "a join beside a scan re-keyed onto a payload column",
+            |c| {
+                let joined = equi_on_3(c);
+                let other = scan(c, 11);
+                c.map_reindex(other, &u64_slots(&[3]), &[0, 1], NullKeys::Keep);
+                let rekeyed = c.ops().len() - 1;
+                c.union(joined, rekeyed);
+            },
+            Placement::Local,
+        ),
+        (
+            "a join re-keyed onto a payload column",
+            |c| {
+                let joined = equi_on_3(c);
+                c.map_reindex(joined, &u64_slots(&[1]), &[2], NullKeys::Keep);
+            },
+            Placement::Local,
+        ),
+        (
+            "a band join sits by its equality prefix",
+            |c| {
+                let key = u64_slots(&[3, 4]);
+                let deltas = [7, 9].map(|s| scan_routed(c, s, &key, 1));
+                c.join(deltas, deltas, RANGE);
+            },
+            Placement::Keyed { dist_stride: 8 },
+        ),
+        (
+            "a pure-range join of broadcast deltas is computed whole on every worker",
+            |c| {
+                let deltas = [7, 9].map(|s| scan_routed(c, s, &u64_slots(&[3]), 0));
+                c.join(deltas, deltas, RANGE);
+            },
+            Placement::Local,
+        ),
+    ];
+    let registry = of_four([7, 9, 11].map(|s| (s, wide_u64())));
+    for (why, build, want) in cases {
+        let mut c = Circuit::default();
+        build(&mut c);
+        assert_eq!(placed(&c, &registry).expect(why), want, "{why}");
+    }
+}
+
+/// An operator reading rows of one join key, or one element, spread over
+/// several workers would compute a result that depends on the worker count, so
+/// the circuit is refused, at any worker count.
+#[test]
+fn an_operator_over_rows_its_key_does_not_co_locate_is_refused() {
+    let cases: [(&str, Build, &str); 3] = [
+        (
+            "a join side relayed by another column than it joins on",
+            |c| {
+                let a = c.input_scattered(7, ReadBound::None, Some(u64_slots(&[2])));
+                let a = c.map_reindex(a, &u64_slots(&[3]), &[0], NullKeys::Keep);
+                let b = scan_keyed(c, 9, &u64_slots(&[3]));
+                c.join([a, b], [a, b], JoinKind::Equi);
+            },
+            "join: a term's operands are not co-located by its key",
+        ),
+        (
+            "a cross join of two partitioned sides",
+            |c| {
+                let deltas = [7, 9].map(|s| scan_keyed(c, s, &u64_slots(&[3])));
+                c.join(deltas, deltas, JoinKind::Cross);
+            },
+            "join: a term's operands are not co-located by its key",
+        ),
+        (
+            "a distinct over rows re-keyed in place",
+            |c| {
+                let a = scan(c, 7);
+                let a = c.map_reindex(a, &u64_slots(&[3]), &[], NullKeys::Keep);
+                c.distinct(a);
+            },
+            "a distinct over rows no key co-locates",
+        ),
+    ];
+    for slot in [Slot::new(0, 4), Slot::SOLO] {
+        let registry = sources_at(slot, [7, 9].map(|s| (s, wide_u64())));
+        for (why, build, guard) in cases {
+            let mut c = Circuit::default();
+            build(&mut c);
+            assert_eq!(rejection(compile(&c, &registry, false)), guard, "{why}");
+        }
     }
 }

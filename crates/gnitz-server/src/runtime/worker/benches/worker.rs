@@ -30,12 +30,12 @@ fn arm(
     frames_owed: usize,
     holds: u64,
 ) {
-    let (mut engine, tid) = table_engine("worker", &format!("request_bench_{label}"), 1, &u64_i64_cols());
+    let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     prepare(&mut engine, tid);
     let rows: Vec<_> = (0..held).map(|i| (i, 1, i as i64)).collect();
     let batch = make_batch_raw(&make_schema_u64_i64(), &rows);
     engine.registry.ingest(tid, batch).unwrap();
-    let record = engine.wire_target(tid).unwrap().1.clone();
+    let record = engine.sal_target(tid).unwrap().1.clone();
     let (mut wp, sal, rx) = worker_over(&mut engine, 1 << 26, 32 << 20);
     // Independent client requests: each under a hold of its own.
     let mut acked = 0;
@@ -43,7 +43,7 @@ fn arm(
         acked = request(&mut sal.excl(), tid, &record, id).expect("group fits");
     }
     let ((), instructions) = Counter::instructions().measure(|| loop {
-        wp.drain_sal();
+        wp.drain_sal(false);
         if wp.replies.is_empty() {
             break;
         }
@@ -64,9 +64,6 @@ fn arm(
         instructions as f64 / per as f64
     );
     drop(wp);
-    let dir = engine.registry.base_dir().to_owned();
-    drop(engine);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The worker's own request path, in instructions per reply frame: a group read

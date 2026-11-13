@@ -7,11 +7,9 @@ use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_wire::{AggDescriptor, Circuit, GroupAggs};
 use gnitz_zset::algebra::{Placement, Slot};
 
-/// `circuit`'s routing. A view's schema decides only which key its placement
-/// names, which no route reads.
+/// `circuit`'s routing.
 pub(super) fn routing<'a>(circuit: &Circuit, registry: &'a RelationRegistry) -> Result<ViewMeta<'a>, String> {
-    let view = crate::test_support::make_schema_u64_i64();
-    ViewMeta::derive(circuit, registry, &view).map(|(meta, _)| meta)
+    ViewMeta::derive(circuit, registry)
 }
 
 /// The id the compiled circuit's view goes by.
@@ -23,6 +21,12 @@ pub(super) fn compile(circuit: &Circuit, registry: &RelationRegistry, bounded: b
     let ctx = EmitCtx::emit(circuit, &meta, VIEW)?;
     let view = ctx.prog.schema_of(ctx.regs[circuit.out()]);
     compile_view(circuit, registry, VIEW, &view, bounded).map(|(out, _)| out)
+}
+
+/// The placement a view of the schema `circuit` outputs registers under.
+pub(super) fn placed(circuit: &Circuit, registry: &RelationRegistry) -> Result<Placement, String> {
+    let view = *compile(circuit, registry, false)?.vm.out_schema();
+    compile_view(circuit, registry, VIEW, &view, false).map(|(_, placement)| placement)
 }
 
 /// One table row's circuit, built into an empty [`Circuit`].

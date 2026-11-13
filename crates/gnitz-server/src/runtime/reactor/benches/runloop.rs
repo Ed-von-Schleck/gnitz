@@ -72,10 +72,9 @@ fn reactor_pass_bench() {
     arm("op+deadline", r, send, || ());
 
     let r = make_reactor();
-    let (conn, partner) = registered(&r);
+    let (peer, partner) = Peer::over_socketpair(&r);
     let frame = gnitz_wire::framed(b"x");
-    let r2 = r.clone();
-    let recv = async move || drop(black_box(r2.recv(&conn).await.expect("a frame")));
+    let recv = async move || drop(black_box(peer.recv().await.expect("a frame")));
     arm("recv", r, recv, || (&partner).write_all(&frame).expect("write"));
 
     for nw in [1, 4, 16] {

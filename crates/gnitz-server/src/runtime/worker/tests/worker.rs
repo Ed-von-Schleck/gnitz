@@ -84,27 +84,28 @@ pub(super) fn probe(tid: u64, keys: &[u8]) -> Read<'_> {
     Read::HasPk { tid, probe: Probe::Pk, keys }
 }
 
-/// Serve every group on the SAL as an exchange wait does: `serve_next(true)`.
+/// Serve every group on the SAL as an exchange wait whose round is still out
+/// does.
 fn drain_in_wait(wp: &mut WorkerProcess) {
-    while wp.serve_next(true).is_some() {}
+    wp.drain_sal(true);
 }
 
 // -- dispatch ---------------------------------------------------------------
 
-/// `serve_next(true)`, driven as the exchange wait's own drain loop drives it:
-/// a read of a view parks in SAL order; a read of a base table answers and a
-/// push is applied from inside the wait; a DdlSync that addresses no worker is
-/// stepped over; and a train is owed, no frame of it sent.
+/// The drain of an exchange wait whose round is still out: a read of a view
+/// parks in SAL order; a read of a base table answers and a push is applied
+/// from inside the wait; a DdlSync that addresses no worker is stepped over;
+/// and a train sends a frame after the group that queued it.
 #[test]
 fn in_wait_dispositions() {
-    let (mut engine, tid) = table_engine("worker", "in_wait_dispositions", 1, &u64_i64_cols());
+    let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let cols = PkColList::from_slice(&[1]);
     let claim = IndexClaim::Index { id: vid + 1, unique: false };
     engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
     let schema = make_schema_u64_i64();
     let spec = all_rows();
-    let record = engine.wire_target(tid).unwrap().1.clone();
+    let record = engine.sal_target(tid).unwrap().1.clone();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
@@ -129,9 +130,9 @@ fn in_wait_dispositions() {
     )]);
     drain_in_wait(&mut wp);
 
-    assert_eq!(owed(&wp.replies), [("parked", 1), ("parked", 2), ("train", 4)]);
+    assert_eq!(owed(&wp.replies), [("parked", 1), ("parked", 2)]);
     let out = frames(&rx);
-    assert_eq!(reqs(&out), [3, 5]);
+    assert_eq!(reqs(&out), [3, 4, 5]);
     assert_eq!(rx.lowest_applied(), 0, "nothing served in a wait is ACKed");
     assert_eq!(
         weighted_rows(&scan_all(wp.catalog, tid)),
@@ -141,11 +142,12 @@ fn in_wait_dispositions() {
     let statuses: Vec<_> = out.iter().map(|f| f.ctrl.hdr.status).collect();
     assert_eq!(
         statuses,
-        [WireStatus::Ok, WireStatus::Error],
-        "the table's read and HasPk (a keyless probe faults) answer"
+        [WireStatus::Ok, WireStatus::Ok, WireStatus::Error],
+        "the table's read, KeySpans and HasPk (a keyless probe faults) answer"
     );
     assert!(out[0].ctrl.hdr.flags.scan_last);
-    let fault = out[1].ctrl.fault(&out[1].bytes).expect("a fault frame");
+    assert!(out[1].ctrl.hdr.flags.scan_last, "KeySpans answers in one frame");
+    let fault = out[2].ctrl.fault(&out[2].bytes).expect("a fault frame");
     assert!(fault.text.contains("pk_probe"), "{fault}");
 }
 
@@ -153,8 +155,7 @@ fn in_wait_dispositions() {
 /// delta — and is ACKed at the position its write answered.
 #[test]
 fn a_two_tid_tick_group_ticks_both_and_acks_its_end() {
-    let dir = crate::test_support::scratch_dir("worker", "two_tid_tick");
-    let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
+    let (_dir, mut engine) = crate::test_support::empty_catalog(1);
     let schema = make_schema_u64_i64();
     for tid in [500, 501] {
         register_full_pk(
@@ -175,24 +176,23 @@ fn a_two_tid_tick_group_ticks_both_and_acks_its_end() {
         tids: vec![500, 501].into(),
     };
     let at = sal.excl().apply(tick).expect("group fits");
-    wp.drain_sal();
+    wp.drain_sal(false);
 
     for tid in [500, 501] {
         assert!(wp.catalog.registry.seal(tid).unwrap().is_none(), "tid {tid} was ticked");
     }
     assert_eq!(rx.lowest_applied(), at, "the group is ACKed at its end");
     assert!(frames(&rx).is_empty(), "an ACK takes no reply slot");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A base-table read drained inside an exchange wait answers at its place in the
 /// SAL: the push behind it is applied, and is not in the reply.
 #[test]
 fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
-    let (mut engine, tid) = table_engine("worker", "push_behind_read", 1, &u64_i64_cols());
+    let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let spec = all_rows();
-    let record = engine.wire_target(tid).unwrap().1.clone();
+    let record = engine.sal_target(tid).unwrap().1.clone();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     let (mut wp, sal, rx) = test_worker(&mut engine);
 
@@ -214,7 +214,7 @@ fn a_push_does_not_reach_a_base_table_read_ahead_of_it() {
 /// the view's reply reaches the ring first.
 #[test]
 fn a_parked_view_read_answers_ahead_of_the_read_behind_it_on_its_lease() {
-    let (mut engine, tid) = table_engine("worker", "parked_view_read", 1, &u64_i64_cols());
+    let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let spec = all_rows();
@@ -246,7 +246,7 @@ fn a_parked_view_read_answers_ahead_of_the_read_behind_it_on_its_lease() {
 /// past what another lease owes.
 #[test]
 fn a_burst_passes_what_another_lease_owes() {
-    let (mut engine, tid) = table_engine("worker", "burst", 1, &u64_i64_cols());
+    let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     let vid = register_identity_view(&mut engine, tid, "v", &u64_i64_cols());
     let schema = make_schema_u64_i64();
     let spec = all_rows();
@@ -269,17 +269,20 @@ fn a_burst_passes_what_another_lease_owes() {
     assert_eq!(owed(&wp.replies), [("parked", 1)]);
 }
 
-/// The wait looks at its round after every read: with the round complete, the
-/// drive goes on after one and leaves the next on the SAL.
+/// The wait looks at its round after every group: with the round complete, the
+/// drive goes on after one, sends no frame of the train it queued, and leaves
+/// the next group on the SAL.
 #[test]
 fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
-    let (mut engine, tid) = table_engine("worker", "round_first", 1, &u64_i64_cols());
+    let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
+    let cols = PkColList::from_slice(&[1]);
+    let claim = IndexClaim::Index { id: tid + 1, unique: false };
+    engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
     let schema = make_schema_u64_i64();
     let spec = all_rows();
     let (mut wp, sal, rx) = test_worker(&mut engine);
-    for request_id in [1, 2] {
-        ask(&mut sal.excl(), scan(tid, &schema, &spec), request_id).expect("group fits");
-    }
+    ask(&mut sal.excl(), Read::KeySpans { tid, cols, claim: false }, 1).expect("group fits");
+    ask(&mut sal.excl(), scan(tid, &schema, &spec), 2).expect("group fits");
 
     // One worker: its own publish completes the round.
     let part = make_batch_raw(&schema, &[(1, 1, 10)]);
@@ -293,7 +296,8 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
     let mut got = Vec::new();
     wp.exchange(std::iter::once(lane), false, &mut got);
     assert_eq!(weighted_rows(&got[0]), weighted_rows(&part));
-    assert_eq!(reqs(&frames(&rx)), [1]);
+    assert_eq!(owed(&wp.replies), [("train", 1)]);
+    assert!(frames(&rx).is_empty(), "no frame leaves once the round is complete");
     let next = wp.sal_reader.next_request(|_, _| None);
     assert!(
         matches!(next, Some(Inbound::Read { route, .. }) if route.request_id == id(2)),
@@ -305,7 +309,7 @@ fn a_complete_round_goes_ahead_of_the_reads_on_the_sal() {
 /// worker's: a peer whose source is not drained overturns it.
 #[test]
 fn exchange_answers_the_rounds_verdict() {
-    let (mut engine, _) = table_engine("worker", "exchange_verdict", 1, &u64_i64_cols());
+    let (_dir, mut engine, _) = table_engine(1, &u64_i64_cols());
     let (mut wp, _sal, _rx) = test_worker(&mut engine);
     let part = make_batch_raw(&make_schema_u64_i64(), &[(1, 1, 10)]);
     let plan = ScatterPlan::broadcast();
@@ -334,7 +338,7 @@ fn a_train_advances_with_every_request() {
     const GROUPS: usize = 5;
     let fixed = make_schema_u64_i64();
     let rows = make_batch_raw(&fixed, &(0..40).map(|i| (i, 1, i as i64)).collect::<Vec<_>>());
-    let (mut engine, tid) = table_engine("worker", "train_advances", 1, &u64_i64_cols());
+    let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     let (mut wp, sal, rx) = test_worker(&mut engine);
     wp.replies
         .set_frame_budget(frame_size(&make_batch_raw(&fixed, &[(0, 1, 0); 4])));
@@ -344,7 +348,7 @@ fn a_train_advances_with_every_request() {
         // Control-only and unanswered: nothing of its own reaches the ring.
         sal.excl().push(tid, &[], Routed::Same(None)).expect("group fits");
     }
-    wp.drain_sal();
+    wp.drain_sal(false);
     assert_eq!(reqs(&frames(&rx)), [11; GROUPS + 1]);
     assert_eq!(owed(&wp.replies), [("train", 11)], "ten frames, six sent");
 }
@@ -354,7 +358,7 @@ fn a_train_advances_with_every_request() {
 /// claim holds.
 #[test]
 fn a_claiming_span_read_holds_its_index_until_its_release() {
-    let (mut engine, tid) = table_engine("worker", "preflight_claim", 1, &u64_i64_cols());
+    let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     let held: Vec<_> = (0..5).map(|i| (i, 1, -(i as i64))).collect();
     engine
         .registry
@@ -373,7 +377,7 @@ fn a_claiming_span_read_holds_its_index_until_its_release() {
 
     let spans = Read::KeySpans { tid, cols, claim: true };
     ask(&mut sal.excl(), spans, 1).expect("group fits");
-    wp.drain_sal();
+    wp.drain_sal(false);
     drain(&mut wp.replies);
     assert!(indexed(&wp));
     let span_schema = pk_only_schema(&[TypeCode::I64]);
@@ -385,7 +389,7 @@ fn a_claiming_span_read_holds_its_index_until_its_release() {
     );
 
     ask(&mut sal.excl(), Read::ReleasePreflight, 2).expect("group fits");
-    wp.drain_sal();
+    wp.drain_sal(false);
     assert!(!indexed(&wp));
     assert_eq!(reqs(&frames(&rx)), [2]);
 }
@@ -398,13 +402,13 @@ fn a_push_behind_a_two_source_tick_waits_for_the_next() {
     let cols = u64_i64_cols();
     let schema = make_schema_u64_i64();
     let spec = all_rows();
-    let (mut engine, t1) = table_engine("worker", "tick_seal_window", 4, &cols);
+    let (_dir, mut engine, t1) = table_engine(4, &cols);
     let t2 = engine.create_table("public.t2", &cols, &[0]).unwrap();
     // A tick of `t1` waits on an exchange round, and on another a wave later.
     let (v1, counts) = register_count_of(&mut engine, t1, &schema, &[1], "v1");
     register_count_of(&mut engine, v1, counts.output_schema(), &[], "total");
     let v2 = register_identity_view(&mut engine, t2, "v2", &cols);
-    let record = engine.wire_target(t2).unwrap().1.clone();
+    let record = engine.sal_target(t2).unwrap().1.clone();
     let row = make_batch_raw(&schema, &[(1, 1, 10)]);
     engine
         .registry
@@ -421,7 +425,7 @@ fn a_push_behind_a_two_source_tick_waits_for_the_next() {
     sal.excl()
         .push(t2, &record, Routed::Same(row.wire_whole()))
         .expect("group fits");
-    wp.drain_sal();
+    wp.drain_sal(false);
     drain(&mut wp.replies);
 
     let out = frames(&rx);

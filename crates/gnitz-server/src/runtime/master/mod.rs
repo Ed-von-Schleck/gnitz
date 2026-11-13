@@ -5,8 +5,7 @@
 //! the workers apply the log through. A push group and a catalog zone, which
 //! no worker answers, are laid out here in a hold or scope of the caller's.
 //! The child `route` decides which workers a read or push reaches; `dispatch`
-//! holds the writes and the tick rounds they allocate; `workers` holds the
-//! worker processes.
+//! holds the writes and the tick ledger; `workers` holds the worker processes.
 
 pub(crate) mod route;
 
@@ -19,9 +18,7 @@ mod workers;
 #[path = "tests/fixtures.rs"]
 pub(crate) mod fixtures;
 
-use std::cell::{Cell, Ref, RefCell, RefMut};
-
-use rustc_hash::FxHashMap;
+use std::cell::{Ref, RefCell, RefMut};
 
 use crate::catalog::CatalogEngine;
 use crate::runtime::reactor::{Reactor, TrainLease};
@@ -44,12 +41,7 @@ pub(crate) struct MasterDispatcher {
     /// The master's one event loop, which reads every worker's replies.
     reactor: Reactor,
     catalog: RefCell<CatalogEngine>,
-    /// The last tick round allocated, one per tid a tick group carries. Starts
-    /// at 1, which is never emitted, so `after_tick = 0` names no round. Grows
-    /// under the SAL hold its tick groups are written under.
-    round: Cell<u64>,
-    /// Ticked relation id → the last round that ticked it.
-    last_tick: RefCell<FxHashMap<u64, u64>>,
+    ticks: dispatch::TickLedger,
     /// Taken by whoever writes an apply — a tick, a checkpoint's rounds, a
     /// backfill — and by a DDL body, whose zone every worker ingests. A worker
     /// inside the exchange wait of a `Tick` or `Backfill` fail-stops on either,
@@ -61,11 +53,10 @@ pub(crate) struct MasterDispatcher {
 impl MasterDispatcher {
     pub(crate) fn new(catalog: CatalogEngine, sal: SalWriter, reactor: Reactor) -> Self {
         MasterDispatcher {
+            ticks: dispatch::TickLedger::new(sal.watermark()),
             sal,
             reactor,
             catalog: RefCell::new(catalog),
-            round: Cell::new(1),
-            last_tick: RefCell::default(),
             applies: AsyncRwLock::default(),
         }
     }

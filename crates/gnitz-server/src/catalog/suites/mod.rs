@@ -51,10 +51,10 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: u64, key: u128) -> gnitz_sto
 }
 
 use crate::test_support::{
-    apply_ddl, bundle, circuit_batch, cmp_all, col_def, col_tab_batch, cols_of, distinct_circuit, equi_join_circuit,
-    fk_child_cols, fk_def, fk_def_on_delete, fk_parent, idx_tab_batch, left_join_engine, mix, negate_chain, net_weight,
-    nullable_def, opk_pk, pk_payload_schema, push_and_tick, push_sys_row, read_rows, refusal, register_full_pk,
-    register_identity_view, scan_all, schema_tab_batch, scratch_dir, sum_weights, sys_batch, table_engine,
+    apply_ddl, bundle, circuit_batch, cmp_all, col_def, col_tab_batch, cols_of, distinct_circuit, empty_catalog,
+    equi_join_circuit, fk_child_cols, fk_def, fk_def_on_delete, fk_parent, idx_tab_batch, left_join_engine, mix,
+    negate_chain, net_weight, nullable_def, opk_pk, pk_payload_schema, push_and_tick, push_sys_row, read_rows, refusal,
+    register_full_pk, register_identity_view, scan_all, schema_tab_batch, sum_weights, sys_batch, table_engine,
     table_tab_batch, table_tab_row, try_register_identity_view, try_register_view, two_term_join_circuit, uuid_def,
     view_blocks, view_tab_row, weights,
 };
@@ -107,6 +107,24 @@ fn reserve(engine: &mut CatalogEngine, seq: u64, count: u64) -> Result<(u64, Bat
     Ok((base, laid.remove(0)))
 }
 
+/// The base of a fresh database's first allocation of `count` ids, and the
+/// `sequences` group that allocation lays out, from a scratch engine: a log
+/// tail that creates ids carries it ahead of the creates.
+fn logged_allocation(count: u64) -> (u64, Batch) {
+    let (_dir, mut engine) = empty_catalog(1);
+    let mut laid = Vec::new();
+    let base = engine
+        .reserve_catalog_ids(count, &mut |family, b| {
+            assert_eq!(family, SysFamily::Sequence);
+            laid.push(b.clone());
+            Ok(())
+        })
+        .map_err(refusal)
+        .unwrap();
+    assert_eq!(laid.len(), 1, "an allocation lays out one group");
+    (base, laid.remove(0))
+}
+
 /// `(live rows, net-negative rows)` of every system family.
 fn sys_row_counts(engine: &CatalogEngine) -> Vec<(usize, usize)> {
     SysFamily::ALL
@@ -118,29 +136,6 @@ fn sys_row_counts(engine: &CatalogEngine) -> Vec<(usize, usize)> {
             )
         })
         .collect()
-}
-
-fn temp_dir(name: &str) -> String {
-    scratch_dir("catalog", name)
-}
-
-/// A fresh engine on an emptied scratch directory named `name`.
-fn fresh(name: &str) -> CatalogEngine {
-    CatalogEngine::open(&temp_dir(name), 1).unwrap()
-}
-
-/// Close `engine`, flushing it, then remove its data directory.
-fn finish(engine: CatalogEngine) {
-    let dir = engine.registry.base_dir().to_owned();
-    engine.close();
-    let _ = fs::remove_dir_all(dir);
-}
-
-/// Drop `engine` unflushed and remove its data directory.
-fn discard(engine: CatalogEngine) {
-    let dir = engine.registry.base_dir().to_owned();
-    drop(engine);
-    let _ = fs::remove_dir_all(dir);
 }
 
 // An arbitrary fixed 128-bit value for UUID columns; the bit pattern is
@@ -238,8 +233,6 @@ fn assert_unreplayed_source_rebuilds_at_reopen(mut engine: CatalogEngine, source
         !engine.boot.rebuild.contains(&over_table),
         "a checkpointed view over a base table resumes, so the rejection is about the source"
     );
-
-    discard(engine);
 }
 
 /// An ephemeral round publishes nothing of a view `source` reaches — neither
@@ -271,8 +264,6 @@ fn assert_round_publishes_nothing_reaching(mut engine: CatalogEngine, source: u6
     assert!(engine.boot.rebuild.contains(&direct));
     assert!(engine.boot.rebuild.contains(&downstream));
     assert!(!engine.boot.rebuild.contains(&over_table));
-
-    discard(engine);
 }
 
 /// `(rows, summed weight)` of relation `id`: equal iff every row stands at weight 1.
@@ -315,14 +306,13 @@ fn rows<const N: usize>(
 /// [`table_engine`] holding ids `0..n`, every row at weight 1, ingested as one
 /// batch.
 fn ingest_fixture<const N: usize>(
-    name: &str,
     cols: &[CatalogColumn],
     n: u64,
     cells: impl Fn(u64) -> [u64; N],
-) -> (CatalogEngine, u64) {
-    let (mut engine, tid) = table_engine("catalog", name, 1, cols);
+) -> (tempfile::TempDir, CatalogEngine, u64) {
+    let (dir, mut engine, tid) = table_engine(1, cols);
     engine.registry.ingest(tid, rows(&engine, tid, 1, 0..n, cells)).unwrap();
-    (engine, tid)
+    (dir, engine, tid)
 }
 
 /// A one-row `public` TABLE_TAB `+1` under an explicit packed `pk_col_idx`

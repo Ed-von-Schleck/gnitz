@@ -44,8 +44,8 @@ async fn enter_ddl(shared: &Shared) -> DdlLocks {
 /// `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT`: hold the first DDL, its zone written
 /// and its locks still held, until a task parks on the apply lock it holds.
 /// Below a checkpoint threshold of one zone, and with no tick request
-/// outstanding, that task is the committer, inside the checkpoint the
-/// watchdog's reclaim wake called for. One-shot.
+/// outstanding, that task is the committer, inside the checkpoint the zone's
+/// crossing of the threshold woke it for. One-shot.
 static DDL_HOLD_FOR_CHECKPOINT: Seam = Seam::new("GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT");
 
 /// Poll bound for [`DDL_HOLD_FOR_CHECKPOINT`], in 1 ms ticks.
@@ -118,14 +118,18 @@ pub(super) async fn handle_ddl_txn(shared: &Shared, body: &[u8]) -> Result<u64, 
         gnitz_fatal_abort!("live CREATE VIEW backfill failed after the CREATE was made durable: {e}");
     }
 
-    // After the backfill: a new view has read the sealed families, and these
-    // rows reach the views that already scanned them.
-    if let Err(e) = shared.dispatcher.drain_tick(&locks.applies, &applied.held_above).await {
-        gnitz_fatal_abort!("catalog tick failed after the DDL was made durable: {e}");
+    // After the backfill: a new view has read the sealed families, and their
+    // rows reach the views that already scanned them. The tick takes whatever
+    // user commit is pending too: every writer holds a catalog read until its
+    // fdatasync, so each of those was laid out before this DDL.
+    match shared.dispatcher.emit_tick(&locks.applies).await {
+        Ok(Some(wait)) => wait.acks().await,
+        Ok(None) => {}
+        Err(e) => gnitz_fatal_abort!("catalog tick failed after the DDL was made durable: {e}"),
     }
     // Any DDL may change what a parked sync reads: a view dropped, a source's
     // token reset, catalog rows a view scans.
-    shared.ticks.wake_watches();
+    shared.dispatcher.wake_watches();
 
     if DDL_HOLD_FOR_CHECKPOINT.take_once() {
         park_until(shared, DDL_HOLD_MAX_POLLS, "ddl hold", || locks.applies.contended()).await;
@@ -164,15 +168,21 @@ async fn commit_bundle(
     // Before the views exist: a tick owed now carries rows pushed ahead of them,
     // and a stream's must not reach them.
     if families.get(SysFamily::Circuit).is_some() {
-        if let Some(wait) = shared.emit_pending_tick(alone).await? {
+        if let Some(wait) = shared.dispatcher.emit_tick(alone).await? {
             wait.acks().await;
         }
     }
     let (applied, zone_lsn) = {
         let mut excl = shared.dispatcher.sal().lock().await;
-        shared
+        let (applied, zone_lsn) = shared
             .dispatcher
-            .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(families, sink))?
+            .emit_zone(&mut excl, |cat, sink| cat.apply_bundle(families, sink))?;
+        // The zone's families a view scans are owed the tick that follows the
+        // backfill; `alone` keeps every other emit from taking them first.
+        for &family in &applied.held_above {
+            shared.dispatcher.credit(&excl, family, 0);
+        }
+        (applied, zone_lsn)
     };
     shared.dispatcher.sal().durable_through(zone_lsn).await;
     Ok(Committed { applied, zone_lsn, filter_seeds })
@@ -188,6 +198,23 @@ async fn release_preflight(shared: &Shared) {
     if let Err(e) = released {
         gnitz_fatal_abort!("releasing the unique-index pre-flight's claims failed: {}", e.text);
     }
+}
+
+/// Allocate `count` contiguous catalog object ids and return the first. The
+/// advance is a DDL SAL zone, which is how boot recovers the counter.
+///
+/// The ACK waits for no fdatasync, and the allocation takes no catalog lock:
+/// the SAL lock orders it among the zones. Nor does it take the apply lock: its
+/// one group is of a family no worker holds, so it reaches no drive in flight.
+/// A DDL creating one of these ids is durable through its own zone's fdatasync
+/// or through a checkpoint, and either makes this zone durable first. An allocation a crash loses was used by no
+/// durable row, and a client drops its allocated ids with its connection.
+pub(super) async fn allocate_ids(shared: &Shared, count: u64) -> Result<u64, WireFault> {
+    let mut excl = shared.dispatcher.sal().lock().await;
+    let (base, _) = shared
+        .dispatcher
+        .emit_zone(&mut excl, |cat, sink| cat.reserve_catalog_ids(count, sink))?;
+    Ok(base)
 }
 
 /// Reserve a SERIAL id range for `seq` and return its base. The advance is a

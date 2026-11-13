@@ -84,13 +84,19 @@ fn ab(a: TypeCode) -> SchemaDescriptor {
 }
 
 /// `10 ⋈ 11` on `10.a = 11.k`, 11 being `(k | w)`: 10 re-keyed onto `key`, a
-/// `distinct` in between where `distinct`, each side stating its key as its route.
+/// `distinct` in between where `distinct`, each side stating as its route the
+/// slots of its key a join of `kind` meets on.
 fn rekeyed_join(c: &mut Circuit, key: &[ReindexSlot], distinct: bool, kind: JoinKind) {
     use gnitz_wire::{NullKeys, ReadBound};
     // Both sides pack at the one type the pair shares.
     let b_key = [(0, key[0].1)];
-    let mut a = c.input_scattered(10, ReadBound::None, Some(key.to_vec()));
-    let b = c.input_scattered(11, ReadBound::None, Some(b_key.to_vec()));
+    // A range join's sides meet on all but its last key slot.
+    let routed = |key: &[ReindexSlot]| match kind {
+        JoinKind::Range { .. } => key[..key.len() - 1].to_vec(),
+        _ => key.to_vec(),
+    };
+    let mut a = c.input_scattered(10, ReadBound::None, Some(routed(key)));
+    let b = c.input_scattered(11, ReadBound::None, Some(routed(&b_key)));
     if distinct {
         a = c.distinct(a);
     }
@@ -317,7 +323,7 @@ fn a_delta_is_relayed_only_where_it_is_not_already_in_place() {
         c.join([a, b], [a, b], JoinKind::Equi);
     };
     type Case = (&'static str, u32, [Source; 2], Build, (usize, usize));
-    let cases: [Case; 9] = [
+    let cases: [Case; 10] = [
         (
             "a shard on the key its scan's rows are placed by",
             4,
@@ -328,7 +334,7 @@ fn a_delta_is_relayed_only_where_it_is_not_already_in_place() {
             },
             (0, 0),
         ),
-        ("a negate is not row-local", 4, [keyed; 2], negated, (1, 0)),
+        ("a negate keeps each row on its worker", 4, [keyed; 2], negated, (0, 0)),
         ("one worker", 1, [keyed; 2], negated, (0, 0)),
         (
             "a view over replicated sources alone is computed whole on every worker",
@@ -349,24 +355,33 @@ fn a_delta_is_relayed_only_where_it_is_not_already_in_place() {
                 });
                 c.union(a, b);
             },
-            (1, 1),
+            (0, 1),
         ),
         (
-            "a replica's share is one worker's rows: an exchange behind it takes a round",
+            "a replica's share is one worker's rows: an exchange behind it by another key takes a round",
             4,
             [replicated, keyed],
             |c| {
+                let b = scan(c, 9);
+                c.shard(b);
                 let a = scan(c, 7);
                 let a = c.negate(a);
                 let a = c.shard(a);
                 let a = c.negate(a);
-                let a = c.shard(a);
-                let b = scan(c, 9);
-                let b = c.negate(b);
-                let b = c.shard(b);
-                c.union(a, b);
+                c.reduce(a, count_by(&[1]));
             },
-            (2, 1),
+            (1, 1),
+        ),
+        (
+            "a hash-row map over a replicated side keeps it whole",
+            4,
+            [replicated, keyed],
+            |c| {
+                scan(c, 9);
+                let a = scan(c, 7);
+                c.map_hash_row(a, &self_typed_slots(&make_schema_u64_i64(), &[1]));
+            },
+            (0, 1),
         ),
         (
             "a routed replicated source is shared",
@@ -402,10 +417,10 @@ fn a_delta_is_relayed_only_where_it_is_not_already_in_place() {
     }
 }
 
-/// A reduce's co-location moves nothing exactly where a walk back through
-/// row-local nodes ends at a scan whose rows are already placed by its group key.
+/// A reduce's co-location moves nothing exactly where its input's rows already
+/// sit on the owner of its group key.
 #[test]
-fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_by_its_key() {
+fn the_output_exchange_is_skipped_only_where_its_input_sits_by_its_key() {
     let i64 = SchemaColumn::new(TypeCode::I64, false);
     let u64 = SchemaColumn::new(TypeCode::U64, false);
     // PK last, so a group column behind a map — an index into the map's output,
@@ -418,7 +433,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
         let other = scan(c, 9);
         c.union(n, other)
     };
-    let cases: [(&str, Source, Stage, &[u32], bool); 13] = [
+    let cases: [(&str, Source, Stage, &[u32], bool); 14] = [
         ("a bare scan", pk_last, bare, &[2], true),
         ("a payload column", pk_last, bare, &[0], false),
         ("an empty key", pk_last, bare, &[], false),
@@ -473,7 +488,7 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
             &[0],
             false,
         ),
-        ("a fan-in draws from two sources", pk_last, fan_in, &[2], false),
+        ("a fan-in of two sources placed by the key", pk_last, fan_in, &[2], true),
         (
             "a filter over a fan-in",
             pk_last,
@@ -483,8 +498,9 @@ fn the_output_exchange_is_skipped_only_behind_a_row_local_walk_to_a_scan_placed_
                 c.filter(u, predicate(0))
             },
             &[2],
-            false,
+            true,
         ),
+        ("a fan-in on a payload column", pk_last, fan_in, &[0], false),
     ];
     for (why, source, mid, group, skipped) in cases {
         let (rounds, _) = relays(4, [source; 2], |c| {

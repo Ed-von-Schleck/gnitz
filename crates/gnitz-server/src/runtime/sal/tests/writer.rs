@@ -11,7 +11,10 @@ use crate::runtime::w2m::fixtures::id;
 use crate::test_support::{make_batch, make_schema_u64_i64};
 use gnitz_store::relation::PkRule;
 use gnitz_zset::schema::encode_schema_block;
-use std::task::Poll;
+use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 
 /// A group that does not fit is refused `SalFull` and leaves the log as it was.
 /// Only one within its kind's limit, refused past the checkpoint's floor, calls
@@ -120,6 +123,70 @@ fn a_checkpoint_is_due_by_the_bytes_behind_the_last_one() {
 
     excl.checkpoint_reset();
     assert!(!log.needs_checkpoint(), "the next base round's rewind");
+}
+
+/// A wake that counts itself.
+#[derive(Default)]
+struct Wakes(AtomicUsize);
+
+impl Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `checkpoint_due` waits on `needs_checkpoint` itself: a group or a scope
+/// that crosses the threshold wakes it, and so does a refusal a checkpoint
+/// may admit. A wait is ready at once while a checkpoint is due, and a group
+/// that leaves the log below the threshold wakes nobody.
+#[test]
+fn checkpoint_due_is_woken_whenever_a_checkpoint_becomes_due() {
+    let cap = 1024;
+    let log = test_log(PREFIX_BYTES + CHECKPOINT_RESERVE + cap, 1, 1);
+    let one = log.push_footprint(&[], Routed::Same(None)) as u64;
+    let log = log.checkpoint_at(2 * one);
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut due = Box::pin(log.checkpoint_due());
+    let mut poll = || due.as_mut().poll(&mut Context::from_waker(&waker));
+    let woken = || wakes.0.load(Ordering::Relaxed);
+    let mut excl = log.excl();
+
+    assert_eq!(poll(), Poll::Pending, "an empty log");
+    excl.write_group(&to(1)).expect("group fits");
+    assert_eq!((woken(), poll()), (0, Poll::Pending), "below the threshold");
+
+    // A scope's commit is where its groups count.
+    let mut scope = excl.begin();
+    scope.unit(|s| s.write(&to(2), true)).expect("group fits");
+    assert_eq!(woken(), 0, "laid out, not published");
+    scope.commit();
+    assert_eq!((woken(), poll()), (1, Poll::Ready(())), "the commit crossed it");
+    assert_eq!(try_poll_once(log.checkpoint_due()), Some(()), "and stays due");
+
+    excl.checkpoint_reset();
+    let mut due = Box::pin(log.checkpoint_due());
+    let mut poll = || due.as_mut().poll(&mut Context::from_waker(&waker));
+    assert_eq!(poll(), Poll::Pending, "the rewind");
+    excl.write_group(&to(3)).expect("group fits");
+    excl.write_group(&to(4)).expect("group fits");
+    assert_eq!((woken(), poll()), (2, Poll::Ready(())), "a group crossed it");
+
+    // Room behind a `FlushEph` for one group, not for two: the second is
+    // refused past the floor with the log below the threshold.
+    excl.checkpoint_reset();
+    excl.apply(Apply::FlushEph { generation: 1 }).expect("group fits");
+    let flush_eph = log.cursor();
+    excl.checkpoint_reset();
+    log.seek((cap - PREFIX_BYTES) as u64 - one - flush_eph);
+    excl.apply(Apply::FlushEph { generation: 1 }).expect("group fits");
+    let mut due = Box::pin(log.checkpoint_due());
+    let mut poll = || due.as_mut().poll(&mut Context::from_waker(&waker));
+    excl.write_group(&to(5)).expect("group fits");
+    assert_eq!((woken(), poll()), (2, Poll::Pending), "one group behind the checkpoint");
+    let full = excl.write_group(&to(6)).expect_err("no room");
+    assert!(full.checkpoint_may_admit());
+    assert_eq!((woken(), poll()), (3, Poll::Ready(())), "the refusal called for one");
 }
 
 /// Nothing a scope lays out is visible until it commits; then all of it is, in

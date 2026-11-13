@@ -1,6 +1,6 @@
 //! The state every relation registration enters and every unregistration
-//! removes — the relation's named record, its FK edges in both directions, its
-//! serial flag and its RESOLVE token — together with the readers of that state;
+//! removes — the relation's two records, its FK edges in both directions and its
+//! RESOLVE token — together with the readers of that state;
 //! and the name index, which follows every TABLE_TAB and VIEW_TAB delta instead,
 //! rename pairs and the system families' own rows included.
 //!
@@ -14,17 +14,17 @@ use std::num::NonZeroU64;
 use std::rc::Rc;
 
 use gnitz_store::relation::Relation;
-use gnitz_wire::schema_block::check_same_types;
 use gnitz_wire::{
-    payload_str, payload_u64, FkAction, PkColList, RelDescriptorBlob, RelIndex, Target, WireFault, WireStatus,
-    RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID,
+    payload_str, payload_u64, CatalogColumn, FkAction, PkColList, RelDescriptorBlob, RelIndex, Target, WireFault,
+    WireStatus, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID,
 };
 use gnitz_zset::algebra::KeySpec;
 use gnitz_zset::repr::Batch;
-use gnitz_zset::schema::SchemaDescriptor;
+use gnitz_zset::schema::{encode_schema_block, SchemaDescriptor};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
+use super::sys_tables::encode_record;
 use super::CatalogEngine;
 
 /// A set of table ids to lock; a write to one table without FK edges, the
@@ -34,25 +34,36 @@ pub(crate) type LockSet = SmallVec<[u64; 4]>;
 /// What one registered relation's lifetime owns: entered by its registration,
 /// removed by its unregistration.
 pub(in crate::catalog) struct RelationEntry {
-    /// The relation's [`encode_record`](super::sys_tables::encode_record).
-    pub(in crate::catalog) record: Rc<[u8]>,
+    /// The relation's [`encode_record`]: what a RESOLVE answers, and what a
+    /// client's push is checked against.
+    record: Rc<[u8]>,
+    /// The relation's [`encode_schema_block`]: what every SAL group of it
+    /// carries, and what a worker checks one against.
+    sal_record: Rc<[u8]>,
     /// The FK edges this relation declares as a child.
     pub(in crate::catalog) fks: Vec<FkEdge>,
-    /// [`gnitz_wire::TableProps::serial`].
-    pub(in crate::catalog) serial: bool,
     /// The token of [`CatalogEngine::resolve_answer`], once computed. Reset by
     /// every hook of a family that can change a RESOLVE answer.
     pub(in crate::catalog) token: Cell<Option<NonZeroU64>>,
 }
 
 impl RelationEntry {
-    pub(in crate::catalog) fn new(record: Rc<[u8]>, fks: Vec<FkEdge>, serial: bool) -> Self {
-        RelationEntry {
-            record,
+    /// The entry of a relation of `schema`, whose columns `defs` describe.
+    pub(in crate::catalog) fn new(schema: &SchemaDescriptor, defs: &[CatalogColumn], fks: Vec<FkEdge>) -> Self {
+        let mut entry = RelationEntry {
+            record: Rc::default(),
+            sal_record: Rc::default(),
             fks,
-            serial,
             token: Cell::new(None),
-        }
+        };
+        entry.set_records(schema, defs);
+        entry
+    }
+
+    /// Re-encode both records for `schema`, whose columns `defs` describe.
+    pub(in crate::catalog) fn set_records(&mut self, schema: &SchemaDescriptor, defs: &[CatalogColumn]) {
+        self.record = Rc::from(encode_record(schema.pk_cols(), defs));
+        self.sal_record = Rc::from(encode_schema_block(schema));
     }
 }
 
@@ -74,11 +85,20 @@ impl CatalogEngine {
         Some((self.registry.relation(tid)?, &self.caches.relations.get(&tid)?.record))
     }
 
-    /// What `frame_record` decodes to, when it lays out `tid`'s columns.
+    /// `tid`'s relation and the nameless record its SAL push groups carry;
+    /// `None` for an unregistered id.
+    pub(crate) fn sal_target(&self, tid: u64) -> Option<(&Relation, &Rc<[u8]>)> {
+        Some((
+            self.registry.relation(tid)?,
+            &self.caches.relations.get(&tid)?.sal_record,
+        ))
+    }
+
+    /// What `frame_record` decodes to, when it is the record [`Self::sal_target`]
+    /// lays `tid`'s groups out with.
     pub(crate) fn known_decode(&self, tid: u64, frame_record: &[u8]) -> Option<SchemaDescriptor> {
-        let (rel, record) = self.wire_target(tid)?;
-        check_same_types(frame_record, record).ok()?;
-        Some(rel.schema())
+        let (rel, record) = self.sal_target(tid)?;
+        (**record == *frame_record).then(|| rel.schema())
     }
 
     /// What a RESOLVE of `tid` answers: its encoded descriptor, its named record
@@ -92,7 +112,7 @@ impl CatalogEngine {
         let desc = RelDescriptorBlob {
             class: rel.kind().class(),
             pk_repeats: rel.pk_repeats(),
-            serial: entry.serial,
+            serial: self.is_serial(tid),
             indexes: rel
                 .indexes()
                 .iter()

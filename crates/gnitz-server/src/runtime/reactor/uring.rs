@@ -29,10 +29,11 @@ fn entered(rc: std::io::Result<usize>) {
 }
 
 /// Every opcode the reactor issues, by its kernel name.
-const OPCODES: [(u8, &str); 7] = [
+const OPCODES: [(u8, &str); 8] = [
     (opcode::Accept::CODE, "ACCEPT"),
     (opcode::Recv::CODE, "RECV"),
     (opcode::Send::CODE, "SEND"),
+    (opcode::Read::CODE, "READ"),
     (opcode::Fsync::CODE, "FSYNC"),
     (opcode::FutexWait::CODE, "FUTEX_WAIT"),
     (opcode::WaitId::CODE, "WAITID"),

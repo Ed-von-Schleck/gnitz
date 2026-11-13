@@ -78,9 +78,10 @@ listener.
   minted certificate is kept in the volume as `/data/tls_cert.pem`, and a client trusts
   it with `tls://host:7543?ca=<copy of it>&token_file=<file holding the token>`.
 - **Unix socket.** A client in another container that shares the volume can dial
-  `/data/gnitz.sock` directly. A client on the host also needs write permission on the
-  socket file, so run the container as the client's user (`--user "$(id -u):$(id -g)"`,
-  plus `--userns=keep-id` under rootless podman).
+  `/data/gnitz.sock` directly. Dialing needs write permission on the socket file, which
+  the server creates owner-only (`--socket-mode=600`), so run the container as the
+  client's user (`--user "$(id -u):$(id -g)"`, plus `--userns=keep-id` under rootless
+  podman), or pass `--socket-mode=660` to admit the socket's group.
 - **Stopping.** `SIGTERM` drains, checkpoints and exits 0. Give it a stop timeout
   longer than the largest checkpoint you expect; the default (10 s for Docker, 30 s for
   Kubernetes) may be too short. A `SIGKILL` loses nothing that was acknowledged, but the

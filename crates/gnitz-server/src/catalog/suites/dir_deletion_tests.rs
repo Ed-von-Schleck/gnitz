@@ -5,7 +5,7 @@ use std::path::Path;
 // A drop leaves its directory to the sweep, and the sweep takes it.
 #[test]
 fn dropped_relation_dir_survives_until_the_sweep() {
-    let mut engine = fresh("sweep_dropped_dir");
+    let (_dir, mut engine) = empty_catalog(1);
     let tid = engine
         .create_table("public.t", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
@@ -20,14 +20,14 @@ fn dropped_relation_dir_survives_until_the_sweep() {
         "the sweep must reclaim a dropped relation's directory"
     );
 
-    finish(engine);
+    engine.close();
 }
 
 // Liveness is read at sweep time, so an id registered again after its drop
 // keeps its directory.
 #[test]
 fn sweep_keeps_a_re_registered_id() {
-    let mut engine = fresh("sweep_keeps_reregistered");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let tbl_dir = relation_dir(engine.registry.base_dir(), tid);
@@ -41,5 +41,5 @@ fn sweep_keeps_a_re_registered_id() {
         "a re-registered id's directory must survive the sweep"
     );
 
-    finish(engine);
+    engine.close();
 }

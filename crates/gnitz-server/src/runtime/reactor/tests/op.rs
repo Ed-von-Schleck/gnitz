@@ -2,7 +2,7 @@
 //! later of the two, and `fsync`, which submits at its first poll and yields
 //! its CQE.
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::time::Duration;
 
 use super::super::test_support::*;
@@ -78,4 +78,33 @@ fn an_op_dropped_after_its_cqe_frees_its_slot() {
     assert_eq!(r.ops.len(), 0, "the drop freed the completed slot");
     assert_eq!(r.block_on(nop(&r)).0, 0);
     assert_eq!(r.ops.len(), 0);
+}
+
+/// `read` of a signalfd yields a signal the reading thread holds blocked:
+/// the signal is dequeued from the thread that submitted the read.
+#[test]
+fn read_takes_a_blocked_signal_off_a_signalfd() {
+    within(|| {
+        let r = make_reactor();
+        // SAFETY: an initialized sigset, masked on this thread alone; the
+        // signal is sent to this thread, so no other thread can take it.
+        let fd = unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGUSR1);
+            assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()), 0);
+            let fd = libc::signalfd(-1, &set, libc::SFD_CLOEXEC);
+            assert!(fd >= 0, "signalfd: {}", std::io::Error::last_os_error());
+            OwnedFd::from_raw_fd(fd)
+        };
+        let size = size_of::<libc::signalfd_siginfo>();
+        let mut read = std::pin::pin!(r.read(leaked(fd), vec![0; size].into_boxed_slice()));
+        assert!(try_poll_once(read.as_mut()).is_none(), "no signal yet");
+        assert_eq!(unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGUSR1) }, 0);
+        let (rc, buf) = r.block_on(read);
+        assert_eq!(rc, size as i32);
+        // SAFETY: `buf` holds one whole `signalfd_siginfo`.
+        let info: libc::signalfd_siginfo = unsafe { std::ptr::read_unaligned(buf.as_ptr().cast()) };
+        assert_eq!(info.ssi_signo, libc::SIGUSR1 as u32);
+    });
 }

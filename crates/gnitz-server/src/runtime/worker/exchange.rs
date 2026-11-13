@@ -15,7 +15,7 @@ impl DriveHost for WorkerProcess<'_> {
 
     /// Publish `lanes` as this worker's rounds — one, or as few as hold them —
     /// and block until every part of each is complete. SAL groups served
-    /// meanwhile go through [`WorkerProcess::serve_next`] with `in_drive`.
+    /// meanwhile go through [`WorkerProcess::drain_sal`] with `in_drive`.
     fn exchange<'b>(
         &mut self,
         mut lanes: impl ExactSizeIterator<Item = Lane<'b>>,
@@ -43,15 +43,9 @@ impl WorkerProcess<'_> {
             let woken = || serves && !sal.is_empty();
             self.mesh.spin_for_part(woken);
             self.mesh.park().park(|| !woken() && !self.mesh.complete());
-            // Once the round is complete the drive goes on after the next read;
-            // the next wait, or the top level, serves what the SAL still holds,
-            // in order.
+            // Once the round is complete the drive goes on.
             if serves {
-                while let Some(read) = self.serve_next(true) {
-                    if read && self.mesh.complete() {
-                        break;
-                    }
-                }
+                self.drain_sal(true);
             }
             if let Some(drained) = self.mesh.step(round, gathered) {
                 return drained;

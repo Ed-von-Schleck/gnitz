@@ -337,11 +337,6 @@ fn rings(parks: WorkerParks, capacity: usize, frame_budget: usize) -> std::io::R
         "W2M capacity={capacity} must be {RING_PREFIX_BYTES}-byte aligned, or the SKIP path's \
          prefix-word writes at the physical end cross the mapping",
     );
-    assert!(
-        capacity < u32::MAX as usize,
-        "W2M capacity={capacity} must stay under 2^32: a cursor advances by at most the ring's \
-         capacity, and only under 2^32 does an advance always move the low half a futex compares",
-    );
     let master: &'static Park = &Park::map(1)?[0];
     let mut writers = Vec::with_capacity(nw);
     let mut readers = Vec::with_capacity(nw);
@@ -466,6 +461,8 @@ impl W2mWriter {
             "w2m: sz={sz} exceeds this ring's {}-byte capacity — it would never fit",
             self.wc.dcap(),
         );
+        // The slot prefix keeps `sz` in its high 32 bits.
+        assert!(sz <= u32::MAX as usize, "w2m: sz={sz} does not fit a slot prefix");
         let placement = self.placement(total)?;
         // SAFETY: this writer is its ring's one producer, and `placement` found
         // the bytes unborrowed: past `write_cursor`, or all of an empty ring.

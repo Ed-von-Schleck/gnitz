@@ -124,9 +124,9 @@ def test_a_view_created_over_committed_data_survives_a_checkpoint_window(target)
 def test_reads_alone_are_reclaimed(own_server, target):
     """Every read verb writes a SAL command group and nothing on a read path
     rewinds the write cursor, so reads alone march it to the end of the mapping.
-    The committer tests its threshold only when something is sent to it, which a
-    read-only workload never does, so only the watchdog's reclaim wake can start
-    the checkpoint that frees it. Four connections read across many thresholds
+    A read-only workload sends the committer nothing, so only the wake a read's
+    group gives it on crossing the threshold can start the checkpoint that frees
+    it. Four connections read across many thresholds
     with no write between, and the first write afterwards must still commit."""
     with gnitz.connect(target) as client:
         client.execute_sql(
@@ -154,8 +154,8 @@ def test_no_checkpoint_runs_inside_a_ddl(own_server):
     `GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT` holds the first DDL, its zone written
     and its locks held, until a task parks on the apply lock it holds. At a
     one-byte threshold the zone alone crosses it, and nothing here asks for a
-    tick, so that task is the committer, in the checkpoint the watchdog's
-    reclaim wake called for. No checkpoint may finish between the hold's park
+    tick, so that task is the committer, in the checkpoint the zone's crossing
+    of the threshold woke it for. No checkpoint may finish between the hold's park
     and its release, and that one runs once the DDL ends."""
     own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "1", "GNITZ_INJECT_DDL_HOLD_FOR_CHECKPOINT": "1"})
     with gnitz.connect(own_server.target) as conn:
@@ -177,9 +177,9 @@ def test_an_idle_server_stops_checkpointing(own_server):
     every read calls for a checkpoint, and a server left alone settles after the
     last one instead of checkpointing what its own checkpoint wrote, forever."""
     own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "1"})
-    # The watchdog first looks 100 ms after the server is ready, and a
-    # checkpoint is logged a worker round trip later: several of its periods,
-    # so one the boot's checkpoint called for is in the log by now.
+    # A checkpoint the boot's checkpoint called for would start as soon as the
+    # server is ready, and is logged a worker round trip later: by now it is in
+    # the log.
     time.sleep(0.5)
     assert own_server.sal_checkpoints() == 0, "the boot's checkpoint called for another"
     with gnitz.connect(own_server.target) as conn:
@@ -190,7 +190,7 @@ def test_an_idle_server_stops_checkpointing(own_server):
     armed = own_server.sal_checkpoints()
     assert armed > 0, "the traffic never crossed the threshold"
 
-    # The watchdog polls every 100 ms; the scan's checkpoint may still be due.
+    # The scan's checkpoint may still be running.
     deadline = time.monotonic() + START_TIMEOUT
     while True:
         before = own_server.sal_checkpoints()

@@ -1,6 +1,6 @@
 use std::num::NonZero;
 
-use super::Workers;
+use super::{WorkerEnd, Workers};
 use crate::runtime::reactor::test_support::make_reactor;
 use crate::runtime::test_support::{fork_child, within};
 use gnitz_foundation::posix_io::retry_eintr;
@@ -25,20 +25,41 @@ fn is_child(pid: NonZero<libc::pid_t>) -> bool {
     retry_eintr(|| unsafe { libc::waitid(libc::P_PID, pid.get() as libc::id_t, &mut info, flags) }).is_ok()
 }
 
-/// `death` resolves with the rank of the worker that exited, every time it is
-/// asked, and reaps none: the dead one is still this process's child behind
-/// it. Dropping the workers then reaps every one, the dead and the live.
+/// `death` resolves with the rank of the worker that exited and how it ended,
+/// every time it is asked, and reaps none: the dead one is still this
+/// process's child behind it. Dropping the workers then reaps every one, the
+/// dead and the live.
 #[test]
 fn death_names_the_dead_worker_without_reaping_it() {
     let live = spawn_live();
-    let dead = NonZero::new(unsafe { fork_child(|| {}) }).unwrap();
+    let dead = NonZero::new(unsafe { fork_child(|| libc::_exit(3)) }).unwrap();
     within(move || {
         let reactor = make_reactor();
         let workers = Workers::new(vec![live, dead]);
-        assert_eq!(reactor.block_on(workers.death(&reactor)), 1);
-        assert_eq!(reactor.block_on(workers.death(&reactor)), 1, "and again");
+        assert_eq!(reactor.block_on(workers.death(&reactor)), (1, WorkerEnd::Exited(3)));
+        assert_eq!(
+            reactor.block_on(workers.death(&reactor)),
+            (1, WorkerEnd::Exited(3)),
+            "and again"
+        );
         assert!(is_child(dead), "the watch left the dead worker unreaped");
         drop(workers);
         assert!(!is_child(live) && !is_child(dead), "the drop reaped both");
+    });
+}
+
+/// A worker a signal killed is reported with that signal.
+#[test]
+fn death_names_the_signal_that_killed_a_worker() {
+    let killed = spawn_live();
+    let mut workers = Workers::new(Vec::new());
+    workers.push(spawn_live());
+    workers.push(killed);
+    unsafe { libc::kill(killed.get(), libc::SIGKILL) };
+    within(move || {
+        let reactor = make_reactor();
+        let (w, end) = reactor.block_on(workers.death(&reactor));
+        assert_eq!((w, end), (1, WorkerEnd::Killed(libc::SIGKILL)));
+        assert_eq!(end.to_string(), "was killed by signal 9 (SIGKILL)");
     });
 }

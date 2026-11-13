@@ -1,5 +1,5 @@
-//! Async primitives for one thread's tasks: `WakeQueue`, `Level`, `oneshot`,
-//! `chan`, `AsyncRwLock` and `select2`.
+//! Async primitives for one thread's tasks: `WakeQueue`, `Level`, `Parked`,
+//! `oneshot`, `chan`, `AsyncRwLock` and `select2`.
 //!
 //! All `!Send` and `Rc<RefCell<_>>`-based on purpose: the master's tasks never
 //! leave the reactor's thread, so a channel send costs no atomic and a waker
@@ -141,6 +141,36 @@ impl Level {
         }
         self.waiters.borrow_mut().push((v, cx.waker().clone()));
         Poll::Pending
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parked
+// ---------------------------------------------------------------------------
+
+/// One task parked until a condition holds, and the wake that has it test the
+/// condition again.
+#[derive(Default)]
+pub(crate) struct Parked(Cell<Option<Waker>>);
+
+impl Parked {
+    /// Resolves once `cond` holds, tested on every poll.
+    pub(crate) async fn until(&self, cond: impl Fn() -> bool) {
+        std::future::poll_fn(|cx| {
+            if cond() {
+                return Poll::Ready(());
+            }
+            self.0.set(Some(cx.waker().clone()));
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// Have the task parked in [`Self::until`] test its condition again.
+    pub(crate) fn wake(&self) {
+        if let Some(waker) = self.0.take() {
+            waker.wake();
+        }
     }
 }
 

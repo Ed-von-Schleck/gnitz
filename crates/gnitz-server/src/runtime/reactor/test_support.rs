@@ -4,6 +4,7 @@
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
+use super::conn::Accepted;
 use super::op::Op;
 use super::*;
 use crate::runtime::park::WorkerSet;
@@ -92,18 +93,13 @@ pub(crate) fn accepted_pair(r: &Reactor) -> (Accepted, UnixStream) {
     (r.admit(OwnedFd::from(local)).expect("under the cap"), partner)
 }
 
-/// A plain connection over an [`accepted_pair`], its recv armed, and the other
-/// end.
-pub(super) fn registered(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
-    let (accepted, partner) = accepted_pair(r);
-    (r.connect(accepted, None), partner)
-}
-
-/// [`registered`], past its handshake: admitting frames up to the payload ceiling.
-pub(super) fn admitted(r: &Reactor) -> (Rc<ClientConn>, UnixStream) {
-    let (conn, partner) = registered(r);
-    conn.admit_full_frames();
-    (conn, partner)
+impl Peer {
+    /// A plain connection over one end of an [`accepted_pair`], its recv armed,
+    /// and the other end.
+    pub(crate) fn over_socketpair(r: &Reactor) -> (Peer, UnixStream) {
+        let (accepted, partner) = accepted_pair(r);
+        (r.connect(accepted, None), partner)
+    }
 }
 
 /// Drive the reactor in non-blocking ticks until `cond` holds after one, for at

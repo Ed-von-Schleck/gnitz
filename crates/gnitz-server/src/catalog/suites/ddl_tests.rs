@@ -8,12 +8,13 @@ use std::collections::HashMap;
 
 #[test]
 fn test_bootstrap() {
-    let dir = temp_dir("bootstrap");
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let engine = CatalogEngine::open(dir, 1).unwrap();
 
     assert!(engine.schema_id("_system").is_some());
     assert!(engine.schema_id("public").is_some());
-    assert_eq!(engine.next_id, gnitz_wire::FIRST_USER_TABLE_ID);
+    assert_eq!(engine.next_catalog_id(), gnitz_wire::FIRST_USER_TABLE_ID);
 
     let schemas_before = count_records(engine.sys_relation(SysFamily::Schema).cursor());
     let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
@@ -21,7 +22,7 @@ fn test_bootstrap() {
     engine.close();
 
     // Idempotent re-open: bootstrap must not duplicate records
-    let engine2 = CatalogEngine::open(&dir, 1).unwrap();
+    let engine2 = CatalogEngine::open(dir, 1).unwrap();
     assert_eq!(
         count_records(engine2.sys_relation(SysFamily::Schema).cursor()),
         schemas_before
@@ -30,7 +31,7 @@ fn test_bootstrap() {
         count_records(engine2.sys_relation(SysFamily::Table).cursor()),
         tables_before
     );
-    finish(engine2);
+    engine2.close();
 }
 
 /// What a client scanning `columns` on a fresh server sees: every system
@@ -43,9 +44,9 @@ fn test_bootstrap() {
 /// drifting apart.
 #[test]
 fn bootstrap_self_description_matches_the_wire_column_lists() {
-    let engine = fresh("bootstrap_self_description");
+    let (_dir, engine) = empty_catalog(1);
     assert_self_description(&engine);
-    finish(engine);
+    engine.close();
 }
 
 fn assert_self_description(engine: &CatalogEngine) {
@@ -87,20 +88,22 @@ fn assert_self_description(engine: &CatalogEngine) {
 
 /// Open a fresh database, close it, and unlink `family`'s manifest — a first
 /// boot that crashed inside its flush barrier with every other family published.
-fn fresh_db_missing_manifest(name: &str, family: SysFamily) -> String {
-    let dir = temp_dir(name);
-    CatalogEngine::open(&dir, 1).unwrap().close();
-    let manifest = format!("{}/manifest.bin", relation_dir(&dir, family.id()));
+fn fresh_db_missing_manifest(family: SysFamily) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    CatalogEngine::open(dir, 1).unwrap().close();
+    let manifest = format!("{}/manifest.bin", relation_dir(dir, family.id()));
     fs::remove_file(&manifest).unwrap();
-    dir
+    tmp
 }
 
 /// A family whose manifest never published is seeded again, and only it: the
 /// families that did publish keep their seed rows at weight 1.
 #[test]
 fn an_unpublished_tables_family_is_reseeded_alone() {
-    let dir = fresh_db_missing_manifest("seed_missing_tables", SysFamily::Table);
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    let tmp = fresh_db_missing_manifest(SysFamily::Table);
+    let dir = tmp.path().to_str().unwrap();
+    let engine = CatalogEngine::open(dir, 1).unwrap();
 
     let col_rows: usize = SysFamily::ALL.iter().map(|f| f.wire().cols.len()).sum();
     for (family, rows) in [
@@ -117,24 +120,25 @@ fn an_unpublished_tables_family_is_reseeded_alone() {
         );
     }
 
-    finish(engine);
+    engine.close();
 }
 
 /// An unpublished `columns` does not stop the open: the system families'
 /// entries are compile-time data, and the reseed restores the self-description.
 #[test]
 fn an_unpublished_columns_family_is_reseeded() {
-    let dir = fresh_db_missing_manifest("seed_missing_columns", SysFamily::Column);
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    let tmp = fresh_db_missing_manifest(SysFamily::Column);
+    let dir = tmp.path().to_str().unwrap();
+    let engine = CatalogEngine::open(dir, 1).unwrap();
     assert_self_description(&engine);
-    finish(engine);
+    engine.close();
 }
 
 // ── test_ddl ─────────────────────────────────────────────────────────
 
 #[test]
 fn test_ddl() {
-    let mut engine = fresh("ddl");
+    let (_dir, mut engine) = empty_catalog(1);
 
     let init_schemas = count_records(engine.sys_relation(SysFamily::Schema).cursor());
     let init_tables = count_records(engine.sys_relation(SysFamily::Table).cursor());
@@ -189,14 +193,14 @@ fn test_ddl() {
     engine.drop_schema("temp").unwrap();
     assert!(engine.schema_id("temp").is_none());
 
-    finish(engine);
+    engine.close();
 }
 
 // ── test_edge_cases ───────────────────────────────────────────────────
 
 #[test]
 fn test_edge_cases() {
-    let mut engine = fresh("edge_cases");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = vec![col_def("id", TypeCode::U64)];
 
     // Drop non-empty schema cascades (PostgreSQL-style): the
@@ -253,7 +257,7 @@ fn test_edge_cases() {
     // Multiple dots in qualified name — second part contains dot
     assert!(engine.create_table("public.schema.tbl", &cols, &[0]).is_err());
 
-    finish(engine);
+    engine.close();
 }
 
 // ── test_nonempty_schema_drop_rejected ───────────────────────────────────
@@ -262,7 +266,7 @@ fn test_edge_cases() {
 
 #[test]
 fn test_nonempty_schema_drop_rejected() {
-    let mut engine = fresh("nonempty_schema_drop_rejected");
+    let (_dir, mut engine) = empty_catalog(1);
 
     engine.create_schema("s").unwrap();
     let tid = engine
@@ -296,20 +300,19 @@ fn test_nonempty_schema_drop_rejected() {
         engine.schema_id("s").is_none(),
         "schema gone after dropping its member first"
     );
-
-    discard(engine);
 }
 
 // ── test_restart (with data + sequence recovery) ─────────────────────
 
 #[test]
 fn test_restart_full() {
-    let dir = temp_dir("restart_full");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
     let cols = vec![col_def("id", TypeCode::U64), col_def("name", TypeCode::String)];
     let first_tid;
 
     {
-        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+        let mut engine = CatalogEngine::open(dir, 1).unwrap();
         engine.create_schema("marketing").unwrap();
         first_tid = engine.create_table("marketing.products", &cols, &[0]).unwrap();
 
@@ -323,7 +326,7 @@ fn test_restart_full() {
     }
 
     {
-        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+        let mut engine = CatalogEngine::open(dir, 1).unwrap();
         assert!(engine.schema_id("marketing").is_some());
         assert!(engine.get_by_name("marketing", "products").is_some());
         // Dropped should stay gone
@@ -339,7 +342,7 @@ fn test_restart_full() {
             new_tid > first_tid,
             "Allocator sequence recovery failed: {new_tid} <= {first_tid}"
         );
-        finish(engine);
+        engine.close();
     }
 }
 
@@ -347,19 +350,20 @@ fn test_restart_full() {
 /// restart via the cursor's copy_current_row_into blob offset rewriting.
 #[test]
 fn test_restart_long_strings() {
-    let dir = temp_dir("restart_long_str");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
     let long_name = "this_is_a_very_long_table_name_exceeding_inline_threshold";
     assert!(long_name.len() > gnitz_wire::SHORT_STRING_THRESHOLD);
 
     {
-        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+        let mut engine = CatalogEngine::open(dir, 1).unwrap();
         engine.create_schema("longtest").unwrap();
         let cols = vec![col_def("id", TypeCode::U64), col_def(long_name, TypeCode::String)];
         engine.create_table("longtest.tbl", &cols, &[0]).unwrap();
         engine.close();
     }
     {
-        let engine = CatalogEngine::open(&dir, 1).unwrap();
+        let engine = CatalogEngine::open(dir, 1).unwrap();
         assert!(engine.get_by_name("longtest", "tbl").is_some());
         // Verify column name survived out-of-line blob round-trip
         let tid = engine.get_by_name("longtest", "tbl").unwrap();
@@ -369,7 +373,7 @@ fn test_restart_long_strings() {
             &*col_defs[1].def.name, long_name,
             "Long column name corrupted after restart"
         );
-        finish(engine);
+        engine.close();
     }
 }
 
@@ -382,7 +386,7 @@ fn test_restart_long_strings() {
 // `assert!`.
 #[test]
 fn test_hook_relation_register_rejects_malformed_pk() {
-    let mut engine = fresh("pk_reject");
+    let (_dir, mut engine) = empty_catalog(1);
 
     // Columns: [c0 U64 non-null, c1 STRING non-null, c2 U64 nullable, c3 F32 non-null].
     let col_defs = vec![
@@ -428,7 +432,7 @@ fn test_hook_relation_register_rejects_malformed_pk() {
     // Nullable PK column (c2 is nullable).
     assert_rejects(PK_LIST_PACKED_FLAG | 1 | (2 << 4), "must not be nullable");
 
-    finish(engine);
+    engine.close();
 }
 
 // ── test_pk_list_round_trips_into_registered_schema ──────────────────
@@ -438,7 +442,7 @@ fn test_hook_relation_register_rejects_malformed_pk() {
 /// column order, at create and again after a reopen.
 #[test]
 fn test_pk_list_round_trips_into_registered_schema() {
-    let mut engine = fresh("pk_list_roundtrip");
+    let (_dir, mut engine) = empty_catalog(1);
     let pk_of = |engine: &CatalogEngine, tid: u64| {
         engine
             .registry
@@ -485,7 +489,7 @@ fn test_pk_list_round_trips_into_registered_schema() {
         assert_eq!(&pk_of(&engine, tid), pk_cols, "PK list of {name} must survive a reopen");
     }
 
-    finish(engine);
+    engine.close();
 }
 
 // ── test_drop_view_removes_directory ─────────────────────────────────
@@ -495,7 +499,7 @@ fn test_pk_list_round_trips_into_registered_schema() {
 
 #[test]
 fn test_drop_view_removes_directory() {
-    let mut engine = fresh("drop_view_dir");
+    let (_dir, mut engine) = empty_catalog(1);
 
     // A view needs a base table to reference.
     let base_cols = vec![col_def("id", TypeCode::U64)];
@@ -520,13 +524,13 @@ fn test_drop_view_removes_directory() {
         "view dir must be deleted by the sweep after the drop: {view_dir}"
     );
 
-    finish(engine);
+    engine.close();
 }
 
 // ── drop_table_retracts_its_serial_sequence_row ──────────────────────
 #[test]
 fn drop_table_retracts_its_serial_sequence_row() {
-    let mut engine = fresh("drop_table_serial_row");
+    let (_dir, mut engine) = empty_catalog(1);
 
     let tid = engine.create_serial_table("public.t").unwrap();
     reserve(&mut engine, tid, 64).unwrap();
@@ -535,13 +539,13 @@ fn drop_table_retracts_its_serial_sequence_row() {
     engine.submit_retraction(SysFamily::Table, tid).unwrap();
     assert_eq!(engine.sequence_value(tid), None, "the drop must retract the SERIAL row");
 
-    finish(engine);
+    engine.close();
 }
 
 // ── dropped_name_resolves_to_its_recreation ──────────────────────────
 #[test]
 fn dropped_name_resolves_to_its_recreation() {
-    let mut engine = fresh("dropped_name_recreate");
+    let (_dir, mut engine) = empty_catalog(1);
 
     let cols = u64_i64_cols();
 
@@ -570,7 +574,7 @@ fn dropped_name_resolves_to_its_recreation() {
         "the name must resolve to the NEW tid after drop + recreate"
     );
 
-    finish(engine);
+    engine.close();
 }
 
 // ── replicated_bit_is_transitive_and_survives_replay ─────────────────
@@ -580,8 +584,9 @@ fn dropped_name_resolves_to_its_recreation() {
 // ascends along scan edges. Replay must reproduce the same placements.
 #[test]
 fn replicated_bit_is_transitive_and_survives_replay() {
-    let dir = temp_dir("replicated_bit_transitive");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
 
     let cols = u64_i64_cols();
 
@@ -654,9 +659,9 @@ fn replicated_bit_is_transitive_and_survives_replay() {
 
     engine.close();
 
-    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine2 = CatalogEngine::open(dir, 1).unwrap();
     assert_stamps(&mut engine2, "after replay");
-    finish(engine2);
+    engine2.close();
 }
 
 // ---------------------------------------------------------------------------
@@ -667,7 +672,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
 /// below the SQL layer (`ViewBudget::from_row`).
 #[test]
 fn a_view_declaring_both_capacity_and_delta_is_rejected() {
-    let mut engine = fresh("capacity_and_delta_together");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = u64_i64_cols();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
@@ -678,15 +683,13 @@ fn a_view_declaring_both_capacity_and_delta_is_rejected() {
     // Either alone is accepted, so the rejection is about the pair.
     try_register_identity_view(&mut engine, tid, "bounded", &cols, 4 << 20, 0).expect("capacity alone");
     try_register_identity_view(&mut engine, tid, "fed", &cols, 0, 4 << 20).expect("delta alone");
-
-    discard(engine);
 }
 
 /// A bounded view a view may not read is named by its qualified name, not its id:
 /// the engine's message is the one every client that bypasses the SQL planner sees.
 #[test]
 fn a_bounded_view_source_is_named() {
-    let mut engine = fresh("refused_view_source_named");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = u64_i64_cols();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let bv = try_register_identity_view(&mut engine, tid, "bv", &cols, 4 << 20, 0).expect("a bounded view");
@@ -696,23 +699,19 @@ fn a_bounded_view_source_is_named() {
         err.contains("'public.bv', which is a capacity-bounded view"),
         "got: {err}"
     );
-
-    discard(engine);
 }
 
 /// A feed keeps a view's deltas in the view's own schema, so a view at
 /// `MAX_COLUMNS` carries one as any other does.
 #[test]
 fn a_view_at_the_column_limit_carries_a_feed() {
-    let mut engine = fresh("fed_view_at_the_column_limit");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols: Vec<CatalogColumn> = (0..gnitz_wire::MAX_COLUMNS)
         .map(|i| crate::test_support::col_def(&format!("c{i}"), gnitz_wire::TypeCode::U64))
         .collect();
     let tid = engine.create_table("public.wide", &cols, &[0]).unwrap();
 
     try_register_identity_view(&mut engine, tid, "fed_wide", &cols, 0, 4 << 20).expect("fed wide view");
-
-    discard(engine);
 }
 
 // ── duplicate visible column names ───────────────────────────────────
@@ -722,7 +721,7 @@ fn a_view_at_the_column_limit_carries_a_feed() {
 // point; a hidden column does not, being invisible to name resolution.
 #[test]
 fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
-    let mut engine = fresh("duplicate_column_names");
+    let (_dir, mut engine) = empty_catalog(1);
 
     let stream = gnitz_wire::TableProps { stream: true, ..Default::default() };
     for (name, flags) in [("dup_table", gnitz_wire::TableProps::default()), ("dup_stream", stream)] {
@@ -755,7 +754,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
     ];
     engine.create_table("public.hidden_dup", &col_defs, &[0]).unwrap();
 
-    finish(engine);
+    engine.close();
 }
 
 // ── One TABLE_TAB batch drops several tables, one batch per family ───────────
@@ -763,7 +762,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
 /// Workers apply the zone in this order, which no end-state assertion can see.
 #[test]
 fn set_based_table_drop_applies_one_group_per_family() {
-    let mut engine = fresh("set_based_table_drop");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let mut tids = Vec::new();
     for name in ["a", "b", "c"] {
@@ -783,7 +782,7 @@ fn set_based_table_drop_applies_one_group_per_family() {
     assert_eq!(families, [SysFamily::Index, SysFamily::Table, SysFamily::Column]);
     assert!(tids.iter().all(|&t| engine.registry.relation(t).is_none()));
 
-    finish(engine);
+    engine.close();
 }
 
 // ── A view drop retracts the internal segments it owns ───────────────────────
@@ -814,7 +813,7 @@ fn view_with_segment(engine: &mut CatalogEngine) -> (u64, u64) {
 /// it carries the drop cascade: a view's segments, a table's indexes.
 #[test]
 fn applied_ddl_reports_the_cascade_and_what_it_created() {
-    let mut engine = fresh("applied_ddl_report");
+    let (_dir, mut engine) = empty_catalog(1);
     let no_log = &mut |_: SysFamily, _: &Batch| Ok(());
 
     // A view over `views`: a CREATE VIEW writes a family a view scans.
@@ -860,12 +859,12 @@ fn applied_ddl_reports_the_cascade_and_what_it_created() {
         .collect();
     assert_eq!(indexes, [(tid, vec![1])], "the index drops with its table");
 
-    finish(engine);
+    engine.close();
 }
 
 #[test]
 fn view_drop_retracts_its_segments() {
-    let mut engine = fresh("view_drop_segments");
+    let (_dir, mut engine) = empty_catalog(1);
     let (v, s) = view_with_segment(&mut engine);
 
     let drop = engine.retract_under(SysFamily::View, &[v]);
@@ -884,12 +883,12 @@ fn view_drop_retracts_its_segments() {
         assert_eq!(rows_under(&engine, SysFamily::Column, id), 0);
     }
 
-    finish(engine);
+    engine.close();
 }
 
 #[test]
 fn dropping_a_view_with_its_segment_retracts_the_segment_once() {
-    let mut engine = fresh("view_drop_segment_once");
+    let (_dir, mut engine) = empty_catalog(1);
     let (v, s) = view_with_segment(&mut engine);
 
     let drop = engine.retract_under(SysFamily::View, &[v, s]);
@@ -902,13 +901,13 @@ fn dropping_a_view_with_its_segment_retracts_the_segment_once() {
         "the segment must not be retracted twice"
     );
 
-    finish(engine);
+    engine.close();
 }
 
 // ── One relation id names one relation ───────────────────────────────
 #[test]
 fn a_view_create_at_a_registered_table_id_is_refused() {
-    let mut engine = fresh("view_at_table_id");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = vec![col_def("id", TypeCode::U64)];
 
     // In its own bundle, against a committed table.
@@ -936,14 +935,14 @@ fn a_view_create_at_a_registered_table_id_is_refused() {
         ("?".to_string(), "?".to_string())
     );
 
-    finish(engine);
+    engine.close();
 }
 
 #[test]
 fn only_a_scanned_table_holds_a_push_for_its_tick() {
     use crate::test_support::make_batch;
     let cols = u64_i64_cols();
-    let (mut engine, tid) = table_engine("catalog", "unscanned_push", 1, &cols);
+    let (_dir, mut engine, tid) = table_engine(1, &cols);
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     engine
@@ -958,5 +957,5 @@ fn only_a_scanned_table_holds_a_push_for_its_tick() {
         .unwrap();
     assert_eq!(engine.registry.seal(tid).unwrap().map(|b| b.len()), Some(1));
 
-    finish(engine);
+    engine.close();
 }

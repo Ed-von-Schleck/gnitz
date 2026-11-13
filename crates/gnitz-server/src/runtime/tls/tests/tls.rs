@@ -20,7 +20,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use super::config::{TLS_CERT_FILE, TLS_KEY_FILE};
 use super::*;
 use crate::runtime::reactor::test_support::{accepted_pair, make_reactor, poll_until};
-use crate::runtime::reactor::{ClientConn, Reactor, SendBody};
+use crate::runtime::reactor::{Peer, Reactor, SendBody};
 use crate::runtime::test_support::{read_nonblocking, within};
 
 const LOOPBACK: &str = "127.0.0.1:0";
@@ -272,12 +272,12 @@ fn a_handshake_message_past_the_buffer_is_refused() {
 
 /// A connection under a TLS session over one end of a socketpair, the other
 /// end, which is the client's, and the PEM the client trusts.
-fn tls_over_socketpair() -> (Reactor, Rc<ClientConn>, UnixStream, String) {
+fn tls_over_socketpair() -> (Reactor, Peer, UnixStream, String) {
     let r = make_reactor();
     let (accepted, receiver) = accepted_pair(&r);
     let (served, pem, _dir) = load_minted(TlsArgs::on(LOOPBACK));
-    let conn = r.connect(accepted, Some(served.session()));
-    (r, conn, receiver, pem)
+    let peer = r.connect(accepted, Some(served.session()));
+    (r, peer, receiver, pem)
 }
 
 /// Tick until the client end reads EOF, returning every byte before it; `None`
@@ -304,11 +304,10 @@ const ALERT_HEADER: [u8; 5] = [0x15, 3, 3, 0, 2];
 /// before the EOF, and no close_notify behind it.
 #[test]
 fn a_protocol_error_reaches_the_client_as_one_fatal_alert() {
-    let (r, conn, client, _) = tls_over_socketpair();
-    let reactor = r.clone();
+    let (r, mut peer, client, _) = tls_over_socketpair();
     r.spawn(async move {
-        assert!(reactor.recv(&conn).await.is_none(), "no frame is delivered");
-        reactor.close(&conn).await;
+        assert!(peer.next_request().await.is_none(), "no frame is delivered");
+        peer.close().await;
     });
     (&client).write_all(b"GET / HTTP/1.1\r\n\r\n").expect("write");
 
@@ -322,8 +321,8 @@ fn a_protocol_error_reaches_the_client_as_one_fatal_alert() {
 /// A local close ships the close_notify, then shuts the socket down.
 #[test]
 fn a_tls_close_ships_close_notify_before_the_shutdown() {
-    let (r, conn, client, _) = tls_over_socketpair();
-    r.block_on(r.close(&conn));
+    let (r, peer, client, _) = tls_over_socketpair();
+    r.block_on(peer.close());
 
     let seen = read_until_eof(&r, &client).expect("the close shuts the socket down");
     assert_eq!(
@@ -354,15 +353,15 @@ fn exchange(fd: &UnixStream, client: &mut rustls::ClientConnection, got: &mut Ve
 /// and a body of many seals reaches the client whole and in order.
 #[test]
 fn a_send_of_many_seals_reaches_the_client_whole() {
-    let (r, conn, fd, pem) = tls_over_socketpair();
+    let (r, mut peer, fd, pem) = tls_over_socketpair();
     let mut client = client_trusting(&pem, "localhost");
     let mut got = Vec::new();
     let body: Vec<u8> = (0..1 << 20).map(|i| (i % 251) as u8).collect();
-    let (reactor, sent) = (r.clone(), body.clone());
+    let sent = body.clone();
     r.spawn(async move {
-        reactor.recv(&conn).await.expect("the client's first frame");
-        let sent = SendBody::Pooled(PooledBuf(sent));
-        reactor.send(&conn, sent).await.expect("sent")
+        peer.next_request().await.expect("the client's first frame");
+        peer.send(SendBody::Pooled(PooledBuf(sent))).await.expect("sent");
+        peer.flush_egress().await.expect("sent")
     });
     let handshaken = poll_until(&r, || {
         exchange(&fd, &mut client, &mut got);

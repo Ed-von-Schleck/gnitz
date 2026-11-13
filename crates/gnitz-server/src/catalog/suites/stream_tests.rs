@@ -10,7 +10,7 @@ use gnitz_store::relation::PkRule;
 /// `RelationKind`, so the flag-to-kind dispatch is what is under test.
 #[test]
 fn stream_flag_registers_storeless_with_no_directory() {
-    let mut engine = fresh("stream_registers_storeless");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = u64_i64_cols();
 
     let sid = create_stream(&mut engine, "public.s", &cols);
@@ -39,15 +39,13 @@ fn stream_flag_registers_storeless_with_no_directory() {
     assert_eq!(base.kind(), RelationKind::BaseTable);
     assert!(!base.pk_repeats());
     assert!(std::path::Path::new(&relation_dir(engine.registry.base_dir(), tid)).exists());
-
-    discard(engine);
 }
 
 /// A bounded filter/projection over a stream is refused at compile; over a table,
 /// and a bounded join over a stream, it compiles.
 #[test]
 fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
-    let mut engine = fresh("bounded_view_over_stream");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = u64_i64_cols();
     let sid = create_stream(&mut engine, "public.s", &cols);
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
@@ -69,14 +67,12 @@ fn a_bounded_linear_view_over_a_stream_is_rejected_at_compile() {
         .expect("a bounded join over a stream compiles");
 
     register_identity_view(&mut engine, sid, "unbounded_over_stream", &cols);
-
-    discard(engine);
 }
 
 /// A view reaching a stream awaits a rebuild at reopen, and so does one over it.
 #[test]
 fn stream_fed_views_are_invalid_at_boot() {
-    let mut engine = fresh("stream_fed_views_invalid");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = u64_i64_cols();
     let sid = create_stream(&mut engine, "public.s", &cols);
     assert_unreplayed_source_rebuilds_at_reopen(engine, sid, &cols);
@@ -85,7 +81,7 @@ fn stream_fed_views_are_invalid_at_boot() {
 /// An ephemeral round publishes no store of a view a stream reaches.
 #[test]
 fn an_ephemeral_round_publishes_no_view_a_stream_reaches() {
-    let mut engine = fresh("stream_views_unpublished");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = u64_i64_cols();
     let sid = create_stream(&mut engine, "public.s", &cols);
     assert_round_publishes_nothing_reaching(engine, sid, &cols);

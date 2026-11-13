@@ -1,10 +1,9 @@
 //! The catalog-shape and row reads: RESOLVE, and SCAN_MULTI under one SAL cut.
 
-use super::peer::Peer;
 use super::tick::{fresh_read_lock, read_watermark};
 use super::{cork_ack, cork_msg, cork_train, decode_fault, forward_scan, target_kind, Access, Shared};
 use crate::runtime::frame::WireMsg;
-use crate::runtime::reactor::TrainLease;
+use crate::runtime::reactor::{Peer, TrainLease};
 use crate::runtime::sal::Read;
 use gnitz_store::read::ReadRows;
 use gnitz_store::relation::RelationKind;
@@ -79,9 +78,10 @@ pub(super) async fn handle_scan(shared: &Shared, peer: &mut Peer, scans: &[ScanI
             RelationKind::SystemCatalog => {
                 let spec = ReadSpec::decode(scan.spec).map_err(decode_fault)?;
                 let rows = cat.registry.scan_spec(scan.target.tid, spec, scan.reply_layout, None)?;
-                // Read off the master's own copy, under no SAL hold: answered
-                // with the last tick's watermark.
-                (Some(rows), shared.ticks.last_lsn())
+                // Read off the master's own copy, under no SAL hold. The
+                // master applies every zone in the step that publishes it, so
+                // every zone at or below the SAL watermark is in this copy.
+                (Some(rows), shared.dispatcher.sal().watermark())
             }
             _ => (None, 0),
         };

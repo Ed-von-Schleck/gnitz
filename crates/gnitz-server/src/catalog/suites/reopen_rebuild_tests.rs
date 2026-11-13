@@ -42,9 +42,10 @@ fn base_with_index(engine: &mut CatalogEngine) -> u64 {
 
 #[test]
 fn index_rebuilds_once_view_defers_on_reopen() {
-    let dir = temp_dir("reopen_rebuild_once");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
 
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
 
     let (tid, cols) = seed_base(&mut engine, "public.base");
 
@@ -71,7 +72,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 
     engine.close();
 
-    let engine2 = CatalogEngine::open(&dir, 1).unwrap();
+    let engine2 = CatalogEngine::open(dir, 1).unwrap();
 
     // The base table must be non-empty after reopen: it came back from its
     // durable shards. Without this guard an empty base would rebuild an empty
@@ -98,7 +99,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
         "index must rebuild from source exactly once on reopen, not double"
     );
 
-    finish(engine2);
+    engine2.close();
 }
 
 // ── index_rebuilds_across_chunk_boundary ─────────────────────────────────
@@ -108,9 +109,10 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 #[test]
 fn index_rebuilds_across_chunk_boundary() {
     let n: usize = gnitz_store::relation::StoreConfig::default().scan_chunk_rows + 3;
-    let dir = temp_dir("reopen_rebuild_chunked");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
 
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
 
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
@@ -128,7 +130,7 @@ fn index_rebuilds_across_chunk_boundary() {
 
     engine.close();
 
-    let engine2 = CatalogEngine::open(&dir, 1).unwrap();
+    let engine2 = CatalogEngine::open(dir, 1).unwrap();
 
     assert_eq!(
         net_weight(&engine2, tid),
@@ -141,7 +143,7 @@ fn index_rebuilds_across_chunk_boundary() {
         "index must rebuild across the chunk boundary exactly once"
     );
 
-    finish(engine2);
+    engine2.close();
 }
 
 // ── Index checkpoint resume ─────────────────────────────────────────────
@@ -177,10 +179,11 @@ fn checkpointed_table_with_index(dir: &str) -> (u64, u64) {
 // ── index_rebuild_is_skipped_after_resume ───────────────────────────────
 #[test]
 fn index_rebuild_is_skipped_after_resume() {
-    let dir = temp_dir("index_resume_skips_rebuild");
-    let (tid, g) = checkpointed_table_with_index(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let (tid, g) = checkpointed_table_with_index(dir);
 
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    let engine = CatalogEngine::open(dir, 1).unwrap();
     assert_eq!(engine.boot.resume_at, g, "the recovered generation is the resume point");
     assert!(
         index_resumed(&engine, tid),
@@ -192,7 +195,7 @@ fn index_rebuild_is_skipped_after_resume() {
         "the resumed index holds exactly one materialisation"
     );
 
-    finish(engine);
+    engine.close();
 }
 
 // ── index_rebuild_forced_by_worker_count_change ─────────────────────────
@@ -200,10 +203,11 @@ fn index_rebuild_is_skipped_after_resume() {
 // generation matches, but the index it stamped is another slot's.
 #[test]
 fn index_rebuild_forced_by_worker_count_change() {
-    let dir = temp_dir("index_resume_worker_count_change");
-    let (tid, g) = checkpointed_table_with_index(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let (tid, g) = checkpointed_table_with_index(dir);
 
-    let engine = CatalogEngine::open(&dir, 2).unwrap();
+    let engine = CatalogEngine::open(dir, 2).unwrap();
     assert_eq!(engine.boot.resume_at, g);
     assert!(
         !index_resumed(&engine, tid),
@@ -217,7 +221,7 @@ fn index_rebuild_forced_by_worker_count_change() {
         "the open's rebuild covers this rank's share of the base exactly once"
     );
 
-    finish(engine);
+    engine.close();
 }
 
 // ── The view twin: one policy for a view's output store and its traces ───
@@ -254,10 +258,11 @@ fn checkpointed_traced_view(dir: &str) -> (u64, u64) {
 // from.
 #[test]
 fn view_traces_resume_with_their_output_store() {
-    let dir = temp_dir("view_traces_resume_with_output");
-    let (tid, vid) = checkpointed_traced_view(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let (tid, vid) = checkpointed_traced_view(dir);
 
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
     assert_eq!(net_weight(&engine, vid), N, "the output store resumes");
 
     // An update: its retraction leaves the view only through a trace that holds
@@ -265,7 +270,7 @@ fn view_traces_resume_with_their_output_store() {
     tick(&mut engine, tid, 0, 1);
     assert_eq!(net_weight(&engine, vid), N, "a resumed trace already holds the row");
 
-    finish(engine);
+    engine.close();
 }
 
 // ── an_unrun_view_checkpoints_its_traces_and_resumes ────────────────────
@@ -275,13 +280,14 @@ fn view_traces_resume_with_their_output_store() {
 // the traces already carry — a clean boot's — leaves them closed.
 #[test]
 fn an_unrun_view_checkpoints_its_traces_and_resumes() {
-    let dir = temp_dir("view_unrun_traces_resume");
-    let (tid, vid) = checkpointed_traced_view(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let (tid, vid) = checkpointed_traced_view(dir);
 
     // Checkpoints no tick precedes — what a boot checkpoint is for a view the
     // replayed tail does not reach: first at the generation the boot resumed, then at
     // the next one.
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let g = engine.durable_generation();
     engine.flush_ephemeral_round(g).unwrap();
     assert!(
@@ -293,12 +299,12 @@ fn an_unrun_view_checkpoints_its_traces_and_resumes() {
     assert!(engine.dag.state_opened(vid), "a moved generation restamps the traces");
     engine.close();
 
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
     assert!(!engine.boot.rebuild.contains(&vid), "the view resumes");
     tick(&mut engine, tid, 0, 1);
     assert_eq!(net_weight(&engine, vid), N, "a resumed trace still holds the row");
 
-    finish(engine);
+    engine.close();
 }
 
 // ── a_missing_trace_child_invalidates_the_view ──────────────────────────
@@ -308,17 +314,18 @@ fn an_unrun_view_checkpoints_its_traces_and_resumes() {
 // first open of its operator state instead.
 #[test]
 fn a_missing_trace_child_invalidates_the_view() {
-    let dir = temp_dir("view_missing_trace_child_invalidates");
-    let (_, vid) = checkpointed_traced_view(&dir);
-    remove_trace(&dir, vid);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let (_, vid) = checkpointed_traced_view(dir);
+    remove_trace(dir, vid);
 
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    let engine = CatalogEngine::open(dir, 1).unwrap();
     assert!(
         engine.boot.rebuild.contains(&vid),
         "a view missing a trace child must be rebuilt, not resumed"
     );
 
-    finish(engine);
+    engine.close();
 }
 
 /// Remove the trace child view `vid` published in `dir`, as a crash part-way
@@ -385,8 +392,9 @@ fn register_distinct_chain(
 // reads — which a check of the segment's own children would keep.
 #[test]
 fn a_chain_resumes_or_rebuilds_as_one() {
-    let dir = temp_dir("chain_resumes_or_rebuilds_as_one");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let (tid, cols) = seed_base(&mut engine, "public.cbase");
     let (seg, top) = register_distinct_chain(&mut engine, tid, &cols, 0).unwrap();
 
@@ -415,19 +423,19 @@ fn a_chain_resumes_or_rebuilds_as_one() {
     engine.close();
 
     // Kept: the segment reopens holding nothing, and takes nothing.
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
     assert!(!engine.boot.rebuild.contains(&seg) && !engine.boot.rebuild.contains(&top));
     tick(&mut engine, tid, N as u64 + 1, 0);
     assert_eq!(net_weight(&engine, seg), 0, "a kept chain's segment stays empty");
     engine.close();
 
     // The owner alone holds a trace; the segment has none to lose.
-    remove_trace(&dir, top);
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    remove_trace(dir, top);
+    let engine = CatalogEngine::open(dir, 1).unwrap();
     assert!(engine.boot.rebuild.contains(&top), "the owner lost its trace");
     assert!(engine.boot.rebuild.contains(&seg), "its segment rebuilds with it");
 
-    finish(engine);
+    engine.close();
 }
 
 // ── only_its_own_unbounded_chain_scans_a_segment ────────────────────────
@@ -435,7 +443,7 @@ fn a_chain_resumes_or_rebuilds_as_one() {
 // nothing, and a capacity-bounded owner would hydrate from nothing.
 #[test]
 fn only_its_own_unbounded_chain_scans_a_segment() {
-    let mut engine = fresh("only_its_chain_scans_a_segment");
+    let (_dir, mut engine) = empty_catalog(1);
     let (tid, cols) = seed_base(&mut engine, "public.sbase");
     let (seg, _) = register_distinct_chain(&mut engine, tid, &cols, 0).unwrap();
 
@@ -450,7 +458,7 @@ fn only_its_own_unbounded_chain_scans_a_segment() {
         .unwrap_err();
     assert!(indexed.contains("a segment of a view's chain"), "got: {indexed}");
 
-    finish(engine);
+    engine.close();
 }
 
 // ── a_rejected_view_opens_empty_and_loses_its_stale_traces ──────────────
@@ -458,23 +466,24 @@ fn only_its_own_unbounded_chain_scans_a_segment() {
 // empty, and no trace of an earlier compile left beside it.
 #[test]
 fn a_rejected_view_opens_empty_and_loses_its_stale_traces() {
-    let dir = temp_dir("view_rejected_erased_at_open");
-    let (_, vid) = checkpointed_traced_view(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let (_, vid) = checkpointed_traced_view(dir);
 
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    let engine = CatalogEngine::open(dir, 1).unwrap();
     let stale = engine
         .registry
         .child_dir(vid, gnitz_store::relation::ChildKind::Scratch("stale"));
     engine.close();
     fs::create_dir_all(&stale).unwrap();
-    remove_trace(&dir, vid);
+    remove_trace(dir, vid);
 
-    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    let engine = CatalogEngine::open(dir, 1).unwrap();
     assert!(engine.boot.rebuild.contains(&vid));
     assert!(!std::path::Path::new(&stale).exists(), "a stale trace is erased");
     assert_eq!(net_weight(&engine, vid), 0, "the output store opens empty");
 
-    finish(engine);
+    engine.close();
 }
 
 // ── a_rebuilt_chain_takes_its_owners_dependents ─────────────────────────
@@ -484,8 +493,9 @@ fn a_rejected_view_opens_empty_and_loses_its_stale_traces() {
 // would hold what a source since refilled had fed it.
 #[test]
 fn a_rebuilt_chain_takes_its_owners_dependents() {
-    let dir = temp_dir("rebuilt_chain_takes_dependents");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let (tid, cols) = seed_base(&mut engine, "public.dbase");
     let identity = |_| crate::test_support::identity_circuit(tid, gnitz_wire::ReadBound::None);
     let (seg, top) = register_chain(&mut engine, traced_circuit(tid, &cols), identity, &cols, 0).unwrap();
@@ -497,8 +507,8 @@ fn a_rebuilt_chain_takes_its_owners_dependents() {
     engine.flush_ephemeral_round(g).unwrap();
     engine.close();
 
-    remove_trace(&dir, seg);
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    remove_trace(dir, seg);
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
     for view in [seg, top, over_top] {
         assert!(engine.boot.rebuild.contains(&view), "view {view}");
     }
@@ -511,5 +521,5 @@ fn a_rebuilt_chain_takes_its_owners_dependents() {
         (net_weight(&engine, top), net_weight(&engine, over_top)),
         (N + 1, N + 1)
     );
-    finish(engine);
+    engine.close();
 }

@@ -70,33 +70,43 @@ impl<'c> WorkerProcess<'c> {
                 self.replies.wait_for_master(|| self.sal_reader.is_empty());
             }
 
-            self.drain_sal();
+            self.drain_sal(false);
         }
     }
 
-    /// Process all pending SAL message groups.
-    fn drain_sal(&mut self) {
-        self.replies.emit_frame();
-        while self.serve_next(false).is_some() {
-            // One frame per request served: neither waits for the other to run dry.
+    /// Serve the SAL's pending groups, one owed reply frame after each, and at
+    /// the top level one ahead of the first: neither waits for the other to run
+    /// dry. `in_drive`: inside an exchange wait, which stops as soon as its
+    /// round is complete, sending no frame after; the next wait, or the top
+    /// level, serves what the SAL still holds, in order.
+    fn drain_sal(&mut self, in_drive: bool) {
+        if !in_drive {
+            self.replies.emit_frame();
+        }
+        while self.serve_next(in_drive) {
+            if in_drive && self.mesh.complete() {
+                break;
+            }
             self.replies.emit_frame();
         }
     }
 
     /// Read the next SAL group this worker acts on and run it: the one place
-    /// either drain loop decodes a group, and the one place a request's outcome
+    /// the drain decodes a group, and the one place a request's outcome
     /// is chosen — a read's failure is a fault frame to its asker, a state
     /// change's a fail-stop. `in_drive`: the group arrives inside an exchange
     /// wait of a `Tick` or `Backfill`.
     ///
-    /// `None` when the SAL holds no group for this worker, else whether the one
-    /// served was a read.
-    fn serve_next(&mut self, in_drive: bool) -> Option<bool> {
+    /// `false` when the SAL holds no group for this worker.
+    fn serve_next(&mut self, in_drive: bool) -> bool {
         let cat = &mut *self.catalog;
-        match self
+        let Some(inbound) = self
             .sal_reader
-            .next_request(|tid, record| cat.known_decode(tid, record))?
-        {
+            .next_request(|tid, record| cat.known_decode(tid, record))
+        else {
+            return false;
+        };
+        match inbound {
             Inbound::Read { route, read } => {
                 // A drive writes views, so a read of one would see the tick
                 // half-run: it parks, kept, since the drive reads further
@@ -114,7 +124,7 @@ impl<'c> WorkerProcess<'c> {
                     let answer = answer(cat, &read);
                     self.replies.reply(route, answer);
                 }
-                Some(true)
+                true
             }
             // The views and the DAG are a drive's own while it runs: of the
             // requests that touch them the master pipelines only reads, which
@@ -131,7 +141,7 @@ impl<'c> WorkerProcess<'c> {
                         gnitz_fatal_abort!("worker: {ingest:?} failed: {e} — aborting for restart");
                     }
                 }
-                Some(false)
+                true
             }
             Inbound::Apply { apply } => {
                 if in_drive {
@@ -146,7 +156,7 @@ impl<'c> WorkerProcess<'c> {
                 // drive left.
                 let cat = &mut *self.catalog;
                 self.replies.answer_parked(|read| answer(cat, read));
-                Some(false)
+                true
             }
         }
     }

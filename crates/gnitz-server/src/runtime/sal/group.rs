@@ -108,7 +108,7 @@ impl<'a> Group<'a> {
         Group {
             request: Ingest::DdlSync { family }.encode(),
             blob: &[],
-            data: Payloads::Shared(batch.wire_whole().map(|d| (family.record(), d))),
+            data: Payloads::Shared(batch.wire_whole().map(|d| (family.sal_record(), d))),
             to: if family.master_only() {
                 WorkerSet::EMPTY
             } else {

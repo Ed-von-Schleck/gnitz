@@ -38,26 +38,27 @@ fn generation_stamp(counter: u64) -> u64 {
 }
 
 impl CatalogEngine {
-    /// Raise the id counter past the id leading each of `batch`'s rows, when
-    /// `family` allocates ids. For rows recovered at boot: a live DDL's ids were
-    /// allocated, which the precheck holds it to.
-    pub(in crate::catalog) fn raise_next_id(&mut self, family: SysFamily, batch: &Batch) {
-        if family.allocates_ids() {
-            for i in 0..batch.len() {
-                let id = gnitz_wire::sys_leading_id(batch.get_pk_bytes(i));
-                self.next_id = self.next_id.max(id.saturating_add(1));
-            }
-        }
+    /// The next catalog object id (schema, relation or index) to allocate,
+    /// from its `sequences` row. The precheck admits no create at or above it.
+    pub(crate) fn next_catalog_id(&self) -> u64 {
+        self.sequence_value(SEQ_ID_NEXT_ID)
+            .unwrap_or(gnitz_wire::FIRST_USER_TABLE_ID)
     }
 
-    /// Allocate `count` contiguous catalog object ids and return the first.
-    pub(crate) fn allocate_ids(&mut self, count: u64) -> Result<u64, String> {
-        let base = self.next_id;
-        let last = validated_run_last(base, count, gnitz_wire::CATALOG_ID_CEILING).ok_or_else(|| match count {
-            0 => "an id run holds at least one id".to_string(),
-            _ => format!("the catalog id space cannot hold {count} more ids (next id {base})"),
+    /// Allocate `count` contiguous catalog object ids and answer the first,
+    /// laying the `sequences` delta recording the advance out through `sink`
+    /// before it is applied.
+    pub(crate) fn reserve_catalog_ids(&mut self, count: u64, sink: &mut ZoneSink<'_>) -> Result<u64, ZoneError> {
+        let old = self.sequence_value(SEQ_ID_NEXT_ID);
+        let base = old.unwrap_or(gnitz_wire::FIRST_USER_TABLE_ID);
+        let last = validated_run_last(base, count, gnitz_wire::CATALOG_ID_CEILING).ok_or_else(|| {
+            let why = match count {
+                0 => "an id run holds at least one id".to_string(),
+                _ => format!("the catalog id space cannot hold {count} more ids (next id {base})"),
+            };
+            ZoneError::Refused(format!("id allocation failed: {why}").into())
         })?;
-        self.next_id = last + 1;
+        self.log_sequence(SEQ_ID_NEXT_ID, old, last + 1, sink)?;
         Ok(base)
     }
 
@@ -89,7 +90,7 @@ impl CatalogEngine {
         count: u64,
         sink: &mut ZoneSink<'_>,
     ) -> Result<u64, ZoneError> {
-        if !self.caches.relations.get(&seq_id).is_some_and(|e| e.serial) {
+        if !self.is_serial(seq_id) {
             return Err(ZoneError::Refused(
                 format!("relation {seq_id} is not a SERIAL table").into(),
             ));
@@ -100,12 +101,24 @@ impl CatalogEngine {
         let old = self.sequence_value(seq_id);
         let base = old.unwrap_or(0).checked_add(1).ok_or_else(invalid)?;
         let last = validated_run_last(base, count, i64::MAX as u64).ok_or_else(invalid)?;
-        let delta = sequence_delta(seq_id, old, last);
+        self.log_sequence(seq_id, old, last, sink)?;
+        Ok(base)
+    }
+
+    /// Move `sequences` row `seq_id` from `old` to `value`, laying the delta out
+    /// through `sink` before it is applied.
+    fn log_sequence(
+        &mut self,
+        seq_id: u64,
+        old: Option<u64>,
+        value: u64,
+        sink: &mut ZoneSink<'_>,
+    ) -> Result<(), ZoneError> {
+        let delta = sequence_delta(seq_id, old, value);
         sink(SysFamily::Sequence, &delta).map_err(ZoneError::Refused)?;
         self.registry
             .ingest(SysFamily::Sequence.id(), delta)
-            .map_err(ZoneError::Diverged)?;
-        Ok(base)
+            .map_err(ZoneError::Diverged)
     }
 
     /// Move `sequences` row `seq_id` to `value`.
@@ -118,18 +131,9 @@ impl CatalogEngine {
             .ingest(SysFamily::Sequence.id(), sequence_delta(seq_id, old, value))
     }
 
-    /// Write the next catalog id to `sequences`, then flush every system table
-    /// in one barrier.
+    /// Flush every system table in one barrier.
     pub(crate) fn flush_all_system_tables(&mut self) -> Result<(), String> {
-        self.set_sequence(SEQ_ID_NEXT_ID, self.next_id)?;
         self.registry.checkpoint_system(self.applied_zone)
-    }
-
-    /// Raise the id counter to the next catalog id stored in `sequences`.
-    pub(in crate::catalog) fn load_next_id(&mut self) {
-        if let Some(v) = self.sequence_value(SEQ_ID_NEXT_ID) {
-            self.next_id = self.next_id.max(v);
-        }
     }
 
     // -- Checkpoint generation -------------------------------------------------

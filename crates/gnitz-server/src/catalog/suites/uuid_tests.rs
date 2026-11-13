@@ -4,21 +4,21 @@ use super::*;
 
 #[test]
 fn test_uuid_pk_create_and_drop() {
-    let mut engine = fresh("uuid_pk_create");
+    let (_dir, mut engine) = empty_catalog(1);
 
     let tid = engine.create_table("public.uuid_tab", &[uuid_def("id")], &[0]).unwrap();
     let s = engine.registry.relation(tid).map(Relation::schema).unwrap();
     assert_eq!(s.columns()[0].type_code, TypeCode::UUID);
 
     engine.drop_table("public.uuid_tab").unwrap();
-    finish(engine);
+    engine.close();
 }
 
 // ── test_uuid_secondary_index ────────────────────────────────────────
 
 #[test]
 fn test_uuid_secondary_index() {
-    let mut engine = fresh("uuid_idx");
+    let (_dir, mut engine) = empty_catalog(1);
 
     let cols = vec![col_def("id", TypeCode::U64), uuid_def("uid")];
     let tid = engine.create_table("public.uuid_idxtab", &cols, &[0]).unwrap();
@@ -37,5 +37,5 @@ fn test_uuid_secondary_index() {
 
     engine.drop_index("public__uuid_idxtab__idx_uid").unwrap();
     engine.drop_table("public.uuid_idxtab").unwrap();
-    finish(engine);
+    engine.close();
 }

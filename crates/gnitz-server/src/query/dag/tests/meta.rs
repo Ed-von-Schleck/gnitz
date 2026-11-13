@@ -20,14 +20,14 @@ fn union_view(engine: &mut CatalogEngine, sources: &[u64], name: &str) -> u64 {
 
 /// A fresh catalog holding base table `public.t` and one more per name in
 /// `more`, each `(id U64 PK, v I64)`.
-fn engine_with_tables<const N: usize>(name: &str, more: [&str; N]) -> (CatalogEngine, u64, [u64; N]) {
-    let (mut engine, t) = table_engine("dag_meta", name, 1, &u64_i64_cols());
+fn engine_with_tables<const N: usize>(more: [&str; N]) -> (tempfile::TempDir, CatalogEngine, u64, [u64; N]) {
+    let (dir, mut engine, t) = table_engine(1, &u64_i64_cols());
     let ids = more.map(|m| {
         engine
             .create_table(&format!("public.{m}"), &u64_i64_cols(), &[0])
             .unwrap()
     });
-    (engine, t, ids)
+    (dir, engine, t, ids)
 }
 
 /// A view's roots and a relation's downstream views walk the same edges
@@ -36,7 +36,7 @@ fn engine_with_tables<const N: usize>(name: &str, more: [&str; N]) -> (CatalogEn
 #[test]
 fn roots_and_downstream_walk_both_directions_transitively() {
     // chain a → c1 → c2 → c3, diamond d → {d1, d2} → d3, disconnected pair p → p1.
-    let (mut engine, a, [d, p]) = engine_with_tables("closures", ["d", "p"]);
+    let (_dir, mut engine, a, [d, p]) = engine_with_tables(["d", "p"]);
     let cols = u64_i64_cols();
     let c1 = register_identity_view(&mut engine, a, "c1", &cols);
     let c2 = register_identity_view(&mut engine, c1, "c2", &cols);
@@ -71,7 +71,7 @@ fn roots_and_downstream_walk_both_directions_transitively() {
 /// A view registered again under a dropped id takes the roots of its new plan.
 #[test]
 fn a_views_roots_are_dropped_and_recomputed_with_its_view() {
-    let (mut engine, t1, [t2]) = engine_with_tables("reregister", ["t2"]);
+    let (_dir, mut engine, t1, [t2]) = engine_with_tables(["t2"]);
     let cols = u64_i64_cols();
     let v1 = register_identity_view(&mut engine, t1, "v1", &cols);
     let v2 = register_identity_view(&mut engine, v1, "v2", &cols);
@@ -96,7 +96,7 @@ fn a_views_roots_are_dropped_and_recomputed_with_its_view() {
 /// when repeated or for an id never linked.
 #[test]
 fn forgetting_a_view_drops_only_what_it_linked() {
-    let (mut engine, t1, [t2]) = engine_with_tables("forget", ["t2"]);
+    let (_dir, mut engine, t1, [t2]) = engine_with_tables(["t2"]);
     let v = union_view(&mut engine, &[t2, t1, t2], "v");
     let sibling = register_identity_view(&mut engine, t1, "sibling", &u64_i64_cols());
     let dag = &mut engine.dag;

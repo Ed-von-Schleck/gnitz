@@ -1,5 +1,3 @@
-use std::rc::Rc;
-
 use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder};
@@ -30,7 +28,6 @@ impl CatalogEngine {
             registry: RelationRegistry::master(base_dir, num_workers, config),
             dag: DagEngine::default(),
             caches: CatalogCacheSet::default(),
-            next_id: gnitz_wire::FIRST_USER_TABLE_ID,
             id_floor: gnitz_wire::FIRST_USER_TABLE_ID,
             used_ids: FxHashSet::default(),
             applied_zone: 0,
@@ -54,7 +51,7 @@ impl CatalogEngine {
                 .map_err(|e| format!("Failed to create system table '{}': error {e}", family.name()))?;
             engine.caches.enter(
                 family.id(),
-                RelationEntry::new(Rc::from(family.record()), Vec::new(), false),
+                RelationEntry::new(family.schema(), &family.column_defs(), Vec::new()),
             );
             engine.mark_zone_applied(engine.replay_floor(family));
         }
@@ -71,9 +68,8 @@ impl CatalogEngine {
             gnitz_note!("SAL system table recovery: replayed {staged} entries");
         }
 
-        engine.load_next_id();
         engine.replay_catalog()?;
-        engine.id_floor = engine.next_id;
+        engine.id_floor = engine.next_catalog_id();
         // Relay each base table onto the launched worker count and drop the children
         // no relation owns any more before the verdict reads every launched rank's
         // manifests — here, where no worker exists yet.
@@ -99,7 +95,6 @@ impl CatalogEngine {
         if lsn <= self.replay_floor(family) {
             return Ok(false);
         }
-        self.raise_next_id(family, &batch);
         self.registry.ingest(family.id(), batch).map_err(|e| {
             format!(
                 "SAL system-table recovery apply failed (table_id={}, lsn={lsn}): {e}",
@@ -134,7 +129,16 @@ impl CatalogEngine {
     fn replay_catalog(&mut self) -> Result<(), String> {
         for family in SysFamily::ALL {
             let rows = self.sys_relation(family).full_scan();
-            self.raise_next_id(family, &rows);
+            // Every id a stored row leads with was allocated, and the allocation
+            // is logged before the DDL that uses it.
+            debug_assert!(
+                !family.allocates_ids() || {
+                    let next = self.next_catalog_id();
+                    (0..rows.len()).all(|i| gnitz_wire::sys_leading_id(rows.get_pk_bytes(i)) < next)
+                },
+                "a stored {} row's id was never allocated",
+                family.row_noun()
+            );
             self.fire_hooks(family, &rows)?;
         }
         Ok(())

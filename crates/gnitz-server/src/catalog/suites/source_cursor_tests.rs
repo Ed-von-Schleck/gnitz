@@ -9,7 +9,7 @@ use gnitz_store::relation::PkRule;
 #[test]
 fn a_backfill_leaves_the_rows_above_the_cut_to_their_tick() {
     let cols = u64_i64_cols();
-    let (mut engine, tid) = ingest_fixture("srccur_pending", &cols, 200, |id| [id * 10]);
+    let (_dir, mut engine, tid) = ingest_fixture(&cols, 200, |id| [id * 10]);
     let vid = register_identity_view(&mut engine, tid, "v_base", &cols);
     let late = rows(&engine, tid, 1, 200..203, |id| [id * 10]);
     engine.ingest_unticked(tid, late, PkRule::Enforce).unwrap();
@@ -18,5 +18,4 @@ fn a_backfill_leaves_the_rows_above_the_cut_to_their_tick() {
     assert_eq!(held(&engine, vid), (200, 200));
     seal_and_tick(&mut engine, tid);
     assert_eq!(held(&engine, vid), (203, 203));
-    discard(engine);
 }

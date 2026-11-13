@@ -17,7 +17,7 @@ use gnitz_wire::{
     ViewParts, ViewTabRow,
 };
 use gnitz_zset::repr::{Batch, BatchBuilder};
-use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_zset::schema::{encode_schema_block, SchemaColumn, SchemaDescriptor};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -239,7 +239,7 @@ impl DdlBundle {
 // Schema derivation from the shared wire column slices
 // ---------------------------------------------------------------------------
 
-/// Each family's schema and named record, indexed by [`SysFamily::index`], both
+/// Each family's schema and SAL record, indexed by [`SysFamily::index`], both
 /// derived from `gnitz-wire`'s system-table columns as a user relation's are
 /// from its COL_TAB records. The record is what every DdlSync group of the
 /// family carries.
@@ -247,12 +247,13 @@ static SCHEMAS: LazyLock<[(SchemaDescriptor, Box<[u8]>); SysFamily::COUNT]> = La
     SysFamily::ALL.map(|family| {
         let (defs, pk) = (family.column_defs(), family.wire().pk_cols);
         let schema = build_schema_from_col_defs(&defs, pk).expect("a system family is an admissible schema");
-        (schema, encode_record(pk, &defs))
+        let record = encode_schema_block(&schema).into();
+        (schema, record)
     })
 });
 
-/// The named record of a relation keyed `pk` over `defs` — the one a RESOLVE
-/// reply and every push/DDL SAL slot carries.
+/// The named record of a relation keyed `pk` over `defs`: the one a RESOLVE
+/// reply carries.
 pub(in crate::catalog) fn encode_record(pk: &[u32], defs: &[CatalogColumn]) -> Box<[u8]> {
     gnitz_wire::schema_block::encode(defs.iter().map(|c| c.def.block_col()), pk).into()
 }
@@ -351,8 +352,8 @@ impl SysFamily {
         &SCHEMAS[self.index()].0
     }
 
-    /// This family's named record.
-    pub(crate) fn record(self) -> &'static [u8] {
+    /// This family's [`encode_schema_block`]: the record its DdlSync groups carry.
+    pub(crate) fn sal_record(self) -> &'static [u8] {
         &SCHEMAS[self.index()].1
     }
 
@@ -449,8 +450,9 @@ impl SysFamily {
     }
 
     /// Does this family hold the master's positions rather than a set? `true`
-    /// for Sequence alone: its rows move with every SERIAL reservation and
-    /// checkpoint and feed the id counters and the resume verdict at boot. So no
+    /// for Sequence alone: its rows move with every id allocation, SERIAL
+    /// reservation and checkpoint, and are the id counters and the checkpoint
+    /// generation the resume verdict reads at boot. So no
     /// client bundle may carry one, no worker is sent one, and no view scans it.
     pub(crate) fn master_only(self) -> bool {
         match self {

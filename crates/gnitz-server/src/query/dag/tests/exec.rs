@@ -3,8 +3,8 @@
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    col_def, make_batch, make_schema_u64_i64, push_and_tick, register_count_of, register_identity_view, scan_all,
-    scan_keyed, scratch_dir, table_engine, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, EchoDrive,
+    col_def, empty_catalog, make_batch, make_schema_u64_i64, push_and_tick, register_count_of, register_identity_view,
+    scan_all, scan_keyed, table_engine, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, EchoDrive,
     RowKey,
 };
 use gnitz_store::relation::PkRule;
@@ -34,9 +34,9 @@ impl Views {
 }
 
 /// A base table `(id U64 PK, v I64)` in a fresh catalog plus [`Views`].
-pub(super) fn engine_with_views(name: &str) -> (CatalogEngine, u64, Views) {
+pub(super) fn engine_with_views() -> (tempfile::TempDir, CatalogEngine, u64, Views) {
     let cols = u64_i64_cols();
-    let (mut engine, base) = table_engine("dag_exec", name, 1, &cols);
+    let (dir, mut engine, base) = table_engine(1, &cols);
     let mut circuit = Circuit::default();
     let sides = [0, 1].map(|_| {
         let scan = circuit.input_delta(base, ReadBound::None);
@@ -52,7 +52,7 @@ pub(super) fn engine_with_views(name: &str) -> (CatalogEngine, u64, Views) {
     circuit.union(left, right);
     let union = try_register_view(&mut engine, circuit, "union", &cols, 0, 0).unwrap();
     let over_union = register_identity_view(&mut engine, union, "over_union", &cols);
-    (engine, base, Views { twice, once, deep, union, over_union })
+    (dir, engine, base, Views { twice, once, deep, union, over_union })
 }
 
 /// `(pk, weight, payload)` rows of a base table `(id U64 PK, v I64)`.
@@ -92,7 +92,7 @@ fn times(rows: &[(u64, i64, i64)], k: i64) -> HashMap<RowKey, i64> {
 /// for an insert and for the retraction a delete pushes.
 #[test]
 fn a_tick_drives_the_whole_closure() {
-    let (mut engine, base, views) = engine_with_views("evaluate");
+    let (_dir, mut engine, base, views) = engine_with_views();
     let ks = [
         (views.twice, 2),
         (views.once, 1),
@@ -117,7 +117,7 @@ fn a_tick_drives_the_whole_closure() {
 /// rounds wait on it.
 #[test]
 fn an_empty_tick_runs_every_round() {
-    let (mut engine, base) = table_engine("dag_exec", "empty_rounds", 4, &u64_i64_cols());
+    let (_dir, mut engine, base) = table_engine(4, &u64_i64_cols());
     let once = register_identity_view(&mut engine, base, "once", &u64_i64_cols());
     for (source, name) in [(base, "count"), (once, "count_once")] {
         register_count(&mut engine, source, &[], name);
@@ -133,7 +133,7 @@ fn an_empty_tick_runs_every_round() {
 /// over the same rows does.
 #[test]
 fn a_ticks_independent_rounds_share_one_wait() {
-    let (mut engine, base) = table_engine("dag_exec", "waves", 4, &u64_i64_cols());
+    let (_dir, mut engine, base) = table_engine(4, &u64_i64_cols());
     let once = register_identity_view(&mut engine, base, "once", &u64_i64_cols());
     let (count_v, plan_v) = register_count(&mut engine, base, &[1], "count_v");
     let (count_once, _) = register_count(&mut engine, once, &[1], "count_once");
@@ -164,6 +164,49 @@ fn a_ticks_independent_rounds_share_one_wait() {
     }
 }
 
+/// `base ⋈ COUNT(*) GROUP BY v` on `v`: `(v, id, count)`. `base` is relayed by
+/// `v`; a count is already placed by `v`, its PK, so its side runs no round.
+fn join_base_with_count(base: u64, counts: u64) -> Circuit {
+    use gnitz_wire::NullKeys;
+    let mut circuit = Circuit::default();
+    // `(source, key column, payload column)`: a count's `v` is its PK.
+    let deltas = [(base, 1, 0), (counts, 0, 1)].map(|(source, key, payload)| {
+        let key = [(key, TypeCode::I64)];
+        let scan = circuit.input_scattered(source, ReadBound::None, Some(key.to_vec()));
+        circuit.map_reindex(scan, &key, &[payload], NullKeys::Keep)
+    });
+    circuit.join(deltas, deltas, gnitz_wire::JoinKind::Equi);
+    circuit
+}
+
+/// A view scanning a table and a view over that table relays the table's delta
+/// in the same wave as the other view's round: only the view's own step and its
+/// producer hold a step back. It still lands what a backfill over the same rows
+/// lands.
+#[test]
+fn a_step_waits_only_on_its_own_view_and_its_producer() {
+    let (_dir, mut engine, base) = table_engine(4, &u64_i64_cols());
+    let (count_v, _) = register_count(&mut engine, base, &[1], "count_v");
+    let cols = [
+        col_def("v", TypeCode::I64),
+        col_def("id", TypeCode::U64),
+        col_def("n", TypeCode::I64),
+    ];
+    let joined = try_register_view(&mut engine, join_base_with_count(base, count_v), "joined", &cols, 0, 0).unwrap();
+    let rows = [(1, 1, 10), (2, 1, 20), (3, 1, 10)];
+    engine.ingest_unticked(base, base_rows(&rows), PkRule::Enforce).unwrap();
+    let mut host = EchoDrive::new(&mut engine);
+    tick(&mut host, base, 1).unwrap();
+    // `count_v`'s round and `joined`'s relay of `base` share a wait; `joined`'s
+    // step over `count_v` then runs on without a round.
+    assert_eq!((host.rounds, host.waits), (2, 1));
+    let oracle = try_register_view(&mut engine, join_base_with_count(base, count_v), "oracle", &cols, 0, 0).unwrap();
+    backfill(&mut engine, oracle).unwrap();
+    let want = held(&mut engine, oracle);
+    assert!(!want.is_empty());
+    assert_eq!(held(&mut engine, joined), want);
+}
+
 /// `a ⋈ b` on their `v`, `a`'s side through a `DISTINCT` where `distinct`: a
 /// clamp folds the register `a`'s relay round writes, a plain re-key does not.
 fn join_on_v(a: u64, b: u64, distinct: bool) -> Circuit {
@@ -184,8 +227,8 @@ fn join_on_v(a: u64, b: u64, distinct: bool) -> Circuit {
 
 /// Tables `a` and `b`, `(id U64 PK, v I64)`, beside three other workers, and a
 /// [`join_on_v`] view per entry of `distinct`, in that order.
-fn joins_on_v(name: &str, distinct: &[bool]) -> (CatalogEngine, [u64; 2], Vec<u64>) {
-    let (mut engine, a) = table_engine("dag_exec", name, 4, &u64_i64_cols());
+fn joins_on_v(distinct: &[bool]) -> (tempfile::TempDir, CatalogEngine, [u64; 2], Vec<u64>) {
+    let (dir, mut engine, a) = table_engine(4, &u64_i64_cols());
     let b = engine.create_table("public.b", &u64_i64_cols(), &[0]).unwrap();
     let cols = [
         col_def("k", TypeCode::I64),
@@ -197,7 +240,7 @@ fn joins_on_v(name: &str, distinct: &[bool]) -> (CatalogEngine, [u64; 2], Vec<u6
         .enumerate()
         .map(|(i, &d)| try_register_view(&mut engine, join_on_v(a, b, d), &format!("j{i}"), &cols, 0, 0).unwrap())
         .collect();
-    (engine, [a, b], views)
+    (dir, engine, [a, b], views)
 }
 
 /// Views relaying one source by one scatter key share one exchange round per
@@ -215,7 +258,7 @@ fn views_relaying_one_source_by_one_key_share_its_round() {
         (0, &[]),
     ];
     let shapes = [false, true, false];
-    let (mut engine, sources, views) = joins_on_v("shared_relay", &shapes);
+    let (_dir, mut engine, sources, views) = joins_on_v(&shapes);
     for &(side, rows) in &ticks {
         let mut host = EchoDrive::new(&mut engine);
         host.cat
@@ -225,7 +268,7 @@ fn views_relaying_one_source_by_one_key_share_its_round() {
         assert_eq!(host.rounds, 1, "one round of source {side} for every view");
     }
     for (i, (&view, &distinct)) in views.iter().zip(&shapes).enumerate() {
-        let (mut alone, sources, own) = joins_on_v(&format!("shared_relay_oracle_{i}"), &[distinct]);
+        let (_dir, mut alone, sources, own) = joins_on_v(&[distinct]);
         for &(side, rows) in &ticks {
             push_and_tick(&mut alone, sources[side], base_rows(rows));
         }
@@ -240,7 +283,7 @@ fn views_relaying_one_source_by_one_key_share_its_round() {
 /// moves the count to what a backfill over it holds.
 #[test]
 fn an_empty_tick_lands_only_an_owed_ground_row() {
-    let (mut engine, base) = table_engine("dag_exec", "empty_tick", 1, &u64_i64_cols());
+    let (_dir, mut engine, base) = table_engine(1, &u64_i64_cols());
     let once = register_identity_view(&mut engine, base, "once", &u64_i64_cols());
     let (count, plan) = register_count(&mut engine, base, &[], "count");
     let ground = plan.ground_row().unwrap();
@@ -270,7 +313,7 @@ fn an_empty_tick_lands_only_an_owed_ground_row() {
 /// not the view's own dependents, which backfill from its store afterwards.
 #[test]
 fn a_backfill_runs_only_the_named_view() {
-    let (mut engine, base, views) = engine_with_views("backfill");
+    let (_dir, mut engine, base, views) = engine_with_views();
     let rows = [(1, 1, 10)];
 
     engine.registry.ingest(base, base_rows(&rows)).unwrap();
@@ -310,7 +353,7 @@ fn a_backfill_of_a_join_feeds_each_source_against_the_ones_before_it() {
     let on_k: &[(u64, u64, u64)] = &[(10, 1, 2), (10, 1, 5), (10, 3, 2), (10, 3, 5), (20, 2, 4)];
     let on_id: &[(u64, u64, u64)] = &[(2, 2, 2), (3, 3, 3)];
     for (key, want) in [(1, on_k), (0, on_id)] {
-        let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", &format!("backfill_join_{key}")), 1).unwrap();
+        let (_dir, mut engine) = empty_catalog(1);
         let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
         let a = engine.create_table("public.a", &cols, &[0]).unwrap();
         let b = engine.create_table("public.b", &cols, &[0]).unwrap();
@@ -348,7 +391,7 @@ fn a_backfill_at_the_cut_and_the_ticks_above_it_fill_a_join_once() {
     let sealed = [[(1, 1, 10), (2, 1, 20)], [(2, 1, 10), (3, 1, 20)]];
     let above = [[(3, 1, 10), (4, 1, 30)], [(4, 1, 30), (5, 1, 10)]];
     for key in [1, 0] {
-        let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", &format!("backfill_cut_{key}")), 1).unwrap();
+        let (_dir, mut engine) = empty_catalog(1);
         let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
         let tables = ["a", "b"].map(|name| engine.create_table(&format!("public.{name}"), &cols, &[0]).unwrap());
         let view = register_join(&mut engine, tables, key, "join");

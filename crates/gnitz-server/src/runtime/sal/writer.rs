@@ -19,7 +19,7 @@ use super::tail::CommittedTail;
 use crate::catalog::SysFamily;
 use crate::runtime::park::{WorkerParks, WorkerSet};
 use crate::runtime::reactor::Reactor;
-use crate::runtime::sync::{AsyncRwLock, WriteGuard};
+use crate::runtime::sync::{AsyncRwLock, Parked, WriteGuard};
 use crate::runtime::w2m::RequestId;
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::PkRule;
@@ -114,6 +114,8 @@ pub(crate) struct SalWriter {
     /// refused since the last rewind, so a checkpoint is warranted whatever the
     /// write cursor says. Cleared by [`Self::rewind`].
     refused_transient: Cell<bool>,
+    /// [`Self::checkpoint_due`], parked until [`Self::needs_checkpoint`] holds.
+    checkpoint_waiter: Parked,
     /// The encode buffer of a group whose payloads are written with `pwrite`.
     scratch: Cell<Vec<u8>>,
     /// A zone member pushing rows was published in this epoch, which is since
@@ -155,6 +157,7 @@ impl SalWriter {
             checkpoint_threshold,
             checkpoint_floor: Cell::default(),
             refused_transient: Cell::default(),
+            checkpoint_waiter: Parked::default(),
             scratch: Cell::default(),
             holds_pushes: Cell::default(),
             excl: AsyncRwLock::default(),
@@ -200,6 +203,7 @@ impl SalWriter {
         full.may_admit = self.checkpoint_may_admit(from, full);
         if full.may_admit {
             self.refused_transient.set(true);
+            self.checkpoint_waiter.wake();
         }
     }
 
@@ -347,6 +351,21 @@ impl SalWriter {
             || self.refused_transient.get()
     }
 
+    /// Resolves once [`Self::needs_checkpoint`] holds.
+    pub(crate) async fn checkpoint_due(&self) {
+        self.checkpoint_waiter.until(|| self.needs_checkpoint()).await
+    }
+
+    /// Move the published end to `end`, and wake [`Self::checkpoint_due`] if
+    /// a checkpoint is now warranted.
+    #[inline]
+    fn advance(&self, end: u64) {
+        self.write_cursor.set(end);
+        if self.needs_checkpoint() {
+            self.checkpoint_waiter.wake();
+        }
+    }
+
     /// Rewind to cursor 0 of `epoch`, which is anchored durably before any of
     /// its groups can exist: a base round's reclaim, and a boot's.
     fn rewind(&self, epoch: u32) {
@@ -461,7 +480,7 @@ impl<'a> SalExcl<'a> {
             full
         })?;
         w.publish(base);
-        w.write_cursor.set(end);
+        w.advance(end);
         Ok(())
     }
 
@@ -672,7 +691,7 @@ impl SalScope<'_, '_> {
                 Some(lsn)
             }
         };
-        w.write_cursor.set(end);
+        w.advance(end);
         closed
     }
 }

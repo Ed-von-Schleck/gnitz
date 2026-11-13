@@ -15,25 +15,6 @@ use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::{Batch, BatchBuilder, ReadCursor};
 use gnitz_zset::schema::SchemaDescriptor;
 
-/// A scratch directory for a test that needs a real on-disk tree, wiped at the
-/// start of the run so the previous same-user run self-cleans. `scope` names the
-/// subsystem, `name` the test.
-///
-/// The path is namespaced by `$USER` (pid if unset): `/tmp` is shared and
-/// sticky, so a directory left by a *different* user occupies the bare path
-/// forever — the start-of-test `remove_dir_all` cannot delete it (sticky bit)
-/// and `CatalogEngine::open` then fails EACCES creating subdirs under it.
-pub fn scratch_dir(scope: &str, name: &str) -> String {
-    let owner = std::env::var("USER").unwrap_or_else(|_| std::process::id().to_string());
-    let path = std::env::temp_dir()
-        .join(format!("gnitz_{scope}_test_{owner}_{name}"))
-        .to_str()
-        .unwrap()
-        .to_owned();
-    let _ = std::fs::remove_dir_all(&path);
-    path
-}
-
 /// Register relation `id`, a `kind` over `schema` placed by its full PK.
 pub fn register_full_pk(registry: &mut RelationRegistry, id: u64, kind: RelationKind, schema: SchemaDescriptor) {
     let spec = RelationSpec {
@@ -424,12 +405,20 @@ pub fn refusal(e: ZoneError) -> String {
 
 // ── Engine fixtures ──────────────────────────────────────────────────────
 
-/// A fresh engine at `workers` on the emptied scratch directory of `scope` and
-/// `name`, holding an empty `public.t` over `cols` on PK column 0; and its id.
-pub fn table_engine(scope: &str, name: &str, workers: u32, cols: &[CatalogColumn]) -> (CatalogEngine, u64) {
-    let mut engine = CatalogEngine::open(&scratch_dir(scope, name), workers).unwrap();
+/// A fresh engine at `workers` on its own temporary directory, which lives as
+/// long as the returned guard.
+pub fn empty_catalog(workers: u32) -> (tempfile::TempDir, CatalogEngine) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = CatalogEngine::open(dir.path().to_str().unwrap(), workers).unwrap();
+    (dir, engine)
+}
+
+/// [`empty_catalog`] holding an empty `public.t` over `cols` on PK column 0;
+/// and its id.
+pub fn table_engine(workers: u32, cols: &[CatalogColumn]) -> (tempfile::TempDir, CatalogEngine, u64) {
+    let (dir, mut engine) = empty_catalog(workers);
     let tid = engine.create_table("public.t", cols, &[0]).unwrap();
-    (engine, tid)
+    (dir, engine, tid)
 }
 
 /// Split `schema.name`, defaulting the schema half. Only the in-process DDL
@@ -476,6 +465,11 @@ impl CatalogEngine {
         let mut engine = Self::open_master(base_dir, num_workers, config, [])?;
         engine.open_stores(0, gnitz_store::relation::Residency::Origin)?;
         Ok(engine)
+    }
+
+    /// [`Self::reserve_catalog_ids`] with no log to lay the advance out in.
+    pub(crate) fn allocate_ids(&mut self, count: u64) -> Result<u64, String> {
+        self.reserve_catalog_ids(count, &mut |_, _| Ok(())).map_err(refusal)
     }
 
     /// Flush every base and system store, then drop the engine. Dropping one

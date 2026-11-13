@@ -174,6 +174,8 @@ fn worker_boot_recovery(catalog: &mut CatalogEngine, tail: &CommittedTail, slot:
 pub(crate) struct ServerArgs {
     pub(crate) data_dir: String,
     pub(crate) socket_path: String,
+    /// The permission bits `socket_path` is created with.
+    pub(crate) socket_mode: u32,
     /// The worker count, or `None` (`--workers=auto`) to size it from the host.
     pub(crate) workers: Option<u32>,
     /// The directory BACKUP writes into; `None` refuses BACKUP.
@@ -268,7 +270,8 @@ fn master_pre_fork_recovery(
 }
 
 /// Fork one child per worker, each of which never returns and takes its own
-/// ends with it. Yields the parent's children.
+/// ends with it. Yields the parent's children; on a failed fork, the ones
+/// already forked are killed and reaped.
 fn fork_workers(
     catalog: &mut CatalogEngine,
     data_dir: &str,
@@ -278,10 +281,15 @@ fn fork_workers(
 ) -> Result<Workers, String> {
     let master_pid = unsafe { libc::getpid() };
     let num_workers = workers.len() as u32;
-    let mut worker_pids = Vec::with_capacity(workers.len());
+    let mut forked = Workers::new(Vec::with_capacity(workers.len()));
     for (w, ipc) in workers.into_iter().enumerate() {
         match unsafe { libc::fork() } {
-            -1 => return Err("fork failed".to_string()),
+            -1 => {
+                return Err(format!(
+                    "fork of worker {w} failed: {}",
+                    std::io::Error::last_os_error()
+                ))
+            }
             0 => run_worker_child(
                 Slot::new(w as u32, num_workers),
                 data_dir,
@@ -291,10 +299,10 @@ fn fork_workers(
                 ipc,
                 pinning,
             ),
-            pid => worker_pids.push(NonZero::new(pid).expect("fork answers the parent a child's pid")),
+            pid => forked.push(NonZero::new(pid).expect("fork answers the parent a child's pid")),
         }
     }
-    Ok(Workers::new(worker_pids))
+    Ok(forked)
 }
 
 /// The master's half of recovery once the workers have recovered and the SAL is
@@ -320,13 +328,19 @@ async fn master_post_fork_recovery(disp: &MasterDispatcher, pushed: BTreeSet<u64
     // one tick brings it to every view, resumed or rebuilt, each row once. A
     // view's operator state needs no tick: the boot checkpoint opens every
     // resumed view's.
-    let ticked: Vec<u64> = {
-        let cat = disp.cat();
-        pushed.into_iter().filter(|&t| cat.dag.is_scanned(t)).collect()
-    };
-    disp.drain_tick(&alone, &ticked)
+    {
+        let laid_out = disp.sal().lock().await;
+        for tid in pushed {
+            disp.credit(&laid_out, tid, 0);
+        }
+    }
+    let tick = disp
+        .emit_tick(&alone)
         .await
         .map_err(|e| format!("recovery tick of the replayed tail failed: {e}"))?;
+    if let Some(wait) = tick {
+        wait.acks().await;
+    }
 
     inject_recovery_panic("sweep");
 
@@ -436,19 +450,19 @@ pub(crate) fn server_main(args: ServerArgs, tls: Option<ResolvedTls>) -> Result<
     };
     let dispatcher = match reactor.block_on(select2(recovered, death.as_mut())) {
         Either::A(recovered) => recovered?,
-        Either::B(w) => {
+        Either::B((w, end)) => {
             return Err(format!(
-                "worker {w} exited during recovery (log: {})",
+                "worker {w} {end} during recovery (log: {})",
                 worker_log(data_dir, w)
             ))
         }
     };
     // Outside the loop: the bind may sleep on an address still in use.
-    let listeners = listen::bind_listeners(data_dir, &args.socket_path, tls)?;
+    let listeners = listen::bind_listeners(data_dir, &args.socket_path, args.socket_mode, tls)?;
     match reactor.block_on(select2(executor::serve(dispatcher, args.backup_dir, listeners), death)) {
         Either::A(()) => Ok(ServerExit::Clean),
-        Either::B(w) => {
-            gnitz_error!("Worker {w} crashed (log: {}); workers stopped", worker_log(data_dir, w));
+        Either::B((w, end)) => {
+            gnitz_error!("Worker {w} {end} (log: {}); workers stopped", worker_log(data_dir, w));
             Ok(ServerExit::WorkerDied)
         }
     }

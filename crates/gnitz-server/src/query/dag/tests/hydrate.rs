@@ -1,7 +1,7 @@
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{
-    col_def, make_batch, make_schema_u64_i64, push_and_tick, reindexed_on_col1, scan_all, scratch_dir, table_engine,
+    col_def, empty_catalog, make_batch, make_schema_u64_i64, push_and_tick, reindexed_on_col1, scan_all, table_engine,
     try_register_identity_view, try_register_view, two_term_join_circuit, u64_i64_cols, zset_of, RowKey,
 };
 use gnitz_store::relation::PkRule;
@@ -20,7 +20,7 @@ fn hydrate(engine: &mut CatalogEngine, view: u64, ids: &[u64]) -> HashMap<RowKey
 #[test]
 fn a_relation_seed_reads_the_source_as_of_its_last_tick() {
     let cols = u64_i64_cols();
-    let (mut engine, tid) = table_engine("dag_hydrate", "relation_seed", 1, &cols);
+    let (_dir, mut engine, tid) = table_engine(1, &cols);
     let view = try_register_identity_view(&mut engine, tid, "bounded", &cols, 1 << 20, 0).unwrap();
     let rows: Vec<(u64, i64, i64)> = (1..=8).map(|id| (id, 1, id as i64 * 10)).collect();
     let schema = make_schema_u64_i64();
@@ -42,7 +42,7 @@ fn a_relation_seed_reads_the_source_as_of_its_last_tick() {
 /// recomputes to exactly the rows it holds, each at weight 1.
 #[test]
 fn a_trace_seed_recomputes_a_joins_rows() {
-    let mut engine = CatalogEngine::open(&scratch_dir("dag_hydrate", "trace_seed"), 1).unwrap();
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
     let a = engine.create_table("public.a", &cols, &[0]).unwrap();
     let b = engine.create_table("public.b", &cols, &[0]).unwrap();
@@ -73,7 +73,7 @@ fn a_trace_seed_recomputes_a_joins_rows() {
 /// once, as the view holds it.
 #[test]
 fn a_clamp_history_seed_is_read_through_the_clamp() {
-    let mut engine = CatalogEngine::open(&scratch_dir("dag_hydrate", "clamp_seed"), 1).unwrap();
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = [col_def("id", TypeCode::U64), col_def("k", TypeCode::U64)];
     let a = engine.create_table("public.a", &cols, &[0]).unwrap();
     let b = engine.create_table("public.b", &cols, &[0]).unwrap();

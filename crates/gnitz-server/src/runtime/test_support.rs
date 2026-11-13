@@ -114,13 +114,6 @@ pub(crate) fn read_nonblocking(s: &UnixStream, cap: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// An empty catalog, and the directory it lives in.
-pub(crate) fn empty_catalog() -> (tempfile::TempDir, crate::catalog::CatalogEngine) {
-    let tmp = tempfile::tempdir().unwrap();
-    let engine = crate::catalog::CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
-    (tmp, engine)
-}
-
 /// Future that returns Pending exactly once, waking itself, then Ready.
 pub(crate) fn yield_once() -> impl std::future::Future<Output = ()> {
     let mut yielded = false;

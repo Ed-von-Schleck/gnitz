@@ -2,12 +2,10 @@ use gnitz_store::relation::{IndexClaim, RelationSpec};
 use gnitz_wire::{IdxTabRow, TableDistribution, ViewParts};
 use gnitz_zset::algebra::Placement;
 use gnitz_zset::repr::Batch;
-use std::rc::Rc;
 
 use super::relations::{FkEdge, RelationEntry};
 use super::sys_tables::{
-    build_schema_from_col_defs, encode_record, pk_signatures, read_rel_row, IdSet, PkShape, RelDetail, RelRow,
-    SysFamily,
+    build_schema_from_col_defs, pk_signatures, read_rel_row, IdSet, PkShape, RelDetail, RelRow, SysFamily,
 };
 use super::CatalogEngine;
 
@@ -45,7 +43,7 @@ impl CatalogEngine {
     fn register_relation(&mut self, rel: &RelRow<'_>) -> Result<(), String> {
         let col_defs = self.read_column_defs(rel.id)?;
         let schema = build_schema_from_col_defs(&col_defs, rel.pk.as_slice())?;
-        let (placement, pk_repeats, compress, serial) = match rel.detail {
+        let (placement, pk_repeats, compress) = match rel.detail {
             RelDetail::View(ViewParts { owner, pk_repeats, props }) => {
                 let circuit = self.read_circuit(rel.id)?;
                 let chain = owner.unwrap_or(rel.id);
@@ -82,7 +80,7 @@ impl CatalogEngine {
                     chain,
                     &circuit,
                 )?;
-                (placement, pk_repeats, props.compress, false)
+                (placement, pk_repeats, props.compress)
             }
             RelDetail::Table(t) => {
                 let placement = match t.distribution {
@@ -91,7 +89,7 @@ impl CatalogEngine {
                     TableDistribution::Keyed { prefix_len } => Placement::keyed(&schema, prefix_len as usize),
                 };
                 // A base table's PK is unique by `enforce_unique_pk`; a stream's is not.
-                (placement, t.stream, t.compress, t.serial)
+                (placement, t.stream, t.compress)
             }
         };
         gnitz_debug!(
@@ -114,7 +112,6 @@ impl CatalogEngine {
                 })
             })
             .collect();
-        let record = Rc::from(encode_record(schema.pk_cols(), &col_defs));
         // Derived, not stored: every process builds the same FK indexes from the same
         // column records. Every FK column carries one, a PK column included.
         let fk_indexes: Vec<_> = fks
@@ -128,8 +125,9 @@ impl CatalogEngine {
             pk_repeats,
             compress,
         };
+        let entry = RelationEntry::new(&schema, &col_defs, fks);
         self.registry.register_at(spec, schema, &fk_indexes, None)?;
-        self.caches.enter(rel.id, RelationEntry::new(record, fks, serial));
+        self.caches.enter(rel.id, entry);
         Ok(())
     }
 
@@ -195,7 +193,7 @@ impl CatalogEngine {
                 .relations
                 .get_mut(&owner)
                 .expect("every registered relation has an entry")
-                .record = Rc::from(encode_record(cur.pk_cols(), &defs));
+                .set_records(&rebuilt, &defs);
         }
         Ok(())
     }

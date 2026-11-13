@@ -388,7 +388,7 @@ fn a_span_train_carries_every_span_and_ends_in_one_empty_frame() {
         (24, 400, 1024, 2..=24),
     ];
     for (n, budget, chunk_rows, carrying) in cases {
-        let (mut engine, tid) = table_engine("worker", &format!("span_train_{n}"), 1, &u64_i64_cols());
+        let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
         let claim = IndexClaim::Index { id: tid + 1, unique: false };
         engine.registry.add_indexes(tid, &[(claim, cols)]).unwrap();
         // Values descend as ids ascend, so span order is not row order.

@@ -38,12 +38,14 @@ pub(crate) fn clear_published(data_dir: &str) -> Result<(), String> {
     }
 }
 
-/// Bind every listener, the AF_UNIX socket last, then publish the endpoint.
-/// Called after the fork, so no worker inherits a listening fd. An address in
-/// use is waited on for up to [`ADDRESS_GRACE`].
+/// Bind every listener, the AF_UNIX socket last and with permission bits
+/// `socket_mode`, then publish the endpoint. Called after the fork, so no worker
+/// inherits a listening fd. An address in use is waited on for up to
+/// [`ADDRESS_GRACE`].
 pub(crate) fn bind_listeners(
     data_dir: &str,
     socket_path: &str,
+    socket_mode: u32,
     tls: Option<TlsListener>,
 ) -> Result<Vec<ClientListener>, String> {
     let deadline = Instant::now() + ADDRESS_GRACE;
@@ -51,7 +53,7 @@ pub(crate) fn bind_listeners(
         .map(|tls| bind_tcp(tls.listen(), deadline).map(|(fd, bound)| (fd, bound, tls)))
         .transpose()?;
     let mut listeners = vec![ClientListener {
-        fd: bind_unix(socket_path, deadline)?,
+        fd: bind_unix(socket_path, socket_mode, deadline)?,
         tls: None,
     }];
     if let Some((fd, bound, tls)) = tcp {
@@ -99,15 +101,15 @@ fn bind_tcp(addr: SocketAddr, deadline: Instant) -> Result<(OwnedFd, SocketAddr)
     Ok((OwnedFd::from(listener), bound))
 }
 
-/// Bind the AF_UNIX listener at `path`, replacing only a stale socket: a
-/// regular file there, or a socket something still answers on at `deadline`,
-/// refuses the boot.
-fn bind_unix(path: &str, deadline: Instant) -> Result<OwnedFd, String> {
+/// Bind the AF_UNIX listener at `path` with permission bits `mode`, replacing
+/// only a stale socket: a regular file there, or a socket something still
+/// answers on at `deadline`, refuses the boot.
+fn bind_unix(path: &str, mode: u32, deadline: Instant) -> Result<OwnedFd, String> {
     use std::os::unix::fs::FileTypeExt;
-    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::os::unix::net::UnixStream;
 
     let listener = loop {
-        match UnixListener::bind(path) {
+        match bind_with_mode(path, mode) {
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 let is_socket = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket());
                 if !is_socket {
@@ -122,15 +124,54 @@ fn bind_unix(path: &str, deadline: Instant) -> Result<OwnedFd, String> {
                 }
                 // Left by a server that is gone.
                 std::fs::remove_file(path).map_err(|e| format!("failed to remove stale socket {path}: {e}"))?;
-                break UnixListener::bind(path);
+                break bind_with_mode(path, mode);
             }
             r => break r,
         }
     }
-    .map(OwnedFd::from)
     .map_err(|e| format!("failed to create server socket {path}: {e}"))?;
     gnitz_info!("Listening on {}", path);
     Ok(listener)
+}
+
+/// A listening AF_UNIX socket bound at `path` with permission bits `mode`. The
+/// mode is set between `bind` and `listen`: until `listen` no connect succeeds,
+/// so no peer the mode excludes can slip in under the mode `bind` created the
+/// socket with.
+fn bind_with_mode(path: &str, mode: u32) -> std::io::Result<OwnedFd> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    let last_error = || Err(std::io::Error::last_os_error());
+    // SAFETY: plain syscalls on a socket this function owns from creation.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return last_error();
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_bytes();
+    // The path must leave room for its terminating NUL.
+    if bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "socket path too long or holds a NUL",
+        ));
+    }
+    for (dst, &src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = src as libc::c_char;
+    }
+    let len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
+    if unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), len) } < 0 {
+        return last_error();
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    // A negative backlog listens at `net.core.somaxconn`.
+    if unsafe { libc::listen(fd.as_raw_fd(), -1) } < 0 {
+        return last_error();
+    }
+    Ok(fd)
 }
 
 #[cfg(test)]

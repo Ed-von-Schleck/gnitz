@@ -77,7 +77,7 @@ fn drive_tick_bench() {
     let all_rows = (TICKS + WIDE_TICKS * WIDE_TICK_ROWS) as i64;
 
     // A view of two sides, a view over a view, a view two producers feed.
-    let (mut engine, base, views) = engine_with_views("tick_bench_closure");
+    let (_dir, mut engine, base, views) = engine_with_views();
     assert_eq!(cells(&counter, "closure", &mut engine, base), 0);
     assert_eq!(
         net_weight(&engine, views.over_union),
@@ -87,7 +87,7 @@ fn drive_tick_bench() {
 
     // A `GROUP BY`, a global `COUNT(*)` and a hash-keyed `DISTINCT`, each behind
     // an exchange.
-    let (mut engine, base) = table_engine("dag_exec", "tick_bench_rounds", 4, &u64_i64_cols());
+    let (_dir, mut engine, base) = table_engine(4, &u64_i64_cols());
     let (grouped, _) = register_count(&mut engine, base, &[1], "grouped");
     let (counted, _) = register_count(&mut engine, base, &[], "counted");
     let mut circuit = Circuit::default();
@@ -108,7 +108,7 @@ fn drive_tick_bench() {
 
     // Four equi-joins of the source onto one other table, all on the source's
     // `v`, beside three other workers: one round of the source a tick.
-    let (mut engine, base) = table_engine("dag_exec", "tick_bench_joins", 4, &u64_i64_cols());
+    let (_dir, mut engine, base) = table_engine(4, &u64_i64_cols());
     let other = engine.create_table("public.u", &u64_i64_cols(), &[0]).unwrap();
     let join_cols = [
         col_def("k", TypeCode::I64),
@@ -136,7 +136,7 @@ fn drive_tick_bench() {
     // Wide ticks of a source one view reads and eight do, every reader but the
     // last taking a copy of the delta.
     for readers in [1, 8] {
-        let (mut engine, base) = table_engine("dag_exec", &format!("tick_bench_fanout_{readers}"), 1, &u64_i64_cols());
+        let (_dir, mut engine, base) = table_engine(1, &u64_i64_cols());
         let views: Vec<u64> = (0..readers)
             .map(|r| register_identity_view(&mut engine, base, &format!("v{r}"), &u64_i64_cols()))
             .collect();

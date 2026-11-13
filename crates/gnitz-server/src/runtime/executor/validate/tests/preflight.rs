@@ -8,11 +8,11 @@ use gnitz_wire::TypeCode;
 #[test]
 fn a_lone_pk_parent_probes_only_for_the_keys_it_deletes() {
     use crate::runtime::master::fixtures::test_dispatcher;
-    use crate::runtime::test_support::empty_catalog;
     use crate::runtime::test_support::try_poll_once;
+    use crate::test_support::empty_catalog;
     use crate::test_support::fk_child_cols;
 
-    let (_tmp, mut engine) = empty_catalog();
+    let (_tmp, mut engine) = empty_catalog(1);
     let parent = engine.create_table("public.parent", &u64_i64_cols(), &[0]).unwrap();
     engine
         .create_table("public.child", &fk_child_cols(parent), &[0])
@@ -47,10 +47,10 @@ type Rows<'r> = &'r [(u64, i64, Option<i64>)];
 fn uniquely_indexed_table() -> (tempfile::TempDir, MasterDispatcher, u64, SchemaDescriptor, PkColList) {
     use crate::catalog::SysFamily;
     use crate::runtime::master::fixtures::test_dispatcher;
-    use crate::runtime::test_support::empty_catalog;
+    use crate::test_support::empty_catalog;
     use crate::test_support::{apply_ddl, idx_tab_batch, nullable_def};
 
-    let (tmp, mut engine) = empty_catalog();
+    let (tmp, mut engine) = empty_catalog(1);
     let cols = [u64_i64_cols()[0].clone(), nullable_def("v", TypeCode::I64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let id = engine.allocate_ids(1).unwrap();

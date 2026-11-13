@@ -1,6 +1,6 @@
 //! One-shot ops: an SQE that posts one CQE to one awaiter, the two meeting in a
-//! slot freed by the later of them. `fsync` and `child_exit` are two; `conn`
-//! pushes the rest.
+//! slot freed by the later of them. `fsync`, `child_exit` and `read` are
+//! three; `conn` pushes the rest.
 
 use std::any::Any;
 
@@ -177,11 +177,34 @@ impl Reactor {
     }
 
     /// Resolves once child `pid` has exited, leaving it a zombie (`WNOWAIT`) for
-    /// a later wait to reap. Yields the CQE `res`: 0, or a negative errno.
-    pub(crate) async fn child_exit(&self, pid: libc::pid_t) -> i32 {
-        let sqe = opcode::WaitId::new(libc::P_PID, pid as libc::id_t, libc::WEXITED | libc::WNOWAIT).build();
-        // SAFETY: the SQE names no memory: with no `infop`, no siginfo is written.
-        unsafe { self.push_op(sqe, ()) }.await.0
+    /// a later wait to reap. Yields how it ended, or the negative errno of a
+    /// failed wait.
+    pub(crate) async fn child_exit(&self, pid: libc::pid_t) -> Result<libc::siginfo_t, i32> {
+        // SAFETY: an all-zero `siginfo_t` is a valid value of the plain C struct.
+        let info: Box<libc::siginfo_t> = Box::new(unsafe { std::mem::zeroed() });
+        let sqe = opcode::WaitId::new(libc::P_PID, pid as libc::id_t, libc::WEXITED | libc::WNOWAIT)
+            .infop(&*info)
+            .build();
+        // SAFETY: the SQE writes the boxed siginfo, which is the op's carry and
+        // so stays allocated until the CQE.
+        let (res, info) = unsafe { self.push_op(sqe, info) }.await;
+        if res < 0 {
+            Err(res)
+        } else {
+            Ok(*info)
+        }
+    }
+
+    /// Read up to `buf.len()` bytes of `fd` into `buf`. Yields the CQE `res`,
+    /// the bytes read or a negative errno, and `buf`.
+    pub(crate) async fn read(&self, fd: BorrowedFd<'static>, mut buf: Box<[u8]>) -> (i32, Box<[u8]>) {
+        let sqe = opcode::Read::new(types::Fd(fd.as_raw_fd()), buf.as_mut_ptr(), buf.len() as u32)
+            .offset(u64::MAX)
+            .build();
+        // SAFETY: `fd` is open for the process's life; the SQE writes `buf`,
+        // which is the op's carry and so stays allocated until the CQE, and a
+        // boxed slice's bytes do not move with the box.
+        unsafe { self.push_op(sqe, buf) }.await
     }
 }
 

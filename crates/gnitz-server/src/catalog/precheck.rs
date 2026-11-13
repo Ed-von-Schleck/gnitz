@@ -525,13 +525,13 @@ impl CatalogEngine {
     /// above the counter. Answers the bundle's created ids.
     fn check_single_use(&self, families: &DdlBundle) -> Result<FxHashSet<u64>, String> {
         let mut created = FxHashSet::default();
+        let next_id = self.next_catalog_id();
         for family in SysFamily::ALL.into_iter().filter(|f| f.allocates_ids()) {
             for id in families.creates(family) {
-                if id >= self.next_id {
+                if id >= next_id {
                     return Err(format!(
-                        "{} {id} was never allocated (next id {})",
-                        family.row_noun(),
-                        self.next_id
+                        "{} {id} was never allocated (next id {next_id})",
+                        family.row_noun()
                     ));
                 }
                 // An id below the bootstrap floor is the shape check's refusal.

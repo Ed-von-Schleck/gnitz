@@ -29,33 +29,6 @@ use hydration::derive_hydration;
 use routing::ViewMeta;
 
 // ---------------------------------------------------------------------------
-// Circuit walks
-// ---------------------------------------------------------------------------
-
-/// True iff `op` hands a subset of its input's rows on, each on its own worker
-/// with the PK region intact.
-fn keeps_rows_and_pk_region(op: &OpNode) -> bool {
-    matches!(op, OpNode::Filter(_) | OpNode::Map(MapKind::Compute(_)))
-}
-
-/// Walk back from `from` through nodes that keep rows and the PK region, to the
-/// first node that does not.
-fn row_local_origin(circuit: &Circuit, mut from: NodeId) -> NodeId {
-    while keeps_rows_and_pk_region(circuit.op(from)) {
-        from = circuit.inputs(from)[0];
-    }
-    from
-}
-
-/// The source of the `ScanDelta` the row-local walk back from `from` ends at.
-fn scanned_row_locally(circuit: &Circuit, from: NodeId) -> Option<u64> {
-    match circuit.op(row_local_origin(circuit, from)) {
-        OpNode::ScanDelta { source, .. } => Some(*source),
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // CompileOutput — typed compilation result
 // ---------------------------------------------------------------------------
 
@@ -93,14 +66,17 @@ pub(super) fn compile_view(
     view_schema: &SchemaDescriptor,
     bounded: bool,
 ) -> Result<(CompileOutput, Placement), String> {
-    let (meta, placement) = ViewMeta::derive(circuit, registry, view_schema)?;
-    let EmitCtx { prog, regs, integrals, sources, .. } = EmitCtx::emit(circuit, &meta, view_id)?;
+    let meta = ViewMeta::derive(circuit, registry)?;
+    let EmitCtx {
+        prog, regs, integrals, sources, dists, ..
+    } = EmitCtx::emit(circuit, &meta, view_id)?;
     let vm = prog.finish(regs[circuit.out()]);
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
     if !vm.out_schema().same_region_types(view_schema) {
         return Err("the circuit's output schema is not the view's".into());
     }
+    let placement = meta.placement(&dists[circuit.out()], vm.out_schema());
     let mut output = CompileOutput {
         vm,
         sources: sources.into_boxed_slice(),

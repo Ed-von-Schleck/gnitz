@@ -10,9 +10,8 @@
 //! A snapshot is its connection's: refused to any other, released by
 //! SNAPSHOT_CLOSE or when the connection ends.
 
-use super::peer::Peer;
 use super::{cork_train, decode_fault, Shared};
-use crate::runtime::reactor::SendBody;
+use crate::runtime::reactor::{Peer, SendBody};
 use crate::runtime::sal::Read;
 use gnitz_wire::snapshot::PageRequest;
 use gnitz_wire::{ControlHeader, WireFault};

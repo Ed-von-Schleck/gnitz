@@ -29,6 +29,9 @@ fn every_refusal_names_what_it_refuses() {
         (too_many.as_str(), None, "--workers"),
         ("--workers=abc /data /sock", None, "--workers"),
         ("--workers=Auto /data /sock", None, "--workers"),
+        ("--socket-mode=1777 /data /sock", None, "--socket-mode"),
+        ("--socket-mode=rw /data /sock", None, "--socket-mode"),
+        ("--socket-mode=8 /data /sock", None, "--socket-mode"),
         ("--tls-listen=localhost:0 /data /sock", None, "localhost:0"),
         (
             "--tls-listen=127.0.0.1:0 --tls-cert=c.pem /data /sock",
@@ -66,6 +69,16 @@ fn every_refusal_names_what_it_refuses() {
             .err()
             .unwrap_or_else(|| panic!("{line:?} is refused"));
         assert!(e.contains(names), "{line:?}: {e}");
+    }
+}
+
+#[test]
+fn the_socket_mode_defaults_to_owner_only() {
+    for (flag, mode) in [("", 0o600), ("--socket-mode=660", 0o660), ("--socket-mode=0", 0)] {
+        assert_eq!(
+            parse(&format!("/data /sock {flag}"), None).unwrap().server.socket_mode,
+            mode
+        );
     }
 }
 

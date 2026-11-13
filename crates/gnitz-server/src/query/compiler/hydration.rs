@@ -10,6 +10,16 @@ const UNSUPPORTED: &str =
 const READS_OWN_STORE: &str =
     "capacity-bounded view: a reduce as its output would read the view's skeleton rows back as its trace";
 
+/// Walk back from `from` through nodes that hand a subset of their input's
+/// rows on, each on its own worker with the PK region intact, to the first
+/// node that does not.
+fn row_local_origin(circuit: &Circuit, mut from: NodeId) -> NodeId {
+    while matches!(circuit.op(from), OpNode::Filter(_) | OpNode::Map(MapKind::Compute(_))) {
+        from = circuit.inputs(from)[0];
+    }
+    from
+}
+
 /// A bounded view's per-key replay: the register it seeds, the integral the
 /// seed is gathered from, and the clamp the gathered weights are read through,
 /// resolved against the plan the emitter produced. The seed is

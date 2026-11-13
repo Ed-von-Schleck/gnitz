@@ -5,7 +5,7 @@ use crate::runtime::tls::{CertSource, TlsArgs, TlsListener};
 /// and a socket a live server answers on each refuse the boot, untouched.
 #[test]
 fn bind_unix_replaces_only_a_stale_socket() {
-    let bind_unix = |path| bind_unix(path, Instant::now());
+    let bind_unix = |path| bind_unix(path, 0o600, Instant::now());
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.sock");
     let path_str = path.to_str().unwrap();
@@ -24,6 +24,20 @@ fn bind_unix_replaces_only_a_stale_socket() {
     bind_unix(path_str).expect("a stale socket is replaced");
 }
 
+/// The socket gets exactly the asked-for mode, whatever the process umask.
+#[test]
+fn bind_unix_creates_the_socket_with_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    for mode in [0o600, 0o660, 0o777] {
+        let path = dir.path().join(format!("{mode:o}.sock"));
+        let _bound = bind_unix(path.to_str().unwrap(), mode, Instant::now()).expect("bind");
+        let got = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(got, mode, "{mode:o}");
+    }
+}
+
 /// Every accepted TLS socket inherits the listening socket's options, and
 /// `clear_published` tolerates an absent endpoint.
 #[test]
@@ -32,7 +46,7 @@ fn bind_listeners_publishes_the_endpoint_and_accepted_sockets_inherit_the_option
     let data_dir = dir.path().to_str().unwrap();
     let sock = dir.path().join("s.sock");
     let tls = TlsListener::open(TlsArgs::on("127.0.0.1:0").resolve().unwrap(), data_dir).unwrap();
-    let mut listeners = bind_listeners(data_dir, sock.to_str().unwrap(), Some(tls)).expect("bind");
+    let mut listeners = bind_listeners(data_dir, sock.to_str().unwrap(), 0o600, Some(tls)).expect("bind");
 
     let endpoint = std::fs::read_to_string(dir.path().join(TLS_ENDPOINT_FILE)).unwrap();
     let addr: SocketAddr = endpoint.trim().parse().expect("a connectable address");
@@ -77,7 +91,7 @@ fn a_failed_tcp_bind_exposes_nothing() {
         ..TlsArgs::on("192.0.2.1:9")
     };
     let tls = TlsListener::open(off_host.resolve().unwrap(), data_dir).unwrap();
-    let e = bind_listeners(data_dir, sock.to_str().unwrap(), Some(tls))
+    let e = bind_listeners(data_dir, sock.to_str().unwrap(), 0o600, Some(tls))
         .err()
         .expect("an address off the host refuses");
     assert!(e.contains("failed to bind TLS listener"), "{e}");
@@ -104,7 +118,8 @@ fn an_address_freed_within_the_grace_is_bound() {
             drop(held);
         }
     });
-    let listeners = bind_listeners(data_dir, path.to_str().unwrap(), Some(tls)).expect("both addresses come free");
+    let listeners =
+        bind_listeners(data_dir, path.to_str().unwrap(), 0o600, Some(tls)).expect("both addresses come free");
     assert_eq!(listeners.len(), 2);
     release.join().unwrap();
 }

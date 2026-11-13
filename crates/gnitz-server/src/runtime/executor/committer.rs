@@ -8,7 +8,7 @@
 use super::family::{FamilyRows, TxnFamily};
 use super::write::HeldTables;
 use super::Shared;
-use crate::runtime::sync::{chan, oneshot};
+use crate::runtime::sync::{chan, oneshot, select2, Either};
 use gnitz_store::relation::PkRule;
 use gnitz_wire::WireFault;
 use gnitz_zset::repr::Batch;
@@ -26,8 +26,6 @@ const MAX_PENDING_ROWS: usize = 100_000;
 enum CommitRequest {
     /// Commit one write.
     Write(PendingWrite),
-    /// Wake the committer so it re-tests `needs_checkpoint`.
-    Reclaim,
     /// End the batch of what is queued ahead, and run `BatchEnd` once it has
     /// committed.
     End(BatchEnd),
@@ -62,7 +60,7 @@ struct PendingWrite {
 }
 
 /// The way to the committer task. A write and a backup are refused once it is
-/// closed; a settle and the reclaim poke are always queued.
+/// closed; a settle is always queued.
 pub(super) struct Committer {
     tx: chan::Sender<CommitRequest>,
     /// Set by [`Committer::close`], in the step that queues the final checkpoint.
@@ -108,11 +106,6 @@ impl Committer {
         self.queue(|done| CommitRequest::End(BatchEnd::Checkpoint(done)))
     }
 
-    /// Wake the committer so it re-tests `needs_checkpoint`.
-    pub(super) fn reclaim(&self) {
-        self.tx.send(CommitRequest::Reclaim);
-    }
-
     fn admit<T>(
         &self,
         req: impl FnOnce(oneshot::Sender<T>) -> CommitRequest,
@@ -142,11 +135,19 @@ struct CommitScratch {
     last_unit: FxHashMap<u64, usize>,
 }
 
-/// The committer task loop. Never returns.
+/// The committer task loop. Never returns. With no request queued it runs a
+/// checkpoint as soon as the SAL wants one: a workload with no writes sends it
+/// nothing, yet its reads still write SAL groups.
 pub(super) async fn run(CommitRequests(mut rx): CommitRequests, shared: Rc<Shared>) {
     let mut s = CommitScratch::default();
     loop {
-        let first = rx.recv().await;
+        let first = match select2(rx.recv(), shared.dispatcher.sal().checkpoint_due()).await {
+            Either::A(req) => req,
+            Either::B(()) => {
+                run_checkpoint_sequence(&shared).await;
+                continue;
+            }
+        };
 
         let mut end = drain_ready_batch(&mut rx, first, &mut s.writes);
         // While the fdatasync in flight covers everything published, this
@@ -221,7 +222,6 @@ fn drain_ready_batch(
                 writes.push(w);
             }
             CommitRequest::End(end) => return Some(end),
-            CommitRequest::Reclaim => {}
         }
         next = (row_count < MAX_PENDING_ROWS).then(|| rx.try_recv()).flatten();
     }
@@ -229,10 +229,8 @@ fn drain_ready_batch(
 }
 
 /// The checkpoint sequence: base round, a tick of everything pending, ephemeral
-/// round, under one hold of the apply lock. A failed base round aborts: the
-/// workers have left the epoch of a SAL that was not rewound, which only a
-/// restart's replay repairs. A failed ephemeral round aborts too: its views are
-/// stamped and the master's system rows are not durable.
+/// round, under one hold of the apply lock. A failed ephemeral round aborts:
+/// its views are stamped and the master's system rows are not durable.
 async fn run_checkpoint_sequence(shared: &Shared) {
     // Held through the ephemeral round, so neither round has a tick in flight
     // (a worker meets no `Flush` inside a drive) and no DDL body, which runs
@@ -240,11 +238,7 @@ async fn run_checkpoint_sequence(shared: &Shared) {
     // before the base round takes the SAL writer: a checkpoint a refusal
     // called for frees no room until then.
     let alone = shared.dispatcher.apply_lock().await;
-    shared
-        .dispatcher
-        .checkpoint_base(&alone)
-        .await
-        .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
+    shared.dispatcher.checkpoint_base(&alone).await;
 
     // One tick takes everything pending: the committer is the task running
     // this, so no write is committed meanwhile and the pending-tick counts
@@ -253,7 +247,7 @@ async fn run_checkpoint_sequence(shared: &Shared) {
     // generation-valid. Unstamped, they stay behind the generation the base
     // round that flushed those deltas' rows advanced to, and are rebuilt at the
     // next boot. Not an abort: this path also serves the shutdown checkpoint.
-    match shared.emit_pending_tick(&alone).await {
+    match shared.dispatcher.emit_tick(&alone).await {
         Ok(Some(wait)) => wait.acks().await,
         Ok(None) => {}
         Err(e) => {

@@ -8,8 +8,10 @@ use super::super::tick::fresh_read_lock;
 use super::*;
 use crate::catalog::CatalogEngine;
 use crate::runtime::master::fixtures::test_dispatcher;
+use crate::runtime::reactor::test_support::poll_until;
 use crate::runtime::sal::Routed;
-use crate::runtime::test_support::{empty_catalog, try_poll_once, within};
+use crate::runtime::test_support::{try_poll_once, within};
+use crate::test_support::empty_catalog;
 use crate::test_support::{
     col_def, make_batch_bytes, make_batch_raw, make_schema_u64_i64, register_identity_view, u64_i64_cols,
 };
@@ -79,7 +81,7 @@ fn a_batch_ends_at_the_row_cap_or_an_end_request() {
     let half = MAX_PENDING_ROWS / 2 + 1;
     let cases = [
         // (queued, (writes, end, left behind))
-        (vec![push_of(1), CommitRequest::Reclaim, push_of(1)], (2, None, 0)),
+        (vec![push_of(1), push_of(1)], (2, None, 0)),
         (
             vec![push_of(MAX_PENDING_ROWS - 1), push_of(2), push_of(1)],
             (2, None, 1),
@@ -214,7 +216,7 @@ fn string_tables<const N: usize>(engine: &mut CatalogEngine, names: [&str; N]) -
 fn sized_row(shared: &Shared, tid: u64, footprint: Option<usize>) -> Batch {
     let sal = shared.dispatcher.sal();
     let cat = shared.cat();
-    let (rel, record) = cat.wire_target(tid).unwrap();
+    let (rel, record) = cat.sal_target(tid).unwrap();
     let sized = |len: usize| {
         let batch = make_batch_bytes(&rel.schema(), &[(1, 1, &vec![b'x'; len])]);
         let bytes = sal.push_footprint(record, Routed::Same(batch.wire_whole()));
@@ -232,7 +234,7 @@ fn sized_row(shared: &Shared, tid: u64, footprint: Option<usize>) -> Batch {
 #[test]
 fn a_checkpoint_ticks_what_is_pending_and_answers_a_waiting_read() {
     within(|| {
-        let (_tmp, mut engine) = empty_catalog();
+        let (_tmp, mut engine) = empty_catalog(1);
         let cols = u64_i64_cols();
         let t = engine.create_table("public.t", &cols, &[0]).unwrap();
         let v = register_identity_view(&mut engine, t, "v", &cols);
@@ -246,7 +248,7 @@ fn a_checkpoint_ticks_what_is_pending_and_answers_a_waiting_read() {
         let mut read = std::pin::pin!(fresh_read_lock(&shared, [v], reactor.now()));
         assert!(try_poll_once(read.as_mut()).is_none(), "the read waits on a drain");
         reactor.block_on(shared.committer.close());
-        assert!(shared.ticks.all_ticked(&shared.cat().dag, [v]));
+        assert!(shared.dispatcher.all_ticked([v]));
         assert!(try_poll_once(read.as_mut()).is_some_and(|locked| locked.is_ok()));
     });
 }
@@ -256,7 +258,7 @@ fn a_checkpoint_ticks_what_is_pending_and_answers_a_waiting_read() {
 #[test]
 fn a_closed_committer_refuses_a_write_and_a_backup() {
     within(|| {
-        let (_tmp, mut engine) = empty_catalog();
+        let (_tmp, mut engine) = empty_catalog(1);
         let [tid] = string_tables(&mut engine, ["public.t"]);
         let (shared, _asks) = workerless_committer(engine);
         let disp = &shared.dispatcher;
@@ -289,12 +291,13 @@ fn a_closed_committer_refuses_a_write_and_a_backup() {
     });
 }
 
-/// A settle with no write queued ahead runs the checkpoint the log is due, and
-/// none on a log below its threshold.
+/// A write that crosses the checkpoint threshold is followed by the checkpoint
+/// it called for with no request queued behind it; a settle then runs none on
+/// a log below its threshold.
 #[test]
-fn a_settle_runs_the_checkpoint_that_is_due() {
+fn a_write_past_the_threshold_is_checkpointed_unasked() {
     within(|| {
-        let (_tmp, mut engine) = empty_catalog();
+        let (_tmp, mut engine) = empty_catalog(1);
         let [tid] = string_tables(&mut engine, ["public.t"]);
         let (shared, _asks) = workerless_committer(engine);
         let disp = &shared.dispatcher;
@@ -308,13 +311,15 @@ fn a_settle_runs_the_checkpoint_that_is_due() {
         disp.reactor()
             .block_on(shared.committer.write(families, HeldTables::default()))
             .expect("the write fits behind the boot checkpoint");
-        assert!(sal.needs_checkpoint(), "the write crossed the threshold");
-        assert_eq!(sal.epoch(), 1);
+        assert!(
+            poll_until(disp.reactor(), || sal.epoch() == 2),
+            "the committer checkpointed with no request queued"
+        );
+        assert!(!sal.needs_checkpoint());
 
         for _ in 0..2 {
             disp.reactor().block_on(shared.committer.settle());
-            assert!(!sal.needs_checkpoint());
-            assert_eq!(sal.epoch(), 2, "one checkpoint, run by the first settle");
+            assert_eq!(sal.epoch(), 2, "the settles ran none");
         }
     });
 }
@@ -332,7 +337,7 @@ fn a_settle_runs_the_checkpoint_that_is_due() {
 #[test]
 fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
     within(|| {
-        let (_tmp, mut engine) = empty_catalog();
+        let (_tmp, mut engine) = empty_catalog(1);
         let [tid, tid_b, tid_c] = string_tables(&mut engine, ["public.t", "public.b", "public.c"]);
         let (shared, _asks) = workerless_committer(engine);
         let disp = &shared.dispatcher;
@@ -346,8 +351,11 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
                     TxnFamily::new(family, WireConflictMode::Update, rows)
                 })
                 .collect();
-            disp.reactor()
-                .block_on(shared.committer.write(families, HeldTables::default()))
+            // The settle answers behind any checkpoint the write called for.
+            let reactor = disp.reactor();
+            let committed = reactor.block_on(shared.committer.write(families, HeldTables::default()));
+            reactor.block_on(shared.committer.settle());
+            committed
         };
         let commit = |footprint: Option<usize>| commit_all(&[(tid, footprint)]);
 
@@ -363,12 +371,12 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
 
         // Refused behind the small write, and laid out directly behind the
         // checkpoint that makes room for it.
+        // The write then crosses the threshold, which calls for the next.
         commit(Some(room)).expect("the write fits behind a checkpoint");
-        assert_eq!(sal.epoch(), 2, "one checkpoint made room");
+        assert_eq!(sal.epoch(), 3, "one checkpoint made room, one followed the write");
         assert_eq!(sal.push_room(), room, "which left what the boot's did");
 
-        // The log is past its threshold, so this batch starts with a
-        // checkpoint: the write is refused directly behind it.
+        // Refused directly behind that checkpoint.
         let e = commit(Some(room + 8)).expect_err("no checkpoint leaves room for it");
         assert_eq!(e.status, WireStatus::SalFull, "{e}");
         assert_eq!(sal.epoch(), 3, "no checkpoint is run for a write refused at the floor");
@@ -401,7 +409,7 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
         // Two such families are within the room: refused at the second, the
         // write goes again, and commits directly behind the checkpoint.
         commit_all(&[(tid, half), (tid_b, half)]).expect("the write fits behind a checkpoint");
-        assert_eq!(sal.epoch(), 5, "one checkpoint made room");
+        assert_eq!(sal.epoch(), 6, "one checkpoint made room, one followed the write");
     });
 }
 
@@ -410,7 +418,7 @@ fn a_refused_write_goes_again_only_if_a_checkpoint_may_make_room() {
 #[test]
 fn a_refused_merged_run_goes_again_as_its_writes() {
     within(|| {
-        let (_tmp, mut engine) = empty_catalog();
+        let (_tmp, mut engine) = empty_catalog(1);
         let [tid] = string_tables(&mut engine, ["public.t"]);
         let (shared, _asks) = workerless_committer(engine);
         let disp = &shared.dispatcher;

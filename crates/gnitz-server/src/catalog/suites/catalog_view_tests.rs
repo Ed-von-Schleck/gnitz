@@ -16,7 +16,7 @@ fn tables_view(engine: &mut CatalogEngine, name: &str) -> u64 {
 /// brings the delta to both views once.
 #[test]
 fn a_scanned_familys_delta_waits_above_the_cut_for_its_tick() {
-    let mut engine = fresh("catalog_view_delta_above_cut");
+    let (_dir, mut engine) = empty_catalog(1);
     let seeds = SysFamily::ALL.len();
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
 
@@ -46,13 +46,11 @@ fn a_scanned_familys_delta_waits_above_the_cut_for_its_tick() {
         assert_eq!(held(&engine, view), (seeds + 1, seeds as i64 + 1), "view {view}");
     }
     assert!(engine.registry.seal(TABLES).unwrap().is_none());
-
-    discard(engine);
 }
 
 #[test]
 fn a_ddl_sync_into_an_unscanned_family_leaves_nothing_above_its_cut() {
-    let mut engine = fresh("catalog_unscanned_family_sealed");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     // A view over `tables` alone: `columns` stays unscanned.
     let view = tables_view(&mut engine, "v_tables");
@@ -63,36 +61,26 @@ fn a_ddl_sync_into_an_unscanned_family_leaves_nothing_above_its_cut() {
 
     assert!(engine.registry.seal(gnitz_wire::COL_TAB).unwrap().is_none());
     assert_eq!(engine.registry.seal(TABLES).unwrap().map(|d| d.len()), Some(1));
-
-    discard(engine);
 }
 
 /// A view reaching a family awaits a rebuild at reopen, and so does one over it.
 #[test]
 fn a_view_reaching_a_family_awaits_rebuild_at_reopen() {
-    assert_unreplayed_source_rebuilds_at_reopen(
-        fresh("catalog_views_invalid_at_boot"),
-        TABLES,
-        &SysFamily::Table.column_defs(),
-    );
+    let (_dir, engine) = empty_catalog(1);
+    assert_unreplayed_source_rebuilds_at_reopen(engine, TABLES, &SysFamily::Table.column_defs());
 }
 
 /// An ephemeral round publishes no store of a view a family reaches.
 #[test]
 fn an_ephemeral_round_publishes_no_view_a_family_reaches() {
-    assert_round_publishes_nothing_reaching(
-        fresh("catalog_views_unpublished"),
-        TABLES,
-        &SysFamily::Table.column_defs(),
-    );
+    let (_dir, engine) = empty_catalog(1);
+    assert_round_publishes_nothing_reaching(engine, TABLES, &SysFamily::Table.column_defs());
 }
 
 #[test]
 fn the_system_schema_takes_no_relation() {
-    let mut engine = fresh("catalog_system_schema_closed");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
-    let before = sys_row_counts(&engine);
-
     let tid = engine.allocate_ids(1).unwrap();
     let table = TableTabRow {
         schema_id: SYSTEM_SCHEMA_ID,
@@ -104,6 +92,7 @@ fn the_system_schema_takes_no_relation() {
     ];
 
     let vid = engine.allocate_ids(1).unwrap();
+    let before = sys_row_counts(&engine);
     let view = ViewTabRow {
         schema_id: SYSTEM_SCHEMA_ID,
         ..view_tab_row(vid, "mine")
@@ -119,13 +108,11 @@ fn the_system_schema_takes_no_relation() {
     }
     assert!(engine.registry.relation(tid).is_none() && engine.registry.relation(vid).is_none());
     assert!(!engine.dag.is_scanned(TABLES));
-
-    discard(engine);
 }
 
 #[test]
 fn no_view_scans_sequences() {
-    let mut engine = fresh("catalog_sequences_unscanned");
+    let (_dir, mut engine) = empty_catalog(1);
     let before = sys_row_counts(&engine);
     let seq = SysFamily::Sequence.id();
     let cols = SysFamily::Sequence.column_defs();
@@ -148,6 +135,4 @@ fn no_view_scans_sequences() {
             assert_eq!(after[family.index()], before[family.index()], "{}", family.name());
         }
     }
-
-    discard(engine);
 }

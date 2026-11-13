@@ -5,7 +5,7 @@ use std::fs;
 /// catalog by `&self`: a refusal there has written nothing.
 #[test]
 fn a_malformed_create_is_refused_at_the_precheck() {
-    let mut engine = fresh("atomicity_precheck");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = vec![
         col_def("id", TypeCode::U64),
         col_def("val", TypeCode::I64),
@@ -102,30 +102,26 @@ fn a_malformed_create_is_refused_at_the_precheck() {
         assert!(err.contains(why), "{why}: {err}");
     }
 
-    finish(engine);
+    engine.close();
 }
 
 // ── the id counter at boot ───────────────────────────────────────────────────
 
-/// A row recovered at boot raises the id counter past its id, so no allocation
-/// hands that id out again.
+/// The id counter is recovered from the allocation the log holds, so no
+/// allocation after a crash hands out an id a recovered row holds.
 #[test]
-fn a_recovered_row_raises_the_id_counter_past_its_id() {
-    let dir = temp_dir("atomicity_recovered_ids");
-    let (sid, tail) = (
-        gnitz_wire::FIRST_USER_TABLE_ID + 500,
-        gnitz_wire::FIRST_USER_TABLE_ID + 900,
-    );
-    let boot = |lsn, id, name| {
-        let group = (SysFamily::Schema, lsn, schema_tab_batch(&[(id, name, 1)]));
-        CatalogEngine::open_master(&dir, 1, Default::default(), [Ok(group)]).unwrap()
-    };
-    let mut engine = boot(500, sid, "recovered");
+fn a_logged_allocation_recovers_the_id_counter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let (base, alloc) = logged_allocation(500);
+    let sid = base + 499;
+    let tail = [
+        Ok((SysFamily::Sequence, 500, alloc)),
+        Ok((SysFamily::Schema, 501, schema_tab_batch(&[(sid, "recovered", 1)]))),
+    ];
+    let mut engine = CatalogEngine::open_master(dir, 1, Default::default(), tail).unwrap();
+    assert!(engine.schema_id("recovered").is_some());
     assert_eq!(engine.allocate_ids(1).unwrap(), sid + 1);
-    drop(engine);
-
-    assert_eq!(boot(501, tail, "recovered_too").allocate_ids(1).unwrap(), tail + 1);
-    let _ = fs::remove_dir_all(&dir);
 }
 
 // ── A schema takes no relation's id ─────────────────────────────────────────
@@ -134,7 +130,7 @@ fn a_recovered_row_raises_the_id_counter_past_its_id() {
 fn a_schema_create_at_a_table_id_is_refused() {
     // Schemas and relations draw from one id counter, so a schema row under a
     // live table's id reuses a spent id; the table and its view stay as they are.
-    let mut engine = fresh("atomicity_schema_id_collision");
+    let (_dir, mut engine) = empty_catalog(1);
 
     engine.create_schema("owner").unwrap();
     let tid = engine
@@ -151,8 +147,6 @@ fn a_schema_create_at_a_table_id_is_refused() {
     assert!(engine.schema_id("victim").is_none());
     assert!(engine.registry.relation(tid).is_some_and(|r| r.kind().is_base_table()));
     assert_eq!(engine.dag.dependents_of(tid), &[vid][..]);
-
-    discard(engine);
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +157,7 @@ fn a_schema_create_at_a_table_id_is_refused() {
 /// (duplicate name) must leave neither an orphan COL_TAB nor a ghost `-1` TABLE_TAB.
 #[test]
 fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
-    let mut engine = fresh("ddl_txn_precheck_ghost");
+    let (_dir, mut engine) = empty_catalog(1);
 
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     // Occupy the qualified name "public.dupname".
@@ -191,8 +185,6 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
         ("?".to_string(), "?".to_string()),
         "no phantom entity survives for the reusable new_tid"
     );
-
-    discard(engine);
 }
 
 /// A CREATE bundle `[COL_TAB, TABLE_TAB]` whose TABLE_TAB passes precheck but fails
@@ -200,7 +192,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 /// must net both families to zero.
 #[test]
 fn ddl_txn_hook_failure_is_undone() {
-    let mut engine = fresh("ddl_txn_hook_rollback");
+    let (_dir, mut engine) = empty_catalog(1);
 
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
 
@@ -232,15 +224,13 @@ fn ddl_txn_hook_failure_is_undone() {
         engine.registry.relation(new_tid).is_none(),
         "no registered table survives the rollback"
     );
-
-    discard(engine);
 }
 
 // ── `sequences` never accumulates an unmatched retraction ───────────────────
 
 #[test]
 fn sequence_advances_leave_no_negative_ghost() {
-    let mut engine = fresh("atomicity_seq_no_ghost");
+    let (_dir, mut engine) = empty_catalog(1);
 
     // First use of every master scalar: the next id and the checkpoint
     // generation are both seeded on demand.
@@ -259,7 +249,7 @@ fn sequence_advances_leave_no_negative_ghost() {
         "sequences must hold no net-negative row"
     );
 
-    finish(engine);
+    engine.close();
 }
 
 // ── Undoing a DROP must not stage the restored relation's directory ──────────
@@ -272,7 +262,7 @@ fn sequence_advances_leave_no_negative_ghost() {
 #[test]
 fn undoing_a_drop_keeps_the_restored_relation_directory() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
-    let (mut engine, tid) = table_engine("catalog", "undo_drop_keeps_dir", 1, &cols);
+    let (_dir, mut engine, tid) = table_engine(1, &cols);
     let reldir = relation_dir(engine.registry.base_dir(), tid);
     // The DROP of a bundle the log then refuses: applied, its zone in hand.
     let drop_batch = engine.retract_under(SysFamily::Table, &[tid]);
@@ -312,8 +302,6 @@ fn undoing_a_drop_keeps_the_restored_relation_directory() {
         std::path::Path::new(&reldir).is_dir(),
         "the restored relation's directory must survive a failure inside its re-registration"
     );
-
-    discard(engine);
 }
 
 // ── A refused CREATE TABLE leaves nothing of the table behind ────────────────
@@ -321,7 +309,7 @@ fn undoing_a_drop_keeps_the_restored_relation_directory() {
 
 #[test]
 fn refused_create_table_leaves_no_trace() {
-    let mut engine = fresh("refused_create_table");
+    let (_dir, mut engine) = empty_catalog(1);
     let parent = fk_parent(&mut engine);
     let tid = engine.allocate_ids(1).unwrap();
     let idx_id = engine.allocate_ids(1).unwrap();
@@ -366,6 +354,4 @@ fn refused_create_table_leaves_no_trace() {
         !std::path::Path::new(&relation_dir(engine.registry.base_dir(), tid)).exists(),
         "the sweep must reclaim the uncreated table's directory"
     );
-
-    discard(engine);
 }

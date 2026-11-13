@@ -9,7 +9,8 @@
 //! rest is split by concept: `runloop` (scheduling, the pass and its sleep on
 //! the W2M park, CQE dispatch), `op` (one-shot ops), `lease` (W2M ingest, the
 //! applied level it raises and the leases it routes to), `conn` (client
-//! connections and their limits), `timer` (deadlines) and `uring` (the ring).
+//! connections, their limits, and the `Peer` a connection's task sends and
+//! receives through), `timer` (deadlines) and `uring` (the ring).
 //!
 //! The reactor reads the W2M rings (`w2m`, `park`) and shares the task
 //! primitives of `sync`; it names nothing that schedules work on it (`sal`,
@@ -40,7 +41,7 @@ pub(super) mod test_support;
 mod timer;
 mod uring;
 
-pub(crate) use conn::{Accepted, ClientConn, Limits, PeerGone, RecvBuf, RecvEnd, SendBody, Session};
+pub(crate) use conn::{Limits, Peer, PeerGone, RecvBuf, RecvEnd, SendBody, Session};
 pub(crate) use lease::{AckWait, Train, TrainLease};
 pub(crate) use uring::check_host;
 

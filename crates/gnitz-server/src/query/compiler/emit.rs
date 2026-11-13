@@ -7,6 +7,7 @@
 //! circuit clears to get one belong to `gnitz-zset`, beside the kernels that
 //! read them.
 
+use super::routing::{node_dist, pk_prefix_routed, Dist};
 use super::*;
 use crate::query::vm::{ClampHistory, HistoryTerm, Op, ProgramBuilder};
 use gnitz_zset::algebra::null_extend_output_schema;
@@ -33,6 +34,9 @@ pub(super) struct EmitCtx<'a> {
     pub(super) sources: Vec<(u64, Scan)>,
     /// The view, whose store is the integral of its output node's register.
     view: u64,
+    /// Where the rows of every node emitted so far sit across the workers, by
+    /// node id, whatever the worker count.
+    pub(super) dists: Vec<Dist>,
 }
 
 /// One scanned source: the register its delta seeds, the register its scans read — the
@@ -78,10 +82,13 @@ impl<'a> EmitCtx<'a> {
             integrals: vec![None; nodes],
             sources: Vec::new(),
             view,
+            dists: Vec::with_capacity(nodes),
         };
         for (nid, op) in circuit.ops() {
             let reg = emit_node(&mut ctx, nid, op)?;
             ctx.regs.push(reg);
+            let dist = node_dist(circuit, nid, meta, &ctx.dists, |n| ctx.prog.schema_of(ctx.regs[n]))?;
+            ctx.dists.push(dist);
         }
         Ok(ctx)
     }
@@ -105,7 +112,7 @@ impl<'a> EmitCtx<'a> {
         if self.meta.self_contained || self.moves_nothing(input, &scatter) {
             return reg;
         }
-        match self.meta.held_whole(input) {
+        match self.held_whole(input) {
             true => self.share(reg, Rc::new(scatter)),
             false => self.prog.round(reg, Rc::new(scatter)),
         }
@@ -115,7 +122,12 @@ impl<'a> EmitCtx<'a> {
     /// worker aggregate its slice ahead of the exchange. A worker holding the
     /// whole input has nothing to pre-aggregate.
     fn pre_aggregates(&self, nid: NodeId, group: &[u32]) -> bool {
-        group.is_empty() && self.circuit.op(nid).exchanges() && !self.meta.held_whole(self.circuit.inputs(nid)[0])
+        group.is_empty() && self.circuit.op(nid).exchanges() && !self.held_whole(self.circuit.inputs(nid)[0])
+    }
+
+    /// Every worker computes the same rows into `nid`.
+    fn held_whole(&self, nid: NodeId) -> bool {
+        self.meta.self_contained || self.dists[nid] == Dist::Whole
     }
 
     /// The source whose scans read `reg`, and its scan.
@@ -134,12 +146,13 @@ impl<'a> EmitCtx<'a> {
     }
 
     /// True when an exchange of `input`'s rows by `scatter` moves nothing: the
-    /// plan hashes the bytes the scan behind `input` placed its rows by.
+    /// plan hashes the leading PK bytes `input`'s rows already sit by.
     fn moves_nothing(&self, input: NodeId, scatter: &ScatterPlan) -> bool {
-        scanned_row_locally(self.circuit, input)
-            // A relayed delta no longer sits where its source's store places it.
-            .filter(|&tid| self.meta.source_route(tid).is_none())
-            .is_some_and(|tid| scatter.routes_to_native_owner(self.meta.source(tid).placement()))
+        let Dist::On(slots) = &self.dists[input] else {
+            return false;
+        };
+        let schema = self.prog.schema_of(self.regs[input]);
+        pk_prefix_routed(&schema, slots).is_some_and(|k| scatter.routes_to_native_owner(Placement::keyed(&schema, k)))
     }
 
     /// The base table whose store is already the integral of `of`, the register

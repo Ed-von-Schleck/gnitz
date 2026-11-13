@@ -67,12 +67,9 @@ pub(crate) struct CatalogEngine {
     /// relation registrations.
     pub(in crate::catalog) caches: CatalogCacheSet,
 
-    /// The next catalog object id (schema, relation or index) `allocate_ids`
-    /// hands out. Boot raises it past every stored id; the precheck admits no
-    /// create at or above it.
-    pub(in crate::catalog) next_id: u64,
-    /// `next_id` as this boot's catalog replay left it: every id below it was
-    /// handed out by an earlier boot, whose connections are gone.
+    /// [`next_catalog_id`](Self::next_catalog_id) as this boot's catalog
+    /// replay left it: every id below it was handed out by an earlier boot,
+    /// whose connections are gone.
     pub(in crate::catalog) id_floor: u64,
     /// The ids a bundle this process committed created. With `id_floor` they
     /// make a catalog object id single-use: the precheck admits a create under

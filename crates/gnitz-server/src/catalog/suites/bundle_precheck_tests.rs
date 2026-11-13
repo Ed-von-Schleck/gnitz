@@ -8,7 +8,7 @@ use crate::test_support::u64_i64_cols;
 /// stores one, not read as some other name.
 #[test]
 fn a_name_that_is_not_utf8_is_refused() {
-    let mut engine = fresh("bundle_non_utf8_names");
+    let (_dir, mut engine) = empty_catalog(1);
     let id = engine.allocate_ids(1).unwrap();
     for family in [SysFamily::Schema, SysFamily::Table, SysFamily::View, SysFamily::Index] {
         let schema = family.schema();
@@ -27,7 +27,7 @@ fn a_name_that_is_not_utf8_is_refused() {
         let err = engine.precheck_family(family, &bb.finish()).unwrap_err();
         assert!(err.contains("name is not UTF-8"), "{}: {err}", family.name());
     }
-    finish(engine);
+    engine.close();
 }
 
 /// Nothing synthesizes a schema name, so it takes the full identifier rule,
@@ -36,7 +36,7 @@ fn a_name_that_is_not_utf8_is_refused() {
 /// it claim a name a live schema holds.
 #[test]
 fn a_schema_row_takes_the_full_identifier_rule_once_per_name() {
-    let mut engine = fresh("bundle_schema_names");
+    let (_dir, mut engine) = empty_catalog(1);
     let (a, b) = (engine.allocate_ids(1).unwrap(), engine.allocate_ids(1).unwrap());
 
     for (name, why) in [("_x", "cannot start with '_'"), ("MixedCase", "not canonical")] {
@@ -58,28 +58,28 @@ fn a_schema_row_takes_the_full_identifier_rule_once_per_name() {
         .precheck_family(SysFamily::Schema, &schema_tab_batch(&[(a, "twice", 1)]))
         .expect("one row under the name is legal");
 
-    finish(engine);
+    engine.close();
 }
 
 /// An IDX_TAB `+1` whose name is not in canonical form is refused.
 #[test]
 fn an_index_row_name_must_be_canonical() {
     let cols = vec![col_def("id", TypeCode::U64), col_def("b", TypeCode::I64)];
-    let (mut engine, tid) = table_engine("catalog", "bundle_index_names", 1, &cols);
+    let (_dir, mut engine, tid) = table_engine(1, &cols);
     let id = engine.allocate_ids(1).unwrap();
 
     let mixed = idx_tab_batch(id, tid, &[1], "MixedCase", false, 1);
     let err = engine.precheck_family(SysFamily::Index, &mixed).unwrap_err();
     assert!(err.contains("not canonical"), "{err}");
 
-    finish(engine);
+    engine.close();
 }
 
 /// An IDX_TAB `+1` whose column list names a column twice is refused: its store
 /// directory would carry a name the directory grammar does not parse.
 #[test]
 fn an_index_row_repeating_a_column_is_refused() {
-    let (mut engine, tid) = table_engine("catalog", "bundle_index_repeated_col", 1, &u64_i64_cols());
+    let (_dir, mut engine, tid) = table_engine(1, &u64_i64_cols());
     let index_id = engine.allocate_ids(1).unwrap();
 
     let row = gnitz_wire::IdxTabRow {
@@ -94,14 +94,14 @@ fn an_index_row_repeating_a_column_is_refused() {
     let err = engine.precheck_family(SysFamily::Index, &batch).unwrap_err();
     assert!(err.contains("names column 1 twice"), "{err}");
 
-    finish(engine);
+    engine.close();
 }
 
 /// A VIEW_TAB `+1`'s `owner_view_id` must name a user view its own bundle
 /// creates, and its name must be canonical.
 #[test]
 fn a_view_row_names_a_real_owner_and_a_canonical_name() {
-    let mut engine = fresh("bundle_view_rows");
+    let (_dir, mut engine) = empty_catalog(1);
     let table = engine.create_table("public.t", &u64_i64_cols(), &[0]).unwrap();
     let existing = register_identity_view(&mut engine, table, "existing", &u64_i64_cols());
     let vid = engine.allocate_ids(3).unwrap();
@@ -165,14 +165,14 @@ fn a_view_row_names_a_real_owner_and_a_canonical_name() {
             .unwrap_or_else(|e| panic!("{rows:?}: {e}"));
     }
 
-    finish(engine);
+    engine.close();
 }
 
 /// A column record on an owner nothing registers is unretractable: the only
 /// COL_TAB retractor is the owner's own drop cascade.
 #[test]
 fn a_column_block_needs_an_owner_its_bundle_creates_or_the_catalog_holds() {
-    let mut engine = fresh("bundle_column_owner");
+    let (_dir, mut engine) = empty_catalog(1);
     let tid = engine.allocate_ids(1).unwrap();
     let columns = || (SysFamily::Column, col_tab_batch(tid, &u64_i64_cols(), 1));
 
@@ -184,7 +184,7 @@ fn a_column_block_needs_an_owner_its_bundle_creates_or_the_catalog_holds() {
     let table = (SysFamily::Table, table_tab_batch(&[(tid, "t", 1)]));
     apply_ddl(&mut engine, [columns(), table]).unwrap();
 
-    finish(engine);
+    engine.close();
 }
 
 /// A circuit `+1` under a view its bundle does not create would inject nodes
@@ -192,7 +192,7 @@ fn a_column_block_needs_an_owner_its_bundle_creates_or_the_catalog_holds() {
 /// pair on VIEW_TAB creates nothing.
 #[test]
 fn a_circuit_block_names_only_views_its_bundle_creates() {
-    let mut engine = fresh("bundle_circuit_owner");
+    let (_dir, mut engine) = empty_catalog(1);
     engine.allocate_ids(16).unwrap();
     let views = |rows: &[(i64, u64)]| {
         let mut circuits = crate::test_support::circuit_batch(30, &negate_chain(16, 2));
@@ -211,7 +211,7 @@ fn a_circuit_block_names_only_views_its_bundle_creates() {
     // Descending, so the rule cannot lean on the block's row order.
     views(&[(1, 30), (1, 20)]).unwrap();
 
-    finish(engine);
+    engine.close();
 }
 
 // ── `apply_bundle` ──────────────────────────────────────────────────────────
@@ -220,7 +220,7 @@ fn a_circuit_block_names_only_views_its_bundle_creates() {
 /// the column records are applied before the row whose hook reads them.
 #[test]
 fn a_creating_bundle_registers_its_table() {
-    let mut engine = fresh("bundle_apply_create");
+    let (_dir, mut engine) = empty_catalog(1);
     let tid = engine.allocate_ids(1).unwrap();
 
     apply_ddl(
@@ -234,14 +234,14 @@ fn a_creating_bundle_registers_its_table() {
     assert_eq!(engine.get_by_name("public", "t"), Some(tid));
     assert!(engine.registry.relation(tid).is_some());
 
-    finish(engine);
+    engine.close();
 }
 
 /// A bundle that only drops retires a dependent first: the view before the table
 /// it reads, the schema after its last member.
 #[test]
 fn an_all_drop_bundle_drops_a_schema_with_its_members() {
-    let mut engine = fresh("bundle_apply_drop_schema");
+    let (_dir, mut engine) = empty_catalog(1);
     engine.create_schema("s").unwrap();
     let sid = engine.schema_id("s").unwrap();
     let tid = engine.create_table("s.t", &u64_i64_cols(), &[0]).unwrap();
@@ -258,7 +258,7 @@ fn an_all_drop_bundle_drops_a_schema_with_its_members() {
     assert!(engine.registry.relation(tid).is_none() && engine.registry.relation(vid).is_none());
     assert!(engine.dag.dependents_of(tid).is_empty());
 
-    finish(engine);
+    engine.close();
 }
 
 /// Three bundles refused after rows of theirs applied — a view whose circuit does
@@ -266,7 +266,7 @@ fn an_all_drop_bundle_drops_a_schema_with_its_members() {
 /// own bundle drops — each leave the catalog they found.
 #[test]
 fn a_refused_view_bundle_leaves_the_prior_catalog() {
-    let mut engine = fresh("bundle_apply_refused_view");
+    let (_dir, mut engine) = empty_catalog(1);
     let base = engine.create_table("public.base", &u64_i64_cols(), &[0]).unwrap();
     let before = sys_row_counts(&engine);
     let view_bundle = |vid: u64, circuit: gnitz_wire::Circuit, cols: &[CatalogColumn]| {
@@ -316,5 +316,5 @@ fn a_refused_view_bundle_leaves_the_prior_catalog() {
         assert!(engine.dag.dependents_of(base).is_empty(), "{want}");
     }
 
-    finish(engine);
+    engine.close();
 }

@@ -42,7 +42,7 @@ fn filtered_view_blocks(vid: u64, base_tid: u64, pred: &[u8], views: Batch) -> [
 /// nothing depending on the source.
 #[test]
 fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
-    let mut engine = fresh("view_compile_unusable_circuit");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = u64_i64_cols();
     let base = engine.create_table("public.base", &cols, &[0]).unwrap();
     let other = engine.create_table("public.other", &cols, &[0]).unwrap();
@@ -78,14 +78,14 @@ fn a_view_bundle_with_an_unusable_circuit_is_refused_and_undone() {
         assert_eq!(sys_row_counts(&engine), before, "{want}");
     }
 
-    finish(engine);
+    engine.close();
 }
 
 /// A capacity-bounded view is a leaf even to a view its own bundle creates, and the
 /// refused bundle leaves neither view an edge.
 #[test]
 fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
-    let mut engine = fresh("view_compile_bounded_in_bundle");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = u64_i64_cols();
     let base = engine.create_table("public.base", &cols, &[0]).unwrap();
     let bounded = engine.allocate_ids(1).unwrap();
@@ -117,7 +117,7 @@ fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
     }
     assert!(engine.registry.relation(bounded).is_none() && engine.registry.relation(over).is_none());
 
-    finish(engine);
+    engine.close();
 }
 
 // ── The one-bundle replacement ──────────────────────────────────────────────
@@ -130,7 +130,7 @@ fn a_bundle_may_not_create_a_view_over_its_own_bounded_view() {
 /// collision; one it does not retire still is.
 #[test]
 fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
-    let mut engine = fresh("view_compile_qname");
+    let (_dir, mut engine) = empty_catalog(1);
     let base_cols = u64_i64_cols();
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 100)]).to_blob_bytes();
@@ -158,14 +158,14 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
         .precheck_family(SysFamily::View, &replace)
         .expect("a bundle that retires the incumbent may reuse its name");
 
-    finish(engine);
+    engine.close();
 }
 
 /// One VIEW_TAB batch registers the replacement and retires the incumbent; its
 /// rollback must restore the incumbent and retire the replacement.
 #[test]
 fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
-    let mut engine = fresh("view_compile_rollback");
+    let (_dir, mut engine) = empty_catalog(1);
     let base_cols = u64_i64_cols();
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let pred = cmp_all(&[(gnitz_expr::CmpOp::Lt, 1, 100)]).to_blob_bytes();
@@ -208,7 +208,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
         "the sweep must reclaim the replacement's directory: {new_dir}"
     );
 
-    finish(engine);
+    engine.close();
 }
 
 /// `a EXCEPT ALL b` over leaves keyed by their own PK equals its definition,
@@ -216,7 +216,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
 #[test]
 fn a_clamp_over_its_sources_stores_holds_its_definition_through_ticks() {
     use std::collections::BTreeMap;
-    let mut engine = fresh("clamp_over_source_stores");
+    let (_dir, mut engine) = empty_catalog(1);
     let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let [a, b] = ["public.a", "public.b"].map(|name| engine.create_table(name, &cols, &[0]).unwrap());
     // `b` agrees with `a` on ids 5..10 but 7.
@@ -286,5 +286,5 @@ fn a_clamp_over_its_sources_stores_holds_its_definition_through_ticks() {
         push_and_tick(&mut engine, tid, batch);
         check(&mut engine, &held, &format!("side {side} id {id} {write:?}"));
     }
-    finish(engine);
+    engine.close();
 }

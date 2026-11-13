@@ -19,7 +19,6 @@ mod committer;
 mod ddl;
 mod delta;
 mod family;
-mod peer;
 mod read;
 mod snapshot;
 mod tick;
@@ -32,9 +31,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use self::committer::{CommitRequests, Committer};
-use self::ddl::{handle_ddl_txn, reserve_serial_range};
+use self::ddl::{allocate_ids, handle_ddl_txn, reserve_serial_range};
 use self::delta::{handle_delta_poll, Feeds, Subscriptions};
-use self::peer::Peer;
 use self::snapshot::HeldSnapshots;
 use self::tick::{TickRequests, Ticks};
 use self::write::{handle_push, handle_push_txn, Writes};
@@ -42,7 +40,7 @@ use crate::catalog::CatalogEngine;
 use crate::runtime::frame::WireMsg;
 use crate::runtime::listen::ClientListener;
 use crate::runtime::master::MasterDispatcher;
-use crate::runtime::reactor::{RecvBuf, SendBody, Train};
+use crate::runtime::reactor::{Peer, RecvBuf, SendBody, Train};
 use crate::runtime::signals;
 use crate::runtime::sync::{chan, oneshot, select2, AsyncRwLock, Either, WriteGuard};
 use crate::runtime::tls::{Served, TlsListener};
@@ -107,7 +105,7 @@ impl Shared {
     ) {
         let boot_seed = dispatcher.sal().watermark();
         let (committer, committer_rx) = Committer::new();
-        let (ticks, tick_rx) = Ticks::new(boot_seed);
+        let (ticks, tick_rx) = Ticks::new();
         let (feeds, asks) = Feeds::new();
         let shared = Rc::new(Shared {
             dispatcher,
@@ -137,7 +135,6 @@ impl Shared {
     /// or awaits the lock being removed.
     fn forget_relation(&self, _catalog_write: &WriteGuard<CatalogLock>, id: u64) {
         self.writes.forget(id);
-        self.ticks.forget(id);
         self.dispatcher.forget_relation(id);
     }
 }
@@ -155,7 +152,7 @@ pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<Strin
     ));
     let (shared, committer_rx, tick_rx, asks) = Shared::new(dispatcher, hello_timeout, backup_dir);
 
-    signals::catch_shutdown();
+    let signals = signals::Signals::open();
     // Past the last env knob the boot reads, so one it refuses stops the
     // server before it reports ready.
     gnitz_note!("{}", gnitz_foundation::log::READY_LINE);
@@ -170,7 +167,7 @@ pub(super) async fn serve(dispatcher: MasterDispatcher, backup_dir: Option<Strin
     reactor.spawn(tick::tick_loop(Rc::clone(&shared), tick_rx));
     reactor.spawn(delta::pump(Rc::clone(&shared), asks));
 
-    serve_until_signalled(&shared, tls.as_deref()).await
+    serve_until_signalled(&shared, tls.as_deref(), signals).await
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +182,7 @@ async fn accept_loop(shared: Rc<Shared>, listener: ClientListener) {
     loop {
         let accepted = reactor.accept(fd.as_fd()).await;
         let served = tls.as_ref().map(|t| t.current());
-        let peer = Peer::new(&reactor, accepted, served.as_ref().map(|s| s.session()));
+        let peer = reactor.connect(accepted, served.as_ref().map(|s| s.session()));
         reactor.spawn(connection_loop(peer, Rc::clone(&shared), served));
     }
 }
@@ -273,7 +270,7 @@ async fn handshake(peer: &mut Peer, served: Option<Rc<Served>>) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Signal loop: TLS reload, SAL reclaim and the final checkpoint
+// Signal loop: TLS reload and the final checkpoint
 // ---------------------------------------------------------------------------
 
 fn reload_tls(tls: Option<&TlsListener>) {
@@ -287,32 +284,19 @@ fn reload_tls(tls: Option<&TlsListener>) {
     }
 }
 
-/// How often the signal loop checks for a signal and for a SAL that wants a
-/// checkpoint.
-const SIGNAL_POLL: Duration = Duration::from_millis(100);
-
-/// Until SIGTERM/SIGINT: poke the committer whenever the SAL wants a checkpoint.
-/// Then close the committer, which runs one final checkpoint behind every write
-/// it admitted.
-async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>) {
+/// Until SIGTERM/SIGINT, read off `signals`: reload the TLS listener on each
+/// SIGHUP. Then close the committer, which runs one final checkpoint behind
+/// every write it admitted.
+async fn serve_until_signalled(shared: &Shared, tls: Option<&TlsListener>, mut signals: signals::Signals) {
     loop {
-        shared.dispatcher.reactor().sleep(SIGNAL_POLL).await;
-
-        if signals::take_reload() {
-            reload_tls(tls);
-        }
-
-        if signals::shutdown_requested() {
-            gnitz_info!("shutdown signal received; draining, checkpointing, and stopping");
-            // The final checkpoint ticks every push no tick has taken yet.
-            shared.committer.close().await;
-            return;
-        }
-
-        // A workload with no writes sends the committer nothing, yet its reads
-        // still write SAL groups.
-        if shared.dispatcher.sal().needs_checkpoint() {
-            shared.committer.reclaim();
+        match signals.next(shared.dispatcher.reactor()).await {
+            libc::SIGHUP => reload_tls(tls),
+            _ => {
+                gnitz_info!("shutdown signal received; draining, checkpointing, and stopping");
+                // The final checkpoint ticks every push no tick has taken yet.
+                shared.committer.close().await;
+                return;
+            }
         }
     }
 }
@@ -372,10 +356,7 @@ async fn dispatch_request(
         ClientVerb::AllocSerialRange => reserve_serial_range(shared, ctrl.hdr.target(), ctrl.hdr.arg0).await?,
 
         // An id allocation names no relation, so `target_id` is only echoed.
-        ClientVerb::AllocIds => shared
-            .cat_mut()
-            .allocate_ids(ctrl.hdr.arg0)
-            .map_err(|e| format!("id allocation failed: {e}"))?,
+        ClientVerb::AllocIds => allocate_ids(shared, ctrl.hdr.arg0).await?,
 
         ClientVerb::Resolve => return read::handle_resolve(shared, peer, &data[ctrl.blob.clone()]).await,
 

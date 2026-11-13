@@ -4,10 +4,9 @@
 use std::cell::Cell;
 use std::fs::File;
 use std::os::fd::AsFd;
-use std::task::{Poll, Waker};
 
 use crate::runtime::reactor::Reactor;
-use crate::runtime::sync::Level;
+use crate::runtime::sync::{Level, Parked};
 
 /// How far a log is durable, and who waits on it. LSNs are its owner's: it
 /// orders them and knows nothing else of them.
@@ -20,7 +19,7 @@ pub(super) struct Durable {
     /// The LSN the fdatasync in flight makes durable; `0` while none is.
     syncing: Cell<u64>,
     /// [`Self::run`], parked until a waiter wants more than is durable.
-    driver: Cell<Option<Waker>>,
+    driver: Parked,
 }
 
 impl Durable {
@@ -29,9 +28,7 @@ impl Durable {
     pub(super) fn want(&self, lsn: u64) {
         if lsn > self.wanted.get() {
             self.wanted.set(lsn);
-            if let Some(driver) = self.driver.take() {
-                driver.wake();
-            }
+            self.driver.wake();
         }
     }
 
@@ -64,14 +61,7 @@ impl Durable {
     /// share the next. Never returns.
     pub(super) async fn run(&self, reactor: &Reactor, file: &'static File, published: impl Fn() -> u64) {
         loop {
-            std::future::poll_fn(|cx| {
-                if self.wanted.get() > self.through.get() {
-                    return Poll::Ready(());
-                }
-                self.driver.set(Some(cx.waker().clone()));
-                Poll::Pending
-            })
-            .await;
+            self.driver.until(|| self.wanted.get() > self.through.get()).await;
             let target = published();
             self.syncing.set(target);
             let rc = reactor.fsync(file.as_fd()).await;

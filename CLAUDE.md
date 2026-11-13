@@ -558,9 +558,10 @@ table. A view may scan one, and is then maintained from catalog deltas as it is
 from a table's: **a DDL's catalog rows have reached every view that scans them
 before the DDL is acknowledged.**
 
-`_system` holds nothing else, and no client write reaches a family but a DDL.
-`sequences` is read but never scanned: it holds the master's positions, not a
-set, moves with every SERIAL reservation and checkpoint, and reaches no worker.
+`_system` holds nothing else, and no client write reaches a family but a DDL,
+an id allocation or a SERIAL reservation. `sequences` is read but never
+scanned: it holds the master's positions, not a set, moves with every id
+allocation, SERIAL reservation and checkpoint, and reaches no worker.
 
 A view reaching a family is rebuilt at every boot, as one reaching a stream is:
 the catalog's tail is applied before any view exists, so no checkpoint keeps

@@ -3,6 +3,7 @@
 //! by killing it; a worker that stops by itself — a failed boot, a fail-stop —
 //! is what [`Workers::death`] reports.
 
+use std::fmt;
 use std::future::{poll_fn, Future};
 use std::num::NonZero;
 use std::task::Poll;
@@ -15,14 +16,72 @@ use gnitz_foundation::posix_io::retry_eintr;
 /// worker for as long as it is held.
 pub(crate) struct Workers(Vec<NonZero<libc::pid_t>>);
 
+/// How a worker ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerEnd {
+    /// It exited with this status.
+    Exited(i32),
+    /// This signal killed it.
+    Killed(i32),
+    /// This signal killed it and dumped its core.
+    Dumped(i32),
+}
+
+impl WorkerEnd {
+    /// How the waited-for child `info` names ended.
+    fn of(info: &libc::siginfo_t) -> Self {
+        // SAFETY: `info` was filled by a `waitid` on an exited child, whose
+        // siginfo carries `si_status`.
+        let status = unsafe { info.si_status() };
+        match info.si_code {
+            libc::CLD_KILLED => WorkerEnd::Killed(status),
+            libc::CLD_DUMPED => WorkerEnd::Dumped(status),
+            _ => WorkerEnd::Exited(status),
+        }
+    }
+}
+
+/// `sig` by number, and by name when it is one a worker dies of.
+struct Signal(i32);
+
+impl fmt::Display for Signal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self.0 {
+            libc::SIGKILL => "SIGKILL",
+            libc::SIGABRT => "SIGABRT",
+            libc::SIGSEGV => "SIGSEGV",
+            libc::SIGBUS => "SIGBUS",
+            libc::SIGILL => "SIGILL",
+            libc::SIGFPE => "SIGFPE",
+            sig => return write!(f, "signal {sig}"),
+        };
+        write!(f, "signal {} ({name})", self.0)
+    }
+}
+
+impl fmt::Display for WorkerEnd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            WorkerEnd::Exited(code) => write!(f, "exited with status {code}"),
+            WorkerEnd::Killed(sig) => write!(f, "was killed by {}", Signal(sig)),
+            WorkerEnd::Dumped(sig) => write!(f, "dumped core on {}", Signal(sig)),
+        }
+    }
+}
+
 impl Workers {
     pub(crate) fn new(pids: Vec<NonZero<libc::pid_t>>) -> Self {
         Workers(pids)
     }
 
-    /// Resolves with the rank of the first worker to exit, which it leaves
-    /// unreaped.
-    pub(crate) async fn death(&self, reactor: &Reactor) -> usize {
+    /// Take `pid` as the next rank's worker.
+    pub(crate) fn push(&mut self, pid: NonZero<libc::pid_t>) {
+        self.0.push(pid);
+    }
+
+    /// Resolves with the rank of the first worker to exit and how it ended,
+    /// leaving it unreaped.
+    pub(crate) async fn death(&self, reactor: &Reactor) -> (usize, WorkerEnd) {
         let mut exits: Vec<_> = self
             .0
             .iter()
@@ -37,11 +96,11 @@ impl Workers {
                 .map_or(Poll::Pending, Poll::Ready)
         })
         .await;
-        if res != 0 {
+        match res {
+            Ok(info) => (w, WorkerEnd::of(&info)),
             // No wait on a child of this process fails but by a bug.
-            gnitz_fatal_abort!("waitid on worker {w}: {}", std::io::Error::from_raw_os_error(-res));
+            Err(e) => gnitz_fatal_abort!("waitid on worker {w}: {}", std::io::Error::from_raw_os_error(-e)),
         }
-        w
     }
 }
 
