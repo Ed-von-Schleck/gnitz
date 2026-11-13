@@ -116,9 +116,12 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
                 flush_barrier([&mut pt], 0).unwrap();
             }
             for &(i, net, payload) in live {
-                let (w, row) = pt.live_row_at(&k[i]);
+                let row = pt.unique_live_row_at(&k[i]);
                 assert_eq!(
-                    (w, row.as_ref().map(|r| r.source()).map(|(src, i)| payload0_i64(src, i))),
+                    (
+                        pt.net_weight_at(&k[i]),
+                        row.as_ref().map(|r| r.source()).map(|(src, i)| payload0_i64(src, i))
+                    ),
                     (net, payload),
                     "{what}: key {i}"
                 );

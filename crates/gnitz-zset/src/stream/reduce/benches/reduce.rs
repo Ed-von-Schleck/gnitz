@@ -1,9 +1,12 @@
+use std::rc::Rc;
+
 use super::tests::Harness;
-use super::ReducePlan;
-use crate::repr::{Batch, BatchBuilder};
-use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{mix, pk_payload_schema, u64_pk_schema};
+use super::{op_reduce, ReducePlan};
+use crate::repr::{from_runs_in_band, Batch, BatchBuilder, MappedShard, Run};
+use crate::schema::{group_band, SchemaColumn, SchemaDescriptor};
+use crate::test_support::{assert_folds, map_shard, mix, pk_payload_schema, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
+use gnitz_wire::PkBuf;
 use gnitz_wire::{AggDescriptor, AggFunc, TypeCode};
 
 /// The reduce of `aggs` over `schema`'s last column, with the COUNT(*) a
@@ -256,9 +259,15 @@ fn op_reduce_bench() {
     });
 }
 
-/// Instructions per delta row of `op_reduce` over a three-run output trace whose
-/// two older runs lie wholly below the delta's first group: the delta touches
-/// every group of the newest run and adds a new group between each pair.
+/// Instructions per delta row of `op_reduce` over a multi-run output trace,
+/// with a new group between each pair the delta touches.
+///
+/// The heap arm: three in-memory runs, unmarked, whose two older runs lie
+/// wholly below the delta's first group; the delta touches every group of the
+/// newest run. The shard arm: the same three runs and a fourth updating every
+/// group of the third, each written as a shard and listed newest first in a
+/// marked cursor, so the two newest shards both hold each group the delta
+/// touches.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn op_reduce_multi_run_bench() {
@@ -277,14 +286,45 @@ fn op_reduce_multi_run_bench() {
         b
     };
     let mut h = Harness::new(plan(&schema, &[0], &[AggFunc::Sum], false));
+    let third = rows(&mut (2 * G..4 * G).step_by(2));
     epoch(&counter, &mut h, &rows(&mut (0..2 * G).step_by(2)));
     epoch(&counter, &mut h, &rows(&mut (1..2 * G).step_by(2)));
-    epoch(&counter, &mut h, &rows(&mut (2 * G..4 * G).step_by(2)));
+    epoch(&counter, &mut h, &third);
     let delta = rows(&mut (2 * G..4 * G));
     // The first pass takes the pool's first allocations.
     let [_, (out, instructions)] = [(); 2].map(|()| counter.measure(|| h.reduce(&delta)));
     println!(
-        "op_reduce_multi_run_bench {:.1} instr/row (out {})",
+        "op_reduce_multi_run_bench heap  {:.1} instr/row (out {})",
+        instructions as f64 / delta.len() as f64,
+        out.len()
+    );
+
+    // A fourth tick retracts and rewrites every group of the third.
+    epoch(&counter, &mut h, &third);
+    let expected = h.reduce(&delta);
+    let runs = h.out_trace.runs();
+    assert_eq!(
+        (runs[2].len(), runs[3].len()),
+        (G as usize, 2 * G as usize),
+        "the two newest runs both hold every group of the third tick"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let out_schema = *runs[0].schema();
+    let shards: Vec<Rc<MappedShard>> = (runs.iter().enumerate().rev())
+        .map(|(i, run)| map_shard(&dir.path().join(format!("{i}.db")), run))
+        .collect();
+    let mut open = |first: &[u8], last: &[u8]| {
+        let (start, end) = group_band(first, last, out_schema.pk_stride()).unwrap();
+        let runs = shards.iter().cloned().map(Run::Shard);
+        let mut cursor = from_runs_in_band(runs, out_schema, start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes));
+        cursor.mark_newest_first();
+        cursor
+    };
+    let mut plan = plan(&schema, &[0], &[AggFunc::Sum], false);
+    let [_, (out, instructions)] = [(); 2].map(|()| counter.measure(|| op_reduce(&delta, &mut open, None, &mut plan)));
+    assert_folds(&[expected], &out, "the shard arm against the heap trace");
+    println!(
+        "op_reduce_multi_run_bench shard {:.1} instr/row (out {})",
         instructions as f64 / delta.len() as f64,
         out.len()
     );

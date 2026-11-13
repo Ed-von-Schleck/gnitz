@@ -16,7 +16,7 @@ use crate::repr::batch::Batch;
 use crate::repr::scatter::{mem_batch_to_unified, ColTable, ColumnarSource, DecodedColumns, UnifiedSource};
 use crate::repr::seek::ColPtr;
 use crate::repr::shard::MappedShard;
-use crate::schema::{Generic, PayloadOrder, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use gnitz_wire::{Heap, RowSource};
 
 #[derive(Clone)]
@@ -59,11 +59,6 @@ impl StoredRow {
         StoredRow { run, row }
     }
 
-    #[inline]
-    fn weight(&self) -> i64 {
-        self.run.get_weight(self.row)
-    }
-
     /// The row this points at, as the `(source, index)` pair every row reader
     /// and every comparator takes. An `impl Trait` return, so which run kind
     /// backs it stays this crate's business.
@@ -71,21 +66,6 @@ impl StoredRow {
     pub fn source(&self) -> (&impl RowSource, usize) {
         (&self.run, self.row)
     }
-}
-
-/// Index of the first candidate in `pool` whose payload group nets strictly
-/// positive.
-pub fn first_live_payload_group(schema: &SchemaDescriptor, pool: &[StoredRow]) -> Option<usize> {
-    (0..pool.len()).find(|&i| {
-        let (run, row) = (&pool[i].run, pool[i].row);
-        let others: i64 = pool
-            .iter()
-            .enumerate()
-            .filter(|&(j, c)| j != i && Generic.compare(schema, run, row, &c.run, c.row).is_eq())
-            .map(|(_, c)| c.weight())
-            .sum();
-        pool[i].weight() + others > 0
-    })
 }
 
 /// `#[inline(always)]` on every forwarder, as [`RowSource`] asks of its

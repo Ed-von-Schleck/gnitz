@@ -65,16 +65,7 @@ fn assert_serves(t: &Table, live: &HashMap<RowKey, i64>, sealed: &HashMap<RowKey
 
     for k in keys {
         let sum: i64 = live.iter().filter(|(e, _)| &e.0 == k).map(|(_, w)| w).sum();
-        assert_eq!(t.has_pk_bytes(k), sum > 0, "has_pk {k:?}");
-        let (w, row) = t.live_row_at(k);
-        assert_eq!((w, row.is_some()), (sum, sum > 0), "live_row_at {k:?}");
-        if let Some(r) = row {
-            let (src, i) = r.source();
-            assert!(
-                want.get(&row_key(src, &s, i)).is_some_and(|&w| w > 0),
-                "the found row is live"
-            );
-        }
+        assert_eq!(t.net_weight_at(k), sum, "net_weight_at {k:?}");
     }
 
     for (cut, want) in [(Cut::Now, want.clone()), (Cut::Sealed, sealed.clone())] {

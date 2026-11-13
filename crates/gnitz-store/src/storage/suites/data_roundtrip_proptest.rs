@@ -93,7 +93,7 @@ const WAVES: usize = L0_COMPACT_THRESHOLD + 1;
 
 proptest! {
     /// Ingested in waves, each flushed (durable) or folded into the RAM tier
-    /// (ephemeral): `has_pk_bytes` finds exactly the rows ingested so far and
+    /// (ephemeral): `net_weight_at` finds exactly the rows ingested so far and
     /// never an absent prefix twin the PK filter may pass; both read paths
     /// serve the multiset, a durable store's past the L0 compaction its waves
     /// owe; and a negated ingest of half the rows leaves the other half.
@@ -115,8 +115,8 @@ proptest! {
         absent.push(rows as u128);
         let absent = test_support::opk_pk(&schema, &absent);
         let finds = |table: &Table, live: std::ops::Range<usize>| {
-            !table.has_pk_bytes(&absent)
-                && (0..rows).all(|i| table.has_pk_bytes(original.get_pk_bytes(i)) == live.contains(&i))
+            table.net_weight_at(&absent) == 0
+                && (0..rows).all(|i| (table.net_weight_at(original.get_pk_bytes(i)) > 0) == live.contains(&i))
         };
 
         for k in 0..WAVES {
@@ -148,9 +148,7 @@ proptest! {
 
         let half = rows / 2;
         for i in 0..half {
-            let (w, found) = table.live_row_at(original.get_pk_bytes(i));
-            prop_assert_eq!(w, original.get_weight(i));
-            prop_assert!(found.is_some());
+            prop_assert_eq!(table.net_weight_at(original.get_pk_bytes(i)), original.get_weight(i));
         }
         table.ingest(Batch::from_ranges(&original, &[(0, half)], 0).negated()).unwrap();
         prop_assert!(finds(&table, half..rows));

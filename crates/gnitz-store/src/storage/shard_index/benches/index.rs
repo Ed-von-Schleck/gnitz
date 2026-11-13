@@ -67,7 +67,12 @@ fn shard_probe_bench() {
         // Label, the range at a held key, the fewest and the most shards it may select.
         type Range = (&'static str, fn(u64) -> (u64, u64), usize, usize);
         let ranges: [Range; 3] = [
-            ("one key", |k| (k, k), 1, l0 + GUARD_FILE_THRESHOLD + 1),
+            (
+                "one key",
+                |k| (k, k),
+                1,
+                l0 + GUARD_FILE_THRESHOLD.iter().sum::<usize>(),
+            ),
             ("a 1/1024 band", |k| (k, k + KEYSPACE / 1024), 1, idx.shard_count()),
             ("the key line", |_| (0, KEYSPACE), idx.shard_count(), idx.shard_count()),
         ];
@@ -255,7 +260,6 @@ fn compaction_amplification_bench() {
         // A cadence, the seq its last barrier published through and the bytes
         // spilled by then, the shards and the bytes its barriers synced.
         let mut barriers = BARRIERS.map(|every| (every, 0, 0, 0usize, 0u64));
-        cstats::reset();
         for n in 0..runs {
             let run = make_batch_raw(&schema, &rows(n, &mut rng)).into_consolidated();
             spill += counter.measure(|| idx.append_l0_run(&run).unwrap()).1;
@@ -275,7 +279,7 @@ fn compaction_amplification_bench() {
             }
         }
 
-        let phases = cstats::dump();
+        let phases = std::mem::take(&mut idx.stats);
         for kind in reaches {
             assert!(phases.contains_key(kind), "{label}: no {kind:?} ran");
         }

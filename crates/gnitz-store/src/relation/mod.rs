@@ -409,9 +409,14 @@ impl Relation {
         self.table().full_scan()
     }
 
-    /// The net weight at `key`, and the live row if there is one.
-    pub fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
-        self.table().live_row_at(key)
+    /// The live row at `key`, if there is one, of a base table or a system
+    /// family, whose every key nets 0 or 1.
+    pub fn unique_live_row_at(&self, key: &[u8]) -> Option<StoredRow> {
+        debug_assert!(matches!(
+            self.kind(),
+            RelationKind::BaseTable | RelationKind::SystemCatalog
+        ));
+        self.table().unique_live_row_at(key)
     }
 
     /// The checkpoint mark this process's store of the relation resumed from;

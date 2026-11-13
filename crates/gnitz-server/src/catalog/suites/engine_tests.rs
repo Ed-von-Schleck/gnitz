@@ -418,9 +418,12 @@ fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
     boot().close();
     let engine = boot();
     assert_eq!(engine.replay_floor(SysFamily::Schema), 500);
-    let (weight, _) = engine
-        .sys_relation(SysFamily::Schema)
-        .live_row_at(&gnitz_wire::sys_key(100));
+    let key = gnitz_wire::sys_key(100);
+    let scan = engine.sys_relation(SysFamily::Schema).full_scan();
+    let weight: i64 = (0..scan.len())
+        .filter(|&i| scan.get_pk_bytes(i) == key)
+        .map(|i| scan.get_weight(i))
+        .sum();
     assert_eq!(weight, 1, "the group at the flushed floor is staged once");
 
     discard(engine);

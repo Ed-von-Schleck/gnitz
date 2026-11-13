@@ -297,7 +297,9 @@ impl CatalogEngine {
     /// head or a persistent negative ghost.
     fn check_cas_and_net(&self, family: SysFamily, batch: &Batch, sig: &PkSignature) -> Result<(), String> {
         let noun = family.row_noun();
-        let (live_weight, live) = self.sys_relation(family).live_row_at(batch.get_pk_bytes(sig.row));
+        let live = self
+            .sys_relation(family)
+            .unique_live_row_at(batch.get_pk_bytes(sig.row));
         if let Some(nj) = sig.neg {
             let Some(sr) = live.as_ref() else {
                 return Err(format!(
@@ -312,7 +314,7 @@ impl CatalogEngine {
             }
         }
         // `check_batch_shape` admitted at most one row of each sign, each of weight ±1.
-        let net = live_weight + sig.pos.is_some() as i64 - sig.neg.is_some() as i64;
+        let net = i64::from(live.is_some()) + sig.pos.is_some() as i64 - sig.neg.is_some() as i64;
         if !(0..=1).contains(&net) {
             return Err(format!(
                 "system-catalog write would leave {} at net weight {net} (expected 0 or 1)",

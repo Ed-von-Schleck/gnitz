@@ -532,13 +532,13 @@ proptest! {
 
     /// Over a store of one row per PK — a reduce output's history, each tick
     /// retracting a group's row and writing its new one — a probe that reads a
-    /// PK off the newest heap run holding it lands where folding every run
-    /// does: on the PK's one live row.
+    /// PK off the newest run holding it, a heap run or a shard, lands where
+    /// folding every run does: on the PK's one live row.
     #[test]
-    fn newest_heap_run_decides_a_one_row_per_pk_probe(
+    fn newest_run_decides_a_one_row_per_pk_probe(
         ticks in prop::collection::vec(prop::collection::vec((0u128..10, prop::option::of(0i64..4)), 1..6), 1..24),
         cuts in prop::collection::vec(any::<prop::sample::Index>(), 0..8),
-        shards in 0usize..4,
+        shards in 0usize..10,
     ) {
         let s = make_schema_u128_i64();
         // Each tick's consolidated delta, and the state after the last.
@@ -576,19 +576,19 @@ proptest! {
                 make_batch_u128(&s, &sum.into_iter().map(|((pk, v), w)| (pk, w, v)).collect::<Vec<_>>())
             })
             .collect();
-        // The oldest stretches as shards, the rest as heap runs newest first.
+        // The oldest stretches as shards, the rest as heap runs, newest first.
         let dir = tempfile::tempdir().unwrap();
         let shards = shards.min(runs.len());
         let sources: Vec<Run> = runs[shards..]
             .iter()
             .rev()
             .map(|b| Run::Mem(Rc::new(b.clone())))
-            .chain(runs[..shards].iter().enumerate().filter(|(_, b)| !b.is_empty()).map(|(i, b)| {
+            .chain(runs[..shards].iter().enumerate().filter(|(_, b)| !b.is_empty()).rev().map(|(i, b)| {
                 Run::Shard(map_shard(&dir.path().join(format!("{i}.db")), b))
             }))
             .collect();
         let mut cursor = from_runs(sources.iter().cloned(), s);
-        cursor.mark_heap_newest_first();
+        cursor.mark_newest_first();
         let mut probe = cursor.group_probe(true);
         for pk in 0u128..11 {
             let found = probe.find(&pk.to_be_bytes()).map(|at| {

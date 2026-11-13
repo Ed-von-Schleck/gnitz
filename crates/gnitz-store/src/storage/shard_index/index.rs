@@ -11,7 +11,7 @@ use std::rc::Rc;
 use super::super::manifest::FlushWork;
 use super::super::Cut;
 use super::{
-    fold_destinations, CompactionKind, FLSMLevel, LevelGuard, ShardEntry, ShardIndex, CANCEL_PERCENT,
+    extent, fold_destinations, CompactionKind, FLSMLevel, LevelGuard, ShardEntry, ShardIndex, CANCEL_PERCENT,
     GUARD_FILE_THRESHOLD, L0_COMPACT_THRESHOLD, L1, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL, UPKEEP_LEVY,
 };
 use crate::storage::pk_ranges_overlap;
@@ -25,11 +25,31 @@ use gnitz_zset::repr::{Codebook, GuardMerge, MappedShard};
 /// One fold the tree owes: the shards it merges and where the merge goes.
 struct Fold {
     kind: CompactionKind,
-    /// The inputs, by seq, in merge order.
-    sources: Vec<u64>,
+    /// The inputs, in merge order.
+    shards: Vec<Rc<MappedShard>>,
+    /// The newest stamp over the inputs, which every output inherits.
+    newest: u64,
     dest: usize,
     /// The destination guards, sorted and distinct.
     keys: Vec<PkBuf>,
+}
+
+impl Fold {
+    /// The fold of `inputs`, in merge order, into the guards keyed `keys` at
+    /// level `dest`.
+    fn new<'a>(
+        kind: CompactionKind,
+        dest: usize,
+        keys: Vec<PkBuf>,
+        inputs: impl IntoIterator<Item = &'a ShardEntry>,
+    ) -> Self {
+        let (mut shards, mut newest) = (Vec::new(), 0);
+        for e in inputs {
+            shards.push(Rc::clone(&e.shard));
+            newest = newest.max(e.newest);
+        }
+        Fold { kind, shards, newest, dest, keys }
+    }
 }
 
 /// A fold under way: its inputs stay registered and read, its outputs are
@@ -38,8 +58,6 @@ struct Fold {
 pub(super) struct Running {
     fold: Fold,
     merge: GuardMerge,
-    /// Every output inherits the newest stamp over the inputs.
-    newest: u64,
     /// The outputs written so far, one per destination of `fold.keys`; `None`
     /// where every row cancelled.
     opened: Vec<Option<ShardEntry>>,
@@ -48,6 +66,11 @@ pub(super) struct Running {
 impl ShardIndex {
     /// Every shard `cut` reads whose PK extent meets the inclusive `bound`, the
     /// pending ones only at [`Cut::Now`]; `None` takes them all.
+    ///
+    /// Newest first: pending, L0, then each level's routed guards, each newest
+    /// first. Every fold keeps that order, as its outputs hold no row older
+    /// than one left above them, and a key lies in one guard per level, so of
+    /// the shards holding a key each is newer than every later one.
     fn entries<'s, 'b>(
         &'s self,
         bound: Option<(&'b [u8], &'b [u8])>,
@@ -58,29 +81,31 @@ impl ShardIndex {
                 Some((lo, hi)) => level.find_guards_for_range(lo, hi),
                 None => 0..level.guards.len(),
             };
-            level.guards[guards].iter().flat_map(|g| g.entries.iter())
+            level.guards[guards].iter().flat_map(|g| g.entries.iter().rev())
         });
         let pending: &[ShardEntry] = match cut {
             Cut::Now => &self.pending,
             Cut::Sealed => &[],
         };
-        (self.l0.iter()).chain(levels).chain(pending).filter(move |e| {
-            bound.is_none_or(|(lo, hi)| pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo, hi))
-        })
+        (pending.iter().rev())
+            .chain(self.l0.iter().rev())
+            .chain(levels)
+            .filter(move |e| {
+                bound.is_none_or(|(lo, hi)| pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo, hi))
+            })
     }
 
     pub(super) fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
         self.entries(None, Cut::Now)
     }
 
-    /// Mutable twin of [`all_entries`](Self::all_entries), in the same order, so
-    /// [`swap_schema`](Self::swap_schema) can assign rebound shards back into
-    /// the entries it walked.
+    /// Every registered entry, pending ones included, in no particular order.
     pub(super) fn all_entries_mut(&mut self) -> impl Iterator<Item = &mut ShardEntry> {
-        let levels = self.levels.iter_mut();
-        (self.l0.iter_mut())
-            .chain(levels.flat_map(|l| l.guards.iter_mut().flat_map(|g| g.entries.iter_mut())))
-            .chain(&mut self.pending)
+        let levels = self
+            .levels
+            .iter_mut()
+            .flat_map(|l| l.guards.iter_mut().flat_map(|g| &mut g.entries));
+        (self.pending.iter_mut()).chain(&mut self.l0).chain(levels)
     }
 
     /// Write `run`, a run spilled into the store, as an unpublished shard named
@@ -211,7 +236,6 @@ impl ShardIndex {
     /// Give up the fold under way and what it wrote; its inputs were never
     /// touched.
     pub(super) fn abandon_fold(&mut self) {
-        self.bands.clear();
         if let Some(run) = self.running.take() {
             self.retire(run.opened.into_iter().flatten());
         }
@@ -249,17 +273,16 @@ impl ShardIndex {
             "a terminal run ascends past every key its level holds"
         );
         debug_assert!(
-            self.running.is_none() && self.bands.is_empty(),
+            self.running.is_none(),
             "a terminal run enters a store with no fold under way"
         );
         debug_assert!(
             self.pending.is_empty() && self.l0.is_empty() && self.levels[L1].guards.is_empty(),
             "a terminal run lands under no newer shard"
         );
-        self.owed = true;
         let entry = self.write_shard(run)?;
         self.l0_run_bytes = self.l0_run_bytes.max(entry.shard.file_len());
-        self.register(TERMINAL, first, entry);
+        self.sink(vec![entry]);
         Ok(())
     }
 
@@ -300,12 +323,10 @@ impl ShardIndex {
         self.capacity.is_some() && self.levels[TERMINAL].guards.iter().any(LevelGuard::dehydrated)
     }
 
-    /// Each shard holding OPK `key`, newest first, with its rows of that key;
-    /// `filter_key` is `key`'s `probe_key`. Newest is pending first, then L0,
-    /// then L1, then the terminal level, each newest first: every fold keeps
-    /// that order, as its outputs hold no row older than one left above them.
-    /// Each level routes by the whole key against its guard partition, once
-    /// the walk reaches it.
+    /// Each shard holding OPK `key`, in [`Self::entries`]' newest-first order,
+    /// with its rows of that key; `filter_key` is `key`'s `probe_key`. Each
+    /// level routes by the whole key against its guard partition, once the
+    /// walk reaches it.
     #[inline]
     pub(crate) fn holding<'s, 'k>(&'s self, key: &'k [u8], filter_key: u64) -> Holding<'s, 'k> {
         Holding {
@@ -319,23 +340,10 @@ impl ShardIndex {
 
     /// Start `fold`: pin its inputs and verify them.
     fn begin(&mut self, fold: Fold) -> Result<(), StorageError> {
-        let shards: Vec<&ShardEntry> = fold
-            .sources
-            .iter()
-            .map(|seq| {
-                self.entries(None, Cut::Sealed)
-                    .find(|e| e.seq == *seq)
-                    .expect("a fold names registered shards")
-            })
-            .collect();
-        let newest = shards.iter().map(|e| e.newest).max().unwrap_or(0);
-        let merge = GuardMerge::begin(
-            shards.iter().map(|e| Rc::clone(&e.shard)).collect(),
-            fold.keys[1..].to_vec(),
-            fold.kind == CompactionKind::Dehydrate,
-        )?;
+        let dehydrate = fold.kind == CompactionKind::Dehydrate;
+        let merge = GuardMerge::begin(fold.shards.clone(), fold.keys[1..].to_vec(), dehydrate)?;
         let opened = Vec::with_capacity(fold.keys.len());
-        self.running = Some(Running { fold, merge, newest, opened });
+        self.running = Some(Running { fold, merge, opened });
         Ok(())
     }
 
@@ -354,7 +362,7 @@ impl ShardIndex {
         let written = merged.map(|merged| {
             // A store that has coded no heap yet codes the run under one of its own.
             let fresh = merged.plain().and_then(|b| self.codebook_for(b));
-            self.write_with(Some(run.newest), |path, opts| {
+            self.write_with(Some(run.fold.newest), |path, opts| {
                 merged.write_as_shard(path, ShardWriteOpts { codebook: fresh.as_deref(), ..opts })
             })
         });
@@ -374,16 +382,20 @@ impl ShardIndex {
         Ok(read)
     }
 
-    /// Retire the inputs of a finished fold and register its outputs under
-    /// their guards.
+    /// Retire the inputs of a finished fold and register its outputs: in L1
+    /// under the guards of its keys, at the terminal level sunk where their
+    /// rows lie.
     fn install(&mut self, run: Running) {
-        let Running { fold, merge, opened, .. } = run;
-        let opened: Vec<(PkBuf, ShardEntry)> = (fold.keys.iter().copied())
+        let Running {
+            fold: Fold { kind, shards, dest, keys, .. },
+            opened,
+            ..
+        } = run;
+        let opened: Vec<(PkBuf, ShardEntry)> = (keys.into_iter())
             .zip(opened)
             .filter_map(|(key, entry)| Some((key, entry?)))
             .collect();
-        let shards = merge.shards();
-        if fold.kind == CompactionKind::L0Fold {
+        if kind == CompactionKind::L0Fold {
             // A run that lands in one guard is one shard whose encodings span
             // the whole run, and can outweigh the spills it was written from.
             // Unobserved, every such guard would be over target as written and
@@ -391,7 +403,7 @@ impl ShardIndex {
             let largest = opened.iter().map(|(_, e)| e.shard.file_len()).max();
             self.l0_run_bytes = self.l0_run_bytes.max(largest.unwrap_or(0));
         }
-        if fold.kind == CompactionKind::GuardSplit {
+        if kind == CompactionKind::GuardSplit {
             // The one fold that reads a guard's whole history at its level, and so
             // every row its retractions can cancel there.
             let wrote: usize = opened.iter().map(|(_, e)| e.shard.row_count()).sum();
@@ -402,42 +414,57 @@ impl ShardIndex {
             self.cancel_yield.observe(retractions, read.saturating_sub(wrote));
         }
         #[cfg(test)]
-        super::cstats::record(
-            fold.kind,
+        self.stats.entry(kind).or_default().add(
             shards.iter().map(|s| s.file_len()).sum(),
             opened.iter().map(|(_, e)| e.shard.file_len()).sum(),
             shards.len(),
         );
 
-        let sources = &fold.sources;
-        let mut superseded = Vec::with_capacity(sources.len());
-        superseded.extend(self.l0.extract_if(.., |e| sources.contains(&e.seq)));
+        // The inputs are found by their `Rc`s: each registered entry holds its
+        // own, and only `ShardIndex::swap_schema` replaces one, abandoning the
+        // fold first.
+        let is_input = |e: &ShardEntry| shards.iter().any(|s| Rc::ptr_eq(s, &e.shard));
+        let mut superseded = Vec::with_capacity(shards.len());
+        superseded.extend(self.l0.extract_if(.., |e| is_input(e)));
         for level in &mut self.levels {
             for guard in &mut level.guards {
-                superseded.extend(guard.entries.extract_if(.., |e| sources.contains(&e.seq)));
+                superseded.extend(guard.entries.extract_if(.., |e| is_input(e)));
             }
             level.guards.retain(|g| !g.entries.is_empty());
         }
+        debug_assert_eq!(superseded.len(), shards.len(), "a fold's inputs are registered entries");
         self.retire(superseded);
-        if fold.kind == CompactionKind::BandCut {
-            // Ascending from the back, so the bands fold down in key order.
-            self.bands = opened.iter().rev().map(|(key, _)| *key).collect();
-        }
         for (key, entry) in opened {
-            self.register(fold.dest, key, entry);
+            if dest == TERMINAL {
+                self.sink(vec![entry]);
+            } else {
+                self.levels[dest].get_or_create_guard(key).entries.push(entry);
+            }
         }
     }
 
-    /// Register `entry` at `level` under the guard keyed `key`. A terminal
-    /// guard holds one shard and is keyed at its least key, whatever `key` is.
-    pub(super) fn register(&mut self, level: usize, key: PkBuf, entry: ShardEntry) {
-        let key = if level == TERMINAL { entry.pk_min } else { key };
-        let guard = self.levels[level].get_or_create_guard(key);
-        guard.entries.push(entry);
+    /// Register `entries`, whose keys lie in one terminal slot, on top of the
+    /// terminal guard whose shards they meet, or under a guard of their own at
+    /// their least key. A terminal guard is keyed at its least row: only guard
+    /// 0 can be met below its key, and lowering the first key keeps the guards
+    /// sorted.
+    fn sink(&mut self, entries: Vec<ShardEntry>) {
+        let (lo, hi) = extent(entries.iter()).expect("something to sink");
+        let terminal = &mut self.levels[TERMINAL];
         debug_assert!(
-            level != TERMINAL || guard.entries.len() == 1,
-            "a terminal guard holds exactly one shard"
+            terminal.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes()).len() <= 1,
+            "what sinks lies in one terminal slot"
         );
+        let slot = terminal.slot(lo.pk_bytes());
+        let guard = if terminal.guards.get(slot).is_some_and(|g| g.overlaps(lo, hi)) {
+            let guard = &mut terminal.guards[slot];
+            guard.guard_key = guard.guard_key.min(lo);
+            guard
+        } else {
+            terminal.get_or_create_guard(lo)
+        };
+        guard.entries.extend(entries);
+        self.owed = true;
     }
 
     fn retire(&mut self, entries: impl IntoIterator<Item = ShardEntry>) {
@@ -457,18 +484,16 @@ impl ShardIndex {
     }
 
     /// The next fold the tree owes, or `None` when it owes none. What costs no
-    /// merge — a band moved down whole — is done here.
+    /// merge — an L1 guard sunk into the terminal level as it stands — is done
+    /// here.
     ///
-    /// In order: the bands of a cut L1 guard, which were cut against the
-    /// terminal partition as it stood; every guard over its byte target or file
-    /// threshold, before the L0 fold lands more on it; the L0 fold; the
-    /// underfull runs, which must see the sizes a split left; L1 down to its
-    /// byte target; and the store down to its capacity.
+    /// In order: every guard over its byte target or file threshold, the
+    /// terminal guards bands sank into among them, before the L0 fold lands
+    /// more on it; the L0 fold; the underfull runs, which must see the sizes a
+    /// split left; L1 down to its byte target; and the store down to its
+    /// capacity.
     fn plan(&mut self) -> Option<Fold> {
         loop {
-            if let Some(fold) = self.next_band_fold() {
-                return Some(fold);
-            }
             let split = [L1, TERMINAL].into_iter().find_map(|level| self.plan_split(level));
             if split.is_some() {
                 return split;
@@ -517,22 +542,6 @@ impl ShardIndex {
         }
     }
 
-    /// The fold of the next band a band cut left, moving down whole every one
-    /// that needs none; `None` once no band is left.
-    fn next_band_fold(&mut self) -> Option<Fold> {
-        while let Some(band) = self.bands.pop() {
-            if let Some(fold) = self.plan_band(band) {
-                return Some(fold);
-            }
-        }
-        None
-    }
-
-    /// Every shard of `guards`, in guard order.
-    fn seqs<'a>(guards: impl IntoIterator<Item = &'a LevelGuard>) -> Vec<u64> {
-        guards.into_iter().flat_map(|g| &g.entries).map(|e| e.seq).collect()
-    }
-
     /// Total registered bytes of L0.
     fn l0_bytes(&self) -> u64 {
         self.l0.iter().map(|e| e.shard.file_len()).sum()
@@ -545,12 +554,7 @@ impl ShardIndex {
             return None;
         }
         self.l0_run_bytes = self.l0_run_bytes.max(self.l0_bytes());
-        Some(Fold {
-            kind: CompactionKind::L0Fold,
-            sources: self.l0.iter().map(|e| e.seq).collect(),
-            dest: L1,
-            keys: self.l1_guard_keys(),
-        })
+        Some(Fold::new(CompactionKind::L0Fold, L1, self.l1_guard_keys(), &self.l0))
     }
 
     /// The largest a guard of `level_idx` is allowed to get: `R`, so no
@@ -614,24 +618,22 @@ impl ShardIndex {
             .map(|(gi, _)| gi)
     }
 
-    /// The keys an L0 fold routes into: L1's guard keys, or L0's shard lower
-    /// bounds while L1 is empty. A guard key is a whole OPK key, compared as one
-    /// byte string, so the partition is exact at every PK width.
+    /// The keys an L0 fold routes into: L1's guard keys. A guard key is a whole
+    /// OPK key, compared as one byte string, so the partition is exact at every
+    /// PK width.
     ///
     /// L0 rows above everything L1 holds get a guard of their own once they are
     /// worth half of one, so an ascending stream lands in fresh guards and not on
-    /// the last one, which it would only push over target.
+    /// the last one, which it would only push over target. With L1 empty every
+    /// L0 row is above it, and L0 gets one guard keyed at its least key whatever
+    /// its size.
     fn l1_guard_keys(&self) -> Vec<PkBuf> {
-        let Some(last) = self.levels[L1].guards.last() else {
-            let mut keys: Vec<PkBuf> = self.l0.iter().map(|e| e.pk_min).collect();
-            keys.sort_unstable();
-            keys.dedup();
-            return keys;
-        };
-        let top = last.key_extent().1.max(last.guard_key);
+        let guards = &self.levels[L1].guards;
+        let top = guards.last().map(|g| g.key_extent().1.max(g.guard_key));
         let (mut above, mut rows, mut fence) = (0, 0, None::<PkBuf>);
         for e in &self.l0 {
-            let (n, first) = (e.shard.row_count(), e.shard.pk_rows(top.pk_bytes()).end);
+            let n = e.shard.row_count();
+            let first = top.map_or(0, |t| e.shard.pk_rows(t.pk_bytes()).end);
             rows += n;
             if first < n {
                 above += n - first;
@@ -641,23 +643,20 @@ impl ShardIndex {
         }
         // Row share stands in for byte share.
         let above_bytes = u128::from(self.l0_bytes()) * above as u128 / rows.max(1) as u128;
-        let fence = fence.filter(|_| above_bytes >= u128::from(self.guard_target_bytes(L1) / 2));
-        self.levels[L1]
-            .guards
-            .iter()
-            .map(|g| g.guard_key)
-            .chain(fence)
-            .collect()
+        let fence = fence.filter(|_| guards.is_empty() || above_bytes >= u128::from(self.guard_target_bytes(L1) / 2));
+        guards.iter().map(|g| g.guard_key).chain(fence).collect()
     }
 
     /// The highest guard in `level_idx` that is over its byte target, or whose
     /// retractions are expected to cancel [`CANCEL_PERCENT`] of its rows — cut
     /// at its own key quantiles, or folded to one shard in place — or else over
-    /// the file threshold, whose newest shards fold into one: the two newest,
-    /// then each older one no larger than the shards already taken. A shard is
-    /// rewritten once the ones above it have grown to its size, so a byte is
-    /// rewritten a logarithmic number of times over the guard's growth; folding
-    /// the whole guard each time would rewrite its oldest shard at every fold.
+    /// its level's file threshold, whose newest shards fold into one: the
+    /// fewest that bring it back to the threshold, then each older one no
+    /// larger than the shards already taken — at a threshold of 1, the whole
+    /// guard. A shard is rewritten once the ones above it have grown to its
+    /// size, so a byte is rewritten a logarithmic number of times over the
+    /// guard's growth; folding the whole guard each time would rewrite its
+    /// oldest shard at every fold.
     fn plan_split(&self, level_idx: usize) -> Option<Fold> {
         self.levels[level_idx]
             .guards
@@ -672,27 +671,25 @@ impl ShardIndex {
         let keys = fold_destinations(guard.guard_key, guard.entries.iter(), target);
         let mut start = 0;
         if keys.len() == 1 && !self.cancels(guard.retractions(), guard.rows()) {
-            if guard.entries.len() <= GUARD_FILE_THRESHOLD {
+            if guard.entries.len() <= GUARD_FILE_THRESHOLD[level_idx] {
                 return None;
             }
-            debug_assert!(!guard.dehydrated(), "a skeleton shard is folded with its whole guard");
             let bytes = |e: &ShardEntry| e.shard.file_len();
-            start = guard.entries.len() - 2;
+            start = GUARD_FILE_THRESHOLD[level_idx] - 1;
             let mut taken: u64 = guard.entries[start..].iter().map(bytes).sum();
             while start > 0 && bytes(&guard.entries[start - 1]) <= taken {
                 start -= 1;
                 taken += bytes(&guard.entries[start]);
             }
         }
-        Some(Fold {
-            kind: match start {
-                0 => CompactionKind::GuardSplit,
-                _ => CompactionKind::TierFold,
-            },
-            sources: guard.entries[start..].iter().map(|e| e.seq).collect(),
-            dest: level_idx,
-            keys,
-        })
+        let kind = if level_idx == TERMINAL && guard.entries.len() > 1 {
+            CompactionKind::Vertical
+        } else if start == 0 {
+            CompactionKind::GuardSplit
+        } else {
+            CompactionKind::TierFold
+        };
+        Some(Fold::new(kind, level_idx, keys, &guard.entries[start..]))
     }
 
     /// The highest underfull run of `level_idx`, folded into its lowest key, so
@@ -724,12 +721,12 @@ impl ShardIndex {
             highest = Some(start..guards.len());
         }
         let guards = &guards[highest?];
-        Some(Fold {
-            kind: CompactionKind::GuardMerge,
-            sources: Self::seqs(guards),
-            dest: level_idx,
-            keys: vec![guards[0].guard_key],
-        })
+        Some(Fold::new(
+            CompactionKind::GuardMerge,
+            level_idx,
+            vec![guards[0].guard_key],
+            guards.iter().flat_map(|g| &g.entries),
+        ))
     }
 
     /// The sweep's first dehydration of a hydrated terminal guard: one skeleton
@@ -737,74 +734,40 @@ impl ShardIndex {
     /// count derived from the hydrated input would shatter it.
     fn plan_dehydration(&self, guard_idx: usize) -> Fold {
         let guard = &self.levels[TERMINAL].guards[guard_idx];
-        Fold {
-            kind: CompactionKind::Dehydrate,
-            sources: Self::seqs([guard]),
-            dest: TERMINAL,
-            keys: vec![guard.guard_key],
-        }
+        Fold::new(
+            CompactionKind::Dehydrate,
+            TERMINAL,
+            vec![guard.guard_key],
+            &guard.entries,
+        )
     }
 
     /// Start L1 guard `src` on its way down into the terminal level, banded so
-    /// no single merge reads more than one band plus one terminal guard: the
-    /// fold that cuts it at the low end of its key extent and at every terminal
-    /// guard key inside the extent. A guard that overlaps one terminal guard
-    /// already is a band, and goes down as [`Self::plan_band`] plans it.
+    /// no single merge reads more than one band plus one terminal guard. A
+    /// guard whose key extent meets one terminal guard at most is a band
+    /// already: it sinks into the terminal level as it stands, and the answer
+    /// is `None`. Any other is cut at the low end of its key extent and at every
+    /// terminal guard key inside the extent, and each band sinks into the
+    /// terminal guard it meets.
     ///
-    /// Each band folds down as a fold of its own, so a failure in band *k*
-    /// leaves bands `0..k` folded and every intermediate state a valid
-    /// partition.
+    /// The split pass then folds each guard a band sank into as a fold of its
+    /// own, so a failure in one leaves that band registered on top of its guard
+    /// and every intermediate state a valid partition.
     fn plan_drain(&mut self, src: usize) -> Option<Fold> {
         let guard = &self.levels[L1].guards[src];
         let (lo, hi) = guard.key_extent();
         let terminal = &self.levels[TERMINAL];
         let run = terminal.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
         if run.len() <= 1 {
-            return self.plan_band(guard.guard_key);
-        }
-        Some(Fold {
-            kind: CompactionKind::BandCut,
-            sources: Self::seqs([guard]),
-            dest: L1,
-            // `skip(1)`: the run's first guard owns `lo`, and every later key is above it.
-            keys: std::iter::once(lo)
-                .chain(terminal.guards[run].iter().skip(1).map(|g| g.guard_key))
-                .collect(),
-        })
-    }
-
-    /// Fold the L1 band keyed `band` into the terminal guard it overlaps, or
-    /// move it down as it stands and answer `None`.
-    fn plan_band(&mut self, band: PkBuf) -> Option<Fold> {
-        let l1 = &self.levels[L1].guards;
-        let src = l1.binary_search_by(|g| g.guard_key.cmp(&band)).ok()?;
-        let (lo, hi) = l1[src].key_extent();
-        let terminal = &self.levels[TERMINAL];
-        let dest = terminal.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
-        debug_assert!(dest.len() <= 1, "a band overlaps one terminal guard");
-        // A band meeting no terminal shard starts a guard at its own low key.
-        let owner = terminal.guards[dest].first().filter(|g| g.overlaps(lo, hi));
-        if owner.is_none() && l1[src].entries.len() == 1 {
-            // One shard, already what the merge would write.
             let band = self.levels[L1].guards.remove(src);
-            for entry in band.entries {
-                self.register(TERMINAL, lo, entry);
-            }
+            self.sink(band.entries);
             return None;
         }
-        let key = owner.map_or(lo, |g| g.guard_key);
-        let inputs = l1[src].entries.iter().chain(owner.into_iter().flat_map(|g| &g.entries));
-        Some(Fold {
-            kind: CompactionKind::Vertical,
-            sources: inputs.clone().map(|e| e.seq).collect(),
-            dest: TERMINAL,
-            // Cut where the output would be split. A skeleton output is one row
-            // per key, so a part count from its hydrated inputs would shatter it.
-            keys: match owner {
-                Some(g) if g.dehydrated() => vec![key],
-                _ => fold_destinations(key, inputs, self.guard_target_bytes(TERMINAL)),
-            },
-        })
+        // `skip(1)`: the run's first guard owns `lo`, and every later key is above it.
+        let keys = std::iter::once(lo)
+            .chain(terminal.guards[run].iter().skip(1).map(|g| g.guard_key))
+            .collect();
+        Some(Fold::new(CompactionKind::BandCut, TERMINAL, keys, &guard.entries))
     }
 
     /// Sum of every registered shard's file size — the quantity a

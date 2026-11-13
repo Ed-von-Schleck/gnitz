@@ -18,7 +18,7 @@ use std::num::NonZeroU64;
 /// with.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Probe {
-    /// The relation's own PK store: each key a live row carries, echoed.
+    /// A base table's own PK store: each key a live row carries, echoed.
     Pk,
     /// A base table's own PK store: each key a live row carries, with that
     /// row's column.
@@ -39,30 +39,16 @@ impl RelationRegistry {
     pub fn probe(&self, id: u64, probe: Probe, keys: PkKeys) -> Result<Batch, String> {
         let relation = self.relation_or_err(id)?;
         let keyed_as = |stride| check_stride("probe", id, &keys, stride);
+        // A PK store probe reads a base table's, whose keys net 0 or 1.
+        let unique_rows = || {
+            keyed_as(relation.schema().pk_stride())?;
+            relation.table_or_err()?;
+            (relation.unique_rows())
+                .ok_or_else(|| format!("probe: PK probe of relation {id}, which is not a base table"))
+        };
         match probe {
-            Probe::Pk => {
-                keyed_as(relation.schema().pk_stride())?;
-                let table = relation.table_or_err()?;
-                let mut echo = Batch::empty_with_schema(&relation.probe_reply_schema(probe)?);
-                // A unique store's key nets 0 or 1, which its unique probe decides
-                // without summing every tier.
-                let unique = relation.unique_rows();
-                keys.iter()
-                    .filter(|k| match unique {
-                        Some(rows) => rows.unique_live_row_at(k).is_some(),
-                        None => table.has_pk_bytes(k),
-                    })
-                    .for_each(|key| echo.push_key_row(key, 1));
-                Ok(echo)
-            }
-            Probe::PkColumn(col) => {
-                keyed_as(relation.schema().pk_stride())?;
-                relation.table_or_err()?;
-                let rows = relation
-                    .unique_rows()
-                    .ok_or_else(|| format!("probe: column probe of relation {id}, which is not a base table"))?;
-                project_unique(rows, &relation.schema(), &keys, &[col])
-            }
+            Probe::Pk => project_unique(unique_rows()?, &relation.schema(), &keys, &[]),
+            Probe::PkColumn(col) => project_unique(unique_rows()?, &relation.schema(), &keys, &[col]),
             Probe::Index(cols, cap) => {
                 let index = relation.index_or_err(cols.as_slice())?;
                 // The keys are the probed spans themselves.

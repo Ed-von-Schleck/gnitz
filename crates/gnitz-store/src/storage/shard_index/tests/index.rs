@@ -63,9 +63,6 @@ impl ShardIndex {
         if let Some(cut) = self.plan_drain(src) {
             self.run(cut)?;
         }
-        while let Some(fold) = self.next_band_fold() {
-            self.run(fold)?;
-        }
         self.rebalance_guards(TERMINAL)
     }
 
@@ -286,11 +283,11 @@ fn guards_over_the_file_threshold_fold_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let mut idx = fresh(dir.path(), schema);
-    for pk in 1..=GUARD_FILE_THRESHOLD as u64 + 1 {
+    for pk in 1..=GUARD_FILE_THRESHOLD[L1] as u64 + 1 {
         seed_guard(&mut idx, L1, gk(0), &test_batch(&[pk], &[pk as i64]), 1);
     }
     // Alternating inserts and retractions of the same rows, netting to zero.
-    for i in 0..GUARD_FILE_THRESHOLD as i64 + 2 {
+    for i in 0..GUARD_FILE_THRESHOLD[L1] as i64 + 2 {
         let rows: Vec<(u64, i64, i64)> = (100..104).map(|k| (k, if i % 2 == 0 { 1 } else { -1 }, 0)).collect();
         seed_guard(&mut idx, L1, gk(100), &make_batch_raw(&schema, &rows), 1);
     }
@@ -302,7 +299,7 @@ fn guards_over_the_file_threshold_fold_in_place() {
         .map(|g| (g.guard_key, g.entries.len()))
         .collect();
     assert_eq!(guards, [(gk(0), 1)]);
-    assert_all_found(&idx, 1..=GUARD_FILE_THRESHOLD as u64 + 1);
+    assert_all_found(&idx, 1..=GUARD_FILE_THRESHOLD[L1] as u64 + 1);
 }
 
 /// One spill retracting enough of the rows under it folds down and cancels them,
@@ -334,7 +331,6 @@ fn retractions_that_cancel_nothing_stop_folding_for_them() {
     let folds_of = |weight: i64| {
         let dir = tempfile::tempdir().unwrap();
         let mut idx = fresh(dir.path(), make_schema_u64_i64());
-        cstats::reset();
         for spill in 0..40 {
             let run = dense_batch(spill * 100, 100);
             let run = if weight < 0 { run.negated() } else { run };
@@ -342,7 +338,7 @@ fn retractions_that_cancel_nothing_stop_folding_for_them() {
             idx.drain().unwrap();
         }
         assert_weighs(&idx, weight, (0..4000).map(gk));
-        cstats::dump().values().map(|p| p.n).sum::<usize>()
+        idx.stats.values().map(|p| p.n).sum::<usize>()
     };
     let (inserted, retracted) = (folds_of(1), folds_of(-1));
     assert!(
@@ -351,8 +347,10 @@ fn retractions_that_cancel_nothing_stop_folding_for_them() {
     );
 }
 
-/// A vertical is atomic per band: a failure in band `k` leaves bands `0..k`
-/// folded, the failing band untouched, and every key reachable.
+/// A vertical is atomic per band: the bands sink into their terminal guards,
+/// which then fold one at a time, the highest first, so a failure in the low
+/// band's fold leaves the high one folded, the low band registered on top of
+/// its guard, and every key reachable.
 #[test]
 fn a_failing_vertical_band_leaves_the_bands_before_it_folded() {
     let dir = tempfile::tempdir().unwrap();
@@ -371,24 +369,24 @@ fn a_failing_vertical_band_leaves_the_bands_before_it_folded() {
         seed_guard(&mut idx, L1, gk(201), &test_batch(&[pk], &[pk as i64]), 100);
     }
 
-    let (split_outputs, first_band_fold) = (2, 1);
-    let second_band_fold = idx.dir.last_seq() + split_outputs + first_band_fold + 1;
-    let blocker = dir.path().join(manifest::shard_name(second_band_fold));
+    let (cut_outputs, high_band_fold) = (2, 1);
+    let low_band_fold = idx.dir.last_seq() + cut_outputs + high_band_fold + 1;
+    let blocker = dir.path().join(manifest::shard_name(low_band_fold));
     std::fs::create_dir_all(&blocker).unwrap();
 
-    let hi_dest_seq = idx.levels[TERMINAL].guards[1].entries[0].seq;
-    assert!(idx.vertical_fold(0).is_err(), "the second band cannot write");
+    let dest_seqs: Vec<u64> = idx.levels[TERMINAL].entries().map(|e| e.seq).collect();
+    assert!(idx.vertical_fold(0).is_err(), "the low band cannot write");
 
-    assert_eq!(idx.levels[L1].guards.len(), 1, "only the failed band is left in L1");
-    assert_eq!(
-        idx.levels[L1].guards[0].guard_key,
-        gk(100_100),
-        "the failed band keeps its own source guard",
-    );
-    assert_eq!(
-        idx.levels[TERMINAL].guards[1].entries[0].seq, hi_dest_seq,
-        "the failed band's destination guard is untouched",
-    );
+    assert!(idx.levels[L1].guards.is_empty(), "both bands left L1");
+    let terminal = &idx.levels[TERMINAL].guards;
+    assert_eq!(terminal.len(), 2);
+    assert_eq!(terminal[0].guard_key, gk(200));
+    assert_eq!(terminal[0].entries.len(), 2, "the low band is on top of its guard");
+    assert_eq!(terminal[0].entries[0].seq, dest_seqs[0], "the low guard is untouched");
+    assert_eq!(terminal[1].guard_key, gk(100_100));
+    assert_eq!(terminal[1].entries.len(), 1, "the high band folded into its guard");
+    assert_ne!(terminal[1].entries[0].seq, dest_seqs[1], "the high guard was rewritten");
+    assert!(idx.owed(), "the low band's fold is still owed");
     assert_all_found(&idx, src_pks.iter().chain(&dest_pks).copied());
 }
 
@@ -522,13 +520,10 @@ fn an_ascending_run_folds_into_one_guard_and_is_not_cut_out_of_it() {
         let spilled = idx.l0_bytes();
         idx.run_compact().unwrap();
         let guards = &idx.levels[L1].guards;
-        // The first run found L1 empty, and was routed by its spills' own bounds.
-        if run > 0 {
-            assert_eq!(guards.len(), guards_before + 1, "run {run}");
-            let folded = guards.last().unwrap();
-            assert_eq!(folded.entries.len(), 1, "run {run}");
-            assert!(folded.bytes() > spilled, "premise: the fold's key is the wider");
-        }
+        assert_eq!(guards.len(), guards_before + 1, "run {run}");
+        let folded = guards.last().unwrap();
+        assert_eq!(folded.entries.len(), 1, "run {run}");
+        assert!(folded.bytes() > spilled, "premise: the fold's key is the wider");
         guards_before = guards.len();
     }
     assert_all_found(&idx, (0..15 * SPILL).step_by(997));
@@ -543,7 +538,9 @@ fn a_failing_compaction_leaves_its_inputs_and_no_output() {
         let dir = tempfile::tempdir().unwrap();
         let mut idx = fresh(dir.path(), make_schema_u64_i64());
 
-        // One L1 guard key per L0 run, so the fold writes two outputs.
+        // Two L1 guards, one per L0 run, so the fold writes two outputs.
+        seed_guard(&mut idx, L1, gk(10), &test_batch(&[11], &[1]), 1);
+        seed_guard(&mut idx, L1, gk(150), &test_batch(&[151], &[1]), 1);
         idx.append_l0_run(&test_batch(&[10, 50], &[1, 1])).unwrap();
         idx.append_l0_run(&test_batch(&[150, 250], &[1, 1])).unwrap();
         // A directory at an output's name: that shard cannot be created.
@@ -557,10 +554,7 @@ fn a_failing_compaction_leaves_its_inputs_and_no_output() {
             "output {failing}: no input retired, no output left behind"
         );
         assert_eq!(idx.level_shape().0, 2, "both inputs stay registered");
-        assert!(
-            idx.levels[L1..].iter().all(|l| l.guards.is_empty()),
-            "nothing was registered"
-        );
+        assert_eq!(idx.levels[L1].entries().count(), 2, "nothing was registered");
         assert_all_found(&idx, [10, 50, 150, 250]);
     }
 }
@@ -1264,10 +1258,10 @@ fn a_jump_in_r_is_merged_within_each_calls_budget() {
     let r = idx.l0_run_bytes;
     assert!(r > 2 * MIN_GUARD_BYTES, "premise: R jumped past the seeded guards");
 
-    cstats::reset();
+    idx.stats.clear();
     let done = idx.maintain(r).unwrap();
     assert!(idx.owed(), "premise: one budget does not finish the job");
-    let merged = cstats::dump()[&CompactionKind::GuardMerge].in_bytes;
+    let merged = idx.stats[&CompactionKind::GuardMerge].in_bytes;
     // The call stops at the first destination past its budget.
     assert!(done < 2 * r && merged < 2 * r, "{merged} B merged against R = {r} B");
     let after_one = idx.levels[TERMINAL].guards.len();
@@ -1313,8 +1307,8 @@ fn a_call_stops_at_the_destination_past_its_budget() {
     idx.drain().unwrap();
     assert!(!idx.owed() && idx.running.is_none());
     assert!(idx.l0.len() <= L0_COMPACT_THRESHOLD);
-    for level in &idx.levels[L1..] {
-        assert!(level.guards.iter().all(|g| g.entries.len() <= GUARD_FILE_THRESHOLD));
+    for (level, threshold) in idx.levels.iter().zip(GUARD_FILE_THRESHOLD) {
+        assert!(level.guards.iter().all(|g| g.entries.len() <= threshold));
     }
 }
 
@@ -1330,9 +1324,8 @@ fn a_vertical_of_a_guard_with_a_low_tail_reads_each_terminal_guard_once() {
     // L1's lowest guard owns the keys below its own key.
     seed_guard(&mut idx, L1, gk(150), &test_batch(&[5, 105, 160], &[5, 6, 7]), 2);
 
-    cstats::reset();
     idx.vertical_fold(0).unwrap();
-    let stats = cstats::dump();
+    let stats = &idx.stats;
     let vertical = &stats[&CompactionKind::Vertical];
     assert_eq!(
         (vertical.n, vertical.in_files),
@@ -1349,7 +1342,6 @@ fn a_vertical_of_a_guard_with_a_low_tail_reads_each_terminal_guard_once() {
 fn an_ascending_stream_is_written_once() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = fresh(tmp.path(), make_schema_u64_i64());
-    cstats::reset();
     let mut keys = Vec::new();
     for i in 0..30u64 {
         append_stable(&mut idx, 1 + i * 10_000);
@@ -1361,9 +1353,8 @@ fn an_ascending_stream_is_written_once() {
     while !idx.levels[L1].guards.is_empty() {
         idx.vertical_fold(0).unwrap();
     }
-    let rewrites: Vec<CompactionKind> = cstats::dump()
-        .into_keys()
-        .filter(|k| !matches!(k, CompactionKind::L0Fold | CompactionKind::GuardMerge))
+    let rewrites: Vec<CompactionKind> = (idx.stats.keys().copied())
+        .filter(|k| !matches!(k, CompactionKind::L0Fold))
         .collect();
     assert_eq!(rewrites, [], "nothing but the L0 fold wrote a row");
     let terminal: Vec<u64> = idx.levels[TERMINAL].entries().map(|e| e.seq).collect();
@@ -1421,9 +1412,8 @@ fn a_vertical_over_target_writes_its_parts_directly() {
     seed_stable(&mut idx, TERMINAL, gk(1), 1, 1);
     seed_guard(&mut idx, L1, gk(2000), &dense_batch(2000, STABLE_ROWS), 2);
 
-    cstats::reset();
     idx.vertical_fold(0).unwrap();
-    let stats = cstats::dump();
+    let stats = &idx.stats;
     assert_eq!(stats[&CompactionKind::Vertical].n, 1);
     assert!(
         !stats.contains_key(&CompactionKind::GuardSplit),
@@ -1529,8 +1519,12 @@ fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
         for (gi, g) in level.guards.iter().enumerate() {
             assert!(!g.entries.is_empty(), "{what}: L{l} guard {gi} is empty");
             if li == TERMINAL {
-                assert_eq!(g.entries.len(), 1, "{what}: terminal guard {gi}");
-                assert_eq!(g.guard_key, g.entries[0].pk_min, "{what}: terminal guard {gi}'s key");
+                assert_eq!(g.guard_key, g.key_extent().0, "{what}: terminal guard {gi}'s key");
+                assert!(
+                    g.entries.len() == 1 || idx.owed(),
+                    "{what}: terminal guard {gi} holds {} shards and no fold is owed",
+                    g.entries.len()
+                );
             } else {
                 assert!(
                     g.entries.iter().all(|e| !e.shard.is_skeleton()),
@@ -1597,22 +1591,47 @@ fn check_model(idx: &ShardIndex, m: &Model, what: &str) {
 /// `GNITZ_MODEL_SEEDS` widens the run.
 #[test]
 fn shard_index_model() {
+    // (capacity, ascending keys, L1 seeded with several guards)
     let configs = [
-        (None, false),
-        (None, true),
-        (Some(150_000), false),
-        (Some(1), true),
-        (Some(150_000), true),
+        (None, false, false),
+        (None, true, false),
+        (Some(150_000), false, false),
+        (Some(1), true, false),
+        (Some(150_000), true, false),
+        (None, false, true),
     ];
     let mut interrupted = 0;
     for seed in 1..=gnitz_foundation::env::env_num("GNITZ_MODEL_SEEDS", 1u64) {
         for pk_cols in [1usize, 3] {
-            for (ci, &(budget, monotone)) in configs.iter().enumerate() {
+            for (ci, &(budget, monotone, seeded)) in configs.iter().enumerate() {
                 let tmp = tempfile::tempdir().unwrap();
                 let schema = stride_schema(pk_cols);
                 let mut rng = crate::test_support::Rng::new(seed * 1_000_003 + (pk_cols * 16 + ci) as u64);
                 let mut idx = open(tmp.path(), schema, budget);
                 let mut m = Model::default();
+                if seeded {
+                    // An L0 fold into an empty L1 has one output. Four L1
+                    // guards, too large for a guard merge to join at the start,
+                    // and L0 one spill short of a fold give the fold several
+                    // outputs for a budgeted call to stop between.
+                    for g in 0..4u64 {
+                        let rows: Vec<(Vec<u8>, i64, i64)> = (0..1500)
+                            .map(|j| {
+                                let i = g * 5000 + j * 3;
+                                let pk = model_key(pk_cols, i);
+                                m.add(pk.clone(), spread(i), 1);
+                                (pk, 1, spread(i))
+                            })
+                            .collect();
+                        let key = PkBuf::from_bytes(&rows[0].0);
+                        seed_guard(&mut idx, L1, key, &make_batch_opk(&schema, &rows), 1);
+                    }
+                    for _ in 0..L0_COMPACT_THRESHOLD {
+                        let batch = m.spill(&mut rng, pk_cols, monotone);
+                        idx.append_l0_run(&batch).unwrap();
+                    }
+                    publish_manifest(&mut idx);
+                }
                 let mut published = m.clone();
                 for step in 0..30 {
                     // A blocker directory at an upcoming shard name fails that write.
@@ -1710,7 +1729,6 @@ fn tier_folds_keep_the_zset() {
         let mut rng = Rng::new(7);
         let mut version = vec![0u64; KEYS as usize];
         let mut m = Model::default();
-        cstats::reset();
         for _ in 0..260 {
             let mut rows = Vec::new();
             for _ in 0..2048 {
@@ -1733,11 +1751,11 @@ fn tier_folds_keep_the_zset() {
             idx.append_l0_run(&make_batch_raw(&schema, &rows).into_consolidated())
                 .unwrap();
             idx.drain().unwrap();
-            for level in &idx.levels[L1..] {
-                assert!(level.guards.iter().all(|g| g.entries.len() <= GUARD_FILE_THRESHOLD));
+            for (level, threshold) in idx.levels.iter().zip(GUARD_FILE_THRESHOLD) {
+                assert!(level.guards.iter().all(|g| g.entries.len() <= threshold));
             }
         }
-        let stats = cstats::dump();
+        let stats = &idx.stats;
         for kind in [
             CompactionKind::TierFold,
             CompactionKind::GuardSplit,

@@ -136,11 +136,6 @@ impl GuardMerge {
         })
     }
 
-    /// The input shards.
-    pub fn shards(&self) -> &[Rc<MappedShard>] {
-        &self.shards
-    }
-
     /// Whether every destination is merged.
     pub fn done(&self) -> bool {
         self.next > self.fences.len()

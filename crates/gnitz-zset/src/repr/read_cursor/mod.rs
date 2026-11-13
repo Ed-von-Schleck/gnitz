@@ -117,10 +117,9 @@ pub struct ReadCursor {
     current_weight: i64,
     /// The row the cursor stands on, while `valid`.
     current: CursorRow,
-    /// How many leading sources are one store's heap runs newest first, each
-    /// newer than every source after them; set by
-    /// [`Self::mark_heap_newest_first`], 0 otherwise.
-    heap_newest_first: u32,
+    /// Whether the sources are one store's runs newest first; set by
+    /// [`Self::mark_newest_first`].
+    newest_first: bool,
     /// See [`Self::skip_payload`].
     skip_payload: u64,
 }
@@ -639,13 +638,11 @@ impl ReadCursor {
         self.commit_emitted(emitted);
     }
 
-    /// Declare the leading [`Run::Mem`] sources one store's heap runs in age
-    /// order, newest first, and every source after them older than each: a
-    /// [`GroupProbe`] over a store of one row per PK reads a PK off the first
-    /// of them holding it.
-    pub fn mark_heap_newest_first(&mut self) {
-        let heap = self.sources.iter().take_while(|run| matches!(run, Run::Mem(_))).count();
-        self.heap_newest_first = heap as u32;
+    /// Declare every source one store's run, each newer than every later
+    /// source holding the same PK: a [`GroupProbe`] over a store of one row per
+    /// PK reads a PK off the first source holding it.
+    pub fn mark_newest_first(&mut self) {
+        self.newest_first = true;
     }
 
     /// Upper bound on the rows a walk from HERE emits — the pre-size a batch that
@@ -726,7 +723,7 @@ fn build(
         valid: false,
         current_weight: 0,
         current: CursorRow { src: 0, row: 0 },
-        heap_newest_first: 0,
+        newest_first: false,
         skip_payload: 0,
     };
     position(&mut cursor);

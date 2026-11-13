@@ -361,9 +361,12 @@ pub(super) struct StoreDir {
 /// holds its store until then, so nothing draws or drops a shard in between.
 pub(super) struct FlushWork<'a> {
     dir: &'a mut StoreDir,
-    /// The manifest staged for the rename. Without one the manifest in place
-    /// is already current, and only the directory syncs are owed.
-    staged: Option<Manifest>,
+    /// The manifest the barrier leaves durable: the one staged, or the one
+    /// already in place.
+    manifest: Manifest,
+    /// Whether `manifest` was staged and is owed its rename; when false it is
+    /// the manifest in place, owed only the directory syncs.
+    rename: bool,
     /// Whether no publish of this store is known durable, so the entries that
     /// reach its directory are owed a sync beside the directory itself.
     first_sync: bool,
@@ -387,21 +390,26 @@ impl StoreDir {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
             Err(e) => return Err(e.into()),
         };
-        let rederived = matches!(recovery, RecoverySource::Rederive { .. });
         let loaded = match recovery {
             _ if created => None,
-            // Erased at open, so it reads nothing: an I/O error on the file it is
-            // about to unlink must not abort it.
-            RecoverySource::Rederive { resume_at: None } => None,
-            // Rebuilt from its sources, so damage is erased rather than fatal.
-            RecoverySource::Rederive { resume_at: Some(want) } => read_at(path, want)?,
             // Its shards are its only copy, so damage stops the open.
             RecoverySource::SalReplay => read(path)?,
+            RecoverySource::Rederive { resume_at } => {
+                let m = match resume_at {
+                    // Erased at open, so it reads nothing: an I/O error on the
+                    // file it is about to unlink must not abort it.
+                    None => None,
+                    // Rebuilt from its sources, so damage is erased rather than
+                    // fatal.
+                    Some(want) => read_at(path, want)?,
+                };
+                if m.is_none() {
+                    // So a later re-open cannot reload what this one rejected.
+                    unlink(&[path])?;
+                }
+                m
+            }
         };
-        if loaded.is_none() && rederived && !created {
-            // So a later re-open cannot reload what this one rejected.
-            unlink(&[path])?;
-        }
         let live: HashSet<u64> = loaded.iter().flat_map(|m| &m.shards.entries).map(|e| e.seq).collect();
         remove_stale_files(path, |seq| live.contains(&seq))?;
         let seq = live.into_iter().max().unwrap_or(0);
@@ -502,24 +510,29 @@ impl StoreDir {
             shards,
         };
         let first_sync = !matches!(self.in_place, InPlace::Durable(_));
-        let staged = match &self.in_place {
+        let rename = match &self.in_place {
             InPlace::Durable(p) if *p == m => return Ok(None),
             InPlace::Renamed(p) if *p == m => {
                 debug_assert!(
                     m.shards.entries.iter().all(|e| self.published(e.seq)),
                     "the manifest in place names an unsynced shard"
                 );
-                None
+                false
             }
             _ => {
                 // Until the barrier records otherwise: a failed publish may have
                 // renamed it.
                 self.in_place = InPlace::Unknown;
                 stage(&self.path, &m)?;
-                Some(m)
+                true
             }
         };
-        Ok(Some(FlushWork { dir: self, staged, first_sync }))
+        Ok(Some(FlushWork {
+            dir: self,
+            manifest: m,
+            rename,
+            first_sync,
+        }))
     }
 
     /// Durably publish every store in `work` as [`Self::stage`] staged it, then
@@ -529,16 +542,14 @@ impl StoreDir {
         // Every staged manifest, and every shard it names that no published one
         // did, before any rename.
         sync.sync_paths(
-            work.iter().flat_map(|w| {
-                w.staged.iter().flat_map(|m| {
-                    let unsynced = m.shards.entries.iter().filter(|e| !w.dir.published(e.seq));
-                    (unsynced.map(|e| w.dir.shard_path(e.seq))).chain([staging_path(&w.dir.path)])
-                })
+            work.iter().filter(|w| w.rename).flat_map(|w| {
+                let unsynced = w.manifest.shards.entries.iter().filter(|e| !w.dir.published(e.seq));
+                (unsynced.map(|e| w.dir.shard_path(e.seq))).chain([staging_path(&w.dir.path)])
             }),
             FsyncFlags::DATASYNC,
         )?;
         for w in &mut work {
-            if w.staged.is_some() {
+            if w.rename {
                 // The rename publishes every shard the manifest names.
                 commit(&w.dir.path)?;
                 w.dir.published_through = w.dir.seq;
@@ -547,12 +558,10 @@ impl StoreDir {
         // After every rename. A rename is metadata: a full fsync, not fdatasync.
         let dirs: BTreeSet<&Path> = work.iter().flat_map(|w| owed_dirs(&w.dir.path, w.first_sync)).collect();
         sync.sync_paths(&dirs, FsyncFlags::empty())?;
-        // No durable manifest names a superseded shard any more.
-        for FlushWork { dir, staged, .. } in work {
-            dir.in_place = match (staged, std::mem::replace(&mut dir.in_place, InPlace::Unknown)) {
-                (Some(m), _) | (None, InPlace::Renamed(m) | InPlace::Durable(m)) => InPlace::Durable(m),
-                (None, InPlace::Unknown) => unreachable!("a store stages nothing only over a manifest in place"),
-            };
+        // Each store's manifest, staged or re-synced, is now durable, and no
+        // durable manifest names a superseded shard any more.
+        for FlushWork { dir, manifest, .. } in work {
+            dir.in_place = InPlace::Durable(manifest);
             for seq in std::mem::take(&mut dir.retired) {
                 dir.unlink_shard(seq);
             }

@@ -20,7 +20,7 @@ impl CatalogEngine {
 
     /// The live row of single-column-keyed `family` at `id`.
     pub(in crate::catalog) fn live_sys_row(&self, family: SysFamily, id: u64) -> Option<StoredRow> {
-        self.sys_relation(family).live_row_at(&gnitz_wire::sys_key(id)).1
+        self.sys_relation(family).unique_live_row_at(&gnitz_wire::sys_key(id))
     }
 
     /// View `id`'s circuit, decoded from its `circuits` row.

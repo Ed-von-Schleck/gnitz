@@ -14,18 +14,17 @@ use gnitz_wire::RowSource;
 
 /// A [`ReadCursor`] turned into a forward probe of ascending PKs. Each
 /// [`Self::find`] gallops every run to the PK on its own, and folds the PK's
-/// rows across runs only where two or more runs hold it — unless one of the
-/// cursor's [newest-first heap runs](ReadCursor::mark_heap_newest_first) does
-/// and the probe is over a store of one row per PK, where that run decides it.
+/// rows across runs only where two or more runs hold it — unless the cursor's
+/// runs are [newest first](ReadCursor::mark_newest_first) and the probe is over
+/// a store of one row per PK, where the first run holding it decides it.
 pub(crate) struct GroupProbe<'c> {
     cursor: &'c mut ReadCursor,
     /// The row the cursor stood on when the probe began, until a key reaches
     /// its PK: the cursor's walk is already past it, and every row below it.
     pending: Option<CursorRow>,
-    /// The leading sources of which the first holding a PK decides it: the
-    /// cursor's newest-first heap runs where every PK nets 0 or one row at +1,
-    /// none otherwise.
-    deciding: usize,
+    /// Whether the first source holding a PK decides it: the sources are
+    /// newest first and every PK nets 0 or one row at +1.
+    newest_decides: bool,
 }
 
 impl ReadCursor {
@@ -39,11 +38,8 @@ impl ReadCursor {
         // An invalid cursor's runs are spent: every key finds none.
         let pending = self.valid.then_some(self.current);
         self.valid = false;
-        let deciding = match one_row_per_pk {
-            true => self.heap_newest_first as usize,
-            false => 0,
-        };
-        GroupProbe { cursor: self, pending, deciding }
+        let newest_decides = one_row_per_pk && self.newest_first;
+        GroupProbe { cursor: self, pending, newest_decides }
     }
 }
 
@@ -107,7 +103,7 @@ impl GroupProbe<'_> {
             }
             if ord.is_eq() {
                 // The runs after it can stay below the PK: a later key gallops them.
-                if i < self.deciding {
+                if self.newest_decides {
                     newest = Some(i);
                     break;
                 }
@@ -120,7 +116,7 @@ impl GroupProbe<'_> {
             let live = newest_decides(&sources[i], &mut states[i], i, key);
             debug_assert!(
                 folded.is_none_or(|f| f == live.map(|at| (at.src, at.row))),
-                "the newest heap run holding a PK answers what folding every run does",
+                "the newest run holding a PK answers what folding every run does",
             );
             return live;
         }

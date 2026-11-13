@@ -21,60 +21,42 @@ mod index;
 /// changes what is written. The index learns its run size from an
 /// [`L0Fold`](Self::L0Fold) and its cancel yield from a
 /// [`GuardSplit`](Self::GuardSplit), the one fold that reads a whole guard in
-/// place, and a [`BandCut`](Self::BandCut) leaves its outputs as the bands the
-/// plan folds down next; the rest only label the byte accounting of [`cstats`].
+/// place; the rest only label the byte accounting of `ShardIndex::stats`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum CompactionKind {
     L0Fold,
     GuardSplit,
-    /// The newest shards of a guard over the file threshold, folded into one.
+    /// The newest shards of an L1 guard over its file threshold, folded into one.
     TierFold,
-    /// An L1 guard cut into bands before a vertical.
+    /// An L1 guard cut at the terminal guard keys its extent spans, each band
+    /// sunk into the terminal guard it meets.
     BandCut,
+    /// A terminal guard holding more than one shard, folded whole.
     Vertical,
     GuardMerge,
     Dehydrate,
 }
 
-/// Per-trigger byte accounting over the folds [`ShardIndex::maintain`] runs.
+/// One trigger's byte accounting over the folds a [`ShardIndex`] installed.
 #[cfg(test)]
-pub(crate) mod cstats {
-    use super::CompactionKind;
-    use std::cell::RefCell;
-    use std::collections::BTreeMap;
+#[derive(Default)]
+struct Phase {
+    n: usize,
+    in_bytes: u64,
+    max_in: u64,
+    out_bytes: u64,
+    in_files: usize,
+}
 
-    #[derive(Default, Clone)]
-    pub(crate) struct Phase {
-        pub(crate) n: usize,
-        pub(crate) in_bytes: u64,
-        pub(crate) max_in: u64,
-        pub(crate) out_bytes: u64,
-        pub(crate) in_files: usize,
-    }
-
-    thread_local! {
-        static STATS: RefCell<BTreeMap<CompactionKind, Phase>> = const { RefCell::new(BTreeMap::new()) };
-    }
-
-    pub(super) fn record(kind: CompactionKind, inb: u64, outb: u64, inf: usize) {
-        STATS.with(|stats| {
-            let mut stats = stats.borrow_mut();
-            let p = stats.entry(kind).or_default();
-            p.n += 1;
-            p.in_bytes += inb;
-            p.max_in = p.max_in.max(inb);
-            p.out_bytes += outb;
-            p.in_files += inf;
-        });
-    }
-
-    pub(crate) fn reset() {
-        STATS.with(|stats| stats.borrow_mut().clear());
-    }
-
-    /// Every trigger that ran since the last [`reset`].
-    pub(crate) fn dump() -> BTreeMap<CompactionKind, Phase> {
-        STATS.with(|stats| stats.borrow().clone())
+#[cfg(test)]
+impl Phase {
+    /// A fold that read `inb` bytes over `inf` files and wrote `outb`.
+    fn add(&mut self, inb: u64, outb: u64, inf: usize) {
+        self.n += 1;
+        self.in_bytes += inb;
+        self.max_in = self.max_in.max(inb);
+        self.out_bytes += outb;
+        self.in_files += inf;
     }
 }
 
@@ -91,15 +73,16 @@ impl ShardIndex {
 /// of the key line.
 const LEVELS: usize = 2;
 /// Guards of overlapping shards, each folding its newest ones in place past
-/// [`GUARD_FILE_THRESHOLD`] and drained into the terminal level.
+/// its [`GUARD_FILE_THRESHOLD`] and drained into the terminal level.
 const L1: usize = 0;
-/// The deepest level: one shard per guard, keyed at the shard's least key, and
-/// the only level a sweep dehydrates.
+/// The deepest level: one shard per guard at rest, each guard keyed at its
+/// least row, and the only level a sweep dehydrates.
 const TERMINAL: usize = 1;
 /// L0 shards past this count trigger the fold into L1.
 pub(super) const L0_COMPACT_THRESHOLD: usize = 4;
-/// Files one guard holds at rest.
-const GUARD_FILE_THRESHOLD: usize = 4;
+/// Files one guard of each level holds at rest; a guard past it folds its
+/// newest shards into one.
+const GUARD_FILE_THRESHOLD: [usize; LEVELS] = [4, 1];
 /// The share of its rows a guard, or of the store's rows L0, may hold that a
 /// fold is expected to cancel before it folds for that alone: the rows a
 /// retraction and the row it retracts take up until one merge reads both.
@@ -221,11 +204,16 @@ fn extent<'a>(entries: impl Iterator<Item = &'a ShardEntry>) -> Option<(PkBuf, P
 /// pass would repeat on them indefinitely. That is the one limit of `target` as
 /// a bound, and it is inherent: a guard boundary *is* a key, so rows sharing a
 /// PK cannot be split across one.
+///
+/// Entries mixing skeleton and hydrated shards fold to `key` alone: the output
+/// is a skeleton, one row per key, so a part count derived from the hydrated
+/// bytes would shatter it.
 fn fold_destinations<'a>(key: PkBuf, entries: impl Iterator<Item = &'a ShardEntry> + Clone, target: u64) -> Vec<PkBuf> {
     let mut keys = vec![key];
     let bytes: u64 = entries.clone().map(|e| e.shard.file_len()).sum();
     let parts = bytes.div_ceil(target).min(MAX_PARTS) as usize;
-    if parts >= 2 && extent(entries.clone()).is_some_and(|(lo, hi)| lo < hi) {
+    let skeleton = |s: bool| entries.clone().any(|e| e.shard.is_skeleton() == s);
+    if parts >= 2 && !(skeleton(true) && skeleton(false)) && extent(entries.clone()).is_some_and(|(lo, hi)| lo < hi) {
         // About `SPLIT_SAMPLES` row keys: each shard is sorted and its PK region
         // fixed-stride, so a key is one O(1) read.
         let rows: usize = entries.clone().map(|e| e.shard.row_count()).sum();
@@ -331,10 +319,9 @@ pub(super) struct ShardIndex {
     upkeep_overdraft: u64,
     /// The fold under way, between two calls of [`Self::maintain`].
     running: Option<index::Running>,
-    /// The L1 guards a band cut left to fold down, by guard key, the lowest
-    /// last. While any is left nothing else reshapes L1 or the terminal level:
-    /// the bands were cut against the terminal partition as it stood.
-    bands: Vec<PkBuf>,
+    /// Per-trigger byte accounting of the folds this index installed.
+    #[cfg(test)]
+    stats: std::collections::BTreeMap<CompactionKind, Phase>,
 }
 
 /// How many rows a retraction is expected to cancel when a fold brings it
@@ -398,14 +385,18 @@ impl ShardIndex {
             owed: !shards.entries.is_empty(),
             upkeep_overdraft: 0,
             running: None,
-            bands: Vec::new(),
+            #[cfg(test)]
+            stats: Default::default(),
         };
         for e in &shards.entries {
             let entry = ShardEntry::open(&idx.dir.shard_path(e.seq), e.seq, &idx.schema, e.newest)?;
             match e.level {
                 // L0's manifest entries, pending ones included, carry no guard.
                 0 => idx.l0.push(entry),
-                level if level as usize <= LEVELS => idx.register(level as usize - 1, e.guard_key, entry),
+                level if level as usize <= LEVELS => idx.levels[level as usize - 1]
+                    .get_or_create_guard(e.guard_key)
+                    .entries
+                    .push(entry),
                 _ => return Err(StorageError::Corrupt("manifest level")),
             }
         }
@@ -445,11 +436,12 @@ impl ShardIndex {
     pub(super) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
         if schema != self.schema {
             self.abandon_fold();
-            let rebound: Vec<Rc<MappedShard>> = self
-                .all_entries()
+            // Every rebind first, so a failure leaves each entry as it was.
+            let mut entries: Vec<&mut ShardEntry> = self.all_entries_mut().collect();
+            let rebound: Vec<Rc<MappedShard>> = (entries.iter())
                 .map(|e| e.shard.rebind(&schema).map(Rc::new))
                 .collect::<Result<_, _>>()?;
-            for (e, shard) in self.all_entries_mut().zip(rebound) {
+            for (e, shard) in entries.iter_mut().zip(rebound) {
                 e.shard = shard;
             }
         }

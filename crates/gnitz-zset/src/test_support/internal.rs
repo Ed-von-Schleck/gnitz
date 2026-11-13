@@ -67,6 +67,11 @@ impl TestTrace {
         }
     }
 
+    /// The runs, oldest first.
+    pub(crate) fn runs(&self) -> &[Rc<Batch>] {
+        &self.runs
+    }
+
     /// A cursor over every run.
     pub(crate) fn cursor(&self) -> ReadCursor {
         from_runs(self.runs.iter().cloned().map(Run::Mem), self.schema)

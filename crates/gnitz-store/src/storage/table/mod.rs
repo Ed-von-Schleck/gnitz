@@ -15,8 +15,14 @@
 //! run is the consolidated sum of a contiguous stretch of ingests, and every
 //! heap run is newer than every shard below the cut: a barrier empties every
 //! heap tier into shards, a spill moves the oldest, and an ingest below the cut
-//! lands only while nothing is pending. Readers rely on that order: a cursor is
-//! [marked](ReadCursor::mark_heap_newest_first) heap newest first, and
+//! lands only while nothing is pending.
+//!
+//! Every reader lists the runs newest first: the heap tiers, then the shards
+//! with the pending ones first. That puts the pending shards after the
+//! memtable and the RAM tier, which is their age order only because a barrier
+//! that writes a pending shard empties both, and nothing lands below the cut
+//! while a shard is pending. Readers rely on that order: a cursor is
+//! [marked](ReadCursor::mark_newest_first) newest first, and
 //! [`Table::unique_live_row_at`] lets the newest run holding a key decide it.
 //!
 //! A row and its retraction stay stored until a fold merges their runs. An open
@@ -24,7 +30,6 @@
 //! under it.
 
 use std::cell::Cell;
-use std::ops::Range;
 use std::rc::Rc;
 
 use super::manifest::RecoverySource;
@@ -35,7 +40,7 @@ use gnitz_wire::{KeyRange, PkBuf, PkKeys};
 use gnitz_zset::repr::Batch;
 use gnitz_zset::repr::StorageError;
 use gnitz_zset::repr::{empty_cursor, from_runs, from_runs_at, from_runs_in_band, PkSetGather, ReadCursor};
-use gnitz_zset::repr::{first_live_payload_group, Run, StoredRow};
+use gnitz_zset::repr::{Run, StoredRow};
 use gnitz_zset::schema::SchemaDescriptor;
 use gnitz_zset::schema::{group_band, probe_key, range_band};
 
@@ -81,9 +86,6 @@ pub(crate) struct Table {
     /// persists.
     held_in_ram: bool,
 
-    /// `live_row_at`'s candidate pool, kept between calls for its capacity.
-    live_row_scratch: Cell<Vec<StoredRow>>,
-
     /// Last `full_scan` result, held until the row set moves.
     cached_full_scan: Cell<Option<Rc<Batch>>>,
 
@@ -114,7 +116,6 @@ impl Table {
             ram_tier: RunSet::cancelling(ram_tier_bytes),
             shard_index,
             held_in_ram: false,
-            live_row_scratch: Cell::new(Vec::new()),
             cached_full_scan: Cell::new(None),
             live_floor: Default::default(),
         })
@@ -288,8 +289,8 @@ impl Table {
             .skip(usize::from(cut == Cut::Sealed))
     }
 
-    /// The runs `cut` reads whose PK extent meets the inclusive `bound`, heap
-    /// tiers newest first and then the shards; `None` takes them all.
+    /// The runs `cut` reads whose PK extent meets the inclusive `bound`, in the
+    /// newest-first order the module doc states; `None` takes them all.
     fn sources<'s, 'b>(
         &'s self,
         bound: Option<(&'b [u8], &'b [u8])>,
@@ -317,7 +318,7 @@ impl Table {
             Some(at) => from_runs_at(runs, schema, at.pk_bytes()),
             None => from_runs(runs, schema),
         };
-        cursor.mark_heap_newest_first();
+        cursor.mark_newest_first();
         if !judged {
             let first_live = cursor.passed_more_than_a_seek().then(|| match cursor.is_valid() {
                 true => PkBuf::from_bytes(cursor.current_pk_bytes()),
@@ -418,7 +419,7 @@ impl Table {
         );
         let runs = self.sources(Some((start.pk_bytes(), hi.pk_bytes())), cut);
         let mut cursor = from_runs_in_band(runs, schema, start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes));
-        cursor.mark_heap_newest_first();
+        cursor.mark_newest_first();
         cursor
     }
 
@@ -447,43 +448,8 @@ impl Table {
     // PK lookups
     // ------------------------------------------------------------------
 
-    /// Byte-keyed PK existence check: the net weight across every tier is
-    /// positive.
-    #[inline]
-    pub(crate) fn has_pk_bytes(&self, key: &[u8]) -> bool {
-        let mut w: i64 = 0;
-        self.for_each_pk_candidate(key, |run, row| w += run.get_weight(row));
-        w > 0
-    }
-
-    /// Visit every row whose PK equals `key`, newest run first, which puts
-    /// `live_row_at`'s live row ahead of the retracted history it would
-    /// otherwise scan past. The heap tiers go ahead of the pending shards, which
-    /// the module doc orders between the memtable and the `pending` set: a
-    /// barrier that writes a pending shard empties the memtable and the RAM
-    /// tier, and nothing lands below the cut while a shard is pending.
-    ///
-    /// A visitor rather than an iterator: an adaptor chain over the tiers does
-    /// not inline into the per-key probes.
-    fn for_each_pk_candidate(&self, key: &[u8], mut f: impl FnMut(&Run, usize)) {
-        let fingerprint = probe_key(key);
-        let mut visit = |run: Run, rows: Range<usize>| {
-            for row in rows {
-                f(&run, row);
-            }
-        };
-        for set in self.ram_tiers(Cut::Now) {
-            for (batch, rows) in set.holding(key, fingerprint) {
-                visit(Run::Mem(Rc::clone(batch)), rows);
-            }
-        }
-        for (shard, rows) in self.shard_index.holding(key, fingerprint) {
-            visit(Run::Shard(Rc::clone(shard)), rows);
-        }
-    }
-
-    /// [`Self::live_row_at`]'s row, for a store whose every key nets 0 or 1 —
-    /// a base table's, under its unique-PK rule.
+    /// The live row at OPK `key`, for a store whose every key nets 0 or 1 — a
+    /// base table's under its unique-PK rule, or a system family's.
     ///
     /// By the run order the module doc states, the newest run holding `key`
     /// decides it: what that stretch of ingests left is the key's state now,
@@ -492,7 +458,6 @@ impl Table {
     /// deleted the key.
     #[inline]
     pub(crate) fn unique_live_row_at(&self, key: &[u8]) -> Option<StoredRow> {
-        // The first run [`Self::for_each_pk_candidate`] visits.
         let fp = probe_key(key);
         let heap = self.ram_tiers(Cut::Now).find_map(|set| set.holding(key, fp).next());
         let (run, mut rows) = match heap {
@@ -505,7 +470,7 @@ impl Table {
         let live = (rows.find(|&row| run.get_weight(row) > 0)).map(|row| StoredRow::new(run, row));
         debug_assert!(
             {
-                let (w, _) = self.live_row_at(key);
+                let w = self.net_weight_at(key);
                 w == i64::from(live.is_some()) && (0..=1).contains(&w)
             },
             "unique_live_row_at: a key nets 0 or 1, and 1 exactly when it answers a row",
@@ -513,37 +478,18 @@ impl Table {
         live
     }
 
-    /// The net weight at OPK `key` and, when it is positive, a live
-    /// (PK, payload) row: one whose payload group across every tier nets
-    /// positive.
-    pub(crate) fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
-        // The scratch pool is taken only once a candidate turns up: most probes
-        // of a fresh key find none.
-        let mut pool = None;
-        let mut total_w: i64 = 0;
-        self.for_each_pk_candidate(key, |run, row| {
-            total_w += run.get_weight(row);
-            pool.get_or_insert_with(|| self.live_row_scratch.take())
-                .push(StoredRow::new(run.clone(), row));
-        });
-        let Some(mut pool) = pool else {
-            return (0, None);
-        };
-
-        let mut row = None;
-        if total_w > 0 {
-            let schema = &self.shard_index.schema;
-            let winner = first_live_payload_group(schema, &pool);
-            debug_assert!(
-                winner.is_some(),
-                "positive net PK weight implies a positive payload group"
-            );
-            row = winner.map(|i| pool.swap_remove(i));
-        }
-
-        pool.clear();
-        self.live_row_scratch.set(pool);
-        (total_w, row)
+    /// The net weight at OPK `key`, summed over every run of every tier: the
+    /// check [`Self::unique_live_row_at`]'s newest-run answer is held to.
+    pub(crate) fn net_weight_at(&self, key: &[u8]) -> i64 {
+        let fp = probe_key(key);
+        let heap = self.ram_tiers(Cut::Now).flat_map(|set| set.holding(key, fp));
+        let heap: i64 = heap
+            .map(|(batch, rows)| rows.map(|r| batch.get_weight(r)).sum::<i64>())
+            .sum();
+        let shards = self.shard_index.holding(key, fp);
+        heap + shards
+            .map(|(shard, rows)| rows.map(|r| shard.get_weight(r)).sum::<i64>())
+            .sum::<i64>()
     }
 }
 
