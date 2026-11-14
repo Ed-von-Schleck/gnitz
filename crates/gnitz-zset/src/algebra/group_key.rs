@@ -2,11 +2,18 @@
 //! join key or a placement prefix to the PK bytes its consumer keys by: the
 //! exchange scatter routes by it, and [`GroupOutKey`] groups and keys the rows of
 //! an operator keyed like a reduce (the reduce, the ad-hoc fold, the top-N and
-//! the window) by it — a group is its output PK.
+//! the window) by it — a group is its output PK. Because the scatter and the
+//! reduce resolve a group set through the one [`GroupKey::new`], a reduce's
+//! input is co-partitioned by its output PK.
+//!
+//! It also numbers a batch's groups for the reduce and the ad-hoc fold:
+//! [`GroupOutKey::runs_into`] where a consolidated batch already stands in key
+//! order, else [`GroupOutKey::numbered_into`] — one ordinal per row, hashed
+//! while the groups are few for the rows, else sorted.
 
 use super::key_pack::{locate_key_col, pk_run, KeyPacker, FOLD_CHUNK_MIN_ROWS};
-use super::{vec_bytes, zeroed};
-use crate::repr::{Batch, MemBatch};
+use super::zeroed;
+use crate::repr::{vec_bytes, Batch, MemBatch};
 use crate::schema::{pk_width_dispatch, DerivedSchema, PkSortKey, SchemaColumn, SchemaDescriptor};
 use gnitz_expr::{ColumnLocator, ReduceOutKey, ReduceOutSlot};
 use gnitz_wire::{TypeCode, NARROW_PK_MAX_BYTES};
@@ -295,7 +302,7 @@ impl GroupOutKey {
     /// range wider than 16 bytes, [`Self::out_pk_with`] rebuilds the output PK
     /// from it. The key's form and width are matched once per call.
     #[inline]
-    pub(crate) fn with_identity<L: IdentityLoop>(&self, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
+    pub(super) fn with_identity<L: IdentityLoop>(&self, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
         match self.key.form(mb) {
             KeyForm::Cells(cells) => {
                 for_key_cells!(cells, |W, OPK| body
@@ -404,15 +411,11 @@ impl GroupScratch {
 fn packed_identity<L: IdentityLoop>(p: &KeyPacker, mb: &MemBatch, rows: &[(usize, usize)], body: L) -> L::Out {
     let (n, read) = (mb.len(), crate::repr::range_rows(rows));
     let few = |k: usize| k * PACK_ROWS_MIN_SPARSITY <= n;
-    let packed = match p.packs_without_hashing() {
-        _ if rows == [(0, n)] => rows,
-        // Packing every row costs less than packing the rows of `rows` alone;
-        // each is widened only as it is read.
-        true if !(few(rows.len()) && few(read)) => {
-            let (mut keys, w) = (vec![0u8; n * p.out_stride], p.out_stride);
-            p.pack_rows(&mut keys, w, mb, &[(0, n)]);
-            return body.run(|r| gnitz_wire::widen_pk_be(&keys[r * w..(r + 1) * w]));
-        }
+    let all = [(0, n)];
+    let packed: &[(usize, usize)] = match p.packs_without_hashing() {
+        _ if rows == all => rows,
+        // Packing every row costs less than packing the rows of `rows` alone.
+        true if !(few(rows.len()) && few(read)) => &all,
         false if read >= FOLD_CHUNK_MIN_ROWS * rows.len() => rows,
         _ => return body.run(|r| p.narrow_image(mb, r)),
     };

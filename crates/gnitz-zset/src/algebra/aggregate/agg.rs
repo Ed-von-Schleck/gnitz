@@ -4,8 +4,8 @@ use std::cmp::Ordering;
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::algebra::{vec_bytes, zeroed};
-use crate::repr::{Batch, DirectWriter, MemBatch};
+use crate::algebra::zeroed;
+use crate::repr::{vec_bytes, Batch, DirectWriter, MemBatch};
 use gnitz_expr::ColumnLocator;
 use gnitz_wire::{for_each_fixed_int, int_cell, AggFunc, FixedInt, ScalarKind};
 use gnitz_wire::{RowSource, TypeCode};

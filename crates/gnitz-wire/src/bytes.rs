@@ -38,7 +38,7 @@ pub trait LeScalar: Copy + sealed::Sealed {}
 macro_rules! le_scalar {
     ($($t:ty),*) => { $(impl sealed::Sealed for $t {} impl LeScalar for $t {})* };
 }
-le_scalar!(u32, u64, i64);
+le_scalar!(u32, u64, i64, u128);
 
 /// A `&[T]` of LE scalars as the region bytes it already is, without a copy.
 #[inline(always)]

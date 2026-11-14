@@ -1,9 +1,8 @@
 //! Linear operators: filter and union, with the union's merged output schema and
 //! an outer join's null-extend output schema.
 //!
-//! The others live with the batch mechanics they are: negate is
-//! `Batch::negated`, MAP `crate::algebra::MapPlan::evaluate_map_batch`, and
-//! null-extend's rows `Batch::widened_with_nulls`.
+//! Negate and null-extend's rows are batch mechanics, `Batch::negated` and
+//! `Batch::widened_with_nulls`; MAP is `MapPlan`, in the sibling `map` module.
 
 use std::borrow::Cow;
 

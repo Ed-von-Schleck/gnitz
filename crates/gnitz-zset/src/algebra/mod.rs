@@ -4,7 +4,7 @@
 //!   - `map`         — `MapPlan`, the columnar driver behind every map and projection
 //!   - `exchange`    — the scatter plan of a worker exchange
 //!   - `aggregate`   — the aggregates, a reduce's row shape, and the ad-hoc fold
-//!   - `group_key`   — the key a row is grouped or routed by, and the output PK a reduce stamps
+//!   - `group_key`   — the key a row is grouped or routed by, the output PK a reduce stamps, and a batch's groups numbered
 //!   - `key_pack`    — the packed keys of a join, a group and an index span, and the row digest
 //!   - `index_entry` — a secondary index's key span, its entries, and their spans alone
 //!   - `order_image` — the byte images an ordered index keys by
@@ -44,8 +44,6 @@ pub(crate) use group_key::{ground_pk, GroupOrdinals, GroupOutKey, GroupScratch, 
 pub(crate) use key_pack::KeyPacker;
 pub(crate) use map::copy_columns;
 pub(crate) use order_image::{image_slot_col, ImageCol, IMAGE_COL};
-
-pub(crate) use crate::repr::vec_bytes;
 
 /// `v` as `n` zeros: freshly allocated zeroed where it lacks the room, else
 /// overwritten in place.

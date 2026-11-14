@@ -25,8 +25,8 @@ fn slot_bytes(tc: TypeCode, native: u128, target: TypeCode) -> Vec<u8> {
 
 /// Two rows fold to one key exactly when they agree on every folded column, a
 /// NULL told from a zero and from an empty string. Up to `FOLD_INLINE_COLS`
-/// fixed-width columns fold on the stack, a wider set or one holding a string
-/// through the scratch. The fold of no columns is V₀.
+/// columns fold on the stack, a wider set through the scratch; a repeated
+/// column shares its null bit.
 #[test]
 fn a_fold_keys_a_row_by_its_columns() {
     use TypeCode::*;
@@ -64,8 +64,6 @@ fn a_fold_keys_a_row_by_its_columns() {
     let b = b.finish();
     let mb = b.as_mem_batch();
 
-    let empty = FoldCols::new(Vec::new());
-    assert_eq!(empty.key_row(&mb, 0), gnitz_wire::global_group_key());
     for cols in [
         &[1][..],
         &[1, 2],
@@ -76,12 +74,6 @@ fn a_fold_keys_a_row_by_its_columns() {
         &[1, 2, 3, 4, 1, 2],
     ] {
         let f = FoldCols::new(cols.iter().map(|&c| schema.locate(c)).collect());
-        let layout = match () {
-            _ if cols.contains(&5) => FoldLayout::Rows,
-            _ if cols.len() <= FOLD_INLINE_COLS => FoldLayout::Inline,
-            _ => FoldLayout::Tagged,
-        };
-        assert_eq!(f.layout, layout, "{cols:?}");
         let keys: Vec<u128> = (0..rows.len()).map(|r| f.key_row(&mb, r)).collect();
         let vals = |r: usize| -> Vec<Option<u128>> { cols.iter().map(|&c| rows[r][c - 1]).collect() };
         for x in 0..rows.len() {
@@ -397,13 +389,14 @@ mod pack_proptest {
 /// persisted key — over random schemas: PK columns at any offset of a compound
 /// PK, payload columns of every integer width, signed and not, nullable or not,
 /// strings among them, and folds of one to eight columns (repeats allowed), so
-/// every layout is reached; over chunks that start anywhere and end short.
+/// a string is assembled on the stack and through the scratch; over chunks that
+/// start anywhere and end short.
 #[test]
 fn keys_chunk_digests_each_row_as_key_row_does() {
     use TypeCode::*;
     let mut rng = Rng::new(0xf01d);
     let payload = [U8, I8, U16, I16, U32, I32, U64, I64, U128, I128, String];
-    let mut layouts = std::collections::HashSet::new();
+    let mut paths = std::collections::HashSet::new();
     for _ in 0..200 {
         let s = random_schema(&mut rng, &payload, true);
         let n = 1 + rng.gen_range(600) as usize;
@@ -434,7 +427,8 @@ fn keys_chunk_digests_each_row_as_key_row_does() {
         let k = 1 + rng.gen_range(8) as usize;
         let cols: Vec<usize> = (0..k).map(|_| rng.gen_range(s.num_columns() as u64) as usize).collect();
         let f = FoldCols::new(cols.iter().map(|&c| s.locate(c)).collect());
-        layouts.insert(format!("{:?}", f.layout));
+        let has_string = cols.iter().any(|&c| s.columns()[c].type_code.is_german_string());
+        paths.insert((has_string, k > FOLD_INLINE_COLS));
         let want: Vec<u128> = (0..n).map(|r| f.key_row(&mb, r)).collect();
         let mut all = Vec::new();
         f.for_each_chunk(&mb, &[(0, n)], |start, keys| {
@@ -449,5 +443,9 @@ fn keys_chunk_digests_each_row_as_key_row_does() {
         f.keys_chunk(&mb, start, &mut chunk);
         assert_eq!(chunk, want[start..start + len], "{cols:?} from row {start}");
     }
-    assert_eq!(layouts.len(), 3, "every layout reached: {layouts:?}");
+    assert_eq!(
+        paths.len(),
+        4,
+        "every assembly reached, with and without a string: {paths:?}"
+    );
 }

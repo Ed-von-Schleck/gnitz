@@ -2,8 +2,8 @@
 //! routing-key kernels.
 
 use super::group_key::{cell_image, for_key_cells, GroupKey, KeyCells, KeyForm};
-use super::key_pack::{filled, KeyPacker};
-use super::route::{ground_owner, worker_for_key, worker_for_pk_bytes, worker_for_wide_pk, Placement, Slot};
+use super::key_pack::{filled, KeyPacker, FOLD_CHUNK};
+use super::route::{ground_owner, worker_for_key, worker_for_wide_pk, Placement, Slot};
 use crate::repr::{Batch, MemBatch};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{zip_cells, MAX_PK_BYTES, NARROW_PK_MAX_BYTES};
@@ -83,10 +83,11 @@ impl ScatterPlan {
         match self.0 {
             Some(ref key) if nw > 1 => match key.form(mb) {
                 KeyForm::Cells(cells) => {
-                    for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(&cells, mb.weight(), 0, sink, nw))
+                    for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(&cells, mb.weight(), sink, nw))
                 }
                 KeyForm::WidePk { at, n } => route_rows(mb, sink, PkRangeW { at, n, nw }),
-                KeyForm::Packed(packer) => route_rows_packed(mb, sink, packer, nw),
+                KeyForm::Packed(p) if p.out_stride <= NARROW_PK_MAX_BYTES => route_identities(mb, sink, p, nw),
+                KeyForm::Packed(p) => route_rows_packed(mb, sink, p, nw),
                 // The one group of no columns has one owner, and no key to hash.
                 KeyForm::Global => route_rows(mb, sink, Owner(ground_owner(nw))),
             },
@@ -167,16 +168,10 @@ fn route_rows<W: RowWorker>(mb: &MemBatch, sink: &mut impl RowSink, w: W) {
 }
 
 /// [`route_rows`] for a key that is one `W`-byte cell per row: each nonzero-weight row to the
-/// owner of its cell's image, the rows numbered from `first_row`.
+/// owner of its cell's image.
 #[inline(never)]
-fn route_cells<const W: usize, const OPK: bool>(
-    cells: &KeyCells,
-    weights: &[u8],
-    first_row: u32,
-    sink: &mut impl RowSink,
-    nw: usize,
-) {
-    let rows = weights.as_chunks::<8>().0.iter().zip(first_row..);
+fn route_cells<const W: usize, const OPK: bool>(cells: &KeyCells, weights: &[u8], sink: &mut impl RowSink, nw: usize) {
+    let rows = weights.as_chunks::<8>().0.iter().zip(0u32..);
     zip_cells::<W, _>(cells.region, cells.stride, cells.off, rows, |cell, (weight, row)| {
         if *weight != [0; 8] {
             sink.put(worker_for_key(cell_image::<W, OPK>(cell, cells.signed), nw), row);
@@ -184,44 +179,43 @@ fn route_cells<const W: usize, const OPK: bool>(
     });
 }
 
-/// Rows [`route_rows_packed`] packs per [`KeyPacker::pack_rows`] call.
-const KEY_CHUNK: usize = 256;
+/// [`route_rows`] for a packed key of at most 16 bytes: each nonzero-weight row to the
+/// owner of its [`KeyPacker::identities`], taken a chunk of rows at a time.
+#[inline(never)]
+fn route_identities(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker, nw: usize) {
+    let (rows, weights) = (mb.len(), mb.weight().as_chunks::<8>().0);
+    let mut buf = [MaybeUninit::<u128>::uninit(); FOLD_CHUNK];
+    let ids = filled(&mut buf[..rows.min(FOLD_CHUNK)], 0);
+    for start in (0..rows).step_by(FOLD_CHUNK) {
+        let ids = &mut ids[..(rows - start).min(FOLD_CHUNK)];
+        packer.identities(mb, start, ids);
+        for ((id, weight), row) in ids.iter().zip(&weights[start..]).zip(start as u32..) {
+            if *weight != [0; 8] {
+                sink.put(worker_for_key(*id, nw), row);
+            }
+        }
+    }
+}
 
-/// [`route_rows`] for a packed key, packed a chunk of rows at a time into a stack buffer.
-/// The buffer is zeroed only as far as the first chunk's keys reach, since no later chunk
-/// is longer; [`KeyPacker::pack_rows`] writes every byte of each key it packs, so a chunk
-/// reads no key left by the one before.
+/// [`route_rows`] for a packed key wider than 16 bytes, packed a chunk of rows at a time
+/// into a stack buffer. The buffer is zeroed only as far as the first chunk's keys reach,
+/// since no later chunk is longer; [`KeyPacker::pack_rows`] writes every byte of each key
+/// it packs, so a chunk reads no key left by the one before.
 #[inline(never)]
 fn route_rows_packed(mb: &MemBatch, sink: &mut impl RowSink, packer: &KeyPacker, nw: usize) {
-    let (rows, width) = (mb.len(), packer.out_stride);
-    let mut buf = [MaybeUninit::<u8>::uninit(); KEY_CHUNK * MAX_PK_BYTES];
-    let keys = filled(&mut buf[..rows.min(KEY_CHUNK) * width], 0);
-    for start in (0..rows).step_by(KEY_CHUNK) {
-        let n = (rows - start).min(KEY_CHUNK);
+    let (rows, width, weights) = (mb.len(), packer.out_stride, mb.weight().as_chunks::<8>().0);
+    let mut buf = [MaybeUninit::<u8>::uninit(); FOLD_CHUNK * MAX_PK_BYTES];
+    let keys = filled(&mut buf[..rows.min(FOLD_CHUNK) * width], 0);
+    for start in (0..rows).step_by(FOLD_CHUNK) {
+        let n = (rows - start).min(FOLD_CHUNK);
         packer.pack_rows(keys, width, mb, &[(start, start + n)]);
-        if width <= NARROW_PK_MAX_BYTES {
-            // A packed key is an OPK image of `width` bytes per row.
-            let weights = &mb.weight()[start * 8..(start + n) * 8];
-            let cells = KeyCells {
-                region: &keys[..n * width],
-                stride: width,
-                off: 0,
-                width,
-                opk: true,
-                signed: false,
-            };
-            for_key_cells!(cells, |W, OPK| route_cells::<W, OPK>(
-                &cells,
-                weights,
-                start as u32,
-                sink,
-                nw
-            ));
-        } else {
-            for (row, key) in (start..).zip(keys.chunks_exact(width).take(n)) {
-                if mb.get_weight(row) != 0 {
-                    sink.put(worker_for_pk_bytes(key, nw), row as u32);
-                }
+        let rows = keys
+            .chunks_exact(width)
+            .zip(&weights[start..start + n])
+            .zip(start as u32..);
+        for ((key, weight), row) in rows {
+            if *weight != [0; 8] {
+                sink.put(worker_for_wide_pk(key, nw), row);
             }
         }
     }

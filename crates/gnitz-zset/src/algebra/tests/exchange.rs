@@ -1,5 +1,6 @@
 use super::*;
 use crate::algebra::group_key::GroupOutKey;
+use crate::algebra::route::worker_for_pk_bytes;
 use crate::algebra::{ground_owner, MapPlan, Placement};
 use crate::repr::BatchBuilder;
 use crate::schema::SchemaColumn;
