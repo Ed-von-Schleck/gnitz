@@ -73,6 +73,31 @@ fn copy_regions(schema: &SchemaDescriptor, src: &[u8], src_cap: usize, dst: &mut
     }
 }
 
+/// A fresh arena of `cap` rows under `schema` holding the `count` rows of
+/// `src`, an arena of `src_cap` rows; the rows past `count` are uninitialized.
+/// `exact` sizes the buffer as [`PooledBuf::uninit_exact`] does, else as
+/// [`PooledBuf::uninit`] does.
+fn arena_copy(
+    schema: &SchemaDescriptor,
+    src: &[u8],
+    src_cap: usize,
+    count: usize,
+    cap: usize,
+    exact: bool,
+) -> PooledBuf {
+    let len = cap * schema.row_width();
+    // SAFETY: `copy_regions` writes the `count` rows a `Batch` reads.
+    let mut data = unsafe {
+        if exact {
+            PooledBuf::uninit_exact(len)
+        } else {
+            PooledBuf::uninit(len)
+        }
+    };
+    copy_regions(schema, src, src_cap, &mut data, cap, count);
+    data
+}
+
 /// Which row of a batch before [`Batch::consolidate_recording`] each row after
 /// it was.
 pub(crate) enum RowOrigins {
@@ -156,6 +181,46 @@ impl Batch {
         b
     }
 
+    /// A batch of `rows` rows, every one written in place by `write_fn` through
+    /// a [`DirectWriter`] over its uninitialized arena, with `max_blob` heap
+    /// bytes reserved up front. Zero rows allocate no arena, and a heap the
+    /// rows left empty is released.
+    pub(crate) fn write_new(
+        schema: &SchemaDescriptor,
+        rows: usize,
+        max_blob: usize,
+        write_fn: impl FnOnce(&mut DirectWriter),
+    ) -> Self {
+        Self::write_new_carrying(schema, rows, max_blob, &[], write_fn)
+    }
+
+    /// [`write_new`](Self::write_new) with each `(heap, at, dead)` of
+    /// `carried` [adopted](Self::adopt_heap) in order before any row is
+    /// written, landing at base `at`: 0 for the first, each next one after
+    /// those before it. Zero rows carry no heap.
+    pub(crate) fn write_new_carrying(
+        schema: &SchemaDescriptor,
+        rows: usize,
+        max_blob: usize,
+        carried: &[(&[u8], usize, usize)],
+        write_fn: impl FnOnce(&mut DirectWriter),
+    ) -> Self {
+        if rows == 0 {
+            return Self::empty_with_schema(schema);
+        }
+        let mut b = Self::with_capacity(schema, rows);
+        b.reserve_blob(max_blob);
+        for &(heap, at, dead) in carried {
+            let base = b.adopt_heap(heap, dead, 0);
+            debug_assert_eq!(base, at, "carried heaps land in order, back to back");
+        }
+        b.write_rows(rows, write_fn);
+        if b.blob.is_empty() {
+            b.blob = PooledBuf::default();
+        }
+        b
+    }
+
     /// Room for `bytes` more blob heap bytes, grown as [`PooledBuf::reserve_pooled`]
     /// grows a buffer: the bytes move verbatim, so cell offsets and `dead_heap`
     /// still hold. A schema with no string column has no heap to reserve.
@@ -230,31 +295,26 @@ impl Batch {
         self
     }
 
-    /// The live `count * stride` bytes of region `r`, the range every
-    /// whole-region accessor below reads.
-    #[inline(always)]
-    fn region(&self, r: usize) -> &[u8] {
-        let off = self.region_start(r);
-        &self.data[off..off + self.count * self.schema.region_stride(r)]
-    }
-
     /// Where region `r` starts in the arena.
     #[inline(always)]
     fn region_start(&self, r: usize) -> usize {
         self.schema.region_start(r, self.capacity)
     }
 
+    /// [`MemBatch::pk`].
     #[inline]
     pub fn pk(&self) -> &[u8] {
-        self.region(REG_PK)
+        self.as_mem_batch().pk()
     }
+    /// [`MemBatch::weight`].
     #[inline]
     pub(crate) fn weight(&self) -> &[u8] {
-        self.region(REG_WEIGHT)
+        self.as_mem_batch().weight()
     }
+    /// [`MemBatch::null_bmp`].
     #[inline]
     pub(crate) fn null_bmp(&self) -> &[u8] {
-        self.region(REG_NULL_BMP)
+        self.as_mem_batch().null_bmp()
     }
 
     /// The `[start, end)` runs of rows with no null bit of `mask` set.
@@ -266,9 +326,10 @@ impl Batch {
         }
         runs_where(words, |w| u64::from_le_bytes(*w) & mask == 0)
     }
+    /// [`MemBatch::col_data`].
     #[inline]
-    pub fn col_data(&self, pi: usize) -> &[u8] {
-        self.region(REG_PAYLOAD_START + pi)
+    pub(crate) fn col_data(&self, pi: usize) -> &[u8] {
+        self.as_mem_batch().col_data(pi)
     }
 
     // ── Row accessors ───────────────────────────────────────────────────
@@ -345,10 +406,7 @@ impl Batch {
         let new_cap = schema.arena_rows((self.capacity * 2).max(8).max(self.count + n));
         let new_total = new_cap * schema.row_width();
         if new_total > self.data.capacity() {
-            // SAFETY: `copy_regions` writes the `count` rows a `Batch` reads.
-            let mut new_data = unsafe { PooledBuf::uninit(new_total) };
-            copy_regions(schema, &self.data, self.capacity, &mut new_data, new_cap, self.count);
-            self.data = new_data;
+            self.data = arena_copy(schema, &self.data, self.capacity, self.count, new_cap, false);
         } else {
             // The arena has room already: shift each region to its new start, last
             // first, so none lands on one still to move.
@@ -647,7 +705,7 @@ impl Batch {
     /// to overwrite cells. A row named twice shares its strings' heap bytes.
     pub(crate) fn indexed_rows_then(&self, indices: &[u32], then: impl FnOnce(&mut DirectWriter<'_>)) -> Self {
         let blob_cap = string_heap::prorated_blob_cap(self.blob.len(), self.count, indices.len());
-        write_to_batch(&self.schema, indices.len(), blob_cap, |writer| {
+        Self::write_new(&self.schema, indices.len(), blob_cap, |writer| {
             super::scatter::scatter_copy(&self.as_mem_batch(), indices, writer);
             then(writer);
         })
@@ -705,8 +763,7 @@ impl Batch {
     /// dropped. Left unconsolidated: rows may now share a key.
     pub fn keyed_by_prefix(&self, out_schema: &SchemaDescriptor) -> Batch {
         debug_assert_eq!(out_schema.num_payload_cols(), 0, "keyed_by_prefix keeps no payload");
-        let mut out = Self::with_capacity(out_schema, self.count);
-        out.write_rows(self.count, |w| {
+        Self::write_new(out_schema, self.count, 0, |w| {
             let (pk, weights, nulls) = w.fixed_mut();
             weights.copy_from_slice(self.weight());
             nulls.fill(0);
@@ -714,8 +771,7 @@ impl Batch {
             for (dst, src) in keys.zip(self.pk().chunks_exact(self.schema.pk_stride())) {
                 dst.copy_from_slice(&src[..dst.len()]);
             }
-        });
-        out
+        })
     }
 
     /// Copy every row into `out_schema`, which extends this batch's schema with
@@ -864,7 +920,7 @@ impl Batch {
     pub fn key_retractions(schema: &SchemaDescriptor, pks: &[u8]) -> Batch {
         let n = pks.len() / schema.pk_stride();
         debug_assert_eq!(n * schema.pk_stride(), pks.len(), "key_retractions: pks are whole keys");
-        write_to_batch(schema, n, 0, |w| {
+        Self::write_new(schema, n, 0, |w| {
             for pi in 0..schema.num_payload_cols() {
                 w.col_mut(pi).fill(0);
             }
@@ -991,11 +1047,18 @@ impl Batch {
             }
             return None;
         };
+        Some(self.adopt_heap(src.blob, dead, room))
+    }
+
+    /// Append `heap` whole onto this batch's heap, charging `dead` of its bytes
+    /// dead, with `room` more heap bytes reserved past it. Returns the base the
+    /// caller shifts the cells it copies out of `heap` by.
+    pub(super) fn adopt_heap(&mut self, heap: &[u8], dead: usize, room: usize) -> usize {
         let base = self.blob.len();
-        self.reserve_blob(src.blob.len() + room);
-        self.blob.extend_from_slice(src.blob);
+        self.reserve_blob(heap.len() + room);
+        self.blob.extend_from_slice(heap);
         self.charge_dead(dead);
-        Some(base)
+        base
     }
 
     /// Append `source[row]` at `weight`, each payload column `skip` names as a
@@ -1190,10 +1253,7 @@ impl Batch {
         let cap = self.schema.arena_rows(self.count);
         let need = cap * self.schema.row_width();
         if self.data.capacity() != need {
-            // SAFETY: `copy_regions` writes the `count` rows a `Batch` reads.
-            let mut data = unsafe { PooledBuf::uninit_exact(need) };
-            copy_regions(&self.schema, &self.data, self.capacity, &mut data, cap, self.count);
-            self.data = data;
+            self.data = arena_copy(&self.schema, &self.data, self.capacity, self.count, cap, true);
             self.capacity = cap;
             self.debug_poison_rows(self.count..cap);
         }
@@ -1210,7 +1270,7 @@ impl Batch {
     /// buffer at all.
     fn compacted(&self) -> Batch {
         let (n, mb) = (self.count, self.as_mem_batch());
-        let mut out = write_to_batch(&self.schema, n, self.blob.len(), |w| {
+        let mut out = Self::write_new(&self.schema, n, self.blob.len(), |w| {
             copy_ranges(&mb, None, &[(0, n)], w)
         });
         out.inherit_consolidated(self);
@@ -1305,9 +1365,7 @@ impl<'a> MemBatch<'a> {
         let schema = self.schema;
         let mut b = Batch::empty_with_schema(schema);
         let cap = schema.arena_rows(self.count);
-        // SAFETY: `copy_regions` writes the `count` rows a `Batch` reads.
-        b.data = unsafe { PooledBuf::uninit(cap * schema.row_width()) };
-        copy_regions(schema, self.data, self.cap, &mut b.data, cap, self.count);
+        b.data = arena_copy(schema, self.data, self.cap, self.count, cap, false);
         b.blob = PooledBuf::with_capacity(self.blob.len());
         b.blob.extend_from_slice(self.blob);
         b.dead_heap = self.dead_heap;
@@ -1480,26 +1538,6 @@ impl<'a> BatchView for MemBatch<'a> {
     fn pk_region(&self) -> (&[u8], usize) {
         (MemBatch::pk(self), self.pk_stride())
     }
-}
-
-/// A batch of `rows` rows, every one written in place by `write_fn` through a
-/// [`DirectWriter`] over its uninitialized arena.
-pub(crate) fn write_to_batch(
-    schema: &SchemaDescriptor,
-    rows: usize,
-    max_blob: usize,
-    write_fn: impl FnOnce(&mut DirectWriter),
-) -> Batch {
-    if rows == 0 {
-        return Batch::empty_with_schema(schema);
-    }
-    let mut b = Batch::with_capacity(schema, rows);
-    b.reserve_blob(max_blob);
-    b.write_rows(rows, write_fn);
-    if b.blob.is_empty() {
-        b.blob = PooledBuf::default();
-    }
-    b
 }
 
 #[cfg(test)]

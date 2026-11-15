@@ -702,7 +702,6 @@ fn sentence(i: u64) -> String {
 /// given.
 #[test]
 fn a_compressing_store_codes_its_shards_under_one_table() {
-    use gnitz_zset::repr::Codebook;
     let dir = tempfile::tempdir().unwrap();
     let schema = crate::test_support::make_schema_pk_u64_payload_string();
     let open = || {
@@ -723,10 +722,7 @@ fn a_compressing_store_codes_its_shards_under_one_table() {
     };
     let digests = |t: &Table| -> Vec<Option<u64>> {
         let shards = table_shards(t);
-        shards
-            .iter()
-            .map(|s| Codebook::of_shard(s).map(|b| b.digest()))
-            .collect()
+        shards.iter().map(|s| s.codebook().map(|b| b.digest())).collect()
     };
     let mut t = open();
     let mut pushed = Vec::new();

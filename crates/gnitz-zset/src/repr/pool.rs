@@ -17,7 +17,7 @@ pub(super) fn take<T>(pool: &'static LocalKey<Cell<VecDeque<T>>>, fits: impl Fn(
     pool.try_with(|p| {
         let mut items = p.take();
         let item = items.iter().rposition(fits).and_then(|i| items.remove(i));
-        p.set(items);
+        put_back(p, items);
         item
     })
     .ok()
@@ -36,8 +36,17 @@ pub(super) fn recycle<T>(pool: &'static LocalKey<Cell<VecDeque<T>>>, item: T, by
             items.pop_front();
         }
         items.push_back(item);
-        p.set(items);
+        put_back(p, items);
     });
+}
+
+/// Store `items` in `p`, which holds the empty deque [`Cell::take`] left there.
+/// That deque owns no allocation, so it is forgotten instead of dropped.
+#[inline(always)]
+fn put_back<T>(p: &Cell<VecDeque<T>>, items: VecDeque<T>) {
+    let left = p.replace(items);
+    debug_assert_eq!(left.capacity(), 0, "a pool refilled while its deque was out");
+    std::mem::forget(left);
 }
 
 /// The bytes `v` holds allocated.

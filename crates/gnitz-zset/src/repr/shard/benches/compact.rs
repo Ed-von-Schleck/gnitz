@@ -242,3 +242,77 @@ fn disjoint_coded_compaction_bench() {
         i as f64 / TOTAL as f64
     );
 }
+
+/// [`disjoint_coded_compaction_bench`]'s sources written uncoded and merged
+/// with no codebook: once with each window a whole shard, then under fences
+/// that cut each shard seven eighths of the way through, so every run takes
+/// the large part of one shard and the small rest of the one before it. Per
+/// row, the merge alone, then the merge with each run written as a shard.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn disjoint_plain_compaction_bench() {
+    const TOTAL: usize = 1 << 18;
+    const SOURCES: usize = 4;
+    let (int, string) = (
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::String, false),
+    );
+    let schema = u64_pk_schema(&[int, string, string, int, string]);
+    let dir = tempfile::tempdir().unwrap();
+    let instructions = Counter::instructions();
+    let per = TOTAL / SOURCES;
+    let inputs: Vec<Rc<MappedShard>> = (0..SOURCES)
+        .map(|s| {
+            let mut b = BatchBuilder::new(&schema);
+            for k in s * per..(s + 1) * per {
+                b.begin_row(k as u128, 1);
+                b.put_int(mix(k as u64) as u128 >> 40);
+                b.put_string(&prose(k * 3));
+                b.put_string(&prose(k * 3 + 1));
+                b.put_int(k as u128 * 7);
+                b.put_string(&prose(k % 64));
+                b.end_row();
+            }
+            map_shard(&dir.path().join(format!("{s}.db")), &b.finish())
+        })
+        .collect();
+    let cut: Vec<PkBuf> = (0..SOURCES)
+        .map(|s| PkBuf::from_bytes(&((s * per + per * 7 / 8) as u64).to_be_bytes()))
+        .collect();
+    for (label, fences) in [("whole windows", Vec::new()), ("cut windows", cut)] {
+        let mut merge = GuardMerge::begin(inputs.clone(), fences.clone(), false).unwrap();
+        let ((rows, heap), merged) = instructions.measure(|| {
+            let (mut rows, mut heap) = (0, 0);
+            while !merge.done() {
+                if let Some(run) = merge.next(None) {
+                    let run = black_box(run);
+                    rows += run.row_count();
+                    heap += run.batch.blob().len();
+                }
+            }
+            (rows, heap)
+        });
+        assert_eq!(rows, TOTAL);
+        let mut merge = GuardMerge::begin(inputs.clone(), fences, false).unwrap();
+        let mut written = 0;
+        let (rows, with_write) = instructions.measure(|| {
+            let mut rows = 0;
+            while !merge.done() {
+                if let Some(run) = merge.next(None) {
+                    let path = dir.path().join(format!("out_{label}_{written}.db"));
+                    run.write_as_shard(path.to_str().unwrap(), ShardWriteOpts::default())
+                        .unwrap();
+                    rows += run.row_count();
+                    written += 1;
+                }
+            }
+            rows
+        });
+        assert_eq!(rows, TOTAL);
+        println!(
+            "{SOURCES} disjoint plain sources, {label}: {:.1} instr/row, written as shards {:.1}, {heap} heap bytes",
+            merged as f64 / TOTAL as f64,
+            with_write as f64 / TOTAL as f64,
+        );
+    }
+}

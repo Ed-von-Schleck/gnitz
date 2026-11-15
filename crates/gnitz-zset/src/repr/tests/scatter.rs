@@ -90,7 +90,7 @@ fn gather_rows_reads_every_backing_alike() {
     use crate::repr::{BatchBuilder, MappedShard, Run};
     use crate::schema::SchemaColumn;
     use crate::test_support::{map_shard, u64_pk_schema, weighted_rows};
-    use gnitz_wire::TypeCode;
+    use gnitz_wire::{TypeCode, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK};
     use std::rc::Rc;
     // Five sources hoist ten fixed-region pointers, past the inline table's eight.
     const SOURCES: usize = 5;
@@ -143,27 +143,37 @@ fn gather_rows_reads_every_backing_alike() {
             .map(|s| shard(&format!("wide_{spread}_{s}"), &source(&wide, s, spread)))
             .collect();
         let windows: Vec<_> = shards.iter().map(|s| s.window(0..s.row_count())).collect();
-        let narrowed: Vec<Run> = (0..SOURCES)
+        let narrowed_shards: Vec<MappedShard> = (0..SOURCES)
             .map(|s| shard(&format!("narrow_{spread}_{s}"), &source(&narrow, s, spread)))
+            .map(|s| s.rebind(&wide).unwrap())
+            .collect();
+        let narrowed: Vec<Run> = narrowed_shards
+            .iter()
             .map(|s| Run::Shard(Rc::new(s.rebind(&wide).unwrap())))
             .collect();
+        let narrowed_windows: Vec<_> = narrowed_shards.iter().map(|s| s.window(0..s.row_count())).collect();
         let mut mixed: Vec<Run> = shards.iter().cloned().map(Run::Shard).collect();
         mixed[1] = mem[1].clone();
         // What each set reads in place.
+        let (pk, nulls, p0, p2) = (REG_PK, REG_NULL_BMP, REG_PAYLOAD_START, REG_PAYLOAD_START + 2);
         assert!(mem
             .iter()
-            .all(|m| m.direct_fixed().is_some() && m.direct_col(0).is_some()));
+            .all(|m| m.in_place(pk).is_some() && m.in_place(nulls).is_some() && m.in_place(p0).is_some()));
         assert!(windows
             .iter()
-            .all(|w| w.direct_fixed().is_some() && w.direct_col(2).is_some()));
-        assert!(windows.iter().all(|w| w.direct_col(0).is_some() == spread));
-        assert!(narrowed
-            .iter()
-            .all(|n| n.direct_fixed().is_none() && n.direct_col(2).is_some()));
+            .all(|w| w.in_place(pk).is_some() && w.in_place(nulls).is_some() && w.in_place(p2).is_some()));
+        assert!(windows.iter().all(|w| w.in_place(p0).is_some() == spread));
+        // A column the file predates is padded NULL, its fixed regions still
+        // read in place.
+        assert!(narrowed_windows.iter().all(|n| n.null_pad_mask() == 1 << 2
+            && n.in_place(pk).is_some()
+            && n.in_place(nulls).is_some()
+            && n.in_place(p2).is_some()));
         let got = [
             gather_rows(&mem, &wide, &picks, 0),
             gather_rows(&windows, &wide, &picks, 0),
             gather_rows(&narrowed, &wide, &picks, 0),
+            gather_rows(&narrowed_windows, &wide, &picks, 0),
             gather_rows(&mixed, &wide, &picks, 0),
         ];
         for (i, got) in got.iter().enumerate() {

@@ -8,8 +8,9 @@
 
 use std::ops::Range;
 
-use super::codebook::Codebook;
+use crate::repr::codebook::Codebook;
 use crate::repr::seek::{gallop_by, lower_bound_by};
+use crate::repr::string_heap::append_value;
 use crate::repr::PooledBuf;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::{null_bits, Level};
@@ -1066,10 +1067,7 @@ impl<'a> HeapWriter<'a> {
     pub(crate) fn push(&mut self, value: HeapValue<'_>) -> usize {
         let at = self.next_at();
         self.plain_len += value.len();
-        match self.coded {
-            None => value.append_to(&mut self.bytes),
-            Some((_, book)) => book.append(value, &mut self.bytes),
-        }
+        append_value(value, &mut self.bytes, self.coded.map(|(_, book)| book));
         at
     }
 

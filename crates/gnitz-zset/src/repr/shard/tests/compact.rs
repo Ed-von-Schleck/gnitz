@@ -522,3 +522,55 @@ fn ascending_windows_decode_to_the_run_their_merge_writes() {
         assert_eq!(run_rows(&got), run_rows(&want), "destination {at}");
     }
 }
+
+/// Plain windows that ascend carry their shard's heap whole where it pays: a
+/// whole shard at no dead byte, most of one charged the long bytes of the rows
+/// it leaves behind, and the small rest of one relocated. Each run holds the
+/// rows the merge path writes, with a dead-byte count bounding its unreferenced
+/// bytes, and is written as a shard that reads back as it.
+#[test]
+fn ascending_plain_windows_carry_their_heaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let block = |pks: std::ops::Range<u64>| -> Batch {
+        let rows: Vec<(u64, i64, String)> = pks.map(|pk| (pk, 1, prose(pk as usize))).collect();
+        let rows: Vec<(u64, i64, &[u8])> = rows.iter().map(|(pk, w, s)| (*pk, *w, s.as_bytes())).collect();
+        make_string_batch(&rows)
+    };
+    let shards = vec![
+        map_shard(&dir.path().join("a.db"), &block(0..400)),
+        map_shard(&dir.path().join("b.db"), &block(400..800)),
+        map_shard(&dir.path().join("c.db"), &block(800..1200)),
+    ];
+    // Whole `a`, then the first seven eighths of `b`, then `b`'s last eighth
+    // and the whole of `c`.
+    let fences = [400u64, 750].map(|k| PkBuf::from_bytes(&k.to_be_bytes())).to_vec();
+    let mut merge = GuardMerge::begin(shards, fences, false).unwrap();
+    let mut dead = Vec::new();
+    while !merge.done() {
+        let (want, windows) = merged_run(&merge, None);
+        assert!(merge.in_order(&windows).is_some(), "premise: the windows need no merge");
+        let at = merge.next;
+        let got = merge.next(None).unwrap();
+        assert!(got.batch.is_consolidated());
+        assert_eq!(run_rows(&got), run_rows(&want), "destination {at}");
+        let batch = &got.batch;
+        assert!(
+            crate::repr::string_heap::measure_dead_heap(&batch.as_mem_batch()) <= batch.dead_heap(),
+            "destination {at}"
+        );
+        dead.push(batch.dead_heap());
+        let path = dir.path().join(format!("out_{at}.db"));
+        got.write_as_shard(path.to_str().unwrap(), ShardWriteOpts::default())
+            .unwrap();
+        let out = MappedShard::open(path.to_str().unwrap(), batch.schema()).unwrap();
+        assert_eq!(
+            string_rows(&out, |r| out.get_weight(r)),
+            string_rows(batch, |r| batch.get_weight(r))
+        );
+    }
+    // `a` whole, `b`'s large part charged its last eighth's bytes, then `b`'s
+    // last eighth relocated beside the whole of `c`.
+    assert_eq!(dead[0], 0);
+    assert!(dead[1] > 0, "the large part of a shard carries its heap");
+    assert_eq!(dead[2], 0);
+}

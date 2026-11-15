@@ -405,7 +405,7 @@ impl ShardIndex {
                 .all_entries()
                 .filter(|e| e.shard.heap().plain().is_none())
                 .max_by_key(|e| e.seq);
-            idx.codebook = newest_coded.and_then(|e| Codebook::of_shard(&e.shard)).map(Rc::new);
+            idx.codebook = newest_coded.and_then(|e| e.shard.codebook()).map(Rc::new);
         }
         Ok(idx)
     }

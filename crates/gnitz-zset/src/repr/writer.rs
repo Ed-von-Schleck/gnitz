@@ -220,14 +220,6 @@ impl<'a> DirectWriter<'a> {
             }
         }
     }
-
-    /// Carry a source heap whole onto the end of this writer's heap. Returns the
-    /// base the caller shifts its copied cells' offsets by.
-    pub(crate) fn adopt_heap(&mut self, src_blob: &[u8]) -> usize {
-        let base = self.blob.len();
-        self.blob.extend_from_slice(src_blob);
-        base
-    }
 }
 
 impl gnitz_expr::MapTarget for DirectWriter<'_> {

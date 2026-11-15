@@ -1,7 +1,7 @@
-use super::super::codebook::Codebook;
 use super::super::file::ShardWriteOpts;
 use super::tests::{build, wide_string};
 use super::*;
+use crate::repr::codebook::Codebook;
 use crate::repr::scatter::{Pick, UnifiedSet};
 use crate::repr::string_heap::{carried_dead, long_bytes_outside};
 use crate::repr::Batch;
@@ -30,7 +30,7 @@ fn slice_blob_relocate_bench() {
     let schema = make_schema_pk_u64_payload_string();
     let cycles = Counter::cycles();
     let arm = |shard: &MappedShard, rc: usize, relocate: bool| {
-        let carried = (!relocate).then(|| shard.heap().plain().expect("a plain heap").len());
+        let carried = (!relocate).then(|| (shard.heap().plain().expect("a plain heap"), 0));
         let slice = || drop(black_box(shard.slice_to_owned_batch_with(0, rc, carried, 0)));
         // The first slice faults in the cold mmap pages.
         assert_eq!(shard.slice_to_owned_batch_with(0, rc, carried, 0).len(), rc);

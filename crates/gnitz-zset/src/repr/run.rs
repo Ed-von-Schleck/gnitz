@@ -13,10 +13,9 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use crate::repr::batch::Batch;
-use crate::repr::scatter::{mem_batch_to_unified, ColTable, ColumnarSource, DecodedColumns, UnifiedSource};
+use crate::repr::scatter::{ColumnarSource, DecodedColumns};
 use crate::repr::seek::ColPtr;
 use crate::repr::shard::MappedShard;
-use crate::schema::SchemaDescriptor;
 use gnitz_wire::{Heap, RowSource};
 
 #[derive(Clone)]
@@ -109,20 +108,6 @@ impl RowSource for Run {
 }
 
 impl ColumnarSource for Run {
-    fn to_unified(
-        &self,
-        schema: &SchemaDescriptor,
-        cols: &mut ColTable,
-        window: Range<usize>,
-        decoded: &mut DecodedColumns,
-        skip: u64,
-    ) -> UnifiedSource<'_> {
-        match self {
-            Run::Mem(b) => mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
-            Run::Shard(s) => s.to_unified(schema, cols, window, decoded, skip),
-        }
-    }
-
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         match self {
@@ -138,17 +123,25 @@ impl ColumnarSource for Run {
         }
     }
 
-    fn direct_col(&self, pi: usize) -> Option<ColPtr> {
+    fn in_place(&self, r: usize) -> Option<ColPtr> {
         match self {
-            Run::Mem(b) => b.as_mem_batch().direct_col(pi),
-            Run::Shard(s) => s.direct_col(pi),
+            Run::Mem(b) => b.as_mem_batch().in_place(r),
+            Run::Shard(s) => s.in_place(r),
         }
     }
 
-    fn direct_fixed(&self) -> Option<[ColPtr; 2]> {
+    fn region(&self, r: usize, window: &Range<usize>, decoded: &mut DecodedColumns) -> ColPtr {
         match self {
-            Run::Mem(b) => b.as_mem_batch().direct_fixed(),
-            Run::Shard(s) => s.direct_fixed(),
+            Run::Mem(b) => ColumnarSource::region(&b.as_mem_batch(), r, window, decoded),
+            Run::Shard(s) => s.region(r, window, decoded),
+        }
+    }
+
+    #[inline(always)]
+    fn null_pad_mask(&self) -> u64 {
+        match self {
+            Run::Mem(_) => 0,
+            Run::Shard(s) => s.null_pad_mask(),
         }
     }
 }

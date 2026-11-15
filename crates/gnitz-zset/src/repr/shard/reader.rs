@@ -13,10 +13,11 @@ use super::error::StorageError;
 use super::layout::*;
 use super::mmap::Mmap;
 use super::pk_filter;
-use crate::repr::batch::{write_to_batch, Batch};
-use crate::repr::scatter::{ColTable, ColumnarSource, DecodedColumns, UnifiedSource};
-use crate::repr::seek::{seek_lower_bound, seek_pk_rows, ColPtr};
-use crate::repr::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap, StringDest};
+use crate::repr::batch::Batch;
+use crate::repr::codebook::Codebook;
+use crate::repr::scatter::{ColumnarSource, DecodedColumns};
+use crate::repr::seek::{seek_lower_bound, seek_pk_rows, ColPtr, ZERO_CELL};
+use crate::repr::string_heap::{carried_dead, long_bytes_outside, prorated_blob_cap, row_long_bytes, StringDest};
 use crate::repr::writer::DirectWriter;
 use crate::repr::PooledBuf;
 use crate::schema::SchemaDescriptor;
@@ -39,9 +40,6 @@ enum PayloadRegion {
     /// of the dictionary in place, a bulk read decodes its own window.
     Dict(DictImage<'static>),
 }
-
-/// What every row of a column the file predates, or a skipped one, reads.
-static ZERO_CELL: [u8; 16] = [0; 16];
 
 /// A payload region read through a decode. A per-row read decodes the block it
 /// lands in and keeps it; a bulk read decodes its own window and keeps nothing.
@@ -138,15 +136,6 @@ impl KeyRegion {
             KeyRegion::Packed(key) => key.image.decode(start, dst),
         }
     }
-
-    /// The keys as a column readable at `rows`, decoded into `decoded` where
-    /// they are packed.
-    fn window(&self, rows: &Range<usize>, stride: usize, decoded: &mut DecodedColumns) -> ColPtr {
-        match self {
-            KeyRegion::Mapped(cp) => *cp,
-            KeyRegion::Packed(key) => decoded.column(rows, stride, |keys| key.image.decode(rows.start, keys)),
-        }
-    }
 }
 
 /// A region of one 8-byte word per row: the weights, or the null words. A
@@ -177,6 +166,14 @@ impl WordRegion {
             WordRegion::Mapped(cp) => read_u64_le(unsafe { cp.row(row, FIXED_REGION_BYTES) }, 0),
             WordRegion::TwoValue(two) => two.at(row),
             WordRegion::For(frame) => frame.at(row),
+        }
+    }
+
+    /// The words as a column readable in place, where they are not packed.
+    fn in_place(&self) -> Option<ColPtr> {
+        match self {
+            WordRegion::Mapped(cp) => Some(*cp),
+            WordRegion::TwoValue(_) | WordRegion::For(_) => None,
         }
     }
 
@@ -377,7 +374,7 @@ impl MappedShard {
                 let width = col.size();
                 if pi >= file_npc {
                     debug_assert!(width <= ZERO_CELL.len());
-                    return Ok(PayloadRegion::Mapped(ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 }));
+                    return Ok(PayloadRegion::Mapped(ColPtr::zeroes()));
                 }
                 let span = &spans[REG_PAYLOAD_START + pi];
                 let image = span.bytes(data);
@@ -519,6 +516,14 @@ impl MappedShard {
         }
     }
 
+    /// The codebook of the heap's table; `None` for a plain heap or a body that
+    /// fails its checksum.
+    pub fn codebook(&self) -> Option<Codebook> {
+        let image = self.coded_heap()?;
+        self.verify_body().ok()?;
+        Some(Codebook::rebuilt(image.table.symbols(), image.trained_sixteenths))
+    }
+
     /// Whether this shard carries a PK filter.
     pub fn has_pk_filter(&self) -> bool {
         self.pk_filter.is_some()
@@ -568,28 +573,66 @@ impl MappedShard {
         }
     }
 
+    /// The heap a batch copying the German-string slots `strings` of `rows`
+    /// carries whole, with the bytes of it charged dead; `None` relocates each
+    /// value. A plain heap is carried into a batch with no codebook where
+    /// [`carried_dead`] prefers it; a shard holds no dead bytes of its own, so it
+    /// charges the long bytes of the rows outside `rows`, and those of the
+    /// string slots outside `strings` in `rows`. A coded heap is carried
+    /// into a batch coded under `codebook`, for every row and when its codes are
+    /// of that same table, at no dead byte.
+    pub(crate) fn carry_for(
+        &self,
+        rows: Range<usize>,
+        strings: u64,
+        codebook: Option<&Codebook>,
+    ) -> Option<(&[u8], usize)> {
+        if strings == 0 {
+            return None;
+        }
+        let n = self.header.row_count;
+        match (self.heap(), codebook) {
+            (Heap::Plain(blob), None) => {
+                // The string slots the batch leaves out are dead in the rows it
+                // keeps too.
+                let all = self.schema.string_payload_slots();
+                let dropped = match all & !strings {
+                    0 => 0,
+                    d => rows.clone().map(|r| row_long_bytes(self, d, r)).sum(),
+                };
+                carried_dead(blob.len(), dropped, n, rows.len(), || {
+                    long_bytes_outside(self, all, &[(rows.start, rows.end)])
+                })
+                .map(|dead| (blob, dead))
+            }
+            (Heap::Coded(c), Some(book)) if rows.len() == n && c.table.digest() == book.digest() => Some((c.codes, 0)),
+            _ => None,
+        }
+    }
+
     /// Copy a contiguous slice of rows into a batch under the schema this handle
-    /// is bound to, the blob arm picked by [`carried_dead`]. A shard holds no dead
-    /// bytes of its own; a carried heap charges the long bytes of the rows outside
-    /// the slice. A coded heap is never carried: its values are decoded into the
-    /// batch's own. The payload columns `skip` names, as payload bits, are
-    /// written as zeroes that are not NULL, for a reader that never reads them.
+    /// is bound to, its heap carried where [`Self::carry_for`] carries it. A
+    /// coded heap is never carried: its values are decoded into the batch's own.
+    /// The payload columns `skip` names, as payload bits, are written as zeroes
+    /// that are not NULL, for a reader that never reads them.
     #[inline]
     pub fn slice_to_owned_batch(&self, start: usize, row_count: usize, skip: u64) -> Batch {
-        let n = self.header.row_count;
         let strings = self.schema.string_payload_slots() & !skip;
-        let carried = self.heap().plain().filter(|_| strings != 0).and_then(|blob| {
-            carried_dead(blob.len(), 0, n, row_count, || {
-                long_bytes_outside(self, strings, &[(start, start + row_count)])
-            })
-        });
+        let carried = self.carry_for(start..start + row_count, strings, None);
         self.slice_to_owned_batch_with(start, row_count, carried, skip)
     }
 
     /// [`slice_to_owned_batch`](Self::slice_to_owned_batch) with the blob arm
     /// passed in rather than derived, so both arms can be forced on one slice:
-    /// `carried` is the dead-byte bound of a carried heap, `None` relocating.
-    fn slice_to_owned_batch_with(&self, start: usize, row_count: usize, carried: Option<usize>, skip: u64) -> Batch {
+    /// `carried` is the plain heap carried whole and its dead bytes, `None`
+    /// relocating.
+    fn slice_to_owned_batch_with(
+        &self,
+        start: usize,
+        row_count: usize,
+        carried: Option<(&[u8], usize)>,
+        skip: u64,
+    ) -> Batch {
         assert!(
             !self.header.skeleton,
             "a skeleton shard has no payload to slice; hydrate its keys"
@@ -597,26 +640,21 @@ impl MappedShard {
         assert!(start + row_count <= self.header.row_count, "slice out of range");
 
         let schema = &self.schema;
-        let heap = self.heap();
-        let relocate = carried.is_none();
-        let blob_cap = if relocate {
-            match schema.string_payload_slots() & !skip {
-                0 => 0,
-                _ => prorated_blob_cap(heap.plain_len(), self.header.row_count, row_count),
-            }
-        } else {
-            heap.plain_len()
+        let blob_cap = match (carried, schema.string_payload_slots() & !skip) {
+            (Some((heap, _)), _) => heap.len(),
+            (None, 0) => 0,
+            (None, _) => prorated_blob_cap(self.heap().plain_len(), self.header.row_count, row_count),
         };
-        let mut batch = write_to_batch(schema, row_count, blob_cap, |w| {
-            // A carried heap lands first in the fresh one, so its cells stand as
-            // the shard holds them.
-            let dest = match relocate {
-                true => StringDest::Placed(None),
-                false => StringDest::Carried(w.adopt_heap(heap.plain().expect("only a plain heap is carried"))),
-            };
+        // A carried heap lands first in the fresh one, so its cells stand as
+        // the shard holds them.
+        let dest = match carried {
+            Some(_) => StringDest::Carried(0),
+            None => StringDest::Placed(None),
+        };
+        let carried = carried.map(|(heap, dead)| (heap, 0, dead));
+        let mut batch = Batch::write_new_carrying(schema, row_count, blob_cap, carried.as_slice(), |w| {
             self.decode_rows_into(start..start + row_count, w, dest, skip);
         });
-        batch.charge_dead(carried.unwrap_or(0));
         batch.certify_consolidated();
         batch
     }
@@ -644,13 +682,13 @@ impl MappedShard {
             "a writer of another layout"
         );
         let (pk, weight, null_bmp) = w.fixed_mut();
-        self.pk.decode(start, schema.pk_stride(), pk);
-        self.weight.decode(start, weight);
+        self.decode_region(REG_PK, start, pk);
+        self.decode_region(REG_WEIGHT, start, weight);
         if self.header.skeleton {
             null_bmp.fill(0);
             return;
         }
-        self.null_bmp.decode(start, null_bmp);
+        self.decode_region(REG_NULL_BMP, start, null_bmp);
         if self.null_pad_mask != 0 || skip != 0 {
             for word in null_bmp.as_chunks_mut::<8>().0 {
                 *word = ((u64::from_le_bytes(*word) | self.null_pad_mask) & !skip).to_le_bytes();
@@ -662,10 +700,21 @@ impl MappedShard {
                 w.col_mut(pi).fill(0);
                 continue;
             }
-            self.decode_payload(pi, col.size(), start, w.col_mut(pi));
+            self.decode_region(REG_PAYLOAD_START + pi, start, w.col_mut(pi));
             if col.type_code.is_german_string() {
                 w.rebase_string_col(pi, self.heap(), dest);
             }
+        }
+    }
+
+    /// Rows `first..` of region `r` as they stand in a batch, as many as `out`
+    /// holds cells of the region's stride; null words without `null_pad_mask`.
+    fn decode_region(&self, r: usize, first: usize, out: &mut [u8]) {
+        match r {
+            REG_PK => self.pk.decode(first, self.schema.pk_stride(), out),
+            REG_WEIGHT => self.weight.decode(first, out),
+            REG_NULL_BMP => self.null_bmp.decode(first, out),
+            _ => self.decode_payload(r - REG_PAYLOAD_START, self.schema.region_stride(r), first, out),
         }
     }
 }
@@ -718,68 +767,12 @@ impl MappedShard {
     pub(crate) fn window(&self, rows: Range<usize>) -> ShardWindow<'_> {
         debug_assert!(rows.end <= self.header.row_count);
         let mut decoded = DecodedColumns::default();
-        let pk = self.pk.window(&rows, self.schema.pk_stride(), &mut decoded);
+        let pk = self.region(REG_PK, &rows, &mut decoded);
         ShardWindow { shard: self, rows, pk, _decoded: decoded }
-    }
-
-    /// [`ColumnarSource::to_unified`] over `pk`, a column of this shard's keys
-    /// readable at `window`.
-    fn unified(
-        &self,
-        pk: ColPtr,
-        schema: &SchemaDescriptor,
-        cols: &mut ColTable,
-        window: Range<usize>,
-        decoded: &mut DecodedColumns,
-        skip: u64,
-    ) -> UnifiedSource<'_> {
-        debug_assert!(window.end <= self.header.row_count);
-        let cols_off = cols.len();
-        cols.extend(
-            self.schema
-                .payload_columns()
-                .take(schema.num_payload_cols())
-                .map(|(pi, col)| {
-                    // The scatter writes a skipped column as zeroes, without
-                    // reading it.
-                    if skip >> pi & 1 == 1 {
-                        return ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 };
-                    }
-                    self.direct_col(pi).unwrap_or_else(|| {
-                        decoded.column(&window, col.size(), |column| {
-                            self.decode_payload(pi, col.size(), window.start, column)
-                        })
-                    })
-                }),
-        );
-        let null_bmp = match &self.null_bmp {
-            WordRegion::Mapped(cp) => *cp,
-            packed => decoded.column(&window, FIXED_REGION_BYTES, |words| packed.decode(window.start, words)),
-        };
-        UnifiedSource {
-            pk,
-            null_bmp,
-            null_pad_mask: self.null_pad_mask,
-            cols_off,
-            heap: self.heap(),
-            heap_at: None,
-        }
     }
 }
 
 impl ColumnarSource for MappedShard {
-    fn to_unified(
-        &self,
-        schema: &SchemaDescriptor,
-        cols: &mut ColTable,
-        window: Range<usize>,
-        decoded: &mut DecodedColumns,
-        skip: u64,
-    ) -> UnifiedSource<'_> {
-        let pk = self.pk.window(&window, schema.pk_stride(), decoded);
-        self.unified(pk, schema, cols, window, decoded, skip)
-    }
-
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         debug_assert!(row < self.header.row_count);
@@ -791,29 +784,33 @@ impl ColumnarSource for MappedShard {
         MappedShard::is_skeleton(self)
     }
 
-    fn direct_col(&self, pi: usize) -> Option<ColPtr> {
-        match &self.col_regions[pi] {
-            PayloadRegion::Mapped(cp) => Some(*cp),
-            _ => None,
+    fn in_place(&self, r: usize) -> Option<ColPtr> {
+        match r {
+            REG_PK => match &self.pk {
+                KeyRegion::Mapped(cp) => Some(*cp),
+                KeyRegion::Packed(_) => None,
+            },
+            REG_WEIGHT => self.weight.in_place(),
+            REG_NULL_BMP => self.null_bmp.in_place(),
+            _ => match &self.col_regions[r - REG_PAYLOAD_START] {
+                PayloadRegion::Mapped(cp) => Some(*cp),
+                _ => None,
+            },
         }
     }
 
-    fn direct_fixed(&self) -> Option<[ColPtr; 2]> {
-        match &self.pk {
-            KeyRegion::Mapped(pk) => Some([*pk, self.direct_nulls()?]),
-            KeyRegion::Packed(_) => None,
-        }
+    fn region(&self, r: usize, window: &Range<usize>, decoded: &mut DecodedColumns) -> ColPtr {
+        debug_assert!(window.end <= self.header.row_count);
+        self.in_place(r).unwrap_or_else(|| {
+            decoded.column(window, self.schema.region_stride(r), |out| {
+                self.decode_region(r, window.start, out)
+            })
+        })
     }
-}
 
-impl MappedShard {
-    /// The null words as a [`ColPtr`] readable in place, where they are stored
-    /// as the row accessor reads them: unpacked, and no column padded NULL.
-    fn direct_nulls(&self) -> Option<ColPtr> {
-        match &self.null_bmp {
-            WordRegion::Mapped(cp) if self.null_pad_mask == 0 => Some(*cp),
-            _ => None,
-        }
+    #[inline(always)]
+    fn null_pad_mask(&self) -> u64 {
+        self.null_pad_mask
     }
 }
 
@@ -858,18 +855,6 @@ impl RowSource for ShardWindow<'_> {
 }
 
 impl ColumnarSource for ShardWindow<'_> {
-    fn to_unified(
-        &self,
-        schema: &SchemaDescriptor,
-        cols: &mut ColTable,
-        window: Range<usize>,
-        decoded: &mut DecodedColumns,
-        skip: u64,
-    ) -> UnifiedSource<'_> {
-        debug_assert!(self.rows.start <= window.start && window.end <= self.rows.end);
-        self.shard.unified(self.pk, schema, cols, window, decoded, skip)
-    }
-
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         self.shard.get_weight(row)
@@ -880,12 +865,24 @@ impl ColumnarSource for ShardWindow<'_> {
         self.shard.is_skeleton()
     }
 
-    fn direct_col(&self, pi: usize) -> Option<ColPtr> {
-        self.shard.direct_col(pi)
+    fn in_place(&self, r: usize) -> Option<ColPtr> {
+        match r {
+            REG_PK => Some(self.pk),
+            _ => self.shard.in_place(r),
+        }
     }
 
-    fn direct_fixed(&self) -> Option<[ColPtr; 2]> {
-        Some([self.pk, self.shard.direct_nulls()?])
+    fn region(&self, r: usize, window: &Range<usize>, decoded: &mut DecodedColumns) -> ColPtr {
+        debug_assert!(self.rows.start <= window.start && window.end <= self.rows.end);
+        match r {
+            REG_PK => self.pk,
+            _ => self.shard.region(r, window, decoded),
+        }
+    }
+
+    #[inline(always)]
+    fn null_pad_mask(&self) -> u64 {
+        self.shard.null_pad_mask
     }
 }
 

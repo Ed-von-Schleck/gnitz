@@ -14,7 +14,17 @@ pub(crate) struct ColPtr {
     pub stride: usize,
 }
 
+/// The bytes a column of zero cells reads, any cell width up to its length.
+pub(crate) static ZERO_CELL: [u8; 16] = [0; 16];
+
 impl ColPtr {
+    /// A column whose every row reads zero cells of up to `ZERO_CELL.len()`
+    /// bytes.
+    #[inline(always)]
+    pub(crate) fn zeroes() -> Self {
+        ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 }
+    }
+
     /// Row `i`'s address.
     #[inline(always)]
     pub(crate) fn row_ptr(self, i: usize) -> *const u8 {

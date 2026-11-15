@@ -8,10 +8,9 @@
 
 use std::rc::Rc;
 
-use gnitz_wire::{push_coded, push_codes, HeapValue, SymbolTable, MAX_SYMBOL_LEN};
+use gnitz_wire::{push_coded, push_codes, HeapValue, SymbolTable, MAX_SYMBOLS, MAX_SYMBOL_LEN};
 
-use super::reader::MappedShard;
-use crate::repr::Batch;
+use super::batch::Batch;
 
 const _: () = assert!(
     fsst::ESCAPE_CODE == gnitz_wire::SYMBOL_ESCAPE,
@@ -20,7 +19,7 @@ const _: () = assert!(
 
 /// Long-value bytes a heap must hold before a table is trained over it: below
 /// four full tables, the table alone takes a quarter of them.
-const MIN_CODED_HEAP: usize = 4 * super::encoding::symbols_head_len(gnitz_wire::MAX_SYMBOLS);
+const MIN_CODED_HEAP: usize = 4 * super::shard::symbols_head_len(MAX_SYMBOLS);
 
 /// Plain bytes of the values sampled to price a table against a batch.
 const PROBE_BYTES: usize = 16 << 10;
@@ -40,20 +39,15 @@ pub struct Codebook {
 }
 
 impl Codebook {
-    /// The codebook of `shard`'s table; `None` for a plain heap or a body that
-    /// fails its checksum.
-    pub fn of_shard(shard: &MappedShard) -> Option<Self> {
-        let image = shard.coded_heap()?;
-        shard.verify_body().ok()?;
-        let (symbols, lens): (Vec<fsst::Symbol>, Vec<u8>) = image
-            .table
-            .symbols()
-            .map(|(sym, len)| (fsst::Symbol::from_slice(sym), len))
-            .unzip();
-        Some(Self::of_encoder(
-            fsst::Compressor::rebuild_from(symbols, lens),
-            image.trained_sixteenths,
-        ))
+    /// The codebook of a table read back, its symbols and their lengths, which
+    /// coded its training values to `trained_sixteenths`.
+    pub(crate) fn rebuilt<'s>(
+        symbols: impl Iterator<Item = (&'s [u8; MAX_SYMBOL_LEN], u8)>,
+        trained_sixteenths: usize,
+    ) -> Self {
+        let (symbols, lens): (Vec<fsst::Symbol>, Vec<u8>) =
+            symbols.map(|(sym, len)| (fsst::Symbol::from_slice(sym), len)).unzip();
+        Self::of_encoder(fsst::Compressor::rebuild_from(symbols, lens), trained_sixteenths)
     }
 
     fn of_encoder(encoder: fsst::Compressor, trained_sixteenths: usize) -> Self {

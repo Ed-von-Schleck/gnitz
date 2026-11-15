@@ -597,9 +597,9 @@ impl GroupEmit<'_, '_, '_> {
             }
         }
         let EmitScratch { vals, fresh, .. } = &*self.s;
-        let mut out = Batch::with_capacity(&heads.plan.shape.output_schema, fresh.len());
-        out.write_rows(fresh.len(), |w| heads.write_fresh(vals, w, fresh));
-        out
+        Batch::write_new(&heads.plan.shape.output_schema, fresh.len(), 0, |w| {
+            heads.write_fresh(vals, w, fresh)
+        })
     }
 
     /// The groups a column at a time: the stored rows gathered off the trace

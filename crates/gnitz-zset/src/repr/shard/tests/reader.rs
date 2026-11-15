@@ -1,13 +1,13 @@
-use super::super::codebook::Codebook;
 use super::super::file::ShardWriteOpts;
 use super::*;
+use crate::repr::codebook::Codebook;
 use crate::repr::scatter::{ColumnarSource, Pick, UnifiedSet};
 use crate::repr::StorageError;
 use crate::repr::{Batch, BatchBuilder};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    make_batch, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, mix, payload0_i64,
-    pk_only_schema, prose, sweep_bit_flips, u64_pk_schema,
+    make_batch, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, map_coded_shard, mix,
+    payload0_i64, pk_only_schema, prose, string_batch, sweep_bit_flips, u64_pk_schema,
 };
 use gnitz_wire::write_u64_le;
 use gnitz_wire::{num_regions, TypeCode, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
@@ -135,7 +135,7 @@ fn assert_reads_as(label: &str, shard: &MappedShard, want: &Batch) {
     for relocate in [false, true] {
         for w in [0..n, 0..0, mid.clone()] {
             // A whole heap charged dead bounds any slice's.
-            let carried = shard.heap().plain().filter(|_| !relocate).map(<[u8]>::len);
+            let carried = shard.heap().plain().filter(|_| !relocate).map(|h| (h, h.len()));
             let b = shard.slice_to_owned_batch_with(w.start, w.len(), carried, 0);
             if let Some(heap) = shard.heap().plain().filter(|_| relocate && w.len() == n) {
                 assert!(b.blob().len() <= heap.len(), "{label}: a relocated span copied twice");
@@ -939,6 +939,32 @@ fn a_symbol_table_its_image_cannot_hold_is_refused() {
     }
 }
 
+/// A table under a body that fails its checksum is refused, never handed to
+/// the rebuild: two equal three-byte symbols are a table no trained encoder
+/// writes, and one the rebuild asserts against.
+#[test]
+fn a_table_under_a_corrupt_body_is_refused() {
+    use gnitz_wire::MAX_SYMBOL_LEN;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.db");
+    let batch = string_batch(&(0..400).map(|i| (i as u64, prose(i))).collect::<Vec<_>>());
+    let book = Codebook::for_batch(None, &batch).unwrap();
+    map_coded_shard(&path, &batch, &book);
+    let mut image = std::fs::read(&path).unwrap();
+    let heap = spans_of(&image)[gnitz_wire::REG_PAYLOAD_START + batch.schema().num_payload_cols()].off;
+    let n = gnitz_wire::read_u64_le(&image, heap + SYMBOLS_COUNT_AT) as usize;
+    let (symbols, lens) = image[heap + SYMBOLS_AT..].split_at_mut(n * MAX_SYMBOL_LEN);
+    let i = lens[..n].iter().position(|&len| len >= 3).unwrap();
+    assert!(lens[i + 1] >= 3, "premise: two symbols of three bytes or more");
+    lens[i..i + 2].fill(3);
+    let three = [symbols[i * MAX_SYMBOL_LEN..][..3].to_vec(), vec![0; MAX_SYMBOL_LEN - 3]].concat();
+    symbols[i * MAX_SYMBOL_LEN..][..2 * MAX_SYMBOL_LEN].copy_from_slice(&three.repeat(2));
+    std::fs::write(&path, &image).unwrap();
+    let forged = MappedShard::open(path.to_str().unwrap(), batch.schema()).unwrap();
+    assert!(forged.coded_heap().is_some(), "the table still parses");
+    assert!(forged.codebook().is_none());
+}
+
 // -----------------------------------------------------------------------
 // Slice blob relocation
 // -----------------------------------------------------------------------
@@ -974,6 +1000,35 @@ fn slice_relocates_only_its_own_strings() {
     );
     let full = shard.slice_to_owned_batch(0, N, 0);
     assert_eq!(Some(full.blob()), shard.heap().plain(), "whole shard: verbatim");
+}
+
+/// A slice that skips a string column and carries the heap whole charges
+/// the skipped column's long values dead, kept rows' included: the heap's
+/// dead-byte count still bounds its unreferenced bytes.
+#[test]
+fn a_carried_slice_charges_its_skipped_strings_dead() {
+    let dir = tempfile::tempdir().unwrap();
+    const N: usize = 128;
+    let string = SchemaColumn::new(TypeCode::String, false);
+    let schema = u64_pk_schema(&[string, string]);
+    let batch = build(schema, N, |b, i| {
+        b.begin_row(i as u128 + 1, 1);
+        b.put_string(&wide_string(i, 64));
+        b.put_string(&wide_string(i + N, 16));
+    });
+    let path = dir.path().join("skip.db").to_str().unwrap().to_owned();
+    batch.write_as_shard(&path, ShardWriteOpts::default()).unwrap();
+    let shard = MappedShard::open(&path, &schema).unwrap();
+    for (start, rows) in [(0, N), (0, N - 8)] {
+        let b = shard.slice_to_owned_batch(start, rows, 0b10);
+        assert_eq!(b.blob().len(), shard.heap().plain().unwrap().len(), "premise: carried");
+        let measured = crate::repr::string_heap::measure_dead_heap(&b.as_mem_batch());
+        assert!(
+            measured <= b.dead_heap(),
+            "{measured} unreferenced past {}",
+            b.dead_heap()
+        );
+    }
 }
 
 // -----------------------------------------------------------------------

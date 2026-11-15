@@ -6,8 +6,8 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 
 use super::batch::{range_rows, MemBatch};
+use super::codebook::Codebook;
 use super::pool::{self, is_tight};
-use super::shard::Codebook;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::TypeCode;
 use gnitz_wire::{Heap, HeapValue, RowSource};
@@ -84,6 +84,7 @@ const DEAD_CHECK_CELLS: usize = 1024;
 /// rows `kept`, ascending and disjoint: the string slots it leaves behind are
 /// charged dead as well. `None` when `src` has no string slot, when no kept
 /// slot reads a non-empty heap, or when carrying loses to relocating.
+#[inline]
 pub(super) fn carry_dead(src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, usize)]) -> Option<usize> {
     let mask = src.schema.string_payload_slots();
     if mask == 0 {
@@ -108,9 +109,13 @@ pub(super) fn carry_dead(src: &MemBatch<'_>, kept_slots: u64, kept: &[(usize, us
             }
         }
     }
+    // The long bytes of the gaps between the kept ranges.
     let excluded = || {
-        let kept_long: usize = kept.iter().map(|&(s, e)| long_bytes(src, mask, s..e)).sum();
-        long_bytes(src, mask, 0..src.count) - kept_long
+        let ends = kept.iter().map(|&(_, e)| e);
+        let starts = kept.iter().map(|&(s, _)| s).chain([src.count]);
+        (std::iter::once(0).chain(ends).zip(starts))
+            .map(|(gap_start, gap_end)| long_bytes(src, mask, gap_start..gap_end))
+            .sum()
     };
     carried_dead(heap, dead, src.count, range_rows(kept), excluded)
 }
@@ -191,7 +196,7 @@ pub(super) fn rebase_string_cells(
 
 /// [`rebase_string_cells`] for one cell, inlined into a loop that picks a
 /// source per cell.
-#[inline]
+#[inline(always)]
 pub(super) fn rebase_string_cell(
     cell: &mut [u8; 16],
     src: Heap<'_>,
@@ -297,16 +302,24 @@ fn place_value(
     cache: Option<&mut BlobCache>,
 ) -> usize {
     let at = dst_blob.len();
-    let mut append = || {
-        match book {
-            None => value.append_to(dst_blob),
-            Some(book) => book.append(value, dst_blob),
-        }
-        at
-    };
     match cache {
-        Some(cache) => *cache.map().entry(value.key()).or_insert_with(append),
-        None => append(),
+        Some(cache) => *cache.map().entry(value.key()).or_insert_with(|| {
+            append_value(value, dst_blob, book);
+            at
+        }),
+        None => {
+            append_value(value, dst_blob, book);
+            at
+        }
+    }
+}
+
+/// Append `value` to `dst_blob`: decoded, or coded under `book`.
+#[inline(always)]
+pub(crate) fn append_value(value: HeapValue<'_>, dst_blob: &mut Vec<u8>, book: Option<&Codebook>) {
+    match book {
+        None => value.append_to(dst_blob),
+        Some(book) => book.append(value, dst_blob),
     }
 }
 

@@ -3,7 +3,8 @@
 //!
 //! - The batch: its region layout (`batch`), the row-at-a-time system-table
 //!   writer over one (`batch_builder`), the direct row writer (`writer`), wire
-//!   serialization (`batch_wire`), and the German-string heap (`string_heap`).
+//!   serialization (`batch_wire`), the German-string heap (`string_heap`), and
+//!   the FSST symbol table a heap's long values are coded under (`codebook`).
 //! - The thread-local object pools that batch arenas, send buffers, cursor
 //!   vectors and kernel scratch recycle through (`pool`).
 //! - The kernels over batches: the OPK lower-bound search and the column
@@ -27,6 +28,7 @@
 mod batch;
 mod batch_builder;
 mod batch_wire;
+mod codebook;
 mod merge;
 mod pool;
 mod read_cursor;
@@ -40,15 +42,14 @@ mod writer;
 pub use batch::{Batch, MemBatch};
 pub use batch_builder::BatchBuilder;
 pub use batch_wire::WireRows;
+pub use codebook::Codebook;
 pub use merge::merge_consolidated;
 pub use pool::PooledBuf;
 pub use read_cursor::{empty_cursor, from_runs, from_runs_at, from_runs_in_band, PkSetGather, ReadCursor};
 pub use run::{Run, StoredRow};
-pub use shard::{
-    guard_slot, Codebook, GuardMerge, GuardRun, MappedShard, ShardDirectory, ShardWriteOpts, StorageError,
-};
+pub use shard::{guard_slot, GuardMerge, GuardRun, MappedShard, ShardDirectory, ShardWriteOpts, StorageError};
 
-pub(crate) use batch::{range_rows, runs_where, runs_where_zip, write_to_batch};
+pub(crate) use batch::{range_rows, runs_where, runs_where_zip};
 pub(crate) use pool::{vec_bytes, with_scratch};
 pub(crate) use read_cursor::{CursorRow, GroupProbe};
 pub(crate) use scatter::{copy_runs, materialize_carrying, stride, stride_dispatch, with_picks};

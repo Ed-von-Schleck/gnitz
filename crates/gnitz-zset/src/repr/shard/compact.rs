@@ -3,9 +3,9 @@
 //! windows that ascend without overlap are taken in key order unmerged, each
 //! decoded straight into the run.
 
-use super::codebook::Codebook;
 use super::file::ShardWriteOpts;
 use super::reader::MappedShard;
+use crate::repr::codebook::Codebook;
 use crate::repr::merge::{disjoint_order, run_merge};
 use crate::repr::scatter::UnifiedSet;
 use crate::repr::string_heap::{long_bytes, prorated_blob_cap, BlobCache, StringDest};
@@ -214,34 +214,41 @@ impl GuardMerge {
 
     /// The run of the windows of the shards [`Self::in_order`] put in `order`:
     /// each window's rows decoded straight into it, one after the other, its
-    /// long values coded under `codebook` where given, under one dedup cache.
-    /// `None` when every window is empty.
+    /// long values coded under `codebook` where given. A window's heap is
+    /// carried whole where [`MappedShard::carry_for`] carries it, and its
+    /// values are relocated under one dedup cache otherwise. `None` when every
+    /// window is empty.
     fn concat(&self, windows: &[Range<usize>], order: &[usize], codebook: Option<&Codebook>) -> Option<Batch> {
         let rows: usize = order.iter().map(|&i| windows[i].len()).sum();
         if rows == 0 {
             return None;
         }
         let out_schema = &self.out_schema;
+        let strings = out_schema.string_payload_slots();
+        let shards: SmallVec<[_; 8]> = (order.iter())
+            .map(|&i| {
+                let (s, w) = (&*self.shards[i], windows[i].clone());
+                (s, w.clone(), s.carry_for(w, strings, codebook))
+            })
+            .collect();
         let mut batch = Batch::with_capacity(out_schema, rows);
-        let shards = order.iter().map(|&i| (&*self.shards[i], windows[i].clone()));
         if out_schema.has_german_string() {
             batch.reserve_blob(
-                (shards.clone())
-                    .map(|(s, w)| prorated_blob_cap(s.heap().plain_len(), s.row_count(), w.len()))
+                (shards.iter())
+                    .map(|(s, w, carry)| match carry {
+                        Some((heap, _)) => heap.len(),
+                        None => prorated_blob_cap(s.heap().plain_len(), s.row_count(), w.len()),
+                    })
                     .sum(),
             );
         }
         let mut cache = BlobCache::for_rows(out_schema, rows);
-        for (s, w) in shards {
+        for (s, w, carry) in shards {
+            let dest = match carry {
+                Some((heap, dead)) => StringDest::Carried(batch.adopt_heap(heap, dead, 0)),
+                None => StringDest::Placed(codebook),
+            };
             batch.write_at_most(w.len(), &mut cache, |dw| {
-                // A whole shard coded under the run's own table is carried: its
-                // codes are already the run's.
-                let dest = match (s.heap(), codebook) {
-                    (Heap::Coded(c), Some(book)) if w.len() == s.row_count() && c.table.digest() == book.digest() => {
-                        StringDest::Carried(dw.adopt_heap(c.codes))
-                    }
-                    _ => StringDest::Placed(codebook),
-                };
                 s.decode_rows_into(w.clone(), dw, dest, 0);
                 (w.len(), ())
             });

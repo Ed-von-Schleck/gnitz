@@ -6,11 +6,11 @@ use std::fs::OpenOptions;
 use std::io::IoSlice;
 use std::os::unix::fs::OpenOptionsExt;
 
-use super::codebook::Codebook;
 use super::encoding::*;
 use super::error::StorageError;
 use super::layout::*;
 use super::pk_filter;
+use crate::repr::codebook::Codebook;
 use crate::repr::Batch;
 use crate::schema::SchemaColumn;
 use gnitz_expr::Level;
