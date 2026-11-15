@@ -11,8 +11,7 @@ use std::collections::VecDeque;
 use std::ops::{ControlFlow, Range};
 
 use crate::repr::batch::{Batch, MemBatch};
-use crate::repr::loser_tree::{LoserTree, Player};
-use crate::repr::merge::{self, MergeOrder};
+use crate::repr::merge::{self, LoserTree, MergeOrder, Player};
 use crate::repr::pool::{recycle, take, vec_bytes};
 use crate::repr::scatter::{ColumnarSource, Pick};
 use crate::repr::seek::gallop_by;

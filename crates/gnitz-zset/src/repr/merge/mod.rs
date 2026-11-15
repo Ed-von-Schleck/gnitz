@@ -1,5 +1,6 @@
 //! The Z-set merges: the N-way run merge over any [`ColumnarSource`], the
-//! two-way galloping batch merge, and in-batch consolidation.
+//! two-way galloping batch merge, and in-batch consolidation; and the loser
+//! tree every N-way merge plays its tournament on (`loser_tree`).
 //!
 //! Operates on flat columnar buffers: pk[OPK big-endian, `pk_stride` B/row],
 //! weight[i64 LE], null_bitmap[u64 LE], payload columns, blob arena.
@@ -17,7 +18,6 @@ use smallvec::SmallVec;
 use std::ops::{ControlFlow, Range};
 
 use super::batch::{Batch, MemBatch};
-use super::loser_tree::{LoserTree, Player};
 use super::scatter::{ColumnarSource, Pick};
 use super::string_heap::{rebase_string_cells, row_long_bytes, BlobCache};
 use super::writer::DirectWriter;
@@ -25,6 +25,9 @@ use crate::schema::{
     pack_pk_be, pk_width_dispatch, with_payload_cmp, PayloadOrder, PkSortKey, SchemaColumn, SchemaDescriptor,
 };
 use gnitz_wire::{native_key_image, Heap, RowSource, ScalarKind, NARROW_PK_MAX_BYTES, REG_PAYLOAD_START, REG_WEIGHT};
+
+mod loser_tree;
+pub(crate) use loser_tree::{LoserTree, Player};
 
 // ---------------------------------------------------------------------------
 // Z-Set `+` over consolidated batches
@@ -112,8 +115,9 @@ fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
 /// of `windows`: one [`Pick`] per (PK, payload) group whose weights do not sum to
 /// zero, at that sum, in (PK, payload) order.
 ///
-/// Out of line, so the merge loop's register allocation does not depend on the
-/// caller it would be inlined into.
+/// Dispatches the payload order, monomorphizing one branch-free copy of the
+/// merge loop, [`merge_picks`]. Out of line, so its callers compile as they
+/// would around a call.
 #[inline(never)]
 pub(crate) fn run_merge<S: ColumnarSource>(
     sources: &[S],
@@ -133,29 +137,29 @@ pub(crate) fn run_merge<S: ColumnarSource>(
         schema.num_payload_cols() == 0 || !sources.iter().any(S::is_skeleton),
         "a skeleton row merges under the PK-only schema: this order is never coarsened"
     );
-    let mut rows = Vec::with_capacity(cursors.iter().map(|c| c.len()).sum());
+    with_payload_cmp!(schema, |payload| merge_picks(sources, schema, &mut cursors, payload))
+}
 
-    // Dispatch the payload order, monomorphizing one branch-free copy of the
-    // merge loop.
-    with_payload_cmp!(schema, |payload| {
-        let order = MergeOrder::past_shared_prefix(sources, &cursors, schema.pk_stride());
-        let mut tree = LoserTree::empty(cursors.len());
-        tree.rebuild(
-            |i| order.head(sources, i, &cursors[i]),
-            merge_less(schema, sources, order, payload),
-        );
-        drive(
-            &mut tree,
-            schema,
-            sources,
-            order,
-            &mut cursors,
-            payload,
-            |src, row, w| {
-                rows.push((src as u32, row as u32, w));
-                ControlFlow::Continue(())
-            },
-        );
+/// [`run_merge`] under one payload order. Out of line, one function per
+/// order: the merge loop's register allocation then depends neither on the
+/// caller it would be inlined into nor on the other order's copy.
+#[inline(never)]
+fn merge_picks<S: ColumnarSource, P: PayloadOrder>(
+    sources: &[S],
+    schema: &SchemaDescriptor,
+    cursors: &mut [Range<usize>],
+    payload: P,
+) -> Vec<Pick> {
+    let mut rows = Vec::with_capacity(cursors.iter().map(|c| c.len()).sum());
+    let order = MergeOrder::past_shared_prefix(sources, cursors, schema.pk_stride());
+    let mut tree = LoserTree::with_buffer(cursors.len(), Vec::new());
+    tree.rebuild(
+        |i| order.head(sources, i, &cursors[i]),
+        merge_less(schema, sources, order, payload),
+    );
+    drive(&mut tree, schema, sources, order, cursors, payload, |src, row, w| {
+        rows.push((src as u32, row as u32, w));
+        ControlFlow::Continue(())
     });
     rows
 }
@@ -250,6 +254,10 @@ impl MergeOrder {
     /// Keyed past the prefix every row `cursors` walk of `sources` shares —
     /// what each walk's first and last rows share, a source being sorted — so
     /// that keys of small values in wide columns do not all tie.
+    ///
+    /// Out of line: run once per merge, and inlined into [`run_merge`] it
+    /// changes how the merge loop compiles.
+    #[inline(never)]
     fn past_shared_prefix<S: ColumnarSource>(sources: &[S], cursors: &[Range<usize>], stride: usize) -> Self {
         if stride <= NARROW_PK_MAX_BYTES {
             return Self::leading(stride, false);

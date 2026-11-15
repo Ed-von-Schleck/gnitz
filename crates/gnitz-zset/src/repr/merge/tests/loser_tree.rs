@@ -77,7 +77,7 @@ fn random_kway_merges_drain_in_key_then_source_order() {
             expected.sort();
 
             let mut pos = vec![0usize; k];
-            let mut t = LoserTree::empty(k);
+            let mut t = LoserTree::with_buffer(k, Vec::new());
             t.rebuild(|i| runs[i].first().map(|&v| (0, key(v))), run_less(&runs));
             let cut = rng.gen_range(expected.len() as u64 + 1) as usize;
             let mut got = drain(&runs, &mut t, &mut pos, cut);
@@ -107,7 +107,7 @@ fn random_runs(rng: &mut Rng, k: usize) -> Vec<Vec<u128>> {
 fn a_reused_buffer_drains_like_a_fresh_one() {
     let mut rng = Rng::new(7);
     let big = random_runs(&mut rng, 13);
-    let mut t = LoserTree::empty(big.len());
+    let mut t = LoserTree::with_buffer(big.len(), Vec::new());
     t.rebuild(|i| big[i].first().map(|&v| (0, key(v))), run_less(&big));
     drain(&big, &mut t, &mut vec![0; big.len()], 5);
     let mut buf = t.take_buffer();

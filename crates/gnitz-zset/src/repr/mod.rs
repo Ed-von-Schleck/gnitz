@@ -8,8 +8,8 @@
 //!   vectors and kernel scratch recycle through (`pool`).
 //! - The kernels over batches: the OPK lower-bound search and the column
 //!   pointer it reads through (`seek`), the column-first row copy (`scatter`),
-//!   the run merges and single-batch consolidation (`merge`), and the N-way
-//!   min-merge tournament the run merge plays (`loser_tree`).
+//!   and the run merges, the N-way tournament they play, and single-batch
+//!   consolidation (`merge`).
 //! - The shard file — its format, writer, reader and compaction, and the
 //!   storage error type they fail with (`shard`).
 //! - Above the representation: the sorted run, whatever backs it (`run`), and
@@ -27,7 +27,6 @@
 mod batch;
 mod batch_builder;
 mod batch_wire;
-mod loser_tree;
 mod merge;
 mod pool;
 mod read_cursor;

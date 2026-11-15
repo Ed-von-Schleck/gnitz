@@ -5,7 +5,7 @@
 use std::cell::Cell;
 use std::mem::MaybeUninit;
 
-use super::pool::with_scratch;
+use crate::repr::pool::with_scratch;
 
 /// A player: an index into the caller's sources, its current row, and the key
 /// the caller gave that row.
@@ -32,7 +32,7 @@ impl Player {
     }
 
     #[inline(always)]
-    pub(crate) fn key(&self) -> u128 {
+    pub(super) fn key(&self) -> u128 {
         (self.key[0] as u128) << 64 | self.key[1] as u128
     }
 }
@@ -83,14 +83,10 @@ pub(crate) struct LoserTree {
 }
 
 impl LoserTree {
-    /// A tournament over `n` sources, every leaf a sentinel — empty until
+    /// A tournament over `n` sources in `losers`' allocation, whatever it held
+    /// before; every leaf is a sentinel, so it is empty until
     /// [`rebuild`](Self::rebuild) plays it. Allocates the losers only for
     /// `n >= 2`.
-    pub(crate) fn empty(n: usize) -> Self {
-        Self::with_buffer(n, Vec::new())
-    }
-
-    /// [`Self::empty`] over `losers`' allocation, whatever it held before.
     pub(crate) fn with_buffer(n: usize, mut losers: Vec<Player>) -> Self {
         debug_assert!(n < u32::MAX as usize, "source count must be < u32::MAX, the sentinel");
         let n_pad = n.next_power_of_two().max(1);
