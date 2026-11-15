@@ -9,7 +9,7 @@ use crate::test_support::{arb_schema, cols_of};
 
 use gnitz_wire::schema_block::check_same_types;
 use gnitz_wire::{ColumnDef, MAX_PK_COLUMNS};
-use gnitz_zset::repr::Batch;
+use gnitz_zset::repr::{Batch, MemBatch};
 use gnitz_zset::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use proptest::prelude::*;
 
@@ -184,7 +184,9 @@ fn a_client_bundle_decodes_to_the_rows_it_wrote() {
         .iter()
         .map(|item| {
             let schema = crate::catalog::SysFamily::from_id(item.hdr.target_id).unwrap().schema();
-            Batch::decode_from_wal_block(&payload[item.data.clone().unwrap()], schema).unwrap()
+            MemBatch::of_wal_block(&payload[item.data.clone().unwrap()], schema)
+                .unwrap()
+                .to_batch()
         })
         .collect();
 

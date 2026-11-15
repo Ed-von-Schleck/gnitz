@@ -7,6 +7,7 @@ use crate::test_support::{
 };
 use gnitz_store::relation::IndexClaim;
 use gnitz_wire::{peek_control_block, DecodedControl, PkColList, TypeCode, WireStatus};
+use gnitz_zset::repr::MemBatch;
 use gnitz_zset::schema::SchemaDescriptor;
 use std::rc::Rc;
 
@@ -50,9 +51,9 @@ impl Frame {
     /// The rows it carries; a frame without a data block carries none.
     pub(in crate::runtime::worker) fn rows(&self, schema: &SchemaDescriptor) -> Batch {
         match self.ctrl.data.clone() {
-            Some(data) => {
-                Batch::decode_from_wal_block(&self.bytes[data], schema).expect("the frame decodes against its schema")
-            }
+            Some(data) => MemBatch::of_wal_block(&self.bytes[data], schema)
+                .expect("the frame decodes against its schema")
+                .to_batch(),
             None => Batch::empty_with_schema(schema),
         }
     }
@@ -252,7 +253,7 @@ fn a_fitting_reply_is_the_source_batch_verbatim() {
     *regions.last_mut().unwrap() = &padded;
     let mut block = Vec::new();
     gnitz_wire::wal::append_block(&regions, 4096, &mut block);
-    let batch = Rc::new(Batch::decode_from_wal_block(&block, &schema).unwrap());
+    let batch = Rc::new(MemBatch::of_wal_block(&block, &schema).unwrap().to_batch());
     assert!(
         batch.dead_heap() > 0,
         "the fixture must have dead heap bytes for the size test to discriminate"

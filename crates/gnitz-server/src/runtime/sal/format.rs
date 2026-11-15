@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicU64;
 use crate::runtime::park::WorkerSet;
 use crate::runtime::w2m::RequestId;
 use gnitz_wire::{read_u32_le, read_u64_le, write_u32_le, write_u64_le, MAX_WORKERS};
-use gnitz_zset::repr::{Batch, WireRows};
+use gnitz_zset::repr::{Batch, MemBatch, WireRows};
 use gnitz_zset::schema::{decode_schema_block, SchemaDescriptor};
 
 /// The publication prefix in front of every group header, one atomically stored
@@ -448,7 +448,7 @@ pub(super) fn payload_rows(
         Some(s) => s,
         None => decode_schema_block(record)?,
     };
-    let batch = Batch::decode_from_wal_block(block, &schema)?;
+    let batch = MemBatch::of_wal_block(block, &schema)?.to_batch();
     batch.debug_verify_null_bits();
     Ok((blob, Some(batch)))
 }

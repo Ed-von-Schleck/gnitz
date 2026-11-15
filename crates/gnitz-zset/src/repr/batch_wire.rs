@@ -186,15 +186,13 @@ impl<'a> MemBatch<'a> {
     /// Heap bytes row `row` adds to a chunk whose spans are already in `seen`:
     /// the spans its long cells in the string slots `slots` name, each new one
     /// charged once.
+    #[inline]
     fn row_heap_cost(&self, row: usize, slots: u64, seen: &mut BlobCache) -> usize {
         let blob = self.blob();
         let mut cost = 0;
         for pi in gnitz_wire::BitIter(slots) {
             if let Some(span) = gnitz_wire::german_string_heap(self.german_cell(row, pi), blob.len()) {
-                let content = &blob[span];
-                if seen.map().insert(blob_span_key(content), 0).is_none() {
-                    cost += content.len();
-                }
+                cost += charge_span(&blob[span], seen);
             }
         }
         cost
@@ -306,12 +304,6 @@ impl Batch {
     /// [`MemBatch::wire_regions`].
     pub fn wire_regions(&self) -> Regions<'_> {
         self.as_mem_batch().wire_regions()
-    }
-
-    /// Decode a WAL block the engine wrote into an owned unconsolidated batch. String
-    /// cells are copied verbatim with their heap.
-    pub fn decode_from_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
-        Ok(MemBatch::of_wal_block(data, schema)?.to_batch())
     }
 
     /// A WAL block a peer wrote, validated — its string cells canonical and
@@ -446,6 +438,17 @@ impl<'a> MemBatch<'a> {
         let dead = MemBatch::validate_foreign(data, schema)?.dead_heap;
         gnitz_wire::wal::set_heap_dead(data, dead);
         Ok(())
+    }
+}
+
+/// The bytes of `content`, a span of the heap a chunk's rows read, when `seen`
+/// does not hold it yet, which it then does; else zero. Out of line, so a row
+/// with no long cell sizes without the map insert's register pressure.
+#[inline(never)]
+fn charge_span(content: &[u8], seen: &mut BlobCache) -> usize {
+    match seen.map().insert(blob_span_key(content), 0) {
+        None => content.len(),
+        Some(_) => 0,
     }
 }
 

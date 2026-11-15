@@ -37,7 +37,7 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
     for (row, forge) in forgeries.into_iter().enumerate() {
         let mut buf = clean.clone();
         forge(&mut buf[cells + row * 16..cells + (row + 1) * 16]);
-        assert!(Batch::decode_from_wal_block(&buf, &schema).is_ok(), "row {row}");
+        assert!(MemBatch::of_wal_block(&buf, &schema).is_ok(), "row {row}");
         assert_eq!(
             Batch::decode_foreign_wal_block(&buf, &schema).err(),
             Some("data WAL German string is not in canonical form"),
@@ -87,7 +87,7 @@ fn a_foreign_decode_refuses_a_null_the_schema_does_not_admit() {
         (block(true), "a null bit on a NOT NULL column"),
         (stray_bit, "a null bit on a NOT NULL column"),
     ] {
-        assert!(Batch::decode_from_wal_block(&forged, &schema).is_ok(), "{why}");
+        assert!(MemBatch::of_wal_block(&forged, &schema).is_ok(), "{why}");
         assert_eq!(Batch::decode_foreign_wal_block(&forged, &schema).err(), Some(why));
     }
 }
@@ -120,7 +120,7 @@ fn a_foreign_decode_refuses_a_boolean_byte_past_one() {
     for at in [second_key, first_cell] {
         let mut forged = clean.clone();
         forged[at] = 2;
-        assert!(Batch::decode_from_wal_block(&forged, &schema).is_ok(), "byte {at}");
+        assert!(MemBatch::of_wal_block(&forged, &schema).is_ok(), "byte {at}");
         assert_eq!(
             Batch::decode_foreign_wal_block(&forged, &schema).err(),
             Some("a BOOLEAN cell is neither 0 nor 1"),
@@ -331,7 +331,7 @@ fn dead_heap_round_trips_an_engine_block() {
     let schema = make_schema_pk_u64_payload_string();
     let b = make_batch_bytes(&schema, &[(1, 1, &[b'a'; 20]), (2, 1, &[b'b'; 30])]).padded(7);
     let block = encode_to_wire_vec(&b);
-    let decoded = Batch::decode_from_wal_block(&block, &schema).unwrap();
+    let decoded = MemBatch::of_wal_block(&block, &schema).unwrap().to_batch();
     assert_eq!((decoded.dead_heap(), decoded.blob().len()), (7, b.blob().len()));
 }
 
@@ -361,7 +361,7 @@ fn a_foreign_decode_measures_the_dead_heap_exactly() {
         let decoded = Batch::decode_foreign_wal_block(&block, &schema).unwrap();
         assert_eq!(decoded.dead_heap(), 70, "header claimed {claimed}");
         assert_eq!(
-            Batch::decode_from_wal_block(&block, &schema).unwrap().dead_heap(),
+            MemBatch::of_wal_block(&block, &schema).unwrap().to_batch().dead_heap(),
             claimed
         );
     }
