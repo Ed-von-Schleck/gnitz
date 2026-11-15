@@ -21,9 +21,9 @@
 //! with the pending ones first. That puts the pending shards after the
 //! memtable and the RAM tier, which is their age order only because a barrier
 //! that writes a pending shard empties both, and nothing lands below the cut
-//! while a shard is pending. Readers rely on that order: a cursor is
-//! [marked](ReadCursor::mark_newest_first) newest first, and
-//! [`Table::unique_live_row_at`] lets the newest run holding a key decide it.
+//! while a shard is pending. Readers rely on that order: a group probe over a
+//! cursor, and [`Table::unique_live_row_at`], let the newest run holding a key
+//! decide it.
 //!
 //! A row and its retraction stay stored until a fold merges their runs. An open
 //! starts at the store's [`LiveFloor`] rather than walking the cancelled pairs
@@ -315,11 +315,10 @@ impl Table {
         let schema = self.shard_index.schema;
         let LiveFloor { at, judged } = self.live_floor.get();
         let runs = self.sources(None, cut);
-        let mut cursor = match at {
+        let cursor = match at {
             Some(at) => from_runs_at(runs, schema, at.pk_bytes()),
             None => from_runs(runs, schema),
         };
-        cursor.mark_newest_first();
         if !judged {
             let first_live = cursor.passed_more_than_a_seek().then(|| match cursor.is_valid() {
                 true => PkBuf::from_bytes(cursor.current_pk_bytes()),
@@ -419,9 +418,7 @@ impl Table {
             "Table::cursor: a bound is not pk_stride wide",
         );
         let runs = self.sources(Some((start.pk_bytes(), hi.pk_bytes())), cut);
-        let mut cursor = from_runs_in_band(runs, schema, start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes));
-        cursor.mark_newest_first();
-        cursor
+        from_runs_in_band(runs, schema, start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes))
     }
 
     /// The consolidated batch of all live rows, cached until the row set moves.

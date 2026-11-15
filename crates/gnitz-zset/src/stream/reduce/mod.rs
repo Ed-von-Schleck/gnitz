@@ -403,7 +403,7 @@ fn emit_groups(
     // A trace with no row at the delta's groups holds no group's history.
     let traced = out_trace.is_valid();
     // A reduce's output holds one row per group.
-    let probe = out_trace.group_probe(true);
+    let probe = out_trace.group_probe();
     let mut emit = GroupEmit {
         heads,
         probe,

@@ -207,27 +207,6 @@ proptest! {
             }
         }
 
-        // A group probe lands on each ascending key's first live row, as an
-        // ascending group seek does, from a cursor opened at the whole store or
-        // at the first key.
-        if let Some(first) = keys.first() {
-            for mut cursor in [open(), from_runs_in_band(runs.iter().cloned(), s, first, None)] {
-                let mut seeking = open();
-                let mut probe = cursor.group_probe(false);
-                for key in &keys {
-                    let found = probe.find(key).map(|at| {
-                        let mut one = Batch::with_capacity(&s, 1);
-                        probe.copy_row_into(at, &mut one, 1);
-                        weighted_rows(&one).remove(0).0
-                    });
-                    let first_live = (0..mat.len()).find(|&r| pk(r) == &key[..]).map(|r| want[r].0.clone());
-                    prop_assert_eq!(&found, &first_live);
-                    let sought = seeking.seek_pk_group_ascending(key).then(|| current(&seeking).0);
-                    prop_assert_eq!(&found, &sought);
-                }
-            }
-        }
-
         // A key-set gather, drained across chunk boundaries.
         let list = PkKeys::from_sorted(stride, keys.concat());
         let mut gather = PkSetGather::over(open(), list.clone());
@@ -533,12 +512,14 @@ proptest! {
     /// Over a store of one row per PK — a reduce output's history, each tick
     /// retracting a group's row and writing its new one — a probe that reads a
     /// PK off the newest run holding it, a heap run or a shard, lands where
-    /// folding every run does: on the PK's one live row.
+    /// folding every run and an ascending group seek do: on the PK's one live
+    /// row, from a cursor opened at the whole store or at the first key.
     #[test]
     fn newest_run_decides_a_one_row_per_pk_probe(
         ticks in prop::collection::vec(prop::collection::vec((0u128..10, prop::option::of(0i64..4)), 1..6), 1..24),
         cuts in prop::collection::vec(any::<prop::sample::Index>(), 0..8),
         shards in 0usize..10,
+        first in 0u128..11,
     ) {
         let s = make_schema_u128_i64();
         // Each tick's consolidated delta, and the state after the last.
@@ -587,15 +568,25 @@ proptest! {
                 Run::Shard(map_shard(&dir.path().join(format!("{i}.db")), b))
             }))
             .collect();
-        let mut cursor = from_runs(sources.iter().cloned(), s);
-        cursor.mark_newest_first();
-        let mut probe = cursor.group_probe(true);
-        for pk in 0u128..11 {
-            let found = probe.find(&pk.to_be_bytes()).map(|at| {
-                let (src, row) = probe.row_at(at);
-                payload0_i64(src, row)
-            });
-            prop_assert_eq!(found, state.get(&pk).copied(), "pk {}", pk);
+        // From a cursor opened at the whole store, and at the first key probed.
+        let whole = from_runs(sources.iter().cloned(), s);
+        let band = from_runs_in_band(sources.iter().cloned(), s, &first.to_be_bytes(), None);
+        for (mut cursor, keys) in [(whole, 0u128..11), (band, first..11)] {
+            let mut seeking = from_runs(sources.iter().cloned(), s);
+            let mut probe = cursor.group_probe();
+            for pk in keys {
+                let key = pk.to_be_bytes();
+                let found = probe.find(&key).map(|at| {
+                    let (src, row) = probe.row_at(at);
+                    payload0_i64(src, row)
+                });
+                prop_assert_eq!(found, state.get(&pk).copied(), "pk {}", pk);
+                let sought = seeking.seek_pk_group_ascending(&key).then(|| {
+                    let (src, row) = seeking.current_row_source();
+                    payload0_i64(src, row)
+                });
+                prop_assert_eq!(found, sought, "pk {}", pk);
+            }
         }
     }
 }

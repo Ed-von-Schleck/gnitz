@@ -72,18 +72,18 @@ impl TestTrace {
         &self.runs
     }
 
-    /// A cursor over every run.
+    /// A cursor over every run, newest first, as a store's is.
     pub(crate) fn cursor(&self) -> ReadCursor {
-        from_runs(self.runs.iter().cloned().map(Run::Mem), self.schema)
+        from_runs(self.runs.iter().rev().cloned().map(Run::Mem), self.schema)
     }
 
     /// A cursor over the rows whose PK begins with a key in `[first, last]` and
     /// over no other: an operator that reads outside the keys it opened its
-    /// history at finds nothing there.
+    /// history at finds nothing there. Its runs are newest first.
     pub(crate) fn cursor_within(&self, first: &[u8], last: &[u8]) -> ReadCursor {
         let (start, end) =
             group_band(first, last, self.schema.pk_stride()).expect("`first <= last`, so the band holds a key");
-        let runs = self.runs.iter().cloned().map(Run::Mem);
+        let runs = self.runs.iter().rev().cloned().map(Run::Mem);
         let end = end.as_ref().map(PkBuf::pk_bytes);
         from_runs_in_band(runs, self.schema, start.pk_bytes(), end)
     }
