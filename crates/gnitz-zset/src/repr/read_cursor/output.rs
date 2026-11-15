@@ -6,6 +6,7 @@ use std::rc::Rc;
 use super::super::run::Run;
 use super::{hydrate_skeletons, ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
+use crate::repr::merge;
 use crate::repr::scatter::{with_picks, ColumnarSource, Pick, UnifiedSet};
 use crate::schema::with_payload_cmp;
 use gnitz_expr::RowFilter;
@@ -168,21 +169,27 @@ impl ReadCursor {
     }
 
     /// Replace `out` with up to `max_rows` merge groups, one [`Pick`] each at its
-    /// net weight, in merge order.
+    /// net weight, in merge order. A [dominated](merge::dominated) drain gallops
+    /// its stretches: every run is folded, so each holds an element once.
     fn drain_sorted_into(&mut self, max_rows: usize, out: &mut Vec<Pick>) {
         out.clear();
         out.reserve(max_rows.min(self.estimated_length()));
         out.push(self.current_pick());
         let mut first_undrained = None;
-        with_payload_cmp!(self.schema, |payload| self.drive(payload, |gs, gr, nw| {
-            if out.len() == max_rows {
-                first_undrained = Some((gs, gr, nw));
-                ControlFlow::Break(())
-            } else {
-                out.push((gs as u32, gr as u32, nw));
-                ControlFlow::Continue(())
+        merge::with_spans!(merge::dominated(&self.states), |SPANS| with_payload_cmp!(
+            self.schema,
+            |payload| {
+                self.drive::<_, SPANS>(payload, |gs, gr, nw| {
+                    if out.len() == max_rows {
+                        first_undrained = Some((gs, gr, nw));
+                        ControlFlow::Break(())
+                    } else {
+                        out.push((gs as u32, gr as u32, nw));
+                        ControlFlow::Continue(())
+                    }
+                })
             }
-        }));
+        ));
         self.commit_emitted(first_undrained);
     }
 }

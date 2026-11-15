@@ -168,6 +168,13 @@ impl LoserTree {
         (top.source_idx != SENTINEL).then_some(top)
     }
 
+    /// The key below which the champion's source holds the least row of every
+    /// source; `0`, which no key is below, when none is known.
+    #[inline(always)]
+    pub(crate) fn bound(&self) -> u128 {
+        self.bound
+    }
+
     /// The internal node above leaf `source_idx`.
     #[inline(always)]
     fn leaf_parent(&self, source_idx: u32) -> usize {
@@ -179,14 +186,17 @@ impl LoserTree {
     /// A champion that stays one keeps its path's losers, whose least key is
     /// then the bound under which its next steps skip the replay: a run that does
     /// not interleave with the others is walked at one compare per row.
+    ///
+    /// Returns whether the step took that skip: the new champion is then below
+    /// [`bound`](Self::bound), and so below every other source's head.
     #[inline(always)]
-    pub(crate) fn step_top(&mut self, next_row: Option<(u32, u128)>, less: &impl Fn(&Player, &Player) -> bool) {
+    pub(crate) fn step_top(&mut self, next_row: Option<(u32, u128)>, less: &impl Fn(&Player, &Player) -> bool) -> bool {
         let source_idx = self.top.source_idx;
         debug_assert_ne!(source_idx, SENTINEL, "step_top on a drained tree");
         let mut cur = match next_row {
             Some((row, key)) if key < self.bound => {
                 self.top = Player::new(key, source_idx, row);
-                return;
+                return true;
             }
             Some((row, key)) => Player::new(key, source_idx, row),
             None => SENTINEL_PLAYER,
@@ -213,6 +223,7 @@ impl LoserTree {
         } else if cur.key() != self.bound {
             self.bound = self.path_least(source_idx);
         }
+        false
     }
 
     /// The least key a loser on `source_idx`'s path holds.

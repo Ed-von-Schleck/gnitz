@@ -63,8 +63,9 @@ fn for_compaction_bench() {
 /// spills has: every match is settled on the PK. By what the PK is — 8 bytes,
 /// then 24 that differ in their leading or only in their trailing column — and
 /// by how the rows are dealt to the sources: scattered, or in ascending blocks
-/// as the spills of an ascending key are. The merge alone is the run walk
-/// without the output batch.
+/// as the spills of an ascending key are, or mostly to one large source with a
+/// scattered few elsewhere, as a level's shard folded with a small delta is.
+/// The merge alone is the run walk without the output batch.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn distinct_compaction_bench() {
@@ -79,7 +80,7 @@ fn distinct_compaction_bench() {
     ];
     // Label, source count, the source key `k` lands in.
     type Deal = (&'static str, u64, fn(u64) -> u64);
-    let deals: [Deal; 4] = [
+    let deals: [Deal; 6] = [
         ("2 equal sources", 2, |k| (mix(k) >> 20) % 2),
         ("5 equal sources", 5, |k| (mix(k) >> 20) % 5),
         ("1 large and 4 small sources", 5, |k| {
@@ -91,6 +92,17 @@ fn distinct_compaction_bench() {
             }
         }),
         ("5 ascending blocks", 5, |k| k * 5 / TOTAL),
+        ("1 large and 1 tiny source", 2, |k| {
+            u64::from((mix(k) >> 20).is_multiple_of(64))
+        }),
+        ("1 large and 4 tiny sources", 5, |k| {
+            let h = mix(k) >> 20;
+            if h.is_multiple_of(64) {
+                1 + (h >> 6) % 4
+            } else {
+                0
+            }
+        }),
     ];
     for (pk, (pk_label, pk_cols, key_col)) in pks.into_iter().enumerate() {
         let schema = pk_payload_schema(&vec![TypeCode::U64; pk_cols]);
@@ -119,7 +131,7 @@ fn distinct_compaction_bench() {
             // is the output batch.
             let (rows, merge) = instructions.measure(|| {
                 let windows: Vec<_> = inputs.iter().map(|s| s.window(0..s.row_count())).collect();
-                let rows = run_merge(&windows, &schema, windows.iter().map(|w| 0..w.row_count()));
+                let rows = run_merge(&windows, &schema, windows.iter().map(|w| 0..w.row_count()), true);
                 black_box(rows).iter().map(|r| r.2 as u64).sum::<u64>()
             });
             assert_eq!(rows, TOTAL);

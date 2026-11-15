@@ -19,6 +19,7 @@ use std::ops::{ControlFlow, Range};
 
 use super::batch::{Batch, MemBatch};
 use super::scatter::{ColumnarSource, Pick};
+use super::seek::gallop_from;
 use super::string_heap::{rebase_string_cells, row_long_bytes, BlobCache};
 use super::writer::DirectWriter;
 use crate::schema::{
@@ -103,7 +104,7 @@ fn merge_interleaved(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Bat
 /// it.
 #[inline(never)]
 fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
-    let rows = run_merge(sources, schema, sources.iter().map(|s| 0..s.count));
+    let rows = run_merge(sources, schema, sources.iter().map(|s| 0..s.count), false);
     super::scatter::materialize_carrying(sources, schema, &rows)
 }
 
@@ -111,9 +112,28 @@ fn merge_rows(sources: &[MemBatch<'_>], schema: &SchemaDescriptor) -> Batch {
 // run_merge: the generic N-way (PK, payload) merge + consolidation
 // ---------------------------------------------------------------------------
 
+/// `$body` with `$spans` a `const bool` that is `$cond`: one copy of it for
+/// each value, as [`drive`]'s `SPANS` asks.
+macro_rules! with_spans {
+    ($cond:expr, |$spans:ident| $body:expr $(,)?) => {
+        if $cond {
+            const $spans: bool = true;
+            $body
+        } else {
+            const $spans: bool = false;
+            $body
+        }
+    };
+}
+pub(crate) use with_spans;
+
 /// The consolidated merge of sorted `sources`, source `i` walked over the `i`-th
 /// of `windows`: one [`Pick`] per (PK, payload) group whose weights do not sum to
 /// zero, at that sum, in (PK, payload) order.
+///
+/// `distinct` says each source holds each element of the merge's order at most
+/// once and at a nonzero weight, which lets the merge emit a [dominated](dominated)
+/// merge's stretches whole.
 ///
 /// Dispatches the payload order, monomorphizing one branch-free copy of the
 /// merge loop, [`merge_picks`]. Out of line, so its callers compile as they
@@ -123,6 +143,7 @@ pub(crate) fn run_merge<S: ColumnarSource>(
     sources: &[S],
     schema: &SchemaDescriptor,
     windows: impl IntoIterator<Item = Range<usize>>,
+    distinct: bool,
 ) -> Vec<Pick> {
     if sources.is_empty() {
         return Vec::new();
@@ -137,14 +158,30 @@ pub(crate) fn run_merge<S: ColumnarSource>(
         schema.num_payload_cols() == 0 || !sources.iter().any(S::is_skeleton),
         "a skeleton row merges under the PK-only schema: this order is never coarsened"
     );
-    with_payload_cmp!(schema, |payload| merge_picks(sources, schema, &mut cursors, payload))
+    with_spans!(distinct && dominated(&cursors), |SPANS| with_payload_cmp!(
+        schema,
+        |payload| merge_picks::<_, _, SPANS>(sources, schema, &mut cursors, payload)
+    ))
+}
+
+/// How many times the rows of all the other windows the largest must hold for
+/// a merge to be [`dominated`].
+const SPAN_SKEW: usize = 8;
+
+/// Whether the largest of `windows` holds at least [`SPAN_SKEW`] times the rows
+/// of all the others: the stretches of it between their rows then run long, and
+/// a merge of distinct sources gallops them. A merge whose stretches are short
+/// keeps a loop with no stretch arm, which the arm would slow.
+pub(crate) fn dominated(windows: &[Range<usize>]) -> bool {
+    let (total, most) = (windows.iter()).fold((0, 0), |(t, m), w| (t + w.len(), m.max(w.len())));
+    (total - most) * SPAN_SKEW <= most
 }
 
 /// [`run_merge`] under one payload order. Out of line, one function per
 /// order: the merge loop's register allocation then depends neither on the
 /// caller it would be inlined into nor on the other order's copy.
 #[inline(never)]
-fn merge_picks<S: ColumnarSource, P: PayloadOrder>(
+fn merge_picks<S: ColumnarSource, P: PayloadOrder, const SPANS: bool>(
     sources: &[S],
     schema: &SchemaDescriptor,
     cursors: &mut [Range<usize>],
@@ -157,7 +194,7 @@ fn merge_picks<S: ColumnarSource, P: PayloadOrder>(
         |i| order.head(sources, i, &cursors[i]),
         merge_less(schema, sources, order, payload),
     );
-    drive(&mut tree, schema, sources, order, cursors, payload, |src, row, w| {
+    drive::<_, _, SPANS>(&mut tree, schema, sources, order, cursors, payload, |src, row, w| {
         rows.push((src as u32, row as u32, w));
         ControlFlow::Continue(())
     });
@@ -311,10 +348,26 @@ impl MergeOrder {
     }
 }
 
+/// The first row of `source` in `from..end` whose key is not below `bound`,
+/// row `from` being below it. Out of line and over values, so the gallop takes
+/// no address of the merge loop's state.
+#[inline(never)]
+fn span_end<S: ColumnarSource>(source: &S, order: MergeOrder, from: usize, end: usize, bound: u128) -> usize {
+    gallop_from(
+        end,
+        from,
+        #[inline(always)]
+        |i| order.key(source, i) < bound,
+    )
+}
+
 /// Drive an N-way (PK, payload) merge to completion over `sources`, folding each
 /// group's weights and calling `emit(group_src, group_row, net_weight)` once per
-/// surviving (net ≠ 0) group; a `Break` returns immediately. The output PK is
-/// re-derived from `(group_src, group_row)` by the caller.
+/// surviving (net ≠ 0) group; a `Break` returns immediately, that group consumed.
+/// Under `SPANS`, which asks that each source hold each element of the order
+/// once and at a nonzero weight, a stretch of one source below every other's
+/// head is galloped instead of stepped, each of its rows a group of one. The
+/// output PK is re-derived from `(group_src, group_row)` by the caller.
 ///
 /// Every N-way merge runs through this — [`run_merge`] and the read cursor's
 /// advance and drain — and it builds its order and group boundary itself, from
@@ -323,7 +376,7 @@ impl MergeOrder {
 /// `#[inline(always)]`: each caller's `emit` returns a constant `ControlFlow`, so
 /// forced inlining folds the branch and drops the unused arm per monomorphisation.
 #[inline(always)]
-pub(crate) fn drive<S, P>(
+pub(crate) fn drive<S, P, const SPANS: bool>(
     tree: &mut LoserTree,
     schema: &SchemaDescriptor,
     sources: &[S],
@@ -341,7 +394,7 @@ pub(crate) fn drive<S, P>(
         ($src:expr) => {{
             let c = &mut cursors[$src];
             c.start += 1;
-            tree.step_top(order.head(sources, $src, c), &less);
+            tree.step_top(order.head(sources, $src, c), &less)
         }};
     }
 
@@ -352,7 +405,22 @@ pub(crate) fn drive<S, P>(
         // is the exemplar, so the boundary test would be tautologically false —
         // and its payload term walks every column.
         let mut net_weight: i64 = sources[group_src].get_weight(group_row);
-        step!(group_src);
+        // A champion stepped below the bound is a group of one, as is every row
+        // of its source still below it: under `SPANS`, one stretch.
+        if step!(group_src) && SPANS {
+            // Its rows are emitted one group each; the champion then steps to
+            // the row past the last emitted, which replays only at the
+            // stretch's end.
+            let (c, source) = (&mut cursors[group_src], &sources[group_src]);
+            let end = span_end(source, order, c.start, c.end, tree.bound());
+            let stop = (group_row..end).find(|&r| emit(group_src, r, source.get_weight(r)).is_break());
+            c.start = stop.map_or(end, |r| r + 1);
+            tree.step_top(order.head(sources, group_src, c), &less);
+            if stop.is_some() {
+                return;
+            }
+            continue;
+        }
 
         // Fold tied rows: each iteration peeks the new root, breaks at the group
         // boundary, otherwise accumulates weight and steps again.

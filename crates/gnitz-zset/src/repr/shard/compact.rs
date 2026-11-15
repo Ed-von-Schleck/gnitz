@@ -105,6 +105,10 @@ pub struct GuardMerge {
     next: usize,
     /// Whether every run is a skeleton one.
     skeleton: bool,
+    /// Whether each shard holds each element of the merge's order once: false
+    /// when a hydrated shard is read under a skeleton merge's PK-only order,
+    /// where its rows repeat PKs that fold.
+    distinct: bool,
     /// The schema every run is merged under.
     out_schema: SchemaDescriptor,
 }
@@ -126,12 +130,14 @@ impl GuardMerge {
             shard.verify_body()?;
         }
         let skeleton = dehydrate || shards.iter().any(|s| s.is_skeleton());
+        let distinct = !skeleton || shards.iter().all(|s| s.is_skeleton());
         Ok(GuardMerge {
             starts: vec![0; shards.len()],
             fences,
             next: 0,
             shards,
             skeleton,
+            distinct,
             out_schema: if skeleton { schema.pk_only() } else { schema },
         })
     }
@@ -189,7 +195,7 @@ impl GuardMerge {
         let shards: Vec<_> = (self.shards.iter().zip(&windows))
             .map(|(s, w)| s.window(w.clone()))
             .collect();
-        let survivors = run_merge(&shards, &self.out_schema, windows.iter().cloned());
+        let survivors = run_merge(&shards, &self.out_schema, windows.iter().cloned(), self.distinct);
         if survivors.is_empty() {
             return None;
         }
@@ -199,10 +205,10 @@ impl GuardMerge {
     }
 
     /// The shards holding rows in `windows`, in the [`disjoint_order`] of their
-    /// windows, when the windows need no merge. A hydrated window under a
-    /// skeleton merge still folds its PK groups, so it always merges.
+    /// windows, when the windows need no merge. Windows that are not
+    /// [`distinct`](Self::distinct) fold within themselves, so always merge.
     fn in_order(&self, windows: &[Range<usize>]) -> Option<SmallVec<[usize; 8]>> {
-        if self.skeleton && !self.shards.iter().all(|s| s.is_skeleton()) {
+        if !self.distinct {
             return None;
         }
         disjoint_order(

@@ -100,9 +100,13 @@ proptest! {
         picks in prop::collection::vec(any::<prop::sample::Index>(), 0..5),
         below_all in any::<bool>(),
         dehydrate in any::<bool>(),
+        dominant in any::<bool>(),
     ) {
-        let runs: Vec<Batch> = rows
-            .chunks(7)
+        // Rows dealt in sevens, or most of them to one run, which a merge then
+        // walks in stretches between the others' rows.
+        let cut = if dominant { rows.len() * 9 / 10 } else { 0 };
+        let runs: Vec<Batch> = std::iter::once(&rows[..cut])
+            .chain(rows[cut..].chunks(7))
             .map(|c| fold_batch(&s, c).into_consolidated())
             .filter(|b| !b.is_empty())
             .collect();
@@ -162,6 +166,37 @@ proptest! {
     }
 }
 
+/// A dehydrating merge of a hydrated shard that holds several rows under one
+/// PK, beside a shard far smaller, folds each PK group to one skeleton row at
+/// its summed weight, the large shard's stretches included.
+#[test]
+fn a_dominated_dehydrating_merge_folds_each_pk_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let rows: Vec<(u64, i64, i64)> = (0..300u64).flat_map(|k| [(k, 1, 0), (k, 2, 1)]).collect();
+    let large = map_shard(&dir.path().join("large.db"), &make_batch(&schema, &rows));
+    let small = map_shard(
+        &dir.path().join("small.db"),
+        &make_batch(&schema, &[(7, 1, 5), (150, -3, 1)]),
+    );
+    let [(_, true, coarse)] = &route(&[large, small], &[PkBuf::zeroed(8)], true)[..] else {
+        panic!("one skeleton output");
+    };
+    let got = skeleton_rows(coarse);
+    let want: Vec<(u64, i64)> = (0..300u64)
+        .filter(|&k| k != 150)
+        .map(|k| (k, if k == 7 { 4 } else { 3 }))
+        .collect();
+    assert_eq!(got, want);
+}
+
+/// `(pk, weight)` of each row of a skeleton batch over a `u64` PK.
+fn skeleton_rows(b: &Batch) -> Vec<(u64, i64)> {
+    (0..b.len())
+        .map(|r| (gnitz_wire::widen_pk_be(b.get_pk_bytes(r)) as u64, b.get_weight(r)))
+        .collect()
+}
+
 /// `(pk, weight, value)` of each row of a `make_schema_u64_i64` batch.
 fn u64_i64_rows(b: &Batch) -> Vec<(u64, i64, i64)> {
     (0..b.len())
@@ -216,14 +251,7 @@ fn ascending_inputs_fold_as_their_merge() {
         .iter()
         .map(|(_, skel, b)| {
             assert!(*skel);
-            (0..b.len())
-                .map(|r| {
-                    (
-                        u64::from_be_bytes(b.get_pk_bytes(r).try_into().unwrap()),
-                        b.get_weight(r),
-                    )
-                })
-                .collect()
+            skeleton_rows(b)
         })
         .collect();
     assert_eq!(coarse, [vec![(1, 1), (2, 3), (3, 1)], vec![(7, 1), (8, 3)]]);
@@ -267,10 +295,7 @@ fn a_skeleton_input_makes_every_output_a_skeleton() {
         .iter()
         .map(|(_, skel, b)| {
             assert_eq!(*b.schema(), schema.pk_only());
-            let rows = (0..b.len())
-                .map(|r| (gnitz_wire::widen_pk_be(b.get_pk_bytes(r)) as u64, b.get_weight(r)))
-                .collect();
-            (*skel, rows)
+            (*skel, skeleton_rows(b))
         })
         .collect();
     assert_eq!(rows, [(true, vec![(1, 3)]), (true, vec![(5, 1), (9, 1)])]);

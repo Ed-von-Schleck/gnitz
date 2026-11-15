@@ -69,10 +69,18 @@ proptest! {
         as_shard in any::<u16>(),
         probes in prop::collection::vec((any::<prop::sample::Index>(), -1i8..=1), 0..8),
         chunk in 1usize..6,
+        dominant in any::<bool>(),
     ) {
         let stride = s.pk_stride();
         let dir = tempfile::tempdir().unwrap();
-        let batches: Vec<Batch> = rows.chunks(run_len).map(|c| fold_batch(&s, c).into_consolidated()).collect();
+        // Rows dealt in runs of `run_len`, or most of them to one run, which a
+        // drain then gallops in stretches between the others' rows.
+        let cut = if dominant { rows.len() * 9 / 10 } else { 0 };
+        let batches: Vec<Batch> = std::iter::once(&rows[..cut])
+            .chain(rows[cut..].chunks(run_len))
+            .filter(|c| !c.is_empty())
+            .map(|c| fold_batch(&s, c).into_consolidated())
+            .collect();
         let runs: Vec<Run> = batches
             .iter()
             .enumerate()
@@ -692,6 +700,42 @@ fn a_drain_writes_skipped_payload_columns_as_zeroes() {
                     }
                 }
             }
+        }
+    }
+}
+
+/// A large run beside a tiny one whose rows fall between its own, cancel one of
+/// its elements, add to another and share a PK with a third under another
+/// payload, drains in chunks cut anywhere in its stretches to exactly the sum
+/// of the two, the large run in memory or a shard.
+#[test]
+fn chunks_cut_a_dominated_drain_anywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let large = make_batch(&schema, &(0..400u64).map(|k| (k, 1, k as i64)).collect::<Vec<_>>());
+    let tiny = make_batch(
+        &schema,
+        &[(37, -1, 37), (90, 1, 0), (90, 2, 90), (201, 1, 7), (399, 2, 1)],
+    );
+    let (large_rc, tiny_rc) = (Rc::new(large.clone()), Rc::new(tiny.clone()));
+    let shard = map_shard(&dir.path().join("large.db"), &large);
+    for chunk in [1, 3, 7, 64, usize::MAX] {
+        for (label, batches, shards) in [
+            ("in memory", vec![Rc::clone(&large_rc), Rc::clone(&tiny_rc)], vec![]),
+            ("a shard", vec![Rc::clone(&tiny_rc)], vec![Rc::clone(&shard)]),
+        ] {
+            let mut c = create_read_cursor(&batches, &shards, schema);
+            let mut chunks = Vec::new();
+            while let Some(b) = c.drain_chunk(chunk) {
+                assert!(b.len() <= chunk, "{label}, chunks of {chunk}: a chunk past its bound");
+                chunks.push(b);
+            }
+            let got = Batch::concat(&schema, chunks.iter().map(Batch::as_mem_batch));
+            assert_folds(
+                &[large.clone(), tiny.clone()],
+                &got,
+                &format!("{label}, chunks of {chunk}"),
+            );
         }
     }
 }

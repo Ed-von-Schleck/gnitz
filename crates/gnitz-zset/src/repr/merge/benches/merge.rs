@@ -61,7 +61,7 @@ fn run_merge_dup_pk_bench() {
         let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_batch(&schema, N, DUP)).collect();
         let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
         let merge = || {
-            let rows = run_merge(black_box(&mem), &schema, mem.iter().map(|m| 0..m.count));
+            let rows = run_merge(black_box(&mem), &schema, mem.iter().map(|m| 0..m.count), true);
             black_box(rows.iter().map(|r| r.2).sum::<i64>())
         };
         // K copies of one batch: every row folds with its twins.
@@ -483,7 +483,7 @@ fn shared_lead_merge_bench() {
                 .collect();
             let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
             let rows = groups * k * run;
-            let merge = || black_box(run_merge(black_box(&mem), &schema, mem.iter().map(|m| 0..m.count)).len());
+            let merge = || black_box(run_merge(black_box(&mem), &schema, mem.iter().map(|m| 0..m.count), true).len());
             assert_eq!(merge(), rows, "every row is distinct");
             // The least of several runs: nothing but the kernel can lower a count.
             let least = (0..5).map(|_| instructions.measure(merge).1).min().unwrap();

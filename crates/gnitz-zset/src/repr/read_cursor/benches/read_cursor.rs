@@ -2,7 +2,7 @@ use super::tests::create_read_cursor;
 use super::*;
 use crate::repr::{Batch, BatchBuilder, MappedShard, Run};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::test_support::{map_shard, pk_payload_schema, pk_u64_two_i64_schema, u64_pk_schema};
+use crate::test_support::{map_shard, mix, pk_payload_schema, pk_u64_two_i64_schema, u64_pk_schema};
 use gnitz_foundation::perf::Counter;
 use gnitz_wire::{PkKeys, TypeCode};
 use std::hint::black_box;
@@ -22,7 +22,8 @@ fn mixed_schema(last: TypeCode) -> SchemaDescriptor {
 /// and cycles per input row of `materialize`, and instructions to open on a key
 /// in the middle and drain 100 rows. Four shards of long strings and NULLs
 /// whose key ranges overlap, so rows fold across them; then two packed
-/// fixed-width shards whose keys interleave and never meet.
+/// fixed-width shards whose keys interleave and never meet; then a large packed
+/// shard beside a tiny one whose keys fall scattered between its rows.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn cursor_drain_bench() {
@@ -54,13 +55,27 @@ fn cursor_drain_bench() {
             map_shard(&dir.path().join(format!("packed_{s}.db")), &b.finish())
         })
         .collect();
+    let scattered: Vec<Rc<MappedShard>> = [false, true]
+        .into_iter()
+        .map(|tiny| {
+            let mut b = BatchBuilder::new(&packed);
+            for i in (0..4 * ROWS).filter(|&i| mix(i as u64).is_multiple_of(64) == tiny) {
+                b.begin_row(i as u128, 1);
+                b.put_int((i % 1000) as u128);
+                b.put_int(3 * i as u128);
+                b.end_row();
+            }
+            map_shard(&dir.path().join(format!("scattered_{tiny}.db")), &b.finish())
+        })
+        .collect();
 
     let (instructions, cycles) = (Counter::instructions(), Counter::cycles());
     for (label, schema, shards) in [
         ("overlapping strings", strings, &overlapping),
         ("interleaved packed", packed, &interleaved),
+        ("large and tiny packed", packed, &scattered),
     ] {
-        let rows = (shards.len() * shards[0].row_count()) as f64;
+        let rows = shards.iter().map(|s| s.row_count()).sum::<usize>() as f64;
         let drain = || black_box(create_read_cursor(&[], shards, schema).materialize()).len();
         // The first drain faults the shards in.
         drain();

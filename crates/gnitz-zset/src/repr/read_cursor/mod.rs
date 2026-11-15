@@ -667,9 +667,13 @@ impl ReadCursor {
     /// [`merge::drive`] over the cursor's tournament: `advance_merge_with` takes
     /// one group, `drain_sorted_into` a whole chunk.
     #[inline(always)]
-    fn drive<P: PayloadOrder>(&mut self, payload: P, emit: impl FnMut(usize, usize, i64) -> ControlFlow<()>) {
+    fn drive<P: PayloadOrder, const SPANS: bool>(
+        &mut self,
+        payload: P,
+        emit: impl FnMut(usize, usize, i64) -> ControlFlow<()>,
+    ) {
         let ReadCursor { tree, sources, states, schema, order, .. } = &mut *self;
-        merge::drive(tree, schema, sources, *order, states, payload, emit);
+        merge::drive::<_, _, SPANS>(tree, schema, sources, *order, states, payload, emit);
     }
 
     /// Merge-mode advance (`self.mode.is_none()`), monomorphized on payload.
@@ -678,7 +682,7 @@ impl ReadCursor {
     #[inline(always)]
     fn advance_merge_with<P: PayloadOrder>(&mut self, payload: P) {
         let mut emitted: Option<(usize, usize, i64)> = None;
-        self.drive(payload, |gs, gr, nw| {
+        self.drive::<_, false>(payload, |gs, gr, nw| {
             emitted = Some((gs, gr, nw));
             ControlFlow::Break(())
         });
