@@ -5,7 +5,7 @@ use crate::test_support::{
     RelationFixture, Rng, TID,
 };
 use gnitz_wire::{image_mask, opk_bias, PkColList, ReadSpec, TypeCode, ViewBudget};
-use gnitz_zset::repr::BatchBuilder;
+use gnitz_zset::repr::{BatchBuilder, Run};
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 const NBASE: u64 = 200;
@@ -517,5 +517,124 @@ fn a_read_of_a_stream_is_refused() {
         relation.open_sealed(ReadBound::None, u64::MAX).map(drop).unwrap_err(),
     ] {
         assert!(err.contains("is a stream"), "{err}");
+    }
+}
+
+/// A drain that skips payload columns emits the rows and weights of one that
+/// does not, every kept cell as it, and each skipped cell as a zero that is
+/// not NULL: through the walk of an index range gathering off the merge of the
+/// store's runs, and through a key list and an index range probed key by key
+/// from a base table's store.
+#[test]
+fn a_drain_writes_skipped_payload_columns_as_zeroes() {
+    use gnitz_wire::{null_word_get, payload_bytes, payload_u64};
+    const N: u64 = 800;
+    // `(id U64 PK | a I64 NULL | s STRING | v I64)`, indexed on `v`.
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::I64, false),
+        ],
+        &[0],
+    );
+    // Generation `generation` of key `pk`, at `v = pk * 10 + generation`.
+    let run = |rows: &mut dyn Iterator<Item = (u64, u64, i64)>| {
+        let mut bb = BatchBuilder::new(&schema);
+        for (pk, generation, w) in rows {
+            bb.begin_row(pk as u128, w);
+            bb.put_opt_int((pk % 3 != 1).then_some((pk * 10 + generation) as u128));
+            bb.put_string(&format!("{pk:0>24}/{generation}"));
+            bb.put_int((pk * 10 + generation) as u128);
+            bb.end_row();
+        }
+        bb.finish()
+    };
+    // Every key at generation 0; a later round rewrites every third key, and a
+    // third deletes every tenth: the first two flushed, the third in memory.
+    let latest = |pk: u64| u64::from(pk.is_multiple_of(3));
+    let rounds = [
+        run(&mut (0..N).map(|pk| (pk, 0, 1))),
+        run(&mut (0..N).step_by(3).flat_map(|pk| [(pk, 0, -1), (pk, 1, 1)])),
+        run(&mut (0..N).step_by(10).map(|pk| (pk, latest(pk), -1))),
+    ];
+    let mut r = relation_fixture(RelationKind::BaseTable, schema, &[&[3]], []);
+    let [first, second, third] = rounds;
+    for rows in [first, second] {
+        r.ingest(TID, rows).unwrap();
+        r.checkpoint_base().unwrap();
+    }
+    r.ingest(TID, third).unwrap();
+    let relation = r.relation(TID).unwrap();
+    let kinds: Vec<bool> = (relation.table_or_err().unwrap().runs())
+        .map(|run| matches!(run, Run::Shard(_)))
+        .collect();
+    assert!(
+        kinds.contains(&true) && kinds.contains(&false),
+        "shards and an in-memory run"
+    );
+    let range = || col_range(3, img(1000), img(1399));
+    // Every other key, the deleted ones among them.
+    let keys = || ReadBound::PkSet(PkKeys::from_images(8, (0..N).step_by(2).map(u128::from)));
+    let open = |label, read| match label {
+        "index range" => relation.open_sealed(range(), read).unwrap(),
+        "unique pk set" => relation.open_read(keys(), read).unwrap().0,
+        _ => relation.open_read(range(), read).unwrap().0,
+    };
+    for label in ["index range", "unique pk set", "unique index range"] {
+        let shape = match open(label, u64::MAX) {
+            SourceCursor::Keyed {
+                gather: KeyGather::Merge(_),
+                walk: Some(_),
+            } => "index range",
+            SourceCursor::Keyed { gather: KeyGather::Unique(_), walk: None } => "unique pk set",
+            SourceCursor::Keyed {
+                gather: KeyGather::Unique(_),
+                walk: Some(_),
+            } => "unique index range",
+            _ => "another source",
+        };
+        assert_eq!(shape, label);
+        let drain = |read| {
+            let mut c = open(label, read);
+            std::iter::from_fn(|| c.drain_chunk(16)).collect::<Vec<_>>()
+        };
+        let want = drain(u64::MAX);
+        assert!(!want.is_empty(), "{label}: rows");
+        for skip in [0b001, 0b010, 0b011, 0b110] {
+            let got = drain(!skip);
+            assert_eq!(got.len(), want.len(), "{label} {skip:#b}: chunks");
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(g.len(), w.len(), "{label} {skip:#b}: rows");
+                assert!(g.is_consolidated(), "{label} {skip:#b}");
+                for i in 0..g.len() {
+                    assert_eq!(
+                        (g.get_pk_bytes(i), g.get_weight(i)),
+                        (w.get_pk_bytes(i), w.get_weight(i))
+                    );
+                    for pi in 0..3 {
+                        let null = |b: &Batch| null_word_get(b.get_null_word(i), pi);
+                        let cell = |b: &Batch| match pi {
+                            1 => payload_bytes(b, i, pi).into_owned(),
+                            _ => payload_u64(b, i, pi).to_le_bytes().to_vec(),
+                        };
+                        if skip >> pi & 1 == 1 {
+                            assert!(!null(g), "{label} {skip:#b}: row {i} column {pi} is NULL");
+                            assert!(
+                                cell(g).iter().all(|&b| b == 0),
+                                "{label} {skip:#b}: row {i} column {pi}"
+                            );
+                        } else {
+                            assert_eq!(
+                                (null(g), cell(g)),
+                                (null(w), cell(w)),
+                                "{label} {skip:#b}: row {i} column {pi}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

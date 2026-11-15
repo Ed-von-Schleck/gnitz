@@ -10,6 +10,7 @@
 use std::hint::black_box;
 
 use super::tests::layout_of;
+use crate::read::SourceCursor;
 use crate::relation::RelationKind;
 use crate::test_support::{
     cmp_all, col_range, cut, id_rows, img, map_of, order_by, relation_fixture, rows_spec, table_shards, wide_on_disk,
@@ -20,7 +21,7 @@ use gnitz_wire::{
     AggDescriptor, AggFunc, ComputeMap, GroupAggs, PkKeys, ReadBound, ReadSink, ReadSpec, SinkKind, TypeCode,
     ViewBudget,
 };
-use gnitz_zset::repr::{BatchBuilder, SourceCursor};
+use gnitz_zset::repr::BatchBuilder;
 use gnitz_zset::schema::{SchemaColumn, SchemaDescriptor};
 
 /// Rows a fixture holds: a multiple of every period a column repeats at.

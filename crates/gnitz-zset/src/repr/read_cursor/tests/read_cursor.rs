@@ -1,6 +1,5 @@
 use super::*;
 use crate::repr::pool::MAX_POOLED_BYTES;
-use crate::repr::run::StoredRow;
 use crate::repr::ShardWriteOpts;
 use crate::repr::{Batch, BatchBuilder, MappedShard};
 use crate::schema::SchemaColumn;
@@ -609,28 +608,11 @@ fn skipping_schema() -> SchemaDescriptor {
     ])
 }
 
-/// `0`'s rows, one at weight 1 per key, as a store of one row per key.
-struct OneRowPerKey(Run);
-
-impl UniqueRows for OneRowPerKey {
-    fn unique_live_row_at(&self, key: &[u8]) -> Option<StoredRow> {
-        let row = (0..self.0.row_count()).find(|&r| self.0.get_pk_bytes(r) == key)?;
-        Some(StoredRow::new(self.0.clone(), row))
-    }
-}
-
-/// Every chunk of a drain of `c`, `skip` its skipped payload columns.
-fn drain_skipping(mut c: SourceCursor<'_>, skip: u64) -> Vec<Batch> {
-    c.skip_payload(skip);
-    std::iter::from_fn(|| c.drain_chunk(64)).collect()
-}
-
 /// A drain that skips payload columns emits the rows and weights of one that
 /// does not, every kept cell as it, and each skipped cell as a zero that is
 /// not NULL: through the merge of shards and a heap run, through the
-/// single-source slice of one shard, through the gathers of a key list and of
-/// an index range over the merge, and through both probed key by key from a
-/// store of one row per key.
+/// single-source slice of one shard, and through the gather of a key list
+/// over the merge.
 #[test]
 fn a_drain_writes_skipped_payload_columns_as_zeroes() {
     let dir = tempfile::tempdir().unwrap();
@@ -656,51 +638,29 @@ fn a_drain_writes_skipped_payload_columns_as_zeroes() {
     let gone = Rc::new(run((0..200).step_by(10).map(|pk| (pk, latest(pk), -1)).collect()));
 
     let merged = || create_read_cursor(&[Rc::clone(&gone)], &[Rc::clone(&old), Rc::clone(&new)], schema);
-    // Every other key, the deleted ones among them, and an index entry `(pk, pk)`
-    // for every third live key.
+    // Every other key, the deleted ones among them.
     let keys = || PkKeys::from_sorted(8, (0..200u64).step_by(2).flat_map(u64::to_be_bytes).collect());
-    let none = || PkKeys::from_sorted(8, Vec::new());
-    let index_schema = crate::test_support::pk_only_schema(&[TypeCode::I64, TypeCode::U64]);
-    let mut entries = BatchBuilder::new(&index_schema);
-    for pk in (0..200u64).step_by(3).filter(|pk| pk % 10 != 0) {
-        entries.begin_row_natives(&[pk as u128, pk as u128], 1);
-        entries.end_row();
-    }
-    let index = Rc::new(entries.finish().into_consolidated());
-    let index_cursor = || create_read_cursor(&[Rc::clone(&index)], &[], index_schema);
-    let unique = OneRowPerKey(Run::Shard(Rc::clone(&old)));
-    let open = |label| match label {
-        "merged" => SourceCursor::Full(merged()),
-        "single" => SourceCursor::Full(create_read_cursor(&[], &[Rc::clone(&old)], schema)),
-        "pk set" => SourceCursor::Keyed {
-            gather: KeyGather::Merge(PkSetGather::over(merged(), keys())),
-            walk: None,
-        },
-        "index range" => {
-            SourceCursor::index_walk(index_cursor(), KeyGather::Merge(PkSetGather::over(merged(), none())))
+    let drain = |label, skip| -> Vec<Batch> {
+        let mut c = match label {
+            "single" => create_read_cursor(&[], &[Rc::clone(&old)], schema),
+            _ => merged(),
+        };
+        c.skip_payload(skip);
+        if label != "pk set" {
+            return std::iter::from_fn(|| c.drain_chunk(64)).collect();
         }
-        "unique pk set" => SourceCursor::Keyed {
-            gather: KeyGather::unique(&unique, schema, keys()),
-            walk: None,
-        },
-        _ => SourceCursor::index_walk(index_cursor(), KeyGather::unique(&unique, schema, none())),
+        let mut g = PkSetGather::over(c, keys());
+        std::iter::from_fn(|| g.drain_chunk(64)).collect()
     };
     assert!(
         create_read_cursor(&[], &[Rc::clone(&old)], schema).mode.is_some(),
         "one source drains through the single-source copy"
     );
-    for label in [
-        "merged",
-        "single",
-        "pk set",
-        "index range",
-        "unique pk set",
-        "unique index range",
-    ] {
-        let want = drain_skipping(open(label), 0);
+    for label in ["merged", "single", "pk set"] {
+        let want = drain(label, 0);
         assert!(!want.is_empty(), "{label}: rows");
         for skip in [0b001, 0b010, 0b011, 0b110] {
-            let got = drain_skipping(open(label), skip);
+            let got = drain(label, skip);
             assert_eq!(got.len(), want.len(), "{label} {skip:#b}: chunks");
             for (g, w) in got.iter().zip(&want) {
                 assert_eq!(g.len(), w.len(), "{label} {skip:#b}: rows");

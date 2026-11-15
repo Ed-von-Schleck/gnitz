@@ -16,9 +16,11 @@ mod delta_read;
 mod key_spans;
 mod pinned;
 mod scan_spec;
+mod source;
 mod store_io;
 
 pub use key_spans::KeySpans;
+pub use source::SourceCursor;
 pub use store_io::Probe;
 
 use std::ops::Deref;

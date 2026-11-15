@@ -22,13 +22,11 @@ use crate::schema::{compare_pk_ordering, group_floor, with_payload_cmp, PayloadO
 mod gather;
 mod output;
 mod probe;
-mod source;
 
 use super::run::Run;
 pub use gather::PkSetGather;
-use gnitz_wire::RowSource;
+use gnitz_wire::{PkKeys, RowSource};
 pub(crate) use probe::GroupProbe;
-pub use source::{project_unique, IndexWalk, KeyGather, SourceCursor, UniqueRows};
 
 /// The skeleton rows a split drain set aside instead of copying: their OPK keys, flat
 /// and ascending, and — in debug builds — each one's coarse weight.
@@ -65,6 +63,53 @@ impl SkeletonKeys {
         );
         chunk
     }
+}
+
+/// `live`, a split drain's chunk, with the skeleton rows it set aside in
+/// `skeletons` replaced by their keys' rows, which `hydrate` recomputes from
+/// the keys, ascending; `live` itself where it set none aside.
+fn hydrate_skeletons(
+    live: Batch,
+    skeletons: SkeletonKeys,
+    hydrate: &mut impl FnMut(PkKeys) -> Result<Batch, String>,
+) -> Result<Batch, String> {
+    if skeletons.keys.is_empty() {
+        return Ok(live);
+    }
+    let keys = PkKeys::from_sorted(live.schema().pk_stride(), skeletons.keys);
+    #[cfg(debug_assertions)]
+    let asked = keys.clone();
+    let hydrated = hydrate(keys)?;
+    #[cfg(debug_assertions)]
+    assert_hydration_matches(&hydrated, &asked, &skeletons.coarse);
+    if live.is_empty() {
+        return Ok(hydrated);
+    }
+    // Both consolidated and PK-disjoint.
+    Ok(merge::merge_consolidated(
+        &[hydrated.as_mem_batch(), live.as_mem_batch()],
+        live.schema(),
+    ))
+}
+
+/// Tripwire: a hydration's rows sum, per PK, to the coarse weight the skeleton row
+/// at that key carried — by linearity of the PK projection — and name exactly the
+/// keys asked.
+#[cfg(debug_assertions)]
+fn assert_hydration_matches(out: &Batch, keys: &PkKeys, coarse: &[i64]) {
+    assert_eq!(keys.len(), coarse.len());
+    let mut got = Vec::new();
+    let mut i = 0;
+    while i < out.len() {
+        let j = crate::repr::pk_group_end(out, i, out.schema().pk_stride());
+        got.push((out.get_pk_bytes(i), out.as_mem_batch().sum_weights(i, j)));
+        i = j;
+    }
+    let want: Vec<_> = keys.iter().zip(coarse.iter().copied()).collect();
+    assert_eq!(
+        got, want,
+        "hydration off its skeleton rows: (pk, summed weight) per key"
+    );
 }
 
 /// A row the cursor stood on, by source and row: readable through
@@ -325,6 +370,12 @@ impl ReadCursor {
                 self.valid && self.current_pk_starts_with(key)
             }
         }
+    }
+
+    /// The schema of the rows the cursor reads.
+    #[inline]
+    pub fn schema(&self) -> &SchemaDescriptor {
+        &self.schema
     }
 
     /// Whether the cursor stands on a row. The `current_*` accessors are

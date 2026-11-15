@@ -4,12 +4,12 @@ use std::ops::{ControlFlow, Range};
 use std::rc::Rc;
 
 use super::super::run::Run;
-use super::{ReadCursor, SkeletonKeys};
+use super::{hydrate_skeletons, ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
 use crate::repr::scatter::{with_picks, ColumnarSource, Pick, UnifiedSet};
 use crate::schema::with_payload_cmp;
 use gnitz_expr::RowFilter;
-use gnitz_wire::RowSource;
+use gnitz_wire::{PkKeys, RowSource};
 
 impl ReadCursor {
     /// Copy the current row into `batch` at `weight`, clearing its consolidated claim.
@@ -30,6 +30,28 @@ impl ReadCursor {
             self.drain_live_chunk(max_rows, s, &mut RowFilter::default())
                 .map(|(b, _)| b)
         })
+    }
+
+    /// [`Self::drain_chunk`] over a store that may hold skeleton rows: each one the
+    /// chunk meets is replaced by its key's rows, which `hydrate` recomputes from
+    /// the keys, ascending. A skeleton row counts once against `max_rows` however
+    /// many rows it hydrates to. The rows of in-memory runs `filter` drops are left
+    /// out; every other row stays, hydrated ones included, for the caller to
+    /// filter. The `bool` is whether `filter` already decided every row of the
+    /// chunk, so the caller need not filter it again: only for a chunk drawn from
+    /// in-memory runs alone, with no skeleton row hydrated.
+    pub fn drain_hydrated(
+        &mut self,
+        max_rows: usize,
+        filter: &mut RowFilter,
+        hydrate: &mut impl FnMut(PkKeys) -> Result<Batch, String>,
+    ) -> Result<Option<(Batch, bool)>, String> {
+        let mut skeletons = SkeletonKeys::default();
+        let Some((live, decided)) = self.drain_live_chunk(max_rows, &mut skeletons, filter) else {
+            return Ok(None);
+        };
+        let decided = decided && skeletons.keys.is_empty();
+        Ok(Some((hydrate_skeletons(live, skeletons, hydrate)?, decided)))
     }
 
     /// [`Self::drain_chunk`], with each skeleton row's key pushed to `skeletons` instead of

@@ -9,7 +9,7 @@
 use gnitz_wire::PkKeys;
 use std::ops::ControlFlow;
 
-use super::{ReadCursor, SkeletonKeys};
+use super::{hydrate_skeletons, ReadCursor, SkeletonKeys};
 use crate::repr::batch::Batch;
 use crate::repr::scatter::{gather_rows, with_picks};
 use crate::schema::SchemaDescriptor;
@@ -34,7 +34,7 @@ impl PkSetGather {
     }
 
     /// Start over on `keys` against the same snapshot.
-    pub(super) fn reload(&mut self, keys: PkKeys) {
+    pub fn reload(&mut self, keys: PkKeys) {
         self.keys = keys;
         self.next = 0;
         if let Some(first) = self.keys.iter().next() {
@@ -47,7 +47,8 @@ impl PkSetGather {
         self.cursor.skip_payload(skip);
     }
 
-    pub(super) fn schema(&self) -> &SchemaDescriptor {
+    /// The schema of the rows the keys are gathered from.
+    pub fn schema(&self) -> &SchemaDescriptor {
         &self.cursor.schema
     }
 
@@ -122,6 +123,21 @@ impl PkSetGather {
                 out
             })
         })
+    }
+
+    /// [`Self::drain_chunk`] over a store that may hold skeleton rows, each one
+    /// replaced by its key's rows as [`ReadCursor::drain_hydrated`]; `Some` and
+    /// empty where every row visited was a skeleton and hydrated to nothing.
+    pub fn drain_hydrated(
+        &mut self,
+        max_rows: usize,
+        hydrate: &mut impl FnMut(PkKeys) -> Result<Batch, String>,
+    ) -> Result<Option<Batch>, String> {
+        let mut skeletons = SkeletonKeys::default();
+        let Some(live) = self.drain_live_chunk(max_rows, &mut skeletons) else {
+            return Ok(None);
+        };
+        hydrate_skeletons(live, skeletons, hydrate).map(Some)
     }
 
     /// The next non-empty chunk of source rows, or `None` once the key list is

@@ -5,12 +5,12 @@
 //! [`Relation::probe_reply_schema`] names.
 
 use super::check_stride;
+use super::source::{KeyGather, SourceCursor};
 use crate::relation::{Cut, Relation, RelationRegistry};
 use crate::storage::Table;
+use gnitz_expr::ColumnLocator;
 use gnitz_wire::{KeyRange, PkColList, PkKeys, ReadBound};
-use gnitz_zset::repr::{
-    empty_cursor, project_unique, Batch, KeyGather, PkSetGather, SourceCursor, StoredRow, UniqueRows,
-};
+use gnitz_zset::repr::{empty_cursor, Batch, PkSetGather};
 use gnitz_zset::schema::{project_schema, SchemaDescriptor};
 use std::num::NonZeroU64;
 
@@ -100,16 +100,16 @@ impl Relation {
 
     /// This process's store of the relation, where its every key nets 0 or 1;
     /// `None` for any other kind, or where this process holds no store.
-    fn unique_rows(&self) -> Option<&dyn UniqueRows> {
+    fn unique_rows(&self) -> Option<&Table> {
         let table = self.table_or_err().ok()?;
-        self.kind().nets_unit_per_key().then_some(table as &dyn UniqueRows)
+        self.kind().nets_unit_per_key().then_some(table)
     }
 
     fn open_source<'a>(
         &self,
         bound: ReadBound,
         cut: Cut,
-        unique: Option<&'a dyn UniqueRows>,
+        unique: Option<&'a Table>,
         read: u64,
     ) -> Result<(SourceCursor<'a>, Option<KeyRange>), String> {
         let schema = self.schema();
@@ -144,7 +144,7 @@ fn open_range<'a>(
     table: &Table,
     r: KeyRange,
     cut: Cut,
-    unique: Option<&'a dyn UniqueRows>,
+    unique: Option<&'a Table>,
 ) -> (SourceCursor<'a>, Option<KeyRange>) {
     let schema = entry.schema();
     if r.walks_pk(schema.pk_cols()) {
@@ -175,11 +175,20 @@ fn open_range<'a>(
     (SourceCursor::Full(table.open_cursor(cut)), Some(r))
 }
 
-/// The probe reads the rows `Cut::Now` reads.
-impl UniqueRows for Table {
-    fn unique_live_row_at(&self, key: &[u8]) -> Option<StoredRow> {
-        Table::unique_live_row_at(self, key)
-    }
+/// Every live row of `keys`, a strictly ascending list of whole PKs of
+/// `schema`, probed from `table`, whose every key nets 0 or 1, at weight 1 and
+/// in the [`project_schema`] layout of `cols`: the PK, then the payload columns
+/// `cols` names. The probe reads the rows `Cut::Now` reads. `Err` where
+/// `project_schema` refuses `cols`.
+fn project_unique(table: &Table, schema: &SchemaDescriptor, keys: &PkKeys, cols: &[u32]) -> Result<Batch, String> {
+    debug_assert_eq!(keys.stride(), schema.pk_stride());
+    let out_schema = project_schema(schema, cols)?;
+    let locs: Vec<ColumnLocator> = cols.iter().map(|&c| schema.locate(c as usize)).collect();
+    let mut out = Batch::with_capacity(&out_schema, keys.len());
+    out.append_projected(&locs, keys.iter().filter_map(|k| table.unique_live_row_at(k)), 1);
+    // One row per key, in ascending key order.
+    out.certify_consolidated();
+    Ok(out)
 }
 
 #[cfg(test)]

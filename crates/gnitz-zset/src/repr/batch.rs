@@ -847,6 +847,17 @@ impl Batch {
         }
     }
 
+    /// Append each of `rows` at `weight`: its key, then its columns at `locs`
+    /// as this batch's payload columns, in order, a NULL one as a NULL.
+    pub fn append_projected(&mut self, locs: &[ColumnLocator], rows: impl IntoIterator<Item = StoredRow>, weight: i64) {
+        for row in rows {
+            let (src, i) = row.source();
+            self.begin_row(src.get_pk_bytes(i), weight);
+            self.append_cells_from(locs, src, i);
+            self.commit_row();
+        }
+    }
+
     /// One `-1` row per key of `pks`, whole `schema` PKs back to back, every
     /// payload cell a zeroed non-NULL filler: the retraction a base table's
     /// unique-PK rule resolves by key alone.
