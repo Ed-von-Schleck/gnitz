@@ -18,7 +18,7 @@ pub const GERMAN_INLINE_OFF: usize = 4;
 ///   [4..8]  prefix — first min(4, len) bytes, zero-padded
 ///   [8..16] if len ≤ 12: suffix bytes [4..len], zero-padded
 ///           if len > 12: blob arena offset (u64 LE)
-#[inline]
+#[inline(always)]
 pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
     let len = s.len();
     assert!(

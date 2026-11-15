@@ -83,6 +83,8 @@ impl PkRule {
 /// user-declared key, which must round-trip through the persisted PK-list word,
 /// and [`MAX_PK_COLUMNS`] for an engine schema derived from one.
 fn validate_pk_indices(pk_cols: &[u32], ncols: usize, max_pk: usize) -> Result<(), PkRule> {
+    // Also bounds the duplicate scan below, which then unrolls.
+    assert!(max_pk <= MAX_PK_COLUMNS, "a PK arity cap past MAX_PK_COLUMNS");
     if pk_cols.is_empty() {
         return Err(PkRule::Empty);
     }
@@ -109,7 +111,6 @@ pub fn validate_pk_tuple(
     max_pk: usize,
     col: impl Fn(u32) -> (TypeCode, bool),
 ) -> Result<(), PkRule> {
-    debug_assert!(max_pk <= MAX_PK_COLUMNS);
     validate_pk_indices(pk_cols, ncols, max_pk)?;
     for &c in pk_cols {
         let (type_code, nullable) = col(c);
