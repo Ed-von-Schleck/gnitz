@@ -234,36 +234,14 @@ pub(crate) async fn execute_statement(
         }
         // A write is checked wherever it lands: sent, by its own request;
         // buffered in a transaction, by the COMMIT that ships it.
-        Statement::Insert(insert) => {
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
             planned_kept(
                 client,
                 schema_name,
                 Descriptors::KEPT,
-                |cat| dml::plan_insert(insert, cat),
+                |cat| dml::plan_write(stmt, cat),
                 |_| true,
-                dml::execute_insert,
-            )
-            .await
-        }
-        Statement::Update(update) => {
-            planned_kept(
-                client,
-                schema_name,
-                Descriptors::KEPT,
-                |cat| dml::plan_update(update, cat),
-                |_| true,
-                dml::execute_mutation,
-            )
-            .await
-        }
-        Statement::Delete(del) => {
-            planned_kept(
-                client,
-                schema_name,
-                Descriptors::KEPT,
-                |cat| dml::plan_delete(del, cat),
-                |_| true,
-                dml::execute_mutation,
+                dml::execute_write,
             )
             .await
         }

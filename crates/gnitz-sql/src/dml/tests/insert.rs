@@ -5,8 +5,9 @@ use crate::test_support::{
     TestCatalog, assert_rejects, batch_of, bind_where, catalog, col, keyed_batch, ncol, parse_stmt, pk_schema, rel,
     rows_of, schema, table,
 };
-use gnitz_wire::TypeCode;
+use gnitz_wire::{ReadBound, RelClass, TypeCode};
 use sqlparser::ast::Statement;
+use std::sync::Arc;
 
 /// | name | shape |
 /// |---|---|
@@ -58,11 +59,19 @@ fn cat() -> TestCatalog {
     ])
 }
 
-fn insert(cat: &dyn Catalog, sql: &str) -> Result<InsertPlan, GnitzSqlError> {
+fn insert(cat: &dyn Catalog, sql: &str) -> Result<WritePlan, GnitzSqlError> {
     let Statement::Insert(insert) = parse_stmt(sql) else {
         panic!("`{sql}` is not an INSERT");
     };
     plan_insert(&insert, cat)
+}
+
+/// The VALUES rows an INSERT plan writes.
+fn rows(plan: &WritePlan) -> &ZSetBatch {
+    match &plan.write {
+        Write::Insert { rows, .. } | Write::Upsert { rows, .. } => rows,
+        _ => panic!("not an INSERT plan"),
+    }
 }
 
 /// Each row's key as its native value.
@@ -116,8 +125,8 @@ fn values_land_in_the_columns_the_list_names() {
     ] {
         let plan = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
         let schema = &plan.target.schema;
-        assert_eq!(keys(&plan.rows), want_keys, "`{sql}`");
-        assert_eq!(rows_of(schema, &plan.rows), want_rows, "`{sql}`");
+        assert_eq!(keys(rows(&plan)), want_keys, "`{sql}`");
+        assert_eq!(rows_of(schema, rows(&plan)), want_rows, "`{sql}`");
     }
 }
 
@@ -132,7 +141,7 @@ fn a_written_key_packs_in_pk_list_order() {
         "INSERT INTO c VALUES (1, 2, 99) ON CONFLICT (a, b) DO NOTHING",
     ] {
         let plan = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-        assert_eq!(plan.rows.pks.region(), [0, 2, 0, 0, 0, 0, 0, 0, 0, 1], "`{sql}`");
+        assert_eq!(rows(&plan).pks.region(), [0, 2, 0, 0, 0, 0, 0, 0, 0, 1], "`{sql}`");
     }
 }
 
@@ -161,7 +170,7 @@ fn an_inserted_key_is_the_key_its_literal_seeks() {
             insert(&cat, &format!("INSERT INTO t VALUES ({lit}, 0)")).unwrap_or_else(|e| panic!("{tc:?}: {e:?}"));
         for pred in [format!("id = {lit}"), format!("id IN ({lit}, {lit})")] {
             let (bound, _) = bound_and_predicate(&s, &bind_where(&pred, &s), &[]).unwrap();
-            assert_eq!(bound, ReadBound::PkSet(plan.rows.pks.keys()), "{tc:?}: {pred}");
+            assert_eq!(bound, ReadBound::PkSet(rows(&plan).pks.keys()), "{tc:?}: {pred}");
         }
     }
 }
@@ -303,8 +312,10 @@ fn returning_a_relations_columns_replies_the_rows_written() {
         ("*", ["v", "id"], 1),
     ] {
         let plan = insert(&cat, &format!("INSERT INTO m VALUES (10, 1) RETURNING {list}")).unwrap();
-        let mut map = plan.returning.unwrap();
-        assert_eq!(map.apply(plan.rows.clone()), plan.rows, "RETURNING {list}");
+        let Write::Insert { rows, returning: Some(mut map) } = plan.write else {
+            panic!("RETURNING {list} has no map")
+        };
+        assert_eq!(map.apply(rows.clone()), rows, "RETURNING {list}");
         let schema = map.out_schema();
         let got: Vec<&str> = schema.columns().iter().map(|c| &*c.name).collect();
         assert_eq!(
@@ -328,8 +339,10 @@ fn returning_names_the_reply_by_the_list() {
         ("v, id", ["v", "id"], 1),
     ] {
         let plan = insert(&cat, &format!("INSERT INTO k VALUES (1, 10) RETURNING {list}")).unwrap();
-        let mut map = plan.returning.unwrap();
-        assert_eq!(map.apply(plan.rows.clone()), plan.rows, "RETURNING {list}");
+        let Write::Insert { rows, returning: Some(mut map) } = plan.write else {
+            panic!("RETURNING {list} has no map")
+        };
+        assert_eq!(map.apply(rows.clone()), rows, "RETURNING {list}");
         let schema = map.out_schema();
         let got: Vec<&str> = schema.columns().iter().map(|c| &*c.name).collect();
         assert_eq!(
@@ -379,11 +392,9 @@ fn on_conflict_resolves_each_row_against_the_row_its_key_holds() {
         ),
     ];
     for (sql, held, want_keys, want_rows) in cases {
-        let InsertPlan {
+        let WritePlan {
             target,
-            rows,
-            conflict: ConflictPlan::Resolve { mut set },
-            ..
+            write: Write::Upsert { rows, mut set },
         } = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
         else {
             panic!("`{sql}` has no ON CONFLICT");
@@ -405,11 +416,9 @@ fn on_conflict_refuses_a_reply_outside_the_read_keys() {
         "INSERT INTO t VALUES (1, 100, 'a') ON CONFLICT DO NOTHING",
         "INSERT INTO t VALUES (1, 100, 'a') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
     ] {
-        let InsertPlan {
+        let WritePlan {
             target,
-            rows,
-            conflict: ConflictPlan::Resolve { mut set },
-            ..
+            write: Write::Upsert { rows, mut set },
         } = insert(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
         else {
             panic!("`{sql}` has no ON CONFLICT");

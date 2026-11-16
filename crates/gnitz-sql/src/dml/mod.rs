@@ -11,12 +11,12 @@ mod insert;
 mod mutate;
 mod select;
 mod set;
+mod write;
 
 #[cfg(test)]
 pub(crate) use explain::explain_lines;
 pub(crate) use explain::{execute_explain, explained_query};
-pub(crate) use insert::{execute_insert, plan_insert};
-pub(crate) use mutate::{execute_mutation, plan_delete, plan_update};
 #[cfg(test)]
 pub(crate) use select::ReadPlan;
 pub(crate) use select::{execute_select, plan_read};
+pub(crate) use write::{execute_write, plan_write};

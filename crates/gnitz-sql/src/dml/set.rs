@@ -10,9 +10,8 @@ use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::{BoundExpr, RegClass};
 use crate::rules::require_column;
 use gnitz_core::{Schema, ZSetBatch};
-use gnitz_expr::{ScalarCell, ScalarEval};
-use gnitz_wire::{ColType, ColumnDef, FixedInt, TypeCode};
-use gnitz_wire::{encode_german_string, null_word_get, null_word_set, relocate_german_string};
+use gnitz_expr::ScalarEval;
+use gnitz_wire::{ColType, FixedInt, TypeCode, null_word_get, null_word_set, relocate_german_string};
 use sqlparser::ast::{Assignment, AssignmentTarget, Expr};
 
 /// Which row a SET right-hand side reads: the row being rewritten, or (ON
@@ -130,7 +129,7 @@ fn excluded_col(e: &Expr) -> Option<&str> {
 /// Compile one SET right-hand side for column `target`, against the schema the
 /// rows it reads carry. Every kind rejection happens here, before any row is
 /// read; a computed value's range and a NULL into a NOT NULL column are the
-/// verdicts [`apply_set`] takes per row.
+/// verdicts [`apply_set`] takes over the rows it rewrites.
 fn classify_set_rhs(expr: BoundExpr, scope: Scope, target: usize, schema: &Schema) -> Result<SetRhs, GnitzSqlError> {
     let col = &schema.columns()[target];
     let ty = col.ty;
@@ -193,9 +192,11 @@ fn classify_set_rhs(expr: BoundExpr, scope: Scope, target: usize, schema: &Schem
 /// right-hand side reads the rows as they were. `excluded` holds the incoming
 /// VALUES rows aligned with `rows` (ON CONFLICT DO UPDATE only).
 ///
-/// Rewritten columns are built in `new` and swapped in. Assigning a string column
-/// also rebuilds every other string column into `new`, whose arena then replaces
-/// `rows`'; otherwise nothing is encoded and `rows`' arena is kept.
+/// Each assigned column is written whole into `new` and swapped in. Assigning a
+/// string column also rebuilds every other string column into `new`, whose arena
+/// then replaces `rows`'; otherwise nothing is encoded and `rows`' arena is kept.
+/// A computed value out of its column's range is refused as it is written; a
+/// NULL into a NOT NULL column once every column is.
 pub(super) fn apply_set(
     set: &mut [SetCol],
     mut rows: ZSetBatch,
@@ -204,95 +205,74 @@ pub(super) fn apply_set(
 ) -> Result<ZSetBatch, GnitzSqlError> {
     let n = rows.len();
     let rebuild = set.iter().any(|a| (schema.columns()[a.ci].ty.tc).is_german_string());
+    // `new` holds the rewritten columns and, from the rows' own, the null words.
     let mut new = ZSetBatch::new(schema);
-    let mut nulls = rows.nulls.clone();
+    new.nulls = rows.nulls.clone();
     for a in set.iter_mut() {
         let def = &schema.columns()[a.ci];
         let pi = schema
             .layout()
             .payload_slot(a.ci)
             .expect("a SET target is a payload column");
-        let tc = def.ty.tc;
         let scoped = |s: Scope| match s {
             Scope::Existing => &rows,
             Scope::Excluded => excluded.expect("only ON CONFLICT DO UPDATE binds EXCLUDED"),
         };
-        new.payload[pi].bytes.reserve_exact(n * tc.wire_stride());
         match &mut a.rhs {
             SetRhs::Const { cell, spill, null } => {
-                let ZSetBatch { payload, blob, .. } = &mut new;
+                let ZSetBatch { payload, blob, nulls, .. } = &mut new;
                 // One spill for every row's cell.
                 let reloc;
-                let cell: &[u8] = if tc.is_german_string() {
+                let cell: &[u8] = if def.ty.tc.is_german_string() {
                     reloc = relocate_german_string(cell.first_chunk().expect("a German cell is 16 bytes"), spill, blob);
                     &reloc
                 } else {
                     cell
                 };
-                for w in &mut nulls {
-                    set_null(w, pi, *null, def)?;
-                    payload[pi].bytes.extend_from_slice(cell);
+                payload[pi].bytes = cell.repeat(n);
+                for w in nulls {
+                    null_word_set(w, pi, *null);
                 }
             }
             SetRhs::Copy { scope, src } => {
                 let b = scoped(*scope);
-                for (w, &sw) in nulls.iter_mut().zip(&b.nulls) {
-                    set_null(w, pi, null_word_get(sw, *src), def)?;
+                for (w, &sw) in new.nulls.iter_mut().zip(&b.nulls) {
+                    null_word_set(w, pi, null_word_get(sw, *src));
                 }
                 new.append_column_from(pi, b, *src);
             }
             SetRhs::Expr { scope, ev } => {
-                let ZSetBatch { payload, blob, .. } = &mut new;
-                // `classify_set_rhs` admits a scalar only into a FixedInt column.
-                let fi = FixedInt::from_type_code(tc);
-                ev.for_each(scoped(*scope), |r, cell| {
-                    let bytes = &mut payload[pi].bytes;
-                    match cell {
-                        ScalarCell::Str(s) => {
-                            set_null(&mut nulls[r], pi, s.is_none(), def)?;
-                            bytes.extend_from_slice(&encode_german_string(s.unwrap_or(&[]), blob));
-                        }
-                        ScalarCell::Int(v) => {
-                            set_null(&mut nulls[r], pi, v.is_none(), def)?;
-                            let fi = fi.expect("a scalar is set only into a FixedInt column");
-                            let v = v.unwrap_or(0);
-                            let (min, max) = fi.range();
-                            if !(min..=max).contains(&v) {
-                                return Err(GnitzSqlError::Rejected(format!(
-                                    "column '{}': {} value out of range: {v}",
-                                    def.name, def.ty
-                                )));
-                            }
-                            bytes.extend_from_slice(&fi.pack(v).to_le_bytes()[..fi.width()]);
-                        }
-                    }
-                    Ok(())
+                new.payload[pi].bytes = vec![0; n * def.ty.tc.wire_stride()];
+                for w in &mut new.nulls {
+                    null_word_set(w, pi, false);
+                }
+                ev.write_slot(scoped(*scope), &mut new, pi, def.ty.tc).map_err(|v| {
+                    GnitzSqlError::Rejected(format!("column '{}': {} value out of range: {v}", def.name, def.ty))
                 })?;
             }
         }
     }
-    if rebuild {
-        for (pi, ci, def) in schema.payload_columns() {
-            if def.ty.tc.is_german_string() && !set.iter().any(|a| a.ci == ci) {
-                new.append_column_from(pi, &rows, pi);
-            }
-        }
-        rows.blob = std::mem::take(&mut new.blob);
-    }
+    // Bit `pi` set where some rewritten row is NULL in column `pi`.
+    let any_null = new.nulls.iter().fold(0, |acc, &w| acc | w);
     for (pi, ci, def) in schema.payload_columns() {
-        if set.iter().any(|a| a.ci == ci) || (rebuild && def.ty.tc.is_german_string()) {
+        let assigned = set.iter().any(|a| a.ci == ci);
+        if assigned {
+            check_not_null(def, null_word_get(any_null, pi))?;
+        }
+        let restrung = rebuild && def.ty.tc.is_german_string();
+        if restrung && !assigned {
+            new.append_column_from(pi, &rows, pi);
+        }
+        if assigned || restrung {
             std::mem::swap(&mut rows.payload[pi], &mut new.payload[pi]);
         }
     }
-    rows.nulls = nulls;
+    if rebuild {
+        rows.blob = new.blob;
+    }
+    rows.nulls = new.nulls;
     rows.weights.fill(1);
     Ok(rows)
-}
-
-fn set_null(word: &mut u64, pi: usize, null: bool, def: &ColumnDef) -> Result<(), GnitzSqlError> {
-    check_not_null(def, null)?;
-    null_word_set(word, pi, null);
-    Ok(())
 }
 
 #[cfg(test)]

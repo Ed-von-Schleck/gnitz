@@ -1,0 +1,133 @@
+//! Every write verb as one of two primitives: a blind push of the VALUES rows
+//! (a plain INSERT), or a read-modify-write — a read of the target whose rows
+//! are rewritten and pushed as an upsert (UPDATE, DELETE, INSERT … ON CONFLICT).
+//! The read is a WHERE's or the VALUES keys'; the rewrite is fixed by whether
+//! there is a SET list:
+//!
+//! |              | no SET list                    | SET list                                  |
+//! |--------------|--------------------------------|-------------------------------------------|
+//! | WHERE        | DELETE: retract the held keys  | UPDATE: the held rows rewritten           |
+//! | VALUES' keys | DO NOTHING: the unheld rows    | DO UPDATE: the unheld rows + held rewritten |
+//!
+//! Planning (`plan_insert`, `plan_update`, `plan_delete`) reads only the
+//! catalog, so a refused statement issues no request and consumes no SERIAL id;
+//! [`execute_write`] runs what was planned.
+
+use super::insert::{plan_insert, resolve_conflicts, serial_col, serial_keys};
+use super::mutate::{plan_delete, plan_update};
+use super::set::{SetCol, apply_set};
+use crate::SqlResult;
+use crate::catalog::Catalog;
+use crate::error::GnitzSqlError;
+use crate::exec::client_map::ClientMap;
+use gnitz_core::{GnitzClient, RelDescriptor, ScanReply, ZSetBatch};
+use gnitz_wire::{ReadBound, RelClass, WireConflictMode};
+use sqlparser::ast::Statement;
+use std::sync::Arc;
+
+/// A write, planned: everything but the SERIAL keys, which only the server can
+/// hand out.
+pub(crate) struct WritePlan {
+    pub(super) target: Arc<RelDescriptor>,
+    pub(super) write: Write,
+}
+
+pub(super) enum Write {
+    /// A plain INSERT: the VALUES rows at weight +1, and the RETURNING reply's
+    /// map over them. Into a SERIAL table the key region is empty until
+    /// [`execute_write`] stamps it.
+    Insert {
+        rows: ZSetBatch,
+        returning: Option<Box<ClientMap>>,
+    },
+    /// INSERT … ON CONFLICT: the VALUES rows, one per key, each dropped (DO
+    /// NOTHING, no `set`) or merged with the SET list (DO UPDATE) where its key
+    /// is held.
+    Upsert {
+        rows: ZSetBatch,
+        set: Option<Vec<SetCol>>,
+    },
+    Update {
+        bound: ReadBound,
+        predicate: Vec<u8>,
+        set: Vec<SetCol>,
+    },
+    Delete {
+        bound: ReadBound,
+        predicate: Vec<u8>,
+    },
+}
+
+/// Plan an INSERT, UPDATE or DELETE.
+pub(crate) fn plan_write(stmt: &Statement, cat: &dyn Catalog) -> Result<WritePlan, GnitzSqlError> {
+    match stmt {
+        Statement::Insert(insert) => plan_insert(insert, cat),
+        Statement::Update(update) => plan_update(update, cat),
+        Statement::Delete(del) => plan_delete(del, cat),
+        _ => unreachable!("dispatch routes only INSERT, UPDATE and DELETE here"),
+    }
+}
+
+/// Run one planned write, tagged with its verb.
+pub(crate) async fn execute_write(client: &mut GnitzClient, plan: WritePlan) -> Result<SqlResult, GnitzSqlError> {
+    let WritePlan { target, mut write } = plan;
+    let schema = &target.schema;
+    if serial_col(&target).is_some()
+        && let Write::Insert { rows, .. } | Write::Upsert { rows, .. } = &mut write
+    {
+        // One reservation for the whole statement.
+        let n = rows.len();
+        rows.pks = serial_keys(client.reserve_serial_ids(&target, n as u64).await?, n, schema)?;
+    }
+    let (tag, count) = match write {
+        Write::Insert { rows, returning } => {
+            // The engine refuses `Error` on a stream (its PK is not unique) and
+            // leaves `Update` unread: the push appends, so the same row twice is
+            // one element at weight 2.
+            let mode = if target.class == RelClass::Stream {
+                WireConflictMode::Update
+            } else {
+                WireConflictMode::Error
+            };
+            // Split on RETURNING: the batch is given away when nothing will
+            // project it, saving a deep clone inside a transaction.
+            let Some(mut map) = returning else {
+                let count = rows.len();
+                client.push(&*target, schema, rows, mode).await?;
+                return Ok(SqlResult::RowsAffected { tag: "INSERT", count });
+            };
+            client.push(&*target, schema, &rows, mode).await?;
+            return Ok(SqlResult::Rows(ScanReply {
+                schema: Arc::clone(map.out_schema()),
+                batch: map.apply(rows),
+                lsn: None,
+            }));
+        }
+        Write::Upsert { rows, mut set } => {
+            let bound = ReadBound::PkSet(rows.pks.keys());
+            let count = client
+                .read_modify_write(&target, bound, Vec::new(), set.is_none(), |held| {
+                    resolve_conflicts(rows, held, set.as_deref_mut(), schema)
+                })
+                .await?;
+            ("INSERT", count)
+        }
+        Write::Update { bound, predicate, mut set } => {
+            let count = client
+                .read_modify_write(&target, bound, predicate, false, |held| {
+                    apply_set(&mut set, held, None, schema)
+                })
+                .await?;
+            ("UPDATE", count)
+        }
+        Write::Delete { bound, predicate } => {
+            let count = client
+                .read_modify_write(&target, bound, predicate, true, |held| {
+                    Ok::<_, GnitzSqlError>(ZSetBatch::retraction(schema, held.pks))
+                })
+                .await?;
+            ("DELETE", count)
+        }
+    };
+    Ok(SqlResult::RowsAffected { tag, count })
+}

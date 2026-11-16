@@ -1,12 +1,13 @@
 use super::*;
 use crate::test_support::{parse_stmt, xorshift};
 use gnitz_core::BatchAppender;
+use gnitz_wire::ColumnDef;
 use sqlparser::ast::Statement;
 use std::hint::black_box;
 
-/// Instructions per row `apply_set` rewrites, over `t (id PK, i1..i8 BIGINT, t1, t2 TEXT)`:
-/// a fixed-width column copied from another, and a string literal, which rebuilds the
-/// other string column onto the new arena.
+/// Instructions per row `apply_set` rewrites, over `t (id PK, i1..i8 BIGINT, t1, t2 TEXT)`,
+/// for each kind of right-hand side: a copied column, a literal (a string one rebuilds
+/// the other string column onto the new arena), and a computed value.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn apply_set_bench() {
@@ -36,6 +37,9 @@ fn apply_set_bench() {
     for (name, sql) in [
         ("copy a fixed column", "UPDATE t SET i1 = i2"),
         ("string literal", "UPDATE t SET t1 = 'x'"),
+        ("int literal", "UPDATE t SET i1 = 7"),
+        ("computed", "UPDATE t SET i1 = i2 + 1"),
+        ("copy x3", "UPDATE t SET i1 = i2, i3 = i4, i5 = i6"),
     ] {
         let Statement::Update(u) = parse_stmt(sql) else {
             panic!("`{sql}` is an UPDATE")

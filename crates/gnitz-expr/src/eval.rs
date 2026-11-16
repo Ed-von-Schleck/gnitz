@@ -6,16 +6,17 @@
 
 use std::ops::Range;
 
-use gnitz_wire::KeyRange;
+use gnitz_wire::{FixedInt, KeyRange, TypeCode};
 
 #[cfg(test)]
 use crate::ResolvedProgram;
+use crate::map::{Emit, EmitStore};
 use crate::morsel::{Evaluator, MorselOut};
 use crate::program::ReadAs;
 use crate::range::RangeMembership;
 #[cfg(test)]
 use crate::simd::Level;
-use crate::{BatchView, ExprValidateErr, LogicalProgram, SchemaDescriptor, Sink};
+use crate::{BatchView, ExprValidateErr, LogicalProgram, MapTarget, SchemaDescriptor, Sink};
 
 /// One row's result of a [`ScalarEval`], in the shape its result register's
 /// class fixes; `None` for SQL NULL.
@@ -205,6 +206,50 @@ impl ScalarEval {
             });
             f(row, ScalarCell::Int(v))
         })
+    }
+
+    /// Write each row of `mb`'s value into payload slot `slot` of `dst`, whose
+    /// region already holds that many cells of `tc`: a string as a German-string
+    /// cell, an integer as the low bytes of the integer type `tc` is stored as. A
+    /// NULL row's cell is zeroed and its null bit set; no bit is cleared. Refused
+    /// with the first non-NULL integer outside that type's range, the slot then
+    /// partly written.
+    pub fn write_slot(
+        &mut self,
+        mb: &dyn BatchView,
+        dst: &mut dyn MapTarget,
+        slot: usize,
+        tc: TypeCode,
+    ) -> Result<(), i128> {
+        let reg = self.result_reg;
+        let (store, range) = match self.class {
+            ResultClass::Str => (EmitStore::Str, None),
+            class => {
+                let fi = FixedInt::from_type_code(tc).expect("an integer is stored only into an integer-stored slot");
+                let store = match fi.width() {
+                    1 => EmitStore::W1,
+                    2 => EmitStore::W2,
+                    4 => EmitStore::W4,
+                    _ => EmitStore::W8,
+                };
+                (store, Some((fi, matches!(class, ResultClass::Unsigned))))
+            }
+        };
+        let e = Emit { reg, slot, store };
+        let mut res = Ok(());
+        self.ev.eval_morsels(mb, 0, mb.row_count(), |row0, out| {
+            if res.is_err() {
+                return;
+            }
+            if let Some((fi, unsigned)) = range
+                && let Some(v) = out.first_outside(reg, fi, unsigned)
+            {
+                res = Err(v);
+                return;
+            }
+            out.emit(&e, dst.slot_mut(slot), row0);
+        });
+        res
     }
 
     /// `f(morsel, i, row)` for row `i` of each morsel, `row` its index in `mb`, up

@@ -1,13 +1,15 @@
 use super::*;
+use crate::dml::set::{SetCol, apply_set};
 use crate::test_support::Cell::{self, F64, Int, Null, Str};
 use crate::test_support::{
-    TestCatalog, assert_rejects, batch_of, catalog, col, ncol, parse_stmt, rel, rows_of, table, typed_schema,
+    TestCatalog, assert_rejects, batch_of, bind_where, catalog, col, ncol, parse_stmt, rel, rows_of, table,
+    typed_schema,
 };
-use gnitz_core::BatchAppender;
+use gnitz_core::{BatchAppender, Schema, ZSetBatch};
 use gnitz_wire::{ColType, RelClass, TypeCode};
 use sqlparser::ast::Statement;
 
-fn plan(cat: &dyn Catalog, sql: &str) -> Result<MutationPlan, GnitzSqlError> {
+fn plan(cat: &dyn Catalog, sql: &str) -> Result<WritePlan, GnitzSqlError> {
     match parse_stmt(sql) {
         Statement::Update(u) => plan_update(&u, cat),
         Statement::Delete(d) => plan_delete(&d, cat),
@@ -15,14 +17,22 @@ fn plan(cat: &dyn Catalog, sql: &str) -> Result<MutationPlan, GnitzSqlError> {
     }
 }
 
+/// An UPDATE plan's SET list.
+fn set_list(plan: WritePlan) -> Vec<SetCol> {
+    let Write::Update { set, .. } = plan.write else {
+        panic!("not an UPDATE plan")
+    };
+    set
+}
+
 /// What `UPDATE t SET <set>` writes for the rows `held` of `schema`, each read at
 /// weight 3.
 fn updated(schema: &Schema, set: &str, held: &[&[Cell]]) -> Result<ZSetBatch, GnitzSqlError> {
     let cat = catalog(vec![("t", table(1, schema.columns().to_vec(), vec![0]))]);
-    let mut plan = plan(&cat, &format!("UPDATE t SET {set}"))?;
+    let mut set = set_list(plan(&cat, &format!("UPDATE t SET {set}"))?);
     let mut rows = batch_of(schema, held);
     rows.weights.fill(3);
-    delta(plan.set.as_deref_mut(), rows, schema)
+    apply_set(&mut set, rows, None, schema)
 }
 
 const I: ColType = ColType::of(TypeCode::I64);
@@ -113,8 +123,8 @@ fn a_uuid_column_is_copied() {
         .u128_val(0)
         .u128_val(u128::MAX - 7);
     let cat = catalog(vec![("t", table(1, schema.columns().to_vec(), vec![0]))]);
-    let mut plan = plan(&cat, "UPDATE t SET c1 = c2").unwrap();
-    let out = delta(plan.set.as_deref_mut(), rows, &schema).unwrap();
+    let mut set = set_list(plan(&cat, "UPDATE t SET c1 = c2").unwrap());
+    let out = apply_set(&mut set, rows, None, &schema).unwrap();
     assert_eq!(out.payload[0].bytes, (u128::MAX - 7).to_le_bytes());
 }
 
@@ -154,8 +164,24 @@ fn a_computed_value_is_range_checked_at_the_column_width() {
     }
 }
 
-/// A NULL into a NOT NULL column is refused per row, whichever way the value is
-/// produced.
+/// A computed value lands in its own row past the first morsel, a NULL among
+/// them too, and one out of range is refused wherever it lies.
+#[test]
+fn a_computed_value_is_written_across_morsels() {
+    let schema = typed_schema(&[TypeCode::I64, TypeCode::U8]);
+    let src = |i: i128| if i % 97 == 5 { Null } else { Int(i % 256) };
+    let held: Vec<[Cell; 2]> = (0..700).map(|i| [src(i), Null]).collect();
+    let held: Vec<&[Cell]> = held.iter().map(|r| &r[..]).collect();
+    let want: Vec<_> = (0..700).map(|i| (vec![src(i), src(i)], 1)).collect();
+    assert_eq!(rows_of(&schema, &updated(&schema, "c2 = c1 + 0", &held).unwrap()), want);
+    let mut bad: Vec<[Cell; 2]> = (0..700).map(|i| [src(i), Null]).collect();
+    bad[650][0] = Int(300);
+    let bad: Vec<&[Cell]> = bad.iter().map(|r| &r[..]).collect();
+    assert_rejects("row 650", updated(&schema, "c2 = c1 + 0", &bad), "out of range: 300");
+}
+
+/// A NULL into a NOT NULL column is refused when any rewritten row holds one,
+/// whichever way the value is produced.
 #[test]
 fn a_null_into_a_not_null_column_is_refused() {
     let schema = crate::test_support::schema(
@@ -313,13 +339,17 @@ fn a_refused_mutation_names_its_rule() {
     plan(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
 }
 
-/// A DELETE writes the retraction of the keys it read.
+/// A DELETE plans the read its WHERE makes, through the access-path ladder.
 #[test]
-fn a_delete_retracts_the_keys_it_read() {
-    let mut plan = plan(&cat(), "DELETE FROM t WHERE v = 5").unwrap();
-    let schema = &plan.target.schema;
-    let held = batch_of(schema, &[&[Int(5), Null], &[Int(5), Str("x")]]);
-    let keys = held.pks.clone();
-    let out = delta(plan.set.as_deref_mut(), held, schema).unwrap();
-    assert_eq!((out.pks, out.weights), (keys, vec![-1, -1]));
+fn a_delete_plans_the_read_of_its_where() {
+    let cat = cat();
+    for pred in ["v = 5", "id = 1", "id = 1 AND v = 5"] {
+        let plan = plan(&cat, &format!("DELETE FROM t WHERE {pred}")).unwrap();
+        let schema = &plan.target.schema;
+        let want = bound_and_predicate(schema, &bind_where(pred, schema), &plan.target.indexes).unwrap();
+        let Write::Delete { bound, predicate } = plan.write else {
+            panic!("not a DELETE plan")
+        };
+        assert_eq!((bound, predicate), want, "{pred}");
+    }
 }

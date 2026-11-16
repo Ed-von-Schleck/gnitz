@@ -3,7 +3,8 @@
 //! `dml::select` would dispatch, so a query the planner rejects returns that
 //! query's own rejection and every line describes what the SELECT would run.
 //!
-//! It reaches nothing: describing a query is as server-free as compiling one.
+//! Describing a plan sends no request: its names were resolved when it was
+//! planned, and whether a read is served locally is read off the client's copy.
 
 use crate::SqlResult;
 use crate::dml::select::{ReadCase, ReadPlan, SpecRead};

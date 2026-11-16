@@ -264,6 +264,26 @@ impl MorselOut<'_> {
         }
     }
 
+    /// The first non-NULL value of integer register `reg` in this morsel outside
+    /// `fi`'s range, read as unsigned under `unsigned`; the bounds are the ones
+    /// `IntCast` tests.
+    pub(crate) fn first_outside(&self, reg: usize, fi: FixedInt, unsigned: bool) -> Option<i128> {
+        let (lo, hi, hi_u) = int_cast_bounds(fi);
+        let outside = |x: i64| if unsigned { x as u64 > hi_u } else { x < lo || x > hi };
+        let vals = self.reg_values(reg);
+        // A fold rather than `any`: with no early exit it vectorizes, and the
+        // usual morsel holds no value outside.
+        if !vals.iter().fold(false, |acc, &x| acc | outside(x)) {
+            return None;
+        }
+        let i = (0..self.m).find(|&i| outside(vals[i]) && !self.is_null(reg, i))?;
+        Some(if unsigned {
+            i128::from(vals[i] as u64)
+        } else {
+            i128::from(vals[i])
+        })
+    }
+
     /// Register `reg`'s values for this morsel's rows, in row order.
     #[inline(always)]
     pub(crate) fn reg_values(&self, reg: usize) -> &[i64] {
