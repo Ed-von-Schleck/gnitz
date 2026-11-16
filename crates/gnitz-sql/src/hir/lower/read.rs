@@ -10,7 +10,7 @@ use crate::error::{GnitzSqlError, derivation};
 use crate::ir::{BExpr, BoundExpr};
 use crate::project::payload_program;
 use gnitz_core::{RelDescriptor, Schema};
-use gnitz_wire::{ColumnDef, OrderKey};
+use gnitz_wire::OrderKey;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use std::sync::Arc;
 pub(crate) enum AdhocRead {
     /// Nothing: the one row these items compute over the ground row, a hidden one
     /// being an ORDER BY key.
-    Constant(AdhocRows),
+    Constant(RowsReply),
     /// One relation.
     Relation {
         desc: Arc<RelDescriptor>,
@@ -32,7 +32,7 @@ pub(crate) enum AdhocRead {
 }
 
 pub(crate) enum AdhocShape {
-    Rows(AdhocRows),
+    Rows(RowsReply),
     Fold {
         pieces: Box<FoldPieces>,
         /// Nothing in the fold's layout tells a DISTINCT from a zero-aggregate GROUP BY.
@@ -162,7 +162,7 @@ pub(crate) fn lower_read(
             };
             let lin = linear(base)?;
             let (desc, source) = lin.source()?;
-            let pieces = distinct_fold(Frame::scan(desc, source), &lin.items(items)?, order)?;
+            let pieces = distinct_fold(Frame::scan(desc, source), lin.items(items)?, order)?;
             let shape = AdhocShape::Fold {
                 pieces: Box::new(pieces),
                 is_distinct: true,
@@ -176,7 +176,7 @@ pub(crate) fn lower_read(
                 // Everything over the reduce is its HAVING and its finalize projection.
                 RelExpr::Reduce { input, group_cols, aggs } => {
                     let lin = linear(input)?;
-                    let pieces = flat_reduce(&lin, input, group_cols, aggs, &top.preds, &top.items(items)?, order)?;
+                    let pieces = flat_reduce(&lin, input, group_cols, aggs, &top.preds, top.items(items)?, order)?;
                     let shape = AdhocShape::Fold {
                         pieces: Box::new(pieces),
                         is_distinct: false,
@@ -220,99 +220,47 @@ fn constant(lin: &Linear<'_>, items: &[ProjEntry], order: Vec<OrderCol>) -> Resu
 }
 
 /// `Project(having?(Reduce))` over `lin`'s relation, as the flat query binds it:
-/// a reduce input column that copies a source column is read in place, and one
-/// that computes is a column of the pre-map under the reduce.
+/// each column the reduce reads, as `lin` composes it over the relation.
 fn flat_reduce(
     lin: &Linear<'_>,
     input: &Rc<RelExpr>,
     group_cols: &[ColId],
     aggs: &[AggCol],
     having: &[HirExpr],
-    items: &[ProjEntry],
+    items: Vec<ProjEntry>,
     order: Vec<OrderCol>,
 ) -> Result<FoldPieces, GnitzSqlError> {
     let (desc, source) = lin.source()?;
     let in_cols = input.cols();
-    let mut copies: HashMap<ColId, ColId> = HashMap::new();
-    let mut pre: Vec<ProjEntry> = Vec::new();
-    let mut computed = 0;
-    // What the reduce reads, in the order its pre-map lists it.
-    for r in reduce_reads(group_cols, aggs) {
-        let e = &lin.map[&r];
-        match e.as_col() {
-            Some(src) => {
-                copies.insert(r, src);
-                if !pre.iter().any(|p| p.out.id == src) {
-                    pre.push(ProjEntry::passthrough(hircol_of(source, src).clone()));
-                }
-            }
-            None => {
-                let def = &hircol_of(&in_cols, r).def;
-                let def = ColumnDef::new(format!("_pre{computed}"), def.ty, def.is_nullable).hidden();
-                computed += 1;
-                pre.push(ProjEntry {
-                    expr: e.clone(),
-                    out: HirCol::new(r, def),
-                });
-            }
-        }
-    }
-    let at = |id: ColId| copies.get(&id).copied().unwrap_or(id);
-    let rename = |e: &HirExpr| e.rebuild(&mut |id| BExpr::ColRef(at(*id)));
-    let group: Vec<ColId> = group_cols.iter().map(|&g| at(g)).collect();
-    let aggs: Vec<AggCol> = aggs
-        .iter()
-        .map(|c| AggCol { arg: c.arg.map(at), ..c.clone() })
-        .collect();
-    let having: Vec<HirExpr> = having.iter().map(rename).collect();
-    let items: Vec<ProjEntry> = items
-        .iter()
-        .map(|it| ProjEntry {
-            expr: rename(&it.expr),
-            out: it.out.clone(),
+    let pre: Vec<ProjEntry> = (reduce_reads(group_cols, aggs).into_iter())
+        .map(|r| ProjEntry {
+            expr: lin.map[&r].clone(),
+            out: hircol_of(&in_cols, r).clone(),
         })
         .collect();
-    fold(
-        Frame::scan(desc, source),
-        (computed > 0).then_some(&pre[..]),
-        &group,
-        &aggs,
-        &having,
-        items,
-        order,
-    )
-}
-
-/// A rows read's reply items, placed: what [`AdhocRows::reply`] numbers.
-pub(crate) struct AdhocRows {
-    /// The schema of the source the items read.
-    src: Arc<Schema>,
-    /// The items' output columns, in item order: the SELECT list, then a hidden column per
-    /// ORDER BY expression no item already computes.
-    cols: Vec<HirCol>,
-    /// The items as the projection's slots, the source PK pinned in front, and the
-    /// frame they produce.
-    proj: Vec<BoundExpr>,
-    out: Frame,
-    /// The ORDER BY, over `cols`.
-    order: Vec<OrderCol>,
+    fold(Frame::scan(desc, source), pre, group_cols, aggs, having, items, order)
 }
 
 /// The rows reply a projection over a source produces.
 pub(crate) struct RowsReply {
+    /// The schema of the source the items read: a relation, a fold's partials, or the
+    /// ground row.
+    pub(crate) src: Arc<Schema>,
     /// The reply's regions under the SELECT list's numbering: the key columns no
     /// item names, hidden, then the items — a key column at the first item that
     /// copies it, every other item a payload column.
-    pub(crate) schema: Arc<gnitz_core::Schema>,
+    pub(crate) schema: Arc<Schema>,
     /// The program filling the reply's payload from a source row; `None` when the
     /// reply's regions are the source's own.
     pub(crate) program: Option<gnitz_expr::LogicalProgram>,
     /// The ORDER BY keys over `schema`.
     pub(crate) order: Vec<OrderKey>,
     /// `order` as the worker's sink numbers its input: the program's output, key
-    /// region first, or the relation where there is no program. Empty where the
-    /// worker's walk already yields `order`.
+    /// region first, or the relation where there is no program.
     pub(crate) sink_order: Vec<OrderKey>,
+    /// Whether `order` ascends a leading run of the source's PK columns, so a walk in
+    /// PK order already yields it.
+    pub(crate) pk_ordered: bool,
     /// `(relation column, reply column)` for each relation column an item copies
     /// verbatim, at the first item that does.
     pub(crate) copied: Vec<(u32, u32)>,
@@ -323,7 +271,7 @@ pub(crate) fn reply_rows(
     src: Frame,
     written: Vec<ProjEntry>,
     mut order: Vec<OrderCol>,
-) -> Result<AdhocRows, GnitzSqlError> {
+) -> Result<RowsReply, GnitzSqlError> {
     // A hidden item is an ORDER BY key; one an earlier item already computes sorts on it.
     let mut items: Vec<ProjEntry> = Vec::with_capacity(written.len());
     for it in written {
@@ -340,81 +288,62 @@ pub(crate) fn reply_rows(
         }
     }
     let (proj, out) = physical::physicalize_projection(&items, &src)?;
-    Ok(AdhocRows {
-        src: src.schema,
-        cols: items.into_iter().map(|it| it.out).collect(),
-        proj,
-        out,
-        order,
-    })
-}
-
-impl AdhocRows {
-    /// The schema of the source the items read: a relation, a fold's partials, or the
-    /// ground row.
-    pub(crate) fn src(&self) -> &Arc<Schema> {
-        &self.src
-    }
-
-    /// The reply, for a worker whose walk yields rows in the relation's PK order when
-    /// `walks_in_pk_order`.
-    pub(crate) fn reply(self, walks_in_pk_order: bool) -> Result<RowsReply, GnitzSqlError> {
-        let AdhocRows { src, cols, proj, out, order } = self;
-        let k = src.pk_cols().len();
-        // The relation's payload columns, each copied in place at its own type: the reply's
-        // regions are the relation's.
-        let payload = proj[k..]
+    let src = src.schema;
+    let k = src.pk_cols().len();
+    // The relation's payload columns, each copied in place at its own type: the reply's
+    // regions are the relation's.
+    let payload = proj[k..]
+        .iter()
+        .zip(&out.schema.columns()[k..])
+        .map(|(item, def)| (item.as_col(), def.ty));
+    let unmapped = payload.eq(src.payload_columns().map(|(_, ci, col)| (Some(ci), col.ty)));
+    let program = (!unmapped)
+        .then(|| payload_program(&proj, &out.schema, &src))
+        .transpose()?;
+    let visible = items.iter().filter(|c| !c.out.def.is_hidden).map(|c| c.out.id);
+    let (schema, column_of) = out.schema_in_order(visible)?;
+    // Each key with its slot of the projection's output.
+    let slots = order
+        .into_iter()
+        .map(|key| Ok((out.slot(key.col)?, key)))
+        .collect::<Result<Vec<_>, GnitzSqlError>>()?;
+    let source_col = |slot: usize| proj[slot].as_col();
+    let numbered = |col: &dyn Fn(usize) -> usize| -> Vec<OrderKey> {
+        slots
             .iter()
-            .zip(&out.schema.columns()[k..])
-            .map(|(item, def)| (item.as_col(), def.ty));
-        let unmapped = payload.eq(src.payload_columns().map(|(_, ci, col)| (Some(ci), col.ty)));
-        let program = (!unmapped)
-            .then(|| payload_program(&proj, &out.schema, &src))
-            .transpose()?;
-        let visible = cols.iter().filter(|c| !c.def.is_hidden).map(|c| c.id);
-        let (schema, column_of) = out.schema_in_order(visible)?;
-        // Each key with its slot of the projection's output.
-        let slots = order
-            .into_iter()
-            .map(|key| Ok((out.slot(key.col)?, key)))
-            .collect::<Result<Vec<_>, GnitzSqlError>>()?;
-        let source_col = |slot: usize| proj[slot].as_col();
-        let numbered = |col: &dyn Fn(usize) -> usize| -> Vec<OrderKey> {
-            slots
-                .iter()
-                .map(|&(slot, key)| OrderKey {
-                    col: col(slot) as u16,
-                    desc: key.desc,
-                    nulls_first: key.nulls_first,
-                })
-                .collect()
-        };
-        let mut copied: Vec<(u32, u32)> = Vec::with_capacity(proj.len());
-        for (slot, item) in proj.iter().enumerate() {
-            let src = item.as_col().map(|s| s as u32);
-            if let Some(src) = src.filter(|s| copied.iter().all(|(c, _)| c != s)) {
-                copied.push((src, column_of[slot]));
-            }
+            .map(|&(slot, key)| OrderKey {
+                col: col(slot) as u16,
+                desc: key.desc,
+                nulls_first: key.nulls_first,
+            })
+            .collect()
+    };
+    let mut copied: Vec<(u32, u32)> = Vec::with_capacity(proj.len());
+    for (slot, item) in proj.iter().enumerate() {
+        let src = item.as_col().map(|s| s as u32);
+        if let Some(src) = src.filter(|s| copied.iter().all(|(c, _)| c != s)) {
+            copied.push((src, column_of[slot]));
         }
-        // A walk in PK order yields keys ascending a leading run of the PK columns.
-        let pk_ordered = slots.len() <= k
-            && slots
-                .iter()
-                .zip(src.pk_cols())
-                .all(|(&(slot, key), &pk)| !key.desc && source_col(slot) == Some(pk as usize));
-        Ok(RowsReply {
-            order: numbered(&|slot| column_of[slot] as usize),
-            // The worker's sink numbers its input: the program's output, or the relation.
-            sink_order: match (walks_in_pk_order && pk_ordered, unmapped) {
-                (true, _) => Vec::new(),
-                (false, true) => numbered(&|slot| source_col(slot).expect("an unmapped reply copies every column")),
-                (false, false) => numbered(&|slot| slot),
-            },
-            copied,
-            program,
-            schema,
-        })
     }
+    // A walk in PK order yields keys ascending a leading run of the PK columns.
+    let pk_ordered = slots.len() <= k
+        && slots
+            .iter()
+            .zip(src.pk_cols())
+            .all(|(&(slot, key), &pk)| !key.desc && source_col(slot) == Some(pk as usize));
+    Ok(RowsReply {
+        order: numbered(&|slot| column_of[slot] as usize),
+        // The worker's sink numbers its input: the program's output, or the relation.
+        sink_order: match unmapped {
+            true => numbered(&|slot| source_col(slot).expect("an unmapped reply copies every column")),
+            false => numbered(&|slot| slot),
+        },
+        pk_ordered,
+        copied,
+        program,
+        schema,
+        src,
+    })
 }
 
 #[cfg(test)]

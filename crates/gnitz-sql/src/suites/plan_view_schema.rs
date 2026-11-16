@@ -278,11 +278,10 @@ fn wildcard_modifiers_rewrite_the_expansion() {
 
 // ── CTEs and derived tables ──────────────────────────────────────────────────
 
-/// A CTE's column aliases name its output; a body that only renames columns
-/// reads its source in place (one segment) while any other body is cut into a
-/// hidden segment where it is read — and not at all where nothing reads it.
+/// A CTE's column aliases name its output, and a linear body over one relation
+/// fuses into the body reading it: no CTE here costs a segment.
 #[test]
-fn a_cte_body_reads_in_place_only_when_it_renames() {
+fn a_linear_cte_body_fuses_into_its_reader() {
     let i = TypeCode::I64;
     let cat = catalog(vec![("ab", table(30, vec![col("a", i), col("b", i)], vec![0]))]);
     let rows: &[(&str, usize, Shape)] = &[
@@ -313,16 +312,16 @@ fn a_cte_body_reads_in_place_only_when_it_renames() {
         ),
         (
             "WITH c AS (SELECT a, b FROM ab WHERE a > 0), cte AS (SELECT a + 1 AS s FROM c) SELECT s FROM cte",
-            3,
+            1,
             sh(&[("a", true, false), ("s", false, false)]),
         ),
         (
             "WITH cte AS (SELECT a + 1 AS s FROM ab) SELECT s FROM cte",
-            2,
+            1,
             sh(&[("a", true, false), ("s", false, false)]),
         ),
         // The same-named derived alias shadows the CTE in the final body, so the
-        // CTE is never read and never cut.
+        // CTE is never read.
         (
             "WITH x AS (SELECT a AS ca FROM ab) SELECT * FROM (SELECT b AS cb FROM ab) x",
             1,
@@ -372,10 +371,10 @@ fn view_column_aliases_name_the_select_list() {
     assert_eq!(names, ["id", "name"]);
 }
 
-/// A CTE that passes a view through whole keeps the view's hidden row key, so a
-/// ROW_NUMBER over the CTE is accepted as it is over the view.
+/// A CTE or a derived table that passes a view through whole keeps the view's
+/// hidden row key, so a ROW_NUMBER over either is accepted as it is over the view.
 #[test]
-fn an_identity_cte_of_a_view_keeps_its_row_key() {
+fn an_identity_cte_or_derived_table_of_a_view_keeps_its_row_key() {
     let i = TypeCode::I64;
     let cat = catalog(vec![(
         "vx",
@@ -391,11 +390,14 @@ fn an_identity_cte_of_a_view_keeps_its_row_key() {
         &cat,
         "WITH c AS (SELECT * FROM vx) SELECT x, ROW_NUMBER() OVER (ORDER BY x) AS rn FROM c",
     );
+    view(
+        &cat,
+        "SELECT x, ROW_NUMBER() OVER (ORDER BY x) AS rn FROM (SELECT * FROM vx) d",
+    );
 }
 
 /// A CTE is one shared subtree read through an alias wherever it is named: a
-/// body carrying work is cut once however often it is read, a pass-through
-/// costs nothing wherever it is read, and both are visible to a subquery.
+/// linear body fuses into each reader, and both are visible to a subquery.
 #[test]
 fn a_cte_is_a_shared_subtree_read_through_aliases() {
     let cat = base();
@@ -417,15 +419,15 @@ fn a_cte_is_a_shared_subtree_read_through_aliases() {
         1
     );
 
-    // A body carrying work is cut once, however often it is named: the second
-    // read of the one segment goes through the collision wrapper.
+    // A linear body fuses into each reader; a self-join of it reads its relation
+    // on both sides, so the second side is cut by the collision rule.
     assert_eq!(
         segments("WITH c AS (SELECT id, g FROM t WHERE g > 0) SELECT id FROM c"),
-        2
+        1
     );
     assert_eq!(
         segments("WITH c AS (SELECT id, g FROM t WHERE g > 0) SELECT c.id, d.g FROM c JOIN c AS d ON c.id = d.id"),
-        3
+        2
     );
 
     // Column aliases name the reference, and a later CTE sees an earlier one.
@@ -433,7 +435,7 @@ fn a_cte_is_a_shared_subtree_read_through_aliases() {
         &cat,
         "WITH c(x, y) AS (SELECT id, g FROM t WHERE g > 0), e AS (SELECT * FROM c) SELECT y, x FROM e",
     );
-    assert_eq!(view_count(&chain), 2);
+    assert_eq!(view_count(&chain), 1);
     assert_eq!(&output_shape(&chain), &sh(&[("y", false, false), ("x", false, false)]));
 
     // A CTE is visible to a subquery's inner relation.

@@ -8,9 +8,8 @@ fn u64_table(cols: &[&str], pk: &[u32]) -> Arc<RelDescriptor> {
     crate::test_support::table(1, cols.iter().map(|n| col(n, TypeCode::U64)).collect(), pk.to_vec())
 }
 
-/// The rows reply of `sql` against `desc`, read as relation `t`, for a worker walking
-/// in PK order when `walks_in_pk_order`.
-fn rows_reply_of(sql: &str, desc: &Arc<RelDescriptor>, walks_in_pk_order: bool) -> RowsReply {
+/// The rows reply of `sql` against `desc`, read as relation `t`.
+fn rows_reply_of(sql: &str, desc: &Arc<RelDescriptor>) -> RowsReply {
     let q = crate::test_support::parse_query(sql);
     let cat = crate::test_support::catalog(vec![("t", Arc::clone(desc))]);
     let read = crate::hir::bind_adhoc_read(&cat, &q).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
@@ -21,8 +20,7 @@ fn rows_reply_of(sql: &str, desc: &Arc<RelDescriptor>, walks_in_pk_order: bool) 
     else {
         panic!("`{sql}` is not a rows read");
     };
-    rows.reply(walks_in_pk_order)
-        .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
+    rows
 }
 
 /// Column `c`'s region: its place in the key region, then in the payload.
@@ -40,8 +38,8 @@ fn region(s: &SchemaDescriptor, c: u16) -> usize {
 /// each column copied in place, ships no program, wherever the key stands and
 /// whatever the columns are called. The worker sorts its input — the program's
 /// output, or the relation — on the region the client sorts the reply on, in the
-/// same direction, and a worker walking in PK order ranks nothing for keys ascending
-/// a leading run of the PK.
+/// same direction, and keys ascending a leading run of the PK are ones a walk in PK
+/// order already yields.
 #[test]
 fn a_rows_reply_numbers_the_select_list_over_the_relations_regions() {
     let t = u64_table(&["id", "v", "w"], &[0]);
@@ -84,7 +82,7 @@ fn a_rows_reply_numbers_the_select_list_over_the_relations_regions() {
         (&t,   "SELECT * FROM t ORDER BY v + 1",             true,  "id v w [_order0]", &[0], "[_order0]", false),
     ];
     for &(desc, sql, mapped, cols, key, order_cols, pk_ordered) in cases {
-        let r = rows_reply_of(sql, desc, false);
+        let r = rows_reply_of(sql, desc);
         let name = |c: usize| {
             let c = &r.schema.columns()[c];
             match c.is_hidden {
@@ -121,8 +119,7 @@ fn a_rows_reply_numbers_the_select_list_over_the_relations_regions() {
                 assert_eq!(region(relation, c as u16), region(reply, to as u16), "`{sql}`");
             }
         }
-        let walked = rows_reply_of(sql, desc, true);
-        assert_eq!(walked.sink_order.is_empty(), pk_ordered, "`{sql}`");
+        assert_eq!(r.pk_ordered, pk_ordered, "`{sql}`");
     }
 }
 
@@ -140,7 +137,7 @@ fn an_identity_select_list_replies_under_the_relations_schema() {
         ("SELECT v, w FROM t", false),
         ("SELECT * FROM t ORDER BY v + 1", false),
     ] {
-        let r = rows_reply_of(sql, &t, false);
+        let r = rows_reply_of(sql, &t);
         assert_eq!(Arc::ptr_eq(&r.schema, &t.schema), shared, "`{sql}`");
     }
 }

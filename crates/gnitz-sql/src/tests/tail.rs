@@ -1,46 +1,16 @@
 use super::*;
-use crate::test_support::{assert_rejects, col, parse_expr_sql, parse_query, rejected};
-use gnitz_wire::TypeCode;
+use crate::test_support::{assert_rejects, parse_expr_sql, parse_query, rejected};
 
 /// The ORDER BY keys of `q`.
 fn keys_of(q: &sqlparser::ast::Query) -> Vec<OrderKey<'_>> {
     parse_order_by(q.order_by.as_ref()).unwrap()
 }
 
-/// A hidden leading key, then `a`, `b`, `c`.
-fn hidden_led() -> Vec<ColumnDef> {
-    vec![
-        col("_group_pk", TypeCode::U128).hidden(),
-        col("a", TypeCode::I64),
-        col("b", TypeCode::I64),
-        col("c", TypeCode::I64),
-    ]
-}
-
-/// A position counts the visible columns only, in its range as in its target.
+/// NULLs sort last ascending and first descending unless placed.
 #[test]
-fn a_position_names_a_visible_column() {
-    let cols = hidden_led();
-    let q = parse_query("SELECT * FROM t ORDER BY 1, 3");
-    assert_eq!(key_slots(&keys_of(&q), &cols, []).unwrap(), vec![1, 3]);
-    for pos in [0, 4] {
-        let q = parse_query(&format!("SELECT * FROM t ORDER BY {pos}"));
-        assert_eq!(
-            rejected(key_slots(&keys_of(&q), &cols, [])),
-            format!("ORDER BY position {pos} is out of range (1..=3)")
-        );
-    }
-}
-
-/// Expression keys take their placements in order, positions their visible
-/// column; NULLs sort last ascending and first descending unless placed.
-#[test]
-fn each_key_sorts_on_its_slot_in_its_direction() {
-    let cols = hidden_led();
+fn each_key_sorts_in_its_direction() {
     let q = parse_query("SELECT * FROM t ORDER BY a + 1, 2, b + 1 DESC, c ASC NULLS FIRST, 1 DESC NULLS LAST");
     let keys = keys_of(&q);
-    assert_eq!(order_exprs(&keys).len(), 3);
-    assert_eq!(key_slots(&keys, &cols, [7, 5, 6]).unwrap(), [7, 2, 5, 6, 1]);
     let dirs: Vec<_> = keys.iter().map(|k| (k.desc, k.nulls_first)).collect();
     assert_eq!(
         dirs,
@@ -52,7 +22,6 @@ fn each_key_sorts_on_its_slot_in_its_direction() {
             (true, false)
         ]
     );
-    assert!(matches!(key_slots(&keys, &cols, [7]), Err(GnitzSqlError::Internal(_))));
 }
 
 /// The key list is capped at what the wire carries.

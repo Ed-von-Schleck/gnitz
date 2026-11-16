@@ -26,9 +26,9 @@ pub(super) struct EmitPieces {
 #[derive(Default)]
 pub(super) struct ViewChain {
     segments: Vec<PlannedView>,
-    /// Each subtree bind shares as one `Rc` — a CTE read through `Alias`es, a
-    /// window input read directly and through `Alias`es — cut once. Every reader
-    /// of a shared subtree reads all its columns.
+    /// Each subtree a spine has cut, by `Rc`. One bind shares — a CTE read through
+    /// `Alias`es, a window input read directly and through `Alias`es — is cut once,
+    /// with all its columns.
     pub(super) cuts: HashMap<*const RelExpr, SegInput>,
 }
 

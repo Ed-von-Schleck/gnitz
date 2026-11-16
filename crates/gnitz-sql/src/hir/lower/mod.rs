@@ -6,10 +6,10 @@
 //! The rules every shell obeys, one home each:
 //!
 //! * input spine — `spine::open` / `Spine::emit`;
-//! * segment cut — [`cut_segment`];
+//! * segment cut — `Peeled::open`, [`cut_segment`];
 //! * source collision — [`materialize`];
 //! * reduce derivation — [`resolve_reduce_specs`], [`keyed_frame`];
-//! * the WHERE and projection above a core — `Demand::emit`;
+//! * the linear levels above a core — `spine::peel` / `spine::emit_over`;
 //! * addressing — `physical::Frame`, [`project_front`].
 
 mod chain;
@@ -21,8 +21,8 @@ mod reduce;
 mod setop;
 mod spine;
 
-use super::physical::{self, Frame, Rename, Slot};
-use super::{AggCol, ColId, HirCol, HirExpr, ProjEntry, RelExpr, col_by_id, split_filter};
+use super::physical::{self, Frame, Slot};
+use super::{AggCol, ColId, ColSet, HirCol, HirExpr, ProjEntry, RelExpr, col_by_id};
 use crate::agg::group_pk_def;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
@@ -30,7 +30,6 @@ use chain::{EmitPieces, ViewChain};
 use gnitz_core::{PlannedView, RelDescriptor, Schema};
 use gnitz_expr::ReduceOutSlot;
 use gnitz_wire::{AggDescriptor, ColumnDef, GroupAggs};
-use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -92,47 +91,11 @@ fn keyed_frame(
     Frame::new(lead.chain(tail), npk)
 }
 
-/// The downstream demand on a combine's output: the final projection and the
-/// WHERE over the node — whatever predicate placement left above it.
-#[derive(Clone, Copy)]
-struct Demand<'a> {
-    items: &'a [ProjEntry],
-    where_preds: &'a [HirExpr],
-}
-
-impl Demand<'_> {
-    /// Every `ColId` the demand reads, into `out`.
-    fn refs(&self, out: &mut HashSet<ColId>) {
-        collect_live_cols(self.items.iter().map(|i| &i.expr).chain(self.where_preds), out);
-    }
-
-    /// The WHERE, then the projection, over the already-emitted `node` whose rows
-    /// `frame` addresses.
-    fn emit(
-        &self,
-        cb: &mut gnitz_wire::Circuit,
-        node: gnitz_wire::NodeId,
-        frame: &Frame,
-    ) -> Result<(gnitz_wire::NodeId, Frame), GnitzSqlError> {
-        let filtered = filter(cb, node, &frame.resolve_preds(self.where_preds)?, &frame.schema)?;
-        project_front(cb, filtered, self.items, frame)
-    }
-}
-
 /// A source a spine reads, with the frame its references resolve against.
 #[derive(Clone)]
 struct SegInput {
     src: SegSource,
     frame: Frame,
-}
-
-impl SegInput {
-    fn renamed(self, rename: &Rename) -> Result<SegInput, GnitzSqlError> {
-        Ok(SegInput {
-            frame: self.frame.renamed(rename)?,
-            src: self.src,
-        })
-    }
 }
 
 /// Where a [`SegInput`]'s rows come from.
@@ -166,7 +129,7 @@ impl SegSource {
 /// Insert every `ColId` referenced anywhere in `exprs` into `live` — the
 /// one home for "which columns does this expression set demand", used to prune a
 /// cut input's segment to exactly the columns its parent reads.
-fn collect_live_cols<'a>(exprs: impl IntoIterator<Item = &'a HirExpr>, live: &mut HashSet<ColId>) {
+fn collect_live_cols<'a>(exprs: impl IntoIterator<Item = &'a HirExpr>, live: &mut ColSet) {
     for e in exprs {
         e.for_each_ref(&mut |id| {
             live.insert(*id);
@@ -210,99 +173,46 @@ pub(crate) fn lower(rel: Rc<RelExpr>, names: &[HirCol]) -> Result<(Vec<PlannedVi
     Ok(chain.finish(top, Arc::new(schema)))
 }
 
-/// `rel` as `Project?(Filter?(core))`: the Project's items, the Filter's
-/// predicates (empty without one), and the core below them.
-fn peel(rel: &Rc<RelExpr>) -> (Option<&[ProjEntry]>, &[HirExpr], &Rc<RelExpr>) {
-    let (items, below) = match rel.as_ref() {
-        RelExpr::Project { input, items } => (Some(items.as_slice()), input),
-        _ => (None, rel),
-    };
-    let (preds, core) = split_filter(below);
-    (items, preds, core)
-}
-
-/// Lower a complete view body to circuit pieces.
+/// Lower a complete view body to circuit pieces: its linear levels over one
+/// combine, in that combine's circuit, or over one source.
 fn lower_body(chain: &mut ViewChain, rel: &Rc<RelExpr>) -> Result<EmitPieces, GnitzSqlError> {
-    let (items, preds, core) = peel(rel);
-    let above = items.map(|items| Demand { items, where_preds: preds });
-    let no_arm = || GnitzSqlError::Internal("HIR lowering has no body arm for this node".into());
-    let mut pieces = match (above, core.as_ref()) {
-        (None, _) if !preds.is_empty() => return Err(no_arm()),
-        (Some(above), RelExpr::Join { left, right, kind, on, plan }) => {
-            return join::lower_join_view(chain, above, [left, right], *kind, on, *plan);
+    let live: ColSet = match rel.as_ref() {
+        RelExpr::Project { items, .. } => items.iter().map(|it| it.out.id).collect(),
+        _ => rel.cols().iter().map(|c| c.id).collect(),
+    };
+    let peeled = spine::peel(rel, &live);
+    let core = peeled.bottom;
+    let mut pieces = match (peeled.owns_bottom(), core.as_ref()) {
+        (true, RelExpr::Join { left, right, kind, on }) => {
+            return join::lower_join_view(chain, peeled, [left, right], *kind, on);
         }
-        (Some(_), RelExpr::Reduce { input, group_cols, aggs }) => reduce::lower_reduce(chain, input, group_cols, aggs)?,
-        (_, RelExpr::Ordered { input, partition, order, op }) => {
+        (true, RelExpr::Reduce { input, group_cols, aggs }) => reduce::lower_reduce(chain, input, group_cols, aggs)?,
+        (true, RelExpr::Ordered { input, partition, order, op }) => {
             ordered::lower_ordered(chain, input, partition, order, op)?
         }
-        (_, RelExpr::Distinct { .. } | RelExpr::SetOp { .. }) => setop::lower_setop(chain, core)?,
-        (Some(above), _) => return spine::lower_linear(chain, rel, above.items),
-        (None, _) => return Err(no_arm()),
+        (true, RelExpr::Distinct { .. } | RelExpr::SetOp { .. }) => setop::lower_setop(chain, core)?,
+        _ => return spine::lower_linear(peeled.open(chain)?),
     };
-    // The shell's circuit ends in its core node, which `above` reads.
-    if let Some(above) = above {
-        let node = pieces.circuit.out();
-        pieces.out = above.emit(&mut pieces.circuit, node, &pieces.out)?.1;
-    }
+    // The body's circuit ends in its core node, which the levels read.
+    let node = pieces.circuit.out();
+    pieces.out = spine::emit_over(&mut pieces.circuit, &peeled.levels, node, pieces.out)?.1;
     Ok(pieces)
-}
-
-/// `Project?(Filter?(Join | Reduce | Ordered | Distinct | SetOp))`: what a
-/// shell lowers as one body.
-fn lowered_whole(rel: &Rc<RelExpr>) -> bool {
-    matches!(
-        peel(rel).2.as_ref(),
-        RelExpr::Join { .. }
-            | RelExpr::Reduce { .. }
-            | RelExpr::Ordered { .. }
-            | RelExpr::Distinct { .. }
-            | RelExpr::SetOp { .. }
-    )
-}
-
-/// `input` read in place: a catalog `Get`, or a rename of what is read in place.
-/// An alias renames its input's source, which is cut whole when it is not read
-/// in place.
-fn resolve_in_place(chain: &mut ViewChain, input: &Rc<RelExpr>) -> Result<Option<SegInput>, GnitzSqlError> {
-    match input.as_ref() {
-        RelExpr::Get { desc, cols } => Ok(Some(SegInput {
-            src: SegSource::Catalog(Arc::clone(desc)),
-            frame: Frame::scan(desc, cols),
-        })),
-        RelExpr::Project { input, items } => {
-            let Some(rename) = Rename::of(items) else {
-                return Ok(None);
-            };
-            resolve_in_place(chain, input)?
-                .map(|seg| seg.renamed(&rename))
-                .transpose()
-        }
-        RelExpr::Alias { input: inner, cols } => {
-            let inner_cols = inner.cols();
-            let seg = match resolve_in_place(chain, inner)? {
-                Some(seg) => seg,
-                None => cut_segment(chain, inner, &inner_cols.iter().map(|c| c.id).collect())?,
-            };
-            seg.renamed(&Rename::alias(&inner_cols, cols)).map(Some)
-        }
-        _ => Ok(None),
-    }
 }
 
 /// Cut `rel` to a fresh hidden segment pruned to `live`, never one [`cut_segment`]
 /// already made.
-fn materialize(chain: &mut ViewChain, rel: &Rc<RelExpr>, live: &HashSet<ColId>) -> Result<SegInput, GnitzSqlError> {
+fn materialize(chain: &mut ViewChain, rel: &Rc<RelExpr>, live: &ColSet) -> Result<SegInput, GnitzSqlError> {
     let body = as_body(rel, live);
     let pieces = lower_body(chain, &body)?;
     Ok(chain.add_segment(pieces))
 }
 
 /// Cut a subtree to a hidden segment pruned to `live`, once per subtree.
-fn cut_segment(chain: &mut ViewChain, subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Result<SegInput, GnitzSqlError> {
+fn cut_segment(chain: &mut ViewChain, subtree: &Rc<RelExpr>, live: &ColSet) -> Result<SegInput, GnitzSqlError> {
     let key = Rc::as_ptr(subtree);
     if let Some(cached) = chain.cuts.get(&key) {
         debug_assert!(
-            live.iter().all(|id| cached.frame.layout.contains(&Some(*id))),
+            live.iter().all(|id| cached.frame.layout.contains(&Some(id))),
             "a shared subtree's segment holds every column a later reader needs"
         );
         return Ok(cached.clone());
@@ -316,10 +226,10 @@ fn cut_segment(chain: &mut ViewChain, subtree: &Rc<RelExpr>, live: &HashSet<ColI
 /// live items, a clamp, set operation, top-N or window is cut with every column
 /// and no map over it, and anything else is wrapped in a projection of its live
 /// columns.
-fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
+fn as_body(subtree: &Rc<RelExpr>, live: &ColSet) -> Rc<RelExpr> {
     match subtree.as_ref() {
         RelExpr::Project { input, items } => {
-            let narrowed: Vec<ProjEntry> = items.iter().filter(|it| live.contains(&it.out.id)).cloned().collect();
+            let narrowed: Vec<ProjEntry> = items.iter().filter(|it| live.contains(it.out.id)).cloned().collect();
             if narrowed.len() == items.len() {
                 Rc::clone(subtree)
             } else {
@@ -329,7 +239,7 @@ fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
         RelExpr::Distinct { .. } | RelExpr::SetOp { .. } | RelExpr::Ordered { .. } => Rc::clone(subtree),
         // The HIR spelling of `SELECT <live cols> FROM <subtree>`.
         _ => {
-            let items = ProjEntry::passthroughs(subtree.cols().iter().filter(|c| live.contains(&c.id)).cloned());
+            let items = ProjEntry::passthroughs(subtree.cols().iter().filter(|c| live.contains(c.id)).cloned());
             RelExpr::project(Rc::clone(subtree), items)
         }
     }

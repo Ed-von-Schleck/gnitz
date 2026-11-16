@@ -107,7 +107,7 @@ fn each_conjunct_is_placed_as_low_as_it_is_exact() {
         ),
         (
             "SELECT t.id FROM t JOIN (SELECT uid, a FROM u) d ON t.a = d.a WHERE d.uid > 1",
-            "Join[eq=1](t, Filter[1](Project(u)))",
+            "Join[eq=1](t, Filter[1](u))",
         ),
     ] {
         assert_eq!(tree(sql), want, "{sql}");

@@ -27,7 +27,7 @@ use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::FoldFinish;
 use crate::exec::client_map::ClientMap;
 use crate::exec::order::ResultCut;
-use crate::hir::{AdhocRead, AdhocRows, AdhocShape, FoldPieces, RowsReply, bind_adhoc_read};
+use crate::hir::{AdhocRead, AdhocShape, FoldPieces, RowsReply, bind_adhoc_read};
 use crate::project::compute_map;
 use crate::tail::extract_limit_offset;
 use crate::validate::{QueryEnvelope, reject_unhonored_query_clauses};
@@ -202,15 +202,23 @@ pub(crate) fn plan_read(query: &Query, cat: &dyn Catalog) -> Result<ReadPlan, Gn
                 program,
                 order,
                 sink_order,
+                pk_ordered,
                 copied,
-            } = rows.reply(in_pk_order)?;
+                ..
+            } = rows;
             // OFFSET+LIMIT logical rows; an OFFSET with no LIMIT cuts nothing.
             let worker_cut = slice
                 .end()
                 .and_then(NonZeroU64::new)
                 // A worker walking in the order asked for meets its smallest rows
                 // first, so it stops at the slice's end instead of ranking every row.
-                .map(|k| RowsCut { k, order: sink_order });
+                .map(|k| RowsCut {
+                    k,
+                    order: match in_pk_order && pk_ordered {
+                        true => Vec::new(),
+                        false => sink_order,
+                    },
+                });
             let sink = ReadSink {
                 map: program.map(|p| compute_map(p, &schema)),
                 kind: SinkKind::Rows { cut: worker_cut },
@@ -235,7 +243,7 @@ fn walks_in_pk_order(bound: &ReadBound, pk_cols: &[u32]) -> bool {
 
 /// A FROM-less SELECT's one row, finished at plan time: `rows` over the global ground
 /// row. One row sorts to itself, so its order is dropped.
-fn plan_constant(rows: AdhocRows) -> Result<(Arc<Schema>, ZSetBatch), GnitzSqlError> {
+fn plan_constant(rows: RowsReply) -> Result<(Arc<Schema>, ZSetBatch), GnitzSqlError> {
     let (mut map, _) = ClientMap::over(rows)?;
     let mut ground_row = ZSetBatch::with_capacity(map.src(), 1);
     BatchAppender::new(&mut ground_row).add_row(gnitz_wire::global_group_key(), 1);

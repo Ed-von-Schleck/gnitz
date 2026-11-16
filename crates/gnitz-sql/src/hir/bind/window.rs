@@ -50,7 +50,7 @@ use crate::bind::{LeafBinder, bind_conjuncts, bind_structural};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, LeafTyping};
 use crate::rules::{find_unique_column, reject_float_key};
-use crate::tail::parse_order_key;
+use crate::tail::{OrderKey, parse_order_key};
 use gnitz_wire::{ColType, ColumnDef, TypeCode};
 use sqlparser::ast::{
     Expr, Function, Ident, NamedWindowDefinition, NamedWindowExpr, OrderByExpr, Select, WindowFrame, WindowFrameBound,
@@ -61,17 +61,18 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// A view body's SELECT list over the relation `rel` builds, with the item each
-/// ORDER BY key sorts on. Window calls in the list, in the ORDER BY keys and in
-/// QUALIFY are found by binding them; a body holding one is desugared. `leaf` is the body's own item leaf; `ctx` names the surface.
+/// A view body's SELECT list over the relation `rel` builds, with the column each
+/// of `order` sorts on. Window calls in the list, in the ORDER BY keys and in
+/// QUALIFY are found by binding them; a body holding one is desugared. `leaf` is
+/// the body's own item leaf; `ctx` names the surface.
 pub(super) fn bind_view_select_list<L: ItemLeaf>(
     ids: &ColIdGen,
     select: &Select,
     rel: impl FnOnce() -> Result<Rc<RelExpr>, GnitzSqlError>,
     leaf: &L,
     ctx: &str,
-    order_exprs: &[&Expr],
-) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
+    order: &[OrderKey<'_>],
+) -> Result<(Rc<RelExpr>, Vec<OrderCol>), GnitzSqlError> {
     if let Some(name) = gnitz_wire::first_duplicate(select.named_window.iter().map(|d| d.0.value.as_str())) {
         return Err(GnitzSqlError::Rejected(format!("WINDOW clause defines '{name}' twice")));
     }
@@ -84,7 +85,7 @@ pub(super) fn bind_view_select_list<L: ItemLeaf>(
         aliases: &[],
     };
     let mut items = bind_projection(&select.projection, &over, ids, ctx)?;
-    let placed = place_order_keys(order_exprs, &mut items, ids, &over)?;
+    let order = place_order_keys(order, &mut items, ids, &over)?;
     let qualify = match &select.qualify {
         Some(q) => bind_conjuncts(q, &WindowLeaf { aliases: &items, ..over }).map_err(|e| e.in_clause("QUALIFY"))?,
         None => Vec::new(),
@@ -97,9 +98,9 @@ pub(super) fn bind_view_select_list<L: ItemLeaf>(
                 "QUALIFY needs a window function in the SELECT list or in the QUALIFY predicate".into(),
             ));
         }
-        return Ok((leaf.project(rel, items)?, placed));
+        return Ok((leaf.project(rel, items)?, order));
     }
-    Ok((desugar(ids, rel, leaf, items, qualify, win)?, placed))
+    Ok((desugar(ids, rel, leaf, items, qualify, win)?, order))
 }
 
 // ── Binding ─────────────────────────────────────────────────────────────────────

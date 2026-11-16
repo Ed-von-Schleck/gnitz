@@ -2,9 +2,10 @@
 final view reads by name.
 
 A CTE, a derived table and an inline set-op or join side are three spellings of
-one bound tree, and the lowering — not the spelling — decides what is cut. So
-the facts here are: a cut body answers exactly as the uncut one, any body may be
-cut, any operator may read a cut segment, and a name crossing a cut resolves
+one bound tree, and the lowering — not the spelling — decides what is cut: a
+filter or projection over a relation fuses into its reader whatever the
+spelling. So the facts here are: a fused body answers as the inline one, any
+body may be cut, any operator may read a cut segment, and a name crossing a cut resolves
 against what the segment exposes. A chain of cuts over existing rows backfilling
 in dependency order is schema_lifetime's; an outer join inside a cut is
 test_outer_join.py's.
@@ -33,18 +34,18 @@ def _filter_into_join(t, u):
 
 # view -> (body, the columns it is read by, its bag over t and u as {id: (a, b)}).
 _VIEWS = {
-    # The filter feeding a join as a CTE and as a derived table (both cut), and as
-    # a pass-through CTE with the predicate in the final and one inline body
-    # (neither cut).
-    "cut_cte": ("WITH d AS (SELECT id, a FROM t WHERE a > 100) "
-                "SELECT d.id AS did, u.b AS ub FROM d JOIN u ON d.id = u.id",
-                ("did", "ub"), _filter_into_join),
-    "cut_derived": ("SELECT d.id AS did, u.b AS ub FROM (SELECT id, a FROM t WHERE a > 100) d "
-                    "JOIN u ON d.id = u.id", ("did", "ub"), _filter_into_join),
-    "uncut_pass_through": ("WITH d AS (SELECT * FROM t) SELECT d.id AS did, u.b AS ub "
-                           "FROM d JOIN u ON d.id = u.id WHERE d.a > 100", ("did", "ub"), _filter_into_join),
-    "uncut_inline": ("SELECT t.id AS did, u.b AS ub FROM t JOIN u ON t.id = u.id WHERE t.a > 100",
-                     ("did", "ub"), _filter_into_join),
+    # The filter feeding a join as a CTE, as a derived table, as a pass-through
+    # CTE with the predicate in the final, and inline: each fuses into the join's
+    # circuit.
+    "filter_cte": ("WITH d AS (SELECT id, a FROM t WHERE a > 100) "
+                   "SELECT d.id AS did, u.b AS ub FROM d JOIN u ON d.id = u.id",
+                   ("did", "ub"), _filter_into_join),
+    "filter_derived": ("SELECT d.id AS did, u.b AS ub FROM (SELECT id, a FROM t WHERE a > 100) d "
+                       "JOIN u ON d.id = u.id", ("did", "ub"), _filter_into_join),
+    "pass_through": ("WITH d AS (SELECT * FROM t) SELECT d.id AS did, u.b AS ub "
+                     "FROM d JOIN u ON d.id = u.id WHERE d.a > 100", ("did", "ub"), _filter_into_join),
+    "inline": ("SELECT t.id AS did, u.b AS ub FROM t JOIN u ON t.id = u.id WHERE t.a > 100",
+               ("did", "ub"), _filter_into_join),
     # Any body behind the cut.
     "body_set_op": ("WITH c AS (SELECT a FROM t UNION SELECT a FROM u) SELECT a FROM c",
                     ("a",), lambda t, u: _set(_t_a(t) + _t_a(u))),

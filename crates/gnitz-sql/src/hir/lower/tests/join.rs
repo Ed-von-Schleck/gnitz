@@ -26,7 +26,7 @@ enum Shape {
 /// Every `join_keep` rule over left `(v, id, k, x)` keyed on `id` and right
 /// `(id, k, y, w)` keyed on `(w, id)`, joined by `l.k = r.k` (Equi), `l.x <= r.y`
 /// (PureRange), both (Band), or neither (Cross). `reads` are the `(side, slot)`s the
-/// demand reads; a Mark join's demand also reads its mark column.
+/// levels above the join read; a Mark join's also read its mark column.
 #[test]
 fn join_keep_rules() {
     let ids = ColIdGen::new();
@@ -44,7 +44,7 @@ fn join_keep_rules() {
         cols: [col(0, 3), col(1, 2)],
         ty: TypeCode::U64.into(),
     };
-    /// The shape, the kind, the demand's reads, and each side's keep list and
+    /// The shape, the kind, what is read above the join, and each side's keep list and
     /// pinned PK arity.
     type Case = (Shape, JoinType, &'static [(usize, usize)], [(&'static [u32], usize); 2]);
     #[rustfmt::skip]
@@ -62,26 +62,26 @@ fn join_keep_rules() {
         // A decorrelated kind has a ν over its left and pins that side alone.
         (Band,  Semi,  &[], [(&[1, 2, 3], 1), (&[], 0)]),
         (PureRange, Anti,  &[], [(&[1, 3], 1), (&[], 0)]),
-        // The pinned PK leads even ahead of a lower demanded slot, and appears once.
+        // The pinned PK leads even ahead of a lower slot read above, and appears once.
         (Band,  Left,  &[(0, 0), (0, 1)], [(&[1, 0, 2, 3], 1), (&[3, 0], 2)]),
         (Band,  Left,  &[(1, 1)], [(&[1, 2, 3], 1), (&[3, 0, 1], 2)]),
-        // Rule 5: a side with a ν that keeps nothing keeps column 0; one without keeps nothing.
-        (Equi, Left,  &[], [(&[0], 0), (&[], 0)]),
-        (Equi, Right, &[], [(&[], 0), (&[0], 0)]),
-        (Equi, Full,  &[], [(&[0], 0), (&[0], 0)]),
-        (Equi, Mark(mark), &[], [(&[0], 0), (&[], 0)]),
+        // An equi side keeps only what is read above the join; its ν is a linear difference.
+        (Equi, Left,  &[], [(&[], 0), (&[], 0)]),
+        (Equi, Right, &[], [(&[], 0), (&[], 0)]),
+        (Equi, Full,  &[], [(&[], 0), (&[], 0)]),
+        (Equi, Mark(mark), &[], [(&[], 0), (&[], 0)]),
         (Equi, Mark(mark), &[(0, 3)], [(&[3], 0), (&[], 0)]),
         (Equi, Left,  &[(0, 3)], [(&[3], 0), (&[], 0)]),
-        // Rules 1 + 2 decide alone; a join reading nothing keeps left column 0.
         (Equi, Inner, &[(1, 3)], [(&[], 0), (&[3], 0)]),
-        (Equi, Inner, &[], [(&[0], 0), (&[], 0)]),
+        (Equi, Inner, &[], [(&[], 0), (&[], 0)]),
     ];
     for &(shape, kind, reads, want) in cases {
         let class = JoinClass {
             eq: matches!(shape, Equi | Band).then_some(eq).into_iter().collect(),
             range: matches!(shape, Band | PureRange).then_some((range, RangeRel::Le)),
         };
-        let plan = class.plan(kind).unwrap();
+        class.admit(kind).unwrap();
+        let plan = class.plan();
         let planned = match plan {
             JoinPlan::Equi => Equi,
             JoinPlan::Band(_) => Band,
@@ -89,12 +89,12 @@ fn join_keep_rules() {
             JoinPlan::Cross => Cross,
         };
         assert_eq!(planned, shape);
-        let refs: HashSet<ColId> = reads
+        let refs: ColSet = reads
             .iter()
             .map(|&(side, slot)| col(side, slot))
             .chain(matches!(kind, Mark(_)).then_some(mark))
             .collect();
-        let got = join_keep(&refs, &class, kind, plan, &frames).unwrap();
+        let got = join_keep(&refs, &class, kind, out_key(plan, kind), &frames).unwrap();
         let got = got.each_ref().map(|(keep, pa)| (keep.as_slice(), *pa));
         assert_eq!(got, want, "{shape:?} {kind:?} reads={reads:?}");
     }

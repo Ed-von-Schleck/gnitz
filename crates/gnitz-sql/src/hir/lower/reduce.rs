@@ -2,14 +2,13 @@
 //! reduce.
 
 use super::super::physical::Frame;
-use super::super::{AggCol, ColId, RelExpr, reduce_reads};
+use super::super::{AggCol, ColId, ColSet, RelExpr, reduce_reads};
 use super::super::{HirCol, ProjEntry};
 use super::spine::{Top, open};
 use super::{EmitPieces, ReduceSpecs, ViewChain, keyed_frame, project_front, resolve_reduce_specs};
 use crate::agg::agg_col_def;
 use crate::error::GnitzSqlError;
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, Circuit, NodeId};
-use std::collections::HashSet;
 use std::rc::Rc;
 
 /// Lower a `Reduce` of `input` to circuit pieces, whose frame addresses the raw
@@ -20,7 +19,7 @@ pub(super) fn lower_reduce(
     group_cols: &[ColId],
     aggs: &[AggCol],
 ) -> Result<EmitPieces, GnitzSqlError> {
-    let live: HashSet<ColId> = reduce_reads(group_cols, aggs).into_iter().collect();
+    let live: ColSet = reduce_reads(group_cols, aggs).into_iter().collect();
     let spine = open(chain, input, &live)?;
     let mut cb = Circuit::default();
     // The spine's output is what the reduce groups and aggregates over, so the
@@ -56,7 +55,7 @@ fn prune_to_reads(
     node: NodeId,
     frame: Frame,
     group_cols: &[ColId],
-    live: &HashSet<ColId>,
+    live: &ColSet,
 ) -> Result<(NodeId, Frame), GnitzSqlError> {
     let pk = frame.schema.pk_cols();
     // An ungrouped reduce pre-aggregates ahead of its exchange, and one grouped on
@@ -67,12 +66,12 @@ fn prune_to_reads(
     }
     let unread = (0..frame.layout.len())
         .filter(|&slot| !pk.contains(&(slot as u32)))
-        .any(|slot| !frame.layout[slot].is_some_and(|id| live.contains(&id)));
+        .any(|slot| !frame.layout[slot].is_some_and(|id| live.contains(id)));
     if !unread {
         return Ok((node, frame));
     }
     let items: Vec<ProjEntry> = (frame.layout.iter().zip(frame.schema.columns()))
-        .filter_map(|(id, def)| id.filter(|id| live.contains(id)).map(|id| (id, def)))
+        .filter_map(|(id, def)| id.filter(|&id| live.contains(id)).map(|id| (id, def)))
         .map(|(id, def)| ProjEntry::passthrough(HirCol::new(id, def.clone())))
         .collect();
     project_front(cb, node, &items, &frame)

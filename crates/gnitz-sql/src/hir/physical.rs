@@ -11,7 +11,6 @@ use crate::ir::{BExpr, BoundExpr};
 use crate::project::{compute_map, payload_program};
 use gnitz_core::{RelDescriptor, Schema};
 use gnitz_wire::{ColumnDef, ComputeMap};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 /// A frame slot: the identity that names it, if any, and its column.
@@ -144,40 +143,33 @@ impl Frame {
         Ok((Arc::new(schema), moved_to))
     }
 
-    /// This frame under `rename`'s identities. A slot it does not name loses its
-    /// identity.
-    pub(crate) fn renamed(&self, rename: &Rename) -> Result<Frame, GnitzSqlError> {
+    /// This frame under the identities of `items`, a projection that moves no data,
+    /// or `None` unless each item is a bare column and none reads a column twice. A
+    /// slot no item reads loses its identity.
+    pub(crate) fn relabeled(&self, items: &[ProjEntry]) -> Result<Option<Frame>, GnitzSqlError> {
         let mut layout = vec![None; self.layout.len()];
-        let mut columns = self.schema.columns().to_vec();
-        for (src, out) in &rename.0 {
-            let slot = self.slot(*src)?;
-            layout[slot] = Some(out.id);
-            columns[slot] = out.def.clone();
+        let mut columns: Option<Vec<ColumnDef>> = None;
+        for it in items {
+            let Some(src) = it.expr.as_col() else {
+                return Ok(None);
+            };
+            let slot = self.slot(src)?;
+            if layout[slot].is_some() {
+                return Ok(None);
+            }
+            layout[slot] = Some(it.out.id);
+            if self.schema.columns()[slot] != it.out.def {
+                columns.get_or_insert_with(|| self.schema.columns().to_vec())[slot] = it.out.def.clone();
+            }
         }
-        let schema = Schema::from_parts(columns, self.schema.pk_cols())
-            .map_err(|e| GnitzSqlError::Internal(format!("renamed schema: {e}")))?;
-        Ok(Frame { layout, schema: Arc::new(schema) })
-    }
-}
-
-/// A projection that moves no data: each output column is a distinct input
-/// column under a new identity.
-pub(crate) struct Rename(Vec<(ColId, HirCol)>);
-
-impl Rename {
-    /// `items` as a rename, `None` unless each is a bare column, no column twice.
-    pub(crate) fn of(items: &[ProjEntry]) -> Option<Rename> {
-        let mut seen = HashSet::new();
-        items
-            .iter()
-            .map(|it| Some((it.expr.as_col().filter(|id| seen.insert(*id))?, it.out.clone())))
-            .collect::<Option<_>>()
-            .map(Rename)
-    }
-
-    /// A relation's columns `inner` under `outer`, position by position.
-    pub(crate) fn alias(inner: &[HirCol], outer: &[HirCol]) -> Rename {
-        Rename(inner.iter().map(|c| c.id).zip(outer.iter().cloned()).collect())
+        let schema = match columns {
+            None => Arc::clone(&self.schema),
+            Some(columns) => Arc::new(
+                Schema::from_parts(columns, self.schema.pk_cols())
+                    .map_err(|e| GnitzSqlError::Internal(format!("relabeled schema: {e}")))?,
+            ),
+        };
+        Ok(Some(Frame { layout, schema }))
     }
 }
 

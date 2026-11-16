@@ -2,12 +2,11 @@
 //! order. Their input opens through the spine, so a projection over a relation
 //! read in place is not stored a second time beside the operator's index.
 
-use super::super::{AggCol, ColId, HirCol, OrderCol, OrderedOp, RelExpr};
+use super::super::{AggCol, ColId, ColSet, HirCol, OrderCol, OrderedOp, RelExpr};
 use super::spine::{Top, open};
 use super::{EmitPieces, ViewChain, keyed_frame, resolve_reduce_specs};
 use crate::error::GnitzSqlError;
 use gnitz_wire::{Circuit, OrderKey};
-use std::collections::HashSet;
 use std::rc::Rc;
 
 /// Lower an `Ordered` node over `input` to circuit pieces.
@@ -18,7 +17,7 @@ pub(super) fn lower_ordered(
     order: &[OrderCol],
     op: &OrderedOp,
 ) -> Result<EmitPieces, GnitzSqlError> {
-    let live: HashSet<ColId> = input.cols().iter().map(|c| c.id).collect();
+    let live: ColSet = input.cols().iter().map(|c| c.id).collect();
     let spine = open(chain, input, &live)?;
     let mut cb = Circuit::default();
     let (node, frame) = spine.emit(&mut cb, Top::Output)?;

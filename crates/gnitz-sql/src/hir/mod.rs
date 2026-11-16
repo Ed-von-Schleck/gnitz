@@ -56,7 +56,7 @@ pub(crate) fn bind_and_lower<'a>(
     let body_columns = names
         .iter()
         .filter(|c| !c.def.is_hidden)
-        .map(|c| c.def.name.to_string())
+        .map(|c| String::from(&*c.def.name))
         .collect();
     bind::apply_positional_aliases(aliases, names.iter_mut().map(|c| &mut c.def), stmt)?;
     let (segments, view) = lower::lower(rel, &names)?;
@@ -70,7 +70,7 @@ pub(crate) fn bind_and_lower<'a>(
 
 pub(crate) use bind::ranking_names;
 pub(crate) use lower::fold::FoldPieces;
-pub(crate) use lower::read::{AdhocRead, AdhocRows, AdhocShape, RowsReply};
+pub(crate) use lower::read::{AdhocRead, AdhocShape, RowsReply};
 
 /// The ad-hoc read path's entry to the same core: bind a query that reads one
 /// relation — its CTEs, then its body — and lower it to one read of that
@@ -97,8 +97,7 @@ pub(crate) fn bind_adhoc_read(
     let ids = ColIdGen::new();
     let mut cx = bind::BindCx::new(cat, &ids, bind::Surface::Adhoc);
     bind::bind_ctes(&mut cx, query)?;
-    let (rel, placed) = bind::bind_select(&cx, select, &crate::tail::order_exprs(&keys))?;
-    let order = bind::order_cols(&keys, &rel.cols(), &placed)?;
+    let (rel, order) = bind::bind_select(&cx, select, &keys)?;
     lower::read::lower_read(&rel, order, cx.refs.into_inner())
 }
 
@@ -107,7 +106,7 @@ pub(crate) fn bind_returning(
     projection: &[sqlparser::ast::SelectItem],
     desc: &Arc<RelDescriptor>,
     alias: &str,
-) -> Result<AdhocRows, GnitzSqlError> {
+) -> Result<RowsReply, GnitzSqlError> {
     let ids = ColIdGen::new();
     let (source, items) = bind::bind_returning(&ids, projection, &desc.schema, alias)?;
     lower::read::reply_rows(physical::Frame::scan(desc, &source), items, Vec::new())
@@ -132,6 +131,47 @@ impl ColIdGen {
         let id = ColId(self.0.get());
         self.0.set(id.0 + 1);
         id
+    }
+}
+
+/// A set of one bind's [`ColId`]s, a bit per id: [`ColIdGen`] mints them dense
+/// from 0.
+#[derive(Clone, Default)]
+pub(crate) struct ColSet(Vec<u64>);
+
+impl ColSet {
+    pub(crate) fn insert(&mut self, id: ColId) {
+        let word = id.0 as usize / 64;
+        if word >= self.0.len() {
+            self.0.resize(word + 1, 0);
+        }
+        self.0[word] |= 1 << (id.0 % 64);
+    }
+
+    pub(crate) fn contains(&self, id: ColId) -> bool {
+        self.0
+            .get(id.0 as usize / 64)
+            .is_some_and(|w| w >> (id.0 % 64) & 1 == 1)
+    }
+
+    /// The ids, ascending.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = ColId> + '_ {
+        (self.0.iter().enumerate())
+            .flat_map(|(w, &bits)| gnitz_wire::BitIter(bits).map(move |b| ColId((w * 64 + b) as u32)))
+    }
+}
+
+impl Extend<ColId> for ColSet {
+    fn extend<I: IntoIterator<Item = ColId>>(&mut self, ids: I) {
+        ids.into_iter().for_each(|id| self.insert(id));
+    }
+}
+
+impl FromIterator<ColId> for ColSet {
+    fn from_iter<I: IntoIterator<Item = ColId>>(ids: I) -> Self {
+        let mut set = ColSet::default();
+        set.extend(ids);
+        set
     }
 }
 
@@ -259,11 +299,9 @@ pub(crate) enum RelExpr {
         left: Rc<RelExpr>,
         right: Rc<RelExpr>,
         kind: JoinType,
-        /// The join's keys. Every other predicate was placed into an input or
-        /// left in a `Filter` above the join as it was built.
+        /// The join's keys, admitted for `kind`. Every other predicate was placed
+        /// into an input or left in a `Filter` above the join as it was built.
         on: JoinClass,
-        /// `on.plan(kind)`, decided as the node is built.
-        plan: JoinPlan,
     },
     /// A GROUP BY / aggregate reduce: the group columns, then the aggregate
     /// columns the finalize `Project` above renders.
@@ -285,8 +323,9 @@ pub(crate) enum RelExpr {
     /// to share.) `cols` is parallel to `input.cols()` and carries the same defs
     /// under new ids, so two aliases of one shared `input` are distinguishable
     /// by id wherever they meet (a self-join's two sides).
-    /// The lowering reads it through its input's source and materializes
-    /// nothing of its own.
+    /// The lowering fuses it into its reader as a rename of its input: over the
+    /// relation its input reads in place, or else over the one segment its input
+    /// is cut to.
     Alias {
         input: Rc<RelExpr>,
         cols: Vec<HirCol>,
@@ -351,6 +390,17 @@ pub(crate) struct OrderCol {
     pub col: ColId,
     pub desc: bool,
     pub nulls_first: bool,
+}
+
+impl OrderCol {
+    /// The written `key`'s direction and NULL placement on the column `col`.
+    pub(crate) fn of(key: &crate::tail::OrderKey<'_>, col: ColId) -> OrderCol {
+        OrderCol {
+            col,
+            desc: key.desc,
+            nulls_first: key.nulls_first,
+        }
+    }
 }
 
 /// One physical reduce column: the op, the column it reads (`None` for COUNT(*)),
@@ -610,26 +660,17 @@ pub(crate) struct JoinClass {
     pub range: Option<(KeyPair, RangeRel)>,
 }
 
-/// Which physical join a step's keys and kind call for; [`JoinClass::plan`]
-/// refuses every other pair. A pure range join has an empty `eq`, as a keyless
-/// one does.
+/// Which physical join a step's keys call for. A pure range join has an empty
+/// `eq`, as a keyless one does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinPlan {
     Equi,
     /// A range conjunct behind an equality prefix.
     Band(RangeRel),
     /// A range conjunct with no equality prefix.
-    PureRange(RangeRel, PureRangeKind),
+    PureRange(RangeRel),
     /// No key: INNER only.
     Cross,
-}
-
-/// The kinds a pure-range join exists in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PureRangeKind {
-    Inner,
-    Left,
-    Exists(ExistsKind),
 }
 
 impl JoinClass {
@@ -661,41 +702,36 @@ impl JoinClass {
         self.keys().map(|p| p.ty)
     }
 
-    /// The physical join a step of `kind` over these keys is, or the refusal of a
-    /// pair no emitter builds. Both refusals are ordinary SQL with a buildable
-    /// lowering; neither emitter was written.
-    pub(crate) fn plan(&self, kind: JoinType) -> Result<JoinPlan, GnitzSqlError> {
-        let rel = self.range.map(|(_, rel)| rel);
-        Ok(match (rel, self.eq.is_empty()) {
+    /// The physical join these keys call for.
+    pub(crate) fn plan(&self) -> JoinPlan {
+        match (self.range.map(|(_, rel)| rel), self.eq.is_empty()) {
             (None, false) => JoinPlan::Equi,
             (Some(rel), false) => JoinPlan::Band(rel),
-            (None, true) if kind == JoinType::Inner => JoinPlan::Cross,
-            (None, true) => {
-                return Err(GnitzSqlError::Rejected(
-                    "a LEFT/RIGHT/FULL JOIN or an EXISTS/IN correlation needs at least one equijoin \
-                     or range predicate between its two sides; only an INNER step (CROSS JOIN, a \
-                     comma-separated FROM, or JOIN … ON with no cross-table comparison) may be keyless."
-                        .into(),
-                ));
-            }
-            (Some(rel), true) => {
-                let kind = match (kind, kind.exists()) {
-                    (_, Some(e)) => PureRangeKind::Exists(e),
-                    (JoinType::Inner, None) => PureRangeKind::Inner,
-                    (JoinType::Left, None) => PureRangeKind::Left,
-                    (_, None) => {
-                        return Err(GnitzSqlError::Rejected(
-                            "pure-range RIGHT/FULL JOIN (a sole inequality range conjunct with no \
-                             equality prefix) is not supported; its mirror null-fill has no inner-join \
-                             witness on the preserved side. Use INNER/LEFT JOIN, or add an equality \
-                             conjunct to make it a band join."
-                                .into(),
-                        ));
-                    }
-                };
-                JoinPlan::PureRange(rel, kind)
-            }
-        })
+            (None, true) => JoinPlan::Cross,
+            (Some(rel), true) => JoinPlan::PureRange(rel),
+        }
+    }
+
+    /// Refuse a step of `kind` over these keys that no emitter builds. Both
+    /// refusals are ordinary SQL with a buildable lowering; neither emitter was
+    /// written.
+    pub(crate) fn admit(&self, kind: JoinType) -> Result<(), GnitzSqlError> {
+        match (self.plan(), kind) {
+            (JoinPlan::Cross, k) if k != JoinType::Inner => Err(GnitzSqlError::Rejected(
+                "a LEFT/RIGHT/FULL JOIN or an EXISTS/IN correlation needs at least one equijoin \
+                 or range predicate between its two sides; only an INNER step (CROSS JOIN, a \
+                 comma-separated FROM, or JOIN … ON with no cross-table comparison) may be keyless."
+                    .into(),
+            )),
+            (JoinPlan::PureRange(_), JoinType::Right | JoinType::Full) => Err(GnitzSqlError::Rejected(
+                "pure-range RIGHT/FULL JOIN (a sole inequality range conjunct with no \
+                 equality prefix) is not supported; its mirror null-fill has no inner-join \
+                 witness on the preserved side. Use INNER/LEFT JOIN, or add an equality \
+                 conjunct to make it a band join."
+                    .into(),
+            )),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -943,3 +979,7 @@ impl RelExpr {
 #[cfg(test)]
 #[path = "tests/hir.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "benches/hir.rs"]
+mod benches;

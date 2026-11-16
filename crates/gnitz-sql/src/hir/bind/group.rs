@@ -1,14 +1,16 @@
 //! GROUP BY / aggregate / HAVING binding: the reduce, the pre-map under it and
 //! the leaf its HAVING and SELECT list bind through.
 
-use super::super::{ColId, ColIdGen, HirAgg, HirCol, HirExpr, ProjEntry, RelExpr, col_by_id, hircol_of, reduce_reads};
+use super::super::{
+    ColId, ColIdGen, HirAgg, HirCol, HirExpr, OrderCol, ProjEntry, RelExpr, col_by_id, hircol_of, reduce_reads,
+};
 use super::{BindCx, ItemLeaf, ScopeLeaf, bind_select_list};
 use crate::agg::{AggArg, AggFunc};
 use crate::bind::{LeafBinder, bind_conjuncts, bind_structural};
 use crate::error::{GnitzSqlError, unsupported_clause};
 use crate::ir::{BExpr, LeafTyping};
 use crate::rules::reject_float_keys;
-use crate::tail::group_by_target;
+use crate::tail::{OrderKey, group_by_target};
 use gnitz_wire::{ColType, ColumnDef};
 use sqlparser::ast::{Expr, GroupByExpr, Select};
 use std::cell::RefCell;
@@ -159,15 +161,15 @@ fn distinct_arg(calls: &[HirAgg]) -> Result<Option<ColId>, GnitzSqlError> {
 }
 
 /// Bind the GROUP BY / aggregate / HAVING suffix over `input`, producing
-/// `Project(Filter_having?(Reduce(input)))`, plus the projection item each
-/// ORDER BY key of `surface` sorts on.
+/// `Project(Filter_having?(Reduce(input)))`, plus the column each of `order`
+/// sorts on.
 pub(super) fn bind_grouped_suffix(
     cx: &BindCx<'_>,
     select: &Select,
     input: Rc<RelExpr>,
     leaf: &ScopeLeaf<'_>,
-    order_exprs: &[&Expr],
-) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
+    order: &[OrderKey<'_>],
+) -> Result<(Rc<RelExpr>, Vec<OrderCol>), GnitzSqlError> {
     let ids = cx.ids;
     let mut pre = PreMap::new(ids, leaf.scope.combined.clone());
     let group_cols = resolve_group_cols(select, leaf, &mut pre)?;
@@ -208,7 +210,7 @@ pub(super) fn bind_grouped_suffix(
         };
         RelExpr::filter(RelExpr::reduce(input, group_cols.clone(), phys), having)
     };
-    bind_select_list(cx, select, rel, &grouped, "GROUP BY", order_exprs)
+    bind_select_list(cx, select, rel, &grouped, "GROUP BY", order)
 }
 
 /// What a grouped body's reduce computes, grown as its expressions bind.

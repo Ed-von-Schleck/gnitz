@@ -22,7 +22,8 @@ mod window;
 pub(crate) use window::ranking_names;
 
 use super::{
-    ColId, ColIdGen, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr, SetOpKind, col_by_id, schema_cols,
+    ColId, ColIdGen, HirCol, HirExpr, JoinType, OrderCol, ProjEntry, RelExpr, SetOpKind, col_by_id, hircol_of,
+    schema_cols,
 };
 use crate::ast_util::{
     body_is_grouped, col_ref_parts, is_agg_call, peel_nested, select_is_distinct, single_part_ident,
@@ -36,7 +37,7 @@ use crate::rules::{
     ClassWant, canonical_user_name, find_unique_column, has_visible_column, reject_duplicate_names, require_class,
     single_relation_col_idx,
 };
-use crate::tail::{OrderKey, extract_limit_offset, key_slots, order_exprs, parse_order_by};
+use crate::tail::{OrderKey, OrderTarget, extract_limit_offset, parse_order_by, reject_position_out_of_range};
 use crate::validate::{
     HonoredClauses, QueryEnvelope, reject_query_envelope_body, reject_unhonored_query_clauses,
     reject_unhonored_select_clauses,
@@ -60,7 +61,7 @@ use subquery::{SubqueryKind, SubqueryRef};
 
 /// Bind a query's CTEs ahead of its body. Each binds to one subtree registered
 /// under its name, which the body (and later CTEs) read through an
-/// [`RelExpr::Alias`] and the lowering cuts once. Scoping precedence as SQL
+/// [`RelExpr::Alias`]. Scoping precedence as SQL
 /// defines it: a CTE shadows a catalog name, a later CTE sees earlier ones, and
 /// one WITH list names each CTE once.
 /// `WITH RECURSIVE` has no builder, and a CTE's trailing FROM is refused.
@@ -143,13 +144,28 @@ pub(super) fn apply_positional_aliases<'a, 'b>(
     reject_duplicate_names(visible.iter().map(|c| &*c.name), &format!("{ctx} column aliases"))
 }
 
-/// The output column `e` names, if it names one. Only an unqualified name can:
-/// an output column belongs to no relation, so a qualified reference is left to
-/// the caller's scope, which checks the qualifier.
-fn output_column<'a>(e: &Expr, cols: impl IntoIterator<Item = &'a ColumnDef>) -> Result<Option<usize>, GnitzSqlError> {
-    match col_ref_parts(e) {
-        Some((None, name)) => find_unique_column(cols, name),
-        _ => Ok(None),
+/// The column of `cols` an ORDER BY key names — a 1-based position among the
+/// visible ones, or an unqualified visible name — else the expression it sorts on.
+/// Only an unqualified name can name an output column: an output column belongs to
+/// no relation, so a qualified reference is left to the caller's scope, which
+/// checks the qualifier.
+fn output_key<'e, 'c>(
+    target: &OrderTarget<'e>,
+    cols: impl Iterator<Item = &'c HirCol> + Clone,
+) -> Result<Result<ColId, &'e Expr>, GnitzSqlError> {
+    match *target {
+        OrderTarget::Position(pos) => {
+            let mut visible = cols.filter(|c| !c.def.is_hidden);
+            reject_position_out_of_range(pos, visible.clone().count(), "ORDER BY")?;
+            Ok(Ok(visible.nth(pos - 1).expect("a position in range").id))
+        }
+        OrderTarget::Expr(e) => Ok(match col_ref_parts(e) {
+            Some((None, name)) => match find_unique_column(cols.clone().map(|c| &c.def), name)? {
+                Some(at) => Ok({ cols }.nth(at).expect("a found column").id),
+                None => Err(e),
+            },
+            _ => Err(e),
+        }),
     }
 }
 
@@ -283,8 +299,12 @@ fn resolve_relation(cx: &BindCx<'_>, tref: &TableRef<'_>) -> Result<Rc<RelExpr>,
         Surface::View(v) => (ClassWant::ViewSource, v.stmt),
     };
     require_class(&rel, name, want, op)?;
-    let columns = (cx.surface.is_view() && tref.columns.is_empty())
-        .then(|| rel.schema.visible_columns().map(|(_, c)| c.name.to_string()).collect());
+    let columns = (cx.surface.is_view() && tref.columns.is_empty()).then(|| {
+        rel.schema
+            .visible_columns()
+            .map(|(_, c)| String::from(&*c.name))
+            .collect()
+    });
     cx.refs.borrow_mut().push(BoundRef {
         tid: rel.tid,
         name: name.to_string(),
@@ -329,50 +349,28 @@ impl<'a> QueryTail<'a> {
         }
     }
 
-    /// Wrap `rel` in the top-N this tail names. `placed` is the output slot of
-    /// each *expression* key, parallel to [`order_exprs`] of its keys; a positional key
-    /// names a visible output column.
-    fn wrap(&self, rel: Rc<RelExpr>, placed: &[usize]) -> Result<Rc<RelExpr>, GnitzSqlError> {
-        let order = order_cols(&self.keys, &rel.cols(), placed)?;
-        Ok(RelExpr::top_n(rel, Vec::new(), order, self.limit, self.offset))
+    /// Wrap `rel` in the top-N this tail names, sorted on `order`.
+    fn wrap(&self, rel: Rc<RelExpr>, order: Vec<OrderCol>) -> Rc<RelExpr> {
+        RelExpr::top_n(rel, Vec::new(), order, self.limit, self.offset)
     }
 
     /// [`Self::wrap`] over a body whose keys can only be its output columns — a
     /// set operation or a parenthesized query, which has no scope of its own.
     fn wrap_by_output(&self, rel: Rc<RelExpr>, stmt: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
         let cols = rel.cols();
-        let mut placed = Vec::new();
-        for e in order_exprs(&self.keys) {
-            match output_column(e, cols.iter().map(|c| &c.def))? {
-                Some(at) => placed.push(at),
-                None => {
-                    return Err(GnitzSqlError::Rejected(format!(
+        let order = (self.keys.iter())
+            .map(|key| {
+                let col = output_key(&key.target, cols.iter())?.map_err(|_| {
+                    GnitzSqlError::Rejected(format!(
                         "{stmt}: ORDER BY over a set operation names an output column or position"
-                    )));
-                }
-            }
-        }
-        self.wrap(rel, &placed)
+                    ))
+                })?;
+                Ok(OrderCol::of(key, col))
+            })
+            .collect::<Result<_, GnitzSqlError>>()?;
+        drop(cols);
+        Ok(self.wrap(rel, order))
     }
-}
-
-/// The output column each of `keys` sorts on, over a body whose columns are `cols`;
-/// `placed` is the column of each *expression* key, parallel to [`order_exprs`] of
-/// `keys`, and a positional key names a visible column.
-pub(super) fn order_cols(
-    keys: &[OrderKey<'_>],
-    cols: &[HirCol],
-    placed: &[usize],
-) -> Result<Vec<OrderCol>, GnitzSqlError> {
-    Ok(key_slots(keys, cols.iter().map(|c| &c.def), placed.iter().copied())?
-        .into_iter()
-        .zip(keys)
-        .map(|(at, key)| OrderCol {
-            col: cols[at].id,
-            desc: key.desc,
-            nulls_first: key.nulls_first,
-        })
-        .collect())
 }
 
 /// Bind a whole view query: its envelope checked, its CTEs, its body, then the
@@ -385,12 +383,12 @@ pub(super) fn bind_query(cx: &mut BindCx<'_>, query: &Query) -> Result<Rc<RelExp
     let tail = QueryTail::parse(query, cx.surface.stmt())?;
     match (query.body.as_ref(), tail) {
         (SetExpr::Select(select), tail) => {
-            let keyed: Vec<&Expr> = tail.as_ref().map(|t| order_exprs(&t.keys)).unwrap_or_default();
-            let (rel, placed) = bind_select(cx, select, &keyed)?;
-            match tail {
-                Some(t) => t.wrap(rel, &placed),
-                None => Ok(rel),
-            }
+            let keys = tail.as_ref().map_or(&[][..], |t| &t.keys);
+            let (rel, order) = bind_select(cx, select, keys)?;
+            Ok(match tail {
+                Some(t) => t.wrap(rel, order),
+                None => rel,
+            })
         }
         (body, None) => bind_body(cx, body),
         (body, Some(tail)) => {
@@ -417,8 +415,9 @@ fn bind_body(cx: &BindCx<'_>, body: &SetExpr) -> Result<Rc<RelExpr>, GnitzSqlErr
 
 /// Resolve one FROM table factor to `(subtree, alias, output cols)`: a table name
 /// to a `Get`, a CTE name to an `Alias` over its shared subtree, a derived table
-/// to its bound subquery, unshared. A column alias list renames the returned
-/// cols, keeping their `ColId`s; the subtree keeps its own names.
+/// to its bound subquery, unshared — collapsed onto its source when it only
+/// renames, as a CTE is. A column alias list renames the returned cols, keeping
+/// their `ColId`s; the subtree keeps its own names.
 fn resolve_table_factor(
     cx: &BindCx<'_>,
     factor: &TableFactor,
@@ -434,9 +433,12 @@ fn resolve_table_factor(
         // Silently dropping TABLESAMPLE would return all rows — a wrong result.
         reject_if(sample.is_some(), &ctx, "TABLESAMPLE")?;
         let body = reject_query_envelope_body(subquery, &ctx)?;
-        let subtree = bind_body(cx, body)?;
-        let mut cols = subtree.cols().into_owned();
-        apply_alias_columns(&alias.columns, cols.iter_mut().map(|c| &mut c.def), &ctx)?;
+        let (subtree, mut defs) = collapse_identity(bind_body(cx, body)?);
+        apply_alias_columns(&alias.columns, defs.iter_mut(), &ctx)?;
+        let cols = (subtree.cols().iter())
+            .zip(defs)
+            .map(|(c, def)| HirCol::new(c.id, def))
+            .collect();
         return Ok((subtree, alias.name.value.clone(), cols));
     }
     let tref = extract_table_ref(factor, cx.cat.schema_name(), cx.surface.stmt())?;
@@ -456,8 +458,8 @@ fn resolve_table_factor(
 pub(super) fn bind_select(
     cx: &BindCx<'_>,
     select: &Select,
-    order_exprs: &[&Expr],
-) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
+    order: &[OrderKey<'_>],
+) -> Result<(Rc<RelExpr>, Vec<OrderCol>), GnitzSqlError> {
     let (stmt, surface) = (cx.surface.stmt(), cx.surface);
     let grouped = body_is_grouped(select);
     let distinct = select_is_distinct(select);
@@ -533,14 +535,14 @@ pub(super) fn bind_select(
         left = RelExpr::filter(left, preds)?;
     }
     if grouped && !distinct {
-        return bind_grouped_suffix(cx, select, left, &leaf, order_exprs);
+        return bind_grouped_suffix(cx, select, left, &leaf, order);
     }
-    let (projected, placed) = bind_select_list(cx, select, || Ok(left), &leaf, ctx, order_exprs)?;
+    let (projected, order) = bind_select_list(cx, select, || Ok(left), &leaf, ctx, order)?;
     if !distinct {
-        return Ok((projected, placed));
+        return Ok((projected, order));
     }
-    reject_unselected_distinct_keys(&projected, &placed, ctx)?;
-    Ok((RelExpr::distinct(projected, "SELECT DISTINCT")?, placed))
+    reject_unselected_distinct_keys(&projected, &order, ctx)?;
+    Ok((RelExpr::distinct(projected, "SELECT DISTINCT")?, order))
 }
 
 /// An ad-hoc read reads one relation, and a subquery derives another.
@@ -551,8 +553,8 @@ fn adhoc_subquery(e: &Expr) -> GnitzSqlError {
     })
 }
 
-/// The SELECT list over the relation `rel` builds, and the item each ORDER BY key
-/// sorts on; a view body also binds its window calls and its QUALIFY. `rel` is
+/// The SELECT list over the relation `rel` builds, and the column each ORDER BY
+/// key sorts on; a view body also binds its window calls and its QUALIFY. `rel` is
 /// called once everything that binds through `leaf` has, so a leaf that
 /// registers what it binds builds its relation from all of it.
 fn bind_select_list<L: ItemLeaf>(
@@ -561,22 +563,22 @@ fn bind_select_list<L: ItemLeaf>(
     rel: impl FnOnce() -> Result<Rc<RelExpr>, GnitzSqlError>,
     leaf: &L,
     ctx: &str,
-    order_exprs: &[&Expr],
-) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
+    order: &[OrderKey<'_>],
+) -> Result<(Rc<RelExpr>, Vec<OrderCol>), GnitzSqlError> {
     let ids = cx.ids;
     if cx.surface.is_view() {
-        return window::bind_view_select_list(ids, select, rel, leaf, ctx, order_exprs);
+        return window::bind_view_select_list(ids, select, rel, leaf, ctx, order);
     }
     let mut items = bind_projection(&select.projection, leaf, ids, ctx)?;
-    let placed = place_order_keys(order_exprs, &mut items, ids, leaf)?;
-    Ok((leaf.project(rel()?, items)?, placed))
+    let order = place_order_keys(order, &mut items, ids, leaf)?;
+    Ok((leaf.project(rel()?, items)?, order))
 }
 
 /// DISTINCT dedups the selected columns, so an ORDER BY key that is not one of them —
 /// a hidden item `place_order_keys` appended — would change the set it orders.
-fn reject_unselected_distinct_keys(projected: &RelExpr, placed: &[usize], ctx: &str) -> Result<(), GnitzSqlError> {
+fn reject_unselected_distinct_keys(projected: &RelExpr, order: &[OrderCol], ctx: &str) -> Result<(), GnitzSqlError> {
     let cols = projected.cols();
-    if placed.iter().any(|&at| cols[at].def.is_hidden) {
+    if order.iter().any(|o| hircol_of(&cols, o.col).def.is_hidden) {
         return Err(GnitzSqlError::Rejected(format!(
             "{ctx}: an ORDER BY key under SELECT DISTINCT must be a selected column"
         )));
@@ -814,7 +816,7 @@ impl JoinScope {
             if has_visible_column(rcols.iter().map(|r| &r.def), &c.def.name)
                 && !names.iter().any(|n| n.eq_ignore_ascii_case(&c.def.name))
             {
-                names.push(c.def.name.to_string());
+                names.push(String::from(&*c.def.name));
             }
         }
         names
@@ -936,35 +938,38 @@ impl Surface {
     }
 }
 
-/// The projection item each key of `order_exprs` sorts on: the output column it
-/// names, else the item whose bound expression equals the key's — so `t.a + b` and
+/// The projection column each of `keys` sorts on: the output column it names,
+/// else the item whose bound expression equals the key's — so `t.a + b` and
 /// `a + b` are one item — else a hidden one appended here.
 fn place_order_keys<L: ItemLeaf>(
-    order_exprs: &[&Expr],
+    keys: &[OrderKey<'_>],
     items: &mut Vec<ProjEntry>,
     ids: &ColIdGen,
     leaf: &L,
-) -> Result<Vec<usize>, GnitzSqlError> {
-    let mut cols = Vec::with_capacity(order_exprs.len());
-    for (i, e) in order_exprs.iter().enumerate() {
-        if let Some(at) = output_column(e, items.iter().map(|it| &it.out.def))? {
-            cols.push(at);
-            continue;
-        }
-        // A leaf that registers while binding (a subquery) hands back a column no
-        // existing item names, so such an entry never matches and is appended.
-        let mut entry =
-            bind_scalar_item(e, Some(format!("_order{i}")), i, leaf, ids).map_err(|e| e.in_clause("ORDER BY"))?;
-        cols.push(match items.iter().position(|it| it.expr == entry.expr) {
-            Some(at) => at,
-            None => {
-                entry.out.def.is_hidden = true;
-                items.push(entry);
-                items.len() - 1
+) -> Result<Vec<OrderCol>, GnitzSqlError> {
+    let mut order = Vec::with_capacity(keys.len());
+    for (i, key) in keys.iter().enumerate() {
+        let col = match output_key(&key.target, items.iter().map(|it| &it.out))? {
+            Ok(col) => col,
+            Err(e) => {
+                // A leaf that registers while binding (a subquery) hands back a column
+                // no existing item names, so such an entry never matches and is appended.
+                let mut entry = bind_scalar_item(e, Some(format!("_order{i}")), i, leaf, ids)
+                    .map_err(|e| e.in_clause("ORDER BY"))?;
+                match items.iter().find(|it| it.expr == entry.expr) {
+                    Some(it) => it.out.id,
+                    None => {
+                        entry.out.def.is_hidden = true;
+                        let id = entry.out.id;
+                        items.push(entry);
+                        id
+                    }
+                }
             }
-        });
+        };
+        order.push(OrderCol::of(key, col));
     }
-    Ok(cols)
+    Ok(order)
 }
 
 /// Bind a set operation, binding both sides recursively; the `SetOp` constructor

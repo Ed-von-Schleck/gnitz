@@ -233,13 +233,15 @@ const SHAPES: &[Row] = &[
     ("SELECT DISTINCT g FROM t UNION ALL SELECT g FROM u", 1, &[PK, PK], &[(Distinct, 1)]),
     ("SELECT g FROM t EXCEPT SELECT DISTINCT g FROM u", 1, &[PK, PK], &[(Distinct, 1), (PositivePart, 1)]),
     ("SELECT * FROM (SELECT g FROM t UNION SELECT g FROM u) d WHERE g > 1", 1, &[PK, PK], &[(Distinct, 1), (Filter, 1)]),
-    // Segments: a non-trivial CTE and a subquery cut; a derived table over one
+    // Segments: a grouped CTE and a subquery cut; a CTE or derived table over one
     // relation, a computed group key and a projection over a join do not.
     ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1), (NullExtend, 1)]),
     ("SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM b)", 2, &[PK, PK, PK, Some(&[])], &[(RangeJoin, 1), (Reduce, 1), (GlobalGround, 1)]),
     ("WITH agg AS (SELECT k, SUM(v) AS total FROM a GROUP BY k) SELECT b.w AS nm, agg.total AS tot FROM agg JOIN b ON agg.k = b.k", 2, &[Some(&[1])], &[(EquiJoin, 1), (Reduce, 1)]),
     ("SELECT d.id FROM (SELECT id, v FROM t WHERE v > 2) d", 1, &[], &[(Filter, 1)]),
-    ("WITH c AS (SELECT id, v FROM t WHERE v > 1) SELECT id FROM c", 2, &[], &[(Filter, 1)]),
+    ("WITH c AS (SELECT id, v FROM t WHERE v > 1) SELECT id FROM c", 1, &[], &[(Filter, 1)]),
+    // The WHERE levels a projection does not separate are one filter.
+    ("WITH c AS (SELECT id, v FROM t WHERE v > 2) SELECT id FROM c WHERE id > 1", 1, &[], &[(Filter, 1)]),
     // A linear final over a grouped CTE: the segment's reduce keeps its exchange,
     // and the final — which neither re-keys nor redistributes — adds none.
     ("WITH c AS (SELECT g, SUM(v) AS s FROM t GROUP BY g) SELECT g FROM c WHERE s > 10", 2, &[Some(&[1])], &[(Reduce, 1), (Filter, 1)]),

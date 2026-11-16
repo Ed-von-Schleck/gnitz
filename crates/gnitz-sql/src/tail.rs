@@ -8,7 +8,6 @@ use crate::ast_util::{expr_has_aggregate, peel_nested, projection_item_expr};
 use crate::bind::bind_constant;
 use crate::error::{GnitzSqlError, reject_if, unsupported_clause};
 use crate::ir::BExpr;
-use gnitz_wire::ColumnDef;
 use sqlparser::ast::{Expr, LimitClause, OrderBy, OrderByExpr, OrderByKind, OrderByOptions, OrderBySort, Value};
 
 /// Parse `e` as a non-negative integer literal, or error — silently degrading a
@@ -111,17 +110,6 @@ pub(crate) fn parse_order_key<'a>(obe: &'a OrderByExpr, clause: &str) -> Result<
     Ok((expr, desc, nulls_first.unwrap_or(desc)))
 }
 
-/// The expression keys of `keys`, in key order — the list a SELECT list's binder
-/// places one projection item each for, and [`key_slots`] reads back.
-pub(crate) fn order_exprs<'a>(keys: &[OrderKey<'a>]) -> Vec<&'a Expr> {
-    keys.iter()
-        .filter_map(|k| match k.target {
-            OrderTarget::Expr(e) => Some(e),
-            OrderTarget::Position(_) => None,
-        })
-        .collect()
-}
-
 /// The ORDER BY clause as key specs, or none for an absent clause. An integer
 /// literal key is positional, by the same rule GROUP BY reads; the unsupported
 /// ClickHouse/DuckDB extensions are refused.
@@ -159,35 +147,6 @@ pub(crate) fn reject_order_key_count(n: usize) -> Result<(), GnitzSqlError> {
         )));
     }
     Ok(())
-}
-
-/// The column each key of `keys` sorts on, over a result whose columns are `cols`. A
-/// position names a *visible* column (1-based, so a hidden column never shifts it);
-/// an expression key takes the slot `placed` records for it, one per
-/// [`order_exprs`] entry in that order.
-pub(crate) fn key_slots<'c>(
-    keys: &[OrderKey<'_>],
-    cols: impl IntoIterator<Item = &'c ColumnDef>,
-    placed: impl IntoIterator<Item = usize>,
-) -> Result<Vec<usize>, GnitzSqlError> {
-    let visible: Vec<usize> = cols
-        .into_iter()
-        .enumerate()
-        .filter(|(_, c)| !c.is_hidden)
-        .map(|(i, _)| i)
-        .collect();
-    let mut placed = placed.into_iter();
-    keys.iter()
-        .map(|k| match k.target {
-            OrderTarget::Position(pos) => {
-                reject_position_out_of_range(pos, visible.len(), "ORDER BY")?;
-                Ok(visible[pos - 1])
-            }
-            OrderTarget::Expr(_) => placed
-                .next()
-                .ok_or_else(|| GnitzSqlError::Internal("ORDER BY placements do not match the keys".into())),
-        })
-        .collect()
 }
 
 /// The `LIMIT n` count and the `OFFSET m` skip, each `None` when absent, in both

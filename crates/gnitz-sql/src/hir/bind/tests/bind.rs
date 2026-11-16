@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{TestCatalog, col, ncol, parse_expr_sql, parse_query, rejected, rel, shadowed_cols, table};
+use crate::test_support::{TestCatalog, col, ncol, parse_query, rejected, rel, shadowed_cols, table};
 use gnitz_wire::{RelClass, TypeCode};
 use std::rc::Rc;
 
@@ -176,19 +176,38 @@ fn a_reduce_reads_one_distinct_set_and_shares_its_columns() {
     }
 }
 
-/// Only an unqualified name can name an output column; a qualified one is left
-/// to the caller's scope, which checks the qualifier.
+/// A position names a visible column, counting the visible ones only, and an
+/// unqualified name the visible column of that name; a qualified one is left to
+/// the caller's scope, which checks the qualifier.
 #[test]
-fn output_column_matches_unqualified_names_only() {
-    let cols = shadowed_cols();
+fn an_output_key_is_a_position_or_an_unqualified_name() {
+    let ids = ColIdGen::new();
+    let cols: Vec<HirCol> = shadowed_cols()
+        .into_iter()
+        .map(|d| HirCol::new(ids.next(), d))
+        .collect();
+    let key = |src: &str| {
+        let q = parse_query(&format!("SELECT * FROM t ORDER BY {src}"));
+        let keys = parse_order_by(q.order_by.as_ref()).unwrap();
+        let at = output_key(&keys[0].target, cols.iter())?.ok();
+        Ok(at.map(|id| cols.iter().position(|c| c.id == id).unwrap()))
+    };
     for (src, want) in [
         ("ID", Some(1)),
         ("(id)", Some(1)),
         ("t.id", None),
         ("id + 1", None),
         ("_k", None),
+        ("1", Some(1)),
+        ("3", Some(4)),
     ] {
-        assert_eq!(output_column(&parse_expr_sql(src), &cols).unwrap(), want, "{src}");
+        assert_eq!(key(src).unwrap(), want, "{src}");
+    }
+    for pos in [0, 4] {
+        assert_eq!(
+            rejected(key(&pos.to_string())),
+            format!("ORDER BY position {pos} is out of range (1..=3)")
+        );
     }
 }
 

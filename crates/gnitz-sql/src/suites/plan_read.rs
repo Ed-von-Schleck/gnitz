@@ -555,6 +555,14 @@ fn a_distinct_reads_as_rows_only_over_a_sets_whole_key() {
         ("SELECT DISTINCT a, x FROM c", "fold: distinct on (a, x)"),
         ("SELECT DISTINCT * FROM tv", "projection:"),
         ("SELECT DISTINCT v, w FROM tv", "fold: distinct on (v, w)"),
+        // The fold names what it groups by its source column, under any alias, and
+        // groups a column selected twice once.
+        ("SELECT DISTINCT v AS a, w FROM tv", "fold: distinct on (v, w)"),
+        ("SELECT DISTINCT v, v AS a FROM tv", "fold: distinct on (v)"),
+        (
+            "SELECT DISTINCT v AS a, w + 1 AS v FROM tv",
+            "fold: distinct on (v, _pre0)",
+        ),
         ("SELECT DISTINCT * FROM bv", "fold: distinct on (id, v, w)"),
     ] {
         let line = &explain(&cat, sql)[3];
@@ -1228,6 +1236,11 @@ fn a_grouped_cte_reads_as_its_fold() {
         (
             "WITH x AS (SELECT g, SUM(v) AS s FROM t WHERE id > 3 GROUP BY g) SELECT g, s * 2 AS d FROM x WHERE s > 10 ORDER BY g",
             "SELECT g, SUM(v) * 2 AS d FROM t WHERE id > 3 GROUP BY g HAVING SUM(v) > 10 ORDER BY g",
+        ),
+        // A column the CTE copies twice is one column of the fold.
+        (
+            "WITH x AS (SELECT g AS a, g AS b FROM t) SELECT a, SUM(b) AS s FROM x GROUP BY a",
+            "SELECT g AS a, SUM(g) AS s FROM t GROUP BY g",
         ),
     ] {
         let c = read(&cat, cte).unwrap_or_else(|e| panic!("`{cte}`: {e:?}"));

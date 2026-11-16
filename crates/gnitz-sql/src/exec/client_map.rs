@@ -8,7 +8,7 @@ use gnitz_core::{PayloadColumn, Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, LogicalProgram, MapEval};
 
 use crate::error::GnitzSqlError;
-use crate::hir::{AdhocRows, RowsReply};
+use crate::hir::RowsReply;
 
 /// A projection program resolved over a source schema, and the output schema it fills.
 /// The output keeps its source's key region; its column list may name those key columns
@@ -23,10 +23,8 @@ pub(crate) struct ClientMap {
 impl ClientMap {
     /// `rows` as the client runs them over their source, and their ORDER BY over the
     /// output.
-    pub(crate) fn over(rows: AdhocRows) -> Result<(Self, Vec<gnitz_wire::OrderKey>), GnitzSqlError> {
-        let src = Arc::clone(rows.src());
-        // No worker walks the source, so no walk yields the order.
-        let RowsReply { schema, program, order, .. } = rows.reply(false)?;
+    pub(crate) fn over(rows: RowsReply) -> Result<(Self, Vec<gnitz_wire::OrderKey>), GnitzSqlError> {
+        let RowsReply { src, schema, program, order, .. } = rows;
         Ok((ClientMap::new(program, src, schema)?, order))
     }
 

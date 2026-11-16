@@ -10,16 +10,16 @@ use super::{ReduceSpecs, keyed_frame, resolve_reduce_specs};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
 use gnitz_core::Schema;
-use gnitz_wire::{ComputeMap, GroupAggs};
+use gnitz_wire::{ColumnDef, ComputeMap, GroupAggs};
 use std::sync::Arc;
 
 /// Everything an ad-hoc grouped read needs, in layout terms: what the workers
 /// fold, and what the client does with the partials. The counterpart of
 /// `lower::EmitPieces` for the fold sink.
 pub(crate) struct FoldPieces {
-    /// The reduce input: the pre-map's output schema when there is one, else the
-    /// source's. The schema `agg`'s columns index, and the one that names them
-    /// (a pre-map column is a hidden `_preN`).
+    /// The reduce input: the source relabelled by a pre-map that only copies its
+    /// columns, else the pre-map's output. The schema `agg`'s columns index, and the
+    /// one that names them (a computed pre-map column is a hidden `_preN`).
     pub(crate) reduce_schema: Arc<Schema>,
     /// What the workers fold. It carries no cardinality COUNT: nothing stateless
     /// gates on one.
@@ -35,54 +35,79 @@ pub(crate) struct FoldPieces {
     /// would answer. An aggregate's finalize composite (AVG's divide, a SUM's null
     /// gate) is *in* its item, exactly as it is in the view path's finalize map — so
     /// the client finisher has no per-aggregate shape switch to keep in step.
-    pub(crate) finalize: super::read::AdhocRows,
+    pub(crate) finalize: super::read::RowsReply,
 }
 
-/// `SELECT DISTINCT items` over `src`. Bare items group the source columns where they lie; any
-/// computed item makes the projection the pre-map and groups its columns.
+/// `SELECT DISTINCT items` over `src`: the items are the pre-map, and the fold
+/// groups every column it produces.
 pub(super) fn distinct_fold(
     src: Frame,
-    items: &[ProjEntry],
+    items: Vec<ProjEntry>,
     order: Vec<OrderCol>,
 ) -> Result<FoldPieces, GnitzSqlError> {
-    let (pre, group_cols) = match items.iter().map(|e| e.expr.as_col()).collect::<Option<Vec<_>>>() {
-        Some(ids) => (None, ids),
-        None => (Some(items), items.iter().map(|e| e.out.id).collect()),
-    };
-    // Every item passes its own group column through: the reduce already evaluated a computed
-    // one into that column.
-    let finalize: Vec<ProjEntry> = items
-        .iter()
-        .zip(&group_cols)
-        .map(|(e, &id)| ProjEntry {
-            expr: BExpr::ColRef(id),
-            out: e.out.clone(),
-        })
-        .collect();
-    fold(src, pre, &group_cols, &[], &[], finalize, order)
+    let group_cols: Vec<ColId> = items.iter().map(|e| e.out.id).collect();
+    let finalize = ProjEntry::passthroughs(items.iter().map(|e| e.out.clone()));
+    fold(src, items, &group_cols, &[], &[], finalize, order)
 }
 
-/// The fold of `group_cols` / `aggs` over `pre` (or the source itself) applied to
+/// The fold of `group_cols` / `aggs` over `pre` applied to
 /// `src`, then `having` and `finalize` over the partial reply, the result ordered by
 /// `order` over `finalize`'s columns.
 pub(super) fn fold(
     src: Frame,
-    pre: Option<&[ProjEntry]>,
+    pre: Vec<ProjEntry>,
     group_cols: &[ColId],
     aggs: &[AggCol],
     having: &[HirExpr],
     finalize: Vec<ProjEntry>,
     order: Vec<OrderCol>,
 ) -> Result<FoldPieces, GnitzSqlError> {
-    // The pre-map, physicalized over the source — the same projection `lower_reduce`
-    // fuses, so the reduce input's column order is identical on both paths.
-    let (map, reduce_in) = match pre {
-        None => (None, src),
-        Some(items) => physical::projection_map(items, &src)?,
+    // Pre-map entries equal in expression are one column: each later one is read
+    // as the first, so a column copied twice still relabels the source. A copy
+    // keeps its source column's definition; a computed column is a hidden `_preN`.
+    let mut kept: Vec<ProjEntry> = Vec::with_capacity(pre.len());
+    let mut same: Vec<(ColId, ColId)> = Vec::new();
+    let mut computed = 0;
+    for mut e in pre {
+        if let Some(k) = kept.iter().find(|k| k.expr == e.expr) {
+            same.push((e.out.id, k.out.id));
+            continue;
+        }
+        e.out.def = match e.expr.as_col() {
+            Some(id) => src.schema.columns()[src.slot(id)?].clone(),
+            None => {
+                let def = ColumnDef::new(format!("_pre{computed}"), e.out.def.ty, e.out.def.is_nullable).hidden();
+                computed += 1;
+                def
+            }
+        };
+        kept.push(e);
+    }
+    let at = |id: ColId| same.iter().find(|(dup, _)| *dup == id).map_or(id, |&(_, k)| k);
+    let read = |e: &HirExpr| e.rebuild(&mut |id| BExpr::ColRef(at(*id)));
+    let mut groups: Vec<ColId> = Vec::with_capacity(group_cols.len());
+    for g in group_cols.iter().map(|&g| at(g)) {
+        if !groups.contains(&g) {
+            groups.push(g);
+        }
+    }
+    let aggs: Vec<AggCol> = (aggs.iter())
+        .map(|c| AggCol { arg: c.arg.map(at), ..c.clone() })
+        .collect();
+    let having: Vec<HirExpr> = having.iter().map(read).collect();
+    let finalize = (finalize.into_iter())
+        .map(|it| ProjEntry { expr: read(&it.expr), out: it.out })
+        .collect();
+    // The pre-map over the source, under the spine's rule: one copying distinct source
+    // columns relabels the source, which the reduce then reads in place; anything else
+    // is a map.
+    let (map, reduce_in) = match src.relabeled(&kept)? {
+        Some(relabeled) => (None, relabeled),
+        None => physical::projection_map(&kept, &src)?,
     };
-    let ReduceSpecs { agg, cols } = resolve_reduce_specs(group_cols, aggs, &reduce_in)?;
+    let ReduceSpecs { agg, cols } = resolve_reduce_specs(&groups, &aggs, &reduce_in)?;
     let partial = keyed_frame(&reduce_in, &agg.group_cols, agg.group_cols.iter().copied(), cols)?;
-    let having = partial.resolve_preds(having)?;
+    let having = partial.resolve_preds(&having)?;
     let finalize = super::read::reply_rows(partial, finalize, order)?;
     Ok(FoldPieces {
         reduce_schema: reduce_in.schema,
